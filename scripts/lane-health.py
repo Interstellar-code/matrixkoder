@@ -5,7 +5,7 @@ Usage: lane-health.py --agent NAME|PANE --lane DIR [--kind claude|codex|opencode
                       [--since EPOCH] [--prompt-marker TEXT] [--ledger PATH]
        lane-health.py --self-test
 
-Prints one JSON line: {"state", "evidence": [...], "agent_status", "last_change_min"}.
+Prints one JSON line: {"state", "evidence": [...], "agent_status", "last_change_min", "scope": "marker"|"tail"}.
 Only pane text produced since dispatch is scanned: the tail after the last occurrence of --prompt-marker
 (the dispatch prompt text), else the last 40 lines — old scrollback never re-triggers QUOTA.
 On QUOTA it marks the agent exhausted in the usage ledger (default $MATRIXKODER_HOME/usage.json, i.e.
@@ -16,11 +16,21 @@ herdr may print {"error": ...} and still exit 0, so JSON is parsed, not exit cod
 import datetime, json, os, re, subprocess, sys, tempfile, time
 
 KINDS = ("claude", "codex", "opencode", "agy")
-# Bare "rate limit" / 429 is a transient throttle, not an exhausted quota — deliberately not matched.
-QUOTA_RE = re.compile(r"(usage limit|limit reached|quota (reached|exceeded)|resets? (in|at) [^\n]{0,40})", re.I)
+# A quota hit needs a quota noun: bare "rate limit"/429, "Context limit reached" and a lone "resets in 3s"
+# are throttles or compaction, not an exhausted plan. Reset phrases only feed parse_reset, never trigger.
+QUOTA_RE = re.compile(r"\b(?:(?:usage|weekly|week|5-hour|5h|hourly|daily|session|plan|individual)\s+(?:limit|quota)\s+"
+                      r"(?:reached|hit|exceeded)|(?:hit|reached)\s+your\s+(?:usage\s+|weekly\s+|5-hour\s+)?limit"
+                      r"|quota\s+(?:reached|exceeded))", re.I)
+# Lines that are code, diffs, grep hits or tool views — an agent editing this very file prints quota words.
+# ponytail: heuristic; a real CLI message with a double quote or "==" in it would be ignored
+CODE_LINE_RE = re.compile(r"[\"`]|\b(?:assert|def|return|import)\b|re\.compile|==|\w\s*=\s*['(\[]|\(\s*'"
+                          r"|^[+-]|^\S+:\d+:|^\s*\d+\s*[│|→:]")
 RESET_AT_RE = re.compile(r"reset(?:s)? at (\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?)", re.I)
-RESET_IN_RE = re.compile(r"resets? in (\d+)h(?:(\d+)m)?", re.I)
+RESET_IN_RE = re.compile(r"(?:resets?|try again)\s+in\s+((?:\d+\s*[a-z]+[\s,]*(?:and\s+)?)+)", re.I)
+RESET_CLOCK_RE = re.compile(r"resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", re.I)
+DUR_RE = re.compile(r"(\d+)\s*([dhm])", re.I)
 WEEKLY_AFTER_H = 6  # a reset further out than this is a weekly window, not the 5h one
+GUESS_H = 5  # reset unknown → assume the 5h window, flagged exhausted_guess, so the agent is re-tried
 # Provider/account failures: the agent is up but every request fails — fail over like QUOTA.
 PROVIDER_RE = re.compile(r"(unsupported model|subscription is required|model service is temporarily unavailable|invalid api key|unauthori[sz]ed|insufficient (credit|balance))", re.I)
 # Only real command lines or dev-server output — not prose like "do not run pnpm dev".
@@ -60,12 +70,19 @@ def pane_text(agent, lines=300):
 
 
 def since_dispatch(text, marker=None):
-    """Pane text produced after the dispatch prompt; without a visible marker, only the last 40 lines."""
+    """-> (pane text produced after the dispatch prompt, "marker"); without a visible marker the last 40
+    lines and "tail"."""
     if marker:
         i = text.rfind(marker.strip())
         if i >= 0:
-            return text[i + len(marker.strip()):]
-    return "\n".join(text.splitlines()[-TAIL_LINES:])
+            return text[i + len(marker.strip()):], "marker"
+    return "\n".join(text.splitlines()[-TAIL_LINES:]), "tail"
+
+
+def quota_hits(text):
+    """Quota phrases on lines that are not code / diff / grep output."""
+    return [m.group(0) for line in text.splitlines() if not CODE_LINE_RE.search(line)
+            for m in QUOTA_RE.finditer(line)]
 
 
 def last_change_min(lane, since=0.0):
@@ -84,8 +101,9 @@ def last_change_min(lane, since=0.0):
 def classify(text, status, idle_min, stall_min):
     """text must already be scoped with since_dispatch()."""
     tail = text[-4000:]
-    if QUOTA_RE.search(tail):
-        return "QUOTA", [m.group(0) for m in QUOTA_RE.finditer(tail)][-2:]
+    hits = quota_hits(tail)
+    if hits:
+        return "QUOTA", hits[-2:]
     prov = PROVIDER_RE.search(tail)
     if prov:
         return "PROVIDER", [prov.group(0)]
@@ -100,16 +118,27 @@ def classify(text, status, idle_min, stall_min):
 
 
 def parse_reset(text, now=None):
-    """-> (exhausted_until ISO or None, window "5h" | "weekly" | None) from limit text."""
+    """-> (exhausted_until ISO or None, window "5h" | "weekly" | None) from limit text.
+    Understands "reset at 2026-10-07 10:02", "resets in 154h43m / 1h 30m / 45m / 2d 3h / 2 hours",
+    "try again in ..." and a bare clock time "resets 3pm" / "resets at 15:30" (next occurrence)."""
     now = now or datetime.datetime.now().astimezone()
     until = None
     m = RESET_AT_RE.search(text)
     if m:  # CLIs print local wall time
         until = datetime.datetime.fromisoformat(m.group(1).replace(" ", "T")).astimezone()
-    else:
+    if until is None:
         m = RESET_IN_RE.search(text)
-        if m:
-            until = now + datetime.timedelta(hours=int(m.group(1)), minutes=int(m.group(2) or 0))
+        mins = sum(int(n) * {"d": 1440, "h": 60, "m": 1}[u.lower()] for n, u in DUR_RE.findall(m.group(1))) if m else 0
+        if mins:
+            until = now + datetime.timedelta(minutes=mins)
+    if until is None:
+        m = RESET_CLOCK_RE.search(text)
+        if m and (m.group(2) or m.group(3)):
+            h = int(m.group(1)) % 12 + (12 if (m.group(3) or "").lower() == "pm" else 0) if m.group(3) else int(m.group(1))
+            if h < 24 and int(m.group(2) or 0) < 60:
+                until = now.replace(hour=h, minute=int(m.group(2) or 0), second=0, microsecond=0)
+                if until <= now:
+                    until += datetime.timedelta(days=1)
     if until is not None:
         window = "weekly" if until - now > datetime.timedelta(hours=WEEKLY_AFTER_H) else "5h"
         return until.isoformat(timespec="seconds"), window
@@ -123,18 +152,31 @@ def record_quota(ledger, key, text, now=None):
             data = json.load(f)
     except (OSError, json.JSONDecodeError):
         data = {}
+    now = now or datetime.datetime.now().astimezone()
     until, window = parse_reset(text, now)
     entry = data.setdefault("agents", {}).setdefault(key, {})
     entry.setdefault("source", "pane-text")  # an existing CodexBar entry keeps its own source
-    entry.update({"exhausted_until": until, "exhausted_window": window, "exhausted_source": "pane-text",
-                  "exhausted_observed_at": (now or datetime.datetime.now().astimezone()).isoformat(timespec="seconds"),
-                  "exhausted_evidence": [m.group(0) for m in QUOTA_RE.finditer(text)][-2:]})
+    guess = until is None
+    if guess:
+        prev = entry.get("exhausted_until")
+        try:
+            prev_future = prev and datetime.datetime.fromisoformat(prev) > now
+        except (TypeError, ValueError):
+            prev_future = False
+        if prev_future:  # a known future reset beats a guess
+            until, window, guess = prev, entry.get("exhausted_window"), entry.get("exhausted_guess", False)
+        else:
+            until = (now + datetime.timedelta(hours=GUESS_H)).isoformat(timespec="seconds")
+    entry.update({"exhausted_until": until, "exhausted_window": window, "exhausted_guess": guess,
+                  "exhausted_source": "pane-text", "exhausted_observed_at": now.isoformat(timespec="seconds"),
+                  "exhausted_evidence": quota_hits(text)[-2:]})
     d = os.path.dirname(ledger) or "."
     os.makedirs(d, exist_ok=True)
     # ponytail: atomic replace, but read-modify-write can race mk-usage.py; add a shared flock if both write often
     fd, tmp = tempfile.mkstemp(dir=d, prefix=".usage-")
     with os.fdopen(fd, "w") as f:
         json.dump(data, f, indent=2)
+    os.chmod(tmp, 0o644)
     os.replace(tmp, ledger)
     return entry
 
@@ -149,12 +191,13 @@ def check(agent, lane, kind=None, stall_min=10.0, since=0.0, marker=None, ledger
     if "error" in got:
         return {"state": "ERROR", "evidence": [str(got["error"])[:200]], "text": ""}
     status = find(got, "agent_status")
-    text = since_dispatch(pane_text(agent), marker)
+    text, scope = since_dispatch(pane_text(agent), marker)
     idle = last_change_min(lane, since)
     state, ev = classify(text, status, idle, stall_min)
     if state == "QUOTA":
         record_quota(ledger or default_ledger(), kind or agent, text)
-    return {"state": state, "evidence": ev, "agent_status": status, "last_change_min": idle, "text": text}
+    return {"state": state, "evidence": ev, "agent_status": status, "last_change_min": idle, "scope": scope,
+            "text": text}
 
 
 def self_test():
@@ -171,17 +214,31 @@ def self_test():
     assert classify("Upstream request failed: An active OpenCode Go subscription is required", "working", 1, 10)[0] == "PROVIDER"
     assert classify('{"error":"unsupported model: gpt-6.1-sol"}', "done", 1, 10)[0] == "PROVIDER"
 
-    # a 429 / bare rate limit is a throttle, not quota
-    assert classify("API Error: 429 rate limit exceeded, retrying in 5s", "working", 1, 10)[0] == "OK"
-    assert classify("Rate limit hit, backing off", "working", 1, 10)[0] == "OK"
+    # real quota wording from the CLIs we drive
+    for msg in ("■ You've hit your usage limit. Upgrade to Pro or try again in 2 hours 13 minutes.",
+                "Claude usage limit reached. Your limit will reset at 3pm.",
+                "5-hour limit reached ∙ resets 3pm", "Weekly limit reached · resets Oct 13, 9am",
+                "Quota exceeded for model gemini-pro"):
+        assert classify(msg, "idle", 1, 10)[0] == "QUOTA", msg
+
+    # false positives (each matched the r1 regex): throttles, compaction, code / grep / diff text
+    for msg in ("API Error: 429 rate limit exceeded, retrying in 5s", "Rate limit hit, backing off",
+                "Context limit reached, compacting conversation", "API Error 429 Too Many Requests, resets in 3s",
+                '    assert classify("Usage limit reached for 5 hour", "idle", 1, 10)[0] == "QUOTA"',
+                "scripts/lane-health.py:20:QUOTA_RE = re.compile(r'(usage limit|limit reached|quota exceeded)')",
+                "+    msg = 'Individual quota reached. Resets in 154h43m'",
+                "    171→    weekly usage limit reached handling", "    if text == 'usage limit reached':"):
+        assert classify(msg, "working", 1, 10)[0] == "OK", msg
 
     # only text since dispatch counts: old scrollback above the prompt marker is ignored
     pane = "Usage limit reached. resets in 3h\n" + "old\n" * 5 + "> Read and follow brief-r2.md exactly.\nworking on it\n"
-    assert since_dispatch(pane, "Read and follow brief-r2.md").strip().startswith("exactly.")
-    assert classify(since_dispatch(pane, "Read and follow brief-r2.md"), "working", 1, 10)[0] == "OK"
-    assert classify(since_dispatch(pane, "marker not on screen"), "working", 1, 10)[0] == "QUOTA"  # in last 40 lines
+    txt, scope = since_dispatch(pane, "Read and follow brief-r2.md")
+    assert txt.strip().startswith("exactly.") and scope == "marker"
+    assert classify(txt, "working", 1, 10)[0] == "OK"
+    txt, scope = since_dispatch(pane, "marker not on screen")
+    assert scope == "tail" and classify(txt, "working", 1, 10)[0] == "QUOTA"  # in last 40 lines
     old = "Usage limit reached. resets in 3h\n" + "noise\n" * 60
-    assert classify(since_dispatch(old), "working", 1, 10)[0] == "OK"  # scrolled past the 40-line tail
+    assert classify(since_dispatch(old)[0], "working", 1, 10)[0] == "OK"  # scrolled past the 40-line tail
 
     # window kind by reset distance
     now = datetime.datetime(2026, 10, 7, 12, 0).astimezone()
@@ -192,6 +249,15 @@ def self_test():
     assert parse_reset("will reset at 2026-10-13 09:00", now)[1] == "weekly"
     assert parse_reset("weekly usage limit reached", now) == (None, "weekly")
     assert parse_reset("usage limit reached", now) == (None, None)
+    later = lambda **kw: (now + datetime.timedelta(**kw)).isoformat(timespec="seconds")
+    assert parse_reset("limit reached, resets in 45m", now) == (later(minutes=45), "5h")
+    assert parse_reset("resets in 1h 30m", now) == (later(minutes=90), "5h")
+    assert parse_reset("resets in 2d 3h", now) == (later(hours=51), "weekly")
+    assert parse_reset("try again in 2 hours 13 minutes", now) == (later(minutes=133), "5h")
+    assert parse_reset("5-hour limit reached ∙ resets 3pm", now) == (later(hours=3), "5h")
+    assert parse_reset("resets at 9am", now) == (later(hours=21), "weekly")  # 9am already passed → tomorrow
+    assert parse_reset("resets at 15:30", now) == (later(hours=3, minutes=30), "5h")
+    assert parse_reset("resets 5 times a day", now) == (None, None)
 
     # ledger keyed by kind, CodexBar windows preserved
     import shutil
@@ -207,10 +273,17 @@ def self_test():
         assert agy["windows"] == codexbar["windows"] and agy["source"] == "codexbar" and d["updated"] == "x"
         assert agy["exhausted_window"] == "weekly" and agy["exhausted_source"] == "pane-text"
         assert agy["exhausted_until"] == (now + datetime.timedelta(hours=154, minutes=43)).isoformat(timespec="seconds")
-        record_quota(ledger, "w2-codex-pane", "usage limit reached", now)  # no --kind → pane name key
-        d = json.load(open(ledger))
-        assert d["agents"]["w2-codex-pane"]["source"] == "pane-text" and d["agents"]["w2-codex-pane"]["exhausted_until"] is None
-        assert os.listdir(tmp) == ["usage.json"]
+        assert agy["exhausted_guess"] is False
+        # a later hit without reset text keeps the known future reset
+        record_quota(ledger, "agy", "Individual quota reached", now + datetime.timedelta(hours=1))
+        agy2 = json.load(open(ledger))["agents"]["agy"]
+        assert agy2["exhausted_until"] == agy["exhausted_until"] and agy2["exhausted_guess"] is False
+        # unknown reset → guessed +5h (never null forever), keyed by pane name when no --kind
+        record_quota(ledger, "w2-codex-pane", "usage limit reached", now)
+        pane_e = json.load(open(ledger))["agents"]["w2-codex-pane"]
+        assert pane_e["source"] == "pane-text" and pane_e["exhausted_guess"] is True
+        assert pane_e["exhausted_until"] == later(hours=GUESS_H)
+        assert os.listdir(tmp) == ["usage.json"] and os.stat(ledger).st_mode & 0o777 == 0o644
         os.environ["MATRIXKODER_HOME"] = tmp
         assert default_ledger() == ledger
     finally:
@@ -223,13 +296,20 @@ def main():
     if "--self-test" in a:
         return self_test()
     def opt(f, d=None):
-        return a[a.index(f) + 1] if f in a else d
+        if f not in a:
+            return d
+        if a.index(f) + 1 >= len(a):
+            sys.exit(f"{f} needs a value\n{__doc__}")
+        return a[a.index(f) + 1]
     agent, lane, kind = opt("--agent"), opt("--lane"), opt("--kind")
     if not agent or not lane or (kind and kind not in KINDS):
         sys.exit(__doc__)
     ledger = opt("--ledger")
-    r = check(agent, lane, kind, float(opt("--stall-min", "10")), float(opt("--since", "0")),
-              opt("--prompt-marker"), ledger and os.path.expanduser(ledger))
+    try:
+        stall_min, since = float(opt("--stall-min", "10")), float(opt("--since", "0"))
+    except ValueError as e:
+        sys.exit(f"{e}\n{__doc__}")
+    r = check(agent, lane, kind, stall_min, since, opt("--prompt-marker"), ledger and os.path.expanduser(ledger))
     r.pop("text")
     print(json.dumps(r))
 

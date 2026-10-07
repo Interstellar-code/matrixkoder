@@ -2,7 +2,7 @@
 
 ## Autonomy
 
-Autonomous means the goal is delivered without the user intervening. You stop only for real human inputs. "Should I continue?" and "which of these two options?" are not pauses — decide with the plan, the mockups and Jev, write the decision on the board, and keep going.
+Autonomous means the goal is delivered without the user intervening. You stop only for real human inputs. "Should I continue?" and "which of these two options?" are not pauses — decide with the plan, the mockups and Jev, record it (`mk-state event --type decision --text "..."`), and keep going.
 
 **Autonomy contract** — a section of the master plan the user approves once (defaults in `matrixkoder.yaml`): goal and definition of done; pre-authorised actions; the pause list. Anything pre-authorised there is not asked again.
 
@@ -18,7 +18,7 @@ Pre-authorised by default: routing and agent choice, failover, fix loops (≤3),
 7. An agent pane `blocked` on an approval dialog — the herdr skill forbids answering for it — when the contract does not pre-authorise launch flags, or a dialog still appears despite them.
 8. `jev_screen` returns `block` on agent output.
 
-**When pausing:** write one question with options and a recommendation under `## Waiting on user` on the board, tell the user, and keep every unblocked lane going — dispatched lanes and background watchers continue, and next briefs are pre-queued with `lane-watch.py --then-send`. The session is turn-based: you resume on the user's next message. At the definition of done, stop with a final report (board + PR link).
+**When pausing:** record one question with options and a recommendation (`mk-state wait set --question "<q>" --options a,b --rec a`; `wait clear` once answered), tell the user, and keep every unblocked lane going — dispatched lanes and background watchers continue, and next briefs are pre-queued with `lane-watch.py --then-send`. The session is turn-based: you resume on the user's next message. At the definition of done, stop with a final report (board + PR link).
 
 ## Locks (cross-session freeze)
 

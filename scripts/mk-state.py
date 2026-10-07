@@ -2,24 +2,27 @@
 """MatrixKoder run state — the ONLY writer of <data>/runs/**. Python 3 stdlib only.
 
   run init --id ID --feature F --branch B [--plan PATH]
-  run list | run get [--id ID] | run set [--id ID] [--next TEXT] [--status active|done]
-  run stage N [--id ID] | run archive --id ID
-  task add --id T --title TEXT [--wave N] [--deps A,B] [--owned glob,glob]
-  task set T key=value ... [--by WHO] [--note TEXT]     keys: status agent model effort lane last_commit gates verdict
+  run list | run get [--id ID | ID] | run set [--id ID] [--next TEXT] [--status active|done]
+  run stage N [--id ID] | run archive --id ID | run archive ID
+  task add --id T --title TEXT [--wave N] [--deps A,B] [--owned glob,glob]   (ids are case-insensitive unique)
+  task set T key=value ... [--note TEXT]     keys: status agent model effort lane last_commit gates verdict
   task round T --kind build|fix|takeover [--cause TEXT]
   task get T
-  event [--task T] --type transition|decision|verdict|quota|note --text TEXT [--from S --to S] [--by WHO]
+  event [--task T] --type transition|decision|verdict|quota|note --text TEXT [--from S] [--to S]  (transition needs --to)
   wait set --question TEXT --options a,b [--rec TEXT] | wait clear
-  lock take RES --reason TEXT [--ttl-min 30] [--scope a,b] [--force-stale] | lock release RES | lock check RES
+  lock take RES --reason TEXT [--ttl-min 30] [--scope a,b] [--force-stale]
+  lock release RES [--force] (refuses a lock taken by another --by) | lock check RES
   render
   --self-test
 
-Common: --data DIR (else $MATRIXKODER_DATA, else <git toplevel of cwd>/.matrixkoder), --run ID for task/event/wait/render
-(default: the single active run). Global dir: $MATRIXKODER_HOME or ~/.matrixkoder (locks/).
+Common: --data DIR (else $MATRIXKODER_DATA, else <main checkout of cwd's git repo>/.matrixkoder; a linked worktree
+resolves to its main checkout, a nested repo to itself), --by WHO (default orchestrator), --run ID for
+task/event/wait/render (default: the single active run). Global dir: $MATRIXKODER_HOME or ~/.matrixkoder (locks/).
 Every command prints ONE JSON line. Errors: {"ok": false, "error": ...} exit 2; lock refused: exit 1.
+run.json is authoritative; events.jsonl may run one line ahead after a crash; `render` rebuilds board.md.
 Schema: docs/state-schema.md
 """
-import argparse, contextlib, datetime, fcntl, json, os, re, socket, sys, tempfile
+import argparse, contextlib, datetime, fcntl, json, math, os, re, socket, sys, tempfile
 
 SCHEMA = 1
 STATUSES = ("planned routed dispatched building verifying review fix merged qa done "
@@ -60,7 +63,20 @@ def resolve_data(arg):
         if os.path.dirname(d) == d:
             raise Fail("no git toplevel above cwd; pass --data or set MATRIXKODER_DATA")
         d = os.path.dirname(d)
-    return os.path.join(d, ".matrixkoder")
+    return os.path.join(main_worktree(d), ".matrixkoder")
+
+
+def main_worktree(top):
+    """A linked worktree (.git is a file + commondir) shares the main checkout's data dir."""
+    try:
+        with open(os.path.join(top, ".git")) as f:
+            gitdir = f.read().split("gitdir:", 1)[1].strip()
+        gitdir = os.path.join(top, gitdir)
+        with open(os.path.join(gitdir, "commondir")) as f:
+            common = os.path.normpath(os.path.join(gitdir, f.read().strip()))
+    except (OSError, IndexError):  # .git is a directory, or a submodule (no commondir)
+        return top
+    return os.path.dirname(common) if os.path.basename(common) == ".git" else top
 
 
 def check_id(v, what):
@@ -84,6 +100,7 @@ def write_json(path, obj):
             f.write("\n")
             f.flush()
             os.fsync(f.fileno())
+        os.chmod(tmp, 0o644)  # mkstemp makes 0600; match board.md / events.jsonl
         os.replace(tmp, path)
     except BaseException:
         with contextlib.suppress(OSError):
@@ -160,7 +177,11 @@ class Store:
                 lines = f.read().splitlines()  # ponytail: reads whole log; tail-seek if logs reach MBs
         except FileNotFoundError:
             return []
-        return [json.loads(x) for x in lines[-n:] if x.strip()]
+        out = []
+        for x in lines:  # a torn line from a crash mid-append is skipped, not fatal
+            with contextlib.suppress(json.JSONDecodeError):
+                out.append(json.loads(x))
+        return out[-n:]
 
     def render(self, run):
         w = run.get("waiting")
@@ -216,7 +237,8 @@ def parse_value(v):
 # ---------- locks (global, cross-session) ----------
 
 def lock_path(res):
-    return os.path.join(home(), "locks", check_id(res, "lock resource") + ".lock")
+    # lower-case file name: APFS is case-insensitive, so "DB" and "db" must be the same lock
+    return os.path.join(home(), "locks", check_id(res, "lock resource").lower() + ".lock")
 
 
 def lock_state(rec):
@@ -239,14 +261,17 @@ def lock_take(a):
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
     with os.fdopen(fd, "w") as f:
         json.dump(rec, f)
+    os.chmod(tmp, 0o644)
     try:
-        for attempt in (0, 1):
+        for attempt in (0, 1, 2):
             try:
                 os.link(tmp, path)  # exclusive create (EEXIST if held) with complete content, never half-written
                 return {"ok": True, "state": "held", "lock": rec, "path": path}
             except FileExistsError:
                 cur = read_json(path)
                 state = lock_state(cur)
+                if state == "free" and attempt < 2:  # released between link and read: try again
+                    continue
                 if state == "stale" and a.force_stale and attempt == 0:
                     # ponytail: two simultaneous --force-stale callers can both win; forcing is a deliberate act
                     with contextlib.suppress(FileNotFoundError):
@@ -277,6 +302,7 @@ def cmd_run(a, st):
             st.event(run, "note", f"run init: {a.feature} on {a.branch}")
             st.save(run)
         return {"ok": True, "run": run}
+    a.run = a.run or getattr(a, "pos_id", None)
     if a.action == "get":
         return {"ok": True, "run": st.load(a.run)}
     if a.action == "archive" and not a.run:
@@ -291,8 +317,8 @@ def cmd_run(a, st):
             if a.status:
                 set_run_status(st, run, a.status)
         elif a.action == "stage":
-            if a.n is None:
-                raise Fail("run stage needs N")
+            if a.n is None or a.n < 0:
+                raise Fail("run stage needs N >= 0")
             run["stage"] = a.n
             st.event(run, "note", f"stage {a.n}")
         else:  # archive
@@ -305,8 +331,7 @@ def set_run_status(st, run, status):
     if status != run["status"]:
         st.event(run, "note", f"run {run['status']} → {status}")
         run["status"] = status
-        if status != "active":
-            run["ended"] = run.get("ended") or now()
+        run["ended"] = None if status == "active" else (run.get("ended") or now())
 
 
 def cmd_task(a, st):
@@ -317,8 +342,9 @@ def cmd_task(a, st):
             return {"ok": True, "task": t, "dir": st.task_dir(run["id"], t["id"])}
         if a.action == "add":
             tid = check_id(a.id, "task id")
-            if any(t["id"] == tid for t in run["tasks"]):
-                raise Fail(f"task {tid} exists")
+            clash = [t["id"] for t in run["tasks"] if t["id"].lower() == tid.lower()]
+            if clash:  # case-insensitive: task folders share one path on APFS
+                raise Fail(f"task {tid} exists" + (f" as {clash[0]}" if clash[0] != tid else ""))
             if not a.title:
                 raise Fail("task add needs --title")
             t = {"id": tid, "title": a.title, "wave": a.wave, "deps": csv(a.deps), "owned": csv(a.owned),
@@ -372,6 +398,10 @@ def cmd_task(a, st):
 def cmd_event(a, st):
     if a.type not in EVENT_TYPES:
         raise Fail(f"bad event type {a.type!r}; one of: {' '.join(EVENT_TYPES)}")
+    if not a.text.strip():
+        raise Fail("event needs a non-empty --text")
+    if a.type == "transition" and not a.to:
+        raise Fail("transition event needs --to")
     for s in (a.from_, a.to):
         if s is not None and s not in STATUSES:
             raise Fail(f"bad status {s!r}")
@@ -403,14 +433,20 @@ def cmd_lock(a, st):
     if a.action == "take":
         if not a.reason:
             raise Fail("lock take needs --reason")
+        if not (math.isfinite(a.ttl_min) and a.ttl_min >= 0):
+            raise Fail("--ttl-min must be a finite number >= 0")
         return lock_take(a)
     path = lock_path(a.resource)
     if a.action == "release":
-        try:
-            os.unlink(path)
-            return {"ok": True, "released": True}
-        except FileNotFoundError:
+        cur = read_json(path)
+        if cur is None:
             return {"ok": True, "released": False}
+        if cur.get("by") != a.by and not a.force:
+            raise Fail(f"lock {a.resource} is held by {cur.get('by')!r}, not {a.by!r} (use --force)",
+                       code=1, state=lock_state(cur), lock=cur)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(path)
+        return {"ok": True, "released": True}
     cur = read_json(path)
     return {"ok": True, "state": lock_state(cur), "lock": cur}
 
@@ -434,6 +470,8 @@ def build_parser():
         r = run.add_parser(name, parents=[data_p])
         r.add_argument("--id", "--run", dest="run")
         r.set_defaults(func=cmd_run)
+    for name in ("get", "archive"):  # `run get r1` works as well as `run get --id r1`
+        run.choices[name].add_argument("pos_id", nargs="?")
     r = run.choices["init"]
     r.add_argument("--feature"), r.add_argument("--branch"), r.add_argument("--plan")
     run.choices["set"].add_argument("--next")
@@ -473,6 +511,7 @@ def build_parser():
     x = lk.choices["take"]
     x.add_argument("--reason"), x.add_argument("--ttl-min", type=float, default=30), x.add_argument("--scope")
     x.add_argument("--force-stale", action="store_true")
+    lk.choices["release"].add_argument("--force", action="store_true")
 
     sub.add_parser("render", parents=[data_p, run_p]).set_defaults(func=cmd_render)
     return p
@@ -485,6 +524,8 @@ def main(argv):
         out, code = a.func(a, st), 0
     except Fail as e:
         out, code = {"ok": False, "error": str(e), **e.extra}, e.code
+    except (OSError, ValueError) as e:  # corrupt JSON (ValueError), unreadable files: still one JSON line
+        out, code = {"ok": False, "error": f"{type(e).__name__}: {e}"}, 2
     print(json.dumps(out))
     return code
 
@@ -578,6 +619,38 @@ def self_test():
         assert mk("run", "archive", code=2)["ok"] is False
         assert mk("task", "get", "T1")["task"]["id"] == "T1"
         assert mk("run", "set", "--status", "done")["run"]["ended"]
+        assert mk("run", "set", "--id", "r1", "--status", "active")["run"]["ended"] is None  # reopen clears ended
+        assert mk("run", "get", "r1")["run"]["id"] == "r1" and mk("run", "get", "--id", "r1")["run"]["id"] == "r1"
+
+        # review r1: case-insensitive task ids, input validation, one JSON line on corrupt files
+        assert "exists as T1" in mk("task", "add", "--id", "t1", "--title", "lower", code=2)["error"]
+        assert mk("task", "get", "T1")["task"]["title"] == "State core"
+        assert mk("event", "--type", "note", "--text", "  ", code=2)["ok"] is False
+        assert mk("event", "--type", "transition", "--text", "x", code=2)["ok"] is False
+        assert mk("run", "stage", "-1", code=2)["ok"] is False
+        for ttl in ("nan", "inf", "-5"):
+            assert mk("lock", "take", "x", "--reason", "r", "--ttl-min", ttl, code=2)["ok"] is False
+        for f in ("run.json", "events.jsonl", "board.md", os.path.join("tasks", "T1", "task.json")):
+            assert os.stat(os.path.join(rdir, f)).st_mode & 0o777 == 0o644, f
+        with open(os.path.join(rdir, "events.jsonl"), "a") as f:
+            f.write('{"t": "torn')  # crash mid-append
+        assert mk("render")["ok"]
+        with open(os.path.join(rdir, "events.jsonl"), "a") as f:
+            f.write("\n")
+        bad = os.path.join(data, "runs", "r2", "run.json")
+        good = open(bad).read()
+        open(bad, "w").write("{not json")
+        assert "JSONDecodeError" in mk("run", "get", "--id", "r2", code=2)["error"]
+        open(bad, "w").write(good)
+
+        # concurrent writers: flock serialises read-modify-write, no lost event or update
+        procs = [subprocess.Popen([sys.executable, os.path.abspath(__file__), "task", "set", "T2", f"agent=a{i}",
+                                   "--note", f"race {i}", "--data", data], env=env, stdout=subprocess.PIPE, text=True)
+                 for i in range(10)]
+        assert all(p.wait() == 0 for p in procs)
+        races = [json.loads(x) for x in open(os.path.join(rdir, "events.jsonl")) if '"race ' in x]
+        assert len(races) == 10 and mk("task", "get", "T2")["task"]["agent"] in {f"a{i}" for i in range(10)}
+        assert len([e for e in mk("run", "get")["run"]["recent"] if e["text"].startswith("race ")]) == 10
 
         # locks live in MATRIXKODER_HOME, exclusive, expire to stale
         assert mk("lock", "take", "dev-server", "--reason", "QA", "--scope", "restart,deploy")["state"] == "held"
@@ -594,6 +667,12 @@ def self_test():
         assert mk("lock", "take", "db", "--reason", "again", "--force-stale")["lock"]["reason"] == "again"
         assert mk("lock", "check", "db")["state"] == "held"
         assert mk("lock", "take", "../etc", "--reason", "x", code=2)["ok"] is False
+        assert mk("lock", "take", "DB", "--reason", "case", code=1)["state"] == "held"  # same file as "db"
+        other = mk("lock", "release", "db", "--by", "lane-watch", code=1)
+        assert other["ok"] is False and other["lock"]["by"] == "orchestrator"
+        assert mk("lock", "release", "db", "--by", "lane-watch", "--force")["released"] is True
+        mk("lock", "take", "web", "--reason", "x")
+        assert os.stat(os.path.join(tmp, "home", "locks", "web.lock")).st_mode & 0o777 == 0o644
 
         # atomic write: a failing write leaves the old file intact and no temp file behind
         p = os.path.join(tmp, "atomic", "x.json")
@@ -618,6 +697,16 @@ def self_test():
         assert os.path.exists(os.path.join(tmp, "envdata", "runs", "e1", "run.json"))
         mk("run", "init", "--id", "d1", "--feature", "F", "--branch", "b", e=envd, cwd=repo)
         assert os.path.exists(os.path.join(rdir, "..", "d1", "run.json"))
+        # a linked worktree (.git file + commondir) resolves to the main checkout's data dir
+        wt_git = os.path.join(repo, ".git", "worktrees", "lane")
+        os.makedirs(wt_git)
+        open(os.path.join(wt_git, "commondir"), "w").write("../..\n")
+        lane = os.path.join(tmp, "repo-worktree-lane")
+        os.makedirs(lane)
+        open(os.path.join(lane, ".git"), "w").write(f"gitdir: {wt_git}\n")
+        mk("run", "init", "--id", "w1", "--feature", "F", "--branch", "b", data_arg=False, cwd=lane)
+        assert os.path.exists(os.path.join(repo, ".matrixkoder", "runs", "w1", "run.json"))
+        assert not os.path.exists(os.path.join(lane, ".matrixkoder"))
         print("mk-state self-test ok")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

@@ -20,10 +20,10 @@ Bootstrap writes nothing outside the outputs it was asked for; scratch files go 
 
 - **Waves.** Lanes in one wave never share a file. Hot files go to one lane or a later wave. Later waves branch from the integration branch after merge, never from another lane's unverified head. Max 3 build lanes + 1 backend lane per run unless `matrixkoder.yaml` says otherwise — verifying each lane costs orchestrator time.
 - **Dispatching long briefs:** always as a file the agent reads, never inline text.
-- **Watching:** `lane-watch.py` (writes task state via `mk-state`) polls git + report + agent status every 20 s and prints one JSON line when it stops. Exit reasons: `DONE`, `QUOTA`, `STALL`, `BLOCKED`, `DEV_SERVER`, `WATCH_EXPIRED`. Run it with `run_in_background` and `--max-wait-min 30` (background tasks aren't bound by the 10-min foreground limit; 9-min windows just cost a re-arm turn each). Re-arm on `WATCH_EXPIRED`; act on the others (failover via `reference/pool-and-usage.md`, pause via `reference/safety.md`).
+- **Watching:** `lane-watch.py` polls git + report + agent status + pane text every 20 s and prints one JSON line when it stops. Exit reasons: `DONE`, `DONE_SENT`, `QUOTA`, `PROVIDER`, `STALL`, `BLOCKED`, `DEV_SERVER`, `ERROR`, `WATCH_EXPIRED`. Always pass `--kind <claude|codex|opencode|agy>` (quota ledger key; without it the pane id is used), `--phase <PHASE>` (DONE needs a `<PHASE> DONE` line; `<PHASE> BLOCKED: <q>` exits BLOCKED with the question), `--prompt-marker "<start of the dispatch prompt>"` (scan only text since dispatch; without it the last 40 lines), and `--task <T> --data <data>` together (it then writes the task status through `mk-state`; one without the other is an error). It only moves a task that is still `dispatched|building|stalled|quota|provider|blocked`; a later status (review, merged, ...) is kept and the exit is logged as a note. Run it with `run_in_background` and `--max-wait-min 30` (background tasks aren't bound by the 10-min foreground limit; 9-min windows just cost a re-arm turn each). Re-arm on `WATCH_EXPIRED`; act on the others (failover via `reference/pool-and-usage.md`, pause via `reference/safety.md`).
 - **Takeover.** When an agent dies mid-phase (quota, stall), its uncommitted work stays. Write the brief's TAKEOVER section: files already changed, last known gate state, "keep it and build on it", ordered finishing steps. Rewrite the brief's `Co-Authored-By` line for the new agent. Hand it to the next agent.
 - **Verify.** Gate output through context-mode: print counts, failing test names, new type errors in owned files. Never paste full logs on the board.
-- **Merging lanes.** Conflicts are resolved by you, by reading both sides; then the full gate set runs again. Record the merge SHA on the board.
+- **Merging lanes.** Conflicts are resolved by you, by reading both sides; then the full gate set runs again. Record the merge SHA: `mk-state task set <T> status=merged last_commit=<sha>`.
 
 ## Context budget
 
@@ -33,7 +33,7 @@ Long runs fail on context, not code. Keep this thread small:
 |---|---|
 | Test/typecheck/lint/build output, git log/diff, `herdr agent read`, transcripts, anything >20 lines | `ctx_batch_execute` / `ctx_execute` / `ctx_execute_file` — print only what you need |
 | Something already seen this run | `ctx_search` before re-running |
-| Prior runs, decisions from other sessions | `mk-state run get`, `board.md`, `<data>/runs/<id>/tasks/*`, Claude Code memory files, `ctx_search` |
+| Prior runs, decisions from other sessions | `mk-state run list` + `run get --id <run>`, `board.md`, `<data>/runs/<id>/tasks/*`, Claude Code memory files, `ctx_search` |
 | "Where is X / who calls Y" | codebase-memory `search_graph` / `trace_path` / `get_code_snippet` (scope with `file_pattern`),  |
 | Reading code or a full diff | a subagent; keep its summary only |
 | External docs | `ctx_fetch_and_index` (+ `jev_screen` if it contains instructions) |

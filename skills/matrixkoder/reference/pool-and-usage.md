@@ -37,18 +37,18 @@ How effort is applied per agent:
 | OpenCode | model variant, if the provider has one; else note "effort n/a" on the board |
 | Claude subagents (Agent tool) | no per-call param, but frontmatter `effort:` works (docs: sub-agents → Frontmatter reference; overrides session effort, not `CLAUDE_CODE_EFFORT_LEVEL`). Launch `subagent_type: effort-<low\|medium\|high\|max>` (plugin agents `agents/effort-*.md`, namespaced `matrixkoder:effort-*` when installed as a plugin) with `model` per Jev. Plugin agents (OMC executor etc.) run at session effort. |
 
-Record the chosen effort in the board's Model column (e.g. `gpt-6.1-sol · high`).
+Record the route with `mk-state task set <T> agent=<kind> model=<m> effort=<e>` (the board shows `gpt-6.1-sol · high`).
 
 ## Usage ledger — `~/.matrixkoder/usage.json` (CodexBar)
 
-One source for every agent: `${CLAUDE_PLUGIN_ROOT}/scripts/mk-usage.py` runs `codexbar usage --format json --provider <p>` (providers from `usage.providers`, every `usage.poll_min` minutes) and normalises into `usage.json`. Read that file; never call codexbar from the loop. Unknown stays `null` — never guess.
+One source for every agent: `${CLAUDE_PLUGIN_ROOT}/scripts/mk-usage.py` (being built, P2 — until then only the pane-text fallback below writes the ledger) runs `codexbar usage --format json --provider <p>` (providers from `usage.providers`, every `usage.poll_min` minutes) and normalises into `usage.json`. Read that file; never call codexbar from the loop. Unknown stays `null` — never guess.
 
 Rules:
 - **Classify windows by `windowMinutes`** (300 = 5h, 10080 = week), never by primary/secondary position. AGY's primary is a weekly window. Keep every window with its `id`/`title`: AGY has two weekly pools, Claude has a Fable-only week.
 - An agent is **available** unless a window that blocks the model in use is at 100%. A window whose `resetsAt` has passed counts as reset (available) — an exhausted quota clears itself.
 - **Codex on an API key reports an auth error** → `n/a (API key)`, not numbers; route it by the static order and pane-text detection.
 - Provider errors → `status: n/a` with the message.
-- Fallback: `lane-health.py` still matches limit text in the pane, but only text since dispatch (not scrollback), ignores bare `rate limit`/429, takes the window kind from the message, writes the same ledger keyed by **agent kind** (not pane id), and `resets_at` when the CLI prints one.
+- Fallback: `lane-health.py --kind <agent kind> --prompt-marker "<dispatch prompt start>"` matches limit text in the pane, but only text since dispatch (not scrollback), needs a quota phrase ("usage limit reached", "hit your limit", "quota exceeded"; never bare `rate limit`/429/"Context limit"), skips code/diff/grep lines, and writes `agents.<kind>.exhausted_until` (+ `exhausted_window` 5h|weekly by reset distance, `exhausted_guess: true` = no reset printed, assumed +5h). An agent is unavailable while `exhausted_until` is in the future; `mk-usage.py` clears it once passed (`docs/state-schema.md`).
 - Claude cross-check: compare CodexBar with the session's own measure; flag drift, never overwrite.
 
 ## Routing preferences (in the master plan)
@@ -69,7 +69,7 @@ Stage 1 writes `## Routing preferences` from `matrixkoder.yaml` defaults; if the
 
 ## Failover
 
-`QUOTA`, `PROVIDER` (unsupported model, subscription required, service unavailable, auth) or `STALL` (working but no file/commit change for 10 min, or idle without the DONE token): snapshot `git status --porcelain` + `git diff --stat` to the board, write the TAKEOVER section, re-decide with Jev (or static order), dispatch. Skip agents inside a reset window. All agents below their floor → pause the run and ask.
+`QUOTA`, `PROVIDER` (unsupported model, subscription required, service unavailable, auth) or `STALL` (working but no file/commit change for 10 min, or idle without the DONE token): record `git status --porcelain` + `git diff --stat` counts as an event (`mk-state event --task <T> --type note`), `task round <T> --kind takeover --cause "quota|stall|provider"`, write the TAKEOVER section, re-decide with Jev (or static order), dispatch. Skip agents inside a reset window. All agents below their floor → pause the run and ask.
 
 ## Typical routes (starting points, Jev adjusts)
 | Job | Route |
