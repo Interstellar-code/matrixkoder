@@ -200,6 +200,8 @@ Bootstrap of the old skill (read-only checks) becomes steps 3–8's detection.
 | P8 | Publish: `gh repo create Interstellar-code/matrixkoder`, push nested repo, marketplace install test | install works in a clean session — user go required |
 
 Build lanes: P1 + P2 parallel (separate files); P3 after; P4–P7 sequential (same hooks module).
+Lanes B, D, G (wave 1) share the main checkout with file ownership. **From P4 on every lane gets its own git worktree**
+`~/Development/matrixkoder-wt-<x>` (branch `mk-<x>`), merged into `main` by the orchestrator after review (decided 2026-10-07).
 Commits only on user go; nothing pushed before P8.
 
 ## 10. Open questions
