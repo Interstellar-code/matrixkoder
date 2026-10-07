@@ -5,6 +5,9 @@
 // an import; the pure data-dir math is in data.ts for wake/tools to reuse.
 import { atom, read, update } from 'claude-code'
 import type { Elements, EngineInterface, On, PluginOptions } from 'claude-code'
+
+// the per-surface element table $.ui.resolve(e) answers (every surface's has Box/Text)
+type Els = Elements[keyof Elements]
 import type { MkEvent, MkRun, MkSnapshot, MkStatusMemory, MkTask } from '../types'
 import {
   PANE_ID, EMPTY_SNAPSHOT, activeEntry, basename, candidateDirs, coerceIndex, coerceRun, coerceUsage, join,
@@ -46,8 +49,10 @@ const STATUS_SHORT: Record<string, string> = {
   building: 'build', verifying: 'verify', dispatched: 'disp', stalled: 'stall', planned: 'plan',
 }
 const DONE = new Set(['done', 'merged'])
-const ATTENTION = new Set(['stalled', 'blocked', 'quota', 'provider'])
+const IN_PROGRESS = new Set(['dispatched', 'building', 'verifying', 'review', 'fix', 'qa', 'merged'])
+const SIDE_STATE = new Set(['blocked', 'quota', 'stalled', 'provider'])
 const LANE_LIVE = new Set(['dispatched', 'building', 'verifying', 'review', 'fix', 'stalled', 'blocked'])
+const LANE_FALLBACK = new Set(['dispatched', 'building', 'verifying', 'fix'])
 let pollInFlight = false
 let lastPollAt = -Infinity
 let lastChipText: string | null | undefined // undefined = never set; skip ui.status when unchanged
@@ -74,7 +79,7 @@ export function registerDashboard(on: On, options: PluginOptions): void {
     // timers first: a throwing first load must never leave the loop dead
     // a cancel may come back as a plain function or a { cancel } handle (mock clock)
     const arm = (cancel: unknown): (() => void) =>
-      typeof cancel === 'function' ? cancel : () => { (cancel as { cancel?: () => void }).cancel?.() }
+      typeof cancel === 'function' ? (cancel as () => void) : () => { (cancel as { cancel?: () => void }).cancel?.() }
     timerRegistry.cancelRefresh?.()
     timerRegistry.cancelRefresh = arm($.clock.every(REFRESH_MS, () => refreshSafe($, options, cwd)))
     timerRegistry.cancelPoll?.()
@@ -139,7 +144,7 @@ export function registerDashboard(on: On, options: PluginOptions): void {
             : RunSection($.ui.resolve(e), snap.run, compact, extraActive)}
         {!snap.setupHint && snap.dataDir !== null && snap.run !== null && PlanSection($.ui.resolve(e), snap.run, cols, compact, snap.now)}
         {!snap.setupHint && snap.dataDir !== null && snap.run !== null && LanesSection($.ui.resolve(e), snap.run, cols)}
-        {UsageSection($.ui.resolve(e), snap, cols, compact)}
+        {UsageSection($.ui.resolve(e), snap, compact)}
         {!snap.setupHint && snap.run?.waiting && WaitingSection($.ui.resolve(e), snap.run.waiting)}
         {!snap.setupHint && snap.run && RecentSection($.ui.resolve(e), (snap.run.recent ?? []).slice(-3).reverse(), compact)}
       </Box>
@@ -351,7 +356,7 @@ async function pollUsage($: EngineInterface): Promise<void> {
 
 // ---------- sections (plain functions: JSX tags resolve to locals by name) ----------
 
-function FirstRun(els: Elements) {
+function FirstRun(els: Els) {
   const { Box, Text } = els
   return (
     <Box flexDirection="column">
@@ -364,7 +369,7 @@ function FirstRun(els: Elements) {
   )
 }
 
-function NoRun(els: Elements, snap: MkSnapshot) {
+function NoRun(els: Els, snap: MkSnapshot) {
   const { Box, Text } = els
   const past = snap.runs.filter(r => r.status !== 'active').slice(-3).reverse()
   return (
@@ -389,7 +394,7 @@ function NoRun(els: Elements, snap: MkSnapshot) {
   )
 }
 
-function RunSection(els: Elements, run: MkRun, compact: boolean, extraActive = 0) {
+function RunSection(els: Els, run: MkRun, compact: boolean, extraActive = 0) {
   const { Box, Text } = els
   const head = run.head_sha ? `@${run.head_sha.slice(0, 7)}` : ''
   const feature = compact ? run.feature.split('-')[0] : run.feature
@@ -404,10 +409,7 @@ function RunSection(els: Elements, run: MkRun, compact: boolean, extraActive = 0
         {extraActive > 0 && <Text color="yellow" dimColor={true}>+{extraActive} active</Text>}
       </Box>
       {run.next && (
-        <Box flexDirection="row" gap={1}>
-          <Text color="cyan" bold={true}>▶ Next:</Text>
-          <Text wrap="truncate-end">{sanitizeText(run.next, 120)}</Text>
-        </Box>
+        <Text wrap="truncate-end"><Text color="cyan" bold={true}>▶ Next: </Text>{sanitizeText(run.next, 120)}</Text>
       )}
     </Box>
   )
@@ -439,7 +441,7 @@ function statusWord(status: string, compact: boolean): string {
   return compact ? STATUS_SHORT[status] ?? status : status
 }
 
-function PlanSection(els: Elements, run: MkRun, cols: number, compact: boolean, nowMs: number) {
+function PlanSection(els: Els, run: MkRun, cols: number, compact: boolean, nowMs: number) {
   const { Box, Text } = els
   const done = run.tasks.filter(t => DONE.has(t.status)).length
   const total = run.tasks.length
@@ -460,19 +462,19 @@ function PlanSection(els: Elements, run: MkRun, cols: number, compact: boolean, 
         </Box>
       </Box>
       {run.tasks.map(task => {
-        const isDone = DONE.has(task.status)
-        const isBuilding = task.status === 'building' || task.status === 'verifying'
-        const isAttention = ATTENTION.has(task.status)
-        const checkbox = isDone ? '[✓]' : isBuilding ? '[•]' : isAttention ? '[!]' : '[ ]'
-        const checkColor = isDone ? 'green' : isBuilding ? 'cyan' : isAttention ? 'yellow' : 'gray'
+        const isDone = task.status === 'done'
+        const isActive = IN_PROGRESS.has(task.status)
+        const isAttention = SIDE_STATE.has(task.status)
+        const checkbox = isDone ? '[✓]' : isActive ? '[•]' : isAttention ? '[!]' : '[ ]'
+        const checkColor = isDone ? 'green' : isActive ? 'cyan' : isAttention ? 'yellow' : 'gray'
         const title = compact ? task.title.slice(0, 14) : task.title // §3.7: 14-char title budget
         const round = task.round && (task.status === 'review' || task.status === 'fix') ? ` r${task.round}` : ''
-        const mins = isBuilding || task.status === 'stalled' ? elapsedMin(task, nowMs) : null
+        const mins = task.status === 'building' || task.status === 'verifying' || task.status === 'stalled' ? elapsedMin(task, nowMs) : null
         const suffix = `${round}${mins != null ? ` ${mins}m` : ''}`
         return (
           <Box key={task.id} flexDirection="row" justifyContent="space-between" gap={1}>
             <Box flexDirection="row" gap={1} flexShrink={1}>
-              <Text color={checkColor} bold={isBuilding || isAttention}>{checkbox}</Text>
+              <Text color={checkColor} bold={isActive || isAttention}>{checkbox}</Text>
               <Text bold={true}>{task.id}</Text>
               <Text dimColor={task.status === 'planned'} wrap={compact ? 'truncate-end' : undefined}>{title}</Text>
             </Box>
@@ -487,16 +489,20 @@ function PlanSection(els: Elements, run: MkRun, cols: number, compact: boolean, 
   )
 }
 
-function LanesSection(els: Elements, run: MkRun, cols: number) {
+function LanesSection(els: Els, run: MkRun, cols: number) {
   const { Box, Text } = els
   const lanes = run.tasks.filter(t => t.lane && LANE_LIVE.has(t.status))
+  // no task carries a lane (early run, lanes not dispatched yet): the live
+  // dispatched|building|verifying|fix tasks stand in with agent glyph + model
+  const rows = lanes.length > 0
+    ? lanes.map(t => ({ task: t, slot: (t.lane ?? '').split('/').filter(Boolean).at(-1) ?? t.lane ?? '' }))
+    : run.tasks.filter(t => LANE_FALLBACK.has(t.status)).map(t => ({ task: t, slot: '·' }))
   return (
     <Box flexDirection="column">
       <Text bold={true}>Lanes</Text>
-      {lanes.length === 0 && <Text dimColor={true}>none live</Text>}
-      {lanes.map(t => {
+      {rows.length === 0 && <Text dimColor={true}>none live</Text>}
+      {rows.map(({ task: t, slot }) => {
         const agent = t.agent ?? 'agent'
-        const slot = (t.lane ?? '').split('/').filter(Boolean).at(-1) ?? t.lane ?? ''
         return (
           <Box key={t.id} flexDirection="row" justifyContent="space-between" gap={1}>
             <Box flexDirection="row" gap={1} flexShrink={1}>
@@ -505,7 +511,7 @@ function LanesSection(els: Elements, run: MkRun, cols: number) {
               <Text dimColor={true} wrap="truncate-end">{[t.model, t.effort].filter(Boolean).join('-')}</Text>
             </Box>
             <Box flexDirection="row" gap={1} flexShrink={0}>
-              <Text color={ATTENTION.has(t.status) ? 'yellow' : 'cyan'}>{t.status}</Text>
+              <Text color={SIDE_STATE.has(t.status) ? 'yellow' : 'cyan'}>{t.status}</Text>
               {cols >= 44 && t.last_commit && <Text dimColor={true}>{t.last_commit.slice(0, 7)}</Text>}
             </Box>
           </Box>
@@ -559,8 +565,9 @@ function usageRows(snap: MkSnapshot, compact: boolean): UsageRow[] {
     const t = Date.parse(until ?? '')
     return Number.isFinite(t) && now > 0 && t > now
   }
-  return names.filter(n => agents[n]).map(name => {
+  return names.flatMap(name => {
     const a = agents[name]
+    if (!a) return [] // noUncheckedIndexedAccess: presence checked, then narrowed
     const pools = Object.entries(a.pools ?? {})
     // primary = the configured pool when present, else the first (schema: the
     // agent-level fields mirror the primary pool); the rest render as sub-rows
@@ -576,7 +583,7 @@ function usageRows(snap: MkSnapshot, compact: boolean): UsageRow[] {
         exhaustedUntil: p.exhausted_until ?? null,
         exhausted: isExhausted(p.exhausted_until),
       }))
-    return {
+    return [{
       name,
       pct: a.five_hour?.used_pct ?? null,
       weekPct: a.weekly?.used_pct ?? null,
@@ -586,70 +593,61 @@ function usageRows(snap: MkSnapshot, compact: boolean): UsageRow[] {
       // when every pool is exhausted — a lone secondary pool stays a sub-row)
       exhausted: isExhausted(a.exhausted_until),
       sub,
-    }
+    } as UsageRow]
   })
 }
 
-function UsageSection(els: Elements, snap: MkSnapshot, cols: number, compact: boolean) {
+function UsageSection(els: Els, snap: MkSnapshot, compact: boolean) {
   const { Box, Text } = els
   const rows = usageRows(snap, compact)
-  const barWidth = compact ? 5 : 7
+  const barW = compact ? 5 : 7 // design §4.2: 7 standard, 5 compact
+  const NAME_W = 14 // fits '  └ claude-gpt': sub-row labels and agent names share one column
+  const NUM_W = 5
+  const RESET_W = 6
+  const leftCol = (text: string, w: number): string => (text.length > w ? text.slice(0, w) : text.padEnd(w))
+  const rightCol = (text: string, w: number): string => (text.length > w ? text.slice(0, w) : text.padStart(w))
+  const pctCol = (pct: number | null): string => (pct == null ? rightCol('n/a', NUM_W) : rightCol(`${Math.round(pct)}%`, NUM_W))
+  const weekCol = (pct: number | null): string => (pct == null ? rightCol('—', NUM_W) : rightCol(`${Math.round(pct)}%`, NUM_W))
+  const resetCol = (iso: string | null): string => rightCol(resetStr(iso, snap.now, compact), RESET_W)
+
+  const row = (keyId: string, name: string, nameColor: string | undefined, boldName: boolean, pct: number | null, weekPct: number | null, resetIso: string | null, exhausted: boolean, exhaustedUntil: string | null) => {
+    const color = pctColor(pct, exhausted)
+    const resetIsoShown = exhausted && exhaustedUntil ? exhaustedUntil : resetIso
+    return (
+      <Box key={keyId} flexDirection="row" gap={0}>
+        <Text color={nameColor} bold={boldName}>{leftCol(name, NAME_W)}</Text>
+        <Text color={color} bold={exhausted}>{bar(pct, barW)}</Text>
+        <Text color={pct == null ? 'gray' : color} bold={exhausted}>{pctCol(pct)}</Text>
+        {!compact && <Text dimColor={true}>{weekCol(weekPct)}</Text>}
+        <Text dimColor={!exhausted} color={exhausted ? 'red' : undefined} bold={exhausted}>{resetCol(resetIsoShown)}</Text>
+        {exhausted && <Text color="red" bold={true}>⊘</Text>}
+      </Box>
+    )
+  }
+
   return (
     <Box flexDirection="column">
-      <Box flexDirection="row" justifyContent="space-between">
+      <Box flexDirection="row" gap={0}>
         <Text bold={true}>Usage</Text>
-        <Box flexDirection="row" gap={compact ? 1 : 2}>
-          <Text dimColor={true}>5h</Text>
-          {!compact && <Text dimColor={true}>week</Text>}
-          <Text dimColor={true}>reset</Text>
-        </Box>
+        <Text>{' '.repeat(Math.max(1, NAME_W + barW - 6))}</Text>
+        <Text dimColor={true}>{rightCol('5h', NUM_W)}</Text>
+        {!compact && <Text dimColor={true}>{rightCol('week', NUM_W)}</Text>}
+        <Text dimColor={true}>{rightCol('reset', RESET_W)}</Text>
       </Box>
       {rows.length === 0 && <Text dimColor={true}>no ledger yet</Text>}
-      {rows.map(r => {
-        const na = r.pct == null // the label alone decides; sub-rows may still exist
-        const color = pctColor(r.pct, r.exhausted)
-        // exhausted rows show when the block clears (exhausted_until), not the next 5h reset
-        const reset = r.exhausted && r.exhaustedUntil ? r.exhaustedUntil : r.reset
-        return (
-          <Box key={r.name} flexDirection="column">
-            <Box flexDirection="row" justifyContent="space-between">
-              <Box flexDirection="row" gap={1}>
-                <Text color={AGENT_COLOR[r.name] ?? 'cyan'} bold={r.exhausted}>{r.name.padEnd(8)}</Text>
-                <Text color={color} bold={r.exhausted}>{bar(r.pct, barWidth)}</Text>
-              </Box>
-              <Box flexDirection="row" gap={1}>
-                <Text color={na ? 'gray' : color} bold={r.exhausted}>{na ? 'n/a' : `${String(Math.round(r.pct ?? 0)).padStart(3)}%`}</Text>
-                {!compact && <Text dimColor={true}>{na || r.weekPct == null ? '—' : `${String(Math.round(r.weekPct)).padStart(3)}%`}</Text>}
-                <Text dimColor={!r.exhausted} color={r.exhausted ? 'red' : undefined} bold={r.exhausted}>{resetStr(reset, snap.now, compact)}</Text>
-                {r.exhausted && <Text color="red" bold={true}>⊘</Text>}
-              </Box>
-            </Box>
-            {r.sub.map(p => {
-              const pcolor = pctColor(p.pct, p.exhausted)
-              const preset = p.exhausted && p.exhaustedUntil ? p.exhaustedUntil : p.reset
-              return (
-                <Box key={p.name} flexDirection="row" justifyContent="space-between">
-                  <Box flexDirection="row" gap={1}>
-                    <Text dimColor={true}>  └ {p.name.padEnd(10)}</Text>
-                    <Text color={pcolor} bold={p.exhausted}>{bar(p.pct, barWidth)}</Text>
-                  </Box>
-                  <Box flexDirection="row" gap={1}>
-                    <Text color={pcolor} bold={p.exhausted}>{p.pct == null ? 'n/a' : `${String(Math.round(p.pct)).padStart(3)}%`}</Text>
-                    {!compact && <Text dimColor={true}>{p.weekPct == null ? '—' : `${String(Math.round(p.weekPct)).padStart(3)}%`}</Text>}
-                    <Text dimColor={!p.exhausted} color={p.exhausted ? 'red' : undefined} bold={p.exhausted}>{resetStr(preset, snap.now, compact)}</Text>
-                    {p.exhausted && <Text color="red" bold={true}>⊘</Text>}
-                  </Box>
-                </Box>
-              )
-            })}
-          </Box>
-        )
-      })}
+      {rows.map(r => (
+        <Box key={r.name} flexDirection="column">
+          {row(r.name, leftCol(r.name, NAME_W), AGENT_COLOR[r.name] ?? 'cyan', r.exhausted, r.pct, r.weekPct, r.reset, r.exhausted, r.exhaustedUntil)}
+          {r.sub.map(p => (
+            row(`${r.name}:${p.name}`, `  └ ${compact ? p.name.slice(0, 6) : p.name}`, undefined, false, p.pct, p.weekPct, p.reset, p.exhausted, p.exhaustedUntil)
+          ))}
+        </Box>
+      ))}
     </Box>
   )
 }
 
-function WaitingSection(els: Elements, waiting: NonNullable<MkRun['waiting']>) {
+function WaitingSection(els: Els, waiting: NonNullable<MkRun['waiting']>) {
   const { Box, Text } = els
   return (
     <Box flexDirection="column">
@@ -668,14 +666,14 @@ function WaitingSection(els: Elements, waiting: NonNullable<MkRun['waiting']>) {
   )
 }
 
-function RecentSection(els: Elements, events: readonly MkEvent[], compact: boolean) {
+function RecentSection(els: Els, events: readonly MkEvent[], compact: boolean) {
   const { Box, Text } = els
   return (
     <Box flexDirection="column">
       <Text bold={true}>Recent</Text>
       {events.length === 0 && <Text dimColor={true}>nothing yet</Text>}
       {events.map((ev, i) => (
-        <Box key={i} flexDirection="row" gap={1}>
+        <Box key={`ev${String(i)}`} flexDirection="row" gap={1}>
           {!compact && <Text dimColor={true}>{(ev.t ?? '').slice(11, 16)}</Text>}
           {/* event text is lane-watch pane evidence — sanitised before display */}
           <Text wrap="truncate-end" color={ev.type === 'verdict' ? 'green' : undefined}>{sanitizeText(ev.text ?? '', compact ? 40 : 80)}</Text>

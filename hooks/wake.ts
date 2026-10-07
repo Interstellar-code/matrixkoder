@@ -51,7 +51,7 @@ async function resolveDataDir($: EngineInterface): Promise<string> {
         try {
           const gitContent = await $.fs.read(gitPath)
           const m = gitContent.match(/gitdir:\s*(.+)/)
-          if (m) {
+          if (m && m[1]) {
             let gitdir = m[1].trim()
             if (!gitdir.startsWith('/')) {
               gitdir = `${dir}/${gitdir}`
@@ -144,8 +144,10 @@ async function pollEvents($: EngineInterface): Promise<void> {
     const newlyDiscovered: Array<{ task: string; to: string }> = []
 
     for (let i = lastSeen; i < lines.length; i++) {
+      const line = lines[i]
+      if (!line) continue
       try {
-        const ev = JSON.parse(lines[i])
+        const ev = JSON.parse(line)
         // Validate every value placed in prompt.submit:
         // task must be a string matching mk-state ID_RE; status must be in WAKE_STATUSES enum;
         // ignore orchestrator's own events to avoid self-wake loops.

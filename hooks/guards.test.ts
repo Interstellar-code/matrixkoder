@@ -278,3 +278,32 @@ test('registers nothing when userConfig guards is false', { options: { guards: f
   const ran = await $.tool.call({ tool: 'Bash', command: 'git stash' })
   expect(ran.deny).toBeUndefined()
 })
+
+test('allows read-only git stash list and git stash show forms', async ($, on) => {
+  stubBash(on)
+  const stashAllow = [
+    'git stash list',
+    'git stash show',
+    'git stash show -p',
+    'git stash show stash@{0}',
+  ]
+  expect(await misses(c => $.tool.call(c), stashAllow, false)).toEqual([])
+})
+
+test('denies all other git stash forms', async ($, on) => {
+  stubBash(on)
+  const stashDeny = [
+    'git stash',
+    'git stash push',
+    'git stash pop',
+    'git stash apply',
+    'git stash drop',
+    'git stash clear',
+    'git stash save',
+    'git stash branch b1',
+    'git stash create',
+    'git stash store 1234567',
+  ]
+  expect(await misses(c => $.tool.call(c), stashDeny, true)).toEqual([])
+})
+

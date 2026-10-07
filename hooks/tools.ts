@@ -45,7 +45,7 @@ export function registerTools(on: On, _options: PluginOptions): void {
   })
 
   on('tool.call', async ($, e, next): Promise<ToolCallResult> => {
-    const tool = e.tool
+    const tool: string = e.tool
     const pluginName = $.plugin.name
     const isMkState = tool === 'mk_state' || tool === `mcp__${pluginName}__mk_state`
     const isMkUsage = tool === 'mk_usage' || tool === `mcp__${pluginName}__mk_usage`
@@ -63,7 +63,9 @@ export function registerTools(on: On, _options: PluginOptions): void {
     }
 
     if (isMkState) {
-      const argsRaw = (e as any).args ?? (e as any).input?.args
+      const inputObj = e as Record<string, unknown>
+      const nestedInput = inputObj.input as Record<string, unknown> | undefined
+      const argsRaw = inputObj.args ?? nestedInput?.args
       if (!Array.isArray(argsRaw) || argsRaw.length === 0) {
         return {
           isError: true,
@@ -132,10 +134,11 @@ export function registerTools(on: On, _options: PluginOptions): void {
           isError: true,
           result: (proc.stderr || proc.stdout || `Process exited with code ${proc.exitCode}`).trim(),
         }
-      } catch (err: any) {
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err)
         return {
           isError: true,
-          result: err?.message ? `mk_state process error: ${err.message}` : String(err),
+          result: `mk_state process error: ${msg}`,
         }
       }
     }
@@ -160,10 +163,11 @@ export function registerTools(on: On, _options: PluginOptions): void {
           isError: true,
           result: (proc.stderr || proc.stdout || `Process exited with code ${proc.exitCode}`).trim(),
         }
-      } catch (err: any) {
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err)
         return {
           isError: true,
-          result: err?.message ? `mk_usage process error: ${err.message}` : String(err),
+          result: `mk_usage process error: ${msg}`,
         }
       }
     }

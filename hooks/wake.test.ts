@@ -21,7 +21,7 @@ test('wake fires once for a new verifying event', { options: { wake: true } }, a
   mock.env(on, { MATRIXKODER_DATA: '/data' })
 
   on('fs.read', (_$, e) => {
-    if (e.path in files) return { value: files[e.path] }
+    if (e.path in files) return { value: files[e.path] ?? '' }
     return { value: '' }
   })
   on('prompt.submit', (_$, e) => {
@@ -29,7 +29,7 @@ test('wake fires once for a new verifying event', { options: { wake: true } }, a
     return { text: e.text }
   })
 
-  const store = new Map<string, any>([
+  const store = new Map<string, unknown>([
     ['wakeEventLines:test-run', 0],
   ])
   on('state.get', (_$, e, next) => {
@@ -50,7 +50,7 @@ test('wake fires once for a new verifying event', { options: { wake: true } }, a
 
   on('session.start', (_$, e, next) => ({ cwd: '/tmp' }))
 
-  await $.session.start({ cwd: '/tmp' })
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
   expect(submitted.length).toBe(0)
 
   // Advance 30s for the poll timer
@@ -79,7 +79,7 @@ test('first enable baselines to current lines and does not wake for history', { 
 
   mock.env(on, { MATRIXKODER_DATA: '/data' })
 
-  on('fs.read', (_$, e) => (e.path in files ? { value: files[e.path] } : { value: '' }))
+  on('fs.read', (_$, e) => (e.path in files ? { value: files[e.path] ?? '' } : { value: '' }))
   on('prompt.submit', (_$, e) => {
     submitted.push(e.text)
     return { text: e.text }
@@ -99,7 +99,7 @@ test('first enable baselines to current lines and does not wake for history', { 
   })
   on('session.start', (_$, e, next) => ({ cwd: '/tmp' }))
 
-  await $.session.start({ cwd: '/tmp' })
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
   await clock.advance(30000)
   await clock.advance(60000)
 
@@ -129,7 +129,7 @@ test('drops hostile task id injection and preserves prompt integrity', { options
 
   mock.env(on, { MATRIXKODER_DATA: '/data' })
 
-  on('fs.read', (_$, e) => (e.path in files ? { value: files[e.path] } : { value: '' }))
+  on('fs.read', (_$, e) => (e.path in files ? { value: files[e.path] ?? '' } : { value: '' }))
   on('prompt.submit', (_$, e) => {
     submitted.push(e.text)
     return { text: e.text }
@@ -151,7 +151,7 @@ test('drops hostile task id injection and preserves prompt integrity', { options
   })
   on('session.start', (_$, e, next) => ({ cwd: '/tmp' }))
 
-  await $.session.start({ cwd: '/tmp' })
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
   await clock.advance(30000)
   await clock.advance(60000)
 
@@ -162,7 +162,7 @@ test('drops hostile task id injection and preserves prompt integrity', { options
 test('5-minute per task+status cap suppresses at 2 min, allows at 6 min', { options: { wake: true } }, async ($, on) => {
   const clock = mock.clock(on)
   const submitted: string[] = []
-  const store = new Map<string, any>([
+  const store = new Map<string, unknown>([
     ['wakeEventLines:cooldown-run', 0],
   ])
 
@@ -177,7 +177,7 @@ test('5-minute per task+status cap suppresses at 2 min, allows at 6 min', { opti
   mock.env(on, { MATRIXKODER_DATA: '/data' })
 
   on('fs.read', (_$, e) => {
-    if (e.path === '/data/runs/index.json') return { value: files[e.path] }
+    if (e.path === '/data/runs/index.json') return { value: files[e.path] ?? '' }
     if (e.path === '/data/runs/cooldown-run/events.jsonl') return { value: eventLines.join('\n') + '\n' }
     return { value: '' }
   })
@@ -202,7 +202,7 @@ test('5-minute per task+status cap suppresses at 2 min, allows at 6 min', { opti
   })
   on('session.start', (_$, e, next) => ({ cwd: '/tmp' }))
 
-  await $.session.start({ cwd: '/tmp' })
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
 
   // Event 1 at t=0 -> poll at 30s -> debounce flush at 90s
   await clock.advance(30000)
@@ -251,7 +251,7 @@ test('not for review event', { options: { wake: true } }, async ($, on) => {
 
   mock.env(on, { MATRIXKODER_DATA: '/data' })
 
-  on('fs.read', (_$, e) => (e.path in files ? { value: files[e.path] } : { value: '' }))
+  on('fs.read', (_$, e) => (e.path in files ? { value: files[e.path] ?? '' } : { value: '' }))
   on('prompt.submit', (_$, e) => {
     submitted.push(e.text)
     return { text: e.text }
@@ -267,7 +267,7 @@ test('not for review event', { options: { wake: true } }, async ($, on) => {
   })
   on('session.start', (_$, e, next) => ({ cwd: '/tmp' }))
 
-  await $.session.start({ cwd: '/tmp' })
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
   await clock.advance(30000)
   await clock.advance(60000)
 
@@ -293,7 +293,7 @@ test('not twice after reload', { options: { wake: true } }, async ($, on) => {
 
   mock.env(on, { MATRIXKODER_DATA: '/data' })
 
-  on('fs.read', (_$, e) => (e.path in files ? { value: files[e.path] } : { value: '' }))
+  on('fs.read', (_$, e) => (e.path in files ? { value: files[e.path] ?? '' } : { value: '' }))
   on('prompt.submit', (_$, e) => {
     submitted.push(e.text)
     return { text: e.text }
@@ -311,7 +311,7 @@ test('not twice after reload', { options: { wake: true } }, async ($, on) => {
 
   on('session.start', (_$, e, next) => ({ cwd: '/tmp' }))
 
-  await $.session.start({ cwd: '/tmp' })
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
   await clock.advance(30000)
   await clock.advance(60000)
 
@@ -322,7 +322,7 @@ test('not twice after reload', { options: { wake: true } }, async ($, on) => {
 test('debounce with mock clock batches events into one submit', { options: { wake: true } }, async ($, on) => {
   const clock = mock.clock(on)
   const submitted: string[] = []
-  const store = new Map<string, any>([
+  const store = new Map<string, unknown>([
     ['wakeEventLines:batch-run', 0],
   ])
 
@@ -369,7 +369,7 @@ test('debounce with mock clock batches events into one submit', { options: { wak
   })
   on('session.start', (_$, e, next) => ({ cwd: '/tmp' }))
 
-  await $.session.start({ cwd: '/tmp' })
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
 
   // Poll 1 at 30s: finds F6 -> verifying, starts 60s debounce
   await clock.advance(30000)
@@ -410,7 +410,7 @@ test('wake: false registers nothing', { options: { wake: false } }, async ($, on
   })
   on('session.start', (_$, e, next) => ({ cwd: '/tmp' }))
 
-  await $.session.start({ cwd: '/tmp' })
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
   await clock.advance(60000)
 
   expect(submitted.length).toBe(0)

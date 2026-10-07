@@ -2,7 +2,7 @@
 // compact 36-col, inline hint, first-run and no-run states. Fixtures arrive
 // via $.fs.write (inline fixtures plugin); fs is served in memory.
 import { test, expect } from 'claude-code/testing'
-import { NOW, RUN_PATH, USAGE_PATH, mockFs, mockWorld, paneProps, sessionStart, sessionStartIn, setRun, setUsage, worldFiles, worldFixtures } from './testkit'
+import { NOW, RUN_PATH, USAGE_PATH, agentOf, agentsOf, mockFs, mockWorld, paneProps, sessionStart, sessionStartIn, setRun, setUsage, tasksOf, worldFiles, worldFixtures } from './testkit'
 
 test('renders section titles, a task row and the agy pool sub-row', { plugins: [worldFixtures] }, async ($, on) => {
   const files = worldFiles()
@@ -74,14 +74,16 @@ test('no active run state lists recent runs and keeps usage', { plugins: [worldF
 test('tasks:[null] run.json still renders and recovers once fixed', { plugins: [worldFixtures] }, async ($, on) => {
   const files = worldFiles()
   setRun(files, run => {
-    run.tasks = [null, run.tasks[4]]
+    const tasks = tasksOf(run)
+    run.tasks = [null, tasks[4] ?? {}]
   })
   const fs = mockFs(on, files)
   const clock = mockWorld(on)
   await $.session.start(sessionStart())
   let ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   expect(await ui.find({ text: /X1/ })).toBeTruthy() // the null task is dropped, the rest render
-  files['/fixtures/run.json'] = files[RUN_PATH] = worldFiles()[RUN_PATH]
+  const good = worldFiles()[RUN_PATH] ?? '{}'
+  files['/fixtures/run.json'] = files[RUN_PATH] = good
   await clock.advance(5000)
   expect(await ui.find({ text: /F6/ })).toBeTruthy() // recovered
   expect(fs.reads.filter(p => p === RUN_PATH).length).toBeGreaterThan(1) // the timer survived the bad load
@@ -95,7 +97,8 @@ test('corrupt run.json shows the ⚠ note, then recovers', { plugins: [worldFixt
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   expect(await ui.find({ text: /cannot read run\.json/ })).toBeTruthy()
-  files['/fixtures/run.json'] = files[RUN_PATH] = worldFiles()[RUN_PATH]
+  const good = worldFiles()[RUN_PATH] ?? '{}'
+  files['/fixtures/run.json'] = files[RUN_PATH] = good
   await clock.advance(5000)
   expect(await ui.find({ text: /cannot read run\.json/ })).toBeUndefined()
   expect(await ui.find({ text: /workflows-v2/ })).toBeTruthy()
@@ -158,9 +161,9 @@ test('missing feature/branch does not break compact rendering', { plugins: [worl
 test('compact cuts the title to 14 chars and shows round/elapsed', { plugins: [worldFixtures] }, async ($, on) => {
   const files = worldFiles()
   setRun(files, run => {
-    const tasks = run.tasks as Record<string, unknown>[]
-    tasks[1].title = 'design and configuration pass'
-    tasks[2].updated = new Date(NOW - 12 * 60_000).toISOString()
+    const tasks = tasksOf(run)
+    if (tasks[1]) tasks[1].title = 'design and configuration pass'
+    if (tasks[2]) tasks[2].updated = new Date(NOW - 12 * 60_000).toISOString()
   })
   mockFs(on, files)
   mockWorld(on)
@@ -176,15 +179,17 @@ test('compact cuts the title to 14 chars and shows round/elapsed', { plugins: [w
 test('red only when the agent-level exhaustion says so; exhausted rows show the clearing date', { plugins: [worldFixtures] }, async ($, on) => {
   const files = worldFiles()
   setUsage(files, usage => {
-    const agents = usage.agents as Record<string, Record<string, unknown>>
+    const agents = agentsOf(usage)
     delete agents.claude
     delete agents.codex
     delete agents.opencode
     // agy carries ONLY the exhausted claude-gpt pool: no gemini, agent-level exhausted_until null
-    const agy = agents.agy
+    const agy = agentOf(usage, 'agy')
+    if (!agy) return
     agy.exhausted_until = null
     agy.five_hour = { used_pct: 100, resets_at: new Date(NOW + 10 * 24 * 3600_000).toISOString() }
-    agy.pools = { 'claude-gpt': (agy.pools as Record<string, unknown>)['claude-gpt'] }
+    const pools = agy.pools
+    agy.pools = typeof pools === 'object' && pools !== null ? { 'claude-gpt': (pools as Record<string, unknown>)['claude-gpt'] } : {}
   })
   mockFs(on, files)
   mockWorld(on)
@@ -196,11 +201,14 @@ test('red only when the agent-level exhaustion says so; exhausted rows show the 
 test('exhausted agent row shows exhausted_until (10-…), not the 5h reset', { plugins: [worldFixtures] }, async ($, on) => {
   const files = worldFiles()
   setUsage(files, usage => {
-    const agents = usage.agents as Record<string, Record<string, unknown>>
-    const oc = agents.opencode as Record<string, any>
+    const oc = agentOf(usage, 'opencode')
+    if (!oc) return
     oc.exhausted_until = new Date(NOW + 10 * 24 * 3600_000).toISOString()
     oc.five_hour = { used_pct: 100, resets_at: new Date(NOW + 3600_000).toISOString() }
-    ;(oc.pools as Record<string, any>).default.exhausted_until = oc.exhausted_until
+    if (typeof oc.pools === 'object' && oc.pools !== null) {
+      const def = (oc.pools as Record<string, Record<string, unknown>>).default
+      if (def) def.exhausted_until = oc.exhausted_until
+    }
   })
   mockFs(on, files)
   mockWorld(on)
@@ -213,10 +221,13 @@ test('exhausted agent row shows exhausted_until (10-…), not the 5h reset', { p
 test('null primary 5h with sub-pools labels n/a, not 0%', { plugins: [worldFixtures] }, async ($, on) => {
   const files = worldFiles()
   setUsage(files, usage => {
-    const agents = usage.agents as Record<string, Record<string, unknown>>
-    const claude = agents.claude as Record<string, any>
+    const claude = agentOf(usage, 'claude')
+    if (!claude) return
     claude.five_hour = null
-    ;(claude.pools as Record<string, any>).default.five_hour = null
+    if (typeof claude.pools === 'object' && claude.pools !== null) {
+      const def = (claude.pools as Record<string, Record<string, unknown>>).default
+      if (def) def.five_hour = null
+    }
   })
   mockFs(on, files)
   mockWorld(on)
@@ -234,9 +245,11 @@ test('missing usage triggers the initial poll with the right argv', { plugins: [
   mockWorld(on, { process: argv => polls.push(argv) })
   await $.session.start(sessionStart())
   expect(polls.length).toBe(1)
-  expect(polls[0][0]).toBe('python3')
-  expect(polls[0][1].endsWith('scripts/mk-usage.py')).toBe(true)
-  expect(polls[0][2]).toBe('--once')
+  const first = polls[0]
+  if (!first) throw new Error('no poll ran')
+  expect(first[0]).toBe('python3')
+  expect(first[1]?.endsWith('scripts/mk-usage.py')).toBe(true)
+  expect(first[2]).toBe('--once')
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   expect(await ui.find({ text: 'no ledger yet' })).toBeTruthy()
 })
@@ -257,16 +270,16 @@ test('/mk args: open, close, setup, init and unknown', { plugins: [worldFixtures
   mockFs(on, worldFiles())
   mockWorld(on)
   await $.session.start(sessionStart())
-  const run = (args: string) => $.command.run({ command: 'mk', args })
-  expect((await run('close')).text).toBe('MatrixKoder pane closed.')
-  expect((await run('open')).text).toBe('MatrixKoder pane opened.')
-  expect((await run('')).text).toBe('MatrixKoder pane closed.')
-  expect((await run('')).text).toBe('MatrixKoder pane opened.')
-  const setup = await run('setup')
+  const runCmd = (args: string) => $.command.run({ command: 'mk', args, origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 165 } })
+  expect((await runCmd('close')).text).toBe('MatrixKoder pane closed.')
+  expect((await runCmd('open')).text).toBe('MatrixKoder pane opened.')
+  expect((await runCmd('')).text).toBe('MatrixKoder pane closed.')
+  expect((await runCmd('')).text).toBe('MatrixKoder pane opened.')
+  const setup = await runCmd('setup')
   expect(setup.text).toContain('coming in P5')
-  const init = await run('init wfv2')
+  const init = await runCmd('init wfv2')
   expect(init.text).toContain('coming in P5')
-  expect((await run('bogus')).text).toContain('Usage:')
+  expect((await runCmd('bogus')).text).toContain('Usage:')
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   expect(await ui.find({ text: /Welcome to MatrixKoder/ })).toBeTruthy() // setupHint forced the first-run panel
 })
@@ -296,4 +309,87 @@ test('chip:false leaves the status line untouched', { plugins: [worldFixtures], 
   await $.session.start(sessionStart())
   await clock.advance(5000)
   expect(chips).toEqual([])
+})
+
+// ---------- fix2: live-pane bugs ----------
+
+test('▶ Next renders as one row: label and text in a single truncating Text', { plugins: [worldFixtures] }, async ($, on) => {
+  const files = worldFiles()
+  setRun(files, run => {
+    run.next = 'Re-review P4+P6 fixes, merge mk-int to main and tag the dashboard milestone'
+  })
+  mockFs(on, files)
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  expect(await ui.find({ text: /▶ Next: Re-review P4\+P6/ })).toBeTruthy() // one row, label + text together
+  // find matches substrings of the whole tree, so walk it: no Text node may be
+  // the bare label — the label and the text share ONE truncating Text
+  const textOf = (n: unknown): string => {
+    if (typeof n === 'string') return n
+    if (typeof n !== 'object' || n === null) return ''
+    const node = n as { type?: string; children?: unknown[] }
+    if (node.type !== 'Text' || !Array.isArray(node.children)) return ''
+    return node.children.map(textOf).join('')
+  }
+  const texts: string[] = []
+  const walk = (n: unknown): void => {
+    if (typeof n !== 'object' || n === null) return
+    const node = n as { type?: string; children?: unknown[] }
+    if (node.type === 'Text') {
+      const own = textOf(n)
+      if (own) texts.push(own)
+    }
+    if (Array.isArray(node.children)) node.children.forEach(walk)
+  }
+  walk(await ui.drawn())
+  expect(texts.includes('▶ Next:')).toBe(false)
+  expect(texts.some(t => t.startsWith('▶ Next: Re-review'))).toBe(true)
+})
+
+test('todo boxes: in-progress [•] (review, merged), side states [!], done [✓]', { plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  expect(await ui.find({ text: /\[•\]F6/ })).toBeTruthy() // review is in progress
+  expect(await ui.find({ text: /\[•\]W0/ })).toBeTruthy() // merged is still in progress
+  expect(await ui.find({ text: /\[!\]FIX6/ })).toBeTruthy() // stalled is a side state
+  expect(await ui.find({ text: /\[ \]X1/ })).toBeTruthy() // planned stays empty
+})
+
+test('todo boxes: done checks green', { plugins: [worldFixtures] }, async ($, on) => {
+  const files = worldFiles()
+  setRun(files, run => {
+    for (const t of tasksOf(run)) t.status = 'done'
+  })
+  mockFs(on, files)
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  expect(await ui.find({ text: /\[✓\]W0/ })).toBeTruthy()
+})
+
+test('usage columns align: padded header, exact-width name column', { plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  expect(await ui.find({ text: '   5h' })).toBeTruthy() // right-aligned 5-wide header
+  expect(await ui.find({ text: ' week' })).toBeTruthy()
+  expect(await ui.find({ text: '  └ claude-gpt' })).toBeTruthy() // sub-row label fills the 14-wide name column exactly
+  expect(await ui.find({ text: 'codex         ' })).toBeTruthy() // agent names pad to the same width
+})
+
+test('lanes fall back to live tasks when no lane is set', { plugins: [worldFixtures] }, async ($, on) => {
+  const files = worldFiles()
+  setRun(files, run => {
+    for (const t of tasksOf(run)) t.lane = null
+  })
+  mockFs(on, files)
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  expect(await ui.find({ text: /∇ AGY/ })).toBeTruthy() // F8 building stands in with its agent glyph
+  expect(await ui.find({ text: 'none live' })).toBeUndefined()
 })
