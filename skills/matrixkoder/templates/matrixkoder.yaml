@@ -1,5 +1,6 @@
-# .omc/stellar.yaml — written by stellar-orchestrator bootstrap after the user approves.
+# <data>/matrixkoder.yaml — written by the MatrixKoder onboarding wizard after the user confirms.
 # Re-checked for drift on every run; the user's explicit statements override any value.
+data_dir: .matrixkoder/               # project data dir (default <repo>/.matrixkoder/, or ~/.matrixkoder/projects/<slug>/)
 repo:
   integration_branch: main            # lanes merge here; one PR to main at the end
   worktree_pattern: ../{repo}-worktree-{x}
@@ -22,7 +23,7 @@ qa:
   dev_url: ""                         # e.g. https://localhost:3000 (always running)
   port: null
   themes: []
-  mockups: ""                         # e.g. .omc/designs/
+  mockups: ""                         # e.g. <data>/designs/
 agents:                               # installed + logged in, verified at bootstrap
   codex: { available: null, models: [] }
   opencode: { available: null, models: [] }
@@ -43,6 +44,14 @@ autonomy_contract:
   preauthorised: [routing, failover, fix-loops, worktrees, lane-merges, push-non-main, open-pr]
   builder_skip_permissions: true      # builders only, in their own worktree; never orchestrator/reviewers/runtime lanes
 deploy:
-  readme: .omc/deploys/README.md      # repo-specific checklist; always user-gated
+  readme: <data>/deploys/README.md      # repo-specific checklist; always user-gated
 locks:
-  dirs: [~/.hermes/locks, ~/.claude/locks]
+  dir: ~/.matrixkoder/locks            # managed via mk-state lock take|release|check
+usage:
+  source: codexbar                    # one source for all agents; mk-usage.py -> ~/.matrixkoder/usage.json
+  poll_min: 5
+  providers: [claude, codex, antigravity]   # add zai when the OpenCode plan key is set in CodexBar
+dashboard:
+  auto_open: true                     # only when fullscreen and >=144 cols
+  chip: true
+  toasts: true

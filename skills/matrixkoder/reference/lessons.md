@@ -12,7 +12,7 @@
 | 8 | A deploy restart exposed an unrelated config drift (gateway port) | Health diff before/after every restart |
 | 9 | Another session sent FREEZE by chat; no expiry, UNFREEZE came late | Lock files with expiry; chat freeze treated as a lock |
 | 10 | Two lanes needed the same shared files (canvas, layout) | File-ownership matrix; hot files sequenced into waves |
-| 11 | `.omc/` is gitignored, so briefs/reviews had to be copied between worktrees | Main repo is canonical; copy briefs in, reports out |
+| 11 | the data dir is gitignored, so briefs/reviews had to be copied between worktrees | Main repo is canonical; copy briefs in, reports out |
 | 12 | Claude limits were needed for other work | Claude-sparing routing with reserve floors |
 | 13 | Approval dialogs blocked builder panes | Contract decides launch flags per repo; otherwise a pause item |
 | 14 | Claude fix rounds ran as Agent-tool subagents: invisible to the user, no effort control, lost on compaction | Claude builds run in a herdr pane in the worktree with `--model --effort`; subagents only for read-only jobs. Cost: a subagent's report lands in the orchestrator context and is re-billed every later turn, and each new fix round re-reads the same files (FIX4 builders: 165–190K tokens each); a live pane keeps its files in its own (cached) context, the orchestrator reads only the report file. Refresh the pane with a takeover brief after 3–4 rounds or near compaction. |
@@ -28,3 +28,5 @@
 | 24 | X1 design pass (AGY pro-high, 37-line report) flagged by-design choices as HIGH (Describe as a SOURCE kind per plan) and called off-screen table columns "missing" | Triage QA findings against the plan and earlier measured QA before briefing a fix round; write the triage into the fix brief so the builder does not chase non-defects |
 | 25 | The skill listed helpers (codebase-memory, canary, visual-verdict, claude-mem) but never called them in a real run; codebase-memory's only index pointed at an old /Volumes path (wrong line numbers); claude-mem smart_outline can't parse TS | Preflight probes each helper and records ok/stale/missing; each stage names the helper call it makes |
 | 26 | claude-mem removed (user, 2026-10-07): background Sonnet summarisation cost Claude quota, ~13 KB context per session, 2.9 GB disk, smart_outline can't parse TS; its one unique feature (cross-session search) was never needed | Use run boards, .omc/ files, Claude Code memory and context-mode instead |
+| 27 | The auto-mode classifier blocked launching builder agents with `--dangerously-skip-permissions` from the orchestrator | Builder launch flags need a user permission rule, or the user starts the pane; never retry around the block |
+| 28 | CodexBar windows were mis-read by position: AGY's primary is a weekly window, not a 5h one | Classify windows by `windowMinutes` (300 = 5h, 10080 = week), never by primary/secondary |

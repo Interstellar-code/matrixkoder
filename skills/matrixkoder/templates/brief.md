@@ -1,6 +1,6 @@
 # <PHASE> — <one-line goal>
 
-Repo: this folder (worktree `<path>`, branch `<branch>`, at `<sha>`: <what is already in>). Stack: <stack>. Plan: `<main repo>/.omc/plans/<feature>.md` (§<n>, <PHASE>). Do ONLY <PHASE>. Other agents work on: <lanes + their areas> — do not touch them.
+Repo: this folder (worktree `<path>`, branch `<branch>`, at `<sha>`: <what is already in>). Stack: <stack>. Plan: `<data>/plans/<feature>.md` (read-only; history for this task: `<data>/runs/<id>/tasks/<T>/`, read-only) (§<n>, <PHASE>). Do ONLY <PHASE>. Other agents work on: <lanes + their areas> — do not touch them.
 
 ## Spec
 <what to build, as numbered parts. Point to files with `path:line`; point to mockups by path; state the API contract the code must use. Never paste code.>
@@ -21,10 +21,10 @@ Do NOT touch: <list>
 ## Rules
 - Never `git checkout`, `git stash`, `git reset`, `git clean`, `git restore`, `--amend`, force-push. Stage only your files.
 - Work in the foreground: no background tasks or subagents (they stall and hide progress).
-- Never run <banned_commands from stellar.yaml: dev server, build that boots services, deploy, restarts>. Never start background jobs and wait on them.
+- Never run <banned_commands from matrixkoder.yaml: dev server, build that boots services, deploy, restarts>. Never start background jobs and wait on them.
 - No secrets in code, logs or the report.
 - Commit: `<type(scope): message>`, blank line, `Co-Authored-By: <agent/model> <email>`.
-- Write `.omc/briefs/<PHASE>-report.md`: files changed, the exact final test/type/lint summary lines, differences from spec/mockups and why, anything skipped. Report only what you ran.
+- Write the report to the path named here (`report-rN.md` in this lane's copy; the orchestrator copies it back): files changed, the exact final test/type/lint summary lines, differences from spec/mockups and why, anything skipped. Report only what you ran.
 - Reply `<PHASE> DONE` (or `<PHASE> BLOCKED: <question>`).
 
 ## TAKEOVER (only when another agent stopped mid-phase)
@@ -34,5 +34,5 @@ You inherit uncommitted work — KEEP it and build on it:
 - Do, in order: <ordered finishing steps>. Do not start over.
 
 ## FIX (only for review findings)
-Findings: `.omc/reviews/<PHASE>-review.md` — cite their numbers in the report.
+Findings: `<data>/runs/<id>/tasks/<T>/review-rN.md` — cite their numbers in the report.
 <numbered findings with acceptance per finding; same files/commands/rules as above>

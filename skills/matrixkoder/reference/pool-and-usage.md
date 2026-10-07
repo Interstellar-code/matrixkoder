@@ -1,4 +1,4 @@
-# Agent pool, tiers, quota-aware routing
+# Agent pool, tiers, usage-aware routing
 
 ## Pool
 
@@ -13,7 +13,7 @@
 
 Reviewer ≠ builder, preferably a different model family.
 
-## Tiers (verify ids with each CLI at bootstrap and date them in `stellar.yaml`)
+## Tiers (verify ids with each CLI at bootstrap and date them in `<data>/matrixkoder.yaml`)
 
 | Jev size class | Codex | OpenCode | AGY | Claude |
 |---|---|---|---|---|
@@ -35,21 +35,25 @@ How effort is applied per agent:
 | AGY | encoded in the model name (Flash Low / Medium / High, Pro High) — pick the matching model |
 | Claude Code in a herdr pane | `claude --effort <level>` at launch |
 | OpenCode | model variant, if the provider has one; else note "effort n/a" on the board |
-| Claude subagents (Agent tool) | no per-call param, but frontmatter `effort:` works (docs: sub-agents → Frontmatter reference; overrides session effort, not `CLAUDE_CODE_EFFORT_LEVEL`). Launch `subagent_type: effort-<low\|medium\|high\|max>` (`~/.claude/agents/effort-*.md`) with `model` per Jev. Plugin agents (OMC executor etc.) run at session effort. |
+| Claude subagents (Agent tool) | no per-call param, but frontmatter `effort:` works (docs: sub-agents → Frontmatter reference; overrides session effort, not `CLAUDE_CODE_EFFORT_LEVEL`). Launch `subagent_type: effort-<low\|medium\|high\|max>` (plugin agents `agents/effort-*.md`, namespaced `matrixkoder:effort-*` when installed as a plugin) with `model` per Jev. Plugin agents (OMC executor etc.) run at session effort. |
 
 Record the chosen effort in the board's Model column (e.g. `gpt-6.1-sol · high`).
 
-## Quota ledger — `~/.claude/state/agent-quota.json`
+## Usage ledger — `~/.matrixkoder/usage.json` (CodexBar)
 
-Every agent is a subscription with a 5-hour window and a weekly window. Per agent: `{plan, window_5h: {used_pct, resets_at}, weekly: {used_pct, resets_at}, source, observed_at}`. Unknown stays `null` — never guess.
+One source for every agent: `${CLAUDE_PLUGIN_ROOT}/scripts/mk-usage.py` runs `codexbar usage --format json --provider <p>` (providers from `usage.providers`, every `usage.poll_min` minutes) and normalises into `usage.json`. Read that file; never call codexbar from the loop. Unknown stays `null` — never guess.
 
-Sources:
-- Claude: the rate-limit JSON the status-line script receives (tee `used_percentage` into the ledger from the HUD script). Slash commands like `/usage` cannot be called from tools.
-- Codex / OpenCode / AGY: reactive — `lane-health.py` matches limit text in the pane (`usage limit`, `limit reached`, `quota`, `resets in`, `reset at <ts>`) and writes `used_pct: 100` + `resets_at`.
+Rules:
+- **Classify windows by `windowMinutes`** (300 = 5h, 10080 = week), never by primary/secondary position. AGY's primary is a weekly window. Keep every window with its `id`/`title`: AGY has two weekly pools, Claude has a Fable-only week.
+- An agent is **available** unless a window that blocks the model in use is at 100%. A window whose `resetsAt` has passed counts as reset (available) — an exhausted quota clears itself.
+- **Codex on an API key reports an auth error** → `n/a (API key)`, not numbers; route it by the static order and pane-text detection.
+- Provider errors → `status: n/a` with the message.
+- Fallback: `lane-health.py` still matches limit text in the pane, but only text since dispatch (not scrollback), ignores bare `rate limit`/429, takes the window kind from the message, writes the same ledger keyed by **agent kind** (not pane id), and `resets_at` when the CLI prints one.
+- Claude cross-check: compare CodexBar with the session's own measure; flag drift, never overwrite.
 
 ## Routing preferences (in the master plan)
 
-Stage 1 writes `## Routing preferences` from `stellar.yaml` defaults; if the user never stated any, propose these and ask once:
+Stage 1 writes `## Routing preferences` from `matrixkoder.yaml` defaults; if the user never stated any, propose these and ask once:
 - **Claude-sparing:** Claude Code orchestrates only; builders Codex → OpenCode → AGY → Claude.
 - **Reserve floors:** Claude ≥40% of 5h and ≥30% weekly left; others may go down to 10% / 15%.
 - The orchestrator saves Claude too: the watch/dispatch loop runs in scripts, the main thread can drop to sonnet between verify/merge stages, reviewers default to Codex or AGY pro unless Jev routes the review to opus.
@@ -58,9 +62,9 @@ Stage 1 writes `## Routing preferences` from `stellar.yaml` defaults; if the use
 ## Jev recipe (cheap — every call is paid)
 
 1. Plan time: **one** `jev_classify` over all phases, size and risk as separate items. Catalog: `trivial`, `standard`, `complex_cross_cutting`, `read_only`, `reversible`, `destructive`, `manual_review`.
-2. Per phase: **one** `jev_decide`. Candidates = agent + model + effort combos (≤4, e.g. `codex gpt-6.1-sol high`, `agy flash-medium`) — the tier and default effort come from step 1 — plus Jev's built-in `ask_user` / `investigate`. Evidence = classify result + ledger snapshot + track record from the board. Priorities = routing preferences. Requirements (max 3): "keeps Claude above its reserve floor", "agent not inside a reset window", "agent supports the tier".
-3. Re-decide only on failover or a ledger change. Reviewers are assigned by the rule above, not by Jev.
-4. Ledger empty for all candidates → skip Jev, use the static Claude-sparing order.
+2. Per phase: **one** `jev_decide`. Candidates = agent + model + effort combos (≤4, e.g. `codex gpt-6.1-sol high`, `agy flash-medium`) — the tier and default effort come from step 1 — plus Jev's built-in `ask_user` / `investigate`. Evidence = classify result + `usage.json` snapshot + track record from the board. Priorities = routing preferences. Requirements (max 3): "keeps Claude above its reserve floor", "agent not inside a reset window", "agent supports the tier".
+3. Re-decide only on failover or a usage change. Reviewers are assigned by the rule above, not by Jev.
+4. `usage.json` empty or n/a for all candidates → skip Jev, use the static Claude-sparing order.
 5. Re-route after a failed round only after the SKILL.md "diagnose the miss" step: brief/verification gaps are fixed in the brief at the same tier. Low confidence between two adjacent tiers: take the **lower** tier when the job is read-only or scripted (browser QA, grading, exploration) — verification catches misses cheaply; go one tier up only for build work on data-loss/security paths. `escaped` → stronger model on a non-Claude agent first, then Claude, and say so. Never re-phrase and re-call.
 
 ## Failover

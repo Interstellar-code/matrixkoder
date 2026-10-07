@@ -1,0 +1,14 @@
+{
+  "name": "matrixkoder",
+  "owner": {
+    "name": "Interstellar-code"
+  },
+  "plugins": [
+    {
+      "name": "matrixkoder",
+      "source": "./",
+      "description": "Multi-agent orchestration (herdr lanes, CodexBar usage, dashboard) for Claude Code."
+    }
+  ],
+  "description": "MatrixKoder multi-agent orchestration plugin"
+}
