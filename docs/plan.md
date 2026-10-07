@@ -1,0 +1,210 @@
+# MatrixKoder — plan (v2, 2026-10-07)
+
+Rebuild of the `stellar-orchestrator` skill (`~/.claude/skills/stellar-orchestrator/`) as a Claude Code
+plugin named **MatrixKoder**: skill + scripts + agents + a mod (right-side in-session dashboard, status
+chip, toasts, guards, resume, onboarding wizard). The old name is retired.
+
+## 1. Decisions made
+
+| # | Decision | By |
+|---|---|---|
+| D1 | Name: MatrixKoder (skill + plugin). Slash command `/mk` | user |
+| D2 | Dashboard lives inside the Claude Code session, docked right (mod Pane), not a herdr/terminal pane | user |
+| D3 | Usage library: **CodexBar CLI** (one source for all agents) — chosen over OpenUsage, ClaudeBar, codeburn, agentsview | user + probe |
+| D4 | Develop locally in hermes-switchui first; dedicated repo `Interstellar-code/matrixkoder` later | user |
+| D5 | Project data in repo root `.matrixkoder/`, gitignored (for hermes-switchui) | user |
+| D6 | Wizard offers both install mode (local dev folder / marketplace) and data location (repo / home) | user |
+| D7 | Run state = `run.json` snapshot + `events.jsonl` history + per-task folders with per-round Markdown | user |
+| D8 | Worktree agents read only their brief; brief points read-only at the task's history folder | user |
+| D9 | Dashboard phase 1 read-only; buttons later | agreed |
+
+## 2. Where things live
+
+### 2a. During development (now)
+
+```
+hermes-switchui/
+├─ .gitignore                      + "/matrixkoder/" and "/.matrixkoder/"
+├─ matrixkoder/                    ← plugin SOURCE, its own nested git repo (git init inside)
+│                                    parent repo ignores it; later: gh repo create + push as-is
+└─ .matrixkoder/                   ← project DATA for hermes-switchui runs
+```
+
+Load while developing: `claude --plugin-dir ~/Development/hermes-switchui/matrixkoder`
+(or `CLAUDE_CODE_PLUGIN_DIRS`). Plugin-dir folders hot-reload in an interactive session.
+
+### 2b. After publishing
+
+`/plugin install matrixkoder --marketplace Interstellar-code/matrixkoder` — repo carries
+`.claude-plugin/marketplace.json`. Wizard step 1 detects which mode is active.
+
+### 2c. Global (always)
+
+```
+~/.matrixkoder/
+├─ config.json        plugin prefs from the wizard (pane auto-open, chip, toasts, poll intervals)
+├─ usage.json         normalised quota ledger, all agents (one per user, not per project)
+├─ projects.json      { "<repo path>": { "data_dir": "...", "onboarded_at": "..." } }
+└─ locks/             cross-session locks (exclusive create + expires_at)
+```
+
+## 3. Plugin source structure
+
+```
+matrixkoder/
+├─ .claude-plugin/
+│  ├─ plugin.json                  name, version, description, "types", userConfig
+│  └─ marketplace.json             one-plugin marketplace (for publishing)
+├─ skills/matrixkoder/
+│  ├─ SKILL.md                     the loop, stages 0–12 (from stellar SKILL.md)
+│  ├─ reference/
+│  │  ├─ loop.md                   stage details, context budget, QA
+│  │  ├─ pool-and-usage.md         agents, tiers, effort, CodexBar ledger, Jev recipe, failover
+│  │  ├─ safety.md                 autonomy contract, pause list, locks, git/dev-server bans
+│  │  ├─ onboarding.md             wizard steps (chat fallback when not fullscreen)
+│  │  └─ lessons.md                26 lessons carried over + new ones
+│  └─ templates/
+│     ├─ brief.md  review.md
+│     └─ matrixkoder.yaml          project settings template (was stellar.yaml)
+├─ agents/                         effort-low|medium|high|max.md (moved from ~/.claude/agents)
+├─ hooks/
+│  ├─ hooks.json                   { "modules": ["./register.tsx"] }
+│  ├─ register.tsx                 wires the modules below
+│  ├─ dashboard.tsx                Pane: header, plan/waves, lanes, usage, waiting, recent
+│  ├─ wizard.tsx                   onboarding steps in the pane
+│  ├─ status.ts                    status-line chip + toasts on state transitions
+│  ├─ resume.ts                    prompt.compose section: active run, next action, waiting
+│  ├─ guards.ts                    tool.call deny list (git undo cmds, force-push, banned cmds)
+│  ├─ tools.ts                     mk_state tool for the model
+│  └─ *.test.ts                    claude plugin test
+├─ types/index.d.ts                $.state contract (pane open, selected run, wizard step)
+├─ scripts/
+│  ├─ mk-state.py                  ONLY writer of run state (init/task/set/event/lock/render/archive)
+│  ├─ mk-usage.py                  codexbar → ~/.matrixkoder/usage.json (normalise, expire resets)
+│  ├─ lane-health.py               OK|STALL|QUOTA|PROVIDER|BLOCKED|DEV_SERVER|ERROR (fixed)
+│  ├─ lane-watch.py                watch → writes task state via mk-state (fixed)
+│  └─ selftest.sh                  runs every script's --self-test
+└─ README.md
+```
+
+Skill-in-plugin and agents-in-plugin follow the standard Claude Code plugin layout; the mod docs only cover
+the hooks module, so P0 confirms all three load from one plugin.
+
+## 4. Project data structure (`<repo>/.matrixkoder/`)
+
+```
+.matrixkoder/
+├─ matrixkoder.yaml                gates, baselines, banned cmds, agents, routing, autonomy, QA
+├─ plans/<feature>.md              human plan (phases, waves, ownership matrix, contract)
+└─ runs/
+   ├─ index.json                   [{ id, feature, status: active|done|archived, started, ended }]
+   └─ <run-id>/
+      ├─ run.json                  snapshot (atomic tmp+rename) — dashboard reads only this
+      ├─ events.jsonl              append-only: transitions, decisions, verdicts, quota events
+      ├─ board.md                  generated by `mk-state render` (human / resume reading)
+      └─ tasks/<TASK>/
+         ├─ task.json              status, wave, deps, lane, owned files, agent·model·effort,
+         │                         gates, rounds[{n, kind, cause, verdict, sha}]
+         ├─ brief-r1.md   report-r1.md   review-r1.md
+         └─ brief-r2-fix.md   report-r2.md   review-r2.md
+```
+
+- Task status: `planned → routed → dispatched → building → verifying → review → fix → merged → qa → done`,
+  side states `blocked | quota | stalled | provider`.
+- New project = new run folder + `index.json` line. Archive = status flag; folder never moves.
+- Briefs copied into a worktree are copies; the canonical file stays in the task folder.
+- Event line: `{"t":"2026-10-07T18:31","task":"FIX6","from":"building","to":"stalled","by":"lane-watch","evidence":"no change 11m"}`
+
+## 5. Usage tracking (CodexBar) — verified 2026-10-07
+
+Installed: CodexBar CLI v0.73.0 (sha256 checked) at `~/.local/share/codexbar/`, symlink
+`~/.local/bin/codexbar`. Config: `~/.config/codexbar/config.json`. Enabled: codex, claude, antigravity.
+
+Command: `codexbar usage --format json --provider <p>` → array of
+`{ source, usage: { primary, secondary, extraRateWindows: [{ id, title, window }] }, error }`,
+each window `{ usedPercent, windowMinutes, resetsAt (ISO UTC), resetDescription }`.
+
+| Provider | Result | Notes |
+|---|---|---|
+| claude | 5h 10% · week 37% · Fable-only week 12% | source `claude` (OAuth) |
+| antigravity | 5h (Gemini) 10% · week pool A 51.9% · week pool B **100%** (resets 2026-10-13) | source `cli`; **primary is weekly here** |
+| codex | error `chatgpt authentication required to read rate limits` | API-key provider → show "n/a (API key)" |
+| zai (OpenCode plan) | not probed | needs the z.ai API key → wizard step, user enters it (secret) |
+
+Normaliser rules (`mk-usage.py`):
+- Classify by `windowMinutes` (300 = 5h, 10080 = week), never by primary/secondary position.
+- Keep every window with `id`/`title` (AGY has two weekly pools; Claude has a Fable-only week).
+- Agent-level "available" = no window at 100% that blocks the model in use; a window past `resetsAt` counts as reset (gap 5).
+- `error.kind == provider` → `status: n/a` with message, never guessed numbers.
+- Poll every 5 min in the background (probes take several seconds each); mod reads only `usage.json`.
+- Pane-text QUOTA detection stays as a fallback that writes the same ledger (gaps 2, 4 fixed there).
+- Claude cross-check: mod `session.measure` → compare with CodexBar; flag drift, never overwrite.
+
+## 6. Mod (in-session)
+
+| Piece | Behaviour |
+|---|---|
+| Pane `/mk` | Toggle. Auto-opens at session start only when fullscreen layout + ≥144 cols (engine rule); else inline on command |
+| Sections | Header (run, branch, stage, next action) · Plan (waves, task rows) · Lanes · Usage bars (5h / week / reset) · Waiting on you · Recent (last events) |
+| Status chip | `✦ mk 1 building · 1 review · ⚠ 1 waiting · agy ⛔ wk 10-13` |
+| Toasts | DONE, QUOTA, STALL, BLOCKED, PROVIDER, waiting-on-user |
+| Resume | `prompt.compose` adds active run + next action + waiting item → survives compaction |
+| Guards | `tool.call` Bash deny: `git checkout/stash/reset/clean/restore`, `--amend`, force-push, `banned_commands` from yaml |
+| `mk_state` tool | model updates state without shell calls |
+| Wake (spike) | lane DONE → `$.command.run({command:"matrixkoder:tick"})` queues a turn when idle; if it works, background `lane-watch` + `/loop` retire |
+
+Mockup: see conversation 2026-10-07 (46-col right pane); becomes `matrixkoder/docs/mockup.txt` in P4.
+
+## 7. Onboarding wizard (first `/mk` in a repo)
+
+Runs as pane steps; falls back to chat questions when not fullscreen. Every step pre-filled, one confirm at the end.
+
+1. Install mode detected (dev `--plugin-dir` / marketplace) — info only
+2. Data location: `<repo>/.matrixkoder/` (+ add to `.gitignore`) or `~/.matrixkoder/projects/<slug>/`
+3. Agents: detect claude / codex / opencode / agy / herdr + model lists; tick to enable
+4. Usage: codexbar present? (show install cmd if not) → enable providers → live probe per agent; z.ai key entry
+5. Gates: detect test / typecheck / lint / format; measure baselines
+6. Routing: builder order, reserve floors, max lanes, effort by size
+7. Autonomy: pre-authorised list, builder permission-skip flags
+8. QA: dev URL, themes, mockups dir
+9. Dashboard prefs: auto-open, chip, toasts, poll intervals
+10. Review → write `matrixkoder.yaml`, `~/.matrixkoder/config.json`, `projects.json`
+
+Bootstrap of the old skill (read-only checks) becomes steps 3–8's detection.
+
+## 8. Known gaps from the stellar review → where fixed
+
+| Gap | Fix | Phase |
+|---|---|---|
+| 1 Claude usage never recorded | CodexBar claude provider (+ mod cross-check) | P2 |
+| 2 quota stored under pane id | ledger keyed by agent kind; lane-health `--kind` | P1/P2 |
+| 3 idle-without-commit waits 30 min | STALL on idle + no matching commit + no change N min; match `<PHASE> BLOCKED:` | P1 |
+| 4 quota regex misfires (scrollback, 429, weekly as 5h) | scan only text since dispatch; drop bare `rate limit`; window from codexbar | P2 |
+| 5 exhausted quota never clears | `resetsAt` passed → available | P2 |
+| 6 locks only on paper | `mk-state lock take/release/check` + `~/.matrixkoder/locks/` | P1 |
+| 7 DONE token never checked | lane-watch matches `<PHASE> DONE` in pane | P1 |
+| 8 stray `__pycache__` | not carried over | P3 |
+
+## 9. Phases
+
+| # | Phase | Exit criteria |
+|---|---|---|
+| P0 | Spikes: (a) pane docks right in fullscreen; (b) skill + agents + hooks load from one plugin via `--plugin-dir`; (c) `$.command.run` starts an orchestrator turn when idle; (d) mod `$.fs`/`$.process` can read `.matrixkoder/` and run `codexbar`; (e) z.ai via codexbar with key | each answered yes/no in this file |
+| P1 | State core: `mk-state.py` (schema, run/task/event/lock/render/archive), lane-health + lane-watch fixes | `--self-test` passes; dry run creates a run, 2 tasks, events, board.md |
+| P2 | Usage: `mk-usage.py` normaliser + background poll | `usage.json` live for claude + agy; codex n/a; zai if key given |
+| P3 | Scaffold `matrixkoder/` (nested git), port skill/refs/templates/agents with renames, `.gitignore` entries | `claude plugin validate` clean; skill triggers on "orchestrate" |
+| P4 | Mod read-only: pane, chip, toasts, resume section | `claude plugin test`; visual check in fullscreen vs mockup |
+| P5 | Wizard | fresh repo onboarding writes all three files |
+| P6 | Guards, `mk_state` tool, wake (if P0c yes) | tests: denied commands, state writes, wake turn |
+| P7 | Pane buttons (approve waiting item, re-arm watcher, open review) | tests |
+| P8 | Publish: `gh repo create Interstellar-code/matrixkoder`, push nested repo, marketplace install test | install works in a clean session — user go required |
+
+Build lanes: P1 + P2 parallel (separate files); P3 after; P4–P7 sequential (same hooks module).
+Commits only on user go; nothing pushed before P8.
+
+## 10. Open questions
+
+- Q1: Fullscreen layout toggle — how the user switches Claude Code into it (affects pane docking).
+- Q2: z.ai API key — user enters it into CodexBar config (secret; never via Jev or briefs).
+- Q3: Codex — keep API-key provider (usage n/a) or sign in with ChatGPT for windows?
+- Q4: Migrate the finished `wfv2-f678` board into the new format, or start fresh?

@@ -1,0 +1,30 @@
+# Lessons (Workflows v2 run, hermes-switchui, Oct 2026) → rules
+
+| # | What happened | Rule |
+|---|---|---|
+| 1 | AGY Gemini Flash LOW looped on background tasks after compaction, stalled twice | No low-effort models for multi-file phases; STALL detector |
+| 2 | AGY hit a Claude quota (6-day reset) and OpenCode a 5-hour limit mid-phase; work left uncommitted | Quota ledger + QUOTA detector + TAKEOVER section + failover |
+| 3 | An agent ran the dev server, its sidecar failed, the agent stopped | Briefs ban dev servers/sidecars; orchestrator owns servers |
+| 4 | Background watchers hit ~10 min tool timeouts and gave up silently | `lane-watch.py` always prints an exit reason; re-arm on `WATCH_EXPIRED` |
+| 5 | `herdr-ask` refuses busy agents, so the next brief was never sent | `--then-send`: send only after commit landed and agent idle |
+| 6 | Tests green while UIs showed invented values and Matrix-only colours; mocked fetch hid a missing route | Independent review + QA invented-data, theme and route checks |
+| 7 | An agent report overstated what was fixed | Own gate reruns + `jev_gate` with real output |
+| 8 | A deploy restart exposed an unrelated config drift (gateway port) | Health diff before/after every restart |
+| 9 | Another session sent FREEZE by chat; no expiry, UNFREEZE came late | Lock files with expiry; chat freeze treated as a lock |
+| 10 | Two lanes needed the same shared files (canvas, layout) | File-ownership matrix; hot files sequenced into waves |
+| 11 | `.omc/` is gitignored, so briefs/reviews had to be copied between worktrees | Main repo is canonical; copy briefs in, reports out |
+| 12 | Claude limits were needed for other work | Claude-sparing routing with reserve floors |
+| 13 | Approval dialogs blocked builder panes | Contract decides launch flags per repo; otherwise a pause item |
+| 14 | Claude fix rounds ran as Agent-tool subagents: invisible to the user, no effort control, lost on compaction | Claude builds run in a herdr pane in the worktree with `--model --effort`; subagents only for read-only jobs. Cost: a subagent's report lands in the orchestrator context and is re-billed every later turn, and each new fix round re-reads the same files (FIX4 builders: 165–190K tokens each); a live pane keeps its files in its own (cached) context, the orchestrator reads only the report file. Refresh the pane with a takeover brief after 3–4 rounds or near compaction. |
+| 15 | Builder reports claimed items fixed that weren't, backed by mock-only tests | Briefs require real route/interaction tests; reviewer checks the tests fail on the old code |
+| 16 | FIX4-B regressed the Back guard: the brief prescribed `history.go(1)` and never described TanStack's own popstate blocker; the response was a bigger model | Diagnose the miss first (brief gap / verification gap / scope / capability); fix the brief before raising tier or effort |
+| 17 | Browser QA ran on opus · high because "low confidence → one tier up" ignored that QA is scripted and read-only | Low confidence on read-only/scripted work takes the lower tier; typical-routes table in pool-and-quota |
+| 18 | lane-watch reported STALL on a lane 1 min after dispatch: idle time was measured from the base commit | lane-health takes `--since` (watch start) as activity; lane-watch passes it |
+| 19 | FIX6 dispatched to OpenCode with `opencode-go/glm-5.3`: that provider needs a separate subscription; herdr said `working` while every request failed, and the lane sat idle ~25 min | Launch with the model id of the plan the user pays for; confirm dispatch by pane activity; lane-health flags `PROVIDER` errors |
+| 20 | Codex config model `gpt-6.1-sol` was rejected by the user's provider; `gpt-6-astra` then returned 'service unavailable' | Probe each agent with its configured model at bootstrap; record failures in the ledger; `PROVIDER` → failover |
+| 21 | 9-min watch windows cost a re-arm turn every few minutes | Background watchers default to 30 min |
+| 22 | OpenCode's oh-my-opencode 'Ultraworker' mode spun on its own background tasks for 10+ min with work uncommitted; it had skipped the required tests and one item | On STALL: check the lane's diff and run the gates yourself, then interrupt (Esc) and send a short 'finish' prompt listing exactly what is missing; tell OpenCode briefs to work in the foreground (no background tasks/subagents) |
+| 23 | D3 gateway restart via `launchctl kickstart -k`: the old gateway drained for 60 s, both respawns failed with "already running", launchd stopped retrying → :8642 down ~1 min, and 1 in-flight api_server run was interrupted by the drain timeout | Restart with `hermes gateway restart` (or wait for the old PID to exit before kickstart); check for in-flight runs first; verify port + /health after, and kickstart again if the service shows no PID |
+| 24 | X1 design pass (AGY pro-high, 37-line report) flagged by-design choices as HIGH (Describe as a SOURCE kind per plan) and called off-screen table columns "missing" | Triage QA findings against the plan and earlier measured QA before briefing a fix round; write the triage into the fix brief so the builder does not chase non-defects |
+| 25 | The skill listed helpers (codebase-memory, canary, visual-verdict, claude-mem) but never called them in a real run; codebase-memory's only index pointed at an old /Volumes path (wrong line numbers); claude-mem smart_outline can't parse TS | Preflight probes each helper and records ok/stale/missing; each stage names the helper call it makes |
+| 26 | claude-mem removed (user, 2026-10-07): background Sonnet summarisation cost Claude quota, ~13 KB context per session, 2.9 GB disk, smart_outline can't parse TS; its one unique feature (cross-session search) was never needed | Use run boards, .omc/ files, Claude Code memory and context-mode instead |

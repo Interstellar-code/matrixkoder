@@ -1,0 +1,48 @@
+# .omc/stellar.yaml — written by stellar-orchestrator bootstrap after the user approves.
+# Re-checked for drift on every run; the user's explicit statements override any value.
+repo:
+  integration_branch: main            # lanes merge here; one PR to main at the end
+  worktree_pattern: ../{repo}-worktree-{x}
+  conventions: []                     # from CLAUDE.md / AGENTS.md, e.g. "never run pnpm check repo-wide"
+gates:
+  install: ""                         # e.g. pnpm install --frozen-lockfile --prefer-offline
+  test: ""                            # scoped form, e.g. pnpm vitest run {paths}
+  typecheck: ""                       # e.g. pnpm exec tsc --noEmit
+  lint_changed: ""                    # e.g. pnpm exec eslint {files}
+  format_changed: ""                  # e.g. pnpm exec prettier --write {files}
+baselines:                            # measured at bootstrap, refreshed each run
+  type_errors: null
+  lint_errors: null
+  known_failing_tests: []
+banned_commands: []                   # dev servers, sidecar boots, deploys, repo-wide formatters
+qa:
+  frontend: false
+  start: ""                           # orchestrator only
+  integration_target: local-main      # local-main = merge reviewed lanes into local main (no push) and QA on the user's running dev server; branch = QA a separate build
+  dev_url: ""                         # e.g. https://localhost:3000 (always running)
+  port: null
+  themes: []
+  mockups: ""                         # e.g. .omc/designs/
+agents:                               # installed + logged in, verified at bootstrap
+  codex: { available: null, models: [] }
+  opencode: { available: null, models: [] }
+  agy: { available: null, models: [] }
+  claude: { available: true }
+  checked_at: null
+routing_preferences:
+  policy: claude-sparing              # Claude Code orchestrates; builders below
+  builder_order: [codex, opencode, agy, claude]
+  effort_by_size: { trivial: low, standard: medium, complex: high, final_review: max }   # Jev may shift one step
+  reserve_floor:
+    claude: { five_hour_left_pct: 40, weekly_left_pct: 30 }
+    others: { five_hour_left_pct: 10, weekly_left_pct: 15 }
+  max_build_lanes: 3
+  reviewers: [codex, agy-pro, claude-opus-if-jev]
+autonomy_contract:
+  pause_only_for: [destructive-not-preauthorised, all-agents-below-floor, uncovered-scope-decision, secrets-or-user-config, lock-over-30min, fix-loop-exhausted, blocked-approval-dialog, jev-screen-block]
+  preauthorised: [routing, failover, fix-loops, worktrees, lane-merges, push-non-main, open-pr]
+  builder_skip_permissions: true      # builders only, in their own worktree; never orchestrator/reviewers/runtime lanes
+deploy:
+  readme: .omc/deploys/README.md      # repo-specific checklist; always user-gated
+locks:
+  dirs: [~/.hermes/locks, ~/.claude/locks]
