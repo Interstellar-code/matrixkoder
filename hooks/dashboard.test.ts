@@ -51,7 +51,7 @@ test('first-run state when no .matrixkoder dir exists', async ($, on) => {
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   expect(await ui.find({ text: /Welcome to MatrixKoder/ })).toBeTruthy()
   expect(await ui.find({ text: /mk setup/ })).toBeTruthy()
-  expect(await ui.find({ text: /wizard \(coming in P5\)/ })).toBeTruthy()
+  expect(await ui.find({ text: /launch the wizard/ })).toBeTruthy()
   expect(await ui.find({ text: 'Plan' })).toBeUndefined()
 })
 
@@ -263,12 +263,10 @@ test('/mk args: open, close, setup, init and unknown', { plugins: [worldFixtures
   expect((await run('')).text).toBe('MatrixKoder pane closed.')
   expect((await run('')).text).toBe('MatrixKoder pane opened.')
   const setup = await run('setup')
-  expect(setup.text).toContain('coming in P5')
+  expect(setup.text).toContain('setup opened') // wizard.tsx answers (wizard.test.ts covers the pane)
   const init = await run('init wfv2')
-  expect(init.text).toContain('coming in P5')
+  expect(init.text).toContain('setup opened')
   expect((await run('bogus')).text).toContain('Usage:')
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  expect(await ui.find({ text: /Welcome to MatrixKoder/ })).toBeTruthy() // setupHint forced the first-run panel
 })
 
 test('the chip is not re-sent when unchanged', { plugins: [worldFixtures] }, async ($, on) => {

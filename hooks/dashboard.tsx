@@ -87,14 +87,11 @@ export function registerDashboard(on: On, options: PluginOptions): void {
     return next(e)
   })
 
-  on('command.run', { command: 'mk' }, async ($, e) => {
+  on('command.run', { command: 'mk' }, async ($, e, next) => {
     const args = e.args.trim().split(/\s+/)[0]?.toLowerCase() ?? ''
     if (args === 'setup' || args === 'init') {
-      // never a toggle-close: open and show the first-run panel whatever the state
-      await openPane($)
-      const prev = await read($, snapshotAtom)
-      await update($, snapshotAtom, () => ({ ...prev, setupHint: true }))
-      return { text: args === 'setup' ? 'Setup wizard coming in P5 — showing the setup panel.' : 'Run init arrives with the wizard coming in P5 — showing the setup panel.' }
+      // wizard.tsx's command.run hook (registered after this one) answers: $ cannot cross an import
+      return next(e)
     }
     if (args === 'open') {
       await openPane($)
@@ -359,7 +356,7 @@ function FirstRun(els: Elements) {
       <Text color="cyan" bold={true}>⬡ Welcome to MatrixKoder!</Text>
       <Text>Configuration required for this project:</Text>
       <Text color="yellow" bold={true}>[!] Missing .matrixkoder/matrixkoder.yaml</Text>
-      <Text color="cyan" bold={true}>▶ Run /mk setup to launch the wizard (coming in P5)</Text>
+      <Text color="cyan" bold={true}>▶ Run /mk setup to launch the wizard</Text>
     </Box>
   )
 }
