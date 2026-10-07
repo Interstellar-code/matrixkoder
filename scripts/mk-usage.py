@@ -218,7 +218,9 @@ def normalize_provider_entry(provider, raw_result_or_json, existing_entry=None, 
         raw_error = "invalid input"
 
     # Check existing entry for lane-health exhausted_* fields
-    prev_until = existing_entry.get("exhausted_until")
+    # only lane-health's pane-text evidence is kept; an exhausted_until this script wrote
+    # itself is recomputed from codexbar every poll
+    prev_until = existing_entry.get("exhausted_until") if existing_entry.get("exhausted_source") == "pane-text" else None
     prev_dt = parse_iso(prev_until) if prev_until else None
     prev_future = bool(prev_dt is not None and prev_dt > now)
 
@@ -498,6 +500,15 @@ def self_test():
     assert agy_norm["pools"]["claude-gpt"]["exhausted_until"] == "2026-10-13T06:00:45Z"
     assert agy_norm["pools"]["gemini"]["exhausted_until"] is None
     assert agy_norm["available_pools"] == ["gemini"]
+
+    # A stale exhausted_until this script wrote itself (no pane-text source) is recomputed, not kept
+    stale = {"status": "ok", "source": "codexbar", "exhausted_until": "2026-10-13T06:00:45Z"}
+    agy_stale = normalize_provider_entry("antigravity", agy_raw, existing_entry=stale, now=ref_now_future)
+    assert agy_stale["exhausted_until"] is None
+    # ...while lane-health's pane-text evidence is kept
+    pane = {"exhausted_until": "2026-10-13T06:00:45Z", "exhausted_source": "pane-text"}
+    agy_pane = normalize_provider_entry("antigravity", agy_raw, existing_entry=pane, now=ref_now_future)
+    assert agy_pane["exhausted_until"] == "2026-10-13T06:00:45Z"
     assert agy_norm["exhausted_until"] is None
     assert agy_norm["weekly"] == {"used_pct": 51.9, "resets_at": "2026-10-11T12:32:16Z"}
     assert agy_norm["five_hour"]["used_pct"] == 10.5

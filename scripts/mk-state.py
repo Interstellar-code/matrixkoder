@@ -54,16 +54,30 @@ def home():
 
 
 def resolve_data(arg):
+    """--data > $MATRIXKODER_DATA > <home>/projects.json entry for the repo > <main checkout>/.matrixkoder.
+    The repo is the nearest .git above cwd (never $HOME itself); a linked worktree maps to its main checkout."""
     if arg:
         return os.path.abspath(os.path.expanduser(arg))
     if os.environ.get("MATRIXKODER_DATA"):
         return os.path.abspath(os.path.expanduser(os.environ["MATRIXKODER_DATA"]))
-    d = os.getcwd()
+    d, stop = os.path.realpath(os.getcwd()), os.path.realpath(os.path.expanduser("~"))
     while not os.path.exists(os.path.join(d, ".git")):  # nearest repo wins; nested repos must pass --data
-        if os.path.dirname(d) == d:
-            raise Fail("no git toplevel above cwd; pass --data or set MATRIXKODER_DATA")
+        if os.path.dirname(d) == d or d == stop:
+            raise Fail("no git toplevel above cwd (the walk stops before $HOME); pass --data or set MATRIXKODER_DATA")
         d = os.path.dirname(d)
-    return os.path.join(main_worktree(d), ".matrixkoder")
+    if d == stop:
+        raise Fail("cwd is $HOME's own repo, not a project; pass --data or set MATRIXKODER_DATA")
+    top = main_worktree(d)
+    try:  # the wizard's home mode: ~/.matrixkoder/projects.json {"<repo>": {"data_dir": ...}}
+        with open(os.path.join(home(), "projects.json")) as f:
+            projects = json.load(f)
+        entry = projects.get(top) or projects.get(os.path.realpath(top))
+        listed = entry.get("data_dir") if isinstance(entry, dict) else None
+    except (OSError, ValueError, AttributeError):
+        listed = None
+    if isinstance(listed, str) and listed.strip():
+        return os.path.normpath(os.path.join(top, os.path.expanduser(listed.strip())))
+    return os.path.join(top, ".matrixkoder")
 
 
 def main_worktree(top):
@@ -713,6 +727,35 @@ def self_test():
         mk("run", "init", "--id", "w1", "--feature", "F", "--branch", "b", data_arg=False, cwd=lane)
         assert os.path.exists(os.path.join(repo, ".matrixkoder", "runs", "w1", "run.json"))
         assert not os.path.exists(os.path.join(lane, ".matrixkoder"))
+
+        # home mode: ~/.matrixkoder/projects.json names the repo's data dir; env still beats it
+        repo2 = os.path.join(tmp, "repo2")
+        os.makedirs(os.path.join(repo2, ".git"))
+        os.makedirs(os.path.join(repo2, "sub"))
+        homedata = os.path.join(tmp, "homedata")
+        os.makedirs(os.path.join(tmp, "home"), exist_ok=True)
+        with open(os.path.join(tmp, "home", "projects.json"), "w") as f:
+            json.dump({os.path.realpath(repo2): {"data_dir": homedata, "onboarded_at": "x"}}, f)
+        mk("run", "init", "--id", "h1", "--feature", "F", "--branch", "b", data_arg=False, cwd=os.path.join(repo2, "sub"))
+        assert os.path.exists(os.path.join(homedata, "runs", "h1", "run.json"))
+        assert not os.path.exists(os.path.join(repo2, ".matrixkoder"))
+        mk("run", "init", "--id", "h2", "--feature", "F", "--branch", "b", data_arg=False, e=envd, cwd=repo2)
+        assert os.path.exists(os.path.join(tmp, "envdata", "runs", "h2", "run.json"))  # env beats projects.json
+        wt2 = os.path.join(repo2, ".git", "worktrees", "lane")
+        os.makedirs(wt2)
+        open(os.path.join(wt2, "commondir"), "w").write("../..\n")
+        lane2 = os.path.join(tmp, "repo2-lane")
+        os.makedirs(lane2)
+        open(os.path.join(lane2, ".git"), "w").write(f"gitdir: {wt2}\n")
+        mk("run", "init", "--id", "h3", "--feature", "F", "--branch", "b", data_arg=False, cwd=lane2)  # keyed by the MAIN checkout
+        assert os.path.exists(os.path.join(homedata, "runs", "h3", "run.json"))
+        # a dotfiles repo at $HOME is never project data
+        fake_home = os.path.join(tmp, "fakehome")
+        os.makedirs(os.path.join(fake_home, ".git"))
+        os.makedirs(os.path.join(fake_home, "proj"))
+        out = subprocess.run([sys.executable, os.path.abspath(__file__), "run", "list"], cwd=os.path.join(fake_home, "proj"),
+                             env=dict(env, HOME=fake_home), capture_output=True, text=True)
+        assert out.returncode != 0 and "$HOME" in (out.stdout + out.stderr), out
 
         # global --data/--by/--run also parse before the subcommand (after: every mk above)
         mk("--data", data, "run", "init", "--id", "f1", "--feature", "F", "--branch", "b", data_arg=False)

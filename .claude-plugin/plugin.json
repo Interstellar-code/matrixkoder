@@ -4,5 +4,14 @@
   "description": "Orchestrate multi-phase builds across Claude Code, Codex, OpenCode and AGY in herdr worktree lanes, with usage-aware routing, durable run state and an in-session dashboard.",
   "author": {
     "name": "Interstellar-code"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "guards": { "title": "Guards", "type": "boolean", "default": true, "description": "Deny destructive git and project-banned commands" },
+    "autoOpen": { "title": "Auto-open pane", "type": "boolean", "default": true, "description": "Open the dashboard pane when a session starts" },
+    "chip": { "title": "Status chip", "type": "boolean", "default": true, "description": "Pin the run health chip under the prompt" },
+    "toasts": { "title": "Toasts", "type": "boolean", "default": true, "description": "Toast on task status transitions" },
+    "usagePollMin": { "title": "Usage poll (min)", "type": "number", "default": 5, "description": "Minutes between mk-usage.py runs" },
+    "wake": { "title": "Wake on events", "type": "boolean", "default": false, "description": "Submit prompt when lanes encounter verifying, blocked, quota, stalled or provider" }
   }
 }

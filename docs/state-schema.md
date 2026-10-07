@@ -8,8 +8,8 @@ allowed, renaming or removing one needs `schema` bumped.
 
 | What | Path |
 |---|---|
-| Project data dir | `--data DIR` → `$MATRIXKODER_DATA` → `<toplevel>/.matrixkoder`, toplevel = the nearest `.git` above cwd; a linked worktree (`.git` file with `commondir`) resolves to its **main checkout**, a nested repo to itself (pass `--data` to reach the outer repo) |
-| Global dir | `$MATRIXKODER_HOME` → `~/.matrixkoder` |
+| Project data dir | `--data DIR` → `$MATRIXKODER_DATA` → the repo's entry in `<global>/projects.json` (`{ "<repo path>": { "data_dir": "..." } }`, written by the onboarding wizard's "home" mode; keyed by the **main checkout** path; `~` allowed, a relative path is resolved against the repo) → `<toplevel>/.matrixkoder`. toplevel = the nearest `.git` above cwd, never `$HOME` itself (a dotfiles repo is not a project); a linked worktree (`.git` file with `commondir`) resolves to its **main checkout**, a nested repo to itself (pass `--data` to reach the outer repo). One order in `scripts/mk-state.py`, `hooks/dashboard.tsx` and `hooks/wake.ts`; the pure helpers are in `hooks/data.ts` (`projectDataDir`) |
+| Global dir | `$MATRIXKODER_HOME` → `~/.matrixkoder` (TS: `globalDirPath` in `hooks/data.ts`; the wizard writes `config.json` / `projects.json` here) |
 | Run index | `<data>/runs/index.json` |
 | Run snapshot | `<data>/runs/<run_id>/run.json` — written atomically (temp file + `os.replace`); **the dashboard reads only this** |
 | Event log | `<data>/runs/<run_id>/events.jsonl` — append-only (`O_APPEND`), one JSON object per line |
@@ -38,6 +38,7 @@ with offset, seconds precision (`2026-10-07T20:09:01+02:00`). Unknown values are
   "id": "mk-p1",
   "feature": "MatrixKoder P1",
   "branch": "main",
+  "head_sha": null,
   "plan": ".matrixkoder/plans/matrixkoder.md",
   "status": "active",
   "stage": 5,
@@ -67,6 +68,7 @@ with offset, seconds precision (`2026-10-07T20:09:01+02:00`). Unknown values are
 | `schema` | int | `1` |
 | `status` | `active \| done \| archived` | `ended` is set when it leaves `active`, cleared when it returns. `run set --status` takes `active\|done`; `archived` only via `run archive` |
 | `stage` | int | loop stage 0–12 (SKILL.md) |
+| `head_sha` | string \| null | optional (design §7.2): the run branch's current commit; the dashboard shows the branch only while absent |
 | `next` | string \| null | next action, shown in the dashboard header and resume section |
 | `waiting` | object \| null | the one question waiting on the user: `question`, `options` (string[]), `rec` (string \| null), `since` (ts) |
 | `tasks` | array | task objects in insertion order (below) |
