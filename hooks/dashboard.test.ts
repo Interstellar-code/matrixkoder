@@ -280,3 +280,20 @@ test('the chip is not re-sent when unchanged', { plugins: [worldFixtures] }, asy
   await clock.advance(5000)
   expect(chips.length).toBe(1)
 })
+
+test('autoOpen:false never opens the pane', { plugins: [worldFixtures], options: { autoOpen: false } }, async ($, on) => {
+  const opens: string[] = []
+  mockFs(on, worldFiles())
+  mockWorld(on, { open: id => opens.push(id) })
+  await $.session.start(sessionStart())
+  expect(opens).toEqual([])
+})
+
+test('chip:false leaves the status line untouched', { plugins: [worldFixtures], options: { chip: false } }, async ($, on) => {
+  const chips: (string | undefined)[] = []
+  mockFs(on, worldFiles())
+  const clock = mockWorld(on, { status: t => chips.push(t) })
+  await $.session.start(sessionStart())
+  await clock.advance(5000)
+  expect(chips).toEqual([])
+})

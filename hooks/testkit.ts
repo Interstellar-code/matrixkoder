@@ -184,6 +184,7 @@ export function mockWorld(
     status?: (text: string | undefined) => void
     toast?: (text: string) => void
     process?: (argv: readonly string[]) => void
+    open?: (id: string) => void
     env?: Record<string, string>
   } = {},
 ): ReturnType<ReturnType<typeof mock.clock>> {
@@ -197,7 +198,10 @@ export function mockWorld(
     opts.process?.(e.argv)
     return { value: { exitCode: 0, stdout: '', stderr: '' } }
   })
-  on('ui.open', (_$, _e) => ({ value: { isPlaced: true } }))
+  on('ui.open', (_$, e) => {
+    opts.open?.(e.id)
+    return { value: { isPlaced: true } }
+  })
   on('ui.close', (_$, _e) => ({ value: undefined }))
   on('ui.status', (_$, e) => {
     opts.status?.(e.text)
