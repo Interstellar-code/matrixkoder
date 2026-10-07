@@ -134,16 +134,16 @@ export function registerDashboard(on: On, options: PluginOptions): void {
         {snap.error && (
           <Text color="yellow" bold={true}>⚠ {snap.error}</Text>
         )}
-        {snap.setupHint || snap.dataDir === null
+        {snap.dataDir === null
           ? FirstRun($.ui.resolve(e))
           : snap.run === null
             ? NoRun($.ui.resolve(e), snap)
             : RunSection($.ui.resolve(e), snap.run, compact, extraActive)}
-        {!snap.setupHint && snap.dataDir !== null && snap.run !== null && PlanSection($.ui.resolve(e), snap.run, cols, compact, snap.now)}
-        {!snap.setupHint && snap.dataDir !== null && snap.run !== null && LanesSection($.ui.resolve(e), snap.run, cols)}
+        {snap.dataDir !== null && snap.run !== null && PlanSection($.ui.resolve(e), snap.run, cols, compact, snap.now)}
+        {snap.dataDir !== null && snap.run !== null && LanesSection($.ui.resolve(e), snap.run, cols)}
         {UsageSection($.ui.resolve(e), snap, compact)}
-        {!snap.setupHint && snap.run?.waiting && WaitingSection($.ui.resolve(e), snap.run.waiting)}
-        {!snap.setupHint && snap.run && RecentSection($.ui.resolve(e), (snap.run.recent ?? []).slice(-3).reverse(), compact)}
+        {snap.run?.waiting && WaitingSection($.ui.resolve(e), snap.run.waiting)}
+        {snap.run && RecentSection($.ui.resolve(e), (snap.run.recent ?? []).slice(-3).reverse(), compact)}
       </Box>
     )
   })
@@ -320,7 +320,7 @@ async function refreshSafe($: EngineInterface, options: PluginOptions, cwd: stri
     const snap = await loadSnapshot($, cwd)
     await applyStatus($, options, snap)
     if (contentSig(prev) !== contentSig(snap)) {
-      await update($, snapshotAtom, () => ({ ...snap, setupHint: prev.setupHint }))
+      await update($, snapshotAtom, () => snap)
     }
   } catch (err) {
     try {

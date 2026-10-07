@@ -22,6 +22,7 @@ const COLUMNS = 64
 const PROBE_MS = 5000
 const PREVIEW_LINES = 40
 const LAST_STEP = WIZARD_STEPS.length
+const toggleable: readonly string[] = AGENT_NAMES.filter(n => n !== 'claude')
 
 // atoms are file-local consts (the scan reads this file's own consts)
 const stepAtom = atom({ plugin: 'matrixkoder', key: 'wizardStep' } as const, 1)
@@ -321,12 +322,13 @@ function Body(els: Elements, $: EngineInterface, d: MkWizardDraft, step: number,
           <Text bold={true}>Agents (tick to enable)</Text>
           {AGENT_NAMES.map(n => {
             const a = d.agents[n]
+            const digit = String(toggleable.indexOf(n) + 1) // hotkey 1..4
             if (a == null || !a.found) return <Text key={n} dimColor={true}>{`[ ] ${n}  not found`}</Text>
             if (n === 'claude') return <Text key={n}>{`[x] ${n}  ${a.path ?? ''}`}</Text>
             return (
               <Box key={n} flexDirection="column">
                 <Button
-                  key={`wz-agent-${n}`} label={`${a.enabled ? '[x]' : '[ ]'} ${n}  ${a.path ?? ''}`}
+                  key={`wz-agent-${n}`} hotkey={digit} label={`${digit} ${a.enabled ? '[x]' : '[ ]'} ${n}  ${a.path ?? ''}`}
                   onPress={() => update($, draftAtom, cur => ({ ...cur, agents: { ...cur.agents, [n]: { ...a, enabled: !a.enabled } } }))}
                 />
                 {a.models.length > 0 && <Text dimColor={true}>{`    ${a.models.length} models: ${a.models.slice(0, 3).join(', ')}${a.models.length > 3 ? ', …' : ''}`}</Text>}
@@ -349,9 +351,9 @@ function Body(els: Elements, $: EngineInterface, d: MkWizardDraft, step: number,
           {d.codexbarVersion != null && (
             <Box flexDirection="column">
               <Text bold={true}>Providers (tick to track)</Text>
-              {d.providersAll.map(p => (
+              {d.providersAll.map((p, i) => (
                 <Button
-                  key={`wz-prov-${p}`} label={`${d.providersOn.includes(p) ? '[x]' : '[ ]'} ${p}`}
+                  key={`wz-prov-${p}`} {...(i < 9 ? { hotkey: String(i + 1) } : {})} label={`${i < 9 ? `${i + 1} ` : ''}${d.providersOn.includes(p) ? '[x]' : '[ ]'} ${p}`}
                   onPress={() => update($, draftAtom, cur => ({ ...cur, providersOn: cur.providersOn.includes(p) ? cur.providersOn.filter(x => x !== p) : [...cur.providersOn, p] }))}
                 />
               ))}
@@ -469,7 +471,7 @@ function Review(els: Elements, $: EngineInterface, d: MkWizardDraft) {
         {yaml.slice(0, PREVIEW_LINES).map((l, i) => <Text key={`y${i}`} dimColor={true}>{l}</Text>)}
         {yaml.length > PREVIEW_LINES && <Text dimColor={true}>{`… ${yaml.length - PREVIEW_LINES} more lines`}</Text>}
       </Box>
-      <Button key="wz-write" variant="primary" label="Write these" onPress={() => writeAll($)} />
+      <Button key="wz-write" variant="primary" hotkey="w" autoFocus={true} label="w Write these" onPress={() => writeAll($)} />
     </Box>
   )
 }
@@ -480,11 +482,11 @@ function Nav(els: Elements, $: EngineInterface, d: MkWizardDraft, step: number) 
   return (
     <Box flexDirection="row" gap={1}>
       {done
-        ? <Button key="wz-close" variant="primary" label="Close" onPress={() => closeWizard($)} />
+        ? <Button key="wz-close" variant="primary" hotkey="x" autoFocus={true} label="x Close" onPress={() => closeWizard($)} />
         : [
-          step > 1 && <Button key="wz-back" label="← Back" onPress={() => goto($, step - 1)} />,
-          step < LAST_STEP && <Button key="wz-next" variant="primary" label="Next →" onPress={() => goto($, step + 1)} />,
-          <Button key="wz-cancel" role="dismiss" label="Cancel" onPress={() => closeWizard($)} />,
+          step > 1 && <Button key="wz-back" hotkey="b" label="b ← Back" onPress={() => goto($, step - 1)} />,
+          step < LAST_STEP && <Button key="wz-next" variant="primary" hotkey="n" autoFocus={true} label="n Next →" onPress={() => goto($, step + 1)} />,
+          <Button key="wz-cancel" role="dismiss" hotkey="c" label="c Cancel" onPress={() => closeWizard($)} />,
         ]}
     </Box>
   )

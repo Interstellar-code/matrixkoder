@@ -1,5 +1,6 @@
 // Tests for MatrixKoder wake prompt.submit on lane events
 import { test, expect, mock } from 'claude-code/testing'
+import type { On } from 'claude-code'
 
 test('wake fires once for a new verifying event', { options: { wake: true } }, async ($, on) => {
   const clock = mock.clock(on)
@@ -414,4 +415,132 @@ test('wake: false registers nothing', { options: { wake: false } }, async ($, on
   await clock.advance(60000)
 
   expect(submitted.length).toBe(0)
+})
+
+// ---------- r3: data dir rule, persisted batch, submit-after-success ----------
+
+const EV = (task: string, to: string, run = 'r1') =>
+  JSON.stringify({ t: '2026-10-07T20:00:00+02:00', run, task, type: 'transition', from: 'building', to }) + '\n'
+
+type WakeWorld = { submitted: string[]; store: Map<string, unknown>; failSubmits: { n: number }; seenAtSubmit: unknown[] }
+
+/** fs from a dict (stat: dirs/files given), submit recorder, and a memory $.state for every wake key. */
+function wakeWorld(on: On, files: Record<string, string>, dirs: string[], env: Record<string, string>, cwd: string): WakeWorld {
+  const w: WakeWorld = { submitted: [], store: new Map(), failSubmits: { n: 0 }, seenAtSubmit: [] }
+  mock.env(on, env)
+  on('fs.read', (_$, e) => ({ value: files[e.path] ?? '' }))
+  on('fs.stat', (_$, e, next) => {
+    if (dirs.includes(e.path)) return { value: { kind: 'dir', size: 0, mtimeMs: 0, isLink: false } }
+    if (e.path in files) return { value: { kind: 'file', size: 0, mtimeMs: 0, isLink: false } }
+    return next(e)
+  })
+  on('prompt.submit', (_$, e) => {
+    w.seenAtSubmit.push(w.store.get('wakeEventLines:r1'))
+    if (w.failSubmits.n > 0) {
+      w.failSubmits.n--
+      throw new Error('submit refused')
+    }
+    w.submitted.push(e.text)
+    return { text: e.text }
+  })
+  const keyOf = (e: { key: string; id?: string }): string => `${e.key}:${e.id ?? ''}`
+  on('state.get', (_$, e) => ({ value: { value: w.store.get(keyOf(e)), version: 1 } }))
+  on('state.set', (_$, e) => {
+    w.store.set(keyOf(e), e.value)
+    return { value: { isSet: true, version: 1 } }
+  })
+  on('session.start', (_$, _e) => ({ cwd }))
+  on('session.cwd', (_$, _e) => ({ value: cwd }))
+  return w
+}
+
+const START = (cwd: string) => ({ cwd, surface: 'terminal' as const, isInteractive: true as const })
+
+test('a linked worktree (commondir ../..) polls the main checkout data dir', { options: { wake: true } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const files: Record<string, string> = {
+    '/tmp/wt-lane/.git': 'gitdir: /tmp/main/.git/worktrees/lane\n',
+    '/tmp/main/.git/worktrees/lane/commondir': '../..\n',
+    '/tmp/main/.matrixkoder/runs/index.json': JSON.stringify([{ id: 'r1', status: 'active' }]),
+    '/tmp/main/.matrixkoder/runs/r1/events.jsonl': '',
+  }
+  const w = wakeWorld(on, files, [], { HOME: '/home/mk' }, '/tmp/wt-lane')
+  w.store.set('wakeEventLines:r1', 0)
+  await $.session.start(START('/tmp/wt-lane'))
+  files['/tmp/main/.matrixkoder/runs/r1/events.jsonl'] = EV('F6', 'verifying')
+  await clock.advance(30000)
+  await clock.advance(60000)
+  expect(w.submitted).toEqual(['MatrixKoder: F6 → verifying. Continue the run from its Next action.'])
+})
+
+test('the data-dir walk stops before $HOME (a dotfiles repo never makes ~/.matrixkoder project data)', { options: { wake: true } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const files: Record<string, string> = {
+    '/home/mk/.matrixkoder/runs/index.json': JSON.stringify([{ id: 'r1', status: 'active' }]),
+    '/home/mk/.matrixkoder/runs/r1/events.jsonl': EV('F6', 'verifying'),
+  }
+  const w = wakeWorld(on, files, ['/home/mk/.git'], { HOME: '/home/mk' }, '/home/mk/proj')
+  w.store.set('wakeEventLines:r1', 0)
+  await $.session.start(START('/home/mk/proj'))
+  await clock.advance(30000)
+  await clock.advance(60000)
+  expect(w.submitted).toEqual([])
+})
+
+test('the batch is persisted in $.state and the seen-line count moves only after the submit', { options: { wake: true } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const files: Record<string, string> = {
+    '/data/runs/index.json': JSON.stringify([{ id: 'r1', status: 'active' }]),
+    '/data/runs/r1/events.jsonl': EV('F6', 'verifying'),
+  }
+  const w = wakeWorld(on, files, [], { MATRIXKODER_DATA: '/data' }, '/tmp')
+  w.store.set('wakeEventLines:r1', 0)
+  await $.session.start(START('/tmp'))
+  await clock.advance(30000) // poll: found, debounce armed
+  expect(w.submitted).toEqual([])
+  expect(w.store.get('wakeEventLines:r1'), 'not advanced before the submit').toBe(0)
+  expect(w.store.get('wakePending:')).toEqual({ run: 'r1', upTo: 1, items: [{ task: 'F6', to: 'verifying' }] })
+  await clock.advance(60000) // debounce fires
+  expect(w.submitted.length).toBe(1)
+  expect(w.store.get('wakeEventLines:r1')).toBe(1)
+  expect(w.store.get('wakePending:')).toMatchObject({ items: [] })
+})
+
+test('a batch persisted before a reload is still submitted (module memory lost)', { options: { wake: true } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const files: Record<string, string> = {
+    '/data/runs/index.json': JSON.stringify([{ id: 'r1', status: 'active' }]),
+    '/data/runs/r1/events.jsonl': EV('F6', 'verifying'),
+  }
+  const w = wakeWorld(on, files, [], { MATRIXKODER_DATA: '/data' }, '/tmp')
+  w.store.set('wakeEventLines:r1', 1) // the lines are already counted seen: only the persisted batch can still wake
+  w.store.set('wakePending:', { run: 'r1', upTo: 1, items: [{ task: 'F6', to: 'verifying' }] })
+  await $.session.start(START('/tmp'))
+  await clock.advance(30000)
+  await clock.advance(60000)
+  expect(w.submitted).toEqual(['MatrixKoder: F6 → verifying. Continue the run from its Next action.'])
+  expect(w.store.get('wakePending:')).toMatchObject({ items: [] })
+})
+
+test('a failed submit keeps the batch and the line count, and the next tick retries', { options: { wake: true } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const files: Record<string, string> = {
+    '/data/runs/index.json': JSON.stringify([{ id: 'r1', status: 'active' }]),
+    '/data/runs/r1/events.jsonl': EV('F6', 'verifying'),
+  }
+  const w = wakeWorld(on, files, [], { MATRIXKODER_DATA: '/data' }, '/tmp')
+  w.store.set('wakeEventLines:r1', 0)
+  w.failSubmits.n = 1
+  await $.session.start(START('/tmp'))
+  await clock.advance(30000) // poll: found
+  await clock.advance(30000)
+  await clock.advance(30000) // debounce (60 s after the find) fires: the submit is refused
+  await clock.advance(30000) // the next poll tick retries
+  await clock.advance(30000)
+  expect(w.seenAtSubmit, 'two attempts, the line count unmoved at both').toEqual([0, 0])
+  expect(w.submitted).toEqual(['MatrixKoder: F6 → verifying. Continue the run from its Next action.'])
+  expect(w.store.get('wakeEventLines:r1')).toBe(1)
+  expect(w.store.get('wakeSentAt:F6:verifying')).toBeDefined()
+  await clock.advance(300000)
+  expect(w.submitted.length, 'sent once').toBe(1)
 })

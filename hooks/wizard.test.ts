@@ -434,3 +434,44 @@ test('an inline-placed wizard pane carries the fullscreen hint', async ($, on) =
     await ui.unmount()
   }
 })
+
+// ---------- keyboard: hotkeys and initial focus (live test: Enter/Tab never reached Next) ----------
+
+test('every wizard Button has a unique hotkey drawn in its label; the primary one holds the focus', async ($, on) => {
+  world(on, repoFiles())
+  await $.session.start(sessionStart())
+  await mk($, 'setup')
+  const FIXED: Record<string, string> = { 'wz-next': 'n', 'wz-back': 'b', 'wz-cancel': 'c', 'wz-write': 'w', 'wz-close': 'x' }
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ plugin: 'matrixkoder', surface, component: 'Pane', requestId: WIZARD, props: paneProps(64) })
+    for (let step = 1; step <= 10; step++) {
+      const buttons = await ui.findAll({ type: 'Button' })
+      const seen = new Set<string>()
+      for (const b of buttons) {
+        const hotkey = b.props.hotkey
+        expect(typeof hotkey, `${surface} step ${step} ${b.key} has a hotkey`).toBe('string')
+        expect(hotkey as string).toMatch(/^[a-z0-9]$/)
+        expect(seen.has(hotkey as string), `${surface} step ${step} hotkey ${String(hotkey)} unique`).toBe(false)
+        seen.add(hotkey as string)
+        expect(b.text, `${surface} ${b.key} label shows its hotkey`).toContain(`${String(hotkey)} `)
+        if (b.key != null && FIXED[b.key] != null) expect(hotkey).toBe(FIXED[b.key])
+      }
+      const primary = buttons.find(b => b.props.autoFocus === true)
+      expect(primary?.key, `${surface} step ${step} initial focus`).toBe(step < 10 ? 'wz-next' : 'wz-write')
+      expect(buttons.filter(b => b.props.autoFocus === true).length).toBe(1)
+      if (step < 10) {
+        expect(await ui.find({ text: 'n Next →' })).toBeTruthy()
+        expect(await ui.find({ text: 'c Cancel' })).toBeTruthy()
+        if (step > 1) expect(await ui.find({ text: 'b ← Back' })).toBeTruthy()
+        await ui.press({ key: 'wz-next' })
+      }
+    }
+    expect(await ui.find({ text: 'w Write these' })).toBeTruthy()
+    await ui.press({ key: 'wz-write' })
+    const close = await ui.find({ key: 'wz-close' })
+    expect(close?.props.hotkey).toBe('x')
+    expect(close?.props.autoFocus).toBe(true)
+    await ui.unmount()
+    await mk($, 'setup')
+  }
+})

@@ -79,8 +79,14 @@ export type MkSnapshot = {
   usage: MkUsage | null
   /** set when state files exist but cannot be read/parsed; the pane shows a ⚠ note */
   error?: string | null
-  /** /mk setup || /mk init asked for the first-run panel this session */
-  setupHint?: boolean
+}
+
+export type MkWakePending = {
+  /** run the events belong to */
+  run: string
+  /** events.jsonl line count to mark as seen once the batch is submitted */
+  upTo: number
+  items: readonly { readonly task: string; readonly to: string }[]
 }
 
 export type MkStatusMemory = {
@@ -101,6 +107,8 @@ declare module 'claude-code' {
       wakeEventLines: { readonly byId: number }
       /** wake.ts: last wake submit timestamp per task:status id */
       wakeSentAt: { readonly byId: number }
+      /** wake.ts: lane events found but not yet submitted; survives a reload */
+      wakePending: MkWakePending
       /** wizard.tsx: current step, 1..10 */
       wizardStep: number
       /** wizard.tsx: detection + answers until the review step writes them */

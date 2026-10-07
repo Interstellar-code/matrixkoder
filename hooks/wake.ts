@@ -1,5 +1,7 @@
 // MatrixKoder wake on lane events: polls events.jsonl and submits prompt on transition events (strict types)
 import type { EngineInterface, On, PluginOptions, Timer } from 'claude-code'
+import type { MkWakePending } from '../types'
+import { candidateDirs, join, mainCheckout, parseGitdir } from './data'
 
 // $.state contract for wakeEventLines and wakeSentAt lives in types/index.d.ts
 
@@ -7,21 +9,16 @@ const WAKE_STATUSES = new Set(['verifying', 'blocked', 'quota', 'stalled', 'prov
 const TASK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 const COOLDOWN_MS = 5 * 60 * 1000 // 5 minutes
 
-let pendingBatch: Array<{ task: string; to: string }> = []
 let debounceTimer: Timer | null = null
 let pollTimer: Timer | null = null
+let retryNext = false // a submit failed: the next poll tick retries at once
 
-function candidateDirs(from: string): string[] {
-  const out: string[] = []
-  let dir = from.replace(/\/+$/, '') || '/'
-  for (;;) {
-    out.push(dir)
-    if (dir === '/') return out
-    const cut = dir.lastIndexOf('/')
-    dir = cut <= 0 ? '/' : dir.slice(0, cut)
-  }
-}
+type Pending = MkWakePending
+const pendingRef = { plugin: 'matrixkoder', key: 'wakePending' } as const
+const EMPTY_PENDING: Pending = { run: '', upTo: 0, items: [] }
 
+/** Same rule as the dashboard and mk-state: MATRIXKODER_DATA, else the nearest .git (never above $HOME);
+ *  a linked worktree resolves to its main checkout. Pure helpers are in data.ts ($ may not cross an import). */
 async function resolveDataDir($: EngineInterface): Promise<string> {
   try {
     const envData = await $.env.get('MATRIXKODER_DATA')
@@ -35,82 +32,94 @@ async function resolveDataDir($: EngineInterface): Promise<string> {
   } catch {
     // fallback
   }
-
-  for (const dir of candidateDirs(cwd)) {
-    const gitPath = `${dir}/.git`
-    let gitStat: { kind: string } | null = null
-    try {
-      gitStat = await $.fs.stat(gitPath)
-    } catch {
-      // not here
-    }
-
-    if (gitStat) {
-      // Found nearest .git! Do not walk past it.
-      if (gitStat.kind === 'file') {
-        try {
-          const gitContent = await $.fs.read(gitPath)
-          const m = gitContent.match(/gitdir:\s*(.+)/)
-          if (m && m[1]) {
-            let gitdir = m[1].trim()
-            if (!gitdir.startsWith('/')) {
-              gitdir = `${dir}/${gitdir}`
-            }
-            const commondirContent = await $.fs.read(`${gitdir}/commondir`).catch(() => '')
-            if (commondirContent) {
-              let common = commondirContent.trim()
-              if (!common.startsWith('/')) {
-                common = `${gitdir}/${common}`
-              }
-              const parts = common.split('/').filter(Boolean)
-              if (parts[parts.length - 1] === '.git') {
-                parts.pop()
-                return `/${parts.join('/')}/.matrixkoder`
-              }
-            }
-          }
-        } catch {
-          // unreadable git file
-        }
-      }
-      return `${dir}/.matrixkoder`
-    }
+  let home: string | undefined
+  try {
+    home = (await $.env.get('HOME')) || undefined
+  } catch {
+    // no HOME: the walk only stops at /
   }
 
-  return `${cwd}/.matrixkoder`
+  for (const dir of candidateDirs(cwd, home)) {
+    const gitPath = join(dir, '.git')
+    let kind: string | null = null
+    try {
+      kind = (await $.fs.stat(gitPath)).kind
+    } catch {
+      continue // no .git here — keep walking up
+    }
+    // nearest repo boundary: never use an ancestor's data
+    if (kind === 'file') {
+      try {
+        const gitdir = parseGitdir(await $.fs.read(gitPath))
+        if (gitdir) {
+          const gd = gitdir.startsWith('/') ? gitdir : join(dir, gitdir)
+          const commondir = await $.fs.read(join(gd, 'commondir'))
+          const main = mainCheckout(gd, commondir)
+          if (main) return join(main, '.matrixkoder')
+        }
+      } catch {
+        // unreadable git file or no commondir: this checkout's own dir
+      }
+    }
+    return join(dir, '.matrixkoder')
+  }
+
+  return join(cwd, '.matrixkoder')
 }
 
+async function readPending($: EngineInterface): Promise<Pending> {
+  const res = await $.state.get(pendingRef).catch(() => ({ value: undefined }))
+  const v = res.value
+  return v && Array.isArray(v.items) && typeof v.run === 'string' && typeof v.upTo === 'number' ? v : EMPTY_PENDING
+}
+
+function armDebounce($: EngineInterface): void {
+  if (debounceTimer) return
+  debounceTimer = $.clock.after(60000, () => {
+    void flushBatch($)
+  })
+}
+
+/** Submits the persisted batch. The seen-line count moves only after the submit resolved. */
 async function flushBatch($: EngineInterface): Promise<void> {
-  if (pendingBatch.length === 0) return
+  debounceTimer = null
+  const pend = await readPending($)
+  if (pend.items.length === 0) return
   let now = Date.now()
   try {
     now = await $.clock.now()
   } catch {
     // clock error
   }
-  const summary = pendingBatch.map(p => `${p.task} → ${p.to}`).join(', ')
+  const summary = pend.items.map(p => `${p.task} → ${p.to}`).join(', ')
   const text = `MatrixKoder: ${summary}. Continue the run from its Next action.`
 
   try {
     await $.prompt.submit({ text })
-    for (const p of pendingBatch) {
-      const throttleKey = `${p.task}:${p.to}`
-      await $.state
-        .set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: throttleKey } as const, now)
-        .catch(() => {})
-    }
-    pendingBatch = []
   } catch {
-    // Retain pendingBatch on submit failure for retry
-  } finally {
-    debounceTimer = null
+    retryNext = true // keep the batch and the old line count; the next poll tick retries
+    return
   }
+  retryNext = false
+  for (const p of pend.items) {
+    await $.state
+      .set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `${p.task}:${p.to}` } as const, now)
+      .catch(() => {})
+  }
+  await $.state.set({ plugin: 'matrixkoder', key: 'wakeEventLines', id: pend.run } as const, pend.upTo).catch(() => {})
+  await $.state.set(pendingRef, EMPTY_PENDING).catch(() => {})
 }
 
 async function pollEvents($: EngineInterface): Promise<void> {
   try {
     const dataDir = await resolveDataDir($)
     const indexPath = `${dataDir}/runs/index.json`
+    // a batch found before a reload (or a failed submit) is still owed
+    const owed = await readPending($)
+    if (owed.items.length > 0 && !debounceTimer) {
+      if (retryNext) await flushBatch($)
+      else armDebounce($)
+    }
     const indexRaw = await $.fs.read(indexPath)
     const runs = JSON.parse(indexRaw)
     if (!Array.isArray(runs)) return
@@ -173,21 +182,19 @@ async function pollEvents($: EngineInterface): Promise<void> {
       }
     }
 
-    await $.state.set(stateRef, lines.length).catch(() => {})
-
-    if (newlyDiscovered.length > 0) {
-      for (const item of newlyDiscovered) {
-        if (!pendingBatch.some(p => p.task === item.task && p.to === item.to)) {
-          pendingBatch.push(item)
-        }
-      }
-
-      if (!debounceTimer) {
-        debounceTimer = $.clock.after(60000, () => {
-          void flushBatch($)
-        })
-      }
+    const pend = await readPending($)
+    if (pend.items.length > 0 && pend.run !== active.id) return // the owed batch belongs to another run; flush it first
+    const items = [...pend.items]
+    for (const item of newlyDiscovered) {
+      if (!items.some(p => p.task === item.task && p.to === item.to)) items.push(item)
     }
+    if (items.length === 0) {
+      await $.state.set(stateRef, lines.length).catch(() => {}) // nothing to wake for: safe to move on
+      return
+    }
+    // lines are NOT marked seen yet: that happens after the submit (flushBatch)
+    await $.state.set(pendingRef, { run: active.id, upTo: lines.length, items }).catch(() => {})
+    armDebounce($)
   } catch {
     // silent on fs/poll error
   }
@@ -196,8 +203,8 @@ async function pollEvents($: EngineInterface): Promise<void> {
 export function registerWake(on: On, options: PluginOptions): void {
   if (!options.wake) return
 
-  pendingBatch = []
   debounceTimer = null
+  retryNext = false
 
   on('session.start', { cwd: /.*/ }, async ($, e, next) => {
     pollTimer?.cancel()

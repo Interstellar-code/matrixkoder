@@ -391,3 +391,19 @@ test('lanes fall back to live tasks when no lane is set', { plugins: [worldFixtu
   expect(await ui.find({ text: /∇ AGY/ })).toBeTruthy() // F8 building stands in with its agent glyph
   expect(await ui.find({ text: 'none live' })).toBeUndefined()
 })
+
+test('/mk setup then closing the wizard shows the run again (no sticky first-run panel)', { plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  const clock = mockWorld(on)
+  await $.session.start(sessionStart())
+  await $.command.run({ command: 'mk', args: 'setup', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 100 } })
+  const wiz = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder-setup', props: paneProps(64) })
+  await wiz.press({ key: 'wz-cancel' }) // the wizard closes
+  await clock.advance(5000) // a refresh tick afterwards
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  expect(await ui.find({ text: /Welcome to MatrixKoder/ })).toBeUndefined()
+  expect(await ui.find({ text: /workflows-v2/ })).toBeTruthy()
+  expect(await ui.find({ text: 'Plan' })).toBeTruthy()
+  expect(await ui.find({ text: 'Lanes' })).toBeTruthy()
+  expect(await ui.find({ text: 'Waiting on you' })).toBeTruthy()
+})
