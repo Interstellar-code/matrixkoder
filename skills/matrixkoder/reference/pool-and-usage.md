@@ -17,7 +17,7 @@ Reviewer ≠ builder, preferably a different model family.
 
 | Jev size class | Codex | OpenCode | AGY | Claude |
 |---|---|---|---|---|
-| trivial / mechanical | default | fast model | gemini flash medium | haiku subagent |
+| trivial / mechanical | default | fast model | gemini flash medium | haiku (Haiku 5.5) · low–medium |
 | standard | default | main model (e.g. GLM-5.x) | gemini flash high | sonnet |
 | complex / cross-cutting / reviews | high reasoning | — | gemini pro high | opus |
 | final review | review pass | — | gemini pro high | fable / opus |
@@ -72,10 +72,15 @@ Stage 1 writes `## Routing preferences` from `matrixkoder.yaml` defaults; if the
 `QUOTA`, `PROVIDER` (unsupported model, subscription required, service unavailable, auth) or `STALL` (working but no file/commit change for 10 min, or idle without the DONE token): record `git status --porcelain` + `git diff --stat` counts as an event (`mk-state event --task <T> --type note`), `task round <T> --kind takeover --cause "quota|stall|provider"`, write the TAKEOVER section, re-decide with Jev (or static order), dispatch. Skip agents inside a reset window. All agents below their floor → pause the run and ask.
 
 ## Typical routes (starting points, Jev adjusts)
+
+Claude tier aliases (`haiku`, `sonnet`, `opus`, `fable`) resolve to the newest model of that tier; record the resolved model on the task. Haiku 5.5 (user, 2026-10-07) is the default for small and easy Claude jobs: include `claude haiku <effort>` as a `jev_decide` candidate for every trivial or read-only job.
+
 | Job | Route |
 |---|---|
 | Browser QA / Playwright flows with a checklist | sonnet · medium |
-| Grading, exploration, doc lookups | sonnet or haiku · low–medium |
+| Exploration, doc/API lookups, grading against a checklist, small mechanical edits (1–2 files) | **haiku · low–medium** (Haiku 5.5: cheap, capable — first choice for small read-only jobs) |
+| Status sweeps, log/test-output digests, board renders | haiku · low |
+| Reviews of designs, contracts or safety code | sonnet · high or a non-Claude pro tier — **never haiku** (lesson 29) |
 | Bounded build, clear brief | non-Claude builder · medium |
 | Data-loss / security build or review | opus-tier · high |
 | Final release review | fable · max |
