@@ -175,19 +175,67 @@ function gitBan(ws: readonly string[]): Ban | undefined {
     if (f) return { cmd: `git push ${f}`, why: 'force push' }
     const plus = rest.find(w => w.startsWith('+'))
     if (plus) return { cmd: `git push ${plus}`, why: 'force push' }
+    // deletes or overwrites remote refs: --delete/-d, `:ref` (empty source), --mirror, --prune
+    const del = rest.find(w => ['--delete', '--mirror', '--prune'].includes(w) || shortHas(w, 'd') || /^:./.test(w))
+    if (del) return { cmd: `git push ${del}`, why: 'deletes remote refs' }
+    return undefined
+  }
+  if (sub === 'branch') {
+    const opts = optsOf(rest)
+    const del = opts.some(w => w === '--delete' || shortHas(w, 'd'))
+    const force = opts.some(w => w === '--force' || shortHas(w, 'f'))
+    if (opts.some(w => shortHas(w, 'D')) || (del && force)) return { cmd: 'git branch -D', why: 'drops unmerged commits' }
+    return undefined
+  }
+  if (sub === 'rebase') {
+    // --abort/--continue/--skip end a rebase already running; blocking them would strand the repo
+    const ends = rest.some(w => ['--abort', '--continue', '--skip'].includes(w))
+    return ends ? undefined : { cmd: 'git rebase', why: 'history rewrite' }
+  }
+  if (sub === 'pull') {
+    const r = optsOf(rest).find(w => w === '--rebase' || /^--rebase=(?!false$|no$)/.test(w) || shortHas(w, 'r'))
+    return r ? { cmd: `git pull ${r}`, why: 'history rewrite' } : undefined
+  }
+  if (sub === 'reflog' && (rest[0] === 'expire' || rest[0] === 'delete'))
+    return { cmd: `git reflog ${rest[0]}`, why: 'drops recovery points' }
+  if (sub === 'update-ref' && optsOf(rest).some(w => shortHas(w, 'd')))
+    return { cmd: 'git update-ref -d', why: 'deletes a ref' }
+  if (sub === 'gc') {
+    const p = optsOf(rest).find(w => w === '--prune' || w.startsWith('--prune='))
+    return p ? { cmd: `git gc ${p}`, why: 'drops unreachable objects' } : undefined
   }
   return undefined
 }
 
-const normFlag = (w: string) => (/^-[a-zA-Z]+$/.test(w) ? `-${[...w.slice(1)].sort().join('')}` : w) // -fr == -rf
+/** A command's short flag letters, other flags and positional words; rm's -R/--recursive/--force fold to r/f. */
+function shape(ws: readonly string[]) {
+  const rm = base(ws[0] ?? '') === 'rm'
+  const RM_LONG: Readonly<Record<string, string>> = { '--recursive': 'r', '--force': 'f' }
+  const letters = new Set<string>()
+  const longs = new Set<string>()
+  const pos: string[] = []
+  for (const w of ws.slice(1)) {
+    if (rm && RM_LONG[w]) letters.add(RM_LONG[w])
+    else if (/^-[a-zA-Z]+$/.test(w)) for (const l of w.slice(1)) letters.add(rm && l === 'R' ? 'r' : l)
+    else if (w.startsWith('-')) longs.add(w)
+    else pos.push(w)
+  }
+  return { letters, longs, pos }
+}
 
+/** A banned item matches when the command name matches, its flags all appear (any order or split: `rm -r -f`
+ * hits `rm -rf`) and its other words lead the command's positional words. */
 function bannedHit(ws: readonly string[], banned: readonly string[]): Ban | undefined {
+  if (!ws.length) return undefined
+  const got = shape(ws)
   const hit = banned.find(c => {
     const cs = c.split(/\s+/).filter(Boolean)
+    if (!cs.length || (cs[0].includes('/') ? ws[0] !== cs[0] : base(ws[0]) !== cs[0])) return false
+    const want = shape(cs)
     return (
-      cs.length > 0 &&
-      cs.length <= ws.length &&
-      cs.every((w, i) => (i === 0 && !w.includes('/') ? base(ws[0]) === w : normFlag(ws[i]) === normFlag(w)))
+      [...want.letters].every(l => got.letters.has(l)) &&
+      [...want.longs].every(l => got.longs.has(l)) &&
+      want.pos.every((w, i) => got.pos[i] === w)
     )
   })
   return hit ? { cmd: hit, why: 'banned in matrixkoder.yaml' } : undefined
