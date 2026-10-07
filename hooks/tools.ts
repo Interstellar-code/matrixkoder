@@ -11,7 +11,7 @@ const ALLOWED_SUBCOMMANDS = new Set([
 ])
 
 export function registerTools(on: On, _options: PluginOptions): void {
-  on('session.start', async ($, e, next) => {
+  on('session.start', { cwd: /.*/ }, async ($, e, next) => {
         try {
       await $.tool.register({
         name: 'mk_state',

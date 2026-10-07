@@ -91,6 +91,8 @@ declare module 'claude-code' {
       snapshot: MkSnapshot
       taskStatuses: MkStatusMemory
       paneOpen: boolean
+      /** wake.ts: events.jsonl lines already seen, per run id */
+      wakeEventLines: { readonly byId: number }
     }
   }
 }

@@ -1,13 +1,7 @@
 // MatrixKoder wake on lane events: polls events.jsonl and submits prompt on transition events
 import type { EngineInterface, On, PluginOptions, StateFamily, Timer } from 'claude-code'
 
-declare module 'claude-code' {
-  interface PluginState {
-    matrixkoder: {
-      wakeEventLines: StateFamily<number>
-    }
-  }
-}
+// $.state contract for wakeEventLines lives in types/index.d.ts
 
 const WAKE_STATUSES = new Set(['verifying', 'blocked', 'quota', 'stalled', 'provider'])
 const COOLDOWN_MS = 5 * 60 * 1000 // 5 minutes
