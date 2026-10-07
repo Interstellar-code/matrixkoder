@@ -544,3 +544,54 @@ test('a failed submit keeps the batch and the line count, and the next tick retr
   await clock.advance(300000)
   expect(w.submitted.length, 'sent once').toBe(1)
 })
+
+// ---------- r4: retryNext, stale pending, projects.json ----------
+
+test('after a refused submit the very next poll tick retries (not the 60 s debounce)', { options: { wake: true } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const files: Record<string, string> = {
+    '/data/runs/index.json': JSON.stringify([{ id: 'r1', status: 'active' }]),
+    '/data/runs/r1/events.jsonl': EV('F6', 'verifying'),
+  }
+  const w = wakeWorld(on, files, [], { MATRIXKODER_DATA: '/data' }, '/tmp')
+  w.store.set('wakeEventLines:r1', 0)
+  w.failSubmits.n = 1
+  await $.session.start(START('/tmp'))
+  await clock.advance(30000) // poll 1: found, debounce due at 90 s
+  await clock.advance(60000) // 90 s: the debounce fires and the submit is refused (the 90 s poll may already retry)
+  await clock.advance(30000) // 120 s: within ONE poll tick of the refusal. Without retryNext a poll only re-arms a 60 s debounce
+  expect(w.seenAtSubmit.length, 'retried at the next tick').toBe(2)
+  expect(w.submitted).toEqual(['MatrixKoder: F6 → verifying. Continue the run from its Next action.'])
+})
+
+test('a persisted batch of a run that is no longer active is dropped, not submitted', { options: { wake: true } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const files: Record<string, string> = {
+    '/data/runs/index.json': JSON.stringify([{ id: 'old', status: 'done' }, { id: 'r1', status: 'active' }]),
+    '/data/runs/r1/events.jsonl': EV('F6', 'review'),
+  }
+  const w = wakeWorld(on, files, [], { MATRIXKODER_DATA: '/data' }, '/tmp')
+  w.store.set('wakeEventLines:r1', 1)
+  w.store.set('wakePending:', { run: 'old', upTo: 3, items: [{ task: 'X1', to: 'blocked' }] })
+  await $.session.start(START('/tmp'))
+  await clock.advance(30000)
+  await clock.advance(120000)
+  expect(w.submitted).toEqual([])
+  expect(w.store.get('wakePending:')).toMatchObject({ items: [] })
+})
+
+test('home mode: the repo\'s data dir comes from $MATRIXKODER_HOME/projects.json; env beats it', { options: { wake: true } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const files: Record<string, string> = {
+    '/srv/mkhome/projects.json': JSON.stringify({ '/tmp/proj': { data_dir: '/srv/elsewhere/proj-data', onboarded_at: 'x' } }),
+    '/srv/elsewhere/proj-data/runs/index.json': JSON.stringify([{ id: 'r1', status: 'active' }]),
+    '/srv/elsewhere/proj-data/runs/r1/events.jsonl': '',
+  }
+  const w = wakeWorld(on, files, ['/tmp/proj/.git'], { HOME: '/home/mk', MATRIXKODER_HOME: '/srv/mkhome' }, '/tmp/proj/sub')
+  w.store.set('wakeEventLines:r1', 0)
+  await $.session.start(START('/tmp/proj/sub'))
+  files['/srv/elsewhere/proj-data/runs/r1/events.jsonl'] = EV('F6', 'verifying')
+  await clock.advance(30000)
+  await clock.advance(60000)
+  expect(w.submitted).toEqual(['MatrixKoder: F6 → verifying. Continue the run from its Next action.'])
+})

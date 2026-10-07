@@ -11,7 +11,7 @@ type Els = Elements[keyof Elements]
 import type { MkEvent, MkRun, MkSnapshot, MkStatusMemory, MkTask } from '../types'
 import {
   PANE_ID, EMPTY_SNAPSHOT, activeEntry, basename, candidateDirs, coerceIndex, coerceRun, coerceUsage, join,
-  mainCheckout, mkSnapshot, normalizePath, parentOf, parseGitdir, parseJson, sanitizeText, timerRegistry,
+  globalDirPath, mainCheckout, mkSnapshot, normalizePath, parentOf, parseGitdir, parseJson, projectDataDir, sanitizeText, timerRegistry,
 } from './data'
 import { chipText, toastsFor } from './status'
 
@@ -86,8 +86,8 @@ export function registerDashboard(on: On, options: PluginOptions): void {
     timerRegistry.cancelPoll = arm($.clock.every(Math.round(min * 60_000), () => pollUsage($)))
     lastChipText = undefined
     await refreshSafe($, options, cwd) // first load populates pane + chip and never toasts
-    const home = await homeDir($)
-    const usageMissing = home == null || (await readJson($, usagePath(home))) == null
+    const gdir = await globalDirOf($, await homeDir($))
+    const usageMissing = gdir == null || (await readJson($, usagePath(gdir))) == null
     if (usageMissing) void pollUsage($) // cold start: do not show "no ledger yet" for N minutes
     return next(e)
   })
@@ -185,8 +185,8 @@ async function readText($: EngineInterface, path: string): Promise<string | null
   }
 }
 
-/** Schema rule (state-schema.md): MATRIXKODER_DATA → nearest .git toplevel's
- *  .matrixkoder; a linked worktree (.git FILE) resolves to its main checkout.
+/** Schema rule (state-schema.md): MATRIXKODER_DATA → ~/.matrixkoder/projects.json entry for the repo → nearest .git
+ *  toplevel's .matrixkoder; a linked worktree (.git FILE) resolves to its main checkout.
  *  The walk stops before home: ~/.matrixkoder is the GLOBAL dir, never project data. */
 async function resolveDataDir($: EngineInterface, cwd: string, home: string | null): Promise<string | null> {
   try {
@@ -215,7 +215,10 @@ async function resolveDataDir($: EngineInterface, cwd: string, home: string | nu
     }
     if (toplevel == null) continue
     // nearest repo boundary found: nested repos stop here (schema: pass --data for the outer)
-    const data = join(toplevel, '.matrixkoder')
+    // the wizard's projects.json (home mode) names the data dir of this repo; else <repo>/.matrixkoder
+    const gdir = await globalDirOf($, home)
+    const listed = gdir == null ? null : projectDataDir(await readJson($, join(gdir, 'projects.json')), [toplevel], home)
+    const data = listed ?? join(toplevel, '.matrixkoder')
     try {
       const s = await $.fs.stat(data)
       if (s.kind === 'dir') return data
@@ -256,8 +259,19 @@ async function homeDir($: EngineInterface): Promise<string | null> {
   return null
 }
 
-function usagePath(home: string): string {
-  return join(home, '.matrixkoder/usage.json')
+/** The global dir ($MATRIXKODER_HOME, else ~/.matrixkoder): usage.json, projects.json. */
+async function globalDirOf($: EngineInterface, home: string | null): Promise<string | null> {
+  let envHome: string | undefined
+  try {
+    envHome = (await $.env.get('MATRIXKODER_HOME')) || undefined
+  } catch {
+    // env noun refused — the default
+  }
+  return globalDirPath(envHome, home)
+}
+
+function usagePath(globalDir: string): string {
+  return join(globalDir, 'usage.json')
 }
 
 async function loadSnapshot($: EngineInterface, cwd: string): Promise<MkSnapshot> {
@@ -275,7 +289,8 @@ async function loadSnapshot($: EngineInterface, cwd: string): Promise<MkSnapshot
   if (dataDir) {
     ;({ run, runs, error } = await loadRun($, dataDir))
   }
-  const usage = home ? coerceUsage(await readJson($, usagePath(home))) : null
+  const gdir = await globalDirOf($, home)
+  const usage = gdir ? coerceUsage(await readJson($, usagePath(gdir))) : null
   return { ...mkSnapshot(now, dataDir, run, runs, usage), error }
 }
 

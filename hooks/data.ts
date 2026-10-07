@@ -49,6 +49,27 @@ export function candidateDirs(from: string, stopBefore?: string): string[] {
   }
 }
 
+/** The global dir: $MATRIXKODER_HOME (a leading ~ means HOME), else ~/.matrixkoder. */
+export function globalDirPath(envHome: string | null | undefined, home: string | null): string | null {
+  const e = (envHome ?? '').trim()
+  if (e !== '') return e === '~' ? home : e.startsWith('~/') ? (home == null ? null : join(home, e.slice(2))) : e
+  return home == null ? null : join(home, '.matrixkoder')
+}
+
+/** projects.json lookup (wizard-written `{ "<repo>": { data_dir } }`): first repo path listed wins. A leading ~
+ *  in data_dir means HOME; a relative one is resolved against the repo. */
+export function projectDataDir(projects: unknown, repoPaths: readonly string[], home: string | null): string | null {
+  if (!isRecord(projects)) return null
+  for (const repo of repoPaths) {
+    const entry = projects[repo]
+    const dir = isRecord(entry) && typeof entry.data_dir === 'string' ? entry.data_dir.trim() : ''
+    if (dir === '') continue
+    if (dir === '~' || dir.startsWith('~/')) return home == null ? null : normalizePath(dir === '~' ? home : join(home, dir.slice(2)))
+    return normalizePath(dir.startsWith('/') ? dir : join(repo, dir))
+  }
+  return null
+}
+
 /** The gitdir path out of a linked worktree's `.git` FILE ("gitdir: /abs/path"). */
 export function parseGitdir(dotGitText: string): string | null {
   const m = dotGitText.split('gitdir:', 2)[1]

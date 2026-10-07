@@ -131,6 +131,34 @@ test('a linked worktree resolves to the main checkout data dir', async ($, on) =
   expect(await ui.find({ text: /workflows-v2/ })).toBeTruthy()
 })
 
+test('home mode: projects.json (under $MATRIXKODER_HOME) names the data dir of a repo, a worktree keys by the main checkout', async ($, on) => {
+  const run = worldFiles()[RUN_PATH] ?? ''
+  const files: Record<string, string> = {
+    '/srv/mkhome/projects.json': JSON.stringify({ '/tmp/main': { data_dir: '/srv/mkhome/projects/main', onboarded_at: 'x' } }),
+    '/srv/mkhome/projects/main/runs/index.json': JSON.stringify([{ id: 'wfv2', feature: 'workflows-v2', status: 'active', started: '2026-10-07T16:00:00+02:00' }]),
+    '/srv/mkhome/projects/main/runs/wfv2/run.json': run,
+    '/tmp/wt-lane/.git': 'gitdir: /tmp/main/.git/worktrees/lane\n',
+    '/tmp/main/.git/worktrees/lane/commondir': '../..\n',
+  }
+  mockFs(on, files, ['/srv/mkhome/projects/main', '/tmp/main/.git'], ['/tmp/wt-lane/.git'])
+  mockWorld(on, { env: { MATRIXKODER_HOME: '/srv/mkhome' } })
+  await $.session.start(sessionStartIn('/tmp/wt-lane'))
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  expect(await ui.find({ text: /workflows-v2/ })).toBeTruthy()
+  expect(await ui.find({ text: /Welcome to MatrixKoder/ })).toBeUndefined()
+})
+
+test('MATRIXKODER_HOME moves the global dir: usage.json is read from it', { plugins: [worldFixtures] }, async ($, on) => {
+  const files = worldFiles()
+  files['/srv/mkhome/usage.json'] = (files[USAGE_PATH] ?? '').replace('claude-gpt', 'srv-pool') // distinguishable from the fixture copy under HOME
+  mockFs(on, files)
+  mockWorld(on, { env: { MATRIXKODER_HOME: '/srv/mkhome' } })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  expect(await ui.find({ text: /srv-pool/ })).toBeTruthy()
+  expect(await ui.find({ text: /claude-gpt/ })).toBeUndefined()
+})
+
 test('MATRIXKODER_DATA overrides the walk', async ($, on) => {
   const files: Record<string, string> = {
     '/tmp/alt-data/runs/index.json': JSON.stringify([{ id: 'alt', feature: 'alt-feature', status: 'active', started: '2026-10-07T16:00:00+02:00' }]),

@@ -1,7 +1,7 @@
 // MatrixKoder wake on lane events: polls events.jsonl and submits prompt on transition events (strict types)
 import type { EngineInterface, On, PluginOptions, Timer } from 'claude-code'
 import type { MkWakePending } from '../types'
-import { candidateDirs, join, mainCheckout, parseGitdir } from './data'
+import { candidateDirs, globalDirPath, join, mainCheckout, parseGitdir, parseJson, projectDataDir } from './data'
 
 // $.state contract for wakeEventLines and wakeSentAt lives in types/index.d.ts
 
@@ -48,6 +48,7 @@ async function resolveDataDir($: EngineInterface): Promise<string> {
       continue // no .git here — keep walking up
     }
     // nearest repo boundary: never use an ancestor's data
+    let top = dir
     if (kind === 'file') {
       try {
         const gitdir = parseGitdir(await $.fs.read(gitPath))
@@ -55,13 +56,29 @@ async function resolveDataDir($: EngineInterface): Promise<string> {
           const gd = gitdir.startsWith('/') ? gitdir : join(dir, gitdir)
           const commondir = await $.fs.read(join(gd, 'commondir'))
           const main = mainCheckout(gd, commondir)
-          if (main) return join(main, '.matrixkoder')
+          if (main) top = main
         }
       } catch {
         // unreadable git file or no commondir: this checkout's own dir
       }
     }
-    return join(dir, '.matrixkoder')
+    // the wizard's projects.json (home mode) names this repo's data dir; else <repo>/.matrixkoder
+    try {
+      let envHome: string | undefined
+      try {
+        envHome = (await $.env.get('MATRIXKODER_HOME')) || undefined
+      } catch {
+        // default global dir
+      }
+      const gdir = globalDirPath(envHome, home ?? null)
+      if (gdir != null) {
+        const listed = projectDataDir(parseJson(await $.fs.read(join(gdir, 'projects.json'))), [top], home ?? null)
+        if (listed != null) return listed
+      }
+    } catch {
+      // no projects.json
+    }
+    return join(top, '.matrixkoder')
   }
 
   return join(cwd, '.matrixkoder')
@@ -114,18 +131,22 @@ async function pollEvents($: EngineInterface): Promise<void> {
   try {
     const dataDir = await resolveDataDir($)
     const indexPath = `${dataDir}/runs/index.json`
-    // a batch found before a reload (or a failed submit) is still owed
+    let runs: unknown
+    try {
+      runs = JSON.parse(await $.fs.read(indexPath))
+    } catch {
+      runs = null
+    }
+    const active = Array.isArray(runs) ? (runs.find((r: { status?: string }) => r.status === 'active') as { id?: string } | undefined) : undefined
+    // a batch found before a reload (or a failed submit) is still owed, but only to the run that is still active
     const owed = await readPending($)
-    if (owed.items.length > 0 && !debounceTimer) {
+    if (owed.items.length > 0 && (!active?.id || owed.run !== active.id)) {
+      await $.state.set(pendingRef, EMPTY_PENDING).catch(() => {}) // a finished run must not wake the session
+    } else if (owed.items.length > 0 && !debounceTimer) {
       if (retryNext) await flushBatch($)
       else armDebounce($)
     }
-    const indexRaw = await $.fs.read(indexPath)
-    const runs = JSON.parse(indexRaw)
-    if (!Array.isArray(runs)) return
-
-    const active = runs.find((r: any) => r.status === 'active')
-    if (!active || !active.id) return
+    if (!active?.id) return
 
     const eventsPath = `${dataDir}/runs/${active.id}/events.jsonl`
     const eventsRaw = await $.fs.read(eventsPath).catch(() => '')
@@ -183,7 +204,6 @@ async function pollEvents($: EngineInterface): Promise<void> {
     }
 
     const pend = await readPending($)
-    if (pend.items.length > 0 && pend.run !== active.id) return // the owed batch belongs to another run; flush it first
     const items = [...pend.items]
     for (const item of newlyDiscovered) {
       if (!items.some(p => p.task === item.task && p.to === item.to)) items.push(item)

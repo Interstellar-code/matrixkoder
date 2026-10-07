@@ -18,7 +18,7 @@ export function emptyDraft(): MkWizardDraft {
   const agents: Record<string, MkWizardAgent> = {}
   for (const n of AGENT_NAMES) agents[n] = { found: false, path: null, enabled: false, models: [] }
   return {
-    loaded: false, repo: null, slug: 'project', home: null, installMode: 'dev', pluginRoot: '', branch: 'main',
+    loaded: false, repo: null, slug: 'project', home: null, globalDir: null, dataEnv: null, installMode: 'dev', pluginRoot: '', branch: 'main',
     dataMode: 'repo', gitignore: true, gitignoreHas: false,
     agents, codexbarVersion: null, providersAll: [...DEFAULT_PROVIDERS], providersOn: [...DEFAULT_PROVIDERS],
     gates: { install: '', test: '', typecheck: '', lint_changed: '', format_changed: '' }, gatesFrom: '', banned: [],
@@ -158,6 +158,8 @@ export function proposeGates(inp: GateInputs): { gates: MkWizardGates; banned: s
 
 const PLAIN = /^[A-Za-z0-9_./~][A-Za-z0-9_./~ =@+-]*$/
 const AMBIGUOUS = /^(true|false|yes|no|on|off|null|~)$/i
+/** YAML 1.1 plain scalars that read as numbers/dates/floats (0x1F, 1_000, 2026-10-08, .inf) */
+const NUMBERISH = /^[-+]?(\.?\d|\.(inf|nan))/i
 
 /** One scalar or flow collection on one line. Quoted (JSON string = valid YAML) unless provably plain. */
 export function inline(v: unknown): string {
@@ -169,7 +171,9 @@ export function inline(v: unknown): string {
     return entries.length === 0 ? '{}' : `{ ${entries.map(([k, x]) => `${k}: ${inline(x)}`).join(', ')} }`
   }
   const s = String(v)
-  if (s === '' || s.trim() !== s || AMBIGUOUS.test(s) || !PLAIN.test(s) || /^[-+]?[\d.]+(e[-+]?\d+)?$/i.test(s) || s.includes(' #') || s.endsWith(':')) return JSON.stringify(s)
+  if (s === '' || s.trim() !== s || AMBIGUOUS.test(s) || !PLAIN.test(s) || NUMBERISH.test(s) || s.includes(' #') || s.endsWith(':')) {
+    return JSON.stringify(s).replace(/[\u0085\u2028\u2029]/g, c => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`)
+  }
   return s
 }
 
@@ -193,8 +197,9 @@ export function builderOrderOf(d: MkWizardDraft): string[] {
   return DEFAULT_BUILDER_ORDER.filter(n => on.has(n))
 }
 
-export function dataDirOf(d: MkWizardDraft, home: string | null = d.home): string | null {
-  if (d.dataMode === 'home') return home == null ? null : `${home}/.matrixkoder/projects/${d.slug}`
+export function dataDirOf(d: MkWizardDraft): string | null {
+  if (d.dataEnv != null) return d.dataEnv // readers check $MATRIXKODER_DATA first
+  if (d.dataMode === 'home') return d.globalDir == null ? null : `${d.globalDir}/projects/${d.slug}`
   return d.repo == null ? null : `${d.repo}/.matrixkoder`
 }
 
@@ -212,7 +217,7 @@ export function buildYaml(d: MkWizardDraft, checkedAt: string): string {
   const proposed = (v: string): string | undefined => (v !== '' ? 'proposed' : undefined)
   L.push('# <data>/matrixkoder.yaml — written by the MatrixKoder onboarding wizard after the user confirmed.')
   L.push('# Re-checked for drift on every run; the user\'s explicit statements override any value.')
-  kv(0, 'data_dir', d.dataMode === 'home' ? `~/.matrixkoder/projects/${d.slug}/` : '.matrixkoder/', 'project data dir')
+  kv(0, 'data_dir', d.dataEnv != null || d.dataMode === 'home' ? `${dataDirOf(d) ?? ''}/` : '.matrixkoder/', 'project data dir')
   L.push('repo:')
   kv(2, 'integration_branch', d.branch, 'lanes merge here; one PR to main at the end')
   kv(2, 'worktree_pattern', '../{repo}-worktree-{x}')
@@ -260,7 +265,7 @@ export function buildYaml(d: MkWizardDraft, checkedAt: string): string {
   L.push('deploy:')
   kv(2, 'readme', '<data>/deploys/README.md', 'repo-specific checklist; always user-gated')
   L.push('locks:')
-  kv(2, 'dir', '~/.matrixkoder/locks')
+  kv(2, 'dir', `${d.globalDir ?? '~/.matrixkoder'}/locks`)
   L.push('usage:')
   kv(2, 'source', 'codexbar', 'one source for all agents; mk-usage.py -> ~/.matrixkoder/usage.json')
   kv(2, 'poll_min', Math.max(1, toInt(d.pollMin, 5)))
@@ -313,7 +318,7 @@ export function fallbackText(d: MkWizardDraft): string {
     'MatrixKoder setup needs the fullscreen pane. Run /tui fullscreen, then /mk setup again.',
     'Detected defaults:',
     `- install: ${d.installMode}`,
-    `- data: ${d.dataMode === 'home' ? `~/.matrixkoder/projects/${d.slug}/` : `${d.repo ?? '<repo>'}/.matrixkoder/ (add to .gitignore)`}`,
+    `- data: ${d.dataEnv != null ? `${d.dataEnv}/ ($MATRIXKODER_DATA)` : d.dataMode === 'home' ? `${dataDirOf(d) ?? ''}/` : `${d.repo ?? '<repo>'}/.matrixkoder/ (add to .gitignore)`}`,
     `- agents: ${found.length > 0 ? found.join(', ') : 'none'}${missing.length > 0 ? ` (missing: ${missing.join(', ')})` : ''}`,
     `- usage: ${d.codexbarVersion != null ? `codexbar ${d.codexbarVersion}, providers ${d.providersOn.join(', ') || 'none'}` : 'codexbar not found'}`,
     `- gates: ${gates.length > 0 ? gates.join('; ') : 'none detected'}`,

@@ -7,7 +7,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Elements as ElementTables, EngineInterface, On, PluginOptions } from 'claude-code'
 import type { MkWizardDraft } from '../types'
-import { join, parseJson } from './data'
+import { globalDirPath, join, parseJson } from './data'
 import {
   AGENT_NAMES, WIZARD_STEPS, ZAI_KEY_CMD, addToGitignore, buildConfigJson, buildProjectsJson, buildYaml,
   builderOrderOf, dataDirOf, EMPTY_DRAFT, emptyDraft, fallbackText, installModeOf, parseModels, parseProviders, parseVersion,
@@ -119,6 +119,16 @@ async function homeOf($: EngineInterface): Promise<string | null> {
 async function detect($: EngineInterface, options: PluginOptions): Promise<MkWizardDraft> {
   const d = emptyDraft()
   d.home = await homeOf($)
+  let dataEnv: string | undefined
+  let homeEnv: string | undefined
+  try {
+    dataEnv = (await $.env.get('MATRIXKODER_DATA'))?.trim() || undefined
+    homeEnv = (await $.env.get('MATRIXKODER_HOME'))?.trim() || undefined
+  } catch {
+    // env refused: as unset
+  }
+  d.dataEnv = dataEnv ?? null
+  d.globalDir = globalDirPath(homeEnv, d.home)
   d.pluginRoot = $.plugin.root
   d.installMode = installModeOf(d.pluginRoot)
   d.autoOpen = options.autoOpen !== false
@@ -203,40 +213,75 @@ async function refreshExisting($: EngineInterface, p: Partial<MkWizardDraft>): P
 
 // ---------- writing (step 10 confirm) ----------
 
+/** Absent (false exists) is null; present-but-unreadable THROWS: never treat a failed read as an empty file. */
+async function readExisting($: EngineInterface, path: string): Promise<string | null> {
+  if (!(await $.fs.exists(path))) return null
+  try {
+    return await $.fs.read(path)
+  } catch (err) {
+    throw new Error(`cannot read ${path} (${String(err instanceof Error ? err.message : err).slice(0, 60)}) — not overwriting it`)
+  }
+}
+
 async function readJsonStrict($: EngineInterface, path: string): Promise<unknown> {
-  const text = await readOpt($, path)
+  const text = await readExisting($, path)
   if (text == null || text.trim() === '') return null
   const parsed = parseJson(text)
   if (parsed === null) throw new Error(`${path} is not valid JSON — fix or remove it, then run /mk setup again`)
+  if (typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error(`${path} is not a JSON object — fix or remove it, then run /mk setup again`)
   return parsed
+}
+
+/** Temp file in the same dir, then `mv -f` (a rename): a crash never leaves a truncated file. $.fs has no rename.
+ *  ponytail: read-merge-write of the two global files is not locked; two wizards finishing in the same
+ *  few milliseconds can lose one repo's projects.json entry. Add a lock via mk-state if that ever happens. */
+async function writeAtomic($: EngineInterface, path: string, text: string): Promise<void> {
+  const tmp = `${path}.tmp`
+  await $.fs.write(tmp, text)
+  const mv = await $.process.run(['mv', '-f', tmp, path], { timeoutMs: PROBE_MS })
+  if (mv.exitCode !== 0) throw new Error(`could not move ${tmp} into place: ${mv.stderr.trim().slice(0, 100)}`)
 }
 
 async function writeAll($: EngineInterface): Promise<void> {
   const d = await read($, draftAtom)
   try {
     const data = dataDirOf(d)
-    if (d.repo == null || data == null || d.home == null) throw new Error('no git repository (or HOME) detected — run /mk setup from inside the project')
+    if (d.repo == null || data == null || d.home == null || d.globalDir == null) throw new Error('no git repository (or HOME) detected — run /mk setup from inside the project')
+    const yamlPath = join(data, 'matrixkoder.yaml')
+    // detection is a snapshot: a yaml that appeared since goes back to the replace confirm, nothing is written
+    const yamlExists = await $.fs.exists(yamlPath)
+    if (yamlExists && !d.existingYaml) {
+      await patch($, { existingYaml: true, replace: false, phase: 'error', error: 'matrixkoder.yaml appeared since detection — choose keep or replace, then write again' })
+      return
+    }
+    // read everything we merge into BEFORE the first write: an unreadable file aborts with nothing changed
+    const gitignorePath = join(d.repo, '.gitignore')
+    const wantGitignore = d.dataMode === 'repo' && d.dataEnv == null && d.gitignore
+    const gitignoreNext = wantGitignore ? addToGitignore(await readExisting($, gitignorePath)) : null
+    const globalDir = d.globalDir
+    const configPath = join(globalDir, 'config.json')
+    const projectsPath = join(globalDir, 'projects.json')
+    const config = await readJsonStrict($, configPath)
+    const projects = await readJsonStrict($, projectsPath)
     const at = new Date(await $.clock.now()).toISOString()
-    const globalDir = join(d.home, '.matrixkoder')
     const written: string[] = []
     const mk = await $.process.run(['mkdir', '-p', join(data, 'plans'), join(data, 'runs'), globalDir], { timeoutMs: PROBE_MS })
     if (mk.exitCode !== 0) throw new Error(`mkdir failed: ${mk.stderr.trim().slice(0, 120)}`)
-    if (!d.existingYaml || d.replace) {
-      await $.fs.write(join(data, 'matrixkoder.yaml'), buildYaml(d, at))
-      written.push(join(data, 'matrixkoder.yaml'))
-    }
-    if (d.dataMode === 'repo' && d.gitignore) {
-      const next = addToGitignore(await readOpt($, join(d.repo, '.gitignore')))
-      if (next != null) {
-        await $.fs.write(join(d.repo, '.gitignore'), next)
-        written.push(join(d.repo, '.gitignore'))
+    if (!yamlExists || d.replace) {
+      if (yamlExists) {
+        const bak = await $.process.run(['cp', '-f', yamlPath, `${yamlPath}.bak`], { timeoutMs: PROBE_MS })
+        if (bak.exitCode !== 0) throw new Error(`could not back up ${yamlPath}: ${bak.stderr.trim().slice(0, 100)}`)
       }
+      await writeAtomic($, yamlPath, buildYaml(d, at))
+      written.push(yamlPath)
     }
-    const configPath = join(globalDir, 'config.json')
-    await $.fs.write(configPath, buildConfigJson(await readJsonStrict($, configPath), d, at))
+    if (gitignoreNext != null) {
+      await writeAtomic($, gitignorePath, gitignoreNext)
+      written.push(gitignorePath)
+    }
+    await writeAtomic($, configPath, buildConfigJson(config, d, at))
     written.push(configPath)
-    const projectsPath = join(globalDir, 'projects.json')
-    await $.fs.write(projectsPath, buildProjectsJson(await readJsonStrict($, projectsPath), d.repo, data, at))
+    await writeAtomic($, projectsPath, buildProjectsJson(projects, d.repo, data, at))
     written.push(projectsPath)
     await patch($, { phase: 'written', written, error: null })
   } catch (err) {
@@ -304,12 +349,16 @@ function Body(els: Elements, $: EngineInterface, d: MkWizardDraft, step: number,
       return (
         <Box flexDirection="column" gap={1}>
           <Text>Repo: <Text bold={true}>{d.repo ?? 'not a git repository'}</Text></Text>
-          <Select
-            key="wz-datamode" label="Data location" value={d.dataMode}
-            options={[{ value: 'repo', label: '<repo>/.matrixkoder/ (default)' }, { value: 'home', label: `~/.matrixkoder/projects/${d.slug}/` }]}
-            onSelect={v => refreshExisting($, { dataMode: v === 'home' ? 'home' : 'repo' })}
-          />
-          {d.dataMode === 'repo' && (d.gitignoreHas
+          {d.dataEnv != null
+            ? <Text color="yellow">{`$MATRIXKODER_DATA is set: data goes to ${d.dataEnv}`}</Text>
+            : (
+              <Select
+                key="wz-datamode" label="Data location" value={d.dataMode}
+                options={[{ value: 'repo', label: '<repo>/.matrixkoder/ (default)' }, { value: 'home', label: `${d.globalDir ?? '~/.matrixkoder'}/projects/${d.slug}/` }]}
+                onSelect={v => refreshExisting($, { dataMode: v === 'home' ? 'home' : 'repo' })}
+              />
+            )}
+          {d.dataEnv == null && d.dataMode === 'repo' && (d.gitignoreHas
             ? <Text dimColor={true}>.gitignore already ignores /.matrixkoder/</Text>
             : YesNo(els, $, d, 'gitignore', 'Add /.matrixkoder/ to .gitignore'))}
           <Text dimColor={true}>Data dir: {dir ?? '—'}</Text>
@@ -455,9 +504,9 @@ function Review(els: Elements, $: EngineInterface, d: MkWizardDraft) {
         <Text bold={true}>Will write</Text>
         <Text>{`${d.existingYaml && !d.replace ? 'keep   ' : d.existingYaml ? 'replace' : 'create '} ${data ?? '?'}/matrixkoder.yaml`}</Text>
         <Text>{`create  ${data ?? '?'}/plans/ and runs/`}</Text>
-        {d.dataMode === 'repo' && d.gitignore && !d.gitignoreHas && <Text>add     /.matrixkoder/ to .gitignore</Text>}
-        <Text>~/.matrixkoder/config.json (merge)</Text>
-        <Text>~/.matrixkoder/projects.json (upsert this repo)</Text>
+        {d.dataEnv == null && d.dataMode === 'repo' && d.gitignore && !d.gitignoreHas && <Text>add     /.matrixkoder/ to .gitignore</Text>}
+        <Text>{`${d.globalDir ?? '~/.matrixkoder'}/config.json (merge)`}</Text>
+        <Text>{`${d.globalDir ?? '~/.matrixkoder'}/projects.json (upsert this repo)`}</Text>
       </Box>
       {d.existingYaml && (
         <Select
@@ -471,22 +520,28 @@ function Review(els: Elements, $: EngineInterface, d: MkWizardDraft) {
         {yaml.slice(0, PREVIEW_LINES).map((l, i) => <Text key={`y${i}`} dimColor={true}>{l}</Text>)}
         {yaml.length > PREVIEW_LINES && <Text dimColor={true}>{`… ${yaml.length - PREVIEW_LINES} more lines`}</Text>}
       </Box>
-      <Button key="wz-write" variant="primary" hotkey="w" autoFocus={true} label="w Write these" onPress={() => writeAll($)} />
+      <Button key="wz-write" variant="primary" hotkey="w" label="w Write these" onPress={() => writeAll($)} />
     </Box>
   )
 }
 
+/** Steps 5-9 hold text Inputs: a letter or digit hotkey could swallow typed characters ("pnpm" -> Next), so
+ *  those steps draw no hotkeys at all. Next holds the initial focus (Enter); Tab walks to the rest. */
+const INPUT_STEPS = new Set([5, 6, 7, 8, 9])
+
 function Nav(els: Elements, $: EngineInterface, d: MkWizardDraft, step: number) {
   const { Box, Button } = els
   const done = d.phase === 'written'
+  const hk = (key: string): { hotkey: string } | Record<string, never> => (INPUT_STEPS.has(step) ? {} : { hotkey: key })
+  const lab = (key: string, text: string): string => (INPUT_STEPS.has(step) ? text : `${key} ${text}`)
   return (
     <Box flexDirection="row" gap={1}>
       {done
         ? <Button key="wz-close" variant="primary" hotkey="x" autoFocus={true} label="x Close" onPress={() => closeWizard($)} />
         : [
-          step > 1 && <Button key="wz-back" hotkey="b" label="b ← Back" onPress={() => goto($, step - 1)} />,
-          step < LAST_STEP && <Button key="wz-next" variant="primary" hotkey="n" autoFocus={true} label="n Next →" onPress={() => goto($, step + 1)} />,
-          <Button key="wz-cancel" role="dismiss" hotkey="c" label="c Cancel" onPress={() => closeWizard($)} />,
+          step > 1 && <Button key="wz-back" {...hk('b')} label={lab('b', '← Back')} onPress={() => goto($, step - 1)} />,
+          step < LAST_STEP && <Button key="wz-next" variant="primary" {...hk('n')} autoFocus={true} label={lab('n', 'Next →')} onPress={() => goto($, step + 1)} />,
+          <Button key="wz-cancel" role="dismiss" {...hk('c')} label={lab('c', 'Cancel')} onPress={() => closeWizard($)} />,
         ]}
     </Box>
   )

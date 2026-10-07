@@ -45,18 +45,28 @@ const PROCS: Record<string, string | null> = {
 type World = { argv: string[][]; opened: string[]; closed: string[]; state: Map<string, { value: unknown; version: number }> }
 
 /** clock, env, process (argv → canned stdout, unknown → exit 1), fs and ui.open/close. `procs` overrides PROCS. */
-function world(on: On, files: Files, procs: Record<string, string | null> = {}, env: Record<string, string> = {}): World {
+function world(on: On, files: Files, procs: Record<string, string | null> = {}, env: Record<string, string> = {}, unreadable: readonly string[] = []): World {
   const w: World = { argv: [], opened: [], closed: [], state: new Map() }
   worldOf = w
   const table = { ...PROCS, ...procs }
   mock.clock(on, { now: NOW })
   mock.env(on, { HOME, ...env })
   mockFs(on, files, [`${PROJECT_DIR}/.git`])
-  on('fs.exists', (_$, e) => ({ value: e.path in files }))
+  // `unreadable`: exists, but fs.read rejects (no content served), like an EACCES file
+  on('fs.exists', (_$, e) => ({ value: e.path in files || unreadable.includes(e.path) }))
   on('session.start', (_$, _e) => ({ cwd: PROJECT_DIR }))
   on('prompt.compose', (_$, _e) => ({ sections: [] }))
   on('process.run', (_$, e) => {
     w.argv.push([...e.argv])
+    // mv / cp act on the in-memory files, as the real commands would on disk
+    if (e.argv[0] === 'mv' || e.argv[0] === 'cp') {
+      const [src, dst] = [e.argv[e.argv.length - 2] ?? '', e.argv[e.argv.length - 1] ?? '']
+      if (src in files) {
+        files[dst] = files[src] ?? ''
+        if (e.argv[0] === 'mv') delete files[src]
+      }
+      return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     const key = e.argv[0] === 'mkdir' ? 'mkdir -p' : e.argv.join(' ')
     const out = table[key]
     return { value: out == null ? { exitCode: 1, stdout: '', stderr: 'not found', isStdoutTruncated: false, isStderrTruncated: false } : { exitCode: 0, stdout: out, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
@@ -383,7 +393,7 @@ test('data location home: yaml goes under ~/.matrixkoder/projects/<slug>/ and no
   await toReview(ui)
   await ui.press({ key: 'wz-write' })
   const dir = `${HOME}/.matrixkoder/projects/mk-proj`
-  expect(files[`${dir}/matrixkoder.yaml`]).toContain('data_dir: ~/.matrixkoder/projects/mk-proj/')
+  expect(files[`${dir}/matrixkoder.yaml`]).toContain(`data_dir: ${dir}/`)
   expect(files[`${PROJECT_DIR}/.gitignore`]).toBe('node_modules/\n')
   expect(JSON.parse(files[PROJECTS] ?? '{}')[PROJECT_DIR]).toEqual({ data_dir: dir, onboarded_at: ISO_NOW })
 })
@@ -437,7 +447,7 @@ test('an inline-placed wizard pane carries the fullscreen hint', async ($, on) =
 
 // ---------- keyboard: hotkeys and initial focus (live test: Enter/Tab never reached Next) ----------
 
-test('every wizard Button has a unique hotkey drawn in its label; the primary one holds the focus', async ($, on) => {
+test('hotkeys: unique and drawn on steps without text Inputs; none where an Input could lose typed letters', async ($, on) => {
   world(on, repoFiles())
   await $.session.start(sessionStart())
   await mk($, 'setup')
@@ -446,9 +456,15 @@ test('every wizard Button has a unique hotkey drawn in its label; the primary on
     const ui = await $.ui.mount({ plugin: 'matrixkoder', surface, component: 'Pane', requestId: WIZARD, props: paneProps(64) })
     for (let step = 1; step <= 10; step++) {
       const buttons = await ui.findAll({ type: 'Button' })
+      const hasInput = (await ui.findAll({ type: 'Input' })).length > 0
+      expect(hasInput, `${surface} step ${step} Input steps are exactly 5-9`).toBe(step >= 5 && step <= 9)
       const seen = new Set<string>()
       for (const b of buttons) {
         const hotkey = b.props.hotkey
+        if (hasInput) {
+          expect(hotkey, `${surface} step ${step} ${b.key}: a hotkey beside an Input could swallow typing`).toBeUndefined()
+          continue
+        }
         expect(typeof hotkey, `${surface} step ${step} ${b.key} has a hotkey`).toBe('string')
         expect(hotkey as string).toMatch(/^[a-z0-9]$/)
         expect(seen.has(hotkey as string), `${surface} step ${step} hotkey ${String(hotkey)} unique`).toBe(false)
@@ -456,13 +472,11 @@ test('every wizard Button has a unique hotkey drawn in its label; the primary on
         expect(b.text, `${surface} ${b.key} label shows its hotkey`).toContain(`${String(hotkey)} `)
         if (b.key != null && FIXED[b.key] != null) expect(hotkey).toBe(FIXED[b.key])
       }
-      const primary = buttons.find(b => b.props.autoFocus === true)
-      expect(primary?.key, `${surface} step ${step} initial focus`).toBe(step < 10 ? 'wz-next' : 'wz-write')
-      expect(buttons.filter(b => b.props.autoFocus === true).length).toBe(1)
+      // initial focus: Next (Enter) on every step but the last; Write never takes it, so held Enter cannot confirm
+      const focused = buttons.filter(b => b.props.autoFocus === true).map(b => b.key)
+      expect(focused, `${surface} step ${step} initial focus`).toEqual(step < 10 ? ['wz-next'] : [])
       if (step < 10) {
-        expect(await ui.find({ text: 'n Next →' })).toBeTruthy()
-        expect(await ui.find({ text: 'c Cancel' })).toBeTruthy()
-        if (step > 1) expect(await ui.find({ text: 'b ← Back' })).toBeTruthy()
+        expect(await ui.find({ text: hasInput ? 'Next →' : 'n Next →' })).toBeTruthy()
         await ui.press({ key: 'wz-next' })
       }
     }
@@ -474,4 +488,119 @@ test('every wizard Button has a unique hotkey drawn in its label; the primary on
     await ui.unmount()
     await mk($, 'setup')
   }
+})
+
+// ---------- r4: safe writes ----------
+
+const GITIGNORE = `${PROJECT_DIR}/.gitignore`
+
+test('an existing but unreadable .gitignore aborts the write and is never overwritten', async ($, on) => {
+  const files = repoFiles()
+  delete files[GITIGNORE] // exists (see world's `unreadable`) but cannot be read
+  const w = world(on, files, {}, {}, [GITIGNORE])
+  await $.session.start(sessionStart())
+  await mk($, 'setup')
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(64) })
+  await toReview(ui)
+  await ui.press({ key: 'wz-write' })
+  expect(await ui.find({ text: /cannot read .*\.gitignore.*not overwriting/ })).toBeTruthy()
+  expect(await ui.find({ text: /MatrixKoder is set up/ })).toBeUndefined()
+  expect(files[GITIGNORE], 'the unreadable file was not replaced').toBeUndefined()
+  expect(Object.keys(files).filter(p => p.includes('.matrixkoder') || p.endsWith('.tmp')), 'nothing at all was written').toEqual([])
+  expect(w.argv.some(a => a[0] === 'mv' || a[0] === 'mkdir')).toBe(false)
+})
+
+for (const victim of ['config.json', 'projects.json'] as const) {
+  test(`an unreadable existing ${victim} aborts before any write`, async ($, on) => {
+    const files = repoFiles()
+    world(on, files, {}, {}, [`${HOME}/.matrixkoder/${victim}`])
+    await $.session.start(sessionStart())
+    await mk($, 'setup')
+    const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(64) })
+    await toReview(ui)
+    await ui.press({ key: 'wz-write' })
+    expect(await ui.find({ text: new RegExp(`cannot read .*${victim.replace('.', '\\.')}`) })).toBeTruthy()
+    expect(Object.keys(files).filter(p => p.includes('.matrixkoder') || p.endsWith('.tmp'))).toEqual([])
+    expect(files[GITIGNORE]).toBe('node_modules/\n')
+  })
+}
+
+test('a non-object config.json ([]) aborts instead of being replaced', async ($, on) => {
+  const files = repoFiles()
+  files[CONFIG] = '[]'
+  world(on, files)
+  await $.session.start(sessionStart())
+  await mk($, 'setup')
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(64) })
+  await toReview(ui)
+  await ui.press({ key: 'wz-write' })
+  expect(files[CONFIG]).toBe('[]')
+  expect(await ui.find({ text: /not a JSON object/ })).toBeTruthy()
+})
+
+test('a matrixkoder.yaml that appeared after detection goes back to the replace confirm and is not overwritten', async ($, on) => {
+  const files = repoFiles()
+  const w = world(on, files)
+  await $.session.start(sessionStart())
+  await mk($, 'setup')
+  expect(draftOf().existingYaml).toBe(false)
+  files[YAML] = '# created by someone else after detection\n'
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(64) })
+  await toReview(ui)
+  await ui.press({ key: 'wz-write' })
+  expect(files[YAML]).toBe('# created by someone else after detection\n')
+  expect(await ui.find({ text: /appeared since detection/ })).toBeTruthy()
+  expect(await ui.find({ key: 'wz-replace' }), 'the replace confirm is now offered').toBeTruthy()
+  expect(files[PROJECTS], 'nothing else was written').toBeUndefined()
+  expect(w.argv.some(a => a[0] === 'mv')).toBe(false)
+  // keep (default) then write again: the yaml stays, the rest is written
+  await ui.press({ key: 'wz-write' })
+  expect(files[YAML]).toBe('# created by someone else after detection\n')
+  expect(files[PROJECTS]).toBeDefined()
+  expect(await ui.find({ text: /MatrixKoder is set up/ })).toBeTruthy()
+})
+
+test('writes go through a .tmp file and mv; replacing a yaml keeps a .bak', async ($, on) => {
+  const files = repoFiles()
+  files[YAML] = '# old\n'
+  const w = world(on, files)
+  await $.session.start(sessionStart())
+  await mk($, 'setup')
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(64) })
+  await toReview(ui)
+  await ui.select({ key: 'wz-replace', value: 'replace' })
+  await ui.press({ key: 'wz-write' })
+  const moves = w.argv.filter(a => a[0] === 'mv').map(a => a[a.length - 1])
+  expect(moves).toEqual([YAML, GITIGNORE, CONFIG, PROJECTS])
+  for (const a of w.argv.filter(x => x[0] === 'mv')) expect(a[a.length - 2]).toBe(`${a[a.length - 1]}.tmp`)
+  expect(Object.keys(files).filter(p => p.endsWith('.tmp')), 'no temp file is left').toEqual([])
+  expect(files[`${YAML}.bak`]).toBe('# old\n')
+  expect(files[YAML]).toContain('integration_branch')
+})
+
+test('$MATRIXKODER_DATA and $MATRIXKODER_HOME are honoured by the wizard', async ($, on) => {
+  const files = repoFiles()
+  world(on, files, {}, { MATRIXKODER_DATA: '/srv/mk-data', MATRIXKODER_HOME: '/srv/mk-home' })
+  await $.session.start(sessionStart())
+  await mk($, 'setup')
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(64) })
+  await ui.press({ key: 'wz-next' })
+  expect(await ui.find({ text: /MATRIXKODER_DATA is set: data goes to \/srv\/mk-data/ })).toBeTruthy()
+  expect(await ui.find({ key: 'wz-datamode' })).toBeUndefined()
+  await toReview(ui)
+  await ui.press({ key: 'wz-write' })
+  expect(files['/srv/mk-data/matrixkoder.yaml']).toContain('data_dir: /srv/mk-data/')
+  expect(JSON.parse(files['/srv/mk-home/projects.json'] ?? 'null')).toEqual({ [PROJECT_DIR]: { data_dir: '/srv/mk-data', onboarded_at: ISO_NOW } })
+  expect(files['/srv/mk-home/config.json']).toBeDefined()
+  expect(files[`${HOME}/.matrixkoder/projects.json`]).toBeUndefined()
+  expect(files[GITIGNORE], 'env data dir lives outside the repo: no .gitignore edit').toBe('node_modules/\n')
+})
+
+test('yaml quoting: numberish, date-ish and NEL values are quoted', () => {
+  for (const v of ['0x1F', '1_000', '2026-10-08', '.inf', '.nan', '-1.5', '12', '\u0085x']) {
+    expect(inline(v).startsWith('"'), v).toBe(true)
+  }
+  expect(inline('\u0085x')).toBe('"\\u0085x"')
+  expect(inline('.matrixkoder/')).toBe('.matrixkoder/')
+  expect(inline('../x')).toBe('../x')
 })

@@ -153,6 +153,10 @@ export type MkWizardDraft = {
   repo: string | null
   slug: string
   home: string | null
+  /** global dir: $MATRIXKODER_HOME, else ~/.matrixkoder */
+  globalDir: string | null
+  /** $MATRIXKODER_DATA when set: every reader uses it, so the wizard writes there */
+  dataEnv: string | null
   installMode: 'dev' | 'marketplace'
   pluginRoot: string
   branch: string
