@@ -38,6 +38,7 @@ function tokenize(s: string, subs: string[]): string[][] {
   }
   for (let i = 0; i < s.length; i++) {
     const c = s[i]
+    if (c === undefined) continue
     if (c === '\\') {
       if (s[i + 1] !== '\n') {
         w += s[i + 1] ?? ''
@@ -105,13 +106,18 @@ function stripPrefixes(ws: readonly string[]): readonly string[] {
   let i = 0
   while (i < ws.length) {
     const w = ws[i]
+    if (!w) break
     if (w === '{' || w === '!' || /^[A-Za-z_]\w*=/.test(w)) {
       i++
       continue
     }
     const valued = WRAPPERS[base(w)]
     if (!valued) break
-    for (i++; i < ws.length && ws[i].startsWith('-'); i++) if (valued.includes(ws[i])) i++
+    for (i++; i < ws.length; i++) {
+      const opt = ws[i]
+      if (!opt || !opt.startsWith('-')) break
+      if (valued.includes(opt)) i++
+    }
   }
   return ws.slice(i)
 }
@@ -124,6 +130,7 @@ function innerScript(ws: readonly string[]): string | undefined {
   let hasC = false
   for (let i = 1; i < ws.length; i++) {
     const w = ws[i]
+    if (!w) continue
     if (['-o', '+o', '-O', '+O', '--rcfile', '--init-file'].includes(w)) i++
     else if (/^[-+]/.test(w)) hasC ||= /^-[a-zA-Z]*c/.test(w)
     else return hasC ? w : undefined
@@ -131,7 +138,8 @@ function innerScript(ws: readonly string[]): string | undefined {
   return undefined
 }
 
-const GIT_UNDO = new Set(['checkout', 'stash', 'reset', 'clean'])
+// Read-only stash forms (list, show) are allowed below; all other stash forms are denied.
+const GIT_UNDO = new Set(['checkout', 'reset', 'clean'])
 const GIT_VALUED = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--config-env', '--super-prefix'])
 const COMMIT_VALUED = new Set([
   '--message', '--file', '--author', '--date', '--template', '--reuse-message', '--reedit-message',
@@ -146,11 +154,19 @@ const optsOf = (rest: readonly string[]) => {
 function gitBan(ws: readonly string[]): Ban | undefined {
   if (base(ws[0] ?? '') !== 'git') return undefined
   let i = 1
-  while (i < ws.length && ws[i].startsWith('-')) i += GIT_VALUED.has(ws[i]) ? 2 : 1
+  while (i < ws.length) {
+    const opt = ws[i]
+    if (!opt || !opt.startsWith('-')) break
+    i += GIT_VALUED.has(opt) ? 2 : 1
+  }
   const sub = ws[i]
   const rest = ws.slice(i + 1)
   if (sub === undefined) return undefined
   if (GIT_UNDO.has(sub)) return { cmd: `git ${sub}`, why: 'destructive git undo' }
+  if (sub === 'stash') {
+    if (rest[0] === 'list' || rest[0] === 'show') return undefined
+    return { cmd: 'git stash', why: 'destructive git undo' }
+  }
   if (sub === 'restore') {
     // --staged alone only unstages; anything touching the worktree discards edits
     const opts = optsOf(rest)
@@ -163,8 +179,9 @@ function gitBan(ws: readonly string[]): Ban | undefined {
     return f ? { cmd: `git switch ${f}`, why: 'discards worktree edits' } : undefined
   }
   if (sub === 'commit') {
-    for (let j = 0; j < rest.length && rest[j] !== '--'; j++) {
+    for (let j = 0; j < rest.length; j++) {
       const w = rest[j]
+      if (!w || w === '--') break
       if (/^--am(e(nd?)?)?$/.test(w)) return { cmd: 'git commit --amend', why: 'history rewrite' }
       if (COMMIT_VALUED.has(w) || /^-[a-zA-Z]*[mFCct]$/.test(w)) j++ // skip the message/value: `-m '--amend'`
     }
@@ -226,11 +243,13 @@ function shape(ws: readonly string[]) {
 /** A banned item matches when the command name matches, its flags all appear (any order or split: `rm -r -f`
  * hits `rm -rf`) and its other words lead the command's positional words. */
 function bannedHit(ws: readonly string[], banned: readonly string[]): Ban | undefined {
-  if (!ws.length) return undefined
+  const w0 = ws[0]
+  if (!w0) return undefined
   const got = shape(ws)
   const hit = banned.find(c => {
     const cs = c.split(/\s+/).filter(Boolean)
-    if (!cs.length || (cs[0].includes('/') ? ws[0] !== cs[0] : base(ws[0]) !== cs[0])) return false
+    const c0 = cs[0]
+    if (!c0 || (c0.includes('/') ? w0 !== c0 : base(w0) !== c0)) return false
     const want = shape(cs)
     return (
       [...want.letters].every(l => got.letters.has(l)) &&
@@ -265,9 +284,9 @@ function check(command: string, banned: readonly string[], depth = 0): Ban | und
 function scalar(s: string): string {
   const t = s.trim()
   const dq = t.match(/^"((?:[^"\\]|\\.)*)"/)
-  if (dq) return dq[1].replace(/\\(.)/g, '$1')
+  if (dq && dq[1] !== undefined) return dq[1].replace(/\\(.)/g, '$1')
   const sq = t.match(/^'((?:[^']|'')*)'/)
-  if (sq) return sq[1].replace(/''/g, "'")
+  if (sq && sq[1] !== undefined) return sq[1].replace(/''/g, "'")
   return t.replace(/(^|\s)#.*$/, '').trim()
 }
 
@@ -279,9 +298,9 @@ function parseBannedCommands(yaml: string): string[] {
     const line = raw.trim()
     if (!inList) {
       const m = line.match(/^banned_commands:\s*(.*)$/)
-      if (!m) continue
+      if (!m || m[1] === undefined) continue
       const flow = m[1].match(/^\[(.*)\]/)
-      if (flow) {
+      if (flow && flow[1] !== undefined) {
         // ponytail: one-line flow list only; a multi-line one reads as empty
         for (const item of flow[1].matchAll(/"(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^,]+/g)) {
           const v = scalar(item[0])

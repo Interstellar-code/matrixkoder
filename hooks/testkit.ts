@@ -5,7 +5,8 @@
 // in memory; mockWorld bottoms every other noun the mod touches, with optional
 // recorders for the chip and toasts.
 import { mock } from 'claude-code/testing'
-import type { On, Plugin } from 'claude-code'
+import type { On } from 'claude-code'
+import type { Plugin } from 'claude-code/testing'
 
 export type Files = Record<string, string>
 
@@ -124,9 +125,30 @@ export function sessionStartIn(cwd: string): { cwd: string; surface: 'terminal';
   return { cwd, surface: 'terminal', isInteractive: true }
 }
 
+/** A parsed JSON object, the shape every fixture mutator works on. */
+export type Json = Record<string, unknown>
+
+const parseObj = (text: string | undefined): Json => {
+  const v: unknown = JSON.parse(text ?? '{}')
+  return typeof v === 'object' && v !== null && !Array.isArray(v) ? (v as Json) : {}
+}
+
+/** The run's tasks, narrowed to objects (a malformed entry is skipped, not fatal). */
+export const tasksOf = (run: Json): Json[] =>
+  Array.isArray(run.tasks) ? run.tasks.filter((t): t is Json => typeof t === 'object' && t !== null) : []
+
+/** The usage ledger's agents map, narrowed IN PLACE (mutators delete entries). */
+export const agentsOf = (usage: Json): Record<string, Json> => {
+  const a = usage.agents
+  return typeof a === 'object' && a !== null && !Array.isArray(a) ? (a as Record<string, Json>) : {}
+}
+
+/** One agent's usage entry, narrowed (undefined when absent). */
+export const agentOf = (usage: Json, name: string): Json | undefined => agentsOf(usage)[name]
+
 /** Rewrite the run fixture (source + dict) in one step; returns the parsed run. */
-export function setRun(files: Files, mutate: (run: Record<string, unknown>) => void): Record<string, unknown> {
-  const run = JSON.parse(files['/fixtures/run.json'])
+export function setRun(files: Files, mutate: (run: Json) => void): Json {
+  const run = parseObj(files['/fixtures/run.json'])
   mutate(run)
   files['/fixtures/run.json'] = JSON.stringify(run)
   files[RUN_PATH] = JSON.stringify(run)
@@ -134,8 +156,8 @@ export function setRun(files: Files, mutate: (run: Record<string, unknown>) => v
 }
 
 /** Rewrite the usage fixture (source + dict) in one step. */
-export function setUsage(files: Files, mutate: (usage: Record<string, unknown>) => void): void {
-  const usage = JSON.parse(files['/fixtures/usage.json'])
+export function setUsage(files: Files, mutate: (usage: Json) => void): void {
+  const usage = parseObj(files['/fixtures/usage.json'])
   mutate(usage)
   files['/fixtures/usage.json'] = JSON.stringify(usage)
   files[USAGE_PATH] = JSON.stringify(usage)
@@ -161,7 +183,8 @@ export function mockFs(
   })
   on('fs.read', (_$, e, next) => {
     reads.push(e.path)
-    return e.path in files ? { value: files[e.path] } : next(e)
+    if (e.path in files) return { value: files[e.path] ?? '' }
+    return next(e)
   })
   on('fs.stat', (_$, e, next) => {
     if (dirs.includes(e.path)) return { value: { kind: 'dir', size: 0, mtimeMs: 0, isLink: false } }
@@ -177,6 +200,9 @@ export function mockFs(
  * the chip and toast texts, `process` taps poll argv, `env` adds variables
  * (e.g. MATRIXKODER_DATA). Returns the mock clock (for advance()).
  */
+/** what mockWorld hands back: the mock clock (for advance()) */
+export type MockWorld = ReturnType<typeof mock.clock>
+
 export function mockWorld(
   on: On,
   opts: {
@@ -187,7 +213,7 @@ export function mockWorld(
     open?: (id: string) => void
     env?: Record<string, string>
   } = {},
-): ReturnType<ReturnType<typeof mock.clock>> {
+): MockWorld {
   const clock = mock.clock(on, { now: NOW })
   mock.env(on, { HOME: '/home/mk', ...opts.env })
   // engine events (session.start, prompt.compose) are answered bare; noun
@@ -196,7 +222,7 @@ export function mockWorld(
   on('prompt.compose', (_$, _e) => ({ sections: [] }))
   on('process.run', (_$, e) => {
     opts.process?.(e.argv)
-    return { value: { exitCode: 0, stdout: '', stderr: '' } }
+    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('ui.open', (_$, e) => {
     opts.open?.(e.id)

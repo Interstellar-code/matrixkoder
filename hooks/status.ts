@@ -84,17 +84,15 @@ export function chipText(snap: MkSnapshot): string {
   const { total, done, byStatus } = counts(run)
   const building = (byStatus.get('building') ?? 0) + (byStatus.get('verifying') ?? 0)
   if (run.waiting) return `⬡ mk · ⚠ 1 waiting on you · ${building} building`
-  const stalled = pick(run, ['stalled'])
-  if (stalled.length > 0) {
-    const t = stalled[0]
-    const mins = minutesSince(t.updated, snap.now)
-    return `⬡ mk · ⚠ ${t.id} stalled${mins != null ? ` (${mins}m)` : ''} · ${building} building`
+  const stalled = pick(run, ['stalled'])[0]
+  if (stalled) {
+    const mins = minutesSince(stalled.updated, snap.now)
+    return `⬡ mk · ⚠ ${stalled.id} stalled${mins != null ? ` (${mins}m)` : ''} · ${building} building`
   }
-  const blocked = pick(run, ['blocked'])
-  if (blocked.length > 0) {
-    const t = blocked[0]
-    const deps = (t.deps ?? []).join(', ') || 'dependencies'
-    return `⬡ mk · ⊘ ${t.id} blocked by ${deps} · ${building} building`
+  const blocked = pick(run, ['blocked'])[0]
+  if (blocked) {
+    const deps = (blocked.deps ?? []).join(', ') || 'dependencies'
+    return `⬡ mk · ⊘ ${blocked.id} blocked by ${deps} · ${building} building`
   }
   if (done === total && total > 0) return `⬡ mk · ✓ all ${total} tasks merged · stage ${run.stage}/12`
   const exhausted = exhaustedAgent(snap)
