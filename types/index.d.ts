@@ -101,6 +101,10 @@ declare module 'claude-code' {
       wakeEventLines: { readonly byId: number }
       /** wake.ts: last wake submit timestamp per task:status id */
       wakeSentAt: { readonly byId: number }
+      /** wizard.tsx: current step, 1..10 */
+      wizardStep: number
+      /** wizard.tsx: detection + answers until the review step writes them */
+      wizardDraft: MkWizardDraft
     }
   }
 }
@@ -113,4 +117,70 @@ declare module 'claude-code' {
       paneOpen: boolean
     }
   }
+}
+
+// ---- onboarding wizard (hooks/wizard.tsx): draft answers, kept in $.state until the review step writes ----
+
+export type MkWizardAgent = {
+  found: boolean
+  path: string | null
+  /** the user's toggle; claude is always on */
+  enabled: boolean
+  /** `agy models` / `opencode models` first columns, capped */
+  models: readonly string[]
+}
+
+export type MkWizardGates = {
+  install: string
+  test: string
+  typecheck: string
+  lint_changed: string
+  format_changed: string
+}
+
+export type MkWizardDraft = {
+  /** detection finished; false until openWizard's scan resolves */
+  loaded: boolean
+  /** main-checkout path of the repo (a linked worktree resolves to it); null outside git */
+  repo: string | null
+  slug: string
+  home: string | null
+  installMode: 'dev' | 'marketplace'
+  pluginRoot: string
+  branch: string
+  dataMode: 'repo' | 'home'
+  /** add /.matrixkoder/ to <repo>/.gitignore (repo mode only) */
+  gitignore: boolean
+  gitignoreHas: boolean
+  agents: Readonly<Record<string, MkWizardAgent>>
+  codexbarVersion: string | null
+  /** providers offered as toggles, and the ones switched on */
+  providersAll: readonly string[]
+  providersOn: readonly string[]
+  gates: MkWizardGates
+  gatesFrom: string
+  banned: readonly string[]
+  /** null = derive from the enabled agents */
+  builderOrder: string | null
+  maxLanes: string
+  claudeFiveHour: string
+  claudeWeekly: string
+  preauthorised: string
+  skipPermissions: boolean
+  qaFrontend: boolean
+  qaStart: string
+  qaDevUrl: string
+  qaThemes: string
+  qaMockups: string
+  qaTarget: 'local-main' | 'branch'
+  autoOpen: boolean
+  chip: boolean
+  toasts: boolean
+  pollMin: string
+  existingYaml: boolean
+  /** "replace?" confirm for an existing matrixkoder.yaml; default keep */
+  replace: boolean
+  phase: 'editing' | 'written' | 'error'
+  written: readonly string[]
+  error: string | null
 }
