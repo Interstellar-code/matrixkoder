@@ -1,0 +1,1 @@
+[{"error":{"message":"Codex connection failed: chatgpt authentication required to read rate limits","code":1,"kind":"provider"},"source":"auto","provider":"codex"}]
