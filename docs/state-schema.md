@@ -140,6 +140,24 @@ entry, and clears them (sets `exhausted_until` to `null`, may drop the rest) onc
 passed. Readers: an agent is exhausted while `exhausted_until` is non-null and in the future; null or
 past = not blocked by pane text (CodexBar windows still apply).
 
+## Usage ledger pools (mk-usage.py)
+
+Each `agents.<kind>` entry groups CodexBar windows into **pools** (each window gets a `pool` field;
+duplicates with the same pool/kind/`resets_at` are collapsed, preferring `antigravity-quota-summary-*` ids).
+Mapping (`POOL_RULES` in `mk-usage.py`): agy `gemini` / `claude-gpt`; claude `fable` (Fable only) / `default`;
+everything else `default`.
+
+```json
+{"agy": {"five_hour": {"used_pct": 19.6, "resets_at": "…"}, "weekly": {"used_pct": 53.9, "resets_at": "…"},
+  "exhausted_until": null, "available_pools": ["gemini"],
+  "pools": {"gemini": {"five_hour": {}, "weekly": {}, "exhausted_until": null},
+            "claude-gpt": {"five_hour": {}, "weekly": {}, "exhausted_until": "2026-10-13T06:00:45Z"}}}}
+```
+
+- `pools.<name>` = `{five_hour, weekly, exhausted_until}`; `exhausted_until` = latest reset among that pool's windows at >= 100%, else null.
+- Agent-level `five_hour` / `weekly` = the primary pool (agy `gemini`, others `default`).
+- Agent-level `exhausted_until` is set only when EVERY pool is exhausted (earliest of the pool resets). `available_pools` lists pools not exhausted — routers should check it, not just `exhausted_until`.
+
 ## CLI
 
 | Command | Flags |

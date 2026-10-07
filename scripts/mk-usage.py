@@ -142,6 +142,53 @@ def run_codexbar_provider(provider, timeout=60):
         }
 
 
+# Pool mapping: (agent, substring in window id or lowercase title prefix) -> pool. Extend here.
+POOL_RULES = {
+    "agy": [("gemini", ("-gemini-",), ("gemini",)), ("claude-gpt", ("-3p-",), ("claude and gpt", "claude/gpt"))],
+    "claude": [("fable", ("scoped-fable",), ("fable only",))],
+}
+PRIMARY_POOL = {"agy": "gemini"}  # agent-level five_hour/weekly come from this pool (default: "default")
+
+
+def pool_of(agent_key, win_id, title):
+    wid, t = str(win_id or "").lower(), str(title or "").lower()
+    for name, id_subs, title_prefixes in POOL_RULES.get(agent_key, []):
+        if any(s in wid for s in id_subs) or t.startswith(title_prefixes):
+            return name
+    return "default"
+
+
+def dedupe_windows(windows):
+    """One window per (pool, kind, resets_at); prefer antigravity-quota-summary-* ids."""
+    out, seen = [], {}
+    for w in windows:
+        if not w.get("resets_at"):
+            out.append(w)
+            continue
+        key = (w["pool"], w["kind"], w["resets_at"])
+        if key not in seen:
+            seen[key] = len(out)
+            out.append(w)
+        elif str(w["id"]).startswith("antigravity-quota-summary-") and not str(out[seen[key]]["id"]).startswith("antigravity-quota-summary-"):
+            out[seen[key]] = w
+    return out
+
+
+def summarize_pool(ws):
+    def best(kind):
+        c = [w for w in ws if w["kind"] == kind]
+        if not c:
+            return None
+        b = max(c, key=lambda w: (w["used_pct"], w["resets_at"] or ""))
+        return {"used_pct": b["used_pct"], "resets_at": b["resets_at"]}
+
+    ex = [w for w in ws if w.get("used_pct", 0) >= 100 and w.get("resets_at")]
+    until = None
+    if ex:
+        until = max(ex, key=lambda w: parse_iso(w["resets_at"]) or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc))["resets_at"]
+    return {"five_hour": best("5h"), "weekly": best("week"), "exhausted_until": until}
+
+
 def normalize_provider_entry(provider, raw_result_or_json, existing_entry=None, now=None):
     now = now or datetime.datetime.now().astimezone()
     existing_entry = existing_entry or {}
@@ -303,30 +350,30 @@ def normalize_provider_entry(provider, raw_result_or_json, existing_entry=None, 
         if isinstance(ew, dict):
             add_window(ew.get("id"), ew.get("window") or {}, custom_title=ew.get("title"))
 
-    # five_hour window with highest used_pct
-    five_hour_cand = [w for w in windows if w["kind"] == "5h"]
-    if five_hour_cand:
-        best_5h = max(five_hour_cand, key=lambda w: (w["used_pct"], w["resets_at"] or ""))
-        five_hour = {"used_pct": best_5h["used_pct"], "resets_at": best_5h["resets_at"]}
-    else:
-        five_hour = None
+    agent_key = PROVIDER_MAP.get(provider, provider)
+    for w in windows:
+        w["pool"] = pool_of(agent_key, w["id"], w["title"])
+    windows = dedupe_windows(windows)
 
-    # weekly window with highest used_pct
-    weekly_cand = [w for w in windows if w["kind"] == "week"]
-    if weekly_cand:
-        best_wk = max(weekly_cand, key=lambda w: (w["used_pct"], w["resets_at"] or ""))
-        weekly = {"used_pct": best_wk["used_pct"], "resets_at": best_wk["resets_at"]}
-    else:
-        weekly = None
+    pools = {}
+    for w in windows:
+        pools.setdefault(w["pool"], []).append(w)
+    pools = {name: summarize_pool(ws) for name, ws in pools.items()}
+    available_pools = [n for n, pl in pools.items() if not pl["exhausted_until"]]
 
-    # exhausted_until: latest resets_at among windows at >= 100%, else null
-    exhausted_cand = [w for w in windows if w.get("used_pct", 0) >= 100 and w.get("resets_at")]
-    if exhausted_cand:
-        latest_win = max(
-            exhausted_cand,
-            key=lambda w: parse_iso(w["resets_at"]) or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc),
+    primary_name = PRIMARY_POOL.get(agent_key, "default")
+    if primary_name not in pools and pools:
+        primary_name = next(iter(pools))
+    prim = pools.get(primary_name) or {}
+    five_hour = prim.get("five_hour")
+    weekly = prim.get("weekly")
+
+    # agent exhausted only when EVERY pool is exhausted: earliest of the pool resets
+    if pools and not available_pools:
+        cb_exhausted_until = min(
+            (pl["exhausted_until"] for pl in pools.values()),
+            key=lambda t: parse_iso(t) or datetime.datetime.max.replace(tzinfo=datetime.timezone.utc),
         )
-        cb_exhausted_until = latest_win["resets_at"]
     else:
         cb_exhausted_until = None
 
@@ -337,6 +384,8 @@ def normalize_provider_entry(provider, raw_result_or_json, existing_entry=None, 
         "windows": windows,
         "five_hour": five_hour,
         "weekly": weekly,
+        "pools": pools,
+        "available_pools": available_pools,
     }
 
     if prev_future:
@@ -443,28 +492,31 @@ def self_test():
 
     assert agy_norm["status"] == "ok"
     assert agy_norm["source"] == "codexbar"
-    # Primary window has windowMinutes=10080 -> kind is "week", NEVER "5h"
-    primary_win = next(w for w in agy_norm["windows"] if w["id"] == "primary")
-    assert primary_win["kind"] == "week"
-    assert primary_win["title"] == "Gemini Models"
-    assert primary_win["used_pct"] == 51.9
+    # Duplicates collapsed: primary == gemini-weekly, secondary == 3p-weekly (prefer quota-summary ids)
+    assert not any(w["id"] in ("primary", "secondary") for w in agy_norm["windows"])
+    gem_wk = [w for w in agy_norm["windows"] if w["pool"] == "gemini" and w["kind"] == "week"]
+    assert len(gem_wk) == 1 and gem_wk[0]["id"] == "antigravity-quota-summary-gemini-weekly"
+    assert gem_wk[0]["used_pct"] == 51.9 and gem_wk[0]["kind"] == "week"  # AGY primary was weekly, never 5h
+    cg_wk = [w for w in agy_norm["windows"] if w["pool"] == "claude-gpt" and w["kind"] == "week"]
+    assert len(cg_wk) == 1 and cg_wk[0]["used_pct"] == 100
 
-    # Secondary window
-    sec_win = next(w for w in agy_norm["windows"] if w["id"] == "secondary")
-    assert sec_win["kind"] == "week"
-    assert sec_win["title"] == "Claude and GPT"
-    assert sec_win["used_pct"] == 100
-
-    # highest-weekly pick among all weekly windows (51.9% and 100%) -> picks 100%
-    assert agy_norm["weekly"]["used_pct"] == 100
-    assert agy_norm["weekly"]["resets_at"] == "2026-10-13T06:00:45Z"
-
-    # five_hour pick -> picks Gemini 5-hour at 10.5%
+    # Pools: claude-gpt exhausted, gemini still usable -> agent NOT exhausted
+    assert agy_norm["pools"]["claude-gpt"]["exhausted_until"] == "2026-10-13T06:00:45Z"
+    assert agy_norm["pools"]["gemini"]["exhausted_until"] is None
+    assert agy_norm["available_pools"] == ["gemini"]
+    assert agy_norm["exhausted_until"] is None
+    assert agy_norm["weekly"] == {"used_pct": 51.9, "resets_at": "2026-10-11T12:32:16Z"}
     assert agy_norm["five_hour"]["used_pct"] == 10.5
     assert agy_norm["five_hour"]["resets_at"] == "2026-10-07T20:26:09Z"
 
-    # exhausted_until from window at 100%
-    assert agy_norm["exhausted_until"] == "2026-10-13T06:00:45Z"
+    # Both pools exhausted -> agent exhausted until the EARLIEST pool reset
+    both = json.loads(json.dumps(agy_raw))
+    for ew in both[0]["usage"]["extraRateWindows"]:
+        if ew["id"] == "antigravity-quota-summary-gemini-weekly":
+            ew["window"]["usedPercent"] = 100
+    both_norm = normalize_provider_entry("antigravity", both, now=ref_now_future)
+    assert both_norm["available_pools"] == []
+    assert both_norm["exhausted_until"] == "2026-10-11T12:32:16Z"
 
     # 3. Claude fixture: kind 5h for primary, week for secondary, Fable only in windows
     claude_fixture_path = os.path.join(fixtures_dir, "codexbar-claude.json")
@@ -491,6 +543,9 @@ def self_test():
     assert claude_norm["five_hour"] == {"used_pct": 17, "resets_at": "2026-10-07T20:30:00Z"}
     assert claude_norm["weekly"] == {"used_pct": 38, "resets_at": "2026-10-13T05:00:00Z"}
     assert claude_norm["exhausted_until"] is None
+    assert c_fable["pool"] == "fable" and c_primary["pool"] == "default"
+    assert claude_norm["pools"]["fable"]["weekly"]["used_pct"] == 14
+    assert claude_norm["available_pools"] == ["default", "fable"]
 
     # 4. Reset-passed -> 0 and reset_passed: true
     # Use a reference time AFTER 20:26:09Z (e.g. 21:00:00Z)
