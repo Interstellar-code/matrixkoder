@@ -457,18 +457,24 @@ def cmd_render(a, st):
 
 
 def build_parser():
+    # --data/--by/--run parse before AND after the subcommand: top-level copies keep
+    # the defaults, subparser copies SUPPRESS so they never clobber an earlier value.
+    top_p = Parser(add_help=False)
+    top_p.add_argument("--data")
+    top_p.add_argument("--by", default="orchestrator")
+    top_p.add_argument("--run")
     data_p = Parser(add_help=False)
-    data_p.add_argument("--data")
-    data_p.add_argument("--by", default="orchestrator")
+    data_p.add_argument("--data", default=argparse.SUPPRESS)
+    data_p.add_argument("--by", default=argparse.SUPPRESS)
     run_p = Parser(add_help=False)
-    run_p.add_argument("--run")
-    p = Parser(prog="mk-state.py")
+    run_p.add_argument("--run", default=argparse.SUPPRESS)
+    p = Parser(prog="mk-state.py", parents=[top_p])
     sub = p.add_subparsers(dest="cmd", required=True)
 
     run = sub.add_parser("run").add_subparsers(dest="action", required=True)
     for name in ("init", "list", "get", "set", "stage", "archive"):
         r = run.add_parser(name, parents=[data_p])
-        r.add_argument("--id", "--run", dest="run")
+        r.add_argument("--id", "--run", dest="run", default=argparse.SUPPRESS)
         r.set_defaults(func=cmd_run)
     for name in ("get", "archive"):  # `run get r1` works as well as `run get --id r1`
         run.choices[name].add_argument("pos_id", nargs="?")
@@ -707,6 +713,14 @@ def self_test():
         mk("run", "init", "--id", "w1", "--feature", "F", "--branch", "b", data_arg=False, cwd=lane)
         assert os.path.exists(os.path.join(repo, ".matrixkoder", "runs", "w1", "run.json"))
         assert not os.path.exists(os.path.join(lane, ".matrixkoder"))
+
+        # global --data/--by/--run also parse before the subcommand (after: every mk above)
+        mk("--data", data, "run", "init", "--id", "f1", "--feature", "F", "--branch", "b", data_arg=False)
+        assert os.path.exists(os.path.join(data, "runs", "f1", "run.json"))
+        front = mk("--data", data, "--by", "front", "--run", "r1", "event", "--type", "note",
+                   "--text", "flags before the subcommand", data_arg=False)["event"]
+        assert front["by"] == "front"  # subparser SUPPRESS keeps the earlier --by
+        assert mk("--data", data, "--run", "r1", "task", "get", "T1", data_arg=False)["task"]["id"] == "T1"
         print("mk-state self-test ok")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

@@ -21,7 +21,7 @@ First `/mk` in a repo runs the onboarding wizard (`skills/matrixkoder/reference/
 | Path | Content |
 |---|---|
 | `skills/matrixkoder/` | `SKILL.md` loop; `reference/` (loop, pool-and-usage, safety, onboarding, lessons); `templates/` |
-| `scripts/` | `mk-state.py` (only writer of run state), `mk-usage.py`, `lane-health.py`, `lane-watch.py` |
+| `scripts/` | `mk-state.py` (only writer of run state), `mk-usage.py` (being built, P2), `lane-health.py`, `lane-watch.py` |
 | `agents/` | `effort-low\|medium\|high\|max` effort-pinned workers; as a plugin they are `matrixkoder:effort-*` |
 | `hooks/`, `types/` | dashboard mod (added in a later phase) |
 | `docs/` | plan, spikes, state schema, dashboard design |
