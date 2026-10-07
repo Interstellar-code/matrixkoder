@@ -203,6 +203,76 @@ test('reads a flow-list banned_commands', async ($, on) => {
   expect(await misses(c => $.tool.call(c), ['make test'], false)).toEqual([])
 })
 
+// Follow-up round: ref/history-destroying forms. Each was ALLOWED by 607cee1.
+const DENY_REFS = [
+  'git branch -D lane/x',
+  'git branch --delete --force lane/x',
+  'git branch -d -f lane/x',
+  'git branch -df lane/x',
+  'git -C ../wt branch -D x',
+  'git rebase main',
+  'git rebase -i HEAD~3',
+  'git rebase --onto main a b',
+  'bash -c "git rebase main"',
+  'git pull --rebase',
+  'git pull -r origin main',
+  'git pull --rebase=interactive',
+  'git reflog expire --expire=now --all',
+  'git reflog delete HEAD@{1}',
+  'git push --delete origin lane/x',
+  'git push -d origin lane/x',
+  'git push origin :lane/x',
+  'git push --mirror backup',
+  'git push --prune origin',
+  'env X=1 git push origin :old',
+  'git update-ref -d refs/heads/x',
+  'git gc --prune=now',
+  'git gc --prune=2.weeks.ago',
+  'git gc --prune',
+  'sudo git gc --aggressive --prune=now',
+]
+
+const ALLOW_REFS = [
+  'git branch -d lane/x',
+  'git branch --delete lane/x',
+  'git branch -f lane/x main',
+  'git branch -a',
+  'git rebase --abort',
+  'git rebase --continue',
+  'git rebase --skip',
+  'git pull',
+  'git pull --no-rebase',
+  'git pull --rebase=false',
+  'git pull --ff-only origin main',
+  'git reflog',
+  'git reflog show main',
+  'git push origin main',
+  'git push origin :',
+  'git push --dry-run origin main',
+  'git update-ref refs/heads/x HEAD',
+  'git gc',
+  'git gc --no-prune',
+  'git commit -m "git rebase main; git push --delete x"',
+]
+
+test('denies branch -D, rebase, pull --rebase, reflog expire, ref-deleting pushes, gc --prune', async ($, on) => {
+  stubBash(on)
+  expect(await misses(c => $.tool.call(c), DENY_REFS, true)).toEqual([])
+})
+
+test('allows safe branch delete, rebase --abort/--continue/--skip, reflog show, plain pull/push/gc', async ($, on) => {
+  stubBash(on)
+  expect(await misses(c => $.tool.call(c), ALLOW_REFS, false)).toEqual([])
+})
+
+test('banned rm -rf also matches split and long flags', async ($, on) => {
+  stubBash(on)
+  project(on, 'banned_commands:\n  - rm -rf\n')
+  const split = ['rm -r -f x', 'rm -f -r x', 'rm --recursive --force x', 'rm -R -f x', 'rm -v --force -r x']
+  expect(await misses(c => $.tool.call(c), split, true)).toEqual([])
+  expect(await misses(c => $.tool.call(c), ['rm -r x', 'rm -f x', 'rm x', 'echo rm -r -f'], false)).toEqual([])
+})
+
 test('registers nothing when userConfig guards is false', { options: { guards: false } }, async ($, on) => {
   stubBash(on)
   const ran = await $.tool.call({ tool: 'Bash', command: 'git stash' })
