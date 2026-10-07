@@ -3,6 +3,11 @@
 
 Normalises CodexBar rate limit windows into ~/.matrixkoder/usage.json.
 Merges with lane-health.py pane-text exhausted_* annotations.
+
+Usage:
+  mk-usage.py [--once] [--out PATH] [--providers p1,p2]
+  mk-usage.py --watch [--interval 300] [--out PATH] [--providers p1,p2]
+  mk-usage.py --self-test
 """
 import argparse
 import datetime
