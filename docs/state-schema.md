@@ -155,8 +155,9 @@ everything else `default`.
 ```
 
 - `pools.<name>` = `{five_hour, weekly, exhausted_until}`; `exhausted_until` = latest reset among that pool's windows at >= 100%, else null.
-- Agent-level `five_hour` / `weekly` = the primary pool (agy `gemini`, others `default`).
-- Agent-level `exhausted_until` is set only when EVERY pool is exhausted (earliest of the pool resets). `available_pools` lists pools not exhausted — routers should check it, not just `exhausted_until`.
+- Agent-level `five_hour` / `weekly` = the primary pool (agy `gemini`, others `default`); if that pool is absent, the first pool present.
+- Agent-level `exhausted_until` = the primary pool's `exhausted_until` (claude `default`, agy `gemini`). Another pool being free does not clear it: claude's `fable` is a sub-scope, so a 100% `default` pool makes Claude exhausted. `available_pools` lists every pool not exhausted — a router wanting a secondary pool (agy `claude-gpt`, claude `fable`) checks it.
+- A future pane-text `exhausted_until` from lane-health overrides the pools (pane text is newer evidence); the later of the two wins.
 
 ## CLI
 

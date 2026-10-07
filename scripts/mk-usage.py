@@ -368,14 +368,8 @@ def normalize_provider_entry(provider, raw_result_or_json, existing_entry=None, 
     five_hour = prim.get("five_hour")
     weekly = prim.get("weekly")
 
-    # agent exhausted only when EVERY pool is exhausted: earliest of the pool resets
-    if pools and not available_pools:
-        cb_exhausted_until = min(
-            (pl["exhausted_until"] for pl in pools.values()),
-            key=lambda t: parse_iso(t) or datetime.datetime.max.replace(tzinfo=datetime.timezone.utc),
-        )
-    else:
-        cb_exhausted_until = None
+    # agent exhausted = its primary pool exhausted (claude's `fable` is a sub-scope, never enough alone)
+    cb_exhausted_until = prim.get("exhausted_until")
 
     entry = {
         "status": "ok",
@@ -509,7 +503,7 @@ def self_test():
     assert agy_norm["five_hour"]["used_pct"] == 10.5
     assert agy_norm["five_hour"]["resets_at"] == "2026-10-07T20:26:09Z"
 
-    # Both pools exhausted -> agent exhausted until the EARLIEST pool reset
+    # Both pools exhausted -> agent exhausted until the PRIMARY (gemini) pool reset
     both = json.loads(json.dumps(agy_raw))
     for ew in both[0]["usage"]["extraRateWindows"]:
         if ew["id"] == "antigravity-quota-summary-gemini-weekly":
@@ -546,6 +540,13 @@ def self_test():
     assert c_fable["pool"] == "fable" and c_primary["pool"] == "default"
     assert claude_norm["pools"]["fable"]["weekly"]["used_pct"] == 14
     assert claude_norm["available_pools"] == ["default", "fable"]
+
+    # Claude default pool at 100%, fable free -> agent exhausted (primary pool rules), fable still listed
+    cl_full = json.loads(json.dumps(claude_raw))
+    cl_full[0]["usage"]["secondary"]["usedPercent"] = 100
+    cl_full_norm = normalize_provider_entry("claude", cl_full, now=ref_now_future)
+    assert cl_full_norm["available_pools"] == ["fable"]
+    assert cl_full_norm["exhausted_until"] == "2026-10-13T05:00:00Z"
 
     # 4. Reset-passed -> 0 and reset_passed: true
     # Use a reference time AFTER 20:26:09Z (e.g. 21:00:00Z)
