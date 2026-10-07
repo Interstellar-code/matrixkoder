@@ -38,6 +38,7 @@ with offset, seconds precision (`2026-10-07T20:09:01+02:00`). Unknown values are
   "id": "mk-p1",
   "feature": "MatrixKoder P1",
   "branch": "main",
+  "head_sha": null,
   "plan": ".matrixkoder/plans/matrixkoder.md",
   "status": "active",
   "stage": 5,
@@ -67,6 +68,7 @@ with offset, seconds precision (`2026-10-07T20:09:01+02:00`). Unknown values are
 | `schema` | int | `1` |
 | `status` | `active \| done \| archived` | `ended` is set when it leaves `active`, cleared when it returns. `run set --status` takes `active\|done`; `archived` only via `run archive` |
 | `stage` | int | loop stage 0–12 (SKILL.md) |
+| `head_sha` | string \| null | optional (design §7.2): the run branch's current commit; the dashboard shows the branch only while absent |
 | `next` | string \| null | next action, shown in the dashboard header and resume section |
 | `waiting` | object \| null | the one question waiting on the user: `question`, `options` (string[]), `rec` (string \| null), `since` (ts) |
 | `tasks` | array | task objects in insertion order (below) |
