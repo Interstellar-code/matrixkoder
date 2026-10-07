@@ -1,4 +1,4 @@
-// MatrixKoder wake on lane events: polls events.jsonl and submits prompt on transition events
+// MatrixKoder wake on lane events: polls events.jsonl and submits prompt on transition events (strict types)
 import type { EngineInterface, On, PluginOptions, Timer } from 'claude-code'
 
 // $.state contract for wakeEventLines and wakeSentAt lives in types/index.d.ts

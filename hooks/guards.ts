@@ -138,6 +138,7 @@ function innerScript(ws: readonly string[]): string | undefined {
   return undefined
 }
 
+// Read-only stash forms (list, show) are allowed below; all other stash forms are denied.
 const GIT_UNDO = new Set(['checkout', 'reset', 'clean'])
 const GIT_VALUED = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--config-env', '--super-prefix'])
 const COMMIT_VALUED = new Set([

@@ -1,4 +1,4 @@
-// MatrixKoder model tools: mk_state and mk_usage
+// MatrixKoder model tools: mk_state and mk_usage (strict types)
 import type { On, PluginOptions, ToolCallResult } from 'claude-code'
 
 const ALLOWED_SUBCOMMANDS = new Set([
