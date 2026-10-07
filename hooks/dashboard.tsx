@@ -1,11 +1,15 @@
-// MatrixKoder dashboard pane (design §3/§6): /mk toggles it, session.start
-// auto-opens it when allowed and runs the state loop; the tree renders the
-// snapshot atoms with the 46-col base layout, 36-col compact and inline
-// variants. All $-bound loading lives here: $ may not cross an import.
+// MatrixKoder dashboard pane (design §3/§6): /mk (or /mk open|close|setup|init)
+// drives it, session.start auto-opens it when allowed and runs the state loop;
+// the tree renders the snapshot atoms with the 46-col base layout, 36-col
+// compact and inline variants. All $-bound loading lives here: $ may not cross
+// an import; the pure data-dir math is in data.ts for wake/tools to reuse.
 import { atom, read, update } from 'claude-code'
 import type { Elements, EngineInterface, On, PluginOptions } from 'claude-code'
 import type { MkEvent, MkRun, MkSnapshot, MkStatusMemory, MkTask } from '../types'
-import { PANE_ID, EMPTY_SNAPSHOT, activeEntry, candidateDirs, coerceIndex, coerceRun, coerceUsage, join, mkSnapshot, parseJson } from './data'
+import {
+  PANE_ID, EMPTY_SNAPSHOT, activeEntry, basename, candidateDirs, coerceIndex, coerceRun, coerceUsage, join,
+  mainCheckout, mkSnapshot, normalizePath, parentOf, parseGitdir, parseJson, sanitizeText, timerRegistry,
+} from './data'
 import { chipText, toastsFor } from './status'
 
 // atoms are file-local consts (the scan reads this file's own consts); the
@@ -21,6 +25,8 @@ const paneOpenAtom = atom({ plugin: 'matrixkoder', key: 'paneOpen' } as const, f
 const COLUMNS = 46
 const REFRESH_MS = 5000
 const USAGE_POLL_DEFAULT_MIN = 5
+const USAGE_POLL_MIN_MIN = 1 // a faster poll with the 120 s timeout would stack runs
+const POLL_MIN_INTERVAL_MS = 60_000
 const AGENT_ORDER = ['claude', 'agy', 'codex', 'opencode'] as const
 const PRIMARY_POOL: Record<string, string> = { agy: 'gemini', claude: 'default' }
 const AGENT_GLYPH: Record<string, string> = { claude: '✦', agy: '∇', codex: '⊚', opencode: '⌂' }
@@ -35,45 +41,77 @@ const STATUS_GLYPH: Record<string, string> = {
   review: '◐', fix: '▲', merged: '◈', qa: '◆', done: '✓',
   blocked: '⊘', quota: '⧗', stalled: '⚠', provider: '⊗',
 }
+/** compact status words per design §3.7 (`building 12m` → `build 12m`) */
+const STATUS_SHORT: Record<string, string> = {
+  building: 'build', verifying: 'verify', dispatched: 'disp', stalled: 'stall', planned: 'plan',
+}
 const DONE = new Set(['done', 'merged'])
 const ATTENTION = new Set(['stalled', 'blocked', 'quota', 'provider'])
 const LANE_LIVE = new Set(['dispatched', 'building', 'verifying', 'review', 'fix', 'stalled', 'blocked'])
+let pollInFlight = false
+let lastPollAt = -Infinity
+let lastChipText: string | null | undefined // undefined = never set; skip ui.status when unchanged
 
 export function registerDashboard(on: On, options: PluginOptions): void {
   on('session.start', async ($, e, next) => {
     try {
-      await $.command.register({ name: 'mk', description: 'Toggle the MatrixKoder dashboard pane' })
+      await $.command.register({ name: 'mk', description: 'Toggle the MatrixKoder dashboard pane', argumentHint: '[open|close|setup|init]' })
     } catch {
       // command registration refused — /mk stays inert, the pane still renders
     }
     if (options.autoOpen !== false) {
-      void $.ui.open({ id: PANE_ID, title: 'MatrixKoder', columns: COLUMNS }).catch(() => {
+      try {
+        const opened = await $.ui.open({ id: PANE_ID, title: 'MatrixKoder', columns: COLUMNS })
+        await update($, paneOpenAtom, () => opened.isPlaced)
+      } catch {
         // the engine seats the pane itself; a refusal is not fatal
-      })
-      await update($, paneOpenAtom, () => true)
+      }
     }
     const min = typeof options.usagePollMin === 'number' && options.usagePollMin > 0
-      ? options.usagePollMin
+      ? Math.max(USAGE_POLL_MIN_MIN, options.usagePollMin)
       : USAGE_POLL_DEFAULT_MIN
-    $.clock.every(Math.round(min * 60_000), () => pollUsage($))
     const cwd = e.cwd // the session's own words for where it runs; timers capture it
-    await refresh($, options, cwd) // first load populates pane + chip and never toasts
-    $.clock.every(REFRESH_MS, () => refresh($, options, cwd))
+    // timers first: a throwing first load must never leave the loop dead
+    // a cancel may come back as a plain function or a { cancel } handle (mock clock)
+    const arm = (cancel: unknown): (() => void) =>
+      typeof cancel === 'function' ? cancel : () => { (cancel as { cancel?: () => void }).cancel?.() }
+    timerRegistry.cancelRefresh?.()
+    timerRegistry.cancelRefresh = arm($.clock.every(REFRESH_MS, () => refreshSafe($, options, cwd)))
+    timerRegistry.cancelPoll?.()
+    timerRegistry.cancelPoll = arm($.clock.every(Math.round(min * 60_000), () => pollUsage($)))
+    lastChipText = undefined
+    await refreshSafe($, options, cwd) // first load populates pane + chip and never toasts
+    const home = await homeDir($)
+    const usageMissing = home == null || (await readJson($, usagePath(home))) == null
+    if (usageMissing) void pollUsage($) // cold start: do not show "no ledger yet" for N minutes
     return next(e)
   })
 
-  on('command.run', { command: 'mk' }, async $ => {
-    if (await read($, paneOpenAtom)) {
-      try {
-        await $.ui.close({ id: PANE_ID })
-      } catch {
-        // already closed — fine
-      }
-      await update($, paneOpenAtom, () => false)
+  on('command.run', { command: 'mk' }, async ($, e) => {
+    const args = e.args.trim().split(/\s+/)[0]?.toLowerCase() ?? ''
+    if (args === 'setup' || args === 'init') {
+      // never a toggle-close: open and show the first-run panel whatever the state
+      await openPane($)
+      const prev = await read($, snapshotAtom)
+      await update($, snapshotAtom, () => ({ ...prev, setupHint: true }))
+      return { text: args === 'setup' ? 'Setup wizard coming in P5 — showing the setup panel.' : 'Run init arrives with the wizard coming in P5 — showing the setup panel.' }
+    }
+    if (args === 'open') {
+      await openPane($)
+      return { text: 'MatrixKoder pane opened.' }
+    }
+    if (args === 'close') {
+      await closePane($)
       return { text: 'MatrixKoder pane closed.' }
     }
-    await $.ui.open({ id: PANE_ID, title: 'MatrixKoder', columns: COLUMNS })
-    await update($, paneOpenAtom, () => true)
+    if (args !== '' && args !== 'toggle') {
+      return { text: 'Usage: /mk [open|close|setup|init] — bare /mk toggles the pane.' }
+    }
+    if (await read($, paneOpenAtom)) {
+      await closePane($)
+      return { text: 'MatrixKoder pane closed.' }
+    }
+    await openPane($)
     return { text: 'MatrixKoder pane opened.' }
   })
 
@@ -82,6 +120,7 @@ export function registerDashboard(on: On, options: PluginOptions): void {
     const snap = await read($, snapshotAtom)
     const cols = e.props.bodyColumns || COLUMNS
     const compact = cols < 40
+    const extraActive = snap.runs.filter(r => r.status === 'active').length - 1
 
     return (
       <Box flexDirection="column" width={cols} gap={1}>
@@ -90,19 +129,40 @@ export function registerDashboard(on: On, options: PluginOptions): void {
             <Text color="yellow">Run /tui fullscreen to dock this panel on the right.</Text>
           </Box>
         )}
-        {snap.dataDir === null
+        {snap.error && (
+          <Text color="yellow" bold={true}>⚠ {snap.error}</Text>
+        )}
+        {snap.setupHint || snap.dataDir === null
           ? FirstRun($.ui.resolve(e))
           : snap.run === null
             ? NoRun($.ui.resolve(e), snap)
-            : RunSection($.ui.resolve(e), snap.run, cols, compact)}
-        {snap.dataDir !== null && snap.run !== null && PlanSection($.ui.resolve(e), snap.run, cols, compact)}
-        {snap.dataDir !== null && snap.run !== null && LanesSection($.ui.resolve(e), snap.run, cols)}
+            : RunSection($.ui.resolve(e), snap.run, compact, extraActive)}
+        {!snap.setupHint && snap.dataDir !== null && snap.run !== null && PlanSection($.ui.resolve(e), snap.run, cols, compact, snap.now)}
+        {!snap.setupHint && snap.dataDir !== null && snap.run !== null && LanesSection($.ui.resolve(e), snap.run, cols)}
         {UsageSection($.ui.resolve(e), snap, cols, compact)}
-        {snap.run?.waiting && WaitingSection($.ui.resolve(e), snap.run.waiting)}
-        {snap.run && RecentSection($.ui.resolve(e), (snap.run.recent ?? []).slice(-3).reverse(), compact)}
+        {!snap.setupHint && snap.run?.waiting && WaitingSection($.ui.resolve(e), snap.run.waiting)}
+        {!snap.setupHint && snap.run && RecentSection($.ui.resolve(e), (snap.run.recent ?? []).slice(-3).reverse(), compact)}
       </Box>
     )
   })
+}
+
+async function openPane($: EngineInterface): Promise<void> {
+  try {
+    const opened = await $.ui.open({ id: PANE_ID, title: 'MatrixKoder', columns: COLUMNS })
+    await update($, paneOpenAtom, () => opened.isPlaced)
+  } catch {
+    await update($, paneOpenAtom, () => false)
+  }
+}
+
+async function closePane($: EngineInterface): Promise<void> {
+  try {
+    await $.ui.close({ id: PANE_ID })
+  } catch {
+    // already closed — fine
+  }
+  await update($, paneOpenAtom, () => false)
 }
 
 // ---------- $-bound loading (file-local: $ never crosses an import) ----------
@@ -115,24 +175,66 @@ async function readJson($: EngineInterface, path: string): Promise<unknown> {
   }
 }
 
-async function findDataDir($: EngineInterface, cwd: string): Promise<string | null> {
-  for (const dir of candidateDirs(cwd)) {
+async function readText($: EngineInterface, path: string): Promise<string | null> {
+  try {
+    return await $.fs.read(path)
+  } catch {
+    return null // missing or unreadable
+  }
+}
+
+/** Schema rule (state-schema.md): MATRIXKODER_DATA → nearest .git toplevel's
+ *  .matrixkoder; a linked worktree (.git FILE) resolves to its main checkout.
+ *  The walk stops before home: ~/.matrixkoder is the GLOBAL dir, never project data. */
+async function resolveDataDir($: EngineInterface, cwd: string, home: string | null): Promise<string | null> {
+  try {
+    const viaEnv = await $.env.get('MATRIXKODER_DATA')
+    if (viaEnv) return viaEnv
+  } catch {
+    // env noun refused — fall through to the walk
+  }
+  for (const dir of candidateDirs(cwd, home ?? undefined)) {
+    const dotGit = join(dir, '.git')
+    let toplevel: string | null = null
     try {
-      const stat = await $.fs.stat(join(dir, '.matrixkoder'))
-      if (stat.kind === 'dir') return join(dir, '.matrixkoder')
+      const stat = await $.fs.stat(dotGit)
+      if (stat.kind === 'dir') {
+        toplevel = dir
+      } else if (stat.kind === 'file') {
+        const gitdir = parseGitdir((await readText($, dotGit)) ?? '')
+        if (gitdir) {
+          const gd = gitdir.startsWith('/') ? gitdir : join(dir, gitdir)
+          const commondir = await readText($, join(gd, 'commondir'))
+          if (commondir != null) toplevel = mainCheckout(gd, commondir) ?? dir
+        }
+      }
     } catch {
-      // not there — walk up
+      continue // no .git here — keep walking up
     }
+    if (toplevel == null) continue
+    // nearest repo boundary found: nested repos stop here (schema: pass --data for the outer)
+    const data = join(toplevel, '.matrixkoder')
+    try {
+      const s = await $.fs.stat(data)
+      if (s.kind === 'dir') return data
+    } catch {
+      // repo without a data dir yet → first-run
+    }
+    return null
   }
   return null
 }
 
-async function loadRun($: EngineInterface, dataDir: string): Promise<{ run: MkRun | null; runs: ReturnType<typeof coerceIndex> }> {
+async function loadRun($: EngineInterface, dataDir: string): Promise<{ run: MkRun | null; runs: ReturnType<typeof coerceIndex>; error: string | null }> {
   const runs = coerceIndex(await readJson($, join(dataDir, 'runs/index.json')))
   const entry = activeEntry(runs)
-  if (!entry) return { run: null, runs }
-  const run = coerceRun(await readJson($, join(dataDir, 'runs', entry.id, 'run.json')))
-  return { run, runs }
+  if (!entry) return { run: null, runs, error: null }
+  const runPath = join(dataDir, 'runs', entry.id, 'run.json')
+  const text = await readText($, runPath)
+  if (text == null) return { run: null, runs, error: `cannot read ${entry.id}/run.json` }
+  const run = coerceRun(parseJson(text))
+  if (run == null) return { run: null, runs, error: 'cannot read run.json' }
+  return { run, runs, error: null }
 }
 
 async function homeDir($: EngineInterface): Promise<string | null> {
@@ -152,6 +254,10 @@ async function homeDir($: EngineInterface): Promise<string | null> {
   return null
 }
 
+function usagePath(home: string): string {
+  return join(home, '.matrixkoder/usage.json')
+}
+
 async function loadSnapshot($: EngineInterface, cwd: string): Promise<MkSnapshot> {
   let now = 0
   try {
@@ -159,28 +265,34 @@ async function loadSnapshot($: EngineInterface, cwd: string): Promise<MkSnapshot
   } catch {
     // clock refused — remaining times show as unknown
   }
-  const dataDir = await findDataDir($, cwd)
+  const home = await homeDir($)
+  const dataDir = await resolveDataDir($, cwd, home)
   let run: MkRun | null = null
   let runs: ReturnType<typeof coerceIndex> = []
+  let error: string | null = null
   if (dataDir) {
-    ;({ run, runs } = await loadRun($, dataDir))
+    ;({ run, runs, error } = await loadRun($, dataDir))
   }
-  const home = await homeDir($)
-  const usage = home ? coerceUsage(await readJson($, join(home, '.matrixkoder/usage.json'))) : null
-  return mkSnapshot(now, dataDir, run, runs, usage)
+  const usage = home ? coerceUsage(await readJson($, usagePath(home))) : null
+  return { ...mkSnapshot(now, dataDir, run, runs, usage), error }
 }
 
 async function applyStatus($: EngineInterface, options: PluginOptions, snap: MkSnapshot): Promise<void> {
   const mem = await read($, statusMemoryAtom)
+  // a run switch must not toast old-vs-new status diffs as transitions
+  const sameRun = mem.runId === (snap.run?.id ?? null)
   if (options.chip !== false) {
     const text = chipText(snap)
-    try {
-      $.ui.status(text === '' ? undefined : text)
-    } catch {
-      // status line refused — the pane still shows everything
+    if (text !== lastChipText) {
+      lastChipText = text
+      try {
+        $.ui.status(text === '' ? undefined : text)
+      } catch {
+        // status line refused — the pane still shows everything
+      }
     }
   }
-  if (options.toasts !== false && mem.loaded) {
+  if (options.toasts !== false && mem.loaded && sameRun) {
     for (const text of toastsFor(mem, snap)) {
       try {
         $.ui.toast(text, { timeoutMs: 4000 })
@@ -191,23 +303,49 @@ async function applyStatus($: EngineInterface, options: PluginOptions, snap: MkS
   }
   const statuses: Record<string, string> = {}
   for (const t of snap.run?.tasks ?? []) statuses[t.id] = t.status
-  await update($, statusMemoryAtom, () => ({ statuses, waiting: !!snap.run?.waiting, loaded: true }))
+  await update($, statusMemoryAtom, () => ({ statuses, waiting: !!snap.run?.waiting, loaded: true, runId: snap.run?.id ?? null }))
 }
 
-async function refresh($: EngineInterface, options: PluginOptions, cwd: string): Promise<void> {
-  const snap = await loadSnapshot($, cwd)
-  await applyStatus($, options, snap)
+/** snapshot signature without `now`: the clock alone must not force a redraw */
+function contentSig(snap: MkSnapshot): string {
+  return JSON.stringify({ ...snap, now: 0 })
+}
+
+/** Never throws: a failing load keeps the last good snapshot and flags the error. */
+async function refreshSafe($: EngineInterface, options: PluginOptions, cwd: string): Promise<void> {
   const prev = await read($, snapshotAtom)
-  if (JSON.stringify(prev) !== JSON.stringify(snap)) {
-    await update($, snapshotAtom, () => snap)
+  try {
+    const snap = await loadSnapshot($, cwd)
+    await applyStatus($, options, snap)
+    if (contentSig(prev) !== contentSig(snap)) {
+      await update($, snapshotAtom, () => ({ ...snap, setupHint: prev.setupHint }))
+    }
+  } catch (err) {
+    try {
+      await update($, snapshotAtom, () => ({ ...prev, error: `cannot read run.json (${String(err).slice(0, 40)})` }))
+    } catch {
+      // even the atom write failed — nothing more to do
+    }
   }
 }
 
 async function pollUsage($: EngineInterface): Promise<void> {
+  if (pollInFlight) return
+  let nowMs = 0
+  try {
+    nowMs = await $.clock.now()
+  } catch {
+    // clock refused — interval check falls back to lastPollAt only
+  }
+  if (nowMs && nowMs - lastPollAt < POLL_MIN_INTERVAL_MS) return
+  pollInFlight = true
+  lastPollAt = nowMs || lastPollAt + POLL_MIN_INTERVAL_MS
   try {
     await $.process.run(['python3', `${$.plugin.root}/scripts/mk-usage.py`, '--once'], { timeoutMs: 120_000 })
   } catch {
     // codexbar missing or slow — the refresh ticks still re-read usage.json
+  } finally {
+    pollInFlight = false
   }
 }
 
@@ -251,23 +389,24 @@ function NoRun(els: Elements, snap: MkSnapshot) {
   )
 }
 
-function RunSection(els: Elements, run: MkRun, cols: number, compact: boolean) {
+function RunSection(els: Elements, run: MkRun, compact: boolean, extraActive = 0) {
   const { Box, Text } = els
   const head = run.head_sha ? `@${run.head_sha.slice(0, 7)}` : ''
+  const feature = compact ? run.feature.split('-')[0] : run.feature
   return (
     <Box flexDirection="column">
       <Text bold={true}>Run</Text>
       <Box flexDirection="row" gap={1}>
-        <Text bold={true}>{compact ? run.feature.split('-')[0] : run.feature}</Text>
-        <Text dimColor={true}>·</Text>
-        <Text dimColor={true}>{run.branch}{head}</Text>
+        <Text bold={true}>{feature}</Text>
+        {run.branch && <Text dimColor={true}>· {run.branch}{head}</Text>}
         <Text dimColor={true}>·</Text>
         <Text color="cyan" bold={true}>{compact ? 'stg' : 'stage'} {run.stage}/12</Text>
+        {extraActive > 0 && <Text color="yellow" dimColor={true}>+{extraActive} active</Text>}
       </Box>
       {run.next && (
         <Box flexDirection="row" gap={1}>
           <Text color="cyan" bold={true}>▶ Next:</Text>
-          <Text wrap="truncate-end">{run.next}</Text>
+          <Text wrap="truncate-end">{sanitizeText(run.next, 120)}</Text>
         </Box>
       )}
     </Box>
@@ -290,7 +429,17 @@ function wavePills(tasks: readonly MkTask[], compact: boolean): { label: string;
   })
 }
 
-function PlanSection(els: Elements, run: MkRun, cols: number, compact: boolean) {
+function elapsedMin(task: MkTask, nowMs: number): number | null {
+  const t = Date.parse(task.updated ?? '')
+  if (!Number.isFinite(t) || !nowMs) return null
+  return Math.max(0, Math.round((nowMs - t) / 60000))
+}
+
+function statusWord(status: string, compact: boolean): string {
+  return compact ? STATUS_SHORT[status] ?? status : status
+}
+
+function PlanSection(els: Elements, run: MkRun, cols: number, compact: boolean, nowMs: number) {
   const { Box, Text } = els
   const done = run.tasks.filter(t => DONE.has(t.status)).length
   const total = run.tasks.length
@@ -316,15 +465,19 @@ function PlanSection(els: Elements, run: MkRun, cols: number, compact: boolean) 
         const isAttention = ATTENTION.has(task.status)
         const checkbox = isDone ? '[✓]' : isBuilding ? '[•]' : isAttention ? '[!]' : '[ ]'
         const checkColor = isDone ? 'green' : isBuilding ? 'cyan' : isAttention ? 'yellow' : 'gray'
+        const title = compact ? task.title.slice(0, 14) : task.title // §3.7: 14-char title budget
+        const round = task.round && (task.status === 'review' || task.status === 'fix') ? ` r${task.round}` : ''
+        const mins = isBuilding || task.status === 'stalled' ? elapsedMin(task, nowMs) : null
+        const suffix = `${round}${mins != null ? ` ${mins}m` : ''}`
         return (
           <Box key={task.id} flexDirection="row" justifyContent="space-between" gap={1}>
             <Box flexDirection="row" gap={1} flexShrink={1}>
               <Text color={checkColor} bold={isBuilding || isAttention}>{checkbox}</Text>
               <Text bold={true}>{task.id}</Text>
-              <Text dimColor={task.status === 'planned'} wrap={compact ? 'truncate-end' : undefined}>{task.title}</Text>
+              <Text dimColor={task.status === 'planned'} wrap={compact ? 'truncate-end' : undefined}>{title}</Text>
             </Box>
             <Box flexDirection="row" gap={1} flexShrink={0}>
-              <Text color={STATUS_COLOR[task.status] ?? 'text'}>{task.status}</Text>
+              <Text color={STATUS_COLOR[task.status] ?? 'text'}>{statusWord(task.status, compact)}{suffix}</Text>
               {cols >= 44 && task.last_commit && <Text dimColor={true}>{task.last_commit.slice(0, 7)}</Text>}
             </Box>
           </Box>
@@ -393,8 +546,9 @@ type UsageRow = {
   pct: number | null
   weekPct: number | null
   reset: string | null
+  exhaustedUntil: string | null
   exhausted: boolean
-  sub: { name: string; pct: number | null; weekPct: number | null; reset: string | null; exhausted: boolean }[]
+  sub: { name: string; pct: number | null; weekPct: number | null; reset: string | null; exhaustedUntil: string | null; exhausted: boolean }[]
 }
 
 function usageRows(snap: MkSnapshot, compact: boolean): UsageRow[] {
@@ -408,7 +562,10 @@ function usageRows(snap: MkSnapshot, compact: boolean): UsageRow[] {
   return names.filter(n => agents[n]).map(name => {
     const a = agents[name]
     const pools = Object.entries(a.pools ?? {})
-    const primary = PRIMARY_POOL[name] ?? 'default'
+    // primary = the configured pool when present, else the first (schema: the
+    // agent-level fields mirror the primary pool); the rest render as sub-rows
+    const configured = PRIMARY_POOL[name] ?? 'default'
+    const primary = pools.some(([pname]) => pname === configured) ? configured : pools[0]?.[0]
     const sub = pools
       .filter(([pname]) => pname !== primary)
       .map(([pname, p]) => ({
@@ -416,6 +573,7 @@ function usageRows(snap: MkSnapshot, compact: boolean): UsageRow[] {
         pct: p.five_hour?.used_pct ?? null,
         weekPct: p.weekly?.used_pct ?? null,
         reset: p.five_hour?.resets_at ?? p.weekly?.resets_at ?? null,
+        exhaustedUntil: p.exhausted_until ?? null,
         exhausted: isExhausted(p.exhausted_until),
       }))
     return {
@@ -423,8 +581,10 @@ function usageRows(snap: MkSnapshot, compact: boolean): UsageRow[] {
       pct: a.five_hour?.used_pct ?? null,
       weekPct: a.weekly?.used_pct ?? null,
       reset: a.five_hour?.resets_at ?? a.weekly?.resets_at ?? null,
-      // agent red only when every pool is exhausted (design §4.3)
-      exhausted: isExhausted(a.exhausted_until) || (pools.length > 0 && pools.every(([, p]) => isExhausted(p.exhausted_until))),
+      exhaustedUntil: a.exhausted_until ?? null,
+      // agent red only on the agent-level exhausted_until (schema: set only
+      // when every pool is exhausted — a lone secondary pool stays a sub-row)
+      exhausted: isExhausted(a.exhausted_until),
       sub,
     }
   })
@@ -446,8 +606,10 @@ function UsageSection(els: Elements, snap: MkSnapshot, cols: number, compact: bo
       </Box>
       {rows.length === 0 && <Text dimColor={true}>no ledger yet</Text>}
       {rows.map(r => {
-        const na = r.pct == null && r.sub.length === 0
+        const na = r.pct == null // the label alone decides; sub-rows may still exist
         const color = pctColor(r.pct, r.exhausted)
+        // exhausted rows show when the block clears (exhausted_until), not the next 5h reset
+        const reset = r.exhausted && r.exhaustedUntil ? r.exhaustedUntil : r.reset
         return (
           <Box key={r.name} flexDirection="column">
             <Box flexDirection="row" justifyContent="space-between">
@@ -458,12 +620,13 @@ function UsageSection(els: Elements, snap: MkSnapshot, cols: number, compact: bo
               <Box flexDirection="row" gap={1}>
                 <Text color={na ? 'gray' : color} bold={r.exhausted}>{na ? 'n/a' : `${String(Math.round(r.pct ?? 0)).padStart(3)}%`}</Text>
                 {!compact && <Text dimColor={true}>{na || r.weekPct == null ? '—' : `${String(Math.round(r.weekPct)).padStart(3)}%`}</Text>}
-                <Text dimColor={!r.exhausted} color={r.exhausted ? 'red' : undefined} bold={r.exhausted}>{resetStr(r.reset, snap.now, compact)}</Text>
+                <Text dimColor={!r.exhausted} color={r.exhausted ? 'red' : undefined} bold={r.exhausted}>{resetStr(reset, snap.now, compact)}</Text>
                 {r.exhausted && <Text color="red" bold={true}>⊘</Text>}
               </Box>
             </Box>
             {r.sub.map(p => {
               const pcolor = pctColor(p.pct, p.exhausted)
+              const preset = p.exhausted && p.exhaustedUntil ? p.exhaustedUntil : p.reset
               return (
                 <Box key={p.name} flexDirection="row" justifyContent="space-between">
                   <Box flexDirection="row" gap={1}>
@@ -473,7 +636,7 @@ function UsageSection(els: Elements, snap: MkSnapshot, cols: number, compact: bo
                   <Box flexDirection="row" gap={1}>
                     <Text color={pcolor} bold={p.exhausted}>{p.pct == null ? 'n/a' : `${String(Math.round(p.pct)).padStart(3)}%`}</Text>
                     {!compact && <Text dimColor={true}>{p.weekPct == null ? '—' : `${String(Math.round(p.weekPct)).padStart(3)}%`}</Text>}
-                    <Text dimColor={!p.exhausted} color={p.exhausted ? 'red' : undefined} bold={p.exhausted}>{resetStr(p.reset, snap.now, compact)}</Text>
+                    <Text dimColor={!p.exhausted} color={p.exhausted ? 'red' : undefined} bold={p.exhausted}>{resetStr(preset, snap.now, compact)}</Text>
                     {p.exhausted && <Text color="red" bold={true}>⊘</Text>}
                   </Box>
                 </Box>
@@ -491,12 +654,12 @@ function WaitingSection(els: Elements, waiting: NonNullable<MkRun['waiting']>) {
   return (
     <Box flexDirection="column">
       <Text color="red" bold={true}>Waiting on you</Text>
-      <Text bold={true} wrap="wrap">{waiting.question}</Text>
+      <Text bold={true} wrap="wrap">{sanitizeText(waiting.question, 160)}</Text>
       {waiting.options && waiting.options.length > 0 && (
         <Box flexDirection="column" marginTop={1}>
           {waiting.options.map((opt, i) => (
             <Text key={opt} dimColor={opt !== waiting.rec} color={opt === waiting.rec ? 'cyan' : undefined}>
-              [{i + 1}] {opt}{opt === waiting.rec ? ' (Rec)' : ''}
+              [{i + 1}] {sanitizeText(opt, 60)}{opt === waiting.rec ? ' (Rec)' : ''}
             </Text>
           ))}
         </Box>
@@ -513,8 +676,9 @@ function RecentSection(els: Elements, events: readonly MkEvent[], compact: boole
       {events.length === 0 && <Text dimColor={true}>nothing yet</Text>}
       {events.map((ev, i) => (
         <Box key={i} flexDirection="row" gap={1}>
-          <Text dimColor={true}>{(ev.t ?? '').slice(11, 16)}</Text>
-          <Text wrap="truncate-end" color={ev.type === 'verdict' ? 'green' : undefined}>{ev.text ?? ''}</Text>
+          {!compact && <Text dimColor={true}>{(ev.t ?? '').slice(11, 16)}</Text>}
+          {/* event text is lane-watch pane evidence — sanitised before display */}
+          <Text wrap="truncate-end" color={ev.type === 'verdict' ? 'green' : undefined}>{sanitizeText(ev.text ?? '', compact ? 40 : 80)}</Text>
         </Box>
       ))}
     </Box>

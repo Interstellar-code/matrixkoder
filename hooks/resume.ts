@@ -1,12 +1,15 @@
 // MatrixKoder resume section (plan §6): prompt.compose adds the active run's
 // id, feature, stage, next action, waiting question and status counts as a
-// session-scoped section, so the loop survives compaction.
+// session-scoped section, so the loop survives compaction. Free-text fields
+// are control-stripped, whitespace-collapsed and capped so the counts tail
+// survives the 600-char budget.
 import { atom, read } from 'claude-code'
 import type { On } from 'claude-code'
 import type { MkRun } from '../types'
-import { EMPTY_SNAPSHOT, PANE_ID } from './data'
+import { EMPTY_SNAPSHOT, PANE_ID, sanitizeText } from './data'
 
 const MAX_CHARS = 600
+const FIELD_CAP = 200
 const SECTION_ID = 'matrixkoder:run'
 
 // same plugin+key address as dashboard.tsx's atom — file-local for the scan
@@ -16,11 +19,13 @@ function resumeText(run: MkRun): string {
   const counts = new Map<string, number>()
   for (const t of run.tasks) counts.set(t.status, (counts.get(t.status) ?? 0) + 1)
   const byStatus = [...counts.entries()].map(([s, n]) => `${n} ${s}`).join(', ')
+  const next = sanitizeText(run.next, FIELD_CAP)
+  const question = sanitizeText(run.waiting?.question, FIELD_CAP)
   const parts = [
-    `MatrixKoder run ${run.id} (${run.feature})`,
+    `MatrixKoder run ${run.id} (${sanitizeText(run.feature, 60)})`,
     `stage ${run.stage}/12`,
-    run.next ? `next: ${run.next}` : null,
-    run.waiting ? `waiting on user: ${run.waiting.question}` : null,
+    next ? `next: ${next}` : null,
+    question ? `waiting on user: ${question}` : null,
     `tasks: ${byStatus} (${run.tasks.length} total)`,
   ].filter((p): p is string => p !== null)
   return parts.join(' · ').slice(0, MAX_CHARS)

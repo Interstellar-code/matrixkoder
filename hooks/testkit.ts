@@ -117,7 +117,28 @@ export const worldFixtures: Plugin = {
 }
 
 export function sessionStart(): { cwd: string; surface: 'terminal'; isInteractive: true } {
-  return { cwd: PROJECT_DIR, surface: 'terminal', isInteractive: true }
+  return sessionStartIn(PROJECT_DIR)
+}
+
+export function sessionStartIn(cwd: string): { cwd: string; surface: 'terminal'; isInteractive: true } {
+  return { cwd, surface: 'terminal', isInteractive: true }
+}
+
+/** Rewrite the run fixture (source + dict) in one step; returns the parsed run. */
+export function setRun(files: Files, mutate: (run: Record<string, unknown>) => void): Record<string, unknown> {
+  const run = JSON.parse(files['/fixtures/run.json'])
+  mutate(run)
+  files['/fixtures/run.json'] = JSON.stringify(run)
+  files[RUN_PATH] = JSON.stringify(run)
+  return run
+}
+
+/** Rewrite the usage fixture (source + dict) in one step. */
+export function setUsage(files: Files, mutate: (usage: Record<string, unknown>) => void): void {
+  const usage = JSON.parse(files['/fixtures/usage.json'])
+  mutate(usage)
+  files['/fixtures/usage.json'] = JSON.stringify(usage)
+  files[USAGE_PATH] = JSON.stringify(usage)
 }
 
 /** prompt.compose's full input — the engine's compose dispatch crashes on an empty one. */
@@ -125,33 +146,59 @@ export function composeArgs() {
   return { model: 'sonnet', promptModel: 'sonnet', surfaces: ['terminal'] as const, tools: [], outputStyle: null, traits: [] }
 }
 
-/** In-memory fs: stat hits for `dirs`, reads from `files`, writes recorded into `files`. */
-export function mockFs(on: On, files: Files, dirs: readonly string[] = [DATA_DIR]): void {
+/** In-memory fs: stat dir-hits for `dirs`, file-hits for `statFiles` (a worktree's
+ *  `.git` is a FILE), reads from `files`, writes recorded into `files`. */
+export function mockFs(
+  on: On,
+  files: Files,
+  dirs: readonly string[] = [DATA_DIR, `${PROJECT_DIR}/.git`],
+  statFiles: readonly string[] = [],
+): { reads: string[] } {
+  const reads: string[] = []
   on('fs.write', (_$, e) => {
     files[e.path] = e.text
     return { value: undefined }
   })
-  on('fs.read', (_$, e, next) => (e.path in files ? { value: files[e.path] } : next(e)))
-  on('fs.stat', (_$, e, next) => (dirs.includes(e.path) ? { value: { kind: 'dir', size: 0, mtimeMs: 0, isLink: false } } : next(e)))
+  on('fs.read', (_$, e, next) => {
+    reads.push(e.path)
+    return e.path in files ? { value: files[e.path] } : next(e)
+  })
+  on('fs.stat', (_$, e, next) => {
+    if (dirs.includes(e.path)) return { value: { kind: 'dir', size: 0, mtimeMs: 0, isLink: false } }
+    if (statFiles.includes(e.path)) return { value: { kind: 'file', size: 0, mtimeMs: 0, isLink: false } }
+    return next(e)
+  })
+  return { reads }
 }
 
 /**
  * Bottoms every noun the mod touches besides fs: clock, env, cwd, process,
- * ui.open/status/toast, session.start and prompt.compose. `recorders` taps the
- * chip and toast texts. Returns the mock clock (for advance()).
+ * ui.open/status/toast, session.start and prompt.compose. `status`/`toast` tap
+ * the chip and toast texts, `process` taps poll argv, `env` adds variables
+ * (e.g. MATRIXKODER_DATA). Returns the mock clock (for advance()).
  */
 export function mockWorld(
   on: On,
-  opts: { autoOpen?: boolean; status?: (text: string | undefined) => void; toast?: (text: string) => void } = {},
+  opts: {
+    autoOpen?: boolean
+    status?: (text: string | undefined) => void
+    toast?: (text: string) => void
+    process?: (argv: readonly string[]) => void
+    env?: Record<string, string>
+  } = {},
 ): ReturnType<ReturnType<typeof mock.clock>> {
   const clock = mock.clock(on, { now: NOW })
-  mock.env(on, { HOME: '/home/mk' })
+  mock.env(on, { HOME: '/home/mk', ...opts.env })
   // engine events (session.start, prompt.compose) are answered bare; noun
   // dispatches (fs.*, ui.*, process.run) take { value }
   on('session.start', (_$, _e) => ({ cwd: PROJECT_DIR }))
   on('prompt.compose', (_$, _e) => ({ sections: [] }))
-  on('process.run', (_$, _e) => ({ value: { exitCode: 0, stdout: '', stderr: '' } }))
+  on('process.run', (_$, e) => {
+    opts.process?.(e.argv)
+    return { value: { exitCode: 0, stdout: '', stderr: '' } }
+  })
   on('ui.open', (_$, _e) => ({ value: { isPlaced: true } }))
+  on('ui.close', (_$, _e) => ({ value: undefined }))
   on('ui.status', (_$, e) => {
     opts.status?.(e.text)
     return { value: undefined }
