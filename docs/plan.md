@@ -23,14 +23,14 @@ chip, toasts, guards, resume, onboarding wizard). The old name is retired.
 ### 2a. During development (now)
 
 ```
-hermes-switchui/
-├─ .gitignore                      + "/matrixkoder/" and "/.matrixkoder/"
-├─ matrixkoder/                    ← plugin SOURCE, its own nested git repo (git init inside)
-│                                    parent repo ignores it; later: gh repo create + push as-is
-└─ .matrixkoder/                   ← project DATA for hermes-switchui runs
+~/Development/
+├─ matrixkoder/                    ← plugin SOURCE, own git repo; later: gh repo create + push as-is
+└─ hermes-switchui/
+   ├─ .gitignore                   + "/.matrixkoder/"
+   └─ .matrixkoder/                ← project DATA for hermes-switchui runs
 ```
 
-Load while developing: `claude --plugin-dir ~/Development/hermes-switchui/matrixkoder`
+Load while developing: `claude --plugin-dir ~/Development/matrixkoder`
 (or `CLAUDE_CODE_PLUGIN_DIRS`). Plugin-dir folders hot-reload in an interactive session.
 
 ### 2b. After publishing
