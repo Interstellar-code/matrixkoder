@@ -77,12 +77,18 @@ export type MkSnapshot = {
   run: MkRun | null
   runs: readonly MkRunIndexEntry[]
   usage: MkUsage | null
+  /** set when state files exist but cannot be read/parsed; the pane shows a ⚠ note */
+  error?: string | null
+  /** /mk setup || /mk init asked for the first-run panel this session */
+  setupHint?: boolean
 }
 
 export type MkStatusMemory = {
   statuses: Readonly<Record<string, string>>
   waiting: boolean
   loaded: boolean
+  /** run id the statuses belong to; a change resets memory silently (no spurious toasts) */
+  runId?: string | null
 }
 
 declare module 'claude-code' {
@@ -93,6 +99,8 @@ declare module 'claude-code' {
       paneOpen: boolean
       /** wake.ts: events.jsonl lines already seen, per run id */
       wakeEventLines: { readonly byId: number }
+      /** wake.ts: last wake submit timestamp per task:status id */
+      wakeSentAt: { readonly byId: number }
     }
   }
 }

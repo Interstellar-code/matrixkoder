@@ -1,14 +1,15 @@
 // MatrixKoder wake on lane events: polls events.jsonl and submits prompt on transition events
-import type { EngineInterface, On, PluginOptions, StateFamily, Timer } from 'claude-code'
+import type { EngineInterface, On, PluginOptions, Timer } from 'claude-code'
 
-// $.state contract for wakeEventLines lives in types/index.d.ts
+// $.state contract for wakeEventLines and wakeSentAt lives in types/index.d.ts
 
 const WAKE_STATUSES = new Set(['verifying', 'blocked', 'quota', 'stalled', 'provider'])
+const TASK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 const COOLDOWN_MS = 5 * 60 * 1000 // 5 minutes
 
 let pendingBatch: Array<{ task: string; to: string }> = []
-const lastSubmitted = new Map<string, number>()
 let debounceTimer: Timer | null = null
+let pollTimer: Timer | null = null
 
 function candidateDirs(from: string): string[] {
   const out: string[] = []
@@ -37,37 +38,42 @@ async function resolveDataDir($: EngineInterface): Promise<string> {
 
   for (const dir of candidateDirs(cwd)) {
     const gitPath = `${dir}/.git`
+    let gitStat: { kind: string } | null = null
     try {
-      const gitContent = await $.fs.read(gitPath)
-      const m = gitContent.match(/gitdir:\s*(.+)/)
-      if (m) {
-        let gitdir = m[1].trim()
-        if (!gitdir.startsWith('/')) {
-          gitdir = `${dir}/${gitdir}`
-        }
-        const commondirContent = await $.fs.read(`${gitdir}/commondir`).catch(() => '')
-        if (commondirContent) {
-          let common = commondirContent.trim()
-          if (!common.startsWith('/')) {
-            common = `${gitdir}/${common}`
+      gitStat = await $.fs.stat(gitPath)
+    } catch {
+      // not here
+    }
+
+    if (gitStat) {
+      // Found nearest .git! Do not walk past it.
+      if (gitStat.kind === 'file') {
+        try {
+          const gitContent = await $.fs.read(gitPath)
+          const m = gitContent.match(/gitdir:\s*(.+)/)
+          if (m) {
+            let gitdir = m[1].trim()
+            if (!gitdir.startsWith('/')) {
+              gitdir = `${dir}/${gitdir}`
+            }
+            const commondirContent = await $.fs.read(`${gitdir}/commondir`).catch(() => '')
+            if (commondirContent) {
+              let common = commondirContent.trim()
+              if (!common.startsWith('/')) {
+                common = `${gitdir}/${common}`
+              }
+              const parts = common.split('/').filter(Boolean)
+              if (parts[parts.length - 1] === '.git') {
+                parts.pop()
+                return `/${parts.join('/')}/.matrixkoder`
+              }
+            }
           }
-          const parts = common.split('/').filter(Boolean)
-          if (parts[parts.length - 1] === '.git') {
-            parts.pop()
-            return `/${parts.join('/')}/.matrixkoder`
-          }
+        } catch {
+          // unreadable git file
         }
       }
       return `${dir}/.matrixkoder`
-    } catch {
-      // .git is not a file
-    }
-
-    try {
-      const stat = await $.fs.stat(`${dir}/.matrixkoder`)
-      if (stat.kind === 'dir') return `${dir}/.matrixkoder`
-    } catch {
-      // not here
     }
   }
 
@@ -85,16 +91,19 @@ async function flushBatch($: EngineInterface): Promise<void> {
   const summary = pendingBatch.map(p => `${p.task} → ${p.to}`).join(', ')
   const text = `MatrixKoder: ${summary}. Continue the run from its Next action.`
 
-  for (const p of pendingBatch) {
-    lastSubmitted.set(`${p.task}:${p.to}`, now)
-  }
-  pendingBatch = []
-  debounceTimer = null
-
   try {
     await $.prompt.submit({ text })
+    for (const p of pendingBatch) {
+      const throttleKey = `${p.task}:${p.to}`
+      await $.state
+        .set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: throttleKey } as const, now)
+        .catch(() => {})
+    }
+    pendingBatch = []
   } catch {
-    // ignore submit failure if session is unready
+    // Retain pendingBatch on submit failure for retry
+  } finally {
+    debounceTimer = null
   }
 }
 
@@ -115,9 +124,15 @@ async function pollEvents($: EngineInterface): Promise<void> {
 
     const lines = eventsRaw.split('\n').filter(line => line.trim().length > 0)
     const stateRef = { plugin: 'matrixkoder', key: 'wakeEventLines', id: active.id } as const
-    const stateRes = await $.state.get(stateRef).catch(() => ({ value: 0 }))
-    const lastSeen = typeof stateRes.value === 'number' ? stateRes.value : 0
+    const stateRes = await $.state.get(stateRef).catch(() => ({ value: undefined }))
 
+    if (typeof stateRes.value !== 'number') {
+      // First enable or first time seeing this active run: baseline to current lines, do not wake for history
+      await $.state.set(stateRef, lines.length).catch(() => {})
+      return
+    }
+
+    const lastSeen = stateRes.value
     if (lines.length <= lastSeen) return
 
     let now = Date.now()
@@ -131,10 +146,21 @@ async function pollEvents($: EngineInterface): Promise<void> {
     for (let i = lastSeen; i < lines.length; i++) {
       try {
         const ev = JSON.parse(lines[i])
-        if (ev.type === 'transition' && ev.to && WAKE_STATUSES.has(ev.to) && ev.task) {
+        // Validate every value placed in prompt.submit:
+        // task must be a string matching mk-state ID_RE; status must be in WAKE_STATUSES enum;
+        // ignore orchestrator's own events to avoid self-wake loops.
+        const isTransition = ev.type === 'transition'
+        const isValidTask = typeof ev.task === 'string' && TASK_ID_RE.test(ev.task)
+        const isValidTo = typeof ev.to === 'string' && WAKE_STATUSES.has(ev.to)
+        const isNotOrchestrator = ev.by !== 'orchestrator'
+
+        if (isTransition && isValidTask && isValidTo && isNotOrchestrator) {
           const throttleKey = `${ev.task}:${ev.to}`
-          const lastTime = lastSubmitted.get(throttleKey)
-          if (lastTime === undefined || now - lastTime >= COOLDOWN_MS) {
+          const sentRef = { plugin: 'matrixkoder', key: 'wakeSentAt', id: throttleKey } as const
+          const sentRes = await $.state.get(sentRef).catch(() => ({ value: undefined }))
+          const lastSent = typeof sentRes.value === 'number' ? sentRes.value : undefined
+
+          if (lastSent === undefined || now - lastSent >= COOLDOWN_MS) {
             if (!newlyDiscovered.some(d => d.task === ev.task && d.to === ev.to)) {
               newlyDiscovered.push({ task: ev.task, to: ev.to })
             }
@@ -154,10 +180,11 @@ async function pollEvents($: EngineInterface): Promise<void> {
         }
       }
 
-      debounceTimer?.cancel()
-      debounceTimer = $.clock.after(60000, () => {
-        void flushBatch($)
-      })
+      if (!debounceTimer) {
+        debounceTimer = $.clock.after(60000, () => {
+          void flushBatch($)
+        })
+      }
     }
   } catch {
     // silent on fs/poll error
@@ -168,11 +195,11 @@ export function registerWake(on: On, options: PluginOptions): void {
   if (!options.wake) return
 
   pendingBatch = []
-  lastSubmitted.clear()
   debounceTimer = null
 
   on('session.start', { cwd: /.*/ }, async ($, e, next) => {
-    $.clock.every(30000, () => {
+    pollTimer?.cancel()
+    pollTimer = $.clock.every(30000, () => {
       void pollEvents($)
     })
     return next(e)

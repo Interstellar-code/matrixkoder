@@ -11,6 +11,7 @@
     "autoOpen": { "title": "Auto-open pane", "type": "boolean", "default": true, "description": "Open the dashboard pane when a session starts" },
     "chip": { "title": "Status chip", "type": "boolean", "default": true, "description": "Pin the run health chip under the prompt" },
     "toasts": { "title": "Toasts", "type": "boolean", "default": true, "description": "Toast on task status transitions" },
-    "usagePollMin": { "title": "Usage poll (min)", "type": "number", "default": 5, "description": "Minutes between mk-usage.py runs" }
+    "usagePollMin": { "title": "Usage poll (min)", "type": "number", "default": 5, "description": "Minutes between mk-usage.py runs" },
+    "wake": { "title": "Wake on events", "type": "boolean", "default": false, "description": "Submit prompt when lanes encounter verifying, blocked, quota, stalled or provider" }
   }
 }
