@@ -1,0 +1,141 @@
+// MatrixKoder chip + toasts (design §5): pure text builders over a snapshot.
+// The refresh loop that feeds them lives in dashboard.tsx (one session.start
+// per module set); registerStatus owns the chip's end-of-session cleanup.
+import type { On, PluginOptions } from 'claude-code'
+import type { MkRun, MkSnapshot, MkStatusMemory, MkTask } from '../types'
+
+const AGENT_ORDER = ['claude', 'agy', 'codex', 'opencode'] as const
+
+function counts(run: MkRun): { total: number; done: number; byStatus: Map<string, number> } {
+  const byStatus = new Map<string, number>()
+  let done = 0
+  for (const t of run.tasks) {
+    byStatus.set(t.status, (byStatus.get(t.status) ?? 0) + 1)
+    if (t.status === 'done' || t.status === 'merged') done += 1
+  }
+  return { total: run.tasks.length, done, byStatus }
+}
+
+function minutesSince(iso: string | null | undefined, now: number): number | null {
+  if (!iso) return null
+  const t = Date.parse(iso)
+  if (!Number.isFinite(t) || !now) return null
+  return Math.max(0, Math.round((now - t) / 60000))
+}
+
+function pick(run: MkRun, statuses: readonly string[]): MkTask[] {
+  return run.tasks.filter(t => statuses.includes(t.status))
+}
+
+function shortDate(iso: string | null | undefined): string {
+  const t = Date.parse(iso ?? '')
+  if (!Number.isFinite(t)) return '—'
+  const d = new Date(t)
+  return `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+function exhaustedAgent(snap: MkSnapshot): { agent: string; resetShort: string } | null {
+  const agents = snap.usage?.agents
+  if (!agents || !snap.now) return null
+  const names = [...AGENT_ORDER, ...Object.keys(agents).filter(a => !(AGENT_ORDER as readonly string[]).includes(a))]
+  for (const agent of names) {
+    const entry = agents[agent]
+    if (!entry) continue
+    const until = Date.parse(entry.exhausted_until ?? '')
+    if (Number.isFinite(until) && until > snap.now) return { agent, resetShort: shortDate(entry.exhausted_until) }
+  }
+  return null
+}
+
+function untilHours(snap: MkSnapshot, agent: string): string {
+  const until = Date.parse(snap.usage?.agents?.[agent]?.exhausted_until ?? '')
+  if (!Number.isFinite(until) || !snap.now) return 'window'
+  return until - snap.now > 6 * 3600_000 ? 'weekly' : '5h'
+}
+
+/** The §5.1 chip, by descending priority; '' clears the line (no run). */
+export function chipText(snap: MkSnapshot): string {
+  const run = snap.run
+  if (!run || run.status === 'done' || run.status === 'archived') return ''
+  const { total, done, byStatus } = counts(run)
+  const building = (byStatus.get('building') ?? 0) + (byStatus.get('verifying') ?? 0)
+  if (run.waiting) return `⬡ mk · ⚠ 1 waiting on you · ${building} building`
+  const stalled = pick(run, ['stalled'])
+  if (stalled.length > 0) {
+    const t = stalled[0]
+    const mins = minutesSince(t.updated, snap.now)
+    return `⬡ mk · ⚠ ${t.id} stalled${mins != null ? ` (${mins}m)` : ''} · ${building} building`
+  }
+  const exhausted = exhaustedAgent(snap)
+  if (exhausted) return `⬡ mk · ${exhausted.agent} ⊘ wk resets ${exhausted.resetShort} · ${building} building`
+  const blocked = pick(run, ['blocked'])
+  if (blocked.length > 0) {
+    const t = blocked[0]
+    const deps = (t.deps ?? []).join(', ') || 'dependencies'
+    return `⬡ mk · ⊘ ${t.id} blocked by ${deps} · ${building} building`
+  }
+  if (done === total && total > 0) return `⬡ mk · ✓ all ${total} tasks merged · stage ${run.stage}/12`
+  if (building > 0 || (byStatus.get('review') ?? 0) > 0) {
+    const parts: string[] = []
+    if (building) parts.push(`${building} building`)
+    const review = byStatus.get('review') ?? 0
+    if (review) parts.push(`${review} review`)
+    return `⬡ mk · ${parts.join(' · ')} · ${done}/${total} done`
+  }
+  const next = (run.next ?? '').slice(0, 30)
+  return `⬡ mk · stage ${run.stage}/12 · idle${next ? ` · next: ${next}` : ''}`
+}
+
+/** The §5.2 toasts for what changed since the previous snapshot (first load: mem.loaded false → none). */
+export function toastsFor(mem: MkStatusMemory, snap: MkSnapshot): string[] {
+  const out: string[] = []
+  const run = snap.run
+  if (run) {
+    for (const t of run.tasks) {
+      const was = mem.statuses[t.id]
+      if (was === undefined || was === t.status) continue
+      const sha = (t.last_commit ?? '').slice(0, 7)
+      const mins = minutesSince(t.updated, snap.now)
+      switch (t.status) {
+        case 'merged':
+        case 'done':
+          out.push(`⬡ [MatrixKoder] Task ${t.id} ${t.status} & passed gates${sha ? ` (${sha})` : ''}`)
+          break
+        case 'stalled':
+          out.push(`⬡ [MatrixKoder] Task ${t.id} stalled: no activity in ${t.lane ?? 'lane'}${mins != null ? ` (${mins}m)` : ''}`)
+          break
+        case 'blocked':
+          out.push(`⬡ [MatrixKoder] Task ${t.id} blocked waiting on ${(t.deps ?? []).join(', ') || 'dependencies'}`)
+          break
+        case 'quota': {
+          const agent = t.agent ?? 'agent'
+          const ex = exhaustedAgent(snap)
+          out.push(`⬡ [MatrixKoder] Quota reached for ${agent} (${untilHours(snap, agent)}).${ex ? ` Resets ${ex.resetShort}.` : ''}`)
+          break
+        }
+        case 'provider': {
+          const ev = (run.recent ?? []).filter(e => e.task === t.id).at(-1)
+          out.push(`⬡ [MatrixKoder] Provider error on ${t.agent ?? 'agent'}: ${(ev?.text ?? 'upstream error').slice(0, 60)}`)
+          break
+        }
+      }
+    }
+    if (!mem.waiting && run.waiting) out.push(`⬡ [MatrixKoder] Action required: ${run.waiting.question}`)
+  }
+  return out
+}
+
+export function registerStatus(on: On, options: PluginOptions): void {
+  // the refresh loop itself starts in dashboard.tsx's single session.start hook
+  // (the validator rejects a second unmatched session.start registration)
+  on('session.end', async ($, e, next) => {
+    if (options.chip !== false) {
+      try {
+        $.ui.status(undefined)
+      } catch {
+        // clearing refused — the session is ending anyway
+      }
+    }
+    return next(e)
+  })
+}
