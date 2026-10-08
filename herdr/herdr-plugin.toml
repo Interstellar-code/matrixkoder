@@ -1,0 +1,16 @@
+id = "matrixkoder"
+name = "MatrixKoder"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Event-driven MatrixKoder lane verdicts: pane status changes become task statuses, pane labels and toasts"
+platforms = ["linux", "macos"]
+
+# Runtime commands run with this directory (the plugin root) as cwd, so ../scripts/ resolves
+# into the repository checkout this plugin lives in. argv is not run through a shell.
+[[events]]
+on = "pane.agent_status_changed"
+command = ["python3", "../scripts/mk-lane-event.py", "event"]
+
+[[events]]
+on = "pane.exited"
+command = ["python3", "../scripts/mk-lane-event.py", "event"]
