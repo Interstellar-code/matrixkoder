@@ -20,6 +20,7 @@ deps = []                                 # phase ids, or <run>:<task> to wait o
 owned = ["src/area/", "src/file.ts"]      # the only files this phase touches; overlap within a wave is a check error
 forbidden = []                            # optional: hot files this phase must leave alone (sequence them instead)
 route = ""                                # "" = jev_decide at stage 2; "<agent> <model> [<effort>]" = pinned, skips Jev
+reviewer = "opencode opencode-go/kimi-k3" # optional: <agent> <model> for the stage 8 reviewer pane; "" = the orchestrator decides
 size = "standard"                         # trivial|standard|complex — feeds jev_classify evidence
 risk = "reversible"                       # read_only|reversible|destructive — feeds jev_classify evidence
 review = "standard"                       # light|standard|data-loss — sets reviewer depth at stage 8
