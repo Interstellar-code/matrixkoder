@@ -96,7 +96,7 @@ python3 scripts/mk-usage.py --once
 
 Other options: `--watch --interval N`, `--out PATH`, `--providers a,b`, `--self-test`. When the project's `matrixkoder.yaml` lists `usage.providers`, the plugin polls exactly those.
 
-Provider names map to CodexBar like this: claude to `claude`, codex to `codex`, antigravity to `agy`, zai to `opencode`, opencodego to `opencode-go`. Agent-style names work too — `opencode` in a provider list polls CodexBar `zai`. If a provider errors, its entry is `n/a` instead of failing the whole poll. Codex on an API key has no quota to read, so expect `n/a` there.
+The provider list holds CodexBar ids directly: `claude`, `codex`, `antigravity` (CodexBar `agy`), `zai` (OpenCode on the Z.AI plan), `opencode` (OpenCode Zen), `opencodego` (`opencode-go`). The wizard pre-selects `zai` when your opencode agent is on the Z.AI plan. If a provider errors, its entry is `n/a` instead of failing the whole poll. Codex on an API key has no quota to read, so expect `n/a` there.
 
 For z.ai, store the key in CodexBar yourself (never paste it into the chat):
 

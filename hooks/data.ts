@@ -159,11 +159,22 @@ export function mkSnapshot(now: number, dataDir: string | null, run: MkRun | nul
 
 // ---------- matrixkoder.yaml line parsers (no YAML dependency; the wizard's emitter shapes) ----------
 
-/** `agents:` block of matrixkoder.yaml: names on `  name: { … available: true … }` lines, herdr excluded.
- *  null when the yaml or the block is absent → callers show every ledger agent. */
+/** `agents:` block of matrixkoder.yaml: names of available: true agents, herdr excluded.
+ *  Accepts any indent >= 2 spaces and block-style or flow-style entries.
+ *  Returns null when the yaml or the block is absent or unparseable ("no filter"), never []. */
 export function parseYamlAgents(yaml: string): readonly string[] | null {
   const out: string[] = []
   let inBlock = false
+  let agentIndent: number | null = null
+  let currentAgent: string | null = null
+  let currentAvailable: boolean | null = null
+
+  const commit = () => {
+    if (currentAgent && currentAvailable === true && currentAgent !== 'herdr' && currentAgent !== 'checked_at') {
+      out.push(currentAgent)
+    }
+  }
+
   for (const raw of yaml.split(/\r?\n/)) {
     if (!inBlock) {
       if (/^agents:\s*(#.*)?$/.test(raw)) inBlock = true
@@ -172,13 +183,31 @@ export function parseYamlAgents(yaml: string): readonly string[] | null {
     const line = raw.trim()
     if (line === '' || line.startsWith('#')) continue
     if (!/^\s/.test(raw)) break // the next top-level key ends the block
-    const m = /^ {2}([A-Za-z0-9_-]+):\s*(.*)$/.exec(raw)
-    if (m?.[1] && m[2] !== undefined && m[1] !== 'herdr' && m[1] !== 'checked_at') {
-      const val = m[2].replace(/\s+#.*$/, '').trim()
-      if (/^\{.*\bavailable:\s*true\b/.test(val)) out.push(m[1])
+
+    const m = /^(\s+)([A-Za-z0-9_-]+):\s*(.*)$/.exec(raw)
+    const indent = m && m[1] ? m[1].length : (raw.match(/^\s*/)?.[0]?.length ?? 0)
+
+    if (m && m[1] && m[2] && indent >= 2 && (agentIndent === null || indent === agentIndent)) {
+      commit()
+      agentIndent = indent
+      currentAgent = m[2]
+      currentAvailable = null
+      const rest = (m[3] ?? '').replace(/\s+#.*$/, '').trim()
+      if (/\bavailable:\s*true\b/.test(rest)) {
+        currentAvailable = true
+      } else if (/\bavailable:\s*false\b/.test(rest)) {
+        currentAvailable = false
+      }
+    } else if (currentAgent && agentIndent !== null && indent > agentIndent) {
+      if (/\bavailable:\s*true\b/.test(line)) {
+        currentAvailable = true
+      } else if (/\bavailable:\s*false\b/.test(line)) {
+        currentAvailable = false
+      }
     }
   }
-  return inBlock ? out : null
+  commit()
+  return out.length > 0 ? out : null
 }
 
 /** `usage:` → `providers:` list of matrixkoder.yaml: a `  providers: [a, b]` flow list or a `- item` block list. null when absent. */

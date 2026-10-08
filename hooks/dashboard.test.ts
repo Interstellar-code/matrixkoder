@@ -3,6 +3,7 @@
 // via $.fs.write (inline fixtures plugin); fs is served in memory.
 import { test, expect } from 'claude-code/testing'
 import { DATA_DIR, NOW, RUN_PATH, USAGE_PATH, agentOf, agentsOf, mockFs, mockWorld, paneProps, sessionStart, sessionStartIn, setRun, setUsage, tasksOf, worldFiles, worldFixtures } from './testkit'
+import { parseYamlAgents } from './data'
 
 /** a project matrixkoder.yaml in the wizard's emitter shape: agents block + usage providers */
 const PROJECT_YAML = [
@@ -532,4 +533,40 @@ test('/mk setup then closing the wizard shows the run again (no sticky first-run
   expect(await ui.find({ text: 'Plan' })).toBeTruthy()
   expect(await ui.find({ text: 'Lanes' })).toBeTruthy()
   expect(await ui.find({ text: 'Waiting on you' })).toBeTruthy()
+})
+
+test('parseYamlAgents accepts any indent >= 2 spaces, block style, and unparseable is null never []', () => {
+  // block style with 2 spaces
+  const block2 = [
+    'agents:',
+    '  codex:',
+    '    available: true',
+    '    models: [gpt-5]',
+    '  claude:',
+    '    available: false',
+  ].join('\n')
+  expect(parseYamlAgents(block2)).toEqual(['codex'])
+
+  // block style with 4 spaces
+  const block4 = [
+    'agents:',
+    '    opencode:',
+    '        available: true',
+    '    agy:',
+    '        available: false',
+  ].join('\n')
+  expect(parseYamlAgents(block4)).toEqual(['opencode'])
+
+  // flow style with 4 spaces
+  const flow4 = [
+    'agents:',
+    '    codex: { available: true }',
+  ].join('\n')
+  expect(parseYamlAgents(flow4)).toEqual(['codex'])
+
+  // unparseable treated as no filter (null), never []
+  expect(parseYamlAgents('agents:\n  garbage without keys')).toBeNull()
+  expect(parseYamlAgents('agents: []')).toBeNull()
+  expect(parseYamlAgents('agents:\n')).toBeNull()
+  expect(parseYamlAgents('no agents block here')).toBeNull()
 })

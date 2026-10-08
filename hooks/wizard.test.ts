@@ -8,7 +8,7 @@ import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import type { MkWizardDraft } from '../types'
 import { NOW, PROJECT_DIR, DATA_DIR, mockFs, paneProps, sessionStart, type Files } from './testkit'
-import { addToGitignore, buildYaml, emptyDraft, inline, parseModels, parseProviders, parseWhich, proposeGates } from './wizard-core'
+import { addToGitignore, buildYaml, emptyDraft, inline, mergeModels, parseModels, parseProviders, parseWhich, proposeGates } from './wizard-core'
 
 const HOME = '/home/mk'
 const WIZARD = 'matrixkoder-setup'
@@ -126,6 +126,10 @@ test('parsers: which, providers, models', () => {
   expect(parseWhich('/bin/claude\n/usr/local/bin/agy\n')).toEqual({ claude: '/bin/claude', agy: '/usr/local/bin/agy' })
   expect(parseProviders('codex: enabled default (Codex)\nopenai: disabled (OpenAI)\nnoise')).toEqual([{ name: 'codex', enabled: true }, { name: 'openai', enabled: false }])
   expect(parseModels('Fetching available models...\ngemini-3.8-flash-high\tGemini\nopencode/big-pickle\n')).toEqual(['gemini-3.8-flash-high', 'opencode/big-pickle'])
+  const manyModels = Array.from({ length: 20 }, (_, i) => `opencode/model-${i + 1}`).join('\n')
+  expect(parseModels(manyModels).length).toBe(20)
+  const merged = mergeModels(['opencode/a', 'opencode/b'], ['zai-coding-plan/p1', 'zai-coding-plan/p2'])
+  expect(merged).toEqual(['zai-coding-plan/p1', 'zai-coding-plan/p2', 'opencode/a', 'opencode/b'])
 })
 
 test('gate proposals: pnpm+vitest, python, Makefile; never invents', () => {
@@ -179,6 +183,19 @@ test('gate proposals: marker files (plugin, selftest, tsconfig-only, Cargo, go.m
   expect(pkgCargo.gates.test).toBe('npx vitest run {paths}')
   expect(pkgCargo.gates.typecheck).toBe('npm run typecheck')
   expect(pkgCargo.from).toBe('package.json + Cargo.toml')
+  // finding 3: selftest + Cargo gives cargo test && bash scripts/selftest.sh
+  const cargoSelftest = proposeGates({ pkg: null, pyproject: null, makefile: null, locks: [], hasTsconfig: false, markers: ['scripts/selftest.sh', 'Cargo.toml'] })
+  expect(cargoSelftest.gates.test).toBe('cargo test && bash scripts/selftest.sh')
+  expect(cargoSelftest.gates.lint_changed).toBe('cargo clippy')
+  expect(cargoSelftest.gates.format_changed).toBe('cargo fmt')
+  expect(cargoSelftest.from).toBe('Cargo.toml + scripts/selftest.sh')
+  // finding 4: package.json and Makefile test stay unchanged when selftest is present
+  const pkgSelftest = proposeGates({ pkg: JSON.parse(PKG), pyproject: null, makefile: null, locks: [], hasTsconfig: true, markers: ['scripts/selftest.sh'] })
+  expect(pkgSelftest.gates.test).toBe('npx vitest run {paths}')
+  expect(pkgSelftest.from).toBe('package.json')
+  const mkSelftest = proposeGates({ pkg: null, pyproject: null, makefile: 'test:\n\tgo test\nlint:\n\tvet\n', locks: [], hasTsconfig: false, markers: ['scripts/selftest.sh'] })
+  expect(mkSelftest.gates.test).toBe('make test')
+  expect(mkSelftest.from).toBe('Makefile')
 })
 
 test('gitignore append is idempotent', () => {
@@ -302,9 +319,10 @@ test('agent and provider toggles, and the z.ai key is a command, never a prompt'
 })
 
 test('opencode on the Z.AI plan: plan models merge in, zai is labelled and pre-selected', async ($, on) => {
+  const bareModels = Array.from({ length: 16 }, (_, i) => `opencode/model-${i + 1}\tModel ${i + 1}`).join('\n')
   const procs: Record<string, string | null> = {
     'which claude codex opencode agy herdr': '/bin/claude\n/bin/codex\n/bin/opencode\n/bin/agy\n/bin/herdr\n',
-    'opencode models': 'Fetching…\nopencode/big-pickle\tBig Pickle\nopencode-go/fast\tGo Fast\n',
+    'opencode models': `Fetching…\n${bareModels}\n`,
     'opencode models zai-coding-plan': 'zai-coding-plan/glm-4.7\tGLM 4.7\nzai-coding-plan/glm-5.3\tGLM 5.3\n',
     'codexbar config providers': 'codex: enabled default (Codex)\nclaude: enabled (Claude)\nzai: disabled (z.ai / GLM)\nopencode: disabled (OpenCode Zen)\nantigravity: enabled (Antigravity)\n',
   }
@@ -313,7 +331,11 @@ test('opencode on the Z.AI plan: plan models merge in, zai is labelled and pre-s
   await mk($, 'setup')
   const d = draftOf()
   expect(d.agents.opencode).toMatchObject({ found: true, enabled: true })
-  expect(d.agents.opencode?.models).toEqual(['opencode/big-pickle', 'opencode-go/fast', 'zai-coding-plan/glm-4.7', 'zai-coding-plan/glm-5.3'])
+  expect(d.agents.opencode?.models).toContain('zai-coding-plan/glm-4.7')
+  expect(d.agents.opencode?.models).toContain('zai-coding-plan/glm-5.3')
+  expect(d.agents.opencode?.models[0]).toBe('zai-coding-plan/glm-4.7')
+  expect(d.agents.opencode?.models[1]).toBe('zai-coding-plan/glm-5.3')
+  expect(d.agents.opencode?.models.length).toBe(12)
   expect(d.providersOn).toContain('zai') // pre-selected even though CodexBar lists zai disabled
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(72) })
   for (let i = 0; i < 3; i++) await ui.press({ key: 'wz-next' })

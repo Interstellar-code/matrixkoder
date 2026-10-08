@@ -60,19 +60,24 @@ export function parseProviders(stdout: string): { name: string; enabled: boolean
   return out
 }
 
-/** `agy models` / `opencode models`: first whitespace column of each model-looking line. */
+/** `agy models` / `opencode models`: first whitespace column of each model-looking line. Model lists are parsed uncapped. */
 export function parseModels(stdout: string): string[] {
   const out: string[] = []
   for (const line of stdout.split('\n')) {
     const id = line.trim().split(/\s+/)[0] ?? ''
     if (/^[A-Za-z0-9][A-Za-z0-9._/:-]*$/.test(id) && /[-/.]/.test(id)) out.push(id)
   }
-  return out.slice(0, MODEL_CAP)
+  return out
 }
 
-/** Detection lists merged in order, deduped, capped (bare `opencode models` + `opencode models zai-coding-plan`). */
+/** Detection lists merged, deduped, capped.
+ *  Every `zai-coding-plan/*` model is kept (put plan models first, then fill up to the cap). */
 export function mergeModels(...lists: readonly (readonly string[])[]): string[] {
-  return [...new Set(lists.flat())].slice(0, MODEL_CAP)
+  const deduped = [...new Set(lists.flat())]
+  const plan = deduped.filter(m => m.startsWith('zai-coding-plan/'))
+  const rest = deduped.filter(m => !m.startsWith('zai-coding-plan/'))
+  const cap = Math.max(MODEL_CAP, plan.length)
+  return [...plan, ...rest].slice(0, cap)
 }
 
 /** The Usage step's provider label: the two OpenCode plans are disambiguated; the stored value stays the CodexBar id. */
@@ -163,21 +168,15 @@ export function proposeGates(inp: GateInputs): { gates: MkWizardGates; banned: s
     if (gates.lint_changed === '' && has('lint')) gates.lint_changed = 'make lint'
     if (gates.format_changed === '') gates.format_changed = has('fmt') ? 'make fmt' : has('format') ? 'make format' : ''
   }
+  const hasProjectTest = gates.test !== ''
   // marker files fill what is still empty, so the blocks above win (a Makefile target beats Cargo)
+  // detection order: plugin → Cargo → go → selftest
   const marker = (m: string): boolean => inp.markers.includes(m)
   if (marker('.claude-plugin/plugin.json')) {
     from.push('.claude-plugin/plugin.json')
     if (gates.test === '') gates.test = 'claude plugin test .'
     // the plugin schema has no whole-repo validate slot; make lint already ignores {files} the same way
     if (gates.lint_changed === '') gates.lint_changed = 'claude plugin validate .'
-  }
-  if (marker('scripts/selftest.sh')) {
-    from.push('scripts/selftest.sh')
-    gates.test = gates.test === '' ? 'bash scripts/selftest.sh' : `${gates.test} && bash scripts/selftest.sh`
-  }
-  if (inp.hasTsconfig && gates.typecheck === '') {
-    from.push('tsconfig.json')
-    gates.typecheck = 'tsc -p . --noEmit'
   }
   if (marker('Cargo.toml')) {
     from.push('Cargo.toml')
@@ -189,6 +188,14 @@ export function proposeGates(inp: GateInputs): { gates: MkWizardGates; banned: s
     from.push('go.mod')
     if (gates.test === '') gates.test = 'go test ./...'
     if (gates.lint_changed === '') gates.lint_changed = 'go vet ./...'
+  }
+  if (marker('scripts/selftest.sh') && !hasProjectTest) {
+    from.push('scripts/selftest.sh')
+    gates.test = gates.test === '' ? 'bash scripts/selftest.sh' : `${gates.test} && bash scripts/selftest.sh`
+  }
+  if (inp.hasTsconfig && gates.typecheck === '') {
+    from.push('tsconfig.json')
+    gates.typecheck = 'tsc -p . --noEmit'
   }
   return { gates, banned, from: from.join(' + ') }
 }

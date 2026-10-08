@@ -157,7 +157,7 @@ async function detect($: EngineInterface, options: PluginOptions): Promise<MkWiz
     run($, ['codexbar', 'config', 'providers']),
   ])
   const models: Record<string, readonly string[]> = {
-    agy: agyModels?.ok ? parseModels(agyModels.out) : [],
+    agy: agyModels?.ok ? mergeModels(parseModels(agyModels.out)) : [],
     opencode: mergeModels(ocModels?.ok ? parseModels(ocModels.out) : [], ocPlanModels?.ok ? parseModels(ocPlanModels.out) : []),
   }
   const agents: MkWizardDraft['agents'] = Object.fromEntries(
@@ -218,7 +218,6 @@ const goto = ($: EngineInterface, step: number): Promise<unknown> =>
     const res = await update($, stepAtom, () => target)
     if (target === 5) {
       const d = await read($, draftAtom)
-      // nothing detected: seat the keys on the first gate field so typing lands there, not on Next
       if (d.gatesFrom === '') {
         try {
           await $.ui.focus({ requestId: WIZARD_ID, key: 'wz-gate-install' })
