@@ -130,7 +130,14 @@ async function detect($: EngineInterface, options: PluginOptions): Promise<MkWiz
   d.dataEnv = dataEnv ?? null
   d.globalDir = globalDirPath(homeEnv, d.home)
   d.pluginRoot = $.plugin.root
-  d.installMode = installModeOf(d.pluginRoot)
+  let forcedMode: 'dev' | 'marketplace' | null = null
+  try {
+    const m = (await $.env.get('MATRIXKODER_INSTALL_MODE'))?.trim()
+    if (m === 'dev' || m === 'marketplace') forcedMode = m
+  } catch {
+    // env refused: no override
+  }
+  d.installMode = forcedMode ?? installModeOf(d.pluginRoot)
   d.autoOpen = options.autoOpen !== false
   d.chip = options.chip !== false
   d.toasts = options.toasts !== false
@@ -383,13 +390,12 @@ function HerdrLinkChoice(els: Elements, $: EngineInterface, d: MkWizardDraft) {
   const a = d.agents.herdr
   const label = 'Link the MatrixKoder herdr plugin (herdr pushes lane events instead of polling)'
   const options = YES_NO.map(o => ({ value: o.value === 'yes' ? 'link' : 'skip', label: o.label }))
-  const value = d.herdrPlugin === 'linked' ? 'link' : d.herdrPlugin
   if (!a?.found) return <Text dimColor={true}>herdr not found on PATH</Text>
+  if (d.herdrPlugin === 'linked') return <Text color="green">✓ MatrixKoder herdr plugin is linked</Text>
   return (
     <Box flexDirection="column">
-      {d.herdrPlugin === 'linked' && <Text color="green">✓ MatrixKoder herdr plugin is linked</Text>}
       <Select
-        key="wz-herdrPlugin" label={label} options={options} value={value}
+        key="wz-herdrPlugin" label={label} options={options} value={d.herdrPlugin}
         onSelect={v => patch($, { herdrPlugin: v as 'link' | 'skip' })}
       />
     </Box>
@@ -566,6 +572,9 @@ function Review(els: Elements, $: EngineInterface, d: MkWizardDraft) {
             {`${d.herdrLinkResult.ok ? '✓' : '⚠'} ${d.herdrLinkResult.text}`}
           </Text>
         )}
+        {d.installMode === 'marketplace' && (
+          <Text dimColor={true}>Re-run /mk setup after each MatrixKoder update: the herdr link points at this plugin version's folder.</Text>
+        )}
         <Text>Next: /mk to open the dashboard.</Text>
       </Box>
     )
@@ -583,6 +592,7 @@ function Review(els: Elements, $: EngineInterface, d: MkWizardDraft) {
         <Text>{`${d.globalDir ?? '~/.matrixkoder'}/projects.json (upsert this repo)`}</Text>
         {d.agents.herdr?.found && d.herdrPlugin === 'link' && <Text>{`link    ${d.pluginRoot}/herdr in herdr`}</Text>}
         {d.agents.herdr?.found && d.herdrPlugin === 'linked' && <Text dimColor={true}>herdr plugin already linked</Text>}
+        {d.installMode === 'marketplace' && <Text dimColor={true}>Re-run /mk setup after each MatrixKoder update: the herdr link points at this plugin version's folder.</Text>}
       </Box>
       {d.existingYaml && (
         <Select

@@ -827,3 +827,36 @@ test('opencode on Ollama Cloud: models merge in, ollama is labelled and pre-sele
   expect(await ui.find({ text: /\[x\] ollama \(OpenCode on Ollama Cloud\)/ })).toBeTruthy()
   expect(await ui.find({ text: /\[ \] opencodego \(OpenCode Go\)/ })).toBeTruthy()
 })
+
+// ---------- H2B R2: linked-state Select, marketplace re-link note ----------
+
+test('wizard does not render a herdr link Select and does not run herdr plugin link when the herdr plugin is already linked', async ($, on) => {
+  const files = repoFiles()
+  const w = world(on, files, { 'herdr plugin list': 'matrixkoder\n' })
+  await $.session.start(sessionStart())
+  await mk($, 'setup')
+  expect(draftOf().herdrPlugin).toBe('linked')
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(64) })
+  await ui.press({ key: 'wz-next' })
+  await ui.press({ key: 'wz-next' })
+  expect(await ui.find({ key: 'wz-herdrPlugin' })).toBeUndefined()
+  expect(await ui.find({ text: /✓ MatrixKoder herdr plugin is linked/ })).toBeTruthy()
+  await toReview(ui)
+  expect(await ui.find({ text: /herdr plugin already linked/ })).toBeTruthy()
+  await ui.press({ key: 'wz-write' })
+  expect(w.argv.filter(a => a[0] === 'herdr' && a[1] === 'plugin' && a[2] === 'link').length).toBe(0)
+  expect(await ui.find({ text: /✓ MatrixKoder is set up/ })).toBeTruthy()
+})
+
+test('wizard adds a marketplace re-link note to Review and the post-write view', async ($, on) => {
+  const files = repoFiles()
+  world(on, files, {}, { MATRIXKODER_INSTALL_MODE: 'marketplace' })
+  await $.session.start(sessionStart())
+  await mk($, 'setup')
+  expect(draftOf().installMode).toBe('marketplace')
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(64) })
+  await toReview(ui)
+  expect(await ui.find({ text: /Re-run \/mk setup after each MatrixKoder update/ })).toBeTruthy()
+  await ui.press({ key: 'wz-write' })
+  expect(await ui.find({ text: /Re-run \/mk setup after each MatrixKoder update/ })).toBeTruthy()
+})
