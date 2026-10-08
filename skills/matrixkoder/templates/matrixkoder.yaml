@@ -3,7 +3,7 @@
 data_dir: .matrixkoder/               # project data dir (default <repo>/.matrixkoder/, or ~/.matrixkoder/projects/<slug>/)
 repo:
   integration_branch: main            # lanes merge here; one PR to main at the end
-  worktree_pattern: ../{repo}-worktree-{x}
+  lanes: { slots: 1, pattern: "../{repo}-mk-{n}", reuse: true }   # reusable worktree slots; the cap is max_build_lanes
   conventions: []                     # from CLAUDE.md / AGENTS.md, e.g. "never run pnpm check repo-wide"
 gates:
   install: ""                         # e.g. pnpm install --frozen-lockfile --prefer-offline

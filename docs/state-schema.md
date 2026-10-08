@@ -14,6 +14,7 @@ allowed, renaming or removing one needs `schema` bumped.
 | Run snapshot | `<data>/runs/<run_id>/run.json` — written atomically (temp file + `os.replace`); **the dashboard reads only this** |
 | Event log | `<data>/runs/<run_id>/events.jsonl` — append-only (`O_APPEND`), one JSON object per line |
 | Board | `<data>/runs/<run_id>/board.md` — regenerated on every write and by `render` |
+| Lane registry | `<data>/lanes.json` — written **only** by `mk-lane.py` (see below); `mk-state.py` never touches it |
 | Task | `<data>/runs/<run_id>/tasks/<task_id>/task.json` (copy of the task object in `run.json`) |
 | Round files | same folder: `brief-rN.md`, `report-rN.md`, `review-rN.md` (paths returned by `task round`; written by the orchestrator / agents, not by mk-state) |
 | Locks | `<home>/locks/<resource lower-cased>.lock` |
@@ -88,7 +89,8 @@ with offset, seconds precision (`2026-10-07T20:09:01+02:00`). Unknown values are
 | `ready` | bool | written by mk-state: has deps, `planned`/`routed`, every dep met. A flip to true logs a `deps met` note; the dashboard toasts it |
 | `status` | enum | `planned → routed → dispatched → building → verifying → review → fix → merged → qa → done`; side states `blocked \| quota \| stalled \| provider` |
 | `agent` | string \| null | agent kind or pane (`codex`, `agy`, ...) |
-| `model`, `effort`, `lane`, `pane` | string \| null | `lane` = worktree path; `pane` = herdr pane id of that lane (`wK:p1`), written by `mk-lane-event.py arm` (`mk-state task set <T> pane=<pane>`, best-effort) |
+| `model`, `effort`, `lane`, `pane` | string \| null | `lane` = worktree (slot) path; `pane` = herdr pane id of that lane (`wK:p1`), written by `mk-lane-event.py arm` (`mk-state task set <T> pane=<pane>`, best-effort) |
+| `branch`, `workspace`, `slot` | string \| null | the lane's own names, written by `mk-lane.py acquire`: `branch` = `mk/<run>/<task>`, `workspace` = herdr workspace label `mk:<repo>:<n>`, `slot` = slot number as a string. Empty value clears (`branch=`), like `lane=`/`pane=`; the board shows all three on the lane cell when set |
 | `last_commit` | string \| null | short sha; also copied to the current round's `sha` |
 | `gates` | any JSON \| null | e.g. `{"test": "pass", "tsc": "pass"}` (pass a JSON value to `task set`) |
 | `verdict` | string \| null | latest review verdict; also copied to the current round's `verdict` |
@@ -107,6 +109,84 @@ with offset, seconds precision (`2026-10-07T20:09:01+02:00`). Unknown values are
 `task set status=...` appends the transition event itself. `text` must be non-empty; a `transition`
 event needs `to`. Readers skip a line that is not valid JSON (a crash mid-append); `run.json` is
 authoritative, so `events.jsonl` may hold one event more than `recent` after a crash.
+
+## `lanes.json` (slot registry, `scripts/mk-lane.py`)
+
+Lives outside `runs/`: it describes the reusable **worktree slots** of this project, not a run.
+`mk-lane.py` is its only writer and mirrors the lane it hands out onto the task (`lane`, `branch`,
+`workspace`, `slot` task keys, best-effort: a failed write there is a warning on the acquire, never a
+failed one). `mk-state.py` never reads or writes it.
+
+```json
+{"schema": 1,
+ "slots": {"1": {"path": "/Users/me/repo-mk-1", "workspace": "mk:repo:1", "workspace_id": "wD",
+                 "state": "free", "run": null, "task": null, "branch": null,
+                 "lock_hash": "9f2c…", "updated": "2026-10-07T20:09:01+02:00"}}}
+```
+
+| Field | Meaning |
+|---|---|
+| `path` | the slot's absolute checkout path (`repo.lanes.pattern` with `{repo}`/`{n}`, against the main checkout) |
+| `workspace`, `workspace_id` | herdr workspace label and its id (`null` when the slot was created with plain `git worktree add`, or with `MK_HERDR=none` in the self-test) |
+| `state` | `free` \| `busy`. A busy slot carries the `run`/`task`/`branch` it was acquired for |
+| `lock_hash` | sha256 of the slot's lockfile when it was last acquired; a different hash (or a created slot) is what `install_needed` reports |
+| `updated` | last write, ISO 8601 local time with offset |
+
+Every read-modify-write holds an exclusive `fcntl.flock` on `<data>/lanes.lock` (wait up to 30 s, then
+`{"ok": false, "error": "lanes.lock busy"}` exit 2) and writes atomically (temp file + `os.replace`,
+`write_json`). `mk-lane.py list` is the only read-only command: it takes no lock and reports a live
+`clean` per slot.
+
+### What makes a slot reusable (`acquire` and `release` both refuse, exit 3)
+
+- **Clean working tree.** `git status --porcelain=v1 -z --ignored --untracked-files=normal
+  --ignore-submodules=none`, split on NUL. `-z` is what makes this trustworthy: porcelain v1
+  C-quotes a path with a space, a non-ASCII byte or a leading `:`, and a quoted path matches nothing
+  and reads as untracked. The flags are on the command line on purpose, because
+  `status.showUntrackedFiles=no` in the user's config would otherwise hide `??` lines and this check
+  is the only thing between a hidden untracked file and `git worktree remove`. Every record must be an
+  ignored entry (`!! …`) on the allowlist: `.matrixkoder-*`, `.env`, `.env.*`, `node_modules/`,
+  `.omc/`, `.serena/`, `.venv/`, `__pycache__/` plus `lanes_disposable`. The three build-cache dirs
+  (`node_modules/`, `__pycache__/`, `.venv/`) match as a path component at any depth; every other
+  entry is root-only. A **directory** entry is disposable only while the repo tracks nothing inside
+  it, at every level including the root: `git --literal-pathspecs ls-files -z -- <dir>` must be empty
+  (a non-zero exit counts as tracked, i.e. dirty). A vendored `node_modules/`, `.venv/` or a dir named
+  `:x` is therefore source, and an ignored file inside it keeps the slot dirty.
+  `lanes_disposable` entries must be literal names (`[A-Za-z0-9._-]+`, optional trailing `/`) — a `*`
+  would make every ignored file disposable, so rejected entries are reported in the `warnings` field
+  of every `ok` answer instead of being applied, and so is a `lanes:` line that does not parse (the
+  defaults are kept, silently widening nothing).
+- **No commit that no ref reaches.** `git rev-list HEAD --not --branches --tags --remotes` must be
+  empty, checked before every `switch` **and before every removal** (`gc`, and `release` with
+  `reuse: false`): a free slot sits detached, so a late builder commit there would be orphaned by the
+  next switch — and `git worktree remove` deletes the worktree's `logs/HEAD`, so a removal would take
+  it from reflog-only to dangling. `gc` reports it as a skip with the SHAs in `unreachable`; `release`
+  exits 3.
+- **The path is ours.** A stored `path` is never rewritten: if the configured pattern now gives a
+  different path the acquire is refused (`slot 1 is at X, pattern now gives Y`). Before any switch or
+  remove, the path must be a worktree registered by `git worktree list` for this repo and must not be
+  the main checkout; a new slot's path must not exist at all (an empty directory included) and must
+  not resolve inside the main checkout. The pattern must contain `{n}`.
+- **Refs are untrusted.** `--base` / `--integration` may not start with `-` and must resolve through
+  `git rev-parse --verify --quiet --end-of-options <ref>^{commit}`; generated branch names go through
+  `git check-ref-format --branch`. git — and herdr — then get the resolved sha.
+- **`--integration` is a branch, not a commit.** It must resolve to `refs/heads/<name>` *in its stored
+  spelling* — `git for-each-ref --format=%(refname) -- refs/heads/<name>` must echo it back — and must
+  not be the slot's own task branch. On a case-insensitive filesystem (macOS, `core.ignorecase`) git
+  resolves a loose ref under any case and `rev-parse --symbolic-full-name` echoes the alias, so
+  `--integration MK/R1/T2` would otherwise pass as the task branch `mk/r1/t2`. Ref names are compared
+  as strings; no tip-sha comparison is made, because integration == task tip is a legitimate
+  fast-forward merge. The task branch is looked up as `refs/heads/<b>`, so a tag of
+  the same name cannot shadow it, and it is kept (not deleted) while `git worktree list --porcelain`
+  shows it checked out in another worktree — `update-ref -d` does not know about worktrees.
+
+Notes worth knowing before you rely on it: a `switch` can overwrite an allowlisted ignored file if the
+target commit happens to track that name (git's own behaviour — keep secrets out of the base branch);
+a crash between creating the worktree and writing `lanes.json` leaves a worktree the registry does not
+know (delete the directory and `git worktree prune`, then acquire again — the create path refuses an
+existing directory); `run`/`task` are stored as typed while the branch is lowercased, so `T1` and `t1`
+map to one branch; and a **hand-edited** `lanes.json` pointing a slot at another worktree of the same
+repo is outside what the tool can detect — it trusts its own registry, so do not edit it by hand.
 
 ## Lock file `<home>/locks/<resource>.lock`
 
@@ -187,7 +267,7 @@ everything else `default`.
 | `run set` | `[--id ID] [--next TEXT] [--status active\|done]` (at least one) |
 | `run stage` / `run archive` | `run stage N` (N >= 0, `[--id ID]`); `run archive --id ID` or `run archive ID` |
 | `task add` | `--id T --title TEXT [--wave N] [--deps A,RUN:B] [--owned glob,glob] [--parent P]` — deps are stored in the target's stored id case and a self-dep is refused; `--parent` onto a task in `merged`/`qa`/`done` fails; returns `warnings` for unknown deps, owned globs overlapping an unmerged task in any active run (the new task's own `--parent` chain is not an overlap: a parent owns its children's globs), and active sibling runs that could not be read |
-| `task set` | `T key=value ... [--note TEXT] [--force]` (`--force`: dispatch past unmet own+ancestor deps); `status=` on a task with children fails (it rolls up); keys `status agent model effort lane pane last_commit gates verdict`; a value starting `{`/`[` is parsed as JSON, empty = null |
+| `task set` | `T key=value ... [--note TEXT] [--force]` (`--force`: dispatch past unmet own+ancestor deps); `status=` on a task with children fails (it rolls up); keys `status agent model effort lane pane branch workspace slot last_commit gates verdict`; a value starting `{`/`[` is parsed as JSON, empty = null |
 | `task round` | `T --kind build\|fix\|takeover [--cause TEXT]` |
 | `task get` | `T` |
 | `event` | `[--task T] --type transition\|decision\|verdict\|quota\|note --text TEXT [--from S] [--to S]` |

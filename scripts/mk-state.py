@@ -9,7 +9,8 @@
       RUN:B is a task in another run of the same data dir; --parent onto merged/qa/done is refused;
       warns when an owned glob overlaps an unmerged task in any active run
       (the new task's own --parent chain is not an overlap: a parent owns its children's globs)
-  task set T key=value ... [--note TEXT] [--force]   keys: status agent model effort lane pane last_commit gates verdict
+  task set T key=value ... [--note TEXT] [--force]   keys: status agent model effort lane pane
+      branch workspace slot last_commit gates verdict (branch/workspace/slot are written by mk-lane.py acquire)
       status=dispatched|building needs every own AND ancestor dep merged/qa/done (--force overrides);
       status= on a parent is refused (it rolls up from children); a task whose deps are all met gets
       ready=true and a "deps met" event; an unreadable sibling run only produces a warnings entry
@@ -35,7 +36,8 @@ SCHEMA = 1
 STATUSES = ("planned routed dispatched building verifying review fix merged qa done "
             "blocked quota stalled provider").split()
 EVENT_TYPES = ("transition", "decision", "verdict", "quota", "note")
-TASK_KEYS = ("status", "agent", "model", "effort", "lane", "pane", "last_commit", "gates", "verdict")
+TASK_KEYS = ("status", "agent", "model", "effort", "lane", "pane", "branch", "workspace", "slot",
+             "last_commit", "gates", "verdict")
 ROUND_KINDS = ("build", "fix", "takeover")
 ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 RECENT, BOARD_EVENTS = 10, 15
@@ -354,9 +356,13 @@ class Store:
                      if x.get("id") and deps_include(x.get("deps"), f"{run['id']}:{t.get('id')}")
                      and t.get("status") not in DEP_MET]
             status = (t.get("status") or "?") + (" · ready" if t.get("ready") else "")
+            # mk-lane.py's slot keys ride the lane cell; unset keys must leave the row byte-identical
+            lane = " · ".join(x for x in (t.get("lane"), t.get("branch"),
+                                           f"slot {t['slot']}" if t.get("slot") else None,
+                                           t.get("workspace")) if x)
             out.append("| " + " | ".join(cell(v) for v in (
                 "↳ " * depth + (t.get("id") or "?"), t.get("title"), t.get("wave"), status, ", ".join(deps),
-                t.get("agent"), me, t.get("round"), t.get("lane"), t.get("last_commit"),
+                t.get("agent"), me, t.get("round"), lane, t.get("last_commit"),
                 t.get("verdict"))) + " |")
         out += ["", f"## Recent events (last {BOARD_EVENTS})", ""]
         for e in self.events(run["id"], BOARD_EVENTS):
@@ -620,7 +626,8 @@ def cmd_task(a, st):
                                         f"consider --deps {ref}")
             t = {"id": tid, "title": a.title, "wave": a.wave, "deps": deps, "owned": owned, "parent": a.parent,
                  "ready": False, "status": "planned", "agent": None, "model": None, "effort": None, "lane": None,
-                 "pane": None, "last_commit": None, "gates": None, "verdict": None, "round": 0, "rounds": [],
+                 "pane": None, "branch": None, "workspace": None, "slot": None,
+                 "last_commit": None, "gates": None, "verdict": None, "round": 0, "rounds": [],
                  "created": now(), "updated": now()}
             run["tasks"].append(t)
             st.event(run, "transition", f"task added: {a.title}", task=tid, to="planned", by=a.by)
@@ -876,6 +883,21 @@ def self_test():
         assert mk("task", "set", "T1", "pan=wK:p1", code=2)["ok"] is False  # still a closed key set
         assert mk("task", "get", "T1")["task"]["pane"] is None
         assert mk("task", "set", "T1", "pane=wK:p1")["task"]["pane"] == "wK:p1"
+
+        # branch/workspace/slot: the lane a task holds, written by mk-lane.py acquire
+        assert {"branch", "workspace", "slot"} <= set(TASK_KEYS)
+        tl = mk("task", "set", "T1", "branch=mk/r1/t1", "workspace=mk:repo:1", "slot=1")["task"]
+        assert (tl["branch"], tl["workspace"], tl["slot"]) == ("mk/r1/t1", "mk:repo:1", "1"), tl
+        assert mk("task", "get", "T1")["task"]["branch"] == "mk/r1/t1"
+        board = open(mk("render")["board"]).read()
+        assert "mk/r1/t1 · slot 1 · mk:repo:1" in board, board  # the lane cell names the slot
+        for k in ("branch", "workspace", "slot"):
+            assert mk("task", "set", "T1", f"{k}=")["task"][k] is None  # empty clears, like lane=
+        plain = open(mk("render")["board"]).read()  # the lane cell is back to the bare path
+        assert "| T1 |" in plain and "mk/r1/t1" not in plain, plain
+        for bad in ("bran=mk/r1/t1", "workspac=mk:repo:1", "slotx=1"):
+            assert mk("task", "set", "T1", bad, code=2)["ok"] is False  # still a closed key set
+        assert mk("task", "set", "T1", "branch=mk/r1/t1", "workspace=mk:repo:1", "slot=1")["ok"]
 
         ev = mk("event", "--task", "T1", "--type", "decision", "--text", "route codex high")["event"]
         assert ev["type"] == "decision" and ev["task"] == "T1"

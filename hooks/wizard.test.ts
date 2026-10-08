@@ -226,6 +226,14 @@ test('baselines stay null and gates are marked proposed', () => {
   expect(yaml).toContain('  install: ""')
 })
 
+test('repo: emits the lanes block (reusable worktree slots), not worktree_pattern', () => {
+  const yaml = buildYaml(emptyDraft(), ISO_NOW)
+  expect(yaml).toContain('  lanes: { slots: 1, pattern: "../{repo}-mk-{n}", reuse: true }   # reusable worktree slots; the cap is max_build_lanes')
+  expect(yaml).not.toContain('worktree_pattern')
+  expect(yaml).not.toContain('-worktree-')
+  expect(yaml).toContain('  integration_branch: main   # lanes merge here; one PR to main at the end\n' + '  lanes: { slots: 1,')
+})
+
 // ---------- /mk setup and the pane ----------
 
 test('/mk setup opens the wizard pane and detection pre-fills the draft', async ($, on) => {
@@ -419,6 +427,8 @@ test('review writes yaml, config.json, projects.json, .gitignore and the dirs; e
     expect(yaml).toContain(`  checked_at: "${ISO_NOW}"`)
     expect(yaml).toContain('  builder_order: [codex, agy, claude]')
     expect(yaml).toContain('  max_build_lanes: 2')
+    expect(yaml).toContain('  lanes: { slots: 1, pattern: "../{repo}-mk-{n}", reuse: true }')
+    expect(yaml).not.toContain('worktree_pattern')
     expect(yaml).toContain('    claude: { five_hour_left_pct: 40, weekly_left_pct: 30 }')
     expect(yaml).toContain('  builder_skip_permissions: true')
     expect(yaml).toContain('  providers: [claude, codex, antigravity]'.replace('claude, codex', 'codex, claude'))
