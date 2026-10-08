@@ -8,7 +8,8 @@ Usage:
                 [--task T --data DIR [--run ID]]
   lane-watch.py --self-test
 
-Done = latest commit subject matches REGEX AND (report exists, if given) AND agent not working
+Done = latest commit subject matches REGEX (searched in the bare subject, so `^feat(x)`-style anchors work; the
+       older "<sha> <subject>" form, e.g. `^[0-9a-f]+ feat`, still matches) AND (report exists, if given) AND agent not working
        AND (with --phase) a "<PHASE> DONE" line in the pane since dispatch. Done wins over a stray
        limit / dev-server string in the same pane.
 "<PHASE> BLOCKED: <question>" in the pane → BLOCKED with the question (the later of DONE / BLOCKED wins).
@@ -76,7 +77,7 @@ def pane_fingerprint(text):
 def decide(h, subj, rx, report_ok, text, phase, stall_min):
     """One poll's verdict -> (state | None to keep watching, evidence list). Pure: no herdr, no git."""
     done_tok, question = phase_tokens(text, phase)
-    commit_ok = bool(rx.search(subj))
+    commit_ok = bool(rx.search(subj.partition(" ")[2]) or rx.search(subj))  # subj = "<sha> <subject>"
     status = h.get("agent_status")
     if h["state"] != "ERROR" and commit_ok and report_ok and status != "working" and (done_tok or not phase):
         return "DONE", [f"commit {subj}"] + ([f"{phase} DONE"] if phase else [])
@@ -167,6 +168,10 @@ def self_test():
     assert decide(ok, good, rx, True, "", None, 10)[0] == "DONE"
     assert decide({**ok, "agent_status": "working"}, good, rx, True, "", None, 10)[0] is None
     assert decide(ok, good, rx, False, "", None, 10)[0] is None
+    # a ^-anchored regex matches the bare subject (lesson 36); an unanchored one is unaffected
+    assert decide(ok, good, re.compile(r"^feat\(p1\): state"), True, "", None, 10)[0] == "DONE"
+    assert decide(ok, other, re.compile(r"^feat\(p1\)"), True, "", None, 10)[0] is None
+    assert decide(ok, good, re.compile(r"state core"), True, "", None, 10)[0] == "DONE"
     # with --phase the DONE token is also required, at line start only
     assert decide(ok, good, rx, True, "I will reply with P1 DONE when finished", "P1", 10)[0] is None
     assert decide(ok, good, rx, True, "all gates green\n⏺ P1 DONE\n", "P1", 10) == ("DONE", [f"commit {good}", "P1 DONE"])
