@@ -145,13 +145,19 @@ Every read-modify-write holds an exclusive `fcntl.flock` on `<data>/lanes.lock` 
   is the only thing between a hidden untracked file and `git worktree remove`. Every line must be an
   ignored entry (`!! …`) on the allowlist: `.matrixkoder-*`, `.env`, `.env.*`, `node_modules/`,
   `.omc/`, `.serena/`, `.venv/`, `__pycache__/` plus `lanes_disposable`. The three build-cache dirs
-  (`node_modules/`, `__pycache__/`, `.venv/`) match as a path component at any depth; every other
-  entry is root-only. `lanes_disposable` entries must be literal names (`[A-Za-z0-9._-]+`, optional
-  trailing `/`) — a `*` would make every ignored file disposable, so rejected entries are reported in
-  the `warnings` field of every `ok` answer instead of being applied.
+  (`node_modules/`, `__pycache__/`, `.venv/`) match as a path component at any depth — but only
+  while that directory holds no tracked files, so a vendored (tracked) `lambda/node_modules/` is source
+  and an ignored file inside it keeps the slot dirty. Every other entry is root-only.
+  `lanes_disposable` entries must be literal names (`[A-Za-z0-9._-]+`, optional trailing `/`) — a `*`
+  would make every ignored file disposable, so rejected entries are reported in the `warnings` field
+  of every `ok` answer instead of being applied, and so is a `lanes:` line that does not parse (the
+  defaults are kept, silently widening nothing).
 - **No commit that no ref reaches.** `git rev-list HEAD --not --branches --tags --remotes` must be
-  empty. A free slot sits detached, so a late builder commit there would be orphaned by the next
-  `switch` and survive only in the reflog; the refusal names the first SHAs in `unreachable`.
+  empty, checked before every `switch` **and before every removal** (`gc`, and `release` with
+  `reuse: false`): a free slot sits detached, so a late builder commit there would be orphaned by the
+  next switch — and `git worktree remove` deletes the worktree's `logs/HEAD`, so a removal would take
+  it from reflog-only to dangling. `gc` reports it as a skip with the SHAs in `unreachable`; `release`
+  exits 3.
 - **The path is ours.** A stored `path` is never rewritten: if the configured pattern now gives a
   different path the acquire is refused (`slot 1 is at X, pattern now gives Y`). Before any switch or
   remove, the path must be a worktree registered by `git worktree list` for this repo and must not be
@@ -159,7 +165,12 @@ Every read-modify-write holds an exclusive `fcntl.flock` on `<data>/lanes.lock` 
   not resolve inside the main checkout. The pattern must contain `{n}`.
 - **Refs are untrusted.** `--base` / `--integration` may not start with `-` and must resolve through
   `git rev-parse --verify --quiet --end-of-options <ref>^{commit}`; generated branch names go through
-  `git check-ref-format --branch`. git then gets the resolved sha.
+  `git check-ref-format --branch`. git — and herdr — then get the resolved sha.
+- **`--integration` is a branch, not a commit.** It must resolve to `refs/heads/<name>`, and must not be
+  the slot's own task branch: as its own "integration" the merged check would pass with nothing but the
+  slot's HEAD pointing at those commits. The task branch is looked up as `refs/heads/<b>`, so a tag of
+  the same name cannot shadow it, and it is kept (not deleted) while `git worktree list --porcelain`
+  shows it checked out in another worktree — `update-ref -d` does not know about worktrees.
 
 Notes worth knowing before you rely on it: a `switch` can overwrite an allowlisted ignored file if the
 target commit happens to track that name (git's own behaviour — keep secrets out of the base branch);
