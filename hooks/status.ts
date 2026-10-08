@@ -114,6 +114,9 @@ export function toastsFor(mem: MkStatusMemory, snap: MkSnapshot): string[] {
   const run = snap.run
   if (run) {
     for (const t of run.tasks) {
+      if (t.ready && mem.ready && !mem.ready.includes(t.id)) {
+        out.push(`⬡ [MatrixKoder] Task ${t.id} ready: deps met (${(t.deps ?? []).join(', ')})`)
+      }
       const was = mem.statuses[t.id]
       if (was === undefined || was === t.status) continue
       const sha = (t.last_commit ?? '').slice(0, 7)

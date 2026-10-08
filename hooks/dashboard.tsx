@@ -320,7 +320,8 @@ async function applyStatus($: EngineInterface, options: PluginOptions, snap: MkS
   }
   const statuses: Record<string, string> = {}
   for (const t of snap.run?.tasks ?? []) statuses[t.id] = t.status
-  await update($, statusMemoryAtom, () => ({ statuses, waiting: !!snap.run?.waiting, loaded: true, runId: snap.run?.id ?? null }))
+  const ready = (snap.run?.tasks ?? []).filter(t => t.ready).map(t => t.id)
+  await update($, statusMemoryAtom, () => ({ statuses, ready, waiting: !!snap.run?.waiting, loaded: true, runId: snap.run?.id ?? null }))
 }
 
 /** snapshot signature without `now`: the clock alone must not force a redraw */

@@ -14,6 +14,10 @@ export type MkTask = {
   title: string
   wave?: number | null
   deps?: readonly string[]
+  /** parent task id (nested task); the parent's status rolls up from its children */
+  parent?: string | null
+  /** set by mk-state: has deps, not started, every dep merged/qa/done */
+  ready?: boolean
   status: string
   agent?: string | null
   model?: string | null
@@ -91,6 +95,8 @@ export type MkWakePending = {
 
 export type MkStatusMemory = {
   statuses: Readonly<Record<string, string>>
+  /** task ids that were ready at the last snapshot (a flip to ready toasts once) */
+  ready?: readonly string[]
   waiting: boolean
   loaded: boolean
   /** run id the statuses belong to; a change resets memory silently (no spurious toasts) */

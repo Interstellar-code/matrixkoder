@@ -4,8 +4,12 @@
   run init --id ID --feature F --branch B [--plan PATH]
   run list | run get [--id ID | ID] | run set [--id ID] [--next TEXT] [--status active|done]
   run stage N [--id ID] | run archive --id ID | run archive ID
-  task add --id T --title TEXT [--wave N] [--deps A,B] [--owned glob,glob]   (ids are case-insensitive unique)
-  task set T key=value ... [--note TEXT]     keys: status agent model effort lane last_commit gates verdict
+  task add --id T --title TEXT [--wave N] [--deps A,RUN:B] [--owned glob,glob] [--parent P]
+      ids are case-insensitive unique; RUN:B is a task in another run of the same data dir; warns when an
+      owned glob overlaps an unmerged task in any active run
+  task set T key=value ... [--note TEXT] [--force]   keys: status agent model effort lane last_commit gates verdict
+      status=dispatched|building needs every dep merged/qa/done (--force overrides); a parent's status rolls up
+      from its children; a task whose deps are all met gets ready=true and a "deps met" event
   task round T --kind build|fix|takeover [--cause TEXT]
   task get T
   event [--task T] --type transition|decision|verdict|quota|note --text TEXT [--from S] [--to S]  (transition needs --to)
@@ -22,7 +26,7 @@ Every command prints ONE JSON line. Errors: {"ok": false, "error": ...} exit 2; 
 run.json is authoritative; events.jsonl may run one line ahead after a crash; `render` rebuilds board.md.
 Schema: docs/state-schema.md
 """
-import argparse, contextlib, datetime, fcntl, json, math, os, re, socket, sys, tempfile
+import argparse, contextlib, datetime, fcntl, fnmatch, json, math, os, re, socket, sys, tempfile
 
 SCHEMA = 1
 STATUSES = ("planned routed dispatched building verifying review fix merged qa done "
@@ -32,6 +36,9 @@ TASK_KEYS = ("status", "agent", "model", "effort", "lane", "last_commit", "gates
 ROUND_KINDS = ("build", "fix", "takeover")
 ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 RECENT, BOARD_EVENTS = 10, 15
+DEP_MET = ("merged", "qa", "done")
+DEP_GATED = ("dispatched", "building")
+SIDE = ("blocked", "provider", "quota", "stalled")  # roll-up precedence: the first present wins
 
 
 class Fail(Exception):
@@ -168,7 +175,9 @@ class Store:
             raise Fail(f"no run {rid!r} in {self.runs}")
         return run
 
-    def save(self, run, task=None):
+    def save(self, run, task=None, by="orchestrator"):
+        rollup(self, run, by)
+        self.refresh_ready(run, by)
         run["updated"] = now()
         if task is not None:
             write_json(os.path.join(self.task_dir(run["id"], task["id"]), "task.json"), task)
@@ -177,6 +186,32 @@ class Store:
         idx.append({k: run[k] for k in ("id", "feature", "status", "started", "ended")})
         write_json(self.index_path, sorted(idx, key=lambda r: r["started"]))
         self.render(run)
+
+    def dep_status(self, run, dep):
+        """Status of a dep ("T" in this run, "RUN:T" in another run of this data dir), None if unknown."""
+        rid, _, tid = dep.rpartition(":")
+        src = run if rid in ("", run["id"]) else read_json(os.path.join(self.run_dir(rid), "run.json")) or {}
+        return next((t["status"] for t in src.get("tasks", []) if t["id"] == tid), None)
+
+    def unmet(self, run, t):
+        return [d for d in t.get("deps") or [] if self.dep_status(run, d) not in DEP_MET]
+
+    def active_runs(self, run):
+        """The other active runs, loaded (the given run is used as is)."""
+        return [run] + [x for x in (read_json(os.path.join(self.run_dir(r["id"]), "run.json"))
+                                    for r in self.index() if r.get("status") == "active" and r["id"] != run["id"])
+                        if x]
+
+    def refresh_ready(self, run, by="orchestrator"):
+        """ready = has deps, not started, all deps met. A flip to ready logs a "deps met" event. -> changed?"""
+        changed = False
+        for t in run["tasks"]:
+            ready = bool(t.get("deps")) and t["status"] in ("planned", "routed") and not self.unmet(run, t)
+            if ready != bool(t.get("ready")):
+                t["ready"], changed = ready, True
+                if ready:
+                    self.event(run, "note", f"deps met ({', '.join(t['deps'])}): ready to dispatch", task=t["id"], by=by)
+        return changed
 
     def event(self, run, type_, text, task=None, frm=None, to=None, by="orchestrator"):
         ev = {"t": now(), "run": run["id"], "task": task, "type": type_, "text": text,
@@ -212,14 +247,19 @@ class Store:
             out.append(f"**Waiting on you:** {w['question']} — options: {' | '.join(w['options'])}"
                        + (f" — rec: {w['rec']}" if w.get("rec") else ""))
         out += ["", "## Tasks", "",
-                "| Task | Title | Wave | Status | Agent | Model · effort | Round | Lane | Last commit | Verdict |",
-                "|---|---|---|---|---|---|---|---|---|---|"]
-        for t in run["tasks"]:
+                "| Task | Title | Wave | Status | Deps | Agent | Model · effort | Round | Lane | Last commit | Verdict |",
+                "|---|---|---|---|---|---|---|---|---|---|---|"]
+        others = self.active_runs(run)[1:]
+        for t, depth in tree(run["tasks"]):
             cell = lambda v: "—" if v in (None, "", []) else str(v).replace("|", "\\|")
             me = " · ".join(x for x in (t.get("model"), t.get("effort")) if x)
+            deps = [f"{d} {'✓' if self.dep_status(run, d) in DEP_MET else '…'}" for d in t.get("deps") or []]
+            deps += [f"blocks {o['id']}:{x['id']}" for o in others for x in o["tasks"]
+                     if f"{run['id']}:{t['id']}" in (x.get("deps") or []) and t["status"] not in DEP_MET]
+            status = t["status"] + (" · ready" if t.get("ready") else "")
             out.append("| " + " | ".join(cell(v) for v in (
-                t["id"], t["title"], t["wave"], t["status"], t["agent"], me, t["round"], t["lane"],
-                t["last_commit"], t["verdict"])) + " |")
+                "↳ " * depth + t["id"], t["title"], t["wave"], status, ", ".join(deps), t["agent"], me, t["round"],
+                t["lane"], t["last_commit"], t["verdict"])) + " |")
         out += ["", f"## Recent events (last {BOARD_EVENTS})", ""]
         for e in self.events(run["id"], BOARD_EVENTS):
             move = f"{e['from'] or ''} → {e['to']}".strip() if e.get("to") else ""
@@ -232,6 +272,47 @@ class Store:
             f.write("\n".join(out) + "\n")
         os.replace(tmp, path)
         return path
+
+
+def tree(tasks):
+    """-> [(task, depth)]: roots in insertion order, each followed by its children (indented on the board)."""
+    kids = {}
+    for t in tasks:
+        kids.setdefault(t.get("parent"), []).append(t)
+    out, ids = [], {t["id"] for t in tasks}
+
+    def walk(t, d):
+        out.append((t, d))
+        for c in kids.get(t["id"], []):
+            walk(c, d + 1)
+    for t in tasks:
+        if t.get("parent") not in ids:  # a root (or an orphan whose parent vanished)
+            walk(t, 0)
+    return out
+
+
+def rollup(st, run, by):
+    """A parent's status follows its children: a side state if any child is in one, else the least advanced."""
+    order = {s: i for i, s in enumerate(STATUSES)}
+    for t, _ in reversed(tree(run["tasks"])):  # leaves first, so nested parents see rolled-up children
+        kids = [c["status"] for c in run["tasks"] if c.get("parent") == t["id"]]
+        if not kids:
+            continue
+        new = next((s for s in SIDE if s in kids), None) or min(kids, key=order.__getitem__)
+        if new != t["status"]:
+            st.event(run, "transition", f"roll-up from children: {t['status']} → {new}", task=t["id"],
+                     frm=t["status"], to=new, by=by)
+            t["status"], t["updated"] = new, now()
+
+
+def globs_overlap(a, b):
+    """Could two owned globs name the same file? fnmatch both ways, else compare literal prefixes.
+    ponytail: prefix heuristic over-warns (src/*.ts vs src/*.css); a real glob intersection if that gets noisy."""
+    if fnmatch.fnmatchcase(a, b) or fnmatch.fnmatchcase(b, a):
+        return True
+    la, lb = (re.split(r"[*?\[]", g, maxsplit=1)[0] for g in (a, b))
+    wild = lambda g: re.search(r"[*?\[]", g)
+    return bool(wild(a) and wild(b)) and (la.startswith(lb) or lb.startswith(la))
 
 
 def find_task(run, tid):
@@ -365,14 +446,37 @@ def cmd_task(a, st):
                 raise Fail(f"task {tid} exists" + (f" as {clash[0]}" if clash[0] != tid else ""))
             if not a.title:
                 raise Fail("task add needs --title")
-            t = {"id": tid, "title": a.title, "wave": a.wave, "deps": csv(a.deps), "owned": csv(a.owned),
-                 "status": "planned", "agent": None, "model": None, "effort": None, "lane": None,
+            deps, owned, warnings = csv(a.deps), csv(a.owned), []
+            for d in deps:
+                rid, _, did = d.rpartition(":")
+                check_id(did, "dep task id")
+                if rid:
+                    check_id(rid, "dep run id")
+                if st.dep_status(run, d) is None:
+                    warnings.append(f"dep {d} not found (yet)")
+            if a.parent:
+                find_task(run, a.parent)
+            for o in st.active_runs(run):
+                for x in o["tasks"]:
+                    ref = x["id"] if o["id"] == run["id"] else f"{o['id']}:{x['id']}"
+                    if x["status"] in DEP_MET or ref in deps:
+                        continue
+                    hits = [f"{g} ~ {h}" for g in owned for h in x.get("owned") or [] if globs_overlap(g, h)]
+                    if hits:
+                        warnings.append(f"owned overlaps {ref} ({x['status']}): {', '.join(hits)}; "
+                                        f"consider --deps {ref}")
+            t = {"id": tid, "title": a.title, "wave": a.wave, "deps": deps, "owned": owned, "parent": a.parent,
+                 "ready": False, "status": "planned", "agent": None, "model": None, "effort": None, "lane": None,
                  "last_commit": None, "gates": None, "verdict": None, "round": 0, "rounds": [],
                  "created": now(), "updated": now()}
             run["tasks"].append(t)
             st.event(run, "transition", f"task added: {a.title}", task=tid, to="planned", by=a.by)
-            st.save(run, t)
-            return {"ok": True, "task": t}
+            st.save(run, t, a.by)
+            for rid in {d.rpartition(":")[0] for d in deps} - {"", run["id"]}:  # their boards show "blocks"
+                other = read_json(os.path.join(st.run_dir(rid), "run.json"))
+                if other:
+                    st.render(other)
+            return {"ok": True, "task": t, **({"warnings": warnings} if warnings else {})}
         t = find_task(run, a.task)
         cur = t["rounds"][-1] if t["rounds"] else None
         if a.action == "set":
@@ -384,6 +488,11 @@ def cmd_task(a, st):
                 changes[k] = parse_value(v)
             if "status" in changes and changes["status"] not in STATUSES:
                 raise Fail(f"bad status {changes['status']!r}; one of: {' '.join(STATUSES)}")
+            if changes.get("status") in DEP_GATED and t["status"] not in DEP_GATED and not a.force:
+                waiting = st.unmet(run, t)
+                if waiting:
+                    raise Fail(f"task {t['id']} waits on {', '.join(waiting)} (not merged/qa/done); pass --force "
+                               "to dispatch anyway", unmet=waiting)
             frm = t["status"]
             t.update(changes)
             if cur and "verdict" in changes:
@@ -405,7 +514,13 @@ def cmd_task(a, st):
             st.event(run, "note", f"round {n} ({a.kind})" + (f": {a.cause}" if a.cause else ""),
                      task=t["id"], by=a.by)
         t["updated"] = now()
-        st.save(run, t)
+        st.save(run, t, a.by)
+        if a.action == "set":  # a merge here can make tasks in other active runs ready
+            for o in st.active_runs(run)[1:]:
+                if st.refresh_ready(o, a.by):
+                    st.save(o, by=a.by)
+                else:
+                    st.render(o)  # its "blocks"/dep marks may have changed
         if a.action == "round":
             d = st.task_dir(run["id"], t["id"])
             return {"ok": True, "task": t["id"], "round": t["round"], "kind": a.kind,
@@ -505,9 +620,10 @@ def build_parser():
     task = sub.add_parser("task").add_subparsers(dest="action", required=True)
     t = task.add_parser("add", parents=[data_p, run_p])
     t.add_argument("--id"), t.add_argument("--title"), t.add_argument("--wave", type=int)
-    t.add_argument("--deps"), t.add_argument("--owned")
+    t.add_argument("--deps"), t.add_argument("--owned"), t.add_argument("--parent")
     t = task.add_parser("set", parents=[data_p, run_p])
     t.add_argument("task"), t.add_argument("pairs", nargs="+"), t.add_argument("--note")
+    t.add_argument("--force", action="store_true")
     t = task.add_parser("round", parents=[data_p, run_p])
     t.add_argument("task"), t.add_argument("--kind", required=True), t.add_argument("--cause")
     t = task.add_parser("get", parents=[data_p, run_p])
@@ -773,6 +889,56 @@ def self_test():
                    "--text", "flags before the subcommand", data_arg=False)["event"]
         assert front["by"] == "front"  # subparser SUPPRESS keeps the earlier --by
         assert mk("--data", data, "--run", "r1", "task", "get", "T1", data_arg=False)["task"]["id"] == "T1"
+
+        # deps, cross-run deps, parent roll-up, owned overlap — own data dir
+        d2 = ["--data", os.path.join(tmp, "deps")]
+        dk = lambda *x, code=0: mk(*x, *d2, code=code, data_arg=False)
+        dk("run", "init", "--id", "ra", "--feature", "A", "--branch", "a")
+        dk("run", "init", "--id", "rb", "--feature", "B", "--branch", "b")
+        dk("task", "add", "--id", "R", "--title", "Reasoning", "--owned", "src/server/hermes-api.ts", "--run", "ra")
+        dk("task", "add", "--id", "X", "--title", "Base", "--run", "rb")
+        w = dk("task", "add", "--id", "A", "--title", "Archive", "--owned", "src/server/*.ts", "--run", "rb")
+        assert any("ra:R" in x and "--deps ra:R" in x for x in w["warnings"]), w  # overlap across runs
+        w = dk("task", "add", "--id", "A2", "--title", "Archive 2", "--owned", "src/server/*.ts",
+               "--deps", "ra:R,X", "--run", "rb")
+        assert not any("ra:R" in x for x in w.get("warnings", [])), w  # dep already declared: no warning
+        assert "dep ra:Q not found" in dk("task", "add", "--id", "A3", "--title", "t", "--deps", "ra:Q",
+                                           "--run", "rb")["warnings"][0]
+        assert globs_overlap("src/a.ts", "src/*.ts") and not globs_overlap("src/a.ts", "src/b.ts")
+        assert not globs_overlap("docs/*", "src/*")
+        # gate: unmet deps block dispatch, --force overrides
+        e = dk("task", "set", "A2", "status=dispatched", "--run", "rb", code=2)
+        assert "waits on ra:R, X" in e["error"] and e["unmet"] == ["ra:R", "X"], e
+        board_a = open(os.path.join(tmp, "deps", "runs", "ra", "board.md")).read()
+        assert "blocks rb:A2" in board_a, board_a  # shown on the dependency's board too
+        dk("task", "set", "X", "status=merged", "--run", "rb")
+        assert dk("task", "get", "A2", "--run", "rb")["task"]["ready"] is False  # ra:R still open
+        dk("task", "set", "R", "status=merged", "--run", "ra")  # cross-run: flips rb:A2 ready
+        t = dk("task", "get", "A2", "--run", "rb")["task"]
+        assert t["ready"] is True, t
+        rb = dk("run", "get", "--id", "rb")["run"]
+        assert any(x["task"] == "A2" and "deps met" in x["text"] for x in rb["recent"])
+        board_b = open(os.path.join(tmp, "deps", "runs", "rb", "board.md")).read()
+        assert "ra:R ✓" in board_b and "planned · ready" in board_b, board_b
+        dk("task", "set", "A2", "status=dispatched", "--run", "rb")
+        assert dk("task", "get", "A2", "--run", "rb")["task"]["ready"] is False
+        dk("task", "set", "A3", "status=building", "--force", "--run", "rb")
+        # parent roll-up: side state wins, else the least advanced child; nested parents too
+        dk("task", "add", "--id", "P", "--title", "Parent", "--run", "rb")
+        dk("task", "add", "--id", "C1", "--title", "Child 1", "--parent", "P", "--run", "rb")
+        dk("task", "add", "--id", "C2", "--title", "Child 2", "--parent", "P", "--run", "rb")
+        dk("task", "add", "--id", "G", "--title", "Grandchild", "--parent", "C2", "--run", "rb")
+        assert dk("task", "add", "--id", "C3", "--title", "t", "--parent", "NOPE", "--run", "rb", code=2)["ok"] is False
+        dk("task", "set", "C1", "status=merged", "--run", "rb")
+        assert dk("task", "get", "P", "--run", "rb")["task"]["status"] == "planned"
+        dk("task", "set", "G", "status=building", "--run", "rb")
+        assert dk("task", "get", "C2", "--run", "rb")["task"]["status"] == "building"
+        assert dk("task", "get", "P", "--run", "rb")["task"]["status"] == "building"
+        dk("task", "set", "C1", "status=stalled", "--run", "rb")
+        assert dk("task", "get", "P", "--run", "rb")["task"]["status"] == "stalled"
+        board_b = open(os.path.join(tmp, "deps", "runs", "rb", "board.md")).read().splitlines()
+        rows = [x.split("|")[1].strip() for x in board_b if x.startswith("| ") and "Task" not in x]
+        assert rows[-4:] == ["P", "↳ C1", "↳ C2", "↳ ↳ G"], rows
         print("mk-state self-test ok")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

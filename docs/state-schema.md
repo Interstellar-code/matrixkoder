@@ -81,7 +81,9 @@ with offset, seconds precision (`2026-10-07T20:09:01+02:00`). Unknown values are
 |---|---|---|
 | `id`, `title` | string | `id` unique case-insensitively within the run (`T1` and `t1` clash) |
 | `wave` | int \| null | |
-| `deps`, `owned` | string[] | task ids it waits on; file globs it owns |
+| `deps`, `owned` | string[] | tasks it waits on (`T` in this run, `RUN:T` in another run of the same data dir); file globs it owns. `task set status=dispatched\|building` fails while a dep is not `merged`/`qa`/`done` (`--force` overrides) |
+| `parent` | string \| null | parent task id (same run); the parent's status rolls up from its children: a side state if any child is in one (`blocked` > `provider` > `quota` > `stalled`), else the least advanced child |
+| `ready` | bool | written by mk-state: has deps, `planned`/`routed`, every dep met. A flip to true logs a `deps met` note; the dashboard toasts it |
 | `status` | enum | `planned → routed → dispatched → building → verifying → review → fix → merged → qa → done`; side states `blocked \| quota \| stalled \| provider` |
 | `agent` | string \| null | agent kind or pane (`codex`, `agy`, ...) |
 | `model`, `effort`, `lane` | string \| null | `lane` = worktree path |
@@ -169,8 +171,8 @@ everything else `default`.
 | `run list` / `run get` | `run get [--id ID \| ID]` (default: the single active run) |
 | `run set` | `[--id ID] [--next TEXT] [--status active\|done]` (at least one) |
 | `run stage` / `run archive` | `run stage N` (N >= 0, `[--id ID]`); `run archive --id ID` or `run archive ID` |
-| `task add` | `--id T --title TEXT [--wave N] [--deps A,B] [--owned glob,glob]` |
-| `task set` | `T key=value ... [--note TEXT]`; keys `status agent model effort lane last_commit gates verdict`; a value starting `{`/`[` is parsed as JSON, empty = null |
+| `task add` | `--id T --title TEXT [--wave N] [--deps A,RUN:B] [--owned glob,glob] [--parent P]` — returns `warnings` for unknown deps and for owned globs overlapping an unmerged task in any active run |
+| `task set` | `T key=value ... [--note TEXT] [--force]` (`--force`: dispatch past unmet deps); keys `status agent model effort lane last_commit gates verdict`; a value starting `{`/`[` is parsed as JSON, empty = null |
 | `task round` | `T --kind build\|fix\|takeover [--cause TEXT]` |
 | `task get` | `T` |
 | `event` | `[--task T] --type transition\|decision\|verdict\|quota\|note --text TEXT [--from S] [--to S]` |

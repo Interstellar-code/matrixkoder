@@ -46,7 +46,10 @@ Scripts: `${CLAUDE_PLUGIN_ROOT}/scripts/`. **All run-state writes go through `mk
 ```
 mk-state.py run init --id <run> --feature "<F>" --branch <integration> --plan <data>/plans/<f>.md
 mk-state.py run set --next "<one line: what to do on resume>"      run stage <N>      run get [--id <run>]
-mk-state.py task add --id <T> --title "<t>" --wave <n> --deps A,B --owned 'glob,glob'
+mk-state.py task add --id <T> --title "<t>" --wave <n> --deps A,<run>:B --owned 'glob,glob' [--parent <P>]
+#   deps gate dispatch (status=dispatched|building errors until every dep is merged/qa/done; --force overrides);
+#   <run>:B waits on a task in another run; a met task gets ready=true + a "deps met" event; act on the
+#   "owned overlaps" warnings (add the suggested --deps); a parent's status rolls up from its children
 mk-state.py task set <T> status=<s> agent=<kind> model=<m> effort=<e> lane=<path> last_commit=<sha> verdict=<v> --note "<why>"
 mk-state.py task round <T> --kind build|fix|takeover --cause "<brief gap|verification gap|scope|capability>"   # prints brief/report/review paths
 mk-state.py event --task <T> --type decision|verdict|quota|note --text "<one line>"

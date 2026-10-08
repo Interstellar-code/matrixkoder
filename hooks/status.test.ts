@@ -141,6 +141,27 @@ test('stalled toast uses the lane basename', { plugins: [worldFixtures] }, async
   expect(toasts).toEqual(['⬡ [MatrixKoder] Task FIX6 stalled: no activity in wt-fix6 (11m)'])
 })
 
+test('a task whose deps are met toasts ready once', { plugins: [worldFixtures] }, async ($, on) => {
+  const files = worldFiles()
+  setRun(files, run => {
+    run.waiting = null
+  })
+  mockFs(on, files)
+  const toasts: string[] = []
+  const clock = mockWorld(on, { toast: t => toasts.push(t) })
+  await $.session.start(sessionStart())
+  setRun(files, run => {
+    const tasks = tasksOf(run)
+    if (tasks[3]) {
+      tasks[3].deps = ['ra:R']
+      tasks[3].ready = true
+    }
+  })
+  await clock.advance(5000)
+  await clock.advance(5000)
+  expect(toasts).toEqual(['⬡ [MatrixKoder] Task FIX6 ready: deps met (ra:R)'])
+})
+
 test('quota toast carries the exhausted pool', { plugins: [worldFixtures] }, async ($, on) => {
   const files = worldFiles()
   setRun(files, run => {
