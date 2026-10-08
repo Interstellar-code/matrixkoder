@@ -24,9 +24,10 @@ Do NOT touch: <list>
 - Work in the foreground: no background tasks (they stall and hide progress). No subagents either, unless the phase's `subagents = true` — then one per task, foreground, on your default model.
 - Never run <banned_commands from matrixkoder.yaml: dev server, build that boots services, deploy, restarts>. Never start background jobs and wait on them.
 - No secrets in code, logs or the report.
+- Committed code and tests never read lane-only `.matrixkoder-*` files (they exist only in this lane; use `scripts/fixtures/`).
 - Commit: `<type(scope): message>`, blank line, `Co-Authored-By: <agent/model> <email>`.
 - Write the report to the path named here (`report-rN.md` in this lane's copy; the orchestrator copies it back): files changed, the exact final test/type/lint summary lines, differences from spec/mockups and why, anything skipped. Report only what you ran.
-- **Last thing you do:** print `<PHASE> R<n> DONE` (or `<PHASE> R<n> BLOCKED: <question>`) as the LAST line of your reply, alone on its line — after any summary, never inside it. `<n>` is your round number, so the token is unique per round and a wait cannot match the previous round still on screen. The orchestrator's watcher looks for that exact line.
+- **Last thing you do:** print `<PHASE> R<n> DONE` (or `<PHASE> R<n> BLOCKED: <question>`) as the LAST line of your reply, alone on its line — after the last commit and the report, never inside a summary. Even if a background-task or subagent completion notice arrives first, let it wait: finish the commit and the report, then print the DONE line. `<n>` is your round number, so the token is unique per round and a wait cannot match the previous round still on screen. The orchestrator's watcher looks for that exact line.
 
 ## TAKEOVER (only when another agent stopped mid-phase)
 You inherit uncommitted work — KEEP it and build on it:
@@ -37,3 +38,11 @@ You inherit uncommitted work — KEEP it and build on it:
 ## FIX (only for review findings)
 Findings: `<data>/runs/<id>/tasks/<T>/review-rN.md` — cite their numbers in the report.
 <numbered findings with acceptance per finding; same files/commands/rules as above>
+
+## LEAD (only when phases share a lane_group)
+This lane holds several phases of one plan — you are the lead and the only committer:
+- Give each phase to ONE subagent, in parallel where files are disjoint — on YOUR OWN default model; you never route or switch models.
+- Subagents edit only their phase's files and never commit.
+- When one returns: review its diff against its acceptance lines, fix what is wrong, run that phase's check.
+- Then commit that phase alone (`git add <its files>`) and print `<PHASE> DONE` on its own line — once per phase.
+- After the last phase: full gates once, then the report, then the round's DONE line (see Rules).
