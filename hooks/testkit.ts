@@ -209,7 +209,7 @@ export function mockWorld(
     autoOpen?: boolean
     status?: (text: string | undefined) => void
     toast?: (text: string) => void
-    process?: (argv: readonly string[]) => void
+    process?: (argv: readonly string[]) => void | { value: { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean; isStderrTruncated: boolean } } | Promise<void | { value: { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean; isStderrTruncated: boolean } }>
     open?: (id: string) => void
     env?: Record<string, string>
   } = {},
@@ -220,9 +220,9 @@ export function mockWorld(
   // dispatches (fs.*, ui.*, process.run) take { value }
   on('session.start', (_$, _e) => ({ cwd: PROJECT_DIR }))
   on('prompt.compose', (_$, _e) => ({ sections: [] }))
-  on('process.run', (_$, e) => {
-    opts.process?.(e.argv)
-    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  on('process.run', async (_$, e) => {
+    const override = await opts.process?.(e.argv)
+    return override ?? { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('ui.open', (_$, e) => {
     opts.open?.(e.id)

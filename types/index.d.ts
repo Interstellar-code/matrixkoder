@@ -208,4 +208,6 @@ export type MkWizardDraft = {
   phase: 'editing' | 'written' | 'error'
   written: readonly string[]
   error: string | null
+  herdrPlugin: 'linked' | 'link' | 'skip'
+  herdrLinkResult: { ok: boolean; text: string } | null
 }

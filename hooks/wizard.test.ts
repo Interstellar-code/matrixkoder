@@ -44,8 +44,15 @@ const PROCS: Record<string, string | null> = {
 
 type World = { argv: string[][]; opened: string[]; closed: string[]; state: Map<string, { value: unknown; version: number }> }
 
-/** clock, env, process (argv → canned stdout, unknown → exit 1), fs and ui.open/close. `procs` overrides PROCS. */
-function world(on: On, files: Files, procs: Record<string, string | null> = {}, env: Record<string, string> = {}, unreadable: readonly string[] = []): World {
+/** clock, env, process (argv → canned stdout, unknown → exit 1), fs and ui.open/close. `procs` overrides PROCS; `process` can override the result. */
+function world(
+  on: On,
+  files: Files,
+  procs: Record<string, string | null> = {},
+  env: Record<string, string> = {},
+  unreadable: readonly string[] = [],
+  process?: (argv: readonly string[]) => void | { value: { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean; isStderrTruncated: boolean } } | Promise<void | { value: { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean; isStderrTruncated: boolean } }>,
+): World {
   const w: World = { argv: [], opened: [], closed: [], state: new Map() }
   worldOf = w
   const table = { ...PROCS, ...procs }
@@ -56,8 +63,10 @@ function world(on: On, files: Files, procs: Record<string, string | null> = {}, 
   on('fs.exists', (_$, e) => ({ value: e.path in files || unreadable.includes(e.path) }))
   on('session.start', (_$, _e) => ({ cwd: PROJECT_DIR }))
   on('prompt.compose', (_$, _e) => ({ sections: [] }))
-  on('process.run', (_$, e) => {
+  on('process.run', async (_$, e) => {
     w.argv.push([...e.argv])
+    const override = await process?.(e.argv)
+    if (override) return override
     // mv / cp act on the in-memory files, as the real commands would on disk
     if (e.argv[0] === 'mv' || e.argv[0] === 'cp') {
       const [src, dst] = [e.argv[e.argv.length - 2] ?? '', e.argv[e.argv.length - 1] ?? '']
@@ -130,6 +139,8 @@ test('parsers: which, providers, models', () => {
   expect(parseModels(manyModels).length).toBe(20)
   const merged = mergeModels(['opencode/a', 'opencode/b'], ['zai-coding-plan/p1', 'zai-coding-plan/p2'])
   expect(merged).toEqual(['zai-coding-plan/p1', 'zai-coding-plan/p2', 'opencode/a', 'opencode/b'])
+  const withOllama = mergeModels(['opencode/a'], ['ollama-cloud/x'], ['zai-coding-plan/p1'])
+  expect(withOllama).toEqual(['zai-coding-plan/p1', 'ollama-cloud/x', 'opencode/a'])
 })
 
 test('gate proposals: pnpm+vitest, python, Makefile; never invents', () => {
@@ -232,6 +243,8 @@ test('/mk setup opens the wizard pane and detection pre-fills the draft', async 
   expect(d.installMode).toBe('dev')
   expect(d.agents.codex).toMatchObject({ found: true, enabled: true })
   expect(d.agents.opencode).toMatchObject({ found: false, enabled: false })
+  expect(d.agents.herdr).toMatchObject({ found: true, enabled: true })
+  expect(d.herdrPlugin).toBe('link')
   expect(d.agents.agy?.models).toEqual(['gemini-3.8-flash-high', 'gemini-3.8-flash-low'])
   expect(d.codexbarVersion).toBe('0.73.0')
   expect(d.providersOn).toEqual(['codex', 'claude', 'antigravity'])
@@ -725,4 +738,125 @@ test('yaml quoting: numberish, date-ish and NEL values are quoted', () => {
   expect(inline('\u0085x')).toBe('"\\u0085x"')
   expect(inline('.matrixkoder/')).toBe('.matrixkoder/')
   expect(inline('../x')).toBe('../x')
+})
+
+// ---------- H2B: herdr plugin link and Ollama Cloud models ----------
+
+test('wizard detects whether the MatrixKoder herdr plugin is linked', async ($, on) => {
+  const files = repoFiles()
+  world(on, files, { 'herdr plugin list': 'matrixkoder\n' })
+  await $.session.start(sessionStart())
+  await mk($, 'setup')
+  expect(draftOf().herdrPlugin).toBe('linked')
+})
+
+test('wizard links the herdr plugin on write when link, and only once', async ($, on) => {
+  const files = repoFiles()
+  const w = world(on, files, {}, {}, [], argv => {
+    if (argv[0] === 'herdr' && argv[1] === 'plugin' && argv[2] === 'link') {
+      return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
+  })
+  await $.session.start(sessionStart())
+  await mk($, 'setup')
+  expect(draftOf().herdrPlugin).toBe('link')
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(64) })
+  await toReview(ui)
+  await ui.press({ key: 'wz-write' })
+  const links = w.argv.filter(a => a[0] === 'herdr' && a[1] === 'plugin' && a[2] === 'link')
+  expect(links.length).toBe(1)
+  expect(links[0]?.[3]).toBe(`${draftOf().pluginRoot}/herdr`)
+  expect(await ui.find({ text: /✓ herdr plugin linked/ })).toBeTruthy()
+})
+
+test('wizard skips the herdr plugin link when skip or already linked', async ($, on) => {
+  const files = repoFiles()
+  const w = world(on, files, {}, {}, [], argv => {
+    if (argv[0] === 'herdr' && argv[1] === 'plugin' && argv[2] === 'link') {
+      return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
+  })
+  await $.session.start(sessionStart())
+  await mk($, 'setup')
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(64) })
+  // navigate to step 3 and choose skip
+  await ui.press({ key: 'wz-next' })
+  await ui.press({ key: 'wz-next' })
+  await ui.select({ key: 'wz-herdrPlugin', value: 'skip' })
+  await toReview(ui)
+  await ui.press({ key: 'wz-write' })
+  expect(w.argv.filter(a => a[0] === 'herdr' && a[1] === 'plugin' && a[2] === 'link').length).toBe(0)
+})
+
+test('wizard survives a failing herdr plugin link without failing the write', async ($, on) => {
+  const files = repoFiles()
+  const w = world(on, files, {}, {}, [], argv => {
+    if (argv[0] === 'herdr' && argv[1] === 'plugin' && argv[2] === 'link') {
+      return { value: { exitCode: 1, stdout: '', stderr: 'no herdr socket', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
+  })
+  await $.session.start(sessionStart())
+  await mk($, 'setup')
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(64) })
+  await toReview(ui)
+  await ui.press({ key: 'wz-write' })
+  expect(w.argv.filter(a => a[0] === 'herdr' && a[1] === 'plugin' && a[2] === 'link').length).toBe(1)
+  expect(await ui.find({ text: /✓ MatrixKoder is set up/ })).toBeTruthy()
+  expect(await ui.find({ text: /⚠ herdr plugin link failed/ })).toBeTruthy()
+})
+
+test('opencode on Ollama Cloud: models merge in, ollama is labelled and pre-selected', async ($, on) => {
+  const bareModels = Array.from({ length: 16 }, (_, i) => `opencode/model-${i + 1}\tModel ${i + 1}`).join('\n')
+  const procs: Record<string, string | null> = {
+    'which claude codex opencode agy herdr': '/bin/claude\n/bin/codex\n/bin/opencode\n/bin/agy\n/bin/herdr\n',
+    'opencode models': `Fetching…\n${bareModels}\n`,
+    'opencode models ollama-cloud': 'ollama-cloud/llama-3.1\tLlama 3.1\nollama-cloud/qwen-2.5\tQwen 2.5\n',
+    'codexbar config providers': 'codex: enabled default (Codex)\nclaude: enabled (Claude)\nzai: disabled (z.ai / GLM)\nopencode: disabled (OpenCode Zen)\nopencodego: disabled (OpenCode Go)\nollama: disabled (Ollama Cloud)\nantigravity: enabled (Antigravity)\n',
+  }
+  world(on, repoFiles(), procs)
+  await $.session.start(sessionStart())
+  await mk($, 'setup')
+  const d = draftOf()
+  expect(d.agents.opencode).toMatchObject({ found: true, enabled: true })
+  expect(d.agents.opencode?.models).toContain('ollama-cloud/llama-3.1')
+  expect(d.agents.opencode?.models).toContain('ollama-cloud/qwen-2.5')
+  expect(d.agents.opencode?.models[0]).toBe('ollama-cloud/llama-3.1')
+  expect(d.providersOn).toContain('ollama')
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(72) })
+  for (let i = 0; i < 3; i++) await ui.press({ key: 'wz-next' })
+  expect(await ui.find({ text: /\[x\] ollama \(OpenCode on Ollama Cloud\)/ })).toBeTruthy()
+  expect(await ui.find({ text: /\[ \] opencodego \(OpenCode Go\)/ })).toBeTruthy()
+})
+
+// ---------- H2B R2: linked-state Select, marketplace re-link note ----------
+
+test('wizard does not render a herdr link Select and does not run herdr plugin link when the herdr plugin is already linked', async ($, on) => {
+  const files = repoFiles()
+  const w = world(on, files, { 'herdr plugin list': 'matrixkoder\n' })
+  await $.session.start(sessionStart())
+  await mk($, 'setup')
+  expect(draftOf().herdrPlugin).toBe('linked')
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(64) })
+  await ui.press({ key: 'wz-next' })
+  await ui.press({ key: 'wz-next' })
+  expect(await ui.find({ key: 'wz-herdrPlugin' })).toBeUndefined()
+  expect(await ui.find({ text: /✓ MatrixKoder herdr plugin is linked/ })).toBeTruthy()
+  await toReview(ui)
+  expect(await ui.find({ text: /herdr plugin already linked/ })).toBeTruthy()
+  await ui.press({ key: 'wz-write' })
+  expect(w.argv.filter(a => a[0] === 'herdr' && a[1] === 'plugin' && a[2] === 'link').length).toBe(0)
+  expect(await ui.find({ text: /✓ MatrixKoder is set up/ })).toBeTruthy()
+})
+
+test('wizard adds a marketplace re-link note to Review and the post-write view', async ($, on) => {
+  const files = repoFiles()
+  world(on, files, {}, { MATRIXKODER_INSTALL_MODE: 'marketplace' })
+  await $.session.start(sessionStart())
+  await mk($, 'setup')
+  expect(draftOf().installMode).toBe('marketplace')
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(64) })
+  await toReview(ui)
+  expect(await ui.find({ text: /Re-run \/mk setup after each MatrixKoder update/ })).toBeTruthy()
+  await ui.press({ key: 'wz-write' })
+  expect(await ui.find({ text: /Re-run \/mk setup after each MatrixKoder update/ })).toBeTruthy()
 })

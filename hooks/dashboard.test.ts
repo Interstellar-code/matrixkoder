@@ -2,7 +2,7 @@
 // compact 36-col, inline hint, first-run and no-run states. Fixtures arrive
 // via $.fs.write (inline fixtures plugin); fs is served in memory.
 import { test, expect } from 'claude-code/testing'
-import { DATA_DIR, NOW, RUN_PATH, USAGE_PATH, agentOf, agentsOf, mockFs, mockWorld, paneProps, sessionStart, sessionStartIn, setRun, setUsage, tasksOf, worldFiles, worldFixtures } from './testkit'
+import { DATA_DIR, NOW, RUN_PATH, RUNS_INDEX, USAGE_PATH, agentOf, agentsOf, mockFs, mockWorld, paneProps, sessionStart, sessionStartIn, setRun, setUsage, tasksOf, worldFiles, worldFixtures } from './testkit'
 import { parseYamlAgents } from './data'
 
 /** a project matrixkoder.yaml in the wizard's emitter shape: agents block + usage providers */
@@ -287,7 +287,7 @@ test('missing usage triggers the initial poll with the right argv', { plugins: [
   delete files[USAGE_PATH]
   mockFs(on, files)
   const polls: (readonly string[])[] = []
-  const clock = mockWorld(on, { process: argv => polls.push(argv) })
+  const clock = mockWorld(on, { process: argv => { polls.push(argv) } })
   await $.session.start(sessionStart())
   // the cold-start poll is fire-and-forget: advance(0) settles the event loop so its dispatch chain reaches process.run
   await clock.advance(0)
@@ -308,7 +308,7 @@ test('a project yaml scopes the usage poll: --providers from usage.providers', {
   delete files[USAGE_PATH]
   mockFs(on, files)
   const polls: (readonly string[])[] = []
-  const clock = mockWorld(on, { process: argv => polls.push(argv) })
+  const clock = mockWorld(on, { process: argv => { polls.push(argv) } })
   await $.session.start(sessionStart())
   // the cold-start poll is fire-and-forget: advance(0) settles the event loop so its dispatch chain reaches process.run
   await clock.advance(0)
@@ -745,4 +745,69 @@ test('U3 add-on: an agents block with all agents disabled shows no usage rows', 
   expect(await ui.find({ text: /agy/ })).toBeUndefined()
   expect(await ui.find({ text: /opencode/ })).toBeUndefined()
   expect(await ui.find({ text: /codex/ })).toBeUndefined()
+})
+
+// ---------- H2B: lane sweep from the dashboard tick ----------
+
+function isSweep(argv: readonly string[]): boolean {
+  return argv.length >= 3 && argv[0] === 'python3' && !!argv[1]?.endsWith('scripts/mk-lane-event.py') && argv[2] === 'sweep'
+}
+
+test('sweep runs every 2 minutes when an orchestration run is active', { plugins: [worldFixtures] }, async ($, on) => {
+  const files = worldFiles()
+  mockFs(on, files)
+  const sweeps: (readonly string[])[] = []
+  const clock = mockWorld(on, { process: argv => { if (isSweep(argv)) sweeps.push(argv) } })
+  await $.session.start(sessionStart())
+  await clock.advance(120_000)
+  expect(sweeps.length).toBe(1)
+  await clock.advance(119_000)
+  expect(sweeps.length).toBe(1) // 1 s short
+  await clock.advance(1_000)
+  expect(sweeps.length).toBe(2)
+})
+
+test('sweep does not run without an active run', async ($, on) => {
+  const files = worldFiles()
+  delete files[RUNS_INDEX]
+  delete files[RUN_PATH]
+  mockFs(on, files, [])
+  const sweeps: (readonly string[])[] = []
+  const clock = mockWorld(on, { process: argv => { if (isSweep(argv)) sweeps.push(argv) } })
+  await $.session.start(sessionStart())
+  await clock.advance(120_000)
+  expect(sweeps.length).toBe(0)
+})
+
+test('sweep skips overlapping runs while one is in flight', { plugins: [worldFixtures] }, async ($, on) => {
+  const files = worldFiles()
+  mockFs(on, files)
+  const sweeps: (readonly string[])[] = []
+  const clock = mockWorld(on, {
+    process: async argv => {
+      if (!isSweep(argv)) return
+      sweeps.push(argv)
+      // simulate a sweep that outlasts the next timer tick
+      await clock.sleep(200_000)
+      return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    },
+  })
+  await $.session.start(sessionStart())
+  await clock.advance(120_000)
+  expect(sweeps.length).toBe(1)
+  await clock.advance(120_000) // second tick fires while first is still sleeping
+  expect(sweeps.length).toBe(1)
+  await clock.advance(200_000) // first finishes; third tick fires and starts
+  expect(sweeps.length).toBe(2)
+})
+
+test('two session.start arm exactly one sweep timer', { plugins: [worldFixtures] }, async ($, on) => {
+  const files = worldFiles()
+  mockFs(on, files)
+  const sweeps: (readonly string[])[] = []
+  const clock = mockWorld(on, { process: argv => { if (isSweep(argv)) sweeps.push(argv) } })
+  await $.session.start(sessionStart())
+  await $.session.start(sessionStart())
+  await clock.advance(120_000)
+  expect(sweeps.length).toBe(1)
 })
