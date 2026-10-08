@@ -2,7 +2,7 @@
 """Classify one herdr agent lane: OK | STALL | QUOTA | PROVIDER | BLOCKED | DEV_SERVER | ERROR.
 
 Usage: lane-health.py --agent NAME|PANE --lane DIR [--kind claude|codex|opencode|agy] [--stall-min 10]
-                      [--since EPOCH] [--prompt-marker TEXT] [--ledger PATH]
+                      [--since EPOCH] [--prompt-marker TEXT] [--pool NAME] [--ledger PATH]
        lane-health.py --self-test
 
 Prints one JSON line: {"state", "evidence": [...], "agent_status", "last_change_min", "scope": "marker"|"tail"}.
@@ -10,10 +10,12 @@ Only pane text produced since dispatch is scanned: the tail after the last occur
 (the dispatch prompt text), else the last 40 lines — old scrollback never re-triggers QUOTA.
 On QUOTA it marks the agent exhausted in the usage ledger (default $MATRIXKODER_HOME/usage.json, i.e.
 ~/.matrixkoder/usage.json) under agents.<kind> (falls back to --agent when no --kind), never touching
-the CodexBar windows mk-usage.py writes there.
+the CodexBar windows mk-usage.py writes there. --pool NAME marks one of an OpenCode provider's per-plan
+pools instead — agents.<kind>.pools.<pool> — because CodexBar reports no windows for those plans.
+The mark is written under an fcntl.flock on <home>/usage.json.lock, shared with mk-usage.py's poll.
 herdr may print {"error": ...} and still exit 0, so JSON is parsed, not exit codes.
 """
-import datetime, json, os, re, subprocess, sys, tempfile, time
+import contextlib, datetime, fcntl, json, os, re, subprocess, sys, tempfile, time
 
 KINDS = ("claude", "codex", "opencode", "agy")
 # A quota hit needs a quota noun: bare "rate limit"/429, "Context limit reached" and a lone "resets in 3s"
@@ -41,6 +43,7 @@ PROVIDER_RE = re.compile(r"(unsupported model|subscription is required|model ser
 DEV_RE = re.compile(r"(?m)^\s*(?:\$|>|●\s*Bash\(|Bash\(|Running:?)\s*.{0,40}?\b(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?dev\b"
                     r"|\[hermes-agent\] Exited|ELIFECYCLE|VITE v\d+[.\d]* +ready|Local:\s+https?://localhost", re.I)
 TAIL_LINES = 40
+POOL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
 
 def herdr_json(*args):
@@ -173,39 +176,45 @@ def parse_reset(text, now=None):
     return None, named
 
 
-def record_quota(ledger, key, text, now=None):
-    """Mark agents.<key> exhausted. Writes only the exhausted_* fields; CodexBar windows stay as they are."""
-    try:
-        with open(ledger) as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        data = {}
-    now = now or datetime.datetime.now().astimezone()
-    until, window = parse_reset(text, now)
-    entry = data.setdefault("agents", {}).setdefault(key, {})
-    entry.setdefault("source", "pane-text")  # an existing CodexBar entry keeps its own source
-    guess = until is None
-    if guess:
-        prev = entry.get("exhausted_until")
+def record_quota(ledger, key, text, now=None, pool=None):
+    """Mark agents.<key> exhausted — under agents.<key>.pools.<pool> when `pool` names one of an
+    OpenCode provider's per-plan pools, else on the agent itself. Writes only the exhausted_* fields;
+    CodexBar windows stay as they are."""
+    if pool is not None and not POOL_RE.fullmatch(pool):
+        raise ValueError(f"bad --pool {pool!r} (letters, digits, . _ -; max 64)")
+    with usage_lock():
         try:
-            prev_future = prev and datetime.datetime.fromisoformat(prev) > now
-        except (TypeError, ValueError):
-            prev_future = False
-        if prev_future:  # a known future reset beats a guess
-            until, window, guess = prev, entry.get("exhausted_window"), entry.get("exhausted_guess", False)
-        else:
-            until = (now + datetime.timedelta(hours=GUESS_H)).isoformat(timespec="seconds")
-    entry.update({"exhausted_until": until, "exhausted_window": window, "exhausted_guess": guess,
-                  "exhausted_source": "pane-text", "exhausted_observed_at": now.isoformat(timespec="seconds"),
-                  "exhausted_evidence": quota_hits(text)[-2:]})
-    d = os.path.dirname(ledger) or "."
-    os.makedirs(d, exist_ok=True)
-    # ponytail: atomic replace, but read-modify-write can race mk-usage.py; add a shared flock if both write often
-    fd, tmp = tempfile.mkstemp(dir=d, prefix=".usage-")
-    with os.fdopen(fd, "w") as f:
-        json.dump(data, f, indent=2)
-    os.chmod(tmp, 0o644)
-    os.replace(tmp, ledger)
+            with open(ledger) as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        now = now or datetime.datetime.now().astimezone()
+        until, window = parse_reset(text, now)
+        entry = data.setdefault("agents", {}).setdefault(key, {})
+        if pool:
+            entry = entry.setdefault("pools", {}).setdefault(pool, {})
+        entry.setdefault("source", "pane-text")  # an existing CodexBar entry keeps its own source
+        guess = until is None
+        if guess:
+            prev = entry.get("exhausted_until")
+            try:
+                prev_future = prev and datetime.datetime.fromisoformat(prev) > now
+            except (TypeError, ValueError):
+                prev_future = False
+            if prev_future:  # a known future reset beats a guess
+                until, window, guess = prev, entry.get("exhausted_window"), entry.get("exhausted_guess", False)
+            else:
+                until = (now + datetime.timedelta(hours=GUESS_H)).isoformat(timespec="seconds")
+        entry.update({"exhausted_until": until, "exhausted_window": window, "exhausted_guess": guess,
+                      "exhausted_source": "pane-text", "exhausted_observed_at": now.isoformat(timespec="seconds"),
+                      "exhausted_evidence": quota_hits(text)[-2:]})
+        d = os.path.dirname(ledger) or "."
+        os.makedirs(d, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".usage-")
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, ledger)
     return entry
 
 
@@ -213,7 +222,23 @@ def default_ledger():
     return os.path.join(os.path.expanduser(os.environ.get("MATRIXKODER_HOME") or "~/.matrixkoder"), "usage.json")
 
 
-def check(agent, lane, kind=None, stall_min=10.0, since=0.0, marker=None, ledger=None):
+@contextlib.contextmanager
+def usage_lock():
+    """# ponytail: the one lock both writers of usage.json take — mk-usage.py's poll and this quota
+    mark. Without it a poll read the file, and its atomic replace then dropped a fresh mark.
+    Fixed under <home>, not beside the ledger, so the two serialise even with different --out paths."""
+    path = os.path.join(os.path.expanduser(os.environ.get("MATRIXKODER_HOME") or "~/.matrixkoder"),
+                        "usage.json.lock")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def check(agent, lane, kind=None, stall_min=10.0, since=0.0, marker=None, ledger=None, pool=None):
     """One health probe. Returns the result dict plus "text" (pane text since dispatch) for lane-watch."""
     got = herdr_json("agent", "get", agent)
     if "error" in got:
@@ -223,13 +248,24 @@ def check(agent, lane, kind=None, stall_min=10.0, since=0.0, marker=None, ledger
     idle = last_change_min(lane, since)
     state, ev = classify(text, status, idle, stall_min)
     if state == "QUOTA":
-        record_quota(ledger or default_ledger(), kind or agent, text)
+        record_quota(ledger or default_ledger(), kind or agent, text, pool=pool)
     return {"state": state, "evidence": ev, "agent_status": status, "last_change_min": idle, "scope": scope,
             "text": text}
 
 
 def self_test():
     import shutil
+    # every ledger path here is a temp file, but usage_lock() resolves <home> independently of --ledger:
+    # pin it before the first write so a run can never create a lock in the real ~/.matrixkoder
+    mk_home = tempfile.mkdtemp(prefix="lane-health-home-")
+    os.environ["MATRIXKODER_HOME"] = mk_home
+    try:
+        self_test_body(shutil)
+    finally:
+        shutil.rmtree(mk_home, ignore_errors=True)
+
+
+def self_test_body(shutil):
     assert classify("Usage limit reached for 5 hour. Your limit will reset at 2026-10-07 10:02:14", "idle", 1, 10)[0] == "QUOTA"
     assert classify("⚠ Individual quota reached. Resets in 154h43m", "idle", 1, 10)[0] == "QUOTA"
     assert classify("all good", "blocked", 1, 10)[0] == "BLOCKED"
@@ -331,6 +367,43 @@ def self_test():
         assert default_ledger() == ledger
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+    # --pool marks the OpenCode plan, not the agent: CodexBar reports no windows for those providers,
+    # so the agent-level entry must stay clean while the pool carries the mark
+    tmp_pool = tempfile.mkdtemp(prefix="lane-health-pool-")
+    try:
+        pled = os.path.join(tmp_pool, "usage.json")
+        json.dump({"agents": {"opencode": {"status": "ok", "source": "codexbar",
+                                           "pools": {"zai": {"five_hour": None, "weekly": None,
+                                                             "exhausted_until": None,
+                                                             "source": "codexbar"}}}}},
+                  open(pled, "w"))
+        e = record_quota(pled, "opencode", "> brief\n" + zai, zn, pool="zai")
+        assert e["exhausted_window"] == "5h" and e["exhausted_source"] == "pane-text", e
+        assert e["exhausted_until"] == "2026-10-08T16:16:57+02:00" and not e["exhausted_guess"], e
+        oc = json.load(open(pled))["agents"]["opencode"]
+        assert "exhausted_until" not in oc and "exhausted_source" not in oc, oc  # agent level untouched
+        zai_pool = oc["pools"]["zai"]
+        assert zai_pool["source"] == "codexbar" and zai_pool["exhausted_until"] == "2026-10-08T16:16:57+02:00"
+        assert zai_pool["exhausted_evidence"] and zai_pool["exhausted_window"] == "5h"
+        assert set(oc["pools"]) == {"zai"}  # a fresh agent gets its pool created, not a sibling plan
+        # a second hit without reset text keeps the pool's known future reset
+        record_quota(pled, "opencode", "usage limit reached", zn + datetime.timedelta(hours=1), pool="zai")
+        z2 = json.load(open(pled))["agents"]["opencode"]["pools"]["zai"]
+        assert z2["exhausted_until"] == zai_pool["exhausted_until"] and z2["exhausted_guess"] is False
+        # no --pool still writes the agent-level fields, exactly as before
+        record_quota(pled, "opencode", "usage limit reached", now)
+        oc2 = json.load(open(pled))["agents"]["opencode"]
+        assert oc2["exhausted_source"] == "pane-text" and oc2["exhausted_guess"] is True
+        for bad in ("../escape", "has space", "", "a" * 65):
+            try:
+                record_quota(pled, "opencode", "usage limit reached", now, pool=bad)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"pool {bad!r} should be refused")
+    finally:
+        shutil.rmtree(tmp_pool, ignore_errors=True)
     print("lane-health self-test ok")
 
 
@@ -352,7 +425,8 @@ def main():
         stall_min, since = float(opt("--stall-min", "10")), float(opt("--since", "0"))
     except ValueError as e:
         sys.exit(f"{e}\n{__doc__}")
-    r = check(agent, lane, kind, stall_min, since, opt("--prompt-marker"), ledger and os.path.expanduser(ledger))
+    r = check(agent, lane, kind, stall_min, since, opt("--prompt-marker"), ledger and os.path.expanduser(ledger),
+              opt("--pool"))
     r.pop("text")
     print(json.dumps(r))
 

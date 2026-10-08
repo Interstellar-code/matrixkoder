@@ -8,7 +8,8 @@
       ids are case-insensitive unique; deps store the real id case and a self-dep is refused;
       RUN:B is a task in another run of the same data dir; --parent onto merged/qa/done is refused;
       warns when an owned glob overlaps an unmerged task in any active run
-  task set T key=value ... [--note TEXT] [--force]   keys: status agent model effort lane last_commit gates verdict
+      (the new task's own --parent chain is not an overlap: a parent owns its children's globs)
+  task set T key=value ... [--note TEXT] [--force]   keys: status agent model effort lane pane last_commit gates verdict
       status=dispatched|building needs every own AND ancestor dep merged/qa/done (--force overrides);
       status= on a parent is refused (it rolls up from children); a task whose deps are all met gets
       ready=true and a "deps met" event; an unreadable sibling run only produces a warnings entry
@@ -34,7 +35,7 @@ SCHEMA = 1
 STATUSES = ("planned routed dispatched building verifying review fix merged qa done "
             "blocked quota stalled provider").split()
 EVENT_TYPES = ("transition", "decision", "verdict", "quota", "note")
-TASK_KEYS = ("status", "agent", "model", "effort", "lane", "last_commit", "gates", "verdict")
+TASK_KEYS = ("status", "agent", "model", "effort", "lane", "pane", "last_commit", "gates", "verdict")
 ROUND_KINDS = ("build", "fix", "takeover")
 ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 RECENT, BOARD_EVENTS = 10, 15
@@ -221,15 +222,9 @@ class Store:
 
     def unmet_tree(self, run, t):
         """The task's own unmet deps plus every ancestor's (a parent's dep gates its children)."""
-        out, p = list(self.unmet(run, t)), t.get("parent")
-        seen = set()
-        while p and p not in seen:
-            seen.add(p)
-            pt = next((x for x in run["tasks"] if x.get("id") == p), None)
-            if pt is None:
-                break
+        out = list(self.unmet(run, t))
+        for pt in ancestor_chain(run, t.get("parent")):
             out += [d for d in self.unmet(run, pt) if d not in out]
-            p = pt.get("parent")
         return out
 
     def norm_dep(self, run, new_tid, dep):
@@ -462,6 +457,20 @@ def find_task(run, tid):
     raise Fail(f"no task {tid!r} in run {run['id']}")
 
 
+def ancestor_chain(run, parent):
+    """-> [task, ...] the --parent chain above `parent`, nearest first; [] without a parent.
+    Missing or cyclic parents stop the walk (a corrupt parent must not hang a command)."""
+    out, p, seen = [], parent, set()
+    while p and p not in seen:
+        seen.add(p)
+        pt = next((x for x in run["tasks"] if x.get("id") == p), None)
+        if pt is None:
+            break
+        out.append(pt)
+        p = pt.get("parent")
+    return out
+
+
 def parse_value(v):
     if v == "":
         return None
@@ -596,18 +605,22 @@ def cmd_task(a, st):
                 if p["status"] in DEP_MET:
                     raise Fail(f"--parent onto {p['id']} ({p['status']}) is refused: status rolls up from children")
             active, _ = st.active_runs(run)
+            own = {x["id"] for x in ancestor_chain(run, a.parent)}  # our own parent chain: not a collision
             for o in active:
+                same = o.get("id") == run.get("id")
                 for x in o.get("tasks") or []:
-                    ref = x.get("id") if o.get("id") == run.get("id") else f"{o.get('id')}:{x.get('id')}"
+                    ref = x.get("id") if same else f"{o.get('id')}:{x.get('id')}"
                     if not x.get("id") or x.get("status") in DEP_MET or ref in deps:
                         continue
+                    if same and x.get("id") in own:
+                        continue  # a parent owns its children's globs; overlapping them is the plan
                     hits = [f"{g} ~ {h}" for g in owned for h in x.get("owned") or [] if globs_overlap(g, h)]
                     if hits:
                         warnings.append(f"owned overlaps {ref} ({x.get('status')}): {', '.join(hits)}; "
                                         f"consider --deps {ref}")
             t = {"id": tid, "title": a.title, "wave": a.wave, "deps": deps, "owned": owned, "parent": a.parent,
                  "ready": False, "status": "planned", "agent": None, "model": None, "effort": None, "lane": None,
-                 "last_commit": None, "gates": None, "verdict": None, "round": 0, "rounds": [],
+                 "pane": None, "last_commit": None, "gates": None, "verdict": None, "round": 0, "rounds": [],
                  "created": now(), "updated": now()}
             run["tasks"].append(t)
             st.event(run, "transition", f"task added: {a.title}", task=tid, to="planned", by=a.by)
@@ -853,6 +866,16 @@ def self_test():
                                     "verdict": "approve", "sha": "abc1234"}
         assert mk("task", "get", "T1")["task"]["round"] == 2
         assert mk("task", "get", "NOPE", code=2)["ok"] is False
+
+        # pane: the lane's herdr pane id (arm writes it) is a settable task key
+        assert "pane" in TASK_KEYS
+        tp = mk("task", "set", "T1", "pane=wK:p1")["task"]
+        assert tp["pane"] == "wK:p1"
+        assert mk("task", "get", "T1")["task"]["pane"] == "wK:p1"
+        assert mk("task", "set", "T1", "pane=")["task"]["pane"] is None  # empty clears, like lane=
+        assert mk("task", "set", "T1", "pan=wK:p1", code=2)["ok"] is False  # still a closed key set
+        assert mk("task", "get", "T1")["task"]["pane"] is None
+        assert mk("task", "set", "T1", "pane=wK:p1")["task"]["pane"] == "wK:p1"
 
         ev = mk("event", "--task", "T1", "--type", "decision", "--text", "route codex high")["event"]
         assert ev["type"] == "decision" and ev["task"] == "T1"
@@ -1115,6 +1138,25 @@ def self_test():
         dk("task", "add", "--id", "Q3C", "--title", "child", "--parent", "Q3", "--run", "rb")
         assert dk("task", "get", "Q3", "--run", "rb")["task"]["status"] == "planned"  # rolled back by the child
         assert dk("task", "get", "D3", "--run", "ra")["task"]["ready"] is False  # refreshed, still correct
+
+        # owned overlap: a child's globs inside its parent's are the plan, not a collision
+        overlap_refs = lambda w: [x.split("owned overlaps ", 1)[1].split(" ")[0]
+                                  for x in w.get("warnings", []) if x.startswith("owned overlaps ")]
+        dk("task", "add", "--id", "OW", "--title", "Owner", "--owned", "scripts/*.py", "--run", "rb")
+        w = dk("task", "add", "--id", "OWC", "--title", "child", "--parent", "OW",
+               "--owned", "scripts/mk-state.py", "--run", "rb")
+        assert not overlap_refs(w), w
+        dk("task", "add", "--id", "OWM", "--title", "mid", "--parent", "OW", "--run", "rb")
+        w = dk("task", "add", "--id", "OWG", "--title", "grandchild", "--parent", "OWM",
+               "--owned", "scripts/mk-state.py", "--run", "rb")
+        assert not ({"OW", "OWM"} & set(overlap_refs(w))), w  # ancestors skipped...
+        assert "OWC" in overlap_refs(w), w  # ...a cousin branch sharing the glob still warns
+        dk("task", "add", "--id", "OWR", "--title", "same id, other run", "--owned", "scripts/*.py", "--run", "ra")
+        w = dk("task", "add", "--id", "OWX", "--title", "unrelated", "--owned", "scripts/*.py", "--run", "rb")
+        assert "ra:OWR" in overlap_refs(w), w  # cross-run overlap is still reported
+        dk("task", "add", "--id", "OWS", "--title", "sibling", "--owned", "scripts/lane-*.py", "--run", "rb")
+        w = dk("task", "add", "--id", "OWY", "--title", "another sibling", "--owned", "scripts/lane-*.py", "--run", "rb")
+        assert "OWS" in overlap_refs(w), w  # a real same-run collision is untouched
 
         # roll-up only raises to building, never lowers; verify every rule in the acceptance
         cases = (

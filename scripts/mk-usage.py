@@ -10,7 +10,9 @@ Usage:
   mk-usage.py --self-test
 """
 import argparse
+import contextlib
 import datetime
+import fcntl
 import json
 import os
 import re
@@ -53,6 +55,24 @@ def default_ledger():
         os.path.expanduser(os.environ.get("MATRIXKODER_HOME") or "~/.matrixkoder"),
         "usage.json",
     )
+
+
+@contextlib.contextmanager
+def usage_lock():
+    """# ponytail: the one lock both writers of usage.json take — this poll and lane-health.py's quota
+    mark. Without it a poll read the file and its atomic replace then dropped a fresh mark. Fixed under
+    <home>, not beside the ledger, so the two serialise even with different --out/--ledger paths."""
+    path = os.path.join(
+        os.path.expanduser(os.environ.get("MATRIXKODER_HOME") or "~/.matrixkoder"),
+        "usage.json.lock",
+    )
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def default_codexbar_config():
@@ -199,6 +219,22 @@ def summarize_pool(ws):
     return {"five_hour": best("5h"), "weekly": best("week"), "exhausted_until": until}
 
 
+def carry_pane_mark(dst, existing, prev_future, prev_until, cb_until=None):
+    """Keep lane-health's future pane-text mark on `dst`, the entry the router reads back. CodexBar's
+    own later exhausted window wins; it is None when CodexBar reports no windows at all, which is the
+    normal case for the OpenCode plans — that silence must not clear the mark. -> kept?"""
+    if not prev_future:
+        return False
+    for k in EXHAUSTED_FIELDS:
+        if k in existing:
+            dst[k] = existing[k]
+    if cb_until:
+        cb_dt, prev_dt = parse_iso(cb_until), parse_iso(prev_until)
+        if cb_dt and prev_dt and cb_dt > prev_dt:
+            dst["exhausted_until"] = cb_until
+    return True
+
+
 def normalize_provider_entry(provider, raw_result_or_json, existing_entry=None, now=None):
     now = now or datetime.datetime.now().astimezone()
     existing_entry = existing_entry or {}
@@ -300,6 +336,8 @@ def normalize_provider_entry(provider, raw_result_or_json, existing_entry=None, 
             for k in EXHAUSTED_FIELDS:
                 if k in existing_entry:
                     entry[k] = existing_entry[k]
+            if agent_key == "opencode" and provider_pool is not None:
+                carry_pane_mark(entry["pools"][provider_pool], entry, True, prev_until)
         return entry
 
     # Success case
@@ -391,6 +429,15 @@ def normalize_provider_entry(provider, raw_result_or_json, existing_entry=None, 
             pool_entry["weekly"] = None
             pool_entry["available_pools"] = []
             pool_entry["exhausted_until"] = None
+        # the mark lands inside pools.<pool>, the dict available_pools and the router actually read;
+        # a CodexBar silent about that plan (every OpenCode one) must not hand it back as available
+        pool_view = pool_entry["pools"].get(provider_pool) if provider_pool else None
+        if pool_view is not None and carry_pane_mark(pool_view, existing_entry, prev_future, prev_until,
+                                                     pool_view.get("exhausted_until")):
+            pool_entry["available_pools"] = [] if pool_view.get("exhausted_until") else [provider_pool]
+            for k in EXHAUSTED_FIELDS:
+                if k in pool_view and k not in pool_entry:
+                    pool_entry[k] = pool_view[k]
         return pool_entry
 
     for w in windows:
@@ -520,65 +567,77 @@ def merge_opencode_entries(entries):
 
 def poll_and_update(providers, out_path, now=None):
     now = now or datetime.datetime.now().astimezone()
-    ledger_data = load_ledger(out_path)
-    agents = ledger_data.get("agents", {})
 
-    ok_agents = []
-    na_agents = []
-    error_agents = []
+    # Every CodexBar fetch first, outside the lock: it is a slow external call, and holding an
+    # exclusive lock across it would make every other writer (a lane-health quota mark) queue behind
+    # the network. Nothing below depends on the fetch order, so this is the same read-modify-write.
+    raw = [(pid, run_codexbar_provider(pid, timeout=60)) for pid in providers]
 
-    opencode_entries = []
-    for provider_id in providers:
-        raw_res = run_codexbar_provider(provider_id, timeout=60)
-        agent_key = PROVIDER_MAP.get(provider_id, provider_id)
-        provider_pool = PROVIDER_POOL.get(provider_id)
-        existing_agent = agents.get(agent_key, {})
-        if agent_key == "opencode":
-            existing_pool_entry = existing_agent.get("pools", {}).get(provider_pool, {}) if provider_pool and isinstance(existing_agent.get("pools"), dict) else {}
-        else:
-            existing_pool_entry = existing_agent
-        norm_entry = normalize_provider_entry(provider_id, raw_res, existing_entry=existing_pool_entry, now=now)
+    with usage_lock():
+        ledger_data = load_ledger(out_path)
+        agents = ledger_data.get("agents", {})
 
-        if agent_key == "opencode":
-            opencode_entries.append(norm_entry)
-            continue
+        ok_agents = []
+        na_agents = []
+        error_agents = []
 
-        agents[agent_key] = norm_entry
+        opencode_entries = []
+        for provider_id, raw_res in raw:
+            agent_key = PROVIDER_MAP.get(provider_id, provider_id)
+            provider_pool = PROVIDER_POOL.get(provider_id)
+            existing_agent = agents.get(agent_key, {})
+            if agent_key == "opencode":
+                existing_pool_entry = existing_agent.get("pools", {}).get(provider_pool, {}) if provider_pool and isinstance(existing_agent.get("pools"), dict) else {}
+            else:
+                existing_pool_entry = existing_agent
+            norm_entry = normalize_provider_entry(provider_id, raw_res, existing_entry=existing_pool_entry, now=now)
 
-        st = norm_entry.get("status")
-        if st == "ok":
-            ok_agents.append(agent_key)
-        elif st == "n/a":
-            na_agents.append(agent_key)
-        else:
-            error_agents.append(agent_key)
+            if agent_key == "opencode":
+                opencode_entries.append(norm_entry)
+                continue
 
-    if opencode_entries:
-        merged = merge_opencode_entries(opencode_entries)
-        agents["opencode"] = merged
-        st = merged.get("status")
-        if st == "ok":
-            ok_agents.append("opencode")
-        elif st == "n/a":
-            na_agents.append("opencode")
-        else:
-            error_agents.append("opencode")
+            agents[agent_key] = norm_entry
 
-    ledger_data["updated_at"] = now.isoformat(timespec="seconds")
-    ledger_data["agents"] = agents
+            st = norm_entry.get("status")
+            if st == "ok":
+                ok_agents.append(agent_key)
+            elif st == "n/a":
+                na_agents.append(agent_key)
+            else:
+                error_agents.append(agent_key)
 
-    atomic_write_ledger(out_path, ledger_data)
+        if opencode_entries:
+            merged = merge_opencode_entries(opencode_entries)
+            agents["opencode"] = merged
+            st = merged.get("status")
+            if st == "ok":
+                ok_agents.append("opencode")
+            elif st == "n/a":
+                na_agents.append("opencode")
+            else:
+                error_agents.append("opencode")
 
-    summary = {
-        "ok": ok_agents,
-        "na": na_agents,
-        "error": error_agents,
-        "out": os.path.abspath(os.path.expanduser(out_path)),
-    }
-    return summary
+        ledger_data["updated_at"] = now.isoformat(timespec="seconds")
+        ledger_data["agents"] = agents
+
+        atomic_write_ledger(out_path, ledger_data)
+
+    return {"ok": ok_agents, "na": na_agents, "error": error_agents,
+            "out": os.path.abspath(os.path.expanduser(out_path))}
 
 
 def self_test():
+    # usage_lock() resolves <home> independently of --out, so pin it to a temp dir before the first
+    # poll: a run must never take a lock (or fall back to the ledger) inside the real ~/.matrixkoder
+    mk_home = tempfile.mkdtemp(prefix="mk-usage-home-")
+    os.environ["MATRIXKODER_HOME"] = mk_home
+    try:
+        self_test_body()
+    finally:
+        shutil.rmtree(mk_home, ignore_errors=True)
+
+
+def self_test_body():
     # 1. Kind by windowMinutes
     assert classify_kind(300) == "5h"
     assert classify_kind(10080) == "week"
@@ -868,6 +927,115 @@ def self_test():
             shutil.rmtree(map_dir, ignore_errors=True)
     finally:
         mod.run_codexbar_provider = real_run
+
+    # 10. lane-health's pane-text mark survives a poll, on an agent and on an OpenCode pool. CodexBar
+    # reports no windows for the OpenCode plans, so a poll that recomputed the pool would hand an
+    # exhausted plan straight back to the router.
+    mod.run_codexbar_provider = fake_run_oc
+    try:
+        keep_dir = tempfile.mkdtemp(prefix="mk-usage-keep-")
+        try:
+            keep_ledger = os.path.join(keep_dir, "usage.json")
+            pane_mark = {"exhausted_until": "2026-10-08T16:16:57+02:00",
+                         "exhausted_window": "5h", "exhausted_guess": False,
+                         "exhausted_source": "pane-text",
+                         "exhausted_observed_at": "2026-10-08T11:50:00+02:00",
+                         "exhausted_evidence": ["Usage limit reached for 5 hour"]}
+            json.dump({"agents": {"opencode": {"status": "ok", "source": "codexbar",
+                                               "pools": {"zai": {"five_hour": None, "weekly": None,
+                                                                 "exhausted_until": None,
+                                                                 **pane_mark}}}}},
+                      open(keep_ledger, "w"))
+            keep_now = datetime.datetime(2026, 10, 8, 11, 50, tzinfo=datetime.timezone(datetime.timedelta(hours=2)))
+            summary = poll_and_update(["zai"], keep_ledger, now=keep_now)
+            assert summary["na"] == ["opencode"], summary
+            oc = load_ledger(keep_ledger)["agents"]["opencode"]
+            zai_pool = oc["pools"]["zai"]
+            for k, v in pane_mark.items():
+                assert zai_pool.get(k) == v, (k, zai_pool)
+            assert oc["available_pools"] == [], oc  # the marked plan is not offered to the router
+            assert oc["exhausted_source"] == "pane-text" and oc["exhausted_window"] == "5h", oc
+            assert oc["exhausted_until"] is None, oc  # one plan down is not the whole agent down
+            # once the marked window has passed, the mark is gone and the plan is live again
+            poll_and_update(["zai"], keep_ledger, now=keep_now + datetime.timedelta(hours=6))
+            zai_after = load_ledger(keep_ledger)["agents"]["opencode"]["pools"]["zai"]
+            assert "exhausted_source" not in zai_after, zai_after
+            assert zai_after["exhausted_until"] is None, zai_after
+
+            # same mark on a pool CodexBar *does* report numbers for: the mark survives the poll
+            go_ledger = os.path.join(keep_dir, "go.json")
+            json.dump({"agents": {"opencode": {"status": "ok", "source": "codexbar",
+                                               "pools": {"go": {"five_hour": None, "weekly": None,
+                                                               "exhausted_until": None, **pane_mark}}}}},
+                      open(go_ledger, "w"))
+            poll_and_update(["opencodego"], go_ledger, now=keep_now)
+            go_pool = load_ledger(go_ledger)["agents"]["opencode"]["pools"]["go"]
+            assert go_pool["five_hour"] == {"used_pct": 0, "resets_at": "2026-10-07T20:00:00Z"}, go_pool
+            for k, v in pane_mark.items():
+                assert go_pool.get(k) == v, (k, go_pool)
+            assert load_ledger(go_ledger)["agents"]["opencode"]["available_pools"] == []
+        finally:
+            shutil.rmtree(keep_dir, ignore_errors=True)
+    finally:
+        mod.run_codexbar_provider = real_run
+
+    # 11. Two writers, one lock: mk-usage's poll and lane-health's quota mark must not lose each
+    # other's fields. Driven as two real processes against one <home>, so it fails without the flock.
+    race_dir = tempfile.mkdtemp(prefix="mk-usage-race-")
+    try:
+        race_home = os.path.join(race_dir, "home")
+        os.makedirs(race_home)
+        race_ledger = os.path.join(race_home, "usage.json")
+        race_bin = os.path.join(race_dir, "bin")
+        os.makedirs(race_bin)
+        entered, release = os.path.join(race_dir, "cb.entered"), os.path.join(race_dir, "cb.release")
+        # the fake codexbar parks inside the poll's fetch window, so the mark lands exactly between the
+        # poll's read and its write — the interleaving the lock has to make impossible
+        with open(os.path.join(race_bin, "codexbar"), "w") as f:
+            f.write("#!/usr/bin/env python3\n"
+                    "import os, sys, time\n"
+                    "base = os.environ['RACE_DIR']\n"
+                    "open(os.path.join(base, 'cb.entered'), 'w').write('1')\n"
+                    "for _ in range(2000):\n"
+                    "    if os.path.exists(os.path.join(base, 'cb.release')):\n"
+                    "        break\n"
+                    "    time.sleep(0.01)\n"
+                    "sys.stdout.write('[{\"usage\": {\"primary\": {\"windowMinutes\": 300,"
+                    " \"usedPercent\": 12, \"resetsAt\": \"2026-10-09T20:00:00Z\"}}}]')\n")
+        os.chmod(os.path.join(race_bin, "codexbar"), 0o755)
+        json.dump({"agents": {}}, open(race_ledger, "w"))
+        env = dict(os.environ, MATRIXKODER_HOME=race_home, RACE_DIR=race_dir,
+                   PATH=race_bin + os.pathsep + os.environ["PATH"])
+        poll_proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--providers", "zai",
+                                      "--out", race_ledger], env=env, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, text=True)
+        for _ in range(2000):
+            if os.path.exists(entered):
+                break
+            time.sleep(0.01)
+        assert os.path.exists(entered), "fake codexbar never ran: the poll did not reach its fetch"
+        # lane-health's record_quota, as its own process, holding the same <home>/usage.json.lock
+        marker = subprocess.run([sys.executable, "-c",
+                                 "import importlib.util, sys\n"
+                                 "spec = importlib.util.spec_from_file_location('lh', sys.argv[1])\n"
+                                 "lh = importlib.util.module_from_spec(spec)\n"
+                                 "spec.loader.exec_module(lh)\n"
+                                 "lh.record_quota(sys.argv[2], 'opencode',"
+                                 " 'Usage limit reached for 5 hour. Your limit will reset at 2026-10-08 22:16:57',"
+                                 " pool='zai')\n",
+                                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "lane-health.py"),
+                                 race_ledger],
+                                env=env, capture_output=True, text=True)
+        assert marker.returncode == 0, marker.stdout + marker.stderr
+        open(release, "w").write("1")
+        poll_out = poll_proc.communicate(timeout=120)
+        assert poll_proc.returncode == 0, poll_out
+        final = load_ledger(race_ledger)["agents"]["opencode"]
+        assert final["pools"]["zai"]["exhausted_source"] == "pane-text", final  # the mark survived the poll
+        assert final["pools"]["zai"]["five_hour"] == {"used_pct": 12, "resets_at": "2026-10-09T20:00:00Z"}, final
+        assert os.path.exists(os.path.join(race_home, "usage.json.lock"))
+    finally:
+        shutil.rmtree(race_dir, ignore_errors=True)
 
     print("mk-usage self-test ok")
 
