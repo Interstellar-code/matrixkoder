@@ -11,7 +11,7 @@ plan: `<plan path>`
 
 | Task | Title | Wave | Status | Agent | Model · effort | Round | Lane | Last commit | Verdict |
 |---|---|---|---|---|---|---|---|---|---|
-| P1 | State core | 1 | building | codex | gpt-5.5 · high | 1 | ../repo-worktree-p1 | — | — |
+| P1 | State core | 1 | building | codex | gpt-6.1-sol · high | 1 | ../repo-worktree-p1 | — | — |
 
 ## Recent events (last 15)
 

@@ -13,25 +13,37 @@
 
 Reviewer ≠ builder, preferably a different model family.
 
-## Tiers (verify ids with each CLI at bootstrap and date them in `<data>/matrixkoder.yaml`)
+## Model menu (snapshot 2026-10-08 — verify ids with each CLI at bootstrap and date them in `<data>/matrixkoder.yaml`)
 
-| Jev size class | Codex | OpenCode | AGY | Claude |
-|---|---|---|---|---|
-| trivial / mechanical | default | fast model | gemini flash medium | haiku (Haiku 5.5) · low–medium |
-| standard | default | main model (e.g. GLM-5.x) | gemini flash high | sonnet |
-| complex / cross-cutting / reviews | high reasoning | — | gemini pro high | opus |
-| final review | review pass | — | gemini pro high | fable / opus |
+This is the menu `jev_decide` picks from, not a size → model mapping. Put the "Jev note" into each candidate's description: Jev judges from the description, so a bare id gives it nothing to weigh. Older generations are left out on purpose.
+
+| Agent | Model id | Effort levels | Jev note |
+|---|---|---|---|
+| Claude | `haiku` (Haiku 5.5) | low / medium / high / max | Cheapest Claude: lookups, digests, checklist grading, 1–2 file mechanical edits. Weak on design/contract/safety reviews. Shared Claude quota. |
+| Claude | `sonnet` (Sonnet 5.5) | low / medium / high / max | Balanced: bounded builds, browser QA, standard reviews. Shared Claude quota. |
+| Claude | `opus` (Opus 5.5) | low / medium / high / max | Strong reasoning: cross-cutting, data-loss, security. Costly on the shared Claude quota. |
+| Claude | `fable` (Fable 5.1) | low / medium / high / max | Most capable Claude, own weekly pool. Final reviews only. |
+| Codex | `gpt-6-astra` | low … ultra | OpenAI frontier: hardest builds, cross-family final/security reviews. |
+| Codex | `gpt-6.1-sol` | low … ultra | Latest OpenAI workhorse: first-choice builder, cross-family reviewer. |
+| Codex | `gpt-6-luna` | low … max | Fast, cheap OpenAI model: mechanical edits, digests. Not for multi-file phases. |
+| AGY | `gemini-3.8-flash-{low,medium,high}` | in the id | Latest Gemini Flash: bulk UI/feature lanes; `-high` for standard builds. Own quota. |
+| AGY | `gemini-3.1-pro-{low,high}` | in the id | Gemini Pro: complex builds, cross-family reviews (`-high`). |
+| AGY | `claude-{opus,sonnet}-5-5-{low,medium,high}` | in the id | AGY-hosted Claude; billing against the Anthropic subscription unverified. |
+| AGY | `gpt-oss-120b-medium` | in the id | Open-weight cheap fallback for trivial work. |
+| OpenCode | per `opencode models` | model variant | Main model (e.g. GLM-5.x); good at takeovers. |
+
+Sources: `codex debug models` (official OpenAI list; ignore the provider cache), `agy models`, the session's Claude model list.
 
 Never put a multi-file phase on a "low" effort model: it looped after context compaction and stalled twice.
 
 ## Effort (part of every route — Jev picks it, the user never has to)
 
-A route is **agent + model + effort**, not just a model. Default by Jev size class: trivial → low, standard → medium, complex / data-loss / security → high, final review → max. Jev may move one step either way given evidence (e.g. a lane that already failed a fix round → one step up).
+A route is **agent + model + effort**, not just a model. Jev picks the effort from the candidates; do not pre-set it from the size class. Static fallback only when Jev is skipped (recipe step 4): trivial → low, standard → medium, complex / data-loss / security → high, final review → max.
 
 How effort is applied per agent:
 | Agent | Knob |
 |---|---|
-| Codex | `codex -c model_reasoning_effort=low\|medium\|high` at launch |
+| Codex | `codex -c model_reasoning_effort=low\|medium\|high\|xhigh\|max\|ultra` at launch (`gpt-6-luna` stops at `max`; `ultra` adds automatic task delegation) |
 | AGY | encoded in the model name (Flash Low / Medium / High, Pro High) — pick the matching model |
 | Claude Code in a herdr pane | `claude --effort <level>` at launch |
 | OpenCode | model variant, if the provider has one; else note "effort n/a" on the board |
@@ -62,7 +74,7 @@ Stage 1 writes `## Routing preferences` from `matrixkoder.yaml` defaults; if the
 ## Jev recipe (cheap — every call is paid)
 
 1. Plan time: **one** `jev_classify` over all phases, size and risk as separate items. Catalog: `trivial`, `standard`, `complex_cross_cutting`, `read_only`, `reversible`, `destructive`, `manual_review`.
-2. Per phase: **one** `jev_decide`. Candidates = agent + model + effort combos (≤4, e.g. `codex gpt-6.1-sol high`, `agy flash-medium`) — the tier and default effort come from step 1 — plus Jev's built-in `ask_user` / `investigate`. Evidence = classify result + `usage.json` snapshot + track record from the board. Priorities = routing preferences. Requirements (max 3): "keeps Claude above its reserve floor", "agent not inside a reset window", "agent supports the tier".
+2. Per phase: **one** `jev_decide`. **Jev picks the route; the orchestrator supplies the menu, never the answer.** Candidates = agent + model + effort routes from the model menu (≤4, e.g. `codex gpt-6.1-sol high`, `agy gemini-3.8-flash-medium`), each described with its Jev note, spanning at least one tier below and one above your own guess and more than one agent where available, and clearly distinct (never 3+ adjacent levels of one family: Jev splits the vote between them) — plus "pause"/"wait for <agent> at <reset>" and Jev's built-in `ask_user` / `investigate`. Evidence = the phase brief verbatim + raw classify result + `usage.json` snapshot + track record from the board (not your own size verdict). Priorities = routing preferences only (never a size → tier mapping); when two conflict for this phase (e.g. accuracy vs Claude-sparing), state which wins. Requirements (max 3): "keeps Claude above its reserve floor", "agent not inside a reset window", "agent supports the tier".
 3. Re-decide only on failover or a usage change. Reviewers are assigned by the rule above, not by Jev.
 4. `usage.json` empty or n/a for all candidates → skip Jev, use the static Claude-sparing order.
 5. Re-route after a failed round only after the SKILL.md "diagnose the miss" step: brief/verification gaps are fixed in the brief at the same tier. Low confidence between two adjacent tiers: take the **lower** tier when the job is read-only or scripted (browser QA, grading, exploration) — verification catches misses cheaply; go one tier up only for build work on data-loss/security paths. `escaped` → stronger model on a non-Claude agent first, then Claude, and say so. Never re-phrase and re-call.
@@ -71,7 +83,7 @@ Stage 1 writes `## Routing preferences` from `matrixkoder.yaml` defaults; if the
 
 `QUOTA`, `PROVIDER` (unsupported model, subscription required, service unavailable, auth) or `STALL` (working but no file/commit change for 10 min, or idle without the DONE token): record `git status --porcelain` + `git diff --stat` counts as an event (`mk-state event --task <T> --type note`), `task round <T> --kind takeover --cause "quota|stall|provider"`, write the TAKEOVER section, re-decide with Jev (or static order), dispatch. Skip agents inside a reset window. All agents below their floor → pause the run and ask.
 
-## Typical routes (starting points, Jev adjusts)
+## Typical routes (static fallback when Jev is skipped; the "never" rules are `jev_decide` requirements)
 
 Claude tier aliases (`haiku`, `sonnet`, `opus`, `fable`) resolve to the newest model of that tier; record the resolved model on the task. Haiku 5.5 (user, 2026-10-07) is the default for small and easy Claude jobs: include `claude haiku <effort>` as a `jev_decide` candidate for every trivial or read-only job.
 
