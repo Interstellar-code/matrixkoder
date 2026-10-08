@@ -36,6 +36,7 @@ STATUS_MAP = {"DONE": "verifying", "DONE_SENT": "verifying", "QUOTA": "quota", "
 FAIL_STATES = ("QUOTA", "PROVIDER", "BLOCKED", "DEV_SERVER", "ERROR")
 WATCHED = ("dispatched", "building", "stalled", "quota", "provider", "blocked")  # a watcher may move these only
 ERROR_RETRIES = 3
+TOKEN_GRACE_MIN = 3  # commit + report + agent idle this long, but no DONE token: DONE anyway (lesson 39)
 
 sys.dont_write_bytecode = True  # no stray __pycache__ next to the scripts
 _spec = importlib.util.spec_from_file_location("lane_health", os.path.join(HERE, "lane-health.py"))
@@ -84,9 +85,14 @@ def decide(h, subj, rx, report_ok, text, phase, stall_min):
         return "DONE", [f"commit {subj}"] + ([f"{phase} DONE"] if phase else [])
     if question:
         return "BLOCKED", [f"{phase} BLOCKED: {question}"]
+    idle = h.get("last_change_min")  # since the last file/commit change OR pane activity (watch() passes it)
+    if (h["state"] != "ERROR" and commit_ok and report_ok and status in ("idle", "done") and phase
+            and idle is not None and idle >= min(TOKEN_GRACE_MIN, stall_min)):
+        # builders (Claude especially) end with a summary and forget the token; the work is there, so the
+        # orchestrator verifies it rather than waiting for WATCH_EXPIRED
+        return "DONE", [f"commit {subj}", f"no {phase} DONE token (commit + report, agent {status} {idle} min)"]
     if h["state"] in FAIL_STATES:
         return h["state"], h.get("evidence") or []
-    idle = h.get("last_change_min")  # since the last file/commit change OR pane activity (watch() passes it)
     if status == "working" and idle is not None and idle >= stall_min:
         return "STALL", [f"working but no file/commit/pane change for {idle} min"]
     if status in ("idle", "done") and idle is not None and idle >= stall_min:
@@ -203,8 +209,13 @@ def self_test():
     assert st == "STALL" and "matching commit" in ev[0]
     assert decide({**ok, "agent_status": "done", "last_change_min": 11}, other, rx, True, "", None, 10)[0] == "STALL"
     assert decide({**ok, "last_change_min": 9}, other, rx, True, "", None, 10)[0] is None
-    st, ev = decide({**ok, "last_change_min": 11}, good, rx, True, "", "P1", 10)  # committed but no token
-    assert st == "STALL" and "P1 DONE token" in ev[0] and "matching commit" not in ev[0]
+    # commit + report + idle, no token: DONE after the grace (lesson 39), never before; no report: still STALL
+    st, ev = decide({**ok, "last_change_min": 4}, good, rx, True, "", "P1", 10)
+    assert st == "DONE" and "no P1 DONE token" in ev[1], (st, ev)
+    assert decide({**ok, "last_change_min": 2}, good, rx, True, "", "P1", 10)[0] is None
+    assert decide({**ok, "agent_status": "working", "last_change_min": 4}, good, rx, True, "", "P1", 10)[0] is None
+    st, ev = decide({**ok, "last_change_min": 11}, good, rx, False, "", "P1", 10)
+    assert st == "STALL" and "report" in ev[0] and "matching commit" not in ev[0]
     # pane activity: digit-only changes (timers) are not activity; new output lines are
     assert pane_fingerprint("Working (12s) esc to interrupt") == pane_fingerprint("Working (73s) esc to interrupt")
     assert pane_fingerprint("$ vitest run\n") != pane_fingerprint("$ vitest run\n 10 failed\n")
