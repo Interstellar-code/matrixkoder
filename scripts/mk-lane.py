@@ -10,7 +10,12 @@
 
 Common: --data DIR (resolved exactly as mk-state.py does), --lock-timeout S (hidden, default 30).
 Every command prints ONE JSON line. Exit 0 ok; 2 bad input, a git/herdr failure, or lanes.lock busy;
-3 slot dirty (acquire and release both refuse: no state change, no git command run); 4 all slots busy.
+3 the slot is not reusable as it stands — dirty working tree, or commits on no branch (acquire and
+release both refuse: no state change, no git command run); 4 all slots busy.
+
+Nothing is ever aimed at a path this repo does not own: a stored slot keeps the path it was created
+with, a slot path must be a registered worktree of this repo and never the main checkout, and every
+ref argument must resolve to a commit here before it reaches git.
 
 Why slots: one git worktree per task means pnpm install, a fresh .env copy and a fresh agent
 folder-trust prompt for every task. A slot is a persistent checkout reused across tasks: acquire
@@ -38,6 +43,12 @@ LOCKFILES = ("pnpm-lock.yaml", "package-lock.json", "yarn.lock", "bun.lock", "bu
 # Ignored entries a slot may keep between tasks; anything else is a pause item, never discarded.
 DISPOSABLE = (".matrixkoder-*", ".env", ".env.*", "node_modules/", ".omc/", ".serena/", ".venv/",
               "__pycache__/")
+# The build-cache dirs every package/venv path ends with: allowed as a path component at any depth,
+# so a monorepo's packages/a/node_modules/ does not read as dirty. Everything else stays root-only.
+ANY_DEPTH = ("node_modules/", "__pycache__/", ".venv/")
+# A lanes_disposable entry is a literal name: no globs, no paths, no `..` — a wildcard would make
+# every ignored file disposable and the next gc would delete the user's data.
+DISPOSABLE_RE = re.compile(r"[A-Za-z0-9._-]+/?")
 LOCK_TIMEOUT = 30.0
 GIT_TIMEOUT, HERDR_TIMEOUT = 120, 300
 DEFAULTS = {"slots": 1, "pattern": "../{repo}-mk-{n}", "reuse": True, "cap": 3, "disposable": []}
@@ -89,8 +100,23 @@ def split_flow(body):
     return [p for p in parts if p.strip()]
 
 
+def strip_comment(s):
+    """Drop a trailing `# …` that is outside quotes. The wizard emits one on the lanes line, and
+    without this the whole `{ … }` is unparseable and every value silently falls back to DEFAULTS."""
+    quote = None
+    for i, ch in enumerate(s):
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "#" and (i == 0 or s[i - 1] in " \t"):
+            return s[:i]
+    return s
+
+
 def flow_map(body):
-    body = body.strip()
+    body = strip_comment(body).strip()
     if not (body.startswith("{") and body.endswith("}")):
         return {}
     out = {}
@@ -101,11 +127,25 @@ def flow_map(body):
     return out
 
 
+def literal_names(items):
+    """-> (accepted, rejected) lanes_disposable entries: literal names only, so the clean check's
+    allowlist can never be widened into "every ignored file is disposable"."""
+    ok, bad = [], []
+    for x in items:
+        name = scalar(x)
+        if DISPOSABLE_RE.fullmatch(name) and ".." not in name:
+            ok.append(name)
+        elif name:
+            bad.append(name)
+    return ok, bad
+
+
 def load_config(data):
     """<data>/matrixkoder.yaml: `  lanes: { slots, pattern, reuse }` under repo, `max_build_lanes`
     (indent >= 2, any block) as the lane cap and one-line `lanes_disposable: [a, b]` on top of the
-    clean-check allowlist. Defaults when absent; an unreadable or corrupt file is the defaults."""
-    cfg = dict(DEFAULTS, disposable=[])
+    clean-check allowlist. Defaults when absent or unreadable; `warnings` carries entries the
+    lanes_disposable check rejected."""
+    cfg = dict(DEFAULTS, disposable=[], warnings=[])
     try:
         with open(os.path.join(data, "matrixkoder.yaml")) as f:
             lines = f.read().splitlines()
@@ -117,9 +157,10 @@ def load_config(data):
             continue
         indent, key, rest = len(m.group(1)), m.group(2), m.group(3)
         if key == "lanes_disposable":  # a top-level one-line list, matched at any indent
-            rest = rest.strip()
+            rest = strip_comment(rest).strip()
             if rest.startswith("[") and rest.endswith("]"):
-                cfg["disposable"] = [scalar(x) for x in split_flow(rest[1:-1])]
+                cfg["disposable"], bad = literal_names(split_flow(rest[1:-1]))
+                cfg["warnings"] += [f"lanes_disposable: ignored {name!r} (not a literal name)" for name in bad]
             continue
         if indent < 2:  # the other two are indented block entries (repo.lanes, routing_preferences)
             continue
@@ -156,13 +197,40 @@ def main_checkout():
 
 
 def slot_path(cfg, main, n):
-    """A slot's absolute path: the pattern with {repo}/{n} filled in, against the main checkout."""
+    """A slot's absolute path: the pattern with {repo}/{n} filled in, against the main checkout.
+    Without `{n}` every slot would land on the same directory, so that pattern is refused."""
+    pattern = cfg["pattern"]
+    if "{n}" not in pattern:
+        raise Fail(f"lanes pattern {pattern!r} has no {{n}}: every slot would share one path")
     return os.path.normpath(os.path.join(
-        main, cfg["pattern"].replace("{repo}", os.path.basename(main)).replace("{n}", str(n))))
+        main, pattern.replace("{repo}", os.path.basename(main)).replace("{n}", str(n))))
 
 
 def workspace_name(main, n):
     return f"mk:{os.path.basename(main)}:{n}"
+
+
+def linked_worktrees(main):
+    """The realpaths git has registered as worktrees of this repo (the main checkout is one of them)."""
+    r = git(["-C", main, "worktree", "list", "--porcelain"])
+    return {os.path.realpath(l.split(" ", 1)[1]) for l in r.stdout.splitlines()
+            if l.startswith("worktree ")}
+
+
+def verify_slot_path(n, path, main):
+    """A slot is a *linked* worktree of this repo and nothing else: never the main checkout, never a
+    directory this repo does not know. Checked before every switch and every remove, so a re-aimed
+    pattern or a foreign path can never be moved or deleted."""
+    p, m = os.path.realpath(path), os.path.realpath(main)
+    if p == m:
+        raise Fail(f"slot {n} is the main checkout {path}, not a lane")
+    if p not in linked_worktrees(main):
+        raise Fail(f"slot {n} at {path} is not a registered worktree of {m}")
+
+
+def inside_main(path, main):
+    p, m = os.path.realpath(path), os.path.realpath(main)
+    return p == m or p.startswith(m + os.sep)
 
 
 # ---------- names ----------
@@ -232,7 +300,8 @@ def locked(data, timeout):
 
 
 def read_lanes(data):
-    """-> the registry; a missing, unreadable or corrupt file is an empty pool, never an error."""
+    """-> the registry. A missing or wrong-shaped file is an empty pool; corrupt JSON is an error
+    (exit 2), because a pool we cannot read is not a pool we may quietly reset."""
     d = mk_state.read_json(os.path.join(data, "lanes.json"), None)
     if not isinstance(d, dict) or not isinstance(d.get("slots"), dict):
         return {"schema": SCHEMA, "slots": {}}
@@ -314,13 +383,17 @@ def ensure_lane_exclude(lane):
 # ---------- the clean check (shared by acquire, release and gc) ----------
 
 def disposable_ok(path, patterns):
-    """Is an ignored entry disposable? A trailing-`/` entry covers its whole subtree; any other entry
-    must match the path itself (fnmatch, so `.matrixkoder-*` and `.env.*` are globs)."""
+    """Is an ignored entry disposable? A trailing-`/` entry covers its whole subtree — at the root, or
+    at any depth when it is one of ANY_DEPTH — while a name must match the path itself at the root
+    (fnmatch, so `.matrixkoder-*` and `.env.*` are globs)."""
     p = path.strip().rstrip("/")
     for pat in patterns:
         if pat.endswith("/"):
-            if p == pat[:-1] or p.startswith(pat):
+            name, root = pat[:-1], pat
+            if p == name or p.startswith(root):
                 return True
+            if pat in ANY_DEPTH and f"/{name}/" in f"/{p}/":
+                return True  # packages/a/node_modules/, scripts/__pycache__/, …
         elif p == pat or fnmatch.fnmatchcase(p, pat) or fnmatch.fnmatchcase(p + "/*", pat):
             return True
     return False
@@ -328,8 +401,12 @@ def disposable_ok(path, patterns):
 
 def clean_state(path, cfg):
     """-> (clean, dirty lines): `git status --porcelain --ignored` in the slot may list nothing but
-    ignored entries on the allowlist. Read-only: it never repairs, only reports."""
-    r = run_cmd(["git", "-C", path, "status", "--porcelain", "--ignored"], 60)
+    ignored entries on the allowlist. Read-only: it never repairs, only reports.
+    The untracked/submodule flags are given on the command line on purpose: `status.showUntrackedFiles`
+    and `diff.ignoreSubmodules` in the user's config would otherwise hide `??` lines, and this check
+    is the only thing standing between a hidden untracked file and `git worktree remove`."""
+    r = run_cmd(["git", "-C", path, "status", "--porcelain", "--ignored", "--untracked-files=normal",
+                 "--ignore-submodules=none"], 60)
     if r.returncode != 0:
         raise Fail(f"git status in {path} failed", stderr=(r.stderr or r.stdout).strip()[:400])
     allow = tuple(DISPOSABLE) + tuple(cfg["disposable"])
@@ -338,11 +415,57 @@ def clean_state(path, cfg):
     return not dirty, dirty
 
 
+def stray_commits(path):
+    """The commits HEAD has that no branch, tag or remote ref reaches. A free slot sits detached, so a
+    late builder commit there is orphaned by the next switch — it survives only in the reflog."""
+    r = run_cmd(["git", "-C", path, "rev-list", "HEAD", "--not", "--branches", "--tags", "--remotes"], 60)
+    if r.returncode != 0:
+        raise Fail(f"git rev-list in {path} failed", stderr=(r.stderr or r.stdout).strip()[:400])
+    return r.stdout.split()
+
+
 def require_clean(n, rec, cfg):
     """Refuse before any git command runs and before any state is written (exit 3)."""
     ok, dirty = clean_state(rec.get("path") or "", cfg)
     if not ok:
         raise Fail(f"slot {n} dirty", code=3, dirty=dirty[:20])
+
+
+def require_no_stray(n, path):
+    """No switch may orphan a commit: check it right before every switch (exit 3)."""
+    shas = stray_commits(path)
+    if shas:
+        raise Fail(f"slot {n} has {len(shas)} commit(s) on no branch", code=3, unreachable=shas[:5])
+
+
+# ---------- ref arguments: untrusted input reaches git as argv ----------
+
+def check_ref(main, ref, what):
+    """-> the commit sha a ref argument resolves to. Rejects a leading `-` (option injection) and
+    anything that is not a commit here, then the sha is what git commands get."""
+    if not ref or ref.startswith("-"):
+        raise Fail(f"{what} {ref!r} must be a ref, not an option")
+    r = run_cmd(["git", "-C", main, "rev-parse", "--verify", "--quiet", "--end-of-options",
+                 f"{ref}^{{commit}}"])
+    if r.returncode != 0 or not r.stdout.strip():
+        raise Fail(f"{what} {ref!r} does not resolve to a commit in {os.path.basename(main)}")
+    return r.stdout.strip()
+
+
+def try_ref(main, ref):
+    """-> the commit sha, or None when the ref is gone (an already-deleted branch is not an error)."""
+    r = run_cmd(["git", "-C", main, "rev-parse", "--verify", "--quiet", "--end-of-options",
+                 f"{ref}^{{commit}}"])
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def check_branch(main, name, what="branch name"):
+    if not name or name.startswith("-"):
+        raise Fail(f"{what} {name!r} must be a ref, not an option")
+    r = run_cmd(["git", "-C", main, "check-ref-format", "--branch", name])
+    if r.returncode != 0:
+        raise Fail(f"{what} {name!r} is not a valid git branch name")
+    return name
 
 
 # ---------- lockfile hash: does the slot still need an install? ----------
@@ -391,15 +514,17 @@ def pick_slot(lanes, cfg):
     raise Fail(f"all {cfg['cap']} slots busy", code=4)
 
 
-def create_slot(rec, main, base):
-    """Create the slot's worktree: herdr (labelled workspace) or plain git. The record is written by
-    the caller after this returns, so a failure leaves no slot behind."""
+def create_slot(rec, main, base_sha, base_ref):
+    """Create the slot's worktree: herdr (labelled workspace) or plain git. git is given the resolved
+    sha; herdr gets the ref the caller wrote, which check_ref already resolved and proved a commit.
+    The record is written by the caller after this returns, so a failure leaves no slot behind."""
     bin_ = herdr_bin()
     if bin_ == "none":
-        git(["-C", main, "worktree", "add", "-b", rec["branch"], rec["path"], base])
+        rec["workspace_id"] = None  # a recreated slot has no herdr workspace, let alone a stale id
+        git(["-C", main, "worktree", "add", "-b", rec["branch"], rec["path"], base_sha])
     else:
         r = run_cmd([bin_, "worktree", "create", "--cwd", main, "--branch", rec["branch"],
-                     "--base", base, "--path", rec["path"], "--label", rec["workspace"],
+                     "--base", base_ref, "--path", rec["path"], "--label", rec["workspace"],
                      "--no-focus"], HERDR_TIMEOUT)
         if r.returncode != 0:
             raise Fail("herdr worktree create failed", stderr=(r.stderr or r.stdout).strip()[:400])
@@ -420,19 +545,31 @@ def remove_slot(rec, main):
 
 def cmd_acquire(a, cfg, data, main):
     nms = names(a.run, a.task, cfg, a.role, a.round, 1, main)  # validates run/task before the lock
+    base = check_ref(main, a.base, "--base")
+    check_branch(main, nms["branch"], "task branch name")
     with locked(data, a.lock_timeout):
         lanes = read_lanes(data)
         n, created = pick_slot(lanes, cfg)
-        rec = lanes["slots"].setdefault(str(n), blank_slot(slot_path(cfg, main, n),
-                                                             workspace_name(main, n)))
+        want = slot_path(cfg, main, n)
+        if inside_main(want, main):
+            raise Fail(f"slot path {want} is the main checkout or inside it")
+        rec = lanes["slots"].get(str(n))
+        if rec is not None and os.path.normpath(rec.get("path") or "") != want:
+            raise Fail(f"slot {n} is at {rec.get('path')}, pattern now gives {want}")
+        if rec is None:
+            rec = lanes["slots"][str(n)] = blank_slot(want, workspace_name(main, n))
         rec.setdefault("workspace_id", None)
-        rec["path"], rec["workspace"] = slot_path(cfg, main, n), workspace_name(main, n)
+        rec["workspace"] = workspace_name(main, n)  # rec["path"] is never reassigned: a slot stays put
         rec["branch"] = nms["branch"]
         if created:
-            create_slot(rec, main, a.base)
+            if os.path.lexists(rec["path"]):
+                raise Fail(f"slot path {rec['path']} exists and is not a registered slot")
+            create_slot(rec, main, base, a.base)
         else:
+            verify_slot_path(n, rec["path"], main)
             require_clean(n, rec, cfg)  # before any git command runs
-            git(["-C", rec["path"], "switch", "--detach", a.base])
+            require_no_stray(n, rec["path"])
+            git(["-C", rec["path"], "switch", "--detach", base])
             git(["-C", rec["path"], "switch", "-c", rec["branch"]])  # an existing branch fails here
         h = lock_hash(rec["path"])
         install_needed = created or h != rec.get("lock_hash") or rec.get("lock_hash") is None
@@ -443,23 +580,36 @@ def cmd_acquire(a, cfg, data, main):
                "agent": nms["agent"], "created": created, "install_needed": install_needed}
         if warning := set_task(data, a.run, a.task, rec, n):
             out["warning"] = f"mk-state task set: {warning}"
-        return out
+        return with_warnings(out, cfg)
 
 
 def cmd_release(a, cfg, data, main):
+    integration = check_ref(main, a.integration, "--integration")
     with locked(data, a.lock_timeout):
         lanes = read_lanes(data)
         rec = lanes["slots"].get(str(a.slot))
         if rec is None:
             raise Fail(f"no slot {a.slot}")
+        verify_slot_path(a.slot, rec["path"], main)
         require_clean(a.slot, rec, cfg)
-        git(["-C", rec["path"], "switch", "--detach", a.integration])
+        require_no_stray(a.slot, rec["path"])
+        git(["-C", rec["path"], "switch", "--detach", integration])
         branch, warning, deleted = rec.get("branch"), None, None
         if branch:
-            r = run_cmd(["git", "-C", main, "branch", "-d", branch])  # plain -d: git refuses unmerged
-            deleted = r.returncode == 0
-            if not deleted:
-                warning = f"branch {branch} not merged, kept"  # never -D
+            # merged-ness is judged against the integration branch, not the main checkout's HEAD, and
+            # update-ref -d <ref> <sha> is a compare-and-swap that refuses if the branch moved
+            sha = try_ref(main, branch)
+            if sha is None:
+                deleted, warning = False, f"branch {branch} already gone"
+            elif run_cmd(["git", "-C", main, "merge-base", "--is-ancestor", sha,
+                          integration]).returncode == 0:
+                r = run_cmd(["git", "-C", main, "update-ref", "-d", f"refs/heads/{branch}", sha])
+                deleted = r.returncode == 0
+                if not deleted:
+                    warning = f"branch {branch} moved while releasing, kept"
+            else:
+                deleted = False
+                warning = f"branch {branch} not merged into {a.integration}, kept"  # never -D
         touch(rec, state="free", run=None, task=None, branch=None)
         out = {"ok": True, "slot": a.slot, "path": rec["path"], "state": "free",
                "integration": a.integration, "branch": branch, "branch_deleted": deleted}
@@ -473,16 +623,23 @@ def cmd_release(a, cfg, data, main):
             else:
                 lanes["slots"].pop(str(a.slot), None)
         write_lanes(data, lanes)
-        return {**out, **({"warning": warning} if warning else {})}
+        return with_warnings({**out, **({"warning": warning} if warning else {})}, cfg)
+
+
+def with_warnings(out, cfg):
+    """Config problems (a rejected lanes_disposable entry) travel with every ok answer: the caller
+    must see that its allowlist is narrower than it asked for."""
+    return {**out, "warnings": list(cfg["warnings"])} if cfg["warnings"] else out
 
 
 def cmd_gc(a, cfg, data, main):
     keep = max(1, a.keep)
     with locked(data, a.lock_timeout):
         lanes = read_lanes(data)
+        survivors = set(slot_numbers(lanes)[:keep])  # the lowest K that exist, not the numbers <= K
         removed, skipped = [], []
-        for n in slot_numbers(lanes):  # lowest first, so the lowest K slots survive
-            if n <= keep:
+        for n in slot_numbers(lanes):
+            if n in survivors:
                 continue
             rec = lanes["slots"][str(n)]
             if rec.get("state") == "busy":
@@ -490,6 +647,11 @@ def cmd_gc(a, cfg, data, main):
                 continue
             if not os.path.isdir(rec.get("path") or ""):
                 skipped.append({"slot": n, "reason": "path gone"})
+                continue
+            try:
+                verify_slot_path(n, rec["path"], main)
+            except Fail as e:
+                skipped.append({"slot": n, "reason": str(e)})
                 continue
             ok, dirty = clean_state(rec["path"], cfg)
             if not ok:
@@ -505,7 +667,7 @@ def cmd_gc(a, cfg, data, main):
             lanes["slots"].pop(str(n))
             removed.append(n)
         write_lanes(data, lanes)
-        return {"ok": True, "removed": removed, "skipped": skipped}
+        return with_warnings({"ok": True, "removed": removed, "skipped": skipped}, cfg)
 
 
 def cmd_list(a, cfg, data, main):
@@ -520,7 +682,7 @@ def cmd_list(a, cfg, data, main):
                     "workspace_id": rec.get("workspace_id"), "state": rec.get("state"),
                     "run": rec.get("run"), "task": rec.get("task"), "branch": rec.get("branch"),
                     "clean": live, "updated": rec.get("updated")})
-    return {"ok": True, "slots": out, "cap": cfg["cap"]}
+    return with_warnings({"ok": True, "slots": out, "cap": cfg["cap"]}, cfg)
 
 
 # ---------- cli ----------
@@ -616,6 +778,7 @@ def self_test():
         return run_py(os.path.join(HERE, "mk-state.py"), list(args), code)
 
     def write(path, text):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as f:
             f.write(text)
 
@@ -627,28 +790,54 @@ def self_test():
                 f.write(f"lanes_disposable: [{disposable}]\n")
 
     try:
-        # a real repo: main + the integration branch, one lockfile, node_modules/ and .omc/ ignored
+        # a real repo: main + the integration branch in its own checkout, one lockfile, and ignored
+        # node_modules/ __pycache__/ .venv/ .omc/ prod.sqlite. Main stays on `main` for the whole test,
+        # like the real orchestrator: merges land in the integration checkout.
         g("init", "-q", "-b", "main")
         g("config", "user.email", "mk-lane@test")
         g("config", "user.name", "mk-lane self-test")
         write(os.path.join(repo, "README.md"), "base\n")
         write(os.path.join(repo, "pnpm-lock.yaml"), "lock v1\n")
-        write(os.path.join(repo, ".gitignore"), "node_modules/\n.omc/\n")
+        write(os.path.join(repo, ".gitignore"), "node_modules/\n__pycache__/\n.venv/\n.omc/\nprod.sqlite\n")
+        write(os.path.join(repo, "pkg", "a", "src", "app.js"), "// tracked, so git lists the\n"
+              "                        // ignored dir inside pkg/ instead of collapsing to `?? pkg/`\n")
+        write(os.path.join(repo, "scripts", "tool.py"), "# tracked\n")
         g("add", "-A"), g("commit", "-qm", "base"), g("branch", "mk/r1/integration")
+        integ = os.path.join(tmp, "integ")  # the integration checkout, not a slot
+        g("worktree", "add", "-q", integ, "mk/r1/integration")
         slot1, slot2 = os.path.join(tmp, "repo-mk-1"), os.path.join(tmp, "repo-mk-2")
 
-        # config: L3's shape, defaults when absent, lanes_disposable, cap = max(slots, lanes)
-        assert load_config(data) == DEFAULTS, load_config(data)  # no yaml at all
+        def merge_integration(branch):
+            return g("-C", integ, "merge", "-q", "--ff-only", branch)
+
+        def main_head():
+            return g("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+
+        # config: L3's shape (with its trailing comment), defaults, cap math, disposable validation
+        assert load_config(data) == {**DEFAULTS, "warnings": []}, load_config(data)  # no yaml at all
+        write(os.path.join(data, "matrixkoder.yaml"),
+              'repo:\n  lanes: { slots: 2, pattern: "../{repo}-lanes-{n}", reuse: true }   '
+              "# reusable worktree slots; the cap is max_build_lanes\n")
+        assert load_config(data) == {**DEFAULTS, "slots": 2, "pattern": "../{repo}-lanes-{n}",
+                                     "cap": 3, "disposable": [], "warnings": []}, load_config(data)
         yaml_cap(2, 2, "../{repo}-lanes-{n}", "build")
         assert load_config(data) == {**DEFAULTS, "slots": 2, "pattern": "../{repo}-lanes-{n}",
-                                     "cap": 2, "disposable": ["build"]}, load_config(data)
+                                     "cap": 2, "disposable": ["build"], "warnings": []}, load_config(data)
         yaml_cap(1, 3)
         assert load_config(data)["cap"] == 3, load_config(data)  # max(slots, max_build_lanes)
         yaml_cap(4, 2)
         assert load_config(data)["cap"] == 4, load_config(data)
         write(os.path.join(data, "matrixkoder.yaml"),
               "repo:\n  lanes: { slots: 1, pattern: ../{repo}-mk-{n}, reuse: false }\n")
-        assert load_config(data) == {**DEFAULTS, "slots": 1, "reuse": False}, load_config(data)
+        assert load_config(data) == {**DEFAULTS, "slots": 1, "reuse": False,
+                                     "warnings": []}, load_config(data)
+        # a wildcard disposable entry is refused, so it can never widen the allowlist to "everything"
+        write(os.path.join(data, "matrixkoder.yaml"),
+              'repo:\n  lanes: { slots: 1, pattern: "../{repo}-mk-{n}", reuse: true }\n'
+              'lanes_disposable: ["*", "../secrets", "*.db", "build", "dist/"]\n')
+        cfg = load_config(data)
+        assert cfg["disposable"] == ["build", "dist/"], cfg
+        assert len(cfg["warnings"]) == 3, cfg
         yaml_cap(1, 1)
 
         # 1 names: lowercased, digit-prefixed agent, the 32-char limit, integration branch
@@ -662,6 +851,11 @@ def self_test():
         assert len(big["agent"]) <= 32 and AGENT_RE.fullmatch(big["agent"]), big
         assert big["agent"].endswith("-build-r1"), big
         assert mk("names", "--run", "r1", "--task", "x", "--slot", "2")["workspace"] == "mk:repo:2"
+        # a pattern without {n} would put every slot on one path: refused before anything is computed
+        write(os.path.join(data, "matrixkoder.yaml"),
+              'repo:\n  lanes: { slots: 1, pattern: "../{repo}", reuse: true }\n')
+        assert "{n}" in mk("names", "--run", "r1", "--task", "t1", code=2)["error"]
+        yaml_cap(1, 1)
 
         st("run", "init", "--id", "r1", "--feature", "Lanes", "--branch", "mk/r1/integration")
         st("task", "add", "--id", "t1", "--title", "first", "--run", "r1")
@@ -681,15 +875,16 @@ def self_test():
         assert mk("acquire", "--run", "r1", "--task", "t2", "--base", "main",
                   code=4)["error"] == "all 1 slots busy"
 
-        # 4 merge the task branch into the integration branch, then release
+        # 4 merge the task branch into the integration branch (main stays on main), then release
         write(os.path.join(slot1, "work.md"), "work\n")
         g("-C", slot1, "add", "-A"), g("-C", slot1, "commit", "-qm", "work")
-        g("switch", "-q", "mk/r1/integration"), g("merge", "-q", "--ff-only", "mk/r1/t1")
-        head = g("rev-parse", "HEAD").stdout.strip()
+        merge_integration("mk/r1/t1")
+        head = g("-C", integ, "rev-parse", "HEAD").stdout.strip()
         rel = mk("release", "--slot", "1", "--integration", "mk/r1/integration")
         assert rel == {"ok": True, "slot": 1, "path": slot1, "state": "free",
                        "integration": "mk/r1/integration", "branch": "mk/r1/t1",
                        "branch_deleted": True}, rel
+        assert main_head() == "main"  # merged-ness judged against integration, not this HEAD
         assert g("rev-parse", "--verify", "--quiet", "refs/heads/mk/r1/t1",
                  check=False).returncode != 0  # the task branch is gone
         assert g("-C", slot1, "rev-parse", "HEAD").stdout.strip() == head  # detached at integration
@@ -700,9 +895,9 @@ def self_test():
         a2 = mk("acquire", "--run", "r1", "--task", "t3", "--base", "mk/r1/integration")
         assert (a2["slot"], a2["path"], a2["created"], a2["install_needed"]) == (1, slot1, False, False), a2
         write(os.path.join(slot1, "work.md"), "work\nmore\n")
-        g("-C", slot1, "commit", "-aqm", "more"), g("merge", "-q", "--ff-only", "mk/r1/t3")
-        write(os.path.join(repo, "pnpm-lock.yaml"), "lock v2\n")
-        g("commit", "-aqm", "lock")
+        g("-C", slot1, "commit", "-aqm", "more"), merge_integration("mk/r1/t3")
+        write(os.path.join(integ, "pnpm-lock.yaml"), "lock v2\n")
+        g("-C", integ, "commit", "-aqm", "lock")
         assert mk("release", "--slot", "1", "--integration", "mk/r1/integration")["branch_deleted"]
         a3 = mk("acquire", "--run", "r1", "--task", "t4", "--base", "mk/r1/integration")
         assert (a3["created"], a3["install_needed"]) == (False, True), a3  # lockfile changed on the base
@@ -722,27 +917,87 @@ def self_test():
                  check=False).returncode != 0  # no branch was created
         rec = mk_state.read_json(os.path.join(data, "lanes.json"))["slots"]["1"]
         assert (rec["state"], rec["branch"], rec["task"]) == ("free", None, None), rec
+        # `status.showUntrackedFiles=no` in the user's config must not hide it: the flags win
+        g("config", "status.showUntrackedFiles", "no")
+        os.unlink(os.path.join(slot1, "scratch.txt"))
+        write(os.path.join(slot1, "hidden.txt"), "untracked, config-hidden\n")
+        assert mk("list")["slots"][0]["clean"] is False
+        assert mk("acquire", "--run", "r1", "--task", "t5", "--base", "main",
+                  code=3)["dirty"] == ["?? hidden.txt"]
+        assert mk("release", "--slot", "1", "--integration", "mk/r1/integration",
+                  code=3)["error"] == "slot 1 dirty"
+        assert mk("list")["slots"][0]["state"] == "free"  # no state change
+        g("config", "--unset", "status.showUntrackedFiles")
+        os.unlink(os.path.join(slot1, "hidden.txt"))
         # an ignored node_modules/ or .omc/ is disposable, not dirty
         os.makedirs(os.path.join(slot1, "node_modules", "pkg"), exist_ok=True)
         os.makedirs(os.path.join(slot1, ".omc", "sessions"), exist_ok=True)
         write(os.path.join(slot1, "node_modules", "pkg", "i.js"), "x\n")
         write(os.path.join(slot1, ".omc", "sessions", "s.json"), "{}\n")
         write(os.path.join(slot1, ".matrixkoder-report-r1.md"), "report\n")
-        os.unlink(os.path.join(slot1, "scratch.txt"))
         assert mk("list")["slots"][0]["clean"] is True
         assert mk("release", "--slot", "1", "--integration", "mk/r1/integration")["ok"]
         assert mk("acquire", "--run", "r1", "--task", "t5", "--base", "mk/r1/integration")["ok"]
 
-        # 7 releasing an unmerged branch keeps it, with a warning, and still frees the slot
+        # 7 a nested build-cache dir is disposable at any depth; the same names at the root stay
+        # root-only for everything else (a nested .env would be dirty)
+        os.makedirs(os.path.join(slot1, "pkg", "a", "node_modules", "dep"), exist_ok=True)
+        os.makedirs(os.path.join(slot1, "scripts", "__pycache__"), exist_ok=True)
+        os.makedirs(os.path.join(slot1, ".venv", "lib"), exist_ok=True)
+        write(os.path.join(slot1, "pkg", "a", "node_modules", "dep", "i.js"), "x\n")
+        write(os.path.join(slot1, "scripts", "__pycache__", "tool.pyc"), "x\n")
+        write(os.path.join(slot1, ".venv", "lib", "p.txt"), "x\n")
+        assert mk("list")["slots"][0]["clean"] is True
+        os.makedirs(os.path.join(slot1, "pkg", "a", ".env.d"), exist_ok=True)
+        write(os.path.join(slot1, "pkg", "a", ".env.local"), "SECRET=1\n")
+        assert mk("list")["slots"][0]["clean"] is False  # .env* is root-only
+        shutil.rmtree(os.path.join(slot1, "pkg", "a", ".env.d"))
+        os.unlink(os.path.join(slot1, "pkg", "a", ".env.local"))
+        assert mk("list")["slots"][0]["clean"] is True
+
+        # 8 releasing an unmerged branch keeps it, with a warning, and still frees the slot
         write(os.path.join(slot1, "work.md"), "work\nmore\nunmerged\n")
         g("-C", slot1, "commit", "-aqm", "unmerged")
         rel = mk("release", "--slot", "1", "--integration", "mk/r1/integration")
-        assert rel["warning"] == "branch mk/r1/t5 not merged, kept" and rel["branch_deleted"] is False, rel
-        assert rel["state"] == "free" and mk("list")["slots"][0]["state"] == "free"
+        assert rel["warning"] == "branch mk/r1/t5 not merged into mk/r1/integration, kept", rel
+        assert rel["branch_deleted"] is False and rel["state"] == "free", rel
+        assert mk("list")["slots"][0]["state"] == "free"
         assert g("rev-parse", "--verify", "--quiet", "refs/heads/mk/r1/t5").returncode == 0
         assert "mk/r1/t5" not in open(os.path.join(data, "lanes.json")).read()  # only in the branch ref
 
-        # 8 with cap 2: gc keeps the lowest slot, removes a free clean extra one, skips a dirty one
+        # 9 a commit on the free detached slot is not orphaned by the next switch
+        write(os.path.join(slot1, "stray.md"), "late builder commit\n")
+        g("-C", slot1, "add", "-A"), g("-C", slot1, "commit", "-qm", "stray")
+        stray = g("-C", slot1, "rev-parse", "HEAD").stdout.strip()
+        s = mk("acquire", "--run", "r1", "--task", "t9", "--base", "main", code=3)
+        assert s["unreachable"] == [stray] and "on no branch" in s["error"], s
+        assert mk("release", "--slot", "1", "--integration", "mk/r1/integration",
+                  code=3)["unreachable"] == [stray]
+        assert g("-C", slot1, "rev-parse", "HEAD").stdout.strip() == stray  # the commit is still there
+        assert mk("list")["slots"][0]["state"] == "free"
+        g("-C", slot1, "branch", "mk/r1/rescued", stray)  # give the commit a ref, as a human would
+        assert mk("acquire", "--run", "r1", "--task", "t9", "--base", "main")["slot"] == 1
+
+        # 10 ref arguments are untrusted: an option never reaches git
+        assert mk("acquire", "--run", "r1", "--task", "ta", "--base=--orphan",
+                  code=2)["error"].startswith("--base '--orphan' must be a ref")
+        assert "expected one argument" in mk("acquire", "--run", "r1", "--task", "ta", "--base",
+                                             "--orphan", code=2)["error"]
+        assert mk("acquire", "--run", "r1", "--task", "ta", "--base", "nosuchref",
+                  code=2)["error"].startswith("--base 'nosuchref' does not resolve")
+        assert mk("release", "--slot", "1", "--integration=--force",
+                  code=2)["error"].startswith("--integration '--force' must be a ref")
+        assert mk("list")["slots"][0]["task"] == "t9"  # none of them changed anything
+        assert check_branch(repo, "mk/r1/t1") == "mk/r1/t1"
+        for bad in ("--force", "mk/r1/ t1", "mk//r1", "x.lock/../y"):
+            try:
+                check_branch(repo, bad)
+                raise AssertionError(f"check_branch accepted {bad!r}")
+            except Fail:
+                pass
+
+        # 11 with cap 2: gc keeps the lowest slot, removes a free clean extra one, skips a dirty one
+        mk("release", "--slot", "1", "--integration", "mk/r1/integration")
         yaml_cap(2, 2)
         assert mk("acquire", "--run", "r1", "--task", "t6", "--base", "main")["slot"] == 1
         a2 = mk("acquire", "--run", "r1", "--task", "t7", "--base", "main")
@@ -752,15 +1007,72 @@ def self_test():
         assert mk("release", "--slot", "1", "--integration", "mk/r1/integration")["ok"]
         assert mk("release", "--slot", "2", "--integration", "mk/r1/integration")["ok"]
         write(os.path.join(slot2, "junk.txt"), "x\n")
+        g("config", "status.showUntrackedFiles", "no")  # gc must not be blinded by the config either
         out = mk("gc", "--keep", "1")
         assert out == {"ok": True, "removed": [],
                        "skipped": [{"slot": 2, "reason": "dirty: ?? junk.txt"}]}, out
         assert os.path.isdir(slot1) and os.path.isdir(slot2)  # never removed, only reported
+        assert os.path.exists(os.path.join(slot2, "junk.txt"))  # and the file is still there
+        g("config", "--unset", "status.showUntrackedFiles")
         os.unlink(os.path.join(slot2, "junk.txt"))
         assert mk("gc", "--keep", "1")["removed"] == [2]
         assert os.path.isdir(slot1) and not os.path.exists(slot2)  # the lowest slot survives
         assert [s["slot"] for s in mk("list")["slots"]] == [1]
         assert mk("gc", "--keep", "0")["removed"] == []  # --keep is clamped to 1
+
+        # 12 the pattern can never re-aim a slot, and a slot path is always ours to touch
+        other = os.path.join(tmp, "other-1")
+        g("worktree", "add", "-q", other, "-b", "userwork", "main")
+        write(os.path.join(other, "mine.txt"), "the user's own work\n")
+        g("-C", other, "add", "-A"), g("-C", other, "commit", "-qm", "user work")
+        write(os.path.join(data, "matrixkoder.yaml"),
+              'repo:\n  lanes: { slots: 2, pattern: "{repo}-lanes/{n}", reuse: true }\n')
+        bad = mk("acquire", "--run", "r1", "--task", "tb", "--base", "main", code=2)
+        assert bad["ok"] is False and "inside it" in bad["error"], bad
+        assert main_head() == "main", main_head()  # the main checkout was never switched
+        write(os.path.join(data, "matrixkoder.yaml"),
+              'repo:\n  lanes: { slots: 2, pattern: "../{repo}", reuse: true }\n')
+        bad = mk("acquire", "--run", "r1", "--task", "tb", "--base", "main", code=2)
+        assert bad["ok"] is False and "{n}" in bad["error"], bad
+        assert main_head() == "main", main_head()
+        write(os.path.join(data, "matrixkoder.yaml"),
+              'repo:\n  lanes: { slots: 2, pattern: "../other-{n}", reuse: true }\n')
+        bad = mk("acquire", "--run", "r1", "--task", "tb", "--base", "main", code=2)
+        assert bad["ok"] is False and "pattern now gives" in bad["error"], bad
+        assert mk("list")["slots"][0]["path"] == slot1  # the stored path is not rewritten
+        assert g("-C", other, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "userwork"
+        yaml_cap(2, 2)
+        assert mk("acquire", "--run", "r1", "--task", "tb", "--base", "main")["slot"] == 1
+        os.makedirs(slot2)  # a directory that is not a slot: git would accept an empty one
+        bad = mk("acquire", "--run", "r1", "--task", "tc", "--base", "main", code=2)
+        assert bad["ok"] is False and "exists and is not a registered slot" in bad["error"], bad
+        assert os.path.isdir(slot2) and not os.listdir(slot2)  # refused, never taken over or emptied
+        os.rmdir(slot2)
+        assert mk("acquire", "--run", "r1", "--task", "tc", "--base", "main")["slot"] == 2
+        assert mk("release", "--slot", "1", "--integration", "mk/r1/integration")["ok"]
+        # the same guard gc uses: a slot path must be a worktree of THIS repo, never the main checkout
+        for path, want in ((os.path.join(tmp, "not-a-worktree"), "not a registered worktree"),
+                           (repo, "is the main checkout")):
+            try:
+                verify_slot_path(9, path, repo)
+                raise AssertionError(f"verify_slot_path accepted {path}")
+            except Fail as e:
+                assert want in str(e), e
+
+        # 13 a rejected lanes_disposable entry narrows the allowlist and is reported
+        write(os.path.join(data, "matrixkoder.yaml"),
+              'repo:\n  lanes: { slots: 2, pattern: "../{repo}-mk-{n}", reuse: true }\n'
+              'lanes_disposable: ["*"]\n')
+        assert mk("release", "--slot", "2", "--integration", "mk/r1/integration")["ok"]
+        write(os.path.join(slot2, "prod.sqlite"), "ignored, but not disposable\n")
+        w = mk("list")
+        assert len(w["warnings"]) == 1 and "not a literal name" in w["warnings"][0], w
+        assert next(x for x in w["slots"] if x["slot"] == 2)["clean"] is False  # the wildcard lost
+        out = mk("gc", "--keep", "1")
+        assert out["removed"] == [] and os.path.exists(os.path.join(slot2, "prod.sqlite")), out
+        os.unlink(os.path.join(slot2, "prod.sqlite"))
+        yaml_cap(2, 2)
+        assert mk("acquire", "--run", "r1", "--task", "tb", "--base", "main")["ok"]
 
         # bad input never changes state; an existing branch leaves the slot detached and still free
         for bad in (("names", "--run", "r1"), ("names", "--run", "r1", "--task", "t/1"),
@@ -768,28 +1080,30 @@ def self_test():
                     ("release", "--slot", "9", "--integration", "main"), ("gc", "--keep", "abc"),
                     ("--lock-timeout", "nan", "gc")):
             assert mk(*bad, code=2)["ok"] is False, bad
-        assert mk("list")["slots"][0]["state"] == "free"
-        dup = mk("acquire", "--run", "r1", "--task", "t5", "--base", "main", code=2)  # mk/r1/t5 exists
+        for free in ("1", "2"):
+            assert mk("release", "--slot", free, "--integration", "mk/r1/integration")["ok"]
+        dup = mk("acquire", "--run", "r1", "--task", "t5", "--base", "main", code=2)  # mk/r1/t5 kept
         assert dup["ok"] is False and "stderr" in dup and "switch" in dup["error"], dup
         assert mk("list")["slots"][0]["state"] == "free"
         assert g("-C", slot1, "symbolic-ref", "-q", "HEAD", check=False).returncode != 0  # detached
 
-        # 9 lanes.lock: a holder outlasts a short timeout, and nothing changes
+        # 14 lanes.lock: a holder outlasts a short timeout, and nothing changes
         assert mk("acquire", "--run", "r1", "--task", "t9", "--base", "main")["slot"] == 1
-        assert mk("acquire", "--run", "r1", "--task", "tb", "--base", "main")["slot"] == 2
+        assert mk("acquire", "--run", "r1", "--task", "tc", "--base", "main")["slot"] == 2
         before = open(os.path.join(data, "lanes.json")).read()
         hold = open(os.path.join(data, "lanes.lock"), "a")
         fcntl.flock(hold, fcntl.LOCK_EX)
         try:
-            assert mk("acquire", "--run", "r1", "--task", "tc", "--base", "main", "--lock-timeout", "1",
+            assert mk("acquire", "--run", "r1", "--task", "td", "--base", "main", "--lock-timeout", "1",
                       code=2)["error"] == "lanes.lock busy"
             assert open(os.path.join(data, "lanes.json")).read() == before  # no state change
-            assert mk("list")["slots"][1]["task"] == "tb"  # the registry stays readable while locked
+            assert mk("list")["slots"][1]["task"] == "tc"  # the registry stays readable while locked
         finally:
             fcntl.flock(hold, fcntl.LOCK_UN)
             hold.close()
-        assert mk("acquire", "--run", "r1", "--task", "tc", "--base", "main",
+        assert mk("acquire", "--run", "r1", "--task", "td", "--base", "main",
                   code=4)["error"] == "all 2 slots busy"
+        assert main_head() == "main"  # this test never moved the user's main checkout
         print("mk-lane self-test ok")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

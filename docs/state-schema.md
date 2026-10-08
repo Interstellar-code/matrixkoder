@@ -135,7 +135,39 @@ failed one). `mk-state.py` never reads or writes it.
 Every read-modify-write holds an exclusive `fcntl.flock` on `<data>/lanes.lock` (wait up to 30 s, then
 `{"ok": false, "error": "lanes.lock busy"}` exit 2) and writes atomically (temp file + `os.replace`,
 `write_json`). `mk-lane.py list` is the only read-only command: it takes no lock and reports a live
-`clean` per slot (`git status --porcelain --ignored` must list nothing but ignored allowlist entries).
+`clean` per slot.
+
+### What makes a slot reusable (`acquire` and `release` both refuse, exit 3)
+
+- **Clean working tree.** `git status --porcelain --ignored --untracked-files=normal
+  --ignore-submodules=none`: the flags are on the command line on purpose, because
+  `status.showUntrackedFiles=no` in the user's config would otherwise hide `??` lines and this check
+  is the only thing between a hidden untracked file and `git worktree remove`. Every line must be an
+  ignored entry (`!! …`) on the allowlist: `.matrixkoder-*`, `.env`, `.env.*`, `node_modules/`,
+  `.omc/`, `.serena/`, `.venv/`, `__pycache__/` plus `lanes_disposable`. The three build-cache dirs
+  (`node_modules/`, `__pycache__/`, `.venv/`) match as a path component at any depth; every other
+  entry is root-only. `lanes_disposable` entries must be literal names (`[A-Za-z0-9._-]+`, optional
+  trailing `/`) — a `*` would make every ignored file disposable, so rejected entries are reported in
+  the `warnings` field of every `ok` answer instead of being applied.
+- **No commit that no ref reaches.** `git rev-list HEAD --not --branches --tags --remotes` must be
+  empty. A free slot sits detached, so a late builder commit there would be orphaned by the next
+  `switch` and survive only in the reflog; the refusal names the first SHAs in `unreachable`.
+- **The path is ours.** A stored `path` is never rewritten: if the configured pattern now gives a
+  different path the acquire is refused (`slot 1 is at X, pattern now gives Y`). Before any switch or
+  remove, the path must be a worktree registered by `git worktree list` for this repo and must not be
+  the main checkout; a new slot's path must not exist at all (an empty directory included) and must
+  not resolve inside the main checkout. The pattern must contain `{n}`.
+- **Refs are untrusted.** `--base` / `--integration` may not start with `-` and must resolve through
+  `git rev-parse --verify --quiet --end-of-options <ref>^{commit}`; generated branch names go through
+  `git check-ref-format --branch`. git then gets the resolved sha.
+
+Notes worth knowing before you rely on it: a `switch` can overwrite an allowlisted ignored file if the
+target commit happens to track that name (git's own behaviour — keep secrets out of the base branch);
+a crash between creating the worktree and writing `lanes.json` leaves a worktree the registry does not
+know (delete the directory and `git worktree prune`, then acquire again — the create path refuses an
+existing directory); `run`/`task` are stored as typed while the branch is lowercased, so `T1` and `t1`
+map to one branch; and a **hand-edited** `lanes.json` pointing a slot at another worktree of the same
+repo is outside what the tool can detect — it trusts its own registry, so do not edit it by hand.
 
 ## Lock file `<home>/locks/<resource>.lock`
 

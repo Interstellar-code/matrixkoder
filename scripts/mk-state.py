@@ -893,7 +893,8 @@ def self_test():
         assert "mk/r1/t1 · slot 1 · mk:repo:1" in board, board  # the lane cell names the slot
         for k in ("branch", "workspace", "slot"):
             assert mk("task", "set", "T1", f"{k}=")["task"][k] is None  # empty clears, like lane=
-        assert "mk/r1/t2" not in mk("render")["board"]  # ...and the board cell goes back to plain lane=
+        plain = open(mk("render")["board"]).read()  # the lane cell is back to the bare path
+        assert "| T1 |" in plain and "mk/r1/t1" not in plain, plain
         for bad in ("bran=mk/r1/t1", "workspac=mk:repo:1", "slotx=1"):
             assert mk("task", "set", "T1", bad, code=2)["ok"] is False  # still a closed key set
         assert mk("task", "set", "T1", "branch=mk/r1/t1", "workspace=mk:repo:1", "slot=1")["ok"]
