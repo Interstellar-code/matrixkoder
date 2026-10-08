@@ -637,6 +637,8 @@ def self_test():
         # default-run selection: ambiguous with two active runs, fine again after archive
         mk("run", "init", "--id", "r2", "--feature", "Other", "--branch", "b2")
         assert mk("task", "get", "T1")["task"]["id"] == "T1"  # only r1 owns T1
+        assert mk("event", "--task", "T1", "--type", "note", "--text", "owner pick")["ok"]
+        assert mk("run", "get", "--id", "r1")["run"]["recent"][-1]["text"] == "owner pick"
         mk("task", "add", "--id", "T1", "--title", "Clash", "--wave", "1", "--run", "r2")
         assert "active runs" in mk("task", "get", "T1", code=2)["error"]  # both own T1: still ambiguous
         assert "active runs" in mk("run", "get", code=2)["error"]
