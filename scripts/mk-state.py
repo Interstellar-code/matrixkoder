@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
 """MatrixKoder run state — the ONLY writer of <data>/runs/**. Python 3 stdlib only.
 
-  run init --id ID --feature F --branch B [--plan PATH]
+  run init --id ID --feature F --branch B [--plan PATH --force]
+      --plan: the plan file drives the run — the plan tool (mk-plan.py, or $MK_PLAN_CMD) `check`
+      must pass and its status be `approved`; --force overrides an unapproved status (with an event).
+      The plan gets `set --status running` + `add-run`, then phase tasks (plan_phase, route,
+      lane_group) and child tasks (plan_task, --parent) are created through the task-add path.
+      plan_sha comes from a final `parse` AFTER those mutations, so the board ⚠ does not fire at once
+  plan sync [--run ID] [--apply] — diff the run's plan against its tasks; the dry run changes
+      nothing: new phase/task → added (the add path), changed title/wave/owned/deps on a
+      planned|routed task → updated, on a started task → warning only, removed → warning (never
+      deleted); --apply stores the new plan_sha and writes exactly ONE summary event. The last
+      plan-linked run set `done` → plan `set --status done` (best-effort, never fatal)
   run list | run get [--id ID | ID] | run set [--id ID] [--next TEXT] [--status active|done]
   run stage N [--id ID] | run archive --id ID | run archive ID
   task add --id T --title TEXT [--wave N] [--deps A,RUN:B] [--owned glob,glob] [--parent P]
@@ -30,7 +40,7 @@ Every command prints ONE JSON line. Errors: {"ok": false, "error": ...} exit 2; 
 run.json is authoritative; events.jsonl may run one line ahead after a crash; `render` rebuilds board.md.
 Schema: docs/state-schema.md
 """
-import argparse, contextlib, datetime, fcntl, fnmatch, json, math, os, re, socket, sys, tempfile
+import argparse, contextlib, datetime, fcntl, fnmatch, hashlib, json, math, os, re, shlex, socket, subprocess, sys, tempfile
 
 SCHEMA = 1
 STATUSES = ("planned routed dispatched building verifying review fix merged qa done "
@@ -151,6 +161,9 @@ class Store:
         self.data = data
         self.runs = os.path.join(data, "runs")
         self.index_path = os.path.join(self.runs, "index.json")
+        # plan sync --apply: events for this run id are counted and dropped (ONE summary event
+        # comes after); other runs' upkeep events still write
+        self.sink_run, self.sunk = None, 0
 
     @contextlib.contextmanager
     def locked(self):
@@ -199,7 +212,9 @@ class Store:
             write_json(os.path.join(self.task_dir(run["id"], task["id"]), "task.json"), task)
         write_json(os.path.join(self.run_dir(run["id"]), "run.json"), run)
         idx = [r for r in self.index() if r["id"] != run["id"]]
-        idx.append({k: run[k] for k in ("id", "feature", "status", "started", "ended")})
+        entry = {k: run[k] for k in ("id", "feature", "status", "started", "ended")}
+        entry["plan"] = run.get("plan_id")  # C4: the plan id, null for plan-less and legacy runs
+        idx.append(entry)
         write_json(self.index_path, sorted(idx, key=lambda r: r["started"]))
         self.render(run)
 
@@ -314,6 +329,9 @@ class Store:
     def event(self, run, type_, text, task=None, frm=None, to=None, by="orchestrator"):
         ev = {"t": now(), "run": run["id"], "task": task, "type": type_, "text": text,
               "from": frm, "to": to, "by": by}
+        if self.sink_run is not None and self.sink_run == run.get("id"):
+            self.sunk += 1  # plan sync --apply: the reused add/update paths stay silent
+            return ev
         fd = os.open(os.path.join(self.run_dir(run["id"]), "events.jsonl"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
         try:
             os.write(fd, (json.dumps(ev) + "\n").encode())
@@ -338,7 +356,14 @@ class Store:
         w = run.get("waiting")
         out = [f"# {run['id']} — {run['feature']}", "",
                f"branch `{run['branch']}` · stage {run['stage']} · {run['status']} · updated {run['updated']}"]
-        if run.get("plan"):
+        if run.get("plan_id"):  # plan-linked run: id · status · sha (+ ⚠ when the file changed)
+            sha = run.get("plan_sha")
+            out.append(f"plan: `{run['plan_id']}` · {run.get('plan_status') or '—'}"
+                       + (f" · sha `{sha[:12]}`" if sha else ""))
+            cur = file_sha(run.get("plan"))  # plain read + hashlib; never the plan tool in render
+            if cur and sha and cur != sha:  # unreadable file: no warning, no crash
+                out.append(f"⚠ plan file changed since run start (stored `{sha[:12]}`)")
+        elif run.get("plan"):  # legacy path-only link (runs created before the plan tool)
             out.append(f"plan: `{run['plan']}`")
         out += ["", f"**Next:** {run.get('next') or '—'}"]
         if w:
@@ -488,6 +513,43 @@ def parse_value(v):
     return v
 
 
+# ---------- plan tool (C3: mk-plan.py only ever as a subprocess, never imported) ----------
+
+def plan_tool(*args):
+    """Run mk-plan.py (or $MK_PLAN_CMD, shlex-split) and return its one JSON line (C2). -> the dict
+    on ok:true, else Fail carrying the tool's errors. The board render never calls this (a plain
+    file read there); `run set --status done` treats a failure as best-effort."""
+    cmd = (shlex.split(os.environ["MK_PLAN_CMD"]) if os.environ.get("MK_PLAN_CMD") else
+           [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "mk-plan.py")])
+    try:
+        r = subprocess.run([*cmd, *args], capture_output=True, text=True, timeout=60)
+    except OSError as e:  # missing script, not executable
+        raise Fail(f"plan tool cannot run: {type(e).__name__}: {e}")
+    except subprocess.TimeoutExpired:
+        raise Fail(f"mk-plan {' '.join(args)}: timed out")
+    out = None
+    for line in reversed((r.stdout or "").strip().splitlines()):  # the JSON line is the last one
+        with contextlib.suppress(json.JSONDecodeError):
+            out = json.loads(line)
+            break
+    if r.returncode == 0 and isinstance(out, dict) and out.get("ok"):
+        return out
+    detail = out.get("errors") or out.get("error") if isinstance(out, dict) else None
+    if isinstance(detail, list):
+        detail = "; ".join(str(x) for x in detail)
+    raise Fail(f"mk-plan {' '.join(args)}: "
+               f"{detail or (r.stdout + r.stderr).strip()[:200] or f'exit {r.returncode}'}")
+
+
+def file_sha(path):
+    """sha256 of a file's bytes, None when unreadable — the board render must never crash on it."""
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except (OSError, TypeError):
+        return None
+
+
 # ---------- locks (global, cross-session) ----------
 
 def lock_path(res):
@@ -546,16 +608,45 @@ def cmd_run(a, st):
         rid = check_id(a.run, "run id")
         if not (a.feature and a.branch):
             raise Fail("run init needs --id --feature --branch")
+        gate = None  # C5: check + the approved gate run BEFORE the lock, before any local write
+        if a.plan:
+            gate = plan_tool("check", a.plan)
+            if gate.get("status") != "approved" and not a.force:
+                raise Fail(f"plan {gate.get('plan') or a.plan} is {gate.get('status')!r}, not approved; "
+                           "approve it (mk-plan.py set --status approved) or pass --force")
         with st.locked():
             if os.path.exists(os.path.join(st.run_dir(rid), "run.json")):
                 raise Fail(f"run {rid} exists")
+            cur = None
+            if a.plan:  # the plan learns the run before the run learns its tasks (C5)
+                plan_tool("set", a.plan, "--status", "running")
+                plan_tool("add-run", a.plan, "--run", rid)
+                cur = plan_tool("parse", a.plan)  # sha AFTER set/add-run: no board ⚠ at birth
             os.makedirs(os.path.join(st.run_dir(rid), "tasks"), exist_ok=True)
             run = {"schema": SCHEMA, "id": rid, "feature": a.feature, "branch": a.branch, "plan": a.plan,
+                   "plan_id": cur.get("plan") if cur else None, "plan_sha": cur.get("sha") if cur else None,
+                   "plan_status": cur.get("status") if cur else None,
                    "status": "active", "stage": 0, "next": None, "waiting": None,
                    "started": now(), "ended": None, "updated": None, "tasks": [], "recent": []}
             st.event(run, "note", f"run init: {a.feature} on {a.branch}")
+            if cur and gate.get("status") != "approved":
+                st.event(run, "note", f"plan {run['plan_id']} was {gate.get('status')!r}, not approved; "
+                                      "run init forced with --force")
             st.save(run)
-        return {"ok": True, "run": run}
+            warnings = list(gate.get("warnings") or []) if gate else []
+            for ph in (cur.get("phases") or []) if cur else []:
+                pid = str(ph.get("id") or "")
+                _, w = add_task(st, run, pid, ph.get("title") or pid, ph.get("wave"),
+                                ph.get("deps") or [], ph.get("owned") or [], None, a.by,
+                                {"plan_phase": pid, "route": ph.get("route") or None,
+                                 "lane_group": ph.get("lane_group") or None})
+                warnings += w
+                for c in ph.get("tasks") or []:
+                    _, w = add_task(st, run, str(c.get("id") or ""), c.get("title") or c.get("id"),
+                                    ph.get("wave"), [], c.get("owned") or [], pid, a.by,
+                                    {"plan_task": c.get("id")})
+                    warnings += w
+        return {"ok": True, "run": run, **({"warnings": warnings} if warnings else {})}
     a.run = a.run or getattr(a, "pos_id", None)
     if a.action == "get":
         return {"ok": True, "run": st.load(a.run)}
@@ -586,6 +677,67 @@ def set_run_status(st, run, status):
         st.event(run, "note", f"run {run['status']} → {status}")
         run["status"] = status
         run["ended"] = None if status == "active" else (run.get("ended") or now())
+        if status == "done" and run.get("plan_id") and run.get("plan"):
+            plan_done_if_last(st, run)  # C5: best-effort, never fatal
+
+
+def plan_done_if_last(st, run):
+    """The LAST run id in the plan's runs list finished → the plan goes `done` (C5). Best-effort:
+    an unreadable plan or a failing plan tool never fails the `run set` around it."""
+    try:
+        cur = plan_tool("parse", run["plan"])
+        runs = [str(x) for x in cur.get("runs") or []]
+        if runs and runs[-1].lower() == run["id"].lower():
+            plan_tool("set", run["plan"], "--status", "done")
+            run["plan_status"] = "done"
+            st.event(run, "note", f"plan {run['plan_id']} done (last run finished)")
+    except Exception:
+        pass
+
+
+def add_task(st, run, tid, title, wave, deps, owned, parent, by, extra=None):
+    """The ONE task-add path (`task add`, `run init --plan`, `plan sync --apply`): validate, append,
+    save (rollup, ready, board, other runs included). `extra` rides on the new task (C4 plan links).
+    -> (task, warnings)"""
+    tid = check_id(tid, "task id")
+    clash = [t["id"] for t in run["tasks"] if t["id"].lower() == tid.lower()]
+    if clash:  # case-insensitive: task folders share one path on APFS
+        raise Fail(f"task {tid} exists" + (f" as {clash[0]}" if clash[0] != tid else ""))
+    if not title:
+        raise Fail("task add needs --title")
+    deps, owned, warnings = list(deps or []), list(owned or []), []
+    deps = [st.norm_dep(run, tid, d) for d in deps]  # stored id case; a self-dep fails here
+    for d in deps:
+        if st.dep_status(run, d) is None:
+            warnings.append(f"dep {d} not found (yet)")
+    if parent:
+        p = find_task(run, parent)
+        if p["status"] in DEP_MET:
+            raise Fail(f"--parent onto {p['id']} ({p['status']}) is refused: status rolls up from children")
+    active, _ = st.active_runs(run)
+    own = {x["id"] for x in ancestor_chain(run, parent)}  # our own parent chain: not a collision
+    for o in active:
+        same = o.get("id") == run.get("id")
+        for x in o.get("tasks") or []:
+            ref = x.get("id") if same else f"{o.get('id')}:{x.get('id')}"
+            if not x.get("id") or x.get("status") in DEP_MET or ref in deps:
+                continue
+            if same and x.get("id") in own:
+                continue  # a parent owns its children's globs; overlapping them is the plan
+            hits = [f"{g} ~ {h}" for g in owned for h in x.get("owned") or [] if globs_overlap(g, h)]
+            if hits:
+                warnings.append(f"owned overlaps {ref} ({x.get('status')}): {', '.join(hits)}; "
+                                f"consider --deps {ref}")
+    t = {"id": tid, "title": title, "wave": wave, "deps": deps, "owned": owned, "parent": parent,
+         "ready": False, "status": "planned", "agent": None, "model": None, "effort": None, "lane": None,
+         "pane": None, "branch": None, "workspace": None, "slot": None,
+         "last_commit": None, "gates": None, "verdict": None, "round": 0, "rounds": [],
+         "created": now(), "updated": now(), **(extra or {})}
+    run["tasks"].append(t)
+    st.event(run, "transition", f"task added: {title}", task=tid, to="planned", by=by)
+    st.save(run, t, by)
+    warnings += st.refresh_others(run, by)  # their boards show "blocks"; ready stays correct
+    return t, warnings
 
 
 def cmd_task(a, st):
@@ -595,44 +747,7 @@ def cmd_task(a, st):
             t = find_task(run, a.task)
             return {"ok": True, "task": t, "dir": st.task_dir(run["id"], t["id"])}
         if a.action == "add":
-            tid = check_id(a.id, "task id")
-            clash = [t["id"] for t in run["tasks"] if t["id"].lower() == tid.lower()]
-            if clash:  # case-insensitive: task folders share one path on APFS
-                raise Fail(f"task {tid} exists" + (f" as {clash[0]}" if clash[0] != tid else ""))
-            if not a.title:
-                raise Fail("task add needs --title")
-            deps, owned, warnings = csv(a.deps), csv(a.owned), []
-            deps = [st.norm_dep(run, tid, d) for d in deps]  # stored id case; a self-dep fails here
-            for d in deps:
-                if st.dep_status(run, d) is None:
-                    warnings.append(f"dep {d} not found (yet)")
-            if a.parent:
-                p = find_task(run, a.parent)
-                if p["status"] in DEP_MET:
-                    raise Fail(f"--parent onto {p['id']} ({p['status']}) is refused: status rolls up from children")
-            active, _ = st.active_runs(run)
-            own = {x["id"] for x in ancestor_chain(run, a.parent)}  # our own parent chain: not a collision
-            for o in active:
-                same = o.get("id") == run.get("id")
-                for x in o.get("tasks") or []:
-                    ref = x.get("id") if same else f"{o.get('id')}:{x.get('id')}"
-                    if not x.get("id") or x.get("status") in DEP_MET or ref in deps:
-                        continue
-                    if same and x.get("id") in own:
-                        continue  # a parent owns its children's globs; overlapping them is the plan
-                    hits = [f"{g} ~ {h}" for g in owned for h in x.get("owned") or [] if globs_overlap(g, h)]
-                    if hits:
-                        warnings.append(f"owned overlaps {ref} ({x.get('status')}): {', '.join(hits)}; "
-                                        f"consider --deps {ref}")
-            t = {"id": tid, "title": a.title, "wave": a.wave, "deps": deps, "owned": owned, "parent": a.parent,
-                 "ready": False, "status": "planned", "agent": None, "model": None, "effort": None, "lane": None,
-                 "pane": None, "branch": None, "workspace": None, "slot": None,
-                 "last_commit": None, "gates": None, "verdict": None, "round": 0, "rounds": [],
-                 "created": now(), "updated": now()}
-            run["tasks"].append(t)
-            st.event(run, "transition", f"task added: {a.title}", task=tid, to="planned", by=a.by)
-            st.save(run, t, a.by)
-            warnings += st.refresh_others(run, a.by)  # their boards show "blocks"; ready stays correct
+            t, warnings = add_task(st, run, a.id, a.title, a.wave, csv(a.deps), csv(a.owned), a.parent, a.by)
             return {"ok": True, "task": t, **({"warnings": warnings} if warnings else {})}
         t = find_task(run, a.task)
         cur = t["rounds"][-1] if t["rounds"] else None
@@ -681,6 +796,116 @@ def cmd_task(a, st):
             return {"ok": True, "task": t["id"], "round": t["round"], "kind": a.kind,
                     **{k: os.path.join(d, f"{k}-r{t['round']}.md") for k in ("brief", "report", "review")}}
         return {"ok": True, "task": t, **({"warnings": warnings} if warnings else {})}
+
+
+def plan_field_diffs(t, src, child):
+    """Which of title/wave/owned/deps differ between a stored task and its plan entry (P2.2).
+    Deps compare case-insensitively (ids do); owned compares exactly (paths)."""
+    d = []
+    if (t.get("title") or "") != str(src.get("title") or ""):
+        d.append("title")
+    if not child and t.get("wave") != src.get("wave"):
+        d.append("wave")
+    if [str(x).lower() for x in t.get("deps") or []] != [str(x).lower() for x in src.get("deps") or []]:
+        d.append("deps")
+    if [str(x) for x in t.get("owned") or []] != [str(x) for x in src.get("owned") or []]:
+        d.append("owned")
+    return d
+
+
+def cmd_plan(a, st):
+    if a.action != "sync":
+        raise Fail(f"unknown plan action {a.action!r}")
+    with st.locked():
+        run = st.load(a.run)
+        if not (run.get("plan_id") and run.get("plan")):
+            raise Fail(f"run {run['id']} has no plan link (run init --plan)")
+        cur = plan_tool("parse", run["plan"])
+        changes, warnings, adds, updates = [], [], [], []
+        ph_by = {str(t.get("plan_phase")).lower(): t for t in run["tasks"] if t.get("plan_phase")}
+        ck_by = {str(t.get("plan_task")).lower(): t for t in run["tasks"] if t.get("plan_task")}
+        for ph in cur.get("phases") or []:
+            pid = str(ph.get("id") or "")
+            t = ph_by.get(pid.lower())
+            if t is None:
+                adds.append(("phase", ph, None))
+                changes.append(f"phase {pid}: new → add")
+            if t is not None:
+                d = plan_field_diffs(t, ph, False)
+                if d:
+                    if t.get("status") in ("planned", "routed"):
+                        updates.append((t, ph, d, False))
+                        changes.append(f"phase {pid}: {', '.join(d)} changed → update")
+                    else:
+                        warnings.append(f"phase {pid} is {t.get('status')} (started): "
+                                        f"{', '.join(d)} changed in the plan; not updated")
+            for c in ph.get("tasks") or []:
+                cid = str(c.get("id") or "")
+                ct = ck_by.get(cid.lower())
+                if ct is None:
+                    adds.append(("task", c, ph))
+                    changes.append(f"task {cid}: new → add")
+                else:
+                    d = plan_field_diffs(ct, c, True)
+                    if d:
+                        if ct.get("status") in ("planned", "routed"):
+                            updates.append((ct, c, d, True))
+                            changes.append(f"task {cid}: {', '.join(d)} changed → update")
+                        else:
+                            warnings.append(f"task {cid} is {ct.get('status')} (started): "
+                                            f"{', '.join(d)} changed in the plan; not updated")
+        seen_ph = {str(ph.get("id")).lower() for ph in cur.get("phases") or []}
+        seen_ck = {str(c.get("id")).lower() for ph in cur.get("phases") or [] for c in ph.get("tasks") or []}
+        for t in run["tasks"]:  # removed from the plan: warned, NEVER deleted
+            if t.get("plan_phase") and str(t["plan_phase"]).lower() not in seen_ph:
+                warnings.append(f"phase {t['plan_phase']} removed from the plan; task {t['id']} kept")
+            if t.get("plan_task") and str(t["plan_task"]).lower() not in seen_ck:
+                warnings.append(f"task {t['plan_task']} removed from the plan; task {t['id']} kept")
+        if not a.apply:
+            return {"ok": True, "run": run["id"], "plan": run["plan_id"], "apply": False,
+                    "sha": cur.get("sha"), "changes": changes, "warnings": warnings}
+        have = {t["id"].lower() for t in run["tasks"]}  # pre-flight: fail before anything is written
+        for _, src, _ in adds:
+            tid = str(src.get("id") or "")
+            if not tid or tid.lower() in have:
+                raise Fail(f"plan adds task {tid!r} but a task with that id exists; rename first")
+        for t, src, d, child in updates:
+            if not child and "deps" in d:  # a self-dep in the new deps fails before any write
+                [st.norm_dep(run, t["id"], x) for x in src.get("deps") or []]
+        st.sink_run, st.sunk = run["id"], 0
+        try:
+            for kind, src, ph in adds:
+                if kind == "phase":
+                    add_task(st, run, str(src.get("id") or ""), src.get("title") or src.get("id"),
+                             src.get("wave"), src.get("deps") or [], src.get("owned") or [], None, a.by,
+                             {"plan_phase": src.get("id"), "route": src.get("route") or None,
+                              "lane_group": src.get("lane_group") or None})
+                else:
+                    add_task(st, run, str(src.get("id") or ""), src.get("title") or src.get("id"),
+                             ph.get("wave"), [], src.get("owned") or [], str(ph.get("id") or ""), a.by,
+                             {"plan_task": src.get("id")})
+            for t, src, d, child in updates:
+                t["title"] = str(src.get("title") or t["title"])
+                if not child:
+                    if "wave" in d:
+                        t["wave"] = src.get("wave")
+                    if "deps" in d:
+                        t["deps"] = [st.norm_dep(run, t["id"], x) for x in src.get("deps") or []]
+                if "owned" in d:
+                    t["owned"] = list(src.get("owned") or [])
+                t["updated"] = now()
+                st.save(run, t, a.by)
+            run["plan_sha"] = cur.get("sha")
+            run["plan_status"] = cur.get("status")
+            st.save(run)
+        finally:
+            sunk = st.sunk
+            st.sink_run, st.sunk = None, 0
+        st.event(run, "note", f"plan sync: {len(adds)} added, {len(updates)} updated"
+                 + (f", {sunk} task events suppressed" if sunk else ""))
+        st.save(run)
+    return {"ok": True, "run": run["id"], "plan": run["plan_id"], "apply": True, "sha": cur.get("sha"),
+            "changes": changes, "warnings": warnings}
 
 
 def cmd_event(a, st):
@@ -768,6 +993,7 @@ def build_parser():
         run.choices[name].add_argument("pos_id", nargs="?")
     r = run.choices["init"]
     r.add_argument("--feature"), r.add_argument("--branch"), r.add_argument("--plan")
+    r.add_argument("--force", action="store_true")  # run init --plan: init an unapproved plan
     run.choices["set"].add_argument("--next")
     run.choices["set"].add_argument("--status", choices=("active", "done"))
     run.choices["stage"].add_argument("n", type=int, nargs="?")
@@ -785,6 +1011,11 @@ def build_parser():
     t.add_argument("task")
     for t in task.choices.values():
         t.set_defaults(func=cmd_task)
+
+    pn = sub.add_parser("plan").add_subparsers(dest="action", required=True)
+    ps = pn.add_parser("sync", parents=[data_p, run_p])
+    ps.add_argument("--apply", action="store_true")  # default: dry run, nothing written
+    ps.set_defaults(func=cmd_plan)
 
     e = sub.add_parser("event", parents=[data_p, run_p])
     e.add_argument("--task"), e.add_argument("--type", required=True), e.add_argument("--text", required=True)
@@ -827,6 +1058,47 @@ def main(argv):
 
 # ---------- self-test ----------
 
+# The C2 surface of mk-plan.py as a fixture over a JSON "plan file" — the self-test must not need
+# P1's real code (it may not exist yet in this worktree).
+PLAN_FIXTURE = '''#!/usr/bin/env python3
+import hashlib, json, sys
+cmd, path = sys.argv[1], sys.argv[2]
+try:
+    db = json.load(open(path))
+except OSError:
+    print(json.dumps({"ok": False, "errors": [f"plan file not found: {path}"]})); sys.exit(3)
+if cmd in ("parse", "check"):
+    if cmd == "check" and db.get("check_error"):
+        print(json.dumps({"ok": False, "errors": ["line 4: " + db["check_error"]]})); sys.exit(2)
+    extra = {"warnings": db.get("warnings", [])} if cmd == "check" else {}
+    print(json.dumps({"ok": True, "plan": db.get("plan"), "status": db.get("status"),
+                      "runs": db.get("runs", []), "sha": hashlib.sha256(open(path, "rb").read()).hexdigest(),
+                      "gates": {}, "phases": db.get("phases", []), **extra}))
+elif cmd == "set":
+    db["status"] = sys.argv[sys.argv.index("--status") + 1]
+    json.dump(db, open(path, "w"), indent=1)
+    print(json.dumps({"ok": True, "status": db["status"]}))
+elif cmd == "add-run":
+    db.setdefault("runs", []).append(sys.argv[sys.argv.index("--run") + 1])
+    json.dump(db, open(path, "w"), indent=1)
+    print(json.dumps({"ok": True, "runs": db["runs"]}))
+else:
+    print(json.dumps({"ok": False, "errors": [f"bad command {cmd}"]})); sys.exit(2)
+'''
+
+# a plan with 2 phases and 3 tasks (P2.1 makes the third child task)
+PLAN_BASE = {"plan": "tplan", "status": "approved", "runs": [], "phases": [
+    {"id": "P1", "title": "Phase one", "wave": 1, "deps": [], "owned": ["scripts/a.py"],
+     "route": "codex gpt-5 high", "size": "standard", "risk": "reversible", "review": "light",
+     "qa": [], "commit": "feat: a", "subagents": False, "lane_group": "A", "tasks": [
+        {"id": "P1.1", "title": "First", "acceptance": "a1", "refs": [], "subagent": False,
+         "owned": ["scripts/a.py"]},
+        {"id": "P1.2", "title": "Second", "acceptance": "a2", "refs": [], "subagent": False, "owned": []}]},
+    {"id": "P2", "title": "Phase two", "wave": 1, "deps": ["P1"], "owned": ["docs/x.md"],
+     "route": "", "size": "standard", "risk": "reversible", "review": "light", "qa": [],
+     "commit": "feat: b", "subagents": False, "lane_group": "A", "tasks": [
+        {"id": "P2.1", "title": "Third", "acceptance": "a3", "refs": [], "subagent": False, "owned": []}]}]}
+
 def self_test():
     import shutil, subprocess
     tmp = tempfile.mkdtemp(prefix="mk-state-test-")
@@ -844,7 +1116,9 @@ def self_test():
 
     try:
         rdir = os.path.join(data, "runs", "r1")
-        out = mk("run", "init", "--id", "r1", "--feature", "Feat", "--branch", "feat/x", "--plan", "plans/f.md")
+        # run init --plan now runs the plan tool (check/approved) — plans/f.md does not exist and
+        # no MK_PLAN_CMD is set here, so r1 is a plan-less run; plan links get their own block below
+        out = mk("run", "init", "--id", "r1", "--feature", "Feat", "--branch", "feat/x")
         assert out["ok"] and out["run"]["status"] == "active"
         for f in ("run.json", "events.jsonl", "board.md"):
             assert os.path.exists(os.path.join(rdir, f)), f
@@ -1248,6 +1522,153 @@ def self_test():
         assert sk("task", "add", "--id", "BD", "--title", "bad dep", "--deps", "baddep:X",
                   "--run", "good")["warnings"][0].startswith("dep baddep:X not found"), open(sick).read()
         assert sk("task", "add", "--id", "N", "--title", "n", "--owned", "src/*.ts", "--run", "good")["ok"]
+        # plans: run init --plan, plan sync, link fields, board ⚠, last-run done — own data dir,
+        # the fixture plan tool in $MK_PLAN_CMD (never P1's real code)
+        fix = os.path.join(tmp, "mkplan-fix.py")
+        with open(fix, "w") as f:
+            f.write(PLAN_FIXTURE)
+        penv = dict(env, MK_PLAN_CMD=" ".join([sys.executable, fix]))
+        pd = os.path.join(tmp, "plans")
+        pk = lambda *x, code=0: mk(*x, "--data", pd, code=code, data_arg=False, e=penv)
+        pfile = os.path.join(tmp, "tplan.json")
+        putdb = lambda db: json.dump(db, open(pfile, "w"), indent=1)
+
+        putdb({**PLAN_BASE, "status": "draft"})
+        e = pk("run", "init", "--id", "pr1", "--feature", "P", "--branch", "b", "--plan", pfile, code=2)
+        assert "not approved" in e["error"] and not os.path.exists(os.path.join(pd, "runs", "pr1")), e
+        putdb({**PLAN_BASE, "status": "approved", "check_error": "dep cycle"})
+        e = pk("run", "init", "--id", "pr1", "--feature", "P", "--branch", "b", "--plan", pfile,
+               "--force", code=2)
+        assert "dep cycle" in e["error"], e  # a failing check is refused even with --force
+        putdb({**PLAN_BASE, "status": "approved"})
+        out = pk("run", "init", "--id", "pr1", "--feature", "Plans", "--branch", "mk/plans", "--plan", pfile)
+        run = out["run"]
+        assert run["plan_id"] == "tplan" and run["plan_status"] == "running"
+        assert run["plan_sha"] == file_sha(pfile)  # from the parse AFTER set/add-run: no ⚠ at birth
+        db = json.load(open(pfile))
+        assert db["status"] == "running" and db["runs"] == ["pr1"]
+        assert [t["id"] for t in run["tasks"]] == ["P1", "P1.1", "P1.2", "P2", "P2.1"], run["tasks"]
+        t = {x["id"]: x for x in run["tasks"]}
+        assert t["P1"]["plan_phase"] == "P1" and t["P1"]["route"] == "codex gpt-5 high"
+        assert t["P1"]["lane_group"] == "A" and t["P1"]["parent"] is None
+        assert t["P2"]["deps"] == ["P1"] and t["P2"]["plan_phase"] == "P2"
+        assert t["P1.1"]["plan_task"] == "P1.1" and t["P1.1"]["parent"] == "P1"
+        assert t["P1.1"]["owned"] == ["scripts/a.py"] and t["P2.1"]["parent"] == "P2"
+        assert os.path.exists(os.path.join(pd, "runs", "pr1", "tasks", "P1.1", "task.json"))
+        idx = {r["id"]: r for r in json.load(open(os.path.join(pd, "runs", "index.json")))}
+        assert idx["pr1"]["plan"] == "tplan"
+        board = open(os.path.join(pd, "runs", "pr1", "board.md")).read()
+        assert "plan: `tplan` · running · sha `" in board and "⚠" not in board, board
+
+        # plan-less runs and tasks carry no plan links (C4), in run.json and the index
+        r1run = mk("run", "get", "--id", "r1")["run"]
+        assert r1run["plan_id"] is None and r1run["plan_sha"] is None and r1run["plan_status"] is None
+        assert all(x.get("plan_phase") is None and x.get("plan_task") is None for x in r1run["tasks"])
+        assert {r["id"]: r for r in mk("run", "list")["runs"]}["r1"]["plan"] is None
+
+        # --force init on an unapproved plan: allowed, and an event says so
+        db["status"] = "draft"
+        putdb(db)
+        assert pk("run", "init", "--id", "pf1", "--feature", "F", "--branch", "b", "--plan", pfile,
+                  "--force")["ok"] is True
+        evs = [json.loads(x) for x in open(os.path.join(pd, "runs", "pf1", "events.jsonl"))]
+        assert any("not approved" in x["text"] and "--force" in x["text"] for x in evs), evs
+        pk("run", "archive", "--id", "pf1")
+
+        # a plan tool that cannot even run: refused before any local write
+        e = mk("run", "init", "--id", "px", "--feature", "F", "--branch", "b", "--plan", pfile, code=2,
+               e=dict(env, MK_PLAN_CMD=os.path.join(tmp, "nope.py")))
+        assert "cannot run" in e["error"] and not os.path.exists(os.path.join(data, "runs", "px")), e
+        # plan sync on a plan-less run is refused before the plan tool is called
+        assert "no plan link" in mk("plan", "sync", "--run", "r1", code=2)["error"]
+
+        # plan sync: dry run changes nothing; P1.1 started → P1 rolled up to building
+        pk("task", "set", "P1.1", "status=building")
+        db = json.load(open(pfile))
+        db["phases"][0]["title"] = "Phase one v2"  # started (building): warning only
+        db["phases"][0]["tasks"] = [x for x in db["phases"][0]["tasks"] if x["id"] != "P1.2"]  # P1.2 gone
+        db["phases"][0]["tasks"][0]["title"] = "First v2"  # started (building): warning only
+        db["phases"][1]["title"] = "Phase two v2"  # planned: update
+        db["phases"].append({"id": "P3", "title": "Phase three", "wave": 2, "deps": ["P2"], "owned": [],
+                             "route": "", "size": "standard", "risk": "reversible", "review": "light",
+                             "qa": [], "commit": "feat: c", "subagents": False, "lane_group": "B",
+                             "tasks": [{"id": "P3.1", "title": "New one", "acceptance": "a4", "refs": [],
+                                        "subagent": False, "owned": []}]})
+        putdb(db)
+        runjson = os.path.join(pd, "runs", "pr1", "run.json")
+        boardp = os.path.join(pd, "runs", "pr1", "board.md")
+        board = open(pk("render")["board"]).read()
+        assert "⚠ plan file changed since run start" in board, board  # the file moved under the run
+        before_run, before_board = open(runjson).read(), open(boardp).read()
+        out = pk("plan", "sync")
+        assert out["apply"] is False and open(runjson).read() == before_run
+        assert open(boardp).read() == before_board  # the dry run does not even re-render
+        assert any("phase P2" in c and "title" in c for c in out["changes"]), out["changes"]
+        assert any("phase P3" in c and "new" in c for c in out["changes"])
+        assert any("task P3.1" in c and "new" in c for c in out["changes"])
+        wtxt = out["warnings"]
+        assert any(w.startswith("phase P1 is building") for w in wtxt), wtxt
+        assert any(w.startswith("task P1.1 is building") for w in wtxt), wtxt
+        assert any("P1.2" in w and "removed" in w and "kept" in w for w in wtxt), wtxt
+
+        # --apply: adds through the add path, updates in place, ONE event, new sha stored
+        evpath = os.path.join(pd, "runs", "pr1", "events.jsonl")
+        n_ev = len(open(evpath).readlines())
+        out = pk("plan", "sync", "--apply")
+        assert out["apply"] is True
+        newev = [json.loads(x) for x in open(evpath)][n_ev:]
+        assert len(newev) == 1 and newev[0]["type"] == "note" and "plan sync" in newev[0]["text"], newev
+        run = pk("run", "get", "--id", "pr1")["run"]
+        t = {x["id"]: x for x in run["tasks"]}
+        assert "P3" in t and t["P3"]["plan_phase"] == "P3" and t["P3"]["lane_group"] == "B"
+        assert "P3.1" in t and t["P3.1"]["parent"] == "P3" and t["P3.1"]["plan_task"] == "P3.1"
+        assert os.path.exists(os.path.join(pd, "runs", "pr1", "tasks", "P3.1", "task.json"))
+        assert t["P2"]["title"] == "Phase two v2"  # planned: updated
+        assert t["P1"]["title"] == "Phase one" and t["P1.1"]["title"] == "First"  # started: untouched
+        assert "P1.2" in t  # removed from the plan: never deleted
+        assert run["plan_sha"] == file_sha(pfile)
+        board = open(pk("render")["board"]).read()
+        assert "⚠" not in board and "Phase two v2" in board, board
+
+        # last run done → plan done; a non-last run finishing leaves the plan alone
+        putdb({**json.load(open(pfile)), "status": "running"})
+        pk("run", "init", "--id", "pr3", "--feature", "F3", "--branch", "b3", "--plan", pfile, "--force")
+        assert json.load(open(pfile))["runs"] == ["pr1", "pf1", "pr3"]
+        pk("run", "set", "--id", "pr1", "--status", "done")
+        assert json.load(open(pfile))["status"] == "running"  # pr1 is not the last run
+        assert pk("run", "get", "--id", "pr1")["run"]["plan_status"] == "running"
+        pk("run", "set", "--id", "pr3", "--status", "done")
+        assert json.load(open(pfile))["status"] == "done"  # the last run finished
+        r3 = pk("run", "get", "--id", "pr3")["run"]
+        assert r3["plan_status"] == "done"
+        evs = [json.loads(x) for x in open(os.path.join(pd, "runs", "pr3", "events.jsonl"))]
+        assert any("plan tplan done" in x["text"] for x in evs), evs
+
+        # best-effort: a missing plan file never fails run set done or render
+        pfile2 = os.path.join(tmp, "tplan2.json")
+        json.dump({"plan": "t2", "status": "running", "runs": [], "phases": []}, open(pfile2, "w"))
+        pk("run", "init", "--id", "pr4", "--feature", "F", "--branch", "b", "--plan", pfile2, "--force")
+        os.unlink(pfile2)
+        out = pk("run", "set", "--id", "pr4", "--status", "done")
+        assert out["ok"] is True and out["run"]["status"] == "done", out
+        assert out["run"]["plan_status"] == "running"  # unchanged: the parse failed, swallowed
+        os.unlink(pfile)
+        board = open(pk("render", "--run", "pr1")["board"]).read()
+        assert "⚠" not in board and "plan: `tplan`" in board, board  # unreadable file: no ⚠, no crash
+
+        # legacy path-only plan link keeps the plain path line; no plan at all → no line
+        lg = os.path.join(tmp, "legacy")
+        mk("run", "init", "--id", "l1", "--feature", "L", "--branch", "b", "--data", lg,
+           data_arg=False, e=env)
+        lb = os.path.join(lg, "runs", "l1", "board.md")
+        assert "plan:" not in open(lb).read()
+        lr = os.path.join(lg, "runs", "l1", "run.json")
+        r = json.load(open(lr))
+        r["plan"] = "plans/legacy.md"
+        write_json(lr, r)
+        board = open(mk("render", "--data", lg, data_arg=False, e=env)["board"]).read()
+        assert "plan: `plans/legacy.md`" in board and "sha" not in board.split("\n")[2], board
+
         # no prefix matching anywhere: abbreviated flags are unknown arguments
         for bad in (["task", "set", "T", "--fo", "status=building"], ["task", "set", "T", "--b=evil"],
                     ["--dat", os.path.join(tmp, "sick"), "run", "list"]):
