@@ -9,9 +9,12 @@ plan: `<plan path>`
 
 ## Tasks
 
-| Task | Title | Wave | Status | Agent | Model · effort | Round | Lane | Last commit | Verdict |
-|---|---|---|---|---|---|---|---|---|---|
-| P1 | State core | 1 | building | codex | gpt-6.1-sol · high | 1 | ../repo-worktree-p1 | — | — |
+| Task | Title | Wave | Status | Deps | Agent | Model · effort | Round | Lane | Last commit | Verdict |
+|---|---|---|---|---|---|---|---|---|---|---|
+| P1 | State core | 1 | building | P0 ✓ | codex | gpt-6.1-sol · high | 1 | ../repo-mk-1 · mk/mk-p1/p1 · slot 1 · mk:repo:1 | 9f2c1ab | approve |
+
+The Lane cell is the lane's path plus, when `mk-lane.py acquire` set them, its `branch`, `slot` and
+`workspace`; with none of them set it stays the bare path (`—` when there is no lane).
 
 ## Recent events (last 15)
 
