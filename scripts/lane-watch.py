@@ -14,7 +14,8 @@ Done = latest commit subject matches REGEX (searched in the bare subject, so `^f
        limit / dev-server string in the same pane.
 "<PHASE> BLOCKED: <question>" in the pane → BLOCKED with the question (the later of DONE / BLOCKED wins).
 A herdr ERROR is retried; the watcher exits ERROR after 3 in a row, or on any crash (still one JSON line).
-Idle/done agent, not Done, and no file/commit change for --stall-min since watch start → STALL.
+Idle/done/working agent, not Done, and no file/commit/pane change for --stall-min since watch start → STALL
+(lane-watch decides STALL itself; lane-health's file-only STALL is not used here).
 Pane output that changed since the last poll (digits ignored, so a ticking timer is not activity) counts as
 activity too: a builder running tests or a revert/re-apply proof without touching files is not STALL.
 With --then-send, on DONE it dispatches "Read and follow <BRIEF_PATH> exactly ..." to the same agent
@@ -25,7 +26,7 @@ QUOTA→quota, STALL→stalled, PROVIDER→provider, BLOCKED→blocked) when the
 Exit states (one JSON line): DONE | DONE_SENT | QUOTA | PROVIDER | STALL | BLOCKED | DEV_SERVER | ERROR | WATCH_EXPIRED.
 Run in the background (30 min default; foreground calls must stay under their 10-min timeout); re-arm on WATCH_EXPIRED.
 """
-import importlib.util, json, os, re, subprocess, sys, time
+import importlib.util, json, math, os, re, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ASK = os.path.expanduser("~/.claude/skills/herdr/scripts/herdr-ask.py")
@@ -85,9 +86,9 @@ def decide(h, subj, rx, report_ok, text, phase, stall_min):
         return "BLOCKED", [f"{phase} BLOCKED: {question}"]
     if h["state"] in FAIL_STATES:
         return h["state"], h.get("evidence") or []
-    if h["state"] == "STALL":
-        return "STALL", h.get("evidence") or []
-    idle = h.get("last_change_min")
+    idle = h.get("last_change_min")  # since the last file/commit change OR pane activity (watch() passes it)
+    if status == "working" and idle is not None and idle >= stall_min:
+        return "STALL", [f"working but no file/commit/pane change for {idle} min"]
     if status in ("idle", "done") and idle is not None and idle >= stall_min:
         missing = [n for n, ok in (("matching commit", commit_ok), ("report", report_ok),
                                    (f"{phase} DONE token", done_tok or not phase)) if not ok]
@@ -135,11 +136,12 @@ def watch(a):
     active, last_fp = start, None  # last time the pane showed new output
     while True:
         subj = commit_subject(lane)
-        h = lh.check(agent, lane, kind, stall_min, active, marker)
+        # math.inf: lane-health judges only files/commits; STALL is decided in decide() with pane activity
+        h = lh.check(agent, lane, kind, math.inf, active, marker)
         fp = pane_fingerprint(h.get("text", ""))
         if last_fp is not None and fp != last_fp:  # pane moved: idle time counts from now, re-check with it
             active = time.time()
-            h = lh.check(agent, lane, kind, stall_min, active, marker)
+            h = lh.check(agent, lane, kind, math.inf, active, marker)
         last_fp = fp
         report_ok = not report or os.path.exists(os.path.join(lane, report))
         state, ev = decide(h, subj, rx, report_ok, h.get("text", ""), phase, stall_min)
@@ -192,13 +194,15 @@ def self_test():
     # health failures pass through
     for s in FAIL_STATES:
         assert decide({**ok, "state": s, "evidence": ["x"]}, other, rx, True, "", None, 10) == (s, ["x"])
-    assert decide({**ok, "state": "STALL", "agent_status": "working"}, other, rx, True, "", None, 10)[0] == "STALL"
+    # working agent: STALL only from lane-watch's own idle (files/commits/pane); lane-health's STALL is ignored
+    assert decide({**ok, "state": "STALL", "agent_status": "working"}, other, rx, True, "", None, 10)[0] is None
+    st, ev = decide({**ok, "agent_status": "working", "last_change_min": 11}, other, rx, True, "", None, 10)
+    assert st == "STALL" and "pane" in ev[0]
     # new STALL: idle/done, no matching commit, no change for stall_min since watch start
     st, ev = decide({**ok, "last_change_min": 11}, other, rx, True, "", None, 10)
     assert st == "STALL" and "matching commit" in ev[0]
     assert decide({**ok, "agent_status": "done", "last_change_min": 11}, other, rx, True, "", None, 10)[0] == "STALL"
     assert decide({**ok, "last_change_min": 9}, other, rx, True, "", None, 10)[0] is None
-    assert decide({**ok, "agent_status": "working", "last_change_min": 11}, other, rx, True, "", None, 10)[0] is None
     st, ev = decide({**ok, "last_change_min": 11}, good, rx, True, "", "P1", 10)  # committed but no token
     assert st == "STALL" and "P1 DONE token" in ev[0] and "matching commit" not in ev[0]
     # pane activity: digit-only changes (timers) are not activity; new output lines are
@@ -269,6 +273,25 @@ def self_test():
         out = cli("--commit-grep", "(", "--poll", "0.1", "--task", "P3", "--data", data)  # bad regex → ERROR
         assert out["state"] == "ERROR" and "missing )" in out["evidence"][0] and out["state_written"] is True, out
         assert cli("--commit-grep", "x", "--task", "P3", code=1).returncode == 1  # --task without --data
+        # working agent, no file/commit change: a pane that keeps moving is never STALL (lesson 37); a frozen one is
+        work_bin = os.path.join(tmp, "workbin")
+        os.makedirs(work_bin)
+        grow = os.path.join(tmp, "grow.txt")
+        open(grow, "w").write("")
+        with open(os.path.join(work_bin, "herdr"), "w") as f:
+            f.write('#!/bin/sh\nif [ "$2" = get ]; then echo \'{"result":{"agent":{"agent_status":"working"}}}\'; '
+                    # like real herdr: a working full-screen agent refuses history reads; only --source visible
+                    'elif [ "$5" != visible ]; then echo \'{"error":{"code":"agent_not_idle"}}\'; '
+                    f'else echo "> Read and follow brief-r3.md"; cat "{grow}"; '
+                    f'if [ -n "$MK_GROW" ]; then echo thinking >> "{grow}"; fi; fi\n')
+        os.chmod(os.path.join(work_bin, "herdr"), 0o755)
+        for grows, want in ((True, "WATCH_EXPIRED"), (False, "STALL")):
+            e2 = dict(env, PATH=work_bin + os.pathsep + os.environ["PATH"], **({"MK_GROW": "1"} if grows else {}))
+            r = subprocess.run([sys.executable, __file__, "--lane", lane, "--agent", "w1", "--commit-grep", "nomatch",
+                                "--prompt-marker", "Read and follow brief-r3.md", "--poll", "0.1",
+                                "--stall-min", "0.02", "--max-wait-min", "0.06"], env=e2, capture_output=True, text=True)
+            out = json.loads(r.stdout.strip().splitlines()[-1])
+            assert out["state"] == want, (grows, out)
         # lane-health CLI: QUOTA keyed by kind into $MATRIXKODER_HOME/usage.json, scope reported
         open(pane, "w").write("> Read and follow brief-r2.md\n■ You've hit your usage limit. Try again in 2 hours.\n")
         r = subprocess.run([sys.executable, os.path.join(HERE, "lane-health.py"), "--agent", "w1", "--lane", lane,

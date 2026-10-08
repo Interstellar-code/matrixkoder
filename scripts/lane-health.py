@@ -64,9 +64,14 @@ def find(obj, key):
 
 
 def pane_text(agent, lines=300):
-    r = subprocess.run(["herdr", "agent", "read", agent, "--source", "recent-unwrapped", "--lines", str(lines)],
-                       capture_output=True, text=True)
-    return r.stdout if not r.stdout.lstrip().startswith('{"error"') else ""
+    """Recent pane history. A working full-screen agent (OpenCode, AGY) refuses history reads with
+    `agent_not_idle` (alternate-screen history needs scrolling), so read the visible screen instead.
+    Returning "" there made the pane look frozen and caused false STALLs (lesson 37)."""
+    for args in (["--source", "recent-unwrapped", "--lines", str(lines)], ["--source", "visible"]):
+        r = subprocess.run(["herdr", "agent", "read", agent, *args], capture_output=True, text=True)
+        if not r.stdout.lstrip().startswith('{"error"'):
+            return r.stdout
+    return ""
 
 
 def since_dispatch(text, marker=None):
