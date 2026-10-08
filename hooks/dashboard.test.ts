@@ -509,6 +509,22 @@ test('U3: opencode agent shows per-plan pools with n/a hints and project agents 
   expect(usageText).not.toContain('codex')
 })
 
+test('U3: a plan pool that reports usage shows bars, not its setup hint', { plugins: [worldFixtures] }, async ($, on) => {
+  const files = worldFiles()
+  files[`${DATA_DIR}/matrixkoder.yaml`] = U3_PROJECT_YAML
+  const usage = JSON.parse(makeU3Usage()) as { agents: { opencode: { pools: Record<string, unknown> } } }
+  usage.agents.opencode.pools.zai = { five_hour: { used_pct: 42, resets_at: new Date(NOW + 2 * 3600_000).toISOString() }, weekly: null, exhausted_until: null }
+  files['/fixtures/usage.json'] = files[USAGE_PATH] = JSON.stringify(usage)
+  mockFs(on, files)
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  const drawn = JSON.stringify(await ui.drawn())
+  expect(drawn).not.toContain('set the z.ai key in CodexBar')
+  expect(drawn).toContain('42%')
+  expect(drawn).toContain('sign in at ollama.com') // ollama still has no numbers
+})
+
 test('two session.start arm exactly one refresh timer', { plugins: [worldFixtures] }, async ($, on) => {
   const files = worldFiles()
   const fs = mockFs(on, files)

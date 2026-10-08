@@ -610,7 +610,9 @@ function usageRows(snap: MkSnapshot, compact: boolean): UsageRow[] {
     const t = Date.parse(until ?? '')
     return Number.isFinite(t) && now > 0 && t > now
   }
-  const poolHint = (name: string, error?: string): string | null => {
+  // a setup hint only for a pool with no numbers yet: once the plan reports usage, its bars show
+  const poolHint = (name: string, error?: string, hasData = false): string | null => {
+    if (hasData) return null
     if (POOL_HINT[name]) return POOL_HINT[name]
     if (error) return error
     return null
@@ -641,7 +643,7 @@ function usageRows(snap: MkSnapshot, compact: boolean): UsageRow[] {
       exhausted: isExhausted(p.exhausted_until),
       status: (p as { status?: string }).status,
       error: (p as { error?: string }).error,
-      hint: poolHint(compact ? pname.slice(0, 6) : pname, (p as { error?: string }).error),
+      hint: poolHint(compact ? pname.slice(0, 6) : pname, (p as { error?: string }).error, p.five_hour != null || p.weekly != null),
     }))
     // claude with sub-pools: single row layout, main row aggregates all models
     if (name === 'claude' && pools.length > 1) {
@@ -657,7 +659,7 @@ function usageRows(snap: MkSnapshot, compact: boolean): UsageRow[] {
         exhausted: isExhausted(a.exhausted_until),
         na: a.status === 'n/a',
         header: false,
-        sub: sub.map(s => ({ ...s, hint: poolHint(s.name, s.error) })),
+        sub: sub.map(s => ({ ...s, hint: poolHint(s.name, s.error, s.pct != null || s.weekPct != null) })),
       } as UsageRow]
     }
     // every other multi-pool agent: header row + one sub-row per pool
@@ -672,7 +674,7 @@ function usageRows(snap: MkSnapshot, compact: boolean): UsageRow[] {
         ...subs.map(s => ({
           name: `${name}:${s.name}`,
           label: `  └ ${compact ? s.name.slice(0, 6) : s.name}`,
-          hint: poolHint(s.name, s.error),
+          hint: poolHint(s.name, s.error, s.pct != null || s.weekPct != null),
           pct: s.pct,
           weekPct: s.weekPct,
           reset: s.reset,
