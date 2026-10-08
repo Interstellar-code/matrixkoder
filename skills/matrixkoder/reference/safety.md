@@ -33,8 +33,8 @@ Several sessions share one machine and one runtime. A session doing something ri
 
 ## Safety rules and why
 
-- **No `git checkout/stash/reset/clean/restore`, `--amend`, force-push.** Agents used them to "undo" and wiped other lanes' uncommitted work in a shared tree. Undo by an inverse edit; commit each verified phase.
-- **`git switch` inside a lane slot — the one narrow exception (user-approved 2026-10-08).** The ban above is untouched and holds for every agent, brief and prompt. Only the orchestrator, only through `mk-lane.py`, may switch a slot's branch, and only after `mk-lane.py` has verified the slot clean (`git status --porcelain --ignored` lists only disposable entries) and holding no commit unreachable from a branch/tag/remote. Never `--force`, never `-D`. Never written into a builder brief or prompt.
+- **No `git checkout/switch/stash/reset/clean/restore`, `--amend`, force-push** (one narrow orchestrator exception below). Agents used them to "undo" and wiped other lanes' uncommitted work in a shared tree. Undo by an inverse edit; commit each verified phase.
+- **`git switch` inside a lane slot — the one narrow exception (user-approved 2026-10-08).** The ban above still holds for every agent, brief and prompt. Only the orchestrator, only through `mk-lane.py`, may switch a slot's branch, and only after `mk-lane.py` has verified the slot clean (`git status --porcelain --ignored` lists only disposable entries) and holding no commit unreachable from a branch/tag/remote. Never `--force`, never `-D`. Never written into a builder brief or prompt.
 - **No dev servers, sidecars, deploys, restarts, background jobs in briefs.** An agent ran the dev command, which spawned a runtime sidecar, failed, and stopped mid-phase. Long-running processes belong to you.
 - **Agent reports are claims.** Reports said "all callers handled" when one screen still showed an empty library; `jev_gate` with real output caught it. Rerun gates yourself.
 - **Mocked tests are not evidence for routes.** A client called an API route that didn't exist; the tests mocked `fetch` and passed. For every new client call, find the server handler.
