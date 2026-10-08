@@ -153,9 +153,13 @@ class Store:
     def index(self):
         return read_json(self.index_path, [])
 
-    def load(self, rid=None):
+    def load(self, rid=None, task=None):
         if rid is None:
             active = [r["id"] for r in self.index() if r.get("status") == "active"]
+            if len(active) > 1 and task:  # several active runs: the one that owns the task wins
+                owners = [r for r in active if any(t["id"] == task for t in (read_json(
+                    os.path.join(self.run_dir(r), "run.json")) or {}).get("tasks", []))]
+                active = owners if len(owners) == 1 else active
             if len(active) != 1:
                 raise Fail(f"{len(active)} active runs {active}; pass --run/--id")
             rid = active[0]
@@ -350,7 +354,7 @@ def set_run_status(st, run, status):
 
 def cmd_task(a, st):
     with st.locked():
-        run = st.load(a.run)
+        run = st.load(a.run, getattr(a, "task", None))
         if a.action == "get":
             t = find_task(run, a.task)
             return {"ok": True, "task": t, "dir": st.task_dir(run["id"], t["id"])}
@@ -420,7 +424,7 @@ def cmd_event(a, st):
         if s is not None and s not in STATUSES:
             raise Fail(f"bad status {s!r}")
     with st.locked():
-        run = st.load(a.run)
+        run = st.load(a.run, a.task)
         if a.task:
             find_task(run, a.task)
         ev = st.event(run, a.type, a.text, task=a.task, frm=a.from_, to=a.to, by=a.by)
@@ -632,7 +636,10 @@ def self_test():
 
         # default-run selection: ambiguous with two active runs, fine again after archive
         mk("run", "init", "--id", "r2", "--feature", "Other", "--branch", "b2")
-        assert "active runs" in mk("task", "get", "T1", code=2)["error"]
+        assert mk("task", "get", "T1")["task"]["id"] == "T1"  # only r1 owns T1
+        mk("task", "add", "--id", "T1", "--title", "Clash", "--wave", "1", "--run", "r2")
+        assert "active runs" in mk("task", "get", "T1", code=2)["error"]  # both own T1: still ambiguous
+        assert "active runs" in mk("run", "get", code=2)["error"]
         assert mk("task", "get", "T1", "--run", "r1")["task"]["id"] == "T1"
         assert mk("run", "archive", "--id", "r2")["run"]["status"] == "archived"
         assert {r["id"]: r["status"] for r in mk("run", "list")["runs"]} == {"r1": "active", "r2": "archived"}

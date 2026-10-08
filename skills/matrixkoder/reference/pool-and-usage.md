@@ -32,7 +32,7 @@ This is the menu `jev_decide` picks from, not a size → model mapping. Put the 
 | AGY | `gpt-oss-120b-medium` | in the id | Open-weight cheap fallback for trivial work. |
 | OpenCode | per `opencode models` | model variant | Main model (e.g. GLM-5.x); good at takeovers. |
 
-Sources: `codex debug models` (official OpenAI list; ignore the provider cache), `agy models`, the session's Claude model list.
+Sources: the list the agent's configured provider actually serves, not the vendor catalog (lesson 32). `codex debug models` prints the official OpenAI list, which can include ids the provider rejects; the provider's `unsupported model` error prints its supported list — use that, and mark a model unavailable on its first rejection. Also `agy models`, `opencode models <provider>` for each provider the user pays for (e.g. `opencode models zai-coding-plan`; the bare `opencode models` shows only `opencode/*` and `opencode-go/*`), and the session's Claude model list.
 
 Never put a multi-file phase on a "low" effort model: it looped after context compaction and stalled twice.
 
