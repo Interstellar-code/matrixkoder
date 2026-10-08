@@ -989,6 +989,10 @@ def self_test_body():
         race_bin = os.path.join(race_dir, "bin")
         os.makedirs(race_bin)
         entered, release = os.path.join(race_dir, "cb.entered"), os.path.join(race_dir, "cb.release")
+        # both resets must stay in the future: a past one is dropped (mark) or zeroed (window)
+        race_now = datetime.datetime.now().astimezone()
+        cb_reset = (race_now + datetime.timedelta(days=1)).astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        mark_reset = (race_now + datetime.timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
         # the fake codexbar parks inside the poll's fetch window, so the mark lands exactly between the
         # poll's read and its write — the interleaving the lock has to make impossible
         with open(os.path.join(race_bin, "codexbar"), "w") as f:
@@ -1001,7 +1005,7 @@ def self_test_body():
                     "        break\n"
                     "    time.sleep(0.01)\n"
                     "sys.stdout.write('[{\"usage\": {\"primary\": {\"windowMinutes\": 300,"
-                    " \"usedPercent\": 12, \"resetsAt\": \"2026-10-09T20:00:00Z\"}}}]')\n")
+                    f" \"usedPercent\": 12, \"resetsAt\": \"{cb_reset}\"}}}}}}]')\n")
         os.chmod(os.path.join(race_bin, "codexbar"), 0o755)
         json.dump({"agents": {}}, open(race_ledger, "w"))
         env = dict(os.environ, MATRIXKODER_HOME=race_home, RACE_DIR=race_dir,
@@ -1021,7 +1025,7 @@ def self_test_body():
                                  "lh = importlib.util.module_from_spec(spec)\n"
                                  "spec.loader.exec_module(lh)\n"
                                  "lh.record_quota(sys.argv[2], 'opencode',"
-                                 " 'Usage limit reached for 5 hour. Your limit will reset at 2026-10-08 22:16:57',"
+                                 f" 'Usage limit reached for 5 hour. Your limit will reset at {mark_reset}',"
                                  " pool='zai')\n",
                                  os.path.join(os.path.dirname(os.path.abspath(__file__)), "lane-health.py"),
                                  race_ledger],
@@ -1032,7 +1036,7 @@ def self_test_body():
         assert poll_proc.returncode == 0, poll_out
         final = load_ledger(race_ledger)["agents"]["opencode"]
         assert final["pools"]["zai"]["exhausted_source"] == "pane-text", final  # the mark survived the poll
-        assert final["pools"]["zai"]["five_hour"] == {"used_pct": 12, "resets_at": "2026-10-09T20:00:00Z"}, final
+        assert final["pools"]["zai"]["five_hour"] == {"used_pct": 12, "resets_at": cb_reset}, final
         assert os.path.exists(os.path.join(race_home, "usage.json.lock"))
     finally:
         shutil.rmtree(race_dir, ignore_errors=True)
