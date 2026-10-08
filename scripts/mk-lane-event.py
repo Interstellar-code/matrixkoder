@@ -344,8 +344,16 @@ def cmd_dispatch(a):
         r = subprocess.run([herdr_bin(), "agent", "prompt", pane, text, "--wait", "--timeout", str(ms)],
                            capture_output=True, text=True, timeout=ms / 1000 + 30)
     except (OSError, subprocess.TimeoutExpired) as e:
-        out({"ok": False, "delivered": False, "pane": pane, "timeout_ms": ms,
-             "error": f"{type(e).__name__}: {e}"[:300]})
+        # the subprocess died, the agent may not have: the pane's own state decides, exactly
+        # like the herdr-timeout arm below
+        why = f"{type(e).__name__}: {e}"[:300]
+        st, pl_err = pane_state(pane)
+        base = {"pane": pane, "timed_out": True, "timeout_ms": ms, "error": why}
+        if st == "working":
+            out({"ok": True, "delivered": True, "pane_state": "working", **base})
+        else:
+            out({"ok": False, "delivered": False, "pane_state": st,
+                 **({"pane_list_error": pl_err} if pl_err else {}), **base})
         return
     blob, err = (r.stdout or "").strip(), (r.stderr or "").strip()
     j = _jload(blob)
@@ -600,6 +608,9 @@ def self_test():
                     "    print(json.dumps({'result': {'ok': True}}))\n"
                     "elif a[:2] == ['agent', 'prompt']:\n"
                     "    open(os.path.join(base, 'calls.log'), 'a').write(' '.join(a) + chr(10))\n"
+                    "    hang = os.path.join(base, 'hang.txt')\n"
+                    "    if os.path.exists(hang):\n"
+                    "        import time; time.sleep(int(open(hang).read().strip()))\n"
                     "    sys.stdout.write(open(os.path.join(base, 'prompt_out.txt')).read())\n"
                     "    sys.stderr.write(open(os.path.join(base, 'prompt_err.txt')).read())\n"
                     "    sys.exit(int(open(os.path.join(base, 'prompt_rc.txt')).read().strip() or '0'))\n"
@@ -838,6 +849,21 @@ def self_test():
         r = cli("dispatch", "--pane", "wZ:gone", "--text", "go")
         assert r["ok"] is False and r["delivered"] is False and "no such pane" in r["error"], r
         assert cli("dispatch", "--pane", "wD:h1", code=2)["ok"] is False  # --text missing
+        # (e) the subprocess itself times out (a hanging herdr): the pane's state still decides
+        open(os.path.join(tmp, "hang.txt"), "w").write("35")
+        set_canned("pane_list_out.txt", json.dumps({"result": {"panes": [
+            {"pane_id": pane_of("H1"), "agent_status": "working"}]}}) + "\n")
+        r = cli("dispatch", "--pane", pane_of("H1"), "--text", "go", "--timeout-ms", "100")
+        assert r["ok"] is True and r["delivered"] is True and r["timed_out"] is True, r
+        assert r["pane_state"] == "working", r
+        os.unlink(os.path.join(tmp, "hang.txt"))
+        # a herdr that cannot even run: the same pane-state check, not working → not delivered
+        open(os.path.join(tmp, "noexec"), "w").write("not a binary\n")
+        set_canned("pane_list_out.txt", '{"result": {"panes": []}}\n')
+        r = cli("dispatch", "--pane", pane_of("H1"), "--text", "go",
+                extra={"MK_HERDR": os.path.join(tmp, "noexec")})
+        assert r["ok"] is False and r["delivered"] is False and r["timed_out"] is True, r
+        assert "PermissionError" in r["error"], r
 
         # disarm: removes the watch file, the lane stops matching events
         r = cli("disarm", "--lane", lanes["H3"])

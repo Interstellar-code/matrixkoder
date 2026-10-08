@@ -370,6 +370,23 @@ def self_test():
         assert st["G1"]["status"] == "verifying" and st["C5"]["status"] == "verifying", st
         assert st["C4"]["status"] == "verifying" and st["P5"]["status"] == "verifying", st  # rolled up
 
+        # one child's write fails (its task.json is a directory): ok is False and the error
+        # names the child — never dropped, and the healthy child still got the verdict
+        mks("task", "add", "--id", "P6", "--title", "errors")
+        mks("task", "add", "--id", "E1", "--title", "e1", "--parent", "P6")
+        mks("task", "add", "--id", "E2", "--title", "e2", "--parent", "P6")
+        mks("task", "set", "E1", "status=building")
+        mks("task", "set", "E2", "status=building")
+        e2json = os.path.join(data, "runs", "r1", "tasks", "E2", "task.json")
+        os.unlink(e2json)
+        os.makedirs(e2json)  # unwritable: the write fails, the error is reported
+        r = record({"state": "DONE", "commit": good, "evidence": ["commit x"]}, "P6", data)
+        assert r["ok"] is False and r["children"] == ["E1", "E2"], r
+        assert r["error"].startswith("E2:") and "IsADirectoryError" in r["error"], r
+        st = statuses()
+        assert st["E1"]["status"] == "verifying", st  # the healthy child still got the verdict
+        assert st["E2"]["status"] == "building", st  # the failing child kept its status
+
         # CLI end to end with a fake herdr on PATH and a real git lane
         bin_ = os.path.join(tmp, "bin")
         os.makedirs(bin_)

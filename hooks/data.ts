@@ -120,11 +120,6 @@ export function activeEntries(entries: readonly MkRunIndexEntry[]): MkRunIndexEn
   return entries.filter(e => e.status === 'active').sort((a, b) => key(b) - key(a))
 }
 
-/** The active-run pick: the NEWEST active run (first of activeEntries). */
-export function activeEntry(entries: readonly MkRunIndexEntry[]): MkRunIndexEntry | null {
-  return activeEntries(entries)[0] ?? null
-}
-
 export function coerceRun(obj: unknown): MkRun | null {
   if (!isRecord(obj) || typeof obj.id !== 'string' || !Array.isArray(obj.tasks)) return null
   const waiting = isRecord(obj.waiting) && typeof obj.waiting.question === 'string'

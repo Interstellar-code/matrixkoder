@@ -682,14 +682,36 @@ def create_slot(rec, main, base_sha):
     return warn
 
 
+def tracked_in(main, rel):
+    """-> does the main checkout track <rel> (the path itself, or anything under it)? Fail closed:
+    any git error counts as tracked, so a broken repo never smuggles files into a slot (the same
+    rule as clean_state's has_tracked)."""
+    t = run_cmd(["git", "-C", main, "--literal-pathspecs", "ls-files", "--error-unmatch", "-z", "--", rel], 30)
+    if t.returncode == 0:
+        return True
+    if t.returncode == 1:  # --error-unmatch: nothing tracked under <rel>
+        return False
+    return True  # any other git error: fail closed
+
+
 def copy_into_slot(cfg, main, lane):
     """The lanes.copy entries from the main checkout into a freshly created slot: the fresh
     worktree has the tracked files, not the gitignored ones a build needs (.env, generated
-    types). -> warnings; a missing or unreadable source is reported, never fatal."""
+    types). Only UNTRACKED content is copied — a tracked source would put repo files in the slot's
+    status — and only literal in-checkout paths: absolute paths, `..` components and symlinks
+    resolving outside the main checkout are skipped. -> warnings; a missing, tracked or
+    unreadable source is reported, never fatal."""
     warns = []
     for rel in cfg["copy"]:
         src, dst = os.path.join(main, rel), os.path.join(lane, rel)
         try:
+            if os.path.isabs(rel) or ".." in rel.split("/"):
+                raise ValueError("not a literal relative path")
+            if os.path.commonpath([os.path.realpath(src), main]) != main:
+                raise ValueError("resolves outside the main checkout")
+            if tracked_in(main, rel):
+                warns.append(f"lanes copy: {rel!r} is tracked in {os.path.basename(main)}, skipped")
+                continue
             if os.path.isdir(src):
                 shutil.copytree(src, dst, dirs_exist_ok=True)
             elif os.path.isfile(src):
@@ -697,7 +719,7 @@ def copy_into_slot(cfg, main, lane):
                 shutil.copy2(src, dst)
             else:
                 warns.append(f"lanes copy: {rel!r} not in {os.path.basename(main)}, skipped")
-        except (OSError, shutil.Error) as e:
+        except (OSError, shutil.Error, ValueError) as e:
             warns.append(f"lanes copy: {rel!r}: {type(e).__name__}: {e}"[:200])
     return warns
 
@@ -1542,20 +1564,34 @@ def self_test():
         tt = st("task", "get", "T2")["task"]
         assert (tt["lane"], tt["slot"]) == (os.path.join(tmp, "repo-mk-4"), "4"), tt
 
-        # lanes.copy: the gitignored paths a fresh slot needs travel from the main checkout
+        # lanes.copy: only untracked paths travel — a tracked source is skipped, and what does
+        # land in the slot is on the clean-check allowlist (the slot stays clean; .env is
+        # gitignored, as in any real project — that is the point of lanes.copy)
+        write(os.path.join(repo, "src", "app.js"), "// tracked source\n")
+        write(os.path.join(repo, ".gitignore"),
+              "node_modules/\n__pycache__/\n/.venv/\n.omc/\nprod.sqlite\n.env\n")
+        g("add", "src", ".gitignore"), g("commit", "-qm", "tracked src; .env ignored")
         write(os.path.join(repo, ".env"), "TOKEN=copy\n")
-        write(os.path.join(repo, ".claude-plugin", "types", "index.d.ts"), "// generated\n")
         write(os.path.join(data, "matrixkoder.yaml"),
               'repo:\n  lanes: { slots: 5, pattern: "../{repo}-mk-{n}", reuse: true, '
-              'copy: [".claude-plugin/types", ".env", "missing.txt"] }\n'
+              'copy: ["README.md", "src", ".env"] }\n'
               'routing_preferences:\n  max_build_lanes: 5\n')
         st("task", "add", "--id", "t14", "--title", "fourteen", "--run", "r1")
         cp = mk("acquire", "--run", "r1", "--task", "t14", "--base", "main")
         assert (cp["ok"], cp["slot"], cp["created"]) == (True, 5, True), cp
         slot5 = os.path.join(tmp, "repo-mk-5")
+        # untracked, so only the copy brings it into the slot; README.md/src are already there
+        # from the worktree checkout (tracked) and were skipped by the copy
         assert open(os.path.join(slot5, ".env")).read() == "TOKEN=copy\n"
-        assert open(os.path.join(slot5, ".claude-plugin", "types", "index.d.ts")).read() == "// generated\n"
-        assert "lanes copy" in cp["warning"] and "missing.txt" in cp["warning"], cp
+        assert cp["warning"].count("lanes copy") == 2, cp  # README.md and src are tracked
+        assert "README.md" in cp["warning"] and "'src'" in cp["warning"], cp
+        assert next(s for s in mk("list")["slots"] if s["slot"] == 5)["clean"] is True
+        # absolute, `..` and symlink-escape sources are skipped before any copy
+        os.symlink(tmp, os.path.join(repo, "escape"))
+        warns = copy_into_slot({"copy": ["escape", "/abs", "../up"]}, repo, slot5)
+        assert len(warns) == 3 and all("lanes copy" in w for w in warns), warns
+        assert not os.path.exists(os.path.join(slot5, "escape"))
+        os.unlink(os.path.join(repo, "escape"))
 
         # the workspace id herdr's create response actually carries: the captured real shape
         captured = ('{"id":"cli:worktree:create","result":{"workspace":{"workspace_id":"wW","label":"mk:repo:7"},'
