@@ -25,7 +25,7 @@ Run `/mk setup` (alias `/mk init`). The wizard opens as a pane, one step at a ti
 |---|---|---|
 | 1 | Install | Shows whether you run from a dev folder or a marketplace install. Info only. |
 | 2 | Data | Where project data lives: `<repo>/.matrixkoder/` (default; added to `.gitignore`) or `~/.matrixkoder/projects/<slug>/`. |
-| 3 | Agents | Which of Claude Code, Codex, OpenCode, AGY you use. Hotkeys 1 to 4 toggle them. |
+| 3 | Agents | Which of Claude Code, Codex, OpenCode, AGY you use. Hotkeys 1 to 4 toggle them. If `herdr` is found, choose whether to link the MatrixKoder herdr plugin so pane events push lane verdicts instead of polling. |
 | 4 | Usage | Which CodexBar providers to track. Hotkeys 1 to 9. `zai (OpenCode Z.AI plan)` and `opencode (OpenCode Zen)` are labelled so you pick the right one; zai is pre-selected when your opencode agent is on the Z.AI plan. Shows the z.ai key command (see [Usage tracking](#usage-tracking)). |
 | 5 | Gates | Your test, typecheck, lint and format commands, as text inputs. Detection reads package.json, pyproject.toml, Makefile, `.claude-plugin/plugin.json`, `scripts/selftest.sh`, tsconfig.json, `Cargo.toml` and `go.mod`; when nothing is detected the first field takes the focus so you can just type. |
 | 6 | Routing | Builder order, reserve floors, max lanes, effort by size, reviewers. |
@@ -96,7 +96,7 @@ python3 scripts/mk-usage.py --once
 
 Other options: `--watch --interval N`, `--out PATH`, `--providers a,b`, `--self-test`. When the project's `matrixkoder.yaml` lists `usage.providers`, the plugin polls exactly those.
 
-The provider list holds CodexBar ids directly: `claude`, `codex`, `antigravity` (CodexBar `agy`), `zai` (OpenCode on the Z.A.I plan), `opencode` (OpenCode Zen), `opencodego` (OpenCode Go plan), `ollama`. The wizard pre-selects `zai` when your opencode agent is on the Z.A.I plan.
+The provider list holds CodexBar ids directly: `claude`, `codex`, `antigravity` (CodexBar `agy`), `zai` (OpenCode on the Z.A.I plan), `opencode` (OpenCode Zen), `opencodego` (OpenCode Go plan), `ollama` (OpenCode on Ollama Cloud). The wizard pre-selects `zai` when your opencode agent is on the Z.A.I plan, and `ollama` when Ollama Cloud models are found.
 
 OpenCode plans are tracked as separate pools under one `opencode` agent so they do not overwrite each other:
 
@@ -105,7 +105,7 @@ OpenCode plans are tracked as separate pools under one `opencode` agent so they 
 | `zai` | `zai` | a z.ai API key |
 | `opencode` | `zen` | OpenCode Zen sign-in |
 | `opencodego` | `go` | OpenCode Go sign-in |
-| `ollama` | `ollama` | an ollama.com session |
+| `ollama` | `ollama` | an ollama.com session (sign in at [ollama.com](https://ollama.com)) |
 
 For z.ai, store the key in CodexBar yourself (never paste it into the chat):
 
@@ -142,6 +142,16 @@ Turn guards off with `claude plugin configure matrixkoder` (`guards` = false).
 Wake lets MatrixKoder submit a prompt to your session when a lane needs attention, so a long run does not sit idle. It fires on `verifying`, `blocked`, `quota`, `stalled` and `provider` events. It checks every 30 seconds, waits 60 seconds to batch events, and allows one wake per task and status every 5 minutes. When you first turn it on, existing history is ignored.
 
 It is **off by default** because it types into your session unprompted. Enable it with `wake` = true in `claude plugin configure matrixkoder`.
+
+## Event-driven lanes (herdr)
+
+MatrixKoder can turn herdr pane events into lane verdicts instead of polling. Link the herdr plugin in the wizard (step 3) or run:
+
+```bash
+herdr plugin link /path/to/matrixkoder/herdr
+```
+
+The plugin runs `scripts/mk-lane-event.py event` for every pane status change and exit, writes task status through `scripts/mk-state.py`, labels the pane and shows a toast. Silence (crashes or hangs) is caught by a sweep that runs from the dashboard tick every two minutes. Full flow and watch-file schema: [`docs/herdr-events.md`](herdr-events.md).
 
 ## Troubleshooting
 

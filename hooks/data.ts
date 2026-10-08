@@ -254,11 +254,13 @@ export function orderAgents(names: readonly string[] | null): readonly string[] 
 
 /** Cross-module timer registry: dashboard arms these, status.ts's session.end cancels them
  *  (a second unmatched session.end registration would fail validation). */
-export const timerRegistry: { cancelRefresh?: () => void; cancelPoll?: () => void } = {}
+export const timerRegistry: { cancelRefresh?: () => void; cancelPoll?: () => void; cancelSweep?: () => void } = {}
 
 export function cancelDashboardTimers(): void {
   timerRegistry.cancelRefresh?.()
   timerRegistry.cancelPoll?.()
+  timerRegistry.cancelSweep?.()
   timerRegistry.cancelRefresh = undefined
   timerRegistry.cancelPoll = undefined
+  timerRegistry.cancelSweep = undefined
 }

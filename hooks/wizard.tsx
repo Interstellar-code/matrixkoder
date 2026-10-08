@@ -148,22 +148,31 @@ async function detect($: EngineInterface, options: PluginOptions): Promise<MkWiz
 
   const agentRun = await run($, ['which', ...AGENT_NAMES])
   const paths = parseWhich(agentRun.out)
-  const [agyModels, ocModels, ocPlanModels, cbVersion, cbProviders] = await Promise.all([
+  const [agyModels, ocModels, ocPlanModels, ocOllamaModels, cbVersion, cbProviders, herdrList] = await Promise.all([
     paths.agy ? run($, ['agy', 'models']) : null,
     paths.opencode ? run($, ['opencode', 'models']) : null,
     // the bare list shows only opencode/* and opencode-go/*; the Z.AI plan models need their own probe
     paths.opencode ? run($, ['opencode', 'models', 'zai-coding-plan']) : null,
+    // Ollama Cloud models are listed under their own plan
+    paths.opencode ? run($, ['opencode', 'models', 'ollama-cloud']) : null,
     run($, ['codexbar', '--version']),
     run($, ['codexbar', 'config', 'providers']),
+    paths.herdr ? run($, ['herdr', 'plugin', 'list']) : null,
   ])
   const models: Record<string, readonly string[]> = {
     agy: agyModels?.ok ? mergeModels(parseModels(agyModels.out)) : [],
-    opencode: mergeModels(ocModels?.ok ? parseModels(ocModels.out) : [], ocPlanModels?.ok ? parseModels(ocPlanModels.out) : []),
+    opencode: mergeModels(
+      ocModels?.ok ? parseModels(ocModels.out) : [],
+      ocPlanModels?.ok ? parseModels(ocPlanModels.out) : [],
+      ocOllamaModels?.ok ? parseModels(ocOllamaModels.out) : [],
+    ),
   }
   const agents: MkWizardDraft['agents'] = Object.fromEntries(
     AGENT_NAMES.map(n => [n, { found: n in paths, path: paths[n] ?? null, enabled: n in paths, models: models[n] ?? [] }]),
   )
   d.agents = agents
+  const herdrLinked = herdrList?.ok ? herdrList.out.includes('matrixkoder') : false
+  d.herdrPlugin = agents.herdr?.found ? (herdrLinked ? 'linked' : 'link') : 'skip'
   if (cbVersion.ok) {
     d.codexbarVersion = parseVersion(cbVersion.out) ?? 'unknown'
     const choices = providerChoices(parseProviders(cbProviders.out))
@@ -175,6 +184,10 @@ async function detect($: EngineInterface, options: PluginOptions): Promise<MkWiz
     const oc = agents.opencode
     if (oc?.enabled && oc.models.some(m => m.startsWith('zai-coding-plan/')) && d.providersAll.includes('zai') && !d.providersOn.includes('zai')) {
       d.providersOn = [...d.providersOn, 'zai']
+    }
+    // same for Ollama Cloud
+    if (oc?.enabled && oc.models.some(m => m.startsWith('ollama-cloud/')) && d.providersAll.includes('ollama') && !d.providersOn.includes('ollama')) {
+      d.providersOn = [...d.providersOn, 'ollama']
     }
   }
 
@@ -308,7 +321,16 @@ async function writeAll($: EngineInterface): Promise<void> {
     written.push(configPath)
     await writeAtomic($, projectsPath, buildProjectsJson(projects, d.repo, data, at))
     written.push(projectsPath)
-    await patch($, { phase: 'written', written, error: null })
+    let herdrLinkResult = d.herdrLinkResult
+    if (d.herdrPlugin === 'link') {
+      try {
+        const link = await $.process.run(['herdr', 'plugin', 'link', `${d.pluginRoot}/herdr`], { timeoutMs: PROBE_MS })
+        herdrLinkResult = { ok: link.exitCode === 0, text: link.exitCode === 0 ? 'herdr plugin linked' : `herdr plugin link failed: ${link.stderr.trim().slice(0, 120)}` }
+      } catch (err) {
+        herdrLinkResult = { ok: false, text: `herdr plugin link failed: ${String(err instanceof Error ? err.message : err).slice(0, 120)}` }
+      }
+    }
+    await patch($, { phase: 'written', written, error: null, herdrLinkResult })
   } catch (err) {
     await patch($, { phase: 'error', error: String(err instanceof Error ? err.message : err).slice(0, 200) })
   }
@@ -353,6 +375,24 @@ function Choice(els: Elements, $: EngineInterface, d: MkWizardDraft, field: StrF
       key={`wz-${field}`} label={label} options={values.map(v => ({ value: v }))} value={d[field]}
       onSelect={v => update($, draftAtom, cur => ({ ...cur, [field]: v }))}
     />
+  )
+}
+
+function HerdrLinkChoice(els: Elements, $: EngineInterface, d: MkWizardDraft) {
+  const { Box, Text, Select } = els
+  const a = d.agents.herdr
+  const label = 'Link the MatrixKoder herdr plugin (herdr pushes lane events instead of polling)'
+  const options = YES_NO.map(o => ({ value: o.value === 'yes' ? 'link' : 'skip', label: o.label }))
+  const value = d.herdrPlugin === 'linked' ? 'link' : d.herdrPlugin
+  if (!a?.found) return <Text dimColor={true}>herdr not found on PATH</Text>
+  return (
+    <Box flexDirection="column">
+      {d.herdrPlugin === 'linked' && <Text color="green">✓ MatrixKoder herdr plugin is linked</Text>}
+      <Select
+        key="wz-herdrPlugin" label={label} options={options} value={value}
+        onSelect={v => patch($, { herdrPlugin: v as 'link' | 'skip' })}
+      />
+    </Box>
   )
 }
 
@@ -409,6 +449,7 @@ function Body(els: Elements, $: EngineInterface, d: MkWizardDraft, step: number,
               </Box>
             )
           })}
+          {d.agents.herdr?.found && <Box flexDirection="column" marginTop={1}>{HerdrLinkChoice(els, $, d)}</Box>}
         </Box>
       )
     case 4:
@@ -520,6 +561,11 @@ function Review(els: Elements, $: EngineInterface, d: MkWizardDraft) {
         <Text color="green" bold={true}>✓ MatrixKoder is set up</Text>
         {d.written.map(p => <Text key={p} dimColor={true}>{`wrote ${p}`}</Text>)}
         {d.existingYaml && !d.replace && <Text dimColor={true}>kept existing matrixkoder.yaml</Text>}
+        {d.herdrLinkResult && (
+          <Text color={d.herdrLinkResult.ok ? 'green' : 'yellow'}>
+            {`${d.herdrLinkResult.ok ? '✓' : '⚠'} ${d.herdrLinkResult.text}`}
+          </Text>
+        )}
         <Text>Next: /mk to open the dashboard.</Text>
       </Box>
     )
@@ -535,6 +581,8 @@ function Review(els: Elements, $: EngineInterface, d: MkWizardDraft) {
         {d.dataEnv == null && d.dataMode === 'repo' && d.gitignore && !d.gitignoreHas && <Text>add     /.matrixkoder/ to .gitignore</Text>}
         <Text>{`${d.globalDir ?? '~/.matrixkoder'}/config.json (merge)`}</Text>
         <Text>{`${d.globalDir ?? '~/.matrixkoder'}/projects.json (upsert this repo)`}</Text>
+        {d.agents.herdr?.found && d.herdrPlugin === 'link' && <Text>{`link    ${d.pluginRoot}/herdr in herdr`}</Text>}
+        {d.agents.herdr?.found && d.herdrPlugin === 'linked' && <Text dimColor={true}>herdr plugin already linked</Text>}
       </Box>
       {d.existingYaml && (
         <Select

@@ -31,6 +31,7 @@ const REFRESH_MS = 5000
 const USAGE_POLL_DEFAULT_MIN = 5
 const USAGE_POLL_MIN_MIN = 1 // a faster poll with the 120 s timeout would stack runs
 const POLL_MIN_INTERVAL_MS = 60_000
+const SWEEP_INTERVAL_MS = 120_000
 const PRIMARY_POOL: Record<string, string> = { agy: 'gemini', claude: 'default' }
 const AGENT_GLYPH: Record<string, string> = { claude: '✦', agy: '∇', codex: '⊚', opencode: '⌂' }
 const AGENT_COLOR: Record<string, string> = { claude: 'magenta', agy: 'blue', codex: 'green', opencode: 'cyan' }
@@ -55,6 +56,8 @@ const LANE_LIVE = new Set(['dispatched', 'building', 'verifying', 'review', 'fix
 const LANE_FALLBACK = new Set(['dispatched', 'building', 'verifying', 'fix'])
 let pollInFlight = false
 let lastPollAt = -Infinity
+let sweepInFlight = false
+let lastSweepAt = -Infinity
 let lastChipText: string | null | undefined // undefined = never set; skip ui.status when unchanged
 
 export function registerDashboard(on: On, options: PluginOptions): void {
@@ -84,6 +87,8 @@ export function registerDashboard(on: On, options: PluginOptions): void {
     timerRegistry.cancelRefresh = arm($.clock.every(REFRESH_MS, () => refreshSafe($, options, cwd)))
     timerRegistry.cancelPoll?.()
     timerRegistry.cancelPoll = arm($.clock.every(Math.round(min * 60_000), () => pollUsage($, cwd)))
+    timerRegistry.cancelSweep?.()
+    timerRegistry.cancelSweep = arm($.clock.every(SWEEP_INTERVAL_MS, () => sweepLanes($, cwd)))
     lastChipText = undefined
     await refreshSafe($, options, cwd) // first load populates pane + chip and never toasts
     const gdir = await globalDirOf($, await homeDir($))
@@ -370,6 +375,29 @@ async function pollUsage($: EngineInterface, cwd: string): Promise<void> {
     // codexbar missing or slow — the refresh ticks still re-read usage.json
   } finally {
     pollInFlight = false
+  }
+}
+
+/** Sweeps armed herdr lanes for silence. Mirrors pollUsage: in-flight guard, interval guard, failures swallowed. */
+async function sweepLanes($: EngineInterface, cwd: string): Promise<void> {
+  if (sweepInFlight) return
+  let nowMs = 0
+  try {
+    nowMs = await $.clock.now()
+  } catch {
+    // clock refused — interval check falls back to lastSweepAt only
+  }
+  if (nowMs && nowMs - lastSweepAt < SWEEP_INTERVAL_MS) return
+  sweepInFlight = true
+  lastSweepAt = nowMs || lastSweepAt + SWEEP_INTERVAL_MS
+  try {
+    const snap = await loadSnapshot($, cwd)
+    if (snap.run == null) return // only sweep when an orchestration run is active
+    await $.process.run(['python3', `${$.plugin.root}/scripts/mk-lane-event.py`, 'sweep'], { timeoutMs: 120_000 })
+  } catch {
+    // herdr or mk-lane-event.py missing — the next tick retries
+  } finally {
+    sweepInFlight = false
   }
 }
 

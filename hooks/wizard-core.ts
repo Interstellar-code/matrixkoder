@@ -8,7 +8,7 @@ import { basename } from './data'
 export const AGENT_NAMES = ['claude', 'codex', 'opencode', 'agy', 'herdr'] as const
 export const DEFAULT_BUILDER_ORDER = ['codex', 'opencode', 'agy', 'claude'] as const
 /** codexbar lists ~60 providers; only these matter to the pool, plus whatever is already enabled */
-export const RELEVANT_PROVIDERS = ['claude', 'codex', 'antigravity', 'zai', 'opencode', 'opencodego'] as const
+export const RELEVANT_PROVIDERS = ['claude', 'codex', 'antigravity', 'zai', 'opencode', 'opencodego', 'ollama'] as const
 export const DEFAULT_PROVIDERS = ['claude', 'codex', 'antigravity'] as const
 export const WIZARD_STEPS = ['Install', 'Data', 'Agents', 'Usage', 'Gates', 'Routing', 'Autonomy', 'QA', 'Dashboard', 'Review'] as const
 export const ZAI_KEY_CMD = `printf '%s' "$Z_AI_API_KEY" | codexbar config set-api-key --provider zai --stdin`
@@ -28,6 +28,7 @@ export function emptyDraft(): MkWizardDraft {
     qaFrontend: false, qaStart: '', qaDevUrl: '', qaThemes: '', qaMockups: '', qaTarget: 'local-main',
     autoOpen: true, chip: true, toasts: true, pollMin: '5',
     existingYaml: false, replace: false, phase: 'editing', written: [], error: null,
+    herdrPlugin: 'skip', herdrLinkResult: null,
   }
 }
 
@@ -71,18 +72,23 @@ export function parseModels(stdout: string): string[] {
 }
 
 /** Detection lists merged, deduped, capped.
- *  Every `zai-coding-plan/*` model is kept (put plan models first, then fill up to the cap). */
+ *  `zai-coding-plan/*` models are kept first, then `ollama-cloud/*`, then the rest. */
 export function mergeModels(...lists: readonly (readonly string[])[]): string[] {
   const deduped = [...new Set(lists.flat())]
   const plan = deduped.filter(m => m.startsWith('zai-coding-plan/'))
-  const rest = deduped.filter(m => !m.startsWith('zai-coding-plan/'))
-  const cap = Math.max(MODEL_CAP, plan.length)
-  return [...plan, ...rest].slice(0, cap)
+  const ollama = deduped.filter(m => m.startsWith('ollama-cloud/'))
+  const rest = deduped.filter(m => !m.startsWith('zai-coding-plan/') && !m.startsWith('ollama-cloud/'))
+  const cap = Math.max(MODEL_CAP, plan.length + ollama.length)
+  return [...plan, ...ollama, ...rest].slice(0, cap)
 }
 
-/** The Usage step's provider label: the two OpenCode plans are disambiguated; the stored value stays the CodexBar id. */
+/** The Usage step's provider label: OpenCode plans are disambiguated; the stored value stays the CodexBar id. */
 export function providerLabel(p: string): string {
-  return p === 'zai' ? 'zai (OpenCode Z.AI plan)' : p === 'opencode' ? 'opencode (OpenCode Zen)' : p
+  if (p === 'zai') return 'zai (OpenCode Z.AI plan)'
+  if (p === 'opencode') return 'opencode (OpenCode Zen)'
+  if (p === 'ollama') return 'ollama (OpenCode on Ollama Cloud)'
+  if (p === 'opencodego') return 'opencodego (OpenCode Go)'
+  return p
 }
 
 export function parseVersion(stdout: string): string | null {
@@ -360,6 +366,13 @@ export function fallbackText(d: MkWizardDraft): string {
   const found = AGENT_NAMES.filter(n => d.agents[n]?.found)
   const missing = AGENT_NAMES.filter(n => !d.agents[n]?.found)
   const gates = Object.entries(d.gates).filter(([, v]) => v !== '').map(([k, v]) => `${k}: ${v}`)
+  const herdrText = !d.agents.herdr?.found
+    ? 'not found'
+    : d.herdrPlugin === 'linked'
+      ? 'plugin linked'
+      : d.herdrPlugin === 'link'
+        ? `run \`herdr plugin link ${d.pluginRoot}/herdr\` to enable event-driven lanes`
+        : 'link skipped'
   return [
     'MatrixKoder setup needs the fullscreen pane. Run /tui fullscreen, then /mk setup again.',
     'Detected defaults:',
@@ -368,6 +381,7 @@ export function fallbackText(d: MkWizardDraft): string {
     `- agents: ${found.length > 0 ? found.join(', ') : 'none'}${missing.length > 0 ? ` (missing: ${missing.join(', ')})` : ''}`,
     `- usage: ${d.codexbarVersion != null ? `codexbar ${d.codexbarVersion}, providers ${d.providersOn.join(', ') || 'none'}` : 'codexbar not found'}`,
     `- gates: ${gates.length > 0 ? gates.join('; ') : 'none detected'}`,
+    `- herdr: ${herdrText}`,
     'Nothing was written.',
   ].join('\n')
 }

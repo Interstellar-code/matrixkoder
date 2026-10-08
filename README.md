@@ -52,6 +52,7 @@ Full walkthrough: [docs/howto.md](docs/howto.md).
 - **Guards**: deny destructive git and project-banned commands in Bash calls.
 - **Tools**: `mk_state` (read run state, limited writes) and `mk_usage` (refresh usage).
 - **Wake**: optionally submits a prompt when a lane needs attention. Off by default.
+- **herdr plugin**: event-driven lane verdicts from pane status changes, with a dashboard sweep backstop. See `docs/herdr-events.md`.
 - **Wizard**: `/mk setup`.
 - **Agents**: `matrixkoder:effort-low|medium|high|max`, effort-pinned workers.
 
