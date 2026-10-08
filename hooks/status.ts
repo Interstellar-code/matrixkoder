@@ -5,9 +5,7 @@
 // import cycle).
 import type { On, PluginOptions } from 'claude-code'
 import type { MkRun, MkSnapshot, MkStatusMemory, MkTask } from '../types'
-import { cancelDashboardTimers, sanitizeText } from './data'
-
-const AGENT_ORDER = ['claude', 'agy', 'codex', 'opencode'] as const
+import { AGENT_ORDER, cancelDashboardTimers, sanitizeText } from './data'
 
 function counts(run: MkRun): { total: number; done: number; byStatus: Map<string, number> } {
   const byStatus = new Map<string, number>()
@@ -37,14 +35,14 @@ function shortDate(iso: string | null | undefined): string {
   return `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
 
-/** Only agents the run actually routes to (no task agents named → every ledger agent). */
+/** Only agents the run actually routes to (no task agents named → the project's agents, else every ledger agent). */
 function exhaustedAgent(snap: MkSnapshot): { agent: string; resetShort: string; window: string } | null {
   const agents = snap.usage?.agents
   if (!agents || !snap.now) return null
   const used = [...new Set(snap.run?.tasks.map(t => t.agent).filter((a): a is string => !!a) ?? [])]
   const names = used.length > 0
     ? used
-    : [...AGENT_ORDER, ...Object.keys(agents).filter(a => !(AGENT_ORDER as readonly string[]).includes(a))]
+    : snap.projectAgents ?? [...AGENT_ORDER, ...Object.keys(agents).filter(a => !(AGENT_ORDER as readonly string[]).includes(a))]
   for (const agent of names) {
     const entry = agents[agent]
     if (!entry) continue

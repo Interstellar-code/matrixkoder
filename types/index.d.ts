@@ -68,6 +68,8 @@ export type MkPool = {
 
 export type MkAgentUsage = MkPool & {
   source?: string
+  /** mk-usage.py's verdict: 'ok' | 'n/a' | 'error' (absent on older ledgers) */
+  status?: string
   available_pools?: readonly string[]
   pools?: Readonly<Record<string, MkPool>>
 }
@@ -81,6 +83,8 @@ export type MkSnapshot = {
   run: MkRun | null
   runs: readonly MkRunIndexEntry[]
   usage: MkUsage | null
+  /** the project yaml's available agents, display-ordered (herdr excluded); null = no yaml / no agents block → show every ledger agent */
+  projectAgents: readonly string[] | null
   /** set when state files exist but cannot be read/parsed; the pane shows a ⚠ note */
   error?: string | null
 }

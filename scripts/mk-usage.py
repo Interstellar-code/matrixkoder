@@ -28,6 +28,18 @@ PROVIDER_MAP = {
     "opencodego": "opencode-go",
 }
 
+# agent-style names a project yaml may list under usage.providers -> the CodexBar provider to poll
+AGENT_TO_PROVIDER = {
+    "opencode": "zai",
+    "agy": "antigravity",
+    "opencode-go": "opencodego",
+}
+
+
+def resolve_provider(name):
+    """Accepts both CodexBar ids and agent-style names (opencode -> zai)."""
+    return AGENT_TO_PROVIDER.get(name, name)
+
 EXHAUSTED_FIELDS = (
     "exhausted_until",
     "exhausted_window",
@@ -437,10 +449,11 @@ def poll_and_update(providers, out_path, now=None):
     error_agents = []
 
     for p in providers:
-        agent_key = PROVIDER_MAP.get(p, p)
-        raw_res = run_codexbar_provider(p, timeout=60)
-        existing_agent = agents.get(agent_key, {})
-        norm_entry = normalize_provider_entry(p, raw_res, existing_entry=existing_agent, now=now)
+        provider_id = resolve_provider(p)  # a project yaml may list agent-style names (opencode -> zai)
+        raw_res = run_codexbar_provider(provider_id, timeout=60)
+        existing_agent = agents.get(PROVIDER_MAP.get(provider_id, provider_id), {})
+        norm_entry = normalize_provider_entry(provider_id, raw_res, existing_entry=existing_agent, now=now)
+        agent_key = PROVIDER_MAP.get(provider_id, provider_id)
         agents[agent_key] = norm_entry
 
         st = norm_entry.get("status")
@@ -668,6 +681,35 @@ def self_test():
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # 8. Agent-style provider names map to CodexBar ids before polling (opencode -> zai)
+    assert resolve_provider("opencode") == "zai"
+    assert resolve_provider("zai") == "zai"
+    assert resolve_provider("agy") == "antigravity"
+    assert resolve_provider("opencode-go") == "opencodego"
+    assert resolve_provider("claude") == "claude"
+    assert resolve_provider("codex") == "codex"
+    polled = []
+
+    def fake_run(provider, timeout=60):
+        polled.append(provider)
+        return {"returncode": 0, "stdout": json.dumps([{"usage": {}}]), "stderr": "", "timeout": False}
+
+    # patch through globals(): a bare assignment here would shadow the name for the whole function
+    mod = sys.modules[__name__]
+    real_run = mod.run_codexbar_provider
+    mod.run_codexbar_provider = fake_run
+    try:
+        map_dir = tempfile.mkdtemp(prefix="mk-usage-map-")
+        try:
+            summary = poll_and_update(["opencode", "claude"], os.path.join(map_dir, "usage.json"), now=ref_now_future)
+            assert polled == ["zai", "claude"]
+            assert summary["ok"] == ["opencode", "claude"]  # the ledger still keys agents, not providers
+            assert load_ledger(os.path.join(map_dir, "usage.json"))["agents"]["opencode"]["status"] == "ok"
+        finally:
+            shutil.rmtree(map_dir, ignore_errors=True)
+    finally:
+        mod.run_codexbar_provider = real_run
 
     print("mk-usage self-test ok")
 

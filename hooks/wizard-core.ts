@@ -70,6 +70,16 @@ export function parseModels(stdout: string): string[] {
   return out.slice(0, MODEL_CAP)
 }
 
+/** Detection lists merged in order, deduped, capped (bare `opencode models` + `opencode models zai-coding-plan`). */
+export function mergeModels(...lists: readonly (readonly string[])[]): string[] {
+  return [...new Set(lists.flat())].slice(0, MODEL_CAP)
+}
+
+/** The Usage step's provider label: the two OpenCode plans are disambiguated; the stored value stays the CodexBar id. */
+export function providerLabel(p: string): string {
+  return p === 'zai' ? 'zai (OpenCode Z.AI plan)' : p === 'opencode' ? 'opencode (OpenCode Zen)' : p
+}
+
 export function parseVersion(stdout: string): string | null {
   const m = /(\d+\.\d+(?:\.\d+)?)/.exec(stdout)
   return m?.[1] ?? null
@@ -95,6 +105,8 @@ export type GateInputs = {
   /** lockfile names that exist at the repo root */
   locks: readonly string[]
   hasTsconfig: boolean
+  /** other repo marker files that exist (fs.exists checks), e.g. 'Cargo.toml', '.claude-plugin/plugin.json' */
+  markers: readonly string[]
 }
 
 function rec(v: unknown): Record<string, unknown> {
@@ -150,6 +162,33 @@ export function proposeGates(inp: GateInputs): { gates: MkWizardGates; banned: s
     if (gates.typecheck === '' && has('typecheck')) gates.typecheck = 'make typecheck'
     if (gates.lint_changed === '' && has('lint')) gates.lint_changed = 'make lint'
     if (gates.format_changed === '') gates.format_changed = has('fmt') ? 'make fmt' : has('format') ? 'make format' : ''
+  }
+  // marker files fill what is still empty, so the blocks above win (a Makefile target beats Cargo)
+  const marker = (m: string): boolean => inp.markers.includes(m)
+  if (marker('.claude-plugin/plugin.json')) {
+    from.push('.claude-plugin/plugin.json')
+    if (gates.test === '') gates.test = 'claude plugin test .'
+    // the plugin schema has no whole-repo validate slot; make lint already ignores {files} the same way
+    if (gates.lint_changed === '') gates.lint_changed = 'claude plugin validate .'
+  }
+  if (marker('scripts/selftest.sh')) {
+    from.push('scripts/selftest.sh')
+    gates.test = gates.test === '' ? 'bash scripts/selftest.sh' : `${gates.test} && bash scripts/selftest.sh`
+  }
+  if (inp.hasTsconfig && gates.typecheck === '') {
+    from.push('tsconfig.json')
+    gates.typecheck = 'tsc -p . --noEmit'
+  }
+  if (marker('Cargo.toml')) {
+    from.push('Cargo.toml')
+    if (gates.test === '') gates.test = 'cargo test'
+    if (gates.lint_changed === '') gates.lint_changed = 'cargo clippy'
+    if (gates.format_changed === '') gates.format_changed = 'cargo fmt'
+  }
+  if (marker('go.mod')) {
+    from.push('go.mod')
+    if (gates.test === '') gates.test = 'go test ./...'
+    if (gates.lint_changed === '') gates.lint_changed = 'go vet ./...'
   }
   return { gates, banned, from: from.join(' + ') }
 }
