@@ -17,7 +17,8 @@ allowed, renaming or removing one needs `schema` bumped.
 | Task | `<data>/runs/<run_id>/tasks/<task_id>/task.json` (copy of the task object in `run.json`) |
 | Round files | same folder: `brief-rN.md`, `report-rN.md`, `review-rN.md` (paths returned by `task round`; written by the orchestrator / agents, not by mk-state) |
 | Locks | `<home>/locks/<resource lower-cased>.lock` |
-| Usage ledger | `<home>/usage.json` (owned by `mk-usage.py`; lane-health only adds `exhausted_*` fields, see below) |
+| Usage ledger | `<home>/usage.json` (owned by `mk-usage.py`; lane-health only adds `exhausted_*` fields, on the agent or on one pool, see below) |
+| Usage ledger lock | `<home>/usage.json.lock` — an empty sidecar every read-modify-write of `usage.json` takes as an exclusive `fcntl.flock` (`mk-usage.py`'s poll and lane-health's quota mark; the two would otherwise lose each other's fields). It holds no data, and it is derived from `<home>` rather than from the ledger path, so writers pointed at different `--out`/`--ledger` paths still serialise |
 
 IDs (run, task, lock resource): `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`. Timestamps: ISO 8601 local time
 with offset, seconds precision (`2026-10-07T20:09:01+02:00`). Unknown values are `null`, never guessed.
@@ -51,6 +52,7 @@ with offset, seconds precision (`2026-10-07T20:09:01+02:00`). Unknown values are
     {
       "id": "P1", "title": "State core", "wave": 1, "deps": [], "owned": ["scripts/mk-state.py", "scripts/lane-*.py"],
       "status": "building", "agent": "codex", "model": "gpt-5.5", "effort": "high", "lane": "../wt-p1",
+      "pane": "wK:p1",
       "last_commit": null, "gates": null, "verdict": null,
       "round": 1,
       "rounds": [{ "n": 1, "kind": "build", "cause": null, "verdict": null, "sha": null, "started": "2026-10-07T20:09:00+02:00" }],
@@ -86,7 +88,7 @@ with offset, seconds precision (`2026-10-07T20:09:01+02:00`). Unknown values are
 | `ready` | bool | written by mk-state: has deps, `planned`/`routed`, every dep met. A flip to true logs a `deps met` note; the dashboard toasts it |
 | `status` | enum | `planned → routed → dispatched → building → verifying → review → fix → merged → qa → done`; side states `blocked \| quota \| stalled \| provider` |
 | `agent` | string \| null | agent kind or pane (`codex`, `agy`, ...) |
-| `model`, `effort`, `lane` | string \| null | `lane` = worktree path |
+| `model`, `effort`, `lane`, `pane` | string \| null | `lane` = worktree path; `pane` = herdr pane id of that lane (`wK:p1`), written by `mk-lane-event.py arm` (`mk-state task set <T> pane=<pane>`, best-effort) |
 | `last_commit` | string \| null | short sha; also copied to the current round's `sha` |
 | `gates` | any JSON \| null | e.g. `{"test": "pass", "tsc": "pass"}` (pass a JSON value to `task set`) |
 | `verdict` | string \| null | latest review verdict; also copied to the current round's `verdict` |
@@ -122,15 +124,25 @@ unless `--force`.
 ## Usage ledger additions (lane-health QUOTA fallback)
 
 lane-health writes into `<home>/usage.json` → `agents.<kind>` (`--kind claude|codex|opencode|agy`;
-pane name if no kind). It never touches CodexBar fields; it sets `source: "pane-text"` only when the
-entry did not exist yet.
+pane name if no kind), or → `agents.<kind>.pools.<pool>` with `--pool NAME` for one OpenCode
+provider's plan (`zai`, `go`, `ollama`, `zen`), which is where a mark belongs when CodexBar reports no
+windows for that plan at all. It never touches CodexBar fields; it sets `source: "pane-text"` only when
+the entry did not exist yet. Both read-modify-writes (this one and `mk-usage.py`'s poll) hold the
+`<home>/usage.json.lock` flock for the whole cycle.
 
 ```json
 {"agents": {"agy": {"source": "codexbar", "windows": ["…CodexBar data, untouched…"],
   "exhausted_until": "2026-10-13T18:43:00+02:00", "exhausted_window": "weekly", "exhausted_guess": false,
   "exhausted_source": "pane-text", "exhausted_observed_at": "2026-10-07T12:00:00+02:00",
-  "exhausted_evidence": ["Individual quota reached"]}}}
+  "exhausted_evidence": ["Individual quota reached"]},
+  "opencode": {"pools": {"zai": {"five_hour": null, "weekly": null,
+    "exhausted_until": "2026-10-08T16:16:57+02:00", "exhausted_window": "5h", "exhausted_guess": false,
+    "exhausted_source": "pane-text", "exhausted_observed_at": "2026-10-08T11:50:00+02:00",
+    "exhausted_evidence": ["Usage limit reached for 5 hour"]}}}}}
 ```
+
+The same field set, written either on the agent (`agents.<kind>`) or on one plan
+(`agents.<kind>.pools.<pool>`, `--pool`).
 
 | Field | Meaning |
 |---|---|
@@ -139,9 +151,11 @@ entry did not exist yet.
 | `exhausted_guess` | true when `exhausted_until` is the +5h assumption. A later hit without a reset time never replaces a known future `exhausted_until` |
 | `exhausted_source` / `_observed_at` / `_evidence` | `"pane-text"`, when, the matched phrases (max 2) |
 
-**Contract with `mk-usage.py` (P2):** it keeps every `exhausted_*` field when it rewrites an agent
-entry, and clears them (sets `exhausted_until` to `null`, may drop the rest) once `exhausted_until` has
-passed. Readers: an agent is exhausted while `exhausted_until` is non-null and in the future; null or
+**Contract with `mk-usage.py` (P2):** it keeps every `exhausted_*` field when it rewrites an agent entry
+— and, the same way, when it rewrites a pool entry — and clears them (sets `exhausted_until` to `null`,
+may drop the rest) once `exhausted_until` has passed. Only a pane-text mark whose `exhausted_until` is
+still in the future is kept; an `exhausted_until` this script wrote itself is recomputed every poll.
+Readers: an agent (or a pool) is exhausted while `exhausted_until` is non-null and in the future; null or
 past = not blocked by pane text (CodexBar windows still apply).
 
 ## Usage ledger pools (mk-usage.py)
@@ -158,10 +172,11 @@ everything else `default`.
             "claude-gpt": {"five_hour": {}, "weekly": {}, "exhausted_until": "2026-10-13T06:00:45Z"}}}}
 ```
 
-- `pools.<name>` = `{five_hour, weekly, exhausted_until}`; `exhausted_until` = latest reset among that pool's windows at >= 100%, else null.
+- `pools.<name>` = `{five_hour, weekly, exhausted_until}`; `exhausted_until` = latest reset among that pool's windows at >= 100%, else null. A pool may also carry the lane-health `exhausted_*` set (`--pool`), so its shape is `{five_hour, weekly, exhausted_until, exhausted_window, exhausted_guess, exhausted_source, exhausted_observed_at, exhausted_evidence}`.
 - Agent-level `five_hour` / `weekly` = the primary pool (agy `gemini`, others `default`); if that pool is absent, the first pool present.
 - Agent-level `exhausted_until` = the primary pool's `exhausted_until` (claude `default`, agy `gemini`). Another pool being free does not clear it: claude's `fable` is a sub-scope, so a 100% `default` pool makes Claude exhausted. `available_pools` lists every pool not exhausted — a router wanting a secondary pool (agy `claude-gpt`, claude `fable`) checks it.
-- A future pane-text `exhausted_until` from lane-health overrides the pools (pane text is newer evidence); the later of the two wins.
+- A future pane-text `exhausted_until` **on the agent** from lane-health overrides that agent's own pools (pane text is newer evidence); the later of the two wins.
+- **A pane-text mark on a pool survives a poll**, exactly as one on an agent does: it is kept while its `exhausted_until` is in the future, and CodexBar replaces it only when it reports a *later* `exhausted_until` for that same pool. A poll that reports no window for the plan — the normal case for every OpenCode one — therefore leaves the mark in place instead of recomputing it away; once the marked window has passed the mark is dropped. The mark lives inside `pools.<name>`, the dict `available_pools` is derived from, so a marked plan stops being offered to the router even though the agent-level `exhausted_until` stays `null` (one plan down is not the whole agent down).
 
 ## CLI
 
@@ -171,8 +186,8 @@ everything else `default`.
 | `run list` / `run get` | `run get [--id ID \| ID]` (default: the single active run) |
 | `run set` | `[--id ID] [--next TEXT] [--status active\|done]` (at least one) |
 | `run stage` / `run archive` | `run stage N` (N >= 0, `[--id ID]`); `run archive --id ID` or `run archive ID` |
-| `task add` | `--id T --title TEXT [--wave N] [--deps A,RUN:B] [--owned glob,glob] [--parent P]` — deps are stored in the target's stored id case and a self-dep is refused; `--parent` onto a task in `merged`/`qa`/`done` fails; returns `warnings` for unknown deps, owned globs overlapping an unmerged task in any active run, and active sibling runs that could not be read |
-| `task set` | `T key=value ... [--note TEXT] [--force]` (`--force`: dispatch past unmet own+ancestor deps); `status=` on a task with children fails (it rolls up); keys `status agent model effort lane last_commit gates verdict`; a value starting `{`/`[` is parsed as JSON, empty = null |
+| `task add` | `--id T --title TEXT [--wave N] [--deps A,RUN:B] [--owned glob,glob] [--parent P]` — deps are stored in the target's stored id case and a self-dep is refused; `--parent` onto a task in `merged`/`qa`/`done` fails; returns `warnings` for unknown deps, owned globs overlapping an unmerged task in any active run (the new task's own `--parent` chain is not an overlap: a parent owns its children's globs), and active sibling runs that could not be read |
+| `task set` | `T key=value ... [--note TEXT] [--force]` (`--force`: dispatch past unmet own+ancestor deps); `status=` on a task with children fails (it rolls up); keys `status agent model effort lane pane last_commit gates verdict`; a value starting `{`/`[` is parsed as JSON, empty = null |
 | `task round` | `T --kind build\|fix\|takeover [--cause TEXT]` |
 | `task get` | `T` |
 | `event` | `[--task T] --type transition\|decision\|verdict\|quota\|note --text TEXT [--from S] [--to S]` |
