@@ -272,7 +272,7 @@ export function buildYaml(d: MkWizardDraft, checkedAt: string): string {
   kv(0, 'data_dir', d.dataEnv != null || d.dataMode === 'home' ? `${dataDirOf(d) ?? ''}/` : '.matrixkoder/', 'project data dir')
   L.push('repo:')
   kv(2, 'integration_branch', d.branch, 'lanes merge here; one PR to main at the end')
-  kv(2, 'worktree_pattern', '../{repo}-worktree-{x}')
+  kv(2, 'lanes', { slots: 1, pattern: '../{repo}-mk-{n}', reuse: true }, 'reusable worktree slots; the cap is max_build_lanes')
   kv(2, 'conventions', [])
   L.push('gates:')
   kv(2, 'install', g.install, proposed(g.install))
