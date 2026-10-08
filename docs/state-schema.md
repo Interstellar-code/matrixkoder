@@ -139,15 +139,19 @@ Every read-modify-write holds an exclusive `fcntl.flock` on `<data>/lanes.lock` 
 
 ### What makes a slot reusable (`acquire` and `release` both refuse, exit 3)
 
-- **Clean working tree.** `git status --porcelain --ignored --untracked-files=normal
-  --ignore-submodules=none`: the flags are on the command line on purpose, because
+- **Clean working tree.** `git status --porcelain=v1 -z --ignored --untracked-files=normal
+  --ignore-submodules=none`, split on NUL. `-z` is what makes this trustworthy: porcelain v1
+  C-quotes a path with a space, a non-ASCII byte or a leading `:`, and a quoted path matches nothing
+  and reads as untracked. The flags are on the command line on purpose, because
   `status.showUntrackedFiles=no` in the user's config would otherwise hide `??` lines and this check
-  is the only thing between a hidden untracked file and `git worktree remove`. Every line must be an
+  is the only thing between a hidden untracked file and `git worktree remove`. Every record must be an
   ignored entry (`!! …`) on the allowlist: `.matrixkoder-*`, `.env`, `.env.*`, `node_modules/`,
   `.omc/`, `.serena/`, `.venv/`, `__pycache__/` plus `lanes_disposable`. The three build-cache dirs
-  (`node_modules/`, `__pycache__/`, `.venv/`) match as a path component at any depth — but only
-  while that directory holds no tracked files, so a vendored (tracked) `lambda/node_modules/` is source
-  and an ignored file inside it keeps the slot dirty. Every other entry is root-only.
+  (`node_modules/`, `__pycache__/`, `.venv/`) match as a path component at any depth; every other
+  entry is root-only. A **directory** entry is disposable only while the repo tracks nothing inside
+  it, at every level including the root: `git --literal-pathspecs ls-files -z -- <dir>` must be empty
+  (a non-zero exit counts as tracked, i.e. dirty). A vendored `node_modules/`, `.venv/` or a dir named
+  `:x` is therefore source, and an ignored file inside it keeps the slot dirty.
   `lanes_disposable` entries must be literal names (`[A-Za-z0-9._-]+`, optional trailing `/`) — a `*`
   would make every ignored file disposable, so rejected entries are reported in the `warnings` field
   of every `ok` answer instead of being applied, and so is a `lanes:` line that does not parse (the
@@ -166,9 +170,13 @@ Every read-modify-write holds an exclusive `fcntl.flock` on `<data>/lanes.lock` 
 - **Refs are untrusted.** `--base` / `--integration` may not start with `-` and must resolve through
   `git rev-parse --verify --quiet --end-of-options <ref>^{commit}`; generated branch names go through
   `git check-ref-format --branch`. git — and herdr — then get the resolved sha.
-- **`--integration` is a branch, not a commit.** It must resolve to `refs/heads/<name>`, and must not be
-  the slot's own task branch: as its own "integration" the merged check would pass with nothing but the
-  slot's HEAD pointing at those commits. The task branch is looked up as `refs/heads/<b>`, so a tag of
+- **`--integration` is a branch, not a commit.** It must resolve to `refs/heads/<name>` *in its stored
+  spelling* — `git for-each-ref --format=%(refname) -- refs/heads/<name>` must echo it back — and must
+  not be the slot's own task branch. On a case-insensitive filesystem (macOS, `core.ignorecase`) git
+  resolves a loose ref under any case and `rev-parse --symbolic-full-name` echoes the alias, so
+  `--integration MK/R1/T2` would otherwise pass as the task branch `mk/r1/t2`. Ref names are compared
+  as strings; no tip-sha comparison is made, because integration == task tip is a legitimate
+  fast-forward merge. The task branch is looked up as `refs/heads/<b>`, so a tag of
   the same name cannot shadow it, and it is kept (not deleted) while `git worktree list --porcelain`
   shows it checked out in another worktree — `update-ref -d` does not know about worktrees.
 

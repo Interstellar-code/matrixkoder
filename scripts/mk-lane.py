@@ -390,50 +390,64 @@ def dirs_named(path, name):
     return ["/".join(parts[:i + 1]) for i in range(len(parts) - 1) if parts[i] == name]
 
 
-def disposable_ok(path, patterns, is_tracked=None):
-    """Is an ignored entry disposable? A trailing-`/` entry covers its whole subtree — at the root, or
-    at any depth when it is one of ANY_DEPTH — while a name must match the path itself at the root
-    (fnmatch, so `.matrixkoder-*` and `.env.*` are globs).
+def disposable_ok(path, patterns, has_tracked=None):
+    """Is an ignored entry disposable?
 
-    An ANY_DEPTH match counts only when that directory is untracked: a vendored (tracked)
-    `lambda/node_modules/` is source, and an ignored file inside it is user data, not a build cache.
-    `is_tracked` answers "does this repo track files under <rel dir>"; without it the depth rule is
-    taken at face value."""
-    p = path.strip().rstrip("/")
+    A trailing-`/` allowlist entry covers its whole subtree — at the root, or at any depth when it is
+    one of ANY_DEPTH — while a name must match the path itself at the root (fnmatch, so
+    `.matrixkoder-*` and `.env.*` are globs). A directory entry is only disposable while the repo
+    tracks nothing inside it, at EVERY level: a vendored `node_modules/` or `.venv/` is source, and an
+    ignored file inside it is user data, not a build cache. `has_tracked(dir)` answers that question;
+    without it a directory match is taken at face value."""
+    raw = path.strip()
+    p = raw.rstrip("/")
     for pat in patterns:
-        if pat.endswith("/"):
-            name, root = pat[:-1], pat
-            if p == name or p.startswith(root):
+        if not pat.endswith("/"):
+            if p == pat or fnmatch.fnmatchcase(p, pat) or fnmatch.fnmatchcase(p + "/*", pat):
                 return True
-            if pat in ANY_DEPTH and f"/{name}/" in f"/{p}/":
-                if is_tracked is None or not any(is_tracked(d) for d in dirs_named(p, name)):
-                    return True  # packages/a/node_modules/, scripts/__pycache__/, …
-        elif p == pat or fnmatch.fnmatchcase(p, pat) or fnmatch.fnmatchcase(p + "/*", pat):
-            return True
+            continue
+        name = pat[:-1]
+        if p == name or p.startswith(pat):  # the allowlisted dir itself, or something inside it
+            if has_tracked is None or not has_tracked(name):
+                return True
+        elif pat in ANY_DEPTH and f"/{name}/" in f"/{p}/":
+            inner = dirs_named(p, name)  # packages/a/node_modules/, scripts/__pycache__/, …
+            if has_tracked is None or not any(has_tracked(d) for d in inner):
+                return True
     return False
 
 
 def clean_state(path, cfg):
-    """-> (clean, dirty lines): `git status --porcelain --ignored` in the slot may list nothing but
-    ignored entries on the allowlist. Read-only: it never repairs, only reports.
-    The untracked/submodule flags are given on the command line on purpose: `status.showUntrackedFiles`
-    and `diff.ignoreSubmodules` in the user's config would otherwise hide `??` lines, and this check
-    is the only thing standing between a hidden untracked file and `git worktree remove`."""
-    r = run_cmd(["git", "-C", path, "status", "--porcelain", "--ignored", "--untracked-files=normal",
-                 "--ignore-submodules=none"], 60)
+    """-> (clean, dirty lines): `git status --porcelain=v1 -z --ignored` in the slot may list nothing
+    but ignored entries on the allowlist, and no allowlisted directory may hold tracked files. Read-only:
+    it never repairs, only reports.
+
+    `-z` is what makes the check trustworthy: porcelain v1 C-quotes a path with a space, a non-ASCII
+    byte or a leading `:`, and a quoted path matches nothing and reads as untracked. The flags are on
+    the command line on purpose — `status.showUntrackedFiles=no` in the user's config would otherwise
+    hide `??` lines, and this check is the only thing standing between a hidden untracked file and
+    `git worktree remove`."""
+    r = run_cmd(["git", "-C", path, "status", "--porcelain=v1", "-z", "--ignored",
+                 "--untracked-files=normal", "--ignore-submodules=none"], 60)
     if r.returncode != 0:
         raise Fail(f"git status in {path} failed", stderr=(r.stderr or r.stdout).strip()[:400])
     allow = tuple(DISPOSABLE) + tuple(cfg["disposable"])
-    tracked = {}
+    cache = {}
 
-    def is_tracked(rel):
-        if rel not in tracked:
-            t = run_cmd(["git", "-C", path, "ls-files", "--", rel], 30)
-            tracked[rel] = bool(t.stdout.strip())
-        return tracked[rel]
+    def has_tracked(rel):
+        """-> does this repo track files under <rel>? --literal-pathspecs so a dir named `:(z)` or
+        `:x` is a path and not pathspec magic; a non-zero exit counts as tracked (fail closed)."""
+        if rel not in cache:
+            t = run_cmd(["git", "-C", path, "--literal-pathspecs", "ls-files", "-z", "--", rel], 30)
+            cache[rel] = t.returncode != 0 or bool(t.stdout.strip())
+        return cache[rel]
 
-    dirty = [ln for ln in r.stdout.splitlines()
-             if not (ln.startswith("!! ") and disposable_ok(ln[3:], allow, is_tracked))]
+    dirty = []
+    for rec in r.stdout.split("\0"):  # NUL-separated records: paths arrive exactly as on disk
+        if not rec:
+            continue
+        if not (rec.startswith("!! ") and disposable_ok(rec[3:], allow, has_tracked)):
+            dirty.append(rec)
     return not dirty, dirty
 
 
@@ -492,8 +506,14 @@ def branch_ref(main, ref, what="--integration"):
     full = r.stdout.strip()
     if r.returncode != 0 or not full.startswith("refs/heads/"):
         raise Fail(f"{what} {ref!r} must be an existing local branch (refs/heads/…), not a sha or tag")
-    name = full[len("refs/heads/"):]
-    return name, check_ref(main, full, what)
+    # A case-insensitive filesystem (macOS, core.ignorecase) resolves a loose ref by any case and
+    # rev-parse echoes the alias back, so `MK/R1/T2` would pass as the task branch `mk/r1/t2`. Only
+    # the real ref list knows the stored spelling.
+    real = run_cmd(["git", "-C", main, "for-each-ref", "--format=%(refname)", "--", full])
+    if real.returncode != 0 or real.stdout.strip() != full:
+        raise Fail(f"{what} {ref!r} is not the stored spelling of a local branch "
+                   f"(no ref named {full!r})")
+    return full[len("refs/heads/"):], check_ref(main, full, what)
 
 
 def branch_holder(main, name, own_path=""):
@@ -1179,6 +1199,70 @@ def self_test():
             assert w["cap"] == DEFAULTS["cap"] and w["slots"][0]["path"] == slot1  # defaults kept
         yaml_cap(1, 1)
         assert "warnings" not in mk("list")
+
+        # 11g an ignored file inside a TRACKED allowlist directory, in all seven shapes the review
+        # reproduces: at the root, under a name with a space, non-ASCII, and two that read as
+        # pathspec magic. The ignore rules are narrowed to prod.sqlite so each dir can hold a tracked
+        # file — adding one under an ignored dir would need a forced add, which this file never uses.
+        shapes = ["node_modules", ".venv", ".omc", "my dir/node_modules", "café/node_modules",
+                  ":x/node_modules", ":(z)/node_modules"]
+        for junk in ("node_modules", ".omc", "pkg/a/node_modules", ".venv", "scripts/__pycache__",
+                     ".matrixkoder-report-r1.md"):  # the ignored fixtures only: pkg/a/src/app.js is tracked
+            victim = os.path.join(slot1, junk)
+            if os.path.isdir(victim):
+                shutil.rmtree(victim)
+            elif os.path.exists(victim):
+                os.unlink(victim)
+        yaml_cap(2, 2)
+        write(os.path.join(integ, ".gitignore"), "prod.sqlite\n")
+        for rel in shapes:
+            write(os.path.join(integ, rel, "x.js"), "// tracked\n")
+        g("-C", integ, "add", "-A"), g("-C", integ, "commit", "-qm", "tracked cache dirs")
+        for rel in shapes:  # ignored, so untracked: the fixture is the file only
+            write(os.path.join(integ, rel, "prod.sqlite"), "data\n")
+        assert mk("acquire", "--run", "r1", "--task", "tg", "--base", "mk/r1/integration")["slot"] == 1
+        assert mk("acquire", "--run", "r1", "--task", "th", "--base", "mk/r1/integration")["slot"] == 2
+        assert mk("release", "--slot", "1", "--integration", "mk/r1/integration")["ok"]
+        assert mk("release", "--slot", "2", "--integration", "mk/r1/integration")["ok"]
+        for slot in (slot1, slot2):  # ignored inside a tracked dir: the shape the review lost data on
+            for rel in shapes:
+                write(os.path.join(slot, rel, "prod.sqlite"), "data\n")
+        assert all(not s["clean"] for s in mk("list")["slots"]), mk("list")
+        out = mk("gc", "--keep", "1")
+        assert out["removed"] == [] and [x["slot"] for x in out["skipped"]] == [2], out
+        assert out["skipped"][0]["reason"].startswith("dirty: !! ") \
+            and "prod.sqlite" in out["skipped"][0]["reason"], out
+        d = mk("acquire", "--run", "r1", "--task", "ti", "--base", "mk/r1/integration", code=3)
+        assert d["error"] == "slot 1 dirty", d
+        for rel in shapes:  # every one of them is named as dirty, unquoted, and still on disk
+            assert f"!! {rel}/prod.sqlite" in d["dirty"], (rel, d["dirty"])
+            for slot in (slot1, slot2):
+                assert os.path.exists(os.path.join(slot, rel, "prod.sqlite")), (slot, rel)
+        for slot in (slot1, slot2):  # clean up the ignored fixtures
+            for rel in shapes:
+                os.unlink(os.path.join(slot, rel, "prod.sqlite"))
+        write(os.path.join(integ, ".gitignore"), "node_modules/\n__pycache__/\n/.venv/\n.omc/\nprod.sqlite\n")
+        g("-C", integ, "add", ".gitignore"), g("-C", integ, "commit", "-qm", "full ignores")
+        assert mk("acquire", "--run", "r1", "--task", "ti", "--base", "mk/r1/integration")["ok"]
+        # the plain case must stay clean: an untracked node_modules/ is still a disposable cache dir
+        write(os.path.join(slot1, "pkg", "node_modules", "dep", "i.js"), "x\n")
+        assert mk("list")["slots"][0]["clean"] is True, mk("list")
+        shutil.rmtree(os.path.join(slot1, "pkg", "node_modules"))
+        assert mk("release", "--slot", "1", "--integration", "mk/r1/integration")["ok"]
+        assert mk("gc", "--keep", "1")["removed"] == [2]  # back to one slot for the rest
+        yaml_cap(1, 1)
+
+        # 11h ref names are compared by their stored spelling: on a case-insensitive filesystem
+        # `--integration MK/R1/TJ` resolves to the loose refs/heads/mk/r1/tj and rev-parse echoes the
+        # alias back, so a name comparison alone would accept it as the task branch
+        assert mk("acquire", "--run", "r1", "--task", "tj", "--base", "mk/r1/integration")["slot"] == 1
+        write(os.path.join(slot1, "alias.md"), "work\n")
+        g("-C", slot1, "add", "-A"), g("-C", slot1, "commit", "-qm", "work"), merge_integration("mk/r1/tj")
+        alias = mk("release", "--slot", "1", "--integration", "MK/R1/TJ", code=2)
+        assert alias["ok"] is False and "branch" in alias["error"], alias
+        assert g("rev-parse", "--verify", "--quiet", "refs/heads/mk/r1/tj").returncode == 0
+        assert mk("list")["slots"][0]["state"] == "busy"  # nothing happened
+        assert mk("release", "--slot", "1", "--integration", "mk/r1/integration")["branch_deleted"]
 
         # 12 the pattern can never re-aim a slot, and a slot path is always ours to touch
         other = os.path.join(tmp, "other-1")
