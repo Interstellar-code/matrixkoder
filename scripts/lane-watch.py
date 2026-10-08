@@ -14,6 +14,8 @@ Done = latest commit subject matches REGEX AND (report exists, if given) AND age
 "<PHASE> BLOCKED: <question>" in the pane → BLOCKED with the question (the later of DONE / BLOCKED wins).
 A herdr ERROR is retried; the watcher exits ERROR after 3 in a row, or on any crash (still one JSON line).
 Idle/done agent, not Done, and no file/commit change for --stall-min since watch start → STALL.
+Pane output that changed since the last poll (digits ignored, so a ticking timer is not activity) counts as
+activity too: a builder running tests or a revert/re-apply proof without touching files is not STALL.
 With --then-send, on DONE it dispatches "Read and follow <BRIEF_PATH> exactly ..." to the same agent
 via the herdr skill's herdr-ask.py (which refuses busy agents, so we only send once idle).
 With --task and --data (both or neither), every exit writes the task status via mk-state (DONE→verifying,
@@ -63,6 +65,12 @@ def phase_tokens(text, phase):
     if blocked and (not done or blocked[-1].start() > done[-1].start()):
         return False, blocked[-1].group(1).strip()
     return bool(done), None
+
+
+def pane_fingerprint(text):
+    """Pane text with digits dropped: spinners and elapsed-time counters change digits only.
+    ponytail: a hung CLI that redraws non-digit text (an animated spinner glyph) still looks active; match its spinner line here if that shows up."""
+    return re.sub(r"\d+", "", text)
 
 
 def decide(h, subj, rx, report_ok, text, phase, stall_min):
@@ -123,9 +131,15 @@ def watch(a):
     stall_min = float(opt(a, "--stall-min", "10"))
     rx = re.compile(grep)
     start, errors = time.time(), 0
+    active, last_fp = start, None  # last time the pane showed new output
     while True:
         subj = commit_subject(lane)
-        h = lh.check(agent, lane, kind, stall_min, start, marker)
+        h = lh.check(agent, lane, kind, stall_min, active, marker)
+        fp = pane_fingerprint(h.get("text", ""))
+        if last_fp is not None and fp != last_fp:  # pane moved: idle time counts from now, re-check with it
+            active = time.time()
+            h = lh.check(agent, lane, kind, stall_min, active, marker)
+        last_fp = fp
         report_ok = not report or os.path.exists(os.path.join(lane, report))
         state, ev = decide(h, subj, rx, report_ok, h.get("text", ""), phase, stall_min)
         errors = errors + 1 if state == "ERROR" else 0
@@ -182,6 +196,9 @@ def self_test():
     assert decide({**ok, "agent_status": "working", "last_change_min": 11}, other, rx, True, "", None, 10)[0] is None
     st, ev = decide({**ok, "last_change_min": 11}, good, rx, True, "", "P1", 10)  # committed but no token
     assert st == "STALL" and "P1 DONE token" in ev[0] and "matching commit" not in ev[0]
+    # pane activity: digit-only changes (timers) are not activity; new output lines are
+    assert pane_fingerprint("Working (12s) esc to interrupt") == pane_fingerprint("Working (73s) esc to interrupt")
+    assert pane_fingerprint("$ vitest run\n") != pane_fingerprint("$ vitest run\n 10 failed\n")
     # status map covers every mapped exit with a valid mk-state status
     sp = importlib.util.spec_from_file_location("mk_state", MK_STATE)
     mk = importlib.util.module_from_spec(sp)

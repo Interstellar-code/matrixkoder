@@ -10,7 +10,7 @@ Repo: this folder (worktree `<path>`, branch `<branch>`, at `<sha>`: <what is al
 Do NOT touch: <list>
 
 ## Tests (must exercise real code)
-<required tests, stated as acceptance ("Back with a dirty draft + Cancel keeps the draft"). Mock only the network edge (fetch / engine client), never the module under test. For every new client call, the server route must exist and be tested. Each fix/guard test must fail on the old code — check it, then restore by re-applying your edit, and say so in the report.>
+<required tests, stated as acceptance ("Back with a dirty draft + Cancel keeps the draft"). Mock only the network edge (fetch / engine client), never the module under test. For every new client call, the server route must exist and be tested. Each fix/guard test must fail on the old code — check it, then restore by re-applying your edit, and say so in the report. Keep the patch inside this lane, never in `$TMPDIR` or `/tmp`: `git diff -- <source files> > .matrixkoder-old-code.patch && git apply -R .matrixkoder-old-code.patch`, run the tests, then `git apply .matrixkoder-old-code.patch` (the file is git-excluded). Do it in one go: do not stop with the source edits removed.>
 
 ## Commands (foreground only — wait for each)
 - Install: `<cmd>`
