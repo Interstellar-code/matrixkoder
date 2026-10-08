@@ -16,7 +16,7 @@ allowed, renaming or removing one needs `schema` bumped.
 | Board | `<data>/runs/<run_id>/board.md` — regenerated on every write and by `render` |
 | Lane registry | `<data>/lanes.json` — written **only** by `mk-lane.py` (see below); `mk-state.py` never touches it |
 | Task | `<data>/runs/<run_id>/tasks/<task_id>/task.json` (copy of the task object in `run.json`) |
-| Round files | same folder: `brief-rN.md`, `report-rN.md`, `review-rN.md` (paths returned by `task round`; written by the orchestrator / agents, not by mk-state) |
+| Round files | same folder: `brief-rN.md`, `report-rN.md`, `review-rN.md` (paths returned by `task round`; written by the orchestrator / agents, not by mk-state; `task round --undo` refuses while any of them exists for the latest round) |
 | Locks | `<home>/locks/<resource lower-cased>.lock` |
 | Usage ledger | `<home>/usage.json` (owned by `mk-usage.py`; lane-health only adds `exhausted_*` fields, on the agent or on one pool, see below) |
 | Usage ledger lock | `<home>/usage.json.lock` — an empty sidecar every read-modify-write of `usage.json` takes as an exclusive `fcntl.flock` (`mk-usage.py`'s poll and lane-health's quota mark; the two would otherwise lose each other's fields). It holds no data, and it is derived from `<home>` rather than from the ledger path, so writers pointed at different `--out`/`--ledger` paths still serialise |
@@ -103,7 +103,7 @@ and legacy path-only runs.
 | `verdict` | string \| null | latest review verdict; also copied to the current round's `verdict` |
 | `round` | int | current round number (0 = none yet) |
 | `rounds` | array | `{n, kind: build\|fix\|takeover, cause, verdict, sha, started}` |
-| `plan_phase`, `route`, `lane_group` | string \| null | **C4**: set on a *phase* task created by `run init --plan` — the plan phase id, its pinned `route` (`""` = Jev decides, stored `null`), and its `lane_group` (phases sharing a value share one worktree). `null` on ad-hoc tasks (`task add`) and children || `plan_task` | string \| null | **C4**: set on a *child* task created from a `[[phase.task]]` — the plan task id (`P1.1`); its `parent` is the phase task. `null` on ad-hoc and phase tasks |
+| `plan_phase`, `route`, `lane_group`, `reviewer` | string \| null | **C4**: set on a *phase* task created by `run init --plan` — the plan phase id, its pinned `route` (`""` = Jev decides, stored `null`), its `lane_group` (phases sharing a value share one worktree), and the phase's `reviewer` (`""` = orchestrator decides, stored `""` — the plan's value or `""` when absent; `task set reviewer=` rewrites it). `null` on ad-hoc tasks (`task add`) and children; the `reviewer` key is absent there until `task set` adds it || `plan_task` | string \| null | **C4**: set on a *child* task created from a `[[phase.task]]` — the plan task id (`P1.1`); its `parent` is the phase task. `null` on ad-hoc and phase tasks |
 
 ## `events.jsonl` line
 
@@ -276,8 +276,8 @@ everything else `default`.
 | `run set` | `[--id ID] [--next TEXT] [--status active\|done]` (at least one) |
 | `run stage` / `run archive` | `run stage N` (N >= 0, `[--id ID]`); `run archive --id ID` or `run archive ID` |
 | `task add` | `--id T --title TEXT [--wave N] [--deps A,RUN:B] [--owned glob,glob] [--parent P]` — deps are stored in the target's stored id case and a self-dep is refused; `--parent` onto a task in `merged`/`qa`/`done` fails; returns `warnings` for unknown deps, owned globs overlapping an unmerged task in any active run (the new task's own `--parent` chain is not an overlap: a parent owns its children's globs), and active sibling runs that could not be read |
-| `task set` | `T key=value ... [--note TEXT] [--force]` (`--force`: dispatch past unmet own+ancestor deps); `status=` on a task with children fails (it rolls up); keys `status agent model effort lane pane branch workspace slot last_commit gates verdict`; a value starting `{`/`[` is parsed as JSON, empty = null |
-| `task round` | `T --kind build\|fix\|takeover [--cause TEXT]` |
+| `task set` | `T key=value ... [--note TEXT] [--force]` (`--force`: dispatch past unmet own+ancestor deps); `status=` on a task with children fails (it rolls up); keys `status agent model effort lane pane branch workspace slot last_commit gates verdict reviewer`; a value starting `{`/`[` is parsed as JSON, empty = null |
+| `task round` | `T --kind build\|fix\|takeover [--cause TEXT]`; `T --undo` drops the latest round — but only while none of its brief/report/review files exist (the paths `task round` returned), else `ok:false` naming them; exactly one note event (`round N undone`); no rounds / `--kind` with `--undo` are refused |
 | `task get` | `T` |
 | `event` | `[--task T] --type transition\|decision\|verdict\|quota\|note --text TEXT [--from S] [--to S]` |
 | `wait set` / `wait clear` | `--question TEXT --options a,b [--rec TEXT]` |
@@ -293,7 +293,8 @@ Every `mk-state.py` command prints exactly one JSON line: `{"ok": true, ...}` ex
 `{"ok": false, "error": "..."}` exit 2 on bad input or a corrupt/unreadable state file; lock refused →
 exit 1 with `state` and `lock`. A malformed sibling active run only produces a `warnings` entry
 and is skipped for cross-run `ready`/board upkeep. Flags never prefix-match (`--fo` is an unknown
-argument). `task round` returns `{round, kind, brief, report, review}` absolute paths for that round.
+argument). `task round` returns `{round, kind, brief, report, review}` absolute paths for that round;
+`task round --undo` returns `{round, undone}` with `round` back to the remaining round number.
 
 lane-watch exit → task status (with `--task --data`, both required together): `DONE`/`DONE_SENT → verifying`,
 `QUOTA → quota`, `STALL → stalled`, `PROVIDER → provider`, `BLOCKED → blocked` — only while the task is
@@ -305,8 +306,9 @@ logged. `DEV_SERVER`, `ERROR`, `WATCH_EXPIRED` only append a `note` event.
 `mk-state.py` never imports `mk-plan.py`; it runs it as a subprocess (`$MK_PLAN_CMD` overrides the
 command) and consumes its one JSON line (`parse`, `check`, `set --status`, `add-run`). Stored fields:
 `run.json` `plan_id`/`plan_sha`/`plan_status` + index `plan`; phase task `plan_phase`/`route`/
-`lane_group`; child task `plan_task` (its `parent` names the phase task). All `null` for plan-less
-runs/tasks; a legacy run keeps its path-only `plan` field and the plain `plan: \`path\`` board line.
+`lane_group`/`reviewer`; child task `plan_task` (its `parent` names the phase task). All `null` for
+plan-less runs/tasks (a phase's `reviewer` is `""`, never `null`, when the plan has none); a legacy
+run keeps its path-only `plan` field and the plain `plan: \`path\`` board line.
 The board of a plan-linked run shows `plan: \`id\` · status · sha \`…12\`` and, when the plan file's
 current sha256 (plain read) differs from `plan_sha`, a `⚠ plan file changed since run start` line —
 an unreadable plan file means no warning and no crash. Setting the **last** run of a plan `done`
