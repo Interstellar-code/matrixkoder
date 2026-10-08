@@ -75,29 +75,19 @@ export function registerDashboard(on: On, options: PluginOptions): void {
         // the engine seats the pane itself; a refusal is not fatal
       }
     }
-    const min = typeof options.usagePollMin === 'number' && options.usagePollMin > 0
-      ? Math.max(USAGE_POLL_MIN_MIN, options.usagePollMin)
-      : USAGE_POLL_DEFAULT_MIN
-    const cwd = e.cwd // the session's own words for where it runs; timers capture it
-    // timers first: a throwing first load must never leave the loop dead
-    // a cancel may come back as a plain function or a { cancel } handle (mock clock)
-    const arm = (cancel: unknown): (() => void) =>
-      typeof cancel === 'function' ? (cancel as () => void) : () => { (cancel as { cancel?: () => void }).cancel?.() }
-    timerRegistry.cancelRefresh?.()
-    timerRegistry.cancelRefresh = arm($.clock.every(REFRESH_MS, () => refreshSafe($, options, cwd)))
-    timerRegistry.cancelPoll?.()
-    timerRegistry.cancelPoll = arm($.clock.every(Math.round(min * 60_000), () => pollUsage($, cwd)))
-    timerRegistry.cancelSweep?.()
-    timerRegistry.cancelSweep = arm($.clock.every(SWEEP_INTERVAL_MS, () => sweepLanes($, cwd)))
-    lastChipText = undefined
-    await refreshSafe($, options, cwd) // first load populates pane + chip and never toasts
-    const gdir = await globalDirOf($, await homeDir($))
-    const usageMissing = gdir == null || (await readJson($, usagePath(gdir))) == null
-    if (usageMissing) void pollUsage($, cwd) // cold start: do not show "no ledger yet" for N minutes
+    await startLoop($, options, e.cwd) // the session's own words for where it runs; timers capture it
     return next(e)
   })
 
   on('command.run', { command: 'mk' }, async ($, e, next) => {
+    // /clear fires session.end (timers cancelled) but never session.start: /mk re-arms the loop
+    if (timerRegistry.cancelRefresh == null) {
+      try {
+        await startLoop($, options, await $.session.cwd())
+      } catch {
+        // no cwd — the pane keeps its last snapshot
+      }
+    }
     const args = e.args.trim().split(/\s+/)[0]?.toLowerCase() ?? ''
     if (args === 'setup' || args === 'init') {
       // wizard.tsx's command.run hook (registered after this one) answers: $ cannot cross an import
@@ -152,6 +142,28 @@ export function registerDashboard(on: On, options: PluginOptions): void {
       </Box>
     )
   })
+}
+
+/** Arms the refresh, usage-poll and lane-sweep timers for `cwd`, then loads the first snapshot. */
+async function startLoop($: EngineInterface, options: PluginOptions, cwd: string): Promise<void> {
+  const min = typeof options.usagePollMin === 'number' && options.usagePollMin > 0
+    ? Math.max(USAGE_POLL_MIN_MIN, options.usagePollMin)
+    : USAGE_POLL_DEFAULT_MIN
+  // timers first: a throwing first load must never leave the loop dead
+  // a cancel may come back as a plain function or a { cancel } handle (mock clock)
+  const arm = (cancel: unknown): (() => void) =>
+    typeof cancel === 'function' ? (cancel as () => void) : () => { (cancel as { cancel?: () => void }).cancel?.() }
+  timerRegistry.cancelRefresh?.()
+  timerRegistry.cancelRefresh = arm($.clock.every(REFRESH_MS, () => refreshSafe($, options, cwd)))
+  timerRegistry.cancelPoll?.()
+  timerRegistry.cancelPoll = arm($.clock.every(Math.round(min * 60_000), () => pollUsage($, cwd)))
+  timerRegistry.cancelSweep?.()
+  timerRegistry.cancelSweep = arm($.clock.every(SWEEP_INTERVAL_MS, () => sweepLanes($, cwd)))
+  lastChipText = undefined
+  await refreshSafe($, options, cwd) // first load populates pane + chip and never toasts
+  const gdir = await globalDirOf($, await homeDir($))
+  const usageMissing = gdir == null || (await readJson($, usagePath(gdir))) == null
+  if (usageMissing) void pollUsage($, cwd) // cold start: do not show "no ledger yet" for N minutes
 }
 
 async function openPane($: EngineInterface): Promise<void> {

@@ -537,6 +537,22 @@ test('two session.start arm exactly one refresh timer', { plugins: [worldFixture
   expect(fs.reads.filter(p => p === RUN_PATH).length).toBe(5) // 2 initial loads + 3 single ticks
 })
 
+test('/mk re-arms the refresh loop after /clear (session.end, no session.start)', { plugins: [worldFixtures] }, async ($, on) => {
+  const files = worldFiles()
+  const fs = mockFs(on, files)
+  const clock = mockWorld(on)
+  on('session.cwd', () => ({ value: '/tmp/mk-proj' }))
+  on('session.end', () => ({ sessionId: 's1' }))
+  await $.session.start(sessionStart())
+  await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: undefined } } as never)
+  await clock.advance(5000)
+  expect(fs.reads.filter(p => p === RUN_PATH).length).toBe(1) // loop dead: only the start load
+  await $.command.run({ command: 'mk', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 165 } })
+  expect(fs.reads.filter(p => p === RUN_PATH).length).toBe(2) // /mk reloads at once
+  await clock.advance(5000)
+  expect(fs.reads.filter(p => p === RUN_PATH).length).toBe(3) // and ticks again
+})
+
 test('/mk args: open, close, setup, init and unknown', { plugins: [worldFixtures] }, async ($, on) => {
   mockFs(on, worldFiles())
   mockWorld(on)
