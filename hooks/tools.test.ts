@@ -84,6 +84,72 @@ test('rejects --data, --by, and --run overrides', async ($, on) => {
   expect(processCalled).toBe(false)
 })
 
+test('allows values that start with a banned flag name but contain whitespace', async ($, on) => {
+  let processCalled = false
+  const capturedArgs: Array<readonly string[]> = []
+  on('process.run', (_$, e) => {
+    processCalled = true
+    capturedArgs.push(e.argv)
+    return { value: procResult({ stdout: '{}' }) }
+  })
+
+  for (const args of [
+    ['event', '--type', 'note', '--text', '--run tests failed'],
+    ['event', '--type', 'note', '--text', '--by design'],
+    ['event', '--type', 'note', '--text', '--data is messy'],
+    ['event', '--type', 'note', '--text', ' --run tests failed'],
+  ]) {
+    const ran = await callTool($, { tool: 'mcp__matrixkoder__mk_state', args })
+    expect(ran.isError).toBeUndefined()
+  }
+  expect(processCalled).toBe(true)
+  expect(capturedArgs.some(argv => argv.includes('--run tests failed'))).toBe(true)
+})
+
+test('rejects task set --force (dep gate bypass)', async ($, on) => {
+  let processCalled = false
+  on('process.run', (_$, e) => {
+    processCalled = true
+    return { value: procResult({ stdout: '{}' }) }
+  })
+
+  for (const args of [
+    ['task', 'set', 'F6', 'status=dispatched', '--force'],
+    ['task', 'set', 'F6', '--force', 'status=dispatched'],
+    ['task', 'set', 'F6', 'status=dispatched', '--force=yes'],
+  ]) {
+    const ran = await callTool($, { tool: 'mcp__matrixkoder__mk_state', args })
+    expect(ran.isError).toBe(true)
+    expect(String(ran.result)).toContain('task set --force is not allowed')
+  }
+
+  const plain = await callTool($, {
+    tool: 'mcp__matrixkoder__mk_state',
+    args: ['task', 'set', 'F6', 'status=routed'],
+  })
+  expect(plain.isError).toBeUndefined()
+  expect(processCalled).toBe(true)
+})
+
+test('rejects abbreviated and --flag=value forms of override flags', async ($, on) => {
+  let processCalled = false
+  on('process.run', (_$, e) => {
+    processCalled = true
+    return { value: procResult({ stdout: '{}' }) }
+  })
+
+  for (const badArg of ['--b=x', '--by=x', '--ru=x', '--run=x', '--dat=x', '--data=x', '--b', '--ru']) {
+    const ran = await callTool($, {
+      tool: 'mcp__matrixkoder__mk_state',
+      args: ['event', '--type', 'note', '--text', 'x', badArg],
+    })
+
+    expect(ran.isError).toBe(true)
+    expect(String(ran.result)).toContain('overrides --data, --by, and --run are not allowed')
+  }
+  expect(processCalled).toBe(false)
+})
+
 test('rejects lock release --force and lock take --force-stale', async ($, on) => {
   let processCalled = false
   on('process.run', (_$, e) => {
@@ -104,6 +170,20 @@ test('rejects lock release --force and lock take --force-stale', async ($, on) =
   })
   expect(ran2.isError).toBe(true)
   expect(String(ran2.result)).toContain('lock take --force-stale is not allowed')
+
+  const ran3 = await callTool($, {
+    tool: 'mcp__matrixkoder__mk_state',
+    args: ['lock', 'take', 'dev-server', '--reason', 'r', '--force-stale=1'],
+  })
+  expect(ran3.isError).toBe(true)
+  expect(String(ran3.result)).toContain('lock take --force-stale is not allowed')
+
+  const ran4 = await callTool($, {
+    tool: 'mcp__matrixkoder__mk_state',
+    args: ['lock', 'release', 'dev-server', '--force=1'],
+  })
+  expect(ran4.isError).toBe(true)
+  expect(String(ran4.result)).toContain('lock release --force is not allowed')
 
   expect(processCalled).toBe(false)
 })
