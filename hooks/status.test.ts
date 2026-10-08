@@ -1,7 +1,7 @@
 // Chip + toast tests (design §5): the chip text after the first load, a toast
 // exactly once per status change, none on the first load.
 import { test, expect } from 'claude-code/testing'
-import { NOW, RUNS_INDEX, RUN_PATH, agentOf, mockFs, mockWorld, sessionStart, setRun, setUsage, tasksOf, worldFiles, worldFixtures } from './testkit'
+import { DATA_DIR, NOW, RUNS_INDEX, RUN_PATH, agentOf, mockFs, mockWorld, sessionStart, setRun, setUsage, tasksOf, worldFiles, worldFixtures } from './testkit'
 
 test('chip shows waiting-on-you over everything else', { plugins: [worldFixtures] }, async ($, on) => {
   const status: (string | undefined)[] = []
@@ -84,6 +84,36 @@ test('only agents the run routes to can raise the quota chip', { plugins: [world
   mockWorld(on, { status: t => chips.push(t) })
   await $.session.start(sessionStart())
   expect(chips.at(-1) ?? '').not.toContain('⊘ wk')
+  expect(chips.at(-1) ?? '').toBe('⬡ mk · 2 building · 1 review · 1/5 done')
+})
+
+test('a project yaml scopes the quota chip: an exhausted agent the yaml disables cannot raise it', { plugins: [worldFixtures] }, async ($, on) => {
+  const files = worldFiles()
+  files[`${DATA_DIR}/matrixkoder.yaml`] = [
+    'data_dir: .matrixkoder/',
+    'agents:',
+    '  codex: { available: false, models: [] }',
+    '  opencode: { available: false, models: [] }',
+    '  agy: { available: false, models: [] }',
+    '  claude: { available: true }',
+    '  herdr: { available: true }',
+    `  checked_at: "${new Date(NOW).toISOString()}"`,
+  ].join('\n')
+  setRun(files, run => {
+    run.waiting = null
+    const tasks = tasksOf(run)
+    if (tasks[3]) tasks[3].status = 'building' // no stalled task
+    for (const t of tasks) t.agent = null // no task agents named → the yaml list applies
+  })
+  setUsage(files, usage => {
+    const agy = agentOf(usage, 'agy')
+    if (agy) agy.exhausted_until = new Date(NOW + 6 * 24 * 3600_000).toISOString() // would raise without the yaml
+  })
+  const chips: (string | undefined)[] = []
+  mockFs(on, files)
+  mockWorld(on, { status: t => chips.push(t) })
+  await $.session.start(sessionStart())
+  expect(chips.at(-1) ?? '').not.toContain('agy ⊘')
   expect(chips.at(-1) ?? '').toBe('⬡ mk · 2 building · 1 review · 1/5 done')
 })
 

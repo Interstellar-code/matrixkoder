@@ -26,8 +26,8 @@ Run `/mk setup` (alias `/mk init`). The wizard opens as a pane, one step at a ti
 | 1 | Install | Shows whether you run from a dev folder or a marketplace install. Info only. |
 | 2 | Data | Where project data lives: `<repo>/.matrixkoder/` (default; added to `.gitignore`) or `~/.matrixkoder/projects/<slug>/`. |
 | 3 | Agents | Which of Claude Code, Codex, OpenCode, AGY you use. Hotkeys 1 to 4 toggle them. |
-| 4 | Usage | Which CodexBar providers to track. Hotkeys 1 to 9. Shows the z.ai key command (see [Usage tracking](#usage-tracking)). |
-| 5 | Gates | Your test, typecheck, lint and format commands, as text inputs. |
+| 4 | Usage | Which CodexBar providers to track. Hotkeys 1 to 9. `zai (OpenCode Z.AI plan)` and `opencode (OpenCode Zen)` are labelled so you pick the right one; zai is pre-selected when your opencode agent is on the Z.AI plan. Shows the z.ai key command (see [Usage tracking](#usage-tracking)). |
+| 5 | Gates | Your test, typecheck, lint and format commands, as text inputs. Detection reads package.json, pyproject.toml, Makefile, `.claude-plugin/plugin.json`, `scripts/selftest.sh`, tsconfig.json, `Cargo.toml` and `go.mod`; when nothing is detected the first field takes the focus so you can just type. |
 | 6 | Routing | Builder order, reserve floors, max lanes, effort by size, reviewers. |
 | 7 | Autonomy | What the orchestrator may do without asking, and what pauses it. |
 | 8 | QA | Whether there is a frontend, its start command, dev URL, and where QA runs. |
@@ -52,7 +52,7 @@ Toggle it with `/mk` (or `/mk open`, `/mk close`). It docks on the right when th
 - **Run**: the active run, its stage and the next action.
 - **Plan**: the waves, each as a row of status glyphs.
 - **Lanes**: one line per task with its agent and status.
-- **Usage**: remaining quota per agent pool. `⊘` in red means the pool is exhausted. `n/a` means the ledger has no value for that pool. `no ledger yet` means usage has not been polled yet.
+- **Usage**: remaining quota per agent pool, scoped to the agents your project's `matrixkoder.yaml` enables (every ledger agent when it names none). An enabled agent with no ledger entry yet shows a dim hint row instead of nothing. The claude main row is labelled `claude (all)` when it covers sub-pools. `—` means the pool has no such window; `n/a` means the provider could not be polled at all; `⊘` in red means the pool is exhausted. `no ledger yet` means usage has not been polled yet.
 - **Waiting on you**: items that need your decision.
 - **Recent**: the last few events.
 
@@ -94,9 +94,9 @@ Other subcommands exist (`run init|stage|set|archive`, `task add|set|round|get`,
 python3 scripts/mk-usage.py --once
 ```
 
-Other options: `--watch --interval N`, `--out PATH`, `--providers a,b`, `--self-test`.
+Other options: `--watch --interval N`, `--out PATH`, `--providers a,b`, `--self-test`. When the project's `matrixkoder.yaml` lists `usage.providers`, the plugin polls exactly those.
 
-Provider names map to CodexBar like this: claude to `claude`, codex to `codex`, antigravity to `agy`, zai to `opencode`, opencodego to `opencode-go`. If a provider errors, its entry is `n/a` instead of failing the whole poll. Codex on an API key has no quota to read, so expect `n/a` there.
+The provider list holds CodexBar ids directly: `claude`, `codex`, `antigravity` (CodexBar `agy`), `zai` (OpenCode on the Z.AI plan), `opencode` (OpenCode Zen), `opencodego` (`opencode-go`). The wizard pre-selects `zai` when your opencode agent is on the Z.AI plan. If a provider errors, its entry is `n/a` instead of failing the whole poll. Codex on an API key has no quota to read, so expect `n/a` there.
 
 For z.ai, store the key in CodexBar yourself (never paste it into the chat):
 

@@ -10,7 +10,10 @@ import type { MkRun, MkRunIndexEntry, MkSnapshot, MkUsage } from '../types'
 
 export const PANE_ID = 'matrixkoder'
 
-export const EMPTY_SNAPSHOT: MkSnapshot = { now: 0, dataDir: null, run: null, runs: [], usage: null }
+/** display order of the known build agents (dashboard usage rows, chip scan) */
+export const AGENT_ORDER = ['claude', 'agy', 'codex', 'opencode'] as const
+
+export const EMPTY_SNAPSHOT: MkSnapshot = { now: 0, dataDir: null, run: null, runs: [], usage: null, projectAgents: null }
 
 /** Variadic path join: '/'-separates without doubling (paths here never end in '/'). */
 export const join = (...parts: readonly string[]): string =>
@@ -150,8 +153,94 @@ export function sanitizeText(text: string | null | undefined, cap = 200): string
     .slice(0, cap)
 }
 
-export function mkSnapshot(now: number, dataDir: string | null, run: MkRun | null, runs: readonly MkRunIndexEntry[], usage: MkUsage | null): MkSnapshot {
-  return { now, dataDir, run, runs, usage }
+export function mkSnapshot(now: number, dataDir: string | null, run: MkRun | null, runs: readonly MkRunIndexEntry[], usage: MkUsage | null, projectAgents: readonly string[] | null): MkSnapshot {
+  return { now, dataDir, run, runs, usage, projectAgents }
+}
+
+// ---------- matrixkoder.yaml line parsers (no YAML dependency; the wizard's emitter shapes) ----------
+
+/** `agents:` block of matrixkoder.yaml: names of available: true agents, herdr excluded.
+ *  Accepts any indent >= 2 spaces and block-style or flow-style entries.
+ *  Returns null when the yaml or the block is absent or unparseable ("no filter"), never []. */
+export function parseYamlAgents(yaml: string): readonly string[] | null {
+  const out: string[] = []
+  let inBlock = false
+  let agentIndent: number | null = null
+  let currentAgent: string | null = null
+  let currentAvailable: boolean | null = null
+
+  const commit = () => {
+    if (currentAgent && currentAvailable === true && currentAgent !== 'herdr' && currentAgent !== 'checked_at') {
+      out.push(currentAgent)
+    }
+  }
+
+  for (const raw of yaml.split(/\r?\n/)) {
+    if (!inBlock) {
+      if (/^agents:\s*(#.*)?$/.test(raw)) inBlock = true
+      continue
+    }
+    const line = raw.trim()
+    if (line === '' || line.startsWith('#')) continue
+    if (!/^\s/.test(raw)) break // the next top-level key ends the block
+
+    const m = /^(\s+)([A-Za-z0-9_-]+):\s*(.*)$/.exec(raw)
+    const indent = m && m[1] ? m[1].length : (raw.match(/^\s*/)?.[0]?.length ?? 0)
+
+    if (m && m[1] && m[2] && indent >= 2 && (agentIndent === null || indent === agentIndent)) {
+      commit()
+      agentIndent = indent
+      currentAgent = m[2]
+      currentAvailable = null
+      const rest = (m[3] ?? '').replace(/\s+#.*$/, '').trim()
+      if (/\bavailable:\s*true\b/.test(rest)) {
+        currentAvailable = true
+      } else if (/\bavailable:\s*false\b/.test(rest)) {
+        currentAvailable = false
+      }
+    } else if (currentAgent && agentIndent !== null && indent > agentIndent) {
+      if (/\bavailable:\s*true\b/.test(line)) {
+        currentAvailable = true
+      } else if (/\bavailable:\s*false\b/.test(line)) {
+        currentAvailable = false
+      }
+    }
+  }
+  commit()
+  return out.length > 0 ? out : null
+}
+
+/** `usage:` → `providers:` list of matrixkoder.yaml: a `  providers: [a, b]` flow list or a `- item` block list. null when absent. */
+export function parseYamlProviders(yaml: string): readonly string[] | null {
+  const out: string[] = []
+  let inUsage = false
+  let inList = false
+  const item = (text: string): string => text.trim().replace(/^["']|["']$/g, '')
+  for (const raw of yaml.split(/\r?\n/)) {
+    if (!inUsage) {
+      if (/^usage:\s*(#.*)?$/.test(raw)) inUsage = true
+      continue
+    }
+    if (!inList) {
+      if (raw !== '' && !/^\s/.test(raw) && !/^usage:/.test(raw.trim())) break // next top-level key
+      const m = /^ {2}providers:\s*(.*)$/.exec(raw)
+      if (!m || m[1] === undefined) continue
+      const flow = m[1].replace(/\s+#.*$/, '').match(/^\[(.*)\]/)
+      if (flow && flow[1] !== undefined) return flow[1].split(',').map(item).filter(v => v !== '')
+      inList = true // a block list follows
+      continue
+    }
+    if (!raw.trim().startsWith('-')) break // the first non-item line ends the list
+    const v = item(raw.trim().slice(1))
+    if (v !== '') out.push(v)
+  }
+  return out.length > 0 || inList ? out : null
+}
+
+/** The project's enabled agents in display order: known ones first, then the yaml's own order. */
+export function orderAgents(names: readonly string[] | null): readonly string[] | null {
+  if (names == null) return null
+  return [...AGENT_ORDER.filter(a => names.includes(a)), ...names.filter(n => !(AGENT_ORDER as readonly string[]).includes(n))]
 }
 
 /** Cross-module timer registry: dashboard arms these, status.ts's session.end cancels them

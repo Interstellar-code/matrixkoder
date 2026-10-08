@@ -10,8 +10,8 @@ import type { MkWizardDraft } from '../types'
 import { globalDirPath, join, parseJson } from './data'
 import {
   AGENT_NAMES, WIZARD_STEPS, ZAI_KEY_CMD, addToGitignore, buildConfigJson, buildProjectsJson, buildYaml,
-  builderOrderOf, dataDirOf, EMPTY_DRAFT, emptyDraft, fallbackText, installModeOf, parseModels, parseProviders, parseVersion,
-  parseWhich, proposeGates, providerChoices, slugOf,
+  builderOrderOf, dataDirOf, EMPTY_DRAFT, emptyDraft, fallbackText, installModeOf, mergeModels, parseModels, parseProviders, parseVersion,
+  parseWhich, proposeGates, providerChoices, providerLabel, slugOf,
 } from './wizard-core'
 
 /** Surfaces that draw Input and Select (mobile does not). */
@@ -148,15 +148,17 @@ async function detect($: EngineInterface, options: PluginOptions): Promise<MkWiz
 
   const agentRun = await run($, ['which', ...AGENT_NAMES])
   const paths = parseWhich(agentRun.out)
-  const [agyModels, ocModels, cbVersion, cbProviders] = await Promise.all([
+  const [agyModels, ocModels, ocPlanModels, cbVersion, cbProviders] = await Promise.all([
     paths.agy ? run($, ['agy', 'models']) : null,
     paths.opencode ? run($, ['opencode', 'models']) : null,
+    // the bare list shows only opencode/* and opencode-go/*; the Z.AI plan models need their own probe
+    paths.opencode ? run($, ['opencode', 'models', 'zai-coding-plan']) : null,
     run($, ['codexbar', '--version']),
     run($, ['codexbar', 'config', 'providers']),
   ])
   const models: Record<string, readonly string[]> = {
-    agy: agyModels?.ok ? parseModels(agyModels.out) : [],
-    opencode: ocModels?.ok ? parseModels(ocModels.out) : [],
+    agy: agyModels?.ok ? mergeModels(parseModels(agyModels.out)) : [],
+    opencode: mergeModels(ocModels?.ok ? parseModels(ocModels.out) : [], ocPlanModels?.ok ? parseModels(ocPlanModels.out) : []),
   }
   const agents: MkWizardDraft['agents'] = Object.fromEntries(
     AGENT_NAMES.map(n => [n, { found: n in paths, path: paths[n] ?? null, enabled: n in paths, models: models[n] ?? [] }]),
@@ -169,22 +171,30 @@ async function detect($: EngineInterface, options: PluginOptions): Promise<MkWiz
       d.providersAll = choices.all
       d.providersOn = choices.on
     }
+    // the opencode agent on the Z.AI plan tracks zai even before its CodexBar toggle is on
+    const oc = agents.opencode
+    if (oc?.enabled && oc.models.some(m => m.startsWith('zai-coding-plan/')) && d.providersAll.includes('zai') && !d.providersOn.includes('zai')) {
+      d.providersOn = [...d.providersOn, 'zai']
+    }
   }
 
   if (d.repo != null) {
     const repo = d.repo
     const lockNames = ['pnpm-lock.yaml', 'yarn.lock', 'bun.lock', 'bun.lockb', 'package-lock.json', 'uv.lock', 'poetry.lock']
-    const [pkg, pyproject, makefile, tsconfig, gitignore, locks] = await Promise.all([
+    const markerNames = ['.claude-plugin/plugin.json', 'scripts/selftest.sh', 'Cargo.toml', 'go.mod']
+    const [pkg, pyproject, makefile, tsconfig, gitignore, locks, markerHits] = await Promise.all([
       readOpt($, join(repo, 'package.json')),
       readOpt($, join(repo, 'pyproject.toml')),
       readOpt($, join(repo, 'Makefile')),
       $.fs.exists(join(repo, 'tsconfig.json')).catch(() => false),
       readOpt($, join(repo, '.gitignore')),
       Promise.all(lockNames.map(n => $.fs.exists(join(repo, n)).catch(() => false))),
+      Promise.all(markerNames.map(n => $.fs.exists(join(repo, n)).catch(() => false))),
     ])
     const proposal = proposeGates({
       pkg: pkg == null ? null : parseJson(pkg), pyproject, makefile, hasTsconfig: tsconfig,
       locks: lockNames.filter((_, i) => locks[i]),
+      markers: markerNames.filter((_, i) => markerHits[i]),
     })
     d.gates = proposal.gates
     d.gatesFrom = proposal.from
@@ -202,7 +212,22 @@ async function detect($: EngineInterface, options: PluginOptions): Promise<MkWiz
 // ---------- state helpers ----------
 
 const patch = ($: EngineInterface, p: Partial<MkWizardDraft>): Promise<unknown> => update($, draftAtom, d => ({ ...d, ...p }))
-const goto = ($: EngineInterface, step: number): Promise<unknown> => update($, stepAtom, () => Math.min(LAST_STEP, Math.max(1, step)))
+const goto = ($: EngineInterface, step: number): Promise<unknown> =>
+  (async () => {
+    const target = Math.min(LAST_STEP, Math.max(1, step))
+    const res = await update($, stepAtom, () => target)
+    if (target === 5) {
+      const d = await read($, draftAtom)
+      if (d.gatesFrom === '') {
+        try {
+          await $.ui.focus({ requestId: WIZARD_ID, key: 'wz-gate-install' })
+        } catch {
+          // focus refused (the site does not hold the keys) — the Input's autoFocus still seats the ring on redraw
+        }
+      }
+    }
+    return res
+  })()
 
 async function refreshExisting($: EngineInterface, p: Partial<MkWizardDraft>): Promise<void> {
   const next = { ...(await read($, draftAtom)), ...p }
@@ -305,10 +330,10 @@ function TextField(els: Elements, $: EngineInterface, d: MkWizardDraft, field: S
   return <Input key={`wz-${field}`} label={label} value={d[field]} placeholder={placeholder} onInput={v => set(v)} onSubmit={v => set(v)} />
 }
 
-function GateField(els: Elements, $: EngineInterface, d: MkWizardDraft, field: GateField, label: string) {
+function GateField(els: Elements, $: EngineInterface, d: MkWizardDraft, field: GateField, label: string, autoFocus = false) {
   const { Input } = els
   const set = (v: string): Promise<unknown> => update($, draftAtom, cur => ({ ...cur, gates: { ...cur.gates, [field]: v } }))
-  return <Input key={`wz-gate-${field}`} label={label} value={d.gates[field]} placeholder="(none)" onInput={v => set(v)} onSubmit={v => set(v)} />
+  return <Input key={`wz-gate-${field}`} label={label} value={d.gates[field]} placeholder="(none)" autoFocus={autoFocus || undefined} onInput={v => set(v)} onSubmit={v => set(v)} />
 }
 
 function YesNo(els: Elements, $: EngineInterface, d: MkWizardDraft, field: BoolField, label: string) {
@@ -402,7 +427,7 @@ function Body(els: Elements, $: EngineInterface, d: MkWizardDraft, step: number,
               <Text bold={true}>Providers (tick to track)</Text>
               {d.providersAll.map((p, i) => (
                 <Button
-                  key={`wz-prov-${p}`} {...(i < 9 ? { hotkey: String(i + 1) } : {})} label={`${i < 9 ? `${i + 1} ` : ''}${d.providersOn.includes(p) ? '[x]' : '[ ]'} ${p}`}
+                  key={`wz-prov-${p}`} {...(i < 9 ? { hotkey: String(i + 1) } : {})} label={`${i < 9 ? `${i + 1} ` : ''}${d.providersOn.includes(p) ? '[x]' : '[ ]'} ${providerLabel(p)}`}
                   onPress={() => update($, draftAtom, cur => ({ ...cur, providersOn: cur.providersOn.includes(p) ? cur.providersOn.filter(x => x !== p) : [...cur.providersOn, p] }))}
                 />
               ))}
@@ -415,11 +440,13 @@ function Body(els: Elements, $: EngineInterface, d: MkWizardDraft, step: number,
           </Box>
         </Box>
       )
-    case 5:
+    case 5: {
+      // nothing detected: the first Input takes the initial focus so the step is typeable at once
+      const gatesEmpty = d.gatesFrom === ''
       return (
         <Box flexDirection="column">
-          <Text dimColor={true}>{d.gatesFrom !== '' ? `Proposed from ${d.gatesFrom}. Test suites are not run.` : 'Nothing detected — fill in what you use.'}</Text>
-          {GateField(els, $, d, 'install', 'install')}
+          <Text dimColor={true}>{d.gatesFrom !== '' ? `Proposed from ${d.gatesFrom}. Test suites are not run.` : 'Nothing detected — Tab to a field and type the command you use.'}</Text>
+          {GateField(els, $, d, 'install', 'install', gatesEmpty)}
           {GateField(els, $, d, 'test', 'test')}
           {GateField(els, $, d, 'typecheck', 'typecheck')}
           {GateField(els, $, d, 'lint_changed', 'lint_changed')}
@@ -428,6 +455,7 @@ function Body(els: Elements, $: EngineInterface, d: MkWizardDraft, step: number,
           {d.banned.length > 0 && <Text dimColor={true}>{`Banned (dev servers): ${d.banned.join(', ')}`}</Text>}
         </Box>
       )
+    }
     case 6:
       return (
         Routing(els, $, d)
@@ -526,7 +554,8 @@ function Review(els: Elements, $: EngineInterface, d: MkWizardDraft) {
 }
 
 /** Steps 5-9 hold text Inputs: a letter or digit hotkey could swallow typed characters ("pnpm" -> Next), so
- *  those steps draw no hotkeys at all. Next holds the initial focus (Enter); Tab walks to the rest. */
+ *  those steps draw no hotkeys at all. Next holds the initial focus (Enter); Tab walks to the rest.
+ *  Exception: step 5 with nothing detected gives it to the first gate Input, so the step is typeable. */
 const INPUT_STEPS = new Set([5, 6, 7, 8, 9])
 
 function Nav(els: Elements, $: EngineInterface, d: MkWizardDraft, step: number) {
@@ -534,13 +563,14 @@ function Nav(els: Elements, $: EngineInterface, d: MkWizardDraft, step: number) 
   const done = d.phase === 'written'
   const hk = (key: string): { hotkey: string } | Record<string, never> => (INPUT_STEPS.has(step) ? {} : { hotkey: key })
   const lab = (key: string, text: string): string => (INPUT_STEPS.has(step) ? text : `${key} ${text}`)
+  const gatesEmpty = step === 5 && d.gatesFrom === ''
   return (
     <Box flexDirection="row" gap={1}>
       {done
         ? <Button key="wz-close" variant="primary" hotkey="x" autoFocus={true} label="x Close" onPress={() => closeWizard($)} />
         : [
           step > 1 && <Button key="wz-back" {...hk('b')} label={lab('b', '← Back')} onPress={() => goto($, step - 1)} />,
-          step < LAST_STEP && <Button key="wz-next" variant="primary" {...hk('n')} autoFocus={true} label={lab('n', 'Next →')} onPress={() => goto($, step + 1)} />,
+          step < LAST_STEP && <Button key="wz-next" variant="primary" {...hk('n')} autoFocus={gatesEmpty ? undefined : true} label={lab('n', 'Next →')} onPress={() => goto($, step + 1)} />,
           <Button key="wz-cancel" role="dismiss" {...hk('c')} label={lab('c', 'Cancel')} onPress={() => closeWizard($)} />,
         ]}
     </Box>

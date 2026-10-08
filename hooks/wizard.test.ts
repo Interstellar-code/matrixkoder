@@ -8,7 +8,7 @@ import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import type { MkWizardDraft } from '../types'
 import { NOW, PROJECT_DIR, DATA_DIR, mockFs, paneProps, sessionStart, type Files } from './testkit'
-import { addToGitignore, buildYaml, emptyDraft, inline, parseModels, parseProviders, parseWhich, proposeGates } from './wizard-core'
+import { addToGitignore, buildYaml, emptyDraft, inline, mergeModels, parseModels, parseProviders, parseWhich, proposeGates } from './wizard-core'
 
 const HOME = '/home/mk'
 const WIZARD = 'matrixkoder-setup'
@@ -126,10 +126,14 @@ test('parsers: which, providers, models', () => {
   expect(parseWhich('/bin/claude\n/usr/local/bin/agy\n')).toEqual({ claude: '/bin/claude', agy: '/usr/local/bin/agy' })
   expect(parseProviders('codex: enabled default (Codex)\nopenai: disabled (OpenAI)\nnoise')).toEqual([{ name: 'codex', enabled: true }, { name: 'openai', enabled: false }])
   expect(parseModels('Fetching available models...\ngemini-3.8-flash-high\tGemini\nopencode/big-pickle\n')).toEqual(['gemini-3.8-flash-high', 'opencode/big-pickle'])
+  const manyModels = Array.from({ length: 20 }, (_, i) => `opencode/model-${i + 1}`).join('\n')
+  expect(parseModels(manyModels).length).toBe(20)
+  const merged = mergeModels(['opencode/a', 'opencode/b'], ['zai-coding-plan/p1', 'zai-coding-plan/p2'])
+  expect(merged).toEqual(['zai-coding-plan/p1', 'zai-coding-plan/p2', 'opencode/a', 'opencode/b'])
 })
 
 test('gate proposals: pnpm+vitest, python, Makefile; never invents', () => {
-  const js = proposeGates({ pkg: JSON.parse(PKG), pyproject: null, makefile: null, locks: ['pnpm-lock.yaml'], hasTsconfig: true })
+  const js = proposeGates({ pkg: JSON.parse(PKG), pyproject: null, makefile: null, locks: ['pnpm-lock.yaml'], hasTsconfig: true, markers: [] })
   expect(js.gates).toEqual({
     install: 'pnpm install --frozen-lockfile --prefer-offline',
     test: 'pnpm exec vitest run {paths}',
@@ -138,12 +142,60 @@ test('gate proposals: pnpm+vitest, python, Makefile; never invents', () => {
     format_changed: 'pnpm exec prettier --write {files}',
   })
   expect(js.banned).toEqual(['pnpm run dev'])
-  const py = proposeGates({ pkg: null, pyproject: '[tool.pytest]\n[tool.ruff]\n[tool.mypy]', makefile: null, locks: ['uv.lock'], hasTsconfig: false })
+  const py = proposeGates({ pkg: null, pyproject: '[tool.pytest]\n[tool.ruff]\n[tool.mypy]', makefile: null, locks: ['uv.lock'], hasTsconfig: false, markers: [] })
   expect(py.gates).toEqual({ install: 'uv sync', test: 'pytest {paths}', typecheck: 'mypy .', lint_changed: 'ruff check {files}', format_changed: 'ruff format {files}' })
-  const mk = proposeGates({ pkg: null, pyproject: null, makefile: 'test:\n\tgo test\nlint:\n\tvet\n', locks: [], hasTsconfig: false })
+  const mk = proposeGates({ pkg: null, pyproject: null, makefile: 'test:\n\tgo test\nlint:\n\tvet\n', locks: [], hasTsconfig: false, markers: [] })
   expect(mk.gates.test).toBe('make test')
   expect(mk.gates.typecheck).toBe('')
-  expect(proposeGates({ pkg: null, pyproject: null, makefile: null, locks: [], hasTsconfig: false }).from).toBe('')
+  expect(proposeGates({ pkg: null, pyproject: null, makefile: null, locks: [], hasTsconfig: false, markers: [] }).from).toBe('')
+})
+
+test('gate proposals: marker files (plugin, selftest, tsconfig-only, Cargo, go.mod)', () => {
+  // this repo's shape: plugin.json + scripts/selftest.sh + tsconfig.json, no package.json
+  const self = proposeGates({ pkg: null, pyproject: null, makefile: null, locks: [], hasTsconfig: true, markers: ['.claude-plugin/plugin.json', 'scripts/selftest.sh'] })
+  expect(self.gates).toEqual({
+    install: '', test: 'claude plugin test . && bash scripts/selftest.sh', typecheck: 'tsc -p . --noEmit',
+    lint_changed: 'claude plugin validate .', format_changed: '',
+  })
+  expect(self.from).toBe('.claude-plugin/plugin.json + scripts/selftest.sh + tsconfig.json')
+  const plugin = proposeGates({ pkg: null, pyproject: null, makefile: null, locks: [], hasTsconfig: false, markers: ['.claude-plugin/plugin.json'] })
+  expect(plugin.gates.test).toBe('claude plugin test .')
+  expect(plugin.gates.lint_changed).toBe('claude plugin validate .')
+  expect(plugin.from).toBe('.claude-plugin/plugin.json')
+  const selftest = proposeGates({ pkg: null, pyproject: null, makefile: null, locks: [], hasTsconfig: false, markers: ['scripts/selftest.sh'] })
+  expect(selftest.gates.test).toBe('bash scripts/selftest.sh')
+  expect(selftest.from).toBe('scripts/selftest.sh')
+  const ts = proposeGates({ pkg: null, pyproject: null, makefile: null, locks: [], hasTsconfig: true, markers: [] })
+  expect(ts.gates.typecheck).toBe('tsc -p . --noEmit')
+  expect(ts.from).toBe('tsconfig.json')
+  const cargo = proposeGates({ pkg: null, pyproject: null, makefile: null, locks: [], hasTsconfig: false, markers: ['Cargo.toml'] })
+  expect(cargo.gates).toEqual({ install: '', test: 'cargo test', typecheck: '', lint_changed: 'cargo clippy', format_changed: 'cargo fmt' })
+  const go = proposeGates({ pkg: null, pyproject: null, makefile: null, locks: [], hasTsconfig: false, markers: ['go.mod'] })
+  expect(go.gates.test).toBe('go test ./...')
+  expect(go.gates.lint_changed).toBe('go vet ./...')
+  // a Makefile target still wins over a marker stack
+  const mkCargo = proposeGates({ pkg: null, pyproject: null, makefile: 'test:\n\tcargo test\n', locks: [], hasTsconfig: false, markers: ['Cargo.toml'] })
+  expect(mkCargo.gates.test).toBe('make test')
+  expect(mkCargo.gates.lint_changed).toBe('cargo clippy')
+  expect(mkCargo.from).toBe('Makefile + Cargo.toml')
+  // package.json keeps its own typecheck; markers add nothing (a consulted marker still lands in from, like a Makefile)
+  const pkgCargo = proposeGates({ pkg: JSON.parse(PKG), pyproject: null, makefile: null, locks: [], hasTsconfig: true, markers: ['Cargo.toml'] })
+  expect(pkgCargo.gates.test).toBe('npx vitest run {paths}')
+  expect(pkgCargo.gates.typecheck).toBe('npm run typecheck')
+  expect(pkgCargo.from).toBe('package.json + Cargo.toml')
+  // finding 3: selftest + Cargo gives cargo test && bash scripts/selftest.sh
+  const cargoSelftest = proposeGates({ pkg: null, pyproject: null, makefile: null, locks: [], hasTsconfig: false, markers: ['scripts/selftest.sh', 'Cargo.toml'] })
+  expect(cargoSelftest.gates.test).toBe('cargo test && bash scripts/selftest.sh')
+  expect(cargoSelftest.gates.lint_changed).toBe('cargo clippy')
+  expect(cargoSelftest.gates.format_changed).toBe('cargo fmt')
+  expect(cargoSelftest.from).toBe('Cargo.toml + scripts/selftest.sh')
+  // finding 4: package.json and Makefile test stay unchanged when selftest is present
+  const pkgSelftest = proposeGates({ pkg: JSON.parse(PKG), pyproject: null, makefile: null, locks: [], hasTsconfig: true, markers: ['scripts/selftest.sh'] })
+  expect(pkgSelftest.gates.test).toBe('npx vitest run {paths}')
+  expect(pkgSelftest.from).toBe('package.json')
+  const mkSelftest = proposeGates({ pkg: null, pyproject: null, makefile: 'test:\n\tgo test\nlint:\n\tvet\n', locks: [], hasTsconfig: false, markers: ['scripts/selftest.sh'] })
+  expect(mkSelftest.gates.test).toBe('make test')
+  expect(mkSelftest.from).toBe('Makefile')
 })
 
 test('gitignore append is idempotent', () => {
@@ -194,6 +246,23 @@ test('/mk setup opens the wizard pane and detection pre-fills the draft', async 
   expect(Object.keys(files).some(p => p.includes('.matrixkoder'))).toBe(false)
   const init = await mk($, 'init feature-x')
   expect(init.text).toContain('setup opened')
+})
+
+test('detection proposes plugin/selftest/tsconfig gates for a repo shaped like this one', async ($, on) => {
+  const files: Files = {
+    [`${PROJECT_DIR}/.claude-plugin/plugin.json`]: '{}',
+    [`${PROJECT_DIR}/scripts/selftest.sh`]: '#!/usr/bin/env bash\n',
+    [`${PROJECT_DIR}/tsconfig.json`]: '{}',
+  }
+  world(on, files)
+  await $.session.start(sessionStart())
+  await mk($, 'setup')
+  const d = draftOf()
+  expect(d.gates).toEqual({
+    install: '', test: 'claude plugin test . && bash scripts/selftest.sh', typecheck: 'tsc -p . --noEmit',
+    lint_changed: 'claude plugin validate .', format_changed: '',
+  })
+  expect(d.gatesFrom).toBe('.claude-plugin/plugin.json + scripts/selftest.sh + tsconfig.json')
 })
 
 test('the pane walks 10 steps forward and back on both surfaces', async ($, on) => {
@@ -247,6 +316,37 @@ test('agent and provider toggles, and the z.ai key is a command, never a prompt'
     await mk($, 'setup') // fresh draft for the next surface
   }
   expect(w.argv.some(a => a.includes('set-api-key'))).toBe(false)
+})
+
+test('opencode on the Z.AI plan: plan models merge in, zai is labelled and pre-selected', async ($, on) => {
+  const bareModels = Array.from({ length: 16 }, (_, i) => `opencode/model-${i + 1}\tModel ${i + 1}`).join('\n')
+  const procs: Record<string, string | null> = {
+    'which claude codex opencode agy herdr': '/bin/claude\n/bin/codex\n/bin/opencode\n/bin/agy\n/bin/herdr\n',
+    'opencode models': `Fetching…\n${bareModels}\n`,
+    'opencode models zai-coding-plan': 'zai-coding-plan/glm-4.7\tGLM 4.7\nzai-coding-plan/glm-5.3\tGLM 5.3\n',
+    'codexbar config providers': 'codex: enabled default (Codex)\nclaude: enabled (Claude)\nzai: disabled (z.ai / GLM)\nopencode: disabled (OpenCode Zen)\nantigravity: enabled (Antigravity)\n',
+  }
+  world(on, repoFiles(), procs)
+  await $.session.start(sessionStart())
+  await mk($, 'setup')
+  const d = draftOf()
+  expect(d.agents.opencode).toMatchObject({ found: true, enabled: true })
+  expect(d.agents.opencode?.models).toContain('zai-coding-plan/glm-4.7')
+  expect(d.agents.opencode?.models).toContain('zai-coding-plan/glm-5.3')
+  expect(d.agents.opencode?.models[0]).toBe('zai-coding-plan/glm-4.7')
+  expect(d.agents.opencode?.models[1]).toBe('zai-coding-plan/glm-5.3')
+  expect(d.agents.opencode?.models.length).toBe(12)
+  expect(d.providersOn).toContain('zai') // pre-selected even though CodexBar lists zai disabled
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(72) })
+  for (let i = 0; i < 3; i++) await ui.press({ key: 'wz-next' })
+  expect(await ui.find({ text: /\[x\] zai \(OpenCode Z\.AI plan\)/ })).toBeTruthy()
+  expect(await ui.find({ text: /\[ \] opencode \(OpenCode Zen\)/ })).toBeTruthy()
+  // the stored value stays the CodexBar id
+  await ui.press({ key: 'wz-prov-zai' })
+  expect((draftOf()).providersOn).not.toContain('zai')
+  await ui.press({ key: 'wz-prov-zai' })
+  expect((draftOf()).providersOn).toContain('zai')
+  await ui.unmount()
 })
 
 test('codexbar missing shows the install hint and still lets the user continue', async ($, on) => {
@@ -472,7 +572,9 @@ test('hotkeys: unique and drawn on steps without text Inputs; none where an Inpu
         expect(b.text, `${surface} ${b.key} label shows its hotkey`).toContain(`${String(hotkey)} `)
         if (b.key != null && FIXED[b.key] != null) expect(hotkey).toBe(FIXED[b.key])
       }
-      // initial focus: Next (Enter) on every step but the last; Write never takes it, so held Enter cannot confirm
+      // initial focus: Next (Enter) on every step but the last; Write never takes it, so held Enter cannot confirm.
+      // One exception (repoFiles here has detection, so it does not apply): step 5 with nothing detected
+      // hands the initial focus to the first gate Input — covered by the test below.
       const focused = buttons.filter(b => b.props.autoFocus === true).map(b => b.key)
       expect(focused, `${surface} step ${step} initial focus`).toEqual(step < 10 ? ['wz-next'] : [])
       if (step < 10) {
@@ -488,6 +590,26 @@ test('hotkeys: unique and drawn on steps without text Inputs; none where an Inpu
     await ui.unmount()
     await mk($, 'setup')
   }
+})
+
+test('gates step with nothing detected: the first gate Input takes the focus, not Next; detected keeps Next', async ($, on) => {
+  const files: Files = {}
+  world(on, files)
+  await $.session.start(sessionStart())
+  await mk($, 'setup')
+  expect((draftOf()).gatesFrom).toBe('')
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(64) })
+  for (let i = 0; i < 4; i++) await ui.press({ key: 'wz-next' })
+  expect(await ui.find({ text: /Nothing detected — Tab to a field and type the command you use\./ })).toBeTruthy()
+  const inputs = await ui.findAll({ type: 'Input' })
+  expect(inputs.map(i => i.key)).toEqual(['wz-gate-install', 'wz-gate-test', 'wz-gate-typecheck', 'wz-gate-lint_changed', 'wz-gate-format_changed'])
+  expect(inputs[0]?.props.autoFocus, 'the first gate Input holds the initial focus').toBe(true)
+  for (const i of inputs.slice(1)) expect(i.props.autoFocus).toBeUndefined()
+  const focusedButtons = (await ui.findAll({ type: 'Button' })).filter(b => b.props.autoFocus === true)
+  expect(focusedButtons, 'Next is not autoFocused when nothing was detected').toEqual([])
+  await ui.input({ key: 'wz-gate-install', text: 'npm i' })
+  expect((draftOf()).gates.install).toBe('npm i')
+  await ui.unmount()
 })
 
 // ---------- r4: safe writes ----------

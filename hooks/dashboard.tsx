@@ -10,8 +10,9 @@ import type { Elements, EngineInterface, On, PluginOptions } from 'claude-code'
 type Els = Elements[keyof Elements]
 import type { MkEvent, MkRun, MkSnapshot, MkStatusMemory, MkTask } from '../types'
 import {
-  PANE_ID, EMPTY_SNAPSHOT, activeEntry, basename, candidateDirs, coerceIndex, coerceRun, coerceUsage, join,
-  globalDirPath, mainCheckout, mkSnapshot, normalizePath, parentOf, parseGitdir, parseJson, projectDataDir, sanitizeText, timerRegistry,
+  AGENT_ORDER, PANE_ID, EMPTY_SNAPSHOT, activeEntry, basename, candidateDirs, coerceIndex, coerceRun, coerceUsage, join,
+  globalDirPath, mainCheckout, mkSnapshot, normalizePath, orderAgents, parentOf, parseGitdir, parseJson, parseYamlAgents, parseYamlProviders,
+  projectDataDir, sanitizeText, timerRegistry,
 } from './data'
 import { chipText, toastsFor } from './status'
 
@@ -30,7 +31,6 @@ const REFRESH_MS = 5000
 const USAGE_POLL_DEFAULT_MIN = 5
 const USAGE_POLL_MIN_MIN = 1 // a faster poll with the 120 s timeout would stack runs
 const POLL_MIN_INTERVAL_MS = 60_000
-const AGENT_ORDER = ['claude', 'agy', 'codex', 'opencode'] as const
 const PRIMARY_POOL: Record<string, string> = { agy: 'gemini', claude: 'default' }
 const AGENT_GLYPH: Record<string, string> = { claude: '✦', agy: '∇', codex: '⊚', opencode: '⌂' }
 const AGENT_COLOR: Record<string, string> = { claude: 'magenta', agy: 'blue', codex: 'green', opencode: 'cyan' }
@@ -83,12 +83,12 @@ export function registerDashboard(on: On, options: PluginOptions): void {
     timerRegistry.cancelRefresh?.()
     timerRegistry.cancelRefresh = arm($.clock.every(REFRESH_MS, () => refreshSafe($, options, cwd)))
     timerRegistry.cancelPoll?.()
-    timerRegistry.cancelPoll = arm($.clock.every(Math.round(min * 60_000), () => pollUsage($)))
+    timerRegistry.cancelPoll = arm($.clock.every(Math.round(min * 60_000), () => pollUsage($, cwd)))
     lastChipText = undefined
     await refreshSafe($, options, cwd) // first load populates pane + chip and never toasts
     const gdir = await globalDirOf($, await homeDir($))
     const usageMissing = gdir == null || (await readJson($, usagePath(gdir))) == null
-    if (usageMissing) void pollUsage($) // cold start: do not show "no ledger yet" for N minutes
+    if (usageMissing) void pollUsage($, cwd) // cold start: do not show "no ledger yet" for N minutes
     return next(e)
   })
 
@@ -291,7 +291,10 @@ async function loadSnapshot($: EngineInterface, cwd: string): Promise<MkSnapshot
   }
   const gdir = await globalDirOf($, home)
   const usage = gdir ? coerceUsage(await readJson($, usagePath(gdir))) : null
-  return { ...mkSnapshot(now, dataDir, run, runs, usage), error }
+  // the project yaml scopes the usage section (and its poll) to this project's agents and providers
+  const yaml = dataDir != null ? await readText($, join(dataDir, 'matrixkoder.yaml')) : null
+  const projectAgents = orderAgents(parseYamlAgents(yaml ?? ''))
+  return { ...mkSnapshot(now, dataDir, run, runs, usage, projectAgents), error }
 }
 
 async function applyStatus($: EngineInterface, options: PluginOptions, snap: MkSnapshot): Promise<void> {
@@ -347,7 +350,8 @@ async function refreshSafe($: EngineInterface, options: PluginOptions, cwd: stri
   }
 }
 
-async function pollUsage($: EngineInterface): Promise<void> {
+/** Polls mk-usage.py for this project: `--providers` from the project yaml when it lists any, else whatever CodexBar has enabled. */
+async function pollUsage($: EngineInterface, cwd: string): Promise<void> {
   if (pollInFlight) return
   let nowMs = 0
   try {
@@ -359,11 +363,28 @@ async function pollUsage($: EngineInterface): Promise<void> {
   pollInFlight = true
   lastPollAt = nowMs || lastPollAt + POLL_MIN_INTERVAL_MS
   try {
-    await $.process.run(['python3', `${$.plugin.root}/scripts/mk-usage.py`, '--once'], { timeoutMs: 120_000 })
+    const providers = await projectProviders($, cwd)
+    const argv = ['python3', `${$.plugin.root}/scripts/mk-usage.py`, '--once', ...(providers != null ? ['--providers', providers.join(',')] : [])]
+    await $.process.run(argv, { timeoutMs: 120_000 })
   } catch {
     // codexbar missing or slow — the refresh ticks still re-read usage.json
   } finally {
     pollInFlight = false
+  }
+}
+
+/** The project yaml's usage providers, or null when it lists none (mk-usage.py then picks CodexBar's enabled set). */
+async function projectProviders($: EngineInterface, cwd: string): Promise<readonly string[] | null> {
+  try {
+    const home = await homeDir($)
+    const dataDir = await resolveDataDir($, cwd, home)
+    if (dataDir == null) return null
+    const yaml = await readText($, join(dataDir, 'matrixkoder.yaml'))
+    if (yaml == null) return null
+    const providers = parseYamlProviders(yaml)
+    return providers != null && providers.length > 0 ? providers : null
+  } catch {
+    return null // an unreadable yaml polls the default set, never blocks the poll
   }
 }
 
@@ -562,17 +583,21 @@ function resetStr(iso: string | null | undefined, now: number, compact: boolean)
 
 type UsageRow = {
   name: string
+  label: string
+  hint: string | null
   pct: number | null
   weekPct: number | null
   reset: string | null
   exhaustedUntil: string | null
   exhausted: boolean
+  /** the whole ledger entry is status 'n/a' (provider error) — the only case the 5h column shows n/a */
+  na: boolean
   sub: { name: string; pct: number | null; weekPct: number | null; reset: string | null; exhaustedUntil: string | null; exhausted: boolean }[]
 }
 
 function usageRows(snap: MkSnapshot, compact: boolean): UsageRow[] {
   const agents = snap.usage?.agents ?? {}
-  const names = [...AGENT_ORDER, ...Object.keys(agents).filter(a => !(AGENT_ORDER as readonly string[]).includes(a))]
+  const names = snap.projectAgents ?? [...AGENT_ORDER, ...Object.keys(agents).filter(a => !(AGENT_ORDER as readonly string[]).includes(a))]
   const now = snap.now
   const isExhausted = (until: string | null | undefined): boolean => {
     const t = Date.parse(until ?? '')
@@ -580,7 +605,17 @@ function usageRows(snap: MkSnapshot, compact: boolean): UsageRow[] {
   }
   return names.flatMap(name => {
     const a = agents[name]
-    if (!a) return [] // noUncheckedIndexedAccess: presence checked, then narrowed
+    if (!a) {
+      // no yaml scoping: an agent without a ledger entry is simply not shown, as it always was
+      if (snap.projectAgents == null) return []
+      // the project enables it: one dim hint row instead of nothing (opencode's quota needs the zai provider)
+      return [{
+        name,
+        label: name,
+        hint: name === 'opencode' ? 'no usage — enable zai in CodexBar' : 'no usage yet',
+        pct: null, weekPct: null, reset: null, exhaustedUntil: null, exhausted: false, na: false, sub: [],
+      } as UsageRow]
+    }
     const pools = Object.entries(a.pools ?? {})
     // primary = the configured pool when present, else the first (schema: the
     // agent-level fields mirror the primary pool); the rest render as sub-rows
@@ -598,6 +633,9 @@ function usageRows(snap: MkSnapshot, compact: boolean): UsageRow[] {
       }))
     return [{
       name,
+      // claude's main row aggregates every model pool; other agents' main row is one pool
+      label: name === 'claude' && sub.length > 0 && !compact ? 'claude (all)' : name,
+      hint: null,
       pct: a.five_hour?.used_pct ?? null,
       weekPct: a.weekly?.used_pct ?? null,
       reset: a.five_hour?.resets_at ?? a.weekly?.resets_at ?? null,
@@ -605,6 +643,7 @@ function usageRows(snap: MkSnapshot, compact: boolean): UsageRow[] {
       // agent red only on the agent-level exhausted_until (schema: set only
       // when every pool is exhausted — a lone secondary pool stays a sub-row)
       exhausted: isExhausted(a.exhausted_until),
+      na: a.status === 'n/a',
       sub,
     } as UsageRow]
   })
@@ -619,18 +658,19 @@ function UsageSection(els: Els, snap: MkSnapshot, compact: boolean) {
   const RESET_W = 6
   const leftCol = (text: string, w: number): string => (text.length > w ? text.slice(0, w) : text.padEnd(w))
   const rightCol = (text: string, w: number): string => (text.length > w ? text.slice(0, w) : text.padStart(w))
-  const pctCol = (pct: number | null): string => (pct == null ? rightCol('n/a', NUM_W) : rightCol(`${Math.round(pct)}%`, NUM_W))
+  // a missing 5h window is '—' like the week column; 'n/a' only for a whole entry the provider could not answer
+  const pctCol = (pct: number | null, na: boolean): string => (pct == null ? rightCol(na ? 'n/a' : '—', NUM_W) : rightCol(`${Math.round(pct)}%`, NUM_W))
   const weekCol = (pct: number | null): string => (pct == null ? rightCol('—', NUM_W) : rightCol(`${Math.round(pct)}%`, NUM_W))
   const resetCol = (iso: string | null): string => rightCol(resetStr(iso, snap.now, compact), RESET_W)
 
-  const row = (keyId: string, name: string, nameColor: string | undefined, boldName: boolean, pct: number | null, weekPct: number | null, resetIso: string | null, exhausted: boolean, exhaustedUntil: string | null) => {
+  const row = (keyId: string, name: string, nameColor: string | undefined, boldName: boolean, pct: number | null, weekPct: number | null, resetIso: string | null, exhausted: boolean, exhaustedUntil: string | null, na: boolean) => {
     const color = pctColor(pct, exhausted)
     const resetIsoShown = exhausted && exhaustedUntil ? exhaustedUntil : resetIso
     return (
       <Box key={keyId} flexDirection="row" gap={0}>
         <Text color={nameColor} bold={boldName}>{leftCol(name, NAME_W)}</Text>
         <Text color={color} bold={exhausted}>{bar(pct, barW)}</Text>
-        <Text color={pct == null ? 'gray' : color} bold={exhausted}>{pctCol(pct)}</Text>
+        <Text color={pct == null ? 'gray' : color} bold={exhausted}>{pctCol(pct, na)}</Text>
         {!compact && <Text dimColor={true}>{weekCol(weekPct)}</Text>}
         <Text dimColor={!exhausted} color={exhausted ? 'red' : undefined} bold={exhausted}>{resetCol(resetIsoShown)}</Text>
         {exhausted && <Text color="red" bold={true}>⊘</Text>}
@@ -650,9 +690,11 @@ function UsageSection(els: Els, snap: MkSnapshot, compact: boolean) {
       {rows.length === 0 && <Text dimColor={true}>no ledger yet</Text>}
       {rows.map(r => (
         <Box key={r.name} flexDirection="column">
-          {row(r.name, leftCol(r.name, NAME_W), AGENT_COLOR[r.name] ?? 'cyan', r.exhausted, r.pct, r.weekPct, r.reset, r.exhausted, r.exhaustedUntil)}
+          {r.hint != null
+            ? <Text dimColor={true}>{leftCol(r.label, NAME_W)}{r.hint}</Text>
+            : row(r.name, leftCol(r.label, NAME_W), AGENT_COLOR[r.name] ?? 'cyan', r.exhausted, r.pct, r.weekPct, r.reset, r.exhausted, r.exhaustedUntil, r.na)}
           {r.sub.map(p => (
-            row(`${r.name}:${p.name}`, `  └ ${compact ? p.name.slice(0, 6) : p.name}`, undefined, false, p.pct, p.weekPct, p.reset, p.exhausted, p.exhaustedUntil)
+            row(`${r.name}:${p.name}`, `  └ ${compact ? p.name.slice(0, 6) : p.name}`, undefined, false, p.pct, p.weekPct, p.reset, p.exhausted, p.exhaustedUntil, false)
           ))}
         </Box>
       ))}

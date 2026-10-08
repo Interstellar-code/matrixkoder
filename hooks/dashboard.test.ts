@@ -2,7 +2,24 @@
 // compact 36-col, inline hint, first-run and no-run states. Fixtures arrive
 // via $.fs.write (inline fixtures plugin); fs is served in memory.
 import { test, expect } from 'claude-code/testing'
-import { NOW, RUN_PATH, USAGE_PATH, agentOf, agentsOf, mockFs, mockWorld, paneProps, sessionStart, sessionStartIn, setRun, setUsage, tasksOf, worldFiles, worldFixtures } from './testkit'
+import { DATA_DIR, NOW, RUN_PATH, USAGE_PATH, agentOf, agentsOf, mockFs, mockWorld, paneProps, sessionStart, sessionStartIn, setRun, setUsage, tasksOf, worldFiles, worldFixtures } from './testkit'
+import { parseYamlAgents } from './data'
+
+/** a project matrixkoder.yaml in the wizard's emitter shape: agents block + usage providers */
+const PROJECT_YAML = [
+  'data_dir: .matrixkoder/',
+  'agents:',
+  '  codex: { available: false, models: [] }',
+  '  opencode: { available: true, models: [zai-coding-plan/glm-4.7] }',
+  '  agy: { available: false, models: [] }',
+  '  claude: { available: true }',
+  '  herdr: { available: true }',
+  `  checked_at: "${new Date(NOW).toISOString()}"`,
+  'usage:',
+  '  source: codexbar',
+  '  poll_min: 5',
+  '  providers: [claude, codex, antigravity]',
+].join('\n')
 
 test('renders section titles, a task row and the agy pool sub-row', { plugins: [worldFixtures] }, async ($, on) => {
   const files = worldFiles()
@@ -270,8 +287,10 @@ test('missing usage triggers the initial poll with the right argv', { plugins: [
   delete files[USAGE_PATH]
   mockFs(on, files)
   const polls: (readonly string[])[] = []
-  mockWorld(on, { process: argv => polls.push(argv) })
+  const clock = mockWorld(on, { process: argv => polls.push(argv) })
   await $.session.start(sessionStart())
+  // the cold-start poll is fire-and-forget: advance(0) settles the event loop so its dispatch chain reaches process.run
+  await clock.advance(0)
   expect(polls.length).toBe(1)
   const first = polls[0]
   if (!first) throw new Error('no poll ran')
@@ -280,6 +299,86 @@ test('missing usage triggers the initial poll with the right argv', { plugins: [
   expect(first[2]).toBe('--once')
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   expect(await ui.find({ text: 'no ledger yet' })).toBeTruthy()
+})
+
+test('a project yaml scopes the usage poll: --providers from usage.providers', { plugins: [worldFixtures] }, async ($, on) => {
+  const files = worldFiles()
+  files[`${DATA_DIR}/matrixkoder.yaml`] = PROJECT_YAML
+  delete files['/fixtures/usage.json']
+  delete files[USAGE_PATH]
+  mockFs(on, files)
+  const polls: (readonly string[])[] = []
+  const clock = mockWorld(on, { process: argv => polls.push(argv) })
+  await $.session.start(sessionStart())
+  // the cold-start poll is fire-and-forget: advance(0) settles the event loop so its dispatch chain reaches process.run
+  await clock.advance(0)
+  expect(polls.length).toBe(1)
+  const first = polls[0]
+  if (!first) throw new Error('no poll ran')
+  expect(first[0]).toBe('python3')
+  expect(first[1]?.endsWith('scripts/mk-usage.py')).toBe(true)
+  expect(first[2]).toBe('--once')
+  expect(first[3]).toBe('--providers')
+  expect(first[4]).toBe('claude,codex,antigravity')
+})
+
+test('the usage section shows only the yaml agents; an enabled agent without a ledger entry gets a hint row', { plugins: [worldFixtures] }, async ($, on) => {
+  const files = worldFiles()
+  files[`${DATA_DIR}/matrixkoder.yaml`] = PROJECT_YAML
+  setUsage(files, usage => {
+    delete agentsOf(usage).opencode // enabled in the yaml, absent from the ledger
+  })
+  mockFs(on, files)
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  expect(await ui.find({ text: 'claude (all)' }), 'claude row shown').toBeTruthy()
+  expect(await ui.find({ text: 'codex         ' }), 'codex disabled in the yaml: no row').toBeUndefined()
+  expect(await ui.find({ text: 'agy            ' }), 'agy disabled in the yaml: no row').toBeUndefined()
+  expect(await ui.find({ text: 'opencode      no usage — enable zai in CodexBar' }), 'opencode hint row').toBeTruthy()
+})
+
+test('fable with no 5h window renders — in the 5h column; claude main row reads claude (all); n/a only for a status n/a entry', { plugins: [worldFixtures] }, async ($, on) => {
+  const files = worldFiles()
+  setUsage(files, usage => {
+    const claude = agentOf(usage, 'claude')
+    const pools = claude?.pools
+    if (typeof pools === 'object' && pools !== null) {
+      const fable = (pools as Record<string, Record<string, unknown>>).fable
+      if (fable) fable.five_hour = null
+    }
+    const codex = agentOf(usage, 'codex')
+    if (codex) codex.status = 'n/a'
+  })
+  mockFs(on, files)
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  expect(await ui.find({ text: 'claude (all)' }), 'main claude row covers all models').toBeTruthy()
+  expect(await ui.find({ text: '  n/a' }), 'a whole-entry n/a keeps n/a in the 5h column').toBeTruthy()
+  // walk the drawn tree: the fable sub-row's 5h column is '—', not n/a
+  const cols: string[] = []
+  let inRow = false
+  const walk = (n: unknown): void => {
+    if (typeof n !== 'object' || n === null) return
+    const node = n as { type?: string; children?: unknown[] }
+    if (node.type === 'Text' && Array.isArray(node.children)) {
+      const own = node.children.map(c => (typeof c === 'string' ? c : '')).join('')
+      if (own.startsWith('  └ fable')) inRow = true
+      else if (inRow) {
+        cols.push(own)
+        if (cols.length === 4) inRow = false // name, bar, 5h, week(+reset on the row's last Texts)
+      }
+    }
+    if (Array.isArray(node.children)) node.children.forEach(walk)
+  }
+  walk(await ui.drawn())
+  expect(cols[0]).toBe('░░░░░░░') // empty bar: no 5h value
+  expect(cols[1], 'fable 5h column').toBe('    —')
+  expect(cols.some(c => c === '  n/a'), 'no n/a on a pool row').toBe(false)
+  // compact keeps the plain agent name
+  await ui.redraw(paneProps(36))
+  expect(await ui.find({ text: 'claude (all)' })).toBeUndefined()
 })
 
 test('two session.start arm exactly one refresh timer', { plugins: [worldFixtures] }, async ($, on) => {
@@ -434,4 +533,40 @@ test('/mk setup then closing the wizard shows the run again (no sticky first-run
   expect(await ui.find({ text: 'Plan' })).toBeTruthy()
   expect(await ui.find({ text: 'Lanes' })).toBeTruthy()
   expect(await ui.find({ text: 'Waiting on you' })).toBeTruthy()
+})
+
+test('parseYamlAgents accepts any indent >= 2 spaces, block style, and unparseable is null never []', () => {
+  // block style with 2 spaces
+  const block2 = [
+    'agents:',
+    '  codex:',
+    '    available: true',
+    '    models: [gpt-5]',
+    '  claude:',
+    '    available: false',
+  ].join('\n')
+  expect(parseYamlAgents(block2)).toEqual(['codex'])
+
+  // block style with 4 spaces
+  const block4 = [
+    'agents:',
+    '    opencode:',
+    '        available: true',
+    '    agy:',
+    '        available: false',
+  ].join('\n')
+  expect(parseYamlAgents(block4)).toEqual(['opencode'])
+
+  // flow style with 4 spaces
+  const flow4 = [
+    'agents:',
+    '    codex: { available: true }',
+  ].join('\n')
+  expect(parseYamlAgents(flow4)).toEqual(['codex'])
+
+  // unparseable treated as no filter (null), never []
+  expect(parseYamlAgents('agents:\n  garbage without keys')).toBeNull()
+  expect(parseYamlAgents('agents: []')).toBeNull()
+  expect(parseYamlAgents('agents:\n')).toBeNull()
+  expect(parseYamlAgents('no agents block here')).toBeNull()
 })
