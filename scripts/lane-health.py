@@ -29,7 +29,11 @@ RESET_AT_RE = re.compile(r"reset(?:s)? at (\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\
 RESET_IN_RE = re.compile(r"(?:resets?|try again)\s+in\s+((?:\d+\s*[a-z]+[\s,]*(?:and\s+)?)+)", re.I)
 RESET_CLOCK_RE = re.compile(r"resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", re.I)
 DUR_RE = re.compile(r"(\d+)\s*([dhm])", re.I)
-WEEKLY_AFTER_H = 6  # a reset further out than this is a weekly window, not the 5h one
+WEEKLY_AFTER_H = 6  # no window named in the text: a reset further out than this is weekly, not the 5h one
+NAMED_5H_RE = re.compile(r"\b(?:5|five)[\s-]*h(?:ou)?rs?\b|\b5h\b", re.I)
+NAMED_WEEK_RE = re.compile(r"\bweek(?:ly)?\b", re.I)
+# ponytail: Z.AI prints its reset in Beijing time; add other provider zones here if their resets look shifted
+PROVIDER_TZ = datetime.timezone(datetime.timedelta(hours=8))
 GUESS_H = 5  # reset unknown → assume the 5h window, flagged exhausted_guess, so the agent is re-tried
 # Provider/account failures: the agent is up but every request fails — fail over like QUOTA.
 PROVIDER_RE = re.compile(r"(unsupported model|subscription is required|model service is temporarily unavailable|invalid api key|unauthori[sz]ed|insufficient (credit|balance))", re.I)
@@ -122,15 +126,34 @@ def classify(text, status, idle_min, stall_min):
     return "OK", []
 
 
+def named_window(text):
+    """The window the limit message names ("5 hour", "5-hour", "5h", "weekly", "week"), from the last limit
+    line (plus the line after it), or None. A named window beats the reset distance (lesson 38)."""
+    lines = text.splitlines()
+    hits = [i for i, l in enumerate(lines) if not CODE_LINE_RE.search(l) and QUOTA_RE.search(l)]
+    scope = " ".join(lines[hits[-1]:hits[-1] + 2]) if hits else text
+    if NAMED_WEEK_RE.search(scope):
+        return "weekly"
+    return "5h" if NAMED_5H_RE.search(scope) else None
+
+
 def parse_reset(text, now=None):
     """-> (exhausted_until ISO or None, window "5h" | "weekly" | None) from limit text.
     Understands "reset at 2026-10-07 10:02", "resets in 154h43m / 1h 30m / 45m / 2d 3h / 2 hours",
     "try again in ..." and a bare clock time "resets 3pm" / "resets at 15:30" (next occurrence)."""
     now = now or datetime.datetime.now().astimezone()
-    until = None
+    until, named = None, named_window(text)
     m = RESET_AT_RE.search(text)
-    if m:  # CLIs print local wall time
-        until = datetime.datetime.fromisoformat(m.group(1).replace(" ", "T")).astimezone()
+    if m:  # most CLIs print local wall time
+        naive = datetime.datetime.fromisoformat(m.group(1).replace(" ", "T"))
+        until = naive.astimezone() if now.tzinfo is None else naive.replace(tzinfo=now.tzinfo)
+        five = datetime.timedelta(hours=5, minutes=5)
+        if named == "5h" and until - now > five:  # a "5 hour" reset can't be further out: provider's own zone
+            alt = naive.replace(tzinfo=PROVIDER_TZ)
+            if now < alt <= now + five:
+                until = alt.astimezone(now.tzinfo)
+            else:
+                return None, "5h"  # zone unknown: caller guesses now + 5h, flagged exhausted_guess
     if until is None:
         m = RESET_IN_RE.search(text)
         mins = sum(int(n) * {"d": 1440, "h": 60, "m": 1}[u.lower()] for n, u in DUR_RE.findall(m.group(1))) if m else 0
@@ -145,9 +168,9 @@ def parse_reset(text, now=None):
                 if until <= now:
                     until += datetime.timedelta(days=1)
     if until is not None:
-        window = "weekly" if until - now > datetime.timedelta(hours=WEEKLY_AFTER_H) else "5h"
+        window = named or ("weekly" if until - now > datetime.timedelta(hours=WEEKLY_AFTER_H) else "5h")
         return until.isoformat(timespec="seconds"), window
-    return None, ("weekly" if re.search(r"week", text, re.I) else None)
+    return None, named
 
 
 def record_quota(ledger, key, text, now=None):
@@ -206,6 +229,7 @@ def check(agent, lane, kind=None, stall_min=10.0, since=0.0, marker=None, ledger
 
 
 def self_test():
+    import shutil
     assert classify("Usage limit reached for 5 hour. Your limit will reset at 2026-10-07 10:02:14", "idle", 1, 10)[0] == "QUOTA"
     assert classify("⚠ Individual quota reached. Resets in 154h43m", "idle", 1, 10)[0] == "QUOTA"
     assert classify("all good", "blocked", 1, 10)[0] == "BLOCKED"
@@ -254,6 +278,20 @@ def self_test():
     assert parse_reset("will reset at 2026-10-13 09:00", now)[1] == "weekly"
     assert parse_reset("weekly usage limit reached", now) == (None, "weekly")
     assert parse_reset("usage limit reached", now) == (None, None)
+    # a named window wins over the distance; a "5 hour" reset printed in Beijing time is converted (lesson 38)
+    zai = "Usage limit reached for 5 hour. Your limit will reset at 2026-10-08 22:16:57"
+    zn = datetime.datetime(2026, 10, 8, 11, 50, tzinfo=datetime.timezone(datetime.timedelta(hours=2)))
+    assert parse_reset(zai, zn) == ("2026-10-08T16:16:57+02:00", "5h"), parse_reset(zai, zn)
+    assert parse_reset("Usage limit reached for 5 hour. Your limit will reset at 2026-10-09 09:00:00", zn) == (None, "5h")
+    assert parse_reset("Weekly usage limit reached. Resets in 3h", zn)[1] == "weekly"
+    assert parse_reset("5-hour limit reached, resets in 7h", zn)[1] == "5h"
+    tmp_l = tempfile.mkdtemp(prefix="lane-health-zai-")
+    try:
+        led = os.path.join(tmp_l, "usage.json")
+        e = record_quota(led, "opencode", "> brief\n" + zai, zn)
+        assert e["exhausted_window"] == "5h" and e["exhausted_until"] == "2026-10-08T16:16:57+02:00" and not e["exhausted_guess"], e
+    finally:
+        shutil.rmtree(tmp_l, ignore_errors=True)
     later = lambda **kw: (now + datetime.timedelta(**kw)).isoformat(timespec="seconds")
     assert parse_reset("limit reached, resets in 45m", now) == (later(minutes=45), "5h")
     assert parse_reset("resets in 1h 30m", now) == (later(minutes=90), "5h")
