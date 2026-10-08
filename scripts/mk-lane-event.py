@@ -199,14 +199,15 @@ def verdict_for(w):
     rx = re.compile(w.get("commit_grep") or ".*")
     report = w.get("report")
     report_ok = not report or os.path.exists(os.path.join(w["lane"], report))
+    subj = lw.commit_subject(w["lane"])
     since = float(w.get("last_activity") or w.get("armed_at") or time.time())
     h = lh.check(w["pane"], w["lane"], w.get("kind"), stall, since, w.get("prompt_marker"))
     fp = pane_fp(h.get("text", ""))
     if w.get("last_pane_fp") is not None and fp != w["last_pane_fp"]:
+        # subj/report_ok are computed before the second lh.check on purpose (pane activity only moves the idle clock)
         w["last_activity"] = time.time()
         h = lh.check(w["pane"], w["lane"], w.get("kind"), stall, w["last_activity"], w.get("prompt_marker"))
     w["last_pane_fp"] = fp
-    subj = lw.commit_subject(w["lane"])
     state, ev = lw.decide(h, subj, rx, report_ok, h.get("text", ""), w.get("phase"), stall)
     return h, subj, state, ev
 
@@ -311,13 +312,11 @@ def cmd_disarm(a):
     lane = opt(a, "--lane")
     if not lane:
         fail("disarm needs --lane")
-    wf, lf = os.path.join(lane, WATCH), os.path.join(lane, LOCK)
+    wf = os.path.join(lane, WATCH)
     with locked(lane):
         removed = os.path.exists(wf)
         if removed:
             os.remove(wf)
-        if os.path.exists(lf):  # the flock stays valid on the open fd after unlink
-            os.remove(lf)
     out({"ok": True, "lane": lane, "removed": removed})
 
 
@@ -677,6 +676,7 @@ def self_test():
         # disarm: removes the watch file, the lane stops matching events
         r = cli("disarm", "--lane", lanes["H3"])
         assert r["ok"] and r["removed"] is True and not os.path.exists(os.path.join(lanes["H3"], WATCH))
+        assert os.path.exists(os.path.join(lanes["H3"], LOCK))  # lock file stays in place
         r = cli("disarm", "--lane", lanes["H3"])
         assert r["ok"] and r["removed"] is False
         r = event("working", tid="H3")
