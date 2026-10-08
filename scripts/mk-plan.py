@@ -14,7 +14,7 @@ set/add-run rewrite only the target header key's line(s) — the markdown body a
 every other header line (comments included) stay byte-identical — via a temp
 file + os.replace, and the rewritten text is re-parsed before anything is written.
 """
-import argparse, contextlib, fnmatch, hashlib, json, os, re, sys, tempfile, tomllib
+import argparse, contextlib, fnmatch, hashlib, json, os, re, stat, sys, tempfile, tomllib
 
 STATUSES = ("draft", "approved", "running", "done", "parked")
 SIZES = ("trivial", "standard", "complex")
@@ -75,9 +75,12 @@ def split_plan(text):
 
 
 def parse_header(header_lines, start=2):
-    """TOML header → dict; tomllib's relative line is offset to a file line number."""
+    """TOML header → dict; tomllib's relative line is offset to a file line number.
+    One trailing \r per line is dropped for PARSING ONLY: tomllib rejects the bare \r a joined
+    CRLF header would end on, so a CRLF plan now parses like its LF twin. set/add-run instead
+    split the raw lines and rewrite only the key's line(s), so the file keeps its own endings."""
     try:
-        return tomllib.loads("\n".join(header_lines))
+        return tomllib.loads("\n".join(l[:-1] if l.endswith("\r") else l for l in header_lines))
     except tomllib.TOMLDecodeError as e:
         rel = TOML_LINE_RE.search(str(e))
         line = int(rel.group(1)) + start - 1 if rel else start
@@ -379,13 +382,17 @@ def rewrite(path, lines, start, end, newline):
 
 def write_atomic(path, text):
     d = os.path.dirname(os.path.abspath(path))
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)  # a read-only plan stays read-only
+    except OSError:
+        mode = 0o644
     fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-")
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(text.encode("utf-8"))
             f.flush()
             os.fsync(f.fileno())
-        os.chmod(tmp, 0o644)  # mkstemp makes 0600; match the plan file
+        os.chmod(tmp, mode)  # mkstemp makes 0600; keep the file's own mode
         os.replace(tmp, path)
     except BaseException:
         with contextlib.suppress(OSError):
@@ -587,6 +594,23 @@ def self_test():
         assert out["ok"] is False and out["errors"][0].startswith("line 4:"), out
         mk("check", os.path.join(tmp, "nope.md"), code=3)
 
+        # CRLF plans parse like their LF twin; set/add-run keep the file's own endings
+        p = write("crlf.md", plan_text(phases=phase("P1") + "\n").replace("\n", "\r\n"))
+        with open(p, "rb") as f:
+            raw = f.read()
+        out = mk("parse", p)
+        assert out["ok"] and out["sha"] == hashlib.sha256(raw).hexdigest()
+        assert mk("check", p)["ok"] is True
+        assert mk("set", p, "--status", "approved")["status"] == "approved"
+        crlf = open(p, "rb").read()
+        assert crlf.replace(b"\r\n", b"\n") == raw.replace(b"\r\n", b"\n").replace(
+            b'status = "draft"', b'status = "approved"')
+        assert b"\n" not in crlf.replace(b"\r\n", b"")  # every newline still a \r\n
+        assert mk("parse", p)["status"] == "approved"
+        assert mk("add-run", p, "--run", "r1")["runs"] == ["r1"]
+        crlf = open(p, "rb").read()
+        assert 'runs = ["r1"]\r' in crlf.decode("utf-8") and b"\n" not in crlf.replace(b"\r\n", b"")
+
         # the eight P1.2 error rules — each violates exactly one, parse stays ok
         def bad(name, phases, needle):
             p = write(f"{name}.md", plan_text(phases=phases + "\n"))
@@ -663,6 +687,14 @@ def self_test():
         before = open(p, "rb").read()
         mk("set", p, "--status", "approved", code=2)
         assert open(p, "rb").read() == before
+
+        # write_atomic keeps the file's own mode; the temp + os.replace lands in a writable dir
+        p = write("mode.md", plan_text())
+        os.chmod(p, 0o444)
+        mk("set", p, "--status", "approved")
+        assert stat.S_IMODE(os.stat(p).st_mode) == 0o444, oct(os.stat(p).st_mode)
+        assert mk("parse", p)["status"] == "approved"
+        os.chmod(p, 0o644)  # cleanup deletes it either way
 
         # P1.3 add-run — appends, idempotent, comments and body untouched
         target = os.path.join(tmp, "run-target.md")

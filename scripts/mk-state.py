@@ -614,6 +614,7 @@ def cmd_run(a, st):
             if gate.get("status") != "approved" and not a.force:
                 raise Fail(f"plan {gate.get('plan') or a.plan} is {gate.get('status')!r}, not approved; "
                            "approve it (mk-plan.py set --status approved) or pass --force")
+            plan_preflight(st, plan_tool("parse", a.plan), rid)
         with st.locked():
             if os.path.exists(os.path.join(st.run_dir(rid), "run.json")):
                 raise Fail(f"run {rid} exists")
@@ -652,6 +653,7 @@ def cmd_run(a, st):
         return {"ok": True, "run": st.load(a.run)}
     if a.action == "archive" and not a.run:
         raise Fail("run archive needs --id")
+    warn = None
     with st.locked():
         run = st.load(a.run)
         if a.action == "set":
@@ -660,7 +662,7 @@ def cmd_run(a, st):
             if a.next is not None:
                 run["next"] = a.next
             if a.status:
-                set_run_status(st, run, a.status)
+                warn = set_run_status(st, run, a.status)
         elif a.action == "stage":
             if a.n is None or a.n < 0:
                 raise Fail("run stage needs N >= 0")
@@ -669,7 +671,7 @@ def cmd_run(a, st):
         else:  # archive
             set_run_status(st, run, "archived")
         st.save(run)
-    return {"ok": True, "run": run}
+    return {"ok": True, "run": run, **({"warning": warn} if warn else {})}
 
 
 def set_run_status(st, run, status):
@@ -678,12 +680,15 @@ def set_run_status(st, run, status):
         run["status"] = status
         run["ended"] = None if status == "active" else (run.get("ended") or now())
         if status == "done" and run.get("plan_id") and run.get("plan"):
-            plan_done_if_last(st, run)  # C5: best-effort, never fatal
+            return plan_done_if_last(st, run)  # C5: best-effort, never fatal
+    return None
 
 
 def plan_done_if_last(st, run):
     """The LAST run id in the plan's runs list finished → the plan goes `done` (C5). Best-effort:
-    an unreadable plan or a failing plan tool never fails the `run set` around it."""
+    a plan-tool error (missing plan file, mk-plan error JSON) never fails the `run set` around it —
+    the message rides back as the command's "warning". Only Fail is caught; anything else is a real
+    bug and still raises."""
     try:
         cur = plan_tool("parse", run["plan"])
         runs = [str(x) for x in cur.get("runs") or []]
@@ -691,8 +696,56 @@ def plan_done_if_last(st, run):
             plan_tool("set", run["plan"], "--status", "done")
             run["plan_status"] = "done"
             st.event(run, "note", f"plan {run['plan_id']} done (last run finished)")
-    except Exception:
-        pass
+    except Fail as e:
+        return f"plan {run.get('plan_id')} not marked done: {e}"
+    return None
+
+
+def plan_preflight(st, cur, rid):
+    """Everything `run init --plan` is about to write, checked the way the task-add path would
+    build it — BEFORE the lock, so an unbuildable plan leaves no run dir, no index entry and a
+    byte-identical plan file (a bad id can no longer half-create a run after `set`/`add-run`).
+    Same id rule as `task add`, unique ids across the run, plan-shaped deps/owned, self-deps."""
+    phases = cur.get("phases") or []
+    if not isinstance(phases, list):
+        raise Fail("plan phases is not a list")
+    ids = []
+    for ph in phases:
+        if not isinstance(ph, dict):
+            raise Fail("plan phase is not an object")
+        pid = str(ph.get("id") or "")
+        check_id(pid, "task id")
+        ids.append(pid)
+        tasks = ph.get("tasks") or []
+        if not isinstance(tasks, list) or not all(isinstance(c, dict) for c in tasks):
+            raise Fail(f"phase {pid}: tasks is not a list")
+        for c in tasks:
+            cid = str(c.get("id") or "")
+            check_id(cid, "task id")
+            ids.append(cid)
+    seen = set()
+    for tid in ids:  # the add path's clash check, run before any task is written
+        if tid.lower() in seen:
+            raise Fail(f"task {tid} exists")
+        seen.add(tid.lower())
+    for ph in phases:
+        pid = str(ph.get("id") or "")
+        deps = ph.get("deps") or []
+        if not isinstance(deps, list) or not all(isinstance(d, str) for d in deps):
+            raise Fail(f"phase {pid}: deps must be a list of ids")
+        for d in deps:
+            st.norm_dep({"id": rid}, pid, d)  # stored id case; a self-dep fails here too
+        plan_owned(ph.get("owned"), f"phase {pid}")
+        for c in ph.get("tasks") or []:
+            plan_owned(c.get("owned"), f"task {c.get('id')}")
+
+
+def plan_owned(owned, who):
+    if owned is None:
+        return []
+    if not isinstance(owned, list) or not all(isinstance(x, str) for x in owned):
+        raise Fail(f"{who}: owned must be a list of paths")
+    return owned
 
 
 def add_task(st, run, tid, title, wave, deps, owned, parent, by, extra=None):
@@ -1644,6 +1697,24 @@ def self_test():
         evs = [json.loads(x) for x in open(os.path.join(pd, "runs", "pr3", "events.jsonl"))]
         assert any("plan tplan done" in x["text"] for x in evs), evs
 
+        # an unbuildable plan: refused before the plan file, the run dir or the index move
+        putdb({**PLAN_BASE, "status": "approved", "phases": [
+            {**PLAN_BASE["phases"][0], "tasks": [
+                {"id": "P1.1", "title": "ok", "acceptance": "a", "refs": [], "subagent": False,
+                 "owned": []},
+                {"id": "bad id", "title": "x", "acceptance": "a", "refs": [], "subagent": False,
+                 "owned": []}]}]})
+        pbytes = open(pfile, "rb").read()
+        e = pk("run", "init", "--id", "pb1", "--feature", "F", "--branch", "b", "--plan", pfile, code=2)
+        assert "invalid task id 'bad id'" in e["error"], e
+        assert open(pfile, "rb").read() == pbytes  # the plan header is untouched
+        assert not os.path.exists(os.path.join(pd, "runs", "pb1"))  # no run dir
+        assert "pb1" not in {r["id"] for r in json.load(open(os.path.join(pd, "runs", "index.json")))}
+        putdb({**PLAN_BASE, "status": "approved"})  # the same run id now builds
+        out = pk("run", "init", "--id", "pb1", "--feature", "F", "--branch", "b", "--plan", pfile)
+        assert [t["id"] for t in out["run"]["tasks"]] == ["P1", "P1.1", "P1.2", "P2", "P2.1"]
+        pk("run", "archive", "--id", "pb1")
+
         # best-effort: a missing plan file never fails run set done or render
         pfile2 = os.path.join(tmp, "tplan2.json")
         json.dump({"plan": "t2", "status": "running", "runs": [], "phases": []}, open(pfile2, "w"))
@@ -1651,7 +1722,8 @@ def self_test():
         os.unlink(pfile2)
         out = pk("run", "set", "--id", "pr4", "--status", "done")
         assert out["ok"] is True and out["run"]["status"] == "done", out
-        assert out["run"]["plan_status"] == "running"  # unchanged: the parse failed, swallowed
+        assert out["run"]["plan_status"] == "running"  # unchanged: the parse failed
+        assert "not marked done" in out.get("warning", ""), out  # said out loud, not swallowed
         os.unlink(pfile)
         board = open(pk("render", "--run", "pr1")["board"]).read()
         assert "⚠" not in board and "plan: `tplan`" in board, board  # unreadable file: no ⚠, no crash

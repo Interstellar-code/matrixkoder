@@ -103,8 +103,7 @@ and legacy path-only runs.
 | `verdict` | string \| null | latest review verdict; also copied to the current round's `verdict` |
 | `round` | int | current round number (0 = none yet) |
 | `rounds` | array | `{n, kind: build\|fix\|takeover, cause, verdict, sha, started}` |
-| `plan_phase`, `route`, `lane_group` | string \| null | **C4**: set on a *phase* task created by `run init --plan` — the plan phase id, its pinned `route` (`""` = Jev decides, stored `null`), and its `lane_group` (phases sharing a value share one worktree). `null` on ad-hoc tasks (`task add`) and children |
-| `plan_task` | string \| null | **C4**: set on a *child* task created from a `[[phase.task]]` — the plan task id (`P1.1`); its `parent` is the phase task. `null` on ad-hoc and phase tasks |
+| `plan_phase`, `route`, `lane_group` | string \| null | **C4**: set on a *phase* task created by `run init --plan` — the plan phase id, its pinned `route` (`""` = Jev decides, stored `null`), and its `lane_group` (phases sharing a value share one worktree). `null` on ad-hoc tasks (`task add`) and children || `plan_task` | string \| null | **C4**: set on a *child* task created from a `[[phase.task]]` — the plan task id (`P1.1`); its `parent` is the phase task. `null` on ad-hoc and phase tasks |
 
 ## `events.jsonl` line
 
@@ -311,5 +310,6 @@ runs/tasks; a legacy run keeps its path-only `plan` field and the plain `plan: \
 The board of a plan-linked run shows `plan: \`id\` · status · sha \`…12\`` and, when the plan file's
 current sha256 (plain read) differs from `plan_sha`, a `⚠ plan file changed since run start` line —
 an unreadable plan file means no warning and no crash. Setting the **last** run of a plan `done`
-runs `set --status done` on the plan and flips the run's `plan_status` (best-effort, never fatal).
+runs `set --status done` on the plan and flips the run's `plan_status` (best-effort, never fatal; a
+plan-tool error rides back as a `warning` in the `run set` JSON).
 `task add` stays for ad-hoc tasks.
