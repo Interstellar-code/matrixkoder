@@ -84,6 +84,28 @@ test('rejects --data, --by, and --run overrides', async ($, on) => {
   expect(processCalled).toBe(false)
 })
 
+test('allows values that start with a banned flag name but contain whitespace', async ($, on) => {
+  let processCalled = false
+  const capturedArgs: Array<readonly string[]> = []
+  on('process.run', (_$, e) => {
+    processCalled = true
+    capturedArgs.push(e.argv)
+    return { value: procResult({ stdout: '{}' }) }
+  })
+
+  for (const args of [
+    ['event', '--type', 'note', '--text', '--run tests failed'],
+    ['event', '--type', 'note', '--text', '--by design'],
+    ['event', '--type', 'note', '--text', '--data is messy'],
+    ['event', '--type', 'note', '--text', ' --run tests failed'],
+  ]) {
+    const ran = await callTool($, { tool: 'mcp__matrixkoder__mk_state', args })
+    expect(ran.isError).toBeUndefined()
+  }
+  expect(processCalled).toBe(true)
+  expect(capturedArgs.some(argv => argv.includes('--run tests failed'))).toBe(true)
+})
+
 test('rejects task set --force (dep gate bypass)', async ($, on) => {
   let processCalled = false
   on('process.run', (_$, e) => {

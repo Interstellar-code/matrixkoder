@@ -83,6 +83,25 @@ Stage 1 writes `## Routing preferences` from `matrixkoder.yaml` defaults; if the
 
 `QUOTA`, `PROVIDER` (unsupported model, subscription required, service unavailable, auth) or `STALL` (working but no file/commit change for 10 min, or idle without the DONE token): record `git status --porcelain` + `git diff --stat` counts as an event (`mk-state event --task <T> --type note`), `task round <T> --kind takeover --cause "quota|stall|provider"`, write the TAKEOVER section, re-decide with Jev (or static order), dispatch. Skip agents inside a reset window. All agents below their floor → pause the run and ask.
 
+## Review sizing
+
+Not every lane needs a separate human reviewer. Depth follows risk, and the reviewer is always a different model family than the builder where possible.
+
+| Lane kind | Review depth |
+|---|---|
+| Docs, typos, 1-line or mechanical changes | **Skip the reviewer.** Real gate output + `jev_review`/`jev_gate` on the real diff (never a placeholder) is enough. |
+| Ordinary feature/UI lanes | **Cheap first pass:** `jev_review` on the real diff. Escalate to a reviewer only when it flags something (`review`/`escalate`) or the lane touches a risk path. |
+| Shared run state, data-loss, security, guards, auth, shell, YAML/config writers, cross-run or concurrency logic | **Full reviewer.** (Evidence 2026-10-08: two full reviews on `mk-state` found 9 then 6 real bugs that passed every gate.) |
+
+**Reviewer choice** is generic, from the repo's MK config:
+- Candidates = agents with `available: true` in `<data>/matrixkoder.yaml` `agents:`, excluding the builder's model family, with quota left in `~/.matrixkoder/usage.json`.
+- Prefer a non-Claude agent in a herdr pane to spare Claude.
+- Use a Claude subagent only when it is the only family left or Jev routes it there.
+- Jev still picks agent + model + effort from those candidates.
+- A data-loss/security review uses the strongest tier available.
+
+**Reviewer brief** = the diff + the brief's acceptance criteria + gate output. Never "explore the repo".
+
 ## Typical routes (static fallback when Jev is skipped; the "never" rules are `jev_decide` requirements)
 
 Claude tier aliases (`haiku`, `sonnet`, `opus`, `fable`) resolve to the newest model of that tier; record the resolved model on the task. Haiku 5.5 (user, 2026-10-07) is the default for small and easy Claude jobs: include `claude haiku <effort>` as a `jev_decide` candidate for every trivial or read-only job.

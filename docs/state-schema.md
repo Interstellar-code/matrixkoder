@@ -82,7 +82,7 @@ with offset, seconds precision (`2026-10-07T20:09:01+02:00`). Unknown values are
 | `id`, `title` | string | `id` unique case-insensitively within the run (`T1` and `t1` clash) |
 | `wave` | int \| null | |
 | `deps`, `owned` | string[] | tasks it waits on (`T` in this run, `RUN:T` in another run of the same data dir); file globs it owns. Stored in the target's stored id case (ids match case-insensitively; a self-dep is refused at add). `task set status=dispatched\|building` fails while a dep of the task **or of any ancestor** is not `merged`/`qa`/`done` (`--force` overrides) |
-| `parent` | string \| null | parent task id (same run); `--parent` onto a task in `merged`/`qa`/`done` is refused. The parent's status rolls up from its children: a side state if any child is in one (`blocked` > `provider` > `quota` > `stalled`), else `building` while any child is past `routed` and not all children are met, else the least advanced child; manual `status=` on a task with children is refused |
+| `parent` | string \| null | parent task id (same run); `--parent` onto a task in `merged`/`qa`/`done` is refused. The parent's status rolls up from its children: a side state if any child is in one (`blocked` > `provider` > `quota` > `stalled`), else the least advanced child, raised to `building` only when at least one child is past `routed` and the least advanced child is below `building` (parents are never lowered); manual `status=` on a task with children is refused |
 | `ready` | bool | written by mk-state: has deps, `planned`/`routed`, every dep met. A flip to true logs a `deps met` note; the dashboard toasts it |
 | `status` | enum | `planned → routed → dispatched → building → verifying → review → fix → merged → qa → done`; side states `blocked \| quota \| stalled \| provider` |
 | `agent` | string \| null | agent kind or pane (`codex`, `agy`, ...) |
@@ -187,10 +187,9 @@ for task/event/wait/render (`run *` commands take `--id`, alias `--run`).
 
 Every `mk-state.py` command prints exactly one JSON line: `{"ok": true, ...}` exit 0;
 `{"ok": false, "error": "..."}` exit 2 on bad input or a corrupt/unreadable state file; lock refused →
-exit 1 with `state` and `lock`. A command in a healthy run stays `ok: true` and adds a `warnings`
-entry when another active run's `run.json` is unreadable (that run is skipped for cross-run
-`ready`/board upkeep); flags never prefix-match (`--fo` is an unknown argument).
-`task round` returns `{round, kind, brief, report, review}` absolute paths for that round.
+exit 1 with `state` and `lock`. A malformed sibling active run only produces a `warnings` entry
+and is skipped for cross-run `ready`/board upkeep. Flags never prefix-match (`--fo` is an unknown
+argument). `task round` returns `{round, kind, brief, report, review}` absolute paths for that round.
 
 lane-watch exit → task status (with `--task --data`, both required together): `DONE`/`DONE_SENT → verifying`,
 `QUOTA → quota`, `STALL → stalled`, `PROVIDER → provider`, `BLOCKED → blocked` — only while the task is

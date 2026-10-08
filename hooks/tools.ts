@@ -10,17 +10,17 @@ const ALLOWED_SUBCOMMANDS = new Set([
   'render',
 ])
 
-// --data/--by/--run steer mk-state at another project or run; the model tool must not pass them in
-// any form: exact, --flag=value, or an abbreviation like --b=x (argparse prefix matching is off,
-// but reject here too so the process never runs)
+// --data/--by/--run steer mk-state at another project or run; the model tool must not pass them
+// in any flag form — exact, --flag=value, or an abbreviation like --b=x. A token containing
+// whitespace is a value ('--text', '--run tests failed'), never a flag.
 const OVERRIDE_FLAGS = ['--data', '--by', '--run']
 
 const flagName = (arg: string): string => arg.split('=', 1)[0] ?? arg
 
 const isOverrideFlag = (arg: string): boolean => {
   const name = flagName(arg)
-  if (!name.startsWith('--') || name.length <= 2) return false
-  return OVERRIDE_FLAGS.some((b) => name === b || b.startsWith(name) || name.startsWith(b))
+  if (!name.startsWith('--') || name.length <= 2 || /\s/.test(name)) return false
+  return OVERRIDE_FLAGS.some((b) => name === b || b.startsWith(name))
 }
 
 export function registerTools(on: On, _options: PluginOptions): void {

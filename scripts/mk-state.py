@@ -208,9 +208,11 @@ class Store:
             src = run
         else:
             try:
-                src = read_json(os.path.join(self.run_dir(rid), "run.json")) or {}
+                src = read_json(os.path.join(self.run_dir(rid), "run.json"))
             except (OSError, ValueError):
                 return None  # unreadable dep target: unknown, so unmet — never fatal
+            if not isinstance(src, dict):
+                return None  # valid JSON but not an object: unknown too
         return next((t.get("status") for t in src.get("tasks") or []
                      if isinstance(t, dict) and str(t.get("id") or "").lower() == tid.lower()), None)
 
@@ -247,8 +249,10 @@ class Store:
             src = run
         else:
             try:
-                src = read_json(os.path.join(self.run_dir(rid), "run.json")) or {}
+                src = read_json(os.path.join(self.run_dir(rid), "run.json"))
             except (OSError, ValueError):
+                src = {}
+            if not isinstance(src, dict):  # valid JSON but not an object: dep stays unknown
                 src = {}
         hit = next((t.get("id") for t in (src.get("tasks") or [])
                     if isinstance(t, dict) and str(t.get("id") or "").lower() == did.lower()), None)
@@ -256,18 +260,29 @@ class Store:
 
     def active_runs(self, run):
         """-> ([run, *other active runs], warnings): the given run first, the other active runs
-        loaded. An unreadable or non-object sibling is skipped and named in warnings, never fatal."""
+        loaded. An unreadable or wrong-shape sibling (missing id/branch/feature/updated, `tasks`
+        not a list of objects) is skipped and named in warnings, never fatal."""
         others, warnings = [], []
         for r in self.index():
-            if r.get("status") != "active" or r.get("id") in (None, run.get("id")):
+            rid = r.get("id")
+            if r.get("status") != "active" or rid in (None, run.get("id")):
                 continue
             try:
-                x = read_json(os.path.join(self.run_dir(r["id"]), "run.json"))
+                x = read_json(os.path.join(self.run_dir(rid), "run.json"))
             except (OSError, ValueError) as e:
-                warnings.append(f"active run {r['id']} unreadable, skipped: {type(e).__name__}")
+                warnings.append(f"active run {rid} unreadable, skipped: {type(e).__name__}")
                 continue
-            if isinstance(x, dict) and x:
-                others.append(x)
+            if not isinstance(x, dict) or not x.get("id"):
+                warnings.append(f"active run {rid} run.json is not a usable run (no id), skipped")
+                continue
+            missing = [k for k in ("branch", "feature", "updated") if not x.get(k)]
+            if missing:
+                warnings.append(f"active run {rid} run.json missing {', '.join(missing)}, skipped")
+                continue
+            if not isinstance(x.get("tasks"), list) or not all(isinstance(t, dict) for t in x["tasks"]):
+                warnings.append(f"active run {rid} has a malformed tasks list, skipped")
+                continue
+            others.append(x)
         return [run] + others, warnings
 
     def refresh_ready(self, run, by="orchestrator"):
@@ -285,7 +300,9 @@ class Store:
     def refresh_others(self, run, by="orchestrator"):
         """Cross-run upkeep after a save that may change a status (task add and task set): refresh
         `ready` and the board of every other active run — a merge here can make their tasks ready,
-        and their boards show "blocks" markers. An unreadable sibling is skipped and warned. -> warnings"""
+        and their boards show "blocks" markers. An unusable sibling is skipped and warned. -> warnings"""
+        # ponytail: every add/set re-renders every other active run, each render re-reading them
+        # all — ~N² in active runs; a per-command {rid: run} cache when that ever shows up
         runs, warnings = self.active_runs(run)
         for o in runs[1:]:
             try:
@@ -293,7 +310,7 @@ class Store:
                     self.save(o, by=by)
                 else:
                     self.render(o)
-            except (OSError, ValueError) as e:
+            except Exception as e:  # a wrong-shape sibling (e.g. missing branch) is a warning, never a traceback
                 warnings.append(f"run {o.get('id')} not refreshed: {type(e).__name__}")
         return warnings
 
@@ -382,8 +399,8 @@ def tree(tasks):
 
 def rollup(st, run, by):
     """A parent's status follows its children: a side state if any child is in one, else the least
-    advanced child — except that once any child is past `routed` and not all are met, the parent is
-    `building` (work started; a parent must not look less advanced than its children)."""
+    advanced child — only ever raised to `building` (never lowered) when work has started: any
+    child past `routed` and the least advanced child below `building`."""
     order = {s: i for i, s in enumerate(STATUSES)}
     for t, _ in reversed(tree(run.get("tasks") or [])):  # leaves first, so nested parents see rolled-up children
         if not t.get("id"):
@@ -393,9 +410,9 @@ def rollup(st, run, by):
             continue
         new = next((s for s in SIDE if s in kids), None)
         if new is None:
-            started = any(order.get(k, 0) > order["routed"] for k in kids)  # unknown status: least advanced
-            new = "building" if started and not all(k in DEP_MET for k in kids) else min(
-                kids, key=lambda s: order.get(s, 0))
+            new = min(kids, key=lambda s: order.get(s, 0))  # unknown status: least advanced
+            if any(order.get(k, 0) > order["routed"] for k in kids) and order.get(new, 0) < order["building"]:
+                new = "building"
         if new != t.get("status"):
             st.event(run, "transition", f"roll-up from children: {t.get('status')} → {new}", task=t["id"],
                      frm=t.get("status"), to=new, by=by)
@@ -1099,12 +1116,29 @@ def self_test():
         assert dk("task", "get", "Q3", "--run", "rb")["task"]["status"] == "planned"  # rolled back by the child
         assert dk("task", "get", "D3", "--run", "ra")["task"]["ready"] is False  # refreshed, still correct
 
+        # roll-up only raises to building, never lowers; verify every rule in the acceptance
+        cases = (
+            ("P4", ("review", "review"), "review"),
+            ("P5", ("verifying", "review"), "verifying"),
+            ("P6", ("fix", "merged"), "fix"),
+            ("P7", ("building", "planned"), "building"),
+            ("P8", ("planned", "planned"), "planned"),
+        )
+        for pid, (s1, s2), want in cases:
+            dk("task", "add", "--id", pid, "--title", pid, "--run", "rb")
+            dk("task", "add", "--id", f"{pid}C1", "--title", "c1", "--parent", pid, "--run", "rb")
+            dk("task", "set", f"{pid}C1", f"status={s1}", "--run", "rb")
+            dk("task", "add", "--id", f"{pid}C2", "--title", "c2", "--parent", pid, "--run", "rb")
+            dk("task", "set", f"{pid}C2", f"status={s2}", "--run", "rb")
+            assert dk("task", "get", pid, "--run", "rb")["task"]["status"] == want, (pid, want)
+
         # building + planned rolls up to building; an unknown child status never crashes the roll-up
         dk("task", "add", "--id", "P3", "--title", "p3", "--run", "rb")
         dk("task", "add", "--id", "K1", "--title", "k1", "--parent", "P3", "--run", "rb")
         dk("task", "add", "--id", "K2", "--title", "k2", "--parent", "P3", "--run", "rb")
         dk("task", "set", "K1", "status=building", "--run", "rb")
-        assert dk("task", "get", "P3", "--run", "rb")["task"]["status"] == "building"
+        got = dk("task", "get", "P3", "--run", "rb")["task"]["status"]
+        assert got == "building", got
         runjson = os.path.join(tmp, "deps", "runs", "rb", "run.json")
         run = json.load(open(runjson))
         next(t for t in run["tasks"] if t["id"] == "K2")["status"] = "weird"  # a status mk-state never wrote
@@ -1118,14 +1152,37 @@ def self_test():
         sk("run", "init", "--id", "sick", "--feature", "S", "--branch", "s")
         sk("task", "add", "--id", "T", "--title", "t", "--run", "good")
         sick = os.path.join(tmp, "sick", "runs", "sick", "run.json")
-        keep = open(sick).read()
+        keep = json.loads(open(sick).read())
         open(sick, "w").write('{"id": "sick", ')  # truncated JSON
         out = sk("task", "set", "T", "status=routed")  # owner pick skips the sick sibling
         assert out["ok"] is True and any("sick" in w for w in out.get("warnings", [])), out
         assert sk("task", "get", "T")["task"]["status"] == "routed"  # later commands still work
         assert sk("render", "--run", "good")["ok"]
-        open(sick, "w").write(json.dumps({**json.loads(keep), "tasks": [{"title": "ghost", "deps": ["good:T"]}]}))
-        assert sk("render", "--run", "good")["ok"]  # a sibling task without id/status: no crash
+        for shape in (
+            {"id": "sick", "tasks": [5]},
+            {"id": "sick", "tasks": {"a": 1}},
+            {**keep, "branch": None},
+            {**keep, "feature": None},
+            {**keep, "updated": None},
+        ):
+            open(sick, "w").write(json.dumps(shape))
+            # render walks active_runs; task set also walks refresh_others — both must warn, not crash
+            out = sk("render", "--run", "good")
+            assert out["ok"] is True, (shape, out)
+            out = sk("task", "set", "T", "status=building")
+            assert out["ok"] is True and any("sick" in w for w in out.get("warnings", [])), (shape, out)
+            assert sk("task", "get", "T")["task"]["status"] == "building"
+        # a sibling task missing id/status must not crash render or commands in the healthy run
+        open(sick, "w").write(json.dumps({**keep, "tasks": [{"title": "ghost", "deps": ["good:T"]}]}))
+        assert sk("render", "--run", "good")["ok"]
+        assert sk("task", "set", "T", "status=review")["ok"]
+        assert sk("task", "get", "T")["task"]["status"] == "review"
+        # a dep-target run.json that is valid JSON but not an object → unmet with a warning, no traceback
+        badrun = os.path.join(tmp, "sick", "runs", "baddep", "run.json")
+        os.makedirs(os.path.dirname(badrun), exist_ok=True)
+        write_json(badrun, [1])
+        assert sk("task", "add", "--id", "BD", "--title", "bad dep", "--deps", "baddep:X",
+                  "--run", "good")["warnings"][0].startswith("dep baddep:X not found"), open(sick).read()
         assert sk("task", "add", "--id", "N", "--title", "n", "--owned", "src/*.ts", "--run", "good")["ok"]
         # no prefix matching anywhere: abbreviated flags are unknown arguments
         for bad in (["task", "set", "T", "--fo", "status=building"], ["task", "set", "T", "--b=evil"],
