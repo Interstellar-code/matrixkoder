@@ -26,7 +26,16 @@ PROVIDER_MAP = {
     "antigravity": "agy",
     "zai": "opencode",
     "opencode": "opencode",
-    "opencodego": "opencode-go",
+    "opencodego": "opencode",
+    "ollama": "opencode",
+}
+
+# OpenCode providers all feed the same agent but distinct per-plan pools.
+PROVIDER_POOL = {
+    "zai": "zai",
+    "opencodego": "go",
+    "ollama": "ollama",
+    "opencode": "zen",
 }
 
 EXHAUSTED_FIELDS = (
@@ -194,6 +203,9 @@ def normalize_provider_entry(provider, raw_result_or_json, existing_entry=None, 
     now = now or datetime.datetime.now().astimezone()
     existing_entry = existing_entry or {}
 
+    agent_key = PROVIDER_MAP.get(provider, provider)
+    provider_pool = PROVIDER_POOL.get(provider)
+
     raw_error = None
     is_timeout = False
     data_list = None
@@ -282,6 +294,8 @@ def normalize_provider_entry(provider, raw_result_or_json, existing_entry=None, 
             "error": clean_error_message(msg),
             "windows": [],
         }
+        if agent_key == "opencode" and provider_pool is not None:
+            entry["pools"] = {provider_pool: {"five_hour": None, "weekly": None, "exhausted_until": None}}
         if prev_future:
             for k in EXHAUSTED_FIELDS:
                 if k in existing_entry:
@@ -353,7 +367,32 @@ def normalize_provider_entry(provider, raw_result_or_json, existing_entry=None, 
         if isinstance(ew, dict):
             add_window(ew.get("id"), ew.get("window") or {}, custom_title=ew.get("title"))
 
-    agent_key = PROVIDER_MAP.get(provider, provider)
+    if agent_key == "opencode" and provider_pool is not None:
+        for w in windows:
+            w["pool"] = provider_pool
+        if windows:
+            pools = {provider_pool: summarize_pool(windows)}
+        else:
+            pools = {}
+        pool_entry = {
+            "status": "ok",
+            "source": "codexbar",
+            "observed_at": observed_at,
+            "windows": windows,
+            "pools": pools,
+        }
+        if provider_pool in pools:
+            pool_entry["five_hour"] = pools[provider_pool].get("five_hour")
+            pool_entry["weekly"] = pools[provider_pool].get("weekly")
+            pool_entry["available_pools"] = [provider_pool] if not pools[provider_pool].get("exhausted_until") else []
+            pool_entry["exhausted_until"] = pools[provider_pool].get("exhausted_until")
+        else:
+            pool_entry["five_hour"] = None
+            pool_entry["weekly"] = None
+            pool_entry["available_pools"] = []
+            pool_entry["exhausted_until"] = None
+        return pool_entry
+
     for w in windows:
         w["pool"] = pool_of(agent_key, w["id"], w["title"])
     windows = dedupe_windows(windows)
@@ -428,6 +467,57 @@ def atomic_write_ledger(path, data):
     os.replace(tmp, abs_path)
 
 
+def merge_opencode_entries(entries):
+    """Merge per-provider OpenCode entries into one agent record with distinct pools."""
+    merged = {
+        "status": "ok",
+        "source": "codexbar",
+        "windows": [],
+        "pools": {},
+        "available_pools": [],
+        "exhausted_until": None,
+    }
+    observed_at = None
+    any_na = False
+    first_ok_pool = None
+    for e in entries:
+        st = e.get("status")
+        if st == "ok":
+            merged["windows"].extend(e.get("windows") or [])
+            for name, pl in (e.get("pools") or {}).items():
+                merged["pools"][name] = pl
+            if e.get("observed_at"):
+                observed_at = e["observed_at"]
+            if first_ok_pool is None:
+                for name, pl in (e.get("pools") or {}).items():
+                    first_ok_pool = (name, pl)
+                    break
+        elif st == "n/a":
+            any_na = True
+            for name, pl in (e.get("pools") or {}).items():
+                merged["pools"][name] = pl
+        for k in EXHAUSTED_FIELDS:
+            if k in e and k not in merged:
+                merged[k] = e[k]
+    if first_ok_pool:
+        merged["observed_at"] = observed_at or e.get("observed_at")
+        merged["five_hour"] = first_ok_pool[1].get("five_hour")
+        merged["weekly"] = first_ok_pool[1].get("weekly")
+        merged["available_pools"] = [n for n, pl in merged["pools"].items() if (pl.get("five_hour") is not None or pl.get("weekly") is not None) and not pl.get("exhausted_until")]
+        exhausted = [pl.get("exhausted_until") for pl in merged["pools"].values() if pl.get("exhausted_until")]
+        usable = [pl for pl in merged["pools"].values() if pl.get("five_hour") is not None or pl.get("weekly") is not None]
+        if exhausted and len(exhausted) == len(usable):
+            merged["exhausted_until"] = max(exhausted, key=lambda iso: parse_iso(iso) or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc))
+    elif any_na:
+        merged["status"] = "n/a" if not any(pl.get("five_hour") is not None or pl.get("weekly") is not None for pl in merged["pools"].values()) else "ok"
+        if not merged.get("observed_at"):
+            merged["observed_at"] = entries[0].get("observed_at") if entries else None
+    else:
+        if not merged.get("observed_at"):
+            merged["observed_at"] = entries[0].get("observed_at") if entries else None
+    return merged
+
+
 def poll_and_update(providers, out_path, now=None):
     now = now or datetime.datetime.now().astimezone()
     ledger_data = load_ledger(out_path)
@@ -437,11 +527,22 @@ def poll_and_update(providers, out_path, now=None):
     na_agents = []
     error_agents = []
 
+    opencode_entries = []
     for provider_id in providers:
         raw_res = run_codexbar_provider(provider_id, timeout=60)
-        existing_agent = agents.get(PROVIDER_MAP.get(provider_id, provider_id), {})
-        norm_entry = normalize_provider_entry(provider_id, raw_res, existing_entry=existing_agent, now=now)
         agent_key = PROVIDER_MAP.get(provider_id, provider_id)
+        provider_pool = PROVIDER_POOL.get(provider_id)
+        existing_agent = agents.get(agent_key, {})
+        if agent_key == "opencode":
+            existing_pool_entry = existing_agent.get("pools", {}).get(provider_pool, {}) if provider_pool and isinstance(existing_agent.get("pools"), dict) else {}
+        else:
+            existing_pool_entry = existing_agent
+        norm_entry = normalize_provider_entry(provider_id, raw_res, existing_entry=existing_pool_entry, now=now)
+
+        if agent_key == "opencode":
+            opencode_entries.append(norm_entry)
+            continue
+
         agents[agent_key] = norm_entry
 
         st = norm_entry.get("status")
@@ -451,6 +552,17 @@ def poll_and_update(providers, out_path, now=None):
             na_agents.append(agent_key)
         else:
             error_agents.append(agent_key)
+
+    if opencode_entries:
+        merged = merge_opencode_entries(opencode_entries)
+        agents["opencode"] = merged
+        st = merged.get("status")
+        if st == "ok":
+            ok_agents.append("opencode")
+        elif st == "n/a":
+            na_agents.append("opencode")
+        else:
+            error_agents.append("opencode")
 
     ledger_data["updated_at"] = now.isoformat(timespec="seconds")
     ledger_data["agents"] = agents
@@ -686,8 +798,72 @@ def self_test():
         try:
             summary = poll_and_update(["opencode", "zai"], os.path.join(map_dir, "usage.json"), now=ref_now_future)
             assert polled == ["opencode", "zai"]
-            assert summary["ok"] == ["opencode", "opencode"]
+            assert summary["ok"] == ["opencode"]
             assert load_ledger(os.path.join(map_dir, "usage.json"))["agents"]["opencode"]["status"] == "ok"
+        finally:
+            shutil.rmtree(map_dir, ignore_errors=True)
+    finally:
+        mod.run_codexbar_provider = real_run
+
+    # 9. OpenCode multi-pool merge: three providers become one agent with distinct pools
+    def fake_run_oc(provider, timeout=60):
+        polled.append(provider)
+        if provider == "zai":
+            return {
+                "returncode": 1,
+                "stdout": json.dumps([{"error": {"message": "Error: No available fetch strategy for zai.", "kind": "provider"}}]),
+                "stderr": "",
+                "timeout": False,
+            }
+        elif provider == "ollama":
+            return {
+                "returncode": 1,
+                "stdout": json.dumps([{"error": {"message": "Error: No Ollama session cookie found; sign in at ollama.com", "kind": "provider"}}]),
+                "stderr": "",
+                "timeout": False,
+            }
+        return {
+            "returncode": 0,
+            "stdout": json.dumps([{
+                "usage": {
+                    "primary": {
+                        "windowMinutes": 300,
+                        "usedPercent": 0,
+                        "resetsAt": "2026-10-07T20:00:00Z",
+                        "resetDescription": "",
+                    },
+                    "secondary": {
+                        "windowMinutes": 10080,
+                        "usedPercent": 0,
+                        "resetsAt": "2026-10-14T00:00:00Z",
+                        "resetDescription": "",
+                    },
+                }
+            }]),
+            "stderr": "",
+            "timeout": False,
+        }
+
+    mod.run_codexbar_provider = fake_run_oc
+    try:
+        map_dir = tempfile.mkdtemp(prefix="mk-usage-oc-")
+        try:
+            for order in (["zai", "opencodego", "ollama"], ["ollama", "opencodego", "zai"]):
+                polled = []
+                summary = poll_and_update(order, os.path.join(map_dir, "usage.json"), now=ref_now_future)
+                assert set(polled) == {"zai", "opencodego", "ollama"}
+                assert summary["ok"] == ["opencode"]
+                ledger = load_ledger(os.path.join(map_dir, "usage.json"))
+                oc = ledger["agents"]["opencode"]
+                assert oc["status"] == "ok"
+                assert set(oc["pools"].keys()) == {"zai", "go", "ollama"}
+                assert oc["pools"]["zai"]["five_hour"] is None
+                assert oc["pools"]["zai"].get("exhausted_until") is None
+                assert oc["pools"]["go"]["five_hour"] == {"used_pct": 0, "resets_at": "2026-10-07T20:00:00Z"}
+                assert oc["pools"]["ollama"]["five_hour"] is None
+                assert oc["available_pools"] == ["go"]
+                assert oc["five_hour"] == {"used_pct": 0, "resets_at": "2026-10-07T20:00:00Z"}
+                assert oc["weekly"] == {"used_pct": 0, "resets_at": "2026-10-14T00:00:00Z"}
         finally:
             shutil.rmtree(map_dir, ignore_errors=True)
     finally:

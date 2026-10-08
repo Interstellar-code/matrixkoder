@@ -381,6 +381,134 @@ test('fable with no 5h window renders — in the 5h column; claude main row read
   expect(await ui.find({ text: 'claude (all)' })).toBeUndefined()
 })
 
+const U3_PROJECT_YAML = [
+  'data_dir: .matrixkoder/',
+  'agents:',
+  '  codex: { available: false, models: [] }',
+  '  opencode: { available: true, models: [zai-coding-plan/glm-4.7] }',
+  '  agy: { available: false, models: [] }',
+  '  claude: { available: true }',
+  '  herdr: { available: true }',
+  `  checked_at: "${new Date(NOW).toISOString()}"`,
+  'usage:',
+  '  source: codexbar',
+  '  poll_min: 5',
+  '  providers: [zai, opencodego, ollama]',
+].join('\n')
+
+function makeU3Usage(): string {
+  return JSON.stringify({
+    agents: {
+      claude: {
+        source: 'codexbar',
+        five_hour: { used_pct: 4, resets_at: new Date(NOW + 4 * 3600_000).toISOString() },
+        weekly: { used_pct: 52, resets_at: new Date(NOW + 90 * 3600_000).toISOString() },
+        exhausted_until: null,
+        available_pools: ['default', 'fable'],
+        pools: {
+          default: {
+            five_hour: { used_pct: 4, resets_at: new Date(NOW + 4 * 3600_000).toISOString() },
+            weekly: { used_pct: 52, resets_at: new Date(NOW + 90 * 3600_000).toISOString() },
+            exhausted_until: null,
+          },
+          fable: {
+            five_hour: { used_pct: 17, resets_at: new Date(NOW + 4 * 3600_000).toISOString() },
+            weekly: { used_pct: 17, resets_at: new Date(NOW + 90 * 3600_000).toISOString() },
+            exhausted_until: null,
+          },
+        },
+      },
+      agy: {
+        source: 'codexbar',
+        five_hour: { used_pct: 54, resets_at: new Date(NOW + 3600_000).toISOString() },
+        weekly: { used_pct: 52, resets_at: new Date(NOW + 6 * 24 * 3600_000).toISOString() },
+        exhausted_until: null,
+        available_pools: ['gemini'],
+        pools: {
+          gemini: {
+            five_hour: { used_pct: 54, resets_at: new Date(NOW + 3600_000).toISOString() },
+            weekly: { used_pct: 52, resets_at: new Date(NOW + 6 * 24 * 3600_000).toISOString() },
+            exhausted_until: null,
+          },
+          'claude-gpt': {
+            five_hour: { used_pct: 100, resets_at: new Date(NOW + 3600_000).toISOString() },
+            weekly: { used_pct: 100, resets_at: new Date(NOW + 6 * 24 * 3600_000).toISOString() },
+            exhausted_until: new Date(NOW + 6 * 24 * 3600_000).toISOString(),
+          },
+        },
+      },
+      codex: { source: 'codexbar', exhausted_until: null, available_pools: ['default'], pools: { default: { five_hour: null, weekly: null, exhausted_until: null } } },
+      opencode: {
+        source: 'codexbar',
+        five_hour: { used_pct: 0, resets_at: new Date(NOW + 4 * 3600_000).toISOString() },
+        weekly: { used_pct: 0, resets_at: new Date(NOW + 7 * 24 * 3600_000).toISOString() },
+        exhausted_until: null,
+        available_pools: ['go'],
+        pools: {
+          zai: {
+            five_hour: null,
+            weekly: null,
+            exhausted_until: null,
+            status: 'n/a',
+            error: 'No available fetch strategy for zai.',
+          },
+          go: {
+            five_hour: { used_pct: 0, resets_at: new Date(NOW + 4 * 3600_000).toISOString() },
+            weekly: { used_pct: 0, resets_at: new Date(NOW + 7 * 3600_000).toISOString() },
+            exhausted_until: null,
+          },
+          ollama: {
+            five_hour: null,
+            weekly: null,
+            exhausted_until: null,
+            status: 'n/a',
+            error: 'No Ollama session cookie found; sign in at ollama.com',
+          },
+        },
+      },
+    },
+  })
+}
+
+test('U3: opencode agent shows per-plan pools with n/a hints and project agents filter out agy/codex', { plugins: [worldFixtures] }, async ($, on) => {
+  const files = worldFiles()
+  files[`${DATA_DIR}/matrixkoder.yaml`] = U3_PROJECT_YAML
+  files['/fixtures/usage.json'] = files[USAGE_PATH] = makeU3Usage()
+  mockFs(on, files)
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  const textOf = (n: unknown): string => {
+    if (typeof n === 'string') return n
+    if (typeof n !== 'object' || n === null) return ''
+    const node = n as { type?: string; children?: unknown[] }
+    if (node.type !== 'Text' || !Array.isArray(node.children)) return ''
+    return node.children.map(textOf).join('')
+  }
+  const texts: string[] = []
+  const walk = (n: unknown): void => {
+    if (typeof n !== 'object' || n === null) return
+    const node = n as { type?: string; children?: unknown[] }
+    if (node.type === 'Text') {
+      const own = textOf(n)
+      if (own) texts.push(own)
+    }
+    if (Array.isArray(node.children)) node.children.forEach(walk)
+  }
+  walk(await ui.drawn())
+  const usageText = texts.filter(t => /claude|opencode|zai|go|ollama|fable/.test(t)).join('\n')
+  expect(usageText).toContain('claude')
+  expect(usageText).toContain('  └ fable')
+  expect(usageText).toContain('opencode')
+  expect(usageText).toContain('  └ zai')
+  expect(usageText).toContain('set the z.ai key in CodexBar')
+  expect(usageText).toContain('  └ go')
+  expect(usageText).toContain('  └ ollama')
+  expect(usageText).toContain('sign in at ollama.com')
+  expect(usageText).not.toContain('agy')
+  expect(usageText).not.toContain('codex')
+})
+
 test('two session.start arm exactly one refresh timer', { plugins: [worldFixtures] }, async ($, on) => {
   const files = worldFiles()
   const fs = mockFs(on, files)
@@ -564,9 +692,41 @@ test('parseYamlAgents accepts any indent >= 2 spaces, block style, and unparseab
   ].join('\n')
   expect(parseYamlAgents(flow4)).toEqual(['codex'])
 
-  // unparseable treated as no filter (null), never []
+  // all-false agents block = empty list (show no agents), not null
+  const allFalse = [
+    'agents:',
+    '  codex: { available: false }',
+    '  claude: { available: false }',
+  ].join('\n')
+  expect(parseYamlAgents(allFalse)).toEqual([])
+
+  // unparseable / absent block = no filter (null), never []
   expect(parseYamlAgents('agents:\n  garbage without keys')).toBeNull()
   expect(parseYamlAgents('agents: []')).toBeNull()
   expect(parseYamlAgents('agents:\n')).toBeNull()
   expect(parseYamlAgents('no agents block here')).toBeNull()
+})
+
+test('U3 add-on: an agents block with all agents disabled shows no usage rows', { plugins: [worldFixtures] }, async ($, on) => {
+  const files = worldFiles()
+  files[`${DATA_DIR}/matrixkoder.yaml`] = [
+    'data_dir: .matrixkoder/',
+    'agents:',
+    '  codex: { available: false, models: [] }',
+    '  opencode: { available: false, models: [] }',
+    '  agy: { available: false, models: [] }',
+    '  claude: { available: false }',
+    '  herdr: { available: true }',
+    `  checked_at: "${new Date(NOW).toISOString()}"`,
+  ].join('\n')
+  mockFs(on, files)
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  // the section still renders but no agent rows appear; herdr is never shown
+  expect(await ui.find({ text: 'Usage' })).toBeTruthy()
+  expect(await ui.find({ text: 'claude' })).toBeUndefined()
+  expect(await ui.find({ text: /agy/ })).toBeUndefined()
+  expect(await ui.find({ text: /opencode/ })).toBeUndefined()
+  expect(await ui.find({ text: /codex/ })).toBeUndefined()
 })

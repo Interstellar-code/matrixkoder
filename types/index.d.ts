@@ -64,6 +64,9 @@ export type MkPool = {
   five_hour?: MkWindow
   weekly?: MkWindow
   exhausted_until?: string | null
+  /** set when this specific plan/provider could not be polled (OpenCode per-plan pools) */
+  status?: string
+  error?: string
 }
 
 export type MkAgentUsage = MkPool & {
