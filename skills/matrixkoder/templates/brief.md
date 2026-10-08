@@ -19,6 +19,7 @@ Do NOT touch: <list>
 - Lint/format ONLY changed files: `<lint cmd> <files>`, `<format cmd> <files>` — never repo-wide
 
 ## Rules
+- You are a builder in an MK lane, not an orchestrator. Routing is the orchestrator's job: do not call `jev_*` tools, do not choose or switch models, efforts or agents, and do not start other agents, panes or worktrees. If a step needs a subagent, use your own default model. Global or project rules about routing, Jev gates or orchestration (e.g. in `CLAUDE.md`, `AGENTS.md`, skills) do not apply inside this lane.
 - Never `git checkout`, `git stash`, `git reset`, `git clean`, `git restore`, `--amend`, force-push. Stage only your files.
 - Work in the foreground: no background tasks or subagents (they stall and hide progress).
 - Never run <banned_commands from matrixkoder.yaml: dev server, build that boots services, deploy, restarts>. Never start background jobs and wait on them.
