@@ -500,7 +500,7 @@ def self_test():
     import shutil, subprocess
     tmp = tempfile.mkdtemp(prefix="mk-plan-test-")
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    real_plan = os.path.join(root, ".matrixkoder-plan.md")
+    real_plan = os.path.join(root, "scripts", "fixtures", "plan-link.md")  # a real plan, kept as a fixture
     template = os.path.join(root, "skills", "matrixkoder", "templates", "plan.md")
 
     def mk(*args, code=0):
