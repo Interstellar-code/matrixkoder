@@ -74,7 +74,7 @@ Six options, set with `claude plugin configure matrixkoder`:
 | Path | Content |
 |---|---|
 | `skills/matrixkoder/` | `SKILL.md` loop; `reference/` (loop, pool-and-usage, safety, onboarding, lessons); `templates/` |
-| `scripts/` | `mk-state.py` (only writer of run state), `mk-lane.py` (reusable lane worktree slots), `mk-usage.py`, `lane-health.py`, `lane-watch.py`, `selftest.sh` |
+| `scripts/` | `mk-state.py` (only writer of run state), `mk-plan.py` (parse/check/edit TOML plan files), `mk-lane.py` (reusable lane worktree slots), `mk-usage.py`, `lane-health.py`, `lane-watch.py`, `selftest.sh` |
 | `agents/` | effort-pinned workers |
 | `hooks/` | dashboard, wizard, guards, status chip, wake and tools (TypeScript) |
 | `types/` | plugin API types |
