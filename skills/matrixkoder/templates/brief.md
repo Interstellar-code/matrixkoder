@@ -25,7 +25,7 @@ Do NOT touch: <list>
 - No secrets in code, logs or the report.
 - Commit: `<type(scope): message>`, blank line, `Co-Authored-By: <agent/model> <email>`.
 - Write the report to the path named here (`report-rN.md` in this lane's copy; the orchestrator copies it back): files changed, the exact final test/type/lint summary lines, differences from spec/mockups and why, anything skipped. Report only what you ran.
-- **Last thing you do:** print `<PHASE> DONE` (or `<PHASE> BLOCKED: <question>`) as the LAST line of your reply, alone on its line — after any summary, never inside it. The orchestrator's watcher looks for that exact line.
+- **Last thing you do:** print `<PHASE> R<n> DONE` (or `<PHASE> R<n> BLOCKED: <question>`) as the LAST line of your reply, alone on its line — after any summary, never inside it. `<n>` is your round number, so the token is unique per round and a wait cannot match the previous round still on screen. The orchestrator's watcher looks for that exact line.
 
 ## TAKEOVER (only when another agent stopped mid-phase)
 You inherit uncommitted work — KEEP it and build on it:

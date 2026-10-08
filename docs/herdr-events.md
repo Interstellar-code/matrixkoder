@@ -43,7 +43,7 @@ locked inode out from under a lock).
 
 | Command | What it does |
 |---|---|
-| `arm --lane DIR --pane ID --task T --run R --data DIR --phase P --commit-grep RX [--report PATH] [--kind K] [--prompt-marker TEXT] [--stall-min 15]` | Writes `<lane>/.matrixkoder-watch.json` (atomic replace). Validates: lane is a git worktree, the regex compiles, `--task/--run/--data` present. Re-arming a lane (a fix round) overwrites the file and clears the verdict. |
+| `arm --lane DIR --pane ID --task T --run R --data DIR --phase P --commit-grep RX [--report PATH] [--kind K] [--prompt-marker TEXT] [--stall-min 15]` | Writes `<lane>/.matrixkoder-watch.json` (atomic replace) and records the pane on the task (`mk-state task set T pane=<pane>`, `--by lane-watch`), so the board and the dashboard name the lane's pane without re-reading the watch files. That write is best-effort: a task that is not in run state yet still arms, and the reply carries `task_pane_error` instead of failing. Validates: lane is a git worktree, the regex compiles, `--task/--run/--data` present. Re-arming a lane (a fix round) overwrites the file and clears the verdict. |
 | `event` | The plugin hook (env above). Unknown pane → `{"ok": true, "ignored": "not an armed lane"}` exit 0 — fast, this fires for every pane on the machine. `working` → bumps `last_activity` only. `done`/`idle`/`blocked` → the same verdict one lane-watch poll would make; a verdict is recorded via lane-watch's `record()` (verdict → mk-state status, never moves a task past `WATCHED`), the pane is labeled (`pane.report_metadata`, source `matrixkoder`, `state_labels` like `{"mk": "H1 · verifying"}`) and a toast fires (`notification.show`, title `MatrixKoder`, body `H1 DONE → verifying`) — both best-effort. `pane.exited` → `STALL` with evidence `agent exited`; an exit after any verdict is post-finish cleanup (no-op). A herdr `ERROR` probe is not a verdict: the next event or sweep retries. |
 | `sweep [--data DIR]` | Backstop for silence: every armed lane (same discovery) with no verdict yet gets the same health check; no file/commit/pane change for `stall_min` since `last_activity` → `STALL`. Prints `{"ok": true, "checked": n, "verdicts": [...]}`. `--data` limits the sweep to one data dir. |
 | `disarm --lane DIR` | Removes the watch file (keeps the lock file so concurrent waiters don't split inodes). The orchestrator runs this after acting on a terminal verdict. |
@@ -56,7 +56,7 @@ Every command prints one JSON line.
 |---|---|
 | `lane`, `pane` | The worktree and the herdr pane id it is armed for |
 | `task`, `run`, `data` | Where to write the verdict (`mk-state task set`, `--data`/`--run`) |
-| `phase`, `commit_grep`, `report`, `kind`, `prompt_marker`, `stall_min` | The verdict inputs, identical semantics to lane-watch's flags |
+| `phase`, `commit_grep`, `report`, `kind`, `prompt_marker`, `stall_min` | The verdict inputs, identical semantics to lane-watch's flags. `phase` is the per-round token prefix: `<T> R<n>`, so `phase_tokens()` matches this round only |
 | `armed_at`, `last_activity` | Epoch seconds; `last_activity` moves on `working` events and on new pane output (digits ignored) |
 | `last_pane_fp` | Fingerprint of the last observed pane text (used by `sweep` to see pane activity) |
 | `verdict`, `verdict_at` | Set after a terminal verdict; a repeated identical event is a no-op. `DONE` is final; a softer verdict (`stalled`, `blocked`, `quota`, `provider`) can still be upgraded (e.g. a stalled lane finishing → `verifying`). |
@@ -75,6 +75,15 @@ note event) make late and duplicate events safe.
   subject, the report (if armed with one), the `<PHASE> DONE` token (with
   `--phase`) and no quota/provider/dev-server finding. `P1 BLOCKED: <question>`
   in the pane wins as `blocked`.
+- **The DONE token is per round.** Arm `--phase "<T> R<n>"` and require
+  `<T> R<n> DONE` / `<T> R<n> BLOCKED: <q>`. A bare `<T> DONE` also matches the
+  previous round's token still on screen — `pane wait-output` searches the
+  current snapshot before it blocks, so it returned in 0 s on the earlier line.
+  Prefer `herdr agent wait <pane>` (turn end, no text match) when you only need
+  the turn to settle.
+- **The pane is on the task too.** `arm` sets `pane` (e.g. `wK:p1`) on the task
+  alongside the watch file; the watch file remains the source of truth for the
+  verdict inputs.
 - **Ordering is not guaranteed** between event processes; the flock serializes
   the read/decide/write cycle per lane.
 - Discovery scans the worktrees of the repos in `$MATRIXKODER_HOME/projects.json`

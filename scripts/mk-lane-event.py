@@ -9,7 +9,9 @@ Usage:
   mk-lane-event.py disarm --lane DIR
   mk-lane-event.py --self-test
 
-arm writes <lane>/.matrixkoder-watch.json. event is run by the herdr plugin for EVERY pane status
+arm writes <lane>/.matrixkoder-watch.json and records the pane on the task (`mk-state task set T
+pane=<pane>`, best-effort: a task missing from run state still arms). event is run by the herdr plugin
+for EVERY pane status
 change / exit in every workspace; it finds the armed lane for that pane (worktrees of the repos in
 $MATRIXKODER_HOME/projects.json, default ~/.matrixkoder) and exits fast with {"ignored": ...} when
 there is none. `working` only refreshes last_activity. `done`/`idle`/`blocked` run the same verdict
@@ -278,6 +280,19 @@ def apply_verdict(w, state, subj, evidence, h):
 
 # ---- commands ---------------------------------------------------------------------------------------
 
+def record_pane(task, pane, data, run=None):
+    """`mk-state task set T pane=<pane>`: the lane's herdr pane id on the task, so the dashboard and
+    the dashboard's lane rows name the pane without re-reading the watch files. Best-effort: the watch
+    file is what makes a lane armed, so a task that is not in run state yet must not stop the arm."""
+    common = ["--data", data, "--by", "lane-watch"] + (["--run", run] if run else [])
+    r = subprocess.run([sys.executable, lw.MK_STATE, "task", "set", task, f"pane={pane}", *common],
+                       capture_output=True, text=True)
+    try:
+        return json.loads(r.stdout.strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError):
+        return {"ok": False, "error": (r.stderr or r.stdout).strip()[-200:]}
+
+
 def cmd_arm(a):
     lane, pane, task = opt(a, "--lane"), opt(a, "--pane"), opt(a, "--task")
     run, data, phase, grep = opt(a, "--run"), opt(a, "--data"), opt(a, "--phase"), opt(a, "--commit-grep")
@@ -305,7 +320,9 @@ def cmd_arm(a):
          "armed_at": now, "last_activity": now, "last_pane_fp": None, "verdict": None, "verdict_at": None}
     with locked(lane):
         write_watch(lane, w)
-    out({"ok": True, "lane": lane, "pane": pane, "watch": os.path.join(lane, WATCH), "armed_at": now})
+    rec = record_pane(task, pane, w["data"], run)
+    out({"ok": True, "lane": lane, "pane": pane, "watch": os.path.join(lane, WATCH), "armed_at": now,
+         **({} if rec.get("ok") else {"task_pane_error": rec.get("error", "mk-state task set failed")})})
 
 
 def cmd_disarm(a):
@@ -585,9 +602,16 @@ def self_test():
         open(status_f, "w").write("done")
         a = arm("H1", report="report.json", prompt_marker="dispatch-h1")
         assert a["ok"] and a["watch"] == os.path.join(lanes["H1"], WATCH)
+        assert "task_pane_error" not in a, a
         w = watch_of("H1")
         assert (w["pane"], w["task"], w["run"], w["phase"], w["data"]) == (pane_of("H1"), "H1", "r1", "P1", data)
         assert w["commit_grep"] == r"feat\(p1\)" and w["verdict"] is None and w["armed_at"] and w["last_activity"]
+        # arm records the lane's pane on the task, so the board names it without reading the watch file
+        def task_field(tid, key):
+            run_ = json.load(open(os.path.join(data, "runs", "r1", "run.json")))
+            return next(t for t in run_["tasks"] if t["id"].lower() == tid.lower())[key]
+
+        assert task_field("H1", "pane") == pane_of("H1")
         r = event("done", tid="H1")
         assert r["verdict"] == "DONE" and r["status"] == "verifying" and r["recorded"], r
         assert r["label"] is True and r["toast"] is True, r
