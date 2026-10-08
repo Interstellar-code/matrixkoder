@@ -10,6 +10,19 @@ const ALLOWED_SUBCOMMANDS = new Set([
   'render',
 ])
 
+// --data/--by/--run steer mk-state at another project or run; the model tool must not pass them in
+// any form: exact, --flag=value, or an abbreviation like --b=x (argparse prefix matching is off,
+// but reject here too so the process never runs)
+const OVERRIDE_FLAGS = ['--data', '--by', '--run']
+
+const flagName = (arg: string): string => arg.split('=', 1)[0] ?? arg
+
+const isOverrideFlag = (arg: string): boolean => {
+  const name = flagName(arg)
+  if (!name.startsWith('--') || name.length <= 2) return false
+  return OVERRIDE_FLAGS.some((b) => name === b || b.startsWith(name) || name.startsWith(b))
+}
+
 export function registerTools(on: On, _options: PluginOptions): void {
   on('session.start', { cwd: /.*/ }, async ($, e, next) => {
     try {
@@ -81,17 +94,7 @@ export function registerTools(on: On, _options: PluginOptions): void {
         }
       }
 
-      const hasBannedOverride = argsRaw.some(arg => {
-        const a = String(arg)
-        return (
-          a === '--data' ||
-          a.startsWith('--data=') ||
-          a === '--by' ||
-          a.startsWith('--by=') ||
-          a === '--run' ||
-          a.startsWith('--run=')
-        )
-      })
+      const hasBannedOverride = argsRaw.some(arg => isOverrideFlag(String(arg)))
       if (hasBannedOverride) {
         return {
           isError: true,
@@ -99,15 +102,24 @@ export function registerTools(on: On, _options: PluginOptions): void {
         }
       }
 
+      // task set --force bypasses the dep gate; only the orchestrator (shell) may pass it
+      if (firstArg === 'task' && String(argsRaw[1] ?? '') === 'set' &&
+          argsRaw.some(a => flagName(String(a)) === '--force')) {
+        return {
+          isError: true,
+          result: 'mk_state: task set --force is not allowed from model tools',
+        }
+      }
+
       if (firstArg === 'lock') {
         const sub = String(argsRaw[1] ?? '')
-        if (sub === 'release' && argsRaw.some(a => String(a) === '--force')) {
+        if (sub === 'release' && argsRaw.some(a => flagName(String(a)) === '--force')) {
           return {
             isError: true,
             result: 'mk_state: lock release --force is not allowed from model tools',
           }
         }
-        if (sub === 'take' && argsRaw.some(a => String(a) === '--force-stale')) {
+        if (sub === 'take' && argsRaw.some(a => flagName(String(a)) === '--force-stale')) {
           return {
             isError: true,
             result: 'mk_state: lock take --force-stale is not allowed from model tools',

@@ -81,8 +81,8 @@ with offset, seconds precision (`2026-10-07T20:09:01+02:00`). Unknown values are
 |---|---|---|
 | `id`, `title` | string | `id` unique case-insensitively within the run (`T1` and `t1` clash) |
 | `wave` | int \| null | |
-| `deps`, `owned` | string[] | tasks it waits on (`T` in this run, `RUN:T` in another run of the same data dir); file globs it owns. `task set status=dispatched\|building` fails while a dep is not `merged`/`qa`/`done` (`--force` overrides) |
-| `parent` | string \| null | parent task id (same run); the parent's status rolls up from its children: a side state if any child is in one (`blocked` > `provider` > `quota` > `stalled`), else the least advanced child |
+| `deps`, `owned` | string[] | tasks it waits on (`T` in this run, `RUN:T` in another run of the same data dir); file globs it owns. Stored in the target's stored id case (ids match case-insensitively; a self-dep is refused at add). `task set status=dispatched\|building` fails while a dep of the task **or of any ancestor** is not `merged`/`qa`/`done` (`--force` overrides) |
+| `parent` | string \| null | parent task id (same run); `--parent` onto a task in `merged`/`qa`/`done` is refused. The parent's status rolls up from its children: a side state if any child is in one (`blocked` > `provider` > `quota` > `stalled`), else `building` while any child is past `routed` and not all children are met, else the least advanced child; manual `status=` on a task with children is refused |
 | `ready` | bool | written by mk-state: has deps, `planned`/`routed`, every dep met. A flip to true logs a `deps met` note; the dashboard toasts it |
 | `status` | enum | `planned → routed → dispatched → building → verifying → review → fix → merged → qa → done`; side states `blocked \| quota \| stalled \| provider` |
 | `agent` | string \| null | agent kind or pane (`codex`, `agy`, ...) |
@@ -171,8 +171,8 @@ everything else `default`.
 | `run list` / `run get` | `run get [--id ID \| ID]` (default: the single active run) |
 | `run set` | `[--id ID] [--next TEXT] [--status active\|done]` (at least one) |
 | `run stage` / `run archive` | `run stage N` (N >= 0, `[--id ID]`); `run archive --id ID` or `run archive ID` |
-| `task add` | `--id T --title TEXT [--wave N] [--deps A,RUN:B] [--owned glob,glob] [--parent P]` — returns `warnings` for unknown deps and for owned globs overlapping an unmerged task in any active run |
-| `task set` | `T key=value ... [--note TEXT] [--force]` (`--force`: dispatch past unmet deps); keys `status agent model effort lane last_commit gates verdict`; a value starting `{`/`[` is parsed as JSON, empty = null |
+| `task add` | `--id T --title TEXT [--wave N] [--deps A,RUN:B] [--owned glob,glob] [--parent P]` — deps are stored in the target's stored id case and a self-dep is refused; `--parent` onto a task in `merged`/`qa`/`done` fails; returns `warnings` for unknown deps, owned globs overlapping an unmerged task in any active run, and active sibling runs that could not be read |
+| `task set` | `T key=value ... [--note TEXT] [--force]` (`--force`: dispatch past unmet own+ancestor deps); `status=` on a task with children fails (it rolls up); keys `status agent model effort lane last_commit gates verdict`; a value starting `{`/`[` is parsed as JSON, empty = null |
 | `task round` | `T --kind build\|fix\|takeover [--cause TEXT]` |
 | `task get` | `T` |
 | `event` | `[--task T] --type transition\|decision\|verdict\|quota\|note --text TEXT [--from S] [--to S]` |
@@ -187,7 +187,9 @@ for task/event/wait/render (`run *` commands take `--id`, alias `--run`).
 
 Every `mk-state.py` command prints exactly one JSON line: `{"ok": true, ...}` exit 0;
 `{"ok": false, "error": "..."}` exit 2 on bad input or a corrupt/unreadable state file; lock refused →
-exit 1 with `state` and `lock`.
+exit 1 with `state` and `lock`. A command in a healthy run stays `ok: true` and adds a `warnings`
+entry when another active run's `run.json` is unreadable (that run is skipped for cross-run
+`ready`/board upkeep); flags never prefix-match (`--fo` is an unknown argument).
 `task round` returns `{round, kind, brief, report, review}` absolute paths for that round.
 
 lane-watch exit → task status (with `--task --data`, both required together): `DONE`/`DONE_SENT → verifying`,
