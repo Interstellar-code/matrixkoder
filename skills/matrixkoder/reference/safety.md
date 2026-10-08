@@ -6,7 +6,7 @@ Autonomous means the goal is delivered without the user intervening. You stop on
 
 **Autonomy contract** — a section of the master plan the user approves once (defaults in `matrixkoder.yaml`): goal and definition of done; pre-authorised actions; the pause list. Anything pre-authorised there is not asked again.
 
-Pre-authorised by default: routing and agent choice, failover, fix loops (≤3), worktree creation, merging lanes into the integration branch, re-arming watchers, retries, choosing among options the plan/mockups cover, pushing non-main branches and opening the final PR, and — if `autonomy_contract.builder_skip_permissions: true` — starting builder agents with their permission-skipping flags (`codex --full-auto`, `claude --dangerously-skip-permissions`, AGY equivalent) inside their own worktree only. Never for the orchestrator, reviewers, or a lane that touches a live runtime.
+Pre-authorised by default: routing and agent choice, failover, fix loops (≤3), worktree creation, lane-slot recycling (`mk-lane.py acquire`/`release`), merging lanes into the integration branch, re-arming watchers, retries, choosing among options the plan/mockups cover, pushing non-main branches and opening the final PR, and — if `autonomy_contract.builder_skip_permissions: true` — starting builder agents with their permission-skipping flags (`codex --full-auto`, `claude --dangerously-skip-permissions`, AGY equivalent) inside their own worktree only. Never for the orchestrator, reviewers, or a lane that touches a live runtime.
 
 **Pause only for:**
 1. Destructive or user-gated actions not pre-authorised: deploy to a live runtime, merge to main, tags, deleting user data.
@@ -17,6 +17,7 @@ Pre-authorised by default: routing and agent choice, failover, fix loops (≤3),
 6. Fix loop exhausted (3) on a HIGH finding.
 7. An agent pane `blocked` on an approval dialog — the herdr skill forbids answering for it — when the contract does not pre-authorise launch flags, or a dialog still appears despite them.
 8. `jev_screen` returns `block` on agent output.
+9. A lane slot `mk-lane.py` refuses — dirty, or with commits unreachable from any branch/tag/remote. Never forced.
 
 **When pausing:** record one question with options and a recommendation (`mk-state wait set --question "<q>" --options a,b --rec a`; `wait clear` once answered), tell the user, and keep every unblocked lane going — dispatched lanes and background watchers continue, and next briefs are pre-queued with `lane-watch.py --then-send`. The session is turn-based: you resume on the user's next message. At the definition of done, stop with a final report (board + PR link).
 
@@ -32,7 +33,8 @@ Several sessions share one machine and one runtime. A session doing something ri
 
 ## Safety rules and why
 
-- **No `git checkout/stash/reset/clean/restore`, `--amend`, force-push.** Agents used them to "undo" and wiped other lanes' uncommitted work in a shared tree. Undo by an inverse edit; commit each verified phase.
+- **No `git checkout/switch/stash/reset/clean/restore`, `--amend`, force-push** (one narrow orchestrator exception below). Agents used them to "undo" and wiped other lanes' uncommitted work in a shared tree. Undo by an inverse edit; commit each verified phase.
+- **`git switch` inside a lane slot — the one narrow exception (user-approved 2026-10-08).** The ban above still holds for every agent, brief and prompt. Only the orchestrator, only through `mk-lane.py`, may switch a slot's branch, and only after `mk-lane.py` has verified the slot clean (`git status --porcelain --ignored` lists only disposable entries) and holding no commit unreachable from a branch/tag/remote. Never `--force`, never `-D`. Never written into a builder brief or prompt.
 - **No dev servers, sidecars, deploys, restarts, background jobs in briefs.** An agent ran the dev command, which spawned a runtime sidecar, failed, and stopped mid-phase. Long-running processes belong to you.
 - **Agent reports are claims.** Reports said "all callers handled" when one screen still showed an empty library; `jev_gate` with real output caught it. Rerun gates yourself.
 - **Mocked tests are not evidence for routes.** A client called an API route that didn't exist; the tests mocked `fetch` and passed. For every new client call, find the server handler.
