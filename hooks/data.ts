@@ -13,7 +13,13 @@ export const PANE_ID = 'matrixkoder'
 /** display order of the known build agents (dashboard usage rows, chip scan) */
 export const AGENT_ORDER = ['claude', 'agy', 'codex', 'opencode'] as const
 
-export const EMPTY_SNAPSHOT: MkSnapshot = { now: 0, dataDir: null, run: null, runs: [], usage: null, projectAgents: null }
+export const EMPTY_SNAPSHOT: MkPaneSnapshot = { now: 0, dataDir: null, run: null, runs: [], usage: null, projectAgents: null, activeRuns: [] }
+
+/** The pane's snapshot: `activeRuns` carries EVERY active run loaded (newest
+ *  first) so the pane renders a Run/Plan/Lanes block per run; `run` stays the
+ *  newest of them — the status chip, toasts and wake keep consuming it. (The
+ *  state key is declared MkSnapshot; the extra field travels in that value.) */
+export type MkPaneSnapshot = MkSnapshot & { activeRuns: readonly MkRun[] }
 
 /** Variadic path join: '/'-separates without doubling (paths here never end in '/'). */
 export const join = (...parts: readonly string[]): string =>
@@ -103,14 +109,15 @@ export function coerceIndex(raw: unknown): MkRunIndexEntry[] {
     : []
 }
 
-/** The active-run pick: status "active", newest started first (chronological, not lexical). */
-export function activeEntry(entries: readonly MkRunIndexEntry[]): MkRunIndexEntry | null {
+/** Every active run, newest started first (chronological, not lexical): the pane
+ *  renders a Run/Plan/Lanes block per entry; the first is the run the chip,
+ *  toasts and wake consume. */
+export function activeEntries(entries: readonly MkRunIndexEntry[]): MkRunIndexEntry[] {
   const key = (e: MkRunIndexEntry): number => {
     const t = Date.parse(e.started ?? '')
     return Number.isFinite(t) ? t : 0
   }
-  const active = entries.filter(e => e.status === 'active').sort((a, b) => key(b) - key(a))
-  return active[0] ?? null
+  return entries.filter(e => e.status === 'active').sort((a, b) => key(b) - key(a))
 }
 
 export function coerceRun(obj: unknown): MkRun | null {
@@ -153,8 +160,8 @@ export function sanitizeText(text: string | null | undefined, cap = 200): string
     .slice(0, cap)
 }
 
-export function mkSnapshot(now: number, dataDir: string | null, run: MkRun | null, runs: readonly MkRunIndexEntry[], usage: MkUsage | null, projectAgents: readonly string[] | null): MkSnapshot {
-  return { now, dataDir, run, runs, usage, projectAgents }
+export function mkSnapshot(now: number, dataDir: string | null, run: MkRun | null, activeRuns: readonly MkRun[], runs: readonly MkRunIndexEntry[], usage: MkUsage | null, projectAgents: readonly string[] | null): MkPaneSnapshot {
+  return { now, dataDir, run, runs, usage, projectAgents, activeRuns }
 }
 
 // ---------- matrixkoder.yaml line parsers (no YAML dependency; the wizard's emitter shapes) ----------

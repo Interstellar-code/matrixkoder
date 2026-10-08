@@ -8,12 +8,13 @@ import type { Elements, EngineInterface, On, PluginOptions } from 'claude-code'
 
 // the per-surface element table $.ui.resolve(e) answers (every surface's has Box/Text)
 type Els = Elements[keyof Elements]
-import type { MkEvent, MkRun, MkSnapshot, MkStatusMemory, MkTask } from '../types'
+import type { MkEvent, MkRun, MkRunIndexEntry, MkSnapshot, MkStatusMemory, MkTask } from '../types'
 import {
-  AGENT_ORDER, PANE_ID, EMPTY_SNAPSHOT, activeEntry, basename, candidateDirs, coerceIndex, coerceRun, coerceUsage, join,
+  AGENT_ORDER, PANE_ID, EMPTY_SNAPSHOT, activeEntries, basename, candidateDirs, coerceIndex, coerceRun, coerceUsage, join,
   globalDirPath, mainCheckout, mkSnapshot, normalizePath, orderAgents, parentOf, parseGitdir, parseJson, parseYamlAgents, parseYamlProviders,
   projectDataDir, sanitizeText, timerRegistry,
 } from './data'
+import type { MkPaneSnapshot } from './data'
 import { chipText, toastsFor } from './status'
 
 // atoms are file-local consts (the scan reads this file's own consts); the
@@ -114,10 +115,10 @@ export function registerDashboard(on: On, options: PluginOptions): void {
 
   on('ui.render', { component: 'Pane', requestId: PANE_ID }, async ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
-    const snap = await read($, snapshotAtom)
+    const snap = await read($, snapshotAtom) as MkPaneSnapshot
     const cols = e.props.bodyColumns || COLUMNS
     const compact = cols < 40
-    const extraActive = snap.runs.filter(r => r.status === 'active').length - 1
+    const active = snap.activeRuns
 
     return (
       <Box flexDirection="column" width={cols} gap={1}>
@@ -131,11 +132,17 @@ export function registerDashboard(on: On, options: PluginOptions): void {
         )}
         {snap.dataDir === null
           ? FirstRun($.ui.resolve(e))
-          : snap.run === null
+          : active.length === 0
             ? NoRun($.ui.resolve(e), snap)
-            : RunSection($.ui.resolve(e), snap.run, compact, extraActive)}
-        {snap.dataDir !== null && snap.run !== null && PlanSection($.ui.resolve(e), snap.run, cols, compact, snap.now)}
-        {snap.dataDir !== null && snap.run !== null && LanesSection($.ui.resolve(e), snap.run, cols)}
+            : active.map(run => (
+              // one Run/Plan/Lanes block per active run, newest first; Usage /
+              // Waiting / Recent below are global and render once
+              <Box key={run.id} flexDirection="column" gap={1}>
+                {RunSection($.ui.resolve(e), run, compact)}
+                {PlanSection($.ui.resolve(e), run, cols, compact, snap.now)}
+                {LanesSection($.ui.resolve(e), run, cols)}
+              </Box>
+            ))}
         {UsageSection($.ui.resolve(e), snap, compact)}
         {snap.run?.waiting && WaitingSection($.ui.resolve(e), snap.run.waiting)}
         {snap.run && RecentSection($.ui.resolve(e), (snap.run.recent ?? []).slice(-3).reverse(), compact)}
@@ -247,16 +254,33 @@ async function resolveDataDir($: EngineInterface, cwd: string, home: string | nu
   return null
 }
 
-async function loadRun($: EngineInterface, dataDir: string): Promise<{ run: MkRun | null; runs: ReturnType<typeof coerceIndex>; error: string | null }> {
+/** Loads every active run, newest first. The NEWEST keeps the single-run
+ *  semantics it always had — its run/error drive the ⚠ note, the NoRun panel
+ *  and the chip/toasts/wake inputs (snap.run); an OLDER run whose run.json
+ *  cannot be read is skipped, never blanking the pane. */
+async function loadRuns($: EngineInterface, dataDir: string): Promise<{ run: MkRun | null; activeRuns: MkRun[]; runs: ReturnType<typeof coerceIndex>; error: string | null }> {
   const runs = coerceIndex(await readJson($, join(dataDir, 'runs/index.json')))
-  const entry = activeEntry(runs)
-  if (!entry) return { run: null, runs, error: null }
+  const active = activeEntries(runs)
+  const head = active[0]
+  if (!head) return { run: null, activeRuns: [], runs, error: null }
+  const first = await readRun($, dataDir, head)
+  if (first.run == null) return { run: null, activeRuns: [], runs, error: first.error }
+  const activeRuns = [first.run]
+  for (const entry of active.slice(1)) {
+    const more = await readRun($, dataDir, entry)
+    if (more.run != null) activeRuns.push(more.run)
+  }
+  return { run: first.run, activeRuns, runs, error: null }
+}
+
+/** One run.json → a coerced run, or the error the loader reports for it. */
+async function readRun($: EngineInterface, dataDir: string, entry: MkRunIndexEntry): Promise<{ run: MkRun | null; error: string | null }> {
   const runPath = join(dataDir, 'runs', entry.id, 'run.json')
   const text = await readText($, runPath)
-  if (text == null) return { run: null, runs, error: `cannot read ${entry.id}/run.json` }
+  if (text == null) return { run: null, error: `cannot read ${entry.id}/run.json` }
   const run = coerceRun(parseJson(text))
-  if (run == null) return { run: null, runs, error: 'cannot read run.json' }
-  return { run, runs, error: null }
+  if (run == null) return { run: null, error: 'cannot read run.json' }
+  return { run, error: null }
 }
 
 async function homeDir($: EngineInterface): Promise<string | null> {
@@ -301,17 +325,18 @@ async function loadSnapshot($: EngineInterface, cwd: string): Promise<MkSnapshot
   const home = await homeDir($)
   const dataDir = await resolveDataDir($, cwd, home)
   let run: MkRun | null = null
+  let activeRuns: MkRun[] = []
   let runs: ReturnType<typeof coerceIndex> = []
   let error: string | null = null
   if (dataDir) {
-    ;({ run, runs, error } = await loadRun($, dataDir))
+    ;({ run, activeRuns, runs, error } = await loadRuns($, dataDir))
   }
   const gdir = await globalDirOf($, home)
   const usage = gdir ? coerceUsage(await readJson($, usagePath(gdir))) : null
   // the project yaml scopes the usage section (and its poll) to this project's agents and providers
   const yaml = dataDir != null ? await readText($, join(dataDir, 'matrixkoder.yaml')) : null
   const projectAgents = orderAgents(parseYamlAgents(yaml ?? ''))
-  return { ...mkSnapshot(now, dataDir, run, runs, usage, projectAgents), error }
+  return { ...mkSnapshot(now, dataDir, run, activeRuns, runs, usage, projectAgents), error }
 }
 
 async function applyStatus($: EngineInterface, options: PluginOptions, snap: MkSnapshot): Promise<void> {
@@ -468,7 +493,7 @@ function NoRun(els: Els, snap: MkSnapshot) {
   )
 }
 
-function RunSection(els: Els, run: MkRun, compact: boolean, extraActive = 0) {
+function RunSection(els: Els, run: MkRun, compact: boolean) {
   const { Box, Text } = els
   const head = run.head_sha ? `@${run.head_sha.slice(0, 7)}` : ''
   const feature = compact ? run.feature.split('-')[0] : run.feature
@@ -480,7 +505,6 @@ function RunSection(els: Els, run: MkRun, compact: boolean, extraActive = 0) {
         {run.branch && <Text dimColor={true}>· {run.branch}{head}</Text>}
         <Text dimColor={true}>·</Text>
         <Text color="cyan" bold={true}>{compact ? 'stg' : 'stage'} {run.stage}/12</Text>
-        {extraActive > 0 && <Text color="yellow" dimColor={true}>+{extraActive} active</Text>}
       </Box>
       {run.next && (
         <Text wrap="truncate-end"><Text color="cyan" bold={true}>▶ Next: </Text>{sanitizeText(run.next, 120)}</Text>

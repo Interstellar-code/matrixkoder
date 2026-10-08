@@ -2,7 +2,8 @@
 """MatrixKoder lanes — computed names + a small pool of reusable worktree slots. Python 3 stdlib only.
 
   names   --run R --task T [--role build|fix|takeover|review] [--round N] [--slot N]
-  acquire --run R --task T --base REF [--role ROLE] [--round N]
+  acquire --run R (--task T | --tasks A,B,C) --base REF [--role ROLE] [--round N]
+           (--tasks: one slot for the group, the lane fields written on every listed task)
   release --slot N --integration REF
   gc      [--keep K]
   list
@@ -20,15 +21,18 @@ ref argument must resolve to a commit here before it reaches git.
 Why slots: one git worktree per task means pnpm install, a fresh .env copy and a fresh agent
 folder-trust prompt for every task. A slot is a persistent checkout reused across tasks: acquire
 takes the lowest free clean slot, release detaches it back to the integration branch. Names are
-computed here, so no agent invents one.
+computed here, so no agent invents one. `lanes: copy: [...]` names gitignored paths a freshly
+created slot needs (.env, generated types): they are copied from the main checkout on create.
 
 This tool belongs to the ORCHESTRATOR: it runs `git switch` inside a slot, only after the slot is
 verified clean and never with force. Builders never run it. It owns <data>/lanes.json (outside runs/);
 run state stays mk-state.py's alone — the task keys written there are best-effort (a failure is a
-warning, never a failed acquire). Schema: docs/state-schema.md
+warning, never a failed acquire), the run id must be one mk-state knows (checked first, nothing is
+created otherwise) and task ids are written in their stored case (mk-state matches ids by case).
+Schema: docs/state-schema.md
 """
 import argparse, contextlib, fcntl, fnmatch, hashlib, importlib.util, json, math, os, re
-import subprocess, sys, tempfile, time
+import shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True  # no stray __pycache__ next to the scripts
@@ -41,17 +45,21 @@ KEY_RE = re.compile(r"^(\s*)([A-Za-z_][A-Za-z0-9_-]*):[ \t]*(.*)$")
 LOCKFILES = ("pnpm-lock.yaml", "package-lock.json", "yarn.lock", "bun.lock", "bun.lockb",
              "uv.lock", "poetry.lock", "Cargo.lock")
 # Ignored entries a slot may keep between tasks; anything else is a pause item, never discarded.
-DISPOSABLE = (".matrixkoder-*", ".env", ".env.*", "node_modules/", ".omc/", ".serena/", ".venv/",
-              "__pycache__/")
+DISPOSABLE = (".matrixkoder-*", ".env", ".env.*", "node_modules/", ".omc/", ".omo/", ".serena/",
+              ".venv/", "__pycache__/")
 # The build-cache dirs every package/venv path ends with: allowed as a path component at any depth,
 # so a monorepo's packages/a/node_modules/ does not read as dirty. Everything else stays root-only.
 ANY_DEPTH = ("node_modules/", "__pycache__/", ".venv/")
 # A lanes_disposable entry is a literal name: no globs, no paths, no `..` — a wildcard would make
 # every ignored file disposable and the next gc would delete the user's data.
 DISPOSABLE_RE = re.compile(r"[A-Za-z0-9._-]+/?")
+# A lanes.copy entry is a literal relative path: same reasoning (a glob would widen the clean
+# check's allowlist, `..`/`.` would leave the main checkout) plus no absolute paths.
+COPY_RE = re.compile(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*/?")
 LOCK_TIMEOUT = 30.0
 GIT_TIMEOUT, HERDR_TIMEOUT = 120, 300
-DEFAULTS = {"slots": 1, "pattern": "../{repo}-mk-{n}", "reuse": True, "cap": 3, "disposable": []}
+DEFAULTS = {"slots": 1, "pattern": "../{repo}-mk-{n}", "reuse": True, "cap": 3, "disposable": [],
+            "copy": []}
 
 
 def _load(name, path):
@@ -81,8 +89,8 @@ def scalar(v):
 
 
 def split_flow(body):
-    """Split a flow collection on the commas that are not inside quotes."""
-    parts, cur, quote = [], "", None
+    """Split a flow collection on the commas that are not inside quotes or a nested [ list ]."""
+    parts, cur, quote, depth = [], "", None, 0
     for ch in body:
         if quote:
             cur += ch
@@ -91,7 +99,13 @@ def split_flow(body):
         elif ch in "\"'":
             quote = ch
             cur += ch
-        elif ch == ",":
+        elif ch == "[":
+            depth += 1
+            cur += ch
+        elif ch == "]":
+            depth = max(0, depth - 1)
+            cur += ch
+        elif ch == "," and depth == 0:
             parts.append(cur)
             cur = ""
         else:
@@ -123,7 +137,9 @@ def flow_map(body):
     for item in split_flow(body[1:-1]):
         k, sep, v = item.partition(":")
         if sep:
-            out[k.strip()] = scalar(v)
+            v = v.strip()
+            out[k.strip()] = ([scalar(x) for x in split_flow(v[1:-1])]
+                              if v.startswith("[") and v.endswith("]") else scalar(v))
     return out
 
 
@@ -140,11 +156,24 @@ def literal_names(items):
     return ok, bad
 
 
+def copy_paths(items):
+    """-> (accepted, rejected) lanes.copy entries: literal relative paths only, so the copy source
+    cannot leave the main checkout and the allowlist entry cannot become a glob."""
+    ok, bad = [], []
+    for x in items:
+        p = x.strip() if isinstance(x, str) else ""
+        if COPY_RE.fullmatch(p) and ".." not in p and p not in (".", "./"):
+            ok.append(p)
+        elif p:
+            bad.append(p)
+    return ok, bad
+
+
 def load_config(data):
-    """<data>/matrixkoder.yaml: `  lanes: { slots, pattern, reuse }` under repo, `max_build_lanes`
+    """<data>/matrixkoder.yaml: `  lanes: { slots, pattern, reuse, copy }` under repo, `max_build_lanes`
     (indent >= 2, any block) as the lane cap and one-line `lanes_disposable: [a, b]` on top of the
     clean-check allowlist. Defaults when absent or unreadable; `warnings` carries entries the
-    lanes_disposable check rejected."""
+    lanes_disposable or copy checks rejected."""
     cfg = dict(DEFAULTS, disposable=[], warnings=[])
     try:
         with open(os.path.join(data, "matrixkoder.yaml")) as f:
@@ -177,6 +206,11 @@ def load_config(data):
                 cfg["pattern"] = block["pattern"]
             if block.get("reuse") in ("true", "false"):
                 cfg["reuse"] = block["reuse"] == "true"
+            if isinstance(block.get("copy"), list):
+                cfg["copy"], bad = copy_paths(block["copy"])
+                cfg["warnings"] += [f"lanes copy: ignored {p!r} (not a literal path)" for p in bad]
+            elif "copy" in block:
+                cfg["warnings"].append("lanes copy: expected a [list]; nothing copied")
     cfg["cap"] = max(cfg["slots"], cfg["cap"])  # the pool never grows past the lane cap
     return cfg
 
@@ -353,7 +387,10 @@ def herdr_bin():
 
 
 def herdr_json_id(text):
-    """`workspace_id` from herdr's JSON output (its own id when nested); None when it prints none."""
+    """-> (workspace_id, warning): the id herdr's create response actually carries —
+    result.workspace.workspace_id, else result.worktree.open_workspace_id. The top-level `id` is
+    the RPC name ("cli:worktree:create"), never a workspace id. A response without any id on any
+    JSON line -> (None, warning): the slot exists, only the id capture failed."""
     for line in reversed([x for x in text.splitlines() if x.strip()]):
         try:
             d = json.loads(line)
@@ -361,15 +398,23 @@ def herdr_json_id(text):
             continue
         if not isinstance(d, dict):
             continue
-        ws = d.get("workspace")
-        for cand in (d.get("workspace_id"), ws.get("id") if isinstance(ws, dict) else None, d.get("id")):
+        result = d.get("result") if isinstance(d.get("result"), dict) else {}
+        ws = d.get("workspace") if isinstance(d.get("workspace"), dict) else None
+        rws = result.get("workspace") if isinstance(result.get("workspace"), dict) else None
+        rwt = result.get("worktree") if isinstance(result.get("worktree"), dict) else None
+        for cand in (rws.get("workspace_id") if rws else None,
+                     rwt.get("open_workspace_id") if rwt else None,
+                     result.get("workspace_id"), d.get("workspace_id"),
+                     ws.get("id") if ws else None, rws.get("id") if rws else None):
             if cand:
-                return str(cand)
-    return None
+                return str(cand), None
+    return None, "herdr worktree create printed no workspace id " \
+                 "(want result.workspace.workspace_id or result.worktree.open_workspace_id)"
 
 
 def ensure_lane_exclude(lane):
-    """`.matrixkoder-*` into the slot's info/exclude (same pattern as mk-lane-event.py)."""
+    """`.matrixkoder-*` and `.omo/` into the slot's info/exclude (same pattern as
+    mk-lane-event.py): lane reports and agent state never read as untracked in a slot."""
     with contextlib.suppress(OSError):
         r = run_cmd(["git", "-C", lane, "rev-parse", "--git-path", "info/exclude"], 5)
         if r.returncode == 0 and r.stdout.strip():
@@ -377,9 +422,10 @@ def ensure_lane_exclude(lane):
             ep = ep if os.path.isabs(ep) else os.path.join(lane, ep)
             if os.path.exists(os.path.dirname(ep)):
                 cur = open(ep).read() if os.path.exists(ep) else ""
-                if ".matrixkoder-*" not in cur:
+                add = [e for e in (".matrixkoder-*", ".omo/") if e not in cur]
+                if add:
                     with open(ep, "a") as f:
-                        f.write(".matrixkoder-*\n")
+                        f.write("".join(e + "\n" for e in add))
 
 
 # ---------- the clean check (shared by acquire, release and gc) ----------
@@ -431,7 +477,7 @@ def clean_state(path, cfg):
                  "--untracked-files=normal", "--ignore-submodules=none"], 60)
     if r.returncode != 0:
         raise Fail(f"git status in {path} failed", stderr=(r.stderr or r.stdout).strip()[:400])
-    allow = tuple(DISPOSABLE) + tuple(cfg["disposable"])
+    allow = tuple(DISPOSABLE) + tuple(cfg["disposable"]) + tuple(cfg["copy"])
     cache = {}
 
     def has_tracked(rel):
@@ -550,6 +596,37 @@ def lock_hash(path):
     return None
 
 
+def run_ids(data):
+    """-> the run ids mk-state knows: <data>/runs/index.json, the same list `run list` prints."""
+    idx = mk_state.read_json(os.path.join(data, "runs", "index.json"), [])
+    if not isinstance(idx, list):
+        return []
+    return [r.get("id") for r in idx if isinstance(r, dict) and r.get("id")]
+
+
+def resolve_run(data, run):
+    """-> the stored run id for `run`, matched case-insensitively (ids are case-insensitive, run
+    dirs are not on every filesystem). None when mk-state knows no such run."""
+    for rid in run_ids(data):
+        if str(rid).lower() == run.lower():
+            return rid
+    return None
+
+
+def resolve_task(data, rid, task):
+    """-> the task id as stored in the run's run.json (mk-state matches task ids by case, so the
+    write must use the stored spelling). Falls back to `task` when the run or its task list cannot
+    be read: the mk-state write stays best-effort, exactly as before."""
+    try:
+        run = mk_state.read_json(os.path.join(data, "runs", rid, "run.json"), None)
+    except (OSError, ValueError):
+        return task
+    for t in (run.get("tasks") if isinstance(run, dict) else None) or []:
+        if isinstance(t, dict) and str(t.get("id") or "").lower() == task.lower():
+            return t["id"]
+    return task
+
+
 def set_task(data, run, task, rec, n):
     """`mk-state task set` for lane/branch/workspace/slot. Best-effort: lanes.json is the truth about
     slots, so a failure here is a warning on an otherwise successful acquire, never a failed one."""
@@ -587,8 +664,10 @@ def pick_slot(lanes, cfg):
 def create_slot(rec, main, base_sha):
     """Create the slot's worktree: herdr (labelled workspace) or plain git, both from the sha
     check_ref resolved — the raw `--base` never reaches herdr either. The record is written by the
-    caller after this returns, so a failure leaves no slot behind."""
+    caller after this returns, so a failure leaves no slot behind. -> None, or a warning when herdr
+    answered without a usable workspace id (the slot itself was created)."""
     bin_ = herdr_bin()
+    warn = None
     if bin_ == "none":
         rec["workspace_id"] = None  # a recreated slot has no herdr workspace, let alone a stale id
         git(["-C", main, "worktree", "add", "-b", rec["branch"], rec["path"], base_sha])
@@ -598,8 +677,51 @@ def create_slot(rec, main, base_sha):
                      "--no-focus"], HERDR_TIMEOUT)
         if r.returncode != 0:
             raise Fail("herdr worktree create failed", stderr=(r.stderr or r.stdout).strip()[:400])
-        rec["workspace_id"] = herdr_json_id(r.stdout)
+        rec["workspace_id"], warn = herdr_json_id(r.stdout)
     ensure_lane_exclude(rec["path"])
+    return warn
+
+
+def tracked_in(main, rel):
+    """-> does the main checkout track <rel> (the path itself, or anything under it)? Fail closed:
+    any git error counts as tracked, so a broken repo never smuggles files into a slot (the same
+    rule as clean_state's has_tracked)."""
+    t = run_cmd(["git", "-C", main, "--literal-pathspecs", "ls-files", "--error-unmatch", "-z", "--", rel], 30)
+    if t.returncode == 0:
+        return True
+    if t.returncode == 1:  # --error-unmatch: nothing tracked under <rel>
+        return False
+    return True  # any other git error: fail closed
+
+
+def copy_into_slot(cfg, main, lane):
+    """The lanes.copy entries from the main checkout into a freshly created slot: the fresh
+    worktree has the tracked files, not the gitignored ones a build needs (.env, generated
+    types). Only UNTRACKED content is copied — a tracked source would put repo files in the slot's
+    status — and only literal in-checkout paths: absolute paths, `..` components and symlinks
+    resolving outside the main checkout are skipped. -> warnings; a missing, tracked or
+    unreadable source is reported, never fatal."""
+    warns = []
+    for rel in cfg["copy"]:
+        src, dst = os.path.join(main, rel), os.path.join(lane, rel)
+        try:
+            if os.path.isabs(rel) or ".." in rel.split("/"):
+                raise ValueError("not a literal relative path")
+            if os.path.commonpath([os.path.realpath(src), main]) != main:
+                raise ValueError("resolves outside the main checkout")
+            if tracked_in(main, rel):
+                warns.append(f"lanes copy: {rel!r} is tracked in {os.path.basename(main)}, skipped")
+                continue
+            if os.path.isdir(src):
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+            elif os.path.isfile(src):
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(src, dst)
+            else:
+                warns.append(f"lanes copy: {rel!r} not in {os.path.basename(main)}, skipped")
+        except (OSError, shutil.Error, ValueError) as e:
+            warns.append(f"lanes copy: {rel!r}: {type(e).__name__}: {e}"[:200])
+    return warns
 
 
 def remove_slot(n, rec, main):
@@ -616,8 +738,27 @@ def remove_slot(n, rec, main):
     return None
 
 
+def acquire_tasks(a):
+    """-> the task id list behind --task / --tasks (a group is one slot; ids keep their case,
+    only branch and agent names are lowercased)."""
+    if a.task and a.tasks:
+        raise Fail("--task and --tasks are mutually exclusive")
+    tasks = [a.task] if a.task else (a.tasks.split(",") if a.tasks else [])
+    if not tasks or not all(tasks):
+        raise Fail("acquire needs --task T or --tasks A,B (no empty entries)")
+    for t in tasks:
+        slug(t, "task id")
+    return tasks
+
+
 def cmd_acquire(a, cfg, data, main):
-    nms = names(a.run, a.task, cfg, a.role, a.round, 1, main)  # validates run/task before the lock
+    tasks = acquire_tasks(a)
+    nms = names(a.run, tasks[0], cfg, a.role, a.round, 1, main)  # validates run/task before the lock
+    rid = resolve_run(data, a.run)  # ids are case-insensitive; the write needs the stored one
+    if rid is None:  # refuse before anything is created: lanes.json, worktree, branch all untouched
+        known = run_ids(data)
+        raise Fail(f"unknown run {a.run!r} (mk-state knows: {', '.join(map(str, known)) or 'no runs'})",
+                   known_runs=known)
     base = check_ref(main, a.base, "--base")
     check_branch(main, nms["branch"], "task branch name")
     with locked(data, a.lock_timeout):
@@ -634,10 +775,13 @@ def cmd_acquire(a, cfg, data, main):
         rec.setdefault("workspace_id", None)
         rec["workspace"] = workspace_name(main, n)  # rec["path"] is never reassigned: a slot stays put
         rec["branch"] = nms["branch"]
+        warns = []
         if created:
             if os.path.lexists(rec["path"]):
                 raise Fail(f"slot path {rec['path']} exists and is not a registered slot")
-            create_slot(rec, main, base)
+            if warn := create_slot(rec, main, base):
+                warns.append(warn)
+            warns += copy_into_slot(cfg, main, rec["path"])
         else:
             verify_slot_path(n, rec["path"], main)
             require_clean(n, rec, cfg)  # before any git command runs
@@ -646,13 +790,18 @@ def cmd_acquire(a, cfg, data, main):
             git(["-C", rec["path"], "switch", "-c", rec["branch"]])  # an existing branch fails here
         h = lock_hash(rec["path"])
         install_needed = created or h != rec.get("lock_hash") or rec.get("lock_hash") is None
-        touch(rec, state="busy", run=a.run, task=a.task, lock_hash=h)
+        touch(rec, state="busy", run=a.run, task=a.task or a.tasks, lock_hash=h)
         write_lanes(data, lanes)
         out = {"ok": True, "slot": n, "path": rec["path"], "workspace": rec["workspace"],
                "workspace_id": rec["workspace_id"], "branch": rec["branch"],
                "agent": nms["agent"], "created": created, "install_needed": install_needed}
-        if warning := set_task(data, a.run, a.task, rec, n):
-            out["warning"] = f"mk-state task set: {warning}"
+        if len(tasks) > 1:
+            out["tasks"] = tasks
+        for t in tasks:
+            if warning := set_task(data, rid, resolve_task(data, rid, t), rec, n):
+                warns.append((f"task {t}: " if len(tasks) > 1 else "") + f"mk-state task set: {warning}")
+        if warns:
+            out["warning"] = "; ".join(warns)
         return with_warnings(out, cfg)
 
 
@@ -799,16 +948,19 @@ def build_parser():
     dp.add_argument("--lock-timeout", type=float, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
 
     def lane_args(x):
-        x.add_argument("--run", required=True), x.add_argument("--task", required=True)
+        x.add_argument("--run", required=True)
         x.add_argument("--role", default="build", choices=ROLES)
         x.add_argument("--round", type=int, default=1)
 
     x = sub.add_parser("names", parents=[dp])
     lane_args(x)
+    x.add_argument("--task", required=True)
     x.add_argument("--slot", type=int, default=1)
     x.set_defaults(func=cmd_names)
     x = sub.add_parser("acquire", parents=[dp])
     lane_args(x)
+    x.add_argument("--task", help="one task; or --tasks A,B,C for a group on one slot")
+    x.add_argument("--tasks", help="comma-separated task group: one slot, lane fields on every task")
     x.add_argument("--base", required=True)
     x.set_defaults(func=cmd_acquire)
     x = sub.add_parser("release", parents=[dp])
@@ -839,7 +991,6 @@ def main(argv):
 # ---------- self-test: real git in temp repos, temp data dir, never the real ~/.matrixkoder ----------
 
 def self_test():
-    import shutil
     tmp = os.path.realpath(tempfile.mkdtemp(prefix="mk-lane-test-"))  # realpath: paths are reported that way
     env = dict(os.environ, MATRIXKODER_HOME=os.path.join(tmp, "home"), MK_HERDR="none")
     env.pop("MATRIXKODER_DATA", None)
@@ -854,16 +1005,16 @@ def self_test():
             assert r.returncode == 0, (args, r.stderr)
         return r
 
-    def run_py(script, args, code=0):
+    def run_py(script, args, code=0, e=None):
         r = subprocess.run([sys.executable, script, *args, "--data", data], capture_output=True,
-                           text=True, env=env, cwd=repo)
+                           text=True, env=e or env, cwd=repo)
         lines = r.stdout.strip().splitlines()
         assert len(lines) == 1, (args, r.stdout, r.stderr)
         assert r.returncode == code, (args, r.returncode, r.stdout, r.stderr)
         return json.loads(lines[0])
 
-    def mk(*args, code=0):
-        return run_py(self_path, list(args), code)
+    def mk(*args, code=0, e=None):
+        return run_py(self_path, list(args), code, e)
 
     def st(*args, code=0):
         return run_py(os.path.join(HERE, "mk-state.py"), list(args), code)
@@ -930,6 +1081,17 @@ def self_test():
         cfg = load_config(data)
         assert cfg["disposable"] == ["build", "dist/"], cfg
         assert len(cfg["warnings"]) == 3, cfg
+        # lanes.copy: a flow list inside the lanes map; only literal relative paths are accepted
+        write(os.path.join(data, "matrixkoder.yaml"),
+              'repo:\n  lanes: { slots: 2, pattern: "../{repo}-mk-{n}", reuse: true, '
+              'copy: [".claude-plugin/types", ".env"] }\n')
+        cfg = load_config(data)
+        assert cfg["copy"] == [".claude-plugin/types", ".env"] and cfg["warnings"] == [], cfg
+        write(os.path.join(data, "matrixkoder.yaml"),
+              'repo:\n  lanes: { slots: 1, pattern: "../{repo}-mk-{n}", reuse: true, '
+              'copy: ["*", "../secrets", "/abs", ".", "ok-dir/"] }\n')
+        cfg = load_config(data)
+        assert cfg["copy"] == ["ok-dir/"] and len(cfg["warnings"]) == 4, cfg
         yaml_cap(1, 1)
 
         # 1 names: lowercased, digit-prefixed agent, the 32-char limit, integration branch
@@ -960,6 +1122,10 @@ def self_test():
         assert os.path.isdir(slot1)
         assert g("-C", slot1, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "mk/r1/t1"
         assert mk("list")["slots"][0]["state"] == "busy"
+        # the slot's info/exclude carries both lane entries (.omo/ is not in .gitignore at all)
+        ep = g("-C", slot1, "rev-parse", "--git-path", "info/exclude").stdout.strip()
+        ep = ep if os.path.isabs(ep) else os.path.join(slot1, ep)
+        assert ".matrixkoder-*" in open(ep).read() and ".omo/" in open(ep).read()
         t = st("task", "get", "t1")["task"]
         assert (t["lane"], t["branch"], t["workspace"], t["slot"]) == (slot1, "mk/r1/t1", "mk:repo:1", "1"), t
 
@@ -1021,11 +1187,14 @@ def self_test():
         assert mk("list")["slots"][0]["state"] == "free"  # no state change
         g("config", "--unset", "status.showUntrackedFiles")
         os.unlink(os.path.join(slot1, "hidden.txt"))
-        # an ignored node_modules/ or .omc/ is disposable, not dirty
+        # an ignored node_modules/ or .omc/ is disposable, not dirty; .omo/ is ignored only through
+        # the exclude entry written at slot creation, and disposable the same way
         os.makedirs(os.path.join(slot1, "node_modules", "pkg"), exist_ok=True)
         os.makedirs(os.path.join(slot1, ".omc", "sessions"), exist_ok=True)
+        os.makedirs(os.path.join(slot1, ".omo", "state"), exist_ok=True)
         write(os.path.join(slot1, "node_modules", "pkg", "i.js"), "x\n")
         write(os.path.join(slot1, ".omc", "sessions", "s.json"), "{}\n")
+        write(os.path.join(slot1, ".omo", "state", "s.json"), "{}\n")
         write(os.path.join(slot1, ".matrixkoder-report-r1.md"), "report\n")
         assert mk("list")["slots"][0]["clean"] is True
         assert mk("release", "--slot", "1", "--integration", "mk/r1/integration")["ok"]
@@ -1206,8 +1375,8 @@ def self_test():
         # file — adding one under an ignored dir would need a forced add, which this file never uses.
         shapes = ["node_modules", ".venv", ".omc", "my dir/node_modules", "café/node_modules",
                   ":x/node_modules", ":(z)/node_modules"]
-        for junk in ("node_modules", ".omc", "pkg/a/node_modules", ".venv", "scripts/__pycache__",
-                     ".matrixkoder-report-r1.md"):  # the ignored fixtures only: pkg/a/src/app.js is tracked
+        for junk in ("node_modules", ".omc", ".omo", "pkg/a/node_modules", ".venv",
+                     "scripts/__pycache__", ".matrixkoder-report-r1.md"):  # ignored fixtures only
             victim = os.path.join(slot1, junk)
             if os.path.isdir(victim):
                 shutil.rmtree(victim)
@@ -1348,6 +1517,105 @@ def self_test():
         assert mk("acquire", "--run", "r1", "--task", "td", "--base", "main",
                   code=4)["error"] == "all 2 slots busy"
         assert main_head() == "main"  # this test never moved the user's main checkout
+
+        # 15 fixes from the first live run: unknown run ids, task groups, task-id case,
+        # slot copies, and the real herdr workspace id
+
+        # an unknown run id is refused before anything is created: no slot, no branch, no lanes entry
+        before = open(os.path.join(data, "lanes.json")).read()
+        bad = mk("acquire", "--run", "plan-link", "--task", "t10", "--base", "main", code=2)
+        assert bad["ok"] is False and "plan-link" in bad["error"] and "r1" in bad["error"], bad
+        assert bad["known_runs"] == ["r1"], bad
+        assert open(os.path.join(data, "lanes.json")).read() == before  # nothing created
+        assert g("rev-parse", "--verify", "--quiet", "refs/heads/mk/r1/plan-link",
+                 check=False).returncode != 0
+
+        # a task group: one slot, the lane fields on every listed task
+        yaml_cap(3, 3)
+        st("task", "add", "--id", "t10", "--title", "ten", "--run", "r1")
+        st("task", "add", "--id", "t11", "--title", "eleven", "--run", "r1")
+        grp = mk("acquire", "--run", "r1", "--tasks", "t10,t11", "--base", "main")
+        assert (grp["ok"], grp["slot"], grp["created"], grp["tasks"]) == (True, 3, True, ["t10", "t11"]), grp
+        slot3 = os.path.join(tmp, "repo-mk-3")
+        for t in ("t10", "t11"):
+            tt = st("task", "get", t)["task"]
+            assert (tt["lane"], tt["branch"], tt["workspace"], tt["slot"]) == (slot3, "mk/r1/t10", "mk:repo:3", "3"), tt
+        assert mk("acquire", "--run", "r1", "--task", "t12", "--tasks", "t12", "--base", "main",
+                  code=2)["error"] == "--task and --tasks are mutually exclusive"
+        assert mk("acquire", "--run", "r1", "--tasks", "t12,,t13", "--base", "main",
+                  code=2)["error"] == "acquire needs --task T or --tasks A,B (no empty entries)"
+
+        # task ids keep their case for the mk-state write; only branch and agent names are lowercased
+        st("task", "add", "--id", "T2", "--title", "upper", "--run", "r1")
+        yaml_cap(4, 4)
+        up = mk("acquire", "--run", "r1", "--task", "T2", "--base", "main")
+        assert (up["slot"], up["agent"], up["branch"]) == (4, "t2-build-r1", "mk/r1/t2"), up
+        tt = st("task", "get", "T2")["task"]
+        assert (tt["lane"], tt["branch"], tt["slot"]) == (os.path.join(tmp, "repo-mk-4"), "mk/r1/t2", "4"), tt
+        # the lowercase spelling addresses the same stored task: no second, lowercase task appears
+        merge_integration("mk/r1/t2")  # frees the branch name for the lowercase re-acquire
+        mk("release", "--slot", "4", "--integration", "mk/r1/integration")
+        yaml_cap(5, 5)
+        low = mk("acquire", "--run", "r1", "--task", "t2", "--base", "main")
+        assert low["slot"] == 4, low  # the lowest free slot, path gone → recreated
+        assert "mk-state task set" not in low.get("warning", ""), low  # the stored-case id was written
+        ids = [t["id"] for t in mk_state.read_json(os.path.join(data, "runs", "r1", "run.json"))["tasks"]]
+        assert ids.count("T2") == 1 and "t2" not in ids, ids
+        tt = st("task", "get", "T2")["task"]
+        assert (tt["lane"], tt["slot"]) == (os.path.join(tmp, "repo-mk-4"), "4"), tt
+
+        # lanes.copy: only untracked paths travel — a tracked source is skipped, and what does
+        # land in the slot is on the clean-check allowlist (the slot stays clean; .env is
+        # gitignored, as in any real project — that is the point of lanes.copy)
+        write(os.path.join(repo, "src", "app.js"), "// tracked source\n")
+        write(os.path.join(repo, ".gitignore"),
+              "node_modules/\n__pycache__/\n/.venv/\n.omc/\nprod.sqlite\n.env\n")
+        g("add", "src", ".gitignore"), g("commit", "-qm", "tracked src; .env ignored")
+        write(os.path.join(repo, ".env"), "TOKEN=copy\n")
+        write(os.path.join(data, "matrixkoder.yaml"),
+              'repo:\n  lanes: { slots: 5, pattern: "../{repo}-mk-{n}", reuse: true, '
+              'copy: ["README.md", "src", ".env"] }\n'
+              'routing_preferences:\n  max_build_lanes: 5\n')
+        st("task", "add", "--id", "t14", "--title", "fourteen", "--run", "r1")
+        cp = mk("acquire", "--run", "r1", "--task", "t14", "--base", "main")
+        assert (cp["ok"], cp["slot"], cp["created"]) == (True, 5, True), cp
+        slot5 = os.path.join(tmp, "repo-mk-5")
+        # untracked, so only the copy brings it into the slot; README.md/src are already there
+        # from the worktree checkout (tracked) and were skipped by the copy
+        assert open(os.path.join(slot5, ".env")).read() == "TOKEN=copy\n"
+        assert cp["warning"].count("lanes copy") == 2, cp  # README.md and src are tracked
+        assert "README.md" in cp["warning"] and "'src'" in cp["warning"], cp
+        assert next(s for s in mk("list")["slots"] if s["slot"] == 5)["clean"] is True
+        # absolute, `..` and symlink-escape sources are skipped before any copy
+        os.symlink(tmp, os.path.join(repo, "escape"))
+        warns = copy_into_slot({"copy": ["escape", "/abs", "../up"]}, repo, slot5)
+        assert len(warns) == 3 and all("lanes copy" in w for w in warns), warns
+        assert not os.path.exists(os.path.join(slot5, "escape"))
+        os.unlink(os.path.join(repo, "escape"))
+
+        # the workspace id herdr's create response actually carries: the captured real shape
+        captured = ('{"id":"cli:worktree:create","result":{"workspace":{"workspace_id":"wW","label":"mk:repo:7"},'
+                    '"worktree":{"branch":"mk/r1/t15","open_workspace_id":"wW","path":"repo-mk-7"}}}')
+        assert herdr_json_id(captured) == ("wW", None)
+        assert herdr_json_id('{"id":"cli:worktree:create","result":{"worktree":{"open_workspace_id":"wX"}}}') == ("wX", None)
+        noid = herdr_json_id('{"id":"cli:worktree:create","result":{}}')
+        assert noid[0] is None and noid[1]  # the slot exists; only the id capture failed
+        # ...and through acquire with a fake herdr: the stored id is the workspace one, never the RPC name
+        fake = os.path.join(tmp, "fake-herdr")
+        write(fake, "#!/usr/bin/env python3\n"
+                    "import sys\n"
+                    "sys.stdout.write('{\"id\":\"cli:worktree:create\",\"result\":{\"workspace\":{\"workspace_id\":\"wW\"},"
+                    "\"worktree\":{\"open_workspace_id\":\"wW\"}}}')\n")
+        os.chmod(fake, 0o755)
+        yaml_cap(6, 6)
+        st("task", "add", "--id", "t15", "--title", "fifteen", "--run", "r1")
+        h = mk("acquire", "--run", "r1", "--task", "t15", "--base", "main", e=dict(env, MK_HERDR=fake))
+        assert (h["ok"], h["slot"], h["workspace_id"]) == (True, 6, "wW"), h
+        assert next(s for s in mk("list")["slots"] if s["slot"] == 6)["workspace_id"] == "wW"
+        lanes = read_lanes(data)  # the fake made no worktree: drop the record again
+        lanes["slots"].pop("6", None)
+        write_lanes(data, lanes)
+
         print("mk-lane self-test ok")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

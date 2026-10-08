@@ -5,6 +5,7 @@ Usage:
   mk-lane-event.py arm --lane DIR --pane ID --task T --run R --data DIR --phase P --commit-grep RX
                       [--report PATH] [--kind claude|codex|opencode|agy] [--prompt-marker TEXT] [--stall-min 15]
   mk-lane-event.py event                (herdr plugin hook: reads HERDR_PLUGIN_EVENT + HERDR_PLUGIN_EVENT_JSON)
+  mk-lane-event.py dispatch --pane ID --text TEXT [--timeout-ms 25000]
   mk-lane-event.py sweep [--data DIR]
   mk-lane-event.py disarm --lane DIR
   mk-lane-event.py --self-test
@@ -23,6 +24,11 @@ land in the watch file so a repeated identical event is a no-op. pane.exited on 
 STALL "agent exited"; after any verdict an exit is just post-finish cleanup. A herdr ERROR probe is
 not a verdict (the next event retries). Silence (crash, hang) produces no event at all — `sweep` is
 the backstop: no file/commit/pane change for stall_min since last_activity → STALL by the same rules.
+dispatch is the one-call prompt helper: `herdr agent prompt <pane> <text> --wait --timeout <ms>`
+(binary from $MK_HERDR, default herdr). A timeout proves nothing either way — the text may already
+be in flight — so the pane's own state decides delivery: pane list still `working` → delivered:true;
+anything else (agent_prompt_stalled, idle, gone, list unreadable) → delivered:false with the observed
+state and herdr's own error. The reply carries exactly what the subprocesses returned, never invented.
 herdr runs one process per event with no ordering guarantee: every read/decide/write of a watch file
 happens under an fcntl.flock on <lane>/.matrixkoder-watch.lock (a stable inode next to the atomically
 replaced watch file). One JSON line per command.
@@ -293,6 +299,84 @@ def record_pane(task, pane, data, run=None):
         return {"ok": False, "error": (r.stderr or r.stdout).strip()[-200:]}
 
 
+def herdr_bin():
+    """The herdr binary dispatch runs; $MK_HERDR lets a self-test inject a fake (mk-lane.py's rule)."""
+    return os.environ.get("MK_HERDR") or "herdr"
+
+
+def _jload(s):
+    s = (s or "").strip()
+    if not s.startswith("{"):
+        return None
+    try:
+        return json.loads(s)
+    except ValueError:
+        return None
+
+
+def pane_state(pane):
+    """(agent_status of <pane> from `herdr pane list`, error). A failed / malformed list is an
+    error, never a guessed state — the caller reports delivered:false with both."""
+    try:
+        r = subprocess.run([herdr_bin(), "pane", "list"], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, f"{type(e).__name__}: {e}"[:200]
+    panes = (lambda j: j.get("result", {}).get("panes") if isinstance(j, dict) else None)(_jload(r.stdout))
+    if r.returncode != 0 or not isinstance(panes, list):
+        return None, (r.stderr or r.stdout or "").strip()[-200:] or f"exit {r.returncode}"
+    row = next((p for p in panes if isinstance(p, dict) and p.get("pane_id") == pane), None)
+    return (row or {}).get("agent_status"), None
+
+
+def cmd_dispatch(a):
+    """Prompt a pane's agent and check delivery in one call. Success → delivered:true. A timeout
+    (herdr's error, or the wait settling on agent_prompt_stalled) → the pane's own state decides:
+    still working → delivered:true; anything else → delivered:false. Other failures → ok:false.
+    Completed checks exit 0 whatever the verdict; only usage errors exit 2."""
+    pane, text = opt(a, "--pane"), opt(a, "--text")
+    if not (pane and text):
+        fail("dispatch needs --pane --text")
+    try:
+        ms = int(opt(a, "--timeout-ms", "25000"))
+    except ValueError as e:
+        fail(f"--timeout-ms: {e}")
+    try:
+        r = subprocess.run([herdr_bin(), "agent", "prompt", pane, text, "--wait", "--timeout", str(ms)],
+                           capture_output=True, text=True, timeout=ms / 1000 + 30)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        # the subprocess died, the agent may not have: the pane's own state decides, exactly
+        # like the herdr-timeout arm below
+        why = f"{type(e).__name__}: {e}"[:300]
+        st, pl_err = pane_state(pane)
+        base = {"pane": pane, "timed_out": True, "timeout_ms": ms, "error": why}
+        if st == "working":
+            out({"ok": True, "delivered": True, "pane_state": "working", **base})
+        else:
+            out({"ok": False, "delivered": False, "pane_state": st,
+                 **({"pane_list_error": pl_err} if pl_err else {}), **base})
+        return
+    blob, err = (r.stdout or "").strip(), (r.stderr or "").strip()
+    j = _jload(blob)
+    jerr = j.get("error") if isinstance(j, dict) else None  # herdr can print {"error": ...} and exit 0
+    agent = j.get("result", {}).get("agent") if isinstance(j, dict) else None
+    status = agent.get("agent_status") if isinstance(agent, dict) else None
+    why = "; ".join(x for x in ((jerr or {}).get("code") if isinstance(jerr, dict) else None, err, blob)
+                    if x)[:300] or f"herdr exited {r.returncode} with no output"
+    if r.returncode == 0 and isinstance(j, dict) and "result" in j and jerr is None \
+            and status != "agent_prompt_stalled":
+        out({"ok": True, "delivered": True, "pane": pane, "agent_status": status, "timeout_ms": ms})
+    elif status == "agent_prompt_stalled" or "timeout" in why.lower() or "timed out" in why.lower():
+        st, pl_err = pane_state(pane)
+        base = {"pane": pane, "timed_out": True, "timeout_ms": ms, "herdr_error": why}
+        if st == "working":  # the wait gave up, the agent did not: the prompt is still being delivered
+            out({"ok": True, "delivered": True, "pane_state": "working", **base})
+        else:
+            out({"ok": False, "delivered": False, "pane_state": st, "error": why,
+                 **({"pane_list_error": pl_err} if pl_err else {}), **base})
+    else:
+        out({"ok": False, "delivered": False, "pane": pane, "timeout_ms": ms, "error": why})
+
+
 def cmd_arm(a):
     lane, pane, task = opt(a, "--lane"), opt(a, "--pane"), opt(a, "--task")
     run, data, phase, grep = opt(a, "--run"), opt(a, "--data"), opt(a, "--phase"), opt(a, "--commit-grep")
@@ -522,10 +606,27 @@ def self_test():
                     "elif a[:2] == ['notification', 'show']:\n"
                     "    open(os.path.join(base, 'notes.log'), 'a').write(' '.join(a[2:]) + chr(10))\n"
                     "    print(json.dumps({'result': {'ok': True}}))\n"
+                    "elif a[:2] == ['agent', 'prompt']:\n"
+                    "    open(os.path.join(base, 'calls.log'), 'a').write(' '.join(a) + chr(10))\n"
+                    "    hang = os.path.join(base, 'hang.txt')\n"
+                    "    if os.path.exists(hang):\n"
+                    "        import time; time.sleep(int(open(hang).read().strip()))\n"
+                    "    sys.stdout.write(open(os.path.join(base, 'prompt_out.txt')).read())\n"
+                    "    sys.stderr.write(open(os.path.join(base, 'prompt_err.txt')).read())\n"
+                    "    sys.exit(int(open(os.path.join(base, 'prompt_rc.txt')).read().strip() or '0'))\n"
+                    "elif a[:2] == ['pane', 'list']:\n"
+                    "    open(os.path.join(base, 'calls.log'), 'a').write(' '.join(a) + chr(10))\n"
+                    "    sys.stdout.write(open(os.path.join(base, 'pane_list_out.txt')).read())\n"
+                    "    sys.exit(0)\n"
                     "else:\n"
                     "    print(json.dumps({'result': {}}))\n")
         os.chmod(os.path.join(bin_, "herdr"), 0o755)
         os.environ["FAKE_HERDR_DIR"] = tmp
+        # canned dispatch replies (dispatch tests rewrite these per case)
+        open(os.path.join(tmp, "prompt_out.txt"), "w").write('{"result": {"agent": {"agent_status": "idle"}}}\n')
+        open(os.path.join(tmp, "prompt_err.txt"), "w").write("")
+        open(os.path.join(tmp, "prompt_rc.txt"), "w").write("0")
+        open(os.path.join(tmp, "pane_list_out.txt"), "w").write('{"result": {"panes": []}}\n')
         # fake herdr socket: records pane.report_metadata, answers {"ok": true}
         import socketserver
 
@@ -697,6 +798,73 @@ def self_test():
         assert watch_of("H7")["verdict"] == "STALL"
         assert any("status review kept" in e.get("text", "") for e in events())
 
+        # dispatch: prompt + delivery check in one call, against the fake herdr ($MK_HERDR)
+        calls = os.path.join(tmp, "calls.log")
+
+        def set_canned(fname, text):
+            open(os.path.join(tmp, fname), "w").write(text)
+
+        def last_call():
+            return open(calls).read().splitlines()[-1]
+
+        # (a) the wait settles → delivered:true; the argv herdr saw is exactly the spec's
+        set_canned("prompt_out.txt", '{"result": {"agent": {"agent_status": "idle"}}}\n')
+        set_canned("prompt_err.txt", "")
+        set_canned("prompt_rc.txt", "0")
+        r = cli("dispatch", "--pane", pane_of("H1"), "--text", "Read brief.md", extra={"MK_HERDR": ""})
+        assert r["ok"] is True and r["delivered"] is True and r["agent_status"] == "idle", r
+        assert r["timeout_ms"] == 25000, r
+        assert last_call() == f"agent prompt {pane_of('H1')} Read brief.md --wait --timeout 25000", last_call()
+        r = cli("dispatch", "--pane", pane_of("H1"), "--text", "go", "--timeout-ms", "1234",
+                extra={"MK_HERDR": os.path.join(bin_, "herdr")})
+        assert r["ok"] and last_call().endswith("--timeout 1234"), last_call()
+        # (b) timeout + pane list shows working → delivered:true (the prompt is still in flight)
+        set_canned("prompt_out.txt", '{"error": {"code": "timeout", "message": "timed out waiting"}}\n')
+        set_canned("prompt_rc.txt", "1")
+        set_canned("pane_list_out.txt", json.dumps({"result": {"panes": [
+            {"pane_id": pane_of("H1"), "agent_status": "working"}]}}) + "\n")
+        r = cli("dispatch", "--pane", pane_of("H1"), "--text", "go")
+        assert r["ok"] is True and r["delivered"] is True and r["pane_state"] == "working", r
+        assert r["timed_out"] is True and "timeout" in r["herdr_error"], r
+        # (c) timeout + agent_prompt_stalled (or the pane gone from the list) → delivered:false
+        set_canned("pane_list_out.txt", json.dumps({"result": {"panes": [
+            {"pane_id": pane_of("H1"), "agent_status": "agent_prompt_stalled"}]}}) + "\n")
+        r = cli("dispatch", "--pane", pane_of("H1"), "--text", "go")
+        assert r["ok"] is False and r["delivered"] is False, r
+        assert r["pane_state"] == "agent_prompt_stalled" and "timeout" in r["error"], r
+        set_canned("pane_list_out.txt", '{"result": {"panes": []}}\n')
+        r = cli("dispatch", "--pane", pane_of("H1"), "--text", "go")
+        assert r["ok"] is False and r["delivered"] is False and r["pane_state"] is None, r
+        # a stall reported as the wait result (rc 0) takes the same pane-list path
+        set_canned("prompt_out.txt", '{"result": {"agent": {"agent_status": "agent_prompt_stalled"}}}\n')
+        set_canned("prompt_rc.txt", "0")
+        set_canned("pane_list_out.txt", json.dumps({"result": {"panes": [
+            {"pane_id": pane_of("H1"), "agent_status": "working"}]}}) + "\n")
+        r = cli("dispatch", "--pane", pane_of("H1"), "--text", "go")
+        assert r["ok"] is True and r["delivered"] is True and r["timed_out"] is True, r
+        # (d) any other failure → ok:false carrying herdr's own words; usage errors stay exit 2
+        set_canned("prompt_out.txt", "")
+        set_canned("prompt_err.txt", "herdr: no such pane wZ:gone")
+        set_canned("prompt_rc.txt", "1")
+        r = cli("dispatch", "--pane", "wZ:gone", "--text", "go")
+        assert r["ok"] is False and r["delivered"] is False and "no such pane" in r["error"], r
+        assert cli("dispatch", "--pane", "wD:h1", code=2)["ok"] is False  # --text missing
+        # (e) the subprocess itself times out (a hanging herdr): the pane's state still decides
+        open(os.path.join(tmp, "hang.txt"), "w").write("35")
+        set_canned("pane_list_out.txt", json.dumps({"result": {"panes": [
+            {"pane_id": pane_of("H1"), "agent_status": "working"}]}}) + "\n")
+        r = cli("dispatch", "--pane", pane_of("H1"), "--text", "go", "--timeout-ms", "100")
+        assert r["ok"] is True and r["delivered"] is True and r["timed_out"] is True, r
+        assert r["pane_state"] == "working", r
+        os.unlink(os.path.join(tmp, "hang.txt"))
+        # a herdr that cannot even run: the same pane-state check, not working → not delivered
+        open(os.path.join(tmp, "noexec"), "w").write("not a binary\n")
+        set_canned("pane_list_out.txt", '{"result": {"panes": []}}\n')
+        r = cli("dispatch", "--pane", pane_of("H1"), "--text", "go",
+                extra={"MK_HERDR": os.path.join(tmp, "noexec")})
+        assert r["ok"] is False and r["delivered"] is False and r["timed_out"] is True, r
+        assert "PermissionError" in r["error"], r
+
         # disarm: removes the watch file, the lane stops matching events
         r = cli("disarm", "--lane", lanes["H3"])
         assert r["ok"] and r["removed"] is True and not os.path.exists(os.path.join(lanes["H3"], WATCH))
@@ -723,6 +891,8 @@ def main():
             return cmd_arm(rest)
         if cmd == "event":
             return cmd_event()
+        if cmd == "dispatch":
+            return cmd_dispatch(rest)
         if cmd == "sweep":
             return cmd_sweep(rest)
         if cmd == "disarm":
