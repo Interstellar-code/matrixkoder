@@ -827,3 +827,47 @@ test('two session.start arm exactly one sweep timer', { plugins: [worldFixtures]
   await clock.advance(120_000)
   expect(sweeps.length).toBe(1)
 })
+
+// ---------- every active run renders, not only the newest ----------
+
+test('two active runs render both Run headers and both Plan lists, newest first', { plugins: [worldFixtures] }, async ($, on) => {
+  const files = worldFiles()
+  // a second, OLDER active run: the fixture body under its own id and feature,
+  // with W0's title replaced so each Plan list has a row only it shows
+  const second = JSON.parse(files['/fixtures/run.json'] ?? '{}') as { id?: string; feature?: string; tasks?: unknown[] }
+  second.id = 'mk-ui'
+  second.feature = 'ui-polish'
+  const w0 = second.tasks?.[0]
+  if (typeof w0 === 'object' && w0 !== null) (w0 as { title?: string }).title = 'mk-ui header pass'
+  files[`${DATA_DIR}/runs/mk-ui/run.json`] = JSON.stringify(second)
+  const index = JSON.stringify([
+    { id: 'wfv2', feature: 'workflows-v2', status: 'active', started: '2026-10-07T16:00:00+02:00', ended: null },
+    { id: 'mk-ui', feature: 'ui-polish', status: 'active', started: '2026-10-07T14:30:00+02:00', ended: null },
+    { id: 'mk-p0', feature: 'mod spikes', status: 'done', started: '2026-10-01T10:00:00+02:00', ended: '2026-10-02T10:00:00+02:00' },
+  ])
+  files['/fixtures/index.json'] = index // worldFixtures re-copies this on session.start
+  files[RUNS_INDEX] = index
+  mockFs(on, files)
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  expect(await ui.find({ text: /workflows-v2/ }), 'newest run header').toBeTruthy()
+  expect(await ui.find({ text: /ui-polish/ }), 'second run header').toBeTruthy()
+  expect(await ui.find({ text: /wizard split/ }), 'newest plan list').toBeTruthy() // W0's fixture title
+  expect(await ui.find({ text: /mk-ui header pass/ }), 'second plan list').toBeTruthy() // W0 retitled in the second run
+  // walk the drawn tree: the newest run's header and plan row come first
+  const texts: string[] = []
+  const walk = (n: unknown): void => {
+    if (typeof n !== 'object' || n === null) return
+    const node = n as { type?: string; children?: unknown[] }
+    if (node.type === 'Text' && Array.isArray(node.children)) {
+      const own = node.children.map(c => (typeof c === 'string' ? c : '')).join('')
+      if (own) texts.push(own)
+    }
+    if (Array.isArray(node.children)) node.children.forEach(walk)
+  }
+  walk(await ui.drawn())
+  const flat = texts.join('\n')
+  expect(flat.indexOf('workflows-v2'), 'newest header first').toBeLessThan(flat.indexOf('ui-polish'))
+  expect(flat.indexOf('wizard split'), 'newest plan row first').toBeLessThan(flat.indexOf('mk-ui header pass'))
+})
