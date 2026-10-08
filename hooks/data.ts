@@ -161,23 +161,29 @@ export function mkSnapshot(now: number, dataDir: string | null, run: MkRun | nul
 
 /** `agents:` block of matrixkoder.yaml: names of available: true agents, herdr excluded.
  *  Accepts any indent >= 2 spaces and block-style or flow-style entries.
- *  Returns null when the yaml or the block is absent or unparseable ("no filter"), never []. */
+ *  Returns null when the yaml or the block is absent or unparseable ("no filter"),
+ *  [] when the agents block is present but every agent is available: false (show no agents). */
 export function parseYamlAgents(yaml: string): readonly string[] | null {
   const out: string[] = []
   let inBlock = false
+  let sawBlock = false
+  let sawAgent = false
   let agentIndent: number | null = null
   let currentAgent: string | null = null
   let currentAvailable: boolean | null = null
 
   const commit = () => {
-    if (currentAgent && currentAvailable === true && currentAgent !== 'herdr' && currentAgent !== 'checked_at') {
+    if (currentAgent && currentAgent !== 'herdr' && currentAgent !== 'checked_at' && currentAvailable === true) {
       out.push(currentAgent)
     }
   }
 
   for (const raw of yaml.split(/\r?\n/)) {
     if (!inBlock) {
-      if (/^agents:\s*(#.*)?$/.test(raw)) inBlock = true
+      if (/^agents:\s*(#.*)?$/.test(raw)) {
+        inBlock = true
+        sawBlock = true
+      }
       continue
     }
     const line = raw.trim()
@@ -191,6 +197,7 @@ export function parseYamlAgents(yaml: string): readonly string[] | null {
       commit()
       agentIndent = indent
       currentAgent = m[2]
+      sawAgent = true
       currentAvailable = null
       const rest = (m[3] ?? '').replace(/\s+#.*$/, '').trim()
       if (/\bavailable:\s*true\b/.test(rest)) {
@@ -207,7 +214,9 @@ export function parseYamlAgents(yaml: string): readonly string[] | null {
     }
   }
   commit()
-  return out.length > 0 ? out : null
+  // block present with at least one named agent but none enabled = show no agents;
+  // absent / empty / unparseable block = no filter (null)
+  return sawBlock && sawAgent ? out : null
 }
 
 /** `usage:` → `providers:` list of matrixkoder.yaml: a `  providers: [a, b]` flow list or a `- item` block list. null when absent. */

@@ -592,7 +592,14 @@ type UsageRow = {
   exhausted: boolean
   /** the whole ledger entry is status 'n/a' (provider error) — the only case the 5h column shows n/a */
   na: boolean
-  sub: { name: string; pct: number | null; weekPct: number | null; reset: string | null; exhaustedUntil: string | null; exhausted: boolean }[]
+  /** true when this row is the agent header that only labels the group */
+  header: boolean
+  sub: { name: string; pct: number | null; weekPct: number | null; reset: string | null; exhaustedUntil: string | null; exhausted: boolean; status?: string; error?: string; hint?: string | null }[]
+}
+
+const POOL_HINT: Record<string, string> = {
+  zai: 'set the z.ai key in CodexBar',
+  ollama: 'sign in at ollama.com',
 }
 
 function usageRows(snap: MkSnapshot, compact: boolean): UsageRow[] {
@@ -602,6 +609,13 @@ function usageRows(snap: MkSnapshot, compact: boolean): UsageRow[] {
   const isExhausted = (until: string | null | undefined): boolean => {
     const t = Date.parse(until ?? '')
     return Number.isFinite(t) && now > 0 && t > now
+  }
+  // a setup hint only for a pool with no numbers yet: once the plan reports usage, its bars show
+  const poolHint = (name: string, error?: string, hasData = false): string | null => {
+    if (hasData) return null
+    if (POOL_HINT[name]) return POOL_HINT[name]
+    if (error) return error
+    return null
   }
   return names.flatMap(name => {
     const a = agents[name]
@@ -613,38 +627,78 @@ function usageRows(snap: MkSnapshot, compact: boolean): UsageRow[] {
         name,
         label: name,
         hint: name === 'opencode' ? 'no usage — enable zai in CodexBar' : 'no usage yet',
-        pct: null, weekPct: null, reset: null, exhaustedUntil: null, exhausted: false, na: false, sub: [],
+        pct: null, weekPct: null, reset: null, exhaustedUntil: null, exhausted: false, na: false, header: false, sub: [],
       } as UsageRow]
     }
     const pools = Object.entries(a.pools ?? {})
-    // primary = the configured pool when present, else the first (schema: the
-    // agent-level fields mirror the primary pool); the rest render as sub-rows
+    // claude keeps its main row = default pool and fable as a sub-row
     const configured = PRIMARY_POOL[name] ?? 'default'
-    const primary = pools.some(([pname]) => pname === configured) ? configured : pools[0]?.[0]
-    const sub = pools
-      .filter(([pname]) => pname !== primary)
-      .map(([pname, p]) => ({
-        name: compact ? pname.slice(0, 6) : pname,
-        pct: p.five_hour?.used_pct ?? null,
-        weekPct: p.weekly?.used_pct ?? null,
-        reset: p.five_hour?.resets_at ?? p.weekly?.resets_at ?? null,
-        exhaustedUntil: p.exhausted_until ?? null,
-        exhausted: isExhausted(p.exhausted_until),
-      }))
+    const primary = name === 'claude' ? 'default' : (pools.some(([pname]) => pname === configured) ? configured : pools[0]?.[0])
+    const subs = pools.map(([pname, p]) => ({
+      name: compact ? pname.slice(0, 6) : pname,
+      pct: p.five_hour?.used_pct ?? null,
+      weekPct: p.weekly?.used_pct ?? null,
+      reset: p.five_hour?.resets_at ?? p.weekly?.resets_at ?? null,
+      exhaustedUntil: p.exhausted_until ?? null,
+      exhausted: isExhausted(p.exhausted_until),
+      status: (p as { status?: string }).status,
+      error: (p as { error?: string }).error,
+      hint: poolHint(compact ? pname.slice(0, 6) : pname, (p as { error?: string }).error, p.five_hour != null || p.weekly != null),
+    }))
+    // claude with sub-pools: single row layout, main row aggregates all models
+    if (name === 'claude' && pools.length > 1) {
+      const sub = subs.filter(s => s.name !== primary)
+      return [{
+        name,
+        label: !compact ? 'claude (all)' : name,
+        hint: null,
+        pct: a.five_hour?.used_pct ?? null,
+        weekPct: a.weekly?.used_pct ?? null,
+        reset: a.five_hour?.resets_at ?? a.weekly?.resets_at ?? null,
+        exhaustedUntil: a.exhausted_until ?? null,
+        exhausted: isExhausted(a.exhausted_until),
+        na: a.status === 'n/a',
+        header: false,
+        sub: sub.map(s => ({ ...s, hint: poolHint(s.name, s.error, s.pct != null || s.weekPct != null) })),
+      } as UsageRow]
+    }
+    // every other multi-pool agent: header row + one sub-row per pool
+    if (pools.length > 1) {
+      return [
+        {
+          name,
+          label: name,
+          hint: null,
+          pct: null, weekPct: null, reset: null, exhaustedUntil: null, exhausted: false, na: false, header: true, sub: [],
+        } as UsageRow,
+        ...subs.map(s => ({
+          name: `${name}:${s.name}`,
+          label: `  └ ${compact ? s.name.slice(0, 6) : s.name}`,
+          hint: poolHint(s.name, s.error, s.pct != null || s.weekPct != null),
+          pct: s.pct,
+          weekPct: s.weekPct,
+          reset: s.reset,
+          exhaustedUntil: s.exhaustedUntil,
+          exhausted: s.exhausted,
+          na: s.status === 'n/a',
+          header: false,
+          sub: [],
+        } as UsageRow)),
+      ]
+    }
+    // single-pool agent
     return [{
       name,
-      // claude's main row aggregates every model pool; other agents' main row is one pool
-      label: name === 'claude' && sub.length > 0 && !compact ? 'claude (all)' : name,
+      label: name,
       hint: null,
       pct: a.five_hour?.used_pct ?? null,
       weekPct: a.weekly?.used_pct ?? null,
       reset: a.five_hour?.resets_at ?? a.weekly?.resets_at ?? null,
       exhaustedUntil: a.exhausted_until ?? null,
-      // agent red only on the agent-level exhausted_until (schema: set only
-      // when every pool is exhausted — a lone secondary pool stays a sub-row)
       exhausted: isExhausted(a.exhausted_until),
       na: a.status === 'n/a',
-      sub,
+      header: false,
+      sub: [],
     } as UsageRow]
   })
 }
@@ -663,17 +717,23 @@ function UsageSection(els: Els, snap: MkSnapshot, compact: boolean) {
   const weekCol = (pct: number | null): string => (pct == null ? rightCol('—', NUM_W) : rightCol(`${Math.round(pct)}%`, NUM_W))
   const resetCol = (iso: string | null): string => rightCol(resetStr(iso, snap.now, compact), RESET_W)
 
-  const row = (keyId: string, name: string, nameColor: string | undefined, boldName: boolean, pct: number | null, weekPct: number | null, resetIso: string | null, exhausted: boolean, exhaustedUntil: string | null, na: boolean) => {
+  const row = (keyId: string, name: string, nameColor: string | undefined, boldName: boolean, pct: number | null, weekPct: number | null, resetIso: string | null, exhausted: boolean, exhaustedUntil: string | null, na: boolean, isHeader: boolean) => {
     const color = pctColor(pct, exhausted)
     const resetIsoShown = exhausted && exhaustedUntil ? exhaustedUntil : resetIso
     return (
       <Box key={keyId} flexDirection="row" gap={0}>
         <Text color={nameColor} bold={boldName}>{leftCol(name, NAME_W)}</Text>
-        <Text color={color} bold={exhausted}>{bar(pct, barW)}</Text>
-        <Text color={pct == null ? 'gray' : color} bold={exhausted}>{pctCol(pct, na)}</Text>
-        {!compact && <Text dimColor={true}>{weekCol(weekPct)}</Text>}
-        <Text dimColor={!exhausted} color={exhausted ? 'red' : undefined} bold={exhausted}>{resetCol(resetIsoShown)}</Text>
-        {exhausted && <Text color="red" bold={true}>⊘</Text>}
+        {isHeader ? (
+          <Text dimColor={true}>{' '.repeat(barW + NUM_W + (compact ? 0 : NUM_W) + RESET_W)}</Text>
+        ) : (
+          [
+            <Text key="bar" color={color} bold={exhausted}>{bar(pct, barW)}</Text>,
+            <Text key="pct" color={pct == null ? 'gray' : color} bold={exhausted}>{pctCol(pct, na)}</Text>,
+            ...(compact ? [] : [<Text key="week" dimColor={true}>{weekCol(weekPct)}</Text>]),
+            <Text key="reset" dimColor={!exhausted} color={exhausted ? 'red' : undefined} bold={exhausted}>{resetCol(resetIsoShown)}</Text>,
+            ...(exhausted ? [<Text key="ex" color="red" bold={true}>⊘</Text>] : []),
+          ]
+        )}
       </Box>
     )
   }
@@ -692,9 +752,11 @@ function UsageSection(els: Els, snap: MkSnapshot, compact: boolean) {
         <Box key={r.name} flexDirection="column">
           {r.hint != null
             ? <Text dimColor={true}>{leftCol(r.label, NAME_W)}{r.hint}</Text>
-            : row(r.name, leftCol(r.label, NAME_W), AGENT_COLOR[r.name] ?? 'cyan', r.exhausted, r.pct, r.weekPct, r.reset, r.exhausted, r.exhaustedUntil, r.na)}
+            : row(r.name, leftCol(r.label, NAME_W), AGENT_COLOR[r.name] ?? 'cyan', r.exhausted, r.pct, r.weekPct, r.reset, r.exhausted, r.exhaustedUntil, r.na, r.header)}
           {r.sub.map(p => (
-            row(`${r.name}:${p.name}`, `  └ ${compact ? p.name.slice(0, 6) : p.name}`, undefined, false, p.pct, p.weekPct, p.reset, p.exhausted, p.exhaustedUntil, false)
+            p.hint != null
+              ? <Text key={`${r.name}:${p.name}`} dimColor={true}>{leftCol(`  └ ${compact ? p.name.slice(0, 6) : p.name}`, NAME_W)}{p.hint}</Text>
+              : row(`${r.name}:${p.name}`, `  └ ${compact ? p.name.slice(0, 6) : p.name}`, undefined, false, p.pct, p.weekPct, p.reset, p.exhausted, p.exhaustedUntil, false, false)
           ))}
         </Box>
       ))}

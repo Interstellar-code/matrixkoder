@@ -96,13 +96,26 @@ python3 scripts/mk-usage.py --once
 
 Other options: `--watch --interval N`, `--out PATH`, `--providers a,b`, `--self-test`. When the project's `matrixkoder.yaml` lists `usage.providers`, the plugin polls exactly those.
 
-The provider list holds CodexBar ids directly: `claude`, `codex`, `antigravity` (CodexBar `agy`), `zai` (OpenCode on the Z.AI plan), `opencode` (OpenCode Zen), `opencodego` (`opencode-go`). The wizard pre-selects `zai` when your opencode agent is on the Z.AI plan. If a provider errors, its entry is `n/a` instead of failing the whole poll. Codex on an API key has no quota to read, so expect `n/a` there.
+The provider list holds CodexBar ids directly: `claude`, `codex`, `antigravity` (CodexBar `agy`), `zai` (OpenCode on the Z.A.I plan), `opencode` (OpenCode Zen), `opencodego` (OpenCode Go plan), `ollama`. The wizard pre-selects `zai` when your opencode agent is on the Z.A.I plan.
+
+OpenCode plans are tracked as separate pools under one `opencode` agent so they do not overwrite each other:
+
+| CodexBar provider | Pool | What it needs |
+|---|---|---|
+| `zai` | `zai` | a z.ai API key |
+| `opencode` | `zen` | OpenCode Zen sign-in |
+| `opencodego` | `go` | OpenCode Go sign-in |
+| `ollama` | `ollama` | an ollama.com session |
 
 For z.ai, store the key in CodexBar yourself (never paste it into the chat):
 
 ```bash
 printf '%s' "$Z_AI_API_KEY" | codexbar config set-api-key --provider zai --stdin
 ```
+
+For Ollama, sign in through your browser at [ollama.com](https://ollama.com) so CodexBar can read the session cookie.
+
+If a provider errors, only that pool becomes `n/a` with a setup hint; the other OpenCode pools stay visible. Codex on an API key has no quota to read, so expect `n/a` there.
 
 The orchestrator reads this ledger when routing: a pool near its limit is skipped, and `⊘` appears on the dashboard.
 
