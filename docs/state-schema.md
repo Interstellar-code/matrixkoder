@@ -27,10 +27,12 @@ with offset, seconds precision (`2026-10-07T20:09:01+02:00`). Unknown values are
 ## `runs/index.json`
 
 ```json
-[{ "id": "mk-p1", "feature": "MatrixKoder P1", "status": "active", "started": "2026-10-07T20:09:00+02:00", "ended": null }]
+[{ "id": "mk-p1", "feature": "MatrixKoder P1", "status": "active", "started": "2026-10-07T20:09:00+02:00", "ended": null, "plan": "plan-link" }]
 ```
 
 `status`: `active | done | archived`. Sorted by `started`. Archive is a flag; the folder never moves.
+`plan` (C4): the plan id of the run this entry was built from (`run init --plan`); `null` for plan-less
+and legacy path-only runs.
 
 ## `run.json`
 
@@ -42,6 +44,9 @@ with offset, seconds precision (`2026-10-07T20:09:01+02:00`). Unknown values are
   "branch": "main",
   "head_sha": null,
   "plan": ".matrixkoder/plans/matrixkoder.md",
+  "plan_id": "plan-link",
+  "plan_sha": "9f2c7ab1c8...",
+  "plan_status": "running",
   "status": "active",
   "stage": 5,
   "next": "watch P1",
@@ -72,6 +77,8 @@ with offset, seconds precision (`2026-10-07T20:09:01+02:00`). Unknown values are
 | `status` | `active \| done \| archived` | `ended` is set when it leaves `active`, cleared when it returns. `run set --status` takes `active\|done`; `archived` only via `run archive` |
 | `stage` | int | loop stage 0–12 (SKILL.md) |
 | `head_sha` | string \| null | optional (design §7.2): the run branch's current commit; the dashboard shows the branch only while absent |
+| `plan` | string \| null | the plan file path, as passed to `run init --plan` (legacy runs store only this) |
+| `plan_id`, `plan_sha`, `plan_status` | string \| null | **C4 plan link**: the plan's id; the sha256 of the plan file bytes taken from a final `mk-plan.py parse` **after** the `set --status running` + `add-run` mutations (so the board's ⚠ does not fire at birth); the plan status then (`running`). `plan sync --apply` refreshes `plan_sha`/`plan_status`; the last plan-linked run set `done` flips `plan_status` to `done` (best-effort). `null` on plan-less runs |
 | `next` | string \| null | next action, shown in the dashboard header and resume section |
 | `waiting` | object \| null | the one question waiting on the user: `question`, `options` (string[]), `rec` (string \| null), `since` (ts) |
 | `tasks` | array | task objects in insertion order (below) |
@@ -96,6 +103,7 @@ with offset, seconds precision (`2026-10-07T20:09:01+02:00`). Unknown values are
 | `verdict` | string \| null | latest review verdict; also copied to the current round's `verdict` |
 | `round` | int | current round number (0 = none yet) |
 | `rounds` | array | `{n, kind: build\|fix\|takeover, cause, verdict, sha, started}` |
+| `plan_phase`, `route`, `lane_group` | string \| null | **C4**: set on a *phase* task created by `run init --plan` — the plan phase id, its pinned `route` (`""` = Jev decides, stored `null`), and its `lane_group` (phases sharing a value share one worktree). `null` on ad-hoc tasks (`task add`) and children || `plan_task` | string \| null | **C4**: set on a *child* task created from a `[[phase.task]]` — the plan task id (`P1.1`); its `parent` is the phase task. `null` on ad-hoc and phase tasks |
 
 ## `events.jsonl` line
 
@@ -262,7 +270,8 @@ everything else `default`.
 
 | Command | Flags |
 |---|---|
-| `run init` | `--id ID --feature F --branch B [--plan PATH]` |
+| `run init` | `--id ID --feature F --branch B [--plan PATH --force]` — with `--plan`: the plan tool (`mk-plan.py`, or `$MK_PLAN_CMD`) `check` must pass and its status be `approved` (refused before any local write); `--force` overrides an unapproved status and logs an event. The plan then gets `set --status running` + `add-run --run ID`, the run stores `plan_id`/`plan_sha`/`plan_status`, and phase + child tasks are created through the `task add` path |
+| `plan sync` | `[--run ID] [--apply]` — diff the run's plan against its tasks (dry run by default, nothing written): new phase/task → added via the add path; changed `title`/`wave`/`owned`/`deps` on a `planned\|routed` task → updated, on a started task → warning only; removed → warning, **never deleted**. `--apply` stores the new `plan_sha` and writes exactly ONE summary event (the reused paths' per-task events are suppressed) |
 | `run list` / `run get` | `run get [--id ID \| ID]` (default: the single active run) |
 | `run set` | `[--id ID] [--next TEXT] [--status active\|done]` (at least one) |
 | `run stage` / `run archive` | `run stage N` (N >= 0, `[--id ID]`); `run archive --id ID` or `run archive ID` |
@@ -290,3 +299,17 @@ lane-watch exit → task status (with `--task --data`, both required together): 
 `QUOTA → quota`, `STALL → stalled`, `PROVIDER → provider`, `BLOCKED → blocked` — only while the task is
 `dispatched|building|stalled|quota|provider|blocked`; otherwise the status is kept and a `note` event is
 logged. `DEV_SERVER`, `ERROR`, `WATCH_EXPIRED` only append a `note` event.
+
+## Plan link (C4)
+
+`mk-state.py` never imports `mk-plan.py`; it runs it as a subprocess (`$MK_PLAN_CMD` overrides the
+command) and consumes its one JSON line (`parse`, `check`, `set --status`, `add-run`). Stored fields:
+`run.json` `plan_id`/`plan_sha`/`plan_status` + index `plan`; phase task `plan_phase`/`route`/
+`lane_group`; child task `plan_task` (its `parent` names the phase task). All `null` for plan-less
+runs/tasks; a legacy run keeps its path-only `plan` field and the plain `plan: \`path\`` board line.
+The board of a plan-linked run shows `plan: \`id\` · status · sha \`…12\`` and, when the plan file's
+current sha256 (plain read) differs from `plan_sha`, a `⚠ plan file changed since run start` line —
+an unreadable plan file means no warning and no crash. Setting the **last** run of a plan `done`
+runs `set --status done` on the plan and flips the run's `plan_status` (best-effort, never fatal; a
+plan-tool error rides back as a `warning` in the `run set` JSON).
+`task add` stays for ad-hoc tasks.

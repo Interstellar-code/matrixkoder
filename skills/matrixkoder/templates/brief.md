@@ -1,6 +1,6 @@
 # <PHASE> — <one-line goal>
 
-Repo: this folder (worktree `<path>`, branch `<branch>`, at `<sha>`: <what is already in>). Stack: <stack>. Plan: `<data>/plans/<feature>.md` (read-only; history for this task: `<data>/runs/<id>/tasks/<T>/`, read-only) (§<n>, <PHASE>). Do ONLY <PHASE>. Other agents work on: <lanes + their areas> — do not touch them.
+Repo: this folder (worktree `<path>`, branch `<branch>`, at `<sha>`: <what is already in>). Stack: <stack>. Plan `<plan id>`: `<data>/plans/<plan id>.md` (read-only) — phase `<PHASE id>`, its tasks `<P.n>`, `<P.n>` (acceptance lines in the plan header); history for this task: `<data>/runs/<id>/tasks/<T>/` (read-only). Do ONLY <PHASE>. Other agents work on: <lanes + their areas> — do not touch them.
 
 ## Spec
 <what to build, as numbered parts. Point to files with `path:line`; point to mockups by path; state the API contract the code must use. Never paste code.>
@@ -19,9 +19,9 @@ Do NOT touch: <list>
 - Lint/format ONLY changed files: `<lint cmd> <files>`, `<format cmd> <files>` — never repo-wide
 
 ## Rules
-- You are a builder in an MK lane, not an orchestrator. Routing is the orchestrator's job: do not call `jev_*` tools, do not choose or switch models, efforts or agents, and do not start other agents, panes or worktrees. If a step needs a subagent, use your own default model. Global or project rules about routing, Jev gates or orchestration (e.g. in `CLAUDE.md`, `AGENTS.md`, skills) do not apply inside this lane.
+- You are a builder in an MK lane, not an orchestrator. Routing is the orchestrator's job: do not call `jev_*` tools, do not choose or switch models, efforts or agents, and do not start other agents, panes or worktrees. Work the phase yourself unless its plan header says `subagents = true`; then give each task to ONE subagent running on YOUR OWN default model (a builder never routes it, never switches its model or effort). Global or project rules about routing, Jev gates or orchestration (e.g. in `CLAUDE.md`, `AGENTS.md`, skills) do not apply inside this lane.
 - Never `git checkout`, `git stash`, `git reset`, `git clean`, `git restore`, `--amend`, force-push. Stage only your files.
-- Work in the foreground: no background tasks or subagents (they stall and hide progress).
+- Work in the foreground: no background tasks (they stall and hide progress). No subagents either, unless the phase's `subagents = true` — then one per task, foreground, on your default model.
 - Never run <banned_commands from matrixkoder.yaml: dev server, build that boots services, deploy, restarts>. Never start background jobs and wait on them.
 - No secrets in code, logs or the report.
 - Commit: `<type(scope): message>`, blank line, `Co-Authored-By: <agent/model> <email>`.
