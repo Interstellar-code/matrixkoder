@@ -21,8 +21,11 @@ activity too: a builder running tests or a revert/re-apply proof without touchin
 With --then-send, on DONE it dispatches "Read and follow <BRIEF_PATH> exactly ..." to the same agent
 via the herdr skill's herdr-ask.py (which refuses busy agents, so we only send once idle).
 With --task and --data (both or neither), every exit writes the task status via mk-state (DONE→verifying,
-QUOTA→quota, STALL→stalled, PROVIDER→provider, BLOCKED→blocked) when the task is still in a watched status
-(dispatched building stalled quota provider blocked); otherwise, and for other exits, it only logs an event.
+QUOTA→quota, STALL→stalled, PROVIDER→provider, BLOCKED→blocked) when the target is still in a watched
+status (dispatched building stalled quota provider blocked); otherwise, and for other exits, it only logs
+an event. A parent task is never written — mk-state refuses status= on it ("status rolls up from
+children") — every child gets the verdict instead, and each mk-state reply is checked: an ok:false error
+always lands in this script's own JSON output, never dropped.
 Exit states (one JSON line): DONE | DONE_SENT | QUOTA | PROVIDER | STALL | BLOCKED | DEV_SERVER | ERROR | WATCH_EXPIRED.
 Run in the background (30 min default; foreground calls must stay under their 10-min timeout); re-arm on WATCH_EXPIRED.
 """
@@ -102,32 +105,98 @@ def decide(h, subj, rx, report_ok, text, phase, stall_min):
     return None, []
 
 
+def child_tasks(task, data, run=None):
+    """Stored ids of <task>'s status-holding descendants — every child, recursing past children
+    that are parents themselves (mk-state refuses status= on ANY parent: "status rolls up from
+    children"; intermediate parents get the verdict by roll-up, leaves by the write). [] for a
+    leaf, an unknown task, an unreadable or ambiguous run: the mk-state write itself then decides,
+    exactly as before. Mirrors mk-state's run pick: --run names the run; else the single active
+    run; with several, the one that owns the task (ids match case-insensitively, as there)."""
+    runs = os.path.join(data, "runs")
+
+    def load(rid):
+        try:
+            with open(os.path.join(runs, rid, "run.json")) as f:
+                j = json.load(f)
+            return j if isinstance(j, dict) else None
+        except (OSError, ValueError):
+            return None
+
+    def owns(j):
+        return isinstance(j.get("tasks"), list) and any(
+            isinstance(t, dict) and str(t.get("id") or "").lower() == task.lower() for t in j["tasks"])
+
+    if run:
+        src = load(run)
+        if src is None or not owns(src):
+            return []
+    else:
+        try:
+            with open(os.path.join(runs, "index.json")) as f:
+                actives = [r["id"] for r in json.load(f)
+                           if isinstance(r, dict) and r.get("status") == "active" and r.get("id")]
+        except (OSError, ValueError):
+            return []
+        owners = [j for j in (load(r) for r in actives) if j and owns(j)]
+        if len(owners) != 1:
+            return []
+        src = owners[0]
+    ts = [t for t in src["tasks"] if isinstance(t, dict) and t.get("id")]
+    pid = next(str(t["id"]) for t in ts if str(t["id"]).lower() == task.lower())
+    # parent stored case-exactly like mk-state's roll-up compares it (c.get("parent") == t["id"])
+    parent_of = lambda tid: [str(c["id"]) for c in ts if c.get("parent") == tid]
+    kids, stack, seen = [], [pid], {pid}
+    while stack:  # walk the subtree; a cyclic hand-edit must not hang this
+        cur = stack.pop()
+        next_ = [k for k in parent_of(cur) if k not in seen]
+        seen.update(next_)
+        stack.extend(next_)
+        if cur != pid and not next_:
+            kids.append(cur)  # a leaf descendant: it can hold a status
+    return [str(t["id"]) for t in ts if str(t["id"]) in kids]  # run.json insertion order
+
+
 def record(out, task, data, run=None):
-    """Write the exit into run state via mk-state. Returns mk-state's JSON reply (or an error dict)."""
+    """Write the exit into run state via mk-state: every child when <task> is a parent (mk-state
+    refuses status= on a parent — "status rolls up from children" — so the children carry the verdict
+    and the parent only rolls up), else the task itself. -> mk-state's reply for one target, or
+    {ok, children, results[, error]} for several; every ok:false reply is reported, never dropped."""
     note = f"lane-watch {out['state']}: " + "; ".join(out.get("evidence") or [out.get("commit") or ""])
     common = ["--data", data, "--by", "lane-watch"] + (["--run", run] if run else [])
     status = STATUS_MAP.get(out["state"])
-    if status:
-        r = subprocess.run([sys.executable, MK_STATE, "task", "get", task, *common], capture_output=True, text=True)
+    targets = child_tasks(task, data, run) or [task]
+    results = []
+    for t in targets:
+        t_note, t_status = note, status
+        if t_status:
+            r = subprocess.run([sys.executable, MK_STATE, "task", "get", t, *common], capture_output=True, text=True)
+            try:
+                cur = json.loads(r.stdout.strip().splitlines()[-1])
+            except (json.JSONDecodeError, IndexError):
+                cur = {"ok": False}
+            if cur.get("ok") and cur["task"]["status"] not in WATCHED:  # late watcher: never overwrite review/merged/...
+                t_note += f" (status {cur['task']['status']} kept)"
+                t_status = None
+        if t_status:
+            pairs = [f"status={t_status}"]
+            if out["state"].startswith("DONE") and out.get("commit"):
+                pairs.append(f"last_commit={out['commit'].split()[0]}")
+            cmd = ["task", "set", t, *pairs, "--note", t_note[:300]]
+        else:
+            cmd = ["event", "--task", t, "--type", "note", "--text", t_note[:300]]
+        r = subprocess.run([sys.executable, MK_STATE, *cmd, *common], capture_output=True, text=True)
         try:
-            cur = json.loads(r.stdout.strip().splitlines()[-1])
+            results.append(json.loads(r.stdout.strip().splitlines()[-1]))
         except (json.JSONDecodeError, IndexError):
-            cur = {"ok": False}
-        if cur.get("ok") and cur["task"]["status"] not in WATCHED:  # late watcher: never overwrite review/merged/...
-            note += f" (status {cur['task']['status']} kept)"
-            status = None
-    if status:
-        pairs = [f"status={status}"]
-        if out["state"].startswith("DONE") and out.get("commit"):
-            pairs.append(f"last_commit={out['commit'].split()[0]}")
-        cmd = ["task", "set", task, *pairs, "--note", note[:300]]
-    else:
-        cmd = ["event", "--task", task, "--type", "note", "--text", note[:300]]
-    r = subprocess.run([sys.executable, MK_STATE, *cmd, *common], capture_output=True, text=True)
-    try:
-        return json.loads(r.stdout.strip().splitlines()[-1])
-    except (json.JSONDecodeError, IndexError):
-        return {"ok": False, "error": (r.stderr or r.stdout).strip()[-200:]}
+            results.append({"ok": False, "error": (r.stderr or r.stdout).strip()[-200:]})
+    if len(results) == 1:
+        return results[0]
+    bad = [f"{t}: {x.get('error') or 'mk-state replied ok:false without an error'}"
+           for t, x in zip(targets, results) if not x.get("ok")]
+    res = {"ok": not bad, "children": targets, "results": results}
+    if bad:
+        res["error"] = "; ".join(bad)[:300]
+    return res
 
 
 def watch(a):
@@ -255,6 +324,52 @@ def self_test():
         assert r["ok"] and "event" in r and "status review kept" in r["event"]["text"]
         assert json.load(open(os.path.join(data, "runs", "r1", "run.json")))["tasks"][0]["status"] == "review"
 
+        # a parent task: mk-state refuses status= on it ("status rolls up from children"), so the
+        # verdict goes to every child, never the parent (which only rolls up)
+        mks("task", "add", "--id", "P2", "--title", "group")
+        for c in ("C1", "C2", "C3"):
+            mks("task", "add", "--id", c, "--title", c, "--parent", "P2")
+            mks("task", "set", c, "status=building")
+
+        def statuses():
+            run_ = json.load(open(os.path.join(data, "runs", "r1", "run.json")))
+            return {t["id"]: t for t in run_["tasks"]}
+
+        r = record({"state": "DONE", "commit": good, "evidence": ["commit x"]}, "P2", data)
+        assert r["ok"] and r["children"] == ["C1", "C2", "C3"], r
+        st = statuses()
+        assert [st[c]["status"] for c in ("C1", "C2", "C3")] == ["verifying"] * 3, st
+        assert st["C1"]["last_commit"] == "abc123" and st["P2"]["status"] == "verifying", st
+        for c in ("C1", "C2", "C3"):  # QUOTA / STALL / BLOCKED move all children the same way
+            mks("task", "set", c, "status=building")
+        r = record({"state": "QUOTA", "evidence": ["usage limit"]}, "P2", data)
+        assert r["ok"], r
+        st = statuses()
+        assert [st[c]["status"] for c in ("C1", "C2", "C3")] == ["quota"] * 3 and st["P2"]["status"] == "quota", st
+        # a child past the watched set keeps its status (late watcher, per child); the others move
+        for c, s in (("C1", "building"), ("C2", "review"), ("C3", "building")):
+            mks("task", "set", c, f"status={s}")
+        r = record({"state": "STALL", "commit": other, "evidence": ["agent idle 11 min"]}, "P2", data)
+        assert r["ok"], r
+        st = statuses()
+        assert (st["C1"]["status"], st["C2"]["status"], st["C3"]["status"]) == \
+            ("stalled", "review", "stalled"), st
+        evs2 = [json.loads(x) for x in open(os.path.join(data, "runs", "r1", "events.jsonl"))]
+        assert any(e.get("task") == "C2" and "status review kept" in e.get("text", "") for e in evs2)
+        # nested groups: a child that is itself a parent never gets the write either — the verdict
+        # lands on the subtree's leaves, intermediate parents roll up
+        mks("task", "add", "--id", "P5", "--title", "nested")
+        mks("task", "add", "--id", "C4", "--title", "mid", "--parent", "P5")
+        mks("task", "add", "--id", "G1", "--title", "grandchild", "--parent", "C4")
+        mks("task", "add", "--id", "C5", "--title", "leaf", "--parent", "P5")
+        mks("task", "set", "G1", "status=building")
+        mks("task", "set", "C5", "status=building")
+        r = record({"state": "DONE", "commit": good, "evidence": ["commit x"]}, "P5", data)
+        assert r["ok"] and r["children"] == ["G1", "C5"], r
+        st = statuses()
+        assert st["G1"]["status"] == "verifying" and st["C5"]["status"] == "verifying", st
+        assert st["C4"]["status"] == "verifying" and st["P5"]["status"] == "verifying", st  # rolled up
+
         # CLI end to end with a fake herdr on PATH and a real git lane
         bin_ = os.path.join(tmp, "bin")
         os.makedirs(bin_)
@@ -281,6 +396,17 @@ def self_test():
                   "Read and follow brief-r1.md", "--poll", "0.1", "--task", "P3", "--data", data)
         assert out["state"] == "DONE" and out["state_written"] is True, out
         assert json.load(open(os.path.join(data, "runs", "r1", "run.json")))["tasks"][-1]["status"] == "verifying"
+        # CLI end to end on a parent: the verdict reaches its children through the same record()
+        mks("task", "add", "--id", "P4", "--title", "cli group")
+        for c in ("D1", "D2", "D3"):
+            mks("task", "add", "--id", c, "--title", c, "--parent", "P4")
+            mks("task", "set", c, "status=building")
+        out = cli("--commit-grep", r"feat\(p1\)", "--phase", "P1", "--kind", "codex", "--prompt-marker",
+                  "Read and follow brief-r1.md", "--poll", "0.1", "--task", "P4", "--data", data)
+        assert out["state"] == "DONE" and out["state_written"] is True, out
+        st = statuses()
+        assert [st[c]["status"] for c in ("D1", "D2", "D3")] == ["verifying"] * 3, st
+        assert st["P4"]["status"] == "verifying", st
         out = cli("--commit-grep", "(", "--poll", "0.1", "--task", "P3", "--data", data)  # bad regex → ERROR
         assert out["state"] == "ERROR" and "missing )" in out["evidence"][0] and out["state_written"] is True, out
         assert cli("--commit-grep", "x", "--task", "P3", code=1).returncode == 1  # --task without --data
