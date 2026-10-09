@@ -29,6 +29,12 @@ dispatch is the one-call prompt helper: `herdr agent prompt <pane> <text> --wait
 be in flight — so the pane's own state decides delivery: pane list still `working` → delivered:true;
 anything else (agent_prompt_stalled, idle, gone, list unreadable) → delivered:false with the observed
 state and herdr's own error. The reply carries exactly what the subprocesses returned, never invented.
+When the first attempt is not delivered while the pane just sits idle/done (the prompt was probably
+lost — once seen on a pane that was `done` all along), dispatch waits DISPATCH_RETRY_S
+($MK_DISPATCH_RETRY_S, default 5 s) and sends the prompt ONE more time; that second attempt decides
+the verdict. Every dispatch reply also carries attempts (1 or 2), herdr_error (herdr's words for the
+attempt that did not deliver — kept even when a retry lands, the final attempt's when both fail) and
+pane_entry (the freshest raw `herdr pane list` row for the pane, null when no observation names it).
 A delivered prompt also re-arms the board for the next round: the pane's armed task has its children
 (or itself, when it has none) set building via mk-state (script from $MK_STATE_CMD, default
 scripts/mk-state.py); a failed write rides along in the JSON as task_status_error and never changes
@@ -41,6 +47,8 @@ import fcntl, hashlib, importlib.util, json, os, re, socket, subprocess, sys, te
 HERE = os.path.dirname(os.path.abspath(__file__))
 WATCH = ".matrixkoder-watch.json"
 LOCK = ".matrixkoder-watch.lock"
+DISPATCH_RETRY_S = 5  # wait before dispatch's one automatic retry; $MK_DISPATCH_RETRY_S overrides
+RETRY_PANE_STATES = ("idle", "done")  # pane sat still through a failed wait → the prompt was lost
 
 sys.dont_write_bytecode = True  # no stray __pycache__ next to the scripts
 
@@ -307,6 +315,16 @@ def herdr_bin():
     return os.environ.get("MK_HERDR") or "herdr"
 
 
+def retry_wait_s():
+    """Seconds dispatch sleeps before its ONE automatic retry ($MK_DISPATCH_RETRY_S overrides the
+    DISPATCH_RETRY_S default — read at call time so a self-test can run it at 0)."""
+    raw = os.environ.get("MK_DISPATCH_RETRY_S")
+    try:
+        return max(0.0, float(raw)) if raw is not None else float(DISPATCH_RETRY_S)
+    except ValueError:
+        return float(DISPATCH_RETRY_S)
+
+
 def _jload(s):
     s = (s or "").strip()
     if not s.startswith("{"):
@@ -318,17 +336,18 @@ def _jload(s):
 
 
 def pane_state(pane):
-    """(agent_status of <pane> from `herdr pane list`, error). A failed / malformed list is an
-    error, never a guessed state — the caller reports delivered:false with both."""
+    """(agent_status, raw list row, error) of <pane> from `herdr pane list`. The row is the exact
+    dict the list named the pane with (None when it did not). A failed / malformed list is an
+    error, never a guessed state — the caller reports delivered:false with the error."""
     try:
         r = subprocess.run([herdr_bin(), "pane", "list"], capture_output=True, text=True, timeout=15)
     except (OSError, subprocess.TimeoutExpired) as e:
-        return None, f"{type(e).__name__}: {e}"[:200]
+        return None, None, f"{type(e).__name__}: {e}"[:200]
     panes = (lambda j: j.get("result", {}).get("panes") if isinstance(j, dict) else None)(_jload(r.stdout))
     if r.returncode != 0 or not isinstance(panes, list):
-        return None, (r.stderr or r.stdout or "").strip()[-200:] or f"exit {r.returncode}"
+        return None, None, (r.stderr or r.stdout or "").strip()[-200:] or f"exit {r.returncode}"
     row = next((p for p in panes if isinstance(p, dict) and p.get("pane_id") == pane), None)
-    return (row or {}).get("agent_status"), None
+    return (row or {}).get("agent_status"), row, None
 
 
 def mk_state_cmd():
@@ -379,34 +398,19 @@ def mark_armed_building(pane):
     return res
 
 
-def cmd_dispatch(a):
-    """Prompt a pane's agent and check delivery in one call. Success → delivered:true. A timeout
-    (herdr's error, or the wait settling on agent_prompt_stalled) → the pane's own state decides:
-    still working → delivered:true; anything else → delivered:false. Other failures → ok:false.
-    Completed checks exit 0 whatever the verdict; only usage errors exit 2."""
-    pane, text = opt(a, "--pane"), opt(a, "--text")
-    if not (pane and text):
-        fail("dispatch needs --pane --text")
-    try:
-        ms = int(opt(a, "--timeout-ms", "25000"))
-    except ValueError as e:
-        fail(f"--timeout-ms: {e}")
+def _prompt_attempt(pane, text, ms):
+    """One `herdr agent prompt --wait --timeout <ms>` call → (kind, why, agent_status, parsed reply).
+    kind: "ok" = the wait result itself says the prompt landed; "exc" = the subprocess died or hung;
+    "wait" = herdr timed out or settled on agent_prompt_stalled — a timeout proves nothing either
+    way, the pane's own state must decide; "fail" = any other herdr failure. why is herdr's own
+    words (or the exception's), never empty."""
     try:
         r = subprocess.run([herdr_bin(), "agent", "prompt", pane, text, "--wait", "--timeout", str(ms)],
                            capture_output=True, text=True, timeout=ms / 1000 + 30)
     except (OSError, subprocess.TimeoutExpired) as e:
         # the subprocess died, the agent may not have: the pane's own state decides, exactly
-        # like the herdr-timeout arm below
-        why = f"{type(e).__name__}: {e}"[:300]
-        st, pl_err = pane_state(pane)
-        base = {"pane": pane, "timed_out": True, "timeout_ms": ms, "error": why}
-        if st == "working":
-            out({"ok": True, "delivered": True, "pane_state": "working", **base,
-                 **(mark_armed_building(pane) or {})})
-        else:
-            out({"ok": False, "delivered": False, "pane_state": st,
-                 **({"pane_list_error": pl_err} if pl_err else {}), **base})
-        return
+        # like a herdr timeout
+        return "exc", f"{type(e).__name__}: {e}"[:300], None, None
     blob, err = (r.stdout or "").strip(), (r.stderr or "").strip()
     j = _jload(blob)
     jerr = j.get("error") if isinstance(j, dict) else None  # herdr can print {"error": ...} and exit 0
@@ -416,19 +420,62 @@ def cmd_dispatch(a):
                     if x)[:300] or f"herdr exited {r.returncode} with no output"
     if r.returncode == 0 and isinstance(j, dict) and "result" in j and jerr is None \
             and status != "agent_prompt_stalled":
-        out({"ok": True, "delivered": True, "pane": pane, "agent_status": status, "timeout_ms": ms,
-             **(mark_armed_building(pane) or {})})
-    elif status == "agent_prompt_stalled" or "timeout" in why.lower() or "timed out" in why.lower():
-        st, pl_err = pane_state(pane)
-        base = {"pane": pane, "timed_out": True, "timeout_ms": ms, "herdr_error": why}
+        return "ok", why, status, j
+    if status == "agent_prompt_stalled" or "timeout" in why.lower() or "timed out" in why.lower():
+        return "wait", why, status, j
+    return "fail", why, status, j
+
+
+def cmd_dispatch(a):
+    """Prompt a pane's agent and check delivery in one call. Success → delivered:true. A timeout
+    (herdr's error, the subprocess dying, or the wait settling on agent_prompt_stalled) → the pane's
+    own state decides: still working → delivered:true; anything else → delivered:false — and when
+    the pane just sits idle/done through a failed wait (the prompt was lost; once seen on a pane
+    that was done all along) dispatch waits DISPATCH_RETRY_S and sends the prompt ONE more time,
+    the second attempt deciding the verdict and never retrying again. Every reply carries attempts
+    (1 or 2), herdr_error (herdr's words for the attempt that did not deliver — the first attempt's
+    when a retry lands, the final attempt's when both fail, the reply itself when nothing failed)
+    and pane_entry (the freshest raw `herdr pane list` row for the pane, null when no observation
+    names it). Other failures → ok:false. Completed checks exit 0 whatever the verdict; only usage
+    errors exit 2."""
+    pane, text = opt(a, "--pane"), opt(a, "--text")
+    if not (pane and text):
+        fail("dispatch needs --pane --text")
+    try:
+        ms = int(opt(a, "--timeout-ms", "25000"))
+    except ValueError as e:
+        fail(f"--timeout-ms: {e}")
+    # the pane's raw list row before any prompt: the ok/fail arms report it as pane_entry; every
+    # not-delivering exc/wait pass below replaces it with its own deciding observation
+    _, entry, pl_err = pane_state(pane)
+    attempts, fail_why = 1, None
+    while True:
+        kind, why, status, j = _prompt_attempt(pane, text, ms)
+        if kind == "ok":
+            out({"ok": True, "delivered": True, "pane": pane, "agent_status": status, "timeout_ms": ms,
+                 "attempts": attempts, "herdr_error": fail_why or why, "pane_entry": entry,
+                 **({"pane_list_error": pl_err} if pl_err else {}), **(mark_armed_building(pane) or {})})
+            return
+        fail_why = why
+        if kind == "fail":  # herdr failed some other way: its own words, no delivery, no pane check
+            out({"ok": False, "delivered": False, "pane": pane, "timeout_ms": ms, "attempts": attempts,
+                 "herdr_error": why, "error": why, "pane_entry": entry})
+            return
+        # exc / wait: a timeout proves nothing either way — the pane's own state decides delivery
+        st, entry, pl_err = pane_state(pane)
         if st == "working":  # the wait gave up, the agent did not: the prompt is still being delivered
-            out({"ok": True, "delivered": True, "pane_state": "working", **base,
-                 **(mark_armed_building(pane) or {})})
-        else:
-            out({"ok": False, "delivered": False, "pane_state": st, "error": why,
-                 **({"pane_list_error": pl_err} if pl_err else {}), **base})
-    else:
-        out({"ok": False, "delivered": False, "pane": pane, "timeout_ms": ms, "error": why})
+            out({"ok": True, "delivered": True, "pane_state": "working", "pane": pane, "timed_out": True,
+                 "timeout_ms": ms, "attempts": attempts, "herdr_error": why, "error": why,
+                 "pane_entry": entry, **(mark_armed_building(pane) or {})})
+            return
+        if attempts == 1 and st in RETRY_PANE_STATES:  # idle/done: the prompt was lost — resend once
+            time.sleep(retry_wait_s())
+            attempts = 2
+            continue
+        out({"ok": False, "delivered": False, "pane_state": st, "pane": pane, "timed_out": True,
+             "timeout_ms": ms, "attempts": attempts, "herdr_error": why, "error": why,
+             "pane_entry": entry, **({"pane_list_error": pl_err} if pl_err else {})})
+        return
 
 
 def cmd_arm(a):
@@ -578,6 +625,9 @@ def self_test():
     assert overrides("QUOTA", "BLOCKED") and overrides("BLOCKED", "DONE")
     assert pane_fp("Working (12s) esc") == pane_fp("Working (73s) esc")  # timers are not activity
     assert pane_fp("$ vitest run") != pane_fp("$ vitest run\n 10 failed")
+    # dispatch retry contract: the default wait is 5 s, read from $MK_DISPATCH_RETRY_S at call time
+    assert RETRY_PANE_STATES == ("idle", "done") and DISPATCH_RETRY_S == 5
+    assert retry_wait_s() == 5.0
 
     tmp = tempfile.mkdtemp(prefix="mk-lane-event-test-")
     home, data = os.path.join(tmp, "home"), os.path.join(tmp, "data")
@@ -661,13 +711,24 @@ def self_test():
                     "    open(os.path.join(base, 'notes.log'), 'a').write(' '.join(a[2:]) + chr(10))\n"
                     "    print(json.dumps({'result': {'ok': True}}))\n"
                     "elif a[:2] == ['agent', 'prompt']:\n"
-                    "    open(os.path.join(base, 'calls.log'), 'a').write(' '.join(a) + chr(10))\n"
+                    "    log = os.path.join(base, 'calls.log')\n"
+                    "    open(log, 'a').write(' '.join(a) + chr(10))\n"
                     "    hang = os.path.join(base, 'hang.txt')\n"
                     "    if os.path.exists(hang):\n"
                     "        import time; time.sleep(int(open(hang).read().strip()))\n"
-                    "    sys.stdout.write(open(os.path.join(base, 'prompt_out.txt')).read())\n"
-                    "    sys.stderr.write(open(os.path.join(base, 'prompt_err.txt')).read())\n"
-                    "    sys.exit(int(open(os.path.join(base, 'prompt_rc.txt')).read().strip() or '0'))\n"
+                    "    sfx = ''\n"
+                    "    q = os.path.join(base, 'prompt_q.txt')\n"
+                    "    if os.path.exists(q):\n"
+                    "        toks = [t.strip() for t in open(q).read().split()]\n"
+                    "        if toks:\n"
+                    "            sfx = '' if toks[0] == '-' else toks[0]\n"
+                    "            open(q, 'w').write(' '.join(toks[1:]))\n"
+                    "    def canned(nm):\n"
+                    "        p = os.path.join(base, nm + sfx + '.txt')\n"
+                    "        return open(p).read() if os.path.exists(p) else open(os.path.join(base, nm + '.txt')).read()\n"
+                    "    sys.stdout.write(canned('prompt_out'))\n"
+                    "    sys.stderr.write(canned('prompt_err'))\n"
+                    "    sys.exit(int(canned('prompt_rc').strip() or '0'))\n"
                     "elif a[:2] == ['pane', 'list']:\n"
                     "    open(os.path.join(base, 'calls.log'), 'a').write(' '.join(a) + chr(10))\n"
                     "    sys.stdout.write(open(os.path.join(base, 'pane_list_out.txt')).read())\n"
@@ -991,6 +1052,69 @@ def self_test():
         assert r["ok"] is True and r["delivered"] is True and r["building"] == [], r
         assert "not json" in r["task_status_error"], r
         os.unlink(os.path.join(tmp, "ms_badjson.txt"))
+
+        # (H2.1) one automatic retry: not delivered + pane idle/done → wait, send once more; every
+        # reply carries attempts, herdr_error and the raw pane row. prompt_q.txt scripts the fake's
+        # prompt replies per call ("-" = the base canned files, "2" = the *2 files, consumed in
+        # order); $MK_DISPATCH_RETRY_S runs the wait at 0 s instead of the real 5.
+        def prompt_calls():
+            return [l for l in open(calls).read().splitlines() if l.startswith("agent prompt")]
+
+        fast = {"MK_DISPATCH_RETRY_S": "0", "MK_STATE_CMD": fake_ms}
+        done_row = {"pane_id": pane_of("H8"), "agent_status": "done", "workspace_id": "wD"}
+        set_canned("prompt_out.txt", '{"error": {"code": "timeout", "message": "timed out waiting"}}\n')
+        set_canned("prompt_rc.txt", "1")
+        set_canned("pane_list_out.txt", json.dumps({"result": {"panes": [done_row]}}) + "\n")
+        # (a) attempt 1 times out on a done pane; the retry lands via its own wait result →
+        # delivered:true, attempts:2, first attempt's words in herdr_error, done row in pane_entry,
+        # mark_armed_building exactly once (the two child writes, no more)
+        set_canned("prompt_out2.txt", '{"result": {"agent": {"agent_status": "working"}}}\n')
+        set_canned("prompt_rc2.txt", "0")
+        set_canned("prompt_q.txt", "- 2")
+        open(ms_log, "w").write("")
+        n0 = len(prompt_calls())
+        r = cli("dispatch", "--pane", pane_of("H8"), "--text", "go", extra=fast)
+        assert r["ok"] is True and r["delivered"] is True and r["attempts"] == 2, r
+        assert r["agent_status"] == "working" and "timeout" in r["herdr_error"], r
+        assert r["pane_entry"] == done_row, r
+        assert len(prompt_calls()) - n0 == 2, prompt_calls()
+        assert ms_calls() == [f"task set H8C1 status=building --data {data} --by dispatch --run r1",
+                              f"task set H8C2 status=building --data {data} --by dispatch --run r1"], ms_calls()
+        # (b) the pane never becomes working (done through both attempts) → delivered:false, the
+        # raw fields still present, no mk-state call
+        set_canned("prompt_q.txt", "- -")
+        open(ms_log, "w").write("")
+        r = cli("dispatch", "--pane", pane_of("H8"), "--text", "go", extra=fast)
+        assert r["ok"] is False and r["delivered"] is False and r["attempts"] == 2, r
+        assert r["pane_state"] == "done" and r["pane_entry"] == done_row, r
+        assert "timeout" in r["herdr_error"] and "timeout" in r["error"] and r["timed_out"] is True, r
+        assert ms_calls() == [], ms_calls()
+        # (c) pane state null — missing from a readable list, or the list unreadable → NO retry
+        set_canned("pane_list_out.txt", '{"result": {"panes": []}}\n')
+        set_canned("prompt_q.txt", "- 2")  # a scripted second reply that must never be sent
+        n0 = len(prompt_calls())
+        r = cli("dispatch", "--pane", pane_of("H8"), "--text", "go", extra=fast)
+        assert r["ok"] is False and r["delivered"] is False and r["attempts"] == 1, r
+        assert r["pane_state"] is None and r["pane_entry"] is None, r
+        assert "pane_list_error" not in r and len(prompt_calls()) - n0 == 1, r
+        set_canned("pane_list_out.txt", "not json\n")  # unreadable list: same verdict, error carried
+        set_canned("prompt_q.txt", "- 2")
+        r = cli("dispatch", "--pane", pane_of("H8"), "--text", "go", extra=fast)
+        assert r["ok"] is False and r["delivered"] is False and r["attempts"] == 1, r
+        assert r["pane_state"] is None and r["pane_entry"] is None and "pane_list_error" in r, r
+        # (d) a delivered first attempt: attempts stays 1, the raw fields are still there
+        idle_row = {"pane_id": pane_of("H1"), "agent_status": "idle", "workspace_id": "wD"}
+        set_canned("prompt_out.txt", '{"result": {"agent": {"agent_status": "idle"}}}\n')
+        set_canned("prompt_rc.txt", "0")
+        set_canned("pane_list_out.txt", json.dumps({"result": {"panes": [idle_row]}}) + "\n")
+        os.unlink(os.path.join(tmp, "prompt_q.txt"))
+        n0 = len(prompt_calls())
+        r = cli("dispatch", "--pane", pane_of("H1"), "--text", "go")
+        assert r["ok"] is True and r["delivered"] is True and r["attempts"] == 1, r
+        assert r["pane_entry"] == idle_row and r["herdr_error"], r
+        assert len(prompt_calls()) - n0 == 1, prompt_calls()
+        for f_ in ("prompt_out2.txt", "prompt_rc2.txt"):
+            os.unlink(os.path.join(tmp, f_))
 
         # disarm: removes the watch file, the lane stops matching events
         r = cli("disarm", "--lane", lanes["H3"])
