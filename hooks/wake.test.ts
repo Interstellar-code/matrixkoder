@@ -1,6 +1,7 @@
 // Tests for MatrixKoder wake prompt.submit on lane events
 import { test, expect, mock } from 'claude-code/testing'
 import type { On } from 'claude-code'
+import { registerWake } from './wake'
 
 test('wake fires once for a new verifying event', { options: { wake: true } }, async ($, on) => {
   const clock = mock.clock(on)
@@ -712,4 +713,168 @@ test('H1.1: a new, different batch goes out during the hold; its lines move only
   expect(w.store.get('wakePending:')).toMatchObject({ items: [] })
   await clock.advance(300000)
   expect(w.submitted.length, 'the held text alone is never submitted').toBe(1)
+})
+
+// ---------- F1: reload-safe poller, batch claim, stale drop, duplicate guard ----------
+
+test('F1.1: registering wake twice (a hot reload) leaves one poller — one submit per tick', { options: { wake: true } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const submitted: string[] = []
+  let pendingWrites = 0 // every poll that finds unseen lines writes wakePending once
+  const files: Record<string, string> = {
+    '/data/runs/index.json': JSON.stringify([{ id: 'r1', status: 'active' }]),
+    '/data/runs/r1/events.jsonl': EV('F6', 'verifying'),
+  }
+  const store = new Map<string, unknown>([['wakeEventLines:r1', 0]])
+
+  mock.env(on, { MATRIXKODER_DATA: '/data' })
+  on('fs.read', (_$, e) => ({ value: files[e.path] ?? '' }))
+  on('prompt.submit', (_$, e) => {
+    submitted.push(e.text)
+    return { text: e.text }
+  })
+  const keyOf = (e: { key: string; id?: string }): string => `${e.key}:${e.id ?? ''}`
+  on('state.get', (_$, e) => ({ value: { value: store.get(keyOf(e)), version: 1 } }))
+  on('state.set', (_$, e) => {
+    if (e.key === 'wakePending') pendingWrites++
+    store.set(keyOf(e), e.value)
+    return { value: { isSet: true, version: 1 } }
+  })
+  on('session.start', (_$, _e) => ({ cwd: '/tmp' }))
+
+  // a hot reload re-evaluates the wake module and registers it again: the new
+  // evaluation cannot see the old module-level timer variable, so the cancel
+  // handle must live where re-evaluation still reaches it
+  registerWake(on, { wake: true })
+  const timers = (globalThis as { __matrixkoderWakeTimers?: { pollCancel?: () => void } }).__matrixkoderWakeTimers
+  expect(timers, 'the poll cancel registry survives a module re-evaluation').toBeDefined()
+
+  await $.session.start(START('/tmp'))
+  const epoch1 = store.get('wakeSentAt:pollEpoch')
+  expect(typeof epoch1, 'the registration stamps a poll epoch in $-state').toBe('number')
+  expect(submitted.length).toBe(0)
+
+  await clock.advance(30000) // one poll tick
+  expect(pendingWrites, 'exactly one poller discovered the event').toBe(1)
+  await clock.advance(60000) // the debounce fires
+  expect(submitted).toEqual(['MatrixKoder: F6 → verifying. Continue the run from its Next action.'])
+
+  // the second registration (a reload's): a new epoch, the old poller goes stale
+  files['/data/runs/r1/events.jsonl'] = EV('F6', 'verifying') + EV('F9', 'stalled')
+  await $.session.start(START('/tmp'))
+  expect(store.get('wakeSentAt:pollEpoch'), 'each registration bumps the epoch').toBe((epoch1 as number) + 1)
+  const writesBefore = pendingWrites
+  await clock.advance(30000) // the stale poller cancels itself; the new one discovers F9 alone
+  expect(pendingWrites - writesBefore, 'no zombie poller rediscovers the event').toBe(1)
+  await clock.advance(60000) // the debounce fires for the second batch
+  expect(submitted.length, 'one submit per batch, one live poller').toBe(2)
+  const writesAfterSubmit = pendingWrites
+  await clock.advance(30000) // nothing new: no zombie writes either
+  expect(pendingWrites - writesAfterSubmit).toBe(0)
+  expect(submitted.length).toBe(2)
+})
+
+test('F1.2: two concurrent flushes of one batch → exactly one submit', { options: { wake: true } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const submitted: string[] = []
+  let pendingAtStatusRead: unknown // wakePending as the first flush re-reads run.json
+  let eventLines = EV('F6', 'verifying')
+  const files: Record<string, string> = {
+    '/data/runs/index.json': JSON.stringify([{ id: 'r1', status: 'active' }]),
+  }
+  const store = new Map<string, unknown>([['wakeEventLines:r1', 0]])
+
+  mock.env(on, { MATRIXKODER_DATA: '/data' })
+  on('fs.read', (_$, e) => {
+    if (e.path === '/data/runs/r1/events.jsonl') return { value: eventLines }
+    if (e.path === '/data/runs/r1/run.json' && pendingAtStatusRead === undefined && store.get('wakeSentAt:claimAt:r1:1') !== undefined) {
+      pendingAtStatusRead = store.get('wakePending:') // inside the flush, after its claim
+    }
+    return { value: files[e.path] ?? '' }
+  })
+  on('prompt.submit', (_$, e) => {
+    submitted.push(e.text)
+    return { text: e.text }
+  })
+  const keyOf = (e: { key: string; id?: string }): string => `${e.key}:${e.id ?? ''}`
+  on('state.get', (_$, e) => ({ value: { value: store.get(keyOf(e)), version: 1 } }))
+  on('state.set', (_$, e) => {
+    store.set(keyOf(e), e.value)
+    return { value: { isSet: true, version: 1 } }
+  })
+  on('session.start', (_$, _e) => ({ cwd: '/tmp' }))
+
+  await $.session.start(START('/tmp'))
+  await clock.advance(30000) // t=30: the poll discovers F6, the debounce arms
+  await clock.advance(60000) // t=90: the flush claims, re-reads status, submits
+
+  expect(submitted).toEqual(['MatrixKoder: F6 → verifying. Continue the run from its Next action.'])
+  expect(pendingAtStatusRead, 'the batch was already the sending sentinel when the submit path ran').toMatchObject({ run: 'r1', upTo: 1, items: [] })
+  expect(store.get('wakeEventLines:r1')).toBe(1)
+  expect(store.get('wakePending:')).toMatchObject({ items: [] })
+
+  // a second flush (another poller, a retry) piles in on the same batch: the
+  // lease a fresh claim stamps makes it return without a second submit
+  eventLines = EV('F6', 'verifying') + EV('F9', 'stalled')
+  store.set('wakePending:', { run: 'r1', upTo: 2, items: [{ task: 'F9', to: 'stalled' }] })
+  store.set('wakeSentAt:claimAt:r1:2', 170000) // a claim 10 s fresh when the next flush runs
+  await clock.advance(30000) // t=120: the owed batch re-arms the debounce
+  await clock.advance(60000) // t=180: the flush meets the fresh lease and returns
+  expect(submitted, 'the racing flush never submitted').toEqual(['MatrixKoder: F6 → verifying. Continue the run from its Next action.'])
+
+  await clock.advance(60000) // t=240: re-arm, then t=270... the lease has expired by the next flush
+  await clock.advance(30000)
+  expect(submitted).toEqual([
+    'MatrixKoder: F6 → verifying. Continue the run from its Next action.',
+    'MatrixKoder: F9 → stalled. Continue the run from its Next action.',
+  ])
+  expect(submitted.length, 'each batch submitted exactly once').toBe(2)
+})
+
+test('F1.3: a batch whose task already moved to review → no submit and the batch cleared', { options: { wake: true } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const files: Record<string, string> = {
+    '/data/runs/index.json': JSON.stringify([{ id: 'r1', status: 'active' }]),
+    '/data/runs/r1/events.jsonl': EV('F6', 'verifying'),
+    // the transition said verifying, but the task is already at review: stale
+    '/data/runs/r1/run.json': JSON.stringify({ id: 'r1', status: 'active', tasks: [{ id: 'F6', status: 'review' }] }),
+  }
+  const w = wakeWorld(on, files, [], { MATRIXKODER_DATA: '/data' }, '/tmp')
+  w.store.set('wakeEventLines:r1', 0)
+  await $.session.start(START('/tmp'))
+  await clock.advance(30000) // poll: F6 → verifying enters the batch
+  expect(w.store.get('wakePending:')).toMatchObject({ items: [{ task: 'F6', to: 'verifying' }] })
+  await clock.advance(60000) // flush: run.json says review — the item is dropped
+  expect(w.submitted).toEqual([])
+  expect(w.store.get('wakeEventLines:r1'), 'lines consumed without a prompt').toBe(1)
+  expect(w.store.get('wakePending:')).toMatchObject({ items: [] })
+  await clock.advance(300000)
+  expect(w.submitted.length, 'nothing later either').toBe(0)
+})
+
+test('F1.2: the same batch (identical text) is not resubmitted within 10 minutes', { options: { wake: true } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const files: Record<string, string> = {
+    '/data/runs/index.json': JSON.stringify([{ id: 'r1', status: 'active' }]),
+    '/data/runs/r1/events.jsonl': EV('F6', 'verifying'),
+  }
+  const w = wakeWorld(on, files, [], { MATRIXKODER_DATA: '/data' }, '/tmp')
+  w.store.set('wakeEventLines:r1', 0)
+  await $.session.start(START('/tmp'))
+  await clock.advance(30000) // poll: found, debounce armed
+  await clock.advance(60000) // 90 s: the clean submit
+  expect(w.submitted.length).toBe(1)
+  expect(w.store.get('wakeEventLines:r1')).toBe(1)
+
+  // a retry or second poller re-delivers the SAME batch (same run, same lines,
+  // same text) 8 minutes later — past the 5-minute cooldown, inside the
+  // 10-minute identical-text window
+  await clock.advance(480000)
+  w.store.set('wakePending:', { run: 'r1', upTo: 1, items: [{ task: 'F6', to: 'verifying' }] })
+  await clock.advance(30000) // poll: the owed batch re-arms the debounce
+  await clock.advance(60000) // flush: that batch was already sent
+  expect(w.seenAtSubmit.length, 'prompt.submit never called again').toBe(1)
+  expect(w.submitted.length).toBe(1)
+  expect(w.store.get('wakePending:')).toMatchObject({ items: [] })
+  expect(w.store.get('wakeEventLines:r1'), 'lines stay consumed').toBe(1)
 })

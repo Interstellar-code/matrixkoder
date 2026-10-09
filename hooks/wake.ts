@@ -12,8 +12,24 @@ const HOLD_MS = 10 * 60 * 1000 // 10 minutes: a submit that threw may still have
 const HOLD_GONE = -1 // a hold that already gave up: never blocks a later identical text
 
 let debounceTimer: Timer | null = null
-let pollTimer: Timer | null = null
 let retryNext = false // a submit failed or its text is on hold: the next poll tick re-checks the batch at once
+
+/** A hot reload re-evaluates this module, so no module-level variable survives
+ *  to the next evaluation: the live poll timer's cancel handle lives on
+ *  globalThis (which a re-evaluation still reaches) under one wake-namespaced
+ *  key — the same role data.ts's timerRegistry plays for the dashboard. */
+const WAKE_TIMERS_KEY = '__matrixkoderWakeTimers'
+type WakeTimers = { pollCancel?: () => void }
+
+function wakeTimers(): WakeTimers {
+  const g = globalThis as unknown as { [WAKE_TIMERS_KEY]?: WakeTimers }
+  let timers = g[WAKE_TIMERS_KEY]
+  if (timers == null) {
+    timers = {}
+    g[WAKE_TIMERS_KEY] = timers
+  }
+  return timers
+}
 
 type Pending = MkWakePending
 const pendingRef = { plugin: 'matrixkoder', key: 'wakePending' } as const
@@ -132,11 +148,41 @@ async function flushBatch($: EngineInterface): Promise<void> {
   debounceTimer = null
   const pend = await readPending($)
   if (pend.items.length === 0) return
+  // Claim the batch before submitting: swap it for the sending sentinel (the
+  // same batch with empty items — MkWakePending carries no extra fields), so
+  // a concurrent flush (a second poller after a reload, a retry) that reads
+  // the full batch before this write still loses: both write a claim token,
+  // but only the flush whose token echoes back owns the batch. A flush that
+  // arrives later still — holding a stale full read — meets the lease: a
+  // claimAt fresher than one poll tick (25 s) means another flush owns the
+  // batch. The lease must stay under the 30 s tick so the retry loop (one
+  // re-flush per tick after a held or failed submit) is never locked out.
+  const claimRef = { plugin: 'matrixkoder', key: 'wakeSentAt', id: `claim:${pend.run}:${pend.upTo}` } as const
+  const claimAtRef = { plugin: 'matrixkoder', key: 'wakeSentAt', id: `claimAt:${pend.run}:${pend.upTo}` } as const
   let now = Date.now()
   try {
     now = await $.clock.now()
   } catch {
     // clock error
+  }
+  const lease = await $.state.get(claimAtRef).catch(() => ({ value: undefined }))
+  if (typeof lease.value === 'number' && now - lease.value < 25000) return // another flush owns this batch
+  const token = Math.random()
+  await $.state.set(claimRef, token).catch(() => {})
+  await $.state.set(claimAtRef, now).catch(() => {})
+  await $.state.set(pendingRef, { run: pend.run, upTo: pend.upTo, items: [] }).catch(() => {})
+  const echo = await $.state.get(claimRef).catch(() => ({ value: undefined }))
+  if (typeof echo.value === 'number' && echo.value !== token) return // another flush owns this batch
+  // The same batch (same run, same lines — the same text) may already have
+  // been submitted: a duplicate re-delivery (a retry, a second poller) never
+  // repeats it within HOLD_MS or ever after; the submit that sent it consumed
+  // these lines already.
+  const sentRef = { plugin: 'matrixkoder', key: 'wakeSentAt', id: `sent:${pend.run}:${pend.upTo}` } as const
+  const sent = await $.state.get(sentRef).catch(() => ({ value: undefined }))
+  if (typeof sent.value === 'number') {
+    await $.state.set({ plugin: 'matrixkoder', key: 'wakeEventLines', id: pend.run } as const, pend.upTo).catch(() => {})
+    await $.state.set(pendingRef, EMPTY_PENDING).catch(() => {})
+    return
   }
   // A later status change may already have reversed a transition while the batch waited:
   // re-read each task's current status and drop items that no longer hold it.
@@ -161,6 +207,7 @@ async function flushBatch($: EngineInterface): Promise<void> {
   const heldAt = typeof held.value === 'number' ? held.value : undefined
   if (heldAt !== undefined && heldAt >= 0) {
     if (now - heldAt < HOLD_MS) {
+      await $.state.set(pendingRef, pend).catch(() => {}) // un-claim: the batch is still owed
       retryNext = true // keep the batch and the old line count; the next poll tick re-checks the hold
       return
     }
@@ -177,6 +224,7 @@ async function flushBatch($: EngineInterface): Promise<void> {
   } catch {
     // the submit may still have been queued: hold the identical text instead of ever resending it
     await $.state.set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `hold:${text}` } as const, now).catch(() => {})
+    await $.state.set(pendingRef, pend).catch(() => {}) // un-claim: the batch is still owed
     retryNext = true // keep the batch and the old line count; the next poll tick re-checks the hold
     return
   }
@@ -186,6 +234,7 @@ async function flushBatch($: EngineInterface): Promise<void> {
       .set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `${p.task}:${p.to}` } as const, now)
       .catch(() => {})
   }
+  await $.state.set(sentRef, now).catch(() => {}) // the duplicate guard for this exact batch
   await $.state.set({ plugin: 'matrixkoder', key: 'wakeEventLines', id: pend.run } as const, pend.upTo).catch(() => {})
   await $.state.set(pendingRef, EMPTY_PENDING).catch(() => {})
 }
@@ -267,6 +316,12 @@ async function pollEvents($: EngineInterface): Promise<void> {
     }
 
     const pend = await readPending($)
+    if (pend.run !== '' && pend.items.length === 0) {
+      // a flush holds this batch's claim (the sentinel kept run and upTo):
+      // rewriting the batch now would resurrect it under the flush — the
+      // lines stay unconsumed and re-enter the next tick's scan instead
+      return
+    }
     const items = [...pend.items]
     for (const item of newlyDiscovered) {
       if (!items.some(p => p.task === item.task && p.to === item.to)) items.push(item)
@@ -286,14 +341,34 @@ async function pollEvents($: EngineInterface): Promise<void> {
 export function registerWake(on: On, options: PluginOptions): void {
   if (!options.wake) return
 
+  wakeTimers() // the shared registry must exist from registration on: a reload's re-registration reads it
   debounceTimer = null
   retryNext = false
 
   on('session.start', { cwd: /.*/ }, async ($, e, next) => {
-    pollTimer?.cancel()
-    pollTimer = $.clock.every(30000, () => {
-      void pollEvents($)
+    const timers = wakeTimers()
+    timers.pollCancel?.() // the previous evaluation's poller (a reload) or this one's re-arm
+    // The epoch is the reload guard the registry cannot give alone: $.state
+    // survives a hot reload even where the reload lands in a fresh module
+    // realm whose globalThis differs. Every registration bumps it; a poller
+    // whose epoch is no longer current cancels itself before polling.
+    const epochRef = { plugin: 'matrixkoder', key: 'wakeSentAt', id: 'pollEpoch' } as const
+    const res = await $.state.get(epochRef).catch(() => ({ value: undefined }))
+    const epoch = (typeof res.value === 'number' ? res.value : 0) + 1
+    await $.state.set(epochRef, epoch).catch(() => {})
+    const timer = $.clock.every(30000, () => {
+      void (async () => {
+        const cur = await $.state.get(epochRef).catch(() => ({ value: undefined }))
+        // an unreadable epoch never cancels (a read error must not eat the
+        // poller, the same rule currentTaskStatus follows); a newer one does
+        if (typeof cur.value === 'number' && cur.value !== epoch) {
+          timer.cancel() // a newer registration owns the poller now
+          return
+        }
+        await pollEvents($)
+      })()
     })
+    timers.pollCancel = () => timer.cancel()
     return next(e)
   })
 }
