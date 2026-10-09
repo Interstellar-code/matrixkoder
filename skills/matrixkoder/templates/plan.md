@@ -26,7 +26,7 @@ risk = "reversible"                       # read_only|reversible|destructive —
 review = "standard"                       # light|standard|data-loss — sets reviewer depth at stage 8
 qa = []                                   # QA flows for stage 11 (frontend changes)
 commit = "feat(scope): one phase, one commit"
-subagents = false                         # true = the builder may hand each task to one subagent (its own default model)
+subagents = true                          # default true: the builder hands each task to one subagent (its own default model); false = the builder works every task itself
 lane_group = ""                           # same value = same wave, one shared worktree and lead session; "" = own lane
 
   [[phase.task]]                          # optional: splits a phase into separately accepted tasks

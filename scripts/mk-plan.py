@@ -122,7 +122,7 @@ def phase_json(ph):
            "size": ph.get("size", "standard"),
            "risk": ph.get("risk", "reversible"), "review": ph.get("review", "standard"),
            "qa": as_list(ph.get("qa")), "commit": ph.get("commit", ""),
-           "subagents": bool(ph.get("subagents", False)), "lane_group": ph.get("lane_group", ""),
+           "subagents": bool(ph.get("subagents", True)), "lane_group": ph.get("lane_group", ""),
            "tasks": [task_json(t) for t in as_list(ph.get("task"))]}
     for k, v in ph.items():  # unknown keys pass through
         if k not in PHASE_KEYS:
@@ -548,7 +548,7 @@ def self_test():
         assert out["plan"] == "feature-id" and out["status"] == "draft" and out["runs"] == []
         assert set(out["gates"]) == {"test", "typecheck", "selftest", "validate"}
         p0 = out["phases"][0]
-        assert p0["id"] == "P1" and p0["wave"] == 1 and p0["lane_group"] == "" and p0["subagents"] is False
+        assert p0["id"] == "P1" and p0["wave"] == 1 and p0["lane_group"] == "" and p0["subagents"] is True  # template default (user 2026-10-09)
         assert p0["reviewer"] == "opencode opencode-go/kimi-k3"  # template's reviewer example passes through
         assert p0["tasks"][0]["id"] == "P1.1" and p0["tasks"][0]["subagent"] is False
         assert out["created"] == "2026-10-08" and out["design"] == []  # unknown/extra keys pass through
