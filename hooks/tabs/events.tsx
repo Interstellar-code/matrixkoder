@@ -9,10 +9,11 @@ import { EVENTS_FIXTURE } from './events.fixture'
 
 type Els = Elements[keyof Elements]
 
-/** one timeline row: clock time, the event-type word, the event text. */
+/** one timeline row: clock time, the event-type word, the event text; `short`
+ *  is the Narrow artboard's own pair for the row (review r1: compact mode). */
 export type EventsView = {
   mock: boolean
-  events: readonly { t: string; type: string; text: string }[]
+  events: readonly { t: string; type: string; text: string; short?: { readonly type: string; readonly text: string } }[]
   earlierCount: number
 }
 
@@ -31,9 +32,10 @@ export function eventsViewOf(events: EventsView['events'], earlierCount = 0): Ev
 
 // C2: the timeline's own type colours stay here — the mockup's blue/green/
 // amber/dim sets, not the pane's STATUS_COLOR (review is blue on this design,
-// yellow there), and the dim types carry dimColor, no colour at all
+// yellow there), and the dim types carry dimColor, no colour at all. 'disp'
+// is the Narrow artboard's short type word for dispatched
 const TYPE_COLOR: Record<string, string | undefined> = {
-  review: 'blue', dispatched: 'blue',
+  review: 'blue', dispatched: 'blue', disp: 'blue',
   fix: 'green', merged: 'green', verified: 'green',
   blocked: 'warning', quota: 'warning',
   route: undefined, brief: undefined, lanes: undefined, stage: undefined,
@@ -44,8 +46,9 @@ const TYPE_COLOR: Record<string, string | undefined> = {
 const TIME_W = 5
 const TYPE_W = 10
 
-/** hard-truncate without padding — the last column leaves no trailing blanks. */
-const clip = (text: string, w: number): string => (text.length > w ? text.slice(0, w) : text)
+/** `…`-truncate to `w` cells — one cut style across the tabs (each tab keeps
+ *  its own copy; ui.ts is T1-frozen). */
+const clip = (text: string, w: number): string => (text.length <= w ? text : `${text.slice(0, Math.max(1, w) - 1)}…`)
 
 /** Pure render: elements only, no $, no state (C1). */
 export function EventsTab(els: Els, view: EventsView, cols: number) {
@@ -63,12 +66,15 @@ export function EventsTab(els: Els, view: EventsView, cols: number) {
         <Text dimColor={true}>{clip(headerSide, Math.max(0, cols - 'Timeline'.length - 1))}</Text>
       </Box>
       {view.events.slice(0, EVENTS_MAX).map((ev, i) => {
-        const tone = TYPE_COLOR[ev.type]
+        // compact uses the Narrow artboard's own short pair for the row
+        const typeWord = compact ? ev.short?.type ?? ev.type : ev.type
+        const text = compact ? ev.short?.text ?? ev.text : ev.text
+        const tone = TYPE_COLOR[typeWord]
         return (
           <Box key={`ev${String(i)}`} flexDirection="row" gap={1}>
             <Text dimColor={true}>{rightCol(ev.t, TIME_W)}</Text>
-            <Text color={tone} dimColor={tone == null}>{leftCol(ev.type, TYPE_W)}</Text>
-            <Text wrap="truncate-end">{clip(ev.text, textW)}</Text>
+            <Text color={tone} dimColor={tone == null}>{leftCol(typeWord, TYPE_W)}</Text>
+            <Text wrap="truncate-end">{clip(text, textW)}</Text>
           </Box>
         )
       })}

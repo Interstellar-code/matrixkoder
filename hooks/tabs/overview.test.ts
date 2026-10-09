@@ -5,17 +5,43 @@
 import { test, expect } from 'claude-code/testing'
 import { mockFs, mockWorld, paneProps, sessionStart, worldFiles, worldFixtures } from './../testkit'
 
-/** every Text node's own text under the drawn tree, in document order (the dashboard tests' walk). */
-function textNodes(root: unknown): string[] {
-  const out: string[] = []
-  const walk = (n: unknown): void => {
-    if (typeof n !== 'object' || n === null) return
-    const node = n as { type?: string; children?: unknown[] }
-    if (node.type === 'Text' && Array.isArray(node.children)) {
-      const own = node.children.map(c => (typeof c === 'string' ? c : '')).join('')
-      if (own) out.push(own)
-    }
-    if (Array.isArray(node.children)) node.children.forEach(walk)
+// ---------- row widths (review r1 HIGH): a row is a horizontal Box (or a
+// Text); its width is the text of every Text descendant — nested Texts
+// included — plus the gap columns between its children. A single Text node
+// staying under `cols` proves nothing about the row it sits in.
+
+type DrawnNode = { type?: string; props?: { flexDirection?: string; gap?: number }; children?: unknown[] }
+
+/** a Text's whole drawn width: its own strings plus any nested Text's strings. */
+function textWidth(node: unknown): number {
+  if (typeof node === 'string') return node.length
+  if (typeof node !== 'object' || node === null) return 0
+  const n = node as DrawnNode
+  if (n.type !== 'Text') return 0
+  return (n.children ?? []).reduce((sum: number, c) => sum + textWidth(c), 0)
+}
+
+/** a subtree's width: a row sums its children plus gap columns; a column takes its widest row. */
+function widthOf(node: unknown): number {
+  if (typeof node !== 'object' || node === null) return 0
+  const n = node as DrawnNode
+  const kids = n.children ?? []
+  if (n.type === 'Text') return textWidth(n)
+  if (n.type === 'Box' && n.props?.flexDirection === 'row') {
+    const gap = typeof n.props.gap === 'number' ? n.props.gap : 0
+    return kids.reduce((sum: number, c) => sum + widthOf(c), 0) + gap * Math.max(0, kids.length - 1)
+  }
+  return kids.reduce((max: number, c) => Math.max(max, widthOf(c)), 0)
+}
+
+/** every row's width in the drawn tree: each Text and each horizontal Box. */
+function rowWidths(root: unknown): number[] {
+  const out: number[] = []
+  const walk = (node: unknown): void => {
+    if (typeof node !== 'object' || node === null) return
+    const n = node as DrawnNode
+    if (n.type === 'Text' || (n.type === 'Box' && n.props?.flexDirection === 'row')) out.push(widthOf(node))
+    for (const c of n.children ?? []) walk(c)
   }
   walk(root)
   return out
@@ -35,17 +61,18 @@ test('the Overview tab renders the Checkout v2 fixture and hides the Old pane', 
   expect(await ui.find({ text: /workflows-v2/ }), 'the Old pane is gone').toBeUndefined()
 })
 
-test('at 36 cols the Overview keeps every drawn Text within the pane width', { plugins: [worldFixtures] }, async ($, on) => {
+test('the Overview keeps every drawn ROW within the pane width at 36, 39, 40 and 46 cols', { plugins: [worldFixtures] }, async ($, on) => {
   mockFs(on, worldFiles())
   mockWorld(on)
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   await ui.press({ key: 'dash-tab-overview' })
-  await ui.redraw(paneProps(36))
-  expect(await ui.find({ text: /MOCK · fixture data · not this run/ }), 'the MOCK row redraws narrow').toBeTruthy()
-  expect(await ui.find({ text: /watching P4 R1/ }), 'the fixture still renders narrow').toBeTruthy()
-  for (const text of textNodes(await ui.drawn())) {
-    expect(text.length, `oversize Text (${String(text.length)}): ${text}`).toBeLessThanOrEqual(36)
+  for (const cols of [36, 39, 40, 46] as const) {
+    await ui.redraw(paneProps(cols))
+    expect(await ui.find({ text: /MOCK · fixture data · not this run/ }), `the MOCK row at ${cols}`).toBeTruthy()
+    expect(await ui.find({ text: /watching P4 R1/ }), `the fixture renders at ${cols}`).toBeTruthy()
+    const wide = rowWidths(await ui.drawn()).filter(w => w > cols)
+    expect(wide, `over-wide rows at ${cols} cols: ${JSON.stringify(wide)}`).toEqual([])
   }
 })
 

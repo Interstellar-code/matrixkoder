@@ -69,6 +69,48 @@ function textOwn(n: unknown): string[] {
   return out
 }
 
+// ---------- row widths (review r1 HIGH): a row is a horizontal Box (or a
+// Text); its width is the text of every Text descendant — nested Texts
+// included — plus the gap columns between its children. A single Text node
+// staying under `cols` proves nothing about the row it sits in.
+
+type DrawnNode = { type?: string; props?: { flexDirection?: string; gap?: number }; children?: unknown[] }
+
+/** a Text's whole drawn width: its own strings plus any nested Text's strings. */
+function textWidth(node: unknown): number {
+  if (typeof node === 'string') return node.length
+  if (typeof node !== 'object' || node === null) return 0
+  const n = node as DrawnNode
+  if (n.type !== 'Text') return 0
+  return (n.children ?? []).reduce((sum: number, c) => sum + textWidth(c), 0)
+}
+
+/** a subtree's width: a row sums its children plus gap columns; a column takes its widest row. */
+function widthOf(node: unknown): number {
+  if (typeof node !== 'object' || node === null) return 0
+  const n = node as DrawnNode
+  const kids = n.children ?? []
+  if (n.type === 'Text') return textWidth(n)
+  if (n.type === 'Box' && n.props?.flexDirection === 'row') {
+    const gap = typeof n.props.gap === 'number' ? n.props.gap : 0
+    return kids.reduce((sum: number, c) => sum + widthOf(c), 0) + gap * Math.max(0, kids.length - 1)
+  }
+  return kids.reduce((max: number, c) => Math.max(max, widthOf(c)), 0)
+}
+
+/** every row's width in the drawn tree: each Text and each horizontal Box. */
+function rowWidths(root: unknown): number[] {
+  const out: number[] = []
+  const walk = (node: unknown): void => {
+    if (typeof node !== 'object' || node === null) return
+    const n = node as DrawnNode
+    if (n.type === 'Text' || (n.type === 'Box' && n.props?.flexDirection === 'row')) out.push(widthOf(node))
+    for (const c of n.children ?? []) walk(c)
+  }
+  walk(root)
+  return out
+}
+
 // ---------- the mounted pane ----------
 
 test('the Events tab draws the Checkout v2 timeline over its fixture', { plugins: [worldFixtures] }, async ($, on) => {
@@ -81,7 +123,7 @@ test('the Events tab draws the Checkout v2 timeline over its fixture', { plugins
   expect(await ui.find({ text: /Timeline/ })).toBeTruthy()
   expect(await ui.find({ text: /events\.jsonl · W2 · newest first/ })).toBeTruthy() // header side
   expect(await ui.find({ text: /P5 r2 sent to opencode glm-5/ })).toBeTruthy() // 17:44 row
-  expect(await ui.find({ text: /worktrees p4 p5 p6 p7 created/ })).toBeTruthy() // 17:35 row
+  expect(await ui.find({ text: /worktrees p4 p5 p6 p7/ })).toBeTruthy() // 17:35 row (its head: the row is clipped with … at 46)
   expect(await ui.find({ text: /24 earlier events/ })).toBeTruthy() // the footer row
   expect(await ui.find({ text: /workflows-v2/ })).toBeUndefined() // Old is gone
   const flat = textOwn(await ui.drawn()).join('\n')
@@ -98,16 +140,21 @@ test('the render caps the timeline at EVENTS_MAX rows however long the view', as
   expect(texts.some(t => t.includes('earlier events')), 'no footer without earlier events').toBe(false)
 })
 
-test('at 36 cols the Events tab draws nothing wider than the pane', { plugins: [worldFixtures] }, async ($, on) => {
+test('the Events tab keeps every drawn ROW within the pane width at 36, 39, 40 and 46 cols', { plugins: [worldFixtures] }, async ($, on) => {
   mockFs(on, worldFiles())
   mockWorld(on)
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  await ui.redraw(paneProps(36))
   await ui.press({ key: 'dash-tab-events' })
+  await ui.redraw(paneProps(36))
   expect(await ui.find({ text: /MOCK · fixture data · not this run/ })).toBeTruthy()
-  expect(await ui.find({ text: /agy 5h exhausted/ })).toBeTruthy() // a fixture row survives the cut
-  const texts = textOwn(await ui.drawn())
-  expect(texts.length, 'the tab drew text').toBeGreaterThan(0)
-  for (const t of texts) expect(t.length, JSON.stringify(t)).toBeLessThanOrEqual(36)
+  expect(await ui.find({ text: /agy ⊘ 19:05/ })).toBeTruthy() // the Narrow board's short row
+  expect(await ui.find({ text: /P5 r2 → glm-5/ })).toBeTruthy() // the Narrow board's short text
+  for (const cols of [36, 39, 40, 46] as const) {
+    await ui.redraw(paneProps(cols))
+    const widths = rowWidths(await ui.drawn())
+    expect(widths.length, `the tab drew rows at ${cols}`).toBeGreaterThan(0)
+    const wide = widths.filter(w => w > cols)
+    expect(wide, `over-wide rows at ${cols} cols: ${JSON.stringify(wide)}`).toEqual([])
+  }
 })

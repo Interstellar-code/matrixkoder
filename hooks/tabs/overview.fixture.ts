@@ -46,6 +46,9 @@ export const OVERVIEW_FIXTURE: Omit<OverviewView, 'mock'> = {
     question: "P6 Tax rules depends on P4's schema change, not yet merged. Hold P6 until P4 merges?",
     options: ['Hold P6 (recommended)', 'Start on main, rebase later', 'Fold into P4 lane'],
     rec: 0,
+    // the Narrow board's waiting card: the short question and its three buttons
+    shortQuestion: 'Hold P6 until P4 merges?',
+    shortOptions: ['Hold', 'Start now', 'Fold in P4'],
   },
   recent: [
     { t: '17:44', text: 'P5 review r2 sent to opencode glm-5 (3 findings r1)' },

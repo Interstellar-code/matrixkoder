@@ -112,9 +112,9 @@ export function PlanTab(els: Els, view: PlanView, cols: number) {
           {wave.rows.map(row => PlanTaskRow(els, row, cols, compact))}
         </Box>
       ))}
-      {/* the Narrow artboard drops the footer; wide, fitLegend sheds tail items */}
+      {/* the Narrow artboard drops the footer; wide, fitLegend sheds tail items and clip marks the last cut */}
       {!compact && (
-        <Text dimColor={true} wrap="truncate-end">{footer.length > cols ? leftCol(footer, cols) : footer}</Text>
+        <Text dimColor={true} wrap="truncate-end">{clip(footer, cols)}</Text>
       )}
     </Box>
   )

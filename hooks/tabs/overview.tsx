@@ -4,7 +4,7 @@
 // terminal voice (C5: no borders, no buttons, every row cut to `cols`). The
 // names below are the C1 contract the later phases build against.
 import type { Elements } from 'claude-code'
-import { AGENT_COLOR, AGENT_GLYPH, NARROW, STATUS_COLOR, bar, fitLegend, leftCol, rightCol } from './ui'
+import { AGENT_COLOR, AGENT_GLYPH, NARROW, bar, fitLegend, leftCol, rightCol } from './ui'
 import { OVERVIEW_FIXTURE } from './overview.fixture'
 
 type Els = Elements[keyof Elements]
@@ -25,7 +25,15 @@ export type OverviewData = {
   tasks: { id: string; title: string; status: string; note: string; short: string }[]
   lanes: { slot: string; agent: string; model: string; modelShort: string; effort: string; status: string; note: string; short: string }[]
   usage: { label: string; short: string; pct: number; weekPct: number; reset: string | null; exhausted: boolean; until: string | null }[]
-  waiting: { since: string; question: string; options: string[]; rec: number }
+  waiting: {
+    since: string
+    question: string
+    options: string[]
+    rec: number
+    /** the Narrow board's waiting card: the short question and its button labels */
+    shortQuestion: string
+    shortOptions: readonly string[]
+  }
   recent: { t: string; text: string }[]
 }
 
@@ -76,7 +84,7 @@ export function OverviewTab(els: Els, view: OverviewView, cols: number) {
       {PlanBlock(els, view, cols, compact)}
       {LanesBlock(els, view.lanes, cols, compact)}
       {UsageBlock(els, view.usage, compact)}
-      {WaitingBlock(els, view.waiting, cols)}
+      {WaitingBlock(els, view.waiting, cols, compact)}
       {RecentBlock(els, view.recent, cols)}
     </Box>
   )
@@ -85,10 +93,10 @@ export function OverviewTab(els: Els, view: OverviewView, cols: number) {
 function RunBlock(els: Els, run: OverviewData['run'], cols: number, compact: boolean) {
   const { Box, Text } = els
   const stage = compact ? `stg ${run.stage}/${run.stages}` : `stage ${run.stage}/${run.stages} ${run.stageWord}`
-  // the id line yields whole items first (fitLegend), then hard-cuts: the name
-  // and the stage never move; the narrow board drops the id line entirely
+  // the id line yields whole items first (fitLegend), then cuts with `…`: the
+  // name and the stage never move; the narrow board drops the id line entirely
   const budget = Math.max(1, cols - run.name.length - stage.length - 2)
-  const idLine = compact ? '' : leftCol(fitLegend([run.id, `run ${run.short}`], budget), budget)
+  const idLine = compact ? '' : ellipsed(fitLegend([run.id, `run ${run.short}`], budget), budget)
   const prefix = compact ? '▶ ' : '▶ Next: '
   return (
     <Box flexDirection="column">
@@ -99,7 +107,7 @@ function RunBlock(els: Els, run: OverviewData['run'], cols: number, compact: boo
         </Box>
         <Text color="cyan" bold={true}>{stage}</Text>
       </Box>
-      <Text><Text color="cyan" bold={true}>{prefix}</Text>{leftCol(run.next, cols - prefix.length)}</Text>
+      <Text><Text color="cyan" bold={true}>{prefix}</Text>{ellipsed(run.next, cols - prefix.length)}</Text>
     </Box>
   )
 }
@@ -154,14 +162,17 @@ function LanesBlock(els: Els, lanes: OverviewData['lanes'], cols: number, compac
         // the narrow board keeps only the short model and drops the effort
         const modelEffort = compact ? lane.modelShort : `${lane.model} ${lane.effort}`
         const budget = Math.max(1, cols - (lane.slot.length + 1 + name.length + 1) - 1 - word.length)
+        // one status, one colour in the tab: the lane word takes the task rows'
+        // TASK_TONE (blocked/quota amber, review blue) — review r1 finding
+        const tone = TASK_TONE[lane.status] ?? { box: '[ ]', color: 'gray' }
         return (
           <Box key={lane.slot} flexDirection="row" justifyContent="space-between" gap={1}>
             <Box flexDirection="row" gap={1} flexShrink={1}>
               <Text dimColor={true}>{lane.slot}</Text>
               <Text color={AGENT_COLOR[lane.agent] ?? 'cyan'} bold={true}>{name}</Text>
-              <Text dimColor={true}>{leftCol(modelEffort, budget)}</Text>
+              <Text dimColor={true}>{ellipsed(modelEffort, budget)}</Text>
             </Box>
-            <Text color={STATUS_COLOR[lane.status] ?? 'gray'}>{word}</Text>
+            <Text color={tone.color}>{word}</Text>
           </Box>
         )
       })}
@@ -173,18 +184,19 @@ function UsageBlock(els: Els, usage: OverviewData['usage'], compact: boolean) {
   const { Box, Text } = els
   const barW = compact ? 5 : 7 // the pane's usage bar widths (design §4.2)
   const NAME_W = compact ? 8 : 12
-  const NUM_W = compact ? 11 : 19 // '38% · 2h10m' compact; wide fits agy's '⊘ exhausted · 19:05'
+  const NUM_W = compact ? 7 : 19 // '⊘ 19:05' compact; wide fits agy's '⊘ exhausted · 19:05'
   return (
     <Box flexDirection="column">
       <Box flexDirection="row" justifyContent="space-between">
         <Text bold={true}>Usage</Text>
-        <Text dimColor={true}>{rightCol(compact ? '5h' : '5h · week · reset', NUM_W)}</Text>
+        <Text dimColor={true}>{rightCol(compact ? '5h wk' : '5h · week · reset', NUM_W)}</Text>
       </Box>
       {usage.map(u => {
         const color = pctColor(u.pct, u.exhausted)
+        // the Narrow board's compact rows: bare 5h and week numbers, no %/reset
         const nums = u.exhausted
           ? (compact ? `⊘ ${u.until ?? '—'}` : `⊘ exhausted · ${u.until ?? '—'}`)
-          : (compact ? `${u.pct}% · ${u.reset ?? '—'}` : `${u.pct}% · ${u.weekPct}% · ${u.reset ?? '—'}`)
+          : (compact ? `${u.pct} ${u.weekPct}` : `${u.pct}% · ${u.weekPct}% · ${u.reset ?? '—'}`)
         return (
           <Box key={u.label} flexDirection="row" gap={1}>
             <Text>{leftCol(compact ? u.short : u.label, NAME_W)}</Text>
@@ -199,23 +211,26 @@ function UsageBlock(els: Els, usage: OverviewData['usage'], compact: boolean) {
 
 // the bordered decision card belongs to the Waiting tab (C5): here the
 // question is a summary — one clipped line, lettered options, no border
-function WaitingBlock(els: Els, waiting: OverviewData['waiting'], cols: number) {
+function WaitingBlock(els: Els, waiting: OverviewData['waiting'], cols: number, compact: boolean) {
   const { Box, Text } = els
+  // the Narrow board's waiting card: the short question and its button labels
+  const question = compact ? waiting.shortQuestion : waiting.question
+  const options = compact ? waiting.shortOptions : waiting.options
   return (
     <Box flexDirection="column">
       <Box flexDirection="row" justifyContent="space-between">
         <Text color="yellow" bold={true}>! Waiting on you</Text>
         <Text dimColor={true}>since {waiting.since}</Text>
       </Box>
-      <Text>{leftCol(waiting.question, cols)}</Text>
-      {waiting.options.map((opt, i) => (
+      <Text>{ellipsed(question, cols)}</Text>
+      {options.map((opt, i) => (
         <Text
           key={opt}
           color={i === waiting.rec ? 'cyan' : undefined}
           bold={i === waiting.rec}
           dimColor={i !== waiting.rec}
         >
-          {leftCol(`${String.fromCharCode(65 + i)} · ${opt}`, cols)}
+          {ellipsed(`${String.fromCharCode(65 + i)} · ${opt}`, cols)}
         </Text>
       ))}
     </Box>
@@ -230,7 +245,7 @@ function RecentBlock(els: Els, recent: OverviewData['recent'], cols: number) {
       {recent.map((ev, i) => (
         <Box key={`ev${String(i)}`} flexDirection="row" gap={1}>
           <Text dimColor={true}>{ev.t}</Text>
-          <Text dimColor={true} wrap="truncate-end">{leftCol(ev.text, cols - ev.t.length - 1)}</Text>
+          <Text dimColor={true} wrap="truncate-end">{ellipsed(ev.text, cols - ev.t.length - 1)}</Text>
         </Box>
       ))}
     </Box>
