@@ -121,6 +121,9 @@ declare module 'claude-code' {
       paneOpen: boolean
       /** dashboard.tsx: the /mk pane's selected tab ('old' = the pre-tab pane) */
       dashTab: MkDashTab
+      /** dashboard.tsx: the tabs' local view state (folded phases, revealed
+       *  options) — C12: only an onPress ever writes it, never a render */
+      viewState: Record<string, string>
       /** wake.ts: events.jsonl lines already seen, per run id */
       wakeEventLines: { readonly byId: number }
       /** wake.ts: last wake submit timestamp per task:status id */

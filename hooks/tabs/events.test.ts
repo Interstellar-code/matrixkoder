@@ -10,6 +10,32 @@ import type {
 } from 'claude-code'
 import { mockFs, mockWorld, paneProps, sessionStart, worldFiles, worldFixtures } from './../testkit'
 import { EVENTS_MAX, EventsTab, eventsViewOf } from './events'
+import { PALETTE, ROLE } from './palette'
+
+/** every node of `type` under `n`, in document order. */
+function nodesOf(n: unknown, type: string): { type: string; props: Record<string, unknown>; children: unknown[] }[] {
+  const out: { type: string; props: Record<string, unknown>; children: unknown[] }[] = []
+  const walk = (node: unknown): void => {
+    if (typeof node !== 'object' || node === null) return
+    const cur = node as { type?: string; props?: Record<string, unknown>; children?: unknown[] }
+    if (cur.type === type) out.push({ type: cur.type, props: cur.props ?? {}, children: cur.children ?? [] })
+    for (const c of cur.children ?? []) walk(c)
+  }
+  walk(n)
+  return out
+}
+
+const textOf = (n: unknown): string => ((n as { children?: unknown[] }).children ?? []).map(c => (typeof c === 'string' ? c : '')).join('')
+
+/** every kit Card in the drawn tree: a round-bordered panel Box. */
+const cardsOf = (drawn: unknown): { props: Record<string, unknown> }[] =>
+  nodesOf(drawn, 'Box').filter(b => b.props.borderStyle === 'round')
+
+/** every type Chip: a tinted Text, in document order. */
+const typeChipsOf = (drawn: unknown): { backgroundColor: unknown; children: unknown[] }[] =>
+  nodesOf(drawn, 'Text')
+    .filter(t => Object.values(ROLE).some(r => r.tint === t.props.backgroundColor))
+    .map(t => ({ backgroundColor: t.props.backgroundColor, children: t.children }))
 
 // ---------- a minimal element table: the tags build the same plain-data nodes
 // the engine's tables do (children among the props, as h passes them); the
@@ -120,14 +146,35 @@ test('the Events tab draws the Checkout v2 timeline over its fixture', { plugins
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   await ui.press({ key: 'dash-tab-events' })
   expect(await ui.find({ text: /MOCK · fixture data · not this run/ })).toBeTruthy() // first row, always
-  expect(await ui.find({ text: /Timeline/ })).toBeTruthy()
-  expect(await ui.find({ text: /events\.jsonl · W2 · newest first/ })).toBeTruthy() // header side
-  expect(await ui.find({ text: /P5 r2 sent to opencode glm-5/ })).toBeTruthy() // 17:44 row
+  expect(await ui.find({ text: /EVENTS/ })).toBeTruthy() // the Card's Section header
+  expect(await ui.find({ text: /last 12/ })).toBeTruthy() // the Section's right side
+  expect(await ui.find({ text: /P5 r2 sent to opencode glm/ })).toBeTruthy() // 17:44 row (clipped to the card's width)
   expect(await ui.find({ text: /worktrees p4 p5 p6 p7/ })).toBeTruthy() // 17:35 row (its head: the row is clipped with … at 46)
   expect(await ui.find({ text: /24 earlier events/ })).toBeTruthy() // the footer row
   expect(await ui.find({ text: /workflows-v2/ })).toBeUndefined() // Old is gone
   const flat = textOwn(await ui.drawn()).join('\n')
   expect(flat.indexOf('P5 r2 sent to opencode glm-5'), 'newest row first').toBeLessThan(flat.indexOf('P3 r1 approved'))
+})
+
+test('the event list sits in one kit Card with coloured type chips', { plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-events' })
+  for (const cols of [36, 46] as const) {
+    await ui.redraw(paneProps(cols))
+    const cards = cardsOf(await ui.drawn())
+    expect(cards, `the one Events Card at ${cols}`).toHaveLength(1)
+    expect(cards[0]?.props.backgroundColor, `card fill at ${cols}`).toBe(PALETTE.panel)
+    expect(cards[0]?.props.borderStyle, `round border at ${cols}`).toBe('round')
+    expect(cards[0]?.props.borderColor, `line border at ${cols}`).toBe(PALETTE.line)
+  }
+  // the type Chips paint by role: review is the live tint, blocked/quota the warn tint
+  const chips = typeChipsOf(await ui.drawn())
+  expect(chips.some(c => c.backgroundColor === ROLE.live.tint), 'a review chip').toBe(true)
+  expect(chips.some(c => c.backgroundColor === ROLE.warn.tint), 'a blocked chip').toBe(true)
+  expect(chips.some(c => c.backgroundColor === ROLE.ok.tint), 'a merged chip').toBe(true)
 })
 
 test('the render caps the timeline at EVENTS_MAX rows however long the view', async () => {

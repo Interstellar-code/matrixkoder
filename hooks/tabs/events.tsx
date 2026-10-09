@@ -1,11 +1,14 @@
-// The /mk pane's Events tab (dashboard-v2-p0, T1.3): artboard E's Timeline
-// card over its fixture — the MOCK row, a header, one row per event (time,
-// type, text) and the earlier-count footer as the last row (C5). Pure render:
-// elements only, no $, no state; the C1 names (EventsView, eventsView,
-// EventsTab) stay the contract the pane and the tests build against.
+// The /mk pane's Events tab (plan dashboard-v2-p0b, V1.3, contract C9/C11): the
+// Main.dc.html timeline redrawn from the V0 kit — the list inside ONE Card with
+// a Section header (EVENTS · last N), each row a dim time, a type Chip in its
+// role colour and the text, cut to the card's content width. The render cap is
+// unchanged. The C1 names (EventsView, eventsView, EventsTab) stay the contract
+// the pane and the tests build against.
 import type { Elements } from 'claude-code'
-import { NARROW, leftCol, rightCol } from './ui'
+import { NARROW } from './ui'
+import { Card, Chip, Section } from './kit'
 import { EVENTS_FIXTURE } from './events.fixture'
+import type { PaletteRole } from './palette'
 
 type Els = Elements[keyof Elements]
 
@@ -31,20 +34,20 @@ export function eventsViewOf(events: EventsView['events'], earlierCount = 0): Ev
 }
 
 // C2: the timeline's own type colours stay here — the mockup's blue/green/
-// amber/dim sets, not the pane's STATUS_COLOR (review is blue on this design,
-// yellow there), and the dim types carry dimColor, no colour at all. 'disp'
-// is the Narrow artboard's short type word for dispatched
-const TYPE_COLOR: Record<string, string | undefined> = {
-  review: 'blue', dispatched: 'blue', disp: 'blue',
-  fix: 'green', merged: 'green', verified: 'green',
-  blocked: 'warning', quota: 'warning',
-  route: undefined, brief: undefined, lanes: undefined, stage: undefined,
+// amber/neutral chip sets, not the pane's STATUS_COLOR (review is blue on this
+// design, yellow there). 'disp' is the Narrow artboard's short type word for
+// dispatched; the neutral types take the idle role's chip.
+const TYPE_ROLE: Record<string, PaletteRole> = {
+  review: 'live', dispatched: 'live', disp: 'live',
+  fix: 'ok', merged: 'ok', verified: 'ok',
+  blocked: 'warn', quota: 'warn',
+  route: 'idle', brief: 'idle', lanes: 'idle', stage: 'idle',
 }
 
-// fixed columns: the clock (17:44) is 5 wide, the type word 10 (the longest,
-// "dispatched"), so every row's text starts at the same column
+// fixed columns: the clock (17:44) is 5 wide; the type word pads to 6 (the
+// longest rows carry the chip's own one-cell padding on top of it)
 const TIME_W = 5
-const TYPE_W = 10
+const TYPE_W = 6
 
 /** `…`-truncate to `w` cells — one cut style across the tabs (each tab keeps
  *  its own copy; ui.ts is T1-frozen). */
@@ -54,30 +57,32 @@ const clip = (text: string, w: number): string => (text.length <= w ? text : `${
 export function EventsTab(els: Els, view: EventsView, cols: number) {
   const { Box, Text } = els
   const compact = cols < NARROW
-  const textW = Math.max(0, cols - TIME_W - TYPE_W - 2) // the two gap columns
-  // the timeline's connector line and dots are CSS art (C5): they translate to
-  // nothing — the columns and the type colours carry the design unfaked
-  const headerSide = compact ? 'events.jsonl · newest first' : 'events.jsonl · W2 · newest first'
+  const W = Math.max(1, cols - 4) // the Card's content width (border + padding per side)
+  const rows = view.events.slice(0, EVENTS_MAX)
+  const headerSide = `last ${String(rows.length)}`
   return (
     <Box flexDirection="column">
       <Text bold={true} color="warning">MOCK · fixture data · not this run</Text>
-      <Box flexDirection="row" gap={1}>
-        <Text bold={true}>Timeline</Text>
-        <Text dimColor={true}>{clip(headerSide, Math.max(0, cols - 'Timeline'.length - 1))}</Text>
-      </Box>
-      {view.events.slice(0, EVENTS_MAX).map((ev, i) => {
-        // compact uses the Narrow artboard's own short pair for the row
-        const typeWord = compact ? ev.short?.type ?? ev.type : ev.type
-        const text = compact ? ev.short?.text ?? ev.text : ev.text
-        const tone = TYPE_COLOR[typeWord]
-        return (
-          <Box key={`ev${String(i)}`} flexDirection="row" gap={1}>
-            <Text dimColor={true}>{rightCol(ev.t, TIME_W)}</Text>
-            <Text color={tone} dimColor={tone == null}>{leftCol(typeWord, TYPE_W)}</Text>
-            <Text wrap="truncate-end">{clip(text, textW)}</Text>
-          </Box>
-        )
-      })}
+      {Card(els, {}, (
+        <Box flexDirection="column">
+          {Section(els, { label: 'Events', right: headerSide })}
+          {rows.map((ev, i) => {
+            // compact uses the Narrow artboard's own short pair for the row
+            const typeWord = compact ? ev.short?.type ?? ev.type : ev.type
+            const text = compact ? ev.short?.text ?? ev.text : ev.text
+            const role = TYPE_ROLE[typeWord] ?? 'idle'
+            const chipW = Math.max(typeWord.length, TYPE_W) + 2 // the Chip pads one cell each side
+            const budget = Math.max(0, W - TIME_W - chipW - 2) // the two gap columns
+            return (
+              <Box key={`ev${String(i)}`} flexDirection="row" gap={1}>
+                <Text dimColor={true}>{ev.t.slice(0, TIME_W).padStart(TIME_W)}</Text>
+                {Chip(els, { label: typeWord.padEnd(TYPE_W), role })}
+                <Text wrap="truncate-end">{clip(text, budget)}</Text>
+              </Box>
+            )
+          })}
+        </Box>
+      ))}
       {view.earlierCount > 0 && (
         <Text dimColor={true}>{view.earlierCount} earlier events</Text>
       )}
