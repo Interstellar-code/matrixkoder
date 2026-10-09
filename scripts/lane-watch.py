@@ -4,8 +4,8 @@
 Usage:
   lane-watch.py --lane DIR --agent NAME|PANE --commit-grep REGEX [--report PATH] [--phase P1]
                 [--kind claude|codex|opencode|agy] [--prompt-marker TEXT]
-                [--then-send BRIEF_PATH] [--max-wait-min 30] [--poll 20] [--stall-min 10]
-                [--task T --data DIR [--run ID]] [--no-commit]
+                 [--then-send BRIEF_PATH] [--max-wait-min 30] [--poll 20] [--stall-min 10]
+                 [--task T | --tasks A,B --data DIR [--run ID]] [--no-commit]
   lane-watch.py --self-test
 
 Done = latest commit subject matches REGEX (searched in the bare subject, so `^feat(x)`-style anchors work; the
@@ -33,6 +33,9 @@ status (dispatched building stalled quota provider blocked); otherwise, and for 
 an event. A parent task is never written — mk-state refuses status= on it ("status rolls up from
 children") — every child gets the verdict instead, and each mk-state reply is checked: an ok:false error
 always lands in this script's own JSON output, never dropped.
+--tasks A,B is the shared-lane-group spelling of --task (one comma list, one pane): the verdict
+reaches every listed task's children (or the task itself when it has none), exactly as --task does
+for one. The two spellings are alternatives — pass one, with --data.
 Exit states (one JSON line): DONE | DONE_SENT | QUOTA | PROVIDER | STALL | BLOCKED | DEV_SERVER | ERROR | WATCH_EXPIRED.
 Run in the background (30 min default; foreground calls must stay under their 10-min timeout); re-arm on WATCH_EXPIRED.
 """
@@ -187,12 +190,21 @@ def child_tasks(task, data, run=None):
 def record(out, task, data, run=None):
     """Write the exit into run state via mk-state: every child when <task> is a parent (mk-state
     refuses status= on a parent — "status rolls up from children" — so the children carry the verdict
-    and the parent only rolls up), else the task itself. -> mk-state's reply for one target, or
+    and the parent only rolls up), else the task itself. <task> may also be a LIST of ids (a shared
+    lane group, --tasks A,B): the verdict reaches every listed task's children — one delivered
+    dispatch marks them all building, one verdict marks them all done — and a task listed twice
+    (or two listed tasks sharing a child) is written once. -> mk-state's reply for one target, or
     {ok, children, results[, error]} for several; every ok:false reply is reported, never dropped."""
     note = f"lane-watch {out['state']}: " + "; ".join(out.get("evidence") or [out.get("commit") or ""])
     common = ["--data", data, "--by", "lane-watch"] + (["--run", run] if run else [])
     status = STATUS_MAP.get(out["state"])
-    targets = child_tasks(task, data, run) or [task]
+    ids = [task] if isinstance(task, str) else [str(t) for t in task]
+    targets, seen = [], set()
+    for tid in ids:
+        for c in (child_tasks(tid, data, run) or [tid]):
+            if c.lower() not in seen:
+                seen.add(c.lower())
+                targets.append(c)
     results = []
     for t in targets:
         t_note, t_status = note, status
@@ -227,6 +239,27 @@ def record(out, task, data, run=None):
     return res
 
 
+def quota_beats_stall(agent, kind):
+    """lane-health's quota detection over the WHOLE pane text — the marker-scoped text a poll
+    classifies can cut a limit banner out: when the agent later echoes its dispatch prompt (a
+    `cat brief` line, a re-printed instruction), since_dispatch's rfind starts after the LAST
+    echo and the banner above it is scoped away — tonight's "Free usage exceeded … [retrying in
+    22h 40m]" pane was judged STALL. So before STALL is ever decided, the full pane text goes
+    through lane-health (imported, the way these scripts share code) and a hit records the usage
+    ledger with its reset time. -> ("QUOTA", evidence) or (None, [])."""
+    text = lh.pane_text(agent)
+    hits = lh.quota_hits(text)
+    if not hits:
+        return None, []
+    try:
+        lh.record_quota(lh.default_ledger(), kind or agent, text)
+    except Exception as e:  # a ledger write never hides the verdict itself
+        return "QUOTA", hits[-2:] + [f"ledger write failed: {type(e).__name__}: {e}"[:200]]
+    until, window = lh.parse_reset(text)
+    return "QUOTA", hits[-2:] + ([f"exhausted_until {until} ({window})"] if until
+                                  else ["exhausted_until unknown"])
+
+
 def watch(a):
     no_commit = "--no-commit" in a
     lane, agent, grep = opt(a, "--lane"), opt(a, "--agent"), opt(a, "--commit-grep")
@@ -256,6 +289,10 @@ def watch(a):
         if state == "ERROR" and errors < ERROR_RETRIES and time.time() - start <= max_wait:
             time.sleep(poll)
             continue
+        if state == "STALL":  # quota beats stall: the whole pane text is checked for a limit banner
+            qstate, qev = quota_beats_stall(agent, kind)
+            if qstate:
+                state, ev = qstate, qev
         if state == "DONE" and then_send:
             msg = f"Read and follow {then_send} exactly. Work autonomously until complete, then reply with the DONE token it names."
             r = subprocess.run([sys.executable, ASK, agent, msg, "--no-wait"], capture_output=True, text=True)
@@ -425,6 +462,37 @@ def self_test():
         assert st["G1"]["status"] == "verifying" and st["C5"]["status"] == "verifying", st
         assert st["C4"]["status"] == "verifying" and st["P5"]["status"] == "verifying", st  # rolled up
 
+        # a lane GROUP (--tasks QG1,QG2): one verdict reaches every listed task's children, the
+        # parents only roll up — the same list one delivered dispatch marks building
+        mks("task", "add", "--id", "QG1", "--title", "group one")
+        for c in ("A1", "A2"):
+            mks("task", "add", "--id", c, "--title", c, "--parent", "QG1")
+            mks("task", "set", c, "status=building")
+        mks("task", "add", "--id", "QG2", "--title", "group two")
+        for c in ("B1", "B2"):
+            mks("task", "add", "--id", c, "--title", c, "--parent", "QG2")
+            mks("task", "set", c, "status=building")
+        r = record({"state": "DONE", "commit": good, "evidence": ["commit x"]}, ["QG1", "QG2"], data)
+        assert r["ok"] and r["children"] == ["A1", "A2", "B1", "B2"], r
+        assert [x["task"]["status"] for x in r["results"]] == ["verifying"] * 4, r
+        st = statuses()
+        assert [st[c]["status"] for c in ("A1", "A2", "B1", "B2")] == ["verifying"] * 4, st
+        assert st["QG1"]["status"] == "verifying" and st["QG2"]["status"] == "verifying", st
+        # a leaf listed alongside a parent goes itself; a child past the watched set still keeps
+        # its status, exactly as for a single --task
+        for c in ("A1", "A2", "B1", "B2"):
+            mks("task", "set", c, "status=building")
+        mks("task", "set", "P1", "status=building")
+        mks("task", "set", "B2", "status=review")
+        r = record({"state": "STALL", "commit": other, "evidence": ["agent idle 11 min"]},
+                   ["QG1", "P1", "QG2"], data)
+        assert r["ok"] and r["children"] == ["A1", "A2", "P1", "B1", "B2"], r
+        st = statuses()
+        assert (st["A1"]["status"], st["B2"]["status"], st["P1"]["status"]) == ("stalled", "review", "stalled"), st
+        # an unknown id in the group is reported, the healthy ones still got the verdict
+        r = record({"state": "DONE", "commit": good, "evidence": ["x"]}, ["QG1", "NOPE"], data)
+        assert r["ok"] is False and "NOPE" in r["error"], r
+
         # one child's write fails (its task.json is a directory): ok is False and the error
         # names the child — never dropped, and the healthy child still got the verdict
         mks("task", "add", "--id", "P6", "--title", "errors")
@@ -479,6 +547,18 @@ def self_test():
         st = statuses()
         assert [st[c]["status"] for c in ("D1", "D2", "D3")] == ["verifying"] * 3, st
         assert st["P4"]["status"] == "verifying", st
+        # --tasks A,B end to end: one pane, one verdict, both groups' children
+        open(pane, "w").write("> Read and follow brief-r1.md\nall gates green\n⏺ P1 DONE\n")
+        subprocess.run(git + ["commit", "-q", "--allow-empty", "-m", "feat(p1): group cli"], check=True)
+        for c in ("A1", "A2", "B1", "B2"):
+            mks("task", "set", c, "status=building")
+        out = cli("--commit-grep", r"feat\(p1\)", "--phase", "P1", "--kind", "codex", "--prompt-marker",
+                  "Read and follow brief-r1.md", "--poll", "0.1", "--tasks", "QG1,QG2", "--data", data)
+        assert out["state"] == "DONE" and out["state_written"] is True, out
+        st = statuses()
+        assert [st[c]["status"] for c in ("A1", "A2", "B1", "B2")] == ["verifying"] * 4, st
+        assert cli("--commit-grep", "x", "--tasks", "QG1,QG2", code=1).returncode == 1  # --tasks without --data
+        cli("--commit-grep", "x", "--poll", "0.1", "--task", "P3", "--tasks", "QG1", "--data", data, code=1)
         out = cli("--commit-grep", "(", "--poll", "0.1", "--task", "P3", "--data", data)  # bad regex → ERROR
         assert out["state"] == "ERROR" and "missing )" in out["evidence"][0] and out["state_written"] is True, out
         assert cli("--commit-grep", "x", "--task", "P3", code=1).returncode == 1  # --task without --data
@@ -544,6 +624,36 @@ def self_test():
         assert h["state"] == "QUOTA" and h["scope"] == "marker" and h["agent_status"] == "idle", h
         led = json.load(open(os.path.join(tmp, "home", "usage.json")))["agents"]["codex"]
         assert led["exhausted_window"] == "5h" and led["exhausted_guess"] is False
+        # J1.3: quota beats STALL — tonight's OpenCode line sits above the marker's last echo (the
+        # agent re-printed its prompt), so the marker-scoped text cannot see it: STALL is never
+        # decided until the whole pane text went through lane-health's quota detection.
+        mks("task", "set", "P3", "status=building")
+        open(pane, "w").write(
+            "> Read and follow brief-r2.md\n"
+            "Free usage exceeded, subscribe to Go [retrying in 22h 40m attempt #1]\n"
+            "$ cat brief-r2.md\n"
+            "Read and follow brief-r2.md exactly. Work autonomously until complete.\n")
+        out = cli("--commit-grep", "nomatch", "--kind", "opencode", "--prompt-marker",
+                  "Read and follow brief-r2.md", "--poll", "0.1", "--stall-min", "0.03",
+                  "--max-wait-min", "0.06", "--task", "P3", "--data", data)
+        assert out["state"] == "QUOTA", out  # not STALL: the banner above the echo still counts
+        assert "Free usage exceeded" in out["evidence"][0], out
+        assert any(e.startswith("exhausted_until ") for e in out["evidence"]), out
+        assert out["state_written"] is True, out
+        assert statuses()["P3"]["status"] == "quota", statuses()
+        ocled = json.load(open(os.path.join(tmp, "home", "usage.json")))["agents"]["opencode"]
+        assert ocled["exhausted_source"] == "pane-text" and ocled["exhausted_window"] == "weekly", ocled
+        assert ocled["exhausted_guess"] is False, ocled
+        # without a quota line on screen the STALL path is unchanged (no override, no ledger entry)
+        oc_ev = ocled["exhausted_observed_at"]
+        open(pane, "w").write("> Read and follow brief-r2.md\nworking, then silence\n")
+        mks("task", "set", "P3", "status=building")
+        out = cli("--commit-grep", "nomatch", "--kind", "opencode", "--prompt-marker",
+                  "Read and follow brief-r2.md", "--poll", "0.1", "--stall-min", "0.03",
+                  "--max-wait-min", "0.06", "--task", "P3", "--data", data)
+        assert out["state"] == "STALL" and out["evidence"][0].startswith("agent idle"), out
+        assert json.load(open(os.path.join(tmp, "home", "usage.json")))["agents"]["opencode"][
+            "exhausted_observed_at"] == oc_ev  # untouched: no quota line, no re-record
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("lane-watch self-test ok")
@@ -558,15 +668,17 @@ def main():
         sys.exit(2)
     if opt(a, "--kind") and opt(a, "--kind") not in lh.KINDS:
         sys.exit(__doc__)
-    task, data = opt(a, "--task"), opt(a, "--data")
-    if bool(task) != bool(data):
+    task, tasks, data = opt(a, "--task"), opt(a, "--tasks"), opt(a, "--data")
+    if task and tasks:
+        sys.exit("--task and --tasks are two spellings of the same thing; pass one\n" + __doc__)
+    if bool(task or tasks) != bool(data):
         sys.exit("--task and --data go together (state is written only with both)\n" + __doc__)
     try:
         out = watch(a)
     except Exception as e:  # never die silently: missing herdr/git, bad regex, bad number → ERROR + state note
         out = {"state": "ERROR", "evidence": [f"{type(e).__name__}: {e}"[:200]]}
-    if task and data:
-        r = record(out, task, data, opt(a, "--run"))
+    if task or tasks:
+        r = record(out, task or [t.strip() for t in tasks.split(",") if t.strip()], data, opt(a, "--run"))
         out["state_written"] = r.get("ok", False)
         if not r.get("ok"):
             out["state_error"] = r.get("error")

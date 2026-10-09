@@ -4,6 +4,8 @@
 Usage:
   mk-lane-event.py arm --lane DIR --pane ID --task T --run R --data DIR --phase P --commit-grep RX
                       [--report PATH] [--kind claude|codex|opencode|agy] [--prompt-marker TEXT] [--stall-min 15]
+  mk-lane-event.py arm --lane DIR --pane ID --tasks A,B --run R --data DIR --phase P --commit-grep RX
+                      [...]   # a shared lane group: one lane serving several phases of one plan
   mk-lane-event.py event                (herdr plugin hook: reads HERDR_PLUGIN_EVENT + HERDR_PLUGIN_EVENT_JSON)
   mk-lane-event.py dispatch --pane ID --text TEXT [--timeout-ms 25000]
   mk-lane-event.py sweep [--data DIR]
@@ -35,10 +37,11 @@ lost — once seen on a pane that was `done` all along), dispatch waits DISPATCH
 the verdict. Every dispatch reply also carries attempts (1 or 2), herdr_error (herdr's words for the
 attempt that did not deliver — kept even when a retry lands, the final attempt's when both fail) and
 pane_entry (the freshest raw `herdr pane list` row for the pane, null when no observation names it).
-A delivered prompt also re-arms the board for the next round: the pane's armed task has its children
-(or itself, when it has none) set building via mk-state (script from $MK_STATE_CMD, default
-scripts/mk-state.py); a failed write rides along in the JSON as task_status_error and never changes
-the delivery verdict. herdr runs one process per event with no ordering guarantee: every read/decide/write of a watch file
+A delivered prompt also re-arms the board for the next round: every armed task's children (or the
+task itself, when it has none) are set building via mk-state (script from $MK_STATE_CMD, default
+scripts/mk-state.py) — with --tasks A,B one delivered dispatch arms the whole lane group, so no
+phase's children are left behind; a failed write rides along in the JSON as task_status_error and
+never changes the delivery verdict. herdr runs one process per event with no ordering guarantee: every read/decide/write of a watch file
 happens under an fcntl.flock on <lane>/.matrixkoder-watch.lock (a stable inode next to the atomically
 replaced watch file). One JSON line per command.
 """
@@ -282,9 +285,12 @@ def toast_pane(task, state, status):
 
 def apply_verdict(w, state, subj, evidence, h):
     """Record via lane-watch's record() (verdict → mk-state status, WATCHED guard), label + toast,
-    stamp the watch file. A failed mk-state write stamps nothing, so the next event retries."""
+    stamp the watch file. A failed mk-state write stamps nothing, so the next event retries. A
+    group lane arms every listed task, so the verdict is recorded for all of them (children, or
+    the task itself when it has none) — the same list dispatch's building marks use."""
     rec = lw.record({"state": state, "commit": subj, "evidence": evidence,
-                     "agent_status": (h or {}).get("agent_status")}, w["task"], w["data"], w.get("run"))
+                     "agent_status": (h or {}).get("agent_status")}, watch_tasks(w), w["data"],
+                    w.get("run"))
     if not rec.get("ok"):
         return rec, False, False, None
     status = lw.STATUS_MAP.get(state, state.lower())
@@ -356,29 +362,48 @@ def mk_state_cmd():
     return os.environ.get("MK_STATE_CMD") or lw.MK_STATE
 
 
+def watch_tasks(w):
+    """The tasks a watch file's lane serves: the armed group list (arm --tasks A,B), else the
+    single --task id. The primary id stays in w["task"] for every single-task consumer."""
+    group = [str(t) for t in (w.get("tasks") or []) if str(t)]
+    return group or ([w["task"]] if w.get("task") else [])
+
+
+def child_ids(task, data, run):
+    """Stored ids of <task>'s children in <run>, [] when it has none or run state is unreadable."""
+    try:
+        with open(os.path.join(data, "runs", run, "run.json")) as f:
+            tasks = json.load(f).get("tasks") or []
+    except (OSError, ValueError):
+        return []
+    return [t.get("id") for t in tasks if isinstance(t, dict)
+            and (t.get("parent") or "").lower() == str(task).lower()]
+
+
 def mark_armed_building(pane):
-    """dispatch delivered:true → the pane's armed task moves again: its children (or the task
-    itself, when it has none) are set building via mk-state, so the board shows the lane working
-    before the agent's first event lands. No armed watch file → None, nothing else in the JSON.
-    mk-state failures are returned, never swallowed and never fatal: the delivery already happened
-    (a parent is never set directly — its status rolls up, so its children are set instead)."""
+    """dispatch delivered:true → the lane's tasks move again: the children of EVERY armed task
+    (or the task itself when it has none) are set building via mk-state, so the board shows the
+    lane working before the agent's first event lands — in a shared lane group one delivered
+    prompt arms every listed phase (tonight's two-phase lane only moved the first phase's).
+    No armed watch file → None, nothing else in the JSON. mk-state failures are returned, never
+    swallowed and never fatal: the delivery already happened (a parent is never set directly —
+    its status rolls up, so its children are set instead)."""
     hit = find_armed(pane)
     if not hit:
         return None
     w = hit[1]
-    task, data, run = w.get("task"), w.get("data"), w.get("run")
-    if not (task and data):
+    data = w.get("data")
+    group = watch_tasks(w)
+    if not (data and group):
         return None
-    targets = [task]
-    if run:
-        try:
-            with open(os.path.join(data, "runs", run, "run.json")) as f:
-                tasks = json.load(f).get("tasks") or []
-            kids = [t.get("id") for t in tasks if isinstance(t, dict)
-                    and (t.get("parent") or "").lower() == str(task).lower()]
-            targets = kids or [task]
-        except (OSError, ValueError):
-            pass  # unreadable run state: mk-state gets the task itself and says what is wrong
+    run = w.get("run")
+    targets, seen = [], set()
+    for t in group:
+        kids = child_ids(t, data, run) if run else []
+        for kid in (kids or [t]):
+            if str(kid).lower() not in seen:
+                seen.add(str(kid).lower())
+                targets.append(kid)
     common = ["--data", data, "--by", "dispatch"] + (["--run", run] if run else [])
     done, errors = [], []
     for t in targets:
@@ -479,10 +504,14 @@ def cmd_dispatch(a):
 
 
 def cmd_arm(a):
-    lane, pane, task = opt(a, "--lane"), opt(a, "--pane"), opt(a, "--task")
+    lane, pane = opt(a, "--lane"), opt(a, "--pane")
+    task, tasks = opt(a, "--task"), opt(a, "--tasks")
     run, data, phase, grep = opt(a, "--run"), opt(a, "--data"), opt(a, "--phase"), opt(a, "--commit-grep")
-    if not all((lane, pane, task, run, data, phase, grep)):
-        fail("arm needs --lane --pane --task --run --data --phase --commit-grep")
+    group = [t.strip() for t in (tasks or "").split(",") if t.strip()]
+    if task and group:
+        fail("arm takes --task (one task) or --tasks (a comma list), not both")
+    if not (lane and pane and run and data and phase and grep) or not (task or group):
+        fail("arm needs --lane --pane --task|--tasks --run --data --phase --commit-grep")
     if not os.path.exists(os.path.join(lane, ".git")):  # dir (main checkout) or file (linked worktree)
         fail(f"{lane} is not a git worktree (no .git)")
     try:
@@ -499,15 +528,21 @@ def cmd_arm(a):
     lane = os.path.abspath(lane)
     ensure_lane_exclude(lane)
     now = time.time()
-    w = {"lane": lane, "pane": pane, "task": task, "run": run, "data": os.path.abspath(data),
+    listed = [task] if task else group  # a group lane: the pane lands on every listed task
+    w = {"lane": lane, "pane": pane, "task": listed[0], "run": run, "data": os.path.abspath(data),
          "phase": phase, "commit_grep": grep, "report": opt(a, "--report"), "kind": kind,
          "prompt_marker": opt(a, "--prompt-marker"), "stall_min": stall,
-         "armed_at": now, "last_activity": now, "last_pane_fp": None, "verdict": None, "verdict_at": None}
+         "armed_at": now, "last_activity": now, "last_pane_fp": None, "verdict": None, "verdict_at": None,
+         **({"tasks": group} if group else {})}
     with locked(lane):
         write_watch(lane, w)
-    rec = record_pane(task, pane, w["data"], run)
+    errs = []
+    for t in listed:  # best-effort, exactly one write per task, exactly as for a single --task
+        rec = record_pane(t, pane, w["data"], run)
+        if not rec.get("ok"):
+            errs.append(f"{t}: {rec.get('error', 'mk-state task set failed')}")
     out({"ok": True, "lane": lane, "pane": pane, "watch": os.path.join(lane, WATCH), "armed_at": now,
-         **({} if rec.get("ok") else {"task_pane_error": rec.get("error", "mk-state task set failed")})})
+         **({"task_pane_error": "; ".join(errs)} if errs else {})})
 
 
 def cmd_disarm(a):
@@ -1115,6 +1150,44 @@ def self_test():
         assert len(prompt_calls()) - n0 == 1, prompt_calls()
         for f_ in ("prompt_out2.txt", "prompt_rc2.txt"):
             os.unlink(os.path.join(tmp, f_))
+
+        # (J1.1) --tasks arms a lane GROUP: the watch file lists every task, and one delivered
+        # dispatch sets the children of EVERY listed task (or the task itself when it has none)
+        # building — tonight's two-phase lane only moved the first phase's children.
+        lanes["H9"] = os.path.join(tmp, "lane-h9")
+        g(repo, "worktree", "add", "-q", "--detach", lanes["H9"])
+        mks("task", "add", "--id", "H9", "--title", "g1", "--run", "r1")
+        mks("task", "add", "--id", "H9C1", "--title", "c1", "--parent", "H9", "--run", "r1")
+        mks("task", "add", "--id", "H10", "--title", "g2", "--run", "r1")
+        mks("task", "set", "H9C1", "status=building")  # H9 rolls up from its child (a parent takes no status)
+        mks("task", "set", "H10", "status=building")
+        r = cli("arm", "--lane", lanes["H9"], "--pane", pane_of("H9"), "--tasks", "H9,H10",
+                "--run", "r1", "--data", data, "--phase", "P1", "--commit-grep", r"feat\(p1\)")
+        assert r["ok"] and "task_pane_error" not in r, r
+        wg = watch_of("H9")
+        assert wg["tasks"] == ["H9", "H10"] and wg["task"] == "H9", wg  # the group, primary kept
+        assert task_field("H10", "pane") == pane_of("H9")  # the pane lands on every listed task
+        assert cli("arm", "--lane", lanes["H9"], "--pane", pane_of("H9"), "--task", "H9", "--tasks",
+                   "H9,H10", "--run", "r1", "--data", data, "--phase", "P1",
+                   "--commit-grep", "x", code=2)["ok"] is False  # two spellings: pass one
+        set_canned("prompt_out.txt", '{"result": {"agent": {"agent_status": "idle"}}}\n')
+        set_canned("prompt_err.txt", "")
+        set_canned("prompt_rc.txt", "0")
+        open(ms_log, "w").write("")
+        r = cli("dispatch", "--pane", pane_of("H9"), "--text", "go", extra={"MK_STATE_CMD": fake_ms})
+        assert r["ok"] is True and r["delivered"] is True and r["building"] == ["H9C1", "H10"], r
+        assert ms_calls() == [f"task set H9C1 status=building --data {data} --by dispatch --run r1",
+                              f"task set H10 status=building --data {data} --by dispatch --run r1"], ms_calls()
+        # a verdict on a group lane records for every listed task: H9's children and childless H10
+        g(lanes["H9"], "commit", "-q", "--allow-empty", "-m", "feat(p1): group core")
+        open(pane_f, "w").write("> dispatch-h9\nall gates green\n⏺ P1 DONE\n")
+        open(status_f, "w").write("done")
+        r = event("done", tid="H9")
+        assert r["verdict"] == "DONE" and r["recorded"], r
+        st_ = json.load(open(os.path.join(data, "runs", "r1", "run.json")))["tasks"]
+        got = {t["id"]: t["status"] for t in st_}
+        assert got["H9C1"] == "verifying" and got["H10"] == "verifying", got
+        assert got["H9"] == "verifying", got  # rolled up from its child
 
         # disarm: removes the watch file, the lane stops matching events
         r = cli("disarm", "--lane", lanes["H3"])
