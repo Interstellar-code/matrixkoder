@@ -20,10 +20,6 @@ type Els = Elements[keyof Elements]
 /** The local view state V1 hands every mock tab (C12), declared structurally. */
 export type TabUi = { get(key: string): string | undefined; set(key: string, value: string): void }
 
-/** the row vocabulary: theme colour keys only (C5′), 'dim' as dimColor. */
-export type Tone = 'text' | 'dim' | 'subtle' | 'success' | 'warning' | 'error' | 'suggestion'
-export type Seg = { text: string; tone?: Tone; bold?: boolean }
-
 /** one decision option: its key (`A`), the label, whether it is the recommended
  *  one, and the explanation under it. `action` is the short word its ActionButton
  *  carries (the mockup's chip form); `row` is the option's own row width. */
