@@ -16,6 +16,9 @@ import {
 } from './data'
 import type { MkPaneSnapshot } from './data'
 import { AGENT_COLOR, AGENT_GLYPH, NARROW, STATUS_COLOR, STATUS_GLYPH, bar, leftCol, rightCol } from './tabs/ui'
+import { mockRunHeader, mockTabCounts, stageWord, STAGE_TOTAL } from './tabs/header'
+import type { RunHeaderData } from './tabs/header'
+import { Chip } from './tabs/kit'
 import { EventsTab, eventsView } from './tabs/events'
 import { LanesTab, lanesView } from './tabs/lanes'
 import { OverviewTab, overviewView } from './tabs/overview'
@@ -46,16 +49,17 @@ const PRIMARY_POOL: Record<string, string> = { agy: 'gemini', claude: 'default' 
 // the pane's glyph/colour vocabularies moved to tabs/ui.ts: one copy for the
 // pane and the tab modules (T1/T2)
 /** the tab bar (S0.2): order and hotkeys are the plan's — o Overview, l Lanes,
- * p Plan, u Usage, e Events, w Waiting, 0 Old. `short` is the under-NARROW
- * label: one glyph per mock tab, Old keeps its word. */
-const TABS: readonly { key: MkDashTab; hotkey: string; label: string; short: string }[] = [
-  { key: 'overview', hotkey: 'o', label: 'Overview', short: 'o' },
-  { key: 'lanes', hotkey: 'l', label: 'Lanes', short: 'l' },
-  { key: 'plan', hotkey: 'p', label: 'Plan', short: 'p' },
-  { key: 'usage', hotkey: 'u', label: 'Usage', short: 'u' },
-  { key: 'events', hotkey: 'e', label: 'Events', short: 'e' },
-  { key: 'waiting', hotkey: 'w', label: 'Waiting', short: 'w' },
-  { key: 'old', hotkey: '0', label: 'Old', short: 'Old' },
+ * p Plan, u Usage, e Events, w Waiting, 0 Old. V0.4 dropped `short`: the bar
+ * carries one scheme at every width — the active tab shows its full word, the
+ * others the hotkey letter plus their count (`l 4`, `p 3/8`, `w !1`, `0`). */
+const TABS: readonly { key: MkDashTab; hotkey: string; label: string }[] = [
+  { key: 'overview', hotkey: 'o', label: 'Overview' },
+  { key: 'lanes', hotkey: 'l', label: 'Lanes' },
+  { key: 'plan', hotkey: 'p', label: 'Plan' },
+  { key: 'usage', hotkey: 'u', label: 'Usage' },
+  { key: 'events', hotkey: 'e', label: 'Events' },
+  { key: 'waiting', hotkey: 'w', label: 'Waiting' },
+  { key: 'old', hotkey: '0', label: 'Old' },
 ]
 /** compact status words per design §3.7 (`building 12m` → `build 12m`) */
 const STATUS_SHORT: Record<string, string> = {
@@ -158,11 +162,14 @@ export function registerDashboard(on: On, options: PluginOptions): void {
 
   on('ui.render', { component: 'Pane', requestId: PANE_ID }, async ($, e) => {
     const els = $.ui.resolve(e)
-    const { Box, Button, Text } = els
+    const { Box, Text } = els
     const snap = await read($, snapshotAtom) as MkPaneSnapshot
     const dashTab = await read($, dashTabAtom)
     const cols = e.props.bodyColumns || COLUMNS
     const compact = cols < NARROW
+    // V0.4: the header is the snapshot's run on Old, the mock world on the six mock tabs
+    const header = dashTab === 'old' ? realRunHeader(snap) : mockRunHeader()
+    const counts = dashTab === 'old' ? realTabCounts(snap.run) : mockTabCounts()
 
     return (
       <Box flexDirection="column" width={cols} gap={1}>
@@ -174,19 +181,8 @@ export function registerDashboard(on: On, options: PluginOptions): void {
         {snap.error && (
           <Text color="yellow" bold={true}>⚠ {snap.error}</Text>
         )}
-        <Box flexDirection="row" flexWrap="wrap" gap={1}>
-          {TABS.map(t => (
-            <Button
-              key={`dash-tab-${t.key}`}
-              plain
-              hotkey={t.hotkey}
-              label={compact ? t.short : t.label}
-              variant={dashTab === t.key ? 'primary' : undefined}
-              dimColor={dashTab === t.key ? undefined : true}
-              onPress={() => { void switchTab($, t.key) }}
-            />
-          ))}
-        </Box>
+        {header != null && RunHeader(els, header, cols)}
+        {TabBar(els, $, dashTab, counts)}
         {dashTab === 'old'
           ? OldTab(els, snap, cols, compact)
           : dashTab === 'overview'
@@ -215,6 +211,115 @@ async function switchTab($: EngineInterface, tab: MkDashTab): Promise<void> {
   } catch {
     // no scroll here — the tab still switched
   }
+}
+
+/** V0.4's run header (Main.dc.html): the bold run name with the stage chip (and
+ *  the MOCK marker on a mock tab) on the right, the dim id line under NARROW
+ *  dropped, then the wrapped ▶ Next line. Every row is budgeted to `cols`. */
+function RunHeader(els: Els, head: RunHeaderData, cols: number) {
+  const { Box, Text } = els
+  // a chip draws ' label ' — one cell each side — and the two keep a gap column
+  const rightWidth = (head.mock ? 'MOCK'.length + 2 + 1 : 0) + head.stage.length + 2
+  const nameBudget = Math.max(1, cols - rightWidth - 1)
+  return (
+    <Box flexDirection="column">
+      <Box flexDirection="row" justifyContent="space-between" gap={1}>
+        <Text bold={true}>{truncateTitle(head.name, nameBudget)}</Text>
+        <Box flexDirection="row" gap={1} flexShrink={0}>
+          {head.mock && Chip(els, { label: 'MOCK', role: 'idle' })}
+          {Chip(els, { label: head.stage, role: 'live' })}
+        </Box>
+      </Box>
+      {cols >= NARROW && head.sub !== '' && (
+        <Text dimColor={true}>{truncateTitle(head.sub, cols)}</Text>
+      )}
+      {wrapToCols(`▶ ${head.next}`, cols).map((line, i) => (
+        <Text key={`next-${String(i)}`} color="subtle">{line}</Text>
+      ))}
+    </Box>
+  )
+}
+
+/** Word-wrap to `cols` cells (Main.dc.html's Next line wraps), one Text per
+ *  line: the pane's row-width contract holds and an overlong word is cut. */
+function wrapToCols(text: string, cols: number): string[] {
+  const width = Math.max(1, Math.floor(cols))
+  const lines: string[] = []
+  let line = ''
+  const push = (): void => { if (line !== '') { lines.push(line); line = '' } }
+  for (const word of text.split(/\s+/).filter(w => w !== '')) {
+    if (word.length > width) {
+      push()
+      for (let i = 0; i < word.length; i += width) lines.push(word.slice(i, i + width))
+      continue
+    }
+    if (line === '') line = word
+    else if (line.length + 1 + word.length <= width) line += ` ${word}`
+    else { push(); line = word }
+  }
+  push()
+  return lines.length > 0 ? lines : ['']
+}
+
+/** V0.4's tab bar (Controls.dc.html): the active tab is the primary chip with
+ *  its full word and count, the others the hotkey letter plus their count, dim.
+ *  The letters live in the labels: the engine draws a plain Button with a
+ *  `hotkey` as `h: label`, which is the `o: o` shape the brief bans. */
+function TabBar(els: Els, $: EngineInterface, dashTab: MkDashTab, counts: Record<MkDashTab, string>) {
+  const { Box, Button } = els
+  return (
+    <Box flexDirection="row" flexWrap="wrap" gap={1}>
+      {TABS.map(t => (
+        <Button
+          key={`dash-tab-${t.key}`}
+          label={dashTab === t.key
+            ? `${t.label}${counts[t.key] === '' ? '' : ` ${counts[t.key]}`}`
+            : `${t.hotkey}${counts[t.key] === '' ? '' : ` ${counts[t.key]}`}`}
+          variant={dashTab === t.key ? 'primary' : undefined}
+          plain={dashTab === t.key ? undefined : true}
+          dimColor={dashTab === t.key ? undefined : true}
+          onPress={() => { void switchTab($, t.key) }}
+        />
+      ))}
+    </Box>
+  )
+}
+
+/** The Old tab's header from the real snapshot (the newest run); no run, no
+ *  header — first-run and no-run keep their own panels. */
+function realRunHeader(snap: MkPaneSnapshot): RunHeaderData | null {
+  const run = snap.run
+  if (run == null) return null
+  const head = run.head_sha ? `@${run.head_sha.slice(0, 7)}` : ''
+  return {
+    name: run.feature,
+    stage: `${run.stage}/${STAGE_TOTAL} ${stageWord(run.stage)}`.trim(),
+    next: sanitizeText(run.next, 120),
+    sub: `${run.id} · ${run.branch}${head}`,
+    mock: false,
+  }
+}
+
+/** The Old tab's tab-bar counts from the same snapshot (the mockup's count
+ *  vocabulary): live lanes, done/total, one open decision. */
+function realTabCounts(run: MkRun | null): Record<MkDashTab, string> {
+  const none: Record<MkDashTab, string> = { overview: '', lanes: '', plan: '', usage: '', events: '', waiting: '', old: '' }
+  if (run == null) return none
+  const done = run.tasks.filter(t => DONE.has(t.status)).length
+  return {
+    ...none,
+    lanes: String(liveLaneRows(run)),
+    plan: `${done}/${run.tasks.length}`,
+    waiting: run.waiting ? '!1' : '',
+  }
+}
+
+/** The rows LanesSection lists (one per lane path, else the live tasks standing
+ *  in) — the tab-bar count must agree with the rows below it. */
+function liveLaneRows(run: MkRun): number {
+  const lanes = run.tasks.filter(t => t.lane && LANE_LIVE.has(t.status))
+  if (lanes.length > 0) return new Set(lanes.map(t => t.lane)).size
+  return run.tasks.filter(t => LANE_FALLBACK.has(t.status)).length
 }
 
 /** Arms the refresh, usage-poll and lane-sweep timers for `cwd`, then loads the first snapshot. */

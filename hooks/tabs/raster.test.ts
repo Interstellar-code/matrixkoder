@@ -85,8 +85,8 @@ test('gradientBar is one ▀ row: filled cells take the gradient, empty the trac
 })
 
 test('gradientBar interpolates between its stops by column position', () => {
-  const c = cells(gradientBar(100, 3, ['#000000', '#ffffff']))
-  expect(c.map(x => x.fg)).toEqual([0x000000, 0x808080, 0xffffff]) // 0, mid grey, full
+  const c = cells(gradientBar(100, 3, [PALETTE.grn, PALETTE.red]))
+  expect(c.map(x => x.fg)).toEqual([rgbWord(PALETTE.grn), 0xb7af82, rgbWord(PALETTE.red)])
   expect(c.every(x => x.bg === rgbWord(PALETTE.panel))).toBe(true)
 })
 

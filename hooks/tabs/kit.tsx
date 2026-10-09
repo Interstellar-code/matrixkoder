@@ -119,8 +119,8 @@ export function ActionButton(els: Els, spec: ActionSpec): RenderElement {
   return Button(props)
 }
 
-/** The terminal's drawn width of an action: `[ label ]` around a plain-free
- *  Button, the label alone for a plain one. The row folds on these numbers. */
+/** The terminal's drawn width of an action — `[ label ]` around a Button, the
+ *  label alone for a plain one. The row folds on these numbers. */
 function actionWidth(spec: ActionSpec): number {
   const label = actionLabel(spec)
   return spec.plain ? label.length : label.length + 4
