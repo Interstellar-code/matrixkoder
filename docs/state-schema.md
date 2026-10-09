@@ -114,7 +114,10 @@ and legacy path-only runs.
 `type`: `transition | decision | verdict | quota | note`. `task` is `null` for run-level events.
 `from`/`to` are task statuses (`from` is `null` when a task is added). `by` = writer (`orchestrator`,
 `lane-watch`, ...; `--by` flag). `text` carries the evidence (plan §4 called it `evidence`).
-`task set status=...` appends the transition event itself. `text` must be non-empty; a `transition`
+`task set status=...` appends the transition event itself. Every `--force` override of a safety gate
+writes exactly one `decision` event `forced by <by>: <command summary>` (`by` = the `--by` flag,
+default `orchestrator`): `task set` past unmet own+ancestor deps, `run init --plan` past an unapproved
+plan status. `text` must be non-empty; a `transition`
 event needs `to`. Readers skip a line that is not valid JSON (a crash mid-append); `run.json` is
 authoritative, so `events.jsonl` may hold one event more than `recent` after a crash.
 
@@ -270,13 +273,13 @@ everything else `default`.
 
 | Command | Flags |
 |---|---|
-| `run init` | `--id ID --feature F --branch B [--plan PATH --force]` — with `--plan`: the plan tool (`mk-plan.py`, or `$MK_PLAN_CMD`) `check` must pass and its status be `approved` (refused before any local write); `--force` overrides an unapproved status and logs an event. The plan then gets `set --status running` + `add-run --run ID`, the run stores `plan_id`/`plan_sha`/`plan_status`, and phase + child tasks are created through the `task add` path |
+| `run init` | `--id ID --feature F --branch B [--plan PATH --force]` — with `--plan`: the plan tool (`mk-plan.py`, or `$MK_PLAN_CMD`) `check` must pass and its status be `approved` (refused before any local write); `--force` overrides an unapproved status and writes a `decision` event naming `--by`. The plan then gets `set --status running` + `add-run --run ID`, the run stores `plan_id`/`plan_sha`/`plan_status`, and phase + child tasks are created through the `task add` path |
 | `plan sync` | `[--run ID] [--apply]` — diff the run's plan against its tasks (dry run by default, nothing written): new phase/task → added via the add path; changed `title`/`wave`/`owned`/`deps` on a `planned\|routed` task → updated, on a started task → warning only; removed → warning, **never deleted**. `--apply` stores the new `plan_sha` and writes exactly ONE summary event (the reused paths' per-task events are suppressed) |
 | `run list` / `run get` | `run get [--id ID \| ID]` (default: the single active run) |
 | `run set` | `[--id ID] [--next TEXT] [--status active\|done]` (at least one) |
 | `run stage` / `run archive` | `run stage N` (N >= 0, `[--id ID]`); `run archive --id ID` or `run archive ID` |
 | `task add` | `--id T --title TEXT [--wave N] [--deps A,RUN:B] [--owned glob,glob] [--parent P]` — deps are stored in the target's stored id case and a self-dep is refused; `--parent` onto a task in `merged`/`qa`/`done` fails; returns `warnings` for unknown deps, owned globs overlapping an unmerged task in any active run (the new task's own `--parent` chain is not an overlap: a parent owns its children's globs), and active sibling runs that could not be read |
-| `task set` | `T key=value ... [--note TEXT] [--force]` (`--force`: dispatch past unmet own+ancestor deps); `status=` on a task with children fails (it rolls up); keys `status agent model effort lane pane branch workspace slot last_commit gates verdict reviewer`; a value starting `{`/`[` is parsed as JSON, empty = null |
+| `task set` | `T key=value ... [--note TEXT] [--force]` (`--force`: dispatch past unmet own+ancestor deps; writes a `decision` event naming `--by`); `status=` on a task with children fails (it rolls up); keys `status agent model effort lane pane branch workspace slot last_commit gates verdict reviewer`; a value starting `{`/`[` is parsed as JSON, empty = null |
 | `task round` | `T --kind build\|fix\|takeover [--cause TEXT]`; `T --undo` drops the latest round — but only while none of its brief/report/review files exist (the paths `task round` returned), else `ok:false` naming them; exactly one note event (`round N undone`); no rounds / `--kind` with `--undo` are refused |
 | `task get` | `T` |
 | `event` | `[--task T] --type transition\|decision\|verdict\|quota\|note --text TEXT [--from S] [--to S]` |

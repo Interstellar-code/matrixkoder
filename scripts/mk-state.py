@@ -636,6 +636,8 @@ def cmd_run(a, st):
             if cur and gate.get("status") != "approved":
                 st.event(run, "note", f"plan {run['plan_id']} was {gate.get('status')!r}, not approved; "
                                       "run init forced with --force")
+                st.event(run, "decision", f"forced by {a.by}: run init --plan {a.plan} "
+                                          f"(plan status {gate.get('status')})", by=a.by)
             st.save(run)
             warnings = list(gate.get("warnings") or []) if gate else []
             for ph in (cur.get("phases") or []) if cur else []:
@@ -820,11 +822,14 @@ def cmd_task(a, st):
             if "status" in changes and any(c.get("parent") == t["id"] for c in run["tasks"]):
                 raise Fail(f"task {t['id']} has children: status rolls up from children "
                            "(set the children, or --parent elsewhere)")
-            if changes.get("status") in DEP_GATED and t["status"] not in DEP_GATED and not a.force:
+            if changes.get("status") in DEP_GATED and t["status"] not in DEP_GATED:
                 waiting = st.unmet_tree(run, t)  # the task's own deps plus every ancestor's
                 if waiting:
-                    raise Fail(f"task {t['id']} waits on {', '.join(waiting)} (not merged/qa/done); pass --force "
-                               "to dispatch anyway", unmet=waiting)
+                    if not a.force:
+                        raise Fail(f"task {t['id']} waits on {', '.join(waiting)} (not merged/qa/done); pass --force "
+                                   "to dispatch anyway", unmet=waiting)
+                    st.event(run, "decision", f"forced by {a.by}: task set {t['id']} status={changes['status']} "
+                             f"(unmet: {', '.join(waiting)})", task=t["id"], by=a.by)
             frm = t["status"]
             t.update(changes)
             if cur and "verdict" in changes:
@@ -1523,6 +1528,26 @@ def self_test():
             e = dk("task", "set", parent, "status=building", "--run", "rb", code=2)
             assert "status rolls up from children" in e["error"], e
 
+        # --force past the dep gate: ONE decision event naming --by (default: orchestrator)
+        dk("task", "add", "--id", "F1", "--title", "forced", "--deps", "A3", "--run", "rb")
+        dk("task", "add", "--id", "F2", "--title", "forced too", "--deps", "A3", "--run", "rb")
+        bev = os.path.join(tmp, "deps", "runs", "rb", "events.jsonl")
+        dec = lambda: [x for x in (json.loads(y) for y in open(bev)) if x["type"] == "decision"]
+        n_dec = len(dec())
+        e = dk("task", "set", "F1", "status=dispatched", "--run", "rb", code=2)  # unforced: still refused
+        assert "waits on A3" in e["error"] and e["unmet"] == ["A3"] and len(dec()) == n_dec, e
+        out = dk("task", "set", "F1", "status=dispatched", "--force", "--by", "user", "--run", "rb")
+        assert out["ok"] and out["task"]["status"] == "dispatched", out
+        d = dec()[n_dec:]
+        assert len(d) == 1 and d[0]["by"] == "user" and d[0]["task"] == "F1", d  # exactly one decision
+        assert d[0]["text"] == "forced by user: task set F1 status=dispatched (unmet: A3)", d
+        assert any(x["type"] == "transition" and x["task"] == "F1" and x["to"] == "dispatched"
+                   for x in (json.loads(y) for y in open(bev)))  # the usual transition event stays
+        dk("task", "set", "F2", "status=building", "--force", "--run", "rb")  # no --by → orchestrator
+        d = dec()[n_dec:]
+        assert len(d) == 2 and d[1]["by"] == "orchestrator", d
+        assert d[1]["text"] == "forced by orchestrator: task set F2 status=building (unmet: A3)", d
+
         # --parent onto merged/qa/done is refused; other runs' ready stays correct after an add
         dk("task", "add", "--id", "Q2", "--title", "q2", "--run", "rb")
         dk("task", "add", "--id", "D2", "--title", "waits on rb:Q2", "--deps", "rb:Q2", "--run", "ra")
@@ -1681,6 +1706,9 @@ def self_test():
                   "--force")["ok"] is True
         evs = [json.loads(x) for x in open(os.path.join(pd, "runs", "pf1", "events.jsonl"))]
         assert any("not approved" in x["text"] and "--force" in x["text"] for x in evs), evs
+        d = [x for x in evs if x["type"] == "decision"]
+        assert len(d) == 1 and d[0]["by"] == "orchestrator", d  # exactly one decision event
+        assert d[0]["text"] == f"forced by orchestrator: run init --plan {pfile} (plan status draft)", d
         pk("run", "archive", "--id", "pf1")
 
         # a plan tool that cannot even run: refused before any local write

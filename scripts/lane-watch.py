@@ -20,8 +20,11 @@ With --no-commit (a reviewer pane: nothing is committed, so there is no commit t
 A herdr ERROR is retried; the watcher exits ERROR after 3 in a row, or on any crash (still one JSON line).
 Idle/done/working agent, not Done, and no file/commit/pane change for --stall-min since watch start → STALL
 (lane-watch decides STALL itself; lane-health's file-only STALL is not used here).
-Pane output that changed since the last poll (digits ignored, so a ticking timer is not activity) counts as
-activity too: a builder running tests or a revert/re-apply proof without touching files is not STALL.
+Pane output that changed since the last poll (digits ignored, so a ticking timer is not activity — the
+`↳ N toolcalls` counter is exempt: a changed count is activity) counts as activity too, and so does the
+mere presence of a running subagent task line (a braille spinner + "Task —"): a builder running tests,
+a revert/re-apply proof or a lead waiting on its subagents is not STALL. Finished "✓ … Task —" lines
+alone are not activity — with only those left, the stall clock runs again.
 With --then-send, on DONE it dispatches "Read and follow <BRIEF_PATH> exactly ..." to the same agent
 via the herdr skill's herdr-ask.py (which refuses busy agents, so we only send once idle).
 With --task and --data (both or neither), every exit writes the task status via mk-state (DONE→verifying,
@@ -77,10 +80,27 @@ def phase_tokens(text, phase):
     return bool(done), None
 
 
+TOOLCALLS_RE = re.compile(r"(↳\s*)(\d+)(\s*toolcalls)")  # the ↳ N toolcalls subagent counter, kept below
+COUNT_AS_LETTERS = str.maketrans("0123456789", "abcdefghij")  # digits that survive the drop
+SPINNERS = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"  # braille glyphs a busy CLI spins through
+RUNNING_TASK_RE = re.compile(rf"(?m)^[{SPINNERS}].*Task —")  # a running subagent task line (em dash)
+
+
 def pane_fingerprint(text):
-    """Pane text with digits dropped: spinners and elapsed-time counters change digits only.
-    ponytail: a hung CLI that redraws non-digit text (an animated spinner glyph) still looks active; match its spinner line here if that shows up."""
-    return re.sub(r"\d+", "", text)
+    """Pane text with digits dropped: spinners and elapsed-time counters change digits only. The
+    `↳ N toolcalls` counter is exempt (its digits become letters): a changed count between polls is
+    subagent activity, the `12m 48s` timer it sits next to still is not.
+    ponytail: a redrawn spinner glyph already moves this; a spinner line whose glyph happens not to
+    change between two polls is caught by running_task() instead (presence, not change)."""
+    kept = TOOLCALLS_RE.sub(lambda m: m.group(1) + m.group(2).translate(COUNT_AS_LETTERS) + m.group(3), text)
+    return re.sub(r"\d+", "", kept)
+
+
+def running_task(text):
+    """True while a running subagent task line is on screen — a braille spinner (⠋⠙⠹…) then
+    "Task —": the subagent is actively working, so the line's presence alone is activity even when
+    the glyph does not change between two polls. Finished "✓ … Task —" lines (no spinner) never count."""
+    return bool(RUNNING_TASK_RE.search(text))
 
 
 def decide(h, subj, rx, report_ok, text, phase, stall_min):
@@ -222,8 +242,11 @@ def watch(a):
         subj = commit_subject(lane)
         # math.inf: lane-health judges only files/commits; STALL is decided in decide() with pane activity
         h = lh.check(agent, lane, kind, math.inf, active, marker)
-        fp = pane_fingerprint(h.get("text", ""))
-        if last_fp is not None and fp != last_fp:  # pane moved: idle time counts from now, re-check with it
+        text = h.get("text", "")
+        fp = pane_fingerprint(text)
+        # pane moved, or a subagent task line (spinner + "Task —") is running: the lane is alive, so
+        # idle time counts from now; only when no task line remains does the stall clock run again
+        if last_fp is not None and (fp != last_fp or running_task(text)):
             active = time.time()
             h = lh.check(agent, lane, kind, math.inf, active, marker)
         last_fp = fp
@@ -310,6 +333,16 @@ def self_test():
     # pane activity: digit-only changes (timers) are not activity; new output lines are
     assert pane_fingerprint("Working (12s) esc to interrupt") == pane_fingerprint("Working (73s) esc to interrupt")
     assert pane_fingerprint("$ vitest run\n") != pane_fingerprint("$ vitest run\n 10 failed\n")
+    # the ↳ N toolcalls counter is activity (a changed count moves the fingerprint); its timer is not
+    assert pane_fingerprint("⠼ General Task — E2\n↳ 49 toolcalls · 12m 48s\n") != \
+        pane_fingerprint("⠼ General Task — E2\n↳ 50 toolcalls · 12m 48s\n")
+    assert pane_fingerprint("⠼ General Task — E2\n↳ 49 toolcalls · 12m 48s\n") == \
+        pane_fingerprint("⠼ General Task — E2\n↳ 49 toolcalls · 13m 5s\n")
+    # a running task line (spinner + "Task —") is activity by presence; finished ✓ lines are not
+    assert running_task("⠼ General Task — E2 reviewer key, quiet optional\n")
+    assert running_task("⠋ Task — x") and running_task("⠏Task — x")
+    assert not running_task("✓ General Task — E2 reviewer key\n")
+    assert not running_task("some Task — mentioned mid-prose\n") and not running_task("↳ 49 toolcalls\n")
     # status map covers every mapped exit with a valid mk-state status
     sp = importlib.util.spec_from_file_location("mk_state", MK_STATE)
     mk = importlib.util.module_from_spec(sp)
@@ -466,13 +499,17 @@ def self_test():
         work_bin = os.path.join(tmp, "workbin")
         os.makedirs(work_bin)
         grow = os.path.join(tmp, "grow.txt")
+        cnt = os.path.join(tmp, "cnt.txt")
         open(grow, "w").write("")
         with open(os.path.join(work_bin, "herdr"), "w") as f:
             f.write('#!/bin/sh\nif [ "$2" = get ]; then echo \'{"result":{"agent":{"agent_status":"working"}}}\'; '
                     # like real herdr: a working full-screen agent refuses history reads; only --source visible
                     'elif [ "$5" != visible ]; then echo \'{"error":{"code":"agent_not_idle"}}\'; '
                     f'else echo "> Read and follow brief-r3.md"; cat "{grow}"; '
-                    f'if [ -n "$MK_GROW" ]; then echo thinking >> "{grow}"; fi; fi\n')
+                    f'if [ -n "$MK_GROW" ]; then echo thinking >> "{grow}"; fi; '
+                    # MK_COUNT: only the ↳ N toolcalls counter moves between polls, nothing else does
+                    f'if [ -n "$MK_COUNT" ]; then n=$(cat "{cnt}" 2>/dev/null || echo 49); '
+                    f'echo "↳ $n toolcalls · 12m 48s"; echo $((n + 1)) > "{cnt}"; fi; fi\n')
         os.chmod(os.path.join(work_bin, "herdr"), 0o755)
         for grows, want in ((True, "WATCH_EXPIRED"), (False, "STALL")):
             e2 = dict(env, PATH=work_bin + os.pathsep + os.environ["PATH"], **({"MK_GROW": "1"} if grows else {}))
@@ -481,6 +518,23 @@ def self_test():
                                 "--stall-min", "0.02", "--max-wait-min", "0.06"], env=e2, capture_output=True, text=True)
             out = json.loads(r.stdout.strip().splitlines()[-1])
             assert out["state"] == want, (grows, out)
+
+        def probe(pane_txt, want, **extra):
+            """One watch run against the working-agent fake; assert its exit state."""
+            open(grow, "w").write(pane_txt)
+            e3 = dict(env, PATH=work_bin + os.pathsep + os.environ["PATH"], **extra)
+            r = subprocess.run([sys.executable, __file__, "--lane", lane, "--agent", "w1", "--commit-grep", "nomatch",
+                                "--prompt-marker", "Read and follow brief-r3.md", "--poll", "0.1",
+                                "--stall-min", "0.02", "--max-wait-min", "0.06"], env=e3, capture_output=True, text=True)
+            out = json.loads(r.stdout.strip().splitlines()[-1])
+            assert out["state"] == want, (pane_txt or extra, out)
+
+        # tonight's false STALL: a pane whose only life is a running subagent task line (spinner +
+        # "Task —", text frozen between polls so the fingerprint never moves) is activity; a pane
+        # with only finished "✓ … Task —" lines is not; a lone ticking ↳ N toolcalls counter is
+        probe("⠼ General Task — E2 reviewer key, quiet optional\n↳ 49 toolcalls · 12m 48s\n", "WATCH_EXPIRED")
+        probe("✓ General Task — E2 reviewer key\n", "STALL")
+        probe("", "WATCH_EXPIRED", MK_COUNT="1")
         # lane-health CLI: QUOTA keyed by kind into $MATRIXKODER_HOME/usage.json, scope reported
         open(pane, "w").write("> Read and follow brief-r2.md\n■ You've hit your usage limit. Try again in 2 hours.\n")
         r = subprocess.run([sys.executable, os.path.join(HERE, "lane-health.py"), "--agent", "w1", "--lane", lane,
