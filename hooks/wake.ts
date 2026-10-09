@@ -8,10 +8,12 @@ import { candidateDirs, globalDirPath, join, mainCheckout, parseGitdir, parseJso
 const WAKE_STATUSES = new Set(['verifying', 'blocked', 'quota', 'stalled', 'provider'])
 const TASK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 const COOLDOWN_MS = 5 * 60 * 1000 // 5 minutes
+const HOLD_MS = 10 * 60 * 1000 // 10 minutes: a submit that threw may still have been queued
+const HOLD_GONE = -1 // a hold that already gave up: never blocks a later identical text
 
 let debounceTimer: Timer | null = null
 let pollTimer: Timer | null = null
-let retryNext = false // a submit failed: the next poll tick retries at once
+let retryNext = false // a submit failed or its text is on hold: the next poll tick re-checks the batch at once
 
 type Pending = MkWakePending
 const pendingRef = { plugin: 'matrixkoder', key: 'wakePending' } as const
@@ -121,7 +123,11 @@ async function currentTaskStatus($: EngineInterface, dataDir: string, run: strin
   return undefined
 }
 
-/** Submits the persisted batch. The seen-line count moves only after the submit resolved. */
+/** The identical-text hold sits in the wakeSentAt family under the id `hold:<text>` (a family
+ *  id is the only computed key the engine lists; the task ids the cooldown uses cannot collide
+ *  with the `hold:` prefix). It holds the time of the last submit attempt of that exact text:
+ *  a submit that threw may still have been queued by a busy session, so the identical text is
+ *  never resent within HOLD_MS; a negative value is a hold that already gave up and blocks nothing. */
 async function flushBatch($: EngineInterface): Promise<void> {
   debounceTimer = null
   const pend = await readPending($)
@@ -149,10 +155,29 @@ async function flushBatch($: EngineInterface): Promise<void> {
   const summary = items.map(p => `${p.task} → ${p.to}`).join(', ')
   const text = `MatrixKoder: ${summary}. Continue the run from its Next action.`
 
+  const held = await $.state
+    .get({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `hold:${text}` } as const)
+    .catch(() => ({ value: undefined }))
+  const heldAt = typeof held.value === 'number' ? held.value : undefined
+  if (heldAt !== undefined && heldAt >= 0) {
+    if (now - heldAt < HOLD_MS) {
+      retryNext = true // keep the batch and the old line count; the next poll tick re-checks the hold
+      return
+    }
+    // the hold expired: that attempt may or may not have been queued — give up on the batch instead of resending
+    await $.state.set({ plugin: 'matrixkoder', key: 'wakeEventLines', id: pend.run } as const, pend.upTo).catch(() => {})
+    await $.state.set(pendingRef, EMPTY_PENDING).catch(() => {})
+    await $.state.set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `hold:${text}` } as const, HOLD_GONE).catch(() => {})
+    retryNext = false
+    return
+  }
+
   try {
     await $.prompt.submit({ text })
   } catch {
-    retryNext = true // keep the batch and the old line count; the next poll tick retries
+    // the submit may still have been queued: hold the identical text instead of ever resending it
+    await $.state.set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `hold:${text}` } as const, now).catch(() => {})
+    retryNext = true // keep the batch and the old line count; the next poll tick re-checks the hold
     return
   }
   retryNext = false
@@ -176,7 +201,7 @@ async function pollEvents($: EngineInterface): Promise<void> {
       runs = null
     }
     const active = Array.isArray(runs) ? (runs.find((r: { status?: string }) => r.status === 'active') as { id?: string } | undefined) : undefined
-    // a batch found before a reload (or a failed submit) is still owed, but only to the run that is still active
+    // a batch found before a reload (or a held/failed submit) is still owed, but only to the run that is still active
     const owed = await readPending($)
     if (owed.items.length > 0 && (!active?.id || owed.run !== active.id)) {
       await $.state.set(pendingRef, EMPTY_PENDING).catch(() => {}) // a finished run must not wake the session

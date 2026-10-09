@@ -522,7 +522,7 @@ test('a batch persisted before a reload is still submitted (module memory lost)'
   expect(w.store.get('wakePending:')).toMatchObject({ items: [] })
 })
 
-test('a failed submit keeps the batch and the line count, and the next tick retries', { options: { wake: true } }, async ($, on) => {
+test('a failed submit keeps the batch and the line count; ticks during the hold do not resend it', { options: { wake: true } }, async ($, on) => {
   const clock = mock.clock(on)
   const files: Record<string, string> = {
     '/data/runs/index.json': JSON.stringify([{ id: 'r1', status: 'active' }]),
@@ -533,35 +533,45 @@ test('a failed submit keeps the batch and the line count, and the next tick retr
   w.failSubmits.n = 1
   await $.session.start(START('/tmp'))
   await clock.advance(30000) // poll: found
-  await clock.advance(30000)
-  await clock.advance(30000) // debounce (60 s after the find) fires: the submit is refused
-  await clock.advance(30000) // the next poll tick retries
-  await clock.advance(30000)
-  expect(w.seenAtSubmit, 'two attempts, the line count unmoved at both').toEqual([0, 0])
-  expect(w.submitted).toEqual(['MatrixKoder: F6 → verifying. Continue the run from its Next action.'])
-  expect(w.store.get('wakeEventLines:r1')).toBe(1)
-  expect(w.store.get('wakeSentAt:F6:verifying')).toBeDefined()
-  await clock.advance(300000)
-  expect(w.submitted.length, 'sent once').toBe(1)
+  await clock.advance(60000) // 90 s: the debounce fires, the one submit attempt throws
+  expect(w.seenAtSubmit, 'exactly one submit call so far').toEqual([0])
+  await clock.advance(30000) // 120 s: the poll tick re-checks — the identical text is on hold, no resend
+  await clock.advance(30000) // 150 s: still on hold
+  expect(w.seenAtSubmit, 'no second call with the identical text').toEqual([0])
+  expect(w.submitted).toEqual([])
+  expect(w.store.get('wakeEventLines:r1'), 'line count unmoved during the hold').toBe(0)
+  expect(w.store.get('wakePending:')).toMatchObject({ run: 'r1', upTo: 1, items: [{ task: 'F6', to: 'verifying' }] })
+  expect(w.store.get('wakeSentAt:hold:MatrixKoder: F6 → verifying. Continue the run from its Next action.')).toBe(90000)
 })
 
 // ---------- r4: retryNext, stale pending, projects.json ----------
 
-test('after a refused submit the very next poll tick retries (not the 60 s debounce)', { options: { wake: true } }, async ($, on) => {
+test('the hold lives in $.state: after a reload the identical text is still held, then given up', { options: { wake: true } }, async ($, on) => {
   const clock = mock.clock(on)
   const files: Record<string, string> = {
     '/data/runs/index.json': JSON.stringify([{ id: 'r1', status: 'active' }]),
     '/data/runs/r1/events.jsonl': EV('F6', 'verifying'),
   }
   const w = wakeWorld(on, files, [], { MATRIXKODER_DATA: '/data' }, '/tmp')
+  const text = 'MatrixKoder: F6 → verifying. Continue the run from its Next action.'
   w.store.set('wakeEventLines:r1', 0)
-  w.failSubmits.n = 1
+  w.store.set('wakePending:', { run: 'r1', upTo: 1, items: [{ task: 'F6', to: 'verifying' }] })
+  w.store.set(`wakeSentAt:hold:${text}`, 0) // the hold was persisted before the reload
   await $.session.start(START('/tmp'))
-  await clock.advance(30000) // poll 1: found, debounce due at 90 s
-  await clock.advance(60000) // 90 s: the debounce fires and the submit is refused (the 90 s poll may already retry)
-  await clock.advance(30000) // 120 s: within ONE poll tick of the refusal. Without retryNext a poll only re-arms a 60 s debounce
-  expect(w.seenAtSubmit.length, 'retried at the next tick').toBe(2)
-  expect(w.submitted).toEqual(['MatrixKoder: F6 → verifying. Continue the run from its Next action.'])
+  await clock.advance(30000) // poll: the persisted batch re-arms the 60 s debounce
+  await clock.advance(60000) // 90 s: the flush meets the hold — the identical text is not resent
+  await clock.advance(120000) // 210 s: every tick re-checks; still inside the hold
+  expect(w.seenAtSubmit.length, 'submit never called inside the hold').toBe(0)
+  expect(w.store.get('wakeEventLines:r1'), 'lines not consumed during the hold').toBe(0)
+  expect(w.store.get('wakePending:')).toMatchObject({ items: [{ task: 'F6', to: 'verifying' }] })
+  await clock.advance(450000) // 660 s: past the 10-minute hold the batch is given up, not resent
+  expect(w.seenAtSubmit.length).toBe(0)
+  expect(w.submitted).toEqual([])
+  expect(w.store.get('wakeEventLines:r1'), 'lines consumed at the hold expiry').toBe(1)
+  expect(w.store.get('wakePending:')).toMatchObject({ items: [] })
+  expect(w.store.get(`wakeSentAt:hold:${text}`)).toBe(-1)
+  await clock.advance(300000)
+  expect(w.seenAtSubmit.length, 'no resend ever').toBe(0)
 })
 
 test('a persisted batch of a run that is no longer active is dropped, not submitted', { options: { wake: true } }, async ($, on) => {
@@ -646,4 +656,60 @@ test('a still-current transition still wakes after the flush-time status re-read
   expect(w.store.get('wakeSentAt:E4:stalled'), 'no cooldown stamped for the dropped item').toBeUndefined()
   expect(w.store.get('wakeEventLines:r1')).toBe(3)
   expect(w.store.get('wakePending:')).toMatchObject({ items: [] })
+})
+
+// ---------- H1: a submit that threw may still have been queued — the identical text is held ----------
+
+test('H1.1: submit throws on 4 consecutive ticks → at most one submit call in 10 min, then the hold gives up', { options: { wake: true } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const files: Record<string, string> = {
+    '/data/runs/index.json': JSON.stringify([{ id: 'r1', status: 'active' }]),
+    '/data/runs/r1/events.jsonl': EV('F6', 'verifying'),
+  }
+  const w = wakeWorld(on, files, [], { MATRIXKODER_DATA: '/data' }, '/tmp')
+  w.store.set('wakeEventLines:r1', 0)
+  w.failSubmits.n = 4 // every one of the next 4 submits would throw
+  await $.session.start(START('/tmp'))
+  await clock.advance(30000) // poll: found, debounce armed
+  await clock.advance(60000) // 90 s: the debounce fires — the one allowed attempt throws
+  await clock.advance(90000) // 180 s: the retry ticks meet the hold; no further call happens
+  expect(w.seenAtSubmit.length, 'exactly one submit call so far').toBe(1)
+  await clock.advance(480000) // 660 s: still inside the 10-minute hold
+  expect(w.seenAtSubmit, 'at most one call with that text within 10 minutes').toEqual([0])
+  expect(w.submitted, 'nothing ever landed').toEqual([])
+  expect(w.store.get('wakeEventLines:r1'), 'lines still unconsumed').toBe(0)
+  expect(w.store.get('wakePending:')).toMatchObject({ items: [{ task: 'F6', to: 'verifying' }] })
+  await clock.advance(90000) // 750 s: past the hold the batch is dropped, not resent
+  expect(w.seenAtSubmit.length).toBe(1)
+  expect(w.submitted).toEqual([])
+  expect(w.store.get('wakeEventLines:r1'), 'lines consumed by the give-up').toBe(1)
+  expect(w.store.get('wakePending:')).toMatchObject({ items: [] })
+  await clock.advance(300000)
+  expect(w.seenAtSubmit.length, 'no resend ever').toBe(1)
+  expect(w.submitted).toEqual([])
+})
+
+test('H1.1: a new, different batch goes out during the hold; its lines move only at the successful submit', { options: { wake: true } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const files: Record<string, string> = {
+    '/data/runs/index.json': JSON.stringify([{ id: 'r1', status: 'active' }]),
+    '/data/runs/r1/events.jsonl': EV('F6', 'verifying'),
+  }
+  const w = wakeWorld(on, files, [], { MATRIXKODER_DATA: '/data' }, '/tmp')
+  w.store.set('wakeEventLines:r1', 0)
+  w.failSubmits.n = 1
+  await $.session.start(START('/tmp'))
+  await clock.advance(30000) // poll: F6 → verifying enters the batch
+  await clock.advance(60000) // 90 s: the submit of that text throws and is held
+  files['/data/runs/r1/events.jsonl'] = EV('F6', 'verifying') + EV('F8', 'stalled')
+  await clock.advance(30000) // 120 s: the old text is still held; the scan adds F8 to the batch
+  expect(w.seenAtSubmit.length, 'still only the held attempt').toBe(1)
+  expect(w.submitted).toEqual([])
+  await clock.advance(60000) // 180 s: the re-armed debounce fires — the batch text now differs and goes out during the hold
+  expect(w.submitted).toEqual(['MatrixKoder: F6 → verifying, F8 → stalled. Continue the run from its Next action.'])
+  expect(w.seenAtSubmit, 'both attempts saw the lines unconsumed').toEqual([0, 0])
+  expect(w.store.get('wakeEventLines:r1'), 'lines consumed by the successful submit').toBe(2)
+  expect(w.store.get('wakePending:')).toMatchObject({ items: [] })
+  await clock.advance(300000)
+  expect(w.submitted.length, 'the held text alone is never submitted').toBe(1)
 })
