@@ -21,8 +21,9 @@ ref argument must resolve to a commit here before it reaches git.
 Why slots: one git worktree per task means pnpm install, a fresh .env copy and a fresh agent
 folder-trust prompt for every task. A slot is a persistent checkout reused across tasks: acquire
 takes the lowest free clean slot, release detaches it back to the integration branch. Names are
-computed here, so no agent invents one. `lanes: copy: [...]` names gitignored paths a freshly
-created slot needs (.env, generated types): they are copied from the main checkout on create.
+computed here, so no agent invents one. `lanes: copy: [...]` names gitignored paths a slot needs
+(.env, generated types): they are copied from the main checkout on every acquire — a reused slot
+gets only the targets it is missing, an existing target is never overwritten.
 
 This tool belongs to the ORCHESTRATOR: it runs `git switch` inside a slot, only after the slot is
 verified clean and never with force. Builders never run it. It owns <data>/lanes.json (outside runs/);
@@ -412,6 +413,40 @@ def herdr_json_id(text):
                  "(want result.workspace.workspace_id or result.worktree.open_workspace_id)"
 
 
+STALE_WS_ID = "cli:worktree:create"  # herdr's RPC id: an old id capture stored it as a workspace id
+
+
+def herdr_list_workspace_id(main, path):
+    """-> (workspace_id | None, warning | None): the open_workspace_id herdr's `worktree list`
+    carries for <path> (--cwd keeps the list to this repo). A path herdr does not know — a
+    plain-git slot — is (None, None): the caller leaves the stored id as is. Only a herdr that
+    fails or answers nothing usable is a warning, the same best-effort rule as the create side."""
+    r = run_cmd([herdr_bin(), "worktree", "list", "--cwd", main], HERDR_TIMEOUT)
+    if r.returncode != 0:
+        why = (r.stderr or r.stdout).strip()[:150] or f"exit {r.returncode}"
+        return None, f"herdr worktree list failed: {why}"
+    for line in reversed([x for x in r.stdout.splitlines() if x.strip()]):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(d, dict):
+            continue
+        result = d.get("result") if isinstance(d.get("result"), dict) else {}
+        wts = result.get("worktrees")
+        if not isinstance(wts, list):
+            continue
+        for w in wts:  # the id for THIS slot's path, never whatever entry happens to be first
+            if not isinstance(w, dict) or not w.get("path"):
+                continue
+            if os.path.normpath(w["path"]) == os.path.normpath(path) \
+                    or os.path.realpath(w["path"]) == os.path.realpath(path):
+                wid = w.get("open_workspace_id") or w.get("workspace_id")
+                return (str(wid), None) if wid else (None, None)
+        return None, None  # a list without this path: unknown to herdr, not an error
+    return None, "herdr worktree list printed no worktree list"
+
+
 def ensure_lane_exclude(lane):
     """`.matrixkoder-*` and `.omo/` into the slot's info/exclude (same pattern as
     mk-lane-event.py): lane reports and agent state never read as untracked in a slot."""
@@ -695,12 +730,13 @@ def tracked_in(main, rel):
 
 
 def copy_into_slot(cfg, main, lane):
-    """The lanes.copy entries from the main checkout into a freshly created slot: the fresh
-    worktree has the tracked files, not the gitignored ones a build needs (.env, generated
-    types). Only UNTRACKED content is copied — a tracked source would put repo files in the slot's
-    status — and only literal in-checkout paths: absolute paths, `..` components and symlinks
-    resolving outside the main checkout are skipped. -> warnings; a missing, tracked or
-    unreadable source is reported, never fatal."""
+    """The lanes.copy entries from the main checkout into the slot — on every acquire, not only a
+    fresh one: the worktree has the tracked files, not the gitignored ones a build needs (.env,
+    generated types). A target that already exists in the slot is NEVER overwritten: a reused slot
+    keeps its own copy, only a missing target is filled. And only UNTRACKED content is copied — a
+    tracked source would put repo files in the slot's status — and only literal in-checkout paths:
+    absolute paths, `..` components and symlinks resolving outside the main checkout are skipped.
+    -> warnings; a missing, tracked or unreadable source is reported, never fatal."""
     warns = []
     for rel in cfg["copy"]:
         src, dst = os.path.join(main, rel), os.path.join(lane, rel)
@@ -712,6 +748,8 @@ def copy_into_slot(cfg, main, lane):
             if tracked_in(main, rel):
                 warns.append(f"lanes copy: {rel!r} is tracked in {os.path.basename(main)}, skipped")
                 continue
+            if os.path.lexists(dst):
+                continue  # never overwrite: a target already in the slot stays exactly as it is
             if os.path.isdir(src):
                 shutil.copytree(src, dst, dirs_exist_ok=True)
             elif os.path.isfile(src):
@@ -776,18 +814,31 @@ def cmd_acquire(a, cfg, data, main):
         rec["workspace"] = workspace_name(main, n)  # rec["path"] is never reassigned: a slot stays put
         rec["branch"] = nms["branch"]
         warns = []
+        create_warn = None
         if created:
             if os.path.lexists(rec["path"]):
                 raise Fail(f"slot path {rec['path']} exists and is not a registered slot")
-            if warn := create_slot(rec, main, base):
-                warns.append(warn)
-            warns += copy_into_slot(cfg, main, rec["path"])
+            create_warn = create_slot(rec, main, base)
         else:
             verify_slot_path(n, rec["path"], main)
             require_clean(n, rec, cfg)  # before any git command runs
             require_no_stray(n, rec["path"])
             git(["-C", rec["path"], "switch", "--detach", base])
             git(["-C", rec["path"], "switch", "-c", rec["branch"]])  # an existing branch fails here
+        # lanes.copy runs on EVERY acquire: a fresh slot gets everything, a reused slot only the
+        # targets it is missing — an existing target is never overwritten (copy_into_slot).
+        warns += copy_into_slot(cfg, main, rec["path"])
+        # a stale registry id (null, or herdr's RPC name an old capture stored) is repaired from
+        # herdr's own list before the record is written; a path herdr does not know stays as is
+        if rec.get("workspace_id") in (None, STALE_WS_ID) and herdr_bin() != "none":
+            wid, warn = herdr_list_workspace_id(main, rec["path"])
+            if wid:
+                rec["workspace_id"] = wid
+                create_warn = None
+            elif warn:
+                warns.append(warn)
+        if create_warn:
+            warns.append(create_warn)
         h = lock_hash(rec["path"])
         install_needed = created or h != rec.get("lock_hash") or rec.get("lock_hash") is None
         touch(rec, state="busy", run=a.run, task=a.task or a.tasks, lock_hash=h)
@@ -1615,6 +1666,82 @@ def self_test():
         lanes = read_lanes(data)  # the fake made no worktree: drop the record again
         lanes["slots"].pop("6", None)
         write_lanes(data, lanes)
+
+        # 16 F4 on a REUSED slot: copies fill only missing targets, a stale id is repaired
+        # from herdr's list — the same rules as on create, nothing existing ever overwritten
+
+        # a reused slot dir + a fake config: a missing target is copied, an existing one is kept
+        # as is, and the tracked/escape refusals are exactly the create path's
+        reused = os.path.join(tmp, "reused-slot")
+        os.makedirs(reused)
+        write(os.path.join(reused, ".env"), "TOKEN=old\n")
+        write(os.path.join(repo, "gen", "t.d.ts"), "export type T = number\n")
+        os.symlink(tmp, os.path.join(repo, "escape"))
+        rw = copy_into_slot({"copy": [".env", "gen", "escape", "/abs", "../up"]}, repo, reused)
+        assert open(os.path.join(reused, ".env")).read() == "TOKEN=old\n", rw  # never overwritten
+        assert open(os.path.join(reused, "gen", "t.d.ts")).read() == "export type T = number\n", rw
+        assert len(rw) == 3 and all("lanes copy" in w for w in rw), rw  # escape, /abs, ../up refuse
+        assert not os.path.exists(os.path.join(reused, "escape")), rw
+        os.unlink(os.path.join(repo, "escape"))
+
+        # ...and through acquire: slot 5 is reused (its path exists), loses its .env, and gets
+        # main's current one back; the second reuse keeps the slot's own newer .env untouched
+        write(os.path.join(data, "matrixkoder.yaml"),
+              'repo:\n  lanes: { slots: 5, pattern: "../{repo}-mk-{n}", reuse: true, '
+              'copy: ["README.md", "src", ".env"] }\n'
+              'routing_preferences:\n  max_build_lanes: 5\n')
+        st("task", "add", "--id", "t16", "--title", "sixteen", "--run", "r1")
+        # integration must ignore .env too: release parks the slot there, and there the copied
+        # .env would read `??` untracked — dirty — instead of ignored-and-disposable
+        write(os.path.join(integ, ".gitignore"),
+              "node_modules/\n__pycache__/\n/.venv/\n.omc/\nprod.sqlite\n.env\n")
+        g("-C", integ, "add", ".gitignore"), g("-C", integ, "commit", "-qm", "ignore .env")
+        assert mk("release", "--slot", "5", "--integration", "mk/r1/integration")["ok"]
+        os.unlink(os.path.join(slot5, ".env"))
+        write(os.path.join(repo, ".env"), "TOKEN=fresh\n")
+        ru = mk("acquire", "--run", "r1", "--task", "t16", "--base", "main")
+        assert (ru["ok"], ru["slot"], ru["created"]) == (True, 5, False), ru
+        assert open(os.path.join(slot5, ".env")).read() == "TOKEN=fresh\n", ru  # missing → copied
+        assert ru["warning"].count("lanes copy") == 2, ru  # tracked README.md/src still refuse
+        assert next(s for s in mk("list")["slots"] if s["slot"] == 5)["clean"] is True
+        st("task", "add", "--id", "t17", "--title", "seventeen", "--run", "r1")
+        assert mk("release", "--slot", "5", "--integration", "mk/r1/integration")["ok"]
+        write(os.path.join(repo, ".env"), "TOKEN=newer\n")
+        keep = mk("acquire", "--run", "r1", "--task", "t17", "--base", "main")
+        assert (keep["ok"], keep["slot"], keep["created"]) == (True, 5, False), keep
+        assert open(os.path.join(slot5, ".env")).read() == "TOKEN=fresh\n", keep  # kept, not replaced
+        yaml_cap(5, 5)
+
+        # a stale registry id becomes the open_workspace_id for THIS slot's path (wL5, not wL1);
+        # a null id on a path herdr's list does not know stays null, and the acquire still succeeds
+        def fake_list_herdr(path_ids):
+            fake = os.path.join(tmp, "fake-herdr-" + "-".join(w for _, w in path_ids))
+            wts = ",".join(f"{{'path': {p!r}, 'open_workspace_id': {w!r}}}" for p, w in path_ids)
+            write(fake, "#!/usr/bin/env python3\n"
+                        "import json\n"
+                        f"print(json.dumps({{'id': 'cli:worktree:list', "
+                        f"'result': {{'worktrees': [{wts}]}}}}))\n")
+            os.chmod(fake, 0o755)
+            return fake
+
+        assert mk("release", "--slot", "5", "--integration", "mk/r1/integration")["ok"]
+        lanes = read_lanes(data)
+        lanes["slots"]["5"]["workspace_id"] = "cli:worktree:create"  # the stale capture
+        write_lanes(data, lanes)
+        st("task", "add", "--id", "t18", "--title", "eighteen", "--run", "r1")
+        ws = mk("acquire", "--run", "r1", "--task", "t18", "--base", "main",
+                e=dict(env, MK_HERDR=fake_list_herdr([(slot1, "wL1"), (slot5, "wL5")])))
+        assert (ws["ok"], ws["slot"], ws["workspace_id"]) == (True, 5, "wL5"), ws
+        assert next(s for s in mk("list")["slots"] if s["slot"] == 5)["workspace_id"] == "wL5"
+        assert mk("release", "--slot", "5", "--integration", "mk/r1/integration")["ok"]
+        lanes = read_lanes(data)
+        lanes["slots"]["5"]["workspace_id"] = None
+        write_lanes(data, lanes)
+        st("task", "add", "--id", "t19", "--title", "nineteen", "--run", "r1")
+        unk = mk("acquire", "--run", "r1", "--task", "t19", "--base", "main",
+                 e=dict(env, MK_HERDR=fake_list_herdr([(slot1, "wL1")])))
+        assert (unk["ok"], unk["slot"], unk["workspace_id"]) == (True, 5, None), unk
+        assert "herdr worktree list" not in unk.get("warning", ""), unk  # unknown path: left silently
 
         print("mk-lane self-test ok")
     finally:
