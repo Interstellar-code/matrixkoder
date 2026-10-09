@@ -263,24 +263,30 @@ function wrapToCols(text: string, cols: number): string[] {
 
 /** V0.4's tab bar (Controls.dc.html): the active tab is the primary chip with
  *  its full word and count, the others the hotkey letter plus their count, dim.
- *  The letters live in the labels: the engine draws a plain Button with a
- *  `hotkey` as `h: label`, which is the `o: o` shape the brief bans. */
+ *  F0: every Button carries its keyboard `hotkey` again. A plain Button draws
+ *  `h: label`, so an inactive tab's label is its count alone (`l: 4`, `p: 3/8`,
+ *  `w: !1`) — or the `·` placeholder when it has none (`o: ·`), never its own
+ *  letter. At 36 cols the wrapped bar runs to two rows; no row is wider than
+ *  the pane. */
 function TabBar(els: Els, $: EngineInterface, dashTab: MkDashTab, counts: Record<MkDashTab, string>) {
   const { Box, Button } = els
   return (
     <Box flexDirection="row" flexWrap="wrap" gap={1}>
-      {TABS.map(t => (
-        <Button
-          key={`dash-tab-${t.key}`}
-          label={dashTab === t.key
-            ? `${t.label}${counts[t.key] === '' ? '' : ` ${counts[t.key]}`}`
-            : `${t.hotkey}${counts[t.key] === '' ? '' : ` ${counts[t.key]}`}`}
-          variant={dashTab === t.key ? 'primary' : undefined}
-          plain={dashTab === t.key ? undefined : true}
-          dimColor={dashTab === t.key ? undefined : true}
-          onPress={() => { void switchTab($, t.key) }}
-        />
-      ))}
+      {TABS.map(t => {
+        const active = dashTab === t.key
+        const count = counts[t.key]
+        return (
+          <Button
+            key={`dash-tab-${t.key}`}
+            hotkey={t.hotkey}
+            label={active ? `${t.label}${count === '' ? '' : ` ${count}`}` : count === '' ? '·' : count}
+            variant={active ? 'primary' : undefined}
+            plain={active ? undefined : true}
+            dimColor={active ? undefined : true}
+            onPress={() => { void switchTab($, t.key) }}
+          />
+        )
+      })}
     </Box>
   )
 }

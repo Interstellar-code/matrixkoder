@@ -138,6 +138,19 @@ test('laneStrip colours one segment per lane by its role', () => {
   expect(segs).toEqual([rgbWord(ROLE.live.fg), rgbWord(ROLE.warn.fg)])
 })
 
+test('M2: an empty lane strip is `cols` track cells, never empty cells or an infinite width', () => {
+  for (const w of [36, 40, 46, 56] as const) {
+    const spec = laneStrip([], w)
+    expect(spec.columns, `columns at ${w}`).toBe(w)
+    expect(spec.rows).toBe(1)
+    const c = cells(spec)
+    expect(c).toHaveLength(w)
+    expect(c.every(x => x.fg === rgbWord(PALETTE.track)), `all track at ${w}`).toBe(true)
+    expect(c.every(x => x.bg === rgbWord(PALETTE.panel))).toBe(true)
+    expect(spec.cells.length, `encoded cells at ${w}`).toBeGreaterThan(0)
+  }
+})
+
 // ---------- pickBar ----------
 
 const rasterEls = { Raster: (props: Record<string, unknown>) => ({ type: 'Raster', props }) } as unknown as Elements[keyof Elements]

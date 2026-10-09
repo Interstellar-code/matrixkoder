@@ -104,9 +104,11 @@ function sample(colors: readonly string[], count: number): string[] {
 
 /** `count` coloured segments of `cols` cells with one-cell gaps (Kit.dc.html's
  *  segs()): every segment the same width, the leftover cells widening the
- *  first gaps, so the strip is always exactly `cols` columns. */
+ *  first gaps, so the strip is always exactly `cols` columns. An empty list is
+ *  an all-track row — never `cells: ''`, which the engine refuses. */
 function strip(colors: readonly string[], cols: number): RasterSpec {
   const width = Math.max(1, Math.floor(cols))
+  if (colors.length === 0) return gradientBar(0, width, [])
   // one cell of segment + one cell of gap is the minimum per item
   const fit = Math.max(1, Math.floor((width + 1) / 2))
   const list = sample(colors, Math.min(fit, colors.length))

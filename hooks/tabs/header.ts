@@ -34,6 +34,12 @@ export function mockRunHeader(): RunHeaderData {
   }
 }
 
+/** The Waiting tab's count: `!n` while decisions are open, nothing at all when
+ *  none are (never `!0`). */
+export function waitingCount(openDecisions: number): string {
+  return openDecisions > 0 ? `!${openDecisions}` : ''
+}
+
 /** The tab bar's per-tab counts on a mock tab, from the same fixtures:
  *  Lanes = live lanes, Plan = done/total, Waiting = open decisions
  *  (Controls.dc.html's `l 4`, `p 3/8`, `w !1`). The other tabs carry none. */
@@ -45,7 +51,7 @@ export function mockTabCounts(): Record<MkDashTab, string> {
     plan: `${plan.done}/${plan.total}`,
     usage: '',
     events: '',
-    waiting: `!${WAITING_FIXTURE.options.length > 0 ? 1 : 0}`, // one open decision
+    waiting: waitingCount(WAITING_FIXTURE.options.length > 0 ? 1 : 0),
     old: '',
   }
 }

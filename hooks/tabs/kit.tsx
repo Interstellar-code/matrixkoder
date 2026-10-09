@@ -105,36 +105,55 @@ export function actionLabel(spec: ActionSpec): string {
  *  colour; `dimColor` is the label drawn dim at rest (quiet), full strength
  *  under the pointer or the focus — which is exactly Controls.dc.html's
  *  outline button. A `disabled` tone keeps the same look with a no-op press:
- *  the engine has no inert Button, so the kit makes one. */
+ *  the engine has no inert Button, so the kit makes one.
+ *
+ *  M3: a Button has no fill, so `warn`/`danger` draw their tone glyph as a
+ *  separate leading Text in the role colour (amber / red) beside the Button —
+ *  the colour cue Controls.dc.html asks for, with the Button's label its word. */
 export function ActionButton(els: Els, spec: ActionSpec): RenderElement {
-  const { Button } = els
+  const { Box, Button, Text } = els
   const tone = spec.tone ?? 'default'
-  const label = actionLabel(spec)
-  const variant = tone === 'primary' ? 'primary' : tone === 'warn' || tone === 'danger' ? 'secondary' : undefined
+  const split = tone === 'warn' || tone === 'danger'
+  const label = split ? spec.word : actionLabel(spec)
+  const variant = tone === 'primary' ? 'primary' : split ? 'secondary' : undefined
   const props: Parameters<typeof Button>[0] = { key: spec.key, label, onPress: () => { if (tone !== 'disabled') spec.onPress?.() } }
   if (!spec.plain && /^[a-z0-9]$/.test(spec.glyph)) props.hotkey = spec.glyph
   if (spec.plain) props.plain = true
   else if (variant != null) props.variant = variant
   if (tone === 'quiet' || tone === 'disabled') props.dimColor = true
-  return Button(props)
+  const button = Button(props)
+  if (!split) return button
+  return (
+    <Box flexDirection="row" gap={1}>
+      <Text color={tone === 'warn' ? ROLE.warn.fg : ROLE.err.fg}>{spec.glyph}</Text>
+      {button}
+    </Box>
+  )
 }
 
-/** The terminal's drawn width of an action — `[ label ]` around a Button, the
- *  label alone for a plain one. The row folds on these numbers. */
+/** The terminal's drawn width of an action — `[ label ]` around a Button (or
+ *  `h: label` for a plain one), the label alone for a plain one, plus for a
+ *  warn/danger action its leading glyph Text and that gap column. The row
+ *  folds on these numbers. */
 function actionWidth(spec: ActionSpec): number {
-  const label = actionLabel(spec)
-  return spec.plain ? label.length : label.length + 4
+  const tone = spec.tone ?? 'default'
+  const split = tone === 'warn' || tone === 'danger'
+  const label = split ? spec.word : actionLabel(spec)
+  const chrome = spec.plain ? `${spec.glyph}: ${label}`.length : label.length + 4
+  return chrome + (split ? spec.glyph.length + 1 : 0)
 }
 
 /** A row of ActionButtons that never wraps: when the row does not fit `cols`
  *  the primary (the first marked primary, else the first action) stays and the
- *  rest collapse into one `⋯ More` button. `onMore` is what a press of it runs
- *  — reveal the folded actions in the caller's local view state (C10). */
+ *  rest collapse into one `⋯ More` button. A fold only happens when the caller
+ *  passed `onMore` — what a press of `⋯` runs, revealing the folded actions in
+ *  the caller's local view state (C10). Without one the row draws every action
+ *  rather than a button that can do nothing (review r1 LOW). */
 export function ActionButtons(els: Els, buttons: readonly ActionSpec[], cols: number, onMore?: () => void): RenderElement {
   const { Box } = els
   const gap = 1
   const fits = buttons.reduce((n, b) => n + actionWidth(b), 0) + gap * Math.max(0, buttons.length - 1)
-  const row: readonly ActionSpec[] = fits <= cols || buttons.length === 0
+  const row: readonly ActionSpec[] = fits <= cols || buttons.length === 0 || onMore == null
     ? buttons
     : (() => {
       const kept = buttons.find(b => b.primary) ?? buttons[0]
@@ -142,7 +161,7 @@ export function ActionButtons(els: Els, buttons: readonly ActionSpec[], cols: nu
       const more: ActionSpec = {
         key: `${kept?.key ?? 'actions'}-more-${folded.length}`,
         glyph: '⋯', word: 'More', tone: 'quiet', plain: true,
-        onPress: onMore ?? (() => {}),
+        onPress: onMore,
       }
       return kept == null ? [more] : [kept, more]
     })()
@@ -159,14 +178,50 @@ export type ControlState = 'building' | 'paused' | 'stopped'
 /** The buttons a control state shows: building = pause + stop, paused =
  *  resume + stop, stopped = restart. Pressing one only calls
  *  `onChange(nextState)` — the caller keeps it in local view state (C10); no
- *  kit control ever writes run state. */
-export function ControlRow(els: Els, state: ControlState, cols: number, onChange: (next: ControlState) => void): RenderElement {
+ *  kit control ever writes run state.
+ *
+ *  M1: `keyPrefix` names the instance's keys (`${keyPrefix}-pause`, …), so a
+ *  pane with one ControlRow per lane never draws two elements under one key.
+ *  No `onMore` is passed: every control row's actions fit at 36 cols, and a
+ *  `⋯` that reveals nothing is a dead button. */
+export function ControlRow(els: Els, state: ControlState, cols: number, onChange: (next: ControlState) => void, keyPrefix = 'ctl'): RenderElement {
   const go = (key: string, glyph: string, word: string, tone: ActionTone, next: ControlState): ActionSpec =>
-    ({ key, glyph, word, tone, primary: tone === 'primary', onPress: () => onChange(next) })
+    ({ key: `${keyPrefix}-${key}`, glyph, word, tone, primary: tone === 'primary', onPress: () => onChange(next) })
   const buttons: readonly ActionSpec[] = state === 'building'
-    ? [go('ctl-pause', '‖', 'pause', 'warn', 'paused'), go('ctl-stop', '■', 'stop', 'danger', 'stopped')]
+    ? [go('pause', '‖', 'pause', 'warn', 'paused'), go('stop', '■', 'stop', 'danger', 'stopped')]
     : state === 'paused'
-      ? [go('ctl-resume', '▶', 'resume', 'primary', 'building'), go('ctl-stop', '■', 'stop', 'danger', 'stopped')]
-      : [go('ctl-restart', '↻', 'restart', 'primary', 'building')]
+      ? [go('resume', '▶', 'resume', 'primary', 'building'), go('stop', '■', 'stop', 'danger', 'stopped')]
+      : [go('restart', '↻', 'restart', 'primary', 'building')]
   return ActionButtons(els, buttons, cols)
+}
+
+/** ── M4 · the tree row V1's Plan tab composes phases and subtasks from ───── */
+
+/** One tree row (Plan tab): a dim prefix (`│ ` per depth level, then `├ ` for a
+ *  non-last sibling or `└ ` for the last), the status glyph in its role colour,
+ *  the title truncated with `…` to the cells that are left, and an optional
+ *  right-side chip. One row, at most `cols` cells wide. */
+export function TreeRow(els: Els, opts: {
+  depth: number
+  last: boolean
+  glyph: string
+  role: PaletteRole
+  title: string
+  right?: string
+  rightRole?: PaletteRole
+}, cols: number): RenderElement {
+  const { Box, Text } = els
+  const prefix = `${'│ '.repeat(Math.max(0, Math.floor(opts.depth)))}${opts.last ? '└ ' : '├ '}`
+  const chipWidth = opts.right == null ? 0 : opts.right.length + 2 // the Chip pads one cell each side
+  const gaps = opts.right == null ? 2 : 3
+  const budget = Math.max(1, cols - prefix.length - 1 - gaps - chipWidth)
+  const title = opts.title.length > budget ? `${opts.title.slice(0, Math.max(1, budget) - 1)}…` : opts.title
+  return (
+    <Box flexDirection="row" gap={1}>
+      <Text dimColor={true}>{prefix}</Text>
+      <Text color={ROLE[opts.role].fg}>{opts.glyph}</Text>
+      <Text>{title}</Text>
+      {opts.right != null && Chip(els, { label: opts.right, role: opts.rightRole ?? opts.role })}
+    </Box>
+  )
 }
