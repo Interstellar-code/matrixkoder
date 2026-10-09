@@ -943,9 +943,13 @@ test('the chosen tab survives a refresh tick', { plugins: [worldFixtures] }, asy
 
 // ---------- V0.4: the run header on every tab and the counted tab bar ----------
 
-/** every tab-bar Button's label, in bar order. */
+/** every tab-bar Button's label, in bar order. A pane body may draw its own
+ *  Buttons (V2's lane controls, the tabs' option buttons): only the bar's own
+ *  `dash-tab-*` keys name tabs. */
 const tabLabels = async (ui: { findAll: (q: { type: string }) => Promise<{ props: Record<string, unknown> }[]> }): Promise<string[]> =>
-  (await ui.findAll({ type: 'Button' })).map(b => String(b.props.label))
+  (await ui.findAll({ type: 'Button' }))
+    .filter(b => String(b.props.key).startsWith('dash-tab-'))
+    .map(b => String(b.props.label))
 
 test('the mock tab counts read the fixtures: lanes, plan done/total, waiting only when open', async () => {
   expect(mockTabCounts()).toEqual({ overview: '', lanes: '4', plan: '3/8', usage: '', events: '', waiting: '!1', old: '' })
@@ -1155,4 +1159,59 @@ test('D1.2: a 120-char title at 100 cols truncates with … and keeps the status
   expect(flat).toContain('building 12m') // same row as the (truncated) title
   expect(flat).toContain(longTitle.slice(0, 40)) // the title's head is still drawn
   expect(flat).not.toContain(longTitle.slice(-20)) // and its tail yielded to the status column
+})
+
+// ---------- V1.4: the rule under the tab bar, and C12: the view state ----------
+
+/** every drawn Text's own text (dashboard.test.ts's rowTexts walk). */
+const allTexts = async (ui: { drawn: () => Promise<unknown> }): Promise<string[]> => rowTexts(await ui.drawn())
+
+test('V1.4: a full-width rule of the palette line colour sits under the tab bar on every tab', { plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  for (const cols of [36, 46] as const) {
+    await ui.press({ key: 'dash-tab-old' })
+    await ui.redraw(paneProps(cols))
+    // Old carries the rule too: the frame is the header + bar, not the tab body
+    expect(await ui.find({ text: new RegExp(`^─{${String(cols)}}$`) }), `the rule on Old at ${cols}`).toBeTruthy()
+    expect((await allTexts(ui)).filter(t => /^─+$/.test(t)), `exactly one rule at ${cols}`).toHaveLength(1)
+    for (const { key, name } of TAB_BUTTONS) {
+      await ui.press({ key: 'dash-tab-old' })
+      await ui.press({ key })
+      expect(await ui.find({ text: new RegExp(`^─{${String(cols)}}$`) }), `${name} rule at ${cols}`).toBeTruthy()
+    }
+  }
+})
+
+test('C12: the view state starts empty — every phase folded — and only a press opens one', { plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-plan' })
+  // the empty default: no subtask tree is drawn before any press
+  expect(await ui.find({ text: /R1 stripe adapter/ }), 'nothing folded at the default').toBeUndefined()
+  expect(await ui.find({ text: /│ ├/ }), 'no tree rows at the default').toBeUndefined()
+  await ui.press({ key: 'plan-fold-P4' })
+  expect(await ui.find({ text: /R1 stripe adapter/ }), 'the press opened the phase').toBeTruthy()
+})
+
+test('C12: every tab call receives the ui handle — the six render with it and the Plan folds through it', { plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  // the three-argument tabs (lanes, usage, waiting, events) take the extra
+  // argument through the pane's widened call and still render their fixture
+  for (const { key, name } of TAB_BUTTONS) {
+    await ui.press({ key: 'dash-tab-old' })
+    await ui.press({ key })
+    expect(await ui.find(mockRow()), `${name} renders with the ui argument`).toBeTruthy()
+  }
+  await ui.press({ key: 'dash-tab-plan' })
+  expect(await ui.find({ text: /R1 stripe adapter/ }), 'folded to start').toBeUndefined()
+  await ui.press({ key: 'plan-fold-P4' })
+  expect(await ui.find({ text: /R1 stripe adapter/ }), 'the fold reaches the tab through ui').toBeTruthy()
 })

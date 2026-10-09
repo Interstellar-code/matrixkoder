@@ -4,7 +4,7 @@
 // compact and inline variants. All $-bound loading lives here: $ may not cross
 // an import; the pure data-dir math is in data.ts for wake/tools to reuse.
 import { atom, read, update } from 'claude-code'
-import type { Elements, EngineInterface, On, PluginOptions } from 'claude-code'
+import type { Elements, EngineInterface, On, PluginOptions, RenderElement } from 'claude-code'
 
 // the per-surface element table $.ui.resolve(e) answers (every surface's has Box/Text)
 type Els = Elements[keyof Elements]
@@ -19,6 +19,7 @@ import { AGENT_COLOR, AGENT_GLYPH, NARROW, STATUS_COLOR, STATUS_GLYPH, bar, left
 import { mockRunHeader, mockTabCounts, stageWord, STAGE_TOTAL } from './tabs/header'
 import type { RunHeaderData } from './tabs/header'
 import { Chip } from './tabs/kit'
+import { PALETTE } from './tabs/palette'
 import { EventsTab, eventsView } from './tabs/events'
 import { LanesTab, lanesView } from './tabs/lanes'
 import { OverviewTab, overviewView } from './tabs/overview'
@@ -38,6 +39,10 @@ const statusMemoryAtom = atom({ plugin: 'matrixkoder', key: 'taskStatuses' } as 
 const paneOpenAtom = atom({ plugin: 'matrixkoder', key: 'paneOpen' } as const, false)
 // S0.2: 'old' (the pre-tab pane) is the default tab
 const dashTabAtom = atom({ plugin: 'matrixkoder', key: 'dashTab' } as const, 'old')
+// C12: the tabs' local view state (folded phases, revealed options). The tabs
+// reach it through the `ui` handle the Pane render hands them; only an onPress
+// writes it, never a render.
+const viewStateAtom = atom({ plugin: 'matrixkoder', key: 'viewState' } as const, {} as Record<string, string>)
 
 const COLUMNS = 46
 const REFRESH_MS = 5000
@@ -165,11 +170,18 @@ export function registerDashboard(on: On, options: PluginOptions): void {
     const { Box, Text } = els
     const snap = await read($, snapshotAtom) as MkPaneSnapshot
     const dashTab = await read($, dashTabAtom)
+    const viewState = await read($, viewStateAtom)
     const cols = e.props.bodyColumns || COLUMNS
     const compact = cols < NARROW
     // V0.4: the header is the snapshot's run on Old, the mock world on the six mock tabs
     const header = dashTab === 'old' ? realRunHeader(snap) : mockRunHeader()
     const counts = dashTab === 'old' ? realTabCounts(snap.run) : mockTabCounts()
+    // C12: the tabs' view-state handle. `get` reads the atom's snapshot; `set`
+    // writes it and is only ever called from an onPress (C10).
+    const ui: TabUi = {
+      get: key => viewState[key],
+      set: (key, value) => { void update($, viewStateAtom, prev => ({ ...prev, [key]: value })) },
+    }
 
     return (
       <Box flexDirection="column" width={cols} gap={1}>
@@ -183,22 +195,41 @@ export function registerDashboard(on: On, options: PluginOptions): void {
         )}
         {header != null && RunHeader(els, header, cols)}
         {TabBar(els, $, dashTab, counts)}
+        {/* V1.4: the engine has no per-side borders, so the header and tab bar
+            read as one framed block above the tab's Cards through this rule */}
+        <Text color={PALETTE.line}>{'─'.repeat(Math.max(0, cols))}</Text>
         {dashTab === 'old'
           ? OldTab(els, snap, cols, compact)
           : dashTab === 'overview'
-            ? OverviewTab(els, overviewView(), cols)
+            ? OverviewTab(els, overviewView(), cols, ui)
             : dashTab === 'lanes'
-              ? LanesTab(els, lanesView(), cols)
+              ? withViewState(LanesTab, els, lanesView(), cols, ui)
               : dashTab === 'plan'
-                ? PlanTab(els, planView(), cols)
+                ? PlanTab(els, planView(), cols, ui)
                 : dashTab === 'usage'
-                  ? UsageTab(els, usageView(), cols)
+                  ? withViewState(UsageTab, els, usageView(), cols, ui)
                   : dashTab === 'events'
-                    ? EventsTab(els, eventsView(), cols)
-                    : WaitingTab(els, waitingView(), cols)}
+                    ? withViewState(EventsTab, els, eventsView(), cols, ui)
+                    : withViewState(WaitingTab, els, waitingView(), cols, ui)}
       </Box>
     )
   })
+}
+
+/** C12: a tab's view-state handle — the structural type every tab file declares
+ *  for itself (no import crosses lanes). */
+type TabUi = { get(key: string): string | undefined; set(key: string, value: string): void }
+
+/** C12 hands `ui` to all six tabs; V2's three still take three arguments, so
+ *  their call goes through a widened view of their signature until they do. */
+function withViewState<V>(
+  tab: (els: Els, view: V, cols: number) => RenderElement,
+  els: Els,
+  view: V,
+  cols: number,
+  ui: TabUi,
+): RenderElement {
+  return (tab as (els: Els, view: V, cols: number, ui?: TabUi) => RenderElement)(els, view, cols, ui)
 }
 
 /** A tab-bar press (S0.2): the state write is legal in onPress (a render must
