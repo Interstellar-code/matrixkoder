@@ -5,13 +5,17 @@ Usage:
   lane-watch.py --lane DIR --agent NAME|PANE --commit-grep REGEX [--report PATH] [--phase P1]
                 [--kind claude|codex|opencode|agy] [--prompt-marker TEXT]
                 [--then-send BRIEF_PATH] [--max-wait-min 30] [--poll 20] [--stall-min 10]
-                [--task T --data DIR [--run ID]]
+                [--task T --data DIR [--run ID]] [--no-commit]
   lane-watch.py --self-test
 
 Done = latest commit subject matches REGEX (searched in the bare subject, so `^feat(x)`-style anchors work; the
        older "<sha> <subject>" form, e.g. `^[0-9a-f]+ feat`, still matches) AND (report exists, if given) AND agent not working
        AND (with --phase) a "<PHASE> DONE" line in the pane since dispatch. Done wins over a stray
        limit / dev-server string in the same pane.
+With --no-commit (a reviewer pane: nothing is committed, so there is no commit to match) the commit half
+       drops out everywhere: --commit-grep is not required (a given one is ignored; without --no-commit it
+       is), Done = (report exists, if given) AND agent not working AND the token, the no-token grace is
+       report + agent idle/done, and STALL never lists a matching commit as missing.
 "<PHASE> BLOCKED: <question>" in the pane → BLOCKED with the question (the later of DONE / BLOCKED wins).
 A herdr ERROR is retried; the watcher exits ERROR after 3 in a row, or on any crash (still one JSON line).
 Idle/done/working agent, not Done, and no file/commit/pane change for --stall-min since watch start → STALL
@@ -39,7 +43,7 @@ STATUS_MAP = {"DONE": "verifying", "DONE_SENT": "verifying", "QUOTA": "quota", "
 FAIL_STATES = ("QUOTA", "PROVIDER", "BLOCKED", "DEV_SERVER", "ERROR")
 WATCHED = ("dispatched", "building", "stalled", "quota", "provider", "blocked")  # a watcher may move these only
 ERROR_RETRIES = 3
-TOKEN_GRACE_MIN = 3  # commit + report + agent idle this long, but no DONE token: DONE anyway (lesson 39)
+TOKEN_GRACE_MIN = 3  # commit + report + agent idle this long (report + idle with --no-commit), but no DONE token: DONE anyway (lesson 39)
 
 sys.dont_write_bytecode = True  # no stray __pycache__ next to the scripts
 _spec = importlib.util.spec_from_file_location("lane_health", os.path.join(HERE, "lane-health.py"))
@@ -80,12 +84,15 @@ def pane_fingerprint(text):
 
 
 def decide(h, subj, rx, report_ok, text, phase, stall_min):
-    """One poll's verdict -> (state | None to keep watching, evidence list). Pure: no herdr, no git."""
+    """One poll's verdict -> (state | None to keep watching, evidence list). Pure: no herdr, no git.
+    rx None = --no-commit (a reviewer pane: no commit to match): any commit counts as matching, no
+    commit evidence is reported, and STALL never lists a matching commit as missing."""
     done_tok, question = phase_tokens(text, phase)
-    commit_ok = bool(rx.search(subj.partition(" ")[2]) or rx.search(subj))  # subj = "<sha> <subject>"
+    commit_ok = rx is None or bool(rx.search(subj.partition(" ")[2]) or rx.search(subj))  # subj = "<sha> <subject>"
+    commit_ev = [] if rx is None else [f"commit {subj}"]
     status = h.get("agent_status")
     if h["state"] != "ERROR" and commit_ok and report_ok and status != "working" and (done_tok or not phase):
-        return "DONE", [f"commit {subj}"] + ([f"{phase} DONE"] if phase else [])
+        return "DONE", commit_ev + ([f"{phase} DONE"] if phase else [])
     if question:
         return "BLOCKED", [f"{phase} BLOCKED: {question}"]
     idle = h.get("last_change_min")  # since the last file/commit change OR pane activity (watch() passes it)
@@ -93,7 +100,8 @@ def decide(h, subj, rx, report_ok, text, phase, stall_min):
             and idle is not None and idle >= min(TOKEN_GRACE_MIN, stall_min)):
         # builders (Claude especially) end with a summary and forget the token; the work is there, so the
         # orchestrator verifies it rather than waiting for WATCH_EXPIRED
-        return "DONE", [f"commit {subj}", f"no {phase} DONE token (commit + report, agent {status} {idle} min)"]
+        got = "commit + report" if rx is not None else "report"
+        return "DONE", commit_ev + [f"no {phase} DONE token ({got}, agent {status} {idle} min)"]
     if h["state"] in FAIL_STATES:
         return h["state"], h.get("evidence") or []
     if status == "working" and idle is not None and idle >= stall_min:
@@ -200,13 +208,14 @@ def record(out, task, data, run=None):
 
 
 def watch(a):
+    no_commit = "--no-commit" in a
     lane, agent, grep = opt(a, "--lane"), opt(a, "--agent"), opt(a, "--commit-grep")
     report, then_send, phase = opt(a, "--report"), opt(a, "--then-send"), opt(a, "--phase")
     kind, marker = opt(a, "--kind"), opt(a, "--prompt-marker")
     max_wait = float(opt(a, "--max-wait-min", "30")) * 60
     poll = float(opt(a, "--poll", "20"))
     stall_min = float(opt(a, "--stall-min", "10"))
-    rx = re.compile(grep)
+    rx = None if no_commit else re.compile(grep)  # --no-commit: no commit to match; decide() counts rx None as ok
     start, errors = time.time(), 0
     active, last_fp = start, None  # last time the pane showed new output
     while True:
@@ -284,6 +293,19 @@ def self_test():
     assert decide({**ok, "last_change_min": 2}, good, rx, True, "", "P1", 10)[0] is None
     assert decide({**ok, "agent_status": "working", "last_change_min": 4}, good, rx, True, "", "P1", 10)[0] is None
     st, ev = decide({**ok, "last_change_min": 11}, good, rx, False, "", "P1", 10)
+    assert st == "STALL" and "report" in ev[0] and "matching commit" not in ev[0]
+    # --no-commit (rx None, a reviewer pane): no commit to match — any subject is fine, no commit evidence
+    assert decide(ok, other, None, True, "P1 DONE", "P1", 10) == ("DONE", ["P1 DONE"])
+    assert decide(ok, other, None, True, "I will reply with P1 DONE", "P1", 10)[0] is None  # token still required
+    assert decide({**ok, "agent_status": "working"}, other, None, True, "P1 DONE", "P1", 10)[0] is None
+    assert decide(ok, other, None, False, "P1 DONE", "P1", 10)[0] is None  # report still required
+    # the no-token grace loses its commit half too: report + idle 3 min is DONE, never before
+    st, ev = decide({**ok, "last_change_min": 4}, other, None, True, "", "P1", 10)
+    assert st == "DONE" and ev == ["no P1 DONE token (report, agent idle 4 min)"], (st, ev)
+    assert decide({**ok, "last_change_min": 2}, other, None, True, "", "P1", 10)[0] is None
+    assert decide({**ok, "agent_status": "working", "last_change_min": 4}, other, None, True, "", "P1", 10)[0] is None
+    # idle STALL never lists a matching commit as missing in this mode (report gone, so the grace cannot fire)
+    st, ev = decide({**ok, "last_change_min": 11}, other, None, False, "P1 DONE", "P1", 10)
     assert st == "STALL" and "report" in ev[0] and "matching commit" not in ev[0]
     # pane activity: digit-only changes (timers) are not activity; new output lines are
     assert pane_fingerprint("Working (12s) esc to interrupt") == pane_fingerprint("Working (73s) esc to interrupt")
@@ -427,6 +449,19 @@ def self_test():
         out = cli("--commit-grep", "(", "--poll", "0.1", "--task", "P3", "--data", data)  # bad regex → ERROR
         assert out["state"] == "ERROR" and "missing )" in out["evidence"][0] and out["state_written"] is True, out
         assert cli("--commit-grep", "x", "--task", "P3", code=1).returncode == 1  # --task without --data
+        # --no-commit (a reviewer pane): --commit-grep is not required and the commit subject is irrelevant
+        subprocess.run(git + ["commit", "-q", "--allow-empty", "-m", "docs: merge lane notes"], check=True)
+        open(pane, "w").write("> Read and follow review-brief-r1.md\nreport written, gates green\n⏺ D2 REVIEW R1 DONE\n")
+        open(os.path.join(lane, "review-r1.md"), "w").write("# review r1\nship it\n")
+        out = cli("--no-commit", "--report", "review-r1.md", "--phase", "D2 REVIEW R1", "--kind", "codex",
+                  "--prompt-marker", "Read and follow review-brief-r1.md", "--poll", "0.1",
+                  "--task", "P3", "--data", data)
+        assert out["state"] == "DONE" and out["evidence"] == ["D2 REVIEW R1 DONE"], out
+        assert out["state_written"] is True, out
+        # without --no-commit, --commit-grep stays required: usage error, exit 2
+        r = subprocess.run([sys.executable, __file__, "--lane", lane, "--agent", "w1", "--report", "review-r1.md",
+                            "--phase", "D2 REVIEW R1"], env=env, capture_output=True, text=True)
+        assert r.returncode == 2 and "Usage" in r.stderr, (r.returncode, r.stderr[:200])
         # working agent, no file/commit change: a pane that keeps moving is never STALL (lesson 37); a frozen one is
         work_bin = os.path.join(tmp, "workbin")
         os.makedirs(work_bin)
@@ -464,8 +499,9 @@ def main():
     a = sys.argv[1:]
     if "--self-test" in a:
         return self_test()
-    if not (opt(a, "--lane") and opt(a, "--agent") and opt(a, "--commit-grep")):
-        sys.exit(__doc__)
+    if not (opt(a, "--lane") and opt(a, "--agent")) or ("--no-commit" not in a and not opt(a, "--commit-grep")):
+        sys.stderr.write(__doc__)  # usage: --commit-grep is required unless --no-commit (a reviewer pane)
+        sys.exit(2)
     if opt(a, "--kind") and opt(a, "--kind") not in lh.KINDS:
         sys.exit(__doc__)
     task, data = opt(a, "--task"), opt(a, "--data")
