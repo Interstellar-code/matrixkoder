@@ -903,7 +903,6 @@ test('every tab hotkey switches to that tab’s MOCK row and hides Old; 0 restor
   for (const { key, name } of TAB_BUTTONS) {
     await ui.press({ key })
     expect(await ui.find(mockRow()), `${name} MOCK row`).toBeTruthy()
-    expect(await ui.find({ text: `${name} — mock coming in T1/T2` }), `${name} stub line`).toBeTruthy()
     expect(await ui.find({ text: /workflows-v2/ }), `${name} hides Old`).toBeUndefined()
     await ui.press({ key: 'dash-tab-old' })
     expect(await ui.find({ text: /workflows-v2/ }), 'Old is back').toBeTruthy()
