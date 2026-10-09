@@ -194,10 +194,14 @@ export function registerDashboard(on: On, options: PluginOptions): void {
           <Text color="yellow" bold={true}>⚠ {snap.error}</Text>
         )}
         {header != null && RunHeader(els, header, cols)}
-        {TabBar(els, $, dashTab, counts)}
         {/* V1.4: the engine has no per-side borders, so the header and tab bar
-            read as one framed block above the tab's Cards through this rule */}
-        <Text color={PALETTE.line}>{'─'.repeat(Math.max(0, cols))}</Text>
+            read as one framed block above the tab's Cards through this rule.
+            The bar and the rule share a gap-less column so the rule sits
+            directly under the bar; the pane's own gap keeps the space after it. */}
+        <Box flexDirection="column">
+          {TabBar(els, $, dashTab, counts)}
+          <Text color={PALETTE.line}>{'─'.repeat(Math.max(0, cols))}</Text>
+        </Box>
         {dashTab === 'old'
           ? OldTab(els, snap, cols, compact)
           : dashTab === 'overview'

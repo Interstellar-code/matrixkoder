@@ -100,7 +100,7 @@ function textOwn(n: unknown): string[] {
 // included — plus the gap columns between its children. A single Text node
 // staying under `cols` proves nothing about the row it sits in.
 
-type DrawnNode = { type?: string; props?: { flexDirection?: string; gap?: number }; children?: unknown[] }
+type DrawnNode = { type?: string; props?: { flexDirection?: string; gap?: number; borderStyle?: string }; children?: unknown[] }
 
 /** a Text's whole drawn width: its own strings plus any nested Text's strings. */
 function textWidth(node: unknown): number {
@@ -124,16 +124,20 @@ function widthOf(node: unknown): number {
   return kids.reduce((max: number, c) => Math.max(max, widthOf(c)), 0)
 }
 
-/** every row's width in the drawn tree: each Text and each horizontal Box. */
-function rowWidths(root: unknown): number[] {
-  const out: number[] = []
-  const walk = (node: unknown): void => {
+/** every row's width in the drawn tree: each Text and each horizontal Box,
+ *  with whether it sits inside a kit Card (a round-bordered Box). */
+function rowWidths(root: unknown): { width: number; inCard: boolean }[] {
+  const out: { width: number; inCard: boolean }[] = []
+  const walk = (node: unknown, inCard: boolean): void => {
     if (typeof node !== 'object' || node === null) return
     const n = node as DrawnNode
-    if (n.type === 'Text' || (n.type === 'Box' && n.props?.flexDirection === 'row')) out.push(widthOf(node))
-    for (const c of n.children ?? []) walk(c)
+    const card = inCard || (n.type === 'Box' && n.props?.borderStyle === 'round')
+    if (n.type === 'Text' || (n.type === 'Box' && n.props?.flexDirection === 'row')) {
+      out.push({ width: widthOf(node), inCard: card })
+    }
+    for (const c of n.children ?? []) walk(c, card)
   }
-  walk(root)
+  walk(root, false)
   return out
 }
 
@@ -199,9 +203,11 @@ test('the Events tab keeps every drawn ROW within the pane width at 36, 39, 40 a
   expect(await ui.find({ text: /P5 r2 → glm-5/ })).toBeTruthy() // the Narrow board's short text
   for (const cols of [36, 39, 40, 46] as const) {
     await ui.redraw(paneProps(cols))
+    // a row inside the Card is budgeted for its content (cols - 4); the MOCK
+    // row and the earlier-count footer outside it owe only the pane's width
     const widths = rowWidths(await ui.drawn())
     expect(widths.length, `the tab drew rows at ${cols}`).toBeGreaterThan(0)
-    const wide = widths.filter(w => w > cols)
+    const wide = widths.filter(w => (w.inCard ? w.width > cols - 4 : w.width > cols))
     expect(wide, `over-wide rows at ${cols} cols: ${JSON.stringify(wide)}`).toEqual([])
   }
 })
