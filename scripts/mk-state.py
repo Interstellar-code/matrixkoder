@@ -5,7 +5,7 @@
       --plan: the plan file drives the run — the plan tool (mk-plan.py, or $MK_PLAN_CMD) `check`
       must pass and its status be `approved`; --force overrides an unapproved status (with an event).
       The plan gets `set --status running` + `add-run`, then phase tasks (plan_phase, route,
-      lane_group) and child tasks (plan_task, --parent) are created through the task-add path.
+      lane_group, reviewer) and child tasks (plan_task, --parent) are created through the task-add path.
       plan_sha comes from a final `parse` AFTER those mutations, so the board ⚠ does not fire at once
   plan sync [--run ID] [--apply] — diff the run's plan against its tasks; the dry run changes
       nothing: new phase/task → added (the add path), changed title/wave/owned/deps on a
@@ -20,11 +20,14 @@
       warns when an owned glob overlaps an unmerged task in any active run
       (the new task's own --parent chain is not an overlap: a parent owns its children's globs)
   task set T key=value ... [--note TEXT] [--force]   keys: status agent model effort lane pane
-      branch workspace slot last_commit gates verdict (branch/workspace/slot are written by mk-lane.py acquire)
+      branch workspace slot last_commit gates verdict reviewer (branch/workspace/slot are written by
+      mk-lane.py acquire; reviewer comes from the plan's phase or task set)
       status=dispatched|building needs every own AND ancestor dep merged/qa/done (--force overrides);
       status= on a parent is refused (it rolls up from children); a task whose deps are all met gets
       ready=true and a "deps met" event; an unreadable sibling run only produces a warnings entry
   task round T --kind build|fix|takeover [--cause TEXT]
+  task round T --undo — drop the latest round again, but only while none of its brief/report/review
+      files exist (the paths task round printed); else ok:false naming them; one event
   task get T
   event [--task T] --type transition|decision|verdict|quota|note --text TEXT [--from S] [--to S]  (transition needs --to)
   wait set --question TEXT --options a,b [--rec TEXT] | wait clear
@@ -47,7 +50,7 @@ STATUSES = ("planned routed dispatched building verifying review fix merged qa d
             "blocked quota stalled provider").split()
 EVENT_TYPES = ("transition", "decision", "verdict", "quota", "note")
 TASK_KEYS = ("status", "agent", "model", "effort", "lane", "pane", "branch", "workspace", "slot",
-             "last_commit", "gates", "verdict")
+             "last_commit", "gates", "verdict", "reviewer")
 ROUND_KINDS = ("build", "fix", "takeover")
 ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 RECENT, BOARD_EVENTS = 10, 15
@@ -640,7 +643,8 @@ def cmd_run(a, st):
                 _, w = add_task(st, run, pid, ph.get("title") or pid, ph.get("wave"),
                                 ph.get("deps") or [], ph.get("owned") or [], None, a.by,
                                 {"plan_phase": pid, "route": ph.get("route") or None,
-                                 "lane_group": ph.get("lane_group") or None})
+                                 "lane_group": ph.get("lane_group") or None,
+                                 "reviewer": ph.get("reviewer") or ""})
                 warnings += w
                 for c in ph.get("tasks") or []:
                     _, w = add_task(st, run, str(c.get("id") or ""), c.get("title") or c.get("id"),
@@ -832,6 +836,24 @@ def cmd_task(a, st):
                          to=t["status"], by=a.by)
             elif a.note:
                 st.event(run, "note", a.note, task=t["id"], by=a.by)
+        elif getattr(a, "undo", False):  # round --undo: drop the latest round, but only an empty one
+            if a.kind or a.cause:
+                raise Fail("task round --undo takes no --kind/--cause")
+            if not t["rounds"]:
+                raise Fail(f"task {t['id']} has no round to undo")
+            n = t["rounds"][-1]["n"]
+            d = st.task_dir(run["id"], t["id"])
+            left = [os.path.join(d, f"{k}-r{n}.md") for k in ("brief", "report", "review")
+                    if os.path.exists(os.path.join(d, f"{k}-r{n}.md"))]
+            if left:  # a file of that round exists: the round was used, it stays
+                raise Fail(f"round {n} of task {t['id']} has files: {', '.join(left)}; "
+                           "delete them first", files=left)
+            t["rounds"].pop()  # exactly what `task round` wrote: the round entry and its number
+            t["round"] = t["rounds"][-1]["n"] if t["rounds"] else 0
+            st.event(run, "note", f"round {n} undone", task=t["id"], by=a.by)
+            t["updated"] = now()
+            st.save(run, t, a.by)
+            return {"ok": True, "task": t["id"], "round": t["round"], "undone": n}
         else:  # round
             if a.kind not in ROUND_KINDS:
                 raise Fail(f"bad kind {a.kind!r}; one of: {' '.join(ROUND_KINDS)}")
@@ -932,7 +954,8 @@ def cmd_plan(a, st):
                     add_task(st, run, str(src.get("id") or ""), src.get("title") or src.get("id"),
                              src.get("wave"), src.get("deps") or [], src.get("owned") or [], None, a.by,
                              {"plan_phase": src.get("id"), "route": src.get("route") or None,
-                              "lane_group": src.get("lane_group") or None})
+                              "lane_group": src.get("lane_group") or None,
+                              "reviewer": src.get("reviewer") or ""})
                 else:
                     add_task(st, run, str(src.get("id") or ""), src.get("title") or src.get("id"),
                              ph.get("wave"), [], src.get("owned") or [], str(ph.get("id") or ""), a.by,
@@ -1059,7 +1082,8 @@ def build_parser():
     t.add_argument("task"), t.add_argument("pairs", nargs="+"), t.add_argument("--note")
     t.add_argument("--force", action="store_true")
     t = task.add_parser("round", parents=[data_p, run_p])
-    t.add_argument("task"), t.add_argument("--kind", required=True), t.add_argument("--cause")
+    t.add_argument("task"), t.add_argument("--kind"), t.add_argument("--cause")
+    t.add_argument("--undo", action="store_true")  # drop the latest (empty) round; kind checked in cmd
     t = task.add_parser("get", parents=[data_p, run_p])
     t.add_argument("task")
     for t in task.choices.values():
@@ -1142,14 +1166,15 @@ else:
 # a plan with 2 phases and 3 tasks (P2.1 makes the third child task)
 PLAN_BASE = {"plan": "tplan", "status": "approved", "runs": [], "phases": [
     {"id": "P1", "title": "Phase one", "wave": 1, "deps": [], "owned": ["scripts/a.py"],
-     "route": "codex gpt-5 high", "size": "standard", "risk": "reversible", "review": "light",
+     "route": "codex gpt-5 high", "reviewer": "opencode opencode-go/kimi-k3", "size": "standard",
+     "risk": "reversible", "review": "light",
      "qa": [], "commit": "feat: a", "subagents": False, "lane_group": "A", "tasks": [
         {"id": "P1.1", "title": "First", "acceptance": "a1", "refs": [], "subagent": False,
          "owned": ["scripts/a.py"]},
         {"id": "P1.2", "title": "Second", "acceptance": "a2", "refs": [], "subagent": False, "owned": []}]},
     {"id": "P2", "title": "Phase two", "wave": 1, "deps": ["P1"], "owned": ["docs/x.md"],
-     "route": "", "size": "standard", "risk": "reversible", "review": "light", "qa": [],
-     "commit": "feat: b", "subagents": False, "lane_group": "A", "tasks": [
+     "route": "", "reviewer": "", "size": "standard", "risk": "reversible", "review": "light",
+     "qa": [], "commit": "feat: b", "subagents": False, "lane_group": "A", "tasks": [
         {"id": "P2.1", "title": "Third", "acceptance": "a3", "refs": [], "subagent": False, "owned": []}]}]}
 
 def self_test():
@@ -1201,6 +1226,27 @@ def self_test():
         assert mk("task", "get", "T1")["task"]["round"] == 2
         assert mk("task", "get", "NOPE", code=2)["ok"] is False
 
+        # round --undo: refused while a round file exists (naming it), then the empty round is dropped
+        assert mk("task", "round", "T1", "--kind", "fix")["round"] == 3
+        assert "takes no" in mk("task", "round", "T1", "--undo", "--kind", "fix", code=2)["error"]
+        brief3 = os.path.join(rdir, "tasks", "T1", "brief-r3.md")
+        open(brief3, "w").write("# brief\n")
+        e = mk("task", "round", "T1", "--undo", code=2)
+        assert e["ok"] is False and e["files"] == [brief3] and brief3 in e["error"], e
+        assert mk("task", "get", "T1")["task"]["round"] == 3  # refused: the round stays
+        os.unlink(brief3)
+        evp = os.path.join(rdir, "events.jsonl")
+        n_ev = len(open(evp).readlines())
+        out = mk("task", "round", "T1", "--undo")
+        assert out["ok"] and out["round"] == 2 and out["undone"] == 3, out
+        evs = [json.loads(x) for x in open(evp)]
+        assert len(evs) == n_ev + 1 and "round 3 undone" in evs[-1]["text"], evs  # exactly one event
+        tu = mk("task", "get", "T1")["task"]
+        assert tu["round"] == 2 and [r["n"] for r in tu["rounds"]] == [1, 2]
+        assert tu["rounds"][-1]["kind"] == "fix" and tu["rounds"][-1]["verdict"] == "approve"
+        assert tu["rounds"][-1]["sha"] == "abc1234"  # round 2 exactly as the undone round 3 found it
+        assert "no round" in mk("task", "round", "T2", "--undo", code=2)["error"]
+
         # pane: the lane's herdr pane id (arm writes it) is a settable task key
         assert "pane" in TASK_KEYS
         tp = mk("task", "set", "T1", "pane=wK:p1")["task"]
@@ -1210,6 +1256,12 @@ def self_test():
         assert mk("task", "set", "T1", "pan=wK:p1", code=2)["ok"] is False  # still a closed key set
         assert mk("task", "get", "T1")["task"]["pane"] is None
         assert mk("task", "set", "T1", "pane=wK:p1")["task"]["pane"] == "wK:p1"
+
+        # reviewer: settable like pane (the plan writes it at run init; the fixture block asserts that)
+        assert "reviewer" in TASK_KEYS
+        assert mk("task", "set", "T1", "reviewer=claude fable")["task"]["reviewer"] == "claude fable"
+        assert mk("task", "set", "T1", "reviewer=")["task"]["reviewer"] is None  # empty clears
+        assert mk("task", "set", "T1", "reviwe=x", code=2)["ok"] is False  # still a closed key set
 
         # branch/workspace/slot: the lane a task holds, written by mk-lane.py acquire
         assert {"branch", "workspace", "slot"} <= set(TASK_KEYS)
@@ -1603,6 +1655,9 @@ def self_test():
         assert [t["id"] for t in run["tasks"]] == ["P1", "P1.1", "P1.2", "P2", "P2.1"], run["tasks"]
         t = {x["id"]: x for x in run["tasks"]}
         assert t["P1"]["plan_phase"] == "P1" and t["P1"]["route"] == "codex gpt-5 high"
+        assert t["P1"]["reviewer"] == "opencode opencode-go/kimi-k3"  # from the plan JSON
+        assert t["P2"]["reviewer"] == ""  # absent in the plan: "" (orchestrator decides), not null
+        assert all("reviewer" not in t[x] for x in ("P1.1", "P1.2", "P2.1"))  # children stay bare
         assert t["P1"]["lane_group"] == "A" and t["P1"]["parent"] is None
         assert t["P2"]["deps"] == ["P1"] and t["P2"]["plan_phase"] == "P2"
         assert t["P1.1"]["plan_task"] == "P1.1" and t["P1.1"]["parent"] == "P1"
@@ -1643,7 +1698,8 @@ def self_test():
         db["phases"][0]["tasks"][0]["title"] = "First v2"  # started (building): warning only
         db["phases"][1]["title"] = "Phase two v2"  # planned: update
         db["phases"].append({"id": "P3", "title": "Phase three", "wave": 2, "deps": ["P2"], "owned": [],
-                             "route": "", "size": "standard", "risk": "reversible", "review": "light",
+                             "route": "", "reviewer": "agy gemini-3.8-flash", "size": "standard",
+                             "risk": "reversible", "review": "light",
                              "qa": [], "commit": "feat: c", "subagents": False, "lane_group": "B",
                              "tasks": [{"id": "P3.1", "title": "New one", "acceptance": "a4", "refs": [],
                                         "subagent": False, "owned": []}]})
@@ -1674,6 +1730,7 @@ def self_test():
         run = pk("run", "get", "--id", "pr1")["run"]
         t = {x["id"]: x for x in run["tasks"]}
         assert "P3" in t and t["P3"]["plan_phase"] == "P3" and t["P3"]["lane_group"] == "B"
+        assert t["P3"]["reviewer"] == "agy gemini-3.8-flash"  # the sync add path stores it too
         assert "P3.1" in t and t["P3.1"]["parent"] == "P3" and t["P3.1"]["plan_task"] == "P3.1"
         assert os.path.exists(os.path.join(pd, "runs", "pr1", "tasks", "P3.1", "task.json"))
         assert t["P2"]["title"] == "Phase two v2"  # planned: updated

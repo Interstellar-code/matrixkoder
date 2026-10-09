@@ -25,7 +25,7 @@ PHASE_ID_RE = re.compile(r"[A-Z][A-Z0-9]{0,7}")
 RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 ROUTE_RE = re.compile(r"\S+( \S+){1,2}")  # "<agent> <model> [<effort>]"; "" means Jev
 TOP_KEYS = ("plan", "status", "runs", "gates", "phase")  # header keys consumed by C2
-PHASE_KEYS = ("id", "title", "wave", "deps", "owned", "forbidden", "route", "size",
+PHASE_KEYS = ("id", "title", "wave", "deps", "owned", "forbidden", "route", "reviewer", "size",
               "risk", "review", "qa", "commit", "subagents", "lane_group", "task")
 TASK_KEYS = ("id", "title", "acceptance", "refs", "subagent", "owned")
 TOML_LINE_RE = re.compile(r"line (\d+)")
@@ -117,7 +117,8 @@ def phase_json(ph):
     out = {"id": str(ph.get("id", "")), "title": ph.get("title", ""),
            "wave": ph.get("wave", 1), "deps": as_list(ph.get("deps")),
            "owned": as_list(ph.get("owned")), "forbidden": as_list(ph.get("forbidden")),
-           "route": ph.get("route", ""), "size": ph.get("size", "standard"),
+           "route": ph.get("route", ""), "reviewer": ph.get("reviewer", ""),
+           "size": ph.get("size", "standard"),
            "risk": ph.get("risk", "reversible"), "review": ph.get("review", "standard"),
            "qa": as_list(ph.get("qa")), "commit": ph.get("commit", ""),
            "subagents": bool(ph.get("subagents", False)), "lane_group": ph.get("lane_group", ""),
@@ -208,16 +209,13 @@ def find_cycle(deps):
 
 def check_plan(header, out):
     """→ (errors, warnings). Errors are exactly the P1.2 contract rules; anything
-    advisory (cross-run deps, missing optional keys, malformed id shapes) is a warning."""
+    advisory (cross-run deps, malformed id shapes) is a warning."""
     errors, warnings = [], []
     phases = out["phases"]
     raw = as_list(header.get("phase"))
 
     if str(out["plan"]) and not PLAN_ID_RE.fullmatch(str(out["plan"])):
         warnings.append(f"plan id {out['plan']!r} does not match [a-z0-9][a-z0-9-]{{0,40}}")
-    for k in ("design", "integration"):
-        if k not in header:
-            warnings.append(f"no {k} key in the header (optional)")
 
     ids = [p["id"] for p in phases if p["id"]]
     for pid in sorted({i for i in ids if ids.count(i) > 1}):
@@ -236,9 +234,6 @@ def check_plan(header, out):
         w = raw[n].get("wave", 1) if n < len(raw) else 1
         if not isinstance(w, int) or isinstance(w, bool) or w < 1:
             warnings.append(f"{pid}: wave {w!r} is not an int >= 1")
-        for k in ("forbidden", "lane_group"):
-            if n < len(raw) and k not in raw[n]:
-                warnings.append(f"{pid}: no {k} key (default {p[k]!r})")
         for d in p["deps"]:
             d = str(d)
             if ":" in d:
@@ -259,13 +254,12 @@ def check_plan(header, out):
             errors.append(f"{pid}: bad review {p['review']!r} ({'|'.join(REVIEWS)})")
         if p["route"] != "" and not ROUTE_RE.fullmatch(str(p["route"])):
             errors.append(f'{pid}: bad route {p["route"]!r} ("" or "<agent> <model> [<effort>]")')
-        raw_tasks = as_list(raw[n].get("task")) if n < len(raw) else []
-        for t, rt in zip(p["tasks"], raw_tasks):
+        if not isinstance(p["reviewer"], str):
+            errors.append(f'{pid}: reviewer {p["reviewer"]!r} is not a string ("" = the orchestrator decides)')
+        for t in p["tasks"]:
             tid = t["id"] or f"{pid} task"
             if t["id"] and pid in by_id and not re.fullmatch(re.escape(pid) + r"\.\d+", t["id"]):
                 warnings.append(f"task id {t['id']!r} is not <phase id>.<n> ({pid}.<n>)")
-            if "refs" not in rt:
-                warnings.append(f"{tid}: no refs key (optional)")
             if t["subagent"]:
                 if not p["subagents"]:
                     warnings.append(f"{tid}: subagent=true outside a subagents=true phase")
@@ -549,6 +543,7 @@ def self_test():
         assert set(out["gates"]) == {"test", "typecheck", "selftest", "validate"}
         p0 = out["phases"][0]
         assert p0["id"] == "P1" and p0["wave"] == 1 and p0["lane_group"] == "" and p0["subagents"] is False
+        assert p0["reviewer"] == "opencode opencode-go/kimi-k3"  # template's reviewer example passes through
         assert p0["tasks"][0]["id"] == "P1.1" and p0["tasks"][0]["subagent"] is False
         assert out["created"] == "2026-10-08" and out["design"] == []  # unknown/extra keys pass through
 
@@ -557,14 +552,15 @@ def self_test():
         assert [p["id"] for p in out["phases"]] == ["P1", "P2", "P3"]
         assert [t["id"] for t in out["phases"][0]["tasks"]] == ["P1.1", "P1.2", "P1.3"]
         assert all(p["wave"] == 1 and p["lane_group"] == "A" and p["deps"] == [] for p in out["phases"])
+        assert all(p["reviewer"] == "" for p in out["phases"])  # optional key defaults to ""
         assert out["phases"][0]["review"] == "data-loss" and out["phases"][0]["size"] == "standard"
 
-        # P1.2 check — both real files are clean (ok:true, exit 0); the template
-        # carries every key, so it must also be warning-free
+        # P1.2 check — both real files are clean (ok:true, exit 0, no warnings):
+        # missing optional keys are quiet, and neither file carries a real problem
         out = mk("check", template)
         assert out["ok"] and out["warnings"] == [] and out["sha"]
         out = mk("check", real_plan)
-        assert out["ok"] and out["sha"] and out["warnings"], out["plan"]
+        assert out["ok"] and out["sha"] and out["warnings"] == [], out["plan"]
 
         # a done/parked plan may have no phases
         for st in ("done", "parked"):
@@ -631,6 +627,7 @@ def self_test():
         bad("review", phase("P1", review="deep"), "bad review 'deep'")
         bad("route-1", phase("P1", route="claude"), "bad route")
         bad("route-4", phase("P1", route="a b c d"), "bad route")
+        bad("reviewer", phase("P1", extra='reviewer = 5\n'), "reviewer 5 is not a string")
         bad("overlap", phase("P1", owned='"src/"') + "\n" + phase("P2", owned='"src/x.py"'),
             "P1 and P2 both own")
         bad("sub-share", phase("P1", subagents=True,
@@ -641,6 +638,13 @@ def self_test():
             "P1.1: subagent task with no owned")
         bad("lane-waves", phase("P1", lane_group="A") + "\n" + phase("P2", wave=2, lane_group="A"),
             "lane_group A: phases in different waves")
+
+        # reviewer: a string value passes through parse verbatim and checks clean
+        p = write("reviewer.md", plan_text(
+            phases=phase("P1", extra='reviewer = "opencode opencode-go/kimi-k3"\n') + "\n"))
+        out = mk("parse", p)
+        assert out["phases"][0]["reviewer"] == "opencode opencode-go/kimi-k3"
+        assert mk("check", p)["warnings"] == []
 
         # warnings: advisories never fail the check
         p = write("warn.md", plan_text(
@@ -656,10 +660,7 @@ def self_test():
                            'route = ""\nsize = "standard"\nrisk = "read_only"\nreview = "light"\n'
                            'qa = []\ncommit = ""\nsubagents = false\n\n'))
         out = mk("check", p)
-        assert out["ok"] is True
-        assert any("forbidden" in w for w in out["warnings"]), out
-        assert any("design" in w for w in out["warnings"]), out
-        assert any("integration" in w for w in out["warnings"]), out
+        assert out["ok"] is True and out["warnings"] == [], out  # no optional keys: still quiet
 
         # P1.3 set — body byte-identical, only the status line changes
         import shutil as sh
