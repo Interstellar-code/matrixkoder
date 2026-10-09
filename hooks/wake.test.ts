@@ -230,8 +230,108 @@ test('5-minute per task+status cap suppresses at 2 min, allows at 6 min', { opti
   )
   await clock.advance(30000) // poll
   await clock.advance(60000) // debounce
-  // Now allowed!
-  expect(submitted.length).toBe(2)
+  // The per-task+status cooldown passed (6 min > 5 min), but the identical-text
+  // hold stamped on the first submit blocks the same text for 10 min — still 1
+  expect(submitted.length).toBe(1)
+})
+
+test('M4: identical text from a NEW event line past the 10-min hold goes out (two submits)', { options: { wake: true } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const submitted: string[] = []
+  const store = new Map<string, unknown>([
+    ['wakeEventLines:hold2-run', 0],
+  ])
+
+  let eventLines = [
+    JSON.stringify({ t: '2026-10-07T20:00:00+02:00', run: 'hold2-run', task: 'F6', type: 'transition', to: 'verifying' }),
+  ]
+
+  const files: Record<string, string> = {
+    '/data/runs/index.json': JSON.stringify([{ id: 'hold2-run', status: 'active' }]),
+  }
+
+  mock.env(on, { MATRIXKODER_DATA: '/data' })
+
+  on('fs.read', (_$, e) => {
+    if (e.path === '/data/runs/index.json') return { value: files[e.path] ?? '' }
+    if (e.path === '/data/runs/hold2-run/events.jsonl') return { value: eventLines.join('\n') + '\n' }
+    return { value: '' }
+  })
+  on('prompt.submit', (_$, e) => {
+    submitted.push(e.text)
+    return { text: e.text }
+  })
+  on('state.get', (_$, e, next) => {
+    if (e.key === 'wakeEventLines' || e.key === 'wakeSentAt') {
+      const k = `${e.key}:${e.id}`
+      return { value: { value: store.get(k), version: 1 } }
+    }
+    return next(e)
+  })
+  on('state.set', (_$, e, next) => {
+    if (e.key === 'wakeEventLines' || e.key === 'wakeSentAt') {
+      const k = `${e.key}:${e.id}`
+      store.set(k, e.value)
+      return { value: { isSet: true, version: 1 } }
+    }
+    return next(e)
+  })
+  on('session.start', (_$, e, next) => ({ cwd: '/tmp' }))
+
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+
+  // Event 1 at t=0 -> submit at 90s
+  await clock.advance(30000)
+  await clock.advance(60000)
+  expect(submitted.length).toBe(1)
+  // identical text from a NEW event line 12 min later (well past the 10-min hold): a second
+  // submit goes out. The brief also covers the 6-min case in the updated 5-minute cap test
+  // (the cap test now expects 1 submit, the hold blocks the same text within 10 min)
+  await clock.advance(720000)
+  eventLines.push(
+    JSON.stringify({ t: '2026-10-07T20:12:00+02:00', run: 'hold2-run', task: 'F6', type: 'transition', to: 'verifying' }),
+  )
+  // the hold is now 12 min old (past the 10-min window): the next flush gives up on the HELD
+  // batch (upTo 1, already submitted) and leaves the NEW batch (upTo 2) in pending; the
+  // following poll re-arms the debounce and the flush submits
+  await clock.advance(30000) // poll at t=840: re-discovers event 2, arms debounce
+  await clock.advance(60000) // t=900: debounce fires; give-up leaves the new batch
+  await clock.advance(30000) // t=930: poll re-arms the debounce (retryNext is false to avoid double-flush)
+  await clock.advance(60000) // t=990: debounce fires, flushes, submits
+  expect(submitted.length, 'identical text 12 min after first submit: sent (hold expired)').toBe(2)
+})
+
+test('M1: a claim older than 2 min with no completed send is cleared and the batch retried once', { options: { wake: true } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const files: Record<string, string> = {
+    '/data/runs/index.json': JSON.stringify([{ id: 'r1', status: 'active' }]),
+    '/data/runs/r1/events.jsonl': EV('F6', 'verifying'),
+  }
+  const w = wakeWorld(on, files, [], { MATRIXKODER_DATA: '/data' }, '/tmp')
+  w.store.set('wakeEventLines:r1', 0)
+  // simulate a flush that died between the claim and the final write: sentinel in pending
+  // and a fresh claim token / claimAt 3 min old. M1's stale-claim recovery clears the
+  // claim, drops the sentinel, and resets wakeEventLines to 0 — the next poll re-discovers
+  // the batch from the lines (per-task cooldown is unset, so the re-discovery fires)
+  w.store.set('wakePending:', { run: 'r1', upTo: 1, items: [] })
+  w.store.set('wakeSentAt:claim:r1:1', 0.42)
+  w.store.set('wakeSentAt:claimAt:r1:1', -180000)  // 3 min old relative to mock clock t=0
+  await $.session.start(START('/tmp'))
+  // poll: the next tick must clear the dead claim and reset wakeEventLines so the
+  // following poll re-discovers the batch and the debounce fires the retry
+  await clock.advance(30000) // poll 1: M1 clear, wakeEventLines reset to 0
+  await clock.advance(30000) // poll 2: re-discovers, arms debounce
+  await clock.advance(60000) // debounce fires, flushes, submits
+  expect(w.submitted.length, 'retry: one submit, no double').toBe(1)
+  expect(w.submitted[0]).toContain('F6 → verifying')
+
+  // a fresh claim does NOT trigger a stale-claim recovery (the lease still owns it)
+  w.store.set('wakePending:', { run: 'r1', upTo: 1, items: [] })
+  w.store.set('wakeSentAt:claim:r1:1', 0.43)
+  w.store.set('wakeSentAt:claimAt:r1:1', 0)  // fresh relative to mock clock
+  await clock.advance(30000)
+  await clock.advance(60000)
+  expect(w.submitted.length, 'fresh claim: no second submit').toBe(1)
 })
 
 test('not for review event', { options: { wake: true } }, async ($, on) => {

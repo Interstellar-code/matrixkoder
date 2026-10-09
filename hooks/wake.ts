@@ -9,6 +9,7 @@ const WAKE_STATUSES = new Set(['verifying', 'blocked', 'quota', 'stalled', 'prov
 const TASK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 const COOLDOWN_MS = 5 * 60 * 1000 // 5 minutes
 const HOLD_MS = 10 * 60 * 1000 // 10 minutes: a submit that threw may still have been queued
+const CLAIM_DEAD_MS = 2 * 60 * 1000 // 2 minutes: a claim without a completed send is dead
 const HOLD_GONE = -1 // a hold that already gave up: never blocks a later identical text
 
 let debounceTimer: Timer | null = null
@@ -211,10 +212,27 @@ async function flushBatch($: EngineInterface): Promise<void> {
       retryNext = true // keep the batch and the old line count; the next poll tick re-checks the hold
       return
     }
-    // the hold expired: that attempt may or may not have been queued — give up on the batch instead of resending
+    // the hold expired: was the held batch the current pending, or a previous one? If a
+    // newer upTo is in pending, the held batch is already done (the new batch has the
+    // same text and must go out); only the held batch's lines are consumed. Otherwise the
+    // attempt may or may not have been queued — give up the held batch.
+    const heldUpToRes = await $.state
+      .get({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `heldUpTo:${text}` } as const)
+      .catch(() => ({ value: undefined }))
+    const heldUpTo = typeof heldUpToRes.value === 'number' ? heldUpToRes.value : pend.upTo
+    await $.state.set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `hold:${text}` } as const, HOLD_GONE).catch(() => {})
+    if (pend.upTo > heldUpTo) {
+      // a newer batch with the same text is in pending — leave it. The next poll's owed
+      // branch re-arms the debounce (or the polling timer's debounce re-arms); the new
+      // batch's items are the same we just re-read, so debounceTimer is null and the
+      // re-arm fires the flush in 60 s. retryNext is NOT set here to avoid the
+      // double-flush the polling timer + owed branch can produce on the same tick.
+      await $.state.set(pendingRef, pend).catch(() => {})
+      retryNext = false
+      return
+    }
     await $.state.set({ plugin: 'matrixkoder', key: 'wakeEventLines', id: pend.run } as const, pend.upTo).catch(() => {})
     await $.state.set(pendingRef, EMPTY_PENDING).catch(() => {})
-    await $.state.set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `hold:${text}` } as const, HOLD_GONE).catch(() => {})
     retryNext = false
     return
   }
@@ -223,7 +241,11 @@ async function flushBatch($: EngineInterface): Promise<void> {
     await $.prompt.submit({ text })
   } catch {
     // the submit may still have been queued: hold the identical text instead of ever resending it
+    // M4: the hold records the upTo of the held batch — a give-up that finds a newer upTo in
+    // pending is a NEW batch (the held batch was already submitted successfully), not the held
+    // one, and the new batch must go out
     await $.state.set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `hold:${text}` } as const, now).catch(() => {})
+    await $.state.set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `heldUpTo:${text}` } as const, pend.upTo).catch(() => {})
     await $.state.set(pendingRef, pend).catch(() => {}) // un-claim: the batch is still owed
     retryNext = true // keep the batch and the old line count; the next poll tick re-checks the hold
     return
@@ -234,6 +256,13 @@ async function flushBatch($: EngineInterface): Promise<void> {
       .set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `${p.task}:${p.to}` } as const, now)
       .catch(() => {})
   }
+  // M4: the identical-text 10-min window — the same prompt text is not submitted again
+  // within 10 min of a successful submit (a duplicate re-delivery from a later batch is
+  // already covered by the per-batch `sent:` guard above; this is the wider window). The
+  // held upTo lets a give-up distinguish the held batch from a newer batch with the same
+  // text (which must go out)
+  await $.state.set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `hold:${text}` } as const, now).catch(() => {})
+  await $.state.set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `heldUpTo:${text}` } as const, pend.upTo).catch(() => {})
   await $.state.set(sentRef, now).catch(() => {}) // the duplicate guard for this exact batch
   await $.state.set({ plugin: 'matrixkoder', key: 'wakeEventLines', id: pend.run } as const, pend.upTo).catch(() => {})
   await $.state.set(pendingRef, EMPTY_PENDING).catch(() => {})
@@ -317,6 +346,42 @@ async function pollEvents($: EngineInterface): Promise<void> {
 
     const pend = await readPending($)
     if (pend.run !== '' && pend.items.length === 0) {
+      // a flush holds this batch's claim (the sentinel kept run and upTo).
+      // M1: a claim that is older than 2 minutes with no completed send is dead — the flush
+      // died between the claim and the final write. The lease (25 s) only protects a batch
+      // that still carries items, so the sentinel alone can stick forever. On a stale claim,
+      // clear the sentinel and the claim keys, mark the retry-once flag, and let the next
+      // tick re-discover the lines (the items are lost; the re-scan re-forms them with the
+      // usual cooldown checks). A second stale-claim with the flag set gives up: lines are
+      // consumed to wake-dead, not retried again.
+      const claimAtRef = { plugin: 'matrixkoder', key: 'wakeSentAt', id: `claimAt:${pend.run}:${pend.upTo}` } as const
+      const claimAtRes = await $.state.get(claimAtRef).catch(() => ({ value: undefined }))
+      const claimAt = typeof claimAtRes.value === 'number' ? claimAtRes.value : undefined
+      const stale = claimAt !== undefined && now - claimAt > CLAIM_DEAD_MS
+      if (stale) {
+        const staleFlagRef = { plugin: 'matrixkoder', key: 'wakeSentAt', id: `staleClaim:${pend.run}:${pend.upTo}` } as const
+        const flagRes = await $.state.get(staleFlagRef).catch(() => ({ value: undefined }))
+        const flagSet = typeof flagRes.value === 'number' && flagRes.value > 0
+        if (flagSet) {
+          // second-time stale: consume the lines, drop the sentinel, do not retry
+          await $.state.set({ plugin: 'matrixkoder', key: 'wakeEventLines', id: pend.run } as const, pend.upTo).catch(() => {})
+          await $.state.set(pendingRef, EMPTY_PENDING).catch(() => {})
+          return
+        }
+        // first-time stale: clear the claim, drop the sentinel, and reset wakeEventLines so
+        // the next poll re-discovers the batch from the lines (the items were wiped to the
+        // sentinel — the lines are the only surviving description of what was about to be
+        // sent). The re-discovery goes through the usual per-task cooldown checks: if the
+        // first submit actually went through, the cooldown is set and the re-discovery is
+        // suppressed; if the flush truly died before submit, the cooldown was never set
+        // and the re-discovery fires the original batch once.
+        await $.state.set(claimAtRef, 0).catch(() => {})
+        await $.state.set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `claim:${pend.run}:${pend.upTo}` } as const, 0).catch(() => {})
+        await $.state.set(pendingRef, EMPTY_PENDING).catch(() => {})
+        await $.state.set({ plugin: 'matrixkoder', key: 'wakeEventLines', id: pend.run } as const, 0).catch(() => {})
+        await $.state.set(staleFlagRef, 1).catch(() => {})
+        return
+      }
       // a flush holds this batch's claim (the sentinel kept run and upTo):
       // rewriting the batch now would resurrect it under the flush — the
       // lines stay unconsumed and re-enter the next tick's scan instead
