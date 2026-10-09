@@ -595,3 +595,55 @@ test('home mode: the repo\'s data dir comes from $MATRIXKODER_HOME/projects.json
   await clock.advance(60000)
   expect(w.submitted).toEqual(['MatrixKoder: F6 → verifying. Continue the run from its Next action.'])
 })
+
+// ---------- F2: a transition a later status change reversed is dropped at flush time ----------
+
+const EV_FROM = (task: string, from: string, to: string) =>
+  JSON.stringify({ t: '2026-10-07T20:00:00+02:00', run: 'r1', task, type: 'transition', from, to }) + '\n'
+
+test('a transition a later event already reversed produces no prompt (E4 → stalled then E4 → building)', { options: { wake: true } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const files: Record<string, string> = {
+    '/data/runs/index.json': JSON.stringify([{ id: 'r1', status: 'active' }]),
+    '/data/runs/r1/events.jsonl': EV_FROM('E4', 'building', 'stalled') + EV_FROM('E4', 'stalled', 'building'),
+    // run.json is authoritative: E4 moved on to building, the stalled transition is stale
+    '/data/runs/r1/run.json': JSON.stringify({ id: 'r1', status: 'active', tasks: [{ id: 'E4', status: 'building' }] }),
+  }
+  const w = wakeWorld(on, files, [], { MATRIXKODER_DATA: '/data' }, '/tmp')
+  w.store.set('wakeEventLines:r1', 0)
+  await $.session.start(START('/tmp'))
+  await clock.advance(30000) // poll: E4 → stalled enters the batch (building is not a wake status)
+  expect(w.store.get('wakePending:')).toMatchObject({ items: [{ task: 'E4', to: 'stalled' }] })
+  await clock.advance(60000) // debounce fires: the re-read drops E4, nothing is submitted
+  expect(w.submitted).toEqual([])
+  expect(w.store.get('wakeEventLines:r1'), 'lines consumed without a submit').toBe(2)
+  expect(w.store.get('wakePending:')).toMatchObject({ items: [] })
+  await clock.advance(300000)
+  expect(w.submitted.length, 'nothing later either: the stale event never re-arms').toBe(0)
+})
+
+test('a still-current transition still wakes after the flush-time status re-read', { options: { wake: true } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const files: Record<string, string> = {
+    '/data/runs/index.json': JSON.stringify([{ id: 'r1', status: 'active' }]),
+    '/data/runs/r1/events.jsonl': EV_FROM('E4', 'building', 'stalled') + EV_FROM('E4', 'stalled', 'building') + EV('F2', 'stalled'),
+    '/data/runs/r1/run.json': JSON.stringify({
+      id: 'r1',
+      status: 'active',
+      tasks: [
+        { id: 'E4', status: 'building' }, // reversed: dropped
+        { id: 'F2', status: 'stalled' }, // still current: wakes
+      ],
+    }),
+  }
+  const w = wakeWorld(on, files, [], { MATRIXKODER_DATA: '/data' }, '/tmp')
+  w.store.set('wakeEventLines:r1', 0)
+  await $.session.start(START('/tmp'))
+  await clock.advance(30000) // poll: E4 → stalled and F2 → stalled enter the batch
+  await clock.advance(60000) // debounce fires: only F2 still holds stalled
+  expect(w.submitted).toEqual(['MatrixKoder: F2 → stalled. Continue the run from its Next action.'])
+  expect(w.store.get('wakeSentAt:F2:stalled')).toBeDefined()
+  expect(w.store.get('wakeSentAt:E4:stalled'), 'no cooldown stamped for the dropped item').toBeUndefined()
+  expect(w.store.get('wakeEventLines:r1')).toBe(3)
+  expect(w.store.get('wakePending:')).toMatchObject({ items: [] })
+})

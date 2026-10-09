@@ -97,6 +97,30 @@ function armDebounce($: EngineInterface): void {
   })
 }
 
+/** The task's CURRENT status at flush time: run.json is authoritative, else the task's
+ *  own task.json copy (state-schema v1). undefined = neither is readable — the caller
+ *  keeps the item, a read error must not silently eat a wake. */
+async function currentTaskStatus($: EngineInterface, dataDir: string, run: string, task: string): Promise<string | undefined> {
+  const runObj = parseJson(await $.fs.read(`${dataDir}/runs/${run}/run.json`).catch(() => ''))
+  const tasks = runObj != null && typeof runObj === 'object' && Array.isArray((runObj as { tasks?: unknown }).tasks)
+    ? (runObj as { tasks: unknown[] }).tasks
+    : null
+  if (tasks != null) {
+    for (const t of tasks) {
+      if (t != null && typeof t === 'object') {
+        const o = t as { id?: unknown; status?: unknown }
+        if (o.id === task && typeof o.status === 'string') return o.status
+      }
+    }
+  }
+  const taskObj = parseJson(await $.fs.read(`${dataDir}/runs/${run}/tasks/${task}/task.json`).catch(() => ''))
+  if (taskObj != null && typeof taskObj === 'object') {
+    const status = (taskObj as { status?: unknown }).status
+    if (typeof status === 'string') return status
+  }
+  return undefined
+}
+
 /** Submits the persisted batch. The seen-line count moves only after the submit resolved. */
 async function flushBatch($: EngineInterface): Promise<void> {
   debounceTimer = null
@@ -108,7 +132,21 @@ async function flushBatch($: EngineInterface): Promise<void> {
   } catch {
     // clock error
   }
-  const summary = pend.items.map(p => `${p.task} → ${p.to}`).join(', ')
+  // A later status change may already have reversed a transition while the batch waited:
+  // re-read each task's current status and drop items that no longer hold it.
+  const dataDir = await resolveDataDir($)
+  const items: Array<{ task: string; to: string }> = []
+  for (const p of pend.items) {
+    const status = await currentTaskStatus($, dataDir, pend.run, p.task)
+    if (status === undefined || status === p.to) items.push(p)
+  }
+  if (items.length === 0) {
+    // every transition was reversed: nothing to submit, but the lines are consumed
+    await $.state.set({ plugin: 'matrixkoder', key: 'wakeEventLines', id: pend.run } as const, pend.upTo).catch(() => {})
+    await $.state.set(pendingRef, EMPTY_PENDING).catch(() => {})
+    return
+  }
+  const summary = items.map(p => `${p.task} → ${p.to}`).join(', ')
   const text = `MatrixKoder: ${summary}. Continue the run from its Next action.`
 
   try {
@@ -118,7 +156,7 @@ async function flushBatch($: EngineInterface): Promise<void> {
     return
   }
   retryNext = false
-  for (const p of pend.items) {
+  for (const p of items) {
     await $.state
       .set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `${p.task}:${p.to}` } as const, now)
       .catch(() => {})
