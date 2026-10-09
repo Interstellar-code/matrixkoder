@@ -2,6 +2,23 @@
 
 All notable changes to this project. Format: Keep a Changelog; versions: SemVer.
 
+## [0.2.0] - 2026-10-09
+
+### Added
+- **dashboard:** mock Lanes, Usage and Waiting tabs (be19ecc)
+- **dashboard:** mock Overview, Plan and Events tabs (e8ec4b3)
+- **dashboard:** tab shell with Old tab and stub mock tabs (2eaf342)
+
+### Fixed
+- **dashboard:** T1 review r1 — row-width tests, narrow layouts, colours (e797a4d)
+- **dashboard:** T2 review r1 — wrap Waiting prose, usage header, colours (9b7852e)
+
+### Docs
+- **skill:** stage 5 dispatches via mk-lane-event.py dispatch; set child tasks, check ok (dbdb08a)
+
+### Other
+- **dashboard:** drop the stub-line assertion so T1/T2 can replace stub bodies (510e1a2)
+
 ## [0.1.0] - 2026-10-09
 
 ### Added
