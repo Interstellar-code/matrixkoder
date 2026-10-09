@@ -110,12 +110,17 @@ export type MkStatusMemory = {
   runId?: string | null
 }
 
+/** dashboard.tsx (S0.2): the /mk pane's tabs — 'old' is the pre-tab pane, the rest are the six mock tabs */
+export type MkDashTab = 'old' | 'overview' | 'lanes' | 'plan' | 'usage' | 'events' | 'waiting'
+
 declare module 'claude-code' {
   interface PluginState {
     matrixkoder: {
       snapshot: MkSnapshot
       taskStatuses: MkStatusMemory
       paneOpen: boolean
+      /** dashboard.tsx: the /mk pane's selected tab ('old' = the pre-tab pane) */
+      dashTab: MkDashTab
       /** wake.ts: events.jsonl lines already seen, per run id */
       wakeEventLines: { readonly byId: number }
       /** wake.ts: last wake submit timestamp per task:status id */

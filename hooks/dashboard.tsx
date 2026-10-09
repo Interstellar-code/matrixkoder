@@ -8,13 +8,20 @@ import type { Elements, EngineInterface, On, PluginOptions } from 'claude-code'
 
 // the per-surface element table $.ui.resolve(e) answers (every surface's has Box/Text)
 type Els = Elements[keyof Elements]
-import type { MkEvent, MkRun, MkRunIndexEntry, MkSnapshot, MkStatusMemory, MkTask } from '../types'
+import type { MkDashTab, MkEvent, MkRun, MkRunIndexEntry, MkSnapshot, MkStatusMemory, MkTask } from '../types'
 import {
   AGENT_ORDER, PANE_ID, EMPTY_SNAPSHOT, activeEntries, basename, candidateDirs, coerceIndex, coerceRun, coerceUsage, join,
   globalDirPath, mainCheckout, mkSnapshot, normalizePath, orderAgents, parentOf, parseGitdir, parseJson, parseYamlAgents, parseYamlProviders,
   projectDataDir, sanitizeText, timerRegistry,
 } from './data'
 import type { MkPaneSnapshot } from './data'
+import { AGENT_COLOR, AGENT_GLYPH, NARROW, STATUS_COLOR, STATUS_GLYPH, bar, leftCol, rightCol } from './tabs/ui'
+import { EventsTab, eventsView } from './tabs/events'
+import { LanesTab, lanesView } from './tabs/lanes'
+import { OverviewTab, overviewView } from './tabs/overview'
+import { PlanTab, planView } from './tabs/plan'
+import { UsageTab, usageView } from './tabs/usage'
+import { WaitingTab, waitingView } from './tabs/waiting'
 import { chipText, toastsFor } from './status'
 
 // atoms are file-local consts (the scan reads this file's own consts); the
@@ -26,6 +33,8 @@ const statusMemoryAtom = atom({ plugin: 'matrixkoder', key: 'taskStatuses' } as 
   loaded: false,
 } satisfies MkStatusMemory)
 const paneOpenAtom = atom({ plugin: 'matrixkoder', key: 'paneOpen' } as const, false)
+// S0.2: 'old' (the pre-tab pane) is the default tab
+const dashTabAtom = atom({ plugin: 'matrixkoder', key: 'dashTab' } as const, 'old')
 
 const COLUMNS = 46
 const REFRESH_MS = 5000
@@ -34,18 +43,20 @@ const USAGE_POLL_MIN_MIN = 1 // a faster poll with the 120 s timeout would stack
 const POLL_MIN_INTERVAL_MS = 60_000
 const SWEEP_INTERVAL_MS = 120_000
 const PRIMARY_POOL: Record<string, string> = { agy: 'gemini', claude: 'default' }
-const AGENT_GLYPH: Record<string, string> = { claude: '✦', agy: '∇', codex: '⊚', opencode: '⌂' }
-const AGENT_COLOR: Record<string, string> = { claude: 'magenta', agy: 'blue', codex: 'green', opencode: 'cyan' }
-const STATUS_COLOR: Record<string, string> = {
-  planned: 'gray', routed: 'gray', dispatched: 'blue', building: 'cyan', verifying: 'cyan',
-  review: 'yellow', fix: 'yellow', merged: 'green', qa: 'blue', done: 'green',
-  blocked: 'red', quota: 'red', stalled: 'yellow', provider: 'red',
-}
-const STATUS_GLYPH: Record<string, string> = {
-  planned: '○', routed: '◇', dispatched: '▷', building: '●', verifying: '⧖',
-  review: '◐', fix: '▲', merged: '◈', qa: '◆', done: '✓',
-  blocked: '⊘', quota: '⧗', stalled: '⚠', provider: '⊗',
-}
+// the pane's glyph/colour vocabularies moved to tabs/ui.ts: one copy for the
+// pane and the tab modules (T1/T2)
+/** the tab bar (S0.2): order and hotkeys are the plan's — o Overview, l Lanes,
+ * p Plan, u Usage, e Events, w Waiting, 0 Old. `short` is the under-NARROW
+ * label: one glyph per mock tab, Old keeps its word. */
+const TABS: readonly { key: MkDashTab; hotkey: string; label: string; short: string }[] = [
+  { key: 'overview', hotkey: 'o', label: 'Overview', short: 'o' },
+  { key: 'lanes', hotkey: 'l', label: 'Lanes', short: 'l' },
+  { key: 'plan', hotkey: 'p', label: 'Plan', short: 'p' },
+  { key: 'usage', hotkey: 'u', label: 'Usage', short: 'u' },
+  { key: 'events', hotkey: 'e', label: 'Events', short: 'e' },
+  { key: 'waiting', hotkey: 'w', label: 'Waiting', short: 'w' },
+  { key: 'old', hotkey: '0', label: 'Old', short: 'Old' },
+]
 /** compact status words per design §3.7 (`building 12m` → `build 12m`) */
 const STATUS_SHORT: Record<string, string> = {
   building: 'build', verifying: 'verify', dispatched: 'disp', stalled: 'stall', planned: 'plan',
@@ -146,11 +157,12 @@ export function registerDashboard(on: On, options: PluginOptions): void {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE_ID }, async ($, e) => {
-    const { Box, Text } = $.ui.resolve(e)
+    const els = $.ui.resolve(e)
+    const { Box, Button, Text } = els
     const snap = await read($, snapshotAtom) as MkPaneSnapshot
+    const dashTab = await read($, dashTabAtom)
     const cols = e.props.bodyColumns || COLUMNS
-    const compact = cols < 40
-    const active = snap.activeRuns
+    const compact = cols < NARROW
 
     return (
       <Box flexDirection="column" width={cols} gap={1}>
@@ -162,25 +174,47 @@ export function registerDashboard(on: On, options: PluginOptions): void {
         {snap.error && (
           <Text color="yellow" bold={true}>⚠ {snap.error}</Text>
         )}
-        {snap.dataDir === null
-          ? FirstRun($.ui.resolve(e))
-          : active.length === 0
-            ? NoRun($.ui.resolve(e), snap)
-            : active.map(run => (
-              // one Run/Plan/Lanes block per active run, newest first; Usage /
-              // Waiting / Recent below are global and render once
-              <Box key={run.id} flexDirection="column" gap={1}>
-                {RunSection($.ui.resolve(e), run, compact)}
-                {PlanSection($.ui.resolve(e), run, cols, compact, snap.now)}
-                {LanesSection($.ui.resolve(e), run, cols)}
-              </Box>
-            ))}
-        {UsageSection($.ui.resolve(e), snap, compact)}
-        {snap.run?.waiting && WaitingSection($.ui.resolve(e), snap.run.waiting)}
-        {snap.run && RecentSection($.ui.resolve(e), (snap.run.recent ?? []).slice(-3).reverse(), compact)}
+        <Box flexDirection="row" flexWrap="wrap" gap={1}>
+          {TABS.map(t => (
+            <Button
+              key={`dash-tab-${t.key}`}
+              plain
+              hotkey={t.hotkey}
+              label={compact ? t.short : t.label}
+              variant={dashTab === t.key ? 'primary' : undefined}
+              dimColor={dashTab === t.key ? undefined : true}
+              onPress={() => { void switchTab($, t.key) }}
+            />
+          ))}
+        </Box>
+        {dashTab === 'old'
+          ? OldTab(els, snap, cols, compact)
+          : dashTab === 'overview'
+            ? OverviewTab(els, overviewView(), cols)
+            : dashTab === 'lanes'
+              ? LanesTab(els, lanesView(), cols)
+              : dashTab === 'plan'
+                ? PlanTab(els, planView(), cols)
+                : dashTab === 'usage'
+                  ? UsageTab(els, usageView(), cols)
+                  : dashTab === 'events'
+                    ? EventsTab(els, eventsView(), cols)
+                    : WaitingTab(els, waitingView(), cols)}
       </Box>
     )
   })
+}
+
+/** A tab-bar press (S0.2): the state write is legal in onPress (a render must
+ * never write), and the pane scrolls back to the top — a refused scroll leaves
+ * the switch standing. */
+async function switchTab($: EngineInterface, tab: MkDashTab): Promise<void> {
+  await update($, dashTabAtom, () => tab)
+  try {
+    await $.ui.scroll({ in: PANE_ID, to: 'start' })
+  } catch {
+    // no scroll here — the tab still switched
+  }
 }
 
 /** Arms the refresh, usage-poll and lane-sweep timers for `cwd`, then loads the first snapshot. */
@@ -487,6 +521,33 @@ async function projectProviders($: EngineInterface, cwd: string): Promise<readon
 
 // ---------- sections (plain functions: JSX tags resolve to locals by name) ----------
 
+/** The pane as it was before the tab bar (S0.2): first-run, no-run and the
+ * per-run sections with Usage/Waiting/Recent below, moved here unchanged. */
+function OldTab(els: Els, snap: MkPaneSnapshot, cols: number, compact: boolean) {
+  const { Box } = els
+  const active = snap.activeRuns
+  return (
+    <Box flexDirection="column" gap={1}>
+      {snap.dataDir === null
+        ? FirstRun(els)
+        : active.length === 0
+          ? NoRun(els, snap)
+          : active.map(run => (
+            // one Run/Plan/Lanes block per active run, newest first; Usage /
+            // Waiting / Recent below are global and render once
+            <Box key={run.id} flexDirection="column" gap={1}>
+              {RunSection(els, run, compact)}
+              {PlanSection(els, run, cols, compact, snap.now)}
+              {LanesSection(els, run, cols)}
+            </Box>
+          ))}
+      {UsageSection(els, snap, compact)}
+      {snap.run?.waiting && WaitingSection(els, snap.run.waiting)}
+      {snap.run && RecentSection(els, (snap.run.recent ?? []).slice(-3).reverse(), compact)}
+    </Box>
+  )
+}
+
 function FirstRun(els: Els) {
   const { Box, Text } = els
   return (
@@ -679,12 +740,6 @@ function LanesSection(els: Els, run: MkRun, cols: number) {
   )
 }
 
-function bar(pct: number | null | undefined, width: number): string {
-  const used = Math.max(0, Math.min(100, pct ?? 0))
-  const full = Math.round((used / 100) * width)
-  return '█'.repeat(full) + '░'.repeat(Math.max(0, width - full))
-}
-
 function pctColor(pct: number | null | undefined, exhausted: boolean): string {
   if (exhausted || (pct ?? 0) > 85) return 'red'
   if ((pct ?? 0) > 60) return 'yellow'
@@ -834,8 +889,6 @@ function UsageSection(els: Els, snap: MkSnapshot, compact: boolean) {
   const NAME_W = 14 // fits '  └ claude-gpt': sub-row labels and agent names share one column
   const NUM_W = 5
   const RESET_W = 6
-  const leftCol = (text: string, w: number): string => (text.length > w ? text.slice(0, w) : text.padEnd(w))
-  const rightCol = (text: string, w: number): string => (text.length > w ? text.slice(0, w) : text.padStart(w))
   // a missing 5h window is '—' like the week column; 'n/a' only for a whole entry the provider could not answer
   const pctCol = (pct: number | null, na: boolean): string => (pct == null ? rightCol(na ? 'n/a' : '—', NUM_W) : rightCol(`${Math.round(pct)}%`, NUM_W))
   const weekCol = (pct: number | null): string => (pct == null ? rightCol('—', NUM_W) : rightCol(`${Math.round(pct)}%`, NUM_W))
