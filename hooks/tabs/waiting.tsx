@@ -56,6 +56,43 @@ function withRight(left: Seg[], right: string, w: number): Seg[] {
   return [...fitted, { text: ' '.repeat(Math.max(0, room - used)) }, { text: tail, tone: 'dim' as Tone }]
 }
 
+/** cut a single-line item to `w` cells, marked with '…' (the tail goes). */
+function cut(text: string, w: number): string {
+  if (text.length <= w) return text
+  if (w <= 1) return leftCol(text, w)
+  return leftCol(text, w - 1) + '…'
+}
+
+/**
+ * word-wrap prose to rows of at most `w` cells: each sentence starts a new row
+ * (so the question's "How should P6 proceed?" stays whole) and continuation
+ * rows keep the first row's column (hanging indent).
+ */
+function wrapProse(text: string, w: number, firstPrefix: string, contPrefix: string): string[] {
+  const out: string[] = []
+  let prefix = firstPrefix
+  for (const sentence of text.split(/(?<=[.?])\s+/)) {
+    let cur = ''
+    for (const raw of sentence.split(' ').filter(Boolean)) {
+      const room = Math.max(1, w - prefix.length)
+      const word = raw.length > room ? leftCol(raw, room) : raw
+      const cand = cur ? cur + ' ' + word : word
+      if (cur && cand.length > room) {
+        out.push(prefix + cur)
+        prefix = contPrefix
+        cur = word
+      } else {
+        cur = cand
+      }
+    }
+    if (cur) {
+      out.push(prefix + cur)
+      prefix = contPrefix
+    }
+  }
+  return out
+}
+
 const sg = (text: string, tone?: Tone, bold?: boolean): Seg => ({ text, tone, bold })
 
 /** Pure render: elements only, no $, no state (C1). */
@@ -83,21 +120,28 @@ export function WaitingTab(els: Els, view: WaitingView, cols: number) {
         <Text>
           {segEls(withRight([sg('! ' + view.header, 'warning', true)], compact ? view.timeCompact : view.time, avail), avail)}
         </Text>
-        <Text>{leftCol(view.question, avail)}</Text>
-        {view.options.map((o, i) => (
-          <Box key={String(i)} flexDirection="column">
-            <Text>{segEls([sg(`${o.key} · ${o.label}`, undefined, true)], avail)}</Text>
-            {o.recommended ? (
-              <Text>
-                {segEls([sg('  (recommended) ', 'success', true), sg(o.explanation, 'dim')], avail)}
-              </Text>
-            ) : (
-              <Text>{segEls([sg('  ' + o.explanation, 'dim')], avail)}</Text>
-            )}
-          </Box>
+        {wrapProse(view.question, avail, '  ', '  ').map((line, i) => (
+          <Text key={String(i)} dimColor={true}>{line}</Text>
         ))}
+        {view.options.map((o, i) => {
+          const rows = wrapProse(o.explanation, avail, o.recommended ? '  (recommended) ' : '  ', '  ')
+          return (
+            <Box key={String(i)} flexDirection="column">
+              <Text>{segEls([sg(cut(`${o.key} · ${o.label}`, avail), undefined, true)], avail)}</Text>
+              {rows.map((line, ri) =>
+                o.recommended && ri === 0 ? (
+                  <Text key={String(ri)}>
+                    {segEls([sg('  (recommended) ', 'success', true), sg(line.slice('  (recommended) '.length), 'dim')], avail)}
+                  </Text>
+                ) : (
+                  <Text key={String(ri)}>{segEls([sg(line, 'dim')], avail)}</Text>
+                ),
+              )}
+            </Box>
+          )
+        })}
         {view.actions.map((a, i) => (
-          <Text key={String(i)}>{segEls([sg('  ' + a, 'dim')], avail)}</Text>
+          <Text key={String(i)}>{segEls([sg(cut('  ' + a, avail), 'dim')], avail)}</Text>
         ))}
       </Box>
       {compact || cols < 50 ? (

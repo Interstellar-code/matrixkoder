@@ -86,6 +86,24 @@ function withRight(left: Seg[], right: string, w: number): Seg[] {
 
 const sg = (text: string, tone?: Tone, bold?: boolean): Seg => ({ text, tone, bold })
 
+const SWATCH: Record<string, Tone> = { '■ above 70%': 'warning', '■ exhausted': 'error' }
+
+/** the fitLegend line rebuilt as segments so each `■` carries its colour. */
+function legendSegs(line: string): Seg[] {
+  const out: Seg[] = []
+  line.split(' · ').forEach((item, i) => {
+    if (i > 0) out.push(sg(' · ', 'dim'))
+    const tone = SWATCH[item]
+    if (tone && item.startsWith('■')) {
+      out.push(sg('■', tone))
+      out.push(sg(item.slice(1), 'dim'))
+    } else {
+      out.push(sg(item, 'dim'))
+    }
+  })
+  return out
+}
+
 /** Pure render: elements only, no $, no state (C1). */
 export function UsageTab(els: Els, view: UsageView, cols: number) {
   const { Box, Text } = els
@@ -140,10 +158,25 @@ export function UsageTab(els: Els, view: UsageView, cols: number) {
       ) : (
         <Text>{segEls(withRight([sg(view.headerLeft, undefined, true)], view.headerRight, avail), avail)}</Text>
       )}
+      {!compact ? (
+        <Text>
+          {segEls(
+            [
+              sg('  ' + leftCol('agent / pool', 13), 'dim'),
+              sg(leftCol('5h', bw), 'dim'),
+              sg(' ' + leftCol('used', 4), 'dim'),
+              sg(leftCol('week', bw), 'dim'),
+              sg(' ' + leftCol('used', 4), 'dim'),
+              sg(' ' + rightCol('reset', 6), 'dim'),
+            ],
+            avail,
+          )}
+        </Text>
+      ) : null}
       {view.rows.map((row, i) => (
         <Text key={String(i)}>{segEls(quotaSegs(row), avail)}</Text>
       ))}
-      <Text dimColor={true}>{fitLegend(view.legend, avail)}</Text>
+      <Text>{segEls(legendSegs(fitLegend(view.legend, avail)), avail)}</Text>
       <Text>{' '}</Text>
       {compact || cols < 50 ? (
         <Text>{segEls([sg(view.decisionsHeader, undefined, true)], avail)}</Text>

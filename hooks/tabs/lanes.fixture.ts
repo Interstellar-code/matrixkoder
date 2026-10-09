@@ -29,7 +29,7 @@ export const LANES_FIXTURE: Omit<LanesView, 'mock'> = {
         { name: 'typecheck', lane: [s('ok', 'success')], baseline: 'ok' },
         { name: 'review', lane: [s('not yet · after gates', 'dim')], baseline: '—' },
       ],
-      gateOneLine: 'tests 412/2 · lint 0 · tsc ok',
+      gateOneLine: [s('  tests 412/2 · lint 0 · tsc ok', 'success')],
       actions: '  [Open pane] [Nudge] [Takeover]',
       compact: {
         header: '● build 14m',
@@ -66,7 +66,11 @@ export const LANES_FIXTURE: Omit<LanesView, 'mock'> = {
         },
         { name: 'review r2', lane: [s('in progress · 4m')], baseline: '—' },
       ],
-      gateOneLine: 'tests 418/2 · lint 0 · 1 blocker · 2 minor',
+      gateOneLine: [
+        s('  tests 418/2 · lint 0 · ', 'success'),
+        s('1 blocker', 'error'),
+        s(' · 2 minor', 'warning'),
+      ],
       actions: '  [Open pane] [Nudge] [Takeover]',
       compact: {
         header: '◐ review r2',
@@ -91,10 +95,10 @@ export const LANES_FIXTURE: Omit<LanesView, 'mock'> = {
         [s('  blocked by  ', 'dim'), s('P4 migration `tax_lines` not merged · decision open in Waiting', 'warning')],
       ],
       gate: [],
-      gateOneLine: '',
+      gateOneLine: [],
       actions: '  [Go to Waiting] [Dispatch anyway]',
       compact: {
-        header: '⊘ blocked',
+        header: '! blocked',
         statusTone: 'warning',
         right: 'P6',
         rows: [{ text: '  opencode glm-5 · needs P4' }],
@@ -112,10 +116,10 @@ export const LANES_FIXTURE: Omit<LanesView, 'mock'> = {
         [s('  fallback  ', 'dim'), s('Jev reroute candidates: opencode glm-5 high · codex gpt-6.1-mini medium')],
       ],
       gate: [],
-      gateOneLine: '',
+      gateOneLine: [],
       actions: '  [Reroute] [Wait]',
       compact: {
-        header: '⧗ quota',
+        header: '⊘ quota',
         statusTone: 'warning',
         right: 'P7 · 19:05',
         rows: [{ text: '  agy gemini-3.8-flash' }],

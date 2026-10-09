@@ -6,9 +6,12 @@
 // wraps at 36 or 46. Pure render (C1): elements only, no $, no state.
 import type { Elements } from 'claude-code'
 import { LANES_FIXTURE } from './lanes.fixture'
-import { NARROW, STATUS_GLYPH, leftCol, rightCol } from './ui'
+import { NARROW, leftCol, rightCol } from './ui'
 
 type Els = Elements[keyof Elements]
+
+/** header glyphs as artboard C draws them (its own vocabulary; ui.ts keeps the pane's). */
+const LANE_GLYPH: Record<string, string> = { building: '●', review: '◐', blocked: '!', quota: '⊘' }
 
 /** the row vocabulary: theme colour keys only (C5), 'dim' as dimColor. */
 export type Tone = 'text' | 'dim' | 'success' | 'warning' | 'error' | 'suggestion'
@@ -26,7 +29,7 @@ export type LaneData = {
   right: string
   rows: Seg[][]
   gate: GateRow[]
-  gateOneLine: string
+  gateOneLine: Seg[]
   actions: string
   compact: {
     header: string
@@ -122,7 +125,7 @@ export function LanesTab(els: Els, view: LanesView, cols: number) {
               {segEls(
                 withRight(
                   [
-                    sg(`${STATUS_GLYPH[lane.status] ?? ''} ${lane.status}`, lane.statusTone, true),
+                    sg(`${LANE_GLYPH[lane.status] ?? ''} ${lane.status}`, lane.statusTone, true),
                     sg(` · ${lane.task} ${lane.title}`, undefined, true),
                   ],
                   lane.right,
@@ -160,8 +163,8 @@ export function LanesTab(els: Els, view: LanesView, cols: number) {
                 </Text>
               ))}
             </Box>
-          ) : !compact && cols < 50 && lane.gateOneLine ? (
-            <Text>{segEls([sg('  ' + lane.gateOneLine, 'success')], avail)}</Text>
+          ) : !compact && cols < 50 && lane.gateOneLine.length > 0 ? (
+            <Text>{segEls(lane.gateOneLine, avail)}</Text>
           ) : null}
           <Text dimColor={true}>{leftCol(lane.actions, avail)}</Text>
           {li < view.lanes.length - 1 ? <Text>{' '}</Text> : null}

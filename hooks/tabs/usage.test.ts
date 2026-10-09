@@ -40,18 +40,21 @@ test('the Usage tab draws the MOCK row and its fixture quota/Jev rows at 46 cols
   expect(await ui.find({ text: /pick opencode glm-5 high/ }), 'fixture Jev pick line').toBeTruthy()
 })
 
-test('the Usage tab fits 36 cols: MOCK row, fixture string, no row over 36 cells', { plugins: [worldFixtures] }, async ($, on) => {
+test('the Usage tab fits 36, 40, 46 and 56 cols: MOCK row, fixture string, no row over cols', { plugins: [worldFixtures] }, async ($, on) => {
   mockFs(on, worldFiles())
   mockWorld(on)
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   await ui.press({ key: 'dash-tab-usage' })
-  await ui.redraw(paneProps(36))
-  expect(await ui.find({ text: MOCK }), 'MOCK row').toBeTruthy()
-  expect(await ui.find({ text: /sign in at ollama.com/ }), 'fixture string at 36').toBeTruthy()
-  for (const w of textWidths(await ui.drawn())) {
-    expect(w, `row wider than 36 cells: ${w}`).toBeLessThanOrEqual(36)
+  for (const w of [36, 40, 46, 56]) {
+    await ui.redraw(paneProps(w))
+    expect(await ui.find({ text: MOCK }), `MOCK row at ${w}`).toBeTruthy()
+    for (const width of textWidths(await ui.drawn())) {
+      expect(width, `row wider than ${w} cells at ${w}: ${width}`).toBeLessThanOrEqual(w)
+    }
   }
+  await ui.redraw(paneProps(36))
+  expect(await ui.find({ text: /sign in at ollama.com/ }), 'fixture string at 36').toBeTruthy()
 })
 
 test('a quota bar row carries the reserve floor tick', { plugins: [worldFixtures] }, async ($, on) => {
