@@ -212,16 +212,35 @@ async function flushBatch($: EngineInterface): Promise<void> {
       retryNext = true // keep the batch and the old line count; the next poll tick re-checks the hold
       return
     }
-    // the hold expired: was the held batch the current pending, or a previous one? If a
-    // newer upTo is in pending, the held batch is already done (the new batch has the
-    // same text and must go out); only the held batch's lines are consumed. Otherwise the
-    // attempt may or may not have been queued — give up the held batch.
+    // the hold expired: was the held batch the current pending, or a previous one? "Newer
+    // batch" is decided by CONTENT — a fresh transition arrived during the hold (the
+    // pending items include a task+to the held batch lacked). Bumping upTo on non-transition
+    // lines (note, heartbeat) does NOT end a hold; the held batch's items are the only
+    // thing that matters. The held text is from a thrown submit that may already have
+    // landed, so any new content the held batch lacked means the new batch must go out.
+    // A hold without recorded items (a pre-reload hold or a successful submit's hold) is
+    // treated as "no new content" — the held batch is the same as what's in pending, give up.
+    // wakeSentAt is typed as a number; the held items list is encoded as a single string with
+    // a sentinel delimiter that cannot appear in a task id or status. The held upTo is the
+    // line count of the held batch — the give-up sets wakeEventLines to that, not the current
+    // pending upTo (which may have advanced past the held batch on note/heartbeat lines).
+    const heldItemsRes = await $.state
+      .get({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `heldItems:${text}` } as const)
+      .catch(() => ({ value: undefined }))
+    const heldItemsRaw = typeof (heldItemsRes as unknown as { value: unknown }).value === 'string'
+      ? (heldItemsRes as unknown as { value: string }).value : ''
+    const heldItemsKnown = heldItemsRaw.length > 0
+    const heldItems: string[] = heldItemsKnown ? heldItemsRaw.split('\u0001') : []
     const heldUpToRes = await $.state
       .get({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `heldUpTo:${text}` } as const)
       .catch(() => ({ value: undefined }))
     const heldUpTo = typeof heldUpToRes.value === 'number' ? heldUpToRes.value : pend.upTo
     await $.state.set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `hold:${text}` } as const, HOLD_GONE).catch(() => {})
-    if (pend.upTo > heldUpTo) {
+    await $.state.set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `heldItems:${text}` } as const, '' as unknown as number).catch(() => {})
+    await $.state.set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `heldUpTo:${text}` } as const, 0).catch(() => {})
+    const pendItems = items.map(p => `${p.task}:${p.to}`).sort()
+    const hasNew = heldItemsKnown && pendItems.some(k => !heldItems.includes(k))
+    if (hasNew) {
       // a newer batch with the same text is in pending — leave it. The next poll's owed
       // branch re-arms the debounce (or the polling timer's debounce re-arms); the new
       // batch's items are the same we just re-read, so debounceTimer is null and the
@@ -231,7 +250,7 @@ async function flushBatch($: EngineInterface): Promise<void> {
       retryNext = false
       return
     }
-    await $.state.set({ plugin: 'matrixkoder', key: 'wakeEventLines', id: pend.run } as const, pend.upTo).catch(() => {})
+    await $.state.set({ plugin: 'matrixkoder', key: 'wakeEventLines', id: pend.run } as const, heldUpTo).catch(() => {})
     await $.state.set(pendingRef, EMPTY_PENDING).catch(() => {})
     retryNext = false
     return
@@ -241,10 +260,13 @@ async function flushBatch($: EngineInterface): Promise<void> {
     await $.prompt.submit({ text })
   } catch {
     // the submit may still have been queued: hold the identical text instead of ever resending it
-    // M4: the hold records the upTo of the held batch — a give-up that finds a newer upTo in
-    // pending is a NEW batch (the held batch was already submitted successfully), not the held
-    // one, and the new batch must go out
+    // R2-M1: the hold records the HELD ITEMS (sorted task:to list) so a give-up can decide
+    // "newer batch" by content — a fresh transition in pending that the held batch lacked
+    // means the new batch must go out. Bumping upTo on a note/heartbeat line does not end
+    // the hold (those events are not wake content; upTo is just the line cursor).
+    const heldItemsStr = items.map(p => `${p.task}:${p.to}`).sort().join('\u0001')
     await $.state.set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `hold:${text}` } as const, now).catch(() => {})
+    await $.state.set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `heldItems:${text}` } as const, heldItemsStr as unknown as number).catch(() => {})
     await $.state.set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `heldUpTo:${text}` } as const, pend.upTo).catch(() => {})
     await $.state.set(pendingRef, pend).catch(() => {}) // un-claim: the batch is still owed
     retryNext = true // keep the batch and the old line count; the next poll tick re-checks the hold
@@ -259,9 +281,11 @@ async function flushBatch($: EngineInterface): Promise<void> {
   // M4: the identical-text 10-min window — the same prompt text is not submitted again
   // within 10 min of a successful submit (a duplicate re-delivery from a later batch is
   // already covered by the per-batch `sent:` guard above; this is the wider window). The
-  // held upTo lets a give-up distinguish the held batch from a newer batch with the same
-  // text (which must go out)
+  // held items record lets a give-up distinguish the held batch from a newer batch with
+  // the same text (which must go out)
   await $.state.set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `hold:${text}` } as const, now).catch(() => {})
+  const heldItemsStr = items.map(p => `${p.task}:${p.to}`).sort().join('\u0001')
+  await $.state.set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `heldItems:${text}` } as const, heldItemsStr as unknown as number).catch(() => {})
   await $.state.set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `heldUpTo:${text}` } as const, pend.upTo).catch(() => {})
   await $.state.set(sentRef, now).catch(() => {}) // the duplicate guard for this exact batch
   await $.state.set({ plugin: 'matrixkoder', key: 'wakeEventLines', id: pend.run } as const, pend.upTo).catch(() => {})
@@ -368,17 +392,15 @@ async function pollEvents($: EngineInterface): Promise<void> {
           await $.state.set(pendingRef, EMPTY_PENDING).catch(() => {})
           return
         }
-        // first-time stale: clear the claim, drop the sentinel, and reset wakeEventLines so
-        // the next poll re-discovers the batch from the lines (the items were wiped to the
-        // sentinel — the lines are the only surviving description of what was about to be
-        // sent). The re-discovery goes through the usual per-task cooldown checks: if the
-        // first submit actually went through, the cooldown is set and the re-discovery is
-        // suppressed; if the flush truly died before submit, the cooldown was never set
-        // and the re-discovery fires the original batch once.
+        // first-time stale: clear the claim, drop the sentinel, and set the once-flag. Do NOT
+        // reset wakeEventLines to 0 — it already holds the right resume point (the dead batch
+        // never advanced it: only a successful submit moves it). Resetting to 0 re-scans the
+        // whole run history and rewakes every transition that is still in a wake status
+        // (the flush-time re-read only drops tasks that moved), producing a bogus prompt that
+        // names tasks the held batch never carried.
         await $.state.set(claimAtRef, 0).catch(() => {})
         await $.state.set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `claim:${pend.run}:${pend.upTo}` } as const, 0).catch(() => {})
         await $.state.set(pendingRef, EMPTY_PENDING).catch(() => {})
-        await $.state.set({ plugin: 'matrixkoder', key: 'wakeEventLines', id: pend.run } as const, 0).catch(() => {})
         await $.state.set(staleFlagRef, 1).catch(() => {})
         return
       }

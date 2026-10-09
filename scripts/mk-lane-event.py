@@ -369,19 +369,21 @@ def pane_text_snapshot(pane):
 
 def marker_in_new_pane_text(pane, marker, before):
     """True when the marker appears in pane text that was NOT in `before` — the since_dispatch
-    check. An empty marker or a failed read of either side proves nothing (False); a marker that
-    was already in `before` is pre-existing, not new, and must not recover the dispatch."""
+    check. Compared by occurrence COUNT (not slice) so a 300-line sliding window cannot hide
+    a freshly landed marker: the bottom of the screen is the new text, the top scrolls off,
+    and a slice like `after[len(before):]` returns nothing when the window slides. An empty
+    marker, an empty `before` AND `after`, or a failed `before` read proves nothing (False)
+    — a read failure means we cannot tell old from new, so we cannot prove the dispatch
+    landed and we must not recover it."""
     if not marker:
         return False
     after = pane_text_snapshot(pane)
     if not before and not after:
         return False
-    # the new portion is everything in `after` past the length of `before` — `before` is the
-    # prefix `after` grew from (the pane scrolls: the bottom of the screen is the new text)
-    new = after[len(before):] if len(after) >= len(before) else after
-    if marker in before:
-        return False  # the marker was already on the pane — not new since this dispatch started
-    return marker in new
+    # a failed `before` read (empty string) cannot prove the marker is new: treat as "cannot prove"
+    if not before:
+        return False
+    return after.count(marker) > before.count(marker)
 
 
 def marker_on_pane(pane, marker):
@@ -855,13 +857,15 @@ def self_test():
                     "elif a[:2] == ['agent', 'prompt']:\n"
                     "    log = os.path.join(base, 'calls.log')\n"
                     "    open(log, 'a').write(' '.join(a) + chr(10))\n"
-                    "    # every prompt call appends the prompt text to pane.txt — the dispatch\n"
-                    "    # helper's since_dispatch recheck reads pane.txt and looks for the prompt\n"
-                    "    # marker in the part that appeared AFTER capture-before\n"
-                    "    ptxt = a[3] if len(a) > 3 else ''\n"
-                    "    if ptxt:\n"
-                    "        with open(os.path.join(base, 'pane.txt'), 'a') as _pf:\n"
-                    "            _pf.write(ptxt + chr(10))\n"
+                    "    # every prompt call appends the prompt text to pane.txt for the since_dispatch\n"
+                    "    # recheck. `no_pane.txt` suppresses the append for tests that need the pane\n"
+                    "    # text to stay static across attempts.\n"
+                    "    no_pane = os.path.join(base, 'no_pane.txt')\n"
+                    "    if not os.path.exists(no_pane):\n"
+                    "        ptxt = a[3] if len(a) > 3 else ''\n"
+                    "        if ptxt:\n"
+                    "            with open(os.path.join(base, 'pane.txt'), 'a') as _pf:\n"
+                    "                _pf.write(ptxt + chr(10))\n"
                     "    hang = os.path.join(base, 'hang.txt')\n"
                     "    if os.path.exists(hang):\n"
                     "        import time; time.sleep(int(open(hang).read().strip()))\n"
@@ -1230,15 +1234,16 @@ def self_test():
         assert len(prompt_calls()) - n0 == 2, prompt_calls()
         assert ms_calls() == [f"task set H8C1 status=building --data {data} --by dispatch --run r1",
                               f"task set H8C2 status=building --data {data} --by dispatch --run r1"], ms_calls()
-        # (b) the pane never becomes working (done through both attempts) → delivered:false, the
-        # raw fields still present, no mk-state call
+        # (b) the pane never becomes working (done through both attempts) but the prompt text
+        # DID land in pane.txt (the fake herdr appends on every prompt call). The count check
+        # sees the marker count go up and recovers — the prompt was delivered even though the
+        # pane state didn't transition to working. delivered:true, recovered:true.
         set_canned("prompt_q.txt", "- -")
         open(ms_log, "w").write("")
         r = cli("dispatch", "--pane", pane_of("H8"), "--text", "go", extra=fast)
-        assert r["ok"] is False and r["delivered"] is False and r["attempts"] == 2, r
+        assert r["ok"] is True and r["delivered"] is True and r["recovered"] is True and r["attempts"] == 2, r
         assert r["pane_state"] == "done" and r["pane_entry"] == done_row, r
         assert "timeout" in r["herdr_error"] and "timeout" in r["error"] and r["timed_out"] is True, r
-        assert ms_calls() == [], ms_calls()
         # (c) pane state null — missing from a readable list, or the list unreadable → NO retry
         set_canned("pane_list_out.txt", '{"result": {"panes": []}}\n')
         set_canned("prompt_q.txt", "- 2")  # a scripted second reply that must never be sent
@@ -1329,14 +1334,15 @@ def self_test():
 
         # (H2) since_dispatch: the recheck only counts the marker when it appears in pane text
         # that is NEW since this dispatch started — the first line of --text that was ALREADY
-        # in the pane (an earlier dispatch's prompt, an old log line) must NOT recover
+        # in the pane (an earlier dispatch's prompt, an old log line) must NOT recover.
         set_canned("prompt_out.txt", '{"result": {"agent": {"agent_status": "agent_prompt_stalled"}}}\n')
         set_canned("prompt_rc.txt", "0")
         set_canned("pane_list_out.txt", json.dumps({"result": {"panes": [idle_row8]}}) + "\n")
-        # pane text BEFORE this dispatch starts already contains the exact marker (the first
-        # line of --text) — the new portion the fake appends on each attempt would carry the
-        # same marker, but it was already there → not new → no recovery
+        # pane text BEFORE this dispatch starts already contains the exact marker. `no_pane.txt`
+        # suppresses the fake's append so the count does not go up — the marker is genuinely
+        # old (a sibling lane's earlier prompt, an old log line) and must not recover.
         open(pane_f, "w").write("Read and follow /this/lane/brief.md\nold tail line\n")
+        open(os.path.join(tmp, "no_pane.txt"), "w").write("")
         set_canned("prompt_q.txt", "- -")
         open(ms_log, "w").write("")
         r = cli("dispatch", "--pane", pane_of("H8"),
@@ -1347,6 +1353,7 @@ def self_test():
         assert ms_calls() == [], (r, ms_calls())
         # the marker does NOT appear in old pane text — the new portion (fake appends) carries
         # the marker and it is genuinely new since this dispatch started → recover
+        os.unlink(os.path.join(tmp, "no_pane.txt"))
         open(pane_f, "w").write("older unrelated work\nold history line\n")
         open(ms_log, "w").write("")
         r = cli("dispatch", "--pane", pane_of("H8"),
@@ -1356,6 +1363,24 @@ def self_test():
         assert r["attempts"] == 2 and ms_calls() == [
             f"task set H8C1 status=building --data {data} --by dispatch --run r1",
             f"task set H8C2 status=building --data {data} --by dispatch --run r1"], ms_calls()
+        os.unlink(os.path.join(tmp, "prompt_q.txt"))
+
+        # (R2-M3) sliding pane: a full 300-line window where the prompt lands at the bottom.
+        # The old slice-based check returned False (the slice from the old length was empty
+        # after the window scrolled). The count check sees the marker count go up (the fake
+        # herdr appends the full --text on every prompt call) and recovers.
+        marker = "Read and follow /this/lane/brief.md"
+        open(pane_f, "w").write("\n".join(f"filler line {i}" for i in range(300)) + "\n")
+        set_canned("prompt_out.txt", '{"result": {"agent": {"agent_status": "agent_prompt_stalled"}}}\n')
+        set_canned("prompt_rc.txt", "0")
+        set_canned("pane_list_out.txt", json.dumps({"result": {"panes": [idle_row8]}}) + "\n")
+        set_canned("prompt_q.txt", "- -")
+        open(ms_log, "w").write("")
+        r = cli("dispatch", "--pane", pane_of("H8"),
+                "--text", f"{marker}\nread the brief and continue",
+                extra=fast)
+        assert r["ok"] is True and r["delivered"] is True and r["recovered"] is True, (
+            "full-window pane: the prompt marker count went up, recovered", r)
         os.unlink(os.path.join(tmp, "prompt_q.txt"))
 
         # (J1.1) --tasks arms a lane GROUP: the watch file lists every task, and one delivered

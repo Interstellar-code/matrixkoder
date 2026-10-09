@@ -854,7 +854,7 @@ def cmd_task(a, st):
                                            "(not merged/qa/done); pass --force to dispatch anyway",
                                            unmet=waiting)
                             st.event(run, "decision", f"forced by {a.by}: task set {t['id']} status={s} "
-                                     "(fan-out, unmet: {', '.join(waiting)})", task=c["id"], by=a.by)
+                                     f"(fan-out, unmet: {', '.join(waiting)})", task=c["id"], by=a.by)
                 for c in leaves:
                     if s != c["status"]:
                         st.event(run, "transition", a.note or f"{c['status']} → {s}", task=c["id"],
@@ -1725,7 +1725,22 @@ def self_test():
         assert len(d) == 2 and d[1]["by"] == "orchestrator", d
         assert d[1]["text"] == "forced by orchestrator: task set F2 status=building (unmet: A3)", d
 
-        # --parent onto merged/qa/done is refused; other runs' ready stays correct after an add
+        # R2-L2: a parent fan-out that is --force'd past the dep gate writes the unmet list into
+        # the decision text (the old code missed the f-prefix and wrote the literal
+        # "{', '.join(waiting)}" into the event). Parent has dep A3 (unmet); the forced
+        # fan-out produces a decision event whose text names the unmet dep.
+        dk("task", "add", "--id", "RFG", "--title", "r2-l2 fan-out gated", "--deps", "A3", "--run", "rb")
+        dk("task", "add", "--id", "RFGC", "--title", "r2-l2 fan-out gated child", "--parent", "RFG", "--run", "rb")
+        n_dec = len(dec())
+        out = dk("task", "set", "RFG", "status=dispatched", "--force", "--run", "rb")
+        assert out["ok"], out
+        # the child (RFGC) was set to dispatched by the fan-out; the parent rolls up
+        assert dk("task", "get", "RFGC", "--run", "rb")["task"]["status"] == "dispatched"
+        d = dec()[n_dec:]
+        assert len(d) == 1 and d[0]["task"] == "RFGC", d
+        # the unmet list is rendered into the text (A3), not the literal format string
+        assert "(fan-out, unmet: A3)" in d[0]["text"], d[0]
+        assert "{'" not in d[0]["text"], d[0]  # the old bug wrote a literal "{', '.join(waiting)}"        # --parent onto merged/qa/done is refused; other runs' ready stays correct after an add
         dk("task", "add", "--id", "Q2", "--title", "q2", "--run", "rb")
         dk("task", "add", "--id", "D2", "--title", "waits on rb:Q2", "--deps", "rb:Q2", "--run", "ra")
         dk("task", "set", "Q2", "status=merged", "--run", "rb")
