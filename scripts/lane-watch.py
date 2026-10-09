@@ -239,15 +239,27 @@ def record(out, task, data, run=None):
     return res
 
 
+FOOTER_LINES = 8  # the limit banner lives in the pane footer; the transcript above it is not a banner
+
+
+def pane_footer(text, lines=FOOTER_LINES):
+    """The last <lines> non-empty pane lines. The real limit banner is printed in the footer
+    (OpenCode's "Free usage exceeded … [retrying in …]" row); the same phrase in the transcript
+    above it is the agent TALKING about a limit — a brief line, a test fixture, a quoted banner —
+    and must not wake a watcher (tonight at 04:00 J1.3's own test text on screen did)."""
+    return "\n".join([l for l in text.splitlines() if l.strip()][-lines:])
+
+
 def quota_beats_stall(agent, kind):
-    """lane-health's quota detection over the WHOLE pane text — the marker-scoped text a poll
+    """lane-health's quota detection over the pane FOOTER — the marker-scoped text a poll
     classifies can cut a limit banner out: when the agent later echoes its dispatch prompt (a
     `cat brief` line, a re-printed instruction), since_dispatch's rfind starts after the LAST
-    echo and the banner above it is scoped away — tonight's "Free usage exceeded … [retrying in
-    22h 40m]" pane was judged STALL. So before STALL is ever decided, the full pane text goes
-    through lane-health (imported, the way these scripts share code) and a hit records the usage
-    ledger with its reset time. -> ("QUOTA", evidence) or (None, [])."""
-    text = lh.pane_text(agent)
+    echo and the banner above it is scoped away — so before STALL is ever decided, the footer
+    (last FOOTER_LINES non-empty lines) goes through lane-health (imported, the way these
+    scripts share code) and a hit records the usage ledger with its reset time. The transcript
+    is deliberately NOT searched: a banner the agent merely quotes is not a banner.
+    -> ("QUOTA", evidence) or (None, [])."""
+    text = pane_footer(lh.pane_text(agent))
     hits = lh.quota_hits(text)
     if not hits:
         return None, []
@@ -626,7 +638,7 @@ def self_test():
         assert led["exhausted_window"] == "5h" and led["exhausted_guess"] is False
         # J1.3: quota beats STALL — tonight's OpenCode line sits above the marker's last echo (the
         # agent re-printed its prompt), so the marker-scoped text cannot see it: STALL is never
-        # decided until the whole pane text went through lane-health's quota detection.
+        # decided until the pane FOOTER (K1.1) went through lane-health's quota detection.
         mks("task", "set", "P3", "status=building")
         open(pane, "w").write(
             "> Read and follow brief-r2.md\n"
@@ -644,6 +656,24 @@ def self_test():
         ocled = json.load(open(os.path.join(tmp, "home", "usage.json")))["agents"]["opencode"]
         assert ocled["exhausted_source"] == "pane-text" and ocled["exhausted_window"] == "weekly", ocled
         assert ocled["exhausted_guess"] is False, ocled
+        # K1.1: the same phrase in the TRANSCRIPT (the agent quoting a banner — a brief line, a
+        # test fixture) with an ordinary footer below it is not a banner: no QUOTA, no re-record.
+        # The marker echo at the end keeps it out of the poll's scoped text too, so decide()
+        # itself says STALL and only the footer check could (wrongly) override it.
+        oc_ev = ocled["exhausted_observed_at"]
+        open(pane, "w").write(
+            "> Read and follow brief-r2.md\n"
+            "Free usage exceeded, subscribe to Go [retrying in 22h 40m attempt #1]\n"
+            "$ pytest tests/ -q\n" + "".join(f"tests/test_{i}.py ....\n" for i in range(1, 11)) +
+            "10 passed in 4.21s\n$ cat brief-r2.md\n"
+            "Read and follow brief-r2.md exactly. Work autonomously until complete.\n")
+        mks("task", "set", "P3", "status=building")
+        out = cli("--commit-grep", "nomatch", "--kind", "opencode", "--prompt-marker",
+                  "Read and follow brief-r2.md", "--poll", "0.1", "--stall-min", "0.03",
+                  "--max-wait-min", "0.06", "--task", "P3", "--data", data)
+        assert out["state"] == "STALL" and out["evidence"][0].startswith("agent idle"), out
+        assert json.load(open(os.path.join(tmp, "home", "usage.json")))["agents"]["opencode"][
+            "exhausted_observed_at"] == oc_ev, "a quoted banner must not re-record the ledger"
         # without a quota line on screen the STALL path is unchanged (no override, no ledger entry)
         oc_ev = ocled["exhausted_observed_at"]
         open(pane, "w").write("> Read and follow brief-r2.md\nworking, then silence\n")
