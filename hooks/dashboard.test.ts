@@ -4,6 +4,7 @@
 import { test, expect } from 'claude-code/testing'
 import { DATA_DIR, NOW, RUN_PATH, RUNS_INDEX, USAGE_PATH, agentOf, agentsOf, mockFs, mockWorld, paneProps, sessionStart, sessionStartIn, setRun, setUsage, tasksOf, worldFiles, worldFixtures } from './testkit'
 import { parseYamlAgents } from './data'
+import { mockTabCounts, waitingCount } from './tabs/header'
 
 /** a project matrixkoder.yaml in the wizard's emitter shape: agents block + usage providers */
 const PROJECT_YAML = [
@@ -938,6 +939,114 @@ test('the chosen tab survives a refresh tick', { plugins: [worldFixtures] }, asy
   await clock.advance(5000) // the refresh tick reloads the snapshot atom
   expect(await ui.find(mockRow())).toBeTruthy() // the tab choice stands
   expect(await ui.find({ text: /workflows-v2/ })).toBeUndefined()
+})
+
+// ---------- V0.4: the run header on every tab and the counted tab bar ----------
+
+/** every tab-bar Button's label, in bar order. */
+const tabLabels = async (ui: { findAll: (q: { type: string }) => Promise<{ props: Record<string, unknown> }[]> }): Promise<string[]> =>
+  (await ui.findAll({ type: 'Button' })).map(b => String(b.props.label))
+
+test('the mock tab counts read the fixtures: lanes, plan done/total, waiting only when open', async () => {
+  expect(mockTabCounts()).toEqual({ overview: '', lanes: '4', plan: '3/8', usage: '', events: '', waiting: '!1', old: '' })
+  expect(waitingCount(0)).toBe('') // LOW: a fixture with no open decision shows no count, never `!0`
+  expect(waitingCount(2)).toBe('!2')
+})
+
+test('the run header sits above the tab bar on Old: name, stage chip and ▶ Next', { plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  expect(await ui.find({ text: 'workflows-v2' }), 'run name').toBeTruthy()
+  expect(await ui.find({ text: /7\/12 Verify/ }), 'stage chip').toBeTruthy()
+  expect(await ui.find({ text: /▶ verify F6 gates/ }), 'the ▶ Next line').toBeTruthy()
+  expect(await ui.find({ text: ' MOCK ' }), 'Old is not marked MOCK').toBeUndefined()
+  expect(await ui.find({ text: /main@82252eb/ }), 'the Old pane under the header is unchanged').toBeTruthy()
+  expect(await ui.find({ text: '▶ Next: ' }), 'the Run section still prints its own Next label').toBeTruthy()
+})
+
+test('every mock tab shows the fixture run header: name, stage chip, MOCK marker and ▶ Next', { plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  for (const { key, name } of TAB_BUTTONS) {
+    await ui.press({ key: 'dash-tab-old' })
+    await ui.press({ key })
+    expect(await ui.find({ text: 'Checkout v2' }), `${name} run name`).toBeTruthy()
+    expect(await ui.find({ text: /6\/12 Watch/ }), `${name} stage chip`).toBeTruthy()
+    expect(await ui.find({ text: ' MOCK ' }), `${name} MOCK marker`).toBeTruthy()
+    expect(await ui.find({ text: /▶ watching P4 R1/ }), `${name} ▶ Next`).toBeTruthy()
+    expect(await ui.find({ text: /workflows-v2/ }), `${name} hides Old`).toBeUndefined()
+  }
+})
+
+test('F0: every tab Button carries its keyboard hotkey — o l p u e w 0, at 36 and 46 cols', { plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  for (const cols of [46, 36] as const) {
+    await ui.press({ key: 'dash-tab-old' })
+    await ui.redraw(paneProps(cols))
+    const buttons = await ui.findAll({ type: 'Button' })
+    expect(buttons.map(b => b.props.hotkey), `hotkeys at ${cols}`).toEqual(['o', 'l', 'p', 'u', 'e', 'w', '0'])
+    for (const b of buttons) {
+      // an inactive tab's label is its count alone (or the `·` placeholder), so
+      // a plain Button's `h: label` drawing never repeats the tab's own letter
+      expect(String(b.props.label), `${String(b.props.hotkey)} label at ${cols}`).not.toBe(String(b.props.hotkey))
+      expect(String(b.props.label).length, `${String(b.props.hotkey)} label at ${cols}`).toBeGreaterThan(0)
+    }
+    for (const row of barRows(buttons, cols)) {
+      expect(row, `bar row at ${cols}`).toBeLessThanOrEqual(cols)
+    }
+  }
+  // the press-by-key switch loop stands
+  for (const { key, name } of TAB_BUTTONS) {
+    await ui.redraw(paneProps(46))
+    await ui.press({ key })
+    expect(await ui.find(mockRow()), `${name} MOCK row`).toBeTruthy()
+    await ui.press({ key: 'dash-tab-old' })
+    expect(await ui.find({ text: /workflows-v2/ }), 'Old is back').toBeTruthy()
+  }
+})
+
+/** the bar's wrapped rows: the engine draws a plain Button `h: label` and a
+ *  non-plain one `[ label ]`, with a one-cell gap between the buttons. */
+function chipWidth(b: { props: Record<string, unknown> }): number {
+  const label = String(b.props.label ?? '')
+  return b.props.plain === true ? `${String(b.props.hotkey ?? '')}: ${label}`.length : `[ ${label} ]`.length
+}
+
+function barRows(buttons: readonly { props: Record<string, unknown> }[], cols: number): number[] {
+  const rows: number[] = []
+  let row = 0
+  for (const b of buttons) {
+    const w = chipWidth(b)
+    row = row === 0 ? w : row + 1 + w > cols ? (rows.push(row), w) : row + 1 + w
+  }
+  if (row > 0) rows.push(row)
+  return rows
+}
+
+test('the tab bar shows the active word and count, the rest hotkey + count, at 46 and at 36 cols', { plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  // Old active: the counts come from the snapshot — 3 live lanes, 1/5 done, 1 open decision
+  expect(await tabLabels(ui)).toEqual(['·', '3', '1/5', '·', '·', '!1', 'Old'])
+  for (const cols of [36, 46] as const) {
+    await ui.press({ key: 'dash-tab-old' })
+    await ui.press({ key: 'dash-tab-lanes' })
+    await ui.redraw(paneProps(cols))
+    const labels = await tabLabels(ui)
+    expect(labels, `at ${cols}`).toEqual(['·', 'Lanes 4', '3/8', '·', '·', '!1', '·'])
+    expect(labels.join(' ')).not.toContain('o: o') // the S0 short labels are gone
+    expect(labels.some(l => /^[a-z0-9]$/.test(l)), 'no tab shows its own letter twice').toBe(false)
+    expect(labels.filter(l => l === '·').length, 'count-less tabs carry the placeholder').toBe(4)
+  }
 })
 
 // ---------- D1: one row per shared lane; titles never hide the status ----------
