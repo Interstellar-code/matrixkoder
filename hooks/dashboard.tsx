@@ -55,6 +55,38 @@ const IN_PROGRESS = new Set(['dispatched', 'building', 'verifying', 'review', 'f
 const SIDE_STATE = new Set(['blocked', 'quota', 'stalled', 'provider'])
 const LANE_LIVE = new Set(['dispatched', 'building', 'verifying', 'review', 'fix', 'stalled', 'blocked'])
 const LANE_FALLBACK = new Set(['dispatched', 'building', 'verifying', 'fix'])
+// The urgency order for a shared lane's rolled-up status, after mk-state.py's
+// rollup(): a side state wins with SIDE precedence (blocked, provider, quota,
+// stalled — "the first present wins"), else the most advanced status in the
+// lifecycle order STATUSES defines (the order STATUS_COLOR/STATUS_GLYPH follow
+// here) names the lane's current work; unknown statuses rank least advanced,
+// like mk-state's order.get(s, 0).
+const LANE_SIDE: readonly string[] = ['blocked', 'provider', 'quota', 'stalled']
+const LANE_STATUS_ORDER: readonly string[] = [
+  'planned', 'routed', 'dispatched', 'building', 'verifying', 'review', 'fix',
+  'merged', 'qa', 'done', 'blocked', 'quota', 'stalled', 'provider',
+]
+
+function laneStatusRank(status: string): number {
+  const i = LANE_STATUS_ORDER.indexOf(status)
+  return i === -1 ? 0 : i
+}
+
+/** The one status a shared lane's tasks roll up to: the most urgent among them. */
+function rollupLaneStatus(tasks: readonly MkTask[]): string {
+  const statuses = tasks.map(t => t.status)
+  for (const s of LANE_SIDE) {
+    if (statuses.includes(s)) return s
+  }
+  return statuses.reduce((top, s) => (laneStatusRank(s) > laneStatusRank(top) ? s : top))
+}
+
+/** `…`-truncate to `budget` columns (data.ts's sanitizeText caps without
+ *  marking the cut; the plan rows must show where the title yielded). */
+function truncateTitle(text: string, budget: number): string {
+  if (text.length <= budget) return text
+  return `${text.slice(0, Math.max(1, budget) - 1)}…`
+}
 let pollInFlight = false
 let lastPollAt = -Infinity
 let sweepInFlight = false
@@ -565,20 +597,27 @@ function PlanSection(els: Els, run: MkRun, cols: number, compact: boolean, nowMs
         const isAttention = SIDE_STATE.has(task.status)
         const checkbox = isDone ? '[✓]' : isActive ? '[•]' : isAttention ? '[!]' : '[ ]'
         const checkColor = isDone ? 'green' : isActive ? 'cyan' : isAttention ? 'yellow' : 'gray'
-        const title = compact ? task.title.slice(0, 14) : task.title // §3.7: 14-char title budget
+        const word = statusWord(task.status, compact)
         const round = task.round && (task.status === 'review' || task.status === 'fix') ? ` r${task.round}` : ''
         const mins = task.status === 'building' || task.status === 'verifying' || task.status === 'stalled' ? elapsedMin(task, nowMs) : null
         const suffix = `${round}${mins != null ? ` ${mins}m` : ''}`
+        const sha = cols >= 44 && task.last_commit ? task.last_commit.slice(0, 7) : ''
+        // the title yields to the status column and the age (D1.2): truncate
+        // with … to the columns left after checkbox + id and status + age + sha
+        const budget = cols - (checkbox.length + 1 + task.id.length + 1) - 1 - (word.length + suffix.length + (sha ? 1 + sha.length : 0))
+        const title = compact
+          ? task.title.slice(0, Math.min(14, Math.max(1, budget))) // §3.7: 14-char title budget
+          : truncateTitle(task.title, budget)
         return (
           <Box key={task.id} flexDirection="row" justifyContent="space-between" gap={1}>
             <Box flexDirection="row" gap={1} flexShrink={1}>
               <Text color={checkColor} bold={isActive || isAttention}>{checkbox}</Text>
               <Text bold={true}>{task.id}</Text>
-              <Text dimColor={task.status === 'planned'} wrap={compact ? 'truncate-end' : undefined}>{title}</Text>
+              <Text dimColor={task.status === 'planned'} wrap="truncate-end">{title}</Text>
             </Box>
             <Box flexDirection="row" gap={1} flexShrink={0}>
-              <Text color={STATUS_COLOR[task.status] ?? 'text'}>{statusWord(task.status, compact)}{suffix}</Text>
-              {cols >= 44 && task.last_commit && <Text dimColor={true}>{task.last_commit.slice(0, 7)}</Text>}
+              <Text color={STATUS_COLOR[task.status] ?? 'text'}>{word}{suffix}</Text>
+              {sha && <Text dimColor={true}>{sha}</Text>}
             </Box>
           </Box>
         )
@@ -590,27 +629,48 @@ function PlanSection(els: Els, run: MkRun, cols: number, compact: boolean, nowMs
 function LanesSection(els: Els, run: MkRun, cols: number) {
   const { Box, Text } = els
   const lanes = run.tasks.filter(t => t.lane && LANE_LIVE.has(t.status))
-  // no task carries a lane (early run, lanes not dispatched yet): the live
-  // dispatched|building|verifying|fix tasks stand in with agent glyph + model
-  const rows = lanes.length > 0
-    ? lanes.map(t => ({ task: t, slot: (t.lane ?? '').split('/').filter(Boolean).at(-1) ?? t.lane ?? '' }))
-    : run.tasks.filter(t => LANE_FALLBACK.has(t.status)).map(t => ({ task: t, slot: '·' }))
+  // one row per LANE PATH (D1.1): phases sharing a worktree share one lane row
+  // listing their phase ids — parents only, child tasks are never listed. No
+  // task carries a lane (early run, lanes not dispatched yet): the live
+  // dispatched|building|verifying|fix tasks stand in with agent glyph + model.
+  const rows: { key: string; slot: string; head: MkTask; tasks: MkTask[] }[] = []
+  if (lanes.length > 0) {
+    const byLane = new Map<string, { head: MkTask; tasks: MkTask[] }>()
+    for (const t of lanes) {
+      const key = t.lane ?? ''
+      const group = byLane.get(key) ?? { head: t, tasks: [] }
+      group.tasks.push(t)
+      byLane.set(key, group)
+    }
+    for (const [lane, group] of byLane) {
+      rows.push({ key: lane, slot: lane.split('/').filter(Boolean).at(-1) ?? lane, ...group })
+    }
+  } else {
+    for (const t of run.tasks.filter(t => LANE_FALLBACK.has(t.status))) {
+      rows.push({ key: t.id, slot: '·', head: t, tasks: [t] })
+    }
+  }
   return (
     <Box flexDirection="column">
       <Text bold={true}>Lanes</Text>
       {rows.length === 0 && <Text dimColor={true}>none live</Text>}
-      {rows.map(({ task: t, slot }) => {
-        const agent = t.agent ?? 'agent'
+      {rows.map(({ key, slot, head, tasks }) => {
+        const status = rollupLaneStatus(tasks)
+        const rep = tasks.find(t => t.status === status) ?? head
+        const parents = tasks.filter(t => !t.parent)
+        const ids = (parents.length > 0 ? parents : tasks).map(t => t.id).join(' ')
+        const agent = rep.agent ?? 'agent'
         return (
-          <Box key={t.id} flexDirection="row" justifyContent="space-between" gap={1}>
+          <Box key={key} flexDirection="row" justifyContent="space-between" gap={1}>
             <Box flexDirection="row" gap={1} flexShrink={1}>
               <Text dimColor={true}>{slot}</Text>
               <Text color={AGENT_COLOR[agent] ?? 'cyan'} bold={true}>{AGENT_GLYPH[agent] ?? '⌂'} {agent.toUpperCase()}</Text>
-              <Text dimColor={true} wrap="truncate-end">{[t.model, t.effort].filter(Boolean).join('-')}</Text>
+              <Text dimColor={true} wrap="truncate-end">{[rep.model, rep.effort].filter(Boolean).join('-')}</Text>
+              <Text wrap="truncate-end">{ids}</Text>
             </Box>
             <Box flexDirection="row" gap={1} flexShrink={0}>
-              <Text color={SIDE_STATE.has(t.status) ? 'yellow' : 'cyan'}>{t.status}</Text>
-              {cols >= 44 && t.last_commit && <Text dimColor={true}>{t.last_commit.slice(0, 7)}</Text>}
+              <Text color={SIDE_STATE.has(status) ? 'yellow' : 'cyan'}>{status}</Text>
+              {cols >= 44 && rep.last_commit && <Text dimColor={true}>{rep.last_commit.slice(0, 7)}</Text>}
             </Box>
           </Box>
         )

@@ -871,3 +871,111 @@ test('two active runs render both Run headers and both Plan lists, newest first'
   expect(flat.indexOf('workflows-v2'), 'newest header first').toBeLessThan(flat.indexOf('ui-polish'))
   expect(flat.indexOf('wizard split'), 'newest plan row first').toBeLessThan(flat.indexOf('mk-ui header pass'))
 })
+
+// ---------- D1: one row per shared lane; titles never hide the status ----------
+
+/** every Text node's own text under `n`, in document order (a found row is walked the same way as ui.drawn) */
+function rowTexts(n: unknown): string[] {
+  const out: string[] = []
+  const walk = (node: unknown): void => {
+    if (typeof node !== 'object' || node === null) return
+    const cur = node as { type?: string; children?: unknown[] }
+    if (cur.type === 'Text' && Array.isArray(cur.children)) {
+      const own = cur.children.map(c => (typeof c === 'string' ? c : '')).join('')
+      if (own) out.push(own)
+    }
+    if (Array.isArray(cur.children)) cur.children.forEach(walk)
+  }
+  walk(n)
+  return out
+}
+
+function sharedLaneTask(id: string, lane: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id, title: `phase ${id}`, wave: 1, deps: [], status: 'building', agent: 'opencode',
+    model: 'glm-5.3', effort: 'medium', lane, last_commit: null, round: 1, rounds: [],
+    updated: new Date(NOW - 5 * 60_000).toISOString(), ...extra,
+  }
+}
+
+test('D1.1: four phase tasks on one lane path render ONE lanes row listing their phase ids', { plugins: [worldFixtures] }, async ($, on) => {
+  const files = worldFiles()
+  setRun(files, run => {
+    run.tasks = [
+      sharedLaneTask('E1', '../wt-shared'),
+      sharedLaneTask('E2', '../wt-shared'),
+      sharedLaneTask('E3', '../wt-shared'),
+      sharedLaneTask('E4', '../wt-shared'),
+      sharedLaneTask('E1.1', '../wt-shared', { parent: 'E1' }), // child round on the same lane: not listed
+    ]
+  })
+  mockFs(on, files)
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  expect(await ui.find({ text: /E1 E2 E3 E4/ }), 'the phase ids on one row').toBeTruthy()
+  expect(await ui.find({ text: /⌂ OPENCODE/ }), 'the shared lane agent').toBeTruthy()
+  expect(await ui.find({ text: 'building' }), 'the rolled-up status').toBeTruthy()
+  const row = await ui.find({ key: '../wt-shared' })
+  expect(row, 'one row keyed by the lane path').toBeDefined()
+  const flat = rowTexts(row).join('')
+  expect(flat).toContain('wt-shared')
+  expect(flat).toContain('E1 E2 E3 E4')
+  expect(flat).toContain('building')
+  expect(flat).not.toContain('E1.1') // child tasks are never listed
+  expect(rowTexts(await ui.drawn()).filter(t => t === 'wt-shared'), 'the slot drawn exactly once').toHaveLength(1)
+})
+
+test('D1.1: the shared row shows the most urgent status; two lane paths stay two rows', { plugins: [worldFixtures] }, async ($, on) => {
+  const files = worldFiles()
+  setRun(files, run => {
+    run.tasks = [
+      sharedLaneTask('E1', '../wt-a', { status: 'blocked' }),
+      sharedLaneTask('E2', '../wt-a', { status: 'stalled' }),
+      sharedLaneTask('E3', '../wt-a', { status: 'verifying' }),
+      sharedLaneTask('E5', '../wt-b'),
+    ]
+  })
+  mockFs(on, files)
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  const rowA = await ui.find({ key: '../wt-a' })
+  const rowB = await ui.find({ key: '../wt-b' })
+  expect(rowA, 'lane A row').toBeDefined()
+  expect(rowB, 'lane B row stays its own row').toBeDefined()
+  const flatA = rowTexts(rowA).join('')
+  expect(flatA).toContain('E1 E2 E3')
+  expect(flatA).toContain('blocked') // SIDE precedence: blocked outranks stalled and verifying
+  expect(flatA).not.toContain('stalled')
+  expect(flatA).not.toContain('verifying')
+  const flatB = rowTexts(rowB).join('')
+  expect(flatB).toContain('E5')
+  expect(flatB).toContain('building')
+})
+
+test('D1.2: a 120-char title at 100 cols truncates with … and keeps the status word and age on the row', { plugins: [worldFixtures] }, async ($, on) => {
+  const files = worldFiles()
+  const longTitle = ('LEAD section for a shared lane (one subagent per phase, quota-aware routing, merged review and QA gates) ' + 'x'.repeat(120)).slice(0, 120)
+  setRun(files, run => {
+    const f6 = tasksOf(run)[1]
+    if (!f6) return
+    f6.title = longTitle
+    f6.status = 'building'
+    f6.round = 0
+    f6.updated = new Date(NOW - 12 * 60_000).toISOString() // age 12m
+  })
+  mockFs(on, files)
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(100) })
+  expect(await ui.find({ text: /…/ }), 'the truncated title marks the cut').toBeTruthy()
+  expect(await ui.find({ text: /building 12m/ }), 'status word and age still found').toBeTruthy()
+  const row = await ui.find({ key: 'F6' })
+  expect(row, 'the plan row').toBeDefined()
+  const flat = rowTexts(row).join('')
+  expect(flat).toContain('…')
+  expect(flat).toContain('building 12m') // same row as the (truncated) title
+  expect(flat).toContain(longTitle.slice(0, 40)) // the title's head is still drawn
+  expect(flat).not.toContain(longTitle.slice(-20)) // and its tail yielded to the status column
+})
