@@ -5,6 +5,7 @@ Python 3 stdlib only.
   parse <path>
   check <path>                     parse + the P1.2 rules, adds "warnings"
   set <path> --status draft|approved|running|done|parked
+                                   approved runs check first; errors refuse the write
   add-run <path> --run ID          appends to runs; idempotent
 
 A plan file: first line +++, TOML until the next +++ line, the rest is free
@@ -397,6 +398,11 @@ def write_atomic(path, text):
 def set_status(path, value):
     if value not in STATUSES:
         raise Fail([f"bad status {value!r} ({'|'.join(STATUSES)})"])
+    if value == "approved":  # F3.1: approving runs the check first; errors refuse the write
+        header, out, _ = read_plan(path)
+        errors, warnings = check_plan(header, out)
+        if errors:
+            raise Fail(errors, warnings=warnings)
     text, _ = load(path)
     lines, close = split_plan(text)
     span = key_span(lines, "status", close)
@@ -688,6 +694,23 @@ def self_test():
         before = open(p, "rb").read()
         mk("set", p, "--status", "approved", code=2)
         assert open(p, "rb").read() == before
+
+        # F3.1 — set --status approved runs check first: errors refuse the write
+        p = write("approve-bad.md", plan_text(phases=phase("P1", route="opencode") + "\n"))
+        assert mk("check", p, code=2)["errors"], "route 'opencode' (no model) fails check"
+        before = open(p, "rb").read()
+        out = mk("set", p, "--status", "approved", code=2)
+        assert out["ok"] is False and any("bad route" in e for e in out["errors"]), out
+        assert open(p, "rb").read() == before  # refused approval: file byte-identical
+        assert mk("set", p, "--status", "running")["status"] == "running"  # no check, unchanged
+        assert mk("parse", p)["status"] == "running"
+        # warnings alone never block an approval
+        p = write("approve-warn.md", plan_text(
+            plan='plan = "Bad_ID"', phases=phase("P1", deps='"r9:T1"') + "\n"))
+        out = mk("check", p)
+        assert out["ok"] is True and out["warnings"], out
+        assert mk("set", p, "--status", "approved")["status"] == "approved"
+        assert mk("parse", p)["status"] == "approved"
 
         # write_atomic keeps the file's own mode; the temp + os.replace lands in a writable dir
         p = write("mode.md", plan_text())
