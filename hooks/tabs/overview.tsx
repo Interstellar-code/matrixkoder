@@ -72,6 +72,10 @@ const USAGE_STOPS: readonly string[] = [PALETTE.grn, PALETTE.amb, PALETTE.red]
 /** the usage row's fixed columns: the 8-cell name, then the numbers' width. */
 const NAME_W = 8
 const NUM_W = { wide: 17, compact: 10 } as const
+/** C12: the Waiting Card's view-state keys, namespaced so they never clash with
+ *  another tab's (`waiting:pick` means the Waiting tab's own option key). */
+const PICK_KEY = 'overview:waiting:pick'
+const MORE_KEY = 'overview:waiting:more'
 
 const glyphOf = (status: string): string => TASK_GLYPH[status] ?? '·'
 const roleOf = (status: string): PaletteRole => TASK_ROLE[status] ?? 'idle'
@@ -150,7 +154,9 @@ function PlanCard(els: Els, view: OverviewData, W: number, compact: boolean) {
           ? <Text dimColor={true}>{`${glyphOf(task.status)} ${word}`}</Text>
           : Chip(els, { label: `${glyphOf(task.status)} ${word}`, role: roleOf(task.status) })
         const rightW = task.status === 'planned' ? word.length + 2 : word.length + glyphOf(task.status).length + 3
-        const budget = Math.max(1, W - task.id.length - rightW - 2)
+        // the row is id · title · filler · right with a gap column between each
+        // pair, so the title's budget gives back all three gap columns
+        const budget = Math.max(1, W - task.id.length - rightW - 3)
         return (
           <Box key={task.id} flexDirection="row" gap={1}>
             <Text bold={true}>{task.id}</Text>
@@ -175,7 +181,8 @@ function LanesCard(els: Els, lanes: OverviewData['lanes'], W: number, compact: b
         const word = compact ? lane.short : lane.note
         const label = `${glyphOf(lane.status)} ${word}`
         const modelEffort = compact ? `${lane.modelShort} ${lane.effort.slice(0, 3)}` : `${lane.model} ${lane.effort}`
-        const budget = Math.max(1, W - lane.slot.length - name.length - (label.length + 2) - 3)
+        // slot · agent · model · filler · chip: four gap columns to give back
+        const budget = Math.max(1, W - lane.slot.length - name.length - (label.length + 2) - 4)
         return (
           <Box key={lane.slot} flexDirection="row" gap={1}>
             <Text dimColor={true}>{lane.slot}</Text>
@@ -230,8 +237,10 @@ function WaitingCard(els: Els, waiting: OverviewData['waiting'], W: number, comp
   const { Box, Text } = els
   const question = compact ? waiting.shortQuestion : waiting.question
   const options = compact ? waiting.shortOptions : waiting.options
-  const pick = ui?.get('waiting:pick')
-  const revealed = ui?.get('waiting:more') === '1'
+  // C12: this Card's keys are namespaced — the Waiting tab owns its own
+  // `waiting:pick` / `waiting:more`, whose values mean something else there
+  const pick = ui?.get(PICK_KEY)
+  const revealed = ui?.get(MORE_KEY) === '1'
   const glyphs = ['a', 'b', 'c']
   const specs: ActionSpec[] = options.slice(0, 3).map((opt, i) => {
     const glyph = glyphs[i] ?? '·'
@@ -242,7 +251,7 @@ function WaitingCard(els: Els, waiting: OverviewData['waiting'], W: number, comp
       word: opt,
       tone: chosen ? 'primary' : 'default',
       primary: chosen,
-      onPress: () => { ui?.set('waiting:pick', glyph) },
+      onPress: () => { ui?.set(PICK_KEY, glyph) },
     }
   })
   return Card(els, { role: 'warn' }, (
@@ -254,7 +263,7 @@ function WaitingCard(els: Els, waiting: OverviewData['waiting'], W: number, comp
       {wrap(question, W).map((line, i) => (
         <Text key={`q${String(i)}`}>{line}</Text>
       ))}
-      {ActionButtons(els, specs, W, ui == null ? undefined : () => { ui.set('waiting:more', '1') })}
+      {ActionButtons(els, specs, W, ui == null ? undefined : () => { ui.set(MORE_KEY, '1') })}
       {revealed && options.slice(1).map((opt, i) => (
         <Text key={`fold${String(i)}`} dimColor={true}>{clip(`${glyphs[i + 1] ?? '·'} ${opt}`, W)}</Text>
       ))}

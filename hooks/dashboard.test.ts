@@ -1166,7 +1166,41 @@ test('D1.2: a 120-char title at 100 cols truncates with … and keeps the status
 /** every drawn Text's own text (dashboard.test.ts's rowTexts walk). */
 const allTexts = async (ui: { drawn: () => Promise<unknown> }): Promise<string[]> => rowTexts(await ui.drawn())
 
-test('V1.4: a full-width rule of the palette line colour sits under the tab bar on every tab', { plugins: [worldFixtures] }, async ($, on) => {
+/** every node of `type` under `n`, in document order. */
+function nodesOf(n: unknown, type: string): { type: string; props: Record<string, unknown>; children: unknown[] }[] {
+  const out: { type: string; props: Record<string, unknown>; children: unknown[] }[] = []
+  const walk = (node: unknown): void => {
+    if (typeof node !== 'object' || node === null) return
+    const cur = node as { type?: string; props?: Record<string, unknown>; children?: unknown[] }
+    if (cur.type === type) out.push({ type: cur.type, props: cur.props ?? {}, children: cur.children ?? [] })
+    for (const c of cur.children ?? []) walk(c)
+  }
+  walk(n)
+  return out
+}
+
+/** the rule Text's parent Box and that Box's children: the rule must sit
+ *  directly under the tab bar (a gap-less wrapper, bar then rule). */
+function ruleSiblings(drawn: unknown): { parent: Record<string, unknown>; kids: unknown[] } | undefined {
+  const isRule = (n: unknown): boolean => {
+    if (typeof n !== 'object' || n === null) return false
+    const node = n as { type?: string; children?: unknown[] }
+    if (node.type !== 'Text') return false
+    const own = (node.children ?? []).map(c => (typeof c === 'string' ? c : '')).join('')
+    return /^─+$/.test(own)
+  }
+  const walk = (n: unknown): { parent: Record<string, unknown>; kids: unknown[] } | undefined => {
+    if (typeof n !== 'object' || n === null) return undefined
+    const cur = n as { type?: string; props?: Record<string, unknown>; children?: unknown[] }
+    const kids = cur.children ?? []
+    if (kids.some(isRule)) return { parent: cur.props ?? {}, kids }
+    for (const c of kids) { const hit = walk(c); if (hit != null) return hit }
+    return undefined
+  }
+  return walk(drawn)
+}
+
+test('V1.4: a full-width rule of the palette line colour sits directly under the tab bar on every tab', { plugins: [worldFixtures] }, async ($, on) => {
   mockFs(on, worldFiles())
   mockWorld(on)
   await $.session.start(sessionStart())
@@ -1177,6 +1211,16 @@ test('V1.4: a full-width rule of the palette line colour sits under the tab bar 
     // Old carries the rule too: the frame is the header + bar, not the tab body
     expect(await ui.find({ text: new RegExp(`^─{${String(cols)}}$`) }), `the rule on Old at ${cols}`).toBeTruthy()
     expect((await allTexts(ui)).filter(t => /^─+$/.test(t)), `exactly one rule at ${cols}`).toHaveLength(1)
+    // flush: the rule's parent is a column Box with no gap that holds the tab
+    // bar and the rule, and nothing else
+    const wrap = ruleSiblings(await ui.drawn())
+    expect(wrap, `the rule's wrapper at ${cols}`).toBeDefined()
+    expect(wrap?.parent.flexDirection, `the wrapper is a column at ${cols}`).toBe('column')
+    expect(wrap?.parent.gap, `no gap inside the wrapper at ${cols}`).toBeUndefined()
+    expect(wrap?.kids, `bar then rule at ${cols}`).toHaveLength(2)
+    const bar = nodesOf(wrap?.kids[0], 'Button')
+    expect(bar.map(b => String(b.props.key)), `the bar is the first child at ${cols}`)
+      .toEqual(['dash-tab-overview', 'dash-tab-lanes', 'dash-tab-plan', 'dash-tab-usage', 'dash-tab-events', 'dash-tab-waiting', 'dash-tab-old'])
     for (const { key, name } of TAB_BUTTONS) {
       await ui.press({ key: 'dash-tab-old' })
       await ui.press({ key })
@@ -1198,7 +1242,7 @@ test('C12: the view state starts empty — every phase folded — and only a pre
   expect(await ui.find({ text: /R1 stripe adapter/ }), 'the press opened the phase').toBeTruthy()
 })
 
-test('C12: every tab call receives the ui handle — the six render with it and the Plan folds through it', { plugins: [worldFixtures] }, async ($, on) => {
+test('C12: every tab call receives the ui handle — all six tabs act on it, not just Overview and Plan', { plugins: [worldFixtures] }, async ($, on) => {
   mockFs(on, worldFiles())
   mockWorld(on)
   await $.session.start(sessionStart())
@@ -1210,8 +1254,27 @@ test('C12: every tab call receives the ui handle — the six render with it and 
     await ui.press({ key })
     expect(await ui.find(mockRow()), `${name} renders with the ui argument`).toBeTruthy()
   }
+  // Overview: the ⋯ reveal reads its flag back from ui and draws the rest
+  await ui.press({ key: 'dash-tab-overview' })
+  expect(await ui.find({ text: /b Start on main, rebase later/ }), 'hidden before the press').toBeUndefined()
+  await ui.press({ key: 'waiting-opt-a-more-2' })
+  expect(await ui.find({ text: /b Start on main, rebase later/ }), 'the Overview reveal after the press').toBeTruthy()
+  // Plan: the phase rows fold through ui
   await ui.press({ key: 'dash-tab-plan' })
   expect(await ui.find({ text: /R1 stripe adapter/ }), 'folded to start').toBeUndefined()
   await ui.press({ key: 'plan-fold-P4' })
-  expect(await ui.find({ text: /R1 stripe adapter/ }), 'the fold reaches the tab through ui').toBeTruthy()
+  expect(await ui.find({ text: /R1 stripe adapter/ }), 'the fold reaches the Plan tab through ui').toBeTruthy()
+  // Lanes: a lane's pause control re-renders that lane with its resume button
+  await ui.press({ key: 'dash-tab-lanes' })
+  expect(await ui.find({ type: 'Button', key: 'p4-resume' }), 'a building lane offers pause, not resume').toBeUndefined()
+  await ui.press({ key: 'p4-pause' })
+  expect(await ui.find({ type: 'Button', key: 'p4-resume' }), 'the paused lane offers resume').toBeTruthy()
+  // Waiting: ⋯ reveals the folded actions; a pick marks the option it picked
+  await ui.press({ key: 'dash-tab-waiting' })
+  const labels = await tabLabels(ui)
+  expect(labels, 'the tab bar keeps its own labels while a body draws buttons').toHaveLength(7)
+  await ui.press({ key: 'waiting-a-more-3' })
+  expect(await ui.find({ type: 'Button', text: /Rebase later/ }), 'the revealed option button').toBeTruthy()
+  await ui.press({ key: 'waiting-b' })
+  expect(await ui.find({ type: 'Button', text: /Rebase later ✓/ }), 'the picked option is marked').toBeTruthy()
 })

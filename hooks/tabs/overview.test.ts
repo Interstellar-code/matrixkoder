@@ -14,7 +14,7 @@ import { PALETTE, ROLE } from './palette'
 // included — plus the gap columns between its children. A single Text node
 // staying under `cols` proves nothing about the row it sits in.
 
-type DrawnNode = { type?: string; props?: { flexDirection?: string; gap?: number }; children?: unknown[] }
+type DrawnNode = { type?: string; props?: { flexDirection?: string; gap?: number; borderStyle?: string }; children?: unknown[] }
 
 /** a Text's whole drawn width: its own strings plus any nested Text's strings. */
 function textWidth(node: unknown): number {
@@ -38,16 +38,20 @@ function widthOf(node: unknown): number {
   return kids.reduce((max: number, c) => Math.max(max, widthOf(c)), 0)
 }
 
-/** every row's width in the drawn tree: each Text and each horizontal Box. */
-function rowWidths(root: unknown): number[] {
-  const out: number[] = []
-  const walk = (node: unknown): void => {
+/** every row's width in the drawn tree: each Text and each horizontal Box,
+ *  with whether it sits inside a kit Card (a round-bordered Box). */
+function rowWidths(root: unknown): { width: number; inCard: boolean }[] {
+  const out: { width: number; inCard: boolean }[] = []
+  const walk = (node: unknown, inCard: boolean): void => {
     if (typeof node !== 'object' || node === null) return
     const n = node as DrawnNode
-    if (n.type === 'Text' || (n.type === 'Box' && n.props?.flexDirection === 'row')) out.push(widthOf(node))
-    for (const c of n.children ?? []) walk(c)
+    const card = inCard || (n.type === 'Box' && n.props?.borderStyle === 'round')
+    if (n.type === 'Text' || (n.type === 'Box' && n.props?.flexDirection === 'row')) {
+      out.push({ width: widthOf(node), inCard: card })
+    }
+    for (const c of n.children ?? []) walk(c, card)
   }
-  walk(root)
+  walk(root, false)
   return out
 }
 
@@ -75,8 +79,36 @@ test('the Overview keeps every drawn ROW within the pane width at 36, 39, 40 and
     await ui.redraw(paneProps(cols))
     expect(await ui.find({ text: /MOCK · fixture data · not this run/ }), `the MOCK row at ${cols}`).toBeTruthy()
     expect(await ui.find({ text: /watching P4 R1/ }), `the fixture renders at ${cols}`).toBeTruthy()
-    const wide = rowWidths(await ui.drawn()).filter(w => w > cols)
+    // a row inside a Card is budgeted for the Card's content (cols - 4: the
+    // border and one padding cell per side); the MOCK row and the header rows
+    // outside any Card still owe only the pane's own width
+    const rows = rowWidths(await ui.drawn())
+    const wide = rows.filter(r => (r.inCard ? r.width > cols - 4 : r.width > cols))
     expect(wide, `over-wide rows at ${cols} cols: ${JSON.stringify(wide)}`).toEqual([])
+  }
+})
+
+test('the clipped Plan and Lanes rows fill the Card content width exactly', () => {
+  // the agy lane's model clips at both widths; the Plan row gets a long title
+  // so it clips at both too
+  const view: ReturnType<typeof overviewView> = {
+    ...overviewView(),
+    tasks: [{ id: 'P4', title: 'Payment provider adapter for the whole checkout flow', status: 'building', note: 'building 14m', short: 'build 14m' }],
+  }
+  for (const cols of [36, 46] as const) {
+    const tree = OverviewTab(stubEls(true), view, cols)
+    const rows = new Map(nodesOf(tree, 'Box').map(b => [String(b.props.key), b]))
+    const planRow = rows.get('P4')
+    // the sonnet lane's model clips at 36 (compact words), the agy lane's at 46
+    const laneRow = rows.get(cols < 40 ? 'p5' : 'p7')
+    expect(planRow, `the P4 row at ${cols}`).toBeDefined()
+    expect(laneRow, `the clipping lane row at ${cols}`).toBeDefined()
+    // the row lands on the Card's content width, never one cell into the padding
+    expect(widthOf(planRow), `the clipped Plan row at ${cols}`).toBe(cols - 4)
+    expect(widthOf(laneRow), `the clipped Lanes row at ${cols}`).toBe(cols - 4)
+    // and the mark of the cut is drawn
+    expect(nodesOf(planRow, 'Text').map(t => ownText(t)).some(t => t.endsWith('…')), `the title clips at ${cols}`).toBe(true)
+    expect(nodesOf(laneRow, 'Text').map(t => ownText(t)).some(t => t.endsWith('…')), `the model clips at ${cols}`).toBe(true)
   }
 })
 
@@ -190,6 +222,9 @@ const ownText = (n: unknown): string => {
 /** every drawn Text's own text under `n`, joined. */
 const allText = (n: unknown): string => nodesOf(n, 'Text').map(t => ownText(t)).join('\n')
 
+/** every Button in the drawn tree. */
+const buttonsOf = (n: unknown): { props: Record<string, unknown> }[] => nodesOf(n, 'Button')
+
 test('the Usage rows use the Raster bar when the table has one, the SmoothBar otherwise', () => {
   const withRaster = OverviewTab(stubEls(true), overviewView(), 46)
   // the Plan card's strip is a Raster too; the usage bars are the keyed ones
@@ -222,17 +257,26 @@ test('the Waiting options are a/b/c Buttons; the pick and the ⋯ reveal are vie
     ;(b?.props.onPress as () => void)()
   }
   press('waiting-opt-a')
-  expect(map.get('waiting:pick'), 'the pick lands in view state').toBe('a')
+  expect(map.get('overview:waiting:pick'), 'the pick lands in view state').toBe('a')
+  // the keys are namespaced: the Waiting tab's own view-state keys stay untouched
+  expect(map.get('waiting:pick'), 'the Waiting tab pick key is not ours').toBeUndefined()
+  expect(map.get('waiting:more'), 'the Waiting tab reveal key is not ours').toBeUndefined()
   press('waiting-opt-a-more-2')
-  expect(map.get('waiting:more'), 'the reveal lands in view state').toBe('1')
+  expect(map.get('overview:waiting:more'), 'the reveal lands in view state').toBe('1')
+  expect(map.get('waiting:more'), 'still not the Waiting tab key').toBeUndefined()
   const revealed = allText(OverviewTab(stubEls(true), overviewView(), 46, map))
   expect(revealed.includes('b Start on main, rebase later'), 'the folded option is revealed').toBe(true)
   expect(revealed.includes('c Fold into P4 lane'), 'the other folded option is revealed').toBe(true)
 
+  // the Overview shows the pick: that option's button takes the primary variant
+  const afterPick = buttonsOf(OverviewTab(stubEls(true), overviewView(), 46, map)).find(b => String(b.props.key) === 'waiting-opt-a')
+  expect(afterPick?.props.variant, 'the picked option is primary').toBe('primary')
+
   // a wide pane fits all three options, each with its own hotkey
-  const roomy = nodesOf(OverviewTab(stubEls(true), overviewView(), 100, map), 'Button')
-    .filter(b => String(b.props.key).startsWith('waiting-opt-'))
+  const roomy = buttonsOf(OverviewTab(stubEls(true), overviewView(), 100, map)).filter(b => String(b.props.key).startsWith('waiting-opt-'))
   expect(roomy.map(b => String(b.props.hotkey)), 'a b c').toEqual(['a', 'b', 'c'])
   ;(roomy[1]?.props.onPress as () => void)()
-  expect(map.get('waiting:pick'), 'pressing b records b').toBe('b')
+  expect(map.get('overview:waiting:pick'), 'pressing b records b').toBe('b')
+  const pickedB = buttonsOf(OverviewTab(stubEls(true), overviewView(), 100, map)).find(b => String(b.props.key) === 'waiting-opt-b')
+  expect(pickedB?.props.variant, 'the Overview shows the b pick').toBe('primary')
 })
