@@ -29,7 +29,10 @@ dispatch is the one-call prompt helper: `herdr agent prompt <pane> <text> --wait
 be in flight — so the pane's own state decides delivery: pane list still `working` → delivered:true;
 anything else (agent_prompt_stalled, idle, gone, list unreadable) → delivered:false with the observed
 state and herdr's own error. The reply carries exactly what the subprocesses returned, never invented.
-herdr runs one process per event with no ordering guarantee: every read/decide/write of a watch file
+A delivered prompt also re-arms the board for the next round: the pane's armed task has its children
+(or itself, when it has none) set building via mk-state (script from $MK_STATE_CMD, default
+scripts/mk-state.py); a failed write rides along in the JSON as task_status_error and never changes
+the delivery verdict. herdr runs one process per event with no ordering guarantee: every read/decide/write of a watch file
 happens under an fcntl.flock on <lane>/.matrixkoder-watch.lock (a stable inode next to the atomically
 replaced watch file). One JSON line per command.
 """
@@ -291,7 +294,7 @@ def record_pane(task, pane, data, run=None):
     the dashboard's lane rows name the pane without re-reading the watch files. Best-effort: the watch
     file is what makes a lane armed, so a task that is not in run state yet must not stop the arm."""
     common = ["--data", data, "--by", "lane-watch"] + (["--run", run] if run else [])
-    r = subprocess.run([sys.executable, lw.MK_STATE, "task", "set", task, f"pane={pane}", *common],
+    r = subprocess.run([sys.executable, mk_state_cmd(), "task", "set", task, f"pane={pane}", *common],
                        capture_output=True, text=True)
     try:
         return json.loads(r.stdout.strip().splitlines()[-1])
@@ -328,6 +331,54 @@ def pane_state(pane):
     return (row or {}).get("agent_status"), None
 
 
+def mk_state_cmd():
+    """The mk-state script this file's run-state writes go through (always a subprocess, never an
+    import); $MK_STATE_CMD lets a self-test inject a fake (mk-lane.py's rule, like $MK_HERDR)."""
+    return os.environ.get("MK_STATE_CMD") or lw.MK_STATE
+
+
+def mark_armed_building(pane):
+    """dispatch delivered:true → the pane's armed task moves again: its children (or the task
+    itself, when it has none) are set building via mk-state, so the board shows the lane working
+    before the agent's first event lands. No armed watch file → None, nothing else in the JSON.
+    mk-state failures are returned, never swallowed and never fatal: the delivery already happened
+    (a parent is never set directly — its status rolls up, so its children are set instead)."""
+    hit = find_armed(pane)
+    if not hit:
+        return None
+    w = hit[1]
+    task, data, run = w.get("task"), w.get("data"), w.get("run")
+    if not (task and data):
+        return None
+    targets = [task]
+    if run:
+        try:
+            with open(os.path.join(data, "runs", run, "run.json")) as f:
+                tasks = json.load(f).get("tasks") or []
+            kids = [t.get("id") for t in tasks if isinstance(t, dict)
+                    and (t.get("parent") or "").lower() == str(task).lower()]
+            targets = kids or [task]
+        except (OSError, ValueError):
+            pass  # unreadable run state: mk-state gets the task itself and says what is wrong
+    common = ["--data", data, "--by", "dispatch"] + (["--run", run] if run else [])
+    done, errors = [], []
+    for t in targets:
+        r = subprocess.run([sys.executable, mk_state_cmd(), "task", "set", t, "status=building", *common],
+                           capture_output=True, text=True)
+        try:
+            j = json.loads(r.stdout.strip().splitlines()[-1])
+        except (json.JSONDecodeError, IndexError):
+            j = None
+        if r.returncode != 0 or not isinstance(j, dict) or not j.get("ok"):
+            errors.append(f"{t}: {(r.stderr or r.stdout).strip()[-200:] or f'exit {r.returncode}'}")
+        else:
+            done.append(t)
+    res = {"building": done}
+    if errors:
+        res["task_status_error"] = "; ".join(errors)[:300]
+    return res
+
+
 def cmd_dispatch(a):
     """Prompt a pane's agent and check delivery in one call. Success → delivered:true. A timeout
     (herdr's error, or the wait settling on agent_prompt_stalled) → the pane's own state decides:
@@ -350,7 +401,8 @@ def cmd_dispatch(a):
         st, pl_err = pane_state(pane)
         base = {"pane": pane, "timed_out": True, "timeout_ms": ms, "error": why}
         if st == "working":
-            out({"ok": True, "delivered": True, "pane_state": "working", **base})
+            out({"ok": True, "delivered": True, "pane_state": "working", **base,
+                 **(mark_armed_building(pane) or {})})
         else:
             out({"ok": False, "delivered": False, "pane_state": st,
                  **({"pane_list_error": pl_err} if pl_err else {}), **base})
@@ -364,12 +416,14 @@ def cmd_dispatch(a):
                     if x)[:300] or f"herdr exited {r.returncode} with no output"
     if r.returncode == 0 and isinstance(j, dict) and "result" in j and jerr is None \
             and status != "agent_prompt_stalled":
-        out({"ok": True, "delivered": True, "pane": pane, "agent_status": status, "timeout_ms": ms})
+        out({"ok": True, "delivered": True, "pane": pane, "agent_status": status, "timeout_ms": ms,
+             **(mark_armed_building(pane) or {})})
     elif status == "agent_prompt_stalled" or "timeout" in why.lower() or "timed out" in why.lower():
         st, pl_err = pane_state(pane)
         base = {"pane": pane, "timed_out": True, "timeout_ms": ms, "herdr_error": why}
         if st == "working":  # the wait gave up, the agent did not: the prompt is still being delivered
-            out({"ok": True, "delivered": True, "pane_state": "working", **base})
+            out({"ok": True, "delivered": True, "pane_state": "working", **base,
+                 **(mark_armed_building(pane) or {})})
         else:
             out({"ok": False, "delivered": False, "pane_state": st, "error": why,
                  **({"pane_list_error": pl_err} if pl_err else {}), **base})
@@ -864,6 +918,79 @@ def self_test():
                 extra={"MK_HERDR": os.path.join(tmp, "noexec")})
         assert r["ok"] is False and r["delivered"] is False and r["timed_out"] is True, r
         assert "PermissionError" in r["error"], r
+
+        # (F5) a delivered prompt moves the armed task forward: its children (or the task itself,
+        # childless) go building via mk-state. The fake ($MK_STATE_CMD) records every call and can
+        # be made to fail; delivered:false must not call mk-state at all.
+        ms_log = os.path.join(tmp, "mscalls.log")
+        with open(os.path.join(bin_, "mk-state"), "w") as f:
+            f.write("#!/usr/bin/env python3\n"
+                    "import json, os, sys\n"
+                    "base = os.environ['FAKE_MK_STATE_DIR']\n"
+                    "open(os.path.join(base, 'mscalls.log'), 'a').write(' '.join(sys.argv[1:]) + chr(10))\n"
+                    "if os.path.exists(os.path.join(base, 'ms_badjson.txt')):\n"
+                    "    sys.stdout.write('not json at all' + chr(10))\n"
+                    "    sys.exit(0)\n"
+                    "if os.path.exists(os.path.join(base, 'ms_err.txt')):\n"
+                    "    sys.stderr.write(open(os.path.join(base, 'ms_err.txt')).read())\n"
+                    "    sys.exit(1)\n"
+                    "print(json.dumps({'ok': True}))\n")
+        os.chmod(os.path.join(bin_, "mk-state"), 0o755)
+        os.environ["FAKE_MK_STATE_DIR"] = tmp
+        fake_ms = os.path.join(bin_, "mk-state")
+
+        # an armed task that HAS children: H8 with H8C1 + H8C2
+        lanes["H8"] = os.path.join(tmp, "lane-h8")
+        g(repo, "worktree", "add", "-q", "--detach", lanes["H8"])
+        mks("task", "add", "--id", "H8", "--title", "H8", "--run", "r1")
+        mks("task", "add", "--id", "H8C1", "--title", "c1", "--parent", "H8", "--run", "r1")
+        mks("task", "add", "--id", "H8C2", "--title", "c2", "--parent", "H8", "--run", "r1")
+        arm("H8")
+
+        def ms_calls():
+            return open(ms_log).read().splitlines() if os.path.exists(ms_log) else []
+
+        # (f) delivered:true, armed task has children → exactly the children set building
+        set_canned("prompt_out.txt", '{"result": {"agent": {"agent_status": "idle"}}}\n')
+        set_canned("prompt_err.txt", "")
+        set_canned("prompt_rc.txt", "0")
+        open(ms_log, "w").write("")
+        r = cli("dispatch", "--pane", pane_of("H8"), "--text", "go", extra={"MK_STATE_CMD": fake_ms})
+        assert r["ok"] is True and r["delivered"] is True and r["building"] == ["H8C1", "H8C2"], r
+        assert "task_status_error" not in r, r
+        assert ms_calls() == [
+            f"task set H8C1 status=building --data {data} --by dispatch --run r1",
+            f"task set H8C2 status=building --data {data} --by dispatch --run r1"], ms_calls()
+        # (g) delivered:true, armed task has NO children → the task itself
+        open(ms_log, "w").write("")
+        r = cli("dispatch", "--pane", pane_of("H1"), "--text", "go", extra={"MK_STATE_CMD": fake_ms})
+        assert r["ok"] is True and r["delivered"] is True and r["building"] == ["H1"], r
+        assert ms_calls() == [f"task set H1 status=building --data {data} --by dispatch --run r1"], ms_calls()
+        # (h) delivered:false → no mk-state call at all
+        set_canned("prompt_out.txt", "")
+        set_canned("prompt_err.txt", "herdr: no such pane wZ:gone")
+        set_canned("prompt_rc.txt", "1")
+        open(ms_log, "w").write("")
+        r = cli("dispatch", "--pane", pane_of("H8"), "--text", "go", extra={"MK_STATE_CMD": fake_ms})
+        assert r["ok"] is False and r["delivered"] is False and "building" not in r, r
+        assert ms_calls() == [], ms_calls()
+        # (i) a failing mk-state (nonzero exit, or bad JSON) → the error rides in the JSON,
+        # delivery verdict unchanged
+        set_canned("prompt_out.txt", '{"result": {"agent": {"agent_status": "idle"}}}\n')
+        set_canned("prompt_err.txt", "")
+        set_canned("prompt_rc.txt", "0")
+        open(os.path.join(tmp, "ms_err.txt"), "w").write("mk-state: run state locked\n")
+        open(ms_log, "w").write("")
+        r = cli("dispatch", "--pane", pane_of("H8"), "--text", "go", extra={"MK_STATE_CMD": fake_ms})
+        assert r["ok"] is True and r["delivered"] is True and r["building"] == [], r
+        assert "run state locked" in r["task_status_error"] and "H8C1" in r["task_status_error"], r
+        os.unlink(os.path.join(tmp, "ms_err.txt"))
+        open(os.path.join(tmp, "ms_badjson.txt"), "w").write("x")
+        open(ms_log, "w").write("")
+        r = cli("dispatch", "--pane", pane_of("H8"), "--text", "go", extra={"MK_STATE_CMD": fake_ms})
+        assert r["ok"] is True and r["delivered"] is True and r["building"] == [], r
+        assert "not json" in r["task_status_error"], r
+        os.unlink(os.path.join(tmp, "ms_badjson.txt"))
 
         # disarm: removes the watch file, the lane stops matching events
         r = cli("disarm", "--lane", lanes["H3"])
