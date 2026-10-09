@@ -19,18 +19,19 @@ import contextlib, datetime, fcntl, json, os, re, subprocess, sys, tempfile, tim
 
 KINDS = ("claude", "codex", "opencode", "agy")
 # A quota hit needs a quota noun: bare "rate limit"/429, "Context limit reached" and a lone "resets in 3s"
-# are throttles or compaction, not an exhausted plan. Reset phrases only feed parse_reset, never trigger.
+# are throttles or compaction, not an exhausted plan. "(Free) usage exceeded" is one (OpenCode's free tier:
+# "Free usage exceeded, subscribe to Go"). Reset phrases only feed parse_reset, never trigger.
 QUOTA_RE = re.compile(r"\b(?:(?:usage|weekly|week|5-hour|5h|hourly|daily|session|plan|individual)\s+(?:limit|quota)\s+"
                       r"(?:reached|hit|exceeded)|(?:hit|reached)\s+your\s+(?:usage\s+|weekly\s+|5-hour\s+)?limit"
-                      r"|quota\s+(?:reached|exceeded))", re.I)
+                      r"|quota\s+(?:reached|exceeded)|(?:free\s+)?usage\s+exceeded)", re.I)
 # Lines that are code, diffs, grep hits or tool views — an agent editing this very file prints quota words.
 # ponytail: heuristic; a real CLI message with a double quote or "==" in it would be ignored
 CODE_LINE_RE = re.compile(r"[\"`]|\b(?:assert|def|return|import)\b|re\.compile|==|\w\s*=\s*['(\[]|\(\s*'"
                           r"|^[+-]|^\S+:\d+:|^\s*\d+\s*[│|→:]")
 RESET_AT_RE = re.compile(r"reset(?:s)? at (\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?)", re.I)
-RESET_IN_RE = re.compile(r"(?:resets?|try again)\s+in\s+((?:\d+\s*[a-z]+[\s,]*(?:and\s+)?)+)", re.I)
+RESET_IN_RE = re.compile(r"(?:resets?|try again|retrying)\s+in\s+((?:\d+\s*[a-z]+[\s,]*(?:and\s+)?)+)", re.I)
 RESET_CLOCK_RE = re.compile(r"resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", re.I)
-DUR_RE = re.compile(r"(\d+)\s*([dhm])", re.I)
+DUR_RE = re.compile(r"(\d+)\s*([dhms])", re.I)
 WEEKLY_AFTER_H = 6  # no window named in the text: a reset further out than this is weekly, not the 5h one
 NAMED_5H_RE = re.compile(r"\b(?:5|five)[\s-]*h(?:ou)?rs?\b|\b5h\b", re.I)
 NAMED_WEEK_RE = re.compile(r"\bweek(?:ly)?\b", re.I)
@@ -143,7 +144,8 @@ def named_window(text):
 def parse_reset(text, now=None):
     """-> (exhausted_until ISO or None, window "5h" | "weekly" | None) from limit text.
     Understands "reset at 2026-10-07 10:02", "resets in 154h43m / 1h 30m / 45m / 2d 3h / 2 hours",
-    "try again in ..." and a bare clock time "resets 3pm" / "resets at 15:30" (next occurrence)."""
+    "try again in ...", "retrying in 23m 36s" (OpenCode free tier) and a bare clock time
+    "resets 3pm" / "resets at 15:30" (next occurrence)."""
     now = now or datetime.datetime.now().astimezone()
     until, named = None, named_window(text)
     m = RESET_AT_RE.search(text)
@@ -159,7 +161,7 @@ def parse_reset(text, now=None):
                 return None, "5h"  # zone unknown: caller guesses now + 5h, flagged exhausted_guess
     if until is None:
         m = RESET_IN_RE.search(text)
-        mins = sum(int(n) * {"d": 1440, "h": 60, "m": 1}[u.lower()] for n, u in DUR_RE.findall(m.group(1))) if m else 0
+        mins = sum(int(n) * {"d": 1440, "h": 60, "m": 1, "s": 1 / 60}[u.lower()] for n, u in DUR_RE.findall(m.group(1))) if m else 0
         if mins:
             until = now + datetime.timedelta(minutes=mins)
     if until is None:
@@ -338,6 +340,12 @@ def self_test_body(shutil):
     assert parse_reset("resets at 15:30", now) == (later(hours=3, minutes=30), "5h")
     assert parse_reset("resets 5 times a day", now) == (None, None)
 
+    # F1: OpenCode free tier — the exact pane line seen tonight, retry delay kept (minutes+seconds)
+    opencode_line = "Free usage exceeded, subscribe to Go [retrying in 23m 36s attempt #1]"
+    assert classify(opencode_line, "idle", 1, 10)[0] == "QUOTA", opencode_line
+    assert parse_reset(opencode_line, now) == (later(minutes=23, seconds=36), "5h"), parse_reset(opencode_line, now)
+    assert parse_reset("Free usage exceeded, subscribe to Go [retrying in 23m attempt #1]", now) == (later(minutes=23), "5h")
+
     # ledger keyed by kind, CodexBar windows preserved
     import shutil
     tmp = tempfile.mkdtemp(prefix="lane-health-test-")
@@ -404,6 +412,16 @@ def self_test_body(shutil):
                 raise AssertionError(f"pool {bad!r} should be refused")
     finally:
         shutil.rmtree(tmp_pool, ignore_errors=True)
+
+    # F1: the OpenCode free-tier hit recorded under kind opencode, exhausted_until = now + retry delay
+    tmp_oc = tempfile.mkdtemp(prefix="lane-health-opencode-")
+    try:
+        ocled = os.path.join(tmp_oc, "usage.json")
+        e = record_quota(ocled, "opencode", "> brief\n" + opencode_line, now)
+        assert e["exhausted_until"] == later(minutes=23, seconds=36) and e["exhausted_window"] == "5h", e
+        assert e["exhausted_guess"] is False and e["exhausted_source"] == "pane-text" and e["exhausted_evidence"], e
+    finally:
+        shutil.rmtree(tmp_oc, ignore_errors=True)
     print("lane-health self-test ok")
 
 
