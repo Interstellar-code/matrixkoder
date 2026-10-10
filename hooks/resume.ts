@@ -4,13 +4,14 @@
 // are control-stripped, whitespace-collapsed and capped so the counts tail
 // survives the 600-char budget.
 import { atom, read } from 'claude-code'
-import type { On } from 'claude-code'
+import type { On, PluginOptions } from 'claude-code'
 import type { MkRun } from '../types'
 import { EMPTY_SNAPSHOT, PANE_ID, sanitizeText } from './data'
 
 const MAX_CHARS = 600
 const FIELD_CAP = 200
 const SECTION_ID = 'matrixkoder:run'
+const SOLO_TEXT = 'MK solo: no orchestration, build in this session'
 
 // same plugin+key address as dashboard.tsx's atom — file-local for the scan
 const snapshotAtom = atom({ plugin: 'matrixkoder', key: 'snapshot' } as const, EMPTY_SNAPSHOT)
@@ -22,7 +23,7 @@ function resumeText(run: MkRun): string {
   const next = sanitizeText(run.next, FIELD_CAP)
   const question = sanitizeText(run.waiting?.question, FIELD_CAP)
   const parts = [
-    `MatrixKoder run ${run.id} (${sanitizeText(run.feature, 60)})`,
+    `MatrixKoder run ${run.id} (${sanitizeText(run.feature, 60)}) · mode orchestrator`,
     `stage ${run.stage}/12`,
     next ? `next: ${next}` : null,
     question ? `waiting on user: ${question}` : null,
@@ -31,9 +32,12 @@ function resumeText(run: MkRun): string {
   return parts.join(' · ').slice(0, MAX_CHARS)
 }
 
-export function registerResume(on: On): void {
+export function registerResume(on: On, options: PluginOptions): void {
   on('prompt.compose', async ($, e, next) => {
     const { sections } = await next(e)
+    if (options.mode === 'solo') {
+      return { sections: [...sections, { id: SECTION_ID, text: SOLO_TEXT, scope: 'session' as const }] }
+    }
     const snap = await read($, snapshotAtom)
     const run = snap.run
     if (!run || run.status === 'done' || run.status === 'archived') return { sections }

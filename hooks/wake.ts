@@ -406,6 +406,8 @@ async function pollEvents($: EngineInterface): Promise<void> {
 }
 
 export function registerWake(on: On, options: PluginOptions): void {
+  // solo mode is a single-session build: no orchestrator, so nothing to wake on
+  if (options.mode === 'solo') return
   if (!options.wake) return
 
   wakeTimers() // the shared registry must exist from registration on: a reload's re-registration reads it

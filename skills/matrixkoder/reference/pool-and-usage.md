@@ -53,7 +53,7 @@ Record the route with `mk-state task set <T> agent=<kind> model=<m> effort=<e>` 
 
 ## Usage ledger — `~/.matrixkoder/usage.json` (CodexBar)
 
-One source for every agent: `${CLAUDE_PLUGIN_ROOT}/scripts/mk-usage.py` (`--once` / `--watch` / `--self-test`; the dashboard runs the poll, the pane-text fallback below writes the same ledger) runs `codexbar usage --format json --provider <p>` (providers from `usage.providers`, every `usage.poll_min` minutes) and normalises into `usage.json`. Read that file; never call codexbar from the loop. Unknown stays `null` — never guess.
+One source for every agent: `${CLAUDE_PLUGIN_ROOT}/scripts/mk-usage.py` (`--once` / `--watch` / `--self-test`; the dashboard runs the poll, the pane-text fallback below writes the same ledger) runs `codexbar usage --format json --provider <p>` (providers from `usage.providers`, every `usagePollMin` minutes — a plugin setting, not a yaml key) and normalises into `usage.json`. Read that file; never call codexbar from the loop. Unknown stays `null` — never guess.
 
 Rules:
 - **Classify windows by `windowMinutes`** (300 = 5h, 10080 = week), never by primary/secondary position. AGY's primary is a weekly window. Keep every window with its `id`/`title`: AGY has two weekly pools, Claude has a Fable-only week.
@@ -68,7 +68,7 @@ Rules:
 Stage 1 writes `## Routing preferences` from `matrixkoder.yaml` defaults; if the user never stated any, propose these and ask once:
 - **Claude-sparing:** Claude Code orchestrates only; builders Codex → OpenCode → AGY → Claude.
 - **Reserve floors:** Claude ≥40% of 5h and ≥30% weekly left; others may go down to 10% / 15%.
-- The orchestrator saves Claude too: the watch/dispatch loop runs in scripts, the main thread can drop to sonnet between verify/merge stages, reviewers default to Codex or AGY pro unless Jev routes the review to opus.
+- The orchestrator saves Claude too: the watch/dispatch loop runs in scripts, the main thread can drop to sonnet between verify/merge stages; the reviewer route comes from `routing_preferences.reviewer` (`visual_reviewer` for visual/UI reviews) unless a phase pins its own.
 - User statements always override; every quota event during the run appends a dated line under the section.
 
 ## Jev recipe (cheap — every call is paid)

@@ -41,7 +41,9 @@ On confirm the wizard writes:
 - `matrixkoder.yaml` in the data directory. If one exists you choose keep (default) or replace; replace backs the old file up to `.bak`.
 - `plans/` and `runs/` folders in the data directory.
 - A `/.matrixkoder/` line in `.gitignore` when you chose the repo data location.
-- `~/.matrixkoder/config.json` (merged) and `~/.matrixkoder/projects.json` (your project is added or updated).
+- `~/.matrixkoder/projects.json` (your project is added or updated).
+
+Dashboard preferences (auto-open, chip, toasts, poll interval) are plugin settings — `claude plugin configure matrixkoder` — not files the wizard writes.
 
 If the pane cannot open (not fullscreen, or too narrow), the same questions are asked in chat.
 

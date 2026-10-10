@@ -255,8 +255,88 @@ export function dataDirOf(d: MkWizardDraft): string | null {
   return d.repo == null ? null : `${d.repo}/.matrixkoder`
 }
 
-/** The filled templates/matrixkoder.yaml. `checkedAt` is an ISO timestamp the caller reads from the clock. */
-export function buildYaml(d: MkWizardDraft, checkedAt: string): string {
+/** The session: keys a replace carries over — the Settings tab owns them between wizard runs. */
+const SESSION_KEYS = new Set(['fresh_session', 'subagents', 'subagent_model', 'stall_min', 'max_wait_min', 'reviewer_split', 'reuse_reviewer'])
+
+type YamlCarry = {
+  session: Record<string, string | number | boolean>
+  picks: Record<string, string[]>
+  reviewer: string | null
+  visualReviewer: string | null
+}
+
+/** `22   # idle minutes…` → `22`: cut at a `#` that starts a comment (whitespace before it, outside quotes). */
+function stripYamlComment(v: string): string {
+  let q: string | null = null
+  for (let i = 0; i < v.length; i++) {
+    const c = v[i]
+    if (q != null) {
+      if (c === q) q = null
+    } else if (c === '"' || c === "'") q = c
+    else if (c === '#' && (i === 0 || v[i - 1] === ' ' || v[i - 1] === '\t')) return v.slice(0, i)
+  }
+  return v
+}
+
+function unquoteScalar(v: string): string {
+  const t = v.trim()
+  return t.length >= 2 && ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) ? t.slice(1, -1) : t
+}
+
+const NUMERIC_KEYS = new Set(['stall_min', 'max_wait_min'])
+
+/** The carried value for one session key, in the type that key actually has. Only the two numeric
+ *  keys become numbers: everything else keeps its text, so a model id that looks like a number
+ *  (`"007"`) stays `"007"` instead of turning into 7. */
+function typedSessionScalar(key: string, v: string): string | number | boolean {
+  if (NUMERIC_KEYS.has(key) && /^-?\d+$/.test(v)) return Number(v)
+  if (key === 'subagents' || key === 'reuse_reviewer') {
+    if (v === 'true') return true
+    if (v === 'false') return false
+  }
+  return v
+}
+
+/** What an existing matrixkoder.yaml set in the three groups a replace must keep: the session:
+ *  block, the picks lists and the two reviewer routes. Line-wise scan in this file's style —
+ *  a malformed or absent block yields no override (defaults apply); never throws. */
+function parseCarry(text: string | null | undefined): YamlCarry {
+  const out: YamlCarry = { session: {}, picks: {}, reviewer: null, visualReviewer: null }
+  if (text == null) return out
+  let block = ''
+  for (const raw of text.split('\n')) {
+    const line = raw.replace(/\r$/, '')
+    if (line.trim() === '' || line.trim().startsWith('#')) continue
+    if (/^[A-Za-z_][\w-]*:/.test(line)) {
+      block = line.slice(0, line.indexOf(':'))
+      continue
+    }
+    const m = /^\s+([A-Za-z_][\w-]*):\s*(.*)$/.exec(line)
+    if (m == null) continue
+    const key = m[1] ?? ''
+    const tail = m[2] ?? ''
+    if (key === '') continue
+    if (block === 'session' && SESSION_KEYS.has(key)) {
+      const v = unquoteScalar(stripYamlComment(tail))
+      if (v !== '') out.session[key] = typedSessionScalar(key, v)
+    } else if (block === 'routing_preferences' && (key === 'reviewer' || key === 'visual_reviewer')) {
+      const v = unquoteScalar(stripYamlComment(tail))
+      if (v !== '') {
+        if (key === 'reviewer') out.reviewer = v
+        else out.visualReviewer = v
+      }
+    } else if (block === 'picks') {
+      const v = stripYamlComment(tail).trim()
+      if (v.startsWith('[') && v.endsWith(']')) out.picks[key] = splitList(v.slice(1, -1)).map(unquoteScalar)
+    }
+  }
+  return out
+}
+
+/** The filled templates/matrixkoder.yaml. `checkedAt` is an ISO timestamp the caller reads from the clock.
+ *  `existingYaml` is the text about to be replaced: its session/picks/reviewer values carry over. */
+export function buildYaml(d: MkWizardDraft, checkedAt: string, existingYaml?: string | null): string {
+  const carry = parseCarry(existingYaml)
   const L: string[] = []
   const kv = (ind: number, key: string, val: unknown, note?: string): void => {
     L.push(`${' '.repeat(ind)}${key}: ${inline(val)}${note ? `   # ${note}` : ''}`)
@@ -309,7 +389,8 @@ export function buildYaml(d: MkWizardDraft, checkedAt: string): string {
   kv(4, 'claude', { five_hour_left_pct: toInt(d.claudeFiveHour, 40), weekly_left_pct: toInt(d.claudeWeekly, 30) })
   kv(4, 'others', { five_hour_left_pct: 10, weekly_left_pct: 15 })
   kv(2, 'max_build_lanes', toInt(d.maxLanes, 3))
-  kv(2, 'reviewers', ['codex', 'agy-pro', 'claude-opus-if-jev'])
+  kv(2, 'reviewer', carry.reviewer ?? 'claude sonnet medium', 'the route every review goes to')
+  kv(2, 'visual_reviewer', carry.visualReviewer ?? 'claude haiku', 'the route a visual/UI review goes to')
   L.push('autonomy_contract:')
   kv(2, 'pause_only_for', ['destructive-not-preauthorised', 'all-agents-below-floor', 'uncovered-scope-decision', 'secrets-or-user-config', 'lock-over-30min', 'fix-loop-exhausted', 'blocked-approval-dialog', 'jev-screen-block'])
   kv(2, 'preauthorised', splitList(d.preauthorised))
@@ -320,31 +401,25 @@ export function buildYaml(d: MkWizardDraft, checkedAt: string): string {
   kv(2, 'dir', `${d.globalDir ?? '~/.matrixkoder'}/locks`)
   L.push('usage:')
   kv(2, 'source', 'codexbar', 'one source for all agents; mk-usage.py -> ~/.matrixkoder/usage.json')
-  kv(2, 'poll_min', Math.max(1, toInt(d.pollMin, 5)))
   kv(2, 'providers', d.providersOn, 'add zai once its key is set in CodexBar')
-  L.push('dashboard:')
-  kv(2, 'auto_open', d.autoOpen, 'only when fullscreen and >=144 cols')
-  kv(2, 'chip', d.chip)
-  kv(2, 'toasts', d.toasts)
+  L.push('session:')
+  kv(2, 'fresh_session', carry.session.fresh_session ?? 'new', 'what a fix or takeover round starts the agent with')
+  kv(2, 'subagents', carry.session.subagents ?? true, 'a phase may hand its tasks to subagents')
+  kv(2, 'subagent_model', carry.session.subagent_model ?? '', 'the model a subagent runs on (empty: the orchestrator\'s own)')
+  kv(2, 'stall_min', carry.session.stall_min ?? 15, 'idle minutes before a working lane is called stalled')
+  kv(2, 'max_wait_min', carry.session.max_wait_min ?? 30, 'minutes lane-watch waits before it gives up')
+  kv(2, 'reviewer_split', carry.session.reviewer_split ?? 'right', 'where the reviewer runs while the builder waits')
+  kv(2, 'reuse_reviewer', carry.session.reuse_reviewer ?? true, 'one reviewer session serves the phase\'s rounds')
+  L.push('picks:')
+  for (const n of AGENT_NAMES) {
+    if (d.agents[n]?.found) kv(2, n, carry.picks[n] ?? [], 'this agent\'s models in preference order')
+  }
   return `${L.join('\n')}\n`
 }
 
 function portOf(url: string): number | null {
   const m = /:(\d{2,5})(?:\/|$)/.exec(url)
   return m?.[1] ? Number(m[1]) : null
-}
-
-/** Global ~/.matrixkoder/config.json: merges the dashboard prefs into whatever is already there. */
-export function buildConfigJson(existing: unknown, d: MkWizardDraft, at: string): string {
-  const base = rec(existing)
-  const out = {
-    ...base,
-    schema: 1,
-    dashboard: { ...rec(base.dashboard), auto_open: d.autoOpen, chip: d.chip, toasts: d.toasts },
-    usage: { ...rec(base.usage), poll_min: Math.max(1, toInt(d.pollMin, 5)) },
-    updated: at,
-  }
-  return `${JSON.stringify(out, null, 2)}\n`
 }
 
 /** Upserts one repo into projects.json without touching the others. */

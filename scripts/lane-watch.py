@@ -4,7 +4,7 @@
 Usage:
   lane-watch.py --lane DIR --agent NAME|PANE --commit-grep REGEX [--report PATH] [--phase P1]
                 [--kind claude|codex|opencode|agy] [--prompt-marker TEXT]
-                 [--then-send BRIEF_PATH] [--max-wait-min 30] [--poll 20] [--stall-min 10]
+                 [--then-send BRIEF_PATH] [--max-wait-min N] [--poll 20] [--stall-min N]
                  [--task T | --tasks A,B --data DIR [--run ID]] [--no-commit]
   lane-watch.py --self-test
 
@@ -37,7 +37,9 @@ always lands in this script's own JSON output, never dropped.
 reaches every listed task's children (or the task itself when it has none), exactly as --task does
 for one. The two spellings are alternatives — pass one, with --data.
 Exit states (one JSON line): DONE | DONE_SENT | QUOTA | PROVIDER | STALL | BLOCKED | DEV_SERVER | ERROR | WATCH_EXPIRED.
-Run in the background (30 min default; foreground calls must stay under their 10-min timeout); re-arm on WATCH_EXPIRED.
+Run in the background (max_wait_min; foreground calls must stay under their 10-min timeout); re-arm on WATCH_EXPIRED.
+--max-wait-min / --stall-min absent: <data>/matrixkoder.yaml session.max_wait_min / session.stall_min,
+else the mk-config schema default.
 """
 import importlib.util, json, math, os, re, subprocess, sys, time
 
@@ -55,6 +57,22 @@ sys.dont_write_bytecode = True  # no stray __pycache__ next to the scripts
 _spec = importlib.util.spec_from_file_location("lane_health", os.path.join(HERE, "lane-health.py"))
 lh = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(lh)
+_cspec = importlib.util.spec_from_file_location("mk_config", os.path.join(HERE, "mk-config.py"))
+mk_config = importlib.util.module_from_spec(_cspec)
+_cspec.loader.exec_module(mk_config)
+
+
+def cfg(key, flag=None):
+    """-> flag > <data>/matrixkoder.yaml > the mk-config schema default. One default, one home:
+    a repo that never set the key gets the schema value, not a second literal here."""
+    if flag is not None:
+        return flag
+    try:
+        lines = mk_config.read_lines(os.path.join(
+            mk_config.mk_state.resolve_data(None), "matrixkoder.yaml"))
+    except Exception:  # outside a repo / unreadable data dir: the schema default, never a crash
+        lines = []
+    return mk_config.value_of(lines, mk_config.row_for(lines, key))[1]
 
 
 def opt(a, f, d=None):
@@ -277,9 +295,9 @@ def watch(a):
     lane, agent, grep = opt(a, "--lane"), opt(a, "--agent"), opt(a, "--commit-grep")
     report, then_send, phase = opt(a, "--report"), opt(a, "--then-send"), opt(a, "--phase")
     kind, marker = opt(a, "--kind"), opt(a, "--prompt-marker")
-    max_wait = float(opt(a, "--max-wait-min", "30")) * 60
+    max_wait = float(cfg("session.max_wait_min", opt(a, "--max-wait-min"))) * 60
     poll = float(opt(a, "--poll", "20"))
-    stall_min = float(opt(a, "--stall-min", "10"))
+    stall_min = float(cfg("session.stall_min", opt(a, "--stall-min")))
     rx = None if no_commit else re.compile(grep)  # --no-commit: no commit to match; decide() counts rx None as ok
     start, errors = time.time(), 0
     active, last_fp = start, None  # last time the pane showed new output
@@ -404,6 +422,7 @@ def self_test():
     tmp = tempfile.mkdtemp(prefix="lane-watch-test-")
     os.environ["MATRIXKODER_HOME"] = os.path.join(tmp, "home")
     data = os.path.join(tmp, "data")
+    restore_data = mk_config.pin_tmp_data(tmp)  # cfg() resolves the data dir: keep it in temp
     try:
         def mks(*args):
             r = subprocess.run([sys.executable, MK_STATE, *args, "--data", data], capture_output=True, text=True)
@@ -684,7 +703,25 @@ def self_test():
         assert out["state"] == "STALL" and out["evidence"][0].startswith("agent idle"), out
         assert json.load(open(os.path.join(tmp, "home", "usage.json")))["agents"]["opencode"][
             "exhausted_observed_at"] == oc_ev  # untouched: no quota line, no re-record
+
+        # no flag and no yaml: the stall/max_wait defaults this script now uses are the schema's
+        empty = os.path.join(tmp, "empty-data")
+        os.makedirs(empty)
+        old_md = os.environ.get("MATRIXKODER_DATA")
+        os.environ["MATRIXKODER_DATA"] = empty
+        try:
+            assert cfg("session.stall_min") == mk_config.value_of(
+                [], mk_config.row_for([], "session.stall_min"))[1], cfg("session.stall_min")
+            assert cfg("session.max_wait_min") == mk_config.value_of(
+                [], mk_config.row_for([], "session.max_wait_min"))[1]
+            assert cfg("session.stall_min", "9") == "9"  # a given flag wins
+        finally:
+            if old_md is None:
+                os.environ.pop("MATRIXKODER_DATA", None)
+            else:
+                os.environ["MATRIXKODER_DATA"] = old_md
     finally:
+        restore_data()
         shutil.rmtree(tmp, ignore_errors=True)
     print("lane-watch self-test ok")
 

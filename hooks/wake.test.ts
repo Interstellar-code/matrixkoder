@@ -1157,3 +1157,19 @@ test('F1.2: the same batch (identical text) is not resubmitted within 10 minutes
   expect(w.store.get('wakePending:')).toMatchObject({ items: [] })
   expect(w.store.get('wakeEventLines:r1'), 'lines stay consumed').toBe(1)
 })
+
+test('solo mode registers no wake hooks at all (no session.start handler, no timers)', { options: { wake: true, mode: 'solo' } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const files: Record<string, string> = {
+    '/data/runs/index.json': JSON.stringify([{ id: 'r1', status: 'active' }]),
+    '/data/runs/r1/events.jsonl': EV('F6', 'verifying'),
+  }
+  const w = wakeWorld(on, files, [], { MATRIXKODER_DATA: '/data' }, '/tmp')
+  await $.session.start(START('/tmp'))
+  await clock.advance(30000)
+  await clock.advance(60000)
+  await clock.advance(300000)
+  expect(w.submitted).toEqual([])
+  const wakeKeys = [...w.store.keys()].filter(k => k.startsWith('wakeEventLines') || k.startsWith('wakeSentAt') || k.startsWith('wakePending'))
+  expect(wakeKeys, 'no pollEpoch bump, no baseline, no pending: nothing registered').toEqual([])
+})

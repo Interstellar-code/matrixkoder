@@ -246,7 +246,7 @@ codex     ░░░░░░░░          n/a    n/a
 
 ### 3.4 State Variation: First-Run Setup (Wizard Incomplete)
 
-Shown when repository configuration (`.matrixkoder/matrixkoder.yaml`) or global config (`~/.matrixkoder/config.json`) is missing.
+Shown when repository configuration (`.matrixkoder/matrixkoder.yaml`) is missing (global plugin prefs live in the plugin's userConfig, not a file).
 
 ```
 Setup

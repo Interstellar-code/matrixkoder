@@ -42,7 +42,6 @@ SCHEMA = 1
 ROLES = ("build", "fix", "takeover", "review")
 AGENT_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}")  # herdr's name limit: 32 chars, lowercase
 ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")  # run/task ids after lowercasing
-KEY_RE = re.compile(r"^(\s*)([A-Za-z_][A-Za-z0-9_-]*):[ \t]*(.*)$")
 LOCKFILES = ("pnpm-lock.yaml", "package-lock.json", "yarn.lock", "bun.lock", "bun.lockb",
              "uv.lock", "poetry.lock", "Cargo.lock")
 # Ignored entries a slot may keep between tasks; anything else is a pause item, never discarded.
@@ -72,6 +71,13 @@ def _load(name, path):
 
 mk_state = _load("mk_state", os.path.join(HERE, "mk-state.py"))  # data dir, atomic write, timestamp
 
+# the yaml parser lives in mk-config.py so one file defines what a value means: a lane slot
+# count and a settings row are read by the same scalar/split_flow/flow_map code
+mk_config = _load("mk_config", os.path.join(HERE, "mk-config.py"))
+scalar, split_flow, strip_comment, flow_map = (mk_config.scalar, mk_config.split_flow,
+                                               mk_config.strip_comment, mk_config.flow_map)
+KEY_RE = mk_config.KEY_RE
+
 
 class Fail(Exception):
     def __init__(self, msg, code=2, **extra):
@@ -80,69 +86,6 @@ class Fail(Exception):
 
 
 # ---------- config: <data>/matrixkoder.yaml, line-wise (no YAML dependency) ----------
-
-def scalar(v):
-    """One YAML scalar: quoted or plain text up to a ` #` comment (hooks/guards.ts scalar())."""
-    v = v.strip()
-    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
-        return v[1:-1]
-    return re.split(r"\s+#", v, maxsplit=1)[0].strip()
-
-
-def split_flow(body):
-    """Split a flow collection on the commas that are not inside quotes or a nested [ list ]."""
-    parts, cur, quote, depth = [], "", None, 0
-    for ch in body:
-        if quote:
-            cur += ch
-            if ch == quote:
-                quote = None
-        elif ch in "\"'":
-            quote = ch
-            cur += ch
-        elif ch == "[":
-            depth += 1
-            cur += ch
-        elif ch == "]":
-            depth = max(0, depth - 1)
-            cur += ch
-        elif ch == "," and depth == 0:
-            parts.append(cur)
-            cur = ""
-        else:
-            cur += ch
-    parts.append(cur)
-    return [p for p in parts if p.strip()]
-
-
-def strip_comment(s):
-    """Drop a trailing `# …` that is outside quotes. The wizard emits one on the lanes line, and
-    without this the whole `{ … }` is unparseable and every value silently falls back to DEFAULTS."""
-    quote = None
-    for i, ch in enumerate(s):
-        if quote:
-            if ch == quote:
-                quote = None
-        elif ch in "\"'":
-            quote = ch
-        elif ch == "#" and (i == 0 or s[i - 1] in " \t"):
-            return s[:i]
-    return s
-
-
-def flow_map(body):
-    body = strip_comment(body).strip()
-    if not (body.startswith("{") and body.endswith("}")):
-        return {}
-    out = {}
-    for item in split_flow(body[1:-1]):
-        k, sep, v = item.partition(":")
-        if sep:
-            v = v.strip()
-            out[k.strip()] = ([scalar(x) for x in split_flow(v[1:-1])]
-                              if v.startswith("[") and v.endswith("]") else scalar(v))
-    return out
-
 
 def literal_names(items):
     """-> (accepted, rejected) lanes_disposable entries: literal names only, so the clean check's
