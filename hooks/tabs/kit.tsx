@@ -141,17 +141,20 @@ export function ActionButton(els: Els, spec: ActionSpec): RenderElement {
  *  press on a filled cell — the blue tint when `on`, the resting button fill
  *  otherwise (`flat`: no fill, for the scope strip's inactive scopes). Drawn
  *  width = label + 4 (one cell of padding each side + the plain press's 2). */
-export function Segment(els: Els, opts: { key: string; label: string; on: boolean; flat?: boolean; hotkey?: string; static?: true; onPress: () => void }): RenderElement {
+export function Segment(els: Els, opts: { key: string; label: string; on: boolean; flat?: boolean; hotkey?: string; static?: true; boxed?: true; onPress: () => void }): RenderElement {
   const { Box, Text } = els
+  const edge = (inner: RenderElement): RenderElement => opts.boxed === true
+    ? <Box key={`${opts.key}-edge`} borderStyle="single" borderColor={opts.on ? ROLE.live.fg : '#5b6776'}>{inner}</Box>
+    : inner
   // the picked segment of a strip needs no press: plain bold blue text on the tint (a Button's label colour is the engine's)
   if (opts.on && opts.static === true) {
-    return <Text key={`${opts.key}-box`} bold={true} color={ROLE.live.fg} backgroundColor={ROLE.live.tint}>{` ${opts.hotkey != null ? `${opts.hotkey}: ` : ''}${opts.label} `}</Text>
+    return edge(<Text key={`${opts.key}-box`} bold={true} color={ROLE.live.fg} backgroundColor={ROLE.live.tint}>{` ${opts.hotkey != null ? `${opts.hotkey}: ` : ''}${opts.label} `}</Text>)
   }
   const bg = opts.on ? ROLE.live.tint : opts.flat === true ? undefined : PALETTE.btn
-  return (
+  return edge(
     <Box key={`${opts.key}-box`} backgroundColor={bg} paddingX={1}>
       {ActionButton(els, { key: opts.key, glyph: opts.label, word: '', plain: true, hotkey: opts.hotkey, tone: opts.on ? 'primary' : 'default', onPress: opts.onPress })}
-    </Box>
+    </Box>,
   )
 }
 

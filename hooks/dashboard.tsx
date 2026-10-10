@@ -427,7 +427,7 @@ function wrapToCols(text: string, cols: number): string[] {
 function TabBar(els: Els, $: EngineInterface, dashTab: MkDashTab, counts: Record<MkDashTab, string>, tabs: readonly { key: MkDashTab; hotkey: string; label: string }[], compact: boolean) {
   const { Box, Button } = els
   return (
-    <Box flexDirection="row" flexWrap="wrap" gap={1}>
+    <Box flexDirection="row" flexWrap="wrap">
       {tabs.map(t => {
         const active = dashTab === t.key
         const count = counts[t.key]
@@ -442,7 +442,7 @@ function TabBar(els: Els, $: EngineInterface, dashTab: MkDashTab, counts: Record
             onPress={() => { void switchTab($, t.key) }}
           />
         )
-        return active ? <Box key={`dash-tab-${t.key}-box`} backgroundColor={ROLE.live.tint} paddingX={1}>{btn}</Box> : btn
+        return <Box key={`dash-tab-${t.key}-box`} borderStyle="single" borderColor={active ? ROLE.live.fg : '#5b6776'} backgroundColor={active ? ROLE.live.tint : undefined} paddingX={1}>{btn}</Box>
       })}
     </Box>
   )
