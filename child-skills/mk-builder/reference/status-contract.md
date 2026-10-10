@@ -5,9 +5,12 @@ in round 2 against review r1 (HIGH 1-2, MEDIUM 3-7, LOW 8-9, bus forward-fit). T
 `child-skills/mk-builder/scripts/mk-builder.py` (MB2.2). The readers are `scripts/lane-watch.py`
 `decide()` (MB3.1) and `scripts/mk-lane-event.py` `verdict_for()` / `cmd_sweep()` (MB3.2). This
 folder (`child-skills/`) is not a registered skill; it is reference material for those phases and
-for the lane-agent skill. Source: `.matrixkoder/plans/mk-builder-skill-research.md` § "Status-file
-contract (`mk-builder-status/v1`)". Every `file:line` below was re-verified in this tree at
-`c2ee953`.
+for the lane-agent skill. Carried items from MB1 review r2 were applied in MB2: R17a (the
+`progress` / `progress --subagent` row split), R18 and R27.6 (reviewer identity), R27.9
+(monotonic `seq`), R33-R34 (seconds), and the stamp below. Source:
+`.matrixkoder/plans/mk-builder-skill-research.md` § "Status-file contract
+(`mk-builder-status/v1`)". Every `file:line` below was re-verified in this tree at
+`1d8cf51`.
 
 ## 1. Path, scope, writer
 
@@ -97,7 +100,8 @@ Table 1 — required fields. Identity key = `(run, task, round, role)` (R27).
 
   | command | `started` | `working` | `subagent` | `blocked` | `done` |
   |---|---|---|---|---|---|
-  | `progress [--subagent]` | legal (R13.1/2) | legal | legal (R13.3) | legal (R13.5) | illegal (R14) |
+  | `progress <step>` | legal (R13.1) | legal (R15) | legal (R13.3) | legal (R13.5) | illegal (R14, R20) |
+  | `progress <step> --subagent` | illegal (R14) | legal (R13.2) | legal (R15 heartbeat) | illegal (R14) | illegal (R14, R20) |
   | `blocked "<q>"` | illegal | legal (R13.4) | illegal | legal (re-ask, R15) | illegal |
   | `done` | illegal | legal (R13.6) | illegal | illegal | illegal (R20) |
   | `ctx <pct>` | legal (R15) | legal | legal | legal | illegal (R20) |
@@ -107,14 +111,31 @@ Table 1 — required fields. Identity key = `(run, task, round, role)` (R27).
   **Why the table:** `ctx` in `started` was neither a legal rewrite nor illegal in v1's text, and
   `phases_done` had no named append command — a writer author had to guess both.
 
+- **R17a.** `--subagent` and plain `progress` are two commands, not one form, and the row split
+  above is the writer's rule: `--subagent` enters or heartbeats the `subagent` state and is legal
+  only from `working` (R13.2) or `subagent` (R15); plain `progress` is legal from every state
+  except `done` (R13.1, R13.3, R13.5, R15). **Why:** R13 lists `started -> subagent` and
+  `blocked -> subagent` under no rule and R14 lists both as illegal, so `progress --subagent` in
+  `started`/`blocked` was both legal and illegal at once; R14 is exhaustive and wins. A subagent
+  run owns a step, and neither `started` (no step begun) nor `blocked` (waiting on an answer)
+  has one to give it — a builder in `blocked` that needs a subagent calls `progress <step>` first
+  (R13.5) and then `progress <step> --subagent` (R13.2). Two state-changing writes are the price
+  of one readable transition list; the writer refuses the illegal pair with one JSON error line
+  (R16) and leaves the file byte-identical.
+
 ## 4. `done` and `blocked` preconditions
 
 - **R18.** Entering `done` requires: the report file exists at the `report` path relative to the
   lane root — the review file when the role is `reviewer` (`.matrixkoder-review-rN.md`,
-  `skills/matrixkoder/templates/review.md:1`) — AND `git -C <lane> rev-parse HEAD` succeeds. The
-  writer records that full sha in `commit`; for a reviewer that sha is the commit under review
-  (the lane's HEAD), and the reader's `--no-commit` path counts any HEAD as a matching commit
-  (`scripts/lane-watch.py:111-115`).
+  `skills/matrixkoder/templates/review.md:1`) — AND `git -C <lane> rev-parse HEAD` succeeds.
+  The writer records that full sha in `commit`; for a reviewer that sha is the commit under review
+  (the lane's HEAD). A reviewer is identified by the armed watch's `phase` carrying the ` REVIEW`
+  marker, and by nothing else (R27.6): the watch has no `--no-commit` field, so the sweep reader's
+  commit check for a reviewer follows the armed `commit_grep` (`scripts/mk-lane-event.py:222-241`,
+  which always builds `rx` from it, and `arm` requires `--commit-grep`, `:615`). `--no-commit` is
+  a `lane-watch.py` CLI flag (`scripts/lane-watch.py:15-18`) local to that CLI; only its own path
+  counts any HEAD as a matching commit (`scripts/lane-watch.py:111-115`). The writer's `done`
+  precondition does not differ per role — report file and a readable HEAD, both.
 - **R19.** Entering `blocked` requires a non-empty `question` (whitespace-only counts as empty);
   otherwise exit non-zero, file byte-identical.
 - **R20.** `done` is final per (run, task, round, role): after `state=done`, every further write
@@ -174,14 +195,26 @@ Table 1 — required fields. Identity key = `(run, task, round, role)` (R27).
   5. `round` equals the round parsed from the watch's `phase`: the parse rule is
      `^(\S+)( REVIEW)? R(\d+)$`, group 1 equals the watch's `task` (parse failure, a non-numeric
      or non-integer round, or a task mismatch → not accepted);
-  6. `role` equals the armed pane's role: a watch whose `phase` carries the optional ` REVIEW`
-     marker (or a `--no-commit` pane, `scripts/lane-watch.py:15-18`) is a reviewer and accepts
-     `role=reviewer` only; any other watch accepts `role=builder` only;
+  6. `role` equals the armed pane's role, and a reviewer is identified by the watch's `phase`
+     carrying the optional ` REVIEW` marker (the regex's group 2) and by nothing else. Such a
+     watch accepts `role=reviewer` only; any other watch accepts `role=builder` only. The watch
+     has no role field and no `--no-commit` field (`scripts/mk-lane-event.py:633-636`);
+     `lane-watch.py`'s `--no-commit` CLI flag (`scripts/lane-watch.py:15-18`) is local to that CLI
+     and carries no watch state a reader can match on;
   7. `updated_at` (float epoch, R7) is >= the watch's `armed_at` (float epoch,
      `scripts/mk-lane-event.py:636`) — both sides full precision, no rounding;
-  8. `state` is one of R12's five values.
+  8. `state` is one of R12's five values;
+  9. `seq` is an int >= 1 (Table 1), and it is strictly greater than the highest `seq` this reader
+     has already accepted for the same `(run, task, round, role)`; a first read of a process has
+     nothing to compare, so only the type and lower bound apply to it. **Why:** `seq` is the write
+     counter the writer bumps on every accepted write (R25) and the only field that orders two
+     observations of one lane, so a rewound or replayed file is a stale lane, a forged file or a
+     clock reset — never the newer truth a reader should act on. A file rejected on this condition
+     falls back exactly as any other R27 miss does (R28), so a writer with a reset counter costs
+     the lane its first channel once, not correctness.
 - **R28.** Any missed condition in R27 — file absent, unreadable, wrong `v`, wrong
-  `run`/`task`/`round`/`role`, `updated_at` before `armed_at`, unknown `state` — sends the reader
+  `run`/`task`/`round`/`role`, `updated_at` before `armed_at`, unknown `state`, a non-monotonic
+  `seq` — sends the reader
   down today's pane-text path, unchanged (token regexes `scripts/lane-watch.py:72-83`; `decide()`
   `scripts/lane-watch.py:109-136`).
 - **R29.** Corrupt JSON is ignored without raising: the reader catches the parse error and takes
@@ -213,13 +246,18 @@ Table 1 — required fields. Identity key = `(run, task, round, role)` (R27).
   `scripts/lane-watch.py:11-14`, `:253-272`); STALL needs no token at all (R33).
 - **R32.** `state=blocked` is the BLOCKED verdict, carrying `question` as the blocked text (the
   pane path's shape, `scripts/lane-watch.py:119-120`).
-- **R33.** `state=working` or `state=subagent`, with `now - updated_at < stall_min`, counts as
+- **R33.** `state=working` or `state=subagent`, with `now - updated_at < stall_min * 60`, counts as
   activity for that poll: the reader moves the lane's idle-clock mark to `updated_at` (a writer
-  that stops moving lets the clock run out). `stall_min` comes from the armed watch or the
-  reader's own default, exactly as today (CLI default 10 at `scripts/lane-watch.py:282`; the
-  event path's watch default is 15, `scripts/mk-lane-event.py:626`).
-- **R34.** `state=subagent` resets the idle clock only while `now - armed_at <= max_wait_min`
-  (default 30, `scripts/lane-watch.py:280`). Past that, `subagent` no longer counts as activity
+  that stops moving lets the clock run out). **The comparison is in seconds on both sides** —
+  `now` and `updated_at` are float epoch seconds (R7) and the watch's `stall_min` is minutes, so
+  the reader multiplies the minutes by 60 and never compares a float to a bare minute count.
+  `stall_min` comes from the armed watch or the reader's own default, exactly as today (CLI
+  default 10 at `scripts/lane-watch.py:282`; the event path's watch default is 15,
+  `scripts/mk-lane-event.py:626`).
+- **R34.** `state=subagent` resets the idle clock only while `now - armed_at <= max_wait_min * 60`
+  — seconds again, by the same multiplication as R33 — and `armed_at` is the watch's float epoch
+  (`scripts/mk-lane-event.py:636`), not the file's `started_at`. The default is 30
+  (`scripts/lane-watch.py:280`). Past that, `subagent` no longer counts as activity
   and the existing pane spinner/toolcall detection alone keeps the lane alive
   (`scripts/lane-watch.py:86-106`).
 - **R35.** `QUOTA`, `PROVIDER` and `DEV_SERVER` are never taken from the file; they stay

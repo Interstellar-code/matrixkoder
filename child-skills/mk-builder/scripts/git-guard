@@ -1,0 +1,243 @@
+#!/bin/sh
+# git-guard — the lane-local `git` wrapper (child-skills/mk-builder/reference/git-guard.md).
+#
+# Installed as `<lane>/.matrixkoder-bin/git`, with that directory first on the lane pane's PATH
+# (G1). It refuses the destructive forms `lane-rules.md` R2 bans and forwards everything else to
+# the real git unchanged (G23). It is a deterrent, not a sandbox — G25-G30 list the bypasses.
+# Implementation: the same reading as the Claude-side scanner `hooks/guards.ts:142-225`, which
+# already encodes this set; the wrapper extends it to the agents that have no scanner.
+
+# G2: the wrapper writes nothing inside the repo or the worktree. Its only effects are the one
+# refusal line (G22) or the real git's own effects passed through (G23).
+
+# G3: global git options that take a value, skipped together with their value while finding the
+# subcommand (hooks/guards.ts:143, :156-161). Any other leading option word is skipped alone.
+VALUED_OPTIONS="-C -c --git-dir --work-tree --namespace --config-env --super-prefix"
+
+is_valued_option() {
+    case " $VALUED_OPTIONS " in
+        *" $1 "*) return 0 ;;
+    esac
+    return 1
+}
+
+# G4: a short-option group counts when it contains the letter — `-f`, `-fd`, `-uf` all force,
+# `-D` and `-d` differ, and `--force` is never a short group (hooks/guards.ts:148, :200-204).
+short_has() { # short_has <letter> <word>
+    case "$2" in
+        --*) return 1 ;;
+        -?*) ;;
+        *) return 1 ;;
+    esac
+    group=${2#-}
+    case "$group" in
+        *[!a-zA-Z]*) return 1 ;;
+    esac
+    case "$group" in
+        *"$1"*) return 0 ;;
+    esac
+    return 1
+}
+
+# G5: the option-based conditions read options only up to the first `--` (`optsOf`,
+# hooks/guards.ts:149-152).
+opts_has() { # opts_has <word> <args...>
+    want=$1
+    shift
+    for w in "$@"; do
+        [ "$w" = "--" ] && break
+        [ "$w" = "$want" ] && return 0
+    done
+    return 1
+}
+
+opts_short_has() { # opts_short_has <letter> <args...>
+    letter=$1
+    shift
+    for w in "$@"; do
+        [ "$w" = "--" ] && break
+        short_has "$letter" "$w" && return 0
+    done
+    return 1
+}
+
+opts_grep() { # opts_grep <pattern> <args...> — for the `--rebase=<v>`, `--prune=<v>` forms
+    pattern=$1
+    shift
+    for w in "$@"; do
+        [ "$w" = "--" ] && break
+        # shellcheck disable=SC2254 # the caller passes a case pattern on purpose
+        case "$w" in
+            $pattern) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# G22: exactly one line on stdout naming the refused rule and why, exit 126, nothing changed —
+# this runs before any exec, so the repo is never touched.
+refuse() { # refuse <subcommand> <Gn> <why>
+    printf 'mk git-guard: refused "git %s" (%s - lane-rules.md R2, git-guard.md %s)\n' "$1" "$3" "$2"
+    exit 126
+}
+
+# decide() parses a COPY of the arguments and returns 0 to allow, or refuses and exits 126.
+decide() {
+    while [ $# -gt 0 ]; do
+        case $1 in
+            -*) ;;
+            *) break ;;
+        esac
+        if is_valued_option "$1" && [ $# -ge 2 ]; then
+            shift 2
+        else
+            shift
+        fi
+    done
+    [ $# -eq 0 ] && return 0 # no subcommand at all: nothing to refuse
+    sub=$1
+    shift
+
+    case $sub in
+        checkout|reset|clean) # G7: refused always, any flags, any paths.
+            refuse "$sub" G7 "destructive git undo"
+            ;;
+        stash) # G8: only the read-only `list` and `show` pass.
+            case ${1:-} in
+                list|show) ;;
+                *) refuse stash G8 "stashing and dropping other lanes' work" ;;
+            esac
+            ;;
+        restore) # G9: `--staged` (or -S) present AND `--worktree` (or -W) absent.
+            if ! opts_has --staged "$@" && ! opts_short_has S "$@"; then
+                refuse restore G9 "destructive git undo"
+            fi
+            if opts_has --worktree "$@" || opts_short_has W "$@"; then
+                refuse restore G9 "destructive git undo"
+            fi
+            ;;
+        switch) # G10: refused only with a force flag.
+            if opts_has --force "$@" || opts_has --discard-changes "$@" || opts_short_has f "$@"; then
+                refuse switch G10 "forced branch switch over others' work"
+            fi
+            ;;
+        commit) # G11: the `--am` prefix family; message options are skipped with their value.
+            skip=0
+            for w in "$@"; do
+                [ "$w" = "--" ] && break
+                if [ "$skip" = 1 ]; then
+                    skip=0
+                    continue
+                fi
+                case $w in
+                    --am|--ame|--amen|--amend)
+                        refuse commit G11 "history rewrite by amend"
+                        ;;
+                    -m|-F|-C|-c|--message|--file|--author|--date|--template|--reuse-message|--reedit-message|--fixup|--squash|--trailer|--cleanup)
+                        skip=1 # the next word is this option's value, not an option
+                        ;;
+                    -?*) case ${w#-} in
+                        *[mFCct]) skip=1 ;;
+                    esac ;;
+                esac
+            done
+            ;;
+        push) # G12: every word after the subcommand, even after `--` (G5).
+            for w in "$@"; do
+                case $w in
+                    --force*) refuse push G12 "force push" ;;
+                    --delete|--mirror|--prune) refuse push G12 "remote history rewrite" ;;
+                    +?*) refuse push G12 "force push by refspec" ;;
+                    :?*) refuse push G12 "empty-source refspec" ;;
+                esac
+                short_has f "$w" && refuse push G12 "force push"
+                short_has d "$w" && refuse push G12 "remote branch delete"
+            done
+            ;;
+        branch) # G13: uppercase -D, or a delete combined with a force.
+            if opts_short_has D "$@"; then
+                refuse branch G13 "forced branch delete"
+            fi
+            if { opts_has --delete "$@" || opts_short_has d "$@"; } &&
+                { opts_has --force "$@" || opts_short_has f "$@"; }; then
+                refuse branch G13 "forced branch delete"
+            fi
+            ;;
+        rebase) # G14: ending a rebase already in progress is allowed.
+            ok=0
+            for w in "$@"; do
+                case $w in
+                    --abort|--continue|--skip) ok=1 ;;
+                esac
+            done
+            [ "$ok" = 1 ] || refuse rebase G14 "history rewrite"
+            ;;
+        pull) # G15: --rebase, --rebase=<v> other than false/no, or a short group with r.
+            if opts_has --rebase "$@" || opts_short_has r "$@"; then
+                refuse pull G15 "history rewrite"
+            fi
+            opts_grep '--rebase=*' "$@" &&
+                ! opts_grep '--rebase=false' "$@" && ! opts_grep '--rebase=no' "$@" &&
+                refuse pull G15 "history rewrite"
+            ;;
+        reflog) # G16: only `expire` and `delete`; every other reflog subcommand passes.
+            case ${1:-} in
+                expire|delete) refuse reflog G16 "history rewrite" ;;
+            esac
+            ;;
+        update-ref) # G17: a short group with d.
+            opts_short_has d "$@" && refuse update-ref G17 "history rewrite"
+            ;;
+        gc) # G18: --prune and every --prune=<v>; plain `git gc` passes.
+            opts_has --prune "$@" && refuse gc G18 "deleting unreachable objects"
+            opts_grep '--prune=*' "$@" && refuse gc G18 "deleting unreachable objects"
+            ;;
+    esac
+    # G6/G19/G20: any other subcommand is not named by the ban, so it passes through.
+    return 0
+}
+
+# G21 needs a canonical path for the wrapper's own directory and for each PATH entry. `realpath`
+# is the one the contract names; `cd`+`pwd -P` is the same answer from the shell's own builtins,
+# which matters because G21's own error case is a PATH that holds nothing but the wrapper's
+# directory - there `realpath` may not be reachable, and a wrapper that cannot resolve its own
+# path must still exit 127 rather than loop.
+dir_of() {
+    case $1 in
+        */*) printf '%s\n' "${1%/*}" ;;
+        *) printf '%s\n' "." ;;
+    esac
+}
+
+abspath() {
+    _abs=$(realpath "$1" 2>/dev/null) && [ -n "$_abs" ] && { printf '%s\n' "$_abs"; return 0; }
+    (CDPATH='' cd -- "$1" 2>/dev/null && pwd -P) 2>/dev/null
+}
+
+decide "$@"
+
+# G21: the real git — drop every PATH entry whose realpath is the wrapper's own directory, then
+# take the first remaining entry holding an executable `git`. No fixed path: this machine has two
+# gits (`/usr/bin/git`, `/opt/homebrew/bin/git`) and a fixed one goes stale at the next update.
+self_dir=$(abspath "$(dir_of "$0")")
+self_file=$(abspath "$0")
+saved_ifs=$IFS
+IFS=:
+for entry in $PATH; do
+    entry=${entry:-.}
+    entry_real=$(abspath "$entry") || entry_real=$entry
+    [ -n "$self_dir" ] && [ "$entry_real" = "$self_dir" ] && continue
+    [ -x "$entry/git" ] || continue
+    # The wrapper never execs itself: a PATH entry that resolves to this very file would
+    # otherwise recurse forever (G1/G21).
+    found=$(abspath "$entry/git") || found=$entry/git
+    [ -n "$self_file" ] && [ "$found" = "$self_file" ] && continue
+    IFS=$saved_ifs
+    # G23: argv untouched, and the wrapper adds no flags of its own.
+    exec "$entry/git" "$@"
+done
+IFS=$saved_ifs
+
+# G21: nothing left on PATH holds a real git.
+printf 'mk git-guard: no real git on PATH\n'
+exit 127

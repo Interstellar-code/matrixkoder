@@ -6,8 +6,8 @@ is the contract both build against, and the deterrent boundary documented for MB
 folder (`child-skills/`) is not a registered skill. The refused set is exactly the one
 `hooks/guards.ts:154-225` (`gitBan`) already encodes Claude-side — the wrapper extends the same
 ban to non-Claude lanes (OpenCode, Codex, AGY). Every `file:line` below was re-verified in this
-tree at `4df9b9c`. The wrapper is a deterrent, not a sandbox — `hooks/guards.ts:3` says so of the
-scanner and the same holds here (§7).
+tree at `1d8cf51`. The wrapper is a deterrent, not a sandbox — `hooks/guards.ts:3` says so of the
+scanner and the same holds here (§7). Only G21's why and the stamp below changed in MB2.
 
 ## 1. Placement and dispatch
 
@@ -100,9 +100,11 @@ scanner and the same holds here (§7).
   (`which -a git`, research `[local]`,
   `/Users/rohits/Development/matrixkoder/.matrixkoder/plans/mk-builder-skill-research.md:39`) —
   so a fixed path can pin the wrong install and goes stale at the next update; `realpath` on both
-  sides makes a symlinked wrapper directory match, and dropping only equal entries (rather than
-  every directory containing a `git`) keeps a real git reachable when the wrapper's own directory
-  is the only one on `PATH`. The scanner's location-independent analogue is `base()` stripping any
+  sides makes a symlinked wrapper directory match, and dropping only entries equal to that
+  directory — rather than every directory that merely holds a `git` — keeps the *other* install
+  reachable. A PATH holding nothing but the wrapper's own directory has no entry left and exits
+  127 by the rule above; that is the one case where no real git is reachable, and it is a setup
+  error, not a lookalike. The scanner's location-independent analogue is `base()` stripping any
   path prefix (`hooks/guards.ts:10`). A plain `command -v git` after the drop is **not** an
   alternative spelling: the `[ -x ]` walk is the one method a test can pin.
 
