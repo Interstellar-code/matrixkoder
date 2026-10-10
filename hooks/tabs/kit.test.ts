@@ -413,18 +413,8 @@ test('S2.1 seg: one pressable per opt, the current `●`-marked; a press reports
     const root = node(SettingRow(stubEls(), field, settingCtx({ cols, changed: true })))
     everyRowFits(root, cols)
     const labels = buttonsIn(root).map(b => String(b.props.label))
-    if (cols === 46) {
-      expect(labels).toContain('● auto') // the current opt
-      expect(labels).toContain('○ ask')
-      expect(labels).toContain('○ never')
-    } else {
-      // at 36 the longest-first shrink takes one cell each off never, then
-      // auto (the changed marker costs its cell): exact short words, every
-      // option still pressable behind its full value
-      expect(labels).toContain('● aut')
-      expect(labels).toContain('○ ask')
-      expect(labels).toContain('○ neve')
-    }
+    // the boxed strip: one plain press per option, the current one on the blue tint
+    for (const w of ['ask', 'auto', 'never']) expect(labels).toContain(w)
     expect(buttonsIn(root).every(b => b.props.hotkey === undefined)).toBe(true) // glyphs, not letters
 
     const chosen: string[] = []

@@ -16,9 +16,9 @@
 // (+ c check on About) beside the scope digits 1-8.
 import type { Elements, RenderElement } from 'claude-code'
 import { SETTINGS_FIXTURE } from './settings.fixture'
-import { ActionButton, Card, Chip, Section, SettingRow } from './kit'
+import { ActionButton, Card, Chip, Section, Segment, SettingRow } from './kit'
 import type { SettingCtx, SettingField } from './kit'
-import { ROLE } from './palette'
+import { PALETTE, ROLE } from './palette'
 import type { SavePayload } from '../settings-io'
 import { settingsInputKeys } from '../settings-io'
 
@@ -449,7 +449,7 @@ export function SettingsTab(els: Els, view: SettingsView, cols: number, ui?: Tab
     const { Input } = els
     findField = (
       <Input
-        key="set-find-input" placeholder="type to filter" value={filter}
+        key="set-find-input" placeholder="find a setting" value={filter}
         onInput={v => { ui?.set('settings:find', v) }} onSubmit={v => { ui?.set('settings:find', v) }}
       />
     )
@@ -458,17 +458,11 @@ export function SettingsTab(els: Els, view: SettingsView, cols: number, ui?: Tab
   }
 
   return (
-    <Box flexDirection="column" gap={1}>
+    <Box flexDirection="column">
       {view.mock && <Text bold={true} color="warning">MOCK · fixture data · not this run</Text>}
       {ScopeBar(els, view, cols, scopeId, ui, noHk)}
-      <Box flexDirection="row" gap={1}>
-        {ActionButton(els, {
-          key: 'set-find', glyph: 'f', word: 'find',
-          noHotkey: noHk,
-          // closing or opening the find field drops a stale ring key with it:
-          // the hook re-records the ring on the next move
-          onPress: () => { ui?.set('settings:findfocus', findFocus ? '' : '1'); ui?.set('settings:focus', '') },
-        })}
+      <Box flexDirection="row" gap={1} backgroundColor={PALETTE.bg} paddingX={1}>
+        <Text dimColor={true}>/</Text>
         {findField}
         {q !== '' && (
           <Text dimColor={!findFocus} color={findFocus ? ROLE.live.fg : undefined}>
@@ -497,6 +491,15 @@ export function SettingsTab(els: Els, view: SettingsView, cols: number, ui?: Tab
         if (ui?.save != null) ui.save(savePayloadOf(view, ui))
         else clearAllEdits(view, ui)
       }, () => { ui?.set('settings:focus', ''); clearAllEdits(view, ui) })}
+      <Box flexDirection="row" gap={1}>
+        <Text dimColor={true}>space toggle · ←→ value ·</Text>
+        {ActionButton(els, {
+          key: 'set-find', glyph: 'f', word: 'find', tone: 'quiet', plain: true, hotkey: noHk ? undefined : 'f',
+          // closing or opening the find field drops a stale ring key with it:
+          // the hook re-records the ring on the next move
+          onPress: () => { ui?.set('settings:findfocus', findFocus ? '' : '1'); ui?.set('settings:focus', '') },
+        })}
+      </Box>
     </Box>
   )
 }
@@ -515,26 +518,26 @@ function ScopeBar(els: Els, view: SettingsView, cols: number, activeId: Settings
   let curW = 0
   view.scopes.forEach((s, i) => {
     const digit = String(i + 1)
-    const w = `${digit} ${s.label}`.length + 4 // ActionButton's `[ label ]`
-    if (cur.length > 0 && curW + 1 + w > cols) {
+    const w = `${digit} ${s.label}`.length + 4 // a Segment: padding + the plain press
+    if (cur.length > 0 && curW + w > cols) {
       rows.push(cur)
       cur = []
       curW = 0
     }
-    curW += (cur.length > 0 ? 1 : 0) + w
+    curW += w
     cur.push({ s, digit, w })
   })
   if (cur.length > 0) rows.push(cur)
   return (
     <Box flexDirection="column">
       {rows.map((row, ri) => (
-        <Box key={`set-scopebar-${String(ri)}`} flexDirection="row" gap={1}>
-          {row.map(({ s, digit }) => ActionButton(els, {
+        <Box key={`set-scopebar-${String(ri)}`} flexDirection="row">
+          {row.map(({ s, digit }) => Segment(els, {
             key: `set-scope-${s.id}`,
-            glyph: digit,
-            word: s.label,
-            tone: s.id === activeId ? 'primary' : 'default',
-            noHotkey: noHk,
+            label: `${digit} ${s.label}`,
+            on: s.id === activeId,
+            flat: true,
+            hotkey: noHk ? undefined : digit,
             onPress: () => {
               ui?.set('settings:scope', s.id)
               ui?.set('settings:sel', '')
@@ -559,7 +562,7 @@ function GroupCards(els: Els, view: SettingsView, scopeId: SettingsScopeId, W: n
     .map(g => ({ g, rows: g.rows.filter(r => rowMatches(r, q)) }))
     .filter(({ rows }) => rows.length > 0)
   return (
-    <Box flexDirection="column" gap={1}>
+    <Box flexDirection="column">
       {groups.map(({ g, rows }) => Card(els, {}, (
         <Box key={`set-group-${g.title}`} flexDirection="column">
           {Section(els, { label: g.title, right: g.right })}
@@ -576,7 +579,7 @@ function ModeCards(els: Els, view: SettingsView, W: number, ui: TabUi | undefine
   const { Box, Text } = els
   const mode = currentMode(view, ui)
   return (
-    <Box flexDirection="column" gap={1}>
+    <Box flexDirection="column">
       {Card(els, {}, (
         <Box flexDirection="column">
           {Section(els, { label: 'operating mode', right: 'radio' })}
@@ -630,7 +633,7 @@ function ModeCards(els: Els, view: SettingsView, W: number, ui: TabUi | undefine
 function ModelsCards(els: Els, view: SettingsView, W: number, ui: TabUi | undefined, q: string): RenderElement {
   const { Box, Text } = els
   return (
-    <Box flexDirection="column" gap={1}>
+    <Box flexDirection="column">
       {view.agents.map(cat => {
         const picks = currentPicks(view, ui, cat.id)
         const full = picks.length >= 4
@@ -702,7 +705,7 @@ function AboutBody(els: Els, view: SettingsView, W: number, ui: TabUi | undefine
   const { Box, Text } = els
   const a = view.about
   return (
-    <Box flexDirection="column" gap={1}>
+    <Box flexDirection="column">
       {GroupCards(els, view, 'about', W, ui, q, noHk)}
       {Card(els, { role: 'live' }, (
         <Box flexDirection="column">
