@@ -50,7 +50,10 @@ scanner and the same holds here (§7). Only G21's why and the stamp below change
   `--message`, `--file`, `--author`, `--date`, `--template`, `--reuse-message`,
   `--reedit-message`, `--fixup`, `--squash`, `--trailer`, `--cleanup`,
   `hooks/guards.ts:144-147`) are skipped with their values, so `-m '--amend'` (message text) does
-  not refuse; the scan stops at the first `--` (`:182-187`).
+  not refuse; short-option clusters are walked left to right: reaching a value-taking letter
+  (`m`, `F`, `C`, `c`, `t`) skips the next word only if it is the last character; if characters
+  follow it in the same word (an attached value such as `-mfoot` or `-m"fix test"`), nothing is
+  skipped; the scan stops at the first `--` (`:182-187`).
 - **G12.** `git push` — refused on any of: an option starting `--force` (includes
   `--force-with-lease`); a short option containing `f`; any word starting `+` (the `+ref:ref`
   refspec form); `--delete`; a short option containing `d`; `--mirror`; `--prune`; a word matching

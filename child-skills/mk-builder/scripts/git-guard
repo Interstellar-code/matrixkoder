@@ -136,9 +136,22 @@ decide() {
                     -m|-F|-C|-c|--message|--file|--author|--date|--template|--reuse-message|--reedit-message|--fixup|--squash|--trailer|--cleanup)
                         skip=1 # the next word is this option's value, not an option
                         ;;
-                    -[!-]*) case ${w#-} in
-                        *[mFCct]) skip=1 ;;
-                    esac ;;
+                    -[!-]*)
+                        _grp=${w#-}
+                        while [ -n "$_grp" ]; do
+                            _c=${_grp%"${_grp#?}"}
+                            _rest=${_grp#?}
+                            case $_c in
+                                [mFCct])
+                                    if [ -z "$_rest" ]; then
+                                        skip=1
+                                    fi
+                                    break
+                                    ;;
+                            esac
+                            _grp=$_rest
+                        done
+                        ;;
                 esac
             done
             ;;

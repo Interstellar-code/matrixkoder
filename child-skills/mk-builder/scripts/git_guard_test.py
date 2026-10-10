@@ -326,6 +326,12 @@ REFUSED = [
     ("g11_amend_no_edit_am", ["commit", "--no-edit", "--am"], "G11", None),
     ("g11_amend_c_opt_no_edit_amend", ["-c", "k=v", "commit", "--no-edit", "--amend"], "G11", None),
     ("g11_amend_C_opt_short_amend", ["-C", ".", "commit", "--short", "--amend"], "G11", None),
+    ("g11_amend_attached_m_foot", ["commit", "-mfoot", "--amend"], "G11", None),
+    ("g11_amend_attached_m_fix_test", ["commit", "-mfix test", "--amend"], "G11", None),
+    ("g11_amend_attached_amfoo", ["commit", "-amfoo", "--amend"], "G11", None),
+    ("g11_amend_attached_Ffile", ["commit", "-Ffile", "--amend"], "G11", None),
+    ("g11_amend_attached_Cabc", ["commit", "-Cabc", "--amend"], "G11", None),
+    ("g11_amend_attached_tfoo", ["commit", "-tfoo", "--amend"], "G11", None),
     # G12 push: every trigger
     ("g12_push_force", ["push", "--force"], "G12", None),
     ("g12_push_force_lease", ["push", "--force-with-lease"], "G12", None),
@@ -374,6 +380,8 @@ ALLOWED = [
     ("a_diff", ["diff"], setup_modified),
     ("a_add", ["add", "README"], setup_modified),
     ("a_commit", ["commit", "-m", "a message"], setup_staged),
+    ("a_commit_message_is_amend", ["commit", "-m", "--amend"], setup_staged),
+    ("a_commit_am", ["commit", "-am", "msg"], setup_staged),
     ("a_apply", ["apply", None], None),  # None -> the patch path, filled in by the runner
     ("a_apply_reverse", ["apply", "-R", None], setup_patch_applied),
     ("a_stash_list", ["stash", "list"], setup_stashed),
