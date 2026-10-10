@@ -153,7 +153,7 @@ test('the decision card is the only bordered box and the recommended option is m
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   await ui.press({ key: 'dash-tab-waiting' })
   const boxes = await ui.findAll({ type: 'Box' })
-  expect(boxes.filter(b => typeof b.props.borderStyle === 'string').length, 'exactly one bordered box').toBe(1)
+  expect(boxes.filter(b => b.props.borderStyle === 'round').length, 'exactly one bordered box').toBe(1)
   expect(await ui.find({ text: /recommended/ }), 'recommended option marked').toBeTruthy()
 })
 

@@ -1469,7 +1469,7 @@ function drawnRowWidths(root: unknown): { width: number; inCard: boolean; text: 
   // row Box, including the settings scope bar's pre-wrapped rows, is measured.
   const isTabBar = (node: R3DrawnNode): boolean =>
     (node.children ?? []).some(c =>
-      typeof c === 'object' && c !== null && (c as R3DrawnNode).type === 'Button' &&
+      typeof c === 'object' && c !== null &&
       String((c as R3DrawnNode).props?.key ?? '').startsWith('dash-tab-'))
   const walk = (node: unknown, inCard: boolean): void => {
     if (typeof node !== 'object' || node === null) return

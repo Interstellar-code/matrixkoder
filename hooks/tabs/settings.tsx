@@ -533,7 +533,7 @@ function ScopeBar(els: Els, view: SettingsView, cols: number, activeId: Settings
   let curW = 0
   view.scopes.forEach((s, i) => {
     const digit = String(i + 1)
-    const w = `${digit}: ${s.label}`.length + 4 // a Segment: padding + the plain press (the engine draws `d: ` before a hotkeyed label)
+    const w = `${digit}: ${s.label}`.length + 6 // a Segment: padding + the plain press + the border (the engine draws `d: ` before a hotkeyed label)
     if (cur.length > 0 && curW + w > cols) {
       rows.push(cur)
       cur = []
@@ -553,6 +553,7 @@ function ScopeBar(els: Els, view: SettingsView, cols: number, activeId: Settings
             on: s.id === activeId,
             flat: true,
             static: true,
+            boxed: true,
             hotkey: noHk ? undefined : digit,
             onPress: () => {
               ui?.set('settings:scope', s.id)
