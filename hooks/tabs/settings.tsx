@@ -16,7 +16,7 @@
 // (+ c check on About) beside the scope digits 1-8.
 import type { Elements, RenderElement } from 'claude-code'
 import { SETTINGS_FIXTURE } from './settings.fixture'
-import { ActionButton, Card, Chip, Section, Segment, SettingRow } from './kit'
+import { ActionButton, Card, Chip, Segment, SettingRow } from './kit'
 import type { SettingCtx, SettingField } from './kit'
 import { PALETTE, ROLE } from './palette'
 import type { SavePayload } from '../settings-io'
@@ -422,6 +422,18 @@ function rowCtx(f: SettingsField, W: number, ui: TabUi | undefined, noHk: true |
 
 // ---------- the render
 
+/** a card header (Settings.dc.html `.h`): bold upper-case in the muted ink, the
+ *  note dim on the right. */
+function SecHead(els: Els, opts: { label: string; right?: string }): RenderElement {
+  const { Box, Text } = els
+  return (
+    <Box flexDirection="row" justifyContent="space-between">
+      <Text bold={true} color={PALETTE.mut}>{opts.label.toUpperCase()}</Text>
+      {opts.right != null && <Text dimColor={true}>{opts.right}</Text>}
+    </Box>
+  )
+}
+
 /** Pure render: elements only, no $, no state (C1); `ui` is the C12 view state. */
 export function SettingsTab(els: Els, view: SettingsView, cols: number, ui?: TabUi): RenderElement {
   const { Box, Text } = els
@@ -565,7 +577,7 @@ function GroupCards(els: Els, view: SettingsView, scopeId: SettingsScopeId, W: n
     <Box flexDirection="column">
       {groups.map(({ g, rows }) => Card(els, {}, (
         <Box key={`set-group-${g.title}`} flexDirection="column">
-          {Section(els, { label: g.title, right: g.right })}
+          {SecHead(els, { label: g.title, right: g.right })}
           {rows.map(r => SettingRow(els, kitField(r, currentValue(r, ui), W), rowCtx(r, W, ui, noHk)))}
         </Box>
       )))}
@@ -582,20 +594,22 @@ function ModeCards(els: Els, view: SettingsView, W: number, ui: TabUi | undefine
     <Box flexDirection="column">
       {Card(els, {}, (
         <Box flexDirection="column">
-          {Section(els, { label: 'operating mode', right: 'radio' })}
+          {SecHead(els, { label: 'operating mode', right: 'radio' })}
           {view.modes.map(m => {
             const cur = m.id === mode
             return (
-              <Box key={`set-modecard-${m.id}`} flexDirection="column">
+              <Box key={`set-modecard-${m.id}`} flexDirection="column" borderStyle="round" borderColor={cur ? ROLE.live.fg : PALETTE.line} backgroundColor={cur ? PALETTE.panel : PALETTE.bg} paddingX={1}>
                 <Box flexDirection="row" justifyContent="space-between" gap={1}>
-                  {ActionButton(els, {
-                    key: `set-mode-${m.id}`, glyph: cur ? '◉' : '○', word: m.name,
-                    tone: cur ? 'primary' : 'default',
-                    onPress: () => { setEdit(ui, 'mode', m.id) },
-                  })}
+                  <Box flexDirection="row" gap={1}>
+                    <Text color={ROLE.live.fg}>{cur ? '◉' : '○'}</Text>
+                    {ActionButton(els, {
+                      key: `set-mode-${m.id}`, glyph: m.name, word: '', plain: true,
+                      onPress: () => { setEdit(ui, 'mode', m.id) },
+                    })}
+                  </Box>
                   <Text dimColor={true}>{m.scope}</Text>
                 </Box>
-                <Text dimColor={true}>{clip(m.desc, W)}</Text>
+                <Text dimColor={true}>{clip(m.desc, W - 2)}</Text>
               </Box>
             )
           })}
@@ -603,7 +617,7 @@ function ModeCards(els: Els, view: SettingsView, W: number, ui: TabUi | undefine
       ))}
       {mode === 'hive' && Card(els, { role: 'live' }, (
           <Box flexDirection="column">
-            {Section(els, { label: 'hive · projects', right: 'projects.json' })}
+            {SecHead(els, { label: 'hive · projects', right: 'projects.json' })}
             {view.projects.map(p => {
               const on = hiveEditOf(ui, p.name) ?? p.on
               const since = `onboarded ${p.since}`
@@ -709,7 +723,7 @@ function AboutBody(els: Els, view: SettingsView, W: number, ui: TabUi | undefine
       {GroupCards(els, view, 'about', W, ui, q, noHk)}
       {Card(els, { role: 'live' }, (
         <Box flexDirection="column">
-          {Section(els, { label: 'version', right: 'plugin.json · git tags' })}
+          {SecHead(els, { label: 'version', right: 'plugin.json · git tags' })}
           <Box flexDirection="row" justifyContent="space-between" gap={1}>
             <Text dimColor={true}>installed</Text>
             <Text>{`v${a.installed}`}</Text>
@@ -733,7 +747,7 @@ function AboutBody(els: Els, view: SettingsView, W: number, ui: TabUi | undefine
       ))}
       {Card(els, {}, (
         <Box flexDirection="column">
-          {Section(els, { label: `what's new · v${a.latest}`, right: `${String(a.commits)} commits` })}
+          {SecHead(els, { label: `what's new · v${a.latest}`, right: `${String(a.commits)} commits` })}
           {a.whatsNew.map(w => (
             <Box key={`set-whatsnew-${w.line}`} flexDirection="row" gap={1}>
               {Chip(els, { label: w.kind, role: w.kind === 'feat' ? 'ok' : 'live' })}
@@ -752,8 +766,13 @@ function AboutBody(els: Els, view: SettingsView, W: number, ui: TabUi | undefine
 function DangerRow(els: Els, label: string, cols: number, onReset: () => void): RenderElement {
   const { Box, Text } = els
   const word = `reset ${label} to defaults`
-  const btn = ActionButton(els, { key: 'set-danger', glyph: '⌫', word, tone: 'danger', onPress: onReset })
-  if ('danger zone'.length + 1 + word.length + 4 + 2 <= cols) {
+  const btn = (
+    <Box backgroundColor={PALETTE.redTint} paddingX={1} flexDirection="row" gap={1}>
+      <Text color={ROLE.err.fg}>⌫</Text>
+      {ActionButton(els, { key: 'set-danger', glyph: word, word: '', plain: true, onPress: onReset })}
+    </Box>
+  )
+  if ('danger zone'.length + 1 + word.length + 8 + 2 <= cols) {
     return (
       <Box flexDirection="row" justifyContent="space-between" gap={1}>
         <Text dimColor={true}>danger zone</Text>
@@ -784,15 +803,15 @@ function SaveMsg(els: Els, msg: string, cols: number): RenderElement {
 function DirtyFooter(els: Els, keys: readonly string[], cols: number, noHk: true | undefined, onSave: () => void, onClear: () => void): RenderElement {
   const { Box, Text } = els
   const head = `● ${keys.length} unsaved`
-  const save = ActionButton(els, { key: 'set-save', glyph: 's', word: 'save', tone: 'primary', noHotkey: noHk, onPress: onSave })
-  const discard = ActionButton(els, { key: 'set-discard', glyph: 'x', word: '', noHotkey: noHk, onPress: onClear })
-  const fixed = head.length + 's save'.length + 4 + 1 + 4 + 3 /* gaps */ + 3 /* ' · ' */
+  const save = Segment(els, { key: 'set-save', label: 's save', on: true, hotkey: noHk ? undefined : 's', onPress: onSave })
+  const discard = Segment(els, { key: 'set-discard', label: 'x discard', on: false, hotkey: noHk ? undefined : 'x', onPress: onClear })
+  const fixed = head.length + 2 + 's save'.length + 4 + 'x discard'.length + 4 + 3 /* gaps */ + 3 /* ' · ' */
   const avail = cols - fixed
   const keysText = avail >= 4 ? clip(keys.join(', '), avail) : ''
   return (
-    <Box flexDirection="row" gap={1}>
-      <Text bold={true} color={ROLE.warn.fg}>{head}</Text>
-      {keysText !== '' && <Text dimColor={true}>{` · ${keysText}`}</Text>}
+    <Box flexDirection="row" gap={1} borderStyle="round" borderColor={ROLE.warn.fg} paddingX={1}>
+      {Chip(els, { label: head, role: 'warn', solid: true })}
+      {keysText !== '' && <Text dimColor={true}>{keysText}</Text>}
       {save}
       {discard}
     </Box>
