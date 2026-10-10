@@ -50,6 +50,9 @@ export function registerWizard(on: On, options: PluginOptions): void {
     const d = await read($, draftAtom)
     const cols = e.props.bodyColumns || COLUMNS
     const title = WIZARD_STEPS[step - 1] ?? ''
+    // the review preview is exactly what a replace writes: read the yaml the carry-over needs (readOpt: null on any failure)
+    const data = dataDirOf(d)
+    const oldYaml = step === LAST_STEP && d.existingYaml && d.replace && data != null ? await readOpt($, join(data, 'matrixkoder.yaml')) : null
     return (
       <Box flexDirection="column" width={cols} gap={1}>
         {e.props.placement === 'inline' && (
@@ -61,7 +64,7 @@ export function registerWizard(on: On, options: PluginOptions): void {
           <Text color="cyan" bold={true}>⬡ MatrixKoder setup</Text>
           <Text dimColor={true}>{`Step ${step}/${LAST_STEP} · ${title}   ${WIZARD_STEPS.map((_, i) => (i + 1 < step ? '●' : i + 1 === step ? '◉' : '○')).join('')}`}</Text>
         </Box>
-        {!d.loaded ? <Text dimColor={true}>Detecting agents, usage and gates…</Text> : Body(els, $, d, step, options)}
+        {!d.loaded ? <Text dimColor={true}>Detecting agents, usage and gates…</Text> : Body(els, $, d, step, options, oldYaml)}
         {d.loaded && Nav(els, $, d, step)}
       </Box>
     )
@@ -315,7 +318,8 @@ async function writeAll($: EngineInterface): Promise<void> {
         const bak = await $.process.run(['cp', '-f', yamlPath, `${yamlPath}.bak`], { timeoutMs: PROBE_MS })
         if (bak.exitCode !== 0) throw new Error(`could not back up ${yamlPath}: ${bak.stderr.trim().slice(0, 100)}`)
       }
-      await writeAtomic($, yamlPath, buildYaml(d, at))
+      // a replace carries the old file's session/picks/reviewers; readExisting throws on an unreadable file, so nothing is written
+      await writeAtomic($, yamlPath, buildYaml(d, at, yamlExists ? await readExisting($, yamlPath) : null))
       written.push(yamlPath)
     }
     if (gitignoreNext != null) {
@@ -430,7 +434,7 @@ function HerdrLinkChoice(els: Elements, $: EngineInterface, d: MkWizardDraft) {
 
 // ---------- steps ----------
 
-function Body(els: Elements, $: EngineInterface, d: MkWizardDraft, step: number, options: PluginOptions) {
+function Body(els: Elements, $: EngineInterface, d: MkWizardDraft, step: number, options: PluginOptions, oldYaml: string | null) {
   const { Box, Text, Button, Select } = els
   switch (step) {
     case 1:
@@ -569,7 +573,7 @@ function Body(els: Elements, $: EngineInterface, d: MkWizardDraft, step: number,
         </Box>
       )
     default:
-      return Review(els, $, d)
+      return Review(els, $, d, oldYaml)
   }
 }
 
@@ -587,7 +591,7 @@ function Routing(els: Elements, $: EngineInterface, d: MkWizardDraft) {
   )
 }
 
-function Review(els: Elements, $: EngineInterface, d: MkWizardDraft) {
+function Review(els: Elements, $: EngineInterface, d: MkWizardDraft, oldYaml: string | null) {
   const { Box, Text, Button, Select } = els
   const data = dataDirOf(d)
   if (d.phase === 'written') {
@@ -609,7 +613,7 @@ function Review(els: Elements, $: EngineInterface, d: MkWizardDraft) {
       </Box>
     )
   }
-  const yaml = buildYaml(d, 'pending').split('\n')
+  const yaml = buildYaml(d, 'pending', d.existingYaml && d.replace ? oldYaml : null).split('\n')
   return (
     <Box flexDirection="column" gap={1}>
       {d.phase === 'error' && <Text color="red" bold={true}>{`✗ ${d.error ?? 'write failed'}`}</Text>}

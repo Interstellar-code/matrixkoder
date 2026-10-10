@@ -12,6 +12,12 @@ Common: --data DIR, resolved exactly as mk-state.py does (--data > $MATRIXKODER_
 mk-state.py. Exit 0 ok; 2 bad input, an unknown key, or a refused write — and a refusal writes
 nothing at all, not even a .bak.
 
+A successful `set` writes `<file>.bak` first: backup = previous version (one-step undo), not the
+original file — the Settings tab saves many times in a row. `set` therefore reports
+`"changed": true` with `"backup_of": "previous"`, or `"changed": false` and no backup at all when
+the value already read that way. Line endings are preserved byte for byte: a CRLF file comes back
+CRLF.
+
 Why line-wise: the yaml is hand-edited and every line carries a comment the user wrote. There is no
 YAML dependency here, and a real yaml round-trip would rewrite every comment, quote and spacing in
 the file on the first write. This reads and patches one line at a time, so one value is a one-line
@@ -34,11 +40,15 @@ KEY_RE = re.compile(r"^(\s*)([A-Za-z_][A-Za-z0-9_-]*):[ \t]*(.*)$")
 # ---------- yaml: line-wise, no dependency (moved verbatim from mk-lane.py) ----------
 
 def scalar(v):
-    """One YAML scalar: quoted or plain text up to a ` #` comment (hooks/guards.ts scalar())."""
-    v = v.strip()
+    """One YAML scalar: quoted or plain text up to a ` #` comment (hooks/guards.ts scalar()).
+
+    The comment goes first and is quote-aware, so `"main"   # note` reads as main: hand-quoting a
+    value is ordinary in a file people edit, and a value that cannot be read back is a value this
+    tool could never write."""
+    v = strip_comment(v).strip()
     if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
         return v[1:-1]
-    return re.split(r"\s+#", v, maxsplit=1)[0].strip()
+    return v
 
 
 def split_flow(body):
@@ -259,17 +269,20 @@ def agents(lines):
 
 
 def rows(lines):
-    """The static schema rows plus one `agents.<a>.available` and one `picks.<a>` row per agent in
-    the file, so a key that is not a known agent simply does not exist."""
+    """The static schema rows plus one `agents.<a>.available` row per agent in the file and one
+    `picks.<a>` row per agent that lists models, so a key that is not a known agent simply does not
+    exist. herdr has no models and is not a coding agent: it gets an availability row, never a picks
+    row — a Settings tab must not offer to order the models of something that has none."""
     out = list(SCHEMA)
     for name, m in agents(lines):
         out.append(_row(f"agents.{name}.available", "agents", "bool", bool(m.get("available", False)),
                         ["agents"], name, "available", f"{name} available",
                         "detected at bootstrap, logged in and installed",
                         editable=False, why="detected at bootstrap — not a typed setting"))
-        out.append(_row(f"picks.{name}", "models", "list", [], [PICKS_SECTION], name, None,
-                        f"{name} model picks", "this agent's models in preference order",
-                        maxlen=4, pool=list(m.get("models") or [])))
+        if isinstance(m.get("models"), list):
+            out.append(_row(f"picks.{name}", "models", "list", [], [PICKS_SECTION], name, None,
+                            f"{name} model picks", "this agent's models in preference order",
+                            maxlen=4, pool=list(m.get("models") or [])))
     return out
 
 
@@ -292,24 +305,28 @@ def opts_of(r, lines):
 
 def coerce(type, raw, default):
     """A yaml scalar as the schema's type; anything unreadable falls back to the default rather than
-    failing a read, so one bad hand-edit never makes the whole config unreadable."""
+    failing a read, so one bad hand-edit never makes the whole config unreadable.
+
+    The comment is stripped BEFORE the quotes are read: `integration_branch: "main"   # note` is the
+    value main with a comment, not the string `"main"`. Hand-quoting is normal in a file people edit,
+    and a value this cannot read back is a value `set` can never write."""
+    s = scalar(strip_comment(raw))
     if type == "bool":
-        s = scalar(raw)
         return {"true": True, "false": False}.get(s.lower(), default)
     if type == "num":
         try:
-            return int(scalar(raw))
+            return int(s)
         except ValueError:
             try:
-                return float(scalar(raw))
+                return float(s)
             except ValueError:
                 return default
     if type == "list":
-        s = strip_comment(raw).strip()
-        if s.startswith("[") and s.endswith("]"):
-            return [scalar(x) for x in split_flow(s[1:-1])]
+        t = s.strip()
+        if t.startswith("[") and t.endswith("]"):
+            return [scalar(x) for x in split_flow(t[1:-1])]
         return default
-    return scalar(raw)
+    return s
 
 
 def value_of(lines, r):
@@ -390,17 +407,30 @@ def _check_target(lines, i, ind, sr, r):
         raise Fail(f"{r['key']}: `{r['line']}:` is indented {ind}, the section uses {want}; refusing")
 
 
+def duplicate_sections(lines, name):
+    """1-based line numbers of every top-level `name:` block header. Two of them mean two parsers can
+    disagree about which one wins, so a patch refuses instead of editing whichever it found first."""
+    return [i + 1 for (i, indent, k, rest) in key_lines(lines)
+            if indent == 0 and k == name and not strip_comment(rest).strip()]
+
+
 def patch(lines, r, value):
     """-> (new lines, how many lines changed). Raises Fail for every shape this patcher will not
     write; the caller has already validated the value, so a Fail here means the file's shape."""
+    for name in r["sec"]:
+        dupes = duplicate_sections(lines, name)
+        if len(dupes) > 1:
+            raise Fail(f"{r['key']}: {name}: appears {len(dupes)} times (lines "
+                       f"{', '.join(str(n) for n in dupes)}); which one wins is not ours to guess")
     kl, sr = key_lines(lines), section_range(lines, key_lines(lines), r["sec"])
     text = emit(value, r["type"])
     if not sr:  # shape 3: the whole block is missing — append it
         if len(r["sec"]) != 1:
             raise Fail(f"{r['key']}: {'.'.join(r['sec'])} is missing; a flow-map block is never invented")
-        block = [f"{r['sec'][0]}:\n", f"  {r['line']}: {text}\n"]
+        eol = file_ending(lines)
+        block = [f"{r['sec'][0]}:{eol}", f"  {r['line']}: {text}{eol}"]
         if lines and not lines[-1].endswith("\n"):
-            block[0] = "\n" + block[0]
+            block[0] = eol + block[0]
         return list(lines) + block, 2
     hits = [(i, ind) for (i, ind, k, _r) in kl if sr[2] <= i < sr[3] and k == r["line"]]
     if r["member"] is not None:  # shape 4: one member of a one-line flow map, the rest kept as written
@@ -418,43 +448,62 @@ def patch(lines, r, value):
             raise Fail(f"{r['key']}: `{r['member']}` is not in the `{r['line']}` flow map; refusing")
         parts[names.index(r["member"])] = f"{r['member']}: {text}"
         new = list(lines)
-        new[i] = " " * ind + f"{r['line']}: {{ " + ", ".join(parts) + " }" + tail + "\n"
+        new[i] = " " * ind + f"{r['line']}: {{ " + ", ".join(parts) + " }" + tail.rstrip("\r") \
+            + ending_of(lines[i])
         return new, 1
     if len(hits) > 1:
-        raise Fail(f"{r['key']}: {len(hits)} `{r['line']}:` lines in {'.'.join(r['sec'])}; refusing")
+        raise Fail(f"{r['key']}: {len(hits)} `{r['line']}:` lines in {'.'.join(r['sec'])} "
+                   f"(lines {', '.join(str(i + 1) for i, _ in hits)}); refusing")
     if not hits:  # shape 2: the block is there, the key is not — insert at the end of the block
         ind, pos = child_indent(lines, sr), sr[3]
-        line = " " * ind + f"{r['line']}: {text}\n"
+        eol = file_ending(lines)
+        line = " " * ind + f"{r['line']}: {text}{eol}"
         if pos and not lines[pos - 1].endswith("\n"):
-            line = "\n" + line
+            line = eol + line
         return lines[:pos] + [line] + lines[pos:], len(line.splitlines())
     i, ind = hits[0]  # shape 1: one value on one line, the comment kept
     _check_target(lines, i, ind, sr, r)
     _head, tail = split_tail(KEY_RE.match(lines[i]).group(3))
     new = list(lines)
-    new[i] = " " * ind + f"{r['line']}: {text}" + tail + "\n"
+    new[i] = " " * ind + f"{r['line']}: {text}" + tail.rstrip("\r") + ending_of(lines[i])
     return new, 1
 
 
 # ponytail: last-writer-wins, no lock; add mk_state lock if wizard+settings race
 def write_yaml(path, old, new, count, checks):
-    """Back up, prove the patched text is the file we meant to write, then replace it atomically.
-    A yaml a human edited by hand is the only config there is: a wrong write is silent corruption,
-    so nothing is written unless the new text parses back to exactly the values that were asked for
-    and differs from the old file only in the lines the patch named."""
-    if os.path.exists(path):
-        shutil.copy2(path, path + ".bak")  # the original bytes, before anything is touched
+    """Prove the patched text is the file we meant to write, back up the version being replaced, then
+    replace it atomically. A yaml a human edited by hand is the only config there is: a wrong write is
+    silent corruption, so nothing is written unless the new text parses back to exactly the values
+    that were asked for and differs from the old file only in the lines the patch named.
+
+    `.bak` is the version this write replaces (one-step undo), not the original file — the Settings tab
+    saves many times in a row. It is made AFTER verify and AFTER the writability check, so a refused set
+    leaves it exactly as it was. backup = previous version."""
     verify(old, new, count, checks)
+    if os.path.exists(path):
+        if not os.access(path, os.W_OK):
+            raise Fail(f"{path} is not writable; fix its permissions or write it by hand")
+        with contextlib.suppress(OSError):
+            os.unlink(path + ".bak")  # a read-only .bak from an earlier run must not block the copy
+        shutil.copyfile(path, path + ".bak")  # bytes only: copy2 would carry a read-only mode over
+        os.chmod(path + ".bak", 0o644)
     d = os.path.dirname(path) or "."
-    os.makedirs(d, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-")
     try:
-        with os.fdopen(fd, "w") as f:
+        os.makedirs(d, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-")
+    except OSError as e:
+        raise Fail(f"could not write in {d}: {e.strerror or e}")
+    try:
+        with os.fdopen(fd, "w", newline="") as f:  # newline='' : no \\n -> \\r\\n translation
             f.writelines(new)
             f.flush()
             os.fsync(f.fileno())
         os.chmod(tmp, 0o644)  # mkstemp makes 0600; match the rest of <data>
         os.replace(tmp, path)  # readers never see a partial file
+    except OSError as e:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise Fail(f"could not write {path}: {e.strerror or e}")
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
@@ -485,11 +534,23 @@ def verify(old, new, count, checks):
 # ---------- commands ----------
 
 def read_lines(path):
+    """newline='' so a CRLF file keeps its \\r inside each line: the patcher re-emits the ending it
+    read, and a config written on Windows must not come back rewritten as LF."""
     try:
-        with open(path) as f:
+        with open(path, newline="") as f:
             return f.readlines()
     except OSError:
         return []
+
+
+def ending_of(line):
+    """The line terminator a line already carries: a patched line keeps its own, an inserted one
+    takes the file's (a file with no terminator at all gets \\n)."""
+    return "\r\n" if line.endswith("\r\n") else "\n"
+
+
+def file_ending(lines):
+    return "\r\n" if any(l.endswith("\r\n") for l in lines) else "\n"
 
 
 def out(obj, code=0):
@@ -574,9 +635,13 @@ def cmd_set(path, lines, args):
     if not r:
         raise Fail(f"unknown key: {key}")
     value = parse_value(raw, r)
+    found, current = value_of(lines, r)
+    if found and current == value:  # a save sends every row it holds, most of them unchanged
+        return out({"ok": True, "key": key, "value": value, "file": path, "changed": False})
     new, count = patch(lines, r, value)  # refused shapes raise before anything is touched
     write_yaml(path, lines, new, count, [(key, value, r)])
-    return out({"ok": True, "key": key, "value": value, "file": path, "backup": path + ".bak"})
+    return out({"ok": True, "key": key, "value": value, "file": path, "changed": True,
+                "backup": path + ".bak", "backup_of": "previous"})
 
 
 def cmd_migrate(path, lines):
@@ -585,23 +650,25 @@ def cmd_migrate(path, lines):
     dead yaml copies of plugin settings without ever writing or deleting them."""
     old = list(lines)
     new, changed, checks, count = list(lines), [], [], 0
+    eol = file_ending(new)
     if not section_range(new, key_lines(new), [SESSION_SECTION]):
-        block = [f"{SESSION_SECTION}:\n"]
+        block = [f"{SESSION_SECTION}:{eol}"]
         if new and not new[-1].endswith("\n"):
-            block[0] = "\n" + block[0]
+            block[0] = eol + block[0]
         for r in SCHEMA:
             if r["sec"] == [SESSION_SECTION]:
-                block.append(f"  {r['line']}: {emit(r['default'], r['type'])}\n")
+                block.append(f"  {r['line']}: {emit(r['default'], r['type'])}{eol}")
         new += block
         changed += [f"{SESSION_SECTION}.{r['line']}" for r in SCHEMA if r["sec"] == [SESSION_SECTION]]
         count += len(block)
+    picks_agents = [name for name, m in agents(old) if isinstance(m.get("models"), list)]
     if not section_range(new, key_lines(new), [PICKS_SECTION]):
-        block = [f"{PICKS_SECTION}:\n"]
+        block = [f"{PICKS_SECTION}:{eol}"]
         if new and not new[-1].endswith("\n"):
-            block[0] = "\n" + block[0]
-        block += [f"  {name}: []\n" for name, _m in agents(old)]
+            block[0] = eol + block[0]
+        block += [f"  {name}:[]{eol}" for name in picks_agents]
         new += block
-        changed += [f"{PICKS_SECTION}.{name}" for name, _m in agents(old)]
+        changed += [f"{PICKS_SECTION}.{name}" for name in picks_agents]
         count += len(block)
     for key in MIGRATED_KEYS:
         r = row_for(old, key)
@@ -700,6 +767,8 @@ def self_test():
             assert len(lines) == 1, f"{args}: expected ONE json line, got {p.stdout!r} {p.stderr!r}"
             obj = json.loads(lines[0])
             assert obj.get("ok") is ok, f"{args}: {obj}"
+            assert p.stderr == "", f"{args}: wrote to stderr: {p.stderr!r}"
+            assert (p.returncode == 0) is ok, f"{args}: exit {p.returncode} for ok={ok}"
             return obj
 
         def rd():
@@ -802,6 +871,103 @@ def self_test():
             f.write(tampered)
         run("set", "session.subagents", "false", ok=False)  # a tab-indented duplicate of the key
         assert rd() == tampered
+
+        # 12. MEDIUM 1: a CRLF file comes back CRLF — one line differs, every \r\n survives
+        crlf = fixture.replace("\n", "\r\n")
+        with open(yaml_path, "wb") as f:
+            f.write(crlf.encode())
+        run("set", "session.stall_min", "12")
+        got = open(yaml_path, "rb").read().decode()
+        assert got.count("\r\n") == crlf.count("\r\n"), "a CRLF terminator was lost"
+        assert "\n" not in got.replace("\r\n", ""), "a bare LF appeared in a CRLF file"
+        assert diff(crlf, got) == [crlf.splitlines().index(
+            "  stall_min: 15   # idle minutes before a lane is called stalled")], diff(crlf, got)
+        assert "  stall_min: 12   # idle minutes before a lane is called stalled\r\n" in got
+        with open(yaml_path, "wb") as f:
+            f.write(fixture.encode())
+
+        # 13. MEDIUM 2: a hand-quoted value with a comment reads as the value, and a set keeps both
+        quoted = fixture.replace("  integration_branch: main   #",
+                                 '  integration_branch: "main"   #')
+        with open(yaml_path, "w") as f:
+            f.write(quoted)
+        assert run("get", "repo.integration_branch")["value"] == "main", "quotes leaked into the value"
+        run("set", "repo.integration_branch", "integration")
+        assert '  integration_branch: integration   # lanes merge here; one PR to main at the end\n' \
+            in rd().splitlines(keepends=True)
+        for tricky in ('"a: b"', '"a#b"', '""', '"007"', '"yes"'):
+            run("set", "repo.integration_branch", tricky)
+            assert run("get", "repo.integration_branch")["value"] == json.loads(tricky), tricky
+        with open(yaml_path, "w") as f:
+            f.write(fixture)
+
+        # 14. MEDIUM 3 + LOW 4: .bak is the version the write replaces, made after verify, so a
+        # refused set never touches it and two sets leave the FIRST set's result in it
+        run("set", "session.stall_min", "22")
+        first = rd()
+        assert open(yaml_path + ".bak").read() == fixture, "the first .bak is not the replaced version"
+        run("set", "session.stall_min", "0", ok=False)
+        run("set", "repo.integration_branch", '"a\nb"', ok=False)  # refused inside verify, where the backup used to be
+        assert open(yaml_path + ".bak").read() == fixture, "a refused write rewrote .bak"
+        run("set", "session.max_wait_min", "45")
+        assert open(yaml_path + ".bak").read() == first, ".bak is not one-step undo (previous version)"
+        out4 = run("set", "session.max_wait_min", "30")
+        assert out4["backup_of"] == "previous" and out4["changed"] is True, out4
+        with open(yaml_path, "w") as f:
+            f.write(fixture)
+
+        # 15. review (a): a save sends unchanged rows too — an equal value is a no-op, not a refusal
+        before, bak = rd(), (yaml_path + ".bak")
+        bak_before = open(bak).read() if os.path.exists(bak) else None
+        out3 = run("set", "agents.agy.available", "false")
+        assert out3["changed"] is False and "backup" not in out3, out3
+        assert rd() == before, "a no-op write changed the file"
+        assert (open(bak).read() if os.path.exists(bak) else None) == bak_before, \
+            "a no-op rewrote .bak"
+        assert run("set", "session.stall_min", "12")["changed"] is True
+        with open(yaml_path, "w") as f:
+            f.write(fixture)
+
+        # 16. MEDIUM 4: a read-only yaml is one JSON error line and a non-zero exit, never a traceback
+        if os.geteuid() != 0:  # root writes anything, so the refusal cannot be asserted as root
+            with open(yaml_path, "w") as f:
+                f.write(fixture)
+            os.chmod(yaml_path, 0o444)
+            try:
+                r = run("set", "session.stall_min", "12", ok=False)
+                assert "not writable" in r["error"], r
+                assert open(yaml_path).read() == fixture, "a refused write touched the file"
+                os.chmod(yaml_path, 0o644)
+                run("set", "session.stall_min", "12")
+                assert oct(os.stat(yaml_path + ".bak").st_mode)[-3:] == "644", ".bak kept the 0444 mode"
+            finally:
+                os.chmod(yaml_path, 0o644)
+            with open(yaml_path, "w") as f:
+                f.write(fixture)
+
+        # 17. MEDIUM 5: a section or key that appears twice is refused with its line numbers — a
+        # patch must never edit the block a different parser would not read
+        two = fixture.rstrip("\n") + "\nsession:\n  stall_min: 99\n"  # the fixture has no final newline
+        with open(yaml_path, "w") as f:
+            f.write(two)
+        r = run("set", "session.stall_min", "12", ok=False)
+        assert "appears 2 times" in r["error"] and str(two.splitlines().index("session:") + 1) in r["error"], r
+        assert rd() == two, "a duplicated section was edited anyway"
+        dup_key = fixture.replace("  subagents: true\n", "  subagents: true\n  subagents: false\n")
+        with open(yaml_path, "w") as f:
+            f.write(dup_key)
+        r = run("set", "session.subagents", "false", ok=False)
+        assert "lines" in r["error"], r
+        assert rd() == dup_key
+
+        # 18. review (b): herdr has no models and is not a builder — it never gets a picks row
+        with open(yaml_path, "w") as f:
+            f.write(fixture)
+        keys = [f["key"] for f in run("list", "--json")["fields"]]
+        assert "agents.herdr.available" in keys, "herdr availability is a real row"
+        assert not any(k.startswith("picks.herdr") for k in keys), keys
+        run("migrate")
+        assert "  herdr: []" not in rd(), "migrate added a herdr picks row"
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("mk-config self-test ok")

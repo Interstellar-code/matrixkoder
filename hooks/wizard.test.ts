@@ -463,6 +463,42 @@ test('review writes yaml, projects.json, .gitignore and the dirs; edits land in 
   }
 })
 
+test('a replace carries the old yaml\'s session, picks and reviewer values; unset keys keep defaults', async ($, on) => {
+  const files = repoFiles()
+  files[YAML] = [
+    '# changed from the Settings tab since the last wizard run',
+    'session:',
+    '  stall_min: 22',
+    'picks:',
+    '  codex: [gpt-6.1, gpt-5.4]',
+    'routing_preferences:',
+    '  reviewer: codex gpt-6.1 high',
+    '',
+  ].join('\n')
+  world(on, files)
+  await $.session.start(sessionStart())
+  await mk($, 'setup')
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(64) })
+  await toReview(ui)
+  await ui.select({ key: 'wz-replace', value: 'replace' })
+  expect(await ui.find({ text: /replace +.*matrixkoder\.yaml/ })).toBeTruthy()
+  await ui.press({ key: 'wz-write' })
+  const yaml = files[YAML] ?? ''
+  // carried: the three groups the old file set
+  expect(yaml).toContain('  stall_min: 22')
+  expect(yaml).toContain('  codex: [gpt-6.1, gpt-5.4]')
+  expect(yaml).toContain('  reviewer: codex gpt-6.1 high')
+  // never set by the old file: the schema defaults still land
+  expect(yaml).toContain('  max_wait_min: 30')
+  expect(yaml).toContain('  fresh_session: new')
+  expect(yaml).toContain('  visual_reviewer: claude haiku')
+  expect(yaml).toContain('  agy: []')
+  // the wizard's own answers come from the draft, not the old file
+  expect(yaml).toContain('  integration_branch: main')
+  expect(yaml).not.toContain('# changed from the Settings tab')
+  await ui.unmount()
+})
+
 test('projects.json is merged, not replaced; a corrupt one aborts the write', async ($, on) => {
   const files = repoFiles()
   files[PROJECTS] = JSON.stringify({ '/other/repo': { data_dir: '/other/repo/.matrixkoder', onboarded_at: 'x' } })

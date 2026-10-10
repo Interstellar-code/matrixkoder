@@ -137,7 +137,7 @@ def phase_json(ph):
            "owned": as_list(ph.get("owned")), "forbidden": as_list(ph.get("forbidden")),
            "route": ph.get("route", ""), "reviewer": ph.get("reviewer", ""),
            "size": ph.get("size", "standard"),
-"risk": ph.get("risk", "reversible"), "review": ph.get("review", "standard"),
+           "risk": ph.get("risk", "reversible"), "review": ph.get("review", "standard"),
            "qa": as_list(ph.get("qa")), "commit": ph.get("commit", ""),
            "subagents": bool(ph["subagents"]) if "subagents" in ph else session_subagents(),
            "lane_group": ph.get("lane_group", ""),

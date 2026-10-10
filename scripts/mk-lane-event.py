@@ -67,8 +67,8 @@ LOCK = ".matrixkoder-watch.lock"
 DISPATCH_RETRY_S = 5  # wait before dispatch's one automatic retry; $MK_DISPATCH_RETRY_S overrides
 DISPATCH_RECHECK_S = 3  # wait before dispatch's one pane-text recheck; $MK_DISPATCH_RECHECK_S overrides
 RETRY_PANE_STATES = ("idle", "done")  # pane sat still through a failed wait → the prompt was lost
-FRESH_IDLE_WAIT_S = 30  # bounded wait for a fresh session's pane to go idle; never an unbounded wait
-FRESH_IDLE_POLL_S = 0.5
+FRESH_IDLE_WAIT_S = float(os.environ.get("MK_FRESH_IDLE_WAIT_S", "30"))  # bounded; $MK_FRESH_IDLE_WAIT_S shrinks it for a self-test
+FRESH_IDLE_POLL_S = float(os.environ.get("MK_FRESH_IDLE_POLL_S", "0.5"))
 FRESH_CMDS = {"opencode": "/new", "claude": "/clear"}
 
 sys.dont_write_bytecode = True  # no stray __pycache__ next to the scripts
@@ -463,12 +463,15 @@ def armed_kind(pane):
 
 
 def wait_idle(pane, budget_s=FRESH_IDLE_WAIT_S, poll_s=FRESH_IDLE_POLL_S):
-    """Bounded wait until <pane> is idle/done, or the wait budget ends — never an unbounded wait."""
+    """-> (status, why) after a bounded wait for <pane> to go idle/done — never an unbounded wait.
+    A budget that runs out reports that, so a caller can refuse to act on an unconfirmed pane."""
     deadline = time.time() + budget_s
     while True:
-        st, _row, _err = pane_state(pane)
-        if st in RETRY_PANE_STATES or time.time() >= deadline:
-            return st
+        st, _row, err = pane_state(pane)
+        if st in RETRY_PANE_STATES:
+            return st, None
+        if time.time() >= deadline:
+            return st, f"pane still {st or 'unreadable'} after {budget_s:g}s"
         time.sleep(poll_s)
 
 
@@ -617,8 +620,16 @@ def cmd_dispatch(a):
              if role == "build" and round_kind in ("fix", "takeover")
              and cfg("session.fresh_session") == "new" else None)
     if fresh:
-        _prompt_attempt(pane, fresh, ms)  # the reset itself; its outcome does not gate the round
-        wait_idle(pane)
+        # The reset gates the round: a prompt that lands mid-reset reaches a session that is about to
+        # be wiped, so an unconfirmed reset fails the round instead of prompting anyway.
+        rkind, rwhy, rstatus, _rj = _prompt_attempt(pane, fresh, ms)
+        ist, iwhy = wait_idle(pane)
+        if rkind != "ok" or ist not in RETRY_PANE_STATES:
+            out({"ok": False, "delivered": False, "pane": pane, "fresh_session": fresh,
+                 "error": "fresh session not confirmed",
+                 "fresh_session_error": rwhy if rkind != "ok" else (iwhy or "pane never went idle"),
+                 "fresh_session_kind": rkind, "agent_status": rstatus})
+            return
     # the pane's raw list row before any prompt: the ok/fail arms report it as pane_entry; every
     # not-delivering exc/wait pass below replaces it with its own deciding observation
     _, entry, pl_err = pane_state(pane)
@@ -1531,6 +1542,38 @@ def self_test():
         assert prompt_calls()[n0] == f"agent prompt {pane_of('H8')} /new --wait --timeout 25000"
         assert cli("dispatch", "--pane", pane_of("H8"), "--text", "x", "--kind", "boss",
                    code=2)["ok"] is False  # --kind takes exactly build|fix|takeover
+
+        # (R2 LOW 1) the reset gates the round: a reset herdr refused, or a pane that never goes
+        # idle after it, must NOT be followed by the task prompt
+        patch_watch("H8", kind="claude")
+        set_canned("prompt_out.txt", "")
+        set_canned("prompt_err.txt", "herdr: pane wZ:gone is gone")
+        set_canned("prompt_rc.txt", "1")
+        n0 = len(prompt_calls())
+        r = cli("dispatch", "--pane", pane_of("H8"), "--text", "fix it", "--kind", "fix", extra=fnew)
+        assert r["ok"] is False and r["delivered"] is False, r
+        assert r["error"] == "fresh session not confirmed" and r["fresh_session"] == "/clear", r
+        assert "is gone" in r["fresh_session_error"], r
+        assert prompt_calls()[n0:] == [
+            f"agent prompt {pane_of('H8')} /clear --wait --timeout 25000"], prompt_calls()[n0:]
+        set_canned("prompt_out.txt", '{"result": {"agent": {"agent_status": "idle"}}}\n')
+        set_canned("prompt_err.txt", "")
+        set_canned("prompt_rc.txt", "0")
+        set_canned("pane_list_out.txt", json.dumps({"result": {"panes": [
+            {"pane_id": pane_of("H8"), "agent_status": "working"}]}}) + "\n")
+        n0 = len(prompt_calls())
+        r = cli("dispatch", "--pane", pane_of("H8"), "--text", "fix it too", "--kind", "fix",
+                extra=dict(fnew, MK_FRESH_IDLE_WAIT_S="1", MK_FRESH_IDLE_POLL_S="0.1"))
+        assert r["ok"] is False and r["delivered"] is False, r
+        assert r["error"] == "fresh session not confirmed" and "still working" in \
+            r["fresh_session_error"], r
+        assert prompt_calls()[n0:] == [
+            f"agent prompt {pane_of('H8')} /clear --wait --timeout 25000"], prompt_calls()[n0:]
+        set_canned("pane_list_out.txt", json.dumps({"result": {"panes": [
+            {"pane_id": pane_of("H8"), "agent_status": "idle"}]}}) + "\n")
+        r = cli("dispatch", "--pane", pane_of("H8"), "--text", "fix it again", "--kind", "fix",
+                extra=fnew)  # the gate is not sticky: the next round resets and prompts again
+        assert r["ok"] is True and r["delivered"] is True and r["fresh_session"] == "/clear", r
 
         # (J1.1) --tasks arms a lane GROUP: the watch file lists every task, and one delivered
         # dispatch sets the children of EVERY listed task (or the task itself when it has none)
