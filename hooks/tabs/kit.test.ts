@@ -326,7 +326,7 @@ test('S2.1 bool: `◉ on` toggle chip fits 46+36, `●` when changed, help + def
   for (const cols of [46, 36] as const) {
     const root = node(SettingRow(stubEls(), field, settingCtx({ cols, changed: true })))
     everyRowFits(root, cols)
-    const tgl = buttonsIn(root).find(b => b.props.label === '◉ on')
+    const tgl = buttonsIn(root).find(b => b.props.label === 'on')
     expect(tgl, `toggle chip at ${cols}`).toBeDefined()
     expect(tgl?.props.hotkey).toBeUndefined() // a glyph, not a letter: no pane hotkey
     const marks = nodesIn('Text', root).filter(t => text(t) === '●')
@@ -335,7 +335,7 @@ test('S2.1 bool: `◉ on` toggle chip fits 46+36, `●` when changed, help + def
 
     let toggled = 0
     const live = node(SettingRow(stubEls(), field, settingCtx({ cols, onToggle: () => { toggled++ } })))
-    ;(buttonsIn(live).find(b => b.props.label === '◉ on')?.props.onPress as () => void)()
+    ;(buttonsIn(live).find(b => b.props.label === 'on')?.props.onPress as () => void)()
     expect(toggled).toBe(1)
 
     let resets = 0
