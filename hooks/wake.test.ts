@@ -273,7 +273,105 @@ test('R2-M1: a thrown submit is held; note/heartbeat lines during the hold do NO
   expect(w.store.get('wakePending:'), 'pending cleared by the give-up').toMatchObject({ items: [] })
 })
 
-test('M4: a NEW batch with new content past the 10-min hold goes out (two submits)', { options: { wake: true } }, async ($, on) => {
+test('M4: identical-text re-transition after the 10-min hold goes out as that task alone (no cursor rewind)', { options: { wake: true } }, async ($, on) => {
+  // Repro of review-r3 R3-A: the six-step scenario where the cursor rewind double-sends
+  // an already-sent task. (1) F6→verifying sent, submit succeeds, cursor=1, hold stamped
+  // for the identical text. (2) F7→stalled sent, submit succeeds, cursor=2. (3) F6→verifying
+  // re-appears after the 10-min hold has expired, cursor is already at 2. (4) The flush gives
+  // up on the held text. The old code rewound the cursor to heldUpTo=1, and the next poll
+  // rescanned lines 2–3, waking F7 a second time past its 5-min cooldown. The fix (Math.max)
+  // keeps the cursor at 2; the next poll only sees line 3, and the third prompt is exactly
+  // "F6 → verifying" with no F7.
+  const clock = mock.clock(on)
+  const submitted: string[] = []
+  const store = new Map<string, unknown>([
+    ['wakeEventLines:hold2-run', 0],
+  ])
+
+  let eventLines = [
+    JSON.stringify({ t: '2026-10-07T20:00:00+02:00', run: 'hold2-run', task: 'F6', type: 'transition', to: 'verifying' }),
+  ]
+
+  const files: Record<string, string> = {
+    '/data/runs/index.json': JSON.stringify([{ id: 'hold2-run', status: 'active' }]),
+  }
+
+  mock.env(on, { MATRIXKODER_DATA: '/data' })
+
+  on('fs.read', (_$, e) => {
+    if (e.path === '/data/runs/index.json') return { value: files[e.path] ?? '' }
+    if (e.path === '/data/runs/hold2-run/events.jsonl') return { value: eventLines.join('\n') + '\n' }
+    return { value: '' }
+  })
+  on('prompt.submit', (_$, e) => {
+    submitted.push(e.text)
+    return { text: e.text }
+  })
+  // all wake state keys go through the store so the give-up sees the real cursor
+  on('state.get', (_$, e) => ({ value: { value: store.get(`${e.key}:${e.id ?? ''}`), version: 1 } }))
+  on('state.set', (_$, e) => {
+    store.set(`${e.key}:${e.id ?? ''}`, e.value)
+    return { value: { isSet: true, version: 1 } }
+  })
+  on('session.start', (_$, e, next) => ({ cwd: '/tmp' }))
+
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+
+  // Step 1: F6 → verifying at line 0. The mock clock fires the 30s polling timer first,
+  // then advances. After the advances, the debounce has fired and the submit landed.
+  // cursor=1; the identical-text hold is stamped for 10 min.
+  await clock.advance(30000) // poll: F6 discovered
+  await clock.advance(60000) // debounce fires, submit
+  expect(submitted.length).toBe(1)
+  expect(submitted[0]).toBe('MatrixKoder: F6 → verifying. Continue the run from its Next action.')
+
+  // Step 2: F7 → stalled at line 1. Push, then advance enough for the poll and debounce
+  // to fire. cursor=2; F6's per-task cooldown stamped (5 min → expires at +5 min from submit).
+  eventLines.push(
+    JSON.stringify({ t: '2026-10-07T20:03:00+02:00', run: 'hold2-run', task: 'F7', type: 'transition', to: 'stalled' }),
+  )
+  await clock.advance(30000) // poll: F7 discovered
+  await clock.advance(60000) // debounce fires, submit
+  expect(submitted.length).toBe(2)
+  expect(submitted[1]).toBe('MatrixKoder: F7 → stalled. Continue the run from its Next action.')
+
+  // Step 3: F6 → verifying re-appears at line 2. First advance to past the 5-min
+  // cooldown (t=390s from the first submit at t=90s), then push the event. The next
+  // poll discovers F6:verifying (eligible) and writes pending; the cursor stays at 2
+  // (the poll only advances the cursor when nothing is eligible). The debounce fires
+  // and the flush meets the still-active hold (t < 690s) — no submit. The hold
+  // eventually expires and the give-up fires.
+  await clock.advance(240000) // advance to t=420s (past the 5-min cooldown at t=390s)
+  eventLines.push(
+    JSON.stringify({ t: '2026-10-07T20:07:00+02:00', run: 'hold2-run', task: 'F6', type: 'transition', to: 'verifying' }),
+  )
+  // advance to past the 10-min hold (t=420 + 400s = 820s). During this advance: polls
+  // discover F6:verifying, arm debounce, debounce fires but the hold is still active
+  // (retryNext=true), the hold eventually expires and the give-up fires at the next
+  // debounce after t=690s.
+  await clock.advance(400000)
+  // Step 4/5/6: the give-up fired during the advance (hold expired at t=690s). The cursor
+  // was at 2 (the poll that discovered F6:verifying did not advance it because
+  // items.length > 0); Math.max(2, heldUpTo=1) = 2. No rewind. The give-up consumed the
+  // pending (the F6:verifying was the same as the held text, so no new submit). The next
+  // poll re-discovered F6:verifying and submitted it. The third prompt must be F6 →
+  // verifying alone (no F7). The old code's rewind to 1 would have rescanned line 1
+  // (F7:stalled, cooldown expired) and produced "F7 → stalled, F6 → verifying" as the
+  // third prompt.
+  expect(submitted.length, 'three submits total: F6, F7, then F6 again').toBe(3)
+  expect(submitted[2], 'the third prompt is F6 → verifying, no F7').toBe('MatrixKoder: F6 → verifying. Continue the run from its Next action.')
+
+  // Step 5/6: the next poll sees lines from 2 onward: only line 2 (F6:verifying).
+  // Line 1 (F7:stalled) was already consumed at step 2. F6:verifying is past its 5-min
+  // cooldown. Prompt 3 is "F6 → verifying" with no F7.
+  await clock.advance(30000) // poll: re-discovers line 2, debounce armed
+  await clock.advance(60000) // debounce fires, flush submits
+  expect(submitted.length, 'three submits total: F6, F7, then F6 again').toBe(3)
+  expect(submitted[2], 'the third prompt is F6 → verifying, no F7').toBe('MatrixKoder: F6 → verifying. Continue the run from its Next action.')
+})
+
+test('M4-new: a new task+to past the 10-min hold goes out (two submits, F8 case)', { options: { wake: true } }, async ($, on) => {
+  // Kept alongside the restored M4 test: a different task+to past the hold still goes out.
   const clock = mock.clock(on)
   const submitted: string[] = []
   const store = new Map<string, unknown>([
