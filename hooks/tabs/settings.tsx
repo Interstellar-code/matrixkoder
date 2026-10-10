@@ -218,7 +218,8 @@ function dirtyKeys(view: SettingsView, ui: TabUi | undefined): string[] {
   const out: string[] = []
   for (const f of flatFields(view)) if (fieldDirty(f, ui)) out.push(f.key)
   for (const p of view.picks) {
-    const e = pickEditOf(ui, p.agent)
+    // a read-only agent (no picks row in the yaml) never counts or saves: a stale edit is ignored
+    const e = p.editable === false ? undefined : pickEditOf(ui, p.agent)
     if (e != null && e.join('|') !== p.models.join('|')) out.push(`models.${p.agent}`)
   }
   for (const pr of view.projects) {
@@ -257,7 +258,8 @@ function savePayloadOf(view: SettingsView, ui: TabUi | undefined): SavePayload {
     }
   }
   for (const p of view.picks) {
-    const e = pickEditOf(ui, p.agent)
+    // a read-only agent (no picks row in the yaml) never counts or saves: a stale edit is ignored
+    const e = p.editable === false ? undefined : pickEditOf(ui, p.agent)
     if (e != null && e.join('|') !== p.models.join('|')) {
       sets.push({ key: `picks.${p.agent}`, value: [...e], list: true })
     }
