@@ -322,7 +322,7 @@ function countMatches(view: SettingsView, scopeId: SettingsScopeId, q: string): 
  *  short button words — `spare`, `bal`, `qual`), else the value itself. The
  *  kit draws the opt's value as the button word, so the tab feeds it the
  *  short word and translates back on choose (the edit keeps the real value). */
-const SEG_SHORT: Record<string, string> = { 'claude-sparing': 'spare', balanced: 'bal', quality: 'qual' }
+const SEG_SHORT: Record<string, string> = { 'claude-sparing': 'spare', balanced: 'bal', quality: 'qual', 'local-main': 'local', integration: 'integ' }
 const segWord = (o: readonly [string, string]): string => SEG_SHORT[o[0]] ?? (o[1] !== '' && o[1].length <= 8 ? o[1] : o[0])
 
 /** pre-shrink a seg's display words so the whole strip fits a CHANGED row at
@@ -571,7 +571,7 @@ function GroupCards(els: Els, view: SettingsView, scopeId: SettingsScopeId, W: n
   const { Box } = els
   const groups = view.groups
     .filter(g => g.scope === scopeId)
-    .map(g => ({ g, rows: g.rows.filter(r => rowMatches(r, q)) }))
+    .map(g => ({ g, rows: (g.title === 'builders' ? [...g.rows].sort((a, b) => Number(currentValue(b, ui) === true) - Number(currentValue(a, ui) === true)) : g.rows).filter(r => rowMatches(r, q)) }))
     .filter(({ rows }) => rows.length > 0)
   return (
     <Box flexDirection="column">

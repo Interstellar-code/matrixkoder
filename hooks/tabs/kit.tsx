@@ -393,10 +393,12 @@ export function SettingRow(els: Els, field: SettingField, ctx: SettingCtx): Rend
             key: `${key}-pick`, glyph: changedShown, word: '',
             plain: true, onPress: ctx.onPick,
           })}
-          <Input
-            key={key} value={String(field.value)}
-            onInput={v => ctx.onEdit(v)} onSubmit={v => ctx.onEdit(v)}
-          />
+          <Box backgroundColor={PALETTE.bg} paddingX={1}>
+            <Input
+              key={key} value={String(field.value)}
+              onInput={v => ctx.onEdit(v)} onSubmit={v => ctx.onEdit(v)}
+            />
+          </Box>
         </Box>
       )
     } else {
@@ -405,8 +407,8 @@ export function SettingRow(els: Els, field: SettingField, ctx: SettingCtx): Rend
   } else if (field.type === 'bool') {
     const on = field.value === true
     main = rowOf(
-      Segment(els, { key: `${key}-tog`, label: onOff(on), on, onPress: ctx.onToggle }),
-      onOff(on).length + 4,
+      Segment(els, { key: `${key}-tog`, label: `${on ? '◉' : '○'} ${onOff(on)}`, on, onPress: ctx.onToggle }),
+      onOff(on).length + 6,
       field.label,
     )
   } else if (field.type === 'num') {
@@ -467,8 +469,10 @@ export function SettingRow(els: Els, field: SettingField, ctx: SettingCtx): Rend
         ? fullVal
         : ellipsize(fullVal, valBudget)
       main = rowOf(
-        ActionButton(els, { key: `${key}-sel`, glyph: valShown, word: '▾', plain: true, onPress: ctx.onToggleOpen }),
-        settingPlainW(`${valShown} ▾`),
+        <Box backgroundColor={PALETTE.bg} paddingX={1}>
+          {ActionButton(els, { key: `${key}-sel`, glyph: valShown, word: '▾', plain: true, onPress: ctx.onToggleOpen })}
+        </Box>,
+        settingPlainW(`${valShown} ▾`) + 2,
         field.label,
       )
       if (ctx.open) {

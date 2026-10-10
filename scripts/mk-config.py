@@ -132,21 +132,21 @@ def _row(key, scope, type, default, sec, line, member, label, help, **kw):
 
 
 SCHEMA = [
-    _row("repo.integration_branch", "project", "text", "main", ["repo"], "integration_branch", None,
-         "Integration branch", "lanes merge here; one PR to main at the end"),
     _row("repo.lanes.slots", "project", "num", 3, ["repo"], "lanes", "slots",
-         "Lane slots", "reusable worktree slots", min=1, max=6),
+         "Worktree slots", "reusable worktree slots", min=1, max=6),
     _row("repo.lanes.reuse", "project", "bool", True, ["repo"], "lanes", "reuse",
          "Reuse slots", "a released slot is reused instead of deleted"),
     _row("repo.lanes.copy", "project", "list", [], ["repo"], "lanes", "copy",
-         "Copied paths", "gitignored paths a fresh slot needs"),
+         "Copy into slot", "gitignored paths a fresh slot needs"),
+    _row("repo.integration_branch", "project", "text", "main", ["repo"], "integration_branch", None,
+         "Integration branch", "lanes merge here; one PR to main at the end"),
     _row("qa.integration_target", "project", "seg", "local-main", ["qa"], "integration_target", None,
-         "QA target", "where the merged lanes are QA'd",
+         "Merge target", "where the merged lanes are QA'd",
          opts=[("local-main", "merge into local main, no push"),
                ("integration", "QA the integration branch")]),
     _row("autonomy_contract.builder_skip_permissions", "project", "bool", True,
          ["autonomy_contract"], "builder_skip_permissions", None,
-         "Builders skip permissions", "builders only, in their own worktree"),
+         "Builders skip perms", "builders only, in their own worktree"),
     _row("routing_preferences.policy", "routing", "seg", "claude-sparing",
          ["routing_preferences"], "policy", None, "Routing policy", "how hard the pool is spared",
          opts=[("claude-sparing", "Claude Code orchestrates; builders below"),
@@ -160,29 +160,29 @@ SCHEMA = [
          "Max build lanes", "concurrent builder lanes", min=1, max=6),
     _row("routing_preferences.reserve_floor.claude.five_hour_left_pct", "routing", "num", 40,
          ["routing_preferences", "reserve_floor"], "claude", "five_hour_left_pct",
-         "Claude 5h floor", "never route Claude below this share of its 5h window",
+         "Claude 5h", "never route Claude below this share of its 5h window",
          min=0, max=90, unit="%"),
     _row("routing_preferences.reserve_floor.claude.weekly_left_pct", "routing", "num", 30,
          ["routing_preferences", "reserve_floor"], "claude", "weekly_left_pct",
-         "Claude weekly floor", "never route Claude below this share of its week",
+         "Claude week", "never route Claude below this share of its week",
          min=0, max=90, unit="%"),
     _row("routing_preferences.reserve_floor.others.five_hour_left_pct", "routing", "num", 10,
          ["routing_preferences", "reserve_floor"], "others", "five_hour_left_pct",
-         "Others 5h floor", "floor for every non-Claude agent", min=0, max=90, unit="%"),
+         "Others 5h", "floor for every non-Claude agent", min=0, max=90, unit="%"),
     _row("routing_preferences.reserve_floor.others.weekly_left_pct", "routing", "num", 15,
          ["routing_preferences", "reserve_floor"], "others", "weekly_left_pct",
-         "Others weekly floor", "floor for every non-Claude agent", min=0, max=90, unit="%"),
+         "Others week", "floor for every non-Claude agent", min=0, max=90, unit="%"),
     _row("routing_preferences.reviewer", "routing", "select", "claude sonnet medium",
          ["routing_preferences"], "reviewer", None,
-         "Reviewer", "the route every review goes to"),
+         "Code reviewer", "the route every review goes to"),
     _row("routing_preferences.visual_reviewer", "routing", "select", "claude haiku",
          ["routing_preferences"], "visual_reviewer", None,
          "Visual reviewer", "the route a visual/UI review goes to"),
-    _row("usage.source", "project", "seg", "codexbar", ["usage"], "source", None,
-         "Usage source", "where every agent's usage is read from",
+    _row("usage.source", "agents", "seg", "codexbar", ["usage"], "source", None,
+         "Source", "where every agent's usage is read from",
          opts=[("codexbar", "the CodexBar CLI"), ("manual", "numbers typed into the pane")]),
-    _row("usage.providers", "project", "list", [], ["usage"], "providers", None,
-         "Usage providers", "providers shown in the usage block"),
+    _row("usage.providers", "agents", "list", [], ["usage"], "providers", None,
+         "Providers", "providers shown in the usage block"),
     _row("session.fresh_session", "child", "seg", "new", ["session"], "fresh_session", None,
          "Fresh session per round", "what a fix or takeover round starts the agent with",
          opts=[("new", "/new or /clear before the prompt"), ("same", "keep the session")]),
@@ -210,6 +210,7 @@ DEAD = (("dashboard", "auto_open", "autoOpen", True),
         ("usage", "poll_min", "usagePollMin", 5))
 # The schema rows this tool writes as a whole block when the section is missing entirely.
 SESSION_SECTION, PICKS_SECTION = "session", "picks"
+AGENT_NAMES = {"opencode": "OpenCode", "claude": "Claude Code", "codex": "Codex", "agy": "AGY"}
 
 
 # ---------- structure: where each line is ----------
@@ -276,7 +277,7 @@ def rows(lines):
     out = list(SCHEMA)
     for name, m in agents(lines):
         out.append(_row(f"agents.{name}.available", "agents", "bool", bool(m.get("available", False)),
-                        ["agents"], name, "available", f"{name} available",
+                        ["agents"], name, "available", AGENT_NAMES.get(name, name),
                         "detected at bootstrap, logged in and installed",
                         editable=False, why="detected at bootstrap — not a typed setting"))
         if isinstance(m.get("models"), list):

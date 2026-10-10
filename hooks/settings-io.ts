@@ -430,7 +430,7 @@ const YAML_GROUPS: Record<'project' | 'routing' | 'agents' | 'child', readonly G
   ],
   routing: [
     { title: 'policy', right: 'routing_preferences', prefixes: ['routing_preferences.policy', 'routing_preferences.builder_order', 'routing_preferences.max_build_lanes'] },
-    { title: 'reserve floor', right: '% left', prefixes: ['reserve_floor.'] },
+    { title: 'reserve floor', right: '% left', prefixes: ['routing_preferences.reserve_floor.'] },
     { title: 'review', prefixes: ['routing_preferences.reviewer', 'routing_preferences.visual_reviewer'] },
   ],
   agents: [
