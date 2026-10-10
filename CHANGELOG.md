@@ -2,6 +2,32 @@
 
 All notable changes to this project. Format: Keep a Changelog; versions: SemVer.
 
+## [0.3.0] - 2026-10-10
+
+### Added
+- **mk-state:** parent status fans out, status aliases, task verify (fb6af0f)
+- **dashboard:** restyle Overview, Plan and Events tabs (b34d7f9)
+- **dashboard:** restyle Lanes, Usage and Waiting tabs (0404354)
+- **dashboard:** restyle Lanes, Usage and Waiting tabs (417d449)
+- **dashboard:** restyle the Usage tab (a14cb09)
+- **skill:** subagents default to true in new plans (589fb17)
+- **dashboard:** restyle the Lanes tab (5d24f6a)
+- **dashboard:** visual kit — palette, cards, chips, bars, Raster parts, controls, run header (2e63411)
+- **dashboard:** visual kit — Raster parts (3122cf7)
+- **dashboard:** visual kit — palette and native parts (e850c84)
+
+### Fixed
+- **wake:** never rewind the event cursor on hold give-up; test identical text after hold (3083796)
+- **mk:** lane A review r2 — wake hold by content, no history rescan, dispatch marker by count (2f54675)
+- **mk:** lane A review r1 — verify judges failures, strict dispatch marker, wake claim lease and text window, baseline parse, descendants (7cd1fba)
+- **wake:** one poller across reloads, claim batches, drop stale transitions (dc8ba7e)
+- **dispatch:** reviewer prompts keep task status; recheck delivery; skill stages 5-8 (0522605)
+- **dashboard:** V1 review r1 — overview view-state keys, title budget, ui on all tabs, flush rule (3771afc)
+- **dashboard:** V0 review r1 — tab hotkeys, ControlRow keys, empty strip, tone glyphs, TreeRow (98c6f1d)
+
+### Other
+- **mk-state:** restore executable bit lost in mk-fixes-1 lane A (c8dba4a)
+
 ## [0.2.0] - 2026-10-09
 
 ### Added
