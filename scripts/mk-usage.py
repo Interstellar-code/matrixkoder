@@ -13,6 +13,7 @@ import argparse
 import contextlib
 import datetime
 import fcntl
+import importlib.util
 import json
 import os
 import re
@@ -21,6 +22,53 @@ import subprocess
 import sys
 import tempfile
 import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _load(name, path):
+    _spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(mod)
+    return mod
+
+
+try:
+    mk_state = _load("mk_state", os.path.join(HERE, "mk-state.py"))
+    mk_config = _load("mk_config", os.path.join(HERE, "mk-config.py"))
+except Exception:
+    mk_state = None
+    mk_config = None
+
+
+def load_yaml_config():
+    """Find matrixkoder.yaml from cwd the way mk-config resolves <data> (mk_state.resolve_data(None)).
+    Any read error falls back to empty dict, never a crash."""
+    if not mk_state or not mk_config:
+        return {}
+    try:
+        data = mk_state.resolve_data(None)
+        path = os.path.join(data, "matrixkoder.yaml")
+        if not os.path.isfile(path):
+            return {}
+        lines = mk_config.read_lines(path)
+        if not lines:
+            return {}
+        cfg = {}
+        r_src = mk_config.row_for(lines, "usage.source")
+        if r_src:
+            found, val = mk_config.value_of(lines, r_src)
+            if found and isinstance(val, str):
+                cfg["source"] = val
+        r_prov = mk_config.row_for(lines, "usage.providers")
+        if r_prov:
+            found, val = mk_config.value_of(lines, r_prov)
+            if found and isinstance(val, list):
+                cfg["providers"] = val
+        return cfg
+    except Exception:
+        return {}
+
 
 PROVIDER_MAP = {
     "claude": "claude",
@@ -80,6 +128,13 @@ def default_codexbar_config():
 
 
 def get_enabled_providers(config_path=None):
+    try:
+        yaml_cfg = load_yaml_config()
+        yaml_prov = yaml_cfg.get("providers")
+        if yaml_prov:
+            return list(yaml_prov)
+    except Exception:
+        pass
     path = config_path or default_codexbar_config()
     if not os.path.isfile(path):
         return ["claude", "antigravity", "codex"]
@@ -1041,6 +1096,120 @@ def self_test_body():
     finally:
         shutil.rmtree(race_dir, ignore_errors=True)
 
+    # 13. C3: Precedence for providers and usage.source: manual
+    c3_dir = tempfile.mkdtemp(prefix="mk-usage-c3-")
+    try:
+        c3_bin = os.path.join(c3_dir, "bin")
+        os.makedirs(c3_bin, exist_ok=True)
+        fake_cb = os.path.join(c3_bin, "codexbar")
+        # Fake codexbar that fails if run: used to verify usage.source: manual never calls codexbar
+        with open(fake_cb, "w") as f:
+            f.write("#!/bin/sh\necho 'ERROR: fake codexbar ran' >&2\nexit 99\n")
+        os.chmod(fake_cb, 0o755)
+
+        c3_data = os.path.join(c3_dir, "data")
+        os.makedirs(c3_data, exist_ok=True)
+        yaml_path = os.path.join(c3_data, "matrixkoder.yaml")
+        c3_ledger = os.path.join(c3_dir, "usage.json")
+        c3_env = dict(os.environ, PATH=c3_bin + ":" + os.environ.get("PATH", ""),
+                      MATRIXKODER_DATA=c3_data)
+
+        # 13a. usage.source: manual makes no codexbar call, prints skipped line, leaves usage.json untouched
+        with open(yaml_path, "w") as f:
+            f.write("usage:\n  source: manual\n  providers: [claude, codex]\n")
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), "--out", c3_ledger],
+                           env=c3_env, capture_output=True, text=True, cwd=c3_dir)
+        assert r.returncode == 0, r.stderr
+        assert json.loads(r.stdout.strip()) == {"ok": True, "skipped": "usage.source=manual"}, r.stdout
+        assert not os.path.exists(c3_ledger), "usage.source: manual must leave usage.json untouched"
+
+        # Now replace fake_cb with one that logs the --provider argument
+        cb_log = os.path.join(c3_dir, "codexbar.log")
+        with open(fake_cb, "w") as f:
+            f.write(f"#!/usr/bin/env python3\nimport sys, json\n"
+                    f"with open({cb_log!r}, 'a') as f:\n"
+                    f"    f.write(sys.argv[sys.argv.index('--provider')+1] + '\\n')\n"
+                    f"print(json.dumps([{{'usage': {{}}}}]))\n")
+        os.chmod(fake_cb, 0o755)
+
+        # 13b. yaml providers used when --providers absent
+        with open(yaml_path, "w") as f:
+            f.write("usage:\n  source: codexbar\n  providers: [claude, antigravity]\n")
+        if os.path.exists(cb_log):
+            os.unlink(cb_log)
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), "--out", c3_ledger],
+                           env=c3_env, capture_output=True, text=True, cwd=c3_dir)
+        assert r.returncode == 0, r.stderr
+        polled_provs = open(cb_log).read().splitlines()
+        assert polled_provs == ["claude", "antigravity"], polled_provs
+
+        old_env_data = os.environ.get("MATRIXKODER_DATA")
+        try:
+            os.environ["MATRIXKODER_DATA"] = c3_data
+            assert get_enabled_providers() == ["claude", "antigravity"]
+        finally:
+            if old_env_data is None:
+                os.environ.pop("MATRIXKODER_DATA", None)
+            else:
+                os.environ["MATRIXKODER_DATA"] = old_env_data
+
+        # 13c. --providers beats yaml
+        if os.path.exists(cb_log):
+            os.unlink(cb_log)
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), "--out", c3_ledger,
+                            "--providers", "codex"],
+                           env=c3_env, capture_output=True, text=True, cwd=c3_dir)
+        assert r.returncode == 0, r.stderr
+        polled_provs = open(cb_log).read().splitlines()
+        assert polled_provs == ["codex"], polled_provs
+
+        # 13d. empty yaml list falls back to the codexbar config
+        with open(yaml_path, "w") as f:
+            f.write("usage:\n  source: codexbar\n  providers: []\n")
+        cb_conf = os.path.join(c3_dir, "codexbar_cfg.json")
+        with open(cb_conf, "w") as f:
+            json.dump({"providers": [{"id": "zai", "enabled": True}, {"id": "codex", "enabled": False}]}, f)
+        old_env_data = os.environ.get("MATRIXKODER_DATA")
+        try:
+            os.environ["MATRIXKODER_DATA"] = c3_data
+            assert get_enabled_providers(config_path=cb_conf) == ["zai"]
+        finally:
+            if old_env_data is None:
+                os.environ.pop("MATRIXKODER_DATA", None)
+            else:
+                os.environ["MATRIXKODER_DATA"] = old_env_data
+
+        # 13e. unreadable yaml -> today's path
+        os.chmod(yaml_path, 0o000)
+        try:
+            old_env_data = os.environ.get("MATRIXKODER_DATA")
+            try:
+                os.environ["MATRIXKODER_DATA"] = c3_data
+                assert get_enabled_providers(config_path=cb_conf) == ["zai"]
+                assert load_yaml_config() == {}
+            finally:
+                if old_env_data is None:
+                    os.environ.pop("MATRIXKODER_DATA", None)
+                else:
+                    os.environ["MATRIXKODER_DATA"] = old_env_data
+        finally:
+            os.chmod(yaml_path, 0o644)
+
+        # invalid yaml syntax -> today's path
+        with open(yaml_path, "w") as f:
+            f.write("::: invalid yaml :::\n")
+        old_env_data = os.environ.get("MATRIXKODER_DATA")
+        try:
+            os.environ["MATRIXKODER_DATA"] = c3_data
+            assert get_enabled_providers(config_path=cb_conf) == ["zai"]
+        finally:
+            if old_env_data is None:
+                os.environ.pop("MATRIXKODER_DATA", None)
+            else:
+                os.environ["MATRIXKODER_DATA"] = old_env_data
+    finally:
+        shutil.rmtree(c3_dir, ignore_errors=True)
+
     print("mk-usage self-test ok")
 
 
@@ -1057,6 +1226,11 @@ def main():
     parser.add_argument("--interval", type=int, default=300, help="Poll interval in seconds for --watch (default: 300)")
 
     args = parser.parse_args()
+
+    yaml_cfg = load_yaml_config()
+    if yaml_cfg.get("source") == "manual":
+        print(json.dumps({"ok": True, "skipped": "usage.source=manual"}))
+        return 0
 
     if args.providers:
         providers = [p.strip() for p in args.providers.split(",") if p.strip()]
