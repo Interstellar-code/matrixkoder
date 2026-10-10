@@ -230,6 +230,29 @@ test('Settings · Routing: policy, the four reserve-floor % rows with bars, revi
   fitCheck(draw(ui, 36, 'routing'), 36)
 })
 
+test('Settings · seg words stay short when the live config sends long notes (S2b)', () => {
+  const v = settingsView()
+  const long = [['claude-sparing', 'Claude Code orchestrates; builders below'], ['balanced', 'Claude Code and builders share work'], ['quality', 'the strongest route wins, quota second']] as const
+  const live = { ...v, groups: v.groups.map(g => ({ ...g, rows: g.rows.map(r => (r.key === 'routing_preferences.policy' ? { ...r, opts: long } : r)) })) }
+  const ui: FakeUi = new Map()
+  ui.set('settings:scope', 'routing')
+  const flat = drawnText(SettingsTab(stubEls, live, 46, ui))
+  for (const w of ['spare', 'bal', 'qual']) expect(flat.includes(w), `the ${w} button`).toBe(true)
+  expect(flat.includes('orchestrates'), 'no note sentence in a button').toBe(false)
+})
+
+test('Settings · Models: an agent with no picks row is read-only and never edits (S2b)', () => {
+  const v = settingsView()
+  const ro = { ...v, picks: v.picks.map(p => (p.agent === 'claude' ? { ...p, editable: false } : p)) }
+  const ui: FakeUi = new Map()
+  ui.set('settings:scope', 'models')
+  const drawn = SettingsTab(stubEls, ro, 46, ui)
+  expect(drawnText(drawn).includes('read-only · no model list'), 'the read-only note').toBe(true)
+  const btn = buttonsOf(drawn).find(b => String(b.props.key ?? '').startsWith('set-model-claude-'))
+  ;(btn?.props.onPress as (() => void) | undefined)?.()
+  expect([...ui.keys()].some(k => k === 'settings:edit:models.claude'), 'no edit written').toBe(false)
+})
+
 test('Settings · Agents: builder availability bools and the usage group', () => {
   const ui: FakeUi = new Map()
   const drawn = draw(ui, 46, 'agents')

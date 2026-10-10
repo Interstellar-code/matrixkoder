@@ -701,7 +701,7 @@ export function buildSettingsView(args: {
     const live = f != null && Array.isArray(f.value)
       ? (f.value as unknown[]).filter((x): x is string => typeof x === 'string').slice(0, 4)
       : null
-    return { agent: p.agent, models: live ?? p.models }
+    return { agent: p.agent, models: live ?? p.models, editable: f != null }
   })
 
   return {

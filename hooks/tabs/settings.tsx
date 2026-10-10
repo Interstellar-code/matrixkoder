@@ -107,7 +107,7 @@ export type SettingsAgentCat = {
 }
 
 /** The default (fixture) ordered picks per agent, max 4. */
-export type SettingsPicks = readonly { readonly agent: string; readonly models: readonly string[] }[]
+export type SettingsPicks = readonly { readonly agent: string; readonly models: readonly string[]; /** false: the yaml has no picks row for this agent (read-only) */ readonly editable?: boolean }[]
 
 /** The About scope's static data (read-only: installed/latest version, the
  *  What's-new lines). */
@@ -320,7 +320,8 @@ function countMatches(view: SettingsView, scopeId: SettingsScopeId, q: string): 
  *  short button words — `spare`, `bal`, `qual`), else the value itself. The
  *  kit draws the opt's value as the button word, so the tab feeds it the
  *  short word and translates back on choose (the edit keeps the real value). */
-const segWord = (o: readonly [string, string]): string => (o[1] !== '' ? o[1] : o[0])
+const SEG_SHORT: Record<string, string> = { 'claude-sparing': 'spare', balanced: 'bal', quality: 'qual' }
+const segWord = (o: readonly [string, string]): string => SEG_SHORT[o[0]] ?? (o[1] !== '' && o[1].length <= 8 ? o[1] : o[0])
 
 /** pre-shrink a seg's display words so the whole strip fits a CHANGED row at
  *  `W` (marker + one-cell label + two gaps + strip ≤ W). The kit shrinks on
@@ -631,6 +632,7 @@ function ModelsCards(els: Els, view: SettingsView, W: number, ui: TabUi | undefi
       {view.agents.map(cat => {
         const picks = currentPicks(view, ui, cat.id)
         const full = picks.length >= 4
+        const readOnly = view.picks.find(p => p.agent === cat.id)?.editable === false
         // off in the catalogue, or switched off in Agents → not routed
         const availField = flatFields(view).find(f => f.key === `agents.${cat.id}.available`)
         const avail = availField == null ? true : currentValue(availField, ui) !== false
@@ -655,7 +657,7 @@ function ModelsCards(els: Els, view: SettingsView, W: number, ui: TabUi | undefi
             {rows.map(m => {
               const idx = picks.indexOf(m.name)
               const on = idx >= 0
-              const blocked = !on && full
+              const blocked = readOnly || (!on && full)
               const markerW = on ? 3 : 1 // the Chip pads one cell each side
               const noteW = m.note !== '' ? m.note.length + 1 : 0
               const nameBudget = Math.max(1, W - markerW - noteW - 2 /* gaps */ - 2 /* plain button */)
@@ -669,7 +671,7 @@ function ModelsCards(els: Els, view: SettingsView, W: number, ui: TabUi | undefi
                     glyph: clip(m.name, nameBudget), word: '', plain: true,
                     tone: blocked ? 'disabled' : undefined,
                     onPress: () => {
-                      if (blocked) return // the 5th pick is refused, edits unchanged
+                      if (blocked) return // the 5th pick (or a read-only agent) is refused, edits unchanged
                       const next = on ? picks.filter(x => x !== m.name) : [...picks, m.name]
                       ui?.set(`settings:edit:models.${cat.id}`, JSON.stringify(next))
                     },
@@ -678,6 +680,7 @@ function ModelsCards(els: Els, view: SettingsView, W: number, ui: TabUi | undefi
                 </Box>
               )
             })}
+            {readOnly && <Text dimColor={true}>{clip('read-only · no model list in matrixkoder.yaml', W)}</Text>}
             {full && <Text color={ROLE.warn.fg}>{clip('4 of 4 picked · untick one to swap', W)}</Text>}
             <Box flexDirection="row" justifyContent="space-between" gap={1}>
               <Text dimColor={true}>routing order = pick order</Text>
