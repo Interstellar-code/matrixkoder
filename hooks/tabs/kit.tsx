@@ -405,8 +405,8 @@ export function SettingRow(els: Els, field: SettingField, ctx: SettingCtx): Rend
   } else if (field.type === 'bool') {
     const on = field.value === true
     main = rowOf(
-      ActionButton(els, { key: `${key}-tog`, glyph: on ? '◉' : '○', word: onOff(on), onPress: ctx.onToggle }),
-      settingBtnW(`${on ? '◉' : '○'} ${onOff(on)}`),
+      Segment(els, { key: `${key}-tog`, label: onOff(on), on, onPress: ctx.onToggle }),
+      onOff(on).length + 4,
       field.label,
     )
   } else if (field.type === 'num') {
