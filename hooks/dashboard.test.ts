@@ -2,7 +2,7 @@
 // compact 36-col, inline hint, first-run and no-run states. Fixtures arrive
 // via $.fs.write (inline fixtures plugin); fs is served in memory.
 import { test, expect } from 'claude-code/testing'
-import { DATA_DIR, NOW, RUN_PATH, RUNS_INDEX, USAGE_PATH, agentOf, agentsOf, mockFs, mockWorld, paneProps, sessionStart, sessionStartIn, setRun, setUsage, tasksOf, worldFiles, worldFixtures } from './testkit'
+import { DATA_DIR, NOW, PROJECT_DIR, RUN_PATH, RUNS_INDEX, USAGE_PATH, agentOf, agentsOf, mockFs, mockWorld, paneProps, sessionStart, sessionStartIn, setRun, setUsage, tasksOf, worldFiles, worldFixtures } from './testkit'
 import { parseYamlAgents } from './data'
 import { mockTabCounts, waitingCount } from './tabs/header'
 
@@ -1558,4 +1558,86 @@ test('R3 MEDIUM 2: the long-default help line fits 46 and 36 cols', { plugins: [
     const wide = drawnRowWidths(await ui.drawn()).filter(w => (w.inCard ? w.width > cols - 4 : w.width > cols))
     expect(wide, `over-wide rows at ${cols} cols: ${JSON.stringify(wide)}`).toEqual([])
   }
+})
+
+// ---------- S3: Settings tab live load + save ----------
+
+/** mk-config.py argv among the spawns (pollUsage's mk-usage.py excluded). */
+const mkConfigCalls = (calls: (readonly string[])[]): string[][] =>
+  calls.filter(a => a.some(x => x.endsWith('scripts/mk-config.py'))).map(a => [...a])
+
+/** Two C1-shaped child rows the save test dirties through the steppers. */
+const S3_FIELDS = [
+  { key: 'session.stall_min', scope: 'child', label: 'Stall after', type: 'num', value: 20, default: 15, min: 5, max: 60, unit: 'm', help: 'No change flags a lane.', editable: true },
+  { key: 'session.max_wait_min', scope: 'child', label: 'Give up after', type: 'num', value: 120, default: 30, min: 10, max: 300, unit: 'm', help: 'Give up on a silent lane.', editable: true },
+]
+
+/** A process tap answering the settings spawns: migrate ok, list with S3_FIELDS, every set ok. */
+function mockSettingsProcess(calls: (readonly string[])[]) {
+  return (argv: readonly string[]) => {
+    calls.push(argv)
+    if (!argv.some(a => a.endsWith('scripts/mk-config.py'))) return undefined
+    const sub = argv[argv.indexOf('--data') + 2]
+    const stdout = sub === 'migrate'
+      ? '{"ok":true,"changed":[],"notes":[]}\n'
+      : sub === 'list'
+        ? `${JSON.stringify({ ok: true, file: `${DATA_DIR}/matrixkoder.yaml`, fields: S3_FIELDS })}\n`
+        : '{"ok":true}\n'
+    return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  }
+}
+
+test('S3: opening the Settings tab runs migrate then list --json, both with --data; a second open does not migrate again', { plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  const calls: (readonly string[])[] = []
+  const clock = mockWorld(on, { process: mockSettingsProcess(calls) })
+  on('session.cwd', () => ({ value: PROJECT_DIR }))
+  on('config.list', () => ({ value: [] }))
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-settings' })
+  for (let i = 0; i < 60 && mkConfigCalls(calls).length < 2; i++) await clock.advance(0)
+  const mk = mkConfigCalls(calls)
+  expect(mk).toHaveLength(2)
+  expect(mk[0]?.[0]).toBe('python3')
+  expect(mk[0]?.[1]?.endsWith('scripts/mk-config.py')).toBe(true)
+  for (const a of mk) {
+    const i = a.indexOf('--data')
+    expect(i, '--data on every mk-config call').toBeGreaterThanOrEqual(0)
+    expect(a[i + 1]).toBe(DATA_DIR)
+  }
+  expect(mk[0]?.slice(-1)).toEqual(['migrate'])
+  expect(mk[1]?.slice(-2)).toEqual(['list', '--json'])
+  // the live view arrived: the MOCK row is gone
+  await ui.redraw(paneProps(46))
+  expect(await ui.find({ text: /MOCK · fixture data/ })).toBeUndefined()
+  // a second open reuses the stored view: no migrate, no new list
+  await ui.press({ key: 'dash-tab-old' })
+  await ui.press({ key: 'dash-tab-settings' })
+  for (let i = 0; i < 20; i++) await clock.advance(0)
+  expect(mkConfigCalls(calls)).toHaveLength(2)
+})
+
+test('S3: save writes one set per dirty yaml row in order, then shows ✓ saved N', { plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  const calls: (readonly string[])[] = []
+  const clock = mockWorld(on, { process: mockSettingsProcess(calls) })
+  on('session.cwd', () => ({ value: PROJECT_DIR }))
+  on('config.list', () => ({ value: [] }))
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-settings' })
+  for (let i = 0; i < 60 && mkConfigCalls(calls).length < 2; i++) await clock.advance(0)
+  await ui.redraw(paneProps(46))
+  await ui.press({ key: 'set-scope-child' })
+  await ui.press({ key: 'set-session.stall_min-inc' }) // 20 → 21 (max 60: step 1)
+  await ui.press({ key: 'set-session.max_wait_min-inc' }) // 120 → 125 (max 300: step 5)
+  await ui.press({ key: 'set-save' })
+  for (let i = 0; i < 60 && mkConfigCalls(calls).length < 4; i++) await clock.advance(0)
+  const sets = mkConfigCalls(calls).slice(2)
+  expect(sets).toHaveLength(2)
+  expect(sets[0]?.slice(-3)).toEqual(['set', 'session.stall_min', '21'])
+  expect(sets[1]?.slice(-3)).toEqual(['set', 'session.max_wait_min', '125'])
+  await ui.redraw(paneProps(46))
+  expect(await ui.find({ text: /✓ saved 2 · backups written first/ }), 'the saved footer').toBeTruthy()
 })

@@ -300,6 +300,10 @@ const settingBtnW = (label: string): number => label.length + 4
 /** a plain Button's drawn width (no brackets; +2 keeps the budget honest). */
 const settingPlainW = (label: string): number => label.length + 2
 
+/** The narrowest Input worth drawing beside a text label (the engine lays the
+ *  field out; the tab only budgets the label): the label yields past this. */
+const TEXT_INPUT_MIN = 12
+
 /** One settings row (plan settings-tab S2.1, Settings.dc.html's rows):
  *  the label left, the control right, one logical row that fits `cols` (46
  *  base, 36 compact — the label yields with `…`); a changed value prefixes
@@ -362,11 +366,15 @@ export function SettingRow(els: Els, field: SettingField, ctx: SettingCtx): Rend
     if ('Input' in els) {
       const { Input } = els
       // the label press selects the row (R3 HIGH 1); the Input carries no
-      // label of its own, so the name draws once
+      // label of its own, so the name draws once. Carried LOW: the label is
+      // capped to leave the minimum Input beside it (plain chrome + gap), so
+      // a long label can never push the Input off a 36-col row.
+      const labelBudget = Math.max(1, ctx.cols - TEXT_INPUT_MIN - 3)
+      const changedShown = ellipsize(ctx.changed ? `● ${field.label}` : field.label, labelBudget)
       main = (
         <Box flexDirection="row" gap={1}>
           {ActionButton(els, {
-            key: `${key}-pick`, glyph: ellipsize(ctx.changed ? `● ${field.label}` : field.label, Math.max(1, ctx.cols - 2)), word: '',
+            key: `${key}-pick`, glyph: changedShown, word: '',
             plain: true, onPress: ctx.onPick,
           })}
           <Input

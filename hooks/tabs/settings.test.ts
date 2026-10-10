@@ -521,3 +521,182 @@ test('Settings · every scope fits 36 and 46 cols; hotkeys are only 1-8 and s/x/
   for (const cols of [36, 46] as const) fitCheck(draw(busy, cols), cols)
   expect(drawnText(draw(busy, 46)).includes('● 2 unsaved'), 'the busy state is dirty').toBe(true)
 })
+
+// ---------- S3: the save press hands the ordered payload to the live wire ----------
+
+/** a fake ui with the S3 live wires: save/recheck record their calls (kept
+ *  import-free — only Map and the tab's own structural TabUi). */
+const liveUiOf = (ui: FakeUi, seen: { saves: unknown[]; rechecks: number }) => ({
+  get: (k: string): string | undefined => ui.get(k),
+  set: (k: string, v: string): void => { ui.set(k, v) },
+  save: (p: unknown): void => { seen.saves.push(p) },
+  recheck: (): void => { seen.rechecks++ },
+})
+
+test('Settings · S3 save: s save hands the ordered payload to the live wire and keeps the edits; x discard writes nothing', () => {
+  const ui: FakeUi = new Map()
+  const seen = { saves: [] as unknown[], rechecks: 0 }
+  const live = liveUiOf(ui, seen)
+  ui.set('settings:scope', 'routing')
+  press(SettingsTab(stubEls, settingsView(), 46, live), 'set-reserve_floor.claude.five_hour_left_pct-inc')
+  press(SettingsTab(stubEls, settingsView(), 46, live), 'set-routing_preferences.policy-seg-qual')
+  const dirty = SettingsTab(stubEls, settingsView(), 46, live)
+  expect(drawnText(dirty).includes('● 2 unsaved'), 'two edits count').toBe(true)
+  press(dirty, 'set-save')
+  // draw order (policy group before reserve floor), yaml rows, nothing else
+  expect(seen.saves).toEqual([{
+    sets: [
+      { key: 'routing_preferences.policy', value: 'quality', list: false },
+      { key: 'reserve_floor.claude.five_hour_left_pct', value: 45, list: false },
+    ],
+    globals: [],
+    visibility: [],
+  }])
+  // the tab keeps the edits: only the dashboard's success clears them
+  expect(ui.get('settings:edit:reserve_floor.claude.five_hour_left_pct')).toBe('45')
+  press(SettingsTab(stubEls, settingsView(), 46, live), 'set-discard')
+  expect(seen.saves).toHaveLength(1) // discard never saves
+  expect(ui.get('settings:edit:reserve_floor.claude.five_hour_left_pct')).toBe('')
+})
+
+test('Settings · S3 save: a global row routes to $.config by suffix; a locked row draws no control', () => {
+  const base = settingsView()
+  const view = {
+    ...base,
+    mock: false,
+    groups: base.groups.map(g => g.scope === 'routing'
+      ? {
+        ...g,
+        rows: g.rows.map(r => r.key === 'routing_preferences.policy'
+          ? { ...r, global: true as const }
+          : r.key === 'reserve_floor.claude.five_hour_left_pct'
+            ? { ...r, global: true as const, editable: false, why: 'Read-only: locked by policy' }
+            : r),
+      }
+      : g),
+  }
+  const ui: FakeUi = new Map()
+  const seen = { saves: [] as unknown[], rechecks: 0 }
+  const live = liveUiOf(ui, seen)
+  ui.set('settings:scope', 'routing')
+  const drawn = SettingsTab(stubEls, view, 46, live)
+  // the locked row offers no control to press (its label press selects only)
+  const ctrls = buttonsOf(drawn).filter(b =>
+    String(b.props.key).startsWith('set-reserve_floor.claude.five_hour_left_pct-') &&
+    !String(b.props.key).endsWith('-pick'))
+  expect(ctrls).toEqual([])
+  press(drawn, 'set-routing_preferences.policy-seg-qual')
+  press(SettingsTab(stubEls, view, 46, live), 'set-save')
+  expect(seen.saves).toEqual([{
+    sets: [],
+    globals: [{ suffix: 'routing_preferences.policy', value: 'quality' }],
+    visibility: [],
+  }])
+})
+
+// ---------- carried MEDIUM: hotkeys follow the real focus ring ----------
+
+test('Settings · carried MEDIUM: hotkeys are inert while the find Input really has focus; typing s filters, never saves', () => {
+  const ui: FakeUi = new Map()
+  const seen = { saves: [] as unknown[], rechecks: 0 }
+  const live = liveUiOf(ui, seen)
+  ui.set('settings:scope', 'routing')
+  ui.set('settings:sel', 'reserve_floor.claude.five_hour_left_pct')
+  ui.set('settings:edit:reserve_floor.claude.five_hour_left_pct', '45') // dirty, so save/discard draw
+  ui.set('settings:focus', 'set-find-input') // the dashboard's ui.focus hook records the ring here
+  const drawn = SettingsTab(stubEls, settingsView(), 46, live)
+  const hotkeys = new Map(buttonsOf(drawn).map(b => [b.props.key, b.props.hotkey]))
+  expect(hotkeys.get('set-save'), 's inert').toBeUndefined()
+  expect(hotkeys.get('set-discard'), 'x inert').toBeUndefined()
+  expect(hotkeys.get('set-find'), 'f inert').toBeUndefined()
+  expect(hotkeys.get('set-scope-project'), 'digits inert').toBeUndefined()
+  expect(hotkeys.get('set-reserve_floor.claude.five_hour_left_pct-reset'), 'r inert').toBeUndefined()
+  // typing `s` reaches the focused Input alone (the engine's InputProps
+  // contract): the filter takes it, no save runs, the edit stands
+  const input = nodesOf(drawn, 'Input').find(i => i.props.key === 'set-find-input')
+  expect(input, 'the find Input').toBeDefined()
+  ;(input?.props.onInput as (v: string) => void)('s')
+  expect(ui.get('settings:find')).toBe('s')
+  expect(seen.saves).toEqual([])
+  expect(ui.get('settings:edit:reserve_floor.claude.five_hour_left_pct')).toBe('45')
+  // the ring moves on: every hotkey is armed again
+  ui.set('settings:focus', '')
+  const back = SettingsTab(stubEls, settingsView(), 46, live)
+  const rehot = new Map(buttonsOf(back).map(b => [b.props.key, b.props.hotkey]))
+  expect(rehot.get('set-save')).toBe('s')
+  expect(rehot.get('set-find')).toBe('f')
+})
+
+test('Settings · carried MEDIUM: a focused text-row Input swallows s the same way', () => {
+  const ui: FakeUi = new Map()
+  const seen = { saves: [] as unknown[], rechecks: 0 }
+  const live = liveUiOf(ui, seen)
+  ui.set('settings:scope', 'project')
+  ui.set('settings:edit:repo.lanes.slots', '4') // dirty, so save draws
+  ui.set('settings:focus', 'set-repo.integration_branch') // the text row's real Input key
+  const drawn = SettingsTab(stubEls, settingsView(), 46, live)
+  expect(new Map(buttonsOf(drawn).map(b => [b.props.key, b.props.hotkey])).get('set-save'), 's inert').toBeUndefined()
+  const input = nodesOf(drawn, 'Input').find(i => i.props.value === 'main')
+  expect(input, 'the branch Input').toBeDefined()
+  ;(input?.props.onInput as (v: string) => void)('s')
+  expect(ui.get('settings:edit:repo.integration_branch')).toBe('"s"')
+  expect(seen.saves).toEqual([])
+})
+
+test('Settings · carried MEDIUM: a focused Button keeps its hotkey — only an Input swallows keys', () => {
+  const ui: FakeUi = new Map()
+  ui.set('settings:scope', 'routing')
+  ui.set('settings:edit:reserve_floor.claude.five_hour_left_pct', '45')
+  ui.set('settings:focus', 'set-save') // a Button holds the ring, not an Input
+  const hotkeys = new Map(buttonsOf(SettingsTab(stubEls, settingsView(), 46, ui)).map(b => [b.props.key, b.props.hotkey]))
+  expect(hotkeys.get('set-save')).toBe('s')
+})
+
+// ---------- S3.2: About live at the render ----------
+
+test('Settings · S3.2 about live: installed/latest versions, what is new, not probed, c re-runs the check, save messages draw', () => {
+  const base = settingsView()
+  const view = {
+    ...base,
+    mock: false,
+    groups: [
+      ...base.groups.filter(g => g.scope !== 'about'),
+      {
+        scope: 'about' as const,
+        title: 'helpers',
+        right: 'probe result',
+        rows: [{
+          key: 'helpers.jev',
+          scope: 'about' as const,
+          label: 'Jev',
+          type: 'seg' as const,
+          value: 'not probed',
+          default: 'not probed',
+          opts: [['ok', 'ok'], ['off', 'off'], ['not probed', '']] as readonly (readonly [string, string])[],
+          help: 'Judgement gates.',
+          editable: false,
+          why: 'Read-only: probed at preflight',
+        }],
+      },
+    ],
+    about: { installed: '0.3.0', latest: '0.4.0', latestNote: '', commits: 1, whatsNew: [{ kind: 'feat' as const, line: 'live rows land' }] },
+  }
+  const ui: FakeUi = new Map()
+  const seen = { saves: [] as unknown[], rechecks: 0 }
+  const live = liveUiOf(ui, seen)
+  ui.set('settings:scope', 'about')
+  const flat = drawnText(SettingsTab(stubEls, view, 46, live))
+  expect(flat.includes('v0.3.0'), 'installed version').toBe(true)
+  expect(flat.includes('v0.4.0'), 'latest tag').toBe(true)
+  expect(flat.includes('live rows land'), "what's new").toBe(true)
+  expect(flat.includes('not probed'), 'absent helper').toBe(true)
+  // `c` stamps the flag and re-runs the latest-tag check through the wire
+  press(SettingsTab(stubEls, view, 46, live), 'set-about-check')
+  expect(ui.get('settings:about:checked')).toBe('1')
+  expect(seen.rechecks).toBe(1)
+  // the save-result lines draw over the scope (success and error alike)
+  ui.set('settings:save:msg', '✓ saved 2 · backups written first')
+  expect(drawnText(SettingsTab(stubEls, view, 46, live)).includes('✓ saved 2 · backups written first'), 'the saved line').toBe(true)
+  ui.set('settings:save:msg', 'session.stall_min: below min 5')
+  expect(drawnText(SettingsTab(stubEls, view, 46, live)).includes('session.stall_min: below min 5'), 'the error line').toBe(true)
+})

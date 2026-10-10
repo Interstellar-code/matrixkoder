@@ -26,6 +26,12 @@ import { LanesTab, lanesView } from './tabs/lanes'
 import { OverviewTab, overviewView } from './tabs/overview'
 import { PlanTab, planView } from './tabs/plan'
 import { SettingsTab, settingsView } from './tabs/settings'
+import type { SettingsValue, SettingsView } from './tabs/settings'
+import {
+  applySavedView, buildSettingsView, firstTagLine, loadYaml, parsePluginManifest, saveGlobals, saveYaml,
+  savedEditKeys, topChangelogEntry,
+} from './settings-io'
+import type { RunFn, SavePayload } from './settings-io'
 import { UsageTab, usageView } from './tabs/usage'
 import { WaitingTab, waitingView } from './tabs/waiting'
 import { chipText, toastsFor } from './status'
@@ -201,6 +207,15 @@ export function registerDashboard(on: On, options: PluginOptions): void {
     return { text: 'MatrixKoder pane opened.' }
   })
 
+  on('ui.focus', { requestId: PANE_ID }, async ($, e, next) => {
+    // Carried MEDIUM: keep the focused element's key where the Settings tab
+    // reads it (`settings:focus`); the tab drops s/x/r/f/c + 1-8 while the
+    // key names one of its Inputs. The ring move itself always goes through.
+    const out = await next(e)
+    await setViewKey($, 'settings:focus', e.element ?? '')
+    return out
+  })
+
   on('ui.render', { component: 'Pane', requestId: PANE_ID }, async ($, e) => {
     const els = $.ui.resolve(e)
     const { Box, Text } = els
@@ -217,10 +232,22 @@ export function registerDashboard(on: On, options: PluginOptions): void {
     const header = dashTab === 'old' ? realRunHeader(snap) : mockRunHeader()
     const counts = dashTab === 'old' ? realTabCounts(snap.run) : mockTabCounts()
     // C12: the tabs' view-state handle. `get` reads the atom's snapshot; `set`
-    // writes it and is only ever called from an onPress (C10).
+    // writes it and is only ever called from an onPress (C10). `save`/`recheck`
+    // are the Settings tab's live wires (S3): the ordered write and the About
+    // re-check, both fire-and-forget from a press.
     const ui: TabUi = {
       get: key => viewState[key],
       set: (key, value) => { void update($, viewStateAtom, prev => ({ ...prev, [key]: value })) },
+      save: payload => { void saveSettings($, payload) },
+      recheck: () => { void recheckAbout($) },
+    }
+    // S3: the live Settings view once loaded (the fixture meanwhile — its
+    // MOCK row says so). A tab opened straight onto settings (defaultTab)
+    // loads here; every other open loads from the tab switch.
+    const settingsState = readSettingsState(viewState)
+    const settingsLive = settingsState.live
+    if (dashTab === 'settings' && settingsLive == null && !settingsInflight && (viewState['settings:load:error'] ?? '') === '') {
+      void ensureSettingsLoaded($)
     }
 
     return (
@@ -250,8 +277,8 @@ export function registerDashboard(on: On, options: PluginOptions): void {
               ? withViewState(LanesTab, tabEls, lanesView(), cols, ui)
               : dashTab === 'plan'
                 ? PlanTab(tabEls, planView(), cols, ui)
-                : dashTab === 'settings'
-                  ? SettingsTab(tabEls, settingsView(), cols, ui)
+            : dashTab === 'settings'
+              ? SettingsTab(tabEls, settingsLive ?? settingsView(), cols, ui)
                   : dashTab === 'usage'
                     ? withViewState(UsageTab, tabEls, usageView(), cols, ui)
                     : dashTab === 'events'
@@ -263,8 +290,14 @@ export function registerDashboard(on: On, options: PluginOptions): void {
 }
 
 /** C12: a tab's view-state handle — the structural type every tab file declares
- *  for itself (no import crosses lanes). */
-type TabUi = { get(key: string): string | undefined; set(key: string, value: string): void }
+ *  for itself (no import crosses lanes). `save`/`recheck` are the Settings
+ *  tab's live wires (S3); every other tab ignores them. */
+type TabUi = {
+  get(key: string): string | undefined
+  set(key: string, value: string): void
+  save?: (payload: SavePayload) => void
+  recheck?: () => void
+}
 
 /** C12 hands `ui` to all six tabs; V2's three still take three arguments, so
  *  their call goes through a widened view of their signature until they do. */
@@ -280,9 +313,10 @@ function withViewState<V>(
 
 /** A tab-bar press (S0.2): the state write is legal in onPress (a render must
  * never write), and the pane scrolls back to the top — a refused scroll leaves
- * the switch standing. */
+ * the switch standing. Opening settings kicks its live load (S3). */
 async function switchTab($: EngineInterface, tab: MkDashTab): Promise<void> {
   await update($, dashTabAtom, () => tab)
+  if (tab === 'settings') void ensureSettingsLoaded($)
   try {
     await $.ui.scroll({ in: PANE_ID, to: 'start' })
   } catch {
@@ -705,6 +739,226 @@ async function projectProviders($: EngineInterface, cwd: string): Promise<readon
     return providers != null && providers.length > 0 ? providers : null
   } catch {
     return null // an unreadable yaml polls the default set, never blocks the poll
+  }
+}
+
+// ---------- S3: the Settings tab's live layer (settings-io does the pure
+// work; these closures hand it this module's $ — $ never crosses an import) ----------
+
+let settingsInflight = false
+
+/** One view-state key write that never throws (a refused write keeps the
+ *  tab's last message — the load/save paths report through these keys). */
+async function setViewKey($: EngineInterface, key: string, value: string): Promise<void> {
+  try {
+    await update($, viewStateAtom, prev => ({ ...prev, [key]: value }))
+  } catch {
+    // the atom write failed — the tab keeps its last message
+  }
+}
+
+/** S3: the live Settings load state rides the view-state atom as JSON
+ *  strings (the engine's atom keys are a closed registry in types/index.d.ts
+ *  — S3 owns no new atom): `settings:live` (the SettingsView, absent until
+ *  the first tab open loads it), `settings:migrated` ('1' once migrate ran),
+ *  `settings:datadir`. A torn JSON parses to null — the tab reloads. */
+function readSettingsState(viewState: Record<string, string>): {
+  live: SettingsView | null
+  migrated: boolean
+  dataDir: string | null
+} {
+  let live: SettingsView | null = null
+  try {
+    const raw = viewState['settings:live']
+    if (raw != null && raw !== '') {
+      const v: unknown = JSON.parse(raw) as unknown
+      if (typeof v === 'object' && v !== null && Array.isArray((v as { groups?: unknown }).groups)) {
+        live = v as SettingsView
+      }
+    }
+  } catch {
+    live = null
+  }
+  return { live, migrated: viewState['settings:migrated'] === '1', dataDir: viewState['settings:datadir'] ?? null }
+}
+
+/** S3.1: load the live Settings rows the first time the tab opens — migrate
+ *  once per session, then list --json (both with --data), globals from
+ *  $.config.list(), About from plugin.json + git tags + CHANGELOG. Later
+ *  opens reuse the stored view; a failed load records `settings:load:error`
+ *  (drawn over the fixture view) and retries next open. */
+async function ensureSettingsLoaded($: EngineInterface): Promise<void> {
+  if (settingsInflight) return
+  settingsInflight = true // synchronous: the render fallback and the tab switch race here
+  try {
+    let seen: Record<string, string> = {}
+    try {
+      seen = await read($, viewStateAtom)
+    } catch {
+      return // the atom read failed — the tab keeps its fixture view
+    }
+    const st = readSettingsState(seen)
+    if (st.live != null) return
+    let cwd: string | null = null
+    try {
+      cwd = await $.session.cwd()
+    } catch {
+      cwd = null
+    }
+    const dataDir = cwd == null ? null : await resolveDataDir($, cwd, await homeDir($))
+    if (dataDir == null) {
+      await setViewKey($, 'settings:load:error', 'no project data dir — run /mk setup first')
+      return
+    }
+    const root = $.plugin.root
+    const run: RunFn = (argv, init) => $.process.run(argv, init)
+    const { fields } = await loadYaml(run, root, dataDir, st.migrated)
+    let cfg: { key: string; value: SettingsValue; isLocked: boolean }[] = []
+    try {
+      cfg = (await $.config.list()).map(r => ({ key: r.key, value: r.value, isLocked: r.isLocked }))
+    } catch {
+      cfg = [] // the config noun refused — yaml rows still draw, globals drop out
+    }
+    const about = await loadAbout($, run, root)
+    const view = buildSettingsView({ fields, file: '', configRows: cfg, globalDefaults: about.defaults, about })
+    try {
+      await update($, viewStateAtom, prev => ({
+        ...prev,
+        ['settings:live']: JSON.stringify(view),
+        ['settings:migrated']: '1',
+        ['settings:datadir']: dataDir,
+      }))
+    } catch {
+      // the view did not stick — the next open retries
+    }
+    await setViewKey($, 'settings:load:error', '')
+  } catch (e) {
+    await setViewKey($, 'settings:load:error', String(e instanceof Error ? e.message : e).slice(0, 120))
+  } finally {
+    settingsInflight = false
+  }
+}
+
+/** S3.2: the About scope's probed data — installed version from the shipped
+ *  plugin.json, latest as the highest git tag in the plugin root, What's new
+ *  as the top CHANGELOG.md entry's lines. Each source falls back alone, so a
+ *  missing file never blanks the rest. */
+async function loadAbout($: EngineInterface, run: RunFn, root: string): Promise<{
+  installed: string
+  latest: string
+  whatsNew: SettingsView['about']['whatsNew']
+  defaults: Record<string, SettingsValue>
+}> {
+  let installed = 'unknown'
+  let defaults: Record<string, SettingsValue> = {}
+  try {
+    const parsed = parsePluginManifest(await $.fs.read(`${root}/.claude-plugin/plugin.json`))
+    installed = parsed.version
+    defaults = parsed.defaults
+  } catch {
+    // unreadable manifest — the About card shows unknown, globals take live values
+  }
+  let latest = installed
+  try {
+    const r = await run(['git', '-C', root, 'tag', '--sort=-v:refname'], { timeoutMs: 30_000 })
+    if (r.exitCode === 0) latest = firstTagLine(r.stdout) || installed
+  } catch {
+    // git refused — latest stays on installed
+  }
+  let whatsNew: SettingsView['about']['whatsNew'] = []
+  try {
+    whatsNew = topChangelogEntry(await $.fs.read(`${root}/CHANGELOG.md`))
+  } catch {
+    whatsNew = []
+  }
+  return { installed, latest, whatsNew, defaults }
+}
+
+/** S3.1: the tab's save press — yaml sets in order (the first ok:false stops
+ *  the rest and its error is the message), then the globals (a {deny} stops
+ *  the rest and its reason is shown). Discard writes nothing: the tab clears
+ *  locally without calling here. Success clears every edit and leaves
+ *  `✓ saved N · backups written first`; any error leaves the edits intact. */
+async function saveSettings($: EngineInterface, payload: SavePayload): Promise<void> {
+  let seen: Record<string, string> = {}
+  try {
+    seen = await read($, viewStateAtom)
+  } catch {
+    await setViewKey($, 'settings:save:msg', 'settings not loaded — open the tab first')
+    return
+  }
+  const st = readSettingsState(seen)
+  if (st.live == null || st.dataDir == null) {
+    await setViewKey($, 'settings:save:msg', 'settings not loaded — open the tab first')
+    return
+  }
+  const run: RunFn = (argv, init) => $.process.run(argv, init)
+  const yaml = await saveYaml(run, $.plugin.root, st.dataDir, payload.sets).catch((e: unknown) => ({
+    saved: 0,
+    error: String(e instanceof Error ? e.message : e) as string | undefined,
+  }))
+  if (yaml.error != null) {
+    await setViewKey($, 'settings:save:msg', yaml.error)
+    return
+  }
+  let cfg: { key: string; value: SettingsValue; isLocked: boolean }[] = []
+  try {
+    cfg = (await $.config.list()).map(r => ({ key: r.key, value: r.value, isLocked: r.isLocked }))
+  } catch {
+    await setViewKey($, 'settings:save:msg', 'config unavailable — yaml saved, globals kept')
+    return
+  }
+  const hiddenField = st.live.groups.flatMap(g => g.rows).find(r => r.key === 'hiddenTabs')
+  const globals = await saveGlobals(
+    async () => cfg,
+    async (key, value) => $.config.set({ key, value }),
+    payload.globals,
+    payload.visibility,
+    typeof hiddenField?.value === 'string' ? hiddenField.value : '',
+  ).catch((e: unknown) => ({ saved: 0, error: String(e instanceof Error ? e.message : e) as string | undefined }))
+  if (globals.error != null) {
+    await setViewKey($, 'settings:save:msg', globals.error)
+    return
+  }
+  const n = yaml.saved + globals.saved
+  try {
+    const drop = new Set(savedEditKeys(st.live))
+    const kept = applySavedView(st.live, payload)
+    await update($, viewStateAtom, prev => {
+      const next: Record<string, string> = {}
+      for (const [k, v] of Object.entries(prev)) if (!drop.has(k)) next[k] = v
+      next['settings:live'] = JSON.stringify(kept)
+      next['settings:save:msg'] = yaml.saved > 0 ? `✓ saved ${n} · backups written first` : `✓ saved ${n}`
+      return next
+    })
+  } catch {
+    // the edits stand — the next save retries them
+  }
+}
+
+/** S3.2: About `c` — re-run the latest-tag check and stamp the check flag
+ *  (the tab already sets the flag; the card flips to `checked now` at once). */
+async function recheckAbout($: EngineInterface): Promise<void> {
+  await setViewKey($, 'settings:about:checked', '1')
+  let seen: Record<string, string> = {}
+  try {
+    seen = await read($, viewStateAtom)
+  } catch {
+    return
+  }
+  const st = readSettingsState(seen)
+  if (st.live == null) return
+  try {
+    const r = await $.process.run(['git', '-C', $.plugin.root, 'tag', '--sort=-v:refname'], { timeoutMs: 30_000 })
+    if (r.exitCode !== 0) return
+    const latest = firstTagLine(r.stdout) || st.live.about.installed
+    await update($, viewStateAtom, prev => {
+      const cur = readSettingsState(prev)
+      if (cur.live == null) return prev
+      return { ...prev, ['settings:live']: JSON.stringify({ ...cur.live, about: { ...cur.live.about, latest } }) }
+    })
+  } catch {
+    // git refused — the flag still flipped, the card keeps its last tag
   }
 }
 

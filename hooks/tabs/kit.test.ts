@@ -418,15 +418,19 @@ test('S2.1 seg: one pressable per opt, the current `●`-marked; a press reports
       expect(labels).toContain('○ ask')
       expect(labels).toContain('○ never')
     } else {
-      // at 36 the strip yields cells to the pick press (R3 HIGH 1) and stays
-      // pressable with the full values behind the short words
-      expect(labels.some(l => l.startsWith('●'))).toBe(true)
+      // at 36 the longest-first shrink takes one cell each off never, then
+      // auto (the changed marker costs its cell): exact short words, every
+      // option still pressable behind its full value
+      expect(labels).toContain('● aut')
+      expect(labels).toContain('○ ask')
+      expect(labels).toContain('○ neve')
     }
     expect(buttonsIn(root).every(b => b.props.hotkey === undefined)).toBe(true) // glyphs, not letters
 
     const chosen: string[] = []
     const live = node(SettingRow(stubEls(), field, settingCtx({ cols, onChoose: v => { chosen.push(v) } })))
-    // the shown word may be shrunk at 36 cols; it stays a prefix of the full value
+    // a shown word stays a prefix of its full value (shrunk at 36 cols), so
+    // the press still resolves to the option behind it
     const shown = (label: unknown): string => String(label).replace(/^[●○] /, '')
     const btnFor = (full: string) =>
       buttonsIn(live).find(b => { const w = shown(b.props.label); return w !== '' && full.startsWith(w) })
@@ -484,8 +488,7 @@ test('S2.1 select: closed `value ▾` toggles the option list below (current `�
   }
 })
 
-test('S2.1 text: the native Input carries the label (● when changed), value and onEdit on both field chains', () => {
-  const field: SettingField = {
+test('S2.1 text: the native Input carries the label (● when changed), value and onEdit on both field chains', () => {  const field: SettingField = {
     key: 'reviewer', label: 'Fallback reviewer', type: 'text', value: 'claude sonnet', default: 'opus',
     help: 'Which model reviews when the pick is exhausted', editable: true,
   }
@@ -570,4 +573,33 @@ test('S2.1 fallback: no Input/Select in the element table → dim value + `edit 
     expect(selText.includes('default')).toBe(false) // nothing to reset
     expect(buttonsIn(sel).map(b => String(b.props.label))).toEqual(['Plugin version']) // the open press; no reset on read-only
   }
+})
+
+test('LOW: a text row caps its label so label + Input fit 36 cols', () => {
+  const field: SettingField = {
+    key: 'branch', label: 'Integration branch name lane', type: 'text', value: 'main', default: 'main',
+    help: 'Lanes merge here', editable: true,
+  }
+  // the label budget leaves the minimum Input beside it (plain chrome + gap)
+  const budget = (cols: number): number => Math.max(1, cols - 12 - 3)
+  for (const cols of [46, 36] as const) {
+    const root = node(SettingRow(fieldEls(), field, settingCtx({ cols })))
+    everyRowFits(root, cols)
+    const pick = buttonsIn(root).find(b => String(b.props.key).endsWith('-pick'))
+    expect(pick, `the label press at ${cols}`).toBeDefined()
+    expect(String(pick?.props.label ?? '').length, `label capped at ${cols}`).toBeLessThanOrEqual(budget(cols))
+    // the changed marker rides inside the same budget
+    const changed = buttonsIn(node(SettingRow(fieldEls(), field, settingCtx({ cols, changed: true })))).find(b =>
+      String(b.props.key).endsWith('-pick'))
+    expect(String(changed?.props.label ?? '').startsWith('● '), `changed marker at ${cols}`).toBe(true)
+    expect(String(changed?.props.label ?? '').length, `changed label capped at ${cols}`).toBeLessThanOrEqual(budget(cols))
+  }
+  // the 28-char label draws whole at 46 (budget 31) and yields at 36 (budget 21)
+  const glyph = (cols: number): string => {
+    const pick = buttonsIn(node(SettingRow(fieldEls(), field, settingCtx({ cols })))).find(b =>
+      String(b.props.key).endsWith('-pick'))
+    return String(pick?.props.label ?? '')
+  }
+  expect(glyph(46)).toBe('Integration branch name lane')
+  expect(glyph(36)).toBe('Integration branch n…')
 })
