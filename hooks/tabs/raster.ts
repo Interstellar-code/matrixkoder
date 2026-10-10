@@ -155,3 +155,14 @@ export function pickBar(els: Els, key: string, spec: RasterSpec, fallback: Rende
   if (!('Raster' in els)) return fallback
   return els.Raster({ key, columns: spec.columns, rows: spec.rows, cells: spec.cells })
 }
+
+/** S2.3: the element table the tabs render with under the `raster` userConfig
+ *  option. Only an explicit `false` drops the Raster — anything else (absent,
+ *  true) keeps the table whole — so `pickBar` above falls back to its
+ *  eighth-block bar exactly as on a surface with no Raster. */
+export function withRaster(els: Els, raster: unknown): Els {
+  if (raster !== false) return els
+  if (!('Raster' in els)) return els
+  const { Raster: _drop, ...rest } = els
+  return rest as Els
+}

@@ -225,3 +225,237 @@ export function TreeRow(els: Els, opts: {
     </Box>
   )
 }
+
+/** ── S2.1 · the Settings tab's setting rows ─────────────────────────── */
+
+/** The value shapes a settings row can hold. */
+export type SettingType = 'bool' | 'num' | 'seg' | 'select' | 'text'
+
+/** One option of a seg/select field: its value and its one-line note. */
+export type SettingOpt = { readonly value: string; readonly note: string }
+
+/** One settings row's data. Everything the row draws comes from here — it
+ *  never reads config, state or scripts (C10); every change leaves through
+ *  a SettingCtx callback. */
+export type SettingField = {
+  readonly key: string
+  readonly label: string
+  readonly type: SettingType
+  readonly value: string | number | boolean
+  readonly default: string | number | boolean
+  readonly min?: number
+  readonly max?: number
+  readonly unit?: string
+  readonly pct?: boolean
+  readonly opts?: readonly SettingOpt[]
+  readonly help: string
+  readonly editable: boolean
+  readonly why?: string
+}
+
+/** What the tab hands a row: the pane width, the selection / dirty / open
+ *  view state, and one callback per interaction. `onPick` is the row-level
+ *  press the tab wires to its own list selection — no kit control fires it
+ *  (rows are selected by the pane's nav, not by a control the kit draws). */
+export type SettingCtx = {
+  readonly cols: number
+  readonly selected: boolean
+  readonly changed: boolean
+  readonly open: boolean
+  readonly onPick: () => void
+  readonly onToggle: () => void
+  readonly onInc: () => void
+  readonly onDec: () => void
+  readonly onChoose: (value: string) => void
+  readonly onToggleOpen: () => void
+  readonly onEdit: (value: string) => void
+  readonly onReset: () => void
+}
+
+/** a bool value as the row words it (the toggle chip, the default line). */
+const onOff = (v: boolean): string => (v ? 'on' : 'off')
+
+/** a field's value (or default) as the row draws it: bool → on/off, num →
+ *  the number plus its unit, anything else → the string itself. */
+const settingText = (field: SettingField, pick: 'value' | 'default'): string => {
+  const v = pick === 'value' ? field.value : field.default
+  if (typeof v === 'boolean') return onOff(v)
+  if (field.type === 'num') return `${v}${field.unit ?? ''}`
+  return String(v)
+}
+
+/** `…`-truncate to a budget of at least one cell (TreeRow's rule). */
+const ellipsize = (s: string, budget: number): string =>
+  s.length > budget ? `${s.slice(0, Math.max(0, budget - 1))}…` : s
+
+/** a bracketed Button's drawn width (`[ label ]` — ActionButtons' math). */
+const settingBtnW = (label: string): number => label.length + 4
+
+/** a plain Button's drawn width (no brackets; +2 keeps the budget honest). */
+const settingPlainW = (label: string): number => label.length + 2
+
+/** One settings row (plan settings-tab S2.1, Settings.dc.html's rows):
+ *  the label left, the control right, one logical row that fits `cols` (46
+ *  base, 36 compact — the label yields with `…`); a changed value prefixes
+ *  the label with `●` in the warn colour; the selected row adds a second
+ *  dim line with the help, `default <X>` and an `r reset` ActionButton.
+ *
+ *  Variants: bool = a pressable toggle chip `◉ on` / `○ off`; num = a
+ *  `− value +` stepper, plus a SmoothBar at value/max when `pct`; seg = one
+ *  pressable per option with the current one `●`-marked; select = a closed
+ *  `value ▾` pressable that toggles the option list below (current `●`,
+ *  every option pressable); text = the native Input (S2.0: present on
+ *  terminal + desktop). A field whose surface carries no Input/Select
+ *  (mobile) draws the dim value plus an `edit in file` note instead of
+ *  crashing; a non-editable row draws the dim value, and its selected
+ *  second line is the `why` (or help), not a reset control. Glyphs never
+ *  take a pane hotkey — `r` for reset is the one letter allowed (the
+ *  Settings design reserves s/x/r/f; scopes hold 1-8). */
+export function SettingRow(els: Els, field: SettingField, ctx: SettingCtx): RenderElement {
+  const { Box, Text } = els
+  const key = `set-${field.key}`
+  const val = settingText(field, 'value')
+
+  /** the main row: marker (when changed) + truncated label + control, the
+   *  widths budgeted so the whole row fits ctx.cols. */
+  const rowOf = (ctrl: RenderElement, ctrlW: number): RenderElement => {
+    const gaps = ctx.changed ? 2 : 1
+    const budget = Math.max(1, ctx.cols - ctrlW - gaps - (ctx.changed ? 1 : 0))
+    return (
+      <Box flexDirection="row" justifyContent="space-between" gap={1}>
+        {ctx.changed && <Text color={ROLE.warn.fg}>●</Text>}
+        <Text>{ellipsize(field.label, budget)}</Text>
+        {ctrl}
+      </Box>
+    )
+  }
+
+  /** the dim `value · edit in file` control of a surface with no field
+   *  element (S2.0: mobile carries neither Input nor Select). */
+  const fileNote = (): RenderElement => (
+    <Box flexDirection="row" gap={1}>
+      <Text dimColor={true}>{val}</Text>
+      <Text dimColor={true}>edit in file</Text>
+    </Box>
+  )
+  const fileNoteW = val.length + 1 + 'edit in file'.length
+
+  let main: RenderElement
+  let openList: RenderElement | false = false
+  if (!field.editable) {
+    // read-only: the dim value instead of a control; the selected line is
+    // the why (or help), not a default + reset
+    main = rowOf(<Text dimColor={true}>{val}</Text>, val.length)
+  } else if (field.type === 'text') {
+    if ('Input' in els) {
+      const { Input } = els
+      // the wizard's native call shape: the label rides the field (the
+      // changed `●` rides it too — a Text colour cannot)
+      main = (
+        <Input
+          key={key} label={ctx.changed ? `● ${field.label}` : field.label} value={String(field.value)}
+          onInput={v => ctx.onEdit(v)} onSubmit={v => ctx.onEdit(v)}
+        />
+      )
+    } else {
+      main = rowOf(fileNote(), fileNoteW)
+    }
+  } else if (field.type === 'bool') {
+    const on = field.value === true
+    main = rowOf(
+      ActionButton(els, { key: `${key}-tog`, glyph: on ? '◉' : '○', word: onOff(on), onPress: ctx.onToggle }),
+      settingBtnW(`${on ? '◉' : '○'} ${onOff(on)}`),
+    )
+  } else if (field.type === 'num') {
+    // % bar: wide panes get 10 cells, compact 6
+    const barW = ctx.cols >= 42 ? 10 : 6
+    const max = field.max ?? 100
+    const n = Number(field.value)
+    main = rowOf(
+      <Box flexDirection="row" gap={1}>
+        {ActionButton(els, { key: `${key}-dec`, glyph: '−', word: '', onPress: ctx.onDec })}
+        <Text>{val}</Text>
+        {ActionButton(els, { key: `${key}-inc`, glyph: '+', word: '', onPress: ctx.onInc })}
+        {field.pct === true && SmoothBar(els, { pct: Number.isFinite(n) && max > 0 ? (n / max) * 100 : 0, width: barW, role: 'live' })}
+      </Box>,
+      val.length + 12 + (field.pct === true ? 1 + barW : 0), // `[ − ]` + `[ + ]` + the two gaps + the bar's
+    )
+  } else if (field.type === 'seg') {
+    const opts = field.opts ?? []
+    // the option words shrink (longest first) until the label keeps a cell
+    let words = opts.map(o => o.value)
+    const segW = (ws: readonly string[]): number =>
+      ws.reduce((n, w) => n + settingBtnW(`○ ${w}`), 0) + Math.max(0, ws.length - 1)
+    while (ctx.cols - segW(words) - (ctx.changed ? 3 : 1) < 1 && words.some(w => w.length > 1)) {
+      let longest = 0
+      for (let i = 1; i < words.length; i++) {
+        if ((words[i] ?? '').length > (words[longest] ?? '').length) longest = i
+      }
+      words = words.map((w, i) => (i === longest ? w.slice(0, -1) : w))
+    }
+    main = rowOf(
+      <Box flexDirection="row" gap={1}>
+        {opts.map((o, i) => ActionButton(els, {
+          key: `${key}-seg-${o.value}`,
+          glyph: o.value === String(field.value) ? '●' : '○',
+          word: words[i] ?? o.value,
+          onPress: () => ctx.onChoose(o.value),
+        }))}
+      </Box>,
+      segW(words),
+    )
+  } else {
+    // select: S2.0 gates on the surface carrying the element; without it
+    // the value is dim text plus the `edit in file` note
+    if (!('Select' in els)) {
+      main = rowOf(fileNote(), fileNoteW)
+    } else {
+      main = rowOf(
+        ActionButton(els, { key: `${key}-sel`, glyph: String(field.value), word: '▾', plain: true, onPress: ctx.onToggleOpen }),
+        settingPlainW(`${String(field.value)} ▾`),
+      )
+      if (ctx.open) {
+        openList = (
+          <Box flexDirection="column">
+            {(field.opts ?? []).map(o => {
+              const cur = o.value === String(field.value)
+              return (
+                <Box flexDirection="row" gap={1}>
+                  <Text color={cur ? ROLE.live.fg : undefined} dimColor={!cur}>{cur ? '●' : '○'}</Text>
+                  {ActionButton(els, { key: `${key}-pick-${o.value}`, glyph: o.value, word: '', plain: true, onPress: () => ctx.onChoose(o.value) })}
+                  {o.note !== '' && <Text dimColor={true}>{ellipsize(o.note, Math.max(1, ctx.cols - o.value.length - 7))}</Text>}
+                </Box>
+              )
+            })}
+          </Box>
+        )
+      }
+    }
+  }
+
+  // the selected row's second line: dim help + `default <X> · r reset`
+  // (non-editable: the why/or help alone — nothing to reset)
+  let helpLine: RenderElement | false = false
+  if (ctx.selected) {
+    if (!field.editable) {
+      helpLine = <Text dimColor={true}>{ellipsize(field.why ?? field.help, ctx.cols)}</Text>
+    } else {
+      const tail = ` · default ${settingText(field, 'default')} · `
+      const reset = ActionButton(els, { key: `${key}-reset`, glyph: 'r', word: 'reset', tone: 'quiet', onPress: ctx.onReset })
+      helpLine = (
+        <Box flexDirection="row" gap={1}>
+          <Text dimColor={true}>{ellipsize(field.help, Math.max(1, ctx.cols - settingBtnW('r reset') - 1 - tail.length))}{tail}</Text>
+          {reset}
+        </Box>
+      )
+    }
+  }
+
+  return (
+    <Box flexDirection="column">
+      {main}
+      {openList}
+      {helpLine}
+    </Box>
+  )
+}

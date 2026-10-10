@@ -20,10 +20,12 @@ import { mockRunHeader, mockTabCounts, stageWord, STAGE_TOTAL } from './tabs/hea
 import type { RunHeaderData } from './tabs/header'
 import { Chip } from './tabs/kit'
 import { PALETTE } from './tabs/palette'
+import { withRaster } from './tabs/raster'
 import { EventsTab, eventsView } from './tabs/events'
 import { LanesTab, lanesView } from './tabs/lanes'
 import { OverviewTab, overviewView } from './tabs/overview'
 import { PlanTab, planView } from './tabs/plan'
+import { SettingsTab, settingsView } from './tabs/settings'
 import { UsageTab, usageView } from './tabs/usage'
 import { WaitingTab, waitingView } from './tabs/waiting'
 import { chipText, toastsFor } from './status'
@@ -65,7 +67,29 @@ const TABS: readonly { key: MkDashTab; hotkey: string; label: string }[] = [
   { key: 'events', hotkey: 'e', label: 'Events' },
   { key: 'waiting', hotkey: 'w', label: 'Waiting' },
   { key: 'old', hotkey: '0', label: 'Old' },
+  { key: 'settings', hotkey: '9', label: 'Settings' },
 ]
+
+/** S2.3: the `hiddenTabs` userConfig value (a comma list of tab keys or
+ *  labels) as a set of tab keys. Unknown names are ignored; Settings is never
+ *  hidden even when named. */
+function hiddenTabKeys(hiddenTabs: unknown): Set<MkDashTab> {
+  if (typeof hiddenTabs !== 'string' || hiddenTabs.trim() === '') return new Set()
+  const out = new Set<MkDashTab>()
+  for (const part of hiddenTabs.split(',')) {
+    const name = part.trim().toLowerCase()
+    if (name === '') continue
+    const tab = TABS.find(t => t.key === name || t.label.toLowerCase() === name)
+    if (tab != null && tab.key !== 'settings') out.add(tab.key)
+  }
+  return out
+}
+
+/** S2.3: the tabs the bar draws under `hiddenTabs` — Settings always stands. */
+function visibleTabs(hiddenTabs: unknown): readonly { key: MkDashTab; hotkey: string; label: string }[] {
+  const hidden = hiddenTabKeys(hiddenTabs)
+  return TABS.filter(t => !hidden.has(t.key))
+}
 /** compact status words per design §3.7 (`building 12m` → `build 12m`) */
 const STATUS_SHORT: Record<string, string> = {
   building: 'build', verifying: 'verify', dispatched: 'disp', stalled: 'stall', planned: 'plan',
@@ -129,6 +153,18 @@ export function registerDashboard(on: On, options: PluginOptions): void {
       }
     }
     await startLoop($, options, e.cwd) // the session's own words for where it runs; timers capture it
+    // S2.3: `defaultTab` picks the opening tab — a known visible tab stands,
+    // anything else keeps the Old default.
+    const opening = typeof options.defaultTab === 'string'
+      ? visibleTabs(options.hiddenTabs).find(t => t.key === options.defaultTab)
+      : undefined
+    if (opening != null) {
+      try {
+        await update($, dashTabAtom, () => opening.key)
+      } catch {
+        // the atom write failed — the pane keeps the Old default
+      }
+    }
     return next(e)
   })
 
@@ -173,6 +209,10 @@ export function registerDashboard(on: On, options: PluginOptions): void {
     const viewState = await read($, viewStateAtom)
     const cols = e.props.bodyColumns || COLUMNS
     const compact = cols < NARROW
+    // S2.3: `raster: false` hands the tabs a table without Raster, so every
+    // pickBar falls back to its eighth-block bar.
+    const tabEls = withRaster(els, options.raster)
+    const tabs = visibleTabs(options.hiddenTabs)
     // V0.4: the header is the snapshot's run on Old, the mock world on the six mock tabs
     const header = dashTab === 'old' ? realRunHeader(snap) : mockRunHeader()
     const counts = dashTab === 'old' ? realTabCounts(snap.run) : mockTabCounts()
@@ -199,22 +239,24 @@ export function registerDashboard(on: On, options: PluginOptions): void {
             The bar and the rule share a gap-less column so the rule sits
             directly under the bar; the pane's own gap keeps the space after it. */}
         <Box flexDirection="column">
-          {TabBar(els, $, dashTab, counts)}
+          {TabBar(els, $, dashTab, counts, tabs)}
           <Text color={PALETTE.line}>{'─'.repeat(Math.max(0, cols))}</Text>
         </Box>
         {dashTab === 'old'
           ? OldTab(els, snap, cols, compact)
           : dashTab === 'overview'
-            ? OverviewTab(els, overviewView(), cols, ui)
+            ? OverviewTab(tabEls, overviewView(), cols, ui)
             : dashTab === 'lanes'
-              ? withViewState(LanesTab, els, lanesView(), cols, ui)
+              ? withViewState(LanesTab, tabEls, lanesView(), cols, ui)
               : dashTab === 'plan'
-                ? PlanTab(els, planView(), cols, ui)
-                : dashTab === 'usage'
-                  ? withViewState(UsageTab, els, usageView(), cols, ui)
-                  : dashTab === 'events'
-                    ? withViewState(EventsTab, els, eventsView(), cols, ui)
-                    : withViewState(WaitingTab, els, waitingView(), cols, ui)}
+                ? PlanTab(tabEls, planView(), cols, ui)
+                : dashTab === 'settings'
+                  ? SettingsTab(tabEls, settingsView(), cols, ui)
+                  : dashTab === 'usage'
+                    ? withViewState(UsageTab, tabEls, usageView(), cols, ui)
+                    : dashTab === 'events'
+                      ? withViewState(EventsTab, tabEls, eventsView(), cols, ui)
+                      : withViewState(WaitingTab, tabEls, waitingView(), cols, ui)}
       </Box>
     )
   })
@@ -303,11 +345,11 @@ function wrapToCols(text: string, cols: number): string[] {
  *  `w: !1`) — or the `·` placeholder when it has none (`o: ·`), never its own
  *  letter. At 36 cols the wrapped bar runs to two rows; no row is wider than
  *  the pane. */
-function TabBar(els: Els, $: EngineInterface, dashTab: MkDashTab, counts: Record<MkDashTab, string>) {
+function TabBar(els: Els, $: EngineInterface, dashTab: MkDashTab, counts: Record<MkDashTab, string>, tabs: readonly { key: MkDashTab; hotkey: string; label: string }[]) {
   const { Box, Button } = els
   return (
     <Box flexDirection="row" flexWrap="wrap" gap={1}>
-      {TABS.map(t => {
+      {tabs.map(t => {
         const active = dashTab === t.key
         const count = counts[t.key]
         return (
@@ -344,7 +386,7 @@ function realRunHeader(snap: MkPaneSnapshot): RunHeaderData | null {
 /** The Old tab's tab-bar counts from the same snapshot (the mockup's count
  *  vocabulary): live lanes, done/total, one open decision. */
 function realTabCounts(run: MkRun | null): Record<MkDashTab, string> {
-  const none: Record<MkDashTab, string> = { overview: '', lanes: '', plan: '', usage: '', events: '', waiting: '', old: '' }
+  const none: Record<MkDashTab, string> = { overview: '', lanes: '', plan: '', usage: '', events: '', waiting: '', old: '', settings: '' }
   if (run == null) return none
   const done = run.tasks.filter(t => DONE.has(t.status)).length
   return {
@@ -377,7 +419,7 @@ async function startLoop($: EngineInterface, options: PluginOptions, cwd: string
   timerRegistry.cancelPoll?.()
   timerRegistry.cancelPoll = arm($.clock.every(Math.round(min * 60_000), () => pollUsage($, cwd)))
   timerRegistry.cancelSweep?.()
-  timerRegistry.cancelSweep = arm($.clock.every(SWEEP_INTERVAL_MS, () => sweepLanes($, cwd)))
+  timerRegistry.cancelSweep = arm($.clock.every(SWEEP_INTERVAL_MS, () => sweepLanes($, options, cwd)))
   lastChipText = undefined
   await refreshSafe($, options, cwd) // first load populates pane + chip and never toasts
   const gdir = await globalDirOf($, await homeDir($))
@@ -627,8 +669,9 @@ async function pollUsage($: EngineInterface, cwd: string): Promise<void> {
   }
 }
 
-/** Sweeps armed herdr lanes for silence. Mirrors pollUsage: in-flight guard, interval guard, failures swallowed. */
-async function sweepLanes($: EngineInterface, cwd: string): Promise<void> {
+/** Sweeps armed herdr lanes for silence. Mirrors pollUsage: in-flight guard, interval guard, failures swallowed. S2.3: `mode: 'solo'` runs no orchestration, so the sweep never fires there. */
+async function sweepLanes($: EngineInterface, options: PluginOptions, cwd: string): Promise<void> {
+  if (options.mode === 'solo') return
   if (sweepInFlight) return
   let nowMs = 0
   try {

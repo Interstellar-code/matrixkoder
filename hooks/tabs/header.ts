@@ -53,6 +53,7 @@ export function mockTabCounts(): Record<MkDashTab, string> {
     events: '',
     waiting: waitingCount(WAITING_FIXTURE.options.length > 0 ? 1 : 0),
     old: '',
+    settings: '',
   }
 }
 
