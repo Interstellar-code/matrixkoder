@@ -1331,7 +1331,7 @@ test('S2.3: hotkey 9 switches to the Settings tab and hides Old', { plugins: [wo
   await loadLiveSettings(clock, ui, calls)
   expect(await ui.find({ text: /MOCK · fixture data/ }), 'never mock rows').toBeUndefined()
   expect(await ui.find({ text: /1 Mode/ }), 'the settings scope bar').toBeTruthy()
-  expect(await ui.find({ text: /workflows-v2/ }), 'Old hidden').toBeUndefined()
+  expect(await ui.find({ text: /Checkout v2/ }), 'the real run header, never the mock world').toBeUndefined()
   await ui.press({ key: 'dash-tab-old' })
   expect(await ui.find({ text: /workflows-v2/ }), 'Old is back').toBeTruthy()
 })
@@ -1372,7 +1372,7 @@ test('S2.3: defaultTab opens the pane on that tab', { plugins: [worldFixtures], 
   await loadLiveSettings(clock, ui, calls) // the render fallback loads it, no press needed
   expect(await ui.find({ text: /MOCK · fixture data/ }), 'never mock rows').toBeUndefined()
   expect(await ui.find({ text: /1 Mode/ }), 'the settings scope bar').toBeTruthy()
-  expect(await ui.find({ text: /workflows-v2/ }), 'Old hidden').toBeUndefined()
+  expect(await ui.find({ text: /Checkout v2/ }), 'the real run header, never the mock world').toBeUndefined()
 })
 
 test('S2.3: an unknown or hidden defaultTab keeps the Old default', { plugins: [worldFixtures], options: { defaultTab: 'nope' } }, async ($, on) => {

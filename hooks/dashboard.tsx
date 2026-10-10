@@ -229,8 +229,9 @@ export function registerDashboard(on: On, options: PluginOptions): void {
     const tabEls = withRaster(els, options.raster)
     const tabs = visibleTabs(options.hiddenTabs)
     // V0.4: the header is the snapshot's run on Old, the mock world on the six mock tabs
-    const header = dashTab === 'old' ? realRunHeader(snap) : mockRunHeader()
-    const counts = dashTab === 'old' ? realTabCounts(snap.run) : mockTabCounts()
+    const realTab = dashTab === 'old' || dashTab === 'settings'
+    const header = realTab ? realRunHeader(snap) : mockRunHeader()
+    const counts = realTab ? realTabCounts(snap.run) : mockTabCounts()
     // C12: the tabs' view-state handle. `get` reads the atom's snapshot; `set`
     // writes it and is only ever called from an onPress (C10). `save`/`recheck`
     // are the Settings tab's live wires (S3): the ordered write and the About
