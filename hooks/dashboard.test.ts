@@ -1047,16 +1047,16 @@ test('the tab bar shows the active word and count, the rest hotkey + count, at 4
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   // Old active: the counts come from the snapshot — 3 live lanes, 1/5 done, 1 open decision
-  expect(await tabLabels(ui)).toEqual(['·', '3', '1/5', '·', '·', '!1', 'Old', '·'])
+  expect(await tabLabels(ui)).toEqual(['Overview', 'Lanes 3', 'Plan 1/5', 'Usage', 'Events', 'Waiting !1', 'Old', 'Settings'])
   for (const cols of [36, 46] as const) {
     await ui.press({ key: 'dash-tab-old' })
     await ui.press({ key: 'dash-tab-lanes' })
     await ui.redraw(paneProps(cols))
     const labels = await tabLabels(ui)
-    expect(labels, `at ${cols}`).toEqual(['·', 'Lanes 4', '3/8', '·', '·', '!1', '·', '·'])
+    expect(labels, `at ${cols}`).toEqual(cols === 46 ? ['Overview', 'Lanes 4', 'Plan 3/8', 'Usage', 'Events', 'Waiting !1', 'Old', 'Settings'] : ['·', 'Lanes 4', '3/8', '·', '·', '!1', '·', '·'])
     expect(labels.join(' ')).not.toContain('o: o') // the S0 short labels are gone
     expect(labels.some(l => /^[a-z0-9]$/.test(l)), 'no tab shows its own letter twice').toBe(false)
-    expect(labels.filter(l => l === '·').length, 'count-less tabs carry the placeholder').toBe(5)
+    expect(labels.filter(l => l === '·').length, 'count-less tabs carry the placeholder').toBe(cols === 46 ? 0 : 5)
   }
 })
 
