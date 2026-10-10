@@ -2,6 +2,48 @@
 
 All notable changes to this project. Format: Keep a Changelog; versions: SemVer.
 
+## [0.4.0] - 2026-10-11
+
+### Added
+- **dashboard,settings:** rounded tab buttons, no inner padding, compact scope strip (eaba2d6)
+- **dashboard,settings:** bordered tab and scope buttons, the picked one in blue (6d458df)
+- **dashboard,settings:** full tab names at normal width; every Settings card gets a visible border (8f0d3c9)
+- **dashboard:** open main tab sits on the tint fill like the Settings sub-strip (626c2fa)
+- **settings:** S2c — artboard fills: selected-row highlight and bar, picked segment as tint text, field fill (10a91d9)
+- **settings:** S2c — read-only bools as chips, flush select field, tests follow (2aa154d)
+- **settings:** S2c — artboard labels, card order, usage under Agents, boxed fields, tinted toggle chip (6c1e408)
+- **settings:** S2c — toggles draw as the artboard's tinted on/off chip (17ef67c)
+- **settings:** S2c — artboard header on the Settings tab, find spacing, hotkey labels not doubled (5f4b32d)
+- **settings:** S2c — card headers in muted ink, bordered mode cards, amber unsaved bar, red danger button (2915409)
+- **settings:** S2c — boxed scope strip, find box, segmented strips, bar-left steppers, tighter cards (faae2ff)
+- **mk-builder:** lane-agent skill, mk-builder.py status writer, git-guard wrapper (fa82aa7)
+- **dashboard:** Settings tab reads and writes real config (b65e245)
+- **config:** mk-config.py — one schema, safe yaml patcher, unified config homes (ea7ff7d)
+- **dashboard:** Settings tab — scopes, typed rows, dirty footer, About (99c5f33)
+
+### Fixed
+- **settings:** S2c — text rows right-align their field (384167d)
+- **settings:** S2c — card contents span the card so values right-align (d2b3838)
+- **settings:** S2c — mode option typed as string for the header (9e57533)
+- **settings:** S2b — drop stale cached Settings view and clear old save message on reload (6e01c22)
+- **settings:** S2b — stale edits of read-only agents are never dirty or saved (78b29e6)
+- **settings:** S2b — short seg words, real header on Settings, read-only picks for agents without a model list (e8565de)
+- **mk-builder:** MB2 re-review r2 — attached short-option values never hide --amend (e99dc96)
+- **mk-builder:** MB2 review r1 — guard catches long-option amend, safe ids, worktree exclude (2f1a0b7)
+- **dashboard:** Settings tab review r1 — CLI errors shown, real focus hook, no migrate without yaml (387f522)
+- **config:** S1 re-review r3 — real stalled-reply test, self-tests pinned to temp data (0c07f95)
+- **config:** S1 re-review r2 — migrate emits valid yaml, reset gate trusts idle pane (607ab8e)
+- **config:** S1 review r1 — CRLF-safe patcher, quoted comments, safe .bak, refuse duplicates, wizard keeps settings (878017d)
+- **dashboard:** Settings tab review r1 — real row selection, dirty vs loaded value, width, typing hotkeys (f6ec0d5)
+
+### Docs
+- **mk-builder:** MB1 review r1 — role in identity, reader inputs match the watch, todo-list rule, citations (1d8cf51)
+- **mk-builder:** status-file contract v1, lane-agent rules, git-wrapper contract (c2ee953)
+
+### Other
+- **settings:** S2c — assertions follow the new look (74f9f8b)
+- **selftest:** run child-skills/*/scripts self-tests too (0230226)
+
 ## [0.3.0] - 2026-10-10
 
 ### Added
