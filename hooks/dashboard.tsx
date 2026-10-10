@@ -263,7 +263,9 @@ export function registerDashboard(on: On, options: PluginOptions): void {
         {snap.error && (
           <Text color="yellow" bold={true}>⚠ {snap.error}</Text>
         )}
-        {header != null && RunHeader(els, header, cols)}
+        {dashTab === 'settings'
+          ? BrandHeader(els, cols, settingsLive?.about.installed ?? '', settingsLive?.about.latest ?? '', options.mode)
+          : header != null && RunHeader(els, header, cols)}
         {/* V1.4: the engine has no per-side borders, so the header and tab bar
             read as one framed block above the tab's Cards through this rule.
             The bar and the rule share a gap-less column so the rule sits
@@ -339,6 +341,30 @@ function SettingsLoading(els: Els, cols: number, loadError: string): RenderEleme
     <Box flexDirection="column" width={cols} gap={1}>
       {loadError !== '' && <Text color={ROLE.err.fg}>{`⚠ ${loadError.length > cols ? `${loadError.slice(0, Math.max(0, cols - 2))}…` : loadError}`}</Text>}
       {loadError === '' && <Text dimColor={true}>loading settings…</Text>}
+    </Box>
+  )
+}
+
+/** The Settings artboard's header (Settings.dc.html): the two-tone logo, the
+ *  MATRIXKODER wordmark and the version chip, then the mode chip and, when a
+ *  newer tag exists, the amber update chip. */
+function BrandHeader(els: Els, cols: number, installed: string, latest: string, mode: string): RenderElement {
+  const { Box, Text } = els
+  const v = (x: string): string => (x === '' ? '' : x.startsWith('v') ? x : `v${x}`)
+  const update = latest !== '' && latest !== installed
+  return (
+    <Box flexDirection="column" width={cols}>
+      <Box flexDirection="row" justifyContent="space-between" gap={1}>
+        <Box flexDirection="row" gap={1}>
+          <Box flexDirection="row"><Text color={PALETTE.blue}>█</Text><Text color={PALETTE.grn}>█</Text></Box>
+          <Text bold={true}>MATRIXKODER</Text>
+        </Box>
+        {installed !== '' && Chip(els, { label: v(installed), role: 'live', solid: true })}
+      </Box>
+      <Box flexDirection="row" gap={1}>
+        {Chip(els, { label: mode.toUpperCase(), role: 'live' })}
+        {update && Chip(els, { label: `↑ ${v(latest)} ready`, role: 'warn' })}
+      </Box>
     </Box>
   )
 }
