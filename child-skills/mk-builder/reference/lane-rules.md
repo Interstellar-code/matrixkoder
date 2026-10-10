@@ -3,12 +3,13 @@
 Frozen by the MB1 reference round (plan `mk-builder-skill`; sibling of `status-contract.md`, frozen
 by MB1.1), amended in round 2 against review r1. The audience is the lane agent itself, through
 the future `child-skills/mk-builder/SKILL.md` (MB2): a brief says "follow lane-rules.md" instead
-of restating these rules. This folder (`child-skills/`) is not a registered skill. Everything here
-was already true as brief text (`skills/matrixkoder/templates/brief.md:21-30`, `:13`, `:32-48`) or
+of restating these rules. Only the stamp below changed in MB2; no rule text did. This folder
+(`child-skills/`) is not a registered skill. Everything here was already true as brief text
+(`skills/matrixkoder/templates/brief.md:21-30`, `:13`, `:32-48`) or
 review template (`skills/matrixkoder/templates/review.md`); this file makes it one numbered,
 checkable contract. Rules whose remainder stays per-brief say **(B)** and carry a pointer to §4 —
 §4 names the part, never its content. Every `file:line` below was re-verified in this tree at
-`c2ee953`. Source: `.matrixkoder/plans/mk-builder-skill-research.md` Part B, rows classed `S`
+`1d8cf51`. Source: `.matrixkoder/plans/mk-builder-skill-research.md` Part B, rows classed `S`
 (1-12, 15, 16); §5 maps each row to exactly one rule. Rules marked **new** have no Part B row.
 
 ## 1. Shared — every lane agent, builder or reviewer

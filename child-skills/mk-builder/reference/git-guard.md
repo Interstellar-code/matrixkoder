@@ -6,8 +6,8 @@ is the contract both build against, and the deterrent boundary documented for MB
 folder (`child-skills/`) is not a registered skill. The refused set is exactly the one
 `hooks/guards.ts:154-225` (`gitBan`) already encodes Claude-side — the wrapper extends the same
 ban to non-Claude lanes (OpenCode, Codex, AGY). Every `file:line` below was re-verified in this
-tree at `4df9b9c`. The wrapper is a deterrent, not a sandbox — `hooks/guards.ts:3` says so of the
-scanner and the same holds here (§7).
+tree at `1d8cf51`. The wrapper is a deterrent, not a sandbox — `hooks/guards.ts:3` says so of the
+scanner and the same holds here (§7). Only G21's why and the stamp below changed in MB2.
 
 ## 1. Placement and dispatch
 
@@ -50,7 +50,10 @@ scanner and the same holds here (§7).
   `--message`, `--file`, `--author`, `--date`, `--template`, `--reuse-message`,
   `--reedit-message`, `--fixup`, `--squash`, `--trailer`, `--cleanup`,
   `hooks/guards.ts:144-147`) are skipped with their values, so `-m '--amend'` (message text) does
-  not refuse; the scan stops at the first `--` (`:182-187`).
+  not refuse; short-option clusters are walked left to right: reaching a value-taking letter
+  (`m`, `F`, `C`, `c`, `t`) skips the next word only if it is the last character; if characters
+  follow it in the same word (an attached value such as `-mfoot` or `-m"fix test"`), nothing is
+  skipped; the scan stops at the first `--` (`:182-187`).
 - **G12.** `git push` — refused on any of: an option starting `--force` (includes
   `--force-with-lease`); a short option containing `f`; any word starting `+` (the `+ref:ref`
   refspec form); `--delete`; a short option containing `d`; `--mirror`; `--prune`; a word matching
@@ -66,7 +69,7 @@ scanner and the same holds here (§7).
 - **G16.** `git reflog expire` and `git reflog delete` — refused; other `reflog` subcommands pass
   (`hooks/guards.ts:216-217`).
 - **G17.** `git update-ref` with a short option containing `d` — refused
-  (`hooks/guards.ts:218-219`).
+  (`hooks/guards.ts:218-219`). (Note: `update-ref --stdin` is a known bypass; see §7 G31).
 - **G18.** `git gc` with `--prune` or `--prune=<any>` (includes `--prune=now`) — refused; plain
   `git gc` passes (`hooks/guards.ts:220-223`).
 
@@ -100,9 +103,11 @@ scanner and the same holds here (§7).
   (`which -a git`, research `[local]`,
   `/Users/rohits/Development/matrixkoder/.matrixkoder/plans/mk-builder-skill-research.md:39`) —
   so a fixed path can pin the wrong install and goes stale at the next update; `realpath` on both
-  sides makes a symlinked wrapper directory match, and dropping only equal entries (rather than
-  every directory containing a `git`) keeps a real git reachable when the wrapper's own directory
-  is the only one on `PATH`. The scanner's location-independent analogue is `base()` stripping any
+  sides makes a symlinked wrapper directory match, and dropping only entries equal to that
+  directory — rather than every directory that merely holds a `git` — keeps the *other* install
+  reachable. A PATH holding nothing but the wrapper's own directory has no entry left and exits
+  127 by the rule above; that is the one case where no real git is reachable, and it is a setup
+  error, not a lookalike. The scanner's location-independent analogue is `base()` stripping any
   path prefix (`hooks/guards.ts:10`). A plain `command -v git` after the drop is **not** an
   alternative spelling: the `[ -x ]` walk is the one method a test can pin.
 
@@ -145,3 +150,6 @@ scanner and the same holds here (§7).
   `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.<n> GIT_CONFIG_VALUE_0=<cmd>` aliases `<n>` for the
   process lifetime (`GIT_CONFIG_PARAMETERS` is the child-process form); the wrapper sees `<n>` as
   the subcommand.
+- **G31.** `git update-ref --stdin` can carry `delete` instructions via standard input without
+  passing `-d` on the command line; G17 and `hooks/guards.ts:218-219` inspect arguments only and
+  match `-d`, so `--stdin` bypasses ref deletion detection without triggering the option guard.
