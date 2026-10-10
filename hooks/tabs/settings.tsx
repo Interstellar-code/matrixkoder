@@ -576,7 +576,7 @@ function GroupCards(els: Els, view: SettingsView, scopeId: SettingsScopeId, W: n
   return (
     <Box flexDirection="column">
       {groups.map(({ g, rows }) => Card(els, {}, (
-        <Box key={`set-group-${g.title}`} flexDirection="column">
+        <Box key={`set-group-${g.title}`} flexDirection="column" width={W}>
           {SecHead(els, { label: g.title, right: g.right })}
           {rows.map(r => SettingRow(els, kitField(r, currentValue(r, ui), W), rowCtx(r, W, ui, noHk)))}
         </Box>
@@ -593,7 +593,7 @@ function ModeCards(els: Els, view: SettingsView, W: number, ui: TabUi | undefine
   return (
     <Box flexDirection="column">
       {Card(els, {}, (
-        <Box flexDirection="column">
+        <Box flexDirection="column" width={W}>
           {SecHead(els, { label: 'operating mode', right: 'radio' })}
           {view.modes.map(m => {
             const cur = m.id === mode
@@ -616,7 +616,7 @@ function ModeCards(els: Els, view: SettingsView, W: number, ui: TabUi | undefine
         </Box>
       ))}
       {mode === 'hive' && Card(els, { role: 'live' }, (
-          <Box flexDirection="column">
+          <Box flexDirection="column" width={W}>
             {SecHead(els, { label: 'hive · projects', right: 'projects.json' })}
             {view.projects.map(p => {
               const on = hiveEditOf(ui, p.name) ?? p.on
@@ -664,7 +664,7 @@ function ModelsCards(els: Els, view: SettingsView, W: number, ui: TabUi | undefi
         const provBudget = Math.max(1, W - cat.name.length - `${picks.length}/4`.length - 2 - 4)
         const orderText = picks.length > 0 ? picks.map(shortModel).join(' → ') : 'none picked'
         return Card(els, { role: off ? undefined : picks.length > 0 ? 'live' : 'warn' }, (
-          <Box key={`set-agent-${cat.id}`} flexDirection="column">
+          <Box key={`set-agent-${cat.id}`} flexDirection="column" width={W}>
             <Box flexDirection="row" justifyContent="space-between" gap={1}>
               <Box flexDirection="row" gap={1}>
                 <Text bold={true} color="subtle">{cat.name}</Text>
@@ -722,7 +722,7 @@ function AboutBody(els: Els, view: SettingsView, W: number, ui: TabUi | undefine
     <Box flexDirection="column">
       {GroupCards(els, view, 'about', W, ui, q, noHk)}
       {Card(els, { role: 'live' }, (
-        <Box flexDirection="column">
+        <Box flexDirection="column" width={W}>
           {SecHead(els, { label: 'version', right: 'plugin.json · git tags' })}
           <Box flexDirection="row" justifyContent="space-between" gap={1}>
             <Text dimColor={true}>installed</Text>
@@ -746,7 +746,7 @@ function AboutBody(els: Els, view: SettingsView, W: number, ui: TabUi | undefine
         </Box>
       ))}
       {Card(els, {}, (
-        <Box flexDirection="column">
+        <Box flexDirection="column" width={W}>
           {SecHead(els, { label: `what's new · v${a.latest}`, right: `${String(a.commits)} commits` })}
           {a.whatsNew.map(w => (
             <Box key={`set-whatsnew-${w.line}`} flexDirection="row" gap={1}>
