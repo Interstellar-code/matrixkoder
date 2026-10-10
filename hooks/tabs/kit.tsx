@@ -144,15 +144,15 @@ export function ActionButton(els: Els, spec: ActionSpec): RenderElement {
 export function Segment(els: Els, opts: { key: string; label: string; on: boolean; flat?: boolean; hotkey?: string; static?: true; boxed?: true; onPress: () => void }): RenderElement {
   const { Box, Text } = els
   const edge = (inner: RenderElement): RenderElement => opts.boxed === true
-    ? <Box key={`${opts.key}-edge`} borderStyle="single" borderColor={opts.on ? ROLE.live.fg : '#5b6776'}>{inner}</Box>
+    ? <Box key={`${opts.key}-edge`} borderStyle="round" borderColor={opts.on ? ROLE.live.fg : '#5b6776'}>{inner}</Box>
     : inner
   // the picked segment of a strip needs no press: plain bold blue text on the tint (a Button's label colour is the engine's)
   if (opts.on && opts.static === true) {
-    return edge(<Text key={`${opts.key}-box`} bold={true} color={ROLE.live.fg} backgroundColor={ROLE.live.tint}>{` ${opts.hotkey != null ? `${opts.hotkey}: ` : ''}${opts.label} `}</Text>)
+    return edge(<Text key={`${opts.key}-box`} bold={true} color={ROLE.live.fg} backgroundColor={ROLE.live.tint}>{opts.boxed === true ? `${opts.hotkey != null ? `${opts.hotkey}: ` : ''}${opts.label}` : ` ${opts.hotkey != null ? `${opts.hotkey}: ` : ''}${opts.label} `}</Text>)
   }
   const bg = opts.on ? ROLE.live.tint : opts.flat === true ? undefined : PALETTE.btn
   return edge(
-    <Box key={`${opts.key}-box`} backgroundColor={bg} paddingX={1}>
+    <Box key={`${opts.key}-box`} backgroundColor={bg} paddingX={opts.boxed === true ? 0 : 1}>
       {ActionButton(els, { key: opts.key, glyph: opts.label, word: '', plain: true, hotkey: opts.hotkey, tone: opts.on ? 'primary' : 'default', onPress: opts.onPress })}
     </Box>,
   )

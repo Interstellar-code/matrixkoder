@@ -29,7 +29,7 @@ const textOf = (n: unknown): string => ((n as { children?: unknown[] }).children
 
 /** every kit Card in the drawn tree: a round-bordered panel Box. */
 const cardsOf = (drawn: unknown): { props: Record<string, unknown> }[] =>
-  nodesOf(drawn, 'Box').filter(b => b.props.borderStyle === 'round')
+  nodesOf(drawn, 'Box').filter(b => b.props.borderStyle === 'round' && !/^(dash-tab|set-scope)-/.test(String(b.props?.key ?? '')))
 
 /** every type Chip: a tinted Text, in document order. */
 const typeChipsOf = (drawn: unknown): { backgroundColor: unknown; children: unknown[] }[] =>
@@ -100,7 +100,7 @@ function textOwn(n: unknown): string[] {
 // included — plus the gap columns between its children. A single Text node
 // staying under `cols` proves nothing about the row it sits in.
 
-type DrawnNode = { type?: string; props?: { flexDirection?: string; gap?: number; borderStyle?: string }; children?: unknown[] }
+type DrawnNode = { type?: string; props?: { key?: string; flexDirection?: string; gap?: number; borderStyle?: string }; children?: unknown[] }
 
 /** a Text's whole drawn width: its own strings plus any nested Text's strings. */
 function textWidth(node: unknown): number {
@@ -131,7 +131,7 @@ function rowWidths(root: unknown): { width: number; inCard: boolean }[] {
   const walk = (node: unknown, inCard: boolean): void => {
     if (typeof node !== 'object' || node === null) return
     const n = node as DrawnNode
-    const card = inCard || (n.type === 'Box' && n.props?.borderStyle === 'round')
+    const card = inCard || (n.type === 'Box' && n.props?.borderStyle === 'round' && !/^(dash-tab|set-scope)-/.test(String(n.props?.key ?? '')))
     if (n.type === 'Text' || (n.type === 'Box' && n.props?.flexDirection === 'row')) {
       out.push({ width: widthOf(node), inCard: card })
     }

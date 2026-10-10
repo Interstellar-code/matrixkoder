@@ -77,7 +77,7 @@ function fakeUi(): TabUi & { map: Map<string, string> } {
 const WIDTHS = [36, 40, 46, 56] as const
 
 /** a Card: a Box with a round border. */
-const cardsIn = (root: unknown): N[] => allOf(root, 'Box').filter(b => b.props.borderStyle === 'round')
+const cardsIn = (root: unknown): N[] => allOf(root, 'Box').filter(b => b.props.borderStyle === 'round' && !/^(dash-tab|set-scope)-/.test(String(b.props?.key ?? '')))
 
 type Drawn = { type?: string; props?: { flexDirection?: string; gap?: number; label?: string; plain?: boolean }; children?: unknown[] }
 
@@ -153,7 +153,7 @@ test('the decision card is the only bordered box and the recommended option is m
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   await ui.press({ key: 'dash-tab-waiting' })
   const boxes = await ui.findAll({ type: 'Box' })
-  expect(boxes.filter(b => b.props.borderStyle === 'round').length, 'exactly one bordered box').toBe(1)
+  expect(boxes.filter(b => b.props.borderStyle === 'round' && !/^(dash-tab|set-scope)-/.test(String(b.props?.key ?? ''))).length, 'exactly one bordered box').toBe(1)
   expect(await ui.find({ text: /recommended/ }), 'recommended option marked').toBeTruthy()
 })
 

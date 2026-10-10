@@ -84,7 +84,7 @@ function fakeUi(): TabUi & { map: Map<string, string> } {
 const WIDTHS = [36, 40, 46, 56] as const
 
 /** a Card: a Box with a round border. */
-const cardsIn = (root: unknown): N[] => allOf(root, 'Box').filter(b => b.props.borderStyle === 'round')
+const cardsIn = (root: unknown): N[] => allOf(root, 'Box').filter(b => b.props.borderStyle === 'round' && !/^(dash-tab|set-scope)-/.test(String(b.props?.key ?? '')))
 
 /** the row widths of the drawn tree: a Text is its own text, a horizontal Box
  *  sums its children plus the gap columns, a Button is its drawn label. */
@@ -202,7 +202,7 @@ test('C11: nothing is drawn outside a Card but the MOCK row and the two hint lin
   const walk = (v: unknown, inCard: boolean): void => {
     if (typeof v !== 'object' || v === null) return
     const cur = node(v)
-    const card = inCard || cur.props.borderStyle === 'round'
+    const card = inCard || cur.props.borderStyle === 'round' && !/^(dash-tab|set-scope)-/.test(String(cur.props?.key ?? ''))
     if (cur.type === 'Text' && !card) orphans.push(text(cur))
     kids(cur).forEach(c => walk(c, card))
   }

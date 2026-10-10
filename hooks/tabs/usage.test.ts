@@ -80,7 +80,7 @@ const HEAT: readonly string[] = [ROLE.ok.fg, ROLE.warn.fg, ROLE.err.fg]
 const WIDTHS = [36, 40, 46, 56] as const
 
 /** a Card: a Box with a round border. */
-const cardsIn = (root: unknown): N[] => allOf(root, 'Box').filter(b => b.props.borderStyle === 'round')
+const cardsIn = (root: unknown): N[] => allOf(root, 'Box').filter(b => b.props.borderStyle === 'round' && !/^(dash-tab|set-scope)-/.test(String(b.props?.key ?? '')))
 
 type Drawn = { type?: string; props?: { flexDirection?: string; gap?: number; label?: string; plain?: boolean; columns?: number }; children?: unknown[] }
 
