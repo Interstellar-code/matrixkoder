@@ -377,7 +377,10 @@ export function SettingRow(els: Els, field: SettingField, ctx: SettingCtx): Rend
   if (!field.editable) {
     // read-only: the dim value instead of a control; the selected line is
     // the why (or help), not a default + reset
-    main = rowOf(<Text dimColor={true}>{val}</Text>, val.length, field.label)
+    // a read-only bool draws the artboard's non-pressable on/off chip
+    main = typeof field.value === 'boolean'
+      ? rowOf(Chip(els, { label: `${field.value ? '◉' : '○'} ${onOff(field.value)}`, role: field.value ? 'live' : 'idle' }), onOff(field.value).length + 4, field.label)
+      : rowOf(<Text dimColor={true}>{val}</Text>, val.length, field.label)
   } else if (field.type === 'text') {
     if ('Input' in els) {
       const { Input } = els
@@ -469,10 +472,10 @@ export function SettingRow(els: Els, field: SettingField, ctx: SettingCtx): Rend
         ? fullVal
         : ellipsize(fullVal, valBudget)
       main = rowOf(
-        <Box backgroundColor={PALETTE.bg} paddingX={1}>
-          {ActionButton(els, { key: `${key}-sel`, glyph: valShown, word: '▾', plain: true, onPress: ctx.onToggleOpen })}
+        <Box backgroundColor={PALETTE.bg}>
+          {ActionButton(els, { key: `${key}-sel`, glyph: ` ${valShown}`, word: '▾', plain: true, onPress: ctx.onToggleOpen })}
         </Box>,
-        settingPlainW(`${valShown} ▾`) + 2,
+        settingPlainW(`${valShown} ▾`) + 1,
         field.label,
       )
       if (ctx.open) {
