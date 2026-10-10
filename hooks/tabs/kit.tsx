@@ -388,7 +388,7 @@ export function SettingRow(els: Els, field: SettingField, ctx: SettingCtx): Rend
       const labelBudget = Math.max(1, ctx.cols - TEXT_INPUT_MIN - 3)
       const changedShown = ellipsize(ctx.changed ? `● ${field.label}` : field.label, labelBudget)
       main = (
-        <Box flexDirection="row" gap={1}>
+        <Box flexDirection="row" gap={1} justifyContent="space-between" width={ctx.cols}>
           {ActionButton(els, {
             key: `${key}-pick`, glyph: changedShown, word: '',
             plain: true, onPress: ctx.onPick,
