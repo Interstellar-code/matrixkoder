@@ -16,3 +16,5 @@ Runs as pane steps in the dashboard; when the pane is not available (not fullscr
 | 10 | Review + confirm | shows the filled `templates/matrixkoder.yaml` as one diff; single question "Write these?" | writes `<data>/matrixkoder.yaml` (via `scripts/mk-config.py`) and `~/.matrixkoder/projects.json`; the step-9 prefs land in the plugin's settings, not a file |
 
 Steps 3–8 are the checks listed in `loop.md` §Bootstrap detection. Open items go in as proposed defaults marked `# proposed`, never as extra questions. Later runs skip the wizard and only drift-check.
+
+After a write, `/mk setup` runs `mk-config.py migrate` once: it fills in the `session:` / `picks:` / reviewer keys a pre-migration file lacks. Those lines are **written into the file with the schema defaults of that day**, so a later change to a default never reaches an already-migrated file — change the line, or delete it and migrate again to have the current default written back.

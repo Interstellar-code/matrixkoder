@@ -666,7 +666,7 @@ def cmd_migrate(path, lines):
         block = [f"{PICKS_SECTION}:{eol}"]
         if new and not new[-1].endswith("\n"):
             block[0] = eol + block[0]
-        block += [f"  {name}:[]{eol}" for name in picks_agents]
+        block += [f"  {name}: []{eol}" for name in picks_agents]
         new += block
         changed += [f"{PICKS_SECTION}.{name}" for name in picks_agents]
         count += len(block)
@@ -967,7 +967,23 @@ def self_test():
         assert "agents.herdr.available" in keys, "herdr availability is a real row"
         assert not any(k.startswith("picks.herdr") for k in keys), keys
         run("migrate")
-        assert "  herdr: []" not in rd(), "migrate added a herdr picks row"
+        migrated = rd().splitlines()
+        assert "  herdr: []" not in migrated, "migrate added a herdr picks row"
+        for agent in ("codex", "opencode", "agy"):  # exact lines: `codex:[]` is a string to a real parser
+            assert f"  {agent}: []" in migrated, f"migrate did not write `{agent}: []`"
+
+        # 19. HIGH 1: every line migrate or set writes is a `key: value` (colon + space) or a bare
+        # section header — a missing space parses as a string in a real YAML reader
+        for line in migrated:
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            assert re.match(r"^\s*[A-Za-z0-9_.-]+:( |$)", line), f"not a yaml key line: {line!r}"
+        run("set", "picks.opencode", '["opencode/big-pickle"]')
+        run("set", "session.subagent_model", '"opencode/exo-free"')
+        for line in rd().splitlines():
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            assert re.match(r"^\s*[A-Za-z0-9_.-]+:( |$)", line), f"not a yaml key line: {line!r}"
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("mk-config self-test ok")

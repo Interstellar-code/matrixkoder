@@ -598,8 +598,11 @@ def cmd_dispatch(a):
     fix|takeover build dispatch on session.fresh_session: new first sends the pane's agent its
     new-session command (/new OpenCode, /clear Claude — the armed watch's kind names the agent)
     and waits (bounded) for the pane to go idle; the reply's fresh_session names the command sent,
-    or null. Other failures → ok:false. Completed checks exit 0 whatever the verdict; only usage
-    errors exit 2."""
+    or null. A reset herdr refuses outright, or a pane that never goes idle, ends the round with
+    ok:false "fresh session not confirmed" and NO task prompt — but a reset that times out
+    (wait/exc, which start no model turn) is delivered as soon as the pane reads idle, like every
+    other uncertain prompt here. Other failures → ok:false. Completed checks exit 0 whatever the
+    verdict; only usage errors exit 2."""
     pane, text = opt(a, "--pane"), opt(a, "--text")
     if not (pane and text):
         fail("dispatch needs --pane --text")
@@ -620,14 +623,16 @@ def cmd_dispatch(a):
              if role == "build" and round_kind in ("fix", "takeover")
              and cfg("session.fresh_session") == "new" else None)
     if fresh:
-        # The reset gates the round: a prompt that lands mid-reset reaches a session that is about to
-        # be wiped, so an unconfirmed reset fails the round instead of prompting anyway.
+        # The reset gates the round, but only a CONFIRMED failure blocks it: `wait`/`exc` mean
+        # "proves nothing, the pane's state decides" everywhere else in this function, and `/clear`
+        # and `/new` start no model turn, so herdr may well time out on a reset that worked. A pane
+        # that ends idle/done is the confirmation; anything else is not.
         rkind, rwhy, rstatus, _rj = _prompt_attempt(pane, fresh, ms)
         ist, iwhy = wait_idle(pane)
-        if rkind != "ok" or ist not in RETRY_PANE_STATES:
+        if rkind == "fail" or ist not in RETRY_PANE_STATES:
             out({"ok": False, "delivered": False, "pane": pane, "fresh_session": fresh,
                  "error": "fresh session not confirmed",
-                 "fresh_session_error": rwhy if rkind != "ok" else (iwhy or "pane never went idle"),
+                 "fresh_session_error": rwhy if rkind == "fail" else (iwhy or "pane never went idle"),
                  "fresh_session_kind": rkind, "agent_status": rstatus})
             return
     # the pane's raw list row before any prompt: the ok/fail arms report it as pane_entry; every
@@ -1574,6 +1579,22 @@ def self_test():
         r = cli("dispatch", "--pane", pane_of("H8"), "--text", "fix it again", "--kind", "fix",
                 extra=fnew)  # the gate is not sticky: the next round resets and prompts again
         assert r["ok"] is True and r["delivered"] is True and r["fresh_session"] == "/clear", r
+
+        # (R3 MEDIUM 2) a reset that TIMES OUT is not a refusal: /clear and /new start no model
+        # turn, so herdr may time out on a reset that worked. An idle pane confirms it.
+        set_canned("prompt_out_stalled.txt", json.dumps(
+            {"error": {"code": "agent_prompt_stalled"}, "result": {"agent": {
+                "agent_status": "agent_prompt_stalled"}}}) + "\n")
+        set_canned("prompt_q.txt", "stalled")  # only the /clear stalls; the task prompt settles
+        n0 = len(prompt_calls())
+        r = cli("dispatch", "--pane", pane_of("H8"), "--text", "fix after a timeout", "--kind", "fix",
+                extra=fnew)
+        assert r["ok"] is True and r["delivered"] is True and r["fresh_session"] == "/clear", r
+        assert prompt_calls()[n0:] == [
+            f"agent prompt {pane_of('H8')} /clear --wait --timeout 25000",
+            f"agent prompt {pane_of('H8')} fix after a timeout --wait --timeout 25000"], \
+            prompt_calls()[n0:]
+        set_canned("prompt_out.txt", '{"result": {"agent": {"agent_status": "idle"}}}\n')
 
         # (J1.1) --tasks arms a lane GROUP: the watch file lists every task, and one delivered
         # dispatch sets the children of EVERY listed task (or the task itself when it has none)

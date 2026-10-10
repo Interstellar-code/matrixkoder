@@ -283,10 +283,18 @@ function unquoteScalar(v: string): string {
   return t.length >= 2 && ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) ? t.slice(1, -1) : t
 }
 
-/** The scalar's YAML type, so kv()/inline() re-emit `22` as a number and `true` as a boolean. */
-function typedScalar(v: string): string | number | boolean {
-  if (v === 'true' || v === 'false') return v === 'true'
-  return /^-?\d+$/.test(v) ? Number(v) : v
+const NUMERIC_KEYS = new Set(['stall_min', 'max_wait_min'])
+
+/** The carried value for one session key, in the type that key actually has. Only the two numeric
+ *  keys become numbers: everything else keeps its text, so a model id that looks like a number
+ *  (`"007"`) stays `"007"` instead of turning into 7. */
+function typedSessionScalar(key: string, v: string): string | number | boolean {
+  if (NUMERIC_KEYS.has(key) && /^-?\d+$/.test(v)) return Number(v)
+  if (key === 'subagents' || key === 'reuse_reviewer') {
+    if (v === 'true') return true
+    if (v === 'false') return false
+  }
+  return v
 }
 
 /** What an existing matrixkoder.yaml set in the three groups a replace must keep: the session:
@@ -310,7 +318,7 @@ function parseCarry(text: string | null | undefined): YamlCarry {
     if (key === '') continue
     if (block === 'session' && SESSION_KEYS.has(key)) {
       const v = unquoteScalar(stripYamlComment(tail))
-      if (v !== '') out.session[key] = typedScalar(v)
+      if (v !== '') out.session[key] = typedSessionScalar(key, v)
     } else if (block === 'routing_preferences' && (key === 'reviewer' || key === 'visual_reviewer')) {
       const v = unquoteScalar(stripYamlComment(tail))
       if (v !== '') {

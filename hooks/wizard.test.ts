@@ -499,6 +499,23 @@ test('a replace carries the old yaml\'s session, picks and reviewer values; unse
   await ui.unmount()
 })
 
+test('a carried string key keeps its text: subagent_model "007" is not the number 7', async ($, on) => {
+  const files = repoFiles()
+  files[YAML] = ['session:', '  subagent_model: "007"', '  reuse_reviewer: false', ''].join('\n')
+  world(on, files)
+  await $.session.start(sessionStart())
+  await mk($, 'setup')
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(64) })
+  await toReview(ui)
+  await ui.select({ key: 'wz-replace', value: 'replace' })
+  await ui.press({ key: 'wz-write' })
+  const yaml = files[YAML] ?? ''
+  expect(yaml).toContain('  subagent_model: "007"   #')    // the text, quoted so yaml keeps it a string
+  expect(yaml).not.toContain('  subagent_model: 7')
+  expect(yaml).toContain('  reuse_reviewer: false')          // a real bool is still a bool
+  await ui.unmount()
+})
+
 test('projects.json is merged, not replaced; a corrupt one aborts the write', async ($, on) => {
   const files = repoFiles()
   files[PROJECTS] = JSON.stringify({ '/other/repo': { data_dir: '/other/repo/.matrixkoder', onboarded_at: 'x' } })
