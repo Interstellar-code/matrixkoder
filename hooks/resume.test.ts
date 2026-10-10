@@ -53,3 +53,28 @@ test('long next/question are capped and control-stripped, counts survive', { plu
   expect(section.text).not.toMatch(/x{201,}/) // next capped at 200
   expect(section.text).not.toMatch(/y{201,}/) // question capped at 200
 })
+
+// ---------- S1.3: the section names the mode ----------
+
+test('solo mode: the section is exactly the solo line, no run lines', { plugins: [worldFixtures], options: { mode: 'solo' } }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const { sections } = await $.prompt.compose(composeArgs())
+  const mk = sections.filter(s => s.id === 'matrixkoder:run')
+  expect(mk).toHaveLength(1)
+  expect(mk[0]?.text).toBe('MK solo: no orchestration, build in this session')
+})
+
+test('a missing mode (orchestrator) names the mode and still carries the run lines', { plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const { sections } = await $.prompt.compose(composeArgs())
+  const section = sections.find(s => s.id === 'matrixkoder:run')
+  expect(section?.text).toContain('mode orchestrator')
+  expect(section?.text).toContain('MatrixKoder run wfv2 (workflows-v2)')
+  expect(section?.text).toContain('stage 7/12')
+  expect(section?.text).toContain('tasks:')
+  expect(section?.text.length).toBeLessThanOrEqual(600)
+})

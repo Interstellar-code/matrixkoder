@@ -69,6 +69,8 @@ Six options, set with `claude plugin configure matrixkoder`:
 | `usagePollMin` | 5 | Minutes between `mk-usage.py` runs (minimum 1) |
 | `wake` | off | Submit a prompt when lanes hit verifying, blocked, quota, stalled or provider |
 
+Per-repo settings live in `<data>/matrixkoder.yaml`; `/mk setup` and `scripts/mk-config.py` own that file, and the plugin settings above own the rest.
+
 ## Folder map
 
 | Path | Content |
@@ -80,7 +82,7 @@ Six options, set with `claude plugin configure matrixkoder`:
 | `types/` | plugin API types |
 | `docs/` | plan, spikes, state schema, dashboard design, user guide |
 
-Project data lives in `<repo>/.matrixkoder/` (or `~/.matrixkoder/projects/<slug>/`). Global state lives in `~/.matrixkoder/` (`usage.json`, `config.json`, `projects.json`, `locks/`).
+Project data lives in `<repo>/.matrixkoder/` (or `~/.matrixkoder/projects/<slug>/`). Global state lives in `~/.matrixkoder/` (`usage.json`, `projects.json`, `locks/`).
 
 ## Development
 

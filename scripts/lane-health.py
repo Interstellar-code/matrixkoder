@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Classify one herdr agent lane: OK | STALL | QUOTA | PROVIDER | BLOCKED | DEV_SERVER | ERROR.
 
-Usage: lane-health.py --agent NAME|PANE --lane DIR [--kind claude|codex|opencode|agy] [--stall-min 10]
+Usage: lane-health.py --agent NAME|PANE --lane DIR [--kind claude|codex|opencode|agy] [--stall-min N]
                       [--since EPOCH] [--prompt-marker TEXT] [--pool NAME] [--ledger PATH]
        lane-health.py --self-test
 
@@ -14,8 +14,27 @@ the CodexBar windows mk-usage.py writes there. --pool NAME marks one of an OpenC
 pools instead — agents.<kind>.pools.<pool> — because CodexBar reports no windows for those plans.
 The mark is written under an fcntl.flock on <home>/usage.json.lock, shared with mk-usage.py's poll.
 herdr may print {"error": ...} and still exit 0, so JSON is parsed, not exit codes.
+--stall-min absent: <data>/matrixkoder.yaml session.stall_min, else the mk-config schema default.
 """
-import contextlib, datetime, fcntl, json, os, re, subprocess, sys, tempfile, time
+import contextlib, datetime, fcntl, importlib.util, json, os, re, subprocess, sys, tempfile, time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+_spec = importlib.util.spec_from_file_location("mk_config", os.path.join(HERE, "mk-config.py"))
+mk_config = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(mk_config)
+
+
+def cfg(key, flag=None):
+    """-> flag > <data>/matrixkoder.yaml > the mk-config schema default. One default, one home:
+    a repo that never set the key gets the schema value, not a second literal here."""
+    if flag is not None:
+        return flag
+    try:
+        lines = mk_config.read_lines(os.path.join(
+            mk_config.mk_state.resolve_data(None), "matrixkoder.yaml"))
+    except Exception:  # outside a repo / unreadable data dir: the schema default, never a crash
+        lines = []
+    return mk_config.value_of(lines, mk_config.row_for(lines, key))[1]
 
 KINDS = ("claude", "codex", "opencode", "agy")
 # A quota hit needs a quota noun: bare "rate limit"/429, "Context limit reached" and a lone "resets in 3s"
@@ -268,6 +287,20 @@ def self_test():
 
 
 def self_test_body(shutil):
+    # no flag and no yaml: the stall default this script now uses IS the mk-config schema's
+    empty = tempfile.mkdtemp(prefix="lane-health-cfg-")
+    old_md = os.environ.get("MATRIXKODER_DATA")
+    os.environ["MATRIXKODER_DATA"] = empty
+    try:
+        assert cfg("session.stall_min") == mk_config.value_of(
+            [], mk_config.row_for([], "session.stall_min"))[1], cfg("session.stall_min")
+        assert cfg("session.stall_min", "9") == "9"  # a given flag wins
+    finally:
+        if old_md is None:
+            os.environ.pop("MATRIXKODER_DATA", None)
+        else:
+            os.environ["MATRIXKODER_DATA"] = old_md
+        shutil.rmtree(empty, ignore_errors=True)
     assert classify("Usage limit reached for 5 hour. Your limit will reset at 2026-10-07 10:02:14", "idle", 1, 10)[0] == "QUOTA"
     assert classify("⚠ Individual quota reached. Resets in 154h43m", "idle", 1, 10)[0] == "QUOTA"
     assert classify("all good", "blocked", 1, 10)[0] == "BLOCKED"
@@ -440,7 +473,7 @@ def main():
         sys.exit(__doc__)
     ledger = opt("--ledger")
     try:
-        stall_min, since = float(opt("--stall-min", "10")), float(opt("--since", "0"))
+        stall_min, since = float(cfg("session.stall_min", opt("--stall-min"))), float(opt("--since", "0"))
     except ValueError as e:
         sys.exit(f"{e}\n{__doc__}")
     r = check(agent, lane, kind, stall_min, since, opt("--prompt-marker"), ledger and os.path.expanduser(ledger),

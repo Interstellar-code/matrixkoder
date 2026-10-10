@@ -15,7 +15,24 @@ set/add-run rewrite only the target header key's line(s) — the markdown body a
 every other header line (comments included) stay byte-identical — via a temp
 file + os.replace, and the rewritten text is re-parsed before anything is written.
 """
-import argparse, contextlib, fnmatch, hashlib, json, os, re, stat, sys, tempfile, tomllib
+import argparse, contextlib, fnmatch, hashlib, importlib.util, json, os, re, stat, sys, tempfile, tomllib
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+_cspec = importlib.util.spec_from_file_location("mk_config", os.path.join(HERE, "mk-config.py"))
+mk_config = importlib.util.module_from_spec(_cspec)
+_cspec.loader.exec_module(mk_config)
+
+
+def session_subagents():
+    """session.subagents from <data>/matrixkoder.yaml, else the mk-config schema default. A phase
+    without its own subagents key inherits this; any failure resolving or reading the config falls
+    back to True — this tool must never fail because no config could be read."""
+    try:
+        lines = mk_config.read_lines(os.path.join(
+            mk_config.mk_state.resolve_data(None), "matrixkoder.yaml"))
+        return bool(mk_config.value_of(lines, mk_config.row_for(lines, "session.subagents"))[1])
+    except Exception:
+        return True
 
 STATUSES = ("draft", "approved", "running", "done", "parked")
 SIZES = ("trivial", "standard", "complex")
@@ -120,9 +137,10 @@ def phase_json(ph):
            "owned": as_list(ph.get("owned")), "forbidden": as_list(ph.get("forbidden")),
            "route": ph.get("route", ""), "reviewer": ph.get("reviewer", ""),
            "size": ph.get("size", "standard"),
-           "risk": ph.get("risk", "reversible"), "review": ph.get("review", "standard"),
+"risk": ph.get("risk", "reversible"), "review": ph.get("review", "standard"),
            "qa": as_list(ph.get("qa")), "commit": ph.get("commit", ""),
-           "subagents": bool(ph.get("subagents", True)), "lane_group": ph.get("lane_group", ""),
+           "subagents": bool(ph["subagents"]) if "subagents" in ph else session_subagents(),
+           "lane_group": ph.get("lane_group", ""),
            "tasks": [task_json(t) for t in as_list(ph.get("task"))]}
     for k, v in ph.items():  # unknown keys pass through
         if k not in PHASE_KEYS:
@@ -567,6 +585,29 @@ def self_test():
         assert out["ok"] and out["warnings"] == [] and out["sha"]
         out = mk("check", real_plan)
         assert out["ok"] and out["sha"] and out["warnings"] == [], out["plan"]
+
+        # a phase without its own subagents key inherits session.subagents (yaml), else the
+        # schema default true; a phase that sets it keeps its own value
+        def parse_env(p, datadir):
+            r = subprocess.run([sys.executable, os.path.abspath(__file__), "parse", p],
+                               capture_output=True, text=True,
+                               env=dict(os.environ, MATRIXKODER_DATA=datadir))
+            lines = [x for x in r.stdout.strip().splitlines() if x]
+            assert r.returncode == 0 and len(lines) == 1, (p, r.stdout, r.stderr)
+            return json.loads(lines[0])
+
+        nokey = ('[[phase]]\nid = "P1"\ntitle = "t"\nwave = 1\ndeps = []\nowned = []\n'
+                 'forbidden = []\nroute = ""\nsize = "standard"\nrisk = "read_only"\n'
+                 'review = "light"\nqa = []\ncommit = ""\n\n')
+        dsub, dempty = os.path.join(tmp, "data-sub"), os.path.join(tmp, "data-empty")
+        os.makedirs(dsub), os.makedirs(dempty)
+        with open(os.path.join(dsub, "matrixkoder.yaml"), "w") as f:
+            f.write("session:\n  subagents: false\n")
+        p = write("inherit-nokey.md", plan_text(phases=nokey))
+        assert parse_env(p, dsub)["phases"][0]["subagents"] is False  # inherited from the yaml
+        assert parse_env(p, dempty)["phases"][0]["subagents"] is True  # the schema default
+        p = write("inherit-own.md", plan_text(phases=phase("P1", subagents=True) + "\n"))
+        assert parse_env(p, dsub)["phases"][0]["subagents"] is True  # its own key wins
 
         # a done/parked plan may have no phases
         for st in ("done", "parked"):

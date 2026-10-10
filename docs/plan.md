@@ -42,7 +42,6 @@ Load while developing: `claude --plugin-dir ~/Development/matrixkoder`
 
 ```
 ~/.matrixkoder/
-├─ config.json        plugin prefs from the wizard (pane auto-open, chip, toasts, poll intervals)
 ├─ usage.json         normalised quota ledger, all agents (one per user, not per project)
 ├─ projects.json      { "<repo path>": { "data_dir": "...", "onboarded_at": "..." } }
 └─ locks/             cross-session locks (exclusive create + expires_at)
@@ -168,7 +167,7 @@ Runs as pane steps; falls back to chat questions when not fullscreen. Every step
 7. Autonomy: pre-authorised list, builder permission-skip flags
 8. QA: dev URL, themes, mockups dir
 9. Dashboard prefs: auto-open, chip, toasts, poll intervals
-10. Review → write `matrixkoder.yaml`, `~/.matrixkoder/config.json`, `projects.json`
+10. Review → write `matrixkoder.yaml`, `projects.json` (dashboard prefs are plugin settings, not a written file)
 
 Bootstrap of the old skill (read-only checks) becomes steps 3–8's detection.
 

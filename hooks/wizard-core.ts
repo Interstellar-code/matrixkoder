@@ -309,7 +309,8 @@ export function buildYaml(d: MkWizardDraft, checkedAt: string): string {
   kv(4, 'claude', { five_hour_left_pct: toInt(d.claudeFiveHour, 40), weekly_left_pct: toInt(d.claudeWeekly, 30) })
   kv(4, 'others', { five_hour_left_pct: 10, weekly_left_pct: 15 })
   kv(2, 'max_build_lanes', toInt(d.maxLanes, 3))
-  kv(2, 'reviewers', ['codex', 'agy-pro', 'claude-opus-if-jev'])
+  kv(2, 'reviewer', 'claude sonnet medium', 'the route every review goes to')
+  kv(2, 'visual_reviewer', 'claude haiku', 'the route a visual/UI review goes to')
   L.push('autonomy_contract:')
   kv(2, 'pause_only_for', ['destructive-not-preauthorised', 'all-agents-below-floor', 'uncovered-scope-decision', 'secrets-or-user-config', 'lock-over-30min', 'fix-loop-exhausted', 'blocked-approval-dialog', 'jev-screen-block'])
   kv(2, 'preauthorised', splitList(d.preauthorised))
@@ -320,31 +321,25 @@ export function buildYaml(d: MkWizardDraft, checkedAt: string): string {
   kv(2, 'dir', `${d.globalDir ?? '~/.matrixkoder'}/locks`)
   L.push('usage:')
   kv(2, 'source', 'codexbar', 'one source for all agents; mk-usage.py -> ~/.matrixkoder/usage.json')
-  kv(2, 'poll_min', Math.max(1, toInt(d.pollMin, 5)))
   kv(2, 'providers', d.providersOn, 'add zai once its key is set in CodexBar')
-  L.push('dashboard:')
-  kv(2, 'auto_open', d.autoOpen, 'only when fullscreen and >=144 cols')
-  kv(2, 'chip', d.chip)
-  kv(2, 'toasts', d.toasts)
+  L.push('session:')
+  kv(2, 'fresh_session', 'new', 'what a fix or takeover round starts the agent with')
+  kv(2, 'subagents', true, 'a phase may hand its tasks to subagents')
+  kv(2, 'subagent_model', '', 'the model a subagent runs on (empty: the orchestrator\'s own)')
+  kv(2, 'stall_min', 15, 'idle minutes before a working lane is called stalled')
+  kv(2, 'max_wait_min', 30, 'minutes lane-watch waits before it gives up')
+  kv(2, 'reviewer_split', 'right', 'where the reviewer runs while the builder waits')
+  kv(2, 'reuse_reviewer', true, 'one reviewer session serves the phase\'s rounds')
+  L.push('picks:')
+  for (const n of AGENT_NAMES) {
+    if (d.agents[n]?.found) kv(2, n, [], 'this agent\'s models in preference order')
+  }
   return `${L.join('\n')}\n`
 }
 
 function portOf(url: string): number | null {
   const m = /:(\d{2,5})(?:\/|$)/.exec(url)
   return m?.[1] ? Number(m[1]) : null
-}
-
-/** Global ~/.matrixkoder/config.json: merges the dashboard prefs into whatever is already there. */
-export function buildConfigJson(existing: unknown, d: MkWizardDraft, at: string): string {
-  const base = rec(existing)
-  const out = {
-    ...base,
-    schema: 1,
-    dashboard: { ...rec(base.dashboard), auto_open: d.autoOpen, chip: d.chip, toasts: d.toasts },
-    usage: { ...rec(base.usage), poll_min: Math.max(1, toInt(d.pollMin, 5)) },
-    updated: at,
-  }
-  return `${JSON.stringify(out, null, 2)}\n`
 }
 
 /** Upserts one repo into projects.json without touching the others. */

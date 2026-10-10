@@ -3,11 +3,12 @@
 
 Usage:
   mk-lane-event.py arm --lane DIR --pane ID --task T --run R --data DIR --phase P --commit-grep RX
-                      [--report PATH] [--kind claude|codex|opencode|agy] [--prompt-marker TEXT] [--stall-min 15]
+                      [--report PATH] [--kind claude|codex|opencode|agy] [--prompt-marker TEXT] [--stall-min N]
   mk-lane-event.py arm --lane DIR --pane ID --tasks A,B --run R --data DIR --phase P --commit-grep RX
                       [...]   # a shared lane group: one lane serving several phases of one plan
   mk-lane-event.py event                (herdr plugin hook: reads HERDR_PLUGIN_EVENT + HERDR_PLUGIN_EVENT_JSON)
   mk-lane-event.py dispatch --pane ID --text TEXT [--timeout-ms 25000] [--role build|review]
+                             [--kind build|fix|takeover]
   mk-lane-event.py sweep [--data DIR]
   mk-lane-event.py disarm --lane DIR
   mk-lane-event.py --self-test
@@ -49,6 +50,14 @@ task_status_error and never changes the delivery verdict. --role review (reviewe
 write entirely — the task under review stays at review — and the reply says status_unchanged:true. herdr runs one process per event with no ordering guarantee: every read/decide/write of a watch file
 happens under an fcntl.flock on <lane>/.matrixkoder-watch.lock (a stable inode next to the atomically
 replaced watch file). One JSON line per command.
+--stall-min absent (arm, and the verdict fallback for a watch that records none): <data>/matrixkoder.yaml
+session.stall_min, else the mk-config schema default.
+dispatch --kind fix|takeover (a fix/takeover round; default build) with --role build on session.fresh_session: new
+(<data>/matrixkoder.yaml, else the schema default) first sends the pane's agent its new-session command — /new for
+an OpenCode lane, /clear for a Claude lane, from the armed watch's kind — then waits (bounded) for the pane to go
+idle and sends the prompt exactly as today. No armed watch kind, a kind without a known command, --kind build,
+--role review, or fresh_session: same: one prompt, no extra herdr call. The reply carries fresh_session (the
+command sent, or null).
 """
 import fcntl, hashlib, importlib.util, json, os, re, socket, subprocess, sys, tempfile, time
 
@@ -58,6 +67,9 @@ LOCK = ".matrixkoder-watch.lock"
 DISPATCH_RETRY_S = 5  # wait before dispatch's one automatic retry; $MK_DISPATCH_RETRY_S overrides
 DISPATCH_RECHECK_S = 3  # wait before dispatch's one pane-text recheck; $MK_DISPATCH_RECHECK_S overrides
 RETRY_PANE_STATES = ("idle", "done")  # pane sat still through a failed wait → the prompt was lost
+FRESH_IDLE_WAIT_S = 30  # bounded wait for a fresh session's pane to go idle; never an unbounded wait
+FRESH_IDLE_POLL_S = 0.5
+FRESH_CMDS = {"opencode": "/new", "claude": "/clear"}
 
 sys.dont_write_bytecode = True  # no stray __pycache__ next to the scripts
 
@@ -71,6 +83,20 @@ def _load(name, path):
 
 lw = _load("lane_watch", os.path.join(HERE, "lane-watch.py"))  # verdict logic lives there — import it
 lh = _load("lane_health", os.path.join(HERE, "lane-health.py"))
+mk_config = _load("mk_config", os.path.join(HERE, "mk-config.py"))
+
+
+def cfg(key, flag=None):
+    """-> flag > <data>/matrixkoder.yaml > the mk-config schema default. One default, one home:
+    a repo that never set the key gets the schema value, not a second literal here."""
+    if flag is not None:
+        return flag
+    try:
+        lines = mk_config.read_lines(os.path.join(
+            mk_config.mk_state.resolve_data(None), "matrixkoder.yaml"))
+    except Exception:  # outside a repo / unreadable data dir: the schema default, never a crash
+        lines = []
+    return mk_config.value_of(lines, mk_config.row_for(lines, key))[1]
 
 # Note (fixed on main in 26f1af8): herdr agent read --source recent-unwrapped
 # returns {"error":{"code":"agent_not_idle"}} while a full-screen agent works;
@@ -223,7 +249,7 @@ def verdict_for(w):
     """The inputs lane-watch's watch() builds each poll — health (agent get + pane text since the
     dispatch marker), commit subject, report existence — fed through decide(). New pane output since
     the last observation refreshes last_activity (the first observation does not: dispatch counts)."""
-    stall = float(w.get("stall_min") or 15)
+    stall = float(w.get("stall_min") or cfg("session.stall_min"))
     rx = re.compile(w.get("commit_grep") or ".*")
     report = w.get("report")
     report_ok = not report or os.path.exists(os.path.join(w["lane"], report))
@@ -423,6 +449,29 @@ def pane_state(pane):
     return (row or {}).get("agent_status"), row, None
 
 
+def fresh_session_cmd(kind):
+    """The new-session command for an agent kind: /new for OpenCode, /clear for Claude. None for a
+    kind with no known command (or no kind at all): that round keeps today's single-prompt
+    behaviour — guessing a slash command an agent does not support would be worse than skipping."""
+    return FRESH_CMDS.get(kind or "")
+
+
+def armed_kind(pane):
+    """The agent kind the armed watch for <pane> records (arm --kind), or None when not armed."""
+    hit = find_armed(pane)
+    return hit[1].get("kind") if hit else None
+
+
+def wait_idle(pane, budget_s=FRESH_IDLE_WAIT_S, poll_s=FRESH_IDLE_POLL_S):
+    """Bounded wait until <pane> is idle/done, or the wait budget ends — never an unbounded wait."""
+    deadline = time.time() + budget_s
+    while True:
+        st, _row, _err = pane_state(pane)
+        if st in RETRY_PANE_STATES or time.time() >= deadline:
+            return st
+        time.sleep(poll_s)
+
+
 def mk_state_cmd():
     """The mk-state script this file's run-state writes go through (always a subprocess, never an
     import); $MK_STATE_CMD lets a self-test inject a fake (mk-lane.py's rule, like $MK_HERDR)."""
@@ -542,18 +591,34 @@ def cmd_dispatch(a):
     status_unchanged:true instead. Every reply carries attempts (1 or 2), herdr_error (herdr's
     words for the attempt that did not deliver — the first attempt's when a retry lands, the final
     attempt's when both fail, the reply itself when nothing failed) and pane_entry (the freshest
-    raw `herdr pane list` row for the pane, null when no observation names it). Other failures →
-    ok:false. Completed checks exit 0 whatever the verdict; only usage errors exit 2."""
+    raw `herdr pane list` row for the pane, null when no observation names it). A --kind
+    fix|takeover build dispatch on session.fresh_session: new first sends the pane's agent its
+    new-session command (/new OpenCode, /clear Claude — the armed watch's kind names the agent)
+    and waits (bounded) for the pane to go idle; the reply's fresh_session names the command sent,
+    or null. Other failures → ok:false. Completed checks exit 0 whatever the verdict; only usage
+    errors exit 2."""
     pane, text = opt(a, "--pane"), opt(a, "--text")
     if not (pane and text):
         fail("dispatch needs --pane --text")
     role = opt(a, "--role", "build")
     if role not in ("build", "review"):
         fail("--role must be build or review")
+    round_kind = opt(a, "--kind", "build")
+    if round_kind not in ("build", "fix", "takeover"):
+        fail("--kind must be build, fix or takeover")
     try:
         ms = int(opt(a, "--timeout-ms", "25000"))
     except ValueError as e:
         fail(f"--timeout-ms: {e}")
+    # a fix/takeover round on fresh_session: new resets the agent's session first: the command,
+    # then a bounded idle wait, then the prompt exactly as today. Everything else (build, review,
+    # fresh_session: same, no armed kind, unknown kind) skips this and sends one prompt as before.
+    fresh = (fresh_session_cmd(armed_kind(pane))
+             if role == "build" and round_kind in ("fix", "takeover")
+             and cfg("session.fresh_session") == "new" else None)
+    if fresh:
+        _prompt_attempt(pane, fresh, ms)  # the reset itself; its outcome does not gate the round
+        wait_idle(pane)
     # the pane's raw list row before any prompt: the ok/fail arms report it as pane_entry; every
     # not-delivering exc/wait pass below replaces it with its own deciding observation
     _, entry, pl_err = pane_state(pane)
@@ -567,19 +632,20 @@ def cmd_dispatch(a):
         if kind == "ok":
             out({"ok": True, "delivered": True, "pane": pane, "agent_status": status, "timeout_ms": ms,
                  "attempts": attempts, "herdr_error": fail_why or why, "pane_entry": entry,
+                 "fresh_session": fresh,
                  **({"pane_list_error": pl_err} if pl_err else {}), **delivered_status(pane, role)})
             return
         fail_why = why
         if kind == "fail":  # herdr failed some other way: its own words, no delivery, no pane check
             out({"ok": False, "delivered": False, "pane": pane, "timeout_ms": ms, "attempts": attempts,
-                 "herdr_error": why, "error": why, "pane_entry": entry})
+                 "herdr_error": why, "error": why, "pane_entry": entry, "fresh_session": fresh})
             return
         # exc / wait: a timeout proves nothing either way — the pane's own state decides delivery
         st, entry, pl_err = pane_state(pane)
         if st == "working":  # the wait gave up, the agent did not: the prompt is still being delivered
             out({"ok": True, "delivered": True, "pane_state": "working", "pane": pane, "timed_out": True,
                  "timeout_ms": ms, "attempts": attempts, "herdr_error": why, "error": why,
-                 "pane_entry": entry, **delivered_status(pane, role)})
+                 "pane_entry": entry, "fresh_session": fresh, **delivered_status(pane, role)})
             return
         if attempts == 1 and st in RETRY_PANE_STATES:  # idle/done: the prompt was lost — resend once
             time.sleep(retry_wait_s())
@@ -595,12 +661,12 @@ def cmd_dispatch(a):
             if marker_in_new_pane_text(pane, prompt_marker(text), pane_text_before):
                 out({"ok": True, "delivered": True, "recovered": True, "pane_state": st, "pane": pane,
                      "timed_out": True, "timeout_ms": ms, "attempts": attempts, "herdr_error": why,
-                     "error": why, "pane_entry": entry,
+                     "error": why, "pane_entry": entry, "fresh_session": fresh,
                      **({"pane_list_error": pl_err} if pl_err else {}), **delivered_status(pane, role)})
                 return
         out({"ok": False, "delivered": False, "pane_state": st, "pane": pane, "timed_out": True,
              "timeout_ms": ms, "attempts": attempts, "herdr_error": why, "error": why,
-             "pane_entry": entry, **({"pane_list_error": pl_err} if pl_err else {})})
+             "pane_entry": entry, "fresh_session": fresh, **({"pane_list_error": pl_err} if pl_err else {})})
         return
 
 
@@ -623,7 +689,7 @@ def cmd_arm(a):
     if kind and kind not in lh.KINDS:
         fail(f"--kind must be one of {' '.join(lh.KINDS)}")
     try:
-        stall = float(opt(a, "--stall-min", "15"))
+        stall = float(cfg("session.stall_min", opt(a, "--stall-min")))
     except ValueError as e:
         fail(f"--stall-min: {e}")
     lane = os.path.abspath(lane)
@@ -772,6 +838,22 @@ def self_test():
     assert prompt_marker("  go  ") == "go" and prompt_marker("go\nthink again") == "go"
     assert prompt_marker("") == "" and prompt_marker(" \n ") == ""
     assert prompt_marker("a" * 200) == "a" * 60  # capped at 60 chars
+
+    # no flag and no yaml: the stall default arm/verdict_for now use is the mk-config schema's
+    empty = tempfile.mkdtemp(prefix="mk-event-cfg-")
+    old_md = os.environ.get("MATRIXKODER_DATA")
+    os.environ["MATRIXKODER_DATA"] = empty
+    try:
+        assert cfg("session.stall_min") == mk_config.value_of(
+            [], mk_config.row_for([], "session.stall_min"))[1], cfg("session.stall_min")
+        assert float({}.get("stall_min") or cfg("session.stall_min")) == 15.0  # verdict_for's fallback
+        assert cfg("session.stall_min", "9") == "9"  # a given flag wins
+    finally:
+        if old_md is None:
+            os.environ.pop("MATRIXKODER_DATA", None)
+        else:
+            os.environ["MATRIXKODER_DATA"] = old_md
+        shutil.rmtree(empty, ignore_errors=True)
 
     tmp = tempfile.mkdtemp(prefix="mk-lane-event-test-")
     home, data = os.path.join(tmp, "home"), os.path.join(tmp, "data")
@@ -1382,6 +1464,73 @@ def self_test():
         assert r["ok"] is True and r["delivered"] is True and r["recovered"] is True, (
             "full-window pane: the prompt marker count went up, recovered", r)
         os.unlink(os.path.join(tmp, "prompt_q.txt"))
+
+        # (S1.4) --kind fix|takeover on session.fresh_session: new sends the pane's agent its
+        # new-session command BEFORE the task text (the armed watch's kind names the agent:
+        # claude -> /clear, opencode -> /new); build, --role review and fresh_session: same
+        # send only the task text. $MATRIXKODER_DATA pins each case's yaml; the fixture says
+        # fresh_session: new.
+        datanew = os.path.join(tmp, "data-new")
+        os.makedirs(datanew)
+        shutil.copy(os.path.join(HERE, "fixtures", "matrixkoder.yaml"),
+                    os.path.join(datanew, "matrixkoder.yaml"))
+        datasame = os.path.join(tmp, "data-same")
+        os.makedirs(datasame)
+        with open(os.path.join(datasame, "matrixkoder.yaml"), "w") as f:
+            f.write("session:\n  fresh_session: same\n")
+        dataempty = os.path.join(tmp, "data-empty")
+        os.makedirs(dataempty)
+        fnew = dict(fast, MATRIXKODER_DATA=datanew)
+        fsame = dict(fast, MATRIXKODER_DATA=datasame)
+        set_canned("prompt_out.txt", '{"result": {"agent": {"agent_status": "idle"}}}\n')
+        set_canned("prompt_err.txt", "")
+        set_canned("prompt_rc.txt", "0")
+        set_canned("pane_list_out.txt", json.dumps({"result": {"panes": [
+            {"pane_id": pane_of("H8"), "agent_status": "idle"}]}}) + "\n")
+        patch_watch("H8", kind="claude")
+        n0 = len(prompt_calls())
+        r = cli("dispatch", "--pane", pane_of("H8"), "--text", "do the fix", "--kind", "fix", extra=fnew)
+        assert r["ok"] is True and r["delivered"] is True and r["fresh_session"] == "/clear", r
+        assert prompt_calls()[n0:] == [
+            f"agent prompt {pane_of('H8')} /clear --wait --timeout 25000",
+            f"agent prompt {pane_of('H8')} do the fix --wait --timeout 25000"], prompt_calls()[n0:]
+        # a takeover round on an OpenCode lane: /new before the text
+        patch_watch("H8", kind="opencode")
+        n0 = len(prompt_calls())
+        r = cli("dispatch", "--pane", pane_of("H8"), "--text", "take over", "--kind", "takeover",
+                extra=fnew)
+        assert r["ok"] is True and r["delivered"] is True and r["fresh_session"] == "/new", r
+        got = prompt_calls()[n0:]
+        assert got[0] == f"agent prompt {pane_of('H8')} /new --wait --timeout 25000" and \
+            got[1] == f"agent prompt {pane_of('H8')} take over --wait --timeout 25000", got
+        # a build round (the default kind): one prompt, exactly as today
+        n0 = len(prompt_calls())
+        r = cli("dispatch", "--pane", pane_of("H8"), "--text", "go build", extra=fnew)
+        assert r["ok"] is True and r["delivered"] is True and r["fresh_session"] is None, r
+        assert prompt_calls()[n0:] == [
+            f"agent prompt {pane_of('H8')} go build --wait --timeout 25000"], prompt_calls()[n0:]
+        # fresh_session: same — a fix round still sends only the task text
+        n0 = len(prompt_calls())
+        r = cli("dispatch", "--pane", pane_of("H8"), "--text", "go fix", "--kind", "fix", extra=fsame)
+        assert r["ok"] is True and r["delivered"] is True and r["fresh_session"] is None, r
+        assert prompt_calls()[n0:] == [
+            f"agent prompt {pane_of('H8')} go fix --wait --timeout 25000"], prompt_calls()[n0:]
+        # --role review never resets, even on a fix round with fresh_session: new
+        n0 = len(prompt_calls())
+        r = cli("dispatch", "--pane", pane_of("H8"), "--text", "review it", "--kind", "fix",
+                "--role", "review", extra=fnew)
+        assert r["ok"] is True and r["delivered"] is True and r["fresh_session"] is None and \
+            r["status_unchanged"] is True, r
+        assert prompt_calls()[n0:] == [
+            f"agent prompt {pane_of('H8')} review it --wait --timeout 25000"], prompt_calls()[n0:]
+        # no yaml at all: the schema default is new, so the fix round still resets first
+        n0 = len(prompt_calls())
+        r = cli("dispatch", "--pane", pane_of("H8"), "--text", "fix again", "--kind", "fix",
+                extra=dict(fast, MATRIXKODER_DATA=dataempty))
+        assert r["ok"] is True and r["delivered"] is True and r["fresh_session"] == "/new", r
+        assert prompt_calls()[n0] == f"agent prompt {pane_of('H8')} /new --wait --timeout 25000"
+        assert cli("dispatch", "--pane", pane_of("H8"), "--text", "x", "--kind", "boss",
+                   code=2)["ok"] is False  # --kind takes exactly build|fix|takeover
 
         # (J1.1) --tasks arms a lane GROUP: the watch file lists every task, and one delivered
         # dispatch sets the children of EVERY listed task (or the task itself when it has none)

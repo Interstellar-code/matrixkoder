@@ -12,7 +12,7 @@ Runs as pane steps in the dashboard; when the pane is not available (not fullscr
 | 6 | Routing | builder order, reserve floors, max lanes, effort by size, reviewers | `matrixkoder.yaml` `routing_preferences`; `repo:` `lanes` — reusable worktree slots, one by default (`slots`, `pattern`, `reuse`; the cap is `max_build_lanes`) |
 | 7 | Autonomy | pre-authorised list, pause list, builder permission-skip flags (lesson 27: the user may need a permission rule or start the pane) | `matrixkoder.yaml` `autonomy_contract` |
 | 8 | QA | frontend?, start cmd, dev URL/port, themes, mockups dir, `qa.integration_target` | `matrixkoder.yaml` `qa` |
-| 9 | Dashboard prefs | auto-open, status chip, toasts, poll intervals | `matrixkoder.yaml` `dashboard`; `~/.matrixkoder/config.json` |
-| 10 | Review + confirm | shows the filled `templates/matrixkoder.yaml` as one diff; single question "Write these?" | writes `<data>/matrixkoder.yaml`, `~/.matrixkoder/config.json`, `~/.matrixkoder/projects.json` |
+| 9 | Dashboard prefs | auto-open, status chip, toasts, poll interval | the plugin's settings (`claude plugin configure matrixkoder`: `autoOpen`, `chip`, `toasts`, `usagePollMin`) — plugin prefs, not yaml keys |
+| 10 | Review + confirm | shows the filled `templates/matrixkoder.yaml` as one diff; single question "Write these?" | writes `<data>/matrixkoder.yaml` (via `scripts/mk-config.py`) and `~/.matrixkoder/projects.json`; the step-9 prefs land in the plugin's settings, not a file |
 
 Steps 3–8 are the checks listed in `loop.md` §Bootstrap detection. Open items go in as proposed defaults marked `# proposed`, never as extra questions. Later runs skip the wizard and only drift-check.

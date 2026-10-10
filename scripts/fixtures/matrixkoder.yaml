@@ -1,0 +1,63 @@
+# <data>/matrixkoder.yaml — written by the MatrixKoder onboarding wizard after the user confirmed.
+# Re-checked for drift on every run; the user's explicit statements override any value.
+data_dir: .matrixkoder/   # project data dir
+repo:
+  lanes_disposable: [".omo/"]   # OpenCode (oh-my-opencode) session state in lane slots
+  integration_branch: main   # lanes merge here; one PR to main at the end
+  lanes: { slots: 3, pattern: "../{repo}-mk-{n}", reuse: true, copy: [".claude-plugin/types"] }   # reusable worktree slots; copy = untracked paths a new slot needs
+  conventions: []
+gates:
+  install: ""
+  test: ""
+  typecheck: ""
+  lint_changed: ""
+  format_changed: ""
+baselines:                            # measured at first run, refreshed each run
+  type_errors: null
+  lint_errors: null
+  known_failing_tests: []
+banned_commands: []
+qa:
+  frontend: false
+  start: ""   # orchestrator only
+  integration_target: local-main   # local-main = merge reviewed lanes into local main (no push) and QA on the running dev server
+  dev_url: ""
+  port: null
+  themes: []
+  mockups: ""
+agents:                               # installed + logged in, verified at bootstrap
+  codex: { available: false, models: [] }
+  opencode: { available: true, models: [opencode/space-bunny-free, opencode/muse-spark-1.3-contributor-free, opencode/big-pickle, opencode/exo-free, opencode/fledge-alpha-free] }
+  agy: { available: false, models: [gemini-3.8-flash-medium, claude-opus-5-5-low] }
+  claude: { available: true }
+  herdr: { available: true }
+  checked_at: "2026-10-08T06:35:23.052Z"
+routing_preferences:
+  policy: claude-sparing   # Claude Code orchestrates; builders below
+  builder_order: [opencode, claude]
+  effort_by_size: { trivial: low, standard: medium, complex: high, final_review: max }
+  reserve_floor:
+    claude: { five_hour_left_pct: 40, weekly_left_pct: 30 }
+    others: { five_hour_left_pct: 10, weekly_left_pct: 15 }
+  max_build_lanes: 3
+  reviewers: [codex, agy-pro, claude-opus-if-jev]
+autonomy_contract:
+  pause_only_for: [destructive-not-preauthorised, all-agents-below-floor, uncovered-scope-decision, secrets-or-user-config, lock-over-30min, fix-loop-exhausted, blocked-approval-dialog, jev-screen-block]
+  preauthorised: [routing, failover, fix-loops, worktrees, lane-merges, push-non-main, open-pr]
+  builder_skip_permissions: true   # builders only, in their own worktree
+deploy:
+  readme: "<data>/deploys/README.md"   # repo-specific checklist; always user-gated
+locks:
+  dir: /Users/rohits/.matrixkoder/locks
+usage:
+  source: codexbar   # one source for all agents; mk-usage.py -> ~/.matrixkoder/usage.json
+  poll_min: 5
+  providers: [claude, opencodego, ollama]   # OpenCode plans: opencodego = OpenCode Go Plus, ollama = Ollama Cloud (Z.AI dropped 2026-10-08)
+session:
+  fresh_session: new   # a fix or takeover round starts a fresh agent session unless told otherwise
+  subagents: true
+  stall_min: 15   # idle minutes before a lane is called stalled
+dashboard:
+  auto_open: true   # only when fullscreen and >=144 cols
+  chip: true
+  toasts: true

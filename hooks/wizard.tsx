@@ -9,7 +9,7 @@ import type { Elements as ElementTables, EngineInterface, On, PluginOptions } fr
 import type { MkWizardDraft } from '../types'
 import { globalDirPath, join, parseJson } from './data'
 import {
-  AGENT_NAMES, WIZARD_STEPS, ZAI_KEY_CMD, addToGitignore, buildConfigJson, buildProjectsJson, buildYaml,
+  AGENT_NAMES, WIZARD_STEPS, ZAI_KEY_CMD, addToGitignore, buildProjectsJson, buildYaml,
   builderOrderOf, dataDirOf, EMPTY_DRAFT, emptyDraft, fallbackText, installModeOf, mergeModels, parseModels, parseProviders, parseVersion,
   parseWhich, proposeGates, providerChoices, providerLabel, slugOf,
 } from './wizard-core'
@@ -304,9 +304,7 @@ async function writeAll($: EngineInterface): Promise<void> {
     const wantGitignore = d.dataMode === 'repo' && d.dataEnv == null && d.gitignore
     const gitignoreNext = wantGitignore ? addToGitignore(await readExisting($, gitignorePath)) : null
     const globalDir = d.globalDir
-    const configPath = join(globalDir, 'config.json')
     const projectsPath = join(globalDir, 'projects.json')
-    const config = await readJsonStrict($, configPath)
     const projects = await readJsonStrict($, projectsPath)
     const at = new Date(await $.clock.now()).toISOString()
     const written: string[] = []
@@ -324,8 +322,6 @@ async function writeAll($: EngineInterface): Promise<void> {
       await writeAtomic($, gitignorePath, gitignoreNext)
       written.push(gitignorePath)
     }
-    await writeAtomic($, configPath, buildConfigJson(config, d, at))
-    written.push(configPath)
     await writeAtomic($, projectsPath, buildProjectsJson(projects, d.repo, data, at))
     written.push(projectsPath)
     let herdrLinkResult = d.herdrLinkResult
@@ -338,6 +334,15 @@ async function writeAll($: EngineInterface): Promise<void> {
       }
     }
     await patch($, { phase: 'written', written, error: null, herdrLinkResult })
+    // best-effort like the herdr link: a migration failure warns, never fails the wizard
+    try {
+      const mig = await $.process.run(['python3', join(d.pluginRoot, 'scripts', 'mk-config.py'), 'migrate', '--data', data], { timeoutMs: PROBE_MS })
+      if (mig.exitCode !== 0) {
+        await patch($, { error: `config migration skipped: ${mig.stderr.trim().slice(0, 120)}` })
+      }
+    } catch (err) {
+      await patch($, { error: `config migration skipped: ${String(err instanceof Error ? err.message : err).slice(0, 120)}` })
+    }
   } catch (err) {
     await patch($, { phase: 'error', error: String(err instanceof Error ? err.message : err).slice(0, 200) })
   }
@@ -348,6 +353,27 @@ async function closeWizard($: EngineInterface): Promise<void> {
     await $.ui.close({ id: WIZARD_ID })
   } catch {
     // already closed
+  }
+}
+
+/** Step 9's confirm: these prefs' one home is the plugin's userConfig, so $.config.set, not a file. */
+async function applyPrefs($: EngineInterface): Promise<void> {
+  const d = await read($, draftAtom)
+  const poll = Number.parseInt(d.pollMin.trim(), 10)
+  const values: Array<[string, boolean | number]> = [
+    ['autoOpen', d.autoOpen],
+    ['chip', d.chip],
+    ['toasts', d.toasts],
+    ['usagePollMin', Number.isFinite(poll) && poll >= 1 ? poll : 5],
+  ]
+  try {
+    for (const [key, value] of values) {
+      const res = await $.config.set({ key, value })
+      if (res.deny != null) throw new Error(`could not set ${key}: ${res.deny}`)
+    }
+    await patch($, { error: null })
+  } catch (err) {
+    await patch($, { error: String(err instanceof Error ? err.message : err).slice(0, 200) })
   }
 }
 
@@ -537,6 +563,9 @@ function Body(els: Elements, $: EngineInterface, d: MkWizardDraft, step: number,
           {YesNo(els, $, d, 'toasts', 'Toasts')}
           {TextField(els, $, d, 'pollMin', 'Usage poll (minutes)')}
           <Text dimColor={true}>{`Plugin settings today: autoOpen ${options.autoOpen !== false ? 'on' : 'off'}, chip ${options.chip !== false ? 'on' : 'off'}, toasts ${options.toasts !== false ? 'on' : 'off'}.`}</Text>
+          <Text dimColor={true}>These live in the plugin's own settings (claude plugin configure matrixkoder), not in the yaml.</Text>
+          {d.error != null && <Text color="red">{`✗ ${d.error}`}</Text>}
+          <Button key="wz-dash-apply" variant="primary" label="Apply these settings" onPress={() => void applyPrefs($)} />
         </Box>
       )
     default:
@@ -575,6 +604,7 @@ function Review(els: Elements, $: EngineInterface, d: MkWizardDraft) {
         {d.installMode === 'marketplace' && (
           <Text dimColor={true}>Re-run /mk setup after each MatrixKoder update: the herdr link points at this plugin version's folder.</Text>
         )}
+        {d.error != null && <Text color="yellow">{`⚠ ${d.error}`}</Text>}
         <Text>Next: /mk to open the dashboard.</Text>
       </Box>
     )
@@ -588,7 +618,6 @@ function Review(els: Elements, $: EngineInterface, d: MkWizardDraft) {
         <Text>{`${d.existingYaml && !d.replace ? 'keep   ' : d.existingYaml ? 'replace' : 'create '} ${data ?? '?'}/matrixkoder.yaml`}</Text>
         <Text>{`create  ${data ?? '?'}/plans/ and runs/`}</Text>
         {d.dataEnv == null && d.dataMode === 'repo' && d.gitignore && !d.gitignoreHas && <Text>add     /.matrixkoder/ to .gitignore</Text>}
-        <Text>{`${d.globalDir ?? '~/.matrixkoder'}/config.json (merge)`}</Text>
         <Text>{`${d.globalDir ?? '~/.matrixkoder'}/projects.json (upsert this repo)`}</Text>
         {d.agents.herdr?.found && d.herdrPlugin === 'link' && <Text>{`link    ${d.pluginRoot}/herdr in herdr`}</Text>}
         {d.agents.herdr?.found && d.herdrPlugin === 'linked' && <Text dimColor={true}>herdr plugin already linked</Text>}

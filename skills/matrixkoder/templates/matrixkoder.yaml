@@ -30,6 +30,18 @@ agents:                               # installed + logged in, verified at boots
   agy: { available: null, models: [] }
   claude: { available: true }
   checked_at: null
+picks:                                # each agent's models in preference order (max 4, from agents.<agent>.models)
+  codex: []
+  opencode: []
+  agy: []
+session:                              # how build/review rounds run in their panes
+  fresh_session: new                  # a fix/takeover round starts a fresh agent session (/new OpenCode, /clear Claude); "same" keeps it
+  subagents: true                     # a phase may hand its tasks to subagents
+  subagent_model: ""                  # the model a subagent runs on (empty: the orchestrator's own)
+  stall_min: 15                       # idle minutes before a working lane is called stalled
+  max_wait_min: 30                    # minutes lane-watch waits before it gives up
+  reviewer_split: right               # where the reviewer pane goes while the builder waits: right (beside the lane) or down
+  reuse_reviewer: true                # one reviewer session serves the phase's rounds
 routing_preferences:
   policy: claude-sparing              # Claude Code orchestrates; builders below
   builder_order: [codex, opencode, agy, claude]
@@ -38,7 +50,8 @@ routing_preferences:
     claude: { five_hour_left_pct: 40, weekly_left_pct: 30 }
     others: { five_hour_left_pct: 10, weekly_left_pct: 15 }
   max_build_lanes: 3
-  reviewers: [codex, agy-pro, claude-opus-if-jev]
+  reviewer: claude sonnet medium      # the route every review goes to
+  visual_reviewer: claude haiku       # the route a visual/UI review goes to
 autonomy_contract:
   pause_only_for: [destructive-not-preauthorised, all-agents-below-floor, uncovered-scope-decision, secrets-or-user-config, lock-over-30min, fix-loop-exhausted, blocked-approval-dialog, jev-screen-block]
   preauthorised: [routing, failover, fix-loops, worktrees, lane-merges, push-non-main, open-pr]
@@ -49,9 +62,4 @@ locks:
   dir: ~/.matrixkoder/locks            # managed via mk-state lock take|release|check
 usage:
   source: codexbar                    # one source for all agents; mk-usage.py -> ~/.matrixkoder/usage.json
-  poll_min: 5
   providers: [claude, codex, antigravity]   # add zai when the OpenCode plan key is set in CodexBar
-dashboard:
-  auto_open: true                     # only when fullscreen and >=144 cols
-  chip: true
-  toasts: true

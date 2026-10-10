@@ -9,7 +9,7 @@ allowed, renaming or removing one needs `schema` bumped.
 | What | Path |
 |---|---|
 | Project data dir | `--data DIR` → `$MATRIXKODER_DATA` → the repo's entry in `<global>/projects.json` (`{ "<repo path>": { "data_dir": "..." } }`, written by the onboarding wizard's "home" mode; keyed by the **main checkout** path; `~` allowed, a relative path is resolved against the repo) → `<toplevel>/.matrixkoder`. toplevel = the nearest `.git` above cwd, never `$HOME` itself (a dotfiles repo is not a project); a linked worktree (`.git` file with `commondir`) resolves to its **main checkout**, a nested repo to itself (pass `--data` to reach the outer repo). One order in `scripts/mk-state.py`, `hooks/dashboard.tsx` and `hooks/wake.ts`; the pure helpers are in `hooks/data.ts` (`projectDataDir`) |
-| Global dir | `$MATRIXKODER_HOME` → `~/.matrixkoder` (TS: `globalDirPath` in `hooks/data.ts`; the wizard writes `config.json` / `projects.json` here) |
+| Global dir | `$MATRIXKODER_HOME` → `~/.matrixkoder` (TS: `globalDirPath` in `hooks/data.ts`; the wizard writes `projects.json` here — plugin prefs live in the plugin's userConfig, not in this dir) |
 | Run index | `<data>/runs/index.json` |
 | Run snapshot | `<data>/runs/<run_id>/run.json` — written atomically (temp file + `os.replace`); **the dashboard reads only this** |
 | Event log | `<data>/runs/<run_id>/events.jsonl` — append-only (`O_APPEND`), one JSON object per line |

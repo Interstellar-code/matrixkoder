@@ -12,7 +12,7 @@ export const register: Register = (on, options) => {
   registerGuards(on, options)
   registerDashboard(on, options)
   registerStatus(on, options)
-  registerResume(on)
+  registerResume(on, options)
   registerTools(on, options)
   registerWake(on, options)
   registerWizard(on, options)
