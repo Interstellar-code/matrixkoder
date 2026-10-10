@@ -264,7 +264,7 @@ export function registerDashboard(on: On, options: PluginOptions): void {
           <Text color="yellow" bold={true}>⚠ {snap.error}</Text>
         )}
         {dashTab === 'settings'
-          ? BrandHeader(els, cols, settingsLive?.about.installed ?? '', settingsLive?.about.latest ?? '', options.mode)
+          ? BrandHeader(els, cols, settingsLive?.about.installed ?? '', settingsLive?.about.latest ?? '', String(options.mode ?? 'orchestrator'))
           : header != null && RunHeader(els, header, cols)}
         {/* V1.4: the engine has no per-side borders, so the header and tab bar
             read as one framed block above the tab's Cards through this rule.
