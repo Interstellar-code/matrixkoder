@@ -431,17 +431,18 @@ function TabBar(els: Els, $: EngineInterface, dashTab: MkDashTab, counts: Record
       {tabs.map(t => {
         const active = dashTab === t.key
         const count = counts[t.key]
-        return (
+        // the open tab sits on the tint like the Settings sub-strip's picked scope; it stays a press (its key and hotkey)
+        const btn = (
           <Button
             key={`dash-tab-${t.key}`}
             hotkey={t.hotkey}
             label={active ? `${t.label}${count === '' ? '' : ` ${count}`}` : count === '' ? '·' : count}
-            variant={active ? 'primary' : undefined}
-            plain={active ? undefined : true}
+            plain={true}
             dimColor={active ? undefined : true}
             onPress={() => { void switchTab($, t.key) }}
           />
         )
+        return active ? <Box key={`dash-tab-${t.key}-box`} backgroundColor={ROLE.live.tint} paddingX={1}>{btn}</Box> : btn
       })}
     </Box>
   )
