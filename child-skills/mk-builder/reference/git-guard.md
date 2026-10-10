@@ -66,7 +66,7 @@ scanner and the same holds here (§7). Only G21's why and the stamp below change
 - **G16.** `git reflog expire` and `git reflog delete` — refused; other `reflog` subcommands pass
   (`hooks/guards.ts:216-217`).
 - **G17.** `git update-ref` with a short option containing `d` — refused
-  (`hooks/guards.ts:218-219`).
+  (`hooks/guards.ts:218-219`). (Note: `update-ref --stdin` is a known bypass; see §7 G31).
 - **G18.** `git gc` with `--prune` or `--prune=<any>` (includes `--prune=now`) — refused; plain
   `git gc` passes (`hooks/guards.ts:220-223`).
 
@@ -147,3 +147,6 @@ scanner and the same holds here (§7). Only G21's why and the stamp below change
   `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.<n> GIT_CONFIG_VALUE_0=<cmd>` aliases `<n>` for the
   process lifetime (`GIT_CONFIG_PARAMETERS` is the child-process form); the wrapper sees `<n>` as
   the subcommand.
+- **G31.** `git update-ref --stdin` can carry `delete` instructions via standard input without
+  passing `-d` on the command line; G17 and `hooks/guards.ts:218-219` inspect arguments only and
+  match `-d`, so `--stdin` bypasses ref deletion detection without triggering the option guard.

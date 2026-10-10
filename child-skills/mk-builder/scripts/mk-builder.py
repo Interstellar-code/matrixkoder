@@ -28,10 +28,10 @@ AGENTS = ("claude", "codex", "opencode", "agy", "unknown")
 # `review` is the spelling the brief and lane-rules R19 use for the reviewer's token.
 ROLE_ALIASES = {"builder": "builder", "review": "reviewer", "reviewer": "reviewer"}
 # Table 1: the mk-state id alphabet (letters, digits, `.`, `_`, `-`, max 64, mk-state.py:134-136)
-ID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 # R21: the archive name, built from the archived file's own four fields.
-ARCHIVE_RE = re.compile(r"^status-[^-]+-r\d+-(?:builder|reviewer)-\d+\.json$")
+ARCHIVE_RE = re.compile(r"^status-[A-Za-z0-9._-]+-r\d+-(?:builder|reviewer)-\d+\.json$")
 # The MB2 stale-lane-file rule: only these names, only when their round is not this start's.
 STALE_RE = re.compile(r"^\.matrixkoder-(?:report-r(\d+)\.md|review-r(\d+)\.md|status.*\.json)$")
 KEYS = ("v", "seq", "run", "task", "round", "role", "agent", "state", "step", "phases_done",
@@ -80,9 +80,19 @@ def is_num(v):
 
 
 def check_run(run):
-    if not run or not ID_RE.fullmatch(run):
+    if not run:
+        raise Fail("run is empty [Table 1 run]")
+    if not ID_RE.fullmatch(run):
         raise Fail(f"invalid run {run!r} (letters, digits, . _ -; max 64) [Table 1 run]")
     return run
+
+
+def check_task(task):
+    if not task:
+        raise Fail("task is empty [Table 1 task]")
+    if not ID_RE.fullmatch(task):
+        raise Fail(f"invalid task {task!r} (letters, digits, . _ -; max 64) [Table 1 task]")
+    return task
 
 
 def check_report(rel):
@@ -98,7 +108,9 @@ def check_report(rel):
 
 
 def check_role(role):
-    got = ROLE_ALIASES.get(role or "")
+    if not role or not ID_RE.fullmatch(role):
+        raise Fail(f"invalid role {role!r} [Table 1 role]")
+    got = ROLE_ALIASES.get(role)
     if not got:
         raise Fail(f"role must be one of {', '.join(ROLES)} (alias 'review'), got {role!r} [Table 1 role]")
     return got
@@ -258,10 +270,8 @@ def cmd_start(a):
     """R21/R22: a different (run, task, round, role) — or a `done` file — is an archive plus a
     fresh file; the same identity with a non-done state is a resume. The lane's round files of
     another round are archived either way."""
-    run, task, round_n = check_run(a.run), (a.task or "").strip(), a.round
+    run, task, round_n = check_run(a.run), check_task((a.task or "").strip()), a.round
     role, agent, report = check_role(a.role), check_agent(a.agent or detect_agent()), check_report(a.report)
-    if not task:
-        raise Fail("task is empty [Table 1 task]")
     if not is_int(round_n) or round_n < 1:
         raise Fail(f"round must be an integer >= 1, got {round_n!r} [Table 1 round]")
     lane, now = lane_dir(a), time.time()
@@ -277,6 +287,7 @@ def cmd_start(a):
                    ctx_pct=None, report=report, agent=agent)
         stamp(obj)  # R22/R25: a resume continues `seq`; a fresh file starts at 1 (R21)
     else:
+        # LOW 2: archive first (archive_status and archive_other_rounds), then write the new file.
         archived.append(archive_status(lane, old))
         obj = new_file(run, task, round_n, role, agent, report, now)
     archived.extend(archive_other_rounds(lane, run, round_n, report))
@@ -323,8 +334,9 @@ def cmd_blocked(a):
     require_state(old, "blocked")
     obj = dict(old, state="blocked", question=question, commit=None, subagent=None)
     write_status(lane, stamp(obj))
+    token_q = " ".join(question.splitlines())
     return ({"ok": True, "seq": obj["seq"], "state": obj["state"], "question": question},
-            token_for(obj, f"BLOCKED: {question}"))
+            token_for(obj, f"BLOCKED: {token_q}"))
 
 
 def lane_head(lane):
@@ -480,20 +492,28 @@ def copy_skill(src, dest):
 def ensure_exclude(repo, line):
     """R2: the lane keeps its `.matrixkoder-*` and the installed skill out of `git status`. The
     line is appended once; an existing exclude file is never rewritten."""
-    git_dir = os.path.join(repo, ".git")
-    if not os.path.isdir(git_dir):
-        return False
-    info = os.path.join(git_dir, "info")
-    os.makedirs(info, exist_ok=True)
-    path = os.path.join(info, "exclude")
     try:
-        with open(path) as f:
+        r = subprocess.run(["git", "-C", repo, "rev-parse", "--git-path", "info/exclude"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return False
+        exclude_path = r.stdout.strip()
+        if not exclude_path:
+            return False
+        if not os.path.isabs(exclude_path):
+            exclude_path = os.path.join(repo, exclude_path)
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+    os.makedirs(os.path.dirname(exclude_path), exist_ok=True)
+    try:
+        with open(exclude_path) as f:
             have = f.read().splitlines()
     except FileNotFoundError:
         have = []
     if line in [x.strip() for x in have]:
         return False
-    with open(path, "a") as f:
+    with open(exclude_path, "a") as f:
         if have and have[-1].strip():
             f.write("\n")
         f.write(line + "\n")
@@ -814,6 +834,10 @@ def t_blocked_question_and_token(root):
     assert obj["state"] == "blocked" and obj["question"] == "v2 or v3 fixture?" and obj["commit"] is None
     cli(lane, "blocked", "never mind - v3")
     assert status(lane)["question"] == "never mind - v3", "R15: a re-ask with a new question"
+    # LOW 1: a question containing newlines must collapse to a single line in the printed token
+    code, lines = cli(lane, "blocked", "line 1\nline 2\nline 3")
+    assert code == 0 and lines[-1] == "S1 R1 BLOCKED: line 1 line 2 line 3", lines
+    assert status(lane)["question"] == "line 1\nline 2\nline 3", "raw question preserved in json"
 
 
 def t_done_preconditions(root):
@@ -1038,6 +1062,52 @@ def t_argv_errors_are_json(root):
     assert "invalid int value" in out["error"], out
     out = refuse(lane, "progress", "x")
     assert STATUS_NAME in out["error"], f"a missing file is reported, not crashed: {out}"
+    # MEDIUM 1: bad task, run, role give JSON ok:false, never a traceback
+    code, lines = cli_raw("start", "--lane", lane, "--run", "bad/run", "--task", "S1", "--round", "1", "--report", "r.md")
+    assert code != 0 and len(lines) == 1 and json.loads(lines[0])["ok"] is False, lines
+    assert "invalid run" in lines[0]
+    code, lines = cli_raw("start", "--lane", lane, "--run", "r1", "--task", "bad/task", "--round", "1", "--report", "r.md")
+    assert code != 0 and len(lines) == 1 and json.loads(lines[0])["ok"] is False, lines
+    assert "invalid task" in lines[0]
+    code, lines = cli_raw("start", "--lane", lane, "--run", "r1", "--task", "S1", "--round", "1", "--role", "bad/role", "--report", "r.md")
+    assert code != 0 and len(lines) == 1 and json.loads(lines[0])["ok"] is False, lines
+    assert "invalid role" in lines[0] or "role must be one of" in lines[0]
+
+
+def t_start_hyphenated_task(root):
+    """MEDIUM 1: hyphenated task id (e.g. S3-a) starts cleanly and archives on next round."""
+    lane = mklane(root, "hyphen_task")
+    out = begin(lane, root, task="S3-a", round=1)
+    assert out["seq"] == 1 and out["task"] == "S3-a", out
+    # start round 2 with a different round to trigger archive
+    out2 = begin(lane, root, task="S3-a", round=2)
+    assert out2["seq"] == 1 and out2["task"] == "S3-a", out2
+    old_dir = os.path.join(lane, ".matrixkoder-old-r1")
+    assert os.path.isdir(old_dir), "archive directory created"
+    archived_files = os.listdir(old_dir)
+    assert "status-S3-a-r1-builder-1.json" in archived_files, f"archived files: {archived_files}"
+
+
+def t_install_in_worktree(root):
+    """MEDIUM 2: in a git worktree lane (.git is a file), install writes the exclude and
+    git status --porcelain shows nothing for .claude/."""
+    main_repo = gitlane(root, "wt_main")
+    wt_dir = os.path.join(root, "wt_lane")
+    git(main_repo, "worktree", "add", wt_dir, "-b", "wt-branch")
+    assert os.path.isfile(os.path.join(wt_dir, ".git")), "worktree .git must be a file"
+    code, lines = cli_raw("install", "--into", wt_dir)
+    assert code == 0 and len(lines) == 1, lines
+    dest = jline(lines)["installed"]
+    assert os.path.isdir(dest), "skill folder installed in worktree"
+    # git status in worktree must show nothing for .claude/
+    status_out = git(wt_dir, "status", "--porcelain")
+    claude_lines = [l for l in status_out.splitlines() if ".claude" in l]
+    assert not claude_lines, f"git status should not show .claude/, got: {claude_lines}"
+    # run install a second time to ensure idempotency in worktree
+    code2, lines2 = cli_raw("install", "--into", wt_dir)
+    assert code2 == 0, lines2
+    status_out2 = git(wt_dir, "status", "--porcelain")
+    assert not [l for l in status_out2.splitlines() if ".claude" in l]
 
 
 def t_skill_frontmatter(root):

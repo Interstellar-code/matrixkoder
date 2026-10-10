@@ -136,7 +136,7 @@ decide() {
                     -m|-F|-C|-c|--message|--file|--author|--date|--template|--reuse-message|--reedit-message|--fixup|--squash|--trailer|--cleanup)
                         skip=1 # the next word is this option's value, not an option
                         ;;
-                    -?*) case ${w#-} in
+                    -[!-]*) case ${w#-} in
                         *[mFCct]) skip=1 ;;
                     esac ;;
                 esac

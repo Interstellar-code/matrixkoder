@@ -139,9 +139,9 @@ Table 1 — required fields. Identity key = `(run, task, round, role)` (R27).
 - **R19.** Entering `blocked` requires a non-empty `question` (whitespace-only counts as empty);
   otherwise exit non-zero, file byte-identical.
 - **R20.** `done` is final per (run, task, round, role): after `state=done`, every further write
-  for the same identity — another `done`, `progress`, `blocked`, `ctx`, `phase-done`, or a
-  same-identity `start` — exits non-zero and leaves the file byte-identical. Only R21 (a different
-  identity) moves the file away.
+  for the same identity — another `done`, `progress`, `blocked`, `ctx`, or `phase-done` — exits
+  non-zero and leaves the file byte-identical; a `start` over a `done` file always archives the
+  old file and writes a fresh one (R17, R21).
 
 ## 5. `start`: archive and resume
 

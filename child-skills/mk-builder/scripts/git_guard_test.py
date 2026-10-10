@@ -320,6 +320,12 @@ REFUSED = [
     ("g11_amend_am", ["commit", "--am"], "G11", None),
     ("g11_amend_ame", ["commit", "--ame"], "G11", None),
     ("g11_amend_amen", ["commit", "--amen"], "G11", None),
+    ("g11_amend_no_edit_amend", ["commit", "--no-edit", "--amend"], "G11", None),
+    ("g11_amend_edit_amend", ["commit", "--edit", "--amend"], "G11", None),
+    ("g11_amend_short_amend", ["commit", "--short", "--amend"], "G11", None),
+    ("g11_amend_no_edit_am", ["commit", "--no-edit", "--am"], "G11", None),
+    ("g11_amend_c_opt_no_edit_amend", ["-c", "k=v", "commit", "--no-edit", "--amend"], "G11", None),
+    ("g11_amend_C_opt_short_amend", ["-C", ".", "commit", "--short", "--amend"], "G11", None),
     # G12 push: every trigger
     ("g12_push_force", ["push", "--force"], "G12", None),
     ("g12_push_force_lease", ["push", "--force-with-lease"], "G12", None),
