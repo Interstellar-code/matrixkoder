@@ -23,6 +23,10 @@ export const PALETTE = {
   grn: '#6fd39a', // ok
   red: '#ff8a6a', // err
   // the four chip tints: the role colour at ~20% over the panel
+  // Settings.dc.html's extra fills: the selected row, the picked mode card, a field
+  sel: '#1a2230',
+  modeOn: '#18202b',
+  field: '#0b0e12',
   blueTint: '#243145',
   ambTint: '#3a3120',
   grnTint: '#213830',

@@ -173,10 +173,10 @@ test('Settings · Mode: scope bar 1-8, MOCK row, Solo/Orchestrator/Hive (no Hybr
   expect(flat.includes('~/.matrixkoder/config.json · all projects'), 'the mode scope-note').toBe(true)
   // the scope bar: one pressable per scope, the digit its hotkey
   const scopeLabels = buttonsOf(drawn).map(b => String(b.props.label))
-  for (const label of ['Mode', 'Project', 'Routing', 'Agents', 'Models', 'Child', 'Tabs', 'About']) {
+  for (const label of ['Project', 'Routing', 'Agents', 'Models', 'Child', 'Tabs', 'About']) { // the active Mode is tint text
     expect(scopeLabels, `the ${label} scope button`).toContain(label)
   }
-  expect(buttonsOf(drawn).find(b => b.props.label === 'Mode')?.props.hotkey).toBe('1')
+  expect(buttonsOf(drawn).find(b => b.props.label === 'Project')?.props.hotkey).toBe('2')
   // the three bound modes; Hybrid is gone (the plan's departure)
   expect(flat.includes('OPERATING MODE'), 'the mode card header').toBe(true)
   for (const name of ['Solo', 'Orchestrator', 'Hive']) expect(flat.includes(name), `the ${name} mode card`).toBe(true)

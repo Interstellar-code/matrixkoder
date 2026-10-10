@@ -141,8 +141,12 @@ export function ActionButton(els: Els, spec: ActionSpec): RenderElement {
  *  press on a filled cell — the blue tint when `on`, the resting button fill
  *  otherwise (`flat`: no fill, for the scope strip's inactive scopes). Drawn
  *  width = label + 4 (one cell of padding each side + the plain press's 2). */
-export function Segment(els: Els, opts: { key: string; label: string; on: boolean; flat?: boolean; hotkey?: string; onPress: () => void }): RenderElement {
-  const { Box } = els
+export function Segment(els: Els, opts: { key: string; label: string; on: boolean; flat?: boolean; hotkey?: string; static?: true; onPress: () => void }): RenderElement {
+  const { Box, Text } = els
+  // the picked segment of a strip needs no press: plain bold blue text on the tint (a Button's label colour is the engine's)
+  if (opts.on && opts.static === true) {
+    return <Text key={`${opts.key}-box`} bold={true} color={ROLE.live.fg} backgroundColor={ROLE.live.tint}>{` ${opts.hotkey != null ? `${opts.hotkey}: ` : ''}${opts.label} `}</Text>
+  }
   const bg = opts.on ? ROLE.live.tint : opts.flat === true ? undefined : PALETTE.btn
   return (
     <Box key={`${opts.key}-box`} backgroundColor={bg} paddingX={1}>
@@ -348,10 +352,11 @@ export function SettingRow(els: Els, field: SettingField, ctx: SettingCtx): Rend
    *  budgeted to what is left after the control (the plain press draws
    *  without chrome). */
   const rowOf = (ctrl: RenderElement, ctrlW: number, label: string): RenderElement => {
-    const gaps = ctx.changed ? 2 : 1
-    const budget = Math.max(1, ctx.cols - ctrlW - 2 /* the plain label press */ - gaps - (ctx.changed ? 1 : 0))
+    const gaps = (ctx.changed ? 2 : 1) + (ctx.selected ? 1 : 0)
+    const budget = Math.max(1, ctx.cols - ctrlW - 2 /* the plain label press */ - gaps - (ctx.changed ? 1 : 0) - (ctx.selected ? 1 : 0))
     return (
       <Box flexDirection="row" justifyContent="space-between" gap={1}>
+        {ctx.selected && <Text color={ROLE.live.fg}>▌</Text>}
         {ctx.changed && <Text color={ROLE.warn.fg}>●</Text>}
         {ActionButton(els, {
           key: `${key}-pick`, glyph: ellipsize(label, budget), word: '',
@@ -396,7 +401,7 @@ export function SettingRow(els: Els, field: SettingField, ctx: SettingCtx): Rend
             key: `${key}-pick`, glyph: changedShown, word: '',
             plain: true, onPress: ctx.onPick,
           })}
-          <Box backgroundColor={PALETTE.bg} paddingX={1}>
+          <Box backgroundColor={PALETTE.field} paddingX={1}>
             <Input
               key={key} value={String(field.value)}
               onInput={v => ctx.onEdit(v)} onSubmit={v => ctx.onEdit(v)}
@@ -424,7 +429,7 @@ export function SettingRow(els: Els, field: SettingField, ctx: SettingCtx): Rend
         {field.pct === true && SmoothBar(els, { pct: Number.isFinite(n) && max > 0 ? (n / max) * 100 : 0, width: barW, role: 'live' })}
         <Box flexDirection="row">
           {Segment(els, { key: `${key}-dec`, label: '−', on: false, onPress: ctx.onDec })}
-          <Box backgroundColor={PALETTE.bg} paddingX={1}><Text>{val}</Text></Box>
+          <Box backgroundColor={PALETTE.field} paddingX={1}><Text>{val}</Text></Box>
           {Segment(els, { key: `${key}-inc`, label: '+', on: false, onPress: ctx.onInc })}
         </Box>
       </Box>,
@@ -451,6 +456,7 @@ export function SettingRow(els: Els, field: SettingField, ctx: SettingCtx): Rend
           key: `${key}-seg-${o.value}`,
           label: words[i] ?? o.value,
           on: o.value === String(field.value),
+          static: true,
           onPress: () => ctx.onChoose(o.value),
         }))}
       </Box>,
@@ -472,7 +478,7 @@ export function SettingRow(els: Els, field: SettingField, ctx: SettingCtx): Rend
         ? fullVal
         : ellipsize(fullVal, valBudget)
       main = rowOf(
-        <Box backgroundColor={PALETTE.bg}>
+        <Box backgroundColor={PALETTE.field}>
           {ActionButton(els, { key: `${key}-sel`, glyph: ` ${valShown}`, word: '▾', plain: true, onPress: ctx.onToggleOpen })}
         </Box>,
         settingPlainW(`${valShown} ▾`) + 1,
@@ -526,7 +532,7 @@ export function SettingRow(els: Els, field: SettingField, ctx: SettingCtx): Rend
   }
 
   return (
-    <Box flexDirection="column">
+    <Box flexDirection="column" backgroundColor={ctx.selected ? PALETTE.sel : undefined}>
       {main}
       {openList}
       {helpLine}
