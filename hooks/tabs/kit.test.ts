@@ -326,7 +326,7 @@ test('S2.1 bool: `◉ on` toggle chip fits 46+36, `●` when changed, help + def
   for (const cols of [46, 36] as const) {
     const root = node(SettingRow(stubEls(), field, settingCtx({ cols, changed: true })))
     everyRowFits(root, cols)
-    const tgl = buttonsIn(root).find(b => b.props.label === 'on')
+    const tgl = buttonsIn(root).find(b => b.props.label === '◉ on')
     expect(tgl, `toggle chip at ${cols}`).toBeDefined()
     expect(tgl?.props.hotkey).toBeUndefined() // a glyph, not a letter: no pane hotkey
     const marks = nodesIn('Text', root).filter(t => text(t) === '●')
@@ -335,7 +335,7 @@ test('S2.1 bool: `◉ on` toggle chip fits 46+36, `●` when changed, help + def
 
     let toggled = 0
     const live = node(SettingRow(stubEls(), field, settingCtx({ cols, onToggle: () => { toggled++ } })))
-    ;(buttonsIn(live).find(b => b.props.label === 'on')?.props.onPress as () => void)()
+    ;(buttonsIn(live).find(b => b.props.label === '◉ on')?.props.onPress as () => void)()
     expect(toggled).toBe(1)
 
     let resets = 0
@@ -446,7 +446,7 @@ test('S2.1 select: closed `value ▾` toggles the option list below (current `�
   for (const cols of [46, 36] as const) {
     const closed = node(SettingRow(fieldEls(), field, settingCtx({ cols })))
     everyRowFits(closed, cols)
-    const chip = buttonsIn(closed).find(b => b.props.label === 'terminal ▾')
+    const chip = buttonsIn(closed).find(b => b.props.label === ' terminal ▾')
     expect(chip, `closed chip at ${cols}`).toBeDefined()
     expect(chip?.props.plain).toBe(true) // no engine hotkey, however short the value
     expect(chip?.props.hotkey).toBeUndefined()
@@ -454,7 +454,7 @@ test('S2.1 select: closed `value ▾` toggles the option list below (current `�
 
     let opened = 0
     const live = node(SettingRow(fieldEls(), field, settingCtx({ cols, onToggleOpen: () => { opened++ } })))
-    ;(buttonsIn(live).find(b => b.props.label === 'terminal ▾')?.props.onPress as () => void)()
+    ;(buttonsIn(live).find(b => b.props.label === ' terminal ▾')?.props.onPress as () => void)()
     expect(opened).toBe(1)
 
     const open = node(SettingRow(fieldEls(), field, settingCtx({ cols, open: true })))
@@ -556,7 +556,7 @@ test('S2.1 fallback: no Input/Select in the element table → dim value + `edit 
     everyRowFits(root, cols)
     // the one pressable is the R3 label press (it reaches the why line); a control would do nothing
     expect(buttonsIn(root).map(b => String(b.props.label))).toEqual(['Plugin version'])
-    expect(nodesIn('Text', root).filter(t => t.props.dimColor === true).map(t => text(t))).toContain('on') // the dim value
+    expect(nodesIn('Text', root).map(t => text(t))).toContain(' ◉ on ') // the read-only chip, not pressable
     const sel = node(SettingRow(stubEls(), ro, settingCtx({ cols, selected: true })))
     const selText = text(sel)
     expect(selText.includes('Read-only: set by the')).toBe(true) // the why line, truncated to cols
