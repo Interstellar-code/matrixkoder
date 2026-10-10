@@ -473,7 +473,7 @@ export function SettingsTab(els: Els, view: SettingsView, cols: number, ui?: Tab
     <Box flexDirection="column">
       {view.mock && <Text bold={true} color="warning">MOCK · fixture data · not this run</Text>}
       {ScopeBar(els, view, cols, scopeId, ui, noHk)}
-      <Box flexDirection="row" gap={1} backgroundColor={PALETTE.bg} paddingX={1}>
+      <Box flexDirection="row" gap={1} backgroundColor={PALETTE.bg} paddingX={1} marginTop={1} marginBottom={1}>
         <Text dimColor={true}>/</Text>
         {findField}
         {q !== '' && (
@@ -506,7 +506,7 @@ export function SettingsTab(els: Els, view: SettingsView, cols: number, ui?: Tab
       <Box flexDirection="row" gap={1}>
         <Text dimColor={true}>space toggle · ←→ value ·</Text>
         {ActionButton(els, {
-          key: 'set-find', glyph: 'f', word: 'find', tone: 'quiet', plain: true, hotkey: noHk ? undefined : 'f',
+          key: 'set-find', glyph: 'find', word: '', tone: 'quiet', plain: true, hotkey: noHk ? undefined : 'f',
           // closing or opening the find field drops a stale ring key with it:
           // the hook re-records the ring on the next move
           onPress: () => { ui?.set('settings:findfocus', findFocus ? '' : '1'); ui?.set('settings:focus', '') },
@@ -530,7 +530,7 @@ function ScopeBar(els: Els, view: SettingsView, cols: number, activeId: Settings
   let curW = 0
   view.scopes.forEach((s, i) => {
     const digit = String(i + 1)
-    const w = `${digit} ${s.label}`.length + 4 // a Segment: padding + the plain press
+    const w = `${digit}: ${s.label}`.length + 4 // a Segment: padding + the plain press (the engine draws `d: ` before a hotkeyed label)
     if (cur.length > 0 && curW + w > cols) {
       rows.push(cur)
       cur = []
@@ -546,7 +546,7 @@ function ScopeBar(els: Els, view: SettingsView, cols: number, activeId: Settings
         <Box key={`set-scopebar-${String(ri)}`} flexDirection="row">
           {row.map(({ s, digit }) => Segment(els, {
             key: `set-scope-${s.id}`,
-            label: `${digit} ${s.label}`,
+            label: s.label,
             on: s.id === activeId,
             flat: true,
             hotkey: noHk ? undefined : digit,
@@ -803,9 +803,9 @@ function SaveMsg(els: Els, msg: string, cols: number): RenderElement {
 function DirtyFooter(els: Els, keys: readonly string[], cols: number, noHk: true | undefined, onSave: () => void, onClear: () => void): RenderElement {
   const { Box, Text } = els
   const head = `● ${keys.length} unsaved`
-  const save = Segment(els, { key: 'set-save', label: 's save', on: true, hotkey: noHk ? undefined : 's', onPress: onSave })
-  const discard = Segment(els, { key: 'set-discard', label: 'x discard', on: false, hotkey: noHk ? undefined : 'x', onPress: onClear })
-  const fixed = head.length + 2 + 's save'.length + 4 + 'x discard'.length + 4 + 3 /* gaps */ + 3 /* ' · ' */
+  const save = Segment(els, { key: 'set-save', label: 'save', on: true, hotkey: noHk ? undefined : 's', onPress: onSave })
+  const discard = Segment(els, { key: 'set-discard', label: 'discard', on: false, hotkey: noHk ? undefined : 'x', onPress: onClear })
+  const fixed = head.length + 2 + 's: save'.length + 4 + 'x: discard'.length + 4 + 3 /* gaps */ + 3 /* ' · ' */
   const avail = cols - fixed
   const keysText = avail >= 4 ? clip(keys.join(', '), avail) : ''
   return (
