@@ -23,13 +23,21 @@
       branch workspace slot last_commit gates verdict reviewer (branch/workspace/slot are written by
       mk-lane.py acquire; reviewer comes from the plan's phase or task set)
       status=dispatched|building needs every own AND ancestor dep merged/qa/done (--force overrides);
-      status= on a parent is refused (it rolls up from children); a task whose deps are all met gets
+      status= on a parent fans out: every child is set (one transition each, the same --note; the
+      parent itself is never set directly, it rolls up from the children); status aliases
+      reviewing/merging/fixing are stored as review/merged/fix; a task whose deps are all met gets
       ready=true and a "deps met" event; an unreadable sibling run only produces a warnings entry
   task round T --kind build|fix|takeover [--cause TEXT]
   task round T --undo — drop the latest round again, but only while none of its brief/report/review
       files exist (the paths task round printed); else ok:false naming them; one event
+  task verify T --tests '<pass>/<fail>' [--tsc N] [--lint N] [--selftest '<run>/<failed>'] [--fail TEXT]
+      stage 7: one verdict event with the counts (e.g. tests 250/1 · tsc 0 · lint 0 · selftest 8/0),
+      compared with the run's latest `baseline:` decision (tests/selftest must not drop; tsc/lint are
+      context); pass moves T (and its children) to review, fail (--fail or a drop) to fix — one
+      transition each (verify: pass | verify: fail — <why>)
   task get T
-  event [--task T] --type transition|decision|verdict|quota|note --text TEXT [--from S] [--to S]  (transition needs --to)
+  event [--task T] --type transition|decision|verdict|quota|note --text TEXT [--from S] [--to S]  (transition
+      needs --to; --from/--to take the status aliases and store the canonical word)
   wait set --question TEXT --options a,b [--rec TEXT] | wait clear
   lock take RES --reason TEXT [--ttl-min 30] [--scope a,b] [--force-stale]
   lock release RES [--force] (refuses a lock taken by another --by) | lock check RES
@@ -48,6 +56,7 @@ import argparse, contextlib, datetime, fcntl, fnmatch, hashlib, json, math, os, 
 SCHEMA = 1
 STATUSES = ("planned routed dispatched building verifying review fix merged qa done "
             "blocked quota stalled provider").split()
+STATUS_ALIASES = {"reviewing": "review", "merging": "merged", "fixing": "fix"}  # input aliases (F2.2)
 EVENT_TYPES = ("transition", "decision", "verdict", "quota", "note")
 TASK_KEYS = ("status", "agent", "model", "effort", "lane", "pane", "branch", "workspace", "slot",
              "last_commit", "gates", "verdict", "reviewer")
@@ -810,6 +819,8 @@ def cmd_task(a, st):
             return {"ok": True, "task": t, **({"warnings": warnings} if warnings else {})}
         t = find_task(run, a.task)
         cur = t["rounds"][-1] if t["rounds"] else None
+        if a.action == "verify":
+            return task_verify(st, run, t, a)
         if a.action == "set":
             changes = {}
             for pair in a.pairs:
@@ -817,11 +828,41 @@ def cmd_task(a, st):
                 if not sep or k not in TASK_KEYS:
                     raise Fail(f"bad pair {pair!r}; keys: {' '.join(TASK_KEYS)}")
                 changes[k] = parse_value(v)
-            if "status" in changes and changes["status"] not in STATUSES:
-                raise Fail(f"bad status {changes['status']!r}; one of: {' '.join(STATUSES)}")
-            if "status" in changes and any(c.get("parent") == t["id"] for c in run["tasks"]):
-                raise Fail(f"task {t['id']} has children: status rolls up from children "
-                           "(set the children, or --parent elsewhere)")
+            if "status" in changes:
+                # F2.2: the alias resolves before the check; the canonical word is what is stored
+                changes["status"] = STATUS_ALIASES.get(changes["status"], changes["status"])
+                if changes["status"] not in STATUSES:
+                    raise Fail(f"bad status {changes['status']!r}; one of: {' '.join(STATUSES)}")
+            kids = [c for c in run["tasks"] if c.get("parent") == t["id"]]
+            fanned = "status" in changes and bool(kids)
+            if fanned:
+                # F2.1 + M3: status= on a parent fans out to every leaf descendant (one transition
+                # each, the same --note); parents and intermediate children are never set directly,
+                # roll-up derives their status from the leaves below them. The dep gate runs per
+                # leaf, all before any write.
+                s = changes.pop("status")
+                leaf_ids = leaf_descendants(t["id"], run["tasks"])
+                leaves = [next((x for x in run["tasks"] if x.get("id", "").lower() == lid), None)
+                          for lid in leaf_ids]
+                leaves = [x for x in leaves if x is not None]
+                for c in leaves:
+                    if s in DEP_GATED and c["status"] not in DEP_GATED:
+                        waiting = st.unmet_tree(run, c)
+                        if waiting:
+                            if not a.force:
+                                raise Fail(f"task {c['id']} waits on {', '.join(waiting)} "
+                                           "(not merged/qa/done); pass --force to dispatch anyway",
+                                           unmet=waiting)
+                            st.event(run, "decision", f"forced by {a.by}: task set {t['id']} status={s} "
+                                     f"(fan-out, unmet: {', '.join(waiting)})", task=c["id"], by=a.by)
+                for c in leaves:
+                    if s != c["status"]:
+                        st.event(run, "transition", a.note or f"{c['status']} → {s}", task=c["id"],
+                                 frm=c["status"], to=s, by=a.by)
+                    elif a.note:
+                        st.event(run, "note", a.note, task=c["id"], by=a.by)
+                    c["status"], c["updated"] = s, now()
+                    write_json(os.path.join(st.task_dir(run["id"], c["id"]), "task.json"), c)
             if changes.get("status") in DEP_GATED and t["status"] not in DEP_GATED:
                 waiting = st.unmet_tree(run, t)  # the task's own deps plus every ancestor's
                 if waiting:
@@ -839,7 +880,7 @@ def cmd_task(a, st):
             if "status" in changes and changes["status"] != frm:
                 st.event(run, "transition", a.note or f"{frm} → {t['status']}", task=t["id"], frm=frm,
                          to=t["status"], by=a.by)
-            elif a.note:
+            elif a.note and not fanned:  # a fan-out already spent the note on each child
                 st.event(run, "note", a.note, task=t["id"], by=a.by)
         elif getattr(a, "undo", False):  # round --undo: drop the latest round, but only an empty one
             if a.kind or a.cause:
@@ -876,6 +917,127 @@ def cmd_task(a, st):
             return {"ok": True, "task": t["id"], "round": t["round"], "kind": a.kind,
                     **{k: os.path.join(d, f"{k}-r{t['round']}.md") for k in ("brief", "report", "review")}}
         return {"ok": True, "task": t, **({"warnings": warnings} if warnings else {})}
+
+
+def count_pair(v, flag):
+    """--tests/--selftest '<int>/<int>' -> (first, second); anything else is refused."""
+    m = re.fullmatch(r"(\d+)/(\d+)", v or "")
+    if not m:
+        raise Fail(f"bad {flag} {v!r}; expected '<int>/<int>'")
+    return int(m.group(1)), int(m.group(2))
+
+
+def latest_baseline(st, run):
+    """The run's latest `baseline:` decision event -> the counts it fixed ({} without one): the
+    tests and selftest pass-counts — tsc/lint ride in the text as context, never as gates. The
+    parser accepts both the `<int>/<int>` form (the orchestrator's first event) and the
+    `<int> pass / <int> fail` form (the dashboard's restyle note)."""
+    for e in reversed(st.events(run["id"], 10 ** 9)):
+        if e.get("type") == "decision" and str(e.get("text") or "").startswith("baseline:"):
+            out = {}
+            for key in ("tests", "selftest"):
+                # "<key> <int>/<int>" — the form `mk-state` itself records
+                m = re.search(rf"\b{key} (\d+)/(\d+)", e["text"])
+                if m:
+                    out[key] = int(m.group(1))
+                    continue
+                # "<key> <int> pass / <int> fail" — the form the dashboard note uses
+                m = re.search(rf"\b{key} (\d+) pass / (\d+) fail", e["text"])
+                if m:
+                    out[key] = int(m.group(1))
+            if "tsc" not in out:
+                m = re.search(r"\btsc (\d+)", e["text"])
+                if m:
+                    out["tsc"] = int(m.group(1))
+            return out
+    return {}
+
+
+def leaf_descendants(task_id, tasks):
+    """All leaf tasks reachable from task_id (a task with no children of its own within the
+    subtree). A parent that itself has a child is NOT a leaf — roll-up derives its status from
+    the leaves below it. Used by the F2.1 fan-out and F2.3 task verify so neither ever writes
+    a status directly onto a task that has children."""
+    children_of = {}
+    for x in tasks:
+        p = (x.get("parent") or "").lower()
+        if p:
+            children_of.setdefault(p, []).append(x)
+    leaves = []
+    stack = [task_id.lower()]
+    while stack:
+        cur = stack.pop()
+        kids = children_of.get(cur, [])
+        if not kids:
+            leaves.append(cur)
+        else:
+            for k in kids:
+                stack.append(k["id"].lower() if isinstance(k, dict) and "id" in k else str(k).lower())
+    return leaves
+
+
+def task_verify(st, run, t, a):
+    """F2.3 `task verify` (stage 7): one verdict event with the counts, compared against the run's
+    latest `baseline:` decision; pass (no --fail, no dropped count, no failing test/selftest)
+    moves T and its leaf descendants to review, fail moves them to fix — one transition each,
+    the same --by. A parent is never set directly (roll-up derives it from the leaves)."""
+    tests = count_pair(a.tests, "--tests")
+    parts = [f"tests {tests[0]}/{tests[1]}"]
+    if tests[1] > 0:
+        parts.append(f"tests {tests[1]} fail")
+    if a.tsc is not None:
+        parts.append(f"tsc {a.tsc}")
+    if a.lint is not None:
+        parts.append(f"lint {a.lint}")
+    selftest = count_pair(a.selftest, "--selftest") if a.selftest is not None else None
+    if selftest is not None:
+        parts.append(f"selftest {selftest[0]}/{selftest[1]}")
+        if selftest[1] > 0:
+            parts.append(f"selftest {selftest[1]} failed")
+    base = latest_baseline(st, run)
+    warnings = []
+    if not base:
+        warnings.append("task verify: no baseline event for this run (the drop gate is off; "
+                       "passing the run is still recorded)")
+    drops = []
+    if "tests" in base and tests[0] < base["tests"]:
+        drops.append(f"tests dropped {base['tests']}→{tests[0]}")
+    if selftest is not None and "selftest" in base and selftest[0] < base["selftest"]:
+        drops.append(f"selftest dropped {base['selftest']}→{selftest[0]}")
+    why = (a.fail or "").strip()
+    failed = bool(why or drops or tests[1] > 0 or (selftest is not None and selftest[1] > 0))
+    extras = ([f"fail: {why}"] if why else []) + (["no baseline"] if not base else [])
+    text = " · ".join(parts + drops + extras)
+    st.event(run, "verdict", text, task=t["id"], by=a.by)
+    # the note carries the FAIL reason or a one-line summary of which counts pushed it to fix
+    # (the verdict event has the full counts; the note names the cause for the board)
+    fail_reasons = list(drops)
+    if tests[1] > 0:
+        fail_reasons.append(f"tests {tests[1]} fail")
+    if selftest is not None and selftest[1] > 0:
+        fail_reasons.append(f"selftest {selftest[1]} failed")
+    if why:
+        fail_reasons.insert(0, why)
+    note = ("verify: pass" if not failed
+            else "verify: fail — " + " · ".join(fail_reasons))
+    target = "fix" if failed else "review"
+    moved = []
+    for leaf_id in leaf_descendants(t["id"], run["tasks"]):
+        if not isinstance(leaf_id, str):
+            continue
+        # resolve the actual task object
+        leaf = next((x for x in run["tasks"] if x.get("id", "").lower() == leaf_id), None)
+        if leaf is None or leaf["status"] == target:
+            continue
+        st.event(run, "transition", note, task=leaf["id"], frm=leaf["status"], to=target, by=a.by)
+        leaf["status"], leaf["updated"] = target, now()
+        moved.append(leaf["id"])
+        write_json(os.path.join(st.task_dir(run["id"], leaf["id"]), "task.json"), leaf)
+    st.save(run, t, a.by)
+    out = {"ok": True, "task": t, "result": "fail" if failed else "pass", "verdict": text, "moved": moved}
+    if warnings:
+        out["warnings"] = warnings
+    return out
 
 
 def plan_field_diffs(t, src, child):
@@ -996,6 +1158,8 @@ def cmd_event(a, st):
         raise Fail("event needs a non-empty --text")
     if a.type == "transition" and not a.to:
         raise Fail("transition event needs --to")
+    a.from_ = STATUS_ALIASES.get(a.from_, a.from_)  # F2.2: --from/--to store the canonical word
+    a.to = STATUS_ALIASES.get(a.to, a.to)
     for s in (a.from_, a.to):
         if s is not None and s not in STATUSES:
             raise Fail(f"bad status {s!r}")
@@ -1091,6 +1255,13 @@ def build_parser():
     t.add_argument("--undo", action="store_true")  # drop the latest (empty) round; kind checked in cmd
     t = task.add_parser("get", parents=[data_p, run_p])
     t.add_argument("task")
+    t = task.add_parser("verify", parents=[data_p, run_p])
+    t.add_argument("task")
+    t.add_argument("--tests", required=True)  # '<pass>/<fail>'
+    t.add_argument("--tsc", type=int)
+    t.add_argument("--lint", type=int)
+    t.add_argument("--selftest")  # '<run>/<failed>'
+    t.add_argument("--fail")
     for t in task.choices.values():
         t.set_defaults(func=cmd_task)
 
@@ -1518,15 +1689,21 @@ def self_test():
         rows = [x.split("|")[1].strip() for x in board_b if x.startswith("| ") and "Task" not in x]
         assert rows[-4:] == ["P", "↳ C1", "↳ C2", "↳ ↳ G"], rows
 
-        # an ancestor's unmet deps gate the child's dispatch; a parent's status is never manual
+        # an ancestor's unmet deps gate the child's dispatch; a parent's status= fans out (F2.1)
         dk("task", "add", "--id", "P2", "--title", "Parent 2", "--deps", "A3", "--run", "rb")
         dk("task", "add", "--id", "C4", "--title", "Child 4", "--parent", "P2", "--run", "rb")
         e = dk("task", "set", "C4", "status=dispatched", "--run", "rb", code=2)
         assert "waits on A3" in e["error"] and e["unmet"] == ["A3"], e
         assert dk("task", "set", "C4", "status=dispatched", "--force", "--run", "rb")["ok"]
-        for parent in ("P", "P2", "C2"):
-            e = dk("task", "set", parent, "status=building", "--run", "rb", code=2)
-            assert "status rolls up from children" in e["error"], e
+        # F2.1: status= on a parent fans out to every child (never written on the parent directly);
+        # the dep gate applies per child — an unmet one refuses the whole fan-out before any write
+        dk("task", "add", "--id", "PG", "--title", "Parent gated", "--deps", "A3", "--run", "rb")
+        dk("task", "add", "--id", "CG", "--title", "Child gated", "--parent", "PG", "--run", "rb")
+        e = dk("task", "set", "PG", "status=building", "--run", "rb", code=2)  # CG behind PG's dep A3
+        assert "waits on A3" in e["error"] and e["unmet"] == ["A3"], e
+        dk("task", "set", "P2", "status=review", "--run", "rb")  # review carries no gate: plain fan-out
+        assert dk("task", "get", "C4", "--run", "rb")["task"]["status"] == "review"
+        assert dk("task", "get", "P2", "--run", "rb")["task"]["status"] == "review"  # rolled up
 
         # --force past the dep gate: ONE decision event naming --by (default: orchestrator)
         dk("task", "add", "--id", "F1", "--title", "forced", "--deps", "A3", "--run", "rb")
@@ -1548,7 +1725,22 @@ def self_test():
         assert len(d) == 2 and d[1]["by"] == "orchestrator", d
         assert d[1]["text"] == "forced by orchestrator: task set F2 status=building (unmet: A3)", d
 
-        # --parent onto merged/qa/done is refused; other runs' ready stays correct after an add
+        # R2-L2: a parent fan-out that is --force'd past the dep gate writes the unmet list into
+        # the decision text (the old code missed the f-prefix and wrote the literal
+        # "{', '.join(waiting)}" into the event). Parent has dep A3 (unmet); the forced
+        # fan-out produces a decision event whose text names the unmet dep.
+        dk("task", "add", "--id", "RFG", "--title", "r2-l2 fan-out gated", "--deps", "A3", "--run", "rb")
+        dk("task", "add", "--id", "RFGC", "--title", "r2-l2 fan-out gated child", "--parent", "RFG", "--run", "rb")
+        n_dec = len(dec())
+        out = dk("task", "set", "RFG", "status=dispatched", "--force", "--run", "rb")
+        assert out["ok"], out
+        # the child (RFGC) was set to dispatched by the fan-out; the parent rolls up
+        assert dk("task", "get", "RFGC", "--run", "rb")["task"]["status"] == "dispatched"
+        d = dec()[n_dec:]
+        assert len(d) == 1 and d[0]["task"] == "RFGC", d
+        # the unmet list is rendered into the text (A3), not the literal format string
+        assert "(fan-out, unmet: A3)" in d[0]["text"], d[0]
+        assert "{'" not in d[0]["text"], d[0]  # the old bug wrote a literal "{', '.join(waiting)}"        # --parent onto merged/qa/done is refused; other runs' ready stays correct after an add
         dk("task", "add", "--id", "Q2", "--title", "q2", "--run", "rb")
         dk("task", "add", "--id", "D2", "--title", "waits on rb:Q2", "--deps", "rb:Q2", "--run", "ra")
         dk("task", "set", "Q2", "status=merged", "--run", "rb")
@@ -1652,6 +1844,161 @@ def self_test():
         assert sk("task", "add", "--id", "BD", "--title", "bad dep", "--deps", "baddep:X",
                   "--run", "good")["warnings"][0].startswith("dep baddep:X not found"), open(sick).read()
         assert sk("task", "add", "--id", "N", "--title", "n", "--owned", "src/*.ts", "--run", "good")["ok"]
+
+        # F2.1/F2.2/F2.3: parent status fan-out, status aliases, task verify — own data dir
+        f2 = ["--data", os.path.join(tmp, "f2")]
+        fk = lambda *x, code=0: mk(*x, *f2, code=code, data_arg=False)
+        fk("run", "init", "--id", "fr", "--feature", "F2 fixes", "--branch", "b")
+        fev = os.path.join(tmp, "f2", "runs", "fr", "events.jsonl")
+        fevs = lambda: [json.loads(x) for x in open(fev)]
+
+        # F2.1: a 3-child parent — status= fans out, one transition per child with the same --note,
+        # the parent itself is never set directly (roll-up derives it from the children)
+        fk("task", "add", "--id", "PF", "--title", "fan-out parent")
+        for i in (1, 2, 3):
+            fk("task", "add", "--id", f"FC{i}", "--title", f"child {i}", "--parent", "PF")
+        fk("task", "set", "PF", "status=fix", "--note", "fix round")
+        run = fk("run", "get")["run"]
+        ts = {x["id"]: x for x in run["tasks"]}
+        assert all(ts[f"FC{i}"]["status"] == "fix" for i in (1, 2, 3)), ts
+        assert ts["PF"]["status"] == "fix"  # rolled up from the children
+        fan = [e for e in fevs() if e["type"] == "transition" and e["to"] == "fix"
+               and e["task"] in ("FC1", "FC2", "FC3")]
+        assert len(fan) == 3 and {e["text"] for e in fan} == {"fix round"}, fan
+        # non-status keys still land on the parent itself (the fan-out is status= only)
+        assert fk("task", "set", "PF", "agent=codex")["task"]["agent"] == "codex"
+
+        # F2.2: aliases are accepted and stored canonically; unknown words still fail with the list
+        fk("task", "add", "--id", "AL", "--title", "aliases")
+        assert fk("task", "set", "AL", "status=reviewing")["task"]["status"] == "review"
+        assert fk("task", "set", "AL", "status=merging")["task"]["status"] == "merged"
+        assert fk("task", "set", "AL", "status=fixing")["task"]["status"] == "fix"
+        e = fk("task", "set", "AL", "status=bogus", code=2)
+        assert "bad status" in e["error"], e
+        assert "review" in e["error"] and "merged" in e["error"] and "reviewing" not in e["error"], e
+        ev = fk("event", "--task", "AL", "--type", "transition", "--text", "alias",
+                "--from", "fixing", "--to", "reviewing")["event"]
+        assert ev["from"] == "fix" and ev["to"] == "review", ev
+        assert fk("event", "--task", "AL", "--type", "transition", "--text", "x",
+                  "--to", "exploding", code=2)["ok"] is False
+
+        # F2.3 pass: counts at baseline → review, one verdict event carrying the counts and --by
+        fk("task", "add", "--id", "VT", "--title", "verify target")
+        fk("event", "--type", "decision", "--text", "baseline: tests 100/0 · tsc 0 · lint 0 · selftest 8/0")
+        out = fk("task", "verify", "VT", "--tests", "100/0", "--tsc", "0", "--lint", "0",
+                 "--selftest", "8/0", "--by", "reviewer-x")
+        assert out["ok"] and out["result"] == "pass" and out["task"]["status"] == "review", out
+        verd = [e for e in fevs() if e["type"] == "verdict"]
+        assert len(verd) == 1 and verd[0]["task"] == "VT" and verd[0]["by"] == "reviewer-x", verd
+        assert verd[0]["text"] == "tests 100/0 · tsc 0 · lint 0 · selftest 8/0", verd
+        tr = [e for e in fevs() if e["type"] == "transition" and e["task"] == "VT" and e["to"] == "review"]
+        assert tr and tr[-1]["text"] == "verify: pass" and tr[-1]["by"] == "reviewer-x", tr
+
+        # F2.3 fail on a dropped count: tests below baseline → fix, the drop named in the verdict
+        out = fk("task", "verify", "VT", "--tests", "99/1", "--tsc", "0", "--lint", "0", "--selftest", "8/0")
+        assert out["result"] == "fail", out
+        assert fk("task", "get", "VT")["task"]["status"] == "fix"
+        verd = [e for e in fevs() if e["type"] == "verdict"][-1]
+        assert "tests dropped 100→99" in verd["text"], verd
+        tr = [e for e in fevs() if e["type"] == "transition" and e["task"] == "VT" and e["to"] == "fix"]
+        assert tr and "verify: fail" in tr[-1]["text"] and "tests dropped 100→99" in tr[-1]["text"], tr
+
+        # F2.3 fail on an explicit reason: --fail wins even with every count at baseline
+        fk("task", "set", "VT", "status=building")  # so the fail move is a real transition
+        out = fk("task", "verify", "VT", "--tests", "100/0", "--selftest", "8/0", "--fail", "gate exploded")
+        assert out["result"] == "fail", out
+        assert fk("task", "get", "VT")["task"]["status"] == "fix"
+        tr = [e for e in fevs() if e["type"] == "transition" and e["task"] == "VT" and e["to"] == "fix"]
+        assert tr and tr[-1]["text"] == "verify: fail — gate exploded", tr
+
+        # F2.3 on a parent: the children move too; --tests must be <int>/<int>
+        fk("task", "add", "--id", "VP", "--title", "verify parent")
+        fk("task", "add", "--id", "VC1", "--title", "c1", "--parent", "VP")
+        fk("task", "add", "--id", "VC2", "--title", "c2", "--parent", "VP")
+        fk("task", "verify", "VP", "--tests", "100/0", "--selftest", "8/0")
+        run = fk("run", "get")["run"]
+        ss = {x["id"]: x["status"] for x in run["tasks"]}
+        assert ss["VP"] == ss["VC1"] == ss["VC2"] == "review", ss
+        for bad in ("100", "a/b", "100/0/1"):
+            assert fk("task", "verify", "VP", "--tests", bad, code=2)["ok"] is False, bad
+
+        # F2.3 H1: tests fail / selftest failed > 0 → fix, named in the verdict text.
+        # M3: verify never writes on a task that has children — the leaves carry the verify
+        # transition; the parent rolls up. Check the leaves' transitions, not the parent's.
+        fk("task", "set", "VP", "status=routed")  # so verify can move it again
+        fk("event", "--type", "decision", "--text",
+           "baseline: tsc 0 · tests 236 pass / 0 fail · selftest 8/0")  # alt form (M2)
+        fk("task", "set", "VP", "status=review")  # so the leaves' fail-move is a real transition
+        out = fk("task", "verify", "VP", "--tests", "240/5", "--selftest", "8/3")
+        assert out["result"] == "fail", out
+        assert fk("task", "get", "VP")["task"]["status"] == "fix"
+        verd = [e for e in fevs() if e["type"] == "verdict"][-1]
+        assert "tests 5 fail" in verd["text"] and "selftest 3 failed" in verd["text"], verd
+        # the verify transitions live on the leaves, not the parent
+        tr_leaves = [e for e in fevs() if e["type"] == "transition" and e["task"] in ("VC1", "VC2")
+                     and e["to"] == "fix"]
+        assert tr_leaves and "verify: fail" in tr_leaves[-1]["text"]
+        assert "tests 5 fail" in tr_leaves[-1]["text"] and "selftest 3 failed" in tr_leaves[-1]["text"], tr_leaves[-1]
+
+        # F2.3 M2: baseline parsed in the "<int> pass / <int> fail" form
+        fk("task", "set", "VP", "status=review")
+        out = fk("task", "verify", "VP", "--tests", "236/0", "--selftest", "8/0")
+        assert out["result"] == "pass" and out["task"]["status"] == "review", out
+        verd = [e for e in fevs() if e["type"] == "verdict"][-1]
+        assert "tests 236/0" in verd["text"] and "selftest 8/0" in verd["text"], verd
+        # F2.3 M2: drop gate works with the dashboard form — a run whose baseline is
+        # "tests 236 pass / 0 fail" and whose verify reports 100/0 must see the drop
+        # (the old parser returned base={} and silently disabled the drop gate)
+        fk("event", "--type", "decision", "--text",
+           "baseline: tsc 0 · tests 236 pass / 0 fail · selftest 8/0")
+        fk("task", "set", "VP", "status=building")
+        out = fk("task", "verify", "VP", "--tests", "100/0", "--selftest", "8/0")
+        assert out["result"] == "fail", out
+        verd = [e for e in fevs() if e["type"] == "verdict"][-1]
+        assert "tests dropped 236→100" in verd["text"], verd
+
+        # F2.3 M2: missing baseline → reply carries warnings, verdict says "no baseline"
+        fk("run", "init", "--id", "fr2", "--feature", "F2 r2", "--branch", "b")
+        fk2 = lambda *x, code=0: mk(*x, "--data", os.path.join(tmp, "f2"), "--run", "fr2",
+                                    code=code, data_arg=False)
+        fk2("task", "add", "--id", "VT2", "--title", "verify no baseline")
+        out = fk2("task", "verify", "VT2", "--tests", "240/5", "--selftest", "8/3")
+        assert out["result"] == "fail", out  # tests fail → still fix even without baseline
+        assert out.get("warnings") and "no baseline" in " ".join(out["warnings"]), out
+        verd = [json.loads(x) for x in open(os.path.join(tmp, "f2", "runs", "fr2", "events.jsonl"))
+                if json.loads(x).get("type") == "verdict"][-1]
+        assert "no baseline" in verd["text"], verd
+
+        # F2.3 M3: descendants — verify reaches leaves, never writes on a parent
+        fk("task", "add", "--id", "VGP", "--title", "verify grand", "--run", "fr")
+        fk("task", "add", "--id", "VGC", "--title", "verify grand child", "--parent", "VGP", "--run", "fr")
+        fk("task", "add", "--id", "VGGC", "--title", "verify grand grand child", "--parent", "VGC", "--run", "fr")
+        fk("event", "--run", "fr", "--task", "VGP", "--type", "decision", "--text",
+           "baseline: tests 100/0 · selftest 8/0")
+        out = fk("task", "verify", "VGP", "--tests", "100/0", "--selftest", "8/0", "--run", "fr")
+        run = fk("run", "get", "--run", "fr")["run"]
+        ss = {x["id"]: x["status"] for x in run["tasks"]}
+        assert ss["VGP"] == "review" and ss["VGC"] == "review" and ss["VGGC"] == "review", ss
+        # F2.3 M3: same for FAIL — leaves move to fix
+        fk("task", "set", "VGGC", "status=building", "--run", "fr")  # so the fail move is a real transition
+        out = fk("task", "verify", "VGP", "--tests", "100/0", "--selftest", "8/0", "--fail", "leaves", "--run", "fr")
+        run = fk("run", "get", "--run", "fr")["run"]
+        ss = {x["id"]: x["status"] for x in run["tasks"]}
+        assert ss["VGGC"] == "fix" and ss["VGC"] == "fix" and ss["VGP"] == "fix", ss
+
+        # F2.1 M3: fan-out reaches leaves too; never writes status onto a task that has children
+        fk("task", "add", "--id", "FGP", "--title", "fan grand", "--run", "fr")
+        fk("task", "add", "--id", "FGC", "--title", "fan grand child", "--parent", "FGP", "--run", "fr")
+        fk("task", "add", "--id", "FGGC", "--title", "fan grand grand child", "--parent", "FGC", "--run", "fr")
+        out = fk("task", "set", "FGP", "status=fix", "--note", "fix leaves", "--run", "fr")
+        run = fk("run", "get", "--run", "fr")["run"]
+        ss = {x["id"]: x["status"] for x in run["tasks"]}
+        assert ss["FGC"] == "fix" and ss["FGGC"] == "fix", ss  # grandchildren too
+        # the parent itself was not set directly: it rolled up from its descendants
+        # (FGP only has FGC as child per data; the roll-up sees FGC=fix → FGP=fix)
+        fan_grand = [e for e in fevs() if e["type"] == "transition" and e["task"] == "FGGC"
+                     and e["to"] == "fix" and e["text"] == "fix leaves"]
+        assert len(fan_grand) == 1, fan_grand  # exactly the grand grand child got the text
         # plans: run init --plan, plan sync, link fields, board ⚠, last-run done — own data dir,
         # the fixture plan tool in $MK_PLAN_CMD (never P1's real code)
         fix = os.path.join(tmp, "mkplan-fix.py")

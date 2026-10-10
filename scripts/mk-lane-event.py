@@ -7,7 +7,7 @@ Usage:
   mk-lane-event.py arm --lane DIR --pane ID --tasks A,B --run R --data DIR --phase P --commit-grep RX
                       [...]   # a shared lane group: one lane serving several phases of one plan
   mk-lane-event.py event                (herdr plugin hook: reads HERDR_PLUGIN_EVENT + HERDR_PLUGIN_EVENT_JSON)
-  mk-lane-event.py dispatch --pane ID --text TEXT [--timeout-ms 25000]
+  mk-lane-event.py dispatch --pane ID --text TEXT [--timeout-ms 25000] [--role build|review]
   mk-lane-event.py sweep [--data DIR]
   mk-lane-event.py disarm --lane DIR
   mk-lane-event.py --self-test
@@ -34,14 +34,19 @@ state and herdr's own error. The reply carries exactly what the subprocesses ret
 When the first attempt is not delivered while the pane just sits idle/done (the prompt was probably
 lost — once seen on a pane that was `done` all along), dispatch waits DISPATCH_RETRY_S
 ($MK_DISPATCH_RETRY_S, default 5 s) and sends the prompt ONE more time; that second attempt decides
-the verdict. Every dispatch reply also carries attempts (1 or 2), herdr_error (herdr's words for the
+the verdict. When even that leaves the pane idle/done and about to be reported not delivered,
+dispatch takes ONE last look after DISPATCH_RECHECK_S ($MK_DISPATCH_RECHECK_S, default 3 s): a fresh
+pane list plus the pane text (lane-health's read, visible-screen fallback) — the prompt marker (the
+first words of --text) found there means the prompt had landed after all, so delivered:true with
+recovered:true. Every dispatch reply also carries attempts (1 or 2), herdr_error (herdr's words for the
 attempt that did not deliver — kept even when a retry lands, the final attempt's when both fail) and
 pane_entry (the freshest raw `herdr pane list` row for the pane, null when no observation names it).
-A delivered prompt also re-arms the board for the next round: every armed task's children (or the
-task itself, when it has none) are set building via mk-state (script from $MK_STATE_CMD, default
-scripts/mk-state.py) — with --tasks A,B one delivered dispatch arms the whole lane group, so no
-phase's children are left behind; a failed write rides along in the JSON as task_status_error and
-never changes the delivery verdict. herdr runs one process per event with no ordering guarantee: every read/decide/write of a watch file
+A delivered build prompt (--role build, the default) also re-arms the board for the next round: every
+armed task's children (or the task itself, when it has none) are set building via mk-state (script
+from $MK_STATE_CMD, default scripts/mk-state.py) — with --tasks A,B one delivered dispatch arms the
+whole lane group, so no phase's children are left behind; a failed write rides along in the JSON as
+task_status_error and never changes the delivery verdict. --role review (reviewer panes) skips that
+write entirely — the task under review stays at review — and the reply says status_unchanged:true. herdr runs one process per event with no ordering guarantee: every read/decide/write of a watch file
 happens under an fcntl.flock on <lane>/.matrixkoder-watch.lock (a stable inode next to the atomically
 replaced watch file). One JSON line per command.
 """
@@ -51,6 +56,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 WATCH = ".matrixkoder-watch.json"
 LOCK = ".matrixkoder-watch.lock"
 DISPATCH_RETRY_S = 5  # wait before dispatch's one automatic retry; $MK_DISPATCH_RETRY_S overrides
+DISPATCH_RECHECK_S = 3  # wait before dispatch's one pane-text recheck; $MK_DISPATCH_RECHECK_S overrides
 RETRY_PANE_STATES = ("idle", "done")  # pane sat still through a failed wait → the prompt was lost
 
 sys.dont_write_bytecode = True  # no stray __pycache__ next to the scripts
@@ -331,6 +337,67 @@ def retry_wait_s():
         return float(DISPATCH_RETRY_S)
 
 
+def recheck_wait_s():
+    """Seconds dispatch sleeps before its ONE pane-text recheck ($MK_DISPATCH_RECHECK_S overrides
+    the DISPATCH_RECHECK_S default — read at call time like the retry wait, so a self-test can run
+    it at 0)."""
+    raw = os.environ.get("MK_DISPATCH_RECHECK_S")
+    try:
+        return max(0.0, float(raw)) if raw is not None else float(DISPATCH_RECHECK_S)
+    except ValueError:
+        return float(DISPATCH_RECHECK_S)
+
+
+def prompt_marker(text):
+    """The marker dispatch searches the pane text for on its recheck: the FIRST LINE of --text,
+    trimmed, capped at 60 chars. The first line carries the meaningful prefix (paths, ids, the
+    command's verb) — the loose "first word" form matched every "Read …" sibling-lane prompt and
+    turned real delivery failures into recovered ones. The 60-char cap keeps the substring search
+    bounded (long paths would otherwise produce expensive near-unique markers)."""
+    line = (text or "").strip().split("\n", 1)[0].strip()
+    return line[:60]
+
+
+def pane_text_snapshot(pane):
+    """The pane's text right now, via lane-health's read with the visible-screen fallback. Any
+    read failure returns '' (a snapshot is best-effort: the comparison below tolerates it)."""
+    try:
+        return lh.pane_text(pane) or ""
+    except Exception:
+        return ""
+
+
+def marker_in_new_pane_text(pane, marker, before):
+    """True when the marker appears in pane text that was NOT in `before` — the since_dispatch
+    check. Compared by occurrence COUNT (not slice) so a 300-line sliding window cannot hide
+    a freshly landed marker: the bottom of the screen is the new text, the top scrolls off,
+    and a slice like `after[len(before):]` returns nothing when the window slides. An empty
+    marker, an empty `before` AND `after`, or a failed `before` read proves nothing (False)
+    — a read failure means we cannot tell old from new, so we cannot prove the dispatch
+    landed and we must not recover it."""
+    if not marker:
+        return False
+    after = pane_text_snapshot(pane)
+    if not before and not after:
+        return False
+    # a failed `before` read (empty string) cannot prove the marker is new: treat as "cannot prove"
+    if not before:
+        return False
+    return after.count(marker) > before.count(marker)
+
+
+def marker_on_pane(pane, marker):
+    """Backwards-compat wrapper used by the test contract asserts (and lane-health's check):
+    the marker is visible anywhere in the pane's current text. Production code uses
+    marker_in_new_pane_text to scope the search to text that arrived since this dispatch started."""
+    if not marker:
+        return False
+    try:
+        return marker in (lh.pane_text(pane) or "")
+    except Exception:
+        return False
+
+
 def _jload(s):
     s = (s or "").strip()
     if not s.startswith("{"):
@@ -423,6 +490,16 @@ def mark_armed_building(pane):
     return res
 
 
+def delivered_status(pane, role):
+    """The board write a DELIVERED dispatch makes, by role. build (the default) →
+    mark_armed_building: every armed task's children (or the task itself) go building. review →
+    no write at all — the task under review stays at review, and status_unchanged:true in the
+    reply says the verdict knowingly moved nothing."""
+    if role == "review":
+        return {"status_unchanged": True}
+    return mark_armed_building(pane) or {}
+
+
 def _prompt_attempt(pane, text, ms):
     """One `herdr agent prompt --wait --timeout <ms>` call → (kind, why, agent_status, parsed reply).
     kind: "ok" = the wait result itself says the prompt landed; "exc" = the subprocess died or hung;
@@ -457,15 +534,22 @@ def cmd_dispatch(a):
     own state decides: still working → delivered:true; anything else → delivered:false — and when
     the pane just sits idle/done through a failed wait (the prompt was lost; once seen on a pane
     that was done all along) dispatch waits DISPATCH_RETRY_S and sends the prompt ONE more time,
-    the second attempt deciding the verdict and never retrying again. Every reply carries attempts
-    (1 or 2), herdr_error (herdr's words for the attempt that did not deliver — the first attempt's
-    when a retry lands, the final attempt's when both fail, the reply itself when nothing failed)
-    and pane_entry (the freshest raw `herdr pane list` row for the pane, null when no observation
-    names it). Other failures → ok:false. Completed checks exit 0 whatever the verdict; only usage
-    errors exit 2."""
+    the second attempt deciding the verdict and never retrying again. When even that leaves the
+    pane idle/done, one recheck after DISPATCH_RECHECK_S — a fresh pane list plus the pane text —
+    searches for the prompt marker (the first words of --text): found → delivered:true with
+    recovered:true (herdr's wait gave up while the prompt had already landed). --role review
+    (reviewer panes) delivers without the board write: no mark_armed_building, the reply says
+    status_unchanged:true instead. Every reply carries attempts (1 or 2), herdr_error (herdr's
+    words for the attempt that did not deliver — the first attempt's when a retry lands, the final
+    attempt's when both fail, the reply itself when nothing failed) and pane_entry (the freshest
+    raw `herdr pane list` row for the pane, null when no observation names it). Other failures →
+    ok:false. Completed checks exit 0 whatever the verdict; only usage errors exit 2."""
     pane, text = opt(a, "--pane"), opt(a, "--text")
     if not (pane and text):
         fail("dispatch needs --pane --text")
+    role = opt(a, "--role", "build")
+    if role not in ("build", "review"):
+        fail("--role must be build or review")
     try:
         ms = int(opt(a, "--timeout-ms", "25000"))
     except ValueError as e:
@@ -473,13 +557,17 @@ def cmd_dispatch(a):
     # the pane's raw list row before any prompt: the ok/fail arms report it as pane_entry; every
     # not-delivering exc/wait pass below replaces it with its own deciding observation
     _, entry, pl_err = pane_state(pane)
+    # since_dispatch capture: the pane text RIGHT NOW, before any herdr call. The recheck only
+    # counts the prompt marker when it appears in pane text that arrived AFTER this snapshot —
+    # an old "Read and follow …" sitting in pane history from a sibling lane must not recover
+    pane_text_before = pane_text_snapshot(pane)
     attempts, fail_why = 1, None
     while True:
         kind, why, status, j = _prompt_attempt(pane, text, ms)
         if kind == "ok":
             out({"ok": True, "delivered": True, "pane": pane, "agent_status": status, "timeout_ms": ms,
                  "attempts": attempts, "herdr_error": fail_why or why, "pane_entry": entry,
-                 **({"pane_list_error": pl_err} if pl_err else {}), **(mark_armed_building(pane) or {})})
+                 **({"pane_list_error": pl_err} if pl_err else {}), **delivered_status(pane, role)})
             return
         fail_why = why
         if kind == "fail":  # herdr failed some other way: its own words, no delivery, no pane check
@@ -491,12 +579,25 @@ def cmd_dispatch(a):
         if st == "working":  # the wait gave up, the agent did not: the prompt is still being delivered
             out({"ok": True, "delivered": True, "pane_state": "working", "pane": pane, "timed_out": True,
                  "timeout_ms": ms, "attempts": attempts, "herdr_error": why, "error": why,
-                 "pane_entry": entry, **(mark_armed_building(pane) or {})})
+                 "pane_entry": entry, **delivered_status(pane, role)})
             return
         if attempts == 1 and st in RETRY_PANE_STATES:  # idle/done: the prompt was lost — resend once
             time.sleep(retry_wait_s())
             attempts = 2
             continue
+        if st in RETRY_PANE_STATES:
+            # idle/done through a failed wait, about to report not delivered: ONE recheck, after
+            # DISPATCH_RECHECK_S — a fresh pane list plus the pane text. The prompt marker visible
+            # in NEW pane text (since_dispatch) means herdr's wait gave up while the prompt had
+            # already landed → delivered:true, recovered:true says why
+            time.sleep(recheck_wait_s())
+            st, entry, pl_err = pane_state(pane)
+            if marker_in_new_pane_text(pane, prompt_marker(text), pane_text_before):
+                out({"ok": True, "delivered": True, "recovered": True, "pane_state": st, "pane": pane,
+                     "timed_out": True, "timeout_ms": ms, "attempts": attempts, "herdr_error": why,
+                     "error": why, "pane_entry": entry,
+                     **({"pane_list_error": pl_err} if pl_err else {}), **delivered_status(pane, role)})
+                return
         out({"ok": False, "delivered": False, "pane_state": st, "pane": pane, "timed_out": True,
              "timeout_ms": ms, "attempts": attempts, "herdr_error": why, "error": why,
              "pane_entry": entry, **({"pane_list_error": pl_err} if pl_err else {})})
@@ -663,6 +764,14 @@ def self_test():
     # dispatch retry contract: the default wait is 5 s, read from $MK_DISPATCH_RETRY_S at call time
     assert RETRY_PANE_STATES == ("idle", "done") and DISPATCH_RETRY_S == 5
     assert retry_wait_s() == 5.0
+    # dispatch recheck contract: the default wait is 3 s, read from $MK_DISPATCH_RECHECK_S at call
+    # time; the marker is --text's first line (up to the first newline), capped at 60 chars
+    assert DISPATCH_RECHECK_S == 3
+    assert recheck_wait_s() == 3.0
+    assert prompt_marker("Read brief.md\nthen stop") == "Read brief.md"
+    assert prompt_marker("  go  ") == "go" and prompt_marker("go\nthink again") == "go"
+    assert prompt_marker("") == "" and prompt_marker(" \n ") == ""
+    assert prompt_marker("a" * 200) == "a" * 60  # capped at 60 chars
 
     tmp = tempfile.mkdtemp(prefix="mk-lane-event-test-")
     home, data = os.path.join(tmp, "home"), os.path.join(tmp, "data")
@@ -748,6 +857,15 @@ def self_test():
                     "elif a[:2] == ['agent', 'prompt']:\n"
                     "    log = os.path.join(base, 'calls.log')\n"
                     "    open(log, 'a').write(' '.join(a) + chr(10))\n"
+                    "    # every prompt call appends the prompt text to pane.txt for the since_dispatch\n"
+                    "    # recheck. `no_pane.txt` suppresses the append for tests that need the pane\n"
+                    "    # text to stay static across attempts.\n"
+                    "    no_pane = os.path.join(base, 'no_pane.txt')\n"
+                    "    if not os.path.exists(no_pane):\n"
+                    "        ptxt = a[3] if len(a) > 3 else ''\n"
+                    "        if ptxt:\n"
+                    "            with open(os.path.join(base, 'pane.txt'), 'a') as _pf:\n"
+                    "                _pf.write(ptxt + chr(10))\n"
                     "    hang = os.path.join(base, 'hang.txt')\n"
                     "    if os.path.exists(hang):\n"
                     "        import time; time.sleep(int(open(hang).read().strip()))\n"
@@ -1091,11 +1209,12 @@ def self_test():
         # (H2.1) one automatic retry: not delivered + pane idle/done → wait, send once more; every
         # reply carries attempts, herdr_error and the raw pane row. prompt_q.txt scripts the fake's
         # prompt replies per call ("-" = the base canned files, "2" = the *2 files, consumed in
-        # order); $MK_DISPATCH_RETRY_S runs the wait at 0 s instead of the real 5.
+        # order); $MK_DISPATCH_RETRY_S runs the wait at 0 s instead of the real 5, and
+        # $MK_DISPATCH_RECHECK_S does the same for the recheck's 3.
         def prompt_calls():
             return [l for l in open(calls).read().splitlines() if l.startswith("agent prompt")]
 
-        fast = {"MK_DISPATCH_RETRY_S": "0", "MK_STATE_CMD": fake_ms}
+        fast = {"MK_DISPATCH_RETRY_S": "0", "MK_DISPATCH_RECHECK_S": "0", "MK_STATE_CMD": fake_ms}
         done_row = {"pane_id": pane_of("H8"), "agent_status": "done", "workspace_id": "wD"}
         set_canned("prompt_out.txt", '{"error": {"code": "timeout", "message": "timed out waiting"}}\n')
         set_canned("prompt_rc.txt", "1")
@@ -1115,15 +1234,16 @@ def self_test():
         assert len(prompt_calls()) - n0 == 2, prompt_calls()
         assert ms_calls() == [f"task set H8C1 status=building --data {data} --by dispatch --run r1",
                               f"task set H8C2 status=building --data {data} --by dispatch --run r1"], ms_calls()
-        # (b) the pane never becomes working (done through both attempts) → delivered:false, the
-        # raw fields still present, no mk-state call
+        # (b) the pane never becomes working (done through both attempts) but the prompt text
+        # DID land in pane.txt (the fake herdr appends on every prompt call). The count check
+        # sees the marker count go up and recovers — the prompt was delivered even though the
+        # pane state didn't transition to working. delivered:true, recovered:true.
         set_canned("prompt_q.txt", "- -")
         open(ms_log, "w").write("")
         r = cli("dispatch", "--pane", pane_of("H8"), "--text", "go", extra=fast)
-        assert r["ok"] is False and r["delivered"] is False and r["attempts"] == 2, r
+        assert r["ok"] is True and r["delivered"] is True and r["recovered"] is True and r["attempts"] == 2, r
         assert r["pane_state"] == "done" and r["pane_entry"] == done_row, r
         assert "timeout" in r["herdr_error"] and "timeout" in r["error"] and r["timed_out"] is True, r
-        assert ms_calls() == [], ms_calls()
         # (c) pane state null — missing from a readable list, or the list unreadable → NO retry
         set_canned("pane_list_out.txt", '{"result": {"panes": []}}\n')
         set_canned("prompt_q.txt", "- 2")  # a scripted second reply that must never be sent
@@ -1150,6 +1270,118 @@ def self_test():
         assert len(prompt_calls()) - n0 == 1, prompt_calls()
         for f_ in ("prompt_out2.txt", "prompt_rc2.txt"):
             os.unlink(os.path.join(tmp, f_))
+
+        # (F3.1) dispatch --role review: delivered WITHOUT the board write — the task under review
+        # stays at review, real mk-state is never called, the reply says status_unchanged:true
+        lanes["H_R"] = os.path.join(tmp, "lane-hr")
+        g(repo, "worktree", "add", "-q", "--detach", lanes["H_R"])
+        mks("task", "add", "--id", "H_R", "--title", "rev", "--run", "r1")
+        mks("task", "set", "H_R", "status=review")
+        arm("H_R")
+        set_canned("prompt_out.txt", '{"result": {"agent": {"agent_status": "idle"}}}\n')
+        set_canned("prompt_err.txt", "")
+        set_canned("prompt_rc.txt", "0")
+        r = cli("dispatch", "--pane", pane_of("H_R"), "--text", "do review", "--role", "review")
+        assert r["ok"] is True and r["delivered"] is True and r["status_unchanged"] is True, r  # real mk-state: any write shows
+        assert "task_status_error" not in r and "building" not in r, r
+        assert task_status("H_R") == "review", task_status("H_R")  # STILL review, not building
+        # the same armed lane, default --role build, fake mk-state: the write IS made — the two
+        # paths differ exactly in the mk-state call review skips
+        mks("task", "set", "H_R", "status=review")
+        open(ms_log, "w").write("")
+        r = cli("dispatch", "--pane", pane_of("H_R"), "--text", "do review",
+                extra={"MK_STATE_CMD": fake_ms})
+        assert r["ok"] is True and r["delivered"] is True and "status_unchanged" not in r, r
+        assert r["building"] == ["H_R"], r  # childless task → itself
+        assert ms_calls() == [f"task set H_R status=building --data {data} --by dispatch --run r1"], ms_calls()
+        assert cli("dispatch", "--pane", pane_of("H_R"), "--text", "x", "--role", "boss",
+                   code=2)["ok"] is False  # --role takes exactly build|review
+
+        # (F3.2) stall + pane idle/done: ONE recheck (fresh pane list + pane text) before
+        # delivered:false — the prompt marker (first words of --text) in the pane text means it
+        # landed after all (herdr's wait gave up on a pane that was done all along)
+        def pane_list_calls():
+            return [l for l in open(calls).read().splitlines() if l == "pane list"]
+
+        set_canned("prompt_out.txt", '{"result": {"agent": {"agent_status": "agent_prompt_stalled"}}}\n')
+        set_canned("prompt_err.txt", "")
+        set_canned("prompt_rc.txt", "0")
+        idle_row8 = {"pane_id": pane_of("H8"), "agent_status": "idle", "workspace_id": "wD"}
+        set_canned("pane_list_out.txt", json.dumps({"result": {"panes": [idle_row8]}}) + "\n")
+        # pane text BEFORE the dispatch does NOT contain the dispatch marker; the fake herdr
+        # appends the prompt text on every prompt call, so the new portion in pane.txt after
+        # both stalled attempts carries the marker — since_dispatch sees it as new and recovers
+        open(pane_f, "w").write("> older unrelated work\nold history line\n")
+        set_canned("prompt_q.txt", "- -")  # both attempts settle on agent_prompt_stalled
+        open(ms_log, "w").write("")
+        nl0 = len(pane_list_calls())
+        r = cli("dispatch", "--pane", pane_of("H8"), "--text", "do the review", extra=fast)
+        assert r["ok"] is True and r["delivered"] is True and r["recovered"] is True, r
+        assert r["attempts"] == 2 and r["pane_state"] == "idle" and r["pane_entry"] == idle_row8, r
+        assert len(pane_list_calls()) - nl0 == 4, pane_list_calls()  # pre-read + 2 deciding + recheck
+        assert ms_calls() == [f"task set H8C1 status=building --data {data} --by dispatch --run r1",
+                              f"task set H8C2 status=building --data {data} --by dispatch --run r1"], ms_calls()
+        # pane working → the existing working path decides on its own check, no recheck happens
+        set_canned("prompt_out.txt", '{"error": {"code": "timeout", "message": "timed out waiting"}}\n')
+        set_canned("prompt_rc.txt", "1")
+        set_canned("pane_list_out.txt", json.dumps({"result": {"panes": [
+            {"pane_id": pane_of("H8"), "agent_status": "working"}]}}) + "\n")
+        nl0 = len(pane_list_calls())
+        r = cli("dispatch", "--pane", pane_of("H8"), "--text", "go", extra=fast)
+        assert r["ok"] is True and r["delivered"] is True and r["pane_state"] == "working", r
+        assert "recovered" not in r and r["attempts"] == 1, r
+        assert len(pane_list_calls()) - nl0 == 2, pane_list_calls()  # pre-read + deciding, no recheck
+
+        # (H2) since_dispatch: the recheck only counts the marker when it appears in pane text
+        # that is NEW since this dispatch started — the first line of --text that was ALREADY
+        # in the pane (an earlier dispatch's prompt, an old log line) must NOT recover.
+        set_canned("prompt_out.txt", '{"result": {"agent": {"agent_status": "agent_prompt_stalled"}}}\n')
+        set_canned("prompt_rc.txt", "0")
+        set_canned("pane_list_out.txt", json.dumps({"result": {"panes": [idle_row8]}}) + "\n")
+        # pane text BEFORE this dispatch starts already contains the exact marker. `no_pane.txt`
+        # suppresses the fake's append so the count does not go up — the marker is genuinely
+        # old (a sibling lane's earlier prompt, an old log line) and must not recover.
+        open(pane_f, "w").write("Read and follow /this/lane/brief.md\nold tail line\n")
+        open(os.path.join(tmp, "no_pane.txt"), "w").write("")
+        set_canned("prompt_q.txt", "- -")
+        open(ms_log, "w").write("")
+        r = cli("dispatch", "--pane", pane_of("H8"),
+                "--text", "Read and follow /this/lane/brief.md\nread the brief and continue",
+                extra=fast)
+        assert r["ok"] is False and r["delivered"] is False, r
+        assert "recovered" not in r and r["attempts"] == 2, r
+        assert ms_calls() == [], (r, ms_calls())
+        # the marker does NOT appear in old pane text — the new portion (fake appends) carries
+        # the marker and it is genuinely new since this dispatch started → recover
+        os.unlink(os.path.join(tmp, "no_pane.txt"))
+        open(pane_f, "w").write("older unrelated work\nold history line\n")
+        open(ms_log, "w").write("")
+        r = cli("dispatch", "--pane", pane_of("H8"),
+                "--text", "Read and follow /this/lane/brief.md\nread the brief and continue",
+                extra=fast)
+        assert r["ok"] is True and r["delivered"] is True and r["recovered"] is True, r
+        assert r["attempts"] == 2 and ms_calls() == [
+            f"task set H8C1 status=building --data {data} --by dispatch --run r1",
+            f"task set H8C2 status=building --data {data} --by dispatch --run r1"], ms_calls()
+        os.unlink(os.path.join(tmp, "prompt_q.txt"))
+
+        # (R2-M3) sliding pane: a full 300-line window where the prompt lands at the bottom.
+        # The old slice-based check returned False (the slice from the old length was empty
+        # after the window scrolled). The count check sees the marker count go up (the fake
+        # herdr appends the full --text on every prompt call) and recovers.
+        marker = "Read and follow /this/lane/brief.md"
+        open(pane_f, "w").write("\n".join(f"filler line {i}" for i in range(300)) + "\n")
+        set_canned("prompt_out.txt", '{"result": {"agent": {"agent_status": "agent_prompt_stalled"}}}\n')
+        set_canned("prompt_rc.txt", "0")
+        set_canned("pane_list_out.txt", json.dumps({"result": {"panes": [idle_row8]}}) + "\n")
+        set_canned("prompt_q.txt", "- -")
+        open(ms_log, "w").write("")
+        r = cli("dispatch", "--pane", pane_of("H8"),
+                "--text", f"{marker}\nread the brief and continue",
+                extra=fast)
+        assert r["ok"] is True and r["delivered"] is True and r["recovered"] is True, (
+            "full-window pane: the prompt marker count went up, recovered", r)
+        os.unlink(os.path.join(tmp, "prompt_q.txt"))
 
         # (J1.1) --tasks arms a lane GROUP: the watch file lists every task, and one delivered
         # dispatch sets the children of EVERY listed task (or the task itself when it has none)

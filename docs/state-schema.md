@@ -92,9 +92,9 @@ and legacy path-only runs.
 | `id`, `title` | string | `id` unique case-insensitively within the run (`T1` and `t1` clash) |
 | `wave` | int \| null | |
 | `deps`, `owned` | string[] | tasks it waits on (`T` in this run, `RUN:T` in another run of the same data dir); file globs it owns. Stored in the target's stored id case (ids match case-insensitively; a self-dep is refused at add). `task set status=dispatched\|building` fails while a dep of the task **or of any ancestor** is not `merged`/`qa`/`done` (`--force` overrides) |
-| `parent` | string \| null | parent task id (same run); `--parent` onto a task in `merged`/`qa`/`done` is refused. The parent's status rolls up from its children: a side state if any child is in one (`blocked` > `provider` > `quota` > `stalled`), else the least advanced child, raised to `building` only when at least one child is past `routed` and the least advanced child is below `building` (parents are never lowered); manual `status=` on a task with children is refused |
+| `parent` | string \| null | parent task id (same run); `--parent` onto a task in `merged`/`qa`/`done` is refused. The parent's status rolls up from its children: a side state if any child is in one (`blocked` > `provider` > `quota` > `stalled`), else the least advanced child, raised to `building` only when at least one child is past `routed` and the least advanced child is below `building` (parents are never lowered); manual `status=` on a task with children **fans out**: every child is set to it (one transition event each, the same `--note`), and the parent itself is never written directly |
 | `ready` | bool | written by mk-state: has deps, `planned`/`routed`, every dep met. A flip to true logs a `deps met` note; the dashboard toasts it |
-| `status` | enum | `planned → routed → dispatched → building → verifying → review → fix → merged → qa → done`; side states `blocked \| quota \| stalled \| provider` |
+| `status` | enum | `planned → routed → dispatched → building → verifying → review → fix → merged → qa → done`; side states `blocked \| quota \| stalled \| provider`. Input aliases, stored as the canonical word (also on `event --from`/`--to`): `reviewing`→`review`, `merging`→`merged`, `fixing`→`fix` |
 | `agent` | string \| null | agent kind or pane (`codex`, `agy`, ...) |
 | `model`, `effort`, `lane`, `pane` | string \| null | `lane` = worktree (slot) path; `pane` = herdr pane id of that lane (`wK:p1`), written by `mk-lane-event.py arm` (`mk-state task set <T> pane=<pane>`, best-effort) |
 | `branch`, `workspace`, `slot` | string \| null | the lane's own names, written by `mk-lane.py acquire`: `branch` = `mk/<run>/<task>`, `workspace` = herdr workspace label `mk:<repo>:<n>`, `slot` = slot number as a string. Empty value clears (`branch=`), like `lane=`/`pane=`; the board shows all three on the lane cell when set |
@@ -112,7 +112,8 @@ and legacy path-only runs.
 ```
 
 `type`: `transition | decision | verdict | quota | note`. `task` is `null` for run-level events.
-`from`/`to` are task statuses (`from` is `null` when a task is added). `by` = writer (`orchestrator`,
+`from`/`to` are task statuses (`from` is `null` when a task is added; the status aliases resolve here
+too, the canonical word is stored). `by` = writer (`orchestrator`,
 `lane-watch`, ...; `--by` flag). `text` carries the evidence (plan §4 called it `evidence`).
 `task set status=...` appends the transition event itself. Every `--force` override of a safety gate
 writes exactly one `decision` event `forced by <by>: <command summary>` (`by` = the `--by` flag,
@@ -279,8 +280,9 @@ everything else `default`.
 | `run set` | `[--id ID] [--next TEXT] [--status active\|done]` (at least one) |
 | `run stage` / `run archive` | `run stage N` (N >= 0, `[--id ID]`); `run archive --id ID` or `run archive ID` |
 | `task add` | `--id T --title TEXT [--wave N] [--deps A,RUN:B] [--owned glob,glob] [--parent P]` — deps are stored in the target's stored id case and a self-dep is refused; `--parent` onto a task in `merged`/`qa`/`done` fails; returns `warnings` for unknown deps, owned globs overlapping an unmerged task in any active run (the new task's own `--parent` chain is not an overlap: a parent owns its children's globs), and active sibling runs that could not be read |
-| `task set` | `T key=value ... [--note TEXT] [--force]` (`--force`: dispatch past unmet own+ancestor deps; writes a `decision` event naming `--by`); `status=` on a task with children fails (it rolls up); keys `status agent model effort lane pane branch workspace slot last_commit gates verdict reviewer`; a value starting `{`/`[` is parsed as JSON, empty = null |
+| `task set` | `T key=value ... [--note TEXT] [--force]` (`--force`: dispatch past unmet own+ancestor deps; writes a `decision` event naming `--by`); `status=` on a task with children fans out to every child — one transition each, the same `--note`, the parent itself never set directly (it rolls up), the dep gate applied per child before any write; status aliases `reviewing`/`merging`/`fixing` store as `review`/`merged`/`fix`; keys `status agent model effort lane pane branch workspace slot last_commit gates verdict reviewer`; a value starting `{`/`[` is parsed as JSON, empty = null |
 | `task round` | `T --kind build\|fix\|takeover [--cause TEXT]`; `T --undo` drops the latest round — but only while none of its brief/report/review files exist (the paths `task round` returned), else `ok:false` naming them; exactly one note event (`round N undone`); no rounds / `--kind` with `--undo` are refused |
+| `task verify` | `T --tests '<pass>/<fail>' [--tsc N] [--lint N] [--selftest '<run>/<failed>'] [--fail TEXT]` — stage 7; one `verdict` event, baseline compare, status move (see the subsection below) |
 | `task get` | `T` |
 | `event` | `[--task T] --type transition\|decision\|verdict\|quota\|note --text TEXT [--from S] [--to S]` |
 | `wait set` / `wait clear` | `--question TEXT --options a,b [--rec TEXT]` |
@@ -303,6 +305,26 @@ lane-watch exit → task status (with `--task --data`, both required together): 
 `QUOTA → quota`, `STALL → stalled`, `PROVIDER → provider`, `BLOCKED → blocked` — only while the task is
 `dispatched|building|stalled|quota|provider|blocked`; otherwise the status is kept and a `note` event is
 logged. `DEV_SERVER`, `ERROR`, `WATCH_EXPIRED` only append a `note` event.
+
+### `task verify` (stage 7)
+
+`task verify T --tests '<pass>/<fail>' [--tsc N] [--lint N] [--selftest '<run>/<failed>'] [--fail 'why']`
+records a verify gate run as **one `verdict` event** on `T` (the `--by` flag rides on it) whose text
+spells the counts in human-readable form, e.g. `tests 250/1 · tsc 0 · lint 0 · selftest 8/0` — flags
+not passed are simply left out. `--tests` is required and must match `<int>/<int>`; so must
+`--selftest` when given.
+
+The counts are compared with the run's **latest `baseline:` `decision` event** — the last event of
+type `decision` whose text starts with `baseline:`; its `tests P/F` and `selftest R/F` numbers are
+the gates (`tsc` and `lint` ride in the text as context only). A gate **drops** when the verify count
+is below the baseline count (`tests dropped 250→249`, `selftest dropped 8→7`); equal or higher is
+fine, and a count the call did not pass is not compared.
+
+Then the status move: on **pass** (no `--fail` and no dropped count) `T` — and every direct child,
+when `T` has children — moves to `review`; on **fail** (a `--fail` reason **or** a dropped count)
+they move to `fix`. Each move is one `transition` event carrying the same `--by` and the note
+`verify: pass` or `verify: fail — <why>` (the `--fail` text, or the drop list); a task already in
+the target status gets no transition (nothing moved).
 
 ## Plan link (C4)
 
