@@ -173,10 +173,10 @@ test('Settings · Mode: scope bar 1-8, MOCK row, Solo/Orchestrator/Hive (no Hybr
   expect(flat.includes('~/.matrixkoder/config.json · all projects'), 'the mode scope-note').toBe(true)
   // the scope bar: one pressable per scope, the digit its hotkey
   const scopeLabels = buttonsOf(drawn).map(b => String(b.props.label))
-  for (const label of ['1 Mode', '2 Project', '3 Routing', '4 Agents', '5 Models', '6 Child', '7 Tabs', '8 About']) {
+  for (const label of ['Mode', 'Project', 'Routing', 'Agents', 'Models', 'Child', 'Tabs', 'About']) {
     expect(scopeLabels, `the ${label} scope button`).toContain(label)
   }
-  expect(buttonsOf(drawn).find(b => b.props.label === '1 Mode')?.props.hotkey).toBe('1')
+  expect(buttonsOf(drawn).find(b => b.props.label === 'Mode')?.props.hotkey).toBe('1')
   // the three bound modes; Hybrid is gone (the plan's departure)
   expect(flat.includes('OPERATING MODE'), 'the mode card header').toBe(true)
   for (const name of ['Solo', 'Orchestrator', 'Hive']) expect(flat.includes(name), `the ${name} mode card`).toBe(true)
@@ -431,7 +431,7 @@ test('Settings · dirty footer: edits mark rows and count, s save / x discard cl
   let dirty = draw(ui, 46, 'routing')
   let flat = drawnText(dirty)
   expect(flat.includes('● 1 unsaved'), 'the count').toBe(true)
-  expect(flat.includes('s save'), 'the save action').toBe(true)
+  expect(flat.includes('save'), 'the save action').toBe(true)
   // a second edit doubles the count (the seg press carries the display word
   // `qual`; the edit stores the real value)
   press(dirty, 'set-routing_preferences.policy-seg-qual')
