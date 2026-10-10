@@ -96,6 +96,8 @@ export type ActionSpec = {
   plain?: true
   /** draw the chrome but arm no engine hotkey for the glyph */
   noHotkey?: true
+  /** a plain button that still arms this engine hotkey (the Segment strips) */
+  hotkey?: string
   onPress?: () => void
 }
 
@@ -122,7 +124,7 @@ export function ActionButton(els: Els, spec: ActionSpec): RenderElement {
   const variant = tone === 'primary' ? 'primary' : split ? 'secondary' : undefined
   const props: Parameters<typeof Button>[0] = { key: spec.key, label, onPress: () => { if (tone !== 'disabled') spec.onPress?.() } }
   if (!spec.plain && spec.noHotkey !== true && /^[a-z0-9]$/.test(spec.glyph)) props.hotkey = spec.glyph
-  if (spec.plain) props.plain = true
+  if (spec.plain) { props.plain = true; if (spec.hotkey != null) props.hotkey = spec.hotkey }
   else if (variant != null) props.variant = variant
   if (tone === 'quiet' || tone === 'disabled') props.dimColor = true
   const button = Button(props)
@@ -131,6 +133,20 @@ export function ActionButton(els: Els, spec: ActionSpec): RenderElement {
     <Box flexDirection="row" gap={1}>
       <Text color={tone === 'warn' ? ROLE.warn.fg : ROLE.err.fg}>{spec.glyph}</Text>
       {button}
+    </Box>
+  )
+}
+
+/** A boxed strip segment (Settings.dc.html's `.seg button` / `.sub`): a plain
+ *  press on a filled cell — the blue tint when `on`, the resting button fill
+ *  otherwise (`flat`: no fill, for the scope strip's inactive scopes). Drawn
+ *  width = label + 4 (one cell of padding each side + the plain press's 2). */
+export function Segment(els: Els, opts: { key: string; label: string; on: boolean; flat?: boolean; hotkey?: string; onPress: () => void }): RenderElement {
+  const { Box } = els
+  const bg = opts.on ? ROLE.live.tint : opts.flat === true ? undefined : PALETTE.btn
+  return (
+    <Box key={`${opts.key}-box`} backgroundColor={bg} paddingX={1}>
+      {ActionButton(els, { key: opts.key, glyph: opts.label, word: '', plain: true, hotkey: opts.hotkey, tone: opts.on ? 'primary' : 'default', onPress: opts.onPress })}
     </Box>
   )
 }
@@ -400,12 +416,14 @@ export function SettingRow(els: Els, field: SettingField, ctx: SettingCtx): Rend
     const n = Number(field.value)
     main = rowOf(
       <Box flexDirection="row" gap={1}>
-        {ActionButton(els, { key: `${key}-dec`, glyph: '−', word: '', onPress: ctx.onDec })}
-        <Text>{val}</Text>
-        {ActionButton(els, { key: `${key}-inc`, glyph: '+', word: '', onPress: ctx.onInc })}
         {field.pct === true && SmoothBar(els, { pct: Number.isFinite(n) && max > 0 ? (n / max) * 100 : 0, width: barW, role: 'live' })}
+        <Box flexDirection="row">
+          {Segment(els, { key: `${key}-dec`, label: '−', on: false, onPress: ctx.onDec })}
+          <Box backgroundColor={PALETTE.bg} paddingX={1}><Text>{val}</Text></Box>
+          {Segment(els, { key: `${key}-inc`, label: '+', on: false, onPress: ctx.onInc })}
+        </Box>
       </Box>,
-      val.length + 12 + (field.pct === true ? 1 + barW : 0), // `[ − ]` + `[ + ]` + the two gaps + the bar's
+      val.length + 2 + 10 + (field.pct === true ? 1 + barW : 0), // two boxed steppers (5 each) + the boxed value + the bar's
       field.label,
     )
   } else if (field.type === 'seg') {
@@ -414,7 +432,7 @@ export function SettingRow(els: Els, field: SettingField, ctx: SettingCtx): Rend
     // the budget reserves the plain label press and the changed marker (R3)
     let words = opts.map(o => o.value)
     const segW = (ws: readonly string[]): number =>
-      ws.reduce((n, w) => n + settingBtnW(`○ ${w}`), 0) + Math.max(0, ws.length - 1)
+      ws.reduce((n, w) => n + w.length + 4, 0)
     while (ctx.cols - segW(words) - 2 - (ctx.changed ? 3 : 1) < 1 && words.some(w => w.length > 1)) {
       let longest = 0
       for (let i = 1; i < words.length; i++) {
@@ -423,11 +441,11 @@ export function SettingRow(els: Els, field: SettingField, ctx: SettingCtx): Rend
       words = words.map((w, i) => (i === longest ? w.slice(0, -1) : w))
     }
     main = rowOf(
-      <Box flexDirection="row" gap={1}>
-        {opts.map((o, i) => ActionButton(els, {
+      <Box flexDirection="row">
+        {opts.map((o, i) => Segment(els, {
           key: `${key}-seg-${o.value}`,
-          glyph: o.value === String(field.value) ? '●' : '○',
-          word: words[i] ?? o.value,
+          label: words[i] ?? o.value,
+          on: o.value === String(field.value),
           onPress: () => ctx.onChoose(o.value),
         }))}
       </Box>,
