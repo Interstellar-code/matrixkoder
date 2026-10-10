@@ -462,7 +462,9 @@ export function SettingsTab(els: Els, view: SettingsView, cols: number, ui?: Tab
         {ActionButton(els, {
           key: 'set-find', glyph: 'f', word: 'find',
           noHotkey: noHk,
-          onPress: () => { ui?.set('settings:findfocus', findFocus ? '' : '1') },
+          // closing or opening the find field drops a stale ring key with it:
+          // the hook re-records the ring on the next move
+          onPress: () => { ui?.set('settings:findfocus', findFocus ? '' : '1'); ui?.set('settings:focus', '') },
         })}
         {findField}
         {q !== '' && (
@@ -487,9 +489,11 @@ export function SettingsTab(els: Els, view: SettingsView, cols: number, ui?: Tab
       {dirties.length > 0 && DirtyFooter(els, dirties, cols, noHk, () => {
         // S3: the save press runs the ordered write (yaml sets, then globals);
         // without the live wire (fixture/tests) it keeps clearing the edits.
+        // Either way the footer unmounts with a stale ring key on it.
+        ui?.set('settings:focus', '')
         if (ui?.save != null) ui.save(savePayloadOf(view, ui))
         else clearAllEdits(view, ui)
-      }, () => { clearAllEdits(view, ui) })}
+      }, () => { ui?.set('settings:focus', ''); clearAllEdits(view, ui) })}
     </Box>
   )
 }
@@ -534,6 +538,7 @@ function ScopeBar(els: Els, view: SettingsView, cols: number, activeId: Settings
               ui?.set('settings:open', '')
               ui?.set('settings:find', '')
               ui?.set('settings:findfocus', '')
+              ui?.set('settings:focus', '') // the scope's Inputs unmount with it
             },
           }))}
         </Box>

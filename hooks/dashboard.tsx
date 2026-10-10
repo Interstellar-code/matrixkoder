@@ -19,19 +19,19 @@ import { AGENT_COLOR, AGENT_GLYPH, NARROW, STATUS_COLOR, STATUS_GLYPH, bar, left
 import { mockRunHeader, mockTabCounts, stageWord, STAGE_TOTAL } from './tabs/header'
 import type { RunHeaderData } from './tabs/header'
 import { Chip } from './tabs/kit'
-import { PALETTE } from './tabs/palette'
+import { PALETTE, ROLE } from './tabs/palette'
 import { withRaster } from './tabs/raster'
 import { EventsTab, eventsView } from './tabs/events'
 import { LanesTab, lanesView } from './tabs/lanes'
 import { OverviewTab, overviewView } from './tabs/overview'
 import { PlanTab, planView } from './tabs/plan'
-import { SettingsTab, settingsView } from './tabs/settings'
+import { SettingsTab } from './tabs/settings'
 import type { SettingsValue, SettingsView } from './tabs/settings'
 import {
-  applySavedView, buildSettingsView, firstTagLine, loadYaml, parsePluginManifest, saveGlobals, saveYaml,
+  applySavedView, buildSettingsView, firstTagLine, runListFields, parsePluginManifest, runMigrate, saveGlobals, saveYaml,
   savedEditKeys, topChangelogEntry,
 } from './settings-io'
-import type { RunFn, SavePayload } from './settings-io'
+import type { RunFn, SavePayload, YamlFieldIn } from './settings-io'
 import { UsageTab, usageView } from './tabs/usage'
 import { WaitingTab, waitingView } from './tabs/waiting'
 import { chipText, toastsFor } from './status'
@@ -241,9 +241,11 @@ export function registerDashboard(on: On, options: PluginOptions): void {
       save: payload => { void saveSettings($, payload) },
       recheck: () => { void recheckAbout($) },
     }
-    // S3: the live Settings view once loaded (the fixture meanwhile — its
-    // MOCK row says so). A tab opened straight onto settings (defaultTab)
-    // loads here; every other open loads from the tab switch.
+    // S3: the live Settings view once loaded. Before that a one-line
+    // skeleton draws — never the fixture's mock rows (LOW 1). A tab opened
+    // straight onto settings (defaultTab) loads here while nothing is stored;
+    // every other open reloads from the tab switch (LOW 5) — a render must
+    // never start a refresh on its own, or the refresh tick would re-list.
     const settingsState = readSettingsState(viewState)
     const settingsLive = settingsState.live
     if (dashTab === 'settings' && settingsLive == null && !settingsInflight && (viewState['settings:load:error'] ?? '') === '') {
@@ -278,7 +280,9 @@ export function registerDashboard(on: On, options: PluginOptions): void {
               : dashTab === 'plan'
                 ? PlanTab(tabEls, planView(), cols, ui)
             : dashTab === 'settings'
-              ? SettingsTab(tabEls, settingsLive ?? settingsView(), cols, ui)
+              ? settingsLive != null
+                ? SettingsTab(tabEls, settingsLive, cols, ui)
+                : SettingsLoading(els, cols, viewState['settings:load:error'] ?? '')
                   : dashTab === 'usage'
                     ? withViewState(UsageTab, tabEls, usageView(), cols, ui)
                     : dashTab === 'events'
@@ -313,15 +317,29 @@ function withViewState<V>(
 
 /** A tab-bar press (S0.2): the state write is legal in onPress (a render must
  * never write), and the pane scrolls back to the top — a refused scroll leaves
- * the switch standing. Opening settings kicks its live load (S3). */
+ * the switch standing. Opening settings kicks its live load (S3); every switch
+ * drops a stale Settings ring key with it (MEDIUM 2). */
 async function switchTab($: EngineInterface, tab: MkDashTab): Promise<void> {
   await update($, dashTabAtom, () => tab)
+  await setViewKey($, 'settings:focus', '')
   if (tab === 'settings') void ensureSettingsLoaded($)
   try {
     await $.ui.scroll({ in: PANE_ID, to: 'start' })
   } catch {
     // no scroll here — the tab still switched
   }
+}
+
+/** S3: the first-open skeleton — one dim line, never mock rows (LOW 1). A
+ *  settled load error draws its `⚠` line here too (no live view to carry it). */
+function SettingsLoading(els: Els, cols: number, loadError: string): RenderElement {
+  const { Box, Text } = els
+  return (
+    <Box flexDirection="column" width={cols} gap={1}>
+      {loadError !== '' && <Text color={ROLE.err.fg}>{`⚠ ${loadError.length > cols ? `${loadError.slice(0, Math.max(0, cols - 2))}…` : loadError}`}</Text>}
+      {loadError === '' && <Text dimColor={true}>loading settings…</Text>}
+    </Box>
+  )
 }
 
 /** V0.4's run header (Main.dc.html): the bold run name with the stage chip (and
@@ -782,11 +800,14 @@ function readSettingsState(viewState: Record<string, string>): {
   return { live, migrated: viewState['settings:migrated'] === '1', dataDir: viewState['settings:datadir'] ?? null }
 }
 
-/** S3.1: load the live Settings rows the first time the tab opens — migrate
- *  once per session, then list --json (both with --data), globals from
- *  $.config.list(), About from plugin.json + git tags + CHANGELOG. Later
- *  opens reuse the stored view; a failed load records `settings:load:error`
- *  (drawn over the fixture view) and retries next open. */
+/** S3: load the live Settings rows. MEDIUM 3: `migrate` runs only when
+ *  `<dataDir>/matrixkoder.yaml` already exists — a tab open never creates
+ *  one; without it neither `migrate` nor `list` runs and the tab says so.
+ *  LOW 5: every open re-reads (`list`, globals, About); `migrate` still runs
+ *  at most once per session (`settings:migrated` is stored right after it
+ *  succeeds — LOW 2 — so a failing `list` never reruns it). Any failure
+ *  still stores a live (possibly yaml-less) view, so the tab draws the `⚠`
+ *  line over live rows and never the fixture (LOW 1). */
 async function ensureSettingsLoaded($: EngineInterface): Promise<void> {
   if (settingsInflight) return
   settingsInflight = true // synchronous: the render fallback and the tab switch race here
@@ -795,10 +816,9 @@ async function ensureSettingsLoaded($: EngineInterface): Promise<void> {
     try {
       seen = await read($, viewStateAtom)
     } catch {
-      return // the atom read failed — the tab keeps its fixture view
+      return // the atom read failed — the loading line stands
     }
     const st = readSettingsState(seen)
-    if (st.live != null) return
     let cwd: string | null = null
     try {
       cwd = await $.session.cwd()
@@ -806,13 +826,31 @@ async function ensureSettingsLoaded($: EngineInterface): Promise<void> {
       cwd = null
     }
     const dataDir = cwd == null ? null : await resolveDataDir($, cwd, await homeDir($))
-    if (dataDir == null) {
-      await setViewKey($, 'settings:load:error', 'no project data dir — run /mk setup first')
-      return
+    let yamlExists = false
+    if (dataDir != null) {
+      try {
+        yamlExists = (await $.fs.stat(join(dataDir, 'matrixkoder.yaml'))).kind === 'file'
+      } catch {
+        yamlExists = false
+      }
     }
     const root = $.plugin.root
     const run: RunFn = (argv, init) => $.process.run(argv, init)
-    const { fields } = await loadYaml(run, root, dataDir, st.migrated)
+    let fields: YamlFieldIn[] = []
+    let loadError = ''
+    if (!yamlExists) {
+      loadError = 'No matrixkoder.yaml — run /mk setup'
+    } else if (dataDir != null) {
+      try {
+        if (!st.migrated) {
+          await runMigrate(run, root, dataDir)
+          await setViewKey($, 'settings:migrated', '1')
+        }
+        fields = (await runListFields(run, root, dataDir)).fields
+      } catch (e) {
+        loadError = String(e instanceof Error ? e.message : e).slice(0, 120)
+      }
+    }
     let cfg: { key: string; value: SettingsValue; isLocked: boolean }[] = []
     try {
       cfg = (await $.config.list()).map(r => ({ key: r.key, value: r.value, isLocked: r.isLocked }))
@@ -825,13 +863,12 @@ async function ensureSettingsLoaded($: EngineInterface): Promise<void> {
       await update($, viewStateAtom, prev => ({
         ...prev,
         ['settings:live']: JSON.stringify(view),
-        ['settings:migrated']: '1',
-        ['settings:datadir']: dataDir,
+        ...(dataDir != null ? { ['settings:datadir']: dataDir } : {}),
       }))
     } catch {
       // the view did not stick — the next open retries
     }
-    await setViewKey($, 'settings:load:error', '')
+    await setViewKey($, 'settings:load:error', loadError)
   } catch (e) {
     await setViewKey($, 'settings:load:error', String(e instanceof Error ? e.message : e).slice(0, 120))
   } finally {
@@ -878,8 +915,21 @@ async function loadAbout($: EngineInterface, run: RunFn, root: string): Promise<
  *  the rest and its error is the message), then the globals (a {deny} stops
  *  the rest and its reason is shown). Discard writes nothing: the tab clears
  *  locally without calling here. Success clears every edit and leaves
- *  `✓ saved N · backups written first`; any error leaves the edits intact. */
+ *  `✓ saved N · backups written first`; any error leaves the edits intact.
+ *  LOW 4: a second press while a save runs does nothing. */
+let settingsSaveInflight = false
+
 async function saveSettings($: EngineInterface, payload: SavePayload): Promise<void> {
+  if (settingsSaveInflight) return
+  settingsSaveInflight = true // synchronous: two presses race here
+  try {
+    await saveSettingsInner($, payload)
+  } finally {
+    settingsSaveInflight = false
+  }
+}
+
+async function saveSettingsInner($: EngineInterface, payload: SavePayload): Promise<void> {
   let seen: Record<string, string> = {}
   try {
     seen = await read($, viewStateAtom)
@@ -888,12 +938,14 @@ async function saveSettings($: EngineInterface, payload: SavePayload): Promise<v
     return
   }
   const st = readSettingsState(seen)
-  if (st.live == null || st.dataDir == null) {
+  // the yaml leg needs its data dir; a globals-only save runs without one
+  // (no yaml rows draw, so saveYaml spawns nothing)
+  if (st.live == null || (payload.sets.length > 0 && st.dataDir == null)) {
     await setViewKey($, 'settings:save:msg', 'settings not loaded — open the tab first')
     return
   }
   const run: RunFn = (argv, init) => $.process.run(argv, init)
-  const yaml = await saveYaml(run, $.plugin.root, st.dataDir, payload.sets).catch((e: unknown) => ({
+  const yaml = await saveYaml(run, $.plugin.root, st.dataDir ?? '', payload.sets).catch((e: unknown) => ({
     saved: 0,
     error: String(e instanceof Error ? e.message : e) as string | undefined,
   }))
@@ -908,13 +960,11 @@ async function saveSettings($: EngineInterface, payload: SavePayload): Promise<v
     await setViewKey($, 'settings:save:msg', 'config unavailable — yaml saved, globals kept')
     return
   }
-  const hiddenField = st.live.groups.flatMap(g => g.rows).find(r => r.key === 'hiddenTabs')
   const globals = await saveGlobals(
     async () => cfg,
     async (key, value) => $.config.set({ key, value }),
     payload.globals,
     payload.visibility,
-    typeof hiddenField?.value === 'string' ? hiddenField.value : '',
   ).catch((e: unknown) => ({ saved: 0, error: String(e instanceof Error ? e.message : e) as string | undefined }))
   if (globals.error != null) {
     await setViewKey($, 'settings:save:msg', globals.error)

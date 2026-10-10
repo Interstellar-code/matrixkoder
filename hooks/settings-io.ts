@@ -57,16 +57,35 @@ export function mkConfigArgv(pluginRoot: string, dataDir: string, ...cmd: string
   return ['python3', `${pluginRoot}/${MK_CONFIG_SCRIPT}`, '--data', dataDir, ...cmd]
 }
 
-/** Run argv, refuse a non-zero exit, parse the one JSON line on stdout. */
+/** Run argv and take the one JSON line on stdout. The real CLI reports a
+ *  refusal as exit 2 WITH the reason on stdout
+ *  (`{"ok":false,"error":"repo.lanes.slots must be between 1 and 6: 99"}`, empty
+ *  stderr) — so stdout is parsed before the exit code is looked at: a JSON
+ *  `ok:false` throws its `error` text, a JSON `ok:true` stands whatever the
+ *  exit. Only with no JSON on stdout does the exit code speak (`<cmd> exit N:
+ *  <stderr>`); exit 0 with no JSON is `printed no JSON`. */
 async function runJson(run: RunFn, argv: readonly string[]): Promise<unknown> {
   const r = await run(argv, { timeoutMs: MK_CONFIG_TIMEOUT_MS })
-  if (r.exitCode !== 0) {
-    throw new Error(`${argv[argv.length - 1] ?? '?'} exit ${r.exitCode}: ${r.stderr.trim().slice(0, 100)}`.trim())
+  const cmd = argv.find(a => a === 'migrate' || a === 'list' || a === 'get' || a === 'set') ?? argv[argv.length - 1] ?? '?'
+  const parsed = tryJson(r.stdout)
+  if (parsed !== undefined) {
+    const ok = okOf(parsed)
+    if (ok.ok) return parsed
+    throw new Error(ok.error)
   }
+  if (r.exitCode !== 0) {
+    const err = r.stderr.trim()
+    throw new Error(err !== '' ? `${cmd} exit ${r.exitCode}: ${err}` : `${cmd} exit ${r.exitCode}`)
+  }
+  throw new Error(`${cmd} printed no JSON`)
+}
+
+/** stdout's JSON value, or undefined when it holds none (empty or torn). */
+function tryJson(stdout: string): unknown {
   try {
-    return JSON.parse(r.stdout.trim()) as unknown
+    return JSON.parse(stdout.trim()) as unknown
   } catch {
-    throw new Error(`${argv[argv.length - 1] ?? '?'} printed no JSON`)
+    return undefined
   }
 }
 
@@ -109,10 +128,30 @@ export async function loadYaml(
   dataDir: string,
   alreadyMigrated: boolean,
 ): Promise<{ file: string; fields: YamlFieldIn[]; migrated: boolean }> {
-  if (!alreadyMigrated) {
-    const ans = await runJson(run, mkConfigArgv(pluginRoot, dataDir, 'migrate'))
-    if (!okOf(ans).ok) throw new Error(`migrate: ${(okOf(ans) as { error: string }).error}`)
+  if (!alreadyMigrated) await runMigrate(run, pluginRoot, dataDir)
+  const { file, fields } = await runListFields(run, pluginRoot, dataDir)
+  return { file, fields, migrated: true }
+}
+
+/** One `migrate` run: throws the CLI's own `error` text on refusal. Split
+ *  from the list so the caller can record `migrated` before listing (a
+ *  failing list must not rerun the migrate). */
+export async function runMigrate(run: RunFn, pluginRoot: string, dataDir: string): Promise<void> {
+  try {
+    const ok = okOf(await runJson(run, mkConfigArgv(pluginRoot, dataDir, 'migrate')))
+    if (!ok.ok) throw new Error(ok.error)
+  } catch (e) {
+    const m = e instanceof Error ? e.message : String(e)
+    throw new Error(m.startsWith('migrate') ? m : `migrate: ${m}`)
   }
+}
+
+/** One `list --json` run: throws when the answer carries no fields. */
+export async function runListFields(
+  run: RunFn,
+  pluginRoot: string,
+  dataDir: string,
+): Promise<{ file: string; fields: YamlFieldIn[] }> {
   const ans = await runJson(run, mkConfigArgv(pluginRoot, dataDir, 'list', '--json'))
   if (!isRecord(ans) || ans.ok !== true || !Array.isArray(ans.fields)) {
     throw new Error('list answered no fields')
@@ -120,7 +159,6 @@ export async function loadYaml(
   return {
     file: typeof ans.file === 'string' ? ans.file : '',
     fields: ans.fields.filter(isRecord).map(f => f as unknown as YamlFieldIn),
-    migrated: true,
   }
 }
 
@@ -153,13 +191,14 @@ export async function saveYaml(
   let saved = 0
   for (const d of dirty) {
     let ans: unknown
+    const formatErr = (err: string): string => (err.startsWith(d.key) ? err : `${d.key}: ${err}`)
     try {
       ans = await runJson(run, mkConfigArgv(pluginRoot, dataDir, 'set', d.key, encodeSetValue(d.value, d.list)))
     } catch (e) {
-      return { saved, error: `${d.key}: ${e instanceof Error ? e.message : String(e)}` }
+      return { saved, error: formatErr(e instanceof Error ? e.message : String(e)) }
     }
     const ok = okOf(ans)
-    if (!ok.ok) return { saved, error: `${d.key}: ${ok.error}` }
+    if (!ok.ok) return { saved, error: formatErr(ok.error) }
     saved++
   }
   return { saved }
@@ -270,25 +309,28 @@ export function tabsVisibilityToHidden(current: unknown, edits: readonly Visibil
 
 /** Save the global rows through $.config: the visibility edits fold into one
  *  hiddenTabs write (skipped when unchanged), then one set per dirty global
- *  in order. A `{deny}` stops the rest and its reason is the message — shown,
- *  like the yaml error. An unknown suffix (nothing listed it) is an error. */
+ *  in order. The fold reads the CURRENT hiddenTabs from the same fresh
+ *  `$.config.list()` — never a stored view — so an outside change is not
+ *  overwritten. A `{deny}` stops the rest and its reason is the message —
+ *  shown, like the yaml error. An unknown suffix (nothing listed it) is an
+ *  error. */
 export async function saveGlobals(
   configList: () => Promise<ConfigRowLite[]>,
   configSet: ConfigSetFn,
   globals: readonly DirtyGlobal[],
   visibility: readonly VisibilityEdit[],
-  hiddenCurrent: unknown,
 ): Promise<{ saved: number; error?: string }> {
   let saved = 0
   const rows = await configList()
   const fullOf = (suffix: string): string | null =>
     matchGlobalKey(rows.map(r => r.key), suffix)
   if (visibility.length > 0) {
-    const next = tabsVisibilityToHidden(hiddenCurrent, visibility)
-    if (next !== String(hiddenCurrent ?? '')) {
-      const full = fullOf('hiddenTabs')
-      if (full == null) return { saved, error: 'hiddenTabs: no such setting' }
-      const out = await configSet(full, next)
+    const hiddenFull = fullOf('hiddenTabs')
+    const hiddenRow = hiddenFull == null ? undefined : rows.find(r => r.key === hiddenFull)
+    const next = tabsVisibilityToHidden(typeof hiddenRow?.value === 'string' ? hiddenRow.value : '', visibility)
+    if (next !== (typeof hiddenRow?.value === 'string' ? hiddenRow.value : '')) {
+      if (hiddenFull == null) return { saved, error: 'hiddenTabs: no such setting' }
+      const out = await configSet(hiddenFull, next)
       if (out.deny != null) return { saved, error: out.deny }
       saved++
     }

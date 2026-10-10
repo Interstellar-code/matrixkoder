@@ -652,6 +652,38 @@ test('Settings · carried MEDIUM: a focused Button keeps its hotkey — only an 
   expect(hotkeys.get('set-save')).toBe('s')
 })
 
+test('Settings · carried MEDIUM: scope change, find toggle and save/discard clear a stale ring key, re-arming s', () => {
+  const ui: FakeUi = new Map()
+  const seen = { saves: [] as unknown[], rechecks: 0 }
+  const live = liveUiOf(ui, seen)
+  ui.set('settings:scope', 'routing')
+  ui.set('settings:edit:reserve_floor.claude.five_hour_left_pct', '45') // dirty, so save draws
+  // a scope change unmounts the scope's Inputs with the ring key on them
+  ui.set('settings:focus', 'set-find-input')
+  press(SettingsTab(stubEls, settingsView(), 46, live), 'set-scope-project')
+  expect(ui.get('settings:focus')).toBe('')
+  // closing find drops it too (it was opened first, the way the f press does)
+  ui.set('settings:scope', 'routing')
+  ui.set('settings:findfocus', '1')
+  ui.set('settings:focus', 'set-find-input')
+  press(SettingsTab(stubEls, settingsView(), 46, live), 'set-find')
+  expect(ui.get('settings:findfocus')).toBe('')
+  expect(ui.get('settings:focus')).toBe('')
+  // save and discard drop it as their footer unmounts
+  for (const key of ['set-save', 'set-discard'] as const) {
+    ui.set('settings:edit:reserve_floor.claude.five_hour_left_pct', '45')
+    ui.set('settings:focus', 'set-find-input')
+    press(SettingsTab(stubEls, settingsView(), 46, live), key)
+    expect(ui.get('settings:focus'), `${key} clears the ring key`).toBe('')
+  }
+  // cleared: `s` is armed on save again, and pressing it saves
+  ui.set('settings:edit:reserve_floor.claude.five_hour_left_pct', '45')
+  const armed = SettingsTab(stubEls, settingsView(), 46, live)
+  expect(new Map(buttonsOf(armed).map(b => [b.props.key, b.props.hotkey])).get('set-save')).toBe('s')
+  press(armed, 'set-save')
+  expect(seen.saves).toHaveLength(2) // the earlier loop's save + this one
+})
+
 // ---------- S3.2: About live at the render ----------
 
 test('Settings · S3.2 about live: installed/latest versions, what is new, not probed, c re-runs the check, save messages draw', () => {

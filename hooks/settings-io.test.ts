@@ -23,7 +23,7 @@ function stubRun(byCmd: (cmd: string[]) => Answer): { run: RunFn; calls: string[
   return { run, calls }
 }
 
-const line = (obj: unknown): Answer => ({ exitCode: 0, stdout: `${JSON.stringify(obj)}\n`, stderr: '' })
+const line = (obj: unknown, exitCode = 0): Answer => ({ exitCode, stdout: `${JSON.stringify(obj)}\n`, stderr: '' })
 
 /** Three C1-shaped rows across two scopes (child watch + project lanes). */
 const FIELDS: YamlFieldIn[] = [
@@ -64,11 +64,33 @@ test('S3.1 load: an already-migrated session lists without migrating', async () 
 })
 
 test('S3.1 load: a refused migrate and a non-JSON list both throw', async () => {
-  const denied = stubRun(cmd => (cmd[0] === 'migrate' ? line({ ok: false, error: 'yaml torn' }) : line(LIST)))
+  // refusals stubbed exactly like the real CLI: exit 2, the JSON on stdout, empty stderr
+  const denied = stubRun(cmd => (cmd[0] === 'migrate' ? line({ ok: false, error: 'yaml torn' }, 2) : line(LIST)))
   await expect(loadYaml(denied.run, '/plug', '/data', false)).rejects.toThrow('migrate: yaml torn')
   expect(denied.calls).toHaveLength(1) // the list never ran after the refused migrate
   const garbage = stubRun(cmd => (cmd[0] === 'migrate' ? line({ ok: true }) : { exitCode: 0, stdout: 'not json\n', stderr: '' }))
   await expect(loadYaml(garbage.run, '/plug', '/data', false)).rejects.toThrow('no JSON')
+})
+
+test('MEDIUM 1: stdout JSON wins over the exit code — the refusal error, not `exit 2`', async () => {
+  // exactly the real CLI's refusal shape: exit 2, JSON on stdout, empty stderr
+  const refused = stubRun(() => ({
+    exitCode: 2,
+    stdout: '{"ok":false,"error":"repo.lanes.slots must be between 1 and 6: 99"}\n',
+    stderr: '',
+  }))
+  const out = await saveYaml(refused.run, '/plug', '/data', [
+    { key: 'repo.lanes.slots', value: 99, list: false },
+    { key: 'repo.lanes.reuse', value: true, list: false },
+  ])
+  expect(out).toEqual({ saved: 0, error: 'repo.lanes.slots must be between 1 and 6: 99' })
+  expect(refused.calls).toHaveLength(1) // the next key's set never ran
+  // no stdout JSON: fall back to the exit code and stderr
+  const bare = stubRun(() => ({ exitCode: 1, stdout: '', stderr: 'boom\n' }))
+  expect(await saveYaml(bare.run, '/plug', '/data', [{ key: 'a', value: 1, list: false }])).toEqual({
+    saved: 0,
+    error: 'a: set exit 1: boom',
+  })
 })
 
 // ---------- S3.1: save ----------
@@ -77,7 +99,7 @@ test('S3.1 save: 2 dirty yaml rows → exactly 2 set calls in order; the first o
   const seen: string[][] = []
   const { run } = stubRun(cmd => {
     seen.push(cmd)
-    return cmd[1] === 'session.stall_min' ? line({ ok: false, error: 'below min 5' }) : line({ ok: true })
+    return cmd[1] === 'session.stall_min' ? line({ ok: false, error: 'below min 5' }, 2) : line({ ok: true })
   })
   const out = await saveYaml(run, '/plug', '/data', [
     { key: 'session.stall_min', value: 2, list: false },
@@ -127,7 +149,6 @@ test('S3.1 globals: sets write in order with the looked-up prefix; a {deny} stop
     },
     [{ suffix: 'chip', value: false }, { suffix: 'toasts', value: false }],
     [],
-    '',
   )
   expect(out).toEqual({ saved: 0, error: 'locked by policy' })
   expect(written).toEqual([['matrixkoder.chip', false]]) // toasts never wrote
@@ -140,16 +161,22 @@ test('S3.1 globals: visibility edits fold into one hiddenTabs write; unchanged s
     written.push([key, value])
     return {}
   }
-  const out = await saveGlobals(async () => rows, set, [], [{ tab: 'lanes', on: false }], '')
+  const out = await saveGlobals(async () => rows, set, [], [{ tab: 'lanes', on: false }])
   expect(out).toEqual({ saved: 1 })
   expect(written).toEqual([['matrixkoder.hiddenTabs', 'lanes']])
-  // turning lanes back on from 'lanes' writes the empty list
-  const back = await saveGlobals(async () => rows, set, [], [{ tab: 'lanes', on: true }], 'lanes')
+  // turning lanes back on from 'lanes' writes the empty list (the current
+  // value comes from the fresh list, not the caller)
+  const back = await saveGlobals(
+    async () => [{ key: 'matrixkoder.hiddenTabs', value: 'lanes', isLocked: false }],
+    set,
+    [],
+    [{ tab: 'lanes', on: true }],
+  )
   expect(back).toEqual({ saved: 1 })
   expect(written[1]).toEqual(['matrixkoder.hiddenTabs', ''])
   // no edits at all: nothing writes
   written.length = 0
-  expect(await saveGlobals(async () => rows, set, [], [], '')).toEqual({ saved: 0 })
+  expect(await saveGlobals(async () => rows, set, [], [])).toEqual({ saved: 0 })
   expect(written).toEqual([])
 })
 
@@ -163,7 +190,6 @@ test('S3.1 globals: an unknown suffix is an error, nothing writes', async () => 
     },
     [{ suffix: 'nope', value: true }],
     [],
-    '',
   )
   expect(out).toEqual({ saved: 0, error: 'nope: no such setting' })
   expect(written).toEqual([])
