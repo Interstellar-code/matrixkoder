@@ -473,7 +473,7 @@ export function SettingsTab(els: Els, view: SettingsView, cols: number, ui?: Tab
     <Box flexDirection="column">
       {view.mock && <Text bold={true} color="warning">MOCK · fixture data · not this run</Text>}
       {ScopeBar(els, view, cols, scopeId, ui, noHk)}
-      <Box flexDirection="row" gap={1} backgroundColor={PALETTE.bg} paddingX={1} marginTop={1} marginBottom={1}>
+      <Box flexDirection="row" gap={1} backgroundColor={PALETTE.field} paddingX={1} marginTop={1} marginBottom={1}>
         <Text dimColor={true}>/</Text>
         {findField}
         {q !== '' && (
@@ -549,6 +549,7 @@ function ScopeBar(els: Els, view: SettingsView, cols: number, activeId: Settings
             label: s.label,
             on: s.id === activeId,
             flat: true,
+            static: true,
             hotkey: noHk ? undefined : digit,
             onPress: () => {
               ui?.set('settings:scope', s.id)
@@ -598,7 +599,7 @@ function ModeCards(els: Els, view: SettingsView, W: number, ui: TabUi | undefine
           {view.modes.map(m => {
             const cur = m.id === mode
             return (
-              <Box key={`set-modecard-${m.id}`} flexDirection="column" borderStyle="round" borderColor={cur ? ROLE.live.fg : PALETTE.line} backgroundColor={cur ? PALETTE.panel : PALETTE.bg} paddingX={1}>
+              <Box key={`set-modecard-${m.id}`} flexDirection="column" borderStyle="round" borderColor={cur ? ROLE.live.fg : PALETTE.line} backgroundColor={cur ? PALETTE.modeOn : PALETTE.bg} paddingX={1}>
                 <Box flexDirection="row" justifyContent="space-between" gap={1}>
                   <Box flexDirection="row" gap={1}>
                     <Text color={ROLE.live.fg}>{cur ? '◉' : '○'}</Text>

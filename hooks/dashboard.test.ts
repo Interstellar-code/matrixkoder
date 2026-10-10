@@ -1330,7 +1330,7 @@ test('S2.3: hotkey 9 switches to the Settings tab and hides Old', { plugins: [wo
   await ui.press({ key: 'dash-tab-settings' })
   await loadLiveSettings(clock, ui, calls)
   expect(await ui.find({ text: /MOCK · fixture data/ }), 'never mock rows').toBeUndefined()
-  expect((await ui.findAll({ type: 'Button' })).find(b => b.props.key === 'set-scope-mode'), 'the settings scope bar').toBeTruthy()
+  expect((await ui.findAll({ type: 'Button' })).find(b => b.props.key === 'set-scope-project'), 'the settings scope bar').toBeTruthy()
   expect(await ui.find({ text: /Checkout v2/ }), 'the real run header, never the mock world').toBeUndefined()
   await ui.press({ key: 'dash-tab-old' })
   expect(await ui.find({ text: /workflows-v2/ }), 'Old is back').toBeTruthy()
@@ -1360,7 +1360,7 @@ test('S2.3: hiddenTabs naming Settings still draws it', { plugins: [worldFixture
   await ui.press({ key: 'dash-tab-settings' })
   await loadLiveSettings(clock, ui, calls)
   expect(await ui.find({ text: /MOCK · fixture data/ }), 'Settings renders live while named hidden').toBeUndefined()
-  expect((await ui.findAll({ type: 'Button' })).find(b => b.props.key === 'set-scope-mode'), 'the settings scope bar').toBeTruthy()
+  expect((await ui.findAll({ type: 'Button' })).find(b => b.props.key === 'set-scope-project'), 'the settings scope bar').toBeTruthy()
 })
 
 test('S2.3: defaultTab opens the pane on that tab', { plugins: [worldFixtures], options: { defaultTab: 'settings' } }, async ($, on) => {
@@ -1371,7 +1371,7 @@ test('S2.3: defaultTab opens the pane on that tab', { plugins: [worldFixtures], 
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   await loadLiveSettings(clock, ui, calls) // the render fallback loads it, no press needed
   expect(await ui.find({ text: /MOCK · fixture data/ }), 'never mock rows').toBeUndefined()
-  expect((await ui.findAll({ type: 'Button' })).find(b => b.props.key === 'set-scope-mode'), 'the settings scope bar').toBeTruthy()
+  expect((await ui.findAll({ type: 'Button' })).find(b => b.props.key === 'set-scope-project'), 'the settings scope bar').toBeTruthy()
   expect(await ui.find({ text: /Checkout v2/ }), 'the real run header, never the mock world').toBeUndefined()
 })
 
@@ -1712,7 +1712,7 @@ test('LOW 5: every open re-lists and shows the fresh reply; migrate still runs o
   const mk = mkConfigCalls(calls)
   expect(mk.filter(a => a[a.length - 1] === 'migrate')).toHaveLength(1) // still once per session
   expect(mk.filter(a => a[a.length - 1] === '--json')).toHaveLength(2)
-  await ui.press({ key: 'set-scope-child' })
+  // the Child scope is still the active one: it draws as tint text, no press needed
   expect(await ui.find({ text: /^25m$/ }), 'the changed reply shows').toBeTruthy()
   expect(await ui.find({ text: /^20m$/ }), 'the stale value is gone').toBeUndefined()
 })

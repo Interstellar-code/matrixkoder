@@ -414,7 +414,7 @@ test('S2.1 seg: one pressable per opt, the current `●`-marked; a press reports
     everyRowFits(root, cols)
     const labels = buttonsIn(root).map(b => String(b.props.label))
     // the boxed strip: one plain press per option, the current one on the blue tint
-    for (const w of ['ask', 'auto', 'never']) expect(labels).toContain(w)
+    for (const w of ['ask', 'never']) expect(labels).toContain(w) // the picked `auto` is plain tint text, not a press
     expect(buttonsIn(root).every(b => b.props.hotkey === undefined)).toBe(true) // glyphs, not letters
 
     const chosen: string[] = []
