@@ -45,7 +45,7 @@ scanner and the same holds here (§7).
   (`hooks/guards.ts:170-176`).
 - **G10.** `git switch` — refused only when `--force`, `--discard-changes` or a short `-f` is
   present (`hooks/guards.ts:177-180`).
-- **G11.** `git commit --amend` — refused on the `--am(e(nd?)*)?` prefix family (`--am`, `--ame`,
+- **G11.** `git commit --amend` — refused on the `--am(e(nd?)?)?` prefix family (`--am`, `--ame`,
   `--amen`, `--amend`, `hooks/guards.ts:185`). Valued message options (`-m`, `-F`, `-C`, `-c`,
   `--message`, `--file`, `--author`, `--date`, `--template`, `--reuse-message`,
   `--reedit-message`, `--fixup`, `--squash`, `--trailer`, `--cleanup`,
@@ -80,10 +80,10 @@ scanner and the same holds here (§7).
   - `git stash list` / `git stash show` (`:166-169`),
   - `git restore --staged` (or `-S`) (`:170-176`),
   - `git rebase --abort|--continue|--skip` (`:207-211`).
-  **Why:** the lane's own workflow needs them — `git apply` / `git apply -R` (the fail-on-old-code
-  proof, `lane-rules.md` R12, `skills/matrixkoder/templates/brief.md:13`) is not a listed
-  subcommand at all, and an unbanned refusal would break legitimate work (`hooks/guards.ts:224`
-  returns "allow" for every unlisted subcommand).
+  **Why:** the lane's own workflow needs them — `git apply` / `git apply -R` are the old-code
+  proof's revert and re-apply step (`lane-rules.md` R13; `skills/matrixkoder/templates/brief.md:13`),
+  so refusing an unlisted subcommand would break that proof; and `hooks/guards.ts:224` returns
+  "allow" for every subcommand the ban does not name — the wrapper mirrors the same default.
 - **G20.** Everyday read/record commands pass: `status`, `log`, `diff`, `add`, `commit`,
   `worktree`, `rev-parse`, `show`, `branch` (without G13's triggers), `fetch`, `merge`, `tag`,
   `pull` (without G15's triggers), `gc` (without G18's trigger) — everything `gitBan` does not
@@ -91,16 +91,20 @@ scanner and the same holds here (§7).
 
 ## 5. Finding the real git
 
-- **G21.** On every pass-through, locate the real git by removing the wrapper's own directory from
-  `PATH` and taking the first `git` found on what remains (a PATH walk, or `command -v git` after
-  the drop). Never hardcode a git path.
+- **G21.** On every pass-through, locate the real git with exactly this method, no other:
+  compute the wrapper's own real directory (`realpath` of the directory holding `$0`), drop every
+  `PATH` entry whose `realpath` equals that directory, then take the first remaining `PATH` entry
+  that holds an executable file named `git` (`[ -x "<entry>/git" ]`). If no entry remains: print
+  one line `mk git-guard: no real git on PATH` and exit 127.
   **Why:** this machine has two gits — `/usr/bin/git` and `/opt/homebrew/bin/git`
   (`which -a git`, research `[local]`,
   `/Users/rohits/Development/matrixkoder/.matrixkoder/plans/mk-builder-skill-research.md:39`) —
-  so a fixed path can pin the wrong install and goes stale at the next Homebrew update; the
-  drop-own-dir rule also makes the wrapper unreachable by itself (infinite exec loop otherwise).
-  The scanner's location-independent analogue is `base()` stripping any path prefix
-  (`hooks/guards.ts:10`).
+  so a fixed path can pin the wrong install and goes stale at the next update; `realpath` on both
+  sides makes a symlinked wrapper directory match, and dropping only equal entries (rather than
+  every directory containing a `git`) keeps a real git reachable when the wrapper's own directory
+  is the only one on `PATH`. The scanner's location-independent analogue is `base()` stripping any
+  path prefix (`hooks/guards.ts:10`). A plain `command -v git` after the drop is **not** an
+  alternative spelling: the `[ -x ]` walk is the one method a test can pin.
 
 ## 6. Refusal and pass-through behaviour
 
@@ -134,3 +138,10 @@ scanner and the same holds here (§7).
   run `git stash` and records the result; a shell snapshot that re-prepends a git dir counts as a
   finding, not a pass. If the smoke test or the measurement shows a gap, the documented next step
   (plan decision D4) is an OpenCode plugin hook (`tool.execute.before`), not a stronger wrapper.
+- **G29.** Environment rewriting reaches the same place G25 does: `env -i git …` clears the
+  environment (PATH included) and `env PATH=<dir> git …` replaces it, so the wrapper is skipped
+  without any absolute path appearing in the command text.
+- **G30.** Env-var aliases hide the subcommand exactly like G26's config aliases:
+  `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.<n> GIT_CONFIG_VALUE_0=<cmd>` aliases `<n>` for the
+  process lifetime (`GIT_CONFIG_PARAMETERS` is the child-process form); the wrapper sees `<n>` as
+  the subcommand.
