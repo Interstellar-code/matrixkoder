@@ -103,7 +103,7 @@ const draw = (ui: FakeUi, cols = 46, scope?: string): unknown => {
 // lays those out): a row is a horizontal Box (or a Text); its width is the
 // text of every Text descendant plus the gap columns between its children.
 
-type DrawnNode = { type?: string; props?: { flexDirection?: string; gap?: number; borderStyle?: string; label?: string; plain?: boolean }; children?: unknown[] }
+type DrawnNode = { type?: string; props?: { key?: string; flexDirection?: string; gap?: number; borderStyle?: string; label?: string; plain?: boolean }; children?: unknown[] }
 
 function textWidth(node: unknown): number {
   if (typeof node === 'string') return node.length
@@ -144,7 +144,7 @@ function rowWidths(root: unknown): { width: number; inCard: boolean; text: strin
   const walk = (node: unknown, inCard: boolean): void => {
     if (typeof node !== 'object' || node === null) return
     const n = node as DrawnNode
-    const card = inCard || (n.type === 'Box' && n.props?.borderStyle === 'round')
+    const card = inCard || (n.type === 'Box' && n.props?.borderStyle === 'round' && !/^(dash-tab|set-scope)-/.test(String(n.props?.key ?? '')))
     if (n.type === 'Text' || (n.type === 'Box' && n.props?.flexDirection === 'row')) {
       out.push({ width: widthOf(node), inCard: card, text: preview(node) })
     }

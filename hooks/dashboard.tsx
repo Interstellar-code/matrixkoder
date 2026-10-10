@@ -442,7 +442,7 @@ function TabBar(els: Els, $: EngineInterface, dashTab: MkDashTab, counts: Record
             onPress={() => { void switchTab($, t.key) }}
           />
         )
-        return <Box key={`dash-tab-${t.key}-box`} borderStyle="single" borderColor={active ? ROLE.live.fg : '#5b6776'} backgroundColor={active ? ROLE.live.tint : undefined} paddingX={1}>{btn}</Box>
+        return <Box key={`dash-tab-${t.key}-box`} borderStyle="round" borderColor={active ? ROLE.live.fg : '#5b6776'} backgroundColor={active ? ROLE.live.tint : undefined}>{btn}</Box>
       })}
     </Box>
   )

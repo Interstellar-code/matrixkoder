@@ -1474,7 +1474,7 @@ function drawnRowWidths(root: unknown): { width: number; inCard: boolean; text: 
   const walk = (node: unknown, inCard: boolean): void => {
     if (typeof node !== 'object' || node === null) return
     const n = node as R3DrawnNode
-    const card = inCard || (n.type === 'Box' && n.props?.borderStyle === 'round')
+    const card = inCard || (n.type === 'Box' && n.props?.borderStyle === 'round' && !/^(dash-tab|set-scope)-/.test(String(n.props?.key ?? '')))
     if (n.type === 'Box' && n.props?.flexDirection === 'row' && isTabBar(n)) {
       for (const c of n.children ?? []) walk(c, card)
       return
