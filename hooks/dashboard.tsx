@@ -159,6 +159,7 @@ export function registerDashboard(on: On, options: PluginOptions): void {
       }
     }
     await startLoop($, options, e.cwd) // the session's own words for where it runs; timers capture it
+    await loadBrandVersion($)
     // S2.3: `defaultTab` picks the opening tab — a known visible tab stands,
     // anything else keeps the Old default.
     const opening = typeof options.defaultTab === 'string'
@@ -179,6 +180,7 @@ export function registerDashboard(on: On, options: PluginOptions): void {
     if (timerRegistry.cancelRefresh == null) {
       try {
         await startLoop($, options, await $.session.cwd())
+        await loadBrandVersion($)
       } catch {
         // no cwd — the pane keeps its last snapshot
       }
@@ -263,9 +265,9 @@ export function registerDashboard(on: On, options: PluginOptions): void {
         {snap.error && (
           <Text color="yellow" bold={true}>⚠ {snap.error}</Text>
         )}
-        {dashTab === 'settings'
-          ? BrandHeader(els, cols, settingsLive?.about.installed ?? '', settingsLive?.about.latest ?? '', String(options.mode ?? 'orchestrator'))
-          : header != null && RunHeader(els, header, cols)}
+        {/* one header for every tab: the brand block, then the run block on every tab but Settings */}
+        {BrandHeader(els, cols, settingsLive?.about.installed ?? viewState['brand:version'] ?? '', settingsLive?.about.latest ?? '', String(options.mode ?? 'orchestrator'))}
+        {dashTab !== 'settings' && header != null && RunHeader(els, header, cols)}
         {/* V1.4: the engine has no per-side borders, so the header and tab bar
             read as one framed block above the tab's Cards through this rule.
             The bar and the rule share a gap-less column so the rule sits
@@ -904,6 +906,17 @@ async function ensureSettingsLoaded($: EngineInterface): Promise<void> {
     await setViewKey($, 'settings:load:error', String(e instanceof Error ? e.message : e).slice(0, 120))
   } finally {
     settingsInflight = false
+  }
+}
+
+/** The brand header's version chip on every tab: plugin.json's version, read
+ *  once at session start (the Settings load refines it with the latest tag). */
+async function loadBrandVersion($: EngineInterface): Promise<void> {
+  try {
+    const version = parsePluginManifest(await $.fs.read(`${$.plugin.root}/.claude-plugin/plugin.json`)).version
+    await setViewKey($, 'brand:version', version === 'unknown' ? '' : version)
+  } catch {
+    // unreadable manifest — the header draws without the version chip
   }
 }
 
