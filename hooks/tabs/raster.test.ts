@@ -5,7 +5,7 @@
 // filled, last filled, first empty and floor cells.
 import { test, expect } from 'claude-code/testing'
 import type { Elements, RenderElement } from 'claude-code'
-import { encodeCells, gradientBar, laneStrip, pickBar, stageBar } from './raster'
+import { encodeCells, gradientBar, laneStrip, pickBar, stageBar, withRaster } from './raster'
 import type { RasterSpec } from './raster'
 import { PALETTE, ROLE, rgbWord } from './palette'
 
@@ -163,4 +163,13 @@ test('pickBar returns the Raster when the element table has one, else the fallba
   expect(raster.type).toBe('Raster')
   expect(raster.props).toMatchObject({ key: 'usage-5h', columns: 20, rows: 1, cells: spec.cells })
   expect(pickBar(bareEls, 'usage-5h', spec, fallback)).toBe(fallback)
+})
+
+test('S2.3 withRaster: only an explicit false drops Raster, so pickBar falls back', () => {
+  expect('Raster' in withRaster(rasterEls, false)).toBe(false)
+  expect(pickBar(withRaster(rasterEls, false), 'usage-5h', gradientBar(50, 20, HEAT), fallback)).toBe(fallback)
+  for (const keep of [true, undefined, null, 'false', 0] as const) {
+    expect(withRaster(rasterEls, keep)).toBe(rasterEls)
+  }
+  expect(withRaster(bareEls, false)).toBe(bareEls) // nothing to drop
 })

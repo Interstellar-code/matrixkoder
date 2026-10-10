@@ -5,7 +5,8 @@
 // calling the closure the Button carries — C10: no press ever leaves the test.
 import { test, expect } from 'claude-code/testing'
 import type { Elements } from 'claude-code'
-import { ActionButton, ActionButtons, ActionRow, Card, Chip, ControlRow, Section, SmoothBar, TreeRow, actionLabel } from './kit'
+import { ActionButton, ActionButtons, ActionRow, Card, Chip, ControlRow, Section, SettingRow, SmoothBar, TreeRow, actionLabel } from './kit'
+import type { SettingCtx, SettingField } from './kit'
 import { PALETTE, ROLE } from './palette'
 
 /** the plain-data node a stub constructor builds (kit.tsx returns these). */
@@ -260,5 +261,313 @@ test('M4: TreeRow draws the depth prefix, the role glyph, a fitted title and an 
   for (const cols of [36, 40, 46, 56] as const) {
     const row = node(TreeRow(stubEls(), { depth: 1, last: false, glyph: '●', role: 'warn', title: 'P6 Tax rules and the migration order', right: '! blocked' }, cols))
     expect(treeWidth(row), `row at ${cols}`).toBeLessThanOrEqual(cols)
+  }
+})
+
+// ---------- S2.1 · SettingRow ----------
+
+/** a stub constructor maker for the field elements (Input, Select). */
+const el = (type: string) => (props: Record<string, unknown>, ...children: unknown[]) =>
+  ({ type, props, children: children.length > 0 ? children : (props.children as unknown[] | undefined) ?? [] }) as unknown
+
+/** an element table with the field elements S2.0 found on terminal + desktop. */
+const fieldEls = (): Elements[keyof Elements] => stubEls({ Input: el('Input'), Select: el('Select') })
+
+/** every node of `type` under `el`, in document order. */
+function nodesIn(type: string, tree: unknown): Node[] {
+  const out: Node[] = []
+  const walk = (n: unknown): void => {
+    if (typeof n !== 'object' || n === null) return
+    const cur = n as Node
+    if (cur.type === type) out.push(cur)
+    for (const c of kids(cur)) walk(c)
+  }
+  walk(tree)
+  return out
+}
+
+/** a node's drawn width: its text run, `[ label ]` per Button (label + 2 for
+ * a plain one), nested rows recursed, one gap column between parts. */
+const drawnWidth = (n: Node): number => {
+  if (n.type === 'Button') return String(n.props.label).length + (n.props.plain ? 2 : 4)
+  if (n.type === 'Text') return text(n).length
+  if (n.type === 'Input') return 0 // the engine lays the field out
+  const parts = kids(n)
+  return parts.reduce((acc, p) => acc + drawnWidth(node(p)), 0) + Math.max(0, parts.length - 1)
+}
+
+/** every row Box under a SettingRow fits `cols` (main row, stepper, option
+ * lines, help line — wherever they sit in the tree). */
+const everyRowFits = (root: Node, cols: number): void => {
+  const walk = (n: unknown): void => {
+    if (typeof n !== 'object' || n === null) return
+    const cur = n as Node
+    if (cur.type === 'Box' && cur.props.flexDirection === 'row') {
+      expect(drawnWidth(cur), `row at ${cols}`).toBeLessThanOrEqual(cols)
+    }
+    for (const c of kids(cur)) walk(c)
+  }
+  walk(root)
+}
+
+/** a SettingCtx with counters, so a test reads what a press reported. */
+const settingCtx = (over: Partial<SettingCtx> = {}): SettingCtx => ({
+  cols: 46, selected: false, changed: false, open: false,
+  onPick: () => {}, onToggle: () => {}, onInc: () => {}, onDec: () => {},
+  onChoose: () => {}, onToggleOpen: () => {}, onEdit: () => {}, onReset: () => {},
+  ...over,
+})
+
+test('S2.1 bool: `◉ on` toggle chip fits 46+36, `●` when changed, help + default + r reset when selected', () => {
+  const field: SettingField = {
+    key: 'autosave', label: 'Autosave snapshots', type: 'bool', value: true, default: false,
+    help: 'Snapshot the plan before each wave', editable: true,
+  }
+  for (const cols of [46, 36] as const) {
+    const root = node(SettingRow(stubEls(), field, settingCtx({ cols, changed: true })))
+    everyRowFits(root, cols)
+    const tgl = buttonsIn(root).find(b => b.props.label === '◉ on')
+    expect(tgl, `toggle chip at ${cols}`).toBeDefined()
+    expect(tgl?.props.hotkey).toBeUndefined() // a glyph, not a letter: no pane hotkey
+    const marks = nodesIn('Text', root).filter(t => text(t) === '●')
+    expect(marks).toHaveLength(1)
+    expect(marks[0]?.props.color).toBe(ROLE.warn.fg) // the changed marker
+
+    let toggled = 0
+    const live = node(SettingRow(stubEls(), field, settingCtx({ cols, onToggle: () => { toggled++ } })))
+    ;(buttonsIn(live).find(b => b.props.label === '◉ on')?.props.onPress as () => void)()
+    expect(toggled).toBe(1)
+
+    let resets = 0
+    const sel = node(SettingRow(stubEls(), field, settingCtx({ cols, selected: true, onReset: () => { resets++ } })))
+    const selText = text(sel)
+    // the help yields to `default X · r reset` — its prefix survives at both widths
+    expect(selText.includes('Snapsh')).toBe(true)
+    expect(selText.includes('default off')).toBe(true)
+    const reset = buttonsIn(sel).find(b => b.props.label === 'r reset')
+    expect(reset).toBeDefined()
+    expect(reset?.props.hotkey).toBe('r') // the one letter the Settings design allows
+    ;(reset?.props.onPress as () => void)()
+    expect(resets).toBe(1)
+  }
+  expect(text(node(SettingRow(stubEls(), field, settingCtx()))).includes('●')).toBe(false) // unchanged: no marker
+})
+
+test('S2.1 num: `− 12m +` stepper fits 46+36; pct adds the SmoothBar at value/max', () => {
+  const stall: SettingField = {
+    key: 'stall', label: 'Stall before flagging a lane stalled', type: 'num', value: 12, default: 15,
+    min: 1, max: 60, unit: 'm', help: 'Pane silence that flags a lane stalled', editable: true,
+  }
+  for (const cols of [46, 36] as const) {
+    const root = node(SettingRow(stubEls(), stall, settingCtx({ cols, changed: true })))
+    everyRowFits(root, cols)
+    const labels = buttonsIn(root).map(b => String(b.props.label))
+    expect(labels).toContain('−')
+    expect(labels).toContain('+')
+    expect(buttonsIn(root).every(b => b.props.hotkey === undefined)).toBe(true)
+    expect(text(root).includes('12m')).toBe(true)
+    expect(text(root).includes('●')).toBe(true)
+
+    let inc = 0
+    let dec = 0
+    const live = node(SettingRow(stubEls(), stall, settingCtx({ cols, onInc: () => { inc++ }, onDec: () => { dec++ } })))
+    ;(buttonsIn(live).find(b => b.props.label === '+')?.props.onPress as () => void)()
+    ;(buttonsIn(live).find(b => b.props.label === '−')?.props.onPress as () => void)()
+    expect(inc).toBe(1)
+    expect(dec).toBe(1)
+
+    const sel = text(node(SettingRow(stubEls(), stall, settingCtx({ cols, selected: true }))))
+    expect(sel.includes('default 15m')).toBe(true)
+  }
+
+  const conf: SettingField = {
+    key: 'conf', label: 'Review confidence floor', type: 'num', value: 60, default: 50,
+    max: 100, pct: true, unit: '%', help: 'Reviews below this ask the reviewer to justify', editable: true,
+  }
+  const bar = (cols: number): Node => {
+    const bars = nodesIn('Text', SettingRow(stubEls(), conf, settingCtx({ cols }))).filter(t => t.props.backgroundColor === PALETTE.track)
+    expect(bars).toHaveLength(1)
+    return bars[0] as Node
+  }
+  expect(text(bar(46))).toBe('██████    ') // 60% of the 10-cell bar
+  expect(bar(46).props.color).toBe(ROLE.live.fg)
+  expect(text(bar(36))).toBe('███▋  ') // 60% of the 6-cell bar: 3 full cells + 5/8
+  for (const cols of [46, 36] as const) {
+    const root = node(SettingRow(stubEls(), conf, settingCtx({ cols, changed: true })))
+    everyRowFits(root, cols)
+    expect(text(root).includes('60%')).toBe(true)
+  }
+})
+
+test('S2.1 seg: one pressable per opt, the current `●`-marked; a press reports the chosen value', () => {
+  const field: SettingField = {
+    key: 'revsplit', label: 'Reviewer split', type: 'seg', value: 'auto', default: 'ask',
+    opts: [
+      { value: 'ask', note: 'ask each time' },
+      { value: 'auto', note: 'route by size' },
+      { value: 'never', note: 'one pass' },
+    ],
+    help: 'When a second reviewer joins a review round', editable: true,
+  }
+  for (const cols of [46, 36] as const) {
+    const root = node(SettingRow(stubEls(), field, settingCtx({ cols, changed: true })))
+    everyRowFits(root, cols)
+    const labels = buttonsIn(root).map(b => String(b.props.label))
+    if (cols === 46) {
+      expect(labels).toContain('● auto') // the current opt
+      expect(labels).toContain('○ ask')
+      expect(labels).toContain('○ never')
+    } else {
+      // at 36 the strip yields cells to the pick press (R3 HIGH 1) and stays
+      // pressable with the full values behind the short words
+      expect(labels.some(l => l.startsWith('●'))).toBe(true)
+    }
+    expect(buttonsIn(root).every(b => b.props.hotkey === undefined)).toBe(true) // glyphs, not letters
+
+    const chosen: string[] = []
+    const live = node(SettingRow(stubEls(), field, settingCtx({ cols, onChoose: v => { chosen.push(v) } })))
+    // the shown word may be shrunk at 36 cols; it stays a prefix of the full value
+    const shown = (label: unknown): string => String(label).replace(/^[●○] /, '')
+    const btnFor = (full: string) =>
+      buttonsIn(live).find(b => { const w = shown(b.props.label); return w !== '' && full.startsWith(w) })
+    ;(btnFor('never')?.props.onPress as () => void)()
+    ;(btnFor('ask')?.props.onPress as () => void)()
+    expect(chosen).toEqual(['never', 'ask'])
+
+    const sel = node(SettingRow(stubEls(), field, settingCtx({ cols, selected: true })))
+    expect(text(sel).includes('default ask')).toBe(true)
+    expect(buttonsIn(sel).some(b => b.props.label === 'r reset')).toBe(true)
+  }
+})
+
+test('S2.1 select: closed `value ▾` toggles the option list below (current `●`, every opt pressable)', () => {
+  const field: SettingField = {
+    key: 'surface', label: 'Dashboard surface', type: 'select', value: 'terminal', default: 'terminal',
+    opts: [
+      { value: 'terminal', note: 'in-session TUI' },
+      { value: 'desktop', note: 'desktop window' },
+    ],
+    help: 'Where the /mk pane docks', editable: true,
+  }
+  for (const cols of [46, 36] as const) {
+    const closed = node(SettingRow(fieldEls(), field, settingCtx({ cols })))
+    everyRowFits(closed, cols)
+    const chip = buttonsIn(closed).find(b => b.props.label === 'terminal ▾')
+    expect(chip, `closed chip at ${cols}`).toBeDefined()
+    expect(chip?.props.plain).toBe(true) // no engine hotkey, however short the value
+    expect(chip?.props.hotkey).toBeUndefined()
+    expect(text(closed).includes('desktop')).toBe(false) // closed: no option list
+
+    let opened = 0
+    const live = node(SettingRow(fieldEls(), field, settingCtx({ cols, onToggleOpen: () => { opened++ } })))
+    ;(buttonsIn(live).find(b => b.props.label === 'terminal ▾')?.props.onPress as () => void)()
+    expect(opened).toBe(1)
+
+    const open = node(SettingRow(fieldEls(), field, settingCtx({ cols, open: true })))
+    everyRowFits(open, cols)
+    const openText = text(open)
+    expect(openText.includes('in-session TUI')).toBe(true) // the dim notes
+    expect(openText.includes('desktop window')).toBe(true)
+    const chosen: string[] = []
+    const liveOpen = node(SettingRow(fieldEls(), field, settingCtx({ cols, open: true, onChoose: v => { chosen.push(v) } })))
+    const opt = (v: string): Node | undefined => buttonsIn(liveOpen).find(b => b.props.label === v)
+    ;(opt('desktop')?.props.onPress as () => void)()
+    ;(opt('terminal')?.props.onPress as () => void)()
+    expect(chosen).toEqual(['desktop', 'terminal'])
+    const marks = nodesIn('Text', open).filter(t => text(t) === '●')
+    expect(marks).toHaveLength(1) // the current option, in the live role colour
+    expect(marks[0]?.props.color).toBe(ROLE.live.fg)
+
+    const sel = node(SettingRow(fieldEls(), field, settingCtx({ cols, selected: true })))
+    expect(text(sel).includes('default terminal')).toBe(true)
+    expect(buttonsIn(sel).some(b => b.props.label === 'r reset')).toBe(true)
+  }
+})
+
+test('S2.1 text: the native Input carries the label (● when changed), value and onEdit on both field chains', () => {
+  const field: SettingField = {
+    key: 'reviewer', label: 'Fallback reviewer', type: 'text', value: 'claude sonnet', default: 'opus',
+    help: 'Which model reviews when the pick is exhausted', editable: true,
+  }
+  for (const cols of [46, 36] as const) {
+    const inputs = nodesIn('Input', SettingRow(fieldEls(), field, settingCtx({ cols })))
+    expect(inputs).toHaveLength(1)
+    const input = inputs[0] as Node
+    expect(input.props.value).toBe('claude sonnet')
+    expect(input.props.label, 'the name draws once, on the row press').toBeUndefined()
+    // the label press selects the row (R3 HIGH 1)
+    const pick = buttonsIn(node(SettingRow(fieldEls(), field, settingCtx({ cols })))).find(b => String(b.props.label) === 'Fallback reviewer')
+    expect(pick, `the label press at ${cols}`).toBeDefined()
+    expect(pick?.props.plain).toBe(true)
+    expect(pick?.props.hotkey).toBeUndefined()
+    const edits: string[] = []
+    const live = node(SettingRow(fieldEls(), field, settingCtx({ cols, onEdit: v => { edits.push(v) } })))
+    const liveInput = nodesIn('Input', live)[0] as Node
+    ;(liveInput.props.onInput as (v: string) => void)('o')
+    ;(liveInput.props.onSubmit as (v: string) => void)('opus')
+    expect(edits).toEqual(['o', 'opus'])
+
+    const changed = buttonsIn(node(SettingRow(fieldEls(), field, settingCtx({ cols, changed: true })))).find(b => String(b.props.label).startsWith('● '))
+    expect(changed, `the changed label press at ${cols}`).toBeDefined()
+
+    const sel = node(SettingRow(fieldEls(), field, settingCtx({ cols, selected: true })))
+    const selText = text(sel)
+    expect(selText.includes('Which')).toBe(true) // the help's prefix (it yields to the tail)
+    expect(selText.includes('default opus')).toBe(true)
+    expect(buttonsIn(sel).some(b => b.props.label === 'r reset')).toBe(true)
+  }
+})
+
+test('S2.1 fallback: no Input/Select in the element table → dim value + `edit in file`, and a non-editable row draws the why line', () => {
+  const textField: SettingField = {
+    key: 'reviewer', label: 'Fallback reviewer', type: 'text', value: 'claude sonnet', default: 'opus',
+    help: 'Which model reviews when the pick is exhausted', editable: true,
+  }
+  const selectField: SettingField = {
+    key: 'surface', label: 'Dashboard surface', type: 'select', value: 'terminal', default: 'terminal',
+    opts: [{ value: 'terminal', note: 'in-session TUI' }, { value: 'desktop', note: 'desktop window' }],
+    help: 'Where the /mk pane docks', editable: true,
+  }
+  for (const cols of [46, 36] as const) {
+    for (const field of [textField, selectField] as const) {
+      const root = node(SettingRow(stubEls(), field, settingCtx({ cols }))) // no Input, no Select
+      expect(nodesIn('Input', root)).toHaveLength(0)
+      expect(nodesIn('Select', root)).toHaveLength(0)
+      everyRowFits(root, cols)
+      const flat = text(root)
+      expect(flat.includes(String(field.value))).toBe(true) // the dim value
+      expect(flat.includes('edit in file')).toBe(true) // plus the note, no crash
+      const dims = nodesIn('Text', root).filter(t => t.props.dimColor === true)
+      expect(dims.map(t => text(t))).toContain('edit in file')
+      // the one pressable is the R3 label press (it fires onPick and reaches
+      // the help line); no control draws without a field element. At 36 the
+      // long label yields to the wide dim control, at 46 it draws whole.
+      const picks = buttonsIn(root)
+      expect(picks).toHaveLength(1)
+      expect(picks[0]?.props.plain).toBe(true)
+      const want = cols === 46 ? field.label : field.label.slice(0, 6)
+      expect(String(picks[0]?.props.label).startsWith(want)).toBe(true)
+      let picked = 0
+      const live = node(SettingRow(stubEls(), field, settingCtx({ cols, onPick: () => { picked++ } })))
+      ;((buttonsIn(live)[0]?.props.onPress ?? (() => {})) as () => void)()
+      expect(picked).toBe(1)
+    }
+  }
+
+  const ro: SettingField = {
+    key: 'pluginver', label: 'Plugin version', type: 'bool', value: true, default: true,
+    help: 'The installed plugin version', editable: false, why: 'Read-only: set by the marketplace install',
+  }
+  for (const cols of [46, 36] as const) {
+    const root = node(SettingRow(stubEls(), ro, settingCtx({ cols })))
+    everyRowFits(root, cols)
+    // the one pressable is the R3 label press (it reaches the why line); a control would do nothing
+    expect(buttonsIn(root).map(b => String(b.props.label))).toEqual(['Plugin version'])
+    expect(nodesIn('Text', root).filter(t => t.props.dimColor === true).map(t => text(t))).toContain('on') // the dim value
+    const sel = node(SettingRow(stubEls(), ro, settingCtx({ cols, selected: true })))
+    const selText = text(sel)
+    expect(selText.includes('Read-only: set by the')).toBe(true) // the why line, truncated to cols
+    expect(selText.includes('default')).toBe(false) // nothing to reset
+    expect(buttonsIn(sel).map(b => String(b.props.label))).toEqual(['Plugin version']) // the open press; no reset on read-only
   }
 })

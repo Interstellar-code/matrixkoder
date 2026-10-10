@@ -884,6 +884,7 @@ const TAB_BUTTONS = [
   { key: 'dash-tab-usage', name: 'Usage' },
   { key: 'dash-tab-events', name: 'Events' },
   { key: 'dash-tab-waiting', name: 'Waiting' },
+  { key: 'dash-tab-settings', name: 'Settings' },
 ] as const
 
 test('a fresh mount shows the Old tab: real run data and no MOCK row', { plugins: [worldFixtures] }, async ($, on) => {
@@ -952,7 +953,7 @@ const tabLabels = async (ui: { findAll: (q: { type: string }) => Promise<{ props
     .map(b => String(b.props.label))
 
 test('the mock tab counts read the fixtures: lanes, plan done/total, waiting only when open', async () => {
-  expect(mockTabCounts()).toEqual({ overview: '', lanes: '4', plan: '3/8', usage: '', events: '', waiting: '!1', old: '' })
+  expect(mockTabCounts()).toEqual({ overview: '', lanes: '4', plan: '3/8', usage: '', events: '', waiting: '!1', old: '', settings: '' })
   expect(waitingCount(0)).toBe('') // LOW: a fixture with no open decision shows no count, never `!0`
   expect(waitingCount(2)).toBe('!2')
 })
@@ -995,7 +996,7 @@ test('F0: every tab Button carries its keyboard hotkey — o l p u e w 0, at 36 
     await ui.press({ key: 'dash-tab-old' })
     await ui.redraw(paneProps(cols))
     const buttons = await ui.findAll({ type: 'Button' })
-    expect(buttons.map(b => b.props.hotkey), `hotkeys at ${cols}`).toEqual(['o', 'l', 'p', 'u', 'e', 'w', '0'])
+    expect(buttons.map(b => b.props.hotkey), `hotkeys at ${cols}`).toEqual(['o', 'l', 'p', 'u', 'e', 'w', '0', '9'])
     for (const b of buttons) {
       // an inactive tab's label is its count alone (or the `·` placeholder), so
       // a plain Button's `h: label` drawing never repeats the tab's own letter
@@ -1040,16 +1041,16 @@ test('the tab bar shows the active word and count, the rest hotkey + count, at 4
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   // Old active: the counts come from the snapshot — 3 live lanes, 1/5 done, 1 open decision
-  expect(await tabLabels(ui)).toEqual(['·', '3', '1/5', '·', '·', '!1', 'Old'])
+  expect(await tabLabels(ui)).toEqual(['·', '3', '1/5', '·', '·', '!1', 'Old', '·'])
   for (const cols of [36, 46] as const) {
     await ui.press({ key: 'dash-tab-old' })
     await ui.press({ key: 'dash-tab-lanes' })
     await ui.redraw(paneProps(cols))
     const labels = await tabLabels(ui)
-    expect(labels, `at ${cols}`).toEqual(['·', 'Lanes 4', '3/8', '·', '·', '!1', '·'])
+    expect(labels, `at ${cols}`).toEqual(['·', 'Lanes 4', '3/8', '·', '·', '!1', '·', '·'])
     expect(labels.join(' ')).not.toContain('o: o') // the S0 short labels are gone
     expect(labels.some(l => /^[a-z0-9]$/.test(l)), 'no tab shows its own letter twice').toBe(false)
-    expect(labels.filter(l => l === '·').length, 'count-less tabs carry the placeholder').toBe(4)
+    expect(labels.filter(l => l === '·').length, 'count-less tabs carry the placeholder').toBe(5)
   }
 })
 
@@ -1220,7 +1221,7 @@ test('V1.4: a full-width rule of the palette line colour sits directly under the
     expect(wrap?.kids, `bar then rule at ${cols}`).toHaveLength(2)
     const bar = nodesOf(wrap?.kids[0], 'Button')
     expect(bar.map(b => String(b.props.key)), `the bar is the first child at ${cols}`)
-      .toEqual(['dash-tab-overview', 'dash-tab-lanes', 'dash-tab-plan', 'dash-tab-usage', 'dash-tab-events', 'dash-tab-waiting', 'dash-tab-old'])
+      .toEqual(['dash-tab-overview', 'dash-tab-lanes', 'dash-tab-plan', 'dash-tab-usage', 'dash-tab-events', 'dash-tab-waiting', 'dash-tab-old', 'dash-tab-settings'])
     for (const { key, name } of TAB_BUTTONS) {
       await ui.press({ key: 'dash-tab-old' })
       await ui.press({ key })
@@ -1272,9 +1273,289 @@ test('C12: every tab call receives the ui handle — all six tabs act on it, not
   // Waiting: ⋯ reveals the folded actions; a pick marks the option it picked
   await ui.press({ key: 'dash-tab-waiting' })
   const labels = await tabLabels(ui)
-  expect(labels, 'the tab bar keeps its own labels while a body draws buttons').toHaveLength(7)
+  expect(labels, 'the tab bar keeps its own labels while a body draws buttons').toHaveLength(8)
   await ui.press({ key: 'waiting-a-more-3' })
   expect(await ui.find({ type: 'Button', text: /Rebase later/ }), 'the revealed option button').toBeTruthy()
   await ui.press({ key: 'waiting-b' })
   expect(await ui.find({ type: 'Button', text: /Rebase later ✓/ }), 'the picked option is marked').toBeTruthy()
+})
+
+// S2.0 answer (host types: Elements[terminal|desktop|vscode] carry Input and
+// Select; Elements[mobile] carries neither): YES on terminal + desktop. Text
+// rows therefore use the native Input; a Select covers constrained values.
+// The probe mounts a Pane whose render records `'Input' in els` /
+// `'Select' in els` straight off `$.ui.resolve(e)` — the same call the pane
+// and the wizard make — so the test keeps passing whichever way the engine
+// answers, while asserting and naming today's answer.
+test('S2.0 spike: $.ui.resolve(e) exposes Input and Select on terminal + desktop', { plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  const seen: { surface: string; input: boolean; select: boolean }[] = []
+  on('ui.render', { component: 'Pane', requestId: 'mk-spike-probe' }, async ($probe, e) => {
+    const els = $probe.ui.resolve(e) as unknown as Record<string, unknown>
+    seen.push({ surface: String(e.surface), input: 'Input' in els, select: 'Select' in els })
+    const Text = els['Text'] as (props: { children: unknown }) => never
+    return Text({ children: 'spike' })
+  })
+  await $.session.start(sessionStart())
+  for (const surface of ['terminal', 'desktop'] as const) {
+    await $.ui.mount({ plugin: 'matrixkoder', surface, component: 'Pane', requestId: 'mk-spike-probe', props: paneProps(46) })
+  }
+  expect(seen.map(s => s.surface).sort()).toEqual(['desktop', 'terminal'])
+  for (const s of seen) {
+    expect(s.input, `${s.surface} exposes Input`).toBe(true)
+    expect(s.select, `${s.surface} exposes Select`).toBe(true)
+  }
+})
+
+// ---------- S2.3: settings wiring — hotkey 9, hiddenTabs, defaultTab, raster=false, solo ----------
+
+test('S2.3: hotkey 9 switches to the Settings tab and hides Old', { plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  const nine = (await ui.findAll({ type: 'Button' })).find(b => b.props.hotkey === '9')
+  expect(nine, 'the bar carries hotkey 9').toBeDefined()
+  expect(String(nine?.props.key)).toBe('dash-tab-settings')
+  await ui.press({ key: 'dash-tab-settings' })
+  expect(await ui.find(mockRow()), 'Settings MOCK row').toBeTruthy()
+  expect(await ui.find({ text: /1 Mode/ }), 'the settings scope bar').toBeTruthy()
+  expect(await ui.find({ text: /workflows-v2/ }), 'Old hidden').toBeUndefined()
+  await ui.press({ key: 'dash-tab-old' })
+  expect(await ui.find({ text: /workflows-v2/ }), 'Old is back').toBeTruthy()
+})
+
+test('S2.3: hiddenTabs hides named tabs but never Settings', { plugins: [worldFixtures], options: { hiddenTabs: 'lanes,plan' } }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  const keys = (await ui.findAll({ type: 'Button' })).map(b => String(b.props.key))
+  expect(keys).not.toContain('dash-tab-lanes')
+  expect(keys).not.toContain('dash-tab-plan')
+  expect(keys).toContain('dash-tab-settings')
+  expect(keys).toContain('dash-tab-old')
+})
+
+test('S2.3: hiddenTabs naming Settings still draws it', { plugins: [worldFixtures], options: { hiddenTabs: 'settings,lanes' } }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  const keys = (await ui.findAll({ type: 'Button' })).map(b => String(b.props.key))
+  expect(keys).toContain('dash-tab-settings')
+  expect(keys).not.toContain('dash-tab-lanes')
+  await ui.press({ key: 'dash-tab-settings' })
+  expect(await ui.find(mockRow()), 'Settings renders while named hidden').toBeTruthy()
+})
+
+test('S2.3: defaultTab opens the pane on that tab', { plugins: [worldFixtures], options: { defaultTab: 'settings' } }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  expect(await ui.find(mockRow()), 'no press needed').toBeTruthy()
+  expect(await ui.find({ text: /1 Mode/ }), 'the settings scope bar').toBeTruthy()
+  expect(await ui.find({ text: /workflows-v2/ }), 'Old hidden').toBeUndefined()
+})
+
+test('S2.3: an unknown or hidden defaultTab keeps the Old default', { plugins: [worldFixtures], options: { defaultTab: 'nope' } }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  expect(await ui.find({ text: /workflows-v2/ }), 'Old stays the default').toBeTruthy()
+  expect(await ui.find(mockRow())).toBeUndefined()
+})
+
+test('S2.3: a hidden defaultTab falls back to Old', { plugins: [worldFixtures], options: { defaultTab: 'lanes', hiddenTabs: 'lanes' } }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  expect(await ui.find({ text: /workflows-v2/ }), 'Old stays the default').toBeTruthy()
+})
+
+test('S2.3: raster:false draws the eighth-block fallback (no Raster); default draws Raster', { plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-plan' })
+  expect(await ui.findAll({ type: 'Raster' }), 'the live wave strip is a Raster by default').not.toHaveLength(0)
+})
+
+test('S2.3: raster:false draws the eighth-block fallback (no Raster)', { plugins: [worldFixtures], options: { raster: false } }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-plan' })
+  expect(await ui.findAll({ type: 'Raster' }), 'no Raster anywhere under raster:false').toHaveLength(0)
+  expect(await ui.find({ text: /Payment provider adapter/ }), 'the live wave still renders').toBeTruthy()
+  // R3 LOW 2: a second bar-drawing mock tab (Usage draws pickBar strips) falls
+  // back too. Old intentionally keeps `els`: OldTab never calls pickBar today
+  // (text bars only), so there is nothing to fall back — out of scope.
+  await ui.press({ key: 'dash-tab-usage' })
+  expect(await ui.findAll({ type: 'Raster' }), 'no Raster on Usage either').toHaveLength(0)
+  expect(await ui.find(mockRow()), 'the Usage mock world still renders').toBeTruthy()
+})
+
+test('S2.3: mode solo skips the lane sweep', { plugins: [worldFixtures], options: { mode: 'solo' } }, async ($, on) => {
+  mockFs(on, worldFiles())
+  const sweeps: (readonly string[])[] = []
+  const clock = mockWorld(on, { process: argv => { if (isSweep(argv)) sweeps.push(argv) } })
+  await $.session.start(sessionStart())
+  await clock.advance(120_000)
+  expect(sweeps, 'no sweep in solo mode with an active run').toHaveLength(0)
+})
+
+// ---------- R3: review-r1 fixes — real row selection, dirty vs loaded, width, typing hotkeys ----------
+
+// R3 MEDIUM 2's measure: every Text and every horizontal Box in the drawn
+// tree, card-aware (plan.test.ts's discipline — a row inside a kit Card owes
+// cols - 4). Buttons count their drawn chrome; Inputs, Selects and Rasters
+// count 0 (the engine lays those out).
+type R3DrawnNode = { type?: string; props?: { key?: string; flexDirection?: string; gap?: number; borderStyle?: string; label?: string; plain?: boolean }; children?: unknown[] }
+
+function r3TextWidth(node: unknown): number {
+  if (typeof node === 'string') return node.length
+  if (typeof node !== 'object' || node === null) return 0
+  const n = node as R3DrawnNode
+  if (n.type !== 'Text') return 0
+  return (n.children ?? []).reduce((sum: number, c) => sum + r3TextWidth(c), 0)
+}
+
+function r3WidthOf(node: unknown): number {
+  if (typeof node !== 'object' || node === null) return 0
+  const n = node as R3DrawnNode
+  if (n.type === 'Text') return r3TextWidth(n)
+  if (n.type === 'Button') return String(n.props?.label ?? '').length + (n.props?.plain ? 2 : 4)
+  if (n.type === 'Input' || n.type === 'Select' || n.type === 'Raster') return 0
+  const kids = n.children ?? []
+  if (n.type === 'Box' && n.props?.flexDirection === 'row') {
+    return kids.reduce((sum: number, c) => sum + r3WidthOf(c), 0) + (typeof n.props.gap === 'number' ? n.props.gap : 0) * Math.max(0, kids.length - 1)
+  }
+  return kids.reduce((max: number, c) => Math.max(max, r3WidthOf(c)), 0)
+}
+
+function drawnRowWidths(root: unknown): { width: number; inCard: boolean; text: string }[] {
+  const out: { width: number; inCard: boolean; text: string }[] = []
+  const preview = (node: unknown): string => {
+    if (typeof node === 'string') return node
+    if (typeof node !== 'object' || node === null) return ''
+    const n = node as R3DrawnNode
+    if (n.type === 'Button') return `[${String(n.props?.label ?? '')}]`
+    return (n.children ?? []).map(preview).join('')
+  }
+  // the main tab bar wraps visually (flexWrap), so the tree never gives its
+  // drawn rows — skip it (the F0 barRows test owns bar wrapping); every other
+  // row Box, including the settings scope bar's pre-wrapped rows, is measured.
+  const isTabBar = (node: R3DrawnNode): boolean =>
+    (node.children ?? []).some(c =>
+      typeof c === 'object' && c !== null && (c as R3DrawnNode).type === 'Button' &&
+      String((c as R3DrawnNode).props?.key ?? '').startsWith('dash-tab-'))
+  const walk = (node: unknown, inCard: boolean): void => {
+    if (typeof node !== 'object' || node === null) return
+    const n = node as R3DrawnNode
+    const card = inCard || (n.type === 'Box' && n.props?.borderStyle === 'round')
+    if (n.type === 'Box' && n.props?.flexDirection === 'row' && isTabBar(n)) {
+      for (const c of n.children ?? []) walk(c, card)
+      return
+    }
+    if (n.type === 'Text' || (n.type === 'Box' && n.props?.flexDirection === 'row')) {
+      out.push({ width: r3WidthOf(node), inCard: card, text: preview(node).slice(0, 60) })
+    }
+    for (const c of n.children ?? []) walk(c, card)
+  }
+  walk(root, false)
+  return out
+}
+
+// R3 HIGH 1: the row label is a real press target. Pressing it through the
+// mounted pane selects the row (help + `default X · r reset` appear); `r`
+// resets it. On the R1 code there is no `-pick` press, so this fails there.
+test('R3 HIGH 1: pressing a row label selects it — help + default + r reset; r resets', { plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-settings' })
+  await ui.press({ key: 'set-scope-routing' })
+  // Max build lanes loads 4 over a default of 3: clean until edited
+  expect(await ui.find({ text: /unsaved/ })).toBeUndefined()
+  await ui.press({ key: 'set-routing_preferences.max_build_lanes-pick' })
+  expect(await ui.find({ text: /Build lanes th/ }), 'the selected row help line').toBeTruthy()
+  expect(await ui.find({ text: /default 3/ }), 'the default tail').toBeTruthy()
+  expect(await ui.find({ type: 'Button', key: 'set-routing_preferences.max_build_lanes-reset' }), 'the r reset press').toBeTruthy()
+  await ui.press({ key: 'set-routing_preferences.max_build_lanes-reset' })
+  expect(await ui.find({ text: /● 1 unsaved/ }), 'reset wrote the default as an edit (it differs from loaded 4)').toBeTruthy()
+})
+
+// R3 MEDIUM 1 (+LOW 4): dirty tracks the loaded value, not the default.
+// Stepping away dirties; stepping back to the loaded value clears. On the R1
+// code the way back still counts unsaved (edit 4 ≠ default 3), so this fails.
+test('R3 MEDIUM 1: value≠default starts clean; editing back to loaded clears ●', { plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-settings' })
+  await ui.press({ key: 'set-scope-routing' })
+  expect(await ui.find({ text: /unsaved/ }), 'loaded 4 over default 3 is clean').toBeUndefined()
+  await ui.press({ key: 'set-routing_preferences.max_build_lanes-inc' }) // 4 → 5
+  expect(await ui.find({ text: /● 1 unsaved/ }), 'the step dirtied the row').toBeTruthy()
+  await ui.press({ key: 'set-routing_preferences.max_build_lanes-dec' }) // 5 → 4, back to loaded
+  expect(await ui.find({ text: /unsaved/ }), 'back to the loaded value is clean').toBeUndefined()
+  const pick = await ui.find({ type: 'Button', key: 'set-routing_preferences.max_build_lanes-pick' }) as { props: { label?: string } } | undefined
+  expect(pick, 'the row press still stands').toBeDefined()
+  expect(String(pick?.props.label ?? ''), 'no changed marker on the label').toBe('Max build lanes')
+})
+
+// R3 MEDIUM 3: while the find field holds the edit mode, the tab drops its
+// letter/digit hotkeys, so typing `s` filters but never saves. The engine
+// holds printable keys in a focused Input anyway
+// (.claude-plugin/types/claude-code/index.d.ts:5437-5439: "while it has focus
+// every printable key reaches it alone"); this test pins the tab's half: the
+// hotkeys are gone in find mode and back out of it. On the R1 code the save
+// press still carries hotkey `s`, so this fails there.
+test('R3 MEDIUM 3: typing s in find mode filters and never saves', { plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-settings' })
+  await ui.press({ key: 'set-scope-routing' })
+  await ui.press({ key: 'set-routing_preferences.max_build_lanes-inc' }) // an edit to protect
+  expect(await ui.find({ text: /● 1 unsaved/ })).toBeTruthy()
+  await ui.press({ key: 'set-find' }) // enter find mode
+  const hotkeyOf = async (key: string): Promise<unknown> =>
+    (await ui.find({ type: 'Button', key }) as { props: { hotkey?: string } } | undefined)?.props.hotkey
+  expect(await hotkeyOf('set-save'), 'no s hotkey in find mode').toBeUndefined()
+  expect(await hotkeyOf('set-discard'), 'no x hotkey in find mode').toBeUndefined()
+  expect(await hotkeyOf('set-scope-routing'), 'no digit hotkey in find mode').toBeUndefined()
+  await ui.input({ key: 'set-find-input', text: 'stall' }) // types an `s`
+  expect(await ui.find({ text: /● 1 unsaved/ }), 'the edit survived typing').toBeTruthy()
+  await ui.press({ key: 'set-find' }) // leave find mode
+  expect(await hotkeyOf('set-save'), 's save is back out of find mode').toBe('s')
+})
+
+// R3 MEDIUM 2: the long-default help line (Code reviewer defaults to
+// `claude sonnet medium`) fits 46 and 36 cols — every drawn row, card-aware.
+// On the R1 code the help tail overflows, so this fails there.
+test('R3 MEDIUM 2: the long-default help line fits 46 and 36 cols', { plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-settings' })
+  await ui.press({ key: 'set-scope-routing' })
+  await ui.press({ key: 'set-routing_preferences.reviewer-pick' })
+  expect(await ui.find({ text: /default claude/ }), 'the clipped default tail').toBeTruthy()
+  for (const cols of [46, 36] as const) {
+    await ui.redraw(paneProps(cols))
+    const wide = drawnRowWidths(await ui.drawn()).filter(w => (w.inCard ? w.width > cols - 4 : w.width > cols))
+    expect(wide, `over-wide rows at ${cols} cols: ${JSON.stringify(wide)}`).toEqual([])
+  }
 })
