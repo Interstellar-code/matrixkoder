@@ -271,7 +271,7 @@ export function registerDashboard(on: On, options: PluginOptions): void {
             The bar and the rule share a gap-less column so the rule sits
             directly under the bar; the pane's own gap keeps the space after it. */}
         <Box flexDirection="column">
-          {TabBar(els, $, dashTab, counts, tabs)}
+          {TabBar(els, $, dashTab, counts, tabs, compact)}
           <Text color={PALETTE.line}>{'─'.repeat(Math.max(0, cols))}</Text>
         </Box>
         {dashTab === 'old'
@@ -424,7 +424,7 @@ function wrapToCols(text: string, cols: number): string[] {
  *  `w: !1`) — or the `·` placeholder when it has none (`o: ·`), never its own
  *  letter. At 36 cols the wrapped bar runs to two rows; no row is wider than
  *  the pane. */
-function TabBar(els: Els, $: EngineInterface, dashTab: MkDashTab, counts: Record<MkDashTab, string>, tabs: readonly { key: MkDashTab; hotkey: string; label: string }[]) {
+function TabBar(els: Els, $: EngineInterface, dashTab: MkDashTab, counts: Record<MkDashTab, string>, tabs: readonly { key: MkDashTab; hotkey: string; label: string }[], compact: boolean) {
   const { Box, Button } = els
   return (
     <Box flexDirection="row" flexWrap="wrap" gap={1}>
@@ -436,7 +436,7 @@ function TabBar(els: Els, $: EngineInterface, dashTab: MkDashTab, counts: Record
           <Button
             key={`dash-tab-${t.key}`}
             hotkey={t.hotkey}
-            label={active ? `${t.label}${count === '' ? '' : ` ${count}`}` : count === '' ? '·' : count}
+            label={active || !compact ? `${t.label}${count === '' ? '' : ` ${count}`}` : count === '' ? '·' : count}
             plain={true}
             dimColor={active ? undefined : true}
             onPress={() => { void switchTab($, t.key) }}

@@ -17,9 +17,9 @@ type Els = Elements[keyof Elements]
 
 /** A filled card: panel background, round border in the role colour (line by
  *  default), one cell of padding on each side. */
-export function Card(els: Els, opts: { role?: PaletteRole }, children: RenderChildren): RenderElement {
+export function Card(els: Els, opts: { role?: PaletteRole; edge?: string }, children: RenderChildren): RenderElement {
   const { Box } = els
-  const border = opts.role == null ? PALETTE.line : ROLE[opts.role].fg
+  const border = opts.role == null ? (opts.edge ?? PALETTE.line) : ROLE[opts.role].fg
   return (
     <Box backgroundColor={PALETTE.panel} borderStyle="round" borderColor={border} paddingX={1}>
       {children}
