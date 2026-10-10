@@ -19,12 +19,21 @@ import { SETTINGS_FIXTURE } from './settings.fixture'
 import { ActionButton, Card, Chip, Section, SettingRow } from './kit'
 import type { SettingCtx, SettingField } from './kit'
 import { ROLE } from './palette'
+import type { SavePayload } from '../settings-io'
+import { settingsInputKeys } from '../settings-io'
 
 type Els = Elements[keyof Elements]
 
 /** C12: this tab's view-state handle — declared locally (structural typing; no
- *  import crosses lanes). */
-type TabUi = { get(key: string): string | undefined; set(key: string, value: string): void }
+ *  import crosses lanes). `save`/`recheck` are the dashboard's live wires (S3):
+ *  save carries the dirty payload to the ordered mk-config + $.config write,
+ *  recheck re-runs the latest-tag check; both absent in fixture/tests. */
+type TabUi = {
+  get(key: string): string | undefined
+  set(key: string, value: string): void
+  save?: (payload: SavePayload) => void
+  recheck?: () => void
+}
 
 /** The eight scopes, in hotkey order; `file`/`note` draw the scope-note line. */
 export type SettingsScopeId = 'mode' | 'project' | 'routing' | 'agents' | 'models' | 'child' | 'tabs' | 'about'
@@ -60,6 +69,9 @@ export type SettingsField = {
   readonly help: string
   readonly editable: boolean
   readonly why?: string
+  /** S3: a live global row (its value came from $.config, keyed by suffix) —
+   *  the save payload routes it to $.config.set, not to mk-config set. */
+  readonly global?: true
 }
 
 /** One card of rows under a scope (the artboard's groups). */
@@ -224,6 +236,45 @@ function clearAllEdits(view: SettingsView, ui: TabUi | undefined): void {
   for (const pr of view.projects) ui?.set(`settings:edit:hive.${pr.name}`, '')
 }
 
+/** S3: the save press payload — every dirty row routed by its marker. A
+ *  `global` row goes to $.config.set by suffix; a tabs.* bool rewrites the
+ *  hiddenTabs comma list; a models.<agent> pick edit goes to `set
+ *  picks.<agent>` as an array; everything else goes to one mk-config `set`
+ *  per key (list rows encode their comma string as an array there). */
+function savePayloadOf(view: SettingsView, ui: TabUi | undefined): SavePayload {
+  const sets: { key: string; value: SettingsValue; list: boolean }[] = []
+  const globals: { suffix: string; value: SettingsValue }[] = []
+  const visibility: { tab: string; on: boolean }[] = []
+  for (const f of flatFields(view)) {
+    const e = editOf(ui, f.key)
+    if (e === undefined) continue
+    if (f.global === true) {
+      globals.push({ suffix: f.key, value: e })
+    } else if (f.scope === 'tabs' && f.key.startsWith('tabs.') && typeof e === 'boolean') {
+      visibility.push({ tab: f.key.slice('tabs.'.length), on: e })
+    } else {
+      sets.push({ key: f.key, value: e, list: f.type === 'list' })
+    }
+  }
+  for (const p of view.picks) {
+    const e = pickEditOf(ui, p.agent)
+    if (e != null && e.join('|') !== p.models.join('|')) {
+      sets.push({ key: `picks.${p.agent}`, value: [...e], list: true })
+    }
+  }
+  return { sets, globals, visibility }
+}
+
+/** Carried MEDIUM: the tab's letter/digit hotkeys (`s x r f c`, scope 1–8)
+ *  are inert while the find field or a text-row Input really has the
+ *  engine's focus ring — read off `settings:focus`, which the dashboard's
+ *  ui.focus hook keeps (element key, '' when the ring leaves). A focused
+ *  Button keeps its hotkey: only an Input swallows printable keys. */
+function inputHot(view: SettingsView, ui: TabUi | undefined): boolean {
+  const key = ui?.get('settings:focus') ?? ''
+  return key !== '' && settingsInputKeys(view).has(key)
+}
+
 /** the danger reset: clears one scope's edits (never drawn on Mode/About). */
 function clearScopeEdits(view: SettingsView, ui: TabUi | undefined, scopeId: SettingsScopeId): void {
   for (const f of flatFields(view)) if (f.scope === scopeId) ui?.set(`settings:edit:${f.key}`, '')
@@ -325,8 +376,10 @@ function kitField(f: SettingsField, value: string | number | boolean, W: number)
 
 /** one row's SettingCtx: the view state read at render, the writes fired only
  *  from the kit's controls. The artboard's stepper rule: step 5 past a max of
- *  60, else 1. Choosing an option also closes the open list. */
-function rowCtx(f: SettingsField, W: number, ui: TabUi | undefined): SettingCtx {
+ *  60, else 1. Choosing an option also closes the open list. `noHk` drops the
+ *  row's letter hotkey (the `r` reset) while an Input holds the real focus or
+ *  the find field holds the edit mode. */
+function rowCtx(f: SettingsField, W: number, ui: TabUi | undefined, noHk: true | undefined): SettingCtx {
   const cur = currentValue(f, ui)
   const n = Number(cur)
   const step = (f.max ?? 60) > 60 ? 5 : 1
@@ -337,11 +390,12 @@ function rowCtx(f: SettingsField, W: number, ui: TabUi | undefined): SettingCtx 
     selected,
     changed: fieldDirty(f, ui),
     open,
-    // R3 MEDIUM 3: while the find field holds the edit mode, no letter/digit
-    // hotkey on the tab may fire (the engine holds printable keys in a
-    // focused Input, but the tab drops its own hotkeys too, so the harness
-    // and every surface agree).
-    noHotkey: ui?.get('settings:findfocus') === '1' ? true : undefined,
+    // Carried MEDIUM (+ R3 MEDIUM 3): while the find field holds the edit
+    // mode, or a text-row Input really has the engine's focus ring (the
+    // engine holds every printable key in a focused Input — InputProps), no
+    // letter/digit hotkey on the tab may fire, so the harness and every
+    // surface agree.
+    noHotkey: noHk,
     onPick: () => ui?.set('settings:sel', selected ? '' : f.key),
     onToggle: () => setEdit(ui, f.key, !(cur === true)),
     onInc: () => setEdit(ui, f.key, Math.min(f.max ?? Number.MAX_SAFE_INTEGER, Number.isFinite(n) ? n + step : Number(f.default))),
@@ -376,8 +430,14 @@ export function SettingsTab(els: Els, view: SettingsView, cols: number, ui?: Tab
   const filter = ui?.get('settings:find') ?? ''
   const q = filter.trim().toLowerCase()
   const findFocus = ui?.get('settings:findfocus') === '1'
+  // Carried MEDIUM: the view flag OR the real ring — either drops s/x/r/f/c
+  // and the scope digits (the engine already feeds printable keys to a
+  // focused Input alone; the tab's own hotkeys stand down too).
+  const noHk = findFocus || inputHot(view, ui) ? true : undefined
   const dirties = dirtyKeys(view, ui)
   const checked = ui?.get('settings:about:checked') === '1'
+  const loadError = ui?.get('settings:load:error') ?? ''
+  const saveMsg = ui?.get('settings:save:msg') ?? ''
 
   // the find field: the native Input (S2.0: on terminal + desktop), else the
   // dim fallback a surface with no fields draws
@@ -397,12 +457,14 @@ export function SettingsTab(els: Els, view: SettingsView, cols: number, ui?: Tab
   return (
     <Box flexDirection="column" gap={1}>
       {view.mock && <Text bold={true} color="warning">MOCK · fixture data · not this run</Text>}
-      {ScopeBar(els, view, cols, scopeId, ui)}
+      {ScopeBar(els, view, cols, scopeId, ui, noHk)}
       <Box flexDirection="row" gap={1}>
         {ActionButton(els, {
           key: 'set-find', glyph: 'f', word: 'find',
-          noHotkey: findFocus ? true : undefined,
-          onPress: () => { ui?.set('settings:findfocus', findFocus ? '' : '1') },
+          noHotkey: noHk,
+          // closing or opening the find field drops a stale ring key with it:
+          // the hook re-records the ring on the next move
+          onPress: () => { ui?.set('settings:findfocus', findFocus ? '' : '1'); ui?.set('settings:focus', '') },
         })}
         {findField}
         {q !== '' && (
@@ -412,17 +474,26 @@ export function SettingsTab(els: Els, view: SettingsView, cols: number, ui?: Tab
         )}
       </Box>
       <Text dimColor={true} wrap="truncate-end">{clip(`${scope.file} · ${scope.note}`, cols)}</Text>
+      {loadError !== '' && <Text color={ROLE.err.fg}>{clip(`⚠ ${loadError}`, cols)}</Text>}
       {scopeId === 'mode'
         ? ModeCards(els, view, W, ui)
         : scopeId === 'models'
           ? ModelsCards(els, view, W, ui, q)
           : scopeId === 'about'
-            ? AboutBody(els, view, W, ui, q, checked)
-            : GroupCards(els, view, scopeId, W, ui, q)}
+            ? AboutBody(els, view, W, ui, q, checked, noHk)
+            : GroupCards(els, view, scopeId, W, ui, q, noHk)}
       {scopeId !== 'mode' && scopeId !== 'about' && (
         DangerRow(els, scope.label, cols, () => { clearScopeEdits(view, ui, scopeId) })
       )}
-      {dirties.length > 0 && DirtyFooter(els, dirties, cols, findFocus, () => { clearAllEdits(view, ui) })}
+      {saveMsg !== '' && SaveMsg(els, saveMsg, cols)}
+      {dirties.length > 0 && DirtyFooter(els, dirties, cols, noHk, () => {
+        // S3: the save press runs the ordered write (yaml sets, then globals);
+        // without the live wire (fixture/tests) it keeps clearing the edits.
+        // Either way the footer unmounts with a stale ring key on it.
+        ui?.set('settings:focus', '')
+        if (ui?.save != null) ui.save(savePayloadOf(view, ui))
+        else clearAllEdits(view, ui)
+      }, () => { ui?.set('settings:focus', ''); clearAllEdits(view, ui) })}
     </Box>
   )
 }
@@ -430,11 +501,11 @@ export function SettingsTab(els: Els, view: SettingsView, cols: number, ui?: Tab
 /** The scope bar: one pressable per scope, its digit the hotkey (1-8 are legal
  *  engine hotkeys), the active scope drawn primary. The bar wraps as whole
  *  buttons — a row never exceeds `cols` (4 scopes per row at 46, 3 at 36). */
-function ScopeBar(els: Els, view: SettingsView, cols: number, activeId: SettingsScopeId, ui: TabUi | undefined): RenderElement {
+function ScopeBar(els: Els, view: SettingsView, cols: number, activeId: SettingsScopeId, ui: TabUi | undefined, noHk: true | undefined): RenderElement {
   const { Box } = els
-  // R3 MEDIUM 3: the scope digits must not fire while the find field holds
-  // the edit mode (typing `1` filters; it must never switch scope).
-  const noHk = ui?.get('settings:findfocus') === '1' ? true : undefined
+  // R3 MEDIUM 3 + carried MEDIUM: the scope digits must not fire while the
+  // find field holds the edit mode or a text Input holds the real ring
+  // (typing `1` filters; it must never switch scope).
   type Item = { s: SettingsScope; digit: string; w: number }
   const rows: Item[][] = []
   let cur: Item[] = []
@@ -467,6 +538,7 @@ function ScopeBar(els: Els, view: SettingsView, cols: number, activeId: Settings
               ui?.set('settings:open', '')
               ui?.set('settings:find', '')
               ui?.set('settings:findfocus', '')
+              ui?.set('settings:focus', '') // the scope's Inputs unmount with it
             },
           }))}
         </Box>
@@ -477,7 +549,7 @@ function ScopeBar(els: Els, view: SettingsView, cols: number, activeId: Settings
 
 /** The row scopes' cards: one kit Card per group (the artboard's LANES /
  * RESERVE FLOOR / … headers), the group's rows filtered by the find query. */
-function GroupCards(els: Els, view: SettingsView, scopeId: SettingsScopeId, W: number, ui: TabUi | undefined, q: string): RenderElement {
+function GroupCards(els: Els, view: SettingsView, scopeId: SettingsScopeId, W: number, ui: TabUi | undefined, q: string, noHk: true | undefined): RenderElement {
   const { Box } = els
   const groups = view.groups
     .filter(g => g.scope === scopeId)
@@ -488,7 +560,7 @@ function GroupCards(els: Els, view: SettingsView, scopeId: SettingsScopeId, W: n
       {groups.map(({ g, rows }) => Card(els, {}, (
         <Box key={`set-group-${g.title}`} flexDirection="column">
           {Section(els, { label: g.title, right: g.right })}
-          {rows.map(r => SettingRow(els, kitField(r, currentValue(r, ui), W), rowCtx(r, W, ui)))}
+          {rows.map(r => SettingRow(els, kitField(r, currentValue(r, ui), W), rowCtx(r, W, ui, noHk)))}
         </Box>
       )))}
     </Box>
@@ -621,12 +693,12 @@ function ModelsCards(els: Els, view: SettingsView, W: number, ui: TabUi | undefi
 /** The About scope (the plan's one-read-only-scope merge of Plugin + Skills +
  * Update): the read-only plugin-option and helper-probe groups, the version
  * card with its view-state-only `c check`, and the What's-new lines. */
-function AboutBody(els: Els, view: SettingsView, W: number, ui: TabUi | undefined, q: string, checked: boolean): RenderElement {
+function AboutBody(els: Els, view: SettingsView, W: number, ui: TabUi | undefined, q: string, checked: boolean, noHk: true | undefined): RenderElement {
   const { Box, Text } = els
   const a = view.about
   return (
     <Box flexDirection="column" gap={1}>
-      {GroupCards(els, view, 'about', W, ui, q)}
+      {GroupCards(els, view, 'about', W, ui, q, noHk)}
       {Card(els, { role: 'live' }, (
         <Box flexDirection="column">
           {Section(els, { label: 'version', right: 'plugin.json · git tags' })}
@@ -643,8 +715,10 @@ function AboutBody(els: Els, view: SettingsView, W: number, ui: TabUi | undefine
           <Box flexDirection="row" gap={1}>
             {ActionButton(els, {
               key: 'set-about-check', glyph: 'c', word: 'check',
-              noHotkey: ui?.get('settings:findfocus') === '1' ? true : undefined,
-              onPress: () => { ui?.set('settings:about:checked', '1') },
+              noHotkey: noHk,
+              // S3.2: `c` re-runs the latest-tag check (the dashboard's wire);
+              // the flag alone keeps the stale-note behaviour in tests.
+              onPress: () => { ui?.set('settings:about:checked', '1'); ui?.recheck?.() },
             })}
           </Box>
         </Box>
@@ -687,14 +761,22 @@ function DangerRow(els: Els, label: string, cols: number, onReset: () => void): 
   )
 }
 
+/** The save-result line: `✓ saved N · backups written first` on success, the
+ *  set error or the {deny} reason otherwise (drawn even while dirty, so the
+ *  reason for the still-dirty footer reads on the same screen). */
+function SaveMsg(els: Els, msg: string, cols: number): RenderElement {
+  const { Text } = els
+  const ok = msg.startsWith('✓')
+  return <Text bold={ok} color={ok ? undefined : ROLE.err.fg}>{clip(msg, Math.max(1, cols))}</Text>
+}
+
 /** The dirty footer: `● N unsaved · <keys> … s save x discard` — the keys
- *  truncated with `…` to what remains of the line. In the fixture save and
- *  discard both clear the edits (S3 wires the real writes). */
-function DirtyFooter(els: Els, keys: readonly string[], cols: number, findFocus: boolean, onClear: () => void): RenderElement {
+ *  truncated with `…` to what remains of the line. The save press runs the
+ *  ordered write (S3); discard only clears the edits, never writes. */
+function DirtyFooter(els: Els, keys: readonly string[], cols: number, noHk: true | undefined, onSave: () => void, onClear: () => void): RenderElement {
   const { Box, Text } = els
   const head = `● ${keys.length} unsaved`
-  const noHk = findFocus ? true : undefined // R3 MEDIUM 3: typing `s`/`x` filters; it must never save
-  const save = ActionButton(els, { key: 'set-save', glyph: 's', word: 'save', tone: 'primary', noHotkey: noHk, onPress: onClear })
+  const save = ActionButton(els, { key: 'set-save', glyph: 's', word: 'save', tone: 'primary', noHotkey: noHk, onPress: onSave })
   const discard = ActionButton(els, { key: 'set-discard', glyph: 'x', word: '', noHotkey: noHk, onPress: onClear })
   const fixed = head.length + 's save'.length + 4 + 1 + 4 + 3 /* gaps */ + 3 /* ' · ' */
   const avail = cols - fixed

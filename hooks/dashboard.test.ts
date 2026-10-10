@@ -2,7 +2,9 @@
 // compact 36-col, inline hint, first-run and no-run states. Fixtures arrive
 // via $.fs.write (inline fixtures plugin); fs is served in memory.
 import { test, expect } from 'claude-code/testing'
-import { DATA_DIR, NOW, RUN_PATH, RUNS_INDEX, USAGE_PATH, agentOf, agentsOf, mockFs, mockWorld, paneProps, sessionStart, sessionStartIn, setRun, setUsage, tasksOf, worldFiles, worldFixtures } from './testkit'
+import type { On, ConfigRow } from 'claude-code'
+import { DATA_DIR, NOW, PROJECT_DIR, RUN_PATH, RUNS_INDEX, USAGE_PATH, agentOf, agentsOf, mockFs, mockWorld, paneProps, sessionStart, sessionStartIn, setRun, setUsage, tasksOf, worldFiles, worldFixtures } from './testkit'
+import type { Files, MockWorld } from './testkit'
 import { parseYamlAgents } from './data'
 import { mockTabCounts, waitingCount } from './tabs/header'
 
@@ -902,7 +904,8 @@ test('every tab hotkey switches to that tab’s MOCK row and hides Old; 0 restor
   mockWorld(on)
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  for (const { key, name } of TAB_BUTTONS) {
+  // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
+  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings')) {
     await ui.press({ key })
     expect(await ui.find(mockRow()), `${name} MOCK row`).toBeTruthy()
     expect(await ui.find({ text: /workflows-v2/ }), `${name} hides Old`).toBeUndefined()
@@ -918,11 +921,12 @@ test('at 36 cols the tab bar drops to short labels and every tab still renders',
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   await ui.redraw(paneProps(36))
-  for (const { key, name } of TAB_BUTTONS) {
+  // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
+  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings')) {
     expect(await ui.find({ type: 'Button', text: name }), `${name} wide label dropped`).toBeUndefined()
   }
   expect(await ui.findAll({ type: 'Button' })).toHaveLength(TAB_BUTTONS.length + 1) // the bar still draws all seven
-  for (const { key } of TAB_BUTTONS) {
+  for (const { key } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings')) {
     await ui.press({ key })
     expect(await ui.find(mockRow()), `${key} renders narrow`).toBeTruthy()
   }
@@ -976,7 +980,8 @@ test('every mock tab shows the fixture run header: name, stage chip, MOCK marker
   mockWorld(on)
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  for (const { key, name } of TAB_BUTTONS) {
+  // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
+  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings')) {
     await ui.press({ key: 'dash-tab-old' })
     await ui.press({ key })
     expect(await ui.find({ text: 'Checkout v2' }), `${name} run name`).toBeTruthy()
@@ -1008,7 +1013,8 @@ test('F0: every tab Button carries its keyboard hotkey — o l p u e w 0, at 36 
     }
   }
   // the press-by-key switch loop stands
-  for (const { key, name } of TAB_BUTTONS) {
+  // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
+  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings')) {
     await ui.redraw(paneProps(46))
     await ui.press({ key })
     expect(await ui.find(mockRow()), `${name} MOCK row`).toBeTruthy()
@@ -1222,7 +1228,8 @@ test('V1.4: a full-width rule of the palette line colour sits directly under the
     const bar = nodesOf(wrap?.kids[0], 'Button')
     expect(bar.map(b => String(b.props.key)), `the bar is the first child at ${cols}`)
       .toEqual(['dash-tab-overview', 'dash-tab-lanes', 'dash-tab-plan', 'dash-tab-usage', 'dash-tab-events', 'dash-tab-waiting', 'dash-tab-old', 'dash-tab-settings'])
-    for (const { key, name } of TAB_BUTTONS) {
+    // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
+    for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings')) {
       await ui.press({ key: 'dash-tab-old' })
       await ui.press({ key })
       expect(await ui.find({ text: new RegExp(`^─{${String(cols)}}$`) }), `${name} rule at ${cols}`).toBeTruthy()
@@ -1250,7 +1257,8 @@ test('C12: every tab call receives the ui handle — all six tabs act on it, not
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   // the three-argument tabs (lanes, usage, waiting, events) take the extra
   // argument through the pane's widened call and still render their fixture
-  for (const { key, name } of TAB_BUTTONS) {
+  // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
+  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings')) {
     await ui.press({ key: 'dash-tab-old' })
     await ui.press({ key })
     expect(await ui.find(mockRow()), `${name} renders with the ui argument`).toBeTruthy()
@@ -1311,15 +1319,17 @@ test('S2.0 spike: $.ui.resolve(e) exposes Input and Select on terminal + desktop
 // ---------- S2.3: settings wiring — hotkey 9, hiddenTabs, defaultTab, raster=false, solo ----------
 
 test('S2.3: hotkey 9 switches to the Settings tab and hides Old', { plugins: [worldFixtures] }, async ($, on) => {
-  mockFs(on, worldFiles())
-  mockWorld(on)
+  const files = worldFiles()
+  const calls: (readonly string[])[] = []
+  const clock = mockSettingsBackend(on, files, calls, R3_FIELDS)
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   const nine = (await ui.findAll({ type: 'Button' })).find(b => b.props.hotkey === '9')
   expect(nine, 'the bar carries hotkey 9').toBeDefined()
   expect(String(nine?.props.key)).toBe('dash-tab-settings')
   await ui.press({ key: 'dash-tab-settings' })
-  expect(await ui.find(mockRow()), 'Settings MOCK row').toBeTruthy()
+  await loadLiveSettings(clock, ui, calls)
+  expect(await ui.find({ text: /MOCK · fixture data/ }), 'never mock rows').toBeUndefined()
   expect(await ui.find({ text: /1 Mode/ }), 'the settings scope bar').toBeTruthy()
   expect(await ui.find({ text: /workflows-v2/ }), 'Old hidden').toBeUndefined()
   await ui.press({ key: 'dash-tab-old' })
@@ -1339,23 +1349,28 @@ test('S2.3: hiddenTabs hides named tabs but never Settings', { plugins: [worldFi
 })
 
 test('S2.3: hiddenTabs naming Settings still draws it', { plugins: [worldFixtures], options: { hiddenTabs: 'settings,lanes' } }, async ($, on) => {
-  mockFs(on, worldFiles())
-  mockWorld(on)
+  const files = worldFiles()
+  const calls: (readonly string[])[] = []
+  const clock = mockSettingsBackend(on, files, calls, R3_FIELDS)
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   const keys = (await ui.findAll({ type: 'Button' })).map(b => String(b.props.key))
   expect(keys).toContain('dash-tab-settings')
   expect(keys).not.toContain('dash-tab-lanes')
   await ui.press({ key: 'dash-tab-settings' })
-  expect(await ui.find(mockRow()), 'Settings renders while named hidden').toBeTruthy()
+  await loadLiveSettings(clock, ui, calls)
+  expect(await ui.find({ text: /MOCK · fixture data/ }), 'Settings renders live while named hidden').toBeUndefined()
+  expect(await ui.find({ text: /1 Mode/ }), 'the settings scope bar').toBeTruthy()
 })
 
 test('S2.3: defaultTab opens the pane on that tab', { plugins: [worldFixtures], options: { defaultTab: 'settings' } }, async ($, on) => {
-  mockFs(on, worldFiles())
-  mockWorld(on)
+  const files = worldFiles()
+  const calls: (readonly string[])[] = []
+  const clock = mockSettingsBackend(on, files, calls, R3_FIELDS)
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  expect(await ui.find(mockRow()), 'no press needed').toBeTruthy()
+  await loadLiveSettings(clock, ui, calls) // the render fallback loads it, no press needed
+  expect(await ui.find({ text: /MOCK · fixture data/ }), 'never mock rows').toBeUndefined()
   expect(await ui.find({ text: /1 Mode/ }), 'the settings scope bar').toBeTruthy()
   expect(await ui.find({ text: /workflows-v2/ }), 'Old hidden').toBeUndefined()
 })
@@ -1477,11 +1492,13 @@ function drawnRowWidths(root: unknown): { width: number; inCard: boolean; text: 
 // mounted pane selects the row (help + `default X · r reset` appear); `r`
 // resets it. On the R1 code there is no `-pick` press, so this fails there.
 test('R3 HIGH 1: pressing a row label selects it — help + default + r reset; r resets', { plugins: [worldFixtures] }, async ($, on) => {
-  mockFs(on, worldFiles())
-  mockWorld(on)
+  const files = worldFiles()
+  const calls: (readonly string[])[] = []
+  const clock = mockSettingsBackend(on, files, calls, R3_FIELDS)
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   await ui.press({ key: 'dash-tab-settings' })
+  await loadLiveSettings(clock, ui, calls)
   await ui.press({ key: 'set-scope-routing' })
   // Max build lanes loads 4 over a default of 3: clean until edited
   expect(await ui.find({ text: /unsaved/ })).toBeUndefined()
@@ -1497,11 +1514,13 @@ test('R3 HIGH 1: pressing a row label selects it — help + default + r reset; r
 // Stepping away dirties; stepping back to the loaded value clears. On the R1
 // code the way back still counts unsaved (edit 4 ≠ default 3), so this fails.
 test('R3 MEDIUM 1: value≠default starts clean; editing back to loaded clears ●', { plugins: [worldFixtures] }, async ($, on) => {
-  mockFs(on, worldFiles())
-  mockWorld(on)
+  const files = worldFiles()
+  const calls: (readonly string[])[] = []
+  const clock = mockSettingsBackend(on, files, calls, R3_FIELDS)
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   await ui.press({ key: 'dash-tab-settings' })
+  await loadLiveSettings(clock, ui, calls)
   await ui.press({ key: 'set-scope-routing' })
   expect(await ui.find({ text: /unsaved/ }), 'loaded 4 over default 3 is clean').toBeUndefined()
   await ui.press({ key: 'set-routing_preferences.max_build_lanes-inc' }) // 4 → 5
@@ -1521,11 +1540,13 @@ test('R3 MEDIUM 1: value≠default starts clean; editing back to loaded clears �
 // hotkeys are gone in find mode and back out of it. On the R1 code the save
 // press still carries hotkey `s`, so this fails there.
 test('R3 MEDIUM 3: typing s in find mode filters and never saves', { plugins: [worldFixtures] }, async ($, on) => {
-  mockFs(on, worldFiles())
-  mockWorld(on)
+  const files = worldFiles()
+  const calls: (readonly string[])[] = []
+  const clock = mockSettingsBackend(on, files, calls, R3_FIELDS)
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   await ui.press({ key: 'dash-tab-settings' })
+  await loadLiveSettings(clock, ui, calls)
   await ui.press({ key: 'set-scope-routing' })
   await ui.press({ key: 'set-routing_preferences.max_build_lanes-inc' }) // an edit to protect
   expect(await ui.find({ text: /● 1 unsaved/ })).toBeTruthy()
@@ -1545,11 +1566,13 @@ test('R3 MEDIUM 3: typing s in find mode filters and never saves', { plugins: [w
 // `claude sonnet medium`) fits 46 and 36 cols — every drawn row, card-aware.
 // On the R1 code the help tail overflows, so this fails there.
 test('R3 MEDIUM 2: the long-default help line fits 46 and 36 cols', { plugins: [worldFixtures] }, async ($, on) => {
-  mockFs(on, worldFiles())
-  mockWorld(on)
+  const files = worldFiles()
+  const calls: (readonly string[])[] = []
+  const clock = mockSettingsBackend(on, files, calls, R3_FIELDS)
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   await ui.press({ key: 'dash-tab-settings' })
+  await loadLiveSettings(clock, ui, calls)
   await ui.press({ key: 'set-scope-routing' })
   await ui.press({ key: 'set-routing_preferences.reviewer-pick' })
   expect(await ui.find({ text: /default claude/ }), 'the clipped default tail').toBeTruthy()
@@ -1558,4 +1581,324 @@ test('R3 MEDIUM 2: the long-default help line fits 46 and 36 cols', { plugins: [
     const wide = drawnRowWidths(await ui.drawn()).filter(w => (w.inCard ? w.width > cols - 4 : w.width > cols))
     expect(wide, `over-wide rows at ${cols} cols: ${JSON.stringify(wide)}`).toEqual([])
   }
+})
+
+// ---------- S3: Settings tab live load + save ----------
+
+/** mk-config.py argv among the spawns (pollUsage's mk-usage.py excluded). */
+const mkConfigCalls = (calls: (readonly string[])[]): string[][] =>
+  calls.filter(a => a.some(x => x.endsWith('scripts/mk-config.py'))).map(a => [...a])
+
+const YAML_PATH = `${DATA_DIR}/matrixkoder.yaml`
+
+/** Two C1-shaped child rows the save test dirties through the steppers. */
+const S3_FIELDS = [
+  { key: 'session.stall_min', scope: 'child', label: 'Stall after', type: 'num', value: 20, default: 15, min: 5, max: 60, unit: 'm', help: 'No change flags a lane.', editable: true },
+  { key: 'session.max_wait_min', scope: 'child', label: 'Give up after', type: 'num', value: 120, default: 30, min: 10, max: 300, unit: 'm', help: 'Give up on a silent lane.', editable: true },
+]
+
+/** Routing rows with the S2 fixture's values, for the R3 tests against live rows. */
+const R3_FIELDS = [
+  { key: 'routing_preferences.max_build_lanes', scope: 'routing', label: 'Max build lanes', type: 'num', value: 4, default: 3, min: 1, max: 6, help: 'Build lanes the router may open at once.', editable: true },
+  { key: 'routing_preferences.reviewer', scope: 'routing', label: 'Code reviewer', type: 'select', value: 'claude sonnet medium', default: 'claude sonnet medium', opts: [['claude sonnet medium', 'pane'], ['opencode-go/kimi-k3', 'pane'], ['claude opus high', 'data-loss']], help: 'New pane in the lane.', editable: true },
+]
+
+type SettingsAnswer = { exitCode: number; stdout: string }
+
+function asConfigRows(rows?: unknown[]): ConfigRow[] {
+  return ((rows ?? []) as { key: string; value: boolean | string | number; isLocked?: boolean }[]).map(r => ({
+    key: r.key,
+    label: r.key,
+    kind: typeof r.value === 'boolean' ? 'boolean' : typeof r.value === 'number' ? 'number' : 'text',
+    value: r.value,
+    provider: { plugin: 'matrixkoder', tier: 'user' },
+    isLocked: r.isLocked ?? false,
+  }))
+}
+
+/** A canned settings backend: the yaml exists, migrate ok, list answers
+ *  `fields`, sets answer ok (or per-command via `setAnswer`). Also bottoms
+ *  session.cwd and $.config.list (default no rows). Returns the mock clock. */
+function mockSettingsBackend(
+  on: On,
+  files: Files,
+  calls: (readonly string[])[],
+  fields: unknown[],
+  opts: { configRows?: unknown[]; setAnswer?: (cmd: string[]) => SettingsAnswer } = {},
+): MockWorld {
+  files[YAML_PATH] = 'session:\n  stall_min: 20\n'
+  mockFs(on, files, [DATA_DIR, `${PROJECT_DIR}/.git`], [YAML_PATH])
+  const clock = mockWorld(on, {
+    process: argv => {
+      calls.push(argv)
+      if (!argv.some(a => a.endsWith('scripts/mk-config.py'))) return undefined
+      const cmd = argv.slice(argv.indexOf('--data') + 2)
+      const sub = cmd[0] ?? ''
+      let answer: SettingsAnswer = { exitCode: 0, stdout: '{"ok":true}\n' }
+      if (sub === 'migrate') answer = { exitCode: 0, stdout: '{"ok":true,"changed":[],"notes":[]}\n' }
+      else if (sub === 'list') answer = { exitCode: 0, stdout: `${JSON.stringify({ ok: true, file: YAML_PATH, fields })}\n` }
+      else if (sub === 'set') answer = opts.setAnswer?.(cmd) ?? { exitCode: 0, stdout: '{"ok":true}\n' }
+      return { value: { exitCode: answer.exitCode, stdout: answer.stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    },
+  })
+  on('session.cwd', () => ({ value: PROJECT_DIR }))
+  on('config.list', () => ({ value: asConfigRows(opts.configRows) }))
+  return clock
+}
+
+type Pressable = { press(q: { key: string }): Promise<unknown>; redraw(p: unknown): Promise<unknown> }
+
+/** Flush the fire-and-forget settings chain until `want` mk-config calls
+ *  landed, then redraw onto the settled view. */
+async function loadLiveSettings(clock: MockWorld, ui: Pressable, calls: (readonly string[])[], want = 2): Promise<void> {
+  for (let i = 0; i < 60 && mkConfigCalls(calls).length < want; i++) await clock.advance(0)
+  await ui.redraw(paneProps(46))
+}
+
+test('S3: opening the Settings tab runs migrate then list --json, both with --data', { plugins: [worldFixtures] }, async ($, on) => {
+  const files = worldFiles()
+  const calls: (readonly string[])[] = []
+  const clock = mockSettingsBackend(on, files, calls, S3_FIELDS)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-settings' })
+  await loadLiveSettings(clock, ui, calls)
+  const mk = mkConfigCalls(calls)
+  expect(mk).toHaveLength(2)
+  expect(mk[0]?.[0]).toBe('python3')
+  expect(mk[0]?.[1]?.endsWith('scripts/mk-config.py')).toBe(true)
+  for (const a of mk) {
+    const i = a.indexOf('--data')
+    expect(i, '--data on every mk-config call').toBeGreaterThanOrEqual(0)
+    expect(a[i + 1]).toBe(DATA_DIR)
+  }
+  expect(mk[0]?.slice(-1)).toEqual(['migrate'])
+  expect(mk[1]?.slice(-2)).toEqual(['list', '--json'])
+  // the live view arrived: no MOCK row anywhere
+  expect(await ui.find({ text: /MOCK · fixture data/ })).toBeUndefined()
+})
+
+test('LOW 5: every open re-lists and shows the fresh reply; migrate still runs once', { plugins: [worldFixtures] }, async ($, on) => {
+  let stall = 20
+  const files = worldFiles()
+  const calls: (readonly string[])[] = []
+  const fields = (): unknown[] => S3_FIELDS.map(f => f.key === 'session.stall_min' ? { ...f, value: stall } : f)
+  const clock = mockWorld(on, {
+    process: argv => {
+      calls.push(argv)
+      if (!argv.some(a => a.endsWith('scripts/mk-config.py'))) return undefined
+      const sub = argv[argv.indexOf('--data') + 2]
+      const stdout = sub === 'migrate'
+        ? '{"ok":true,"changed":[],"notes":[]}\n'
+        : `${JSON.stringify({ ok: true, file: YAML_PATH, fields: fields() })}\n`
+      return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    },
+  })
+  files[YAML_PATH] = 'session:\n  stall_min: 20\n'
+  mockFs(on, files, [DATA_DIR, `${PROJECT_DIR}/.git`], [YAML_PATH])
+  on('session.cwd', () => ({ value: PROJECT_DIR }))
+  on('config.list', () => ({ value: [] }))
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-settings' })
+  await loadLiveSettings(clock, ui, calls)
+  await ui.press({ key: 'set-scope-child' })
+  expect(await ui.find({ text: '20m' }), 'the first list reply').toBeTruthy()
+  // the yaml changes under the pane; the next open re-reads it
+  stall = 25
+  await ui.press({ key: 'dash-tab-old' })
+  await ui.press({ key: 'dash-tab-settings' })
+  await loadLiveSettings(clock, ui, calls, 3)
+  const mk = mkConfigCalls(calls)
+  expect(mk.filter(a => a[a.length - 1] === 'migrate')).toHaveLength(1) // still once per session
+  expect(mk.filter(a => a[a.length - 1] === '--json')).toHaveLength(2)
+  await ui.press({ key: 'set-scope-child' })
+  expect(await ui.find({ text: /^25m$/ }), 'the changed reply shows').toBeTruthy()
+  expect(await ui.find({ text: /^20m$/ }), 'the stale value is gone').toBeUndefined()
+})
+
+test('S3: save writes one set per dirty yaml row in order, then shows ✓ saved N', { plugins: [worldFixtures] }, async ($, on) => {
+  const files = worldFiles()
+  const calls: (readonly string[])[] = []
+  const clock = mockSettingsBackend(on, files, calls, S3_FIELDS)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-settings' })
+  await loadLiveSettings(clock, ui, calls)
+  await ui.press({ key: 'set-scope-child' })
+  await ui.press({ key: 'set-session.stall_min-inc' }) // 20 → 21 (max 60: step 1)
+  await ui.press({ key: 'set-session.max_wait_min-inc' }) // 120 → 125 (max 300: step 5)
+  await ui.press({ key: 'set-save' })
+  for (let i = 0; i < 60 && mkConfigCalls(calls).length < 4; i++) await clock.advance(0)
+  const sets = mkConfigCalls(calls).slice(2)
+  expect(sets).toHaveLength(2)
+  expect(sets[0]?.slice(-3)).toEqual(['set', 'session.stall_min', '21'])
+  expect(sets[1]?.slice(-3)).toEqual(['set', 'session.max_wait_min', '125'])
+  await ui.redraw(paneProps(46))
+  expect(await ui.find({ text: /✓ saved 2 · backups written first/ }), 'the saved footer').toBeTruthy()
+})
+
+test('MEDIUM 1: a refused set shows the CLI error text in the footer; the next set never runs', { plugins: [worldFixtures] }, async ($, on) => {
+  const files = worldFiles()
+  const calls: (readonly string[])[] = []
+  // refusal exactly like the real CLI: exit 2, the JSON on stdout, empty stderr
+  const clock = mockSettingsBackend(on, files, calls, S3_FIELDS, {
+    setAnswer: cmd => cmd[1] === 'session.stall_min'
+      ? { exitCode: 2, stdout: '{"ok":false,"error":"session.stall_min must be between 5 and 60: 2"}\n' }
+      : { exitCode: 0, stdout: '{"ok":true}\n' },
+  })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-settings' })
+  await loadLiveSettings(clock, ui, calls)
+  await ui.press({ key: 'set-scope-child' })
+  await ui.press({ key: 'set-session.stall_min-inc' })
+  await ui.press({ key: 'set-session.max_wait_min-inc' })
+  await ui.press({ key: 'set-save' })
+  for (let i = 0; i < 60 && mkConfigCalls(calls).length < 3; i++) await clock.advance(0)
+  for (let i = 0; i < 10; i++) await clock.advance(0)
+  await ui.redraw(paneProps(46))
+  expect(mkConfigCalls(calls).filter(a => a.includes('set'))).toHaveLength(1) // the second set never ran
+  expect(await ui.find({ text: /must be between 5 and 60/ }), 'the CLI reason in the footer').toBeTruthy()
+})
+
+test('MEDIUM 2: the ui.focus hook records the ring; leaving the Input re-arms s', { plugins: [worldFixtures] }, async ($, on) => {
+  on('ui.focus', () => ({}))
+  const files = worldFiles()
+  const calls: (readonly string[])[] = []
+  const clock = mockSettingsBackend(on, files, calls, S3_FIELDS)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-settings' })
+  await loadLiveSettings(clock, ui, calls)
+  await ui.press({ key: 'set-scope-child' })
+  await ui.press({ key: 'set-session.stall_min-inc' }) // dirty, so save draws
+  const hotkeyOf = async (key: string): Promise<unknown> =>
+    (await ui.find({ type: 'Button', key }) as { props: { hotkey?: string } } | undefined)?.props.hotkey
+  // the engine moves the ring onto the find Input: the producer records it
+  await $.ui.focus({ component: 'Pane', requestId: 'matrixkoder', element: 'set-find-input', origin: { kind: 'person' } })
+  await ui.redraw(paneProps(46))
+  expect(await hotkeyOf('set-save'), 's inert while the Input holds the ring').toBeUndefined()
+  // the ring moves on to a Button: s is armed again
+  await $.ui.focus({ component: 'Pane', requestId: 'matrixkoder', element: 'set-save', origin: { kind: 'person' } })
+  await ui.redraw(paneProps(46))
+  expect(await hotkeyOf('set-save'), 's back once the ring leaves the Input').toBe('s')
+  // a tab switch clears a stale ring key with it
+  await $.ui.focus({ component: 'Pane', requestId: 'matrixkoder', element: 'set-find-input', origin: { kind: 'person' } })
+  await ui.redraw(paneProps(46))
+  expect(await hotkeyOf('set-save'), 's inert again').toBeUndefined()
+  await ui.press({ key: 'dash-tab-old' })
+  await ui.press({ key: 'dash-tab-settings' })
+  await ui.redraw(paneProps(46))
+  expect(await hotkeyOf('set-save'), 's back after the tab switch').toBe('s')
+})
+
+test('MEDIUM 3: without matrixkoder.yaml neither migrate nor list runs; globals still show', { plugins: [worldFixtures] }, async ($, on) => {
+  const files = worldFiles() // no yaml file, and none stattable
+  mockFs(on, files)
+  const calls: (readonly string[])[] = []
+  const clock = mockWorld(on, {
+    process: argv => {
+      calls.push(argv)
+      return undefined
+    },
+  })
+  on('session.cwd', () => ({ value: PROJECT_DIR }))
+  on('config.list', () => ({ value: asConfigRows([{ key: 'matrixkoder.chip', value: true, isLocked: false }]) }))
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-settings' })
+  for (let i = 0; i < 20; i++) await clock.advance(0)
+  await ui.redraw(paneProps(46))
+  expect(mkConfigCalls(calls), 'no mk-config.py call at all').toEqual([])
+  expect(await ui.find({ text: /No matrixkoder\.yaml — run \/mk setup/ }), 'the setup note').toBeTruthy()
+  expect(await ui.find({ text: /MOCK · fixture data/ }), 'never mock rows').toBeUndefined()
+  await ui.press({ key: 'set-scope-about' })
+  expect(await ui.find({ text: /Status chip/ }), 'the global row still shows').toBeTruthy()
+})
+
+test('LOW 1: a failed load shows the ⚠ line over live rows, never the fixture', { plugins: [worldFixtures] }, async ($, on) => {
+  const files = worldFiles()
+  files[YAML_PATH] = 'session:\n  stall_min: 20\n'
+  mockFs(on, files, [DATA_DIR, `${PROJECT_DIR}/.git`], [YAML_PATH])
+  const calls: (readonly string[])[] = []
+  const clock = mockWorld(on, {
+    process: argv => {
+      calls.push(argv)
+      return undefined // the default answer carries no JSON: migrate throws
+    },
+  })
+  on('session.cwd', () => ({ value: PROJECT_DIR }))
+  on('config.list', () => ({ value: [] }))
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-settings' })
+  for (let i = 0; i < 20; i++) await clock.advance(0)
+  await ui.redraw(paneProps(46))
+  expect(await ui.find({ text: /printed no JSON/ }), 'the ⚠ reason').toBeTruthy()
+  expect(await ui.find({ text: /MOCK · fixture data/ }), 'never mock rows').toBeUndefined()
+})
+
+test('LOW 2: a failing list records settings:migrated so migrate is not rerun on retry', { plugins: [worldFixtures] }, async ($, on) => {
+  let listAttempts = 0
+  const files = worldFiles()
+  const calls: (readonly string[])[] = []
+  const clock = mockWorld(on, {
+    process: argv => {
+      calls.push(argv)
+      if (!argv.some(a => a.endsWith('scripts/mk-config.py'))) return undefined
+      const sub = argv[argv.indexOf('--data') + 2]
+      if (sub === 'migrate') return { value: { exitCode: 0, stdout: '{"ok":true,"changed":[],"notes":[]}\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      listAttempts++
+      if (listAttempts === 1) return { value: { exitCode: 1, stdout: '', stderr: 'temporary list fail', isStdoutTruncated: false, isStderrTruncated: false } }
+      return { value: { exitCode: 0, stdout: `${JSON.stringify({ ok: true, file: YAML_PATH, fields: S3_FIELDS })}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    },
+  })
+  files[YAML_PATH] = 'session:\n  stall_min: 20\n'
+  mockFs(on, files, [DATA_DIR, `${PROJECT_DIR}/.git`], [YAML_PATH])
+  on('session.cwd', () => ({ value: PROJECT_DIR }))
+  on('config.list', () => ({ value: [] }))
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-settings' })
+  for (let i = 0; i < 20; i++) await clock.advance(0)
+  // first open: migrate (ok) + list (failed)
+  expect(mkConfigCalls(calls).filter(a => a.includes('migrate'))).toHaveLength(1)
+  expect(mkConfigCalls(calls).filter(a => a.includes('list'))).toHaveLength(1)
+  // second open: list retried, but migrate NOT rerun
+  await ui.press({ key: 'dash-tab-old' })
+  await ui.press({ key: 'dash-tab-settings' })
+  await loadLiveSettings(clock, ui, calls, 3)
+  expect(mkConfigCalls(calls).filter(a => a.includes('migrate'))).toHaveLength(1)
+  expect(mkConfigCalls(calls).filter(a => a.includes('list'))).toHaveLength(2)
+})
+
+test('LOW 4: a second save press while saving does nothing', { plugins: [worldFixtures] }, async ($, on) => {
+  const files = worldFiles()
+  const calls: (readonly string[])[] = []
+  const clock = mockSettingsBackend(on, files, calls, [], {
+    configRows: [{ key: 'matrixkoder.chip', value: true, isLocked: false }],
+  })
+  let release: () => void = () => {}
+  const gate = new Promise<void>(res => { release = res })
+  const setCalls: [string, unknown][] = []
+  on('config.set', async (_$, e) => {
+    setCalls.push([String((e as { key?: unknown }).key), (e as { value?: unknown }).value])
+    if (setCalls.length === 1) await gate // the first save parks here
+    return { value: true }
+  })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-settings' })
+  await loadLiveSettings(clock, ui, calls)
+  await ui.press({ key: 'set-scope-about' })
+  await ui.press({ key: 'set-chip-tog' }) // a dirty global row, no yaml sets
+  await ui.press({ key: 'set-save' })
+  for (let i = 0; i < 20; i++) await clock.advance(0)
+  await ui.press({ key: 'set-save' }) // still saving: dropped
+  for (let i = 0; i < 20; i++) await clock.advance(0)
+  expect(setCalls).toHaveLength(1)
+  release()
+  for (let i = 0; i < 60 && !(await ui.find({ text: /✓ saved 1/ })); i++) await clock.advance(0)
+  expect(await ui.find({ text: /✓ saved 1/ }), 'the save lands once').toBeTruthy()
 })
