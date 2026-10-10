@@ -792,7 +792,9 @@ function readSettingsState(viewState: Record<string, string>): {
     if (raw != null && raw !== '') {
       const v: unknown = JSON.parse(raw) as unknown
       if (typeof v === 'object' && v !== null && Array.isArray((v as { groups?: unknown }).groups)) {
-        live = v as SettingsView
+        // a view cached by older code has no `editable` on its picks: drop it so the tab reloads
+        const picks = (v as { picks?: { editable?: boolean }[] }).picks
+        if (Array.isArray(picks) && picks.every(p => typeof p.editable === 'boolean')) live = v as SettingsView
       }
     }
   } catch {
@@ -864,6 +866,7 @@ async function ensureSettingsLoaded($: EngineInterface): Promise<void> {
       await update($, viewStateAtom, prev => ({
         ...prev,
         ['settings:live']: JSON.stringify(view),
+        ['settings:save:msg']: '',
         ...(dataDir != null ? { ['settings:datadir']: dataDir } : {}),
       }))
     } catch {
