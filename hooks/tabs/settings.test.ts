@@ -251,6 +251,13 @@ test('Settings · Models: an agent with no picks row is read-only and never edit
   const btn = buttonsOf(drawn).find(b => String(b.props.key ?? '').startsWith('set-model-claude-'))
   ;(btn?.props.onPress as (() => void) | undefined)?.()
   expect([...ui.keys()].some(k => k === 'settings:edit:models.claude'), 'no edit written').toBe(false)
+  // a stale edit from before the fix is neither counted nor saved
+  ui.set('settings:edit:models.claude', JSON.stringify(['x']))
+  const saved: unknown[] = []
+  const ui2 = { get: (k: string) => ui.get(k), set: (k: string, v: string) => { ui.set(k, v) }, save: (pl: unknown) => { saved.push(pl) } }
+  ui.set('settings:edit:mode', '')
+  const again = SettingsTab(stubEls, ro, 46, ui2 as never)
+  expect(drawnText(again).includes('unsaved'), 'a stale read-only edit is not dirty').toBe(false)
 })
 
 test('Settings · Agents: builder availability bools and the usage group', () => {
