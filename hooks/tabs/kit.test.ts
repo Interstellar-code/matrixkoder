@@ -413,15 +413,25 @@ test('S2.1 seg: one pressable per opt, the current `●`-marked; a press reports
     const root = node(SettingRow(stubEls(), field, settingCtx({ cols, changed: true })))
     everyRowFits(root, cols)
     const labels = buttonsIn(root).map(b => String(b.props.label))
-    expect(labels).toContain('● auto') // the current opt
-    expect(labels).toContain('○ ask')
-    expect(labels).toContain('○ never')
+    if (cols === 46) {
+      expect(labels).toContain('● auto') // the current opt
+      expect(labels).toContain('○ ask')
+      expect(labels).toContain('○ never')
+    } else {
+      // at 36 the strip yields cells to the pick press (R3 HIGH 1) and stays
+      // pressable with the full values behind the short words
+      expect(labels.some(l => l.startsWith('●'))).toBe(true)
+    }
     expect(buttonsIn(root).every(b => b.props.hotkey === undefined)).toBe(true) // glyphs, not letters
 
     const chosen: string[] = []
     const live = node(SettingRow(stubEls(), field, settingCtx({ cols, onChoose: v => { chosen.push(v) } })))
-    ;(buttonsIn(live).find(b => b.props.label === '○ never')?.props.onPress as () => void)()
-    ;(buttonsIn(live).find(b => b.props.label === '○ ask')?.props.onPress as () => void)()
+    // the shown word may be shrunk at 36 cols; it stays a prefix of the full value
+    const shown = (label: unknown): string => String(label).replace(/^[●○] /, '')
+    const btnFor = (full: string) =>
+      buttonsIn(live).find(b => { const w = shown(b.props.label); return w !== '' && full.startsWith(w) })
+    ;(btnFor('never')?.props.onPress as () => void)()
+    ;(btnFor('ask')?.props.onPress as () => void)()
     expect(chosen).toEqual(['never', 'ask'])
 
     const sel = node(SettingRow(stubEls(), field, settingCtx({ cols, selected: true })))
@@ -483,8 +493,13 @@ test('S2.1 text: the native Input carries the label (● when changed), value an
     const inputs = nodesIn('Input', SettingRow(fieldEls(), field, settingCtx({ cols })))
     expect(inputs).toHaveLength(1)
     const input = inputs[0] as Node
-    expect(input.props.label).toBe('Fallback reviewer')
     expect(input.props.value).toBe('claude sonnet')
+    expect(input.props.label, 'the name draws once, on the row press').toBeUndefined()
+    // the label press selects the row (R3 HIGH 1)
+    const pick = buttonsIn(node(SettingRow(fieldEls(), field, settingCtx({ cols })))).find(b => String(b.props.label) === 'Fallback reviewer')
+    expect(pick, `the label press at ${cols}`).toBeDefined()
+    expect(pick?.props.plain).toBe(true)
+    expect(pick?.props.hotkey).toBeUndefined()
     const edits: string[] = []
     const live = node(SettingRow(fieldEls(), field, settingCtx({ cols, onEdit: v => { edits.push(v) } })))
     const liveInput = nodesIn('Input', live)[0] as Node
@@ -492,8 +507,8 @@ test('S2.1 text: the native Input carries the label (● when changed), value an
     ;(liveInput.props.onSubmit as (v: string) => void)('opus')
     expect(edits).toEqual(['o', 'opus'])
 
-    const changed = nodesIn('Input', SettingRow(fieldEls(), field, settingCtx({ cols, changed: true })))[0] as Node
-    expect(String(changed.props.label).startsWith('● ')).toBe(true)
+    const changed = buttonsIn(node(SettingRow(fieldEls(), field, settingCtx({ cols, changed: true })))).find(b => String(b.props.label).startsWith('● '))
+    expect(changed, `the changed label press at ${cols}`).toBeDefined()
 
     const sel = node(SettingRow(fieldEls(), field, settingCtx({ cols, selected: true })))
     const selText = text(sel)
@@ -524,7 +539,18 @@ test('S2.1 fallback: no Input/Select in the element table → dim value + `edit 
       expect(flat.includes('edit in file')).toBe(true) // plus the note, no crash
       const dims = nodesIn('Text', root).filter(t => t.props.dimColor === true)
       expect(dims.map(t => text(t))).toContain('edit in file')
-      expect(buttonsIn(root)).toHaveLength(0) // nothing pressable without a field element
+      // the one pressable is the R3 label press (it fires onPick and reaches
+      // the help line); no control draws without a field element. At 36 the
+      // long label yields to the wide dim control, at 46 it draws whole.
+      const picks = buttonsIn(root)
+      expect(picks).toHaveLength(1)
+      expect(picks[0]?.props.plain).toBe(true)
+      const want = cols === 46 ? field.label : field.label.slice(0, 6)
+      expect(String(picks[0]?.props.label).startsWith(want)).toBe(true)
+      let picked = 0
+      const live = node(SettingRow(stubEls(), field, settingCtx({ cols, onPick: () => { picked++ } })))
+      ;((buttonsIn(live)[0]?.props.onPress ?? (() => {})) as () => void)()
+      expect(picked).toBe(1)
     }
   }
 
@@ -535,12 +561,13 @@ test('S2.1 fallback: no Input/Select in the element table → dim value + `edit 
   for (const cols of [46, 36] as const) {
     const root = node(SettingRow(stubEls(), ro, settingCtx({ cols })))
     everyRowFits(root, cols)
-    expect(buttonsIn(root)).toHaveLength(0) // a control would do nothing
+    // the one pressable is the R3 label press (it reaches the why line); a control would do nothing
+    expect(buttonsIn(root).map(b => String(b.props.label))).toEqual(['Plugin version'])
     expect(nodesIn('Text', root).filter(t => t.props.dimColor === true).map(t => text(t))).toContain('on') // the dim value
     const sel = node(SettingRow(stubEls(), ro, settingCtx({ cols, selected: true })))
     const selText = text(sel)
     expect(selText.includes('Read-only: set by the')).toBe(true) // the why line, truncated to cols
     expect(selText.includes('default')).toBe(false) // nothing to reset
-    expect(buttonsIn(sel)).toHaveLength(0)
+    expect(buttonsIn(sel).map(b => String(b.props.label))).toEqual(['Plugin version']) // the open press; no reset on read-only
   }
 })

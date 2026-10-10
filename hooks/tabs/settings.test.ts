@@ -248,7 +248,7 @@ test('Settings · Child: builder sessions, watch and reviewer panes', () => {
   const drawn = draw(ui, 46, 'child')
   const flat = drawnText(drawn)
   expect(flat.includes('yaml lanes.child · lane sessions'), 'the child scope-note').toBe(true)
-  for (const sig of ['New round', '/new', 'Subagents', 'Subagent model', 'ollama-cloud/minimax-m3', 'Stop at context', 'Stop at cost', 'Stall after', 'Give up after', 'herdr events plugin', 'Split', 'Reuse reviewer pane']) {
+  for (const sig of ['New round', '/new', 'Subagents', 'Subagent model', 'ollama-cloud/minima', 'Stop at cont', 'Stop at cost', 'Stall after', 'Give up after', 'herdr events plugin', 'Split', 'Reuse reviewer pane']) {
     expect(flat.includes(sig), `the ${sig} row`).toBe(true)
   }
   expect(flat.includes('reset Child to defaults'), 'the danger row').toBe(true)
@@ -438,7 +438,7 @@ test('Settings · rows: selection draws help + default + r reset; reset returns 
   press(sel, 'set-repo.lanes.slots-inc')
   expect(drawnText(draw(ui)).includes('● 1 unsaved'), 'the step dirtied the row').toBe(true)
   press(draw(ui), 'set-repo.lanes.slots-reset')
-  expect(ui.get('settings:edit:repo.lanes.slots')).toBe('3')
+  expect(ui.get('settings:edit:repo.lanes.slots')).toBe('') // reset to a default that equals the loaded value stores no edit (R3 LOW 4)
   expect(drawnText(draw(ui)).includes('unsaved'), 'reset to default is clean').toBe(false)
 
   // bool toggle, num steps, seg and select choices, text edit — every control
@@ -446,7 +446,7 @@ test('Settings · rows: selection draws help + default + r reset; reset returns 
   const drawn = draw(ui, 46, 'project')
   press(drawn, 'set-repo.lanes.reuse-tog')
   expect(ui.get('settings:edit:repo.lanes.reuse')).toBe('false')
-  const branch = nodesOf(drawn, 'Input').find(i => i.props.label === 'Integration branch')
+  const branch = nodesOf(drawn, 'Input').find(i => i.props.value === 'main') // the Integration branch row (the label rides its press now)
   ;(branch?.props.onInput as (v: string) => void)('dev')
   expect(ui.get('settings:edit:repo.integration_branch')).toBe('"dev"')
 

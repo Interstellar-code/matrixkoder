@@ -74,7 +74,7 @@ export const SETTINGS_FIXTURE: SettingsView = {
       rows: [
         { key: 'routing_preferences.policy', scope: 'routing', label: 'Policy', type: 'seg', value: 'claude-sparing', default: 'claude-sparing', opts: [['claude-sparing', 'spare'], ['balanced', 'bal'], ['quality', 'qual']], help: 'Claude orchestrates; builders below.', editable: true },
         { key: 'routing_preferences.builder_order', scope: 'routing', label: 'Builder order', type: 'list', value: ['opencode', 'claude'], default: ['opencode', 'claude'], help: 'Codex never (user rule).', editable: true },
-        { key: 'routing_preferences.max_build_lanes', scope: 'routing', label: 'Max build lanes', type: 'num', value: 3, default: 3, min: 1, max: 6, help: 'Build lanes the router may open at once.', editable: true },
+        { key: 'routing_preferences.max_build_lanes', scope: 'routing', label: 'Max build lanes', type: 'num', value: 4, default: 3, min: 1, max: 6, help: 'Build lanes the router may open at once.', editable: true },
       ],
     },
     {

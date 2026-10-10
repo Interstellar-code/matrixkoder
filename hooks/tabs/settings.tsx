@@ -191,10 +191,13 @@ function currentValue(f: SettingsField, ui: TabUi | undefined): string | number 
   return e ?? toText(f.value)
 }
 
-/** an edit differs from the fixture default → the row is dirty. */
+/** an edit differs from the loaded value → the row is dirty (`●`, unsaved).
+ *  The default plays no part here (R3 MEDIUM 1): a row whose loaded value
+ *  already differs from its default is clean until edited, and editing back
+ *  to the loaded value clears the mark. */
 function fieldDirty(f: SettingsField, ui: TabUi | undefined): boolean {
   const e = editOf(ui, f.key)
-  return e !== undefined && String(e) !== String(toText(f.default))
+  return e !== undefined && String(e) !== String(toText(f.value))
 }
 
 /** the dirty keys in draw order: field keys, then models.<agent>, then
@@ -214,6 +217,7 @@ function dirtyKeys(view: SettingsView, ui: TabUi | undefined): string[] {
 }
 
 /** save/discard in the fixture: both just clear every edit (S3 wires writes). */
+// shortcut: fixture save clears edits, S3 wires real writes
 function clearAllEdits(view: SettingsView, ui: TabUi | undefined): void {
   for (const f of flatFields(view)) ui?.set(`settings:edit:${f.key}`, '')
   for (const p of view.picks) ui?.set(`settings:edit:models.${p.agent}`, '')
@@ -333,6 +337,11 @@ function rowCtx(f: SettingsField, W: number, ui: TabUi | undefined): SettingCtx 
     selected,
     changed: fieldDirty(f, ui),
     open,
+    // R3 MEDIUM 3: while the find field holds the edit mode, no letter/digit
+    // hotkey on the tab may fire (the engine holds printable keys in a
+    // focused Input, but the tab drops its own hotkeys too, so the harness
+    // and every surface agree).
+    noHotkey: ui?.get('settings:findfocus') === '1' ? true : undefined,
     onPick: () => ui?.set('settings:sel', selected ? '' : f.key),
     onToggle: () => setEdit(ui, f.key, !(cur === true)),
     onInc: () => setEdit(ui, f.key, Math.min(f.max ?? Number.MAX_SAFE_INTEGER, Number.isFinite(n) ? n + step : Number(f.default))),
@@ -345,7 +354,12 @@ function rowCtx(f: SettingsField, W: number, ui: TabUi | undefined): SettingCtx 
     },
     onToggleOpen: () => ui?.set('settings:open', open ? '' : f.key),
     onEdit: v => setEdit(ui, f.key, v),
-    onReset: () => setEdit(ui, f.key, toText(f.default)),
+    // R3 LOW 4: resetting to a default that already equals the loaded value
+    // stores no edit (nothing is unsaved); otherwise the default is the edit.
+    onReset: () => {
+      if (String(toText(f.default)) === String(toText(f.value))) ui?.set(`settings:edit:${f.key}`, '')
+      else setEdit(ui, f.key, toText(f.default))
+    },
   }
 }
 
@@ -387,6 +401,7 @@ export function SettingsTab(els: Els, view: SettingsView, cols: number, ui?: Tab
       <Box flexDirection="row" gap={1}>
         {ActionButton(els, {
           key: 'set-find', glyph: 'f', word: 'find',
+          noHotkey: findFocus ? true : undefined,
           onPress: () => { ui?.set('settings:findfocus', findFocus ? '' : '1') },
         })}
         {findField}
@@ -407,7 +422,7 @@ export function SettingsTab(els: Els, view: SettingsView, cols: number, ui?: Tab
       {scopeId !== 'mode' && scopeId !== 'about' && (
         DangerRow(els, scope.label, cols, () => { clearScopeEdits(view, ui, scopeId) })
       )}
-      {dirties.length > 0 && DirtyFooter(els, dirties, cols, () => { clearAllEdits(view, ui) })}
+      {dirties.length > 0 && DirtyFooter(els, dirties, cols, findFocus, () => { clearAllEdits(view, ui) })}
     </Box>
   )
 }
@@ -417,6 +432,9 @@ export function SettingsTab(els: Els, view: SettingsView, cols: number, ui?: Tab
  *  buttons — a row never exceeds `cols` (4 scopes per row at 46, 3 at 36). */
 function ScopeBar(els: Els, view: SettingsView, cols: number, activeId: SettingsScopeId, ui: TabUi | undefined): RenderElement {
   const { Box } = els
+  // R3 MEDIUM 3: the scope digits must not fire while the find field holds
+  // the edit mode (typing `1` filters; it must never switch scope).
+  const noHk = ui?.get('settings:findfocus') === '1' ? true : undefined
   type Item = { s: SettingsScope; digit: string; w: number }
   const rows: Item[][] = []
   let cur: Item[] = []
@@ -442,6 +460,7 @@ function ScopeBar(els: Els, view: SettingsView, cols: number, activeId: Settings
             glyph: digit,
             word: s.label,
             tone: s.id === activeId ? 'primary' : 'default',
+            noHotkey: noHk,
             onPress: () => {
               ui?.set('settings:scope', s.id)
               ui?.set('settings:sel', '')
@@ -624,6 +643,7 @@ function AboutBody(els: Els, view: SettingsView, W: number, ui: TabUi | undefine
           <Box flexDirection="row" gap={1}>
             {ActionButton(els, {
               key: 'set-about-check', glyph: 'c', word: 'check',
+              noHotkey: ui?.get('settings:findfocus') === '1' ? true : undefined,
               onPress: () => { ui?.set('settings:about:checked', '1') },
             })}
           </Box>
@@ -670,11 +690,12 @@ function DangerRow(els: Els, label: string, cols: number, onReset: () => void): 
 /** The dirty footer: `● N unsaved · <keys> … s save x discard` — the keys
  *  truncated with `…` to what remains of the line. In the fixture save and
  *  discard both clear the edits (S3 wires the real writes). */
-function DirtyFooter(els: Els, keys: readonly string[], cols: number, onClear: () => void): RenderElement {
+function DirtyFooter(els: Els, keys: readonly string[], cols: number, findFocus: boolean, onClear: () => void): RenderElement {
   const { Box, Text } = els
   const head = `● ${keys.length} unsaved`
-  const save = ActionButton(els, { key: 'set-save', glyph: 's', word: 'save', tone: 'primary', onPress: onClear })
-  const discard = ActionButton(els, { key: 'set-discard', glyph: 'x', word: '', onPress: onClear })
+  const noHk = findFocus ? true : undefined // R3 MEDIUM 3: typing `s`/`x` filters; it must never save
+  const save = ActionButton(els, { key: 'set-save', glyph: 's', word: 'save', tone: 'primary', noHotkey: noHk, onPress: onClear })
+  const discard = ActionButton(els, { key: 'set-discard', glyph: 'x', word: '', noHotkey: noHk, onPress: onClear })
   const fixed = head.length + 's save'.length + 4 + 1 + 4 + 3 /* gaps */ + 3 /* ' · ' */
   const avail = cols - fixed
   const keysText = avail >= 4 ? clip(keys.join(', '), avail) : ''

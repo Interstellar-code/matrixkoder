@@ -1394,6 +1394,12 @@ test('S2.3: raster:false draws the eighth-block fallback (no Raster)', { plugins
   await ui.press({ key: 'dash-tab-plan' })
   expect(await ui.findAll({ type: 'Raster' }), 'no Raster anywhere under raster:false').toHaveLength(0)
   expect(await ui.find({ text: /Payment provider adapter/ }), 'the live wave still renders').toBeTruthy()
+  // R3 LOW 2: a second bar-drawing mock tab (Usage draws pickBar strips) falls
+  // back too. Old intentionally keeps `els`: OldTab never calls pickBar today
+  // (text bars only), so there is nothing to fall back — out of scope.
+  await ui.press({ key: 'dash-tab-usage' })
+  expect(await ui.findAll({ type: 'Raster' }), 'no Raster on Usage either').toHaveLength(0)
+  expect(await ui.find(mockRow()), 'the Usage mock world still renders').toBeTruthy()
 })
 
 test('S2.3: mode solo skips the lane sweep', { plugins: [worldFixtures], options: { mode: 'solo' } }, async ($, on) => {
@@ -1403,4 +1409,153 @@ test('S2.3: mode solo skips the lane sweep', { plugins: [worldFixtures], options
   await $.session.start(sessionStart())
   await clock.advance(120_000)
   expect(sweeps, 'no sweep in solo mode with an active run').toHaveLength(0)
+})
+
+// ---------- R3: review-r1 fixes — real row selection, dirty vs loaded, width, typing hotkeys ----------
+
+// R3 MEDIUM 2's measure: every Text and every horizontal Box in the drawn
+// tree, card-aware (plan.test.ts's discipline — a row inside a kit Card owes
+// cols - 4). Buttons count their drawn chrome; Inputs, Selects and Rasters
+// count 0 (the engine lays those out).
+type R3DrawnNode = { type?: string; props?: { key?: string; flexDirection?: string; gap?: number; borderStyle?: string; label?: string; plain?: boolean }; children?: unknown[] }
+
+function r3TextWidth(node: unknown): number {
+  if (typeof node === 'string') return node.length
+  if (typeof node !== 'object' || node === null) return 0
+  const n = node as R3DrawnNode
+  if (n.type !== 'Text') return 0
+  return (n.children ?? []).reduce((sum: number, c) => sum + r3TextWidth(c), 0)
+}
+
+function r3WidthOf(node: unknown): number {
+  if (typeof node !== 'object' || node === null) return 0
+  const n = node as R3DrawnNode
+  if (n.type === 'Text') return r3TextWidth(n)
+  if (n.type === 'Button') return String(n.props?.label ?? '').length + (n.props?.plain ? 2 : 4)
+  if (n.type === 'Input' || n.type === 'Select' || n.type === 'Raster') return 0
+  const kids = n.children ?? []
+  if (n.type === 'Box' && n.props?.flexDirection === 'row') {
+    return kids.reduce((sum: number, c) => sum + r3WidthOf(c), 0) + (typeof n.props.gap === 'number' ? n.props.gap : 0) * Math.max(0, kids.length - 1)
+  }
+  return kids.reduce((max: number, c) => Math.max(max, r3WidthOf(c)), 0)
+}
+
+function drawnRowWidths(root: unknown): { width: number; inCard: boolean; text: string }[] {
+  const out: { width: number; inCard: boolean; text: string }[] = []
+  const preview = (node: unknown): string => {
+    if (typeof node === 'string') return node
+    if (typeof node !== 'object' || node === null) return ''
+    const n = node as R3DrawnNode
+    if (n.type === 'Button') return `[${String(n.props?.label ?? '')}]`
+    return (n.children ?? []).map(preview).join('')
+  }
+  // the main tab bar wraps visually (flexWrap), so the tree never gives its
+  // drawn rows — skip it (the F0 barRows test owns bar wrapping); every other
+  // row Box, including the settings scope bar's pre-wrapped rows, is measured.
+  const isTabBar = (node: R3DrawnNode): boolean =>
+    (node.children ?? []).some(c =>
+      typeof c === 'object' && c !== null && (c as R3DrawnNode).type === 'Button' &&
+      String((c as R3DrawnNode).props?.key ?? '').startsWith('dash-tab-'))
+  const walk = (node: unknown, inCard: boolean): void => {
+    if (typeof node !== 'object' || node === null) return
+    const n = node as R3DrawnNode
+    const card = inCard || (n.type === 'Box' && n.props?.borderStyle === 'round')
+    if (n.type === 'Box' && n.props?.flexDirection === 'row' && isTabBar(n)) {
+      for (const c of n.children ?? []) walk(c, card)
+      return
+    }
+    if (n.type === 'Text' || (n.type === 'Box' && n.props?.flexDirection === 'row')) {
+      out.push({ width: r3WidthOf(node), inCard: card, text: preview(node).slice(0, 60) })
+    }
+    for (const c of n.children ?? []) walk(c, card)
+  }
+  walk(root, false)
+  return out
+}
+
+// R3 HIGH 1: the row label is a real press target. Pressing it through the
+// mounted pane selects the row (help + `default X · r reset` appear); `r`
+// resets it. On the R1 code there is no `-pick` press, so this fails there.
+test('R3 HIGH 1: pressing a row label selects it — help + default + r reset; r resets', { plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-settings' })
+  await ui.press({ key: 'set-scope-routing' })
+  // Max build lanes loads 4 over a default of 3: clean until edited
+  expect(await ui.find({ text: /unsaved/ })).toBeUndefined()
+  await ui.press({ key: 'set-routing_preferences.max_build_lanes-pick' })
+  expect(await ui.find({ text: /Build lanes th/ }), 'the selected row help line').toBeTruthy()
+  expect(await ui.find({ text: /default 3/ }), 'the default tail').toBeTruthy()
+  expect(await ui.find({ type: 'Button', key: 'set-routing_preferences.max_build_lanes-reset' }), 'the r reset press').toBeTruthy()
+  await ui.press({ key: 'set-routing_preferences.max_build_lanes-reset' })
+  expect(await ui.find({ text: /● 1 unsaved/ }), 'reset wrote the default as an edit (it differs from loaded 4)').toBeTruthy()
+})
+
+// R3 MEDIUM 1 (+LOW 4): dirty tracks the loaded value, not the default.
+// Stepping away dirties; stepping back to the loaded value clears. On the R1
+// code the way back still counts unsaved (edit 4 ≠ default 3), so this fails.
+test('R3 MEDIUM 1: value≠default starts clean; editing back to loaded clears ●', { plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-settings' })
+  await ui.press({ key: 'set-scope-routing' })
+  expect(await ui.find({ text: /unsaved/ }), 'loaded 4 over default 3 is clean').toBeUndefined()
+  await ui.press({ key: 'set-routing_preferences.max_build_lanes-inc' }) // 4 → 5
+  expect(await ui.find({ text: /● 1 unsaved/ }), 'the step dirtied the row').toBeTruthy()
+  await ui.press({ key: 'set-routing_preferences.max_build_lanes-dec' }) // 5 → 4, back to loaded
+  expect(await ui.find({ text: /unsaved/ }), 'back to the loaded value is clean').toBeUndefined()
+  const pick = await ui.find({ type: 'Button', key: 'set-routing_preferences.max_build_lanes-pick' }) as { props: { label?: string } } | undefined
+  expect(pick, 'the row press still stands').toBeDefined()
+  expect(String(pick?.props.label ?? ''), 'no changed marker on the label').toBe('Max build lanes')
+})
+
+// R3 MEDIUM 3: while the find field holds the edit mode, the tab drops its
+// letter/digit hotkeys, so typing `s` filters but never saves. The engine
+// holds printable keys in a focused Input anyway
+// (.claude-plugin/types/claude-code/index.d.ts:5437-5439: "while it has focus
+// every printable key reaches it alone"); this test pins the tab's half: the
+// hotkeys are gone in find mode and back out of it. On the R1 code the save
+// press still carries hotkey `s`, so this fails there.
+test('R3 MEDIUM 3: typing s in find mode filters and never saves', { plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-settings' })
+  await ui.press({ key: 'set-scope-routing' })
+  await ui.press({ key: 'set-routing_preferences.max_build_lanes-inc' }) // an edit to protect
+  expect(await ui.find({ text: /● 1 unsaved/ })).toBeTruthy()
+  await ui.press({ key: 'set-find' }) // enter find mode
+  const hotkeyOf = async (key: string): Promise<unknown> =>
+    (await ui.find({ type: 'Button', key }) as { props: { hotkey?: string } } | undefined)?.props.hotkey
+  expect(await hotkeyOf('set-save'), 'no s hotkey in find mode').toBeUndefined()
+  expect(await hotkeyOf('set-discard'), 'no x hotkey in find mode').toBeUndefined()
+  expect(await hotkeyOf('set-scope-routing'), 'no digit hotkey in find mode').toBeUndefined()
+  await ui.input({ key: 'set-find-input', text: 'stall' }) // types an `s`
+  expect(await ui.find({ text: /● 1 unsaved/ }), 'the edit survived typing').toBeTruthy()
+  await ui.press({ key: 'set-find' }) // leave find mode
+  expect(await hotkeyOf('set-save'), 's save is back out of find mode').toBe('s')
+})
+
+// R3 MEDIUM 2: the long-default help line (Code reviewer defaults to
+// `claude sonnet medium`) fits 46 and 36 cols — every drawn row, card-aware.
+// On the R1 code the help tail overflows, so this fails there.
+test('R3 MEDIUM 2: the long-default help line fits 46 and 36 cols', { plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-settings' })
+  await ui.press({ key: 'set-scope-routing' })
+  await ui.press({ key: 'set-routing_preferences.reviewer-pick' })
+  expect(await ui.find({ text: /default claude/ }), 'the clipped default tail').toBeTruthy()
+  for (const cols of [46, 36] as const) {
+    await ui.redraw(paneProps(cols))
+    const wide = drawnRowWidths(await ui.drawn()).filter(w => (w.inCard ? w.width > cols - 4 : w.width > cols))
+    expect(wide, `over-wide rows at ${cols} cols: ${JSON.stringify(wide)}`).toEqual([])
+  }
 })
