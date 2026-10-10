@@ -422,6 +422,7 @@ def self_test():
     tmp = tempfile.mkdtemp(prefix="lane-watch-test-")
     os.environ["MATRIXKODER_HOME"] = os.path.join(tmp, "home")
     data = os.path.join(tmp, "data")
+    restore_data = mk_config.pin_tmp_data(tmp)  # cfg() resolves the data dir: keep it in temp
     try:
         def mks(*args):
             r = subprocess.run([sys.executable, MK_STATE, *args, "--data", data], capture_output=True, text=True)
@@ -720,6 +721,7 @@ def self_test():
             else:
                 os.environ["MATRIXKODER_DATA"] = old_md
     finally:
+        restore_data()
         shutil.rmtree(tmp, ignore_errors=True)
     print("lane-watch self-test ok")
 

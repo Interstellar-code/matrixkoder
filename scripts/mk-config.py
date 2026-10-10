@@ -533,6 +533,28 @@ def verify(old, new, count, checks):
 
 # ---------- commands ----------
 
+def pin_tmp_data(tmp):
+    """Point MATRIXKODER_DATA/HOME at temp dirs inside `tmp` for a whole self-test, and prove the
+    resolution actually lands there. Run from a lane without --data, the data dir resolves to the
+    MAIN checkout's .matrixkoder/ — a self-test would then read (and any future write path would
+    touch) a real config. -> restore(), for the caller's finally."""
+    data, home = os.path.join(tmp, "data"), os.path.join(tmp, "home")
+    os.makedirs(data, exist_ok=True), os.makedirs(home, exist_ok=True)
+    was = {k: os.environ.get(k) for k in ("MATRIXKODER_DATA", "MATRIXKODER_HOME")}
+    os.environ["MATRIXKODER_DATA"], os.environ["MATRIXKODER_HOME"] = data, home
+    got = os.path.realpath(mk_state.resolve_data(None))
+    assert got.startswith(os.path.realpath(tmp)), \
+        f"the self-test would resolve {got}, which is outside its temp dir {tmp}"
+
+    def restore():
+        for k, v in was.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return restore
+
+
 def read_lines(path):
     """newline='' so a CRLF file keeps its \\r inside each line: the patcher re-emits the ending it
     read, and a config written on Windows must not come back rewritten as LF."""
@@ -750,9 +772,10 @@ FIVE = ('["opencode/space-bunny-free", "opencode/muse-spark-1.3-contributor-free
 
 def self_test():
     tmp = tempfile.mkdtemp(prefix="mk-config-selftest-")
+    restore = pin_tmp_data(tmp)  # the in-process calls below must resolve here, not in a real repo
     try:
         data, home, yaml_path = os.path.join(tmp, "data"), os.path.join(tmp, "home"), None
-        os.makedirs(data)
+        os.makedirs(data, exist_ok=True)
         yaml_path = os.path.join(data, "matrixkoder.yaml")
         with open(FIXTURE) as f:
             fixture = f.read()
@@ -985,6 +1008,7 @@ def self_test():
                 continue
             assert re.match(r"^\s*[A-Za-z0-9_.-]+:( |$)", line), f"not a yaml key line: {line!r}"
     finally:
+        restore()
         shutil.rmtree(tmp, ignore_errors=True)
     print("mk-config self-test ok")
     return 0

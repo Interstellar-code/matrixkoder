@@ -280,9 +280,13 @@ def self_test():
     # pin it before the first write so a run can never create a lock in the real ~/.matrixkoder
     mk_home = tempfile.mkdtemp(prefix="lane-health-home-")
     os.environ["MATRIXKODER_HOME"] = mk_home
+    tmp_data = tempfile.mkdtemp(prefix="lane-health-data-")
+    restore_data = mk_config.pin_tmp_data(tmp_data)  # cfg() resolves the data dir: keep it in temp
     try:
         self_test_body(shutil)
     finally:
+        restore_data()
+        shutil.rmtree(tmp_data, ignore_errors=True)
         shutil.rmtree(mk_home, ignore_errors=True)
 
 

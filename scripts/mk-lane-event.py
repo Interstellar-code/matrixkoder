@@ -875,6 +875,8 @@ def self_test():
     home, data = os.path.join(tmp, "home"), os.path.join(tmp, "data")
     os.makedirs(home)
     os.environ["MATRIXKODER_HOME"] = home
+    # every dispatch resolves the data dir through cfg(); pin it so no case reads a real config
+    restore_data = mk_config.pin_tmp_data(tmp)
     # never drop this pop: a test run inside a herdr pane inherits the REAL herdr via this env var
     os.environ.pop("HERDR_BIN_PATH", None)
     try:
@@ -1582,10 +1584,12 @@ def self_test():
 
         # (R3 MEDIUM 2) a reset that TIMES OUT is not a refusal: /clear and /new start no model
         # turn, so herdr may time out on a reset that worked. An idle pane confirms it.
-        set_canned("prompt_out_stalled.txt", json.dumps(
+        # the fake reads prompt_out<sfx>.txt, so the suffix queue must name the file it will look for
+        set_canned("prompt_out2.txt", json.dumps(
             {"error": {"code": "agent_prompt_stalled"}, "result": {"agent": {
                 "agent_status": "agent_prompt_stalled"}}}) + "\n")
-        set_canned("prompt_q.txt", "stalled")  # only the /clear stalls; the task prompt settles
+        set_canned("prompt_rc2.txt", "0")
+        set_canned("prompt_q.txt", "2")  # only the /clear stalls; the task prompt settles
         n0 = len(prompt_calls())
         r = cli("dispatch", "--pane", pane_of("H8"), "--text", "fix after a timeout", "--kind", "fix",
                 extra=fnew)
@@ -1646,6 +1650,7 @@ def self_test():
         srv.shutdown()
         srv.server_close()
     finally:
+        restore_data()
         shutil.rmtree(tmp, ignore_errors=True)
     print("mk-lane-event self-test ok")
 

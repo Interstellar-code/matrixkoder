@@ -517,6 +517,9 @@ def main(argv):
 def self_test():
     import shutil, subprocess
     tmp = tempfile.mkdtemp(prefix="mk-plan-test-")
+    # every parse reads session.subagents, which resolves the data dir: pin it here so the run can
+    # never read the main checkout's .matrixkoder/ (and fail if it would)
+    restore_data = mk_config.pin_tmp_data(tmp)
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     real_plan = os.path.join(root, "scripts", "fixtures", "plan-link.md")  # a real plan, kept as a fixture
     template = os.path.join(root, "skills", "matrixkoder", "templates", "plan.md")
@@ -792,6 +795,7 @@ def self_test():
 
         print("mk-plan self-test ok")
     finally:
+        restore_data()
         shutil.rmtree(tmp, ignore_errors=True)
 
 
