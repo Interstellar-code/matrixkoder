@@ -10,6 +10,12 @@ the lane token on the last line for `done` and `blocked` (R26).
 
 `measure` (plan MB5.1) is the one orchestrator-side exception: read-only counters over a run's
 `events.jsonl` and `tasks/*/brief-r*.md` under a `<data>` root — no lane file is read or written.
+
+The bus client (plan BB) adds `ask`, `wait`, `inbox` and `ack` against `scripts/mk-bus.py`
+(`child-skills/mk-builder/reference/bus-contract.md`): the lane's coordinates come from
+`<lane>/.matrixkoder-bus.json` (B24), every call carries a 2 s connect budget, and an unusable
+bus degrades to today's channels within that budget — `ask` falls back to the BLOCKED flow,
+never a traceback.
 """
 import argparse
 import contextlib
@@ -19,10 +25,15 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 FALLBACK_VERSION = "0.3.0"
 STATUS_NAME = ".matrixkoder-status.json"
@@ -40,6 +51,19 @@ ARCHIVE_RE = re.compile(r"^status-[A-Za-z0-9._-]+-r\d+-(?:builder|reviewer)-\d+\
 STALE_RE = re.compile(r"^\.matrixkoder-(?:report-r(\d+)\.md|review-r(\d+)\.md|status.*\.json)$")
 KEYS = ("v", "seq", "run", "task", "round", "role", "agent", "state", "step", "phases_done",
         "question", "commit", "report", "subagent", "ctx_pct", "started_at", "updated_at")
+
+# Bus client (plan BB, `reference/bus-contract.md`). B24: the lane file `mk-bus.py token` writes;
+# the inbox cursor is lane-only state, git-excluded with the `.matrixkoder-*` pattern (R2). B11:
+# /wait clamps its server-side wait to 1..90 s, so the client long-polls in chunks of at most 90 s
+# (a tool timeout cuts the call; `wait <ask id>` resumes it) and every connect carries a 2 s
+# budget so a down bus falls back within it.
+BUS_LANE_FILE = ".matrixkoder-bus.json"
+BUS_CURSOR_FILE = ".matrixkoder-bus-cursor"
+BUS_RUN = "bb"  # the self-test's run id (every fixture token and message uses it)
+BUS_CONNECT_TIMEOUT = 2.0
+BUS_WAIT_CHUNK_MAX = 90.0
+BUS_ASK_TIMEOUT = 600.0
+ASK_ID_RE = re.compile(r"^m-(\d+)$")  # B15 Table 1: ids are `m-<seq>`
 
 # R13/R15/R17/R17a — the writer's legality table, read as: this command may run in which states.
 # `progress` targets `working` (R13.1 from started, R13.3 from subagent, R13.5 from blocked,
@@ -303,7 +327,9 @@ def cmd_start(a):
 
 def cmd_progress(a):
     """R13.1/R13.3/R13.5/R15 plain progress; R13.2/R15 `--subagent`, where a heartbeat in
-    `subagent` bumps only `seq` and `updated_at` so the run's age stays readable (R9)."""
+    `subagent` bumps only `seq` and `updated_at` so the run's age stays readable (R9). BB: the
+    trailing line is the unread hint, not a token — `N unread — run inbox` when the bus holds
+    messages for this lane, silent otherwise."""
     lane, old = lane_dir(a), load_live(lane_dir(a))
     step = (a.step or "").strip()
     if not step:
@@ -320,7 +346,7 @@ def cmd_progress(a):
         obj = dict(old, step=step, state="working", question=None, subagent=None)
     write_status(lane, stamp(obj))
     return ({"ok": True, "seq": obj["seq"], "state": obj["state"], "step": obj["step"],
-             "subagent": obj["subagent"]}, None)
+             "subagent": obj["subagent"]}, bus_unread_hint(lane))
 
 
 def token_for(old, tail):
@@ -698,6 +724,306 @@ def cmd_measure(a):
              "blocked": len(questions), "blocked_questions": questions}, None)
 
 
+# ---------- bus client (plan BB; contract: reference/bus-contract.md) ----------
+
+class Handled(Exception):
+    """A bus command that already printed its exact output (`ask`'s answer text,
+    `PENDING`, `BUS DOWN`); `code` is the exit main returns."""
+
+    def __init__(self, code=0):
+        super().__init__(f"already printed: exit {code}")
+        self.code = code
+
+
+class BusDown(Exception):
+    """The bus is unusable (no lane file, connection refused, timeout, garbage response)."""
+
+
+class BusHttp(Exception):
+    """The bus answered with an HTTP error status (`code`, server `error` text)."""
+
+    def __init__(self, code, error):
+        super().__init__(f"{code}: {error}")
+        self.code, self.error = code, error
+
+
+def bus_http_error(e):
+    """The brief's client error shape: `{"ok": false, "error": "<status>: <server error>"}`."""
+    return f"{e.code}: {e.error}"
+
+
+def bus_lane_config(lane):
+    """B24: `<lane>/.matrixkoder-bus.json` `{v, url, token, run, task}`, written by
+    `mk-bus.py token`. None when absent or unusable — the caller's down-fallback."""
+    try:
+        with open(os.path.join(lane, BUS_LANE_FILE)) as f:
+            obj = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(obj, dict) or not obj.get("url") or not obj.get("token"):
+        return None
+    return obj
+
+
+def bus_read_cursor(lane):
+    """The last seq this lane has seen (`<lane>/.matrixkoder-bus-cursor`, lane-only). A missing
+    or corrupt cursor reads as 0 — at-least-once, never a crash."""
+    try:
+        with open(os.path.join(lane, BUS_CURSOR_FILE)) as f:
+            return int(f.read().strip() or 0)
+    except (OSError, ValueError):
+        return 0
+
+
+def bus_write_cursor(lane, seq):
+    with open(os.path.join(lane, BUS_CURSOR_FILE), "w") as f:
+        f.write(f"{int(seq)}\n")
+
+
+def bus_call(cfg, method, path, body=None, timeout=BUS_CONNECT_TIMEOUT):
+    """One HTTP call to the bus (B4-B8: loopback, Bearer token, strict Host). BusDown on any
+    connection failure, BusHttp on any HTTP error status — never a traceback."""
+    base = (cfg.get("url") or "").rstrip("/")
+    parsed = urllib.parse.urlparse(base)
+    host = parsed.hostname or "127.0.0.1"
+    headers = {"Authorization": f"Bearer {cfg['token']}",
+               "Host": f"{host}:{parsed.port}" if parsed.port else host}
+    data = None
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(base + path, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        error = e.reason
+        with contextlib.suppress(OSError, ValueError):
+            error = json.loads(e.read().decode("utf-8")).get("error") or e.reason
+        raise BusHttp(e.code, error) from None
+    except (urllib.error.URLError, TimeoutError, ConnectionRefusedError, OSError, ValueError) as e:
+        raise BusDown(f"{type(e).__name__}: {e}") from None
+    if not isinstance(payload, dict):
+        raise BusDown("response is not a JSON object")
+    return payload
+
+
+def bus_ack_body(cfg, msg_id):
+    """B13: `{run, id, ack_level: 3}` — level 3 is `read` (B19): this script printed it."""
+    body = {"id": msg_id, "ack_level": 3}
+    if cfg.get("run"):
+        body["run"] = cfg["run"]
+    return body
+
+
+def bus_wait_chunk(cfg, after, chunk):
+    """One B11 long-poll chunk: the `/health` probe carries the 2 s connect budget (a refused
+    loopback connect fails instantly; a hung server surfaces here, not after the chunk), then
+    `GET /wait` with a read window that spans the chunk."""
+    bus_call(cfg, "GET", "/health")
+    qs = urllib.parse.urlencode({"after": int(after), "timeout": f"{chunk:g}"})
+    return bus_call(cfg, "GET", f"/wait?{qs}", timeout=chunk + 10.0)
+
+
+def bus_poll_answer(cfg, ask_id, after, deadline):
+    """Long-poll `GET /wait` in chunks of at most 90 s until the `answer` whose `reply_to` is
+    this ask arrives, skipping other messages addressed to the lane, or until `deadline`.
+    Returns the answer message or None; raises BusDown/BusHttp to the caller."""
+    while True:
+        remaining = deadline - time.time()
+        if remaining < 1.0:  # /wait clamps to >= 1 s server-side; a shorter chunk would overshoot
+            return None
+        res = bus_wait_chunk(cfg, after, min(BUS_WAIT_CHUNK_MAX, remaining))
+        msg = res.get("message")
+        if msg is None:
+            continue
+        if msg.get("kind") == "answer" and msg.get("reply_to") == ask_id:
+            return msg
+        seq = msg.get("seq")
+        if is_int(seq) and seq > after:
+            after = seq
+
+
+def status_block(lane, question):
+    """ask's blocked write — cmd_blocked's own writer (R13.4/R15: state, raw question, commit
+    and subagent cleared), so MB3 reads BLOCKED and no STALL fires while the call waits.
+    Best-effort: the bus round trip never dies on a refused status write."""
+    try:
+        old = load_live(lane)
+        require_state(old, "blocked")
+        obj = dict(old, state="blocked", question=question, commit=None, subagent=None)
+        write_status(lane, stamp(obj))
+        return True
+    except (Fail, OSError, ValueError):
+        return False
+
+
+def status_resume(lane):
+    """The answer's write-back: `blocked -> working` (R13.5), the step kept. Best-effort."""
+    try:
+        old = load_live(lane)
+        require_state(old, "progress")
+        obj = dict(old, state="working", question=None, subagent=None)
+        write_status(lane, stamp(obj))
+        return True
+    except (Fail, OSError, ValueError):
+        return False
+
+
+def ask_down(lane, question):
+    """The down-fallback: the bus is unusable, so the round trip degrades to today's BLOCKED
+    flow — the status file gets the question exactly as `blocked` writes it, and the agent is
+    pointed at the BLOCKED token. Always raises Handled(4)."""
+    status_block(lane, question)
+    print("BUS DOWN: use the BLOCKED token")
+    raise Handled(4)
+
+
+def check_bus_timeout(v):
+    if not is_num(v) or not v > 0:
+        raise Fail(f"timeout must be a positive number of seconds, got {v!r}")
+    return v
+
+
+def cmd_ask(a):
+    """BB: POST the question, go blocked, long-poll for the answer; on it, ack level 3, back to
+    working, print the text. Timeout prints `PENDING <ask id>` and exits 3 (status stays
+    blocked). An unusable bus is ask_down; an HTTP error is one JSON line and exit 5."""
+    lane, question = lane_dir(a), a.question
+    if question is None or not question.strip():
+        raise Fail("ask needs a non-empty question [R19]")
+    deadline = time.time() + check_bus_timeout(a.timeout)
+    cfg = bus_lane_config(lane)
+    if cfg is None:
+        ask_down(lane, question)
+    try:
+        res = bus_call(cfg, "POST", "/send", body={"kind": "ask", "text": question})
+    except BusDown:
+        ask_down(lane, question)
+    except BusHttp as e:
+        raise Fail(bus_http_error(e), code=5)
+    msg = res.get("message") or {}
+    ask_id, after = msg.get("id"), msg.get("seq")
+    if not ask_id or not is_int(after):
+        ask_down(lane, question)  # recorded but unusable response: the same fallback
+    status_block(lane, question)
+    try:
+        answer = bus_poll_answer(cfg, ask_id, after, deadline)
+    except BusDown:
+        ask_down(lane, question)
+    except BusHttp as e:
+        raise Fail(bus_http_error(e), code=5)
+    if answer is None:
+        print(f"PENDING {ask_id}")
+        raise Handled(3)
+    with contextlib.suppress(BusDown, BusHttp, OSError, ValueError):
+        bus_call(cfg, "POST", "/ack", body=bus_ack_body(cfg, answer["id"]))
+    status_resume(lane)
+    print(answer["text"])
+    raise Handled(0)
+
+
+def cmd_wait(a):
+    """BB: resume ask's long-poll (a tool timeout cut the call). Same outputs as `ask`."""
+    lane, ask_id = lane_dir(a), (a.ask_id or "").strip()
+    if not ask_id:
+        raise Fail("ask id is empty")
+    m = ASK_ID_RE.fullmatch(ask_id)
+    if not m:
+        raise Fail(f"ask id must be m-<seq>, got {ask_id!r} [B15]")
+    deadline = time.time() + check_bus_timeout(a.timeout)
+    cfg = bus_lane_config(lane)
+    if cfg is None:
+        raise Fail("bus down", code=4)
+    try:
+        answer = bus_poll_answer(cfg, ask_id, int(m.group(1)), deadline)
+    except BusDown:
+        raise Fail("bus down", code=4)
+    except BusHttp as e:
+        raise Fail(bus_http_error(e), code=5)
+    if answer is None:
+        print(f"PENDING {ask_id}")
+        raise Handled(3)
+    with contextlib.suppress(BusDown, BusHttp, OSError, ValueError):
+        bus_call(cfg, "POST", "/ack", body=bus_ack_body(cfg, answer["id"]))
+    status_resume(lane)
+    print(answer["text"])
+    raise Handled(0)
+
+
+def cmd_inbox(a):
+    """BB: print the messages addressed to this lane after the cursor, one JSON line each,
+    ack each at level 3, advance the cursor. Empty prints nothing and exits 0."""
+    lane = lane_dir(a)
+    cfg = bus_lane_config(lane)
+    if cfg is None:
+        raise Fail("bus down", code=4)
+    after = bus_read_cursor(lane)
+    while True:
+        try:
+            res = bus_wait_chunk(cfg, after, 1.0)
+        except BusDown:
+            raise Fail("bus down", code=4)
+        except BusHttp as e:
+            raise Fail(bus_http_error(e), code=5)
+        msg = res.get("message")
+        if not msg:
+            break
+        print(json.dumps(msg))
+        seq = msg.get("seq")
+        if not is_int(seq) or seq <= after:
+            break  # cannot advance past this message; stop rather than fetch it again
+        after = seq
+        bus_write_cursor(lane, seq)
+        try:
+            bus_call(cfg, "POST", "/ack", body=bus_ack_body(cfg, msg.get("id")))
+        except BusHttp as e:
+            raise Fail(bus_http_error(e), code=5)
+        except (BusDown, OSError, ValueError):
+            raise Fail("bus down", code=4)
+    raise Handled(0)
+
+
+def cmd_ack(a):
+    """BB: POST /ack level 3 for one message (B13)."""
+    lane, msg_id = lane_dir(a), (a.msg_id or "").strip()
+    if not msg_id:
+        raise Fail("message id is empty")
+    cfg = bus_lane_config(lane)
+    if cfg is None:
+        raise Fail("bus down", code=4)
+    try:
+        res = bus_call(cfg, "POST", "/ack", body=bus_ack_body(cfg, msg_id))
+    except BusDown:
+        raise Fail("bus down", code=4)
+    except BusHttp as e:
+        raise Fail(bus_http_error(e), code=5)
+    return (res, None)
+
+
+def bus_unread_hint(lane):
+    """The `progress` hint: `N unread — run inbox` when the bus holds messages for this lane
+    past the inbox cursor. Best effort — a 2 s budget, silent whenever the bus is unusable,
+    never a failure, never a cursor move."""
+    cfg = bus_lane_config(lane)
+    if cfg is None:
+        return None
+    try:
+        after, n = bus_read_cursor(lane), 0
+        while True:
+            res = bus_wait_chunk(cfg, after, 1.0)
+            msg = res.get("message")
+            if msg is None:
+                break
+            n += 1
+            seq = msg.get("seq")
+            if is_int(seq) and seq > after:
+                after = seq
+        return f"{n} unread — run inbox" if n else None
+    except (Fail, BusDown, BusHttp, OSError, ValueError):
+        return None
+
+
 # ---------- CLI ----------
 
 def build_parser():
@@ -742,6 +1068,17 @@ def build_parser():
     sp.add_argument("pct", type=int)
     sp = lane_cmd("phase-done", cmd_phase_done, "append a completed phase id [R8]")
     sp.add_argument("phase_id")
+    sp = lane_cmd("ask", cmd_ask, "post the question on the bus and block for the answer [BB]")
+    sp.add_argument("question")
+    sp.add_argument("--timeout", type=float, default=BUS_ASK_TIMEOUT,
+                    help="total seconds to wait for the answer (default 600)")
+    sp = lane_cmd("wait", cmd_wait, "resume waiting for the answer to <ask id> [BB]")
+    sp.add_argument("ask_id")
+    sp.add_argument("--timeout", type=float, default=BUS_ASK_TIMEOUT,
+                    help="total seconds to wait for the answer (default 600)")
+    lane_cmd("inbox", cmd_inbox, "print this lane's unread bus messages and ack them [BB]")
+    sp = lane_cmd("ack", cmd_ack, "record a bus message as read, level 3 [BB]")
+    sp.add_argument("msg_id")
     sp = lane_cmd("show", cmd_show, "read-only: apply the R27 reader conditions and print the verdict")
     sp.add_argument("--armed-at", type=float, default=0.0, help="watch armed_at, a float epoch")
     sp.add_argument("--run", default=None)
@@ -760,11 +1097,14 @@ def main(argv=None):
         if a.self_test:
             return run_self_test()
         if not getattr(a, "cmd", None):
-            raise Fail("no command; --help lists the R17 command set "
-                       "(start, progress, blocked, done, ctx, phase-done, show, install, measure)")
+            raise Fail("no command; --help lists the command set "
+                       "(start, progress, blocked, done, ctx, phase-done, show, "
+                       "ask, wait, inbox, ack, install, measure)")
         out, token = a.func(a)
     except Fail as e:
         print(json.dumps({"ok": False, "error": str(e), **e.extra}))
+        return e.code
+    except Handled as e:
         return e.code
     except (OSError, ValueError) as e:  # corrupt JSON, unreadable files: still one JSON line
         print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}))
@@ -1412,6 +1752,300 @@ def t_measure_read_only(root):
     assert data_digest(data) == before, "a refused run changed nothing either"
 
 
+# ---------- bus client self-test (plan BB) ----------
+# The real `scripts/mk-bus.py` (resolved from this file's repo root), started the way its own
+# --self-test starts a server: `ensure` — a detached serve on an ephemeral 127.0.0.1 port with a
+# temp data dir — tracked in BUS_SERVERS and stopped in run_self_test's finally. An installed
+# skill copy has no scripts/ tree next to it, so every bus case returns early there; the plugin
+# checkout, where the gates run, always has it.
+
+MK_BUS_PY = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))), "scripts", "mk-bus.py")
+BUS_SERVERS = []        # every (pid, data dir) this self-test started
+BUS_SERVER_CACHE = {}   # one shared server per (root, name); cases are order-independent
+
+
+def bus_cli(*args):
+    """The real mk-bus.py, one JSON line back: (rc, obj); a failed call fails the case."""
+    r = subprocess.run([sys.executable, MK_BUS_PY, *args], capture_output=True, text=True,
+                       timeout=90, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+    lines = [x for x in r.stdout.splitlines() if x.strip()]
+    obj = json.loads(lines[-1]) if lines else {}
+    assert r.returncode == 0 and obj.get("ok") is True, \
+        f"mk-bus.py {args}: rc={r.returncode} out={obj} err={r.stderr.strip()}"
+    return r.returncode, obj
+
+
+def bus_server(root, name="bus"):
+    """One REAL mk-bus server per (root, name): ensure → detached serve, ephemeral port,
+    temp data dir. Returns (data dir, pid, port)."""
+    key = (root, name)
+    if key not in BUS_SERVER_CACHE:
+        data = os.path.join(root, f"{name}-data")
+        os.makedirs(data, exist_ok=True)
+        _, res = bus_cli("ensure", "--data", data, "--run", BUS_RUN)
+        assert res.get("started") is True and res.get("pid") and res.get("port"), res
+        BUS_SERVERS.append((res["pid"], data))
+        BUS_SERVER_CACHE[key] = (data, res["pid"], res["port"])
+    return BUS_SERVER_CACHE[key]
+
+
+def bus_lane(root, lane_name, task, data):
+    """A lane dir whose `.matrixkoder-bus.json` is written by the real `mk-bus.py token`."""
+    lane = mklane(root, lane_name)
+    bus_cli("token", "--lane", lane, "--task", task, "--run", BUS_RUN, "--data", data)
+    return lane
+
+
+def bus_rows(data):
+    """`<data>/runs/<run>/bus.jsonl` as dicts; a torn line is skipped, a missing file is []."""
+    out = []
+    with contextlib.suppress(OSError):
+        with open(os.path.join(data, "runs", BUS_RUN, "bus.jsonl")) as f:
+            for line in f:
+                with contextlib.suppress(json.JSONDecodeError):
+                    obj = json.loads(line)
+                    if isinstance(obj, dict):
+                        out.append(obj)
+    return out
+
+
+def bus_poll_until(fn, timeout=15.0, step=0.05):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        got = fn()
+        if got:
+            return got
+        time.sleep(step)
+    raise AssertionError(f"bus_poll_until timed out after {timeout}s")
+
+
+def stop_pid(pid, timeout=5.0):
+    """mk-bus.py's stop_process shape: SIGTERM, wait out the timeout, SIGKILL."""
+    with contextlib.suppress(OSError):
+        os.kill(pid, signal.SIGTERM)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return
+        time.sleep(0.05)
+    with contextlib.suppress(OSError):
+        os.kill(pid, signal.SIGKILL)
+
+
+def stop_bus_servers():
+    for pid, _ in BUS_SERVERS:
+        stop_pid(pid)
+
+
+def bus_serve_leftovers():
+    """The brief's no-serve-left check: pgrep per started server's own data dir (never a bare
+    `pgrep mk-bus`, which would match a real orchestrator bus running beside this test)."""
+    out = []
+    for _, data in BUS_SERVERS:
+        try:
+            r = subprocess.run(["pgrep", "-f", f"mk-bus.py serve --data {data}"],
+                               capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            continue  # no pgrep here: the pid checks above are the guarantee
+        if r.returncode == 0:
+            out.append(data)
+    return out
+
+
+def t_bus_ask_answer_roundtrip(root):
+    """The BB round trip against the real server: ask lands on the bus, the status file goes
+    blocked (observed mid-wait) and back to working, the real `mk-bus.py answer` (sent from a
+    thread) unblocks the call, the answer text is the only stdout line, and an ack level-3
+    record for the answer is in bus.jsonl."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data, _, _ = bus_server(root)
+    lane = bus_lane(root, "bus_ask_lane", "TQ", data)
+    begin(lane, root)
+    cli(lane, "progress", "parse-plan")
+    question, answer_text = "which fixture format is the acceptance target?", "target format v3"
+    seen = {}
+
+    def answer_when_blocked():
+        row = bus_poll_until(lambda: next(
+            (r for r in bus_rows(data) if r.get("kind") == "ask" and r.get("task") == "TQ"), None))
+        seen["blocked"] = bus_poll_until(
+            lambda: status(lane) if status(lane).get("state") == "blocked" else None)
+        # an info to the lane lands while the ask polls: it must be skipped, not returned
+        bus_cli("send", "--run", BUS_RUN, "--task", "TQ", "--kind", "info",
+                "--text", "noise for the poll", "--data", data)
+        bus_cli("answer", row["id"], answer_text, "--run", BUS_RUN, "--data", data)
+
+    th = threading.Thread(target=answer_when_blocked)
+    th.start()
+    try:
+        code, lines = cli(lane, "ask", question, "--timeout", "30")
+    finally:
+        th.join(30)
+    assert code == 0 and lines == [answer_text], (code, lines)
+    st = status(lane)
+    assert st["state"] == "working" and st["question"] is None, st
+    assert seen["blocked"]["question"] == question, seen["blocked"]
+    rows = bus_rows(data)
+    asks = [r for r in rows if r.get("kind") == "ask" and r.get("task") == "TQ"]
+    assert len(asks) == 1 and asks[0]["from"] == "TQ" and asks[0]["to"] == "orch", asks
+    assert asks[0]["text"] == question, asks[0]
+    answers = [r for r in rows if r.get("kind") == "answer" and r.get("reply_to") == asks[0]["id"]]
+    assert len(answers) == 1 and answers[0]["text"] == answer_text, answers
+    assert answers[0]["to"] == "TQ" and answers[0]["from"] == "orch", answers[0]
+    acks = [r for r in rows if r.get("kind") == "ack" and r.get("reply_to") == answers[0]["id"]]
+    assert len(acks) == 1 and acks[0]["ack_level"] == 3, acks
+
+
+def t_bus_ask_pending_then_wait(root):
+    """ask with --timeout 2 and no answer: `PENDING <ask id>`, exit 3, status stays blocked.
+    `wait` on an unanswered ask PENDINGs too; once the real answer lands (with nobody
+    polling), `wait` returns its text, sets working and leaves a level-3 ack."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data, _, _ = bus_server(root)
+    lane = bus_lane(root, "bus_pend_lane", "TP", data)
+    begin(lane, root)
+    cli(lane, "progress", "build")
+    t0 = time.time()
+    code, lines = cli(lane, "ask", "no answer coming", "--timeout", "2")
+    assert time.time() - t0 < 10, "the 2 s ask must not hang"
+    assert code == 3 and len(lines) == 1 and lines[0].startswith("PENDING m-"), (code, lines)
+    ask_id = lines[0].split()[1]
+    st = status(lane)
+    assert st["state"] == "blocked" and st["question"] == "no answer coming", st
+    code, lines = cli(lane, "ask", "also unanswered", "--timeout", "2")
+    assert code == 3 and len(lines) == 1 and lines[0].startswith("PENDING m-"), (code, lines)
+    ask2 = lines[0].split()[1]
+    code, lines = cli(lane, "wait", ask2, "--timeout", "2")
+    assert code == 3 and lines == [f"PENDING {ask2}"], (code, lines)
+    assert status(lane)["state"] == "blocked", "a PENDING wait leaves the status blocked"
+    bus_cli("answer", ask_id, "late answer", "--run", BUS_RUN, "--data", data)
+    code, lines = cli(lane, "wait", ask_id, "--timeout", "10")
+    assert code == 0 and lines == ["late answer"], (code, lines)
+    st = status(lane)
+    assert st["state"] == "working" and st["question"] is None, st
+    answers = [r for r in bus_rows(data)
+               if r.get("kind") == "answer" and r.get("reply_to") == ask_id]
+    assert len(answers) == 1 and answers[0]["text"] == "late answer", answers
+    acks = [r for r in bus_rows(data)
+            if r.get("kind") == "ack" and r.get("reply_to") == answers[0]["id"]]
+    assert len(acks) == 1 and acks[0]["ack_level"] == 3, acks
+
+
+def t_bus_inbox_drains_and_acks(root):
+    """inbox prints the info sent to the lane as one JSON line, acks it level 3, advances the
+    lane cursor; a second inbox prints nothing and exits 0."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data, _, _ = bus_server(root)
+    lane = bus_lane(root, "bus_inbox_lane", "TI", data)
+    begin(lane, root)
+    cli(lane, "progress", "parse-plan")
+    bus_cli("send", "--run", BUS_RUN, "--task", "TI", "--kind", "info",
+            "--text", "integration merges after BB", "--data", data)
+    code, lines = cli(lane, "inbox")
+    assert code == 0 and len(lines) == 1, (code, lines)
+    msg = json.loads(lines[0])
+    assert msg["kind"] == "info" and msg["to"] == "TI" and msg["from"] == "orch", msg
+    assert msg["task"] == "TI" and msg["text"] == "integration merges after BB", msg
+    with open(os.path.join(lane, BUS_CURSOR_FILE)) as f:
+        assert int(f.read().strip()) == msg["seq"], "the cursor advanced past the message"
+    acks = [r for r in bus_rows(data)
+            if r.get("kind") == "ack" and r.get("reply_to") == msg["id"]]
+    assert len(acks) == 1 and acks[0]["ack_level"] == 3, acks
+    code, lines = cli(lane, "inbox")
+    assert code == 0 and lines == [], (code, lines)
+
+
+def t_bus_progress_unread_hint(root):
+    """progress prints `N unread — run inbox` as its one extra line when the bus holds messages
+    for the lane past the cursor — and no extra line once drained, with no bus lane file, or
+    before any message exists."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data, _, _ = bus_server(root)
+    lane = bus_lane(root, "bus_hint_lane", "TH", data)
+    begin(lane, root)
+    code, lines = cli(lane, "progress", "parse-plan")
+    assert code == 0 and len(lines) == 1, lines
+    bus_cli("send", "--run", BUS_RUN, "--task", "TH", "--kind", "info",
+            "--text", "ping TH", "--data", data)
+    code, lines = cli(lane, "progress", "build")
+    assert code == 0 and len(lines) == 2 and lines[1] == "1 unread — run inbox", lines
+    code, lines = cli(lane, "inbox")
+    assert code == 0 and len(lines) == 1 and json.loads(lines[0])["text"] == "ping TH", lines
+    code, lines = cli(lane, "progress", "test")
+    assert code == 0 and len(lines) == 1, lines
+    bare = mklane(root, "bus_hint_nolane")
+    begin(bare, root)
+    code, lines = cli(bare, "progress", "parse-plan")
+    assert code == 0 and len(lines) == 1, lines
+
+
+def t_bus_server_down_fallback(root):
+    """Server stopped, and the no-lane-file case: ask exits 4 within 3 s with the status file
+    blocked and `BUS DOWN: use the BLOCKED token`; inbox/ack/wait print the bus-down JSON line
+    and exit 4."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data, pid, _ = bus_server(root, "busdown")
+    lane = bus_lane(root, "bus_down_lane", "TD", data)
+    begin(lane, root)
+    cli(lane, "progress", "parse-plan")
+    stop_pid(pid)
+    t0 = time.time()
+    code, lines = cli(lane, "ask", "is the bus up?", "--timeout", "30")
+    elapsed = time.time() - t0
+    assert code == 4 and lines == ["BUS DOWN: use the BLOCKED token"], (code, lines)
+    assert elapsed < 3.0, f"ask fell back in {elapsed:.1f}s, not within 3 s"
+    st = status(lane)
+    assert st["state"] == "blocked" and st["question"] == "is the bus up?", st
+    down = json.dumps({"ok": False, "error": "bus down"})
+    for args in (("inbox",), ("ack", "m-1"), ("wait", "m-1", "--timeout", "3")):
+        code, lines = cli(lane, *args)
+        assert code == 4 and lines == [down], (args, code, lines)
+    bare = mklane(root, "bus_down_nolane")
+    begin(bare, root)
+    cli(bare, "progress", "parse-plan")
+    code, lines = cli(bare, "ask", "no bus here", "--timeout", "30")
+    assert code == 4 and lines == ["BUS DOWN: use the BLOCKED token"], (code, lines)
+    st = status(bare)
+    assert st["state"] == "blocked" and st["question"] == "no bus here", st
+    code, lines = cli(bare, "inbox")
+    assert code == 4 and lines == [down], (code, lines)
+
+
+def t_bus_bad_token_http_error(root):
+    """A rejected token is an HTTP error, not a fallback: one JSON line
+    `{"ok": false, "error": "<status>: <server error>"}` and exit 5, on every bus command,
+    with the status file untouched."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data, _, _ = bus_server(root)
+    lane = bus_lane(root, "bus_badtok_lane", "TB", data)
+    begin(lane, root)
+    cli(lane, "progress", "parse-plan")
+    path = os.path.join(lane, BUS_LANE_FILE)
+    with open(path) as f:
+        cfg = json.load(f)
+    cfg["token"] = "tok_bogus_" + "0" * 32
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+    rejected = {"ok": False, "error": "401: unauthorized"}
+    code, lines = cli(lane, "ask", "anyone there?", "--timeout", "5")
+    assert code == 5 and len(lines) == 1 and json.loads(lines[0]) == rejected, (code, lines)
+    st = status(lane)
+    assert st["state"] == "working" and st["question"] is None, "a 401 touches no status"
+    for args in (("inbox",), ("ack", "m-1"), ("wait", "m-1")):
+        code, lines = cli(lane, *args)
+        assert code == 5 and len(lines) == 1 and json.loads(lines[0]) == rejected, (args, code, lines)
+
+
 def t_skill_frontmatter(root):
     """The SKILL.md this script serves: exactly the three portable frontmatter keys, the
     directory-matching name, the guard description, the one allowed-tools value, steps before
@@ -1452,6 +2086,9 @@ def t_skill_frontmatter(root):
     assert steps, "no `##` heading names a step (start, progress, blocked, done)"
     for i in steps:
         assert i < refs[0], f"step heading {headings[i][1]!r} must come before `## Reference`"
+    ask_sec = [i for i, (_, h) in enumerate(headings) if h == "Asking the orchestrator"]
+    assert len(ask_sec) == 1, "exactly one `## Asking the orchestrator` section (BB)"
+    assert ask_sec[0] < refs[0], "`## Asking the orchestrator` must come before `## Reference`"
     assert "${CLAUDE_SKILL_DIR}" in body, "the body must give the Claude Code script path"
     assert "base directory" in body, "the body must give the OpenCode script path (base directory)"
     assert ".claude/skills/mk-builder/SKILL.md" in body or "child-skills/mk-builder/SKILL.md" in body, \
@@ -1462,10 +2099,11 @@ def t_skill_frontmatter(root):
 
 
 def run_self_test():
-    """Print one line per case, then `ok <n> cases`; exit non-zero if any case failed."""
+    """Print one line per case, then `ok <n> cases`; exit non-zero if any case failed. Every
+    bus server the cases started is stopped in the finally, and none may survive it (pgrep)."""
     root = tempfile.mkdtemp(prefix="mk-builder-selftest-")
     cases = sorted((n, f) for n, f in globals().items() if n.startswith("t_") and callable(f))
-    failed = []
+    failed, leftover = [], []
     try:
         for name, fn in cases:
             try:
@@ -1475,7 +2113,12 @@ def run_self_test():
                 failed.append(name)
                 print(f"not ok {name}: {type(e).__name__}: {e}")
     finally:
+        stop_bus_servers()
+        leftover = bus_serve_leftovers()
         shutil.rmtree(root, ignore_errors=True)
+    if leftover:
+        failed.append("bus_server_leftover")
+        print(f"not ok bus_server_leftover: pgrep still shows a serve for: {leftover}")
     if failed:
         print(f"{len(failed)} of {len(cases)} cases failed: {', '.join(failed)}")
         return 1
