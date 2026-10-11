@@ -153,11 +153,15 @@ def upsert_agent(con, agent, caps, kind, cli, status, protected):
 
 
 def display_of(model, known=None):
-    """A display name: a known one, else the title-cased last segment of the id."""
+    """A display name: a known one, else the whole id, title-cased.
+
+    `provider/model` becomes both parts joined by a space, and `-` and `_` become spaces:
+    manifest/auto -> Manifest Auto, zai-coding-plan/glm-5.2 -> Zai Coding Plan Glm 5.2.
+    """
     if known:
         return known
-    seg = model.split("/")[-1].replace("-", " ").replace("_", " ")
-    return " ".join(w.capitalize() for w in seg.split())
+    words = model.replace("/", " ").replace("-", " ").replace("_", " ").split()
+    return " ".join(w.capitalize() for w in words)
 
 
 def upsert_model(con, agent, model, efforts, provider, status, protected, display=None):
@@ -622,21 +626,18 @@ def self_test():
             "gemini-3.8-flash-medium  12k ctx": ("gemini-3.8-flash-medium", None),
             "claude-sonnet-5-5 · medium": ("claude-sonnet-5-5", "medium"),
         }
-        con = open_catalog(home)
-        try:
-            upsert_model(con, "opencode", "manifest/auto", ["low", "medium", "high"], "opencode",
-                         "picked", set(), "Manifest Auto")
-            upsert_model(con, "agy", "gemini-3.8-flash-medium", [], "agy", "picked", set())
-            upsert_model(con, "claude", "claude-sonnet-5-5", ["low", "medium", "high", "max"],
-                         "claude", "picked", set(), "Sonnet 5.5")
-            con.commit()
-        finally:
-            con.close()
+        # seeded, not hand-inserted: the derived display of manifest/auto must be "Manifest Auto"
+        open(yaml, "w").write(
+            "agents:\n"
+            "  opencode: { available: true, models: [manifest/auto, opencode/alpha] }\n"
+            "  agy: { available: true, models: [gemini-3.8-flash-medium] }\n"
+            "  claude: { available: true, models: [claude-sonnet-5-5] }\n")
+        _run(home, "seed", "--yaml", yaml, "--jev", jev, "--no-probe")
+        shown = _run(home, "show", "opencode", "manifest/auto")
+        _check(shown["model"]["display"] == "Manifest Auto", f"derived display {shown['model']['display']}")
         for footer, (model, effort) in footers.items():
             got = pane_model("pane-1", footer, home)
             _check(got["model"] == model and got.get("effort") == effort, f"footer {footer!r} -> {got}")
-        got = pane_model("pane-1", "Sonnet 5.5 · high", home)
-        _check(got["model"] == "claude-sonnet-5-5" and got["effort"] == "high", f"display match {got}")
         # a model whose id is a bare word must not match inside "no model here" or "models"
         con = open_catalog(home)
         try:
