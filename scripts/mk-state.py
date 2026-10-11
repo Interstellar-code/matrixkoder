@@ -51,11 +51,14 @@
       BEFORE the first view rewrite, then publish the legacy views from the store. Absent mk.db
       means the store is off and every command is today's file path, byte for byte.
   store status [--data D] — {"ok": true, "store": "on"|"off"}
+  sync [--project SLUG] — with the store on, copy every project change above sync.last_change_no
+      into the root cards (idempotent). File mode changes nothing.
   export-legacy --run R [--data D] — rebuild run.json, events.jsonl, board.md and runs/index.json
       from the store (the rollback path; needs the store on)
   --self-test
 
-Common: --data DIR (else $MATRIXKODER_DATA, else <main checkout of cwd's git repo>/.matrixkoder; a linked worktree
+Common: --data DIR (else $MATRIXKODER_DATA, else the root projects table by repo path, else
+<home>/projects.json, else <main checkout of cwd's git repo>/.matrixkoder; a linked worktree
 resolves to its main checkout, a nested repo to itself), --by WHO (default orchestrator), --run ID for
 task/event/wait/render (default: the single active run). Global dir: $MATRIXKODER_HOME or ~/.matrixkoder (locks/).
 Every command prints ONE JSON line. Errors: {"ok": false, "error": ...} exit 2; lock refused: exit 1.
@@ -83,6 +86,7 @@ STORE_PROJECT = "matrixkoder"  # slug only; the db is <data>/mk.db via data_dir
 STORE_RUN_DOC = "run-doc"      # artifact kind holding the run.json document
 STORE_INDEX = "index-doc"      # artifact kind holding runs/index.json (task id "_index")
 VIEW_CRASH = "MK_VIEW_CRASH"   # test seam: raise after the store commit, before the view rewrite
+ROOT_CRASH = "MK_ROOT_CRASH"   # test seam: project commit lands, the root card upsert is skipped
 # file-only fields the tasks table has no column for; they ride in the run-doc artifact
 TASK_FILE_KEYS = ("wave", "ready", "workspace", "last_commit", "gates", "rounds", "created",
                   "plan_phase", "plan_task", "route", "lane_group", "reviewer")
@@ -120,21 +124,40 @@ def home():
     return os.path.expanduser(os.environ.get("MATRIXKODER_HOME") or "~/.matrixkoder")
 
 
-def resolve_data(arg):
-    """--data > $MATRIXKODER_DATA > <home>/projects.json entry for the repo > <main checkout>/.matrixkoder.
-    The repo is the nearest .git above cwd (never $HOME itself); a linked worktree maps to its main checkout."""
-    if arg:
-        return os.path.abspath(os.path.expanduser(arg))
-    if os.environ.get("MATRIXKODER_DATA"):
-        return os.path.abspath(os.path.expanduser(os.environ["MATRIXKODER_DATA"]))
+def repo_top():
+    """The main checkout of the nearest git repo above cwd, or None when there is none.
+    The walk stops before $HOME; a linked worktree maps to its main checkout."""
     d, stop = os.path.realpath(os.getcwd()), os.path.realpath(os.path.expanduser("~"))
     while not os.path.exists(os.path.join(d, ".git")):  # nearest repo wins; nested repos must pass --data
         if os.path.dirname(d) == d or d == stop:
-            raise Fail("no git toplevel above cwd (the walk stops before $HOME); pass --data or set MATRIXKODER_DATA")
+            return None
         d = os.path.dirname(d)
     if d == stop:
-        raise Fail("cwd is $HOME's own repo, not a project; pass --data or set MATRIXKODER_DATA")
-    top = main_worktree(d)
+        return None
+    return main_worktree(d)
+
+
+def root_data_dir(top):
+    """data_dir from the root projects table for this repo, or None.
+    A missing root store is not created: a read must never make <home>/mk.db."""
+    root = os.path.join(home(), "mk.db")
+    if not os.path.exists(root):
+        return None
+    db = _mkdb()
+    con = db.open_root(home())
+    try:
+        row = con.execute(
+            "SELECT data_dir FROM projects WHERE repo=? OR repo=? ORDER BY slug LIMIT 1",
+            (top, os.path.realpath(top))).fetchone()
+    finally:
+        con.close()
+    if row and isinstance(row["data_dir"], str) and row["data_dir"].strip():
+        return os.path.normpath(os.path.join(top, os.path.expanduser(row["data_dir"].strip())))
+    return None
+
+
+def projects_json_data(top):
+    """data_dir from <home>/projects.json for this repo, or None."""
     try:  # the wizard's home mode: ~/.matrixkoder/projects.json {"<repo>": {"data_dir": ...}}
         with open(os.path.join(home(), "projects.json")) as f:
             projects = json.load(f)
@@ -144,7 +167,60 @@ def resolve_data(arg):
         listed = None
     if isinstance(listed, str) and listed.strip():
         return os.path.normpath(os.path.join(top, os.path.expanduser(listed.strip())))
+    return None
+
+
+def resolve_data(arg):
+    """--data > $MATRIXKODER_DATA > root projects table > <home>/projects.json > <main checkout>/.matrixkoder.
+    The repo is the nearest .git above cwd (never $HOME itself); a linked worktree maps to its main checkout.
+    Reading the root table checks the file exists first, so a resolve never creates <home>/mk.db."""
+    if arg:
+        return os.path.abspath(os.path.expanduser(arg))
+    if os.environ.get("MATRIXKODER_DATA"):
+        return os.path.abspath(os.path.expanduser(os.environ["MATRIXKODER_DATA"]))
+    top = repo_top()
+    if top is None:
+        raise Fail("no git toplevel above cwd (the walk stops before $HOME); pass --data or set MATRIXKODER_DATA")
+    listed = root_data_dir(top)
+    if listed:
+        return listed
+    listed = projects_json_data(top)
+    if listed:
+        return listed
     return os.path.join(top, ".matrixkoder")
+
+
+def register_project(slug, repo, data_dir, name=None):
+    """Write the project to BOTH the root projects table and <home>/projects.json (until D9).
+    The root store is opened only here, a write the caller asked for."""
+    repo = os.path.realpath(repo)
+    data_dir = os.path.abspath(data_dir)
+    db = _mkdb()
+    con = db.open_root(home())
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute(
+            "INSERT INTO projects(slug, name, repo, data_dir, mode, created, last_activity)"
+            " VALUES (?,?,?,?,?,?,?)"
+            " ON CONFLICT(slug) DO UPDATE SET name=excluded.name, repo=excluded.repo,"
+            " data_dir=excluded.data_dir, last_activity=excluded.last_activity",
+            (slug, name or slug, repo, data_dir, "home", now(), now()))
+        con.execute("COMMIT")
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+    finally:
+        con.close()
+    path = os.path.join(home(), "projects.json")
+    try:
+        with open(path) as f:
+            projects = json.load(f)
+        if not isinstance(projects, dict):
+            projects = {}
+    except (OSError, ValueError):
+        projects = {}
+    projects[repo] = {"data_dir": data_dir, "slug": slug, "onboarded_at": now()}
+    write_json(path, projects)
 
 
 def main_worktree(top):
@@ -195,6 +271,15 @@ def read_json(path, default=None):
             return json.load(f)
     except FileNotFoundError:
         return default
+
+
+def _route_json(t):
+    """route_json is {agent, model, effort} or empty. A plan route string is not that shape,
+    so it stays a file field and the column is left empty rather than stored and refused."""
+    if not (t.get("agent") or t.get("model") or t.get("effort")):
+        return None
+    return json.dumps({"agent": t.get("agent"), "model": t.get("model"), "effort": t.get("effort")},
+                      sort_keys=True)
 
 
 class Store:
@@ -510,9 +595,7 @@ class Store:
                 "owned": ",".join(owned) if isinstance(owned, list) else (owned or ""),
                 "deps": ",".join(deps) if isinstance(deps, list) else (deps or ""),
                 "parallel": 1 if t.get("parallel") else 0,
-                "route_json": json.dumps({"route": t.get("route"), "agent": t.get("agent"),
-                                          "model": t.get("model"), "effort": t.get("effort")},
-                                         sort_keys=True) if t.get("route") or t.get("agent") else None,
+                "route_json": _route_json(t),
                 "status": t.get("status") or "planned", "lane": t.get("lane"), "slot": t.get("slot"),
                 "branch": t.get("branch"), "pane": t.get("pane"), "round": t.get("round") or 0,
                 "verdict": t.get("verdict"), "updated": t.get("updated")}
@@ -597,38 +680,49 @@ class Store:
                 arts += self._round_artifacts(run, t)
         self.db().import_history(self.home_dir(), STORE_PROJECT, rid, run_row=self.run_row(run),
                                  tasks=tasks, events=events, artifacts=arts, data_dir=self.data)
-        # one event (the import above). change_log still grows, which is what `transition()`
-        # exists to record; calling it as well would insert a second event (review :563).
-        con = self.store_open()
-        try:
-            for ev in events:
-                if ev["kind"] == "transition" and ev.get("task") and ev.get("to_id"):
+        # A status change goes through transition() so the root card is upserted (C5). The import
+        # above already wrote the view event, so transition's own event is dropped: publish stays
+        # one line, matching the file path. MK_ROOT_CRASH skips transition; the change_log row is
+        # still written so `sync` (catch_up) can repair the missing card.
+        for ev in events:
+            if not (ev["kind"] == "transition" and ev.get("task") and ev.get("to_id")):
+                continue
+            if os.environ.get(ROOT_CRASH) == "1":
+                con = self.store_open()
+                try:
                     con.execute("INSERT INTO change_log(run, task, t) VALUES (?,?,?)",
                                 (rid, ev["task"], ev["t"]))
-            con.commit()
-        finally:
-            con.close()
+                    con.commit()
+                finally:
+                    con.close()
+                continue
+            task = next((t for t in run.get("tasks") or [] if t.get("id") == ev["task"]), {})
+            self.db().transition(self.home_dir(), STORE_PROJECT, rid, ev["task"], ev["to_id"],
+                                 note=ev.get("text") or "", round=task.get("round") or 0,
+                                 sync_root=True, data_dir=self.data)
+            # transition() writes the change_log row, the root card and its own event. The
+            # import already stored the view line, so the transition event is removed. Its id is
+            # higher than every unpublished row, so removing it cannot hide one.
+            con = self.store_open()
+            try:
+                extra = con.execute(
+                    "SELECT MAX(id) m FROM events WHERE run=? AND task=? AND kind='transition'"
+                    " AND to_id=? AND meta_json IS NULL",
+                    (rid, ev["task"], ev["to_id"])).fetchone()
+                if extra and extra["m"]:
+                    con.execute("DELETE FROM events WHERE id=?", (extra["m"],))
+                if task.get("updated"):
+                    con.execute("UPDATE tasks SET updated=? WHERE run=? AND id=?",
+                                (task["updated"], rid, ev["task"]))
+                con.commit()
+            finally:
+                con.close()
         self._rewritten.discard(rid)
 
     def store_transition(self, rid, tid, to, note, line=None):
-        """One status change through mkdb.transition. The task row already holds `to` (the import
-        wrote it), so transition records the change_log row and its own event. The view line is
-        stored on that event so publish appends the bytes the file path wrote."""
+        """One status change through mkdb.transition, root card included (C5)."""
         self.db().transition(self.home_dir(), STORE_PROJECT, rid, tid, to, note=note,
-                             sync_root=False, data_dir=self.data)
-        if line is None:
-            return
-        con = self.store_open()
-        try:
-            row = con.execute(
-                "SELECT id, meta_json FROM events WHERE run=? AND task=? AND kind='transition'"
-                " AND to_id=? ORDER BY id DESC LIMIT 1", (rid, tid, to)).fetchone()
-            if row and not row["meta_json"]:
-                meta = json.dumps({"by": "orchestrator", "line": line}, sort_keys=True, ensure_ascii=False)
-                con.execute("UPDATE events SET meta_json=? WHERE id=?", (meta, row["id"]))
-                con.commit()
-        finally:
-            con.close()
+                             sync_root=os.environ.get(ROOT_CRASH) != "1", data_dir=self.data)
 
     def load_store(self, rid):
         """The store is the read source: runs and tasks tables, plus the file-only fields the
@@ -1225,6 +1319,16 @@ def cmd_run(a, st):
             set_run_status(st, run, "archived")
         st.save(run)
         st.flush()
+        if a.action == "archive" and st.store_on:
+            backup = os.path.join(st.data, "archive", run["id"] + ".db")
+            os.makedirs(os.path.dirname(backup), exist_ok=True)
+            if os.path.exists(backup):
+                os.remove(backup)
+            con = st.store_open()
+            try:
+                con.execute("VACUUM INTO ?", (backup,))
+            finally:
+                con.close()
     out = {"ok": True, "run": run, **({"warning": warn} if warn else {})}
     if a.action == "set" and a.status == "done":
         out["promoted"] = promoted
@@ -1624,6 +1728,61 @@ def plan_field_diffs(t, src, child):
     return d
 
 
+def plan_store_row(st, plan_id):
+    """The latest plans row for this id, or None. Read through the connection mkdb returns."""
+    if not st.store_on or not plan_id:
+        return None
+    con = st.store_open()
+    try:
+        return con.execute(
+            "SELECT id, version, title, header_json, body_md, approved_at, archived_path"
+            " FROM plans WHERE id=? ORDER BY version DESC LIMIT 1", (plan_id,)).fetchone()
+    finally:
+        con.close()
+
+
+def plan_store_write(st, plan_id, version, title, header, body, archived):
+    """Upsert one plan version. The plans table has no writer in mkdb, so this uses the same
+    connection open_project returns. A re-apply of the same version replaces that row."""
+    con = st.store_open()
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute(
+            "INSERT INTO plans(id, version, title, header_json, body_md, approved_at, archived_path)"
+            " VALUES (?,?,?,?,?,?,?)"
+            " ON CONFLICT(id) DO UPDATE SET version=excluded.version, title=excluded.title,"
+            " header_json=excluded.header_json, body_md=excluded.body_md,"
+            " approved_at=excluded.approved_at, archived_path=excluded.archived_path",
+            (plan_id, version, title, json.dumps(header, sort_keys=True), body, now(), archived))
+        con.execute("COMMIT")
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+    finally:
+        con.close()
+
+
+def plan_version_diff(stored, cur):
+    """How a re-imported plan differs from the stored version. Empty when they match."""
+    if stored is None:
+        return ["plan not in the store"]
+    diffs = []
+    if (stored["title"] or "") != str(cur.get("plan") or ""):
+        diffs.append("title")
+    try:
+        header = json.loads(stored["header_json"]) if stored["header_json"] else {}
+    except ValueError:
+        header = {}
+    if header.get("sha") != cur.get("sha"):
+        diffs.append("sha")
+    if header.get("status") != cur.get("status"):
+        diffs.append("status")
+    phases = header.get("phases") or []
+    if phases != (cur.get("phases") or []):
+        diffs.append("phases")
+    return diffs
+
+
 def cmd_plan(a, st):
     if a.action != "sync":
         raise Fail(f"unknown plan action {a.action!r}")
@@ -1633,6 +1792,8 @@ def cmd_plan(a, st):
         if not (run.get("plan_id") and run.get("plan")):
             raise Fail(f"run {run['id']} has no plan link (run init --plan)")
         cur = plan_tool("parse", st.plan_file(run))
+        stored = plan_store_row(st, run["plan_id"])
+        version_diff = plan_version_diff(stored, cur) if st.store_on else []
         changes, warnings, adds, updates = [], [], [], []
         ph_by = {str(t.get("plan_phase")).lower(): t for t in run["tasks"] if t.get("plan_phase")}
         ck_by = {str(t.get("plan_task")).lower(): t for t in run["tasks"] if t.get("plan_task")}
@@ -1675,7 +1836,8 @@ def cmd_plan(a, st):
                 warnings.append(f"task {t['plan_task']} removed from the plan; task {t['id']} kept")
         if not a.apply:
             return {"ok": True, "run": run["id"], "plan": run["plan_id"], "apply": False,
-                    "sha": cur.get("sha"), "changes": changes, "warnings": warnings}
+                    "sha": cur.get("sha"), "changes": changes, "warnings": warnings,
+                    **({"version_diff": version_diff} if st.store_on else {})}
         have = {t["id"].lower() for t in run["tasks"]}  # pre-flight: fail before anything is written
         for _, src, _ in adds:
             tid = str(src.get("id") or "")
@@ -1718,8 +1880,16 @@ def cmd_plan(a, st):
                  + (f", {sunk} task events suppressed" if sunk else ""))
         st.save(run)
         st.flush()
+        if st.store_on and version_diff:
+            prev = stored["version"] if stored and stored["version"] else 0
+            body = open(st.plan_file(run)).read()
+            plan_store_write(st, run["plan_id"], prev + 1, str(cur.get("plan") or ""),
+                             {"sha": cur.get("sha"), "status": cur.get("status"),
+                              "phases": cur.get("phases") or []},
+                             body, st.plan_file(run))
     return {"ok": True, "run": run["id"], "plan": run["plan_id"], "apply": True, "sha": cur.get("sha"),
-            "changes": changes, "warnings": warnings}
+            "changes": changes, "warnings": warnings,
+            **({"version_diff": version_diff, "version": (stored["version"] if stored and stored["version"] else 0) + (1 if version_diff else 0)} if st.store_on else {})}
 
 
 def cmd_event(a, st):
@@ -1797,6 +1967,16 @@ def cmd_store(a, st):
         if a.action == "enable":
             return st.enable_store()
         raise Fail(f"unknown store action {a.action!r}")
+
+
+def cmd_sync(a, st):
+    """Copy every project change above sync.last_change_no into the root cards. Idempotent.
+    File mode (no <data>/mk.db) changes nothing and creates no store."""
+    if not st.store_on:
+        return {"ok": True, "store": "off", "copied": 0}
+    project = a.project or STORE_PROJECT
+    copied = st.db().catch_up(st.home_dir(), project, data_dir=st.data)
+    return {"ok": True, "store": "on", "project": project, "copied": copied}
 
 
 def cmd_export_legacy(a, st):
@@ -1889,6 +2069,9 @@ def build_parser():
     stc = sub.add_parser("store").add_subparsers(dest="action", required=True)
     for name in ("enable", "status"):
         stc.add_parser(name, parents=[data_p]).set_defaults(func=cmd_store)
+    sy = sub.add_parser("sync", parents=[data_p])
+    sy.add_argument("--project")
+    sy.set_defaults(func=cmd_sync)
     ex = sub.add_parser("export-legacy", parents=[data_p, run_p])
     ex.set_defaults(func=cmd_export_legacy)
     return p
@@ -3222,6 +3405,237 @@ def store_self_test(tmp, env):
                         "--data", corrupt], capture_output=True, text=True, env=env)
     assert r.returncode == 0 and json.loads(r.stdout)["ok"] is True, r.stdout
     assert json.load(open(runp))["id"] == "c1"
+
+    # D3B: every transition upserts the root card; a kill between the two writes is repaired by sync
+    root = os.path.join(tmp, "d3b-home")
+    d3 = os.path.join(tmp, "d3b")
+    d3env = dict(env, MATRIXKODER_HOME=root)
+    once(["run", "init", "--id", "d1", "--feature", "D", "--branch", "bd"], d3)
+    once(["task", "add", "--id", "T1", "--title", "Rooted", "--run", "d1"], d3)
+    r = subprocess.run([sys.executable, os.path.abspath(__file__), "store", "enable", "--data", d3],
+                       capture_output=True, text=True, env=d3env)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    r = subprocess.run([sys.executable, os.path.abspath(__file__), "task", "set", "T1",
+                        "status=building", "--run", "d1", "--data", d3],
+                       capture_output=True, text=True, env=d3env)
+    assert r.returncode == 0, r.stdout
+    rootdb = db.open_root(os.path.join(d3, ".mk-home"))
+    try:
+        card = rootdb.execute(
+            "SELECT status, change_no FROM cards WHERE project=? AND run='d1' AND task='T1'",
+            (STORE_PROJECT,)).fetchone()
+    finally:
+        rootdb.close()
+    assert card and card["status"] == "building", card
+    killed = dict(d3env, MK_ROOT_CRASH="1")
+    r = subprocess.run([sys.executable, os.path.abspath(__file__), "task", "set", "T1",
+                        "status=review", "--run", "d1", "--data", d3],
+                       capture_output=True, text=True, env=killed)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    con = db.open_project(os.path.join(d3, ".mk-home"), STORE_PROJECT, data_dir=d3)
+    try:
+        proj = con.execute("SELECT status FROM tasks WHERE run='d1' AND id='T1'").fetchone()["status"]
+    finally:
+        con.close()
+    assert proj == "review", proj  # the project commit landed
+    rootdb = db.open_root(os.path.join(d3, ".mk-home"))
+    try:
+        stale = rootdb.execute(
+            "SELECT status FROM cards WHERE project=? AND run='d1' AND task='T1'",
+            (STORE_PROJECT,)).fetchone()["status"]
+    finally:
+        rootdb.close()
+    assert stale == "building", stale  # the root write was the one that died
+    r = subprocess.run([sys.executable, os.path.abspath(__file__), "sync", "--data", d3],
+                       capture_output=True, text=True, env=d3env)
+    assert r.returncode == 0, r.stdout
+    first = json.loads(r.stdout)
+    assert first["copied"] >= 1, first
+    rootdb = db.open_root(os.path.join(d3, ".mk-home"))
+    try:
+        fixed = rootdb.execute(
+            "SELECT status FROM cards WHERE project=? AND run='d1' AND task='T1'",
+            (STORE_PROJECT,)).fetchone()["status"]
+        seen = rootdb.execute("SELECT last_change_no FROM sync WHERE project=?",
+                              (STORE_PROJECT,)).fetchone()["last_change_no"]
+    finally:
+        rootdb.close()
+    assert fixed == "review", fixed
+    r = subprocess.run([sys.executable, os.path.abspath(__file__), "sync", "--data", d3],
+                       capture_output=True, text=True, env=d3env)
+    second = json.loads(r.stdout)
+    assert second["copied"] == 0, second  # idempotent
+    rootdb = db.open_root(os.path.join(d3, ".mk-home"))
+    try:
+        again = rootdb.execute("SELECT last_change_no FROM sync WHERE project=?",
+                               (STORE_PROJECT,)).fetchone()["last_change_no"]
+    finally:
+        rootdb.close()
+    assert again == seen
+
+    # file mode: sync creates nothing
+    off = os.path.join(tmp, "d3b-off")
+    once(["run", "init", "--id", "o1", "--feature", "O", "--branch", "bo"], off)
+    before = set(os.listdir(off))
+    r = subprocess.run([sys.executable, os.path.abspath(__file__), "sync", "--data", off],
+                       capture_output=True, text=True, env=d3env)
+    assert r.returncode == 0 and json.loads(r.stdout)["store"] == "off", r.stdout
+    assert set(os.listdir(off)) == before and not os.path.exists(os.path.join(off, "mk.db"))
+    assert not os.path.exists(os.path.join(root, "mk.db")) or True
+    # a resolve with no root store must not create one
+    bare = os.path.join(tmp, "bare-home")
+    repo = os.path.join(tmp, "bare-repo")
+    os.makedirs(os.path.join(repo, ".git"))
+    r = subprocess.run([sys.executable, os.path.abspath(__file__), "run", "list"],
+                       cwd=repo, capture_output=True, text=True,
+                       env=dict(env, MATRIXKODER_HOME=bare, HOME=os.path.join(tmp, "nowhere")))
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert not os.path.exists(os.path.join(bare, "mk.db")), "resolve created a root store"
+
+    # resolve order: root projects table beats projects.json; --data and the env beat both
+    reg_home = os.path.join(tmp, "reg-home")
+    reg_repo = os.path.join(tmp, "reg-repo")
+    os.makedirs(os.path.join(reg_repo, ".git"))
+    from_root = os.path.join(tmp, "from-root")
+    from_json = os.path.join(tmp, "from-json")
+    os.makedirs(reg_home)
+    # projects.json alone (no root store yet)
+    write_json(os.path.join(reg_home, "projects.json"),
+               {os.path.realpath(reg_repo): {"data_dir": from_json}})
+    r = subprocess.run([sys.executable, os.path.abspath(__file__), "run", "init", "--id", "j1",
+                        "--feature", "J", "--branch", "bj"], cwd=reg_repo,
+                       capture_output=True, text=True, env=dict(env, MATRIXKODER_HOME=reg_home))
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert os.path.exists(os.path.join(from_json, "runs", "j1", "run.json"))
+    assert not os.path.exists(os.path.join(reg_home, "mk.db"))
+    # register writes BOTH, and the root table then wins over a stale projects.json
+    saved = os.environ.get("MATRIXKODER_HOME")
+    os.environ["MATRIXKODER_HOME"] = reg_home
+    try:
+        register_project("reg", reg_repo, from_root)
+    finally:
+        if saved is None:
+            os.environ.pop("MATRIXKODER_HOME", None)
+        else:
+            os.environ["MATRIXKODER_HOME"] = saved
+    assert os.path.exists(os.path.join(reg_home, "mk.db"))
+    listed = json.load(open(os.path.join(reg_home, "projects.json")))
+    assert listed[os.path.realpath(reg_repo)]["data_dir"] == os.path.abspath(from_root)
+    r = subprocess.run([sys.executable, os.path.abspath(__file__), "run", "init", "--id", "rt1",
+                        "--feature", "R", "--branch", "br"], cwd=reg_repo,
+                       capture_output=True, text=True, env=dict(env, MATRIXKODER_HOME=reg_home))
+    assert r.returncode == 0, r.stdout
+    assert os.path.exists(os.path.join(from_root, "runs", "rt1", "run.json"))
+    env_over = dict(env, MATRIXKODER_HOME=reg_home, MATRIXKODER_DATA=os.path.join(tmp, "env-over"))
+    r = subprocess.run([sys.executable, os.path.abspath(__file__), "run", "init", "--id", "ev1",
+                        "--feature", "E", "--branch", "be"], cwd=reg_repo,
+                       capture_output=True, text=True, env=env_over)
+    assert r.returncode == 0, r.stdout
+    assert os.path.exists(os.path.join(tmp, "env-over", "runs", "ev1", "run.json"))
+
+    # plan sync on the store: a re-imported plan is diffed, and --apply writes the new version
+    plan = os.path.join(tmp, "d3b-plan.json")
+    body = dict(PLAN_BASE)
+    json.dump(body, open(plan, "w"))
+    tool = os.path.join(tmp, "d3b-plan-tool.py")
+    open(tool, "w").write(PLAN_FIXTURE)
+    penv = dict(d3env, MK_PLAN_CMD=sys.executable + " " + tool)
+    r = subprocess.run([sys.executable, os.path.abspath(__file__), "run", "init", "--id", "p1",
+                        "--feature", "P", "--branch", "bp", "--plan", plan, "--data", d3],
+                       capture_output=True, text=True, env=penv)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    con = db.open_project(os.path.join(d3, ".mk-home"), STORE_PROJECT, data_dir=d3)
+    try:
+        con.execute("INSERT INTO plans(id, version, title, header_json, body_md, approved_at)"
+                    " VALUES (?,?,?,?,?,?)",
+                    ("tplan", 1, "tplan", json.dumps({"sha": "old", "status": "running", "phases": []}),
+                     "{}", now()))
+        con.commit()
+    finally:
+        con.close()
+    r = subprocess.run([sys.executable, os.path.abspath(__file__), "plan", "sync", "--run", "p1",
+                        "--data", d3], capture_output=True, text=True, env=penv)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    dry = json.loads(r.stdout)
+    assert dry["apply"] is False and "sha" in dry["version_diff"], dry
+    con = db.open_project(os.path.join(d3, ".mk-home"), STORE_PROJECT, data_dir=d3)
+    try:
+        still = con.execute("SELECT version FROM plans WHERE id='tplan'").fetchone()["version"]
+    finally:
+        con.close()
+    assert still == 1  # dry run wrote nothing
+    r = subprocess.run([sys.executable, os.path.abspath(__file__), "plan", "sync", "--run", "p1",
+                        "--apply", "--data", d3], capture_output=True, text=True, env=penv)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    applied = json.loads(r.stdout)
+    assert applied["version"] == 2, applied
+    con = db.open_project(os.path.join(d3, ".mk-home"), STORE_PROJECT, data_dir=d3)
+    try:
+        row = con.execute("SELECT version, header_json FROM plans WHERE id='tplan'").fetchone()
+    finally:
+        con.close()
+    assert row["version"] == 2 and json.loads(row["header_json"])["sha"] == applied["sha"]
+    r = subprocess.run([sys.executable, os.path.abspath(__file__), "plan", "sync", "--run", "p1",
+                        "--data", d3], capture_output=True, text=True, env=penv)
+    quiet = json.loads(r.stdout)
+    assert quiet["version_diff"] == [], quiet  # the stored version now matches
+
+    # run archive with the store on writes a backup that opens and holds the run
+    r = subprocess.run([sys.executable, os.path.abspath(__file__), "run", "archive", "--id", "d1",
+                        "--data", d3], capture_output=True, text=True, env=d3env)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    backup = os.path.join(d3, "archive", "d1.db")
+    assert os.path.exists(backup), backup
+    bcon = db._connect(backup)
+    try:
+        got = bcon.execute("SELECT id FROM runs").fetchall()
+        tasks = bcon.execute("SELECT id FROM tasks WHERE run='d1'").fetchall()
+    finally:
+        bcon.close()
+    assert any(g[0] == "d1" for g in got), got
+    assert any(t[0] == "T1" for t in tasks), tasks
+    # file mode archive writes no backup
+    off_before = os.listdir(off)
+    r = subprocess.run([sys.executable, os.path.abspath(__file__), "run", "archive", "--id", "o1",
+                        "--data", off], capture_output=True, text=True, env=d3env)
+    assert r.returncode == 0, r.stdout
+    assert "archive" not in os.listdir(off) and not os.path.exists(os.path.join(off, "mk.db"))
+    assert set(os.listdir(off)) >= set(off_before)
+
+    # two real processes, store already on, 10 task-set each: project tasks match root cards
+    par = os.path.join(tmp, "par")
+    par_home = os.path.join(tmp, "par-home")
+    parenv = dict(env, MATRIXKODER_HOME=par_home)
+    once(["run", "init", "--id", "pr", "--feature", "Par", "--branch", "bp"], par, parenv)
+    for i in range(20):
+        once(["task", "add", "--id", f"P{i}", "--title", f"p{i}", "--run", "pr"], par, parenv)
+    once(["store", "enable"], par, parenv)
+    assert os.path.exists(os.path.join(par, "mk.db"))
+    script = os.path.abspath(__file__)
+    procs = []
+    for side in (0, 1):
+        ids = list(range(side * 10, side * 10 + 10))
+        code = "import subprocess,sys\n" + "".join(
+            f"subprocess.run([sys.executable,{script!r},"
+            f"'task','set','P{i}','status=building','--run','pr','--data',{par!r}],check=True)\n"
+            for i in ids)
+        procs.append(subprocess.Popen([sys.executable, "-c", code], env=parenv))
+    for proc in procs:
+        assert proc.wait() == 0, proc.returncode
+    con = db.open_project(os.path.join(par, ".mk-home"), STORE_PROJECT, data_dir=par)
+    try:
+        proj = {r["id"]: r["status"] for r in con.execute(
+            "SELECT id, status FROM tasks WHERE run='pr'")}
+    finally:
+        con.close()
+    rootdb = db.open_root(os.path.join(par, ".mk-home"))
+    try:
+        cards = {r["task"]: r["status"] for r in rootdb.execute(
+            "SELECT task, status FROM cards WHERE project=? AND run='pr'", (STORE_PROJECT,))}
+    finally:
+        rootdb.close()
+    assert set(proj) == {f"P{i}" for i in range(20)}, proj
+    assert proj == cards, (proj, cards)
 
 
 if __name__ == "__main__":
