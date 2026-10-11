@@ -2,6 +2,8 @@
 
 Commit(s): <sha range>. Brief: <path>. Mockups: <paths>. Read-only review of the commit, not the working tree.
 
+You run as the mk-builder skill's reviewer role (a lane agent: read-only, writes ONLY `<lane>/.matrixkoder-review-rN.md`, findings under severities, ends with the `<PHASE> REVIEW R<n> DONE` token) — those rules are the skill's, not this template's (`.claude/skills/mk-builder/`, `reference/lane-rules.md` R15-R20).
+
 ## CRITICAL / HIGH / MEDIUM / LOW
 - `path:line` — problem — fix
 
