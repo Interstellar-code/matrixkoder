@@ -984,12 +984,34 @@ test('every mock tab shows the fixture run header: name, stage chip, MOCK marker
   for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings')) {
     await ui.press({ key: 'dash-tab-old' })
     await ui.press({ key })
+    expect(await ui.find({ text: 'MATRIXKODER' }), `${name} shared brand header`).toBeTruthy()
+    expect(await ui.find({ text: /ORCHESTRATOR/ }), `${name} mode chip`).toBeTruthy()
     expect(await ui.find({ text: 'Checkout v2' }), `${name} run name`).toBeTruthy()
     expect(await ui.find({ text: /6\/12 Watch/ }), `${name} stage chip`).toBeTruthy()
     expect(await ui.find({ text: ' MOCK ' }), `${name} MOCK marker`).toBeTruthy()
     expect(await ui.find({ text: /▶ watching P4 R1/ }), `${name} ▶ Next`).toBeTruthy()
     expect(await ui.find({ text: /workflows-v2/ }), `${name} hides Old`).toBeUndefined()
   }
+})
+
+test('the shared brand header shows plugin.json\'s version chip on a run tab and keeps the run block off Settings', { plugins: [worldFixtures] }, async ($, on) => {
+  // the engine names the plugin root, so the manifest is matched by its suffix
+  const manifest = JSON.stringify({ name: 'matrixkoder', version: '9.8.7' })
+  const isManifest = (k: string | symbol): boolean => typeof k === 'string' && k.endsWith('/.claude-plugin/plugin.json')
+  mockFs(on, new Proxy(worldFiles(), {
+    has: (f, k) => isManifest(k) || k in f,
+    get: (f, k) => (isManifest(k) ? manifest : f[k as string]),
+  }))
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(36) })
+  await ui.press({ key: 'dash-tab-overview' })
+  expect(await ui.find({ text: 'MATRIXKODER' }), 'brand wordmark').toBeTruthy()
+  expect(await ui.find({ text: / v9\.8\.7 / }), 'version chip from plugin.json').toBeTruthy()
+  expect(await ui.find({ text: 'Checkout v2' }), 'run block under the brand').toBeTruthy()
+  await ui.press({ key: 'dash-tab-settings' })
+  expect(await ui.find({ text: 'MATRIXKODER' }), 'same brand header on Settings').toBeTruthy()
+  expect(await ui.find({ text: 'Checkout v2' }), 'no run block on Settings').toBeUndefined()
 })
 
 test('F0: every tab Button carries its keyboard hotkey — o l p u e w 0, at 36 and 46 cols', { plugins: [worldFixtures] }, async ($, on) => {

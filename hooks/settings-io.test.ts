@@ -9,6 +9,9 @@ import {
   tabsVisibilityToHidden, topChangelogEntry,
 } from './settings-io'
 import type { ConfigRowLite, RunFn, YamlFieldIn } from './settings-io'
+import { SETTINGS_FIXTURE } from './tabs/settings.fixture'
+import { SETTINGS_SCHEMA } from './tabs/settings.schema'
+import type { SettingsField } from './tabs/settings'
 
 type Answer = { exitCode: number; stdout: string; stderr: string }
 
@@ -287,4 +290,82 @@ test('S3 save: the stored view folds the saved values back, so saved rows read c
   })
   expect(kept.groups.flatMap(g => g.rows).find(r => r.key === 'session.stall_min')?.value).toBe(25)
   expect(kept.groups.flatMap(g => g.rows).find(r => r.key === 'session.max_wait_min')?.value).toBe(120)
+})
+
+// ---------- drift tests: schema and plugin.json userConfig ----------
+//
+// The bundled test runner runs in a sealed JS sandbox (no `process`, `Bun`,
+// `require` or `fs`); it cannot run `python3 scripts/mk-config.py list` or
+// read `.claude-plugin/plugin.json` from a test body. Instead, the
+// committed `hooks/tabs/settings.schema.ts` is the reduced shape generated
+// by `scripts/settings-drift.py --write` (a fresh data dir + a minimal
+// agents block, the real `.claude-plugin/plugin.json`). Re-run
+// `scripts/settings-drift.py --write` after editing either source, and
+// `scripts/settings-drift.py --check` (or the script's --self-test) is the
+// process-side guard that catches drift between the committed file and the
+// live sources.
+
+const SCHEMA = SETTINGS_SCHEMA.schema
+const USER_CONFIG = SETTINGS_SCHEMA.userConfig
+
+const YAML_SCOPES = new Set<SettingsField['scope']>(['project', 'routing', 'agents', 'child'])
+
+/** Every yaml row the fixture draws (mutable, value-bearing, no models /
+ *  tabs.* / about helpers — those scopes carry their own checks). */
+function fixtureYamlRows(): SettingsField[] {
+  return SETTINGS_FIXTURE.groups
+    .filter(g => YAML_SCOPES.has(g.scope))
+    .flatMap(g => g.rows)
+    .filter(r => r.editable)
+}
+
+type SchemaRow = (typeof SETTINGS_SCHEMA)['schema'][number]
+
+test('drift: editable YAML rows in SETTINGS_FIXTURE match the generated schema (both directions)', () => {
+  const schemaMap = new Map<string, SchemaRow>(SCHEMA.map(f => [f.key as string, f]))
+  const fixtureRows = fixtureYamlRows()
+  expect(fixtureRows.length).toBeGreaterThan(0)
+
+  // 1. fixture -> schema: every editable fixture row has a schema row,
+  // and an editable schema row's default matches the fixture's
+  for (const row of fixtureRows) {
+    const schemaRow = schemaMap.get(row.key)
+    expect(schemaRow, `key ${row.key} must exist in the generated schema`).toBeDefined()
+    if (schemaRow && schemaRow.editable) {
+      expect(row.default, `default for ${row.key} must match schema default`).toEqual(schemaRow.default)
+    }
+  }
+
+  // 2. schema -> fixture: every editable schema row in a yaml scope has
+  // a fixture row (a new editable schema row with no fixture row escapes
+  // the tab and stays invisible — catch it here)
+  const fixtureKeys = new Set(fixtureRows.map(r => r.key))
+  for (const f of SCHEMA) {
+    if (!f.editable) continue
+    if (!YAML_SCOPES.has(f.scope as SettingsField['scope'])) continue
+    expect(fixtureKeys.has(f.key as string), `schema key ${f.key} has no editable fixture row`).toBe(true)
+  }
+})
+
+test('drift: global rows in SETTINGS_FIXTURE exactly match plugin.json userConfig keys', () => {
+  // A userConfig key draws one fixture row in scope 'mode' / 'tabs' / 'about';
+  // a fixture row in those scopes whose key is also a userConfig key draws
+  // the userConfig default. The set is exact — a renamed key or a missing
+  // row trips this test (the old `r.key in userConfig` filter skipped both).
+  const globalScopes = new Set<SettingsField['scope']>(['mode', 'tabs', 'about'])
+  const fixtureGlobalRows = SETTINGS_FIXTURE.groups
+    .filter(g => globalScopes.has(g.scope))
+    .flatMap(g => g.rows)
+    .filter(r => r.key in USER_CONFIG)
+  const fixtureGlobalKeys = new Set(fixtureGlobalRows.map(r => r.key))
+  const userConfigKeys = new Set(Object.keys(USER_CONFIG))
+
+  expect(fixtureGlobalRows.length).toBeGreaterThan(0)
+  // exact set match: every userConfig key is drawn, no extra userConfig
+  // keys are drawn, no fixture row is silently skipped
+  expect(fixtureGlobalKeys).toEqual(userConfigKeys)
+  for (const row of fixtureGlobalRows) {
+    const expected = USER_CONFIG[row.key as keyof typeof USER_CONFIG]
+    expect(row.default, `default for ${row.key} must match plugin.json userConfig default`).toEqual(expected)
+  }
 })

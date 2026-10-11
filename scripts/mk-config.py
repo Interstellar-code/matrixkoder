@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""MatrixKoder config — one schema, one writer: list, get, set, migrate. Python 3 stdlib only.
+"""MatrixKoder config — one schema, one writer: list, get, set, migrate, context, probe. Python 3 stdlib only.
 
   list --json
   get KEY [--set KEY=VALUE]   (--set: the caller's own value, so a draft can be read back)
   set KEY VALUE               VALUE is JSON: 12, true, "main", ["a","b"]
   migrate
+  context [--usage PATH]
+  probe
   --self-test
 
 Common: --data DIR, resolved exactly as mk-state.py does (--data > $MATRIXKODER_DATA >
@@ -29,7 +31,7 @@ retry, a wrong write costs them a hand-edited config.
 The yaml parser (scalar, split_flow, strip_comment, flow_map, KEY_RE) lives here and mk-lane.py
 loads it from this file: one parser for both tools, so a value can never mean two things.
 """
-import contextlib, difflib, importlib.util, json, os, re, shutil, subprocess, sys, tempfile
+import contextlib, datetime, difflib, importlib.util, json, os, re, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True  # no stray __pycache__ next to the scripts
@@ -211,6 +213,13 @@ DEAD = (("dashboard", "auto_open", "autoOpen", True),
 # The schema rows this tool writes as a whole block when the section is missing entirely.
 SESSION_SECTION, PICKS_SECTION = "session", "picks"
 AGENT_NAMES = {"opencode": "OpenCode", "claude": "Claude Code", "codex": "Codex", "agy": "AGY"}
+HELPERS = [
+    ("herdr", "Pane and worktree manager."),
+    ("jev", "Judgement gates for routing."),
+    ("context_mode", "Context compression for big outputs."),
+    ("codebase_memory", "Serena-style project memory."),
+    ("canary", "Browser QA recordings."),
+]
 
 
 # ---------- structure: where each line is ----------
@@ -284,6 +293,9 @@ def rows(lines):
             out.append(_row(f"picks.{name}", "models", "list", [], [PICKS_SECTION], name, None,
                             f"{name} model picks", "this agent's models in preference order",
                             maxlen=4, pool=list(m.get("models") or [])))
+    for hid, hhelp in HELPERS:
+        out.append(_row(f"helpers.{hid}", "about", "seg", "not probed", ["helpers"], "helpers", hid,
+                        hid, hhelp, editable=False, why="Read-only: probed at preflight"))
     return out
 
 
@@ -332,6 +344,22 @@ def coerce(type, raw, default):
 
 def value_of(lines, r):
     """-> (found, value): the yaml's value for a schema row, else the schema default."""
+    if r["key"].startswith("helpers."):
+        kl = key_lines(lines)
+        hits = [i for (i, indent, k, _r) in kl if indent == 0 and k == "helpers"]
+        if len(hits) != 1:
+            return False, r["default"]
+        rest = KEY_RE.match(lines[hits[0]]).group(3)
+        m = flow_map(rest)
+        if r["member"] in m:
+            return True, coerce(r["type"], m[r["member"]], r["default"])
+        sr = section_range(lines, kl, ["helpers"])
+        if sr:
+            ch_hits = [i for (i, indent, k, _r) in kl if sr[2] <= i < sr[3] and k == r["member"]]
+            if len(ch_hits) == 1:
+                ch_rest = KEY_RE.match(lines[ch_hits[0]]).group(3)
+                return True, coerce(r["type"], ch_rest, r["default"])
+        return False, r["default"]
     kl, sr = key_lines(lines), section_range(lines, key_lines(lines), r["sec"])
     if not sr:
         return False, r["default"]
@@ -522,8 +550,48 @@ def changed_lines(old, new):
     return n
 
 
+def is_block_scalar(raw):
+    """True when a key line's inline value is a YAML block-scalar indicator (`|`, `>`, with
+    optional chomping/indent modifiers and optional comment) — its deeper-indented lines are the
+    scalar's text, not orphans."""
+    return bool(re.match(r"^\s*[|>](?:[+-]?[0-9]?|[0-9]?[+-]?)?\s*(?:#.*)?$", raw))
+
+
+def check_structure(reread):
+    """Refuse corrupt yaml: no duplicate top-level sections, and no orphan child lines
+    (no line indented deeper than a preceding key line that has an inline scalar/flow-map value;
+    block-scalar values own their deeper-indented lines)."""
+    seen_top = set()
+    prev_key = None
+    for i, raw in enumerate(reread):
+        line = strip_comment(raw).rstrip()
+        if not line.strip():
+            continue
+        m = KEY_RE.match(raw)
+        if m:
+            indent = len(m.group(1))
+            k = m.group(2)
+            rest = m.group(3)
+            if indent == 0:
+                if k in seen_top:
+                    raise Fail(f"corrupt yaml: duplicate top-level section `{k}` (line {i + 1})")
+                seen_top.add(k)
+            if prev_key is not None:
+                prev_i, prev_indent, prev_k, prev_rest = prev_key
+                if strip_comment(prev_rest).strip() and not is_block_scalar(prev_rest) and indent > prev_indent:
+                    raise Fail(f"corrupt yaml: orphan child line {i + 1} `{k}:` indented deeper than inline `{prev_k}:` (line {prev_i + 1})")
+            prev_key = (i, indent, k, rest)
+        else:
+            indent = len(raw) - len(raw.lstrip())
+            if prev_key is not None:
+                prev_i, prev_indent, prev_k, prev_rest = prev_key
+                if strip_comment(prev_rest).strip() and not is_block_scalar(prev_rest) and indent > prev_indent:
+                    raise Fail(f"corrupt yaml: orphan child line {i + 1} indented deeper than inline `{prev_k}:` (line {prev_i + 1})")
+
+
 def verify(old, new, count, checks):
     reread = "".join(new).splitlines(keepends=True)
+    check_structure(reread)
     if changed_lines(old, new) != count:
         raise Fail(f"the patch would change {changed_lines(old, new)} lines, not the {count} it named")
     for key, value, r in checks:
@@ -657,6 +725,9 @@ def cmd_set(path, lines, args):
     r = row_for(lines, key)
     if not r:
         raise Fail(f"unknown key: {key}")
+    # agents.*.available is editable=False in rows() for Settings UI, but allowed in set CLI for bootstrap / drift detection
+    if not r.get("editable", True) and not r["key"].startswith("agents."):
+        raise Fail(f"{key} is read-only: {r.get('why', 'not editable')}")
     value = parse_value(raw, r)
     found, current = value_of(lines, r)
     if found and current == value:  # a save sends every row it holds, most of them unchanged
@@ -726,6 +797,267 @@ def dead_notes(lines):
     return out_lines
 
 
+def load_usage(usage_path_arg):
+    path = usage_path_arg
+    if not path:
+        home = os.environ.get("MATRIXKODER_HOME")
+        if home:
+            path = os.path.join(home, "usage.json")
+        else:
+            path = os.path.expanduser("~/.matrixkoder/usage.json")
+    path = os.path.expanduser(path)
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def extract_left(val):
+    if val is None:
+        return None
+    num = None
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        num = val
+    elif isinstance(val, dict):
+        if "used_pct" in val and isinstance(val["used_pct"], (int, float)) and not isinstance(val["used_pct"], bool):
+            num = 100 - val["used_pct"]
+        elif "left_pct" in val and isinstance(val["left_pct"], (int, float)) and not isinstance(val["left_pct"], bool):
+            num = val["left_pct"]
+        elif "left" in val and isinstance(val["left"], (int, float)) and not isinstance(val["left"], bool):
+            num = val["left"]
+    if num is None:
+        return None
+    rounded = round(float(num), 1)
+    return int(rounded) if rounded.is_integer() else rounded
+
+
+def is_future_iso(ts):
+    if not isinstance(ts, str):
+        return False
+    try:
+        s = ts.strip().replace("Z", "+00:00")
+        dt = datetime.datetime.fromisoformat(s)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt > now
+    except Exception:  # an unparseable timestamp is not a reset window
+        return False
+
+
+def cmd_context(path, lines, usage_arg=None):
+    schema_rows = {r["key"]: r for r in rows(lines)}  # row_for scans the schema per call; resolve once
+
+    def val(key):
+        r = schema_rows.get(key)
+        if not r:
+            raise Fail(f"unknown schema row: {key}")
+        return value_of(lines, r)[1]
+
+    builder_skip_permissions = val("autonomy_contract.builder_skip_permissions")
+    if builder_skip_permissions:
+        launch_flags = {
+            "claude": ["--dangerously-skip-permissions"],
+            "codex": ["--dangerously-bypass-approvals-and-sandbox"],
+            "opencode": [],
+            "agy": [],
+        }
+    else:
+        launch_flags = {
+            "claude": [],
+            "codex": [],
+            "opencode": [],
+            "agy": [],
+        }
+
+    usage_data = load_usage(usage_arg)
+    usage_agents = usage_data.get("agents") if isinstance(usage_data.get("agents"), dict) else {}
+
+    claude_five_floor = val("routing_preferences.reserve_floor.claude.five_hour_left_pct")
+    claude_week_floor = val("routing_preferences.reserve_floor.claude.weekly_left_pct")
+    others_five_floor = val("routing_preferences.reserve_floor.others.five_hour_left_pct")
+    others_week_floor = val("routing_preferences.reserve_floor.others.weekly_left_pct")
+
+    agents_map = {}
+    for name, m in agents(lines):
+        r_avail = row_for(lines, f"agents.{name}.available")
+        avail = value_of(lines, r_avail)[1] if r_avail else bool(m.get("available", False))
+
+        r_picks = row_for(lines, f"picks.{name}")
+        picks = value_of(lines, r_picks)[1] if r_picks else []
+
+        if name == "claude":
+            floor = {"five_hour_left_pct": claude_five_floor, "weekly_left_pct": claude_week_floor}
+        else:
+            floor = {"five_hour_left_pct": others_five_floor, "weekly_left_pct": others_week_floor}
+
+        u_agent = usage_agents.get(name) if isinstance(usage_agents.get(name), dict) else {}
+        five_hour_left = extract_left(u_agent.get("five_hour"))
+        weekly_left = extract_left(u_agent.get("weekly"))
+        left = {"five_hour": five_hour_left, "weekly": weekly_left}
+
+        if five_hour_left is None and weekly_left is None:
+            below_floor = None
+        else:
+            below = False
+            if five_hour_left is not None and five_hour_left < floor["five_hour_left_pct"]:
+                below = True
+            if weekly_left is not None and weekly_left < floor["weekly_left_pct"]:
+                below = True
+            below_floor = below
+
+        if is_future_iso(u_agent.get("exhausted_until")):
+            below_floor = True
+
+        agents_map[name] = {
+            "available": avail,
+            "picks": picks,
+            "floor": floor,
+            "left": left,
+            "below_floor": below_floor,
+        }
+
+    return out({
+        "ok": True,
+        "policy": val("routing_preferences.policy"),
+        "builder_order": val("routing_preferences.builder_order"),
+        "max_build_lanes": val("routing_preferences.max_build_lanes"),
+        "reviewer": val("routing_preferences.reviewer"),
+        "visual_reviewer": val("routing_preferences.visual_reviewer"),
+        "subagent_model": val("session.subagent_model"),
+        "fresh_session": val("session.fresh_session"),
+        "reviewer_split": val("session.reviewer_split"),
+        "reuse_reviewer": val("session.reuse_reviewer"),
+        "integration_branch": val("repo.integration_branch"),
+        "integration_target": val("qa.integration_target"),
+        "builder_skip_permissions": builder_skip_permissions,
+        "usage_source": val("usage.source"),
+        "providers": val("usage.providers"),
+        "launch_flags": launch_flags,
+        "agents": agents_map,
+    })
+
+
+PROBE_TIMEOUT_S = 30  # every probe gets this long; a health check that needs longer is stale, not missing
+
+
+def probe_herdr():
+    try:
+        p = subprocess.run(["herdr", "agent", "list"], capture_output=True, text=True,
+                           timeout=PROBE_TIMEOUT_S)
+        return "ok" if p.returncode == 0 else "stale"
+    except FileNotFoundError:
+        return "missing"
+    except Exception:  # a timeout or a crash: installed but unverified
+        return "stale"
+
+
+def probe_claude_mcps():
+    """The three MCP helpers from `claude mcp list`. `missing` only when the binary is absent or the
+    line is absent from a successful listing; a timeout or a non-zero exit leaves them unverified,
+    which is `stale`, not `missing`."""
+    stale = {"jev": "stale", "context_mode": "stale", "codebase_memory": "stale"}
+    try:
+        p = subprocess.run(["claude", "mcp", "list"], capture_output=True, text=True,
+                           timeout=PROBE_TIMEOUT_S)
+    except FileNotFoundError:
+        return {"jev": "missing", "context_mode": "missing", "codebase_memory": "missing"}
+    except Exception:
+        return stale
+    if p.returncode != 0:
+        return stale
+
+    stdout = p.stdout or ""
+    lines = stdout.splitlines()
+
+    def check(pattern):
+        matching = [l for l in lines if pattern in l.lower()]
+        if not matching:
+            return "missing"
+        if any("connected" in l.lower() for l in matching):
+            return "ok"
+        return "stale"
+
+    return {
+        "jev": check("jev"),
+        "context_mode": check("context-mode"),
+        "codebase_memory": check("codebase-memory"),
+    }
+
+
+def probe_canary():
+    try:
+        p = subprocess.run(["npx", "--no-install", "@usecanary/cli", "--version"],
+                           capture_output=True, text=True, timeout=PROBE_TIMEOUT_S)
+        return "ok" if p.returncode == 0 else "missing"  # spec: a failing npx means no canary
+    except FileNotFoundError:
+        return "missing"
+    except Exception:  # a timeout is installed-but-unverified here too: stale, not missing
+        return "stale"
+
+
+def cmd_probe(path, lines):
+    herdr_status = probe_herdr()
+    mcp_statuses = probe_claude_mcps()
+    canary_status = probe_canary()
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+    res = {
+        "ok": True,
+        "herdr": herdr_status,
+        "jev": mcp_statuses["jev"],
+        "context_mode": mcp_statuses["context_mode"],
+        "codebase_memory": mcp_statuses["codebase_memory"],
+        "canary": canary_status,
+        "probed_at": now_iso,
+    }
+
+    helpers_line = (f"helpers: {{ herdr: {res['herdr']}, jev: {res['jev']}, "
+                    f"context_mode: {res['context_mode']}, codebase_memory: {res['codebase_memory']}, "
+                    f"canary: {res['canary']}, probed_at: {json.dumps(res['probed_at'])} }}")
+
+    kl = key_lines(lines)
+    hits = [i for (i, indent, k, _r) in kl if indent == 0 and k == "helpers"]
+    if len(hits) > 1:
+        raise Fail(f"helpers: appears {len(hits)} times (lines {', '.join(str(i + 1) for i in hits)}); refusing")
+
+    if len(hits) == 1:
+        i = hits[0]
+        eol = ending_of(lines[i])
+        new = list(lines)
+        rest = KEY_RE.match(lines[i]).group(3)
+        if not strip_comment(rest).strip():
+            # a block-style `helpers:` section is replaced whole: its indented children would be
+            # orphaned under the new flow-map line and corrupt the file
+            sr = section_range(lines, kl, ["helpers"])
+            end = sr[3]
+            while end > sr[2]:
+                body = strip_comment(lines[end - 1]).strip()
+                if body:
+                    break
+                end -= 1
+            new[i:end] = [helpers_line + eol]
+        else:
+            new[i] = helpers_line + eol
+    else:
+        eol = file_ending(lines)
+        new = list(lines)
+        line_to_add = helpers_line + eol
+        if new and not new[-1].endswith("\n"):
+            line_to_add = eol + line_to_add
+        new.append(line_to_add)
+
+    count = changed_lines(lines, new)
+    checks = [(f"helpers.{hid}", res[hid], row_for(new, f"helpers.{hid}"))
+              for hid, _help in HELPERS]
+    write_yaml(path, lines, new, count, checks)
+    return out(res)
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if "--self-test" in argv:
@@ -736,6 +1068,12 @@ def main(argv=None):
         if i + 1 >= len(argv):
             return out({"ok": False, "error": "--data needs a directory"}, 2)
         data_arg, argv = argv[i + 1], argv[:i] + argv[i + 2:]
+    usage_arg = None
+    if "--usage" in argv:
+        i = argv.index("--usage")
+        if i + 1 >= len(argv):
+            return out({"ok": False, "error": "--usage needs a path"}, 2)
+        usage_arg, argv = argv[i + 1], argv[:i] + argv[i + 2:]
     try:
         data = mk_state.resolve_data(data_arg)
         path = os.path.join(data, "matrixkoder.yaml")
@@ -751,8 +1089,12 @@ def main(argv=None):
             return cmd_set(path, lines, args)
         if cmd == "migrate":
             return cmd_migrate(path, lines)
+        if cmd == "context":
+            return cmd_context(path, lines, usage_arg)
+        if cmd == "probe":
+            return cmd_probe(path, lines)
         raise Fail("usage: mk-config.py [--data DIR] list --json | get KEY [--set KEY=VALUE] | "
-                   "set KEY VALUE | migrate | --self-test")
+                   "set KEY VALUE | migrate | context [--usage PATH] | probe | --self-test")
     except mk_state.Fail as e:  # data dir resolution failed
         return out({"ok": False, "error": str(e)}, e.code)
     except Fail as e:
@@ -1008,6 +1350,275 @@ def self_test():
             if not line.strip() or line.lstrip().startswith("#"):
                 continue
             assert re.match(r"^\s*[A-Za-z0-9_.-]+:( |$)", line), f"not a yaml key line: {line!r}"
+
+        # 20. context subcommand
+        with open(yaml_path, "w") as f:
+            f.write(fixture)
+        ctx = run("context")
+        assert ctx["ok"] is True
+        assert ctx["policy"] == "claude-sparing"
+        assert ctx["builder_skip_permissions"] is True
+        assert ctx["launch_flags"]["claude"] == ["--dangerously-skip-permissions"]
+        assert ctx["launch_flags"]["codex"] == ["--dangerously-bypass-approvals-and-sandbox"]
+        assert ctx["launch_flags"]["opencode"] == []
+        assert ctx["launch_flags"]["agy"] == []
+        assert ctx["agents"]["opencode"]["available"] is True
+        assert ctx["agents"]["codex"]["available"] is False
+        assert ctx["agents"]["opencode"]["picks"] == []
+        # absent yaml key returns schema default
+        assert ctx["subagent_model"] == ""
+        assert ctx["fresh_session"] == "new"
+        assert ctx["reviewer_split"] == "right"
+        assert ctx["reuse_reviewer"] is True
+
+        # picks populated per agent
+        run("set", "picks.opencode", '["opencode/big-pickle"]')
+        ctx2 = run("context")
+        assert ctx2["agents"]["opencode"]["picks"] == ["opencode/big-pickle"]
+
+        # launch_flags with skip false
+        run("set", "autonomy_contract.builder_skip_permissions", "false")
+        ctx3 = run("context")
+        assert ctx3["builder_skip_permissions"] is False
+        assert ctx3["launch_flags"] == {"claude": [], "codex": [], "opencode": [], "agy": []}
+        run("set", "autonomy_contract.builder_skip_permissions", "true")
+
+        # below_floor true / false / null for claude and for one non-Claude agent (opencode)
+        usage_fake_path = os.path.join(tmp, "fake_usage.json")
+        # null when no usage numbers exist (both five_hour and weekly are None)
+        with open(usage_fake_path, "w") as f:
+            json.dump({"agents": {
+                "claude": {"five_hour": None, "weekly": None},
+                "opencode": {},
+            }}, f)
+        ctx_null = run("context", "--usage", usage_fake_path)
+        assert ctx_null["agents"]["claude"]["below_floor"] is None
+        assert ctx_null["agents"]["claude"]["left"] == {"five_hour": None, "weekly": None}
+        assert ctx_null["agents"]["opencode"]["below_floor"] is None
+        assert ctx_null["agents"]["opencode"]["left"] == {"five_hour": None, "weekly": None}
+
+        # false when left >= floor
+        # claude floor: 5h=40, week=30. opencode floor: 5h=10, week=15.
+        with open(usage_fake_path, "w") as f:
+            json.dump({"agents": {
+                "claude": {"five_hour": {"used_pct": 20}, "weekly": {"used_pct": 50}},  # 5h left=80, week left=50
+                "opencode": {"five_hour": {"used_pct": 50}, "weekly": 70},  # 5h left=50, week left=70
+            }}, f)
+        ctx_false = run("context", "--usage", usage_fake_path)
+        assert ctx_false["agents"]["claude"]["below_floor"] is False
+        assert ctx_false["agents"]["claude"]["left"] == {"five_hour": 80, "weekly": 50}
+        assert ctx_false["agents"]["opencode"]["below_floor"] is False
+        assert ctx_false["agents"]["opencode"]["left"] == {"five_hour": 50, "weekly": 70}
+
+        # true when any existing window left < floor
+        with open(usage_fake_path, "w") as f:
+            json.dump({"agents": {
+                "claude": {"five_hour": {"used_pct": 75}},  # 5h left=25 < 40
+                "opencode": {"weekly": {"used_pct": 90}},  # week left=10 < 15
+            }}, f)
+        ctx_true = run("context", "--usage", usage_fake_path)
+        assert ctx_true["agents"]["claude"]["below_floor"] is True
+        assert ctx_true["agents"]["claude"]["left"] == {"five_hour": 25, "weekly": None}
+        assert ctx_true["agents"]["opencode"]["below_floor"] is True
+        assert ctx_true["agents"]["opencode"]["left"] == {"five_hour": None, "weekly": 10}
+
+        # 20b. below_floor is also true while an exhausted_until reset window is still running,
+        #      and false again once it is in the past (review r1 LOW: below_floor is not only %)
+        future = (datetime.datetime.now(datetime.timezone.utc)
+                  + datetime.timedelta(hours=1)).isoformat()
+        past = (datetime.datetime.now(datetime.timezone.utc)
+                - datetime.timedelta(hours=1)).isoformat()
+        with open(usage_fake_path, "w") as f:
+            json.dump({"agents": {
+                "claude": {"five_hour": {"used_pct": 10}, "exhausted_until": future},  # 5h left=90
+                "opencode": {"weekly": {"used_pct": 10}, "exhausted_until": past},  # week left=90
+            }}, f)
+        ctx_exh = run("context", "--usage", usage_fake_path)
+        assert ctx_exh["agents"]["claude"]["below_floor"] is True, ctx_exh["agents"]["claude"]
+        assert ctx_exh["agents"]["claude"]["left"] == {"five_hour": 90, "weekly": None}
+        assert ctx_exh["agents"]["opencode"]["below_floor"] is False, ctx_exh["agents"]["opencode"]
+
+        # 21. probe subcommand & helpers rows
+        # (a) list emits all five helpers.* rows (not probed when absent)
+        with open(yaml_path, "w") as f:
+            f.write(fixture)
+        list_fields = run("list", "--json")["fields"]
+        helper_fields = {f["key"]: f for f in list_fields if f["key"].startswith("helpers.")}
+        assert set(helper_fields.keys()) == {
+            "helpers.herdr", "helpers.jev", "helpers.context_mode", "helpers.codebase_memory", "helpers.canary"
+        }
+        for hkey, hf in helper_fields.items():
+            assert hf["value"] == "not probed", hf
+            assert hf["default"] == "not probed", hf
+            assert hf["editable"] is False, hf
+            assert hf["scope"] == "about", hf
+            assert hf["why"] == "Read-only: probed at preflight", hf
+
+        # (b) set helpers.jev ok is refused
+        run("set", "helpers.jev", '"ok"', ok=False)
+
+        # (c) fake herdr, claude, npx scripts on temp PATH giving ok, failing and absent results
+        fake_bin = os.path.join(tmp, "bin")
+        os.makedirs(fake_bin, exist_ok=True)
+        orig_path = env.get("PATH", "")
+        env["PATH"] = f"{fake_bin}:/usr/bin:/bin"
+
+        def make_bin(name, content):
+            p = os.path.join(fake_bin, name)
+            with open(p, "w") as bf:
+                bf.write(content)
+            os.chmod(p, 0o755)
+
+        def rm_bin(name):
+            p = os.path.join(fake_bin, name)
+            if os.path.exists(p):
+                os.unlink(p)
+
+        make_bin("herdr", "#!/bin/sh\nexit 0\n")
+        make_bin("claude", "#!/bin/sh\necho 'jev: connected'\necho 'plugin:context-mode: connected'\necho 'codebase-memory: error'\nexit 0\n")
+        make_bin("npx", "#!/bin/sh\nexit 0\n")
+
+        p_res1 = run("probe")
+        assert p_res1["ok"] is True
+        assert p_res1["herdr"] == "ok"
+        assert p_res1["jev"] == "ok"
+        assert p_res1["context_mode"] == "ok"
+        assert p_res1["codebase_memory"] == "stale"
+        assert p_res1["canary"] == "ok"
+        assert "probed_at" in p_res1
+
+        # Check values in yaml
+        yaml_text1 = rd()
+        assert f"helpers: {{ herdr: ok, jev: ok, context_mode: ok, codebase_memory: stale, canary: ok, probed_at: \"{p_res1['probed_at']}\" }}" in yaml_text1.splitlines()
+
+        # (d) probe twice gives identical bytes except probed_at
+        time.sleep(0.01)
+        p_res2 = run("probe")
+        yaml_text2 = rd()
+        assert p_res1["probed_at"] != p_res2["probed_at"]
+        re_probe = re.compile(r'probed_at: "[^"]*"')
+        assert re_probe.sub("probed_at: XXX", yaml_text1) == re_probe.sub("probed_at: XXX", yaml_text2)
+
+        # (e) failing and absent results
+        make_bin("herdr", "#!/bin/sh\nexit 1\n")
+        rm_bin("claude")
+        make_bin("npx", "#!/bin/sh\nexit 1\n")
+
+        p_res3 = run("probe")
+        assert p_res3["herdr"] == "stale"
+        assert p_res3["jev"] == "missing"  # claude absent: the MCP helpers are missing
+        assert p_res3["context_mode"] == "missing"
+        assert p_res3["codebase_memory"] == "missing"
+        assert p_res3["canary"] == "missing"
+
+        for hid in ("jev", "context_mode", "codebase_memory", "canary"):
+            assert run("get", f"helpers.{hid}")["value"] == "missing"
+        assert run("get", "helpers.herdr")["value"] == "stale"
+
+        # (f) review r1 HIGH: a block-style helpers section is replaced whole — its indented
+        # children must not survive as orphans under the new flow-map line
+        block_style = fixture.rstrip("\n") + "\nhelpers:\n  herdr: ok\n  jev: ok\n" \
+            "  context_mode: ok\n  codebase_memory: ok\n  canary: ok\n" \
+            '  probed_at: "2000-01-01T00:00:00Z"\n'
+        with open(yaml_path, "w") as f:
+            f.write(block_style)
+        make_bin("herdr", "#!/bin/sh\nexit 0\n")
+        make_bin("claude", "#!/bin/sh\necho 'jev: connected'\nexit 0\n")
+        make_bin("npx", "#!/bin/sh\nexit 0\n")
+        p_res4 = run("probe")
+        assert p_res4["ok"] is True and p_res4["herdr"] == "ok" and p_res4["canary"] == "ok"
+        after_block = rd()
+        assert "helpers:\n" not in after_block, f"block header survived:\n{after_block}"
+        assert "  herdr: ok\n" not in after_block, f"orphan child survived:\n{after_block}"
+        flow_hits = [l for l in after_block.splitlines() if l.startswith("helpers: {")]
+        assert len(flow_hits) == 1, after_block
+        # every row reads back to what was probed, from the flow line
+        for hid in ("herdr", "jev", "context_mode", "codebase_memory", "canary"):
+            assert run("get", f"helpers.{hid}")["value"] == p_res4[hid]
+        # idempotent on the flow line: probe again -> one flow line, same rows
+        p_res5 = run("probe")
+        after_block2 = rd()
+        re_probe2 = re.compile(r'probed_at: "[^"]*"')
+        assert re_probe2.sub("probed_at: X", after_block2) \
+            == re_probe2.sub("probed_at: X", after_block)
+        # and the file above and below the helpers line did not move
+        assert after_block.splitlines()[:fixture.rstrip("\n").count("\n") + 1] \
+            == block_style.splitlines()[:fixture.rstrip("\n").count("\n") + 1]
+
+        # (g) verify refuses a corrupt result: a patch that would orphan an indented child under
+        # an inline flow-map line fails and writes nothing
+        corrupt = fixture.replace("session:\n", "session:\n  stall_min: 15\nsessionx: { a: 1 }\n"
+                                        "  orphan: 2\n")
+        with open(yaml_path, "w") as f:
+            f.write(corrupt)
+        r = run("set", "session.stall_min", "20", ok=False)
+        assert "corrupt yaml" in r["error"] and "orphan" in r["error"], r
+        assert rd() == corrupt, "a corrupt-shaped result was written"
+        assert not os.path.exists(yaml_path + ".bak") or open(yaml_path + ".bak").read() != corrupt
+
+        # (h) review r1 MEDIUM: a claude that fails or times out leaves the MCP helpers stale
+        # (installed but unverified), never missing; a successful listing without a server's line
+        # is missing
+        with open(yaml_path, "w") as f:
+            f.write(fixture)
+        make_bin("claude", "#!/bin/sh\nexit 1\n")
+        p_res6 = run("probe")
+        assert p_res6["jev"] == "stale" and p_res6["context_mode"] == "stale" \
+            and p_res6["codebase_memory"] == "stale", p_res6
+        make_bin("claude", "#!/bin/sh\nsleep 45\n")  # longer than the 30 s probe timeout
+        t0 = time.time()
+        p_res7 = run("probe")
+        assert time.time() - t0 < 45, "the 30 s probe timeout did not fire"
+        assert p_res7["jev"] == "stale" and p_res7["canary"] in ("ok", "stale"), p_res7
+        make_bin("claude", "#!/bin/sh\necho 'something-else: connected'\nexit 0\n")
+        p_res8 = run("probe")
+        assert p_res8["jev"] == "missing" and p_res8["context_mode"] == "missing" \
+            and p_res8["codebase_memory"] == "missing", p_res8
+        # canary: failing npx is missing (spec), a timing-out npx is stale
+        make_bin("npx", "#!/bin/sh\nexit 1\n")
+        p_res9 = run("probe")
+        assert p_res9["canary"] == "missing", p_res9
+        make_bin("npx", "#!/bin/sh\nsleep 45\n")
+        p_res10 = run("probe")
+        assert p_res10["canary"] == "stale", p_res10
+        # (i) review r2 HIGH: a key whose inline value is a block-scalar indicator owns its
+        # deeper-indented lines — set and probe succeed and the block text is byte-identical;
+        # a `- item` list under a mapping key stays accepted (the orphan refusal is pinned by (g))
+        block_scalar = ("session:\n  stall_min: 15\nnote: |\n  folded text\n"
+                        "picks:\n  opencode:\n    - alpha\n    - beta\n"
+                        "repo:\n  integration_branch: main\n")
+        with open(yaml_path, "w") as f:
+            f.write(block_scalar)
+        run("set", "session.stall_min", "20")
+        after_bs = rd()
+        assert "note: |\n  folded text\n" in after_bs, after_bs
+        assert "    - alpha\n    - beta\n" in after_bs, after_bs
+        assert after_bs.count("  stall_min: 20\n") == 1, after_bs
+        make_bin("herdr", "#!/bin/sh\nexit 0\n")
+        make_bin("claude", "#!/bin/sh\necho 'jev: connected'\nexit 0\n")
+        make_bin("npx", "#!/bin/sh\nexit 0\n")
+        p_bs = run("probe")
+        assert p_bs["ok"] is True and p_bs["herdr"] == "ok", p_bs
+        after_bs2 = rd()
+        assert "note: |\n  folded text\n" in after_bs2, after_bs2
+        assert "    - alpha\n    - beta\n" in after_bs2, after_bs2
+        assert after_bs2.count("  stall_min: 20\n") == 1, after_bs2
+
+        # (j) review r2 MEDIUM: probe's block-style branch keeps trailing blank and comment
+        # lines after the helpers section byte-identical
+        trailing = ("helpers:\n  herdr: ok\n  jev: ok\n\n# keep\n"
+                    "repo:\n  integration_branch: main\n")
+        with open(yaml_path, "w") as f:
+            f.write(trailing)
+        p_tr = run("probe")
+        assert p_tr["ok"] is True, p_tr
+        after_tr = rd()
+        flow_tr = [l for l in after_tr.splitlines() if l.startswith("helpers: {")]
+        assert len(flow_tr) == 1, after_tr
+        assert "  herdr: ok\n" not in after_tr, f"old child survived:\n{after_tr}"
+        assert "\n# keep\n" in after_tr, f"trailing comment lost:\n{after_tr}"
+        assert after_tr.endswith("repo:\n  integration_branch: main\n"), after_tr
+        assert after_tr.index("\n# keep\n") < after_tr.index("repo:"), after_tr
     finally:
         restore()
         shutil.rmtree(tmp, ignore_errors=True)
