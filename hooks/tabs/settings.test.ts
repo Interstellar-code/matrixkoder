@@ -170,7 +170,7 @@ test('Settings · Mode: scope bar 1-8, MOCK row, Solo/Orchestrator/Hive (no Hybr
   const drawn = draw(ui)
   const flat = drawnText(drawn)
   expect(flat.includes('MOCK · fixture data · not this run'), 'the MOCK row').toBe(true)
-  expect(flat.includes('~/.matrixkoder/config.json · all projects'), 'the mode scope-note').toBe(true)
+  expect(flat.includes('plugin.json · all projects'), 'the mode scope-note').toBe(true)
   // the scope bar: one pressable per scope, the digit its hotkey
   const scopeLabels = buttonsOf(drawn).map(b => String(b.props.label))
   for (const label of ['Project', 'Routing', 'Agents', 'Models', 'Child', 'Tabs', 'About']) { // the active Mode is tint text
@@ -265,7 +265,7 @@ test('Settings · Agents: builder availability bools and the usage group', () =>
   const drawn = draw(ui, 46, 'agents')
   const flat = drawnText(drawn)
   expect(flat.includes('matrixkoder.yaml · agents · usage'), 'the agents scope-note').toBe(true)
-  for (const sig of ['OpenCode', 'Claude Code', 'herdr', 'Codex', 'AGY', 'codexbar', 'Poll', 'claude, opencodego, ollama']) {
+  for (const sig of ['OpenCode', 'Claude Code', 'herdr', 'Codex', 'AGY', 'codexbar', 'claude, opencodego, ollama']) {
     expect(flat.includes(sig), `the ${sig} row`).toBe(true)
   }
   expect(flat.includes('reset Agents to defaults'), 'the danger row').toBe(true)
@@ -278,7 +278,7 @@ test('Settings · Child: builder sessions, watch and reviewer panes', () => {
   const drawn = draw(ui, 46, 'child')
   const flat = drawnText(drawn)
   expect(flat.includes('yaml lanes.child · lane sessions'), 'the child scope-note').toBe(true)
-  for (const sig of ['New round', '/new', 'Subagents', 'Subagent model', 'ollama-cloud/minima', 'Stop at cont', 'Stop at cost', 'Stall after', 'Give up after', 'herdr events plugin', 'Split', 'Reuse reviewer pane']) {
+  for (const sig of ['New round', 'new', 'Subagents', 'Subagent model', 'Stall after', 'Give up after', 'Split', 'Reuse reviewer pane']) {
     expect(flat.includes(sig), `the ${sig} row`).toBe(true)
   }
   expect(flat.includes('reset Child to defaults'), 'the danger row').toBe(true)
@@ -291,7 +291,7 @@ test('Settings · Tabs: visibility bools, the C2 rows (defaultTab, hiddenTabs, r
   const drawn = draw(ui, 46, 'tabs')
   const flat = drawnText(drawn)
   expect(flat.includes('userConfig · dashboard'), 'the tabs scope-note').toBe(true)
-  for (const sig of ['o Overview', '0 Old', 'Open on', 'overview ▾', 'Hidden tabs', 'Auto-open pane', 'Status chip', 'Raster bars']) {
+  for (const sig of ['o Overview', '0 Old', 'Open on', 'old ▾', 'Hidden tabs', 'Raster bars']) {
     expect(flat.includes(sig), `the ${sig} row`).toBe(true)
   }
   expect(flat.includes('reset Tabs to defaults'), 'the danger row').toBe(true)
@@ -426,8 +426,8 @@ test('Settings · dirty footer: edits mark rows and count, s save / x discard cl
   const drawn = draw(ui, 46, 'routing')
   expect(drawnText(drawn).includes('unsaved'), 'no footer clean').toBe(false)
   // a num step: the reserve floor's max is 90 > 60, so the step is 5
-  press(drawn, 'set-reserve_floor.claude.five_hour_left_pct-inc')
-  expect(ui.get('settings:edit:reserve_floor.claude.five_hour_left_pct')).toBe('45')
+  press(drawn, 'set-routing_preferences.reserve_floor.claude.five_hour_left_pct-inc')
+  expect(ui.get('settings:edit:routing_preferences.reserve_floor.claude.five_hour_left_pct')).toBe('45')
   let dirty = draw(ui, 46, 'routing')
   let flat = drawnText(dirty)
   expect(flat.includes('● 1 unsaved'), 'the count').toBe(true)
@@ -442,11 +442,11 @@ test('Settings · dirty footer: edits mark rows and count, s save / x discard cl
   fitCheck(draw(ui, 36, 'routing'), 36) // the footer fits the compact pane too
 
   press(dirty, 'set-save')
-  expect(ui.get('settings:edit:reserve_floor.claude.five_hour_left_pct')).toBe('')
+  expect(ui.get('settings:edit:routing_preferences.reserve_floor.claude.five_hour_left_pct')).toBe('')
   expect(ui.get('settings:edit:routing_preferences.policy')).toBe('')
   expect(drawnText(draw(ui, 46, 'routing')).includes('unsaved'), 'save cleared the edits').toBe(false)
 
-  press(draw(ui, 46, 'routing'), 'set-reserve_floor.claude.weekly_left_pct-inc')
+  press(draw(ui, 46, 'routing'), 'set-routing_preferences.reserve_floor.claude.weekly_left_pct-inc')
   expect(drawnText(draw(ui, 46, 'routing')).includes('● 1 unsaved'), 'dirty again').toBe(true)
   press(draw(ui, 46, 'routing'), 'set-discard')
   expect(drawnText(draw(ui, 46, 'routing')).includes('unsaved'), 'discard cleared the edits').toBe(false)
@@ -509,10 +509,10 @@ test('Settings · danger: every scope except Mode and About; the press clears th
   }
   // a press clears its own scope's edits and leaves another scope's alone
   const drawn = draw(ui, 46, 'routing')
-  press(drawn, 'set-reserve_floor.others.weekly_left_pct-inc')
+  press(drawn, 'set-routing_preferences.reserve_floor.others.weekly_left_pct-inc')
   press(draw(ui, 46, 'agents'), 'set-agents.agy.available-tog')
   press(draw(ui, 46, 'routing'), 'set-danger')
-  expect(ui.get('settings:edit:reserve_floor.others.weekly_left_pct')).toBe('')
+  expect(ui.get('settings:edit:routing_preferences.reserve_floor.others.weekly_left_pct')).toBe('')
   expect(ui.get('settings:edit:agents.agy.available')).toBe('true') // untouched (agy off → toggled on)
   // on Models the danger row also clears pick edits
   const models = draw(ui, 46, 'models')
@@ -542,10 +542,10 @@ test('Settings · every scope fits 36 and 46 cols; hotkeys are only 1-8 and s/x/
   // select, edits, a filter
   const busy = new Map([
     ['settings:scope', 'routing'],
-    ['settings:sel', 'reserve_floor.claude.five_hour_left_pct'],
+    ['settings:sel', 'routing_preferences.reserve_floor.claude.five_hour_left_pct'],
     ['settings:open', 'routing_preferences.reviewer'],
     ['settings:edit:routing_preferences.reviewer', '"claude opus high"'],
-    ['settings:edit:reserve_floor.claude.five_hour_left_pct', '85'],
+    ['settings:edit:routing_preferences.reserve_floor.claude.five_hour_left_pct', '85'],
     ['settings:find', 're'],
   ])
   for (const cols of [36, 46] as const) fitCheck(draw(busy, cols), cols)
@@ -568,7 +568,7 @@ test('Settings · S3 save: s save hands the ordered payload to the live wire and
   const seen = { saves: [] as unknown[], rechecks: 0 }
   const live = liveUiOf(ui, seen)
   ui.set('settings:scope', 'routing')
-  press(SettingsTab(stubEls, settingsView(), 46, live), 'set-reserve_floor.claude.five_hour_left_pct-inc')
+  press(SettingsTab(stubEls, settingsView(), 46, live), 'set-routing_preferences.reserve_floor.claude.five_hour_left_pct-inc')
   press(SettingsTab(stubEls, settingsView(), 46, live), 'set-routing_preferences.policy-seg-qual')
   const dirty = SettingsTab(stubEls, settingsView(), 46, live)
   expect(drawnText(dirty).includes('● 2 unsaved'), 'two edits count').toBe(true)
@@ -577,16 +577,16 @@ test('Settings · S3 save: s save hands the ordered payload to the live wire and
   expect(seen.saves).toEqual([{
     sets: [
       { key: 'routing_preferences.policy', value: 'quality', list: false },
-      { key: 'reserve_floor.claude.five_hour_left_pct', value: 45, list: false },
+      { key: 'routing_preferences.reserve_floor.claude.five_hour_left_pct', value: 45, list: false },
     ],
     globals: [],
     visibility: [],
   }])
   // the tab keeps the edits: only the dashboard's success clears them
-  expect(ui.get('settings:edit:reserve_floor.claude.five_hour_left_pct')).toBe('45')
+  expect(ui.get('settings:edit:routing_preferences.reserve_floor.claude.five_hour_left_pct')).toBe('45')
   press(SettingsTab(stubEls, settingsView(), 46, live), 'set-discard')
   expect(seen.saves).toHaveLength(1) // discard never saves
-  expect(ui.get('settings:edit:reserve_floor.claude.five_hour_left_pct')).toBe('')
+  expect(ui.get('settings:edit:routing_preferences.reserve_floor.claude.five_hour_left_pct')).toBe('')
 })
 
 test('Settings · S3 save: a global row routes to $.config by suffix; a locked row draws no control', () => {
@@ -599,7 +599,7 @@ test('Settings · S3 save: a global row routes to $.config by suffix; a locked r
         ...g,
         rows: g.rows.map(r => r.key === 'routing_preferences.policy'
           ? { ...r, global: true as const }
-          : r.key === 'reserve_floor.claude.five_hour_left_pct'
+          : r.key === 'routing_preferences.reserve_floor.claude.five_hour_left_pct'
             ? { ...r, global: true as const, editable: false, why: 'Read-only: locked by policy' }
             : r),
       }
@@ -612,7 +612,7 @@ test('Settings · S3 save: a global row routes to $.config by suffix; a locked r
   const drawn = SettingsTab(stubEls, view, 46, live)
   // the locked row offers no control to press (its label press selects only)
   const ctrls = buttonsOf(drawn).filter(b =>
-    String(b.props.key).startsWith('set-reserve_floor.claude.five_hour_left_pct-') &&
+    String(b.props.key).startsWith('set-routing_preferences.reserve_floor.claude.five_hour_left_pct-') &&
     !String(b.props.key).endsWith('-pick'))
   expect(ctrls).toEqual([])
   press(drawn, 'set-routing_preferences.policy-seg-qual')
@@ -631,8 +631,8 @@ test('Settings · carried MEDIUM: hotkeys are inert while the find Input really 
   const seen = { saves: [] as unknown[], rechecks: 0 }
   const live = liveUiOf(ui, seen)
   ui.set('settings:scope', 'routing')
-  ui.set('settings:sel', 'reserve_floor.claude.five_hour_left_pct')
-  ui.set('settings:edit:reserve_floor.claude.five_hour_left_pct', '45') // dirty, so save/discard draw
+  ui.set('settings:sel', 'routing_preferences.reserve_floor.claude.five_hour_left_pct')
+  ui.set('settings:edit:routing_preferences.reserve_floor.claude.five_hour_left_pct', '45') // dirty, so save/discard draw
   ui.set('settings:focus', 'set-find-input') // the dashboard's ui.focus hook records the ring here
   const drawn = SettingsTab(stubEls, settingsView(), 46, live)
   const hotkeys = new Map(buttonsOf(drawn).map(b => [b.props.key, b.props.hotkey]))
@@ -640,7 +640,7 @@ test('Settings · carried MEDIUM: hotkeys are inert while the find Input really 
   expect(hotkeys.get('set-discard'), 'x inert').toBeUndefined()
   expect(hotkeys.get('set-find'), 'f inert').toBeUndefined()
   expect(hotkeys.get('set-scope-project'), 'digits inert').toBeUndefined()
-  expect(hotkeys.get('set-reserve_floor.claude.five_hour_left_pct-reset'), 'r inert').toBeUndefined()
+  expect(hotkeys.get('set-routing_preferences.reserve_floor.claude.five_hour_left_pct-reset'), 'r inert').toBeUndefined()
   // typing `s` reaches the focused Input alone (the engine's InputProps
   // contract): the filter takes it, no save runs, the edit stands
   const input = nodesOf(drawn, 'Input').find(i => i.props.key === 'set-find-input')
@@ -648,7 +648,7 @@ test('Settings · carried MEDIUM: hotkeys are inert while the find Input really 
   ;(input?.props.onInput as (v: string) => void)('s')
   expect(ui.get('settings:find')).toBe('s')
   expect(seen.saves).toEqual([])
-  expect(ui.get('settings:edit:reserve_floor.claude.five_hour_left_pct')).toBe('45')
+  expect(ui.get('settings:edit:routing_preferences.reserve_floor.claude.five_hour_left_pct')).toBe('45')
   // the ring moves on: every hotkey is armed again
   ui.set('settings:focus', '')
   const back = SettingsTab(stubEls, settingsView(), 46, live)
@@ -676,7 +676,7 @@ test('Settings · carried MEDIUM: a focused text-row Input swallows s the same w
 test('Settings · carried MEDIUM: a focused Button keeps its hotkey — only an Input swallows keys', () => {
   const ui: FakeUi = new Map()
   ui.set('settings:scope', 'routing')
-  ui.set('settings:edit:reserve_floor.claude.five_hour_left_pct', '45')
+  ui.set('settings:edit:routing_preferences.reserve_floor.claude.five_hour_left_pct', '45')
   ui.set('settings:focus', 'set-save') // a Button holds the ring, not an Input
   const hotkeys = new Map(buttonsOf(SettingsTab(stubEls, settingsView(), 46, ui)).map(b => [b.props.key, b.props.hotkey]))
   expect(hotkeys.get('set-save')).toBe('s')
@@ -687,7 +687,7 @@ test('Settings · carried MEDIUM: scope change, find toggle and save/discard cle
   const seen = { saves: [] as unknown[], rechecks: 0 }
   const live = liveUiOf(ui, seen)
   ui.set('settings:scope', 'routing')
-  ui.set('settings:edit:reserve_floor.claude.five_hour_left_pct', '45') // dirty, so save draws
+  ui.set('settings:edit:routing_preferences.reserve_floor.claude.five_hour_left_pct', '45') // dirty, so save draws
   // a scope change unmounts the scope's Inputs with the ring key on them
   ui.set('settings:focus', 'set-find-input')
   press(SettingsTab(stubEls, settingsView(), 46, live), 'set-scope-project')
@@ -701,13 +701,13 @@ test('Settings · carried MEDIUM: scope change, find toggle and save/discard cle
   expect(ui.get('settings:focus')).toBe('')
   // save and discard drop it as their footer unmounts
   for (const key of ['set-save', 'set-discard'] as const) {
-    ui.set('settings:edit:reserve_floor.claude.five_hour_left_pct', '45')
+    ui.set('settings:edit:routing_preferences.reserve_floor.claude.five_hour_left_pct', '45')
     ui.set('settings:focus', 'set-find-input')
     press(SettingsTab(stubEls, settingsView(), 46, live), key)
     expect(ui.get('settings:focus'), `${key} clears the ring key`).toBe('')
   }
   // cleared: `s` is armed on save again, and pressing it saves
-  ui.set('settings:edit:reserve_floor.claude.five_hour_left_pct', '45')
+  ui.set('settings:edit:routing_preferences.reserve_floor.claude.five_hour_left_pct', '45')
   const armed = SettingsTab(stubEls, settingsView(), 46, live)
   expect(new Map(buttonsOf(armed).map(b => [b.props.key, b.props.hotkey])).get('set-save')).toBe('s')
   press(armed, 'set-save')

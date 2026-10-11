@@ -2,7 +2,7 @@
 """MatrixKoder lanes — computed names + a small pool of reusable worktree slots. Python 3 stdlib only.
 
   names   --run R --task T [--role build|fix|takeover|review] [--round N] [--slot N]
-  acquire --run R (--task T | --tasks A,B,C) --base REF [--role ROLE] [--round N]
+  acquire --run R (--task T | --tasks A,B,C) [--base REF] [--role ROLE] [--round N]
            (--tasks: one slot for the group, the lane fields written on every listed task)
   release --slot N --integration REF
   gc      [--keep K]
@@ -59,7 +59,7 @@ COPY_RE = re.compile(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*/?")
 LOCK_TIMEOUT = 30.0
 GIT_TIMEOUT, HERDR_TIMEOUT = 120, 300
 DEFAULTS = {"slots": 1, "pattern": "../{repo}-mk-{n}", "reuse": True, "cap": 3, "disposable": [],
-            "copy": []}
+            "copy": [], "integration_branch": "main"}
 
 
 def _load(name, path):
@@ -124,6 +124,9 @@ def load_config(data):
             lines = f.read().splitlines()
     except OSError:
         return cfg
+    r = mk_config.row_for(lines, "repo.integration_branch")
+    if r:
+        _, cfg["integration_branch"] = mk_config.value_of(lines, r)
     for raw in lines:
         m = KEY_RE.match(raw)
         if not m:
@@ -740,7 +743,8 @@ def cmd_acquire(a, cfg, data, main):
         known = run_ids(data)
         raise Fail(f"unknown run {a.run!r} (mk-state knows: {', '.join(map(str, known)) or 'no runs'})",
                    known_runs=known)
-    base = check_ref(main, a.base, "--base")
+    base_ref = a.base if a.base is not None else cfg.get("integration_branch", "main")
+    base = check_ref(main, base_ref, "--base")
     check_branch(main, nms["branch"], "task branch name")
     with locked(data, a.lock_timeout):
         lanes = read_lanes(data)
@@ -955,7 +959,7 @@ def build_parser():
     lane_args(x)
     x.add_argument("--task", help="one task; or --tasks A,B,C for a group on one slot")
     x.add_argument("--tasks", help="comma-separated task group: one slot, lane fields on every task")
-    x.add_argument("--base", required=True)
+    x.add_argument("--base", required=False, default=None)
     x.set_defaults(func=cmd_acquire)
     x = sub.add_parser("release", parents=[dp])
     x.add_argument("--slot", type=int, required=True), x.add_argument("--integration", required=True)
@@ -1685,6 +1689,44 @@ def self_test():
                  e=dict(env, MK_HERDR=fake_list_herdr([(slot1, "wL1")])))
         assert (unk["ok"], unk["slot"], unk["workspace_id"]) == (True, 5, None), unk
         assert "herdr worktree list" not in unk.get("warning", ""), unk  # unknown path: left silently
+
+        # 12 acquire without --base uses repo.integration_branch from the yaml; an explicit --base
+        # still wins; a bad yaml value still fails check_ref
+        assert mk("release", "--slot", "5", "--integration", "mk/r1/integration")["ok"]
+        write(os.path.join(data, "matrixkoder.yaml"),
+              'repo:\n  integration_branch: mk/r1/integration\n  lanes: { slots: 5, reuse: true }\n')
+        st("task", "add", "--id", "t20", "--title", "twenty", "--run", "r1")
+        acq_nobase = mk("acquire", "--run", "r1", "--task", "t20")
+        assert (acq_nobase["ok"], acq_nobase["slot"]) == (True, 5), acq_nobase
+        integ_sha = g("rev-parse", "--verify", "mk/r1/integration^{commit}").stdout.strip()
+        main_sha = g("rev-parse", "--verify", "main^{commit}").stdout.strip()
+        assert integ_sha != main_sha  # integration branch has distinct commits from main
+        assert g("-C", slot5, "rev-parse", "HEAD^{commit}").stdout.strip() == integ_sha
+
+        # an explicit --base still wins
+        assert mk("release", "--slot", "5", "--integration", "mk/r1/integration")["ok"]
+        st("task", "add", "--id", "t21", "--title", "twenty-one", "--run", "r1")
+        acq_exp = mk("acquire", "--run", "r1", "--task", "t21", "--base", "main")
+        assert (acq_exp["ok"], acq_exp["slot"]) == (True, 5), acq_exp
+        assert g("-C", slot5, "rev-parse", "HEAD^{commit}").stdout.strip() == main_sha
+
+        # a bad yaml value still fails check_ref
+        assert mk("release", "--slot", "5", "--integration", "mk/r1/integration")["ok"]
+        write(os.path.join(data, "matrixkoder.yaml"),
+              'repo:\n  integration_branch: nosuchbranch\n  lanes: { slots: 5, reuse: true }\n')
+        st("task", "add", "--id", "t22", "--title", "twenty-two", "--run", "r1")
+        bad_yaml = mk("acquire", "--run", "r1", "--task", "t22", code=2)
+        assert "does not resolve to a commit" in bad_yaml["error"]
+        assert bad_yaml["ok"] is False
+
+        # absent from yaml falls back to schema default "main"
+        write(os.path.join(data, "matrixkoder.yaml"),
+              'repo:\n  lanes: { slots: 5, reuse: true }\n')
+        st("task", "add", "--id", "t23", "--title", "twenty-three", "--run", "r1")
+        acq_dflt = mk("acquire", "--run", "r1", "--task", "t23")
+        assert (acq_dflt["ok"], acq_dflt["slot"]) == (True, 5), acq_dflt
+        assert g("-C", slot5, "rev-parse", "HEAD^{commit}").stdout.strip() == main_sha
+        assert mk("release", "--slot", "5", "--integration", "mk/r1/integration")["ok"]
 
         print("mk-lane self-test ok")
     finally:
