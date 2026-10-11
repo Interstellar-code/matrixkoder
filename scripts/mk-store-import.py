@@ -27,7 +27,8 @@ import mkdb  # the only writer; this script never opens sqlite itself
 HERE = os.path.dirname(os.path.abspath(__file__))
 REAL_BUS = "/Users/rohits/Development/matrixkoder/.matrixkoder"
 STATE_KINDS = ("transition", "note", "verdict", "decision", "quota")
-KIND_RE = re.compile(r"^(brief|report|review|verify|review-brief)-r(\d+)\.[A-Za-z0-9]+$")
+KIND_RE = re.compile(r"^(brief-review|review-brief|brief|report|review|verify)-r(\d+)\.[A-Za-z0-9]+$")
+KIND_OF = {"brief-review": "review-brief"}  # real filename; the table stores review-brief
 
 
 class Fail(Exception):
@@ -43,6 +44,23 @@ class Parser(argparse.ArgumentParser):
 
     def error(self, message):
         raise Fail(message)
+
+
+def check_run_id(run_id):
+    """C11 slug rule, same as --project, before any path is built from the id."""
+    mkdb.check_slug(run_id)
+
+
+def run_dir_of(data, run_id):
+    """The run directory, refused when it is a symlink that escapes <data>/runs."""
+    check_run_id(run_id)
+    runs = os.path.realpath(os.path.join(data, "runs"))
+    path = os.path.join(data, "runs", run_id)
+    real = os.path.realpath(path)
+    if os.path.islink(path) or not (real == runs or real.startswith(runs + os.sep)):
+        if os.path.islink(path) or not real.startswith(runs + os.sep):
+            raise Fail(f"run {run_id!r} escapes <data>/runs")
+    return path
 
 
 def real_home():
@@ -104,15 +122,41 @@ def _task_type(task, by_id):
     return "phase"
 
 
+def _deps_of_task(task, by_id, run_id):
+    """Keep every dep. <this_run>:<id> becomes the plain id. A self-dep is named, not stored."""
+    kept, unresolved = [], []
+    for dep in task.get("deps") or []:
+        if not isinstance(dep, str) or not dep:
+            continue
+        if ":" in dep:
+            other, _, tid = dep.partition(":")
+            if other == run_id and tid == task["id"]:
+                unresolved.append({"run": run_id, "task": task["id"], "dep": dep})
+            elif other == run_id and tid in by_id:
+                kept.append(tid)  # <this_run>:<id> normalises to the plain id
+            else:
+                kept.append(dep)  # dropped later if the target task is not in the project
+        else:
+            kept.append(dep)
+    return kept, unresolved
+
+
 def load_run(data, run_id):
-    """Read one legacy run. Nothing here writes."""
-    run_dir = os.path.join(data, "runs", run_id)
+    """Read one legacy run. Nothing here writes. The run id is checked before the path is built."""
+    run_dir = run_dir_of(data, run_id)
     run_path = os.path.join(run_dir, "run.json")
     if not os.path.isfile(run_path):
-        raise Fail(f"no run.json at {run_path}")
-    with open(run_path, encoding="utf-8") as fh:
-        doc = json.load(fh)
+        raise Fail(f"no run.json for {run_id}")
+    try:
+        with open(run_path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError) as e:
+        raise Fail(f"bad run.json for {run_id}: {e}")
+    if not isinstance(doc, dict):
+        raise Fail(f"bad run.json for {run_id}: expected an object")
     tasks = doc.get("tasks") or []
+    if not isinstance(tasks, list) or any(not isinstance(t, dict) or "id" not in t for t in tasks):
+        raise Fail(f"bad run.json for {run_id}: tasks must be objects with id")
     by_id = {t["id"]: t for t in tasks}
     run_row = {
         "id": run_id,
@@ -134,7 +178,7 @@ def load_run(data, run_id):
             "title": t.get("title") or "",
             "acceptance": t.get("acceptance") or "",
             "owned": _csv(t.get("owned")),
-            "deps": _csv([d for d in (t.get("deps") or []) if isinstance(d, str) and ":" not in d and d in by_id]),
+            "deps": _csv(_deps_of_task(t, by_id, run_id)[0]),
             "parallel": 1 if t.get("parallel") else 0,
             "route_json": _route(t),
             "status": t.get("status") or "planned",
@@ -174,7 +218,7 @@ def load_run(data, run_id):
                     "text": ev.get("text") or "",
                     "meta_json": json.dumps({"by": ev.get("by"), "line": n}),
                 })
-    artifacts = []
+    artifacts, skipped_artifacts = [], []
     tasks_dir = os.path.join(run_dir, "tasks")
     if os.path.isdir(tasks_dir):
         for dirpath, dirs, files in os.walk(tasks_dir):
@@ -188,35 +232,50 @@ def load_run(data, run_id):
                 if not m:
                     continue
                 path = os.path.join(dirpath, name)
-                with open(path, encoding="utf-8", newline="") as fh:
-                    text = fh.read()
                 rel = os.path.relpath(path, run_dir)
+                # import_history takes text and stores it through JSON, so a non-UTF-8 file
+                # cannot round-trip. It is named in skipped_artifacts and left untouched.
+                with open(path, "rb") as fh:
+                    raw = fh.read()
+                try:
+                    text = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    skipped_artifacts.append({"name": rel, "reason": "not valid UTF-8"})
+                    continue
                 artifacts.append({
                     "src": f"{run_id}:{rel}",
                     "task": task_id,
                     "round": int(m.group(2)),
-                    "kind": m.group(1),
+                    "kind": KIND_OF.get(m.group(1), m.group(1)),
                     "rev": 1,
                     "text": text,
                     "created": doc.get("updated") or doc.get("started"),
                 })
-    return run_row, task_rows, events, artifacts, skipped
+    unresolved = []
+    for t in tasks:
+        _, extra = _deps_of_task(t, by_id, run_id)
+        unresolved.extend(extra)
+    return run_row, task_rows, events, artifacts, skipped, unresolved, skipped_artifacts
 
 
 def source_counts(data):
     """Count what the importer will read, without writing."""
     runs_dir = os.path.join(data, "runs")
-    counts = {"runs": 0, "tasks": 0, "events": 0, "artifacts": 0}
+    counts = {"runs": 0, "tasks": 0, "events": 0, "artifacts": 0, "skipped_events": 0}
     if not os.path.isdir(runs_dir):
         return counts
     for name in sorted(os.listdir(runs_dir)):
         if not os.path.isfile(os.path.join(runs_dir, name, "run.json")):
             continue
-        _, tasks, events, artifacts, _ = load_run(data, name)
+        try:
+            _, tasks, events, artifacts, skipped, _, _ = load_run(data, name)
+        except Fail:
+            continue  # a bad run is not part of the parity the store can hold
         counts["runs"] += 1
         counts["tasks"] += len(tasks)
         counts["events"] += len(events)
         counts["artifacts"] += len(artifacts)
+        counts["skipped_events"] = counts.get("skipped_events", 0) + skipped
     return counts
 
 
@@ -233,41 +292,147 @@ def store_counts(home, project):
         con.close()
 
 
+def _present_runs(home, project):
+    con = mkdb.open_project(home, project)
+    try:
+        return {r["id"] for r in con.execute("SELECT id FROM runs")}
+    finally:
+        con.close()
+
+
+def _known_tasks(home, project):
+    con = mkdb.open_project(home, project)
+    try:
+        return {(r["run"], r["id"]) for r in con.execute("SELECT run, id FROM tasks")}
+    finally:
+        con.close()
+
+
+def _split_deps(tasks, run_id, known):
+    """Drop deps whose target is not in the project. Returns (tasks, unresolved records)."""
+    out, unresolved = [], []
+    for t in tasks:
+        kept = []
+        for dep in [d for d in (t.get("deps") or "").split(",") if d]:
+            if ":" in dep:
+                other, _, tid = dep.partition(":")
+                target = (other, tid)
+            else:
+                target = (run_id, dep)
+            if target in known or target == (run_id, t["id"]):
+                if target == (run_id, t["id"]):
+                    unresolved.append({"run": run_id, "task": t["id"], "dep": dep})
+                    continue
+                kept.append(dep)
+            else:
+                unresolved.append({"run": run_id, "task": t["id"], "dep": dep})
+        row = dict(t)
+        row["deps"] = ",".join(kept)
+        out.append(row)
+    return out, unresolved
+
+
+def _dep_runs(tasks, run_id):
+    """Other runs this run's tasks name in <run>:<id> deps."""
+    runs = set()
+    for t in tasks:
+        for dep in [d for d in (t.get("deps") or "").split(",") if d]:
+            if ":" in dep:
+                other = dep.split(":", 1)[0]
+                if other != run_id:
+                    runs.add(other)
+    return runs
+
+
+def _import_order(loaded):
+    """A run follows the runs it depends on. A cycle falls back to name order."""
+    names = set(loaded)
+    edges = {}
+    for name, bundle in loaded.items():
+        tasks = bundle[1]
+        edges[name] = {r for r in _dep_runs(tasks, name) if r in names}
+    order, pending = [], set(names)
+    while pending:
+        ready = sorted(n for n in pending if edges[n].isdisjoint(pending))
+        if not ready:  # cycle or unsortable: the rest go by name
+            order.extend(sorted(pending))
+            break
+        order.extend(ready)
+        pending -= set(ready)
+    return order
+
+
 def import_one(home, project, data, run_id):
-    """Slug is checked before any store path is built (C11)."""
+    """Slug and run id are checked before any store path is built (C11)."""
     mkdb.check_slug(project)
-    run_dir = os.path.join(data, "runs", run_id)
+    check_run_id(run_id)
+    run_dir = run_dir_of(data, run_id)
     before = tree_checksums(run_dir)
-    run_row, tasks, events, artifacts, skipped = load_run(data, run_id)
-    # The project store lives under the temp home, never inside the legacy data dir.
+    run_row, tasks, events, artifacts, skipped, unresolved, skipped_arts = load_run(data, run_id)
+    known = _known_tasks(home, project) | {(run_id, t["id"]) for t in tasks}
+    tasks, dropped = _split_deps(tasks, run_id, known)
     added = mkdb.import_history(home, project, run_id, run_row=run_row, tasks=tasks,
                                 events=events, artifacts=artifacts)
     cards = mkdb.catch_up(home, project)
     if tree_checksums(run_dir) != before:
         raise Fail("source files changed during import")
     return {"added": added, "cards": cards, "skipped_events": skipped,
+            "skipped_artifacts": skipped_arts,
+            "unresolved_deps": list(unresolved) + dropped,
             "source": {"tasks": len(tasks), "events": len(events), "artifacts": len(artifacts)}}
 
 
+def _run_names(data):
+    runs_dir = os.path.join(data, "runs")
+    names = []
+    if not os.path.isdir(runs_dir):
+        return names
+    for name in sorted(os.listdir(runs_dir)):
+        if os.path.isfile(os.path.join(runs_dir, name, "run.json")):
+            names.append(name)
+    return names
+
+
 def import_all(home, project, data):
+    """One bad run is reported and skipped; the rest still import. Exit 4 when any failed."""
     mkdb.check_slug(project)
     runs_dir = os.path.join(data, "runs")
     if not os.path.isdir(runs_dir):
         raise Fail(f"no runs dir at {runs_dir}")
     before = tree_checksums(runs_dir)
-    imported = []
-    for name in sorted(os.listdir(runs_dir)):
-        if not os.path.isfile(os.path.join(runs_dir, name, "run.json")):
+    loaded, failed = {}, []
+    for name in _run_names(data):
+        try:
+            check_run_id(name)
+            loaded[name] = load_run(data, name)  # 7-tuple
+        except Exception as e:  # one bad run.json must not stop the others
+            failed.append({"run": name, "error": str(e)})
+    # Runs land in dependency order, so a <run>:<id> dep finds its target task.
+    imported, unresolved_deps, skipped_events, skipped_artifacts = [], [], 0, []
+    known = _known_tasks(home, project)
+    for name in _import_order(loaded):
+        run_row, tasks, events, artifacts, skipped, unresolved, skipped_arts = loaded[name]
+        known |= {(name, t["id"]) for t in tasks}
+        tasks, dropped = _split_deps(tasks, name, known)
+        try:
+            mkdb.import_history(home, project, name, run_row=run_row, tasks=tasks,
+                                events=events, artifacts=artifacts)
+        except Exception as e:
+            failed.append({"run": name, "error": str(e)})
             continue
         imported.append(name)
-        run_row, tasks, events, artifacts, _ = load_run(data, name)
-        mkdb.import_history(home, project, name, run_row=run_row, tasks=tasks,
-                            events=events, artifacts=artifacts)
+        skipped_events += skipped
+        skipped_artifacts.extend(skipped_arts)
+        unresolved_deps.extend(unresolved)
+        unresolved_deps.extend(dropped)
     cards = mkdb.catch_up(home, project)
     if tree_checksums(runs_dir) != before:
         raise Fail("source files changed during import")
-    return {"runs": imported, "cards": cards,
-            "source": source_counts(data), "store": store_counts(home, project)}
+    return {"imported": imported, "failed": failed, "cards": cards,
+            "skipped_events": skipped_events, "skipped_artifacts": skipped_artifacts,
+            "unresolved_deps": unresolved_deps,
+            "source": source_counts(data), "store": store_counts(home, project),
+            "exit": 0 if not failed else 4}
 
 
 def _check(cond, msg):
@@ -389,14 +554,148 @@ def self_test():
         code, out, err = _run_cli(["run", "--project", "matrixkoder", "--data", data, "--all", "--home", home])
         _check(code == 0, f"--all: {code} {out} {err}")
         parity = json.loads(out)
-        _check(parity["source"] == parity["store"], f"parity {parity}")
+        shared = ("runs", "tasks", "events", "artifacts")
+        _check({k: parity["source"][k] for k in shared} == {k: parity["store"][k] for k in shared},
+               f"parity {parity}")
+        _check(parity["skipped_events"] == 1, parity)
         _check(parity["source"]["runs"] == 2 and parity["source"]["events"] == 7, parity["source"])
         _check(tree_checksums(os.path.join(data, "runs")) == before, "source changed by --all")
 
+        _guards_r2(tmp)
         _real_bus(tmp)
         print("mk-store-import self-test ok")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+
+def _guards_r2(tmp):
+    """Cross-run deps, hostile run ids, a bad run inside --all, non-UTF-8, brief-review names."""
+    data = os.path.join(tmp, "r2")
+    home = os.path.join(tmp, "r2-home")
+    os.makedirs(home)
+    # r1:T1 is a dep of r2:T2, and r2 also names a run that is not in the project.
+    r1 = {"id": "r1", "status": "done", "tasks": [
+        {"id": "T1", "title": "one", "status": "done", "parent": None, "deps": []}]}
+    r2 = {"id": "r2", "status": "done", "tasks": [
+        {"id": "T2", "title": "two", "status": "done", "parent": None,
+         "deps": ["r1:T1", "r2:T2", "missing-run:Z"]}]}
+    _write(os.path.join(data, "runs", "r1", "run.json"), json.dumps(r1))
+    _write(os.path.join(data, "runs", "r2", "run.json"), json.dumps(r2))
+    _write(os.path.join(data, "runs", "r2", "events.jsonl"), "this is not json\n")
+    _write(os.path.join(data, "runs", "r2", "tasks", "T2", "brief-review-r1.md"), "review brief\n")
+    blob = bytes([0xff, 0xfe, 0x00])
+    with open(os.path.join(data, "runs", "r2", "tasks", "T2", "report-r1.md"), "wb") as fh:
+        fh.write(blob)
+    code, out, err = _run_cli(["run", "--project", "matrixkoder", "--data", data, "--all", "--home", home])
+    _check(code == 0, f"r2 import: {code} {out} {err}")
+    doc = json.loads(out)
+    _check(doc["skipped_events"] == 1, doc)
+    con = mkdb.open_project(home, "matrixkoder")
+    try:
+        deps = con.execute("SELECT deps FROM tasks WHERE run='r2' AND id='T2'").fetchone()["deps"]
+        _check(deps == "r1:T1", f"deps dropped: {deps}")
+        text = con.execute("SELECT text, kind FROM artifacts WHERE run='r2' AND kind='review-brief'").fetchone()
+        _check(text and text["text"] == "review brief\n", f"brief-review {text and dict(text)}")
+        stored = con.execute("SELECT text FROM artifacts WHERE run='r2' AND kind='report'").fetchone()
+        _check(stored is None, "non-UTF-8 file was stored")
+        _check(open(os.path.join(data, "runs", "r2", "tasks", "T2", "report-r1.md"), "rb").read() == blob,
+               "source bytes altered")
+    finally:
+        con.close()
+    deps = {(d["task"], d["dep"]) for d in doc["unresolved_deps"]}
+    _check(("T2", "missing-run:Z") in deps and ("T2", "r2:T2") in deps, doc["unresolved_deps"])
+    _check(("T2", "r1:T1") not in deps, doc["unresolved_deps"])
+    _check(any(a["name"].endswith("report-r1.md") and a["reason"] == "not valid UTF-8"
+               for a in doc["skipped_artifacts"]), doc["skipped_artifacts"])
+
+
+    # case A: the target task is already in the store (r1 imported above), a new run depends on it
+    later = os.path.join(tmp, "later")
+    _write(os.path.join(later, "runs", "r3", "run.json"), json.dumps(
+        {"id": "r3", "status": "done", "tasks": [
+            {"id": "T3", "title": "three", "status": "done", "parent": None, "deps": ["r1:T1"]}]}))
+    code, out, err = _run_cli(["run", "--project", "matrixkoder", "--data", later, "--run", "r3", "--home", home])
+    _check(code == 0, f"case A: {code} {out} {err}")
+    con = mkdb.open_project(home, "matrixkoder")
+    try:
+        deps = con.execute("SELECT deps FROM tasks WHERE run='r3' AND id='T3'").fetchone()["deps"]
+        _check(deps == "r1:T1", f"case A deps {deps}")
+    finally:
+        con.close()
+    # case B: neither run is stored yet; dependency order imports the target first
+    fresh = os.path.join(tmp, "order")
+    fresh_home = os.path.join(tmp, "order-home")
+    os.makedirs(fresh_home)
+    _write(os.path.join(fresh, "runs", "b2", "run.json"), json.dumps(
+        {"id": "b2", "status": "done", "tasks": [
+            {"id": "T", "title": "needs b1", "status": "done", "parent": None, "deps": ["b1:T"]}]}))
+    _write(os.path.join(fresh, "runs", "b1", "run.json"), json.dumps(
+        {"id": "b1", "status": "done", "tasks": [
+            {"id": "T", "title": "base", "status": "done", "parent": None, "deps": []}]}))
+    code, out, err = _run_cli(["run", "--project", "matrixkoder", "--data", fresh, "--all", "--home", fresh_home])
+    _check(code == 0, f"case B: {code} {out} {err}")
+    con = mkdb.open_project(fresh_home, "matrixkoder")
+    try:
+        deps = con.execute("SELECT deps FROM tasks WHERE run='b2' AND id='T'").fetchone()["deps"]
+        _check(deps == "b1:T", f"case B deps {deps}")
+    finally:
+        con.close()
+    # case C: the target run is in neither the store nor this call, so the dep is dropped and named
+    lone = os.path.join(tmp, "lone")
+    lone_home = os.path.join(tmp, "lone-home")
+    os.makedirs(lone_home)
+    _write(os.path.join(lone, "runs", "lone", "run.json"), json.dumps(
+        {"id": "lone", "status": "done", "tasks": [
+            {"id": "T", "title": "alone", "status": "done", "parent": None, "deps": ["nowhere:Z"]}]}))
+    code, out, err = _run_cli(["run", "--project", "matrixkoder", "--data", lone, "--run", "lone", "--home", lone_home])
+    _check(code == 0, f"case C: {code} {out} {err}")
+    doc = json.loads(out)
+    _check(doc["unresolved_deps"] == [{"run": "lone", "task": "T", "dep": "nowhere:Z"}], doc["unresolved_deps"])
+    con = mkdb.open_project(lone_home, "matrixkoder")
+    try:
+        deps = con.execute("SELECT deps FROM tasks WHERE run='lone' AND id='T'").fetchone()["deps"]
+        _check(deps == "", f"case C stored {deps!r}")
+    finally:
+        con.close()
+
+    # hostile run ids: nothing outside the data dir is read
+    marker = os.path.join(tmp, "outside-read")
+    for bad in ("../x", "/tmp", ""):
+        before = set(os.listdir(tmp))
+        code, out, err = _run_cli(["run", "--project", "matrixkoder", "--data", data, "--run", bad, "--home", home])
+        _check(code != 0 and out.startswith('{"ok": false'), f"hostile {bad!r}: {code} {out} {err}")
+        _check("Traceback" not in err, f"traceback for {bad!r}: {err}")
+        _check(not os.path.exists(marker), f"{bad!r} read outside")
+    outside = os.path.join(tmp, "outside")
+    os.makedirs(os.path.join(outside, "secret"), exist_ok=True)
+    _write(os.path.join(outside, "run.json"), json.dumps({"id": "nope", "tasks": []}))
+    link = os.path.join(data, "runs", "linked")
+    os.symlink(outside, link)
+    code, out, err = _run_cli(["run", "--project", "matrixkoder", "--data", data, "--run", "linked", "--home", home])
+    _check(code != 0 and "escapes" in out, f"symlink: {code} {out} {err}")
+
+    # one malformed run.json among two good runs
+    bad_dir = os.path.join(tmp, "mixed")
+    good_home = os.path.join(tmp, "mixed-home")
+    os.makedirs(good_home)
+    for name in ("good1", "good2"):
+        _write(os.path.join(bad_dir, "runs", name, "run.json"),
+               json.dumps({"id": name, "status": "done", "tasks": [
+                   {"id": "T", "title": name, "status": "done", "parent": None, "deps": []}]}))
+    _write(os.path.join(bad_dir, "runs", "bad", "run.json"), "{not json")
+    code, out, err = _run_cli(["run", "--project", "matrixkoder", "--data", bad_dir, "--all", "--home", good_home])
+    _check(code == 4, f"mixed exit {code} {out} {err}")
+    doc = json.loads(out)
+    _check(sorted(doc["imported"]) == ["good1", "good2"], doc["imported"])
+    _check(any(f["run"] == "bad" for f in doc["failed"]), doc["failed"])
+
+    # a non-object run.json is a JSON error, never a traceback
+    obj = os.path.join(tmp, "obj")
+    _write(os.path.join(obj, "runs", "arr", "run.json"), "[1, 2, 3]")
+    code, out, err = _run_cli(["run", "--project", "matrixkoder", "--data", obj, "--run", "arr",
+                               "--home", os.path.join(tmp, "obj-home")])
+    _check(code == 2 and out.startswith('{"ok": false') and "Traceback" not in err, f"non-object: {code} {out} {err}")
 
 
 def _real_bus(tmp):
@@ -468,9 +767,15 @@ def main(argv):
     # Slug first, before the home or any store path is built.
     mkdb.check_slug(args.project)
     home = resolve_import_home(args.home, args.allow_real_home)
+    if args.run:
+        check_run_id(args.run)
     if args.all:
-        return import_all(home, args.project, os.path.abspath(args.data))
-    return import_one(home, args.project, os.path.abspath(args.data), args.run)
+        result = import_all(home, args.project, os.path.abspath(args.data))
+        code = result.pop("exit")
+        print(json.dumps({"ok": code == 0, **result}))
+        return code
+    print(json.dumps({"ok": True, **import_one(home, args.project, os.path.abspath(args.data), args.run)}))
+    return 0
 
 
 if __name__ == "__main__":
@@ -478,7 +783,7 @@ if __name__ == "__main__":
         if sys.argv[1:] == ["--self-test"]:
             self_test()
         else:
-            print(json.dumps({"ok": True, **main(sys.argv[1:])}))
+            sys.exit(main(sys.argv[1:]))
     except Fail as e:
         print(json.dumps({"ok": False, "error": str(e)}))
         sys.exit(e.code)
