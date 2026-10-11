@@ -147,10 +147,7 @@ let lastPollAt = -Infinity
 let sweepInFlight = false
 let lastSweepAt = -Infinity
 let busInFlight = false
-/** data.ts's timerRegistry declares exactly three cancels and data.ts is not
- *  this phase's file: the bus timer's cancel rides the same object under one
- *  more key, armed and cancelled in startLoop like cancelPoll/cancelSweep. */
-const busTimers = timerRegistry as typeof timerRegistry & { cancelBus?: () => void }
+const busTimers = timerRegistry
 let lastChipText: string | null | undefined // undefined = never set; skip ui.status when unchanged
 
 export function registerDashboard(on: On, options: PluginOptions): void {
@@ -811,7 +808,7 @@ async function ensureBus($: EngineInterface, options: PluginOptions, cwd: string
     if (snap.run == null) return // only an active run owns a bus
     const script = `${$.plugin.root}/scripts/mk-bus.py`
     if ((await readText($, join(dataDir, 'bus.json'))) != null) {
-      await $.process.run(['python3', script, 'heartbeat', '--data', dataDir], { timeoutMs: BUS_TIMEOUT_MS })
+      await $.process.run(['python3', script, 'heartbeat', '--data', dataDir, '--run', snap.run.id], { timeoutMs: BUS_TIMEOUT_MS })
       return
     }
     if (await busDisabled($, dataDir)) return

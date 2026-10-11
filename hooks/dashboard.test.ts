@@ -868,7 +868,7 @@ test('a bus.json in the data dir turns the tick into a heartbeat', { plugins: [w
   await $.session.start(sessionStart())
   await clock.advance(0)
   expect(bus.length).toBe(1)
-  expect(bus[0]?.slice(2)).toEqual(['heartbeat', '--data', DATA_DIR])
+  expect(bus[0]?.slice(2)).toEqual(['heartbeat', '--data', DATA_DIR, '--run', 'wfv2'])
   await clock.advance(15_000)
   expect(bus.filter(a => a[2] === 'ensure'), 'ensure never runs while bus.json names a server').toHaveLength(0)
   expect(bus.length).toBe(2)

@@ -14,8 +14,9 @@ Subcommands:
       trusted when /health names this data dir (a refused port means pid reuse): else
       bus.json is stale and the bus respawns. Returns
       {"ok": true, "pid": PID, "port": PORT, "started": BOOL}.
-  heartbeat [--data DIR]
-      Updates owner_heartbeat in <data>/bus.json.
+  heartbeat [--data DIR] [--run ID]
+      Updates owner_heartbeat in <data>/bus.json. If the server is dead, restarts it (the
+      ensure path). Prints {"ok":true,"restarted":bool,"pid","port"}.
   token --lane DIR --task T [--run ID] [--data DIR]
       Mints bearer token, writes <lane>/.matrixkoder-bus.json (0600) with
       {"v": 1, "url": "http://127.0.0.1:<port>", "token": TOKEN, "run": RUN, "task": TASK},
@@ -39,7 +40,7 @@ Subcommands:
 
 Every command prints ONE JSON line. Errors: {"ok": false, "error": ...} exit 2.
 """
-import argparse, contextlib, datetime, fcntl, hmac, importlib.util, json, math, os, re, secrets, signal, socket, subprocess, sys, tempfile, threading, time
+import argparse, contextlib, datetime, fcntl, hmac, importlib.util, io, json, math, os, re, secrets, signal, socket, subprocess, sys, tempfile, threading, time
 import urllib.error, urllib.parse, urllib.request
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
@@ -1355,9 +1356,12 @@ def cmd_heartbeat(args):
     if not bdata or "pid" not in bdata:
         raise Fail("bus down")
 
-    bdata["owner_heartbeat"] = time.time()
-    write_json(bus_json_path, bdata, mode=0o600)
-    res = {"ok": True, "owner_heartbeat": bdata["owner_heartbeat"]}
+    # A SIGKILLed server leaves bus.json behind, so a bare timestamp refresh kept a dead
+    # bus "alive" forever (todo 38). ensure probes /health under its lock, refreshes
+    # owner_heartbeat when healthy and respawns (replaying bus.jsonl) when not.
+    with contextlib.redirect_stdout(io.StringIO()):  # ensure prints its own line; we print one
+        ens = cmd_ensure(args)
+    res = {"ok": True, "restarted": ens["started"], "pid": ens["pid"], "port": ens["port"]}
     out(res)
     return res
 
@@ -2839,6 +2843,27 @@ def self_test():
         assert len(open(jsonl_m).readlines()) == cnt_m_before + 2, "exactly ask + one answer appended"
         done("duplicate answer race -> one 200, one 400")
 
+        # 13. heartbeat restarts a SIGKILLed bus (todo 38) and replays its pending ask
+        data_hb = os.path.join(tmp, "data_hb")
+        rc, res_hb0, _ = cli(["ensure", "--data", data_hb, "--run", "rh"])
+        assert rc == 0 and res_hb0["started"] is True
+        pids.append(res_hb0["pid"])
+        rc, res_hb_ask, _ = cli(["send", "--run", "rh", "--task", "T1", "--kind", "ask", "--text", "survive?", "--from", "T1", "--to", "orch", "--data", data_hb])
+        ask_hb = res_hb_ask["message"]["id"]
+        rc, res_hb_ok, _ = cli(["heartbeat", "--data", data_hb, "--run", "rh"])
+        assert res_hb_ok["ok"] is True and res_hb_ok["restarted"] is False, res_hb_ok
+        os.kill(res_hb0["pid"], signal.SIGKILL)
+        assert poll_until(lambda: not is_pid_alive(res_hb0["pid"]), timeout=5.0)
+        rc, res_hb, _ = cli(["heartbeat", "--data", data_hb, "--run", "rh"])
+        assert res_hb["ok"] is True and res_hb["restarted"] is True and res_hb["pid"] != res_hb0["pid"], res_hb
+        pids.append(res_hb["pid"])
+        with urllib.request.urlopen(urllib.request.Request(
+                f"http://127.0.0.1:{res_hb['port']}/health", headers={"Host": f"127.0.0.1:{res_hb['port']}"}), timeout=2.0) as resp:
+            assert json.loads(resp.read().decode("utf-8"))["data"] == data_hb
+        rc, pend_hb, _ = cli(["pending", "--run", "rh", "--data", data_hb])
+        assert [p["id"] for p in pend_hb["pending"]] == [ask_hb], pend_hb
+        done("heartbeat restarts a killed bus; pending ask replayed")
+
     finally:
         for p in pids:
             stop_process(p)
@@ -2877,6 +2902,7 @@ def main():
 
     p_hb = subparsers.add_parser("heartbeat")
     p_hb.add_argument("--data", help="MatrixKoder data dir")
+    p_hb.add_argument("--run", help="Run id (passed to a restarted server)")
 
     p_token = subparsers.add_parser("token")
     p_token.add_argument("--lane", required=True, help="Lane worktree directory")
