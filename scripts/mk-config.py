@@ -694,7 +694,9 @@ def pin_tmp_data(tmp):
     was = {k: os.environ.get(k) for k in ("MATRIXKODER_DATA", "MATRIXKODER_HOME")}
     os.environ["MATRIXKODER_DATA"], os.environ["MATRIXKODER_HOME"] = data, home
     got = os.path.realpath(mk_state.resolve_data(None))
-    assert got.startswith(os.path.realpath(tmp)), \
+    # the resolved dir, not the env value just written: a resolver that ignores the env and
+    # lands in a real checkout must fail this assert
+    assert os.path.commonpath([got, os.path.realpath(tmp)]) == os.path.realpath(tmp), \
         f"the self-test would resolve {got}, which is outside its temp dir {tmp}"
 
     def restore():
@@ -754,6 +756,9 @@ def parse_value(raw, r, lines=None):
             raise Fail(f"{r['key']} takes at most {r['maxlen']} entries: {raw} has {len(v)}")
         for x in v:
             if r.get("pool") and x not in r["pool"]:
+                saved = value_of(lines, r)[1] if lines is not None else []
+                if isinstance(saved, list) and x in saved:
+                    continue  # already saved and since dropped from the pool: kept, not a new pick
                 raise Fail(f"{r['key']}: {x} is not a model of that agent")
     else:
         if not isinstance(v, str):
@@ -785,6 +790,10 @@ def cmd_list(path, lines):
                 f["stale"] = True  # a saved route the catalog no longer lists stays visible and flagged
         if r.get("pool") is not None:
             f["pool"] = list(r["pool"])  # the only models `set` accepts for this agent: one pool, picker and validator
+            if r["type"] == "list" and isinstance(value, list):
+                gone = [x for x in value if isinstance(x, str) and x not in r["pool"]]
+                if gone:  # a saved pick a later probe dropped: still shown, flagged unavailable
+                    f["unavailable"] = gone
         if not f["editable"]:
             f["why"] = r["why"]
         fields.append(f)
@@ -1106,9 +1115,19 @@ def probe_models(cli):
         return []
     out = []
     for raw in (p.stdout or "").splitlines():
-        fields = raw.split()
-        if fields and fields[0] not in out:
-            out.append(fields[0])
+        line = raw.strip()
+        fields = line.split()
+        if not fields:
+            continue
+        mid = fields[0]
+        # a banner ("Fetching available models..."), a label ending in ":", or a line of dashes
+        # is not an id; `id<TAB>description` still is, because its first field is the id
+        if line.endswith("...") or line.endswith(":") or set(mid) <= set("-"):
+            continue
+        if " " in mid or not re.fullmatch(r"[A-Za-z0-9._:/@+-]+", mid):
+            continue
+        if mid not in out:
+            out.append(mid)
     return out
 
 
@@ -1255,6 +1274,19 @@ FIVE = ('["opencode/space-bunny-free", "opencode/muse-spark-1.3-contributor-free
 
 def self_test():
     tmp = tempfile.mkdtemp(prefix="mk-config-selftest-")
+    # (a) the pin assert fires when resolution lands outside the temp dir. The helper runs
+    # inside try, so a failed pin still restores the environment.
+    real = mk_state.resolve_data
+    try:
+        mk_state.resolve_data = lambda arg: os.path.expanduser("~")
+        try:
+            pin_tmp_data(tmp)
+        except AssertionError as e:
+            assert "outside its temp dir" in str(e), e
+        else:
+            raise AssertionError("pin_tmp_data did not fire when resolution landed outside the temp dir")
+    finally:
+        mk_state.resolve_data = real
     restore = pin_tmp_data(tmp)  # the in-process calls below must resolve here, not in a real repo
     try:
         data, home, yaml_path = os.path.join(tmp, "data"), os.path.join(tmp, "home"), None
@@ -1909,6 +1941,36 @@ def self_test():
         assert run("get", "picks.opencode")["value"] == ["ollama-cloud/minimax-m3"]
         # a model the refreshed pool no longer lists is refused: the tab cannot offer it either
         run("set", "picks.opencode", '["opencode/step-5-preview-free"]', ok=False)
+        refused = run("set", "picks.opencode", '["opencode/step-5-preview-free"]', ok=False)
+        assert "is not a model of that agent" in refused["error"], refused
+
+        # 29. a saved pick a later probe drops stays visible (flagged unavailable) and does not
+        #     refuse a set of the picks that remain
+        run("set", "picks.opencode", '["opencode/space-bunny-free", "ollama-cloud/minimax-m3"]')
+        make_bin("opencode", "#!/bin/sh\nprintf 'ollama-cloud/minimax-m3\\n'\n")
+        p_drop = run("probe")
+        assert p_drop["models"]["opencode"] == "updated", p_drop
+        field = next(f for f in run("list", "--json")["fields"] if f["key"] == "picks.opencode")
+        assert field["value"] == ["opencode/space-bunny-free", "ollama-cloud/minimax-m3"], field
+        assert field["unavailable"] == ["opencode/space-bunny-free"], field
+        assert field["pool"] == ["ollama-cloud/minimax-m3"], field
+        # keeping the dropped pick is allowed; a model that was never in the pool is still refused
+        run("set", "picks.opencode", '["opencode/space-bunny-free", "ollama-cloud/minimax-m3"]')
+        never = run("set", "picks.opencode", '["opencode/never-existed"]', ok=False)
+        run("set", "picks.opencode", '["ollama-cloud/minimax-m3"]')
+        assert run("get", "picks.opencode")["value"] == ["ollama-cloud/minimax-m3"]
+        assert "is not a model of that agent" in never["error"], never
+        make_bin("opencode", "#!/bin/sh\nprintf 'opencode/space-bunny-free\\nollama-cloud/minimax-m3\\n'\n")
+
+        # 30. probe_models ignores a banner, a blank and a line of dashes; id<TAB>description stays an id
+        make_bin("opencode", "#!/bin/sh\n"
+                 "printf 'Fetching available models...\\n\\n----------\\n"
+                 "opencode/space-bunny-free\\tfree bunny\\n"
+                 "ollama-cloud/minimax-m3\\n'\n")
+        p_ban = run("probe")
+        assert p_ban["models"]["opencode"] == "updated", p_ban
+        assert ("  opencode: { available: true, models: [opencode/space-bunny-free, "
+                "ollama-cloud/minimax-m3] }") in agent_lines(), rd()
 
         # a failing CLI, an absent CLI and one that prints nothing all leave the list as it was
         before_agents = agent_lines()

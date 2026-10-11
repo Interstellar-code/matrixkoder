@@ -11,6 +11,7 @@ Do NOT touch: <list>
 
 ## Tests (must exercise real code)
 <required tests, stated as acceptance ("Back with a dirty draft + Cancel keeps the draft"). Mock only the network edge (fetch / engine client), never the module under test. For every new client call, the server route must exist and be tested. Each fix/guard test must fail on the old code: <which tests>; prove it with the mk-builder skill's proof method (reference/lane-rules.md R13) — follow it as written.>
+The plugin test runtime cannot read files or spawn processes, so a TS test cannot check drift against a script directly: commit a generated JSON beside the fixture and add a `scripts/*-drift.py --self-test` that checks it against the real sources.
 
 ## Commands (wait for each)
 - Install: `<cmd>`
@@ -18,6 +19,7 @@ Do NOT touch: <list>
 - Types: `<typecheck cmd>` must stay at **<baseline>**; nothing new in <owned paths>
 - Lint/format ONLY changed files: `<lint cmd> <files>`, `<format cmd> <files>` — never repo-wide
 - Banned commands (repo list): <banned commands>
+- Run each finite check in the background with its output in a file and the exit code appended (`cmd > out.txt 2>&1; echo EXIT:$? >> out.txt`), read every result before committing, quote its last line, never start servers.
 
 ## Rules
 - Use the mk-builder skill (installed in this lane at `.claude/skills/mk-builder/`) — round R<n>. Every lane rule is the skill's (`reference/lane-rules.md` R1-R29); never restate one here. This brief carries only the per-brief values: the round number <n>, and the end-of-round token `<PHASE> R<n> DONE` (or `<PHASE> R<n> BLOCKED: <question>`) as the LAST line of your reply, alone on its line.
