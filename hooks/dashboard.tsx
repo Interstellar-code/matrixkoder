@@ -743,10 +743,11 @@ function kanbanFiltersOf(view: Record<string, string>): KanbanFilters {
 
 /** The Kanban body: empty until a root store has been seen, else the last cards read. */
 function kanbanPaneView(view: Record<string, string>) {
-  // No root store (or no tick yet): the fixture, so the tab renders without mkdb.
-  // kanban:empty=1 is the confirmed miss — "no store yet", and mkdb was not called.
-  if (view[CARDS_EMPTY_KEY] === '1') return emptyKanbanView()
-  if ((view[CARDS_KEY] ?? '') === '') return kanbanFixtureView()
+  // Fixture only in the explicit mock mode the other tabs use (kanban:mock=1).
+  // Anything else with no store, or before the first tick, is the empty state —
+  // never the fixture cards.
+  if (view['kanban:mock'] === '1') return kanbanFixtureView()
+  if (view[CARDS_EMPTY_KEY] === '1' || (view[CARDS_KEY] ?? '') === '') return emptyKanbanView()
   let cards: KanbanCard[] = []
   try {
     const parsed = JSON.parse(view[CARDS_KEY] ?? '[]') as unknown
@@ -764,8 +765,9 @@ function kanbanPaneView(view: Record<string, string>) {
  * every other tick.
  */
 async function refreshCards($: EngineInterface): Promise<void> {
-  // MK_HOME is the store home; otherwise the store is $HOME/.matrixkoder/mk.db.
-  // exists() runs before any mkdb spawn: cards() would create a missing root store.
+  // storeHome is MK_HOME when set, otherwise $HOME/.matrixkoder. Both the
+  // exists-check and the --home handed to mkdb use that directory: cards()
+  // would create a missing root store, so exists() runs first.
   let mkHome = ''
   try {
     mkHome = (await $.env.get('MK_HOME')) || ''
@@ -773,8 +775,8 @@ async function refreshCards($: EngineInterface): Promise<void> {
     mkHome = ''
   }
   const userHome = mkHome === '' ? await homeDir($) : null
-  const home = mkHome !== '' ? mkHome : userHome
-  const path = home == null ? '' : mkHome !== '' ? join(home, 'mk.db') : join(home, '.matrixkoder', 'mk.db')
+  const storeHome = mkHome !== '' ? mkHome : (userHome == null ? null : join(userHome, '.matrixkoder'))
+  const path = storeHome == null ? '' : join(storeHome, 'mk.db')
   let exists = false
   if (path !== '') {
     try {
@@ -794,7 +796,7 @@ async function refreshCards($: EngineInterface): Promise<void> {
         const r = await run(argv, init)
         return { stdout: r.stdout, code: r.exitCode }
       },
-      $.plugin.root, home, exists, tick, lastMs)
+      $.plugin.root, storeHome, exists, tick, lastMs)
   } catch {
     return // a refused exists/run must not kill the refresh tick
   }
@@ -802,7 +804,7 @@ async function refreshCards($: EngineInterface): Promise<void> {
     ...prev,
     [CARDS_TICK_KEY]: String(tick),
     [CARDS_MS_KEY]: String(got.skipped ? lastMs : got.ms),
-    [CARDS_EMPTY_KEY]: got.empty && mkHome !== '' ? '1' : '0',
+    [CARDS_EMPTY_KEY]: got.empty ? '1' : '0',
     ...(got.skipped ? {} : { [CARDS_KEY]: JSON.stringify(got.cards) }),
   }))
 }

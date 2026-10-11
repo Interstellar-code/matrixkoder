@@ -1068,7 +1068,7 @@ test('every tab hotkey switches to that tab’s MOCK row and hides Old; 0 restor
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
-  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings')) {
+  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban')) {
     await ui.press({ key })
     expect(await ui.find(mockRow()), `${name} MOCK row`).toBeTruthy()
     expect(await ui.find({ text: /workflows-v2/ }), `${name} hides Old`).toBeUndefined()
@@ -1144,7 +1144,7 @@ test('every mock tab shows the fixture run header: name, stage chip, MOCK marker
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
-  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings')) {
+  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban')) {
     await ui.press({ key: 'dash-tab-old' })
     await ui.press({ key })
     expect(await ui.find({ text: 'MATRIXKODER' }), `${name} shared brand header`).toBeTruthy()
@@ -1199,7 +1199,7 @@ test('F0: every tab Button carries its keyboard hotkey — o l p u e w k 0, at 3
   }
   // the press-by-key switch loop stands
   // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
-  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings')) {
+  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban')) {
     await ui.redraw(paneProps(46))
     await ui.press({ key })
     expect(await ui.find(mockRow()), `${name} MOCK row`).toBeTruthy()
@@ -1443,7 +1443,7 @@ test('C12: every tab call receives the ui handle — all six tabs act on it, not
   // the three-argument tabs (lanes, usage, waiting, events) take the extra
   // argument through the pane's widened call and still render their fixture
   // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
-  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings')) {
+  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban')) {
     await ui.press({ key: 'dash-tab-old' })
     await ui.press({ key })
     expect(await ui.find(mockRow()), `${name} renders with the ui argument`).toBeTruthy()
@@ -2135,5 +2135,62 @@ test('D8A: a dashboard tick reads cards once when the root store exists, and nev
   const before = cardCalls().length
   await clock.advance(5000)
   expect(cardCalls().length, 'the next tick reads cards once more').toBe(before + 1)
+})
+
+
+test('D8A R2: MK_HOME unset reads ~/.matrixkoder/mk.db and shows no store yet', { plugins: [worldFixtures] }, async ($, on) => {
+  const calls: string[][] = []
+  const exists: string[] = []
+  const clock = mockWorld(on, {
+    process: argv => {
+      calls.push([...argv])
+      return undefined
+    },
+  })
+  on('fs.exists', (_$, e) => {
+    exists.push(String(e.path))
+    return { value: false }
+  })
+  mockFs(on, worldFiles())
+  await $.session.start(sessionStart())
+  await clock.advance(0)
+  const homeIdx = calls.flat().indexOf('--home')
+  const cardCalls = calls.filter(a => a.includes('cards'))
+  expect(cardCalls, 'a missing store never spawns mkdb').toHaveLength(0)
+  expect(exists.some(p => p === '/home/mk/.matrixkoder/mk.db'), `exists looked at ${exists.join(',')}`).toBe(true)
+  expect(exists.some(p => p === '/home/mk/mk.db'), 'must not probe $HOME/mk.db').toBe(false)
+  void homeIdx
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-kanban' })
+  expect(await ui.find({ text: 'no store yet' })).toBeTruthy()
+  expect(await ui.find({ text: /alpha/ })).toBeUndefined()
+  expect(await ui.find({ text: /beta/ })).toBeUndefined()
+  expect(await ui.find({ text: /gamma/ })).toBeUndefined()
+})
+
+test('D8A R2: a present store with zero cards draws an empty board, not the fixture', { plugins: [worldFixtures] }, async ($, on) => {
+  const calls: string[][] = []
+  const clock = mockWorld(on, {
+    process: argv => {
+      calls.push([...argv])
+      if (argv.includes('cards')) {
+        return { value: { exitCode: 0, stdout: '{"ok":true,"cards":[]}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      }
+      return undefined
+    },
+  })
+  on('fs.exists', (_$, e) => ({ value: String(e.path) === '/home/mk/.matrixkoder/mk.db' }))
+  mockFs(on, worldFiles())
+  await $.session.start(sessionStart())
+  await clock.advance(0)
+  const cardCalls = calls.filter(a => a.includes('cards'))
+  expect(cardCalls, 'one cards read').toHaveLength(1)
+  const homeAt = cardCalls[0]!.indexOf('--home')
+  expect(cardCalls[0]![homeAt + 1]).toBe('/home/mk/.matrixkoder')
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-kanban' })
+  expect(await ui.find({ text: 'no store yet' }), 'a present store is not the empty-store line').toBeUndefined()
+  expect(await ui.find({ text: 'Backlog 0' })).toBeTruthy()
+  expect(await ui.find({ text: /alpha/ })).toBeUndefined()
 })
 
