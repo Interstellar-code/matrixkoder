@@ -248,13 +248,25 @@ def pane_fp(text):
 def verdict_for(w):
     """The inputs lane-watch's watch() builds each poll — health (agent get + pane text since the
     dispatch marker), commit subject, report existence — fed through decide(). New pane output since
-    the last observation refreshes last_activity (the first observation does not: dispatch counts)."""
+    the last observation refreshes last_activity (the first observation does not: dispatch counts).
+    The lane's .matrixkoder-status.json is read FIRST (R27, R42: the caller — cmd_event/cmd_sweep —
+    already holds the per-lane flock, so no second locking scheme); an accepted working/subagent
+    heartbeat moves the idle mark (R33, subagent only within max_wait_min of armed_at, R34), and
+    decide() gets st + armed (R30/R32) and returns source-tagged evidence (R41)."""
     stall = float(w.get("stall_min") or cfg("session.stall_min"))
     rx = re.compile(w.get("commit_grep") or ".*")
     report = w.get("report")
     report_ok = not report or os.path.exists(os.path.join(w["lane"], report))
     subj = lw.commit_subject(w["lane"])
+    armed = {"lane": w["lane"], "run": w.get("run"), "task": w.get("task"), "phase": w.get("phase"),
+             "armed_at": float(w.get("armed_at") or 0.0),
+             "max_wait_min": float(cfg("session.max_wait_min"))}
+    st = lw.read_status(w["lane"], armed)   # R27/R28; R42: inside the caller's per-lane flock
     since = float(w.get("last_activity") or w.get("armed_at") or time.time())
+    if lw.status_activity(st, stall, armed):
+        # R33: the reader moves the lane's idle-clock mark to the file's write (never backwards)
+        since = max(since, float(st["updated_at"]))
+        w["last_activity"] = since
     h = lh.check(w["pane"], w["lane"], w.get("kind"), stall, since, w.get("prompt_marker"))
     fp = pane_fp(h.get("text", ""))
     if w.get("last_pane_fp") is not None and fp != w["last_pane_fp"]:
@@ -262,7 +274,7 @@ def verdict_for(w):
         w["last_activity"] = time.time()
         h = lh.check(w["pane"], w["lane"], w.get("kind"), stall, w["last_activity"], w.get("prompt_marker"))
     w["last_pane_fp"] = fp
-    state, ev = lw.decide(h, subj, rx, report_ok, h.get("text", ""), w.get("phase"), stall)
+    state, ev = lw.decide(h, subj, rx, report_ok, h.get("text", ""), w.get("phase"), stall, st, armed)
     return h, subj, state, ev
 
 
@@ -319,7 +331,13 @@ def apply_verdict(w, state, subj, evidence, h):
     """Record via lane-watch's record() (verdict → mk-state status, WATCHED guard), label + toast,
     stamp the watch file. A failed mk-state write stamps nothing, so the next event retries. A
     group lane arms every listed task, so the verdict is recorded for all of them (children, or
-    the task itself when it has none) — the same list dispatch's building marks use."""
+    the task itself when it has none) — the same list dispatch's building marks use. R41: every
+    verdict event/note written here carries source=status|pane|grace — decide()'s evidence ends
+    with it; evidence from any other caller (the pane-exit STALL) is a pane detection and gets
+    source=pane appended."""
+    evidence = list(evidence or [])
+    if not any(str(e).startswith("source=") for e in evidence):   # R41: pane detections (R35)
+        evidence = evidence + ["source=pane"]
     rec = lw.record({"state": state, "commit": subj, "evidence": evidence,
                      "agent_status": (h or {}).get("agent_status")}, watch_tasks(w), w["data"],
                     w.get("run"))
@@ -896,7 +914,7 @@ def self_test():
         os.makedirs(ex_dir, exist_ok=True)
         with open(os.path.join(ex_dir, "exclude"), "a") as f:
             f.write(".matrixkoder-*\n")
-        tasks = ("H1", "H2", "H3", "H4", "H5", "H6", "H7")
+        tasks = ("H1", "H2", "H3", "H4", "H5", "H6", "H7", "T1", "T2")  # T1/T2: MB3.2 status-file cases
         lanes = {}
         for tid in tasks:
             lanes[tid] = os.path.join(tmp, "lane-" + tid.lower())
@@ -933,6 +951,15 @@ def self_test():
             w = watch_of(tid)
             w.update(kw)
             json.dump(w, open(os.path.join(lanes[tid], WATCH), "w"), indent=2)
+
+        def wstat(tid, state, updated_at, **kw):
+            # a contract-valid v1 status file (status-contract.md Table 1) into the lane; kw overrides
+            d = {"v": 1, "seq": 1, "run": "r1", "task": tid, "round": 1, "role": "builder",
+                 "agent": "opencode", "state": state, "step": "selftest", "phases_done": [],
+                 "question": None, "commit": None, "report": "report.json", "subagent": None,
+                 "ctx_pct": None, "started_at": updated_at, "updated_at": updated_at}
+            d.update(kw)
+            json.dump(d, open(os.path.join(lanes[tid], ".matrixkoder-status.json"), "w"))
 
         # fake herdr on PATH: agent get/read answer from files, notification calls are recorded
         bin_ = os.path.join(tmp, "bin")
@@ -1130,6 +1157,10 @@ def self_test():
         r = event(tid="H4", exited=True)
         assert r["verdict"] == "STALL" and r["status"] == "stalled" and task_status("H4") == "stalled", r
         assert any("agent exited" in e.get("text", "") for e in events())
+        # R41 guard: the pane-exit STALL note carries a source (apply_verdict appended source=pane;
+        # H4 is the only lane-watch STALL so far — the sweep STALLs come later)
+        assert all("source=pane" in e.get("text", "") for e in events()
+                   if e.get("text", "").startswith("lane-watch STALL"))
         r = event(tid="H4", exited=True)
         assert r.get("noop") is True
 
@@ -1165,6 +1196,42 @@ def self_test():
         assert r["verdict"] == "STALL" and task_status("H7") == "review", r
         assert watch_of("H7")["verdict"] == "STALL"
         assert any("status review kept" in e.get("text", "") for e in events())
+
+        # (MB3.2) the status-file channel: verdict_for reads <lane>/.matrixkoder-status.json first
+        # (R27) inside the caller's per-lane flock (R42), and every verdict note carries a source (R41)
+        # case 1: pane shows NO token, the status file says done -> DONE from the file (R30), source=status
+        g(lanes["T1"], "commit", "-q", "--allow-empty", "-m", "feat(p1): status core")
+        open(os.path.join(lanes["T1"], "report.json"), "w").write("{}")
+        open(pane_f, "w").write("> dispatch-t1\nwork finished, gates green\n")
+        open(status_f, "w").write("done")
+        arm("T1", phase="T1 R1", report="report.json", prompt_marker="dispatch-t1")
+        wstat("T1", "done", time.time(), commit="0123456789abcdef0123456789abcdef01234567")
+        r = event("done", tid="T1")
+        assert r["verdict"] == "DONE" and r["status"] == "verifying" and r["recorded"], r
+        assert task_status("T1") == "verifying" and watch_of("T1")["verdict"] == "DONE"
+        assert "source=status" in [t for t in transitions() if t.get("task") == "T1"][-1]["text"]
+        # case 2: the same lane, a stale file (armed_at later than updated_at, R27.7) -> no verdict
+        mks("task", "set", "T1", "status=building")
+        patch_watch("T1", verdict=None, verdict_at=None, armed_at=time.time() + 60)
+        r = event("done", tid="T1")
+        assert r.get("verdict") is None and "no verdict" in r.get("note", ""), r
+        assert task_status("T1") == "building"
+        armed = {"lane": lanes["T1"], "run": "r1", "task": "T1", "phase": "T1 R1",
+                 "armed_at": time.time() + 60, "max_wait_min": 30}
+        assert lw.read_status(lanes["T1"], armed) is None  # R27.7 directly: updated_at < armed_at
+        patch_watch("T1", armed_at=time.time())  # later cases use their own lanes; leave this one sane
+        # case 3: a v=99 file the reader must ignore whole (R39) -> the pane token is the only channel
+        g(lanes["T2"], "commit", "-q", "--allow-empty", "-m", "feat(p1): pane core")
+        open(os.path.join(lanes["T2"], "report.json"), "w").write("{}")
+        open(pane_f, "w").write("> dispatch-t2\nall gates green\n⏺ T2 R1 DONE\n")
+        open(status_f, "w").write("done")
+        arm("T2", phase="T2 R1", report="report.json", prompt_marker="dispatch-t2")
+        wstat("T2", "done", time.time(), v=99, commit="0123456789abcdef0123456789abcdef01234567")
+        r = event("done", tid="T2")
+        assert r["verdict"] == "DONE" and r["status"] == "verifying" and r["recorded"], r
+        t2 = [t for t in transitions() if t.get("task") == "T2"][-1]["text"]
+        assert "source=pane" in t2 and "source=status" not in t2, t2
+        assert task_status("T2") == "verifying"
 
         # dispatch: prompt + delivery check in one call, against the fake herdr ($MK_HERDR)
         calls = os.path.join(tmp, "calls.log")
