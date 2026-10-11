@@ -139,6 +139,11 @@ const ALLOW = [
   "echo '$(git reset)'",
   'echo "a \\"; git reset\\""',
   "git commit -m '--amend'",
+  'git commit -m --amend',
+  'git commit -m "x"',
+  'git commit -F msg.txt',
+  'echo "git commit --amend"',
+  'echo "see the heredoc body: git commit --amend"',
   'echo hi # git reset',
   "bash -c 'git status'",
 ]
@@ -153,6 +158,26 @@ test('denies the banned git forms the first guard caught', async ($, on) => {
 test('denies the review bypass forms', async ($, on) => {
   stubBash(on)
   expect(await misses(c => $.tool.call(c), DENY_REVIEW, true)).toEqual([])
+})
+
+// G2: an attached short-option value must not hide a following --amend.
+// Each case is its own assertion so a regression names the command that slipped through.
+const DENY_AMEND_ATTACHED = [
+  'git commit -mfoot --amend',
+  'git commit -amfoo --amend',
+  'git commit -m"fix test" --amend',
+  'git commit -am msg --amend',
+  'git commit -m msg --amend',
+]
+
+test('denies --amend after an attached short-option value', async ($, on) => {
+  stubBash(on)
+  for (const command of DENY_AMEND_ATTACHED) {
+    const ran = await $.tool.call({ tool: 'Bash', command })
+    expect(ran.deny, command).toBe(
+      'MatrixKoder guard: git commit --amend is banned (history rewrite). Undo by an inverse edit instead.',
+    )
+  }
 })
 
 test('allows safe git, restore --staged and quoted mentions', async ($, on) => {
