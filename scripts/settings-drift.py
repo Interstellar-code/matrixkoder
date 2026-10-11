@@ -15,14 +15,19 @@ allows a `.ts` file as a fallback for the same reason.
 
 Usage:
   settings-drift.py --write         regenerate the committed file
-  settings-drift.py --check         fail with the differing keys if the file
-                                    has drifted from the live sources
-  settings-drift.py --self-test     prove --check fails on a tampered copy
+  settings-drift.py --check         fail with the differing keys/fields if
+                                    the file has drifted from the live
+                                    sources (compares the whole shape, not
+                                    a subset — every field the test reads
+                                    must match)
+  settings-drift.py --self-test     prove --check fails on a tampered temp
+                                    copy (the committed file is never
+                                    touched; a path is passed via an
+                                    internal argv)
 
-The script always uses a fresh temp data dir for `mk-config.py` (an empty
-yaml, plus a minimal `agents:` block so the schema exposes the five
-`agents.<name>.available` rows the fixture also draws). The real
-`.matrixkoder/` is never touched.
+The script always uses a fresh temp data dir for `mk-config.py`. See MIN_YAML
+for why that yaml carries an `agents:` block. The real `.matrixkoder/` is
+never touched.
 """
 from __future__ import annotations
 
@@ -39,10 +44,18 @@ MK_CONFIG = REPO_ROOT / "scripts" / "mk-config.py"
 PLUGIN_JSON = REPO_ROOT / ".claude-plugin" / "plugin.json"
 OUT_FILE = REPO_ROOT / "hooks" / "tabs" / "settings.schema.ts"
 
-# The minimal yaml the schema needs to expose the rows the fixture draws:
-# five agents (so `agents.<name>.available` shows up) with `opencode.models`
-# a list (so `picks.opencode` shows up, matching the fixture's picks row).
-# Anything not in this yaml is reported as the schema default.
+# MIN_YAML is the minimal yaml the schema needs to expose the rows the
+# fixture also draws. Why this exists at all: mk-config.py derives some
+# schema rows from the active yaml — without an `agents:` block, the
+# `agents.<name>.available` rows and the `picks.opencode` row (which is
+# sourced from `opencode.models`) do not appear. The committed file and
+# the TS test both rely on those rows being present, so the schema has to
+# be captured with the same minimal yaml. The script writes this yaml into
+# a fresh temp data dir; the real `.matrixkoder/` is never touched.
+#
+# If mk-config.py stops emitting the `agents.*` rows from this yaml (for
+# example because the gating logic moves), `self_test` asserts on it and
+# the test fails before the broken committed file is shipped.
 MIN_YAML = (
     "agents:\n"
     "  opencode: { available: true, models: [a] }\n"
@@ -141,59 +154,75 @@ def cmd_write(live_obj: dict) -> int:
     return 0
 
 
-def diff_keys(a: object, b: object, label: str) -> list[str]:
-    """Keys present in A but missing in B, and vice versa. Values are
-    checked separately by the caller."""
-    if not (isinstance(a, list) and isinstance(b, list)):
-        return [f"{label}: shape differs (a={type(a).__name__} b={type(b).__name__})"]
-    a_keys = {x.get("key") for x in a if isinstance(x, dict) and "key" in x}
-    b_keys = {x.get("key") for x in b if isinstance(x, dict) and "key" in x}
-    only_a = sorted(k for k in a_keys - b_keys if k is not None)
-    only_b = sorted(k for k in b_keys - a_keys if k is not None)
+def diff_paths(a: object, b: object) -> list[str]:
+    """Walk a and b and return dotted paths to every differing leaf, plus
+    `shape` lines for type/keyset mismatches. The whole shape is compared
+    — every field the test reads (key, scope, default, editable, type)
+    must match. A flip of `editable` in mk-config.py is caught here
+    because the parsed dicts no longer match."""
     out: list[str] = []
-    for k in only_a:
-        out.append(f"{label}: live has {k!r}, file does not")
-    for k in only_b:
-        out.append(f"{label}: file has {k!r}, live does not")
+
+    def walk(x: object, y: object, path: str) -> None:
+        if type(x) is not type(y):
+            out.append(f"{path}: type differs (live={type(x).__name__} file={type(y).__name__})")
+            return
+        if isinstance(x, dict):
+            x_keys = set(x.keys())
+            y_keys = set(y.keys())
+            for k in sorted(x_keys - y_keys):
+                out.append(f"{path}.{k}: live has it, file does not")
+            for k in sorted(y_keys - x_keys):
+                out.append(f"{path}.{k}: file has it, live does not")
+            for k in sorted(x_keys & y_keys):
+                walk(x[k], y[k], f"{path}.{k}" if path else k)
+        elif isinstance(x, list):
+            if len(x) != len(y):
+                out.append(f"{path}: list length differs (live={len(x)} file={len(y)})")
+                return
+            # Lists of dicts with a `key` field are compared by key so
+            # the report names the row, not the index. Other lists are
+            # compared positionally.
+            if x and y and all(isinstance(v, dict) and "key" in v for v in x) and all(isinstance(v, dict) and "key" in v for v in y):
+                x_by = {v["key"]: v for v in x if isinstance(v.get("key"), str)}
+                y_by = {v["key"]: v for v in y if isinstance(v.get("key"), str)}
+                for k in sorted(set(x_by) - set(y_by)):
+                    out.append(f"{path}: live has key {k!r}, file does not")
+                for k in sorted(set(y_by) - set(x_by)):
+                    out.append(f"{path}: file has key {k!r}, live does not")
+                for k in sorted(set(x_by) & set(y_by)):
+                    walk(x_by[k], y_by[k], f"{path}[{k!r}]")
+            else:
+                for i, (xi, yi) in enumerate(zip(x, y)):
+                    walk(xi, yi, f"{path}[{i}]")
+        else:
+            if x != y:
+                out.append(f"{path}: differs (live={x!r} file={y!r})")
+
+    walk(a, b, "")
     return out
 
 
-def diff_user_config(a: dict, b: dict) -> list[str]:
-    out: list[str] = []
-    only_a = sorted(set(a) - set(b))
-    only_b = sorted(set(b) - set(a))
-    for k in only_a:
-        out.append(f"userConfig: live has {k!r}, file does not")
-    for k in only_b:
-        out.append(f"userConfig: file has {k!r}, live does not")
-    for k in sorted(set(a) & set(b)):
-        if a[k] != b[k]:
-            out.append(f"userConfig: {k} default differs (live={a[k]!r} file={b[k]!r})")
-    return out
+def cmd_check(live_obj: dict, file_path: Path = OUT_FILE) -> int:
+    """Compare the whole parsed shape of `file_path` against the live shape.
 
-
-def diff_defaults(a: list[dict], b: list[dict]) -> list[str]:
-    """Per-key default comparison on the schema rows."""
-    a_by = {x["key"]: x.get("default") for x in a if "key" in x}
-    b_by = {x["key"]: x.get("default") for x in b if "key" in x}
-    out: list[str] = []
-    for k in sorted(set(a_by) & set(b_by)):
-        if a_by[k] != b_by[k]:
-            out.append(f"schema: {k} default differs (live={a_by[k]!r} file={b_by[k]!r})")
-    return out
-
-
-def cmd_check(live_obj: dict) -> int:
-    if not OUT_FILE.exists():
-        print(f"{OUT_FILE.relative_to(REPO_ROOT)}: missing — run --write", file=sys.stderr)
+    The previous implementation compared only key sets, userConfig defaults
+    and schema defaults, so a flip of `editable` / `scope` / `type` in
+    mk-config.py could leave the committed file stale with no signal. The
+    TS test (`hooks/settings-io.test.ts`, schema test) reads `editable` and
+    `scope` from the file, so the test was then checking the wrong rows.
+    The whole shape is small and deterministic — comparing it directly
+    catches every field the test relies on."""
+    if not file_path.exists():
+        if file_path == OUT_FILE:
+            print(f"{OUT_FILE.relative_to(REPO_ROOT)}: missing — run --write", file=sys.stderr)
+        else:
+            print(f"{file_path}: missing", file=sys.stderr)
         return 1
-    file_obj = from_ts(OUT_FILE.read_text())
-    problems: list[str] = []
-    problems += diff_keys(live_obj.get("schema"), file_obj.get("schema"), "schema")
-    problems += diff_user_config(live_obj.get("userConfig", {}), file_obj.get("userConfig", {}))
-    problems += diff_defaults(live_obj.get("schema", []), file_obj.get("schema", []))
+    file_obj = from_ts(file_path.read_text())
+    problems = diff_paths(live_obj, file_obj)
     if problems:
-        print("settings-drift: drift detected", file=sys.stderr)
+        label = file_path.relative_to(REPO_ROOT) if file_path.is_absolute() and str(file_path).startswith(str(REPO_ROOT)) else file_path
+        print(f"settings-drift: drift detected in {label}", file=sys.stderr)
         for p in problems:
             print(f"  {p}", file=sys.stderr)
         print(f"  fix: python3 scripts/settings-drift.py --write", file=sys.stderr)
@@ -205,49 +234,86 @@ def cmd_check(live_obj: dict) -> int:
 # ---------- self-test ----------
 
 def self_test() -> int:
-    """Prove --check fails on a tampered copy. We rewrite OUT_FILE in place
-    with a known-wrong default, run --check, and restore."""
+    """Prove --check fails on a tampered copy and the committed file is
+    never touched. We write a tampered variant to a temp file and pass
+    its path to cmd_check via an internal argv."""
     if not OUT_FILE.exists():
         print("self-test: skipped (no settings.schema.ts yet — run --write first)", file=sys.stderr)
         return 1
-    backup = OUT_FILE.read_text()
-    try:
-        live_obj = live()
-        tampered = from_ts(backup)
-        if not tampered["schema"]:
-            print("self-test: schema empty, cannot tamper", file=sys.stderr)
-            return 1
-        tampered["schema"][0]["default"] = "__tampered__"
-        OUT_FILE.write_text(to_ts(tampered))
-        rc = cmd_check(live_obj)
-        if rc == 0:
-            print("self-test FAIL: --check did not flag a tampered default", file=sys.stderr)
-            return 1
-        print("self-test: --check fails on a tampered default ✓")
-    finally:
-        OUT_FILE.write_text(backup)
-    rc = cmd_check(live())
-    if rc != 0:
-        print("self-test FAIL: --check did not pass after restore", file=sys.stderr)
+
+    # Guard 1: the schema the live sources emit, with our minimal yaml,
+    # must include the `agents.*` rows. If mk-config.py stops gating
+    # those rows on the yaml, this fails before any tamper check runs —
+    # the committed file would otherwise miss those rows with no signal.
+    live_obj = live()
+    schema_keys = {row["key"] for row in live_obj["schema"]}
+    expected_agent_keys = {
+        "agents.opencode.available",
+        "agents.claude.available",
+        "agents.codex.available",
+        "agents.agy.available",
+        "agents.herdr.available",
+    }
+    missing = sorted(expected_agent_keys - schema_keys)
+    if missing:
+        print(
+            f"self-test FAIL: mk-config stopped emitting agents.* rows from MIN_YAML: {missing}",
+            file=sys.stderr,
+        )
         return 1
-    print("self-test: --check passes after restore ✓")
+    print("self-test: MIN_YAML still emits the agents.* rows ✓")
+
+    # Guard 2: --check catches a tamper on a temp copy. A single byte flip
+    # (editable false -> true) is enough to fail the whole-shape compare;
+    # --check on the committed file must still pass.
+    tampered = from_ts(OUT_FILE.read_text())
+    if not tampered["schema"]:
+        print("self-test: schema empty, cannot tamper", file=sys.stderr)
+        return 1
+    target = next(r for r in tampered["schema"] if r.get("editable") is True)
+    target["editable"] = not target["editable"]  # toggle, so a False->True flip is just as caught as True->False
+    tamper_path = OUT_FILE.with_name(OUT_FILE.name + ".tamper")
+    try:
+        tamper_path.write_text(to_ts(tampered))
+        rc = cmd_check(live_obj, tamper_path)
+        if rc == 0:
+            print("self-test FAIL: --check did not flag a tampered editable flag", file=sys.stderr)
+            return 1
+        print("self-test: --check fails on a tampered editable flag ✓")
+    finally:
+        tamper_path.unlink(missing_ok=True)
+
+    # Guard 3: the committed file is unchanged.
+    rc = cmd_check(live_obj)
+    if rc != 0:
+        print("self-test FAIL: --check did not pass on the committed file", file=sys.stderr)
+        return 1
+    print("self-test: --check passes on the committed file ✓")
     return 0
 
 
 # ---------- entry ----------
 
 def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--write", action="store_true", help="regenerate the committed file")
     g.add_argument("--check", action="store_true", help="fail if the file has drifted")
     g.add_argument("--self-test", action="store_true", help="prove --check catches tampering")
+    # Internal: cmd_check target. Passed as a positional so selftest can
+    # run cmd_check on a temp copy without ever touching the committed
+    # file. Undocumented on purpose — users go through --check / --write.
+    ap.add_argument("--check-path", default=None, help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
     if args.self_test:
         return self_test()
     live_obj = live()
     if args.write:
         return cmd_write(live_obj)
+    if args.check_path is not None:
+        return cmd_check(live_obj, Path(args.check_path))
     return cmd_check(live_obj)
 
 
