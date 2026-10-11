@@ -76,10 +76,8 @@ CREATE TABLE IF NOT EXISTS schema_version(version INTEGER PRIMARY KEY);
 """
 # v2: artifacts.src is the importer's stable source key. NULL on rows written by the live path.
 # event_src mirrors meta_json.src so a repeat import is one indexed lookup, not a table scan.
-V2_SQL = """
-ALTER TABLE artifacts ADD COLUMN src TEXT;
-CREATE TABLE IF NOT EXISTS event_src(run TEXT, src TEXT, PRIMARY KEY(run, src));
-"""
+# A step may be SQL or a callable: ALTER TABLE ADD COLUMN is not idempotent as SQL, so V2 is a
+# function that adds the column only when PRAGMA table_info says it is missing.
 
 
 class Fail(Exception):
@@ -162,12 +160,18 @@ def _migrate(con, version, migrations):
     have = row["v"] or 0
     if have > version:
         raise Fail(f"store schema v{have} is newer than this code (v{version}); upgrade mkdb.py", 3)
-    for n, sql in migrations:
+    for n, step in migrations:
         if n <= have or n > version:
             continue
         # executescript() commits on its own, so the version stamp is a second transaction:
-        # a crash between them re-runs the migration, which is why every migration is idempotent.
-        con.executescript(sql)
+        # a crash between them re-runs the migration, which is why every step is idempotent.
+        # A step is either SQL or a callable(con); an ALTER TABLE ADD COLUMN must be a callable
+        # that checks the column first, because the SQL is not safe to run twice.
+        if callable(step):
+            step(con)
+            con.commit()
+        else:
+            con.executescript(step)
         _begin(con)
         try:
             con.execute("INSERT OR IGNORE INTO schema_version(version) VALUES (?)", (n,))
@@ -191,22 +195,20 @@ def _ensure_prev_status(con):
         con.execute("ALTER TABLE tasks ADD COLUMN prev_status TEXT")
 
 
-def _ensure_artifact_src(con):
-    """v2 columns, re-added if a crash landed between the DDL and its version stamp."""
+def _v2(con):
+    """The shipped v2 step. Safe to run twice: the column, the table and the index are guarded."""
     cols = [r["name"] for r in con.execute("PRAGMA table_info(artifacts)")]
     if cols and "src" not in cols:
         con.execute("ALTER TABLE artifacts ADD COLUMN src TEXT")
     con.execute("CREATE TABLE IF NOT EXISTS event_src(run TEXT, src TEXT, PRIMARY KEY(run, src))")
+    con.execute("CREATE INDEX IF NOT EXISTS art_run_src ON artifacts(run, src)")
 
 
 def open_project(home, slug=None, data_dir=None, version=SCHEMA, migrations=()):
     """Open or create the project store (C2). check_home runs before any directory is created."""
     path = os.path.join(project_dir(home, slug, data_dir), "mk.db")
-    con = _migrate(_connect(path), version, ((1, PROJECT_DDL), (2, V2_SQL)) + tuple(migrations))
+    con = _migrate(_connect(path), version, ((1, PROJECT_DDL), (2, _v2)) + tuple(migrations))
     _ensure_prev_status(con)
-    have = con.execute("SELECT MAX(version) AS v FROM schema_version").fetchone()["v"] or 0
-    if have >= 2:
-        _ensure_artifact_src(con)
     return con
 
 
@@ -576,7 +578,7 @@ def import_history(home, project, run, *, run_row=None, tasks=(), events=(), art
                 cols = ["run"] + list(TASK_COLS) + ["prev_status"]
                 values = [run] + [t.get(c) for c in TASK_COLS] + [prev]
                 values[cols.index("status")] = status
-                existed = con.execute("SELECT 1 FROM tasks WHERE run=? AND id=?", me).fetchone()
+                existed = con.execute("SELECT * FROM tasks WHERE run=? AND id=?", me).fetchone()
                 con.execute(
                     "INSERT INTO tasks(" + ",".join(cols) + ") VALUES (" + ",".join("?" * len(cols)) + ")"
                     " ON CONFLICT(run, id) DO UPDATE SET " + ",".join(
@@ -585,6 +587,12 @@ def import_history(home, project, run, *, run_row=None, tasks=(), events=(), art
                 if not existed:
                     added["tasks"] += 1
                     _change_log(con, run, t["id"])
+                else:
+                    # A re-import logs a change only when a column actually moved, so catch_up()
+                    # rebuilds the card; identical data adds nothing, change_log included.
+                    changed = any(existed[c] != v for c, v in zip(cols, values))
+                    if changed:
+                        _change_log(con, run, t["id"])
             seen_src = set()
             for ev in events:
                 src = ev.get("src")
@@ -603,10 +611,14 @@ def import_history(home, project, run, *, run_row=None, tasks=(), events=(), art
                      ev.get("from_id"), ev.get("to_id"), ev.get("reply_to"), ev.get("text"), meta))
                 con.execute("INSERT INTO event_src(run, src) VALUES (?,?)", (run, src))
                 added["events"] += 1
+            seen_art = set()
             for art in artifacts:
                 src = art.get("src")
                 if not src:
                     raise Fail("artifact missing src")
+                if src in seen_art:
+                    raise Fail(f"duplicate artifact src in one import: {src}")
+                seen_art.add(src)
                 if con.execute("SELECT 1 FROM artifacts WHERE run=? AND src=?", (run, src)).fetchone():
                     continue
                 text = art.get("text")
@@ -652,10 +664,14 @@ def cards(home, project=None):
 
 
 def _cli(argv):
+    # The common options are accepted before or after the subcommand. They are pulled out first,
+    # so a subcommand never sees them and the two positions cannot disagree.
+    common = Parser(prog="mkdb.py", add_help=False)
+    common.add_argument("--data", help="project data dir (overrides --project)")
+    common.add_argument("--home", help="MK home (default $MK_HOME or ~/.matrixkoder)")
+    common.add_argument("--project", help="project slug")
+    known, rest = common.parse_known_args(argv)
     p = Parser(prog="mkdb.py", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--data", help="project data dir (overrides --project)")
-    p.add_argument("--home", help="MK home (default $MK_HOME or ~/.matrixkoder)")
-    p.add_argument("--project", help="project slug")
     sub = p.add_subparsers(dest="cmd")
     tl = sub.add_parser("timeline")
     tl.add_argument("--run", required=True)
@@ -666,7 +682,9 @@ def _cli(argv):
     im = sub.add_parser("import-history")
     im.add_argument("--run", required=True)
     im.add_argument("--json-file", required=True)
-    args = p.parse_args(argv)
+    args = p.parse_args(rest)
+    for name in ("data", "home", "project"):
+        setattr(args, name, getattr(known, name))
     home = resolve_home(args.home)
     if args.data:  # C11: refuse a synced or networked --data dir before any directory is created
         project_dir(home, data_dir=args.data)
@@ -679,8 +697,13 @@ def _cli(argv):
     if args.cmd == "import-history":
         if not args.project:
             raise Fail("import-history needs --project")
-        with open(args.json_file) as fh:
-            doc = json.load(fh)
+        try:
+            with open(args.json_file) as fh:
+                doc = json.load(fh)
+        except (OSError, ValueError) as e:
+            raise Fail(f"bad json file {args.json_file}: {e}")
+        if not isinstance(doc, dict):
+            raise Fail(f"bad json file {args.json_file}: expected an object")
         counts = import_history(home, args.project, args.run, run_row=doc.get("run_row"),
                                 tasks=doc.get("tasks") or (), events=doc.get("events") or (),
                                 artifacts=doc.get("artifacts") or (), data_dir=args.data)
@@ -763,6 +786,9 @@ def self_test():
         _crashes(home)
         _import(home)
         _import_atomic(home)
+        _import_dup_artifact(home)
+        _import_cli(home)
+        _import_reupdate(home)
         _import_cycle(home)
         _import_race(home)
         _v1_upgrade(home)
@@ -1061,6 +1087,37 @@ def _cycle_race(home):
 
 
 def _migrations(home):
+    """Finding 1: the REAL v2 step, applied without its stamp, must succeed on the next open."""
+    v1 = os.path.join(home, "v2crash")
+    con = open_project(home, data_dir=v1, version=1, migrations=())
+    try:
+        add_task(con, "r", "kept", "task", title="keep me")
+    finally:
+        con.close()
+    bare = sqlite3.connect(os.path.join(v1, "mk.db"))
+    bare.row_factory = sqlite3.Row
+    _v2(bare)  # the crash: the step landed, the schema_version stamp did not
+    bare.commit()
+    bare.close()
+    reopened = open_project(home, data_dir=v1)
+    try:
+        _check(reopened.execute("SELECT MAX(version) v FROM schema_version").fetchone()["v"] == 2,
+               "v2 not stamped after the crash")
+        _check(reopened.execute("SELECT title FROM tasks WHERE id='kept'").fetchone()["title"] == "keep me",
+               "v2 crash lost a row")
+        _check(reopened.execute("SELECT 1 FROM sqlite_master WHERE name='art_run_src'").fetchone(),
+               "art_run_src missing")
+    finally:
+        reopened.close()
+    again = open_project(home, data_dir=v1)
+    third = open_project(home, data_dir=v1)
+    try:
+        _check(again.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == 2, "reopen grew")
+        _check(third.execute("SELECT title FROM tasks WHERE id='kept'").fetchone()["title"] == "keep me",
+               "second reopen lost a row")
+    finally:
+        again.close()
+        third.close()
     data = os.path.join(home, "mig")
     first = open_project(home, data_dir=data, version=3, migrations=((3, V3_SQL),))
     _check(first.execute("SELECT 1 FROM sqlite_master WHERE name='mkdb_v3_probe'").fetchone(), "v2")
@@ -1292,6 +1349,86 @@ def _import(home):
     try:
         _check(_checksum(con) == digest, "second import changed a row")
         _check(con.execute("SELECT COUNT(*) c FROM events").fetchone()["c"] == n_events, "events grew")
+    finally:
+        con.close()
+
+
+def _import_dup_artifact(home):
+    """Finding 2: two artifacts with one src in a batch are refused and nothing is written."""
+    data = os.path.join(home, "dupa")
+    try:
+        import_history(home, "dupa", "hist",
+                       tasks=[{"id": "t", "type": "task", "status": "planned"}],
+                       artifacts=[{"src": "same", "task": "t", "round": 1, "kind": "report", "rev": 1,
+                                   "text": "one", "created": "2020-01-01T00:00:00+00:00"},
+                                  {"src": "same", "task": "t", "round": 1, "kind": "report", "rev": 2,
+                                   "text": "two", "created": "2020-01-01T00:00:01+00:00"}],
+                       data_dir=data)
+    except Fail as e:
+        _check("duplicate artifact src" in str(e), f"unexpected error {e}")
+    else:
+        raise SystemExit("SELF-TEST FAIL: a duplicate artifact src was imported")
+    con = open_project(home, data_dir=data)
+    try:
+        for table in ("tasks", "artifacts", "change_log"):
+            _check(con.execute(f"SELECT COUNT(*) c FROM {table}").fetchone()["c"] == 0,
+                   f"{table} written despite the duplicate src")
+    finally:
+        con.close()
+
+
+def _import_cli(home):
+    """Finding 3: a bad JSON file is a JSON error, and options work after the subcommand."""
+    data = os.path.join(home, "cli")
+    base = [sys.executable, os.path.abspath(__file__), "--home", home, "--data", data]
+    def run(args, payload=None):
+        path = None
+        if payload is not None:
+            path = os.path.join(home, "in.json")
+            with open(path, "w") as fh:
+                fh.write(payload)
+        proc = subprocess.run(base + args + (["--json-file", path] if path else []),
+                              capture_output=True, text=True)
+        return proc.returncode, proc.stdout, proc.stderr
+    rc, out, err = run(["import-history", "--project", "cli", "--run", "hist"], payload="[1, 2]")
+    _check(rc != 0 and "Traceback" not in err and '"ok": false' in out, f"non-object: rc={rc} out={out!r} err={err!r}")
+    rc, out, err = run(["import-history", "--project", "cli", "--run", "hist"], payload="{")
+    _check(rc != 0 and "Traceback" not in err and '"ok": false' in out, f"bad json: rc={rc} out={out!r} err={err!r}")
+    rc, out, err = run(["import-history", "--project", "cli", "--run", "hist", "--json-file",
+                        os.path.join(home, "missing.json")])
+    _check(rc != 0 and "Traceback" not in err and '"ok": false' in out, f"missing: rc={rc} out={out!r} err={err!r}")
+    good = json.dumps({"run_row": {"id": "hist", "status": "done"},
+                       "tasks": [{"id": "t", "type": "task", "status": "done"}]})
+    rc, out, err = run(["import-history", "--run", "hist", "--project", "cli"], payload=good)
+    _check(rc == 0 and '"tasks": 1' in out, f"options after subcommand: rc={rc} out={out!r} err={err!r}")
+
+
+def _import_reupdate(home):
+    """Finding 6: a re-import logs a change only when a column changed."""
+    data = os.path.join(home, "reup")
+    task = {"id": "t", "type": "task", "status": "planned", "title": "one"}
+    import_history(home, "reup", "hist", tasks=[task], data_dir=data)
+    con = open_project(home, data_dir=data)
+    try:
+        before = con.execute("SELECT COUNT(*) c FROM change_log").fetchone()["c"]
+    finally:
+        con.close()
+    same = import_history(home, "reup", "hist", tasks=[dict(task)], data_dir=data)
+    _check(same["tasks"] == 0, f"identical re-import counted a task: {same}")
+    con = open_project(home, data_dir=data)
+    try:
+        _check(con.execute("SELECT COUNT(*) c FROM change_log").fetchone()["c"] == before,
+               "identical re-import wrote change_log")
+    finally:
+        con.close()
+    changed = dict(task, title="two")
+    import_history(home, "reup", "hist", tasks=[changed], data_dir=data)
+    con = open_project(home, data_dir=data)
+    try:
+        after = con.execute("SELECT COUNT(*) c FROM change_log").fetchone()["c"]
+        _check(after == before + 1, f"changed re-import logged {after - before}")
+        _check(con.execute("SELECT title FROM tasks WHERE id='t'").fetchone()["title"] == "two",
+               "update did not land")
     finally:
         con.close()
 

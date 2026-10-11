@@ -370,15 +370,19 @@ Every open sets `journal_mode=WAL`, `busy_timeout=5000`, `foreign_keys=ON`. Ever
 ### `schema_version` and migrations
 
 Both stores carry `schema_version(version INTEGER PRIMARY KEY)`. `SCHEMA = 2`. Migrations are an
-ordered `(version, sql)` list applied once, each idempotent (`CREATE TABLE IF NOT EXISTS`,
-`INSERT OR IGNORE`, and `ALTER TABLE` guarded by a column check) because the DDL and its version
-stamp are two transactions. A store whose version is newer than the code is refused:
+ordered `(version, step)` list applied once. A step is either SQL or a Python callable. SQL steps
+are idempotent by construction (`CREATE TABLE IF NOT EXISTS`, `INSERT OR IGNORE`); an
+`ALTER TABLE ADD COLUMN` is not safe to run twice, so it goes through a guarded Python step that
+checks `PRAGMA table_info` and adds the column only when it is missing. The step and its version
+stamp are two transactions, so a crash between them re-runs the step. A store whose version is
+newer than the code is refused:
 `{"ok": false, "error": "store schema vN is newer …"}`, exit 3.
 
-v2 (shipped) adds `artifacts.src TEXT` — the importer's stable source key, NULL on rows the live
-path writes — and `event_src(run, src, PRIMARY KEY(run, src))`, the same key for events so a
-repeat import is an indexed lookup. A v1 store is upgraded in place the next time it is opened
-and keeps every row it had. The v2→v3 migration exists only inside `--self-test`.
+v2 (shipped, a Python step) adds `artifacts.src TEXT` — the importer's stable source key, NULL
+on rows the live path writes — the index `art_run_src(run, src)`, and `event_src(run, src,
+PRIMARY KEY(run, src))`, the same key for events so a repeat import is an indexed lookup. A v1
+store is upgraded in place the next time it is opened and keeps every row it had; re-running the
+step changes nothing. The v2→v3 migration exists only inside `--self-test`.
 
 ### Project tables (C2)
 
