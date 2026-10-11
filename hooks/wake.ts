@@ -38,8 +38,8 @@ const EMPTY_PENDING: Pending = { run: '', upTo: 0, items: [] }
 
 /** Same rule as the dashboard and mk-state: MATRIXKODER_DATA, else the nearest .git (never above $HOME);
  *  a linked worktree resolves to its main checkout. Pure helpers are in data.ts ($ may not cross an import).
- *  Exported for tools.ts (mk_bus's --data) — the single canonical copy; dashboard.tsx keeps its own. */
-export async function resolveDataDir($: EngineInterface): Promise<string> {
+ *  tools.ts (mk_bus's --data) keeps its own file-local copy for the same loader rule. */
+async function resolveDataDir($: EngineInterface): Promise<string> {
   try {
     const envData = await $.env.get('MATRIXKODER_DATA')
     if (envData) return envData.trim()
@@ -265,7 +265,9 @@ async function flushBatch($: EngineInterface): Promise<void> {
     // An ask wake stamps ONLY its ask cooldown id: stamping the plain `${task}:blocked`
     // as well would suppress an unrelated later plain blocked wake for the same task
     // inside the 5-min window (and vice versa the ask key never blocks a plain wake).
-    const cooldownId = p.askId === undefined ? `${p.task}:${p.to}` : `${p.task}:blocked:${p.askId}`
+    // The ask id carries the run (pend.run): ids repeat across runs, so an id-only key
+    // would let run A's m-1 throttle run B's m-1 for the same task (review LOW 3).
+    const cooldownId = p.askId === undefined ? `${p.task}:${p.to}` : `${p.task}:blocked:${pend.run}:${p.askId}`
     await $.state
       .set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: cooldownId } as const, now)
       .catch(() => {})
@@ -345,11 +347,13 @@ async function pollEvents($: EngineInterface): Promise<void> {
           // A bus ask is a question, not a status: two different asks are two different
           // questions, and the per task:status key would swallow the second ask inside the
           // 5-min cooldown — so a blocked transition whose note is a bus ask carries the
-          // ask's message id and throttles per ASK, not per task:status.
+          // ask's message id and throttles per ASK, not per task:status. The key carries
+          // the run too (events.jsonl is per active run): ask ids repeat across runs, so
+          // run B's m-1 must not be throttled by run A's m-1 stamp (review LOW 3).
           const askMatch =
             ev.to === 'blocked' && typeof ev.text === 'string' ? /^bus ask (m-\d+):/.exec(ev.text) : null
           const askId = askMatch?.[1]
-          const throttleKey = askId === undefined ? `${ev.task}:${ev.to}` : `${ev.task}:blocked:${askId}`
+          const throttleKey = askId === undefined ? `${ev.task}:${ev.to}` : `${ev.task}:blocked:${active.id}:${askId}`
           const sentRef = { plugin: 'matrixkoder', key: 'wakeSentAt', id: throttleKey } as const
           const sentRes = await $.state.get(sentRef).catch(() => ({ value: undefined }))
           const lastSent = typeof sentRes.value === 'number' ? sentRes.value : undefined

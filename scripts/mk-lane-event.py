@@ -835,6 +835,10 @@ def cmd_disarm(a):
         wdata = (w or {}).get("data")
     enabled = (bus_enabled(wdata) if wdata  # the watch names the data dir its bus lives in
                else bool(cfg("bus.enabled")))  # no watch (or no data in it): the ambient resolve
+    # Spec-literal: "bus.enabled: false -> neither runs". So a bus.enabled flipped to
+    # false between arm and disarm leaves the lane token unrevoked on the bus (review
+    # LOW) — accepted: the token only authenticates against this loopback bus, and the
+    # owner-timeout shutdown is the backstop that eventually kills it with the server.
     bus = (disarm_bus(lane, wdata) if enabled
            else {"ok": True, "skipped": "bus.enabled is false"})
     out({"ok": True, "lane": lane, "removed": removed, "bus": bus})

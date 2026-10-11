@@ -24,9 +24,9 @@ Subcommands:
       Removes <lane>/.matrixkoder-bus.json and invalidates token.
   send --run ID --task T --kind KIND --text TEXT [--from S] [--to S] [--reply-to ID] [--data DIR]
       Sends a message via POST /send. A lane-token ask also marks its task blocked in run state
-      (mk-state task set <T> status=blocked --note "bus ask <id>: <text>" --by bus, once per ask
-      id); that reply carries state_updated/mk_state_error, and an mk-state failure never fails
-      the POST.
+      (mk-state task set <T> status=blocked --note "bus ask <id>: <text>" --by bus, once per
+      (run, ask id) — ids are per run); that reply carries state_updated/mk_state_error, and an
+      mk-state failure never fails the POST.
   answer MSG_ID TEXT [--run ID] [--data DIR]
       Sends answer message with reply_to=MSG_ID. Also runs
       scripts/mk-state.py --data <data> --run ID task set <T> status=building --note "bus answer".
@@ -241,16 +241,20 @@ class BusState:
         self.tokens = {}
         self.tokens_mtime = 0
         self.runs = {}
-        # ask ids whose task was already marked blocked (the /send lane-ask path): guards the
-        # "once per ask id" mk-state write, thread-safe under the same lock as every other state
+        # (run, ask id) pairs whose task was already marked blocked (the /send lane-ask
+        # path): guards the "once per ask" mk-state write, thread-safe under the same lock
+        # as every other state change. Ask ids are per run ("m-1" exists in every run),
+        # so the key carries the run too — an id-only key would let run A's m-1 suppress
+        # run B's m-1 blocked-marking on the same bus (review MEDIUM 2).
         self.marked_asks = set()
 
-    def mark_ask_once(self, ask_id):
-        """True exactly once per ask id: the caller may run its one blocked-marking write."""
+    def mark_ask_once(self, run, ask_id):
+        """True exactly once per (run, ask id): the caller may run its one blocked-marking write."""
         with self.lock:
-            if ask_id in self.marked_asks:
+            key = (run, ask_id)
+            if key in self.marked_asks:
                 return False
-            self.marked_asks.add(ask_id)
+            self.marked_asks.add(key)
             return True
 
     def get_token(self, token_str):
@@ -1039,7 +1043,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     # guard is the bus state's set; an mk-state failure rides in the reply and
                     # never fails the POST (the ask itself was already delivered).
                     ask_reply = {"state_updated": False, "mk_state_error": None}
-                    if self.server.bus_state.mark_ask_once(msg["id"]):
+                    if self.server.bus_state.mark_ask_once(run, msg["id"]):
                         ask_reply["state_updated"], ask_reply["mk_state_error"] = _mk_state_task_set(
                             self.server.bus_state.data_dir, run, task, "blocked",
                             f"bus ask {msg['id']}: {text[:80]}", by="bus")
@@ -2681,6 +2685,67 @@ def self_test():
             f.write("bus:\n  owner_timeout_min: 999\n")
         assert owner_timeout_s(data_ot) == 120 * 60.0  # clamped up to the schema max
         done("owner_timeout_s: env > yaml (clamped) > 1800 s default")
+
+        # 11f. Ask ids are per run ("m-1" exists in every run), so the once-per-ask guard
+        # must key (run, id), not id alone (review MEDIUM 2): two runs on ONE bus, each
+        # lane's first ask is m-1 — both tasks must go blocked. Also pins the argparse
+        # side of the "--" terminator (review MEDIUM 1): option-shaped answer texts reach
+        # mk-bus.py only after "--" and are stored verbatim, flags not hijacked.
+        data_2r = os.path.join(tmp, "data_2runs")
+        os.makedirs(data_2r, exist_ok=True)
+        for rid, tid in (("r6", "T6"), ("r7", "T7")):
+            subprocess.run([sys.executable, mk_state, "--data", data_2r, "run", "init", "--id", rid, "--feature", "f", "--branch", "b", "--force"], check=True, capture_output=True)
+            subprocess.run([sys.executable, mk_state, "--data", data_2r, "--run", rid, "task", "add", "--id", tid, "--title", f"ask lane {rid}"], check=True, capture_output=True)
+            subprocess.run([sys.executable, mk_state, "--data", data_2r, "--run", rid, "task", "set", tid, "status=building"], check=True, capture_output=True)
+
+        rc, res_ens_2r, _ = cli(["ensure", "--data", data_2r, "--run", "r6"])
+        assert rc == 0 and res_ens_2r["ok"] is True, res_ens_2r
+        pids.append(res_ens_2r["pid"])
+        port_2r = res_ens_2r["port"]
+
+        def post_ask_2r(tok, text):
+            req_2r = urllib.request.Request(
+                f"http://127.0.0.1:{port_2r}/send",
+                data=json.dumps({"kind": "ask", "text": text}).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {tok}", "Host": f"127.0.0.1:{port_2r}"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req_2r, timeout=5.0) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+
+        def status_2r(rid, tid):
+            run_ = read_json(os.path.join(data_2r, "runs", rid, "run.json"))
+            return next(t["status"] for t in run_["tasks"] if t["id"] == tid)
+
+        toks_2r = {}
+        for rid, tid in (("r6", "T6"), ("r7", "T7")):
+            lane_2r = os.path.join(tmp, f"lane_2r_{rid}")
+            os.makedirs(lane_2r, exist_ok=True)
+            rc, res_tok_2r, _ = cli(["token", "--lane", lane_2r, "--task", tid, "--run", rid, "--data", data_2r])
+            assert rc == 0 and res_tok_2r["ok"] is True, res_tok_2r
+            toks_2r[rid] = res_tok_2r["token"]
+
+        ask_2r_a = post_ask_2r(toks_2r["r6"], "first run question")
+        ask_2r_b = post_ask_2r(toks_2r["r7"], "second run question")
+        assert ask_2r_a["message"]["id"] == "m-1", ask_2r_a
+        assert ask_2r_b["message"]["id"] == "m-1", ask_2r_b  # per-run ids: both m-1
+        assert ask_2r_a["state_updated"] is True and ask_2r_a["mk_state_error"] is None, ask_2r_a
+        # the id-only guard returned state_updated=False here (run A's m-1 had already marked)
+        assert ask_2r_b["state_updated"] is True and ask_2r_b["mk_state_error"] is None, ask_2r_b
+        assert status_2r("r6", "T6") == "blocked"
+        assert status_2r("r7", "T7") == "blocked"  # and T7 stayed building on the id-only guard
+
+        rc, res_2r_ev, _ = cli(["answer", "--data", data_2r, "--run", "r6", "--", "m-1", "--run=evil"])
+        assert rc == 0 and res_2r_ev["ok"] is True, res_2r_ev
+        assert res_2r_ev["message"]["text"] == "--run=evil", res_2r_ev  # verbatim, not swallowed
+        assert res_2r_ev["message"]["run"] == "r6", res_2r_ev  # --run not hijacked by the text
+
+        ask_2r_c = post_ask_2r(toks_2r["r6"], "third question")
+        ask_2r_c_id = ask_2r_c["message"]["id"]  # m-3: the --run=evil answer took m-2
+        rc, res_2r_x, _ = cli(["answer", "--data", data_2r, "--run", "r6", "--", ask_2r_c_id, "-x"])
+        assert rc == 0 and res_2r_x["ok"] is True, res_2r_x
+        assert res_2r_x["message"]["text"] == "-x" and res_2r_x["message"]["run"] == "r6", res_2r_x
+        done("ask-once keyed (run, id): two runs' m-1 asks both block; answer -- stores text verbatim")
 
         # 12. Unsupported methods answer JSON 405, never the stdlib 501 HTML
         # page (LOW 5); HEAD sends the JSON headers with no body.

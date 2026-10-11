@@ -353,7 +353,11 @@ export function registerTools(on: On, _options: PluginOptions): void {
           }
         }
         const dataDir = await resolveDataDir($)
-        return runBus(['python3', scriptPath, 'answer', '--data', dataDir, ...(runArg ? ['--run', runArg] : []), msgIdRaw, textRaw])
+        // "--" ends option parsing: a space-free text starting with "-" ("--run=evil",
+        // "-x", "--data=/x") would otherwise be swallowed as an option by argparse and
+        // could hijack --run/--data (review MEDIUM 1). After the terminator both the
+        // msg id and the text stay positional, stored verbatim.
+        return runBus(['python3', scriptPath, 'answer', '--data', dataDir, ...(runArg ? ['--run', runArg] : []), '--', msgIdRaw, textRaw])
       }
       const dataDir = await resolveDataDir($)
       return runBus(['python3', scriptPath, actionRaw, '--data', dataDir, ...(runArg ? ['--run', runArg] : [])])

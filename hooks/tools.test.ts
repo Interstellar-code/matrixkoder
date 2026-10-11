@@ -339,7 +339,36 @@ test('mk_bus answer with run builds the exact argv', async ($, on) => {
 
   expect(ran.isError).toBeUndefined()
   expect(sawArgs[1]).toContain('scripts/mk-bus.py')
-  expect(sawArgs).toEqual(['python3', sawArgs[1], 'answer', '--data', '/data', '--run', 'r1', 'm-5', 'use fixture v3'])
+  expect(sawArgs).toEqual(['python3', sawArgs[1], 'answer', '--data', '/data', '--run', 'r1', '--', 'm-5', 'use fixture v3'])
+})
+
+test('mk_bus answer passes option-shaped text after -- so it stays positional', async ($, on) => {
+  // review MEDIUM 1: a space-free text starting with "-" is option-shaped for argparse —
+  // without the "--" terminator "--run=evil" was swallowed as the --run flag (text lost),
+  // and "--data=/x" would redirect the answer to another data dir. The argv must carry
+  // "--" before the positionals, and the text must appear after it verbatim.
+  mock.env(on, { MATRIXKODER_DATA: '/data' })
+  const seen: string[][] = []
+  on('process.run', (_$, e) => {
+    seen.push([...e.argv])
+    return { value: procResult({ exitCode: 0, stdout: '{"ok":true}' }) }
+  })
+
+  for (const hostile of ['--run=evil', '-x']) {
+    const ran = await callTool($, {
+      tool: 'mcp__matrixkoder__mk_bus',
+      action: 'answer',
+      msg_id: 'm-3',
+      text: hostile,
+    })
+
+    expect(ran.isError).toBeUndefined()
+    const argv = seen[seen.length - 1] ?? []
+    expect(argv.length, 'the process must have run').toBeGreaterThan(0)
+    const dd = argv.indexOf('--')
+    expect(dd, `argv must contain -- before the positionals: ${argv.join(' ')}`).toBeGreaterThan(0)
+    expect(argv.slice(dd)).toEqual(['--', 'm-3', hostile])
+  }
 })
 
 test('mk_bus answer rejects bad msg_id without running the process', async ($, on) => {

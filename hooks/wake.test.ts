@@ -1311,3 +1311,77 @@ test('two plain blocked transitions 1 min apart wake once (old behaviour kept)',
   await clock.advance(60000)
   expect(submitted.length).toBe(1)
 })
+
+test('same task and ask id in a new run wakes again inside 5 min', { options: { wake: true } }, async ($, on) => {
+  // review LOW 3: ask ids repeat across runs ("m-1" exists in every run), so the ask
+  // cooldown key carries the run: run B's F6 / m-1 ask must not be throttled by run
+  // A's stamp of the same task+ask inside the 5-min window. Run B's batch also carries
+  // F7 so the two submit texts differ (the identical-text hold would otherwise swallow
+  // the second wake regardless of the cooldown key); on the old id-only key F6 was
+  // throttled away and the second prompt named only F7.
+  const clock = mock.clock(on)
+  const submitted: string[] = []
+  const store = new Map<string, unknown>([
+    ['wakeEventLines:askA-run', 0],
+    ['wakeEventLines:askB-run', 0],
+  ])
+
+  const eventsA = [
+    JSON.stringify({ t: '2026-10-07T22:00:00+02:00', run: 'askA-run', task: 'F6', type: 'transition', from: 'building', to: 'blocked', text: 'bus ask m-1: q1', by: 'bus' }),
+  ]
+  let eventsB: string[] = []
+  let index = JSON.stringify([{ id: 'askA-run', status: 'active' }])
+
+  mock.env(on, { MATRIXKODER_DATA: '/data' })
+
+  on('fs.read', (_$, e) => {
+    if (e.path === '/data/runs/index.json') return { value: index }
+    if (e.path === '/data/runs/askA-run/events.jsonl') return { value: eventsA.join('\n') + '\n' }
+    if (e.path === '/data/runs/askB-run/events.jsonl') return { value: eventsB.join('\n') + '\n' }
+    return { value: '' }
+  })
+  on('prompt.submit', (_$, e) => {
+    submitted.push(e.text)
+    return { text: e.text }
+  })
+  on('state.get', (_$, e, next) => {
+    if (e.key === 'wakeEventLines' || e.key === 'wakeSentAt') {
+      const k = `${e.key}:${e.id}`
+      return { value: { value: store.get(k), version: 1 } }
+    }
+    return next(e)
+  })
+  on('state.set', (_$, e, next) => {
+    if (e.key === 'wakeEventLines' || e.key === 'wakeSentAt') {
+      const k = `${e.key}:${e.id}`
+      store.set(k, e.value)
+      return { value: { isSet: true, version: 1 } }
+    }
+    return next(e)
+  })
+  on('session.start', (_$, e, next) => ({ cwd: '/tmp' }))
+
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+
+  // Run A's ask m-1 on F6: discovered at t=30s, submitted at t=90s — stamps the ask
+  // cooldown for (run A, m-1) until t=390s
+  await clock.advance(30000)
+  await clock.advance(60000)
+  expect(submitted.length).toBe(1)
+  expect(submitted[0]).toBe('MatrixKoder: F6 → blocked (bus ask m-1). Continue the run from its Next action.')
+
+  // Run A ends, run B goes active; its first ask is ALSO m-1 on the SAME task F6,
+  // landing 180 s into run A's 5-min ask cooldown (t=270s poll)
+  index = JSON.stringify([{ id: 'askA-run', status: 'done' }, { id: 'askB-run', status: 'active' }])
+  eventsB = [
+    JSON.stringify({ t: '2026-10-07T22:03:00+02:00', run: 'askB-run', task: 'F6', type: 'transition', from: 'building', to: 'blocked', text: 'bus ask m-1: q1 again', by: 'bus' }),
+    JSON.stringify({ t: '2026-10-07T22:03:05+02:00', run: 'askB-run', task: 'F7', type: 'transition', to: 'stalled' }),
+  ]
+  await clock.advance(150000) // t=240s: idle polls on run A
+  await clock.advance(30000) // t=270s: poll discovers run B's lines
+  await clock.advance(60000) // t=330s: debounce flush
+  expect(submitted.length).toBe(2)
+  // the second wake names run B's ask — the old id-only key throttled F6 away and the
+  // prompt read only "F7 → stalled"
+  expect(submitted[1]).toBe('MatrixKoder: F6 → blocked (bus ask m-1), F7 → stalled. Continue the run from its Next action.')
+})
