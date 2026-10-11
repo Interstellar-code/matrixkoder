@@ -183,8 +183,15 @@ def upsert_model(con, agent, model, efforts, provider, status, protected, displa
 
 
 def known_displays():
-    """Display names from ~/.config/opencode/opencode.json when it is readable, else {}."""
-    path = os.path.expanduser("~/.config/opencode/opencode.json")
+    """Display names from an opencode config when one is named, else {}.
+
+    OPENCODE_CONFIG points the test at a fixture; without it the user's own config is read, and a
+    self-test sets the variable empty so it never touches ~/.config/opencode.
+    """
+    if "OPENCODE_CONFIG" in os.environ:
+        path = os.environ["OPENCODE_CONFIG"]
+    else:
+        path = os.path.expanduser("~/.config/opencode/opencode.json")
     try:
         data = json.load(open(path))
     except Exception:
@@ -214,28 +221,47 @@ def probe_models(cli):
     return out
 
 
+MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
+HEADER_WORDS = {"model", "models", "id", "name", "alias", "jev note"}
+
+
+def _model_id(cell):
+    """A cell that looks like a model id, or None. Header words and anything with a space are not."""
+    cell = cell.strip().strip("`")
+    if cell.lower() in HEADER_WORDS or not MODEL_ID_RE.match(cell):
+        return None
+    return cell
+
+
 def jev_models(path):
-    """(agent, model id) pairs from the Jev catalog markdown, or [] when the file is absent."""
+    """(agent, model id) pairs from the Jev catalog markdown, or [] when the file is absent.
+
+    Header rows and separator rows are skipped, and only cells that look like a model id are kept,
+    so a column titled `Model` never becomes a model.
+    """
     if not path or not os.path.isfile(path):
         return []
     section, found = "", []
     for line in open(path):
         if line.startswith("## "):
             section = line[3:].strip().lower()
-        if not line.startswith("|") or "---" in line or "Model" in line.split("|")[1:2]:
             continue
-        cells = [c.strip().strip("`") for c in line.strip().strip("|").split("|")]
-        if section.startswith("claude") and len(cells) >= 2:
-            m = re.search(r"`([a-z0-9.-]+)`", line)
-            if m:
-                found.append(("claude", m.group(1)))
-        elif section.startswith("codex") and cells and cells[0]:
-            found.append(("codex", cells[0]))
-        elif section.startswith("agy"):
-            for part in re.findall(r"`([^`]+)`", cells[0] if cells else ""):
-                base = part.split(" / ")[0].strip()
-                if base:
-                    found.append(("agy", base))
+        if not line.startswith("|"):
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if not cells or all(set(c) <= set("-: ") for c in cells):
+            continue
+        if all(c.strip("`").strip().lower() in HEADER_WORDS for c in cells if c.strip()):
+            continue
+        agent = ("claude" if section.startswith("claude") else "codex" if section.startswith("codex")
+                 else "agy" if section.startswith("agy") else "")
+        if not agent:
+            continue
+        # only the first cell names the model; later cells are notes and must not become ids
+        for part in re.findall(r"`([^`]+)`", cells[0]) or [cells[0]]:
+            mid = _model_id(part.split(" / ")[0])
+            if mid and (agent, mid) not in found:
+                found.append((agent, mid))
     return found
 
 
@@ -418,8 +444,11 @@ def match_footer(con, text):
         for needle in (row["id"], row["display"]):
             if not needle:
                 continue
-            pos = low.find(needle.lower())
-            if pos < 0:
+            # whole token, and a real id or display: a bare word (no digit or separator) is never a
+            # model, so "model" does not match inside "no model here" or "models"
+            if " " not in needle and not re.search(r"[0-9./_:-]", needle):
+                continue
+            if not re.search(r"(?<![A-Za-z0-9])" + re.escape(needle) + r"(?![A-Za-z0-9])", text or "", re.I):
                 continue
             if best is None or len(needle) > len(best[0]):
                 best = (needle, row)
@@ -513,7 +542,26 @@ def _run(home, *args):
     return _cli(["--home", home, *args])
 
 
+def _real_jev_check():
+    """Finding 1 against the real default Jev file, when this machine has one. Skips otherwise."""
+    if not os.path.isfile(JEV_DEFAULT):
+        print(json.dumps({"ok": True, "real_jev": "skipped", "reason": "no default Jev file"}))
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        home = os.path.join(tmp, "home")
+        seed(home, None, JEV_DEFAULT, probe=False)
+        con = open_catalog(home)
+        try:
+            bad = [r["id"] for r in con.execute(
+                "SELECT id FROM models WHERE id IN ('Model','Models','ID','Name')")]
+        finally:
+            con.close()
+        _check(bad == [], f"real Jev file seeded header words: {bad}")
+
+
 def self_test():
+    os.environ["OPENCODE_CONFIG"] = ""  # never read this machine's ~/.config/opencode
+    _real_jev_check()
     with tempfile.TemporaryDirectory() as tmp:
         home = os.path.join(tmp, "home")
         yaml = os.path.join(tmp, "matrixkoder.yaml")
@@ -524,7 +572,11 @@ def self_test():
             "  claude: { available: true }\n")
         jev = os.path.join(tmp, "models.md")
         open(jev, "w").write(
-            "## Codex (official)\n\n| Model | Jev note |\n|---|---|\n| `gpt-6-luna` | fast |\n")
+            "## Codex (official)\n\n| Model | Jev note |\n|---|---|\n| `gpt-6-luna` | fast |\n"
+            "## AGY\n\n| Model id | Jev note |\n|---|---|\n| `gemini-3.8-flash-medium` | bulk |\n")
+        ids = [m for _a, m in jev_models(jev)]
+        _check("Model" not in ids and "gpt-6-luna" in ids and "gemini-3.8-flash-medium" in ids,
+               f"jev parser kept a header: {ids}")
         first = _run(home, "seed", "--yaml", yaml, "--jev", jev, "--no-probe")
         second = _run(home, "seed", "--yaml", yaml, "--jev", jev, "--no-probe")
         _check(first["models"] == second["models"], f"seed not idempotent {first} {second}")
@@ -585,6 +637,20 @@ def self_test():
             _check(got["model"] == model and got.get("effort") == effort, f"footer {footer!r} -> {got}")
         got = pane_model("pane-1", "Sonnet 5.5 · high", home)
         _check(got["model"] == "claude-sonnet-5-5" and got["effort"] == "high", f"display match {got}")
+        # a model whose id is a bare word must not match inside "no model here" or "models"
+        con = open_catalog(home)
+        try:
+            upsert_model(con, "codex", "model", [], "codex", "catalog", set())
+            con.commit()
+        finally:
+            con.close()
+        for text in ("no model here", "models"):
+            try:
+                pane_model("pane-1", text, home)
+            except Fail:
+                pass
+            else:
+                raise SystemExit(f"SELF-TEST FAIL: {text!r} matched a model")
         try:
             pane_model("pane-1", "no model here", home)
         except Fail as e:
