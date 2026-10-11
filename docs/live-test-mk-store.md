@@ -22,6 +22,12 @@ gate. `agent` rows need a real lane and are never claimed by the scripted runner
 A row whose feature does not exist yet is `pending: <phase>`; the scripted runner
 reports it `PENDING`, never as pass.
 
+A gate is signed off only when every scripted row it runs has passed. The summary
+line carries `pass`, `fail` and `PENDING` counts, and `ok` is true only when `fail`
+and `PENDING` are both 0. The process exits 0 when ok, 1 when any row failed, and 3
+when nothing failed but some rows are still PENDING. A later gate re-runs the earlier
+ones: G1 runs the G1 rows, G2 runs G1 and G2, and G3 runs every row.
+
 ## Matrix
 
 | id | contract | gate | kind | pending | do | see |

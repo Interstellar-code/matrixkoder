@@ -6,12 +6,16 @@
       and the root and project stores via scripts/mkdb.py. One JSON line with every path.
       Writes a marker file listing exactly what it created.
   teardown --home DIR
-      Removes only what that marker lists. Refuses anything else: the path must be the
-      temp home the marker names.
+      Removes the setup root (its home and scratch repo) and nothing else. The marker
+      only proves the root is ours: a random token in the marker must match a second
+      file inside the root. A path outside that root, a symlink, or a missing --home
+      is refused.
   scripted --gate G1|G2|G3 [--home DIR]
-      Every matrix row for that gate that needs no AI. One JSON line per row
-      (pass / fail / PENDING) and a summary line. A row whose feature is absent, or
-      whose matrix cell says pending, is PENDING, never pass.
+      Scripted rows up to and including that gate (G1; G2 = G1+G2; G3 = every row).
+      One JSON line per row (pass / fail / PENDING) and a summary line. A row whose
+      feature is absent, or whose matrix cell says pending, is PENDING, never pass.
+      The summary is ok only when fail and PENDING are both 0. Exit 0 when ok, 1 when
+      any row failed, 3 when nothing failed but some rows are PENDING.
   --self-test
 
 Common: --home DIR. A home that resolves to ~/.matrixkoder, or that is not under the
@@ -19,7 +23,7 @@ system temp dir, exits non-zero before anything is created.
 Every command prints ONE JSON line. Errors: {"ok": false, "error": ...} exit 2.
 The matrix is docs/live-test-mk-store.md. Store access goes through scripts/mkdb.py only.
 """
-import argparse, json, os, re, shutil, subprocess, sys, tempfile
+import argparse, json, os, secrets, shutil, subprocess, sys, tempfile
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -30,8 +34,9 @@ ROOT = os.path.dirname(HERE)
 MATRIX = os.path.join(ROOT, "docs", "live-test-mk-store.md")
 MARKER = "mk-livetest-marker.json"
 GATES = ("G1", "G2", "G3")
-REAL_HOME = os.path.abspath(os.path.expanduser("~/.matrixkoder"))
-ROW_RE = re.compile(r"^\| (C\d+[\w-]*) \| (C\d+) \| (G[123]) \| (scripted|agent) \| ([^|]*?) \|")
+REAL_HOME = os.path.realpath(os.path.abspath(os.path.expanduser("~/.matrixkoder")))
+TOKEN = "mk-livetest-token"
+GATE_RANK = {"G1": 1, "G2": 2, "G3": 3}
 
 
 class Fail(Exception):
@@ -89,24 +94,37 @@ def _marker_path(home):
     return os.path.join(home, MARKER)
 
 
-def _write_marker(home, created):
+def _write_marker(root, home, repo):
+    """The marker only proves this root is ours. A second file holds the same token."""
+    token = secrets.token_hex(16)
     with open(_marker_path(home), "w", encoding="utf-8") as fh:
-        json.dump({"home": home, "created": created}, fh)
+        json.dump({"home": home, "repo": repo, "root": root, "token": token}, fh)
+    with open(os.path.join(root, TOKEN), "w", encoding="utf-8") as fh:
+        fh.write(token)
 
 
 def _read_marker(home):
+    """Confirm the root is ours. The marker is not a list of paths to delete."""
     path = _marker_path(home)
-    if not os.path.isfile(path):
+    if not os.path.isfile(path) or os.path.islink(path):
         raise Fail(f"no marker at {path}; teardown only removes what setup created")
     with open(path, encoding="utf-8") as fh:
         data = json.load(fh)
     if os.path.realpath(data.get("home", "")) != os.path.realpath(home):
         raise Fail("marker home does not match; refusing")
+    root = os.path.realpath(data.get("root", ""))
+    token_path = os.path.join(root, TOKEN)
+    if os.path.islink(token_path) or not os.path.isfile(token_path):
+        raise Fail("setup token missing; refusing")
+    with open(token_path, encoding="utf-8") as fh:
+        if fh.read().strip() != data.get("token"):
+            raise Fail("setup token does not match; refusing")
     return data
 
 
 def setup(slug="lt"):
     """Temp home, scratch repo with one commit, both stores. Returns the JSON payload."""
+    mkdb.check_slug(slug)
     parent = tempfile.mkdtemp(prefix="mk-livetest-")
     home = refuse_home(os.path.join(parent, "home"))
     os.makedirs(home)
@@ -125,39 +143,61 @@ def setup(slug="lt"):
     root.close()
     proj = mkdb.open_project(home, slug)
     proj.close()
-    created = [home, repo, os.path.join(home, "mk.db"), os.path.join(data, "mk.db")]
-    _write_marker(home, created)
+    _write_marker(parent, home, repo)
     return {"ok": True, "home": home, "repo": repo, "data": data, "slug": slug,
             "root_db": os.path.join(home, "mk.db"), "project_db": os.path.join(data, "mk.db"),
             "marker": _marker_path(home)}
 
 
-def _rm(path):
-    if os.path.islink(path) or os.path.isfile(path):
-        os.remove(path)
-    elif os.path.isdir(path):
-        shutil.rmtree(path)
+def _inside(root, path):
+    """True only when path is strictly inside root. Symlinks never count as inside."""
+    root, path = os.path.realpath(root), os.path.realpath(path)
+    return os.path.commonpath([root, path]) == root and path != root
+
+
+def _unlink(path):
+    """Remove a symlink as a link. Never follow it."""
+    if os.path.islink(path):
+        os.unlink(path)
+        return True
+    return False
+
+
+def _check_root(root):
+    """The setup root: a real directory named mk-livetest-* directly under the temp dir."""
+    root = os.path.realpath(root)
+    parent, name = os.path.split(root)
+    if parent != temp_root() or not name.startswith("mk-livetest-"):
+        raise Fail(f"refusing a setup root that is not mk-livetest-* under the temp dir: {root}")
+    if os.path.islink(root) or not os.path.isdir(root):
+        raise Fail(f"refusing a setup root that is not a real directory: {root}")
+    if root in (temp_root(), os.path.realpath("/"), os.path.realpath(os.path.expanduser("~"))):
+        raise Fail(f"refusing to remove {root}")
+    return root
 
 
 def teardown(home):
-    """Remove only the paths the marker lists, longest first, then the marker itself."""
+    """Remove the setup root, and nothing the marker lists. The marker only confirms it."""
+    if not home:
+        raise Fail("teardown needs --home")
     home = refuse_home(home)
     data = _read_marker(home)
-    listed = [os.path.realpath(p) for p in data["created"]]
-    root = temp_root()
-    for path in listed:
-        if path != root and not path.startswith(root + os.sep):
-            raise Fail(f"marker lists a path outside the temp dir: {path}")
-        if path == REAL_HOME or path.startswith(REAL_HOME + os.sep):
-            raise Fail(f"marker lists the real home: {path}")
-    # The marker's home directory goes last so a partial failure can be retried.
-    for path in sorted(listed, key=len, reverse=True):
-        if os.path.lexists(path):
-            _rm(path)
-    parent = os.path.dirname(home)
-    if os.path.isdir(parent) and os.path.basename(parent).startswith("mk-livetest-"):
-        shutil.rmtree(parent)
-    return {"ok": True, "removed": listed}
+    root = _check_root(data["root"])
+    if not _inside(root, home):
+        raise Fail(f"home is not inside the setup root: {home}")
+    repo = os.path.realpath(data.get("repo", ""))
+    if not _inside(root, repo):
+        raise Fail(f"repo is not inside the setup root: {repo}")
+    # Children first, and a symlink is unlinked rather than followed. The root goes last.
+    for path in (repo, home):
+        if _unlink(path):
+            continue
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+    if _unlink(root):
+        raise Fail("setup root is a symlink; refusing to follow it")
+    shutil.rmtree(root)
+    return {"ok": True, "removed": [root]}
 
 
 def _run_row(row, ctx):
@@ -171,12 +211,15 @@ def _run_row(row, ctx):
         fn(ctx)
     except Fail as e:
         return "fail", str(e)
+    except Exception as e:
+        return "fail", f"{type(e).__name__}: {e}"
     return "pass", ""
 
 
 def _need(ctx):
     if not ctx.get("home"):
         raise Fail("scripted needs a home from setup (pass --home)")
+    ctx.setdefault("run", "r-" + secrets.token_hex(4))
     return ctx
 
 
@@ -207,6 +250,10 @@ def row_c2_create(ctx):
     con = mkdb.open_project(ctx["home"], data_dir=ctx["data"])
     try:
         _pragmas(con)
+        have = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        missing = [t for t in ("plans", "runs", "tasks", "events") if t not in have]
+        if missing:
+            raise Fail(f"project store missing tables: {', '.join(missing)}")
     finally:
         con.close()
 
@@ -217,11 +264,12 @@ def _seed(ctx):
         return
     con = mkdb.open_project(ctx["home"], data_dir=ctx["data"])
     try:
+        run = ctx["run"]
         mkdb._begin(con)
-        con.execute("INSERT INTO runs(id, status) VALUES (?, ?)", ("r", "active"))
+        con.execute("INSERT INTO runs(id, status) VALUES (?, ?)", (run, "active"))
         con.execute("COMMIT")
-        mkdb.add_task(con, "r", "phase", "phase", title="phase")
-        mkdb.add_task(con, "r", "task", "task", title="task", parent="phase")
+        mkdb.add_task(con, run, "phase", "phase", title="phase")
+        mkdb.add_task(con, run, "task", "task", title="task", parent="phase")
     finally:
         con.close()
     ctx["seeded"] = True
@@ -229,10 +277,10 @@ def _seed(ctx):
 
 def row_c2_timeline(ctx):
     _seed(_need(ctx))
-    mkdb.transition(ctx["home"], ctx["slug"], "r", "task", "building", note="lt", data_dir=ctx["data"])
+    mkdb.transition(ctx["home"], ctx["slug"], ctx["run"], "task", "building", note="lt", data_dir=ctx["data"])
     out = subprocess.run(
         [sys.executable, os.path.join(HERE, "mkdb.py"), "--home", ctx["home"], "--data", ctx["data"],
-         "--project", ctx["slug"], "timeline", "--run", "r", "--task", "task", "--json"],
+         "--project", ctx["slug"], "timeline", "--run", ctx["run"], "--task", "task", "--json"],
         check=True, capture_output=True, text=True)
     line = out.stdout.strip().splitlines()[-1]
     got = json.loads(line)
@@ -247,11 +295,11 @@ def row_c3_tree(ctx):
     _need(ctx)
     con = mkdb.open_project(ctx["home"], data_dir=ctx["data"])
     try:
-        mkdb.add_task(con, "r", "tree-phase", "phase", title="p")
-        mkdb.add_task(con, "r", "tree-task", "task", title="t", parent="tree-phase")
-        mkdb.add_task(con, "r", "tree-sub", "subtask", title="s", parent="tree-task")
+        mkdb.add_task(con, ctx["run"], "tree-phase", "phase", title="p")
+        mkdb.add_task(con, ctx["run"], "tree-task", "task", title="t", parent="tree-phase")
+        mkdb.add_task(con, ctx["run"], "tree-sub", "subtask", title="s", parent="tree-task")
         try:
-            mkdb.add_task(con, "r", "orphan", "task", parent="no-such")
+            mkdb.add_task(con, ctx["run"], "orphan", "task", parent="no-such")
         except mkdb.Fail:
             pass
         else:
@@ -266,25 +314,25 @@ def row_c3_cycle(ctx):
     con = mkdb.open_project(ctx["home"], data_dir=ctx["data"])
     try:
         try:
-            mkdb.add_task(con, "r", "self2", "task", deps="self2")
+            mkdb.add_task(con, ctx["run"], "self2", "task", deps="self2")
         except mkdb.Fail as e:
             if "self-dep" not in str(e):
                 raise Fail(f"self-dep not named: {e}")
         else:
             raise Fail("self-dep was accepted")
-        if con.execute("SELECT 1 FROM tasks WHERE run=? AND id=?", ("r", "self2")).fetchone():
+        if con.execute("SELECT 1 FROM tasks WHERE run=? AND id=?", (ctx["run"], "self2")).fetchone():
             raise Fail("self-dep row was stored")
-        mkdb.add_task(con, "r", "left", "task", title="l")
-        mkdb.add_task(con, "r", "right", "task", title="r", deps="left")
+        mkdb.add_task(con, ctx["run"], "left", "task", title="l")
+        mkdb.add_task(con, ctx["run"], "right", "task", title="r", deps="left")
         # No update API: check_deps is the same check add_task runs before insert.
         try:
-            mkdb.check_deps(con, "r", "left", "right")
+            mkdb.check_deps(con, ctx["run"], "left", "right")
         except mkdb.Fail as e:
             if "cycle:" not in str(e) or "left" not in str(e):
                 raise Fail(f"cycle not named: {e}")
         else:
             raise Fail("cycle was accepted")
-        if con.execute("SELECT deps FROM tasks WHERE run=? AND id=?", ("r", "left")).fetchone()["deps"]:
+        if con.execute("SELECT deps FROM tasks WHERE run=? AND id=?", (ctx["run"], "left")).fetchone()["deps"]:
             raise Fail("cycle wrote a dep")
     finally:
         con.close()
@@ -294,26 +342,26 @@ def row_c4_columns(ctx):
     _seed(_need(ctx))
     con = mkdb.open_project(ctx["home"], data_dir=ctx["data"])
     try:
-        mkdb.add_task(con, "r", "col", "task", title="c", parent="phase")
+        mkdb.add_task(con, ctx["run"], "col-" + ctx["run"], "task", title="c", parent="phase")
     finally:
         con.close()
     want = [("planned", "Backlog", 0), ("building", "Building", 0), ("review", "Review", 0),
             ("done", "Done", 0), ("blocked", "Done", 1)]
     # planned is the insert status; transition the rest, syncing the root so cards can see it.
     for status, col, attention in want[1:]:
-        mkdb.transition(ctx["home"], ctx["slug"], "r", "col", status, sync_root=True, data_dir=ctx["data"])
+        mkdb.transition(ctx["home"], ctx["slug"], ctx["run"], "col-" + ctx["run"], status, sync_root=True, data_dir=ctx["data"])
         got = mkdb.cards(ctx["home"], ctx["slug"])
-        card = next((c for c in got if c["task"] == "col"), None)
+        card = next((c for c in got if c["task"] == "col-" + ctx["run"]), None)
         if not card or card["col"] != col or card["attention"] != attention:
             raise Fail(f"{status}: card {card}")
 
 
 def row_c10(ctx):
     _seed(_need(ctx))
-    before = mkdb.timeline(ctx["home"], ctx["slug"], "r", "task", ctx["data"])
-    change = mkdb.transition(ctx["home"], ctx["slug"], "r", "task", "review", note="c10",
+    before = mkdb.timeline(ctx["home"], ctx["slug"], ctx["run"], "task", ctx["data"])
+    change = mkdb.transition(ctx["home"], ctx["slug"], ctx["run"], "task", "review", note="c10",
                              data_dir=ctx["data"])
-    after = mkdb.timeline(ctx["home"], ctx["slug"], "r", "task", ctx["data"])
+    after = mkdb.timeline(ctx["home"], ctx["slug"], ctx["run"], "task", ctx["data"])
     if change < 1 or len(after) != len(before) + 1:
         raise Fail("transition did not record one event")
     if after[-1]["kind"] != "transition" or after[-1]["to_id"] != "review":
@@ -341,7 +389,7 @@ def row_c11_slug(ctx):
 def row_c11_wal(ctx):
     home, repo = _need(ctx)["home"], ctx["repo"]
     # A write forces the WAL file. It must live in the temp home, not the git repo.
-    mkdb.transition(home, ctx["slug"], "r", "task", "building", note="wal", data_dir=ctx["data"])
+    mkdb.transition(home, ctx["slug"], ctx["run"], "task", "building", note="wal", data_dir=ctx["data"])
     wal = os.path.join(ctx["data"], "mk.db-wal")
     if os.path.isfile(wal) and not os.path.realpath(wal).startswith(os.path.realpath(home) + os.sep):
         raise Fail("wal escaped the temp home")
@@ -374,29 +422,35 @@ ROWS = {
 }
 
 
-def scripted(gate, home=None):
+def _ctx(home):
+    """The scratch layout setup wrote: home/projects/<slug> and the sibling repo."""
+    home = refuse_home(home)
+    data = _read_marker(home)
+    ctx = {"home": home, "repo": data.get("repo"), "slug": "lt"}
+    projects = os.path.join(home, "projects")
+    if os.path.isdir(projects):
+        slugs = [s for s in os.listdir(projects) if os.path.isdir(os.path.join(projects, s))]
+        if slugs:
+            ctx["slug"] = slugs[0]
+            ctx["data"] = os.path.join(projects, slugs[0])
+    return ctx
+
+
+def _select(gate, rows):
+    """G1, then G2 = G1+G2, then G3 = every row. A later gate re-runs the earlier ones."""
+    rank = GATE_RANK[gate]
+    return [r for r in rows if r["kind"] == "scripted" and GATE_RANK.get(r["gate"], 99) <= rank]
+
+
+def scripted(gate, home=None, rows=None):
     if gate not in GATES:
         raise Fail(f"gate must be one of {GATES}")
-    ctx = {}
-    if home:
-        home = refuse_home(home)
-        data = _read_marker(home)
-        ctx = {"home": home, "slug": "lt"}
-        # The marker lists the repo; the project data dir is the one store under projects/.
-        for path in data["created"]:
-            if path.rstrip("/").endswith("/repo") or os.path.basename(path) == "repo":
-                ctx["repo"] = path
-        projects = os.path.join(home, "projects")
-        if os.path.isdir(projects):
-            slugs = [s for s in os.listdir(projects) if os.path.isdir(os.path.join(projects, s))]
-            if slugs:
-                ctx["slug"] = slugs[0]
-                ctx["data"] = os.path.join(projects, slugs[0])
-                ctx["repo"] = ctx.get("repo")
+    ctx = _ctx(home) if home else {}
+    chosen = _select(gate, matrix_rows() if rows is None else rows)
+    if not chosen:
+        raise Fail(f"gate {gate} selected no rows")
     results = []
-    for row in matrix_rows():
-        if row["gate"] != gate or row["kind"] != "scripted":
-            continue
+    for row in chosen:
         status, detail = _run_row(row, ctx)
         item = {"ok": status != "fail", "row": row["id"], "contract": row["contract"],
                 "status": status}
@@ -404,7 +458,8 @@ def scripted(gate, home=None):
             item["detail"] = detail
         results.append(item)
     counts = {s: sum(1 for r in results if r["status"] == s) for s in ("pass", "fail", "PENDING")}
-    return results, {"ok": counts["fail"] == 0, "gate": gate, "summary": counts}
+    ok = counts["fail"] == 0 and counts["PENDING"] == 0
+    return results, {"ok": ok, "gate": gate, "summary": counts}
 
 
 def _check(cond, msg):
@@ -461,17 +516,25 @@ def self_test():
     try:
         proc = subprocess.run(
             [sys.executable, os.path.abspath(__file__), "--home", home, "scripted", "--gate", "G1"],
-            check=True, capture_output=True, text=True)
+            capture_output=True, text=True)
+        _check(proc.returncode == 3, f"G1 with PENDING rows exited {proc.returncode}")
         lines = [json.loads(l) for l in proc.stdout.strip().splitlines()]
         summary = lines[-1]
         by_id = {l["row"]: l for l in lines if "row" in l}
         _check(any(l.get("status") == "pass" for l in lines), "no scripted row passed")
-        pending = [l for l in lines if l.get("status") == "PENDING"]
-        _check(pending, "unimplemented row was not PENDING")
-        _check(all(l["status"] != "pass" for l in pending), "PENDING row counted as pass")
-        _check(summary.get("summary", {}).get("PENDING", 0) == len(pending), "summary mismatch")
-        _check("C8-catalog" in by_id and by_id["C8-catalog"]["status"] == "PENDING",
-               "C8-catalog (no catalog yet) was not PENDING")
+        pending_ids = {r["id"] for r in matrix_rows() if r["pending"] and r["kind"] == "scripted"
+                       and GATE_RANK[r["gate"]] <= GATE_RANK["G1"]}
+        _check(pending_ids, "matrix has no pending G1 row")
+        for rid in pending_ids:
+            _check(by_id.get(rid, {}).get("status") == "PENDING", f"{rid} was not PENDING")
+        _check(summary.get("ok") is False, "PENDING gate reported ok")
+        _check(summary["summary"]["PENDING"] == len(pending_ids), "PENDING count mismatch")
+        g1 = [r["id"] for r in _select("G1", matrix_rows())]
+        g2 = [r["id"] for r in _select("G2", matrix_rows())]
+        g3 = [r["id"] for r in _select("G3", matrix_rows())]
+        _check(set(g1) <= set(g2) <= set(g3), "gates are not nested")
+        _check(len(g3) == sum(1 for r in matrix_rows() if r["kind"] == "scripted"),
+               "G3 is not the full scripted matrix")
     finally:
         subprocess.run([sys.executable, os.path.abspath(__file__), "teardown", "--home", home],
                        check=True, capture_output=True, text=True)
@@ -479,6 +542,62 @@ def self_test():
     _check(not os.path.exists(repo), "scratch repo survived teardown")
     parent = os.path.dirname(home)
     _check(not os.path.exists(parent), "temp parent survived teardown")
+
+    # Injected rows: absent feature is PENDING (ok false), a raising row is fail, a clean set is ok.
+    def boom(ctx):
+        raise RuntimeError("boom")
+    def fine(ctx):
+        return None
+    absent = [{"id": "X-absent", "contract": "C1", "gate": "G1", "kind": "scripted", "pending": "pending: DX"}]
+    _, summary = scripted("G1", rows=absent)
+    _check(summary["ok"] is False and summary["summary"]["PENDING"] == 1, "absent row was not PENDING")
+    saved = dict(ROWS)
+    try:
+        ROWS["X-boom"] = boom
+        ROWS["X-fine"] = fine
+        bad = [{"id": "X-boom", "contract": "C1", "gate": "G1", "kind": "scripted", "pending": ""}]
+        _, summary = scripted("G1", rows=bad)
+        _check(summary["summary"]["fail"] == 1 and summary["ok"] is False, "raising row was not fail")
+        good = [{"id": "X-fine", "contract": "C1", "gate": "G1", "kind": "scripted", "pending": ""}]
+        _, summary = scripted("G1", rows=good)
+        _check(summary["ok"] is True and summary["summary"]["pass"] == 1, "clean set was not ok")
+    finally:
+        ROWS.clear()
+        ROWS.update(saved)
+
+    # A tampered marker cannot delete a file outside the setup root.
+    victim_dir = tempfile.mkdtemp(prefix="mk-livetest-victim-")
+    victim = os.path.join(victim_dir, "victim_probe.txt")
+    with open(victim, "w", encoding="utf-8") as fh:
+        fh.write("sensitive")
+    try:
+        fake = tempfile.mkdtemp(prefix="mk-livetest-fake-")
+        h = os.path.join(fake, "home")
+        os.makedirs(h)
+        with open(os.path.join(h, MARKER), "w", encoding="utf-8") as fh:
+            json.dump({"home": h, "created": [victim, h]}, fh)
+        proc = _cli_fail(["teardown", "--home", h])
+        _check(os.path.isfile(victim), "tampered marker deleted the victim")
+        _check("token" in proc.stdout or "token" in proc.stderr, proc.stdout + proc.stderr)
+        for bad_root in (temp_root(), "/", os.path.expanduser("~")):
+            link = os.path.join(fake, "link")
+            if os.path.lexists(link):
+                os.unlink(link)
+            os.symlink(bad_root, link)
+            proc = _cli_fail(["teardown", "--home", link])
+            _check(os.path.exists(bad_root), f"teardown followed a symlink to {bad_root}")
+    finally:
+        shutil.rmtree(victim_dir)
+        if os.path.isdir(fake):
+            shutil.rmtree(fake)
+
+    # teardown with no --home is a clean error, and --home is accepted on either side.
+    proc = _cli_fail(["teardown"])
+    _check("teardown needs --home" in proc.stdout, proc.stdout)
+    _check("Traceback" not in proc.stderr, proc.stderr)
+    proc = _cli_fail(["--home", REAL_HOME, "teardown"])
+    _check("refusing the real MK home" in proc.stdout, proc.stdout)
+    _check("Traceback" not in proc.stderr, proc.stderr)
 
     # This file never opens a store itself, read-write or otherwise.
     src = open(os.path.abspath(__file__), encoding="utf-8").read()
@@ -491,38 +610,57 @@ def _emit(payload):
     print(json.dumps(payload))
 
 
-def main(argv):
-    if argv == ["--self-test"]:
-        self_test()
-        return 0
+def _parser():
+    """--home is one option, accepted before or after the subcommand.
+
+    Each subparser redefines it with default SUPPRESS, so a value given on the parent
+    is not overwritten by the subparser's default of None.
+    """
     p = Parser(prog="mk-livetest.py", description=__doc__,
                formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--home", help="MK home; must be under the system temp dir, never ~/.matrixkoder")
     sub = p.add_subparsers(dest="cmd")
-    sub.add_parser("setup")
+    su = sub.add_parser("setup")
+    su.add_argument("--slug", default="lt")
+    su.add_argument("--home", default=argparse.SUPPRESS)
     td = sub.add_parser("teardown")
-    td.add_argument("--home")
+    td.add_argument("--home", default=argparse.SUPPRESS)
     sc = sub.add_parser("scripted")
     sc.add_argument("--gate", required=True)
-    args = p.parse_args(argv)
-    # Refuse a bad --home before any command creates anything.
-    if args.home:
-        refuse_home(args.home)
+    sc.add_argument("--home", default=argparse.SUPPRESS)
+    return p
+
+
+def _exit_for(summary):
+    """0 when ok, 1 when a row failed, 3 when nothing failed but some rows are PENDING."""
+    if summary["summary"]["fail"]:
+        return 1
+    if summary["summary"]["PENDING"]:
+        return 3
+    return 0
+
+
+def main(argv):
+    if argv == ["--self-test"]:
+        self_test()
+        return 0
+    args = _parser().parse_args(argv)
+    home = getattr(args, "home", None)
+    # Refuse a bad --home before any command creates anything, on every subcommand.
+    if home:
+        refuse_home(home)
     if args.cmd == "setup":
-        _emit(setup())
+        _emit(setup(args.slug))
         return 0
     if args.cmd == "teardown":
-        home = args.home or getattr(args, "home", None)
-        # teardown's own --home lands on the subparser; the parent --home is args too only
-        # when given before the command. Accept either position.
-        _emit(teardown(args.home))
+        _emit(teardown(home))
         return 0
     if args.cmd == "scripted":
-        results, summary = scripted(args.gate, args.home)
+        results, summary = scripted(args.gate, home)
         for item in results:
             _emit(item)
         _emit(summary)
-        return 0 if summary["ok"] else 1
+        return _exit_for(summary)
     raise Fail("usage: mk-livetest.py setup|teardown|scripted  (or --self-test)")
 
 
