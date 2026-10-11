@@ -321,32 +321,59 @@ def row_for(lines, key):
 
 ROUTE_KEYS = ("routing_preferences.reviewer", "routing_preferences.visual_reviewer")
 CATALOG_TIMEOUT_S = 10  # a settings screen that waits longer than this is broken, not loading
+_ROUTES_CACHE = {}  # one catalog read per process; the self-test clears it for a fresh read
+
+
+def catalog_home():
+    """The MK home `mk-catalog.py` would use: $MK_HOME, else ~/.matrixkoder — the same rule as
+    mkdb.resolve_home with no --home argument."""
+    return os.path.abspath(os.path.expanduser(os.environ.get("MK_HOME") or "~/.matrixkoder"))
 
 
 def catalog_routes():
     """The runnable routes `mk-catalog.py routes --json` lists, or None when the catalog is absent
     or errors. A settings screen must never crash because the catalog is missing, so every failure
     — a missing script, a non-zero exit, a timeout, output that is not the documented shape — reads
-    as "no catalog" and the caller falls back to the current value alone."""
+    as "no catalog" and the caller falls back to the current value alone.
+
+    The catalog command creates <home>/mk.db when none exists, so it is never called unless the
+    store is already there: opening Settings must not create ~/.matrixkoder/mk.db. The result is
+    cached for the process, so one `list` starts at most one subprocess."""
+    if "routes" in _ROUTES_CACHE:
+        return _ROUTES_CACHE["routes"]
+    if not os.path.isfile(os.path.join(catalog_home(), "mk.db")):
+        _ROUTES_CACHE["routes"] = None  # no store: do not call the catalog, it would create one
+        return None
     try:
+        counter = os.environ.get("MK_CONFIG_COUNT_ROUTES")  # self-test only: counts the calls
+        if counter:
+            with open(counter, "a") as f:
+                f.write("1")
         p = subprocess.run([sys.executable, os.path.join(HERE, "mk-catalog.py"), "routes", "--json"],
                            capture_output=True, text=True, timeout=CATALOG_TIMEOUT_S)
     except Exception:  # a timeout or a missing interpreter: the catalog is not there
+        _ROUTES_CACHE["routes"] = None
         return None
     if p.returncode != 0:
+        _ROUTES_CACHE["routes"] = None
         return None
     try:
         data = json.loads(p.stdout)
     except ValueError:
+        _ROUTES_CACHE["routes"] = None
         return None
     routes = data.get("routes") if isinstance(data, dict) and data.get("ok") is True else None
     if not isinstance(routes, list) or not all(isinstance(x, str) and x.strip() for x in routes):
+        _ROUTES_CACHE["routes"] = None
         return None
     # a home with no catalog seeds an empty one and still exits 0: an empty pool is "no catalog",
     # so the dropdown falls back to the current value instead of flagging it stale
     if not routes:
+        _ROUTES_CACHE["routes"] = None
         return None
-    return list(dict.fromkeys(routes))  # the catalog's order, duplicates dropped
+    got = list(dict.fromkeys(routes))  # the catalog's order, duplicates dropped
+    _ROUTES_CACHE["routes"] = got
+    return got
 
 
 def opts_of(r, lines):
@@ -1243,6 +1270,8 @@ def self_test():
             run_env = dict(env)
             if os.environ.get("MK_HOME"):  # a seeded temp catalog for the reviewer dropdowns
                 run_env["MK_HOME"] = os.environ["MK_HOME"]
+            if os.environ.get("MK_CONFIG_COUNT_ROUTES"):  # the subprocess-count probe
+                run_env["MK_CONFIG_COUNT_ROUTES"] = os.environ["MK_CONFIG_COUNT_ROUTES"]
             p = subprocess.run([sys.executable, script, *args], capture_output=True, text=True,
                                env=run_env, cwd=tmp)
             lines = [x for x in (p.stdout or "").splitlines() if x.strip()]
@@ -1814,19 +1843,39 @@ def self_test():
             f.write(fixture)
 
         # 27. with the catalog absent the dropdown falls back to the current value alone and
-        #     the screen still answers
+        #     the screen still answers — and an empty home stays empty: list and context must
+        #     never create <home>/mk.db (review R1 finding 1)
         missing = os.path.join(tmp, "no-catalog")
+        os.makedirs(missing)
         os.environ["MK_HOME"] = missing
         try:
             fb = next(f for f in run("list", "--json")["fields"]
                       if f["key"] == "routing_preferences.reviewer")
             assert fb["opts"] == [["claude sonnet medium", ""]], fb
             assert "stale" not in fb, fb
+            run("context")
+            assert os.listdir(missing) == [], "list or context created a file in an empty home"
             run("set", "routing_preferences.reviewer", '"claude sonnet medium"')
             refused = run("set", "routing_preferences.reviewer", '"opencode opencode/alpha low"', ok=False)
             assert "must be one of" in refused["error"], refused
         finally:
             del os.environ["MK_HOME"]
+        with open(yaml_path, "w") as f:
+            f.write(fixture)
+
+        # 28. one list reads the catalog once: two route rows share one subprocess (review R1 finding 2).
+        #     The count is taken inside the child process, where the cache lives.
+        os.environ["MK_HOME"] = cat_home
+        counter = os.path.join(tmp, "route-calls")
+        open(counter, "w").write("")
+        os.environ["MK_CONFIG_COUNT_ROUTES"] = counter
+        try:
+            run("list", "--json")
+            n = len(open(counter).read())
+            assert n <= 1, n
+        finally:
+            del os.environ["MK_HOME"]
+            del os.environ["MK_CONFIG_COUNT_ROUTES"]
         with open(yaml_path, "w") as f:
             f.write(fixture)
 
