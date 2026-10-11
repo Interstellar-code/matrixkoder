@@ -192,7 +192,8 @@ def resolve_data(arg):
 
 def register_project(slug, repo, data_dir, name=None):
     """Write the project to BOTH the root projects table and <home>/projects.json (until D9).
-    The root store is opened only here, a write the caller asked for."""
+    The slug is checked (C11) before the root store is opened or projects.json is touched."""
+    _mkdb().check_slug(slug)
     repo = os.path.realpath(repo)
     data_dir = os.path.abspath(data_dir)
     db = _mkdb()
@@ -1316,25 +1317,62 @@ def cmd_run(a, st):
             run["stage"] = a.n
             st.event(run, "note", f"stage {a.n}")
         else:  # archive
+            if st.store_on:
+                archive_backup(st, run)  # before the status commit: a failed backup leaves the run active
             set_run_status(st, run, "archived")
         st.save(run)
         st.flush()
-        if a.action == "archive" and st.store_on:
-            backup = os.path.join(st.data, "archive", run["id"] + ".db")
-            os.makedirs(os.path.dirname(backup), exist_ok=True)
-            if os.path.exists(backup):
-                os.remove(backup)
-            con = st.store_open()
-            try:
-                con.execute("VACUUM INTO ?", (backup,))
-            finally:
-                con.close()
     out = {"ok": True, "run": run, **({"warning": warn} if warn else {})}
     if a.action == "set" and a.status == "done":
         out["promoted"] = promoted
         if perr:
             out["promote_error"] = perr
     return out
+
+
+
+def archive_backup(st, run):
+    """VACUUM INTO a new file, check it holds the run, then rename it into place.
+    An existing <run>.db is kept: the new backup is <run>-<UTC timestamp>.db. A failure removes
+    the temp file and raises, before the run is marked archived."""
+    dest_dir = os.path.join(st.data, "archive")
+    os.makedirs(dest_dir, exist_ok=True)
+    final = os.path.join(dest_dir, run["id"] + ".db")
+    if os.path.exists(final):
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        final = os.path.join(dest_dir, f"{run['id']}-{stamp}.db")
+    tmp = os.path.join(dest_dir, run["id"] + ".db.tmp")
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    con = st.store_open()
+    try:
+        try:
+            if os.environ.get("MK_ARCHIVE_FAIL") == "1":  # test seam: the backup fails before any rename
+                raise Fail("injected archive backup failure")
+            con.execute("VACUUM INTO ?", (tmp,))
+        except Exception as e:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            raise Fail(f"archive backup failed: {type(e).__name__}: {e}")
+    finally:
+        con.close()
+    try:
+        check = st.db()._connect(tmp)
+        try:
+            row = check.execute("SELECT 1 FROM runs WHERE id=?", (run["id"],)).fetchone()
+            task = check.execute("SELECT COUNT(*) c FROM tasks WHERE run=?", (run["id"],)).fetchone()
+        finally:
+            check.close()
+        if not row:
+            raise Fail(f"archive backup has no run {run['id']}")
+        if task["c"] != len([t for t in run.get("tasks") or [] if t.get("id")]):
+            raise Fail(f"archive backup task count {task['c']} != the run")
+        os.replace(tmp, final)
+    except Exception:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+    return final
 
 
 def promote_closed(st, run, by):
@@ -3481,7 +3519,7 @@ def store_self_test(tmp, env):
                        capture_output=True, text=True, env=d3env)
     assert r.returncode == 0 and json.loads(r.stdout)["store"] == "off", r.stdout
     assert set(os.listdir(off)) == before and not os.path.exists(os.path.join(off, "mk.db"))
-    assert not os.path.exists(os.path.join(root, "mk.db")) or True
+    assert not os.path.exists(os.path.join(root, "mk.db")), "file mode created a root store"
     # a resolve with no root store must not create one
     bare = os.path.join(tmp, "bare-home")
     repo = os.path.join(tmp, "bare-repo")
@@ -3519,6 +3557,23 @@ def store_self_test(tmp, env):
         else:
             os.environ["MATRIXKODER_HOME"] = saved
     assert os.path.exists(os.path.join(reg_home, "mk.db"))
+    # an invalid slug is refused before any file is written
+    slug_home = os.path.join(tmp, "slug-home")
+    os.makedirs(slug_home)
+    os.environ["MATRIXKODER_HOME"] = slug_home
+    try:
+        for bad in ("../x", "X", "", "a" * 42):
+            try:
+                register_project(bad, reg_repo, from_root)
+                raise AssertionError(f"slug {bad!r} was accepted")
+            except Exception as e:
+                assert type(e).__name__ == "Fail", (bad, type(e), e)
+                assert "slug" in str(e), (bad, e)
+        assert not os.path.exists(os.path.join(slug_home, "projects.json"))
+        assert not os.path.exists(os.path.join(slug_home, "mk.db"))
+        assert os.listdir(slug_home) == []
+    finally:
+        os.environ["MATRIXKODER_HOME"] = reg_home
     listed = json.load(open(os.path.join(reg_home, "projects.json")))
     assert listed[os.path.realpath(reg_repo)]["data_dir"] == os.path.abspath(from_root)
     r = subprocess.run([sys.executable, os.path.abspath(__file__), "run", "init", "--id", "rt1",
@@ -3594,6 +3649,25 @@ def store_self_test(tmp, env):
         bcon.close()
     assert any(g[0] == "d1" for g in got), got
     assert any(t[0] == "T1" for t in tasks), tasks
+    # a second archive keeps the first backup and writes a timestamped second file
+    r = subprocess.run([sys.executable, os.path.abspath(__file__), "run", "archive", "--id", "d1",
+                        "--data", d3], capture_output=True, text=True, env=d3env)
+    assert r.returncode == 0, r.stdout
+    names = sorted(os.listdir(os.path.join(d3, "archive")))
+    assert "d1.db" in names and any(n.startswith("d1-") and n.endswith(".db") for n in names), names
+    assert open(backup, "rb").read()  # the first backup is still a file
+    # an injected VACUUM failure leaves the old backup, the run status and no tmp file
+    status_before = json.load(open(os.path.join(d3, "runs", "d1", "run.json")))["status"]
+    kept = open(backup, "rb").read()
+    r = subprocess.run([sys.executable, os.path.abspath(__file__), "run", "archive", "--id", "d1",
+                        "--data", d3], capture_output=True, text=True,
+                       env=dict(d3env, MK_ARCHIVE_FAIL="1"))
+    assert r.returncode == 2, (r.returncode, r.stdout, r.stderr)
+    body = json.loads(r.stdout)
+    assert body["ok"] is False and "backup" in body["error"], body
+    assert open(backup, "rb").read() == kept
+    assert not os.path.exists(os.path.join(d3, "archive", "d1.db.tmp"))
+    assert json.load(open(os.path.join(d3, "runs", "d1", "run.json")))["status"] == status_before
     # file mode archive writes no backup
     off_before = os.listdir(off)
     r = subprocess.run([sys.executable, os.path.abspath(__file__), "run", "archive", "--id", "o1",
