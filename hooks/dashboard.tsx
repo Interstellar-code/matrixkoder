@@ -34,6 +34,8 @@ import {
 import type { RunFn, SavePayload, YamlFieldIn } from './settings-io'
 import { UsageTab, usageView } from './tabs/usage'
 import { WaitingTab, waitingView } from './tabs/waiting'
+import { KanbanTab, kanbanView, readCards, emptyKanbanView, kanbanFixtureView } from './tabs/kanban'
+import type { KanbanCard, KanbanFilters } from './tabs/kanban'
 import { chipText, toastsFor } from './status'
 
 // atoms are file-local consts (the scan reads this file's own consts); the
@@ -77,6 +79,7 @@ const TABS: readonly { key: MkDashTab; hotkey: string; label: string }[] = [
   { key: 'usage', hotkey: 'u', label: 'Usage' },
   { key: 'events', hotkey: 'e', label: 'Events' },
   { key: 'waiting', hotkey: 'w', label: 'Waiting' },
+  { key: 'kanban', hotkey: 'k', label: 'Kanban' },
   { key: 'old', hotkey: '0', label: 'Old' },
   { key: 'settings', hotkey: '9', label: 'Settings' },
 ]
@@ -243,7 +246,7 @@ export function registerDashboard(on: On, options: PluginOptions): void {
     // V0.4: the header is the snapshot's run on Old, the mock world on the six mock tabs
     const realTab = dashTab === 'old' || dashTab === 'settings'
     const header = realTab ? realRunHeader(snap) : mockRunHeader()
-    const counts = realTab ? realTabCounts(snap.run) : mockTabCounts()
+    const counts = { ...(realTab ? realTabCounts(snap.run) : mockTabCounts()), kanban: '' }
     // C12: the tabs' view-state handle. `get` reads the atom's snapshot; `set`
     // writes it and is only ever called from an onPress (C10). `save`/`recheck`
     // are the Settings tab's live wires (S3): the ordered write and the About
@@ -302,7 +305,9 @@ export function registerDashboard(on: On, options: PluginOptions): void {
                     ? withViewState(UsageTab, tabEls, usageView(), cols, ui)
                     : dashTab === 'events'
                       ? withViewState(EventsTab, tabEls, eventsView(), cols, ui)
-                      : withViewState(WaitingTab, tabEls, waitingView(), cols, ui)}
+                      : dashTab === 'kanban'
+                        ? KanbanTab(tabEls, kanbanPaneView(viewState), cols)
+                        : withViewState(WaitingTab, tabEls, waitingView(), cols, ui)}
       </Box>
     )
   })
@@ -478,7 +483,7 @@ function realRunHeader(snap: MkPaneSnapshot): RunHeaderData | null {
 /** The Old tab's tab-bar counts from the same snapshot (the mockup's count
  *  vocabulary): live lanes, done/total, one open decision. */
 function realTabCounts(run: MkRun | null): Record<MkDashTab, string> {
-  const none: Record<MkDashTab, string> = { overview: '', lanes: '', plan: '', usage: '', events: '', waiting: '', old: '', settings: '' }
+  const none: Record<MkDashTab, string> = { overview: '', lanes: '', plan: '', usage: '', events: '', waiting: '', kanban: '', old: '', settings: '' }
   if (run == null) return none
   const done = run.tasks.filter(t => DONE.has(t.status)).length
   return {
@@ -722,6 +727,86 @@ function contentSig(snap: MkSnapshot): string {
   return JSON.stringify({ ...snap, now: 0 })
 }
 
+
+/** Cards JSON kept on the view-state atom so a tick is one read, not a render. */
+const CARDS_KEY = 'kanban:cards'
+const CARDS_MS_KEY = 'kanban:ms'
+const CARDS_TICK_KEY = 'kanban:tick'
+const CARDS_EMPTY_KEY = 'kanban:empty'
+
+function kanbanFiltersOf(view: Record<string, string>): KanbanFilters {
+  return {
+    needsYou: view['kanban:needs'] === '1',
+    project: view['kanban:project'] ? view['kanban:project'] : null,
+  }
+}
+
+/** The Kanban body: empty until a root store has been seen, else the last cards read. */
+function kanbanPaneView(view: Record<string, string>) {
+  // No root store (or no tick yet): the fixture, so the tab renders without mkdb.
+  // kanban:empty=1 is the confirmed miss — "no store yet", and mkdb was not called.
+  if (view[CARDS_EMPTY_KEY] === '1') return emptyKanbanView()
+  if ((view[CARDS_KEY] ?? '') === '') return kanbanFixtureView()
+  let cards: KanbanCard[] = []
+  try {
+    const parsed = JSON.parse(view[CARDS_KEY] ?? '[]') as unknown
+    if (Array.isArray(parsed)) cards = parsed as KanbanCard[]
+  } catch {
+    cards = []
+  }
+  return kanbanView(cards, kanbanFiltersOf(view), new Date().toISOString(), Number(view[CARDS_MS_KEY] ?? '0') > 100)
+}
+
+/**
+ * One `mkdb.py cards --json` per dashboard tick. The root file is checked with
+ * fs.exists first: a missing ~/.matrixkoder/mk.db (or $MK_HOME/mk.db) never
+ * spawns mkdb, which would create the store. A read slower than 100 ms skips
+ * every other tick.
+ */
+async function refreshCards($: EngineInterface): Promise<void> {
+  // MK_HOME is the store home; otherwise the store is $HOME/.matrixkoder/mk.db.
+  // exists() runs before any mkdb spawn: cards() would create a missing root store.
+  let mkHome = ''
+  try {
+    mkHome = (await $.env.get('MK_HOME')) || ''
+  } catch {
+    mkHome = ''
+  }
+  const userHome = mkHome === '' ? await homeDir($) : null
+  const home = mkHome !== '' ? mkHome : userHome
+  const path = home == null ? '' : mkHome !== '' ? join(home, 'mk.db') : join(home, '.matrixkoder', 'mk.db')
+  let exists = false
+  if (path !== '') {
+    try {
+      exists = await $.fs.exists(path)
+    } catch {
+      exists = false
+    }
+  }
+  const view = await read($, viewStateAtom)
+  const tick = Number(view[CARDS_TICK_KEY] ?? '0') + 1
+  const lastMs = Number(view[CARDS_MS_KEY] ?? '0')
+  const run = (argv: readonly string[], init?: { timeoutMs?: number }) => $.process.run([...argv], init)
+  let got
+  try {
+    got = await readCards(
+      async (argv, init) => {
+        const r = await run(argv, init)
+        return { stdout: r.stdout, code: r.exitCode }
+      },
+      $.plugin.root, home, exists, tick, lastMs)
+  } catch {
+    return // a refused exists/run must not kill the refresh tick
+  }
+  await update($, viewStateAtom, prev => ({
+    ...prev,
+    [CARDS_TICK_KEY]: String(tick),
+    [CARDS_MS_KEY]: String(got.skipped ? lastMs : got.ms),
+    [CARDS_EMPTY_KEY]: got.empty && mkHome !== '' ? '1' : '0',
+    ...(got.skipped ? {} : { [CARDS_KEY]: JSON.stringify(got.cards) }),
+  }))
+}
+
 /** Never throws: a failing load keeps the last good snapshot and flags the error. */
 async function refreshSafe($: EngineInterface, options: PluginOptions, cwd: string): Promise<void> {
   const prev = await read($, snapshotAtom)
@@ -731,6 +816,7 @@ async function refreshSafe($: EngineInterface, options: PluginOptions, cwd: stri
     if (contentSig(prev) !== contentSig(snap)) {
       await update($, snapshotAtom, () => snap)
     }
+    await refreshCards($)
   } catch (err) {
     try {
       await update($, snapshotAtom, () => ({ ...prev, error: `cannot read run.json (${String(err).slice(0, 40)})` }))
