@@ -22,7 +22,7 @@ import argparse, datetime, hashlib, json, multiprocessing, os, re, sqlite3, subp
 
 sys.dont_write_bytecode = True
 
-SCHEMA = 2
+SCHEMA = 3
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
 TYPES = ("phase", "task", "subtask")
 # C4: the column a status lands in. Attention statuses keep their column and raise the flag.
@@ -69,7 +69,9 @@ CREATE INDEX IF NOT EXISTS ev_task ON events(run, task, id);
 CREATE TABLE IF NOT EXISTS artifacts(
   id INTEGER PRIMARY KEY, run TEXT, task TEXT, round INTEGER, kind TEXT, rev INTEGER, text TEXT, created TEXT);
 CREATE TABLE IF NOT EXISTS acks(run TEXT, msg TEXT, lane TEXT, level INTEGER, t TEXT, PRIMARY KEY(run, msg, lane));
-CREATE TABLE IF NOT EXISTS lane_slots(slot TEXT PRIMARY KEY, lane_path TEXT, state TEXT, run TEXT, task TEXT);
+CREATE TABLE IF NOT EXISTS lane_slots(
+  slot TEXT PRIMARY KEY, lane_path TEXT, state TEXT, run TEXT, task TEXT,
+  workspace TEXT, workspace_id TEXT, branch TEXT, lock_hash TEXT, updated TEXT);
 CREATE TABLE IF NOT EXISTS waits(id INTEGER PRIMARY KEY, run TEXT, question TEXT, opened TEXT, cleared TEXT);
 CREATE TABLE IF NOT EXISTS change_log(change_no INTEGER PRIMARY KEY, run TEXT, task TEXT, t TEXT);
 CREATE TABLE IF NOT EXISTS schema_version(version INTEGER PRIMARY KEY);
@@ -204,10 +206,24 @@ def _v2(con):
     con.execute("CREATE INDEX IF NOT EXISTS art_run_src ON artifacts(run, src)")
 
 
+# Columns a lanes.json slot carries beyond the v1 lane_slots row (mk-lane.py slot record).
+LANE_SLOT_COLS = ("workspace", "workspace_id", "branch", "lock_hash", "updated")
+
+
+def _v3(con):
+    """The shipped v3 step. Safe to run twice: each column is added only when table_info lacks it."""
+    cols = [r["name"] for r in con.execute("PRAGMA table_info(lane_slots)")]
+    if not cols:
+        return
+    for name in LANE_SLOT_COLS:
+        if name not in cols:
+            con.execute(f"ALTER TABLE lane_slots ADD COLUMN {name} TEXT")
+
+
 def open_project(home, slug=None, data_dir=None, version=SCHEMA, migrations=()):
     """Open or create the project store (C2). check_home runs before any directory is created."""
     path = os.path.join(project_dir(home, slug, data_dir), "mk.db")
-    con = _migrate(_connect(path), version, ((1, PROJECT_DDL), (2, _v2)) + tuple(migrations))
+    con = _migrate(_connect(path), version, ((1, PROJECT_DDL), (2, _v2), (3, _v3)) + tuple(migrations))
     _ensure_prev_status(con)
     return con
 
@@ -719,7 +735,7 @@ def main(argv):
 
 # --- self-test ----------------------------------------------------------------
 
-V3_SQL = "CREATE TABLE IF NOT EXISTS mkdb_v3_probe(id INTEGER PRIMARY KEY);"  # test migration, not shipped
+V3_SQL = "CREATE TABLE IF NOT EXISTS mkdb_v3_probe(id INTEGER PRIMARY KEY);"  # test migration past shipped v3, not shipped
 
 
 def _check(cond, msg):
@@ -792,6 +808,7 @@ def self_test():
         _import_cycle(home)
         _import_race(home)
         _v1_upgrade(home)
+        _lane_slots_v3(home)
         _single_writer()
     print(json.dumps({"ok": True, "self_test": "pass"}))
     return 0
@@ -812,7 +829,10 @@ def _stores(home):
         proj.close()
     again = open_project(home, "demo")  # re-open is a no-op: still one version row
     try:
-        _check(again.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == 2, "re-open")
+        _check(again.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == 3, "re-open")
+        slot_cols = [r["name"] for r in again.execute("PRAGMA table_info(lane_slots)")]
+        for name in LANE_SLOT_COLS:
+            _check(name in slot_cols, f"fresh store missing {name}")
     finally:
         again.close()
     via_data = open_project(home, data_dir=os.path.join(home, "explicit"))
@@ -1101,7 +1121,7 @@ def _migrations(home):
     bare.close()
     reopened = open_project(home, data_dir=v1)
     try:
-        _check(reopened.execute("SELECT MAX(version) v FROM schema_version").fetchone()["v"] == 2,
+        _check(reopened.execute("SELECT MAX(version) v FROM schema_version").fetchone()["v"] == 3,
                "v2 not stamped after the crash")
         _check(reopened.execute("SELECT title FROM tasks WHERE id='kept'").fetchone()["title"] == "keep me",
                "v2 crash lost a row")
@@ -1112,26 +1132,26 @@ def _migrations(home):
     again = open_project(home, data_dir=v1)
     third = open_project(home, data_dir=v1)
     try:
-        _check(again.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == 2, "reopen grew")
+        _check(again.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == 3, "reopen grew")
         _check(third.execute("SELECT title FROM tasks WHERE id='kept'").fetchone()["title"] == "keep me",
                "second reopen lost a row")
     finally:
         again.close()
         third.close()
     data = os.path.join(home, "mig")
-    first = open_project(home, data_dir=data, version=3, migrations=((3, V3_SQL),))
+    first = open_project(home, data_dir=data, version=4, migrations=((4, V3_SQL),))
     _check(first.execute("SELECT 1 FROM sqlite_master WHERE name='mkdb_v3_probe'").fetchone(), "v2")
     first.close()
-    second = open_project(home, data_dir=data, version=3, migrations=((3, V3_SQL),))
-    _check(second.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == 3, "idempotent")
+    second = open_project(home, data_dir=data, version=4, migrations=((4, V3_SQL),))
+    _check(second.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == 4, "idempotent")
     second.close()
     # Finding 8: a crash between executescript and the version stamp re-runs safely.
     con = sqlite3.connect(os.path.join(data, "mk.db"))
-    con.execute("DELETE FROM schema_version WHERE version=3")
+    con.execute("DELETE FROM schema_version WHERE version=4")
     con.commit()
     con.close()
-    third = open_project(home, data_dir=data, version=3, migrations=((3, V3_SQL),))
-    _check(third.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == 3, "re-stamp")
+    third = open_project(home, data_dir=data, version=4, migrations=((4, V3_SQL),))
+    _check(third.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == 4, "re-stamp")
     _check(third.execute("SELECT COUNT(*) c FROM mkdb_v3_probe").fetchone()["c"] == 0, "probe grew")
     third.close()
     try:
@@ -1508,6 +1528,57 @@ def _import_race(home):
         con.close()
 
 
+def _lane_slots_v3(home):
+    """A v2 store with a populated lane_slots row migrates to v3 and keeps the row.
+
+    A crash after the REAL v3 step and before the version stamp reopens cleanly.
+    A fresh store already has the columns; opening twice more changes nothing.
+    """
+    data = os.path.join(home, "slots-v2")
+    os.makedirs(data, exist_ok=True)
+    # The base CREATE TABLE already has the v3 columns, so a real v2 file is built here:
+    # the pre-v3 lane_slots shape, stamped at version 2, with one busy row.
+    bare = sqlite3.connect(os.path.join(data, "mk.db"))
+    bare.executescript("""
+        CREATE TABLE lane_slots(slot TEXT PRIMARY KEY, lane_path TEXT, state TEXT, run TEXT, task TEXT);
+        CREATE TABLE schema_version(version INTEGER PRIMARY KEY);
+        INSERT INTO schema_version(version) VALUES (1);
+        INSERT INTO schema_version(version) VALUES (2);
+        INSERT INTO lane_slots(slot, lane_path, state, run, task) VALUES ('1', '/tmp/lane', 'busy', 'r1', 'D5B');
+    """)
+    bare.commit()
+    names = [r[1] for r in bare.execute("PRAGMA table_info(lane_slots)")]
+    bare.close()
+    _check("workspace" not in names, "v2 fixture already had workspace")
+    bare = sqlite3.connect(os.path.join(data, "mk.db"))
+    bare.row_factory = sqlite3.Row
+    _v3(bare)  # the crash: the step landed, the schema_version stamp did not
+    bare.commit()
+    bare.close()
+    reopened = open_project(home, data_dir=data)
+    try:
+        _check(reopened.execute("SELECT MAX(version) v FROM schema_version").fetchone()["v"] == 3,
+               "v3 not stamped after the crash")
+        row = reopened.execute("SELECT lane_path, state, run, task, workspace, branch FROM lane_slots WHERE slot='1'").fetchone()
+        _check(row["lane_path"] == "/tmp/lane" and row["state"] == "busy" and row["run"] == "r1"
+               and row["task"] == "D5B", f"v3 crash lost the slot: {dict(row) if row else None}")
+        _check(row["workspace"] is None and row["branch"] is None, "v3 filled old columns")
+    finally:
+        reopened.close()
+    again = open_project(home, data_dir=data)
+    third = open_project(home, data_dir=data)
+    try:
+        _check(again.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == 3, "v3 reopen grew")
+        _check(third.execute("SELECT task FROM lane_slots WHERE slot='1'").fetchone()["task"] == "D5B",
+               "second reopen lost the slot")
+        names = [r["name"] for r in third.execute("PRAGMA table_info(lane_slots)")]
+        for name in LANE_SLOT_COLS:
+            _check(names.count(name) == 1, f"{name} missing or duplicated")
+    finally:
+        again.close()
+        third.close()
+
+
 def _v1_upgrade(home):
     """A store created at v1 is upgraded in place and keeps the rows it already had."""
     data = os.path.join(home, "v1")
@@ -1520,7 +1591,7 @@ def _v1_upgrade(home):
         con.close()
     upgraded = open_project(home, data_dir=data)
     try:
-        _check(upgraded.execute("SELECT MAX(version) v FROM schema_version").fetchone()["v"] == 2, "not v2")
+        _check(upgraded.execute("SELECT MAX(version) v FROM schema_version").fetchone()["v"] == 3, "not v3")
         _check("src" in [r["name"] for r in upgraded.execute("PRAGMA table_info(artifacts)")], "src missing")
         row = upgraded.execute("SELECT title FROM tasks WHERE id='kept'").fetchone()
         _check(row["title"] == "keep me", f"row lost: {dict(row) if row else None}")
