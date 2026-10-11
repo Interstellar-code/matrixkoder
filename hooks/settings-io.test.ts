@@ -10,6 +10,8 @@ import {
 } from './settings-io'
 import type { ConfigRowLite, RunFn, YamlFieldIn } from './settings-io'
 import { SETTINGS_FIXTURE } from './tabs/settings.fixture'
+import { SETTINGS_SCHEMA } from './tabs/settings.schema'
+import type { SettingsField } from './tabs/settings'
 
 type Answer = { exitCode: number; stdout: string; stderr: string }
 
@@ -294,91 +296,76 @@ test('S3 save: the stored view folds the saved values back, so saved rows read c
 //
 // The bundled test runner runs in a sealed JS sandbox (no `process`, `Bun`,
 // `require` or `fs`); it cannot run `python3 scripts/mk-config.py list` or
-// read `.claude-plugin/plugin.json` from a test body. The drift tests below
-// carry a snapshot of the schema and the userConfig defaults captured by
-// `python3 scripts/mk-config.py list --json` and `.claude-plugin/plugin.json`
-// at the time of authoring. To refresh: re-run those commands, paste the
-// output into the snapshot below, and update the assertion expectations.
+// read `.claude-plugin/plugin.json` from a test body. Instead, the
+// committed `hooks/tabs/settings.schema.ts` is the reduced shape generated
+// by `scripts/settings-drift.py --write` (a fresh data dir + a minimal
+// agents block, the real `.claude-plugin/plugin.json`). Re-run
+// `scripts/settings-drift.py --write` after editing either source, and
+// `scripts/settings-drift.py --check` (or the script's --self-test) is the
+// process-side guard that catches drift between the committed file and the
+// live sources.
 
-const SCHEMA_SNAPSHOT: ReadonlyArray<{ key: string; scope: string; default: unknown; editable: boolean }> = [
-  { "key": "repo.lanes.slots", "scope": "project", "default": 3, "editable": true },
-  { "key": "repo.lanes.reuse", "scope": "project", "default": true, "editable": true },
-  { "key": "repo.lanes.copy", "scope": "project", "default": [], "editable": true },
-  { "key": "repo.integration_branch", "scope": "project", "default": "main", "editable": true },
-  { "key": "qa.integration_target", "scope": "project", "default": "local-main", "editable": true },
-  { "key": "autonomy_contract.builder_skip_permissions", "scope": "project", "default": true, "editable": true },
-  { "key": "routing_preferences.policy", "scope": "routing", "default": "claude-sparing", "editable": true },
-  { "key": "routing_preferences.builder_order", "scope": "routing", "default": [], "editable": true },
-  { "key": "routing_preferences.max_build_lanes", "scope": "routing", "default": 3, "editable": true },
-  { "key": "routing_preferences.reserve_floor.claude.five_hour_left_pct", "scope": "routing", "default": 40, "editable": true },
-  { "key": "routing_preferences.reserve_floor.claude.weekly_left_pct", "scope": "routing", "default": 30, "editable": true },
-  { "key": "routing_preferences.reserve_floor.others.five_hour_left_pct", "scope": "routing", "default": 10, "editable": true },
-  { "key": "routing_preferences.reserve_floor.others.weekly_left_pct", "scope": "routing", "default": 15, "editable": true },
-  { "key": "routing_preferences.reviewer", "scope": "routing", "default": "claude sonnet medium", "editable": true },
-  { "key": "routing_preferences.visual_reviewer", "scope": "routing", "default": "claude haiku", "editable": true },
-  { "key": "usage.source", "scope": "agents", "default": "codexbar", "editable": true },
-  { "key": "usage.providers", "scope": "agents", "default": [], "editable": true },
-  { "key": "session.fresh_session", "scope": "child", "default": "new", "editable": true },
-  { "key": "session.subagents", "scope": "child", "default": true, "editable": true },
-  { "key": "session.subagent_model", "scope": "child", "default": "", "editable": true },
-  { "key": "session.stall_min", "scope": "child", "default": 15, "editable": true },
-  { "key": "session.max_wait_min", "scope": "child", "default": 30, "editable": true },
-  { "key": "session.reviewer_split", "scope": "child", "default": "right", "editable": true },
-  { "key": "session.reuse_reviewer", "scope": "child", "default": true, "editable": true },
-  { "key": "agents.codex.available", "scope": "agents", "default": true, "editable": false },
-  { "key": "picks.codex", "scope": "models", "default": [], "editable": true },
-  { "key": "agents.opencode.available", "scope": "agents", "default": true, "editable": false },
-  { "key": "picks.opencode", "scope": "models", "default": [], "editable": true },
-  { "key": "agents.agy.available", "scope": "agents", "default": true, "editable": false },
-  { "key": "picks.agy", "scope": "models", "default": [], "editable": true },
-  { "key": "agents.claude.available", "scope": "agents", "default": true, "editable": false },
-  { "key": "agents.herdr.available", "scope": "agents", "default": true, "editable": false },
-]
+const SCHEMA = SETTINGS_SCHEMA.schema
+const USER_CONFIG = SETTINGS_SCHEMA.userConfig
 
-const USERCONFIG_SNAPSHOT: Readonly<Record<string, unknown>> = {
-  guards: true,
-  autoOpen: true,
-  chip: true,
-  toasts: true,
-  usagePollMin: 5,
-  wake: false,
-  mode: 'orchestrator',
-  defaultTab: 'old',
-  hiddenTabs: '',
-  raster: true,
+const YAML_SCOPES = new Set<SettingsField['scope']>(['project', 'routing', 'agents', 'child'])
+
+/** Every yaml row the fixture draws (mutable, value-bearing, no models /
+ *  tabs.* / about helpers — those scopes carry their own checks). */
+function fixtureYamlRows(): SettingsField[] {
+  return SETTINGS_FIXTURE.groups
+    .filter(g => YAML_SCOPES.has(g.scope))
+    .flatMap(g => g.rows)
+    .filter(r => r.editable)
 }
 
-test('drift: editable YAML rows in SETTINGS_FIXTURE match mk-config list schema', () => {
-  const schemaMap = new Map(SCHEMA_SNAPSHOT.map(f => [f.key, f]))
+type SchemaRow = (typeof SETTINGS_SCHEMA)['schema'][number]
 
-  const yamlScopes = new Set(['project', 'routing', 'agents', 'child'])
-  const editableRows = SETTINGS_FIXTURE.groups
-    .filter(g => yamlScopes.has(g.scope))
-    .flatMap(g => g.rows)
-    .filter(r => r.editable !== false && !(r as { global?: boolean }).global)
+test('drift: editable YAML rows in SETTINGS_FIXTURE match the generated schema (both directions)', () => {
+  const schemaMap = new Map<string, SchemaRow>(SCHEMA.map(f => [f.key as string, f]))
+  const fixtureRows = fixtureYamlRows()
+  expect(fixtureRows.length).toBeGreaterThan(0)
 
-  expect(editableRows.length).toBeGreaterThan(0)
-  for (const row of editableRows) {
+  // 1. fixture -> schema: every editable fixture row has a schema row,
+  // and an editable schema row's default matches the fixture's
+  for (const row of fixtureRows) {
     const schemaRow = schemaMap.get(row.key)
-    expect(schemaRow, `key ${row.key} must exist in schema`).toBeDefined()
-    if (schemaRow && schemaRow.editable !== false) {
+    expect(schemaRow, `key ${row.key} must exist in the generated schema`).toBeDefined()
+    if (schemaRow && schemaRow.editable) {
       expect(row.default, `default for ${row.key} must match schema default`).toEqual(schemaRow.default)
     }
   }
+
+  // 2. schema -> fixture: every editable schema row in a yaml scope has
+  // a fixture row (a new editable schema row with no fixture row escapes
+  // the tab and stays invisible — catch it here)
+  const fixtureKeys = new Set(fixtureRows.map(r => r.key))
+  for (const f of SCHEMA) {
+    if (!f.editable) continue
+    if (!YAML_SCOPES.has(f.scope as SettingsField['scope'])) continue
+    expect(fixtureKeys.has(f.key as string), `schema key ${f.key} has no editable fixture row`).toBe(true)
+  }
 })
 
-test('drift: global rows in SETTINGS_FIXTURE match plugin.json userConfig defaults', () => {
-  const userConfig = USERCONFIG_SNAPSHOT
-
-  const globalScopes = new Set(['mode', 'tabs', 'about'])
-  const globalRows = SETTINGS_FIXTURE.groups
+test('drift: global rows in SETTINGS_FIXTURE exactly match plugin.json userConfig keys', () => {
+  // A userConfig key draws one fixture row in scope 'mode' / 'tabs' / 'about';
+  // a fixture row in those scopes whose key is also a userConfig key draws
+  // the userConfig default. The set is exact — a renamed key or a missing
+  // row trips this test (the old `r.key in userConfig` filter skipped both).
+  const globalScopes = new Set<SettingsField['scope']>(['mode', 'tabs', 'about'])
+  const fixtureGlobalRows = SETTINGS_FIXTURE.groups
     .filter(g => globalScopes.has(g.scope))
     .flatMap(g => g.rows)
-    .filter(r => r.key in userConfig)
+    .filter(r => r.key in USER_CONFIG)
+  const fixtureGlobalKeys = new Set(fixtureGlobalRows.map(r => r.key))
+  const userConfigKeys = new Set(Object.keys(USER_CONFIG))
 
-  expect(globalRows.length).toBeGreaterThan(0)
-  for (const row of globalRows) {
-    const expected = userConfig[row.key]
+  expect(fixtureGlobalRows.length).toBeGreaterThan(0)
+  // exact set match: every userConfig key is drawn, no extra userConfig
+  // keys are drawn, no fixture row is silently skipped
+  expect(fixtureGlobalKeys).toEqual(userConfigKeys)
+  for (const row of fixtureGlobalRows) {
+    const expected = USER_CONFIG[row.key as keyof typeof USER_CONFIG]
     expect(row.default, `default for ${row.key} must match plugin.json userConfig default`).toEqual(expected)
   }
 })
