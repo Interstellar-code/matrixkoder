@@ -383,8 +383,12 @@ prev_status, lane, slot, branch, pane, round, verdict, updated, PRIMARY KEY(run,
 `deps` is one TEXT CSV of ids in the same plan, or `<run>:<id>` in the same project. Validated on
 write: the dep must exist, a self-dep is refused, a cycle is refused with the path named
 (`cycle: r:phase -> r:task -> r:phase`). `route_json` is `{"agent","model","effort"}` or empty.
-Status rolls up subtask → task → phase: an attention status (`blocked`, `stalled`, `quota`,
-`provider`) wins, otherwise the parent takes the least-done column of its children.
+Status rolls up subtask → task → phase through `transition()`: if any child is in an
+attention status the parent takes that status, first match in the order `blocked`, `stalled`,
+`quota`, `provider`, so the parent keeps its previous column through `prev_status` and gets
+`attention=1`; when no child is in an attention status the parent returns to the least-done
+column of its children's non-attention statuses, attention 0. A parent already at the rolled
+status is not transitioned again.
 
 `events(id INTEGER PRIMARY KEY, run, task, t, chan, kind, from_id, to_id, reply_to, text,
 artifact_id, meta_json)` with index `ev_task(run, task, id)`. `chan` is `state` or `bus`.

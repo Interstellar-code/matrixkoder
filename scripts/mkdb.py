@@ -299,23 +299,27 @@ def _prev_status(con, run, task):
     return row["prev_status"] if row else None
 
 
-def _rollup(con, run, task):
-    """A parent's status follows its children: attention wins, else the least-done column.
+def _placed(row, status=None):
+    """Column and attention for a task row. The one path transition() and catch_up() both use."""
+    status = row["status"] if status is None else status
+    prev = row["prev_status"] if status in ATTENTION else None
+    return column_of(status, prev)
 
-    An attention child keeps the parent on its own previous non-attention status when it has
-    one, so a blocked child does not drag a building parent back to Backlog.
+
+def _rollup(con, run, task):
+    """The status a parent should hold, or None when it has no children.
+
+    Any child in an attention status wins, first match in ATTENTION order (blocked, stalled,
+    quota, provider): the parent takes that status, and transition() then keeps the parent's
+    previous column and sets attention=1. Otherwise the parent takes the least-done column of
+    its children's non-attention statuses.
     """
-    kids = con.execute("SELECT status, prev_status FROM tasks WHERE run=? AND parent=?",
-                       (run, task)).fetchall()
+    kids = con.execute("SELECT status FROM tasks WHERE run=? AND parent=?", (run, task)).fetchall()
     if not kids:
         return None
     statuses = [k["status"] for k in kids]
     for flag in ATTENTION:
         if flag in statuses:
-            row = con.execute("SELECT prev_status FROM tasks WHERE run=? AND id=?",
-                              (run, task)).fetchone()
-            if row and row["prev_status"] in COLUMNS:
-                return row["prev_status"]
             return flag
     order = list(dict.fromkeys(COLUMNS.values()))
     cols = {column_of(s)[0]: s for s in statuses}
@@ -346,16 +350,18 @@ def transition(home, project, run, task, to, note="", round=0, sync_root=False, 
     """The ONLY status writer (C10). One project transaction, then the root card iff sync_root."""
     con = open_project(home, project, data_dir)
     try:
-        row = con.execute(
-            "SELECT parent, type, title, route_json, lane, status, prev_status FROM tasks"
-            " WHERE run=? AND id=?", (run, task)).fetchone()
-        if not row:
-            raise Fail(f"no task {run}:{task}")
-        # An attention status keeps the column of the previous non-attention status (C4).
-        col, attention = column_of(to, row["prev_status"] if to in ATTENTION else None)
-        kept = row["prev_status"] if to in ATTENTION else (to if to in COLUMNS else row["prev_status"])
+        # The read and the write share one immediate transaction, so a concurrent transition
+        # cannot change prev_status between the two.
         _begin(con)
         try:
+            row = con.execute(
+                "SELECT parent, type, title, route_json, lane, status, prev_status FROM tasks"
+                " WHERE run=? AND id=?", (run, task)).fetchone()
+            if not row:
+                raise Fail(f"no task {run}:{task}")
+            # An attention status keeps the column of the previous non-attention status (C4).
+            col, attention = _placed(row, to)
+            kept = row["prev_status"] if to in ATTENTION else (to if to in COLUMNS else row["prev_status"])
             con.execute(
                 "UPDATE tasks SET status=?, prev_status=?, round=?, updated=? WHERE run=? AND id=?",
                 (to, kept, round, now(), run, task))
@@ -413,7 +419,7 @@ def catch_up(home, project, data_dir=None):
     con = open_project(home, project, data_dir)
     try:
         rows = con.execute("SELECT t.run, t.id, t.parent, t.type, t.title, t.route_json, t.lane,"
-                           " t.status, t.round, c.change_no FROM change_log c JOIN tasks t"
+                           " t.status, t.prev_status, t.round, c.change_no FROM change_log c JOIN tasks t"
                            " ON t.run=c.run AND t.id=c.task ORDER BY c.change_no").fetchall()
     finally:
         con.close()
@@ -426,7 +432,7 @@ def catch_up(home, project, data_dir=None):
     for r in rows:
         if r["change_no"] <= last:
             continue
-        col, attention = column_of(r["status"])
+        col, attention = _placed(r)
         _upsert_card(home, project, r["run"], r["id"], r, r["status"], col, attention,
                      r["round"], r["change_no"], data_dir)
     return len([r for r in rows if r["change_no"] > last])
@@ -503,6 +509,15 @@ def _pragmas(con):
             con.execute("PRAGMA foreign_keys").fetchone()[0])
 
 
+def _flip_worker(home, data, slot, n):
+    """Alternate one shared task between building and blocked."""
+    os.environ.pop("MKDB_FAIL_BEFORE_ROOT", None)
+    os.environ.pop("MKDB_FAIL_IN_TXN", None)
+    for i in range(n):
+        to = "blocked" if (i + slot) % 2 else "building"
+        transition(home, "flip", "r", "shared", to, note=f"{slot}:{i}", sync_root=True, data_dir=data)
+
+
 def _worker(home, data, slot, n, bad, sync=False, project="probe"):
     """One of 8 writer processes, each writing its own task row."""
     os.environ.pop("MKDB_FAIL_BEFORE_ROOT", None)
@@ -540,6 +555,7 @@ def self_test():
         _writers(home)
         _sync_monotonic(home)
         _attention(home)
+        _flip(home)
         _cycle_race(home)
         _tree(home)
         _reads(home)
@@ -686,15 +702,118 @@ def _attention(home):
     transition(home, "attn", "r", "t", "blocked", sync_root=True, data_dir=data)
     got = {c["task"]: c for c in cards(home, "attn")}
     _check(got["t"]["col"] == "Building" and got["t"]["attention"] == 1, f"blocked card {got.get('t')}")
-    _check(got["phase"]["col"] == "Building", f"parent dragged off its column: {got.get('phase')}")
+    _check(got["phase"]["status"] == "blocked" and got["phase"]["col"] == "Building"
+           and got["phase"]["attention"] == 1, f"parent unflagged: {got.get('phase')}")
+    con = open_project(home, data_dir=data)
+    try:
+        prow = con.execute("SELECT status, prev_status FROM tasks WHERE id='phase'").fetchone()
+        _check(prow["status"] == "blocked" and prow["prev_status"] == "building", f"phase row {dict(prow)}")
+        before = con.execute("SELECT COUNT(*) c FROM events WHERE task='phase'").fetchone()["c"]
+    finally:
+        con.close()
+    transition(home, "attn", "r", "t", "blocked", note="again", sync_root=True, data_dir=data)
+    con = open_project(home, data_dir=data)
+    try:
+        after = con.execute("SELECT COUNT(*) c FROM events WHERE task='phase'").fetchone()["c"]
+        _check(after == before, f"parent re-transitioned: {before} -> {after}")
+    finally:
+        con.close()
     transition(home, "attn", "r", "t", "building", sync_root=True, data_dir=data)
     got = {c["task"]: c for c in cards(home, "attn")}
     _check(got["t"]["col"] == "Building" and got["t"]["attention"] == 0, f"attention stuck {got.get('t')}")
+    _check(got["phase"]["status"] == "building" and got["phase"]["attention"] == 0,
+           f"phase did not return: {got.get('phase')}")
     transition(home, "attn", "r", "fresh", "blocked", sync_root=True, data_dir=data)
     fresh = {c["task"]: c for c in cards(home, "attn")}["fresh"]
     _check(fresh["col"] == "Backlog" and fresh["attention"] == 1, f"no-history attention {fresh}")
     _check(column_of("blocked") == ("Backlog", 1), "column_of(blocked) without prev")
     _check(column_of("blocked", "building") == ("Building", 1), "column_of keeps prev column")
+    # two children: the parent stays flagged until the blocked one clears
+    con = open_project(home, data_dir=data)
+    try:
+        add_task(con, "r", "t2", "task", parent="phase")
+    finally:
+        con.close()
+    transition(home, "attn", "r", "t", "blocked", sync_root=True, data_dir=data)
+    transition(home, "attn", "r", "t2", "building", sync_root=True, data_dir=data)
+    got = {c["task"]: c for c in cards(home, "attn")}
+    _check(got["phase"]["status"] == "blocked" and got["phase"]["attention"] == 1,
+           f"sibling cleared the flag: {got.get('phase')}")
+    transition(home, "attn", "r", "t", "building", sync_root=True, data_dir=data)
+    got = {c["task"]: c for c in cards(home, "attn")}
+    _check(got["phase"]["status"] == "building" and got["phase"]["attention"] == 0,
+           f"flag stuck after both clear: {got.get('phase')}")
+    # three levels: subtask -> task -> phase
+    con = open_project(home, data_dir=data)
+    try:
+        add_task(con, "r", "sub", "subtask", parent="t")
+    finally:
+        con.close()
+    transition(home, "attn", "r", "sub", "building", sync_root=True, data_dir=data)
+    transition(home, "attn", "r", "sub", "blocked", sync_root=True, data_dir=data)
+    got = {c["task"]: c for c in cards(home, "attn")}
+    _check(got["t"]["status"] == "blocked" and got["t"]["attention"] == 1, f"task not flagged {got.get('t')}")
+    _check(got["phase"]["status"] == "blocked" and got["phase"]["col"] == "Building"
+           and got["phase"]["attention"] == 1, f"phase not flagged {got.get('phase')}")
+    # catch_up replays the attention column onto a fresh root, and leaves a plain task unchanged
+    root = open_root(home)
+    try:
+        root.execute("DELETE FROM cards WHERE project='attn'")
+        root.execute("DELETE FROM sync WHERE project='attn'")
+        root.commit()
+    finally:
+        root.close()
+    caught = catch_up(home, "attn", data)
+    _check(caught > 0, "catch_up replayed nothing")
+    got = {c["task"]: c for c in cards(home, "attn")}
+    _check(got["sub"]["col"] == "Building" and got["sub"]["attention"] == 1, f"replayed sub {got.get('sub')}")
+    _check(got["phase"]["col"] == "Building" and got["phase"]["attention"] == 1,
+           f"replayed phase {got.get('phase')}")
+    plain = dict(got["t2"])
+    root = open_root(home)
+    try:
+        root.execute("DELETE FROM cards WHERE project='attn' AND task='t2'")
+        root.execute("UPDATE sync SET last_change_no=0 WHERE project='attn'")
+        root.commit()
+    finally:
+        root.close()
+    catch_up(home, "attn", data)
+    again = {c["task"]: c for c in cards(home, "attn")}["t2"]
+    _check(again["status"] == plain["status"] and again["col"] == plain["col"]
+           and again["attention"] == plain["attention"], f"plain card changed {plain} -> {again}")
+
+
+def _flip(home):
+    """8 processes alternate one task between building and blocked; column and log stay consistent."""
+    data = os.path.join(home, "flip")
+    con = open_project(home, data_dir=data)
+    try:
+        add_task(con, "r", "shared", "task")
+    finally:
+        con.close()
+    transition(home, "flip", "r", "shared", "building", sync_root=True, data_dir=data)
+    procs = []
+    for i in range(8):
+        proc = multiprocessing.get_context("fork").Process(target=_flip_worker, args=(home, data, i, 10))
+        proc.start()
+        procs.append(proc)
+    for proc in procs:
+        proc.join(120)
+        _check(proc.exitcode == 0, f"flip writer exit {proc.exitcode}")
+    con = open_project(home, data_dir=data)
+    try:
+        row = con.execute("SELECT status, prev_status FROM tasks WHERE id='shared'").fetchone()
+        nums = [r[0] for r in con.execute("SELECT change_no FROM change_log ORDER BY change_no")]
+    finally:
+        con.close()
+    card = {c["task"]: c for c in cards(home, "flip")}["shared"]
+    _check(row["prev_status"] == "building", f"prev_status lost: {dict(row)}")
+    _check(card["col"] == "Building", f"column fell to {card['col']} for a task that was building")
+    if row["status"] == "blocked":
+        _check(card["attention"] == 1, "blocked without attention")
+    else:
+        _check(row["status"] == "building" and card["attention"] == 0, f"status {row['status']}")
+    _check(nums == list(range(1, len(nums) + 1)), "change_no not gap-free")
 
 
 def _cycle_race(home):
