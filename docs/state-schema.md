@@ -377,8 +377,9 @@ exit 3. The v1→v2 migration exists only inside `--self-test`; it is not in the
 
 ### Project tables (C2)
 
-`tasks(run, id, parent, type, title, acceptance, owned, deps, parallel, route_json, status, lane,
-slot, branch, pane, round, verdict, updated, PRIMARY KEY(run, id))` — `type` is `phase|task|subtask`;
+`tasks(run, id, parent, type, title, acceptance, owned, deps, parallel, route_json, status,
+prev_status, lane, slot, branch, pane, round, verdict, updated, PRIMARY KEY(run, id))` — `type` is
+`phase|task|subtask`; `prev_status` is the last non-attention status (NULL until the first one);
 `deps` is one TEXT CSV of ids in the same plan, or `<run>:<id>` in the same project. Validated on
 write: the dep must exist, a self-dep is refused, a cycle is refused with the path named
 (`cycle: r:phase -> r:task -> r:phase`). `route_json` is `{"agent","model","effort"}` or empty.
@@ -396,10 +397,14 @@ artifact_id, meta_json)` with index `ev_task(run, task, id)`. `chan` is `state` 
 round, verdict, gates, updated, change_no, PRIMARY KEY(project, run, task))`. `col` (C4) is derived
 from `status`: Backlog (`planned`, `routed`) · Ready · Building (`dispatched`, `building`,
 `takeover`) · Verify (`verifying`) · Review · Fix · Done (`merged`, `qa`, `done`); an attention
-status keeps its column and sets `attention=1`. `sync(project PRIMARY KEY, last_change_no)` records
-how far the root copy got.
+status (`blocked`, `stalled`, `quota`, `provider`) keeps the column of the task's previous
+non-attention status — `tasks.prev_status`, written by `transition()` — and sets `attention=1`.
+A task with no previous non-attention status uses Backlog. `column_of(status, prev_status=None)`
+is pure; `transition()` and the rollup do the lookup. `sync(project PRIMARY KEY, last_change_no)`
+records how far the root copy got and only ever moves forward (`MAX` of the stored value and the
+new `change_no`); a card's own `change_no` is monotonic the same way.
 
-### `transition(project, run, task, to, note="", round=0, sync_root=False, data_dir=None)`
+### `transition(home, project, run, task, to, note="", round=0, sync_root=False, data_dir=None)`
 
 The only status writer (C10). One project-store transaction updates the task row, appends an
 `events` row (`chan='state'`, `kind='transition'`) and a `change_log` row, and returns `change_no`.
@@ -410,9 +415,11 @@ between the two leaves the project change durable and the root behind; `catch_up
 
 ### API and CLI
 
-API: `open_root(home)`, `open_project(home, slug=None, data_dir=None)`, `add_task(con, run, task, type, …)`,
-`transition(…)`, `catch_up(home, project, data_dir=None)`, `timeline(home, project, run, task, data_dir=None)`,
-`cards(home, project=None)`, `check_slug`, `check_home`, `column_of`.
+API: `open_root(home)`, `open_project(home, slug=None, data_dir=None)`,
+`add_task(con, run, task, type, title="", parent=None, deps="", route_json=None, status="planned")`,
+`transition(home, project, run, task, to, note="", round=0, sync_root=False, data_dir=None)`,
+`catch_up(home, project, data_dir=None)`, `timeline(home, project, run, task, data_dir=None)`,
+`cards(home, project=None)`, `check_slug`, `check_home`, `column_of(status, prev_status=None)`.
 
 ```
 mkdb.py timeline --project P --run R --task T --json [--data DIR] [--home DIR]

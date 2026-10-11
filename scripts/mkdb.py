@@ -18,7 +18,7 @@ the only status writer, and the root card is a copy written afterwards, only whe
 
 Schema: docs/state-schema.md (store section).
 """
-import argparse, datetime, json, multiprocessing, os, re, sqlite3, sys, tempfile
+import argparse, datetime, json, multiprocessing, os, re, sqlite3, subprocess, sys, tempfile
 
 sys.dont_write_bytecode = True
 
@@ -60,7 +60,7 @@ CREATE TABLE IF NOT EXISTS runs(
   next TEXT, started TEXT, ended TEXT);
 CREATE TABLE IF NOT EXISTS tasks(
   run TEXT, id TEXT, parent TEXT, type TEXT, title TEXT, acceptance TEXT, owned TEXT, deps TEXT,
-  parallel INTEGER, route_json TEXT, status TEXT, lane TEXT, slot TEXT, branch TEXT, pane TEXT,
+  parallel INTEGER, route_json TEXT, status TEXT, prev_status TEXT, lane TEXT, slot TEXT, branch TEXT, pane TEXT,
   round INTEGER, verdict TEXT, updated TEXT, PRIMARY KEY(run, id));
 CREATE TABLE IF NOT EXISTS events(
   id INTEGER PRIMARY KEY, run TEXT, task TEXT, t TEXT, chan TEXT, kind TEXT, from_id TEXT,
@@ -115,12 +115,19 @@ def resolve_home(arg):
 
 
 def project_dir(home, slug=None, data_dir=None):
-    """--data wins; else <home>/projects/<slug>. The slug is checked before the path exists."""
+    """--data wins; else <home>/projects/<slug>. The slug is checked before the path exists.
+
+    Both routes pass check_home before anything is created: a synced or networked home, and a
+    --data dir that itself looks synced, are refused (C11).
+    """
     if data_dir:
-        return os.path.abspath(os.path.expanduser(data_dir))
+        path = os.path.abspath(os.path.expanduser(data_dir))
+        check_home(path)
+        return path
     if not slug:
         raise Fail("pass --project or --data")
     check_slug(slug)
+    check_home(home)
     return os.path.join(home, "projects", slug)
 
 
@@ -171,10 +178,19 @@ def open_root(home, version=SCHEMA, migrations=()):
     return _migrate(_connect(os.path.join(home, "mk.db")), version, ((1, ROOT_DDL),) + tuple(migrations))
 
 
+def _ensure_prev_status(con):
+    """tasks.prev_status holds the last non-attention status (C4). Added in place; schema stays v1."""
+    cols = [r["name"] for r in con.execute("PRAGMA table_info(tasks)")]
+    if cols and "prev_status" not in cols:
+        con.execute("ALTER TABLE tasks ADD COLUMN prev_status TEXT")
+
+
 def open_project(home, slug=None, data_dir=None, version=SCHEMA, migrations=()):
-    """Open or create the project store (C2)."""
+    """Open or create the project store (C2). check_home runs before any directory is created."""
     path = os.path.join(project_dir(home, slug, data_dir), "mk.db")
-    return _migrate(_connect(path), version, ((1, PROJECT_DDL),) + tuple(migrations))
+    con = _migrate(_connect(path), version, ((1, PROJECT_DDL),) + tuple(migrations))
+    _ensure_prev_status(con)
+    return con
 
 
 def _deps_of(text):
@@ -202,8 +218,35 @@ def _reaches(start, edges):
     return seen
 
 
+def _cycle_through(me, edges):
+    """One simple directed cycle through me, or None. BFS with a parent map; always terminates."""
+    parent = {me: None}
+    queue = [me]
+    found = None
+    while queue:
+        cur = queue.pop(0)
+        for nxt in edges.get(cur, ()):
+            if nxt == me and cur != me:
+                found = cur
+                break
+            if nxt not in parent:
+                parent[nxt] = cur
+                queue.append(nxt)
+        if found is not None:
+            break
+    if found is None:
+        return None
+    path = [me]
+    cur = found
+    while cur is not None:
+        path.append(cur)
+        cur = parent[cur]
+    path.reverse()
+    return path
+
+
 def check_deps(con, run, task, deps):
-    """Exist, no self-dep, no cycle. A cycle error names the path back to the task."""
+    """Exist, no self-dep, no cycle. A cycle error names one simple path back to the task."""
     me = (run, task)
     for dep in _deps_of(deps):
         target = _dep_target(run, dep)
@@ -216,13 +259,8 @@ def check_deps(con, run, task, deps):
         key = (row["run"], row["id"])
         edges[key] = [_dep_target(row["run"], d) for d in _deps_of(row["deps"])]
     edges[me] = [_dep_target(run, d) for d in _deps_of(deps)]
-    if me in _reaches(me, edges):
-        path, cur = [me], me
-        while True:  # walk one cycle back to the start so the error can name it
-            cur = next(n for n in edges[cur] if me in _reaches(n, edges) or n == me)
-            path.append(cur)
-            if cur == me:
-                break
+    path = _cycle_through(me, edges)
+    if path:
         raise Fail("cycle: " + " -> ".join(f"{r}:{t}" for r, t in path))
 
 
@@ -239,23 +277,45 @@ def check_route(route_json):
     return route_json
 
 
-def column_of(status):
-    """C4: the kanban column, plus the attention flag for blocked/stalled/quota/provider."""
+def column_of(status, prev_status=None):
+    """C4: the kanban column, plus the attention flag for blocked/stalled/quota/provider.
+
+    An attention status keeps the column of prev_status (the task's previous non-attention
+    status). With no previous status the column is Backlog. column_of stays pure: the caller
+    looks prev_status up.
+    """
     if status in ATTENTION:
-        return COLUMNS.get(status, "Backlog"), 1
+        if prev_status in COLUMNS:
+            return COLUMNS[prev_status], 1
+        return "Backlog", 1
     if status not in COLUMNS:
         raise Fail(f"unknown status {status!r}")
     return COLUMNS[status], 0
 
 
+def _prev_status(con, run, task):
+    """The task's previous non-attention status, stored on the row (NULL until the first one)."""
+    row = con.execute("SELECT prev_status FROM tasks WHERE run=? AND id=?", (run, task)).fetchone()
+    return row["prev_status"] if row else None
+
+
 def _rollup(con, run, task):
-    """A parent's status follows its children: attention wins, else the least-done column."""
-    kids = con.execute("SELECT status FROM tasks WHERE run=? AND parent=?", (run, task)).fetchall()
+    """A parent's status follows its children: attention wins, else the least-done column.
+
+    An attention child keeps the parent on its own previous non-attention status when it has
+    one, so a blocked child does not drag a building parent back to Backlog.
+    """
+    kids = con.execute("SELECT status, prev_status FROM tasks WHERE run=? AND parent=?",
+                       (run, task)).fetchall()
     if not kids:
         return None
     statuses = [k["status"] for k in kids]
     for flag in ATTENTION:
         if flag in statuses:
+            row = con.execute("SELECT prev_status FROM tasks WHERE run=? AND id=?",
+                              (run, task)).fetchone()
+            if row and row["prev_status"] in COLUMNS:
+                return row["prev_status"]
             return flag
     order = list(dict.fromkeys(COLUMNS.values()))
     cols = {column_of(s)[0]: s for s in statuses}
@@ -263,15 +323,15 @@ def _rollup(con, run, task):
 
 
 def add_task(con, run, task, type, title="", parent=None, deps="", route_json=None, status="planned"):
-    """Insert one task. Validates type, deps (C3) and route_json before the write."""
+    """Insert one task. The dep check and the insert share one write transaction (C3)."""
     if type not in TYPES:
         raise Fail(f"bad type {type!r}: expected phase|task|subtask")
     check_route(route_json)
-    if parent and not con.execute("SELECT 1 FROM tasks WHERE run=? AND id=?", (run, parent)).fetchone():
-        raise Fail(f"missing parent: {parent}")
-    check_deps(con, run, task, deps)
     _begin(con)
     try:
+        if parent and not con.execute("SELECT 1 FROM tasks WHERE run=? AND id=?", (run, parent)).fetchone():
+            raise Fail(f"missing parent: {parent}")
+        check_deps(con, run, task, deps)
         con.execute(
             "INSERT INTO tasks(run, id, parent, type, title, deps, route_json, status, updated)"
             " VALUES (?,?,?,?,?,?,?,?,?)",
@@ -286,15 +346,19 @@ def transition(home, project, run, task, to, note="", round=0, sync_root=False, 
     """The ONLY status writer (C10). One project transaction, then the root card iff sync_root."""
     con = open_project(home, project, data_dir)
     try:
-        col, attention = column_of(to)
-        row = con.execute("SELECT parent, type, title, route_json, lane FROM tasks WHERE run=? AND id=?",
-                          (run, task)).fetchone()
+        row = con.execute(
+            "SELECT parent, type, title, route_json, lane, status, prev_status FROM tasks"
+            " WHERE run=? AND id=?", (run, task)).fetchone()
         if not row:
             raise Fail(f"no task {run}:{task}")
+        # An attention status keeps the column of the previous non-attention status (C4).
+        col, attention = column_of(to, row["prev_status"] if to in ATTENTION else None)
+        kept = row["prev_status"] if to in ATTENTION else (to if to in COLUMNS else row["prev_status"])
         _begin(con)
         try:
-            con.execute("UPDATE tasks SET status=?, round=?, updated=? WHERE run=? AND id=?",
-                        (to, round, now(), run, task))
+            con.execute(
+                "UPDATE tasks SET status=?, prev_status=?, round=?, updated=? WHERE run=? AND id=?",
+                (to, kept, round, now(), run, task))
             con.execute(
                 "INSERT INTO events(run, task, t, chan, kind, to_id, text) VALUES (?,?,?,?,?,?,?)",
                 (run, task, now(), "state", "transition", to, note))
@@ -304,6 +368,10 @@ def transition(home, project, run, task, to, note="", round=0, sync_root=False, 
         except Exception:
             con.execute("ROLLBACK")
             raise
+        # The child's card lands before the parent rollup, so a lower change_no cannot follow a
+        # higher one into the root. sync.last_change_no is also monotonic inside the upsert.
+        if sync_root:
+            _upsert_card(home, project, run, task, row, to, col, attention, round, change_no, data_dir)
         rolled = _rollup(con, run, row["parent"]) if row["parent"] else None
         if rolled and rolled != con.execute("SELECT status FROM tasks WHERE run=? AND id=?",
                                             (run, row["parent"])).fetchone()["status"]:
@@ -311,8 +379,6 @@ def transition(home, project, run, task, to, note="", round=0, sync_root=False, 
                        round=round, sync_root=sync_root, data_dir=data_dir)
     finally:
         con.close()
-    if sync_root:
-        _upsert_card(home, project, run, task, row, to, col, attention, round, change_no, data_dir)
     return change_no
 
 
@@ -327,12 +393,12 @@ def _upsert_card(home, project, run, task, row, status, col, attention, round, c
                 " route_json, lane, round, updated, change_no) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(project, run, task) DO UPDATE SET status=excluded.status, col=excluded.col,"
                 " attention=excluded.attention, round=excluded.round, updated=excluded.updated,"
-                " change_no=excluded.change_no",
+                " change_no=MAX(cards.change_no, excluded.change_no)",
                 (project, run, task, row["parent"], row["type"], row["title"], status, col, attention,
                  row["route_json"], row["lane"], round, now(), change_no))
             root.execute(
                 "INSERT INTO sync(project, last_change_no) VALUES (?,?)"
-                " ON CONFLICT(project) DO UPDATE SET last_change_no=excluded.last_change_no",
+                " ON CONFLICT(project) DO UPDATE SET last_change_no=MAX(sync.last_change_no, excluded.last_change_no)",
                 (project, change_no))
             root.execute("COMMIT")
         except Exception:
@@ -404,6 +470,8 @@ def _cli(argv):
     cd.add_argument("--json", action="store_true")
     args = p.parse_args(argv)
     home = resolve_home(args.home)
+    if args.data:  # C11: refuse a synced or networked --data dir before any directory is created
+        project_dir(home, data_dir=args.data)
     if args.cmd == "timeline":
         if not args.project:
             raise Fail("timeline needs --project")
@@ -435,16 +503,32 @@ def _pragmas(con):
             con.execute("PRAGMA foreign_keys").fetchone()[0])
 
 
-def _worker(home, data, slot, n, bad):
+def _worker(home, data, slot, n, bad, sync=False, project="probe"):
     """One of 8 writer processes, each writing its own task row."""
+    os.environ.pop("MKDB_FAIL_BEFORE_ROOT", None)
+    os.environ.pop("MKDB_FAIL_IN_TXN", None)
     try:
         for i in range(n):
             if bad and i == n - 1:
                 os.environ["MKDB_FAIL_IN_TXN"] = "1"
-            transition(home, "probe", "r", f"w{slot}", "building", note=str(i), data_dir=data)
+            transition(home, project, "r", f"w{slot}", "building", note=str(i),
+                       sync_root=sync, data_dir=data)
     except Exception:
         if not bad:
             raise
+
+
+def _cycle_worker(home, data, slot):
+    """Each process adds one side of a mutual dependency. At most one side may commit."""
+    con = open_project(home, data_dir=data)
+    try:
+        me, other = ("left", "right") if slot % 2 == 0 else ("right", "left")
+        try:
+            add_task(con, "r", f"{me}{slot}", "task", deps=f"{other}{slot ^ 1}")
+        except Fail:
+            return
+    finally:
+        con.close()
 
 
 def self_test():
@@ -454,6 +538,9 @@ def self_test():
         _guards(tmp, home)
         _migrations(home)
         _writers(home)
+        _sync_monotonic(home)
+        _attention(home)
+        _cycle_race(home)
         _tree(home)
         _reads(home)
         _crashes(home)
@@ -495,14 +582,157 @@ def _guards(tmp, home):
         else:
             raise SystemExit(f"SELF-TEST FAIL: slug {slug!r} was accepted")
     _check(set(os.listdir(tmp)) == before, "a refused slug created a path")
-    for bad in (os.path.join(tmp, "Mobile Documents", "mk"), "/Volumes/share/mk",
-                os.path.join(tmp, "Library", "CloudStorage", "iCloud", "mk")):
+    unsafe = (os.path.join(tmp, "CloudStorage", "iCloud"),
+              os.path.join(tmp, "Mobile Documents", "x"),
+              os.path.join(tmp, "Library", "CloudStorage", "iCloud", "mk"))
+    for bad in unsafe:
         try:
-            check_home(bad)
+            open_project(bad, slug="proj")
         except Fail:
             pass
         else:
-            raise SystemExit(f"SELF-TEST FAIL: home {bad!r} was accepted")
+            raise SystemExit(f"SELF-TEST FAIL: open_project accepted {bad!r}")
+        _check(not os.path.exists(os.path.join(bad, "projects")), f"open_project created {bad}")
+        try:
+            open_project(home, data_dir=bad)
+        except Fail:
+            pass
+        else:
+            raise SystemExit(f"SELF-TEST FAIL: --data route accepted {bad!r}")
+        _check(not os.path.exists(bad), f"--data created {bad}")
+    # the CLI takes the same route and must exit non-zero without creating the dir
+    cli_bad = os.path.join(tmp, "Mobile Documents", "cli")
+    rc = subprocess.call([sys.executable, os.path.abspath(__file__), "--data", cli_bad,
+                          "--home", home, "cards", "--json"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _check(rc != 0, f"CLI --data exited {rc}")
+    _check(not os.path.exists(cli_bad), "CLI --data created a directory")
+
+
+def _sync_monotonic(home):
+    """Finding 1: a child rollup must not rewind sync.last_change_no or a card's change_no."""
+    data = os.path.join(home, "syncm")
+    con = open_project(home, data_dir=data)
+    try:
+        add_task(con, "r", "phase", "phase")
+        add_task(con, "r", "t1", "task", parent="phase")
+    finally:
+        con.close()
+    transition(home, "syncm", "r", "t1", "done", sync_root=True, data_dir=data)
+    root = open_root(home)
+    try:
+        last = root.execute("SELECT last_change_no FROM sync WHERE project='syncm'").fetchone()[0]
+        _check(last == 2, f"sync.last_change_no rewound to {last}")
+        nums = {r["task"]: r["change_no"] for r in root.execute(
+            "SELECT task, change_no FROM cards WHERE project='syncm'")}
+        _check(nums.get("t1") == 1 and nums.get("phase") == 2, f"card change_no {nums}")
+    finally:
+        root.close()
+    # a later upsert carrying a lower change_no must not lower the watermark or the card
+    con = open_project(home, data_dir=data)
+    try:
+        row = con.execute("SELECT parent, type, title, route_json, lane FROM tasks WHERE id='t1'").fetchone()
+    finally:
+        con.close()
+    _upsert_card(home, "syncm", "r", "t1", row, "done", "Done", 0, 0, 1, data)
+    root = open_root(home)
+    try:
+        last = root.execute("SELECT last_change_no FROM sync WHERE project='syncm'").fetchone()[0]
+        card = root.execute("SELECT change_no FROM cards WHERE project='syncm' AND task='t1'").fetchone()[0]
+        _check(last == 2 and card == 1, f"lower change_no moved sync={last} card={card}")
+    finally:
+        root.close()
+    # 8 concurrent sync_root writers: the watermark equals MAX(change_log.change_no)
+    wdata = os.path.join(home, "syncw")
+    con = open_project(home, data_dir=wdata)
+    try:
+        for i in range(8):
+            add_task(con, "r", f"w{i}", "task")
+    finally:
+        con.close()
+    procs = []
+    for i in range(8):
+        proc = multiprocessing.get_context("fork").Process(
+            target=_worker, args=(home, wdata, i, 5, False, True, "syncw"))
+        proc.start()
+        procs.append(proc)
+    for proc in procs:
+        proc.join(60)
+        _check(proc.exitcode == 0, f"sync writer exit {proc.exitcode}")
+    con = open_project(home, data_dir=wdata)
+    try:
+        top = con.execute("SELECT MAX(change_no) c FROM change_log").fetchone()["c"]
+    finally:
+        con.close()
+    root = open_root(home)
+    try:
+        last = root.execute("SELECT last_change_no FROM sync WHERE project='syncw'").fetchone()[0]
+        _check(last == top, f"sync.last_change_no {last} != MAX(change_log) {top}")
+    finally:
+        root.close()
+
+
+def _attention(home):
+    """Finding 4: blocked keeps the previous column; leaving it clears the flag. Through transition()."""
+    data = os.path.join(home, "attn")
+    con = open_project(home, data_dir=data)
+    try:
+        add_task(con, "r", "phase", "phase")
+        add_task(con, "r", "t", "task", parent="phase")
+        add_task(con, "r", "fresh", "task")
+    finally:
+        con.close()
+    transition(home, "attn", "r", "t", "building", sync_root=True, data_dir=data)
+    transition(home, "attn", "r", "t", "blocked", sync_root=True, data_dir=data)
+    got = {c["task"]: c for c in cards(home, "attn")}
+    _check(got["t"]["col"] == "Building" and got["t"]["attention"] == 1, f"blocked card {got.get('t')}")
+    _check(got["phase"]["col"] == "Building", f"parent dragged off its column: {got.get('phase')}")
+    transition(home, "attn", "r", "t", "building", sync_root=True, data_dir=data)
+    got = {c["task"]: c for c in cards(home, "attn")}
+    _check(got["t"]["col"] == "Building" and got["t"]["attention"] == 0, f"attention stuck {got.get('t')}")
+    transition(home, "attn", "r", "fresh", "blocked", sync_root=True, data_dir=data)
+    fresh = {c["task"]: c for c in cards(home, "attn")}["fresh"]
+    _check(fresh["col"] == "Backlog" and fresh["attention"] == 1, f"no-history attention {fresh}")
+    _check(column_of("blocked") == ("Backlog", 1), "column_of(blocked) without prev")
+    _check(column_of("blocked", "building") == ("Building", 1), "column_of keeps prev column")
+
+
+def _cycle_race(home):
+    """Finding 2: a branched cycle is named and returns. Finding 5: concurrent adds stay acyclic."""
+    data = os.path.join(home, "cyc")
+    con = open_project(home, data_dir=data)
+    try:
+        add_task(con, "r", "A", "task")
+        add_task(con, "r", "B", "task", deps="A")
+        con.execute("UPDATE tasks SET deps='B,me' WHERE id='A'")
+        con.execute("COMMIT")
+        try:
+            add_task(con, "r", "me", "task", deps="A")
+        except Fail as e:
+            _check("cycle" in str(e) and "r:me" in str(e), f"cycle not named: {e}")
+        else:
+            raise SystemExit("SELF-TEST FAIL: branched cycle accepted")
+    finally:
+        con.close()
+    rdata = os.path.join(home, "cycr")
+    open_project(home, data_dir=rdata).close()
+    procs = []
+    for i in range(8):
+        proc = multiprocessing.get_context("fork").Process(target=_cycle_worker, args=(home, rdata, i))
+        proc.start()
+        procs.append(proc)
+    for proc in procs:
+        proc.join(60)
+        _check(proc.exitcode == 0, f"cycle racer exit {proc.exitcode}")
+    con = open_project(home, data_dir=rdata)
+    try:
+        edges = {}
+        for row in con.execute("SELECT run, id, deps FROM tasks"):
+            edges[(row["run"], row["id"])] = [_dep_target(row["run"], d) for d in _deps_of(row["deps"])]
+        for node in list(edges):
+            _check(node not in _reaches(node, edges), f"cycle survived: {node}")
+    finally:
+        con.close()
 
 
 def _migrations(home):
@@ -513,6 +743,15 @@ def _migrations(home):
     second = open_project(home, data_dir=data, version=2, migrations=((2, V2_SQL),))
     _check(second.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == 2, "idempotent")
     second.close()
+    # Finding 8: a crash between executescript and the version stamp re-runs safely.
+    con = sqlite3.connect(os.path.join(data, "mk.db"))
+    con.execute("DELETE FROM schema_version WHERE version=2")
+    con.commit()
+    con.close()
+    third = open_project(home, data_dir=data, version=2, migrations=((2, V2_SQL),))
+    _check(third.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == 2, "re-stamp")
+    _check(third.execute("SELECT COUNT(*) c FROM mkdb_v2_probe").fetchone()["c"] == 0, "probe grew")
+    third.close()
     try:
         open_project(home, data_dir=data, version=1)
     except Fail as e:
