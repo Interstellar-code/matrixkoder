@@ -202,6 +202,12 @@ SCHEMA = [
                ("down", "the reviewer runs after the builder stops")]),
     _row("session.reuse_reviewer", "child", "bool", True, ["session"], "reuse_reviewer", None,
          "Reuse reviewer", "one reviewer session serves the phase's rounds"),
+    _row("bus.enabled", "child", "bool", True, ["bus"], "enabled", None,
+         "Bus enabled", "arm starts the loopback bus and writes the lane token."),
+    _row("bus.owner_timeout_min", "child", "num", 30, ["bus"], "owner_timeout_min", None,
+         "Owner timeout", "bus self-exits after this many idle minutes.", min=5, max=120),
+    _row("bus.ask_timeout_s", "child", "num", 600, ["bus"], "ask_timeout_s", None,
+         "Ask timeout", "a lane ask waits this long for the answer.", min=60, max=3600),
 ]
 
 MIGRATED_KEYS = ("routing_preferences.reviewer", "routing_preferences.visual_reviewer")
@@ -932,6 +938,7 @@ def cmd_context(path, lines, usage_arg=None):
         "fresh_session": val("session.fresh_session"),
         "reviewer_split": val("session.reviewer_split"),
         "reuse_reviewer": val("session.reuse_reviewer"),
+        "bus_ask_timeout_s": val("bus.ask_timeout_s"),
         "integration_branch": val("repo.integration_branch"),
         "integration_target": val("qa.integration_target"),
         "builder_skip_permissions": builder_skip_permissions,
@@ -1619,6 +1626,29 @@ def self_test():
         assert "\n# keep\n" in after_tr, f"trailing comment lost:\n{after_tr}"
         assert after_tr.endswith("repo:\n  integration_branch: main\n"), after_tr
         assert after_tr.index("\n# keep\n") < after_tr.index("repo:"), after_tr
+
+        # 22. bus.* rows: the whole missing section is appended (the same mechanism as
+        #     picks), values round-trip, and a value below the minimum is refused
+        with open(yaml_path, "w") as f:
+            f.write(fixture)
+        before, bak = rd(), yaml_path + ".bak"
+        run("set", "bus.enabled", "false")
+        added = rd().splitlines()
+        assert added[:len(before.splitlines())] == before.splitlines(), "an existing line moved"
+        assert added[-2:] == ["bus:", "  enabled: false"], added[-2:]
+        assert run("get", "bus.enabled")["value"] is False
+        run("set", "bus.owner_timeout_min", "7")  # the block exists now: the key is inserted into it
+        assert run("get", "bus.owner_timeout_min")["value"] == 7
+        os.unlink(bak)
+        before = rd()
+        run("set", "bus.owner_timeout_min", "4", ok=False)  # below min 5
+        run("set", "bus.ask_timeout_s", "59", ok=False)  # below min 60
+        assert rd() == before and not os.path.exists(bak)
+
+        # 23. context carries the bus ask timeout: the schema default, then the set value
+        assert run("context")["bus_ask_timeout_s"] == 600
+        run("set", "bus.ask_timeout_s", "900")
+        assert run("context")["bus_ask_timeout_s"] == 900
     finally:
         restore()
         shutil.rmtree(tmp, ignore_errors=True)
