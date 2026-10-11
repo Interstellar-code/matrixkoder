@@ -7,9 +7,13 @@ mirrored by a `--self-test` case. It writes one lane file, `<lane>/.matrixkoder-
 
 Stdlib only. One JSON line on stdout per invocation, like `scripts/mk-state.py:1299-1309`, plus
 the lane token on the last line for `done` and `blocked` (R26).
+
+`measure` (plan MB5.1) is the one orchestrator-side exception: read-only counters over a run's
+`events.jsonl` and `tasks/*/brief-r*.md` under a `<data>` root — no lane file is read or written.
 """
 import argparse
 import contextlib
+import datetime
 import io
 import json
 import os
@@ -528,6 +532,172 @@ def cmd_install(a):
     return ({"ok": True, "installed": dest, "version": plugin_version(), "files": count}, None)
 
 
+# ---------- measure (plan MB5.1: read-only counters over one run) ----------
+
+# The verdict vocabulary `lane-watch.record()` prefixes its notes with (scripts/lane-watch.py:62-64
+# STATUS_MAP keys, plus the pane-exit and watch-expiry states). Only those events carry — or, in
+# runs that predate MB3, lack — the `source=` tag `apply_verdict` appends as the final evidence
+# item (scripts/mk-lane-event.py:330-340, plan C4).
+VERDICT_HEAD_RE = re.compile(
+    r"^lane-watch (DONE|DONE_SENT|STALL|BLOCKED|QUOTA|PROVIDER|ERROR|WATCH_EXPIRED|DEV_SERVER): ")
+SOURCE_RE = re.compile(r"source=(status|pane|grace)\b")
+# The grace DONE shape, both eras: pre-MB3 "no S2 R3 DONE token (commit + report, agent idle
+# 3.1 min)" (settings-tab-r1) and current "no P1 DONE token (report, agent idle 4 min)"
+# (scripts/lane-watch.py:233-240) — the source=grace tag covers only the current one.
+NO_TOKEN_RE = re.compile(r"no \S.* DONE token")
+# A commit mention (record()'s "commit <sha>", an orchestrator "verify T @<sha>", a merge note):
+# the false-STALL proxy's second signal. 7-40 hex chars; a 7-digit decimal is rare enough in
+# verdict prose that the proxy keeps it.
+COMMIT_SHA_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
+BRIEF_NAME_RE = re.compile(r"^brief-r(\d+)\.md$")
+SOURCES = ("status", "pane", "grace")
+FALSE_STALL_WINDOW = datetime.timedelta(minutes=10)  # the acceptance's "within 10 min"
+
+
+def parse_events(run_dir):
+    """`events.jsonl` as a list of dicts; a torn line from a crash mid-append is skipped, not
+    fatal (mk-state.py:355-365). A missing file is an empty run, not an error."""
+    try:
+        with open(os.path.join(run_dir, "events.jsonl")) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    out = []
+    for x in lines:
+        with contextlib.suppress(json.JSONDecodeError):
+            out.append(json.loads(x))
+    return out
+
+
+def verdict_of(e):
+    """(state, text) for an event lane-watch's record() wrote — `lane-watch <STATE>: <evidence>`
+    — else None. Orchestrator verdicts (type "verdict", no lane-watch head) are not counted."""
+    m = VERDICT_HEAD_RE.match(e.get("text") or "")
+    return (m.group(1), e["text"]) if m else None
+
+
+def source_of(text):
+    """The LAST `source=` tag in the text (apply_verdict appends it as the final evidence item,
+    so the last one is the verdict's own); None when the run predates MB3 — counted as `none`."""
+    hit = None
+    for m in SOURCE_RE.finditer(text):
+        hit = m.group(1)
+    return hit
+
+
+def blocked_question(text):
+    """The question inside a BLOCKED verdict's evidence: after the verdict head, strip the final
+    `; source=...` item (and any `(status ... kept)` suffix record() appends for a late watcher,
+    scripts/lane-watch.py:337), then the evidence's own prefix — `<phase> BLOCKED: ` (the pane
+    path, scripts/lane-watch.py:228) or `status file blocked: ` (the file path, :230)."""
+    q = text[VERDICT_HEAD_RE.match(text).end():]
+    cut = q.rfind("; source=")
+    if cut != -1:
+        q = q[:cut]
+    q = re.sub(r"^status file blocked: ", "", q)
+    q = re.sub(r"^(.*?) BLOCKED: ", "", q, count=1)
+    return q.strip()
+
+
+def event_time(e):
+    """The event's `t` as a datetime (mk-state writes ISO seconds with an offset,
+    scripts/mk-state.py:87), or None — an event without a usable time joins no window."""
+    try:
+        return datetime.datetime.fromisoformat(e["t"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def false_stall(se, events):
+    """The false-STALL proxy: this STALL is followed by a DONE verdict, or by any event that
+    mentions a commit sha, for the SAME task within 10 minutes. A STALL whose task is null
+    cannot be attributed to a lane, and neither can a STALL without a parsable time."""
+    if se.get("task") is None:
+        return False
+    t1 = event_time(se)
+    if t1 is None:
+        return False
+    for e in events:
+        if e is se or e.get("task") != se.get("task"):
+            continue
+        t2 = event_time(e)
+        if t2 is None:
+            continue
+        if datetime.timedelta(0) <= t2 - t1 <= FALSE_STALL_WINDOW:
+            v = verdict_of(e)
+            if (v and v[0] in ("DONE", "DONE_SENT")) or COMMIT_SHA_RE.search(e.get("text") or ""):
+                return True
+    return False
+
+
+def brief_counts(run_dir):
+    """Per task, each `brief-rN.md`'s lines (splitlines of the decoded bytes — equals `wc -l` on
+    the newline-terminated briefs mk-state writes) and bytes (the file's size, `wc -c`). Only
+    `brief-rN.md` counts: `task.json`, `review-brief-rN.md` and reports are not briefs. Rounds
+    sort numerically, so brief-r10 follows brief-r2."""
+    tasks_dir = os.path.join(run_dir, "tasks")
+    out = {}
+    try:
+        names = sorted(os.listdir(tasks_dir))
+    except OSError:
+        return out
+    for name in names:
+        if not os.path.isdir(os.path.join(tasks_dir, name)):
+            continue
+        try:
+            files = os.listdir(os.path.join(tasks_dir, name))
+        except OSError:
+            continue
+        briefs = {}
+        for fn in files:
+            if not BRIEF_NAME_RE.match(fn):
+                continue
+            with open(os.path.join(tasks_dir, name, fn), "rb") as f:
+                data = f.read()
+            briefs[fn] = {"lines": len(data.decode("utf-8", "replace").splitlines()), "bytes": len(data)}
+        out[name] = dict(sorted(briefs.items(),
+                                key=lambda kv: (int(BRIEF_NAME_RE.match(kv[0]).group(1)), kv[0])))
+    return out
+
+
+def cmd_measure(a):
+    """MB5.1: one JSON line of read-only counters over one run — per task brief lines and bytes,
+    verdict events by source (status|pane|grace, plus `none` for runs that predate the MB3 tag),
+    DONE verdicts that needed the grace rule (missed DONE lines), STALL events followed by a
+    DONE or a commit within 10 min (the false-STALL proxy), and the BLOCKED questions. Nothing
+    under <data> is written; counts are per EVENT, so a 4-child lane records one verdict once
+    per child (and once more as a kept-status note) — measurement.md states how to read that."""
+    run = check_run(a.run)
+    data = os.path.abspath(a.data)
+    if not os.path.isdir(data):
+        raise Fail(f"data dir {data!r} does not exist [measure]")
+    run_dir = os.path.join(data, "runs", run)
+    if not os.path.isdir(run_dir):
+        raise Fail(f"unknown run {run!r}: no {run_dir} directory [measure]")
+    events = parse_events(run_dir)
+    by_source = {s: 0 for s in SOURCES}
+    by_source["none"] = 0
+    missed, stalls, questions = 0, [], []
+    for e in events:
+        v = verdict_of(e)
+        if not v:
+            continue
+        state, text = v
+        src = source_of(text)
+        by_source[src or "none"] += 1
+        if state == "DONE" and (src == "grace" or NO_TOKEN_RE.search(text)):
+            missed += 1
+        elif state == "STALL":
+            stalls.append(e)
+        elif state == "BLOCKED":
+            questions.append(blocked_question(text))
+    false = sum(1 for se in stalls if false_stall(se, events))
+    return ({"ok": True, "run": run, "data": data, "briefs": brief_counts(run_dir),
+             "verdicts_by_source": by_source, "missed_done_lines": missed,
+             "stalls": len(stalls), "false_stalls": false,
+             "blocked": len(questions), "blocked_questions": questions}, None)
+
+
 # ---------- CLI ----------
 
 def build_parser():
@@ -540,6 +710,12 @@ def build_parser():
     sp = sub.add_parser("install", help="copy this skill folder into <dir>/.claude/skills/mk-builder/")
     sp.add_argument("--into", required=True, help="target repo or lane root")
     sp.set_defaults(func=cmd_install)
+
+    sp = sub.add_parser("measure", help="read-only counters over one run: briefs, verdict "
+                                        "sources, missed DONE lines, false STALLs, blocked")
+    sp.add_argument("--data", required=True, help="the MatrixKoder data root (holds runs/)")
+    sp.add_argument("--run", required=True)
+    sp.set_defaults(func=cmd_measure)
 
     def lane_cmd(name, fn, help_):
         sp = sub.add_parser(name, help=help_)
@@ -585,7 +761,7 @@ def main(argv=None):
             return run_self_test()
         if not getattr(a, "cmd", None):
             raise Fail("no command; --help lists the R17 command set "
-                       "(start, progress, blocked, done, ctx, phase-done, show, install)")
+                       "(start, progress, blocked, done, ctx, phase-done, show, install, measure)")
         out, token = a.func(a)
     except Fail as e:
         print(json.dumps({"ok": False, "error": str(e), **e.extra}))
@@ -1108,6 +1284,132 @@ def t_install_in_worktree(root):
     assert code2 == 0, lines2
     status_out2 = git(wt_dir, "status", "--porcelain")
     assert not [l for l in status_out2.splitlines() if ".claude" in l]
+
+
+# ---------- measure self-test (MB5.1) ----------
+
+def measure_fixture(root):
+    """One fixture run dir: every shape `measure` counts — pre-MB3 verdicts (no source tag),
+    MB3 verdicts (status/pane/grace), a grace DONE, a kept-status BLOCKED note, a torn line, two
+    tasks with briefs, and files that must NOT count as briefs (task.json, review-brief-r1.md).
+    R6: the fixture is built in the self-test's temp root at run time, never committed."""
+    data = os.path.join(root, "measure_data")
+    run_dir = os.path.join(data, "runs", "fx")
+    t1 = os.path.join(run_dir, "tasks", "T1")
+    t2 = os.path.join(run_dir, "tasks", "T2")
+    os.makedirs(t1, exist_ok=True)
+    os.makedirs(t2, exist_ok=True)
+    for path, body in ((os.path.join(t1, "brief-r1.md"), "alpha\nbeta\ngamma\n"),
+                       (os.path.join(t1, "brief-r2.md"), "x\n"),
+                       (os.path.join(t2, "brief-r1.md"), "one\ntwo\n"),
+                       (os.path.join(t1, "task.json"), "{}\n"),
+                       (os.path.join(t1, "review-brief-r1.md"), "not a brief\n")):
+        with open(path, "w") as f:
+            f.write(body)
+    rows = [
+        ("2026-10-10T12:00:00+02:00", None, "note", "run init: fixture run", None, None, "orchestrator"),
+        # pre-MB3 STALL (no source): false — a DONE for T1 lands 3 min later
+        ("2026-10-10T12:05:00+02:00", "T1", "transition",
+         "lane-watch STALL: working but no file/commit/pane change for 10.0 min",
+         "building", "stalled", "lane-watch"),
+        ("2026-10-10T12:08:00+02:00", "T1", "transition",
+         "lane-watch DONE: commit a1b2c3d4e5f6a7b8c9d0 fixture subject one; T1 R1 DONE",
+         "stalled", "verifying", "lane-watch"),
+        # MB3 STALL, source=pane: false — an orchestrator verdict (not a lane-watch DONE) for T2
+        # mentions a commit sha 5 min later
+        ("2026-10-10T12:20:00+02:00", "T2", "transition",
+         "lane-watch STALL: working but no file/commit/pane change for 10.5 min; source=pane",
+         "building", "stalled", "lane-watch"),
+        ("2026-10-10T12:25:00+02:00", "T2", "verdict", "verify T2 @f6ec0d5ff: tests 3/0",
+         None, None, "orchestrator"),
+        # MB3 STALL, source=status: NOT false — T1's next DONE is 20 min later
+        ("2026-10-10T12:40:00+02:00", "T1", "transition",
+         "lane-watch STALL: working but no file/commit/pane change for 10.0 min; source=status",
+         "building", "stalled", "lane-watch"),
+        ("2026-10-10T13:00:00+02:00", "T1", "transition",
+         "lane-watch DONE: commit a1b2c3d4e5f6a7b8c9d0 fixture subject two; T1 R2 DONE",
+         "stalled", "verifying", "lane-watch"),
+        # the grace DONE (current shape): the one missed DONE line
+        ("2026-10-10T13:30:00+02:00", "T2", "note",
+         "lane-watch DONE: no T2 R1 DONE token (report, agent idle 4 min); source=grace",
+         None, None, "lane-watch"),
+        ("2026-10-10T14:00:00+02:00", "T2", "transition",
+         "lane-watch BLOCKED: T2 BLOCKED: which fixture format is the acceptance target?; source=pane",
+         "building", "blocked", "lane-watch"),
+        ("2026-10-10T14:10:00+02:00", "T1", "transition",
+         "lane-watch BLOCKED: status file blocked: v2 or v3 fixture?; source=status",
+         "building", "blocked", "lane-watch"),
+        ("2026-10-10T14:20:00+02:00", "T1", "transition",
+         "lane-watch DONE: commit a1b2c3d4e5f6a7b8c9d0 fixture subject three; "
+         "status file done (seq 5); source=status",
+         "blocked", "verifying", "lane-watch"),
+        # a late watcher's kept-status note: the ` (status ... kept)` suffix must not reach the
+        # extracted question
+        ("2026-10-10T14:30:00+02:00", "T2", "note",
+         "lane-watch BLOCKED: T2 BLOCKED: resolved: answer b; source=pane (status blocked kept)",
+         None, None, "lane-watch"),
+    ]
+    with open(os.path.join(run_dir, "events.jsonl"), "w") as f:
+        for t, task, typ, text, frm, to, by in rows:
+            f.write(json.dumps({"t": t, "run": "fx", "task": task, "type": typ,
+                                "text": text, "from": frm, "to": to, "by": by}) + "\n")
+        f.write("{torn\n")  # a crash mid-append: skipped, not fatal
+    return data
+
+
+def data_digest(data):
+    """(relative path, size, mtime_ns) per file under <data> — the read-only proof."""
+    items = []
+    for d, dirs, files in os.walk(data):
+        dirs.sort()
+        for name in sorted(files):
+            p = os.path.join(d, name)
+            st = os.stat(p)
+            items.append((os.path.relpath(p, data), st.st_size, st.st_mtime_ns))
+    return items
+
+
+def t_measure_exact_counts(root):
+    """MB5.1: the fixture run's exact counters — briefs (only brief-rN.md, task.json and
+    review-brief-r1.md excluded), verdict events by source (the pre-MB3 `none` bucket included),
+    the grace DONE as the one missed DONE line, two false STALLs (one by a DONE, one by a commit
+    mention in a non-lane-watch event, the third STALL outside the 10-min window), and the three
+    BLOCKED questions with the kept-status suffix stripped."""
+    data = measure_fixture(root)
+    code, lines = cli_raw("measure", "--data", data, "--run", "fx")
+    assert code == 0 and len(lines) == 1, lines
+    out = jline(lines)
+    assert out == {
+        "ok": True, "run": "fx", "data": data,
+        "briefs": {"T1": {"brief-r1.md": {"lines": 3, "bytes": 17},
+                          "brief-r2.md": {"lines": 1, "bytes": 2}},
+                   "T2": {"brief-r1.md": {"lines": 2, "bytes": 8}}},
+        "verdicts_by_source": {"status": 3, "pane": 3, "grace": 1, "none": 3},
+        "missed_done_lines": 1, "stalls": 3, "false_stalls": 2, "blocked": 3,
+        "blocked_questions": ["which fixture format is the acceptance target?",
+                              "v2 or v3 fixture?", "resolved: answer b"],
+    }, out
+
+
+def t_measure_read_only(root):
+    """MB5.1: measure changes no file under <data> (paths, sizes and mtimes identical before and
+    after), a second run is byte-identical, and an unknown run or data dir is one JSON error
+    line and a non-zero exit that also changes nothing."""
+    data = measure_fixture(root)
+    before = data_digest(data)
+    code, lines = cli_raw("measure", "--data", data, "--run", "fx")
+    assert code == 0, lines
+    assert data_digest(data) == before, "measure wrote something under <data>"
+    code2, lines2 = cli_raw("measure", "--data", data, "--run", "fx")
+    assert code2 == 0 and lines2 == lines, "a second run is not byte-identical"
+    for args, needle in ((("measure", "--data", data, "--run", "nope"), "unknown run"),
+                         (("measure", "--data", os.path.join(root, "no-such-data"), "--run", "fx"),
+                          "does not exist")):
+        code3, lines3 = cli_raw(*args)
+        assert code3 != 0 and len(lines3) == 1, (args, lines3)
+        out = jline(lines3)
+        assert out.get("ok") is False and needle in out.get("error", ""), (args, out)
+    assert data_digest(data) == before, "a refused run changed nothing either"
 
 
 def t_skill_frontmatter(root):
