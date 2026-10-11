@@ -173,6 +173,27 @@ export const SETTINGS_SCHEMA = {
     },
     {
       "default": true,
+      "editable": true,
+      "key": "bus.enabled",
+      "scope": "child",
+      "type": "bool"
+    },
+    {
+      "default": 30,
+      "editable": true,
+      "key": "bus.owner_timeout_min",
+      "scope": "child",
+      "type": "num"
+    },
+    {
+      "default": 600,
+      "editable": true,
+      "key": "bus.ask_timeout_s",
+      "scope": "child",
+      "type": "num"
+    },
+    {
+      "default": true,
       "editable": false,
       "key": "agents.opencode.available",
       "scope": "agents",

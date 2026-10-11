@@ -58,6 +58,11 @@ const USAGE_POLL_DEFAULT_MIN = 5
 const USAGE_POLL_MIN_MIN = 1 // a faster poll with the 120 s timeout would stack runs
 const POLL_MIN_INTERVAL_MS = 60_000
 const SWEEP_INTERVAL_MS = 120_000
+// The bus host (mk-bus.py): one idempotent `ensure` (or `heartbeat`) every 15 s.
+// Its own start window is a few seconds of flock + probe, so the spawn timeout
+// stays short — a slow one is swallowed and the next tick retries.
+const BUS_INTERVAL_MS = 15_000
+const BUS_TIMEOUT_MS = 10_000
 const PRIMARY_POOL: Record<string, string> = { agy: 'gemini', claude: 'default' }
 // the pane's glyph/colour vocabularies moved to tabs/ui.ts: one copy for the
 // pane and the tab modules (T1/T2)
@@ -141,6 +146,11 @@ let pollInFlight = false
 let lastPollAt = -Infinity
 let sweepInFlight = false
 let lastSweepAt = -Infinity
+let busInFlight = false
+/** data.ts's timerRegistry declares exactly three cancels and data.ts is not
+ *  this phase's file: the bus timer's cancel rides the same object under one
+ *  more key, armed and cancelled in startLoop like cancelPoll/cancelSweep. */
+const busTimers = timerRegistry as typeof timerRegistry & { cancelBus?: () => void }
 let lastChipText: string | null | undefined // undefined = never set; skip ui.status when unchanged
 
 export function registerDashboard(on: On, options: PluginOptions): void {
@@ -159,6 +169,7 @@ export function registerDashboard(on: On, options: PluginOptions): void {
       }
     }
     await startLoop($, options, e.cwd) // the session's own words for where it runs; timers capture it
+    void ensureBus($, options, e.cwd) // the 15 s tick is too late for a session that needs the bus now
     await loadBrandVersion($)
     // S2.3: `defaultTab` picks the opening tab — a known visible tab stands,
     // anything else keeps the Old default.
@@ -179,8 +190,10 @@ export function registerDashboard(on: On, options: PluginOptions): void {
     // /clear fires session.end (timers cancelled) but never session.start: /mk re-arms the loop
     if (timerRegistry.cancelRefresh == null) {
       try {
-        await startLoop($, options, await $.session.cwd())
+        const cwd = await $.session.cwd()
+        await startLoop($, options, cwd)
         await loadBrandVersion($)
+        void ensureBus($, options, cwd) // /mk is how /clear comes back — the bus needs no /clear
       } catch {
         // no cwd — the pane keeps its last snapshot
       }
@@ -502,6 +515,8 @@ async function startLoop($: EngineInterface, options: PluginOptions, cwd: string
   timerRegistry.cancelPoll = arm($.clock.every(Math.round(min * 60_000), () => pollUsage($, cwd)))
   timerRegistry.cancelSweep?.()
   timerRegistry.cancelSweep = arm($.clock.every(SWEEP_INTERVAL_MS, () => sweepLanes($, options, cwd)))
+  busTimers.cancelBus?.()
+  busTimers.cancelBus = arm($.clock.every(BUS_INTERVAL_MS, () => ensureBus($, options, cwd)))
   lastChipText = undefined
   await refreshSafe($, options, cwd) // first load populates pane + chip and never toasts
   const gdir = await globalDirOf($, await homeDir($))
@@ -772,6 +787,53 @@ async function sweepLanes($: EngineInterface, options: PluginOptions, cwd: strin
     // herdr or mk-lane-event.py missing — the next tick retries
   } finally {
     sweepInFlight = false
+  }
+}
+
+/** Keeps the bus host alive for the active run: `heartbeat` while `<data>/bus.json`
+ *  names a server, else the idempotent `ensure`. Mirrors sweepLanes — an in-flight
+ *  guard, every failure swallowed — and writes nothing, so it never blocks a render. */
+async function ensureBus($: EngineInterface, options: PluginOptions, cwd: string): Promise<void> {
+  if (options.mode === 'solo') return // S2.3: solo runs no orchestration, so it hosts no bus
+  if (timerRegistry.cancelRefresh == null) { // orphaned by /clear: the registry knows three cancels, not this one
+    busTimers.cancelBus?.()
+    busTimers.cancelBus = undefined
+    return
+  }
+  if (busInFlight) return
+  busInFlight = true
+  try {
+    const dataDir = await resolveDataDir($, cwd, await homeDir($))
+    if (dataDir == null) return // first-run: the wizard writes the data dir
+    // the pane's own snapshot, not a second loadSnapshot: the refresh timer owns
+    // reading run.json, and startLoop always populates this before either call site
+    const snap = await read($, snapshotAtom) as MkPaneSnapshot
+    if (snap.run == null) return // only an active run owns a bus
+    const script = `${$.plugin.root}/scripts/mk-bus.py`
+    if ((await readText($, join(dataDir, 'bus.json'))) != null) {
+      await $.process.run(['python3', script, 'heartbeat', '--data', dataDir], { timeoutMs: BUS_TIMEOUT_MS })
+      return
+    }
+    if (await busDisabled($, dataDir)) return
+    await $.process.run(['python3', script, 'ensure', '--data', dataDir, '--run', snap.run.id], { timeoutMs: BUS_TIMEOUT_MS })
+  } catch {
+    // mk-bus.py missing or slow — the next tick retries
+  } finally {
+    busInFlight = false
+  }
+}
+
+/** True only for an explicit `{"ok":true,"value":false}` from mk-config.py. Every
+ *  other answer leaves the bus on — including the "unknown key" a checkout without
+ *  BC's `bus.enabled` row prints — so the host never waits on that row to exist. */
+async function busDisabled($: EngineInterface, dataDir: string): Promise<boolean> {
+  try {
+    const argv = ['python3', `${$.plugin.root}/scripts/mk-config.py`, 'get', 'bus.enabled', '--data', dataDir]
+    const r = await $.process.run(argv, { timeoutMs: BUS_TIMEOUT_MS })
+    const ans = parseJson(r.stdout) as { ok?: unknown; value?: unknown } | null
+    return typeof ans === 'object' && ans !== null && ans.ok === true && ans.value === false
+  } catch {
+    return false
   }
 }
 

@@ -134,6 +134,14 @@ export const SETTINGS_FIXTURE: SettingsView = {
         { key: 'session.reuse_reviewer', scope: 'child', label: 'Reuse reviewer pane', type: 'bool', value: true, default: true, help: '/clear between rounds.', editable: true },
       ],
     },
+    {
+      scope: 'child', title: 'bus',
+      rows: [
+        { key: 'bus.enabled', scope: 'child', label: 'Bus enabled', type: 'bool', value: true, default: true, help: 'arm starts the loopback bus and writes the lane token.', editable: true },
+        { key: 'bus.owner_timeout_min', scope: 'child', label: 'Owner timeout', type: 'num', value: 30, default: 30, min: 5, max: 120, unit: 'm', help: 'bus self-exits after this many idle minutes.', editable: true },
+        { key: 'bus.ask_timeout_s', scope: 'child', label: 'Ask timeout', type: 'num', value: 600, default: 600, min: 60, max: 3600, unit: 's', help: 'a lane ask waits this long for the answer.', editable: true },
+      ],
+    },
     // ---- Tabs: the artboard's visibility + pane rows, plus the C2 rows
     // (defaultTab, hiddenTabs, raster) in the same field shape
     {

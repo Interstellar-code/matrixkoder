@@ -97,7 +97,7 @@ export type MkWakePending = {
   run: string
   /** events.jsonl line count to mark as seen once the batch is submitted */
   upTo: number
-  items: readonly { readonly task: string; readonly to: string }[]
+  items: readonly { readonly task: string; readonly to: string; readonly askId?: string }[]
 }
 
 export type MkStatusMemory = {

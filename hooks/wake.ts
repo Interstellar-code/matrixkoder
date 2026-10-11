@@ -37,7 +37,8 @@ const pendingRef = { plugin: 'matrixkoder', key: 'wakePending' } as const
 const EMPTY_PENDING: Pending = { run: '', upTo: 0, items: [] }
 
 /** Same rule as the dashboard and mk-state: MATRIXKODER_DATA, else the nearest .git (never above $HOME);
- *  a linked worktree resolves to its main checkout. Pure helpers are in data.ts ($ may not cross an import). */
+ *  a linked worktree resolves to its main checkout. Pure helpers are in data.ts ($ may not cross an import).
+ *  tools.ts (mk_bus's --data) keeps its own file-local copy for the same loader rule. */
 async function resolveDataDir($: EngineInterface): Promise<string> {
   try {
     const envData = await $.env.get('MATRIXKODER_DATA')
@@ -188,7 +189,7 @@ async function flushBatch($: EngineInterface): Promise<void> {
   // A later status change may already have reversed a transition while the batch waited:
   // re-read each task's current status and drop items that no longer hold it.
   const dataDir = await resolveDataDir($)
-  const items: Array<{ task: string; to: string }> = []
+  const items: Array<{ task: string; to: string; askId?: string }> = []
   for (const p of pend.items) {
     const status = await currentTaskStatus($, dataDir, pend.run, p.task)
     if (status === undefined || status === p.to) items.push(p)
@@ -199,7 +200,12 @@ async function flushBatch($: EngineInterface): Promise<void> {
     await $.state.set(pendingRef, EMPTY_PENDING).catch(() => {})
     return
   }
-  const summary = items.map(p => `${p.task} → ${p.to}`).join(', ')
+  // An ask item names its ask in the summary: the distinct text is what lets a second ask
+  // past the identical-text hold (two asks would otherwise summarize to the same plain
+  // "task → blocked" and the hold would swallow the second question). m-\d+ is validation-safe.
+  const summary = items
+    .map(p => (p.askId === undefined ? `${p.task} → ${p.to}` : `${p.task} → blocked (bus ask ${p.askId})`))
+    .join(', ')
   const text = `MatrixKoder: ${summary}. Continue the run from its Next action.`
 
   const held = await $.state
@@ -256,8 +262,14 @@ async function flushBatch($: EngineInterface): Promise<void> {
   }
   retryNext = false
   for (const p of items) {
+    // An ask wake stamps ONLY its ask cooldown id: stamping the plain `${task}:blocked`
+    // as well would suppress an unrelated later plain blocked wake for the same task
+    // inside the 5-min window (and vice versa the ask key never blocks a plain wake).
+    // The ask id carries the run (pend.run): ids repeat across runs, so an id-only key
+    // would let run A's m-1 throttle run B's m-1 for the same task (review LOW 3).
+    const cooldownId = p.askId === undefined ? `${p.task}:${p.to}` : `${p.task}:blocked:${pend.run}:${p.askId}`
     await $.state
-      .set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `${p.task}:${p.to}` } as const, now)
+      .set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: cooldownId } as const, now)
       .catch(() => {})
   }
   // M4: the identical-text 10-min window — the same prompt text is not submitted again
@@ -316,7 +328,7 @@ async function pollEvents($: EngineInterface): Promise<void> {
     } catch {
       // clock error
     }
-    const newlyDiscovered: Array<{ task: string; to: string }> = []
+    const newlyDiscovered: Array<{ task: string; to: string; askId?: string }> = []
 
     for (let i = lastSeen; i < lines.length; i++) {
       const line = lines[i]
@@ -332,14 +344,26 @@ async function pollEvents($: EngineInterface): Promise<void> {
         const isNotOrchestrator = ev.by !== 'orchestrator'
 
         if (isTransition && isValidTask && isValidTo && isNotOrchestrator) {
-          const throttleKey = `${ev.task}:${ev.to}`
+          // A bus ask is a question, not a status: two different asks are two different
+          // questions, and the per task:status key would swallow the second ask inside the
+          // 5-min cooldown — so a blocked transition whose note is a bus ask carries the
+          // ask's message id and throttles per ASK, not per task:status. The key carries
+          // the run too (events.jsonl is per active run): ask ids repeat across runs, so
+          // run B's m-1 must not be throttled by run A's m-1 stamp (review LOW 3).
+          const askMatch =
+            ev.to === 'blocked' && typeof ev.text === 'string' ? /^bus ask (m-\d+):/.exec(ev.text) : null
+          const askId = askMatch?.[1]
+          const throttleKey = askId === undefined ? `${ev.task}:${ev.to}` : `${ev.task}:blocked:${active.id}:${askId}`
           const sentRef = { plugin: 'matrixkoder', key: 'wakeSentAt', id: throttleKey } as const
           const sentRes = await $.state.get(sentRef).catch(() => ({ value: undefined }))
           const lastSent = typeof sentRes.value === 'number' ? sentRes.value : undefined
 
           if (lastSent === undefined || now - lastSent >= COOLDOWN_MS) {
-            if (!newlyDiscovered.some(d => d.task === ev.task && d.to === ev.to)) {
-              newlyDiscovered.push({ task: ev.task, to: ev.to })
+            // dedup on task+to+askId: for plain items both askIds are undefined, so plain
+            // behaviour is unchanged; two asks differ on askId and both must survive
+            if (!newlyDiscovered.some(d => d.task === ev.task && d.to === ev.to && d.askId === askId)) {
+              if (askId === undefined) newlyDiscovered.push({ task: ev.task, to: ev.to })
+              else newlyDiscovered.push({ task: ev.task, to: ev.to, askId })
             }
           }
         }
@@ -391,7 +415,8 @@ async function pollEvents($: EngineInterface): Promise<void> {
     }
     const items = [...pend.items]
     for (const item of newlyDiscovered) {
-      if (!items.some(p => p.task === item.task && p.to === item.to)) items.push(item)
+      // askId joins the identity: undefined === undefined keeps plain items deduped as before
+      if (!items.some(p => p.task === item.task && p.to === item.to && p.askId === item.askId)) items.push(item)
     }
     if (items.length === 0) {
       await $.state.set(stateRef, lines.length).catch(() => {}) // nothing to wake for: safe to move on
