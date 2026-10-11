@@ -692,12 +692,6 @@ def pin_tmp_data(tmp):
     data, home = os.path.join(tmp, "data"), os.path.join(tmp, "home")
     os.makedirs(data, exist_ok=True), os.makedirs(home, exist_ok=True)
     was = {k: os.environ.get(k) for k in ("MATRIXKODER_DATA", "MATRIXKODER_HOME")}
-    os.environ["MATRIXKODER_DATA"], os.environ["MATRIXKODER_HOME"] = data, home
-    got = os.path.realpath(mk_state.resolve_data(None))
-    # the resolved dir, not the env value just written: a resolver that ignores the env and
-    # lands in a real checkout must fail this assert
-    assert os.path.commonpath([got, os.path.realpath(tmp)]) == os.path.realpath(tmp), \
-        f"the self-test would resolve {got}, which is outside its temp dir {tmp}"
 
     def restore():
         for k, v in was.items():
@@ -705,6 +699,17 @@ def pin_tmp_data(tmp):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+    os.environ["MATRIXKODER_DATA"], os.environ["MATRIXKODER_HOME"] = data, home
+    try:
+        got = os.path.realpath(mk_state.resolve_data(None))
+        # the resolved dir, not the env value just written: a resolver that ignores the env and
+        # lands in a real checkout must fail this assert
+        assert os.path.commonpath([got, os.path.realpath(tmp)]) == os.path.realpath(tmp), \
+            f"the self-test would resolve {got}, which is outside its temp dir {tmp}"
+    except Exception:
+        restore()  # a failed pin must not leave the caller's environment mutated
+        raise
     return restore
 
 
@@ -1116,15 +1121,16 @@ def probe_models(cli):
     out = []
     for raw in (p.stdout or "").splitlines():
         line = raw.strip()
-        fields = line.split()
-        if not fields:
+        if not line:
             continue
-        mid = fields[0]
-        # a banner ("Fetching available models..."), a label ending in ":", or a line of dashes
-        # is not an id; `id<TAB>description` still is, because its first field is the id
-        if line.endswith("...") or line.endswith(":") or set(mid) <= set("-"):
-            continue
-        if " " in mid or not re.fullmatch(r"[A-Za-z0-9._:/@+-]+", mid):
+        if "\t" in line:  # id<TAB>description: the description may end in "..." and still be an id
+            mid = line.split("\t", 1)[0].strip()
+        else:
+            # no tab: the whole line is the id, so a banner with spaces is not one
+            mid = line
+            if " " in mid or mid.endswith(":") or mid.endswith("...") or set(mid) <= set("-"):
+                continue
+        if not mid or not re.fullmatch(r"[A-Za-z0-9._:/@+-]+", mid):
             continue
         if mid not in out:
             out.append(mid)
@@ -1274,21 +1280,25 @@ FIVE = ('["opencode/space-bunny-free", "opencode/muse-spark-1.3-contributor-free
 
 def self_test():
     tmp = tempfile.mkdtemp(prefix="mk-config-selftest-")
-    # (a) the pin assert fires when resolution lands outside the temp dir. The helper runs
-    # inside try, so a failed pin still restores the environment.
+    # (a) the pin assert fires when resolution lands outside the temp dir, and a failed pin
+    # restores the environment itself. The sibling path starts with the temp path, so the old
+    # startswith check would have let it through.
     real = mk_state.resolve_data
+    before = {k: os.environ.get(k) for k in ("MATRIXKODER_DATA", "MATRIXKODER_HOME")}
     try:
-        mk_state.resolve_data = lambda arg: os.path.expanduser("~")
+        mk_state.resolve_data = lambda arg: os.path.realpath(tmp) + "-sibling"
         try:
             pin_tmp_data(tmp)
         except AssertionError as e:
             assert "outside its temp dir" in str(e), e
         else:
             raise AssertionError("pin_tmp_data did not fire when resolution landed outside the temp dir")
+        assert {k: os.environ.get(k) for k in before} == before, os.environ
     finally:
         mk_state.resolve_data = real
-    restore = pin_tmp_data(tmp)  # the in-process calls below must resolve here, not in a real repo
+    restore = None
     try:
+        restore = pin_tmp_data(tmp)  # the in-process calls below must resolve here, not in a real repo
         data, home, yaml_path = os.path.join(tmp, "data"), os.path.join(tmp, "home"), None
         os.makedirs(data, exist_ok=True)
         yaml_path = os.path.join(data, "matrixkoder.yaml")
@@ -1962,15 +1972,19 @@ def self_test():
         assert "is not a model of that agent" in never["error"], never
         make_bin("opencode", "#!/bin/sh\nprintf 'opencode/space-bunny-free\\nollama-cloud/minimax-m3\\n'\n")
 
-        # 30. probe_models ignores a banner, a blank and a line of dashes; id<TAB>description stays an id
+        # 30. a line with a TAB yields the id before it; a line without one must be a single
+        #     id token. Banners, labels and dashes are skipped.
         make_bin("opencode", "#!/bin/sh\n"
-                 "printf 'Fetching available models...\\n\\n----------\\n"
-                 "opencode/space-bunny-free\\tfree bunny\\n"
-                 "ollama-cloud/minimax-m3\\n'\n")
+                 "printf 'Fetching available models...\\n"
+                 "Models: 3 available\\n"
+                 "Models:\\n"
+                 "-----\\n"
+                 "gemini-3.8-flash-high\\tGemini 3.8 Flash (High)...\\n"
+                 "opencode/big-pickle\\n'\n")
         p_ban = run("probe")
         assert p_ban["models"]["opencode"] == "updated", p_ban
-        assert ("  opencode: { available: true, models: [opencode/space-bunny-free, "
-                "ollama-cloud/minimax-m3] }") in agent_lines(), rd()
+        assert ("  opencode: { available: true, models: [gemini-3.8-flash-high, "
+                "opencode/big-pickle] }") in agent_lines(), rd()
 
         # a failing CLI, an absent CLI and one that prints nothing all leave the list as it was
         before_agents = agent_lines()
@@ -1983,7 +1997,8 @@ def self_test():
         assert p_m3["models"] == {"opencode": "unchanged", "agy": "unchanged"}, p_m3
         assert agent_lines() == before_agents, "a probe that could not read the models rewrote them"
     finally:
-        restore()
+        if restore:
+            restore()
         shutil.rmtree(tmp, ignore_errors=True)
     print("mk-config self-test ok")
     return 0
