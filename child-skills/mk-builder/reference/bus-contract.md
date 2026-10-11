@@ -1,7 +1,9 @@
 # bus-contract.md — the mk-bus loopback message bus, protocol `v: 1` (`mk-bus/v1`)
 
 Frozen by task BA.1 for MatrixKoder (plan MatrixKoder Bus Architecture, contracts C1-C4; decisions
-D1-D4 binding; updated in BA FIX R2 for review findings and security hardening). Sibling of
+D1-D4 binding; updated in BA FIX R2 for review findings and security hardening; updated in BA FIX
+R4/R5 for the re-review findings: lane-scoped acks on every path, strict B18/B13 typing, OPTIONS
+JSON, ensure probe semantics, and honest B31 coverage). Sibling of
 `status-contract.md` (MB1.1), `lane-rules.md`, and `git-guard.md`. The server implementation is
 `scripts/mk-bus.py` (BA.2). The clients are the orchestrator (`scripts/mk-state.py`,
 `scripts/lane-watch.py`) and lane agents via their local tooling
@@ -154,7 +156,7 @@ loopback message bus connecting the orchestrator with isolated lane sessions.
   - Server assigns monotonic `seq`, formats `id: "m-<seq>"`, sets `ts` to current UTC ISO 8601 with trailing
     `Z` (`%Y-%m-%dT%H:%M:%SZ`), sets `ack_level: 1`, writes under flock to `<data>/runs/<run>/bus.jsonl`, and
     broadcasts to active SSE listeners and long-poll waiters.
-  - Returns HTTP 200 OK (or 201 Created) with the complete recorded message object:
+  - Returns HTTP 200 OK with the complete recorded message object:
     ```json
     {"ok": true, "message": {"seq": 1, "id": "m-1", ...}}
     ```
@@ -173,8 +175,11 @@ loopback message bus connecting the orchestrator with isolated lane sessions.
       {"run": "<run>", "id": "<msg-id>", "ack_level": 2 | 3}
       ```
     - `id`: Must reference an existing message in `<data>/runs/<run>/bus.jsonl`.
-    - `ack_level`: Integer in `1..3` (for ack endpoints: `2` or `3`).
-  - Server records the acknowledgment in `<data>/runs/<run>/bus.jsonl` under flock.
+    - `ack_level`: Integer in `1..3` (strictly typed: a JSON `true`/`false` is rejected with HTTP 400).
+      Levels `2` or `3` are the normal use.
+  - Server records the acknowledgment in `<data>/runs/<run>/bus.jsonl` under flock. Ack records are
+    stored as `kind="ack"` lines and are never added to the message index (live or replayed) — only
+    the target message's `ack_level` changes.
   - Returns HTTP 200 OK:
     ```json
     {"ok": true, "id": "<msg-id>", "ack_level": 3}
@@ -264,6 +269,10 @@ Table 1 — Every field typed, null rules, and meaning.
     git commit. **Why Level 4 is not a bus ack packet:** A synthetic packet cannot guarantee that an
     agent acted truthfully; only externally observable artifacts (a git commit sha, a status file
     transition, or a corresponding answer message) constitute honest proof of action.
+  - **Persistence rule:** Level 2 (`delivered`) is tracked in server memory only — it is NOT written
+    to `bus.jsonl` and resets to 1 on server restart. Only explicit acknowledgments (`POST /ack`, or
+    `POST /send` with `kind="ack"`) are persisted as `kind="ack"` records; on replay they raise the
+    target message's `ack_level`, and ack records themselves are never replayed as messages.
 
 ## 4. Host Lifecycle and Daemon Management (Contract C3)
 
@@ -286,16 +295,24 @@ Table 1 — Every field typed, null rules, and meaning.
   - Removed cleanly upon graceful server shutdown.
 - **B22.** `ensure --data <data> --run <run>`:
   - Idempotent daemon activator.
-  - Acquires `<data>/bus.lock`.
-  - Reads `<data>/bus.json` if present. If the file exists and points to an active PID whose
-    `GET http://127.0.0.1:<port>/health` probe returns HTTP 200 within 500 ms, the server is healthy.
-    `ensure` refreshes `owner_heartbeat` and returns immediately.
-  - If `<data>/bus.json` is missing, stale, or the health probe fails:
+  - Acquires `<data>/bus-ensure.lock` (mode `0600`), a dedicated lock that serializes concurrent
+    `ensure` calls. The running server separately holds `<data>/bus.lock` (B20); `ensure` itself
+    never takes `bus.lock`.
+  - Reads `<data>/bus.json` if present. If the file exists and points to a live PID, `ensure`
+    probes `GET http://127.0.0.1:<port>/health` with a 1.0 s timeout, retrying for up to 5.0 s
+    while the PID stays alive. A 200 response means healthy: `ensure` refreshes `owner_heartbeat`
+    and returns immediately with `started: false`.
+  - `<data>/bus.json` is removed ONLY when the recorded PID is dead (or the file is missing or
+    unreadable). A live server whose health probe fails transiently is never declared down: no
+    respawn is attempted (a second `serve` could not take `bus.lock` anyway), and `ensure` fails
+    with `{"ok": false, "error": "bus process alive but not answering health probes"}` instead of
+    destroying live state.
+  - When no healthy server exists:
     1. Spawns a detached background process: `python3 scripts/mk-bus.py serve --data <data>`.
-    2. Polls `GET /health` until responsive (up to 5.0 seconds).
+    2. Polls `GET /health` until responsive (up to 10.0 seconds).
     3. Confirms `<data>/bus.json` is populated.
-  - Idempotent: multiple callers calling `ensure` concurrently serialize on `<data>/bus.lock`; exactly
-    one server is started, and `started: true` is reported only for the winning PID.
+  - Idempotent: multiple callers calling `ensure` concurrently serialize on `<data>/bus-ensure.lock`;
+    exactly one server is started, and `started: true` is reported only for the winning PID.
 - **B23.** Owner heartbeat and automatic stale reap:
   - The orchestrator periodically executes `mk-bus.py heartbeat --data <data>` while active.
   - The `heartbeat` command updates `owner_heartbeat` in `<data>/bus.json` to `time.time()`.
@@ -306,8 +323,10 @@ Table 1 — Every field typed, null rules, and meaning.
     orphaned background daemons from accumulating on developer machines.
 - **B24.** Token Scoping, Credential Isolation, and File Permissions:
   - **Strict file permissions (0600):** State and credential files—specifically `<data>/bus.json`,
-    `<data>/bus-tokens.json`, `<data>/bus.lock`, and `<lane>/.matrixkoder-bus.json`—MUST have strict
-    POSIX permissions `0600` (`-rw-------`). Permissions are enforced via `os.fchmod` on descriptor
+    `<data>/bus-tokens.json`, `<data>/bus.lock`, `<data>/bus-ensure.lock`, `<data>/bus-tokens.lock`,
+    `<data>/runs/<run>/bus.jsonl`, and `<lane>/.matrixkoder-bus.json`—MUST have strict
+    POSIX permissions `0600` (`-rw-------`). The directories `<data>/runs/` and `<data>/runs/<run>/`
+    are mode `0700`. Permissions are enforced via `os.fchmod` on descriptor
     creation and update.
   - **Constant-time token verification:** Incoming bearer tokens are verified using `hmac.compare_digest`
     against registered tokens.
@@ -316,7 +335,9 @@ Table 1 — Every field typed, null rules, and meaning.
       and `<data>/bus-tokens.json` (0600). Allowed to send answers, send to any lane, read `/pending`,
       and override sender/recipient.
     - **Lane tokens:** Scoped strictly to `{run, task}`. Generated via `mk-bus.py token --lane <path> --task <T> --run <run>`.
-      Registered in `<data>/bus-tokens.json` and written to `<lane>/.matrixkoder-bus.json` (0600):
+      The reserved task id `"orch"` is refused (`invalid`/reserved error, exit 2) — a lane token can
+      never carry the orchestrator identity. Registered in `<data>/bus-tokens.json` and written to
+      `<lane>/.matrixkoder-bus.json` (0600):
       ```json
       {
         "v": 1,
@@ -329,6 +350,12 @@ Table 1 — Every field typed, null rules, and meaning.
       For lane tokens, the server pins `run = tok.run`, `task = tok.task`, `from = tok.task`, forces
       `to = "orch"`, and restricts `kind` to `ask | info | ack` (returns HTTP 403 on violations). Acks are
       restricted to messages addressed to that lane. Reading `/pending` is forbidden (HTTP 403).
+    - **CLI token preference (known limit):** the orchestrator CLI commands (`send`, `answer`,
+      `pending`) always prefer the orchestrator token in `<data>/bus.json` and only fall back to a
+      `<lane>/.matrixkoder-bus.json` token when `bus.json` carries none; the lane file's `url` is
+      never used by the CLI. Lane token scoping therefore holds against lanes that cannot read
+      `<data>/bus.json`; a lane that can read it obtains the orchestrator token regardless. Lane
+      agents use their own scoped token over HTTP directly, not via the CLI.
     - Conforms to status-contract R2 and R40: git-excluded via the `.matrixkoder-*` pattern in
       `<lane>/.git/info/exclude`. Never committed to git.
   - Command: `mk-bus.py revoke --lane <path>`
@@ -414,27 +441,53 @@ Table 1 — Every field typed, null rules, and meaning.
   ```bash
   python3 scripts/mk-bus.py --self-test
   ```
-  - Executes self-contained integration tests verifying:
-    1. Ephemeral server bind and unauthenticated `GET /health` probe returning `pid` and `uptime_sec`.
-    2. Host header enforcement and rejection of external hostnames (HTTP 400).
-    3. Browser Origin header rejection (HTTP 403, no CORS headers).
-    4. Bearer token constant-time verification (`hmac.compare_digest`) and HTTP 401 rejection on invalid token (no log output).
-    5. Path traversal validation: `run` and `task` with `..` or `/` return HTTP 400 (`invalid run id` / `invalid task id`), verifying no files written outside data directory.
-    6. Token scoping: Lane tokens bound to `{run, task}` cannot send answers, read `/pending`, or ack other lanes (HTTP 403); orchestrator token has full privileges.
-    7. State file permissions: `<data>/bus.json`, `<data>/bus-tokens.json`, `<data>/bus.lock`, and `<lane>/.matrixkoder-bus.json` strictly mode `0600` via `fchmod`.
-    8. Input validation (B18): Request body object enforcement, kind enum, text length <= 64 KiB, reply_to existence, ack_level in 1..3, timeout clamping (1..90 s, NaN resilience).
-    9. SSE stream delivery (`GET /events`) with monotonic `id: <seq>`, charset UTF-8, `X-Accel-Buffering`, and `: keepalive\n\n` comments every 15 s.
-    10. `Last-Event-ID` message replay over SSE.
-    11. Long-poll fallback (`GET /wait`) returning `{"ok": true, "message": ..., "messages": [...]}`.
-    12. Send and Ack workflows with honest Ack levels 1, 2, and 3.
-    13. Pending questions index and answer resolution with `state_updated` and `mk_state_error` reporting.
-    14. Stale owner heartbeat auto-reap and concurrent `ensure` race protection.
-    15. Graceful server teardown.
+  - Executes a self-contained integration test (stdlib only, temp data dir, real server on an
+    ephemeral 127.0.0.1 port, real HTTP from an in-test client, real `mk-state.py`). Coverage:
+    1. `ensure` idempotence: two calls → one process (`started: false`, same pid/port), plus the
+       unauthenticated `GET /health` probe returning `pid` and `uptime_sec`.
+    2. Concurrent `ensure` race: 4 simultaneous callers serialize on `bus-ensure.lock`; exactly one
+       reports `started: true`; all agree on pid/port.
+    3. Token minting: lane file mode `0600` carrying `"v": 1`; the reserved task id `orch` refused;
+       state files (`bus.json`, `bus-tokens.json`, `bus.lock`, `bus-ensure.lock`, `bus-tokens.lock`)
+       mode `0600`.
+    4. Path traversal: `run` ids containing `..`, `/`, NUL or empty → HTTP 400; nothing created
+       outside the data dir.
+    5. Lane token scoping: lane tokens cannot send answers, send peer-to-peer, override `run`, read
+       `/pending`, or stream/long-poll another lane or run (`/events`, `/wait`) → HTTP 403.
+    6. Auth: wrong, absent, and non-ASCII bearer tokens → HTTP 401 with `bus.jsonl` unchanged.
+    7. Input validation over real HTTP: non-dict body, bad `kind`, empty `text` for ask, `reply_to`
+       on ask/info, ack without `reply_to`, unknown `reply_to`, boolean `ack_level` (both `/send`
+       and `/ack`), bodies over 64 KiB → HTTP 413, external `Host` → HTTP 400, `Origin` header and
+       `OPTIONS` preflight → HTTP 403 JSON.
+    8. `/wait` timeout clamp over real HTTP: `timeout=0.2` clamps up to 1 s; `timeout=nan` falls
+       back to a finite 30 s wait (stays open until a matching message arrives, no error).
+    9. ask → answer round trip in under 2 s with honest ack levels (1 → 3 via `/ack`).
+    10. Cross-lane ack forgery refused on every ack path: `POST /send` with `kind="ack"` and
+        `POST /ack` → HTTP 403, nothing written.
+    11. `bus.jsonl` record shape: every C2 field present on each line, UTC `Z` timestamps, file mode
+        `0600`, `runs/` and `runs/<run>/` mode `0700`.
+    12. SSE replay via `Last-Event-ID` with `Content-Type: text/event-stream; charset=utf-8` and
+        monotonic `id:` events after the given seq.
+    13. Lane ack via `POST /send` records an ack record (never a message): the record id is not
+        addressable live, and `/wait` + `/pending` state is identical after a restart
+        (live state == replayed state).
+    14. Stale `owner_heartbeat` self-exit and missing-`bus.json` reaper.
+    15. Server down → `send` prints `{"ok": false, "error": "bus down"}`, non-zero exit, no traceback.
+    16. `ensure` against a live but unresponsive (SIGSTOPed) server: `bus.json` kept, no respawn,
+        error surfaced; recovery after `SIGCONT`.
+    17. `answer` integration with the real `mk-state.py`: task status becomes `building`,
+        `state_updated`/`mk_state_error` reported.
+    18. Ambiguous message id: `answer m-1` without `--run` when several runs hold `m-1` →
+        `{"ok": false, "error": "ambiguous message id, pass --run"}`; `--run` disambiguates.
   - Stdout format: prints banner followed by JSON summary:
     ```
     pass mk-bus.py: mk-bus self-test ok
-    {"ok": true, "tests": 15, "passed": 15}
+    {"ok": true, "tests": 18, "passed": 18}
     ```
+    The `tests`/`passed` counts are COMPUTED from the checks that actually ran — never a literal.
+  - Not covered by the self-test (verified by review probes instead): `: keepalive` comment cadence
+    on a 15 s idle stream, token revocation on a running server, and constant-time properties of
+    the token comparison (only its 401 behavior is tested).
 
 ## 6. Worked JSON Examples
 

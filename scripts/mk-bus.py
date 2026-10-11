@@ -15,8 +15,8 @@ Subcommands:
       Updates owner_heartbeat in <data>/bus.json.
   token --lane DIR --task T [--run ID] [--data DIR]
       Mints bearer token, writes <lane>/.matrixkoder-bus.json (0600) with
-      {"url": "http://127.0.0.1:<port>", "token": TOKEN, "run": RUN, "task": TASK},
-      and registers in <data>/bus-tokens.json (0600).
+      {"v": 1, "url": "http://127.0.0.1:<port>", "token": TOKEN, "run": RUN, "task": TASK},
+      and registers in <data>/bus-tokens.json (0600). The reserved task id "orch" is refused.
   revoke --lane DIR [--data DIR]
       Removes <lane>/.matrixkoder-bus.json and invalidates token.
   send --run ID --task T --kind KIND --text TEXT [--from S] [--to S] [--reply-to ID] [--data DIR]
@@ -193,9 +193,19 @@ class BusState:
             if mtime != self.tokens_mtime or not self.tokens:
                 self.tokens = read_json(tokens_path, default={})
                 self.tokens_mtime = mtime
-            # Constant-time comparison across stored tokens
+            # Constant-time comparison across stored tokens. Compare encoded
+            # bytes: hmac.compare_digest raises TypeError on non-ASCII input,
+            # which must surface as 401, not a 500.
+            try:
+                token_bytes = token_str.encode("utf-8")
+            except UnicodeEncodeError:
+                return None
             for stored_tok, tok_info in self.tokens.items():
-                if hmac.compare_digest(stored_tok, token_str):
+                try:
+                    stored_bytes = stored_tok.encode("utf-8")
+                except (UnicodeEncodeError, AttributeError):
+                    continue
+                if hmac.compare_digest(stored_bytes, token_bytes):
                     return tok_info
             return None
 
@@ -239,29 +249,37 @@ class BusState:
             by_id = {}
             max_seq = 0
             if os.path.exists(jsonl_path):
-                with open(jsonl_path, "r", encoding="utf-8") as f:
+                # Per-line tolerance: the file may be hand-edited between runs,
+                # so one bad line (invalid UTF-8, non-int seq, non-hashable
+                # reply_to) is skipped instead of failing replay for the run.
+                with open(jsonl_path, "rb") as f:
                     fcntl.flock(f.fileno(), fcntl.LOCK_SH)
                     try:
-                        for line in f:
-                            line = line.strip()
+                        for raw in f:
+                            line = raw.strip()
                             if not line:
                                 continue
                             try:
-                                obj = json.loads(line)
+                                obj = json.loads(line.decode("utf-8"))
                             except Exception:
                                 continue
                             if not isinstance(obj, dict) or "id" not in obj or "seq" not in obj:
                                 continue
-                            seq = obj.get("seq", 0)
+                            seq = obj.get("seq")
+                            if not isinstance(seq, int) or isinstance(seq, bool):
+                                continue
                             if seq > max_seq:
                                 max_seq = seq
                             if obj.get("kind") == "ack":
                                 target_id = obj.get("reply_to")
-                                if target_id and target_id in by_id:
-                                    by_id[target_id]["ack_level"] = max(
-                                        by_id[target_id].get("ack_level", 1),
-                                        obj.get("ack_level", 1)
-                                    )
+                                level = obj.get("ack_level", 1)
+                                if not isinstance(level, int) or isinstance(level, bool):
+                                    level = 1
+                                if isinstance(target_id, str) and target_id in by_id:
+                                    cur = by_id[target_id].get("ack_level", 1)
+                                    if not isinstance(cur, int) or isinstance(cur, bool) or cur < 1:
+                                        cur = 1
+                                    by_id[target_id]["ack_level"] = max(cur, level)
                             else:
                                 messages.append(obj)
                                 by_id[obj["id"]] = obj
@@ -277,6 +295,35 @@ class BusState:
             }
             self.runs[run] = rstate
             return rstate
+
+    def _append_jsonl(self, run_dir, line):
+        """Append one JSON line to <run_dir>/bus.jsonl under flock.
+
+        Message text may carry sensitive content, so the log is created 0600
+        and <data>/runs and <data>/runs/<run> are 0700 (enforced even when
+        they were created earlier with looser modes)."""
+        os.makedirs(run_dir, exist_ok=True)
+        os.chmod(run_dir, 0o700)
+        with contextlib.suppress(OSError):
+            os.chmod(os.path.dirname(run_dir), 0o700)
+        jsonl_path = os.path.join(run_dir, "bus.jsonl")
+
+        # Open with lock, ensuring previous line had newline. O_APPEND keeps
+        # every write at EOF regardless of interleaved readers.
+        fd = os.open(jsonl_path, os.O_CREAT | os.O_RDWR | os.O_APPEND, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                size = os.fstat(fd).st_size
+                if size > 0 and os.pread(fd, 1, size - 1) != b"\n":
+                    os.write(fd, b"\n")
+                os.write(fd, line.encode("utf-8"))
+                os.fsync(fd)
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
     def append_message(self, run, task, from_val, to_val, kind, text, reply_to):
         if not is_valid_id(run):
@@ -305,27 +352,8 @@ class BusState:
             }
 
             run_dir = os.path.join(self.data_dir, "runs", run)
-            os.makedirs(run_dir, exist_ok=True)
-            jsonl_path = os.path.join(run_dir, "bus.jsonl")
             line = json.dumps(msg, separators=(",", ":")) + "\n"
-
-            # Open with lock, ensuring previous line had newline
-            with open(jsonl_path, "a+", encoding="utf-8") as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                try:
-                    f.seek(0, os.SEEK_END)
-                    size = f.tell()
-                    if size > 0:
-                        f.seek(size - 1)
-                        last_char = f.read(1)
-                        if last_char != "\n":
-                            f.write("\n")
-                    f.seek(0, os.SEEK_END)
-                    f.write(line)
-                    f.flush()
-                    os.fsync(f.fileno())
-                finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            self._append_jsonl(run_dir, line)
 
             rstate["messages"].append(msg)
             rstate["by_id"][msg_id] = msg
@@ -360,26 +388,8 @@ class BusState:
             }
 
             run_dir = os.path.join(self.data_dir, "runs", run)
-            os.makedirs(run_dir, exist_ok=True)
-            jsonl_path = os.path.join(run_dir, "bus.jsonl")
             line = json.dumps(ack_rec, separators=(",", ":")) + "\n"
-
-            with open(jsonl_path, "a+", encoding="utf-8") as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                try:
-                    f.seek(0, os.SEEK_END)
-                    size = f.tell()
-                    if size > 0:
-                        f.seek(size - 1)
-                        last_char = f.read(1)
-                        if last_char != "\n":
-                            f.write("\n")
-                    f.seek(0, os.SEEK_END)
-                    f.write(line)
-                    f.flush()
-                    os.fsync(f.fileno())
-                finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            self._append_jsonl(run_dir, line)
 
             if target_msg:
                 target_msg["ack_level"] = max(target_msg.get("ack_level", 1), ack_level)
@@ -404,9 +414,11 @@ class BusState:
 
             pending = []
             for rstate in runs_to_check:
+                # Hand-edited lines may carry a non-hashable reply_to; skip those.
                 answered = {
                     m["reply_to"] for m in rstate["messages"]
-                    if m.get("kind") == "answer" and m.get("reply_to")
+                    if m.get("kind") == "answer"
+                    and isinstance(m.get("reply_to"), str)
                 }
                 for m in rstate["messages"]:
                     if m.get("kind") == "ask" and m["id"] not in answered:
@@ -432,6 +444,20 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def send_error_json(self, status, error_msg):
         self.send_json(status, {"ok": False, "error": error_msg})
+
+    def lane_can_ack(self, tok, target_msg):
+        """One shared check for every ack path (POST /ack and POST /send with
+        kind=ack): a lane token can only ack messages addressed to its own lane
+        (`to == tok.task` or `task == tok.task`). Orchestrator tokens always may."""
+        if tok.get("role") == "orch":
+            return True
+        tok_task = tok.get("task")
+        return target_msg.get("to") == tok_task or target_msg.get("task") == tok_task
+
+    def do_OPTIONS(self):
+        # B7: CORS preflight is rejected with JSON, never answered with CORS
+        # headers (BaseHTTPRequestHandler would otherwise answer 501 HTML).
+        self.send_error_json(403, "browser origins rejected")
 
     def validate_request(self):
         if "Origin" in self.headers:
@@ -481,7 +507,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             if not tok:
                 return
 
-            is_orch = (tok.get("role") == "orch" or tok.get("task") == "orch")
+            is_orch = tok.get("role") == "orch"
 
             if path == "/events":
                 # Disable socket timeout for long-lived SSE stream
@@ -618,8 +644,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                 deadline = time.time() + timeout
                 rstate = self.server.bus_state.get_run_state(run)
 
+                # Build the payload under the lock, send after releasing it:
+                # rstate["cond"] wraps the global bus_state lock, and writing
+                # to a stalled socket while holding it would block appends.
+                response = None
                 with rstate["cond"]:
-                    while True:
+                    while response is None:
                         matching = None
                         for m in rstate["messages"]:
                             if m["seq"] > after_seq and matches_lane(m, lane):
@@ -627,23 +657,15 @@ class RequestHandler(BaseHTTPRequestHandler):
                                 break
                         if matching:
                             matching["ack_level"] = max(matching.get("ack_level", 1), 2)
-                            self.send_json(200, {
-                                "ok": True,
-                                "message": matching,
-                                "messages": [matching]
-                            })
-                            return
-
-                        remaining = deadline - time.time()
-                        if remaining <= 0:
-                            self.send_json(200, {
-                                "ok": True,
-                                "message": None,
-                                "messages": []
-                            })
-                            return
-
-                        rstate["cond"].wait(timeout=min(remaining, 0.5))
+                            snap = dict(matching)
+                            response = {"ok": True, "message": snap, "messages": [snap]}
+                        else:
+                            remaining = deadline - time.time()
+                            if remaining <= 0:
+                                response = {"ok": True, "message": None, "messages": []}
+                            else:
+                                rstate["cond"].wait(timeout=min(remaining, 0.5))
+                self.send_json(200, response)
 
             elif path == "/pending":
                 if not is_orch:
@@ -675,7 +697,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             if not tok:
                 return
 
-            is_orch = (tok.get("role") == "orch" or tok.get("task") == "orch")
+            is_orch = tok.get("role") == "orch"
 
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path
@@ -730,17 +752,34 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if len(text.encode("utf-8")) > 65536:
                     self.send_error_json(400, "text exceeds 64 KiB")
                     return
+                # B18: text is non-empty for ask/answer/info; empty is allowed
+                # only for ack.
+                if kind in ("ask", "answer", "info") and not text:
+                    self.send_error_json(400, "text must be non-empty")
+                    return
 
                 reply_to = body.get("reply_to")
                 if reply_to is not None and not isinstance(reply_to, str):
                     self.send_error_json(400, "reply_to must be a string or null")
                     return
-                # B18: reply_to is required for kind=ack and must name an existing
-                # message in the target run (checked after run resolution below,
-                # because the run determines which bus.jsonl to look in).
+                # B18: reply_to MUST be null for ask/info; required for ack and
+                # answer. For ack/answer it must name an existing message in the
+                # target run (checked after run resolution below, because the
+                # run determines which bus.jsonl to look in).
+                if kind in ("ask", "info") and reply_to is not None:
+                    self.send_error_json(400, "reply_to must be null for ask/info")
+                    return
                 if kind == "ack" and not reply_to:
                     self.send_error_json(400, "reply_to required for ack")
                     return
+                # B13: ack_level is a strict integer 1..3 (bool is not an int
+                # here even though True == 1 in Python).
+                ack_level = None
+                if kind == "ack":
+                    ack_level = body.get("ack_level", 3)
+                    if not isinstance(ack_level, int) or isinstance(ack_level, bool) or ack_level not in (1, 2, 3):
+                        self.send_error_json(400, "invalid ack_level")
+                        return
 
                 if not is_orch:
                     # Lane token scoping
@@ -811,6 +850,28 @@ class RequestHandler(BaseHTTPRequestHandler):
                     if reply_to not in rstate["by_id"]:
                         self.send_error_json(400, "reply_to message not found")
                         return
+                    # A lane token can only ack messages addressed to its own
+                    # lane — the same check POST /ack applies (one shared rule).
+                    if not is_orch and not self.lane_can_ack(tok, rstate["by_id"][reply_to]):
+                        self.send_error_json(403, "cannot ack messages for other lanes")
+                        return
+                    # Ack records are never messages: persist an ack record like
+                    # POST /ack does, so live state and replayed state agree.
+                    self.server.bus_state.record_ack(
+                        run=run,
+                        target_id=reply_to,
+                        ack_level=ack_level,
+                        from_val=from_val,
+                        to_val=to_val,
+                    )
+                    target_msg = rstate["by_id"][reply_to]
+                    self.send_json(200, {
+                        "ok": True,
+                        "id": reply_to,
+                        "ack_level": target_msg.get("ack_level"),
+                        "ack_recorded": True,
+                    })
+                    return
 
                 msg = self.server.bus_state.append_message(
                     run=run,
@@ -830,7 +891,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                     return
 
                 ack_level = body.get("ack_level", 3)
-                if not isinstance(ack_level, int) or ack_level not in (1, 2, 3):
+                # Strict integer: bool passes isinstance(int) but True == 1
+                # would silently persist as JSON true.
+                if not isinstance(ack_level, int) or isinstance(ack_level, bool) or ack_level not in (1, 2, 3):
                     self.send_error_json(400, "invalid ack_level")
                     return
 
@@ -865,12 +928,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                     self.send_error_json(400, "message not found")
                     return
 
-                # Lane token may only ack messages addressed to it
-                if not is_orch:
-                    tok_task = tok.get("task")
-                    if target_msg.get("to") != tok_task and target_msg.get("task") != tok_task:
-                        self.send_error_json(403, "cannot ack messages for other lanes")
-                        return
+                # One shared rule with POST /send kind=ack (lane_can_ack):
+                # a lane token can only ack messages addressed to its own
+                # lane; orchestrator tokens always may.
+                if not self.lane_can_ack(tok, target_msg):
+                    self.send_error_json(403, "cannot ack messages for other lanes")
+                    return
 
                 self.server.bus_state.record_ack(
                     run=run,
@@ -1004,29 +1067,45 @@ def cmd_ensure(args):
     os.fchmod(efd, 0o600)
     fcntl.flock(efd, fcntl.LOCK_EX)
     try:
-        # Check if server is already running
+        # Check if server is already running. bus.json is only removed when
+        # the recorded pid is DEAD: a live server whose /health probe times
+        # out once (busy box, slow start) must never be declared down — the
+        # old remove-and-respawn behavior made the healthy server self-exit
+        # (review LOW 5). Probe with retries while the pid lives.
         if os.path.exists(bus_json_path):
-            try:
-                bdata = read_json(bus_json_path)
-                pid = bdata.get("pid")
-                port = bdata.get("port")
-                if pid and port and is_pid_alive(pid):
-                    req = urllib.request.Request(
-                        f"http://127.0.0.1:{port}/health",
-                        headers={"Host": f"127.0.0.1:{port}"}
-                    )
-                    with urllib.request.urlopen(req, timeout=1.0) as resp:
-                        if resp.status == 200:
-                            # Refresh heartbeat
-                            bdata["owner_heartbeat"] = time.time()
-                            write_json(bus_json_path, bdata, mode=0o600)
-                            res = {"ok": True, "pid": pid, "port": port, "started": False}
-                            out(res)
-                            return res
-            except Exception:
-                pass
+            bdata = read_json(bus_json_path)
+            pid = (bdata or {}).get("pid")
+            port = (bdata or {}).get("port")
+            if pid and port and is_pid_alive(pid):
+                probe_deadline = time.time() + 5.0
+                while time.time() < probe_deadline:
+                    try:
+                        req = urllib.request.Request(
+                            f"http://127.0.0.1:{port}/health",
+                            headers={"Host": f"127.0.0.1:{port}"}
+                        )
+                        with urllib.request.urlopen(req, timeout=1.0) as resp:
+                            if resp.status == 200:
+                                # Refresh heartbeat
+                                bdata["owner_heartbeat"] = time.time()
+                                write_json(bus_json_path, bdata, mode=0o600)
+                                res = {"ok": True, "pid": pid, "port": port, "started": False}
+                                out(res)
+                                return res
+                    except Exception:
+                        pass
+                    if not is_pid_alive(pid):
+                        # Died under our probe: fall through to restart.
+                        break
+                    time.sleep(0.2)
+                else:
+                    # pid alive but /health never answered within the retry
+                    # window. The server holds bus.lock, so a new serve would
+                    # just exit; refuse instead of destroying live state.
+                    raise Fail("bus process alive but not answering health probes")
 
-        # Not running: start detached serve process
+        # Not running (no bus.json, unreadable bus.json, or dead pid):
+        # start a detached serve process
         if os.path.exists(bus_json_path):
             with contextlib.suppress(OSError):
                 os.remove(bus_json_path)
@@ -1095,6 +1174,9 @@ def cmd_token(args):
 
     if not is_valid_id(args.task):
         raise Fail("invalid task id")
+    # Reserved sender identity: a lane token must never carry it (review LOW 2)
+    if args.task == "orch":
+        raise Fail("task id 'orch' is reserved")
     run_val = getattr(args, "run", "") or ""
     if run_val and not is_valid_id(run_val):
         raise Fail("invalid run id")
@@ -1110,7 +1192,9 @@ def cmd_token(args):
 
     tok = secrets.token_urlsafe(32)
     lane_file = os.path.join(lane_dir, ".matrixkoder-bus.json")
+    # "v": 1 matches the contract B24 lane-file example (protocol version).
     payload = {
+        "v": 1,
         "url": f"http://127.0.0.1:{port}",
         "token": tok,
         "run": run_val,
@@ -1259,11 +1343,17 @@ def cmd_answer(args):
 
     runs_dir = os.path.join(data_dir, "runs")
     target_run = getattr(args, "run", None)
+    if target_run and not is_valid_id(target_run):
+        raise Fail("invalid run id")
     runs_to_search = [target_run] if target_run else []
     if not target_run and os.path.exists(runs_dir):
         runs_to_search = [d for d in os.listdir(runs_dir) if os.path.isdir(os.path.join(runs_dir, d)) and is_valid_id(d)]
 
-    target_msg = None
+    # Message ids are per run ("m-1" exists in every run), so without --run
+    # the id can match in several runs. Collect every match instead of
+    # answering whichever run os.listdir happens to return first (review
+    # MEDIUM 2), then refuse when it is ambiguous.
+    matches = []
     for r in runs_to_search:
         jsonl = os.path.join(runs_dir, r, "bus.jsonl")
         if os.path.exists(jsonl):
@@ -1278,16 +1368,17 @@ def cmd_answer(args):
                             if not isinstance(m, dict):
                                 continue
                             if m.get("id") == args.msg_id:
-                                target_msg = m
-                                target_run = r
+                                matches.append((r, m))
                                 break
             except Exception:
                 pass
-        if target_msg:
-            break
 
-    if not target_msg:
+    if not matches:
         raise Fail(f"message not found: {args.msg_id}")
+    if not target_run and len(matches) > 1:
+        raise Fail("ambiguous message id, pass --run")
+    target_run, target_msg = matches[0]
+
     if target_msg.get("kind") != "ask":
         raise Fail(f"message {args.msg_id} is not an ask")
     if not target_run or not is_valid_id(target_run):
@@ -1452,6 +1543,12 @@ def self_test():
             time.sleep(0.05)
         raise AssertionError(f"pid {popen.pid} still alive after {timeout}s")
 
+    # B31: the summary counts the checks that actually ran — never a literal.
+    checks = []
+
+    def done(name):
+        checks.append(name)
+
     try:
         data = os.path.join(tmp, "data")
         lane1 = os.path.join(tmp, "lane1")
@@ -1477,6 +1574,7 @@ def self_test():
         rc, res2, _ = cli(["ensure", "--data", data, "--run", "r1"])
         assert rc == 0 and res2["ok"] is True and res2["started"] is False, res2
         assert res2["pid"] == pid1 and res2["port"] == port1
+        done("ensure idempotence + /health")
 
         # 1b. Concurrent ensure race (LOW finding 9): N callers serialize on
         # <data>/bus-ensure.lock; exactly one reports started:true, the rest
@@ -1500,6 +1598,7 @@ def self_test():
         assert started_count == 1, f"expected exactly 1 started:true, got {started_count}: {race_results}"
         assert all(r["pid"] == race_results[0]["pid"] for r in race_results), race_results
         assert all(r["port"] == race_results[0]["port"] for r in race_results), race_results
+        done("concurrent ensure race")
 
         # 2. Token generation and state file permissions 0600
         rc, res_tok, _ = cli(["token", "--lane", lane1, "--task", "T1", "--run", "r1", "--data", data])
@@ -1508,13 +1607,21 @@ def self_test():
         lane_bus_json = os.path.join(lane1, ".matrixkoder-bus.json")
         assert os.path.exists(lane_bus_json)
         assert (os.stat(lane_bus_json).st_mode & 0o777) == 0o600
+        lane_payload = read_json(lane_bus_json, {})
+        assert lane_payload.get("v") == 1, f"B24 lane file must carry v:1, got {lane_payload}"
+        assert lane_payload.get("task") == "T1" and lane_payload.get("run") == "r1"
+
+        # Reserved identity 'orch' is refused for --task (review LOW 2)
+        rc, res_orch, _ = cli(["token", "--lane", lane1, "--task", "orch", "--run", "r1", "--data", data], check=False)
+        assert rc != 0 and res_orch.get("error") == "task id 'orch' is reserved", res_orch
 
         # Assert server state files are 0600
-        for fname in ("bus.json", "bus-tokens.json", "bus.lock"):
+        for fname in ("bus.json", "bus-tokens.json", "bus.lock", "bus-ensure.lock", "bus-tokens.lock"):
             fpath = os.path.join(data, fname)
             assert os.path.exists(fpath), f"{fname} missing"
             mode = os.stat(fpath).st_mode & 0o777
             assert mode == 0o600, f"{fname} has mode {oct(mode)}, expected 0600"
+        done("token minting + 0600 perms + v:1 lane file")
 
         # 3. Path traversal security checks (HIGH finding 1): run/task with '..' or '/' -> 400
         for bad_id in ("../../evil", "foo/bar", "evil..run", "bad\0id", ""):
@@ -1530,6 +1637,7 @@ def self_test():
             except urllib.error.HTTPError as e:
                 assert e.code == 400, f"Expected 400 for {bad_id}, got {e.code}"
         assert not os.path.exists(os.path.join(tmp, "evil")), "Directory created outside data dir!"
+        done("path traversal rejection")
 
         # 4. Token scoping security checks (HIGH finding 2): lane token restrictions
         # (a) Lane token cannot send answer -> 403
@@ -1582,6 +1690,24 @@ def self_test():
         except urllib.error.HTTPError as e:
             assert e.code == 403, f"Expected 403, got {e.code}"
 
+        # (e) Lane token cannot stream or long-poll another lane or run -> 403
+        for scope_url in (
+            f"/events?lane=T2",
+            f"/events?run=r2",
+            f"/wait?lane=T2&timeout=1",
+            f"/wait?run=r2&timeout=1",
+        ):
+            req_scope = urllib.request.Request(
+                f"http://127.0.0.1:{port1}{scope_url}",
+                headers={"Authorization": f"Bearer {token1}", "Host": f"127.0.0.1:{port1}"}
+            )
+            try:
+                with urllib.request.urlopen(req_scope, timeout=5.0):
+                    raise AssertionError(f"Expected 403 for {scope_url}")
+            except urllib.error.HTTPError as e:
+                assert e.code == 403, f"Expected 403 for {scope_url}, got {e.code}"
+        done("lane token scoping (send/events/wait/pending)")
+
         # 5. Auth validation: wrong token & absent token -> 401, bus.jsonl unchanged
         jsonl_path = os.path.join(data, "runs", "r1", "bus.jsonl")
         count_before = len(open(jsonl_path).readlines()) if os.path.exists(jsonl_path) else 0
@@ -1610,8 +1736,23 @@ def self_test():
         except urllib.error.HTTPError as e:
             assert e.code == 401, f"Expected 401, got {e.code}"
 
+        # Non-ASCII bearer (review LOW 1): byte comparison must yield 401,
+        # never a TypeError -> 500.
+        req_nonascii = urllib.request.Request(
+            f"http://127.0.0.1:{port1}/send",
+            data=b'{"run":"r1","task":"T1","kind":"ask","text":"bad"}',
+            headers={"Content-Type": "application/json", "Authorization": "Bearer é", "Host": f"127.0.0.1:{port1}"},
+            method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req_nonascii):
+                raise AssertionError("Expected 401 on non-ASCII bearer")
+        except urllib.error.HTTPError as e:
+            assert e.code == 401, f"Expected 401 for non-ASCII bearer, got {e.code}"
+
         count_after = len(open(jsonl_path).readlines()) if os.path.exists(jsonl_path) else 0
         assert count_after == count_before, "bus.jsonl modified after 401 requests"
+        done("auth 401 (wrong/absent/non-ASCII) + no writes")
 
         # 6. Input validation per B18 (MEDIUM finding 5)
         # Non-dict body -> 400
@@ -1653,21 +1794,112 @@ def self_test():
         except urllib.error.HTTPError as e:
             assert e.code == 400, f"Expected 400 for ack without reply_to, got {e.code}"
 
-        # Non-finite timeout in /wait -> clamps safely without spin
-        req_nan_wait = urllib.request.Request(
-            f"http://127.0.0.1:{port1}/wait?lane=T1&after=0&timeout=nan",
-            headers={"Authorization": f"Bearer {token1}", "Host": f"127.0.0.1:{port1}"}
+        # B18 strict: empty text for ask -> 400; reply_to on ask -> 400
+        for bad_body in (
+            b'{"run":"r1","task":"T1","kind":"ask","text":""}',
+            b'{"run":"r1","task":"T1","kind":"ask","text":"hi","reply_to":"m-1"}',
+            b'{"run":"r1","task":"T1","kind":"info","text":"hi","reply_to":"m-1"}',
+        ):
+            req_b18 = urllib.request.Request(
+                f"http://127.0.0.1:{port1}/send",
+                data=bad_body,
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {token1}", "Host": f"127.0.0.1:{port1}"},
+                method="POST"
+            )
+            try:
+                with urllib.request.urlopen(req_b18):
+                    raise AssertionError(f"Expected 400 for B18 violation: {bad_body!r}")
+            except urllib.error.HTTPError as e:
+                assert e.code == 400, f"Expected 400 for {bad_body!r}, got {e.code}"
+
+        # B13 strict integer: bool ack_level refused on /send and /ack
+        req_ack_bool = urllib.request.Request(
+            f"http://127.0.0.1:{port1}/send",
+            data=b'{"run":"r1","kind":"ack","text":"","reply_to":"m-1","ack_level":true}',
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token1}", "Host": f"127.0.0.1:{port1}"},
+            method="POST"
         )
-        # Should not hang indefinitely or raise unhandled
-        t0_nan = time.time()
-        # Test with tiny timeout param to verify finite handling
+        try:
+            with urllib.request.urlopen(req_ack_bool):
+                raise AssertionError("Expected 400 for bool ack_level via /send")
+        except urllib.error.HTTPError as e:
+            assert e.code == 400, f"Expected 400 for bool ack_level via /send, got {e.code}"
+
+        req_ack_bool2 = urllib.request.Request(
+            f"http://127.0.0.1:{port1}/ack",
+            data=b'{"run":"r1","id":"m-1","ack_level":true}',
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token1}", "Host": f"127.0.0.1:{port1}"},
+            method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req_ack_bool2):
+                raise AssertionError("Expected 400 for bool ack_level via /ack")
+        except urllib.error.HTTPError as e:
+            assert e.code == 400, f"Expected 400 for bool ack_level via /ack, got {e.code}"
+
+        # 413 over real HTTP: body above the 64 KiB limit
+        req_big = urllib.request.Request(
+            f"http://127.0.0.1:{port1}/send",
+            data=b'{"run":"r1","task":"T1","kind":"info","text":"' + b"x" * 70000 + b'"}',
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token1}", "Host": f"127.0.0.1:{port1}"},
+            method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req_big):
+                raise AssertionError("Expected 413 for oversized body")
+        except urllib.error.HTTPError as e:
+            assert e.code == 413, f"Expected 413, got {e.code}"
+
+        # B6 Host header enforcement over real HTTP
+        req_bad_host = urllib.request.Request(
+            f"http://127.0.0.1:{port1}/health",
+            headers={"Host": "evil.com"}
+        )
+        try:
+            with urllib.request.urlopen(req_bad_host):
+                raise AssertionError("Expected 400 for external Host header")
+        except urllib.error.HTTPError as e:
+            assert e.code == 400, f"Expected 400 for bad Host, got {e.code}"
+            assert json.loads(e.read().decode("utf-8"))["error"] == "invalid host header"
+
+        # B7 Origin rejection over real HTTP
+        req_origin = urllib.request.Request(
+            f"http://127.0.0.1:{port1}/health",
+            headers={"Host": f"127.0.0.1:{port1}", "Origin": "http://evil.example"}
+        )
+        try:
+            with urllib.request.urlopen(req_origin):
+                raise AssertionError("Expected 403 for Origin header")
+        except urllib.error.HTTPError as e:
+            assert e.code == 403, f"Expected 403 for Origin, got {e.code}"
+            assert json.loads(e.read().decode("utf-8"))["error"] == "browser origins rejected"
+
+        # B7 CORS preflight: OPTIONS -> 403 JSON (never 501 HTML)
+        req_options = urllib.request.Request(
+            f"http://127.0.0.1:{port1}/send",
+            headers={"Host": f"127.0.0.1:{port1}", "Content-Type": "application/json"},
+            method="OPTIONS"
+        )
+        try:
+            with urllib.request.urlopen(req_options):
+                raise AssertionError("Expected 403 for OPTIONS preflight")
+        except urllib.error.HTTPError as e:
+            assert e.code == 403, f"Expected 403 for OPTIONS, got {e.code}"
+            opt_body = json.loads(e.read().decode("utf-8"))
+            assert opt_body == {"ok": False, "error": "browser origins rejected"}, opt_body
+
+        # /wait timeout clamp over real HTTP (B11/B18): 0.2 clamps up to 1.0
+        t0_fin = time.time()
         req_fin_wait = urllib.request.Request(
             f"http://127.0.0.1:{port1}/wait?lane=T1&after=0&timeout=0.2",
             headers={"Authorization": f"Bearer {token1}", "Host": f"127.0.0.1:{port1}"}
         )
-        with urllib.request.urlopen(req_fin_wait, timeout=2.0) as resp:
+        with urllib.request.urlopen(req_fin_wait, timeout=5.0) as resp:
             fin_res = json.loads(resp.read().decode("utf-8"))
-            assert fin_res["ok"] is True
+            assert fin_res["ok"] is True and fin_res["message"] is None, fin_res
+        dt_fin = time.time() - t0_fin
+        assert dt_fin >= 0.9, f"timeout=0.2 must clamp to 1.0 s, returned after {dt_fin:.2f}s"
+        done("input validation + 413 + host/origin/OPTIONS + wait clamp")
 
         # 7. ask -> answer round trip (< 2s) with mk-state unblock and honest acks
         rc, send_ask, _ = cli(["send", "--run", "r1", "--task", "T1", "--kind", "ask", "--text", "how to proceed?", "--from", "T1", "--to", "orch", "--data", data])
@@ -1737,6 +1969,76 @@ def self_test():
                 raise AssertionError("Expected 400 for ack with unknown reply_to")
         except urllib.error.HTTPError as e:
             assert e.code == 400, f"Expected 400 for ack with unknown reply_to, got {e.code}"
+        done("ask->answer round trip + honest acks")
+
+        # 7b. Cross-lane ack forgery refused on EVERY ack path (MEDIUM 1):
+        # T1 must not ack T2's messages, via /send kind=ack AND via /ack.
+        lane2 = os.path.join(tmp, "lane2")
+        os.makedirs(lane2, exist_ok=True)
+        rc, res_tok2, _ = cli(["token", "--lane", lane2, "--task", "T2", "--run", "r1", "--data", data])
+        assert rc == 0 and res_tok2["ok"] is True, res_tok2
+        token2 = res_tok2["token"]
+
+        rc, res_ask_t2, _ = cli(["send", "--run", "r1", "--task", "T2", "--kind", "ask", "--text", "T2 question", "--from", "T2", "--to", "orch", "--data", data])
+        assert rc == 0 and res_ask_t2["ok"] is True, res_ask_t2
+        t2_ask_id = res_ask_t2["message"]["id"]
+        t2_ask_seq = res_ask_t2["message"]["seq"]
+
+        lines_before = len(open(jsonl_path).readlines())
+        req_cross_ack = urllib.request.Request(
+            f"http://127.0.0.1:{port1}/send",
+            data=json.dumps({"kind": "ack", "text": "", "reply_to": t2_ask_id}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token1}", "Host": f"127.0.0.1:{port1}"},
+            method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req_cross_ack):
+                raise AssertionError("Expected 403 for T1 acking T2's ask via /send")
+        except urllib.error.HTTPError as e:
+            assert e.code == 403, f"Expected 403 for cross-lane ack via /send, got {e.code}"
+
+        req_cross_ack2 = urllib.request.Request(
+            f"http://127.0.0.1:{port1}/ack",
+            data=json.dumps({"id": t2_ask_id, "run": "r1"}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token1}", "Host": f"127.0.0.1:{port1}"},
+            method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req_cross_ack2):
+                raise AssertionError("Expected 403 for T1 acking T2's ask via /ack")
+        except urllib.error.HTTPError as e:
+            assert e.code == 403, f"Expected 403 for cross-lane ack via /ack, got {e.code}"
+
+        assert len(open(jsonl_path).readlines()) == lines_before, "403 acks must write nothing"
+        done("cross-lane ack refused on /send and /ack")
+
+        # 7c. NaN /wait timeout over real HTTP (B11): non-finite falls back to
+        # a finite 30 s wait, proven by the request staying open until a
+        # matching message arrives (no error, no instant empty return).
+        nan_result = {}
+
+        def do_nan_wait():
+            req_nan = urllib.request.Request(
+                f"http://127.0.0.1:{port1}/wait?lane=T1&after={t2_ask_seq}&timeout=nan",
+                headers={"Authorization": f"Bearer {token1}", "Host": f"127.0.0.1:{port1}"}
+            )
+            with urllib.request.urlopen(req_nan, timeout=10.0) as resp:
+                nan_result["res"] = json.loads(resp.read().decode("utf-8"))
+
+        th_nan = threading.Thread(target=do_nan_wait)
+        th_nan.start()
+        time.sleep(0.4)
+        assert th_nan.is_alive(), "timeout=nan must not return instantly or error"
+
+        rc, send_info, _ = cli(["send", "--run", "r1", "--task", "T1", "--kind", "info", "--text", "update", "--from", "orch", "--to", "T1", "--data", data])
+        assert rc == 0 and send_info["ok"] is True, send_info
+        info_id = send_info["message"]["id"]
+
+        th_nan.join(timeout=5.0)
+        assert not th_nan.is_alive(), "nan wait thread did not terminate"
+        assert nan_result["res"]["ok"] is True, nan_result
+        assert nan_result["res"]["message"]["id"] == info_id, nan_result
+        done("NaN /wait over real HTTP")
 
         # Verify bus.jsonl contains ask, answer, ack lines with typed fields
         lines = [json.loads(line.strip()) for line in open(jsonl_path).readlines() if line.strip()]
@@ -1747,11 +2049,14 @@ def self_test():
                 assert k in l, f"Field {k} missing in line {l}"
             assert l["ts"].endswith("Z"), f"Timestamp not UTC Z: {l['ts']}"
 
-        # 8. Server restart and replay via Last-Event-ID
-        # An info message addressed to T1 gives the lane something to replay with seq > 2.
-        rc, send_info, _ = cli(["send", "--run", "r1", "--task", "T1", "--kind", "info", "--text", "update", "--from", "orch", "--to", "T1", "--data", data])
-        assert rc == 0 and send_info["ok"] is True, send_info
+        # LOW 7: the message log is 0600 and the runs dirs are 0700
+        assert (os.stat(jsonl_path).st_mode & 0o777) == 0o600, "bus.jsonl must be 0600"
+        assert (os.stat(os.path.join(data, "runs")).st_mode & 0o777) == 0o700, "runs/ must be 0700"
+        assert (os.stat(os.path.join(data, "runs", "r1")).st_mode & 0o777) == 0o700, "runs/r1 must be 0700"
+        done("bus.jsonl fields, UTC Z, 0600/0700 modes")
 
+        # 8. Server restart and replay via Last-Event-ID (the 7c info message
+        # addressed to T1 gives the lane something to replay with seq > 2)
         stop_process(pid1)
         assert not is_pid_alive(pid1)
 
@@ -1766,13 +2071,90 @@ def self_test():
             headers={"Authorization": f"Bearer {token1}", "Last-Event-ID": "2", "Host": f"127.0.0.1:{port2}"}
         )
         with urllib.request.urlopen(req_sse, timeout=3.0) as resp:
+            assert resp.headers.get("Content-Type") == "text/event-stream; charset=utf-8", \
+                f"Wrong SSE Content-Type: {resp.headers.get('Content-Type')}"
             first_line = resp.readline().decode("utf-8")
             assert first_line.startswith("id: "), f"Expected id: ..., got {first_line!r}"
             ev_id = int(first_line.split(":")[1].strip())
             assert ev_id > 2, f"Expected event id > 2, got {ev_id}"
+        done("SSE replay via Last-Event-ID + headers")
 
+        # 8b. Lane ack via /send records an ack, never a message (MEDIUM 1):
+        # the ack record is absent from messages/by_id live, and live state
+        # equals replayed state after a restart.
+        req_lane_ack = urllib.request.Request(
+            f"http://127.0.0.1:{port2}/send",
+            data=json.dumps({"kind": "ack", "text": "", "reply_to": ans_msg["id"]}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token1}", "Host": f"127.0.0.1:{port2}"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req_lane_ack, timeout=2.0) as resp:
+            lane_ack_res = json.loads(resp.read().decode("utf-8"))
+        assert lane_ack_res["ok"] is True and lane_ack_res["ack_recorded"] is True, lane_ack_res
+        assert lane_ack_res["id"] == ans_msg["id"], lane_ack_res
+
+        last_line = json.loads(open(jsonl_path).readlines()[-1].strip())
+        assert last_line["kind"] == "ack" and last_line["reply_to"] == ans_msg["id"], last_line
+        ack_rec_id = last_line["id"]
+
+        req_addr_ack = urllib.request.Request(
+            f"http://127.0.0.1:{port2}/send",
+            data=json.dumps({"kind": "ack", "text": "", "reply_to": ack_rec_id}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token1}", "Host": f"127.0.0.1:{port2}"},
+            method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req_addr_ack):
+                raise AssertionError("ack record id must not be addressable live")
+        except urllib.error.HTTPError as e:
+            assert e.code == 400, f"Expected 400 addressing ack record live, got {e.code}"
+
+        req_wait_live = urllib.request.Request(
+            f"http://127.0.0.1:{port2}/wait?lane=T1&after=0&timeout=1",
+            headers={"Authorization": f"Bearer {token1}", "Host": f"127.0.0.1:{port2}"}
+        )
+        with urllib.request.urlopen(req_wait_live, timeout=5.0) as resp:
+            wait_live = json.loads(resp.read().decode("utf-8"))
+        assert wait_live["message"]["id"] == ans_msg["id"], wait_live
+
+        rc, pend_live, _ = cli(["pending", "--run", "r1", "--data", data])
+        assert rc == 0 and [p["id"] for p in pend_live["pending"]] == [t2_ask_id], pend_live
+
+        # Restart: replayed state must equal the live state observed above
         stop_process(pid2)
         assert not is_pid_alive(pid2)
+        rc, res_restart2, _ = cli(["ensure", "--data", data, "--run", "r1"])
+        assert rc == 0 and res_restart2["ok"] is True and res_restart2["started"] is True
+        pid3 = res_restart2["pid"]
+        port3 = res_restart2["port"]
+        pids.append(pid3)
+
+        req_addr_ack2 = urllib.request.Request(
+            f"http://127.0.0.1:{port3}/send",
+            data=json.dumps({"kind": "ack", "text": "", "reply_to": ack_rec_id}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token1}", "Host": f"127.0.0.1:{port3}"},
+            method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req_addr_ack2):
+                raise AssertionError("ack record id must not be addressable after replay")
+        except urllib.error.HTTPError as e:
+            assert e.code == 400, f"Expected 400 addressing ack record after replay, got {e.code}"
+
+        req_wait_replay = urllib.request.Request(
+            f"http://127.0.0.1:{port3}/wait?lane=T1&after=0&timeout=1",
+            headers={"Authorization": f"Bearer {token1}", "Host": f"127.0.0.1:{port3}"}
+        )
+        with urllib.request.urlopen(req_wait_replay, timeout=5.0) as resp:
+            wait_replay = json.loads(resp.read().decode("utf-8"))
+        assert wait_replay["message"]["id"] == wait_live["message"]["id"], wait_replay
+
+        rc, pend_replay, _ = cli(["pending", "--run", "r1", "--data", data])
+        assert rc == 0 and [p["id"] for p in pend_replay["pending"]] == [p["id"] for p in pend_live["pending"]], pend_replay
+        done("lane ack via /send is a record, live == replayed")
+
+        stop_process(pid3)
+        assert not is_pid_alive(pid3)
 
         # 9. Stale owner_heartbeat and missing bus.json reaper (LOW finding 9)
         env_hb = os.environ.copy()
@@ -1810,12 +2192,40 @@ def self_test():
         poll_until(lambda: os.path.exists(bus_json_path))
         os.remove(bus_json_path)
         wait_pid_dead(p_hb2)
+        done("stale heartbeat + missing bus.json reap")
 
         # 10. Client error mapping (MEDIUM finding 7): 401/403/400 map to HTTP status; only down is "bus down"
         # Server down test
         rc, res_down, err = cli(["send", "--run", "r1", "--task", "T1", "--kind", "ask", "--text", "hi", "--data", data], check=False)
         assert rc != 0
         assert res_down == {"ok": False, "error": "bus down"}, res_down
+        done("server down -> bus down")
+
+        # 10b. ensure vs a live but unresponsive server (LOW 5): a failed
+        # health probe on a LIVE pid must not delete bus.json or respawn a
+        # second serve; the bus recovers once the server responds again.
+        data_slow = os.path.join(tmp, "data_slow")
+        os.makedirs(data_slow, exist_ok=True)
+        rc, res_slow, _ = cli(["ensure", "--data", data_slow, "--run", "rs"])
+        assert rc == 0 and res_slow["ok"] is True and res_slow["started"] is True, res_slow
+        pid_slow = res_slow["pid"]
+        pids.append(pid_slow)
+
+        os.kill(pid_slow, signal.SIGSTOP)
+        try:
+            rc, res_probe_slow, _ = cli(["ensure", "--data", data_slow, "--run", "rs"], check=False)
+            assert rc != 0, "ensure must fail, not respawn, against a live unresponsive server"
+            assert res_probe_slow.get("ok") is False and "not answering" in res_probe_slow.get("error", ""), res_probe_slow
+            bslow = read_json(os.path.join(data_slow, "bus.json"))
+            assert bslow and bslow.get("pid") == pid_slow, "bus.json must be kept while the pid is alive"
+        finally:
+            os.kill(pid_slow, signal.SIGCONT)
+
+        rc, res_slow2, _ = cli(["ensure", "--data", data_slow, "--run", "rs"])
+        assert rc == 0 and res_slow2["ok"] is True and res_slow2["started"] is False, res_slow2
+        assert res_slow2["pid"] == pid_slow and res_slow2["port"] == res_slow["port"], res_slow2
+        stop_process(pid_slow)
+        done("ensure keeps live-but-unresponsive bus")
 
         # 11. mk-state integration with state_updated report
         data_state = os.path.join(tmp, "data_state")
@@ -1840,6 +2250,30 @@ def self_test():
 
         p_get2 = subprocess.run([sys.executable, mk_state, "--data", data_state, "--run", "r2", "task", "get", "T2"], stdout=subprocess.PIPE, text=True, check=True)
         assert json.loads(p_get2.stdout)["task"]["status"] == "building"
+        done("mk-state integration (answer -> building)")
+
+        # 11b. Ambiguous message id refused (MEDIUM 2): ids are per run, so
+        # "m-1" exists in both r2 and r3; without --run the CLI must fail
+        # instead of answering whichever run os.listdir returned first.
+        subprocess.run([sys.executable, mk_state, "--data", data_state, "run", "init", "--id", "r3", "--feature", "f", "--branch", "b", "--force"], check=True, capture_output=True)
+        subprocess.run([sys.executable, mk_state, "--data", data_state, "--run", "r3", "task", "add", "--id", "T3", "--title", "task three"], check=True, capture_output=True)
+
+        rc, res_ask3, _ = cli(["send", "--run", "r3", "--task", "T3", "--kind", "ask", "--text", "second run ask", "--from", "T3", "--to", "orch", "--data", data_state])
+        assert rc == 0 and res_ask3["ok"] is True, res_ask3
+        assert res_ask3["message"]["id"] == "m-1", res_ask3
+
+        rc, res_amb, _ = cli(["answer", "m-1", "which one?", "--data", data_state], check=False)
+        assert rc != 0, "ambiguous answer without --run must fail"
+        assert res_amb == {"ok": False, "error": "ambiguous message id, pass --run"}, res_amb
+
+        # --run disambiguates: r3's ask is unanswered (r2's already answered)
+        rc, res_dis, _ = cli(["answer", "m-1", "answered via run", "--run", "r3", "--data", data_state])
+        assert rc == 0 and res_dis["ok"] is True, res_dis
+        assert res_dis["message"]["reply_to"] == "m-1" and res_dis["message"]["run"] == "r3", res_dis
+
+        rc, res_r2, _ = cli(["answer", "m-1", "nope", "--run", "r2", "--data", data_state], check=False)
+        assert rc != 0 and "already answered" in res_r2.get("error", ""), res_r2
+        done("ambiguous answer refused, --run disambiguates")
 
     finally:
         for p in pids:
@@ -1849,7 +2283,7 @@ def self_test():
             shutil.rmtree(tmp, ignore_errors=True)
 
     print("pass mk-bus.py: mk-bus self-test ok")
-    print(json.dumps({"ok": True, "tests": 15, "passed": 15}))
+    print(json.dumps({"ok": True, "tests": len(checks), "passed": len(checks)}))
     return 0
 
 
