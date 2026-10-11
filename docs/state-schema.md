@@ -369,7 +369,7 @@ Every open sets `journal_mode=WAL`, `busy_timeout=5000`, `foreign_keys=ON`. Ever
 
 ### `schema_version` and migrations
 
-Both stores carry `schema_version(version INTEGER PRIMARY KEY)`. `SCHEMA = 2`. Migrations are an
+Both stores carry `schema_version(version INTEGER PRIMARY KEY)`. `SCHEMA = 3`. Migrations are an
 ordered `(version, step)` list applied once. A step is either SQL or a Python callable. SQL steps
 are idempotent by construction (`CREATE TABLE IF NOT EXISTS`, `INSERT OR IGNORE`); an
 `ALTER TABLE ADD COLUMN` is not safe to run twice, so it goes through a guarded Python step that
@@ -382,7 +382,15 @@ v2 (shipped, a Python step) adds `artifacts.src TEXT` — the importer's stable 
 on rows the live path writes — the index `art_run_src(run, src)`, and `event_src(run, src,
 PRIMARY KEY(run, src))`, the same key for events so a repeat import is an indexed lookup. A v1
 store is upgraded in place the next time it is opened and keeps every row it had; re-running the
-step changes nothing. The v2→v3 migration exists only inside `--self-test`.
+step changes nothing.
+
+v3 (shipped, a guarded Python step, the same `PRAGMA table_info` pattern as v2) adds
+`lane_slots.workspace`, `workspace_id`, `branch`, `lock_hash` and `updated`, each `TEXT` and NULL
+on rows written before the migration. A fresh store is created with those columns already in the
+base `CREATE TABLE`, then the v2 and v3 steps run and stamp version 3. A v1 or v2 store is
+upgraded in place on the next open and keeps every `lane_slots` row; opening it again changes
+nothing. A crash after the columns are added and before the version stamp is repaired by the next
+open, because each column is added only when it is missing.
 
 ### Project tables (C2)
 
@@ -402,7 +410,7 @@ status is not transitioned again.
 `events(id INTEGER PRIMARY KEY, run, task, t, chan, kind, from_id, to_id, reply_to, text,
 artifact_id, meta_json)` with index `ev_task(run, task, id)`. `chan` is `state` or `bus`.
 `change_log(change_no INTEGER PRIMARY KEY, run, task, t)` — `change_no` is the rowid, gap-free.
-`plans`, `runs`, `acks`, `lane_slots`, `waits` as in contract C2.
+`lane_slots(slot TEXT PRIMARY KEY, lane_path, state, run, task, workspace, workspace_id, branch, lock_hash, updated)` — the five trailing columns are v3, each `TEXT`, and match the slot record in `lanes.json` (`workspace` and `workspace_id` are null for a plain git worktree; `branch`, `lock_hash` and `updated` are null until the slot is acquired). `plans`, `runs`, `acks`, `waits` as in contract C2.
 `artifacts(id INTEGER PRIMARY KEY, run, task, round, kind, rev, text, created, src)` — `text` is
 stored byte-for-byte; `src` is the v2 source key.
 
