@@ -369,11 +369,16 @@ Every open sets `journal_mode=WAL`, `busy_timeout=5000`, `foreign_keys=ON`. Ever
 
 ### `schema_version` and migrations
 
-Both stores carry `schema_version(version INTEGER PRIMARY KEY)`. `SCHEMA = 1`. Migrations are an
+Both stores carry `schema_version(version INTEGER PRIMARY KEY)`. `SCHEMA = 2`. Migrations are an
 ordered `(version, sql)` list applied once, each idempotent (`CREATE TABLE IF NOT EXISTS`,
-`INSERT OR IGNORE`) because the DDL and its version stamp are two transactions. A store whose
-version is newer than the code is refused: `{"ok": false, "error": "store schema vN is newer …"}`,
-exit 3. The v1→v2 migration exists only inside `--self-test`; it is not in the shipped list.
+`INSERT OR IGNORE`, and `ALTER TABLE` guarded by a column check) because the DDL and its version
+stamp are two transactions. A store whose version is newer than the code is refused:
+`{"ok": false, "error": "store schema vN is newer …"}`, exit 3.
+
+v2 (shipped) adds `artifacts.src TEXT` — the importer's stable source key, NULL on rows the live
+path writes — and `event_src(run, src, PRIMARY KEY(run, src))`, the same key for events so a
+repeat import is an indexed lookup. A v1 store is upgraded in place the next time it is opened
+and keeps every row it had. The v2→v3 migration exists only inside `--self-test`.
 
 ### Project tables (C2)
 
@@ -393,7 +398,9 @@ status is not transitioned again.
 `events(id INTEGER PRIMARY KEY, run, task, t, chan, kind, from_id, to_id, reply_to, text,
 artifact_id, meta_json)` with index `ev_task(run, task, id)`. `chan` is `state` or `bus`.
 `change_log(change_no INTEGER PRIMARY KEY, run, task, t)` — `change_no` is the rowid, gap-free.
-`plans`, `runs`, `artifacts`, `acks`, `lane_slots`, `waits` as in contract C2.
+`plans`, `runs`, `acks`, `lane_slots`, `waits` as in contract C2.
+`artifacts(id INTEGER PRIMARY KEY, run, task, round, kind, rev, text, created, src)` — `text` is
+stored byte-for-byte; `src` is the v2 source key.
 
 ### Root tables (C1)
 
@@ -423,13 +430,51 @@ API: `open_root(home)`, `open_project(home, slug=None, data_dir=None)`,
 `add_task(con, run, task, type, title="", parent=None, deps="", route_json=None, status="planned")`,
 `transition(home, project, run, task, to, note="", round=0, sync_root=False, data_dir=None)`,
 `catch_up(home, project, data_dir=None)`, `timeline(home, project, run, task, data_dir=None)`,
-`cards(home, project=None)`, `check_slug`, `check_home`, `column_of(status, prev_status=None)`.
+`cards(home, project=None)`, `check_slug`, `check_home`, `column_of(status, prev_status=None)`,
+`import_history(home, project, run, *, run_row=None, tasks=(), events=(), artifacts=(), data_dir=None)`.
 
 ```
 mkdb.py timeline --project P --run R --task T --json [--data DIR] [--home DIR]
 mkdb.py cards [--project P] --json [--home DIR]
+mkdb.py import-history --project P --run R --json-file F [--data DIR] [--home DIR]
 mkdb.py --self-test
 ```
 
 `timeline` is `SELECT … FROM events WHERE run=? AND task=? ORDER BY id`. `cards` reads the root
 store. One JSON line per call; errors exit 2, a newer store exits 3.
+
+### `import_history(home, project, run, *, run_row=None, tasks=(), events=(), artifacts=(), data_dir=None)`
+
+The one write path for historical rows, so the importer never opens SQLite itself. The whole call
+is one `BEGIN IMMEDIATE` transaction; any error rolls it back and the store is unchanged.
+
+- `run_row` is a dict of the `runs` columns (`id plan plan_version branch status stage next
+  started ended`) and is upserted by `id`, which must equal `run`.
+- `tasks` are dicts of the `tasks` columns the importer has (`id parent type title acceptance
+  owned deps parallel route_json status lane slot branch pane round verdict updated`). They are
+  inserted with their original `status`, `round`, `verdict` and `updated`, parents before
+  children. `prev_status` is set from the imported status: a column status keeps itself, an
+  attention status (`blocked`, `stalled`, `quota`, `provider`) gets NULL, so `column_of` places it
+  in Backlog — the same helper `transition()` uses, not a second copy. The C3 dep rules apply to
+  the whole batch: a dep may name a task later in the same batch, and a cycle is refused with the
+  path named.
+- `events` are dicts `t chan kind from_id to_id reply_to text meta_json task` plus `src`, the
+  stable source key. They are stored with the original `t`, `chan` and `kind` — no `now()`, no
+  forced `kind='transition'` — in the order given, so ids ascend with the input. `src` is written
+  into `meta_json` as `"src"` and recorded in `event_src`.
+- `artifacts` are dicts `task round kind rev text created` plus `src`. `text` is stored
+  byte-for-byte and `src` goes in the `artifacts.src` column.
+
+Idempotent: an event or artifact whose `src` is already stored is skipped, and tasks and the run
+row upsert, so the same call twice adds nothing. Each task actually added gets one `change_log`
+row, so `catch_up()` can build its root card later. `sync_root` stays off; this function never
+writes the root store. It returns `{runs, tasks, events, artifacts}`, the counts of rows actually
+added.
+
+```
+mkdb.py import-history --project P --run R --json-file F [--data DIR] [--home DIR]
+```
+
+`--json-file` is a JSON object with the same four keys (`run_row`, `tasks`, `events`,
+`artifacts`). The command prints one JSON line: `{"ok": true, "runs": N, "tasks": N, "events": N,
+"artifacts": N}`.
