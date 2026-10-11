@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Run every scripts/*.py and child-skills/*/scripts/*.py that has a --self-test; exit non-zero if any fails.
+# mk-bus.py --self-test runs as part of the *.py pattern below.
 # Tests use temp dirs and a temp MATRIXKODER_HOME, never the real ~/.matrixkoder.
 cd "$(dirname "$0")" || exit 2
 export PYTHONDONTWRITEBYTECODE=1
