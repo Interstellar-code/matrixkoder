@@ -351,9 +351,15 @@ def value_of(lines, r):
             return False, r["default"]
         rest = KEY_RE.match(lines[hits[0]]).group(3)
         m = flow_map(rest)
-        if r["member"] not in m:
-            return False, r["default"]
-        return True, coerce(r["type"], m[r["member"]], r["default"])
+        if r["member"] in m:
+            return True, coerce(r["type"], m[r["member"]], r["default"])
+        sr = section_range(lines, kl, ["helpers"])
+        if sr:
+            ch_hits = [i for (i, indent, k, _r) in kl if sr[2] <= i < sr[3] and k == r["member"]]
+            if len(ch_hits) == 1:
+                ch_rest = KEY_RE.match(lines[ch_hits[0]]).group(3)
+                return True, coerce(r["type"], ch_rest, r["default"])
+        return False, r["default"]
     kl, sr = key_lines(lines), section_range(lines, key_lines(lines), r["sec"])
     if not sr:
         return False, r["default"]
@@ -544,8 +550,40 @@ def changed_lines(old, new):
     return n
 
 
+def check_structure(reread):
+    """Refuse corrupt yaml: no duplicate top-level sections, and no orphan child lines
+    (no line indented deeper than a preceding key line that has an inline scalar/flow-map value)."""
+    seen_top = set()
+    prev_key = None
+    for i, raw in enumerate(reread):
+        line = strip_comment(raw).rstrip()
+        if not line.strip():
+            continue
+        m = KEY_RE.match(raw)
+        if m:
+            indent = len(m.group(1))
+            k = m.group(2)
+            rest = m.group(3)
+            if indent == 0:
+                if k in seen_top:
+                    raise Fail(f"corrupt yaml: duplicate top-level section `{k}` (line {i + 1})")
+                seen_top.add(k)
+            if prev_key is not None:
+                prev_i, prev_indent, prev_k, prev_rest = prev_key
+                if strip_comment(prev_rest).strip() and indent > prev_indent:
+                    raise Fail(f"corrupt yaml: orphan child line {i + 1} `{k}:` indented deeper than inline `{prev_k}:` (line {prev_i + 1})")
+            prev_key = (i, indent, k, rest)
+        else:
+            indent = len(raw) - len(raw.lstrip())
+            if prev_key is not None:
+                prev_i, prev_indent, prev_k, prev_rest = prev_key
+                if strip_comment(prev_rest).strip() and indent > prev_indent:
+                    raise Fail(f"corrupt yaml: orphan child line {i + 1} indented deeper than inline `{prev_k}:` (line {prev_i + 1})")
+
+
 def verify(old, new, count, checks):
     reread = "".join(new).splitlines(keepends=True)
+    check_structure(reread)
     if changed_lines(old, new) != count:
         raise Fail(f"the patch would change {changed_lines(old, new)} lines, not the {count} it named")
     for key, value, r in checks:
@@ -679,6 +717,7 @@ def cmd_set(path, lines, args):
     r = row_for(lines, key)
     if not r:
         raise Fail(f"unknown key: {key}")
+    # agents.*.available is editable=False in rows() for Settings UI, but allowed in set CLI for bootstrap / drift detection
     if not r.get("editable", True) and not r["key"].startswith("agents."):
         raise Fail(f"{key} is read-only: {r.get('why', 'not editable')}")
     value = parse_value(raw, r)
@@ -788,9 +827,25 @@ def extract_left(val):
     return int(rounded) if rounded.is_integer() else rounded
 
 
+def is_future_iso(ts):
+    if not isinstance(ts, str):
+        return False
+    try:
+        s = ts.strip().replace("Z", "+00:00")
+        dt = datetime.datetime.fromisoformat(s)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt > now
+    except Exception:  # an unparseable timestamp is not a reset window
+        return False
+
+
 def cmd_context(path, lines, usage_arg=None):
+    schema_rows = {r["key"]: r for r in rows(lines)}  # row_for scans the schema per call; resolve once
+
     def val(key):
-        r = row_for(lines, key)
+        r = schema_rows.get(key)
         if not r:
             raise Fail(f"unknown schema row: {key}")
         return value_of(lines, r)[1]
@@ -847,6 +902,9 @@ def cmd_context(path, lines, usage_arg=None):
                 below = True
             below_floor = below
 
+        if is_future_iso(u_agent.get("exhausted_until")):
+            below_floor = True
+
         agents_map[name] = {
             "available": avail,
             "picks": picks,
@@ -876,23 +934,34 @@ def cmd_context(path, lines, usage_arg=None):
     })
 
 
+PROBE_TIMEOUT_S = 30  # every probe gets this long; a health check that needs longer is stale, not missing
+
+
 def probe_herdr():
     try:
-        p = subprocess.run(["herdr", "agent", "list"], capture_output=True, text=True, timeout=30)
+        p = subprocess.run(["herdr", "agent", "list"], capture_output=True, text=True,
+                           timeout=PROBE_TIMEOUT_S)
         return "ok" if p.returncode == 0 else "stale"
     except FileNotFoundError:
         return "missing"
-    except (subprocess.TimeoutExpired, Exception):
+    except Exception:  # a timeout or a crash: installed but unverified
         return "stale"
 
 
 def probe_claude_mcps():
+    """The three MCP helpers from `claude mcp list`. `missing` only when the binary is absent or the
+    line is absent from a successful listing; a timeout or a non-zero exit leaves them unverified,
+    which is `stale`, not `missing`."""
+    stale = {"jev": "stale", "context_mode": "stale", "codebase_memory": "stale"}
     try:
-        p = subprocess.run(["claude", "mcp", "list"], capture_output=True, text=True, timeout=30)
-        if p.returncode != 0:
-            return {"jev": "missing", "context_mode": "missing", "codebase_memory": "missing"}
-    except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+        p = subprocess.run(["claude", "mcp", "list"], capture_output=True, text=True,
+                           timeout=PROBE_TIMEOUT_S)
+    except FileNotFoundError:
         return {"jev": "missing", "context_mode": "missing", "codebase_memory": "missing"}
+    except Exception:
+        return stale
+    if p.returncode != 0:
+        return stale
 
     stdout = p.stdout or ""
     lines = stdout.splitlines()
@@ -915,10 +984,12 @@ def probe_claude_mcps():
 def probe_canary():
     try:
         p = subprocess.run(["npx", "--no-install", "@usecanary/cli", "--version"],
-                           capture_output=True, text=True, timeout=30)
-        return "ok" if p.returncode == 0 else "missing"
-    except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+                           capture_output=True, text=True, timeout=PROBE_TIMEOUT_S)
+        return "ok" if p.returncode == 0 else "missing"  # spec: a failing npx means no canary
+    except FileNotFoundError:
         return "missing"
+    except Exception:  # a timeout is installed-but-unverified here too: stale, not missing
+        return "stale"
 
 
 def cmd_probe(path, lines):
@@ -950,7 +1021,14 @@ def cmd_probe(path, lines):
         i = hits[0]
         eol = ending_of(lines[i])
         new = list(lines)
-        new[i] = helpers_line + eol
+        rest = KEY_RE.match(lines[i]).group(3)
+        if not strip_comment(rest).strip():
+            # a block-style `helpers:` section is replaced whole: its indented children would be
+            # orphaned under the new flow-map line and corrupt the file
+            sr = section_range(lines, kl, ["helpers"])
+            new[i:sr[3]] = [helpers_line + eol]
+        else:
+            new[i] = helpers_line + eol
     else:
         eol = file_ending(lines)
         new = list(lines)
@@ -1330,6 +1408,22 @@ def self_test():
         assert ctx_true["agents"]["opencode"]["below_floor"] is True
         assert ctx_true["agents"]["opencode"]["left"] == {"five_hour": None, "weekly": 10}
 
+        # 20b. below_floor is also true while an exhausted_until reset window is still running,
+        #      and false again once it is in the past (review r1 LOW: below_floor is not only %)
+        future = (datetime.datetime.now(datetime.timezone.utc)
+                  + datetime.timedelta(hours=1)).isoformat()
+        past = (datetime.datetime.now(datetime.timezone.utc)
+                - datetime.timedelta(hours=1)).isoformat()
+        with open(usage_fake_path, "w") as f:
+            json.dump({"agents": {
+                "claude": {"five_hour": {"used_pct": 10}, "exhausted_until": future},  # 5h left=90
+                "opencode": {"weekly": {"used_pct": 10}, "exhausted_until": past},  # week left=90
+            }}, f)
+        ctx_exh = run("context", "--usage", usage_fake_path)
+        assert ctx_exh["agents"]["claude"]["below_floor"] is True, ctx_exh["agents"]["claude"]
+        assert ctx_exh["agents"]["claude"]["left"] == {"five_hour": 90, "weekly": None}
+        assert ctx_exh["agents"]["opencode"]["below_floor"] is False, ctx_exh["agents"]["opencode"]
+
         # 21. probe subcommand & helpers rows
         # (a) list emits all five helpers.* rows (not probed when absent)
         with open(yaml_path, "w") as f:
@@ -1398,7 +1492,7 @@ def self_test():
 
         p_res3 = run("probe")
         assert p_res3["herdr"] == "stale"
-        assert p_res3["jev"] == "missing"
+        assert p_res3["jev"] == "missing"  # claude absent: the MCP helpers are missing
         assert p_res3["context_mode"] == "missing"
         assert p_res3["codebase_memory"] == "missing"
         assert p_res3["canary"] == "missing"
@@ -1406,6 +1500,73 @@ def self_test():
         for hid in ("jev", "context_mode", "codebase_memory", "canary"):
             assert run("get", f"helpers.{hid}")["value"] == "missing"
         assert run("get", "helpers.herdr")["value"] == "stale"
+
+        # (f) review r1 HIGH: a block-style helpers section is replaced whole — its indented
+        # children must not survive as orphans under the new flow-map line
+        block_style = fixture.rstrip("\n") + "\nhelpers:\n  herdr: ok\n  jev: ok\n" \
+            "  context_mode: ok\n  codebase_memory: ok\n  canary: ok\n" \
+            '  probed_at: "2000-01-01T00:00:00Z"\n'
+        with open(yaml_path, "w") as f:
+            f.write(block_style)
+        make_bin("herdr", "#!/bin/sh\nexit 0\n")
+        make_bin("claude", "#!/bin/sh\necho 'jev: connected'\nexit 0\n")
+        make_bin("npx", "#!/bin/sh\nexit 0\n")
+        p_res4 = run("probe")
+        assert p_res4["ok"] is True and p_res4["herdr"] == "ok" and p_res4["canary"] == "ok"
+        after_block = rd()
+        assert "helpers:\n" not in after_block, f"block header survived:\n{after_block}"
+        assert "  herdr: ok\n" not in after_block, f"orphan child survived:\n{after_block}"
+        flow_hits = [l for l in after_block.splitlines() if l.startswith("helpers: {")]
+        assert len(flow_hits) == 1, after_block
+        # every row reads back to what was probed, from the flow line
+        for hid in ("herdr", "jev", "context_mode", "codebase_memory", "canary"):
+            assert run("get", f"helpers.{hid}")["value"] == p_res4[hid]
+        # idempotent on the flow line: probe again -> one flow line, same rows
+        p_res5 = run("probe")
+        after_block2 = rd()
+        re_probe2 = re.compile(r'probed_at: "[^"]*"')
+        assert re_probe2.sub("probed_at: X", after_block2) \
+            == re_probe2.sub("probed_at: X", after_block)
+        # and the file above and below the helpers line did not move
+        assert after_block.splitlines()[:fixture.rstrip("\n").count("\n") + 1] \
+            == block_style.splitlines()[:fixture.rstrip("\n").count("\n") + 1]
+
+        # (g) verify refuses a corrupt result: a patch that would orphan an indented child under
+        # an inline flow-map line fails and writes nothing
+        corrupt = fixture.replace("session:\n", "session:\n  stall_min: 15\nsessionx: { a: 1 }\n"
+                                        "  orphan: 2\n")
+        with open(yaml_path, "w") as f:
+            f.write(corrupt)
+        r = run("set", "session.stall_min", "20", ok=False)
+        assert "corrupt yaml" in r["error"] and "orphan" in r["error"], r
+        assert rd() == corrupt, "a corrupt-shaped result was written"
+        assert not os.path.exists(yaml_path + ".bak") or open(yaml_path + ".bak").read() != corrupt
+
+        # (h) review r1 MEDIUM: a claude that fails or times out leaves the MCP helpers stale
+        # (installed but unverified), never missing; a successful listing without a server's line
+        # is missing
+        with open(yaml_path, "w") as f:
+            f.write(fixture)
+        make_bin("claude", "#!/bin/sh\nexit 1\n")
+        p_res6 = run("probe")
+        assert p_res6["jev"] == "stale" and p_res6["context_mode"] == "stale" \
+            and p_res6["codebase_memory"] == "stale", p_res6
+        make_bin("claude", "#!/bin/sh\nsleep 45\n")  # longer than the 30 s probe timeout
+        t0 = time.time()
+        p_res7 = run("probe")
+        assert time.time() - t0 < 45, "the 30 s probe timeout did not fire"
+        assert p_res7["jev"] == "stale" and p_res7["canary"] in ("ok", "stale"), p_res7
+        make_bin("claude", "#!/bin/sh\necho 'something-else: connected'\nexit 0\n")
+        p_res8 = run("probe")
+        assert p_res8["jev"] == "missing" and p_res8["context_mode"] == "missing" \
+            and p_res8["codebase_memory"] == "missing", p_res8
+        # canary: failing npx is missing (spec), a timing-out npx is stale
+        make_bin("npx", "#!/bin/sh\nexit 1\n")
+        p_res9 = run("probe")
+        assert p_res9["canary"] == "missing", p_res9
+        make_bin("npx", "#!/bin/sh\nsleep 45\n")
+        p_res10 = run("probe")
+        assert p_res10["canary"] == "stale", p_res10
     finally:
         restore()
         shutil.rmtree(tmp, ignore_errors=True)

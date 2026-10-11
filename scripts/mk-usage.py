@@ -17,6 +17,7 @@ import importlib.util
 import json
 import os
 import re
+import select
 import shutil
 import subprocess
 import sys
@@ -36,7 +37,9 @@ def _load(name, path):
 try:
     mk_state = _load("mk_state", os.path.join(HERE, "mk-state.py"))
     mk_config = _load("mk_config", os.path.join(HERE, "mk-config.py"))
-except Exception:
+except Exception as e:
+    print(f"mk-usage: warning: mk-state/mk-config unavailable ({e}); yaml settings ignored",
+          file=sys.stderr)
     mk_state = None
     mk_config = None
 
@@ -1207,6 +1210,63 @@ def self_test_body():
                 os.environ.pop("MATRIXKODER_DATA", None)
             else:
                 os.environ["MATRIXKODER_DATA"] = old_env_data
+
+        # 13f. explicit --providers polls and does not skip when usage.source: manual is in yaml
+        with open(yaml_path, "w") as f:
+            f.write("usage:\n  source: manual\n  providers: [claude, antigravity]\n")
+        if os.path.exists(cb_log):
+            os.unlink(cb_log)
+        if os.path.exists(c3_ledger):
+            os.unlink(c3_ledger)
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), "--out", c3_ledger,
+                            "--providers", "codex"],
+                           env=c3_env, capture_output=True, text=True, cwd=c3_dir)
+        assert r.returncode == 0, r.stderr
+        polled_provs = open(cb_log).read().splitlines()
+        assert polled_provs == ["codex"], polled_provs
+        assert os.path.exists(c3_ledger), "explicit --providers must write usage.json even if usage.source=manual"
+        res_json = json.loads(r.stdout.strip())
+        assert res_json.get("ok") == ["codex"], res_json
+        assert "skipped" not in res_json
+
+        # 13g. --watch with usage.source: manual prints skip line once and loops without exiting immediately
+        with open(yaml_path, "w") as f:
+            f.write("usage:\n  source: manual\n  providers: [claude, antigravity]\n")
+        if os.path.exists(cb_log):
+            os.unlink(cb_log)
+        if os.path.exists(c3_ledger):
+            os.unlink(c3_ledger)
+        watch_proc = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--watch", "--interval", "0.05",
+             "--out", c3_ledger],
+            env=c3_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=c3_dir
+        )
+        try:
+            rlist, _, _ = select.select([watch_proc.stdout], [], [], 5.0)
+            assert rlist, "watch mode produced no output within 5s"
+            first_line = watch_proc.stdout.readline()
+            assert json.loads(first_line.strip()) == {"ok": True, "skipped": "usage.source=manual"}, first_line
+            assert not os.path.exists(c3_ledger), "usage.source: manual must leave usage.json untouched"
+            assert not os.path.exists(cb_log), "fake codexbar must not have run"
+            time.sleep(0.15)
+            assert watch_proc.poll() is None, "watch mode exited prematurely"
+            rlist, _, _ = select.select([watch_proc.stdout], [], [], 0.05)
+            assert not rlist, "watch mode printed more than once while usage.source: manual"
+            # Flipping source resumes polling
+            with open(yaml_path, "w") as f:
+                f.write("usage:\n  source: codexbar\n  providers: [claude]\n")
+            rlist, _, _ = select.select([watch_proc.stdout], [], [], 5.0)
+            assert rlist, "resumed watch mode produced no output within 5s"
+            resumed_line = watch_proc.stdout.readline()
+            assert "claude" in json.loads(resumed_line.strip()).get("ok", [])
+            assert os.path.exists(c3_ledger), "resumed polling must write usage.json"
+        finally:
+            watch_proc.terminate()
+            try:
+                watch_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                watch_proc.kill()
+                watch_proc.wait(timeout=5)
     finally:
         shutil.rmtree(c3_dir, ignore_errors=True)
 
@@ -1223,33 +1283,50 @@ def main():
     parser.add_argument("--out", help="Output path (default: ~/.matrixkoder/usage.json)")
     parser.add_argument("--once", action="store_true", default=True, help="Run once and exit (default)")
     parser.add_argument("--watch", action="store_true", help="Loop indefinitely")
-    parser.add_argument("--interval", type=int, default=300, help="Poll interval in seconds for --watch (default: 300)")
+    parser.add_argument("--interval", type=float, default=300, help="Poll interval in seconds for --watch (default: 300)")
 
     args = parser.parse_args()
 
-    yaml_cfg = load_yaml_config()
-    if yaml_cfg.get("source") == "manual":
-        print(json.dumps({"ok": True, "skipped": "usage.source=manual"}))
-        return 0
-
-    if args.providers:
-        providers = [p.strip() for p in args.providers.split(",") if p.strip()]
-    else:
-        providers = get_enabled_providers()
-
     out_path = args.out or default_ledger()
+    explicit_providers = (
+        [p.strip() for p in args.providers.split(",") if p.strip()]
+        if args.providers
+        else None
+    )
 
-    if args.watch:
-        try:
-            while True:
-                summary = poll_and_update(providers, out_path)
-                print(json.dumps(summary, separators=(",", ":")), flush=True)
-                time.sleep(args.interval)
-        except KeyboardInterrupt:
-            return 0
-    else:
+    if not args.watch:
+        if explicit_providers is not None:
+            providers = explicit_providers
+        else:
+            yaml_cfg = load_yaml_config()
+            if yaml_cfg.get("source") == "manual":
+                print(json.dumps({"ok": True, "skipped": "usage.source=manual"}), flush=True)
+                return 0
+            providers = get_enabled_providers()
+
         summary = poll_and_update(providers, out_path)
         print(json.dumps(summary, separators=(",", ":")), flush=True)
+        return 0
+
+    skipped_printed = False
+    try:
+        while True:
+            if explicit_providers is not None:
+                summary = poll_and_update(explicit_providers, out_path)
+                print(json.dumps(summary, separators=(",", ":")), flush=True)
+            else:
+                yaml_cfg = load_yaml_config()
+                if yaml_cfg.get("source") == "manual":
+                    if not skipped_printed:
+                        print(json.dumps({"ok": True, "skipped": "usage.source=manual"}), flush=True)
+                        skipped_printed = True
+                else:
+                    skipped_printed = False
+                    providers = get_enabled_providers()
+                    summary = poll_and_update(providers, out_path)
+                    print(json.dumps(summary, separators=(",", ":")), flush=True)
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
         return 0
 
 
