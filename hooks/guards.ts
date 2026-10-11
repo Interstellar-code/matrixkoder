@@ -183,7 +183,20 @@ function gitBan(ws: readonly string[]): Ban | undefined {
       const w = rest[j]
       if (!w || w === '--') break
       if (/^--am(e(nd?)?)?$/.test(w)) return { cmd: 'git commit --amend', why: 'history rewrite' }
-      if (COMMIT_VALUED.has(w) || /^-[a-zA-Z]*[mFCct]$/.test(w)) j++ // skip the message/value: `-m '--amend'`
+      if (COMMIT_VALUED.has(w)) { j++; continue } // long option: the next word is its value
+      // Short cluster, walked like git: the first value letter (m F C c t) ends the walk.
+      // Last letter → the next word is the value (skip one). More characters, or a space
+      // inside the word (`-m"fix test"` arrives as `-mfix test`), → attached value (skip nothing).
+      if (w.startsWith('-') && !w.startsWith('--')) {
+        const cluster = w.slice(1)
+        for (let k = 0; k < cluster.length; k++) {
+          const letter = cluster[k]
+          if (letter !== undefined && 'mFCct'.includes(letter)) {
+            if (k === cluster.length - 1 && !w.includes(' ')) j++
+            break
+          }
+        }
+      }
     }
     return undefined
   }
