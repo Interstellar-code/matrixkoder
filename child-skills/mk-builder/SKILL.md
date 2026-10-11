@@ -38,6 +38,18 @@ python3 ${CLAUDE_SKILL_DIR}/scripts/mk-builder.py start --run <run> --task <task
 
 `python3 ${CLAUDE_SKILL_DIR}/scripts/mk-builder.py done` — only once the report file exists at the `report` path given to `start` and the phase commit exists. It records HEAD and prints the token.
 
+## Asking the orchestrator
+
+When a real spec ambiguity blocks the task — not a design choice you could make and defend yourself — ask instead of guessing or stalling:
+
+```
+python3 ${CLAUDE_SKILL_DIR}/scripts/mk-builder.py ask "<question>"
+```
+
+`ask` blocks and returns the answer: it prints the answer text and exits 0, and while it waits the status file says `blocked`, so no STALL fires. `PENDING <ask id>` (exit 3) means the answer has not arrived within the timeout — run `wait <ask id>` to resume the same wait, and keep working only after it returns. `BUS DOWN: use the BLOCKED token` (exit 4) means the bus is unreachable — fall back to `blocked "<question>"` and end your reply with its token.
+
+Run `inbox` at step boundaries, right after each `progress` call: `progress` prints one extra line, `N unread — run inbox`, when messages are waiting; `inbox` prints them as JSON lines (acknowledging each) and prints nothing when there is nothing to read. `ack <msg id>` records a single message as read.
+
 ## Token rule
 
 The last stdout line of `done` / `blocked` is the line your reply must end with — alone on its line, after the commit and the report.
