@@ -9,7 +9,7 @@ import {
   tabsVisibilityToHidden, topChangelogEntry,
 } from './settings-io'
 import type { ConfigRowLite, RunFn, YamlFieldIn } from './settings-io'
-import { SETTINGS_FIXTURE } from './tabs/settings.fixture'
+import { SETTINGS_FIXTURE, SETTINGS_LIST_FIXTURE } from './tabs/settings.fixture'
 import { SETTINGS_SCHEMA } from './tabs/settings.schema'
 import type { SettingsField } from './tabs/settings'
 
@@ -228,7 +228,7 @@ test('S3 view: yaml fields group by scope; picks overlay; unknown shapes never b
   expect(view.groups.flatMap(g => g.rows).some(r => r.key === 'weird.scope')).toBe(false)
   expect(view.groups.flatMap(g => g.rows).some(r => r.key === 'weird.type')).toBe(false)
   expect(view.picks.find(p => p.agent === 'opencode')?.models).toEqual(['a', 'b']) // the picks.* overlay
-  expect(view.picks.find(p => p.agent === 'claude')?.models).toHaveLength(4) // the catalogue default stands
+  expect(view.picks.find(p => p.agent === 'claude')?.models).toEqual([]) // no pool: no default offered
   // globals by suffix: mode matched matrixkoder.mode, chip locked read-only
   const mode = view.groups.flatMap(g => g.rows).find(r => r.key === 'mode')
   expect(mode?.value).toBe('orchestrator')
@@ -236,6 +236,105 @@ test('S3 view: yaml fields group by scope; picks overlay; unknown shapes never b
   expect(mode?.default).toBe('orchestrator')
   const chip = view.groups.flatMap(g => g.rows).find(r => r.key === 'chip')
   expect(chip?.editable).toBe(false)
+})
+
+/** The pool a `picks.<agent>` row carries in the list fixture — the one list the
+ *  picker and `mk-config.py set` both read, so the test never restates it. */
+function fixturePool(agent: string): string[] {
+  const row = SETTINGS_LIST_FIXTURE.find(f => f.key === `picks.${agent}`)
+  return Array.isArray(row?.pool) ? (row?.pool as unknown[]).filter((x): x is string => typeof x === 'string') : []
+}
+
+test('W3.1 models: every option a picker shows is a model `set picks.<agent>` accepts', () => {
+  const view = buildSettingsView({
+    fields: [...SETTINGS_LIST_FIXTURE],
+    file: '',
+    configRows: [],
+    globalDefaults: {},
+    about: ABOUT,
+  })
+  // the offer IS the pool, per agent, in the pool's own order
+  for (const card of view.agents) {
+    expect(card.models.map(m => m.name)).toEqual(fixturePool(card.id))
+  }
+  expect(view.agents.map(a => a.id)).toEqual(['opencode', 'claude', 'agy', 'codex'])
+  // the reported failure (2026-10-11): a model no pool lists is not offered, so `set` cannot
+  // refuse it — the hard-coded catalogue offered exactly this one
+  expect(fixturePool('opencode')).not.toContain('opencode/step-5-preview-free')
+  for (const card of view.agents) {
+    expect(card.models.map(m => m.name)).not.toContain('opencode/step-5-preview-free')
+  }
+})
+
+test('W3.1 models: the defaults shown before a save are filtered to the pool', () => {
+  const view = buildSettingsView({
+    fields: [...SETTINGS_LIST_FIXTURE],
+    file: '',
+    configRows: [],
+    globalDefaults: {},
+    about: ABOUT,
+  })
+  expect(view.picks.find(p => p.agent === 'opencode')?.models).toEqual(
+    ['opencode/space-bunny-free', 'ollama-cloud/minimax-m3'])
+  // a row the answer carried no picks for falls back to the defaults, and a default outside
+  // the pool is dropped: opencode's defaults are ollama-cloud/minimax-m3,
+  // opencode/step-5-preview-free (in no pool) and opencode/space-bunny-free
+  const noValue = SETTINGS_LIST_FIXTURE.map(f => (
+    f.key === 'picks.opencode' ? { ...f, value: undefined } : f
+  ))
+  const draft = buildSettingsView({
+    fields: noValue,
+    file: '',
+    configRows: [],
+    globalDefaults: {},
+    about: ABOUT,
+  })
+  expect(draft.picks.find(p => p.agent === 'opencode')?.models).toEqual(
+    ['ollama-cloud/minimax-m3', 'opencode/space-bunny-free'])
+  // every default an agent would show is one its pool lists (nothing can be refused on save)
+  for (const p of draft.picks) {
+    for (const m of p.models) expect(fixturePool(p.agent)).toContain(m)
+  }
+  expect(view.picks.find(p => p.agent === 'opencode')?.editable).toBe(true)
+})
+
+test('W3.1 models: a picks row with no pool offers nothing rather than a catalogue', () => {
+  const view = buildSettingsView({
+    fields: [{ key: 'picks.opencode', scope: 'models', label: 'x', type: 'list', value: [], default: [], help: '', editable: true }],
+    file: '',
+    configRows: [],
+    globalDefaults: {},
+    about: ABOUT,
+  })
+  expect(view.agents.find(a => a.id === 'opencode')?.models).toEqual([])
+  expect(view.picks.find(p => p.agent === 'opencode')?.models).toEqual([])
+  // and an agent the yaml lists no row for at all is read-only, as before
+  expect(view.picks.find(p => p.agent === 'claude')?.editable).toBe(false)
+})
+
+test('W3.1 models: only the agents the yaml has switched on draw a card', () => {
+  // the user report behind this: the Agents scope showed AGY on while its Models card
+  // read "agent off in Agents · not routed", and Codex was off but still drew models
+  const avail = (name: string, on: boolean): YamlFieldIn => ({
+    key: `agents.${name}.available`, scope: 'agents', label: name, type: 'bool',
+    value: on, default: false, help: 'detected at bootstrap', editable: false,
+  })
+  const view = buildSettingsView({
+    fields: [...SETTINGS_LIST_FIXTURE, avail('agy', true), avail('codex', false)],
+    file: '',
+    configRows: [],
+    globalDefaults: {},
+    about: ABOUT,
+  })
+  expect(view.agents.map(a => a.id)).toEqual(['opencode', 'claude', 'agy'])
+  // an agent that is on is never labelled off beside it
+  expect(view.agents.every(a => a.off === false)).toBe(true)
+  expect(view.agents.find(a => a.id === 'agy')?.models.map(m => m.name)).toEqual(fixturePool('agy'))
+  // no availability row at all keeps the agent on (a yaml written before the row existed)
+  const noRows = buildSettingsView({
+    fields: [...SETTINGS_LIST_FIXTURE], file: '', configRows: [], globalDefaults: {}, about: ABOUT,
+  })
+  expect(noRows.agents.map(a => a.id)).toEqual(['opencode', 'claude', 'agy', 'codex'])
 })
 
 test('S3.2 about: version, latest tag, what is new, helpers fall back to not probed', () => {

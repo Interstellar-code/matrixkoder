@@ -115,6 +115,8 @@ export type YamlFieldIn = {
   max?: unknown
   unit?: unknown
   opts?: unknown
+  /** The models `set <key>` accepts: the pool the Models picker offers. */
+  pool?: unknown
   help: unknown
   editable: unknown
   why?: unknown
@@ -470,45 +472,18 @@ const PROJECTS: SettingsView['projects'] = [
   { name: 'hermes-desktop', since: '10-08', on: false },
 ]
 
-const AGENT_CATS: SettingsView['agents'] = [
-  {
-    id: 'opencode', name: 'OpenCode', provider: 'opencode · opencode-go · ollama-cloud', off: false,
-    models: [
-      { name: 'ollama-cloud/minimax-m3', note: 'paid' },
-      { name: 'opencode-go/kimi-k3', note: '$' },
-      { name: 'opencode/step-5-preview-free', note: 'free' },
-      { name: 'opencode/space-bunny-free', note: 'free' },
-      { name: 'opencode-go/claude-haiku-5-5', note: '$' },
-      { name: 'opencode/longcat-2.5-preview-free', note: 'free' },
-      { name: 'opencode/nemotron-3-ultra-free', note: 'free' },
-      { name: 'ollama-cloud/minimax-m2.7', note: '$' },
-    ],
-  },
-  {
-    id: 'claude', name: 'Claude Code', provider: 'anthropic subscription', off: false,
-    models: [
-      { name: 'claude-fable-5-1', note: 'sub' },
-      { name: 'claude-opus-5-5', note: 'sub' },
-      { name: 'claude-sonnet-5-5', note: 'sub' },
-      { name: 'claude-haiku-5-5', note: 'sub' },
-    ],
-  },
-  {
-    id: 'agy', name: 'AGY', provider: 'google', off: true,
-    models: [
-      { name: 'gemini-3.1-pro-high', note: 'sub' },
-      { name: 'gemini-3.8-flash-high', note: 'sub' },
-      { name: 'gemini-3.8-flash-medium', note: 'sub' },
-      { name: 'gemini-3.7-flash-low', note: 'sub' },
-    ],
-  },
-  {
-    id: 'codex', name: 'Codex', provider: 'openai', off: true,
-    models: [
-      { name: 'gpt-6.1-sol high', note: 'sub' },
-      { name: 'gpt-6.1-mini', note: 'sub' },
-    ],
-  },
+/** The agent cards the Models scope draws: who they are and where they run.
+ *  Their model options are NOT listed here — each card's options are its
+ *  `picks.<agent>` row's pool, the same list `set` accepts (below) — and
+ *  whether a card draws at all is the live `agents.<id>.available` row, not a
+ *  flag here: a flag can only contradict the Agents scope beside it. */
+type AgentCard = { id: string; name: string; provider: string }
+
+const AGENT_CARDS: readonly AgentCard[] = [
+  { id: 'opencode', name: 'OpenCode', provider: 'opencode · opencode-go · ollama-cloud' },
+  { id: 'claude', name: 'Claude Code', provider: 'anthropic subscription' },
+  { id: 'agy', name: 'AGY', provider: 'google' },
+  { id: 'codex', name: 'Codex', provider: 'openai' },
 ]
 
 const DEFAULT_PICKS: readonly { agent: string; models: readonly string[] }[] = [
@@ -517,6 +492,22 @@ const DEFAULT_PICKS: readonly { agent: string; models: readonly string[] }[] = [
   { agent: 'agy', models: [] },
   { agent: 'codex', models: [] },
 ]
+
+/** The models an agent's picker may offer: exactly its picks row's `pool` —
+ *  the list `mk-config.py set picks.<agent>` validates against. No row, no
+ *  pool, no options: a card never falls back to a catalogue `set` would refuse. */
+function poolOf(f: YamlFieldIn | undefined): readonly string[] {
+  const raw = f?.pool
+  if (!Array.isArray(raw)) return []
+  return raw.filter((x): x is string => typeof x === 'string' && x !== '')
+}
+
+/** Whether this tab may route an agent: its live `agents.<id>.available` row, absent = yes (a yaml
+ *  written before the row existed). The same reading `ModelsCards` takes for the `off` line, so the
+ *  two scopes cannot disagree about one agent. */
+function isAvailable(f: YamlFieldIn | undefined): boolean {
+  return f == null || toSettingsValue(f.value) !== false
+}
 
 /** A C1 unknown as the row value the tab draws (scalars pass, string lists
  *  pass, anything else stringifies — the render never crashes on it). */
@@ -581,8 +572,8 @@ export function buildSettingsView(args: {
     if (typeof f.key === 'string' && !byKey.has(f.key)) byKey.set(f.key, f)
   }
 
-  // yaml rows, grouped (picks.* handled with the catalogue below, models-scope
-  // fields the roster cannot place are ignored — the catalogue is static)
+  // yaml rows, grouped (picks.* and the Models scope are built from the pool below, so
+  // a models-scope field the roster cannot place is ignored rather than drawn twice)
   const grouped = new Map<string, SettingsField[]>()
   const pushRow = (scope: string, row: SettingsField): void => {
     const list = grouped.get(scope) ?? []
@@ -695,13 +686,15 @@ export function buildSettingsView(args: {
     }),
   })
 
-  // picks.* overlay the catalogue defaults (at most 4 — the C1 bound)
+  // picks.* overlay the defaults shown before any save, filtered to the same pool the picker
+  // offers — a default `set picks.<agent>` would refuse is not shown as a choice either
   const picks = DEFAULT_PICKS.map(p => {
     const f = byKey.get(`picks.${p.agent}`)
     const live = f != null && Array.isArray(f.value)
       ? (f.value as unknown[]).filter((x): x is string => typeof x === 'string').slice(0, 4)
       : null
-    return { agent: p.agent, models: live ?? p.models, editable: f != null }
+    const pool = poolOf(f)
+    return { agent: p.agent, models: live ?? p.models.filter(m => pool.includes(m)), editable: f != null }
   })
 
   return {
@@ -710,7 +703,9 @@ export function buildSettingsView(args: {
     groups,
     modes: MODES,
     projects: PROJECTS,
-    agents: AGENT_CATS,
+    agents: AGENT_CARDS
+      .filter(c => isAvailable(byKey.get(`agents.${c.id}.available`)))
+      .map(c => ({ ...c, off: false, models: poolOf(byKey.get(`picks.${c.id}`)).map(name => ({ name, note: '' })) })),
     picks,
     about: { installed: about.installed, latest: about.latest, latestNote: '', commits: about.whatsNew.length, whatsNew: about.whatsNew },
   }
