@@ -11,7 +11,9 @@
       nothing: new phase/task → added (the add path), changed title/wave/owned/deps on a
       planned|routed task → updated, on a started task → warning only, removed → warning (never
       deleted); --apply stores the new plan_sha and writes exactly ONE summary event. The last
-      plan-linked run set `done` → plan `set --status done` (best-effort, never fatal)
+      plan-linked run set `done` → plan `set --status done` (best-effort, never fatal).
+      The same transition promotes that run's `merged` and `qa` tasks to `done` (the task-set
+      path; one event each, note says the run close promoted them; best-effort, never fatal)
   run list | run get [--id ID | ID] | run set [--id ID] [--next TEXT] [--status active|done]
   run stage N [--id ID] | run archive --id ID | run archive ID
   task add --id T --title TEXT [--wave N] [--deps A,RUN:B] [--owned glob,glob] [--parent P]
@@ -678,6 +680,12 @@ def cmd_run(a, st):
                 run["next"] = a.next
             if a.status:
                 warn = set_run_status(st, run, a.status)
+                promoted, perr = [], None
+                if a.status == "done" and run["status"] == "done":
+                    try:
+                        promoted = promote_closed(st, run, a.by)
+                    except Exception as e:  # best-effort like the plan update: never fail run set
+                        perr = f"{type(e).__name__}: {e}"
         elif a.action == "stage":
             if a.n is None or a.n < 0:
                 raise Fail("run stage needs N >= 0")
@@ -686,7 +694,30 @@ def cmd_run(a, st):
         else:  # archive
             set_run_status(st, run, "archived")
         st.save(run)
-    return {"ok": True, "run": run, **({"warning": warn} if warn else {})}
+    out = {"ok": True, "run": run, **({"warning": warn} if warn else {})}
+    if a.action == "set" and a.status == "done":
+        out["promoted"] = promoted
+        if perr:
+            out["promote_error"] = perr
+    return out
+
+
+def promote_closed(st, run, by):
+    """On the transition to done: every task of THIS run at merged or qa becomes done, through
+    the same write as `task set` (one transition each; roll-up happens in the save that follows).
+    The note says the close promoted it. Other statuses and other runs are left alone. A task
+    that already is done is not an event. -> promoted ids."""
+    note = "promoted by closing the run"
+    promoted = []
+    for t in run.get("tasks") or []:
+        if t.get("status") not in ("merged", "qa") or not t.get("id"):
+            continue
+        frm = t["status"]
+        st.event(run, "transition", note, task=t["id"], frm=frm, to="done", by=by)
+        t["status"], t["updated"] = "done", now()
+        write_json(os.path.join(st.task_dir(run["id"], t["id"]), "task.json"), t)
+        promoted.append(t["id"])
+    return promoted
 
 
 def set_run_status(st, run, status):
@@ -2177,6 +2208,54 @@ def self_test():
         for bad in (["task", "set", "T", "--fo", "status=building"], ["task", "set", "T", "--b=evil"],
                     ["--dat", os.path.join(tmp, "sick"), "run", "list"]):
             assert sk(*bad, code=2)["ok"] is False, bad
+        # run set --status done promotes THIS run's merged and qa tasks to done
+        pd2 = ["--data", os.path.join(tmp, "promote")]
+        pm = lambda *x, code=0: mk(*x, *pd2, code=code, data_arg=False)
+        pm("run", "init", "--id", "close", "--feature", "Close", "--branch", "c")
+        pm("run", "init", "--id", "other", "--feature", "Other", "--branch", "o")
+        for tid, stt in (("M", "merged"), ("Q", "qa"), ("B", "building"),
+                         ("K", "blocked"), ("P", "planned")):
+            pm("task", "add", "--id", tid, "--title", tid, "--run", "close")
+            if stt != "planned":
+                pm("task", "set", tid, f"status={stt}", "--run", "close")
+        pm("task", "add", "--id", "PAR", "--title", "parent", "--run", "close")
+        pm("task", "add", "--id", "C1", "--title", "c1", "--parent", "PAR", "--run", "close")
+        pm("task", "add", "--id", "C2", "--title", "c2", "--parent", "PAR", "--run", "close")
+        pm("task", "set", "C1", "status=merged", "--run", "close")
+        pm("task", "set", "C2", "status=qa", "--run", "close")
+        # roll-up already lifted PAR to merged; put it back so the close promotes the
+        # children and the following save rolls the parent up to done (not a direct set)
+        rj = os.path.join(tmp, "promote", "runs", "close", "run.json")
+        run = json.load(open(rj))
+        par = next(t for t in run["tasks"] if t["id"] == "PAR")
+        assert par["status"] == "merged", par
+        par["status"] = "building"
+        write_json(rj, run)
+        write_json(os.path.join(tmp, "promote", "runs", "close", "tasks", "PAR", "task.json"), par)
+        pm("task", "add", "--id", "OM", "--title", "other merged", "--run", "other")
+        pm("task", "set", "OM", "status=merged", "--run", "other")
+        evp = os.path.join(tmp, "promote", "runs", "close", "events.jsonl")
+        n_ev = len(open(evp).readlines())
+        out = pm("run", "set", "--id", "close", "--status", "done")
+        assert out["ok"] and out["run"]["status"] == "done", out
+        assert out["promoted"] == ["M", "Q", "C1", "C2"], out
+        assert "promote_error" not in out, out
+        got = {t["id"]: t["status"] for t in pm("run", "get", "--id", "close")["run"]["tasks"]}
+        assert got["M"] == "done" and got["Q"] == "done", got
+        assert got["B"] == "building" and got["K"] == "blocked" and got["P"] == "planned", got
+        assert got["PAR"] == "done" and got["C1"] == "done" and got["C2"] == "done", got
+        assert pm("task", "get", "OM", "--run", "other")["task"]["status"] == "merged"
+        newev = [json.loads(x) for x in open(evp)][n_ev:]
+        promo = [e for e in newev if e.get("type") == "transition" and e.get("to") == "done"
+                 and e.get("text") == "promoted by closing the run"]
+        assert [e["task"] for e in promo] == ["M", "Q", "C1", "C2"], newev
+        assert all(e["from"] in ("merged", "qa") for e in promo), promo
+        again = pm("run", "set", "--id", "close", "--status", "done")
+        assert again["ok"] and again["promoted"] == [], again
+        assert "promote_error" not in again
+        tail = [json.loads(x) for x in open(evp)][n_ev + len(newev):]
+        assert not [e for e in tail if e.get("to") == "done"], tail  # no second promotion
+
         print("mk-state self-test ok")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
