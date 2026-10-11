@@ -23,7 +23,11 @@ folder-trust prompt for every task. A slot is a persistent checkout reused acros
 takes the lowest free clean slot, release detaches it back to the integration branch. Names are
 computed here, so no agent invents one. `lanes: copy: [...]` names gitignored paths a slot needs
 (.env, generated types): they are copied from the main checkout on every acquire — a reused slot
-gets only the targets it is missing, an existing target is never overwritten.
+gets only the targets it is missing, an existing target is never overwritten. Every acquire also
+refreshes the lane's own tooling: stale top-level `.matrixkoder-*` reports move into
+`.matrixkoder-old-<run>/` first (archived, never deleted), then the plugin's child-skills/mk-builder/
+is copied to <slot>/.claude/skills/mk-builder (overwritten, so the version always matches the
+plugin) with an executable git guard at <slot>/.matrixkoder-bin/git.
 
 This tool belongs to the ORCHESTRATOR: it runs `git switch` inside a slot, only after the slot is
 verified clean and never with force. Builders never run it. It owns <data>/lanes.json (outside runs/);
@@ -45,8 +49,12 @@ ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")  # run/task ids after lowercasi
 LOCKFILES = ("pnpm-lock.yaml", "package-lock.json", "yarn.lock", "bun.lock", "bun.lockb",
              "uv.lock", "poetry.lock", "Cargo.lock")
 # Ignored entries a slot may keep between tasks; anything else is a pause item, never discarded.
+# `.claude/` AND `.claude/skills/mk-builder/` (both, never just one): with only the ignored skill
+# dir inside it, git collapses the status entry to `!! .claude/`, which the dir pattern alone does
+# not match; when other untracked .claude/ content makes git descend, the entry names the skill dir
+# instead. Both entries, so both shapes read disposable.
 DISPOSABLE = (".matrixkoder-*", ".env", ".env.*", "node_modules/", ".omc/", ".omo/", ".serena/",
-              ".venv/", "__pycache__/")
+              ".venv/", "__pycache__/", ".claude/", ".claude/skills/mk-builder/")
 # The build-cache dirs every package/venv path ends with: allowed as a path component at any depth,
 # so a monorepo's packages/a/node_modules/ does not read as dirty. Everything else stays root-only.
 ANY_DEPTH = ("node_modules/", "__pycache__/", ".venv/")
@@ -58,6 +66,13 @@ DISPOSABLE_RE = re.compile(r"[A-Za-z0-9._-]+/?")
 COPY_RE = re.compile(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*/?")
 LOCK_TIMEOUT = 30.0
 GIT_TIMEOUT, HERDR_TIMEOUT = 120, 300
+# The lane tooling acquire installs: the plugin's own mk-builder skill copy and its git guard,
+# resolved from the script's own directory (the plugin root is its parent) so the copy works from
+# any cwd. A missing source is a hard Fail, never a lane without its guard.
+SKILL_SRC = os.path.join(os.path.dirname(HERE), "child-skills", "mk-builder")
+GUARD_SRC = os.path.join(SKILL_SRC, "scripts", "git-guard")
+# Top-level `.matrixkoder-*` files that are never stale: the current brief and the watch state.
+LANE_KEEP_FILES = (".matrixkoder-brief.md", ".matrixkoder-watch.json", ".matrixkoder-watch.lock")
 DEFAULTS = {"slots": 1, "pattern": "../{repo}-mk-{n}", "reuse": True, "cap": 3, "disposable": [],
             "copy": [], "integration_branch": "main"}
 
@@ -394,8 +409,10 @@ def herdr_list_workspace_id(main, path):
 
 
 def ensure_lane_exclude(lane):
-    """`.matrixkoder-*` and `.omo/` into the slot's info/exclude (same pattern as
-    mk-lane-event.py): lane reports and agent state never read as untracked in a slot."""
+    """`.matrixkoder-*`, `.omo/` and the installed skill dir into the slot's info/exclude (same
+    pattern as mk-lane-event.py): lane reports, agent state and the skill install never read as
+    untracked in a slot. Only missing patterns are appended, so calling it on every acquire stays
+    idempotent — a reused slot created by an older version catches up on the new entries."""
     with contextlib.suppress(OSError):
         r = run_cmd(["git", "-C", lane, "rev-parse", "--git-path", "info/exclude"], 5)
         if r.returncode == 0 and r.stdout.strip():
@@ -403,7 +420,8 @@ def ensure_lane_exclude(lane):
             ep = ep if os.path.isabs(ep) else os.path.join(lane, ep)
             if os.path.exists(os.path.dirname(ep)):
                 cur = open(ep).read() if os.path.exists(ep) else ""
-                add = [e for e in (".matrixkoder-*", ".omo/") if e not in cur]
+                add = [e for e in (".matrixkoder-*", ".omo/", ".claude/skills/mk-builder/")
+                       if e not in cur]
                 if add:
                     with open(ep, "a") as f:
                         f.write("".join(e + "\n" for e in add))
@@ -708,6 +726,63 @@ def copy_into_slot(cfg, main, lane):
     return warns
 
 
+def archive_stale_lane_files(lane, run):
+    """Every top-level `.matrixkoder-*` FILE except the brief and the watch state moves into
+    <lane>/.matrixkoder-old-<run>/ before the install writes its own: a report from an earlier
+    round would otherwise sit next to the fresh ones and read as this round's. Moved (shutil.move),
+    never deleted; directories (.matrixkoder-bin/, an older archive) stay put; a name that already
+    exists in the archive keeps both under a numeric suffix. Deterministic: names are visited
+    sorted, and with nothing stale no archive dir appears at all. -> the archive dir, or None."""
+    if not os.path.isdir(lane):
+        return None  # a herdr that answered ok but created no worktree: nothing to archive
+    old = os.path.join(lane, f".matrixkoder-old-{run}")
+    for name in sorted(os.listdir(lane)):
+        p = os.path.join(lane, name)
+        if not name.startswith(".matrixkoder-") or name in LANE_KEEP_FILES or not os.path.isfile(p):
+            continue
+        os.makedirs(old, exist_ok=True)
+        dst, i = os.path.join(old, name), 1
+        while os.path.exists(dst):
+            i += 1
+            dst = os.path.join(old, f"{name}.{i}")
+        shutil.move(p, dst)
+    return old if os.path.isdir(old) else None
+
+
+def install_lane_skill(lane):
+    """The mk-builder skill copy and its git guard into the slot, on EVERY acquire: overwrite, not
+    merge — an existing install is always this tool's own untracked, excluded, disposable dir, and
+    a wholesale replace is the only way the slot's version always matches the plugin. A missing
+    source is a hard Fail (a lane silently missing its guard is worse than a refused acquire) and
+    leaves no half-installed skill dir behind. -> (skill dir, guard path), both absolute."""
+    skill = os.path.join(lane, ".claude", "skills", "mk-builder")
+    guard = os.path.join(lane, ".matrixkoder-bin", "git")
+    if not os.path.isdir(lane):
+        # a herdr that answered ok but created no worktree: report the intended destinations,
+        # install nothing (creating the path implicitly would poison the next pick_slot), and
+        # let the acquire through exactly as before — the next real acquire installs for real.
+        return skill, guard
+    if not os.path.isdir(SKILL_SRC):
+        raise Fail(f"mk-builder skill source {SKILL_SRC} not found in the plugin")
+    if not os.path.isfile(GUARD_SRC):
+        raise Fail(f"git-guard source {GUARD_SRC} not found in the plugin")
+    skill = os.path.join(lane, ".claude", "skills", "mk-builder")
+    if os.path.islink(skill) or os.path.isfile(skill):
+        os.unlink(skill)
+    elif os.path.isdir(skill):
+        shutil.rmtree(skill)
+    try:
+        shutil.copytree(SKILL_SRC, skill)
+        os.makedirs(os.path.join(lane, ".matrixkoder-bin"), exist_ok=True)
+        guard = os.path.join(lane, ".matrixkoder-bin", "git")
+        shutil.copy2(GUARD_SRC, guard)
+        os.chmod(guard, 0o755)  # copy2 keeps the source mode; chmod guarantees the executable bit
+    except (OSError, shutil.Error) as e:
+        shutil.rmtree(skill, ignore_errors=True)  # no partial install left behind
+        raise Fail(f"mk-builder skill install into {lane} failed: {type(e).__name__}: {e}"[:400])
+    return skill, guard
+
+
 def remove_slot(n, rec, main):
     """Drop the slot's worktree: herdr (which also removes the ignored files) or plain git. Never
     forced, and never with commits only this slot's HEAD knows about: `git worktree remove` deletes the
@@ -772,6 +847,13 @@ def cmd_acquire(a, cfg, data, main):
             require_no_stray(n, rec["path"])
             git(["-C", rec["path"], "switch", "--detach", base])
             git(["-C", rec["path"], "switch", "-c", rec["branch"]])  # an existing branch fails here
+        # the lane's own tooling refreshes on EVERY acquire, fresh slot or reused: the exclude
+        # entries first (a reused slot created by an older version never got the new ones), then
+        # the stale-report archive — before the install, so old reports never sit next to the new
+        # — then the skill copy + guard, overwritten so the version always matches the plugin.
+        ensure_lane_exclude(rec["path"])
+        archive_stale_lane_files(rec["path"], rid)
+        skill_dst, guard_dst = install_lane_skill(rec["path"])
         # lanes.copy runs on EVERY acquire: a fresh slot gets everything, a reused slot only the
         # targets it is missing — an existing target is never overwritten (copy_into_slot).
         warns += copy_into_slot(cfg, main, rec["path"])
@@ -792,7 +874,8 @@ def cmd_acquire(a, cfg, data, main):
         write_lanes(data, lanes)
         out = {"ok": True, "slot": n, "path": rec["path"], "workspace": rec["workspace"],
                "workspace_id": rec["workspace_id"], "branch": rec["branch"],
-               "agent": nms["agent"], "created": created, "install_needed": install_needed}
+               "agent": nms["agent"], "created": created, "install_needed": install_needed,
+               "skill_installed": skill_dst, "guard_path": guard_dst}
         if len(tasks) > 1:
             out["tasks"] = tasks
         for t in tasks:
@@ -1116,14 +1199,19 @@ def self_test():
         a1 = mk("acquire", "--run", "r1", "--task", "t1", "--base", "main")
         assert a1 == {"ok": True, "slot": 1, "path": slot1, "workspace": "mk:repo:1",
                       "workspace_id": None, "branch": "mk/r1/t1", "agent": "t1-build-r1",
-                      "created": True, "install_needed": True}, a1
+                      "created": True, "install_needed": True,
+                      "skill_installed": os.path.join(slot1, ".claude/skills/mk-builder"),
+                      "guard_path": os.path.join(slot1, ".matrixkoder-bin/git")}, a1
         assert os.path.isdir(slot1)
         assert g("-C", slot1, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "mk/r1/t1"
         assert mk("list")["slots"][0]["state"] == "busy"
-        # the slot's info/exclude carries both lane entries (.omo/ is not in .gitignore at all)
+        # the slot's info/exclude carries the lane entries (.omo/ is not in .gitignore at all),
+        # including the installed skill dir — without it the install would read as untracked
         ep = g("-C", slot1, "rev-parse", "--git-path", "info/exclude").stdout.strip()
         ep = ep if os.path.isabs(ep) else os.path.join(slot1, ep)
-        assert ".matrixkoder-*" in open(ep).read() and ".omo/" in open(ep).read()
+        excl = open(ep).read()
+        assert ".matrixkoder-*" in excl and ".omo/" in excl
+        assert ".claude/skills/mk-builder/" in excl
         t = st("task", "get", "t1")["task"]
         assert (t["lane"], t["branch"], t["workspace"], t["slot"]) == (slot1, "mk/r1/t1", "mk:repo:1", "1"), t
 
@@ -1196,6 +1284,62 @@ def self_test():
         write(os.path.join(slot1, ".matrixkoder-report-r1.md"), "report\n")
         assert mk("list")["slots"][0]["clean"] is True
         assert mk("release", "--slot", "1", "--integration", "mk/r1/integration")["ok"]
+        assert mk("acquire", "--run", "r1", "--task", "t5", "--base", "mk/r1/integration")["ok"]
+        # (that acquire also archived the report file from the lines above — its own old dir)
+        assert os.listdir(os.path.join(slot1, ".matrixkoder-old-r1")) == [".matrixkoder-report-r1.md"]
+
+        # 6b the acceptance case, on a REUSED free slot: four stale top-level reports plus the
+        # brief and watch state; acquire must archive the four into .matrixkoder-old-r1/ (moved,
+        # never deleted) and install skill + guard. The stale files are `.matrixkoder-*` — ignored
+        # via the exclude, disposable — so require_clean never refuses the slot.
+        shutil.rmtree(os.path.join(slot1, ".matrixkoder-old-r1"))  # reset the fixture from above
+        assert mk("release", "--slot", "1", "--integration", "mk/r1/integration")["ok"]
+        stale_files = {".matrixkoder-report-r1.md": "stale report\n",
+                       ".matrixkoder-review-r1.md": "stale review\n",
+                       ".matrixkoder-status.json": '{"stale": true}\n',
+                       ".matrixkoder-old-code.patch": "--- stale\n"}
+        for name, body in stale_files.items():
+            write(os.path.join(slot1, name), body)
+        write(os.path.join(slot1, ".matrixkoder-brief.md"), "# brief\n")
+        write(os.path.join(slot1, ".matrixkoder-watch.json"), '{"watch": 1}\n')
+        write(os.path.join(slot1, ".matrixkoder-watch.lock"), "")
+        old1 = os.path.join(slot1, ".matrixkoder-old-r1")
+        skill_dst = os.path.join(slot1, ".claude", "skills", "mk-builder")
+        guard_dst = os.path.join(slot1, ".matrixkoder-bin", "git")
+        src_skill = os.path.join(os.path.dirname(HERE), "child-skills", "mk-builder")
+        st("task", "add", "--id", "t6a", "--title", "archive case a", "--run", "r1")
+        acq1 = mk("acquire", "--run", "r1", "--task", "t6a", "--base", "main")
+        assert (acq1["ok"], acq1["skill_installed"], acq1["guard_path"]) == \
+            (True, skill_dst, guard_dst), acq1
+        # the four stale files sit in the archive, byte-identical; only brief + watch remain at
+        # top level among `.matrixkoder-*` FILES (the archive and .matrixkoder-bin/ are dirs)
+        assert sorted(os.listdir(old1)) == sorted(stale_files), os.listdir(old1)
+        for name, body in stale_files.items():
+            assert open(os.path.join(old1, name), "rb").read() == body.encode(), name
+        top_files = sorted(x for x in os.listdir(slot1) if x.startswith(".matrixkoder-")
+                           and os.path.isfile(os.path.join(slot1, x)))
+        assert top_files == [".matrixkoder-brief.md", ".matrixkoder-watch.json",
+                             ".matrixkoder-watch.lock"], top_files
+        # the install matches the plugin source, and the guard is executable
+        assert open(os.path.join(skill_dst, "SKILL.md"), "rb").read() == \
+            open(os.path.join(src_skill, "SKILL.md"), "rb").read()
+        assert open(guard_dst, "rb").read() == \
+            open(os.path.join(src_skill, "scripts", "git-guard"), "rb").read()
+        assert os.access(guard_dst, os.X_OK)
+        # release still passes its clean check with the installed skill dir + guard present
+        assert mk("release", "--slot", "1", "--integration", "mk/r1/integration")["ok"]
+        # a second acquire on the clean slot is idempotent: same fields, byte-identical install,
+        # and no duplicate archive content (nothing stale was left to move a second time)
+        st("task", "add", "--id", "t6b", "--title", "archive case b", "--run", "r1")
+        acq2 = mk("acquire", "--run", "r1", "--task", "t6b", "--base", "main")
+        assert (acq2["ok"], acq2["skill_installed"], acq2["guard_path"]) == \
+            (True, skill_dst, guard_dst), acq2
+        assert sorted(os.listdir(old1)) == sorted(stale_files), os.listdir(old1)
+        assert open(os.path.join(skill_dst, "SKILL.md"), "rb").read() == \
+            open(os.path.join(src_skill, "SKILL.md"), "rb").read()
+        assert os.access(guard_dst, os.X_OK)
+        assert mk("release", "--slot", "1", "--integration", "mk/r1/integration")["ok"]
+        # back on t5 at the integration tip, the state case 8 below expects
         assert mk("acquire", "--run", "r1", "--task", "t5", "--base", "mk/r1/integration")["ok"]
 
         # 7 a nested build-cache dir is disposable at any depth; the same names at the root stay
