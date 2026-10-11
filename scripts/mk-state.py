@@ -744,15 +744,7 @@ class Store:
             with open(tmp, "w") as f:
                 f.write(str(max(ids)) + "\n")
             os.replace(tmp, marker_path)
-        run_path = os.path.join(self.run_dir(rid), "run.json")
-        if os.path.exists(run_path):
-            try:
-                with open(run_path) as f:
-                    json.load(f)
-            except ValueError as e:
-                # the file-path load names JSONDecodeError; the store-on contract names ValueError
-                raise ValueError(str(e))
-        write_json(run_path, view)
+        write_json(os.path.join(self.run_dir(rid), "run.json"), view)
         for t in view.get("tasks") or []:
             if t.get("id"):
                 write_json(os.path.join(self.task_dir(rid, t["id"]), "task.json"), t)
@@ -781,9 +773,17 @@ class Store:
         finally:
             con.close()
         latest = row["m"] or 0
-        if self._view_marker(rid) == latest and latest:
+        run_path = os.path.join(self.run_dir(rid), "run.json")
+        view_bad = not os.path.exists(run_path)
+        if not view_bad:
+            try:
+                with open(run_path) as f:
+                    json.load(f)
+            except ValueError:
+                view_bad = True
+        if not view_bad and self._view_marker(rid) == latest and latest:
             return
-        if latest == 0:
+        if latest == 0 and not view_bad:
             return
         self.publish(self.load_store(rid))
 
@@ -1194,7 +1194,9 @@ def cmd_run(a, st):
         return {"ok": True, "run": run, **({"warnings": warnings} if warnings else {})}
     a.run = a.run or getattr(a, "pos_id", None)
     if a.action == "get":
-        return {"ok": True, "run": st.load(a.run)}
+        with st.locked():
+            st.repair()
+            return {"ok": True, "run": st.load(a.run)}
     if a.action == "archive" and not a.run:
         raise Fail("run archive needs --id")
     warn = None
@@ -3183,22 +3185,43 @@ def store_self_test(tmp, env):
     body = json.loads(lines[0])
     assert body["ok"] is False and body["error"].startswith("IsADirectoryError"), body
 
-    # a corrupt run.json with the store on is one JSON line naming ValueError
+    # with the store on, a corrupt or missing view is repaired from the store
     corrupt = os.path.join(tmp, "corrupt")
     once(["run", "init", "--id", "c1", "--feature", "C", "--branch", "bc"], corrupt)
     once(["task", "add", "--id", "T", "--title", "Tee", "--run", "c1"], corrupt)
     once(["store", "enable"], corrupt)
-    with open(os.path.join(corrupt, "runs", "c1", "run.json"), "w") as f:
+    runp = os.path.join(corrupt, "runs", "c1", "run.json")
+    boardp = os.path.join(corrupt, "runs", "c1", "board.md")
+    evp = os.path.join(corrupt, "runs", "c1", "events.jsonl")
+    with open(runp, "w") as f:
         f.write("{not json")
+    with open(boardp, "w") as f:
+        f.write("# truncated")
+    ev_before = open(evp).read().splitlines()
+    open(evp, "w").write("\n".join(ev_before[:-1]) + ("\n" if len(ev_before) > 1 else ""))
+    # the marker still says every store row was published; drop it so the missing tail is appended
+    os.remove(os.path.join(corrupt, "runs", "c1", ".store-event"))
     r = subprocess.run([sys.executable, os.path.abspath(__file__), "task", "set", "T",
                         "status=building", "--run", "c1", "--data", corrupt],
                        capture_output=True, text=True, env=env)
-    assert r.returncode == 2, (r.returncode, r.stdout, r.stderr)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
     assert "Traceback" not in r.stderr, r.stderr
     lines = r.stdout.strip().splitlines()
     assert len(lines) == 1, r.stdout
     body = json.loads(lines[0])
-    assert body["ok"] is False and body["error"].startswith("ValueError"), body
+    assert body["ok"] is True, body
+    repaired = json.load(open(runp))
+    assert next(t["status"] for t in repaired["tasks"] if t["id"] == "T") == "building"
+    assert open(boardp).read().count("\n") > 1 and "truncated" not in open(boardp).read()
+    ev_after = open(evp).read().splitlines()
+    assert ev_after[:len(ev_before) - 1] == ev_before[:-1]  # the kept prefix was not rewritten
+    assert len(ev_after) > len(ev_before) - 1  # the missing tail came back, then the new event
+    # a deleted run.json is rewritten too
+    os.remove(runp)
+    r = subprocess.run([sys.executable, os.path.abspath(__file__), "run", "get", "--id", "c1",
+                        "--data", corrupt], capture_output=True, text=True, env=env)
+    assert r.returncode == 0 and json.loads(r.stdout)["ok"] is True, r.stdout
+    assert json.load(open(runp))["id"] == "c1"
 
 
 if __name__ == "__main__":
