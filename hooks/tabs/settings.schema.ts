@@ -212,6 +212,41 @@ export const SETTINGS_SCHEMA = {
       "key": "agents.herdr.available",
       "scope": "agents",
       "type": "bool"
+    },
+    {
+      "default": "not probed",
+      "editable": false,
+      "key": "helpers.herdr",
+      "scope": "about",
+      "type": "seg"
+    },
+    {
+      "default": "not probed",
+      "editable": false,
+      "key": "helpers.jev",
+      "scope": "about",
+      "type": "seg"
+    },
+    {
+      "default": "not probed",
+      "editable": false,
+      "key": "helpers.context_mode",
+      "scope": "about",
+      "type": "seg"
+    },
+    {
+      "default": "not probed",
+      "editable": false,
+      "key": "helpers.codebase_memory",
+      "scope": "about",
+      "type": "seg"
+    },
+    {
+      "default": "not probed",
+      "editable": false,
+      "key": "helpers.canary",
+      "scope": "about",
+      "type": "seg"
     }
   ],
   "userConfig": {
