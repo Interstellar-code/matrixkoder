@@ -550,9 +550,17 @@ def changed_lines(old, new):
     return n
 
 
+def is_block_scalar(raw):
+    """True when a key line's inline value is a YAML block-scalar indicator (`|`, `>`, with
+    optional chomping/indent modifiers and optional comment) — its deeper-indented lines are the
+    scalar's text, not orphans."""
+    return bool(re.match(r"^\s*[|>](?:[+-]?[0-9]?|[0-9]?[+-]?)?\s*(?:#.*)?$", raw))
+
+
 def check_structure(reread):
     """Refuse corrupt yaml: no duplicate top-level sections, and no orphan child lines
-    (no line indented deeper than a preceding key line that has an inline scalar/flow-map value)."""
+    (no line indented deeper than a preceding key line that has an inline scalar/flow-map value;
+    block-scalar values own their deeper-indented lines)."""
     seen_top = set()
     prev_key = None
     for i, raw in enumerate(reread):
@@ -570,14 +578,14 @@ def check_structure(reread):
                 seen_top.add(k)
             if prev_key is not None:
                 prev_i, prev_indent, prev_k, prev_rest = prev_key
-                if strip_comment(prev_rest).strip() and indent > prev_indent:
+                if strip_comment(prev_rest).strip() and not is_block_scalar(prev_rest) and indent > prev_indent:
                     raise Fail(f"corrupt yaml: orphan child line {i + 1} `{k}:` indented deeper than inline `{prev_k}:` (line {prev_i + 1})")
             prev_key = (i, indent, k, rest)
         else:
             indent = len(raw) - len(raw.lstrip())
             if prev_key is not None:
                 prev_i, prev_indent, prev_k, prev_rest = prev_key
-                if strip_comment(prev_rest).strip() and indent > prev_indent:
+                if strip_comment(prev_rest).strip() and not is_block_scalar(prev_rest) and indent > prev_indent:
                     raise Fail(f"corrupt yaml: orphan child line {i + 1} indented deeper than inline `{prev_k}:` (line {prev_i + 1})")
 
 
@@ -1026,7 +1034,13 @@ def cmd_probe(path, lines):
             # a block-style `helpers:` section is replaced whole: its indented children would be
             # orphaned under the new flow-map line and corrupt the file
             sr = section_range(lines, kl, ["helpers"])
-            new[i:sr[3]] = [helpers_line + eol]
+            end = sr[3]
+            while end > sr[2]:
+                body = strip_comment(lines[end - 1]).strip()
+                if body:
+                    break
+                end -= 1
+            new[i:end] = [helpers_line + eol]
         else:
             new[i] = helpers_line + eol
     else:
@@ -1567,6 +1581,44 @@ def self_test():
         make_bin("npx", "#!/bin/sh\nsleep 45\n")
         p_res10 = run("probe")
         assert p_res10["canary"] == "stale", p_res10
+        # (i) review r2 HIGH: a key whose inline value is a block-scalar indicator owns its
+        # deeper-indented lines — set and probe succeed and the block text is byte-identical;
+        # a `- item` list under a mapping key stays accepted (the orphan refusal is pinned by (g))
+        block_scalar = ("session:\n  stall_min: 15\nnote: |\n  folded text\n"
+                        "picks:\n  opencode:\n    - alpha\n    - beta\n"
+                        "repo:\n  integration_branch: main\n")
+        with open(yaml_path, "w") as f:
+            f.write(block_scalar)
+        run("set", "session.stall_min", "20")
+        after_bs = rd()
+        assert "note: |\n  folded text\n" in after_bs, after_bs
+        assert "    - alpha\n    - beta\n" in after_bs, after_bs
+        assert after_bs.count("  stall_min: 20\n") == 1, after_bs
+        make_bin("herdr", "#!/bin/sh\nexit 0\n")
+        make_bin("claude", "#!/bin/sh\necho 'jev: connected'\nexit 0\n")
+        make_bin("npx", "#!/bin/sh\nexit 0\n")
+        p_bs = run("probe")
+        assert p_bs["ok"] is True and p_bs["herdr"] == "ok", p_bs
+        after_bs2 = rd()
+        assert "note: |\n  folded text\n" in after_bs2, after_bs2
+        assert "    - alpha\n    - beta\n" in after_bs2, after_bs2
+        assert after_bs2.count("  stall_min: 20\n") == 1, after_bs2
+
+        # (j) review r2 MEDIUM: probe's block-style branch keeps trailing blank and comment
+        # lines after the helpers section byte-identical
+        trailing = ("helpers:\n  herdr: ok\n  jev: ok\n\n# keep\n"
+                    "repo:\n  integration_branch: main\n")
+        with open(yaml_path, "w") as f:
+            f.write(trailing)
+        p_tr = run("probe")
+        assert p_tr["ok"] is True, p_tr
+        after_tr = rd()
+        flow_tr = [l for l in after_tr.splitlines() if l.startswith("helpers: {")]
+        assert len(flow_tr) == 1, after_tr
+        assert "  herdr: ok\n" not in after_tr, f"old child survived:\n{after_tr}"
+        assert "\n# keep\n" in after_tr, f"trailing comment lost:\n{after_tr}"
+        assert after_tr.endswith("repo:\n  integration_branch: main\n"), after_tr
+        assert after_tr.index("\n# keep\n") < after_tr.index("repo:"), after_tr
     finally:
         restore()
         shutil.rmtree(tmp, ignore_errors=True)
