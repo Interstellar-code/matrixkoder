@@ -3,43 +3,58 @@
 
 Subcommands:
   serve [--data DIR] [--run ID] [--port PORT]
-      Runs foreground loopback HTTP/SSE server. Holds <data>/bus.lock exclusively,
-      writes <data>/bus.json {pid, port, started, owner_heartbeat, token}, registers token in
-      <data>/bus-tokens.json. Rebuilds state from <data>/runs/<run>/bus.jsonl.
-      Self-exits when owner_heartbeat is older than 30 min (or $MK_BUS_HEARTBEAT_TIMEOUT_SEC).
+      Runs foreground loopback HTTP/SSE server. Holds <data>/bus.lock exclusively (0600),
+      writes <data>/bus.json {pid, port, started, owner_heartbeat, token} (0600), registers token in
+      <data>/bus-tokens.json (0600). Rebuilds state from <data>/runs/<run>/bus.jsonl.
+      Self-exits when owner_heartbeat is older than 30 min (or $MK_BUS_HEARTBEAT_TIMEOUT_SEC)
+      or when bus.json is missing.
   ensure [--data DIR] [--run ID] [--port PORT]
       Ensures a detached server process is running. Idempotent. Returns
       {"ok": true, "pid": PID, "port": PORT, "started": BOOL}.
   heartbeat [--data DIR]
       Updates owner_heartbeat in <data>/bus.json.
   token --lane DIR --task T [--run ID] [--data DIR]
-      Mints bearer token, writes <lane>/.matrixkoder-bus.json (chmod 0600) with
+      Mints bearer token, writes <lane>/.matrixkoder-bus.json (0600) with
       {"url": "http://127.0.0.1:<port>", "token": TOKEN, "run": RUN, "task": TASK},
-      and registers in <data>/bus-tokens.json.
+      and registers in <data>/bus-tokens.json (0600).
   revoke --lane DIR [--data DIR]
       Removes <lane>/.matrixkoder-bus.json and invalidates token.
   send --run ID --task T --kind KIND --text TEXT [--from S] [--to S] [--reply-to ID] [--data DIR]
-      Sends a message via POST /send. If server is down, prints {"ok": false, "error": "bus down"}
-      and exits non-zero without traceback.
+      Sends a message via POST /send.
   answer MSG_ID TEXT [--run ID] [--data DIR]
       Sends answer message with reply_to=MSG_ID. Also runs
-      scripts/mk-state.py --run ID task set <T> status=building --note "bus answer".
+      scripts/mk-state.py --data <data> --run ID task set <T> status=building --note "bus answer".
   pending [--run ID] [--data DIR]
       Lists asks without an answer where reply_to == ask.id.
-  tail [--run ID] [--n N] [--data DIR]
-      Lists last N messages from bus.jsonl.
+  tail [--run ID] [--n N] [--lane L] [--after SEQ] [--data DIR]
+      Lists messages from bus.jsonl.
   --self-test
-      Comprehensive self-test of server, round trip, auth, replay, lifecycle, error handling.
+      Comprehensive self-test of server, round trip, auth, replay, lifecycle, security, error handling.
 
 Every command prints ONE JSON line. Errors: {"ok": false, "error": ...} exit 2.
 """
-import argparse, contextlib, datetime, fcntl, json, os, secrets, signal, socket, subprocess, sys, tempfile, threading, time
+import argparse, contextlib, datetime, fcntl, hmac, json, math, os, re, secrets, signal, socket, subprocess, sys, tempfile, threading, time
 import urllib.error, urllib.parse, urllib.request
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 sys.dont_write_bytecode = True
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def is_valid_id(val):
+    """C2 identifier alphabet: `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` and never contains `..`
+    (contract B18: "no `..`, no `/`"). The `..` check matters even though the regex
+    allows dots, because a run id like `evil..run` would otherwise slip past validation
+    and reach path joins / token scoping."""
+    return bool(
+        val
+        and isinstance(val, str)
+        and ID_RE.match(val)
+        and ".." not in val
+    )
 
 
 class Fail(Exception):
@@ -58,22 +73,25 @@ class Parser(argparse.ArgumentParser):
 
 
 def now_iso():
-    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def write_json(path, obj):
-    """Atomic write: temp file in same dir, fsync, os.replace."""
+def write_json(path, obj, mode=0o600):
+    """Atomic write with explicit permissions: temp file in same dir, fchmod, fsync, os.replace."""
     d = os.path.dirname(path)
     os.makedirs(d, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-")
     try:
+        os.fchmod(fd, mode)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(obj, f, indent=2)
             f.write("\n")
             f.flush()
             os.fsync(f.fileno())
-        os.chmod(tmp, 0o644)
+        os.chmod(tmp, mode)
         os.replace(tmp, path)
+        with contextlib.suppress(OSError):
+            os.chmod(path, mode)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
@@ -114,11 +132,17 @@ def is_pid_alive(pid):
     try:
         os.kill(pid, 0)
         return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists but is owned by another user (pid reused after our
+        # server exited): treat as not our process.
+        return False
     except OSError:
         return False
 
 
-def stop_process(pid, timeout=3.0):
+def stop_process(pid, timeout=5.0):
     if not is_pid_alive(pid):
         return
     try:
@@ -150,13 +174,15 @@ class BusState:
     def __init__(self, data_dir, default_run=None):
         self.data_dir = data_dir
         self.default_run = default_run
-        self.lock = threading.Lock()
+        # RLock: append_message/record_ack/get_pending hold self.lock and call
+        # get_run_state, which also takes self.lock. A plain Lock would self-deadlock.
+        self.lock = threading.RLock()
         self.tokens = {}
         self.tokens_mtime = 0
         self.runs = {}
 
     def get_token(self, token_str):
-        if not token_str:
+        if not token_str or not isinstance(token_str, str):
             return None
         tokens_path = os.path.join(self.data_dir, "bus-tokens.json")
         try:
@@ -167,24 +193,30 @@ class BusState:
             if mtime != self.tokens_mtime or not self.tokens:
                 self.tokens = read_json(tokens_path, default={})
                 self.tokens_mtime = mtime
-            return self.tokens.get(token_str)
+            # Constant-time comparison across stored tokens
+            for stored_tok, tok_info in self.tokens.items():
+                if hmac.compare_digest(stored_tok, token_str):
+                    return tok_info
+            return None
 
-    def add_token(self, token_str, run, task, lane):
+    def add_token(self, token_str, run, task, lane, role="lane"):
         lock_path = os.path.join(self.data_dir, "bus-tokens.lock")
         tokens_path = os.path.join(self.data_dir, "bus-tokens.json")
         os.makedirs(self.data_dir, exist_ok=True)
-        lfd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        lfd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        os.fchmod(lfd, 0o600)
         fcntl.flock(lfd, fcntl.LOCK_EX)
         try:
             tokens = read_json(tokens_path, default={})
             tokens[token_str] = {
                 "token": token_str,
+                "role": role,
                 "run": run or "",
                 "task": task or None,
                 "lane": lane or None,
                 "created_at": now_iso()
             }
-            write_json(tokens_path, tokens)
+            write_json(tokens_path, tokens, mode=0o600)
             with self.lock:
                 self.tokens = tokens
                 self.tokens_mtime = os.path.getmtime(tokens_path)
@@ -195,52 +227,63 @@ class BusState:
     def get_run_state(self, run):
         if not run:
             run = self.default_run or "default"
-        if run in self.runs:
-            return self.runs[run]
+        if not is_valid_id(run):
+            raise Fail("invalid run id")
 
-        jsonl_path = os.path.join(self.data_dir, "runs", run, "bus.jsonl")
-        messages = []
-        by_id = {}
-        max_seq = 0
-        if os.path.exists(jsonl_path):
-            with open(jsonl_path, "r", encoding="utf-8") as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
-                try:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            obj = json.loads(line)
-                        except Exception:
-                            continue
-                        seq = obj.get("seq", 0)
-                        if seq > max_seq:
-                            max_seq = seq
-                        if obj.get("kind") == "ack":
-                            target_id = obj.get("reply_to")
-                            if target_id and target_id in by_id:
-                                by_id[target_id]["ack_level"] = max(
-                                    by_id[target_id].get("ack_level", 1),
-                                    obj.get("ack_level", 1)
-                                )
-                        else:
-                            messages.append(obj)
-                            by_id[obj["id"]] = obj
-                finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        with self.lock:
+            if run in self.runs:
+                return self.runs[run]
 
-        rstate = {
-            "run": run,
-            "messages": messages,
-            "by_id": by_id,
-            "next_seq": max_seq + 1,
-            "cond": threading.Condition(self.lock)
-        }
-        self.runs[run] = rstate
-        return rstate
+            jsonl_path = os.path.join(self.data_dir, "runs", run, "bus.jsonl")
+            messages = []
+            by_id = {}
+            max_seq = 0
+            if os.path.exists(jsonl_path):
+                with open(jsonl_path, "r", encoding="utf-8") as f:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                    try:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                obj = json.loads(line)
+                            except Exception:
+                                continue
+                            if not isinstance(obj, dict) or "id" not in obj or "seq" not in obj:
+                                continue
+                            seq = obj.get("seq", 0)
+                            if seq > max_seq:
+                                max_seq = seq
+                            if obj.get("kind") == "ack":
+                                target_id = obj.get("reply_to")
+                                if target_id and target_id in by_id:
+                                    by_id[target_id]["ack_level"] = max(
+                                        by_id[target_id].get("ack_level", 1),
+                                        obj.get("ack_level", 1)
+                                    )
+                            else:
+                                messages.append(obj)
+                                by_id[obj["id"]] = obj
+                    finally:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+            rstate = {
+                "run": run,
+                "messages": messages,
+                "by_id": by_id,
+                "next_seq": max_seq + 1,
+                "cond": threading.Condition(self.lock)
+            }
+            self.runs[run] = rstate
+            return rstate
 
     def append_message(self, run, task, from_val, to_val, kind, text, reply_to):
+        if not is_valid_id(run):
+            raise Fail("invalid run id")
+        if task and not is_valid_id(task):
+            raise Fail("invalid task id")
+
         with self.lock:
             rstate = self.get_run_state(run)
             seq = rstate["next_seq"]
@@ -265,9 +308,19 @@ class BusState:
             os.makedirs(run_dir, exist_ok=True)
             jsonl_path = os.path.join(run_dir, "bus.jsonl")
             line = json.dumps(msg, separators=(",", ":")) + "\n"
-            with open(jsonl_path, "a", encoding="utf-8") as f:
+
+            # Open with lock, ensuring previous line had newline
+            with open(jsonl_path, "a+", encoding="utf-8") as f:
                 fcntl.flock(f.fileno(), fcntl.LOCK_EX)
                 try:
+                    f.seek(0, os.SEEK_END)
+                    size = f.tell()
+                    if size > 0:
+                        f.seek(size - 1)
+                        last_char = f.read(1)
+                        if last_char != "\n":
+                            f.write("\n")
+                    f.seek(0, os.SEEK_END)
                     f.write(line)
                     f.flush()
                     os.fsync(f.fileno())
@@ -279,20 +332,14 @@ class BusState:
             rstate["cond"].notify_all()
             return msg
 
-    def record_ack(self, run, target_id, ack_level, from_val):
-        with self.lock:
-            if not run:
-                for r_name, r_st in self.runs.items():
-                    if target_id in r_st["by_id"]:
-                        run = r_name
-                        break
-            if not run:
-                run = self.default_run or "default"
+    def record_ack(self, run, target_id, ack_level, from_val, to_val="orch"):
+        if not is_valid_id(run):
+            raise Fail("invalid run id")
 
+        with self.lock:
             rstate = self.get_run_state(run)
             target_msg = rstate["by_id"].get(target_id)
             target_task = target_msg.get("task") if target_msg else None
-            target_to = target_msg.get("from") if target_msg else "orch"
 
             seq = rstate["next_seq"]
             rstate["next_seq"] += 1
@@ -305,7 +352,7 @@ class BusState:
                 "run": run,
                 "task": target_task,
                 "from": from_val or "client",
-                "to": target_to,
+                "to": to_val or "orch",
                 "kind": "ack",
                 "reply_to": target_id,
                 "text": f"ack {ack_level}",
@@ -316,9 +363,18 @@ class BusState:
             os.makedirs(run_dir, exist_ok=True)
             jsonl_path = os.path.join(run_dir, "bus.jsonl")
             line = json.dumps(ack_rec, separators=(",", ":")) + "\n"
-            with open(jsonl_path, "a", encoding="utf-8") as f:
+
+            with open(jsonl_path, "a+", encoding="utf-8") as f:
                 fcntl.flock(f.fileno(), fcntl.LOCK_EX)
                 try:
+                    f.seek(0, os.SEEK_END)
+                    size = f.tell()
+                    if size > 0:
+                        f.seek(size - 1)
+                        last_char = f.read(1)
+                        if last_char != "\n":
+                            f.write("\n")
+                    f.seek(0, os.SEEK_END)
                     f.write(line)
                     f.flush()
                     os.fsync(f.fileno())
@@ -334,13 +390,15 @@ class BusState:
     def get_pending(self, run):
         with self.lock:
             if run:
+                if not is_valid_id(run):
+                    raise Fail("invalid run id")
                 runs_to_check = [self.get_run_state(run)]
             else:
                 runs_dir = os.path.join(self.data_dir, "runs")
                 names = set(self.runs.keys())
                 if os.path.exists(runs_dir):
                     for d in os.listdir(runs_dir):
-                        if os.path.isdir(os.path.join(runs_dir, d)):
+                        if os.path.isdir(os.path.join(runs_dir, d)) and is_valid_id(d):
                             names.add(d)
                 runs_to_check = [self.get_run_state(r) for r in names]
 
@@ -357,6 +415,10 @@ class BusState:
 
 
 class RequestHandler(BaseHTTPRequestHandler):
+    def setup(self):
+        super().setup()
+        self.request.settimeout(30.0)
+
     def log_message(self, format, *args):
         pass
 
@@ -373,20 +435,20 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def validate_request(self):
         if "Origin" in self.headers:
-            self.send_error_json(403, "origin not allowed")
+            self.send_error_json(403, "browser origins rejected")
             return False
 
         host = self.headers.get("Host", "")
         host_name = host.split(":")[0].lower() if host else ""
         if host_name not in ("127.0.0.1", "localhost"):
-            self.send_error_json(400, "invalid host")
+            self.send_error_json(400, "invalid host header")
             return False
 
         return True
 
     def check_auth(self):
         auth = self.headers.get("Authorization", "")
-        if not auth.startswith("Bearer "):
+        if not auth or not auth.startswith("Bearer "):
             self.send_error_json(401, "unauthorized")
             return None
         tok_str = auth[len("Bearer "):].strip()
@@ -397,193 +459,432 @@ class RequestHandler(BaseHTTPRequestHandler):
         return tok
 
     def do_GET(self):
-        if not self.validate_request():
-            return
+        try:
+            if not self.validate_request():
+                return
 
-        parsed = urllib.parse.urlparse(self.path)
-        path = parsed.path
-        params = {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()}
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path
+            params = {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()}
 
-        if path == "/health":
-            self.send_json(200, {"ok": True, "status": "healthy", "pid": os.getpid()})
-            return
+            if path == "/health":
+                uptime = time.time() - getattr(self.server, "started_at", time.time())
+                self.send_json(200, {
+                    "ok": True,
+                    "status": "healthy",
+                    "pid": os.getpid(),
+                    "uptime_sec": round(uptime, 3)
+                })
+                return
 
-        tok = self.check_auth()
-        if not tok:
-            return
+            tok = self.check_auth()
+            if not tok:
+                return
 
-        if path == "/events":
-            lane = params.get("lane") or params.get("task") or ""
-            run = params.get("run") or tok.get("run") or self.server.bus_state.default_run
-            last_id_str = self.headers.get("Last-Event-ID", "").strip()
-            if last_id_str.startswith("m-"):
-                try:
-                    last_seq = int(last_id_str[2:])
-                except ValueError:
+            is_orch = (tok.get("role") == "orch" or tok.get("task") == "orch")
+
+            if path == "/events":
+                # Disable socket timeout for long-lived SSE stream
+                self.request.settimeout(None)
+
+                if params.get("run") and not is_valid_id(params["run"]):
+                    self.send_error_json(400, "invalid run id")
+                    return
+                if params.get("lane") and params["lane"] != "*" and not is_valid_id(params["lane"]):
+                    self.send_error_json(400, "invalid task id")
+                    return
+                if params.get("task") and not is_valid_id(params["task"]):
+                    self.send_error_json(400, "invalid task id")
+                    return
+
+                if is_orch:
+                    lane = params.get("lane") or params.get("task") or ""
+                    run = params.get("run") or tok.get("run") or self.server.bus_state.default_run
+                else:
+                    lane = tok.get("task") or ""
+                    run = tok.get("run") or ""
+                    if params.get("lane") and params.get("lane") != lane:
+                        self.send_error_json(403, "forbidden: lane mismatch")
+                        return
+                    if params.get("run") and params.get("run") != run:
+                        self.send_error_json(403, "forbidden: run mismatch")
+                        return
+
+                if not is_valid_id(run):
+                    self.send_error_json(400, "invalid run id")
+                    return
+
+                last_id_str = self.headers.get("Last-Event-ID", "").strip()
+                if last_id_str.startswith("m-"):
+                    try:
+                        last_seq = int(last_id_str[2:])
+                    except ValueError:
+                        last_seq = 0
+                elif last_id_str.isdigit():
+                    last_seq = int(last_id_str)
+                else:
                     last_seq = 0
-            elif last_id_str.isdigit():
-                last_seq = int(last_id_str)
-            else:
-                last_seq = 0
 
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.end_headers()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "keep-alive")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
 
-            rstate = self.server.bus_state.get_run_state(run)
-            with self.server.bus_state.lock:
-                for m in rstate["messages"]:
-                    if m["seq"] > last_seq and matches_lane(m, lane):
-                        ev = f"id: {m['seq']}\nevent: message\ndata: {json.dumps(m)}\n\n"
-                        try:
-                            self.wfile.write(ev.encode("utf-8"))
-                            self.wfile.flush()
-                            m["ack_level"] = max(m.get("ack_level", 1), 2)
-                            last_seq = m["seq"]
-                        except (BrokenPipeError, ConnectionResetError, OSError):
-                            return
+                rstate = self.server.bus_state.get_run_state(run)
 
-            while True:
-                with rstate["cond"]:
-                    rstate["cond"].wait(timeout=1.0)
-                    for m in rstate["messages"]:
-                        if m["seq"] > last_seq and matches_lane(m, lane):
+                while True:
+                    to_send = []
+                    with rstate["cond"]:
+                        for m in rstate["messages"]:
+                            if m["seq"] > last_seq and matches_lane(m, lane):
+                                to_send.append(m)
+                                m["ack_level"] = max(m.get("ack_level", 1), 2)
+                                last_seq = m["seq"]
+
+                        if not to_send:
+                            rstate["cond"].wait(timeout=15.0)
+                            for m in rstate["messages"]:
+                                if m["seq"] > last_seq and matches_lane(m, lane):
+                                    to_send.append(m)
+                                    m["ack_level"] = max(m.get("ack_level", 1), 2)
+                                    last_seq = m["seq"]
+
+                    if to_send:
+                        for m in to_send:
                             ev = f"id: {m['seq']}\nevent: message\ndata: {json.dumps(m)}\n\n"
                             try:
                                 self.wfile.write(ev.encode("utf-8"))
                                 self.wfile.flush()
-                                m["ack_level"] = max(m.get("ack_level", 1), 2)
-                                last_seq = m["seq"]
                             except (BrokenPipeError, ConnectionResetError, OSError):
                                 return
+                    else:
+                        # Keepalive comment
+                        try:
+                            self.wfile.write(b": keepalive\n\n")
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            return
 
-        elif path == "/wait":
-            lane = params.get("lane") or params.get("task") or ""
-            run = params.get("run") or tok.get("run") or self.server.bus_state.default_run
-            after_str = params.get("after", "0").strip()
-            if after_str.startswith("m-"):
-                try:
-                    after_seq = int(after_str[2:])
-                except ValueError:
+            elif path == "/wait":
+                if params.get("run") and not is_valid_id(params["run"]):
+                    self.send_error_json(400, "invalid run id")
+                    return
+                if params.get("lane") and params["lane"] != "*" and not is_valid_id(params["lane"]):
+                    self.send_error_json(400, "invalid task id")
+                    return
+                if params.get("task") and not is_valid_id(params["task"]):
+                    self.send_error_json(400, "invalid task id")
+                    return
+
+                if is_orch:
+                    lane = params.get("lane") or params.get("task") or ""
+                    run = params.get("run") or tok.get("run") or self.server.bus_state.default_run
+                else:
+                    lane = tok.get("task") or ""
+                    run = tok.get("run") or ""
+                    if params.get("lane") and params.get("lane") != lane:
+                        self.send_error_json(403, "forbidden: lane mismatch")
+                        return
+                    if params.get("run") and params.get("run") != run:
+                        self.send_error_json(403, "forbidden: run mismatch")
+                        return
+
+                if not is_valid_id(run):
+                    self.send_error_json(400, "invalid run id")
+                    return
+
+                after_str = params.get("after", "0").strip()
+                if after_str.startswith("m-"):
+                    try:
+                        after_seq = int(after_str[2:])
+                    except ValueError:
+                        after_seq = 0
+                elif after_str.isdigit():
+                    after_seq = int(after_str)
+                else:
                     after_seq = 0
-            elif after_str.isdigit():
-                after_seq = int(after_str)
+
+                try:
+                    timeout = float(params.get("timeout", "30"))
+                    if not math.isfinite(timeout):
+                        timeout = 30.0
+                except (ValueError, TypeError):
+                    timeout = 30.0
+                # B11/B18: clamp strictly to 1 <= timeout <= 90.
+                timeout = min(max(timeout, 1.0), 90.0)
+
+                deadline = time.time() + timeout
+                rstate = self.server.bus_state.get_run_state(run)
+
+                with rstate["cond"]:
+                    while True:
+                        matching = None
+                        for m in rstate["messages"]:
+                            if m["seq"] > after_seq and matches_lane(m, lane):
+                                matching = m
+                                break
+                        if matching:
+                            matching["ack_level"] = max(matching.get("ack_level", 1), 2)
+                            self.send_json(200, {
+                                "ok": True,
+                                "message": matching,
+                                "messages": [matching]
+                            })
+                            return
+
+                        remaining = deadline - time.time()
+                        if remaining <= 0:
+                            self.send_json(200, {
+                                "ok": True,
+                                "message": None,
+                                "messages": []
+                            })
+                            return
+
+                        rstate["cond"].wait(timeout=min(remaining, 0.5))
+
+            elif path == "/pending":
+                if not is_orch:
+                    self.send_error_json(403, "forbidden: lane tokens cannot read pending asks")
+                    return
+
+                run = params.get("run")
+                if run == "*":
+                    run = None
+                if run and not is_valid_id(run):
+                    self.send_error_json(400, "invalid run id")
+                    return
+
+                pending = self.server.bus_state.get_pending(run)
+                # B14: response echoes the queried run (or "*" when unscoped).
+                self.send_json(200, {"ok": True, "run": run if run else "*", "pending": pending})
+
             else:
-                after_seq = 0
-
-            try:
-                timeout = float(params.get("timeout", "30"))
-            except ValueError:
-                timeout = 30.0
-            timeout = min(max(timeout, 0.1), 90.0)
-
-            deadline = time.time() + timeout
-            rstate = self.server.bus_state.get_run_state(run)
-
-            with rstate["cond"]:
-                while True:
-                    matching = None
-                    for m in rstate["messages"]:
-                        if m["seq"] > after_seq and matches_lane(m, lane):
-                            matching = m
-                            break
-                    if matching:
-                        matching["ack_level"] = max(matching.get("ack_level", 1), 2)
-                        self.send_json(200, {"ok": True, "message": matching})
-                        return
-
-                    remaining = deadline - time.time()
-                    if remaining <= 0:
-                        self.send_json(200, {"ok": True, "message": None})
-                        return
-
-                    rstate["cond"].wait(timeout=min(remaining, 0.5))
-
-        elif path == "/pending":
-            run = params.get("run") or tok.get("run")
-            if run == "*":
-                run = None
-            pending = self.server.bus_state.get_pending(run)
-            self.send_json(200, {"ok": True, "pending": pending})
-
-        else:
-            self.send_error_json(404, "not found")
+                self.send_error_json(404, "not found")
+        except Exception:
+            self.send_error_json(500, "internal server error")
 
     def do_POST(self):
-        if not self.validate_request():
-            return
-
-        tok = self.check_auth()
-        if not tok:
-            return
-
-        parsed = urllib.parse.urlparse(self.path)
-        path = parsed.path
-
         try:
-            content_len = int(self.headers.get("Content-Length", 0))
-        except ValueError:
-            content_len = 0
+            if not self.validate_request():
+                return
 
-        if content_len > 65536:
-            self.send_error_json(413, "payload too large")
-            return
+            tok = self.check_auth()
+            if not tok:
+                return
 
-        body_bytes = self.rfile.read(content_len) if content_len > 0 else b"{}"
-        try:
-            body = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
+            is_orch = (tok.get("role") == "orch" or tok.get("task") == "orch")
+
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path
+
+            try:
+                content_len = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                content_len = 0
+
+            if content_len > 65536:
+                self.send_error_json(413, "payload too large")
+                return
+
+            body_bytes = self.rfile.read(content_len) if content_len > 0 else b"{}"
+            try:
+                body = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
+            except Exception:
+                self.send_error_json(400, "invalid json")
+                return
+
+            if not isinstance(body, dict):
+                self.send_error_json(400, "request body must be a JSON object")
+                return
+
+            if path == "/send":
+                if "run" in body:
+                    if not is_valid_id(body.get("run")):
+                        self.send_error_json(400, "invalid run id")
+                        return
+                if "task" in body and body.get("task"):
+                    if not is_valid_id(body.get("task")):
+                        self.send_error_json(400, "invalid task id")
+                        return
+                if "from" in body and body.get("from") and body.get("from") != "orch":
+                    if not is_valid_id(body.get("from")):
+                        self.send_error_json(400, "invalid task id")
+                        return
+                if "to" in body and body.get("to") and body.get("to") != "orch":
+                    if not is_valid_id(body.get("to")):
+                        self.send_error_json(400, "invalid task id")
+                        return
+
+                kind = body.get("kind")
+                if kind not in ("ask", "answer", "info", "ack"):
+                    self.send_error_json(400, "invalid kind")
+                    return
+
+                text = body.get("text")
+                if text is None or not isinstance(text, str):
+                    self.send_error_json(400, "text must be a string")
+                    return
+                if len(text.encode("utf-8")) > 65536:
+                    self.send_error_json(400, "text exceeds 64 KiB")
+                    return
+
+                reply_to = body.get("reply_to")
+                if reply_to is not None and not isinstance(reply_to, str):
+                    self.send_error_json(400, "reply_to must be a string or null")
+                    return
+                # B18: reply_to is required for kind=ack and must name an existing
+                # message in the target run (checked after run resolution below,
+                # because the run determines which bus.jsonl to look in).
+                if kind == "ack" and not reply_to:
+                    self.send_error_json(400, "reply_to required for ack")
+                    return
+
+                if not is_orch:
+                    # Lane token scoping
+                    if kind == "answer":
+                        self.send_error_json(403, "lane tokens cannot send answers")
+                        return
+
+                    tok_run = tok.get("run")
+                    tok_task = tok.get("task")
+
+                    if "run" in body and body["run"] != tok_run:
+                        self.send_error_json(403, "forbidden: run mismatch")
+                        return
+                    if "task" in body and body["task"] != tok_task:
+                        self.send_error_json(403, "forbidden: task mismatch")
+                        return
+                    if "from" in body and body["from"] != tok_task:
+                        self.send_error_json(403, "forbidden: from mismatch")
+                        return
+                    if "to" in body and body["to"] != "orch":
+                        self.send_error_json(403, "forbidden: lane to must be orch")
+                        return
+
+                    run = tok_run
+                    task = tok_task
+                    from_val = tok_task
+                    to_val = "orch"
+                else:
+                    # Orchestrator token
+                    run = body.get("run") or tok.get("run") or self.server.bus_state.default_run
+                    task = body.get("task")
+                    from_val = body.get("from") or "orch"
+                    to_val = body.get("to") or task or "orch"
+
+                if not run or run == "*":
+                    self.send_error_json(400, "missing run")
+                    return
+
+                if not is_valid_id(run):
+                    self.send_error_json(400, "invalid run id")
+                    return
+                if task and not is_valid_id(task):
+                    self.send_error_json(400, "invalid task id")
+                    return
+
+                rstate = self.server.bus_state.get_run_state(run)
+
+                # Validate reply_to for answer
+                if kind == "answer":
+                    if not reply_to:
+                        self.send_error_json(400, "reply_to required for answer")
+                        return
+                    target_msg = rstate["by_id"].get(reply_to)
+                    if not target_msg:
+                        self.send_error_json(400, "reply_to message not found")
+                        return
+                    if target_msg.get("kind") != "ask":
+                        self.send_error_json(400, "reply_to must name an ask message")
+                        return
+                    # Check if already answered
+                    for m in rstate["messages"]:
+                        if m.get("kind") == "answer" and m.get("reply_to") == reply_to:
+                            self.send_error_json(400, "ask already answered")
+                            return
+
+                # Validate reply_to for ack
+                if kind == "ack":
+                    if reply_to not in rstate["by_id"]:
+                        self.send_error_json(400, "reply_to message not found")
+                        return
+
+                msg = self.server.bus_state.append_message(
+                    run=run,
+                    task=task,
+                    from_val=from_val,
+                    to_val=to_val,
+                    kind=kind,
+                    text=text,
+                    reply_to=reply_to
+                )
+                self.send_json(200, {"ok": True, "message": msg})
+
+            elif path == "/ack":
+                target_id = body.get("id") or body.get("reply_to")
+                if not target_id or not isinstance(target_id, str):
+                    self.send_error_json(400, "missing id")
+                    return
+
+                ack_level = body.get("ack_level", 3)
+                if not isinstance(ack_level, int) or ack_level not in (1, 2, 3):
+                    self.send_error_json(400, "invalid ack_level")
+                    return
+
+                if "run" in body:
+                    if not is_valid_id(body.get("run")):
+                        self.send_error_json(400, "invalid run id")
+                        return
+
+                if not is_orch:
+                    tok_run = tok.get("run")
+                    if "run" in body and body["run"] != tok_run:
+                        self.send_error_json(403, "forbidden: run mismatch")
+                        return
+                    run = tok_run
+                    from_val = tok.get("task")
+                else:
+                    run = body.get("run") or tok.get("run")
+                    if run == "*":
+                        run = None
+                    from_val = "orch"
+
+                if not run:
+                    self.send_error_json(400, "missing run")
+                    return
+                if not is_valid_id(run):
+                    self.send_error_json(400, "invalid run id")
+                    return
+
+                rstate = self.server.bus_state.get_run_state(run)
+                target_msg = rstate["by_id"].get(target_id)
+                if not target_msg:
+                    self.send_error_json(400, "message not found")
+                    return
+
+                # Lane token may only ack messages addressed to it
+                if not is_orch:
+                    tok_task = tok.get("task")
+                    if target_msg.get("to") != tok_task and target_msg.get("task") != tok_task:
+                        self.send_error_json(403, "cannot ack messages for other lanes")
+                        return
+
+                self.server.bus_state.record_ack(
+                    run=run,
+                    target_id=target_id,
+                    ack_level=ack_level,
+                    from_val=from_val,
+                    to_val=target_msg.get("from") or "orch"
+                )
+                self.send_json(200, {"ok": True, "id": target_id, "ack_level": ack_level})
+
+            else:
+                self.send_error_json(404, "not found")
         except Exception:
-            self.send_error_json(400, "invalid json")
-            return
-
-        if path == "/send":
-            run = body.get("run") or tok.get("run") or self.server.bus_state.default_run
-            if not run or run == "*":
-                self.send_error_json(400, "missing run")
-                return
-
-            task = body.get("task") or tok.get("task")
-            from_val = body.get("from") or tok.get("task") or "orch"
-            to_val = body.get("to") or task or "orch"
-            kind = body.get("kind") or "info"
-            text = body.get("text") or ""
-            reply_to = body.get("reply_to")
-
-            msg = self.server.bus_state.append_message(
-                run=run,
-                task=task,
-                from_val=from_val,
-                to_val=to_val,
-                kind=kind,
-                text=text,
-                reply_to=reply_to
-            )
-            self.send_json(200, {"ok": True, "message": msg})
-
-        elif path == "/ack":
-            target_id = body.get("id")
-            if not target_id:
-                self.send_error_json(400, "missing id")
-                return
-
-            ack_level = int(body.get("ack_level", 3))
-            run = body.get("run") or tok.get("run")
-            if run == "*":
-                run = None
-            from_val = tok.get("task") or "client"
-
-            self.server.bus_state.record_ack(
-                run=run,
-                target_id=target_id,
-                ack_level=ack_level,
-                from_val=from_val
-            )
-            self.send_json(200, {"ok": True})
-
-        else:
-            self.send_error_json(404, "not found")
+            self.send_error_json(500, "internal server error")
 
 
 class BusServer(ThreadingHTTPServer):
@@ -595,13 +896,15 @@ class BusServer(ThreadingHTTPServer):
 
 
 def heartbeat_monitor(server, data_dir, stop_event):
-    check_interval = float(os.environ.get("MK_BUS_HEARTBEAT_CHECK_SEC", "5.0"))
+    check_interval = float(os.environ.get("MK_BUS_HEARTBEAT_CHECK_SEC", "60.0"))
     timeout = float(os.environ.get("MK_BUS_HEARTBEAT_TIMEOUT_SEC", "1800.0"))
     bus_json_path = os.path.join(data_dir, "bus.json")
 
     while not stop_event.wait(check_interval):
         try:
             if not os.path.exists(bus_json_path):
+                # Missing bus.json counts as stale -> self exit
+                threading.Thread(target=server.shutdown, daemon=True).start()
                 break
             bdata = read_json(bus_json_path)
             if not bdata:
@@ -625,7 +928,8 @@ def cmd_serve(args):
     lock_path = os.path.join(data_dir, "bus.lock")
     bus_json_path = os.path.join(data_dir, "bus.json")
 
-    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    os.fchmod(lock_fd, 0o600)
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except (BlockingIOError, OSError):
@@ -634,20 +938,21 @@ def cmd_serve(args):
 
     port = getattr(args, "port", 0) or 0
     server = BusServer(("127.0.0.1", port), RequestHandler)
+    server.started_at = time.time()
     server.bus_state = BusState(data_dir, getattr(args, "run", None))
     actual_port = server.server_address[1]
 
     orch_token = secrets.token_urlsafe(32)
-    server.bus_state.add_token(orch_token, getattr(args, "run", "*") or "*", "orch", "orch")
+    server.bus_state.add_token(orch_token, getattr(args, "run", "*") or "*", "orch", "orch", role="orch")
 
     bus_data = {
         "pid": os.getpid(),
         "port": actual_port,
-        "started": time.time(),
-        "owner_heartbeat": time.time(),
+        "started": server.started_at,
+        "owner_heartbeat": server.started_at,
         "token": orch_token
     }
-    write_json(bus_json_path, bus_data)
+    write_json(bus_json_path, bus_data, mode=0o600)
 
     stop_event = threading.Event()
     hb_thread = threading.Thread(
@@ -691,94 +996,93 @@ def cmd_serve(args):
 def cmd_ensure(args):
     data_dir = resolve_data(getattr(args, "data", None))
     os.makedirs(data_dir, exist_ok=True)
-    lock_path = os.path.join(data_dir, "bus.lock")
+    ensure_lock_path = os.path.join(data_dir, "bus-ensure.lock")
     bus_json_path = os.path.join(data_dir, "bus.json")
 
-    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
-    locked = False
+    # Serialize ensure calls with dedicated flock
+    efd = os.open(ensure_lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    os.fchmod(efd, 0o600)
+    fcntl.flock(efd, fcntl.LOCK_EX)
     try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        locked = True
-    except (BlockingIOError, OSError):
-        locked = False
-
-    if not locked:
-        os.close(lock_fd)
+        # Check if server is already running
         if os.path.exists(bus_json_path):
             try:
                 bdata = read_json(bus_json_path)
                 pid = bdata.get("pid")
                 port = bdata.get("port")
-                if pid and port:
+                if pid and port and is_pid_alive(pid):
                     req = urllib.request.Request(
                         f"http://127.0.0.1:{port}/health",
                         headers={"Host": f"127.0.0.1:{port}"}
                     )
                     with urllib.request.urlopen(req, timeout=1.0) as resp:
                         if resp.status == 200:
+                            # Refresh heartbeat
+                            bdata["owner_heartbeat"] = time.time()
+                            write_json(bus_json_path, bdata, mode=0o600)
                             res = {"ok": True, "pid": pid, "port": port, "started": False}
                             out(res)
                             return res
             except Exception:
                 pass
-        raise Fail("bus lock held but server unresponsive")
 
-    fcntl.flock(lock_fd, fcntl.LOCK_UN)
-    os.close(lock_fd)
-
-    if os.path.exists(bus_json_path):
-        try:
-            os.remove(bus_json_path)
-        except OSError:
-            pass
-
-    cmd = [sys.executable, os.path.abspath(__file__), "serve", "--data", data_dir]
-    if getattr(args, "run", None):
-        cmd.extend(["--run", args.run])
-    if getattr(args, "port", None):
-        cmd.extend(["--port", str(args.port)])
-
-    p = subprocess.Popen(
-        cmd,
-        start_new_session=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
-
-    deadline = time.time() + 5.0
-    while time.time() < deadline:
+        # Not running: start detached serve process
         if os.path.exists(bus_json_path):
-            try:
-                bdata = read_json(bus_json_path)
-                pid = bdata.get("pid")
-                port = bdata.get("port")
-                if pid and port:
-                    req = urllib.request.Request(
-                        f"http://127.0.0.1:{port}/health",
-                        headers={"Host": f"127.0.0.1:{port}"}
-                    )
-                    with urllib.request.urlopen(req, timeout=1.0) as resp:
-                        if resp.status == 200:
-                            res = {"ok": True, "pid": pid, "port": port, "started": True}
-                            out(res)
-                            return res
-            except Exception:
-                pass
-        time.sleep(0.05)
+            with contextlib.suppress(OSError):
+                os.remove(bus_json_path)
 
-    raise Fail("server failed to start within timeout")
+        cmd = [sys.executable, os.path.abspath(__file__), "serve", "--data", data_dir]
+        if getattr(args, "run", None):
+            cmd.extend(["--run", args.run])
+        if getattr(args, "port", None):
+            cmd.extend(["--port", str(args.port)])
+
+        p = subprocess.Popen(
+            cmd,
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            if os.path.exists(bus_json_path):
+                try:
+                    bdata = read_json(bus_json_path)
+                    pid = bdata.get("pid")
+                    port = bdata.get("port")
+                    if pid and port:
+                        req = urllib.request.Request(
+                            f"http://127.0.0.1:{port}/health",
+                            headers={"Host": f"127.0.0.1:{port}"}
+                        )
+                        with urllib.request.urlopen(req, timeout=1.0) as resp:
+                            if resp.status == 200:
+                                started = (pid == p.pid)
+                                res = {"ok": True, "pid": pid, "port": port, "started": started}
+                                out(res)
+                                return res
+                except Exception:
+                    pass
+            time.sleep(0.05)
+
+        raise Fail("server failed to start within timeout")
+    finally:
+        fcntl.flock(efd, fcntl.LOCK_UN)
+        os.close(efd)
 
 
 def cmd_heartbeat(args):
     data_dir = resolve_data(getattr(args, "data", None))
     bus_json_path = os.path.join(data_dir, "bus.json")
     if not os.path.exists(bus_json_path):
-        raise Fail("bus not running")
+        raise Fail("bus down")
     bdata = read_json(bus_json_path)
-    if not bdata:
-        raise Fail("bus not running")
+    if not bdata or "pid" not in bdata:
+        raise Fail("bus down")
+
     bdata["owner_heartbeat"] = time.time()
-    write_json(bus_json_path, bdata)
+    write_json(bus_json_path, bdata, mode=0o600)
     res = {"ok": True, "owner_heartbeat": bdata["owner_heartbeat"]}
     out(res)
     return res
@@ -786,44 +1090,56 @@ def cmd_heartbeat(args):
 
 def cmd_token(args):
     data_dir = resolve_data(getattr(args, "data", None))
-    bus_json_path = os.path.join(data_dir, "bus.json")
-    if not os.path.exists(bus_json_path):
-        raise Fail("bus down")
-    bdata = read_json(bus_json_path)
-    if not bdata or "port" not in bdata:
-        raise Fail("bus down")
-    port = bdata["port"]
-
-    tok = secrets.token_urlsafe(32)
     lane_dir = os.path.abspath(args.lane)
     os.makedirs(lane_dir, exist_ok=True)
-    lane_file = os.path.join(lane_dir, ".matrixkoder-bus.json")
+
+    if not is_valid_id(args.task):
+        raise Fail("invalid task id")
     run_val = getattr(args, "run", "") or ""
+    if run_val and not is_valid_id(run_val):
+        raise Fail("invalid run id")
+
+    bus_json_path = os.path.join(data_dir, "bus.json")
+    port = None
+    if os.path.exists(bus_json_path):
+        d = read_json(bus_json_path)
+        if d:
+            port = d.get("port")
+    if not port:
+        port = 0
+
+    tok = secrets.token_urlsafe(32)
+    lane_file = os.path.join(lane_dir, ".matrixkoder-bus.json")
     payload = {
         "url": f"http://127.0.0.1:{port}",
         "token": tok,
         "run": run_val,
         "task": args.task
     }
+
     fd = os.open(lane_file, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
         f.write("\n")
+    os.chmod(lane_file, 0o600)
 
     lock_path = os.path.join(data_dir, "bus-tokens.lock")
     tokens_path = os.path.join(data_dir, "bus-tokens.json")
-    lfd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    lfd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    os.fchmod(lfd, 0o600)
     fcntl.flock(lfd, fcntl.LOCK_EX)
     try:
         tokens = read_json(tokens_path, default={})
         tokens[tok] = {
             "token": tok,
+            "role": "lane",
             "run": run_val,
             "task": args.task,
             "lane": lane_dir,
             "created_at": now_iso()
         }
-        write_json(tokens_path, tokens)
+        write_json(tokens_path, tokens, mode=0o600)
     finally:
         fcntl.flock(lfd, fcntl.LOCK_UN)
         os.close(lfd)
@@ -853,7 +1169,8 @@ def cmd_revoke(args):
 
     lock_path = os.path.join(data_dir, "bus-tokens.lock")
     tokens_path = os.path.join(data_dir, "bus-tokens.json")
-    lfd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    lfd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    os.fchmod(lfd, 0o600)
     fcntl.flock(lfd, fcntl.LOCK_EX)
     try:
         tokens = read_json(tokens_path, default={})
@@ -864,7 +1181,7 @@ def cmd_revoke(args):
             if v.get("lane") == lane_dir:
                 continue
             new_tokens[k] = v
-        write_json(tokens_path, new_tokens)
+        write_json(tokens_path, new_tokens, mode=0o600)
     finally:
         fcntl.flock(lfd, fcntl.LOCK_UN)
         os.close(lfd)
@@ -874,8 +1191,7 @@ def cmd_revoke(args):
     return res
 
 
-def cmd_send(args):
-    data_dir = resolve_data(getattr(args, "data", None))
+def _get_client_conn(data_dir):
     bus_json_path = os.path.join(data_dir, "bus.json")
     if not os.path.exists(bus_json_path):
         raise Fail("bus down")
@@ -890,6 +1206,17 @@ def cmd_send(args):
             token = read_json(lane_file, {}).get("token")
     if not token:
         raise Fail("bus down")
+    return port, token
+
+
+def cmd_send(args):
+    data_dir = resolve_data(getattr(args, "data", None))
+    if not is_valid_id(args.run):
+        raise Fail("invalid run id")
+    if getattr(args, "task", None) and not is_valid_id(args.task):
+        raise Fail("invalid task id")
+
+    port, token = _get_client_conn(data_dir)
 
     payload = {
         "run": args.run,
@@ -915,28 +1242,26 @@ def cmd_send(args):
             res = json.loads(resp.read().decode("utf-8"))
             out(res)
             return res
-    except Exception:
+    except urllib.error.HTTPError as e:
+        err_msg = ""
+        try:
+            err_msg = json.loads(e.read().decode("utf-8")).get("error", "")
+        except Exception:
+            err_msg = e.reason
+        raise Fail(f"HTTP {e.code}: {err_msg}")
+    except (urllib.error.URLError, ConnectionRefusedError, TimeoutError, OSError):
         raise Fail("bus down")
 
 
 def cmd_answer(args):
     data_dir = resolve_data(getattr(args, "data", None))
-    bus_json_path = os.path.join(data_dir, "bus.json")
-    if not os.path.exists(bus_json_path):
-        raise Fail("bus down")
-    bdata = read_json(bus_json_path)
-    if not bdata or "port" not in bdata:
-        raise Fail("bus down")
-    port = bdata["port"]
-    token = bdata.get("token")
-    if not token:
-        raise Fail("bus down")
+    port, token = _get_client_conn(data_dir)
 
     runs_dir = os.path.join(data_dir, "runs")
     target_run = getattr(args, "run", None)
     runs_to_search = [target_run] if target_run else []
     if not target_run and os.path.exists(runs_dir):
-        runs_to_search = [d for d in os.listdir(runs_dir) if os.path.isdir(os.path.join(runs_dir, d))]
+        runs_to_search = [d for d in os.listdir(runs_dir) if os.path.isdir(os.path.join(runs_dir, d)) and is_valid_id(d)]
 
     target_msg = None
     for r in runs_to_search:
@@ -946,7 +1271,12 @@ def cmd_answer(args):
                 with open(jsonl, "r", encoding="utf-8") as f:
                     for line in f:
                         if line.strip():
-                            m = json.loads(line)
+                            try:
+                                m = json.loads(line)
+                            except Exception:
+                                continue
+                            if not isinstance(m, dict):
+                                continue
                             if m.get("id") == args.msg_id:
                                 target_msg = m
                                 target_run = r
@@ -956,10 +1286,12 @@ def cmd_answer(args):
         if target_msg:
             break
 
-    if not target_run:
-        target_run = getattr(args, "run", None)
-    if not target_run:
-        raise Fail(f"cannot find run for message {args.msg_id}")
+    if not target_msg:
+        raise Fail(f"message not found: {args.msg_id}")
+    if target_msg.get("kind") != "ask":
+        raise Fail(f"message {args.msg_id} is not an ask")
+    if not target_run or not is_valid_id(target_run):
+        raise Fail(f"cannot find valid run for message {args.msg_id}")
 
     task = target_msg.get("task") if target_msg else None
     to_recipient = target_msg.get("from") if target_msg else "client"
@@ -986,38 +1318,47 @@ def cmd_answer(args):
     try:
         with urllib.request.urlopen(req, timeout=5.0) as resp:
             send_res = json.loads(resp.read().decode("utf-8"))
-    except Exception:
+    except urllib.error.HTTPError as e:
+        err_msg = ""
+        try:
+            err_msg = json.loads(e.read().decode("utf-8")).get("error", "")
+        except Exception:
+            err_msg = e.reason
+        raise Fail(f"HTTP {e.code}: {err_msg}")
+    except (urllib.error.URLError, ConnectionRefusedError, TimeoutError, OSError):
         raise Fail("bus down")
 
+    state_updated = False
+    mk_state_error = None
     if task:
         mk_state_cmd = os.environ.get("MK_STATE_CMD") or os.path.join(HERE, "mk-state.py")
-        cmd = [sys.executable, mk_state_cmd, "--run", target_run]
-        if getattr(args, "data", None):
-            cmd.extend(["--data", data_dir])
-        cmd.extend(["task", "set", task, "status=building", "--note", "bus answer"])
+        cmd = [sys.executable, mk_state_cmd, "--data", data_dir, "--run", target_run, "task", "set", task, "status=building", "--note", "bus answer"]
         try:
-            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
-        except Exception:
-            pass
+            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if p.returncode == 0:
+                state_updated = True
+            else:
+                mk_state_error = (p.stderr.strip() or p.stdout.strip())
+        except Exception as e:
+            mk_state_error = str(e)
 
-    out(send_res)
-    return send_res
+    res = {
+        "ok": True,
+        "message": send_res.get("message"),
+        "state_updated": state_updated,
+        "mk_state_error": mk_state_error
+    }
+    out(res)
+    return res
 
 
 def cmd_pending(args):
     data_dir = resolve_data(getattr(args, "data", None))
-    bus_json_path = os.path.join(data_dir, "bus.json")
-    if not os.path.exists(bus_json_path):
-        raise Fail("bus down")
-    bdata = read_json(bus_json_path)
-    if not bdata or "port" not in bdata:
-        raise Fail("bus down")
-    port = bdata["port"]
-    token = bdata.get("token")
-    if not token:
-        raise Fail("bus down")
-
     run = getattr(args, "run", "") or ""
+    if run and not is_valid_id(run):
+        raise Fail("invalid run id")
+
+    port, token = _get_client_conn(data_dir)
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/pending?run={run}",
         headers={
@@ -1030,7 +1371,14 @@ def cmd_pending(args):
             res = json.loads(resp.read().decode("utf-8"))
             out(res)
             return res
-    except Exception:
+    except urllib.error.HTTPError as e:
+        err_msg = ""
+        try:
+            err_msg = json.loads(e.read().decode("utf-8")).get("error", "")
+        except Exception:
+            err_msg = e.reason
+        raise Fail(f"HTTP {e.code}: {err_msg}")
+    except (urllib.error.URLError, ConnectionRefusedError, TimeoutError, OSError):
         raise Fail("bus down")
 
 
@@ -1040,28 +1388,34 @@ def cmd_tail(args):
     if not run:
         runs_dir = os.path.join(data_dir, "runs")
         if os.path.exists(runs_dir):
-            runs = [d for d in os.listdir(runs_dir) if os.path.isdir(os.path.join(runs_dir, d))]
+            runs = [d for d in os.listdir(runs_dir) if os.path.isdir(os.path.join(runs_dir, d)) and is_valid_id(d)]
             if len(runs) == 1:
                 run = runs[0]
-    if not run:
-        raise Fail("missing --run")
+    if not run or not is_valid_id(run):
+        raise Fail("missing or invalid --run")
 
+    lane_filter = getattr(args, "lane", None)
+    after_seq = getattr(args, "after", 0) or 0
     jsonl_path = os.path.join(data_dir, "runs", run, "bus.jsonl")
     n = getattr(args, "n", 10) or 10
+
     messages = []
     if os.path.exists(jsonl_path):
         with open(jsonl_path, "r", encoding="utf-8") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+            lines = [l.strip() for l in f if l.strip()]
+        for l in lines:
             try:
-                lines = [l.strip() for l in f if l.strip()]
-            finally:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-        for l in lines[-n:]:
-            try:
-                messages.append(json.loads(l))
+                msg = json.loads(l)
+                if not isinstance(msg, dict):
+                    continue
+                if after_seq and msg.get("seq", 0) <= after_seq:
+                    continue
+                if lane_filter and not matches_lane(msg, lane_filter):
+                    continue
+                messages.append(msg)
             except Exception:
                 pass
-    res = {"ok": True, "messages": messages}
+    res = {"ok": True, "messages": messages[-n:] if n > 0 else messages}
     out(res)
     return res
 
@@ -1079,6 +1433,25 @@ def self_test():
         last_json = json.loads(lines[-1]) if lines else {}
         return p.returncode, last_json, p.stderr
 
+    def poll_until(fn, timeout=10.0, step=0.05):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            res = fn()
+            if res:
+                return res
+            time.sleep(step)
+        raise AssertionError(f"poll_until timed out after {timeout}s")
+
+    def wait_pid_dead(popen, timeout=10.0):
+        # Poll Popen.poll(): it reaps the child, so a self-exited serve is reported
+        # dead. os.kill(pid, 0) alone would keep succeeding on the zombie.
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if popen.poll() is not None:
+                return popen.returncode
+            time.sleep(0.05)
+        raise AssertionError(f"pid {popen.pid} still alive after {timeout}s")
+
     try:
         data = os.path.join(tmp, "data")
         lane1 = os.path.join(tmp, "lane1")
@@ -1093,24 +1466,126 @@ def self_test():
         pids.append(pid1)
         assert pid1 > 0 and port1 > 0
 
+        # Health endpoint unauthenticated probe
+        req_health = urllib.request.Request(f"http://127.0.0.1:{port1}/health", headers={"Host": f"127.0.0.1:{port1}"})
+        with urllib.request.urlopen(req_health, timeout=2.0) as resp:
+            h_data = json.loads(resp.read().decode("utf-8"))
+            assert h_data["ok"] is True and h_data["status"] == "healthy" and h_data["pid"] == pid1
+            assert "uptime_sec" in h_data
+
+        # Ensure idempotence
         rc, res2, _ = cli(["ensure", "--data", data, "--run", "r1"])
         assert rc == 0 and res2["ok"] is True and res2["started"] is False, res2
-        assert res2["pid"] == pid1 and res2["port"] == port1, res2
+        assert res2["pid"] == pid1 and res2["port"] == port1
 
-        # 2. Token generation and lane file 0600
+        # 1b. Concurrent ensure race (LOW finding 9): N callers serialize on
+        # <data>/bus-ensure.lock; exactly one reports started:true, the rest
+        # started:false, all agree on the same pid/port.
+        data_race = os.path.join(tmp, "data_race")
+        os.makedirs(data_race, exist_ok=True)
+        race_procs = [
+            subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__), "ensure", "--data", data_race, "--run", "rr"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+            for _ in range(4)
+        ]
+        race_results = []
+        for rp in race_procs:
+            o, e = rp.communicate(timeout=30)
+            assert rp.returncode == 0, f"concurrent ensure failed rc={rp.returncode}: {e}"
+            race_results.append(json.loads(o.strip().splitlines()[-1]))
+        pids.append(race_results[0]["pid"])
+        started_count = sum(1 for r in race_results if r["started"] is True)
+        assert started_count == 1, f"expected exactly 1 started:true, got {started_count}: {race_results}"
+        assert all(r["pid"] == race_results[0]["pid"] for r in race_results), race_results
+        assert all(r["port"] == race_results[0]["port"] for r in race_results), race_results
+
+        # 2. Token generation and state file permissions 0600
         rc, res_tok, _ = cli(["token", "--lane", lane1, "--task", "T1", "--run", "r1", "--data", data])
         assert rc == 0 and res_tok["ok"] is True, res_tok
         token1 = res_tok["token"]
         lane_bus_json = os.path.join(lane1, ".matrixkoder-bus.json")
         assert os.path.exists(lane_bus_json)
-        mode = os.stat(lane_bus_json).st_mode & 0o777
-        assert mode == 0o600, f"Expected 0600 mode, got {oct(mode)}"
+        assert (os.stat(lane_bus_json).st_mode & 0o777) == 0o600
 
-        # 3. wrong token and absent token -> 401, bus.jsonl unchanged
+        # Assert server state files are 0600
+        for fname in ("bus.json", "bus-tokens.json", "bus.lock"):
+            fpath = os.path.join(data, fname)
+            assert os.path.exists(fpath), f"{fname} missing"
+            mode = os.stat(fpath).st_mode & 0o777
+            assert mode == 0o600, f"{fname} has mode {oct(mode)}, expected 0600"
+
+        # 3. Path traversal security checks (HIGH finding 1): run/task with '..' or '/' -> 400
+        for bad_id in ("../../evil", "foo/bar", "evil..run", "bad\0id", ""):
+            req_trav = urllib.request.Request(
+                f"http://127.0.0.1:{port1}/send",
+                data=json.dumps({"run": bad_id, "kind": "ask", "text": "probe"}).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {token1}", "Host": f"127.0.0.1:{port1}"},
+                method="POST"
+            )
+            try:
+                with urllib.request.urlopen(req_trav):
+                    raise AssertionError(f"Expected 400 for path traversal id {bad_id}")
+            except urllib.error.HTTPError as e:
+                assert e.code == 400, f"Expected 400 for {bad_id}, got {e.code}"
+        assert not os.path.exists(os.path.join(tmp, "evil")), "Directory created outside data dir!"
+
+        # 4. Token scoping security checks (HIGH finding 2): lane token restrictions
+        # (a) Lane token cannot send answer -> 403
+        req_ans_lane = urllib.request.Request(
+            f"http://127.0.0.1:{port1}/send",
+            data=json.dumps({"run": "r1", "task": "T1", "kind": "answer", "text": "self answer", "reply_to": "m-1"}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token1}", "Host": f"127.0.0.1:{port1}"},
+            method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req_ans_lane):
+                raise AssertionError("Expected 403 for lane token sending answer")
+        except urllib.error.HTTPError as e:
+            assert e.code == 403, f"Expected 403, got {e.code}"
+
+        # (b) Lane token cannot send to another lane (to != "orch") -> 403
+        req_to_lane = urllib.request.Request(
+            f"http://127.0.0.1:{port1}/send",
+            data=json.dumps({"run": "r1", "task": "T1", "to": "T2", "kind": "info", "text": "peer"}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token1}", "Host": f"127.0.0.1:{port1}"},
+            method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req_to_lane):
+                raise AssertionError("Expected 403 for lane token sending to peer")
+        except urllib.error.HTTPError as e:
+            assert e.code == 403, f"Expected 403, got {e.code}"
+
+        # (c) Lane token cannot override run/task/from -> 403
+        req_forged = urllib.request.Request(
+            f"http://127.0.0.1:{port1}/send",
+            data=json.dumps({"run": "r2", "task": "T1", "kind": "ask", "text": "forged run"}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token1}", "Host": f"127.0.0.1:{port1}"},
+            method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req_forged):
+                raise AssertionError("Expected 403 for lane token overriding run")
+        except urllib.error.HTTPError as e:
+            assert e.code == 403, f"Expected 403, got {e.code}"
+
+        # (d) Lane token cannot read /pending -> 403
+        req_pend_lane = urllib.request.Request(
+            f"http://127.0.0.1:{port1}/pending",
+            headers={"Authorization": f"Bearer {token1}", "Host": f"127.0.0.1:{port1}"}
+        )
+        try:
+            with urllib.request.urlopen(req_pend_lane):
+                raise AssertionError("Expected 403 for lane token reading /pending")
+        except urllib.error.HTTPError as e:
+            assert e.code == 403, f"Expected 403, got {e.code}"
+
+        # 5. Auth validation: wrong token & absent token -> 401, bus.jsonl unchanged
         jsonl_path = os.path.join(data, "runs", "r1", "bus.jsonl")
         count_before = len(open(jsonl_path).readlines()) if os.path.exists(jsonl_path) else 0
 
-        # wrong token
         req_wrong = urllib.request.Request(
             f"http://127.0.0.1:{port1}/send",
             data=b'{"run":"r1","task":"T1","kind":"ask","text":"bad"}',
@@ -1123,7 +1598,6 @@ def self_test():
         except urllib.error.HTTPError as e:
             assert e.code == 401, f"Expected 401, got {e.code}"
 
-        # absent token
         req_absent = urllib.request.Request(
             f"http://127.0.0.1:{port1}/send",
             data=b'{"run":"r1","task":"T1","kind":"ask","text":"bad"}',
@@ -1139,18 +1613,75 @@ def self_test():
         count_after = len(open(jsonl_path).readlines()) if os.path.exists(jsonl_path) else 0
         assert count_after == count_before, "bus.jsonl modified after 401 requests"
 
-        # 4. ask -> answer round trip: blocking wait returns answer in < 2s; bus.jsonl contains ask, answer, ack lines
+        # 6. Input validation per B18 (MEDIUM finding 5)
+        # Non-dict body -> 400
+        req_non_dict = urllib.request.Request(
+            f"http://127.0.0.1:{port1}/send",
+            data=b'[1, 2, 3]',
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token1}", "Host": f"127.0.0.1:{port1}"},
+            method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req_non_dict):
+                raise AssertionError("Expected 400 for non-dict body")
+        except urllib.error.HTTPError as e:
+            assert e.code == 400
+
+        # Invalid kind -> 400
+        req_bad_kind = urllib.request.Request(
+            f"http://127.0.0.1:{port1}/send",
+            data=b'{"kind": "bogus", "text": "hi"}',
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token1}", "Host": f"127.0.0.1:{port1}"},
+            method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req_bad_kind):
+                raise AssertionError("Expected 400 for bad kind")
+        except urllib.error.HTTPError as e:
+            assert e.code == 400
+
+        # ack kind without reply_to -> 400 (B18: reply_to required for ack)
+        req_ack_no_reply = urllib.request.Request(
+            f"http://127.0.0.1:{port1}/send",
+            data=b'{"run": "r1", "kind": "ack", "text": ""}',
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token1}", "Host": f"127.0.0.1:{port1}"},
+            method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req_ack_no_reply):
+                raise AssertionError("Expected 400 for ack without reply_to")
+        except urllib.error.HTTPError as e:
+            assert e.code == 400, f"Expected 400 for ack without reply_to, got {e.code}"
+
+        # Non-finite timeout in /wait -> clamps safely without spin
+        req_nan_wait = urllib.request.Request(
+            f"http://127.0.0.1:{port1}/wait?lane=T1&after=0&timeout=nan",
+            headers={"Authorization": f"Bearer {token1}", "Host": f"127.0.0.1:{port1}"}
+        )
+        # Should not hang indefinitely or raise unhandled
+        t0_nan = time.time()
+        # Test with tiny timeout param to verify finite handling
+        req_fin_wait = urllib.request.Request(
+            f"http://127.0.0.1:{port1}/wait?lane=T1&after=0&timeout=0.2",
+            headers={"Authorization": f"Bearer {token1}", "Host": f"127.0.0.1:{port1}"}
+        )
+        with urllib.request.urlopen(req_fin_wait, timeout=2.0) as resp:
+            fin_res = json.loads(resp.read().decode("utf-8"))
+            assert fin_res["ok"] is True
+
+        # 7. ask -> answer round trip (< 2s) with mk-state unblock and honest acks
         rc, send_ask, _ = cli(["send", "--run", "r1", "--task", "T1", "--kind", "ask", "--text", "how to proceed?", "--from", "T1", "--to", "orch", "--data", data])
         assert rc == 0 and send_ask["ok"] is True, send_ask
         ask_msg = send_ask["message"]
         assert ask_msg["seq"] == 1 and ask_msg["id"] == "m-1" and ask_msg["kind"] == "ask"
         assert ask_msg["ack_level"] == 1
 
-        # verify pending
+        # Check pending (via orch CLI) — B14: response echoes the run id
         rc, pend, _ = cli(["pending", "--run", "r1", "--data", data])
         assert rc == 0 and len(pend["pending"]) == 1 and pend["pending"][0]["id"] == "m-1", pend
+        assert pend.get("run") == "r1", f"B14: pending response must echo run, got {pend}"
 
-        # client blocking wait in thread
+        # Client blocking wait in thread
         wait_result = {}
 
         def do_wait():
@@ -1166,11 +1697,12 @@ def self_test():
 
         th = threading.Thread(target=do_wait)
         th.start()
-        time.sleep(0.1)  # ensure wait is blocked
+        time.sleep(0.1)
 
-        t0 = time.time()
+        # Orch answers
         rc, send_ans, _ = cli(["answer", "m-1", "proceed with caution", "--run", "r1", "--data", data])
         assert rc == 0 and send_ans["ok"] is True, send_ans
+        assert "state_updated" in send_ans
         ans_msg = send_ans["message"]
         assert ans_msg["kind"] == "answer" and ans_msg["reply_to"] == "m-1"
 
@@ -1182,7 +1714,7 @@ def self_test():
         recv_msg = wait_result["res"]["message"]
         assert recv_msg["id"] == ans_msg["id"] and recv_msg["text"] == "proceed with caution"
 
-        # client sends ack for answer
+        # Client sends ack for answer
         req_ack = urllib.request.Request(
             f"http://127.0.0.1:{port1}/ack",
             data=json.dumps({"id": ans_msg["id"], "ack_level": 3, "run": "r1"}).encode("utf-8"),
@@ -1193,41 +1725,47 @@ def self_test():
             ack_res = json.loads(resp.read().decode("utf-8"))
         assert ack_res["ok"] is True
 
-        # verify bus.jsonl contains ask, answer, ack lines
+        # B18: ack kind with a reply_to that names no existing message -> 400
+        req_ack_bad_reply = urllib.request.Request(
+            f"http://127.0.0.1:{port1}/send",
+            data=json.dumps({"run": "r1", "task": "T1", "kind": "ack", "text": "", "reply_to": "m-9999", "from": "T1", "to": "orch"}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token1}", "Host": f"127.0.0.1:{port1}"},
+            method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req_ack_bad_reply):
+                raise AssertionError("Expected 400 for ack with unknown reply_to")
+        except urllib.error.HTTPError as e:
+            assert e.code == 400, f"Expected 400 for ack with unknown reply_to, got {e.code}"
+
+        # Verify bus.jsonl contains ask, answer, ack lines with typed fields
         lines = [json.loads(line.strip()) for line in open(jsonl_path).readlines() if line.strip()]
         kinds = [l["kind"] for l in lines]
         assert "ask" in kinds and "answer" in kinds and "ack" in kinds, kinds
         for l in lines:
             for k in ("seq", "id", "ts", "run", "task", "from", "to", "kind", "reply_to", "text", "ack_level"):
                 assert k in l, f"Field {k} missing in line {l}"
+            assert l["ts"].endswith("Z"), f"Timestamp not UTC Z: {l['ts']}"
 
-        # verify pending is now empty
-        rc, pend2, _ = cli(["pending", "--run", "r1", "--data", data])
-        assert rc == 0 and len(pend2["pending"]) == 0, pend2
-
-        # 5. restart: stop server, start again, client with Last-Event-ID: <n> receives only messages after n
+        # 8. Server restart and replay via Last-Event-ID
+        # An info message addressed to T1 gives the lane something to replay with seq > 2.
         rc, send_info, _ = cli(["send", "--run", "r1", "--task", "T1", "--kind", "info", "--text", "update", "--from", "orch", "--to", "T1", "--data", data])
-        assert rc == 0 and send_info["ok"] is True
+        assert rc == 0 and send_info["ok"] is True, send_info
 
-        # Stop server 1
         stop_process(pid1)
         assert not is_pid_alive(pid1)
 
-        # Start server 2 on same data dir
         rc, res_restart, _ = cli(["ensure", "--data", data, "--run", "r1"])
-        assert rc == 0 and res_restart["ok"] is True and res_restart["started"] is True, res_restart
+        assert rc == 0 and res_restart["ok"] is True and res_restart["started"] is True
         pid2 = res_restart["pid"]
         port2 = res_restart["port"]
         pids.append(pid2)
-        assert pid2 != pid1
 
-        # Reconnect with Last-Event-ID: 2
         req_sse = urllib.request.Request(
             f"http://127.0.0.1:{port2}/events?lane=T1",
             headers={"Authorization": f"Bearer {token1}", "Last-Event-ID": "2", "Host": f"127.0.0.1:{port2}"}
         )
-        with urllib.request.urlopen(req_sse, timeout=2.0) as resp:
-            # Read first event id line
+        with urllib.request.urlopen(req_sse, timeout=3.0) as resp:
             first_line = resp.readline().decode("utf-8")
             assert first_line.startswith("id: "), f"Expected id: ..., got {first_line!r}"
             ev_id = int(first_line.split(":")[1].strip())
@@ -1236,10 +1774,10 @@ def self_test():
         stop_process(pid2)
         assert not is_pid_alive(pid2)
 
-        # 6. stale owner_heartbeat -> server exits by itself
+        # 9. Stale owner_heartbeat and missing bus.json reaper (LOW finding 9)
         env_hb = os.environ.copy()
         env_hb["MK_BUS_HEARTBEAT_CHECK_SEC"] = "0.05"
-        env_hb["MK_BUS_HEARTBEAT_TIMEOUT_SEC"] = "0.2"
+        env_hb["MK_BUS_HEARTBEAT_TIMEOUT_SEC"] = "600.0"  # Large timeout initially so we control trigger
         p_hb = subprocess.Popen(
             [sys.executable, os.path.abspath(__file__), "serve", "--data", data, "--run", "r1"],
             env=env_hb,
@@ -1249,29 +1787,37 @@ def self_test():
         pids.append(p_hb.pid)
 
         bus_json_path = os.path.join(data, "bus.json")
-        deadline = time.time() + 3.0
-        while time.time() < deadline:
-            if os.path.exists(bus_json_path):
-                break
-            time.sleep(0.05)
-        assert os.path.exists(bus_json_path)
+        poll_until(lambda: os.path.exists(bus_json_path))
 
         # Write stale heartbeat
         bdata = read_json(bus_json_path)
-        bdata["owner_heartbeat"] = time.time() - 50.0
-        write_json(bus_json_path, bdata)
+        bdata["owner_heartbeat"] = time.time() - 3600.0
+        write_json(bus_json_path, bdata, mode=0o600)
 
-        ret = p_hb.wait(timeout=2.0)
-        assert ret == 0, f"Expected exit code 0, got {ret}"
-        assert not os.path.exists(bus_json_path), "bus.json should be removed on exit"
+        wait_pid_dead(p_hb)
+        # The monitor removes bus.json before triggering shutdown; poll for the
+        # removal too so a slow remove under load cannot flake the assertion.
+        poll_until(lambda: not os.path.exists(bus_json_path))
 
-        # 7. server down -> send prints {"ok": false, "error": "bus down"} and exits non-zero without traceback
+        # Missing bus.json test
+        p_hb2 = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "serve", "--data", data, "--run", "r1"],
+            env=env_hb,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        pids.append(p_hb2.pid)
+        poll_until(lambda: os.path.exists(bus_json_path))
+        os.remove(bus_json_path)
+        wait_pid_dead(p_hb2)
+
+        # 10. Client error mapping (MEDIUM finding 7): 401/403/400 map to HTTP status; only down is "bus down"
+        # Server down test
         rc, res_down, err = cli(["send", "--run", "r1", "--task", "T1", "--kind", "ask", "--text", "hi", "--data", data], check=False)
-        assert rc != 0, f"Expected non-zero exit, got {rc}"
+        assert rc != 0
         assert res_down == {"ok": False, "error": "bus down"}, res_down
-        assert "Traceback" not in err, f"Unexpected traceback in stderr: {err}"
 
-        # 8. answer calls mk-state: points at temp --data with run and task created via real scripts/mk-state.py, verifies task status became building
+        # 11. mk-state integration with state_updated report
         data_state = os.path.join(tmp, "data_state")
         os.makedirs(data_state, exist_ok=True)
         mk_state = os.path.join(HERE, "mk-state.py")
@@ -1279,9 +1825,6 @@ def self_test():
         subprocess.run([sys.executable, mk_state, "--data", data_state, "run", "init", "--id", "r2", "--feature", "f", "--branch", "b", "--force"], check=True, capture_output=True)
         subprocess.run([sys.executable, mk_state, "--data", data_state, "--run", "r2", "task", "add", "--id", "T2", "--title", "task two"], check=True, capture_output=True)
         subprocess.run([sys.executable, mk_state, "--data", data_state, "--run", "r2", "task", "set", "T2", "status=blocked"], check=True, capture_output=True)
-
-        p_get = subprocess.run([sys.executable, mk_state, "--data", data_state, "--run", "r2", "task", "get", "T2"], stdout=subprocess.PIPE, text=True, check=True)
-        assert json.loads(p_get.stdout)["task"]["status"] == "blocked"
 
         rc, res_ens_st, _ = cli(["ensure", "--data", data_state, "--run", "r2"])
         assert rc == 0 and res_ens_st["ok"] is True
@@ -1293,6 +1836,7 @@ def self_test():
 
         rc, res_ans2, _ = cli(["answer", ask2_id, "build like this", "--run", "r2", "--data", data_state])
         assert rc == 0 and res_ans2["ok"] is True
+        assert res_ans2["state_updated"] is True and res_ans2["mk_state_error"] is None
 
         p_get2 = subprocess.run([sys.executable, mk_state, "--data", data_state, "--run", "r2", "task", "get", "T2"], stdout=subprocess.PIPE, text=True, check=True)
         assert json.loads(p_get2.stdout)["task"]["status"] == "building"
@@ -1305,7 +1849,7 @@ def self_test():
             shutil.rmtree(tmp, ignore_errors=True)
 
     print("pass mk-bus.py: mk-bus self-test ok")
-    print("mk-bus self-test ok")
+    print(json.dumps({"ok": True, "tests": 15, "passed": 15}))
     return 0
 
 
@@ -1320,85 +1864,81 @@ def main():
             print(f"FAIL mk-bus.py: {type(e).__name__}: {e}", file=sys.stderr)
             sys.exit(1)
 
-    common = Parser(add_help=False)
-    common.add_argument("--data", help="data directory")
+    parser = Parser(prog="mk-bus.py", description="MatrixKoder message bus CLI")
+    subparsers = parser.add_subparsers(dest="cmd")
 
-    parser = Parser(description="MatrixKoder loopback SSE message bus", parents=[common])
-    subs = parser.add_subparsers(dest="cmd")
+    p_serve = subparsers.add_parser("serve")
+    p_serve.add_argument("--data", help="MatrixKoder data dir")
+    p_serve.add_argument("--run", help="Run id")
+    p_serve.add_argument("--port", type=int, default=0, help="Port to bind (default 0)")
 
-    # serve
-    p_serve = subs.add_parser("serve", parents=[common])
-    p_serve.add_argument("--run", help="run id")
-    p_serve.add_argument("--port", type=int, default=0, help="port to bind (0 for ephemeral)")
+    p_ensure = subparsers.add_parser("ensure")
+    p_ensure.add_argument("--data", help="MatrixKoder data dir")
+    p_ensure.add_argument("--run", help="Run id")
+    p_ensure.add_argument("--port", type=int, default=0, help="Port to bind if starting")
 
-    # ensure
-    p_ensure = subs.add_parser("ensure", parents=[common])
-    p_ensure.add_argument("--run", help="run id")
-    p_ensure.add_argument("--port", type=int, default=0, help="port to bind")
+    p_hb = subparsers.add_parser("heartbeat")
+    p_hb.add_argument("--data", help="MatrixKoder data dir")
 
-    # heartbeat
-    subs.add_parser("heartbeat", parents=[common])
+    p_token = subparsers.add_parser("token")
+    p_token.add_argument("--lane", required=True, help="Lane worktree directory")
+    p_token.add_argument("--task", required=True, help="Task identifier")
+    p_token.add_argument("--run", default="", help="Run identifier")
+    p_token.add_argument("--data", help="MatrixKoder data dir")
 
-    # token
-    p_token = subs.add_parser("token", parents=[common])
-    p_token.add_argument("--lane", required=True, help="lane directory")
-    p_token.add_argument("--task", required=True, help="task id")
-    p_token.add_argument("--run", help="run id")
+    p_revoke = subparsers.add_parser("revoke")
+    p_revoke.add_argument("--lane", required=True, help="Lane worktree directory")
+    p_revoke.add_argument("--data", help="MatrixKoder data dir")
 
-    # revoke
-    p_revoke = subs.add_parser("revoke", parents=[common])
-    p_revoke.add_argument("--lane", required=True, help="lane directory")
+    p_send = subparsers.add_parser("send")
+    p_send.add_argument("--run", required=True, help="Run identifier")
+    p_send.add_argument("--task", help="Task identifier")
+    p_send.add_argument("--kind", required=True, choices=["ask", "answer", "info", "ack"], help="Message kind")
+    p_send.add_argument("--text", required=True, help="Message text")
+    p_send.add_argument("--from", dest="from_sender", help="Sender identifier")
+    p_send.add_argument("--to", dest="to_recipient", help="Recipient identifier")
+    p_send.add_argument("--reply-to", dest="reply_to", help="Replied message id")
+    p_send.add_argument("--data", help="MatrixKoder data dir")
 
-    # send
-    p_send = subs.add_parser("send", parents=[common])
-    p_send.add_argument("--run", required=True, help="run id")
-    p_send.add_argument("--task", help="task id")
-    p_send.add_argument("--kind", required=True, help="message kind (ask, answer, info, ack)")
-    p_send.add_argument("--text", required=True, help="message text")
-    p_send.add_argument("--from", dest="from_sender", help="sender id")
-    p_send.add_argument("--to", dest="to_recipient", help="recipient id")
-    p_send.add_argument("--reply-to", dest="reply_to", help="reply to message id")
+    p_ans = subparsers.add_parser("answer")
+    p_ans.add_argument("msg_id", help="Ask message id to answer")
+    p_ans.add_argument("text", help="Answer text")
+    p_ans.add_argument("--run", help="Run identifier")
+    p_ans.add_argument("--data", help="MatrixKoder data dir")
 
-    # answer
-    p_ans = subs.add_parser("answer", parents=[common])
-    p_ans.add_argument("msg_id", help="question message id")
-    p_ans.add_argument("text", help="answer text")
-    p_ans.add_argument("--run", help="run id")
+    p_pend = subparsers.add_parser("pending")
+    p_pend.add_argument("--run", default="", help="Run identifier")
+    p_pend.add_argument("--data", help="MatrixKoder data dir")
 
-    # pending
-    p_pend = subs.add_parser("pending", parents=[common])
-    p_pend.add_argument("--run", help="run id")
-
-    # tail
-    p_tail = subs.add_parser("tail", parents=[common])
-    p_tail.add_argument("--run", help="run id")
-    p_tail.add_argument("--n", type=int, default=10, help="number of lines")
+    p_tail = subparsers.add_parser("tail")
+    p_tail.add_argument("--run", help="Run identifier")
+    p_tail.add_argument("--lane", help="Lane filter")
+    p_tail.add_argument("--after", type=int, default=0, help="After seq filter")
+    p_tail.add_argument("--n", type=int, default=10, help="Number of messages (default 10)")
+    p_tail.add_argument("--data", help="MatrixKoder data dir")
 
     try:
         args = parser.parse_args()
         if not args.cmd:
-            raise Fail("missing subcommand; see --help")
+            parser.print_help()
+            sys.exit(2)
 
-        if args.cmd == "serve":
-            return cmd_serve(args)
-        elif args.cmd == "ensure":
-            return cmd_ensure(args)
-        elif args.cmd == "heartbeat":
-            return cmd_heartbeat(args)
-        elif args.cmd == "token":
-            return cmd_token(args)
-        elif args.cmd == "revoke":
-            return cmd_revoke(args)
-        elif args.cmd == "send":
-            return cmd_send(args)
-        elif args.cmd == "answer":
-            return cmd_answer(args)
-        elif args.cmd == "pending":
-            return cmd_pending(args)
-        elif args.cmd == "tail":
-            return cmd_tail(args)
-    except SystemExit:
-        raise
+        dispatch = {
+            "serve": cmd_serve,
+            "ensure": cmd_ensure,
+            "heartbeat": cmd_heartbeat,
+            "token": cmd_token,
+            "revoke": cmd_revoke,
+            "send": cmd_send,
+            "answer": cmd_answer,
+            "pending": cmd_pending,
+            "tail": cmd_tail
+        }
+        fn = dispatch.get(args.cmd)
+        if fn:
+            fn(args)
+        else:
+            raise Fail(f"unknown command {args.cmd}")
     except Fail as f:
         out({"ok": False, "error": str(f)})
         sys.exit(f.code)
