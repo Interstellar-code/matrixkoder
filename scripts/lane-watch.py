@@ -25,6 +25,19 @@ Pane output that changed since the last poll (digits ignored, so a ticking timer
 mere presence of a running subagent task line (a braille spinner + "Task —"): a builder running tests,
 a revert/re-apply proof or a lead waiting on its subagents is not STALL. Finished "✓ … Task —" lines
 alone are not activity — with only those left, the stall clock runs again.
+The lane's .matrixkoder-status.json (written by the mk-builder skill's mk-builder.py) is the FIRST
+channel: read_status() accepts it only under status-contract.md R27 (v <= 1; run and task equal the
+armed watch's; the round and the reviewer role parsed from the --phase form "<T>[ REVIEW] R<n>";
+updated_at >= the watch's armed_at; seq strictly monotonic per process and identity), and any miss —
+absent, corrupt (never an exception, R29), stale or wrong identity — falls back to today's pane-text
+path unchanged (R28). state=done IS the DONE token (R30: the commit and report checks stay; it overrides
+only the pane-status and herdr-ERROR halves of the DONE branch) and state=blocked is BLOCKED with its
+question (R32). A fresh working/subagent heartbeat (updated_at inside --stall-min) resets the idle
+clock (R33; a subagent run is not a STALL — but only within --max-wait-min of the watch's armed_at,
+R34). QUOTA / PROVIDER / DEV_SERVER stay pane-text detections (R35: an agent at a quota wall cannot
+write a file). Every verdict's evidence ends with its source tag (R41): source=status (decided from
+the accepted file), source=pane (the pane-text path, QUOTA/STALL/ERROR/WATCH_EXPIRED included),
+source=grace (the no-token DONE rule).
 With --then-send, on DONE it dispatches "Read and follow <BRIEF_PATH> exactly ..." to the same agent
 via the herdr skill's herdr-ask.py (which refuses busy agents, so we only send once idle).
 With --task and --data (both or neither), every exit writes the task status via mk-state (DONE→verifying,
@@ -52,6 +65,10 @@ FAIL_STATES = ("QUOTA", "PROVIDER", "BLOCKED", "DEV_SERVER", "ERROR")
 WATCHED = ("dispatched", "building", "stalled", "quota", "provider", "blocked")  # a watcher may move these only
 ERROR_RETRIES = 3
 TOKEN_GRACE_MIN = 3  # commit + report + agent idle this long (report + idle with --no-commit), but no DONE token: DONE anyway (lesson 39)
+STATUS_FILE = ".matrixkoder-status.json"   # R1: <lane>/.matrixkoder-status.json, written by mk-builder.py (MB2)
+STATUS_STATES = ("started", "working", "subagent", "done", "blocked")   # R12
+PHASE_ROUND_RE = re.compile(r"^(\S+)( REVIEW)? R(\d+)$")   # R27.5 round + R27.6 reviewer marker
+_seen_seq = {}   # R27.9: (lane, run, task, round, role) -> highest seq THIS process accepted
 
 sys.dont_write_bytecode = True  # no stray __pycache__ next to the scripts
 _spec = importlib.util.spec_from_file_location("lane_health", os.path.join(HERE, "lane-health.py"))
@@ -124,33 +141,117 @@ def running_task(text):
     return bool(RUNNING_TASK_RE.search(text))
 
 
-def decide(h, subj, rx, report_ok, text, phase, stall_min):
+def read_status(lane, armed):
+    """The lane's .matrixkoder-status.json when it passes reader acceptance (status-contract.md
+    R27, in order), else None -> today's pane-text path unchanged (R28). No exception ever escapes
+    (R29): a missing file, corrupt JSON or a wrong-typed field is a miss, never a crash. Unknown
+    fields are ignored (R38). The only file this watcher ever gains; the caller passes the result
+    to decide() as st."""
+    try:
+        with open(os.path.join(lane, STATUS_FILE)) as f:   # R27.1: <lane>/.matrixkoder-status.json
+            st = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(st, dict):
+        return None   # R27.1: a JSON object
+    v = st.get("v")
+    if not isinstance(v, int) or isinstance(v, bool) or v > 1:
+        return None   # R27.2: an int the reader supports; a newer v ignores the WHOLE file (R39)
+    if st.get("run") != armed.get("run"):
+        return None   # R27.3: an armed watch without a run never accepts (None != a string)
+    if st.get("task") != armed.get("task"):
+        return None   # R27.4: the watch's task (the group lead, not another member)
+    m = PHASE_ROUND_RE.match(str(armed.get("phase") or ""))   # R27.5/R27.6: the round + reviewer marker
+    rnd = st.get("round")
+    if (not m or m.group(1) != armed.get("task")
+            or not isinstance(rnd, int) or isinstance(rnd, bool) or rnd != int(m.group(3))):
+        return None   # R27.5: a parse failure, task mismatch or a non-matching round is not accepted
+    if st.get("role") != ("reviewer" if m.group(2) else "builder"):
+        return None   # R27.6: the REVIEW marker arms the reviewer role, and nothing else does
+    upd = st.get("updated_at")
+    if (not isinstance(upd, (int, float)) or isinstance(upd, bool)
+            or upd < float(armed.get("armed_at") or 0.0)):
+        return None   # R27.7: full-precision epoch seconds on both sides (R7), never rounded
+    if st.get("state") not in STATUS_STATES:
+        return None   # R27.8: R12's five values
+    seq = st.get("seq")
+    if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
+        return None   # R27.9: type + lower bound (Table 1)
+    ident = (lane, st.get("run"), st.get("task"), rnd, st.get("role"))
+    if ident in _seen_seq and seq <= _seen_seq[ident]:
+        return None   # R27.9: rewound or replayed — never the newer truth a reader should act on
+    _seen_seq[ident] = seq
+    return st
+
+
+def status_activity(st, stall_min, armed):
+    """R33/R34: an accepted working/subagent file whose updated_at is inside stall_min is activity
+    for this poll — a writer that stops moving lets the clock run out. The comparison is in SECONDS
+    on both sides (R33): stall_min is minutes, so it is multiplied by 60. state=subagent counts only
+    while now - armed_at <= max_wait_min * 60 (R34) — the WATCH's armed_at, never the file's
+    started_at; past that the pane spinner/toolcall detection alone keeps the lane alive. The 30.0
+    literal is the last-resort echo of the schema default (session.max_wait_min = 30); callers
+    that resolve cfg() pass the real value in armed."""
+    if not st or st.get("state") not in ("working", "subagent"):
+        return False
+    now = time.time()
+    if now - float(st.get("updated_at") or 0) >= float(stall_min) * 60:
+        return False   # R33: the heartbeat is stale — not activity
+    if st["state"] == "subagent":
+        if now - float((armed or {}).get("armed_at") or 0) > \
+                float((armed or {}).get("max_wait_min") or 30.0) * 60:
+            return False   # R34: subagent is honoured only up to max_wait_min of the watch's armed_at
+    return True
+
+
+def decide(h, subj, rx, report_ok, text, phase, stall_min, st=None, armed=None):
     """One poll's verdict -> (state | None to keep watching, evidence list). Pure: no herdr, no git.
     rx None = --no-commit (a reviewer pane: no commit to match): any commit counts as matching, no
-    commit evidence is reported, and STALL never lists a matching commit as missing."""
+    commit evidence is reported, and STALL never lists a matching commit as missing. st = a status
+    file accepted by read_status (R27) or None; a file that missed any R27 condition fell back to
+    this pane-text path unchanged (R28). Every verdict's evidence ends with its source (R41):
+    status = decided from the accepted file, pane = the pane-text path, grace = the no-token rule."""
     done_tok, question = phase_tokens(text, phase)
     commit_ok = rx is None or bool(rx.search(subj.partition(" ")[2]) or rx.search(subj))  # subj = "<sha> <subject>"
     commit_ev = [] if rx is None else [f"commit {subj}"]
     status = h.get("agent_status")
-    if h["state"] != "ERROR" and commit_ok and report_ok and status != "working" and (done_tok or not phase):
-        return "DONE", commit_ev + ([f"{phase} DONE"] if phase else [])
+    f_done = bool(st) and st.get("state") == "done"        # R30: the file IS the DONE token
+    f_blocked = bool(st) and st.get("state") == "blocked"  # R32
+    # R30: an accepted done file overrides ONLY the pane-status ("working") and herdr-ERROR halves
+    # of this branch; the commit and report checks stay exactly as today (commit_ok/report_ok feed it)
+    if commit_ok and report_ok and (f_done or (h["state"] != "ERROR" and status != "working"
+                                               and (done_tok or not phase))):
+        if f_done:   # R31 rows 1-2: pane token present or not, the accepted file decides; source=status
+            return "DONE", commit_ev + [f"status file done (seq {st['seq']})", "source=status"]
+        return "DONE", commit_ev + ([f"{phase} DONE"] if phase else []) + ["source=pane"]
     if question:
-        return "BLOCKED", [f"{phase} BLOCKED: {question}"]
-    idle = h.get("last_change_min")  # since the last file/commit change OR pane activity (watch() passes it)
+        return "BLOCKED", [f"{phase} BLOCKED: {question}", "source=pane"]
+    if f_blocked:   # R32: the file's question, the pane path's shape
+        return "BLOCKED", [f"status file blocked: {st['question']}", "source=status"]
+    idle = h.get("last_change_min")
     if (h["state"] != "ERROR" and commit_ok and report_ok and status in ("idle", "done") and phase
             and idle is not None and idle >= min(TOKEN_GRACE_MIN, stall_min)):
         # builders (Claude especially) end with a summary and forget the token; the work is there, so the
-        # orchestrator verifies it rather than waiting for WATCH_EXPIRED
+        # orchestrator verifies it rather than waiting for WATCH_EXPIRED. R30 overrides nothing here:
+        # a non-terminal file state never touches the grace (R31's table gives the file precedence
+        # only for done/blocked).
         got = "commit + report" if rx is not None else "report"
-        return "DONE", commit_ev + [f"no {phase} DONE token ({got}, agent {status} {idle} min)"]
+        return "DONE", commit_ev + [f"no {phase} DONE token ({got}, agent {status} {idle} min)",
+                                    "source=grace"]
+    if status_activity(st, stall_min, armed):
+        # R33/R34: an accepted working/subagent file with updated_at inside stall_min (subagent only
+        # within max_wait_min of armed_at) is activity for THIS poll; no STALL. Past that the existing
+        # pane spinner/toolcall detection alone keeps the lane alive (R34).
+        return None, []
     if h["state"] in FAIL_STATES:
-        return h["state"], h.get("evidence") or []
+        return h["state"], (h.get("evidence") or []) + ["source=pane"]   # R41: pane detections (R35)
     if status == "working" and idle is not None and idle >= stall_min:
-        return "STALL", [f"working but no file/commit/pane change for {idle} min"]
+        return "STALL", [f"working but no file/commit/pane change for {idle} min", "source=pane"]
     if status in ("idle", "done") and idle is not None and idle >= stall_min:
         missing = [n for n, ok in (("matching commit", commit_ok), ("report", report_ok),
                                    (f"{phase} DONE token", done_tok or not phase)) if not ok]
-        return "STALL", [f"agent {status}, no file/commit change for {idle} min, missing: {', '.join(missing)}"]
+        return "STALL", [f"agent {status}, no file/commit change for {idle} min, missing: {', '.join(missing)}",
+                         "source=pane"]
     return None, []
 
 
@@ -284,10 +385,10 @@ def quota_beats_stall(agent, kind):
     try:
         lh.record_quota(lh.default_ledger(), kind or agent, text)
     except Exception as e:  # a ledger write never hides the verdict itself
-        return "QUOTA", hits[-2:] + [f"ledger write failed: {type(e).__name__}: {e}"[:200]]
+        return "QUOTA", hits[-2:] + [f"ledger write failed: {type(e).__name__}: {e}"[:200], "source=pane"]
     until, window = lh.parse_reset(text)
     return "QUOTA", hits[-2:] + ([f"exhausted_until {until} ({window})"] if until
-                                  else ["exhausted_until unknown"])
+                                   else ["exhausted_until unknown"]) + ["source=pane"]   # R41 (R35)
 
 
 def watch(a):
@@ -301,6 +402,12 @@ def watch(a):
     rx = None if no_commit else re.compile(grep)  # --no-commit: no commit to match; decide() counts rx None as ok
     start, errors = time.time(), 0
     active, last_fp = start, None  # last time the pane showed new output
+    t_one, t_list = opt(a, "--task"), opt(a, "--tasks")
+    # the armed watch read_status() accepts against (R27): run/task/phase-round/role + armed_at;
+    # a watch without --run, --task or a "<T>[ REVIEW] R<n>" phase never accepts a file (R27.3-5)
+    armed = {"lane": lane, "run": opt(a, "--run"),
+             "task": t_one or (t_list.split(",")[0].strip() if t_list else None),
+             "phase": phase, "armed_at": start, "max_wait_min": max_wait / 60}
     while True:
         subj = commit_subject(lane)
         # math.inf: lane-health judges only files/commits; STALL is decided in decide() with pane activity
@@ -313,8 +420,12 @@ def watch(a):
             active = time.time()
             h = lh.check(agent, lane, kind, math.inf, active, marker)
         last_fp = fp
+        st = read_status(lane, armed)
+        if status_activity(st, stall_min, armed):
+            # R33: the reader moves the lane's idle-clock mark to the file's write (never backwards)
+            active = max(active, float(st["updated_at"]))
         report_ok = not report or os.path.exists(os.path.join(lane, report))
-        state, ev = decide(h, subj, rx, report_ok, h.get("text", ""), phase, stall_min)
+        state, ev = decide(h, subj, rx, report_ok, h.get("text", ""), phase, stall_min, st, armed)
         errors = errors + 1 if state == "ERROR" else 0
         if state == "ERROR" and errors < ERROR_RETRIES and time.time() - start <= max_wait:
             time.sleep(poll)
@@ -332,7 +443,8 @@ def watch(a):
             return {"state": state, "commit": subj, "evidence": ev, "agent_status": h.get("agent_status")}
         if time.time() - start > max_wait:
             return {"state": "WATCH_EXPIRED", "commit": subj, "agent_status": h.get("agent_status"),
-                    "last_change_min": h.get("last_change_min")}
+                    "last_change_min": h.get("last_change_min"),
+                    "evidence": ["watch window ended", "source=pane"]}   # R41: a pane detection
         time.sleep(poll)
 
 
@@ -350,12 +462,13 @@ def self_test():
     assert decide(ok, good, re.compile(r"state core"), True, "", None, 10)[0] == "DONE"
     # with --phase the DONE token is also required, at line start only
     assert decide(ok, good, rx, True, "I will reply with P1 DONE when finished", "P1", 10)[0] is None
-    assert decide(ok, good, rx, True, "all gates green\n⏺ P1 DONE\n", "P1", 10) == ("DONE", [f"commit {good}", "P1 DONE"])
+    assert decide(ok, good, rx, True, "all gates green\n⏺ P1 DONE\n", "P1", 10) == \
+        ("DONE", [f"commit {good}", "P1 DONE", "source=pane"])
     assert decide(ok, other, rx, True, "P1 DONE", "P1", 10)[0] is None
     assert decide(ok, good, rx, True, "P2 DONE", "P1", 10)[0] is None
     # BLOCKED token wins and carries the question
     st, ev = decide({**ok, "agent_status": "working"}, other, rx, True, "● P1 BLOCKED: which schema version?\n", "P1", 10)
-    assert st == "BLOCKED" and ev == ["P1 BLOCKED: which schema version?"]
+    assert st == "BLOCKED" and ev == ["P1 BLOCKED: which schema version?", "source=pane"]
     # placeholder lines from an echoed brief never count; the later of DONE / BLOCKED wins
     assert decide(ok, other, rx, True, "Reply P1 BLOCKED: <question> if stuck", "P1", 10)[0] is None
     assert phase_tokens("P1 BLOCKED: <question>\nP1 DONE <sha>\n", "P1") == (False, None)
@@ -367,7 +480,7 @@ def self_test():
     assert decide({**ok, "state": "ERROR", "evidence": ["x"]}, good, rx, True, "", None, 10)[0] == "ERROR"
     # health failures pass through
     for s in FAIL_STATES:
-        assert decide({**ok, "state": s, "evidence": ["x"]}, other, rx, True, "", None, 10) == (s, ["x"])
+        assert decide({**ok, "state": s, "evidence": ["x"]}, other, rx, True, "", None, 10) == (s, ["x", "source=pane"])
     # working agent: STALL only from lane-watch's own idle (files/commits/pane); lane-health's STALL is ignored
     assert decide({**ok, "state": "STALL", "agent_status": "working"}, other, rx, True, "", None, 10)[0] is None
     st, ev = decide({**ok, "agent_status": "working", "last_change_min": 11}, other, rx, True, "", None, 10)
@@ -385,13 +498,13 @@ def self_test():
     st, ev = decide({**ok, "last_change_min": 11}, good, rx, False, "", "P1", 10)
     assert st == "STALL" and "report" in ev[0] and "matching commit" not in ev[0]
     # --no-commit (rx None, a reviewer pane): no commit to match — any subject is fine, no commit evidence
-    assert decide(ok, other, None, True, "P1 DONE", "P1", 10) == ("DONE", ["P1 DONE"])
+    assert decide(ok, other, None, True, "P1 DONE", "P1", 10) == ("DONE", ["P1 DONE", "source=pane"])
     assert decide(ok, other, None, True, "I will reply with P1 DONE", "P1", 10)[0] is None  # token still required
     assert decide({**ok, "agent_status": "working"}, other, None, True, "P1 DONE", "P1", 10)[0] is None
     assert decide(ok, other, None, False, "P1 DONE", "P1", 10)[0] is None  # report still required
     # the no-token grace loses its commit half too: report + idle 3 min is DONE, never before
     st, ev = decide({**ok, "last_change_min": 4}, other, None, True, "", "P1", 10)
-    assert st == "DONE" and ev == ["no P1 DONE token (report, agent idle 4 min)"], (st, ev)
+    assert st == "DONE" and ev == ["no P1 DONE token (report, agent idle 4 min)", "source=grace"], (st, ev)
     assert decide({**ok, "last_change_min": 2}, other, None, True, "", "P1", 10)[0] is None
     assert decide({**ok, "agent_status": "working", "last_change_min": 4}, other, None, True, "", "P1", 10)[0] is None
     # idle STALL never lists a matching commit as missing in this mode (report gone, so the grace cannot fire)
@@ -416,6 +529,157 @@ def self_test():
     sp.loader.exec_module(mk)
     assert set(STATUS_MAP.values()) <= set(mk.STATUSES)
     assert STATUS_MAP["DONE"] == "verifying" and STATUS_MAP["STALL"] == "stalled"
+
+    # --- the status-file channel (status-contract.md R27-R41): read_status() acceptance + decide(st, armed) ---
+    import shutil, tempfile
+    stmp = tempfile.mkdtemp(prefix="lane-watch-status-")  # fixture lanes only, never a real .matrixkoder/
+    try:
+        t0 = time.time() - 120  # the watch armed 2 min ago
+
+        def wstat(dir_, **kw):
+            """One contract-valid v1 status file (Table 1 fields) into dir_, kw overriding; -> path."""
+            j = {"v": 1, "seq": 5, "run": "r1", "task": "P1", "round": 1, "role": "builder",
+                 "agent": "opencode", "state": "working", "step": "start", "phases_done": [],
+                 "question": None, "commit": None, "report": ".matrixkoder-report-r1.md",
+                 "subagent": None, "ctx_pct": None, "started_at": t0, "updated_at": t0 + 1}
+            j.update(kw)
+            p = os.path.join(dir_, STATUS_FILE)
+            with open(p, "w") as f:
+                json.dump(j, f)
+            return p
+
+        def mklane(name):  # a fresh lane dir per case: _seen_seq identities never leak across cases
+            d = os.path.join(stmp, name)
+            os.makedirs(d, exist_ok=True)
+            return d
+
+        armed = {"lane": stmp, "run": "r1", "task": "P1", "phase": "P1 R1",
+                 "armed_at": t0, "max_wait_min": 30}
+
+        # done file + commit + report and no pane token -> DONE, source=status (R30/R31 row 2)
+        ln = mklane("done")
+        wstat(ln, state="done", seq=5)
+        st = read_status(ln, armed)
+        assert st and st["state"] == "done" and st["seq"] == 5, st
+        assert decide(ok, good, rx, True, "", "P1 R1", 10, st, armed) == \
+            ("DONE", [f"commit {good}", "status file done (seq 5)", "source=status"])
+        # R30: the done file overrides the pane-status and herdr-ERROR halves ONLY; commit + report stay
+        assert decide({**ok, "agent_status": "working"}, good, rx, True, "", "P1 R1", 10, st, armed)[0] == "DONE"
+        assert decide({**ok, "state": "ERROR", "evidence": ["x"]}, good, rx, True, "", "P1 R1", 10,
+                      st, armed) == ("DONE", [f"commit {good}", "status file done (seq 5)", "source=status"])
+        assert decide(ok, other, rx, True, "", "P1 R1", 10, st, armed)[0] is None  # commit mismatch: no DONE
+        assert decide(ok, good, rx, False, "", "P1 R1", 10, st, armed)[0] is None   # report missing: no DONE
+        # the reviewer form (--no-commit, rx None): phase "D2 REVIEW R1" arms role=reviewer (R27.6)
+        armed_rev = {"lane": stmp, "run": "r1", "task": "D2", "phase": "D2 REVIEW R1",
+                     "armed_at": t0, "max_wait_min": 30}
+        ln = mklane("done-rev")
+        wstat(ln, task="D2", role="reviewer", state="done")
+        st_rev = read_status(ln, armed_rev)
+        assert st_rev and st_rev["role"] == "reviewer", st_rev
+        assert decide(ok, other, None, True, "", "D2 REVIEW R1", 10, st_rev, armed_rev) == \
+            ("DONE", ["status file done (seq 5)", "source=status"])  # no commit evidence when rx is None
+
+        # a status file of another round -> not DONE (R27.5): the round comes from the phase form
+        ln = mklane("round2")
+        wstat(ln, round=2)
+        assert read_status(ln, armed) is None
+        assert decide(ok, good, rx, True, "", "P1 R1", 10, None, armed)[0] is None
+
+        # updated_at before armed_at -> ignored (R27.7)
+        ln = mklane("stale")
+        wstat(ln, updated_at=t0 - 60)
+        assert read_status(ln, armed) is None
+        assert decide(ok, good, rx, True, "", "P1 R1", 10, None, armed)[0] is None
+
+        # v=99 -> the whole file is ignored (R39); the pane-text path still works (source=pane)
+        ln = mklane("v99")
+        wstat(ln, v=99, state="done")
+        assert read_status(ln, armed) is None
+        assert decide(ok, good, rx, True, "all gates green\n⏺ P1 R1 DONE\n", "P1 R1", 10, None, armed) == \
+            ("DONE", [f"commit {good}", "P1 R1 DONE", "source=pane"])
+
+        # blocked file -> BLOCKED with its question, source=status (R32)
+        ln = mklane("blocked")
+        wstat(ln, state="blocked", seq=6, question="Which fixture format is the acceptance target?")
+        st = read_status(ln, armed)
+        assert st and st["state"] == "blocked", st
+        assert decide(ok, other, rx, True, "", "P1 R1", 10, st, armed) == \
+            ("BLOCKED", ["status file blocked: Which fixture format is the acceptance target?", "source=status"])
+
+        # subagent heartbeat 14 min old with stall_min 15 -> no STALL; 16 min old -> STALL (R33/R34)
+        now = time.time()
+        st14 = {"v": 1, "seq": 9, "run": "r1", "task": "P1", "round": 1, "role": "builder",
+                "state": "subagent", "updated_at": now - 14 * 60,
+                "subagent": {"task": "S1.2", "since": now - 14 * 60}}
+        h16 = {**ok, "agent_status": "working", "last_change_min": 16}
+        assert decide(h16, other, rx, True, "", "P1 R1", 15, st14, armed) == (None, [])  # a heartbeat is activity
+        st16 = {**st14, "updated_at": now - 16 * 60, "subagent": {"task": "S1.2", "since": now - 16 * 60}}
+        st, ev = decide(h16, other, rx, True, "", "P1 R1", 15, st16, armed)
+        assert st == "STALL" and ev[-1] == "source=pane", (st, ev)  # stale heartbeat: the clock ran out
+        # R34: a subagent run past max_wait_min of the WATCH's armed_at is not activity either
+        armed_max = {**armed, "armed_at": now - 31 * 60}
+        assert status_activity(st14, 15, armed_max) is False
+
+        # QUOTA in the pane with a done file -> DONE, finished wins (R30 first branch; R31 row 1)
+        ln = mklane("quota")
+        wstat(ln, state="done")
+        st = read_status(ln, armed)
+        assert st and st["state"] == "done", st
+        stq, evq = decide({**ok, "state": "QUOTA", "evidence": ["x"]}, good, rx, True, "P1 R1 DONE",
+                          "P1 R1", 10, st, armed)
+        assert stq == "DONE" and evq[-1] == "source=status", (stq, evq)
+
+        # corrupt JSON -> the pane-text path, no exception (R29)
+        ln = mklane("corrupt")
+        with open(os.path.join(ln, STATUS_FILE), "wb") as f:
+            f.write(b"not json{{{")
+        assert read_status(ln, armed) is None
+        assert decide(ok, good, rx, True, "⏺ P1 R1 DONE\n", "P1 R1", 10, None, armed) == \
+            ("DONE", [f"commit {good}", "P1 R1 DONE", "source=pane"])
+
+        # grace DONE -> source=grace (the no-token rule, TOKEN_GRACE_MIN)
+        st, ev = decide({**ok, "last_change_min": 4}, good, rx, True, "", "P1 R1", 10, None, armed)
+        assert st == "DONE" and ev == [f"commit {good}",
+                                       "no P1 R1 DONE token (commit + report, agent idle 4 min)",
+                                       "source=grace"], (st, ev)
+
+        # R27.9: seq is strictly monotonic per process and identity — a rewound or replayed file is stale
+        ln = mklane("mono")
+        wstat(ln, seq=5)
+        st = read_status(ln, armed)
+        assert st and st["seq"] == 5
+        assert read_status(ln, armed) is None            # the SAME file again: not strictly greater
+        wstat(ln, seq=3)
+        assert read_status(ln, armed) is None            # rewound: never the newer truth
+        wstat(ln, seq=6)
+        st = read_status(ln, armed)
+        assert st and st["seq"] == 6                      # a new write is accepted
+        armed_r2 = {**armed, "phase": "P1 R2"}
+        wstat(ln, seq=1, round=2)
+        st = read_status(ln, armed_r2)
+        assert st and st["seq"] == 1                      # new identity: no comparison
+
+        # R27.5/R27.6: the round and the reviewer role come from the phase form, and nothing else
+        ln = mklane("role-rev")
+        wstat(ln, task="D2", role="builder")
+        assert read_status(ln, armed_rev) is None        # a REVIEW phase accepts role=reviewer only
+        ln = mklane("role-builder")
+        wstat(ln, role="reviewer")
+        assert read_status(ln, armed) is None           # a plain phase accepts role=builder only
+        ln = mklane("nophase")
+        wstat(ln)
+        assert read_status(ln, {**armed, "phase": "P1"}) is None   # no R<n> tail: no round, no acceptance
+        assert read_status(ln, {**armed, "phase": "P2 R1"}) is None  # group 1 must equal the watch's task
+        ln = mklane("otherrun")
+        wstat(ln, run="r2")
+        assert read_status(ln, armed) is None            # R27.3: another run's file is not ours
+
+        # R38: a reader ignores every field it does not know — never rejects for an unknown field
+        ln = mklane("extra")
+        wstat(ln, proto="mk-builder-status/v1", msg_id=None, last_read_id="b7")
+        assert read_status(ln, armed) is not None
+    finally:
+        shutil.rmtree(stmp, ignore_errors=True)
 
     # record(): writes status + transition event through mk-state, in a temp data dir
     import shutil, tempfile
@@ -600,7 +864,7 @@ def self_test():
         out = cli("--no-commit", "--report", "review-r1.md", "--phase", "D2 REVIEW R1", "--kind", "codex",
                   "--prompt-marker", "Read and follow review-brief-r1.md", "--poll", "0.1",
                   "--task", "P3", "--data", data)
-        assert out["state"] == "DONE" and out["evidence"] == ["D2 REVIEW R1 DONE"], out
+        assert out["state"] == "DONE" and out["evidence"] == ["D2 REVIEW R1 DONE", "source=pane"], out
         assert out["state_written"] is True, out
         # without --no-commit, --commit-grep stays required: usage error, exit 2
         r = subprocess.run([sys.executable, __file__, "--lane", lane, "--agent", "w1", "--report", "review-r1.md",
@@ -743,7 +1007,7 @@ def main():
     try:
         out = watch(a)
     except Exception as e:  # never die silently: missing herdr/git, bad regex, bad number → ERROR + state note
-        out = {"state": "ERROR", "evidence": [f"{type(e).__name__}: {e}"[:200]]}
+        out = {"state": "ERROR", "evidence": [f"{type(e).__name__}: {e}"[:200], "source=pane"]}   # R41
     if task or tasks:
         r = record(out, task or [t.strip() for t in tasks.split(",") if t.strip()], data, opt(a, "--run"))
         out["state_written"] = r.get("ok", False)
