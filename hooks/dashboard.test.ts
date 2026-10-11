@@ -290,7 +290,7 @@ test('missing usage triggers the initial poll with the right argv', { plugins: [
   delete files[USAGE_PATH]
   mockFs(on, files)
   const polls: (readonly string[])[] = []
-  const clock = mockWorld(on, { process: argv => { polls.push(argv) } })
+  const clock = mockWorld(on, { process: argv => { if (argv.some(a => a.endsWith('scripts/mk-usage.py'))) polls.push(argv) } })
   await $.session.start(sessionStart())
   // the cold-start poll is fire-and-forget: advance(0) settles the event loop so its dispatch chain reaches process.run
   await clock.advance(0)
@@ -311,7 +311,7 @@ test('a project yaml scopes the usage poll: --providers from usage.providers', {
   delete files[USAGE_PATH]
   mockFs(on, files)
   const polls: (readonly string[])[] = []
-  const clock = mockWorld(on, { process: argv => { polls.push(argv) } })
+  const clock = mockWorld(on, { process: argv => { if (argv.some(a => a.endsWith('scripts/mk-usage.py'))) polls.push(argv) } })
   await $.session.start(sessionStart())
   // the cold-start poll is fire-and-forget: advance(0) settles the event loop so its dispatch chain reaches process.run
   await clock.advance(0)
@@ -829,6 +829,168 @@ test('two session.start arm exactly one sweep timer', { plugins: [worldFixtures]
   await $.session.start(sessionStart())
   await clock.advance(120_000)
   expect(sweeps.length).toBe(1)
+})
+
+// ---------- BD: the plugin host keeps the bus alive ----------
+
+function isBus(argv: readonly string[]): boolean {
+  return argv.length >= 3 && argv[0] === 'python3' && !!argv[1]?.endsWith('scripts/mk-bus.py') && (argv[2] === 'ensure' || argv[2] === 'heartbeat')
+}
+
+function isBusEnabledGet(argv: readonly string[]): boolean {
+  return argv.length >= 3 && argv[0] === 'python3' && !!argv[1]?.endsWith('scripts/mk-config.py') && argv[2] === 'get' && argv[3] === 'bus.enabled'
+}
+
+test('bus ensure runs with --data and --run on session.start, then every 15 s', { plugins: [worldFixtures] }, async ($, on) => {
+  const files = worldFiles()
+  mockFs(on, files)
+  const bus: (readonly string[])[] = []
+  const clock = mockWorld(on, { process: argv => { if (isBus(argv)) bus.push(argv) } })
+  await $.session.start(sessionStart())
+  await clock.advance(0) // the session.start call is fire-and-forget
+  expect(bus.length).toBe(1)
+  const first = bus[0] ?? []
+  expect(first[0]).toBe('python3')
+  expect(first[1]?.endsWith('scripts/mk-bus.py')).toBe(true)
+  expect(first[2]).toBe('ensure')
+  expect(first.slice(3)).toEqual(['--data', DATA_DIR, '--run', 'wfv2'])
+  await clock.advance(15_000)
+  expect(bus.length).toBe(2) // the tick, not only the session-start call
+  expect(bus[1]?.slice(2)).toEqual(['ensure', '--data', DATA_DIR, '--run', 'wfv2'])
+})
+
+test('a bus.json in the data dir turns the tick into a heartbeat', { plugins: [worldFixtures] }, async ($, on) => {
+  const files = worldFiles()
+  files[`${DATA_DIR}/bus.json`] = JSON.stringify({ pid: 4242, port: 51234, started: 0, owner_heartbeat: 0 })
+  mockFs(on, files)
+  const bus: (readonly string[])[] = []
+  const clock = mockWorld(on, { process: argv => { if (isBus(argv)) bus.push(argv) } })
+  await $.session.start(sessionStart())
+  await clock.advance(0)
+  expect(bus.length).toBe(1)
+  expect(bus[0]?.slice(2)).toEqual(['heartbeat', '--data', DATA_DIR])
+  await clock.advance(15_000)
+  expect(bus.filter(a => a[2] === 'ensure'), 'ensure never runs while bus.json names a server').toHaveLength(0)
+  expect(bus.length).toBe(2)
+})
+
+test('mode solo runs no bus command', { plugins: [worldFixtures], options: { mode: 'solo' } }, async ($, on) => {
+  mockFs(on, worldFiles())
+  const bus: (readonly string[])[] = []
+  const clock = mockWorld(on, { process: argv => { if (isBus(argv)) bus.push(argv) } })
+  await $.session.start(sessionStart())
+  await clock.advance(15_000)
+  expect(bus, 'solo hosts no bus even with an active run').toHaveLength(0)
+})
+
+test('no active run runs no bus command', async ($, on) => {
+  const files = worldFiles()
+  const index = files[RUNS_INDEX] ?? ''
+  const runJson = files[RUN_PATH] ?? '{}'
+  delete files[RUNS_INDEX]
+  delete files[RUN_PATH]
+  mockFs(on, files) // the data dir must resolve, or the host would skip for the wrong reason
+  const bus: (readonly string[])[] = []
+  const clock = mockWorld(on, { process: argv => { if (isBus(argv)) bus.push(argv) } })
+  await $.session.start(sessionStart())
+  await clock.advance(15_000)
+  expect(bus, 'nothing to keep alive without a run').toHaveLength(0)
+  // control: the same session with a run restored calls ensure, so the run is what kept this quiet
+  files[RUNS_INDEX] = index
+  files[RUN_PATH] = runJson
+  await clock.advance(15_000)
+  expect(bus.length, 'the run, not a dead host, is what kept this quiet').toBe(1)
+})
+
+test('bus.enabled=false skips ensure, any other mk-config answer proceeds', { plugins: [worldFixtures] }, async ($, on) => {
+  const files = worldFiles()
+  mockFs(on, files)
+  const bus: (readonly string[])[] = []
+  const gets: (readonly string[])[] = []
+  const ok = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+  const clock = mockWorld(on, {
+    process: argv => {
+      if (isBusEnabledGet(argv)) { gets.push(argv); return ok('{"ok": true, "value": false}') } // the row BC adds
+      if (isBus(argv)) bus.push(argv)
+      return ok('{"ok": false, "error": "unknown key: bus.enabled"}') // every checkout without BC
+    },
+  })
+  await $.session.start(sessionStart())
+  await clock.advance(0)
+  expect(gets.length, 'the row is read before ensure').toBe(1)
+  expect(gets[0]?.slice(3)).toEqual(['bus.enabled', '--data', DATA_DIR])
+  expect(bus, 'an explicit false leaves the bus down').toHaveLength(0)
+})
+
+test('an unknown bus.enabled key does not stop ensure', { plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  const bus: (readonly string[])[] = []
+  const clock = mockWorld(on, {
+    process: argv => {
+      if (isBus(argv)) bus.push(argv)
+      // mk-config.py prints ok:false and exits 2 for a key no row declares
+      return { value: { exitCode: 2, stdout: '{"ok": false, "error": "unknown key: bus.enabled"}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    },
+  })
+  await $.session.start(sessionStart())
+  await clock.advance(0)
+  expect(bus.length).toBe(1)
+  expect(bus[0]?.[2]).toBe('ensure')
+})
+
+test('a failing ensure never throws and the next tick retries', { plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  let attempts = 0
+  const clock = mockWorld(on, {
+    process: argv => {
+      if (!isBus(argv)) return
+      attempts++
+      throw new Error('mk-bus.py exit 2: server failed to start within timeout')
+    },
+  })
+  await $.session.start(sessionStart())
+  await clock.advance(0)
+  expect(attempts).toBe(1)
+  await clock.advance(15_000)
+  expect(attempts, 'the tick after a failure tries again').toBe(2)
+})
+
+test('a bus tick in flight blocks the next one', { plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  const bus: (readonly string[])[] = []
+  const clock = mockWorld(on, {
+    process: async argv => {
+      if (!isBus(argv)) return
+      bus.push(argv)
+      await clock.sleep(60_000) // the start outlives every tick inside it
+      return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    },
+  })
+  await $.session.start(sessionStart())
+  await clock.advance(0)
+  expect(bus.length).toBe(1)
+  await clock.advance(15_000)
+  await clock.advance(15_000)
+  expect(bus.length, 'no second process while the first still runs').toBe(1)
+  await clock.advance(120_000)
+  expect(bus.length, 'a tick after it finishes starts again').toBeGreaterThan(1)
+})
+
+test('the /mk re-arm path calls ensure once, without a 15 s wait', { plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  const bus: (readonly string[])[] = []
+  const clock = mockWorld(on, { process: argv => { if (isBus(argv)) bus.push(argv) } })
+  on('session.cwd', () => ({ value: PROJECT_DIR }))
+  on('session.end', () => ({ sessionId: 's1' }))
+  await $.session.start(sessionStart())
+  await clock.advance(0)
+  expect(bus.length).toBe(1)
+  await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: undefined } } as never)
+  await clock.advance(60_000)
+  expect(bus.length, '/clear stopped the timers, nothing ticked').toBe(1)
+  await $.command.run({ command: 'mk', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 165 } })
+  await clock.advance(0)
+  expect(bus.length, '/mk re-arms and calls ensure at once').toBe(2)
 })
 
 // ---------- every active run renders, not only the newest ----------
@@ -1652,6 +1814,8 @@ function mockSettingsBackend(
   mockFs(on, files, [DATA_DIR, `${PROJECT_DIR}/.git`], [YAML_PATH])
   const clock = mockWorld(on, {
     process: argv => {
+      // the bus host's own spawns are not Settings calls (BD runs them on session.start)
+      if (isBus(argv) || isBusEnabledGet(argv)) return undefined
       calls.push(argv)
       if (!argv.some(a => a.endsWith('scripts/mk-config.py'))) return undefined
       const cmd = argv.slice(argv.indexOf('--data') + 2)
@@ -1821,6 +1985,7 @@ test('MEDIUM 3: without matrixkoder.yaml neither migrate nor list runs; globals 
   const calls: (readonly string[])[] = []
   const clock = mockWorld(on, {
     process: argv => {
+      if (isBus(argv) || isBusEnabledGet(argv)) return undefined // the bus host's own spawns are not Settings calls
       calls.push(argv)
       return undefined
     },
