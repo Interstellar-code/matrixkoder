@@ -2,13 +2,14 @@
 """MatrixKoder loopback message bus — SSE / HTTP pubsub under flock. Python 3 stdlib only.
 
 Subcommands:
-  serve [--data DIR] [--run ID] [--port PORT]
+  serve [--data DIR] [--run ID] [--port PORT] [--prefer-port PORT]
       Runs foreground loopback HTTP/SSE server. Holds <data>/bus.lock exclusively (0600),
       writes <data>/bus.json {pid, port, started, owner_heartbeat, token} (0600), registers token in
       <data>/bus-tokens.json (0600). Rebuilds state from <data>/runs/<run>/bus.jsonl.
       Self-exits when owner_heartbeat is older than bus.owner_timeout_min
       (<data>/matrixkoder.yaml, clamped to [5, 120] min, default 30; $MK_BUS_HEARTBEAT_TIMEOUT_SEC
-      overrides) or when bus.json is missing.
+      overrides) or when bus.json is missing. --prefer-port tries that port first, then falls
+      back to an OS-assigned one (ensure passes the dead bus's port so armed lanes keep their url).
   ensure [--data DIR] [--run ID] [--port PORT]
       Ensures a detached server process is running. Idempotent. A recorded pid is only
       trusted when /health names this data dir (a refused port means pid reuse): else
@@ -1168,7 +1169,13 @@ def cmd_serve(args):
         sys.exit(2)
 
     port = getattr(args, "port", 0) or 0
-    server = BusServer(("127.0.0.1", port), RequestHandler)
+    prefer = getattr(args, "prefer_port", 0) or 0
+    server = None
+    if not port and prefer:
+        with contextlib.suppress(OSError):
+            server = BusServer(("127.0.0.1", prefer), RequestHandler)
+    if server is None:
+        server = BusServer(("127.0.0.1", port), RequestHandler)
     server.started_at = time.time()
     server.bus_state = BusState(data_dir, getattr(args, "run", None))
     actual_port = server.server_address[1]
@@ -1302,7 +1309,10 @@ def cmd_ensure(args):
 
         # Not running (no bus.json, unreadable bus.json, dead pid, or a stale
         # bus.json whose pid was reused): start a detached serve process
+        old_port = None
         if os.path.exists(bus_json_path):
+            old_bdata = read_json(bus_json_path)
+            old_port = old_bdata.get("port") if isinstance(old_bdata, dict) else None
             with contextlib.suppress(OSError):
                 os.remove(bus_json_path)
 
@@ -1311,6 +1321,9 @@ def cmd_ensure(args):
             cmd.extend(["--run", args.run])
         if getattr(args, "port", None):
             cmd.extend(["--port", str(args.port)])
+        elif type(old_port) is int and 1024 <= old_port <= 65535:  # bus.json is untrusted: bool/huge ports would crash serve
+            # armed lanes hold the old url; reuse its port when free
+            cmd.extend(["--prefer-port", str(old_port)])
 
         p = subprocess.Popen(
             cmd,
@@ -2864,6 +2877,40 @@ def self_test():
         assert [p["id"] for p in pend_hb["pending"]] == [ask_hb], pend_hb
         done("heartbeat restarts a killed bus; pending ask replayed")
 
+        # 14. restart keeps the old port so armed lanes' url still works
+        data_pp = os.path.join(tmp, "data_pp")
+        lane_pp = os.path.join(tmp, "lane_pp")
+        os.makedirs(lane_pp)
+        rc, res_pp0, _ = cli(["ensure", "--data", data_pp, "--run", "rp"])
+        assert rc == 0 and res_pp0["started"] is True, res_pp0
+        pids.append(res_pp0["pid"])
+        rc, _tk, _ = cli(["token", "--lane", lane_pp, "--task", "T1", "--run", "rp", "--data", data_pp])
+        assert rc == 0, _tk
+        os.kill(res_pp0["pid"], signal.SIGKILL)
+        assert poll_until(lambda: not is_pid_alive(res_pp0["pid"]), timeout=5.0)
+        rc, res_pp1, _ = cli(["heartbeat", "--data", data_pp, "--run", "rp"])
+        assert res_pp1["restarted"] is True and res_pp1["port"] == res_pp0["port"], (res_pp0, res_pp1)
+        pids.append(res_pp1["pid"])
+        lane_cfg = read_json(os.path.join(lane_pp, ".matrixkoder-bus.json"))
+        lane_host = lane_cfg["url"].split("//", 1)[1]
+        with urllib.request.urlopen(urllib.request.Request(
+                f"{lane_cfg['url']}/wait?lane=T1&timeout=1", headers={"Authorization": f"Bearer {lane_cfg['token']}", "Host": lane_host}), timeout=2.0) as resp:
+            assert json.loads(resp.read().decode("utf-8"))["ok"] is True
+        # old port taken by another listener -> restart still works, on a new port
+        os.kill(res_pp1["pid"], signal.SIGKILL)
+        assert poll_until(lambda: not is_pid_alive(res_pp1["pid"]), timeout=5.0)
+        squat = socket.socket()
+        squat.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # TIME_WAIT from the earlier /wait
+        try:
+            squat.bind(("127.0.0.1", res_pp1["port"]))
+            squat.listen(1)
+            rc, res_pp2, _ = cli(["heartbeat", "--data", data_pp, "--run", "rp"])
+            assert res_pp2["ok"] is True and res_pp2["restarted"] is True and res_pp2["port"] != res_pp1["port"], res_pp2
+            pids.append(res_pp2["pid"])
+        finally:
+            squat.close()
+        done("restart reuses the old port; falls back to a new one when it is taken")
+
     finally:
         for p in pids:
             stop_process(p)
@@ -2894,6 +2941,7 @@ def main():
     p_serve.add_argument("--data", help="MatrixKoder data dir")
     p_serve.add_argument("--run", help="Run id")
     p_serve.add_argument("--port", type=int, default=0, help="Port to bind (default 0)")
+    p_serve.add_argument("--prefer-port", type=int, default=0, help="Try this port first, else fall back to 0")
 
     p_ensure = subparsers.add_parser("ensure")
     p_ensure.add_argument("--data", help="MatrixKoder data dir")

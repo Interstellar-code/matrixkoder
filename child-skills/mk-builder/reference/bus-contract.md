@@ -30,6 +30,8 @@ loopback message bus connecting the orchestrator with isolated lane sessions.
 - **B5.** Ephemeral port: The daemon binds to an ephemeral OS-assigned port (`port=0` at socket bind).
   The chosen port is published in `<data>/bus.json` (B21). This eliminates port conflicts between
   concurrent runs, test suites, or leftover zombie processes.
+  A respawn (`ensure`/`heartbeat`) first re-tries the dead bus's previous port, so armed lanes' url
+  stays valid, and falls back to a fresh ephemeral port when it is taken.
 - **B6.** Loopback Host header enforcement: Every incoming HTTP request MUST include a `Host` header
   whose host portion strictly equals `127.0.0.1` or `localhost` (e.g. `127.0.0.1:<port>`). Any request
   with a missing, malformed, or external `Host` header (such as a DNS rebinding attack domain) is
