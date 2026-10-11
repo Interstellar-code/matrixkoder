@@ -14,7 +14,11 @@ Usage:
   mk-lane-event.py --self-test
 
 arm writes <lane>/.matrixkoder-watch.json and records the pane on the task (`mk-state task set T
-pane=<pane>`, best-effort: a task missing from run state still arms). event is run by the herdr plugin
+pane=<pane>`, best-effort: a task missing from run state still arms). When yaml bus.enabled is true
+(the mk-config schema default) arm also runs mk-bus.py ensure then token for the primary task (the
+lane's .matrixkoder-bus.json; its url reported as bus:{ok,url}) and disarm runs mk-bus.py revoke —
+a bus failure rides in the reply as bus:{ok:false,error} and never fails the command ($MK_BUS_CMD
+overrides the script; bus.enabled:false runs no bus command at all). event is run by the herdr plugin
 for EVERY pane status
 change / exit in every workspace; it finds the armed lane for that pane (worktrees of the repos in
 $MATRIXKODER_HOME/projects.json, default ~/.matrixkoder) and exits fast with {"ignored": ...} when
@@ -499,6 +503,74 @@ def mk_state_cmd():
     return os.environ.get("MK_STATE_CMD") or lw.MK_STATE
 
 
+def bus_cmd():
+    """The bus script arm/disarm wire the lane through (a subprocess, like every mk-state call);
+    $MK_BUS_CMD lets a self-test inject a fake (the same rule as $MK_STATE_CMD)."""
+    return os.environ.get("MK_BUS_CMD") or os.path.join(HERE, "mk-bus.py")
+
+
+def bus_enabled(data):
+    """bus.enabled from <data>/matrixkoder.yaml (mk-config helpers: one parser, one default).
+    arm knows its --data, so this never resolves ambient. Missing/unreadable yaml → the schema
+    default (true): a repo that never wrote the key still gets the bus."""
+    try:
+        lines = mk_config.read_lines(os.path.join(data, "matrixkoder.yaml"))
+        return bool(mk_config.value_of(lines, mk_config.row_for(lines, "bus.enabled"))[1])
+    except Exception:  # never crash arm over a setting read
+        return True
+
+
+def run_bus(args_list):
+    """One mk-bus command; -> (json, error). Exit 0 with a JSON ok:true line gives (json, None);
+    every other outcome (non-zero exit, bad/absent JSON, ok:false, a timeout, an exec failure)
+    gives the command's own error as one line. The bus must never fail arm/disarm, so nothing
+    here raises."""
+    try:
+        r = subprocess.run([sys.executable, bus_cmd(), *args_list],
+                           capture_output=True, text=True, timeout=30)
+    except Exception as e:  # missing script, timeout, …: bus trouble, never arm trouble
+        return None, f"{type(e).__name__}: {e}"[:200]
+    j = None
+    try:
+        j = json.loads(r.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        j = None
+    if r.returncode == 0 and isinstance(j, dict) and j.get("ok"):
+        return j, None
+    if isinstance(j, dict) and isinstance(j.get("error"), str) and j["error"].strip():
+        err = j["error"].strip()
+    else:
+        tail = (r.stderr or r.stdout or "").strip()
+        err = tail.splitlines()[-1] if tail else f"exit {r.returncode}"
+    return j, err[:200]
+
+
+def arm_bus(lane, task, run, data):
+    """arm's bus wiring: ensure the server, then mint the lane token (which writes
+    <lane>/.matrixkoder-bus.json); on full success report the lane file's url. token only runs
+    after a good ensure, so a dead bus costs one command, and every failure lands in the reply."""
+    _j, err = run_bus(["ensure", "--data", data, "--run", run])
+    if err:
+        return {"ok": False, "error": err}
+    _j, err = run_bus(["token", "--lane", lane, "--task", task, "--run", run, "--data", data])
+    if err:
+        return {"ok": False, "error": err}
+    try:
+        with open(os.path.join(lane, ".matrixkoder-bus.json")) as f:
+            url = json.load(f).get("url")
+    except (OSError, ValueError):
+        return {"ok": False, "error": "lane bus file unreadable"}
+    return ({"ok": True, "url": url} if url
+            else {"ok": False, "error": "lane bus file has no url"})
+
+
+def disarm_bus(lane, data):
+    """disarm's bus wiring: revoke the lane token (--data only when the watch named one). Like
+    arm_bus, a failure is reported in the reply, never fatal to the disarm."""
+    _j, err = run_bus(["revoke", "--lane", lane, *(["--data", data] if data else [])])
+    return {"ok": True} if err is None else {"ok": False, "error": err}
+
+
 def watch_tasks(w):
     """The tasks a watch file's lane serves: the armed group list (arm --tasks A,B), else the
     single --task id. The primary id stays in w["task"] for every single-task consumer."""
@@ -742,8 +814,12 @@ def cmd_arm(a):
         rec = record_pane(t, pane, w["data"], run)
         if not rec.get("ok"):
             errs.append(f"{t}: {rec.get('error', 'mk-state task set failed')}")
+    # the bus wiring rides along: bus.enabled false → no command at all; any failure is reported,
+    # never fatal — the lane is armed with or without the bus
+    bus = (arm_bus(lane, listed[0], run, w["data"]) if bus_enabled(w["data"])
+           else {"ok": True, "skipped": "bus.enabled is false"})
     out({"ok": True, "lane": lane, "pane": pane, "watch": os.path.join(lane, WATCH), "armed_at": now,
-         **({"task_pane_error": "; ".join(errs)} if errs else {})})
+         "bus": bus, **({"task_pane_error": "; ".join(errs)} if errs else {})})
 
 
 def cmd_disarm(a):
@@ -752,10 +828,16 @@ def cmd_disarm(a):
         fail("disarm needs --lane")
     wf = os.path.join(lane, WATCH)
     with locked(lane):
+        w = read_watch(lane)
         removed = os.path.exists(wf)
         if removed:
             os.remove(wf)
-    out({"ok": True, "lane": lane, "removed": removed})
+        wdata = (w or {}).get("data")
+    enabled = (bus_enabled(wdata) if wdata  # the watch names the data dir its bus lives in
+               else bool(cfg("bus.enabled")))  # no watch (or no data in it): the ambient resolve
+    bus = (disarm_bus(lane, wdata) if enabled
+           else {"ok": True, "skipped": "bus.enabled is false"})
+    out({"ok": True, "lane": lane, "removed": removed, "bus": bus})
 
 
 def cmd_event():
@@ -1022,6 +1104,35 @@ def self_test():
         open(os.path.join(tmp, "prompt_err.txt"), "w").write("")
         open(os.path.join(tmp, "prompt_rc.txt"), "w").write("0")
         open(os.path.join(tmp, "pane_list_out.txt"), "w").write('{"result": {"panes": []}}\n')
+        # fake mk-bus on $MK_BUS_CMD (like the fake mk-state below): records its argv, answers
+        # from canned bus_<cmd>_rc/out.txt files, and token's default success writes the lane's
+        # .matrixkoder-bus.json with a url exactly like the real one — so no test in THIS file
+        # ever starts a real bus server.
+        bus_log = os.path.join(tmp, "buscalls.log")
+        with open(os.path.join(bin_, "mk-bus"), "w") as f:
+            f.write("#!/usr/bin/env python3\n"
+                    "import json, os, sys\n"
+                    "a = sys.argv[1:]\n"
+                    "base = os.environ['FAKE_MK_BUS_DIR']\n"
+                    "open(os.path.join(base, 'buscalls.log'), 'a').write(' '.join(a) + chr(10))\n"
+                    "cmd = a[0] if a else ''\n"
+                    "rc, out = 0, '{\"ok\": true}'\n"
+                    "p_rc = os.path.join(base, 'bus_' + cmd + '_rc.txt')\n"
+                    "p_out = os.path.join(base, 'bus_' + cmd + '_out.txt')\n"
+                    "if os.path.exists(p_rc):\n"
+                    "    rc = int(open(p_rc).read().strip() or '0')\n"
+                    "if os.path.exists(p_out):\n"
+                    "    out = open(p_out).read()\n"
+                    "elif cmd == 'token' and '--lane' in a:\n"
+                    "    lane = a[a.index('--lane') + 1]\n"
+                    "    with open(os.path.join(lane, '.matrixkoder-bus.json'), 'w') as lf:\n"
+                    "        json.dump({'v': 1, 'url': 'http://127.0.0.1:9999', 'token': 'fake'}, lf)\n"
+                    "    out = '{\"ok\": true, \"token\": \"fake\"}'\n"
+                    "sys.stdout.write(out + chr(10))\n"
+                    "sys.exit(rc)\n")
+        os.chmod(os.path.join(bin_, "mk-bus"), 0o755)
+        os.environ["FAKE_MK_BUS_DIR"] = tmp
+        os.environ["MK_BUS_CMD"] = os.path.join(bin_, "mk-bus")
         # fake herdr socket: records pane.report_metadata, answers {"ok": true}
         import socketserver
 
@@ -1713,6 +1824,104 @@ def self_test():
         assert r["ok"] and r["removed"] is False
         r = event("working", tid="H3")
         assert r == {"ok": True, "ignored": "not an armed lane"}, r
+
+        # (BUS) arm/disarm wire the lane into the bus through the fake ($MK_BUS_CMD): argv
+        # recorded to buscalls.log, canned failures per subcommand. No real server, ever.
+        def bus_calls():
+            return open(bus_log).read().splitlines() if os.path.exists(bus_log) else []
+
+        # (a) default (no bus yaml): ensure then token with exactly this argv; the reply reports
+        # the lane file's url
+        open(bus_log, "w").write("")
+        lanes["HB"] = os.path.join(tmp, "lane-hb")
+        g(repo, "worktree", "add", "-q", "--detach", lanes["HB"])
+        mks("task", "add", "--id", "HB", "--title", "bus lane", "--run", "r1")
+        r = cli("arm", "--lane", lanes["HB"], "--pane", pane_of("HB"), "--task", "HB", "--run", "r1",
+                "--data", data, "--phase", "P1", "--commit-grep", "x")
+        assert r["ok"] is True and r["bus"] == {"ok": True, "url": "http://127.0.0.1:9999"}, r
+        assert bus_calls() == [f"ensure --data {data} --run r1",
+                               f"token --lane {lanes['HB']} --task HB --run r1 --data {data}"], bus_calls()
+        assert json.load(open(os.path.join(lanes["HB"], ".matrixkoder-bus.json")))["url"] == \
+            "http://127.0.0.1:9999"
+        # (b) a group arm (--tasks A,B): token's --task is the FIRST listed task
+        open(bus_log, "w").write("")
+        lanes["HG"] = os.path.join(tmp, "lane-hg")
+        g(repo, "worktree", "add", "-q", "--detach", lanes["HG"])
+        mks("task", "add", "--id", "HG1", "--title", "g1", "--run", "r1")
+        mks("task", "add", "--id", "HG2", "--title", "g2", "--run", "r1")
+        r = cli("arm", "--lane", lanes["HG"], "--pane", pane_of("HG"), "--tasks", "HG1,HG2",
+                "--run", "r1", "--data", data, "--phase", "P1", "--commit-grep", "x")
+        assert r["ok"] is True and r["bus"]["ok"] is True and "task_pane_error" not in r, r
+        assert bus_calls() == [f"ensure --data {data} --run r1",
+                               f"token --lane {lanes['HG']} --task HG1 --run r1 --data {data}"], bus_calls()
+        # (c) a data dir whose yaml says bus.enabled false: no bus command at all, arm or disarm
+        databus = os.path.join(tmp, "data-busoff")
+        os.makedirs(databus)
+        with open(os.path.join(databus, "matrixkoder.yaml"), "w") as f:
+            f.write("bus:\n  enabled: false\n")
+
+        def mks_in(dir_, *args):
+            r_ = subprocess.run([sys.executable, MK, *args, "--data", dir_],
+                                capture_output=True, text=True)
+            assert r_.returncode == 0, r_.stdout + r_.stderr
+
+        mks_in(databus, "run", "init", "--id", "r1", "--feature", "F", "--branch", "b")
+        mks_in(databus, "task", "add", "--id", "HO", "--title", "off", "--run", "r1")
+        open(bus_log, "w").write("")
+        lanes["HO"] = os.path.join(tmp, "lane-ho")
+        g(repo, "worktree", "add", "-q", "--detach", lanes["HO"])
+        r = cli("arm", "--lane", lanes["HO"], "--pane", pane_of("HO"), "--task", "HO", "--run", "r1",
+                "--data", databus, "--phase", "P1", "--commit-grep", "x")
+        assert r["ok"] is True and "task_pane_error" not in r and \
+            r["bus"] == {"ok": True, "skipped": "bus.enabled is false"}, r
+        assert bus_calls() == [], bus_calls()
+        r = cli("disarm", "--lane", lanes["HO"])
+        assert r["ok"] is True and r["removed"] is True and \
+            r["bus"] == {"ok": True, "skipped": "bus.enabled is false"}, r
+        assert bus_calls() == [], bus_calls()
+        # (d) ensure fails (exit 2, {"ok": false, "error": "boom"}) → arm still ok:true,
+        # bus.ok:false carrying "boom", and token was NOT called
+        open(os.path.join(tmp, "bus_ensure_rc.txt"), "w").write("2")
+        open(os.path.join(tmp, "bus_ensure_out.txt"), "w").write('{"ok": false, "error": "boom"}\n')
+        open(bus_log, "w").write("")
+        r = cli("arm", "--lane", lanes["HB"], "--pane", pane_of("HB"), "--task", "HB", "--run", "r1",
+                "--data", data, "--phase", "P2", "--commit-grep", "x")
+        assert r["ok"] is True and r["bus"]["ok"] is False and "boom" in r["bus"]["error"], r
+        assert bus_calls() == [f"ensure --data {data} --run r1"], bus_calls()
+        os.unlink(os.path.join(tmp, "bus_ensure_rc.txt"))
+        os.unlink(os.path.join(tmp, "bus_ensure_out.txt"))
+        # (e) token fails after a good ensure → bus.ok:false, arm still ok:true
+        open(os.path.join(tmp, "bus_token_rc.txt"), "w").write("2")
+        open(os.path.join(tmp, "bus_token_out.txt"), "w").write('{"ok": false, "error": "no token"}\n')
+        r = cli("arm", "--lane", lanes["HB"], "--pane", pane_of("HB"), "--task", "HB", "--run", "r1",
+                "--data", data, "--phase", "P2", "--commit-grep", "x")
+        assert r["ok"] is True and r["bus"]["ok"] is False and "no token" in r["bus"]["error"], r
+        os.unlink(os.path.join(tmp, "bus_token_rc.txt"))
+        os.unlink(os.path.join(tmp, "bus_token_out.txt"))
+        # (f) disarm on an armed lane → revoke --lane … --data <watch's data>; no watch →
+        # revoke --lane only (ambient bus.enabled, no yaml → true); a failing revoke → disarm
+        # still ok:true, bus.ok:false
+        open(bus_log, "w").write("")
+        r = cli("disarm", "--lane", lanes["HB"])
+        assert r["ok"] is True and r["removed"] is True and r["bus"] == {"ok": True}, r
+        assert bus_calls() == [f"revoke --lane {lanes['HB']} --data {data}"], bus_calls()
+        open(bus_log, "w").write("")
+        r = cli("disarm", "--lane", lanes["HB"])
+        assert r["ok"] is True and r["removed"] is False and r["bus"] == {"ok": True}, r
+        assert bus_calls() == [f"revoke --lane {lanes['HB']}"], bus_calls()
+        lanes["HB2"] = os.path.join(tmp, "lane-hb2")
+        g(repo, "worktree", "add", "-q", "--detach", lanes["HB2"])
+        mks("task", "add", "--id", "HB2", "--title", "b2", "--run", "r1")
+        r = cli("arm", "--lane", lanes["HB2"], "--pane", pane_of("HB2"), "--task", "HB2",
+                "--run", "r1", "--data", data, "--phase", "P1", "--commit-grep", "x")
+        assert r["ok"] is True and r["bus"]["ok"] is True, r
+        open(os.path.join(tmp, "bus_revoke_rc.txt"), "w").write("2")
+        open(os.path.join(tmp, "bus_revoke_out.txt"), "w").write('{"ok": false, "error": "revoke boom"}\n')
+        r = cli("disarm", "--lane", lanes["HB2"])
+        assert r["ok"] is True and r["removed"] is True and r["bus"]["ok"] is False and \
+            "revoke boom" in r["bus"]["error"], r
+        os.unlink(os.path.join(tmp, "bus_revoke_rc.txt"))
+        os.unlink(os.path.join(tmp, "bus_revoke_out.txt"))
 
         srv.shutdown()
         srv.server_close()

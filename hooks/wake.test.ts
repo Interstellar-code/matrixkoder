@@ -1173,3 +1173,141 @@ test('solo mode registers no wake hooks at all (no session.start handler, no tim
   const wakeKeys = [...w.store.keys()].filter(k => k.startsWith('wakeEventLines') || k.startsWith('wakeSentAt') || k.startsWith('wakePending'))
   expect(wakeKeys, 'no pollEpoch bump, no baseline, no pending: nothing registered').toEqual([])
 })
+
+test('two bus asks 1 min apart wake twice', { options: { wake: true } }, async ($, on) => {
+  // Spec 3: a bus ask is a question — the second ask (m-2) must wake even though the
+  // per-task F6:blocked cooldown from the first ask (m-1) is still inside its 5-min
+  // window. The old per task:status key suppressed the second ask; the per-ask key
+  // `${task}:blocked:${askId}` lets it through, and the ask-labeled summary text keeps
+  // it past the identical-text hold.
+  const clock = mock.clock(on)
+  const submitted: string[] = []
+  const store = new Map<string, unknown>([
+    ['wakeEventLines:busask-run', 0],
+  ])
+
+  let eventLines = [
+    JSON.stringify({ t: '2026-10-07T21:00:00+02:00', run: 'busask-run', task: 'F6', type: 'transition', from: 'building', to: 'blocked', text: 'bus ask m-1: q1', by: 'bus' }),
+  ]
+
+  const files: Record<string, string> = {
+    '/data/runs/index.json': JSON.stringify([{ id: 'busask-run', status: 'active' }]),
+  }
+
+  mock.env(on, { MATRIXKODER_DATA: '/data' })
+
+  on('fs.read', (_$, e) => {
+    if (e.path === '/data/runs/index.json') return { value: files[e.path] ?? '' }
+    if (e.path === '/data/runs/busask-run/events.jsonl') return { value: eventLines.join('\n') + '\n' }
+    return { value: '' }
+  })
+  on('prompt.submit', (_$, e) => {
+    submitted.push(e.text)
+    return { text: e.text }
+  })
+  on('state.get', (_$, e, next) => {
+    if (e.key === 'wakeEventLines' || e.key === 'wakeSentAt') {
+      const k = `${e.key}:${e.id}`
+      return { value: { value: store.get(k), version: 1 } }
+    }
+    return next(e)
+  })
+  on('state.set', (_$, e, next) => {
+    if (e.key === 'wakeEventLines' || e.key === 'wakeSentAt') {
+      const k = `${e.key}:${e.id}`
+      store.set(k, e.value)
+      return { value: { isSet: true, version: 1 } }
+    }
+    return next(e)
+  })
+  on('session.start', (_$, e, next) => ({ cwd: '/tmp' }))
+
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+
+  // Ask 1 at t=0 -> poll at 30s -> debounce flush at 90s
+  await clock.advance(30000)
+  await clock.advance(60000)
+  expect(submitted.length).toBe(1)
+  expect(submitted[0]).toBe('MatrixKoder: F6 → blocked (bus ask m-1). Continue the run from its Next action.')
+
+  // Ask 2 arrives 1 min after the first — inside the 5-min cooldown that the old
+  // per-task key stamped at t=90s (this is where the old code saw one submit total)
+  await clock.advance(60000) // t=150s
+  eventLines.push(
+    JSON.stringify({ t: '2026-10-07T21:01:00+02:00', run: 'busask-run', task: 'F6', type: 'transition', from: 'blocked', to: 'blocked', text: 'bus ask m-2: q2', by: 'bus' }),
+  )
+  await clock.advance(30000) // poll at t=180s: m-2 is a NEW ask — discovered
+  await clock.advance(60000) // debounce at t=240s: different text, hold does not block
+  expect(submitted.length).toBe(2)
+  expect(submitted[1]).toBe('MatrixKoder: F6 → blocked (bus ask m-2). Continue the run from its Next action.')
+})
+
+test('two plain blocked transitions 1 min apart wake once (old behaviour kept)', { options: { wake: true } }, async ($, on) => {
+  // The plain per task:status cooldown is unchanged by the bus-ask rule: a second plain
+  // blocked transition for the same task inside 5 min is still suppressed, ask or not.
+  const clock = mock.clock(on)
+  const submitted: string[] = []
+  const store = new Map<string, unknown>([
+    ['wakeEventLines:plainblk-run', 0],
+  ])
+
+  let eventLines = [
+    JSON.stringify({ t: '2026-10-07T21:00:00+02:00', run: 'plainblk-run', task: 'F6', type: 'transition', from: 'building', to: 'blocked' }),
+  ]
+
+  const files: Record<string, string> = {
+    '/data/runs/index.json': JSON.stringify([{ id: 'plainblk-run', status: 'active' }]),
+  }
+
+  mock.env(on, { MATRIXKODER_DATA: '/data' })
+
+  on('fs.read', (_$, e) => {
+    if (e.path === '/data/runs/index.json') return { value: files[e.path] ?? '' }
+    if (e.path === '/data/runs/plainblk-run/events.jsonl') return { value: eventLines.join('\n') + '\n' }
+    return { value: '' }
+  })
+  on('prompt.submit', (_$, e) => {
+    submitted.push(e.text)
+    return { text: e.text }
+  })
+  on('state.get', (_$, e, next) => {
+    if (e.key === 'wakeEventLines' || e.key === 'wakeSentAt') {
+      const k = `${e.key}:${e.id}`
+      return { value: { value: store.get(k), version: 1 } }
+    }
+    return next(e)
+  })
+  on('state.set', (_$, e, next) => {
+    if (e.key === 'wakeEventLines' || e.key === 'wakeSentAt') {
+      const k = `${e.key}:${e.id}`
+      store.set(k, e.value)
+      return { value: { isSet: true, version: 1 } }
+    }
+    return next(e)
+  })
+  on('session.start', (_$, e, next) => ({ cwd: '/tmp' }))
+
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+
+  // Event 1 at t=0 -> submit at 90s
+  await clock.advance(30000)
+  await clock.advance(60000)
+  expect(submitted.length).toBe(1)
+  expect(submitted[0]).toBe('MatrixKoder: F6 → blocked. Continue the run from its Next action.')
+
+  // Event 2 (plain blocked, no bus-ask note) 1 min later: suppressed by the 5-min
+  // per-task cooldown — exactly the pre-existing behaviour
+  await clock.advance(60000) // t=150s
+  eventLines.push(
+    JSON.stringify({ t: '2026-10-07T21:01:00+02:00', run: 'plainblk-run', task: 'F6', type: 'transition', from: 'blocked', to: 'blocked' }),
+  )
+  await clock.advance(30000) // poll at t=180s: inside the cooldown, nothing discovered
+  await clock.advance(60000) // debounce: nothing pending
+  expect(submitted.length).toBe(1)
+
+  // Past the 5-min window nothing changes either: the suppressed line was consumed
+  await clock.advance(240000)
+  await clock.advance(30000)
+  await clock.advance(60000)
+  expect(submitted.length).toBe(1)
+})

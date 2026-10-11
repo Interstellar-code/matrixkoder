@@ -6,10 +6,13 @@ Subcommands:
       Runs foreground loopback HTTP/SSE server. Holds <data>/bus.lock exclusively (0600),
       writes <data>/bus.json {pid, port, started, owner_heartbeat, token} (0600), registers token in
       <data>/bus-tokens.json (0600). Rebuilds state from <data>/runs/<run>/bus.jsonl.
-      Self-exits when owner_heartbeat is older than 30 min (or $MK_BUS_HEARTBEAT_TIMEOUT_SEC)
-      or when bus.json is missing.
+      Self-exits when owner_heartbeat is older than bus.owner_timeout_min
+      (<data>/matrixkoder.yaml, clamped to [5, 120] min, default 30; $MK_BUS_HEARTBEAT_TIMEOUT_SEC
+      overrides) or when bus.json is missing.
   ensure [--data DIR] [--run ID] [--port PORT]
-      Ensures a detached server process is running. Idempotent. Returns
+      Ensures a detached server process is running. Idempotent. A recorded pid is only
+      trusted when /health names this data dir (a refused port means pid reuse): else
+      bus.json is stale and the bus respawns. Returns
       {"ok": true, "pid": PID, "port": PORT, "started": BOOL}.
   heartbeat [--data DIR]
       Updates owner_heartbeat in <data>/bus.json.
@@ -20,7 +23,10 @@ Subcommands:
   revoke --lane DIR [--data DIR]
       Removes <lane>/.matrixkoder-bus.json and invalidates token.
   send --run ID --task T --kind KIND --text TEXT [--from S] [--to S] [--reply-to ID] [--data DIR]
-      Sends a message via POST /send.
+      Sends a message via POST /send. A lane-token ask also marks its task blocked in run state
+      (mk-state task set <T> status=blocked --note "bus ask <id>: <text>" --by bus, once per ask
+      id); that reply carries state_updated/mk_state_error, and an mk-state failure never fails
+      the POST.
   answer MSG_ID TEXT [--run ID] [--data DIR]
       Sends answer message with reply_to=MSG_ID. Also runs
       scripts/mk-state.py --data <data> --run ID task set <T> status=building --note "bus answer".
@@ -33,7 +39,7 @@ Subcommands:
 
 Every command prints ONE JSON line. Errors: {"ok": false, "error": ...} exit 2.
 """
-import argparse, contextlib, datetime, fcntl, hmac, json, math, os, re, secrets, signal, socket, subprocess, sys, tempfile, threading, time
+import argparse, contextlib, datetime, fcntl, hmac, importlib.util, json, math, os, re, secrets, signal, socket, subprocess, sys, tempfile, threading, time
 import urllib.error, urllib.parse, urllib.request
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
@@ -160,6 +166,61 @@ def stop_process(pid, timeout=5.0):
         pass
 
 
+def _load_mk_config():
+    """mk-config from the sibling script (a path load, never an import — each script stands alone),
+    or None when that fails: a broken sibling install must leave the bus running on its defaults,
+    not dead on an import error."""
+    try:
+        spec = importlib.util.spec_from_file_location("mk_config", os.path.join(HERE, "mk-config.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+_mk_config = _load_mk_config()
+
+
+def owner_timeout_s(data_dir):
+    """Seconds a silent owner may keep the bus alive: $MK_BUS_HEARTBEAT_TIMEOUT_SEC (test hook,
+    unchanged precedence) > bus.owner_timeout_min from <data_dir>/matrixkoder.yaml (mk-config
+    helpers; clamped to the schema's [5, 120] minutes, then ×60) > the schema default 30 min.
+    Any failure to read the setting falls back to 1800.0 s, exactly the old hard-coded default."""
+    env = os.environ.get("MK_BUS_HEARTBEAT_TIMEOUT_SEC")
+    if env is not None:
+        try:
+            return float(env)
+        except ValueError:
+            pass  # an unparseable hook falls through to the settings rather than crash the monitor
+    if _mk_config is not None:
+        try:
+            lines = _mk_config.read_lines(os.path.join(data_dir, "matrixkoder.yaml"))
+            row = _mk_config.row_for(lines, "bus.owner_timeout_min")
+            minutes = _mk_config.value_of(lines, row)[1]
+            return float(max(5, min(120, minutes))) * 60.0
+        except Exception:
+            pass
+    return 1800.0
+
+
+def _mk_state_task_set(data_dir, run, task, status, note, by="orchestrator"):
+    """The ONE mk-state write the bus makes (cmd_answer's unblock and the lane-ask block both go
+    through here): `task set <T> status=<s> --note <n> --by <by>`, $MK_STATE_CMD overridable for a
+    self-test. -> (state_updated, mk_state_error): a failure is returned, never raised — the
+    caller rode it along in its reply instead of failing the command that triggered the write."""
+    mk_state_cmd = os.environ.get("MK_STATE_CMD") or os.path.join(HERE, "mk-state.py")
+    cmd = [sys.executable, mk_state_cmd, "--data", data_dir, "--run", run, "task", "set", task,
+           f"status={status}", "--note", note, "--by", by]
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+        if p.returncode == 0:
+            return True, None
+        return False, (p.stderr.strip() or p.stdout.strip())
+    except Exception as e:
+        return False, str(e)
+
+
 def matches_lane(msg, lane):
     if not lane or lane == "*":
         return True
@@ -180,6 +241,17 @@ class BusState:
         self.tokens = {}
         self.tokens_mtime = 0
         self.runs = {}
+        # ask ids whose task was already marked blocked (the /send lane-ask path): guards the
+        # "once per ask id" mk-state write, thread-safe under the same lock as every other state
+        self.marked_asks = set()
+
+    def mark_ask_once(self, ask_id):
+        """True exactly once per ask id: the caller may run its one blocked-marking write."""
+        with self.lock:
+            if ask_id in self.marked_asks:
+                return False
+            self.marked_asks.add(ask_id)
+            return True
 
     def get_token(self, token_str):
         if not token_str or not isinstance(token_str, str):
@@ -234,6 +306,32 @@ class BusState:
             fcntl.flock(lfd, fcntl.LOCK_UN)
             os.close(lfd)
 
+    def retire_orch_tokens(self):
+        """Drop every role=="orch" entry from <data>/bus-tokens.json: each serve
+        start registers a fresh orchestrator token, and without retirement every
+        orch token since the data dir's birth stayed valid forever (review LOW 4).
+        Same bus-tokens.lock + write_json 0600 pattern as add_token/cmd_revoke;
+        lane tokens are untouched."""
+        lock_path = os.path.join(self.data_dir, "bus-tokens.lock")
+        tokens_path = os.path.join(self.data_dir, "bus-tokens.json")
+        os.makedirs(self.data_dir, exist_ok=True)
+        lfd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        os.fchmod(lfd, 0o600)
+        fcntl.flock(lfd, fcntl.LOCK_EX)
+        try:
+            tokens = read_json(tokens_path, default={})
+            if not isinstance(tokens, dict):
+                tokens = {}
+            kept = {k: v for k, v in tokens.items()
+                    if not (isinstance(v, dict) and v.get("role") == "orch")}
+            write_json(tokens_path, kept, mode=0o600)
+            with self.lock:
+                self.tokens = kept
+                self.tokens_mtime = os.path.getmtime(tokens_path)
+        finally:
+            fcntl.flock(lfd, fcntl.LOCK_UN)
+            os.close(lfd)
+
     def get_run_state(self, run):
         if not run:
             run = self.default_run or "default"
@@ -264,6 +362,12 @@ class BusState:
                             except Exception:
                                 continue
                             if not isinstance(obj, dict) or "id" not in obj or "seq" not in obj:
+                                continue
+                            # A non-str (or empty) id would poison by_id with an
+                            # unhashable key and TypeError every later request for
+                            # the run (review LOW 3, hand-edited files only): skip
+                            # the whole line, id AND seq.
+                            if not isinstance(obj.get("id"), str) or not obj.get("id"):
                                 continue
                             seq = obj.get("seq")
                             if not isinstance(seq, int) or isinstance(seq, bool):
@@ -333,6 +437,14 @@ class BusState:
 
         with self.lock:
             rstate = self.get_run_state(run)
+            if kind == "answer":
+                # Authoritative duplicate-answer check under the lock: the early
+                # check in do_POST runs unlocked, so two simultaneous answers to
+                # one ask could both pass it (review LOW 5). append_message is
+                # the one serialization point for writes — exactly one lands.
+                for m in rstate["messages"]:
+                    if m.get("kind") == "answer" and m.get("reply_to") == reply_to:
+                        raise Fail("ask already answered")
             seq = rstate["next_seq"]
             rstate["next_seq"] += 1
             msg_id = f"m-{seq}"
@@ -459,6 +571,25 @@ class RequestHandler(BaseHTTPRequestHandler):
         # headers (BaseHTTPRequestHandler would otherwise answer 501 HTML).
         self.send_error_json(403, "browser origins rejected")
 
+    # B25: PUT/DELETE/PATCH would otherwise fall through to the stdlib 501
+    # HTML page — errors are JSON on this bus. Constant 405, no auth path.
+    def do_PUT(self):
+        self.send_error_json(405, "method not allowed")
+
+    def do_DELETE(self):
+        self.send_error_json(405, "method not allowed")
+
+    def do_PATCH(self):
+        self.send_error_json(405, "method not allowed")
+
+    def do_HEAD(self):
+        # Same 405, but HEAD must never carry a body: send the status and
+        # JSON headers like send_json does, skipping the body write.
+        self.send_response(405)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def validate_request(self):
         if "Origin" in self.headers:
             self.send_error_json(403, "browser origins rejected")
@@ -495,11 +626,15 @@ class RequestHandler(BaseHTTPRequestHandler):
 
             if path == "/health":
                 uptime = time.time() - getattr(self.server, "started_at", time.time())
+                # "data" lets ensure IDENTIFY our server: a live pid alone can
+                # be pid reuse, and a reused pid serving another data dir must
+                # not be trusted (review LOW 1). Loopback-only, same user.
                 self.send_json(200, {
                     "ok": True,
                     "status": "healthy",
                     "pid": os.getpid(),
-                    "uptime_sec": round(uptime, 3)
+                    "uptime_sec": round(uptime, 3),
+                    "data": self.server.bus_state.data_dir
                 })
                 return
 
@@ -749,7 +884,15 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if text is None or not isinstance(text, str):
                     self.send_error_json(400, "text must be a string")
                     return
-                if len(text.encode("utf-8")) > 65536:
+                try:
+                    text_len = len(text.encode("utf-8"))
+                except UnicodeEncodeError:
+                    # json.loads happily builds a lone surrogate from a \ud800
+                    # escape; it can never encode to UTF-8 (the jsonl append
+                    # would raise) -> reject at the door as 400, never a 500.
+                    self.send_error_json(400, "text is not valid UTF-8")
+                    return
+                if text_len > 65536:
                     self.send_error_json(400, "text exceeds 64 KiB")
                     return
                 # B18: text is non-empty for ask/answer/info; empty is allowed
@@ -873,16 +1016,36 @@ class RequestHandler(BaseHTTPRequestHandler):
                     })
                     return
 
-                msg = self.server.bus_state.append_message(
-                    run=run,
-                    task=task,
-                    from_val=from_val,
-                    to_val=to_val,
-                    kind=kind,
-                    text=text,
-                    reply_to=reply_to
-                )
-                self.send_json(200, {"ok": True, "message": msg})
+                # append_message re-checks "ask already answered" under the
+                # lock: a losing racer surfaces here as Fail -> 400, never a
+                # 500 from the handler's blanket except.
+                try:
+                    msg = self.server.bus_state.append_message(
+                        run=run,
+                        task=task,
+                        from_val=from_val,
+                        to_val=to_val,
+                        kind=kind,
+                        text=text,
+                        reply_to=reply_to
+                    )
+                except Fail as e:
+                    self.send_error_json(400, str(e))
+                    return
+                if kind == "ask" and not is_orch:
+                    # A lane ask means the lane is parked on the orchestrator: set its task
+                    # blocked so the dashboard wake surfaces it (answer sets building again).
+                    # append_message has returned, so no lock is held here; the once-per-ask-id
+                    # guard is the bus state's set; an mk-state failure rides in the reply and
+                    # never fails the POST (the ask itself was already delivered).
+                    ask_reply = {"state_updated": False, "mk_state_error": None}
+                    if self.server.bus_state.mark_ask_once(msg["id"]):
+                        ask_reply["state_updated"], ask_reply["mk_state_error"] = _mk_state_task_set(
+                            self.server.bus_state.data_dir, run, task, "blocked",
+                            f"bus ask {msg['id']}: {text[:80]}", by="bus")
+                    self.send_json(200, {"ok": True, "message": msg, **ask_reply})
+                else:
+                    self.send_json(200, {"ok": True, "message": msg})
 
             elif path == "/ack":
                 target_id = body.get("id") or body.get("reply_to")
@@ -960,7 +1123,7 @@ class BusServer(ThreadingHTTPServer):
 
 def heartbeat_monitor(server, data_dir, stop_event):
     check_interval = float(os.environ.get("MK_BUS_HEARTBEAT_CHECK_SEC", "60.0"))
-    timeout = float(os.environ.get("MK_BUS_HEARTBEAT_TIMEOUT_SEC", "1800.0"))
+    timeout = owner_timeout_s(data_dir)  # env hook > bus.owner_timeout_min > schema default 30 min
     bus_json_path = os.path.join(data_dir, "bus.json")
 
     while not stop_event.wait(check_interval):
@@ -1006,6 +1169,11 @@ def cmd_serve(args):
     actual_port = server.server_address[1]
 
     orch_token = secrets.token_urlsafe(32)
+    # One live orchestrator identity per data dir: retire earlier orch tokens
+    # BEFORE registering the fresh one (review LOW 4), so the previous
+    # orchestrator's token answers 401 after a restart instead of living
+    # forever.
+    server.bus_state.retire_orch_tokens()
     server.bus_state.add_token(orch_token, getattr(args, "run", "*") or "*", "orch", "orch", role="orch")
 
     bus_data = {
@@ -1067,18 +1235,27 @@ def cmd_ensure(args):
     os.fchmod(efd, 0o600)
     fcntl.flock(efd, fcntl.LOCK_EX)
     try:
-        # Check if server is already running. bus.json is only removed when
-        # the recorded pid is DEAD: a live server whose /health probe times
-        # out once (busy box, slow start) must never be declared down — the
-        # old remove-and-respawn behavior made the healthy server self-exit
-        # (review LOW 5). Probe with retries while the pid lives.
+        # Check if server is already running. The recorded pid alone proves
+        # nothing: after a SIGKILL or a reboot the OS may have recycled it for
+        # any same-user process, and ensure would fail forever on a stale
+        # bus.json (review LOW 1). /health now names the data dir it serves,
+        # so the probe must IDENTIFY our server, not just find a live pid. A
+        # REFUSED connection also means pid reuse: our server, even SIGSTOPed,
+        # keeps its listening socket (the kernel completes the handshake from
+        # the backlog; only the response stalls), so refusal ≠ timeout. A
+        # timeout or any other probe error on a live pid keeps the old rule:
+        # the server holds bus.lock and a respawn would just exit — retry to
+        # the deadline, then fail without touching bus.json (review LOW 5,
+        # self-test 10b).
         if os.path.exists(bus_json_path):
             bdata = read_json(bus_json_path)
             pid = (bdata or {}).get("pid")
             port = (bdata or {}).get("port")
             if pid and port and is_pid_alive(pid):
+                stale = False
                 probe_deadline = time.time() + 5.0
                 while time.time() < probe_deadline:
+                    refused = False
                     try:
                         req = urllib.request.Request(
                             f"http://127.0.0.1:{port}/health",
@@ -1086,16 +1263,30 @@ def cmd_ensure(args):
                         )
                         with urllib.request.urlopen(req, timeout=1.0) as resp:
                             if resp.status == 200:
-                                # Refresh heartbeat
-                                bdata["owner_heartbeat"] = time.time()
-                                write_json(bus_json_path, bdata, mode=0o600)
-                                res = {"ok": True, "pid": pid, "port": port, "started": False}
-                                out(res)
-                                return res
+                                h = json.loads(resp.read().decode("utf-8"))
+                                if isinstance(h, dict) and h.get("data") == data_dir:
+                                    # Healthy and provably ours: refresh heartbeat.
+                                    bdata["owner_heartbeat"] = time.time()
+                                    write_json(bus_json_path, bdata, mode=0o600)
+                                    res = {"ok": True, "pid": pid, "port": port, "started": False}
+                                    out(res)
+                                    return res
+                            # 200 from a different data dir: another mk-bus
+                            # owns this pid (pid reuse across data dirs) —
+                            # bus.json is stale, respawn ours.
+                            stale = True
+                    except urllib.error.URLError as e:
+                        # urllib wraps refusal as URLError(reason=ConnectionRefusedError);
+                        # http.client can also raise it bare.
+                        refused = isinstance(getattr(e, "reason", None), ConnectionRefusedError)
+                    except ConnectionRefusedError:
+                        refused = True
                     except Exception:
                         pass
-                    if not is_pid_alive(pid):
-                        # Died under our probe: fall through to restart.
+                    if stale or refused or not is_pid_alive(pid):
+                        # Stale (reused pid), nothing listening, or the pid
+                        # died under our probe: all fall through to
+                        # remove + respawn.
                         break
                     time.sleep(0.2)
                 else:
@@ -1104,8 +1295,8 @@ def cmd_ensure(args):
                     # just exit; refuse instead of destroying live state.
                     raise Fail("bus process alive but not answering health probes")
 
-        # Not running (no bus.json, unreadable bus.json, or dead pid):
-        # start a detached serve process
+        # Not running (no bus.json, unreadable bus.json, dead pid, or a stale
+        # bus.json whose pid was reused): start a detached serve process
         if os.path.exists(bus_json_path):
             with contextlib.suppress(OSError):
                 os.remove(bus_json_path)
@@ -1422,16 +1613,8 @@ def cmd_answer(args):
     state_updated = False
     mk_state_error = None
     if task:
-        mk_state_cmd = os.environ.get("MK_STATE_CMD") or os.path.join(HERE, "mk-state.py")
-        cmd = [sys.executable, mk_state_cmd, "--data", data_dir, "--run", target_run, "task", "set", task, "status=building", "--note", "bus answer"]
-        try:
-            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if p.returncode == 0:
-                state_updated = True
-            else:
-                mk_state_error = (p.stderr.strip() or p.stdout.strip())
-        except Exception as e:
-            mk_state_error = str(e)
+        state_updated, mk_state_error = _mk_state_task_set(data_dir, target_run, task,
+                                                           "building", "bus answer")
 
     res = {
         "ok": True,
@@ -1575,6 +1758,14 @@ def self_test():
         assert rc == 0 and res2["ok"] is True and res2["started"] is False, res2
         assert res2["pid"] == pid1 and res2["port"] == port1
         done("ensure idempotence + /health")
+
+        # 1a. /health names its data dir (LOW 1 support): ensure must be able
+        # to tell OUR bus from a reused pid serving a different data dir.
+        req_hd = urllib.request.Request(f"http://127.0.0.1:{port1}/health", headers={"Host": f"127.0.0.1:{port1}"})
+        with urllib.request.urlopen(req_hd, timeout=2.0) as resp:
+            hd = json.loads(resp.read().decode("utf-8"))
+            assert hd.get("data") == data, hd
+        done("health reports its data dir")
 
         # 1b. Concurrent ensure race (LOW finding 9): N callers serialize on
         # <data>/bus-ensure.lock; exactly one reports started:true, the rest
@@ -2156,6 +2347,34 @@ def self_test():
         stop_process(pid3)
         assert not is_pid_alive(pid3)
 
+        # 8c. Replay tolerance for a hand-edited line whose id is not a str
+        # (LOW 3): the line is skipped (id AND seq) and the run still serves
+        # its REAL messages instead of TypeError-500ing every request.
+        poison = '{"seq": 99, "id": [1], "kind": "info", "run": "r1", "task": "T1", "from": "x", "to": "T1", "text": "poison", "reply_to": null, "ack_level": 1, "ts": "2026-01-01T00:00:00Z"}\n'
+        with open(jsonl_path, "a") as f:
+            f.write(poison)
+        rc, res_ens_poison, _ = cli(["ensure", "--data", data, "--run", "r1"])
+        assert rc == 0 and res_ens_poison["ok"] is True and res_ens_poison["started"] is True, res_ens_poison
+        pids.append(res_ens_poison["pid"])
+        port_p = res_ens_poison["port"]
+        req_wp = urllib.request.Request(
+            f"http://127.0.0.1:{port_p}/wait?lane=T1&after=0&timeout=1",
+            headers={"Authorization": f"Bearer {token1}", "Host": f"127.0.0.1:{port_p}"}
+        )
+        with urllib.request.urlopen(req_wp, timeout=5.0) as resp:
+            wp = json.loads(resp.read().decode("utf-8"))
+        assert wp["ok"] is True and wp["message"]["id"] == ans_msg["id"], wp
+        rc, pend_p, _ = cli(["pending", "--run", "r1", "--data", data])
+        assert rc == 0 and [p["id"] for p in pend_p["pending"]] == [t2_ask_id], pend_p
+        stop_process(res_ens_poison["pid"])
+        assert not is_pid_alive(res_ens_poison["pid"])
+        # Restore the log so later sections replay a pristine r1.
+        lines_p = open(jsonl_path).readlines()
+        assert lines_p[-1] == poison, "poison line must still be the last line"
+        with open(jsonl_path, "w") as f:
+            f.writelines(lines_p[:-1])
+        done("replay skips non-str id lines")
+
         # 9. Stale owner_heartbeat and missing bus.json reaper (LOW finding 9)
         env_hb = os.environ.copy()
         env_hb["MK_BUS_HEARTBEAT_CHECK_SEC"] = "0.05"
@@ -2227,6 +2446,76 @@ def self_test():
         stop_process(pid_slow)
         done("ensure keeps live-but-unresponsive bus")
 
+        # 10c. Stale bus.json whose pid is a live NON-listening process
+        # (LOW 1): pid reuse (here a sleeper) must be told from our stopped
+        # server — connection refused means nothing of ours listens there,
+        # so bus.json is stale: ensure removes it and respawns a real bus.
+        data_stale = os.path.join(tmp, "data_stale")
+        os.makedirs(data_stale, exist_ok=True)
+        sleeper = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        pids.append(sleeper.pid)
+        write_json(os.path.join(data_stale, "bus.json"),
+                   {"pid": sleeper.pid, "port": 1, "started": time.time(),
+                    "owner_heartbeat": time.time(), "token": "stale"}, mode=0o600)
+        rc, res_stale, _ = cli(["ensure", "--data", data_stale, "--run", "rst"])
+        assert rc == 0 and res_stale["ok"] is True and res_stale["started"] is True, res_stale
+        pids.append(res_stale["pid"])
+        b_stale = read_json(os.path.join(data_stale, "bus.json"))
+        assert b_stale["pid"] == res_stale["pid"] and b_stale["pid"] != sleeper.pid, b_stale
+        req_sh = urllib.request.Request(
+            f"http://127.0.0.1:{res_stale['port']}/health",
+            headers={"Host": f"127.0.0.1:{res_stale['port']}"}
+        )
+        with urllib.request.urlopen(req_sh, timeout=2.0) as resp:
+            sh = json.loads(resp.read().decode("utf-8"))
+        assert sh["ok"] is True and sh["data"] == data_stale, sh
+        stop_process(res_stale["pid"])
+        assert not is_pid_alive(res_stale["pid"])
+        stop_process(sleeper.pid)
+        # The sleeper is a direct child of this process: reap it, else the
+        # zombie keeps answering os.kill(pid, 0) (see wait_pid_dead).
+        wait_pid_dead(sleeper)
+        done("stale pid (refused) -> bus.json replaced, real respawn")
+
+        # 10d. Orchestrator tokens retire at serve start (LOW 4): a restart
+        # drops every earlier role=="orch" entry; the previous orchestrator
+        # token answers 401 and exactly one orch entry remains.
+        data_orch = os.path.join(tmp, "data_orch")
+        os.makedirs(data_orch, exist_ok=True)
+        rc, res_o1, _ = cli(["ensure", "--data", data_orch, "--run", "ro"])
+        assert rc == 0 and res_o1["ok"] is True and res_o1["started"] is True, res_o1
+        pids.append(res_o1["pid"])
+        old_orch_tok = read_json(os.path.join(data_orch, "bus.json"))["token"]
+        stop_process(res_o1["pid"])
+        assert not is_pid_alive(res_o1["pid"])
+        rc, res_o2, _ = cli(["ensure", "--data", data_orch, "--run", "ro"])
+        assert rc == 0 and res_o2["ok"] is True and res_o2["started"] is True, res_o2
+        pids.append(res_o2["pid"])
+        req_old = urllib.request.Request(
+            f"http://127.0.0.1:{res_o2['port']}/pending",
+            headers={"Authorization": f"Bearer {old_orch_tok}", "Host": f"127.0.0.1:{res_o2['port']}"}
+        )
+        try:
+            with urllib.request.urlopen(req_old, timeout=2.0):
+                raise AssertionError("Expected 401 for the retired orch token")
+        except urllib.error.HTTPError as e:
+            assert e.code == 401, f"Expected 401 for retired orch token, got {e.code}"
+        toks_o = read_json(os.path.join(data_orch, "bus-tokens.json"), {})
+        orch_entries = [v for v in toks_o.values() if isinstance(v, dict) and v.get("role") == "orch"]
+        assert len(orch_entries) == 1, orch_entries
+        new_orch_tok = read_json(os.path.join(data_orch, "bus.json"))["token"]
+        assert new_orch_tok != old_orch_tok
+        req_new = urllib.request.Request(
+            f"http://127.0.0.1:{res_o2['port']}/pending",
+            headers={"Authorization": f"Bearer {new_orch_tok}", "Host": f"127.0.0.1:{res_o2['port']}"}
+        )
+        with urllib.request.urlopen(req_new, timeout=2.0) as resp:
+            assert json.loads(resp.read().decode("utf-8"))["ok"] is True
+        done("orch token retirement on restart (old 401, one left)")
+
         # 11. mk-state integration with state_updated report
         data_state = os.path.join(tmp, "data_state")
         os.makedirs(data_state, exist_ok=True)
@@ -2274,6 +2563,216 @@ def self_test():
         rc, res_r2, _ = cli(["answer", "m-1", "nope", "--run", "r2", "--data", data_state], check=False)
         assert rc != 0 and "already answered" in res_r2.get("error", ""), res_r2
         done("ambiguous answer refused, --run disambiguates")
+
+        # 11c. A lane ask over real HTTP marks its task blocked (once per ask id, --by bus) via
+        # the one shared mk-state helper; the reply carries state_updated/mk_state_error; the
+        # answer restores building through the same helper.
+        data_ask = os.path.join(tmp, "data_ask")
+        os.makedirs(data_ask, exist_ok=True)
+        subprocess.run([sys.executable, mk_state, "--data", data_ask, "run", "init", "--id", "r4", "--feature", "f", "--branch", "b", "--force"], check=True, capture_output=True)
+        subprocess.run([sys.executable, mk_state, "--data", data_ask, "--run", "r4", "task", "add", "--id", "T4", "--title", "ask lane"], check=True, capture_output=True)
+        subprocess.run([sys.executable, mk_state, "--data", data_ask, "--run", "r4", "task", "set", "T4", "status=building"], check=True, capture_output=True)
+
+        rc, res_ens_ask, _ = cli(["ensure", "--data", data_ask, "--run", "r4"])
+        assert rc == 0 and res_ens_ask["ok"] is True, res_ens_ask
+        pids.append(res_ens_ask["pid"])
+        port_ask = res_ens_ask["port"]
+
+        lane_ask = os.path.join(tmp, "lane_ask")
+        os.makedirs(lane_ask, exist_ok=True)
+        rc, res_tok_ask, _ = cli(["token", "--lane", lane_ask, "--task", "T4", "--run", "r4", "--data", data_ask])
+        assert rc == 0 and res_tok_ask["ok"] is True, res_tok_ask
+        tok_ask = res_tok_ask["token"]
+
+        def post_lane_ask(text):
+            req_ask = urllib.request.Request(
+                f"http://127.0.0.1:{port_ask}/send",
+                data=json.dumps({"kind": "ask", "text": text}).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {tok_ask}", "Host": f"127.0.0.1:{port_ask}"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req_ask, timeout=5.0) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+
+        def r4_status():
+            run_ = read_json(os.path.join(data_ask, "runs", "r4", "run.json"))
+            return next(t["status"] for t in run_["tasks"] if t["id"] == "T4")
+
+        def r4_bus_transitions():
+            ev_path = os.path.join(data_ask, "runs", "r4", "events.jsonl")
+            return [json.loads(l) for l in open(ev_path).readlines() if l.strip()
+                    and json.loads(l).get("type") == "transition"
+                    and json.loads(l).get("by") == "bus"]
+
+        ask1 = post_lane_ask("which fixture should I load?")
+        assert ask1["ok"] is True and ask1["state_updated"] is True and ask1["mk_state_error"] is None, ask1
+        ask1_id = ask1["message"]["id"]
+        assert r4_status() == "blocked"
+        tr1 = r4_bus_transitions()
+        assert len(tr1) == 1 and tr1[0]["text"].startswith(f"bus ask {ask1_id}: which fixture"), tr1
+        assert tr1[0]["from"] == "building" and tr1[0]["to"] == "blocked", tr1
+
+        rc, res_ans_ask, _ = cli(["answer", ask1_id, "load the schema one", "--run", "r4", "--data", data_ask])
+        assert rc == 0 and res_ans_ask["ok"] is True, res_ans_ask
+        assert res_ans_ask["state_updated"] is True and res_ans_ask["mk_state_error"] is None, res_ans_ask
+        assert r4_status() == "building"
+
+        ask2 = post_lane_ask("and where is the report written?")
+        assert ask2["ok"] is True and ask2["state_updated"] is True and ask2["mk_state_error"] is None, ask2
+        ask2_id = ask2["message"]["id"]
+        assert r4_status() == "blocked"
+        tr2 = r4_bus_transitions()
+        assert len(tr2) == 2 and tr2[1]["text"].startswith(f"bus ask {ask2_id}: and where is the report"), tr2
+        assert tr2[1]["from"] == "building" and tr2[1]["to"] == "blocked", tr2
+        done("lane ask marks blocked (--by bus), answer restores building")
+
+        # 11d. mk-state failing on the ask path: the POST still succeeds, the failure rides in
+        # the reply, and run state is untouched.
+        data_askf = os.path.join(tmp, "data_askfail")
+        os.makedirs(data_askf, exist_ok=True)
+        subprocess.run([sys.executable, mk_state, "--data", data_askf, "run", "init", "--id", "r5", "--feature", "f", "--branch", "b", "--force"], check=True, capture_output=True)
+        subprocess.run([sys.executable, mk_state, "--data", data_askf, "--run", "r5", "task", "add", "--id", "T5", "--title", "ask fail lane"], check=True, capture_output=True)
+        subprocess.run([sys.executable, mk_state, "--data", data_askf, "--run", "r5", "task", "set", "T5", "status=building"], check=True, capture_output=True)
+        r5_json = os.path.join(data_askf, "runs", "r5", "run.json")
+        before = open(r5_json, "rb").read()
+        fake_ms = os.path.join(tmp, "fake-mk-state.py")
+        with open(fake_ms, "w") as f:
+            f.write("#!/usr/bin/env python3\nimport sys\nsys.stderr.write('mk-state: run state locked\\n')\nsys.exit(1)\n")
+        os.chmod(fake_ms, 0o755)
+        os.environ["MK_STATE_CMD"] = fake_ms  # inherited by the serve this ensure starts
+        try:
+            rc, res_ens_f, _ = cli(["ensure", "--data", data_askf, "--run", "r5"])
+            assert rc == 0 and res_ens_f["ok"] is True, res_ens_f
+            pids.append(res_ens_f["pid"])
+            lane_askf = os.path.join(tmp, "lane_askfail")
+            os.makedirs(lane_askf, exist_ok=True)
+            rc, res_tok_f, _ = cli(["token", "--lane", lane_askf, "--task", "T5", "--run", "r5", "--data", data_askf])
+            assert rc == 0 and res_tok_f["ok"] is True, res_tok_f
+            req_askf = urllib.request.Request(
+                f"http://127.0.0.1:{res_ens_f['port']}/send",
+                data=json.dumps({"kind": "ask", "text": "does this fail?"}).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {res_tok_f['token']}", "Host": f"127.0.0.1:{res_ens_f['port']}"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req_askf, timeout=5.0) as resp:
+                assert resp.status == 200
+                askf = json.loads(resp.read().decode("utf-8"))
+            assert askf["ok"] is True and askf["state_updated"] is False, askf
+            assert askf["mk_state_error"] and "run state locked" in askf["mk_state_error"], askf
+            assert open(r5_json, "rb").read() == before, "run.json must be untouched when mk-state fails"
+        finally:
+            os.environ.pop("MK_STATE_CMD", None)
+        done("lane ask survives mk-state failure (200 + error carried)")
+
+        # 11e. owner_timeout_s: env hook > yaml bus.owner_timeout_min (clamped to the schema's
+        # [5, 120]) > 1800.0 s default. Asserted directly on the helper: fast, no waiting.
+        data_ot = os.path.join(tmp, "data_ot")
+        os.makedirs(data_ot, exist_ok=True)
+        with open(os.path.join(data_ot, "matrixkoder.yaml"), "w") as f:
+            f.write("bus:\n  owner_timeout_min: 5\n")
+        assert owner_timeout_s(data_ot) == 300.0
+        assert owner_timeout_s(data_ask) == 1800.0  # no yaml there
+        os.environ["MK_BUS_HEARTBEAT_TIMEOUT_SEC"] = "7"
+        try:
+            assert owner_timeout_s(data_ot) == 7.0 and owner_timeout_s(data_ask) == 7.0
+        finally:
+            os.environ.pop("MK_BUS_HEARTBEAT_TIMEOUT_SEC", None)
+        with open(os.path.join(data_ot, "matrixkoder.yaml"), "w") as f:
+            f.write("bus:\n  owner_timeout_min: 999\n")
+        assert owner_timeout_s(data_ot) == 120 * 60.0  # clamped up to the schema max
+        done("owner_timeout_s: env > yaml (clamped) > 1800 s default")
+
+        # 12. Unsupported methods answer JSON 405, never the stdlib 501 HTML
+        # page (LOW 5); HEAD sends the JSON headers with no body.
+        data_misc = os.path.join(tmp, "data_misc")
+        os.makedirs(data_misc, exist_ok=True)
+        rc, res_m, _ = cli(["ensure", "--data", data_misc, "--run", "rm"])
+        assert rc == 0 and res_m["ok"] is True and res_m["started"] is True, res_m
+        pids.append(res_m["pid"])
+        port_m = res_m["port"]
+        for verb in ("PUT", "DELETE", "PATCH"):
+            req_m = urllib.request.Request(
+                f"http://127.0.0.1:{port_m}/send",
+                data=b"{}", headers={"Host": f"127.0.0.1:{port_m}"}, method=verb
+            )
+            try:
+                with urllib.request.urlopen(req_m, timeout=2.0):
+                    raise AssertionError(f"Expected 405 for {verb}")
+            except urllib.error.HTTPError as e:
+                assert e.code == 405, f"Expected 405 for {verb}, got {e.code}"
+                assert json.loads(e.read().decode("utf-8")) == {"ok": False, "error": "method not allowed"}
+        req_head = urllib.request.Request(
+            f"http://127.0.0.1:{port_m}/health", headers={"Host": f"127.0.0.1:{port_m}"}, method="HEAD"
+        )
+        try:
+            with urllib.request.urlopen(req_head, timeout=2.0):
+                raise AssertionError("Expected 405 for HEAD")
+        except urllib.error.HTTPError as e:
+            assert e.code == 405, f"Expected 405 for HEAD, got {e.code}"
+            assert e.read() == b""
+        done("PUT/DELETE/PATCH/HEAD -> JSON 405")
+
+        # 12b. A lone surrogate in text is a 400, not a 500, and writes
+        # nothing (LOW 2): json.loads happily builds it from the \ud800
+        # escape, so the UTF-8 length check is the gate.
+        orch_m = read_json(os.path.join(data_misc, "bus.json"))["token"]
+        jsonl_m = os.path.join(data_misc, "runs", "rm", "bus.jsonl")
+        cnt_m_before = len(open(jsonl_m).readlines()) if os.path.exists(jsonl_m) else 0
+        req_sur = urllib.request.Request(
+            f"http://127.0.0.1:{port_m}/send",
+            data=b'{"run":"rm","kind":"info","text":"\\ud800"}',
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {orch_m}", "Host": f"127.0.0.1:{port_m}"},
+            method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req_sur, timeout=2.0):
+                raise AssertionError("Expected 400 for lone surrogate text")
+        except urllib.error.HTTPError as e:
+            assert e.code == 400, f"Expected 400 for lone surrogate, got {e.code}"
+            assert json.loads(e.read().decode("utf-8"))["error"] == "text is not valid UTF-8"
+        cnt_m_after = len(open(jsonl_m).readlines()) if os.path.exists(jsonl_m) else 0
+        assert cnt_m_after == cnt_m_before, "bus.jsonl must be unchanged after surrogate 400"
+        done("lone surrogate text -> 400, no write")
+
+        # 12c. Two concurrent answers to one ask (LOW 5): the duplicate
+        # check inside append_message runs under the lock, so exactly one
+        # lands (200) and the loser surfaces as 400, never a 500.
+        req_ask_m = urllib.request.Request(
+            f"http://127.0.0.1:{port_m}/send",
+            data=json.dumps({"run": "rm", "kind": "ask", "text": "race ask"}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {orch_m}", "Host": f"127.0.0.1:{port_m}"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req_ask_m, timeout=2.0) as resp:
+            ask_m = json.loads(resp.read().decode("utf-8"))["message"]
+        race_results = []
+
+        def post_race_answer(tag):
+            req_a = urllib.request.Request(
+                f"http://127.0.0.1:{port_m}/send",
+                data=json.dumps({"run": "rm", "kind": "answer", "text": f"answer {tag}", "reply_to": ask_m["id"]}).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {orch_m}", "Host": f"127.0.0.1:{port_m}"},
+                method="POST"
+            )
+            try:
+                with urllib.request.urlopen(req_a, timeout=5.0) as resp:
+                    race_results.append((resp.status, None))
+            except urllib.error.HTTPError as e:
+                race_results.append((e.code, json.loads(e.read().decode("utf-8")).get("error")))
+
+        race_threads = [threading.Thread(target=post_race_answer, args=(i,)) for i in range(2)]
+        for t in race_threads:
+            t.start()
+        for t in race_threads:
+            t.join(timeout=10.0)
+        assert all(not t.is_alive() for t in race_threads), "race threads did not terminate"
+        codes_m = sorted(r[0] for r in race_results)
+        assert codes_m == [200, 400], race_results
+        for code_m, err_m in race_results:
+            if code_m == 400:
+                assert err_m == "ask already answered", race_results
+        assert len(open(jsonl_m).readlines()) == cnt_m_before + 2, "exactly ask + one answer appended"
+        done("duplicate answer race -> one 200, one 400")
 
     finally:
         for p in pids:

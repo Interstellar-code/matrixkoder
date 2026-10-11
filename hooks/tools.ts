@@ -1,5 +1,6 @@
-// MatrixKoder model tools: mk_state and mk_usage (strict types)
-import type { On, PluginOptions, ToolCallResult } from 'claude-code'
+// MatrixKoder model tools: mk_state, mk_usage and mk_bus (strict types)
+import type { EngineInterface, On, PluginOptions, ToolCallResult } from 'claude-code'
+import { candidateDirs, globalDirPath, join, mainCheckout, parseGitdir, parseJson, projectDataDir } from './data'
 
 const ALLOWED_SUBCOMMANDS = new Set([
   'run',
@@ -9,6 +10,13 @@ const ALLOWED_SUBCOMMANDS = new Set([
   'lock',
   'render',
 ])
+
+// mk_bus: read-mostly bus access — pending/tail are reads, answer is the only write.
+// Validation runs before any process spawn so a malformed call never reaches mk-bus.py.
+const BUS_ACTIONS = new Set(['pending', 'tail', 'answer'])
+const BUS_MSG_ID_RE = /^m-\d+$/ // bus message ids are always m-<digits>
+const BUS_RUN_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/ // same shape as mk-state ID_RE
+const BUS_TEXT_MAX_BYTES = 65536 // 64 KiB cap on an answer's UTF-8 bytes
 
 // --data/--by/--run steer mk-state at another project or run; the model tool must not pass them
 // in any flag form — exact, --flag=value, or an abbreviation like --b=x. A token containing
@@ -21,6 +29,76 @@ const isOverrideFlag = (arg: string): boolean => {
   const name = flagName(arg)
   if (!name.startsWith('--') || name.length <= 2 || /\s/.test(name)) return false
   return OVERRIDE_FLAGS.some((b) => name === b || b.startsWith(name))
+}
+
+/** File-local copy of wake.ts's resolveDataDir: the loader forbids passing $ across an
+ *  import (the same reason dashboard.tsx keeps its own copy), and mk_bus needs the same
+ *  canonical rule — MATRIXKODER_DATA, else the nearest .git (never above $HOME), a linked
+ *  worktree resolving to its main checkout, projects.json naming the dir, else
+ *  <repo>/.matrixkoder. Pure helpers come from data.ts ($ may not cross an import). */
+async function resolveDataDir($: EngineInterface): Promise<string> {
+  try {
+    const envData = await $.env.get('MATRIXKODER_DATA')
+    if (envData) return envData.trim()
+  } catch {
+    // env noun error
+  }
+  let cwd = '.'
+  try {
+    cwd = await $.session.cwd()
+  } catch {
+    // fallback
+  }
+  let home: string | undefined
+  try {
+    home = (await $.env.get('HOME')) || undefined
+  } catch {
+    // no HOME: the walk only stops at /
+  }
+
+  for (const dir of candidateDirs(cwd, home)) {
+    const gitPath = join(dir, '.git')
+    let kind: string | null = null
+    try {
+      kind = (await $.fs.stat(gitPath)).kind
+    } catch {
+      continue // no .git here — keep walking up
+    }
+    // nearest repo boundary: never use an ancestor's data
+    let top = dir
+    if (kind === 'file') {
+      try {
+        const gitdir = parseGitdir(await $.fs.read(gitPath))
+        if (gitdir) {
+          const gd = gitdir.startsWith('/') ? gitdir : join(dir, gitdir)
+          const commondir = await $.fs.read(join(gd, 'commondir'))
+          const main = mainCheckout(gd, commondir)
+          if (main) top = main
+        }
+      } catch {
+        // unreadable git file or no commondir: this checkout's own dir
+      }
+    }
+    // the wizard's projects.json (home mode) names this repo's data dir; else <repo>/.matrixkoder
+    try {
+      let envHome: string | undefined
+      try {
+        envHome = (await $.env.get('MATRIXKODER_HOME')) || undefined
+      } catch {
+        // default global dir
+      }
+      const gdir = globalDirPath(envHome, home ?? null)
+      if (gdir != null) {
+        const listed = projectDataDir(parseJson(await $.fs.read(join(gdir, 'projects.json'))), [top], home ?? null)
+        if (listed != null) return listed
+      }
+    } catch {
+      // no projects.json
+    }
+    return join(top, '.matrixkoder')
+  }
+
+  return join(cwd, '.matrixkoder')
 }
 
 export function registerTools(on: On, _options: PluginOptions): void {
@@ -50,6 +128,26 @@ export function registerTools(on: On, _options: PluginOptions): void {
           type: 'object',
         },
       })
+
+      await $.tool.register({
+        name: 'mk_bus',
+        description:
+          'MatrixKoder orchestrator↔lane bus: list pending asks (action=pending), recent messages (action=tail), or answer an ask (action=answer).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: {
+              type: 'string',
+              enum: ['pending', 'tail', 'answer'],
+              description: 'bus operation to run',
+            },
+            msg_id: { type: 'string', description: 'msg id of the ask to answer (m-<n>)' },
+            text: { type: 'string', description: 'answer text' },
+            run: { type: 'string', description: 'run id filter' },
+          },
+          required: ['action'],
+        },
+      })
     } catch {
       // tool registration refused or unready
     }
@@ -62,8 +160,9 @@ export function registerTools(on: On, _options: PluginOptions): void {
     const pluginName = $.plugin.name
     const isMkState = tool === 'mk_state' || tool === `mcp__${pluginName}__mk_state`
     const isMkUsage = tool === 'mk_usage' || tool === `mcp__${pluginName}__mk_usage`
+    const isMkBus = tool === 'mk_bus' || tool === `mcp__${pluginName}__mk_bus`
 
-    if (!isMkState && !isMkUsage) {
+    if (!isMkState && !isMkUsage && !isMkBus) {
       return next(e)
     }
 
@@ -182,6 +281,82 @@ export function registerTools(on: On, _options: PluginOptions): void {
           result: `mk_usage process error: ${msg}`,
         }
       }
+    }
+
+    if (isMkBus) {
+      const inputObj = e as Record<string, unknown>
+      const nestedInput = inputObj.input as Record<string, unknown> | undefined
+      const actionRaw = inputObj.action ?? nestedInput?.action
+      if (typeof actionRaw !== 'string' || !BUS_ACTIONS.has(actionRaw)) {
+        return {
+          isError: true,
+          result: 'mk_bus: action must be one of pending, tail, answer',
+        }
+      }
+      const msgIdRaw = inputObj.msg_id ?? nestedInput?.msg_id
+      const textRaw = inputObj.text ?? nestedInput?.text
+      const runRaw = inputObj.run ?? nestedInput?.run
+      if (runRaw !== undefined && (typeof runRaw !== 'string' || !BUS_RUN_RE.test(runRaw) || runRaw.includes('..'))) {
+        return {
+          isError: true,
+          result: 'mk_bus: run must be a run id (letter/digit start, then letters, digits, ., _, -; no ..)',
+        }
+      }
+      const runArg = typeof runRaw === 'string' ? runRaw : undefined
+
+      const runBus = async (argv: readonly string[]): Promise<ToolCallResult> => {
+        try {
+          const proc = await $.process.run([...argv], {
+            cwd,
+            timeoutMs: 30000,
+          })
+          if (proc.isStdoutTruncated || proc.isStderrTruncated) {
+            return {
+              isError: true,
+              result: 'mk_bus error: process output truncated (exceeded 4 MiB limit)',
+            }
+          }
+          if (proc.exitCode === 0) {
+            return { result: proc.stdout.trim() }
+          }
+          return {
+            isError: true,
+            result: (proc.stderr || proc.stdout || `Process exited with code ${proc.exitCode}`).trim(),
+          }
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err)
+          return {
+            isError: true,
+            result: `mk_bus process error: ${msg}`,
+          }
+        }
+      }
+
+      const scriptPath = `${pluginRoot}/scripts/mk-bus.py`
+      if (actionRaw === 'answer') {
+        if (typeof msgIdRaw !== 'string' || !BUS_MSG_ID_RE.test(msgIdRaw)) {
+          return {
+            isError: true,
+            result: 'mk_bus: answer requires msg_id of the form m-<n>',
+          }
+        }
+        if (typeof textRaw !== 'string' || textRaw.length === 0) {
+          return {
+            isError: true,
+            result: 'mk_bus: answer requires a non-empty text',
+          }
+        }
+        if (new TextEncoder().encode(textRaw).length > BUS_TEXT_MAX_BYTES) {
+          return {
+            isError: true,
+            result: 'mk_bus: answer text exceeds the 64 KiB (65536 UTF-8 bytes) limit',
+          }
+        }
+        const dataDir = await resolveDataDir($)
+        return runBus(['python3', scriptPath, 'answer', '--data', dataDir, ...(runArg ? ['--run', runArg] : []), msgIdRaw, textRaw])
+      }
+      const dataDir = await resolveDataDir($)
+      return runBus(['python3', scriptPath, actionRaw, '--data', dataDir, ...(runArg ? ['--run', runArg] : [])])
     }
 
     return next(e)
