@@ -226,6 +226,9 @@ HELPERS = [
     ("codebase_memory", "Serena-style project memory."),
     ("canary", "Browser QA recordings."),
 ]
+# The agents whose model list a CLI can answer for, and the argv that asks. claude and codex have
+# no such command here: their picks are written by hand and the list is small enough to keep.
+MODEL_CLIS = {"opencode": "opencode", "agy": "agy"}
 
 
 # ---------- structure: where each line is ----------
@@ -701,6 +704,8 @@ def cmd_list(path, lines):
         opts = opts_of(r, lines)
         if opts is not None:
             f["opts"] = opts
+        if r.get("pool") is not None:
+            f["pool"] = list(r["pool"])  # the only models `set` accepts for this agent: one pool, picker and validator
         if not f["editable"]:
             f["why"] = r["why"]
         fields.append(f)
@@ -1007,6 +1012,52 @@ def probe_canary():
         return "stale"
 
 
+def probe_models(cli):
+    """The model ids `<cli> models` prints, one per line, in the order it printed them. Only the
+    first whitespace-separated field of a line is the id — `agy models` prints `id<TAB>description`,
+    and a description pasted into the yaml would make every pick of that agent unwritable. [] whenever
+    the CLI is absent, fails, times out or prints nothing — the caller then leaves the yaml's list
+    exactly as it is, because a list nobody could read is not evidence that the agent has no models."""
+    try:
+        p = subprocess.run([cli, "models"], capture_output=True, text=True, timeout=PROBE_TIMEOUT_S)
+    except Exception:  # FileNotFoundError (no such CLI), a timeout, anything it raises on the way
+        return []
+    if p.returncode != 0:
+        return []
+    out = []
+    for raw in (p.stdout or "").splitlines():
+        fields = raw.split()
+        if fields and fields[0] not in out:
+            out.append(fields[0])
+    return out
+
+
+def agent_models_row(agent):
+    """The patcher row for one agent's `models` member inside its one-line `agents:` flow map. Not
+    a settings row — `models` is detected, never typed — only the shape `patch` needs."""
+    return _row(f"agents.{agent}.models", "agents", "list", [], ["agents"], agent, "models",
+                f"{agent} models", "the models this agent can pick")
+
+
+def refresh_models(lines):
+    """Patch `agents.<a>.models` for every agent whose CLI answered, through the safe patcher, and
+    -> (new lines, per-agent state, verify checks). The helpers line is patched first, so a model
+    refresh never has to know how the helpers section was written."""
+    new, state, checks = lines, {}, []
+    for agent, cli in MODEL_CLIS.items():
+        ids = probe_models(cli)
+        state[agent] = "unchanged"
+        if not ids:
+            continue
+        r = agent_models_row(agent)
+        if not value_of(new, r)[0]:
+            continue  # no `models` member on this agent's line: there is nothing to refresh
+        new, _count = patch(new, r, ids)
+        state[agent] = "updated"
+        checks.append((r["key"], ids, r))
+    return new, state, checks
+
+
 def cmd_probe(path, lines):
     herdr_status = probe_herdr()
     mcp_statuses = probe_claude_mcps()
@@ -1058,9 +1109,11 @@ def cmd_probe(path, lines):
             line_to_add = eol + line_to_add
         new.append(line_to_add)
 
-    count = changed_lines(lines, new)
     checks = [(f"helpers.{hid}", res[hid], row_for(new, f"helpers.{hid}"))
               for hid, _help in HELPERS]
+    new, res["models"], model_checks = refresh_models(new)
+    checks += model_checks
+    count = changed_lines(lines, new)
     write_yaml(path, lines, new, count, checks)
     return out(res)
 
@@ -1649,6 +1702,48 @@ def self_test():
         assert run("context")["bus_ask_timeout_s"] == 600
         run("set", "bus.ask_timeout_s", "900")
         assert run("context")["bus_ask_timeout_s"] == 900
+
+        # 24. probe refreshes agents.<a>.models from the agent CLIs through the safe patcher, and
+        #     every model the refreshed pool lists is one `set picks.<a>` accepts
+        with open(yaml_path, "w") as f:
+            f.write(fixture)
+        make_bin("opencode", "#!/bin/sh\nprintf 'opencode/space-bunny-free\\nollama-cloud/minimax-m3\\n'\n")
+        make_bin("agy", "#!/bin/sh\n"
+                        "printf 'gemini-3.8-flash-medium\\tGemini 3.8 Flash (Medium)\\n"
+                        "gemini-3.1-pro-high\\tGemini 3.1 Pro (High)\\n'\n")  # id<TAB>label, as the real CLI prints
+
+        def agent_lines():
+            return [l for l in rd().splitlines()
+                    if l.startswith("  opencode: ") or l.startswith("  agy: ")]
+
+        p_m1 = run("probe")
+        assert p_m1["models"] == {"opencode": "updated", "agy": "updated"}, p_m1
+        assert ("  opencode: { available: true, models: [opencode/space-bunny-free, "
+                "ollama-cloud/minimax-m3] }") in agent_lines(), rd()
+        assert "  agy: { available: false, models: [gemini-3.8-flash-medium, gemini-3.1-pro-high] }" \
+            in agent_lines(), rd()
+        pools = {f["key"]: f.get("pool") for f in run("list", "--json")["fields"]
+                 if f["key"].startswith("picks.")}
+        assert pools["picks.opencode"] == ["opencode/space-bunny-free", "ollama-cloud/minimax-m3"], pools
+        assert pools["picks.agy"] == ["gemini-3.8-flash-medium", "gemini-3.1-pro-high"], pools
+        # every option a picker can show for these agents is accepted by set
+        for pkey, pool in pools.items():
+            for mid in pool:
+                run("set", pkey, json.dumps([mid]))
+        assert run("get", "picks.opencode")["value"] == ["ollama-cloud/minimax-m3"]
+        # a model the refreshed pool no longer lists is refused: the tab cannot offer it either
+        run("set", "picks.opencode", '["opencode/step-5-preview-free"]', ok=False)
+
+        # a failing CLI, an absent CLI and one that prints nothing all leave the list as it was
+        before_agents = agent_lines()
+        make_bin("opencode", "#!/bin/sh\nexit 1\n")
+        make_bin("agy", "#!/bin/sh\ntrue\n")
+        p_m2 = run("probe")
+        assert p_m2["models"] == {"opencode": "unchanged", "agy": "unchanged"}, p_m2
+        rm_bin("agy")
+        p_m3 = run("probe")
+        assert p_m3["models"] == {"opencode": "unchanged", "agy": "unchanged"}, p_m3
+        assert agent_lines() == before_agents, "a probe that could not read the models rewrote them"
     finally:
         restore()
         shutil.rmtree(tmp, ignore_errors=True)

@@ -15,15 +15,47 @@
 // builder_order, usage.providers) hold readonly string[] values the tab joins
 // with ', '.
 import type { SettingsView } from './settings'
+import type { YamlFieldIn } from '../settings-io'
 
 /** the artboard's model list (its MODELS), the subagent-model select's options. */
-const SUBAGENT_MODELS = [
+export const SUBAGENT_MODELS = [
   ['ollama-cloud/minimax-m3', 'paid'],
   ['opencode/step-5-preview-free', 'free'],
   ['opencode/space-bunny-free', 'free'],
   ['opencode-go/kimi-k3', '41% 5h'],
   ['zai-coding-plan/glm-5.1', '⊘ dropped'],
 ] as const
+
+/** The `mk-config.py list --json` fields a live repo answers with, in the CLI's own shape, so the
+ *  tests can read a `picks.<agent>` row's `pool` — the models that agent's picker may offer and the
+ *  only ones `mk-config.py set picks.<agent>` accepts. `opencode/step-5-preview-free` is in no pool
+ *  on purpose: it is the model the picker offered while `set` refused it (user report 2026-10-11),
+ *  and it is a default pick in settings-io.ts, so it also proves a default outside the pool is dropped. */
+export const SETTINGS_LIST_FIXTURE: readonly YamlFieldIn[] = [
+  {
+    key: 'picks.opencode', scope: 'models', label: 'opencode model picks', type: 'list',
+    value: ['opencode/space-bunny-free', 'ollama-cloud/minimax-m3'], default: [],
+    pool: ['opencode/space-bunny-free', 'ollama-cloud/minimax-m3', 'opencode-go/kimi-k3'],
+    help: "this agent's models in preference order", editable: true,
+  },
+  {
+    key: 'picks.claude', scope: 'models', label: 'claude model picks', type: 'list',
+    value: [], default: [],
+    pool: ['claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-opus-5-5', 'claude-fable-5-1'],
+    help: "this agent's models in preference order", editable: true,
+  },
+  {
+    key: 'picks.agy', scope: 'models', label: 'agy model picks', type: 'list',
+    value: [], default: [],
+    pool: ['gemini-3.8-flash-medium', 'gemini-3.1-pro-high'],
+    help: "this agent's models in preference order", editable: true,
+  },
+  {
+    key: 'picks.codex', scope: 'models', label: 'codex model picks', type: 'list',
+    value: [], default: [], pool: [],
+    help: "this agent's models in preference order", editable: true,
+  },
+]
 
 export const SETTINGS_FIXTURE: SettingsView = {
   mock: true,
