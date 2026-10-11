@@ -3150,21 +3150,30 @@ def store_self_test(tmp, env):
     assert ia == ib, (ia, ib)
     assert not os.path.exists(os.path.join(twin, "mk.db"))  # the twin never opted in
 
-    # events.jsonl only grows, one line at a time, and matches the file-path twin
+    # events.jsonl only grows, one line at a time, and matches the file-path twin.
+    # One pinned clock for both paths: re-reading now() between them stamps a different second
+    # whenever the clock ticks, and the byte compare then fails.
     evp = os.path.join(data, "runs", "s2", "events.jsonl")
     counts = [len(open(evp).read().splitlines())]
-    mk("event", "--type", "note", "--text", "one more", "--run", "s2")
-    counts.append(len(open(evp).read().splitlines()))
-    mk("task", "set", "B", "status=routed", "--run", "s2")
-    counts.append(len(open(evp).read().splitlines()))
-    assert counts == sorted(counts) and len(set(counts)) == len(counts), counts
-    for step in (("event", "--type", "note", "--text", "one more", "--run", "s2"),
-                 ("task", "set", "B", "status=routed", "--run", "s2")):
-        _CLOCK["t"] = real_now()
-        with contextlib.redirect_stdout(open(os.devnull, "w")):
-            assert main([*step, "--data", twin]) == 0, step
-    assert open(evp, "rb").read() == open(os.path.join(twin, "runs", "s2", "events.jsonl"), "rb").read()
-    now = real_now
+    # Both paths go through main() in this process. mk() is a subprocess, so a pinned clock
+    # here would never reach it and the two files would stamp different seconds.
+    now = _frozen_now
+    _CLOCK["t"] = "2000-01-01T00:00:00+00:00"
+    grow = (("event", "--type", "note", "--text", "one more", "--run", "s2"),
+            ("task", "set", "B", "status=routed", "--run", "s2"))
+    try:
+        for step in grow:
+            with contextlib.redirect_stdout(open(os.devnull, "w")):
+                assert main([*step, "--data", data]) == 0, step
+            counts.append(len(open(evp).read().splitlines()))
+        assert counts == sorted(counts) and len(set(counts)) == len(counts), counts
+        for step in grow:
+            with contextlib.redirect_stdout(open(os.devnull, "w")):
+                assert main([*step, "--data", twin]) == 0, step
+        assert open(evp, "rb").read() == open(os.path.join(twin, "runs", "s2", "events.jsonl"), "rb").read()
+    finally:
+        now = real_now
+        _CLOCK["t"] = None
 
     # a status change goes through transition(): change_log grew and the event is in the store
     con = db.open_project(os.path.join(data, ".mk-home"), STORE_PROJECT, data_dir=data)
