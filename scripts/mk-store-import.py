@@ -77,6 +77,13 @@ def resolve_import_home(arg, allow_real):
     return home
 
 
+def inside(root, path):
+    """True when path's real location is root or a file under it. commonpath, so a sibling
+    directory named <root>-evil does not pass."""
+    root, path = os.path.realpath(root), os.path.realpath(path)
+    return os.path.commonpath((root, path)) == root
+
+
 def file_sha(path):
     h = hashlib.sha256()
     with open(path, "rb") as fh:
@@ -86,12 +93,14 @@ def file_sha(path):
 
 
 def tree_checksums(root):
-    """sha256 of every file under root, keyed by relative path. Read-only."""
+    """sha256 of every file under root, keyed by relative path. A symlink that escapes root is skipped."""
     out = {}
     for dirpath, dirs, files in os.walk(root):
         dirs[:] = [d for d in dirs if d != ".git"]
         for name in files:
             path = os.path.join(dirpath, name)
+            if not inside(root, path):
+                continue
             out[os.path.relpath(path, root)] = file_sha(path)
     return out
 
@@ -147,6 +156,8 @@ def load_run(data, run_id):
     run_path = os.path.join(run_dir, "run.json")
     if not os.path.isfile(run_path):
         raise Fail(f"no run.json for {run_id}")
+    if not inside(run_dir, run_path):
+        raise Fail(f"run.json for {run_id} escapes the run dir")
     try:
         with open(run_path, encoding="utf-8") as fh:
             doc = json.load(fh)
@@ -193,6 +204,8 @@ def load_run(data, run_id):
     events, skipped = [], 0
     ev_path = os.path.join(run_dir, "events.jsonl")
     if os.path.isfile(ev_path):
+        if not inside(run_dir, ev_path):
+            raise Fail(f"events.jsonl for {run_id} escapes the run dir")
         with open(ev_path, encoding="utf-8") as fh:
             for n, line in enumerate(fh, 1):
                 raw = line.strip()
@@ -233,6 +246,9 @@ def load_run(data, run_id):
                     continue
                 path = os.path.join(dirpath, name)
                 rel = os.path.relpath(path, run_dir)
+                if not inside(run_dir, path):
+                    skipped_artifacts.append({"name": rel, "reason": "symlink escapes run dir"})
+                    continue
                 # import_history takes text and stores it through JSON, so a non-UTF-8 file
                 # cannot round-trip. It is named in skipped_artifacts and left untouched.
                 with open(path, "rb") as fh:
@@ -562,6 +578,7 @@ def self_test():
         _check(tree_checksums(os.path.join(data, "runs")) == before, "source changed by --all")
 
         _guards_r2(tmp)
+        _symlinks(tmp)
         _real_bus(tmp)
         print("mk-store-import self-test ok")
     finally:
@@ -696,6 +713,62 @@ def _guards_r2(tmp):
     code, out, err = _run_cli(["run", "--project", "matrixkoder", "--data", obj, "--run", "arr",
                                "--home", os.path.join(tmp, "obj-home")])
     _check(code == 2 and out.startswith('{"ok": false') and "Traceback" not in err, f"non-object: {code} {out} {err}")
+
+
+
+def _symlinks(tmp):
+    """Files inside a run dir may not point outside it. A link to another file in the same dir may."""
+    data = os.path.join(tmp, "links")
+    home = os.path.join(tmp, "links-home")
+    os.makedirs(home)
+    secret = os.path.join(tmp, "secret-events.jsonl")
+    _write(secret, json.dumps({"t": "1999-01-01T00:00:00+00:00", "run": "lnk", "task": "T",
+                               "type": "note", "text": "SECRET-OUTSIDE", "by": "x"}) + "\n")
+    run_dir = os.path.join(data, "runs", "lnk")
+    _write(os.path.join(run_dir, "run.json"), json.dumps(
+        {"id": "lnk", "status": "done", "tasks": [
+            {"id": "T", "title": "t", "status": "done", "parent": None, "deps": []}]}))
+    os.symlink(secret, os.path.join(run_dir, "events.jsonl"))
+    code, out, err = _run_cli(["run", "--project", "matrixkoder", "--data", data, "--run", "lnk", "--home", home])
+    _check(code == 2 and "escapes" in out, f"events link: {code} {out} {err}")
+    _check("SECRET-OUTSIDE" not in out, "secret leaked into the result")
+    if os.path.exists(os.path.join(home, "projects")):
+        con = mkdb.open_project(home, "matrixkoder")
+        try:
+            texts = [r["text"] for r in con.execute("SELECT text FROM events")]
+            _check("SECRET-OUTSIDE" not in texts, texts)
+        finally:
+            con.close()
+
+    # the events file is legitimate; the artifact link escapes and is skipped by name
+    os.remove(os.path.join(run_dir, "events.jsonl"))
+    _write(os.path.join(run_dir, "events.jsonl"), json.dumps(
+        {"t": "2020-01-01T00:00:00+00:00", "run": "lnk", "task": "T", "type": "note",
+         "text": "inside", "by": "x"}) + "\n")
+    outside_art = os.path.join(tmp, "secret-brief.md")
+    _write(outside_art, "SECRET-ART")
+    os.makedirs(os.path.join(run_dir, "tasks", "T"))
+    os.symlink(outside_art, os.path.join(run_dir, "tasks", "T", "brief-r1.md"))
+    real_report = os.path.join(run_dir, "tasks", "T", "real-report.md")
+    _write(real_report, "kept report\n")
+    os.symlink(real_report, os.path.join(run_dir, "tasks", "T", "report-r1.md"))
+    code, out, err = _run_cli(["run", "--project", "matrixkoder", "--data", data, "--run", "lnk", "--home", home])
+    _check(code == 0, f"artifact link: {code} {out} {err}")
+    doc = json.loads(out)
+    _check(any(a["reason"] == "symlink escapes run dir" and a["name"].endswith("brief-r1.md")
+               for a in doc["skipped_artifacts"]), doc["skipped_artifacts"])
+    con = mkdb.open_project(home, "matrixkoder")
+    try:
+        texts = [r["text"] for r in con.execute("SELECT text FROM artifacts")]
+        _check("SECRET-ART" not in texts, texts)
+        _check("kept report\n" in texts, texts)
+    finally:
+        con.close()
+
+    # a sibling directory whose name only shares the run id's prefix is not inside the run dir
+    evil = os.path.join(data, "runs", "lnk-evil")
+    _write(os.path.join(evil, "run.json"), json.dumps({"id": "lnk-evil", "status": "done", "tasks": []}))
+    _check(not inside(run_dir, os.path.join(evil, "run.json")), "sibling prefix passed inside()")
 
 
 def _real_bus(tmp):
