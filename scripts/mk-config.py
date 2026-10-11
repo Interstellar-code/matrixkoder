@@ -200,6 +200,10 @@ SCHEMA = [
          "Reviewer split", "where the reviewer runs while the builder waits",
          opts=[("right", "the reviewer pane sits beside the lane"),
                ("down", "the reviewer runs after the builder stops")]),
+    _row("session.todo_done_status", "child", "seg", "verify", ["session"], "todo_done_status", None,
+         "Todo completed becomes", "what a completed todo sets the task to",
+         opts=[("verify", "a completed todo moves the task to verify"),
+               ("done", "a completed todo moves the task to done")]),
     _row("session.reuse_reviewer", "child", "bool", True, ["session"], "reuse_reviewer", None,
          "Reuse reviewer", "one reviewer session serves the phase's rounds"),
     _row("bus.enabled", "child", "bool", True, ["bus"], "enabled", None,
@@ -315,11 +319,80 @@ def row_for(lines, key):
     return None
 
 
+ROUTE_KEYS = ("routing_preferences.reviewer", "routing_preferences.visual_reviewer")
+CATALOG_TIMEOUT_S = 10  # a settings screen that waits longer than this is broken, not loading
+_ROUTES_CACHE = {}  # one catalog read per process; the self-test clears it for a fresh read
+
+
+def catalog_home():
+    """The MK home `mk-catalog.py` would use: $MK_HOME, else ~/.matrixkoder — the same rule as
+    mkdb.resolve_home with no --home argument."""
+    return os.path.abspath(os.path.expanduser(os.environ.get("MK_HOME") or "~/.matrixkoder"))
+
+
+def catalog_routes():
+    """The runnable routes `mk-catalog.py routes --json` lists, or None when the catalog is absent
+    or errors. A settings screen must never crash because the catalog is missing, so every failure
+    — a missing script, a non-zero exit, a timeout, output that is not the documented shape — reads
+    as "no catalog" and the caller falls back to the current value alone.
+
+    The catalog command creates <home>/mk.db when none exists, so it is never called unless the
+    store is already there: opening Settings must not create ~/.matrixkoder/mk.db. The result is
+    cached for the process, so one `list` starts at most one subprocess."""
+    if "routes" in _ROUTES_CACHE:
+        return _ROUTES_CACHE["routes"]
+    if not os.path.isfile(os.path.join(catalog_home(), "mk.db")):
+        _ROUTES_CACHE["routes"] = None  # no store: do not call the catalog, it would create one
+        return None
+    try:
+        counter = os.environ.get("MK_CONFIG_COUNT_ROUTES")  # self-test only: counts the calls
+        if counter:
+            with open(counter, "a") as f:
+                f.write("1")
+        p = subprocess.run([sys.executable, os.path.join(HERE, "mk-catalog.py"), "routes", "--json"],
+                           capture_output=True, text=True, timeout=CATALOG_TIMEOUT_S)
+    except Exception:  # a timeout or a missing interpreter: the catalog is not there
+        _ROUTES_CACHE["routes"] = None
+        return None
+    if p.returncode != 0:
+        _ROUTES_CACHE["routes"] = None
+        return None
+    try:
+        data = json.loads(p.stdout)
+    except ValueError:
+        _ROUTES_CACHE["routes"] = None
+        return None
+    routes = data.get("routes") if isinstance(data, dict) and data.get("ok") is True else None
+    if not isinstance(routes, list) or not all(isinstance(x, str) and x.strip() for x in routes):
+        _ROUTES_CACHE["routes"] = None
+        return None
+    # a home with no catalog seeds an empty one and still exits 0: an empty pool is "no catalog",
+    # so the dropdown falls back to the current value instead of flagging it stale
+    if not routes:
+        _ROUTES_CACHE["routes"] = None
+        return None
+    got = list(dict.fromkeys(routes))  # the catalog's order, duplicates dropped
+    _ROUTES_CACHE["routes"] = got
+    return got
+
+
 def opts_of(r, lines):
     """The [[value, note]] option list a UI shows; session.subagent_model's options are the models
-    the yaml says this OpenCode build has, so they come from the file and never from a hard-coded list."""
+    the yaml says this OpenCode build has, so they come from the file and never from a hard-coded list.
+
+    The two reviewer rows take their options from the catalog's runnable routes. A saved value the
+    catalog no longer lists stays in the list and is flagged `stale` — dropping it would hide the
+    value the file holds, and re-saving it is refused (item 39). With the catalog absent the
+    dropdown falls back to the current value alone, so the screen still draws."""
     if r["key"] == "session.subagent_model":
         return [[m, ""] for m in dict(agents(lines)).get("opencode", {}).get("models", [])]
+    if r["key"] in ROUTE_KEYS:
+        current = value_of(lines, r)[1]
+        routes = catalog_routes()
+        pool = [current] if routes is None else list(routes)
+        if current not in pool:  # a saved route the catalog dropped: kept, and marked stale
+            pool.append(current)
+        return [[v, "stale" if routes is not None and v not in routes else ""] for v in pool]
     return [[v, note] for (v, note) in r["opts"]] if r.get("opts") else None
 
 
@@ -658,7 +731,7 @@ def out(obj, code=0):
     return code
 
 
-def parse_value(raw, r):
+def parse_value(raw, r, lines=None):
     """`set` takes JSON so a number, a bool, a string and a list are told apart; a bare word is a
     string, and anything else is a refusal rather than a guess."""
     try:
@@ -687,6 +760,10 @@ def parse_value(raw, r):
             raise Fail(f"{r['key']} is a string: {raw} is not")
         if r.get("opts") and v not in [o[0] for o in r["opts"]]:
             raise Fail(f"{r['key']} must be one of {', '.join(o[0] for o in r['opts'])}: {raw}")
+        if r["key"] in ROUTE_KEYS:  # the dropdown's options are the catalog, not the schema row
+            allowed = [o[0] for o in (opts_of(r, lines) or [])]
+            if v not in allowed:
+                raise Fail(f"{r['key']} must be one of {', '.join(allowed)}: {raw}")
     return v
 
 
@@ -704,6 +781,8 @@ def cmd_list(path, lines):
         opts = opts_of(r, lines)
         if opts is not None:
             f["opts"] = opts
+            if r["key"] in ROUTE_KEYS and any(n == "stale" for (_v, n) in opts):
+                f["stale"] = True  # a saved route the catalog no longer lists stays visible and flagged
         if r.get("pool") is not None:
             f["pool"] = list(r["pool"])  # the only models `set` accepts for this agent: one pool, picker and validator
         if not f["editable"]:
@@ -724,7 +803,7 @@ def cmd_get(path, lines, args):
             k, sep, raw = args[i + 1].partition("=") if i + 1 < len(args) else ("", "", "")
             if not sep or k != key:
                 raise Fail(f"--set needs KEY=VALUE for {key}")
-            return out({"ok": True, "key": key, "value": parse_value(raw, r)})  # the caller's value wins
+            return out({"ok": True, "key": key, "value": parse_value(raw, r, lines)})  # the caller's value wins
     found, value = value_of(lines, r)
     return out({"ok": True, "key": key, "value": value})
 
@@ -739,7 +818,7 @@ def cmd_set(path, lines, args):
     # agents.*.available is editable=False in rows() for Settings UI, but allowed in set CLI for bootstrap / drift detection
     if not r.get("editable", True) and not r["key"].startswith("agents."):
         raise Fail(f"{key} is read-only: {r.get('why', 'not editable')}")
-    value = parse_value(raw, r)
+    value = parse_value(raw, r, lines)
     found, current = value_of(lines, r)
     if found and current == value:  # a save sends every row it holds, most of them unchanged
         return out({"ok": True, "key": key, "value": value, "file": path, "changed": False})
@@ -942,6 +1021,7 @@ def cmd_context(path, lines, usage_arg=None):
         "subagent_model": val("session.subagent_model"),
         "fresh_session": val("session.fresh_session"),
         "reviewer_split": val("session.reviewer_split"),
+        "todo_done_status": val("session.todo_done_status"),
         "reuse_reviewer": val("session.reuse_reviewer"),
         "bus_ask_timeout_s": val("bus.ask_timeout_s"),
         "integration_branch": val("repo.integration_branch"),
@@ -1187,8 +1267,13 @@ def self_test():
         script = os.path.join(HERE, "mk-config.py")
 
         def run(*args, ok=True):
+            run_env = dict(env)
+            if os.environ.get("MK_HOME"):  # a seeded temp catalog for the reviewer dropdowns
+                run_env["MK_HOME"] = os.environ["MK_HOME"]
+            if os.environ.get("MK_CONFIG_COUNT_ROUTES"):  # the subprocess-count probe
+                run_env["MK_CONFIG_COUNT_ROUTES"] = os.environ["MK_CONFIG_COUNT_ROUTES"]
             p = subprocess.run([sys.executable, script, *args], capture_output=True, text=True,
-                               env=env, cwd=tmp)
+                               env=run_env, cwd=tmp)
             lines = [x for x in (p.stdout or "").splitlines() if x.strip()]
             assert len(lines) == 1, f"{args}: expected ONE json line, got {p.stdout!r} {p.stderr!r}"
             obj = json.loads(lines[0])
@@ -1702,6 +1787,97 @@ def self_test():
         assert run("context")["bus_ask_timeout_s"] == 600
         run("set", "bus.ask_timeout_s", "900")
         assert run("context")["bus_ask_timeout_s"] == 900
+
+        # 25. session.todo_done_status (C9): the schema default, then `done` changes what context
+        #     returns, and a value outside verify|done is refused with nothing written
+        assert run("get", "session.todo_done_status")["value"] == "verify"
+        row = next(f for f in run("list", "--json")["fields"] if f["key"] == "session.todo_done_status")
+        assert (row["type"], row["scope"], row["default"], row["label"]) == \
+            ("seg", "child", "verify", "Todo completed becomes"), row
+        assert [o[0] for o in row["opts"]] == ["verify", "done"], row
+        assert run("context")["todo_done_status"] == "verify"
+        run("set", "session.todo_done_status", '"done"')
+        assert run("context")["todo_done_status"] == "done"
+        before, bak = rd(), yaml_path + ".bak"
+        os.unlink(bak)
+        bad = run("set", "session.todo_done_status", '"merged"', ok=False)
+        assert "must be one of" in bad["error"], bad
+        assert rd() == before and not os.path.exists(bak)
+        with open(yaml_path, "w") as f:
+            f.write(fixture)
+
+        # 26. the reviewer dropdowns offer the catalog's routes, and every offered option passes set
+        cat_home = os.path.join(tmp, "catalog-home")
+        cat_yaml = os.path.join(tmp, "catalog.yaml")
+        with open(cat_yaml, "w") as f:
+            f.write("agents:\n  opencode: { available: true, models: [opencode/alpha] }\n"
+                    "  claude: { available: true, models: [claude-sonnet] }\n")
+        seeded = subprocess.run([sys.executable, os.path.join(HERE, "mk-catalog.py"),
+                                 "--home", cat_home, "seed", "--yaml", cat_yaml, "--no-probe"],
+                                capture_output=True, text=True)
+        assert seeded.returncode == 0, seeded.stderr
+        os.environ["MK_HOME"] = cat_home
+        try:
+            live = "opencode opencode/alpha low"  # a route the seeded catalog lists
+            run("set", "routing_preferences.reviewer", json.dumps(live))
+            run("set", "routing_preferences.visual_reviewer", json.dumps(live))
+            fields = {f["key"]: f for f in run("list", "--json")["fields"]}
+            for key in ("routing_preferences.reviewer", "routing_preferences.visual_reviewer"):
+                offered = [o[0] for o in fields[key]["opts"]]
+                assert offered and all(n == "" for (_v, n) in fields[key]["opts"]), fields[key]
+                assert "stale" not in fields[key], fields[key]
+                for route in offered:  # every option the dropdown shows is one set accepts
+                    run("set", key, json.dumps(route))
+                    assert run("get", key)["value"] == route
+            # a saved value the catalog no longer lists stays visible and is flagged stale
+            with open(yaml_path, "w") as f:
+                f.write(fixture)  # reviewer is the schema default, not a seeded route
+            stale = next(f for f in run("list", "--json")["fields"]
+                         if f["key"] == "routing_preferences.reviewer")
+            assert stale.get("stale") is True, stale
+            assert stale["opts"][-1] == ["claude sonnet medium", "stale"], stale["opts"]
+            run("set", "routing_preferences.reviewer", '"claude sonnet medium"')  # kept, so re-saving it passes
+        finally:
+            del os.environ["MK_HOME"]
+        with open(yaml_path, "w") as f:
+            f.write(fixture)
+
+        # 27. with the catalog absent the dropdown falls back to the current value alone and
+        #     the screen still answers — and an empty home stays empty: list and context must
+        #     never create <home>/mk.db (review R1 finding 1)
+        missing = os.path.join(tmp, "no-catalog")
+        os.makedirs(missing)
+        os.environ["MK_HOME"] = missing
+        try:
+            fb = next(f for f in run("list", "--json")["fields"]
+                      if f["key"] == "routing_preferences.reviewer")
+            assert fb["opts"] == [["claude sonnet medium", ""]], fb
+            assert "stale" not in fb, fb
+            run("context")
+            assert os.listdir(missing) == [], "list or context created a file in an empty home"
+            run("set", "routing_preferences.reviewer", '"claude sonnet medium"')
+            refused = run("set", "routing_preferences.reviewer", '"opencode opencode/alpha low"', ok=False)
+            assert "must be one of" in refused["error"], refused
+        finally:
+            del os.environ["MK_HOME"]
+        with open(yaml_path, "w") as f:
+            f.write(fixture)
+
+        # 28. one list reads the catalog once: two route rows share one subprocess (review R1 finding 2).
+        #     The count is taken inside the child process, where the cache lives.
+        os.environ["MK_HOME"] = cat_home
+        counter = os.path.join(tmp, "route-calls")
+        open(counter, "w").write("")
+        os.environ["MK_CONFIG_COUNT_ROUTES"] = counter
+        try:
+            run("list", "--json")
+            n = len(open(counter).read())
+            assert n <= 1, n
+        finally:
+            del os.environ["MK_HOME"]
+            del os.environ["MK_CONFIG_COUNT_ROUTES"]
+        with open(yaml_path, "w") as f:
+            f.write(fixture)
 
         # 24. probe refreshes agents.<a>.models from the agent CLIs through the safe patcher, and
         #     every model the refreshed pool lists is one `set picks.<a>` accepts

@@ -165,6 +165,13 @@ export const SETTINGS_SCHEMA = {
       "type": "seg"
     },
     {
+      "default": "verify",
+      "editable": true,
+      "key": "session.todo_done_status",
+      "scope": "child",
+      "type": "seg"
+    },
+    {
       "default": true,
       "editable": true,
       "key": "session.reuse_reviewer",
