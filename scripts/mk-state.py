@@ -744,7 +744,15 @@ class Store:
             with open(tmp, "w") as f:
                 f.write(str(max(ids)) + "\n")
             os.replace(tmp, marker_path)
-        write_json(os.path.join(self.run_dir(rid), "run.json"), view)
+        run_path = os.path.join(self.run_dir(rid), "run.json")
+        if os.path.exists(run_path):
+            try:
+                with open(run_path) as f:
+                    json.load(f)
+            except ValueError as e:
+                # the file-path load names JSONDecodeError; the store-on contract names ValueError
+                raise ValueError(str(e))
+        write_json(run_path, view)
         for t in view.get("tasks") or []:
             if t.get("id"):
                 write_json(os.path.join(self.task_dir(rid, t["id"]), "task.json"), t)
@@ -1891,14 +1899,15 @@ def main(argv):
         out, code = a.func(a, st), 0
     except Fail as e:
         out, code = {"ok": False, "error": str(e), **e.extra}, e.code
+    except (OSError, ValueError) as e:  # corrupt JSON (ValueError), unreadable files: still one JSON line
+        out, code = {"ok": False, "error": f"{type(e).__name__}: {e}"}, 2
     except Exception as e:
         # mkdb.Fail is a different class (loaded by path). A store error is still one JSON line.
+        # OSError and ValueError are handled above: they must not fall through to a traceback.
         if type(e).__name__ == "Fail" and type(e).__module__ == "mkdb":
             out, code = {"ok": False, "error": str(e)}, getattr(e, "code", 2)
         else:
             raise
-    except (OSError, ValueError) as e:  # corrupt JSON (ValueError), unreadable files: still one JSON line
-        out, code = {"ok": False, "error": f"{type(e).__name__}: {e}"}, 2
     print(json.dumps(out))
     return code
 
@@ -3156,6 +3165,40 @@ def store_self_test(tmp, env):
     out = once(["run", "set", "--id", "ap1", "--status", "done"], keep, e3)
     assert out["ok"] and "warning" not in out, out
     assert json.load(open(archived))["status"] == "done"
+
+    # a task.json that is a directory is one JSON line, exit 2, no traceback (store off)
+    bad = os.path.join(tmp, "isdir")
+    once(["run", "init", "--id", "d1", "--feature", "D", "--branch", "bd"], bad)
+    once(["task", "add", "--id", "T", "--title", "Tee", "--run", "d1"], bad)
+    tp = os.path.join(bad, "runs", "d1", "tasks", "T", "task.json")
+    os.remove(tp)
+    os.mkdir(tp)
+    r = subprocess.run([sys.executable, os.path.abspath(__file__), "task", "set", "T",
+                        "status=building", "--run", "d1", "--data", bad],
+                       capture_output=True, text=True, env=env)
+    assert r.returncode == 2, (r.returncode, r.stdout, r.stderr)
+    assert "Traceback" not in r.stderr, r.stderr
+    lines = r.stdout.strip().splitlines()
+    assert len(lines) == 1, (r.stdout, r.stderr)
+    body = json.loads(lines[0])
+    assert body["ok"] is False and body["error"].startswith("IsADirectoryError"), body
+
+    # a corrupt run.json with the store on is one JSON line naming ValueError
+    corrupt = os.path.join(tmp, "corrupt")
+    once(["run", "init", "--id", "c1", "--feature", "C", "--branch", "bc"], corrupt)
+    once(["task", "add", "--id", "T", "--title", "Tee", "--run", "c1"], corrupt)
+    once(["store", "enable"], corrupt)
+    with open(os.path.join(corrupt, "runs", "c1", "run.json"), "w") as f:
+        f.write("{not json")
+    r = subprocess.run([sys.executable, os.path.abspath(__file__), "task", "set", "T",
+                        "status=building", "--run", "c1", "--data", corrupt],
+                       capture_output=True, text=True, env=env)
+    assert r.returncode == 2, (r.returncode, r.stdout, r.stderr)
+    assert "Traceback" not in r.stderr, r.stderr
+    lines = r.stdout.strip().splitlines()
+    assert len(lines) == 1, r.stdout
+    body = json.loads(lines[0])
+    assert body["ok"] is False and body["error"].startswith("ValueError"), body
 
 
 if __name__ == "__main__":
