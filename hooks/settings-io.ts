@@ -408,7 +408,7 @@ export function topChangelogEntry(text: string): SettingsAbout['whatsNew'] {
 // ---------- the live SettingsView (same shape the fixture built for) ----------
 
 const SCOPES: readonly SettingsScope[] = [
-  { id: 'mode', label: 'Mode', file: '~/.matrixkoder/config.json', note: 'all projects' },
+  { id: 'mode', label: 'Mode', file: 'plugin.json', note: 'all projects' },
   { id: 'project', label: 'Project', file: '.matrixkoder/matrixkoder.yaml', note: 'this repo' },
   { id: 'routing', label: 'Routing', file: 'matrixkoder.yaml', note: 'routing_preferences' },
   { id: 'agents', label: 'Agents', file: 'matrixkoder.yaml', note: 'agents · usage' },

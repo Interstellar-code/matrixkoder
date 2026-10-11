@@ -9,6 +9,7 @@ import {
   tabsVisibilityToHidden, topChangelogEntry,
 } from './settings-io'
 import type { ConfigRowLite, RunFn, YamlFieldIn } from './settings-io'
+import { SETTINGS_FIXTURE } from './tabs/settings.fixture'
 
 type Answer = { exitCode: number; stdout: string; stderr: string }
 
@@ -287,4 +288,97 @@ test('S3 save: the stored view folds the saved values back, so saved rows read c
   })
   expect(kept.groups.flatMap(g => g.rows).find(r => r.key === 'session.stall_min')?.value).toBe(25)
   expect(kept.groups.flatMap(g => g.rows).find(r => r.key === 'session.max_wait_min')?.value).toBe(120)
+})
+
+// ---------- drift tests: schema and plugin.json userConfig ----------
+//
+// The bundled test runner runs in a sealed JS sandbox (no `process`, `Bun`,
+// `require` or `fs`); it cannot run `python3 scripts/mk-config.py list` or
+// read `.claude-plugin/plugin.json` from a test body. The drift tests below
+// carry a snapshot of the schema and the userConfig defaults captured by
+// `python3 scripts/mk-config.py list --json` and `.claude-plugin/plugin.json`
+// at the time of authoring. To refresh: re-run those commands, paste the
+// output into the snapshot below, and update the assertion expectations.
+
+const SCHEMA_SNAPSHOT: ReadonlyArray<{ key: string; scope: string; default: unknown; editable: boolean }> = [
+  { "key": "repo.lanes.slots", "scope": "project", "default": 3, "editable": true },
+  { "key": "repo.lanes.reuse", "scope": "project", "default": true, "editable": true },
+  { "key": "repo.lanes.copy", "scope": "project", "default": [], "editable": true },
+  { "key": "repo.integration_branch", "scope": "project", "default": "main", "editable": true },
+  { "key": "qa.integration_target", "scope": "project", "default": "local-main", "editable": true },
+  { "key": "autonomy_contract.builder_skip_permissions", "scope": "project", "default": true, "editable": true },
+  { "key": "routing_preferences.policy", "scope": "routing", "default": "claude-sparing", "editable": true },
+  { "key": "routing_preferences.builder_order", "scope": "routing", "default": [], "editable": true },
+  { "key": "routing_preferences.max_build_lanes", "scope": "routing", "default": 3, "editable": true },
+  { "key": "routing_preferences.reserve_floor.claude.five_hour_left_pct", "scope": "routing", "default": 40, "editable": true },
+  { "key": "routing_preferences.reserve_floor.claude.weekly_left_pct", "scope": "routing", "default": 30, "editable": true },
+  { "key": "routing_preferences.reserve_floor.others.five_hour_left_pct", "scope": "routing", "default": 10, "editable": true },
+  { "key": "routing_preferences.reserve_floor.others.weekly_left_pct", "scope": "routing", "default": 15, "editable": true },
+  { "key": "routing_preferences.reviewer", "scope": "routing", "default": "claude sonnet medium", "editable": true },
+  { "key": "routing_preferences.visual_reviewer", "scope": "routing", "default": "claude haiku", "editable": true },
+  { "key": "usage.source", "scope": "agents", "default": "codexbar", "editable": true },
+  { "key": "usage.providers", "scope": "agents", "default": [], "editable": true },
+  { "key": "session.fresh_session", "scope": "child", "default": "new", "editable": true },
+  { "key": "session.subagents", "scope": "child", "default": true, "editable": true },
+  { "key": "session.subagent_model", "scope": "child", "default": "", "editable": true },
+  { "key": "session.stall_min", "scope": "child", "default": 15, "editable": true },
+  { "key": "session.max_wait_min", "scope": "child", "default": 30, "editable": true },
+  { "key": "session.reviewer_split", "scope": "child", "default": "right", "editable": true },
+  { "key": "session.reuse_reviewer", "scope": "child", "default": true, "editable": true },
+  { "key": "agents.codex.available", "scope": "agents", "default": true, "editable": false },
+  { "key": "picks.codex", "scope": "models", "default": [], "editable": true },
+  { "key": "agents.opencode.available", "scope": "agents", "default": true, "editable": false },
+  { "key": "picks.opencode", "scope": "models", "default": [], "editable": true },
+  { "key": "agents.agy.available", "scope": "agents", "default": true, "editable": false },
+  { "key": "picks.agy", "scope": "models", "default": [], "editable": true },
+  { "key": "agents.claude.available", "scope": "agents", "default": true, "editable": false },
+  { "key": "agents.herdr.available", "scope": "agents", "default": true, "editable": false },
+]
+
+const USERCONFIG_SNAPSHOT: Readonly<Record<string, unknown>> = {
+  guards: true,
+  autoOpen: true,
+  chip: true,
+  toasts: true,
+  usagePollMin: 5,
+  wake: false,
+  mode: 'orchestrator',
+  defaultTab: 'old',
+  hiddenTabs: '',
+  raster: true,
+}
+
+test('drift: editable YAML rows in SETTINGS_FIXTURE match mk-config list schema', () => {
+  const schemaMap = new Map(SCHEMA_SNAPSHOT.map(f => [f.key, f]))
+
+  const yamlScopes = new Set(['project', 'routing', 'agents', 'child'])
+  const editableRows = SETTINGS_FIXTURE.groups
+    .filter(g => yamlScopes.has(g.scope))
+    .flatMap(g => g.rows)
+    .filter(r => r.editable !== false && !(r as { global?: boolean }).global)
+
+  expect(editableRows.length).toBeGreaterThan(0)
+  for (const row of editableRows) {
+    const schemaRow = schemaMap.get(row.key)
+    expect(schemaRow, `key ${row.key} must exist in schema`).toBeDefined()
+    if (schemaRow && schemaRow.editable !== false) {
+      expect(row.default, `default for ${row.key} must match schema default`).toEqual(schemaRow.default)
+    }
+  }
+})
+
+test('drift: global rows in SETTINGS_FIXTURE match plugin.json userConfig defaults', () => {
+  const userConfig = USERCONFIG_SNAPSHOT
+
+  const globalScopes = new Set(['mode', 'tabs', 'about'])
+  const globalRows = SETTINGS_FIXTURE.groups
+    .filter(g => globalScopes.has(g.scope))
+    .flatMap(g => g.rows)
+    .filter(r => r.key in userConfig)
+
+  expect(globalRows.length).toBeGreaterThan(0)
+  for (const row of globalRows) {
+    const expected = userConfig[row.key]
+    expect(row.default, `default for ${row.key} must match plugin.json userConfig default`).toEqual(expected)
+  }
 })

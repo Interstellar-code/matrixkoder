@@ -28,7 +28,7 @@ const SUBAGENT_MODELS = [
 export const SETTINGS_FIXTURE: SettingsView = {
   mock: true,
   scopes: [
-    { id: 'mode', label: 'Mode', file: '~/.matrixkoder/config.json', note: 'all projects' },
+    { id: 'mode', label: 'Mode', file: 'plugin.json', note: 'all projects' },
     { id: 'project', label: 'Project', file: '.matrixkoder/matrixkoder.yaml', note: 'this repo' },
     { id: 'routing', label: 'Routing', file: 'matrixkoder.yaml', note: 'routing_preferences' },
     { id: 'agents', label: 'Agents', file: 'matrixkoder.yaml', note: 'agents · usage' },
@@ -57,7 +57,7 @@ export const SETTINGS_FIXTURE: SettingsView = {
       rows: [
         { key: 'repo.lanes.slots', scope: 'project', label: 'Worktree slots', type: 'num', value: 3, default: 3, min: 1, max: 6, help: 'Reusable worktrees ../matrixkoder-mk-N.', editable: true },
         { key: 'repo.lanes.reuse', scope: 'project', label: 'Reuse slots', type: 'bool', value: true, default: true, help: 'Keep a slot after release.', editable: true },
-        { key: 'repo.lanes.copy', scope: 'project', label: 'Copy into slot', type: 'list', value: ['.claude-plugin/types'], default: ['.claude-plugin/types'], help: 'Untracked paths a fresh slot needs.', editable: true },
+        { key: 'repo.lanes.copy', scope: 'project', label: 'Copy into slot', type: 'list', value: ['.claude-plugin/types'], default: [], help: 'Untracked paths a fresh slot needs.', editable: true },
         { key: 'repo.integration_branch', scope: 'project', label: 'Integration branch', type: 'text', value: 'main', default: 'main', help: 'Lanes merge here.', editable: true },
       ],
     },
@@ -73,17 +73,17 @@ export const SETTINGS_FIXTURE: SettingsView = {
       scope: 'routing', title: 'policy', right: 'routing_preferences',
       rows: [
         { key: 'routing_preferences.policy', scope: 'routing', label: 'Policy', type: 'seg', value: 'claude-sparing', default: 'claude-sparing', opts: [['claude-sparing', 'spare'], ['balanced', 'bal'], ['quality', 'qual']], help: 'Claude orchestrates; builders below.', editable: true },
-        { key: 'routing_preferences.builder_order', scope: 'routing', label: 'Builder order', type: 'list', value: ['opencode', 'claude'], default: ['opencode', 'claude'], help: 'Codex never (user rule).', editable: true },
+        { key: 'routing_preferences.builder_order', scope: 'routing', label: 'Builder order', type: 'list', value: ['opencode', 'claude'], default: [], help: 'Codex never (user rule).', editable: true },
         { key: 'routing_preferences.max_build_lanes', scope: 'routing', label: 'Max build lanes', type: 'num', value: 4, default: 3, min: 1, max: 6, help: 'Build lanes the router may open at once.', editable: true },
       ],
     },
     {
       scope: 'routing', title: 'reserve floor', right: '% left',
       rows: [
-        { key: 'reserve_floor.claude.five_hour_left_pct', scope: 'routing', label: 'Claude 5h', type: 'num', value: 40, default: 40, min: 0, max: 90, unit: '%', help: 'Below this Claude is not a builder.', editable: true },
-        { key: 'reserve_floor.claude.weekly_left_pct', scope: 'routing', label: 'Claude week', type: 'num', value: 30, default: 30, min: 0, max: 90, unit: '%', help: 'Claude weekly floor.', editable: true },
-        { key: 'reserve_floor.others.five_hour_left_pct', scope: 'routing', label: 'Others 5h', type: 'num', value: 10, default: 10, min: 0, max: 90, unit: '%', help: 'Five-hour floor for other agents.', editable: true },
-        { key: 'reserve_floor.others.weekly_left_pct', scope: 'routing', label: 'Others week', type: 'num', value: 15, default: 15, min: 0, max: 90, unit: '%', help: 'Weekly floor for other agents.', editable: true },
+        { key: 'routing_preferences.reserve_floor.claude.five_hour_left_pct', scope: 'routing', label: 'Claude 5h', type: 'num', value: 40, default: 40, min: 0, max: 90, unit: '%', help: 'Below this Claude is not a builder.', editable: true },
+        { key: 'routing_preferences.reserve_floor.claude.weekly_left_pct', scope: 'routing', label: 'Claude week', type: 'num', value: 30, default: 30, min: 0, max: 90, unit: '%', help: 'Claude weekly floor.', editable: true },
+        { key: 'routing_preferences.reserve_floor.others.five_hour_left_pct', scope: 'routing', label: 'Others 5h', type: 'num', value: 10, default: 10, min: 0, max: 90, unit: '%', help: 'Five-hour floor for other agents.', editable: true },
+        { key: 'routing_preferences.reserve_floor.others.weekly_left_pct', scope: 'routing', label: 'Others week', type: 'num', value: 15, default: 15, min: 0, max: 90, unit: '%', help: 'Weekly floor for other agents.', editable: true },
       ],
     },
     {
@@ -108,34 +108,30 @@ export const SETTINGS_FIXTURE: SettingsView = {
       scope: 'agents', title: 'usage', right: 'usage',
       rows: [
         { key: 'usage.source', scope: 'agents', label: 'Source', type: 'seg', value: 'codexbar', default: 'codexbar', opts: [['codexbar', 'codexbar'], ['manual', 'manual']], help: 'Where usage numbers come from.', editable: true },
-        { key: 'usage.poll_min', scope: 'agents', label: 'Poll', type: 'num', value: 5, default: 5, min: 1, max: 60, unit: 'm', help: 'Minutes between usage polls.', editable: true },
-        { key: 'usage.providers', scope: 'agents', label: 'Providers', type: 'list', value: ['claude', 'opencodego', 'ollama'], default: ['claude', 'opencodego', 'ollama'], help: 'Z.AI dropped 2026-10-08.', editable: true },
+        { key: 'usage.providers', scope: 'agents', label: 'Providers', type: 'list', value: ['claude', 'opencodego', 'ollama'], default: [], help: 'Z.AI dropped 2026-10-08.', editable: true },
       ],
     },
     // ---- Child
     {
       scope: 'child', title: 'builder sessions', right: 'lanes.child',
       rows: [
-        { key: 'lanes.child.fresh_session', scope: 'child', label: 'New round', type: 'seg', value: '/new', default: '/new', opts: [['/new', '/new'], ['same', 'same']], help: 'Clear context per round; model stays.', editable: true },
-        { key: 'lanes.child.subagents', scope: 'child', label: 'Subagents', type: 'bool', value: true, default: true, help: 'Plan default (template).', editable: true },
-        { key: 'lanes.child.subagent_model', scope: 'child', label: 'Subagent model', type: 'select', value: 'ollama-cloud/minimax-m3', default: 'ollama-cloud/minimax-m3', opts: SUBAGENT_MODELS, help: 'Written to the lane oh-my-openagent categories.', editable: true },
-        { key: 'lanes.child.ctx_stop_pct', scope: 'child', label: 'Stop at context', type: 'num', value: 80, default: 80, min: 50, max: 95, unit: '%', help: 'Interrupt + takeover in a fresh session.', editable: true },
-        { key: 'lanes.child.cost_stop_usd', scope: 'child', label: 'Stop at cost', type: 'num', value: 5, default: 5, min: 1, max: 50, help: 'Per round, paid models.', editable: true },
+        { key: 'session.fresh_session', scope: 'child', label: 'New round', type: 'seg', value: 'new', default: 'new', opts: [['new', 'new'], ['same', 'same']], help: 'Clear context per round; model stays.', editable: true },
+        { key: 'session.subagents', scope: 'child', label: 'Subagents', type: 'bool', value: true, default: true, help: 'Plan default (template).', editable: true },
+        { key: 'session.subagent_model', scope: 'child', label: 'Subagent model', type: 'select', value: '', default: '', opts: SUBAGENT_MODELS, help: 'Written to the lane oh-my-openagent categories.', editable: true },
       ],
     },
     {
       scope: 'child', title: 'watch', right: 'lane-watch',
       rows: [
-        { key: 'lanes.child.stall_min', scope: 'child', label: 'Stall after', type: 'num', value: 20, default: 20, min: 5, max: 60, unit: 'm', help: 'No file/commit/pane change.', editable: true },
-        { key: 'lanes.child.max_wait_min', scope: 'child', label: 'Give up after', type: 'num', value: 120, default: 120, min: 30, max: 300, unit: 'm', help: 'Give up on a silent lane after this.', editable: true },
-        { key: 'herdr.events', scope: 'child', label: 'herdr events plugin', type: 'bool', value: true, default: true, help: 'herdr-plugin.toml events.', editable: true },
+        { key: 'session.stall_min', scope: 'child', label: 'Stall after', type: 'num', value: 15, default: 15, min: 5, max: 60, unit: 'm', help: 'No file/commit/pane change.', editable: true },
+        { key: 'session.max_wait_min', scope: 'child', label: 'Give up after', type: 'num', value: 30, default: 30, min: 10, max: 300, unit: 'm', help: 'Give up on a silent lane after this.', editable: true },
       ],
     },
     {
       scope: 'child', title: 'reviewer panes',
       rows: [
-        { key: 'lanes.child.reviewer_split', scope: 'child', label: 'Split', type: 'seg', value: 'right', default: 'right', opts: [['right', 'right'], ['down', 'down']], help: 'herdr pane split.', editable: true },
-        { key: 'lanes.child.reuse_reviewer', scope: 'child', label: 'Reuse reviewer pane', type: 'bool', value: true, default: true, help: '/clear between rounds.', editable: true },
+        { key: 'session.reviewer_split', scope: 'child', label: 'Split', type: 'seg', value: 'right', default: 'right', opts: [['right', 'right'], ['down', 'down']], help: 'herdr pane split.', editable: true },
+        { key: 'session.reuse_reviewer', scope: 'child', label: 'Reuse reviewer pane', type: 'bool', value: true, default: true, help: '/clear between rounds.', editable: true },
       ],
     },
     // ---- Tabs: the artboard's visibility + pane rows, plus the C2 rows
@@ -155,11 +151,8 @@ export const SETTINGS_FIXTURE: SettingsView = {
     {
       scope: 'tabs', title: 'pane', right: 'dashboard',
       rows: [
-        { key: 'defaultTab', scope: 'tabs', label: 'Open on', type: 'select', value: 'overview', default: 'overview', opts: [['overview', ''], ['lanes', ''], ['plan', ''], ['usage', ''], ['events', ''], ['waiting', ''], ['old', ''], ['settings', 'this tab']], help: 'The tab the pane opens on.', editable: true },
+        { key: 'defaultTab', scope: 'tabs', label: 'Open on', type: 'select', value: 'old', default: 'old', opts: [['overview', ''], ['lanes', ''], ['plan', ''], ['usage', ''], ['events', ''], ['waiting', ''], ['old', ''], ['settings', 'this tab']], help: 'The tab the pane opens on.', editable: true },
         { key: 'hiddenTabs', scope: 'tabs', label: 'Hidden tabs', type: 'text', value: '', default: '', help: 'Comma list of tabs to hide (Settings never hidden).', editable: true },
-        { key: 'dashboard.auto_open', scope: 'tabs', label: 'Auto-open pane', type: 'bool', value: true, default: true, help: '≥144 cols, fullscreen.', editable: true },
-        { key: 'dashboard.chip', scope: 'tabs', label: 'Status chip', type: 'bool', value: true, default: true, help: 'Run health under the prompt.', editable: true },
-        { key: 'dashboard.toasts', scope: 'tabs', label: 'Toasts', type: 'bool', value: true, default: true, help: 'Toast on task status transitions.', editable: true },
         { key: 'raster', scope: 'tabs', label: 'Raster bars', type: 'bool', value: true, default: true, help: 'Off = eighth-block fallback.', editable: true },
       ],
     },
@@ -167,7 +160,7 @@ export const SETTINGS_FIXTURE: SettingsView = {
     {
       scope: 'about', title: 'plugin options', right: 'userConfig',
       rows: [
-        { key: 'wake', scope: 'about', label: 'Wake on events', type: 'bool', value: true, default: true, help: 'Submit a prompt when a lane needs attention.', editable: false, why: 'Read-only: claude plugin configure' },
+        { key: 'wake', scope: 'about', label: 'Wake on events', type: 'bool', value: false, default: false, help: 'Submit a prompt when a lane needs attention.', editable: false, why: 'Read-only: claude plugin configure' },
         { key: 'guards', scope: 'about', label: 'Guards', type: 'bool', value: true, default: true, help: 'Deny destructive git, banned commands.', editable: false, why: 'Read-only: claude plugin configure' },
         { key: 'usagePollMin', scope: 'about', label: 'Usage poll', type: 'num', value: 5, default: 5, min: 1, max: 60, unit: 'm', help: 'Minutes between usage polls.', editable: false, why: 'Read-only: claude plugin configure' },
         { key: 'autoOpen', scope: 'about', label: 'Auto-open pane', type: 'bool', value: true, default: true, help: 'Open the pane when a session starts.', editable: false, why: 'Read-only: claude plugin configure' },
