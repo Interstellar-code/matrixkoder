@@ -340,3 +340,85 @@ an unreadable plan file means no warning and no crash. Setting the **last** run 
 runs `set --status done` on the plan and flips the run's `plan_status` (best-effort, never fatal; a
 plan-tool error rides back as a `warning` in the `run set` JSON).
 `task add` stays for ad-hoc tasks.
+
+## SQLite stores (`scripts/mkdb.py`)
+
+`mkdb.py` is the only module that opens a store read-write (research §8: a test greps `scripts/`
+for `sqlite3.connect` and fails if any other script opens one without `mode=ro`). Nothing else
+calls it yet — the run still uses the JSON/file state above. Every self-test and caller passes a
+temp home; the real `~/.matrixkoder` is never created here.
+
+### Locations
+
+| Store | Path | Holds |
+|---|---|---|
+| Root (C1) | `<home>/mk.db` | `projects`, `cards`, `project_summary`, `sync` |
+| Project (C2) | `<data>/mk.db`, or `<home>/projects/<slug>/mk.db` when only a slug is given | `plans`, `runs`, `tasks`, `events`, `artifacts`, `acks`, `lane_slots`, `waits`, `change_log` |
+
+`<home>` is `--home` → `$MK_HOME` → `~/.matrixkoder`. `<data>` is `--data` / `data_dir`: until DM a
+project lives at `<repo>/.matrixkoder/`, not under the home. The slug is checked against
+`^[a-z0-9][a-z0-9-]{0,40}$` **before** any path is built from it. A home whose path contains
+`Mobile Documents`, `CloudStorage`, `iCloud` or `Dropbox`, or starts with `/Volumes/`, is refused —
+a path-string heuristic, so a custom sync root or a volume mounted elsewhere slips through
+(`shortcut:` in `scripts/mkdb.py`).
+
+### PRAGMAs and transactions
+
+Every open sets `journal_mode=WAL`, `busy_timeout=5000`, `foreign_keys=ON`. Every write runs inside
+`BEGIN IMMEDIATE`. WAL files (`-wal`, `-shm`) sit next to the db and must move with it (`VACUUM INTO`).
+
+### `schema_version` and migrations
+
+Both stores carry `schema_version(version INTEGER PRIMARY KEY)`. `SCHEMA = 1`. Migrations are an
+ordered `(version, sql)` list applied once, each idempotent (`CREATE TABLE IF NOT EXISTS`,
+`INSERT OR IGNORE`) because the DDL and its version stamp are two transactions. A store whose
+version is newer than the code is refused: `{"ok": false, "error": "store schema vN is newer …"}`,
+exit 3. The v1→v2 migration exists only inside `--self-test`; it is not in the shipped list.
+
+### Project tables (C2)
+
+`tasks(run, id, parent, type, title, acceptance, owned, deps, parallel, route_json, status, lane,
+slot, branch, pane, round, verdict, updated, PRIMARY KEY(run, id))` — `type` is `phase|task|subtask`;
+`deps` is one TEXT CSV of ids in the same plan, or `<run>:<id>` in the same project. Validated on
+write: the dep must exist, a self-dep is refused, a cycle is refused with the path named
+(`cycle: r:phase -> r:task -> r:phase`). `route_json` is `{"agent","model","effort"}` or empty.
+Status rolls up subtask → task → phase: an attention status (`blocked`, `stalled`, `quota`,
+`provider`) wins, otherwise the parent takes the least-done column of its children.
+
+`events(id INTEGER PRIMARY KEY, run, task, t, chan, kind, from_id, to_id, reply_to, text,
+artifact_id, meta_json)` with index `ev_task(run, task, id)`. `chan` is `state` or `bus`.
+`change_log(change_no INTEGER PRIMARY KEY, run, task, t)` — `change_no` is the rowid, gap-free.
+`plans`, `runs`, `artifacts`, `acks`, `lane_slots`, `waits` as in contract C2.
+
+### Root tables (C1)
+
+`cards(project, run, task, parent, type, title, status, col, attention, question, route_json, lane,
+round, verdict, gates, updated, change_no, PRIMARY KEY(project, run, task))`. `col` (C4) is derived
+from `status`: Backlog (`planned`, `routed`) · Ready · Building (`dispatched`, `building`,
+`takeover`) · Verify (`verifying`) · Review · Fix · Done (`merged`, `qa`, `done`); an attention
+status keeps its column and sets `attention=1`. `sync(project PRIMARY KEY, last_change_no)` records
+how far the root copy got.
+
+### `transition(project, run, task, to, note="", round=0, sync_root=False, data_dir=None)`
+
+The only status writer (C10). One project-store transaction updates the task row, appends an
+`events` row (`chan='state'`, `kind='transition'`) and a `change_log` row, and returns `change_no`.
+A failure inside it leaves nothing. The C5 root card upsert is a **second** transaction and runs
+only when `sync_root=True`; the default is `False`, so D1 and D3A do not write `cards`. A crash
+between the two leaves the project change durable and the root behind; `catch_up()` replays
+`change_log` from `sync.last_change_no`.
+
+### API and CLI
+
+API: `open_root(home)`, `open_project(home, slug=None, data_dir=None)`, `add_task(con, run, task, type, …)`,
+`transition(…)`, `catch_up(home, project, data_dir=None)`, `timeline(home, project, run, task, data_dir=None)`,
+`cards(home, project=None)`, `check_slug`, `check_home`, `column_of`.
+
+```
+mkdb.py timeline --project P --run R --task T --json [--data DIR] [--home DIR]
+mkdb.py cards [--project P] --json [--home DIR]
+mkdb.py --self-test
+```
+
+`timeline` is `SELECT … FROM events WHERE run=? AND task=? ORDER BY id`. `cards` reads the root
+store. One JSON line per call; errors exit 2, a newer store exits 3.
