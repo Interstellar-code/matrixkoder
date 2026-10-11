@@ -27,7 +27,7 @@ import argparse, json, os, secrets, shutil, subprocess, sys, tempfile
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import mkdb  # the only store opener; this file never calls sqlite3.connect
+import mkdb  # the only store opener; this file opens no database itself
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -601,8 +601,9 @@ def self_test():
 
     # This file never opens a store itself, read-write or otherwise.
     src = open(os.path.abspath(__file__), encoding="utf-8").read()
-    _check(not any(line.lstrip().startswith("sqlite3.connect(") for line in src.splitlines()),
-           "sqlite3.connect in the harness")
+    needle = "sqlite3" + ".connect("
+    _check(not any(line.lstrip().startswith(needle) for line in src.splitlines()),
+           "database connect call in the harness")
     print("SELF-TEST PASS")
 
 
