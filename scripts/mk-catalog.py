@@ -29,6 +29,8 @@ CATALOG_DDL = """
 CREATE TABLE IF NOT EXISTS agents(
   id TEXT PRIMARY KEY, kind TEXT, cli TEXT, provider_plans_json TEXT, capabilities_json TEXT,
   status TEXT, notes TEXT, updated TEXT);
+CREATE TABLE IF NOT EXISTS catalog_user(
+  agent TEXT, model TEXT, field TEXT, PRIMARY KEY(agent, model, field));
 CREATE TABLE IF NOT EXISTS models(
   agent TEXT, id TEXT, provider TEXT, display TEXT, context_tokens INTEGER,
   effort_levels_json TEXT, benchmarks_json TEXT, cost_json TEXT, quota_pool TEXT,
@@ -81,6 +83,7 @@ def open_catalog(home):
     """
     con = mkdb.open_root(home)
     con.executescript(CATALOG_DDL)
+    _migrate_user_markers(con)
     return con
 
 
@@ -102,25 +105,31 @@ def _load(text, default):
         return default
 
 
+def _migrate_user_markers(con):
+    """Move a `_user` marker left in agents.notes by round 1 into catalog_user, then drop it."""
+    if not con.execute("SELECT 1 FROM sqlite_master WHERE name='agents'").fetchone():
+        return
+    for row in con.execute("SELECT id, notes FROM agents"):
+        bag = _load(row["notes"], None)
+        if not isinstance(bag, dict) or "_user" not in bag:
+            continue
+        for field in bag["_user"]:
+            con.execute("INSERT OR IGNORE INTO catalog_user(agent, model, field) VALUES (?,?,?)",
+                        (row["id"], "", field))
+        bag.pop("_user")
+        con.execute("UPDATE agents SET notes=? WHERE id=?", ("" if not bag else _dump(bag), row["id"]))
+
+
 def _user_fields(con, agent, model=None):
-    """Fields a user set, which seed must not touch."""
-    if model is None:
-        row = con.execute("SELECT notes FROM agents WHERE id=?", (agent,)).fetchone()
-        return set(_load(row["notes"], {}).get("_user", [])) if row else set()
-    row = con.execute("SELECT user_json FROM models WHERE agent=? AND id=?", (agent, model)).fetchone()
-    return set(_load(row["user_json"] if row else None, []))
+    """Fields a user set, which seed must not touch. The record lives in catalog_user, never a C8 column."""
+    key = "" if model is None else model
+    return {r["field"] for r in con.execute(
+        "SELECT field FROM catalog_user WHERE agent=? AND model=?", (agent, key))}
 
 
 def _mark_user(con, agent, model, field):
-    if model is None:
-        row = con.execute("SELECT notes FROM agents WHERE id=?", (agent,)).fetchone()
-        bag = _load(row["notes"], {})
-        bag["_user"] = sorted(set(bag.get("_user", [])) | {field})
-        con.execute("UPDATE agents SET notes=? WHERE id=?", (_dump(bag), agent))
-    else:
-        row = con.execute("SELECT user_json FROM models WHERE agent=? AND id=?", (agent, model)).fetchone()
-        fields = sorted(set(_load(row["user_json"] if row else None, [])) | {field})
-        con.execute("UPDATE models SET user_json=? WHERE agent=? AND id=?", (_dump(fields), agent, model))
+    con.execute("INSERT OR IGNORE INTO catalog_user(agent, model, field) VALUES (?,?,?)",
+                (agent, "" if model is None else model, field))
 
 
 def upsert_agent(con, agent, caps, kind, cli, status, protected):
@@ -143,14 +152,22 @@ def upsert_agent(con, agent, caps, kind, cli, status, protected):
     con.execute(f"UPDATE agents SET {cols} WHERE id=?", (*sets.values(), agent))
 
 
-def upsert_model(con, agent, model, efforts, provider, status, protected):
+def display_of(model, known=None):
+    """A display name: a known one, else the title-cased last segment of the id."""
+    if known:
+        return known
+    seg = model.split("/")[-1].replace("-", " ").replace("_", " ")
+    return " ".join(w.capitalize() for w in seg.split())
+
+
+def upsert_model(con, agent, model, efforts, provider, status, protected, display=None):
     have = con.execute("SELECT * FROM models WHERE agent=? AND id=?", (agent, model)).fetchone()
     if not have:
         con.execute("INSERT INTO models(agent, id, provider, display, context_tokens, effort_levels_json,"
                     " benchmarks_json, cost_json, quota_pool, status, notes, updated, capabilities_json,"
                     " user_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (agent, model, provider, model, None, _dump(efforts), _dump({}), _dump({}), None,
-                     status, "", now(), None, _dump([])))
+                    (agent, model, provider, display_of(model, display), None, _dump(efforts), _dump({}),
+                     _dump({}), None, status, "", now(), None, _dump([])))
         return
     sets = {"updated": now()}
     if "provider" not in protected:
@@ -159,8 +176,26 @@ def upsert_model(con, agent, model, efforts, provider, status, protected):
         sets["status"] = status
     if "effort_levels_json" not in protected:
         sets["effort_levels_json"] = _dump(efforts)
+    if "display" not in protected and display:
+        sets["display"] = display
     cols = ", ".join(f"{k}=?" for k in sets)
     con.execute(f"UPDATE models SET {cols} WHERE agent=? AND id=?", (*sets.values(), agent, model))
+
+
+def known_displays():
+    """Display names from ~/.config/opencode/opencode.json when it is readable, else {}."""
+    path = os.path.expanduser("~/.config/opencode/opencode.json")
+    try:
+        data = json.load(open(path))
+    except Exception:
+        return {}
+    out = {}
+    for provider in (data.get("provider") or {}).values():
+        for mid, info in (provider.get("models") or {}).items():
+            name = info.get("name") if isinstance(info, dict) else None
+            if name:
+                out[mid] = name
+    return out
 
 
 def probe_models(cli):
@@ -244,10 +279,11 @@ def seed(home, yaml_path, jev_path, probe=True):
                              "enabled" if enabled else "disabled", _user_fields(con, name))
                 picked = list(info.get("models") or [])
                 probed = probe_models(PROBE_CLIS[name]) if probe and name in PROBE_CLIS else []
+                displays = known_displays()
                 for model in list(dict.fromkeys(picked + probed)):
                     upsert_model(con, name, model, seed_row["efforts"], seed_row["kind"],
                                  "picked" if model in picked else "probed",
-                                 _user_fields(con, name, model))
+                                 _user_fields(con, name, model), displays.get(model))
             for agent, model in jev_models(jev_path):
                 efforts = SEEDS.get(agent, {}).get("efforts", [])
                 upsert_model(con, agent, model, efforts, SEEDS.get(agent, {}).get("kind", agent),
@@ -362,21 +398,58 @@ def routes(home):
     return {"ok": True, "routes": out}
 
 
-def pane_model(pane, text=None):
-    """The model in a herdr pane footer. --text feeds the footer directly (tests); otherwise herdr."""
-    if text is None:
-        try:
-            proc = subprocess.run(["herdr", "pane", "read", pane], capture_output=True, text=True,
-                                  timeout=20)
-        except Exception as e:
-            raise Fail(f"herdr pane read failed: {e}")
-        if proc.returncode != 0:
-            raise Fail(f"herdr pane read exited {proc.returncode}: {proc.stderr.strip()}")
-        text = proc.stdout
-    hits = FOOTER_RE.findall(text or "")
-    if not hits:
-        raise Fail(f"no model in pane {pane!r} footer")
-    return {"ok": True, "pane": pane, "model": hits[-1]}
+def _footer_text(pane, text):
+    if text is not None:
+        return text
+    try:
+        proc = subprocess.run(["herdr", "pane", "read", pane], capture_output=True, text=True, timeout=20)
+    except Exception as e:
+        raise Fail(f"herdr pane read failed: {e}")
+    if proc.returncode != 0:
+        raise Fail(f"herdr pane read exited {proc.returncode}: {proc.stderr.strip()}")
+    return proc.stdout
+
+
+def match_footer(con, text):
+    """The catalog model a pane footer shows: longest id or display match, effort if shown."""
+    low = (text or "").lower()
+    best = None
+    for row in con.execute("SELECT agent, id, display, effort_levels_json FROM models"):
+        for needle in (row["id"], row["display"]):
+            if not needle:
+                continue
+            pos = low.find(needle.lower())
+            if pos < 0:
+                continue
+            if best is None or len(needle) > len(best[0]):
+                best = (needle, row)
+    if best is None:
+        hits = FOOTER_RE.findall(text or "")
+        if not hits:
+            return None
+        return {"model": hits[-1], "display": None, "effort": None}
+    needle, row = best
+    efforts = _load(row["effort_levels_json"], [])
+    effort = next((e for e in sorted(efforts, key=len, reverse=True) if re.search(r"\b" + re.escape(e) + r"\b", low)), None)
+    return {"agent": row["agent"], "model": row["id"], "display": row["display"], "effort": effort}
+
+
+def pane_model(pane, text=None, home=None):
+    """The model in a herdr pane footer, matched against the catalog. --text feeds the footer."""
+    text = _footer_text(pane, text)
+    con = open_catalog(home) if home else None
+    try:
+        found = match_footer(con, text) if con else None
+    finally:
+        if con:
+            con.close()
+    if not found:
+        hits = FOOTER_RE.findall(text or "")
+        if not hits:
+            raise Fail(f"no known model in pane {pane!r} footer")
+        found = {"model": hits[-1]}
+    found.update(ok=True, pane=pane)
+    return found
 
 
 def _cli(argv):
@@ -388,7 +461,8 @@ def _cli(argv):
     sd.add_argument("--yaml")
     sd.add_argument("--jev")
     sd.add_argument("--no-probe", action="store_true")
-    sub.add_parser("list")
+    ls = sub.add_parser("list")
+    ls.add_argument("--json", action="store_true")
     sh = sub.add_parser("show")
     sh.add_argument("agent")
     sh.add_argument("model", nargs="?")
@@ -419,7 +493,7 @@ def _cli(argv):
     if args.cmd == "routes":
         return routes(home)
     if args.cmd == "model":
-        return pane_model(args.pane, args.text)
+        return pane_model(args.pane, args.text, home)
     raise Fail("usage: mk-catalog.py seed|list|show|set|routes|model  (or --self-test)")
 
 
@@ -478,12 +552,43 @@ def self_test():
         got = routes(home)["routes"]
         _check(all(not r.startswith("opencode ") for r in got), f"disabled agent still routed: {got}")
         _check(any(r.startswith("claude claude-sonnet ") for r in got), f"added agent missing: {got}")
-        footer = "builder  manifest/auto  12k ctx\n"
-        _check(pane_model("pane-1", footer)["model"] == "manifest/auto", "pane footer")
+        _run(home, "set", "opencode", "notes", '"my custom note"')
+        shown = _run(home, "show", "opencode")
+        _check(shown["agent"]["notes"] == "my custom note", f"notes destroyed: {shown['agent']['notes']}")
+        _run(home, "seed", "--yaml", yaml, "--jev", jev, "--no-probe")
+        shown = _run(home, "show", "opencode")
+        _check(shown["agent"]["notes"] == "my custom note", "seed overwrote agent notes")
+        _run(home, "set", "opencode", "status", '"disabled"')
+        _run(home, "seed", "--yaml", yaml, "--jev", jev, "--no-probe")
+        shown = _run(home, "show", "opencode")
+        _check(shown["agent"]["status"] == "disabled", "seed overwrote a set status")
+        listed = _run(home, "list", "--json")
+        _check(listed["ok"] and listed["agents"], "list --json rejected")
+        footers = {
+            "Build · Manifest Auto Manifest · high": ("manifest/auto", "high"),
+            "▣ Sisyphus - Ultraworker · Manifest Auto": ("manifest/auto", None),
+            "gemini-3.8-flash-medium  12k ctx": ("gemini-3.8-flash-medium", None),
+            "claude-sonnet-5-5 · medium": ("claude-sonnet-5-5", "medium"),
+        }
+        con = open_catalog(home)
         try:
-            pane_model("pane-1", "no model here")
-        except Fail:
-            pass
+            upsert_model(con, "opencode", "manifest/auto", ["low", "medium", "high"], "opencode",
+                         "picked", set(), "Manifest Auto")
+            upsert_model(con, "agy", "gemini-3.8-flash-medium", [], "agy", "picked", set())
+            upsert_model(con, "claude", "claude-sonnet-5-5", ["low", "medium", "high", "max"],
+                         "claude", "picked", set(), "Sonnet 5.5")
+            con.commit()
+        finally:
+            con.close()
+        for footer, (model, effort) in footers.items():
+            got = pane_model("pane-1", footer, home)
+            _check(got["model"] == model and got.get("effort") == effort, f"footer {footer!r} -> {got}")
+        got = pane_model("pane-1", "Sonnet 5.5 · high", home)
+        _check(got["model"] == "claude-sonnet-5-5" and got["effort"] == "high", f"display match {got}")
+        try:
+            pane_model("pane-1", "no model here", home)
+        except Fail as e:
+            _check("no known model" in str(e), f"unclear error: {e}")
         else:
             raise SystemExit("SELF-TEST FAIL: a footer without a model was accepted")
         here = os.path.abspath(__file__)
