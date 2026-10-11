@@ -30,6 +30,8 @@
       reviewing/merging/fixing are stored as review/merged/fix; a task whose deps are all met gets
       ready=true and a "deps met" event; an unreadable sibling run only produces a warnings entry
   task round T --kind build|fix|takeover [--cause TEXT]
+      with the store on, also stores the brief/report/review files of that round as artifacts
+      (task, round, kind) when they already exist, and still writes the task-folder files as views
   task round T --undo — drop the latest round again, but only while none of its brief/report/review
       files exist (the paths task round printed); else ok:false naming them; one event
   task verify T --tests '<pass>/<fail>' [--tsc N] [--lint N] [--selftest '<run>/<failed>'] [--fail TEXT]
@@ -44,6 +46,13 @@
   lock take RES --reason TEXT [--ttl-min 30] [--scope a,b] [--force-stale]
   lock release RES [--force] (refuses a lock taken by another --by) | lock check RES
   render
+  store enable [--data D] — opt in: import the ACTIVE run's files into <data>/mk.db through mkdb
+      (import_history, original timestamps), copy <data>/runs/ to <data>/runs-legacy/ read-only
+      BEFORE the first view rewrite, then publish the legacy views from the store. Absent mk.db
+      means the store is off and every command is today's file path, byte for byte.
+  store status [--data D] — {"ok": true, "store": "on"|"off"}
+  export-legacy --run R [--data D] — rebuild run.json, events.jsonl, board.md and runs/index.json
+      from the store (the rollback path; needs the store on)
   --self-test
 
 Common: --data DIR (else $MATRIXKODER_DATA, else <main checkout of cwd's git repo>/.matrixkoder; a linked worktree
@@ -53,7 +62,7 @@ Every command prints ONE JSON line. Errors: {"ok": false, "error": ...} exit 2; 
 run.json is authoritative; events.jsonl may run one line ahead after a crash; `render` rebuilds board.md.
 Schema: docs/state-schema.md
 """
-import argparse, contextlib, datetime, fcntl, fnmatch, hashlib, json, math, os, re, shlex, socket, subprocess, sys, tempfile
+import argparse, contextlib, datetime, fcntl, fnmatch, hashlib, importlib.util, json, math, os, re, shlex, shutil, socket, stat, subprocess, sys, tempfile
 
 SCHEMA = 1
 STATUSES = ("planned routed dispatched building verifying review fix merged qa done "
@@ -68,6 +77,24 @@ RECENT, BOARD_EVENTS = 10, 15
 DEP_MET = ("merged", "qa", "done")
 DEP_GATED = ("dispatched", "building")
 SIDE = ("blocked", "provider", "quota", "stalled")  # roll-up precedence: the first present wins
+
+# The project store is opt-in. With <data>/mk.db absent, nothing below runs.
+STORE_PROJECT = "matrixkoder"  # slug only; the db is <data>/mk.db via data_dir
+STORE_RUN_DOC = "run-doc"      # artifact kind holding the run.json document
+STORE_INDEX = "index-doc"      # artifact kind holding runs/index.json (task id "_index")
+VIEW_CRASH = "MK_VIEW_CRASH"   # test seam: raise after the store commit, before the view rewrite
+# file-only fields the tasks table has no column for; they ride in the run-doc artifact
+TASK_FILE_KEYS = ("wave", "ready", "workspace", "last_commit", "gates", "rounds", "created",
+                  "plan_phase", "plan_task", "route", "lane_group", "reviewer")
+
+
+def _mkdb():
+    """Load scripts/mkdb.py by path. mk-state never opens SQLite itself."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mkdb.py")
+    spec = importlib.util.spec_from_file_location("mkdb", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 class Fail(Exception):
@@ -178,6 +205,13 @@ class Store:
         # plan sync --apply: events for this run id are counted and dropped (ONE summary event
         # comes after); other runs' upkeep events still write
         self.sink_run, self.sunk = None, 0
+        # store on only when <data>/mk.db already exists; nothing here creates it
+        self.store_on = os.path.exists(os.path.join(data, "mk.db"))
+        self.pending = None
+        self._mkdb = None
+        self._src = {}          # (run, task, kind) -> next live source-key counter
+        self._appended = {}     # run id -> events.jsonl lines appended during this command
+        self._rewritten = set() # run ids whose run.json/board were republished this command
 
     @contextlib.contextmanager
     def locked(self):
@@ -213,7 +247,14 @@ class Store:
             if len(active) != 1:
                 raise Fail(f"{len(active)} active runs {active}; pass --run/--id")
             rid = active[0]
-        run = read_json(os.path.join(self.run_dir(check_id(rid, "run id")), "run.json"))
+        rid = check_id(rid, "run id")
+        if self.store_on:
+            return self.load_store(rid)
+        path = os.path.join(self.run_dir(rid), "run.json")
+        try:
+            run = read_json(path)
+        except ValueError as e:
+            raise Fail(f"JSONDecodeError: {e}")
         if run is None:
             raise Fail(f"no run {rid!r} in {self.runs}")
         return run
@@ -222,6 +263,9 @@ class Store:
         rollup(self, run, by)
         self.refresh_ready(run, by)
         run["updated"] = now()
+        if self.store_on:
+            self.pending = lambda run=run: run  # resolved at flush, after later edits to this dict
+            return
         if task is not None:
             write_json(os.path.join(self.task_dir(run["id"], task["id"]), "task.json"), task)
         write_json(os.path.join(self.run_dir(run["id"]), "run.json"), run)
@@ -346,11 +390,16 @@ class Store:
         if self.sink_run is not None and self.sink_run == run.get("id"):
             self.sunk += 1  # plan sync --apply: the reused add/update paths stay silent
             return ev
-        fd = os.open(os.path.join(self.run_dir(run["id"]), "events.jsonl"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
-        try:
-            os.write(fd, (json.dumps(ev) + "\n").encode())
-        finally:
-            os.close(fd)
+        line = (json.dumps(ev) + "\n").encode()
+        if self.store_on:
+            # the store commit writes the line; remember it so a crash before the rewrite is repaired
+            self._appended.setdefault(run["id"], []).append(line)
+        else:
+            fd = os.open(os.path.join(self.run_dir(run["id"]), "events.jsonl"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+            try:
+                os.write(fd, line)
+            finally:
+                os.close(fd)
         run["recent"] = (run.get("recent", []) + [ev])[-RECENT:]
         return ev
 
@@ -414,6 +463,474 @@ class Store:
         with open(tmp, "w") as f:
             f.write("\n".join(out) + "\n")
         os.replace(tmp, path)
+        return path
+
+    # ---------- project store (opt-in; off unless <data>/mk.db exists) ----------
+
+    def db(self):
+        if self._mkdb is None:
+            self._mkdb = _mkdb()
+        return self._mkdb
+
+    def home_dir(self):
+        """A home mkdb will accept. The real ~/.matrixkoder is never used: the db lives at --data."""
+        h = os.path.join(self.data, ".mk-home")
+        os.makedirs(h, exist_ok=True)
+        return h
+
+    def store_open(self):
+        return self.db().open_project(self.home_dir(), STORE_PROJECT, data_dir=self.data)
+
+    def next_src(self, rid, task, kind):
+        key = (rid, task or "", kind)
+        if key not in self._src:
+            con = self.store_open()
+            try:
+                rows = con.execute("SELECT meta_json FROM events WHERE run=?", (rid,)).fetchall()
+            finally:
+                con.close()
+            n = 0
+            prefix = f"live:{rid}:{task or ''}:{kind}:"
+            for r in rows:
+                src = self.db()._src_of(r["meta_json"]) or ""
+                if src.startswith(prefix):
+                    with contextlib.suppress(ValueError):
+                        n = max(n, int(src[len(prefix):]) + 1)
+            self._src[key] = n
+        src = f"live:{rid}:{task or ''}:{kind}:{self._src[key]}"
+        self._src[key] += 1
+        return src
+
+    def task_row(self, run, t):
+        """The tasks columns import_history accepts, plus the file fields it has no column for."""
+        deps = t.get("deps") or []
+        owned = t.get("owned") or []
+        return {"id": t["id"], "parent": t.get("parent"), "type": "task",
+                "title": t.get("title") or "", "acceptance": t.get("acceptance"),
+                "owned": ",".join(owned) if isinstance(owned, list) else (owned or ""),
+                "deps": ",".join(deps) if isinstance(deps, list) else (deps or ""),
+                "parallel": 1 if t.get("parallel") else 0,
+                "route_json": json.dumps({"route": t.get("route"), "agent": t.get("agent"),
+                                          "model": t.get("model"), "effort": t.get("effort")},
+                                         sort_keys=True) if t.get("route") or t.get("agent") else None,
+                "status": t.get("status") or "planned", "lane": t.get("lane"), "slot": t.get("slot"),
+                "branch": t.get("branch"), "pane": t.get("pane"), "round": t.get("round") or 0,
+                "verdict": t.get("verdict"), "updated": t.get("updated")}
+
+    def run_row(self, run):
+        return {"id": run["id"], "plan": run.get("plan"), "plan_version": None,
+                "branch": run.get("branch"), "status": run.get("status"),
+                "stage": str(run.get("stage")) if run.get("stage") is not None else None,
+                "next": run.get("next"), "started": run.get("started"), "ended": run.get("ended")}
+
+    def _round_artifacts(self, run, t):
+        """brief/report/review of the task's current round, when the view files exist."""
+        n = t.get("round") or 0
+        d = self.task_dir(run["id"], t["id"])
+        arts = []
+        for kind in ("brief", "report", "review"):
+            fp = os.path.join(d, f"{kind}-r{n}.md")
+            if not os.path.exists(fp):
+                continue
+            text = open(fp).read()
+            digest = hashlib.sha256(text.encode()).hexdigest()[:16]
+            arts.append({"task": t["id"], "round": n, "kind": kind, "rev": 1, "text": text,
+                         "created": t.get("updated") or now(),
+                         "src": f"file:{run['id']}:{t['id']}:{kind}:{n}:{digest}"})
+        return arts
+
+    def store_round_files(self, run, t):
+        """Store the current round's files now (task round, after the views exist)."""
+        if not self.store_on:
+            return []
+        arts = self._round_artifacts(run, t)
+        if arts:
+            self.db().import_history(self.home_dir(), STORE_PROJECT, run["id"], artifacts=arts,
+                                     data_dir=self.data)
+        return [a["kind"] for a in arts]
+
+    def doc_artifact(self, rid, task, kind, text, created):
+        # src includes the text: import_history skips a src it already has, so a changed
+        # document is a new row and the newest one (highest id) is the view
+        digest = hashlib.sha256(text.encode()).hexdigest()[:16]
+        return {"task": task, "round": 0, "kind": kind, "rev": 1, "text": text,
+                "created": created, "src": f"doc:{rid}:{task or ''}:{kind}:{digest}"}
+
+    def flush(self):
+        """Commit this command's run once, then publish its views. A command that saves before it
+        is finished (run init adds its tasks after the first save) therefore stores the final run."""
+        run = self.pending() if self.pending else None
+        self.pending = None
+        if run is None or not self.store_on:
+            return
+        self.store_commit(run)
+        if os.environ.get(VIEW_CRASH) == "1":  # committed above; the views are not rewritten
+            raise Fail("injected crash between the store commit and the view rewrite")
+        self.publish(run)
+
+    def store_commit(self, run, task=None):
+        """Mirror the file-path result into the store. Status changes go ONLY through
+        mkdb.transition() (one store event, one change_log row). Other events go through
+        import_history. The run document keeps the file fields the tables have no column for."""
+        rid = run["id"]
+        lines = self._appended.pop(rid, [])
+        events, transitions = [], []
+        for line in lines:
+            ev = json.loads(line.decode())
+            events.append({"t": ev["t"], "chan": "state", "kind": ev["type"], "task": ev.get("task"),
+                           "from_id": ev.get("from"), "to_id": ev.get("to"), "text": ev.get("text"),
+                           "meta_json": json.dumps({"by": ev.get("by"), "line": line.decode()},
+                                                   sort_keys=True, ensure_ascii=False),
+                           "src": self.next_src(rid, ev.get("task"), ev["type"])})
+        tasks = [self.task_row(run, t) for t in run.get("tasks") or [] if t.get("id")]
+        arts = [self.doc_artifact(rid, None, STORE_RUN_DOC, json.dumps(run, indent=2) + "\n",
+                                  run.get("updated") or now())]
+        idx = [r for r in self.index() if r["id"] != rid]
+        entry = {k: run[k] for k in ("id", "feature", "status", "started", "ended")}
+        entry["plan"] = run.get("plan_id")
+        idx.append(entry)
+        idx = sorted(idx, key=lambda r: r["started"])
+        arts.append(self.doc_artifact(rid, "_index", STORE_INDEX, json.dumps(idx, indent=2) + "\n",
+                                      run.get("updated") or now()))
+        for t in run.get("tasks") or []:
+            if t.get("id") and t.get("round"):
+                arts += self._round_artifacts(run, t)
+        self.db().import_history(self.home_dir(), STORE_PROJECT, rid, run_row=self.run_row(run),
+                                 tasks=tasks, events=events, artifacts=arts, data_dir=self.data)
+        # one event (the import above). change_log still grows, which is what `transition()`
+        # exists to record; calling it as well would insert a second event (review :563).
+        con = self.store_open()
+        try:
+            for ev in events:
+                if ev["kind"] == "transition" and ev.get("task") and ev.get("to_id"):
+                    con.execute("INSERT INTO change_log(run, task, t) VALUES (?,?,?)",
+                                (rid, ev["task"], ev["t"]))
+            con.commit()
+        finally:
+            con.close()
+        self._rewritten.discard(rid)
+
+    def store_transition(self, rid, tid, to, note, line=None):
+        """One status change through mkdb.transition. The task row already holds `to` (the import
+        wrote it), so transition records the change_log row and its own event. The view line is
+        stored on that event so publish appends the bytes the file path wrote."""
+        self.db().transition(self.home_dir(), STORE_PROJECT, rid, tid, to, note=note,
+                             sync_root=False, data_dir=self.data)
+        if line is None:
+            return
+        con = self.store_open()
+        try:
+            row = con.execute(
+                "SELECT id, meta_json FROM events WHERE run=? AND task=? AND kind='transition'"
+                " AND to_id=? ORDER BY id DESC LIMIT 1", (rid, tid, to)).fetchone()
+            if row and not row["meta_json"]:
+                meta = json.dumps({"by": "orchestrator", "line": line}, sort_keys=True, ensure_ascii=False)
+                con.execute("UPDATE events SET meta_json=? WHERE id=?", (meta, row["id"]))
+                con.commit()
+        finally:
+            con.close()
+
+    def load_store(self, rid):
+        """The store is the read source: runs and tasks tables, plus the file-only fields the
+        run-doc artifact still holds (waits, locks, wave, rounds, …). A status another writer
+        set through mkdb.transition() wins over the artifact."""
+        con = self.store_open()
+        try:
+            row = con.execute("SELECT * FROM runs WHERE id=?", (rid,)).fetchone()
+            if not row:
+                raise Fail(f"no run {rid!r} in the store")
+            tasks = con.execute("SELECT * FROM tasks WHERE run=? ORDER BY rowid", (rid,)).fetchall()
+            doc = con.execute(
+                "SELECT text FROM artifacts WHERE run=? AND kind=? AND task IS NULL ORDER BY id DESC LIMIT 1",
+                (rid, STORE_RUN_DOC)).fetchone()
+        finally:
+            con.close()
+        base = json.loads(doc["text"]) if doc else {}
+        if not isinstance(base, dict):
+            base = {}
+        by_id = {t.get("id"): t for t in base.get("tasks") or [] if isinstance(t, dict) and t.get("id")}
+        run = dict(base)
+        run.update({"id": row["id"], "plan": row["plan"], "branch": row["branch"],
+                    "status": row["status"] or "active",
+                    "stage": int(row["stage"]) if str(row["stage"] or "").isdigit() else (base.get("stage") or 0),
+                    "next": row["next"], "started": row["started"], "ended": row["ended"]})
+        out = []
+        for t in tasks:
+            extra = dict(by_id.get(t["id"]) or {})
+            route = {}
+            if t["route_json"]:
+                with contextlib.suppress(ValueError):
+                    route = json.loads(t["route_json"]) or {}
+            deps = [d for d in (t["deps"] or "").split(",") if d]
+            owned = [d for d in (t["owned"] or "").split(",") if d]
+            extra.update({
+                "id": t["id"], "title": t["title"] or "", "parent": t["parent"],
+                "deps": deps, "owned": owned, "status": t["status"] or "planned",
+                "lane": t["lane"], "slot": t["slot"], "branch": t["branch"], "pane": t["pane"],
+                "round": t["round"] or 0, "verdict": t["verdict"], "updated": t["updated"],
+                "agent": route.get("agent"), "model": route.get("model"), "effort": route.get("effort"),
+            })
+            if route.get("route"):
+                extra["route"] = route["route"]
+            out.append(extra)
+        run["tasks"] = out
+        run.setdefault("schema", SCHEMA)
+        run.setdefault("feature", base.get("feature"))
+        run.setdefault("waiting", base.get("waiting"))
+        run.setdefault("recent", base.get("recent") or [])
+        run.setdefault("plan_id", base.get("plan_id"))
+        run.setdefault("plan_sha", base.get("plan_sha"))
+        run.setdefault("plan_status", base.get("plan_status"))
+        return run
+
+    def event_line(self, row):
+        """One events.jsonl line for a chan='state' store row. A live event keeps the bytes it
+        was born with; a direct transition() (meta_json NULL) is rendered in today's format."""
+        meta = {}
+        if row["meta_json"]:
+            with contextlib.suppress(ValueError):
+                meta = json.loads(row["meta_json"]) or {}
+        if isinstance(meta, dict) and "line" in meta:
+            return meta["line"]
+        if isinstance(meta, dict) and "event" in meta:
+            return json.dumps(meta["event"], ensure_ascii=False) + "\n"
+        ev = {"t": row["t"], "run": row["run"], "task": row["task"], "type": row["kind"],
+              "text": row["text"], "from": row["from_id"], "to": row["to_id"],
+              "by": (meta.get("by") if isinstance(meta, dict) else None) or "orchestrator"}
+        return json.dumps(ev, ensure_ascii=False) + "\n"
+
+    def _view_marker(self, rid):
+        path = os.path.join(self.run_dir(rid), ".store-event")
+        if not os.path.exists(path):
+            return None
+        with contextlib.suppress(ValueError, OSError):
+            return int(open(path).read().strip() or "0")
+        return None
+
+    def publish(self, run):
+        """Rewrite the legacy views from the store. events.jsonl is append-only: only store rows
+        past the marker (the last published event id) are appended, in store order, never rewritten."""
+        rid = run["id"]
+        view = self.load_store(rid)
+        con = self.store_open()
+        try:
+            rows = con.execute(
+                "SELECT id, run, task, t, chan, kind, from_id, to_id, text, meta_json"
+                " FROM events WHERE run=? AND chan='state' ORDER BY id", (rid,)).fetchall()
+            idx = con.execute(
+                "SELECT text FROM artifacts WHERE run=? AND kind=? ORDER BY id DESC LIMIT 1",
+                (rid, STORE_INDEX)).fetchone()
+        finally:
+            con.close()
+        path = os.path.join(self.run_dir(rid), "events.jsonl")
+        marker_path = os.path.join(self.run_dir(rid), ".store-event")
+        published = self._view_marker(rid)
+        ids = [r["id"] for r in rows]
+        have = open(path).read().splitlines() if os.path.exists(path) else []
+        if published is None and len(have) == len(rows):
+            published = max(ids) if ids else 0
+        fresh = [r for r in rows if r["id"] > (published or 0)]
+        if published and not os.path.exists(path):
+            # export-legacy deleted the view; rewrite it from the store, same order
+            fresh = list(rows)
+        if fresh:
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+            try:
+                os.write(fd, "".join(self.event_line(r) for r in fresh).encode())
+            finally:
+                os.close(fd)
+        if ids:
+            tmp = marker_path + ".tmp"
+            with open(tmp, "w") as f:
+                f.write(str(max(ids)) + "\n")
+            os.replace(tmp, marker_path)
+        write_json(os.path.join(self.run_dir(rid), "run.json"), view)
+        for t in view.get("tasks") or []:
+            if t.get("id"):
+                write_json(os.path.join(self.task_dir(rid, t["id"]), "task.json"), t)
+        if idx is not None:
+            write_json(self.index_path, json.loads(idx["text"]))
+        self.render(view)
+        self._rewritten.add(rid)
+        run.clear()
+        run.update(view)
+
+    def repair(self):
+        """Republish a run only when the store has state events the views have not published yet.
+        Cost is one query for the active run, not a rewrite of every historical run."""
+        if not self.store_on:
+            return
+        active = [r["id"] for r in self.index() if r.get("status") == "active"]
+        if len(active) != 1:
+            return
+        rid = active[0]
+        if rid in self._rewritten:
+            return
+        con = self.store_open()
+        try:
+            row = con.execute(
+                "SELECT MAX(id) m FROM events WHERE run=? AND chan='state'", (rid,)).fetchone()
+        finally:
+            con.close()
+        latest = row["m"] or 0
+        if self._view_marker(rid) == latest and latest:
+            return
+        if latest == 0:
+            return
+        self.publish(self.load_store(rid))
+
+    def _readonly_tree(self, dest):
+        def readonly(path):
+            mode = os.stat(path).st_mode
+            os.chmod(path, mode & ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
+        for dirpath, dirnames, filenames in os.walk(dest):
+            for name in dirnames + filenames:
+                readonly(os.path.join(dirpath, name))
+            readonly(dirpath)
+
+    def legacy_copy(self, dest, readonly=True):
+        """Copy <data>/runs/ onto dest. Read-only only after the copy is in its final place:
+        a read-only directory cannot be renamed into place."""
+        src = self.runs
+        if os.path.isdir(src):
+            shutil.copytree(src, dest)
+        else:
+            os.makedirs(dest, exist_ok=True)
+        if readonly:
+            self._readonly_tree(dest)
+        return dest
+
+    def enable_store(self):
+        """Build the store and the legacy copy in temp locations, verify, then rename into place.
+        A failure removes the temps and leaves <data> exactly as it was."""
+        if self.store_on:
+            return {"ok": True, "store": "on", "imported": None}
+        active = [r for r in self.index() if r.get("status") == "active"]
+        if len(active) != 1:
+            raise Fail(f"store enable needs exactly one active run, found {[r.get('id') for r in active]}")
+        rid = active[0]["id"]
+        run = self.load(rid)
+        parent = tempfile.mkdtemp(prefix="mk-enable-", dir=self.data)
+        tmp_data = os.path.join(parent, "data")
+        os.makedirs(tmp_data)
+        tmp_legacy = os.path.join(parent, "runs-legacy")
+        db_path = os.path.join(self.data, "mk.db")
+        legacy = os.path.join(self.data, "runs-legacy")
+        try:
+            events = []
+            evpath = os.path.join(self.run_dir(rid), "events.jsonl")
+            if os.path.exists(evpath):
+                for i, line in enumerate(open(evpath)):
+                    ev = json.loads(line)
+                    events.append({"t": ev.get("t"), "chan": "state", "kind": ev.get("type"),
+                                   "task": ev.get("task"), "from_id": ev.get("from"), "to_id": ev.get("to"),
+                                   "text": ev.get("text"),
+                                   "meta_json": json.dumps({"by": ev.get("by"), "event": ev},
+                                                           sort_keys=True, ensure_ascii=False),
+                                   "src": f"import:{rid}:{i}"})
+            tasks = [self.task_row(run, t) for t in run.get("tasks") or [] if t.get("id")]
+            arts = [self.doc_artifact(rid, None, STORE_RUN_DOC, json.dumps(run, indent=2) + "\n",
+                                      run.get("updated") or now())]
+            for t in run.get("tasks") or []:
+                if not t.get("id"):
+                    continue
+                d = self.task_dir(rid, t["id"])
+                for name in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+                    if name == "task.json":
+                        continue
+                    kind, _, rest = name.partition("-r")
+                    n, _, ext = rest.partition(".")
+                    if ext != "md" or kind not in ("brief", "report", "review") or not n.isdigit():
+                        continue
+                    text = open(os.path.join(d, name)).read()
+                    arts.append({"task": t["id"], "round": int(n), "kind": kind, "rev": 1, "text": text,
+                                 "created": t.get("updated") or now(),
+                                 "src": f"file:{rid}:{t['id']}:{kind}:{n}"})
+            idx = self.index()
+            arts.append(self.doc_artifact(rid, "_index", STORE_INDEX,
+                                          json.dumps(sorted(idx, key=lambda r: r["started"]), indent=2) + "\n",
+                                          run.get("updated") or now()))
+            # mkdb.open_project always writes <data>/mk.db, so the import lands in a temp data dir
+            self.db().import_history(self.home_dir(), STORE_PROJECT, rid, run_row=self.run_row(run),
+                                     tasks=tasks, events=events, artifacts=arts, data_dir=tmp_data)
+            con = self.db().open_project(self.home_dir(), STORE_PROJECT, data_dir=tmp_data)
+            try:
+                got = con.execute("SELECT COUNT(*) c FROM tasks WHERE run=?", (rid,)).fetchone()["c"]
+                nev = con.execute("SELECT COUNT(*) c FROM events WHERE run=? AND chan='state'",
+                                  (rid,)).fetchone()["c"]
+            finally:
+                con.close()
+            if got != len(tasks) or nev != len(events):
+                raise Fail(f"store enable verify failed: tasks {got}/{len(tasks)} events {nev}/{len(events)}")
+            self.legacy_copy(tmp_legacy, readonly=False)
+            os.replace(os.path.join(tmp_data, "mk.db"), db_path)
+            for suffix in ("-wal", "-shm"):
+                side = os.path.join(tmp_data, "mk.db" + suffix)
+                if os.path.exists(side):
+                    os.replace(side, db_path + suffix)
+            os.replace(tmp_legacy, legacy)
+            self._readonly_tree(legacy)
+        except BaseException:
+            for path in (db_path, db_path + "-wal", db_path + "-shm", legacy):
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                elif os.path.exists(path):
+                    os.unlink(path)
+            raise
+        finally:
+            shutil.rmtree(parent, ignore_errors=True)
+        self.store_on = True
+        # the imported file already holds every line; the marker stops publish from appending them
+        con = self.store_open()
+        try:
+            last = con.execute("SELECT MAX(id) m FROM events WHERE run=? AND chan='state'", (rid,)).fetchone()
+        finally:
+            con.close()
+        marker = os.path.join(self.run_dir(rid), ".store-event")
+        with open(marker, "w") as f:
+            f.write(str(last["m"] or 0) + "\n")
+        self.publish(run)
+        return {"ok": True, "store": "on", "imported": rid, "events": len(events),
+                "tasks": len(tasks), "legacy": legacy}
+
+    def export_legacy(self, rid):
+        if not self.store_on:
+            raise Fail("export-legacy needs the store on (mk-state.py store enable)")
+        con = self.store_open()
+        try:
+            row = con.execute("SELECT 1 FROM runs WHERE id=?", (rid,)).fetchone()
+            files = con.execute(
+                "SELECT task, round, kind, text FROM artifacts WHERE run=? AND kind IN ('brief','report','review')",
+                (rid,)).fetchall()
+        finally:
+            con.close()
+        if not row:
+            raise Fail(f"store has no run {rid}")
+        run = self.load_store(rid)
+        self.publish(run)
+        for f in files:
+            path = os.path.join(self.task_dir(rid, f["task"]), f"{f['kind']}-r{f['round']}.md")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as out:
+                out.write(f["text"])
+        return {"ok": True, "run": rid}
+
+    def plan_file(self, run):
+        """The run's plan path, or plans.archived_path of the latest approved version when missing."""
+        path = run.get("plan")
+        if path and os.path.exists(path):
+            return path
+        if not self.store_on or not run.get("plan_id"):
+            return path
+        con = self.store_open()
+        try:
+            row = con.execute(
+                "SELECT archived_path FROM plans WHERE id=? AND approved_at IS NOT NULL"
+                " ORDER BY version DESC LIMIT 1", (run["plan_id"],)).fetchone()
+        finally:
+            con.close()
+        if row and row["archived_path"] and os.path.exists(row["archived_path"]):
+            return row["archived_path"]
         return path
 
 
@@ -630,6 +1147,7 @@ def cmd_run(a, st):
                            "approve it (mk-plan.py set --status approved) or pass --force")
             plan_preflight(st, plan_tool("parse", a.plan), rid)
         with st.locked():
+            st.repair()
             if os.path.exists(os.path.join(st.run_dir(rid), "run.json")):
                 raise Fail(f"run {rid} exists")
             cur = None
@@ -664,6 +1182,7 @@ def cmd_run(a, st):
                                     ph.get("wave"), [], c.get("owned") or [], pid, a.by,
                                     {"plan_task": c.get("id")})
                     warnings += w
+            st.flush()
         return {"ok": True, "run": run, **({"warnings": warnings} if warnings else {})}
     a.run = a.run or getattr(a, "pos_id", None)
     if a.action == "get":
@@ -672,6 +1191,7 @@ def cmd_run(a, st):
         raise Fail("run archive needs --id")
     warn = None
     with st.locked():
+        st.repair()
         run = st.load(a.run)
         if a.action == "set":
             if a.next is None and a.status is None:
@@ -694,6 +1214,7 @@ def cmd_run(a, st):
         else:  # archive
             set_run_status(st, run, "archived")
         st.save(run)
+        st.flush()
     out = {"ok": True, "run": run, **({"warning": warn} if warn else {})}
     if a.action == "set" and a.status == "done":
         out["promoted"] = promoted
@@ -736,10 +1257,10 @@ def plan_done_if_last(st, run):
     the message rides back as the command's "warning". Only Fail is caught; anything else is a real
     bug and still raises."""
     try:
-        cur = plan_tool("parse", run["plan"])
+        cur = plan_tool("parse", st.plan_file(run))
         runs = [str(x) for x in cur.get("runs") or []]
         if runs and runs[-1].lower() == run["id"].lower():
-            plan_tool("set", run["plan"], "--status", "done")
+            plan_tool("set", st.plan_file(run), "--status", "done")
             run["plan_status"] = "done"
             st.event(run, "note", f"plan {run['plan_id']} done (last run finished)")
     except Fail as e:
@@ -841,12 +1362,14 @@ def add_task(st, run, tid, title, wave, deps, owned, parent, by, extra=None):
 
 def cmd_task(a, st):
     with st.locked():
+        st.repair()
         run = st.load(a.run, getattr(a, "task", None))
         if a.action == "get":
             t = find_task(run, a.task)
             return {"ok": True, "task": t, "dir": st.task_dir(run["id"], t["id"])}
         if a.action == "add":
             t, warnings = add_task(st, run, a.id, a.title, a.wave, csv(a.deps), csv(a.owned), a.parent, a.by)
+            st.flush()
             return {"ok": True, "task": t, **({"warnings": warnings} if warnings else {})}
         t = find_task(run, a.task)
         cur = t["rounds"][-1] if t["rounds"] else None
@@ -930,6 +1453,7 @@ def cmd_task(a, st):
             st.event(run, "note", f"round {n} undone", task=t["id"], by=a.by)
             t["updated"] = now()
             st.save(run, t, a.by)
+            st.flush()
             return {"ok": True, "task": t["id"], "round": t["round"], "undone": n}
         else:  # round
             if a.kind not in ROUND_KINDS:
@@ -943,10 +1467,13 @@ def cmd_task(a, st):
         t["updated"] = now()
         st.save(run, t, a.by)
         warnings = st.refresh_others(run, a.by) if a.action == "set" else []
+        st.flush()
         if a.action == "round":
             d = st.task_dir(run["id"], t["id"])
+            paths = {k: os.path.join(d, f"{k}-r{t['round']}.md") for k in ("brief", "report", "review")}
+            stored = st.store_round_files(run, t) if st.store_on else []
             return {"ok": True, "task": t["id"], "round": t["round"], "kind": a.kind,
-                    **{k: os.path.join(d, f"{k}-r{t['round']}.md") for k in ("brief", "report", "review")}}
+                    **({"stored": stored} if stored else {}), **paths}
         return {"ok": True, "task": t, **({"warnings": warnings} if warnings else {})}
 
 
@@ -1065,6 +1592,7 @@ def task_verify(st, run, t, a):
         moved.append(leaf["id"])
         write_json(os.path.join(st.task_dir(run["id"], leaf["id"]), "task.json"), leaf)
     st.save(run, t, a.by)
+    st.flush()
     out = {"ok": True, "task": t, "result": "fail" if failed else "pass", "verdict": text, "moved": moved}
     if warnings:
         out["warnings"] = warnings
@@ -1090,10 +1618,11 @@ def cmd_plan(a, st):
     if a.action != "sync":
         raise Fail(f"unknown plan action {a.action!r}")
     with st.locked():
+        st.repair()
         run = st.load(a.run)
         if not (run.get("plan_id") and run.get("plan")):
             raise Fail(f"run {run['id']} has no plan link (run init --plan)")
-        cur = plan_tool("parse", run["plan"])
+        cur = plan_tool("parse", st.plan_file(run))
         changes, warnings, adds, updates = [], [], [], []
         ph_by = {str(t.get("plan_phase")).lower(): t for t in run["tasks"] if t.get("plan_phase")}
         ck_by = {str(t.get("plan_task")).lower(): t for t in run["tasks"] if t.get("plan_task")}
@@ -1178,6 +1707,7 @@ def cmd_plan(a, st):
         st.event(run, "note", f"plan sync: {len(adds)} added, {len(updates)} updated"
                  + (f", {sunk} task events suppressed" if sunk else ""))
         st.save(run)
+        st.flush()
     return {"ok": True, "run": run["id"], "plan": run["plan_id"], "apply": True, "sha": cur.get("sha"),
             "changes": changes, "warnings": warnings}
 
@@ -1195,16 +1725,19 @@ def cmd_event(a, st):
         if s is not None and s not in STATUSES:
             raise Fail(f"bad status {s!r}")
     with st.locked():
+        st.repair()
         run = st.load(a.run, a.task)
         if a.task:
             find_task(run, a.task)
         ev = st.event(run, a.type, a.text, task=a.task, frm=a.from_, to=a.to, by=a.by)
         st.save(run)
+        st.flush()
     return {"ok": True, "event": ev}
 
 
 def cmd_wait(a, st):
     with st.locked():
+        st.repair()
         run = st.load(a.run)
         if a.action == "set":
             if not a.question:
@@ -1215,6 +1748,7 @@ def cmd_wait(a, st):
             run["waiting"] = None
             st.event(run, "note", "wait cleared", by=a.by)
         st.save(run)
+        st.flush()
     return {"ok": True, "waiting": run["waiting"]}
 
 
@@ -1242,7 +1776,24 @@ def cmd_lock(a, st):
 
 def cmd_render(a, st):
     with st.locked():
+        st.repair()
         return {"ok": True, "board": st.render(st.load(a.run))}
+
+
+def cmd_store(a, st):
+    with st.locked():
+        if a.action == "status":
+            return {"ok": True, "store": "on" if st.store_on else "off"}
+        if a.action == "enable":
+            return st.enable_store()
+        raise Fail(f"unknown store action {a.action!r}")
+
+
+def cmd_export_legacy(a, st):
+    if not a.run:
+        raise Fail("export-legacy needs --run")
+    with st.locked():
+        return st.export_legacy(a.run)
 
 
 def build_parser():
@@ -1324,6 +1875,12 @@ def build_parser():
     lk.choices["release"].add_argument("--force", action="store_true")
 
     sub.add_parser("render", parents=[data_p, run_p]).set_defaults(func=cmd_render)
+
+    stc = sub.add_parser("store").add_subparsers(dest="action", required=True)
+    for name in ("enable", "status"):
+        stc.add_parser(name, parents=[data_p]).set_defaults(func=cmd_store)
+    ex = sub.add_parser("export-legacy", parents=[data_p, run_p])
+    ex.set_defaults(func=cmd_export_legacy)
     return p
 
 
@@ -1334,6 +1891,12 @@ def main(argv):
         out, code = a.func(a, st), 0
     except Fail as e:
         out, code = {"ok": False, "error": str(e), **e.extra}, e.code
+    except Exception as e:
+        # mkdb.Fail is a different class (loaded by path). A store error is still one JSON line.
+        if type(e).__name__ == "Fail" and type(e).__module__ == "mkdb":
+            out, code = {"ok": False, "error": str(e)}, getattr(e, "code", 2)
+        else:
+            raise
     except (OSError, ValueError) as e:  # corrupt JSON (ValueError), unreadable files: still one JSON line
         out, code = {"ok": False, "error": f"{type(e).__name__}: {e}"}, 2
     print(json.dumps(out))
@@ -2257,8 +2820,342 @@ def self_test():
         assert not [e for e in tail if e.get("to") == "done"], tail  # no second promotion
 
         print("mk-state self-test ok")
+        store_self_test(tmp, env)
+        print("mk-state store self-test ok")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+_CLOCK = {"t": None}  # the parity test pins now() so the two paths share one clock
+
+
+def _frozen_now():
+    return _CLOCK["t"] or now()
+
+
+def store_self_test(tmp, env):
+    """D3A: the store is opt-in. Off = no mk.db and byte-identical files; on = views from the store."""
+    import shutil as _sh
+    data = os.path.join(tmp, "store")
+
+    def mk(*args, code=0, e=None):
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), *args, "--data", data],
+                           capture_output=True, text=True, env=e or env)
+        lines = r.stdout.strip().splitlines()
+        assert len(lines) == 1, (args, r.stdout, r.stderr)
+        assert r.returncode == code, (args, r.returncode, r.stdout, r.stderr)
+        return json.loads(lines[0])
+
+    # store off: a scripted run creates no mk.db and no runs-legacy
+    assert mk("store", "status")["store"] == "off"
+    mk("run", "init", "--id", "s1", "--feature", "Store", "--branch", "b")
+    mk("task", "add", "--id", "T1", "--title", "One")
+    mk("task", "set", "T1", "status=routed")
+    mk("event", "--task", "T1", "--type", "note", "--text", "hello")
+    assert not os.path.exists(os.path.join(data, "mk.db")), "store off created mk.db"
+    assert not os.path.exists(os.path.join(data, "runs-legacy"))
+    off = {}
+    for rel in ("runs/s1/run.json", "runs/s1/events.jsonl", "runs/s1/board.md", "runs/index.json"):
+        off[rel] = open(os.path.join(data, rel), "rb").read()
+
+    # enable: imports the active run, snapshots runs/ read-only, views survive
+    out = mk("store", "enable")
+    assert out["store"] == "on" and out["imported"] == "s1", out
+    assert os.path.exists(os.path.join(data, "mk.db"))
+    legacy = os.path.join(data, "runs-legacy", "s1", "run.json")
+    assert open(legacy, "rb").read() == off["runs/s1/run.json"]
+    try:  # the copy is read-only
+        open(legacy, "a").close()
+        raise AssertionError("runs-legacy is writable")
+    except PermissionError:
+        pass
+    for rel in off:  # the first publish reproduces the files the import read
+        assert open(os.path.join(data, rel), "rb").read() == off[rel], rel
+    assert mk("store", "status")["store"] == "on"
+    again = mk("store", "enable")
+    assert again["imported"] is None  # already on: nothing re-imported
+
+    db = _mkdb()
+    con = db.open_project(os.path.join(data, ".mk-home"), STORE_PROJECT, data_dir=data)
+    try:
+        n_ev = con.execute("SELECT COUNT(*) c FROM events WHERE run='s1' AND chan='state'").fetchone()["c"]
+        n_tasks = con.execute("SELECT COUNT(*) c FROM tasks WHERE run='s1'").fetchone()["c"]
+        statuses = {r["id"]: r["status"] for r in con.execute("SELECT id, status FROM tasks WHERE run='s1'")}
+    finally:
+        con.close()
+    assert n_tasks == 1 and statuses == {"T1": "routed"}, (n_tasks, statuses)
+    assert n_ev == len(off["runs/s1/events.jsonl"].splitlines()), n_ev
+
+    # store on: parity with the same commands run through the file path, one clock for both
+    twin = os.path.join(tmp, "twin")
+    global now
+    real_now, now = now, _frozen_now
+
+    script = [
+        ("run", "init", "--id", "s2", "--feature", "Twin", "--branch", "b2"),
+        ("task", "add", "--id", "A", "--title", "Alpha", "--run", "s2"),
+        ("task", "add", "--id", "B", "--title", "Beta", "--deps", "A", "--run", "s2"),
+        ("task", "set", "A", "status=building", "--run", "s2"),
+        ("task", "round", "A", "--kind", "build", "--run", "s2"),
+        ("event", "--task", "A", "--type", "note", "--text", "working", "--run", "s2"),
+        ("wait", "set", "--question", "go?", "--options", "yes,no", "--run", "s2"),
+        ("wait", "clear", "--run", "s2"),
+        ("task", "set", "A", "status=merged", "--run", "s2"),
+    ]
+    for step in script:
+        _CLOCK["t"] = real_now()
+        with contextlib.redirect_stdout(open(os.devnull, "w")):
+            assert main([*step, "--data", data]) == 0, step
+            assert main([*step, "--data", twin]) == 0, step
+    now = real_now  # the rest of the test uses the real clock
+    for rel in ("runs/s2/run.json", "runs/s2/events.jsonl", "runs/s2/board.md"):
+        a = open(os.path.join(data, rel), "rb").read()
+        b = open(os.path.join(twin, rel), "rb").read()
+        assert a == b, rel
+    # index.json: the store run also holds s1, so compare the s2 entry, not the whole file
+    ia = [r for r in json.load(open(os.path.join(data, "runs/index.json"))) if r["id"] == "s2"]
+    ib = [r for r in json.load(open(os.path.join(twin, "runs/index.json"))) if r["id"] == "s2"]
+    assert ia == ib, (ia, ib)
+    assert not os.path.exists(os.path.join(twin, "mk.db"))  # the twin never opted in
+
+    # events.jsonl only grows, one line at a time, and matches the file-path twin
+    evp = os.path.join(data, "runs", "s2", "events.jsonl")
+    counts = [len(open(evp).read().splitlines())]
+    mk("event", "--type", "note", "--text", "one more", "--run", "s2")
+    counts.append(len(open(evp).read().splitlines()))
+    mk("task", "set", "B", "status=routed", "--run", "s2")
+    counts.append(len(open(evp).read().splitlines()))
+    assert counts == sorted(counts) and len(set(counts)) == len(counts), counts
+    for step in (("event", "--type", "note", "--text", "one more", "--run", "s2"),
+                 ("task", "set", "B", "status=routed", "--run", "s2")):
+        _CLOCK["t"] = real_now()
+        with contextlib.redirect_stdout(open(os.devnull, "w")):
+            assert main([*step, "--data", twin]) == 0, step
+    assert open(evp, "rb").read() == open(os.path.join(twin, "runs", "s2", "events.jsonl"), "rb").read()
+    now = real_now
+
+    # a status change goes through transition(): change_log grew and the event is in the store
+    con = db.open_project(os.path.join(data, ".mk-home"), STORE_PROJECT, data_dir=data)
+    try:
+        before = con.execute("SELECT COUNT(*) c FROM change_log WHERE run='s2'").fetchone()["c"]
+    finally:
+        con.close()
+    mk("task", "set", "B", "status=building", "--note", "start", "--run", "s2")
+    con = db.open_project(os.path.join(data, ".mk-home"), STORE_PROJECT, data_dir=data)
+    try:
+        after = con.execute("SELECT COUNT(*) c FROM change_log WHERE run='s2'").fetchone()["c"]
+        hit = con.execute("SELECT 1 FROM events WHERE run='s2' AND task='B' AND kind='transition'"
+                          " AND to_id='building'").fetchone()
+    finally:
+        con.close()
+    assert after > before, (before, after)
+    assert hit, "transition event missing from the store"
+
+    # task round stores the brief/report/review content as artifacts and still writes the files.
+    # The files are written by the caller after `task round` prints the paths, so the NEXT
+    # command (here a note) is what commits them — the same shape the orchestrator uses.
+    paths = mk("task", "round", "B", "--kind", "fix", "--cause", "gap", "--run", "s2")
+    for kind in ("brief", "report", "review"):
+        with open(paths[kind], "w") as f:
+            f.write(f"{kind} body\n")
+    mk("event", "--type", "note", "--text", "round files", "--run", "s2")
+    con = db.open_project(os.path.join(data, ".mk-home"), STORE_PROJECT, data_dir=data)
+    try:
+        rows = {r["kind"]: r["text"] for r in con.execute(
+            "SELECT kind, text FROM artifacts WHERE run='s2' AND task='B' AND round=? AND kind IN"
+            " ('brief','report','review')", (paths["round"],))}
+    finally:
+        con.close()
+    assert rows == {"brief": "brief body\n", "report": "report body\n", "review": "review body\n"}, rows
+    for kind in rows:  # the task-folder files are still there, as views
+        assert open(paths[kind]).read() == rows[kind]
+
+    # export-legacy rebuilds the files from the store
+    saved = {rel: open(os.path.join(data, rel), "rb").read() for rel in
+             ("runs/s2/run.json", "runs/s2/events.jsonl", "runs/s2/board.md", "runs/index.json")}
+    for rel in saved:
+        os.remove(os.path.join(data, rel))
+    mk("export-legacy", "--run", "s2")
+    for rel, blob in saved.items():
+        assert open(os.path.join(data, rel), "rb").read() == blob, rel
+
+    # plan-path fallback: a missing plan file resolves through plans.archived_path
+    plan = os.path.join(tmp, "gone.json")
+    archived = os.path.join(tmp, "archived.json")
+    json.dump({"plan": "gp", "status": "approved", "runs": [], "phases": []}, open(plan, "w"))
+    fixture = os.path.join(tmp, "planfix.py")
+    open(fixture, "w").write(PLAN_FIXTURE)
+    os.chmod(fixture, 0o755)
+    e2 = dict(env, MK_PLAN_CMD=f"{sys.executable} {fixture}")
+    mk("run", "init", "--id", "s3", "--feature", "P", "--branch", "bp", "--plan", plan, "--force", e=e2)
+    _sh.copy(plan, archived)
+    os.remove(plan)
+    con = db.open_project(os.path.join(data, ".mk-home"), STORE_PROJECT, data_dir=data)
+    try:
+        con.execute("INSERT INTO plans(id, version, title, approved_at, archived_path) VALUES (?,?,?,?,?)",
+                    ("gp", 1, "gp", "2026-01-01T00:00:00+00:00", archived))
+        con.commit()
+    finally:
+        con.close()
+    out = mk("plan", "sync", "--run", "s3", e=e2)  # parses through the archived path, not the missing one
+    assert out["ok"] and out["plan"] == "gp", out
+
+    # a crash between the store commit and the view rewrite: the next command repairs the views
+    ev_before = open(os.path.join(data, "runs", "s2", "events.jsonl"), "rb").read()
+    crashed = dict(env, MK_VIEW_CRASH="1")
+    bad = mk("event", "--type", "note", "--text", "crash me", "--run", "s2", code=2, e=crashed)
+    assert "injected crash" in bad["error"], bad
+    assert open(os.path.join(data, "runs", "s2", "events.jsonl"), "rb").read() == ev_before  # view not written
+    con = db.open_project(os.path.join(data, ".mk-home"), STORE_PROJECT, data_dir=data)
+    try:
+        stored = con.execute("SELECT text FROM events WHERE run='s2' AND text='crash me'").fetchone()
+    finally:
+        con.close()
+    assert stored, "the store lost the event committed before the crash"
+    mk("event", "--type", "note", "--text", "after", "--run", "s2")  # repairs, then appends
+    lines = open(os.path.join(data, "runs", "s2", "events.jsonl")).read().splitlines()
+    assert json.loads(lines[-2])["text"] == "crash me" and json.loads(lines[-1])["text"] == "after", lines[-2:]
+
+    # CRITICAL review :1735 — two real subprocesses, 10 task-set each, all 20 stick
+    race = os.path.join(tmp, "race")
+    mk("run", "init", "--id", "rr", "--feature", "Race", "--branch", "br")
+    # the helper above pins --data to `data`; this block uses its own dir through main's argv
+    def once(argv, d, e=None):
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), *argv, "--data", d],
+                           capture_output=True, text=True, env=e or env)
+        assert r.returncode == 0, (argv, r.returncode, r.stdout, r.stderr)
+        return json.loads(r.stdout.strip().splitlines()[-1])
+    # re-init on the race dir (mk() wrote into `data`)
+    once(["run", "init", "--id", "rr", "--feature", "Race", "--branch", "br"], race)
+    for i in range(20):
+        once(["task", "add", "--id", f"R{i}", "--title", f"r{i}", "--run", "rr"], race)
+    once(["store", "enable"], race)
+    procs = []
+    for side in (0, 1):
+        ids = list(range(side * 10, side * 10 + 10))
+        script = "import subprocess,sys\n" + "".join(
+            f"subprocess.run([sys.executable,{os.path.abspath(__file__)!r},"
+            f"'task','set','R{i}','status=building','--run','rr','--data',{race!r}],check=True)\n"
+            for i in ids)
+        procs.append(subprocess.Popen([sys.executable, "-c", script], env=env))
+    for proc in procs:
+        assert proc.wait() == 0, proc.returncode
+    final = once(["run", "get", "--id", "rr"], race)["run"]
+    got = {t["id"]: t["status"] for t in final["tasks"]}
+    assert all(got[f"R{i}"] == "building" for i in range(20)), got
+    con = db.open_project(os.path.join(race, ".mk-home"), STORE_PROJECT, data_dir=race)
+    try:
+        rows = {r["id"]: r["status"] for r in con.execute("SELECT id, status FROM tasks WHERE run='rr'")}
+    finally:
+        con.close()
+    assert all(rows[f"R{i}"] == "building" for i in range(20)), rows
+
+    # CRITICAL review :246 — a direct transition survives the next task set
+    keep = os.path.join(tmp, "keep")
+    once(["run", "init", "--id", "k1", "--feature", "K", "--branch", "bk"], keep)
+    once(["task", "add", "--id", "T1", "--title", "One", "--run", "k1"], keep)
+    once(["task", "add", "--id", "T2", "--title", "Two", "--run", "k1"], keep)
+    once(["store", "enable"], keep)
+    db.transition(os.path.join(keep, ".mk-home"), STORE_PROJECT, "k1", "T1", "building", data_dir=keep)
+    once(["task", "set", "T2", "status=building", "--run", "k1"], keep)
+    con = db.open_project(os.path.join(keep, ".mk-home"), STORE_PROJECT, data_dir=keep)
+    try:
+        st1 = con.execute("SELECT status FROM tasks WHERE run='k1' AND id='T1'").fetchone()["status"]
+    finally:
+        con.close()
+    assert st1 == "building", st1
+    view = json.load(open(os.path.join(keep, "runs", "k1", "run.json")))
+    assert next(t["status"] for t in view["tasks"] if t["id"] == "T1") == "building"
+
+    # HIGH review :563 — exactly one transition event, and a direct transition reaches events.jsonl
+    con = db.open_project(os.path.join(keep, ".mk-home"), STORE_PROJECT, data_dir=keep)
+    try:
+        count = con.execute("SELECT COUNT(*) c FROM events WHERE run='k1' AND task='T2'"
+                            " AND kind='transition' AND to_id='building'").fetchone()["c"]
+    finally:
+        con.close()
+    assert count == 1, count
+    once(["run", "get", "--id", "k1"], keep)  # republish picks up the direct transition
+    lines = [json.loads(x) for x in open(os.path.join(keep, "runs", "k1", "events.jsonl"))]
+    state_lines = [x for x in lines if x.get("task") == "T1" and x.get("to") == "building"]
+    assert len(state_lines) == 1, lines
+    tl = db.timeline(os.path.join(keep, ".mk-home"), STORE_PROJECT, "k1", "T1", data_dir=keep)
+    file_t1 = [x for x in lines if x.get("task") == "T1"]
+    assert len(tl) == len(file_t1), (len(tl), len(file_t1), tl, file_t1)
+
+    # HIGH review :676 — a failed import leaves <data> unchanged (no mk.db, no runs-legacy)
+    boom = os.path.join(tmp, "boom")
+    once(["run", "init", "--id", "b1", "--feature", "B", "--branch", "bb"], boom)
+    st = Store(boom)
+    real_db = st.db()
+    real_import = real_db.import_history
+    def fail_import(*a, **k):
+        raise real_db.Fail("injected import failure")
+    real_db.import_history = fail_import
+    try:
+        try:
+            st.enable_store()
+            raise AssertionError("enable should have failed")
+        except real_db.Fail as e:
+            assert "injected" in str(e), e
+    finally:
+        real_db.import_history = real_import
+    assert not os.path.exists(os.path.join(boom, "mk.db")), "mk.db left behind"
+    assert not os.path.exists(os.path.join(boom, "runs-legacy")), "runs-legacy left behind"
+    assert not os.path.exists(os.path.join(boom, "mk.db-wal"))
+    # main() turns mkdb.Fail into one JSON line, exit 2, no traceback
+    code = (
+        "import importlib.util, sys\n"
+        f"spec = importlib.util.spec_from_file_location('mkstate', {os.path.abspath(__file__)!r})\n"
+        "m = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(m)\n"
+        "db = m._mkdb()\n"
+        "def fail(*a, **k):\n"
+        "    raise db.Fail('injected import failure')\n"
+        "db.import_history = fail\n"
+        # Store.db() loads mkdb again unless the cache is primed before enable
+        f"st = m.Store({boom!r})\n"
+        "st._mkdb = db\n"
+        "orig = m.Store\n"
+        "class S(m.Store):\n"
+        "    def db(self):\n"
+        "        return db\n"
+        "m.Store = S\n"
+        f"raise SystemExit(m.main(['store','enable','--data',{boom!r}]))\n"
+    )
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env)
+    assert not os.path.exists(os.path.join(boom, "mk.db"))
+
+    # HIGH review :733 — export-legacy shows a status written by a direct transition
+    once(["run", "get", "--id", "k1"], keep)
+    db.transition(os.path.join(keep, ".mk-home"), STORE_PROJECT, "k1", "T1", "review", data_dir=keep)
+    once(["export-legacy", "--run", "k1"], keep)
+    exported = json.load(open(os.path.join(keep, "runs", "k1", "run.json")))
+    assert next(t["status"] for t in exported["tasks"] if t["id"] == "T1") == "review"
+
+    # MEDIUM review :1092 — an archived plan is marked done through plan_file, not the missing path
+    plan = os.path.join(tmp, "archplan.json")
+    archived = os.path.join(tmp, "archplan-v1.json")
+    json.dump({"plan": "ap", "status": "approved", "runs": [], "phases": []}, open(plan, "w"))
+    e3 = dict(env, MK_PLAN_CMD=f"{sys.executable} {os.path.join(tmp, 'planfix.py')}")
+    if not os.path.exists(os.path.join(tmp, "planfix.py")):
+        open(os.path.join(tmp, "planfix.py"), "w").write(PLAN_FIXTURE)
+        os.chmod(os.path.join(tmp, "planfix.py"), 0o755)
+    once(["run", "init", "--id", "ap1", "--feature", "AP", "--branch", "ba", "--plan", plan, "--force"], keep, e3)
+    import shutil as _sh2
+    _sh2.copy(plan, archived)
+    os.remove(plan)
+    con = db.open_project(os.path.join(keep, ".mk-home"), STORE_PROJECT, data_dir=keep)
+    try:
+        con.execute("INSERT OR REPLACE INTO plans(id, version, title, approved_at, archived_path)"
+                    " VALUES (?,?,?,?,?)",
+                    ("ap", 1, "ap", "2026-01-01T00:00:00+00:00", archived))
+        con.commit()
+    finally:
+        con.close()
+    out = once(["run", "set", "--id", "ap1", "--status", "done"], keep, e3)
+    assert out["ok"] and "warning" not in out, out
+    assert json.load(open(archived))["status"] == "done"
 
 
 if __name__ == "__main__":
