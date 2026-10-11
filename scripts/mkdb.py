@@ -18,11 +18,11 @@ the only status writer, and the root card is a copy written afterwards, only whe
 
 Schema: docs/state-schema.md (store section).
 """
-import argparse, datetime, json, multiprocessing, os, re, sqlite3, subprocess, sys, tempfile
+import argparse, datetime, hashlib, json, multiprocessing, os, re, sqlite3, subprocess, sys, tempfile
 
 sys.dont_write_bytecode = True
 
-SCHEMA = 1
+SCHEMA = 2
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
 TYPES = ("phase", "task", "subtask")
 # C4: the column a status lands in. Attention statuses keep their column and raise the flag.
@@ -74,6 +74,10 @@ CREATE TABLE IF NOT EXISTS waits(id INTEGER PRIMARY KEY, run TEXT, question TEXT
 CREATE TABLE IF NOT EXISTS change_log(change_no INTEGER PRIMARY KEY, run TEXT, task TEXT, t TEXT);
 CREATE TABLE IF NOT EXISTS schema_version(version INTEGER PRIMARY KEY);
 """
+# v2: artifacts.src is the importer's stable source key. NULL on rows written by the live path.
+# event_src mirrors meta_json.src so a repeat import is one indexed lookup, not a table scan.
+# A step may be SQL or a callable: ALTER TABLE ADD COLUMN is not idempotent as SQL, so V2 is a
+# function that adds the column only when PRAGMA table_info says it is missing.
 
 
 class Fail(Exception):
@@ -156,12 +160,18 @@ def _migrate(con, version, migrations):
     have = row["v"] or 0
     if have > version:
         raise Fail(f"store schema v{have} is newer than this code (v{version}); upgrade mkdb.py", 3)
-    for n, sql in migrations:
+    for n, step in migrations:
         if n <= have or n > version:
             continue
         # executescript() commits on its own, so the version stamp is a second transaction:
-        # a crash between them re-runs the migration, which is why every migration is idempotent.
-        con.executescript(sql)
+        # a crash between them re-runs the migration, which is why every step is idempotent.
+        # A step is either SQL or a callable(con); an ALTER TABLE ADD COLUMN must be a callable
+        # that checks the column first, because the SQL is not safe to run twice.
+        if callable(step):
+            step(con)
+            con.commit()
+        else:
+            con.executescript(step)
         _begin(con)
         try:
             con.execute("INSERT OR IGNORE INTO schema_version(version) VALUES (?)", (n,))
@@ -185,10 +195,19 @@ def _ensure_prev_status(con):
         con.execute("ALTER TABLE tasks ADD COLUMN prev_status TEXT")
 
 
+def _v2(con):
+    """The shipped v2 step. Safe to run twice: the column, the table and the index are guarded."""
+    cols = [r["name"] for r in con.execute("PRAGMA table_info(artifacts)")]
+    if cols and "src" not in cols:
+        con.execute("ALTER TABLE artifacts ADD COLUMN src TEXT")
+    con.execute("CREATE TABLE IF NOT EXISTS event_src(run TEXT, src TEXT, PRIMARY KEY(run, src))")
+    con.execute("CREATE INDEX IF NOT EXISTS art_run_src ON artifacts(run, src)")
+
+
 def open_project(home, slug=None, data_dir=None, version=SCHEMA, migrations=()):
     """Open or create the project store (C2). check_home runs before any directory is created."""
     path = os.path.join(project_dir(home, slug, data_dir), "mk.db")
-    con = _migrate(_connect(path), version, ((1, PROJECT_DDL),) + tuple(migrations))
+    con = _migrate(_connect(path), version, ((1, PROJECT_DDL), (2, _v2)) + tuple(migrations))
     _ensure_prev_status(con)
     return con
 
@@ -438,6 +457,188 @@ def catch_up(home, project, data_dir=None):
     return len([r for r in rows if r["change_no"] > last])
 
 
+RUN_COLS = ("id", "plan", "plan_version", "branch", "status", "stage", "next", "started", "ended")
+TASK_COLS = ("id", "parent", "type", "title", "acceptance", "owned", "deps", "parallel",
+             "route_json", "status", "lane", "slot", "branch", "pane", "round", "verdict", "updated")
+EVENT_COLS = ("t", "chan", "kind", "from_id", "to_id", "reply_to", "text", "meta_json", "task")
+ARTIFACT_COLS = ("task", "round", "kind", "rev", "text", "created")
+
+
+def _src_of(meta_json):
+    """The importer's stable source key, stored as meta_json.src. Absent means a live event."""
+    if not meta_json:
+        return None
+    try:
+        meta = json.loads(meta_json)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(meta, dict):
+        return None
+    return meta.get("src")
+
+
+def _with_src(meta_json, src):
+    """Put src into meta_json without dropping the keys the importer already set."""
+    if meta_json in (None, ""):
+        meta = {}
+    else:
+        try:
+            meta = json.loads(meta_json)
+        except (TypeError, ValueError):
+            raise Fail(f"bad meta_json: {meta_json!r}")
+        if not isinstance(meta, dict):
+            raise Fail(f"bad meta_json: expected an object, got {meta_json!r}")
+    meta["src"] = src
+    return json.dumps(meta, sort_keys=True, ensure_ascii=False)
+
+
+def _parents_first(tasks):
+    """Insert order: a parent before its children. A cycle among parents is named and refused."""
+    by_id = {}
+    for task in tasks:
+        tid = task.get("id")
+        if not tid or tid in by_id:
+            raise Fail(f"bad task id {tid!r}")
+        by_id[tid] = task
+    edges = {tid: [t["parent"]] if t.get("parent") else [] for tid, t in by_id.items()}
+    order, pending = [], set(by_id)
+    while pending:
+        ready = sorted(t for t in pending if all(p not in pending for p in edges[t]))
+        if not ready:
+            start = sorted(pending)[0]
+            cycle = _cycle_through(start, {t: edges[t] for t in pending})
+            raise Fail("cycle: " + " -> ".join(cycle or sorted(pending)))
+        order.extend(ready)
+        pending -= set(ready)
+    return [by_id[t] for t in order]
+
+
+def import_history(home, project, run, *, run_row=None, tasks=(), events=(), artifacts=(), data_dir=None):
+    """Import one historical run with its original values (D1B). The only history writer.
+
+    One BEGIN IMMEDIATE transaction for the whole call; any error rolls it back, so the store is
+    unchanged. Idempotent: events and artifacts carry a stable source key (meta_json.src, and the
+    artifacts.src column) and a repeat imports nothing. Tasks and the run row upsert. sync_root
+    stays off — change_log rows are written so catch_up() can build the cards later, and nothing
+    here touches the root store. Returns counts of rows actually added.
+    """
+    con = open_project(home, project, data_dir)
+    try:
+        _begin(con)
+        try:
+            added = {"runs": 0, "tasks": 0, "events": 0, "artifacts": 0}
+            if run_row is not None:
+                row = {c: run_row.get(c) for c in RUN_COLS}
+                if row["id"] != run:
+                    raise Fail(f"run_row id {row['id']!r} != run {run!r}")
+                before = con.execute("SELECT 1 FROM runs WHERE id=?", (run,)).fetchone()
+                con.execute(
+                    "INSERT INTO runs(" + ",".join(RUN_COLS) + ") VALUES (" + ",".join("?" * len(RUN_COLS)) + ")"
+                    " ON CONFLICT(id) DO UPDATE SET " + ",".join(f"{c}=excluded.{c}" for c in RUN_COLS if c != "id"),
+                    tuple(row[c] for c in RUN_COLS))
+                if not before:
+                    added["runs"] = 1
+            ordered = _parents_first(list(tasks))
+            # Deps are checked against the batch plus what is already stored, so a dep may name a
+            # task later in the same batch. The graph is built once and extended as rows insert.
+            known = {(r["run"], r["id"]): _deps_of(r["deps"])
+                     for r in con.execute("SELECT run, id, deps FROM tasks")}
+            batch_ids = {t["id"] for t in ordered}
+            for t in ordered:
+                if t.get("type") not in TYPES:
+                    raise Fail(f"bad type {t.get('type')!r}: expected phase|task|subtask")
+                check_route(t.get("route_json"))
+                parent = t.get("parent")
+                if parent and parent not in batch_ids and not con.execute(
+                        "SELECT 1 FROM tasks WHERE run=? AND id=?", (run, parent)).fetchone():
+                    raise Fail(f"missing parent: {parent}")
+                me = (run, t["id"])
+                deps = _deps_of(t.get("deps"))
+                targets = []
+                for dep in deps:
+                    target = _dep_target(run, dep)
+                    if target == me:
+                        raise Fail(f"self-dep: {t['id']} depends on itself")
+                    if target[0] == run and target[1] not in batch_ids and target not in known:
+                        raise Fail(f"missing dep: {dep} is not a task in this project")
+                    if target[0] != run and target not in known:
+                        raise Fail(f"missing dep: {dep} is not a task in this project")
+                    targets.append(target)
+                known[me] = deps
+                edges = {k: [_dep_target(k[0], d) for d in v] for k, v in known.items()}
+                path = _cycle_through(me, edges)
+                if path:
+                    raise Fail("cycle: " + " -> ".join(f"{r_}:{t_}" for r_, t_ in path))
+                status = t.get("status") or "planned"
+                # An attention status keeps the column of the status it names as previous; the
+                # importer has no earlier row, so prev_status is the status itself when it is a
+                # column status and NULL otherwise (column_of then uses Backlog).
+                prev = status if status in COLUMNS else None
+                column_of(status, prev)  # refuse an unknown status before anything is written
+                cols = ["run"] + list(TASK_COLS) + ["prev_status"]
+                values = [run] + [t.get(c) for c in TASK_COLS] + [prev]
+                values[cols.index("status")] = status
+                existed = con.execute("SELECT * FROM tasks WHERE run=? AND id=?", me).fetchone()
+                con.execute(
+                    "INSERT INTO tasks(" + ",".join(cols) + ") VALUES (" + ",".join("?" * len(cols)) + ")"
+                    " ON CONFLICT(run, id) DO UPDATE SET " + ",".join(
+                        f"{c}=excluded.{c}" for c in cols if c not in ("run", "id")),
+                    tuple(values))
+                if not existed:
+                    added["tasks"] += 1
+                    _change_log(con, run, t["id"])
+                else:
+                    # A re-import logs a change only when a column actually moved, so catch_up()
+                    # rebuilds the card; identical data adds nothing, change_log included.
+                    changed = any(existed[c] != v for c, v in zip(cols, values))
+                    if changed:
+                        _change_log(con, run, t["id"])
+            seen_src = set()
+            for ev in events:
+                src = ev.get("src")
+                if not src:
+                    raise Fail("event missing src")
+                if src in seen_src:
+                    raise Fail(f"duplicate src in one import: {src}")
+                seen_src.add(src)
+                meta = _with_src(ev.get("meta_json"), src)
+                if con.execute("SELECT 1 FROM event_src WHERE run=? AND src=?", (run, src)).fetchone():
+                    continue
+                con.execute(
+                    "INSERT INTO events(run, task, t, chan, kind, from_id, to_id, reply_to, text, meta_json)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (run, ev.get("task"), ev.get("t"), ev.get("chan"), ev.get("kind"),
+                     ev.get("from_id"), ev.get("to_id"), ev.get("reply_to"), ev.get("text"), meta))
+                con.execute("INSERT INTO event_src(run, src) VALUES (?,?)", (run, src))
+                added["events"] += 1
+            seen_art = set()
+            for art in artifacts:
+                src = art.get("src")
+                if not src:
+                    raise Fail("artifact missing src")
+                if src in seen_art:
+                    raise Fail(f"duplicate artifact src in one import: {src}")
+                seen_art.add(src)
+                if con.execute("SELECT 1 FROM artifacts WHERE run=? AND src=?", (run, src)).fetchone():
+                    continue
+                text = art.get("text")
+                if not isinstance(text, str):
+                    raise Fail(f"artifact text must be a string, got {type(text).__name__}")
+                con.execute(
+                    "INSERT INTO artifacts(run, task, round, kind, rev, text, created, src)"
+                    " VALUES (?,?,?,?,?,?,?,?)",
+                    (run, art.get("task"), art.get("round"), art.get("kind"), art.get("rev"),
+                     text, art.get("created"), src))
+                added["artifacts"] += 1
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+    finally:
+        con.close()
+    return added
+
+
 def timeline(home, project, run, task, data_dir=None):
     """SELECT … FROM events WHERE run=? AND task=? ORDER BY id."""
     con = open_project(home, project, data_dir)
@@ -463,10 +664,14 @@ def cards(home, project=None):
 
 
 def _cli(argv):
+    # The common options are accepted before or after the subcommand. They are pulled out first,
+    # so a subcommand never sees them and the two positions cannot disagree.
+    common = Parser(prog="mkdb.py", add_help=False)
+    common.add_argument("--data", help="project data dir (overrides --project)")
+    common.add_argument("--home", help="MK home (default $MK_HOME or ~/.matrixkoder)")
+    common.add_argument("--project", help="project slug")
+    known, rest = common.parse_known_args(argv)
     p = Parser(prog="mkdb.py", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--data", help="project data dir (overrides --project)")
-    p.add_argument("--home", help="MK home (default $MK_HOME or ~/.matrixkoder)")
-    p.add_argument("--project", help="project slug")
     sub = p.add_subparsers(dest="cmd")
     tl = sub.add_parser("timeline")
     tl.add_argument("--run", required=True)
@@ -474,7 +679,12 @@ def _cli(argv):
     tl.add_argument("--json", action="store_true")
     cd = sub.add_parser("cards")
     cd.add_argument("--json", action="store_true")
-    args = p.parse_args(argv)
+    im = sub.add_parser("import-history")
+    im.add_argument("--run", required=True)
+    im.add_argument("--json-file", required=True)
+    args = p.parse_args(rest)
+    for name in ("data", "home", "project"):
+        setattr(args, name, getattr(known, name))
     home = resolve_home(args.home)
     if args.data:  # C11: refuse a synced or networked --data dir before any directory is created
         project_dir(home, data_dir=args.data)
@@ -484,7 +694,21 @@ def _cli(argv):
         return {"ok": True, "events": timeline(home, args.project, args.run, args.task, args.data)}
     if args.cmd == "cards":
         return {"ok": True, "cards": cards(home, args.project)}
-    raise Fail("usage: mkdb.py timeline|cards --json  (or --self-test)")
+    if args.cmd == "import-history":
+        if not args.project:
+            raise Fail("import-history needs --project")
+        try:
+            with open(args.json_file) as fh:
+                doc = json.load(fh)
+        except (OSError, ValueError) as e:
+            raise Fail(f"bad json file {args.json_file}: {e}")
+        if not isinstance(doc, dict):
+            raise Fail(f"bad json file {args.json_file}: expected an object")
+        counts = import_history(home, args.project, args.run, run_row=doc.get("run_row"),
+                                tasks=doc.get("tasks") or (), events=doc.get("events") or (),
+                                artifacts=doc.get("artifacts") or (), data_dir=args.data)
+        return {"ok": True, **counts}
+    raise Fail("usage: mkdb.py timeline|cards|import-history --json  (or --self-test)")
 
 
 def main(argv):
@@ -495,7 +719,7 @@ def main(argv):
 
 # --- self-test ----------------------------------------------------------------
 
-V2_SQL = "CREATE TABLE IF NOT EXISTS mkdb_v2_probe(id INTEGER PRIMARY KEY);"  # test migration, not shipped
+V3_SQL = "CREATE TABLE IF NOT EXISTS mkdb_v3_probe(id INTEGER PRIMARY KEY);"  # test migration, not shipped
 
 
 def _check(cond, msg):
@@ -560,6 +784,14 @@ def self_test():
         _tree(home)
         _reads(home)
         _crashes(home)
+        _import(home)
+        _import_atomic(home)
+        _import_dup_artifact(home)
+        _import_cli(home)
+        _import_reupdate(home)
+        _import_cycle(home)
+        _import_race(home)
+        _v1_upgrade(home)
         _single_writer()
     print(json.dumps({"ok": True, "self_test": "pass"}))
     return 0
@@ -580,7 +812,7 @@ def _stores(home):
         proj.close()
     again = open_project(home, "demo")  # re-open is a no-op: still one version row
     try:
-        _check(again.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == 1, "re-open")
+        _check(again.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == 2, "re-open")
     finally:
         again.close()
     via_data = open_project(home, data_dir=os.path.join(home, "explicit"))
@@ -855,21 +1087,52 @@ def _cycle_race(home):
 
 
 def _migrations(home):
+    """Finding 1: the REAL v2 step, applied without its stamp, must succeed on the next open."""
+    v1 = os.path.join(home, "v2crash")
+    con = open_project(home, data_dir=v1, version=1, migrations=())
+    try:
+        add_task(con, "r", "kept", "task", title="keep me")
+    finally:
+        con.close()
+    bare = sqlite3.connect(os.path.join(v1, "mk.db"))
+    bare.row_factory = sqlite3.Row
+    _v2(bare)  # the crash: the step landed, the schema_version stamp did not
+    bare.commit()
+    bare.close()
+    reopened = open_project(home, data_dir=v1)
+    try:
+        _check(reopened.execute("SELECT MAX(version) v FROM schema_version").fetchone()["v"] == 2,
+               "v2 not stamped after the crash")
+        _check(reopened.execute("SELECT title FROM tasks WHERE id='kept'").fetchone()["title"] == "keep me",
+               "v2 crash lost a row")
+        _check(reopened.execute("SELECT 1 FROM sqlite_master WHERE name='art_run_src'").fetchone(),
+               "art_run_src missing")
+    finally:
+        reopened.close()
+    again = open_project(home, data_dir=v1)
+    third = open_project(home, data_dir=v1)
+    try:
+        _check(again.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == 2, "reopen grew")
+        _check(third.execute("SELECT title FROM tasks WHERE id='kept'").fetchone()["title"] == "keep me",
+               "second reopen lost a row")
+    finally:
+        again.close()
+        third.close()
     data = os.path.join(home, "mig")
-    first = open_project(home, data_dir=data, version=2, migrations=((2, V2_SQL),))
-    _check(first.execute("SELECT 1 FROM sqlite_master WHERE name='mkdb_v2_probe'").fetchone(), "v2")
+    first = open_project(home, data_dir=data, version=3, migrations=((3, V3_SQL),))
+    _check(first.execute("SELECT 1 FROM sqlite_master WHERE name='mkdb_v3_probe'").fetchone(), "v2")
     first.close()
-    second = open_project(home, data_dir=data, version=2, migrations=((2, V2_SQL),))
-    _check(second.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == 2, "idempotent")
+    second = open_project(home, data_dir=data, version=3, migrations=((3, V3_SQL),))
+    _check(second.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == 3, "idempotent")
     second.close()
     # Finding 8: a crash between executescript and the version stamp re-runs safely.
     con = sqlite3.connect(os.path.join(data, "mk.db"))
-    con.execute("DELETE FROM schema_version WHERE version=2")
+    con.execute("DELETE FROM schema_version WHERE version=3")
     con.commit()
     con.close()
-    third = open_project(home, data_dir=data, version=2, migrations=((2, V2_SQL),))
-    _check(third.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == 2, "re-stamp")
-    _check(third.execute("SELECT COUNT(*) c FROM mkdb_v2_probe").fetchone()["c"] == 0, "probe grew")
+    third = open_project(home, data_dir=data, version=3, migrations=((3, V3_SQL),))
+    _check(third.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == 3, "re-stamp")
+    _check(third.execute("SELECT COUNT(*) c FROM mkdb_v3_probe").fetchone()["c"] == 0, "probe grew")
     third.close()
     try:
         open_project(home, data_dir=data, version=1)
@@ -1000,6 +1263,269 @@ def _crashes(home):
     finally:
         os.environ.pop("MKDB_FAIL_BEFORE_ROOT", None)
         os.environ.pop("MKDB_FAIL_IN_TXN", None)
+
+
+
+def _checksum(con):
+    """A stable digest of the rows an import can touch, so idempotence is more than a count."""
+    h = hashlib.sha256()
+    for table in ("runs", "tasks", "events", "artifacts", "change_log", "event_src"):
+        for row in con.execute(f"SELECT * FROM {table}"):
+            h.update(repr(tuple(row)).encode())
+    return h.hexdigest()
+
+
+def _sample():
+    """One small historical run: parent + child, an attention task, past timestamps, two artifacts."""
+    run_row = {"id": "hist", "plan": "p", "plan_version": 1, "branch": "b", "status": "done",
+               "stage": None, "next": None, "started": "2020-01-01T00:00:00+00:00",
+               "ended": "2020-01-02T00:00:00+00:00"}
+    tasks = [
+        {"id": "child", "parent": "parent", "type": "task", "title": "child", "deps": "later",
+         "status": "done", "round": 2, "verdict": "pass", "updated": "2020-01-01T01:00:00+00:00"},
+        {"id": "parent", "type": "phase", "title": "parent", "status": "done",
+         "updated": "2020-01-01T02:00:00+00:00"},
+        {"id": "later", "type": "task", "title": "later", "status": "blocked", "round": 4,
+         "verdict": None, "updated": "2020-01-01T03:00:00+00:00"},
+    ]
+    events = [
+        {"src": "e1", "task": "child", "t": "2020-01-01T00:00:01+00:00", "chan": "state",
+         "kind": "transition", "text": "started"},
+        {"src": "e2", "task": "child", "t": "2020-01-01T00:00:02+00:00", "chan": "state",
+         "kind": "note", "text": "a note"},
+        {"src": "e3", "task": "child", "t": "2020-01-01T00:00:03+00:00", "chan": "state",
+         "kind": "verdict", "text": "pass"},
+        {"src": "e4", "task": "child", "t": "2020-01-01T00:00:04+00:00", "chan": "state",
+         "kind": "decision", "text": "ship it"},
+        {"src": "e5", "task": "child", "t": "2020-01-01T00:00:05+00:00", "chan": "bus",
+         "kind": "ask", "text": "question?"},
+    ]
+    artifacts = [
+        {"src": "a1", "task": "child", "round": 2, "kind": "report", "rev": 1,
+         "text": "caf\u00e9 \u2014 no newline", "created": "2020-01-01T00:00:06+00:00"},
+        {"src": "a2", "task": "child", "round": 2, "kind": "brief", "rev": 1,
+         "text": "plain\n", "created": "2020-01-01T00:00:07+00:00"},
+    ]
+    return run_row, tasks, events, artifacts
+
+
+def _import(home):
+    """Round trip plus idempotence: original t/chan/kind, byte-identical text, zero rows the second time."""
+    data = os.path.join(home, "imp")
+    run_row, tasks, events, artifacts = _sample()
+    counts = import_history(home, "imp", "hist", run_row=run_row, tasks=tasks, events=events,
+                            artifacts=artifacts, data_dir=data)
+    _check(counts == {"runs": 1, "tasks": 3, "events": 5, "artifacts": 2}, f"counts {counts}")
+    got = timeline(home, "imp", "hist", "child", data)
+    _check([e["kind"] for e in got] == ["transition", "note", "verdict", "decision", "ask"], f"kinds {got}")
+    _check([e["t"] for e in got] == [e["t"] for e in events], "timestamps rewritten")
+    _check([e["chan"] for e in got] == ["state", "state", "state", "state", "bus"], f"chans {got}")
+    _check([e["text"] for e in got] == [e["text"] for e in events], "text changed")
+    _check("now()" not in "".join(e["t"] for e in got), "a timestamp looks like now()")
+    con = open_project(home, data_dir=data)
+    try:
+        rows = {r["id"]: r for r in con.execute("SELECT * FROM tasks")}
+        _check(rows["later"]["status"] == "blocked" and rows["later"]["prev_status"] is None,
+               f"attention row {dict(rows['later'])}")
+        _check(column_of(rows["later"]["status"], rows["later"]["prev_status"]) == ("Backlog", 1),
+               "attention column")
+        _check(rows["child"]["status"] == "done" and rows["child"]["round"] == 2
+               and rows["child"]["verdict"] == "pass" and rows["child"]["parent"] == "parent",
+               f"child {dict(rows['child'])}")
+        texts = [r["text"] for r in con.execute("SELECT text FROM artifacts ORDER BY src")]
+        _check(hashlib.sha256(texts[0].encode()).hexdigest()
+               == hashlib.sha256("caf\u00e9 \u2014 no newline".encode()).hexdigest(), "unicode text")
+        _check(texts[1] == "plain\n" and not texts[0].endswith("\n"), f"newline changed {texts!r}")
+        _check(con.execute("SELECT COUNT(*) c FROM change_log").fetchone()["c"] == 3, "change_log")
+        digest = _checksum(con)
+        n_events = con.execute("SELECT COUNT(*) c FROM events").fetchone()["c"]
+    finally:
+        con.close()
+    _check(cards(home, "imp") == [], "import wrote the root store")
+    again = import_history(home, "imp", "hist", run_row=run_row, tasks=tasks, events=events,
+                           artifacts=artifacts, data_dir=data)
+    _check(again == {"runs": 0, "tasks": 0, "events": 0, "artifacts": 0}, f"second import {again}")
+    con = open_project(home, data_dir=data)
+    try:
+        _check(_checksum(con) == digest, "second import changed a row")
+        _check(con.execute("SELECT COUNT(*) c FROM events").fetchone()["c"] == n_events, "events grew")
+    finally:
+        con.close()
+
+
+def _import_dup_artifact(home):
+    """Finding 2: two artifacts with one src in a batch are refused and nothing is written."""
+    data = os.path.join(home, "dupa")
+    try:
+        import_history(home, "dupa", "hist",
+                       tasks=[{"id": "t", "type": "task", "status": "planned"}],
+                       artifacts=[{"src": "same", "task": "t", "round": 1, "kind": "report", "rev": 1,
+                                   "text": "one", "created": "2020-01-01T00:00:00+00:00"},
+                                  {"src": "same", "task": "t", "round": 1, "kind": "report", "rev": 2,
+                                   "text": "two", "created": "2020-01-01T00:00:01+00:00"}],
+                       data_dir=data)
+    except Fail as e:
+        _check("duplicate artifact src" in str(e), f"unexpected error {e}")
+    else:
+        raise SystemExit("SELF-TEST FAIL: a duplicate artifact src was imported")
+    con = open_project(home, data_dir=data)
+    try:
+        for table in ("tasks", "artifacts", "change_log"):
+            _check(con.execute(f"SELECT COUNT(*) c FROM {table}").fetchone()["c"] == 0,
+                   f"{table} written despite the duplicate src")
+    finally:
+        con.close()
+
+
+def _import_cli(home):
+    """Finding 3: a bad JSON file is a JSON error, and options work after the subcommand."""
+    data = os.path.join(home, "cli")
+    base = [sys.executable, os.path.abspath(__file__), "--home", home, "--data", data]
+    def run(args, payload=None):
+        path = None
+        if payload is not None:
+            path = os.path.join(home, "in.json")
+            with open(path, "w") as fh:
+                fh.write(payload)
+        proc = subprocess.run(base + args + (["--json-file", path] if path else []),
+                              capture_output=True, text=True)
+        return proc.returncode, proc.stdout, proc.stderr
+    rc, out, err = run(["import-history", "--project", "cli", "--run", "hist"], payload="[1, 2]")
+    _check(rc != 0 and "Traceback" not in err and '"ok": false' in out, f"non-object: rc={rc} out={out!r} err={err!r}")
+    rc, out, err = run(["import-history", "--project", "cli", "--run", "hist"], payload="{")
+    _check(rc != 0 and "Traceback" not in err and '"ok": false' in out, f"bad json: rc={rc} out={out!r} err={err!r}")
+    rc, out, err = run(["import-history", "--project", "cli", "--run", "hist", "--json-file",
+                        os.path.join(home, "missing.json")])
+    _check(rc != 0 and "Traceback" not in err and '"ok": false' in out, f"missing: rc={rc} out={out!r} err={err!r}")
+    good = json.dumps({"run_row": {"id": "hist", "status": "done"},
+                       "tasks": [{"id": "t", "type": "task", "status": "done"}]})
+    rc, out, err = run(["import-history", "--run", "hist", "--project", "cli"], payload=good)
+    _check(rc == 0 and '"tasks": 1' in out, f"options after subcommand: rc={rc} out={out!r} err={err!r}")
+
+
+def _import_reupdate(home):
+    """Finding 6: a re-import logs a change only when a column changed."""
+    data = os.path.join(home, "reup")
+    task = {"id": "t", "type": "task", "status": "planned", "title": "one"}
+    import_history(home, "reup", "hist", tasks=[task], data_dir=data)
+    con = open_project(home, data_dir=data)
+    try:
+        before = con.execute("SELECT COUNT(*) c FROM change_log").fetchone()["c"]
+    finally:
+        con.close()
+    same = import_history(home, "reup", "hist", tasks=[dict(task)], data_dir=data)
+    _check(same["tasks"] == 0, f"identical re-import counted a task: {same}")
+    con = open_project(home, data_dir=data)
+    try:
+        _check(con.execute("SELECT COUNT(*) c FROM change_log").fetchone()["c"] == before,
+               "identical re-import wrote change_log")
+    finally:
+        con.close()
+    changed = dict(task, title="two")
+    import_history(home, "reup", "hist", tasks=[changed], data_dir=data)
+    con = open_project(home, data_dir=data)
+    try:
+        after = con.execute("SELECT COUNT(*) c FROM change_log").fetchone()["c"]
+        _check(after == before + 1, f"changed re-import logged {after - before}")
+        _check(con.execute("SELECT title FROM tasks WHERE id='t'").fetchone()["title"] == "two",
+               "update did not land")
+    finally:
+        con.close()
+
+
+def _import_atomic(home):
+    """A bad dep in the middle of the batch rolls the whole call back."""
+    data = os.path.join(home, "atom")
+    run_row, tasks, events, artifacts = _sample()
+    tasks = tasks + [{"id": "bad", "type": "task", "title": "bad", "deps": "nope", "status": "planned"}]
+    try:
+        import_history(home, "atom", "hist", run_row=run_row, tasks=tasks, events=events,
+                       artifacts=artifacts, data_dir=data)
+    except Fail as e:
+        _check("missing dep" in str(e), f"unexpected error {e}")
+    else:
+        raise SystemExit("SELF-TEST FAIL: a bad dep was imported")
+    con = open_project(home, data_dir=data)
+    try:
+        for table in ("runs", "tasks", "events", "artifacts", "change_log"):
+            _check(con.execute(f"SELECT COUNT(*) c FROM {table}").fetchone()["c"] == 0,
+                   f"{table} not rolled back")
+    finally:
+        con.close()
+
+
+def _import_cycle(home):
+    """A cycle inside the batch is refused and named; a dep on a later task in the batch is fine."""
+    data = os.path.join(home, "icyc")
+    try:
+        import_history(home, "icyc", "hist", tasks=[
+            {"id": "a", "type": "task", "deps": "b", "status": "planned"},
+            {"id": "b", "type": "task", "deps": "a", "status": "planned"}], data_dir=data)
+    except Fail as e:
+        _check("cycle" in str(e) and "hist:a" in str(e) and "hist:b" in str(e), f"cycle not named: {e}")
+    else:
+        raise SystemExit("SELF-TEST FAIL: a batch cycle was imported")
+    con = open_project(home, data_dir=data)
+    try:
+        _check(con.execute("SELECT COUNT(*) c FROM tasks").fetchone()["c"] == 0, "cycle left rows")
+    finally:
+        con.close()
+    # _sample's child depends on `later`, which comes after it in the batch
+    run_row, tasks, events, artifacts = _sample()
+    counts = import_history(home, "icyc", "hist", run_row=run_row, tasks=tasks, data_dir=data)
+    _check(counts["tasks"] == 3, f"forward dep refused: {counts}")
+
+
+def _import_worker(home, data, slot):
+    os.environ.pop("MKDB_FAIL_BEFORE_ROOT", None)
+    os.environ.pop("MKDB_FAIL_IN_TXN", None)
+    import_history(home, "race", f"r{slot}",
+                   run_row={"id": f"r{slot}", "status": "done"},
+                   tasks=[{"id": "t", "type": "task", "status": "done"}],
+                   events=[{"src": f"s{slot}", "task": "t", "t": "2020-01-01T00:00:00+00:00",
+                            "chan": "state", "kind": "note", "text": str(slot)}],
+                   data_dir=data)
+
+
+def _import_race(home):
+    """4 processes import different runs into one project store; counts add up, nobody is locked out."""
+    data = os.path.join(home, "race")
+    open_project(home, data_dir=data).close()
+    procs = []
+    for i in range(4):
+        proc = multiprocessing.get_context("fork").Process(target=_import_worker, args=(home, data, i))
+        proc.start()
+        procs.append(proc)
+    for proc in procs:
+        proc.join(60)
+        _check(proc.exitcode == 0, f"import racer exit {proc.exitcode}")
+    con = open_project(home, data_dir=data)
+    try:
+        _check(con.execute("SELECT COUNT(*) c FROM runs").fetchone()["c"] == 4, "runs lost")
+        _check(con.execute("SELECT COUNT(*) c FROM tasks").fetchone()["c"] == 4, "tasks lost")
+        _check(con.execute("SELECT COUNT(*) c FROM events").fetchone()["c"] == 4, "events lost")
+    finally:
+        con.close()
+
+
+def _v1_upgrade(home):
+    """A store created at v1 is upgraded in place and keeps the rows it already had."""
+    data = os.path.join(home, "v1")
+    con = open_project(home, data_dir=data, version=1, migrations=())
+    try:
+        add_task(con, "r", "kept", "task", title="keep me")
+        _check("src" not in [r["name"] for r in con.execute("PRAGMA table_info(artifacts)")],
+               "v1 store already had src")
+    finally:
+        con.close()
+    upgraded = open_project(home, data_dir=data)
+    try:
+        _check(upgraded.execute("SELECT MAX(version) v FROM schema_version").fetchone()["v"] == 2, "not v2")
+        _check("src" in [r["name"] for r in upgraded.execute("PRAGMA table_info(artifacts)")], "src missing")
+        row = upgraded.execute("SELECT title FROM tasks WHERE id='kept'").fetchone()
+        _check(row["title"] == "keep me", f"row lost: {dict(row) if row else None}")
+    finally:
+        upgraded.close()
 
 
 def _single_writer():
