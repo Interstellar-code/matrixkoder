@@ -4185,10 +4185,31 @@ def _x1_rss_kb():
         return 0
 
 
+def _x1_fast_baseline(root):
+    """One spawn-cost baseline from a NORMAL fast peer, shared by the drip cases:
+    a real-bus `progress` round trip on its own lane when the plugin checkout is
+    present, else a `python -c pass` spawn. Never measured from a drip peer:
+    against the drip the baseline stretches to the whole drip on a path without
+    the absolute deadline, and the scaled bound grows with it. The server is a
+    cached bus_server (stopped by stop_bus_servers) and the lane lives in the
+    temp root, like every other bus case."""
+    if os.path.isfile(MK_BUS_PY):
+        data, _, _ = bus_server(root, "x1dripbase")
+        blane = bus_lane(root, "x1_drip_baseline", "X1D", data)
+        begin(blane, root, run=BUS_RUN, task="X1D")
+        b0 = time.time()
+        cli(blane, "progress", "work")
+        return max(0.25, time.time() - b0)
+    b0 = time.time()
+    subprocess.run([sys.executable, "-c", "pass"], capture_output=True, timeout=30)
+    return max(0.25, time.time() - b0)
+
+
 def t_x1_slow_drip_body_honours_budget(root):
     """Review R1 HIGH: a peer that streams the body at 1 byte/s resets a per-recv
-    socket timer. inbox and progress must still return within 3 s; ask --timeout 5
-    within 6 s. RSS must not grow by the drip."""
+    socket timer. inbox and progress must still return within a baseline-scaled
+    bound (floor 5 s, cap 20 s); ask --timeout 5 within the wider bound (floor
+    10 s). RSS must not grow by the drip."""
     import threading
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -4245,26 +4266,15 @@ def t_x1_slow_drip_body_honours_budget(root):
     begin(lane, root)
     env = {"MK_BUS_URL": f"http://127.0.0.1:{port}", "MK_BUS_TOKEN": "sekrit"}
     before = _x1_rss_kb()
-    # Baseline from a NORMAL fast peer (one real-bus progress round trip, as in
-    # t_d7_one_ack_per_answer), never from the drip peer itself: measuring
-    # against the drip peer stretches the baseline to the whole 60 s body on a
-    # path without the absolute deadline, and the scaled bound grows with it.
-    # Without the absolute deadline each run below takes the full 60 s drip
-    # (do_GET/do_POST loop 60 x 1 s; cli_raw timeout is 180 s), which exceeds
-    # the 20 s hard cap, so the case still fails on that regression path.
-    if os.path.isfile(MK_BUS_PY):
-        _data, _, _ = bus_server(root, "x1dripbase")
-        _blane = bus_lane(root, "x1_drip_baseline", "X1D", _data)
-        begin(_blane, root, run=BUS_RUN, task="X1D")
-        b0 = time.time()
-        cli(_blane, "progress", "work")
-        baseline = max(0.25, time.time() - b0)
-    else:
-        b0 = time.time()
-        subprocess.run([sys.executable, "-c", "pass"], capture_output=True, timeout=30)
-        baseline = max(0.25, time.time() - b0)
-    inbox_bound = min(20.0, max(3.0, 4 * baseline))
-    ask_bound = min(20.0, max(6.5, 5 + 4 * baseline))
+    # Baseline from _x1_fast_baseline: a NORMAL fast peer, never the drip peer
+    # itself (see the helper). Without the absolute deadline each run below
+    # takes the full 60 s drip (do_GET/do_POST loop 60 x 1 s; cli_raw timeout
+    # is 180 s), which exceeds the 20 s hard cap, so the case still fails on
+    # that regression path. Floors 5/10 s absorb a fast sample followed by a
+    # load spike (review R6 LOW) and stay far below the 60 s drip.
+    baseline = _x1_fast_baseline(root)
+    inbox_bound = min(20.0, max(5.0, 4 * baseline))
+    ask_bound = min(20.0, max(10.0, 5 + 4 * baseline))
     try:
         t0 = time.time()
         code, lines = cli(lane, "inbox", env=env)
@@ -4299,7 +4309,8 @@ def t_x1_slow_drip_body_honours_budget(root):
 
 def t_x1_slow_drip_headers_honours_budget(root):
     """A peer that dribbles response-header bytes at 1 byte/s. The deadline covers
-    headers, not only the body: inbox and progress return within 3 s."""
+    headers, not only the body: inbox and progress return within a baseline-scaled
+    bound (floor 3 s, cap 20 s)."""
     import socket as _socket
     import threading
 
@@ -4345,16 +4356,22 @@ def t_x1_slow_drip_headers_honours_budget(root):
     lane = mklane(root, "x1_drip_hdr")
     begin(lane, root)
     env = {"MK_BUS_URL": f"http://127.0.0.1:{port}", "MK_BUS_TOKEN": "sekrit"}
+    # Baseline from _x1_fast_baseline: a NORMAL fast peer, never the drip peer
+    # itself (see the helper). Without the absolute deadline each run below
+    # waits out the whole 51-byte header drip at 1 byte/s (~51 s; cli_raw
+    # timeout is 180 s), which exceeds the 20 s hard cap, so the case still
+    # fails on that regression path.
+    bound = min(20.0, max(3.0, 4 * _x1_fast_baseline(root)))
     try:
         t0 = time.time()
         code, lines = cli(lane, "inbox", env=env)
         elapsed = time.time() - t0
-        assert elapsed < 3.0, f"inbox took {elapsed:.2f}s against dribbled headers: {lines}"
+        assert elapsed < bound, f"inbox took {elapsed:.2f}s against dribbled headers: {lines}"
         assert code == 4, (code, lines)
         t0 = time.time()
         code, lines = cli(lane, "progress", "parse-plan", env=env)
         elapsed = time.time() - t0
-        assert elapsed < 3.0, f"progress took {elapsed:.2f}s against dribbled headers: {lines}"
+        assert elapsed < bound, f"progress took {elapsed:.2f}s against dribbled headers: {lines}"
         assert code == 0, (code, lines)
     finally:
         sock.close()

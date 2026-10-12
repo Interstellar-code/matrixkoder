@@ -601,6 +601,9 @@ def quota_beats_stall(agent, kind):
     is deliberately NOT searched: a banner the agent merely quotes is not a banner.
     -> ("QUOTA", evidence) or (None, [])."""
     text = pane_footer(lh.pane_text(agent))
+    # the same banner filter classify uses: a quota word inside a test log in the footer
+    # is not a wall, so it must not beat a stall or write the ledger
+    text = "\n".join(lh.banner_lines(text))
     hits = lh.quota_hits(text)
     if not hits:
         return None, []
@@ -702,6 +705,23 @@ def watch(a):
 
 
 def self_test():
+    # Load-proof windows (W1): one trivial spawn is timed and every stall window
+    # below is multiplied by it, so a loaded machine still gets several polls
+    # inside max-wait. The ratio stays, so a stall still fires inside the window.
+    _t0 = time.time()
+    subprocess.run([sys.executable, "-c", "pass"], check=True)
+    # named _spawn_scale, not _scale: self_test later rebinds `_hit, _scale` from
+    # child_progress, and a win() after that point must still see the spawn scale
+    _spawn_scale = max(1.0, (time.time() - _t0) / 0.05)
+
+    def win(stall, wait):
+        # last_change_min rounds UP to the next 0.1 min, so one slow poll reads as
+        # 0.2. The floor sits above that. Below scale ~4 the floor wins, so every
+        # pair comes out 0.25/0.75 (a 2:1 pair becomes 1:3); a stall still fires
+        # inside the window and a live pane still outlives it.
+        return f"{max(0.25, stall * _spawn_scale):.4f}", f"{max(0.75, wait * _spawn_scale):.4f}"
+
+
     rx = re.compile(r"^\w+ feat\(p1\)")
     ok = {"state": "OK", "evidence": [], "agent_status": "idle", "last_change_min": 1}
     good, other = "abc123 feat(p1): state core", "def456 chore: wip"
@@ -1144,9 +1164,13 @@ def self_test():
         os.chmod(os.path.join(work_bin, "herdr"), 0o755)
         for grows, want in ((True, "WATCH_EXPIRED"), (False, "STALL")):
             e2 = dict(env, PATH=work_bin + os.pathsep + os.environ["PATH"], **({"MK_GROW": "1"} if grows else {}))
+            # the wider arguments only differ once the spawn scale passes ~4; below that
+            # win() returns the same 0.25/0.75 floor for both. The frozen pane keeps the
+            # smaller arguments so a stall still fires inside its window.
+            stall, wait = win(0.06, 0.18) if grows else win(0.02, 0.06)
             r = subprocess.run([sys.executable, __file__, "--lane", lane, "--agent", "w1", "--commit-grep", "nomatch",
                                 "--prompt-marker", "Read and follow brief-r3.md", "--poll", "0.1",
-                                "--stall-min", "0.02", "--max-wait-min", "0.06"], env=e2, capture_output=True, text=True)
+                                "--stall-min", stall, "--max-wait-min", wait], env=e2, capture_output=True, text=True)
             out = json.loads(r.stdout.strip().splitlines()[-1])
             assert out["state"] == want, (grows, out)
 
@@ -1175,40 +1199,34 @@ def self_test():
         # grace elapsed with the child: this watch is a fresh process (child_seen_until unset)
         r = subprocess.run([sys.executable, __file__, "--lane", lane, "--agent", "w1",
                             "--commit-grep", "nomatch", "--prompt-marker", "Read and follow brief-r3.md",
-                            "--poll", "0.1", "--stall-min", "0.02", "--max-wait-min", "0.06"],
+                            "--poll", "0.1", "--stall-min", win(0.02, 0.06)[0], "--max-wait-min", win(0.02, 0.06)[1]],
                            env=dict(env, PATH=work_bin + os.pathsep + os.environ["PATH"]),
                            capture_output=True, text=True)
         out = json.loads(r.stdout.strip().splitlines()[-1])
         assert out["state"] == "STALL", out  # child gone, grace elapsed: pane-text STALL as before
 
-        # Load-proof windows (W1 addendum): these probes prove activity vs stall, not a
-        # wall-clock. A trivial python spawn is timed and the 0.02/0.06 minute windows are
-        # multiplied so a loaded machine (spawn of seconds) still gets several polls
-        # inside max-wait. The RATIO stays 0.06/0.02, so a stall still fires inside the
-        # window and a live pane still outlives it.
-        _t0 = time.time()
-        subprocess.run([sys.executable, "-c", "pass"], check=True)
-        _spawn = max(0.05, time.time() - _t0)
-        _scale = max(1.0, _spawn / 0.05)
-        _stall = f"{0.02 * _scale:.4f}"
-        _wait = f"{0.06 * _scale:.4f}"
+        _stall, _wait = win(0.02, 0.06)
 
-        def probe(pane_txt, want, **extra):
+        def probe(pane_txt, want, stall=_stall, wait=_wait, **extra):
             """One watch run against the working-agent fake; assert its exit state."""
             open(grow, "w").write(pane_txt)
             e3 = dict(env, PATH=work_bin + os.pathsep + os.environ["PATH"], **extra)
             r = subprocess.run([sys.executable, __file__, "--lane", lane, "--agent", "w1", "--commit-grep", "nomatch",
                                 "--prompt-marker", "Read and follow brief-r3.md", "--poll", "0.1",
-                                "--stall-min", _stall, "--max-wait-min", _wait], env=e3, capture_output=True, text=True)
+                                "--stall-min", stall, "--max-wait-min", wait], env=e3, capture_output=True, text=True)
             out = json.loads(r.stdout.strip().splitlines()[-1])
             assert out["state"] == want, (pane_txt or extra, out)
 
         # tonight's false STALL: a pane whose only life is a running subagent task line (spinner +
         # "Task —", text frozen between polls so the fingerprint never moves) is activity; a pane
         # with only finished "✓ … Task —" lines is not; a lone ticking ↳ N toolcalls counter is
-        probe("⠼ General Task — E2 reviewer key, quiet optional\n↳ 49 toolcalls · 12m 48s\n", "WATCH_EXPIRED")
+        # the task line counts only once a poll has seen it. Its arguments are larger, but
+        # below scale ~4 win() floors both to the same 0.25/0.75, so the window is only
+        # actually wider under load.
+        probe("⠼ General Task — E2 reviewer key, quiet optional\n↳ 49 toolcalls · 12m 48s\n", "WATCH_EXPIRED",
+              *win(0.06, 0.18))
         probe("✓ General Task — E2 reviewer key\n", "STALL")
-        probe("", "WATCH_EXPIRED", MK_COUNT="1")
+        probe("", "WATCH_EXPIRED", *win(0.06, 0.18), MK_COUNT="1")
         # lane-health CLI: QUOTA keyed by kind into $MATRIXKODER_HOME/usage.json, scope reported
         open(pane, "w").write("> Read and follow brief-r2.md\n■ You've hit your usage limit. Try again in 2 hours.\n")
         r = subprocess.run([sys.executable, os.path.join(HERE, "lane-health.py"), "--agent", "w1", "--lane", lane,
@@ -1228,8 +1246,8 @@ def self_test():
             "$ cat brief-r2.md\n"
             "Read and follow brief-r2.md exactly. Work autonomously until complete.\n")
         out = cli("--commit-grep", "nomatch", "--kind", "opencode", "--prompt-marker",
-                  "Read and follow brief-r2.md", "--poll", "0.1", "--stall-min", "0.03",
-                  "--max-wait-min", "0.06", "--task", "P3", "--data", data)
+                  "Read and follow brief-r2.md", "--poll", "0.1", "--stall-min", win(0.03, 0.06)[0],
+                  "--max-wait-min", win(0.03, 0.06)[1], "--task", "P3", "--data", data)
         assert out["state"] == "QUOTA", out  # not STALL: the banner above the echo still counts
         assert "Free usage exceeded" in out["evidence"][0], out
         assert any(e.startswith("exhausted_until ") for e in out["evidence"]), out
@@ -1251,8 +1269,8 @@ def self_test():
             "Read and follow brief-r2.md exactly. Work autonomously until complete.\n")
         mks("task", "set", "P3", "status=building")
         out = cli("--commit-grep", "nomatch", "--kind", "opencode", "--prompt-marker",
-                  "Read and follow brief-r2.md", "--poll", "0.1", "--stall-min", "0.03",
-                  "--max-wait-min", "0.06", "--task", "P3", "--data", data)
+                  "Read and follow brief-r2.md", "--poll", "0.1", "--stall-min", win(0.03, 0.06)[0],
+                  "--max-wait-min", win(0.03, 0.06)[1], "--task", "P3", "--data", data)
         assert out["state"] == "STALL" and out["evidence"][0].startswith("agent idle"), out
         assert json.load(open(os.path.join(tmp, "home", "usage.json")))["agents"]["opencode"][
             "exhausted_observed_at"] == oc_ev, "a quoted banner must not re-record the ledger"
@@ -1261,8 +1279,8 @@ def self_test():
         open(pane, "w").write("> Read and follow brief-r2.md\nworking, then silence\n")
         mks("task", "set", "P3", "status=building")
         out = cli("--commit-grep", "nomatch", "--kind", "opencode", "--prompt-marker",
-                  "Read and follow brief-r2.md", "--poll", "0.1", "--stall-min", "0.03",
-                  "--max-wait-min", "0.06", "--task", "P3", "--data", data)
+                  "Read and follow brief-r2.md", "--poll", "0.1", "--stall-min", win(0.03, 0.06)[0],
+                  "--max-wait-min", win(0.03, 0.06)[1], "--task", "P3", "--data", data)
         assert out["state"] == "STALL" and out["evidence"][0].startswith("agent idle"), out
         assert json.load(open(os.path.join(tmp, "home", "usage.json")))["agents"]["opencode"][
             "exhausted_observed_at"] == oc_ev  # untouched: no quota line, no re-record
@@ -1270,8 +1288,8 @@ def self_test():
         # --- the project store (D5A.1): reads go through mkdb; files are the fallback --------
         # self-hosting guard: every run above was the file path; none of them created a store
         assert not os.path.exists(os.path.join(data, "mk.db")), "a watch created mk.db"
-        out = cli("--commit-grep", "nomatch", "--poll", "0.1", "--stall-min", "0.02",
-                  "--max-wait-min", "0.06", "--task", "P3", "--data", data)
+        out = cli("--commit-grep", "nomatch", "--poll", "0.1", "--stall-min", win(0.02, 0.06)[0],
+                  "--max-wait-min", win(0.02, 0.06)[1], "--task", "P3", "--data", data)
         assert out["state"] == "STALL" and out["state_written"], out  # file path, still works
         assert not os.path.exists(os.path.join(data, "mk.db")), "file-path run created mk.db"
         # undo the E2 fixture (task.json is a directory) BEFORE enabling: store enable republishes
@@ -1319,7 +1337,7 @@ def self_test():
         open(pane, "w").write("> Read and follow brief-s1.md\nquiet, no token\n")
         out = cli("--commit-grep", "nomatch", "--report", "report-s1.md", "--phase", "S5 R1", "--run", "r1",
                   "--kind", "codex", "--prompt-marker", "Read and follow brief-s1.md",
-                  "--poll", "0.1", "--stall-min", "0.02", "--max-wait-min", "0.06",
+                  "--poll", "0.1", "--stall-min", win(0.02, 0.06)[0], "--max-wait-min", win(0.02, 0.06)[1],
                   "--task", "S5", "--data", data)
         assert out["state"] == "STALL" and "matching commit" in out["evidence"][0], out
         # ... and no report artifact for the round -> the file check fails -> STALL lists report
@@ -1329,7 +1347,7 @@ def self_test():
         mks("task", "set", "S7", "status=verifying")
         out = cli("--commit-grep", r"feat\(s4\)", "--report", "report-s1.md", "--phase", "S7 R1", "--run", "r1",
                   "--kind", "codex", "--prompt-marker", "Read and follow brief-s1.md",
-                  "--poll", "0.1", "--stall-min", "0.02", "--max-wait-min", "0.06",
+                  "--poll", "0.1", "--stall-min", win(0.02, 0.06)[0], "--max-wait-min", win(0.02, 0.06)[1],
                   "--task", "S7", "--data", data)
         assert out["state"] == "STALL" and "report" in out["evidence"][0], out
         # fallback: the row is round 2, so phase S8 R1 has no row -> the status file decides
@@ -1436,6 +1454,22 @@ def self_test():
     finally:
         restore_data()
         shutil.rmtree(tmp, ignore_errors=True)
+    # A2: the filter is what suppresses it, so the test drives quota_beats_stall itself.
+    # A quota phrase inside a bar-drawn command in the footer must not beat a stall;
+    # a real wall in the footer must. Removing the banner_lines line fails the first assert.
+    log = "\n".join(["  \u2503", "  \u2503  $ pytest",
+                      "  \u2503  Usage limit reached for 5 hour resets in 3h", "  \u2503"])
+    wall = "Usage limit reached for 5 hour. resets in 3h"
+    real_pane = lh.pane_text
+    try:
+        lh.pane_text = lambda agent, lines=300: log
+        assert quota_beats_stall("w1", "opencode") == (None, []), "a test log must not beat a stall"
+        lh.pane_text = lambda agent, lines=300: wall
+        state, ev = quota_beats_stall("w1", "opencode")
+        assert state == "QUOTA", (state, ev)
+    finally:
+        lh.pane_text = real_pane
+
     print("lane-watch self-test ok")
 
 
