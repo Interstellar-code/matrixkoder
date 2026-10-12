@@ -49,7 +49,8 @@ class Case:
         e = dict(os.environ)
         e.update(PYTHONDONTWRITEBYTECODE="1", GIT_CONFIG_GLOBAL=os.devnull,
                  GIT_CONFIG_SYSTEM=os.devnull, HOME=self.home, GIT_EDITOR=":",
-                 GIT_MERGE_AUTOEDIT="no", GIT_ASKPASS="/bin/echo", GIT_PAGER="cat", GIT_CEILING_DIRECTORIES=self.root, LC_ALL="C")
+                 GIT_MERGE_AUTOEDIT="no", GIT_ASKPASS="/bin/echo", GIT_PAGER="cat", GIT_CEILING_DIRECTORIES=self.root, LC_ALL="C",
+                 GIT_AUTHOR_DATE="2026-01-01T00:00:00+0000", GIT_COMMITTER_DATE="2026-01-01T00:00:00+0000")
         if path_override is not None:
             e["PATH"] = path_override
         else:
