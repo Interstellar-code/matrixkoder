@@ -55,6 +55,21 @@ const EMPTY_PENDING: Pending = { run: '', upTo: 0, items: [] }
 const askBodies = new Map<string, string>()
 const askKey = (run: string, task: string, askId: string) => `${run}\0${task}\0${askId}`
 
+/** The key is typed `byId: number`, so the form rides in the sign. A line count (file mode,
+ *  and every cursor saved before store mode) is >= 0. An events.id cursor is stored negative,
+ *  -(id+1), which is never 0 and never collides with a line count. */
+const idCursorOf = (id: number): number => -(id + 1)
+const idFromCursor = (stored: number): number => -stored - 1
+
+/** A store cursor is negative. Writes from the flush keep that sign; file mode stays >= 0. */
+async function keepCursorForm($: EngineInterface, run: string, n: number): Promise<number> {
+  const res = await $.state.get({ plugin: 'matrixkoder', key: 'wakeEventLines', id: run } as const).catch(() => ({ value: undefined }))
+  return typeof res.value === 'number' && res.value < 0 ? idCursorOf(n) : n
+}
+
+
+
+
 /** Same rule as the dashboard and mk-state: MATRIXKODER_DATA, else the nearest .git (never above $HOME);
  *  a linked worktree resolves to its main checkout. Pure helpers are in data.ts ($ may not cross an import).
  *  tools.ts (mk_bus's --data) keeps its own file-local copy for the same loader rule. */
@@ -232,7 +247,7 @@ async function flushBatch($: EngineInterface): Promise<void> {
   const sentRef = { plugin: 'matrixkoder', key: 'wakeSentAt', id: `sent:${pend.run}:${pend.upTo}` } as const
   const sent = await $.state.get(sentRef).catch(() => ({ value: undefined }))
   if (typeof sent.value === 'number') {
-    await $.state.set({ plugin: 'matrixkoder', key: 'wakeEventLines', id: pend.run } as const, pend.upTo).catch(() => {})
+    await $.state.set({ plugin: 'matrixkoder', key: 'wakeEventLines', id: pend.run } as const, await keepCursorForm($, pend.run, pend.upTo)).catch(() => {})
     askBodies.clear()
     await $.state.set(pendingRef, EMPTY_PENDING).catch(() => {})
     return
@@ -247,7 +262,7 @@ async function flushBatch($: EngineInterface): Promise<void> {
   }
   if (items.length === 0) {
     // every transition was reversed: nothing to submit, but the lines are consumed
-    await $.state.set({ plugin: 'matrixkoder', key: 'wakeEventLines', id: pend.run } as const, pend.upTo).catch(() => {})
+    await $.state.set({ plugin: 'matrixkoder', key: 'wakeEventLines', id: pend.run } as const, await keepCursorForm($, pend.run, pend.upTo)).catch(() => {})
     askBodies.clear()
     await $.state.set(pendingRef, EMPTY_PENDING).catch(() => {})
     return
@@ -301,7 +316,7 @@ async function flushBatch($: EngineInterface): Promise<void> {
     const cursorRes = await $.state.get(cursorRef).catch(() => ({ value: undefined }))
     const currentCursor = typeof cursorRes.value === 'number' ? cursorRes.value : 0
     const nextCursor = Math.max(currentCursor, heldUpTo)
-    await $.state.set(cursorRef, nextCursor).catch(() => {})
+    await $.state.set(cursorRef, await keepCursorForm($, pend.run, nextCursor)).catch(() => {})
     askBodies.clear()
     await $.state.set(pendingRef, EMPTY_PENDING).catch(() => {})
     retryNext = false
@@ -342,7 +357,7 @@ async function flushBatch($: EngineInterface): Promise<void> {
   await $.state.set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `hold:${text}` } as const, now).catch(() => {})
   await $.state.set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `heldUpTo:${text}` } as const, pend.upTo).catch(() => {})
   await $.state.set(sentRef, now).catch(() => {}) // the duplicate guard for this exact batch
-  await $.state.set({ plugin: 'matrixkoder', key: 'wakeEventLines', id: pend.run } as const, pend.upTo).catch(() => {})
+  await $.state.set({ plugin: 'matrixkoder', key: 'wakeEventLines', id: pend.run } as const, await keepCursorForm($, pend.run, pend.upTo)).catch(() => {})
   askBodies.clear()
   await $.state.set(pendingRef, EMPTY_PENDING).catch(() => {})
 }
@@ -476,18 +491,28 @@ async function pollEvents($: EngineInterface): Promise<void> {
 
     const stateRef = { plugin: 'matrixkoder', key: 'wakeEventLines', id: active.id } as const
     const stateRes = await $.state.get(stateRef).catch(() => ({ value: undefined }))
-    // File mode: the cursor is a line count. Store mode: it is the last consumed events.id.
-    // A project does not switch modes mid-run; the number is never converted.
+    // File mode: the cursor is a line count, >= 0. Store mode: it is the last consumed
+    // events.id, stored negative (idCursorOf) because the key is typed byId:number and a
+    // second key cannot record the form. A non-negative number saved before store mode
+    // existed is a line count; reading it as an id would re-wake every event with id > N.
     const cursorOf = (ev: WakeEvent, index: number): number => (mode === 'store' ? (ev.id ?? 0) : index + 1)
     const maxCursor = events.reduce((m, ev, i) => Math.max(m, cursorOf(ev, i)), 0)
+    const saved = typeof stateRes.value === 'number' ? stateRes.value : undefined
 
-    if (typeof stateRes.value !== 'number') {
+    if (mode === 'store' && !(typeof saved === 'number' && saved < 0)) {
+      // First store-mode tick for this run, whether or not a line-count cursor was saved:
+      // baseline to the current max id and do not wake for events already in the store.
+      await $.state.set(stateRef, idCursorOf(maxCursor)).catch(() => {})
+      return
+    }
+
+    if (typeof saved !== 'number') {
       // First enable or first time seeing this active run: baseline to current max, do not wake for history
       await $.state.set(stateRef, maxCursor).catch(() => {})
       return
     }
 
-    const lastSeen = stateRes.value
+    const lastSeen = mode === 'store' ? idFromCursor(saved) : saved
     if (maxCursor <= lastSeen) return
 
     let now = Date.now()
@@ -565,7 +590,7 @@ async function pollEvents($: EngineInterface): Promise<void> {
         const flagSet = typeof flagRes.value === 'number' && flagRes.value > 0
         if (flagSet) {
           // second-time stale: consume the lines, drop the sentinel, do not retry
-          await $.state.set({ plugin: 'matrixkoder', key: 'wakeEventLines', id: pend.run } as const, pend.upTo).catch(() => {})
+          await $.state.set({ plugin: 'matrixkoder', key: 'wakeEventLines', id: pend.run } as const, await keepCursorForm($, pend.run, pend.upTo)).catch(() => {})
           askBodies.clear()
           await $.state.set(pendingRef, EMPTY_PENDING).catch(() => {})
           return
@@ -594,7 +619,7 @@ async function pollEvents($: EngineInterface): Promise<void> {
       if (!items.some(p => p.task === item.task && p.to === item.to && p.askId === item.askId)) items.push(item)
     }
     if (items.length === 0) {
-      await $.state.set(stateRef, maxCursor).catch(() => {}) // nothing to wake for: safe to move on
+      await $.state.set(stateRef, mode === 'store' ? idCursorOf(maxCursor) : maxCursor).catch(() => {}) // nothing to wake for: safe to move on
       return
     }
     // lines are NOT marked seen yet: that happens after the submit (flushBatch)
