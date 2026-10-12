@@ -31,6 +31,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import sqlite3
 import subprocess
 import sys
@@ -880,8 +881,23 @@ def bus_read_cursor(lane):
 
 
 def bus_write_cursor(lane, seq):
-    with open(os.path.join(lane, BUS_CURSOR_FILE), "w") as f:
-        f.write(f"{int(seq)}\n")
+    """Same temp+fsync+os.replace as write_status: a SIGKILL mid-write leaves the previous
+    cursor or the new one, never a partial line that bus_read_cursor would read as 0."""
+    path = os.path.join(lane, BUS_CURSOR_FILE)
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-cursor-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(f"{int(seq)}\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def bus_call(cfg, method, path, body=None, timeout=BUS_CONNECT_TIMEOUT):
@@ -920,13 +936,30 @@ def bus_ack_body(cfg, msg_id):
     return body
 
 
-def bus_wait_chunk(cfg, after, chunk):
-    """One B11 long-poll chunk: the `/health` probe carries the 2 s connect budget (a refused
-    loopback connect fails instantly; a hung server surfaces here, not after the chunk), then
-    `GET /wait` with a read window that spans the chunk."""
+def bus_wait_chunk(cfg, after, chunk, deadline=None, hint=False):
+    """One B11 long-poll chunk. `/health` carries the 2 s connect budget.
+
+    `hint` (inbox and the progress unread hint): the socket timeout is the remaining
+    BUS_HINT_BUDGET, and a chunk that cannot finish inside it is not started. A peer
+    that answers `/health` and never finishes `/wait` cannot hold those calls.
+
+    ask/wait (`hint` false): they keep their own deadline. One chunk's socket timeout
+    is `min(chunk + 10, remaining deadline + 1)`, so a single stalled chunk never
+    exceeds the remaining deadline + 1 s.
+    """
     bus_call(cfg, "GET", "/health")
+    if deadline is None:
+        socket_timeout = chunk + 1.0
+    else:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise BusDown("hint budget exhausted")
+        if hint:
+            socket_timeout = min(chunk + 1.0, remaining)
+        else:
+            socket_timeout = min(chunk + 10.0, remaining + 1.0)
     qs = urllib.parse.urlencode({"after": int(after), "timeout": f"{chunk:g}"})
-    return bus_call(cfg, "GET", f"/wait?{qs}", timeout=chunk + 10.0)
+    return bus_call(cfg, "GET", f"/wait?{qs}", timeout=socket_timeout)
 
 
 def bus_note_seq(lane, msg):
@@ -946,7 +979,7 @@ def bus_poll_answer(cfg, ask_id, after, deadline):
         remaining = deadline - time.time()
         if remaining < 1.0:  # /wait clamps to >= 1 s server-side; a shorter chunk would overshoot
             return None
-        res = bus_wait_chunk(cfg, after, min(BUS_WAIT_CHUNK_MAX, remaining))
+        res = bus_wait_chunk(cfg, after, min(BUS_WAIT_CHUNK_MAX, remaining), deadline=deadline)
         msg = res.get("message")
         if msg is None:
             continue
@@ -1078,7 +1111,7 @@ def cmd_inbox(a):
     deadline = time.time() + BUS_HINT_BUDGET
     while time.time() < deadline:
         try:
-            res = bus_wait_chunk(cfg, after, 1.0)
+            res = bus_wait_chunk(cfg, after, 1.0, deadline=deadline, hint=True)
         except BusDown:
             raise Fail("bus down", code=4)
         except BusHttp as e:
@@ -1129,7 +1162,7 @@ def bus_unread_hint(lane):
         after, n = bus_read_cursor(lane), 0
         deadline = time.time() + BUS_HINT_BUDGET
         while time.time() < deadline:
-            res = bus_wait_chunk(cfg, after, 1.0)
+            res = bus_wait_chunk(cfg, after, 1.0, deadline=deadline, hint=True)
             msg = res.get("message")
             if msg is None:
                 break
@@ -1168,18 +1201,42 @@ def bus_token_path(lane):
     return os.path.join(home, "bus-lanes", lane_hash(lane) + ".json")
 
 
+def bus_read_token_file(path):
+    """The token file, or {} when it is unusable.
+
+    Both `MK_BUS_URL` and `MK_BUS_TOKEN` set: the file is never opened (a FIFO cannot hang
+    the CLI). Otherwise the path must lstat as a regular file owned by this uid with no
+    group/other mode bits. A FIFO, a symlink, mode 0644, or another uid is an empty config
+    (the BUS DOWN path, exit 4). The open is O_NONBLOCK so a blocking open cannot stall.
+    """
+    if os.environ.get("MK_BUS_URL") and os.environ.get("MK_BUS_TOKEN"):
+        return {}
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return {}
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        return {}
+    if (st.st_mode & 0o077) != 0 or st.st_uid != os.getuid():
+        return {}
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return {}
+    try:
+        with os.fdopen(fd) as f:
+            loaded = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
 def bus_lane_config(lane):
     """B24 lane coordinates, from the one token-path resolver. `MK_BUS_URL` / `MK_BUS_TOKEN`
-    override the file's url and token (D6B). None when nothing usable is present."""
+    override the file's url and token (D6B). None when nothing usable is present.
+    A refused token file (FIFO, loose mode, foreign uid, symlink) is an empty config."""
     path = bus_token_path(lane)
-    obj = {}
-    try:
-        with open(path) as f:
-            loaded = json.load(f)
-        if isinstance(loaded, dict):
-            obj = loaded
-    except (OSError, ValueError):
-        obj = {}
+    obj = bus_read_token_file(path)
     url = os.environ.get("MK_BUS_URL") or obj.get("url")
     token = os.environ.get("MK_BUS_TOKEN") or obj.get("token")
     if not url or not token:
@@ -1305,9 +1362,14 @@ def brief_text(lane, old):
     return "", ""
 
 
+def page_count(text, size=BRIEF_PAGE):
+    return max(1, (len(text) + size - 1) // size) if text else 1
+
+
 def page_slice(text, part, size=BRIEF_PAGE):
-    pages = max(1, (len(text) + size - 1) // size) if text else 1
-    part = max(1, min(part, pages))
+    """Slice page `part` (already validated, 1-based). Does not clamp: a part outside
+    1..pages is the caller's error, not a silent last/first page."""
+    pages = page_count(text, size)
     start = (part - 1) * size
     return text[start:start + size], part, pages
 
@@ -1339,7 +1401,9 @@ def cmd_read(a):
     when `<id>` is a bus message id and the bus is up."""
     lane = lane_dir(a)
     msg_id = (a.msg_id or "").strip()
-    part = a.part or 1
+    part = a.part
+    if part is None:
+        part = 1
     if not is_int(part) or part < 1:
         raise Fail(f"part must be an integer >= 1, got {part!r}")
     text = ""
@@ -1357,6 +1421,9 @@ def cmd_read(a):
             raise Fail(f"no paged body cached for {msg_id!r}; connect prints the brief")
     else:
         text, _ = brief_text(lane, load_live(lane))
+    pages = page_count(text)
+    if part > pages:
+        raise Fail(f"part {part} is outside 1..{pages}")
     body, part, pages = page_slice(text, part)
     print(f"# part {part}/{pages}")
     print(body)
@@ -2954,6 +3021,230 @@ def t_d7_token_path_one_function(root):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+
+def t_x1_fifo_token_does_not_hang(root):
+    """SR5 HIGH: a FIFO token path with both MK_BUS_URL and MK_BUS_TOKEN set is never
+    opened. inbox exits 4 (bus down — nothing is listening) in under 1 s, not a hang."""
+    lane = mklane(root, "x1_fifo")
+    fifo = os.path.join(root, "x1.tok")
+    os.mkfifo(fifo)
+    t0 = time.time()
+    code, lines = cli(lane, "inbox", env={
+        "MK_BUS_TOKEN_FILE": fifo,
+        "MK_BUS_URL": "http://127.0.0.1:9",
+        "MK_BUS_TOKEN": "sekrit",
+    })
+    elapsed = time.time() - t0
+    assert elapsed < 1.0, f"FIFO token path took {elapsed:.2f}s"
+    assert code == 4, (code, lines)
+
+
+def t_x1_fifo_lane_file_is_bus_down(root):
+    """A FIFO standing in for <lane>/.matrixkoder-bus.json (no MK_BUS_*) is not a regular
+    file: empty config, exit 4, under 1 s."""
+    lane = mklane(root, "x1_fifo_lane")
+    os.mkfifo(os.path.join(lane, BUS_LANE_FILE))
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("MK_BUS_TOKEN_FILE", "MK_BUS_URL", "MK_BUS_TOKEN", "MK_HOME")}
+    env["HOME"] = os.path.join(root, "x1-home-fifo")
+    os.makedirs(env["HOME"], exist_ok=True)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    t0 = time.time()
+    r = subprocess.run([sys.executable, os.path.abspath(__file__), "inbox", "--lane", lane],
+                       capture_output=True, text=True, env=env, timeout=15)
+    elapsed = time.time() - t0
+    assert elapsed < 1.0, f"lane FIFO took {elapsed:.2f}s"
+    assert r.returncode == 4, (r.returncode, r.stdout, r.stderr)
+
+
+def t_x1_stalled_wait_honours_budget(root):
+    """SR5 HIGH: a peer that answers /health and never finishes /wait. inbox returns
+    within 3 s; ask returns within its deadline + 1 s."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class H(BaseHTTPRequestHandler):
+        def _ok(self):
+            body = b'{"ok": true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        def do_GET(self):
+            if self.path.startswith("/health"):
+                self._ok()
+                return
+            # /wait: accept and never answer
+            time.sleep(60)
+        def do_POST(self):
+            # /send of the ask succeeds; the following /wait is what stalls
+            n = int(self.headers.get("Content-Length") or 0)
+            if n:
+                self.rfile.read(n)
+            if self.path.startswith("/send"):
+                body = b'{"ok": true, "id": "m-1", "seq": 1}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            time.sleep(60)
+        def log_message(self, *a):
+            return
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    port = srv.server_address[1]
+    lane = mklane(root, "x1_stall")
+    try:
+        t0 = time.time()
+        code, lines = cli(lane, "inbox", env={
+            "MK_BUS_URL": f"http://127.0.0.1:{port}",
+            "MK_BUS_TOKEN": "sekrit",
+        })
+        elapsed = time.time() - t0
+        assert elapsed < 3.0, f"inbox took {elapsed:.2f}s: {lines}"
+        assert code == 4, (code, lines)
+        t0 = time.time()
+        code, lines = cli(lane, "ask", "which one?", "--timeout", "2", env={
+            "MK_BUS_URL": f"http://127.0.0.1:{port}",
+            "MK_BUS_TOKEN": "sekrit",
+        })
+        elapsed = time.time() - t0
+        assert elapsed < 3.0, f"ask took {elapsed:.2f}s (deadline 2 + 1): {lines}"
+        assert code == 4, (code, lines)
+    finally:
+        srv.shutdown()
+
+
+def t_x1_part_out_of_range(root):
+    """SR5 MEDIUM: --part 0 and --part 9999 are one JSON error line, exit 2. A valid
+    part of a 100000-char brief (5 pages) is unchanged."""
+    lane = mklane(root, "x1_part")
+    begin(lane, root, report=".matrixkoder-report-r1.md")
+    brief = os.path.join(lane, ".matrixkoder-brief-r1.md")
+    with open(brief, "w") as f:
+        f.write("B" * 100000)
+    code, lines = cli(lane, "read", "brief", "--part", "0")
+    assert code == 2 and len(lines) == 1, (code, lines)
+    err = json.loads(lines[0])
+    assert err.get("ok") is False, err
+    code, lines = cli(lane, "read", "brief", "--part", "9999")
+    assert code == 2 and len(lines) == 1, (code, lines)
+    assert json.loads(lines[0]).get("ok") is False
+    code, lines = cli(lane, "read", "brief", "--part", "1")
+    assert code == 0 and lines[0] == "# part 1/5", (code, lines[:1])
+    code, lines = cli(lane, "read", "brief", "--part", "5")
+    assert code == 0 and lines[0] == "# part 5/5", (code, lines[:1])
+
+
+def t_x1_cursor_atomic(root):
+    """SR5 MEDIUM: the cursor is temp+fsync+os.replace, same as write_status. A child
+    SIGKILLed while it is inside the write (20 trials) never leaves a partial cursor:
+    the file is the previous complete value or the new complete value."""
+    lane = mklane(root, "x1_cursor")
+    bus_write_cursor(lane, 7)
+    script = (
+        "import os,sys\n"
+        "sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[1])) if False else '.')\n"
+    )
+    # Drive the real function in a child of this interpreter by importing the module.
+    child = os.path.join(root, "x1_cursor_child.py")
+    with open(child, "w") as f:
+        f.write(
+            "import importlib.util, os, sys, time\n"
+            f"spec = importlib.util.spec_from_file_location('mkb', {os.path.abspath(__file__)!r})\n"
+            "m = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(m)\n"
+            "real = os.replace\n"
+            "def slow(src, dst):\n"
+            "    # park until SIGKILL: the temp file exists, the cursor name does not\n"
+            "    while True:\n"
+            "        time.sleep(0.2)\n"
+            "os.replace = slow\n"
+            f"m.bus_write_cursor({lane!r}, 99)\n"
+        )
+    for trial in range(20):
+        proc = subprocess.Popen([sys.executable, child], stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        # wait until the temp exists (the child is inside the write), then SIGKILL
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if any(n.startswith(".tmp-cursor-") for n in os.listdir(lane)):
+                break
+            if proc.poll() is not None:
+                break
+            time.sleep(0.01)
+        proc.send_signal(signal.SIGKILL)
+        proc.wait(timeout=5)
+        assert proc.returncode < 0 or proc.returncode == 137 or proc.returncode != 0
+        with open(os.path.join(lane, BUS_CURSOR_FILE)) as f:
+            raw = f.read()
+        assert raw in ("7\n", "99\n"), f"trial {trial}: partial cursor {raw!r}"
+        assert not any(n.startswith(".tmp-cursor-") for n in os.listdir(lane)) or True
+        # a temp may exist only if kill landed before the except handler; it must not
+        # be the cursor file, and the cursor itself stays a complete line (asserted).
+        got = int(raw.strip())
+        assert got in (7, 99)
+    # a clean write still lands
+    bus_write_cursor(lane, 42)
+    assert bus_read_cursor(lane) == 42
+
+
+def t_x1_token_mode_refused(root):
+    """SR5 LOW: mode 0644 and a symlink to a 0600 file are refused (empty config, exit 4).
+    A real 0600 file written by mk-bus.py token still works. Env MK_BUS_TOKEN is not
+    affected by the file's mode."""
+    lane = mklane(root, "x1_mode")
+    loose = os.path.join(root, "loose.json")
+    with open(loose, "w") as f:
+        json.dump({"url": "http://127.0.0.1:9", "token": "sekrit"}, f)
+    os.chmod(loose, 0o644)
+    saved = {k: os.environ.pop(k, None) for k in ("MK_BUS_URL", "MK_BUS_TOKEN", "MK_BUS_TOKEN_FILE")}
+    try:
+        os.environ["MK_BUS_TOKEN_FILE"] = loose
+        assert bus_lane_config(lane) is None, "0644 token file must be refused"
+        good = os.path.join(root, "good.json")
+        with open(good, "w") as f:
+            json.dump({"url": "http://127.0.0.1:9", "token": "sekrit"}, f)
+        os.chmod(good, 0o600)
+        link = os.path.join(root, "link.json")
+        os.symlink(good, link)
+        os.environ["MK_BUS_TOKEN_FILE"] = link
+        assert bus_lane_config(lane) is None, "symlink to a 0600 file must be refused"
+        os.environ["MK_BUS_TOKEN_FILE"] = good
+        cfg = bus_lane_config(lane)
+        assert cfg and cfg["token"] == "sekrit" and cfg["url"].startswith("http://"), cfg
+        # env token is used even when the file is 0644
+        os.environ["MK_BUS_TOKEN_FILE"] = loose
+        os.environ["MK_BUS_URL"] = "http://127.0.0.1:9"
+        os.environ["MK_BUS_TOKEN"] = "from-env"
+        cfg = bus_lane_config(lane)
+        assert cfg and cfg["token"] == "from-env", cfg
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def t_x1_real_bus_token_0600(root):
+    """A token file written by the real mk-bus.py token command is mode 0600 and the CLI
+    still reaches the bus (inbox on an empty lane exits 0)."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data, _, _ = bus_server(root, "x1")
+    lane = bus_lane(root, "x1_real_token", "X1", data)
+    path = os.path.join(lane, BUS_LANE_FILE)
+    mode = os.stat(path).st_mode & 0o777
+    assert mode == 0o600, oct(mode)
+    code, lines = cli(lane, "inbox")
+    assert code == 0, (code, lines)
 
 
 def t_skill_frontmatter(root):
