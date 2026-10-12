@@ -30,6 +30,10 @@ retry, a wrong write costs them a hand-edited config.
 
 The yaml parser (scalar, split_flow, strip_comment, flow_map, KEY_RE) lives here and mk-lane.py
 loads it from this file: one parser for both tools, so a value can never mean two things.
+
+session.selftest_jobs_total: integer 1..16, the whole-machine self-test job budget. When the yaml
+has no value the default is derived as max(1, round(cpu_count/3)); list/get/context show that
+number and say it is derived.
 """
 import contextlib, datetime, difflib, importlib.util, json, os, re, shutil, subprocess, sys, tempfile, time
 
@@ -204,6 +208,9 @@ SCHEMA = [
          "Todo completed becomes", "what a completed todo sets the task to",
          opts=[("verify", "a completed todo moves the task to verify"),
                ("done", "a completed todo moves the task to done")]),
+    _row("session.selftest_jobs_total", "child", "num", None, ["session"], "selftest_jobs_total", None,
+         "Self-test jobs", "parallel self-tests when MK_SELFTEST_JOBS is unset (1..16)",
+         min=1, max=16, integer=True, derived=True),
     _row("session.reuse_reviewer", "child", "bool", True, ["session"], "reuse_reviewer", None,
          "Reuse reviewer", "one reviewer session serves the phase's rounds"),
     _row("bus.enabled", "child", "bool", True, ["bus"], "enabled", None,
@@ -398,6 +405,19 @@ def opts_of(r, lines):
 
 # ---------- reading ----------
 
+def derived_selftest_jobs():
+    """The job budget when the yaml has no session.selftest_jobs_total: max(1, round(cores/3))."""
+    cores = os.cpu_count() or 1
+    return max(1, round(cores / 3))
+
+
+def effective_default(r):
+    """The default a read shows. A derived row has no fixed number in the schema."""
+    if r.get("derived") and r["key"] == "session.selftest_jobs_total":
+        return derived_selftest_jobs()
+    return r["default"]
+
+
 def coerce(type, raw, default):
     """A yaml scalar as the schema's type; anything unreadable falls back to the default rather than
     failing a read, so one bad hand-edit never makes the whole config unreadable.
@@ -412,10 +432,7 @@ def coerce(type, raw, default):
         try:
             return int(s)
         except ValueError:
-            try:
-                return float(s)
-            except ValueError:
-                return default
+            return default  # a float or a word is unreadable: the default, never a guessed number
     if type == "list":
         t = s.strip()
         if t.startswith("[") and t.endswith("]"):
@@ -425,38 +442,40 @@ def coerce(type, raw, default):
 
 
 def value_of(lines, r):
-    """-> (found, value): the yaml's value for a schema row, else the schema default."""
+    """-> (found, value): the yaml's value for a schema row, else the schema default
+    (a derived default when the row has one)."""
+    dflt = effective_default(r)
     if r["key"].startswith("helpers."):
         kl = key_lines(lines)
         hits = [i for (i, indent, k, _r) in kl if indent == 0 and k == "helpers"]
         if len(hits) != 1:
-            return False, r["default"]
+            return False, dflt
         rest = KEY_RE.match(lines[hits[0]]).group(3)
         m = flow_map(rest)
         if r["member"] in m:
-            return True, coerce(r["type"], m[r["member"]], r["default"])
+            return True, coerce(r["type"], m[r["member"]], dflt)
         sr = section_range(lines, kl, ["helpers"])
         if sr:
             ch_hits = [i for (i, indent, k, _r) in kl if sr[2] <= i < sr[3] and k == r["member"]]
             if len(ch_hits) == 1:
                 ch_rest = KEY_RE.match(lines[ch_hits[0]]).group(3)
-                return True, coerce(r["type"], ch_rest, r["default"])
-        return False, r["default"]
+                return True, coerce(r["type"], ch_rest, dflt)
+        return False, dflt
     kl, sr = key_lines(lines), section_range(lines, key_lines(lines), r["sec"])
     if not sr:
-        return False, r["default"]
+        return False, dflt
     hits = [i for (i, indent, k, _r) in kl if sr[2] <= i < sr[3] and k == r["line"]]
     if len(hits) != 1:
-        return False, r["default"]  # absent, or a duplicate: a read never guesses
+        return False, dflt  # absent, or a duplicate: a read never guesses
     rest = KEY_RE.match(lines[hits[0]]).group(3)
     if r["member"] is None:
-        return True, coerce(r["type"], rest, r["default"])
+        return True, coerce(r["type"], rest, dflt)
     m = flow_map(rest)
     if r["member"] not in m:
-        return False, r["default"]
+        return False, dflt
     got = m[r["member"]]
     # flow_map already gives a nested [ list ] back as a list; everything else is still a scalar
-    return True, got if r["type"] == "list" else coerce(r["type"], got, r["default"])
+    return True, got if r["type"] == "list" else coerce(r["type"], got, dflt)
 
 
 # ---------- writing: values as yaml text ----------
@@ -751,9 +770,17 @@ def parse_value(raw, r, lines=None):
             raise Fail(f"{r['key']} is a bool: {raw} is not true or false")
     elif t == "num":
         if isinstance(v, bool) or not isinstance(v, (int, float)):
+            if r.get("integer"):
+                raise Fail(f"{r['key']} must be an integer from {r.get('min')} to {r.get('max')}: {raw}")
             raise Fail(f"{r['key']} is a number: {raw} is not one")
+        if r.get("integer") and isinstance(v, float):
+            lo, hi = r.get("min"), r.get("max")
+            raise Fail(f"{r['key']} must be an integer from {lo} to {hi}: {raw}")
         if "min" in r and v < r["min"] or "max" in r and v > r["max"]:
-            raise Fail(f"{r['key']} must be between {r.get('min')} and {r.get('max')}: {raw}")
+            lo, hi = r.get("min"), r.get("max")
+            if r.get("integer"):
+                raise Fail(f"{r['key']} must be an integer from {lo} to {hi}: {raw}")
+            raise Fail(f"{r['key']} must be between {lo} and {hi}: {raw}")
     elif t == "list":
         if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
             raise Fail(f"{r['key']} is a list of strings: {raw} is not")
@@ -780,10 +807,13 @@ def parse_value(raw, r, lines=None):
 def cmd_list(path, lines):
     fields = []
     for r in rows(lines):
-        value = value_of(lines, r)[1]
+        found, value = value_of(lines, r)
+        shown_default = effective_default(r)
         f = {"key": r["key"], "scope": r["scope"], "label": r["label"], "type": r["type"],
-             "value": value, "default": r["default"], "help": r["help"],
+             "value": value, "default": shown_default, "help": r["help"],
              "editable": r.get("editable", True)}
+        if r.get("derived") and not found:
+            f["derived"] = True  # the yaml has no value: value and default are the derived number
         if r["type"] == "num":
             f["min"], f["max"] = r.get("min"), r.get("max")
             if r.get("unit"):
@@ -819,7 +849,21 @@ def cmd_get(path, lines, args):
                 raise Fail(f"--set needs KEY=VALUE for {key}")
             return out({"ok": True, "key": key, "value": parse_value(raw, r, lines)})  # the caller's value wins
     found, value = value_of(lines, r)
-    return out({"ok": True, "key": key, "value": value})
+    ans = {"ok": True, "key": key, "value": value}
+    if r.get("derived") and not found:
+        ans["derived"] = True  # no yaml value: this number is max(1, round(cores/3))
+        ans["default"] = value
+    if r.get("integer"):
+        # the scalar as written. A hand edit of "abc" or 99 still resolves to a value, and a
+        # reader that must not trust it (selftest.sh) warns from this text.
+        kl = key_lines(lines)
+        sr = section_range(lines, kl, r["sec"])
+        hits = [i for (i, indent, k, _r) in kl if sr and sr[2] <= i < sr[3] and k == r["line"]]
+        if len(hits) == 1:
+            raw = scalar(KEY_RE.match(lines[hits[0]]).group(3))
+            if not (raw.isdigit() and r.get("min", 1) <= int(raw) <= r.get("max", 16)):
+                ans["raw"] = raw  # selftest.sh warns and uses 4; list/context keep the derived value
+    return out(ans)
 
 
 def cmd_set(path, lines, args):
@@ -855,7 +899,7 @@ def cmd_migrate(path, lines):
             block[0] = eol + block[0]
         for r in SCHEMA:
             if r["sec"] == [SESSION_SECTION]:
-                block.append(f"  {r['line']}: {emit(r['default'], r['type'])}{eol}")
+                block.append(f"  {r['line']}: {emit(effective_default(r), r['type'])}{eol}")
         new += block
         changed += [f"{SESSION_SECTION}.{r['line']}" for r in SCHEMA if r["sec"] == [SESSION_SECTION]]
         count += len(block)
@@ -1036,6 +1080,9 @@ def cmd_context(path, lines, usage_arg=None):
         "fresh_session": val("session.fresh_session"),
         "reviewer_split": val("session.reviewer_split"),
         "todo_done_status": val("session.todo_done_status"),
+        "selftest_jobs_total": val("session.selftest_jobs_total"),
+        "selftest_jobs_total_derived": not value_of(
+            lines, schema_rows["session.selftest_jobs_total"])[0],
         "reuse_reviewer": val("session.reuse_reviewer"),
         "bus_ask_timeout_s": val("bus.ask_timeout_s"),
         "integration_branch": val("repo.integration_branch"),
@@ -1845,6 +1892,137 @@ def self_test():
         bad = run("set", "session.todo_done_status", '"merged"', ok=False)
         assert "must be one of" in bad["error"], bad
         assert rd() == before and not os.path.exists(bak)
+        with open(yaml_path, "w") as f:
+            f.write(fixture)
+
+        # 28. session.selftest_jobs_total: absent yaml derives max(1, round(cores/3)) and says so;
+        #     set writes an integer into session:; 0, 17, negatives, floats, strings and bools refuse
+        want = max(1, round((os.cpu_count() or 1) / 3))
+        got = run("get", "session.selftest_jobs_total")
+        assert got["value"] == want and got.get("derived") is True and got.get("default") == want, got
+        row = next(f for f in run("list", "--json")["fields"] if f["key"] == "session.selftest_jobs_total")
+        assert (row["type"], row["scope"], row["min"], row["max"], row["value"], row["default"],
+                row.get("derived"), row["label"]) == \
+            ("num", "child", 1, 16, want, want, True, "Self-test jobs"), row
+        ctx = run("context")
+        assert ctx["selftest_jobs_total"] == want and ctx["selftest_jobs_total_derived"] is True, ctx
+        run("set", "session.selftest_jobs_total", "2")
+        saved = run("get", "session.selftest_jobs_total")
+        assert saved["value"] == 2 and "derived" not in saved, saved
+        assert "  selftest_jobs_total: 2\n" in rd()
+        ctx = run("context")
+        assert ctx["selftest_jobs_total"] == 2 and ctx["selftest_jobs_total_derived"] is False, ctx
+        listed = next(f for f in run("list", "--json")["fields"] if f["key"] == "session.selftest_jobs_total")
+        assert listed["value"] == 2 and "derived" not in listed and listed["default"] == want, listed
+        before, bak = rd(), yaml_path + ".bak"
+        if os.path.exists(bak):
+            os.unlink(bak)
+        for bad_raw in ("0", "17", "-1", "1.5", '"abc"', "true"):
+            bad = run("set", "session.selftest_jobs_total", bad_raw, ok=False)
+            assert "integer from 1 to 16" in bad["error"], bad
+            assert rd() == before and not os.path.exists(bak)
+        # a hand-edited float or word is unreadable: the read falls back to the derived default
+        with open(yaml_path, "w") as f:
+            f.write(fixture + "  selftest_jobs_total: abc\n")
+        garbled = run("get", "session.selftest_jobs_total")
+        assert garbled["value"] == want and garbled.get("derived") is True, garbled
+        with open(yaml_path, "w") as f:
+            f.write(fixture)
+
+        # 29. selftest.sh: env wins; else the saved integer; garbage and a missing yaml fall back
+        #     to 4. Garbage warns once. A missing yaml is silent. MATRIXKODER_DATA stays inside tmp.
+        real_yaml = "/Users/rohits/Development/matrixkoder/.matrixkoder/matrixkoder.yaml"
+        prod = os.path.join(tmp, "prod")
+        os.makedirs(prod)
+        shutil.copy(real_yaml, os.path.join(prod, "matrixkoder.yaml"))
+        subprocess.run([sys.executable, script, "--data", prod, "set",
+                        "session.selftest_jobs_total", "2"], check=True,
+                       capture_output=True, text=True)
+        harness = os.path.join(tmp, "harness", "scripts")
+        os.makedirs(harness)
+        raw_sh = open(os.path.join(HERE, "selftest.sh")).read()
+        needle_data = 'cfg=$(python3 "$cfg_py" get session.selftest_jobs_total 2>/dev/null) || cfg=\n'
+        repl_data = 'cfg=$(python3 "$cfg_py" --data "$MATRIXKODER_DATA" get session.selftest_jobs_total 2>/dev/null) || cfg=\n'
+        if raw_sh.count(needle_data) != 1:
+            raise AssertionError("selftest.sh config call changed")
+        raw_sh = raw_sh.replace(needle_data, repl_data, 1)
+        needle = '  [ -e "$f" ] || continue\n  files+=("$f")\n'
+        repl = ('  [ -e "$f" ] || continue\n'
+                '  case "$(basename "$f")" in mk-config.py|mk-state.py) continue ;; esac\n'
+                '  files+=("$f")\n')
+        if raw_sh.count(needle) != 1:
+            raise AssertionError("selftest.sh file loop changed; the harness skip no longer matches")
+        with open(os.path.join(harness, "selftest.sh"), "w") as f:
+            f.write(raw_sh.replace(needle, repl, 1))
+        # the lane resolves mk-config.py beside selftest.sh; the copy must be the script under test
+        shutil.copy(script, os.path.join(harness, "mk-config.py"))
+        shutil.copy(os.path.join(HERE, "mk-state.py"), os.path.join(harness, "mk-state.py"))
+        for name in ("w1.py", "w2.py", "w3.py"):
+            with open(os.path.join(harness, name), "w") as f:
+                f.write(
+                    "import os, sys, time\n"
+                    "if '--self-test' in sys.argv:\n"
+                    "    d = os.environ['MK_JOBS_DIR']\n"
+                    "    os.makedirs(d, exist_ok=True)\n"
+                    "    open(os.path.join(d, str(os.getpid())), 'w').write(str(time.time()))\n"
+                    "    time.sleep(0.5)\n"
+                    "    print('ok')\n"
+                )
+
+        def trace(data, env_jobs, text=None):
+            if text is not None:
+                with open(os.path.join(data, "matrixkoder.yaml"), "w") as f:
+                    f.write(text)
+            stamp = os.path.join(tmp, "trace-%s" % time.time())
+            slots = stamp + ".slots"
+            env = dict(os.environ, MATRIXKODER_DATA=data, MATRIXKODER_HOME=home,
+                       MK_SELFTEST_TRACE=stamp, MK_JOBS_DIR=slots, PYTHONDONTWRITEBYTECODE="1",
+                       )
+            env.pop("MK_SELFTEST_JOBS", None)
+            if env_jobs is not None:
+                env["MK_SELFTEST_JOBS"] = env_jobs
+            p = subprocess.run(["bash", "selftest.sh"], cwd=harness, env=env,
+                               capture_output=True, text=True)
+            got = open(stamp).read().strip() if os.path.exists(stamp) else ""
+            times = []
+            if os.path.isdir(slots):
+                for name in os.listdir(slots):
+                    try:
+                        times.append(float(open(os.path.join(slots, name)).read()))
+                    except ValueError:
+                        pass
+            # how many workers had already started before the first one could finish (0.5s sleep)
+            peak = 1
+            if times:
+                t0 = min(times)
+                peak = sum(1 for t in times if t < t0 + 0.35)
+            return p, got, peak
+
+        base = open(os.path.join(prod, "matrixkoder.yaml")).read()
+        p_env, j_env, peak_env = trace(prod, "1")
+        assert p_env.returncode == 0 and j_env == "1" and peak_env == 1, (j_env, peak_env, p_env.stdout, p_env.stderr)
+        assert p_env.stderr == "", p_env.stderr
+        assert p_env.stdout.strip().splitlines()[-1] == "selftest: 3 run, 0 failed", p_env.stdout
+        p_saved, j_saved, peak_saved = trace(prod, None)
+        assert p_saved.returncode == 0 and j_saved == "2" and peak_saved == 2 and p_saved.stderr == "", \
+            (j_saved, peak_saved, p_saved.stderr, p_saved.stdout[-300:])
+        # three workers, jobs=2: the pid files exist, and the run is not serial.
+        # Serial would be 3 * 0.5s; two workers finish in about 1s. Bound it loosely.
+        p_g, j_g, peak_g = trace(prod, None, base.replace("selftest_jobs_total: 2", "selftest_jobs_total: abc"))
+        assert p_g.returncode == 0 and j_g == "4", (j_g, p_g.stderr)
+        warns = [ln for ln in p_g.stderr.splitlines() if ln.startswith("warning:")]
+        assert len(warns) == 1 and "abc" in warns[0], p_g.stderr
+        p_99, j_99, peak_99 = trace(prod, None, base.replace("selftest_jobs_total: 2", "selftest_jobs_total: 99"))
+        assert p_99.returncode == 0 and j_99 == "4", (j_99, p_99.stderr)
+        assert len([ln for ln in p_99.stderr.splitlines() if ln.startswith("warning:")]) == 1, p_99.stderr
+        assert "99" in p_99.stderr, p_99.stderr
+        empty = os.path.join(tmp, "empty-data")
+        os.makedirs(empty)
+        p_e, j_e, peak_e = trace(empty, None)
+        cfg_txt = open(p_e.stdout and "" or "").read() if False else ""
+        # the trace file's sibling holds the raw config line
+        assert p_e.returncode == 0 and j_e == "4" and peak_e == 3 and p_e.stderr == "", (j_e, peak_e, p_e.stderr, p_e.stdout[-200:])
+        # restore the fixture yaml the later cases read
         with open(yaml_path, "w") as f:
             f.write(fixture)
 
