@@ -138,7 +138,11 @@ def last_change_min(lane, since=0.0):
 # An error line counts when it starts with "Error:" / "API Error:" / "Upstream request failed:",
 # holds "retrying in", or holds an HTTP status inside an API error block.
 # What stays undetectable: a real wall the agent quotes mid-sentence ("the usage limit reached
-# branch is covered"), and a real banner whose line also holds a double quote (CODE_LINE_RE).
+# branch is covered"), a line that STARTS with "Error:" but is prose ("Error: unauthorized
+# handling is now fixed"), a mid-line "hit your limit" ("So I hit your limit detection fix"),
+# a wall whose lead word is not "Claude" ("Claude Code: usage limit reached" — _QUOTA_LEAD
+# accepts only that one lead word), and a real banner whose line also holds a double quote
+# (CODE_LINE_RE).
 _QUOTA_LEAD = r"(?:(?:usage|weekly|week|5-hour|5h|hourly|daily|session|plan|individual)\s+(?:limit|quota)\s+(?:reached|hit|exceeded)|quota\s+(?:reached|exceeded)|(?:free\s+)?usage\s+exceeded)"
 _QUOTA_FREE = r"(?:hit|reached)\s+your\s+(?:usage\s+|weekly\s+|5-hour\s+)?limit|reached\s+your\s+pro\s+5-hour\s+limit"
 BANNER_RE = re.compile(
@@ -424,8 +428,10 @@ def self_test_body(shutil):
                 "Error: 401 Unauthorized"):
         assert classify(msg, "working", 1, 10)[0] == "OK", (msg, classify(msg, "working", 1, 10))
     # a real sanitized pane whose tool output carries the trigger words: no verdict
-    fx = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "pane-working.txt")
-    assert classify(open(fx).read(), "working", 1, 10)[0] == "OK", fx
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name in ("pane-working.txt", "pane-live-1.txt", "pane-live-2.txt"):
+        fx = os.path.join(here, "fixtures", name)
+        assert classify(open(fx).read(), "working", 1, 10)[0] == "OK", fx
 
     # A1 R3: a banner-shaped line inside a bar-drawn command (`  ┃  $ ...`) is tool output.
     # These fail when _tool_block is stubbed to return False.

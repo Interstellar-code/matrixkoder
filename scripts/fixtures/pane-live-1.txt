@@ -1,0 +1,63 @@
+# sanitised read-only capture of a working builder pane (wV:p9), 2026-10-12
+  ┃  py arm --lane /tmp/work --pane
+  ┃  wD:nb --task NB --run r1 --data /tmp/work
+  ┃  h3ww_x6m/data --phase P1 --commit-grep feat\(p1\)
+  ┃
+
+     It’s arming NB now, so the assertion is next. I’ll wait for the log.
+
+  ┃
+  ┃  $ while ps -p 00000 >/dev/null 2>&1; do sleep 15; done; wc -c /tmp/d7b3-ev9.log; tail -n 12 /tmp/d7b3-ev9.lo
+  ┃  g
+  ┃
+  ┃  (5 earlier lines)
+  ┃    File "/home/builder/Development/matrixkoder-mk-1/scripts/mk-lane-event.py", line 2683, in main
+  ┃      return self_test()
+  ┃    File "/home/builder/Development/matrixkoder-mk-1/scripts/mk-lane-event.py", line 2559, in self_test
+  ┃      raise AssertionError("stdout=%s stderr=%s" % (_rr.stdout[-400:], _rr.stderr[-400:]))
+  ┃  AssertionError: stdout={"ok": true, "delivered": true, "pane": "wD:nb", "agent_status": "idle",
+  ┃  "timeout_ms": 00000, "attempts": 1, "herdr_error": "{\"result\": {\"agent\": {\"agent_status\": \"idle\"}}}
+  ┃  ", "pane_entry": null, "fresh_session": null, "building": ["NB"]}
+  ┃   stderr=
+  ┃
+
+     The debug line never printed and stderr is empty, so this process is not running the edited branch. I’ll
+     confirm the edit is in the file the suite loads.
+
+  ┃
+  ┃  $ rg -n "MK_DEBUG_CONNECT" scripts/mk-lane-event.py; echo '---'; sed -n '848,870p' scripts/mk-lane-event.py
+  ┃
+  ┃  (20 earlier lines)
+  ┃                  # the full prompt is kept; the reply says why the doorbell was not typed
+  ┃                  a = list(a) + ["--publish-error", publish_error]
+  ┃      role = opt(a, "--role", "build")
+  ┃      if role not in ("build", "review"):
+  ┃          fail("--role must be build or review")
+  ┃      round_kind = opt(a, "--kind", "build")
+  ┃
+
+     The edit is in the file, but the child never printed it. I’ll log before the condition so the next run shows
+     whether the pane was armed.
+
+  ┃
+  ┃  $ python3 << 'PY'
+  ┃  from pathlib import Path…
+  ┃
+  ┃  enter
+  ┃
+
+     The next run logs whether the pane was armed. I’ll rerun.
+
+  ┃
+  ┃  $ nohup python3 -u scripts/mk-lane-event.py --self-test > /tmp/d7b3-ev10.log 2>&1 & echo $! > /tmp/d7b3-ev10
+  ┃  .pid; echo ev $(cat /tmp/d7b3-ev10.pid)
+  ┃
+  ┃  ev 2802
+  ┃
+
+  ┃
+  ┃
+  ┃
+  ┃  Build auto · Manifest Auto Manifest · high
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ⬝⬝⬝⬝⬝⬝⬝⬝ esc interrupt                                                           121.9K (61%)  ctrl+p commands
