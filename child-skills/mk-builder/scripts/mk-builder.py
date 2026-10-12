@@ -3677,6 +3677,9 @@ def t_d7_one_ack_per_answer(root):
         code, lines = cli(lane, "ask", "which schema?", "--timeout", str(int(poll_for)))
     finally:
         th.join(poll_for + 5)
+    # "ask already answered" needs two answer POSTs; cmd_ask posts one ask and
+    # the thread posts one answer, so a one-off comes from two runs sharing one
+    # store (overlapping runs fall back to the shared MK-home bus.json), not from this code.
     assert errors.empty(), errors.get()
     assert code == 0 and lines == ["the schema is v2"], (code, lines)
     code, lines = cli(lane, "inbox")
@@ -4103,14 +4106,26 @@ def t_x1_slow_drip_body_honours_budget(root):
     begin(lane, root)
     env = {"MK_BUS_URL": f"http://127.0.0.1:{port}", "MK_BUS_TOKEN": "sekrit"}
     before = _x1_rss_kb()
-    # one measured spawn plus a real round trip (inbox against this peer, which
-    # answers /health immediately and then drips). The absolute deadline is what
-    # cuts the drip: a path with no deadline runs for the whole 60 s body.
-    b0 = time.time()
-    cli(lane, "inbox", env=env)
-    baseline = max(0.25, time.time() - b0)
-    inbox_bound = max(3.0, 4 * baseline)
-    ask_bound = max(6.5, 5 + 4 * baseline)
+    # Baseline from a NORMAL fast peer (one real-bus progress round trip, as in
+    # t_d7_one_ack_per_answer), never from the drip peer itself: measuring
+    # against the drip peer stretches the baseline to the whole 60 s body on a
+    # path without the absolute deadline, and the scaled bound grows with it.
+    # Without the absolute deadline each run below takes the full 60 s drip
+    # (do_GET/do_POST loop 60 x 1 s; cli_raw timeout is 180 s), which exceeds
+    # the 20 s hard cap, so the case still fails on that regression path.
+    if os.path.isfile(MK_BUS_PY):
+        _data, _, _ = bus_server(root, "x1dripbase")
+        _blane = bus_lane(root, "x1_drip_baseline", "X1D", _data)
+        begin(_blane, root, run=BUS_RUN, task="X1D")
+        b0 = time.time()
+        cli(_blane, "progress", "work")
+        baseline = max(0.25, time.time() - b0)
+    else:
+        b0 = time.time()
+        subprocess.run([sys.executable, "-c", "pass"], capture_output=True, timeout=30)
+        baseline = max(0.25, time.time() - b0)
+    inbox_bound = min(20.0, max(3.0, 4 * baseline))
+    ask_bound = min(20.0, max(6.5, 5 + 4 * baseline))
     try:
         t0 = time.time()
         code, lines = cli(lane, "inbox", env=env)
