@@ -14,7 +14,7 @@ Do NOT touch: <list>
 
 ## Commands (wait for each)
 - Install: `<cmd>`
-- Tests: `<scoped test cmd>` (known unrelated failures: <list or none>)
+- Tests: `<the self-tests of the changed scripts only, one command each, e.g. python3 scripts/<name>.py --self-test>` (known unrelated failures: <list or none>). Not the full suite unless this line says so; mk-builder skill R33.
 - Types: `<typecheck cmd>` must stay at **<baseline>**; nothing new in <owned paths>
 - Lint/format ONLY changed files: `<lint cmd> <files>`, `<format cmd> <files>` — never repo-wide
 - Banned commands (repo list): <banned commands>

@@ -145,6 +145,20 @@ checkable contract. Rules whose remainder stays per-brief say **(B)** and carry 
   matching older rounds (lesson #41, `skills/matrixkoder/reference/lessons.md:45`) — the round
   number is the fix.
 
+- **R33. (new, user 2026-10-12)** Scope every test run to your diff. Take `git diff --name-only`
+  against your base and run ONLY the self-tests of the scripts you changed
+  (`python3 scripts/<name>.py --self-test`, or the file's own test runner) and the tests that read
+  the files you changed (`grep -rl <file> scripts hooks child-skills`). Run `claude plugin test .`
+  and the typecheck only when a `.ts`/`.tsx` file or plugin metadata changed. Do NOT run
+  `bash scripts/selftest.sh` (all suites) unless the brief names it for this round. One run per
+  command; no loops, no retries to make a flaky case pass, no CPU burners; a failing case is first
+  run alone and read before any rerun. In the report list the commands you ran and why each is in
+  scope; write one line for every suite you did not run ("not run: not in my diff").
+  **Why:** the machine also runs the user's 24 h Hermes agent (swap 94 % used, load 55 to 70 with
+  five lanes testing). The plan and the brief used to name `selftest.sh`, so every lane ran all 19
+  suites on every round. **Check:** the report names only suites of the changed files; the run
+  shows no `selftest.sh` unless the brief asked for it.
+
 ## 3. Reviewer rules
 
 - **R15.** Review read-only: you write ONLY `<lane>/.matrixkoder-review-rN.md` — no code edits,

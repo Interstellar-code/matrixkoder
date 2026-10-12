@@ -9,7 +9,7 @@ integration = "mk/<feature>/integration"  # optional: branch the lanes merge int
 [gates]                                   # full-suite gates the orchestrator reruns at merge and QA; scoped forms go in briefs
 test = "<test cmd>"                       # e.g. pnpm vitest run
 typecheck = "<typecheck cmd>"             # e.g. pnpm exec tsc --noEmit
-selftest = "<selftest cmd>"               # e.g. bash scripts/selftest.sh
+selftest = "<self-test cmd of the changed scripts>"  # e.g. python3 scripts/<name>.py --self-test; the full bash scripts/selftest.sh runs once on the integration tip, not per task
 validate = "<validate cmd>"               # e.g. claude plugin validate .
 
 [[phase]]                                 # one block per phase; phases in one wave must own disjoint files
