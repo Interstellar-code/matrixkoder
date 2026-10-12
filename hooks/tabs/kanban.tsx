@@ -41,6 +41,10 @@ export type KanbanView = {
   filters: KanbanFilters
   /** set when the last cards call was slower than 100 ms (read every 2nd tick) */
   slow: boolean
+  /** one short line when the last cards read failed; last good cards stay */
+  error: string | null
+  /** true when `error` is set and the cards shown are from an earlier good read */
+  stale: boolean
 }
 
 const ATTENTION = ['blocked', 'stalled', 'quota', 'provider'] as const
@@ -98,6 +102,8 @@ export function kanbanView(cards: readonly KanbanCard[], filters: KanbanFilters,
     projects,
     filters,
     slow,
+    error: null,
+    stale: false,
   }
 }
 
@@ -109,7 +115,7 @@ export function kanbanFixtureView(filters: KanbanFilters = { needsYou: false, pr
 }
 
 export function emptyKanbanView(): KanbanView {
-  return { mock: false, empty: true, columns: KANBAN_COLUMNS, cards: [], projects: [], filters: { needsYou: false, project: null }, slow: false }
+  return { mock: false, empty: true, columns: KANBAN_COLUMNS, cards: [], projects: [], filters: { needsYou: false, project: null }, slow: false, error: null, stale: false }
 }
 
 const cut = (text: string, w: number): string => {
@@ -167,15 +173,19 @@ export function KanbanTab(els: Els, view: KanbanView, cols: number, nowIso: stri
     )
   }
   const compact = cols < NARROW
+  const errorLine = view.error == null || view.error === ''
+    ? null
+    : cut(`⚠ ${view.stale ? 'stale · ' : ''}${view.error}`, width)
   const inner = Math.max(8, width - (compact ? 0 : 2))
   return (
     <Box flexDirection="column" width={cols}>
       {view.mock ? <Text bold={true} color="warning">MOCK · fixture data · not this run</Text> : null}
+      {errorLine != null ? <Text color="yellow" bold={true}>{errorLine}</Text> : null}
       <Text dimColor={true}>{cut(
         `Needs you ${view.filters.needsYou ? 'on' : 'off'} · project ${view.filters.project ?? 'all'}${view.slow ? ' · slow' : ''}`,
         width,
       )}</Text>
-      {view.columns.map(col => {
+      {(view.error != null && view.cards.length === 0 ? [] : view.columns).map(col => {
         const rows = view.cards.filter(card => columnOf(card) === col)
         const head = `${col} ${String(rows.length)}`
         return (
@@ -189,13 +199,35 @@ export function KanbanTab(els: Els, view: KanbanView, cols: number, nowIso: stri
   )
 }
 
-export type CardsRead = { cards: KanbanCard[]; ms: number; skipped: boolean; empty: boolean }
+export type CardsRead = {
+  cards: KanbanCard[]
+  ms: number
+  skipped: boolean
+  empty: boolean
+  /** set on a failed read; cards stay empty so the caller keeps the last good set */
+  error: string | null
+}
+
+/** One short line for a failed cards read. Never the raw traceback. */
+export function cardsErrorLine(kind: 'exit' | 'json' | 'ok' | 'spawn' | 'timeout', detail?: string): string {
+  if (kind === 'timeout') return 'cards read timed out'
+  if (kind === 'spawn') return 'cards read failed: cannot run mkdb'
+  if (kind === 'json') return 'cards read failed: not JSON'
+  if (kind === 'ok') {
+    const why = (detail ?? '').replace(/\s+/g, ' ').trim().slice(0, 60)
+    return why === '' ? 'cards read failed' : `cards read failed: ${why}`
+  }
+  return 'cards read failed: mkdb exited'
+}
 
 /**
  * One cards read for a dashboard tick.
  * `homeHasStore` must be checked by the caller (or passed false): a missing
  * root store returns empty and does not invoke `run`, so mkdb cannot create it.
- * When the previous read took longer than 100 ms, every other tick is skipped.
+ * A non-zero exit, non-JSON stdout, `{"ok": false}`, a thrown spawn or a
+ * timeout sets `error` and returns no cards (the caller keeps the last good
+ * set). When the previous read took longer than 100 ms, every other tick is
+ * skipped.
  */
 export async function readCards(
   run: RunFn,
@@ -205,18 +237,33 @@ export async function readCards(
   tick: number,
   lastMs: number,
 ): Promise<CardsRead> {
-  if (home == null || !homeHasStore) return { cards: [], ms: 0, skipped: true, empty: true }
-  if (lastMs > 100 && tick % 2 === 1) return { cards: [], ms: lastMs, skipped: true, empty: false }
+  const fail = (error: string, ms: number): CardsRead => ({ cards: [], ms, skipped: false, empty: false, error })
+  if (home == null || !homeHasStore) return { cards: [], ms: 0, skipped: true, empty: true, error: null }
+  if (lastMs > 100 && tick % 2 === 1) return { cards: [], ms: lastMs, skipped: true, empty: false, error: null }
   const argv = ['python3', `${pluginRoot}/scripts/mkdb.py`, '--home', home, 'cards', '--json']
   const started = Date.now()
-  const result = await run(argv, { timeoutMs: 5_000 })
-  const ms = Date.now() - started
-  let cards: KanbanCard[] = []
+  let result: { stdout?: string; code?: number }
   try {
-    const parsed = JSON.parse(result.stdout ?? '') as CardsPayload
-    if (Array.isArray(parsed.cards)) cards = [...parsed.cards]
-  } catch {
-    cards = []
+    result = await run(argv, { timeoutMs: 5_000 })
+  } catch (err) {
+    const ms = Date.now() - started
+    const msg = err instanceof Error ? err.message : String(err)
+    if (/timed out|timeout/i.test(msg)) return fail(cardsErrorLine('timeout'), ms)
+    return fail(cardsErrorLine('spawn'), ms)
   }
-  return { cards, ms, skipped: false, empty: false }
+  const ms = Date.now() - started
+  if (result.code !== 0 && result.code != null) return fail(cardsErrorLine('exit'), ms)
+  const stdout = result.stdout ?? ''
+  if (stdout.trim() === '') return fail(cardsErrorLine('json'), ms)
+  let parsed: CardsPayload
+  try {
+    parsed = JSON.parse(stdout) as CardsPayload
+  } catch {
+    return fail(cardsErrorLine('json'), ms)
+  }
+  if (parsed == null || typeof parsed !== 'object' || parsed.ok !== true) {
+    return fail(cardsErrorLine('ok', typeof parsed?.error === 'string' ? parsed.error : ''), ms)
+  }
+  const cards = Array.isArray(parsed.cards) ? [...parsed.cards] : []
+  return { cards, ms, skipped: false, empty: false, error: null }
 }

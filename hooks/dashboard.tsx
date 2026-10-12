@@ -34,8 +34,8 @@ import {
 import type { RunFn, SavePayload, YamlFieldIn } from './settings-io'
 import { UsageTab, usageView } from './tabs/usage'
 import { WaitingTab, waitingView } from './tabs/waiting'
-import { KanbanTab, kanbanView, readCards, emptyKanbanView, kanbanFixtureView } from './tabs/kanban'
-import type { KanbanCard, KanbanFilters } from './tabs/kanban'
+import { KanbanTab, kanbanView, readCards, emptyKanbanView, kanbanFixtureView, cardsErrorLine } from './tabs/kanban'
+import type { KanbanCard, KanbanFilters, CardsRead } from './tabs/kanban'
 import { chipText, toastsFor } from './status'
 
 // atoms are file-local consts (the scan reads this file's own consts); the
@@ -733,6 +733,8 @@ const CARDS_KEY = 'kanban:cards'
 const CARDS_MS_KEY = 'kanban:ms'
 const CARDS_TICK_KEY = 'kanban:tick'
 const CARDS_EMPTY_KEY = 'kanban:empty'
+const CARDS_ERROR_KEY = 'kanban:error'
+const CARDS_STALE_KEY = 'kanban:stale'
 
 function kanbanFiltersOf(view: Record<string, string>): KanbanFilters {
   return {
@@ -747,7 +749,8 @@ function kanbanPaneView(view: Record<string, string>) {
   // Anything else with no store, or before the first tick, is the empty state —
   // never the fixture cards.
   if (view['kanban:mock'] === '1') return kanbanFixtureView()
-  if (view[CARDS_EMPTY_KEY] === '1' || (view[CARDS_KEY] ?? '') === '') return emptyKanbanView()
+  const err = view[CARDS_ERROR_KEY] ?? ''
+  if ((view[CARDS_EMPTY_KEY] === '1' || (view[CARDS_KEY] ?? '') === '') && err === '') return emptyKanbanView()
   let cards: KanbanCard[] = []
   try {
     const parsed = JSON.parse(view[CARDS_KEY] ?? '[]') as unknown
@@ -755,15 +758,49 @@ function kanbanPaneView(view: Record<string, string>) {
   } catch {
     cards = []
   }
-  return kanbanView(cards, kanbanFiltersOf(view), new Date().toISOString(), Number(view[CARDS_MS_KEY] ?? '0') > 100)
+  const viewOut = kanbanView(cards, kanbanFiltersOf(view), new Date().toISOString(), Number(view[CARDS_MS_KEY] ?? '0') > 100)
+  if (err === '') return viewOut
+  return { ...viewOut, error: err, stale: view[CARDS_STALE_KEY] === '1' }
 }
 
 /**
  * One `mkdb.py cards --json` per dashboard tick. The root file is checked with
  * fs.exists first: a missing ~/.matrixkoder/mk.db (or $MK_HOME/mk.db) never
- * spawns mkdb, which would create the store. A read slower than 100 ms skips
- * every other tick.
+ * spawns mkdb, which would create the store. The read is started and not
+ * awaited, so a slow cards call cannot hold the tick; one read is in flight
+ * at most (the 5 s timeout lives in readCards). A read slower than 100 ms
+ * still skips every other tick.
  */
+let cardsInFlight = false
+
+function applyCardsRead(
+  prev: Record<string, string>,
+  tick: number,
+  lastMs: number,
+  got: CardsRead,
+): Record<string, string> {
+  const had = (prev[CARDS_KEY] ?? '') !== ''
+  if (got.error != null) {
+    return {
+      ...prev,
+      [CARDS_TICK_KEY]: String(tick),
+      [CARDS_MS_KEY]: String(got.ms),
+      [CARDS_ERROR_KEY]: got.error,
+      [CARDS_STALE_KEY]: had ? '1' : '0',
+      [CARDS_EMPTY_KEY]: '0',
+    }
+  }
+  return {
+    ...prev,
+    [CARDS_TICK_KEY]: String(tick),
+    [CARDS_MS_KEY]: String(got.skipped ? lastMs : got.ms),
+    [CARDS_EMPTY_KEY]: got.empty ? '1' : '0',
+    [CARDS_ERROR_KEY]: '',
+    [CARDS_STALE_KEY]: '0',
+    ...(got.skipped ? {} : { [CARDS_KEY]: JSON.stringify(got.cards) }),
+  }
+}
+
 async function refreshCards($: EngineInterface): Promise<void> {
   // storeHome is MK_HOME when set, otherwise $HOME/.matrixkoder. Both the
   // exists-check and the --home handed to mkdb use that directory: cards()
@@ -789,24 +826,36 @@ async function refreshCards($: EngineInterface): Promise<void> {
   const tick = Number(view[CARDS_TICK_KEY] ?? '0') + 1
   const lastMs = Number(view[CARDS_MS_KEY] ?? '0')
   const run = (argv: readonly string[], init?: { timeoutMs?: number }) => $.process.run([...argv], init)
-  let got
-  try {
-    got = await readCards(
-      async (argv, init) => {
-        const r = await run(argv, init)
-        return { stdout: r.stdout, code: r.exitCode }
-      },
-      $.plugin.root, storeHome, exists, tick, lastMs)
-  } catch {
-    return // a refused exists/run must not kill the refresh tick
+  // A missing store is synchronous inside readCards (no spawn). Record it
+  // before returning so the pane can show "no store yet" on this tick.
+  if (storeHome == null || !exists) {
+    const got = await readCards(async () => ({ stdout: '', code: 0 }), $.plugin.root, storeHome, exists, tick, lastMs)
+    await update($, viewStateAtom, prev => applyCardsRead(prev, tick, lastMs, got))
+    return
   }
-  await update($, viewStateAtom, prev => ({
-    ...prev,
-    [CARDS_TICK_KEY]: String(tick),
-    [CARDS_MS_KEY]: String(got.skipped ? lastMs : got.ms),
-    [CARDS_EMPTY_KEY]: got.empty ? '1' : '0',
-    ...(got.skipped ? {} : { [CARDS_KEY]: JSON.stringify(got.cards) }),
-  }))
+  // A slow or failed read must not hold this tick. One read in flight.
+  if (cardsInFlight) {
+    await update($, viewStateAtom, prev => ({ ...prev, [CARDS_TICK_KEY]: String(tick) }))
+    return
+  }
+  cardsInFlight = true
+  const started = Date.now()
+  void readCards(
+    async (argv, init) => {
+      const r = await run(argv, init)
+      return { stdout: r.stdout, code: r.exitCode }
+    },
+    $.plugin.root, storeHome, exists, tick, lastMs,
+  ).then(async got => {
+    const ms = Math.max(got.ms, Date.now() - started)
+    await update($, viewStateAtom, prev => applyCardsRead(prev, tick, lastMs, { ...got, ms }))
+  }).catch(async () => {
+    await update($, viewStateAtom, prev => applyCardsRead(prev, tick, lastMs, {
+      cards: [], ms: Date.now() - started, skipped: false, empty: false, error: cardsErrorLine('spawn'),
+    }))
+  }).finally(() => {
+    cardsInFlight = false
+  })
 }
 
 /** Never throws: a failing load keeps the last good snapshot and flags the error. */
