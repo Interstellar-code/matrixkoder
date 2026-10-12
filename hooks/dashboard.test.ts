@@ -2339,3 +2339,33 @@ test('the waiting tick feeds the tab: live, empty, down, then the fixture', () =
   const garbage = waitingPane({ 'waiting:src': 'live', 'waiting:pending': '{not json' })
   expect(garbage.asks).toEqual([])
 })
+
+// D8B R3: a slow pending read must not stack. The mock holds the promise, so
+// four ticks later exactly one call is outstanding; releasing it lets the next
+// tick start exactly one more.
+test('a slow pending read stays one in flight across four ticks', { plugins: [worldFixtures] }, async ($, on) => {
+  const held: Array<(v: { value: { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean; isStderrTruncated: boolean } }) => void> = []
+  let started = 0
+  const clock = mockWorld(on, {
+    process: argv => {
+      if (!argv.includes('pending')) return undefined
+      started += 1
+      return new Promise<{ value: { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean; isStderrTruncated: boolean } }>(resolve => {
+        held.push(resolve)
+      })
+    },
+  })
+  mockFs(on, worldFiles())
+  await $.session.start(sessionStart())
+  for (let i = 0; i < 4; i++) {
+    await clock.advance(5000)
+    for (let j = 0; j < 5; j++) await clock.advance(0)
+  }
+  expect(started, 'one read outstanding after four ticks').toBe(1)
+  expect(held).toHaveLength(1)
+  held[0]?.({ value: { exitCode: 0, stdout: '{"ok":true,"run":"*","pending":[]}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+  for (let j = 0; j < 10; j++) await clock.advance(0)
+  await clock.advance(5000)
+  for (let j = 0; j < 5; j++) await clock.advance(0)
+  expect(started, 'the next tick starts exactly one new read').toBe(2)
+})

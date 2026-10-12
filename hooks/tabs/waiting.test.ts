@@ -7,7 +7,7 @@
 import { test, expect } from 'claude-code/testing'
 import type { Elements } from 'claude-code'
 import { mockFs, mockWorld, paneProps, sessionStart, worldFiles, worldFixtures } from './../testkit'
-import { ASK_CAP, WaitingTab, askKey, askView, emptyWaitingView, optionChipRole, readPending, runWaitView, waitingActions, waitingAsks, waitingMoreKey, waitingPick, waitingPickKey, waitingView } from './waiting'
+import { ASK_CAP, WaitingTab, askKey, askView, cellWidth, emptyWaitingView, optionChipRole, readPending, runWaitView, waitingActions, waitingAsks, waitingMoreKey, waitingPick, waitingPickKey, waitingView } from './waiting'
 import type { PendingAsk, RunFn, TabUi, WaitOption } from './waiting'
 import { PENDING_CAPTURED } from './waiting.pending.fixture'
 import { ROLE } from './palette'
@@ -407,6 +407,18 @@ test('50 asks cap at 8 cards plus a +N more row, and long, unicode and odd ids f
     const texts = allOf(tree, 'Text').map(t => text(t))
     expect(texts.filter(t => t.startsWith('m-')).length, 'capped').toBeLessThanOrEqual(ASK_CAP)
     expect(texts.some(t => t.includes('+') && t.includes('more')), 'the overflow row').toBe(true)
+  }
+})
+
+test('CJK and emoji text fits the pane in terminal cells', () => {
+  const ask: PendingAsk = { id: 'm-1', run: 'r1', task: 'T1', text: '質問'.repeat(30), ts: NOW }
+  const emoji: PendingAsk = { id: 'm-2', run: 'r1', task: 'T1', text: '🤔'.repeat(40), ts: NOW }
+  for (const cols of [46, 36]) {
+    for (const one of [ask, emoji]) {
+      const tree = waitingAsks(stubEls(), [one], cols, NOW)
+      const widest = Math.max(...allOf(tree, 'Text').map(t => cellWidth(text(t))))
+      expect(widest, `${String(cols)} cols`).toBeLessThanOrEqual(cols)
+    }
   }
 })
 

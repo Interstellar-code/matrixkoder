@@ -737,7 +737,6 @@ function contentSig(snap: MkSnapshot): string {
  *  (no tick yet, so the tab still shows the fixture). */
 const PENDING_KEY = 'waiting:pending'
 const PENDING_SRC_KEY = 'waiting:src'
-const PENDING_TICK_KEY = 'waiting:tick'
 
 export function waitingPane(view: Record<string, string>): { src: string; asks: PendingAsk[] } {
   let asks: PendingAsk[] = []
@@ -764,31 +763,30 @@ export function waitingPaneView(pane: { src: string; asks: PendingAsk[] }, runWa
 
 /** One `mk-bus.py pending` per dashboard tick, for the active project's data dir.
  *  Never starts a bus and never creates a file: `readPending` only runs the
- *  injected command. The in-flight guard is the tick counter on the view state,
- *  not a module flag: a tick whose number is already recorded has a read in
- *  flight or done, so a second call for the same tick returns. */
+ *  injected command. The read is fired and not awaited, like `refreshCards`, so
+ *  a slow one cannot hold the tick; `pendingInFlight` is set before it starts
+ *  and cleared in `finally`, so a tick that finds the previous read still
+ *  running skips instead of stacking another process. */
+let pendingInFlight = false
+
 async function refreshPending($: EngineInterface, cwd: string): Promise<void> {
-  const view = await read($, viewStateAtom)
-  const tick = String(Number(view[PENDING_TICK_KEY] ?? '0') + 1)
-  const current = await read($, viewStateAtom)
-  if (current[PENDING_TICK_KEY] === tick) return
-  await update($, viewStateAtom, prev => (
-    prev[PENDING_TICK_KEY] === tick ? prev : { ...prev, [PENDING_TICK_KEY]: tick }
-  ))
+  if (pendingInFlight) return
+  pendingInFlight = true
   const dataDir = await resolveDataDir($, cwd, await homeDir($)).catch(() => null)
   const run = (argv: readonly string[], init?: { timeoutMs?: number }) =>
     $.process.run([...argv], init).then(r => ({ stdout: r.stdout, code: r.exitCode }))
-  try {
-    const got = await readPending(run, $.plugin.root, dataDir)
+  void readPending(run, $.plugin.root, dataDir).then(async got => {
     if (!got.live && !got.down) return
     await update($, viewStateAtom, prev => ({
       ...prev,
       [PENDING_SRC_KEY]: got.down ? 'down' : 'live',
       ...(got.live ? { [PENDING_KEY]: JSON.stringify(got.asks) } : {}),
     }))
-  } catch {
+  }).catch(async () => {
     await update($, viewStateAtom, prev => ({ ...prev, [PENDING_SRC_KEY]: 'down' }))
-  }
+  }).finally(() => {
+    pendingInFlight = false
+  })
 }
 
 /** Cards JSON kept on the view-state atom so a tick is one read, not a render. */

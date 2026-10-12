@@ -69,7 +69,7 @@ export type PendingAsk = {
 /** How many asks one render draws; the rest collapse to a dim "+N more" row. */
 export const ASK_CAP = 8
 
-/** What one `mk-bus.py pending --json` stdout looks like (`cmd_pending`). */
+/** What one `mk-bus.py pending` stdout looks like (`cmd_pending`; it prints JSON and takes no `--json`). */
 export type PendingPayload = { ok?: boolean; run?: string; pending?: readonly PendingAsk[]; error?: string }
 
 /** Injected process runner, same shape as the Kanban tab's. */
@@ -221,12 +221,38 @@ export function waitingPick(ui: TabUi | undefined, view: WaitingView): string | 
   return held != null && view.options.some(o => o.key === held) ? held : undefined
 }
 
-/** cut `text` to `w` cells, marking the cut with `…` — a row never wraps. */
+/** Terminal cells one code point takes. East-Asian wide, emoji and the
+ *  ellipsis are 2; combining marks are 0; everything else is 1. */
+export function cellWidth(text: string): number {
+  let n = 0
+  for (const ch of text) {
+    const cp = ch.codePointAt(0) ?? 0
+    if (cp === 0x200d || (cp >= 0xfe00 && cp <= 0xfe0f) || (cp >= 0x300 && cp <= 0x36f)) continue
+    n += wideCell(cp) ? 2 : 1
+  }
+  return n
+}
+
+function wideCell(cp: number): boolean {
+  return cp === 0x2026
+    || (cp >= 0x1100 && cp <= 0x115f) || cp === 0x2329 || cp === 0x232a
+    || (cp >= 0x2e80 && cp <= 0xa4cf) || (cp >= 0xac00 && cp <= 0xd7a3)
+    || (cp >= 0xf900 && cp <= 0xfaff) || (cp >= 0xfe10 && cp <= 0xfe19)
+    || (cp >= 0xfe30 && cp <= 0xfe6f) || (cp >= 0xff00 && cp <= 0xff60)
+    || (cp >= 0xffe0 && cp <= 0xffe6) || (cp >= 0x1f300 && cp <= 0x1f64f)
+    || (cp >= 0x1f900 && cp <= 0x1f9ff) || (cp >= 0x20000 && cp <= 0x3fffd)
+}
+
+/** cut `text` to `w` terminal cells, marking the cut with `…` — a row never wraps. */
 function cut(text: string, w: number): string {
   if (w <= 0) return ''
-  if (text.length <= w) return text
-  if (w === 1) return '…'
-  return `${text.slice(0, w - 1)}…`
+  if (cellWidth(text) <= w) return text
+  let out = ''
+  for (const ch of text) {
+    if (cellWidth(out + ch) > w - 1) break
+    out += ch
+  }
+  return `${out}…`
 }
 
 /**
@@ -240,10 +266,10 @@ function wrapProse(text: string, w: number, firstPrefix: string, contPrefix: str
   for (const sentence of text.split(/(?<=[.?])\s+/)) {
     let cur = ''
     for (const raw of sentence.split(' ').filter(Boolean)) {
-      const room = Math.max(1, w - prefix.length)
-      const word = raw.length > room ? cut(raw, room) : raw
+      const room = Math.max(1, w - cellWidth(prefix))
+      const word = cellWidth(raw) > room ? cut(raw, room) : raw
       const cand = cur ? `${cur} ${word}` : word
-      if (cur && cand.length > room) {
+      if (cur && cellWidth(cand) > room) {
         out.push(prefix + cur)
         prefix = contPrefix
         cur = word
