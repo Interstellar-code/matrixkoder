@@ -1346,9 +1346,13 @@ def cmd_ask(a):
         raise Handled(3)
     with contextlib.suppress(BusDown, BusHttp, OSError, ValueError):
         bus_call(cfg, "POST", "/ack", body=bus_ack_body(cfg, answer["id"]))
-    bus_note_seq(lane, answer, held)  # todos 37/42: inbox must not re-show or re-ack this answer
+    # Print and resume BEFORE the cursor write. A held cursor lock raises BusLock
+    # after 5 s; the answer is already acked at level 3, so losing the cursor
+    # move must not lose the answer (review R3 HIGH).
     status_resume(lane)
     print(answer["text"])
+    with contextlib.suppress(BusLock):
+        bus_note_seq(lane, answer, held)  # todos 37/42: inbox must not re-show or re-ack this answer
     raise Handled(0)
 
 
@@ -1377,9 +1381,11 @@ def cmd_wait(a):
         raise Handled(3)
     with contextlib.suppress(BusDown, BusHttp, OSError, ValueError):
         bus_call(cfg, "POST", "/ack", body=bus_ack_body(cfg, answer["id"]))
-    bus_note_seq(lane, answer, held)  # todos 37/42: inbox must not re-show or re-ack this answer
+    # Same order as ask: the answer is delivered even when the cursor lock is held.
     status_resume(lane)
     print(answer["text"])
+    with contextlib.suppress(BusLock):
+        bus_note_seq(lane, answer, held)  # todos 37/42: inbox must not re-show or re-ack this answer
     raise Handled(0)
 
 
@@ -1406,17 +1412,21 @@ def cmd_inbox(a):
         seq = msg.get("seq")
         if not is_int(seq) or seq <= after:
             break  # non-int or non-advancing seq: stop, do not spin (item 37)
-        # Already acked at level 3 (ask/wait consumed it): do not print it again
-        # and do not send a second ack (todo 42). The cursor still moves past it.
-        try:
-            advanced = bus_advance_cursor(lane, seq)
-        except BusLock as e:
-            raise Fail(str(e), code=5)
+        # At-least-once, same as ask/wait: a BusLock or a crash before the cursor
+        # moves re-shows the message next time, which is the safe direction.
+        # ack_level 3 (ask/wait already consumed it) is not printed and not
+        # re-acked (todo 42); the cursor still moves past it.
         if msg.get("ack_level") == 3:
-            after = advanced
+            try:
+                after = bus_advance_cursor(lane, seq)
+            except BusLock as e:
+                raise Fail(str(e), code=5)
             continue
         print(json.dumps(msg))
-        after = advanced
+        try:
+            after = bus_advance_cursor(lane, seq)
+        except BusLock as e:
+            raise Fail(str(e), code=5)
         try:
             bus_call(cfg, "POST", "/ack", body=bus_ack_body(cfg, msg.get("id")))
         except BusHttp as e:
@@ -3159,6 +3169,86 @@ def t_b1_non_int_seq_does_not_spin(root):
         assert code == 5, (code, lines)
     finally:
         srv.shutdown()
+
+
+def _b1_hold_lock(root, lane, name):
+    """A process holding the cursor lock. Returns (proc, ready path). The caller kills it."""
+    lock = os.path.join(lane, BUS_CURSOR_FILE + ".lock")
+    ready = os.path.join(root, name + ".ready")
+    script = (
+        "import fcntl, sys, time\n"
+        "f = open(sys.argv[1], 'a')\n"
+        "fcntl.flock(f.fileno(), fcntl.LOCK_EX)\n"
+        "open(sys.argv[2], 'w').write('held')\n"
+        "time.sleep(60)\n"
+    )
+    proc = subprocess.Popen([sys.executable, "-c", script, lock, ready])
+    deadline = time.time() + 5
+    while time.time() < deadline and not os.path.exists(ready):
+        time.sleep(0.02)
+    assert os.path.exists(ready), "holder never took the lock"
+    return proc
+
+
+def t_b1_held_lock_does_not_lose_the_answer(root):
+    """Review R3 HIGH: the cursor lock is held by another process. wait and ask
+    still print the answer and exit 0. inbox fails with the named BusLock error
+    and prints nothing. Bounds scale from one measured spawn."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data, _, _ = bus_server(root)
+    lane = bus_lane(root, "b1_held_lane", "BH", data)
+    begin(lane, root)
+    cli(lane, "progress", "build")
+    b0 = time.time()
+    cli(lane, "inbox")
+    baseline = max(0.05, time.time() - b0)
+    # wait path: ask goes PENDING, the answer lands, then the lock is taken
+    code, lines = cli(lane, "ask", "held?", "--timeout", "2")
+    assert code == 3 and lines[0].startswith("PENDING "), (code, lines)
+    ask_id = lines[0].split()[1]
+    bus_cli("answer", ask_id, "KEPT", "--run", BUS_RUN, "--data", data)
+    holder = _b1_hold_lock(root, lane, "b1_held_wait")
+    try:
+        t0 = time.time()
+        code, lines = cli(lane, "wait", ask_id, "--timeout", "10")
+        elapsed = time.time() - t0
+        assert code == 0 and lines == ["KEPT"], (code, lines)
+        assert elapsed < max(3.0, 8 * baseline), elapsed
+        assert status(lane)["state"] == "working"
+    finally:
+        holder.kill(); holder.wait(timeout=5)
+    # ask path: the lock is held before the answer is posted
+    holder = _b1_hold_lock(root, lane, "b1_held_ask")
+
+    def answer_when_blocked():
+        row = bus_poll_until(lambda: next(
+            (r for r in bus_rows(data) if r.get("kind") == "ask" and r.get("text") == "held ask?"), None))
+        bus_poll_until(lambda: status(lane) if status(lane).get("state") == "blocked" else None)
+        bus_cli("answer", row["id"], "KEPT2", "--run", BUS_RUN, "--data", data)
+
+    th = threading.Thread(target=answer_when_blocked)
+    th.start()
+    try:
+        t0 = time.time()
+        code, lines = cli(lane, "ask", "held ask?", "--timeout", "15")
+        elapsed = time.time() - t0
+    finally:
+        th.join(20)
+        holder.kill(); holder.wait(timeout=5)
+    assert code == 0 and lines == ["KEPT2"], (code, lines)
+    assert elapsed < max(8.0, 8 * baseline), elapsed
+    # inbox with the lock held: the named error, and nothing printed
+    bus_cli("send", "--run", BUS_RUN, "--task", "BH", "--kind", "info",
+            "--text", "unread while locked", "--data", data)
+    holder = _b1_hold_lock(root, lane, "b1_held_inbox")
+    try:
+        code, lines = cli(lane, "inbox")
+        assert code == 5 and len(lines) == 1, (code, lines)
+        err = json.loads(lines[0])
+        assert err.get("ok") is False and "cursor lock" in err.get("error", ""), err
+    finally:
+        holder.kill(); holder.wait(timeout=5)
 
 
 def t_b1_cursor_lock_wait_is_bounded(root):
