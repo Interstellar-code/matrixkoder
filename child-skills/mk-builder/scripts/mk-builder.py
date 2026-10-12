@@ -400,10 +400,86 @@ def lane_head(lane):
     return sha if SHA_RE.fullmatch(sha) else None
 
 
+# R31: a test/build command still running from this lane. Same idea as lane-watch
+# child_progress, self-contained (that script is not imported).
+_CHILD_RE = re.compile(
+    r"(?:^|/)(?:selftest\.sh|pytest|tsc)(?:\s|$)"
+    r"|claude\s+plugin\s+test"
+    r"|python3?\b.*(?:--self-test|\btime\.sleep\b)",
+    re.I)
+
+
+def _ps_rows():
+    """(pid, ppid, command) from `ps -axo pid,ppid,command`. Empty on any failure."""
+    try:
+        r = subprocess.run(["ps", "-axo", "pid,ppid,command"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return []
+    except (OSError, subprocess.SubprocessError):
+        return []
+    rows = []
+    for line in r.stdout.splitlines()[1:]:
+        parts = line.split(None, 2)
+        if len(parts) < 3 or not parts[0].isdigit():
+            continue
+        rows.append((parts[0], parts[1], parts[2]))
+    return rows
+
+
+def _cwd_of(pid):
+    try:
+        return os.path.realpath(os.readlink(f"/proc/{pid}/cwd"))
+    except OSError:
+        pass
+    try:
+        r = subprocess.run(["lsof", "-a", "-p", pid, "-d", "cwd", "-Fn"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    for line in r.stdout.splitlines():
+        if line.startswith("n"):
+            return os.path.realpath(line[1:])
+    return ""
+
+
+def running_lane_children(lane):
+    """Commands started from this lane that are still running. `done` itself runs as a fresh
+    process, so the child is not its descendant: a process counts when its command matches a
+    test/build pattern AND its cwd (or its arguments) point into this lane. The mk-builder
+    process checking the lane is never a hit. Empty when ps cannot be read."""
+    lane = os.path.realpath(lane)
+    me = str(os.getpid())
+    rows = _ps_rows()
+    hits = []
+    for pid, _ppid, command in rows:
+        if pid == me:
+            continue
+        if not _CHILD_RE.search(command):
+            continue
+        if os.path.abspath(__file__) in command and "--self-test" not in command:
+            continue
+        cwd = _cwd_of(pid)
+        in_lane = False
+        if cwd:
+            try:
+                in_lane = os.path.commonpath([cwd, lane]) == lane
+            except ValueError:
+                in_lane = False
+        if not in_lane:
+            in_lane = lane in command
+        if in_lane:
+            hits.append(command.strip())
+    return hits
+
+
 def cmd_done(a):
     """R18: the report file at the lane root AND a readable HEAD; R20: final per identity, so the
     legality table refuses every second write. The report is checked first, so the error is
-    deterministic."""
+    deterministic. R31: a still-running lane child is a WARNING before the token, never a failure
+    and never a change to the token being the last line."""
     lane, old = lane_dir(a), load_live(lane_dir(a))
     require_state(old, "done")
     report = old.get("report") or ""
@@ -414,6 +490,8 @@ def cmd_done(a):
         raise Fail("no_head: `git -C <lane> rev-parse HEAD` failed [R18]")
     obj = dict(old, state="done", question=None, subagent=None, commit=sha)
     write_status(lane, stamp(obj))
+    for command in running_lane_children(lane):
+        print(f"WARNING: a lane child is still running: {command}")
     # Todo reporting: the report's `## Todo` section rides on the DONE token. A missing
     # section or an `open` item without a reason warns and does not fail the round.
     warn = ""
@@ -2752,6 +2830,74 @@ def t_d7_one_ack_per_answer(root):
     assert len(answers) == 1, answers
     mine = [r for r in rows if r.get("kind") == "ack" and r.get("reply_to") == answers[0]["id"]]
     assert len(mine) == 1, mine
+
+
+def t_done_warns_on_running_child(root):
+    """R31: a real `python3 -c time.sleep` started in the lane makes `done` print a WARNING
+    before the token; with no child the same path prints no WARNING. HOME is a temp dir.
+    The token stays the last line and the exit code stays 0 either way."""
+    saved = os.environ.get("HOME")
+    home = os.path.join(root, "r31-home")
+    os.makedirs(home, exist_ok=True)
+    os.environ["HOME"] = home
+    lane = gitlane(root, "r31_child")
+    try:
+        begin(lane, root, report=".matrixkoder-report-r1.md")
+        cli(lane, "progress", "work")
+        with open(os.path.join(lane, ".matrixkoder-report-r1.md"), "w") as f:
+            f.write("# report\n")
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            cwd=lane, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            code, lines = cli(lane, "done")
+        finally:
+            child.kill()
+            child.wait(timeout=10)
+        assert code == 0, lines
+        assert any(x.startswith("WARNING: a lane child is still running:") and "time.sleep" in x
+                   for x in lines), lines
+        assert lines[-1].endswith(" DONE"), lines
+        assert not lines[-1].startswith("WARNING"), lines
+    finally:
+        if saved is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = saved
+    lane2 = gitlane(root, "r31_quiet")
+    begin(lane2, root, report=".matrixkoder-report-r1.md")
+    cli(lane2, "progress", "work")
+    with open(os.path.join(lane2, ".matrixkoder-report-r1.md"), "w") as f:
+        f.write("# report\n")
+    code, lines = cli(lane2, "done")
+    assert code == 0 and not any(x.startswith("WARNING:") for x in lines), lines
+    assert lines[-1].endswith(" DONE"), lines
+
+
+def t_r31_wait_loop_wording(root):
+    """R31 as written: the brief Commands line and lane-rules R31 both carry the same-turn
+    bounded wait, and that loop really returns the exit line a detached job appended."""
+    here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    brief = os.path.join(here, "skills", "matrixkoder", "templates", "brief.md")
+    rules = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "reference", "lane-rules.md")
+    with open(brief) as f:
+        brief_text = f.read()
+    with open(rules) as f:
+        rules_text = f.read()
+    needle = "until grep -q '^EXIT:' out.txt; do sleep 5; done"
+    assert needle in brief_text, "the brief Commands line lost the same-turn wait"
+    assert needle in rules_text and "**R31." in rules_text, "lane-rules R31 lost the wait"
+    out = os.path.join(root, "wait-out.txt")
+    subprocess.Popen(
+        ["sh", "-c", f"sleep 1; echo EXIT:0 >> {out}"],
+        cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    r = subprocess.run(
+        ["sh", "-c", f"until grep -q '^EXIT:' {out}; do sleep 1; done"],
+        cwd=root, capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    with open(out) as f:
+        assert f.read().strip() == "EXIT:0"
 
 
 def t_d7_done_todo_counts(root):

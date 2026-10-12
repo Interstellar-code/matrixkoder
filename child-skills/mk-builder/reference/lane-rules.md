@@ -44,7 +44,8 @@ checkable contract. Rules whose remainder stays per-brief say **(B)** and carry 
   background task or background job and wait on it.
   **Why:** background tasks stall lanes and hide progress — a mode spun on its own background
   tasks for 10+ min with the work uncommitted (`skills/matrixkoder/templates/brief.md:24`;
-  `skills/matrixkoder/reference/lessons.md:26`, #22).
+  `skills/matrixkoder/reference/lessons.md:26`, #22). A finite check that must be detached is
+  R31: start it, then wait for it in the same turn.
 
 - **R4.** Never run the brief's banned commands — at minimum anything that starts a dev server,
   boots shared services, deploys, or restarts one.
@@ -214,6 +215,16 @@ checkable contract. Rules whose remainder stays per-brief say **(B)** and carry 
   lane-to-lane message passes the orchestrator.
   **Why:** a lane that messages another lane routes work the orchestrator owns (R1). **Check:**
   the lane transcript shows no send addressed to another lane.
+- **R31. (new)** Start each finite check detached with its output in a file and the exit code
+  appended (`cmd > out.txt 2>&1; echo EXIT:$? >> out.txt`), then in the SAME turn wait with a
+  bounded loop (`until grep -q '^EXIT:' out.txt; do sleep 5; done; tail -n 5 out.txt`, upper
+  bound 20 minutes; print a message if it expires) and never end a turn while a job you started
+  is still running. Read every result before committing. Never start servers (R4).
+  **Why:** OpenCode and AGY panes are not woken when a background job ends, so a builder that
+  ends its turn with the job still running sits idle until someone nudges it; Claude Code panes
+  are woken. Ending the turn used to strand the lane (`mk-improvements.md` item 59). **Check:**
+  the transcript shows the wait loop in the same turn as the start, and `done` warns when a
+  lane child is still running.
 
 ## 5. Research Part B mapping (S rows → rules)
 

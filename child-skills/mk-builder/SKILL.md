@@ -46,7 +46,7 @@ It prints the brief, paged at about 24,000 chars, then the phase task list as li
 
 ## 4. done
 
-`python3 ${CLAUDE_SKILL_DIR}/scripts/mk-builder.py done` — only once the report file exists at the `report` path given to `start` and the phase commit exists. It records HEAD and prints the token.
+`python3 ${CLAUDE_SKILL_DIR}/scripts/mk-builder.py done` — only once the report file exists at the `report` path given to `start` and the phase commit exists. It records HEAD and prints the token. Before that token, a still-running lane child is a one-line WARNING (lane-rules R31); the token stays the last line.
 
 The report's `## Todo` section is lines `[done|skipped|open] <text> - <evidence>`. When that section is present, `done` prints `<T> R<n> DONE todo 6/7 done 1 skipped`. A missing section, or an `open` item without a reason, warns and does not fail the round.
 
