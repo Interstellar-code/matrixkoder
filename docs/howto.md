@@ -24,7 +24,7 @@ Run `/mk setup` (alias `/mk init`). The wizard opens as a pane, one step at a ti
 | # | Step | What it asks |
 |---|---|---|
 | 1 | Install | Shows whether you run from a dev folder or a marketplace install. Info only. |
-| 2 | Data | Where project data lives: `<repo>/.matrixkoder/` (default; added to `.gitignore`) or `~/.matrixkoder/projects/<slug>/`. |
+| 2 | Data | Where project data lives: `<repo>/.matrixkoder/` (default and current; added to `.gitignore`). `~/.matrixkoder/projects/<slug>/` is the home mode that lands after the data move (DM, still to come) — not live yet. |
 | 3 | Agents | Which of Claude Code, Codex, OpenCode, AGY you use. Hotkeys 1 to 4 toggle them. If `herdr` is found, choose whether to link the MatrixKoder herdr plugin so pane events push lane verdicts instead of polling. |
 | 4 | Usage | Which CodexBar providers to track. Hotkeys 1 to 9. `zai (OpenCode Z.AI plan)` and `opencode (OpenCode Zen)` are labelled so you pick the right one; zai is pre-selected when your opencode agent is on the Z.AI plan. Shows the z.ai key command (see [Usage tracking](#usage-tracking)). |
 | 5 | Gates | Your test, typecheck, lint and format commands, as text inputs. Detection reads package.json, pyproject.toml, Makefile, `.claude-plugin/plugin.json`, `scripts/selftest.sh`, tsconfig.json, `Cargo.toml` and `go.mod`; when nothing is detected the first field takes the focus so you can just type. |
@@ -55,8 +55,9 @@ Toggle it with `/mk` (or `/mk open`, `/mk close`). It docks on the right when th
 - **Plan**: the waves, each as a row of status glyphs.
 - **Lanes**: one line per task with its agent and status.
 - **Usage**: remaining quota per agent pool, scoped to the agents your project's `matrixkoder.yaml` enables (every ledger agent when it names none). An enabled agent with no ledger entry yet shows a dim hint row instead of nothing. The claude main row is labelled `claude (all)` when it covers sub-pools. `—` means the pool has no such window; `n/a` means the provider could not be polled at all; `⊘` in red means the pool is exhausted. `no ledger yet` means usage has not been polled yet.
-- **Waiting on you**: items that need your decision.
+- **Waiting on you**: items that need your decision (full tab: hotkey `w`, `hooks/tabs/waiting.tsx` — real pending asks).
 - **Recent**: the last few events.
+- **Kanban**: per-tick cards from `mkdb.py cards --json` (hotkey `k`, `hooks/tabs/kanban.tsx`).
 
 Status glyphs: `○` planned, `◇` routed, `▷` dispatched, `●` building, `⧖` verifying, `◐` review, `▲` fix, `◈` merged, `◆` QA, `✓` done, `⊘` blocked, `⧗` quota, `⚠` stalled, `⊗` provider problem.
 
@@ -68,9 +69,11 @@ The status chip under the prompt shows run health in one line; toasts announce t
 
 ## Running an orchestration
 
-Say what you want in plain words, for example "orchestrate the plan in docs/plan.md". The `matrixkoder` skill takes over and runs the loop: plan, route each phase to an agent with quota left (Claude Code is spared), write briefs, dispatch to herdr panes and worktrees, watch, verify, review, fix, merge, QA, and open one PR. It stops only for the human decisions listed in `skills/matrixkoder/reference/safety.md`.
+Say what you want in plain words, for example "orchestrate the plan in docs/plan.md". The `matrixkoder` skill takes over and runs the loop: plan, route each phase to an agent with quota left (Claude Code is spared; `scripts/mk-catalog.py routes --json` lists every runnable route, `model --pane <pane>` reads the live model from a herdr pane footer), write briefs, dispatch to herdr panes and worktrees, watch, verify, review, fix, merge, QA, and open one PR. It stops only for the human decisions listed in `skills/matrixkoder/reference/safety.md`.
 
-What lands on disk, under the data directory:
+Dispatch uses the root bus when it is up (`scripts/mk-bus.py`, one bus per MK home: `<home>/bus.json`, `bus.lock`, `bus-tokens.json`; lane token file outside the lane at `~/.matrixkoder/bus-lanes/<sha256(realpath(lane))>.json`, mode 0600, `$MK_BUS_TOKEN_FILE` overrides). The pane gets one typed doorbell line (`MK_SELFTEST_JOBS=<n> python3 <skill>/scripts/mk-builder.py connect`), and `connect` prints the paged brief (~24,000 chars, `read <id> --part n`) plus the phase task list. When the bus is down the dispatch falls back to the full prompt plus the brief copy in the lane (`<lane>/.matrixkoder-brief.md`) — that copy is bus-down-fallback-only, never written when the bus is up.
+
+What lands on disk, under the data directory (today that is `<repo>/.matrixkoder/`; `~/.matrixkoder/projects/<slug>/` becomes the home only after the data move):
 
 | Path | Content |
 |---|---|
@@ -78,6 +81,7 @@ What lands on disk, under the data directory:
 | `runs/<id>/run.json`, `events.jsonl` | Run snapshot and append-only history |
 | `runs/<id>/board.md` | Generated status board. Never hand-edit. |
 | `runs/<id>/tasks/<T>/` | `task.json`, `brief-rN.md`, `report-rN.md`, `review-rN.md` per round |
+| `plans/archive/<plan>-v<n>.md` | Approved plan versions (`scripts/mk-plan.py approve <plan>` validates, imports one version into the project store, and archives the file here; the original path still resolves via fallback. Without a store it behaves as before) |
 
 All run state is written through `scripts/mk-state.py`; do not edit `run.json`, `events.jsonl` or `board.md` by hand. Read-only commands you can run yourself:
 
@@ -164,4 +168,4 @@ The plugin runs `scripts/mk-lane-event.py event` for every pane status change an
 - **No pane at all**: `/mk open`, and check `autoOpen` in settings.
 - **Plugin changes not showing**: restart the session, or start Claude Code with `--plugin-dir`.
 - **A command is denied**: it matched a guard. Use a safe alternative, or turn `guards` off.
-- **Dashboard says "Run /mk init <feature-name>"**: that hint is stale. Use `/mk setup` for the wizard and ask the model to "orchestrate …" to start a run.
+- **Dashboard says "Run /mk init <feature-name>"**: that text is real — the dashboard NoRun view still prints it (`hooks/dashboard.tsx`). There is no `/mk init` command; use `/mk setup` for the wizard and ask the model to "orchestrate …" to start a run.
