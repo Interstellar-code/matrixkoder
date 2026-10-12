@@ -447,8 +447,23 @@ def row_c1_projects(ctx):
         raise Fail("locks is not a directory")
 
 
+def _card_col(ctx, task):
+    """The kanban column from the real `mkdb.py cards --json`, not a stored status."""
+    out = _py(os.path.join(HERE, "mkdb.py"), "--home", ctx["home"], "--project", ctx["slug"],
+              "cards", "--json")
+    card = next((c for c in out.get("cards") or [] if c.get("task") == task and c.get("run") == ctx["run"]), None)
+    if not card:
+        raise Fail(f"cards --json has no card for {task}: {out}")
+    return card.get("col"), card.get("status")
+
+
 def row_c3_ready(ctx):
-    """Every dep merged or done makes the task ready. Siblings with no dep may both build."""
+    """C3/C4: before the dep is done the card is Backlog; after it is Ready.
+
+    `col` is what `cards --json` returns. Two siblings with no dep between them are both
+    startable (both may be building). The production status writer is mkdb.transition;
+    mk-state.py store mode calls that same function.
+    """
     ctx = _need(ctx)
     con = mkdb.open_project(ctx["home"], data_dir=ctx["data"])
     try:
@@ -458,25 +473,23 @@ def row_c3_ready(ctx):
         mkdb.add_task(con, ctx["run"], "sib-2", "task", title="s2")
     finally:
         con.close()
-    mkdb.transition(ctx["home"], ctx["slug"], ctx["run"], "rdy-a", "done", data_dir=ctx["data"])
-    con = mkdb.open_project(ctx["home"], data_dir=ctx["data"])
-    try:
-        status = con.execute("SELECT status FROM tasks WHERE run=? AND id=?",
-                             (ctx["run"], "rdy-b")).fetchone()["status"]
-    finally:
-        con.close()
-    if status != "ready":
-        raise Fail(f"rdy-b is {status}, not ready")
+    # Cards are the root copy. Sync so cards --json can see them before the dep is done.
+    mkdb.transition(ctx["home"], ctx["slug"], ctx["run"], "rdy-b", "planned",
+                    sync_root=True, data_dir=ctx["data"])
+    before, before_status = _card_col(ctx, "rdy-b")
+    if before != "Backlog":
+        raise Fail(f"rdy-b col is {before!r} (status {before_status}) before the dep is done, not Backlog")
+    mkdb.transition(ctx["home"], ctx["slug"], ctx["run"], "rdy-a", "done",
+                    sync_root=True, data_dir=ctx["data"])
+    after, after_status = _card_col(ctx, "rdy-b")
+    if after != "Ready":
+        raise Fail(f"rdy-b col is {after!r} (status {after_status}) after rdy-a is done, not Ready")
     for sib in ("sib-1", "sib-2"):
-        mkdb.transition(ctx["home"], ctx["slug"], ctx["run"], sib, "building", data_dir=ctx["data"])
-    con = mkdb.open_project(ctx["home"], data_dir=ctx["data"])
-    try:
-        both = [r["status"] for r in con.execute(
-            "SELECT status FROM tasks WHERE run=? AND id IN ('sib-1','sib-2') ORDER BY id", (ctx["run"],))]
-    finally:
-        con.close()
-    if both != ["building", "building"]:
-        raise Fail(f"siblings not both building: {both}")
+        mkdb.transition(ctx["home"], ctx["slug"], ctx["run"], sib, "building",
+                        sync_root=True, data_dir=ctx["data"])
+    cols = [_card_col(ctx, sib)[0] for sib in ("sib-1", "sib-2")]
+    if cols != ["Building", "Building"]:
+        raise Fail(f"siblings not both startable: {cols}")
 
 
 def row_c5_sync(ctx):
@@ -839,6 +852,8 @@ def self_test():
         _check(f"C{n}" in have, f"matrix has no row for C{n}")
     _check(any(r["kind"] == "agent" for r in rows), "no agent row")
     _check(any(r["pending"] for r in rows), "no pending row")
+    hidden = [r["id"] for r in rows if r["pending"] and r["id"] in ROWS]
+    _check(not hidden, f"pending row also has a step, so a failure would be hidden: {hidden}")
 
     # Real home, and a non-temp path, are refused before anything is created.
     before = set(os.listdir(REAL_HOME)) if os.path.isdir(REAL_HOME) else set()
@@ -872,18 +887,21 @@ def self_test():
         proc = subprocess.run(
             [sys.executable, os.path.abspath(__file__), "--home", home, "scripted", "--gate", "G1"],
             capture_output=True, text=True)
-        _check(proc.returncode == 3, f"G1 with PENDING rows exited {proc.returncode}")
         lines = [json.loads(l) for l in proc.stdout.strip().splitlines()]
         summary = lines[-1]
         by_id = {l["row"]: l for l in lines if "row" in l}
         _check(any(l.get("status") == "pass" for l in lines), "no scripted row passed")
         pending_ids = {r["id"] for r in matrix_rows() if r["pending"] and r["kind"] == "scripted"
                        and GATE_RANK[r["gate"]] <= GATE_RANK["G1"]}
-        _check(pending_ids, "matrix has no pending G1 row")
+        # Exit follows the matrix: 3 only while a G1 scripted row is still pending.
+        # A row with a step is never pending (checked above), so a failing step exits 1.
+        want = 3 if pending_ids else (1 if summary["summary"]["fail"] else 0)
+        _check(proc.returncode == want, f"G1 exited {proc.returncode}, wanted {want}")
         for rid in pending_ids:
             _check(by_id.get(rid, {}).get("status") == "PENDING", f"{rid} was not PENDING")
-        _check(summary.get("ok") is False, "PENDING gate reported ok")
         _check(summary["summary"]["PENDING"] == len(pending_ids), "PENDING count mismatch")
+        if pending_ids:
+            _check(summary.get("ok") is False, "PENDING gate reported ok")
         g1 = [r["id"] for r in _select("G1", matrix_rows())]
         g2 = [r["id"] for r in _select("G2", matrix_rows())]
         g3 = [r["id"] for r in _select("G3", matrix_rows())]

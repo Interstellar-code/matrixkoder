@@ -39,7 +39,7 @@ ones: G1 runs the G1 rows, G2 runs G1 and G2, and G3 runs every row.
 | C2-timeline | C2 | G1 | scripted | | `mkdb.py timeline --run R --task T --json` after one transition. | One JSON line; events for that task only, ordered by id, chan `state`. |
 | C3-tree | C3 | G1 | scripted | | Add a phase, a task under it, and a subtask; parent comes from nesting. | All three rows exist; a missing parent is refused. |
 | C3-cycle | C3 | G1 | scripted | | Add a task that depends on itself, then two tasks that depend on each other. | Both refused; the cycle error names the path; neither bad row is stored. |
-| C3-ready | C3 | G1 | scripted | pending: D3A | Mark every dep of a task merged/done. | The task becomes ready; parallel siblings with no dep between them may both be building. |
+| C3-ready | C3 | G1 | scripted | | Mark every dep of a task merged/done. | The task becomes ready; parallel siblings with no dep between them may both be building. |
 | C4-columns | C4 | G1 | scripted | | Transition a task through planned, building, review, done, then blocked. | Columns are Backlog, Building, Review, Done; blocked keeps its column and raises attention. |
 | C5-sync | C5 | G1 | scripted | | `transition()` with root sync, then `mk-state.py sync` after a crash between the two writes. | Root card and summary catch up from `sync.last_change_no`; only C1 fields cross. |
 | C6-lifecycle | C6 | G2 | scripted | pending: D6B | Two scratch projects heartbeat one root bus; stop one project's heartbeats. | The bus stays up while the other heartbeats and exits only after `owner_timeout_min`. |
