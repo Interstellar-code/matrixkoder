@@ -607,13 +607,57 @@ def promote_ready(home, project, run, changed=None, data_dir=None, sync_root=Fal
     return moved
 
 
+ACTIVE_RUN_STATUSES = ("running", "active")  # mk-state writes 'active'; 'running' kept for older rows
+
+
+def _summary_values(con):
+    """C1 project_summary aggregates from an OPEN project connection: three aggregate
+    statements, no per-task scan and no second connection.
+
+    active_runs counts the runs the store holds as running/active; by_status_json is the
+    sorted-keys JSON object of task-status counts over ALL tasks of the project (every run);
+    attention reuses the card rule (column_of): a status in ATTENTION; last_event is the
+    newest events.t of the project (NULL with no events). change_no is the caller's — the
+    change just committed.
+    """
+    by, attention = {}, 0
+    for r in con.execute("SELECT status, COUNT(*) c FROM tasks GROUP BY status"):
+        by[r["status"]] = r["c"]
+        if r["status"] in ATTENTION:
+            attention += r["c"]
+    active = con.execute(
+        "SELECT COUNT(*) c FROM runs WHERE status IN (?,?)", ACTIVE_RUN_STATUSES).fetchone()["c"]
+    last_event = con.execute("SELECT MAX(t) m FROM events").fetchone()["m"]
+    return active, json.dumps(by, sort_keys=True), attention, last_event
+
+
+def _write_summary(root, project, values, change_no):
+    """The C1 summary upsert, INSIDE the caller's open root transaction (C5: it lands with
+    the card). change_no never lowers: a replay carrying an older change keeps the stored one.
+    """
+    active, by_json, attention, last_event = values
+    root.execute(
+        "INSERT INTO project_summary(project, active_runs, by_status_json, attention, last_event, change_no)"
+        " VALUES (?,?,?,?,?,?)"
+        " ON CONFLICT(project) DO UPDATE SET active_runs=excluded.active_runs,"
+        " by_status_json=excluded.by_status_json, attention=excluded.attention,"
+        " last_event=excluded.last_event, change_no=MAX(project_summary.change_no, excluded.change_no)",
+        (project, active, by_json, attention, last_event, change_no))
+
+
 def _repair_cards(home, project, repairs, data_dir):
     """Write every mismatched card and advance the watermark in ONE root transaction.
 
     change_no is the task's own MAX(change_log), which can sit below the watermark the
     triggering transition already advanced. The watermark moves to at least that number and
     at least its current value, so a later catch_up still replays anything newer.
+    The batch also writes the summary ONCE (not per card), in the same transaction.
     """
+    con = open_project(home, project, data_dir)
+    try:
+        summary = _summary_values(con)
+    finally:
+        con.close()
     root = open_root(home)
     try:
         _begin(root)
@@ -637,6 +681,7 @@ def _repair_cards(home, project, repairs, data_dir):
                 "INSERT INTO sync(project, last_change_no) VALUES (?,?)"
                 " ON CONFLICT(project) DO UPDATE SET last_change_no=MAX(sync.last_change_no, excluded.last_change_no)",
                 (project, hi))
+            _write_summary(root, project, summary, hi)
             root.execute("COMMIT")
         except Exception:
             root.execute("ROLLBACK")
@@ -692,9 +737,12 @@ def transition(home, project, run, task, to, note="", round=0, sync_root=False, 
             raise
         # The child's card lands before the parent rollup, so a lower change_no cannot follow a
         # higher one into the root. sync.last_change_no is also monotonic inside the upsert.
+        # The summary is computed from the just-committed rows on the same connection, then
+        # written in the SAME root transaction as the card (C5): a kill before it leaves both
+        # missing, and catch_up heals both.
         if sync_root:
             _upsert_card(home, project, run, task, row, to, col, attention, round, change_no, data_dir,
-                         updated=stamped)
+                         updated=stamped, summary=_summary_values(con))
         rolled = _rollup(con, run, row["parent"]) if row["parent"] else None
         if rolled and rolled != con.execute("SELECT status FROM tasks WHERE run=? AND id=?",
                                             (run, row["parent"])).fetchone()["status"]:
@@ -712,8 +760,13 @@ def transition(home, project, run, task, to, note="", round=0, sync_root=False, 
 
 
 def _upsert_card(home, project, run, task, row, status, col, attention, round, change_no, data_dir,
-                  updated=None):
-    """C5: the root copy, in its own transaction. A failure here leaves the project change durable."""
+                  updated=None, summary=None):
+    """C5: the root copy, in its own transaction. A failure here leaves the project change durable.
+
+    summary (C1 project_summary values from _summary_values) is written in the SAME root
+    transaction, so the card and the summary always land together; None skips it (callers
+    that only repair a card leave the summary to their own batch).
+    """
     root = open_root(home)
     try:
         _begin(root)
@@ -733,6 +786,8 @@ def _upsert_card(home, project, run, task, row, status, col, attention, round, c
                 "INSERT INTO sync(project, last_change_no) VALUES (?,?)"
                 " ON CONFLICT(project) DO UPDATE SET last_change_no=MAX(sync.last_change_no, excluded.last_change_no)",
                 (project, change_no))
+            if summary is not None:
+                _write_summary(root, project, summary, change_no)
             root.execute("COMMIT")
         except Exception:
             root.execute("ROLLBACK")
@@ -748,6 +803,12 @@ def catch_up(home, project, data_dir=None):
     row for that task sits at or below the watermark: a kill between a transition and the
     card repair leaves exactly that. The repair uses the task's own MAX(change_no) and does
     not move the watermark backwards.
+
+    C1: the summary is written ONCE after the replays (never per card), carrying the
+    watermark as its change_no — so a store whose cards are current but whose summary is
+    missing or stale (a kill between the card writes and this one) heals here too. The
+    write is skipped when the stored row already equals the recomputed one, so a second
+    catch_up over a synced store writes nothing.
     """
     con = open_project(home, project, data_dir)
     try:
@@ -758,6 +819,7 @@ def catch_up(home, project, data_dir=None):
                             " prev_status, round, verdict, updated FROM tasks").fetchall()
         nos = {(r["run"], r["task"]): r["c"] for r in con.execute(
             "SELECT run, task, MAX(change_no) c FROM change_log GROUP BY run, task")}
+        summary = _summary_values(con)
     finally:
         con.close()
     root = open_root(home)
@@ -788,6 +850,26 @@ def catch_up(home, project, data_dir=None):
         _upsert_card(home, project, t["run"], t["id"], t, t["status"], col, attention,
                      t["round"], no, data_dir, updated=t["updated"])
         n += 1
+    # C1: the one summary write. The compare-then-write reads happen outside a transaction
+    # (single writer: nothing else moves the root between them), and the write only opens
+    # one when the row is missing or differs, so the idempotent pass commits nothing.
+    root = open_root(home)
+    try:
+        seen = root.execute("SELECT last_change_no FROM sync WHERE project=?", (project,)).fetchone()
+        have = root.execute(
+            "SELECT active_runs, by_status_json, attention, last_event, change_no"
+            " FROM project_summary WHERE project=?", (project,)).fetchone()
+        want_no = seen["last_change_no"] if seen else 0
+        if have is None or tuple(have) != (*summary, want_no):
+            _begin(root)
+            try:
+                _write_summary(root, project, summary, want_no)
+                root.execute("COMMIT")
+            except Exception:
+                root.execute("ROLLBACK")
+                raise
+    finally:
+        root.close()
     return n
 
 
@@ -1331,6 +1413,12 @@ def self_test():
         _v1_upgrade(home)
         _lane_slots_v3(home)
         _card_verdict(home)
+        _summary_transitions(home)
+        _summary_regress(home)
+        _summary_import(home)
+        _summary_kill(home)
+        _summary_idempotent(home)
+        _summary_two_projects(home)
         _reads_create_nothing(home)
         _projects_read(home)
         _single_writer()
@@ -2292,6 +2380,272 @@ def _card_verdict(home):
     caught = catch_up(home, "verdict", data)
     got = cards(home, "verdict")
     _check(caught >= 1 and got[0]["verdict"] == "REQUEST CHANGES", f"catch_up verdict {got} n={caught}")
+
+
+# --- S1 summary self-tests: extract this whole region for the old-code probe ---
+def _summary_row(root, project):
+    """The stored project_summary row as a plain tuple, or None while the writer is absent."""
+    r = root.execute(
+        "SELECT active_runs, by_status_json, attention, last_event, change_no"
+        " FROM project_summary WHERE project=?", (project,)).fetchone()
+    return tuple(r) if r else None
+
+
+def _summary_recount(home, data_dir):
+    """Independent recount of the summary contract, computed here with fresh SQL (C1).
+
+    active_runs = runs with status IN ('running','active'); by_status_json = json.dumps of
+    {status: count} over every task, sort_keys=True; attention = tasks in blocked/stalled/
+    quota/provider; last_event = MAX(t) over events, NULL with no events. No writer helper
+    is reused: the recount must not inherit the bug it polices.
+    """
+    con = open_project(home, data_dir=data_dir)
+    try:
+        counts = {r["status"]: r["c"] for r in
+                  con.execute("SELECT status, COUNT(*) c FROM tasks GROUP BY status")}
+        active = con.execute(
+            "SELECT COUNT(*) c FROM runs WHERE status IN ('running','active')").fetchone()["c"]
+        last = con.execute("SELECT MAX(t) FROM events").fetchone()[0]
+    finally:
+        con.close()
+    return (active, json.dumps(counts, sort_keys=True),
+            sum(n for s, n in counts.items() if s in ATTENTION), last)
+
+
+def _summary_import_sample():
+    """One small historical run: a done task, an attention task, two past-timestamped events."""
+    run_row = {"id": "hist", "plan": "p", "plan_version": 1, "branch": "b", "status": "done",
+               "stage": None, "next": None, "started": "2021-01-01T00:00:00+00:00",
+               "ended": "2021-01-02T00:00:00+00:00"}
+    tasks = [
+        {"id": "a", "type": "task", "title": "a", "status": "done",
+         "updated": "2021-01-01T01:00:00+00:00"},
+        {"id": "b", "type": "task", "title": "b", "status": "quota",
+         "updated": "2021-01-01T02:00:00+00:00"},
+    ]
+    events = [
+        {"src": "s1", "task": "a", "t": "2021-01-01T00:00:01+00:00", "chan": "state",
+         "kind": "transition", "text": "started"},
+        {"src": "s2", "task": "b", "t": "2021-01-01T00:00:09+00:00", "chan": "bus",
+         "kind": "note", "text": "hit the quota"},
+    ]
+    return run_row, tasks, events
+
+
+def _summary_transitions(home):
+    """Transitions across two seeded runs: the row equals an independent recount (C1).
+
+    One run is 'active', one 'done', so active_runs must count only the first; the blocked
+    task must raise attention; change_no must equal the sync watermark — the last change
+    the root has seen for the project.
+    """
+    data = os.path.join(home, "sumtr")
+    con = open_project(home, data_dir=data)
+    try:
+        _begin(con)
+        con.execute("INSERT INTO runs(id, status) VALUES ('r1', 'active')")
+        con.execute("INSERT INTO runs(id, status) VALUES ('r2', 'done')")
+        con.execute("COMMIT")
+        add_task(con, "r1", "t1", "task")
+        add_task(con, "r1", "t2", "task")
+        add_task(con, "r2", "t3", "task")
+        add_task(con, "r2", "t4", "task")
+    finally:
+        con.close()
+    transition(home, "sumtr", "r1", "t1", "building", sync_root=True, data_dir=data)
+    transition(home, "sumtr", "r1", "t2", "blocked", sync_root=True, data_dir=data)
+    transition(home, "sumtr", "r2", "t3", "done", sync_root=True, data_dir=data)
+    transition(home, "sumtr", "r2", "t4", "review", sync_root=True, data_dir=data)
+    root = open_root(home)
+    try:
+        row = _summary_row(root, "sumtr")
+        _check(row is not None, "_summary_transitions: no project_summary row for 'sumtr'")
+        expect = _summary_recount(home, data)
+        _check(row[:4] == expect, f"_summary_transitions: row {row[:4]} != recount {expect}")
+        last = root.execute("SELECT last_change_no FROM sync WHERE project='sumtr'").fetchone()
+        _check(last and row[4] == last[0],
+               f"_summary_transitions: change_no {row[4]} != watermark {last[0] if last else None}")
+    finally:
+        root.close()
+
+
+def _summary_regress(home):
+    """done -> fix rewrites the summary: by_status_json differs and matches the recount again."""
+    data = os.path.join(home, "sumre")
+    con = open_project(home, data_dir=data)
+    try:
+        add_task(con, "r", "tmain", "task")
+        add_task(con, "r", "tdep", "task", deps="tmain")
+    finally:
+        con.close()
+    transition(home, "sumre", "r", "tmain", "done", sync_root=True, data_dir=data)
+    root = open_root(home)
+    try:
+        row = _summary_row(root, "sumre")
+        _check(row is not None, "_summary_regress: no project_summary row for 'sumre'")
+        old_json, old_no = row[1], row[4]
+    finally:
+        root.close()
+    transition(home, "sumre", "r", "tmain", "fix", sync_root=True, data_dir=data)
+    root = open_root(home)
+    try:
+        row = _summary_row(root, "sumre")
+        expect = _summary_recount(home, data)
+        _check(row[:4] == expect, f"_summary_regress: row {row[:4]} != recount {expect}")
+        _check(row[1] != old_json, "_summary_regress: done->fix left by_status_json unchanged")
+        last = root.execute("SELECT last_change_no FROM sync WHERE project='sumre'").fetchone()
+        _check(last and row[4] == last[0] and row[4] >= old_no,
+               f"_summary_regress: change_no {row[4]} vs watermark {last[0] if last else None},"
+               f" previously {old_no}")
+    finally:
+        root.close()
+
+
+def _summary_import(home):
+    """An imported run: catch_up builds the summary; last_event is the newest imported t."""
+    data = os.path.join(home, "sumim")
+    run_row, tasks, events = _summary_import_sample()
+    import_history(home, "sumim", "hist", run_row=run_row, tasks=tasks, events=events, data_dir=data)
+    caught = catch_up(home, "sumim", data_dir=data)
+    _check(caught >= 1, f"_summary_import: catch_up replayed nothing (n={caught})")
+    root = open_root(home)
+    try:
+        row = _summary_row(root, "sumim")
+        _check(row is not None, "_summary_import: no project_summary row for 'sumim'")
+        expect = _summary_recount(home, data)
+        _check(row[:4] == expect, f"_summary_import: row {row[:4]} != recount {expect}")
+        newest = max(e["t"] for e in events)
+        _check(row[3] == newest, f"_summary_import: last_event {row[3]} != max imported t {newest}")
+    finally:
+        root.close()
+
+
+def _summary_kill(home):
+    """A kill between the two writes: the project moved, the root got neither card nor
+    summary; catch_up heals both and the healed row equals the recount."""
+    data = os.path.join(home, "sumki")
+    con = open_project(home, data_dir=data)
+    try:
+        add_task(con, "r", "t", "task")
+    finally:
+        con.close()
+    os.environ["MKDB_FAIL_BEFORE_ROOT"] = "1"
+    try:
+        try:
+            transition(home, "sumki", "r", "t", "building", sync_root=True, data_dir=data)
+        except Fail:
+            pass
+        else:
+            raise SystemExit("SELF-TEST FAIL: _summary_kill: the injected root failure did not fire")
+        con = open_project(home, data_dir=data)
+        try:
+            _check(con.execute("SELECT status FROM tasks WHERE id='t'").fetchone()["status"]
+                   == "building", "_summary_kill: project change lost")
+        finally:
+            con.close()
+        root = open_root(home)
+        try:
+            _check(cards(home, "sumki") == [], "_summary_kill: root card written despite the failure")
+            _check(_summary_row(root, "sumki") is None,
+                   "_summary_kill: summary written despite the failure")
+        finally:
+            root.close()
+        os.environ.pop("MKDB_FAIL_BEFORE_ROOT", None)
+        caught = catch_up(home, "sumki", data_dir=data)
+        _check(caught >= 1 and len(cards(home, "sumki")) == 1,
+               f"_summary_kill: catch_up did not heal the card (n={caught})")
+        root = open_root(home)
+        try:
+            row = _summary_row(root, "sumki")
+            _check(row is not None, "_summary_kill: no project_summary row after catch_up")
+            expect = _summary_recount(home, data)
+            _check(row[:4] == expect, f"_summary_kill: row {row[:4]} != recount {expect}")
+        finally:
+            root.close()
+    finally:
+        os.environ.pop("MKDB_FAIL_BEFORE_ROOT", None)
+
+
+def _summary_idempotent(home):
+    """A second catch_up over an already-synced store writes nothing.
+
+    One root connection stays open across both calls: PRAGMA data_version on it moves only
+    when another connection commits to the file, so it doubles the row/watermark/cards
+    checks. If data_version ever proves unusable here, those three checks below are the
+    idempotence contract on their own.
+    """
+    data = os.path.join(home, "sumid")
+    con = open_project(home, data_dir=data)
+    try:
+        add_task(con, "r", "t1", "task")
+        add_task(con, "r", "t2", "task")
+    finally:
+        con.close()
+    transition(home, "sumid", "r", "t1", "building", sync_root=True, data_dir=data)
+    transition(home, "sumid", "r", "t2", "done", sync_root=True, data_dir=data)
+    # one change the root has not seen, so the first catch_up has real work to do
+    transition(home, "sumid", "r", "t1", "review", sync_root=False, data_dir=data)
+    caught = catch_up(home, "sumid", data_dir=data)
+    _check(caught >= 1, f"_summary_idempotent: first catch_up replayed nothing (n={caught})")
+    root = open_root(home)
+    try:
+        row = _summary_row(root, "sumid")
+        _check(row is not None, "_summary_idempotent: no project_summary row for 'sumid'")
+        dv = root.execute("PRAGMA data_version").fetchone()[0]
+        before = [tuple(c) for c in root.execute(
+            "SELECT run, task, status, change_no FROM cards WHERE project='sumid'"
+            " ORDER BY run, task")]
+        wm = root.execute("SELECT last_change_no FROM sync WHERE project='sumid'").fetchone()[0]
+        again = catch_up(home, "sumid", data_dir=data)
+        _check(again == 0, f"_summary_idempotent: second catch_up replayed {again}")
+        dv2 = root.execute("PRAGMA data_version").fetchone()[0]
+        row2 = _summary_row(root, "sumid")
+        after = [tuple(c) for c in root.execute(
+            "SELECT run, task, status, change_no FROM cards WHERE project='sumid'"
+            " ORDER BY run, task")]
+        wm2 = root.execute("SELECT last_change_no FROM sync WHERE project='sumid'").fetchone()[0]
+        _check(dv == dv2, f"_summary_idempotent: data_version moved {dv} -> {dv2}")
+        _check(row == row2, f"_summary_idempotent: row changed {row} -> {row2}")
+        _check(before == after, "_summary_idempotent: cards changed")
+        _check(wm == wm2, f"_summary_idempotent: watermark moved {wm} -> {wm2}")
+    finally:
+        root.close()
+
+
+def _summary_two_projects(home):
+    """Two data-dir projects under one root: each row matches its own recount, and the
+    rows differ — no project's summary leaks into the other's."""
+    p1, p2 = os.path.join(home, "p1data"), os.path.join(home, "p2data")
+    con = open_project(home, data_dir=p1)
+    try:
+        add_task(con, "r", "a1", "task")
+        add_task(con, "r", "a2", "task")
+    finally:
+        con.close()
+    con = open_project(home, data_dir=p2)
+    try:
+        add_task(con, "r", "b1", "task")
+        add_task(con, "r", "b2", "task")
+        add_task(con, "r", "b3", "task")
+    finally:
+        con.close()
+    transition(home, "sump1", "r", "a1", "building", sync_root=True, data_dir=p1)
+    transition(home, "sump1", "r", "a2", "blocked", sync_root=True, data_dir=p1)
+    transition(home, "sump2", "r", "b1", "done", sync_root=True, data_dir=p2)
+    transition(home, "sump2", "r", "b2", "review", sync_root=True, data_dir=p2)
+    transition(home, "sump2", "r", "b3", "stalled", sync_root=True, data_dir=p2)
+    root = open_root(home)
+    try:
+        r1, r2 = _summary_row(root, "sump1"), _summary_row(root, "sump2")
+        _check(r1 is not None, "_summary_two_projects: no project_summary row for 'sump1'")
+        _check(r2 is not None, "_summary_two_projects: no project_summary row for 'sump2'")
+        e1, e2 = _summary_recount(home, p1), _summary_recount(home, p2)
+        _check(r1[:4] == e1, f"_summary_two_projects: sump1 row {r1[:4]} != recount {e1}")
+        _check(r2[:4] == e2, f"_summary_two_projects: sump2 row {r2[:4]} != recount {e2}")
+        _check(r1 != r2, "_summary_two_projects: the two projects share one summary row")
+    finally:
+        root.close()
+# --- end S1 summary self-tests ---
 
 
 def _listing(path):
