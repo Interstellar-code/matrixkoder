@@ -221,26 +221,20 @@ export function waitingPick(ui: TabUi | undefined, view: WaitingView): string | 
   return held != null && view.options.some(o => o.key === held) ? held : undefined
 }
 
-/** Terminal cells one code point takes. East-Asian wide, emoji and the
- *  ellipsis are 2; combining marks are 0; everything else is 1. */
+/** Terminal cells a string takes. Wide: emoji presentation, extended
+ *  pictographic with an emoji presentation, and East Asian Width W/F (CJK,
+ *  kana, hangul, fullwidth). Zero: ZWJ, variation selectors, combining marks.
+ *  The ellipsis is 1: most terminals draw it in one cell. */
+const WIDE = /\p{Emoji_Presentation}|\p{Extended_Pictographic}\uFE0F?|[\u1100-\u115F\u2329\u232A\u2E80-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE10-\uFE19\uFE30-\uFE6F\uFF00-\uFF60\uFFE0-\uFFE6\u{20000}-\u{3FFFD}]/u
+const ZERO = /\p{Mn}|\u200D|[\uFE00-\uFE0F]/u
+
 export function cellWidth(text: string): number {
   let n = 0
   for (const ch of text) {
-    const cp = ch.codePointAt(0) ?? 0
-    if (cp === 0x200d || (cp >= 0xfe00 && cp <= 0xfe0f) || (cp >= 0x300 && cp <= 0x36f)) continue
-    n += wideCell(cp) ? 2 : 1
+    if (ZERO.test(ch)) continue
+    n += WIDE.test(ch) ? 2 : 1
   }
   return n
-}
-
-function wideCell(cp: number): boolean {
-  return cp === 0x2026
-    || (cp >= 0x1100 && cp <= 0x115f) || cp === 0x2329 || cp === 0x232a
-    || (cp >= 0x2e80 && cp <= 0xa4cf) || (cp >= 0xac00 && cp <= 0xd7a3)
-    || (cp >= 0xf900 && cp <= 0xfaff) || (cp >= 0xfe10 && cp <= 0xfe19)
-    || (cp >= 0xfe30 && cp <= 0xfe6f) || (cp >= 0xff00 && cp <= 0xff60)
-    || (cp >= 0xffe0 && cp <= 0xffe6) || (cp >= 0x1f300 && cp <= 0x1f64f)
-    || (cp >= 0x1f900 && cp <= 0x1f9ff) || (cp >= 0x20000 && cp <= 0x3fffd)
 }
 
 /** cut `text` to `w` terminal cells, marking the cut with `…` — a row never wraps. */

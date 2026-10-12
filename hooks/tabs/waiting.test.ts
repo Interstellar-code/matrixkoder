@@ -7,7 +7,7 @@
 import { test, expect } from 'claude-code/testing'
 import type { Elements } from 'claude-code'
 import { mockFs, mockWorld, paneProps, sessionStart, worldFiles, worldFixtures } from './../testkit'
-import { ASK_CAP, WaitingTab, askKey, askView, cellWidth, emptyWaitingView, optionChipRole, readPending, runWaitView, waitingActions, waitingAsks, waitingMoreKey, waitingPick, waitingPickKey, waitingView } from './waiting'
+import { ASK_CAP, WaitingTab, askKey, askView, emptyWaitingView, optionChipRole, readPending, runWaitView, waitingActions, waitingAsks, waitingMoreKey, waitingPick, waitingPickKey, waitingView } from './waiting'
 import type { PendingAsk, RunFn, TabUi, WaitOption } from './waiting'
 import { PENDING_CAPTURED } from './waiting.pending.fixture'
 import { ROLE } from './palette'
@@ -410,14 +410,30 @@ test('50 asks cap at 8 cards plus a +N more row, and long, unicode and odd ids f
   }
 })
 
-test('CJK and emoji text fits the pane in terminal cells', () => {
-  const ask: PendingAsk = { id: 'm-1', run: 'r1', task: 'T1', text: '質問'.repeat(30), ts: NOW }
-  const emoji: PendingAsk = { id: 'm-2', run: 'r1', task: 'T1', text: '🤔'.repeat(40), ts: NOW }
+/** Independent of `cellWidth`: emoji presentation and CJK/kana/hangul/
+ *  fullwidth are 2 cells; marks, ZWJ and variation selectors are 0. */
+function refWidth(s: string): number {
+  const wide = /\p{Emoji_Presentation}|[\u1100-\u115F\u2E80-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFF00-\uFF60\uFFE0-\uFFE6]/u
+  const zero = /\p{Mn}|\u200D|[\uFE00-\uFE0F]/u
+  let n = 0
+  for (const ch of s) {
+    if (zero.test(ch)) continue
+    n += wide.test(ch) ? 2 : 1
+  }
+  return n
+}
+
+test('emoji, CJK, ZWJ, combining, tab and ellipsis fit the pane', () => {
+  const samples = [
+    '🚀'.repeat(40), '✅'.repeat(40), '🫶'.repeat(40), '⚡'.repeat(40), '❌'.repeat(40),
+    '🤔'.repeat(40), '質問'.repeat(30), 'ひらがな'.repeat(15), '한국어'.repeat(20),
+    '👨‍👩‍👧'.repeat(20), 'é'.repeat(60), 'a\tb '.repeat(20), '…'.repeat(60),
+  ]
   for (const cols of [46, 36]) {
-    for (const one of [ask, emoji]) {
-      const tree = waitingAsks(stubEls(), [one], cols, NOW)
-      const widest = Math.max(...allOf(tree, 'Text').map(t => cellWidth(text(t))))
-      expect(widest, `${String(cols)} cols`).toBeLessThanOrEqual(cols)
+    for (const sample of samples) {
+      const tree = waitingAsks(stubEls(), [{ id: 'm-1', run: 'r1', task: 'T1', text: sample, ts: NOW }], cols, NOW)
+      const widest = Math.max(...allOf(tree, 'Text').map(t => refWidth(text(t))))
+      expect(widest, `${JSON.stringify(sample.slice(0, 4))} at ${String(cols)}`).toBeLessThanOrEqual(cols)
     }
   }
 })
