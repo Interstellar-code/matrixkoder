@@ -156,18 +156,34 @@ def _connect(path):
 
 
 def _connect_ro(path):
-    """Open an existing store read-only. Never creates the file, its directory, or -wal/-shm.
+    """Open an existing store read-only. Never creates the database file.
 
     mode=ro is the documented exception to the single-writer rule: a read must not migrate,
     stamp schema_version, or otherwise write. query_only is belt and braces on top of the URI.
+
+    immutable=1 is used ONLY when no -wal exists: it tells SQLite the file never changes, so it
+    ignores the WAL, which would hide commits a live writer has not checkpointed yet. With a WAL
+    present the open is plain mode=ro, which reads the WAL. A mode=ro open of a WAL database needs
+    the -shm file and creates it when it can; if the directory is not writable and -shm is missing,
+    the failure is a named error, never a traceback.
     """
-    # immutable=1 stops SQLite creating -wal/-shm sidecars for a read (mode=ro alone still does).
-    uri = "file:" + path + "?mode=ro&immutable=1"
-    con = sqlite3.connect(uri, uri=True, timeout=5.0)
+    wal = path + "-wal"
+    if os.path.exists(wal) and os.path.getsize(wal) > 0:
+        uri = "file:" + path + "?mode=ro"
+    else:
+        uri = "file:" + path + "?mode=ro&immutable=1"
+    try:
+        con = sqlite3.connect(uri, uri=True, timeout=5.0)
+    except sqlite3.OperationalError as e:
+        raise Fail(f"cannot open {path} read-only: {e}")
     con.row_factory = sqlite3.Row
-    con.execute("PRAGMA query_only=ON")
-    con.execute("PRAGMA busy_timeout=5000")
-    con.execute("PRAGMA foreign_keys=ON")
+    try:
+        con.execute("PRAGMA query_only=ON")
+        con.execute("PRAGMA busy_timeout=5000")
+        con.execute("PRAGMA foreign_keys=ON")
+    except sqlite3.OperationalError as e:
+        con.close()
+        raise Fail(f"cannot open {path} read-only: {e}")
     return con
 
 
@@ -2083,6 +2099,52 @@ def _reads_create_nothing(home):
         raise SystemExit("SELF-TEST FAIL: an unstamped root store was read without a migration error")
     _check(_file_hash(os.path.join(root_old, "mk.db")) == root_hash, "reading an old root wrote it")
     _check(not os.path.exists(os.path.join(root_old, "mk.db-wal")), "reading an old root created a wal")
+
+    # Y1 R2: a commit sitting in the WAL, not yet checkpointed, must be visible to a read.
+    # The reviewer's repro: wal_autocheckpoint=0, one committed insert, then timeline.
+    wal = os.path.join(home, "ro-wal")
+    con = open_project(home, data_dir=wal)
+    try:
+        add_task(con, "r", "t", "task", title="initial")
+    finally:
+        con.close()
+    wal_db = os.path.join(wal, "mk.db")
+    wcon = sqlite3.connect(wal_db)
+    wcon.execute("PRAGMA wal_autocheckpoint=0")
+    wcon.execute("INSERT INTO events(run, task, t, chan, kind, text) VALUES(?,?,?,?,?,?)",
+                 ("r", "t", "1000", "state", "note", "uncheckpointed_wal_event"))
+    wcon.commit()
+    _check(os.path.getsize(wal_db + "-wal") > 0, "the repro did not leave a WAL")
+    before = {n: _file_hash(wal_db + s) for n, s in (("db", ""), ("wal", "-wal"))}
+    shm_existed = os.path.exists(wal_db + "-shm")
+    got = timeline(home, "p", "r", "t", wal)
+    _check(any(e["text"] == "uncheckpointed_wal_event" for e in got),
+           f"timeline missed the uncheckpointed WAL event: {[e['text'] for e in got]}")
+    after = {n: _file_hash(wal_db + s) for n, s in (("db", ""), ("wal", "-wal"))}
+    # The -shm file is the WAL index, not data: SQLite rewrites it when a reader attaches, so its
+    # hash is not stable. The database and the WAL frames themselves must not change, and a read
+    # must not create the -shm when the writer did not already have one.
+    _check(after == before, f"reading a live WAL changed the data: {before} -> {after}")
+    _check(os.path.exists(wal_db + "-shm") == shm_existed, "the read created or removed the -shm")
+    wcon.close()
+
+    # A writer holding an uncommitted transaction must not hang or crash the read.
+    held = os.path.join(home, "ro-held")
+    con = open_project(home, data_dir=held)
+    try:
+        add_task(con, "r", "t", "task", title="held")
+    finally:
+        con.close()
+    held_db = os.path.join(held, "mk.db")
+    holder = sqlite3.connect(held_db, timeout=5.0)
+    holder.execute("PRAGMA busy_timeout=5000")
+    holder.execute("BEGIN IMMEDIATE")
+    holder.execute("INSERT INTO events(run, task, t, chan, kind, text) VALUES(?,?,?,?,?,?)",
+                   ("r", "t", "1000", "state", "note", "not_committed"))
+    got = timeline(home, "p", "r", "t", held)
+    _check(all(e["text"] != "not_committed" for e in got), "a read saw an uncommitted insert")
+    holder.execute("ROLLBACK")
+    holder.close()
 
 
 def _single_writer():
