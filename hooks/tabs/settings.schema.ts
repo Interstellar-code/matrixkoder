@@ -235,11 +235,25 @@ export const SETTINGS_SCHEMA = {
       "type": "bool"
     },
     {
+      "default": [],
+      "editable": true,
+      "key": "picks.codex",
+      "scope": "models",
+      "type": "list"
+    },
+    {
       "default": true,
       "editable": false,
       "key": "agents.agy.available",
       "scope": "agents",
       "type": "bool"
+    },
+    {
+      "default": [],
+      "editable": true,
+      "key": "picks.agy",
+      "scope": "models",
+      "type": "list"
     },
     {
       "default": true,
