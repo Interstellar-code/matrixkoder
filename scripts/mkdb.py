@@ -18,7 +18,7 @@ the only status writer, and the root card is a copy written afterwards, only whe
 
 Schema: docs/state-schema.md (store section).
 """
-import argparse, datetime, hashlib, json, multiprocessing, os, re, sqlite3, subprocess, sys, tempfile
+import argparse, contextlib, datetime, hashlib, json, multiprocessing, os, re, sqlite3, subprocess, sys, tempfile
 
 sys.dont_write_bytecode = True
 
@@ -465,55 +465,97 @@ def _dep_met(con, run, dep):
     return bool(row) and row["status"] in DEP_MET
 
 
-def promote_ready(home, project, run, data_dir=None, sync_root=False):
-    """Move every planned/routed task whose deps are all met to `ready`, through transition().
+def promote_ready(home, project, run, changed=None, data_dir=None, sync_root=False):
+    """Move dependents of `run`'s tasks to `ready` when every dep is met, and back to `planned`
+    when a dep leaves the met set (a done -> fix regress), through transition().
 
-    A task with no deps stays planned. A task that has started is never touched. Idempotent:
-    a task already `ready` is not in READY_FROM, so a second pass moves nothing. Each move is
-    its own transition, so it gets its own event, root card and change_no. -> ids moved."""
+    Scope: the triggering run, plus any task that names `<run>:<id>` in deps — never an
+    unrelated old run. One connection for the scan, one snapshot of the dep statuses, so a
+    long waiting chain costs one query per pass, not one per candidate. A task with no deps
+    stays planned; a task that has started is never touched (its status is not in READY_FROM).
+    Each move is ONE transaction: no event (the file view's "deps met" note is the one event),
+    `updated` unchanged. Idempotent: a task already `ready` is not in READY_FROM, and a demoted
+    task has an unmet dep, so a second pass moves nothing. A candidate whose card does not
+    match its row is repaired: the import can write the status itself (file flag -> store
+    status) with a change_log row below the watermark the triggering transition advanced, which
+    catch_up() then never replays. -> ids moved."""
     con = open_project(home, project, data_dir)
     try:
-        rows = con.execute("SELECT run, id, deps, status FROM tasks WHERE status IN (?,?)",
-                           READY_FROM).fetchall()
-        waiting = [(r["run"], r["id"], _deps_of(r["deps"])) for r in rows if _deps_of(r["deps"])]
+        like = f"%{run}:%"
+        rows = con.execute(
+            "SELECT run, id, deps, status FROM tasks"
+            " WHERE (status IN (?,?) AND (run=? OR deps LIKE ?))"
+            "    OR (status='ready' AND (run=? OR deps LIKE ?))",
+            (*READY_FROM, run, like, run, like)).fetchall()
+        if not rows:
+            return []
+        runs = {run}
+        for r in rows:
+            for d in _deps_of(r["deps"]):
+                with contextlib.suppress(Fail):  # malformed dep: the task is skipped below
+                    runs.add(_dep_target(r["run"], d)[0])
+        marks = {(x["run"], x["id"]): x["status"] for x in
+                 con.execute("SELECT run, id, status FROM tasks WHERE run IN (%s)"
+                             % ",".join("?" * len(runs)), tuple(sorted(runs)))}
     finally:
         con.close()
+    card_status = {}
+    if sync_root:
+        root = open_root(home)
+        try:
+            card_status = {(c["run"], c["task"]): c["status"] for c in
+                           root.execute("SELECT run, task, status FROM cards WHERE project=?",
+                                        (project,))}
+        finally:
+            root.close()
     moved = []
-    for rid, tid, deps in waiting:
-        con = open_project(home, project, data_dir)
-        try:
-            met = all(_dep_met(con, rid, d) for d in deps)
-            cur = con.execute("SELECT status FROM tasks WHERE run=? AND id=?", (rid, tid)).fetchone()
-        finally:
-            con.close()
-        if not met or not cur or cur["status"] not in READY_FROM:
+    for r in rows:
+        deps = _deps_of(r["deps"])
+        if not deps:
             continue
-        # the file view records readiness as a flag, not an event, and stamps the task once.
-        # remember that stamp so the promotion does not move `updated` a second later.
-        con = open_project(home, project, data_dir)
         try:
-            stamped = con.execute("SELECT updated FROM tasks WHERE run=? AND id=?", (rid, tid)).fetchone()
-        finally:
-            con.close()
-        transition(home, project, rid, tid, "ready", note="deps met: ready",
-                   sync_root=sync_root, data_dir=data_dir)
-        con = open_project(home, project, data_dir)
-        try:
-            extra = con.execute(
-                "SELECT MAX(id) m FROM events WHERE run=? AND task=? AND kind='transition' AND to_id='ready'",
-                (rid, tid)).fetchone()
-            if extra and extra["m"]:
-                con.execute("DELETE FROM events WHERE id=?", (extra["m"],))
-            if stamped and stamped["updated"]:
-                con.execute("UPDATE tasks SET updated=? WHERE run=? AND id=?", (stamped["updated"], rid, tid))
-            con.commit()
-        finally:
-            con.close()
-        moved.append(tid)
+            targets = [_dep_target(r["run"], d) for d in deps]
+        except Fail:
+            continue  # a malformed stored dep: skip this task, never fail the committed change
+        met = all(marks.get(t) in DEP_MET for t in targets)
+        if r["status"] in READY_FROM and met:
+            to = "ready"
+        elif r["status"] == "ready" and not met:
+            to = "planned"
+        else:
+            to = None
+        key = (r["run"], r["id"])
+        if to is not None:
+            con = open_project(home, project, data_dir)
+            try:
+                cur = con.execute("SELECT status FROM tasks WHERE run=? AND id=?", key).fetchone()
+            finally:
+                con.close()
+            if not cur or cur["status"] != r["status"]:
+                continue  # moved between the scan and now: leave it to the next pass
+            transition(home, project, r["run"], r["id"], to,
+                       note="" if to == "ready" else "dep no longer met",
+                       data_dir=data_dir, sync_root=sync_root, event=False, keep_updated=True)
+            card_status[key] = to
+            if to == "ready":
+                moved.append(r["id"])
+        if sync_root and card_status.get(key) != r["status"]:
+            con = open_project(home, project, data_dir)
+            try:
+                row = con.execute("SELECT * FROM tasks WHERE run=? AND id=?", key).fetchone()
+                no = con.execute("SELECT MAX(change_no) c FROM change_log WHERE run=? AND task=?",
+                                 key).fetchone()["c"]
+            finally:
+                con.close()
+            if row and no:
+                col, attention = _placed(row)
+                _upsert_card(home, project, r["run"], r["id"], row, row["status"], col, attention,
+                             row["round"], no, data_dir, updated=row["updated"])
     return moved
 
 
-def transition(home, project, run, task, to, note="", round=0, sync_root=False, data_dir=None, verdict=_UNSET):
+def transition(home, project, run, task, to, note="", round=0, sync_root=False, data_dir=None, verdict=_UNSET,
+                 event=True, keep_updated=False):
     """The ONLY status writer (C10). One project transaction, then the root card iff sync_root.
 
     verdict defaults to leaving the task's stored verdict unchanged. Pass a string or None to
@@ -526,8 +568,8 @@ def transition(home, project, run, task, to, note="", round=0, sync_root=False, 
         _begin(con)
         try:
             row = con.execute(
-                "SELECT parent, type, title, route_json, lane, status, prev_status, verdict FROM tasks"
-                " WHERE run=? AND id=?", (run, task)).fetchone()
+                "SELECT parent, type, title, route_json, lane, status, prev_status, verdict, updated"
+                " FROM tasks WHERE run=? AND id=?", (run, task)).fetchone()
             if not row:
                 raise Fail(f"no task {run}:{task}")
             # An attention status keeps the column of the previous non-attention status (C4).
@@ -535,14 +577,16 @@ def transition(home, project, run, task, to, note="", round=0, sync_root=False, 
             kept = row["prev_status"] if to in ATTENTION else (to if to in COLUMNS else row["prev_status"])
             # verdict= is optional: a status-only transition leaves the stored verdict alone.
             verdict = row["verdict"] if verdict is _UNSET else verdict
+            stamped = row["updated"] if (keep_updated and row["updated"]) else now()
             con.execute(
                 "UPDATE tasks SET status=?, prev_status=?, round=?, verdict=?, updated=? WHERE run=? AND id=?",
-                (to, kept, round, verdict, now(), run, task))
+                (to, kept, round, verdict, stamped, run, task))
             row = dict(row)
             row["verdict"] = verdict
-            con.execute(
-                "INSERT INTO events(run, task, t, chan, kind, to_id, text) VALUES (?,?,?,?,?,?,?)",
-                (run, task, now(), "state", "transition", to, note))
+            if event:
+                con.execute(
+                    "INSERT INTO events(run, task, t, chan, kind, to_id, text) VALUES (?,?,?,?,?,?,?)",
+                    (run, task, now(), "state", "transition", to, note))
             cur = _change_log(con, run, task)
             change_no = cur.lastrowid
             con.execute("COMMIT")
@@ -552,7 +596,8 @@ def transition(home, project, run, task, to, note="", round=0, sync_root=False, 
         # The child's card lands before the parent rollup, so a lower change_no cannot follow a
         # higher one into the root. sync.last_change_no is also monotonic inside the upsert.
         if sync_root:
-            _upsert_card(home, project, run, task, row, to, col, attention, round, change_no, data_dir)
+            _upsert_card(home, project, run, task, row, to, col, attention, round, change_no, data_dir,
+                         updated=stamped)
         rolled = _rollup(con, run, row["parent"]) if row["parent"] else None
         if rolled and rolled != con.execute("SELECT status FROM tasks WHERE run=? AND id=?",
                                             (run, row["parent"])).fetchone()["status"]:
@@ -562,12 +607,15 @@ def transition(home, project, run, task, to, note="", round=0, sync_root=False, 
         con.close()
     # a task reaching merged/done can unblock its dependents. ready itself is not terminal,
     # so this cannot recurse.
-    if to in DEP_MET:
-        promote_ready(home, project, run, data_dir=data_dir, sync_root=sync_root)
+    # a task reaching the met set can promote its dependents; one leaving it (done -> fix)
+    # can demote them. `row["status"]` is the status before this transition.
+    if to in DEP_MET or row["status"] in DEP_MET:
+        promote_ready(home, project, run, changed=task, data_dir=data_dir, sync_root=sync_root)
     return change_no
 
 
-def _upsert_card(home, project, run, task, row, status, col, attention, round, change_no, data_dir):
+def _upsert_card(home, project, run, task, row, status, col, attention, round, change_no, data_dir,
+                  updated=None):
     """C5: the root copy, in its own transaction. A failure here leaves the project change durable."""
     root = open_root(home)
     try:
@@ -583,7 +631,7 @@ def _upsert_card(home, project, run, task, row, status, col, attention, round, c
                 " change_no=MAX(cards.change_no, excluded.change_no)",
                 (project, run, task, row["parent"], row["type"], row["title"], status, col, attention,
                  row["route_json"], row["lane"], round, row["verdict"] if "verdict" in row.keys() else None,
-                 now(), change_no))
+                 updated or now(), change_no))
             root.execute(
                 "INSERT INTO sync(project, last_change_no) VALUES (?,?)"
                 " ON CONFLICT(project) DO UPDATE SET last_change_no=MAX(sync.last_change_no, excluded.last_change_no)",
@@ -2212,57 +2260,79 @@ def _reads_create_nothing(home):
 
 
 def _ready(home):
-    """A task whose deps are all merged/done becomes ready, through transition()."""
+    """A task whose deps are all merged/done becomes ready; a regress demotes it; the move is
+    one transaction with no event and no `updated` rewrite; the scan stays inside the run."""
     data = os.path.join(home, "ready")
     con = open_project(home, data_dir=data)
     try:
         add_task(con, "r", "rdy-a", "task", title="a")
         add_task(con, "r", "rdy-b", "task", title="b", deps="rdy-a")
         add_task(con, "r", "nodep", "task", title="no deps")
-        # diamond: ready only after BOTH deps are done
         add_task(con, "r", "d1", "task")
         add_task(con, "r", "d2", "task")
         add_task(con, "r", "diamond", "task", deps="d1,d2")
-        # cross-run dep
         add_task(con, "other", "ext", "task")
         add_task(con, "r", "cross", "task", deps="other:ext")
-        # a started task is never reset, even when its dep is met
         add_task(con, "r", "started", "task", deps="rdy-a", status="building")
+        # an unrelated OLD run whose dep happens to be met: a transition in r must not touch it
+        add_task(con, "old", "gone", "task", status="done")
+        add_task(con, "old", "waiter", "task", deps="gone")
+        add_task(con, "old", "far", "task", deps="other:ext")
     finally:
         con.close()
 
-    def status(run, task):
+    def row(run, task, col="status"):
         c = open_project(home, data_dir=data)
         try:
-            return c.execute("SELECT status FROM tasks WHERE run=? AND id=?", (run, task)).fetchone()["status"]
+            return c.execute(f"SELECT {col} FROM tasks WHERE run=? AND id=?", (run, task)).fetchone()[0]
         finally:
             c.close()
 
-    def changes():
+    def counts():
         c = open_project(home, data_dir=data)
         try:
-            return c.execute("SELECT COUNT(*) c FROM change_log").fetchone()["c"]
+            return (c.execute("SELECT COUNT(*) c FROM change_log").fetchone()["c"],
+                    c.execute("SELECT COUNT(*) c FROM events").fetchone()["c"])
         finally:
             c.close()
 
-    _check(status("r", "rdy-b") == "planned", "rdy-b not planned before its dep is done")
+    _check(row("r", "rdy-b") == "planned", "rdy-b not planned before its dep is done")
+    stamped = row("r", "rdy-b", "updated")
     transition(home, "matrixkoder", "r", "rdy-a", "done", data_dir=data)
-    _check(status("r", "rdy-b") == "ready", f"rdy-b is {status('r', 'rdy-b')} after rdy-a is done")
-    _check(status("r", "nodep") == "planned", "a task with no deps moved")
-    _check(status("r", "started") == "building", "a started task was reset")
-    _check(status("r", "diamond") == "planned", "diamond ready after one dep")
+    _check(row("r", "rdy-b") == "ready", f"rdy-b is {row('r', 'rdy-b')} after rdy-a is done")
+    _check(row("r", "rdy-b", "updated") == stamped, "the promotion moved tasks.updated")
+    _check(row("r", "nodep") == "planned", "a task with no deps moved")
+    _check(row("r", "started") == "building", "a started task was reset")
+    _check(row("r", "diamond") == "planned", "diamond ready after one dep")
     transition(home, "matrixkoder", "r", "d1", "done", data_dir=data)
-    _check(status("r", "diamond") == "planned", "diamond ready after only d1")
+    _check(row("r", "diamond") == "planned", "diamond ready after only d1")
     transition(home, "matrixkoder", "r", "d2", "merged", data_dir=data)
-    _check(status("r", "diamond") == "ready", "diamond not ready after both deps")
-    _check(status("r", "cross") == "planned", "cross-run dep counted before it was done")
+    _check(row("r", "diamond") == "ready", "diamond not ready after both deps")
+    _check(row("r", "cross") == "planned", "cross-run dep counted before it was done")
+    _check(row("old", "waiter") == "planned" and row("old", "far") == "planned",
+           "a transition in run r promoted tasks in the unrelated old run")
     transition(home, "matrixkoder", "other", "ext", "done", data_dir=data)
-    _check(status("r", "cross") == "ready", "cross-run dep did not promote")
-    # idempotent: a second pass moves nothing and writes no change_log row
-    before = changes()
+    _check(row("r", "cross") == "ready", "cross-run dep did not promote")
+    # no promotion wrote a transition event: the file view's "deps met" note is the one event
+    c = open_project(home, data_dir=data)
+    try:
+        n = c.execute("SELECT COUNT(*) c FROM events WHERE kind='transition' AND to_id='ready'").fetchone()["c"]
+    finally:
+        c.close()
+    _check(n == 0, f"a promotion wrote {n} transition events")
+    # idempotent: a second pass moves nothing, writes no change_log row and no event
+    before = counts()
     moved = promote_ready(home, "matrixkoder", "r", data_dir=data)
     _check(moved == [], f"second pass moved {moved}")
-    _check(changes() == before, "second pass wrote a change_log row")
+    _check(counts() == before, "second pass wrote a change_log row or an event")
+    # a dep that regresses demotes the dependent (file mode flips the ready flag the same way)
+    stamped_b = row("r", "rdy-b", "updated")
+    transition(home, "matrixkoder", "r", "rdy-a", "fix", data_dir=data)
+    _check(row("r", "rdy-b") == "planned", f"a regressed dep left rdy-b {row('r', 'rdy-b')}")
+    _check(row("r", "rdy-b", "updated") == stamped_b, "the demotion moved tasks.updated")
+    # back again: done -> ready, so the pair is reversible
+    transition(home, "matrixkoder", "r", "rdy-a", "done", data_dir=data)
+    _check(row("r", "rdy-b") == "ready", "a re-met dep did not re-promote")
 
 
 def _single_writer():

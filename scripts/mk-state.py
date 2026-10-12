@@ -614,13 +614,18 @@ class Store:
         """The tasks columns import_history accepts, plus the file fields it has no column for."""
         deps = t.get("deps") or []
         owned = t.get("owned") or []
+        # the file view shows readiness as a flag on a planned task; the store shows it as the
+        # status. Mapping the flag back stops the next import from demoting a ready task.
+        status = t.get("status") or "planned"
+        if status in ("planned", "routed") and t.get("ready"):
+            status = "ready"
         return {"id": t["id"], "parent": t.get("parent"), "type": "task",
                 "title": t.get("title") or "", "acceptance": t.get("acceptance"),
                 "owned": ",".join(owned) if isinstance(owned, list) else (owned or ""),
                 "deps": ",".join(deps) if isinstance(deps, list) else (deps or ""),
                 "parallel": 1 if t.get("parallel") else 0,
                 "route_json": _route_json(t),
-                "status": t.get("status") or "planned", "lane": t.get("lane"), "slot": t.get("slot"),
+                "status": status, "lane": t.get("lane"), "slot": t.get("slot"),
                 "branch": t.get("branch"), "pane": t.get("pane"), "round": t.get("round") or 0,
                 "verdict": t.get("verdict"), "updated": t.get("updated")}
 
@@ -790,6 +795,14 @@ class Store:
             finally:
                 con.close()
         self._rewritten.discard(rid)
+        if os.environ.get(ROOT_CRASH) != "1":
+            # the import maps the file's ready flag to the store status itself, so the promote
+            # pass here mostly finds nothing to move. What it does is repair cards: the import's
+            # change_log row can sit below the watermark the transition above just advanced,
+            # which catch_up() then never replays.
+            self.db().catch_up(self.home_dir(), STORE_PROJECT, data_dir=self.data)
+            self.db().promote_ready(self.home_dir(), STORE_PROJECT, rid,
+                                    data_dir=self.data, sync_root=True)
 
     def store_transition(self, rid, tid, to, note, line=None):
         """One status change through mkdb.transition, root card included (C5)."""
@@ -4172,6 +4185,41 @@ def store_self_test(tmp, env):
     once(["store", "enable"], stale)
     assert not os.path.exists(old), "stale enable dir survived"
     assert os.path.exists(young), "young enable dir was removed"
+
+    # M2 R2: `ready` survives the next ordinary write, and a regress demotes it.
+    # Through the real CLI, not mkdb.promote_ready directly.
+    rd = os.path.join(tmp, "ready")
+    once(["run", "init", "--id", "rr", "--feature", "Ready", "--branch", "br"], rd)
+    once(["store", "enable"], rd)
+    once(["task", "add", "--id", "A", "--title", "dep", "--run", "rr"], rd)
+    once(["task", "add", "--id", "B", "--title", "needs A", "--deps", "A", "--run", "rr"], rd)
+    once(["task", "add", "--id", "Z", "--title", "unrelated", "--run", "rr"], rd)
+    once(["task", "set", "A", "status=done", "--run", "rr"], rd)
+
+    def store_status(tid):
+        c = _mkdb().open_project(os.path.join(rd, ".mk-home"), STORE_PROJECT, data_dir=rd)
+        try:
+            return c.execute("SELECT status FROM tasks WHERE run='rr' AND id=?", (tid,)).fetchone()["status"]
+        finally:
+            c.close()
+
+    assert store_status("B") == "ready", store_status("B")
+    view = once(["task", "get", "B", "--run", "rr"], rd)["task"]
+    assert view["status"] == "planned" and view["ready"] is True, view  # file view keeps the flag
+    # the next unrelated write must NOT demote B
+    once(["task", "set", "Z", "status=building", "--run", "rr"], rd)
+    assert store_status("B") == "ready", "an unrelated task set demoted B to " + store_status("B")
+    assert store_status("Z") == "building"
+    # the root card shows Ready
+    _mkdb().catch_up(os.path.join(rd, ".mk-home"), STORE_PROJECT, data_dir=rd)
+    cards = _mkdb().cards(os.path.join(rd, ".mk-home"), STORE_PROJECT)
+    col = next(c["col"] for c in cards if c["task"] == "B" and c["run"] == "rr")
+    assert col == "Ready", col
+    # a regress demotes: A done -> fix puts B back to planned
+    once(["task", "set", "A", "status=fix", "--run", "rr"], rd)
+    assert store_status("B") == "planned", "a regressed dep left B " + store_status("B")
+    view = once(["task", "get", "B", "--run", "rr"], rd)["task"]
+    assert view["ready"] is False, view
 
 
 if __name__ == "__main__":
