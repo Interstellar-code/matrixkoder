@@ -3,6 +3,7 @@
 
   timeline --project P --run R --task T --json
   cards [--project P] --json
+  projects --json
   --self-test
 
 Common: --data DIR (the project data dir; until DM a project lives at <repo>/.matrixkoder/),
@@ -930,6 +931,21 @@ def cards(home, project=None):
         root.close()
 
 
+def projects(home):
+    """Read the root store's projects, ordered by slug.
+
+    A missing root store is an empty list: <home>/mk.db is not created.
+    """
+    check_home(home)
+    root = _open_read(os.path.join(home, "mk.db"), ROOT_SCHEMA)
+    if root is None:
+        return []
+    try:
+        return [dict(r) for r in root.execute("SELECT * FROM projects ORDER BY slug")]
+    finally:
+        root.close()
+
+
 def _cli(argv):
     # The common options are accepted before or after the subcommand. They are pulled out first,
     # so a subcommand never sees them and the two positions cannot disagree.
@@ -946,6 +962,8 @@ def _cli(argv):
     tl.add_argument("--json", action="store_true")
     cd = sub.add_parser("cards")
     cd.add_argument("--json", action="store_true")
+    pj = sub.add_parser("projects")
+    pj.add_argument("--json", action="store_true")
     im = sub.add_parser("import-history")
     im.add_argument("--run", required=True)
     im.add_argument("--json-file", required=True)
@@ -961,6 +979,8 @@ def _cli(argv):
         return {"ok": True, "events": timeline(home, args.project, args.run, args.task, args.data)}
     if args.cmd == "cards":
         return {"ok": True, "cards": cards(home, args.project)}
+    if args.cmd == "projects":
+        return {"ok": True, "projects": projects(home)}
     if args.cmd == "import-history":
         if not args.project:
             raise Fail("import-history needs --project")
@@ -975,7 +995,7 @@ def _cli(argv):
                                 tasks=doc.get("tasks") or (), events=doc.get("events") or (),
                                 artifacts=doc.get("artifacts") or (), data_dir=args.data)
         return {"ok": True, **counts}
-    raise Fail("usage: mkdb.py timeline|cards|import-history --json  (or --self-test)")
+    raise Fail("usage: mkdb.py timeline|cards|projects|import-history --json  (or --self-test)")
 
 
 def main(argv):
@@ -1063,6 +1083,7 @@ def self_test():
         _lane_slots_v3(home)
         _card_verdict(home)
         _reads_create_nothing(home)
+        _projects_read(home)
         _single_writer()
     print(json.dumps({"ok": True, "self_test": "pass"}))
     return 0
@@ -2145,6 +2166,44 @@ def _reads_create_nothing(home):
     _check(all(e["text"] != "not_committed" for e in got), "a read saw an uncommitted insert")
     holder.execute("ROLLBACK")
     holder.close()
+
+
+def _projects_read(home):
+    """projects() lists the root store and never creates one."""
+    seeded = os.path.join(home, "proj-read")
+    root = open_root(seeded)
+    try:
+        root.execute(
+            "INSERT INTO projects(slug, name, repo, data_dir, mode, created, last_activity)"
+            " VALUES (?,?,?,?,?,?,?)",
+            ("beta", "Beta", "/r/beta", "/d/beta", "local", "t1", "t2"))
+        root.execute(
+            "INSERT INTO projects(slug, name, repo, data_dir, mode, created, last_activity)"
+            " VALUES (?,?,?,?,?,?,?)",
+            ("alpha", "Alpha", "/r/alpha", "/d/alpha", "local", "t1", "t2"))
+        root.commit()
+    finally:
+        root.close()
+    got = projects(seeded)
+    _check([r["slug"] for r in got] == ["alpha", "beta"], f"order {got}")
+    _check(all({"slug", "repo", "data_dir"} <= set(r) for r in got), f"columns {got}")
+    _check(got[0]["repo"] == "/r/alpha" and got[0]["data_dir"] == "/d/alpha", f"alpha {got[0]}")
+    cli = _cli(["projects", "--json", "--home", seeded])
+    _check(cli["ok"] is True and [r["slug"] for r in cli["projects"]] == ["alpha", "beta"], f"cli {cli}")
+
+    missing = os.path.join(home, "proj-missing-dir")
+    _check(not os.path.exists(missing), "fixture dir already exists")
+    _check(projects(missing) == [], "projects() created a missing home")
+    cli = _cli(["projects", "--json", "--home", missing])
+    _check(cli == {"ok": True, "projects": []}, f"missing cli {cli}")
+    _check(not os.path.exists(missing), "projects created a directory")
+
+    bare = os.path.join(home, "proj-no-db")
+    os.makedirs(bare)
+    _check(projects(bare) == [], "projects() created mk.db")
+    cli = _cli(["projects", "--json", "--home", bare])
+    _check(cli == {"ok": True, "projects": []}, f"bare cli {cli}")
+    _check(not os.path.exists(os.path.join(bare, "mk.db")), "projects created mk.db")
 
 
 def _single_writer():
