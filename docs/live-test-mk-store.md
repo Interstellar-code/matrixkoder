@@ -45,7 +45,7 @@ ones: G1 runs the G1 rows, G2 runs G1 and G2, and G3 runs every row.
 | C6-lifecycle | C6 | G2 | scripted | | Two scratch projects heartbeat one root bus; stop one project's heartbeats. | The bus stays up while the other heartbeats and exits only after `owner_timeout_min`. |
 | C6-tokens | C6 | G2 | scripted | | Use a project-scoped token against the other project. | Denied (403); a lane token cannot read another project; the root token is read-only. |
 | C7-connect | C7 | G1 | agent | pending: D7 | `connect` on a real `manifest/auto` lane. | A paged brief and the phase task list arrive; one `[<id>]` todo per task. |
-| C7-todo | C7 | G2 | scripted | | `todo_hook: yes` and the backup `todo done` both fire for the same (task, state, round). | The card moves once (dedupe); `session.todo_done_status` verify and done both work. |
+| C7-todo | C7 | G2 | scripted | | The hook recipe is recorded and the status is posted by hand (`HOOK_RECIPES` is only a string; nothing runs it); the backup `todo done` fires twice for the same (task, state, round). | The first report is sent and the second is deduped; exactly one `status verify` task event; the card moves once. |
 | C8-catalog | C8 | G1 | scripted | | Seed agents and models, then read a route pick list. | Rows match the seed; a model may override capabilities; routing reads the catalog. |
 | C9-setting | C9 | G2 | scripted | | Set `session.todo_done_status` to verify, then to done. | Completing a todo lands the task in verifying or done accordingly; default is verify. |
 | C10-transition | C10 | G1 | scripted | | Move a task with `mkdb.transition()` and try any other status write. | One state event, a bumped `change_no`, and the root card only when sync is on; no second writer. |

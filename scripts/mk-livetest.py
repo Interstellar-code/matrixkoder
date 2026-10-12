@@ -635,7 +635,9 @@ def row_c8_catalog(ctx):
 
 
 def _bus_env(ctx):
-    """Store mode keeps the one bus in the MK home. Pin it so nothing touches ~/.matrixkoder."""
+    """Store mode keeps the one bus in the MK home. Pin MK_BUS_DIR so nothing
+    touches ~/.matrixkoder: project_slug_for resolves the root projects table
+    through MK_BUS_DIR, so an unpinned bus would read the real root store."""
     return dict(os.environ, MK_BUS_DIR=ctx["home"], MK_HOME=ctx["home"], MATRIXKODER_HOME=ctx["home"])
 
 
@@ -865,6 +867,21 @@ def _second_project(ctx):
     return slug, data
 
 
+def _bus_project(ctx):
+    """The slug the bus actually uses for this project. project_slug_for derives
+    one (`p` + hash) and registers it, so the `lt` row setup wrote is not it."""
+    import sqlite3
+    con = sqlite3.connect(os.path.join(ctx["home"], "mk.db"))
+    try:
+        row = con.execute("SELECT slug FROM projects WHERE data_dir=?",
+                          (os.path.realpath(ctx["data"]),)).fetchone()
+    finally:
+        con.close()
+    if not row:
+        raise Fail(f"the bus never registered {ctx['data']}")
+    return row[0]
+
+
 def _orch_token(ctx, project, run):
     """Mint an orchestrator token the way the bus self-test does, in the root token file."""
     import fcntl
@@ -921,13 +938,13 @@ def row_c1_summary(ctx):
     proj = mkdb.open_project(ctx["home"], data_dir=ctx["data"])
     try:
         active = proj.execute("SELECT COUNT(*) c FROM runs WHERE status='active'").fetchone()["c"]
+        # Per project, not per run: project_summary is one row per project (plan C1).
         by_status = {}
-        for row in proj.execute("SELECT status, COUNT(*) c FROM tasks WHERE run=? GROUP BY status",
-                                (ctx["run"],)):
+        for row in proj.execute("SELECT status, COUNT(*) c FROM tasks GROUP BY status"):
             by_status[row["status"]] = row["c"]
         attention = proj.execute(
-            "SELECT COUNT(*) c FROM tasks WHERE run=? AND status IN ('blocked','stalled','quota','provider')",
-            (ctx["run"],)).fetchone()["c"]
+            "SELECT COUNT(*) c FROM tasks WHERE status IN ('blocked','stalled','quota','provider')"
+            ).fetchone()["c"]
         last = proj.execute("SELECT MAX(change_no) m FROM change_log WHERE run=?",
                             (ctx["run"],)).fetchone()["m"]
     finally:
@@ -1012,24 +1029,41 @@ def _dead(pid):
 def row_c6_tokens(ctx):
     """C6: a project token on the other project is 403; a lane token cannot read it; root is read-only."""
     import fcntl
-    ctx = _need(ctx)
+    ctx = _own_run(_need(ctx), "c6t")
     slug_b, data_b = _second_project(ctx)
+    con = mkdb.open_project(ctx["home"], data_dir=ctx["data"])
+    try:
+        mkdb._begin(con)
+        con.execute("INSERT INTO runs(id, status) VALUES (?, ?)", (ctx["run"], "active"))
+        con.execute("COMMIT")
+        # The bus refuses a /send whose task is not in the store.
+        mkdb.add_task(con, ctx["run"], "C6T", "task", title="tokens")
+    finally:
+        con.close()
     started = _bus(ctx, "ensure", "--run", ctx["run"])
     port = started.get("port")
     if not port:
         raise Fail(f"bus did not start: {started}")
     base = f"http://127.0.0.1:{port}"
-    tok_a = _orch_token(ctx, ctx["slug"], ctx["run"])
+    tok_a = _orch_token(ctx, _bus_project(ctx), ctx["run"])
     st, body = _http("GET", base + f"/pending?run={ctx['run']}&project={slug_b}", tok_a)
     if st != 403:
         raise Fail(f"project token on the other project: {st} {body}")
+    # A lane token may POST /send for its own task. /pending is refused for every
+    # project, so it cannot show the project scope.
     lane = _lane(ctx, "c6-token-lane")
     _bus(ctx, "token", "--lane", lane, "--task", "C6T", "--run", ctx["run"])
     with open(_lane_token(ctx, lane)) as fh:
         lane_tok = json.load(fh)["token"]
-    st, body = _http("GET", base + f"/pending?run={ctx['run']}&project={slug_b}", lane_tok)
+    own = {"run": ctx["run"], "task": "C6T", "kind": "info", "text": "mine",
+           "from": "C6T", "to": "orch", "project": _bus_project(ctx)}
+    st, body = _http("POST", base + "/send", lane_tok, own)
+    if st != 200:
+        raise Fail(f"lane token could not send on its own project: {st} {body}")
+    other = dict(own, project=slug_b)
+    st, body = _http("POST", base + "/send", lane_tok, other)
     if st != 403:
-        raise Fail(f"lane token read the other project: {st} {body}")
+        raise Fail(f"lane token sent to the other project: {st} {body}")
     root_tok = secrets.token_urlsafe(32)
     path = os.path.join(ctx["home"], "bus-tokens.json")
     fd = os.open(os.path.join(ctx["home"], "bus-tokens.lock"), os.O_CREAT | os.O_RDWR, 0o600)
@@ -1037,7 +1071,7 @@ def row_c6_tokens(ctx):
         fcntl.flock(fd, fcntl.LOCK_EX)
         tokens = json.load(open(path))
         tokens[root_tok] = {"token": root_tok, "role": "root", "run": ctx["run"], "task": "C6T",
-                            "lane": "", "project": ctx["slug"], "created_at": "lt"}
+                            "lane": "", "project": _bus_project(ctx), "created_at": "lt"}
         json.dump(tokens, open(path, "w"))
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
@@ -1050,7 +1084,12 @@ def row_c6_tokens(ctx):
 
 
 def row_c7_todo(ctx):
-    """C7: the todo hook and the backup `todo done` both fire; the card moves once."""
+    """C7: the backup `todo done` dedupes, and the card moves once.
+
+    The hook itself is not run: HOOK_RECIPES is only the string
+    `claude --settings <path>` and nothing executes it. The row installs the
+    recipe (the recorded PostToolUse payload) and posts the status by hand
+    through an orchestrator /send, which is what moves the card."""
     ctx = _own_run(_need(ctx), "c7")
     con = mkdb.open_project(ctx["home"], data_dir=ctx["data"])
     try:
@@ -1073,7 +1112,7 @@ def row_c7_todo(ctx):
     code, _, _ = _builder(lane, "progress", "work", env=env)
     if code != 0:
         raise Fail("progress failed")
-    # The hook: the recorded PostToolUse TodoWrite payload, posted as the same status.
+    # The recorded payload, checked then posted by hand. Nothing runs the recipe.
     code, lines, err = _builder(lane, "hook-install", "--agent", "claude", env=env)
     if code != 0:
         raise Fail(f"hook-install failed: {lines} {err[-200:]}")
@@ -1082,18 +1121,30 @@ def row_c7_todo(ctx):
     todo = payload["tool_input"]["todos"][0]
     if todo["status"] != "completed":
         raise Fail(f"hook payload is not a completion: {todo}")
-    tok = _orch_token(ctx, ctx["slug"], ctx["run"])
+    tok = _orch_token(ctx, _bus_project(ctx), ctx["run"])
     with open(os.path.join(ctx["home"], "bus.json")) as fh:
         port = json.load(fh)["port"]
     st, body = _http("POST", f"http://127.0.0.1:{port}/send", tok,
                      {"run": ctx["run"], "task": "C7T", "kind": "status", "text": "verifying",
-                      "from": "orch", "to": "C7T", "project": ctx["slug"]})
+                      "from": "orch", "to": "C7T", "project": _bus_project(ctx)})
     if st != 200:
         raise Fail(f"hook status post failed: {st} {body}")
-    # The backup reporter for the same (task, state, round).
+    # The backup reporter, twice for the same (task, state, round). The first
+    # sends; the second is deduped. A task message never calls transition(), so
+    # the card moving once is the hand-posted status, and the dedupe is the
+    # event count below.
     code, lines, err = _builder(lane, "todo", "done", "C7T", env=env)
     if code != 0:
         raise Fail(f"todo done failed: {lines} {err[-200:]}")
+    first = json.loads(lines[0])
+    if first.get("sent") is not True or first.get("deduped") is not False:
+        raise Fail(f"first todo done was not sent: {first}")
+    code, lines, err = _builder(lane, "todo", "done", "C7T", env=env)
+    if code != 0:
+        raise Fail(f"second todo done failed: {lines} {err[-200:]}")
+    second = json.loads(lines[0])
+    if second.get("deduped") is not True or second.get("sent") is not False:
+        raise Fail(f"second todo done was not deduped: {second}")
     proj = mkdb.open_project(ctx["home"], data_dir=ctx["data"])
     try:
         status = proj.execute("SELECT status FROM tasks WHERE run=? AND id=?",
@@ -1101,8 +1152,17 @@ def row_c7_todo(ctx):
         moves = proj.execute(
             "SELECT COUNT(*) c FROM events WHERE run=? AND task=? AND chan='state' AND kind='transition'",
             (ctx["run"], "C7T")).fetchone()["c"]
+        announced = proj.execute(
+            "SELECT text FROM events WHERE chan='bus' AND run=? AND task=? AND kind='task'",
+            (ctx["run"], "C7T")).fetchall()
     finally:
         proj.close()
+    heads = [((r["text"] or "").split(chr(10), 1)[0]).strip() for r in announced]
+    if heads.count("status verify") != 1:
+        raise Fail("status verify announced %d times: %s" % (heads.count("status verify"), heads))
+    # The card moves once, on the hand-posted orchestrator status. A lane
+    # `task` message never calls transition(), so the backup reports must not
+    # have moved it again.
     if status != "verifying" or moves != 1:
         raise Fail(f"card moved {moves} times to {status}, wanted once to verifying")
 
@@ -1129,10 +1189,13 @@ def row_c9_setting(ctx):
     if code != 0:
         raise Fail(f"start failed: {lines} {err[-200:]}")
     _builder(lane, "progress", "work", env=env)
-    # Default, with no yaml at all, is verify.
+    # Default, with no yaml at all, is verify, and it is actually sent.
     code, lines, err = _builder(lane, "todo", "done", "C9S", env=env)
-    if code != 0 or json.loads(lines[0]).get("mapped") != "verify":
-        raise Fail(f"default is not verify: {lines} {err[-200:]}")
+    if code != 0:
+        raise Fail(f"todo done failed: {lines} {err[-200:]}")
+    first = json.loads(lines[0])
+    if first.get("mapped") != "verify" or first.get("sent") is not True:
+        raise Fail(f"default is not a sent verify: {first}")
     # Then `done`. A new round is a new dedupe key, so the second report is sent.
     with open(os.path.join(ctx["data"], "matrixkoder.yaml"), "w") as fh:
         fh.write("todo_done_status: done\n")
@@ -1142,8 +1205,24 @@ def row_c9_setting(ctx):
         raise Fail(f"round 2 start failed: {lines}")
     _builder(lane, "progress", "work", env=env)
     code, lines, err = _builder(lane, "todo", "done", "C9S", env=env)
-    if code != 0 or json.loads(lines[0]).get("mapped") != "done":
-        raise Fail(f"setting done did not map to done: {lines} {err[-200:]}")
+    if code != 0:
+        raise Fail(f"second todo done failed: {lines} {err[-200:]}")
+    second = json.loads(lines[0])
+    if second.get("mapped") != "done" or second.get("sent") is not True:
+        raise Fail(f"setting done did not send a done: {second}")
+    proj = mkdb.open_project(ctx["home"], data_dir=ctx["data"])
+    try:
+        rows = proj.execute(
+            "SELECT text FROM events WHERE chan='bus' AND kind='task' AND run=? AND task=?",
+            (ctx["run"], "C9S")).fetchall()
+    finally:
+        proj.close()
+    seen = {}
+    for r in rows:
+        head, _, rest = (r["text"] or "").partition(chr(10))
+        seen.setdefault(head.strip(), set()).add(rest.split(chr(10), 1)[0].strip())
+    if seen.get("status verify") != {"round: 1"} or seen.get("status done") != {"round: 2"}:
+        raise Fail(f"task events are not status verify/done for their rounds: {seen}")
 
 
 def row_c13_doorbell(ctx):
@@ -1174,12 +1253,12 @@ def row_c13_doorbell(ctx):
     started = _py(os.path.join(HERE, "mk-bus.py"), "ensure", "--data", ctx["data"], "--run", ctx["run"], env=env)
     if not started.get("pid"):
         raise Fail(f"bus did not start: {started}")
-    tok = _orch_token(ctx, ctx["slug"], ctx["run"])
+    tok = _orch_token(ctx, _bus_project(ctx), ctx["run"])
     with open(os.path.join(ctx["home"], "bus.json")) as fh:
         port = json.load(fh)["port"]
     st, body = _http("POST", f"http://127.0.0.1:{port}/send", tok,
                      {"run": ctx["run"], "task": "C13D", "kind": "nudge", "text": "look",
-                      "from": "orch", "to": "C13D", "project": ctx["slug"]})
+                      "from": "orch", "to": "C13D", "project": _bus_project(ctx)})
     if st != 200:
         raise Fail(f"nudge failed: {st} {body}")
     rang = _wait_until(lambda: open(fake + ".rang").read() if os.path.isfile(fake + ".rang") else "",
@@ -1189,14 +1268,32 @@ def row_c13_doorbell(ctx):
     open(fake + ".status", "w").write("working")
     st, body = _http("POST", f"http://127.0.0.1:{port}/send", tok,
                      {"run": ctx["run"], "task": "C13D", "kind": "nudge", "text": "busy",
-                      "from": "orch", "to": "C13D", "project": ctx["slug"]})
+                      "from": "orch", "to": "C13D", "project": _bus_project(ctx)})
     if st != 200:
         raise Fail(f"second nudge failed: {st} {body}")
-    import time
-    time.sleep(0.6)
-    rang2 = open(fake + ".rang").read()
-    if rang2.count("mk-builder.py inbox") != 1:
-        raise Fail(f"the working agent's nudge was not queued: {rang2!r}")
+    second_id = (body.get("message") or body).get("id")
+    if not second_id:
+        raise Fail(f"second nudge returned no id: {body}")
+    # A working lane is not rung. Check before the queue wait, so a bus that
+    # rings immediately fails here instead of timing out on the queue.
+    if open(fake + ".rang").read().count("mk-builder.py inbox") != 1:
+        raise Fail("the working agent's nudge was rung: %r" % open(fake + ".rang").read())
+    # The bus persists a nudge for a working lane in <bus dir>/ring-queue.json.
+    queued = _wait_until(
+        lambda: second_id in json.dumps(json.load(open(os.path.join(ctx["home"], "ring-queue.json"))))
+        if os.path.isfile(os.path.join(ctx["home"], "ring-queue.json")) else False,
+        5, "the second nudge to be queued")
+    if not queued:
+        raise Fail("the working agent's nudge is not in ring-queue.json")
+    # And it was NOT rung yet: a bus that rings a working lane fails here.
+    if open(fake + ".rang").read().count("mk-builder.py inbox") != 1:
+        raise Fail("the queued nudge was rung while the agent was working: %r" % open(fake + ".rang").read())
+    # Flip to idle: the queued ring drains once, and only once.
+    open(fake + ".status", "w").write("idle")
+    _wait_until(lambda: open(fake + ".rang").read().count("mk-builder.py inbox") == 2,
+                5, "the queued nudge to ring once the agent is idle")
+    if open(fake + ".rang").read().count("mk-builder.py inbox") != 2:
+        raise Fail(f"expected exactly 2 rings, got: {open(fake + '.rang').read()!r}")
 
 
 def row_c13_metrics(ctx):
