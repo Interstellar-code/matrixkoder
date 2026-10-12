@@ -29,6 +29,7 @@ import hashlib
 import io
 import json
 import os
+import queue
 import re
 import shutil
 import signal
@@ -1414,19 +1415,18 @@ def cmd_inbox(a):
             break  # non-int or non-advancing seq: stop, do not spin (item 37)
         # At-least-once, same as ask/wait: a BusLock or a crash before the cursor
         # moves re-shows the message next time, which is the safe direction.
-        # ack_level 3 (ask/wait already consumed it) is not printed and not
-        # re-acked (todo 42); the cursor still moves past it.
-        if msg.get("ack_level") == 3:
-            try:
-                after = bus_advance_cursor(lane, seq)
-            except BusLock as e:
-                raise Fail(str(e), code=5)
-            continue
-        print(json.dumps(msg))
+        # The re-shown message is acked once, on the call that actually advances
+        # the cursor (review R4). ack_level 3 (ask/wait already consumed it) is
+        # not printed and not re-acked (todo 42); the cursor still moves past it.
+        # The lock is taken before the print, so a lock failure is the error line
+        # alone: a caller never sees a message and an error in one run.
         try:
             after = bus_advance_cursor(lane, seq)
         except BusLock as e:
             raise Fail(str(e), code=5)
+        if msg.get("ack_level") == 3:
+            continue
+        print(json.dumps(msg))
         try:
             bus_call(cfg, "POST", "/ack", body=bus_ack_body(cfg, msg.get("id")))
         except BusHttp as e:
@@ -3249,6 +3249,43 @@ def t_b1_held_lock_does_not_lose_the_answer(root):
         assert err.get("ok") is False and "cursor lock" in err.get("error", ""), err
     finally:
         holder.kill(); holder.wait(timeout=5)
+    # the next inbox, lock free, shows that message exactly once and acks it
+    code, lines = cli(lane, "inbox")
+    assert code == 0 and len(lines) == 1, (code, lines)
+    shown = json.loads(lines[0])
+    assert shown.get("text") == "unread while locked", shown
+    code, lines = cli(lane, "inbox")
+    assert code == 0 and lines == [], lines
+
+
+def t_b1_fresh_unread_lock_prints_error_only(root):
+    """Review R4 MEDIUM: a FRESH lane whose only message is an unread info, with
+    the cursor lock already held. inbox prints the error line only (the lock is
+    taken before the print) and exits 5. The next inbox, lock free, shows that
+    message exactly once."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data, _, _ = bus_server(root)
+    lane = bus_lane(root, "b1_fresh_lock", "BF", data)
+    begin(lane, root)
+    cli(lane, "progress", "build")
+    bus_cli("send", "--run", BUS_RUN, "--task", "BF", "--kind", "info",
+            "--text", "fresh unread", "--data", data)
+    holder = _b1_hold_lock(root, lane, "b1_fresh_inbox")
+    try:
+        code, lines = cli(lane, "inbox")
+        assert code == 5 and len(lines) == 1, (code, lines)
+        err = json.loads(lines[0])
+        assert err.get("ok") is False and "cursor lock" in err.get("error", ""), err
+        assert "fresh unread" not in lines[0], lines
+    finally:
+        holder.kill(); holder.wait(timeout=5)
+    code, lines = cli(lane, "inbox")
+    assert code == 0 and len(lines) == 1, (code, lines)
+    shown = json.loads(lines[0])
+    assert shown.get("text") == "fresh unread", shown
+    code, lines = cli(lane, "inbox")
+    assert code == 0 and lines == [], lines
 
 
 def t_b1_cursor_lock_wait_is_bounded(root):
@@ -3605,7 +3642,11 @@ def t_d7_bus_down_ask_blocks(root):
 
 
 def t_d7_one_ack_per_answer(root):
-    """ask acks the answer once; inbox does not show it or ack it again."""
+    """ask acks the answer once; inbox does not show it or ack it again.
+
+    The answer thread reports its own exception onto a queue instead of dying
+    silently, and its poll deadline scales from one measured spawn plus a real
+    round trip so a loaded machine does not turn a live ask into PENDING."""
     if not os.path.isfile(MK_BUS_PY):
         return
     data = os.path.join(root, "d7ack-data")
@@ -3614,20 +3655,29 @@ def t_d7_one_ack_per_answer(root):
     bus_server(root, "d7ack")
     lane = bus_lane(root, "d7_ack_lane", "D7A", data)
     begin(lane, root, run=BUS_RUN, task="D7A")
+    b0 = time.time()
     cli(lane, "progress", "work")
+    baseline = max(0.5, time.time() - b0)
+    poll_for = max(30.0, 20 * baseline)
+    errors = queue.Queue()
 
     def answer():
-        row = bus_poll_until(lambda: next(
-            (r for r in d7_bus_rows(data) if r.get("kind") == "ask" and r.get("task") == "D7A"), None))
-        got = d7_answer(data, row["id"], "the schema is v2", "D7A")
-        assert got.get("ok") is True, got
+        try:
+            row = bus_poll_until(lambda: next(
+                (r for r in d7_bus_rows(data) if r.get("kind") == "ask" and r.get("task") == "D7A"), None),
+                timeout=poll_for)
+            got = d7_answer(data, row["id"], "the schema is v2", "D7A")
+            assert got.get("ok") is True, got
+        except Exception as e:
+            errors.put(f"{type(e).__name__}: {e}")
 
     th = threading.Thread(target=answer)
     th.start()
     try:
-        code, lines = cli(lane, "ask", "which schema?", "--timeout", "30")
+        code, lines = cli(lane, "ask", "which schema?", "--timeout", str(int(poll_for)))
     finally:
-        th.join(30)
+        th.join(poll_for + 5)
+    assert errors.empty(), errors.get()
     assert code == 0 and lines == ["the schema is v2"], (code, lines)
     code, lines = cli(lane, "inbox")
     assert code == 0 and lines == [], lines
@@ -3789,11 +3839,16 @@ def t_x1_fifo_lane_file_is_bus_down(root):
     env["HOME"] = os.path.join(root, "x1-home-fifo")
     os.makedirs(env["HOME"], exist_ok=True)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    # one measured spawn of this interpreter, then a generous floor: the FIFO
+    # is still never opened, so the case stays well under a real open() hang
+    b0 = time.time()
+    subprocess.run([sys.executable, "-c", "pass"], capture_output=True, env=env, timeout=30)
+    floor = max(2.0, 8 * (time.time() - b0))
     t0 = time.time()
     r = subprocess.run([sys.executable, os.path.abspath(__file__), "inbox", "--lane", lane],
-                       capture_output=True, text=True, env=env, timeout=15)
+                       capture_output=True, text=True, env=env, timeout=max(15, floor + 5))
     elapsed = time.time() - t0
-    assert elapsed < 1.0, f"lane FIFO took {elapsed:.2f}s"
+    assert elapsed < floor, f"lane FIFO took {elapsed:.2f}s against a {floor:.2f}s floor"
     assert r.returncode == 4, (r.returncode, r.stdout, r.stderr)
 
 
@@ -4048,23 +4103,33 @@ def t_x1_slow_drip_body_honours_budget(root):
     begin(lane, root)
     env = {"MK_BUS_URL": f"http://127.0.0.1:{port}", "MK_BUS_TOKEN": "sekrit"}
     before = _x1_rss_kb()
+    # one measured spawn plus a real round trip (inbox against this peer, which
+    # answers /health immediately and then drips). The absolute deadline is what
+    # cuts the drip: a path with no deadline runs for the whole 60 s body.
+    b0 = time.time()
+    cli(lane, "inbox", env=env)
+    baseline = max(0.25, time.time() - b0)
+    inbox_bound = max(3.0, 4 * baseline)
+    ask_bound = max(6.5, 5 + 4 * baseline)
     try:
         t0 = time.time()
         code, lines = cli(lane, "inbox", env=env)
         elapsed = time.time() - t0
-        assert elapsed < 3.0, f"inbox took {elapsed:.2f}s against a 1 byte/s body: {lines}"
+        assert elapsed < inbox_bound, f"inbox took {elapsed:.2f}s against a 1 byte/s body: {lines}"
         assert code == 4, (code, lines)
         t0 = time.time()
         code, lines = cli(lane, "progress", "parse-plan", env=env)
         elapsed = time.time() - t0
-        assert elapsed < 3.0, f"progress took {elapsed:.2f}s against a 1 byte/s body: {lines}"
+        assert elapsed < inbox_bound, f"progress took {elapsed:.2f}s against a 1 byte/s body: {lines}"
         assert code == 0, (code, lines)
         t0 = time.time()
         code, lines = cli(lane, "ask", "which one?", "--timeout", "5", env=env)
         elapsed = time.time() - t0
         # deadline is set at ask start; one chunk may run remaining+1, and the
-        # server floor is 1 s, so the bound is the brief's timeout + 1.
-        assert elapsed < 6.5, f"ask took {elapsed:.2f}s (timeout 5, deadline + 1): {lines}"
+        # server floor is 1 s, so the bound is the brief's timeout + 1, scaled
+        # from the measured baseline. Without the absolute deadline the 60 s
+        # drip would blow past it.
+        assert elapsed < ask_bound, f"ask took {elapsed:.2f}s (timeout 5, deadline + 1): {lines}"
         # no answer yet: PENDING (exit 3) or BUS DOWN (exit 4). Never a hang.
         assert code in (3, 4), (code, lines)
         if code == 3:
