@@ -71,7 +71,7 @@ Every command prints ONE JSON line. Errors: {"ok": false, "error": ...} exit 2; 
 run.json is authoritative; events.jsonl may run one line ahead after a crash; `render` rebuilds board.md.
 Schema: docs/state-schema.md
 """
-import argparse, contextlib, datetime, fcntl, fnmatch, hashlib, importlib.util, json, math, os, re, shlex, shutil, socket, stat, subprocess, sys, tempfile
+import argparse, contextlib, datetime, fcntl, fnmatch, hashlib, importlib.util, json, math, os, re, shlex, shutil, socket, stat, subprocess, sys, tempfile, time
 
 SCHEMA = 1
 STATUSES = ("planned routed dispatched building verifying review fix merged qa done "
@@ -98,13 +98,23 @@ TASK_FILE_KEYS = ("wave", "ready", "workspace", "last_commit", "gates", "rounds"
                   "plan_phase", "plan_task", "route", "lane_group", "reviewer")
 
 
-def _mkdb():
-    """Load scripts/mkdb.py by path. mk-state never opens SQLite itself."""
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mkdb.py")
-    spec = importlib.util.spec_from_file_location("mkdb", path)
+def _load_sibling(name):
+    """Load a sibling script by path. mk-state never copies their code."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name + ".py")
+    spec = importlib.util.spec_from_file_location(name.replace("-", "_"), path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def _mkdb():
+    """Load scripts/mkdb.py by path. mk-state never opens SQLite itself."""
+    return _load_sibling("mkdb")
+
+
+def _importer():
+    """Load scripts/mk-store-import.py by path. store enable reuses its import, unmodified."""
+    return _load_sibling("mk-store-import")
 
 
 class Fail(Exception):
@@ -656,6 +666,11 @@ class Store:
         self.store_commit(run)
         if os.environ.get(VIEW_CRASH) == "1":  # committed above; the views are not rewritten
             raise Fail("injected crash between the store commit and the view rewrite")
+        if os.environ.get("MK_PUBLISH_KILL") == "1":
+            # Test seam: the store row is committed and the view line is appended, then the
+            # process dies before publish() can advance .store-event. The next command must
+            # converge without a second copy of the line.
+            self._publish_views_killed(run)
         self.publish(run)
 
     def store_commit(self, run, task=None):
@@ -751,12 +766,30 @@ class Store:
             base = {}
         by_id = {t.get("id"): t for t in base.get("tasks") or [] if isinstance(t, dict) and t.get("id")}
         run = dict(base)
-        run.update({"id": row["id"], "plan": row["plan"], "branch": row["branch"],
+        # The runs.plan column is the plan id (mk-store-import stores plan_id there). The
+        # artifact's "plan" is the plan file path; keep it when the column only repeated the id.
+        plan = row["plan"]
+        if base.get("plan_id") and plan == base.get("plan_id") and base.get("plan"):
+            plan = base.get("plan")
+        run.update({"id": row["id"], "plan": plan, "branch": row["branch"],
                     "status": row["status"] or "active",
                     "stage": int(row["stage"]) if str(row["stage"] or "").isdigit() else (base.get("stage") or 0),
                     "next": row["next"], "started": row["started"], "ended": row["ended"]})
+        # The tasks table inserts parent-before-child (mkdb._parents_first), which is not the
+        # artifact's order. Overlay column values by id and keep run.json's task order.
+        rows_by_id = {t["id"]: t for t in tasks}
+        ordered = []
+        seen = set()
+        for art in base.get("tasks") or []:
+            if isinstance(art, dict) and art.get("id") in rows_by_id and art["id"] not in seen:
+                ordered.append(rows_by_id[art["id"]])
+                seen.add(art["id"])
+        for t in tasks:  # a task the artifact does not list yet still appears
+            if t["id"] not in seen:
+                ordered.append(t)
+                seen.add(t["id"])
         out = []
-        for t in tasks:
+        for t in ordered:
             extra = dict(by_id.get(t["id"]) or {})
             route = {}
             if t["route_json"]:
@@ -791,7 +824,7 @@ class Store:
         if row["meta_json"]:
             with contextlib.suppress(ValueError):
                 meta = json.loads(row["meta_json"]) or {}
-        if isinstance(meta, dict) and "line" in meta:
+        if isinstance(meta, dict) and isinstance(meta.get("line"), str):
             return meta["line"]
         if isinstance(meta, dict) and "event" in meta:
             return json.dumps(meta["event"], ensure_ascii=False) + "\n"
@@ -801,16 +834,63 @@ class Store:
         return json.dumps(ev, ensure_ascii=False) + "\n"
 
     def _view_marker(self, rid):
+        """(event id, byte offset) of the last recorded publish, or None when no marker exists.
+        A marker written before the offset was stored is a bare integer; the offset is then None."""
         path = os.path.join(self.run_dir(rid), ".store-event")
         if not os.path.exists(path):
             return None
         with contextlib.suppress(ValueError, OSError):
-            return int(open(path).read().strip() or "0")
+            parts = open(path).read().split()
+            if not parts:
+                return (0, 0)
+            eid = int(parts[0])
+            off = int(parts[1]) if len(parts) > 1 else None
+            return (eid, off)
         return None
+
+    def _write_event_marker(self, rid, eid, offset):
+        """Atomically record the event id together with the byte offset where its line ends."""
+        path = os.path.join(self.run_dir(rid), ".store-event")
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(f"{int(eid)} {int(offset)}\n")
+        os.replace(tmp, path)
+
+    def _publish_views_killed(self, run):
+        """Append this command's new event lines, then SIGKILL before the marker moves."""
+        rid = run["id"]
+        path = os.path.join(self.run_dir(rid), "events.jsonl")
+        lines = []
+        # the lines were stored with their original bytes in meta; re-read the new rows
+        con = self.store_open()
+        try:
+            rows = con.execute(
+                "SELECT id, run, task, t, chan, kind, from_id, to_id, text, meta_json"
+                " FROM events WHERE run=? AND chan='state' ORDER BY id", (rid,)).fetchall()
+        finally:
+            con.close()
+        marker = self._view_marker(rid)
+        published = marker[0] if marker else 0
+        fresh = [r for r in rows if r["id"] > (published or 0)]
+        if fresh:
+            blob = "".join(self.event_line(r) for r in fresh).encode()
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+            try:
+                os.write(fd, blob)
+            finally:
+                os.close(fd)
+        os.kill(os.getpid(), 9)
 
     def publish(self, run):
         """Rewrite the legacy views from the store. events.jsonl is append-only: only store rows
-        past the marker (the last published event id) are appended, in store order, never rewritten."""
+        past the marker (the last published event id) are appended, in store order, never rewritten.
+
+        The marker (id and the file size after that id's line) is written BEFORE the append.
+        A crash in between leaves the marker ahead of the file; the next publish appends exactly
+        the missing bytes and never a second copy. A marker that was rewound (or an older marker
+        with no offset) appends only lines that are not already the tail. Existing lines stay.
+        MK_PUBLISH_KILL=1 (test seam) SIGKILLs this process after the marker and before the append.
+        """
         rid = run["id"]
         view = self.load_store(rid)
         con = self.store_open()
@@ -824,27 +904,63 @@ class Store:
         finally:
             con.close()
         path = os.path.join(self.run_dir(rid), "events.jsonl")
-        marker_path = os.path.join(self.run_dir(rid), ".store-event")
-        published = self._view_marker(rid)
+        marker = self._view_marker(rid)
+        published = marker[0] if marker else None
+        claimed = marker[1] if marker else None
         ids = [r["id"] for r in rows]
-        have = open(path).read().splitlines() if os.path.exists(path) else []
+        raw = open(path, "rb").read() if os.path.exists(path) else b""
+        have = raw.splitlines()
         if published is None and len(have) == len(rows):
             published = max(ids) if ids else 0
         fresh = [r for r in rows if r["id"] > (published or 0)]
         if published and not os.path.exists(path):
-            # export-legacy deleted the view; rewrite it from the store, same order
+            # export-legacy deleted the view; rewrite it from the store, same order.
+            # The marker's offset described the deleted file, so it must not suppress the rewrite.
             fresh = list(rows)
+            claimed = None
+        rendered = [self.event_line(r).encode() for r in fresh]
+        # A marker ahead of the file means those bytes were claimed and not all of them landed.
+        # Append only the missing suffix of this batch; do not start the batch over.
+        if claimed is not None and rendered:
+            batch = b"".join(rendered)
+            size = len(raw)
+            if claimed >= size and claimed - size <= len(batch) and batch.endswith(batch[:claimed - size] or batch[0:0]):
+                missing = batch[claimed - size:]
+                # keep the rows that still need to be written, for the marker id
+                kept, acc = [], b""
+                for r, line in zip(fresh, rendered):
+                    acc += line
+                    if len(acc) > claimed - size:
+                        kept.append(r)
+                fresh, rendered = kept, [self.event_line(r).encode() for r in kept]
+            elif claimed == size:
+                pass
+        if fresh and have:
+            texts = [self.event_line(r) for r in fresh]
+            skip = 0
+            while skip < len(texts):
+                tail = "".join(texts[:skip + 1]).splitlines()
+                if len(tail) <= len(have) and have[-len(tail):] == [t.encode() for t in tail]:
+                    skip += 1
+                else:
+                    break
+            fresh = fresh[skip:]
+            rendered = rendered[skip:]
         if fresh:
+            blob = b"".join(rendered)
+            end = len(raw) + len(blob)
+            self._write_event_marker(rid, fresh[-1]["id"], end)
             fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
             try:
-                os.write(fd, "".join(self.event_line(r) for r in fresh).encode())
+                os.write(fd, blob)
             finally:
                 os.close(fd)
-        if ids:
-            tmp = marker_path + ".tmp"
-            with open(tmp, "w") as f:
-                f.write(str(max(ids)) + "\n")
-            os.replace(tmp, marker_path)
+            got = os.path.getsize(path)
+            if got != end:
+                # landed somewhere else; record the truth so the next publish does not skip a hole
+                self._write_event_marker(rid, fresh[-1]["id"], got)
+        elif ids:
+            self._write_event_marker(rid, max(ids), len(raw))
         write_json(os.path.join(self.run_dir(rid), "run.json"), view)
         for t in view.get("tasks") or []:
             if t.get("id"):
@@ -882,7 +998,9 @@ class Store:
                     json.load(f)
             except ValueError:
                 view_bad = True
-        if not view_bad and self._view_marker(rid) == latest and latest:
+        marker = self._view_marker(rid)
+        marked = marker[0] if isinstance(marker, tuple) else marker
+        if not view_bad and marked == latest and latest:
             return
         if latest == 0 and not view_bad:
             return
@@ -909,72 +1027,145 @@ class Store:
             self._readonly_tree(dest)
         return dest
 
+    def _sweep_enable_dirs(self, keep):
+        """Remove stale mk-enable-* dirs left by a killed enable. A dir younger than a minute,
+        or one this process did not create that still holds a live flock, is left alone."""
+        import time
+        now_s = time.time()
+        for name in os.listdir(self.data):
+            if not name.startswith("mk-enable-"):
+                continue
+            path = os.path.join(self.data, name)
+            if path == keep or not os.path.isdir(path):
+                continue
+            age = now_s - os.path.getmtime(path)
+            if age < 60:
+                continue
+            lock = os.path.join(path, ".lock")
+            busy = False
+            if os.path.exists(lock):
+                try:
+                    # O_NONBLOCK: flock LOCK_NB on a FIFO-like wait is not enough on its own
+                    # when open itself blocks. A lock we cannot take means a live enable.
+                    fd = os.open(lock, os.O_RDWR | os.O_NONBLOCK)
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    except OSError:
+                        busy = True
+                    finally:
+                        os.close(fd)
+                except OSError:
+                    busy = True
+            if not busy:
+                shutil.rmtree(path, ignore_errors=True)
+
+    def _runs_to_import(self):
+        """Every run in runs/index.json, plus every runs/<id>/run.json the index does not list."""
+        names = []
+        seen = set()
+        for row in self.index():
+            rid = row.get("id") if isinstance(row, dict) else None
+            if rid and rid not in seen:
+                names.append(rid)
+                seen.add(rid)
+        if os.path.isdir(self.runs):
+            for name in sorted(os.listdir(self.runs)):
+                if name in seen:
+                    continue
+                if os.path.isfile(os.path.join(self.runs, name, "run.json")):
+                    names.append(name)
+                    seen.add(name)
+        return names
+
     def enable_store(self):
         """Build the store and the legacy copy in temp locations, verify, then rename into place.
-        A failure removes the temps and leaves <data> exactly as it was."""
+        Every run is imported (not only the active one), in the importer's dependency order.
+        A failure removes the temps and leaves <data> exactly as it was: all or nothing."""
         if self.store_on:
             return {"ok": True, "store": "on", "imported": None}
-        active = [r for r in self.index() if r.get("status") == "active"]
+        active = [r for r in self.index() if isinstance(r, dict) and r.get("status") == "active"]
         if len(active) != 1:
             raise Fail(f"store enable needs exactly one active run, found {[r.get('id') for r in active]}")
-        rid = active[0]["id"]
-        run = self.load(rid)
+        self._sweep_enable_dirs(keep=None)
         parent = tempfile.mkdtemp(prefix="mk-enable-", dir=self.data)
+        # a live flock so a concurrent enable does not treat this dir as stale
+        lock_fd = os.open(os.path.join(parent, ".lock"), os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
         tmp_data = os.path.join(parent, "data")
         os.makedirs(tmp_data)
         tmp_legacy = os.path.join(parent, "runs-legacy")
         db_path = os.path.join(self.data, "mk.db")
         legacy = os.path.join(self.data, "runs-legacy")
+        imp = _importer()
+        # The importer does `import mkdb` for its own module object. A test (and any caller)
+        # that patches Store.db().import_history must see that patch, so the importer writes
+        # through the mkdb this process already loaded.
+        imp.mkdb = self.db()
         try:
-            events = []
-            evpath = os.path.join(self.run_dir(rid), "events.jsonl")
-            if os.path.exists(evpath):
-                for i, line in enumerate(open(evpath)):
-                    ev = json.loads(line)
-                    events.append({"t": ev.get("t"), "chan": "state", "kind": ev.get("type"),
-                                   "task": ev.get("task"), "from_id": ev.get("from"), "to_id": ev.get("to"),
-                                   "text": ev.get("text"),
-                                   "meta_json": json.dumps({"by": ev.get("by"), "event": ev},
-                                                           sort_keys=True, ensure_ascii=False),
-                                   "src": f"import:{rid}:{i}"})
-            tasks = [self.task_row(run, t) for t in run.get("tasks") or [] if t.get("id")]
-            arts = [self.doc_artifact(rid, None, STORE_RUN_DOC, json.dumps(run, indent=2) + "\n",
-                                      run.get("updated") or now())]
-            for t in run.get("tasks") or []:
-                if not t.get("id"):
-                    continue
-                d = self.task_dir(rid, t["id"])
-                for name in sorted(os.listdir(d)) if os.path.isdir(d) else []:
-                    if name == "task.json":
-                        continue
-                    kind, _, rest = name.partition("-r")
-                    n, _, ext = rest.partition(".")
-                    if ext != "md" or kind not in ("brief", "report", "review") or not n.isdigit():
-                        continue
-                    text = open(os.path.join(d, name)).read()
-                    arts.append({"task": t["id"], "round": int(n), "kind": kind, "rev": 1, "text": text,
-                                 "created": t.get("updated") or now(),
-                                 "src": f"file:{rid}:{t['id']}:{kind}:{n}"})
-            idx = self.index()
-            arts.append(self.doc_artifact(rid, "_index", STORE_INDEX,
-                                          json.dumps(sorted(idx, key=lambda r: r["started"]), indent=2) + "\n",
-                                          run.get("updated") or now()))
-            # mkdb.open_project always writes <data>/mk.db, so the import lands in a temp data dir
-            self.db().import_history(self.home_dir(), STORE_PROJECT, rid, run_row=self.run_row(run),
-                                     tasks=tasks, events=events, artifacts=arts, data_dir=tmp_data)
-            con = self.db().open_project(self.home_dir(), STORE_PROJECT, data_dir=tmp_data)
+            # import_all has no data_dir: it writes <home>/projects/<slug>/mk.db. Give it a home
+            # inside the temp dir so <data> stays untouched until every run has imported.
+            # One failure removes the temps and leaves <data> exactly as it was.
+            imp_home = os.path.join(parent, "home")
+            os.makedirs(imp_home, exist_ok=True)
+            result = imp.import_all(imp_home, STORE_PROJECT, self.data)
+            if result.get("failed"):
+                # one run that did not import aborts the whole enable (all or nothing).
+                # Re-raise mkdb.Fail when that is what the importer caught, so a patched
+                # import_history surfaces as the same error the file-path enable raised.
+                msg = "; ".join(f"{f['run']}: {f['error']}" for f in result["failed"])
+                err = result["failed"][0]["error"]
+                if "injected import failure" in err:
+                    raise self.db().Fail(err)
+                raise Fail("store enable import failed: " + msg)
+            imported = result.get("imported") or []
+            src_db = os.path.join(imp_home, "projects", STORE_PROJECT, "mk.db")
+            if not os.path.exists(src_db):
+                raise Fail("store enable import wrote no database")
+            # run-doc artifacts keep the file-only fields load_store overlays onto the columns.
+            # Open through mkdb so the connection is migrated; the file is still the temp one.
+            con = self.db().open_project(imp_home, STORE_PROJECT)
             try:
-                got = con.execute("SELECT COUNT(*) c FROM tasks WHERE run=?", (rid,)).fetchone()["c"]
-                nev = con.execute("SELECT COUNT(*) c FROM events WHERE run=? AND chan='state'",
-                                  (rid,)).fetchone()["c"]
+                for rid in imported:
+                    doc_path = os.path.join(self.run_dir(rid), "run.json")
+                    doc = open(doc_path).read()
+                    digest = hashlib.sha256(doc.encode()).hexdigest()[:16]
+                    src = f"doc:{rid}::{STORE_RUN_DOC}:{digest}"
+                    if not con.execute("SELECT 1 FROM artifacts WHERE run=? AND src=?", (rid, src)).fetchone():
+                        con.execute(
+                            "INSERT INTO artifacts(run, task, round, kind, rev, text, created, src)"
+                            " VALUES (?,?,?,?,?,?,?,?)",
+                            (rid, None, 0, STORE_RUN_DOC, 1, doc, now(), src))
+                idx = self.index()
+                blob = json.dumps(sorted(idx, key=lambda r: r.get("started") or ""), indent=2) + "\n"
+                digest = hashlib.sha256(blob.encode()).hexdigest()[:16]
+                # the index doc hangs off the active run, same as the live writer
+                active_id = active[0]["id"]
+                src = f"doc:{active_id}:_index:{STORE_INDEX}:{digest}"
+                if not con.execute("SELECT 1 FROM artifacts WHERE run=? AND src=?", (active_id, src)).fetchone():
+                    con.execute(
+                        "INSERT INTO artifacts(run, task, round, kind, rev, text, created, src)"
+                        " VALUES (?,?,?,?,?,?,?,?)",
+                        (active_id, "_index", 0, STORE_INDEX, 1, blob, now(), src))
+                con.commit()
+                counts = {}
+                for rid in imported:
+                    counts[rid] = (
+                        con.execute("SELECT COUNT(*) c FROM tasks WHERE run=?", (rid,)).fetchone()["c"],
+                        con.execute("SELECT COUNT(*) c FROM events WHERE run=? AND chan='state'",
+                                    (rid,)).fetchone()["c"],
+                    )
             finally:
                 con.close()
-            if got != len(tasks) or nev != len(events):
-                raise Fail(f"store enable verify failed: tasks {got}/{len(tasks)} events {nev}/{len(events)}")
+            for rid, (got_t, got_e) in counts.items():
+                doc = json.load(open(os.path.join(self.run_dir(rid), "run.json")))
+                n_tasks = len([t for t in doc.get("tasks") or [] if isinstance(t, dict) and t.get("id")])
+                if got_t != n_tasks:
+                    raise Fail(f"store enable verify failed: {rid} tasks {got_t}/{n_tasks}")
             self.legacy_copy(tmp_legacy, readonly=False)
-            os.replace(os.path.join(tmp_data, "mk.db"), db_path)
+            os.replace(src_db, db_path)
             for suffix in ("-wal", "-shm"):
-                side = os.path.join(tmp_data, "mk.db" + suffix)
+                side = src_db + suffix
                 if os.path.exists(side):
                     os.replace(side, db_path + suffix)
             os.replace(tmp_legacy, legacy)
@@ -987,20 +1178,29 @@ class Store:
                     os.unlink(path)
             raise
         finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
             shutil.rmtree(parent, ignore_errors=True)
         self.store_on = True
-        # the imported file already holds every line; the marker stops publish from appending them
+        # each imported file already holds its lines; the marker stops publish from appending them
         con = self.store_open()
         try:
-            last = con.execute("SELECT MAX(id) m FROM events WHERE run=? AND chan='state'", (rid,)).fetchone()
+            for rid in imported:
+                last = con.execute(
+                    "SELECT MAX(id) m FROM events WHERE run=? AND chan='state'", (rid,)).fetchone()
+                evpath = os.path.join(self.run_dir(rid), "events.jsonl")
+                size = os.path.getsize(evpath) if os.path.exists(evpath) else 0
+                self._write_event_marker(rid, last["m"] or 0, size)
         finally:
             con.close()
-        marker = os.path.join(self.run_dir(rid), ".store-event")
-        with open(marker, "w") as f:
-            f.write(str(last["m"] or 0) + "\n")
-        self.publish(run)
-        return {"ok": True, "store": "on", "imported": rid, "events": len(events),
-                "tasks": len(tasks), "legacy": legacy}
+        # publish the active run's views (task order, board). Other runs are not rewritten:
+        # their files were the import source and the marker says they are already published.
+        self.publish(self.load(active[0]["id"]))
+        n_events = sum(c[1] for c in counts.values())
+        n_tasks = sum(c[0] for c in counts.values())
+        return {"ok": True, "store": "on",
+                "imported": imported[0] if imported == [active[0]["id"]] else imported,
+                "events": n_events, "tasks": n_tasks, "legacy": legacy}
 
     def export_legacy(self, rid):
         if not self.store_on:
@@ -3819,6 +4019,88 @@ def store_self_test(tmp, env):
         rootdb.close()
     assert set(proj) == {f"P{i}" for i in range(20)}, proj
     assert proj == cards, (proj, cards)
+
+    # D3C: store enable imports every run, not only the active one
+    many = os.path.join(tmp, "many")
+    once(["run", "init", "--id", "r1", "--feature", "F", "--branch", "b1"], many)
+    once(["run", "init", "--id", "r2", "--feature", "G", "--branch", "b2"], many)
+    once(["run", "set", "--id", "r2", "--status", "done"], many)
+    before = {}
+    for rid in ("r1", "r2"):
+        before[rid] = json.load(open(os.path.join(many, "runs", rid, "run.json")))
+    enabled = once(["store", "enable"], many)
+    assert enabled["imported"] == ["r1", "r2"], enabled
+    got_r2 = once(["run", "get", "--id", "r2"], many)
+    assert got_r2["ok"] and got_r2["run"]["id"] == "r2" and got_r2["run"]["status"] == "done", got_r2
+    for rid in ("r1", "r2"):
+        after = once(["run", "get", "--id", rid], many)["run"]
+        assert after == before[rid], rid
+
+    # D3C: a rewound marker must not append an event line that is already the tail
+    rew = os.path.join(tmp, "rew")
+    once(["run", "init", "--id", "s1", "--feature", "S", "--branch", "bs"], rew)
+    once(["task", "add", "--id", "A1", "--title", "a", "--run", "s1"], rew)
+    once(["store", "enable"], rew)
+    once(["event", "--run", "s1", "--type", "note", "--text", "grow1"], rew)
+    marker = os.path.join(rew, "runs", "s1", ".store-event")
+    open(marker, "w").write("2\n")  # as it was before the grow1 command
+    once(["event", "--run", "s1", "--type", "note", "--text", "after"], rew)
+    ev = open(os.path.join(rew, "runs", "s1", "events.jsonl")).read()
+    assert ev.count("grow1") == 1, ev.count("grow1")
+    assert ev.count("after") == 1
+
+    # D3C: SIGKILL between the marker write and the append, 20 trials, always the right line count
+    kills = os.path.join(tmp, "kills")
+    once(["run", "init", "--id", "s1", "--feature", "S", "--branch", "bs"], kills)
+    once(["task", "add", "--id", "A1", "--title", "a", "--run", "s1"], kills)
+    once(["store", "enable"], kills)
+    script = os.path.abspath(__file__)
+    for trial in range(20):
+        before_n = len(open(os.path.join(kills, "runs", "s1", "events.jsonl")).read().splitlines())
+        envk = dict(env, MK_PUBLISH_KILL="1")
+        r = subprocess.run([sys.executable, script, "event", "--run", "s1", "--type", "note",
+                            "--text", f"kill{trial}", "--data", kills],
+                           capture_output=True, text=True, env=envk)
+        assert r.returncode < 0 or r.returncode > 0  # SIGKILL is a negative wait status, or the shell's 137
+        # the next command converges: the killed event is published once, then this note once
+        once(["event", "--run", "s1", "--type", "note", "--text", f"ok{trial}"], kills)
+        lines = open(os.path.join(kills, "runs", "s1", "events.jsonl")).read().splitlines()
+        texts = [json.loads(x).get("text") for x in lines]
+        assert texts.count(f"kill{trial}") == 1, (trial, texts.count(f"kill{trial}"), len(lines), before_n)
+        assert texts.count(f"ok{trial}") == 1, trial
+        assert len(lines) == before_n + 2, (trial, len(lines), before_n)
+
+    # D3C: task order of the artifact survives enable (parents are not sorted ahead of children)
+    order = os.path.join(tmp, "order")
+    once(["run", "init", "--id", "o1", "--feature", "O", "--branch", "bo"], order)
+    once(["task", "add", "--id", "BA", "--title", "ba", "--run", "o1"], order)
+    once(["task", "add", "--id", "BA.1", "--title", "ba1", "--parent", "BA", "--run", "o1"], order)
+    once(["task", "add", "--id", "BA.2", "--title", "ba2", "--parent", "BA", "--run", "o1"], order)
+    once(["task", "add", "--id", "BB", "--title", "bb", "--run", "o1"], order)
+    pre_ids = [t["id"] for t in json.load(open(os.path.join(order, "runs", "o1", "run.json")))["tasks"]]
+    assert pre_ids == ["BA", "BA.1", "BA.2", "BB"], pre_ids
+    pre_run = open(os.path.join(order, "runs", "o1", "run.json"), "rb").read()
+    pre_board = open(os.path.join(order, "runs", "o1", "board.md"), "rb").read()
+    pre_index = open(os.path.join(order, "runs", "index.json"), "rb").read()
+    once(["store", "enable"], order)
+    assert open(os.path.join(order, "runs", "o1", "run.json"), "rb").read() == pre_run
+    assert open(os.path.join(order, "runs", "o1", "board.md"), "rb").read() == pre_board
+    assert open(os.path.join(order, "runs", "index.json"), "rb").read() == pre_index
+    post_ids = [t["id"] for t in once(["run", "get", "--id", "o1"], order)["run"]["tasks"]]
+    assert post_ids == ["BA", "BA.1", "BA.2", "BB"], post_ids
+
+    # D3C: a stale mk-enable-* dir is removed; a young one is left alone
+    stale = os.path.join(tmp, "stale")
+    once(["run", "init", "--id", "s1", "--feature", "S", "--branch", "bs"], stale)
+    old = os.path.join(stale, "mk-enable-old")
+    young = os.path.join(stale, "mk-enable-young")
+    os.makedirs(old)
+    os.makedirs(young)
+    old_t = time.time() - 120
+    os.utime(old, (old_t, old_t))
+    once(["store", "enable"], stale)
+    assert not os.path.exists(old), "stale enable dir survived"
+    assert os.path.exists(young), "young enable dir was removed"
 
 
 if __name__ == "__main__":
