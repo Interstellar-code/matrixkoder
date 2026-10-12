@@ -895,7 +895,15 @@ async function ensureBus($: EngineInterface, options: PluginOptions, cwd: string
     const snap = await read($, snapshotAtom) as MkPaneSnapshot
     if (snap.run == null) return // only an active run owns a bus
     const script = `${$.plugin.root}/scripts/mk-bus.py`
-    if ((await readText($, join(dataDir, 'bus.json'))) != null) {
+    // Root bus (C6): a project with a store heartbeats the one bus under the
+    // MK home. File mode (no mk.db) keeps the per-project bus.json.
+    let mkHome = ''
+    try { mkHome = (await $.env.get('MK_HOME')) || '' } catch { mkHome = '' }
+    const userHome = mkHome === '' ? await homeDir($) : null
+    const busHome = mkHome !== '' ? mkHome : (userHome == null ? null : join(userHome, '.matrixkoder'))
+    const rootBus = busHome != null && (await readText($, join(dataDir, 'mk.db'))) != null
+    const busFile = rootBus ? join(busHome as string, 'bus.json') : join(dataDir, 'bus.json')
+    if ((await readText($, busFile)) != null) {
       await $.process.run(['python3', script, 'heartbeat', '--data', dataDir, '--run', snap.run.id], { timeoutMs: BUS_TIMEOUT_MS })
       return
     }
