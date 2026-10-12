@@ -319,9 +319,13 @@ def check_plan(header, out):
             errors.append(f'{pid}: reviewer {p["reviewer"]!r} is not a string ("" = the orchestrator decides)')
         for t in p["tasks"]:
             tid = t["id"] or f"{pid} task"
+            if not t["id"]:
+                errors.append(f"{pid}: task has no id")
             if t["id"] and pid in by_id and not re.fullmatch(re.escape(pid) + r"\.\d+", t["id"]):
                 warnings.append(f"task id {t['id']!r} is not <phase id>.<n> ({pid}.<n>)")
             for s in t.get("subtasks") or []:
+                if not s["id"]:
+                    errors.append(f"{tid}: subtask has no id")
                 if s["id"] and t["id"] and not re.fullmatch(re.escape(t["id"]) + r"\.\d+", s["id"]):
                     warnings.append(f"subtask id {s['id']!r} is not <task id>.<m> ({t['id']}.<m>)")
                 if isinstance(s.get("route"), dict):
@@ -450,8 +454,9 @@ def write_atomic(path, text):
         mode = 0o644
     fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-")
     try:
+        blob = text.encode("utf-8") if isinstance(text, str) else text
         with os.fdopen(fd, "wb") as f:
-            f.write(text.encode("utf-8"))
+            f.write(blob)
             f.flush()
             os.fsync(f.fileno())
         os.chmod(tmp, mode)  # mkstemp makes 0600; keep the file's own mode
@@ -709,17 +714,21 @@ def approve_file(path, data, home, run):
         # tasks first (each add_task commits its own transaction), plans row next, move last.
         # a later failure deletes only the tasks this call inserted.
         try:
-            for tid, typ, parent, title, acceptance, owned, deps, parallel, route in flat_items(out):
-                # acceptance, owned and parallel ride in the title only as far as add_task allows;
-                # the plans header keeps them, and add_task stores title, parent, deps and route.
+            items = flat_items(out)
+            # pass 1: insert with empty deps so a forward dep (a later phase or sibling) exists
+            for tid, typ, parent, title, acceptance, owned, deps, parallel, route in items:
                 db.add_task(con, run_id, tid, typ, title=title, parent=parent,
-                            deps=",".join(str(d) for d in deps), route_json=route_json_of(route))
+                            deps="", route_json=route_json_of(route))
                 added.append(tid)
-                # add_task stores title/parent/deps/route only; the rest of the task row is filled
-                # on the same connection. plans is the only table with its own INSERT.
                 con.execute(
                     "UPDATE tasks SET acceptance=?, owned=?, parallel=? WHERE run=? AND id=?",
                     (acceptance, ",".join(str(x) for x in owned), 1 if parallel else 0, run_id, tid))
+                con.commit()
+            # pass 2: store the authored deps and let mkdb name a cycle, self-dep or missing id
+            for tid, typ, parent, title, acceptance, owned, deps, parallel, route in items:
+                dep_text = ",".join(str(d) for d in deps)
+                db.check_deps(con, run_id, tid, dep_text)
+                con.execute("UPDATE tasks SET deps=? WHERE run=? AND id=?", (dep_text, run_id, tid))
                 con.commit()
             db._begin(con)
             try:
@@ -806,13 +815,14 @@ def export_plan(path, data, home):
     # byte-equal header: the archived file is the source of the header bytes
     archived = row["archived_path"]
     if archived and os.path.isfile(archived):
-        text = open(archived, encoding="utf-8").read()
-        lines, close = split_plan(text)
-        rebuilt = text  # the archived file is the header round trip; body is inside it verbatim
+        with open(archived, "rb") as fh:
+            raw = fh.read()
+        rebuilt = raw.decode("utf-8")
+        split_plan(rebuilt)  # refuse a corrupt archive before writing it back
     else:
         raise Fail([f"archived plan missing: {archived}"])
     if path != archived:
-        write_atomic(path, rebuilt)
+        write_atomic(path, raw)  # the archive bytes, CRLF included
     return {"ok": True, "plan": plan_id, "version": row["version"], "path": archived, "text": rebuilt}
 
 
@@ -1253,6 +1263,74 @@ def self_test():
         bad = mk("approve", missing, "--data", data, "--home", home, "--run", "ry", code=2)
         assert any("missing dep" in e and "other:NOPE" in e for e in bad["errors"]), bad
         assert open(missing, "rb").read() == blob
+
+        # R3 — a forward dep (phase A on a later phase C, a task on a later sibling) approves
+        fwd = write("fwd.md", plan_text(plan='plan = "fwd"', phases=(
+            phase("PA", wave=1, deps='"PC"', tasks=task("PA.1", extra='  deps = "PA.2"\n')
+                  + task("PA.2"))
+            + "\n" + phase("PC", wave=1) + "\n")))
+        out = mk("approve", fwd, "--data", data, "--home", home, "--run", "rf")
+        assert out["ok"] and out["version"] == 1, out
+        con = db.open_project(home, data_dir=data)
+        deps = {r["id"]: r["deps"] for r in con.execute("SELECT id, deps FROM tasks WHERE run='rf'")}
+        con.close()
+        assert deps["PA"] == "PC" and deps["PA.1"] == "PA.2" and deps["PA.2"] == "", deps
+
+        # a cycle across two later items is refused and names both ids; file and store stay
+        cyc2 = write("cyc2.md", plan_text(plan='plan = "cyc2"', phases=(
+            phase("PA", wave=1, deps='"PC"') + "\n" + phase("PC", wave=1, deps='"PA"') + "\n")))
+        blob = open(cyc2, "rb").read()
+        con = db.open_project(home, data_dir=data)
+        n_before = con.execute("SELECT COUNT(*) c FROM tasks").fetchone()["c"]
+        con.close()
+        bad = mk("approve", cyc2, "--data", data, "--home", home, "--run", "rc", code=2)
+        assert any("cycle:" in e and "PA" in e and "PC" in e for e in bad["errors"]), bad
+        assert open(cyc2, "rb").read() == blob
+        con = db.open_project(home, data_dir=data)
+        assert con.execute("SELECT COUNT(*) c FROM tasks").fetchone()["c"] == n_before
+        assert con.execute("SELECT id FROM plans WHERE id='cyc2'").fetchone() is None
+        con.close()
+
+        # a copy of the real mk-store plan approves; every phase and task lands with its deps
+        real = "/Users/rohits/Development/matrixkoder/.matrixkoder/plans/mk-store.md"
+        copy = os.path.join(tmp, "mk-store-copy.md")
+        shutil.copy(real, copy)
+        parsed = mk("parse", copy)
+        want = {}
+        for ph in parsed["phases"]:
+            want[ph["id"]] = ",".join(str(d) for d in ph["deps"])
+            for task in ph["tasks"]:
+                want[task["id"]] = ",".join(str(d) for d in task["deps"])
+        out = mk("approve", copy, "--data", data, "--home", home, "--run", "mkstore")
+        assert out["ok"] and not os.path.exists(copy), out
+        assert os.path.isfile(real)  # the real plan was never moved
+        con = db.open_project(home, data_dir=data)
+        got = {r["id"]: r["deps"] for r in con.execute(
+            "SELECT id, deps FROM tasks WHERE run='mkstore'")}
+        con.close()
+        assert set(got) == set(want), (sorted(set(want) - set(got)), sorted(set(got) - set(want)))
+        assert got == want
+
+        # CRLF export is byte-equal to the archived file
+        crlf = write("crlf-exp.md", plan_text(plan='plan = "crlfexp"', phases=phase("P1") + "\n").replace("\n", "\r\n"))
+        original = open(crlf, "rb").read()
+        out = mk("approve", crlf, "--data", data, "--home", home, "--run", "rcrlf")
+        assert out["ok"], out
+        archived = open(out["archived"], "rb").read()
+        dest = os.path.join(tmp, "crlfexp.md")
+        exp = mk("export", dest, "--data", data, "--home", home)
+        assert exp["ok"] and open(dest, "rb").read() == archived
+        assert b"\r\n" in archived and archived != original  # status line changed, endings did not
+        assert archived.replace(b"\r\n", b"") .count(b"\n") == 0
+
+        # a task or subtask with no id is a check error
+        noid = write("noid.md", plan_text(phases=phase("P1", tasks=(
+            '  [[phase.task]]\n  title = "missing"\n  acceptance = "a"\n'
+            '  [[phase.task.subtask]]\n  title = "also missing"\n  acceptance = "b"\n')) + "\n"))
+        bad = mk("check", noid, code=2)
+        assert any("task has no id" in e for e in bad["errors"]), bad
+        assert any("subtask has no id" in e for e in bad["errors"]), bad
+
 
         # the run's plan path still resolves through mk-state after the file is archived
         state = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mk-state.py")
