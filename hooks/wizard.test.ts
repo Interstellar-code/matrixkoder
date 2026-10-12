@@ -269,6 +269,20 @@ test('/mk setup opens the wizard pane and detection pre-fills the draft', async 
   expect(init.text).toContain('setup opened')
 })
 
+test('detection picks home for a bare repo', async ($, on) => {
+  world(on, {})
+  await $.session.start(sessionStart())
+  await mk($, 'setup')
+  expect(draftOf().dataMode).toBe('home')
+})
+
+test('detection keeps repo mode when package.json exists', async ($, on) => {
+  world(on, repoFiles())
+  await $.session.start(sessionStart())
+  await mk($, 'setup')
+  expect(draftOf().dataMode).toBe('repo')
+})
+
 test('detection proposes plugin/selftest/tsconfig gates for a repo shaped like this one', async ($, on) => {
   const files: Files = {
     [`${PROJECT_DIR}/.claude-plugin/plugin.json`]: '{}',

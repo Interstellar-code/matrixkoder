@@ -65,6 +65,27 @@ export function globalDirPath(envHome: string | null | undefined, home: string |
   return home == null ? null : join(home, '.matrixkoder')
 }
 
+/** One row of `mkdb.py projects --json`: the root store's projects table. */
+export type MkProjectRow = { slug?: unknown; repo?: unknown; data_dir?: unknown }
+
+/** Root-store lookup (`mkdb.py projects --json`): first repo path whose row has a data_dir wins.
+ *  Same path rules as projectDataDir. A failed command or an empty list is not a match — the
+ *  caller falls back to projects.json. */
+export function projectDirFromStore(rows: readonly MkProjectRow[] | null | undefined, repoPaths: readonly string[], home: string | null): string | null {
+  if (!Array.isArray(rows)) return null
+  const wanted = new Set(repoPaths)
+  for (const row of rows) {
+    if (row == null || typeof row !== 'object') continue
+    const repo = typeof row.repo === 'string' ? row.repo : ''
+    if (!wanted.has(repo)) continue
+    const dir = typeof row.data_dir === 'string' ? row.data_dir.trim() : ''
+    if (dir === '') continue
+    if (dir === '~' || dir.startsWith('~/')) return home == null ? null : normalizePath(dir === '~' ? home : join(home, dir.slice(2)))
+    return normalizePath(dir.startsWith('/') ? dir : join(repo, dir))
+  }
+  return null
+}
+
 /** projects.json lookup (wizard-written `{ "<repo>": { data_dir } }`): first repo path listed wins. A leading ~
  *  in data_dir means HOME; a relative one is resolved against the repo. */
 export function projectDataDir(projects: unknown, repoPaths: readonly string[], home: string | null): string | null {

@@ -523,3 +523,59 @@ test('mk_bus surfaces non-zero exit with the script error', async ($, on) => {
   expect(ran.isError).toBe(true)
   expect(String(ran.result)).toContain('bus down')
 })
+
+const okBus = () => procResult({ exitCode: 0, stdout: JSON.stringify({ ok: true, pending: [] }) })
+
+test('mk_bus resolves --data from the root store when projects.json is absent', async ($, on) => {
+  mock.env(on, { HOME: '/home/x' })
+  on('session.cwd', () => ({ value: '/repo' }))
+  on('fs.stat', (_$, e, next) => {
+    if (e.path === '/repo/.git') return { value: { kind: 'dir', size: 0, mtimeMs: 0, isLink: false } }
+    return next(e)
+  })
+  const seen: string[][] = []
+  on('process.run', (_$, e) => {
+    seen.push([...e.argv])
+    if (e.argv.includes('projects')) {
+      return {
+        value: procResult({
+          stdout: JSON.stringify({ ok: true, projects: [{ slug: 'proj', repo: '/repo', data_dir: '/srv/store-data' }] }),
+        }),
+      }
+    }
+    return { value: okBus() }
+  })
+
+  const ran = await callTool($, { tool: 'mcp__matrixkoder__mk_bus', action: 'pending' })
+
+  expect(ran.isError).toBeUndefined()
+  const bus = seen.find(argv => argv.some(a => a.includes('mk-bus.py'))) ?? []
+  expect(bus[bus.indexOf('--data') + 1]).toBe('/srv/store-data')
+})
+
+test('mk_bus falls back to projects.json when the root store command fails', async ($, on) => {
+  mock.env(on, { HOME: '/home/x' })
+  on('session.cwd', () => ({ value: '/repo' }))
+  on('fs.stat', (_$, e, next) => {
+    if (e.path === '/repo/.git') return { value: { kind: 'dir', size: 0, mtimeMs: 0, isLink: false } }
+    return next(e)
+  })
+  on('fs.read', (_$, e, next) => {
+    if (e.path === '/home/x/.matrixkoder/projects.json') {
+      return { value: JSON.stringify({ '/repo': { data_dir: '/srv/json-data' } }) }
+    }
+    return next(e)
+  })
+  const seen: string[][] = []
+  on('process.run', (_$, e) => {
+    seen.push([...e.argv])
+    if (e.argv.includes('projects')) return { value: procResult({ exitCode: 1, stderr: 'store down' }) }
+    return { value: okBus() }
+  })
+
+  const ran = await callTool($, { tool: 'mcp__matrixkoder__mk_bus', action: 'pending' })
+
+  expect(ran.isError).toBeUndefined()
+  const bus = seen.find(argv => argv.some(a => a.includes('mk-bus.py'))) ?? []
+  expect(bus[bus.indexOf('--data') + 1]).toBe('/srv/json-data')
+})

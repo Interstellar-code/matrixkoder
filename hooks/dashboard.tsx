@@ -12,7 +12,7 @@ import type { MkDashTab, MkEvent, MkRun, MkRunIndexEntry, MkSnapshot, MkStatusMe
 import {
   AGENT_ORDER, PANE_ID, EMPTY_SNAPSHOT, activeEntries, basename, candidateDirs, coerceIndex, coerceRun, coerceUsage, join,
   globalDirPath, mainCheckout, mkSnapshot, normalizePath, orderAgents, parentOf, parseGitdir, parseJson, parseYamlAgents, parseYamlProviders,
-  projectDataDir, sanitizeText, timerRegistry,
+  projectDataDir, projectDirFromStore, sanitizeText, timerRegistry, type MkProjectRow,
 } from './data'
 import type { MkPaneSnapshot } from './data'
 import { AGENT_COLOR, AGENT_GLYPH, NARROW, STATUS_COLOR, STATUS_GLYPH, bar, leftCol, rightCol } from './tabs/ui'
@@ -569,6 +569,43 @@ async function readText($: EngineInterface, path: string): Promise<string | null
 /** Schema rule (state-schema.md): MATRIXKODER_DATA → ~/.matrixkoder/projects.json entry for the repo → nearest .git
  *  toplevel's .matrixkoder; a linked worktree (.git FILE) resolves to its main checkout.
  *  The walk stops before home: ~/.matrixkoder is the GLOBAL dir, never project data. */
+
+/** The global dir ($MATRIXKODER_HOME, else ~/.matrixkoder): usage.json, projects.json. */
+async function globalDirOf($: EngineInterface, home: string | null): Promise<string | null> {
+  let envHome: string | undefined
+  try {
+    envHome = (await $.env.get('MATRIXKODER_HOME')) || undefined
+  } catch {
+    // env noun refused — the default
+  }
+  return globalDirPath(envHome, home)
+}
+
+
+/** Root store first (`mkdb.py projects --json`), then projects.json. null = neither names this
+ *  repo. File-local on purpose: the loader follows $ only into a function declared in this file. */
+async function listedDataDir($: EngineInterface, repoPaths: readonly string[], home: string | null): Promise<string | null> {
+  const gdir = await globalDirOf($, home)
+  if (gdir == null) return null
+  try {
+    const ran = await $.process.run(
+      ['python3', join($.plugin.root, 'scripts/mkdb.py'), 'projects', '--json', '--home', gdir],
+      { timeoutMs: 5000 },
+    )
+    if (ran.exitCode === 0) {
+      const parsed = parseJson(ran.stdout)
+      const rows = parsed !== null && typeof parsed === 'object' && 'projects' in parsed
+        ? (parsed as { projects?: unknown }).projects
+        : null
+      const fromStore = projectDirFromStore(Array.isArray(rows) ? rows as MkProjectRow[] : null, repoPaths, home)
+      if (fromStore != null) return fromStore
+    }
+  } catch {
+    // no python, or the command failed: projects.json still names the dir
+  }
+  return projectDataDir(await readJson($, join(gdir, 'projects.json')), repoPaths, home)
+}
+
 async function resolveDataDir($: EngineInterface, cwd: string, home: string | null): Promise<string | null> {
   try {
     const viaEnv = await $.env.get('MATRIXKODER_DATA')
@@ -596,9 +633,8 @@ async function resolveDataDir($: EngineInterface, cwd: string, home: string | nu
     }
     if (toplevel == null) continue
     // nearest repo boundary found: nested repos stop here (schema: pass --data for the outer)
-    // the wizard's projects.json (home mode) names the data dir of this repo; else <repo>/.matrixkoder
-    const gdir = await globalDirOf($, home)
-    const listed = gdir == null ? null : projectDataDir(await readJson($, join(gdir, 'projects.json')), [toplevel], home)
+    // the root store names the data dir of this repo; projects.json is the fallback; else <repo>/.matrixkoder
+    const listed = await listedDataDir($, [toplevel], home)
     const data = listed ?? join(toplevel, '.matrixkoder')
     try {
       const s = await $.fs.stat(data)
@@ -655,17 +691,6 @@ async function homeDir($: EngineInterface): Promise<string | null> {
     // no process either — usage stays empty
   }
   return null
-}
-
-/** The global dir ($MATRIXKODER_HOME, else ~/.matrixkoder): usage.json, projects.json. */
-async function globalDirOf($: EngineInterface, home: string | null): Promise<string | null> {
-  let envHome: string | undefined
-  try {
-    envHome = (await $.env.get('MATRIXKODER_HOME')) || undefined
-  } catch {
-    // env noun refused — the default
-  }
-  return globalDirPath(envHome, home)
 }
 
 function usagePath(globalDir: string): string {

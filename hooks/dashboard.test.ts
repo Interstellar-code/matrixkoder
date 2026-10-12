@@ -169,6 +169,25 @@ test('home mode: projects.json (under $MATRIXKODER_HOME) names the data dir of a
   expect(await ui.find({ text: /Welcome to MatrixKoder/ })).toBeUndefined()
 })
 
+test('the root store alone names the data dir when projects.json is absent', async ($, on) => {
+  const run = worldFiles()[RUN_PATH] ?? ''
+  const files: Record<string, string> = {
+    '/srv/store-data/runs/index.json': JSON.stringify([{ id: 'wfv2', feature: 'workflows-v2', status: 'active', started: '2026-10-07T16:00:00+02:00' }]),
+    '/srv/store-data/runs/wfv2/run.json': run,
+  }
+  mockFs(on, files, ['/srv/store-data', '/tmp/main/.git'])
+  mockWorld(on, {
+    env: { MATRIXKODER_HOME: '/srv/mkhome' },
+    process: (argv) => argv.includes('projects')
+      ? { value: { exitCode: 0, stdout: JSON.stringify({ ok: true, projects: [{ slug: 'main', repo: '/tmp/main', data_dir: '/srv/store-data' }] }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      : undefined,
+  })
+  await $.session.start(sessionStartIn('/tmp/main'))
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  expect(await ui.find({ text: /workflows-v2/ })).toBeTruthy()
+  expect(await ui.find({ text: /Welcome to MatrixKoder/ })).toBeUndefined()
+})
+
 test('MATRIXKODER_HOME moves the global dir: usage.json is read from it', { plugins: [worldFixtures] }, async ($, on) => {
   const files = worldFiles()
   files['/srv/mkhome/usage.json'] = (files[USAGE_PATH] ?? '').replace('claude-gpt', 'srv-pool') // distinguishable from the fixture copy under HOME
