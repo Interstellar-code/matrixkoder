@@ -36,11 +36,156 @@ export type WaitingView = {
   actions: string[]
   footerLeft: string
   footerRight: string
+  /** set on a real ask: its bus id, the task it belongs to, and its age */
+  id?: string
+  task?: string
+  age?: string
+}
+
+/**
+ * One pending ask as `mk-bus.py pending --json` returns it.
+ * Keys pinned from the bus message `append_message` builds
+ * (`scripts/mk-bus.py` around the `msg = {` in `append_message`) and from
+ * `get_pending`, which returns those messages unanswered. `cmd_pending`
+ * wraps them as `{"ok": true, "run": …, "pending": […]}`.
+ */
+export type PendingAsk = {
+  id: string
+  task?: string | null
+  text?: string
+  ts?: string
+  /** present only when the ask carried a decision; the bus message has none */
+  options?: WaitOption[]
+}
+
+/** What one `mk-bus.py pending --json` stdout looks like (`cmd_pending`). */
+export type PendingPayload = { ok?: boolean; run?: string; pending?: readonly PendingAsk[]; error?: string }
+
+/** Injected process runner, same shape as the Kanban tab's. */
+export type RunFn = (
+  argv: readonly string[],
+  init?: { timeoutMs?: number },
+) => Promise<{ stdout?: string; code?: number }>
+
+/** A run snapshot's wait, the bus-down fallback (`types` `MkWaiting`). */
+export type RunWait = { question: string; options?: readonly string[]; rec?: string | null; since?: string | null }
+
+/** One `pending --json` read for a dashboard tick. */
+export type PendingRead = {
+  asks: readonly PendingAsk[]
+  /** the bus answered (even with zero asks): real source, never the fixture */
+  live: boolean
+  /** the bus did not answer: caller falls back to the run snapshot, else the fixture */
+  down: boolean
 }
 
 /** the fixture with the mock flag (C1/C3). */
 export function waitingView(): WaitingView {
   return { mock: true, ...WAITING_FIXTURE }
+}
+
+/** Whole minutes between an ask's `ts` and now. Unparseable clocks yield nothing. */
+export function askAge(ts: string | undefined, nowIso: string): string {
+  if (ts == null || ts === '') return ''
+  const a = Date.parse(ts)
+  const b = Date.parse(nowIso)
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return ''
+  const mins = Math.max(0, Math.round((b - a) / 60000))
+  if (mins < 60) return `${String(mins)}m`
+  const hours = Math.floor(mins / 60)
+  return hours < 48 ? `${String(hours)}h` : `${String(Math.floor(hours / 24))}d`
+}
+
+/** One real ask as a card. Options keep the decision layout; without them the
+ *  card shows the id and the answer command as a dim hint (C10: no script). */
+export function askView(ask: PendingAsk, nowIso: string): WaitingView {
+  const age = askAge(ask.ts, nowIso)
+  const task = ask.task ?? ''
+  const options = ask.options ?? []
+  return {
+    mock: false,
+    id: ask.id,
+    task,
+    age,
+    header: task !== '' ? task : ask.id,
+    time: age !== '' ? `open ${age}` : '',
+    timeCompact: age,
+    question: ask.text ?? '',
+    options,
+    actions: options.length === 0 ? [`mk-bus.py answer ${ask.id} "<text>"`] : ['or type "mk: pick A"'],
+    footerLeft: ask.id,
+    footerRight: age,
+  }
+}
+
+/** The run snapshot's wait, used only when the bus did not answer. */
+export function runWaitView(wait: RunWait): WaitingView {
+  const options: WaitOption[] = (wait.options ?? []).map(label => ({
+    key: label,
+    label,
+    action: label,
+    explanation: '',
+    recommended: wait.rec != null && wait.rec === label,
+  }))
+  return {
+    mock: false,
+    header: 'run wait',
+    time: wait.since ?? '',
+    timeCompact: wait.since ?? '',
+    question: wait.question,
+    options,
+    actions: [],
+    footerLeft: 'from the run snapshot',
+    footerRight: '',
+  }
+}
+
+/** Nothing pending from a real source: the empty state, never the fixture. */
+export function emptyWaitingView(): WaitingView {
+  return {
+    mock: false,
+    header: '',
+    time: '',
+    timeCompact: '',
+    question: '',
+    options: [],
+    actions: [],
+    footerLeft: '',
+    footerRight: '',
+  }
+}
+
+/**
+ * One `mk-bus.py pending --json` per dashboard tick. The runner is injected:
+ * the plugin test runtime cannot spawn. A missing script, a non-zero exit,
+ * non-JSON or `{"ok": false}` is "bus down" (`down: true`) and spawns nothing
+ * else — this never starts a bus and never creates a file. `{"ok": true}` with
+ * an empty list is a real source (`live: true`, `asks: []`).
+ */
+export async function readPending(run: RunFn, pluginRoot: string): Promise<PendingRead> {
+  const down: PendingRead = { asks: [], live: false, down: true }
+  const argv = ['python3', `${pluginRoot}/scripts/mk-bus.py`, 'pending', '--json']
+  let result: { stdout?: string; code?: number }
+  try {
+    result = await run(argv, { timeoutMs: 5_000 })
+  } catch {
+    return down
+  }
+  if (result.code !== 0 && result.code != null) return down
+  const stdout = result.stdout ?? ''
+  // An empty answer is "no bus spoke": the caller keeps whatever it was showing
+  // (the fixture before the first real tick). A dead bus exits non-zero or
+  // throws, which is the `down` path above.
+  if (stdout.trim() === '') return { asks: [], live: false, down: false }
+  let parsed: PendingPayload
+  try {
+    parsed = JSON.parse(stdout) as PendingPayload
+  } catch {
+    return down
+  }
+  if (parsed == null || typeof parsed !== 'object' || parsed.ok !== true) return down
+  const asks = Array.isArray(parsed.pending) ? parsed.pending.filter(a => typeof a?.id === 'string') : []
+  return { asks, live: true, down: false }
 }
 
 /** where the tab keeps its view state (C12). */
@@ -180,23 +325,54 @@ function actionRows(els: Els, view: WaitingView, ui: TabUi | undefined, w: numbe
   ]
 }
 
-/** Pure render: elements only, no $, no state (C1). */
-export function WaitingTab(els: Els, view: WaitingView, cols: number, ui?: TabUi): RenderElement {
+/** one ask as a card. A real ask with no options shows its id and the answer
+ *  command instead of the decision buttons (C10: the tab calls no script). */
+function askCard(els: Els, view: WaitingView, cols: number, ui: TabUi | undefined, key: string): RenderElement {
   const { Box, Text } = els
   const w = Math.max(8, cols - 4) // the Card's border + padding each side (C11)
   const picked = waitingPick(ui, view)
   const rows: RenderElement[] = [headerRow(els, view, cols, w)]
+  if (view.id != null && view.id !== '') rows.push(<Text key={`${key}-id`} dimColor={true}>{cut(`${view.id}${view.task != null && view.task !== '' ? ` · ${view.task}` : ''}${view.age != null && view.age !== '' ? ` · ${view.age}` : ''}`, w)}</Text>)
   for (const [i, line] of wrapProse(view.question, w, '  ', '  ').entries()) {
-    rows.push(<Text key={`q-${String(i)}`}>{line}</Text>)
+    rows.push(<Text key={`${key}-q-${String(i)}`}>{line}</Text>)
   }
-  for (const option of view.options) rows.push(...optionRows(els, option, picked === option.key, w))
-  rows.push(...actionRows(els, view, ui, w))
+  if (view.options.length > 0) {
+    for (const option of view.options) rows.push(...optionRows(els, option, picked === option.key, w))
+    rows.push(...actionRows(els, view, ui, w))
+  }
   for (const hint of view.actions) rows.push(ActionRow(els, { actions: cut(hint, w) }))
+  return Card(els, { role: 'warn' }, <Box key={key} flexDirection="column">{rows}</Box>)
+}
+
+/** Pure render: elements only, no $, no state (C1).
+ *  One view draws one card (the fixture, the run-snapshot fallback, one ask).
+ *  Several real asks stack through `waitingAsks`. */
+export function WaitingTab(els: Els, view: WaitingView, cols: number, ui?: TabUi): RenderElement {
+  const { Box, Text } = els
+  if (!view.mock && view.question === '' && view.options.length === 0 && (view.id == null || view.id === '')) {
+    return (
+      <Box flexDirection="column">
+        <Text dimColor={true}>nothing waiting</Text>
+      </Box>
+    )
+  }
   return (
     <Box flexDirection="column">
-      <Text bold={true} color="warning">MOCK · fixture data · not this run</Text>
-      {Card(els, { role: 'warn' }, <Box flexDirection="column">{rows}</Box>)}
+      {view.mock && <Text bold={true} color="warning">MOCK · fixture data · not this run</Text>}
+      {askCard(els, view, cols, ui, 'ask')}
       <Text dimColor={true}>{hintRow(view.footerLeft, view.footerRight, cols)}</Text>
+    </Box>
+  )
+}
+
+/** Several pending asks, one card each, in the order the bus returned them. */
+export function waitingAsks(els: Els, asks: readonly PendingAsk[], cols: number, nowIso: string, ui?: TabUi): RenderElement {
+  const { Box, Text } = els
+  if (asks.length === 0) return WaitingTab(els, emptyWaitingView(), cols, ui)
+  return (
+    <Box flexDirection="column">
+      {asks.map(ask => askCard(els, askView(ask, nowIso), cols, ui, ask.id))}
+      <Text dimColor={true}>{hintRow(`${String(asks.length)} waiting`, '', cols)}</Text>
     </Box>
   )
 }

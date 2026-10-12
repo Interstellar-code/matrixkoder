@@ -33,7 +33,8 @@ import {
 } from './settings-io'
 import type { RunFn, SavePayload, YamlFieldIn } from './settings-io'
 import { UsageTab, usageView } from './tabs/usage'
-import { WaitingTab, waitingView } from './tabs/waiting'
+import { WaitingTab, waitingAsks, waitingView, readPending, askView, runWaitView, emptyWaitingView } from './tabs/waiting'
+import type { PendingAsk, RunWait } from './tabs/waiting'
 import { KanbanTab, kanbanView, readCards, emptyKanbanView, kanbanFixtureView, cardsErrorLine } from './tabs/kanban'
 import type { KanbanCard, KanbanFilters, CardsRead } from './tabs/kanban'
 import { chipText, toastsFor } from './status'
@@ -307,7 +308,9 @@ export function registerDashboard(on: On, options: PluginOptions): void {
                       ? withViewState(EventsTab, tabEls, eventsView(), cols, ui)
                       : dashTab === 'kanban'
                         ? KanbanTab(tabEls, kanbanPaneView(viewState), cols)
-                        : withViewState(WaitingTab, tabEls, waitingView(), cols, ui)}
+                        : waitingPane(viewState).src === 'live'
+                          ? waitingAsks(tabEls, waitingPane(viewState).asks, cols, new Date().toISOString(), ui)
+                          : withViewState(WaitingTab, tabEls, waitingPaneView(viewState, snap.run?.waiting ?? null), cols, ui)}
       </Box>
     )
   })
@@ -728,6 +731,60 @@ function contentSig(snap: MkSnapshot): string {
 }
 
 
+/** Pending asks kept on the view-state atom so a tick is one read, not a render.
+ *  `waiting:src` is `live` (the bus answered), `down` (it did not) or unset
+ *  (no tick yet, so the tab still shows the fixture). */
+const PENDING_KEY = 'waiting:pending'
+const PENDING_SRC_KEY = 'waiting:src'
+
+function waitingPane(view: Record<string, string>): { src: string; asks: PendingAsk[] } {
+  let asks: PendingAsk[] = []
+  try {
+    const parsed = JSON.parse(view[PENDING_KEY] ?? '[]') as unknown
+    if (Array.isArray(parsed)) asks = parsed as PendingAsk[]
+  } catch {
+    asks = []
+  }
+  return { src: view[PENDING_SRC_KEY] ?? '', asks }
+}
+
+function waitingPaneView(view: Record<string, string>, runWaiting: RunWait | null) {
+  const src = view[PENDING_SRC_KEY] ?? ''
+  if (src === '') return waitingView()
+  if (src === 'live') {
+    const { asks } = waitingPane(view)
+    const first = asks[0]
+    if (first == null) return emptyWaitingView()
+    return askView(first, new Date().toISOString())
+  }
+  if (runWaiting != null && runWaiting.question !== '') return runWaitView(runWaiting)
+  return waitingView()
+}
+
+/** One `mk-bus.py pending --json` per dashboard tick. Never starts a bus and
+ *  never creates a file: `readPending` only runs the injected command. */
+let pendingInFlight = false
+
+async function refreshPending($: EngineInterface): Promise<void> {
+  if (pendingInFlight) return
+  pendingInFlight = true
+  const run = (argv: readonly string[], init?: { timeoutMs?: number }) =>
+    $.process.run([...argv], init).then(r => ({ stdout: r.stdout, code: r.exitCode }))
+  try {
+    const got = await readPending(run, $.plugin.root)
+    if (!got.live && !got.down) return
+    await update($, viewStateAtom, prev => ({
+      ...prev,
+      [PENDING_SRC_KEY]: got.down ? 'down' : 'live',
+      ...(got.live ? { [PENDING_KEY]: JSON.stringify(got.asks) } : {}),
+    }))
+  } catch {
+    await update($, viewStateAtom, prev => ({ ...prev, [PENDING_SRC_KEY]: 'down' }))
+  } finally {
+    pendingInFlight = false
+  }
+}
+
 /** Cards JSON kept on the view-state atom so a tick is one read, not a render. */
 const CARDS_KEY = 'kanban:cards'
 const CARDS_MS_KEY = 'kanban:ms'
@@ -868,6 +925,7 @@ async function refreshSafe($: EngineInterface, options: PluginOptions, cwd: stri
       await update($, snapshotAtom, () => snap)
     }
     await refreshCards($)
+    await refreshPending($)
   } catch (err) {
     try {
       await update($, snapshotAtom, () => ({ ...prev, error: `cannot read run.json (${String(err).slice(0, 40)})` }))
