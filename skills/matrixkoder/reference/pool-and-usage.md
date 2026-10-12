@@ -34,6 +34,8 @@ This is the menu `jev_decide` picks from, not a size → model mapping. Put the 
 
 Sources: the list the agent's configured provider actually serves, not the vendor catalog (lesson 32). `codex debug models` prints the official OpenAI list, which can include ids the provider rejects; the provider's `unsupported model` error prints its supported list — use that, and mark a model unavailable on its first rejection. Also `agy models`, `opencode models <provider>` for each provider the user pays for (e.g. `opencode models zai-coding-plan`; the bare `opencode models` shows only `opencode/*` and `opencode-go/*`), and the session's Claude model list.
 
+**Live catalog:** `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/mk-catalog.py routes --json` lists the runnable routes (enabled agents × picked models × efforts) backing the snapshot above; `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/mk-catalog.py model --pane <pane>` reads the live model out of a herdr pane footer (`--text` feeds footer text directly). The settings reviewer rows take their options from the catalog's runnable routes (wired in `scripts/mk-config.py`): a saved value the catalog dropped stays in the list flagged `stale`; with the catalog absent the dropdown falls back to the current value alone.
+
 Never put a multi-file phase on a "low" effort model: it looped after context compaction and stalled twice.
 
 ## Effort (part of every route — Jev picks it, the user never has to)
@@ -99,6 +101,7 @@ Not every lane needs a separate human reviewer. Depth follows risk, and the revi
 - Use a Claude subagent only when it is the only family left or Jev routes it there.
 - Jev still picks agent + model + effort from those candidates.
 - A data-loss/security review uses the strongest tier available.
+- The settings UI's reviewer rows offer the catalog's runnable routes (see **Live catalog** above).
 
 **Reviewer brief** = the diff + the brief's acceptance criteria + gate output. Never "explore the repo".
 
