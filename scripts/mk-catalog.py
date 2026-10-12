@@ -448,7 +448,7 @@ def routes(home):
     try:
         out = []
         for agent in con.execute("SELECT id FROM agents WHERE status='enabled' ORDER BY id"):
-            if agent["id"] in NOT_A_BUILDER:
+            if str(agent["id"]).strip().casefold() in NOT_A_BUILDER:
                 continue
             for model in con.execute("SELECT id, effort_levels_json FROM models WHERE agent=? AND"
                                      " status IN ('picked','probed') ORDER BY id", (agent["id"],)):
