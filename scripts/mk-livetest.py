@@ -176,11 +176,44 @@ def _check_root(root):
     return root
 
 
+def _kill_buses(home):
+    """Stop every mk-bus.py serve whose --data is inside this home. A restart writes a new pid
+    into bus.json, so this re-reads the file rather than trusting the pid a row remembered."""
+    import signal
+    home = os.path.realpath(home)
+    path = os.path.join(home, "bus.json")
+    pids = set()
+    if os.path.isfile(path):
+        try:
+            pid = json.load(open(path)).get("pid")
+        except (OSError, ValueError):
+            pid = None
+        if isinstance(pid, int) and pid > 1:
+            pids.add(pid)
+    try:
+        listed = subprocess.run(["ps", "-ax", "-o", "pid=,command="],
+                                capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        listed = ""
+    for line in listed.splitlines():
+        if "mk-bus.py" in line and "serve" in line and home in line:
+            head = line.strip().split(None, 1)[0]
+            if head.isdigit():
+                pids.add(int(head))
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    return sorted(pids)
+
+
 def teardown(home):
     """Remove the setup root, and nothing the marker lists. The marker only confirms it."""
     if not home:
         raise Fail("teardown needs --home")
     home = refuse_home(home)
+    _kill_buses(home)  # before the rmtree, so a serve cannot outlive the home it was started for
     data = _read_marker(home)
     root = _check_root(data["root"])
     if not _inside(root, home):
@@ -213,6 +246,9 @@ def _run_row(row, ctx):
         return "fail", str(e)
     except Exception as e:
         return "fail", f"{type(e).__name__}: {e}"
+    finally:
+        if ctx.get("home"):  # a row that started a bus, then raised, must not leave the serve
+            _kill_buses(ctx["home"])
     return "pass", ""
 
 
@@ -426,8 +462,15 @@ def _state_mod():
 def row_c1_projects(ctx):
     """Register a project row through mk-state.register_project. usage.json and locks/ stay files."""
     ctx = _need(ctx)
+    saved = os.environ.get("MATRIXKODER_HOME")
     os.environ["MATRIXKODER_HOME"] = ctx["home"]
-    _state_mod().register_project(ctx["slug"], ctx["repo"], ctx["data"], name="live")
+    try:
+        _state_mod().register_project(ctx["slug"], ctx["repo"], ctx["data"], name="live")
+    finally:
+        if saved is None:
+            os.environ.pop("MATRIXKODER_HOME", None)
+        else:
+            os.environ["MATRIXKODER_HOME"] = saved
     con = mkdb.open_root(ctx["home"])
     try:
         row = con.execute("SELECT slug, name, repo, data_dir, mode FROM projects WHERE slug=?",
@@ -543,7 +586,7 @@ def row_c8_catalog(ctx):
     with open(yaml_path, "w", encoding="utf-8") as fh:
         fh.write("agents:\n"
                  "  opencode: { available: true, models: [gpt-lt] }\n"
-                 "  agy: { available: false, models: [] }\n")
+                 "  agy: { available: false, models: [gpt-off] }\n")
     import importlib.util
     spec = importlib.util.spec_from_file_location("mk_catalog", os.path.join(HERE, "mk-catalog.py"))
     cat = importlib.util.module_from_spec(spec)
@@ -577,8 +620,17 @@ def row_c8_catalog(ctx):
     listed = cat.routes(ctx["home"])
     if "opencode gpt-lt low" not in listed.get("routes", []):
         raise Fail(f"routing did not read the catalog: {listed}")
+    # agy is disabled but has a picked model, so a routes() that forgot the enabled
+    # filter would emit "agy gpt-off". An empty model list would hide that.
     if any(r.startswith("agy ") for r in listed["routes"]):
-        raise Fail("a disabled agent was routed")
+        raise Fail(f"a disabled agent was routed: {listed['routes']}")
+    con = cat.read_catalog(ctx["home"])
+    try:
+        off = con.execute("SELECT status FROM models WHERE agent='agy' AND id='gpt-off'").fetchone()
+    finally:
+        con.close()
+    if not off or off["status"] != "picked":
+        raise Fail("the disabled agent has no model row, so the filter check cannot bite")
 
 
 def _bus_env(ctx):
@@ -908,6 +960,19 @@ def self_test():
         _check(set(g1) <= set(g2) <= set(g3), "gates are not nested")
         _check(len(g3) == sum(1 for r in matrix_rows() if r["kind"] == "scripted"),
                "G3 is not the full scripted matrix")
+        # G2 still has pending rows, so exit 3 and "PENDING is not a pass" stay asserted
+        # even when G1 has none left.
+        proc = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "--home", home, "scripted", "--gate", "G2"],
+            capture_output=True, text=True)
+        g2_lines = [json.loads(l) for l in proc.stdout.strip().splitlines()]
+        g2_summary = g2_lines[-1]
+        _check(g2_summary["summary"]["PENDING"] > 0, f"G2 had no PENDING: {g2_summary}")
+        _check(g2_summary.get("ok") is False, "PENDING gate reported ok")
+        _check(all(l.get("status") != "pass" or not l.get("detail", "").startswith("pending")
+                   for l in g2_lines if "row" in l), "a pending row was scored pass")
+        _check(proc.returncode == (1 if g2_summary["summary"]["fail"] else 3),
+               f"G2 exited {proc.returncode}")
     finally:
         subprocess.run([sys.executable, os.path.abspath(__file__), "teardown", "--home", home],
                        check=True, capture_output=True, text=True)
