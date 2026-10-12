@@ -42,7 +42,8 @@ KINDS = ("claude", "codex", "opencode", "agy")
 # "Free usage exceeded, subscribe to Go"). Reset phrases only feed parse_reset, never trigger.
 QUOTA_RE = re.compile(r"\b(?:(?:usage|weekly|week|5-hour|5h|hourly|daily|session|plan|individual)\s+(?:limit|quota)\s+"
                       r"(?:reached|hit|exceeded)|(?:hit|reached)\s+your\s+(?:usage\s+|weekly\s+|5-hour\s+)?limit"
-                      r"|quota\s+(?:reached|exceeded)|(?:free\s+)?usage\s+exceeded)", re.I)
+                      r"|quota\s+(?:reached|exceeded)|(?:free\s+)?usage\s+exceeded"
+                      r"|reached\s+your\s+pro\s+5-hour\s+limit)", re.I)
 # Lines that are code, diffs, grep hits or tool views — an agent editing this very file prints quota words.
 # ponytail: heuristic; a real CLI message with a double quote or "==" in it would be ignored
 CODE_LINE_RE = re.compile(r"[\"`]|\b(?:assert|def|return|import)\b|re\.compile|==|\w\s*=\s*['(\[]|\(\s*'"
@@ -449,6 +450,43 @@ def self_test_body(shutil):
                 raise AssertionError(f"pool {bad!r} should be refused")
     finally:
         shutil.rmtree(tmp_pool, ignore_errors=True)
+
+    # K3: Ollama Cloud Pro 5-hour wall — one pool for every ollama-cloud/* model, keyed "ollama"
+    ollama_hint = "You reached your Pro 5-hour limit. resets in 2h 14m"
+    ollama_bare = "You reached your Pro 5-hour limit"
+    assert classify(ollama_hint, "idle", 1, 10)[0] == "QUOTA", ollama_hint
+    assert classify(ollama_bare, "working", 1, 10)[0] == "QUOTA", ollama_bare
+    assert classify("YOU REACHED YOUR PRO 5-HOUR LIMIT — try another model", "idle", 1, 10)[0] == "QUOTA"
+    buried = ("thinking\n" * 20) + "error: You reached your Pro 5-hour limit. resets at 3:14pm\n" + ("more\n" * 10)
+    assert classify(buried, "working", 1, 10)[0] == "QUOTA", buried
+    # a mere mention of "5-hour" is not the wall; an ordinary working pane stays OK
+    for msg in ("the Pro plan's 5-hour window is usually enough",
+                "docs say a 5-hour limit exists for ollama cloud",
+                "editing lane-health.py, tests still green"):
+        assert classify(msg, "working", 1, 10)[0] == "OK", msg
+    # an existing agent's quota line still classifies as before
+    assert classify("⚠ Individual quota reached. Resets in 154h43m", "idle", 1, 10)[0] == "QUOTA"
+    assert parse_reset(ollama_hint, now) == (later(hours=2, minutes=14), "5h"), parse_reset(ollama_hint, now)
+    assert parse_reset(ollama_bare, now) == (None, "5h"), parse_reset(ollama_bare, now)
+    assert parse_reset("You reached your Pro 5-hour limit. resets at 3:14pm", now) == (later(hours=3, minutes=14), "5h")
+    tmp_ol = tempfile.mkdtemp(prefix="lane-health-ollama-")
+    try:
+        olled = os.path.join(tmp_ol, "usage.json")
+        json.dump({"updated": "keep", "agents": {"opencode": {"source": "codexbar", "status": "ok"}}}, open(olled, "w"))
+        e = record_quota(olled, "ollama", "> brief\n" + ollama_hint, now)
+        assert e["exhausted_until"] == later(hours=2, minutes=14) and e["exhausted_window"] == "5h", e
+        assert e["exhausted_guess"] is False and e["exhausted_source"] == "pane-text" and e["exhausted_evidence"], e
+        saved = json.load(open(olled))
+        assert saved["updated"] == "keep" and saved["agents"]["opencode"]["source"] == "codexbar"
+        assert "exhausted_until" not in saved["agents"]["opencode"]
+        assert set(json.load(open(olled))["agents"]) == {"opencode", "ollama"}
+        # no reset hint: exhausted_until is now + 5h, flagged a guess (fresh key, not the hinted one)
+        bare_led = os.path.join(tmp_ol, "bare.json")
+        bare = record_quota(bare_led, "ollama", ollama_bare, now)
+        assert bare["exhausted_guess"] is True and bare["exhausted_until"] == later(hours=GUESS_H), bare
+        assert bare["exhausted_window"] == "5h" and set(json.load(open(bare_led))["agents"]) == {"ollama"}
+    finally:
+        shutil.rmtree(tmp_ol, ignore_errors=True)
 
     # F1: the OpenCode free-tier hit recorded under kind opencode, exhausted_until = now + retry delay
     tmp_oc = tempfile.mkdtemp(prefix="lane-health-opencode-")

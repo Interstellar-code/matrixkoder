@@ -13,7 +13,11 @@
       deleted); --apply stores the new plan_sha and writes exactly ONE summary event. The last
       plan-linked run set `done` → plan `set --status done` (best-effort, never fatal).
       The same transition promotes that run's `merged` and `qa` tasks to `done` (the task-set
-      path; one event each, note says the run close promoted them; best-effort, never fatal)
+      path; one event each, note says the run close promoted them; best-effort, never fatal).
+      Setting an already-done run to done again is not a no-op: promotion runs again, so a
+      crash between the status write and a later promotion can be repaired by re-running it.
+      Tasks already moved are listed in `promoted` even when a later promotion raises
+      (`promote_error`).
   run list | run get [--id ID | ID] | run set [--id ID] [--next TEXT] [--status active|done]
   run stage N [--id ID] | run archive --id ID | run archive ID
   task add --id T --title TEXT [--wave N] [--deps A,RUN:B] [--owned glob,glob] [--parent P]
@@ -34,7 +38,9 @@
       (task, round, kind) when they already exist, and still writes the task-folder files as views
   task round T --undo — drop the latest round again, but only while none of its brief/report/review
       files exist (the paths task round printed); else ok:false naming them; one event
-  task verify T --tests '<pass>/<fail>' [--tsc N] [--lint N] [--selftest '<run>/<failed>'] [--fail TEXT]
+  task verify T --tests '<passed>/<failed>' [--tsc N] [--lint N] [--selftest '<run>/<failed>'] [--fail TEXT]
+      a failed count larger than the passed count is refused (that shape is almost surely
+      passed/total, e.g. 384/387); the task is not moved
       stage 7: one verdict event with the counts (e.g. tests 250/1 · tsc 0 · lint 0 · selftest 8/0),
       compared with the run's latest `baseline:` decision (tests/selftest must not drop; tsc/lint are
       context); pass moves T (and its children) to review, fail (--fail or a drop) to fix — one
@@ -1307,8 +1313,11 @@ def cmd_run(a, st):
                 warn = set_run_status(st, run, a.status)
                 promoted, perr = [], None
                 if a.status == "done" and run["status"] == "done":
+                    # the list lives here, not inside promote_closed: a raise midway still
+                    # reports every task this call already moved
                     try:
-                        promoted = promote_closed(st, run, a.by)
+                        for tid in promote_closed(st, run, a.by):
+                            promoted.append(tid)
                     except Exception as e:  # best-effort like the plan update: never fail run set
                         perr = f"{type(e).__name__}: {e}"
         elif a.action == "stage":
@@ -1379,18 +1388,23 @@ def promote_closed(st, run, by):
     """On the transition to done: every task of THIS run at merged or qa becomes done, through
     the same write as `task set` (one transition each; roll-up happens in the save that follows).
     The note says the close promoted it. Other statuses and other runs are left alone. A task
-    that already is done is not an event. -> promoted ids."""
+    that already is done is not an event. Yields each promoted id as that promotion succeeds,
+    so the caller can keep the ones that landed when a later one raises."""
     note = "promoted by closing the run"
-    promoted = []
+    n = 0
     for t in run.get("tasks") or []:
         if t.get("status") not in ("merged", "qa") or not t.get("id"):
             continue
+        # test seam: fail before this task, after earlier ones were already yielded
+        fail_after = os.environ.get("MK_PROMOTE_FAIL_AFTER")
+        if fail_after is not None and n >= int(fail_after):
+            raise RuntimeError(f"injected promote failure before {t['id']}")
         frm = t["status"]
         st.event(run, "transition", note, task=t["id"], frm=frm, to="done", by=by)
         t["status"], t["updated"] = "done", now()
         write_json(os.path.join(st.task_dir(run["id"], t["id"]), "task.json"), t)
-        promoted.append(t["id"])
-    return promoted
+        n += 1
+        yield t["id"]
 
 
 def set_run_status(st, run, status):
@@ -1634,7 +1648,12 @@ def count_pair(v, flag):
     m = re.fullmatch(r"(\d+)/(\d+)", v or "")
     if not m:
         raise Fail(f"bad {flag} {v!r}; expected '<int>/<int>'")
-    return int(m.group(1)), int(m.group(2))
+    a, b = int(m.group(1)), int(m.group(2))
+    # a failed count above the passed count is almost surely passed/total (384/387)
+    if flag == "--tests" and b > a:
+        raise Fail(f"bad --tests {v!r}; expected <passed>/<failed> "
+                   f"(the failed count is larger than the passed count, which looks like passed/total)")
+    return a, b
 
 
 def latest_baseline(st, run):
@@ -2050,7 +2069,10 @@ def build_parser():
     r.add_argument("--feature"), r.add_argument("--branch"), r.add_argument("--plan")
     r.add_argument("--force", action="store_true")  # run init --plan: init an unapproved plan
     run.choices["set"].add_argument("--next")
-    run.choices["set"].add_argument("--status", choices=("active", "done"))
+    run.choices["set"].add_argument("--status", choices=("active", "done"),
+                                    help="done promotes this run's merged/qa tasks; "
+                                         "already-done is not a no-op, it promotes again "
+                                         "(repairs a crash between the two writes)")
     run.choices["stage"].add_argument("n", type=int, nargs="?")
 
     task = sub.add_parser("task").add_subparsers(dest="action", required=True)
@@ -2067,7 +2089,8 @@ def build_parser():
     t.add_argument("task")
     t = task.add_parser("verify", parents=[data_p, run_p])
     t.add_argument("task")
-    t.add_argument("--tests", required=True)  # '<pass>/<fail>'
+    t.add_argument("--tests", required=True, metavar="<passed>/<failed>",
+                   help="passed/failed counts; a failed count larger than the passed count is refused")
     t.add_argument("--tsc", type=int)
     t.add_argument("--lint", type=int)
     t.add_argument("--selftest")  # '<run>/<failed>'
@@ -2748,6 +2771,27 @@ def self_test():
         for bad in ("100", "a/b", "100/0/1"):
             assert fk("task", "verify", "VP", "--tests", bad, code=2)["ok"] is False, bad
 
+        # K2.1: --help names <passed>/<failed>; a failed count larger than the passed
+        # count looks like passed/total and is refused (exit 2, task not moved, no event).
+        help_out = subprocess.run([sys.executable, os.path.abspath(__file__), "task", "verify", "--help"],
+                                  capture_output=True, text=True, env=env)
+        assert help_out.returncode == 0, help_out.stderr
+        assert "--tests <passed>/<failed>" in help_out.stdout, help_out.stdout
+        fk("task", "set", "VT", "status=building")
+        n_before = len(fevs())
+        bad = fk("task", "verify", "VT", "--tests", "384/387", code=2)
+        assert bad["ok"] is False, bad
+        assert "384/387" in bad["error"] and "<passed>/<failed>" in bad["error"], bad
+        assert fk("task", "get", "VT")["task"]["status"] == "building"
+        assert len(fevs()) == n_before, "refused --tests wrote an event"
+        for ok_pair, want in (("350/0", "pass"), ("0/0", "pass"), ("10/3", "fail"), ("3/3", "fail")):
+            fk("task", "set", "VT", "status=building")
+            if ok_pair == "0/0":  # the run baseline is 100; a zero pass-count must not trip the drop gate
+                fk("event", "--type", "decision", "--text", "baseline: tests 0/0 · selftest 8/0")
+            out = fk("task", "verify", "VT", "--tests", ok_pair, "--selftest", "8/0")
+            assert out["ok"] and out["result"] == want, (ok_pair, out)
+        fk("event", "--type", "decision", "--text", "baseline: tests 100/0 · tsc 0 · lint 0 · selftest 8/0")
+
         # F2.3 H1: tests fail / selftest failed > 0 → fix, named in the verdict text.
         # M3: verify never writes on a task that has children — the leaves carry the verify
         # transition; the parent rolls up. Check the leaves' transitions, not the parent's.
@@ -3050,6 +3094,26 @@ def self_test():
         assert "promote_error" not in again
         tail = [json.loads(x) for x in open(evp)][n_ev + len(newev):]
         assert not [e for e in tail if e.get("to") == "done"], tail  # no second promotion
+
+        # K2.2: a raise on the 2nd promotion still reports the task already moved.
+        # The list is built by the caller; MK_PROMOTE_FAIL_AFTER=1 fails inside promote_closed.
+        pm("run", "init", "--id", "half", "--feature", "Half", "--branch", "h")
+        pm("task", "add", "--id", "H1", "--title", "first", "--run", "half")
+        pm("task", "add", "--id", "H2", "--title", "second", "--run", "half")
+        pm("task", "set", "H1", "status=merged", "--run", "half")
+        pm("task", "set", "H2", "status=qa", "--run", "half")
+        boom = dict(env)
+        boom["MK_PROMOTE_FAIL_AFTER"] = "1"
+        half = mk("run", "set", "--id", "half", "--status", "done", "--data", os.path.join(tmp, "promote"),
+                  data_arg=False, e=boom)
+        assert half["ok"] and half["promoted"] == ["H1"], half
+        assert "promote_error" in half and half["promote_error"], half
+        got = {t["id"]: t["status"] for t in pm("run", "get", "--id", "half")["run"]["tasks"]}
+        assert got["H1"] == "done" and got["H2"] == "qa", got
+        # already-done keeps promoting: it repairs a crash between the two writes
+        rest = pm("run", "set", "--id", "half", "--status", "done")
+        assert rest["ok"] and rest["promoted"] == ["H2"], rest
+        assert "promote_error" not in rest
 
         print("mk-state self-test ok")
         store_self_test(tmp, env)
@@ -3684,6 +3748,42 @@ def store_self_test(tmp, env):
     assert r.returncode == 0, r.stdout
     assert "archive" not in os.listdir(off) and not os.path.exists(os.path.join(off, "mk.db"))
     assert set(os.listdir(off)) >= set(off_before)
+
+    # K2 store on: --tests 384/387 refused (task stays, no event); 350/0 still passes;
+    # a raise on the 2nd promotion still lists the 1st.
+    k2 = os.path.join(tmp, "k2on")
+    k2env = dict(env, MATRIXKODER_HOME=os.path.join(tmp, "k2on-home"))
+    once(["run", "init", "--id", "k2", "--feature", "K2", "--branch", "bk"], k2, k2env)
+    once(["task", "add", "--id", "V", "--title", "verify", "--run", "k2"], k2, k2env)
+    once(["store", "enable"], k2, k2env)
+    once(["event", "--type", "decision", "--text", "baseline: tests 0/0 · selftest 0/0", "--run", "k2"], k2, k2env)
+    r = subprocess.run([sys.executable, os.path.abspath(__file__), "task", "verify", "V",
+                        "--tests", "384/387", "--run", "k2", "--data", k2],
+                       capture_output=True, text=True, env=k2env)
+    assert r.returncode == 2, r.stdout
+    body = json.loads(r.stdout.strip())
+    assert body["ok"] is False and "384/387" in body["error"] and "<passed>/<failed>" in body["error"], body
+    got = once(["task", "get", "V", "--run", "k2"], k2, k2env)
+    assert got["task"]["status"] == "planned", got
+    # the refused verify wrote no verdict
+    assert "384/387" not in open(os.path.join(k2, "runs", "k2", "events.jsonl")).read()
+    passed = once(["task", "verify", "V", "--tests", "350/0", "--run", "k2"], k2, k2env)
+    assert passed["result"] == "pass" and passed["task"]["status"] == "review", passed
+    once(["task", "add", "--id", "A", "--title", "a", "--run", "k2"], k2, k2env)
+    once(["task", "add", "--id", "B", "--title", "b", "--run", "k2"], k2, k2env)
+    once(["task", "set", "A", "status=merged", "--run", "k2"], k2, k2env)
+    once(["task", "set", "B", "status=qa", "--run", "k2"], k2, k2env)
+    boom = dict(k2env, MK_PROMOTE_FAIL_AFTER="1")
+    r = subprocess.run([sys.executable, os.path.abspath(__file__), "run", "set", "--id", "k2",
+                        "--status", "done", "--data", k2], capture_output=True, text=True, env=boom)
+    assert r.returncode == 0, r.stdout
+    body = json.loads(r.stdout.strip())
+    assert body["promoted"] == ["A"], body
+    assert "promote_error" in body and "B" in body["promote_error"], body
+    tasks = {t["id"]: t["status"] for t in once(["run", "get", "--id", "k2"], k2, k2env)["run"]["tasks"]}
+    assert tasks["A"] == "done" and tasks["B"] == "qa", tasks
+    rest = once(["run", "set", "--id", "k2", "--status", "done"], k2, k2env)
+    assert rest["promoted"] == ["B"] and "promote_error" not in rest, rest
 
     # two real processes, store already on, 10 task-set each: project tasks match root cards
     par = os.path.join(tmp, "par")
