@@ -25,7 +25,7 @@ is a path to a JSON file used INSTEAD of `mk-lane.py list` (read only when
 set). Tests put a fake `herdr`, a fake `ps` and a fake `mk-lane-event.py`
 first on PATH.
 """
-import json, os, re, shutil, subprocess, sys, tempfile, time
+import fcntl, json, os, re, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True
@@ -35,6 +35,8 @@ IDLE_MIN_DEFAULT = 3
 PANE_TAIL = 40
 WATCH = ".matrixkoder-watch.json"
 STATE_NAME = "nudge-state.json"
+LOCK_NAME = "nudge-state.lock"
+LOCK_WAIT_S = 5.0
 
 # Same idea as lane-watch child_progress, self-contained (do not import it).
 CHILD_RE = re.compile(
@@ -86,7 +88,7 @@ def herdr_agents():
     """`herdr agent list` -> list of agent dicts. Missing binary or bad JSON raises."""
     if shutil.which("herdr") is None:
         raise FileNotFoundError("herdr-missing")
-    r = subprocess.run(["herdr", "agent", "list"], capture_output=True, text=True, timeout=20)
+    r = subprocess.run(["herdr", "agent", "list"], capture_output=True, text=True, timeout=10)
     text = (r.stdout or "").strip()
     if not text:
         raise ValueError("herdr-malformed: empty output")
@@ -116,7 +118,7 @@ def pane_text(pane):
         return ""
     try:
         r = subprocess.run(["herdr", "pane", "read", pane],
-                           capture_output=True, text=True, timeout=20)
+                           capture_output=True, text=True, timeout=10)
     except Exception:
         return ""
     return "\n".join((r.stdout or "").splitlines()[-PANE_TAIL:])
@@ -139,13 +141,60 @@ def ps_rows():
     return rows
 
 
+def _ancestor_pids(rows):
+    """PIDs of this process and every parent visible in the ps table."""
+    by_pid = {}
+    for pid, ppid, cmd in rows:
+        by_pid[str(pid)] = str(ppid)
+    pids = set()
+    cur = str(os.getpid())
+    seen = set()
+    while cur and cur not in seen and cur not in ("0", "1"):
+        seen.add(cur)
+        pids.add(cur)
+        cur = by_pid.get(cur) or (str(os.getppid()) if cur == str(os.getpid()) else None)
+        if cur == str(os.getpid()):
+            break
+    pids.add(str(os.getpid()))
+    return pids
+
+
+def lane_in_cmd(cmd, lane):
+    """True when the lane path is a whole path token, not a prefix of a longer lane.
+
+    `/…/matrixkoder-mk-1` must not match `/…/matrixkoder-mk-10/scripts/selftest.sh`.
+    A hit is the lane path followed by `/`, end of string, or a non-path character.
+    """
+    needle = (lane or "").rstrip("/")
+    if not needle or needle not in cmd:
+        return False
+    i = 0
+    while True:
+        j = cmd.find(needle, i)
+        if j < 0:
+            return False
+        after = cmd[j + len(needle):j + len(needle) + 1]
+        if after == "" or after == "/" or after not in "/._-0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ":
+            return True
+        i = j + 1
+
+
 def matching_children(rows, lane):
-    """Commands whose arguments point into the lane path AND look like a test/build."""
+    """Commands whose arguments point into the lane path AND look like a test/build.
+
+    Excludes this process and its parent chain (a `--self-test` running inside the
+    lane must not count as the lane's own job).
+    """
     if not lane:
         return []
-    needle = lane.rstrip("/")
-    return [{"pid": pid, "ppid": ppid, "command": cmd[:200]}
-            for pid, ppid, cmd in rows if needle in cmd and CHILD_RE.search(cmd)]
+    skip = _ancestor_pids(rows)
+    out_rows = []
+    for pid, ppid, cmd in rows:
+        if str(pid) in skip:
+            continue
+        if lane_in_cmd(cmd, lane) and CHILD_RE.search(cmd):
+            out_rows.append({"pid": pid, "ppid": ppid, "command": cmd[:200]})
+    return out_rows
 
 
 def read_watch(lane):
@@ -300,11 +349,26 @@ def save_state(path, doc):
 
 
 def rate_ok(doc, lane, now):
+    """False while the last nudge is younger than RATE_S.
+
+    A timestamp in the future (clock skew) is treated as expired so one bad clock
+    cannot silence a lane forever. The caller records a warning when that happens.
+    """
     try:
         last = float((doc.get("nudged") or {}).get(lane))
     except (TypeError, ValueError):
         return True
+    if last > now:
+        return True
     return (now - last) >= RATE_S
+
+
+def future_state(doc, lane, now):
+    try:
+        last = float((doc.get("nudged") or {}).get(lane))
+    except (TypeError, ValueError):
+        return False
+    return last > now
 
 
 def error_name(exc):
@@ -335,6 +399,17 @@ def scan(data, idle_min, now=None):
     except Exception as e:
         return named_error("ps-error", e)
 
+    pane_counts = {}
+    for slot in slots:
+        if not isinstance(slot, dict) or str(slot.get("state") or "").lower() != "busy":
+            continue
+        watch = read_watch(slot.get("path") or "")
+        if not watch:
+            continue
+        pane = str(watch.get("pane") or "")
+        if pane:
+            pane_counts[pane] = pane_counts.get(pane, 0) + 1
+
     lanes = []
     for slot in slots:
         if not isinstance(slot, dict) or str(slot.get("state") or "").lower() != "busy":
@@ -352,6 +427,8 @@ def scan(data, idle_min, now=None):
         report = report_present(watch)
         klass = classify(status, idle_minutes(agent, now), bool(kids),
                          commit, report, text, idle_min)
+        if pane and pane_counts.get(str(pane), 0) > 1:
+            klass = "ambiguous-pane"
         lanes.append({
             "slot": slot.get("slot"), "lane": lane,
             "task": watch.get("task") or slot.get("task"),
@@ -373,9 +450,79 @@ def dispatch(pane, text):
     return r.returncode == 0, (r.stdout or r.stderr or "").strip()[:300]
 
 
+def lock_path_for(data):
+    base = data or os.environ.get("MATRIXKODER_HOME") or os.path.expanduser("~/.matrixkoder")
+    return os.path.join(base, LOCK_NAME)
+
+
+class NudgeLock:
+    """Exclusive flock on <data>/nudge-state.lock covering read, rate check, send, write.
+
+    Non-blocking try first, then a bounded wait of LOCK_WAIT_S. If another nudge
+    still holds it, the caller exits 0 with skipped "another nudge is running"
+    and sends nothing.
+    """
+
+    def __init__(self, data):
+        self.path = lock_path_for(data)
+        self.fd = None
+        self.busy = False
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self.fd = open(self.path, "a+")
+        try:
+            fcntl.flock(self.fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return self
+        except OSError:
+            pass
+        deadline = time.monotonic() + LOCK_WAIT_S
+        while time.monotonic() < deadline:
+            try:
+                fcntl.flock(self.fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError:
+                time.sleep(0.05)
+        self.busy = True
+        return self
+
+    def __exit__(self, *exc):
+        if self.fd is not None:
+            try:
+                fcntl.flock(self.fd.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            self.fd.close()
+
+
 def nudge(data, apply, idle_min, now=None):
     if now is None:
         now = float(os.environ["MK_NUDGE_NOW"]) if os.environ.get("MK_NUDGE_NOW") else time.time()
+    # The lock wraps read-state, the rate check, dispatch AND write-state so two
+    # processes cannot both send for one lane. scan() itself only reads.
+    if apply:
+        lock = NudgeLock(data)
+        lock.__enter__()
+        if lock.busy:
+            scanned = scan(data, idle_min, now)
+            scanned["dry_run"] = False
+            scanned["sent"] = []
+            scanned["ok"] = True
+            scanned["skipped"] = "another nudge is running"
+            for lane in scanned.get("lanes") or []:
+                lane["nudge"] = None
+                lane["sent"] = False
+                lane["skipped"] = "another nudge is running"
+            lock.__exit__(None, None, None)
+            return scanned
+        try:
+            return _nudge_locked(data, apply, idle_min, now)
+        finally:
+            lock.__exit__(None, None, None)
+    return _nudge_locked(data, apply, idle_min, now)
+
+
+def _nudge_locked(data, apply, idle_min, now):
     scanned = scan(data, idle_min, now)
     scanned["dry_run"] = not apply
     if scanned.get("error"):
@@ -384,10 +531,14 @@ def nudge(data, apply, idle_min, now=None):
     path = state_path(data)
     doc = load_state(path)
     sent = []
+    warnings = []
     for lane in scanned["lanes"]:
         lane["nudge"] = None
         lane["sent"] = False
         lane["skipped"] = None
+        if lane["class"] == "ambiguous-pane":
+            lane["skipped"] = "ambiguous-pane"
+            continue
         if lane["class"] not in ("stranded", "waiting-on-job"):
             continue
         if lane["reviewer"]:
@@ -395,6 +546,9 @@ def nudge(data, apply, idle_min, now=None):
             continue
         text = nudge_text(lane.get("task") or "TASK", round_of(read_watch(lane["lane"])))
         lane["nudge"] = text
+        if future_state(doc, lane["lane"], now):
+            lane["warning"] = "future-dated state timestamp; treating as expired"
+            warnings.append({"lane": lane["lane"], "warning": lane["warning"]})
         if not rate_ok(doc, lane["lane"], now):
             lane["skipped"] = "rate-limit"
             continue
@@ -411,6 +565,8 @@ def nudge(data, apply, idle_min, now=None):
             lane["skipped"] = "dispatch-failed"
     if apply and sent:
         save_state(path, doc)
+    if warnings:
+        scanned["warnings"] = warnings
     scanned["sent"] = sent
     return scanned
 
@@ -445,11 +601,37 @@ def write_exec(path, body):
     os.chmod(path, 0o755)
 
 
-HERDR_STUB = '#!/opt/homebrew/opt/python@3.14/bin/python3.14\nimport os, sys\ncmd = " ".join(sys.argv[1:3])\nif cmd == "agent list":\n    sys.stdout.write(open(os.environ["MK_NUDGE_HERDR_JSON"]).read())\nelif cmd == "pane read":\n    f = os.path.join(os.environ["MK_NUDGE_ROOT"], "pane-%s.txt" % sys.argv[3])\n    if os.path.exists(f):\n        sys.stdout.write(open(f).read())\nelse:\n    sys.stderr.write("unexpected herdr " + cmd)\n    sys.exit(3)\n'
+HERDR_STUB = (
+    "#!" + sys.executable + "\n"
+    "import os, sys\n"
+    "cmd = \" \".join(sys.argv[1:3])\n"
+    "if cmd == \"agent list\":\n"
+    "    sys.stdout.write(open(os.environ[\"MK_NUDGE_HERDR_JSON\"]).read())\n"
+    "elif cmd == \"pane read\":\n"
+    "    f = os.path.join(os.environ[\"MK_NUDGE_ROOT\"], \"pane-%s.txt\" % sys.argv[3])\n"
+    "    if os.path.exists(f):\n"
+    "        sys.stdout.write(open(f).read())\n"
+    "else:\n"
+    "    sys.stderr.write(\"unexpected herdr \" + cmd)\n"
+    "    sys.exit(3)\n"
+)
 
-PS_STUB = '#!/opt/homebrew/opt/python@3.14/bin/python3.14\nimport os, sys\nsys.stdout.write(open(os.environ["MK_NUDGE_PS_FILE"]).read())\n'
+PS_STUB = (
+    "#!" + sys.executable + "\n"
+    "import os, sys\n"
+    "sys.stdout.write(open(os.environ[\"MK_NUDGE_PS_FILE\"]).read())\n"
+)
 
-DISPATCH_STUB = '#!/opt/homebrew/opt/python@3.14/bin/python3.14\nimport os, sys\npane = sys.argv[sys.argv.index("--pane") + 1]\ntext = sys.argv[sys.argv.index("--text") + 1]\nfh = open(os.environ["MK_NUDGE_SENT_LOG"], "a")\nfh.write(pane + " " + " ".join(text.splitlines()) + chr(10))\nfh.close()\nsys.stdout.write(\'{"ok": true}\' + chr(10))\n'
+DISPATCH_STUB = (
+    "#!" + sys.executable + "\n"
+    "import os, sys\n"
+    "pane = sys.argv[sys.argv.index(\"--pane\") + 1]\n"
+    "text = sys.argv[sys.argv.index(\"--text\") + 1]\n"
+    "fh = open(os.environ[\"MK_NUDGE_SENT_LOG\"], \"a\")\n"
+    "fh.write(pane + \" \" + \" \".join(text.splitlines()) + chr(10))\n"
+    "fh.close()\n"
+    "sys.stdout.write('{\"ok\": true}' + chr(10))\n"
+)
 
 def self_test():
     fails = []
@@ -649,9 +831,118 @@ def self_test():
         check("missing-ps-exit", code == 0)
         check("missing-ps-name", doc.get("error") == "ps-missing")
         check("missing-ps-empty", doc.get("lanes") == [])
+        os.rename(saved_ps + ".off", saved_ps)
+        env["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
 
         home = os.path.expanduser("~/.matrixkoder")
         check("no-real-home", not data.startswith(home) and not lanes_file.startswith(home))
+
+        # prefix collision: lane .../matrixkoder-mk-1 must not see mk-10's job
+        base = os.path.join(root, "lanes")
+        mk1 = os.path.join(base, "matrixkoder-mk-1")
+        mk10 = os.path.join(base, "matrixkoder-mk-10")
+        rows_pref = [
+            ("200", "1", "python3 %s/scripts/selftest.sh" % mk10),
+            ("201", "1", "python3 %s/scripts/thing.py --self-test" % mk1),
+            (str(os.getpid()), "1", "python3 %s/scripts/mk-lane-nudge.py --self-test" % mk1),
+        ]
+        hit1 = matching_children(rows_pref, mk1)
+        hit10 = matching_children(rows_pref, mk10)
+        check("prefix-mk1-not-mk10", [c["pid"] for c in hit1] == ["201"])
+        check("prefix-mk10-own", [c["pid"] for c in hit10] == ["200"])
+        check("self-pid-excluded", all(c["pid"] != str(os.getpid()) for c in hit1))
+        # parent chain: a parent whose command also matches is not a child job
+        parent = str(os.getppid())
+        rows_par = [
+            (parent, "1", "python3 %s/scripts/selftest.sh" % mk1),
+            ("303", parent, "python3 %s/scripts/selftest.sh" % mk1),
+        ]
+        check("parent-excluded", [c["pid"] for c in matching_children(rows_par, mk1)] == ["303"])
+
+        # future-dated state timestamp is expired, with a warning field
+        future_doc = {"nudged": {L["stranded"]: now + 99999}}
+        check("future-rate-ok", rate_ok(future_doc, L["stranded"], now) is True)
+        save_state(os.path.join(data, STATE_NAME), future_doc)
+        if os.path.exists(sent_log):
+            os.remove(sent_log)
+        code, doc = run(["nudge", "--data", data, "--apply"])
+        warned = doc.get("warnings") or []
+        lanes = doc.get("lanes") if isinstance(doc.get("lanes"), list) else []
+        c1 = next((x for x in lanes if x.get("task") == "C1"), None)
+        if c1 is None:
+            fails.append("future-shape:" + str(doc)[:400])
+        else:
+            check("future-sent", any(s.get("pane") == "w1:p3" for s in doc.get("sent", [])))
+            check("future-warning", "future-dated" in str(c1.get("warning")) and bool(warned))
+
+        # two lanes sharing one pane: class ambiguous-pane, zero dispatches
+        share_a = make_lane("share-a", "w1:p9", "S1", "S1 R1", "^feat", old)
+        share_b = make_lane("share-b", "w1:p9", "S2", "S2 R1", "^feat", old)
+        slots2 = [
+            {"slot": 1, "path": share_a, "state": "busy", "run": "r1", "task": "S1"},
+            {"slot": 2, "path": share_b, "state": "busy", "run": "r1", "task": "S2"},
+        ]
+        lanes2 = os.path.join(root, "lanes-share.json")
+        json.dump({"ok": True, "slots": slots2}, open(lanes2, "w"))
+        agents2 = [
+            {"pane_id": "w1:p9", "agent_status": "idle", "name": "s1-build-r1",
+             "cwd": share_a, "state_change_seq": 1},
+        ]
+        herdr2 = os.path.join(root, "herdr-share.json")
+        json.dump({"id": "cli:agent:list", "result": {"agents": agents2}}, open(herdr2, "w"))
+        open(os.path.join(root, "pane-w1:p9.txt"), "w").write("I'll wait for the EXIT line.\n")
+        env["MK_NUDGE_LANES_JSON"] = lanes2
+        env["MK_NUDGE_HERDR_JSON"] = herdr2
+        env["MK_NUDGE_SEQ_EPOCH"] = json.dumps({"1": now - 1800})
+        data2 = os.path.join(root, "data-share")
+        os.makedirs(data2)
+        env["MATRIXKODER_HOME"] = data2
+        if os.path.exists(sent_log):
+            os.remove(sent_log)
+        code, doc = run(["scan", "--data", data2])
+        classes = sorted(x["class"] for x in doc.get("lanes", []))
+        check("share-class", classes == ["ambiguous-pane", "ambiguous-pane"])
+        code, doc = run(["nudge", "--data", data2, "--apply"])
+        check("share-sent-zero", doc.get("sent") == [])
+        check("share-skipped", all(x.get("skipped") == "ambiguous-pane" for x in doc.get("lanes", [])))
+        check("share-no-log", not os.path.exists(sent_log))
+
+        # two REAL processes, fake dispatch that records calls and sleeps:
+        # exactly one dispatch per stranded lane
+        slow = os.path.join(bin_dir, "mk-lane-event.py")
+        write_exec(slow, (
+            "#!" + sys.executable + "\n"
+            "import os, sys, time\n"
+            "time.sleep(0.4)\n"
+            "pane = sys.argv[sys.argv.index('--pane') + 1]\n"
+            "fh = open(os.environ['MK_NUDGE_SENT_LOG'], 'a')\n"
+            "fh.write(pane + chr(10))\n"
+            "fh.close()\n"
+            "sys.stdout.write('{\"ok\": true}' + chr(10))\n"
+        ))
+        lone = make_lane("lone", "w1:p3", "C1", "C1 R1", "^feat", old)
+        # reuse stranded lane path already armed; point lanes json back
+        env["MK_NUDGE_LANES_JSON"] = lanes_file
+        env["MK_NUDGE_HERDR_JSON"] = herdr_file
+        env["MK_NUDGE_SEQ_EPOCH"] = json.dumps(seq_epoch)
+        data3 = os.path.join(root, "data-race")
+        os.makedirs(data3)
+        env["MATRIXKODER_HOME"] = data3
+        sent2 = os.path.join(root, "sent-race.log")
+        env["MK_NUDGE_SENT_LOG"] = sent2
+        procs = []
+        for _ in range(2):
+            procs.append(subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__), "nudge", "--data", data3, "--apply"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env))
+        outs = [pr.communicate(timeout=30) for pr in procs]
+        codes = [pr.returncode for pr in procs]
+        log2 = open(sent2).read() if os.path.exists(sent2) else ""
+        panes = [ln.strip() for ln in log2.splitlines() if ln.strip()]
+        check("race-exit", codes == [0, 0])
+        check("race-one-each", sorted(panes) == ["w1:p2", "w1:p3"])
+        # restore PATH stubs for anything after (none)
+        env["MK_NUDGE_SENT_LOG"] = sent_log
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
