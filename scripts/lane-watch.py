@@ -710,13 +710,16 @@ def self_test():
     # inside max-wait. The ratio stays, so a stall still fires inside the window.
     _t0 = time.time()
     subprocess.run([sys.executable, "-c", "pass"], check=True)
-    _scale = max(1.0, (time.time() - _t0) / 0.05)
+    # named _spawn_scale, not _scale: self_test later rebinds `_hit, _scale` from
+    # child_progress, and a win() after that point must still see the spawn scale
+    _spawn_scale = max(1.0, (time.time() - _t0) / 0.05)
 
     def win(stall, wait):
         # last_change_min rounds UP to the next 0.1 min, so one slow poll reads as
-        # 0.2. The floor sits above that and keeps the 1:3 ratio, so a stall still
-        # fires inside the window and a live pane still outlives it.
-        return f"{max(0.25, stall * _scale):.4f}", f"{max(0.75, wait * _scale):.4f}"
+        # 0.2. The floor sits above that. Below scale ~4 the floor wins, so every
+        # pair comes out 0.25/0.75 (a 2:1 pair becomes 1:3); a stall still fires
+        # inside the window and a live pane still outlives it.
+        return f"{max(0.25, stall * _spawn_scale):.4f}", f"{max(0.75, wait * _spawn_scale):.4f}"
 
 
     rx = re.compile(r"^\w+ feat\(p1\)")
@@ -1161,8 +1164,9 @@ def self_test():
         os.chmod(os.path.join(work_bin, "herdr"), 0o755)
         for grows, want in ((True, "WATCH_EXPIRED"), (False, "STALL")):
             e2 = dict(env, PATH=work_bin + os.pathsep + os.environ["PATH"], **({"MK_GROW": "1"} if grows else {}))
-            # a growing pane is only seen as activity on the SECOND poll, so its window must
-            # outlast one slow poll; the frozen pane keeps the tight window so a stall still fires
+            # the wider arguments only differ once the spawn scale passes ~4; below that
+            # win() returns the same 0.25/0.75 floor for both. The frozen pane keeps the
+            # smaller arguments so a stall still fires inside its window.
             stall, wait = win(0.06, 0.18) if grows else win(0.02, 0.06)
             r = subprocess.run([sys.executable, __file__, "--lane", lane, "--agent", "w1", "--commit-grep", "nomatch",
                                 "--prompt-marker", "Read and follow brief-r3.md", "--poll", "0.1",
@@ -1216,8 +1220,9 @@ def self_test():
         # tonight's false STALL: a pane whose only life is a running subagent task line (spinner +
         # "Task —", text frozen between polls so the fingerprint never moves) is activity; a pane
         # with only finished "✓ … Task —" lines is not; a lone ticking ↳ N toolcalls counter is
-        # the task line counts only once a poll has seen it, so its window is wider than the
-        # frozen-pane window: a slow first poll must still land inside it
+        # the task line counts only once a poll has seen it. Its arguments are larger, but
+        # below scale ~4 win() floors both to the same 0.25/0.75, so the window is only
+        # actually wider under load.
         probe("⠼ General Task — E2 reviewer key, quiet optional\n↳ 49 toolcalls · 12m 48s\n", "WATCH_EXPIRED",
               *win(0.06, 0.18))
         probe("✓ General Task — E2 reviewer key\n", "STALL")

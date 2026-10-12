@@ -139,12 +139,12 @@ def last_change_min(lane, since=0.0):
 # holds "retrying in", or holds an HTTP status inside an API error block.
 # What stays undetectable: a real wall the agent quotes mid-sentence ("the usage limit reached
 # branch is covered"), a line that STARTS with "Error:" but is prose ("Error: unauthorized
-# handling is now fixed"), a mid-line "hit your limit" ("So I hit your limit detection fix"),
-# a wall whose lead word is not "Claude" ("Claude Code: usage limit reached" — _QUOTA_LEAD
-# accepts only that one lead word), and a real banner whose line also holds a double quote
-# (CODE_LINE_RE).
+# handling is now fixed"), a wall whose lead word is not "Claude" ("Claude Code: usage limit
+# reached" — _QUOTA_LEAD accepts only that one lead word), and a real banner whose line also
+# holds a double quote (CODE_LINE_RE). A mid-line "hit your limit" is NOT one of these: it is
+# anchored to the line start, so prose no longer reads as a wall.
 _QUOTA_LEAD = r"(?:(?:usage|weekly|week|5-hour|5h|hourly|daily|session|plan|individual)\s+(?:limit|quota)\s+(?:reached|hit|exceeded)|quota\s+(?:reached|exceeded)|(?:free\s+)?usage\s+exceeded)"
-_QUOTA_FREE = r"(?:hit|reached)\s+your\s+(?:usage\s+|weekly\s+|5-hour\s+)?limit|reached\s+your\s+pro\s+5-hour\s+limit"
+_QUOTA_FREE = r"^\W*(?:you(?:'ve|\s+have)?\s+)?(?:hit|reached)\s+your\s+(?:usage\s+|weekly\s+|5-hour\s+|pro\s+5-hour\s+)?limit"
 BANNER_RE = re.compile(
     r"(?i)(?:"
     r"^\W*(?:Claude\s+)?\W*" + _QUOTA_LEAD + r"|"
@@ -421,7 +421,10 @@ def self_test_body(shutil):
     assert classify("┃  Upstream request failed: An active OpenCode Go subscription is required",
                     "working", 1, 10)[0] == "PROVIDER"
     # prose, and tool output that is not drawn with a bar, never raise a verdict
-    for msg in ("I handled unauthorized and 401 in the test",
+    for msg in ("So I hit your limit detection fix and moved on",
+                "I think you hit your limit, so wait",
+                "The agent says it hit your limit handling is done",
+                "I handled unauthorized and 401 in the test",
                 "+    x = 'Error: unauthorized'",
                 "   12→ Error: subscription is required",
                 "| a | unauthorized |",
