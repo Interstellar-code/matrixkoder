@@ -19,6 +19,9 @@ Do NOT touch: <list>
 - Lint/format ONLY changed files: `<lint cmd> <files>`, `<format cmd> <files>` — never repo-wide
 - Banned commands (repo list): <banned commands>
 
+## Parallel parts (default ON)
+<Name the separable parts and who takes them, for example "tests and fixtures: helper 1; docs: helper 2; the shared hot file and the integration: you". The rules for helpers (todo list first, only the lead runs the gates, the report section) are in the mk-builder skill, reference/lane-rules.md R9. Write "none, because <reason>" only when the plan turns the flag off.>
+
 ## Rules
 - Use the mk-builder skill (installed in this lane at `.claude/skills/mk-builder/`) — round R<n>. Every lane rule is the skill's (`reference/lane-rules.md` R1-R29); never restate one here. This brief carries only the per-brief values: the round number <n>, and the end-of-round token `<PHASE> R<n> DONE` (or `<PHASE> R<n> BLOCKED: <question>`) as the LAST line of your reply, alone on its line.
 - Commit: `<type(scope): message>` subject, blank line, `Co-Authored-By: <agent/model> <email>`.

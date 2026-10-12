@@ -92,6 +92,11 @@ checkable contract. Rules whose remainder stays per-brief say **(B)** and carry 
   (`/Users/rohits/Development/matrixkoder/.matrixkoder/plans/mk-improvements.md` item 11, open).
   **Check:** the todo list exists before the first file write. **(B)** the task skeleton it
   mirrors — R27.
+  **Subagents (user, 2026-10-12):** every subagent you start does the same: its prompt begins
+  "first write your own todo list with the todo tool, one item per step, one in_progress at a
+  time". In 24 h of OpenCode sessions the lead sessions kept a todo list 28 of 32 times, the
+  subagents 1 of 13. Your report lists them in a `## Subagents` section (part, items, final
+  status). **Check:** each subagent prompt contains the todo sentence.
 
 - **R10.** Commit in the fixed shape: `<type(scope): message>`, blank line,
   `Co-Authored-By: <identity>`, one commit whose subject matches the brief's `--commit-grep` — the
