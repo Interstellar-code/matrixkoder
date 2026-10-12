@@ -4251,6 +4251,31 @@ def store_self_test(tmp, env):
     view = once(["task", "get", "B", "--run", "rr"], rt2)["task"]
     assert view["status"] == "routed" and view["ready"] is True, view
 
+    # M2 R4: a routed task with met deps is not demoted and re-promoted on every write.
+    # Three unrelated writes after the promotion add no change_log row for B.
+    ch = os.path.join(tmp, "churn")
+    once(["run", "init", "--id", "rr", "--feature", "Churn", "--branch", "br"], ch)
+    once(["store", "enable"], ch)
+    once(["task", "add", "--id", "A", "--title", "dep", "--run", "rr"], ch)
+    once(["task", "add", "--id", "B", "--title", "needs A", "--deps", "A", "--run", "rr"], ch)
+    once(["task", "add", "--id", "Z", "--title", "unrelated", "--run", "rr"], ch)
+    once(["task", "set", "A", "status=done", "--run", "rr"], ch)
+    once(["task", "set", "B", "status=routed", "--run", "rr"], ch)
+
+    def b_changes():
+        c = _mkdb().open_project(os.path.join(ch, ".mk-home"), STORE_PROJECT, data_dir=ch)
+        try:
+            return c.execute("SELECT COUNT(*) n FROM change_log WHERE run='rr' AND task='B'").fetchone()["n"]
+        finally:
+            c.close()
+
+    after_promote = b_changes()
+    for status in ("building", "verifying", "review"):
+        once(["task", "set", "Z", "status=" + status, "--run", "rr"], ch)
+    assert b_changes() == after_promote, (after_promote, b_changes())
+    view = once(["task", "get", "B", "--run", "rr"], ch)["task"]
+    assert view["status"] == "routed" and view["ready"] is True, view
+
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["--self-test"]:

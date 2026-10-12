@@ -908,15 +908,22 @@ def import_history(home, project, run, *, run_row=None, tasks=(), events=(), art
                 # column status and NULL otherwise (column_of then uses Backlog).
                 prev = status if status in COLUMNS else None
                 column_of(status, prev)  # refuse an unknown status before anything is written
-                # file_status is not an import column. A re-import keeps the stored one when the
-                # incoming status is still `ready` (the file view of a routed-ready task); any
-                # other status clears it, because the published status is the status itself.
                 existed = con.execute("SELECT * FROM tasks WHERE run=? AND id=?", me).fetchone()
-                # file_status is not an import column. A re-import keeps the stored one when the
-                # incoming status is still `ready` (the file view of a routed-ready task); any
-                # other status clears it, because the published status is the status itself.
+                # file_status is not an import column; the store owns it. A re-import keeps the
+                # stored one when the incoming status is `ready` (the file view of a planned
+                # task whose ready flag is set), and keeps the stored `ready` + file_status
+                # when the incoming status IS the stored file_status (the file view of a
+                # routed task the store already holds ready) — otherwise every ordinary write
+                # would demote it to `routed` and let promote_ready re-promote it, two
+                # change_log rows and two card writes each time. Any other status clears it:
+                # the published status is then the status itself.
                 keep_file = None
-                if existed and status == "ready" and existed["file_status"] in READY_FROM:
+                if existed and existed["status"] == "ready" and status in READY_FROM \
+                        and existed["file_status"] == status:
+                    # the promotion stored `ready` as prev_status, which is not a column
+                    # status; recomputing it here would differ and log a change every write
+                    status, keep_file, prev = "ready", existed["file_status"], existed["prev_status"]
+                elif existed and status == "ready" and existed["file_status"] in READY_FROM:
                     keep_file = existed["file_status"]
                 cols = ["run"] + list(TASK_COLS) + ["prev_status", "file_status"]
                 values = [run] + [t.get(c) for c in TASK_COLS] + [prev, keep_file]
