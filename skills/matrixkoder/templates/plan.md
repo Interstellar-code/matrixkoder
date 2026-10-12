@@ -36,6 +36,15 @@ lane_group = ""                           # same value = same wave, one shared w
   refs = []                               # optional: path:line pointers the brief quotes
   subagent = false                        # true only inside a subagents=true phase; then owned is required
   owned = []                              # required when subagent = true; subset of the phase's owned
+
+  [[phase.task.subtask]]                  # optional: splits a task into subtasks; id is <phase>.<n>.<m>
+  id = "P1.1.1"                           # <phase id>.<n>.<m>; the importer derives type=subtask and parent from nesting
+  title = "what this subtask delivers, one line"
+  acceptance = "the outcome that decides this subtask done"
+  deps = []                               # comma-separated ids in the same plan, or <run>:<id> to wait on another run
+  parallel = false                        # true: parallel-flagged siblings with no dep between them may run at once
+  route = ""                              # "" or "<agent> <model> [<effort>]"; or an inline table {agent, model, effort}
+  owned = []                              # files this subtask touches
 +++
 
 # <plan id> — <one line: what this plan delivers>
