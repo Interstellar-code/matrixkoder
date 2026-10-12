@@ -1,0 +1,266 @@
+// Kanban tab tests (plan mk-store, D8A, contract C4/C1): the render called
+// directly with a stub element table so the assertions read the elements
+// KanbanTab actually built — seven columns in fixture order, the red attention
+// badge kept off the card line, needs-you and project filters, no overflow at
+// 46 and 36, the empty store line, and readCards skipping when there is no
+// store or the last read was slow on an odd tick.
+import { test, expect } from 'claude-code/testing'
+import type { Elements } from 'claude-code'
+import {
+  KanbanTab,
+  KANBAN_NOW,
+  applyFilters,
+  cardLine,
+  columnOf,
+  emptyKanbanView,
+  isAttention,
+  kanbanFixtureView,
+  readCards,
+  timeInStatus,
+} from './kanban'
+import type { RunFn } from './kanban'
+import { KANBAN_AFTER, KANBAN_COLUMNS, KANBAN_FIXTURE } from './kanban.fixture'
+
+const ATTENTION_STATUSES = ['blocked', 'stalled', 'quota', 'provider'] as const
+const ATTENTION_TASKS = ['P4', 'D5A', 'P6', 'F2'] as const
+
+type N = { type: string; props: Record<string, unknown>; children: unknown[] }
+
+const node = (v: unknown): N => v as N
+const kids = (v: unknown): N[] => {
+  const arr = (v as { children?: unknown[] }).children
+  return Array.isArray(arr) ? (arr as unknown[]).map(node) : []
+}
+const text = (v: unknown): string => kids(v).map(c => (typeof c === 'string' ? c : text(c))).join('')
+
+function allOf(root: unknown, type: string): N[] {
+  const out: N[] = []
+  const walk = (v: unknown): void => {
+    if (typeof v !== 'object' || v === null) return
+    const cur = node(v)
+    if (cur.type === type) out.push(cur)
+    kids(cur).forEach(walk)
+  }
+  walk(root)
+  return out
+}
+
+const stubEls = (): Elements[keyof Elements] => {
+  const make = (type: string) => (props: Record<string, unknown>, ...children: unknown[]) =>
+    ({ type, props, children: children.length > 0 ? children : ((props.children as unknown[] | undefined) ?? []) }) as unknown
+  return {
+    Box: make('Box'),
+    Text: make('Text'),
+  } as unknown as Elements[keyof Elements]
+}
+
+type Drawn = { type?: string; props?: { flexDirection?: string; gap?: number }; children?: unknown[] }
+
+function rowWidth(v: unknown): number {
+  if (typeof v !== 'object' || v === null) return 0
+  const cur = v as Drawn
+  const cs = cur.children ?? []
+  if (cur.type === 'Text') return text(cur).length
+  if (cur.type === 'Box' && cur.props?.flexDirection === 'row') {
+    const gap = typeof cur.props?.gap === 'number' ? cur.props.gap : 0
+    return cs.reduce((sum: number, c) => sum + rowWidth(c), 0) + gap * Math.max(0, cs.length - 1)
+  }
+  return cs.reduce((max: number, c) => Math.max(max, rowWidth(c)), 0)
+}
+
+function rowWidths(root: unknown): number[] {
+  const out: number[] = []
+  const walk = (v: unknown): void => {
+    if (typeof v !== 'object' || v === null) return
+    const cur = v as Drawn
+    if (cur.type === 'Text' || (cur.type === 'Box' && cur.props?.flexDirection === 'row')) out.push(rowWidth(cur))
+    for (const c of cur.children ?? []) walk(c)
+  }
+  walk(root)
+  return out
+}
+
+const headers = (root: unknown): string[] =>
+  allOf(root, 'Text').filter(t => t.props.bold === true).map(t => text(t))
+
+/** column section whose header starts with `name`, plus the card rows under it. */
+function columnSection(root: unknown, name: string): N | undefined {
+  return allOf(root, 'Box').find(box => {
+    const head = kids(box).find(k => k.type === 'Text' && k.props.bold === true)
+    return head != null && text(head).startsWith(`${name} `)
+  })
+}
+
+const redBadges = (root: unknown): N[] =>
+  allOf(root, 'Text').filter(t => t.props.color === 'red' && text(t) === '! ')
+
+test('every C4 column is drawn from the fixture in order and columnOf is the col field', () => {
+  const view = kanbanFixtureView()
+  const tree = KanbanTab(stubEls(), view, 46)
+  const heads = headers(tree)
+  for (const col of KANBAN_COLUMNS) {
+    expect(heads.some(h => h.startsWith(`${col} `)), `header ${col}`).toBe(true)
+  }
+  const order = KANBAN_COLUMNS.map(col => heads.findIndex(h => h.startsWith(`${col} `)))
+  expect(order.every((i, n) => i >= 0 && (n === 0 || i > order[n - 1]!)), 'column order').toBe(true)
+  for (const card of KANBAN_FIXTURE) {
+    expect(columnOf(card), card.task).toBe(card.col)
+  }
+  const d3a = KANBAN_FIXTURE.find(c => c.task === 'D3A')
+  const p4 = KANBAN_FIXTURE.find(c => c.task === 'P4')
+  expect(d3a).toBeTruthy()
+  expect(p4).toBeTruthy()
+  expect(columnOf(d3a!)).toBe('Building')
+  expect(columnOf(p4!)).toBe('Building')
+  expect(p4!.status).toBe('blocked')
+  const building = columnSection(tree, 'Building')
+  expect(building, 'Building section').toBeTruthy()
+  expect(text(building!)).toContain('D3A')
+  expect(text(building!)).toContain('P4')
+})
+
+test('attention cards carry a separate red "! " badge and isAttention is only those four', () => {
+  const tree = KanbanTab(stubEls(), kanbanFixtureView(), 46)
+  const rows = allOf(tree, 'Box').filter(b => b.props.flexDirection === 'row' && b.props.key != null)
+  expect(rows.length).toBe(KANBAN_FIXTURE.length)
+  for (const row of rows) {
+    const key = String(row.props.key)
+    const task = key.split('/')[2] ?? ''
+    const card = KANBAN_FIXTURE.find(c => c.task === task)
+    expect(card, key).toBeTruthy()
+    const badges = kids(row).filter(k => k.type === 'Text' && k.props.color === 'red')
+    const attention = ATTENTION_TASKS.includes(task as (typeof ATTENTION_TASKS)[number])
+    if (attention) {
+      expect(badges.length, task).toBe(1)
+      expect(text(badges[0]!)).toBe('! ')
+      expect(text(badges[0]!)).not.toContain('\n')
+      const line = kids(row).filter(k => k.type === 'Text' && k.props.color !== 'red').map(text).join('')
+      expect(line.startsWith('! '), `${task} badge folded into line`).toBe(false)
+    } else {
+      expect(badges.length, task).toBe(0)
+    }
+  }
+  for (const card of KANBAN_FIXTURE) {
+    const want = (ATTENTION_STATUSES as readonly string[]).includes(card.status)
+    expect(isAttention(card.status), card.status).toBe(want)
+  }
+  expect(isAttention('building')).toBe(false)
+  expect(isAttention('verifying')).toBe(false)
+  expect(isAttention('done')).toBe(false)
+  expect(redBadges(tree).length).toBe(4)
+})
+
+test('needs-you keeps only attention cards, project beta keeps beta, and both filters compose', () => {
+  const needs = kanbanFixtureView({ needsYou: true, project: null })
+  const attention = KANBAN_FIXTURE.filter(c => c.attention === 1 || isAttention(c.status))
+  expect(needs.cards.map(c => c.task).sort()).toEqual(attention.map(c => c.task).sort())
+  expect(needs.cards.every(c => ATTENTION_TASKS.includes(c.task as (typeof ATTENTION_TASKS)[number]))).toBe(true)
+  expect(applyFilters(KANBAN_FIXTURE, { needsYou: true, project: null }).map(c => c.task).sort())
+    .toEqual([...ATTENTION_TASKS].sort())
+
+  const beta = kanbanFixtureView({ needsYou: false, project: 'beta' })
+  const betaCards = KANBAN_FIXTURE.filter(c => c.project === 'beta')
+  expect(beta.cards.map(c => c.task).sort()).toEqual(betaCards.map(c => c.task).sort())
+  expect(beta.cards.every(c => c.project === 'beta')).toBe(true)
+  expect(applyFilters(KANBAN_FIXTURE, { needsYou: false, project: 'beta' }).every(c => c.project === 'beta')).toBe(true)
+
+  const both = applyFilters(KANBAN_FIXTURE, { needsYou: true, project: 'beta' })
+  expect(both.map(c => c.task).sort()).toEqual(['P4', 'P6'])
+  expect(kanbanFixtureView({ needsYou: true, project: 'beta' }).cards.map(c => c.task).sort()).toEqual(['P4', 'P6'])
+
+  const tree = KanbanTab(stubEls(), needs, 46)
+  expect(text(columnSection(tree, 'Building')!)).toContain('P4')
+  expect(text(columnSection(tree, 'Building')!)).not.toContain('D3A')
+})
+
+test('46 and 36 cols never overflow and the red badge stays exactly "! "', () => {
+  for (const cols of [46, 36]) {
+    const tree = KanbanTab(stubEls(), kanbanFixtureView(), cols)
+    for (const t of allOf(tree, 'Text')) {
+      const shown = text(t)
+      expect(shown.length, `text longer than ${cols}: ${shown}`).toBeLessThanOrEqual(cols)
+    }
+    for (const w of rowWidths(tree)) {
+      expect(w, `row wider than ${cols}`).toBeLessThanOrEqual(cols)
+    }
+    const badges = redBadges(tree)
+    expect(badges.length, `badges at ${cols}`).toBe(4)
+    for (const badge of badges) {
+      expect(text(badge)).toBe('! ')
+      expect(text(badge).length).toBe(2)
+      expect(text(badge)).not.toContain('\n')
+    }
+  }
+  for (const card of KANBAN_FIXTURE) {
+    for (const width of [46, 36, 20]) {
+      expect(cardLine(card, KANBAN_NOW, width).length).toBeLessThanOrEqual(width)
+    }
+  }
+})
+
+test('emptyKanbanView shows "no store yet" and no column headers', () => {
+  const tree = KanbanTab(stubEls(), emptyKanbanView(), 46)
+  const texts = allOf(tree, 'Text').map(t => text(t))
+  expect(texts).toContain('no store yet')
+  expect(texts.filter(t => t === 'no store yet').length).toBe(1)
+  for (const col of KANBAN_COLUMNS) {
+    expect(texts.some(t => t.startsWith(col)), col).toBe(false)
+  }
+})
+
+test('readCards skips a missing store, parses one cards call, and skips a slow odd tick', async () => {
+  let calls = 0
+  const run: RunFn = async argv => {
+    calls += 1
+    expect(argv).toContain('cards')
+    expect(argv).toContain('--json')
+    expect(argv).toContain('--home')
+    const homeAt = argv.indexOf('--home')
+    expect(argv[homeAt + 1]).toBe('/tmp/mk-home')
+    return { stdout: JSON.stringify({ ok: true, cards: [KANBAN_FIXTURE[0]] }), code: 0 }
+  }
+
+  calls = 0
+  const missing = await readCards(run, '/plugin', '/tmp/mk-home', false, 0, 0)
+  expect(calls).toBe(0)
+  expect(missing.empty).toBe(true)
+  expect(missing.cards).toEqual([])
+
+  calls = 0
+  const fresh = await readCards(run, '/plugin', '/tmp/mk-home', true, 0, 0)
+  expect(calls).toBe(1)
+  expect(fresh.empty).toBe(false)
+  expect(fresh.skipped).toBe(false)
+  expect(fresh.cards).toEqual([KANBAN_FIXTURE[0]])
+  expect(typeof fresh.ms).toBe('number')
+
+  calls = 0
+  const skipped = await readCards(run, '/plugin', '/tmp/mk-home', true, 1, 150)
+  expect(calls).toBe(0)
+  expect(skipped.skipped).toBe(true)
+  expect(skipped.empty).toBe(false)
+
+  calls = 0
+  const even = await readCards(run, '/plugin', '/tmp/mk-home', true, 0, 150)
+  expect(calls).toBe(1)
+  expect(even.skipped).toBe(false)
+  expect(typeof even.ms).toBe('number')
+})
+
+test('D3A is under Building before the fixture transition and under Verify after', () => {
+  const before = KanbanTab(stubEls(), kanbanFixtureView({ needsYou: false, project: null }, KANBAN_FIXTURE), 46)
+  const after = KanbanTab(stubEls(), kanbanFixtureView({ needsYou: false, project: null }, KANBAN_AFTER), 46)
+  expect(text(columnSection(before, 'Building')!)).toContain('D3A')
+  expect(text(columnSection(before, 'Verify')!)).not.toContain('D3A')
+  expect(text(columnSection(after, 'Verify')!)).toContain('D3A')
+  expect(text(columnSection(after, 'Building')!)).not.toContain('D3A')
+  const moved = KANBAN_AFTER.find(c => c.task === 'D3A')
+  expect(moved).toBeTruthy()
+  expect(moved!.status).toBe('verifying')
+  expect(moved!.col).toBe('Verify')
+  expect(columnOf(moved!)).toBe('Verify')
+})
+
+test('timeInStatus of one hour before KANBAN_NOW is 1h', () => {
+  expect(timeInStatus('2026-10-12T09:00:00+02:00', KANBAN_NOW)).toBe('1h')
+})

@@ -1048,6 +1048,7 @@ const TAB_BUTTONS = [
   { key: 'dash-tab-usage', name: 'Usage' },
   { key: 'dash-tab-events', name: 'Events' },
   { key: 'dash-tab-waiting', name: 'Waiting' },
+  { key: 'dash-tab-kanban', name: 'Kanban' },
   { key: 'dash-tab-settings', name: 'Settings' },
 ] as const
 
@@ -1067,7 +1068,7 @@ test('every tab hotkey switches to that tab’s MOCK row and hides Old; 0 restor
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
-  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings')) {
+  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban')) {
     await ui.press({ key })
     expect(await ui.find(mockRow()), `${name} MOCK row`).toBeTruthy()
     expect(await ui.find({ text: /workflows-v2/ }), `${name} hides Old`).toBeUndefined()
@@ -1087,8 +1088,8 @@ test('at 36 cols the tab bar drops to short labels and every tab still renders',
   for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings')) {
     expect(await ui.find({ type: 'Button', text: name }), `${name} wide label dropped`).toBeUndefined()
   }
-  expect(await ui.findAll({ type: 'Button' })).toHaveLength(TAB_BUTTONS.length + 1) // the bar still draws all seven
-  for (const { key } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings')) {
+  expect(await ui.findAll({ type: 'Button' })).toHaveLength(TAB_BUTTONS.length + 1) // the bar still draws every tab
+  for (const { key } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban')) {
     await ui.press({ key })
     expect(await ui.find(mockRow()), `${key} renders narrow`).toBeTruthy()
   }
@@ -1119,7 +1120,7 @@ const tabLabels = async (ui: { findAll: (q: { type: string }) => Promise<{ props
     .map(b => String(b.props.label))
 
 test('the mock tab counts read the fixtures: lanes, plan done/total, waiting only when open', async () => {
-  expect(mockTabCounts()).toEqual({ overview: '', lanes: '4', plan: '3/8', usage: '', events: '', waiting: '!1', old: '', settings: '' })
+  expect(mockTabCounts()).toEqual({ overview: '', lanes: '4', plan: '3/8', usage: '', events: '', waiting: '!1', kanban: '', old: '', settings: '' })
   expect(waitingCount(0)).toBe('') // LOW: a fixture with no open decision shows no count, never `!0`
   expect(waitingCount(2)).toBe('!2')
 })
@@ -1143,7 +1144,7 @@ test('every mock tab shows the fixture run header: name, stage chip, MOCK marker
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
-  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings')) {
+  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban')) {
     await ui.press({ key: 'dash-tab-old' })
     await ui.press({ key })
     expect(await ui.find({ text: 'MATRIXKODER' }), `${name} shared brand header`).toBeTruthy()
@@ -1176,7 +1177,7 @@ test('the shared brand header shows plugin.json\'s version chip on a run tab and
   expect(await ui.find({ text: 'Checkout v2' }), 'no run block on Settings').toBeUndefined()
 })
 
-test('F0: every tab Button carries its keyboard hotkey — o l p u e w 0, at 36 and 46 cols', { plugins: [worldFixtures] }, async ($, on) => {
+test('F0: every tab Button carries its keyboard hotkey — o l p u e w k 0, at 36 and 46 cols', { plugins: [worldFixtures] }, async ($, on) => {
   mockFs(on, worldFiles())
   mockWorld(on)
   await $.session.start(sessionStart())
@@ -1185,7 +1186,7 @@ test('F0: every tab Button carries its keyboard hotkey — o l p u e w 0, at 36 
     await ui.press({ key: 'dash-tab-old' })
     await ui.redraw(paneProps(cols))
     const buttons = await ui.findAll({ type: 'Button' })
-    expect(buttons.map(b => b.props.hotkey), `hotkeys at ${cols}`).toEqual(['o', 'l', 'p', 'u', 'e', 'w', '0', '9'])
+    expect(buttons.map(b => b.props.hotkey), `hotkeys at ${cols}`).toEqual(['o', 'l', 'p', 'u', 'e', 'w', 'k', '0', '9'])
     for (const b of buttons) {
       // an inactive tab's label is its count alone (or the `·` placeholder), so
       // a plain Button's `h: label` drawing never repeats the tab's own letter
@@ -1198,7 +1199,7 @@ test('F0: every tab Button carries its keyboard hotkey — o l p u e w 0, at 36 
   }
   // the press-by-key switch loop stands
   // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
-  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings')) {
+  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban')) {
     await ui.redraw(paneProps(46))
     await ui.press({ key })
     expect(await ui.find(mockRow()), `${name} MOCK row`).toBeTruthy()
@@ -1231,16 +1232,16 @@ test('the tab bar shows the active word and count, the rest hotkey + count, at 4
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   // Old active: the counts come from the snapshot — 3 live lanes, 1/5 done, 1 open decision
-  expect(await tabLabels(ui)).toEqual(['Overview', 'Lanes 3', 'Plan 1/5', 'Usage', 'Events', 'Waiting !1', 'Old', 'Settings'])
+  expect(await tabLabels(ui)).toEqual(['Overview', 'Lanes 3', 'Plan 1/5', 'Usage', 'Events', 'Waiting !1', 'Kanban', 'Old', 'Settings'])
   for (const cols of [36, 46] as const) {
     await ui.press({ key: 'dash-tab-old' })
     await ui.press({ key: 'dash-tab-lanes' })
     await ui.redraw(paneProps(cols))
     const labels = await tabLabels(ui)
-    expect(labels, `at ${cols}`).toEqual(cols === 46 ? ['Overview', 'Lanes 4', 'Plan 3/8', 'Usage', 'Events', 'Waiting !1', 'Old', 'Settings'] : ['·', 'Lanes 4', '3/8', '·', '·', '!1', '·', '·'])
+    expect(labels, `at ${cols}`).toEqual(cols === 46 ? ['Overview', 'Lanes 4', 'Plan 3/8', 'Usage', 'Events', 'Waiting !1', 'Kanban', 'Old', 'Settings'] : ['·', 'Lanes 4', '3/8', '·', '·', '!1', '·', '·', '·'])
     expect(labels.join(' ')).not.toContain('o: o') // the S0 short labels are gone
     expect(labels.some(l => /^[a-z0-9]$/.test(l)), 'no tab shows its own letter twice').toBe(false)
-    expect(labels.filter(l => l === '·').length, 'count-less tabs carry the placeholder').toBe(cols === 46 ? 0 : 5)
+    expect(labels.filter(l => l === '·').length, 'count-less tabs carry the placeholder').toBe(cols === 46 ? 0 : 6)
   }
 })
 
@@ -1411,7 +1412,7 @@ test('V1.4: a full-width rule of the palette line colour sits directly under the
     expect(wrap?.kids, `bar then rule at ${cols}`).toHaveLength(2)
     const bar = nodesOf(wrap?.kids[0], 'Button')
     expect(bar.map(b => String(b.props.key)), `the bar is the first child at ${cols}`)
-      .toEqual(['dash-tab-overview', 'dash-tab-lanes', 'dash-tab-plan', 'dash-tab-usage', 'dash-tab-events', 'dash-tab-waiting', 'dash-tab-old', 'dash-tab-settings'])
+      .toEqual(['dash-tab-overview', 'dash-tab-lanes', 'dash-tab-plan', 'dash-tab-usage', 'dash-tab-events', 'dash-tab-waiting', 'dash-tab-kanban', 'dash-tab-old', 'dash-tab-settings'])
     // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
     for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings')) {
       await ui.press({ key: 'dash-tab-old' })
@@ -1442,7 +1443,7 @@ test('C12: every tab call receives the ui handle — all six tabs act on it, not
   // the three-argument tabs (lanes, usage, waiting, events) take the extra
   // argument through the pane's widened call and still render their fixture
   // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
-  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings')) {
+  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban')) {
     await ui.press({ key: 'dash-tab-old' })
     await ui.press({ key })
     expect(await ui.find(mockRow()), `${name} renders with the ui argument`).toBeTruthy()
@@ -1465,7 +1466,7 @@ test('C12: every tab call receives the ui handle — all six tabs act on it, not
   // Waiting: ⋯ reveals the folded actions; a pick marks the option it picked
   await ui.press({ key: 'dash-tab-waiting' })
   const labels = await tabLabels(ui)
-  expect(labels, 'the tab bar keeps its own labels while a body draws buttons').toHaveLength(8)
+  expect(labels, 'the tab bar keeps its own labels while a body draws buttons').toHaveLength(9)
   await ui.press({ key: 'waiting-a-more-3' })
   expect(await ui.find({ type: 'Button', text: /Rebase later/ }), 'the revealed option button').toBeTruthy()
   await ui.press({ key: 'waiting-b' })
@@ -2089,3 +2090,107 @@ test('LOW 4: a second save press while saving does nothing', { plugins: [worldFi
   for (let i = 0; i < 60 && !(await ui.find({ text: /✓ saved 1/ })); i++) await clock.advance(0)
   expect(await ui.find({ text: /✓ saved 1/ }), 'the save lands once').toBeTruthy()
 })
+
+test('D8A: hotkey k opens the Kanban tab between Waiting and Old', { plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  const clock = mockWorld(on, { env: { MK_HOME: '/tmp/mk-d8a-missing' } })
+  on('fs.exists', () => ({ value: false }))
+  await $.session.start(sessionStart())
+  await clock.advance(0)
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  const buttons = await ui.findAll({ type: 'Button' })
+  const keys = buttons.map(b => String(b.props.key))
+  const w = keys.indexOf('dash-tab-waiting')
+  const k = keys.indexOf('dash-tab-kanban')
+  const o = keys.indexOf('dash-tab-old')
+  expect(k, 'kanban sits after waiting').toBe(w + 1)
+  expect(o, 'old sits after kanban').toBe(k + 1)
+  const kanban = buttons.find(b => b.props.key === 'dash-tab-kanban')
+  expect(kanban?.props.hotkey).toBe('k')
+  expect(String(kanban?.props.label)).toContain('Kanban')
+  await ui.press({ key: 'dash-tab-kanban' })
+  expect(await ui.find({ text: 'no store yet' }), 'missing root store draws the empty state').toBeTruthy()
+})
+
+test('D8A: a dashboard tick reads cards once when the root store exists, and never when it does not', { plugins: [worldFixtures] }, async ($, on) => {
+  const calls: string[][] = []
+  const clock = mockWorld(on, {
+    env: { MK_HOME: '/tmp/mk-d8a-home' },
+    process: argv => {
+      calls.push([...argv])
+      if (argv.includes('cards')) {
+        return { value: { exitCode: 0, stdout: '{"ok":true,"cards":[]}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      }
+      return undefined
+    },
+  })
+  on('fs.exists', (_$, e) => ({ value: String(e.path).endsWith('/tmp/mk-d8a-home/mk.db') }))
+  mockFs(on, worldFiles())
+  await $.session.start(sessionStart())
+  await clock.advance(0)
+  const cardCalls = () => calls.filter(a => a.includes('cards'))
+  expect(cardCalls(), 'the opening tick reads cards once').toHaveLength(1)
+  expect(cardCalls()[0]).toContain('--json')
+  expect(cardCalls()[0]).toContain('--home')
+  const before = cardCalls().length
+  await clock.advance(5000)
+  expect(cardCalls().length, 'the next tick reads cards once more').toBe(before + 1)
+})
+
+
+test('D8A R2: MK_HOME unset reads ~/.matrixkoder/mk.db and shows no store yet', { plugins: [worldFixtures] }, async ($, on) => {
+  const calls: string[][] = []
+  const exists: string[] = []
+  const clock = mockWorld(on, {
+    process: argv => {
+      calls.push([...argv])
+      return undefined
+    },
+  })
+  on('fs.exists', (_$, e) => {
+    exists.push(String(e.path))
+    return { value: false }
+  })
+  mockFs(on, worldFiles())
+  await $.session.start(sessionStart())
+  await clock.advance(0)
+  const homeIdx = calls.flat().indexOf('--home')
+  const cardCalls = calls.filter(a => a.includes('cards'))
+  expect(cardCalls, 'a missing store never spawns mkdb').toHaveLength(0)
+  expect(exists.some(p => p === '/home/mk/.matrixkoder/mk.db'), `exists looked at ${exists.join(',')}`).toBe(true)
+  expect(exists.some(p => p === '/home/mk/mk.db'), 'must not probe $HOME/mk.db').toBe(false)
+  void homeIdx
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-kanban' })
+  expect(await ui.find({ text: 'no store yet' })).toBeTruthy()
+  expect(await ui.find({ text: /alpha/ })).toBeUndefined()
+  expect(await ui.find({ text: /beta/ })).toBeUndefined()
+  expect(await ui.find({ text: /gamma/ })).toBeUndefined()
+})
+
+test('D8A R2: a present store with zero cards draws an empty board, not the fixture', { plugins: [worldFixtures] }, async ($, on) => {
+  const calls: string[][] = []
+  const clock = mockWorld(on, {
+    process: argv => {
+      calls.push([...argv])
+      if (argv.includes('cards')) {
+        return { value: { exitCode: 0, stdout: '{"ok":true,"cards":[]}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      }
+      return undefined
+    },
+  })
+  on('fs.exists', (_$, e) => ({ value: String(e.path) === '/home/mk/.matrixkoder/mk.db' }))
+  mockFs(on, worldFiles())
+  await $.session.start(sessionStart())
+  await clock.advance(0)
+  const cardCalls = calls.filter(a => a.includes('cards'))
+  expect(cardCalls, 'one cards read').toHaveLength(1)
+  const homeAt = cardCalls[0]!.indexOf('--home')
+  expect(cardCalls[0]![homeAt + 1]).toBe('/home/mk/.matrixkoder')
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-kanban' })
+  expect(await ui.find({ text: 'no store yet' }), 'a present store is not the empty-store line').toBeUndefined()
+  expect(await ui.find({ text: 'Backlog 0' })).toBeTruthy()
+  expect(await ui.find({ text: /alpha/ })).toBeUndefined()
+})
+
