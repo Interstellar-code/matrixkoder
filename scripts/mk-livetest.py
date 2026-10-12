@@ -176,11 +176,44 @@ def _check_root(root):
     return root
 
 
+def _kill_buses(home):
+    """Stop every mk-bus.py serve whose --data is inside this home. A restart writes a new pid
+    into bus.json, so this re-reads the file rather than trusting the pid a row remembered."""
+    import signal
+    home = os.path.realpath(home)
+    path = os.path.join(home, "bus.json")
+    pids = set()
+    if os.path.isfile(path):
+        try:
+            pid = json.load(open(path)).get("pid")
+        except (OSError, ValueError):
+            pid = None
+        if isinstance(pid, int) and pid > 1:
+            pids.add(pid)
+    try:
+        listed = subprocess.run(["ps", "-ax", "-o", "pid=,command="],
+                                capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        listed = ""
+    for line in listed.splitlines():
+        if "mk-bus.py" in line and "serve" in line and home in line:
+            head = line.strip().split(None, 1)[0]
+            if head.isdigit():
+                pids.add(int(head))
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    return sorted(pids)
+
+
 def teardown(home):
     """Remove the setup root, and nothing the marker lists. The marker only confirms it."""
     if not home:
         raise Fail("teardown needs --home")
     home = refuse_home(home)
+    _kill_buses(home)  # before the rmtree, so a serve cannot outlive the home it was started for
     data = _read_marker(home)
     root = _check_root(data["root"])
     if not _inside(root, home):
@@ -213,6 +246,9 @@ def _run_row(row, ctx):
         return "fail", str(e)
     except Exception as e:
         return "fail", f"{type(e).__name__}: {e}"
+    finally:
+        if ctx.get("home"):  # a row that started a bus, then raised, must not leave the serve
+            _kill_buses(ctx["home"])
     return "pass", ""
 
 
@@ -399,6 +435,382 @@ def row_c11_wal(ctx):
                 raise Fail(f"store file inside the scratch repo: {name}")
 
 
+def _py(*args, env=None, timeout=60):
+    """One real script, one JSON line. A non-zero exit is a Fail carrying its output."""
+    proc = subprocess.run([sys.executable, *args], capture_output=True, text=True,
+                          timeout=timeout, env=env)
+    lines = [x for x in proc.stdout.splitlines() if x.strip()]
+    if proc.returncode != 0:
+        raise Fail(f"{os.path.basename(args[0])} {' '.join(args[1:])}: rc={proc.returncode} "
+                   f"out={proc.stdout.strip()[-400:]} err={proc.stderr.strip()[-400:]}")
+    return json.loads(lines[-1]) if lines else {}
+
+
+def _state(ctx, *args, env=None):
+    return _py(os.path.join(HERE, "mk-state.py"), "--data", ctx["data"], *args, env=env)
+
+
+def _state_mod():
+    """mk-state.py, loaded by path: the hyphen keeps it off the import path."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("mk_state", os.path.join(HERE, "mk-state.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def row_c1_projects(ctx):
+    """Register a project row through mk-state.register_project. usage.json and locks/ stay files."""
+    ctx = _need(ctx)
+    saved = os.environ.get("MATRIXKODER_HOME")
+    os.environ["MATRIXKODER_HOME"] = ctx["home"]
+    try:
+        _state_mod().register_project(ctx["slug"], ctx["repo"], ctx["data"], name="live")
+    finally:
+        if saved is None:
+            os.environ.pop("MATRIXKODER_HOME", None)
+        else:
+            os.environ["MATRIXKODER_HOME"] = saved
+    con = mkdb.open_root(ctx["home"])
+    try:
+        row = con.execute("SELECT slug, name, repo, data_dir, mode FROM projects WHERE slug=?",
+                          (ctx["slug"],)).fetchone()
+        if not row or row["repo"] != os.path.realpath(ctx["repo"]) or row["data_dir"] != os.path.abspath(ctx["data"]):
+            raise Fail(f"projects row missing or wrong: {dict(row) if row else None}")
+        tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        con.close()
+    if "usage" in tables or "locks" in tables:
+        raise Fail("usage or locks became a table")
+    usage = os.path.join(ctx["home"], "usage.json")
+    locks = os.path.join(ctx["home"], "locks")
+    if os.path.exists(usage) and not os.path.isfile(usage):
+        raise Fail("usage.json is not a file")
+    if os.path.exists(locks) and not os.path.isdir(locks):
+        raise Fail("locks is not a directory")
+
+
+def _card_col(ctx, task):
+    """The kanban column from the real `mkdb.py cards --json`, not a stored status."""
+    out = _py(os.path.join(HERE, "mkdb.py"), "--home", ctx["home"], "--project", ctx["slug"],
+              "cards", "--json")
+    card = next((c for c in out.get("cards") or [] if c.get("task") == task and c.get("run") == ctx["run"]), None)
+    if not card:
+        raise Fail(f"cards --json has no card for {task}: {out}")
+    return card.get("col"), card.get("status")
+
+
+def row_c3_ready(ctx):
+    """C3/C4: before the dep is done the card is Backlog; after it is Ready.
+
+    `col` is what `cards --json` returns. Two siblings with no dep between them are both
+    startable (both may be building). The production status writer is mkdb.transition;
+    mk-state.py store mode calls that same function.
+    """
+    ctx = _need(ctx)
+    con = mkdb.open_project(ctx["home"], data_dir=ctx["data"])
+    try:
+        mkdb.add_task(con, ctx["run"], "rdy-a", "task", title="a")
+        mkdb.add_task(con, ctx["run"], "rdy-b", "task", title="b", deps="rdy-a")
+        mkdb.add_task(con, ctx["run"], "sib-1", "task", title="s1")
+        mkdb.add_task(con, ctx["run"], "sib-2", "task", title="s2")
+    finally:
+        con.close()
+    # Cards are the root copy. Sync so cards --json can see them before the dep is done.
+    mkdb.transition(ctx["home"], ctx["slug"], ctx["run"], "rdy-b", "planned",
+                    sync_root=True, data_dir=ctx["data"])
+    before, before_status = _card_col(ctx, "rdy-b")
+    if before != "Backlog":
+        raise Fail(f"rdy-b col is {before!r} (status {before_status}) before the dep is done, not Backlog")
+    mkdb.transition(ctx["home"], ctx["slug"], ctx["run"], "rdy-a", "done",
+                    sync_root=True, data_dir=ctx["data"])
+    after, after_status = _card_col(ctx, "rdy-b")
+    if after != "Ready":
+        raise Fail(f"rdy-b col is {after!r} (status {after_status}) after rdy-a is done, not Ready")
+    for sib in ("sib-1", "sib-2"):
+        mkdb.transition(ctx["home"], ctx["slug"], ctx["run"], sib, "building",
+                        sync_root=True, data_dir=ctx["data"])
+    cols = [_card_col(ctx, sib)[0] for sib in ("sib-1", "sib-2")]
+    if cols != ["Building", "Building"]:
+        raise Fail(f"siblings not both startable: {cols}")
+
+
+def row_c5_sync(ctx):
+    """A transition with sync writes the root card. A later one without sync is the crash
+    between the two writes; mkdb.catch_up (what mk-state.py sync calls) replays from
+    sync.last_change_no. Only the card columns cross."""
+    ctx = _need(ctx)
+    con = mkdb.open_project(ctx["home"], data_dir=ctx["data"])
+    try:
+        mkdb.add_task(con, ctx["run"], "sync-t", "task", title="sync me")
+    finally:
+        con.close()
+    mkdb.transition(ctx["home"], ctx["slug"], ctx["run"], "sync-t", "building",
+                    sync_root=True, data_dir=ctx["data"])
+    mkdb.transition(ctx["home"], ctx["slug"], ctx["run"], "sync-t", "review",
+                    sync_root=False, data_dir=ctx["data"])
+    root = mkdb.open_root(ctx["home"])
+    try:
+        stale = root.execute("SELECT status FROM cards WHERE project=? AND run=? AND task=?",
+                             (ctx["slug"], ctx["run"], "sync-t")).fetchone()
+    finally:
+        root.close()
+    if not stale or stale["status"] != "building":
+        raise Fail(f"root card was not left behind the project: {dict(stale) if stale else None}")
+    # mk-state.py sync is the file-mode command; on a store it calls mkdb.catch_up.
+    copied = mkdb.catch_up(ctx["home"], ctx["slug"], data_dir=ctx["data"])
+    if copied < 1:
+        raise Fail(f"sync copied nothing: {copied}")
+    root = mkdb.open_root(ctx["home"])
+    try:
+        card = root.execute(
+            "SELECT status, title, change_no FROM cards WHERE project=? AND run=? AND task=?",
+            (ctx["slug"], ctx["run"], "sync-t")).fetchone()
+        seen = root.execute("SELECT last_change_no FROM sync WHERE project=?", (ctx["slug"],)).fetchone()
+        cols = {r[1] for r in root.execute("PRAGMA table_info(cards)")}
+    finally:
+        root.close()
+    if not card or card["status"] != "review" or card["title"] != "sync me":
+        raise Fail(f"root card did not catch up: {dict(card) if card else None}")
+    if not seen or seen["last_change_no"] < card["change_no"]:
+        raise Fail("sync.last_change_no did not catch the card")
+    leaked = cols & {"deps", "events", "note"}
+    if leaked:
+        raise Fail(f"non-C1 fields on the root card: {leaked}")
+
+
+def row_c8_catalog(ctx):
+    """Seed agents and models from a temp yaml, then read the route pick list."""
+    ctx = _need(ctx)
+    yaml_path = os.path.join(ctx["home"], "catalog.yaml")
+    with open(yaml_path, "w", encoding="utf-8") as fh:
+        fh.write("agents:\n"
+                 "  opencode: { available: true, models: [gpt-lt] }\n"
+                 "  agy: { available: false, models: [gpt-off] }\n")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("mk_catalog", os.path.join(HERE, "mk-catalog.py"))
+    cat = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cat)
+    seeded = cat.seed(ctx["home"], yaml_path, os.devnull, probe=False)
+    if seeded.get("models", 0) < 1:
+        raise Fail(f"seed stored no models: {seeded}")
+    con = cat.read_catalog(ctx["home"])
+    try:
+        agent = con.execute("SELECT status, capabilities_json FROM agents WHERE id='opencode'").fetchone()
+        model = con.execute("SELECT status FROM models WHERE agent='opencode' AND id='gpt-lt'").fetchone()
+    finally:
+        con.close()
+    if not agent or agent["status"] != "enabled" or not model or model["status"] != "picked":
+        raise Fail("seed rows do not match the yaml")
+    caps = json.loads(agent["capabilities_json"])
+    caps["todo_hook"] = "yes"
+    con = cat.open_catalog(ctx["home"])
+    try:
+        mkdb._begin(con)
+        con.execute("UPDATE models SET capabilities_json=? WHERE agent='opencode' AND id='gpt-lt'",
+                    (json.dumps(caps),))
+        con.execute("COMMIT")
+        stored = json.loads(con.execute(
+            "SELECT capabilities_json FROM models WHERE agent='opencode' AND id='gpt-lt'"
+        ).fetchone()["capabilities_json"])
+    finally:
+        con.close()
+    if stored.get("todo_hook") != "yes":
+        raise Fail("a model could not override capabilities")
+    listed = cat.routes(ctx["home"])
+    if "opencode gpt-lt low" not in listed.get("routes", []):
+        raise Fail(f"routing did not read the catalog: {listed}")
+    # agy is disabled but has a picked model, so a routes() that forgot the enabled
+    # filter would emit "agy gpt-off". An empty model list would hide that.
+    if any(r.startswith("agy ") for r in listed["routes"]):
+        raise Fail(f"a disabled agent was routed: {listed['routes']}")
+    con = cat.read_catalog(ctx["home"])
+    try:
+        off = con.execute("SELECT status FROM models WHERE agent='agy' AND id='gpt-off'").fetchone()
+    finally:
+        con.close()
+    if not off or off["status"] != "picked":
+        raise Fail("the disabled agent has no model row, so the filter check cannot bite")
+
+
+def _bus_env(ctx):
+    """Store mode keeps the one bus in the MK home. Pin it so nothing touches ~/.matrixkoder."""
+    return dict(os.environ, MK_BUS_DIR=ctx["home"], MK_HOME=ctx["home"], MATRIXKODER_HOME=ctx["home"])
+
+
+def _bus(ctx, *args, timeout=30):
+    return _py(os.path.join(HERE, "mk-bus.py"), *args, "--data", ctx["data"],
+               timeout=timeout, env=_bus_env(ctx))
+
+
+def _lane_token(ctx, lane):
+    """The token file mk-bus writes in store mode: <home>/bus-lanes/<sha256(lane)>.json."""
+    import hashlib
+    digest = hashlib.sha256(os.path.realpath(lane).encode()).hexdigest()
+    return os.path.join(ctx["home"], "bus-lanes", digest + ".json")
+
+
+def _lane(ctx, name):
+    lane = os.path.join(ctx["home"], name)
+    os.makedirs(lane, exist_ok=True)
+    return lane
+
+
+def _builder(lane, *args, env=None, timeout=30):
+    script = os.path.join(ROOT, "child-skills", "mk-builder", "scripts", "mk-builder.py")
+    proc = subprocess.run([sys.executable, script, *args, "--lane", lane],
+                          capture_output=True, text=True, timeout=timeout, env=env)
+    return proc.returncode, [x for x in proc.stdout.splitlines() if x.strip()], proc.stderr
+
+
+def row_c12_fallback(ctx):
+    """Stop the bus, then ask. Exit 4, the BLOCKED token, and the lane status is blocked."""
+    ctx = _need(ctx)
+    started = _bus(ctx, "ensure", "--run", ctx["run"])
+    pid = started.get("pid")
+    if not pid:
+        raise Fail(f"bus did not start: {started}")
+    lane = _lane(ctx, "c12-lane")
+    _bus(ctx, "token", "--lane", lane, "--task", "C12", "--run", ctx["run"])
+    env = _bus_env(ctx)
+    code, lines, err = _builder(lane, "start", "--run", ctx["run"], "--task", "C12",
+                                "--round", "1", "--report", "r.md", env=env)
+    if code != 0:
+        raise Fail(f"start failed: {lines} {err[-200:]}")
+    code, _, _ = _builder(lane, "progress", "work", env=env)
+    if code != 0:
+        raise Fail("progress failed")
+    os.kill(pid, 9)
+    code, lines, err = _builder(lane, "ask", "is the bus up?", "--timeout", "5", env=env, timeout=20)
+    if code != 4 or not any("BUS DOWN: use the BLOCKED token" in x for x in lines):
+        raise Fail(f"ask did not fall back: rc={code} out={lines} err={err[-300:]}")
+    with open(os.path.join(lane, ".matrixkoder-status.json"), encoding="utf-8") as fh:
+        st = json.load(fh)
+    if st.get("state") != "blocked":
+        raise Fail(f"lane status is {st.get('state')}, not blocked")
+
+
+def row_c13_restart(ctx):
+    """kill -9 the bus and start it again. It binds the same port; the lane url still answers."""
+    import socket
+    import time
+    import urllib.request
+    ctx = _need(ctx)
+    started = _bus(ctx, "ensure", "--run", ctx["run"])
+    port, pid = started.get("port"), started.get("pid")
+    if not port or not pid:
+        raise Fail(f"bus did not start: {started}")
+    lane = _lane(ctx, "c13-restart-lane")
+    _bus(ctx, "token", "--lane", lane, "--task", "C13R", "--run", ctx["run"])
+    with open(_lane_token(ctx, lane), encoding="utf-8") as fh:
+        url = json.load(fh).get("url")
+    os.kill(pid, 9)
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        sock = socket.socket()
+        try:
+            if sock.connect_ex(("127.0.0.1", port)) != 0:
+                break
+        finally:
+            sock.close()
+        time.sleep(0.05)
+    else:
+        raise Fail("the killed bus never released its port")
+    again = _bus(ctx, "ensure", "--run", ctx["run"])
+    if again.get("port") != port:
+        raise Fail(f"restart bound {again.get('port')}, not {port}")
+    if not url or f":{port}" not in url:
+        raise Fail(f"lane url {url} is not the restarted port")
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/health", timeout=5) as resp:
+            if resp.status != 200:
+                raise Fail(f"health status {resp.status}")
+    except Fail:
+        raise
+    except Exception as e:
+        raise Fail(f"lane url did not answer: {e}") from e
+
+
+def row_c13_ask_blocked(ctx):
+    """ask while the bus is down: exit 4 and the task status is blocked."""
+    ctx = _need(ctx)
+    lane = _lane(ctx, "c13-ask-lane")
+    with open(os.path.join(lane, ".matrixkoder-bus.json"), "w", encoding="utf-8") as fh:
+        json.dump({"v": 1, "url": "http://127.0.0.1:1", "token": "tok_down",
+                   "run": ctx["run"], "task": "C13A"}, fh)
+    env = dict(os.environ, MATRIXKODER_HOME=ctx["home"])
+    code, lines, err = _builder(lane, "start", "--run", ctx["run"], "--task", "C13A",
+                                "--round", "1", "--report", "r.md", env=env)
+    if code != 0:
+        raise Fail(f"start failed: {lines} {err[-200:]}")
+    code, _, _ = _builder(lane, "progress", "work", env=env)
+    if code != 0:
+        raise Fail("progress failed")
+    code, lines, err = _builder(lane, "ask", "anyone there?", "--timeout", "5", env=env, timeout=20)
+    if code != 4:
+        raise Fail(f"ask exited {code}, not 4: {lines} {err[-300:]}")
+    with open(os.path.join(lane, ".matrixkoder-status.json"), encoding="utf-8") as fh:
+        st = json.load(fh)
+    if st.get("state") != "blocked" or st.get("question") != "anyone there?":
+        raise Fail(f"task status is not blocked: {st.get('state')} {st.get('question')}")
+
+
+def row_c13_ack_once(ctx):
+    """The same answer delivered twice records one ack."""
+    ctx = _need(ctx)
+    con = mkdb.open_project(ctx["home"], data_dir=ctx["data"])
+    try:
+        mkdb._begin(con)
+        con.execute("INSERT OR IGNORE INTO runs(id, status) VALUES (?, ?)", (ctx["run"], "active"))
+        con.execute("COMMIT")
+    finally:
+        con.close()
+    started = _bus(ctx, "ensure", "--run", ctx["run"])
+    if not started.get("pid"):
+        raise Fail(f"bus did not start: {started}")
+    # Store mode records the message in the project store, which requires the run and the task.
+    con = mkdb.open_project(ctx["home"], data_dir=ctx["data"])
+    try:
+        mkdb.add_task(con, ctx["run"], "C13K", "task", title="ack")
+    finally:
+        con.close()
+    lane = _lane(ctx, "c13-ack-lane")
+    _bus(ctx, "token", "--lane", lane, "--task", "C13K", "--run", ctx["run"])
+    env = dict(_bus_env(ctx), MK_BUS_DATA=ctx["data"])
+    code, lines, err = _builder(lane, "start", "--run", ctx["run"], "--task", "C13K",
+                                "--round", "1", "--report", "r.md", env=env)
+    if code != 0:
+        raise Fail(f"start failed: {lines} {err[-200:]}")
+    # from=orch: a lane ask also tries to mark the task blocked through mk-state, which
+    # needs a run doc this row does not have. The ack under test is the answer, not that.
+    ask = _bus(ctx, "send", "--run", ctx["run"], "--task", "C13K", "--kind", "info",
+               "--text", "seed", "--from", "orch", "--to", "C13K")
+    ask_id = (ask.get("message") or ask).get("id")
+    if not ask_id:
+        raise Fail(f"seed send returned no id: {ask}")
+    ask = _bus(ctx, "send", "--run", ctx["run"], "--task", "C13K", "--kind", "ask",
+               "--text", "which schema?", "--from", "orch", "--to", "C13K")
+    ask_id = (ask.get("message") or ask).get("id")
+    if not ask_id:
+        raise Fail(f"ask send returned no id: {ask}")
+    sent = _bus(ctx, "send", "--run", ctx["run"], "--task", "C13K", "--kind", "answer",
+                "--text", "once", "--from", "orch", "--to", "C13K", "--reply-to", ask_id)
+    msg = (sent.get("message") or sent).get("id")
+    if not msg:
+        raise Fail(f"send returned no id: {sent}")
+    for _ in range(2):
+        code, lines, err = _builder(lane, "ack", msg, env=env, timeout=20)
+        if code != 0:
+            raise Fail(f"ack failed: rc={code} out={lines} err={err[-200:]}")
+    con = mkdb.open_project(ctx["home"], data_dir=ctx["data"])
+    try:
+        rows = list(con.execute("SELECT msg, level FROM acks WHERE run=? AND msg=?", (ctx["run"], msg)))
+    finally:
+        con.close()
+    if len(rows) != 1:
+        raise Fail(f"ack recorded {len(rows)} times: {[dict(r) for r in rows]}")
+
+
 def row_c14(ctx):
     """The harness row: setup already ran; teardown is the self-test's own step."""
     _need(ctx)
@@ -418,6 +830,14 @@ ROWS = {
     "C10-transition": row_c10,
     "C11-slug": row_c11_slug,
     "C11-wal": row_c11_wal,
+    "C1-projects": row_c1_projects,
+    "C3-ready": row_c3_ready,
+    "C5-sync": row_c5_sync,
+    "C8-catalog": row_c8_catalog,
+    "C12-fallback": row_c12_fallback,
+    "C13-restart": row_c13_restart,
+    "C13-ask-blocked": row_c13_ask_blocked,
+    "C13-ack-once": row_c13_ack_once,
     "C14-harness": row_c14,
 }
 
@@ -484,6 +904,8 @@ def self_test():
         _check(f"C{n}" in have, f"matrix has no row for C{n}")
     _check(any(r["kind"] == "agent" for r in rows), "no agent row")
     _check(any(r["pending"] for r in rows), "no pending row")
+    hidden = [r["id"] for r in rows if r["pending"] and r["id"] in ROWS]
+    _check(not hidden, f"pending row also has a step, so a failure would be hidden: {hidden}")
 
     # Real home, and a non-temp path, are refused before anything is created.
     before = set(os.listdir(REAL_HOME)) if os.path.isdir(REAL_HOME) else set()
@@ -517,24 +939,40 @@ def self_test():
         proc = subprocess.run(
             [sys.executable, os.path.abspath(__file__), "--home", home, "scripted", "--gate", "G1"],
             capture_output=True, text=True)
-        _check(proc.returncode == 3, f"G1 with PENDING rows exited {proc.returncode}")
         lines = [json.loads(l) for l in proc.stdout.strip().splitlines()]
         summary = lines[-1]
         by_id = {l["row"]: l for l in lines if "row" in l}
         _check(any(l.get("status") == "pass" for l in lines), "no scripted row passed")
         pending_ids = {r["id"] for r in matrix_rows() if r["pending"] and r["kind"] == "scripted"
                        and GATE_RANK[r["gate"]] <= GATE_RANK["G1"]}
-        _check(pending_ids, "matrix has no pending G1 row")
+        # Exit follows the matrix: 3 only while a G1 scripted row is still pending.
+        # A row with a step is never pending (checked above), so a failing step exits 1.
+        want = 3 if pending_ids else (1 if summary["summary"]["fail"] else 0)
+        _check(proc.returncode == want, f"G1 exited {proc.returncode}, wanted {want}")
         for rid in pending_ids:
             _check(by_id.get(rid, {}).get("status") == "PENDING", f"{rid} was not PENDING")
-        _check(summary.get("ok") is False, "PENDING gate reported ok")
         _check(summary["summary"]["PENDING"] == len(pending_ids), "PENDING count mismatch")
+        if pending_ids:
+            _check(summary.get("ok") is False, "PENDING gate reported ok")
         g1 = [r["id"] for r in _select("G1", matrix_rows())]
         g2 = [r["id"] for r in _select("G2", matrix_rows())]
         g3 = [r["id"] for r in _select("G3", matrix_rows())]
         _check(set(g1) <= set(g2) <= set(g3), "gates are not nested")
         _check(len(g3) == sum(1 for r in matrix_rows() if r["kind"] == "scripted"),
                "G3 is not the full scripted matrix")
+        # G2 still has pending rows, so exit 3 and "PENDING is not a pass" stay asserted
+        # even when G1 has none left.
+        proc = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "--home", home, "scripted", "--gate", "G2"],
+            capture_output=True, text=True)
+        g2_lines = [json.loads(l) for l in proc.stdout.strip().splitlines()]
+        g2_summary = g2_lines[-1]
+        _check(g2_summary["summary"]["PENDING"] > 0, f"G2 had no PENDING: {g2_summary}")
+        _check(g2_summary.get("ok") is False, "PENDING gate reported ok")
+        _check(all(l.get("status") != "pass" or not l.get("detail", "").startswith("pending")
+                   for l in g2_lines if "row" in l), "a pending row was scored pass")
+        _check(proc.returncode == (1 if g2_summary["summary"]["fail"] else 3),
+               f"G2 exited {proc.returncode}")
     finally:
         subprocess.run([sys.executable, os.path.abspath(__file__), "teardown", "--home", home],
                        check=True, capture_output=True, text=True)
