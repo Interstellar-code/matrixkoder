@@ -1,62 +1,195 @@
-  ┃
-  ┃  $ rg -n "def prompt_marker|text.split|first line" scripts/mk-lane-event.py | head -15    I'll read the brief and follow it
-  ┃                                                                                           exactly, starting with the
-  ┃  406:def prompt_marker(text):                                                             integration branch merge.The brief
-  ┃  408:    trimmed, capped at 60 chars. The first line carries the meaningful prefix (      i...
-  ┃  paths, ids, the
-  ┃  1218:    # time; the marker is --text's first line (up to the first newline), capped     Context
-  ┃  at 60 chars                                                                              85,496 tokens
-  ┃  1887:        # that is NEW since this dispatch started — the first line of --text        43% used
-  ┃  that was ALREADY
-  ┃                                                                                           MCP
-                                                                                              • headroom                  Connected
-  ┃                                                                                           • serena                    Connected
-  ┃  $ sed -n 690,729p < /home/builder
-  ┃  py
-  ┃
-  ┃  (34 earlier lines)
-  ┃                      if x)[:300] or f"herdr exited {r.returncode} with no output"
-  ┃      if r.returncode == 0 and isinstance(j, dict) and "result" in j and jerr is None \
-  ┃              and status != "agent_prompt_stalled":
-  ┃          return "ok", why, status, j
-  ┃      if status == "agent_prompt_stalled" or "timeout" in why.lower() or "timed out" in
-  ┃  why.lower():
-  ┃          return "wait", why, status, j
-  ┃
-
-     The fake herdr records only the first line of the prompt. I’ll put the job hint on
-     that same line.
-
-  ┃
-  ┃  $ python3 << 'PY'
-  ┃  from pathlib import Path…
-  ┃
-  ┃  one line
-  ┃
-
-  ┃
-  ┃  $ nohup python3 -u scripts/mk-lane-event.py --self-test > /tmp/d7b-ev4.log 2>&1 & ech
-  ┃  o $! > /tmp/d7b-ev4.pid; echo started $(cat /tmp/d7b-ev4.pid)
-  ┃
-  ┃  started 28253
-  ┃
-
-     The suite is pid 28253. I’ll wait for it to finish.
-
-  ┃
-  ┃  $ for i in $(seq 1 36); do if ! ps -p 28253 >/dev/null 2>&1; then break; fi; sleep 5;
-  ┃   done; wc -c /tmp/d7b-ev4.log; tail -n 12 /tmp/d7b-ev4.log; ps -p 28253 -o eti…
+# captured w1Q:p1, sanitized
+┃  brief-r2.md
   ┃
   ┃  (no output)
   ┃
-  ┃  Command exceeded timeout of 120000 ms. Retry with a larger timeout if the command is
-  ┃  expected to take longer.
-  ┃  Timed out before completion
+
+     The brief file is short. I'll read it whole so the round-2 rules are exact.
+
+  ┃
+  ┃  $ wc -l /home/builder
+  ┃   echo '---'; cat /home/builder
+  ┃
+  ┃  (23 earlier lines)
+  ┃  e plugin test .` (known 5000 ms flake under load: rerun the failing file alone and say so), `npx tsc -
+  ┃  p . --noEmit` (**0**), then the FULL suite once before DONE: `MK_SELFTEST_JOBS=2 bash scripts/
+  ┃  selftest.sh` (expect `selftest: 19 run, 0 failed`; if it shows a failure, rerun and NAME the failing
+  ┃  suite from the output file before reporting). Banned commands: the repo list.
+  ┃
+  ┃  ## Rules
+  ┃  Use the mk-builder skill, round R2. Todo list; report `## Todo`. Last line `A1 R2 DONE` (or `A1 R2
+  ┃  BLOCKED: <question>`) alone. Commit (new commit): `fix(health): banner shapes only, tool output and
+  ┃  (redacted)
+  ┃  ai>`. Report: `/home/builder
+  ┃
+
+     I'll capture the three live panes, then rewrite the matcher so every old fixture still matches and the
+     review cases don't.
+
+  ┃
+  ┃  ⠙ cd /home/builder && mkdir -p /tmp/a1r2 && for p in w1Q:p1 wV:p9 w1R:p1;
+  ┃     do herdr pane read "$p" --lines 80 > /tmp/a1r2/$p.txt 2>&1; echo "$p $(wc -l < /tmp/a1r2/$p.…
+  ┃
+
+  ┃
+  ┃  $ cd /home/builder && git show a204303:scripts/lane-health.py | rg -n "as
+  ┃  sert classify" | head -40
+  ┃
+  ┃  (16 earlier lines)
+  ┃  457:    assert classify(ollama_hint, "idle", 1, 10)[0] == "QUOTA", ollama_hint
+  ┃  458:    assert classify(ollama_bare, "working", 1, 10)[0] == "QUOTA", ollama_bare
+  ┃  459:    assert classify("YOU REACHED YOUR PRO 5-HOUR LIMIT — try another model", "idle", 1, 10)[0] ==
+  ┃  "QUOTA"
+  ┃  461:    assert classify(buried, "working", 1, 10)[0] == "QUOTA", buried
+  ┃  466:        assert classify(msg, "working", 1, 10)[0] == "OK", msg
+  ┃  468:    assert classify("⚠ Individual quota reached. Resets in 154h43m", "idle", 1, 10)[0] == "QUOTA"
   ┃
 
   ┃
   ┃
   ┃
   ┃  Build auto · Manifest Auto Manifest · high
-  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
-   ⬝⬝⬝⬝⬝⬝⬝⬝ esc interrupt                                     0.0K (0%)  ctrl+p commands    …/matrixkoder-mk-1:mk/mk-store-r1/d7b
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ⬝⬝⬝⬝⬝⬝⬝⬝ esc interrupt                                          ↓ 1 shell · 0.0K (0%)  ctrl+p commands
+
+# captured wV:p9, sanitized
+The script buffers everything and prints it at the end, so an empty log is expected until
+     it finishes. I’ll check how many scripts are still running.
+
+  ┃
+  ┃  $ ps -ax -o pid,ppid,etime,command | awk '$2==50210 || $2==47662' | head -8; echo '--- chil
+  ┃  dren of xargs'; ps -ax -o pid,ppid,etime,command | awk '$2==90525' | head
+  ┃
+  ┃  50210 47662       05:45 xargs -0 -P 2 -I{} bash -c k=${1//\//_}; python3 "$1" --self-test
+  ┃  >"$tmp/$k.out" 2>&1; echo $? >"$tmp/$k.rc" _ {}
+  ┃  90525 50210       01:24 bash -c k=${1//\//_}; python3 "$1" --self-test >"$tmp/$k.out" 2>&1;
+  ┃  echo $? >"$tmp/$k.rc" _ ../child-skills/mk-builder/scripts/mk-builder.py
+  ┃  --- children of xargs
+  ┃  (redacted)
+  ┃  framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python ../child-skills/mk-
+  ┃  builder/scripts/mk-builder.py --self-test
+  ┃
+
+     Only the builder suite is still running inside it, and that one passed on its own. I’ll
+     wait for the whole script to exit.
+
+  ┃
+  ┃  $ for i in $(seq 1 24); do if ! ps -p 47662 >/dev/null 2>&1; then break; fi; sleep 5; done;
+  ┃   wc -l /tmp/d7b-full.log; tail -n 8 /tmp/d7b-full.log; ps -p 47662 -o etime,state | …
+  ┃
+  ┃  (4 earlier lines)
+  ┃  pass mkdb.py: {"ok": true, "self_test": "pass"}
+  ┃  pass settings-drift.py: self-test: --check passes on the committed file ✓
+  ┃  pass ../child-skills/mk-builder/scripts/git_guard_test.py: ok 8 cases
+  ┃  pass ../child-skills/mk-builder/scripts/mk-builder.py: ok 51 cases
+  ┃  selftest: 19 run, 0 failed
+  ┃  ELAPSED STAT
+  ┃
+
+     The full suite finished: selftest: 19 run, 0 failed. I’ll put that line in the report.
+
+  ┃
+  ┃  $ python3 - /home/builder '- `MK_SEL
+  ┃  FTEST_JOBS=2 bash scripts/selftest.sh`: running, pid 47662, log `/tmp/d7b-full.log`.…
+  ┃
+  ┃  (no output)
+  ┃
+
+  ┃
+  ┃  $ python3 - /home/builder '- [open]
+  ┃  full selftest.sh - pid 47662, log /tmp/d7b-full.log, not finished yet' '- [done] ful…
+  ┃
+  ┃  (no output)
+  ┃
+
+     The report now quotes the real last line. I’ll confirm no code changed, so there is nothing
+     new to commit.
+
+  ┃
+  ┃  $ git status --short && git log -1 --oneline
+  ┃
+  ┃  57099f9 feat(lanes): no coordination files in the lane — brief and token via the bus
+  ┃
+
+     The full suite finished cleanly. Its last line is selftest: 19 run, 0 failed. No suite
+     failed, so nothing was rerun, and no code changed after 57099f9, so there is no new commit.
+     The report now quotes that line and no longer says the suites were not run.
+
+     - mk-bus.py --self-test: {"ok": true, "tests": 31, "passed": 31}
+     - mk-builder.py --self-test: ok 51 cases (one earlier run flaked on
+       t_d7_one_ack_per_answer; the rerun passed)
+     - claude plugin test .: 374 pass / 0 fail
+     - npx tsc -p . --noEmit: exit 0
+
+     D7B R1 DONE
+
+     Build · Manifest Auto · 50.5s · 25.6 tok/s
+
+  ┃
+  ┃
+  ┃
+  ┃  Build auto · Manifest Auto Manifest · high
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+  ~/Development/matrixkoder-mk-1:mk/mk-store-r1/d7b                0.0K (0%)  ctrl+p commands
+
+# captured w1R:p1, sanitized
+┃
+
+  ┃
+  ┃  $ D=/tmp/x
+  ┃  until grep -q '^EXIT:' "$D/b1-selfF.out" 2>/dev/null; do sleep 20; done…
+  ┃
+  ┃  57:ok 56 cases
+  ┃  58:EXIT:0
+  ┃
+
+     Self-test is green again. I'll run the full suite.
+
+  ┃
+  ┃  $ D=/tmp/x
+  ┃  cd /home/builder
+  ┃
+  ┃  PID 55413
+  ┃  ALIVE
+  ┃
+
+  ┃
+  ┃  $ D=/tmp/x
+  ┃  until grep -q '^EXIT:' "$D/b1-suite.out" 2>/dev/null; do sleep 20; done…
+  ┃
+  ┃  (no output)
+  ┃
+  ┃  Command exceeded timeout of 120000 ms. Retry with a larger timeout if the
+  ┃  command is expected to take longer.
+  ┃  Timed out before completion
+  ┃
+
+  ┃
+  ┃  $ D=/tmp/x
+  ┃  if grep -q '^EXIT:' "$D/b1-suite.out" 2>/dev/null; then tail -n 3 "$D/b1-…
+  ┃
+  ┃  STILL
+  ┃  02:16
+  ┃
+
+  ┃
+  ┃  ⠙ D=/tmp/x
+  ┃    until grep -q '^EXIT:' "$D/b1-suite.out" 2>/dev/null; do sleep 20; done…
+  ┃
+
+     Press ctrl+b to move running work to the background
+
+  ┃
+  ┃
+  ┃
+  ┃  Build auto · Manifest Auto Manifest · high
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ⬝⬝⬝⬝⬝⬝⬝⬝ esc interrupt                ↓ 1 shell · 0.0K (0%)  ctrl+p commands
+
+  ┃
+  ┃  $ pytest tests/test_bus.py -q
+  ┃  FAIL test_unauthorized_401
+  ┃  AssertionError: expected 403, got quota
+  ┃  rate limit: skipped
+  ┃  usage limit not reached
+  ┃
