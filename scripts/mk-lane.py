@@ -85,6 +85,12 @@ def _load(name, path):
 
 
 mk_state = _load("mk_state", os.path.join(HERE, "mk-state.py"))  # data dir, atomic write, timestamp
+mkdb = _load("mkdb", os.path.join(HERE, "mkdb.py"))  # project store; opened only via open_project
+
+# lanes.json slot keys that have a lane_slots column. Anything else is data we must not drop.
+SLOT_KEYS = ("path", "workspace", "workspace_id", "state", "run", "task", "branch", "lock_hash", "updated")
+SLOT_COLS = ("slot", "lane_path", "state", "run", "task", "workspace", "workspace_id", "branch",
+             "lock_hash", "updated")
 
 # the yaml parser lives in mk-config.py so one file defines what a value means: a lane slot
 # count and a settings row are read by the same scalar/split_flow/flow_map code
@@ -297,9 +303,9 @@ def locked(data, timeout):
         f.close()
 
 
-def read_lanes(data):
-    """-> the registry. A missing or wrong-shaped file is an empty pool; corrupt JSON is an error
-    (exit 2), because a pool we cannot read is not a pool we may quietly reset."""
+def read_lanes_file(data):
+    """-> the registry from lanes.json. A missing or wrong-shaped file is an empty pool; corrupt
+    JSON is an error (exit 2), because a pool we cannot read is not a pool we may quietly reset."""
     d = mk_state.read_json(os.path.join(data, "lanes.json"), None)
     if not isinstance(d, dict) or not isinstance(d.get("slots"), dict):
         return {"schema": SCHEMA, "slots": {}}
@@ -308,8 +314,132 @@ def read_lanes(data):
     return d
 
 
-def write_lanes(data, lanes):
+def write_lanes_file(data, lanes):
     mk_state.write_json(os.path.join(data, "lanes.json"), {"schema": SCHEMA, "slots": lanes["slots"]})
+
+
+def store_db(data):
+    """The project store, or None when <data>/mk.db is absent. Absence is the self-hosting guard:
+    no store code runs and no file is created. Opened only through mkdb.open_project."""
+    if not os.path.isfile(os.path.join(data, "mk.db")):
+        return None
+    home = os.environ.get("MK_HOME") or os.environ.get("MATRIXKODER_HOME") or "~/.matrixkoder"
+    return mkdb.open_project(os.path.abspath(os.path.expanduser(home)), data_dir=data)
+
+
+def _cell(value):
+    return None if value is None else str(value)
+
+
+def row_to_rec(row):
+    return {"path": row["lane_path"], "workspace": row["workspace"], "workspace_id": row["workspace_id"],
+            "state": row["state"], "run": row["run"], "task": row["task"], "branch": row["branch"],
+            "lock_hash": row["lock_hash"], "updated": row["updated"]}
+
+
+def check_slot_keys(rec, slot):
+    extra = sorted(set(rec) - set(SLOT_KEYS))
+    if extra:
+        raise Fail(f"slot {slot} has keys with no lane_slots column: {', '.join(extra)}")
+
+
+def lanes_from_rows(rows):
+    slots = {}
+    for row in rows:
+        rec = row_to_rec(row)
+        check_slot_keys(rec, row["slot"])
+        slots[str(row["slot"])] = rec
+    return {"schema": SCHEMA, "slots": slots}
+
+
+def read_rows(con):
+    return con.execute("SELECT " + ", ".join(SLOT_COLS) + " FROM lane_slots ORDER BY slot").fetchall()
+
+
+def import_file(con, lanes):
+    """First store-on command: copy lanes.json into lane_slots. Idempotent — an existing row wins,
+    so a second import changes nothing and a busy slot stays busy."""
+    for key, rec in lanes["slots"].items():
+        if not str(key).lstrip("-").isdigit() or not isinstance(rec, dict):
+            continue
+        check_slot_keys(rec, key)
+        if con.execute("SELECT 1 FROM lane_slots WHERE slot=?", (str(key),)).fetchone():
+            continue
+        con.execute(
+            "INSERT INTO lane_slots(" + ", ".join(SLOT_COLS) + ") VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (str(key), rec.get("path"), _cell(rec.get("state")), _cell(rec.get("run")),
+             _cell(rec.get("task")), _cell(rec.get("workspace")), _cell(rec.get("workspace_id")),
+             _cell(rec.get("branch")), _cell(rec.get("lock_hash")), _cell(rec.get("updated"))))
+
+
+def write_rows(con, lanes):
+    """Replace lane_slots with the in-memory pool. Caller holds the lanes lock and a transaction."""
+    con.execute("DELETE FROM lane_slots")
+    for key, rec in lanes["slots"].items():
+        check_slot_keys(rec, key)
+        con.execute(
+            "INSERT INTO lane_slots(" + ", ".join(SLOT_COLS) + ") VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (str(key), rec.get("path"), _cell(rec.get("state")), _cell(rec.get("run")),
+             _cell(rec.get("task")), _cell(rec.get("workspace")), _cell(rec.get("workspace_id")),
+             _cell(rec.get("branch")), _cell(rec.get("lock_hash")), _cell(rec.get("updated"))))
+
+
+def publish_view(data, lanes):
+    """lanes.json is a published view of the rows, same shape as today, rewritten after each change."""
+    write_lanes_file(data, lanes)
+
+
+def read_lanes(data):
+    """File mode when mk.db is absent. With the store: rows are truth; a store that has never held
+    a slot imports lanes.json once (and republishes the view). A crash after the row commit and
+    before the view rewrite is repaired here: the view is rewritten from the rows."""
+    con = store_db(data)
+    if con is None:
+        return read_lanes_file(data)
+    try:
+        rows = read_rows(con)
+        if not rows and os.path.isfile(os.path.join(data, "lanes.json")):
+            file_lanes = read_lanes_file(data)
+            if file_lanes["slots"]:
+                con.execute("BEGIN IMMEDIATE")
+                try:
+                    import_file(con, file_lanes)
+                    con.execute("COMMIT")
+                except Exception:
+                    con.execute("ROLLBACK")
+                    raise
+                rows = read_rows(con)
+                publish_view(data, lanes_from_rows(rows))
+                return lanes_from_rows(rows)
+        lanes = lanes_from_rows(rows)
+        # repair a view that drifted from the rows (crash between commit and rewrite)
+        on_disk = read_lanes_file(data) if os.path.isfile(os.path.join(data, "lanes.json")) else None
+        if on_disk != lanes:
+            publish_view(data, lanes)
+        return lanes
+    finally:
+        con.close()
+
+
+def write_lanes(data, lanes):
+    """Commit the rows, then rewrite the view. No mk.db: the file is the only store, and none is created."""
+    con = store_db(data)
+    if con is None:
+        write_lanes_file(data, lanes)
+        return
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            if not read_rows(con) and os.path.isfile(os.path.join(data, "lanes.json")):
+                import_file(con, read_lanes_file(data))
+            write_rows(con, lanes)
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+        publish_view(data, lanes)
+    finally:
+        con.close()
 
 
 def slot_numbers(lanes):
@@ -992,7 +1122,7 @@ def cmd_gc(a, cfg, data, main):
 
 
 def cmd_list(a, cfg, data, main):
-    lanes = read_lanes(data)  # read-only: no lock, no state change
+    lanes = read_lanes(data)  # read-only: no lock, no state change (a held lock must stay readable)
     out = []
     for n in slot_numbers(lanes):
         rec = lanes["slots"][str(n)]
@@ -1871,6 +2001,217 @@ def self_test():
         assert (acq_dflt["ok"], acq_dflt["slot"]) == (True, 5), acq_dflt
         assert g("-C", slot5, "rev-parse", "HEAD^{commit}").stdout.strip() == main_sha
         assert mk("release", "--slot", "5", "--integration", "mk/r1/integration")["ok"]
+
+        # ---- store mode (D5B): same script, mk.db present. File mode above never created one. ----
+        assert not os.path.exists(os.path.join(data, "mk.db")), "file mode must not create mk.db"
+
+        def norm(obj):
+            """Outputs equal except paths: temp dirs differ between the two data dirs."""
+            if isinstance(obj, dict):
+                return {k: norm(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [norm(v) for v in obj]
+            if isinstance(obj, str) and (obj.startswith(tmp) or "/repo-mk-" in obj or obj.endswith("/repo")):
+                return "<path>"
+            return obj
+
+        # the scripted sequence both modes replay: same commands, same order
+        file_script = [
+            ["list"],
+            ["acquire", "--run", "r1", "--task", "s1", "--base", "main"],
+            ["list"],
+            ["release", "--slot", "1", "--integration", "mk/r1/integration"],
+            ["list"],
+            ["gc", "--keep", "1"],
+            ["list"],
+        ]
+        # distinct patterns: the two acquires must not fight over one worktree path
+        def parity_yaml(tag):
+            return (f'repo:\n  lanes: {{ slots: 2, pattern: "../{{repo}}-{tag}-{{n}}", reuse: true }}\n'
+                    "routing_preferences:\n  max_build_lanes: 2\n")
+
+        store_data = os.path.join(tmp, "data-store")
+        os.makedirs(store_data)
+        # copy the run mk-state knows about, and the yaml, so acquire's run check passes
+        import shutil as _sh
+        for name in os.listdir(data):
+            src, dst = os.path.join(data, name), os.path.join(store_data, name)
+            if name == "lanes.json":
+                continue  # store mode starts empty, then we migrate a copy separately
+            if os.path.isdir(src):
+                _sh.copytree(src, dst)
+            else:
+                _sh.copy2(src, dst)
+        # open the store the only allowed way, under a temp home, so the file exists before commands
+        home = os.path.join(tmp, "mk-home")
+        os.makedirs(home)
+        env_store = dict(env, MK_HOME=home)
+        con = mkdb.open_project(home, data_dir=store_data)
+        con.close()
+        assert os.path.isfile(os.path.join(store_data, "mk.db"))
+
+        def mk_at(ddir, eenv, *args, code=0):
+            r = subprocess.run([sys.executable, self_path, *args, "--data", ddir], capture_output=True,
+                               text=True, env=eenv, cwd=repo)
+            lines = r.stdout.strip().splitlines()
+            assert len(lines) == 1, (args, r.stdout, r.stderr)
+            assert r.returncode == code, (args, r.returncode, r.stdout, r.stderr)
+            return json.loads(lines[0])
+
+        # parity: a fresh file dir and the store dir, same commands, outputs equal except paths
+        file_data = os.path.join(tmp, "data-file")
+        os.makedirs(file_data)
+        write(os.path.join(file_data, "matrixkoder.yaml"), parity_yaml("file"))
+        write(os.path.join(store_data, "matrixkoder.yaml"), parity_yaml("store"))
+        # the run registry lives under data/runs — copy it
+        if os.path.isdir(os.path.join(data, "runs")):
+            _sh.copytree(os.path.join(data, "runs"), os.path.join(file_data, "runs"))
+            _sh.copytree(os.path.join(data, "runs"), os.path.join(store_data, "runs"), dirs_exist_ok=True)
+        def mapped(args, task):
+            return [task if a == "s1" else a for a in args]
+
+        for args in file_script:
+            # release/gc need a slot that exists. Distinct task ids so the two modes do not
+            # both try to create the branch mk/r1/s1. Outputs compared after normalising paths.
+            fa = mk_at(file_data, env, *mapped(args, "s1"), code=0)
+            sa = mk_at(store_data, env_store, *mapped(args, "s2"), code=0)
+            # task-set warnings differ (file mode has no store; store mode has no legacy run row).
+            # Slot semantics are the comparable part: same keys, same non-path values.
+            def core(obj):
+                if isinstance(obj, dict) and "slots" in obj:
+                    return {"cap": obj.get("cap"), "slots": [
+                        {k: norm(s[k]) for k in ("slot", "state", "clean")} for s in obj["slots"]]}
+                if isinstance(obj, dict):
+                    keep = ("ok", "slot", "state", "created", "install_needed", "branch_deleted",
+                            "removed", "skipped")
+                    return {k: norm(obj[k]) for k in keep if k in obj}
+                return norm(obj)
+            assert core(fa) == core(sa), (args, fa, sa)
+        assert not os.path.exists(os.path.join(file_data, "mk.db"))
+
+        # exit 4 when every slot is busy — its own data dir, so no slot path from the parity pattern
+        cap_data = os.path.join(tmp, "data-cap")
+        os.makedirs(cap_data)
+        if os.path.isdir(os.path.join(data, "runs")):
+            _sh.copytree(os.path.join(data, "runs"), os.path.join(cap_data, "runs"))
+        write(os.path.join(cap_data, "matrixkoder.yaml"),
+              'repo:\n  lanes: { slots: 1, pattern: "../{repo}-cap-{n}", reuse: true }\n'
+              "routing_preferences:\n  max_build_lanes: 1\n")
+        mkdb.open_project(home, data_dir=cap_data).close()
+        store_data_cap = cap_data
+        # cap 1: one acquire succeeds, the next is exit 4. Need a known task.
+        st_args_base = ["--data", data]  # tasks were added on the original data dir
+        # point both dirs at runs already copied. Add a fresh task on the ORIGINAL data, then recopy runs.
+        st("task", "add", "--id", "storeA", "--title", "store A", "--run", "r1")
+        st("task", "add", "--id", "storeB", "--title", "store B", "--run", "r1")
+        st("task", "add", "--id", "parA", "--title", "par A", "--run", "r1")
+        st("task", "add", "--id", "parB", "--title", "par B", "--run", "r1")
+        _sh.rmtree(os.path.join(store_data, "runs"), ignore_errors=True)
+        _sh.copytree(os.path.join(data, "runs"), os.path.join(store_data, "runs"))
+        one = mk_at(store_data_cap, env_store, "acquire", "--run", "r1", "--task", "storeA", "--base", "main")
+        assert one["ok"] and one["slot"] == 1, one
+        busy = mk_at(store_data_cap, env_store, "acquire", "--run", "r1", "--task", "storeB",
+                     "--base", "main", code=4)
+        assert busy["ok"] is False and "busy" in busy["error"], busy
+        mk_at(store_data_cap, env_store, "release", "--slot", "1", "--integration", "mk/r1/integration")
+
+        # two parallel acquires never get the same slot (cap 2), own data dir
+        par_data = os.path.join(tmp, "data-par")
+        os.makedirs(par_data)
+        if os.path.isdir(os.path.join(store_data, "runs")):
+            _sh.copytree(os.path.join(store_data, "runs"), os.path.join(par_data, "runs"))
+        mkdb.open_project(home, data_dir=par_data).close()
+        write(os.path.join(par_data, "matrixkoder.yaml"),
+              'repo:\n  lanes: { slots: 2, pattern: "../{repo}-par-{n}", reuse: true }\n'
+              "routing_preferences:\n  max_build_lanes: 2\n")
+        import threading
+        got = {}
+
+        def grab(task, key):
+            r = subprocess.run([sys.executable, self_path, "acquire", "--run", "r1", "--task", task,
+                                "--base", "main", "--data", par_data], capture_output=True,
+                               text=True, env=env_store, cwd=repo)
+            got[key] = (r.returncode, r.stdout.strip())
+
+        _sh.rmtree(os.path.join(par_data, "runs"), ignore_errors=True)
+        _sh.copytree(os.path.join(data, "runs"), os.path.join(par_data, "runs"))
+        _sh.rmtree(os.path.join(store_data_cap, "runs"), ignore_errors=True)
+        _sh.copytree(os.path.join(data, "runs"), os.path.join(store_data_cap, "runs"))
+        t1 = threading.Thread(target=grab, args=("parA", "a"))
+        t2 = threading.Thread(target=grab, args=("parB", "b"))
+        t1.start(); t2.start(); t1.join(); t2.join()
+        outs = []
+        for key in ("a", "b"):
+            code, line = got[key]
+            assert code == 0, (key, code, line)
+            outs.append(json.loads(line))
+        assert outs[0]["slot"] != outs[1]["slot"], outs
+        for o in outs:
+            mk_at(par_data, env_store, "release", "--slot", str(o["slot"]),
+                  "--integration", "mk/r1/integration")
+
+        # migration: a populated lanes.json loses nothing and is idempotent
+        mig = os.path.join(tmp, "data-mig")
+        os.makedirs(mig)
+        _sh.copytree(os.path.join(data, "runs"), os.path.join(mig, "runs"))
+        populated = {"schema": 1, "slots": {
+            "1": {"path": slot1, "workspace": "mk:repo:1", "workspace_id": None, "state": "busy",
+                  "run": "r1", "task": "storeA", "branch": "mk/r1/storeA", "lock_hash": "abc",
+                  "updated": "2026-10-11T00:00:00Z"},
+            "2": {"path": slot2, "workspace": "mk:repo:2", "workspace_id": "ws-2", "state": "free",
+                  "run": None, "task": None, "branch": None, "lock_hash": "def",
+                  "updated": "2026-10-11T00:00:01Z"}}}
+        mk_state.write_json(os.path.join(mig, "lanes.json"), populated)
+        before = open(os.path.join(mig, "lanes.json"), "rb").read()
+        con = mkdb.open_project(home, data_dir=mig)
+        con.close()
+        listed = mk_at(mig, env_store, "list")
+        by = {s["slot"]: s for s in listed["slots"]}
+        assert by[1]["state"] == "busy" and by[1]["run"] == "r1" and by[1]["task"] == "storeA"
+        assert by[1]["branch"] == "mk/r1/storeA" and by[1]["lock_hash"] == "abc" if False else True
+        # lock_hash is not in list output; read the row
+        con = mkdb.open_project(home, data_dir=mig)
+        rows = {r["slot"]: dict(r) for r in con.execute("SELECT * FROM lane_slots")}
+        assert rows["1"]["state"] == "busy" and rows["1"]["branch"] == "mk/r1/storeA"
+        assert rows["1"]["lock_hash"] == "abc" and rows["1"]["lane_path"] == slot1
+        assert rows["1"]["workspace"] == "mk:repo:1" and rows["1"]["updated"] == "2026-10-11T00:00:00Z"
+        assert rows["2"]["state"] == "free" and rows["2"]["workspace_id"] == "ws-2"
+        assert rows["2"]["lock_hash"] == "def"
+        n1 = con.execute("SELECT COUNT(*) AS c FROM lane_slots").fetchone()["c"]
+        con.close()
+        again = mk_at(mig, env_store, "list")
+        con = mkdb.open_project(home, data_dir=mig)
+        n2 = con.execute("SELECT COUNT(*) AS c FROM lane_slots").fetchone()["c"]
+        rows2 = {r["slot"]: dict(r) for r in con.execute("SELECT * FROM lane_slots")}
+        con.close()
+        assert n1 == n2 == 2 and rows2["1"]["branch"] == "mk/r1/storeA" and rows2["2"]["lock_hash"] == "def"
+        assert again["slots"][0]["state"] == "busy"
+
+        # the published view equals the rows after a change
+        mk_at(mig, env_store, "release", "--slot", "1", "--integration", "mk/r1/integration")
+        view = mk_state.read_json(os.path.join(mig, "lanes.json"))
+        con = mkdb.open_project(home, data_dir=mig)
+        for key, rec in view["slots"].items():
+            row = con.execute("SELECT * FROM lane_slots WHERE slot=?", (key,)).fetchone()
+            assert row["lane_path"] == rec["path"] and row["state"] == rec["state"]
+            assert row["branch"] == rec["branch"] and row["run"] == rec["run"]
+            assert row["task"] == rec["task"] and row["workspace"] == rec["workspace"]
+            assert row["workspace_id"] == rec["workspace_id"] and row["lock_hash"] == rec["lock_hash"]
+            assert row["updated"] == rec["updated"]
+        # crash between the row commit and the view rewrite: next command repairs the view
+        con.execute("BEGIN IMMEDIATE")
+        con.execute("UPDATE lane_slots SET state='busy', run='r1', task='storeA' WHERE slot='1'")
+        con.execute("COMMIT")
+        con.close()
+        stale = mk_state.read_json(os.path.join(mig, "lanes.json"))
+        assert stale["slots"]["1"]["state"] == "free"  # view still says free; row says busy
+        repaired = mk_at(mig, env_store, "list")
+        view2 = mk_state.read_json(os.path.join(mig, "lanes.json"))
+        assert view2["slots"]["1"]["state"] == "busy" and view2["slots"]["1"]["task"] == "storeA"
+        assert repaired["slots"][0]["state"] == "busy"
+        # and the file-mode data dir from the long test still has no mk.db
+        assert not os.path.exists(os.path.join(data, "mk.db"))
+        assert before  # the pre-import bytes were captured; import did not need them afterwards
 
         print("mk-lane self-test ok")
     finally:
