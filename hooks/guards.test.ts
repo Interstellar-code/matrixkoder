@@ -108,6 +108,17 @@ const DENY_REVIEW = [
   "git 'reset' --hard",
   'git \\reset',
   'git commit --amen',
+  // rtk wraps the real command (`rtk git` is rtk's git subcommand)
+  'rtk git stash',
+  'rtk git checkout x',
+  'rtk proxy git stash',
+  'rtk proxy git checkout x',
+  '/Users/me/.cargo/bin/rtk git stash',
+  'rtk run git reset --hard',
+  'rtk git commit -mfoo --amend',
+  'rtk git push --force',
+  'sudo rtk git stash',
+  'rtk -u git stash',
 ]
 
 const ALLOW = [
@@ -146,6 +157,14 @@ const ALLOW = [
   'echo "see the heredoc body: git commit --amend"',
   'echo hi # git reset',
   "bash -c 'git status'",
+  'rtk git status',
+  'rtk git log',
+  'rtk git diff',
+  'rtk ls',
+  'rtk grep x',
+  'rtk test npm test',
+  'rtk proxy ls',
+  'rtk read file',
 ]
 
 test('denies the banned git forms the first guard caught', async ($, on) => {
