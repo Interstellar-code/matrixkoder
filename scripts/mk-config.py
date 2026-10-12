@@ -35,7 +35,7 @@ session.selftest_jobs_total: integer 1..16, the whole-machine self-test job budg
 has no value the default is derived as max(1, round(cpu_count/3)); list/get/context show that
 number and say it is derived.
 """
-import contextlib, datetime, difflib, importlib.util, json, os, re, shutil, subprocess, sys, tempfile, time
+import contextlib, datetime, difflib, fcntl, importlib.util, json, os, re, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True  # no stray __pycache__ next to the scripts
@@ -599,7 +599,41 @@ def patch(lines, r, value):
     return new, 1
 
 
-# ponytail: last-writer-wins, no lock; add mk_state lock if wizard+settings race
+LOCK_WAIT_S = 5  # a Settings save waits this long for another writer, then refuses; never hangs
+LOCK_NAME = "matrixkoder.yaml.lock"
+
+
+@contextlib.contextmanager
+def yaml_lock(path):
+    """Exclusive flock on a sibling lock file for the whole read-modify-write.
+
+    The kernel drops the lock when this process dies (kill -9 included). A holder that outlasts
+    LOCK_WAIT_S is a named error, not a second writer and not a hang. Reads never call this.
+    """
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    try:
+        os.makedirs(d, exist_ok=True)
+        f = open(os.path.join(d, LOCK_NAME), "a")
+    except OSError as e:
+        raise Fail(f"could not lock {path}: {e.strerror or e}")
+    try:
+        deadline = time.monotonic() + LOCK_WAIT_S
+        while True:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise Fail(f"{LOCK_NAME} busy")
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+    finally:
+        f.close()
+
+
 def write_yaml(path, old, new, count, checks):
     """Prove the patched text is the file we meant to write, back up the version being replaced, then
     replace it atomically. A yaml a human edited by hand is the only config there is: a wrong write is
@@ -786,6 +820,8 @@ def parse_value(raw, r, lines=None):
             raise Fail(f"{r['key']} is a list of strings: {raw} is not")
         if r.get("maxlen") and len(v) > r["maxlen"]:
             raise Fail(f"{r['key']} takes at most {r['maxlen']} entries: {raw} has {len(v)}")
+        if r["key"] == "routing_preferences.builder_order" and any(x == "codex" for x in v):
+            raise Fail(f"{r['key']}: codex is never a builder; {raw}")
         for x in v:
             if r.get("pool") and x not in r["pool"]:
                 saved = value_of(lines, r)[1] if lines is not None else []
@@ -877,11 +913,14 @@ def cmd_set(path, lines, args):
     if not r.get("editable", True) and not r["key"].startswith("agents."):
         raise Fail(f"{key} is read-only: {r.get('why', 'not editable')}")
     value = parse_value(raw, r, lines)
-    found, current = value_of(lines, r)
-    if found and current == value:  # a save sends every row it holds, most of them unchanged
-        return out({"ok": True, "key": key, "value": value, "file": path, "changed": False})
-    new, count = patch(lines, r, value)  # refused shapes raise before anything is touched
-    write_yaml(path, lines, new, count, [(key, value, r)])
+    with yaml_lock(path):
+        lines = read_lines(path)  # the copy main() read is stale once another writer held the lock
+        r = row_for(lines, key) or r
+        found, current = value_of(lines, r)
+        if found and current == value:  # a save sends every row it holds, most of them unchanged
+            return out({"ok": True, "key": key, "value": value, "file": path, "changed": False})
+        new, count = patch(lines, r, value)  # refused shapes raise before anything is touched
+        write_yaml(path, lines, new, count, [(key, value, r)])
     return out({"ok": True, "key": key, "value": value, "file": path, "changed": True,
                 "backup": path + ".bak", "backup_of": "previous"})
 
@@ -890,6 +929,12 @@ def cmd_migrate(path, lines):
     """Bring a config written before this schema up to it, and nothing else: the new sections and
     the two new routing keys get their schema defaults when absent. Idempotent, and it reports the
     dead yaml copies of plugin settings without ever writing or deleting them."""
+    with yaml_lock(path):
+        return _migrate_locked(path, read_lines(path))
+
+
+def _migrate_locked(path, lines):
+    """Migrate body. Caller holds yaml_lock, so this read is the file that gets written."""
     old = list(lines)
     new, changed, checks, count = list(lines), [], [], 0
     eol = file_ending(new)
@@ -1211,6 +1256,12 @@ def refresh_models(lines):
 
 
 def cmd_probe(path, lines):
+    with yaml_lock(path):
+        return _probe_locked(path, read_lines(path))
+
+
+def _probe_locked(path, lines):
+    """Probe body. Caller holds yaml_lock for the probes and the write, so a set waits."""
     herdr_status = probe_herdr()
     mcp_statuses = probe_claude_mcps()
     canary_status = probe_canary()
@@ -2174,6 +2225,52 @@ def self_test():
         p_m3 = run("probe")
         assert p_m3["models"] == {"opencode": "unchanged", "agy": "unchanged"}, p_m3
         assert agent_lines() == before_agents, "a probe that could not read the models rewrote them"
+
+        # 31. codex is never a builder_order value: refused, yaml unchanged, no .bak
+        before, bak = rd(), yaml_path + ".bak"
+        if os.path.exists(bak):
+            os.unlink(bak)
+        refused = run("set", "routing_preferences.builder_order", '["codex"]', ok=False)
+        assert "never a builder" in refused["error"], refused
+        assert rd() == before and not os.path.exists(bak)
+        refused = run("set", "routing_preferences.builder_order", '["opencode", "codex"]', ok=False)
+        assert "never a builder" in refused["error"] and rd() == before
+
+        # 32. the lock serialises two real set processes, and a holder that never releases it
+        #     makes set return the named error inside the wait bound with the yaml unchanged.
+        import signal as _signal
+        run("set", "session.stall_min", "15")
+        before = rd()
+        procs = [
+            subprocess.Popen([sys.executable, script, "set", "session.stall_min", "22"], env=env, cwd=tmp),
+            subprocess.Popen([sys.executable, script, "set", "session.max_wait_min", "40"], env=env, cwd=tmp),
+        ]
+        for proc in procs:
+            proc.wait(timeout=30)
+        after = rd()
+        assert "stall_min: 22" in after and "max_wait_min: 40" in after, after
+        hold = os.path.join(data, "matrixkoder.yaml.lock")
+        hf = open(hold, "a")
+        fcntl.flock(hf, fcntl.LOCK_EX)
+        try:
+            t0 = time.monotonic()
+            busy = run("set", "session.stall_min", "30", ok=False)
+            waited = time.monotonic() - t0
+            assert "matrixkoder.yaml.lock busy" in busy["error"], busy
+            assert waited < LOCK_WAIT_S + 2, waited
+            assert rd() == after
+        finally:
+            fcntl.flock(hf, fcntl.LOCK_UN)
+            hf.close()
+        # kill -9 of a holder: the kernel drops the flock and the next set proceeds
+        sleeper = subprocess.Popen(
+            [sys.executable, "-c",
+             "import fcntl,time; f=open(%r,'a'); fcntl.flock(f,fcntl.LOCK_EX); time.sleep(60)" % hold])
+        time.sleep(0.2)
+        sleeper.send_signal(_signal.SIGKILL)
+        sleeper.wait(timeout=5)
+        run("set", "session.stall_min", "18")
+        assert "stall_min: 18" in rd()
     finally:
         if restore:
             restore()
