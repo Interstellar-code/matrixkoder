@@ -75,6 +75,9 @@ STORE_PROJECT = "matrixkoder"  # slug only; the db is <data>/mk.db via data_dir 
 # D5A.3: a pane that is quiet is still working while a descendant runs one of these. The window
 # after the child exits is stall_min * max(1, loadavg_1m / cpu_count): a busy machine gets a
 # longer grace, an idle machine keeps today's stall_min. cpu_count 0 is treated as 1.
+# A load spike must not stretch one stall_min without limit, and a leaked matching child
+# must not refresh the grace forever (SR2). Factor and the total window share this cap.
+CHILD_SCALE_CAP = 4.0
 CHILD_PROGRESS_RE = re.compile(
     r"(?:^|/)(?:selftest\.sh|pytest|tsc)(?:\s|$)"
     r"|claude\s+plugin\s+test"
@@ -176,9 +179,28 @@ def _load_mkdb():
     return _mkdb_mod
 
 
+# A terminal row from the previous round must not decide this watch (SR2).
+STORE_TERMINAL = ("done", "verifying", "review", "merged", "blocked")
+
+
+def _row_epoch(updated):
+    """mkdb stores ISO-8601 text; an epoch float also parses. Unparseable is 0."""
+    try:
+        return float(updated)
+    except (TypeError, ValueError):
+        try:
+            import datetime
+            return datetime.datetime.fromisoformat(str(updated)).timestamp()
+        except (TypeError, ValueError):
+            return 0.0
+
+
 def store_status_row(data, armed):
     """The tasks row for this armed round when the store is on and the row exists, else None.
-    A miss (store off, no row, wrong round) is the status-file fallback, never an exception."""
+    A miss (store off, no row, wrong round) is the status-file fallback, never an exception.
+    A read failure is not a miss: it returns {"store_error": "<why>"} so the verdict can name
+    it. A terminal row (done/verifying/review/merged/blocked) whose updated is not after the
+    watch's armed_at is the previous round's outcome and is ignored."""
     if not store_on(data) or not armed or not armed.get("run") or not armed.get("task"):
         return None
     m = PHASE_ROUND_RE.match(str(armed.get("phase") or ""))
@@ -193,9 +215,20 @@ def store_status_row(data, armed):
                 (armed["run"], armed["task"])).fetchone()
         finally:
             con.close()
-    except Exception:
-        return None
+    except Exception as e:
+        return {"store_error": f"{type(e).__name__}: {e}"}
     if not row or row["round"] != rnd:
+        return None
+    status = (row["status"] or "").lower()
+    # A terminal row whose updated is not after armed_at is the previous round's outcome
+    # (task round bumps the round but the row keeps its old timestamp). A row written in
+    # the same second as the arm still counts: ISO timestamps have whole seconds.
+    armed_at = armed.get("armed_at")
+    # 30s, not 1s: a loaded machine can take well over a second between the status
+    # write and the arm, and ISO timestamps are whole seconds. A row from the PREVIOUS
+    # round is minutes-to-hours older, so 30s still rejects it.
+    if (armed_at is not None and status in STORE_TERMINAL
+            and _row_epoch(row["updated"]) + 30.0 <= float(armed_at)):
         return None
     return row
 
@@ -258,7 +291,7 @@ def child_progress(pane_pid, now=None):
         cpus = os.cpu_count() or 1
     except Exception:
         load1, cpus = 0.0, 1
-    return hit, max(1.0, float(load1) / float(cpus or 1))
+    return hit, min(CHILD_SCALE_CAP, max(1.0, float(load1) / float(cpus or 1)))
 
 
 def read_status(lane, armed):
@@ -271,6 +304,13 @@ def read_status(lane, armed):
     fields are ignored (R38). The only file this watcher ever gains; the caller passes the result
     to decide() as st."""
     row = store_status_row((armed or {}).get("data"), armed)
+    if isinstance(row, dict) and row.get("store_error"):
+        # A failed store read is a named miss, not silence and not the pane path: decide()
+        # keeps watching (source=status) instead of grace-DONE or STALL on a quiet lane.
+        return {"v": 1, "seq": None, "run": (armed or {}).get("run"),
+                "task": (armed or {}).get("task"), "round": None, "role": "builder",
+                "state": "store_error", "question": None, "updated_at": 0.0,
+                "source": "status", "store_error": row["store_error"]}
     if row is not None:
         # the store row for this round wins; the status file is not read. seq stays None so the
         # row never enters _seen_seq (that counter belongs to the file channel only).
@@ -284,16 +324,7 @@ def read_status(lane, armed):
         else:
             # a non-terminal row is not a heartbeat: updated_at 0 so it never resets the idle clock
             state, question, fresh = "started", None, False
-        upd = 0.0
-        if fresh:
-            try:  # mkdb stores ISO-8601 text; an epoch float also parses. Unparseable = not fresh.
-                upd = float(row["updated"])
-            except (TypeError, ValueError):
-                try:
-                    import datetime
-                    upd = datetime.datetime.fromisoformat(str(row["updated"])).timestamp()
-                except (TypeError, ValueError):
-                    upd = 0.0
+        upd = _row_epoch(row["updated"]) if fresh else 0.0
         return {"v": 1, "seq": None, "run": armed.get("run"), "task": armed.get("task"),
                 "round": row["round"], "role": "builder", "state": state, "question": question,
                 "updated_at": upd, "source": "store"}
@@ -361,6 +392,11 @@ def decide(h, subj, rx, report_ok, text, phase, stall_min, st=None, armed=None):
     file accepted by read_status (R27) or None; a file that missed any R27 condition fell back to
     this pane-text path unchanged (R28). Every verdict's evidence ends with its source (R41):
     status = decided from the accepted file, pane = the pane-text path, grace = the no-token rule."""
+    if st and st.get("state") == "store_error":
+        # The store could not be read. Do not fall through to the pane/grace path: a quiet
+        # idle lane must not become DONE or STALL because of a locked or corrupt mk.db.
+        why = st.get("store_error") or "unknown"
+        return None, [f"store_error: {why}", "source=status"]
     done_tok, question = phase_tokens(text, phase)
     commit_ok = rx is None or bool(rx.search(subj.partition(" ")[2]) or rx.search(subj))  # subj = "<sha> <subject>"
     commit_ev = [] if rx is None else [f"commit {subj}"]
@@ -577,6 +613,20 @@ def quota_beats_stall(agent, kind):
                                    else ["exhausted_until unknown"]) + ["source=pane"]   # R41 (R35)
 
 
+def child_grace_end(child_first, child_seen_until, running, stall_min, scale, max_wait, now):
+    """End of the child-progress grace, or None when a STALL is not suppressed.
+
+    While the child still runs, the window stays open until max(4*stall_min, the watch's
+    max-wait) after the child was FIRST seen. After it exits, only stall_min*scale remains
+    (scale <= 4), never past that same bound. A leaked child cannot hold a lane forever;
+    a real stall fires once the bound passes. Pure: the caller passes the clock."""
+    if child_seen_until is None:
+        return None
+    alive_until = child_first + max(stall_min * 60 * CHILD_SCALE_CAP, max_wait)
+    end = alive_until if running else min(child_seen_until + stall_min * 60 * scale, alive_until)
+    return end if now < end else None
+
+
 def watch(a):
     no_commit = "--no-commit" in a
     lane, agent, grep = opt(a, "--lane"), opt(a, "--agent"), opt(a, "--commit-grep")
@@ -590,7 +640,7 @@ def watch(a):
     active, last_fp = start, None  # last time the pane showed new output
     # D5A.3: last epoch a test/build descendant of the pane was seen. After it exits,
     # grace = stall_min * max(1, loadavg_1m / cpu_count), measured when the child was last seen running.
-    child_seen_until, child_scale = 0.0, 1.0
+    child_seen_until, child_scale, child_first = 0.0, 1.0, 0.0
     t_one, t_list = opt(a, "--task"), opt(a, "--tasks")
     # the armed watch read_status() accepts against (R27): run/task/phase-round/role + armed_at;
     # a watch without --run, --task or a "<T>[ REVIEW] R<n>" phase never accepts a file (R27.3-5)
@@ -622,9 +672,12 @@ def watch(a):
         pane_pid = os.environ.get("MK_PANE_PID") or h.get("pane_pid")
         running, scale = child_progress(pane_pid)
         if running:
-            child_seen_until, child_scale = time.time(), scale
-        # grace = stall_min * max(1, loadavg_1m / cpu_count), measured when the child was last seen running.
-        if state == "STALL" and child_seen_until and time.time() < child_seen_until + stall_min * 60 * child_scale:
+            now_c = time.time()
+            if not child_first:
+                child_first = now_c
+            child_seen_until, child_scale = now_c, scale
+        if state == "STALL" and child_grace_end(
+                child_first, child_seen_until, running, stall_min, child_scale, max_wait, time.time()):
             state = None  # quiet pane, but the test/build child (or its grace) is still in play
         errors = errors + 1 if state == "ERROR" else 0
         if state == "ERROR" and errors < ERROR_RETRIES and time.time() - start <= max_wait:
@@ -1102,27 +1155,23 @@ def self_test():
         # on its command line (CHILD_PROGRESS_RE); it is the pane pid. Never a server.
         active0, scale0 = child_progress(None)
         assert active0 is False and scale0 >= 1.0, (active0, scale0)
-        # the pane pid itself is not scanned; a descendant is. ps truncates a long -c line before
-        # --self-test, so the match is a short argv: python .../selftest.sh (CHILD_PROGRESS_RE).
+        # a descendant running a matching command is seen; the pane pid itself is not.
+        # The watch-level suppression under load is proven by child_grace_end on an
+        # injected clock (below), not by this wall-clock watch: ps under heavy load
+        # outruns any fixed window.
         script = os.path.join(lane, "selftest.sh")
         wrap = os.path.join(lane, "wrap.py")
         open(script, "w").write("import time\ntime.sleep(30)\n")
         open(wrap, "w").write("import subprocess,sys\nsubprocess.run([sys.executable, sys.argv[1]])\n")
         child = subprocess.Popen([sys.executable, wrap, script])
         try:
-            time.sleep(0.3)  # let the descendant reach ps before the first look
+            time.sleep(0.3)
             assert child_progress(child.pid)[0] is True, (child.pid, child.poll())
-            e4 = dict(env, PATH=work_bin + os.pathsep + os.environ["PATH"], MK_PANE_PID=str(child.pid))
-            r = subprocess.run([sys.executable, __file__, "--lane", lane, "--agent", "w1",
-                                "--commit-grep", "nomatch", "--prompt-marker", "Read and follow brief-r3.md",
-                                "--poll", "0.1", "--stall-min", "0.02", "--max-wait-min", "0.05"],
-                               env=e4, capture_output=True, text=True)
-            out = json.loads(r.stdout.strip().splitlines()[-1])
-            assert out["state"] == "WATCH_EXPIRED", out  # child still running: STALL suppressed
         finally:
             child.kill()
             child.wait(timeout=5)
         assert child_progress(child.pid)[0] is False, child.pid
+
         # grace elapsed with the child: this watch is a fresh process (child_seen_until unset)
         r = subprocess.run([sys.executable, __file__, "--lane", lane, "--agent", "w1",
                             "--commit-grep", "nomatch", "--prompt-marker", "Read and follow brief-r3.md",
@@ -1132,13 +1181,25 @@ def self_test():
         out = json.loads(r.stdout.strip().splitlines()[-1])
         assert out["state"] == "STALL", out  # child gone, grace elapsed: pane-text STALL as before
 
+        # Load-proof windows (W1 addendum): these probes prove activity vs stall, not a
+        # wall-clock. A trivial python spawn is timed and the 0.02/0.06 minute windows are
+        # multiplied so a loaded machine (spawn of seconds) still gets several polls
+        # inside max-wait. The RATIO stays 0.06/0.02, so a stall still fires inside the
+        # window and a live pane still outlives it.
+        _t0 = time.time()
+        subprocess.run([sys.executable, "-c", "pass"], check=True)
+        _spawn = max(0.05, time.time() - _t0)
+        _scale = max(1.0, _spawn / 0.05)
+        _stall = f"{0.02 * _scale:.4f}"
+        _wait = f"{0.06 * _scale:.4f}"
+
         def probe(pane_txt, want, **extra):
             """One watch run against the working-agent fake; assert its exit state."""
             open(grow, "w").write(pane_txt)
             e3 = dict(env, PATH=work_bin + os.pathsep + os.environ["PATH"], **extra)
             r = subprocess.run([sys.executable, __file__, "--lane", lane, "--agent", "w1", "--commit-grep", "nomatch",
                                 "--prompt-marker", "Read and follow brief-r3.md", "--poll", "0.1",
-                                "--stall-min", "0.02", "--max-wait-min", "0.06"], env=e3, capture_output=True, text=True)
+                                "--stall-min", _stall, "--max-wait-min", _wait], env=e3, capture_output=True, text=True)
             out = json.loads(r.stdout.strip().splitlines()[-1])
             assert out["state"] == want, (pane_txt or extra, out)
 
@@ -1289,6 +1350,72 @@ def self_test():
         assert out["state"] == "DONE" and out["evidence"][-1] == "source=status", out
         assert "status file done (seq 3)" in out["evidence"], out
         os.unlink(os.path.join(lane, STATUS_FILE))
+
+        # W1: task round with the store on starts the new round non-terminal and clears verdict,
+        # in the tasks row the watcher reads (the file view is unchanged on purpose).
+        def w1row():
+            c = store_con(data)
+            try:
+                return dict(c.execute(
+                    "SELECT status, round, verdict FROM tasks WHERE run='r1' AND id='W1T'").fetchone())
+            finally:
+                c.close()
+        mks("task", "add", "--id", "W1T", "--title", "round reset")
+        mks("task", "set", "W1T", "status=done", "verdict=OLD")
+        mks("task", "round", "W1T", "--kind", "build")
+        got = w1row()
+        assert got["status"] == "planned" and got["verdict"] is None and got["round"] == 1, got
+        mks("task", "set", "W1T", "status=done", "verdict=OLD")
+        mks("task", "round", "W1T", "--kind", "fix")
+        got = w1row()
+        assert got["status"] == "fix" and got["verdict"] is None and got["round"] == 2, got
+        mks("task", "set", "W1T", "status=done", "verdict=OLD")
+        mks("task", "round", "W1T", "--kind", "takeover")
+        got = w1row()
+        assert got["status"] == "building" and got["verdict"] is None and got["round"] == 3, got
+        # a terminal row older than armed_at is the previous round's outcome: ignored
+        mks("task", "set", "W1T", "status=done", "verdict=OLD")
+        _c = store_con(data)
+        _upd = _c.execute("SELECT updated FROM tasks WHERE id='W1T'").fetchone()["updated"]
+        _c.close()
+        stale = store_status_row(data, {"run": "r1", "task": "W1T", "phase": "W1T R3",
+                                         "armed_at": _row_epoch(_upd) + 120, "data": data})
+        assert stale is None, dict(stale) if stale else stale
+        # a terminal row written after armed_at still decides
+        fresh = store_status_row(data, {"run": "r1", "task": "W1T", "phase": "W1T R3",
+                                         "armed_at": _row_epoch(_upd) - 5, "data": data})
+        assert fresh and fresh["status"] == "done", dict(fresh) if fresh else fresh
+
+        # W1: a store read failure is a named reason, never a silent None, and decide keeps watching
+        dbp = os.path.join(data, "mk.db")
+        os.rename(dbp, dbp + ".w1bak")
+        os.mkdir(dbp)
+        try:
+            err = store_status_row(data, {"run": "r1", "task": "W1T", "phase": "W1T R3", "data": data})
+            assert isinstance(err, dict) and str(err.get("store_error", "")).startswith("store_error") is False
+            assert "store_error" in err and err["store_error"], err
+            st_err = read_status(lane, {"run": "r1", "task": "W1T", "phase": "W1T R3",
+                                         "armed_at": 0, "data": data})
+            assert st_err["state"] == "store_error" and st_err["source"] == "status", st_err
+            quiet = {"state": "OK", "evidence": [], "agent_status": "idle", "last_change_min": 30}
+            dstate, dev = decide(quiet, "abc feat(p1): x", re.compile("feat"), True, "",
+                                 "W1T R3", 10, st_err, {"armed_at": 0})
+            assert dstate is None and dev[-1] == "source=status" and dev[0].startswith("store_error:"), dev
+        finally:
+            os.rmdir(dbp)
+            os.rename(dbp + ".w1bak", dbp)
+
+        # W1: the child-progress scale never exceeds 4
+        _hit, _scale = child_progress(os.getpid())
+        assert _scale <= CHILD_SCALE_CAP, _scale
+        # the cap itself, on an injected clock (no wall time, so load cannot flake it).
+        stall, mx = 15.0, 30 * 60.0
+        cap = max(stall * 60 * CHILD_SCALE_CAP, mx)
+        assert child_grace_end(0.0, 0.0, True, stall, 4.0, mx, cap - 1) is not None
+        assert child_grace_end(0.0, 0.0, True, stall, 100.0, mx, cap + 1) is None
+        assert child_grace_end(0.0, 100.0, False, stall, 4.0, mx, 100 + stall * 60 - 1) is not None
+        assert child_grace_end(0.0, 100.0, False, stall, 100.0, mx, 100 + stall * 60 * CHILD_SCALE_CAP + 1) is None
+        assert child_grace_end(0.0, None, False, stall, 1.0, mx, 0) is None
 
         # no flag and no yaml: the stall/max_wait defaults this script now uses are the schema's
         empty = os.path.join(tmp, "empty-data")
