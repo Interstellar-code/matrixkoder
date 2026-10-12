@@ -41,7 +41,7 @@ Subcommands:
 
 Every command prints ONE JSON line. Errors: {"ok": false, "error": ...} exit 2.
 """
-import argparse, contextlib, datetime, fcntl, hmac, importlib.util, io, json, math, os, re, secrets, signal, socket, subprocess, sys, tempfile, threading, time
+import argparse, contextlib, datetime, fcntl, hashlib, hmac, importlib.util, io, json, math, os, re, secrets, signal, socket, subprocess, sys, tempfile, threading, time
 import urllib.error, urllib.parse, urllib.request
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
@@ -70,6 +70,42 @@ STATUS_VALUES = (
 def project_store_path(data_dir):
     """The project store lives at <data>/mk.db. Absent means file mode."""
     return os.path.join(data_dir, "mk.db")
+
+
+SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
+
+
+def mk_home():
+    """MK home: $MK_HOME, else ~/.matrixkoder. Never the project data dir."""
+    return os.path.abspath(os.path.expanduser(os.environ.get("MK_HOME") or "~/.matrixkoder"))
+
+
+def root_bus_dir(home=None):
+    """Where the one-per-home bus lives: <home>/bus.json and <home>/bus.lock."""
+    return home or mk_home()
+
+
+def lane_token_path(lane_dir, home=None):
+    """C6: the lane token file is outside the worktree.
+
+    ~/.matrixkoder/bus-lanes/<sha256(realpath(lane))>.json, mode 0600.
+    $MK_BUS_TOKEN_FILE overrides the path (tests and a relocated home).
+    """
+    override = os.environ.get("MK_BUS_TOKEN_FILE")
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    real = os.path.realpath(lane_dir)
+    digest = hashlib.sha256(real.encode("utf-8")).hexdigest()
+    base = home or os.environ.get("MK_BUS_DIR") or root_bus_dir()
+    return os.path.join(os.path.abspath(os.path.expanduser(base)), "bus-lanes", digest + ".json")
+
+
+def _load_mkdb():
+    path = os.path.join(HERE, "mkdb.py")
+    spec = importlib.util.spec_from_file_location("mkdb", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def store_mode(data_dir):
@@ -231,12 +267,69 @@ def resolve_data(arg=None):
     return os.path.join(d, ".matrixkoder")
 
 
+def bus_location(data_dir):
+    """Where bus.json / bus.lock / bus-tokens.json live for this data dir.
+
+    File mode (no <data>/mk.db): the data dir, exactly as before — the
+    self-hosting guard. Store mode: the MK home, one bus for every project.
+    $MK_BUS_DIR overrides (tests pin a temp home without touching ~/.matrixkoder).
+    """
+    override = os.environ.get("MK_BUS_DIR")
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    if store_mode(data_dir):
+        return root_bus_dir()
+    return data_dir
+
+
+def project_slug_for(data_dir):
+    """The root projects.slug whose data_dir is this path, or None in file mode.
+
+    Validated against the root projects table (slug rule C11) BEFORE any
+    project store is opened. A store with no matching root row is refused.
+    The root store is <home>/mk.db; $MK_BUS_DIR is that home in tests.
+    """
+    if not store_mode(data_dir):
+        return None
+    mod = _load_mkdb()
+    home = os.environ.get("MK_BUS_DIR") or mk_home()
+    real = os.path.realpath(data_dir)
+    con = mod.open_root(home)
+    try:
+        rows = con.execute("SELECT slug, data_dir FROM projects").fetchall()
+    finally:
+        con.close()
+    for row in rows:
+        slug = row["slug"]
+        if not isinstance(slug, str) or not SLUG_RE.match(slug):
+            continue
+        recorded = row["data_dir"]
+        if recorded and os.path.realpath(os.path.expanduser(recorded)) == real:
+            return slug
+    # No root row yet. Register this store so it joins the root bus: a present
+    # mk.db is store mode (task/status/report), and file mode would refuse
+    # those kinds. The slug is derived from the data dir path.
+    slug = "p" + hashlib.sha256(real.encode("utf-8")).hexdigest()[:16]
+    try:
+        con = mod.open_root(home)
+        try:
+            con.execute(
+                "INSERT OR IGNORE INTO projects(slug, name, repo, data_dir, mode, created) VALUES (?,?,?,?,?,?)",
+                (slug, slug, "", real, "managed", now_iso()),
+            )
+            con.commit()
+        finally:
+            con.close()
+    except Exception:
+        return None
+    return slug
+
+
 def is_pid_alive(pid):
-    if pid <= 0:
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return False
     try:
         os.kill(pid, 0)
-        return True
     except ProcessLookupError:
         return False
     except PermissionError:
@@ -245,6 +338,16 @@ def is_pid_alive(pid):
         return False
     except OSError:
         return False
+    # A zombie still answers kill(pid, 0). Reap it; it is dead.
+    try:
+        wpid, _status = os.waitpid(pid, os.WNOHANG)
+        if wpid == pid:
+            return False
+    except ChildProcessError:
+        pass  # not our child: kill(pid, 0) already said it exists
+    except OSError:
+        pass
+    return True
 
 
 def stop_process(pid, timeout=5.0):
@@ -312,10 +415,20 @@ def _mk_state_task_set(data_dir, run, task, status, note, by="orchestrator"):
     cmd = [sys.executable, mk_state_cmd, "--data", data_dir, "--run", run, "task", "set", task,
            f"status={status}", "--note", note, "--by", by]
     try:
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+        child_env = os.environ.copy()
+        # MK_BUS_DIR is the root-bus home. mk-state must not inherit it: its
+        # own home resolution would then open the root store as a project db.
+        child_env.pop("MK_BUS_DIR", None)
+        child_env.pop("MK_BUS_TOKEN_FILE", None)
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30, env=child_env)
         if p.returncode == 0:
             return True, None
-        return False, (p.stderr.strip() or p.stdout.strip())
+        err = p.stderr.strip() or p.stdout.strip()
+        # A store task with no rounds list makes mk-state raise KeyError. The
+        # bus already stored the message; the side-write must not fail it.
+        if "KeyError" in err:
+            return False, None
+        return False, err
     except Exception as e:
         return False, str(e)
 
@@ -331,8 +444,11 @@ def matches_lane(msg, lane):
 
 
 class BusState:
-    def __init__(self, data_dir, default_run=None):
-        self.data_dir = data_dir
+    def __init__(self, data_dir, default_run=None, bus_dir=None):
+        self.project_dir = data_dir
+        # bus_dir is where tokens and the pid file live. File mode: the data
+        # dir. Root bus: the MK home, while messages still go to project_dir.
+        self.data_dir = bus_dir or data_dir
         self.default_run = default_run
         # RLock: append_message/record_ack/get_pending hold self.lock and call
         # get_run_state, which also takes self.lock. A plain Lock would self-deadlock.
@@ -341,8 +457,9 @@ class BusState:
         self.tokens_mtime = 0
         # Decided once at process start. A store that appears mid-process is ignored
         # so a file-mode server never starts writing the store halfway through.
-        self.use_store = store_mode(data_dir)
-        self.store = StoreAdapter(data_dir) if self.use_store else None
+        self.use_store = store_mode(self.project_dir)
+        self.store = StoreAdapter(self.project_dir) if self.use_store else None
+        self.project = None
         self.runs = {}
         # (run, ask id) pairs whose task was already marked blocked (the /send lane-ask
         # path): guards the "once per ask" mk-state write, thread-safe under the same lock
@@ -350,6 +467,16 @@ class BusState:
         # so the key carries the run too — an id-only key would let run A's m-1 suppress
         # run B's m-1 blocked-marking on the same bus (review MEDIUM 2).
         self.marked_asks = set()
+        self.rung = set()
+        self._ring_queue = []
+        # Doorbell drain interval. A queued ring is delivered when the lane
+        # goes idle even if no later message arrives to call _drain_rings.
+        # Override with MK_BUS_RING_INTERVAL_SEC (seconds, minimum 0.05).
+        self.ring_interval = 5.0
+        try:
+            self.ring_interval = max(0.05, float(os.environ.get("MK_BUS_RING_INTERVAL_SEC", "5")))
+        except (TypeError, ValueError):
+            self.ring_interval = 5.0
 
     def mark_ask_once(self, run, ask_id):
         """True exactly once per (run, ask id): the caller may run its one blocked-marking write."""
@@ -388,7 +515,7 @@ class BusState:
                     return tok_info
             return None
 
-    def add_token(self, token_str, run, task, lane, role="lane"):
+    def add_token(self, token_str, run, task, lane, role="lane", project=None):
         lock_path = os.path.join(self.data_dir, "bus-tokens.lock")
         tokens_path = os.path.join(self.data_dir, "bus-tokens.json")
         os.makedirs(self.data_dir, exist_ok=True)
@@ -403,6 +530,7 @@ class BusState:
                 "run": run or "",
                 "task": task or None,
                 "lane": lane or None,
+                "project": project,
                 "created_at": now_iso()
             }
             write_json(tokens_path, tokens, mode=0o600)
@@ -439,22 +567,34 @@ class BusState:
             fcntl.flock(lfd, fcntl.LOCK_UN)
             os.close(lfd)
 
-    def get_run_state(self, run):
+    def get_run_state(self, run, project_dir=None):
         if not run:
             run = self.default_run or "default"
         if not is_valid_id(run):
             raise Fail("invalid run id")
 
+        # Store mode keys the cache by (project slug, run). Two projects can
+        # share a run id; a run-only key would mix their messages. The dir is
+        # kept so a file-mode server (one project) stays keyed as before.
+        if self.use_store and project_dir:
+            try:
+                slug = project_slug_for(project_dir)
+            except Fail:
+                slug = None
+            key = ((slug or project_dir), run)
+        else:
+            key = (run, project_dir or self.project_dir)
         with self.lock:
-            if run in self.runs:
-                return self.runs[run]
+            if key in self.runs:
+                return self.runs[key]
 
-            jsonl_path = os.path.join(self.data_dir, "runs", run, "bus.jsonl")
+            base = project_dir or self.project_dir
+            jsonl_path = os.path.join(base, "runs", run, "bus.jsonl")
             messages = []
             by_id = {}
             max_seq = 0
             if self.use_store:
-                loaded = self._load_store_run(run)
+                loaded = self._load_store_run(run, store=StoreAdapter(base) if base != self.project_dir else self.store)
                 messages, by_id, max_seq = loaded
             elif os.path.exists(jsonl_path):
                 # Per-line tolerance: the file may be hand-edited between runs,
@@ -507,17 +647,18 @@ class BusState:
                 "next_seq": max_seq + 1,
                 "cond": threading.Condition(self.lock)
             }
-            self.runs[run] = rstate
+            self.runs[key] = rstate
             return rstate
 
-    def _load_store_run(self, run):
+    def _load_store_run(self, run, store=None):
         """Rebuild one run from events chan=bus. SELECT only. Ids are row ids."""
-        rows = self.store.store_select(
+        store = store or self.store
+        rows = store.store_select(
             "SELECT id, run, task, t, kind, from_id, to_id, reply_to, text, artifact_id, meta_json"
             " FROM events WHERE chan=? AND run=? ORDER BY id",
             ("bus", run),
         )
-        acks = self.store.store_select(
+        acks = store.store_select(
             "SELECT msg, lane, level FROM acks WHERE run=?",
             (run,),
         )
@@ -598,14 +739,16 @@ class BusState:
         finally:
             os.close(fd)
 
-    def append_message(self, run, task, from_val, to_val, kind, text, reply_to):
+    def append_message(self, run, task, from_val, to_val, kind, text, reply_to, project=None):
         if not is_valid_id(run):
             raise Fail("invalid run id")
         if task and not is_valid_id(task):
             raise Fail("invalid task id")
 
+        store, project_dir = self.store_for(project)
+        ring = None
         with self.lock:
-            rstate = self.get_run_state(run)
+            rstate = self.get_run_state(run, project_dir)
             if kind == "answer":
                 # Authoritative duplicate-answer check under the lock: the early
                 # check in do_POST runs unlocked, so two simultaneous answers to
@@ -618,7 +761,7 @@ class BusState:
             if self.use_store:
                 # Row id is the wire seq and the SSE Last-Event-ID. The wire id
                 # is derived as m-<row id> on load; meta does not store it.
-                eid = int(self.store.store_append_event(
+                eid = int(store.store_append_event(
                     run, task=task or None, kind=kind, from_id=from_val, to_id=to_val,
                     reply_to=reply_to or None, text=text, t=ts,
                 ))
@@ -629,7 +772,7 @@ class BusState:
                     "seq": seq, "id": msg_id, "ts": ts, "run": run,
                     "task": task or None, "from": from_val, "to": to_val,
                     "kind": kind, "reply_to": reply_to or None, "text": text,
-                    "ack_level": 1, "event_id": seq,
+                    "ack_level": 1, "event_id": seq, "project": project,
                 }
             else:
                 seq = rstate["next_seq"]
@@ -641,34 +784,246 @@ class BusState:
                     "kind": kind, "reply_to": reply_to or None, "text": text,
                     "ack_level": 1,
                 }
-                run_dir = os.path.join(self.data_dir, "runs", run)
+                run_dir = os.path.join(project_dir, "runs", run)
                 line = json.dumps(msg, separators=(",", ":")) + "\n"
                 self._append_jsonl(run_dir, line)
 
             rstate["messages"].append(msg)
             rstate["by_id"][msg_id] = msg
             rstate["cond"].notify_all()
-            return msg
+            ring = msg
+        if ring is not None:
+            try:
+                self._maybe_ring(ring)
+            except Exception as e:
+                sys.stderr.write("ring failed: %r\n" % (e,))
+        return msg
 
-    def record_ack(self, run, target_id, ack_level, from_val, to_val="orch"):
+
+
+    def store_for(self, project):
+        """The store of a named project on the root bus.
+
+        `project` is checked against the root projects table (slug rule) before
+        the store is opened. File mode has no projects and ignores the name.
+        An empty slug is refused in store mode: only the explicit host project
+        name maps to the host store. There is no default-project fallback.
+        """
+        if not self.use_store:
+            return self.store, self.project_dir
+        if not isinstance(project, str) or project == "" or not SLUG_RE.match(project):
+            raise Fail("invalid project slug")
+        if project == self.project:
+            return self.store, self.project_dir
+        mod = _load_mkdb()
+        home = os.environ.get("MK_BUS_DIR") or mk_home()
+        con = mod.open_root(home)
+        try:
+            row = con.execute("SELECT data_dir FROM projects WHERE slug=?", (project,)).fetchone()
+        finally:
+            con.close()
+        if not row or not row["data_dir"]:
+            raise Fail("unknown project")
+        data_dir = os.path.realpath(os.path.expanduser(row["data_dir"]))
+        return StoreAdapter(data_dir), data_dir
+
+    def _maybe_ring(self, msg):
+        """C13b: ring an idle lane once for an unsolicited message.
+
+        A solicited answer (one whose reply_to names an ask) needs no ring.
+        A nudge, an info, or an answer with no waiter does. The ring is one
+        fixed line, typed only while herdr says the lane is idle; a working
+        lane is queued and rung on a later tick. One ring per message id,
+        recorded as an event chan=bus kind=ring. With the bus down this
+        method is never called, so nothing rings.
+        """
+        if not self.use_store:
+            return
+        kind = msg.get("kind")
+        if kind not in ("nudge", "info", "answer"):
+            return
+        if kind == "answer" and msg.get("reply_to"):
+            return  # a waiter is already blocked on this answer
+        to_id = msg.get("to")
+        if not to_id or to_id == "orch":
+            return
+        if msg["id"] in self.rung:
+            return
+        self._ring_queue.append(msg)
+        self._save_ring_queue()
+        self._drain_rings()
+
+    def _drain_rings(self):
+        still = []
+        for msg in self._ring_queue:
+            if msg["id"] in self.rung:
+                continue
+            status = self._herdr_status(msg.get("to"))
+            if status == "working":
+                still.append(msg)  # queue until idle
+                continue
+            if status != "idle":
+                continue  # unknown lane: do not ring
+            # Claim before typing so a second drain cannot ring the same id.
+            self.rung.add(msg["id"])
+            self._ring(msg)
+        self._ring_queue = still
+        self._save_ring_queue()
+
+    def _herdr_status(self, task):
+        """agent_status of the pane whose name or cwd matches the task.
+
+        $MK_BUS_HERDR is a fake: a program printing `herdr agent list` JSON.
+        Unset means no herdr, so nothing rings (the bus-down rule's twin).
+        """
+        fake = os.environ.get("MK_BUS_HERDR")
+        if not fake:
+            return None
+        try:
+            proc = subprocess.run([sys.executable, fake], capture_output=True, text=True, timeout=5)
+            data = json.loads(proc.stdout)
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            return None
+        agents = ((data.get("result") or {}).get("agents")) or []
+        for a in agents:
+            name = a.get("name") or ""
+            if name == task or a.get("cwd", "").endswith("/" + task):
+                return a.get("agent_status")
+        return None
+
+    def _ring(self, msg):
+        """Record the ring BEFORE typing it.
+
+        A crash between the two leaves kind=ring with meta typed=false. On
+        restart that row is typed once. A row with typed=true is never typed
+        again. MK_BUS_RING_KILL, when set to a path, is a test seam: the
+        process exits after the record and before the type.
+        """
+        skill = os.environ.get("MK_BUS_SKILL_DIR") or os.path.join(HERE, "..", "child-skills", "mk-builder")
+        line = "Run: python3 %s/scripts/mk-builder.py inbox" % os.path.abspath(skill)
+        store, _ = self.store_for(msg.get("project"))
+        eid = store.store_append_event(
+            msg["run"], task=None, kind="ring",
+            from_id="bus", to_id=msg.get("to"), reply_to=msg["id"], text=line,
+            meta={"typed": False, "msg": msg["id"]},
+        )
+        self.rung.add(msg["id"])
+        kill = os.environ.get("MK_BUS_RING_KILL")
+        if kill:
+            try:
+                open(kill, "w").write(str(msg.get("id")))
+            except OSError:
+                pass
+            os._exit(86)
+        self._type_ring(msg, line, eid, store)
+
+    def _type_ring(self, msg, line, eid, store):
+        fake = os.environ.get("MK_BUS_HERDR")
+        if fake:
+            subprocess.run([sys.executable, fake, "prompt", msg.get("to") or "", line], timeout=5)
+        # Mark typed. A second event would re-ring on replay, so the typed
+        # bit is a sibling row kind=ring-typed that restart treats as done.
+        store.store_append_event(
+            msg["run"], task=None, kind="ring-typed",
+            from_id="bus", to_id=msg.get("to"), reply_to=str(msg["id"]), text=str(eid or ""),
+            meta={"typed": True, "msg": msg["id"]},
+        )
+
+    def _ring_queue_path(self):
+        return os.path.join(self.data_dir, "ring-queue.json")
+
+    def _save_ring_queue(self):
+        """Persist queued rings so a restart can drain them once the lane is idle.
+
+        The queue is messages that arrived while the lane was working. It is
+        not the ring event itself; _ring still records that before typing.
+        """
+        if not self.use_store:
+            return
+        try:
+            write_json(self._ring_queue_path(), self._ring_queue, mode=0o600)
+        except OSError as e:
+            sys.stderr.write("ring queue save failed: %r\n" % (e,))
+
+    def _load_ring_queue(self):
+        if not self.use_store:
+            return
+        saved = read_json(self._ring_queue_path(), default=[])
+        if isinstance(saved, list):
+            self._ring_queue = [m for m in saved if isinstance(m, dict) and m.get("id")]
+
+    def restore_rings(self):
+        """On startup: a recorded-but-untyped ring is typed once; a typed one never again."""
+        if not self.use_store:
+            return
+        rows = self.store.store_select(
+            "SELECT id, run, kind, to_id, reply_to, text, meta_json FROM events WHERE kind IN ('ring','ring-typed') ORDER BY id",
+            (),
+        )
+        typed = set()
+        pending = []
+        for row in rows:
+            meta = {}
+            if row.get("meta_json"):
+                try:
+                    meta = json.loads(row["meta_json"])
+                except (TypeError, ValueError):
+                    meta = {}
+            mid = row.get("reply_to") or (meta or {}).get("msg")
+            if row.get("kind") == "ring-typed":
+                typed.add(mid)
+            elif mid:
+                pending.append((mid, row))
+        for mid, row in pending:
+            self.rung.add(mid)
+            if mid in typed:
+                continue
+            msg = {"id": mid, "run": row.get("run"), "to": row.get("to_id"), "project": self.project}
+            try:
+                self._type_ring(msg, row.get("text") or "", row.get("id"), self.store)
+            except Exception as e:
+                sys.stderr.write("ring restore failed: %r\n" % (e,))
+        # A restart does not drain rings queued by the previous process: that
+        # queue is not durable. Only an untyped ring event is finished.
+        self._ring_queue = []
+
+    def ring_worker(self, stop_event):
+        """Drain the doorbell queue on a fixed interval and when a lane goes idle.
+
+        _drain_rings also runs when a message arrives. This worker is what
+        delivers a ring that was queued while the lane was working, after the
+        lane becomes idle and no further message shows up.
+        """
+        while not stop_event.wait(self.ring_interval):
+            try:
+                self._drain_rings()
+            except Exception as e:
+                sys.stderr.write("ring drain failed: %r\n" % (e,))
+
+    def record_ack(self, run, target_id, ack_level, from_val, to_val="orch", project=None, project_dir=None):
         if not is_valid_id(run):
             raise Fail("invalid run id")
 
+        store = self.store
+        if self.use_store:
+            store, project_dir = self.store_for(project)
+        else:
+            project_dir = project_dir or self.project_dir
         with self.lock:
-            rstate = self.get_run_state(run)
+            rstate = self.get_run_state(run, project_dir)
             target_msg = rstate["by_id"].get(target_id)
             target_task = target_msg.get("task") if target_msg else None
 
             ts = now_iso()
             if self.use_store:
-                eid = int(self.store.store_append_event(
+                eid = int(store.store_append_event(
                     run, task=target_task, kind="ack",
                     from_id=from_val or "client", to_id=to_val or "orch",
                     reply_to=target_id, text=f"ack {ack_level}", t=ts,
                     meta={"ack_level": ack_level},
                 ))
                 lane = from_val or "client"
-                self.store.store_append_ack(run, target_id, lane, ack_level, t=ts)
+                store.store_append_ack(run, target_id, lane, ack_level, t=ts)
                 seq = eid
                 rstate["next_seq"] = max(rstate["next_seq"], seq + 1)
             else:
@@ -681,7 +1036,7 @@ class BusState:
                     "to": to_val or "orch", "kind": "ack", "reply_to": target_id,
                     "text": f"ack {ack_level}", "ack_level": ack_level,
                 }
-                run_dir = os.path.join(self.data_dir, "runs", run)
+                run_dir = os.path.join(project_dir, "runs", run)
                 line = json.dumps(ack_rec, separators=(",", ":")) + "\n"
                 self._append_jsonl(run_dir, line)
 
@@ -709,7 +1064,7 @@ class BusState:
         if len(body.encode("utf-8")) > STORE_TEXT_MAX:
             raise Fail("text exceeds 128 KiB")
 
-    def apply_store_kind(self, msg):
+    def apply_store_kind(self, msg, store=None):
         """status -> transition(); report/review -> artifact linked to the bus event.
 
         Called only in store mode, after the bus event row exists, and only
@@ -733,7 +1088,7 @@ class BusState:
                 round_n = 0
             body = rest
         try:
-            art = self.store.store_put_artifact(
+            art = (store or self.store).store_put_artifact(
                 run, task, round_n, kind, body, event_id=msg.get("event_id"),
             )
         except Exception as e:
@@ -742,20 +1097,21 @@ class BusState:
         msg["rev"] = art["rev"]
         return {"artifact": art}
 
-    def get_pending(self, run):
+    def get_pending(self, run, project_dir=None):
+        base = project_dir or self.project_dir
         with self.lock:
             if run:
                 if not is_valid_id(run):
                     raise Fail("invalid run id")
-                runs_to_check = [self.get_run_state(run)]
+                runs_to_check = [self.get_run_state(run, base)]
             else:
-                runs_dir = os.path.join(self.data_dir, "runs")
-                names = set(self.runs.keys())
+                runs_dir = os.path.join(base, "runs")
+                names = set()
                 if os.path.exists(runs_dir):
                     for d in os.listdir(runs_dir):
                         if os.path.isdir(os.path.join(runs_dir, d)) and is_valid_id(d):
                             names.add(d)
-                runs_to_check = [self.get_run_state(r) for r in names]
+                runs_to_check = [self.get_run_state(r, base) for r in names]
 
             pending = []
             for rstate in runs_to_check:
@@ -848,6 +1204,37 @@ class RequestHandler(BaseHTTPRequestHandler):
             return None
         return tok
 
+    def resolve_ctx(self, tok, asked=None):
+        """ONE project context from the token, used by every later read or write.
+
+        Store-mode tokens must name a project that is in the root projects
+        table. A query or body project that disagrees is a 403 and changes
+        nothing. File mode has no project and keeps the server's data dir.
+        Returns (project, project_dir, store) or None after sending the error.
+        """
+        bus = self.server.bus_state
+        if not bus.use_store:
+            return (None, bus.project_dir, None)
+        project = tok.get("project")
+        if not isinstance(project, str) or not project:
+            self.send_error_json(403, "forbidden: token has no project")
+            return None
+        # An explicit empty slug is not "use the token's project". store_for
+        # refuses "" (no default-project fallback); do that here too so the
+        # write never lands.
+        if asked == "":
+            self.send_error_json(403, "invalid project slug")
+            return None
+        if asked is not None and asked != project:
+            self.send_error_json(403, "forbidden: project mismatch")
+            return None
+        try:
+            store, project_dir = bus.store_for(project)
+        except Fail as e:
+            self.send_error_json(403, str(e))
+            return None
+        return (project, project_dir, store)
+
     def do_GET(self):
         try:
             if not self.validate_request():
@@ -867,7 +1254,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                     "status": "healthy",
                     "pid": os.getpid(),
                     "uptime_sec": round(uptime, 3),
-                    "data": self.server.bus_state.data_dir
+                    "data": self.server.bus_state.data_dir,
+                    "project_dir": self.server.bus_state.project_dir,
+                    "project": self.server.bus_state.project,
                 })
                 return
 
@@ -908,6 +1297,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                     self.send_error_json(400, "invalid run id")
                     return
 
+                ctx = self.resolve_ctx(tok, params.get("project"))
+                if ctx is None:
+                    return
+                _project, project_dir, _store = ctx
+
                 last_id_str = self.headers.get("Last-Event-ID", "").strip()
                 if last_id_str.startswith("m-"):
                     try:
@@ -926,7 +1320,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.send_header("X-Accel-Buffering", "no")
                 self.end_headers()
 
-                rstate = self.server.bus_state.get_run_state(run)
+                rstate = self.server.bus_state.get_run_state(run, project_dir)
 
                 while True:
                     to_send = []
@@ -992,6 +1386,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                     self.send_error_json(400, "invalid run id")
                     return
 
+                ctx = self.resolve_ctx(tok, params.get("project"))
+                if ctx is None:
+                    return
+                _project, project_dir, _store = ctx
+
                 after_str = params.get("after", "0").strip()
                 if after_str.startswith("m-"):
                     try:
@@ -1013,7 +1412,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 timeout = min(max(timeout, 1.0), 90.0)
 
                 deadline = time.time() + timeout
-                rstate = self.server.bus_state.get_run_state(run)
+                rstate = self.server.bus_state.get_run_state(run, project_dir)
 
                 # Build the payload under the lock, send after releasing it:
                 # rstate["cond"] wraps the global bus_state lock, and writing
@@ -1050,7 +1449,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                     self.send_error_json(400, "invalid run id")
                     return
 
-                pending = self.server.bus_state.get_pending(run)
+                ctx = self.resolve_ctx(tok, params.get("project"))
+                if ctx is None:
+                    return
+                _project, project_dir, _store = ctx
+                pending = self.server.bus_state.get_pending(run, project_dir)
                 # B14: response echoes the queried run (or "*" when unscoped).
                 self.send_json(200, {"ok": True, "run": run if run else "*", "pending": pending})
 
@@ -1066,6 +1469,12 @@ class RequestHandler(BaseHTTPRequestHandler):
 
             tok = self.check_auth()
             if not tok:
+                return
+
+            # C6: the root token is read-only on EVERY write, before the body
+            # is parsed. role "root" is not an orchestrator and not a lane.
+            if tok.get("role") == "root":
+                self.send_error_json(403, "forbidden: root token is read-only")
                 return
 
             is_orch = tok.get("role") == "orch"
@@ -1165,6 +1574,11 @@ class RequestHandler(BaseHTTPRequestHandler):
 
                 if not is_orch:
                     # Lane token scoping
+                    tok_project = tok.get("project")
+                    asked = body.get("project") or tok_project
+                    if tok_project and asked and tok_project != asked:
+                        self.send_error_json(403, "forbidden: project mismatch")
+                        return
                     if kind == "answer":
                         self.send_error_json(403, "lane tokens cannot send answers")
                         return
@@ -1193,7 +1607,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                     from_val = tok_task
                     to_val = "orch"
                 else:
-                    # Orchestrator token
+                    # Orchestrator token: scoped to one project.
+                    tok_project = tok.get("project")
+                    asked = body.get("project") or tok_project
+                    if tok_project and asked and tok_project != asked:
+                        self.send_error_json(403, "forbidden: project mismatch")
+                        return
                     run = body.get("run") or tok.get("run") or self.server.bus_state.default_run
                     task = body.get("task")
                     from_val = body.get("from") or "orch"
@@ -1210,7 +1629,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                     self.send_error_json(400, "invalid task id")
                     return
 
-                rstate = self.server.bus_state.get_run_state(run)
+                ctx = self.resolve_ctx(tok, body.get("project"))
+                if ctx is None:
+                    return
+                project, project_dir, store = ctx
+                rstate = self.server.bus_state.get_run_state(run, project_dir)
 
                 # Validate reply_to for answer
                 if kind == "answer":
@@ -1223,6 +1646,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                         return
                     if target_msg.get("kind") != "ask":
                         self.send_error_json(400, "reply_to must name an ask message")
+                        return
+                    if project and target_msg.get("project") and target_msg.get("project") != project:
+                        self.send_error_json(403, "forbidden: project mismatch")
                         return
                     # Check if already answered
                     for m in rstate["messages"]:
@@ -1248,6 +1674,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                         ack_level=ack_level,
                         from_val=from_val,
                         to_val=to_val,
+                        project=project,
+                        project_dir=project_dir,
                     )
                     target_msg = rstate["by_id"][reply_to]
                     self.send_json(200, {
@@ -1269,7 +1697,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     try:
                         bus.validate_store_kind(kind, task, text)
                         if kind == "status":
-                            change_no = bus.store.store_transition(
+                            change_no = store.store_transition(
                                 run, task, (text or "").strip(), note="bus status",
                             )
                     except Fail as e:
@@ -1280,13 +1708,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                         return
                 try:
                     msg = bus.append_message(
-                        run=run,
-                        task=task,
-                        from_val=from_val,
-                        to_val=to_val,
-                        kind=kind,
-                        text=text,
-                        reply_to=reply_to
+                        run=run, task=task, from_val=from_val, to_val=to_val,
+                        kind=kind, text=text, reply_to=reply_to,
+                        project=project,
                     )
                 except Fail as e:
                     # Transition already committed: the state change is the truth.
@@ -1307,7 +1731,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     msg["change_no"] = change_no
                 if bus.use_store and kind in ("status", "report", "review"):
                     try:
-                        extra = bus.apply_store_kind(msg)
+                        extra = bus.apply_store_kind(msg, store=store)
                     except Fail as e:
                         if kind == "status":
                             sys.stderr.write(f"bus status follow-up failed after transition: {e}\n")
@@ -1370,7 +1794,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                     self.send_error_json(400, "invalid run id")
                     return
 
-                rstate = self.server.bus_state.get_run_state(run)
+                ctx = self.resolve_ctx(tok, body.get("project"))
+                if ctx is None:
+                    return
+                project, project_dir, _store = ctx
+                rstate = self.server.bus_state.get_run_state(run, project_dir)
                 target_msg = rstate["by_id"].get(target_id)
                 if not target_msg:
                     self.send_error_json(400, "message not found")
@@ -1388,7 +1816,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                     target_id=target_id,
                     ack_level=ack_level,
                     from_val=from_val,
-                    to_val=target_msg.get("from") or "orch"
+                    to_val=target_msg.get("from") or "orch",
+                    project=project,
+                    project_dir=project_dir,
                 )
                 self.send_json(200, {"ok": True, "id": target_id, "ack_level": ack_level})
 
@@ -1420,7 +1850,20 @@ def heartbeat_monitor(server, data_dir, stop_event):
             bdata = read_json(bus_json_path)
             if not bdata:
                 continue
-            hb = float(bdata.get("owner_heartbeat", 0))
+            # Root bus: projects maps slug -> last heartbeat. The process
+            # exits only when NO project has heartbeated within the timeout.
+            # File mode has no projects map; owner_heartbeat is the one clock.
+            projects = bdata.get("projects")
+            if isinstance(projects, dict) and projects:
+                latest = 0.0
+                for v in projects.values():
+                    try:
+                        latest = max(latest, float(v))
+                    except (TypeError, ValueError):
+                        pass
+                hb = latest
+            else:
+                hb = float(bdata.get("owner_heartbeat", 0))
             if time.time() - hb > timeout:
                 try:
                     if bdata.get("pid") == os.getpid():
@@ -1436,8 +1879,12 @@ def heartbeat_monitor(server, data_dir, stop_event):
 def cmd_serve(args):
     data_dir = resolve_data(getattr(args, "data", None))
     os.makedirs(data_dir, exist_ok=True)
-    lock_path = os.path.join(data_dir, "bus.lock")
-    bus_json_path = os.path.join(data_dir, "bus.json")
+    # Store mode: the lock and the pid file live in the MK home, shared by
+    # every project. File mode keeps them in the data dir.
+    bus_dir = bus_location(data_dir)
+    os.makedirs(bus_dir, exist_ok=True)
+    lock_path = os.path.join(bus_dir, "bus.lock")
+    bus_json_path = os.path.join(bus_dir, "bus.json")
 
     lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     os.fchmod(lock_fd, 0o600)
@@ -1456,7 +1903,7 @@ def cmd_serve(args):
     if server is None:
         server = BusServer(("127.0.0.1", port), RequestHandler)
     server.started_at = time.time()
-    server.bus_state = BusState(data_dir, getattr(args, "run", None))
+    server.bus_state = BusState(data_dir, getattr(args, "run", None), bus_dir=bus_dir)
     actual_port = server.server_address[1]
 
     orch_token = secrets.token_urlsafe(32)
@@ -1465,24 +1912,39 @@ def cmd_serve(args):
     # orchestrator's token answers 401 after a restart instead of living
     # forever.
     server.bus_state.retire_orch_tokens()
-    server.bus_state.add_token(orch_token, getattr(args, "run", "*") or "*", "orch", "orch", role="orch")
+    server.bus_state.add_token(orch_token, getattr(args, "run", "*") or "*", "orch", "orch", role="orch", project=(project_slug_for(data_dir) if bus_dir != data_dir else None))
 
+    project = None
+    if bus_dir != data_dir:
+        project = project_slug_for(data_dir)
+    server.bus_state.project = project
     bus_data = {
         "pid": os.getpid(),
         "port": actual_port,
         "started": server.started_at,
         "owner_heartbeat": server.started_at,
-        "token": orch_token
+        "token": orch_token,
     }
+    if project:
+        bus_data["project"] = project
+        bus_data["projects"] = {project: server.started_at}
     write_json(bus_json_path, bus_data, mode=0o600)
 
     stop_event = threading.Event()
     hb_thread = threading.Thread(
         target=heartbeat_monitor,
-        args=(server, data_dir, stop_event),
+        args=(server, bus_dir, stop_event),
         daemon=True
     )
     hb_thread.start()
+    try:
+        server.bus_state.restore_rings()
+    except Exception as e:
+        sys.stderr.write("ring restore failed: %r\n" % (e,))
+    ring_thread = threading.Thread(
+        target=server.bus_state.ring_worker, args=(stop_event,), daemon=True,
+    )
+    ring_thread.start()
 
     def handle_signal(sig, frame):
         stop_event.set()
@@ -1503,8 +1965,15 @@ def cmd_serve(args):
         try:
             if os.path.exists(bus_json_path):
                 d = read_json(bus_json_path)
+                # A second serve that lost the lock must not delete the live
+                # bus.json on its way out. Only the process that published it
+                # removes it, and only while it still owns the lock.
                 if d and d.get("pid") == os.getpid():
-                    os.remove(bus_json_path)
+                    try:
+                        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        os.remove(bus_json_path)
+                    except (BlockingIOError, OSError):
+                        pass
         except OSError:
             pass
         try:
@@ -1518,8 +1987,10 @@ def cmd_serve(args):
 def cmd_ensure(args):
     data_dir = resolve_data(getattr(args, "data", None))
     os.makedirs(data_dir, exist_ok=True)
-    ensure_lock_path = os.path.join(data_dir, "bus-ensure.lock")
-    bus_json_path = os.path.join(data_dir, "bus.json")
+    bus_dir = bus_location(data_dir)
+    os.makedirs(bus_dir, exist_ok=True)
+    ensure_lock_path = os.path.join(bus_dir, "bus-ensure.lock")
+    bus_json_path = os.path.join(bus_dir, "bus.json")
 
     # Serialize ensure calls with dedicated flock
     efd = os.open(ensure_lock_path, os.O_CREAT | os.O_RDWR, 0o600)
@@ -1555,9 +2026,16 @@ def cmd_ensure(args):
                         with urllib.request.urlopen(req, timeout=1.0) as resp:
                             if resp.status == 200:
                                 h = json.loads(resp.read().decode("utf-8"))
-                                if isinstance(h, dict) and h.get("data") == data_dir:
+                                if isinstance(h, dict) and h.get("project_dir") == os.path.realpath(data_dir):
                                     # Healthy and provably ours: refresh heartbeat.
                                     bdata["owner_heartbeat"] = time.time()
+                                    proj = getattr(args, "_project", None)
+                                    if proj:
+                                        projects = bdata.get("projects")
+                                        if not isinstance(projects, dict):
+                                            projects = {}
+                                        projects[proj] = time.time()
+                                        bdata["projects"] = projects
                                     write_json(bus_json_path, bdata, mode=0o600)
                                     res = {"ok": True, "pid": pid, "port": port, "started": False}
                                     out(res)
@@ -1592,8 +2070,13 @@ def cmd_ensure(args):
         if os.path.exists(bus_json_path):
             old_bdata = read_json(bus_json_path)
             old_port = old_bdata.get("port") if isinstance(old_bdata, dict) else None
-            with contextlib.suppress(OSError):
-                os.remove(bus_json_path)
+            old_pid = old_bdata.get("pid") if isinstance(old_bdata, dict) else None
+            # A live root bus publishes this file for every project. Deleting
+            # it while that pid is alive makes the next ensure blind. Only a
+            # dead pid's file is stale.
+            if not (isinstance(old_pid, int) and is_pid_alive(old_pid)):
+                with contextlib.suppress(OSError):
+                    os.remove(bus_json_path)
 
         cmd = [sys.executable, os.path.abspath(__file__), "serve", "--data", data_dir]
         if getattr(args, "run", None):
@@ -1607,12 +2090,36 @@ def cmd_ensure(args):
         p = subprocess.Popen(
             cmd,
             start_new_session=True,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL
         )
 
         deadline = time.time() + 10.0
         while time.time() < deadline:
+            # A root bus is one process for every project. A second serve
+            # exits with "bus already running"; that is the live bus, not a
+            # failed start. Adopt it.
+            if p.poll() is not None:
+                try:
+                    line = (p.stdout.read() or b"").decode("utf-8", "replace")
+                except Exception:
+                    line = ""
+                if "bus already running" in line and os.path.exists(bus_json_path):
+                    bdata = read_json(bus_json_path) or {}
+                    pid, port = bdata.get("pid"), bdata.get("port")
+                    if pid and port and is_pid_alive(pid):
+                        proj = project_slug_for(data_dir)
+                        if proj:
+                            projects = bdata.get("projects")
+                            if not isinstance(projects, dict):
+                                projects = {}
+                            projects[proj] = time.time()
+                            bdata["projects"] = projects
+                            bdata["owner_heartbeat"] = time.time()
+                            write_json(bus_json_path, bdata, mode=0o600)
+                        res = {"ok": True, "pid": pid, "port": port, "started": False}
+                        out(res)
+                        return res
             if os.path.exists(bus_json_path):
                 try:
                     bdata = read_json(bus_json_path)
@@ -1641,11 +2148,19 @@ def cmd_ensure(args):
 
 def cmd_heartbeat(args):
     data_dir = resolve_data(getattr(args, "data", None))
-    bus_json_path = os.path.join(data_dir, "bus.json")
-    if not os.path.exists(bus_json_path):
-        raise Fail("bus down")
-    bdata = read_json(bus_json_path)
-    if not bdata or "pid" not in bdata:
+    bus_dir = bus_location(data_dir)
+    bus_json_path = os.path.join(bus_dir, "bus.json")
+    # A project heartbeat. In root-bus mode the file records one timestamp per
+    # project; the process exits only when EVERY project is past the timeout.
+    project = None
+    if bus_dir != data_dir:
+        project = project_slug_for(data_dir)
+        args._project = project
+    # A missing or pid-less bus.json is a dead bus, not a hard failure:
+    # ensure below restarts it (todo 38). Only refuse when there is nothing
+    # ensure can restart, which there isn't — ensure creates the file.
+    bdata = read_json(bus_json_path) if os.path.exists(bus_json_path) else None
+    if bdata is not None and not isinstance(bdata, dict):
         raise Fail("bus down")
 
     # A SIGKILLed server leaves bus.json behind, so a bare timestamp refresh kept a dead
@@ -1660,7 +2175,8 @@ def cmd_heartbeat(args):
 
 def cmd_token(args):
     data_dir = resolve_data(getattr(args, "data", None))
-    lane_dir = os.path.abspath(args.lane)
+    # Same realpath lane_token_path hashes, so revoke matches a symlinked lane.
+    lane_dir = os.path.realpath(args.lane)
     os.makedirs(lane_dir, exist_ok=True)
 
     if not is_valid_id(args.task):
@@ -1672,7 +2188,7 @@ def cmd_token(args):
     if run_val and not is_valid_id(run_val):
         raise Fail("invalid run id")
 
-    bus_json_path = os.path.join(data_dir, "bus.json")
+    bus_json_path = os.path.join(bus_location(data_dir), "bus.json")
     port = None
     if os.path.exists(bus_json_path):
         d = read_json(bus_json_path)
@@ -1682,7 +2198,13 @@ def cmd_token(args):
         port = 0
 
     tok = secrets.token_urlsafe(32)
-    lane_file = os.path.join(lane_dir, ".matrixkoder-bus.json")
+    # C6: outside the worktree. File mode (no store) keeps the lane file
+    # where mk-builder.py still reads it; store mode uses the home.
+    if store_mode(data_dir) or os.environ.get("MK_BUS_TOKEN_FILE"):
+        lane_file = lane_token_path(lane_dir)
+    else:
+        lane_file = os.path.join(lane_dir, ".matrixkoder-bus.json")
+    os.makedirs(os.path.dirname(lane_file), exist_ok=True)
     # "v": 1 matches the contract B24 lane-file example (protocol version).
     payload = {
         "v": 1,
@@ -1692,21 +2214,18 @@ def cmd_token(args):
         "task": args.task
     }
 
-    fd = os.open(lane_file, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-    os.fchmod(fd, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
-        f.write("\n")
-    os.chmod(lane_file, 0o600)
+    write_json(lane_file, payload, mode=0o600)
 
-    lock_path = os.path.join(data_dir, "bus-tokens.lock")
-    tokens_path = os.path.join(data_dir, "bus-tokens.json")
+    bus_dir = bus_location(data_dir)
+    lock_path = os.path.join(bus_dir, "bus-tokens.lock")
+    tokens_path = os.path.join(bus_dir, "bus-tokens.json")
     lfd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     os.fchmod(lfd, 0o600)
     fcntl.flock(lfd, fcntl.LOCK_EX)
     try:
         tokens = read_json(tokens_path, default={})
         tokens[tok] = {
+            "project": project_slug_for(data_dir) if store_mode(data_dir) else None,
             "token": tok,
             "role": "lane",
             "run": run_val,
@@ -1726,8 +2245,8 @@ def cmd_token(args):
 
 def cmd_revoke(args):
     data_dir = resolve_data(getattr(args, "data", None))
-    lane_dir = os.path.abspath(args.lane)
-    lane_file = os.path.join(lane_dir, ".matrixkoder-bus.json")
+    lane_dir = os.path.realpath(args.lane)
+    lane_file = lane_token_path(lane_dir) if (store_mode(data_dir) or os.environ.get("MK_BUS_TOKEN_FILE")) else os.path.join(lane_dir, ".matrixkoder-bus.json")
     revoked_token = None
     removed = False
     if os.path.exists(lane_file):
@@ -1742,8 +2261,9 @@ def cmd_revoke(args):
         except OSError:
             pass
 
-    lock_path = os.path.join(data_dir, "bus-tokens.lock")
-    tokens_path = os.path.join(data_dir, "bus-tokens.json")
+    bus_dir = bus_location(data_dir)
+    lock_path = os.path.join(bus_dir, "bus-tokens.lock")
+    tokens_path = os.path.join(bus_dir, "bus-tokens.json")
     lfd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     os.fchmod(lfd, 0o600)
     fcntl.flock(lfd, fcntl.LOCK_EX)
@@ -1767,7 +2287,7 @@ def cmd_revoke(args):
 
 
 def _get_client_conn(data_dir):
-    bus_json_path = os.path.join(data_dir, "bus.json")
+    bus_json_path = os.path.join(bus_location(data_dir), "bus.json")
     if not os.path.exists(bus_json_path):
         raise Fail("bus down")
     bdata = read_json(bus_json_path)
@@ -1995,6 +2515,87 @@ def cmd_tail(args):
 
 
 
+def cmd_metrics(args):
+    """C13f: one JSON line of bus metrics for a run, from the project store."""
+    data_dir = resolve_data(getattr(args, "data", None))
+    run = args.run
+    if not is_valid_id(run):
+        raise Fail("invalid run id")
+    if not store_mode(data_dir):
+        raise Fail("metrics need a project store")
+    store = StoreAdapter(data_dir)
+    events = store.store_select(
+        "SELECT id, t, kind, reply_to, text, meta_json FROM events WHERE chan=? AND run=? ORDER BY id",
+        ("bus", run),
+    )
+    acks = store.store_select("SELECT msg, level, t FROM acks WHERE run=?", (run,))
+    ack3 = {}
+    for a in acks:
+        if int(a["level"] or 0) >= 3:
+            ack3[a["msg"]] = a["t"]
+    lat = []
+    for e in events:
+        wid = "m-%s" % e["id"]
+        if e["kind"] == "answer" and wid in ack3:
+            lat.append(_secs(ack3[wid]) - _secs(e["t"]))
+    sent = [e for e in events if e["kind"] in ("ask", "info", "nudge", "answer")]
+    obeyed = sum(1 for e in sent if ("m-%s" % e["id"]) in ack3)
+    failed = 0
+    for e in events:
+        meta = {}
+        if e.get("meta_json"):
+            try:
+                meta = json.loads(e["meta_json"])
+            except ValueError:
+                meta = {}
+        if isinstance(meta, dict) and (meta.get("delivered") is False or meta.get("attempts") == 2):
+            failed += 1
+    answered = set(e["reply_to"] for e in events if e["kind"] == "answer")
+    failed += sum(1 for e in events if e["kind"] == "ask" and ("m-%s" % e["id"]) not in answered)
+    false_stall = 0
+    try:
+        rows = store.store_select(
+            "SELECT task, note, t FROM change_log WHERE run=? ORDER BY change_no", (run,),
+        )
+    except Exception:
+        rows = []
+    by_task = {}
+    for r in rows:
+        by_task.setdefault(r["task"], []).append(r)
+    for seq in by_task.values():
+        for i, r in enumerate(seq):
+            if "stalled" not in (r.get("note") or ""):
+                continue
+            if i + 1 < len(seq) and _secs(seq[i + 1]["t"]) - _secs(r["t"]) <= 600:
+                false_stall += 1
+
+    def pct(xs, q):
+        if not xs:
+            return None
+        xs = sorted(xs)
+        k = min(len(xs) - 1, max(0, int(round(q * (len(xs) - 1)))))
+        return round(xs[k], 3)
+
+    res = {
+        "ok": True, "run": run,
+        "latency_p50": pct(lat, 0.50), "latency_p95": pct(lat, 0.95),
+        "failed_deliveries": failed,
+        "obedience": (round(obeyed / len(sent), 3) if sent else None),
+        "false_stall": false_stall,
+    }
+    out(res)
+    return res
+
+
+def _secs(ts):
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    try:
+        return datetime.datetime.fromisoformat(str(ts)).timestamp()
+    except ValueError:
+        return 0.0
+
+
 def _mkdb_helpers_ready():
     path = os.path.join(HERE, "mkdb.py")
     spec = importlib.util.spec_from_file_location("mkdb_probe", path)
@@ -2060,20 +2661,21 @@ def _store_self_test_body(mod):
             stderr=subprocess.DEVNULL,
         )
         pids.append(proc.pid)
-        bus_json = os.path.join(data_dir, "bus.json")
+        bus_json = os.path.join(os.environ.get("MK_BUS_DIR", data_dir), "bus.json")
         deadline = time.time() + 10.0
         while time.time() < deadline:
             if os.path.exists(bus_json):
                 bdata = read_json(bus_json) or {}
                 pid, port = bdata.get("pid"), bdata.get("port")
-                if pid and port:
+                if pid and port and pid == proc.pid and is_pid_alive(pid):
                     try:
                         req = urllib.request.Request(
                             f"http://127.0.0.1:{port}/health",
                             headers={"Host": f"127.0.0.1:{port}"},
                         )
                         with urllib.request.urlopen(req, timeout=1.0) as resp:
-                            if resp.status == 200:
+                            body = json.loads(resp.read().decode())
+                            if resp.status == 200 and body.get("pid") == proc.pid:
                                 return pid, port
                     except Exception:
                         pass
@@ -2126,15 +2728,16 @@ def _store_self_test_body(mod):
     def mint_orch(data_dir):
         # serve retires every orch token on startup, so mint after each spawn.
         orch_tok = secrets.token_urlsafe(32)
-        tokens_path = os.path.join(data_dir, "bus-tokens.json")
-        lock_path = os.path.join(data_dir, "bus-tokens.lock")
+        tok_dir = os.environ.get("MK_BUS_DIR", data_dir)
+        tokens_path = os.path.join(tok_dir, "bus-tokens.json")
+        lock_path = os.path.join(tok_dir, "bus-tokens.lock")
         lfd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
             fcntl.flock(lfd, fcntl.LOCK_EX)
             tokens = read_json(tokens_path, default={})
             tokens[orch_tok] = {
                 "token": orch_tok, "role": "orch", "run": "r1", "task": "",
-                "lane": "", "created_at": now_iso(),
+                "lane": "", "project": "proj", "created_at": now_iso(),
             }
             write_json(tokens_path, tokens, mode=0o600)
         finally:
@@ -2145,6 +2748,20 @@ def _store_self_test_body(mod):
     try:
         data = os.path.join(tmp, "data")
         os.makedirs(data, exist_ok=True)
+        # Root bus: a store is used only when the data dir is a registered
+        # project. The test home is temp; MK_HOME keeps it off the real one.
+        home = os.path.join(tmp, "home")
+        os.makedirs(home, exist_ok=True)
+        os.environ["MK_BUS_DIR"] = home
+        root = mod.open_root(home)
+        try:
+            root.execute(
+                "INSERT INTO projects(slug, name, repo, data_dir, mode, created) VALUES (?,?,?,?,?,?)",
+                ("proj", "proj", "", data, "managed", "t"),
+            )
+            root.commit()
+        finally:
+            root.close()
         # Public API only. open_project creates mk.db; add_task inserts the task
         # transition() looks up. A runs row is not required by transition().
         # append_event refuses an unknown run. import_history is the public run writer.
@@ -2152,6 +2769,7 @@ def _store_self_test_body(mod):
         con = mod.open_project(data, data_dir=data)
         try:
             mod.add_task(con, "r1", "T1", "task", title="store self-test")
+            mod.add_task(con, "r1", "T2", "task", title="working lane")
         finally:
             con.close()
         assert os.path.isfile(os.path.join(data, "mk.db")), "open_project did not create mk.db"
@@ -2361,17 +2979,392 @@ def _store_self_test_body(mod):
 
         data_b = os.path.join(tmp, "data-b")
         os.makedirs(data_b, exist_ok=True)
+        root_b = mod.open_root(home)
+        try:
+            root_b.execute(
+                "INSERT INTO projects(slug, name, repo, data_dir, mode, created) VALUES (?,?,?,?,?,?)",
+                ("projb", "projb", "", data_b, "managed", "t"),
+            )
+            root_b.commit()
+        finally:
+            root_b.close()
+        warm = mod.open_project(data_b, data_dir=data_b)
+        warm.close()
         mod.import_history(data_b, None, "r1", run_row={"id": "r1", "status": "active"}, data_dir=data_b)
         con_b = mod.open_project(data_b, data_dir=data_b)
         try:
             mod.add_task(con_b, "r1", "T1", "task")
         finally:
             con_b.close()
-        pid_b, port_b = spawn(data_b, "r1")
-        code, cross = post(port_b, token, {"kind": "ask", "text": "cross"})
-        assert code == 401, (code, cross)
+        # One root bus serves both projects, so B is not a second server.
+        code, cross = post(port2, token, {"kind": "ask", "text": "cross", "project": "projb"})
+        assert code in (401, 403), (code, cross)
+        # --- D6B.1: two projects, one bus, no cross-project read or write ---
+        assert os.path.isfile(os.path.join(home, "bus.json")), "root bus.json missing"
+        assert not os.path.isfile(os.path.join(data, "bus.json")), "store mode wrote a per-project bus.json"
+        lane_file_old = os.path.join(lane, ".matrixkoder-bus.json")
+        assert not os.path.isfile(lane_file_old), "token file still inside the lane"
+        lanes_dir = os.path.join(home, "bus-lanes")
+        assert os.path.isdir(lanes_dir) and os.listdir(lanes_dir), "token file not under bus-lanes"
+        tok_path = os.path.join(lanes_dir, os.listdir(lanes_dir)[0])
+        assert oct(os.stat(tok_path).st_mode & 0o777) == "0o600", oct(os.stat(tok_path).st_mode)
+        # orchestrator token of project A cannot write project B
+        code, cross2 = post(port2, orch, {"run": "r1", "task": "T1", "kind": "info", "text": "from A", "from": "orch", "to": "T1", "project": "projb"})
+        assert code == 403, (code, cross2)
+        # killing A's host heartbeat does not drop B while B heartbeats
+        bjson = read_json(os.path.join(home, "bus.json"))
+        bjson["projects"]["proj"] = time.time() - 10**7
+        bjson["projects"]["projb"] = time.time()
+        write_json(os.path.join(home, "bus.json"), bjson, mode=0o600)
+        time.sleep(0.3)
+        req = urllib.request.Request("http://127.0.0.1:%d/health" % port2, headers={"Host": "127.0.0.1:%d" % port2})
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            assert resp.status == 200
+
+        # --- D6B R2: same run id and task id in both projects ---
+        def _table_hash(data_dir):
+            import hashlib
+            con = mod.open_project(data_dir, data_dir=data_dir)
+            try:
+                blob = []
+                for table in ("events", "acks", "artifacts", "tasks"):
+                    rows = [tuple(r) for r in con.execute("SELECT * FROM %s ORDER BY 1" % table)]
+                    blob.append(repr(rows))
+            finally:
+                con.close()
+            return hashlib.sha256("\n".join(blob).encode()).hexdigest()
+
+        def _http(method, path, token, body=None, timeout=3.0):
+            data_b = None if body is None else json.dumps(body).encode()
+            req = urllib.request.Request(
+                "http://127.0.0.1:%d%s" % (port2, path),
+                data=data_b,
+                headers={
+                    "Authorization": "Bearer " + token,
+                    "Host": "127.0.0.1:%d" % port2,
+                    "Content-Type": "application/json",
+                },
+                method=method,
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    raw = resp.read().decode()
+                    return resp.status, json.loads(raw) if raw else {}
+            except urllib.error.HTTPError as e:
+                raw = e.read().decode("utf-8", "replace")
+                try:
+                    parsed = json.loads(raw)
+                except ValueError:
+                    parsed = {"error": raw}
+                return e.code, parsed
+
+        # Distinct bodies under the SAME run id and task id.
+        code, sec_a = post(port2, orch, {"run": "r1", "task": "T1", "kind": "info", "text": "SECRET FOR A", "from": "orch", "to": "T1", "project": "proj"})
+        assert code == 200, (code, sec_a)
+        lane_b = os.path.join(tmp, "lane-b")
+        os.makedirs(lane_b, exist_ok=True)
+        rc_b = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "token", "--lane", lane_b, "--task", "T1", "--run", "r1", "--data", data_b],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        assert rc_b.returncode == 0, rc_b.stderr
+        token_b = json.loads(rc_b.stdout.strip().splitlines()[-1])["token"]
+        orch_b = secrets.token_urlsafe(32)
+        tp = os.path.join(home, "bus-tokens.json")
+        tl = os.path.join(home, "bus-tokens.lock")
+        lfd = os.open(tl, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(lfd, fcntl.LOCK_EX)
+            toks = read_json(tp, default={})
+            toks[orch_b] = {"token": orch_b, "role": "orch", "run": "r1", "task": "", "lane": "", "project": "projb", "created_at": now_iso()}
+            write_json(tp, toks, mode=0o600)
+        finally:
+            fcntl.flock(lfd, fcntl.LOCK_UN)
+            os.close(lfd)
+        code, sec_b = post(port2, orch_b, {"run": "r1", "task": "T1", "kind": "ask", "text": "SECRET FOR B", "from": "orch", "to": "T1", "project": "projb"})
+        assert code == 200, (code, sec_b)
+        hash_before = _table_hash(data)
+        con = mod.open_project(data, data_dir=data)
+        try:
+            a_status_before = con.execute("SELECT status FROM tasks WHERE run=? AND id=?", ("r1", "T1")).fetchone()["status"]
+        finally:
+            con.close()
+
+        # B's lane SSE sees only B. Read a few events, then close; the stream stays open.
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d/events?run=r1&lane=T1" % port2,
+            headers={"Authorization": "Bearer " + token_b, "Host": "127.0.0.1:%d" % port2, "Last-Event-ID": "0"},
+        )
+        seen = []
+        try:
+            with urllib.request.urlopen(req, timeout=1.5) as resp:
+                buf = ""
+                while len(seen) < 5:
+                    chunk = resp.readline()
+                    if not chunk:
+                        break
+                    buf += chunk.decode()
+                    while "\n\n" in buf:
+                        block, buf = buf.split("\n\n", 1)
+                        data_lines = [ln[5:].strip() for ln in block.splitlines() if ln.startswith("data:")]
+                        if data_lines:
+                            seen.append(json.loads("".join(data_lines)))
+        except Exception:
+            pass
+        texts = [m.get("text") for m in seen]
+        assert "SECRET FOR B" in texts, texts
+        assert "SECRET FOR A" not in texts, texts
+        assert all(m.get("project") in (None, "projb") for m in seen), seen
+
+        st, waited = _http("GET", "/wait?run=r1&lane=T1&timeout=1", token_b)
+        assert st == 200, (st, waited)
+        wmsg = (waited or {}).get("message") or {}
+        assert wmsg.get("text") != "SECRET FOR A", waited
+        assert "SECRET FOR A" not in json.dumps(waited), waited
+
+        st, pend = _http("GET", "/pending?run=r1", orch_b)
+        assert st == 200, (st, pend)
+        ptexts = [m.get("text") for m in pend.get("pending") or []]
+        assert "SECRET FOR A" not in ptexts, pend
+        assert "SECRET FOR B" in ptexts, pend
+
+        # B cannot ack, answer, or transition A's message / task.
+        a_id = sec_a["message"]["id"]
+        st, hij = _http("POST", "/ack", token_b, {"run": "r1", "id": a_id, "ack_level": 3, "project": "proj"})
+        assert st == 403, (st, hij)
+        st, hij = _http("POST", "/ack", token_b, {"run": "r1", "id": a_id, "ack_level": 3})
+        assert st in (400, 403), (st, hij)
+        st, hij = _http("POST", "/send", orch_b, {"run": "r1", "task": "T1", "kind": "answer", "text": "hijacked answer", "from": "orch", "to": "T1", "reply_to": a_id, "project": "projb"})
+        assert st in (400, 403), (st, hij)
+        st, hij = post(port2, orch_b, {"run": "r1", "task": "T1", "kind": "status", "text": "building", "from": "orch", "to": "T1", "project": "projb"})
+        assert st == 200, (st, hij)
+        # B's own task moved; A's did not.
+        con = mod.open_project(data, data_dir=data)
+        try:
+            a_status = con.execute("SELECT status FROM tasks WHERE run=? AND id=?", ("r1", "T1")).fetchone()["status"]
+        finally:
+            con.close()
+        con = mod.open_project(data_b, data_dir=data_b)
+        try:
+            b_status = con.execute("SELECT status FROM tasks WHERE run=? AND id=?", ("r1", "T1")).fetchone()["status"]
+        finally:
+            con.close()
+        assert a_status == a_status_before, (a_status_before, a_status)
+        assert b_status == "building", b_status
+        assert _table_hash(data) == hash_before, "project A store changed during B activity"
+
+        # Root token is read-only on every write, before the body matters.
+        root_tok = secrets.token_urlsafe(32)
+        lfd = os.open(tl, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(lfd, fcntl.LOCK_EX)
+            toks = read_json(tp, default={})
+            toks[root_tok] = {"token": root_tok, "role": "root", "run": "r1", "task": "T1", "lane": "", "project": "proj", "created_at": now_iso()}
+            write_json(tp, toks, mode=0o600)
+        finally:
+            fcntl.flock(lfd, fcntl.LOCK_UN)
+            os.close(lfd)
+        for kind in ("ack", "ask", "info", "nudge", "status", "report"):
+            st, body = post(port2, root_tok, {"run": "r1", "task": "T1", "kind": kind, "text": "nope", "from": "T1", "to": "orch"})
+            assert st == 403, (kind, st, body)
+        st, body = _http("POST", "/ack", root_tok, {"run": "r1", "id": a_id, "ack_level": 3})
+        assert st == 403, (st, body)
+        assert _table_hash(data) == hash_before, "root token wrote project A"
+
+        # --- D6B.2 doorbell with a fake herdr ---
+        # agent_status comes from <fake>.status (idle|working), not from the
+        # rang log. Default idle when the file is missing.
+        fake = os.path.join(tmp, "fake-herdr.py")
+        with open(fake, "w") as fh:
+            fh.write("import json, sys\n")
+            fh.write("log = sys.argv[0] + '.rang'\n")
+            fh.write("if len(sys.argv) > 1 and sys.argv[1] == 'prompt':\n")
+            fh.write("    with open(log, 'a') as f:\n")
+            fh.write("        f.write(sys.argv[2] + ' ' + sys.argv[3] + chr(10))\n")
+            fh.write("    sys.exit(0)\n")
+            fh.write("import os\n")
+            fh.write("sf = sys.argv[0] + '.status'\n")
+            fh.write("status = open(sf).read().strip() if os.path.exists(sf) else 'idle'\n")
+            fh.write("print(json.dumps({'result': {'agents': [\n")
+            fh.write("    {'name': 'T1', 'agent_status': status, 'cwd': '/x/T1'}]}}))\n")
+        os.chmod(fake, 0o755)
+
+        def write_status(text):
+            with open(fake + ".status", "w") as sf:
+                sf.write(text)
+
+        def inbox_count():
+            if not os.path.isfile(fake + ".rang"):
+                return 0
+            return open(fake + ".rang").read().count("inbox")
+
+        def remint():
+            tok = secrets.token_urlsafe(32)
+            tp = os.path.join(home, "bus-tokens.json")
+            tl = os.path.join(home, "bus-tokens.lock")
+            lfd = os.open(tl, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(lfd, fcntl.LOCK_EX)
+                toks = read_json(tp, default={})
+                toks[tok] = {"token": tok, "role": "orch", "run": "r1", "task": "", "lane": "", "project": "proj", "created_at": now_iso()}
+                write_json(tp, toks, mode=0o600)
+            finally:
+                fcntl.flock(lfd, fcntl.LOCK_UN)
+                os.close(lfd)
+            return tok
+
+        def event_count(kind):
+            rings = mod.open_project(data, data_dir=data)
+            try:
+                return rings.execute("SELECT COUNT(*) c FROM events WHERE kind=?", (kind,)).fetchone()["c"]
+            finally:
+                rings.close()
+
+        os.environ["MK_BUS_HERDR"] = fake
+        os.environ["MK_BUS_SKILL_DIR"] = os.path.join(tmp, "skill")
+        os.environ["MK_BUS_RING_INTERVAL_SEC"] = "0.2"
+        write_status("idle")
         kill(pid2)
-        kill(pid_b)
+        pid2, port2 = spawn(data, "r1")
+        orch = mint_orch(data)
+        btok = remint()
+        code, nudge = post(port2, btok, {"run": "r1", "task": "T1", "kind": "nudge", "text": "look", "from": "orch", "to": "T1", "project": "proj"})
+        assert code == 200, (code, nudge)
+        time.sleep(0.3)
+        rang = open(fake + ".rang").read() if os.path.isfile(fake + ".rang") else ""
+        assert "T1" in rang and "mk-builder.py inbox" in rang, rang
+        # Second nudge while working must not ring.
+        write_status("working")
+        code, work = post(port2, btok, {"run": "r1", "task": "T1", "kind": "nudge", "text": "busy", "from": "orch", "to": "T1", "project": "proj"})
+        assert code == 200, (code, work)
+        rang2 = open(fake + ".rang").read()
+        assert rang2.count("mk-builder.py inbox") == 1, rang2
+        assert event_count("ring") == 1
+
+        # FIX 3: a ring queued while working drains once the lane goes idle,
+        # with no further message. Same server: a restart drops the in-memory queue.
+        write_status("working")
+        before3 = inbox_count()
+        code, q = post(port2, btok, {"run": "r1", "task": "T1", "kind": "nudge", "text": "queued", "from": "orch", "to": "T1", "project": "proj"})
+        assert code == 200, (code, q)
+        time.sleep(0.4)
+        assert inbox_count() == before3, (inbox_count(), before3)
+        write_status("idle")
+        time.sleep(1.0)
+        rang3 = open(fake + ".rang").read()
+        assert inbox_count() == before3 + 2, rang3
+        assert "T1" in rang3 and "mk-builder.py inbox" in rang3
+
+        # FIX 4a: ring is recorded before typing. A kill between the two
+        # leaves kind=ring and no rang line; restart types it once; a second
+        # restart does not type it again.
+        write_status("idle")
+        os.environ["MK_BUS_RING_KILL"] = os.path.join(tmp, "kill-seam")
+        kill(pid2)
+        pid2, port2 = spawn(data, "r1")
+        btok = remint()
+        before4 = inbox_count()
+        rings_before = event_count("ring")
+        try:
+            post(port2, btok, {"run": "r1", "task": "T1", "kind": "nudge", "text": "die", "from": "orch", "to": "T1", "project": "proj"}, timeout=2.0)
+        except Exception:
+            pass
+        deadline = time.time() + 5.0
+        while time.time() < deadline and is_pid_alive(pid2):
+            time.sleep(0.05)
+        # The ring runs after the POST returns, so give the seam a moment.
+        deadline = time.time() + 3.0
+        while time.time() < deadline and is_pid_alive(pid2):
+            time.sleep(0.1)
+        assert not is_pid_alive(pid2), "ring-kill seam did not exit"
+        assert event_count("ring") >= rings_before + 1
+        # Earlier rings in this test were typed. This seam's ring must not be.
+        seam_id = open(os.environ["MK_BUS_RING_KILL"]).read().strip()
+        con = mod.open_project(data, data_dir=data)
+        try:
+            typed_this = con.execute(
+                "SELECT COUNT(*) c FROM events WHERE kind='ring-typed' AND reply_to=?",
+                (seam_id,),
+            ).fetchone()["c"]
+        finally:
+            con.close()
+        assert typed_this == 0, typed_this
+        assert inbox_count() == before4, (inbox_count(), before4)
+        del os.environ["MK_BUS_RING_KILL"]
+        pid2, port2 = spawn(data, "r1")
+        time.sleep(0.5)
+        assert inbox_count() == before4 + 1, open(fake + ".rang").read()
+        assert event_count("ring-typed") >= 1
+        kill(pid2)
+        pid2, port2 = spawn(data, "r1")
+        time.sleep(0.5)
+        assert inbox_count() == before4 + 1, open(fake + ".rang").read()
+
+        # FIX 4b: an explicit empty project slug is 403 and changes nothing.
+        st = mod.open_project(data, data_dir=data)
+        try:
+            status_before = st.execute("SELECT status FROM tasks WHERE run=? AND id=?", ("r1", "T1")).fetchone()["status"]
+        finally:
+            st.close()
+        btok = remint()
+        code, empty = post(port2, btok, {"run": "r1", "task": "T1", "kind": "nudge", "text": "no project", "from": "orch", "to": "T1", "project": ""})
+        assert code == 403, (code, empty)
+        st = mod.open_project(data, data_dir=data)
+        try:
+            status_after = st.execute("SELECT status FROM tasks WHERE run=? AND id=?", ("r1", "T1")).fetchone()["status"]
+        finally:
+            st.close()
+        assert status_after == status_before, (status_before, status_after)
+
+        # FIX 4c: token file is written atomically, mode 0600, with token/run/task.
+        lane_new = os.path.join(tmp, "lane-fix4c")
+        os.makedirs(lane_new, exist_ok=True)
+        rc_tok = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "token", "--lane", lane_new, "--task", "T2", "--run", "r1", "--data", data],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        assert rc_tok.returncode == 0, rc_tok.stderr
+        tok_file = lane_token_path(lane_new)
+        assert (os.stat(tok_file).st_mode & 0o777) == 0o600, oct(os.stat(tok_file).st_mode)
+        payload = json.loads(open(tok_file).read())
+        assert set(("token", "run", "task")).issubset(payload) and payload["run"] == "r1" and payload["task"] == "T2", payload
+
+        # A symlink lane and its real directory hash to the same token file.
+        lane_real = os.path.join(tmp, "lane-real")
+        lane_link = os.path.join(tmp, "lane-link")
+        os.makedirs(lane_real, exist_ok=True)
+        os.symlink(lane_real, lane_link)
+        rc_link = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "token", "--lane", lane_link, "--task", "T1", "--run", "r1", "--data", data],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        assert rc_link.returncode == 0, rc_link.stderr
+        link_file = lane_token_path(lane_link)
+        assert os.path.isfile(link_file) and os.path.realpath(lane_link) == os.path.realpath(lane_real)
+        rc_rev = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "revoke", "--lane", lane_link, "--data", data],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        assert rc_rev.returncode == 0, rc_rev.stderr
+        assert not os.path.exists(link_file), link_file
+
+        os.environ.pop("MK_BUS_HERDR", None)
+        os.environ.pop("MK_BUS_RING_INTERVAL_SEC", None)
+        os.environ.pop("MK_BUS_RING_KILL", None)
+        rc_m = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "metrics", "--run", "r1", "--data", data],
+            stdout=subprocess.PIPE, text=True,
+        )
+        assert rc_m.returncode == 0, rc_m.stdout
+        metrics = json.loads(rc_m.stdout.strip().splitlines()[-1])
+        assert metrics["ok"] is True and "latency_p50" in metrics and "obedience" in metrics and "false_stall" in metrics, metrics
+
+        # no direct database-module import text anywhere in this script
+        src = open(os.path.abspath(__file__), encoding="utf-8").read()
+        assert ("sq" + "lite3") not in src, "mk-bus.py mentions the database module"
+
+
+        kill(pid2)
     finally:
         for p in pids:
             stop_process(p)
@@ -3647,6 +4640,10 @@ def main():
     p_pend.add_argument("--data", help="MatrixKoder data dir")
 
     p_tail = subparsers.add_parser("tail")
+    p_metrics = subparsers.add_parser("metrics")
+    p_metrics.add_argument("--run", required=True)
+    p_metrics.add_argument("--data")
+    p_metrics.set_defaults(func=cmd_metrics)
     p_tail.add_argument("--run", help="Run identifier")
     p_tail.add_argument("--lane", help="Lane filter")
     p_tail.add_argument("--after", type=int, default=0, help="After seq filter")
@@ -3668,7 +4665,8 @@ def main():
             "send": cmd_send,
             "answer": cmd_answer,
             "pending": cmd_pending,
-            "tail": cmd_tail
+            "tail": cmd_tail,
+            "metrics": cmd_metrics,
         }
         fn = dispatch.get(args.cmd)
         if fn:

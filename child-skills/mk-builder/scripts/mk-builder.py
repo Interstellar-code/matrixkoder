@@ -1367,15 +1367,16 @@ def bus_unread_hint(lane):
 # the report file and the brief copy (C12) and never raise on a missing bus.
 
 def lane_hash(lane):
-    return hashlib.sha256(os.path.abspath(lane).encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha256(os.path.realpath(lane).encode("utf-8")).hexdigest()
 
 
 def bus_token_path(lane):
     """ONE resolver for the lane token file (D6B moves it; this CLI must follow).
 
-    Order: `MK_BUS_TOKEN_FILE` when set, else `<lane>/.matrixkoder-bus.json`, else
-    `~/.matrixkoder/bus-lanes/<hash(lane)>.json`. Tests point HOME at a temp dir, so the
-    third location never touches the real home.
+    Order: `MK_BUS_TOKEN_FILE` when set, else `<lane>/.matrixkoder-bus.json` when that
+    file exists (file mode), else `<home>/bus-lanes/<sha256(realpath(lane))>.json`.
+    The hash and the home are the same ones `scripts/mk-bus.py` writes: realpath,
+    full sha256, `$MK_BUS_DIR` or `$MK_HOME` or `~/.matrixkoder`.
     """
     env = os.environ.get("MK_BUS_TOKEN_FILE")
     if env:
@@ -1383,7 +1384,12 @@ def bus_token_path(lane):
     lane_file = os.path.join(lane, BUS_LANE_FILE)
     if os.path.isfile(lane_file):
         return lane_file
-    home = os.environ.get("MK_HOME") or os.path.expanduser("~/.matrixkoder")
+    if os.environ.get("MK_BUS_DIR"):
+        home = os.path.abspath(os.path.expanduser(os.environ["MK_BUS_DIR"]))
+    elif os.environ.get("MK_HOME"):
+        home = os.path.abspath(os.path.expanduser(os.environ["MK_HOME"]))
+    else:
+        home = os.path.join(os.path.expanduser("~"), ".matrixkoder")
     return os.path.join(home, "bus-lanes", lane_hash(lane) + ".json")
 
 
@@ -2595,7 +2601,11 @@ def bus_server(root, name="bus"):
         data = os.path.join(root, f"{name}-data")
         os.makedirs(data, exist_ok=True)
         _, res = bus_cli("ensure", "--data", data, "--run", BUS_RUN)
-        assert res.get("started") is True and res.get("pid") and res.get("port"), res
+        # A root bus is one process for every project, so a second ensure
+        # reports started:false while still handing back the live pid and port.
+        assert res.get("pid") and res.get("port") and (
+            res.get("started") is True or store_present(data)
+        ), res
         BUS_SERVERS.append((res["pid"], data))
         BUS_SERVER_CACHE[key] = (data, res["pid"], res["port"])
     return BUS_SERVER_CACHE[key]
@@ -2607,7 +2617,9 @@ def bus_lane(root, lane_name, task, data):
     production token file has no `data` field; `MK_BUS_DATA` is the other way to name it."""
     lane = mklane(root, lane_name)
     bus_cli("token", "--lane", lane, "--task", task, "--run", BUS_RUN, "--data", data)
-    path = os.path.join(lane, BUS_LANE_FILE)
+    path = bus_token_path(lane)
+    if not os.path.isfile(path):
+        path = os.path.join(lane, BUS_LANE_FILE)
     with open(path) as f:
         cfg = json.load(f)
     cfg["data"] = data
@@ -2885,8 +2897,13 @@ def d7_store(data, run, task):
 
 def d7_answer(data, ask_id, text, to_task):
     """Post an answer with the orchestrator token. `mk-bus.py answer` reads bus.jsonl,
-    which store mode does not write; the HTTP path is what the orchestrator actually uses."""
-    with open(os.path.join(data, "bus.json")) as f:
+    which store mode does not write; the HTTP path is what the orchestrator actually uses.
+    Store mode publishes bus.json in the MK home, not in the data dir."""
+    bus_json = os.path.join(data, "bus.json")
+    if not os.path.isfile(bus_json):
+        home = os.environ.get("MK_BUS_DIR") or os.environ.get("MK_HOME") or os.path.expanduser("~/.matrixkoder")
+        bus_json = os.path.join(home, "bus.json")
+    with open(bus_json) as f:
         b = json.load(f)
     body = {"run": BUS_RUN, "task": to_task, "kind": "answer", "text": text,
             "from": "orch", "to": to_task, "reply_to": ask_id}
