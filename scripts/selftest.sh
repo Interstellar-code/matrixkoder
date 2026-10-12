@@ -3,8 +3,9 @@
 # mk-bus.py --self-test runs as part of the *.py pattern below.
 # Tests use temp dirs and a temp MATRIXKODER_HOME, never the real ~/.matrixkoder.
 # Jobs: MK_SELFTEST_JOBS when set (a non-number or a value < 1 warns and runs serially); otherwise
-# session.selftest_jobs_total from one guarded `python3 mk-config.py get` (a missing yaml, a
-# missing script or any other failure falls back to 4, silently; a saved value that is not an
+# session.selftest_jobs_total from one `python3 mk-config.py get` in its own process group,
+# killed after 5 s (a missing yaml, a missing script, a timeout, a non-zero exit or any other
+# failure falls back to 4; only a timeout prints one stderr line; a saved value that is not an
 # integer from 1 to 16 warns once and uses 4); otherwise 4.
 # N runs N self-tests at once, the slow ones first; each one's output is buffered and printed after
 # the run in discovery order, so the report and the last line match a serial run.
@@ -25,7 +26,29 @@ else
   jobs=4
   cfg_py=$(dirname "$0")/mk-config.py
   if [ -f "$cfg_py" ]; then
-    cfg=$(python3 "$cfg_py" get session.selftest_jobs_total 2>/dev/null) || cfg=
+    # Bound the lookup: a hung or blocked mk-config.py must not stall every lane's suite.
+    # macOS has no GNU timeout and bash 3.2 has no wait -n, so poll for 5 s then kill.
+    cfg_out=$(mktemp "${TMPDIR:-/tmp}/mk-selftest-cfg.XXXXXX") || exit 2
+    # Own process group so the 5 s kill reaches python, not only the waiting shell.
+    # macOS has no GNU timeout and bash 3.2 has no wait -n. The lookup line is unchanged.
+    set -m
+    { cfg=$(python3 "$cfg_py" get session.selftest_jobs_total 2>/dev/null) || cfg=
+      printf '%s' "$cfg" >"$cfg_out"; } &
+    cfg_pid=$!
+    cfg_i=0
+    # The shell exits once python starts, so wait on the output file, not on the shell.
+    while [ ! -s "$cfg_out" ] && kill -0 -"$cfg_pid" 2>/dev/null && [ "$cfg_i" -lt 50 ]; do sleep 0.1; cfg_i=$((cfg_i + 1)); done
+    if [ ! -s "$cfg_out" ] && kill -0 -"$cfg_pid" 2>/dev/null; then
+      kill -KILL -"$cfg_pid" 2>/dev/null
+      wait "$cfg_pid" 2>/dev/null
+      echo "warning: session.selftest_jobs_total lookup timed out after 5s, using 4" >&2
+      cfg=
+    else
+      wait "$cfg_pid" 2>/dev/null
+      cfg=$(cat "$cfg_out" 2>/dev/null) || cfg=
+    fi
+    set +m
+    rm -f "$cfg_out"
     got=$(printf '%s' "$cfg" | python3 -c 'import json,sys
 try:
     o=json.loads(sys.stdin.read())
