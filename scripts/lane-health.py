@@ -131,13 +131,89 @@ def last_change_min(lane, since=0.0):
     return round((time.time() - newest) / 60, 1) if newest else None
 
 
+# A verdict needs a banner SHAPE, not a keyword in prose or in something the agent ran.
+# A quota phrase counts only when it is the main content of the line: the line starts with it
+# (after a glyph or whitespace), or the line is one of Claude's own walls ("hit/reached your
+# limit", "reached your pro 5-hour limit"), which are prose-shaped and have no marker.
+# An error line counts when it starts with "Error:" / "API Error:" / "Upstream request failed:",
+# holds "retrying in", or holds an HTTP status inside an API error block.
+# What stays undetectable: a real wall the agent quotes mid-sentence ("the usage limit reached
+# branch is covered"), and a real banner whose line also holds a double quote (CODE_LINE_RE).
+_QUOTA_LEAD = r"(?:(?:usage|weekly|week|5-hour|5h|hourly|daily|session|plan|individual)\s+(?:limit|quota)\s+(?:reached|hit|exceeded)|quota\s+(?:reached|exceeded)|(?:free\s+)?usage\s+exceeded)"
+_QUOTA_FREE = r"(?:hit|reached)\s+your\s+(?:usage\s+|weekly\s+|5-hour\s+)?limit|reached\s+your\s+pro\s+5-hour\s+limit"
+BANNER_RE = re.compile(
+    r"(?i)(?:"
+    r"^\W*(?:Claude\s+)?\W*" + _QUOTA_LEAD + r"|"
+    + _QUOTA_FREE + r"|"
+    r"^\W*(?:error|api\s+error|upstream\s+request\s+failed)\s*:"
+    r"|\bretrying\s+in\b"
+    r"|\bapi\s+error\b.*\b[45]\d\d\b"
+    r")")
+# A command block is tool output only when it contains a shell prompt. herdr draws BOTH the
+# message column and command output with a bar, so a bar alone is not tool output (a real banner
+# can sit inside one). The bar comes BEFORE the `$`, so the prompt is matched after non-word
+# characters: `  ┃  $ pytest`.
+CMD_BLOCK_RE = re.compile(r"(?m)^\W*\$\s")
+# Lines that are code, diffs, file views or tables, plus test-runner result lines. A real banner
+# never starts with `+`, a line number, a table cell, or `FAIL`/`PASS`/`ok <n>`.
+# `Error: 4xx` is suppressed even bare: a harness that prints `Error: 403 Forbidden` with no
+# "API" in front is treated as a raw test log. Accepted trade-off; no real pane has shown it.
+TOOL_LINE_RE = re.compile(
+    r"(?:" + CODE_LINE_RE.pattern + r")"
+    r"|^\s*\|"                              # markdown table row
+    r"|^(?:FAIL|PASS)\s+\S"                 # test-runner result
+    r"|^(?:ok|not ok)\s+\d+"                # TAP
+    r"|^\s*(?:AssertionError|Traceback)\b"  # a test failure, not a harness banner
+    r"|^\W*Error:\s*[45]\d\d\b")         # a raw HTTP log line, bar or not
+# Limit: a banner the agent quotes inside a fenced code block, or a real error whose line also
+# contains a double quote, is dropped (CODE_LINE_RE). A `$ ` prompt inside a message column
+# marks that whole bar-block as tool output.
+
+
+def _tool_block(lines, i):
+    """True when line i sits in a bar block that contains a shell prompt — a command the agent ran.
+    The prompt may follow the bar (`  ┃  $ pytest`), so CMD_BLOCK_RE allows non-word characters first."""
+    if not re.search(r"[\u2503\u2502]", lines[i]):
+        return False
+    lo = i
+    while lo > 0 and re.search(r"[\u2503\u2502]", lines[lo - 1]):
+        lo -= 1
+    hi = i
+    while hi + 1 < len(lines) and re.search(r"[\u2503\u2502]", lines[hi + 1]):
+        hi += 1
+    return any(CMD_BLOCK_RE.search(l) for l in lines[lo:hi + 1])
+
+
+def banner_lines(text):
+    """Lines carrying an error-banner shape, from the last TAIL_LINES lines.
+
+    Dropped: a line inside a command block (a bar-drawn run of lines holding a `$ ` prompt, the
+    bar coming before the `$`), a code / diff / file-view / table / test-runner line, and a raw
+    `Error: 401 ...` log line. A banner drawn inside a bar with no prompt still counts. A quota
+    phrase buried in a sentence does not, because the phrase has to lead the line."""
+    lines = text.splitlines()[-TAIL_LINES:]
+    out = []
+    for i, ln in enumerate(lines):
+        # a JSON error object is the harness's own line, even though it holds quotes
+        if re.match(r'\s*\{\s*"error"\s*:', ln) and PROVIDER_RE.search(ln):
+            out.append(ln)
+            continue
+        if _tool_block(lines, i) or TOOL_LINE_RE.search(ln):
+            continue
+        if BANNER_RE.search(ln):
+            out.append(ln)
+    return out
+
+
 def classify(text, status, idle_min, stall_min):
     """text must already be scoped with since_dispatch()."""
     tail = text[-4000:]
-    hits = quota_hits(tail)
+    # QUOTA and PROVIDER come only from the agent's own error banner, never from tool output.
+    banner = "\n".join(banner_lines(tail))
+    hits = quota_hits(banner)
     if hits:
         return "QUOTA", hits[-2:]
-    prov = PROVIDER_RE.search(tail)
+    prov = PROVIDER_RE.search(banner)
     if prov:
         return "PROVIDER", [prov.group(0)]
     if status == "blocked":
@@ -314,6 +390,54 @@ def self_test_body(shutil):
     assert classify("  $ pnpm dev", "working", 1, 10)[0] == "DEV_SERVER"
     assert classify("thinking", "working", 12, 10)[0] == "STALL"
     assert classify("thinking", "working", 3, 10)[0] == "OK"
+
+    # A1: words inside tool output never raise a verdict while the agent is working.
+    # The ┃ block is how a real herdr pane draws command output (scripts/fixtures/pane-working.txt).
+    tool = "\n".join([
+        "running the suite",
+        "  \u2503",
+        "  \u2503  FAIL test_unauthorized_401",
+        "  \u2503  AssertionError: 403 quota rate limit",
+        "  \u2503",
+    ])
+    assert classify(tool, "working", 1, 10)[0] == "OK", classify(tool, "working", 1, 10)
+    # a banner of the agent's own, then tool output below it, still matches
+    banner_then_tool = "Error: subscription is required\n" + tool
+    assert classify(banner_then_tool, "working", 1, 10)[0] == "PROVIDER"
+    # a banner scrolled above the last N lines does not
+    scrolled = "Error: unauthorized\n" + "\n".join(["working"] * (TAIL_LINES + 5))
+    assert classify(scrolled, "working", 1, 10)[0] == "OK", classify(scrolled, "working", 1, 10)
+
+    # A1 R2: every quota shape is a banner shape, including Claude's own wall
+    for msg in ("You've hit your limit · resets 3pm", "You have reached your limit",
+                "ERROR: Usage limit reached resets in 3h",
+                "┃  Free usage exceeded, subscribe to Go [retrying in 23m]",
+                "│ hit your limit │"):
+        assert classify(msg, "idle", 1, 10)[0] == "QUOTA", msg
+    assert classify("┃  Upstream request failed: An active OpenCode Go subscription is required",
+                    "working", 1, 10)[0] == "PROVIDER"
+    # prose, and tool output that is not drawn with a bar, never raise a verdict
+    for msg in ("I handled unauthorized and 401 in the test",
+                "+    x = 'Error: unauthorized'",
+                "   12→ Error: subscription is required",
+                "| a | unauthorized |",
+                "Error: 401 Unauthorized"):
+        assert classify(msg, "working", 1, 10)[0] == "OK", (msg, classify(msg, "working", 1, 10))
+    # a real sanitized pane whose tool output carries the trigger words: no verdict
+    fx = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "pane-working.txt")
+    assert classify(open(fx).read(), "working", 1, 10)[0] == "OK", fx
+
+    # A1 R3: a banner-shaped line inside a bar-drawn command (`  ┃  $ ...`) is tool output.
+    # These fail when _tool_block is stubbed to return False.
+    for block in ("  \u2503  $ npm test\n  \u2503  Error: unauthorized\n  \u2503",
+                  "  \u2503  $ curl x\n  \u2503  Error: 401 Unauthorized\n  \u2503",
+                  "  \u2503  $ cat notes\n  \u2503  Upstream request failed: foo unauthorized\n  \u2503",
+                  "  \u2503  $ pytest\n  \u2503  Usage limit reached for 5 hour resets in 3h\n  \u2503"):
+        assert classify(block, "working", 1, 10)[0] == "OK", (block, classify(block, "working", 1, 10))
+    # a quota phrase buried in a sentence is prose, not a wall
+    for msg in ("The quota exceeded handling is done; 5-hour limit",
+                "I fixed the usage limit reached detection"):
+        assert classify(msg, "working", 1, 10)[0] == "OK", msg
     m = RESET_AT_RE.search("will reset at 2026-10-07 10:02:14")
     assert m and m.group(1) == "2026-10-07 10:02:14"
     assert classify("Upstream request failed: An active OpenCode Go subscription is required", "working", 1, 10)[0] == "PROVIDER"

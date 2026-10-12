@@ -601,6 +601,9 @@ def quota_beats_stall(agent, kind):
     is deliberately NOT searched: a banner the agent merely quotes is not a banner.
     -> ("QUOTA", evidence) or (None, [])."""
     text = pane_footer(lh.pane_text(agent))
+    # the same banner filter classify uses: a quota word inside a test log in the footer
+    # is not a wall, so it must not beat a stall or write the ledger
+    text = "\n".join(lh.banner_lines(text))
     hits = lh.quota_hits(text)
     if not hits:
         return None, []
@@ -1436,6 +1439,16 @@ def self_test():
     finally:
         restore_data()
         shutil.rmtree(tmp, ignore_errors=True)
+    # A1 R3: a quota PHRASE inside a bar-drawn command must not beat a stall. This fails
+    # when the banner_lines filter in quota_beats_stall is removed, because quota_hits alone
+    # still matches the phrase.
+    log = "\n".join(["  \u2503", "  \u2503  $ pytest",
+                      "  \u2503  Usage limit reached for 5 hour resets in 3h", "  \u2503"])
+    assert lh.quota_hits(log), "the phrase is real, so the filter is what suppresses it"
+    assert lh.quota_hits("\n".join(lh.banner_lines(log))) == [], log
+    wall = "Usage limit reached for 5 hour. resets in 3h"
+    assert lh.quota_hits("\n".join(lh.banner_lines(wall))), wall
+
     print("lane-watch self-test ok")
 
 
