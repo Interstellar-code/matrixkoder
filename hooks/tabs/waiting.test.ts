@@ -7,8 +7,9 @@
 import { test, expect } from 'claude-code/testing'
 import type { Elements } from 'claude-code'
 import { mockFs, mockWorld, paneProps, sessionStart, worldFiles, worldFixtures } from './../testkit'
-import { WaitingTab, optionChipRole, waitingActions, waitingMoreKey, waitingPick, waitingPickKey, waitingView } from './waiting'
-import type { TabUi, WaitOption } from './waiting'
+import { ASK_CAP, WaitingTab, askKey, askView, emptyWaitingView, optionChipRole, readPending, runWaitView, waitingActions, waitingAsks, waitingMoreKey, waitingPick, waitingPickKey, waitingView } from './waiting'
+import type { PendingAsk, RunFn, TabUi, WaitOption } from './waiting'
+import { PENDING_CAPTURED } from './waiting.pending.fixture'
 import { ROLE } from './palette'
 
 const MOCK = /MOCK · fixture data · not this run/
@@ -294,4 +295,178 @@ test('the card still shows the fixture: the question, every option and the hints
   }
   expect(texts.some(t => t.includes('mk: pick A')), 'the type-a-pick hint').toBe(true)
   expect(texts.some(t => t.includes('wake: off')), 'the footer hint').toBe(true)
+})
+
+// ---------- real pending asks (D8B) ----
+// Shape pinned from scripts/mk-bus.py: append_message builds the message
+// ({seq, id, ts, run, task, from, to, kind, reply_to, text, ack_level}) and
+// get_pending returns the unanswered kind:"ask" messages; cmd_pending wraps
+// them as {"ok": true, "run", "pending": [...]} (the /pending handler).
+
+const NOW = '2026-10-12T10:00:00+02:00'
+
+const ASK_A: PendingAsk = {
+  id: 'm-1', task: 'T1', text: 'how to proceed?', ts: '2026-10-12T09:57:00+02:00',
+}
+const ASK_B: PendingAsk = {
+  id: 'm-2', task: 'T2', text: 'which lane?', ts: '2026-10-12T09:00:00+02:00',
+  options: [{ key: 'A', label: 'Hold', action: 'Hold', recommended: true, explanation: 'wait' }],
+}
+
+const runner = (stdout: string, code = 0): RunFn & { calls: number } => {
+  const fn = (async () => {
+    fn.calls += 1
+    return { stdout, code }
+  }) as unknown as RunFn & { calls: number }
+  fn.calls = 0
+  return fn
+}
+
+test('the captured real pending output renders its id, task, text and run', () => {
+  const payload = JSON.parse(PENDING_CAPTURED) as { ok: boolean; pending: PendingAsk[] }
+  expect(payload.ok).toBe(true)
+  const ask = payload.pending[0]
+  expect(ask?.id).toBe('m-1')
+  expect(ask?.run).toBe('r1')
+  const tree = waitingAsks(stubEls(), payload.pending, 46, '2026-10-12T12:26:53Z')
+  const texts = allOf(tree, 'Text').map(t => text(t))
+  expect(texts.some(t => t.includes('m-1'))).toBe(true)
+  expect(texts.some(t => t.includes('T1'))).toBe(true)
+  expect(texts.some(t => t.includes('how to proceed?'))).toBe(true)
+  expect(texts.some(t => t.includes('3m')), 'age from the captured ts').toBe(true)
+  expect(texts.some(t => t.includes('mk-bus.py answer m-1 --run r1')), 'the hint names the run').toBe(true)
+  expect(texts.some(t => MOCK.test(t))).toBe(false)
+})
+
+test('a seeded pending ask renders its id, task, text and age', () => {
+  const tree = waitingAsks(stubEls(), [ASK_A], 46, NOW)
+  const texts = allOf(tree, 'Text').map(t => text(t))
+  expect(texts.some(t => t.includes('m-1')), 'the id').toBe(true)
+  expect(texts.some(t => t.includes('T1')), 'the task').toBe(true)
+  expect(texts.some(t => t.includes('how to proceed?')), 'the text').toBe(true)
+  expect(texts.some(t => t.includes('3m')), 'the age').toBe(true)
+  expect(texts.some(t => MOCK.test(t)), 'no MOCK banner on a real source').toBe(false)
+  expect(texts.some(t => t.includes('mk-bus.py answer m-1')), 'the answer hint when there are no options').toBe(true)
+})
+
+test('two asks stack, and the one with options keeps the decision layout', () => {
+  const tree = waitingAsks(stubEls(), [ASK_A, ASK_B], 46, NOW)
+  const texts = allOf(tree, 'Text').map(t => text(t))
+  expect(texts.filter(t => t.includes('m-1') || t.includes('m-2')).length, 'both ids').toBeGreaterThanOrEqual(2)
+  expect(texts.some(t => t.includes('which lane?'))).toBe(true)
+  expect(allOf(tree, 'Button').some(b => String(b.props.label).includes('Hold')), 'the option action button').toBe(true)
+  expect(texts.some(t => t.includes('2 waiting')), 'the count').toBe(true)
+})
+
+test('an answered ask is gone on the next tick: the empty state, not the fixture', () => {
+  const tree = waitingAsks(stubEls(), [], 46, NOW)
+  const texts = allOf(tree, 'Text').map(t => text(t))
+  expect(texts.some(t => t.includes('nothing waiting'))).toBe(true)
+  expect(texts.some(t => MOCK.test(t)), 'a real empty source shows no banner').toBe(false)
+  expect(texts.some(t => t.includes('tax_lines')), 'the fixture is not drawn').toBe(false)
+})
+
+test('the MOCK banner shows only when no real source is available', () => {
+  const mock = allOf(WaitingTab(stubEls(), waitingView(), 46), 'Text').map(t => text(t))
+  expect(mock.some(t => MOCK.test(t))).toBe(true)
+  const real = allOf(WaitingTab(stubEls(), askView(ASK_A, NOW), 46), 'Text').map(t => text(t))
+  expect(real.some(t => MOCK.test(t))).toBe(false)
+})
+
+test('bus down falls back to the run snapshot wait, without the banner', () => {
+  const view = runWaitView({ question: 'hold the merge?', options: ['yes', 'no'], rec: 'yes', since: '17:41' })
+  const texts = allOf(WaitingTab(stubEls(), view, 46), 'Text').map(t => text(t))
+  expect(texts.some(t => t.includes('hold the merge?'))).toBe(true)
+  expect(texts.some(t => t.includes('yes'))).toBe(true)
+  expect(texts.some(t => MOCK.test(t))).toBe(false)
+  expect(view.mock).toBe(false)
+})
+
+test('the same id in two runs gets two keys, and the hint names the run', () => {
+  const a = { ...ASK_A, run: 'r1' }
+  const b = { ...ASK_A, run: 'r2', text: 'other run' }
+  expect(askKey(a)).not.toBe(askKey(b))
+  const texts = allOf(waitingAsks(stubEls(), [a, b], 46, NOW), 'Text').map(t => text(t))
+  expect(texts.some(t => t.includes('--run r1'))).toBe(true)
+  expect(texts.some(t => t.includes('--run r2'))).toBe(true)
+})
+
+test('50 asks cap at 8 cards plus a +N more row, and long, unicode and odd ids fit 46 and 36', () => {
+  const many: PendingAsk[] = Array.from({ length: 50 }, (_, i) => ({
+    id: i === 7 ? 'm-7-odd' : `m-${String(i)}`,
+    run: i % 2 === 0 ? 'r1' : 'r2',
+    task: 'T1',
+    text: i === 3 ? 'a very long question that would overflow a narrow pane if it were not cut: ' + 'x'.repeat(200) : 'ask',
+    ts: NOW,
+  }))
+  many.push({ id: 'm-ü', run: 'r1', task: 'TΩ', text: 'unicode: 質問 🤔 café', ts: NOW })
+  for (const cols of [46, 36]) {
+    const tree = waitingAsks(stubEls(), many, cols, NOW)
+    const widths = textWidths(tree)
+    expect(Math.max(...widths), `${String(cols)} cols`).toBeLessThanOrEqual(cols)
+    const texts = allOf(tree, 'Text').map(t => text(t))
+    expect(texts.filter(t => t.startsWith('m-')).length, 'capped').toBeLessThanOrEqual(ASK_CAP)
+    expect(texts.some(t => t.includes('+') && t.includes('more')), 'the overflow row').toBe(true)
+  }
+})
+
+/** Independent of `cellWidth`: emoji presentation and CJK/kana/hangul/
+ *  fullwidth are 2 cells; marks, ZWJ and variation selectors are 0. */
+function refWidth(s: string): number {
+  const wide = /\p{Emoji_Presentation}|[\u1100-\u115F\u2E80-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFF00-\uFF60\uFFE0-\uFFE6]/u
+  const zero = /\p{Mn}|\u200D|[\uFE00-\uFE0F]/u
+  let n = 0
+  for (const ch of s) {
+    if (zero.test(ch)) continue
+    n += wide.test(ch) ? 2 : 1
+  }
+  return n
+}
+
+test('emoji, CJK, ZWJ, combining, tab and ellipsis fit the pane', () => {
+  const samples = [
+    '🚀'.repeat(40), '✅'.repeat(40), '🫶'.repeat(40), '⚡'.repeat(40), '❌'.repeat(40),
+    '🤔'.repeat(40), '質問'.repeat(30), 'ひらがな'.repeat(15), '한국어'.repeat(20),
+    '👨‍👩‍👧'.repeat(20), 'é'.repeat(60), 'a\tb '.repeat(20), '…'.repeat(60),
+  ]
+  for (const cols of [46, 36]) {
+    for (const sample of samples) {
+      const tree = waitingAsks(stubEls(), [{ id: 'm-1', run: 'r1', task: 'T1', text: sample, ts: NOW }], cols, NOW)
+      const widest = Math.max(...allOf(tree, 'Text').map(t => refWidth(text(t))))
+      expect(widest, `${JSON.stringify(sample.slice(0, 4))} at ${String(cols)}`).toBeLessThanOrEqual(cols)
+    }
+  }
+})
+
+test('46 and 36 col renders do not overflow', () => {
+  for (const cols of [46, 36]) {
+    const tree = waitingAsks(stubEls(), [ASK_A, ASK_B], cols, NOW)
+    const widths = textWidths(tree)
+    expect(Math.max(...widths), `${String(cols)} cols`).toBeLessThanOrEqual(cols)
+    expect(allOf(WaitingTab(stubEls(), emptyWaitingView(), cols), 'Text').map(t => text(t)).join('').length).toBeLessThanOrEqual(cols)
+  }
+})
+
+test('the tick calls the runner once, and a dead bus is down without a second spawn', async () => {
+  const seen: string[][] = []
+  const live = (async (argv: readonly string[]) => {
+    seen.push([...argv])
+    return { stdout: PENDING_CAPTURED, code: 0 }
+  }) as unknown as RunFn
+  const got = await readPending(live, '/plugin', '/tmp/proj')
+  expect(seen).toHaveLength(1)
+  expect(seen[0]?.slice(2)).toEqual(['pending', '--data', '/tmp/proj'])
+  expect(seen[0]?.join(' ').includes('--json')).toBe(false)
+  expect(got.live).toBe(true)
+  expect(got.asks.map(a => a.id)).toEqual(['m-1'])
+  expect(got.asks[0]?.run).toBe('r1')
+  const dead = runner('{"ok": false, "error": "bus down"}', 2)
+  const down = await readPending(dead, '/plugin')
+  expect(dead.calls).toBe(1)
+  expect(down.down).toBe(true)
+  expect(down.live).toBe(false)
+  const empty = runner(JSON.stringify({ ok: true, run: 'r1', pending: [] }))
+  const none = await readPending(empty, '/plugin')
+  expect(none.live).toBe(true)
+  expect(none.asks).toEqual([])
 })
