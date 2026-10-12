@@ -23,6 +23,7 @@ import argparse, datetime, hashlib, json, multiprocessing, os, re, sqlite3, subp
 sys.dont_write_bytecode = True
 
 SCHEMA = 3
+ROOT_SCHEMA = 1  # open_root stamps v1 and never migrates the root store; project stores go to SCHEMA
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
 TYPES = ("phase", "task", "subtask")
 # C4: the column a status lands in. Attention statuses keep their column and raise the flag.
@@ -151,6 +152,55 @@ def _connect(path):
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA busy_timeout=5000")
     con.execute("PRAGMA foreign_keys=ON")
+    return con
+
+
+def _connect_ro(path):
+    """Open an existing store read-only. Never creates the file, its directory, or -wal/-shm.
+
+    mode=ro is the documented exception to the single-writer rule: a read must not migrate,
+    stamp schema_version, or otherwise write. query_only is belt and braces on top of the URI.
+    """
+    # immutable=1 stops SQLite creating -wal/-shm sidecars for a read (mode=ro alone still does).
+    uri = "file:" + path + "?mode=ro&immutable=1"
+    con = sqlite3.connect(uri, uri=True, timeout=5.0)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA query_only=ON")
+    con.execute("PRAGMA busy_timeout=5000")
+    con.execute("PRAGMA foreign_keys=ON")
+    return con
+
+
+def _schema_version(con):
+    """The stamped version, or 0 when the store has no schema_version table (a pre-v1 file)."""
+    row = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'").fetchone()
+    if not row:
+        return 0
+    got = con.execute("SELECT MAX(version) AS v FROM schema_version").fetchone()
+    return got["v"] or 0
+
+
+def _open_read(path, version):
+    """Open path for a read, or None when the file does not exist.
+
+    A missing file returns None without creating anything. A store newer than this code is
+    refused (exit 3), same as a writer. An older store is refused (exit 2) instead of migrated:
+    a read must not write, and the caller is told to run a writer command.
+    """
+    if not os.path.isfile(path):
+        return None
+    con = _connect_ro(path)
+    try:
+        have = _schema_version(con)
+    except Exception:
+        con.close()
+        raise
+    if have > version:
+        con.close()
+        raise Fail(f"store schema v{have} is newer than this code (v{version}); upgrade mkdb.py", 3)
+    if have < version:
+        con.close()
+        raise Fail(f"store schema v{have} needs migration to v{version}; run a writer command")
     return con
 
 
@@ -829,8 +879,14 @@ def put_artifact(home, project, run, task, round, kind, text, *, event_id=None, 
 
 
 def timeline(home, project, run, task, data_dir=None):
-    """SELECT … FROM events WHERE run=? AND task=? ORDER BY id."""
-    con = open_project(home, project, data_dir)
+    """SELECT … FROM events WHERE run=? AND task=? ORDER BY id.
+
+    A missing store is an empty timeline: no file and no directory is created.
+    """
+    path = os.path.join(project_dir(home, project, data_dir), "mk.db")
+    con = _open_read(path, SCHEMA)
+    if con is None:
+        return []
     try:
         return [dict(r) for r in con.execute(
             "SELECT id, run, task, t, chan, kind, to_id, text FROM events"
@@ -840,8 +896,14 @@ def timeline(home, project, run, task, data_dir=None):
 
 
 def cards(home, project=None):
-    """Read the root store's cards, optionally one project."""
-    root = open_root(home)
+    """Read the root store's cards, optionally one project.
+
+    A missing root store is an empty card list: <home>/mk.db is not created.
+    """
+    check_home(home)
+    root = _open_read(os.path.join(home, "mk.db"), ROOT_SCHEMA)
+    if root is None:
+        return []
     try:
         if project:
             rows = root.execute("SELECT * FROM cards WHERE project=? ORDER BY change_no", (project,))
@@ -984,6 +1046,7 @@ def self_test():
         _v1_upgrade(home)
         _lane_slots_v3(home)
         _card_verdict(home)
+        _reads_create_nothing(home)
         _single_writer()
     print(json.dumps({"ok": True, "self_test": "pass"}))
     return 0
@@ -1942,6 +2005,84 @@ def _card_verdict(home):
     caught = catch_up(home, "verdict", data)
     got = cards(home, "verdict")
     _check(caught >= 1 and got[0]["verdict"] == "REQUEST CHANGES", f"catch_up verdict {got} n={caught}")
+
+
+def _listing(path):
+    """Every path under path, relative, so a read that creates anything is visible."""
+    found = []
+    for dirpath, dirs, files in os.walk(path):
+        dirs.sort()
+        for name in sorted(dirs + files):
+            found.append(os.path.relpath(os.path.join(dirpath, name), path))
+    return sorted(found)
+
+
+def _file_hash(path):
+    return hashlib.sha256(open(path, "rb").read()).hexdigest() if os.path.exists(path) else None
+
+
+def _reads_create_nothing(home):
+    """Y1: cards and timeline never create a store, and a read never writes or migrates one."""
+    empty = os.path.join(home, "empty-read")
+    os.makedirs(empty)
+    before = _listing(empty)
+    got = json.loads(subprocess.check_output(
+        [sys.executable, __file__, "--home", empty, "cards", "--json"], text=True))
+    _check(got == {"ok": True, "cards": []}, f"empty cards {got}")
+    got = json.loads(subprocess.check_output(
+        [sys.executable, __file__, "--home", empty, "--project", "ghost",
+         "timeline", "--run", "r", "--task", "t", "--json"], text=True))
+    _check(got == {"ok": True, "events": []}, f"empty timeline {got}")
+    _check(_listing(empty) == before == [], f"empty home grew: {_listing(empty)}")
+    _check(cards(empty) == [] and timeline(empty, "ghost", "r", "t") == [], "api read created a store")
+    _check(_listing(empty) == [], "api read created a file")
+
+    data = os.path.join(home, "ro-read")
+    con = open_project(home, data_dir=data)
+    try:
+        add_task(con, "r", "t", "task", title="kept")
+    finally:
+        con.close()
+    transition(home, "ignored", "r", "t", "building", note="hello", data_dir=data)
+    db = os.path.join(data, "mk.db")
+    hashes = {name: _file_hash(os.path.join(data, name)) for name in ("mk.db", "mk.db-wal", "mk.db-shm")}
+    got = timeline(home, "ignored", "r", "t", data)
+    _check(any(e["text"] == "hello" for e in got), f"ro timeline {got}")
+    after = {name: _file_hash(os.path.join(data, name)) for name in ("mk.db", "mk.db-wal", "mk.db-shm")}
+    _check(after == hashes, f"read wrote the store: {hashes} -> {after}")
+
+    old = os.path.join(home, "ro-old")
+    con = open_project(home, data_dir=old, version=1, migrations=())
+    try:
+        add_task(con, "r", "t", "task", title="old")
+    finally:
+        con.close()
+    old_db = os.path.join(old, "mk.db")
+    old_hash = _file_hash(old_db)
+    try:
+        timeline(home, "ignored", "r", "t", old)
+    except Fail as e:
+        _check(e.code == 2 and "needs migration" in str(e), f"old-store error: {e}")
+    else:
+        raise SystemExit("SELF-TEST FAIL: an old store was read without a migration error")
+    _check(_file_hash(old_db) == old_hash, "reading an old store wrote it")
+    _check(not os.path.exists(old_db + "-wal"), "reading an old store created a wal")
+
+    root_old = os.path.join(home, "ro-root-old")
+    os.makedirs(root_old)
+    bare = sqlite3.connect(os.path.join(root_old, "mk.db"))
+    bare.execute("CREATE TABLE schema_version(version INTEGER PRIMARY KEY)")
+    bare.commit()
+    bare.close()
+    root_hash = _file_hash(os.path.join(root_old, "mk.db"))
+    try:
+        cards(root_old)
+    except Fail as e:
+        _check(e.code == 2 and "needs migration" in str(e), f"old root error: {e}")
+    else:
+        raise SystemExit("SELF-TEST FAIL: an unstamped root store was read without a migration error")
+    _check(_file_hash(os.path.join(root_old, "mk.db")) == root_hash, "reading an old root wrote it")
+    _check(not os.path.exists(os.path.join(root_old, "mk.db-wal")), "reading an old root created a wal")
 
 
 def _single_writer():
