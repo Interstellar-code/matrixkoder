@@ -81,6 +81,13 @@ EVENT_TYPES = ("transition", "decision", "verdict", "quota", "note")
 TASK_KEYS = ("status", "agent", "model", "effort", "lane", "pane", "branch", "workspace", "slot",
              "last_commit", "gates", "verdict", "reviewer")
 ROUND_KINDS = ("build", "fix", "takeover")
+# A new round must not inherit the previous round's terminal row. File mode never wrote
+# status on `task round` (the row stays whatever it was); the store path maps each kind
+# onto the status the board already uses for that kind, in the same commit as the bump.
+ROUND_STATUS = {"build": "planned", "fix": "fix", "takeover": "building"}
+# A terminal status is the one thing a new round must never inherit; a non-terminal one stays
+# (demoting building -> planned would skew every later transition's "from" against the file path).
+ROUND_TERMINAL = ("done", "verifying", "review", "merged", "blocked")
 ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 RECENT, BOARD_EVENTS = 10, 15
 DEP_MET = ("merged", "qa", "done")
@@ -702,6 +709,49 @@ class Store:
                 arts += self._round_artifacts(run, t)
         self.db().import_history(self.home_dir(), STORE_PROJECT, rid, run_row=self.run_row(run),
                                  tasks=tasks, events=events, artifacts=arts, data_dir=self.data)
+        # task round: the tasks row (and its root card) must not keep the previous round's
+        # terminal status or verdict. import_history already wrote the new status; the card
+        # is updated here, in this same commit, with no second event line.
+        reset = getattr(self, "_round_reset", None)
+        if reset:
+            self._round_reset = None
+            tid, kind = reset
+            task = next((t for t in run.get("tasks") or [] if t.get("id") == tid), None)
+            if task:
+                to = ROUND_STATUS[kind]
+                con = self.store_open()
+                try:
+                    row = con.execute("SELECT status, prev_status FROM tasks WHERE run=? AND id=?",
+                                      (rid, tid)).fetchone()
+                    cur = (row["status"] or "").lower() if row else None
+                    prev = row["prev_status"] if row else None
+                finally:
+                    con.close()
+                # a non-terminal row keeps its status (parity with the file path, which never
+                # rewrote it); a terminal one is reset to the kind's status. The verdict is
+                # ALWAYS cleared: a stale "DONE ..." verdict decides the watch on its own.
+                if cur and cur not in ROUND_TERMINAL:
+                    to = cur
+                self.db().transition(self.home_dir(), STORE_PROJECT, rid, tid, to,
+                                     note=f"round {task.get('round')} ({kind}) reset",
+                                     round=task.get("round") or 0, sync_root=True,
+                                     data_dir=self.data, verdict=None)
+                con = self.store_open()
+                try:
+                    extra = con.execute(
+                        "SELECT MAX(id) m FROM events WHERE run=? AND task=? AND kind='transition'"
+                        " AND to_id=? AND meta_json IS NULL",
+                        (rid, tid, to)).fetchone()
+                    if extra and extra["m"]:
+                        con.execute("DELETE FROM events WHERE id=?", (extra["m"],))
+                    # prev_status back to what the row held before the reset: the next real
+                    # transition must map columns exactly as the file path would have.
+                    if cur and cur not in ROUND_TERMINAL:
+                        con.execute("UPDATE tasks SET prev_status=? WHERE run=? AND id=?",
+                                    (prev, rid, tid))
+                    con.commit()
+                finally:
+                    con.close()
         # A status change goes through transition() so the root card is upserted (C5). The import
         # above already wrote the view event, so transition's own event is dropped: publish stays
         # one line, matching the file path. MK_ROOT_CRASH skips transition; the change_log row is
@@ -1830,6 +1880,10 @@ def cmd_task(a, st):
                                 "started": now()})
             st.event(run, "note", f"round {n} ({a.kind})" + (f": {a.cause}" if a.cause else ""),
                      task=t["id"], by=a.by)
+            # Store mode only, and only the store row: the file views (run.json, events,
+            # task.json) stay exactly what the file path writes. The watcher reads the row.
+            if st.store_on:
+                st._round_reset = (t["id"], a.kind)
         t["updated"] = now()
         st.save(run, t, a.by)
         warnings = st.refresh_others(run, a.by) if a.action == "set" else []
@@ -2440,8 +2494,13 @@ def self_test():
         t1 = mk("task", "set", "T1", "status=routed", "agent=codex", "model=gpt-5", "effort=high",
                 'gates={"test":"pass"}', "--by", "lane-watch")["task"]
         assert t1["status"] == "routed" and t1["gates"] == {"test": "pass"}
+        # file mode: a round bump never touches status or verdict (self-hosting guard)
+        before = mk("task", "get", "T1")["task"]
         r1 = mk("task", "round", "T1", "--kind", "build")
         assert r1["round"] == 1 and r1["brief"].endswith(os.path.join("tasks", "T1", "brief-r1.md"))
+        after = mk("task", "get", "T1")["task"]
+        assert after["status"] == before["status"] == "routed" and after["verdict"] == before["verdict"], after
+        assert not os.path.exists(os.path.join(data, "mk.db")), "file-mode round created mk.db"
         r2 = mk("task", "round", "T1", "--kind", "fix", "--cause", "brief gap")
         assert r2["round"] == 2 and r2["review"].endswith("review-r2.md") and r2["report"].endswith("report-r2.md")
         assert mk("task", "round", "T1", "--kind", "nap", code=2)["ok"] is False
@@ -3407,7 +3466,10 @@ def store_self_test(tmp, env):
     for rel in ("runs/s2/run.json", "runs/s2/events.jsonl", "runs/s2/board.md"):
         a = open(os.path.join(data, rel), "rb").read()
         b = open(os.path.join(twin, rel), "rb").read()
-        assert a == b, rel
+        if a != b:
+            open("/tmp/w1-diff-a.json","wb").write(a)
+            open("/tmp/w1-diff-b.json","wb").write(b)
+            raise AssertionError(rel)
     # index.json: the store run also holds s1, so compare the s2 entry, not the whole file
     ia = [r for r in json.load(open(os.path.join(data, "runs/index.json"))) if r["id"] == "s2"]
     ib = [r for r in json.load(open(os.path.join(twin, "runs/index.json"))) if r["id"] == "s2"]

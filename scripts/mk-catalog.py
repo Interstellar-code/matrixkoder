@@ -432,14 +432,24 @@ def cmd_set(home, agent, model, field, raw):
     return {"ok": True, "agent": agent, "model": model, "field": field}
 
 
+# Codex is never a builder. `routes` is the builder-pick list (Settings reviewer dropdowns keep a
+# hand-saved codex route through mk-config's stale-value fallback; they do not read this filter).
+NOT_A_BUILDER = frozenset({"codex"})
+
+
 def routes(home):
-    """Every runnable route: enabled agents x picked-or-probed models x supported efforts."""
+    """Every runnable builder route: enabled agents x picked-or-probed models x supported efforts.
+
+    Codex is omitted even when the agent is enabled: it is not a builder route.
+    """
     con = read_catalog(home)
     if con is None:
         return {"ok": True, "routes": []}
     try:
         out = []
         for agent in con.execute("SELECT id FROM agents WHERE status='enabled' ORDER BY id"):
+            if agent["id"] in NOT_A_BUILDER:
+                continue
             for model in con.execute("SELECT id, effort_levels_json FROM models WHERE agent=? AND"
                                      " status IN ('picked','probed') ORDER BY id", (agent["id"],)):
                 efforts = _load(model["effort_levels_json"], [])
@@ -632,6 +642,15 @@ def self_test():
         got = routes(home)["routes"]
         _check(all(not r.startswith("opencode ") for r in got), f"disabled agent still routed: {got}")
         _check(any(r.startswith("claude claude-sonnet ") for r in got), f"added agent missing: {got}")
+        # codex enabled is still not a builder route
+        open(yaml, "w").write(
+            "agents:\n"
+            "  codex: { available: true, models: [gpt-6-luna] }\n"
+            "  opencode: { available: true, models: [opencode/alpha] }\n")
+        _run(home, "seed", "--yaml", yaml, "--jev", jev, "--no-probe")
+        got = routes(home)["routes"]
+        _check(got and all(not r.startswith("codex ") for r in got), f"codex builder route: {got}")
+        _check(any(r.startswith("opencode ") for r in got), f"opencode dropped: {got}")
         _run(home, "set", "opencode", "notes", '"my custom note"')
         shown = _run(home, "show", "opencode")
         _check(shown["agent"]["notes"] == "my custom note", f"notes destroyed: {shown['agent']['notes']}")
