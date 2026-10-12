@@ -282,12 +282,15 @@ everything else `default`.
 | `task add` | `--id T --title TEXT [--wave N] [--deps A,RUN:B] [--owned glob,glob] [--parent P]` — deps are stored in the target's stored id case and a self-dep is refused; `--parent` onto a task in `merged`/`qa`/`done` fails; returns `warnings` for unknown deps, owned globs overlapping an unmerged task in any active run (the new task's own `--parent` chain is not an overlap: a parent owns its children's globs), and active sibling runs that could not be read |
 | `task set` | `T key=value ... [--note TEXT] [--force]` (`--force`: dispatch past unmet own+ancestor deps; writes a `decision` event naming `--by`); `status=` on a task with children fans out to every child — one transition each, the same `--note`, the parent itself never set directly (it rolls up), the dep gate applied per child before any write; status aliases `reviewing`/`merging`/`fixing` store as `review`/`merged`/`fix`; keys `status agent model effort lane pane branch workspace slot last_commit gates verdict reviewer`; a value starting `{`/`[` is parsed as JSON, empty = null |
 | `task round` | `T --kind build\|fix\|takeover [--cause TEXT]`; `T --undo` drops the latest round — but only while none of its brief/report/review files exist (the paths `task round` returned), else `ok:false` naming them; exactly one note event (`round N undone`); no rounds / `--kind` with `--undo` are refused |
-| `task verify` | `T --tests '<pass>/<fail>' [--tsc N] [--lint N] [--selftest '<run>/<failed>'] [--fail TEXT]` — stage 7; one `verdict` event, baseline compare, status move (see the subsection below) |
+| `task verify` | `T --tests '<passed>/<failed>' [--tsc N] [--lint N] [--selftest '<run>/<failed>'] [--fail TEXT]` — stage 7; one `verdict` event, baseline compare, status move (see the subsection below). A failed count larger than the passed count is refused |
 | `task get` | `T` |
 | `event` | `[--task T] --type transition\|decision\|verdict\|quota\|note --text TEXT [--from S] [--to S]` |
 | `wait set` / `wait clear` | `--question TEXT --options a,b [--rec TEXT]` |
 | `lock take` / `release` / `check` | `RES --reason TEXT [--ttl-min 30] [--scope a,b] [--force-stale]`; `release RES [--force]` |
 | `render` | regenerate `board.md` |
+| `store enable` / `store status` | opt-in to the SQLite store (see below) |
+| `sync` | `[--project SLUG]` — root-card catch-up (see below) |
+| `export-legacy` | `--run R` — rebuild the legacy files from the tables (see below) |
 
 Common flags: `--data DIR`, `--by WHO` (default `orchestrator`; written to events and locks), `--run ID`
 for task/event/wait/render (`run *` commands take `--id`, alias `--run`).
@@ -301,6 +304,14 @@ and is skipped for cross-run `ready`/board upkeep. Flags never prefix-match (`--
 argument). `task round` returns `{round, kind, brief, report, review}` absolute paths for that round;
 `task round --undo` returns `{round, undone}` with `round` back to the remaining round number.
 
+Every lane-watch verdict's evidence ends with a source tag saying which channel decided it:
+`source=store` (the project store's `tasks` row — `store row done` / `store row blocked`),
+`source=status` (the accepted status file — `status file done (seq N)`), `source=pane` (the
+pane text: the DONE token, QUOTA, STALL, ERROR, WATCH_EXPIRED), or `source=grace` (the
+no-token rule: commit and report present, agent idle, token missing). The store is read only
+when `<data>/mk.db` already exists — a watch never creates it, and without it the status file
+and the pane text decide.
+
 lane-watch exit → task status (with `--task --data`, both required together): `DONE`/`DONE_SENT → verifying`,
 `QUOTA → quota`, `STALL → stalled`, `PROVIDER → provider`, `BLOCKED → blocked` — only while the task is
 `dispatched|building|stalled|quota|provider|blocked`; otherwise the status is kept and a `note` event is
@@ -311,8 +322,10 @@ logged. `DEV_SERVER`, `ERROR`, `WATCH_EXPIRED` only append a `note` event.
 `task verify T --tests '<pass>/<fail>' [--tsc N] [--lint N] [--selftest '<run>/<failed>'] [--fail 'why']`
 records a verify gate run as **one `verdict` event** on `T` (the `--by` flag rides on it) whose text
 spells the counts in human-readable form, e.g. `tests 250/1 · tsc 0 · lint 0 · selftest 8/0` — flags
-not passed are simply left out. `--tests` is required and must match `<int>/<int>`; so must
-`--selftest` when given.
+not passed are simply left out. `--tests` is required and must match `<passed>/<failed>` — two integers. A failed count
+larger than the passed count is refused (`bad --tests '3/5' … the failed count is larger
+than the passed count, which looks like passed/total`), since that shape usually means the
+caller passed passed/total; equal counts pass the check. So must `--selftest` when given.
 
 The counts are compared with the run's **latest `baseline:` `decision` event** — the last event of
 type `decision` whose text starts with `baseline:`; its `tests P/F` and `selftest R/F` numbers are
@@ -339,7 +352,57 @@ current sha256 (plain read) differs from `plan_sha`, a `⚠ plan file changed si
 an unreadable plan file means no warning and no crash. Setting the **last** run of a plan `done`
 runs `set --status done` on the plan and flips the run's `plan_status` (best-effort, never fatal; a
 plan-tool error rides back as a `warning` in the `run set` JSON).
+`run set --status done` also promotes: every task of this run at `merged` or `qa` moves to `done`,
+one transition each, noted `promoted by closing the run`. The reply carries `promoted`, the list of
+task ids this call moved (`[]` when there were none). The promotion is best-effort and never fails
+the command: if one task raises midway, the tasks already moved stay moved and the reply also
+carries `promote_error` (`"<Error>: <message>"`) — a key present only on that failure. Re-running
+`run set --status done` on an already-done run promotes whatever is still at `merged` or `qa`, so
+it repairs a partial promotion.
 `task add` stays for ad-hoc tasks.
+
+## Store mode (`store enable`)
+
+Off by default: `store status` answers `{"store": "off"}` while `<data>/mk.db` does not exist, and
+every command keeps using the JSON files. `store enable` is the opt-in. It creates the project
+store, imports the active run (reply `{"store": "on", "imported": "<run>", "events": N, "tasks": N,
+"legacy": "<data>/runs-legacy"}`), and moves the current `runs/` tree to `<data>/runs-legacy/` — a
+read-only copy taken at enable time, not updated again.
+
+With the store on, all writes go through the store and the legacy views under `runs/` are
+republished from it: `run.json`, `tasks/` and `board.md` are rewritten, and `events.jsonl` is
+append-only — new events are appended, the file is never rewritten. `runs/<run>/.store-event`
+remembers how far the republish got. `store status` then answers `{"store": "on"}`.
+
+`export-legacy --run R` rebuilds that run's legacy files from the tables (reply `{"ok": true, "run": R}`).
+
+`sync [--project SLUG]` catches the root `cards` up from `sync.last_change_no`: it copies the
+`change_log` rows the root is behind on and answers `{"store": "on", "project": "<slug>", "copied": N}`.
+Run again it copies nothing (`"copied": 0`) — it is idempotent, and `last_change_no` only moves
+forward. The project defaults to `matrixkoder`.
+
+`run archive` with the store on first backs the project store up: `VACUUM INTO` a temp file
+(`<data>/archive/<run>.db.tmp`), checked to hold the run and its task count, then renamed to
+`<data>/archive/<run>.db`. The backup is written to the temp file first, and an existing backup is
+never overwritten — when `<run>.db` is already there the new one lands beside it as
+`<run>-<UTC timestamp>.db` (e.g. `r1-20261012T031854Z.db`). The backup happens before the status
+commit: if it fails, the temp file is removed and the run stays active.
+
+`plan sync` on the store adds `version_diff` to its reply — the list of plan fields whose stored
+version differs from the parsed file (`[]` when they match). The dry run still writes nothing.
+`--apply` writes the new plan version into the `plans` table (version + 1) when there is a diff,
+and the reply gains `version`, the stored version number.
+
+## Data dir resolution
+
+`<data>` resolves in this order: `--data` > `$MATRIXKODER_DATA` > the root `projects` table (by
+repo path) > `<home>/projects.json` > `<main checkout>/.matrixkoder`. The repo is the nearest
+`.git` above the cwd, never `$HOME` itself, and a linked worktree maps to its main checkout.
+Reading the root table checks that `<home>/mk.db` exists first, so resolving never creates it.
+`projects.json` is `{"<repo>": {"data_dir": ...}}`, keyed by the repo's real path. Registering a
+project writes both the root `projects` table and `projects.json`; the slug is checked against
+`^[a-z0-9][a-z0-9-]{0,40}$` before either is touched, and a bad slug writes nothing.
+
 
 ## SQLite stores (`scripts/mkdb.py`)
 
@@ -479,7 +542,7 @@ mkdb.py --self-test
 ```
 
 `timeline` is `SELECT … FROM events WHERE run=? AND task=? ORDER BY id`. `cards` reads the root
-store. One JSON line per call; errors exit 2, a newer store exits 3.
+store. `mk-catalog.py` follows the same rule for the root store: its read commands (`list`, `show`, `routes`, `model`) go through `read_catalog`, which returns an empty result when `<home>/mk.db` is absent (`list` and `routes` answer `{"ok": true, …: []}`) and never creates it, while the writers `seed` and `set` call `open_catalog` and do create it (`set` creates it even when the agent is unknown and the command then refuses). One JSON line per call; errors exit 2, a newer store exits 3.
 
 ### `import_history(home, project, run, *, run_row=None, tasks=(), events=(), artifacts=(), data_dir=None)`
 
