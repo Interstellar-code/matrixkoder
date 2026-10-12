@@ -1,0 +1,62 @@
+  ┃
+  ┃  $ rg -n "def prompt_marker|text.split|first line" scripts/mk-lane-event.py | head -15    I'll read the brief and follow it
+  ┃                                                                                           exactly, starting with the
+  ┃  406:def prompt_marker(text):                                                             integration branch merge.The brief
+  ┃  408:    trimmed, capped at 60 chars. The first line carries the meaningful prefix (      i...
+  ┃  paths, ids, the
+  ┃  1218:    # time; the marker is --text's first line (up to the first newline), capped     Context
+  ┃  at 60 chars                                                                              85,496 tokens
+  ┃  1887:        # that is NEW since this dispatch started — the first line of --text        43% used
+  ┃  that was ALREADY
+  ┃                                                                                           MCP
+                                                                                              • headroom                  Connected
+  ┃                                                                                           • serena                    Connected
+  ┃  $ sed -n 690,729p < /home/builder
+  ┃  py
+  ┃
+  ┃  (34 earlier lines)
+  ┃                      if x)[:300] or f"herdr exited {r.returncode} with no output"
+  ┃      if r.returncode == 0 and isinstance(j, dict) and "result" in j and jerr is None \
+  ┃              and status != "agent_prompt_stalled":
+  ┃          return "ok", why, status, j
+  ┃      if status == "agent_prompt_stalled" or "timeout" in why.lower() or "timed out" in
+  ┃  why.lower():
+  ┃          return "wait", why, status, j
+  ┃
+
+     The fake herdr records only the first line of the prompt. I’ll put the job hint on
+     that same line.
+
+  ┃
+  ┃  $ python3 << 'PY'
+  ┃  from pathlib import Path…
+  ┃
+  ┃  one line
+  ┃
+
+  ┃
+  ┃  $ nohup python3 -u scripts/mk-lane-event.py --self-test > /tmp/d7b-ev4.log 2>&1 & ech
+  ┃  o $! > /tmp/d7b-ev4.pid; echo started $(cat /tmp/d7b-ev4.pid)
+  ┃
+  ┃  started 28253
+  ┃
+
+     The suite is pid 28253. I’ll wait for it to finish.
+
+  ┃
+  ┃  $ for i in $(seq 1 36); do if ! ps -p 28253 >/dev/null 2>&1; then break; fi; sleep 5;
+  ┃   done; wc -c /tmp/d7b-ev4.log; tail -n 12 /tmp/d7b-ev4.log; ps -p 28253 -o eti…
+  ┃
+  ┃  (no output)
+  ┃
+  ┃  Command exceeded timeout of 120000 ms. Retry with a larger timeout if the command is
+  ┃  expected to take longer.
+  ┃  Timed out before completion
+  ┃
+
+  ┃
+  ┃
+  ┃
+  ┃  Build auto · Manifest Auto Manifest · high
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ⬝⬝⬝⬝⬝⬝⬝⬝ esc interrupt                                     0.0K (0%)  ctrl+p commands    …/matrixkoder-mk-1:mk/mk-store-r1/d7b

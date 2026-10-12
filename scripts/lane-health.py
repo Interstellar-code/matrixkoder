@@ -131,13 +131,50 @@ def last_change_min(lane, since=0.0):
     return round((time.time() - newest) / 60, 1) if newest else None
 
 
+# The agent's own error banner, not a word inside something it ran. OpenCode/AGY/Claude print
+# these as their own line: "Error: ...", "retrying in ...", "rate limit", "usage limit", or an
+# HTTP status inside an API error block. A test log that merely contains the words does not.
+BANNER_RE = re.compile(
+    r"(?i)^(?!.*[\u2503\u2502]).*(?:"
+    r"\berror\s*:"
+    r"|retrying\s+in\b"
+    r"|\brate\s+limit\b"
+    r"|\b(?:usage|weekly|5-hour|5h|hourly|daily|session|plan|individual)\s+(?:limit|quota)\b"
+    r"|\bquota\s+(?:reached|exceeded)\b"
+    r"|\busage\s+exceeded\b"
+    r"|api\s+error\b.*\b[45]\d\d\b"
+    r"|\b(?:status|http)\s*[:=]?\s*[45]\d\d\b"
+    r")")
+# Tool output is the block a command the agent ran produced. herdr draws it between box rules;
+# a leading `$`, `>`, or a test-runner line is the same thing in a transcript.
+TOOL_OUTPUT_RE = re.compile(
+    r"[\u2503\u2502]|(?:^|\n)\s*(?:\$|>)\s|^(?:FAIL|PASS|ERROR|ok|not ok)\b", re.M)
+BANNER_LINES = 40  # a banner scrolled above the last N lines is no longer the agent's state
+
+
+def banner_lines(text):
+    """Lines of the agent's own speech that carry an error-banner shape, from the last N lines.
+    A line inside a tool-output block (┃ rules, a shell prompt, a test-runner line) never counts,
+    so `unauthorized`, `401`, `quota` in a test name or assertion cannot raise a verdict."""
+    lines = text.splitlines()[-BANNER_LINES:]
+    out = []
+    for ln in lines:
+        if TOOL_OUTPUT_RE.search(ln):
+            continue
+        if BANNER_RE.search(ln) or PROVIDER_RE.search(ln):
+            out.append(ln)
+    return out
+
+
 def classify(text, status, idle_min, stall_min):
     """text must already be scoped with since_dispatch()."""
     tail = text[-4000:]
-    hits = quota_hits(tail)
+    # QUOTA and PROVIDER come only from the agent's own error banner, never from tool output.
+    banner = "\n".join(banner_lines(tail))
+    hits = quota_hits(banner)
     if hits:
         return "QUOTA", hits[-2:]
-    prov = PROVIDER_RE.search(tail)
+    prov = PROVIDER_RE.search(banner)
     if prov:
         return "PROVIDER", [prov.group(0)]
     if status == "blocked":
@@ -314,6 +351,23 @@ def self_test_body(shutil):
     assert classify("  $ pnpm dev", "working", 1, 10)[0] == "DEV_SERVER"
     assert classify("thinking", "working", 12, 10)[0] == "STALL"
     assert classify("thinking", "working", 3, 10)[0] == "OK"
+
+    # A1: words inside tool output never raise a verdict while the agent is working.
+    # The ┃ block is how a real herdr pane draws command output (scripts/fixtures/pane-working.txt).
+    tool = "\n".join([
+        "running the suite",
+        "  \u2503",
+        "  \u2503  FAIL test_unauthorized_401",
+        "  \u2503  AssertionError: 403 quota rate limit",
+        "  \u2503",
+    ])
+    assert classify(tool, "working", 1, 10)[0] == "OK", classify(tool, "working", 1, 10)
+    # a banner of the agent's own, then tool output below it, still matches
+    banner_then_tool = "Error: subscription is required\n" + tool
+    assert classify(banner_then_tool, "working", 1, 10)[0] == "PROVIDER"
+    # a banner scrolled above the last N lines does not
+    scrolled = "Error: unauthorized\n" + "\n".join(["working"] * (BANNER_LINES + 5))
+    assert classify(scrolled, "working", 1, 10)[0] == "OK", classify(scrolled, "working", 1, 10)
     m = RESET_AT_RE.search("will reset at 2026-10-07 10:02:14")
     assert m and m.group(1) == "2026-10-07 10:02:14"
     assert classify("Upstream request failed: An active OpenCode Go subscription is required", "working", 1, 10)[0] == "PROVIDER"
