@@ -75,11 +75,18 @@ def home_of(arg):
     return mkdb.resolve_home(arg)
 
 
+def store_path(home):
+    """The root store file mkdb.open_root would create. Reads check this before opening."""
+    return os.path.join(home, "mk.db")
+
+
 def open_catalog(home):
     """The root connection from mkdb. The C8 tables are created on it, idempotently.
 
     mkdb's migration list only applies versions up to its own SCHEMA, so a catalog migration
     passed in would be skipped. The connection is still one mkdb opened; this script never opens a database itself.
+    Writers (seed, set) call this and may create the file. Read commands must not: they call
+    read_catalog, which returns None when the store is absent.
     """
     con = mkdb.open_root(home)
     con.executescript(CATALOG_DDL)
@@ -328,8 +335,21 @@ def seed(home, yaml_path, jev_path, probe=True):
     return {"ok": True, "agents": len(names), "models": count}
 
 
+def read_catalog(home):
+    """Open the catalog for a read, or None when <home>/mk.db does not exist yet.
+
+    Checked before open_catalog so a read never creates the root store. Writers keep calling
+    open_catalog directly.
+    """
+    if not os.path.isfile(store_path(home)):
+        return None
+    return open_catalog(home)
+
+
 def cmd_list(home):
-    con = open_catalog(home)
+    con = read_catalog(home)
+    if con is None:
+        return {"ok": True, "agents": [], "models": []}
     try:
         agents = [dict(r) for r in con.execute("SELECT * FROM agents ORDER BY id")]
         models = [dict(r) for r in con.execute("SELECT * FROM models ORDER BY agent, id")]
@@ -339,7 +359,9 @@ def cmd_list(home):
 
 
 def cmd_show(home, agent, model):
-    con = open_catalog(home)
+    con = read_catalog(home)
+    if con is None:
+        raise Fail(f"no agent {agent!r}")
     try:
         row = con.execute("SELECT * FROM agents WHERE id=?", (agent,)).fetchone()
         if not row:
@@ -412,7 +434,9 @@ def cmd_set(home, agent, model, field, raw):
 
 def routes(home):
     """Every runnable route: enabled agents x picked-or-probed models x supported efforts."""
-    con = open_catalog(home)
+    con = read_catalog(home)
+    if con is None:
+        return {"ok": True, "routes": []}
     try:
         out = []
         for agent in con.execute("SELECT id FROM agents WHERE status='enabled' ORDER BY id"):
@@ -470,7 +494,7 @@ def match_footer(con, text):
 def pane_model(pane, text=None, home=None):
     """The model in a herdr pane footer, matched against the catalog. --text feeds the footer."""
     text = _footer_text(pane, text)
-    con = open_catalog(home) if home else None
+    con = read_catalog(home) if home else None
     try:
         found = match_footer(con, text) if con else None
     finally:
@@ -663,6 +687,42 @@ def self_test():
             bad = [ln for ln in fh if "sqlite3" in ln and "connect" in ln and "mkdb" not in ln
                    and not ln.lstrip().startswith("_check")]
             _check(bad == [], f"this script opens a database itself: {bad}")
+    # a read against an empty home must not create mk.db (todo 49)
+    with tempfile.TemporaryDirectory() as empty:
+        before = sorted(os.listdir(empty))
+        listed = _run(empty, "list", "--json")
+        _check(listed == {"ok": True, "agents": [], "models": []}, f"empty list {listed}")
+        _check(sorted(os.listdir(empty)) == before, f"list created {os.listdir(empty)}")
+        routed = _run(empty, "routes", "--json")
+        _check(routed == {"ok": True, "routes": []}, f"empty routes {routed}")
+        _check(os.listdir(empty) == [], f"routes created {os.listdir(empty)}")
+        try:
+            _run(empty, "show", "opencode")
+        except Fail as e:
+            _check("no agent" in str(e), f"empty show {e}")
+        else:
+            raise SystemExit("SELF-TEST FAIL: show on an empty home succeeded")
+        _check(os.listdir(empty) == [], f"show created {os.listdir(empty)}")
+        try:
+            _run(empty, "model", "--pane", "pane-1", "--text", "no model here")
+        except Fail as e:
+            _check("no known model" in str(e), f"empty model {e}")
+        else:
+            raise SystemExit("SELF-TEST FAIL: model on an empty home succeeded")
+        _check(os.listdir(empty) == [], f"model created {os.listdir(empty)}")
+        # writers still create the store; fixtures live beside the home, not inside it
+        side = tempfile.mkdtemp(dir=os.path.dirname(empty))
+        yaml = os.path.join(side, "matrixkoder.yaml")
+        open(yaml, "w").write("agents:\n  opencode: { available: true, models: [opencode/alpha] }\n")
+        jev = os.path.join(side, "models.md")
+        open(jev, "w").write("## Codex (official)\n\n| Model | Jev note |\n|---|---|\n| `gpt-6-luna` | fast |\n")
+        seeded = _run(empty, "seed", "--yaml", yaml, "--jev", jev, "--no-probe")
+        _check(os.path.isfile(store_path(empty)), "seed did not create the store")
+        _check(seeded["ok"] is True and seeded["models"] >= 1, f"seed {seeded}")
+        shown = _run(empty, "show", "opencode", "opencode/alpha")
+        _check(shown["ok"] and shown["model"]["status"] == "picked", f"seeded show {shown}")
+        got = _run(empty, "routes", "--json")["routes"]
+        _check(got == [f"opencode opencode/alpha {e}" for e in ("low", "medium", "high")], f"seeded routes {got}")
     print(json.dumps({"ok": True, "self_test": "pass"}))
     return 0
 
