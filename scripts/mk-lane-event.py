@@ -656,42 +656,107 @@ def mark_armed_building(pane):
     return res
 
 
-def selftest_jobs_hint(data):
-    """The per-lane self-test job budget: max(1, total // active_lanes).
-
-    total comes from `mk-config.py get session.selftest_jobs_total`, bounded at 5 s;
-    a failed lookup uses 4. active_lanes is the number of armed lanes for this data
-    dir (at least 1). An existing MK_SELFTEST_JOBS in the environment wins and is
-    returned as-is. The result is a number, never a model or effort choice.
-    """
-    env = os.environ.get("MK_SELFTEST_JOBS")
-    if env and env.strip():
-        return env.strip()
-    total = 4
+def selftest_jobs_total(data):
+    """session.selftest_jobs_total from mk-config.py, looked up by the HERE path so the
+    cwd does not matter. Bounded at 5 s. A failure, or a value outside 1..16 (the same
+    range scripts/selftest.sh accepts), uses 4."""
     try:
         r = subprocess.run(
-            [sys.executable, "mk-config.py", "get",
+            [sys.executable, os.path.join(HERE, "mk-config.py"), "get",
              "session.selftest_jobs_total", "--data", data],
             capture_output=True, text=True, timeout=5)
         if r.returncode == 0 and r.stdout.strip():
             j = json.loads(r.stdout.strip().splitlines()[-1])
             v = j.get("value")
-            if isinstance(v, int) and not isinstance(v, bool) and v >= 1:
-                total = v
+            if isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= 16:
+                return v
     except Exception:
-        total = 4
-    active = len(armed_lanes(data)) or 1
+        pass
+    return 4
+
+
+def selftest_jobs_hint(data, active=None):
+    """The per-lane self-test job budget: max(1, total // active_lanes).
+
+    An existing MK_SELFTEST_JOBS in the environment wins and is returned as-is.
+    active overrides the armed-lane count (tests); otherwise it is the number of
+    armed lanes for this data dir, at least 1. The result is a number, never a
+    model or effort choice.
+    """
+    env = os.environ.get("MK_SELFTEST_JOBS")
+    if env and env.strip():
+        return env.strip()
+    total = selftest_jobs_total(data)
+    if active is None:
+        active = len(armed_lanes(data)) or 1
+    active = active or 1
     return str(max(1, total // active))
 
 
+def bus_is_up(data):
+    """True only when a bus is already serving this data dir. Reads bus.json and probes
+    /health; never calls ensure, so a down bus stays down and the full prompt is kept."""
+    if not data:
+        return False
+    override = os.environ.get("MK_BUS_DIR")
+    bus_dir = os.path.abspath(os.path.expanduser(override)) if override else data
+    try:
+        with open(os.path.join(bus_dir, "bus.json")) as f:
+            info = json.load(f)
+        port = int(info.get("port"))
+    except (OSError, ValueError, TypeError):
+        return False
+    try:
+        r = subprocess.run(
+            [sys.executable, "-c",
+             "import sys,urllib.request; urllib.request.urlopen(sys.argv[1], timeout=2).read()",
+             f"http://127.0.0.1:{port}/health"],
+            capture_output=True, text=True, timeout=5)
+    except Exception:
+        return False
+    return r.returncode == 0
+
+
+def brief_body_for(data, run, task):
+    """The brief the orchestrator would hand the lane: the newest brief-rN.md for the task."""
+    d = os.path.join(data, "runs", run, "tasks", task)
+    best, best_n = None, -1
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return None, None
+    for name in names:
+        m = re.fullmatch(r"brief-r(\d+)\.md", name)
+        if m and int(m.group(1)) > best_n:
+            best, best_n = os.path.join(d, name), int(m.group(1))
+    if not best:
+        return None, None
+    try:
+        return open(best).read(), best_n
+    except OSError:
+        return None, None
+
+
+def publish_brief(data, run, task):
+    """Send the task's current brief to the lane as the orchestrator. File mode uses kind
+    info (the only kinds a file-mode bus accepts); store mode uses kind task. -> (ok, error)."""
+    text, n = brief_body_for(data, run, task)
+    if text is None:
+        return False, "no brief"
+    body = f"round:{n}\nkind:brief\n{text}"
+    kind = "task" if os.path.isfile(os.path.join(data, "mk.db")) else "info"
+    _j, err = run_bus(["send", "--data", data, "--run", run, "--task", task,
+                       "--kind", kind, "--from", "orch", "--to", task, "--text", body])
+    return err is None, err
+
+
 def connect_text(lane, data):
-    """The one line a bus-enabled dispatch types: connect, plus the job-budget hint."""
+    """The one line a bus-up dispatch types: connect, plus the job-budget command."""
     skill = os.path.join(lane, ".claude", "skills", "mk-builder")
     n = selftest_jobs_hint(data) if data else "4"
-    # One line: the fake herdr and the prompt marker both keep only the first line,
-    # and the hint has to travel with the doorbell.
-    return (f"Run: python3 {skill}/scripts/mk-builder.py connect"
-            f" — run self-test suites with MK_SELFTEST_JOBS={n}")
+    # One line: the fake herdr and the prompt marker both keep only the first line.
+    # The hint is a command prefix, so typing it is how the builder's shell gets the var.
+    return (f"MK_SELFTEST_JOBS={n} python3 {skill}/scripts/mk-builder.py connect")
 
 
 def delivered_status(pane, role):
@@ -762,10 +827,17 @@ def cmd_dispatch(a):
     # prompt is only the connect doorbell. Without the flag the caller's full prompt
     # is typed unchanged — that is the bus-down path, and every dispatch that predates
     # the doorbell.
+    # The doorbell replaces the prompt ONLY when the bus is actually up and the brief
+    # was published. A yaml flag is not enough: a bus that is enabled but down, or a
+    # publish that fails, keeps today's full prompt (C12).
     if "--connect" in a and opt(a, "--role", "build") == "build":
         hit = find_armed(pane)
-        if hit and bus_enabled(hit[1].get("data") or ""):
-            text = connect_text(hit[1].get("lane") or "", hit[1].get("data") or "")
+        wdata = (hit[1].get("data") or "") if hit else ""
+        wrun, wtask = (hit[1].get("run"), hit[1].get("task")) if hit else (None, None)
+        if hit and bus_enabled(wdata) and bus_is_up(wdata):
+            ok, _err = publish_brief(wdata, wrun, wtask)
+            if ok:
+                text = connect_text(hit[1].get("lane") or "", wdata)
     role = opt(a, "--role", "build")
     if role not in ("build", "review"):
         fail("--role must be build or review")
@@ -914,37 +986,64 @@ def cmd_disarm(a):
     out({"ok": True, "lane": lane, "removed": removed, "bus": bus})
 
 
+ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 SEV_RANK = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
 SEV_ORDER = ("CRITICAL", "HIGH", "MEDIUM", "LOW")
 
 
 def review_verdict(text):
-    """The verdict word on the review's title line: APPROVE or REQUEST CHANGES."""
+    """The verdict token after the last em dash of the title line.
+
+    `templates/review.md` titles end `— APPROVE` or `— REQUEST CHANGES`. A title that
+    merely mentions both words (the unfilled template, or "APPROVE (no REQUEST CHANGES
+    needed)") matches neither.
+    """
     head = (text or "").splitlines()[0] if text else ""
-    if "REQUEST CHANGES" in head:
+    tail = head.rsplit("\u2014", 1)[-1] if "\u2014" in head else head.rsplit(" - ", 1)[-1]
+    token = tail.strip().rstrip(".").upper()
+    if token == "REQUEST CHANGES":
         return "REQUEST CHANGES"
-    if "APPROVE" in head:
+    if token == "APPROVE":
         return "APPROVE"
     return ""
 
 
 def review_findings(text):
-    """Findings under the severity headings of templates/review.md.
+    """Findings under the exact single-severity headings of templates/review.md.
 
-    A bullet is `- path:line — problem — fix`. Lines before the first severity
-    heading, and the Must-check / Verified sections, are not findings.
+    A heading is `## CRITICAL` and nothing else: the template's own
+    `## CRITICAL / HIGH / MEDIUM / LOW` line is not a heading. A finding starts with
+    `- ` or `1. `; following indented lines stay with it. `###` headings and any other
+    `##` heading end the section.
     """
-    out, sev = [], None
-    for line in (text or "").splitlines():
-        m = re.match(r"^##\s+(CRITICAL|HIGH|MEDIUM|LOW)\b", line.strip())
+    out, sev, cur = [], None, None
+    for raw in (text or "").splitlines():
+        line = raw.rstrip()
+        m = re.fullmatch(r"##[ \t]+(CRITICAL|HIGH|MEDIUM|LOW)", line.strip())
         if m:
+            if cur:
+                out.append(cur)
+                cur = None
             sev = m.group(1)
             continue
-        if line.startswith("## ") and sev:
+        if line.startswith("#"):
+            if cur:
+                out.append(cur)
+                cur = None
             sev = None
             continue
-        if sev and line.startswith("- "):
-            out.append({"severity": sev, "text": line[2:].strip()})
+        if not sev:
+            continue
+        bullet = re.match(r"^(?:- |\d+\. )(.*)$", line)
+        if bullet:
+            if cur:
+                out.append(cur)
+            cur = {"severity": sev, "text": bullet.group(1).strip()}
+            continue
+        if cur and (line.startswith(" ") or line.startswith("\t")) and line.strip():
+            cur["text"] += " " + line.strip()
+    if cur:
+        out.append(cur)
     return out
 
 
@@ -1029,16 +1128,66 @@ def wake_orchestrator(data, run, task, round_n, hold):
                     "--kind", "info", "--from", "orch", "--to", "orch", "--text", text])
 
 
+def task_round_of(data, run, task):
+    """The task's current round, or 0 when the task cannot be read."""
+    r = subprocess.run(
+        [sys.executable, mk_state_cmd(), "--data", data, "--run", run, "task", "get", task],
+        capture_output=True, text=True)
+    try:
+        j = json.loads(r.stdout.strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError):
+        return 0
+    if r.returncode != 0 or not isinstance(j, dict) or not j.get("ok"):
+        return 0
+    return int((j.get("task") or {}).get("round") or 0)
+
+
+def review_round_of(path):
+    """The N in review-rN.md, or None."""
+    m = re.fullmatch(r"review-r(\d+)\.md", os.path.basename(path or ""))
+    return int(m.group(1)) if m else None
+
+
+def hold_path(data, run, task):
+    return os.path.join(data, "runs", run, "tasks", task, ".matrixkoder-handoff.json")
+
+
+def compose_brief(brief_path, fix):
+    """Append the FIX section to the brief that already exists. A missing brief starts
+    from templates/brief.md. Never replaces a brief the orchestrator already wrote."""
+    existing = ""
+    if brief_path and os.path.isfile(brief_path):
+        try:
+            existing = open(brief_path).read()
+        except OSError:
+            existing = ""
+    if not existing.strip():
+        tmpl = os.path.join(HERE, "..", "skills", "matrixkoder", "templates", "brief.md")
+        try:
+            existing = open(os.path.normpath(tmpl)).read()
+        except OSError:
+            existing = ""
+    body = existing.rstrip("\n")
+    if "## FIX (only for review findings)" in body:
+        body = body.split("## FIX (only for review findings)", 1)[0].rstrip("\n")
+    return (body + "\n\n" + fix) if body else fix
+
+
 def cmd_review_handoff(a):
     """REQUEST CHANGES opens the fix round and sends the FIX brief to the builder through
-    the orchestrator. APPROVE only records the verdict. The reviewer never messages the builder."""
+    the orchestrator. APPROVE only records the verdict. The reviewer never messages the builder.
+
+    Idempotent: acts only when the review's N equals the task's current round and no fix
+    round for that N exists yet. --hold records the pending handoff and nothing else; the
+    next call without --hold releases it.
+    """
     task = opt(a, "--task")
-    if not task:
-        fail("review-handoff needs --task")
+    if not task or not ID_RE.fullmatch(task):
+        fail("review-handoff needs a valid --task id")
     data = opt(a, "--data") or cfg_data()
     run = opt(a, "--run")
-    if not run:
-        fail("review-handoff needs --run (or an active run)")
+    if not run or not ID_RE.fullmatch(run):
+        fail("review-handoff needs a valid --run id")
     hold = "--hold" in a
     min_sev = (opt(a, "--min", "LOW") or "LOW").upper()
     if min_sev not in SEV_RANK:
@@ -1046,6 +1195,9 @@ def cmd_review_handoff(a):
     path = opt(a, "--review") or review_path_for(data, run, task)
     if not path or not os.path.isfile(path):
         fail(f"no review file for {task}")
+    n = review_round_of(path)
+    if n is None:
+        fail("review file is not review-rN.md")
     try:
         text = open(path).read()
     except OSError as e:
@@ -1061,6 +1213,37 @@ def cmd_review_handoff(a):
         return
     if verdict != "REQUEST CHANGES":
         fail("review title has neither APPROVE nor REQUEST CHANGES")
+    cur = task_round_of(data, run, task)
+    if cur != n:
+        out({"ok": True, "dispatched": False, "task": task, "round": cur,
+             "reason": "already handed off" if cur > n else "review round is not the current round"})
+        return
+    findings = review_findings(text)
+    if not findings:
+        out({"ok": True, "dispatched": False, "task": task, "round": cur, "findings": 0,
+             "reason": "no findings; held for the orchestrator"})
+        return
+    pending = hold_path(data, run, task)
+    if hold:
+        # Record the pending handoff and nothing else: no round, no brief, no send.
+        blob = {"task": task, "run": run, "review": path, "round": n,
+                "min": min_sev, "cause": opt(a, "--cause", "verification gap")}
+        try:
+            os.makedirs(os.path.dirname(pending), exist_ok=True)
+            with open(pending, "w") as f:
+                json.dump(blob, f)
+        except OSError as e:
+            out({"ok": False, "error": f"hold write failed: {e}", "task": task})
+            return
+        out({"ok": True, "verdict": "REQUEST CHANGES", "dispatched": False, "held": True,
+             "task": task, "round": n, "findings": len(findings),
+             "reason": "held for veto"})
+        return
+    if os.path.isfile(pending):
+        try:
+            os.unlink(pending)
+        except OSError:
+            pass
     cause = opt(a, "--cause", "verification gap")
     rnd = subprocess.run(
         [sys.executable, mk_state_cmd(), "--data", data, "--run", run,
@@ -1073,33 +1256,28 @@ def cmd_review_handoff(a):
     if rnd.returncode != 0 or not opened.get("ok"):
         out({"ok": False, "error": opened.get("error") or "task round failed", "task": task})
         return
-    findings = review_findings(text)
     fix = render_fix_section(findings, min_sev)
     brief_path = opened.get("brief")
+    written = compose_brief(brief_path, fix)
     if brief_path:
         try:
             with open(brief_path, "w") as f:
-                f.write(fix)
+                f.write(written)
         except OSError as e:
             out({"ok": False, "error": f"brief write failed: {e}", "task": task})
             return
-    sent, send_err = send_brief_over_bus(data, run, task, fix, opened.get("round"))
+    sent, send_err = send_brief_over_bus(data, run, task, written, opened.get("round"))
     fixed, fix_err = set_children_fix(data, run, task)
-    wake, wake_err = (None, None)
-    if not hold:
-        wake, wake_err = wake_orchestrator(data, run, task, opened.get("round"), False)
-    # --hold waits: the wake is recorded but not sent until the caller says so. The
-    # reply names the held wake so the orchestrator can release it.
+    wake, wake_err = wake_orchestrator(data, run, task, opened.get("round"), False)
     out({"ok": True, "verdict": "REQUEST CHANGES", "dispatched": True, "task": task,
          "round": opened.get("round"), "kind": "fix", "brief": brief_path,
          "findings": len(findings), "required": sum(
              1 for f in findings if SEV_RANK[f["severity"]] <= SEV_RANK[min_sev]),
          "children": fixed, "sent": bool(sent and not send_err),
-         "held": hold, "wake": None if hold else bool(wake and not wake_err),
+         "held": False, "wake": bool(wake and not wake_err),
          **({"send_error": send_err} if send_err else {}),
          **({"children_error": "; ".join(fix_err)} if fix_err else {}),
-         **({"wake_error": wake_err} if wake_err else {}),
-         **({"hold_text": f"review-handoff {task} round {opened.get('round')}: fix opened; hold for veto"} if hold else {})})
+         **({"wake_error": wake_err} if wake_err else {})})
 
 
 def cfg_data():
@@ -2274,65 +2452,39 @@ def self_test():
         assert v.get("S4", {}).get("verdict") == "DONE", r
         assert "source=store" in [e for e in events() if e.get("task") == "S4" and "lane-watch" in (e.get("text") or "")][-1]["text"]
 
-        # (D7B) the per-lane self-test job hint: max(1, total // active_lanes).
-        # The lookup is a script on PATH so the test can make it fail.
-        def jobs_of(script, n_lanes, env_jobs=None):
-            e = dict(os.environ)
-            e.pop("MK_SELFTEST_JOBS", None)
-            if env_jobs is not None:
-                e["MK_SELFTEST_JOBS"] = env_jobs
-            bin2 = os.path.join(tmp, "jobsbin")
-            os.makedirs(bin2, exist_ok=True)
-            sp = os.path.join(bin2, "mk-config.py")
-            open(sp, "w").write(script)
-            os.chmod(sp, 0o755)
-            e["PATH"] = bin2 + os.pathsep + e.get("PATH", "")
-            # active lanes: arm writes a watch the registry counts
-            saved = os.environ.get("PATH")
-            os.environ["PATH"] = e["PATH"]
-            if env_jobs is not None:
-                os.environ["MK_SELFTEST_JOBS"] = env_jobs
-            else:
-                os.environ.pop("MK_SELFTEST_JOBS", None)
-            try:
-                return selftest_jobs_hint(data)
-            finally:
-                if saved is None:
-                    os.environ.pop("PATH", None)
-                else:
-                    os.environ["PATH"] = saved
-                if env_jobs is not None:
-                    os.environ.pop("MK_SELFTEST_JOBS", None)
-
-        def cfg_script(total):
-            return ("#!/usr/bin/env python3\nimport json,sys\n"
-                    "print(json.dumps({'ok': True, 'value': %d}))\n" % total)
-
-        # one armed lane is already up (the suite's own); count what the registry sees
-        base_active = len(armed_lanes(data)) or 1
-        # total 4, the live active count
-        assert selftest_jobs_hint.__doc__
+        # (D7B) the job hint calls the real function. The lookup uses the HERE path,
+        # so the cwd does not matter, and the arithmetic goes through selftest_jobs_hint.
         os.environ.pop("MK_SELFTEST_JOBS", None)
-        # lookup failure -> 4, then // active
-        fail_script = "#!/bin/sh\nexit 1\n"
-        got = jobs_of(fail_script, 1)
-        assert got == str(max(1, 4 // base_active)), (got, base_active)
-        # an existing MK_SELFTEST_JOBS wins over the lookup
-        got = jobs_of(cfg_script(8), 1, env_jobs="7")
-        assert got == "7", got
-        # the arithmetic itself, independent of how many lanes this suite armed
+        saved_cwd = os.getcwd()
+        try:
+            os.chdir(tmp)
+            away = selftest_jobs_total(data)
+            os.chdir(os.path.join(tmp, "repo"))
+            home = selftest_jobs_total(data)
+        finally:
+            os.chdir(saved_cwd)
+        assert away == home and 1 <= away <= 16, (away, home)
         for total, active, expect in ((4, 1, "4"), (4, 2, "2"), (4, 5, "1"),
                                       (8, 1, "8"), (8, 2, "4"), (8, 5, "1")):
-            assert str(max(1, total // active)) == expect, (total, active)
+            real_total = selftest_jobs_total(data)
+            got = selftest_jobs_hint(data, active=active)
+            assert got == str(max(1, real_total // active)), (got, real_total, active)
+            assert str(max(1, total // (active or 1))) == expect
+        os.environ["MK_SELFTEST_JOBS"] = "7"
+        try:
+            assert selftest_jobs_hint(data, active=1) == "7"
+        finally:
+            os.environ.pop("MK_SELFTEST_JOBS", None)
+        # a value outside 1..16 is refused by the same bound selftest.sh uses
+        assert selftest_jobs_total.__doc__
 
-        # (D7B) --connect types only the doorbell; without it the full prompt is unchanged
+        # (D7B) the bus is down here (the fake never listens), so --connect keeps the prompt
         n0 = len(prompt_calls())
         r = cli("dispatch", "--pane", pane_of("H1"), "--text", "the full prompt stays",
                 "--connect")
         assert r["delivered"] is True, r
-        typed = prompt_calls()[n0:][-1]
-        assert "mk-builder.py connect" in typed and "the full prompt stays" not in typed, typed
-        assert "MK_SELFTEST_JOBS=" in typed, typed
+        assert prompt_calls()[n0:][-1].endswith("the full prompt stays --wait --timeout 25000"), \
+            prompt_calls()[n0:]
         n0 = len(prompt_calls())
         r = cli("dispatch", "--pane", pane_of("H1"), "--text", "the full prompt stays")
         assert prompt_calls()[n0:][-1].endswith("the full prompt stays --wait --timeout 25000"), \
@@ -2372,9 +2524,33 @@ def self_test():
             "# HH review — REQUEST CHANGES\n\n## CRITICAL\n- x:1 — boom — stop\n")
         open(bus_log, "w").write("")
         r = cli("review-handoff", "--task", "HH", "--run", "r1", "--data", data, "--hold")
-        assert r["ok"] is True and r["held"] is True and r["wake"] is None, r
-        assert "hold for veto" in r["hold_text"], r
-        assert not any("--to orch" in c for c in bus_calls()), bus_calls()
+        assert r["ok"] is True and r["held"] is True and r["dispatched"] is False, r
+        hh = next(t for t in json.load(open(os.path.join(data, "runs", "r1", "run.json")))["tasks"]
+                  if t["id"] == "HH")
+        assert hh["round"] == 1, hh  # nothing opened while held
+        assert bus_calls() == [], bus_calls()
+        # the second call releases: one round, one send
+        r = cli("review-handoff", "--task", "HH", "--run", "r1", "--data", data)
+        assert r["ok"] is True and r["dispatched"] is True and r["round"] == 2, r
+        # a second run on the same review opens nothing more
+        r = cli("review-handoff", "--task", "RH", "--run", "r1", "--data", data)
+        assert r["ok"] is True and r["dispatched"] is False and r["reason"] == "already handed off", r
+        # a review with no parseable findings is held, not opened
+        mks("task", "add", "--id", "RZ", "--title", "empty")
+        mks("task", "round", "RZ", "--kind", "build")
+        zd = os.path.join(data, "runs", "r1", "tasks", "RZ")
+        open(os.path.join(zd, "review-r1.md"), "w").write(
+            "# RZ review — REQUEST CHANGES\n\nno headings here\n")
+        r = cli("review-handoff", "--task", "RZ", "--run", "r1", "--data", data)
+        assert r["ok"] is True and r["dispatched"] is False and r["findings"] == 0, r
+        # the template's own combined heading is not a severity heading
+        assert review_findings("## CRITICAL / HIGH / MEDIUM / LOW\n- a:1 — p — f\n") == []
+        # a wrapped bullet keeps its continuation
+        got = review_findings("## HIGH\n- a:1 — p —\n  the rest of it\n")
+        assert got == [{"severity": "HIGH", "text": "a:1 — p — the rest of it"}], got
+        # an odd id is refused
+        r = cli("review-handoff", "--task", "../x", "--run", "r1", "--data", data, code=2)
+        assert r["ok"] is False, r
 
         srv.shutdown()
         srv.server_close()

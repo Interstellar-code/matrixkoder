@@ -1534,8 +1534,9 @@ def plan_tasks(plan_path, task):
     return out
 
 
-def brief_text(lane, old):
-    """The brief this round was given: the report's sibling brief, else the lane brief copy."""
+def brief_from_files(lane, old):
+    """The brief copied into the lane: the report's sibling brief, else the lane brief copy.
+    File mode keeps this as the first choice, so a present lane file wins over the bus."""
     report = (old or {}).get("report") or ""
     candidates = []
     if report:
@@ -1552,6 +1553,55 @@ def brief_text(lane, old):
         except OSError:
             continue
     return "", ""
+
+
+def brief_from_bus(lane, old):
+    """The brief the orchestrator published for this lane, when no lane file exists.
+
+    One short /wait. A message whose text starts `round:<n>\\nkind:brief\\n` is the brief;
+    the newest such round wins. Anything else (the bus down, no such message) is no brief.
+    """
+    cfg = bus_lane_config(lane)
+    if cfg is None:
+        return "", ""
+    want = None
+    report = (old or {}).get("report") or ""
+    m = re.search(r"-r(\d+)\.", os.path.basename(report)) if report else None
+    if m:
+        want = int(m.group(1))
+    best_n, best = -1, ""
+    after = 0
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        try:
+            res = bus_wait_chunk(cfg, after, 1.0, deadline=deadline, hint=True)
+        except (BusDown, BusHttp, OSError, ValueError):
+            break
+        msg = res.get("message") if isinstance(res, dict) else None
+        if not msg:
+            break
+        seq = msg.get("seq")
+        if is_int(seq) and seq > after:
+            after = seq
+        text = msg.get("text") or ""
+        head, sep, rest = text.partition("\n")
+        if head.startswith("round:") and rest.startswith("kind:brief\n"):
+            try:
+                n = int(head[6:].strip())
+            except ValueError:
+                n = 0
+            if (want is None or n == want) and n >= best_n:
+                best_n, best = n, rest[len("kind:brief\n"):]
+    return (best, f"bus:brief-r{best_n}") if best else ("", "")
+
+
+def brief_text(lane, old):
+    """The brief this round was given. A lane file wins (file mode, unchanged); otherwise
+    the brief the orchestrator published on the bus."""
+    text, path = brief_from_files(lane, old)
+    if text:
+        return text, path
+    return brief_from_bus(lane, old)
 
 
 def page_count(text, size=BRIEF_PAGE):
@@ -2989,6 +3039,37 @@ def t_d7_connect_pages_and_tasks(root):
     assert "read <id> --part 2" in text
     code, lines = cli(lane, "read", "brief", "--part", "2")
     assert code == 0 and lines[0].startswith("# part 2/"), lines[:1]
+
+
+def t_d7b_connect_reads_the_bus_brief(root):
+    """D7B R2: with no lane brief file, connect prints the brief the orchestrator published.
+    A later round's brief replaces it. The lane file, when present, still wins."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data = os.path.join(root, "d7brief-data")
+    os.makedirs(data, exist_ok=True)
+    bus_server(root, "d7brief")
+    lane = bus_lane(root, "d7_brief_lane", "D7B", data)
+    begin(lane, root, run=BUS_RUN, task="D7B")
+    body = "round:1\nkind:brief\n# the real brief\nbuild the thing\n"
+    code, res = bus_cli("send", "--data", data, "--run", BUS_RUN, "--task", "D7B",
+                        "--kind", "info", "--from", "orch", "--to", "D7B", "--text", body)
+    assert code == 0 and res.get("ok"), res
+    code, lines = cli(lane, "connect")
+    assert code == 0, lines
+    text = "\n".join(lines)
+    assert "# the real brief" in text and "build the thing" in text, text
+    body2 = "round:2\nkind:brief\n# round two brief\nfix the thing\n"
+    code, res = bus_cli("send", "--data", data, "--run", BUS_RUN, "--task", "D7B",
+                        "--kind", "info", "--from", "orch", "--to", "D7B", "--text", body2)
+    assert code == 0 and res.get("ok"), res
+    code, lines = cli(lane, "connect")
+    text = "\n".join(lines)
+    assert "round two brief" in text and "fix the thing" in text, text
+    with open(os.path.join(lane, ".matrixkoder-brief.md"), "w") as f:
+        f.write("the lane file wins\n")
+    code, lines = cli(lane, "connect")
+    assert "the lane file wins" in "\n".join(lines), lines
 
 
 def t_d7_todo_backup_and_dedupe(root):
