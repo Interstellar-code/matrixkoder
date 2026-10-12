@@ -1163,6 +1163,13 @@ class BusSeq(Exception):
     """A bus message carried a seq that is not an integer (item 37)."""
 
 
+class BusLock(Exception):
+    """The inbox-cursor lock was still held when the wait ran out (review R2)."""
+
+
+BUS_LOCK_WAIT = 5.0
+
+
 def bus_advance_cursor(lane, seq):
     """Move the cursor forward to `seq`, never backwards.
 
@@ -1176,7 +1183,17 @@ def bus_advance_cursor(lane, seq):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     lock = path + ".lock"
     with open(lock, "a") as lf:
-        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        # LOCK_NB so a holder that never releases cannot stall the lane. Retry
+        # until BUS_LOCK_WAIT, then BusLock: the cursor is unchanged.
+        deadline = time.monotonic() + BUS_LOCK_WAIT
+        while True:
+            try:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise BusLock(f"inbox cursor lock held for {BUS_LOCK_WAIT:.0f}s")
+                time.sleep(0.05)
         try:
             cur = bus_read_cursor(lane)
             if seq > cur:
@@ -1320,7 +1337,7 @@ def cmd_ask(a):
         answer, held = bus_poll_answer(cfg, ask_id, after, deadline, floor=bus_read_cursor(lane))
     except BusDown:
         ask_down(lane, question)
-    except BusSeq as e:
+    except (BusSeq, BusLock) as e:
         raise Fail(str(e), code=5)
     except BusHttp as e:
         raise Fail(bus_http_error(e), code=5)
@@ -1351,7 +1368,7 @@ def cmd_wait(a):
         answer, held = bus_poll_answer(cfg, ask_id, int(m.group(1)), deadline, floor=bus_read_cursor(lane))
     except BusDown:
         raise Fail("bus down", code=4)
-    except BusSeq as e:
+    except (BusSeq, BusLock) as e:
         raise Fail(str(e), code=5)
     except BusHttp as e:
         raise Fail(bus_http_error(e), code=5)
@@ -1391,11 +1408,15 @@ def cmd_inbox(a):
             break  # non-int or non-advancing seq: stop, do not spin (item 37)
         # Already acked at level 3 (ask/wait consumed it): do not print it again
         # and do not send a second ack (todo 42). The cursor still moves past it.
+        try:
+            advanced = bus_advance_cursor(lane, seq)
+        except BusLock as e:
+            raise Fail(str(e), code=5)
         if msg.get("ack_level") == 3:
-            after = bus_advance_cursor(lane, seq)
+            after = advanced
             continue
         print(json.dumps(msg))
-        after = bus_advance_cursor(lane, seq)
+        after = advanced
         try:
             bus_call(cfg, "POST", "/ack", body=bus_ack_body(cfg, msg.get("id")))
         except BusHttp as e:
@@ -3055,13 +3076,19 @@ def t_b1_stale_seq_is_busseq(root):
     srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     env = {"MK_BUS_URL": f"http://127.0.0.1:{srv.server_address[1]}", "MK_BUS_TOKEN": "sekrit"}
+    b0 = time.time()
+    cli(lane, "inbox", env=env)  # one real round trip: the baseline
+    baseline = time.time() - b0
     try:
         t0 = time.time()
         code, lines = cli(lane, "ask", "stale?", "--timeout", "30", env=env)
         elapsed = time.time() - t0
-        assert elapsed < 2.0, f"stale seq spun for {elapsed:.2f}s over {calls['n']} calls: {lines}"
+        # The proof of "no spin" is the call count: a hot loop makes thousands.
+        # Wall time is a backstop scaled to a baseline, so a slow box does not
+        # fail a correct run (review R2: 2.43 s and 2.64 s under load).
+        assert calls["n"] < 50, calls["n"]
+        assert elapsed < max(2.0, 8 * baseline), f"stale seq spun for {elapsed:.2f}s over {calls['n']} calls: {lines}"
         assert code == 5, (code, lines)
-        assert calls["n"] < 100, calls["n"]
     finally:
         srv.shutdown()
 
@@ -3093,6 +3120,7 @@ def t_b1_non_int_seq_does_not_spin(root):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     lane = mklane(root, "b1_badseq")
     begin(lane, root)
+    calls = {"n": 0}
 
     class H(BaseHTTPRequestHandler):
         def _json(self, body):
@@ -3106,6 +3134,7 @@ def t_b1_non_int_seq_does_not_spin(root):
             if self.path.startswith("/health"):
                 self._json('{"ok": true}')
                 return
+            calls["n"] += 1
             self._json('{"ok": true, "message": {"id": "m-9", "seq": "nope", "kind": "info"}}')
         def do_POST(self):
             n = int(self.headers.get("Content-Length") or 0)
@@ -3118,14 +3147,53 @@ def t_b1_non_int_seq_does_not_spin(root):
     srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     env = {"MK_BUS_URL": f"http://127.0.0.1:{srv.server_address[1]}", "MK_BUS_TOKEN": "sekrit"}
+    b0 = time.time()
+    cli(lane, "inbox", env=env)  # one real round trip: the baseline
+    baseline = time.time() - b0
     try:
         t0 = time.time()
         code, lines = cli(lane, "ask", "bad seq?", "--timeout", "30", env=env)
         elapsed = time.time() - t0
-        assert elapsed < 2.0, f"non-int seq spun for {elapsed:.2f}s: {lines}"
+        assert calls["n"] < 50, calls["n"]
+        assert elapsed < max(2.0, 8 * baseline), f"non-int seq spun for {elapsed:.2f}s over {calls['n']} calls: {lines}"
         assert code == 5, (code, lines)
     finally:
         srv.shutdown()
+
+
+def t_b1_cursor_lock_wait_is_bounded(root):
+    """A holder that keeps the cursor lock: bus_advance_cursor raises BusLock
+    inside the wait and leaves the cursor where it was."""
+    lane = mklane(root, "b1_lock")
+    bus_write_cursor(lane, 3)
+    lock = os.path.join(lane, BUS_CURSOR_FILE + ".lock")
+    ready = os.path.join(root, "b1_lock_ready")
+    script = (
+        "import fcntl, os, sys, time\n"
+        "f = open(sys.argv[1], 'a')\n"
+        "fcntl.flock(f.fileno(), fcntl.LOCK_EX)\n"
+        "open(sys.argv[2], 'w').write('held')\n"
+        "time.sleep(30)\n"
+    )
+    holder = subprocess.Popen([sys.executable, "-c", script, lock, ready])
+    deadline = time.time() + 5
+    while time.time() < deadline and not os.path.exists(ready):
+        time.sleep(0.02)
+    assert os.path.exists(ready), "holder never took the lock"
+    try:
+        t0 = time.time()
+        raised = False
+        try:
+            bus_advance_cursor(lane, 8)
+        except BusLock:
+            raised = True
+        elapsed = time.time() - t0
+        assert raised, "a held lock did not raise BusLock"
+        assert BUS_LOCK_WAIT - 1 < elapsed < BUS_LOCK_WAIT + 2, elapsed
+        assert bus_read_cursor(lane) == 3
+    finally:
+        holder.kill()
+        holder.wait(timeout=5)
 
 
 def t_b1_cursor_never_backwards(root):
