@@ -264,7 +264,10 @@ def verdict_for(w):
     subj = lw.commit_subject(w["lane"])
     armed = {"lane": w["lane"], "run": w.get("run"), "task": w.get("task"), "phase": w.get("phase"),
              "armed_at": float(w.get("armed_at") or 0.0),
-             "max_wait_min": float(cfg("session.max_wait_min"))}
+             "max_wait_min": float(cfg("session.max_wait_min")),
+             "data": w.get("data")}
+    if not report_ok and lw.store_report_ok(w.get("data"), armed, report):
+        report_ok = True  # report artifact in the store; the file is absent
     st = lw.read_status(w["lane"], armed)   # R27/R28; R42: inside the caller's per-lane flock
     since = float(w.get("last_activity") or w.get("armed_at") or time.time())
     if lw.status_activity(st, stall, armed):
@@ -279,6 +282,8 @@ def verdict_for(w):
         h = lh.check(w["pane"], w["lane"], w.get("kind"), stall, w["last_activity"], w.get("prompt_marker"))
     w["last_pane_fp"] = fp
     state, ev = lw.decide(h, subj, rx, report_ok, h.get("text", ""), w.get("phase"), stall, st, armed)
+    if st and st.get("source") == "store" and ev and ev[-1] == "source=status":
+        ev = ev[:-1] + ["source=store"]  # decided from the tasks row, not the status file
     return h, subj, state, ev
 
 
@@ -342,6 +347,7 @@ def apply_verdict(w, state, subj, evidence, h):
     evidence = list(evidence or [])
     if not any(str(e).startswith("source=") for e in evidence):   # R41: pane detections (R35)
         evidence = evidence + ["source=pane"]
+    # source is one of store|status|pane|grace (D5A.2); decide() already ends with one of them
     rec = lw.record({"state": state, "commit": subj, "evidence": evidence,
                      "agent_status": (h or {}).get("agent_status")}, watch_tasks(w), w["data"],
                     w.get("run"))
@@ -1926,6 +1932,80 @@ def self_test():
             "revoke boom" in r["bus"]["error"], r
         os.unlink(os.path.join(tmp, "bus_revoke_rc.txt"))
         os.unlink(os.path.join(tmp, "bus_revoke_out.txt"))
+
+        # --- the project store (D5A.2): verdict_for reads the store inside the per-lane lock ---
+        # self-hosting guard: every case above ran with no store and created none
+        assert not os.path.exists(os.path.join(data, "mk.db")), "an event created mk.db"
+        mks("store", "enable")
+        assert os.path.getsize(os.path.join(data, "mk.db")) > 0
+        # store-first: no lane status file, the tasks row + report artifact decide -> DONE, source=store
+        mks("task", "add", "--id", "S1", "--title", "store")
+        mks("task", "set", "S1", "status=building")
+        lanes["S1"] = os.path.join(tmp, "lane-s1")
+        g(repo, "worktree", "add", "-q", "--detach", lanes["S1"])
+        g(lanes["S1"], "commit", "-q", "--allow-empty", "-m", "feat(p1): store core")
+        td = os.path.join(data, "runs", "r1", "tasks", "S1")
+        open(os.path.join(td, "report-r1.md"), "w").write("# report\nstore\n")
+        mks("task", "round", "S1", "--kind", "build")
+        os.unlink(os.path.join(td, "report-r1.md"))   # only the artifact remains
+        mks("task", "set", "S1", "status=verifying")
+        open(pane_f, "w").write("> dispatch-s1\nquiet, no token\n")
+        open(status_f, "w").write("done")
+        arm("S1", phase="S1 R1", report="report.json", prompt_marker="dispatch-s1")
+        assert not os.path.exists(os.path.join(lanes["S1"], ".matrixkoder-status.json"))
+        r = event("done", tid="S1")
+        assert r["verdict"] == "DONE" and r["recorded"], r
+        s1 = [e for e in events() if e.get("task") == "S1" and "lane-watch" in (e.get("text") or "")][-1]["text"]
+        assert "source=store" in s1 and "source=status" not in s1, s1
+        # DONE still needs the commit: a store row of verifying with a non-matching subject is
+        # never DONE. decide() is what verdict_for feeds; the row comes from the store.
+        mks("task", "add", "--id", "S2", "--title", "store2")
+        mks("task", "set", "S2", "status=building")
+        mks("task", "round", "S2", "--kind", "build")
+        mks("task", "set", "S2", "status=verifying")
+        armed = {"run": "r1", "task": "S2", "phase": "S2 R1", "data": data}
+        st = lw.read_status(lanes["H1"], armed)  # the lane dir is irrelevant: the row is the channel
+        assert st and st["source"] == "store" and st["state"] == "done", st
+        h = {"state": "OK", "agent_status": "done", "last_change_min": 5}
+        state, ev = lw.decide(h, "abc chore: wip", re.compile("nomatch"), True, "", "S2 R1", 1, st, armed)
+        assert state == "STALL" and ev[-1] == "source=pane", (state, ev)
+
+        # fallback: the row is round 2, so phase S3 R1 has no row -> the status file decides
+        mks("task", "add", "--id", "S3", "--title", "fallback")
+        mks("task", "set", "S3", "status=building")
+        lanes["S3"] = os.path.join(tmp, "lane-s3")
+        g(repo, "worktree", "add", "-q", "--detach", lanes["S3"])
+        g(lanes["S3"], "commit", "-q", "--allow-empty", "-m", "feat(p1): file core")
+        open(os.path.join(lanes["S3"], "report.json"), "w").write("{}")
+        mks("task", "round", "S3", "--kind", "build")
+        mks("task", "round", "S3", "--kind", "fix")   # round 2: phase S3 R1 has no store row
+        mks("task", "set", "S3", "status=verifying")
+        open(pane_f, "w").write("> dispatch-s3\nquiet, no token\n")
+        open(status_f, "w").write("done")
+        arm("S3", phase="S3 R1", report="report.json", prompt_marker="dispatch-s3")
+        wstat("S3", "done", time.time() + 5)
+        r = event("done", tid="S3")
+        assert r["verdict"] == "DONE" and r["recorded"], r
+        s3 = [e for e in events() if e.get("task") == "S3" and "lane-watch" in (e.get("text") or "")][-1]["text"]
+        assert "source=status" in s3 and "source=store" not in s3, s3
+        # sweep reads the store too: a quiet lane whose row says done is DONE, source=store
+        mks("task", "add", "--id", "S4", "--title", "sweep")
+        mks("task", "set", "S4", "status=building")
+        lanes["S4"] = os.path.join(tmp, "lane-s4")
+        g(repo, "worktree", "add", "-q", "--detach", lanes["S4"])
+        g(lanes["S4"], "commit", "-q", "--allow-empty", "-m", "feat(p1): sweep core")
+        td = os.path.join(data, "runs", "r1", "tasks", "S4")
+        open(os.path.join(td, "report-r1.md"), "w").write("# report\n")
+        mks("task", "round", "S4", "--kind", "build")
+        os.unlink(os.path.join(td, "report-r1.md"))
+        mks("task", "set", "S4", "status=verifying")
+        open(pane_f, "w").write("quiet\n")
+        open(status_f, "w").write("idle")
+        arm("S4", phase="S4 R1", report="report.json")
+        r = cli("sweep", "--data", data)
+        v = {x["task"]: x for x in r["verdicts"]}
+        assert v.get("S4", {}).get("verdict") == "DONE", r
+        assert "source=store" in [e for e in events() if e.get("task") == "S4" and "lane-watch" in (e.get("text") or "")][-1]["text"]
 
         srv.shutdown()
         srv.server_close()
