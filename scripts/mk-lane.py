@@ -53,7 +53,11 @@ LOCKFILES = ("pnpm-lock.yaml", "package-lock.json", "yarn.lock", "bun.lock", "bu
 # dir inside it, git collapses the status entry to `!! .claude/`, which the dir pattern alone does
 # not match; when other untracked .claude/ content makes git descend, the entry names the skill dir
 # instead. Both entries, so both shapes read disposable.
-DISPOSABLE = (".matrixkoder-*", ".env", ".env.*", "node_modules/", ".omc/", ".omo/", ".serena/",
+# `.omc/` is not on this list. Ignored `.omc` state is disposable only through the path-segment
+# rule in omc_ignored_ok: a `!!` entry whose path has a `.omc` segment, and only while that tree
+# tracks nothing. A tracked `.omc/plans/*.md` (or any other non-`!!` line) still counts. Listing
+# `.omc/` here would also swallow an ignored file inside a TRACKED `.omc/` (the 11g case).
+DISPOSABLE = (".matrixkoder-*", ".env", ".env.*", "node_modules/", ".omo/", ".serena/",
               ".venv/", "__pycache__/", ".claude/", ".claude/skills/mk-builder/")
 # The build-cache dirs every package/venv path ends with: allowed as a path component at any depth,
 # so a monorepo's packages/a/node_modules/ does not read as dirty. Everything else stays root-only.
@@ -565,8 +569,24 @@ def dirs_named(path, name):
     return ["/".join(parts[:i + 1]) for i in range(len(parts) - 1) if parts[i] == name]
 
 
+def omc_ignored_ok(path, has_tracked):
+    """An ignored (`!!`) entry whose path has a `.omc` segment is not dirty. Builder OMC hooks
+    write `.omc/project-memory.json`, `.omc/sessions/`, `.omc/state/` and nested `src/…/.omc/`
+    that gitignore hides. Only while that `.omc` tree tracks nothing: a tracked `.omc/plans/`
+    makes an ignored sibling inside it user data. A non-`!!` line never reaches here, so a
+    modified tracked plan still counts. This check never deletes."""
+    parts = path.strip().rstrip("/").split("/")
+    if ".omc" not in parts:
+        return False
+    omc = "/".join(parts[:parts.index(".omc") + 1])
+    return has_tracked is None or not has_tracked(omc)
+
+
 def disposable_ok(path, patterns, has_tracked=None):
     """Is an ignored entry disposable?
+
+    Ignored `.omc` state is the extra case (omc_ignored_ok): a path segment, not an allowlist
+    name, and still only when that tree is untracked.
 
     A trailing-`/` allowlist entry covers its whole subtree — at the root, or at any depth when it is
     one of ANY_DEPTH — while a name must match the path itself at the root (fnmatch, so
@@ -574,6 +594,8 @@ def disposable_ok(path, patterns, has_tracked=None):
     tracks nothing inside it, at EVERY level: a vendored `node_modules/` or `.venv/` is source, and an
     ignored file inside it is user data, not a build cache. `has_tracked(dir)` answers that question;
     without it a directory match is taken at face value."""
+    if omc_ignored_ok(path, has_tracked):
+        return True
     raw = path.strip()
     p = raw.rstrip("/")
     for pat in patterns:
@@ -896,10 +918,19 @@ def install_lane_skill(lane):
         raise Fail(f"mk-builder skill source {SKILL_SRC} not found in the plugin")
     if not os.path.isfile(GUARD_SRC):
         raise Fail(f"git-guard source {GUARD_SRC} not found in the plugin")
-    skill = os.path.join(lane, ".claude", "skills", "mk-builder")
+    slot_real = os.path.realpath(lane)
+
+    def inside_slot(p_):
+        try:
+            return os.path.commonpath([os.path.realpath(p_), slot_real]) == slot_real
+        except ValueError:  # realpath outside this mount: never ours
+            return False
+
     if os.path.islink(skill) or os.path.isfile(skill):
-        os.unlink(skill)
+        os.unlink(skill)  # a link or a stray file goes by the link only; a link is never followed
     elif os.path.isdir(skill):
+        if not inside_slot(skill):
+            raise Fail(f"mk-builder skill path {skill} resolves outside the slot, refused")
         shutil.rmtree(skill)
     try:
         shutil.copytree(SKILL_SRC, skill)
@@ -908,7 +939,8 @@ def install_lane_skill(lane):
         shutil.copy2(GUARD_SRC, guard)
         os.chmod(guard, 0o755)  # copy2 keeps the source mode; chmod guarantees the executable bit
     except (OSError, shutil.Error) as e:
-        shutil.rmtree(skill, ignore_errors=True)  # no partial install left behind
+        if not os.path.islink(skill) and inside_slot(skill):
+            shutil.rmtree(skill, ignore_errors=True)  # no partial install left behind
         raise Fail(f"mk-builder skill install into {lane} failed: {type(e).__name__}: {e}"[:400])
     return skill, guard
 
@@ -1252,10 +1284,14 @@ def self_test():
         write(os.path.join(repo, "README.md"), "base\n")
         write(os.path.join(repo, "pnpm-lock.yaml"), "lock v1\n")
         # `.venv/` is anchored at the root so a *tracked* vendor/.venv/ can exist for the 11c case
-        write(os.path.join(repo, ".gitignore"), "node_modules/\n__pycache__/\n/.venv/\n.omc/\nprod.sqlite\n")
+        write(os.path.join(repo, ".gitignore"),
+              "node_modules/\n__pycache__/\n/.venv/\n.omc/\nprod.sqlite\n.claude/\n")
         write(os.path.join(repo, "pkg", "a", "src", "app.js"), "// tracked, so git lists the\n"
               "                        // ignored dir inside pkg/ instead of collapsing to `?? pkg/`\n")
         write(os.path.join(repo, "scripts", "tool.py"), "# tracked\n")
+        # tracked beside the nested `.omc` the 8b case writes, so git names `!! src/x/.omc/`
+        # instead of collapsing the whole tree to `!! src/`
+        write(os.path.join(repo, "src", "x", "keep.txt"), "tracked neighbour\n")
         g("add", "-A"), g("commit", "-qm", "base"), g("branch", "mk/r1/integration")
         integ = os.path.join(tmp, "integ")  # the integration checkout, not a slot
         g("worktree", "add", "-q", integ, "mk/r1/integration")
@@ -1498,6 +1534,51 @@ def self_test():
         assert g("rev-parse", "--verify", "--quiet", "refs/heads/mk/r1/t5").returncode == 0
         assert "mk/r1/t5" not in open(os.path.join(data, "lanes.json")).read()  # only in the branch ref
 
+        # 8b (L1.1) git-ignored `.omc` state alone is not dirt, at the root and nested, and the
+        # check never deletes it. A modified TRACKED `.omc/plans/x.md` still refuses, and so does
+        # any other untracked file. The repo ignores `.omc/` wholesale, so the tracked plan is
+        # force-added on the integration branch (`git add -f`, here only). Slot 1 stays free.
+        write(os.path.join(integ, ".omc", "plans", "x.md"), "tracked plan\n")
+        g("-C", integ, "add", "-f", ".omc/plans/x.md")
+        g("-C", integ, "commit", "-qm", "track an omc plan")
+        omc_root = os.path.join(slot1, ".omc")
+        omc_nested = os.path.join(slot1, "src", "x", ".omc")
+        for rel in ("project-memory.json", os.path.join("sessions", "s.json"),
+                    os.path.join("state", "x")):
+            write(os.path.join(omc_root, rel), "{}\n")
+            write(os.path.join(omc_nested, rel), "{}\n")
+        # the slot still sits on the pre-plan tip, so nothing under .omc/ is tracked here: clean
+        assert mk("list")["slots"][0]["clean"] is True, mk("list")
+        assert mk("release", "--slot", "1", "--integration", "mk/r1/integration")["ok"]
+        for rel in ("project-memory.json", os.path.join("sessions", "s.json"),
+                    os.path.join("state", "x")):
+            assert os.path.isfile(os.path.join(omc_root, rel)), rel  # never deleted
+            assert os.path.isfile(os.path.join(omc_nested, rel)), rel
+        # the release switched HEAD to the tip that tracks `.omc/plans/x.md`: ignored siblings
+        # inside a tracked .omc tree are user data, not state, so the slot reads dirty again
+        assert mk("list")["slots"][0]["clean"] is False, mk("list")
+        for rel in ("project-memory.json", os.path.join("sessions", "s.json"),
+                    os.path.join("state", "x")):
+            os.unlink(os.path.join(omc_root, rel))
+            os.unlink(os.path.join(omc_nested, rel))
+        os.removedirs(os.path.join(omc_root, "sessions"))
+        os.removedirs(os.path.join(omc_root, "state"))
+        os.removedirs(os.path.join(omc_nested, "sessions"))
+        os.removedirs(os.path.join(omc_nested, "state"))
+        assert mk("list")["slots"][0]["clean"] is True, mk("list")
+        # a modified tracked plan still refuses, with the ignored state long gone
+        write(os.path.join(omc_root, "plans", "x.md"), "tracked plan\nedited\n")
+        d = mk("release", "--slot", "1", "--integration", "mk/r1/integration", code=3)
+        assert d["error"] == "slot 1 dirty", d
+        assert any(".omc/plans/x.md" in line and not line.startswith("!!") for line in d["dirty"]), d
+        write(os.path.join(omc_root, "plans", "x.md"), "tracked plan\n")
+        # an ordinary untracked file beside nothing else still refuses
+        write(os.path.join(slot1, "scratch-omc.txt"), "untracked\n")
+        d = mk("release", "--slot", "1", "--integration", "mk/r1/integration", code=3)
+        assert d["error"] == "slot 1 dirty" and "?? scratch-omc.txt" in d["dirty"], d
+        os.unlink(os.path.join(slot1, "scratch-omc.txt"))
+        assert mk("release", "--slot", "1", "--integration", "mk/r1/integration")["ok"]
+
         # 9 a commit on the free detached slot is not orphaned by the next switch
         write(os.path.join(slot1, "stray.md"), "late builder commit\n")
         g("-C", slot1, "add", "-A"), g("-C", slot1, "commit", "-qm", "stray")
@@ -1656,11 +1737,17 @@ def self_test():
                 os.unlink(victim)
         yaml_cap(2, 2)
         write(os.path.join(integ, ".gitignore"), "prod.sqlite\n")
+        # 8b force-added `.omc/plans/x.md` under a wholesale `.omc/` ignore; narrowing the ignore
+        # would otherwise leave that file deleted in this commit
+        write(os.path.join(integ, ".omc", "plans", "x.md"), "tracked plan\n")
         for rel in shapes:
             write(os.path.join(integ, rel, "x.js"), "// tracked\n")
         g("-C", integ, "add", "-A"), g("-C", integ, "commit", "-qm", "tracked cache dirs")
         for rel in shapes:  # ignored, so untracked: the fixture is the file only
             write(os.path.join(integ, rel, "prod.sqlite"), "data\n")
+        # slot 1 still carries the 8b deletion of `.omc/plans/x.md` in its index; restore it
+        write(os.path.join(slot1, ".omc", "plans", "x.md"), "tracked plan\n")
+        g("-C", slot1, "add", "-f", ".omc/plans/x.md")
         assert mk("acquire", "--run", "r1", "--task", "tg", "--base", "mk/r1/integration")["slot"] == 1
         assert mk("acquire", "--run", "r1", "--task", "th", "--base", "mk/r1/integration")["slot"] == 2
         assert mk("release", "--slot", "1", "--integration", "mk/r1/integration")["ok"]
@@ -1743,6 +1830,34 @@ def self_test():
                 raise AssertionError(f"verify_slot_path accepted {path}")
             except Fail as e:
                 assert want in str(e), e
+
+        # 12b (L1.2) a symlinked `.claude/skills/mk-builder` pointing outside the slot is
+        # unlinked, never followed: the sentinel outside survives, the lane gets a real skill dir.
+        # Slot 1 is the free one here (released just above); slot 2 stays busy.
+        outside = os.path.join(tmp, "outside-skill")
+        os.makedirs(outside)
+        write(os.path.join(outside, "SENTINEL"), "do not delete\n")
+        link = os.path.join(slot1, ".claude", "skills", "mk-builder")
+        # the slot's HEAD predates the `.claude/` gitignore line, so exclude it here or the
+        # symlink reads as `?? .claude/` and acquire refuses before the install runs
+        ep = g("-C", slot1, "rev-parse", "--git-path", "info/exclude").stdout.strip()
+        ep = ep if os.path.isabs(ep) else os.path.join(slot1, ep)
+        with open(ep, "a") as f:
+            f.write(".claude/\n")
+        if os.path.lexists(link):
+            if os.path.islink(link) or os.path.isfile(link):
+                os.unlink(link)
+            else:
+                shutil.rmtree(link)
+        os.symlink(outside, link)
+        st("task", "add", "--id", "t12b", "--title", "skill symlink", "--run", "r1")
+        acq = mk("acquire", "--run", "r1", "--task", "t12b", "--base", "main")
+        assert acq["slot"] == 1 and acq["ok"], acq
+        assert not os.path.islink(link) and os.path.isdir(link)
+        assert open(os.path.join(outside, "SENTINEL")).read() == "do not delete\n"
+        assert open(os.path.join(link, "SKILL.md"), "rb").read() == \
+            open(os.path.join(os.path.dirname(HERE), "child-skills", "mk-builder", "SKILL.md"), "rb").read()
+        assert mk("release", "--slot", "1", "--integration", "mk/r1/integration")["ok"]
 
         # 13 a rejected lanes_disposable entry narrows the allowlist and is reported
         write(os.path.join(data, "matrixkoder.yaml"),
@@ -2212,6 +2327,65 @@ def self_test():
         # and the file-mode data dir from the long test still has no mk.db
         assert not os.path.exists(os.path.join(data, "mk.db"))
         assert before  # the pre-import bytes were captured; import did not need them afterwards
+
+        # L1 in store mode: ignored `.omc` state alone leaves the slot releasable, a modified
+        # tracked plan still refuses, and the outside skill symlink is not followed.
+        st("task", "add", "--id", "omcs", "--title", "omc store", "--run", "r1")
+        st("task", "add", "--id", "omcs2", "--title", "omc store 2", "--run", "r1")
+        omc_data = os.path.join(tmp, "data-omc-store")
+        os.makedirs(omc_data)
+        _sh.copytree(os.path.join(data, "runs"), os.path.join(omc_data, "runs"))
+        write(os.path.join(omc_data, "matrixkoder.yaml"),
+              'repo:\n  lanes: { slots: 2, pattern: "../{repo}-omc-{n}", reuse: true }\n'
+              "routing_preferences:\n  max_build_lanes: 2\n")
+        mkdb.open_project(home, data_dir=omc_data).close()
+        got = mk_at(omc_data, env_store, "acquire", "--run", "r1", "--task", "omcs", "--base", "main")
+        assert got["ok"] and got["slot"] == 1, got
+        omc_slot = got["path"]
+        for rel in ("project-memory.json", os.path.join("sessions", "s.json"),
+                    os.path.join("state", "x")):
+            write(os.path.join(omc_slot, ".omc", rel), "{}\n")
+        # the base fixture already tracks src/x/keep.txt, so the nested .omc is named
+        write(os.path.join(omc_slot, "src", "x", ".omc", "state", "x"), "x\n")
+        assert mk_at(omc_data, env_store, "list")["slots"][0]["clean"] is True
+        assert mk_at(omc_data, env_store, "release", "--slot", "1",
+                     "--integration", "mk/r1/integration")["ok"]
+        assert os.path.isfile(os.path.join(omc_slot, ".omc", "project-memory.json"))
+        # the release switched onto the tip that tracks `.omc/plans/x.md`, so the ignored
+        # siblings inside that tracked tree are user data again: clear them, then a modified
+        # tracked plan still refuses
+        for rel in ("project-memory.json", os.path.join("sessions", "s.json"),
+                    os.path.join("state", "x")):
+            os.unlink(os.path.join(omc_slot, ".omc", rel))
+        os.removedirs(os.path.join(omc_slot, ".omc", "sessions"))
+        os.removedirs(os.path.join(omc_slot, ".omc", "state"))
+        write(os.path.join(omc_slot, ".omc", "plans", "x.md"), "tracked plan\nedited\n")
+        refused = mk_at(omc_data, env_store, "release", "--slot", "1",
+                        "--integration", "mk/r1/integration", code=3)
+        assert refused["error"] == "slot 1 dirty", refused
+        assert any(".omc/plans/x.md" in line and not line.startswith("!!") for line in refused["dirty"]), refused
+        write(os.path.join(omc_slot, ".omc", "plans", "x.md"), "tracked plan\n")
+        assert mk_at(omc_data, env_store, "release", "--slot", "1",
+                     "--integration", "mk/r1/integration")["ok"]
+        outside_s = os.path.join(tmp, "outside-skill-store")
+        os.makedirs(outside_s)
+        write(os.path.join(outside_s, "SENTINEL"), "do not delete\n")
+        link_s = os.path.join(omc_slot, ".claude", "skills", "mk-builder")
+        if os.path.lexists(link_s):
+            if os.path.islink(link_s) or os.path.isfile(link_s):
+                os.unlink(link_s)
+            else:
+                shutil.rmtree(link_s)
+        os.symlink(outside_s, link_s)
+        st("task", "add", "--id", "syms", "--title", "symlink store", "--run", "r1")
+        _sh.rmtree(os.path.join(omc_data, "runs"))
+        _sh.copytree(os.path.join(data, "runs"), os.path.join(omc_data, "runs"))
+        got = mk_at(omc_data, env_store, "acquire", "--run", "r1", "--task", "syms", "--base", "main")
+        assert got["ok"] and got["slot"] == 1, got
+        assert not os.path.islink(link_s) and os.path.isdir(link_s)
+        assert open(os.path.join(outside_s, "SENTINEL")).read() == "do not delete\n"
+        assert mk_at(omc_data, env_store, "release", "--slot", "1",
+                     "--integration", "mk/r1/integration")["ok"]
 
         print("mk-lane self-test ok")
     finally:
