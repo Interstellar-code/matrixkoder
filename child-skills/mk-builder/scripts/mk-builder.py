@@ -23,11 +23,13 @@ fall back to the lane status file, the report file and the brief copy, so a lane
 """
 import argparse
 import contextlib
+import fcntl
 import datetime
 import hashlib
 import io
 import json
 import os
+import queue
 import re
 import shutil
 import signal
@@ -882,14 +884,24 @@ def bus_http_error(e):
     return f"{e.code}: {e.error}"
 
 
+# A seq past this cannot be a JSON number the bus would send, and writing it
+# poisons the cursor so no later message is visible (review R1).
+BUS_SEQ_MAX = 2 ** 53
+
+def bus_seq(v):
+    """A cursor seq: a non-negative int below 2**53. Anything else is unusable."""
+    return is_int(v) and 0 <= v < BUS_SEQ_MAX
+
+
 def bus_read_cursor(lane):
-    """The last seq this lane has seen (`<lane>/.matrixkoder-bus-cursor`, lane-only). A missing
-    or corrupt cursor reads as 0 — at-least-once, never a crash."""
+    """The last seq this lane has seen (`<lane>/.matrixkoder-bus-cursor`, lane-only). A missing,
+    corrupt, negative or huge cursor reads as 0 — at-least-once, never a crash."""
     try:
         with open(os.path.join(lane, BUS_CURSOR_FILE)) as f:
-            return int(f.read().strip() or 0)
+            n = int(f.read().strip() or 0)
     except (OSError, ValueError):
         return 0
+    return n if bus_seq(n) else 0
 
 
 def bus_write_cursor(lane, seq):
@@ -1148,32 +1160,115 @@ def bus_wait_chunk(cfg, after, chunk, deadline=None, hint=False):
     return bus_call(cfg, "GET", f"/wait?{qs}", timeout=socket_timeout)
 
 
-def bus_note_seq(lane, msg):
-    """Advance the inbox cursor past a message this lane has already been shown (D7.2, C13e).
-    A non-integer seq is ignored — the cursor never moves backwards or onto garbage."""
+class BusSeq(Exception):
+    """A bus message carried a seq that is not an integer (item 37)."""
+
+
+class BusLock(Exception):
+    """The inbox-cursor lock was still held when the wait ran out (review R2)."""
+
+
+BUS_LOCK_WAIT = 5.0
+
+
+def bus_advance_cursor(lane, seq):
+    """Move the cursor forward to `seq`, never backwards.
+
+    The compare and the write happen under an exclusive flock on a sibling lock
+    file, so a concurrent `inbox` and `ask` cannot pass each other's read and
+    write an older seq last (review R1). A seq that is not a cursor seq is ignored.
+    """
+    if not bus_seq(seq):
+        return bus_read_cursor(lane)
+    path = os.path.join(lane, BUS_CURSOR_FILE)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    lock = path + ".lock"
+    with open(lock, "a") as lf:
+        # LOCK_NB so a holder that never releases cannot stall the lane. Retry
+        # until BUS_LOCK_WAIT, then BusLock: the cursor is unchanged.
+        deadline = time.monotonic() + BUS_LOCK_WAIT
+        while True:
+            try:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise BusLock(f"inbox cursor lock held for {BUS_LOCK_WAIT:.0f}s")
+                time.sleep(0.05)
+        try:
+            cur = bus_read_cursor(lane)
+            if seq > cur:
+                bus_write_cursor(lane, seq)
+                return seq
+            return cur
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+
+def bus_note_seq(lane, msg, held=()):
+    """Advance the inbox cursor past a message already shown to this lane.
+
+    Never backwards, never onto a non-integer or a seq at or past 2**53. `held`
+    seqs are unread messages addressed to this lane: the cursor stops before the
+    lowest of those below this message, so a higher answer cannot hide them
+    (todos 37 and 42). The write goes through bus_advance_cursor.
+    """
     seq = msg.get("seq") if isinstance(msg, dict) else None
-    if is_int(seq) and seq > bus_read_cursor(lane):
-        bus_write_cursor(lane, seq)
+    if not bus_seq(seq):
+        return
+    blocked = [s for s in held if bus_seq(s) and s < seq]
+    target = min(blocked) - 1 if blocked else seq
+    bus_advance_cursor(lane, target)
 
 
-def bus_poll_answer(cfg, ask_id, after, deadline):
-    """Long-poll `GET /wait` in chunks of at most 90 s until the `answer` whose `reply_to` is
-    this ask arrives, skipping other messages addressed to the lane, or until `deadline`.
-    Returns the answer message or None; raises BusDown/BusHttp to the caller.
-    A non-integer `seq` (item 37) is ignored: the cursor stays put and the loop continues."""
+def bus_poll_answer(cfg, ask_id, after, deadline, floor=0):
+    """Long-poll `GET /wait` until the answer arrives or the deadline passes.
+
+    `after` is where the poll starts. `floor` is the lane cursor: messages
+    between the cursor and the ask are unread and land in `held`, so the cursor
+    cannot jump over one that is older than the ask (review R1 HIGH).
+
+    Returns (answer or None, held seqs). A message that is not a dict, or whose
+    seq is not a cursor seq, raises BusSeq. A seq that does not advance `after`
+    raises BusSeq too: fetching it again would be a hot loop (review R1, ~4.1M
+    calls in 2 s against a stub that answers at once).
+    """
+    if bus_seq(floor) and floor < after:
+        after = floor
+    held = []
     while True:
         remaining = deadline - time.time()
         if remaining < 1.0:  # /wait clamps to >= 1 s server-side; a shorter chunk would overshoot
-            return None
+            return None, held
         res = bus_wait_chunk(cfg, after, min(BUS_WAIT_CHUNK_MAX, remaining), deadline=deadline)
         msg = res.get("message")
         if msg is None:
             continue
-        if msg.get("kind") == "answer" and msg.get("reply_to") == ask_id:
-            return msg
+        if not isinstance(msg, dict):
+            raise BusSeq(f"bus message is not an object: {type(msg).__name__}")
         seq = msg.get("seq")
-        if is_int(seq) and seq > after:
-            after = seq
+        if not bus_seq(seq):
+            raise BusSeq(f"bus message seq is not a cursor seq: {seq!r}")
+        if seq <= after:
+            # Same message again. Sleep out this chunk and poll once more, so a
+            # stub that answers instantly cannot hot-loop (review R1: ~4.1M
+            # calls in 2 s) and one re-delivery from the real bus is not fatal.
+            # Two in a row is BusSeq.
+            time.sleep(min(1.0, max(0.0, deadline - time.time())))
+            res2 = bus_wait_chunk(cfg, after, 1.0, deadline=deadline)
+            msg2 = res2.get("message") if isinstance(res2, dict) else None
+            if msg2 is None:
+                continue
+            if not isinstance(msg2, dict):
+                raise BusSeq(f"bus message is not an object: {type(msg2).__name__}")
+            seq2 = msg2.get("seq")
+            if not bus_seq(seq2) or seq2 <= after:
+                raise BusSeq(f"bus message seq does not advance past {after}: {seq2!r}")
+            msg, seq = msg2, seq2
+        if msg.get("kind") == "answer" and msg.get("reply_to") == ask_id:
+            return msg, [s for s in held if s < seq]
+        held.append(seq)
+        after = seq
 
 
 def status_block(lane, question):
@@ -1240,9 +1335,11 @@ def cmd_ask(a):
         ask_down(lane, question)  # recorded but unusable response: the same fallback
     status_block(lane, question)
     try:
-        answer = bus_poll_answer(cfg, ask_id, after, deadline)
+        answer, held = bus_poll_answer(cfg, ask_id, after, deadline, floor=bus_read_cursor(lane))
     except BusDown:
         ask_down(lane, question)
+    except (BusSeq, BusLock) as e:
+        raise Fail(str(e), code=5)
     except BusHttp as e:
         raise Fail(bus_http_error(e), code=5)
     if answer is None:
@@ -1250,9 +1347,13 @@ def cmd_ask(a):
         raise Handled(3)
     with contextlib.suppress(BusDown, BusHttp, OSError, ValueError):
         bus_call(cfg, "POST", "/ack", body=bus_ack_body(cfg, answer["id"]))
-    bus_note_seq(lane, answer)  # D7.2: inbox must not re-show or re-ack this answer
+    # Print and resume BEFORE the cursor write. A held cursor lock raises BusLock
+    # after 5 s; the answer is already acked at level 3, so losing the cursor
+    # move must not lose the answer (review R3 HIGH).
     status_resume(lane)
     print(answer["text"])
+    with contextlib.suppress(BusLock):
+        bus_note_seq(lane, answer, held)  # todos 37/42: inbox must not re-show or re-ack this answer
     raise Handled(0)
 
 
@@ -1269,9 +1370,11 @@ def cmd_wait(a):
     if cfg is None:
         raise Fail("bus down", code=4)
     try:
-        answer = bus_poll_answer(cfg, ask_id, int(m.group(1)), deadline)
+        answer, held = bus_poll_answer(cfg, ask_id, int(m.group(1)), deadline, floor=bus_read_cursor(lane))
     except BusDown:
         raise Fail("bus down", code=4)
+    except (BusSeq, BusLock) as e:
+        raise Fail(str(e), code=5)
     except BusHttp as e:
         raise Fail(bus_http_error(e), code=5)
     if answer is None:
@@ -1279,9 +1382,11 @@ def cmd_wait(a):
         raise Handled(3)
     with contextlib.suppress(BusDown, BusHttp, OSError, ValueError):
         bus_call(cfg, "POST", "/ack", body=bus_ack_body(cfg, answer["id"]))
-    bus_note_seq(lane, answer)  # D7.2: inbox must not re-show or re-ack this answer
+    # Same order as ask: the answer is delivered even when the cursor lock is held.
     status_resume(lane)
     print(answer["text"])
+    with contextlib.suppress(BusLock):
+        bus_note_seq(lane, answer, held)  # todos 37/42: inbox must not re-show or re-ack this answer
     raise Handled(0)
 
 
@@ -1305,12 +1410,23 @@ def cmd_inbox(a):
         msg = res.get("message")
         if not msg:
             break
-        print(json.dumps(msg))
         seq = msg.get("seq")
         if not is_int(seq) or seq <= after:
-            break  # cannot advance past this message; stop rather than fetch it again
-        after = seq
-        bus_write_cursor(lane, seq)
+            break  # non-int or non-advancing seq: stop, do not spin (item 37)
+        # At-least-once, same as ask/wait: a BusLock or a crash before the cursor
+        # moves re-shows the message next time, which is the safe direction.
+        # The re-shown message is acked once, on the call that actually advances
+        # the cursor (review R4). ack_level 3 (ask/wait already consumed it) is
+        # not printed and not re-acked (todo 42); the cursor still moves past it.
+        # The lock is taken before the print, so a lock failure is the error line
+        # alone: a caller never sees a message and an error in one run.
+        try:
+            after = bus_advance_cursor(lane, seq)
+        except BusLock as e:
+            raise Fail(str(e), code=5)
+        if msg.get("ack_level") == 3:
+            continue
+        print(json.dumps(msg))
         try:
             bus_call(cfg, "POST", "/ack", body=bus_ack_body(cfg, msg.get("id")))
         except BusHttp as e:
@@ -2862,6 +2978,461 @@ def t_bus_ask_pending_then_wait(root):
     assert len(acks) == 1 and acks[0]["ack_level"] == 3, acks
 
 
+def _b1_acks(data, reply_to):
+    return [r for r in bus_rows(data)
+            if r.get("kind") == "ack" and r.get("reply_to") == reply_to]
+
+
+def t_b1_ask_advances_cursor_no_second_ack(root):
+    """Todos 37 and 42: after ask consumes an answer, inbox prints nothing and the
+    bus log has exactly one level-3 ack for that answer.
+
+    This case and t_b1_wait_advances_cursor_no_second_ack PASS on the R1 base:
+    bus_note_seq already covered an answer with nothing unread before it. They
+    are regression guards. The proof that the cursor does not skip an unread
+    message is t_b1_lower_seq_stays_unread and t_b1_unread_older_than_the_ask.
+    """
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data, _, _ = bus_server(root)
+    lane = bus_lane(root, "b1_ask_lane", "BA", data)
+    begin(lane, root)
+    cli(lane, "progress", "parse-plan")
+    question = "which cursor?"
+
+    def answer_when_blocked():
+        row = bus_poll_until(lambda: next(
+            (r for r in bus_rows(data) if r.get("kind") == "ask" and r.get("task") == "BA"), None))
+        bus_cli("answer", row["id"], "cursor advanced", "--run", BUS_RUN, "--data", data)
+
+    th = threading.Thread(target=answer_when_blocked)
+    th.start()
+    try:
+        code, lines = cli(lane, "ask", question, "--timeout", "30")
+    finally:
+        th.join(30)
+    assert code == 0 and lines == ["cursor advanced"], (code, lines)
+    code, lines = cli(lane, "inbox")
+    assert code == 0 and lines == [], (code, lines)
+    answers = [r for r in bus_rows(data)
+               if r.get("kind") == "answer" and r.get("text") == "cursor advanced"]
+    assert len(answers) == 1, answers
+    acks = _b1_acks(data, answers[0]["id"])
+    assert len(acks) == 1 and acks[0]["ack_level"] == 3, acks
+    assert bus_read_cursor(lane) >= answers[0]["seq"]
+
+
+def t_b1_wait_advances_cursor_no_second_ack(root):
+    """Same for wait: the answer is consumed, inbox is empty, one ack only."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data, _, _ = bus_server(root)
+    lane = bus_lane(root, "b1_wait_lane", "BW", data)
+    begin(lane, root)
+    cli(lane, "progress", "build")
+    code, lines = cli(lane, "ask", "hold", "--timeout", "2")
+    assert code == 3 and lines[0].startswith("PENDING m-"), (code, lines)
+    ask_id = lines[0].split()[1]
+    bus_cli("answer", ask_id, "wait advanced", "--run", BUS_RUN, "--data", data)
+    code, lines = cli(lane, "wait", ask_id, "--timeout", "10")
+    assert code == 0 and lines == ["wait advanced"], (code, lines)
+    code, lines = cli(lane, "inbox")
+    assert code == 0 and lines == [], (code, lines)
+    answers = [r for r in bus_rows(data)
+               if r.get("kind") == "answer" and r.get("reply_to") == ask_id]
+    assert len(answers) == 1, answers
+    acks = _b1_acks(data, answers[0]["id"])
+    assert len(acks) == 1 and acks[0]["ack_level"] == 3, acks
+
+
+def t_b1_lower_seq_stays_unread(root):
+    """An unread message with a lower seq is still printed by inbox after an
+    answer with a higher seq was consumed. The cursor does not jump over it."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data, _, _ = bus_server(root)
+    lane = bus_lane(root, "b1_gap_lane", "BG", data)
+    begin(lane, root)
+    cli(lane, "progress", "build")
+    code, lines = cli(lane, "ask", "gap?", "--timeout", "2")
+    assert code == 3, (code, lines)
+    ask_id = lines[0].split()[1]
+    # info lands first (lower seq), then the answer (higher seq)
+    bus_cli("send", "--run", BUS_RUN, "--task", "BG", "--kind", "info",
+            "--text", "still unread", "--data", data)
+    bus_cli("answer", ask_id, "the answer", "--run", BUS_RUN, "--data", data)
+    code, lines = cli(lane, "wait", ask_id, "--timeout", "10")
+    assert code == 0 and lines == ["the answer"], (code, lines)
+    code, lines = cli(lane, "inbox")
+    assert code == 0 and len(lines) == 1, (code, lines)
+    shown = json.loads(lines[0])
+    assert shown["kind"] == "info" and shown["text"] == "still unread", shown
+    # the info was acked once, by inbox, not twice; the answer was acked once, by wait
+    assert len(_b1_acks(data, shown["id"])) == 1
+    answers = [r for r in bus_rows(data) if r.get("kind") == "answer" and r.get("reply_to") == ask_id]
+    assert len(answers) == 1 and len(_b1_acks(data, answers[0]["id"])) == 1, answers
+
+
+def t_b1_unread_older_than_the_ask(root):
+    """Review R1 HIGH: an info sent BEFORE the ask has a lower seq than the ask.
+    ask must not move the cursor past it. inbox still prints it, once, and the
+    answer keeps a single ack. Same shape for wait."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data, _, _ = bus_server(root)
+    lane = bus_lane(root, "b1_early_lane", "BE", data)
+    begin(lane, root)
+    cli(lane, "progress", "build")
+    bus_cli("send", "--run", BUS_RUN, "--task", "BE", "--kind", "info",
+            "--text", "early unread", "--data", data)
+
+    def answer_when_blocked():
+        row = bus_poll_until(lambda: next(
+            (r for r in bus_rows(data) if r.get("kind") == "ask" and r.get("task") == "BE"), None))
+        bus_poll_until(lambda: status(lane) if status(lane).get("state") == "blocked" else None)
+        bus_cli("answer", row["id"], "A", "--run", BUS_RUN, "--data", data)
+
+    th = threading.Thread(target=answer_when_blocked)
+    th.start()
+    try:
+        code, lines = cli(lane, "ask", "q?", "--timeout", "30")
+    finally:
+        th.join(30)
+    assert code == 0 and lines == ["A"], (code, lines)
+    code, lines = cli(lane, "inbox")
+    assert code == 0 and len(lines) == 1, (code, lines)
+    shown = json.loads(lines[0])
+    assert shown["text"] == "early unread" and shown["kind"] == "info", shown
+    assert len(_b1_acks(data, shown["id"])) == 1
+    # wait: a second early info, then an unanswered ask that wait consumes
+    bus_cli("send", "--run", BUS_RUN, "--task", "BE", "--kind", "info",
+            "--text", "early for wait", "--data", data)
+    code, lines = cli(lane, "ask", "later?", "--timeout", "2")
+    assert code == 3 and lines[0].startswith("PENDING "), (code, lines)
+    ask_id = lines[0].split()[1]
+    bus_cli("answer", ask_id, "W", "--run", BUS_RUN, "--data", data)
+    code, lines = cli(lane, "wait", ask_id, "--timeout", "10")
+    assert code == 0 and lines == ["W"], (code, lines)
+    code, lines = cli(lane, "inbox")
+    assert code == 0 and len(lines) == 1, (code, lines)
+    assert json.loads(lines[0])["text"] == "early for wait"
+
+
+def t_b1_cursor_monotonic_under_two_processes(root):
+    """Two real processes: one advances to 9, one tries to write 4. The cursor
+    ends at 9. bus_advance_cursor holds the lock across the compare and the write."""
+    lane = mklane(root, "b1_race")
+    bus_write_cursor(lane, 1)
+    child = os.path.join(root, "b1_race_child.py")
+    with open(child, "w") as f:
+        f.write(
+            "import importlib.util, os, sys, time\n"
+            f"spec = importlib.util.spec_from_file_location('mkb', {os.path.abspath(__file__)!r})\n"
+            "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+            "real = m.bus_write_cursor\n"
+            "def slow(lane, seq):\n"
+            "    time.sleep(0.3)\n"
+            "    real(lane, seq)\n"
+            "m.bus_write_cursor = slow\n"
+            f"m.bus_advance_cursor({lane!r}, int(sys.argv[1]))\n"
+        )
+    # both pass the unlocked read of a cursor at 1, then write. The lock must
+    # make the second writer re-read and refuse to go backwards.
+    a = subprocess.Popen([sys.executable, child, "9"])
+    b = subprocess.Popen([sys.executable, child, "4"])
+    a.wait(timeout=15); b.wait(timeout=15)
+    assert bus_read_cursor(lane) == 9, bus_read_cursor(lane)
+
+
+def t_b1_stale_seq_is_busseq(root):
+    """A stub that returns seq <= after must not hot-loop. ask returns within
+    2 s with the named BusSeq error, not after burning the 30 s deadline."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    lane = mklane(root, "b1_stale")
+    begin(lane, root)
+    calls = {"n": 0}
+
+    class H(BaseHTTPRequestHandler):
+        def _json(self, body):
+            raw = body.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+        def do_GET(self):
+            if self.path.startswith("/health"):
+                self._json('{"ok": true}')
+                return
+            calls["n"] += 1
+            # always the same seq, which does not advance `after`
+            self._json('{"ok": true, "message": {"id": "m-2", "seq": 1, "kind": "info"}}')
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            if n:
+                self.rfile.read(n)
+            self._json('{"ok": true, "message": {"id": "m-1", "seq": 1}}')
+        def log_message(self, *a):
+            return
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    env = {"MK_BUS_URL": f"http://127.0.0.1:{srv.server_address[1]}", "MK_BUS_TOKEN": "sekrit"}
+    b0 = time.time()
+    cli(lane, "inbox", env=env)  # one real round trip: the baseline
+    baseline = time.time() - b0
+    try:
+        t0 = time.time()
+        code, lines = cli(lane, "ask", "stale?", "--timeout", "30", env=env)
+        elapsed = time.time() - t0
+        # The proof of "no spin" is the call count: a hot loop makes thousands.
+        # Wall time is a backstop scaled to a baseline, so a slow box does not
+        # fail a correct run (review R2: 2.43 s and 2.64 s under load).
+        assert calls["n"] < 50, calls["n"]
+        assert elapsed < max(2.0, 8 * baseline), f"stale seq spun for {elapsed:.2f}s over {calls['n']} calls: {lines}"
+        assert code == 5, (code, lines)
+    finally:
+        srv.shutdown()
+
+
+def t_b1_huge_seq_and_poisoned_cursor(root):
+    """A seq at or past 2**53 is not a cursor seq. A cursor file holding one, or
+    a negative number, reads as 0."""
+    lane = mklane(root, "b1_huge")
+    assert not bus_seq(10 ** 30)
+    assert not bus_seq(-1)
+    bus_note_seq(lane, {"seq": 10 ** 30})
+    assert bus_read_cursor(lane) == 0
+    with open(os.path.join(lane, BUS_CURSOR_FILE), "w") as f:
+        f.write(str(10 ** 30) + "\n")
+    assert bus_read_cursor(lane) == 0
+    with open(os.path.join(lane, BUS_CURSOR_FILE), "w") as f:
+        f.write("-5\n")
+    assert bus_read_cursor(lane) == 0
+    bus_advance_cursor(lane, 4)
+    assert bus_read_cursor(lane) == 4
+    bus_advance_cursor(lane, 10 ** 30)
+    assert bus_read_cursor(lane) == 4
+
+
+def t_b1_non_int_seq_does_not_spin(root):
+    """A /wait body whose seq is not an integer returns within 2 s (BusSeq),
+    instead of polling that same message until the deadline."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    lane = mklane(root, "b1_badseq")
+    begin(lane, root)
+    calls = {"n": 0}
+
+    class H(BaseHTTPRequestHandler):
+        def _json(self, body):
+            raw = body.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+        def do_GET(self):
+            if self.path.startswith("/health"):
+                self._json('{"ok": true}')
+                return
+            calls["n"] += 1
+            self._json('{"ok": true, "message": {"id": "m-9", "seq": "nope", "kind": "info"}}')
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            if n:
+                self.rfile.read(n)
+            self._json('{"ok": true, "message": {"id": "m-1", "seq": 1}}')
+        def log_message(self, *a):
+            return
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    env = {"MK_BUS_URL": f"http://127.0.0.1:{srv.server_address[1]}", "MK_BUS_TOKEN": "sekrit"}
+    b0 = time.time()
+    cli(lane, "inbox", env=env)  # one real round trip: the baseline
+    baseline = time.time() - b0
+    try:
+        t0 = time.time()
+        code, lines = cli(lane, "ask", "bad seq?", "--timeout", "30", env=env)
+        elapsed = time.time() - t0
+        assert calls["n"] < 50, calls["n"]
+        assert elapsed < max(2.0, 8 * baseline), f"non-int seq spun for {elapsed:.2f}s over {calls['n']} calls: {lines}"
+        assert code == 5, (code, lines)
+    finally:
+        srv.shutdown()
+
+
+def _b1_hold_lock(root, lane, name):
+    """A process holding the cursor lock. Returns (proc, ready path). The caller kills it."""
+    lock = os.path.join(lane, BUS_CURSOR_FILE + ".lock")
+    ready = os.path.join(root, name + ".ready")
+    script = (
+        "import fcntl, sys, time\n"
+        "f = open(sys.argv[1], 'a')\n"
+        "fcntl.flock(f.fileno(), fcntl.LOCK_EX)\n"
+        "open(sys.argv[2], 'w').write('held')\n"
+        "time.sleep(60)\n"
+    )
+    proc = subprocess.Popen([sys.executable, "-c", script, lock, ready])
+    deadline = time.time() + 5
+    while time.time() < deadline and not os.path.exists(ready):
+        time.sleep(0.02)
+    assert os.path.exists(ready), "holder never took the lock"
+    return proc
+
+
+def t_b1_held_lock_does_not_lose_the_answer(root):
+    """Review R3 HIGH: the cursor lock is held by another process. wait and ask
+    still print the answer and exit 0. inbox fails with the named BusLock error
+    and prints nothing. Bounds scale from one measured spawn."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data, _, _ = bus_server(root)
+    lane = bus_lane(root, "b1_held_lane", "BH", data)
+    begin(lane, root)
+    cli(lane, "progress", "build")
+    b0 = time.time()
+    cli(lane, "inbox")
+    baseline = max(0.05, time.time() - b0)
+    # wait path: ask goes PENDING, the answer lands, then the lock is taken
+    code, lines = cli(lane, "ask", "held?", "--timeout", "2")
+    assert code == 3 and lines[0].startswith("PENDING "), (code, lines)
+    ask_id = lines[0].split()[1]
+    bus_cli("answer", ask_id, "KEPT", "--run", BUS_RUN, "--data", data)
+    holder = _b1_hold_lock(root, lane, "b1_held_wait")
+    try:
+        t0 = time.time()
+        code, lines = cli(lane, "wait", ask_id, "--timeout", "10")
+        elapsed = time.time() - t0
+        assert code == 0 and lines == ["KEPT"], (code, lines)
+        assert elapsed < max(3.0, 8 * baseline), elapsed
+        assert status(lane)["state"] == "working"
+    finally:
+        holder.kill(); holder.wait(timeout=5)
+    # ask path: the lock is held before the answer is posted
+    holder = _b1_hold_lock(root, lane, "b1_held_ask")
+
+    def answer_when_blocked():
+        row = bus_poll_until(lambda: next(
+            (r for r in bus_rows(data) if r.get("kind") == "ask" and r.get("text") == "held ask?"), None))
+        bus_poll_until(lambda: status(lane) if status(lane).get("state") == "blocked" else None)
+        bus_cli("answer", row["id"], "KEPT2", "--run", BUS_RUN, "--data", data)
+
+    th = threading.Thread(target=answer_when_blocked)
+    th.start()
+    try:
+        t0 = time.time()
+        code, lines = cli(lane, "ask", "held ask?", "--timeout", "15")
+        elapsed = time.time() - t0
+    finally:
+        th.join(20)
+        holder.kill(); holder.wait(timeout=5)
+    assert code == 0 and lines == ["KEPT2"], (code, lines)
+    assert elapsed < max(8.0, 8 * baseline), elapsed
+    # inbox with the lock held: the named error, and nothing printed
+    bus_cli("send", "--run", BUS_RUN, "--task", "BH", "--kind", "info",
+            "--text", "unread while locked", "--data", data)
+    holder = _b1_hold_lock(root, lane, "b1_held_inbox")
+    try:
+        code, lines = cli(lane, "inbox")
+        assert code == 5 and len(lines) == 1, (code, lines)
+        err = json.loads(lines[0])
+        assert err.get("ok") is False and "cursor lock" in err.get("error", ""), err
+    finally:
+        holder.kill(); holder.wait(timeout=5)
+    # the next inbox, lock free, shows that message exactly once and acks it
+    code, lines = cli(lane, "inbox")
+    assert code == 0 and len(lines) == 1, (code, lines)
+    shown = json.loads(lines[0])
+    assert shown.get("text") == "unread while locked", shown
+    code, lines = cli(lane, "inbox")
+    assert code == 0 and lines == [], lines
+
+
+def t_b1_fresh_unread_lock_prints_error_only(root):
+    """Review R4 MEDIUM: a FRESH lane whose only message is an unread info, with
+    the cursor lock already held. inbox prints the error line only (the lock is
+    taken before the print) and exits 5. The next inbox, lock free, shows that
+    message exactly once."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data, _, _ = bus_server(root)
+    lane = bus_lane(root, "b1_fresh_lock", "BF", data)
+    begin(lane, root)
+    cli(lane, "progress", "build")
+    bus_cli("send", "--run", BUS_RUN, "--task", "BF", "--kind", "info",
+            "--text", "fresh unread", "--data", data)
+    holder = _b1_hold_lock(root, lane, "b1_fresh_inbox")
+    try:
+        code, lines = cli(lane, "inbox")
+        assert code == 5 and len(lines) == 1, (code, lines)
+        err = json.loads(lines[0])
+        assert err.get("ok") is False and "cursor lock" in err.get("error", ""), err
+        assert "fresh unread" not in lines[0], lines
+    finally:
+        holder.kill(); holder.wait(timeout=5)
+    code, lines = cli(lane, "inbox")
+    assert code == 0 and len(lines) == 1, (code, lines)
+    shown = json.loads(lines[0])
+    assert shown.get("text") == "fresh unread", shown
+    code, lines = cli(lane, "inbox")
+    assert code == 0 and lines == [], lines
+
+
+def t_b1_cursor_lock_wait_is_bounded(root):
+    """A holder that keeps the cursor lock: bus_advance_cursor raises BusLock
+    inside the wait and leaves the cursor where it was."""
+    lane = mklane(root, "b1_lock")
+    bus_write_cursor(lane, 3)
+    lock = os.path.join(lane, BUS_CURSOR_FILE + ".lock")
+    ready = os.path.join(root, "b1_lock_ready")
+    script = (
+        "import fcntl, os, sys, time\n"
+        "f = open(sys.argv[1], 'a')\n"
+        "fcntl.flock(f.fileno(), fcntl.LOCK_EX)\n"
+        "open(sys.argv[2], 'w').write('held')\n"
+        "time.sleep(30)\n"
+    )
+    holder = subprocess.Popen([sys.executable, "-c", script, lock, ready])
+    deadline = time.time() + 5
+    while time.time() < deadline and not os.path.exists(ready):
+        time.sleep(0.02)
+    assert os.path.exists(ready), "holder never took the lock"
+    try:
+        t0 = time.time()
+        raised = False
+        try:
+            bus_advance_cursor(lane, 8)
+        except BusLock:
+            raised = True
+        elapsed = time.time() - t0
+        assert raised, "a held lock did not raise BusLock"
+        assert BUS_LOCK_WAIT - 1 < elapsed < BUS_LOCK_WAIT + 2, elapsed
+        assert bus_read_cursor(lane) == 3
+    finally:
+        holder.kill()
+        holder.wait(timeout=5)
+
+
+def t_b1_cursor_never_backwards(root):
+    """bus_note_seq refuses a seq at or below the cursor."""
+    lane = mklane(root, "b1_back")
+    bus_write_cursor(lane, 7)
+    bus_note_seq(lane, {"seq": 3})
+    assert bus_read_cursor(lane) == 7
+    bus_note_seq(lane, {"seq": 7})
+    assert bus_read_cursor(lane) == 7
+    bus_note_seq(lane, {"seq": "9"})
+    assert bus_read_cursor(lane) == 7
+    bus_note_seq(lane, {"seq": 11}, held=(9,))
+    # 9 is unread and lower, so the cursor stops just before it
+    assert bus_read_cursor(lane) == 8, bus_read_cursor(lane)
+    bus_note_seq(lane, {"seq": 12})
+    assert bus_read_cursor(lane) == 12
+
+
 def t_bus_inbox_drains_and_acks(root):
     """inbox prints the info sent to the lane as one JSON line, acks it level 3, advances the
     lane cursor; a second inbox prints nothing and exits 0."""
@@ -3210,7 +3781,11 @@ def t_d7_bus_down_ask_blocks(root):
 
 
 def t_d7_one_ack_per_answer(root):
-    """ask acks the answer once; inbox does not show it or ack it again."""
+    """ask acks the answer once; inbox does not show it or ack it again.
+
+    The answer thread reports its own exception onto a queue instead of dying
+    silently, and its poll deadline scales from one measured spawn plus a real
+    round trip so a loaded machine does not turn a live ask into PENDING."""
     if not os.path.isfile(MK_BUS_PY):
         return
     data = os.path.join(root, "d7ack-data")
@@ -3219,20 +3794,32 @@ def t_d7_one_ack_per_answer(root):
     bus_server(root, "d7ack")
     lane = bus_lane(root, "d7_ack_lane", "D7A", data)
     begin(lane, root, run=BUS_RUN, task="D7A")
+    b0 = time.time()
     cli(lane, "progress", "work")
+    baseline = max(0.5, time.time() - b0)
+    poll_for = max(30.0, 20 * baseline)
+    errors = queue.Queue()
 
     def answer():
-        row = bus_poll_until(lambda: next(
-            (r for r in d7_bus_rows(data) if r.get("kind") == "ask" and r.get("task") == "D7A"), None))
-        got = d7_answer(data, row["id"], "the schema is v2", "D7A")
-        assert got.get("ok") is True, got
+        try:
+            row = bus_poll_until(lambda: next(
+                (r for r in d7_bus_rows(data) if r.get("kind") == "ask" and r.get("task") == "D7A"), None),
+                timeout=poll_for)
+            got = d7_answer(data, row["id"], "the schema is v2", "D7A")
+            assert got.get("ok") is True, got
+        except Exception as e:
+            errors.put(f"{type(e).__name__}: {e}")
 
     th = threading.Thread(target=answer)
     th.start()
     try:
-        code, lines = cli(lane, "ask", "which schema?", "--timeout", "30")
+        code, lines = cli(lane, "ask", "which schema?", "--timeout", str(int(poll_for)))
     finally:
-        th.join(30)
+        th.join(poll_for + 5)
+    # "ask already answered" needs two answer POSTs; cmd_ask posts one ask and
+    # the thread posts one answer, so a one-off comes from two runs sharing one
+    # store (overlapping runs fall back to the shared MK-home bus.json), not from this code.
+    assert errors.empty(), errors.get()
     assert code == 0 and lines == ["the schema is v2"], (code, lines)
     code, lines = cli(lane, "inbox")
     assert code == 0 and lines == [], lines
@@ -3394,11 +3981,16 @@ def t_x1_fifo_lane_file_is_bus_down(root):
     env["HOME"] = os.path.join(root, "x1-home-fifo")
     os.makedirs(env["HOME"], exist_ok=True)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    # one measured spawn of this interpreter, then a generous floor: the FIFO
+    # is still never opened, so the case stays well under a real open() hang
+    b0 = time.time()
+    subprocess.run([sys.executable, "-c", "pass"], capture_output=True, env=env, timeout=30)
+    floor = max(2.0, 8 * (time.time() - b0))
     t0 = time.time()
     r = subprocess.run([sys.executable, os.path.abspath(__file__), "inbox", "--lane", lane],
-                       capture_output=True, text=True, env=env, timeout=15)
+                       capture_output=True, text=True, env=env, timeout=max(15, floor + 5))
     elapsed = time.time() - t0
-    assert elapsed < 1.0, f"lane FIFO took {elapsed:.2f}s"
+    assert elapsed < floor, f"lane FIFO took {elapsed:.2f}s against a {floor:.2f}s floor"
     assert r.returncode == 4, (r.returncode, r.stdout, r.stderr)
 
 
@@ -3653,23 +4245,45 @@ def t_x1_slow_drip_body_honours_budget(root):
     begin(lane, root)
     env = {"MK_BUS_URL": f"http://127.0.0.1:{port}", "MK_BUS_TOKEN": "sekrit"}
     before = _x1_rss_kb()
+    # Baseline from a NORMAL fast peer (one real-bus progress round trip, as in
+    # t_d7_one_ack_per_answer), never from the drip peer itself: measuring
+    # against the drip peer stretches the baseline to the whole 60 s body on a
+    # path without the absolute deadline, and the scaled bound grows with it.
+    # Without the absolute deadline each run below takes the full 60 s drip
+    # (do_GET/do_POST loop 60 x 1 s; cli_raw timeout is 180 s), which exceeds
+    # the 20 s hard cap, so the case still fails on that regression path.
+    if os.path.isfile(MK_BUS_PY):
+        _data, _, _ = bus_server(root, "x1dripbase")
+        _blane = bus_lane(root, "x1_drip_baseline", "X1D", _data)
+        begin(_blane, root, run=BUS_RUN, task="X1D")
+        b0 = time.time()
+        cli(_blane, "progress", "work")
+        baseline = max(0.25, time.time() - b0)
+    else:
+        b0 = time.time()
+        subprocess.run([sys.executable, "-c", "pass"], capture_output=True, timeout=30)
+        baseline = max(0.25, time.time() - b0)
+    inbox_bound = min(20.0, max(3.0, 4 * baseline))
+    ask_bound = min(20.0, max(6.5, 5 + 4 * baseline))
     try:
         t0 = time.time()
         code, lines = cli(lane, "inbox", env=env)
         elapsed = time.time() - t0
-        assert elapsed < 3.0, f"inbox took {elapsed:.2f}s against a 1 byte/s body: {lines}"
+        assert elapsed < inbox_bound, f"inbox took {elapsed:.2f}s against a 1 byte/s body: {lines}"
         assert code == 4, (code, lines)
         t0 = time.time()
         code, lines = cli(lane, "progress", "parse-plan", env=env)
         elapsed = time.time() - t0
-        assert elapsed < 3.0, f"progress took {elapsed:.2f}s against a 1 byte/s body: {lines}"
+        assert elapsed < inbox_bound, f"progress took {elapsed:.2f}s against a 1 byte/s body: {lines}"
         assert code == 0, (code, lines)
         t0 = time.time()
         code, lines = cli(lane, "ask", "which one?", "--timeout", "5", env=env)
         elapsed = time.time() - t0
         # deadline is set at ask start; one chunk may run remaining+1, and the
-        # server floor is 1 s, so the bound is the brief's timeout + 1.
-        assert elapsed < 6.5, f"ask took {elapsed:.2f}s (timeout 5, deadline + 1): {lines}"
+        # server floor is 1 s, so the bound is the brief's timeout + 1, scaled
+        # from the measured baseline. Without the absolute deadline the 60 s
+        # drip would blow past it.
+        assert elapsed < ask_bound, f"ask took {elapsed:.2f}s (timeout 5, deadline + 1): {lines}"
         # no answer yet: PENDING (exit 3) or BUS DOWN (exit 4). Never a hang.
         assert code in (3, 4), (code, lines)
         if code == 3:
