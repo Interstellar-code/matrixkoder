@@ -408,7 +408,8 @@ column of its children's non-attention statuses, attention 0. A parent already a
 status is not transitioned again.
 
 `events(id INTEGER PRIMARY KEY, run, task, t, chan, kind, from_id, to_id, reply_to, text,
-artifact_id, meta_json)` with index `ev_task(run, task, id)`. `chan` is `state` or `bus`.
+artifact_id, meta_json)` with index `ev_task(run, task, id)`. `chan` is `state` or `bus` on rows
+`transition()` and `import_history` write; `append_event` also accepts `note`.
 `change_log(change_no INTEGER PRIMARY KEY, run, task, t)` — `change_no` is the rowid, gap-free.
 `lane_slots(slot TEXT PRIMARY KEY, lane_path, state, run, task, workspace, workspace_id, branch, lock_hash, updated)` — the five trailing columns are v3, each `TEXT`, and match the slot record in `lanes.json` (`workspace` and `workspace_id` are null for a plain git worktree; `branch`, `lock_hash` and `updated` are null until the slot is acquired). `plans`, `runs`, `acks`, `waits` as in contract C2.
 `artifacts(id INTEGER PRIMARY KEY, run, task, round, kind, rev, text, created, src)` — `text` is
@@ -444,6 +445,31 @@ API: `open_root(home)`, `open_project(home, slug=None, data_dir=None)`,
 `catch_up(home, project, data_dir=None)`, `timeline(home, project, run, task, data_dir=None)`,
 `cards(home, project=None)`, `check_slug`, `check_home`, `column_of(status, prev_status=None)`,
 `import_history(home, project, run, *, run_row=None, tasks=(), events=(), artifacts=(), data_dir=None)`.
+
+### Live writers (`append_event`, `append_ack`, `put_artifact`)
+
+Three helpers, each one `BEGIN IMMEDIATE` transaction on the project store. They validate with
+`check_slug` (through `open_project`) and refuse an unknown run or task with `Fail`. None of them
+writes `tasks.status`. `change_log` follows `import_history`: a row is written only when a task
+row changes, and these helpers never change one, so they write no `change_log` row.
+
+`append_event(home, project, run, *, task=None, chan, kind, from_id=None, to_id=None, reply_to=None, text="", meta=None, artifact_id=None, t=None, data_dir=None) -> int`
+inserts one `events` row and returns its id (the bus SSE `Last-Event-ID`). `t` defaults to now;
+a `meta` dict is stored as `meta_json`. `chan` must be `state`, `bus` or `note`. `chan='state'`
+with `kind='transition'` is refused — status changes go through `transition()` only (C10). An
+`artifact_id` that is not an artifact of this run is refused. `task=None` is a run-level event.
+
+`append_ack(home, project, run, msg, lane, level, *, t=None, data_dir=None) -> bool` inserts into
+`acks(run, msg, lane, level, t)` or leaves the row alone. The level never decreases: an equal or
+lower level is a no-op, a higher level upgrades the row. Returns True only when a row was inserted
+or upgraded.
+
+`put_artifact(home, project, run, task, round, kind, text, *, event_id=None, data_dir=None) -> {"id", "rev"}`
+inserts a live artifact with `src` NULL. `rev` is 1 plus the highest existing rev for
+`(run, task, round, kind)`, or 1 when none. When `event_id` is given, `events.artifact_id` on that
+event is set in the same transaction; a failure after the insert rolls both back. Text of 256 KiB
+is accepted; a larger body is refused.
+
 
 ```
 mkdb.py timeline --project P --run R --task T --json [--data DIR] [--home DIR]
