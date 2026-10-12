@@ -1555,11 +1555,66 @@ def brief_from_files(lane, old):
     return "", ""
 
 
+def parse_brief_message(text):
+    """A published brief is `round:<n>\nkind:brief\n<body>`. -> (round, body) or None."""
+    head, sep, rest = (text or "").partition("\n")
+    if not (sep and head.startswith("round:") and rest.startswith("kind:brief\n")):
+        return None
+    try:
+        n = int(head[6:].strip())
+    except ValueError:
+        return None
+    return n, rest[len("kind:brief\n"):]
+
+
+def brief_messages(cfg):
+    """Every bus message for this lane's task, newest last. The store when it exists,
+    else bus.jsonl. One read, so an inbox of earlier messages cannot eat the budget.
+    Scoped to the token's task: a shared run must not hand this lane another task's brief."""
+    data = bus_data_dir(cfg)
+    run = cfg.get("run")
+    task = cfg.get("task")
+    if not data or not run:
+        return []
+    if store_present(data):
+        try:
+            if task:
+                rows = store_rows(
+                    data,
+                    "SELECT text FROM events WHERE chan='bus' AND run=? AND task=? ORDER BY id",
+                    (run, task))
+            else:
+                rows = store_rows(
+                    data,
+                    "SELECT text FROM events WHERE chan='bus' AND run=? ORDER BY id",
+                    (run,))
+        except (OSError, sqlite3.Error):
+            return []
+        return [r.get("text") or "" for r in rows]
+    path = os.path.join(data, "runs", run, "bus.jsonl")
+    out = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(msg, dict) and (not task or msg.get("task") == task):
+                    out.append(msg.get("text") or "")
+    except OSError:
+        return []
+    return out
+
+
 def brief_from_bus(lane, old):
     """The brief the orchestrator published for this lane, when no lane file exists.
 
-    One short /wait. A message whose text starts `round:<n>\\nkind:brief\\n` is the brief;
-    the newest such round wins. Anything else (the bus down, no such message) is no brief.
+    The newest `round:<n>\nkind:brief\n` message wins. A report naming round N asks for
+    that round only, so a stale earlier brief is not served. No such message is no brief.
     """
     cfg = bus_lane_config(lane)
     if cfg is None:
@@ -1570,28 +1625,13 @@ def brief_from_bus(lane, old):
     if m:
         want = int(m.group(1))
     best_n, best = -1, ""
-    after = 0
-    deadline = time.time() + 3
-    while time.time() < deadline:
-        try:
-            res = bus_wait_chunk(cfg, after, 1.0, deadline=deadline, hint=True)
-        except (BusDown, BusHttp, OSError, ValueError):
-            break
-        msg = res.get("message") if isinstance(res, dict) else None
-        if not msg:
-            break
-        seq = msg.get("seq")
-        if is_int(seq) and seq > after:
-            after = seq
-        text = msg.get("text") or ""
-        head, sep, rest = text.partition("\n")
-        if head.startswith("round:") and rest.startswith("kind:brief\n"):
-            try:
-                n = int(head[6:].strip())
-            except ValueError:
-                n = 0
-            if (want is None or n == want) and n >= best_n:
-                best_n, best = n, rest[len("kind:brief\n"):]
+    for text in brief_messages(cfg):
+        parsed = parse_brief_message(text)
+        if not parsed:
+            continue
+        n, body = parsed
+        if (want is None or n == want) and n >= best_n:
+            best_n, best = n, body
     return (best, f"bus:brief-r{best_n}") if best else ("", "")
 
 
@@ -1622,6 +1662,9 @@ def cmd_connect(a):
     lane = lane_dir(a)
     old = load_live(lane)
     text, path = brief_text(lane, old)
+    if not text:
+        print("# brief: none found")
+        raise Handled(0)
     plan = a.plan or os.environ.get("MK_PLAN") or ""
     tasks = plan_tasks(plan, old.get("task") or "") if plan else []
     body, part, pages = page_slice(text, 1)
@@ -3051,6 +3094,10 @@ def t_d7b_connect_reads_the_bus_brief(root):
     bus_server(root, "d7brief")
     lane = bus_lane(root, "d7_brief_lane", "D7B", data)
     begin(lane, root, run=BUS_RUN, task="D7B")
+    # noise first: an inbox of earlier messages must not hide the brief that follows
+    for i in range(30):
+        bus_cli("send", "--data", data, "--run", BUS_RUN, "--task", "D7B",
+                "--kind", "info", "--from", "orch", "--to", "D7B", "--text", f"noise {i}")
     body = "round:1\nkind:brief\n# the real brief\nbuild the thing\n"
     code, res = bus_cli("send", "--data", data, "--run", BUS_RUN, "--task", "D7B",
                         "--kind", "info", "--from", "orch", "--to", "D7B", "--text", body)
@@ -3070,6 +3117,17 @@ def t_d7b_connect_reads_the_bus_brief(root):
         f.write("the lane file wins\n")
     code, lines = cli(lane, "connect")
     assert "the lane file wins" in "\n".join(lines), lines
+    os.unlink(os.path.join(lane, ".matrixkoder-brief.md"))
+    # 30 earlier messages must not hide the brief, and a lane with nothing prints the marker
+    for i in range(30):
+        bus_cli("send", "--data", data, "--run", BUS_RUN, "--task", "D7B",
+                "--kind", "info", "--from", "orch", "--to", "D7B", "--text", f"noise {i}")
+    code, lines = cli(lane, "connect")
+    assert "round two brief" in "\n".join(lines), lines
+    empty = bus_lane(root, "d7_empty_lane", "D7E", data)
+    begin(empty, root, run=BUS_RUN, task="D7E")
+    code, lines = cli(empty, "connect")
+    assert lines == ["# brief: none found"], (code, lines, brief_messages(bus_lane_config(empty)))
 
 
 def t_d7_todo_backup_and_dedupe(root):

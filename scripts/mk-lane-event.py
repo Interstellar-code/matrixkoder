@@ -693,13 +693,32 @@ def selftest_jobs_hint(data, active=None):
     return str(max(1, total // active))
 
 
+def bus_dir_for(data):
+    """Where bus.json lives, the same rule as mk-bus.bus_location: $MK_BUS_DIR, else the
+    MK home when <data>/mk.db exists (store mode), else the data dir (file mode)."""
+    override = os.environ.get("MK_BUS_DIR")
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    if data and os.path.isfile(os.path.join(data, "mk.db")):
+        # Same rule as mk-bus.root_bus_dir / mk_home: $MK_HOME, else ~/.matrixkoder.
+        # MATRIXKODER_HOME is the projects.json home, not the bus home.
+        home = os.environ.get("MK_HOME") or os.path.expanduser("~/.matrixkoder")
+        return os.path.abspath(os.path.expanduser(home))
+    return data
+
+
+def brief_message(round_n, text):
+    """The one brief format both publish_brief and review-handoff send, and the one
+    connect reads: `round:<n>\nkind:brief\n<body>`."""
+    return f"round:{round_n}\nkind:brief\n{text}"
+
+
 def bus_is_up(data):
-    """True only when a bus is already serving this data dir. Reads bus.json and probes
-    /health; never calls ensure, so a down bus stays down and the full prompt is kept."""
+    """True only when a bus is already serving this data dir. Reads bus.json from the
+    mk-bus location and probes /health; never calls ensure, so a down bus stays down."""
     if not data:
         return False
-    override = os.environ.get("MK_BUS_DIR")
-    bus_dir = os.path.abspath(os.path.expanduser(override)) if override else data
+    bus_dir = bus_dir_for(data)
     try:
         with open(os.path.join(bus_dir, "bus.json")) as f:
             info = json.load(f)
@@ -709,7 +728,10 @@ def bus_is_up(data):
     try:
         r = subprocess.run(
             [sys.executable, "-c",
-             "import sys,urllib.request; urllib.request.urlopen(sys.argv[1], timeout=2).read()",
+             "import json,sys,urllib.request\n"
+             "body=urllib.request.urlopen(sys.argv[1], timeout=2).read()\n"
+             "j=json.loads(body)\n"
+             "sys.exit(0 if isinstance(j, dict) and j.get('ok') and j.get('status')=='healthy' else 1)",
              f"http://127.0.0.1:{port}/health"],
             capture_output=True, text=True, timeout=5)
     except Exception:
@@ -741,9 +763,9 @@ def publish_brief(data, run, task):
     """Send the task's current brief to the lane as the orchestrator. File mode uses kind
     info (the only kinds a file-mode bus accepts); store mode uses kind task. -> (ok, error)."""
     text, n = brief_body_for(data, run, task)
-    if text is None:
+    if not text or not str(text).strip():
         return False, "no brief"
-    body = f"round:{n}\nkind:brief\n{text}"
+    body = brief_message(n, text)
     kind = "task" if os.path.isfile(os.path.join(data, "mk.db")) else "info"
     _j, err = run_bus(["send", "--data", data, "--run", run, "--task", task,
                        "--kind", kind, "--from", "orch", "--to", task, "--text", body])
@@ -835,9 +857,12 @@ def cmd_dispatch(a):
         wdata = (hit[1].get("data") or "") if hit else ""
         wrun, wtask = (hit[1].get("run"), hit[1].get("task")) if hit else (None, None)
         if hit and bus_enabled(wdata) and bus_is_up(wdata):
-            ok, _err = publish_brief(wdata, wrun, wtask)
+            ok, publish_error = publish_brief(wdata, wrun, wtask)
             if ok:
                 text = connect_text(hit[1].get("lane") or "", wdata)
+            elif publish_error:
+                # the full prompt is kept; the reply says why the doorbell was not typed
+                a = list(a) + ["--publish-error", publish_error]
     role = opt(a, "--role", "build")
     if role not in ("build", "review"):
         fail("--role must be build or review")
@@ -881,6 +906,7 @@ def cmd_dispatch(a):
             out({"ok": True, "delivered": True, "pane": pane, "agent_status": status, "timeout_ms": ms,
                  "attempts": attempts, "herdr_error": fail_why or why, "pane_entry": entry,
                  "fresh_session": fresh,
+                 **({"publish_error": opt(a, "--publish-error")} if opt(a, "--publish-error") else {}),
                  **({"pane_list_error": pl_err} if pl_err else {}), **delivered_status(pane, role)})
             return
         fail_why = why
@@ -1090,7 +1116,7 @@ def send_brief_over_bus(data, run, task, text, round_n):
     """The orchestrator sends the FIX brief to the builder. Store mode stores it as a
     brief artifact (connect reads that); file mode sends it as info. Never a lane-to-lane
     message: the sender is the orchestrator token."""
-    body = f"round:{round_n}\n{text}"
+    body = brief_message(round_n, text)
     if os.path.isfile(os.path.join(data, "mk.db")):
         return run_bus(["send", "--data", data, "--run", run, "--task", task,
                         "--kind", "task", "--from", "orch", "--to", task, "--text", body])
@@ -2476,7 +2502,15 @@ def self_test():
         finally:
             os.environ.pop("MK_SELFTEST_JOBS", None)
         # a value outside 1..16 is refused by the same bound selftest.sh uses
-        assert selftest_jobs_total.__doc__
+        # a value outside 1..16 is refused: the lookup is stubbed to print each one
+        real_here = HERE
+        for bad in (17, 0, -1, "abc"):
+            os.environ.pop("MK_SELFTEST_JOBS", None)
+            globals()["HERE"] = tmp
+            open(os.path.join(tmp, "mk-config.py"), "w").write(
+                "import json,sys\nprint(json.dumps({'ok':True,'value':%s}))\n" % json.dumps(bad))
+            assert selftest_jobs_total(data) == 4, bad
+        globals()["HERE"] = real_here
 
         # (D7B) the bus is down here (the fake never listens), so --connect keeps the prompt
         n0 = len(prompt_calls())
@@ -2489,6 +2523,98 @@ def self_test():
         r = cli("dispatch", "--pane", pane_of("H1"), "--text", "the full prompt stays")
         assert prompt_calls()[n0:][-1].endswith("the full prompt stays --wait --timeout 25000"), \
             prompt_calls()[n0:]
+
+        # (D7B R3) bus up: a real /health plus bus.json. The suite's bus is the fake, so
+        # "published" is the recorded send argv. No brief -> the full prompt and the reply names
+        # the error. A brief -> the doorbell. A send the fake refuses -> the full prompt again.
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        class _H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = b'{"ok": true, "status": "healthy"}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            def log_message(self, *a):
+                pass
+        _srv = ThreadingHTTPServer(("127.0.0.1", 0), _H)
+        threading.Thread(target=_srv.serve_forever, daemon=True).start()
+        # store enable earlier left mk.db. The bus home is $MK_HOME (mk-bus.root_bus_dir),
+        # not MATRIXKODER_HOME. Pin it for this block, then write bus.json AFTER arm:
+        # arm's ensure must not be the writer.
+        _saved_bus_home = os.environ.get("MK_HOME")
+        _bus_home = os.path.join(tmp, "home")
+        os.environ["MK_HOME"] = _bus_home
+        try:
+            _bus_dir = bus_dir_for(data)
+            assert _bus_dir == os.path.abspath(_bus_home), _bus_dir
+            os.makedirs(_bus_dir, exist_ok=True)
+            mks("task", "add", "--id", "NB", "--title", "no brief")
+            lanes["NB"] = os.path.join(tmp, "lane-nb")
+            g(repo, "worktree", "add", "-q", "--detach", lanes["NB"])
+            arm("NB")
+            open(os.path.join(_bus_dir, "bus.json"), "w").write(
+                json.dumps({"port": _srv.server_address[1]}))
+            assert bus_is_up(data) is True, (_bus_dir, open(os.path.join(_bus_dir, "bus.json")).read())
+            _td = os.path.join(data, "runs", "r1", "tasks", "NB")
+            os.makedirs(_td, exist_ok=True)
+            open(bus_log, "w").write("")
+            n0 = len(prompt_calls())
+            r = cli("dispatch", "--pane", pane_of("NB"), "--text", "the full prompt stays", "--connect")
+            assert r["delivered"] is True and r.get("publish_error"), r
+            assert prompt_calls()[n0:][-1].endswith("the full prompt stays --wait --timeout 25000"), \
+                prompt_calls()[n0:]
+            open(os.path.join(_td, "brief-r1.md"), "w").write("# the brief\nhello lane\n")
+            open(bus_log, "w").write("")
+            n0 = len(prompt_calls())
+            r = cli("dispatch", "--pane", pane_of("NB"), "--text", "the full prompt stays", "--connect")
+            assert r["delivered"] is True and "publish_error" not in r, r
+            _typed = prompt_calls()[n0:][-1]
+            assert "mk-builder.py connect" in _typed and "the full prompt stays" not in _typed, _typed
+            # mk.db is already present (store enable, above), so the send is kind task, not info
+            assert any("--kind task" in c and "kind:brief" in c for c in [" ".join(bus_calls())]), bus_calls()
+            # a refused send keeps the full prompt and names the error
+            open(os.path.join(tmp, "bus_send_rc.txt"), "w").write("2")
+            open(os.path.join(tmp, "bus_send_out.txt"), "w").write('{"ok": false, "error": "too big"}\n')
+            open(bus_log, "w").write("")
+            n0 = len(prompt_calls())
+            r = cli("dispatch", "--pane", pane_of("NB"), "--text", "the full prompt stays", "--connect")
+            assert r.get("publish_error") == "too big", r
+            assert prompt_calls()[n0:][-1].endswith("the full prompt stays --wait --timeout 25000"), \
+                prompt_calls()[n0:]
+            os.unlink(os.path.join(tmp, "bus_send_rc.txt"))
+            os.unlink(os.path.join(tmp, "bus_send_out.txt"))
+            os.unlink(os.path.join(_bus_dir, "bus.json"))
+        finally:
+            if _saved_bus_home is None:
+                os.environ.pop("MK_HOME", None)
+            else:
+                os.environ["MK_HOME"] = _saved_bus_home
+
+        # (D7B R3) store mode: mk.db present, so bus.json lives in the MK home, not the data dir.
+        # A stale <data>/bus.json must not win. A real store-mode bus, real acquire and arm.
+        open(os.path.join(data, "mk.db"), "w").write("")
+        _home = os.path.join(tmp, "mkhome")
+        os.makedirs(_home, exist_ok=True)
+        open(os.path.join(data, "bus.json"), "w").write(json.dumps({"port": 1}))
+        # no MK_BUS_DIR: a present mk.db resolves to the MK home, never the stale data-dir file
+        _saved_home = os.environ.get("MK_HOME")
+        os.environ["MK_HOME"] = _home
+        try:
+            assert bus_dir_for(data) == os.path.abspath(_home), bus_dir_for(data)
+            assert bus_is_up(data) is False
+            open(os.path.join(_home, "bus.json"), "w").write(
+                json.dumps({"port": _srv.server_address[1]}))
+            assert bus_is_up(data) is True  # the home bus, not the stale data-dir file
+        finally:
+            if _saved_home is None:
+                os.environ.pop("MK_HOME", None)
+            else:
+                os.environ["MK_HOME"] = _saved_home
+        _srv.shutdown()
+        os.unlink(os.path.join(data, "mk.db"))
+        os.unlink(os.path.join(data, "bus.json"))
 
         # (D7B.2) review-handoff. The bus is the fake, so "sent" is the recorded argv.
         rev_dir = os.path.join(data, "runs", "r1", "tasks", "RH")
@@ -2506,7 +2632,9 @@ def self_test():
         brief = open(r["brief"]).read()
         assert "## FIX" in brief and "[HIGH]" in brief and "not required" in brief and "[LOW]" in brief, brief
         calls = bus_calls()
-        assert any(c.startswith("send ") and "--from orch" in c and "--kind info" in c for c in calls), calls
+        joined = " ".join(calls)
+        assert joined.startswith("send ") and "--from orch" in joined and "--kind info" in joined \
+            and "kind:brief" in joined, calls
         # APPROVE records the verdict and dispatches nothing
         mks("task", "add", "--id", "RA", "--title", "approve")
         mks("task", "round", "RA", "--kind", "build")
