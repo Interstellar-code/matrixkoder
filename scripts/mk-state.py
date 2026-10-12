@@ -847,9 +847,14 @@ class Store:
                     route = json.loads(t["route_json"]) or {}
             deps = [d for d in (t["deps"] or "").split(",") if d]
             owned = [d for d in (t["owned"] or "").split(",") if d]
+            # the store status `ready` is the kanban column; the file view keeps `planned`
+            # and shows readiness with the `ready` flag, so the two views stay byte-identical
+            status = t["status"] or "planned"
+            if status == "ready":
+                status = "planned"
             extra.update({
                 "id": t["id"], "title": t["title"] or "", "parent": t["parent"],
-                "deps": deps, "owned": owned, "status": t["status"] or "planned",
+                "deps": deps, "owned": owned, "status": status,
                 "lane": t["lane"], "slot": t["slot"], "branch": t["branch"], "pane": t["pane"],
                 "round": t["round"] or 0, "verdict": t["verdict"], "updated": t["updated"],
                 "agent": route.get("agent"), "model": route.get("model"), "effort": route.get("effort"),
@@ -1198,6 +1203,10 @@ class Store:
                         " VALUES (?,?,?,?,?,?,?,?)",
                         (active_id, "_index", 0, STORE_INDEX, 1, blob, now(), src))
                 con.commit()
+                # a dep already met in the imported history makes its dependent ready, the same
+                # rule a live transition applies. One move per task, through the single writer.
+                for rid in imported:
+                    self.db().promote_ready(imp_home, STORE_PROJECT, rid, sync_root=False)
                 counts = {}
                 for rid in imported:
                     counts[rid] = (
