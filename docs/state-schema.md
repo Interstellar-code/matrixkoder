@@ -365,14 +365,26 @@ it repairs a partial promotion.
 
 Off by default: `store status` answers `{"store": "off"}` while `<data>/mk.db` does not exist, and
 every command keeps using the JSON files. `store enable` is the opt-in. It creates the project
-store, imports the active run (reply `{"store": "on", "imported": "<run>", "events": N, "tasks": N,
-"legacy": "<data>/runs-legacy"}`), and moves the current `runs/` tree to `<data>/runs-legacy/` — a
-read-only copy taken at enable time, not updated again.
+store, and imports every run: each entry in `runs/index.json`, plus any `runs/<id>/run.json`
+the index does not list. The importer (`scripts/mk-store-import.py`) lands them in dependency
+order, so a `<run>:<id>` dep finds its target; deps that still cannot be resolved are reported in
+`unresolved_deps` and do not abort the import. One run that fails to import aborts the whole
+enable and `<data>` is left exactly as it was — all or nothing. The reply is `{"store": "on",
+"imported": "<run>" | ["<run>", …], "events": N, "tasks": N, "legacy": "<data>/runs-legacy"}`
+(`imported` is the single id only when that id is the one active run, otherwise the list, in
+dependency order). The current `runs/` tree moves to `<data>/runs-legacy/` — a read-only copy
+taken at enable time, not updated again. `run.json`'s task order is kept: the tasks table inserts
+parents before children, and the republished view overlays those rows back onto the artifact's
+order. Before the import, stale `mk-enable-*` directories in `<data>` older than a minute are
+swept (a directory younger than a minute, or one holding a live lock, is left alone).
 
 With the store on, all writes go through the store and the legacy views under `runs/` are
 republished from it: `run.json`, `tasks/` and `board.md` are rewritten, and `events.jsonl` is
 append-only — new events are appended, the file is never rewritten. `runs/<run>/.store-event`
-remembers how far the republish got. `store status` then answers `{"store": "on"}`.
+holds the last published event id and the byte offset where its line ends, written before the
+append. A crash between the two leaves the marker ahead of the file; the next publish appends
+exactly the missing bytes, and a marker that was rewound skips lines that are already the tail,
+so a crash never duplicates a line. `store status` then answers `{"store": "on"}`.
 
 `export-legacy --run R` rebuilds that run's legacy files from the tables (reply `{"ok": true, "run": R}`).
 
@@ -481,7 +493,9 @@ stored byte-for-byte; `src` is the v2 source key.
 ### Root tables (C1)
 
 `cards(project, run, task, parent, type, title, status, col, attention, question, route_json, lane,
-round, verdict, gates, updated, change_no, PRIMARY KEY(project, run, task))`. `col` (C4) is derived
+round, verdict, gates, updated, change_no, PRIMARY KEY(project, run, task))`. The root card carries
+`verdict`: the value `transition()` stored on the task (the imported verdict when a later
+status-only transition did not replace it). `col` (C4) is derived
 from `status`: Backlog (`planned`, `routed`) · Ready · Building (`dispatched`, `building`,
 `takeover`) · Verify (`verifying`) · Review · Fix · Done (`merged`, `qa`, `done`); an attention
 status (`blocked`, `stalled`, `quota`, `provider`) keeps the column of the task's previous
@@ -491,9 +505,11 @@ is pure; `transition()` and the rollup do the lookup. `sync(project PRIMARY KEY,
 records how far the root copy got and only ever moves forward (`MAX` of the stored value and the
 new `change_no`); a card's own `change_no` is monotonic the same way.
 
-### `transition(home, project, run, task, to, note="", round=0, sync_root=False, data_dir=None)`
+### `transition(home, project, run, task, to, note="", round=0, sync_root=False, data_dir=None, verdict=<unchanged>)`
 
-The only status writer (C10). One project-store transaction updates the task row, appends an
+The only status writer (C10). `verdict` is optional: omitted, the task's stored verdict is left
+unchanged; a string or `None` replaces it, and the root card (when `sync_root=True`) and a later
+`catch_up()` both copy that value. One project-store transaction updates the task row, appends an
 `events` row (`chan='state'`, `kind='transition'`) and a `change_log` row, and returns `change_no`.
 A failure inside it leaves nothing. The C5 root card upsert is a **second** transaction and runs
 only when `sync_root=True`; the default is `False`, so D1 and D3A do not write `cards`. A crash
@@ -562,7 +578,10 @@ is one `BEGIN IMMEDIATE` transaction; any error rolls it back and the store is u
 - `events` are dicts `t chan kind from_id to_id reply_to text meta_json task` plus `src`, the
   stable source key. They are stored with the original `t`, `chan` and `kind` — no `now()`, no
   forced `kind='transition'` — in the order given, so ids ascend with the input. `src` is written
-  into `meta_json` as `"src"` and recorded in `event_src`.
+  into `meta_json` as `"src"` and recorded in `event_src`. The importer counts a blank line in
+  `events.jsonl` (and a malformed line, and a line whose kind is not a state kind) in
+  `skipped_events`, with the line number and reason in `skipped_event_reasons`; a blank line is
+  not imported.
 - `artifacts` are dicts `task round kind rev text created` plus `src`. `text` is stored
   byte-for-byte and `src` goes in the `artifacts.src` column.
 
