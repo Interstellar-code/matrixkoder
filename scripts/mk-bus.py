@@ -51,6 +51,103 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
+# File mode (no project store): the original four kinds, 64 KiB body.
+# Store mode adds C7 kinds. report/review bodies page up to 128 KiB.
+FILE_KINDS = ("ask", "answer", "info", "ack")
+STORE_KINDS = FILE_KINDS + ("task", "status", "commit", "report", "review", "nudge")
+FILE_TEXT_MAX = 65536
+STORE_TEXT_MAX = 131072
+PAGE_BYTES = 65536
+NONEMPTY_KINDS = ("ask", "answer", "info", "task", "status", "commit", "report", "review", "nudge")
+# status values transition() already accepts (COLUMNS plus attention).
+STATUS_VALUES = (
+    "planned", "routed", "ready", "dispatched", "building", "takeover",
+    "verifying", "review", "fix", "merged", "qa", "done",
+    "blocked", "stalled", "quota", "provider",
+)
+
+
+def project_store_path(data_dir):
+    """The project store lives at <data>/mk.db. Absent means file mode."""
+    return os.path.join(data_dir, "mk.db")
+
+
+def store_mode(data_dir):
+    """Self-hosting guard: store code runs only when the project store already exists."""
+    return os.path.isfile(project_store_path(data_dir))
+
+
+class StoreAdapter:
+    """The only place mk-bus talks to the project store.
+
+    Wired to mkdb.append_event / append_ack / put_artifact / transition once those
+    helpers exist (D1D). Until then every method raises, and store_mode stays false
+    unless a store file is already present — callers must not reach here in file mode.
+    """
+
+    def __init__(self, data_dir):
+        self.data_dir = data_dir
+        self._mkdb = None
+
+    def _mod(self):
+        if self._mkdb is None:
+            path = os.path.join(HERE, "mkdb.py")
+            spec = importlib.util.spec_from_file_location("mkdb", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            self._mkdb = mod
+        return self._mkdb
+
+    def store_append_event(self, run, *, task=None, kind, from_id=None, to_id=None,
+                            reply_to=None, text="", meta=None, artifact_id=None, t=None):
+        fn = getattr(self._mod(), "append_event", None)
+        if fn is None:
+            raise Fail("store writer append_event is not available")
+        # Test-only: MK_BUS_APPEND_FAIL makes the next append raise after the
+        # caller has already transitioned, so the 500 path is reachable.
+        flag_path = os.path.join(self.data_dir, "append-fail")
+        if os.path.isfile(flag_path):
+            os.remove(flag_path)
+            raise RuntimeError("injected append failure")
+        return fn(
+            self.data_dir, None, run, task=task, chan="bus", kind=kind,
+            from_id=from_id, to_id=to_id, reply_to=reply_to, text=text,
+            meta=meta, artifact_id=artifact_id, t=t, data_dir=self.data_dir,
+        )
+
+    def store_append_ack(self, run, msg, lane, level, *, t=None):
+        fn = getattr(self._mod(), "append_ack", None)
+        if fn is None:
+            raise Fail("store writer append_ack is not available")
+        return fn(self.data_dir, None, run, msg, lane, level, t=t, data_dir=self.data_dir)
+
+    def store_put_artifact(self, run, task, round_n, kind, text, *, event_id=None):
+        fn = getattr(self._mod(), "put_artifact", None)
+        if fn is None:
+            raise Fail("store writer put_artifact is not available")
+        return fn(
+            self.data_dir, None, run, task, round_n, kind, text,
+            event_id=event_id, data_dir=self.data_dir,
+        )
+
+    def store_transition(self, run, task, to, note="", round_n=0):
+        fn = getattr(self._mod(), "transition", None)
+        if fn is None:
+            raise Fail("store writer transition is not available")
+        return fn(
+            self.data_dir, None, run, task, to, note=note, round=round_n,
+            sync_root=False, data_dir=self.data_dir,
+        )
+
+    def store_select(self, sql, params=()):
+        """SELECT only, on the connection open_project returns. No writes."""
+        mod = self._mod()
+        con = mod.open_project(self.data_dir, data_dir=self.data_dir)
+        try:
+            return [dict(r) for r in con.execute(sql, params)]
+        finally:
+            con.close()
+
 
 def is_valid_id(val):
     """C2 identifier alphabet: `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` and never contains `..`
@@ -242,6 +339,10 @@ class BusState:
         self.lock = threading.RLock()
         self.tokens = {}
         self.tokens_mtime = 0
+        # Decided once at process start. A store that appears mid-process is ignored
+        # so a file-mode server never starts writing the store halfway through.
+        self.use_store = store_mode(data_dir)
+        self.store = StoreAdapter(data_dir) if self.use_store else None
         self.runs = {}
         # (run, ask id) pairs whose task was already marked blocked (the /send lane-ask
         # path): guards the "once per ask" mk-state write, thread-safe under the same lock
@@ -352,7 +453,10 @@ class BusState:
             messages = []
             by_id = {}
             max_seq = 0
-            if os.path.exists(jsonl_path):
+            if self.use_store:
+                loaded = self._load_store_run(run)
+                messages, by_id, max_seq = loaded
+            elif os.path.exists(jsonl_path):
                 # Per-line tolerance: the file may be hand-edited between runs,
                 # so one bad line (invalid UTF-8, non-int seq, non-hashable
                 # reply_to) is skipped instead of failing replay for the run.
@@ -406,6 +510,65 @@ class BusState:
             self.runs[run] = rstate
             return rstate
 
+    def _load_store_run(self, run):
+        """Rebuild one run from events chan=bus. SELECT only. Ids are row ids."""
+        rows = self.store.store_select(
+            "SELECT id, run, task, t, kind, from_id, to_id, reply_to, text, artifact_id, meta_json"
+            " FROM events WHERE chan=? AND run=? ORDER BY id",
+            ("bus", run),
+        )
+        acks = self.store.store_select(
+            "SELECT msg, lane, level FROM acks WHERE run=?",
+            (run,),
+        )
+        ack_of = {}
+        for a in acks:
+            ack_of[a["msg"]] = max(ack_of.get(a["msg"], 1), int(a["level"] or 1))
+        messages, by_id, max_seq = [], {}, 0
+        for row in rows:
+            eid = int(row["id"])
+            if eid > max_seq:
+                max_seq = eid
+            meta = {}
+            if row.get("meta_json"):
+                try:
+                    meta = json.loads(row["meta_json"])
+                except (TypeError, ValueError):
+                    meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
+            # Wire id is always m-<event row id>. meta.bus_id is ignored: older
+            # rows stored the placeholder "pending", which collided in by_id.
+            msg_id = f"m-{eid}"
+            if row.get("kind") == "ack":
+                target = row.get("reply_to")
+                level = meta.get("ack_level", 1)
+                if not isinstance(level, int) or isinstance(level, bool):
+                    level = 1
+                if isinstance(target, str) and target in by_id:
+                    cur = by_id[target].get("ack_level", 1)
+                    by_id[target]["ack_level"] = max(cur, level)
+                continue
+            msg = {
+                "seq": eid,
+                "id": msg_id,
+                "ts": row.get("t") or "",
+                "run": run,
+                "task": row.get("task"),
+                "from": row.get("from_id") or "",
+                "to": row.get("to_id") or "",
+                "kind": row.get("kind"),
+                "reply_to": row.get("reply_to"),
+                "text": row.get("text") or "",
+                "ack_level": ack_of.get(msg_id, 1),
+                "event_id": eid,
+            }
+            if row.get("artifact_id") is not None:
+                msg["artifact_id"] = row["artifact_id"]
+            messages.append(msg)
+            by_id[msg["id"]] = msg
+        return messages, by_id, max_seq
+
     def _append_jsonl(self, run_dir, line):
         """Append one JSON line to <run_dir>/bus.jsonl under flock.
 
@@ -451,27 +614,36 @@ class BusState:
                 for m in rstate["messages"]:
                     if m.get("kind") == "answer" and m.get("reply_to") == reply_to:
                         raise Fail("ask already answered")
-            seq = rstate["next_seq"]
-            rstate["next_seq"] += 1
-            msg_id = f"m-{seq}"
             ts = now_iso()
-            msg = {
-                "seq": seq,
-                "id": msg_id,
-                "ts": ts,
-                "run": run,
-                "task": task or None,
-                "from": from_val,
-                "to": to_val,
-                "kind": kind,
-                "reply_to": reply_to or None,
-                "text": text,
-                "ack_level": 1
-            }
-
-            run_dir = os.path.join(self.data_dir, "runs", run)
-            line = json.dumps(msg, separators=(",", ":")) + "\n"
-            self._append_jsonl(run_dir, line)
+            if self.use_store:
+                # Row id is the wire seq and the SSE Last-Event-ID. The wire id
+                # is derived as m-<row id> on load; meta does not store it.
+                eid = int(self.store.store_append_event(
+                    run, task=task or None, kind=kind, from_id=from_val, to_id=to_val,
+                    reply_to=reply_to or None, text=text, t=ts,
+                ))
+                seq = eid
+                msg_id = f"m-{seq}"
+                rstate["next_seq"] = max(rstate["next_seq"], seq + 1)
+                msg = {
+                    "seq": seq, "id": msg_id, "ts": ts, "run": run,
+                    "task": task or None, "from": from_val, "to": to_val,
+                    "kind": kind, "reply_to": reply_to or None, "text": text,
+                    "ack_level": 1, "event_id": seq,
+                }
+            else:
+                seq = rstate["next_seq"]
+                rstate["next_seq"] += 1
+                msg_id = f"m-{seq}"
+                msg = {
+                    "seq": seq, "id": msg_id, "ts": ts, "run": run,
+                    "task": task or None, "from": from_val, "to": to_val,
+                    "kind": kind, "reply_to": reply_to or None, "text": text,
+                    "ack_level": 1,
+                }
+                run_dir = os.path.join(self.data_dir, "runs", run)
+                line = json.dumps(msg, separators=(",", ":")) + "\n"
+                self._append_jsonl(run_dir, line)
 
             rstate["messages"].append(msg)
             rstate["by_id"][msg_id] = msg
@@ -487,33 +659,88 @@ class BusState:
             target_msg = rstate["by_id"].get(target_id)
             target_task = target_msg.get("task") if target_msg else None
 
-            seq = rstate["next_seq"]
-            rstate["next_seq"] += 1
-            ack_id = f"m-{seq}"
             ts = now_iso()
-            ack_rec = {
-                "seq": seq,
-                "id": ack_id,
-                "ts": ts,
-                "run": run,
-                "task": target_task,
-                "from": from_val or "client",
-                "to": to_val or "orch",
-                "kind": "ack",
-                "reply_to": target_id,
-                "text": f"ack {ack_level}",
-                "ack_level": ack_level
-            }
-
-            run_dir = os.path.join(self.data_dir, "runs", run)
-            line = json.dumps(ack_rec, separators=(",", ":")) + "\n"
-            self._append_jsonl(run_dir, line)
+            if self.use_store:
+                eid = int(self.store.store_append_event(
+                    run, task=target_task, kind="ack",
+                    from_id=from_val or "client", to_id=to_val or "orch",
+                    reply_to=target_id, text=f"ack {ack_level}", t=ts,
+                    meta={"ack_level": ack_level},
+                ))
+                lane = from_val or "client"
+                self.store.store_append_ack(run, target_id, lane, ack_level, t=ts)
+                seq = eid
+                rstate["next_seq"] = max(rstate["next_seq"], seq + 1)
+            else:
+                seq = rstate["next_seq"]
+                rstate["next_seq"] += 1
+                ack_id = f"m-{seq}"
+                ack_rec = {
+                    "seq": seq, "id": ack_id, "ts": ts, "run": run,
+                    "task": target_task, "from": from_val or "client",
+                    "to": to_val or "orch", "kind": "ack", "reply_to": target_id,
+                    "text": f"ack {ack_level}", "ack_level": ack_level,
+                }
+                run_dir = os.path.join(self.data_dir, "runs", run)
+                line = json.dumps(ack_rec, separators=(",", ":")) + "\n"
+                self._append_jsonl(run_dir, line)
 
             if target_msg:
                 target_msg["ack_level"] = max(target_msg.get("ack_level", 1), ack_level)
 
             rstate["cond"].notify_all()
             return True
+
+    def validate_store_kind(self, kind, task, text):
+        """Checks that must pass before any store write for status/report/review.
+
+        A failure here stores nothing and streams nothing.
+        """
+        if kind == "status":
+            if not task:
+                raise Fail("status requires a task")
+            to = (text or "").strip()
+            if to not in STATUS_VALUES:
+                raise Fail(f"invalid status {to!r}")
+            return
+        if not task:
+            raise Fail(f"{kind} requires a task")
+        body = (text or "").replace("\x1e", "")
+        if len(body.encode("utf-8")) > STORE_TEXT_MAX:
+            raise Fail("text exceeds 128 KiB")
+
+    def apply_store_kind(self, msg):
+        """status -> transition(); report/review -> artifact linked to the bus event.
+
+        Called only in store mode, after the bus event row exists, and only
+        after validate_store_kind and (for status) a successful transition().
+        """
+        kind = msg["kind"]
+        run, task = msg["run"], msg.get("task")
+        if kind == "status":
+            return {"change_no": msg.get("change_no")}
+        if not task:
+            raise Fail(f"{kind} requires a task")
+        body = msg["text"].replace("\x1e", "")
+        if len(body.encode("utf-8")) > STORE_TEXT_MAX:
+            raise Fail("text exceeds 128 KiB")
+        round_n = 0
+        head, sep, rest = body.partition("\n")
+        if head.startswith("round:"):
+            try:
+                round_n = int(head[6:].strip())
+            except ValueError:
+                round_n = 0
+            body = rest
+        try:
+            art = self.store.store_put_artifact(
+                run, task, round_n, kind, body, event_id=msg.get("event_id"),
+            )
+        except Exception as e:
+            raise Fail(str(e))
+        msg["artifact_id"] = art["id"]
+        msg["rev"] = art["rev"]
+        return {"artifact": art}
 
     def get_pending(self, run):
         with self.lock:
@@ -706,7 +933,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     with rstate["cond"]:
                         for m in rstate["messages"]:
                             if m["seq"] > last_seq and matches_lane(m, lane):
-                                to_send.append(m)
+                                to_send.append(dict(m))
                                 m["ack_level"] = max(m.get("ack_level", 1), 2)
                                 last_seq = m["seq"]
 
@@ -714,13 +941,16 @@ class RequestHandler(BaseHTTPRequestHandler):
                             rstate["cond"].wait(timeout=15.0)
                             for m in rstate["messages"]:
                                 if m["seq"] > last_seq and matches_lane(m, lane):
-                                    to_send.append(m)
+                                    to_send.append(dict(m))
                                     m["ack_level"] = max(m.get("ack_level", 1), 2)
                                     last_seq = m["seq"]
 
+                    # The lock is released before the socket write. A slow SSE
+                    # client must not hold the run lock or a store connection.
                     if to_send:
                         for m in to_send:
-                            ev = f"id: {m['seq']}\nevent: message\ndata: {json.dumps(m)}\n\n"
+                            sse_id = m.get("event_id", m["seq"])
+                            ev = f"id: {sse_id}\nevent: message\ndata: {json.dumps(m)}\n\n"
                             try:
                                 self.wfile.write(ev.encode("utf-8"))
                                 self.wfile.flush()
@@ -848,7 +1078,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             except ValueError:
                 content_len = 0
 
-            if content_len > 65536:
+            limit = STORE_TEXT_MAX + 4096 if self.server.bus_state.use_store else 65536
+            if content_len > limit:
                 self.send_error_json(413, "payload too large")
                 return
 
@@ -882,7 +1113,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                         return
 
                 kind = body.get("kind")
-                if kind not in ("ask", "answer", "info", "ack"):
+                allowed = STORE_KINDS if self.server.bus_state.use_store else FILE_KINDS
+                if kind not in allowed:
                     self.send_error_json(400, "invalid kind")
                     return
 
@@ -898,12 +1130,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                     # would raise) -> reject at the door as 400, never a 500.
                     self.send_error_json(400, "text is not valid UTF-8")
                     return
-                if text_len > 65536:
-                    self.send_error_json(400, "text exceeds 64 KiB")
+                text_max = STORE_TEXT_MAX if self.server.bus_state.use_store else FILE_TEXT_MAX
+                if text_len > text_max:
+                    self.send_error_json(400, "text exceeds 64 KiB" if text_max == FILE_TEXT_MAX else "text exceeds 128 KiB")
                     return
                 # B18: text is non-empty for ask/answer/info; empty is allowed
                 # only for ack.
-                if kind in ("ask", "answer", "info") and not text:
+                if kind in NONEMPTY_KINDS and not text:
                     self.send_error_json(400, "text must be non-empty")
                     return
 
@@ -915,7 +1148,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 # answer. For ack/answer it must name an existing message in the
                 # target run (checked after run resolution below, because the
                 # run determines which bus.jsonl to look in).
-                if kind in ("ask", "info") and reply_to is not None:
+                if kind in ("ask", "info", "task", "status", "commit", "report", "review", "nudge") and reply_to is not None:
                     self.send_error_json(400, "reply_to must be null for ask/info")
                     return
                 if kind == "ack" and not reply_to:
@@ -934,6 +1167,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                     # Lane token scoping
                     if kind == "answer":
                         self.send_error_json(403, "lane tokens cannot send answers")
+                        return
+                    if kind == "status":
+                        self.send_error_json(403, "lane tokens cannot set status")
                         return
 
                     tok_run = tok.get("run")
@@ -1025,8 +1261,25 @@ class RequestHandler(BaseHTTPRequestHandler):
                 # append_message re-checks "ask already answered" under the
                 # lock: a losing racer surfaces here as Fail -> 400, never a
                 # 500 from the handler's blanket except.
+                bus = self.server.bus_state
+                change_no = None
+                if bus.use_store and kind in ("status", "report", "review"):
+                    # Validate, and for status transition, BEFORE any bus event.
+                    # A failure returns 400 with nothing stored and nothing streamed.
+                    try:
+                        bus.validate_store_kind(kind, task, text)
+                        if kind == "status":
+                            change_no = bus.store.store_transition(
+                                run, task, (text or "").strip(), note="bus status",
+                            )
+                    except Fail as e:
+                        self.send_error_json(400, str(e))
+                        return
+                    except Exception as e:
+                        self.send_error_json(400, str(e))
+                        return
                 try:
-                    msg = self.server.bus_state.append_message(
+                    msg = bus.append_message(
                         run=run,
                         task=task,
                         from_val=from_val,
@@ -1036,7 +1289,33 @@ class RequestHandler(BaseHTTPRequestHandler):
                         reply_to=reply_to
                     )
                 except Fail as e:
+                    # Transition already committed: the state change is the truth.
+                    # Do not report ok; the next status resend is idempotent.
+                    if change_no is not None:
+                        sys.stderr.write(f"bus status event append failed after transition: {e}\n")
+                        self.send_error_json(500, "status applied but the bus event was not stored")
+                        return
                     self.send_error_json(400, str(e))
+                    return
+                except Exception as e:
+                    if change_no is not None:
+                        sys.stderr.write(f"bus status event append failed after transition: {e}\n")
+                        self.send_error_json(500, "status applied but the bus event was not stored")
+                        return
+                    raise
+                if change_no is not None:
+                    msg["change_no"] = change_no
+                if bus.use_store and kind in ("status", "report", "review"):
+                    try:
+                        extra = bus.apply_store_kind(msg)
+                    except Fail as e:
+                        if kind == "status":
+                            sys.stderr.write(f"bus status follow-up failed after transition: {e}\n")
+                            self.send_error_json(500, "status applied but the bus event was not stored")
+                            return
+                        self.send_error_json(400, str(e))
+                        return
+                    self.send_json(200, {"ok": True, "message": msg, **extra})
                     return
                 if kind == "ask" and not is_orch:
                     # A lane ask means the lane is parked on the orchestrator: set its task
@@ -1713,6 +1992,390 @@ def cmd_tail(args):
     res = {"ok": True, "messages": messages[-n:] if n > 0 else messages}
     out(res)
     return res
+
+
+
+def _mkdb_helpers_ready():
+    path = os.path.join(HERE, "mkdb.py")
+    spec = importlib.util.spec_from_file_location("mkdb_probe", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    needed = ("append_event", "append_ack", "put_artifact", "transition", "open_project")
+    return mod if all(hasattr(mod, n) for n in needed) else None
+
+
+def _store_self_test():
+    """Store-mode cases. Skipped until D1D's helpers are importable.
+
+    Each case fails on the file-mode bus: a present mk.db is ignored, so a
+    report never becomes an artifact and a restart cannot replay from the store.
+    """
+    mod = _mkdb_helpers_ready()
+    if mod is None:
+        print("store-mode self-test skipped: mkdb live writers not present")
+        return
+    # Implemented in the same function once the helpers land. The skip line is
+    # the R2 gate that this file does not call them before they exist.
+    _store_self_test_body(mod)
+
+
+def _store_self_test_body(mod):
+    """Real store round-trip. Runs only after append_event exists.
+
+    File-mode self_test (the 31 checks above) is not touched. This body is
+    reached only when _mkdb_helpers_ready sees append_event.
+    """
+    import shutil
+
+    tmp = tempfile.mkdtemp(prefix="mk-bus-store-")
+    pids = []
+
+    def post(port, token, body, timeout=10.0):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/send",
+            data=json.dumps(body).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}",
+                "Host": f"127.0.0.1:{port}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status, json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode("utf-8", "replace")
+            try:
+                parsed = json.loads(raw)
+            except ValueError:
+                parsed = {"error": raw}
+            return e.code, parsed
+
+    def spawn(data_dir, run):
+        proc = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "serve", "--data", data_dir, "--run", run],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        pids.append(proc.pid)
+        bus_json = os.path.join(data_dir, "bus.json")
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            if os.path.exists(bus_json):
+                bdata = read_json(bus_json) or {}
+                pid, port = bdata.get("pid"), bdata.get("port")
+                if pid and port:
+                    try:
+                        req = urllib.request.Request(
+                            f"http://127.0.0.1:{port}/health",
+                            headers={"Host": f"127.0.0.1:{port}"},
+                        )
+                        with urllib.request.urlopen(req, timeout=1.0) as resp:
+                            if resp.status == 200:
+                                return pid, port
+                    except Exception:
+                        pass
+            if proc.poll() is not None:
+                raise AssertionError(f"serve exited {proc.returncode} before health")
+            time.sleep(0.05)
+        raise AssertionError("store serve did not become healthy")
+
+    def kill(pid):
+        stop_process(pid)
+        deadline = time.time() + 5.0
+        while time.time() < deadline and is_pid_alive(pid):
+            time.sleep(0.05)
+
+    def sse_replay(port, token, last_id, expect):
+        """Read SSE until `expect` message events have arrived, then close.
+
+        The stream stays open (keepalive comments), so a bare read would hang.
+        lane=* with the orchestrator token: a lane token only sees messages
+        addressed to that lane, and an ask is addressed to orch.
+        """
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/events?lane=*",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Last-Event-ID": str(last_id),
+                "Host": f"127.0.0.1:{port}",
+            },
+        )
+        events = []
+        try:
+            with urllib.request.urlopen(req, timeout=5.0) as resp:
+                buf = ""
+                while len(events) < expect:
+                    chunk = resp.readline()
+                    if not chunk:
+                        break
+                    buf += chunk.decode("utf-8")
+                    while "\n\n" in buf:
+                        block, buf = buf.split("\n\n", 1)
+                        data_lines = [ln[5:].strip() for ln in block.splitlines() if ln.startswith("data:")]
+                        if data_lines:
+                            events.append(json.loads("".join(data_lines)))
+        except (TimeoutError, urllib.error.URLError, socket.timeout):
+            if expect < 50:
+                raise
+        return events
+
+
+    def mint_orch(data_dir):
+        # serve retires every orch token on startup, so mint after each spawn.
+        orch_tok = secrets.token_urlsafe(32)
+        tokens_path = os.path.join(data_dir, "bus-tokens.json")
+        lock_path = os.path.join(data_dir, "bus-tokens.lock")
+        lfd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(lfd, fcntl.LOCK_EX)
+            tokens = read_json(tokens_path, default={})
+            tokens[orch_tok] = {
+                "token": orch_tok, "role": "orch", "run": "r1", "task": "",
+                "lane": "", "created_at": now_iso(),
+            }
+            write_json(tokens_path, tokens, mode=0o600)
+        finally:
+            fcntl.flock(lfd, fcntl.LOCK_UN)
+            os.close(lfd)
+        return orch_tok
+
+    try:
+        data = os.path.join(tmp, "data")
+        os.makedirs(data, exist_ok=True)
+        # Public API only. open_project creates mk.db; add_task inserts the task
+        # transition() looks up. A runs row is not required by transition().
+        # append_event refuses an unknown run. import_history is the public run writer.
+        mod.import_history(data, None, "r1", run_row={"id": "r1", "status": "active"}, data_dir=data)
+        con = mod.open_project(data, data_dir=data)
+        try:
+            mod.add_task(con, "r1", "T1", "task", title="store self-test")
+        finally:
+            con.close()
+        assert os.path.isfile(os.path.join(data, "mk.db")), "open_project did not create mk.db"
+
+        lane = os.path.join(tmp, "lane")
+        os.makedirs(lane, exist_ok=True)
+        pid, port = spawn(data, "r1")
+        orch = mint_orch(data)
+        rc_tok = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "token",
+             "--lane", lane, "--task", "T1", "--run", "r1", "--data", data],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        assert rc_tok.returncode == 0, rc_tok.stderr
+        token = json.loads(rc_tok.stdout.strip().splitlines()[-1])["token"]
+
+        code, ask = post(port, token, {"kind": "ask", "text": "store ask"})
+        assert code == 200 and ask["ok"] is True, ask
+        ask_id = ask["message"]["id"]
+        code, ans = post(port, orch, {
+            "run": "r1", "task": "T1", "kind": "answer", "text": "store answer",
+            "from": "orch", "to": "T1", "reply_to": ask_id,
+        })
+        assert code == 200 and ans["ok"] is True, ans
+        code, rep = post(port, token, {"kind": "report", "text": "round:1\nfirst report"})
+        assert code == 200 and rep["ok"] is True, rep
+        assert rep.get("artifact", {}).get("rev") == 1, rep
+
+        rows = mod.timeline(data, None, "r1", "T1", data_dir=data)
+        kinds = [r["kind"] for r in rows]
+        assert "ask" in kinds and "answer" in kinds and "report" in kinds, kinds
+        sent_texts = {"store ask", "store answer", "round:1\nfirst report"}
+        got_texts = {r["text"] for r in rows}
+        assert sent_texts <= got_texts, (sent_texts, got_texts)
+
+        sent_seqs = [ask["message"]["seq"], ans["message"]["seq"], rep["message"]["seq"]]
+        kill(pid)
+        pid2, port2 = spawn(data, "r1")
+        orch = mint_orch(data)
+        first = min(sent_seqs)
+        replayed = sse_replay(port2, orch, first - 1, len(sent_seqs))
+        replay_seqs = [m["seq"] for m in replayed]
+        assert replay_seqs == sent_seqs, (replay_seqs, sent_seqs)
+        assert [m["text"] for m in replayed] == [
+            "store ask", "store answer", "round:1\nfirst report",
+        ], replayed
+        live_ids = [ask["message"]["id"], ans["message"]["id"], rep["message"]["id"]]
+        assert [m["id"] for m in replayed] == live_ids, (replayed, live_ids)
+        assert all(i == f"m-{s}" for i, s in zip(live_ids, sent_seqs)), (live_ids, sent_seqs)
+        assert len(replay_seqs) == len(set(replay_seqs)), replay_seqs
+        # Answer a replayed ask and ack a replayed message; the level survives another restart.
+        replayed_ask = next(m for m in replayed if m["kind"] == "ask")
+        code, ans2 = post(port2, orch, {
+            "run": "r1", "task": "T1", "kind": "answer", "text": "answered after restart",
+            "from": "orch", "to": "T1", "reply_to": replayed_ask["id"],
+        })
+        # The original ask was already answered before the restart.
+        assert code == 400, (code, ans2)
+        code, ask2 = post(port2, token, {"kind": "ask", "text": "ask after restart"})
+        assert code == 200 and ask2["message"]["id"].startswith("m-"), ask2
+        kill(pid2)
+        pid3, port3 = spawn(data, "r1")
+        orch = mint_orch(data)
+        replayed2 = sse_replay(port3, orch, 0, 99)
+        again = next(m for m in replayed2 if m["id"] == ask2["message"]["id"])
+        assert again["id"] == ask2["message"]["id"]
+        code, ans3 = post(port3, orch, {
+            "run": "r1", "task": "T1", "kind": "answer", "text": "answer of replayed ask",
+            "from": "orch", "to": "T1", "reply_to": again["id"],
+        })
+        assert code == 200 and ans3["ok"] is True, ans3
+        code, acked = post(port3, orch, {
+            "run": "r1", "task": "T1", "kind": "ack", "text": "",
+            "from": "orch", "to": "T1", "reply_to": again["id"], "ack_level": 3,
+        })
+        assert code == 200 and acked.get("ack_level") == 3, acked
+        kill(pid3)
+        pid2, port2 = spawn(data, "r1")
+        orch = mint_orch(data)
+        replayed3 = sse_replay(port2, orch, 0, 99)
+        persisted = next(m for m in replayed3 if m["id"] == again["id"])
+        assert persisted["ack_level"] == 3, persisted
+        assert persisted["id"] == f"m-{persisted['seq']}", persisted
+
+        code, rep2 = post(port2, token, {"kind": "report", "text": "round:1\nsecond report"})
+        assert code == 200 and rep2.get("artifact", {}).get("rev") == 2, rep2
+
+        before = mod.open_project(data, data_dir=data)
+        try:
+            n_before = before.execute("SELECT COUNT(*) c FROM change_log").fetchone()["c"]
+            status_before = before.execute(
+                "SELECT status FROM tasks WHERE run=? AND id=?", ("r1", "T1")
+            ).fetchone()["status"]
+        finally:
+            before.close()
+        code, st = post(port2, orch, {
+            "run": "r1", "task": "T1", "kind": "status", "text": "building",
+            "from": "orch", "to": "T1",
+        })
+        assert code == 200 and st["ok"] is True, st
+        after = mod.open_project(data, data_dir=data)
+        try:
+            nums = [r["change_no"] for r in after.execute("SELECT change_no FROM change_log")]
+            status_now = after.execute(
+                "SELECT status FROM tasks WHERE run=? AND id=?", ("r1", "T1")
+            ).fetchone()["status"]
+        finally:
+            after.close()
+        assert len(nums) == n_before + 1, (n_before, nums)
+        assert status_now == "building", status_now
+
+        ev_before = mod.open_project(data, data_dir=data)
+        try:
+            n_events = ev_before.execute("SELECT COUNT(*) c FROM events").fetchone()["c"]
+        finally:
+            ev_before.close()
+        # Connected client: a rejected status must not appear on the stream.
+        sse_box = {"events": [], "err": None, "stop": False}
+        def _listen():
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port2}/events?lane=*",
+                headers={
+                    "Authorization": f"Bearer {orch}",
+                    "Last-Event-ID": "999999999",
+                    "Host": f"127.0.0.1:{port2}",
+                },
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=2.0) as resp:
+                    buf = ""
+                    while not sse_box["stop"]:
+                        chunk = resp.readline()
+                        if not chunk:
+                            break
+                        buf += chunk.decode("utf-8")
+                        while "\n\n" in buf:
+                            block, buf = buf.split("\n\n", 1)
+                            data_lines = [ln[5:].strip() for ln in block.splitlines() if ln.startswith("data:")]
+                            if data_lines:
+                                sse_box["events"].append(json.loads("".join(data_lines)))
+            except Exception as e:
+                if not sse_box["stop"]:
+                    sse_box["err"] = repr(e)
+        listener = threading.Thread(target=_listen, daemon=True)
+        listener.start()
+        time.sleep(0.2)
+        code, bad = post(port2, orch, {
+            "run": "r1", "task": "T1", "kind": "status", "text": "not-a-status",
+            "from": "orch", "to": "T1",
+        })
+        assert code == 400, (code, bad)
+        # Rejected transition: task exists but the move is not a known status,
+        # and a second case uses a status word transition() itself refuses if any.
+        code, bad2 = post(port2, orch, {
+            "run": "r1", "task": "NO-SUCH", "kind": "status", "text": "building",
+            "from": "orch", "to": "NO-SUCH",
+        })
+        assert code == 400, (code, bad2)
+        ev_after = mod.open_project(data, data_dir=data)
+        try:
+            n_events_after = ev_after.execute("SELECT COUNT(*) c FROM events").fetchone()["c"]
+        finally:
+            ev_after.close()
+        assert n_events_after == n_events, (n_events, n_events_after)
+        sse_box["stop"] = True
+        listener.join(timeout=3)
+        assert sse_box["events"] == [], sse_box
+        still = mod.open_project(data, data_dir=data)
+        try:
+            unchanged = still.execute(
+                "SELECT status FROM tasks WHERE run=? AND id=?", ("r1", "T1")
+            ).fetchone()["status"]
+        finally:
+            still.close()
+        assert unchanged == "building", unchanged
+        assert status_before == "planned", status_before
+
+        # One-shot: the live serve child raises on the next store_append_event.
+        open(os.path.join(data, "append-fail"), "w").close()
+        code, inj = post(port2, orch, {
+            "run": "r1", "task": "T1", "kind": "status", "text": "review",
+            "from": "orch", "to": "T1",
+        })
+        assert code == 500, (code, inj)
+        # The transition is the truth even though the bus event was not stored.
+        chk = mod.open_project(data, data_dir=data)
+        try:
+            st_now = chk.execute(
+                "SELECT status FROM tasks WHERE run=? AND id=?", ("r1", "T1")
+            ).fetchone()["status"]
+            n_bus = chk.execute(
+                "SELECT COUNT(*) c FROM events WHERE chan=? AND kind=?", ("bus", "status")
+            ).fetchone()["c"]
+        finally:
+            chk.close()
+        assert st_now == "review", st_now
+        # The injected failure must not have added a bus status row for this send.
+        # (the earlier successful "building" status is the only bus status row)
+        assert n_bus == 1, n_bus
+
+        big = "a" * 100000
+        code, big_res = post(port2, token, {"kind": "report", "text": "round:2\n" + big}, timeout=20.0)
+        assert code == 200 and big_res["ok"] is True, (code, big_res.get("error"))
+        over = "b" * (131072 + 1)
+        code, over_res = post(port2, token, {"kind": "report", "text": over}, timeout=20.0)
+        assert code == 400, (code, over_res)
+
+        data_b = os.path.join(tmp, "data-b")
+        os.makedirs(data_b, exist_ok=True)
+        mod.import_history(data_b, None, "r1", run_row={"id": "r1", "status": "active"}, data_dir=data_b)
+        con_b = mod.open_project(data_b, data_dir=data_b)
+        try:
+            mod.add_task(con_b, "r1", "T1", "task")
+        finally:
+            con_b.close()
+        pid_b, port_b = spawn(data_b, "r1")
+        code, cross = post(port_b, token, {"kind": "ask", "text": "cross"})
+        assert code == 401, (code, cross)
+        kill(pid2)
+        kill(pid_b)
+    finally:
+        for p in pids:
+            stop_process(p)
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def self_test():
@@ -2918,6 +3581,7 @@ def self_test():
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)
 
+    _store_self_test()
     print("pass mk-bus.py: mk-bus self-test ok")
     print(json.dumps({"ok": True, "tests": len(checks), "passed": len(checks)}))
     return 0
