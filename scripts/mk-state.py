@@ -617,7 +617,9 @@ class Store:
         # the file view shows readiness as a flag on a planned task; the store shows it as the
         # status. Mapping the flag back stops the next import from demoting a ready task.
         status = t.get("status") or "planned"
-        if status in ("planned", "routed") and t.get("ready"):
+        # only a planned task becomes the kanban status `ready`. A routed task keeps `routed`
+        # and the ready flag: mapping it to `ready` made the next load publish it as `planned`.
+        if status == "planned" and t.get("ready"):
             status = "ready"
         return {"id": t["id"], "parent": t.get("parent"), "type": "task",
                 "title": t.get("title") or "", "acceptance": t.get("acceptance"),
@@ -796,10 +798,9 @@ class Store:
                 con.close()
         self._rewritten.discard(rid)
         if os.environ.get(ROOT_CRASH) != "1":
-            # the import maps the file's ready flag to the store status itself, so the promote
-            # pass here mostly finds nothing to move. What it does is repair cards: the import's
-            # change_log row can sit below the watermark the transition above just advanced,
-            # which catch_up() then never replays.
+            # catch_up repairs a card whose status disagrees with the task row, including one
+            # whose change_log sits below the watermark the transition above just advanced.
+            # promote_ready then moves dependents and writes their cards in one root transaction.
             self.db().catch_up(self.home_dir(), STORE_PROJECT, data_dir=self.data)
             self.db().promote_ready(self.home_dir(), STORE_PROJECT, rid,
                                     data_dir=self.data, sync_root=True)
@@ -863,13 +864,18 @@ class Store:
             # the store status `ready` is the kanban column; the file view keeps `planned`
             # and shows readiness with the `ready` flag, so the two views stay byte-identical
             status = t["status"] or "planned"
+            ready = bool(extra.get("ready"))
+            # store `ready` is the kanban column. The published status is file_status when the
+            # promotion remembered one (`routed`), otherwise `planned`, plus the ready flag.
             if status == "ready":
-                status = "planned"
+                published = t["file_status"] if t["file_status"] in ("planned", "routed") else "planned"
+                status, ready = published, True
             extra.update({
                 "id": t["id"], "title": t["title"] or "", "parent": t["parent"],
                 "deps": deps, "owned": owned, "status": status,
                 "lane": t["lane"], "slot": t["slot"], "branch": t["branch"], "pane": t["pane"],
                 "round": t["round"] or 0, "verdict": t["verdict"], "updated": t["updated"],
+                "ready": ready,
                 "agent": route.get("agent"), "model": route.get("model"), "effort": route.get("effort"),
             })
             if route.get("route"):
@@ -4220,6 +4226,30 @@ def store_self_test(tmp, env):
     assert store_status("B") == "planned", "a regressed dep left B " + store_status("B")
     view = once(["task", "get", "B", "--run", "rr"], rd)["task"]
     assert view["ready"] is False, view
+
+    # M2 R3: a routed task whose deps are met stays routed, in both orders.
+    rt = os.path.join(tmp, "routed")
+    once(["run", "init", "--id", "rr", "--feature", "Routed", "--branch", "br"], rt)
+    once(["store", "enable"], rt)
+    once(["task", "add", "--id", "A", "--title", "dep", "--run", "rr"], rt)
+    once(["task", "add", "--id", "B", "--title", "needs A", "--deps", "A", "--run", "rr"], rt)
+    once(["task", "add", "--id", "Z", "--title", "unrelated", "--run", "rr"], rt)
+    once(["task", "set", "A", "status=done", "--run", "rr"], rt)
+    got = once(["task", "set", "B", "status=routed", "--run", "rr"], rt)
+    assert got["task"]["status"] == "routed" and got["task"]["ready"] is True, got["task"]
+    once(["task", "set", "Z", "status=building", "--run", "rr"], rt)
+    view = once(["task", "get", "B", "--run", "rr"], rt)["task"]
+    assert view["status"] == "routed" and view["ready"] is True, view
+
+    rt2 = os.path.join(tmp, "routed2")
+    once(["run", "init", "--id", "rr", "--feature", "Routed", "--branch", "br"], rt2)
+    once(["store", "enable"], rt2)
+    once(["task", "add", "--id", "A", "--title", "dep", "--run", "rr"], rt2)
+    once(["task", "add", "--id", "B", "--title", "needs A", "--deps", "A", "--run", "rr"], rt2)
+    once(["task", "set", "B", "status=routed", "--run", "rr"], rt2)
+    once(["task", "set", "A", "status=done", "--run", "rr"], rt2)
+    view = once(["task", "get", "B", "--run", "rr"], rt2)["task"]
+    assert view["status"] == "routed" and view["ready"] is True, view
 
 
 if __name__ == "__main__":

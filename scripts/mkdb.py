@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS runs(
   next TEXT, started TEXT, ended TEXT);
 CREATE TABLE IF NOT EXISTS tasks(
   run TEXT, id TEXT, parent TEXT, type TEXT, title TEXT, acceptance TEXT, owned TEXT, deps TEXT,
-  parallel INTEGER, route_json TEXT, status TEXT, prev_status TEXT, lane TEXT, slot TEXT, branch TEXT, pane TEXT,
+  parallel INTEGER, route_json TEXT, status TEXT, prev_status TEXT, file_status TEXT, lane TEXT, slot TEXT, branch TEXT, pane TEXT,
   round INTEGER, verdict TEXT, updated TEXT, PRIMARY KEY(run, id));
 CREATE TABLE IF NOT EXISTS events(
   id INTEGER PRIMARY KEY, run TEXT, task TEXT, t TEXT, chan TEXT, kind TEXT, from_id TEXT,
@@ -270,6 +270,14 @@ def _ensure_prev_status(con):
         con.execute("ALTER TABLE tasks ADD COLUMN prev_status TEXT")
 
 
+def _ensure_file_status(con):
+    """tasks.file_status is the published status (planned or routed) while status is the kanban
+    status `ready`. Added in place, only when missing, so the step is safe to run twice."""
+    cols = [r["name"] for r in con.execute("PRAGMA table_info(tasks)")]
+    if cols and "file_status" not in cols:
+        con.execute("ALTER TABLE tasks ADD COLUMN file_status TEXT")
+
+
 def _v2(con):
     """The shipped v2 step. Safe to run twice: the column, the table and the index are guarded."""
     cols = [r["name"] for r in con.execute("PRAGMA table_info(artifacts)")]
@@ -298,6 +306,7 @@ def open_project(home, slug=None, data_dir=None, version=SCHEMA, migrations=()):
     path = os.path.join(project_dir(home, slug, data_dir), "mk.db")
     con = _migrate(_connect(path), version, ((1, PROJECT_DDL), (2, _v2), (3, _v3)) + tuple(migrations))
     _ensure_prev_status(con)
+    _ensure_file_status(con)
     return con
 
 
@@ -454,8 +463,26 @@ def add_task(con, run, task, type, title="", parent=None, deps="", route_json=No
         raise
 
 
-READY_FROM = ("planned", "routed")  # only these move to ready; a started task is never touched
+# only these move to ready; a started task is never touched. `routed` stays the published
+# status (file_status) so a later import does not turn it into `planned`.
+READY_FROM = ("planned", "routed")
 DEP_MET = ("merged", "qa", "done")
+
+
+def _scope_hit(row_run, deps, run):
+    """True when the task is in `run`, or one dep token names `<run>:<id>` exactly.
+
+    A substring LIKE would let run `r` match the dep `other:ext` (the letters `r:`).
+    """
+    if row_run == run:
+        return True
+    for d in _deps_of(deps):
+        try:
+            if _dep_target(row_run, d)[0] == run:
+                return True
+        except Fail:
+            continue
+    return False
 
 
 def _dep_met(con, run, dep):
@@ -469,34 +496,43 @@ def promote_ready(home, project, run, changed=None, data_dir=None, sync_root=Fal
     """Move dependents of `run`'s tasks to `ready` when every dep is met, and back to `planned`
     when a dep leaves the met set (a done -> fix regress), through transition().
 
-    Scope: the triggering run, plus any task that names `<run>:<id>` in deps — never an
-    unrelated old run. One connection for the scan, one snapshot of the dep statuses, so a
-    long waiting chain costs one query per pass, not one per candidate. A task with no deps
-    stays planned; a task that has started is never touched (its status is not in READY_FROM).
-    Each move is ONE transaction: no event (the file view's "deps met" note is the one event),
-    `updated` unchanged. Idempotent: a task already `ready` is not in READY_FROM, and a demoted
-    task has an unmet dep, so a second pass moves nothing. A candidate whose card does not
-    match its row is repaired: the import can write the status itself (file flag -> store
-    status) with a change_log row below the watermark the triggering transition advanced, which
-    catch_up() then never replays. -> ids moved."""
+    Scope: the triggering run, plus any task whose dep token names `<run>:<id>` exactly —
+    never an unrelated old run, and never a substring (`other:ext` does not match run `r`).
+    One connection for the scan, one snapshot of the dep statuses, so a long waiting chain
+    costs one query per pass, not one per candidate. A task with no deps stays planned; a
+    task that has started is never touched (its status is not in READY_FROM). Each move is
+    ONE transaction: no event (the file view's "deps met" note is the one event), `updated`
+    unchanged. `file_status` keeps `planned` or `routed` so the published view can restore it.
+    Idempotent: a task already `ready` is not in READY_FROM, and a demoted task has an unmet
+    dep, so a second pass moves nothing. When sync_root is set, every card that does not match
+    its row is repaired in ONE root transaction at the end of the pass (a missing card is
+    recorded, so a task with no change_log is visited once). -> ids moved."""
     con = open_project(home, project, data_dir)
     try:
-        like = f"%{run}:%"
-        rows = con.execute(
-            "SELECT run, id, deps, status FROM tasks"
-            " WHERE (status IN (?,?) AND (run=? OR deps LIKE ?))"
-            "    OR (status='ready' AND (run=? OR deps LIKE ?))",
-            (*READY_FROM, run, like, run, like)).fetchall()
+        cand = con.execute(
+            "SELECT run, id, deps, status, file_status FROM tasks"
+            " WHERE status IN (?,?,?)",
+            (*READY_FROM, "ready")).fetchall()
+        rows = [r for r in cand if _scope_hit(r["run"], r["deps"], run)]
         if not rows:
             return []
         runs = {run}
         for r in rows:
             for d in _deps_of(r["deps"]):
-                with contextlib.suppress(Fail):  # malformed dep: the task is skipped below
+                with contextlib.suppress(Fail):
                     runs.add(_dep_target(r["run"], d)[0])
         marks = {(x["run"], x["id"]): x["status"] for x in
                  con.execute("SELECT run, id, status FROM tasks WHERE run IN (%s)"
                              % ",".join("?" * len(runs)), tuple(sorted(runs)))}
+        # change_no and the full row, read once, so the card repair does not reopen per task
+        full = {}
+        nos = {}
+        if sync_root:
+            for r in rows:
+                key = (r["run"], r["id"])
+                full[key] = con.execute("SELECT * FROM tasks WHERE run=? AND id=?", key).fetchone()
+                nos[key] = con.execute(
+                    "SELECT MAX(change_no) c FROM change_log WHERE run=? AND task=?", key).fetchone()["c"]
     finally:
         con.close()
     card_status = {}
@@ -509,6 +545,7 @@ def promote_ready(home, project, run, changed=None, data_dir=None, sync_root=Fal
         finally:
             root.close()
     moved = []
+    repairs = []
     for r in rows:
         deps = _deps_of(r["deps"])
         if not deps:
@@ -518,44 +555,97 @@ def promote_ready(home, project, run, changed=None, data_dir=None, sync_root=Fal
         except Fail:
             continue  # a malformed stored dep: skip this task, never fail the committed change
         met = all(marks.get(t) in DEP_MET for t in targets)
+        published = r["file_status"] if r["file_status"] in READY_FROM else "planned"
         if r["status"] in READY_FROM and met:
             to = "ready"
         elif r["status"] == "ready" and not met:
-            to = "planned"
+            to = published
         else:
             to = None
         key = (r["run"], r["id"])
+        status_now = r["status"]
         if to is not None:
             con = open_project(home, project, data_dir)
             try:
-                cur = con.execute("SELECT status FROM tasks WHERE run=? AND id=?", key).fetchone()
+                cur = con.execute("SELECT status, file_status FROM tasks WHERE run=? AND id=?",
+                                  key).fetchone()
             finally:
                 con.close()
             if not cur or cur["status"] != r["status"]:
                 continue  # moved between the scan and now: leave it to the next pass
+            if to == "ready":
+                file_status = cur["file_status"] if cur["file_status"] in READY_FROM else cur["status"]
+            else:
+                file_status = None  # demoted: the status itself is the published one again
             transition(home, project, r["run"], r["id"], to,
                        note="" if to == "ready" else "dep no longer met",
-                       data_dir=data_dir, sync_root=sync_root, event=False, keep_updated=True)
-            card_status[key] = to
+                       data_dir=data_dir, sync_root=False, event=False, keep_updated=True,
+                       file_status=file_status)
+            status_now = to
+            if sync_root:
+                con = open_project(home, project, data_dir)
+                try:
+                    full[key] = con.execute("SELECT * FROM tasks WHERE run=? AND id=?", key).fetchone()
+                    nos[key] = con.execute(
+                        "SELECT MAX(change_no) c FROM change_log WHERE run=? AND task=?",
+                        key).fetchone()["c"]
+                finally:
+                    con.close()
             if to == "ready":
                 moved.append(r["id"])
-        if sync_root and card_status.get(key) != r["status"]:
-            con = open_project(home, project, data_dir)
-            try:
-                row = con.execute("SELECT * FROM tasks WHERE run=? AND id=?", key).fetchone()
-                no = con.execute("SELECT MAX(change_no) c FROM change_log WHERE run=? AND task=?",
-                                 key).fetchone()["c"]
-            finally:
-                con.close()
+        if sync_root and card_status.get(key) != status_now:
+            row = full.get(key)
+            no = nos.get(key)
             if row and no:
-                col, attention = _placed(row)
-                _upsert_card(home, project, r["run"], r["id"], row, row["status"], col, attention,
-                             row["round"], no, data_dir, updated=row["updated"])
+                repairs.append((r, dict(row) if not isinstance(row, dict) else row, status_now, no))
+            else:
+                # no change_log, or no row: remember it so the next pass does not reopen it
+                card_status[key] = status_now
+    if repairs:
+        _repair_cards(home, project, repairs, data_dir)
     return moved
 
 
+def _repair_cards(home, project, repairs, data_dir):
+    """Write every mismatched card and advance the watermark in ONE root transaction.
+
+    change_no is the task's own MAX(change_log), which can sit below the watermark the
+    triggering transition already advanced. The watermark moves to at least that number and
+    at least its current value, so a later catch_up still replays anything newer.
+    """
+    root = open_root(home)
+    try:
+        _begin(root)
+        try:
+            hi = 0
+            for r, row, status, no in repairs:
+                col, attention = _placed(row, status)
+                root.execute(
+                    "INSERT INTO cards(project, run, task, parent, type, title, status, col, attention,"
+                    " route_json, lane, round, verdict, updated, change_no)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                    " ON CONFLICT(project, run, task) DO UPDATE SET status=excluded.status, col=excluded.col,"
+                    " attention=excluded.attention, round=excluded.round, verdict=excluded.verdict,"
+                    " updated=excluded.updated,"
+                    " change_no=MAX(cards.change_no, excluded.change_no)",
+                    (project, r["run"], r["id"], row["parent"], row["type"], row["title"], status, col,
+                     attention, row["route_json"], row["lane"], row["round"],
+                     row["verdict"] if "verdict" in row.keys() else None, row["updated"], no))
+                hi = max(hi, no)
+            root.execute(
+                "INSERT INTO sync(project, last_change_no) VALUES (?,?)"
+                " ON CONFLICT(project) DO UPDATE SET last_change_no=MAX(sync.last_change_no, excluded.last_change_no)",
+                (project, hi))
+            root.execute("COMMIT")
+        except Exception:
+            root.execute("ROLLBACK")
+            raise
+    finally:
+        root.close()
+
+
 def transition(home, project, run, task, to, note="", round=0, sync_root=False, data_dir=None, verdict=_UNSET,
-                 event=True, keep_updated=False):
+                 event=True, keep_updated=False, file_status=_UNSET):
     """The ONLY status writer (C10). One project transaction, then the root card iff sync_root.
 
     verdict defaults to leaving the task's stored verdict unchanged. Pass a string or None to
@@ -568,7 +658,7 @@ def transition(home, project, run, task, to, note="", round=0, sync_root=False, 
         _begin(con)
         try:
             row = con.execute(
-                "SELECT parent, type, title, route_json, lane, status, prev_status, verdict, updated"
+                "SELECT parent, type, title, route_json, lane, status, prev_status, file_status, verdict, updated"
                 " FROM tasks WHERE run=? AND id=?", (run, task)).fetchone()
             if not row:
                 raise Fail(f"no task {run}:{task}")
@@ -578,9 +668,15 @@ def transition(home, project, run, task, to, note="", round=0, sync_root=False, 
             # verdict= is optional: a status-only transition leaves the stored verdict alone.
             verdict = row["verdict"] if verdict is _UNSET else verdict
             stamped = row["updated"] if (keep_updated and row["updated"]) else now()
+            # file_status is the published status under a kanban `ready`. A real transition
+            # (the user set a status) clears it; a promotion passes the status it replaced.
+            if file_status is _UNSET:
+                stored_file = None if event else row["file_status"] if "file_status" in row.keys() else None
+            else:
+                stored_file = file_status
             con.execute(
-                "UPDATE tasks SET status=?, prev_status=?, round=?, verdict=?, updated=? WHERE run=? AND id=?",
-                (to, kept, round, verdict, stamped, run, task))
+                "UPDATE tasks SET status=?, prev_status=?, file_status=?, round=?, verdict=?, updated=? WHERE run=? AND id=?",
+                (to, kept, stored_file, round, verdict, stamped, run, task))
             row = dict(row)
             row["verdict"] = verdict
             if event:
@@ -645,27 +741,53 @@ def _upsert_card(home, project, run, task, row, status, col, attention, round, c
 
 
 def catch_up(home, project, data_dir=None):
-    """Replay project changes the root has not seen yet (C5 sync.last_change_no)."""
+    """Replay project changes the root has not seen yet (C5 sync.last_change_no).
+
+    Also repairs a card whose status disagrees with the task row even when every change_log
+    row for that task sits at or below the watermark: a kill between a transition and the
+    card repair leaves exactly that. The repair uses the task's own MAX(change_no) and does
+    not move the watermark backwards.
+    """
     con = open_project(home, project, data_dir)
     try:
         rows = con.execute("SELECT t.run, t.id, t.parent, t.type, t.title, t.route_json, t.lane,"
-                           " t.status, t.prev_status, t.round, t.verdict, c.change_no FROM change_log c"
+                           " t.status, t.prev_status, t.round, t.verdict, t.updated, c.change_no FROM change_log c"
                            " JOIN tasks t ON t.run=c.run AND t.id=c.task ORDER BY c.change_no").fetchall()
+        tasks = con.execute("SELECT run, id, parent, type, title, route_json, lane, status,"
+                            " prev_status, round, verdict, updated FROM tasks").fetchall()
+        nos = {(r["run"], r["task"]): r["c"] for r in con.execute(
+            "SELECT run, task, MAX(change_no) c FROM change_log GROUP BY run, task")}
     finally:
         con.close()
     root = open_root(home)
     try:
         seen = root.execute("SELECT last_change_no FROM sync WHERE project=?", (project,)).fetchone()
+        cards_now = {(c["run"], c["task"]): c["status"] for c in
+                     root.execute("SELECT run, task, status FROM cards WHERE project=?", (project,))}
     finally:
         root.close()
     last = seen["last_change_no"] if seen else 0
+    n = 0
     for r in rows:
         if r["change_no"] <= last:
             continue
         col, attention = _placed(r)
         _upsert_card(home, project, r["run"], r["id"], r, r["status"], col, attention,
-                     r["round"], r["change_no"], data_dir)
-    return len([r for r in rows if r["change_no"] > last])
+                     r["round"], r["change_no"], data_dir, updated=r["updated"])
+        cards_now[(r["run"], r["id"])] = r["status"]
+        n += 1
+    for t in tasks:
+        key = (t["run"], t["id"])
+        if cards_now.get(key) == t["status"]:
+            continue
+        no = nos.get(key)
+        if not no:
+            continue
+        col, attention = _placed(t)
+        _upsert_card(home, project, t["run"], t["id"], t, t["status"], col, attention,
+                     t["round"], no, data_dir, updated=t["updated"])
+        n += 1
+    return n
 
 
 RUN_COLS = ("id", "plan", "plan_version", "branch", "status", "stage", "next", "started", "ended")
@@ -786,10 +908,19 @@ def import_history(home, project, run, *, run_row=None, tasks=(), events=(), art
                 # column status and NULL otherwise (column_of then uses Backlog).
                 prev = status if status in COLUMNS else None
                 column_of(status, prev)  # refuse an unknown status before anything is written
-                cols = ["run"] + list(TASK_COLS) + ["prev_status"]
-                values = [run] + [t.get(c) for c in TASK_COLS] + [prev]
-                values[cols.index("status")] = status
+                # file_status is not an import column. A re-import keeps the stored one when the
+                # incoming status is still `ready` (the file view of a routed-ready task); any
+                # other status clears it, because the published status is the status itself.
                 existed = con.execute("SELECT * FROM tasks WHERE run=? AND id=?", me).fetchone()
+                # file_status is not an import column. A re-import keeps the stored one when the
+                # incoming status is still `ready` (the file view of a routed-ready task); any
+                # other status clears it, because the published status is the status itself.
+                keep_file = None
+                if existed and status == "ready" and existed["file_status"] in READY_FROM:
+                    keep_file = existed["file_status"]
+                cols = ["run"] + list(TASK_COLS) + ["prev_status", "file_status"]
+                values = [run] + [t.get(c) for c in TASK_COLS] + [prev, keep_file]
+                values[cols.index("status")] = status
                 con.execute(
                     "INSERT INTO tasks(" + ",".join(cols) + ") VALUES (" + ",".join("?" * len(cols)) + ")"
                     " ON CONFLICT(run, id) DO UPDATE SET " + ",".join(
@@ -2278,6 +2409,10 @@ def _ready(home):
         add_task(con, "old", "gone", "task", status="done")
         add_task(con, "old", "waiter", "task", deps="gone")
         add_task(con, "old", "far", "task", deps="other:ext")
+        # a met cross-run dep whose run id is a substring of another run id (`r` inside nothing,
+        # but `other:ext` contains the letters of a short run). Run id `r` must not match it.
+        add_task(con, "old", "w", "task", deps="other:ext")
+        add_task(con, "r", "routed", "task", deps="rdy-a", status="routed")
     finally:
         con.close()
 
@@ -2311,8 +2446,14 @@ def _ready(home):
     _check(row("r", "cross") == "planned", "cross-run dep counted before it was done")
     _check(row("old", "waiter") == "planned" and row("old", "far") == "planned",
            "a transition in run r promoted tasks in the unrelated old run")
+    _check(row("old", "w") == "planned", "run r matched the dep other:ext by substring")
+    _check(row("r", "routed") == "ready", "a routed task whose dep is met did not become ready")
+    _check(row("r", "routed", "file_status") == "routed",
+           "promoting a routed task forgot the published status")
     transition(home, "matrixkoder", "other", "ext", "done", data_dir=data)
     _check(row("r", "cross") == "ready", "cross-run dep did not promote")
+    _check(row("old", "w") == "ready", "a met cross-run dep did not promote old:w")
+    _check(row("old", "far") == "ready", "a met cross-run dep did not promote old:far")
     # no promotion wrote a transition event: the file view's "deps met" note is the one event
     c = open_project(home, data_dir=data)
     try:
@@ -2329,6 +2470,7 @@ def _ready(home):
     stamped_b = row("r", "rdy-b", "updated")
     transition(home, "matrixkoder", "r", "rdy-a", "fix", data_dir=data)
     _check(row("r", "rdy-b") == "planned", f"a regressed dep left rdy-b {row('r', 'rdy-b')}")
+    _check(row("r", "routed") == "routed", f"a regressed dep left the routed task {row('r', 'routed')}")
     _check(row("r", "rdy-b", "updated") == stamped_b, "the demotion moved tasks.updated")
     # back again: done -> ready, so the pair is reversible
     transition(home, "matrixkoder", "r", "rdy-a", "done", data_dir=data)
