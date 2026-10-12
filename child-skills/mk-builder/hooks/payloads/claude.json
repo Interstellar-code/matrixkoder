@@ -1,0 +1,1 @@
+{"hook_event_name":"PostToolUse","tool_name":"TodoWrite","tool_input":{"todos":[{"content":"[D7.1] connect delivers brief and task list","status":"completed","activeForm":"Connecting"}]},"source":"documented shape from Claude Code hooks (PostToolUse TodoWrite); not captured from a live session — the catalog seed names the recipe but ships no sample payload"}
