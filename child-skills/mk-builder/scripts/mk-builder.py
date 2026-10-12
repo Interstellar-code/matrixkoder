@@ -16,21 +16,28 @@ The bus client (plan BB) adds `ask`, `wait`, `inbox` and `ack` against `scripts/
 `<lane>/.matrixkoder-bus.json` (B24), every call carries a 2 s connect budget, and an unusable
 bus degrades to today's channels within that budget — `ask` falls back to the BLOCKED flow,
 never a traceback.
+
+Plan D7 adds `connect`, `read`, `todo`, `commit` and `report` over the same bus (contracts C7,
+C8, C9, C12). With no project store (`<data>/mk.db` absent) or the bus down, those commands
+fall back to the lane status file, the report file and the brief copy, so a lane never stalls.
 """
 import argparse
 import contextlib
 import datetime
+import hashlib
 import io
 import json
 import os
 import re
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -63,7 +70,20 @@ BUS_RUN = "bb"  # the self-test's run id (every fixture token and message uses i
 BUS_CONNECT_TIMEOUT = 2.0
 BUS_WAIT_CHUNK_MAX = 90.0
 BUS_ASK_TIMEOUT = 600.0
+# D7.2 (item 37): inbox and the progress hint must return inside this wall clock, even when
+# /wait would otherwise sit for its 1 s floor on an empty inbox.
+BUS_HINT_BUDGET = 2.0
 ASK_ID_RE = re.compile(r"^m-(\d+)$")  # B15 Table 1: ids are `m-<seq>`
+# D7: connect pages a brief at about 24,000 chars; `read <id> --part n` fetches one page.
+BRIEF_PAGE = 24000
+# C9: completed maps to this setting; verify is the schema default when config is unreadable.
+TODO_DONE_DEFAULT = "verify"
+TODO_STATES = ("in_progress", "completed", "done")  # `done` is the backup spelling of completed
+# C8 seed recipes (scripts/mk-catalog.py SEEDS). A kind is hook-capable only when the catalog
+# says todo_hook: yes. Recorded payload shapes live in hooks/payloads/<kind>.json.
+HOOK_RECIPES = {
+    "claude": "claude --settings <path under ~/.matrixkoder>",
+}
 
 # R13/R15/R17/R17a — the writer's legality table, read as: this command may run in which states.
 # `progress` targets `working` (R13.1 from started, R13.3 from subagent, R13.5 from blocked,
@@ -394,8 +414,24 @@ def cmd_done(a):
         raise Fail("no_head: `git -C <lane> rev-parse HEAD` failed [R18]")
     obj = dict(old, state="done", question=None, subagent=None, commit=sha)
     write_status(lane, stamp(obj))
-    return ({"ok": True, "seq": obj["seq"], "state": obj["state"], "commit": sha},
-            token_for(obj, "DONE"))
+    # Todo reporting: the report's `## Todo` section rides on the DONE token. A missing
+    # section or an `open` item without a reason warns and does not fail the round.
+    warn = ""
+    try:
+        with open(os.path.join(lane, report)) as f:
+            items, warn = parse_todo_section(f.read())
+    except OSError:
+        items = []
+        warn = "todo section missing"
+    done_n, skipped_n, total = todo_counts(items)
+    tail = "DONE"
+    if items:
+        tail = f"DONE todo {done_n}/{total} done {skipped_n} skipped"
+    if warn:
+        print(f"todo warning: {warn}")
+    return ({"ok": True, "seq": obj["seq"], "state": obj["state"], "commit": sha,
+             "todo": {"done": done_n, "skipped": skipped_n, "total": total}},
+            token_for(obj, tail))
 
 
 def cmd_ctx(a):
@@ -700,7 +736,10 @@ def cmd_measure(a):
     run_dir = os.path.join(data, "runs", run)
     if not os.path.isdir(run_dir):
         raise Fail(f"unknown run {run!r}: no {run_dir} directory [measure]")
-    events = parse_events(run_dir)
+    if store_present(data):
+        events = measure_store(data, run)
+    else:
+        events = parse_events(run_dir)
     by_source = {s: 0 for s in SOURCES}
     by_source["none"] = 0
     missed, stalls, questions = 0, [], []
@@ -750,19 +789,6 @@ class BusHttp(Exception):
 def bus_http_error(e):
     """The brief's client error shape: `{"ok": false, "error": "<status>: <server error>"}`."""
     return f"{e.code}: {e.error}"
-
-
-def bus_lane_config(lane):
-    """B24: `<lane>/.matrixkoder-bus.json` `{v, url, token, run, task}`, written by
-    `mk-bus.py token`. None when absent or unusable — the caller's down-fallback."""
-    try:
-        with open(os.path.join(lane, BUS_LANE_FILE)) as f:
-            obj = json.load(f)
-    except (OSError, ValueError):
-        return None
-    if not isinstance(obj, dict) or not obj.get("url") or not obj.get("token"):
-        return None
-    return obj
 
 
 def bus_read_cursor(lane):
@@ -825,10 +851,19 @@ def bus_wait_chunk(cfg, after, chunk):
     return bus_call(cfg, "GET", f"/wait?{qs}", timeout=chunk + 10.0)
 
 
+def bus_note_seq(lane, msg):
+    """Advance the inbox cursor past a message this lane has already been shown (D7.2, C13e).
+    A non-integer seq is ignored — the cursor never moves backwards or onto garbage."""
+    seq = msg.get("seq") if isinstance(msg, dict) else None
+    if is_int(seq) and seq > bus_read_cursor(lane):
+        bus_write_cursor(lane, seq)
+
+
 def bus_poll_answer(cfg, ask_id, after, deadline):
     """Long-poll `GET /wait` in chunks of at most 90 s until the `answer` whose `reply_to` is
     this ask arrives, skipping other messages addressed to the lane, or until `deadline`.
-    Returns the answer message or None; raises BusDown/BusHttp to the caller."""
+    Returns the answer message or None; raises BusDown/BusHttp to the caller.
+    A non-integer `seq` (item 37) is ignored: the cursor stays put and the loop continues."""
     while True:
         remaining = deadline - time.time()
         if remaining < 1.0:  # /wait clamps to >= 1 s server-side; a shorter chunk would overshoot
@@ -918,6 +953,7 @@ def cmd_ask(a):
         raise Handled(3)
     with contextlib.suppress(BusDown, BusHttp, OSError, ValueError):
         bus_call(cfg, "POST", "/ack", body=bus_ack_body(cfg, answer["id"]))
+    bus_note_seq(lane, answer)  # D7.2: inbox must not re-show or re-ack this answer
     status_resume(lane)
     print(answer["text"])
     raise Handled(0)
@@ -946,6 +982,7 @@ def cmd_wait(a):
         raise Handled(3)
     with contextlib.suppress(BusDown, BusHttp, OSError, ValueError):
         bus_call(cfg, "POST", "/ack", body=bus_ack_body(cfg, answer["id"]))
+    bus_note_seq(lane, answer)  # D7.2: inbox must not re-show or re-ack this answer
     status_resume(lane)
     print(answer["text"])
     raise Handled(0)
@@ -953,13 +990,15 @@ def cmd_wait(a):
 
 def cmd_inbox(a):
     """BB: print the messages addressed to this lane after the cursor, one JSON line each,
-    ack each at level 3, advance the cursor. Empty prints nothing and exits 0."""
+    ack each at level 3, advance the cursor. Empty prints nothing and exits 0.
+    D7.2: the whole drain is capped at 2 s wall clock (item 37)."""
     lane = lane_dir(a)
     cfg = bus_lane_config(lane)
     if cfg is None:
         raise Fail("bus down", code=4)
     after = bus_read_cursor(lane)
-    while True:
+    deadline = time.time() + BUS_HINT_BUDGET
+    while time.time() < deadline:
         try:
             res = bus_wait_chunk(cfg, after, 1.0)
         except BusDown:
@@ -1003,14 +1042,15 @@ def cmd_ack(a):
 
 def bus_unread_hint(lane):
     """The `progress` hint: `N unread — run inbox` when the bus holds messages for this lane
-    past the inbox cursor. Best effort — a 2 s budget, silent whenever the bus is unusable,
-    never a failure, never a cursor move."""
+    past the inbox cursor. Best effort — a hard 2 s wall-clock cap (item 37), silent whenever
+    the bus is unusable, never a failure, never a cursor move."""
     cfg = bus_lane_config(lane)
     if cfg is None:
         return None
     try:
         after, n = bus_read_cursor(lane), 0
-        while True:
+        deadline = time.time() + BUS_HINT_BUDGET
+        while time.time() < deadline:
             res = bus_wait_chunk(cfg, after, 1.0)
             msg = res.get("message")
             if msg is None:
@@ -1023,6 +1063,432 @@ def bus_unread_hint(lane):
     except (Fail, BusDown, BusHttp, OSError, ValueError):
         return None
 
+
+# ---------- D7: task list, todo mirror, commit and report over the bus ----------
+# Self-hosting guard: these commands talk to the bus only when the lane file (or MK_BUS_*)
+# resolves AND the project store exists. Otherwise they fall back to the lane status file,
+# the report file and the brief copy (C12) and never raise on a missing bus.
+
+def lane_hash(lane):
+    return hashlib.sha256(os.path.abspath(lane).encode("utf-8")).hexdigest()[:16]
+
+
+def bus_token_path(lane):
+    """ONE resolver for the lane token file (D6B moves it; this CLI must follow).
+
+    Order: `MK_BUS_TOKEN_FILE` when set, else `<lane>/.matrixkoder-bus.json`, else
+    `~/.matrixkoder/bus-lanes/<hash(lane)>.json`. Tests point HOME at a temp dir, so the
+    third location never touches the real home.
+    """
+    env = os.environ.get("MK_BUS_TOKEN_FILE")
+    if env:
+        return os.path.expanduser(env)
+    lane_file = os.path.join(lane, BUS_LANE_FILE)
+    if os.path.isfile(lane_file):
+        return lane_file
+    home = os.environ.get("MK_HOME") or os.path.expanduser("~/.matrixkoder")
+    return os.path.join(home, "bus-lanes", lane_hash(lane) + ".json")
+
+
+def bus_lane_config(lane):
+    """B24 lane coordinates, from the one token-path resolver. `MK_BUS_URL` / `MK_BUS_TOKEN`
+    override the file's url and token (D6B). None when nothing usable is present."""
+    path = bus_token_path(lane)
+    obj = {}
+    try:
+        with open(path) as f:
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            obj = loaded
+    except (OSError, ValueError):
+        obj = {}
+    url = os.environ.get("MK_BUS_URL") or obj.get("url")
+    token = os.environ.get("MK_BUS_TOKEN") or obj.get("token")
+    if not url or not token:
+        return None
+    cfg = dict(obj)
+    cfg["url"], cfg["token"] = url, token
+    cfg["_token_path"] = path
+    return cfg
+
+
+def bus_data_dir(cfg):
+    """The project data dir: `MK_BUS_DATA` wins, else the token file's `data` field.
+    Production token files omit it; without either, store mode stays off (C12)."""
+    env = os.environ.get("MK_BUS_DATA")
+    if env and os.path.isdir(env):
+        return os.path.abspath(env)
+    if not cfg:
+        return None
+    data = cfg.get("data")
+    if isinstance(data, str) and os.path.isdir(data):
+        return os.path.abspath(data)
+    return None
+
+
+def store_present(data):
+    """Self-hosting guard: store mode only when <data>/mk.db already exists."""
+    return bool(data) and os.path.isfile(os.path.join(data, "mk.db"))
+
+
+def store_rows(data, sql, params=()):
+    """SELECT-only against the project store. Read-only URI so a lane CLI cannot write it."""
+    uri = "file:" + os.path.join(data, "mk.db") + "?mode=ro"
+    con = sqlite3.connect(uri, uri=True, timeout=5)
+    con.row_factory = sqlite3.Row
+    try:
+        return [dict(r) for r in con.execute(sql, params)]
+    finally:
+        con.close()
+
+
+def todo_done_status(data):
+    """C9: `session.todo_done_status` from <data>/matrixkoder.yaml, else the schema default."""
+    path = os.path.join(data or "", "matrixkoder.yaml")
+    try:
+        with open(path) as f:
+            text = f.read()
+    except OSError:
+        return TODO_DONE_DEFAULT
+    # A tiny scan, not a YAML parser: the key is one line `todo_done_status: verify|done`.
+    for line in text.splitlines():
+        raw = line.split("#", 1)[0].strip()
+        if raw.startswith("todo_done_status:"):
+            val = raw.split(":", 1)[1].strip().strip('"').strip("'")
+            if val in ("verify", "done"):
+                return val
+    return TODO_DONE_DEFAULT
+
+
+def bus_send(cfg, kind, text, task=None):
+    """POST /send as the lane. The token already scopes run and task; `task` is sent only
+    when it matches the token's task (the bus refuses a mismatch)."""
+    body = {"kind": kind, "text": text}
+    if task and cfg.get("task") and task == cfg.get("task"):
+        body["task"] = task
+    return bus_call(cfg, "POST", "/send", body=body)
+
+
+def phase_of(task):
+    """A task id `D7.1` belongs to phase `D7`; a phase id has no dot."""
+    return task.split(".", 1)[0] if "." in task else task
+
+
+def plan_tasks(plan_path, task):
+    """The phase's task list from a plan file: id, title, parallel, deps. Empty when the
+    plan cannot be read — connect still prints the brief."""
+    try:
+        with open(plan_path, "rb") as f:
+            raw = f.read().decode("utf-8")
+    except OSError:
+        return []
+    if not raw.startswith("+++"):
+        return []
+    end = raw.find("\n+++", 3)
+    if end < 0:
+        return []
+    try:
+        doc = tomllib.loads(raw[3:end].lstrip("\n"))
+    except tomllib.TOMLDecodeError:
+        return []
+    phase_id = phase_of(task)
+    out = []
+    for phase in doc.get("phase") or []:
+        if not isinstance(phase, dict) or phase.get("id") != phase_id:
+            continue
+        for t in phase.get("task") or []:
+            if not isinstance(t, dict) or not t.get("id"):
+                continue
+            deps = t.get("deps") or []
+            if isinstance(deps, str):
+                deps = [x.strip() for x in deps.split(",") if x.strip()]
+            out.append({"id": t["id"], "title": t.get("title") or "",
+                        "parallel": bool(t.get("parallel") or False), "deps": list(deps)})
+    return out
+
+
+def brief_text(lane, old):
+    """The brief this round was given: the report's sibling brief, else the lane brief copy."""
+    report = (old or {}).get("report") or ""
+    candidates = []
+    if report:
+        base = os.path.basename(report)
+        m = re.search(r"-r(\d+)\.", base)
+        n = m.group(1) if m else "1"
+        candidates.append(os.path.join(lane, os.path.dirname(report), f"brief-r{n}.md"))
+        candidates.append(os.path.join(lane, f".matrixkoder-brief-r{n}.md"))
+    candidates.append(os.path.join(lane, ".matrixkoder-brief.md"))
+    for path in candidates:
+        try:
+            with open(path) as f:
+                return f.read(), path
+        except OSError:
+            continue
+    return "", ""
+
+
+def page_slice(text, part, size=BRIEF_PAGE):
+    pages = max(1, (len(text) + size - 1) // size) if text else 1
+    part = max(1, min(part, pages))
+    start = (part - 1) * size
+    return text[start:start + size], part, pages
+
+
+def cmd_connect(a):
+    """D7.1: print the brief (one page, ~24,000 chars) and the phase task list. The agent
+    adds one `[<id>] ` todo per task. Ack of the brief happens on `read` of the last page."""
+    lane = lane_dir(a)
+    old = load_live(lane)
+    text, path = brief_text(lane, old)
+    plan = a.plan or os.environ.get("MK_PLAN") or ""
+    tasks = plan_tasks(plan, old.get("task") or "") if plan else []
+    body, part, pages = page_slice(text, 1)
+    lines = [f"# brief {part}/{pages}" + (f" {path}" if path else ""), body]
+    if pages > 1:
+        lines.append(f"# more: read <id> --part 2 .. {pages}")
+    lines.append("# tasks")
+    for t in tasks:
+        deps = ",".join(t["deps"])
+        lines.append(f"[{t['id']}] {t['title']} parallel={str(t['parallel']).lower()} deps={deps}")
+    if not tasks:
+        lines.append("# tasks: (none — no plan, or this phase has no tasks)")
+    print("\n".join(lines))
+    raise Handled(0)
+
+
+def cmd_read(a):
+    """D7.1: one page of a paged body. `--part` is 1-based. The last page acks the message
+    when `<id>` is a bus message id and the bus is up."""
+    lane = lane_dir(a)
+    msg_id = (a.msg_id or "").strip()
+    part = a.part or 1
+    if not is_int(part) or part < 1:
+        raise Fail(f"part must be an integer >= 1, got {part!r}")
+    text = ""
+    if msg_id and msg_id != "brief":
+        cfg = bus_lane_config(lane)
+        if cfg is None:
+            raise Fail("bus down", code=4)
+        # The body was delivered as a message; re-fetch by walking /wait is not how paging
+        # works — the sender pages, and `read` slices a body the lane already stored.
+        cache = os.path.join(lane, ".matrixkoder-pages", msg_id)
+        try:
+            with open(cache) as f:
+                text = f.read()
+        except OSError:
+            raise Fail(f"no paged body cached for {msg_id!r}; connect prints the brief")
+    else:
+        text, _ = brief_text(lane, load_live(lane))
+    body, part, pages = page_slice(text, part)
+    print(f"# part {part}/{pages}")
+    print(body)
+    if part == pages and msg_id and msg_id != "brief":
+        cfg = bus_lane_config(lane)
+        if cfg is not None:
+            with contextlib.suppress(BusDown, BusHttp, OSError, ValueError):
+                bus_call(cfg, "POST", "/ack", body=bus_ack_body(cfg, msg_id))
+    raise Handled(0)
+
+
+def hook_install(kind, home):
+    """C8: install the hook recipe OUTSIDE the worktree, under the MK home. Returns the
+    settings path, or None when this kind has no hook (`todo_hook` is not yes)."""
+    recipe = HOOK_RECIPES.get(kind)
+    if not recipe:
+        return None
+    dest_dir = os.path.join(home, "hooks")
+    os.makedirs(dest_dir, exist_ok=True)
+    settings = os.path.join(dest_dir, f"{kind}-todo.json")
+    payload_src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               "hooks", "payloads", f"{kind}.json")
+    try:
+        with open(payload_src) as f:
+            recorded = f.read()
+    except OSError:
+        recorded = ""
+    doc = {"recipe": recipe, "installed_outside_worktree": True, "recorded_payload": recorded}
+    fd = os.open(settings, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(doc, f)
+        f.write("\n")
+    return settings
+
+
+def cmd_hook_install(a):
+    """Dispatch-time hook install. Refuses to write inside the lane worktree."""
+    lane = lane_dir(a)
+    kind = check_agent(a.agent or detect_agent())
+    home = os.environ.get("MK_HOME") or os.path.expanduser("~/.matrixkoder")
+    home = os.path.abspath(home)
+    if os.path.commonpath([home, os.path.abspath(lane)]) == os.path.abspath(lane):
+        raise Fail("hook install must be outside the worktree [C8]")
+    path = hook_install(kind, home)
+    if path is None:
+        return ({"ok": True, "installed": False, "agent": kind,
+                 "reason": "todo_hook is not yes for this agent"}, None)
+    return ({"ok": True, "installed": True, "agent": kind, "settings": path,
+             "recipe": HOOK_RECIPES[kind]}, None)
+
+
+def parse_todo_section(text):
+    """The report's `## Todo` section: lines `[done|skipped|open] <text> - <evidence>`.
+    Returns (items, warned). A missing section or an `open` item with no evidence warns."""
+    m = re.search(r"(?m)^## Todo\s*$", text)
+    if not m:
+        return [], "todo section missing"
+    body = text[m.end():]
+    nxt = re.search(r"(?m)^## ", body)
+    if nxt:
+        body = body[:nxt.start()]
+    items, warns = [], []
+    line_re = re.compile(r"^\[(done|skipped|open)\]\s+(.+?)\s+-\s+(.*)$")
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        hit = line_re.match(line)
+        if not hit:
+            continue
+        state, title, evidence = hit.group(1), hit.group(2).strip(), hit.group(3).strip()
+        items.append({"state": state, "text": title, "evidence": evidence})
+        if state == "open" and not evidence:
+            warns.append(f"open without a reason: {title}")
+    warn = "; ".join(warns)
+    return items, warn
+
+
+def todo_counts(items):
+    done = sum(1 for i in items if i["state"] == "done")
+    skipped = sum(1 for i in items if i["state"] == "skipped")
+    return done, skipped, len(items)
+
+
+def status_seen_on_bus(cfg, data, task, mapped, round_n):
+    """Dedupe lives on the bus: a task message `status <mapped>` with `round: <n>` for this
+    task was already announced. A different round is a different key."""
+    try:
+        rows = store_rows(
+            data,
+            "SELECT text FROM events WHERE chan='bus' AND run=? AND task=? AND kind='task'",
+            (cfg.get("run"), task),
+        )
+    except (OSError, sqlite3.Error):
+        return False
+    prefix = f"status {mapped}"
+    for row in rows:
+        text = row.get("text") or ""
+        head, _, rest = text.partition("\n")
+        if head.strip() != prefix:
+            continue
+        if rest.startswith(f"round: {round_n}"):
+            return True
+    return False
+
+
+def post_status(lane, old, state, note):
+    """Report one todo state. The dedupe key is (task, mapped state, round): a second report
+    of the same triple is dropped, and a fix round (a new round) is a new key, so re-entering
+    in_progress is sent again (C7).
+
+    `completed` maps to `session.todo_done_status` (C9: verify|done). The mapped value is
+    what is announced. A lane token cannot POST kind=status (the bus reserves that for the
+    orchestrator token), so the announcement is a `task` message whose text is
+    `status <mapped>` — the bus change this needs is listed in the D7 report — and with the
+    bus or the store absent nothing is sent (C12: the lane status file is the record)."""
+    task, round_n = old.get("task"), old.get("round")
+    cfg = bus_lane_config(lane)
+    data = bus_data_dir(cfg) if cfg else None
+    mapped = "in_progress" if state == "in_progress" else (
+        todo_done_status(data) if data else TODO_DONE_DEFAULT)
+    if cfg is not None and store_present(data) and status_seen_on_bus(cfg, data, task, mapped, round_n):
+        return {"sent": False, "deduped": True, "state": state, "mapped": mapped}
+    if cfg is None or not store_present(data):
+        return {"sent": False, "deduped": False, "state": state, "mapped": mapped,
+                "fallback": "lane-file"}
+    text = f"status {mapped}\nround: {round_n}\n{note}"
+    try:
+        bus_send(cfg, "task", text, task=task)
+    except (BusDown, BusHttp):
+        return {"sent": False, "deduped": False, "state": state, "mapped": mapped,
+                "fallback": "bus-down"}
+    return {"sent": True, "deduped": False, "state": state, "mapped": mapped, "note": note}
+
+
+def cmd_todo(a):
+    """`todo done <id>` — the backup reporter (C7). `todo in_progress <id>` likewise.
+    Both post a status; the bus dedupes by (task, state, round)."""
+    lane, old = lane_dir(a), load_live(lane_dir(a))
+    which = (a.which or "").strip()
+    tid = (a.task_id or "").strip()
+    if which not in TODO_STATES:
+        raise Fail(f"todo state must be one of {TODO_STATES}, got {which!r}")
+    if not tid:
+        raise Fail("todo needs a task id")
+    # The lane status file still moves, so a watcher with the bus down sees progress (C12).
+    if which == "in_progress":
+        require_state(old, "progress")
+        obj = dict(old, step=tid, state="working", question=None, subagent=None)
+        write_status(lane, stamp(obj))
+    note = f"todo {which} {tid}"
+    res = post_status(lane, old, which, note)
+    return ({"ok": True, "task": tid, **res}, None)
+
+
+def cmd_commit_msg(a):
+    """Announce the commit. Replaces nothing in git; the message is the bus record."""
+    lane, old = lane_dir(a), load_live(lane_dir(a))
+    sha = (a.sha or "").strip() or (lane_head(lane) or "")
+    if not SHA_RE.fullmatch(sha):
+        raise Fail(f"commit needs a 40-hex sha, got {sha!r}")
+    text = f"round: {old.get('round')}\n{sha}"
+    cfg = bus_lane_config(lane)
+    data = bus_data_dir(cfg) if cfg else None
+    if cfg is None or not store_present(data):
+        return ({"ok": True, "sent": False, "fallback": "lane-file", "commit": sha}, None)
+    try:
+        bus_send(cfg, "commit", text)
+    except (BusDown, BusHttp):
+        return ({"ok": True, "sent": False, "fallback": "bus-down", "commit": sha}, None)
+    return ({"ok": True, "sent": True, "commit": sha}, None)
+
+
+def cmd_report(a):
+    """Send the report file as a `report` message (paged by the bus at 128 KiB). With the
+    bus down the file on disk stays the record (C12)."""
+    lane, old = lane_dir(a), load_live(lane_dir(a))
+    report = old.get("report") or ""
+    path = os.path.join(lane, report)
+    if not report or not os.path.isfile(path):
+        raise Fail(f"report_missing: {report!r} does not exist at the lane root")
+    with open(path) as f:
+        text = f.read()
+    body = f"round: {old.get('round')}\n{text}"
+    cfg = bus_lane_config(lane)
+    data = bus_data_dir(cfg) if cfg else None
+    if cfg is None or not store_present(data):
+        return ({"ok": True, "sent": False, "fallback": "file", "report": report}, None)
+    try:
+        bus_send(cfg, "report", body)
+    except (BusDown, BusHttp):
+        return ({"ok": True, "sent": False, "fallback": "bus-down", "report": report}, None)
+    return ({"ok": True, "sent": True, "report": report}, None)
+
+
+def measure_store(data, run):
+    """D7: when the project store exists, measure reads it instead of events.jsonl."""
+    events = store_rows(
+        data,
+        "SELECT id, task, t, chan, kind, text FROM events WHERE run=? ORDER BY id",
+        (run,),
+    )
+    # Adapt store rows to the events.jsonl shape parse_events/verdict_of already understand.
+    adapted = []
+    for e in events:
+        if e.get("chan") not in ("state", "bus", None):
+            continue
+        adapted.append({"t": e.get("t"), "task": e.get("task"), "kind": e.get("kind"),
+                        "text": e.get("text") or "", "chan": e.get("chan")})
+    return adapted
 
 # ---------- CLI ----------
 
@@ -1077,6 +1543,19 @@ def build_parser():
     sp.add_argument("--timeout", type=float, default=BUS_ASK_TIMEOUT,
                     help="total seconds to wait for the answer (default 600)")
     lane_cmd("inbox", cmd_inbox, "print this lane's unread bus messages and ack them [BB]")
+    sp = lane_cmd("connect", cmd_connect, "print the brief (paged) and the phase task list [D7.1]")
+    sp.add_argument("--plan", default=None, help="plan file; default $MK_PLAN")
+    sp = lane_cmd("read", cmd_read, "print one page of a paged brief or message [D7.1]")
+    sp.add_argument("msg_id")
+    sp.add_argument("--part", type=int, default=1)
+    sp = lane_cmd("todo", cmd_todo, "backup todo reporter: todo in_progress|done <id> [C7]")
+    sp.add_argument("which")
+    sp.add_argument("task_id")
+    sp = lane_cmd("hook-install", cmd_hook_install, "install the todo hook outside the worktree [C8]")
+    sp.add_argument("--agent", default=None)
+    sp = lane_cmd("commit", cmd_commit_msg, "announce the commit sha on the bus [C7]")
+    sp.add_argument("sha", nargs="?", default=None)
+    lane_cmd("report", cmd_report, "send the report file on the bus [C7]")
     sp = lane_cmd("ack", cmd_ack, "record a bus message as read, level 3 [BB]")
     sp.add_argument("msg_id")
     sp = lane_cmd("show", cmd_show, "read-only: apply the R27 reader conditions and print the verdict")
@@ -1099,7 +1578,8 @@ def main(argv=None):
         if not getattr(a, "cmd", None):
             raise Fail("no command; --help lists the command set "
                        "(start, progress, blocked, done, ctx, phase-done, show, "
-                       "ask, wait, inbox, ack, install, measure)")
+                       "ask, wait, inbox, ack, connect, read, todo, hook-install, "
+                       "commit, report, install, measure)")
         out, token = a.func(a)
     except Fail as e:
         print(json.dumps({"ok": False, "error": str(e), **e.extra}))
@@ -1791,9 +2271,19 @@ def bus_server(root, name="bus"):
 
 
 def bus_lane(root, lane_name, task, data):
-    """A lane dir whose `.matrixkoder-bus.json` is written by the real `mk-bus.py token`."""
+    """A lane dir whose `.matrixkoder-bus.json` is written by the real `mk-bus.py token`.
+    The data dir is stamped into the file so D7 commands can find the project store. The
+    production token file has no `data` field; `MK_BUS_DATA` is the other way to name it."""
     lane = mklane(root, lane_name)
     bus_cli("token", "--lane", lane, "--task", task, "--run", BUS_RUN, "--data", data)
+    path = os.path.join(lane, BUS_LANE_FILE)
+    with open(path) as f:
+        cfg = json.load(f)
+    cfg["data"] = data
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+    os.chmod(path, 0o600)
     return lane
 
 
@@ -2044,6 +2534,280 @@ def t_bus_bad_token_http_error(root):
     for args in (("inbox",), ("ack", "m-1"), ("wait", "m-1")):
         code, lines = cli(lane, *args)
         assert code == 5 and len(lines) == 1 and json.loads(lines[0]) == rejected, (args, code, lines)
+
+
+def d7_store(data, run, task):
+    """A real project store on the self-test's data dir, with one task row. Public mkdb API."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "mkdb", os.path.join(os.path.dirname(MK_BUS_PY), "mkdb.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    mod.import_history(data, None, run, run_row={"id": run, "status": "active"}, data_dir=data)
+    con = mod.open_project(data, data_dir=data)
+    try:
+        mod.add_task(con, run, task, "task", title="d7")
+    finally:
+        con.close()
+    return mod
+
+
+def d7_answer(data, ask_id, text, to_task):
+    """Post an answer with the orchestrator token. `mk-bus.py answer` reads bus.jsonl,
+    which store mode does not write; the HTTP path is what the orchestrator actually uses."""
+    with open(os.path.join(data, "bus.json")) as f:
+        b = json.load(f)
+    body = {"run": BUS_RUN, "task": to_task, "kind": "answer", "text": text,
+            "from": "orch", "to": to_task, "reply_to": ask_id}
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{b['port']}/send", data=json.dumps(body).encode(),
+        headers={"Authorization": f"Bearer {b['token']}", "Content-Type": "application/json",
+                 "Host": f"127.0.0.1:{b['port']}"}, method="POST")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode())
+
+
+def d7_bus_rows(data):
+    """Bus messages from the store when it exists, else bus.jsonl (file mode)."""
+    if store_present(data):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "mkdb_rows", os.path.join(os.path.dirname(MK_BUS_PY), "mkdb.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        con = mod.open_project(data, data_dir=data)
+        try:
+            rows = []
+            for r in con.execute(
+                    "SELECT id, kind, text, task, from_id, to_id, reply_to, meta_json "
+                    "FROM events WHERE chan='bus' AND run=? ORDER BY id", (BUS_RUN,)):
+                d = dict(r)
+                d["from"] = d.get("from_id")
+                d["to"] = d.get("to_id")
+                d["id"] = f"m-{d['id']}"
+                meta = {}
+                if d.get("meta_json"):
+                    with contextlib.suppress(ValueError):
+                        meta = json.loads(d["meta_json"])
+                if d["kind"] == "ack":
+                    d["ack_level"] = meta.get("ack_level", 1)
+                rows.append(d)
+            return rows
+        finally:
+            con.close()
+    return bus_rows(data)
+
+
+def d7_task_msgs(data, task):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "mkdb", os.path.join(os.path.dirname(MK_BUS_PY), "mkdb.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    con = mod.open_project(data, data_dir=data)
+    try:
+        return [dict(r) for r in con.execute(
+            "SELECT kind, text FROM events WHERE chan='bus' AND task=? AND kind='task'", (task,))]
+    finally:
+        con.close()
+
+
+def t_d7_connect_pages_and_tasks(root):
+    """connect prints page 1 of a real-size brief and the phase task list. A brief over
+    24,000 chars (a real brief, concatenated) says there is a next page."""
+    lane = mklane(root, "d7_connect")
+    begin(lane, root, task="D7.1")
+    src = "/Users/rohits/Development/matrixkoder/.matrixkoder/runs/mk-store-r1/tasks/D7/brief-r1.md"
+    with open(src) as f:
+        real = f.read()
+    big = (real + "\n") * 5
+    assert len(big) > BRIEF_PAGE
+    with open(os.path.join(lane, ".matrixkoder-brief.md"), "w") as f:
+        f.write(big)
+    plan = os.path.join(root, "plan.md")
+    with open(plan, "w") as f:
+        f.write('+++\nplan = "t"\nstatus = "running"\n[[phase]]\nid = "D7"\n'
+                '[[phase.task]]\nid = "D7.1"\ntitle = "connect"\nparallel = false\n'
+                'deps = []\n[[phase.task]]\nid = "D7.2"\ntitle = "ask"\n'
+                'parallel = true\ndeps = ["D7.1"]\n+++\n')
+    code, lines = cli(lane, "connect", "--plan", plan)
+    assert code == 0, lines
+    text = "\n".join(lines)
+    assert text.startswith("# brief 1/"), text[:40]
+    assert "[D7.1] connect parallel=false deps=" in text, text[-500:]
+    assert "[D7.2] ask parallel=true deps=D7.1" in text
+    assert "read <id> --part 2" in text
+    code, lines = cli(lane, "read", "brief", "--part", "2")
+    assert code == 0 and lines[0].startswith("# part 2/"), lines[:1]
+
+
+def t_d7_todo_backup_and_dedupe(root):
+    """Backup `todo done` alone announces one status. A second report is deduped. A fix
+    round re-entering in_progress is a new key and is not deduped."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data = os.path.join(root, "d7todo-data")
+    os.makedirs(data, exist_ok=True)
+    d7_store(data, BUS_RUN, "D7T")
+    bus_server(root, "d7todo")
+    lane = bus_lane(root, "d7_todo_lane", "D7T", data)
+    begin(lane, root, run=BUS_RUN, task="D7T")
+    cli(lane, "progress", "work")
+    code, lines = cli(lane, "todo", "done", "D7.1", env={"MK_BUS_DATA": data})
+    assert code == 0, lines
+    first = jline(lines)
+    assert first["sent"] is True and first["deduped"] is False and first["mapped"] == "verify", first
+    code, lines = cli(lane, "todo", "done", "D7.1", env={"MK_BUS_DATA": data})
+    second = jline(lines)
+    assert second["deduped"] is True and second["sent"] is False, second
+    msgs = d7_task_msgs(data, "D7T")
+    assert len(msgs) == 1 and msgs[0]["text"].startswith("status verify\nround: 1\n"), msgs
+    begin(lane, root, run=BUS_RUN, task="D7T", round=2)
+    cli(lane, "progress", "fix")
+    code, lines = cli(lane, "todo", "in_progress", "D7.1", env={"MK_BUS_DATA": data})
+    assert code == 0 and jline(lines)["sent"] is True and jline(lines)["deduped"] is False, lines
+    code, lines = cli(lane, "todo", "in_progress", "D7.1", env={"MK_BUS_DATA": data})
+    assert jline(lines)["deduped"] is True, lines
+    assert len(d7_task_msgs(data, "D7T")) == 2
+
+
+def t_d7_todo_done_status_setting(root):
+    """C9: session.todo_done_status = done changes the announced status."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data = os.path.join(root, "d7set-data")
+    os.makedirs(data, exist_ok=True)
+    d7_store(data, BUS_RUN, "D7S")
+    bus_server(root, "d7set")
+    with open(os.path.join(data, "matrixkoder.yaml"), "w") as f:
+        f.write("todo_done_status: done\n")
+    lane = bus_lane(root, "d7_set_lane", "D7S", data)
+    begin(lane, root, run=BUS_RUN, task="D7S")
+    cli(lane, "progress", "work")
+    code, lines = cli(lane, "todo", "done", "D7.1", env={"MK_BUS_DATA": data})
+    assert code == 0 and jline(lines)["mapped"] == "done", lines
+
+
+def t_d7_hook_install_outside(root):
+    """todo_hook yes installs under MK_HOME, never inside the lane. A no-hook agent installs nothing."""
+    lane = gitlane(root, "d7_hook_lane")
+    begin(lane, root)
+    home = os.path.join(root, "mk-home")
+    code, lines = cli(lane, "hook-install", "--agent", "claude", env={"MK_HOME": home})
+    assert code == 0, lines
+    out = jline(lines)
+    assert out["installed"] is True and out["settings"].startswith(home), out
+    assert os.path.commonpath([out["settings"], lane]) != lane
+    with open(out["settings"]) as f:
+        doc = json.load(f)
+    assert "recorded_payload" in doc
+    code, lines = cli(lane, "hook-install", "--agent", "agy", env={"MK_HOME": home})
+    assert code == 0 and jline(lines)["installed"] is False, lines
+
+
+def t_d7_bus_down_ask_blocks(root):
+    """Kill the bus, ask, and the lane status file is blocked with the question."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data, pid, _ = bus_server(root, "d7down")
+    lane = bus_lane(root, "d7_down_lane", "D7D", data)
+    begin(lane, root)
+    cli(lane, "progress", "work")
+    stop_pid(pid)
+    code, lines = cli(lane, "ask", "where is the schema?", "--timeout", "30")
+    assert code == 4 and lines == ["BUS DOWN: use the BLOCKED token"], (code, lines)
+    st = status(lane)
+    assert st["state"] == "blocked" and st["question"] == "where is the schema?", st
+
+
+def t_d7_one_ack_per_answer(root):
+    """ask acks the answer once; inbox does not show it or ack it again."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data = os.path.join(root, "d7ack-data")
+    os.makedirs(data, exist_ok=True)
+    d7_store(data, BUS_RUN, "D7A")
+    bus_server(root, "d7ack")
+    lane = bus_lane(root, "d7_ack_lane", "D7A", data)
+    begin(lane, root, run=BUS_RUN, task="D7A")
+    cli(lane, "progress", "work")
+
+    def answer():
+        row = bus_poll_until(lambda: next(
+            (r for r in d7_bus_rows(data) if r.get("kind") == "ask" and r.get("task") == "D7A"), None))
+        got = d7_answer(data, row["id"], "the schema is v2", "D7A")
+        assert got.get("ok") is True, got
+
+    th = threading.Thread(target=answer)
+    th.start()
+    try:
+        code, lines = cli(lane, "ask", "which schema?", "--timeout", "30")
+    finally:
+        th.join(30)
+    assert code == 0 and lines == ["the schema is v2"], (code, lines)
+    code, lines = cli(lane, "inbox")
+    assert code == 0 and lines == [], lines
+    rows = d7_bus_rows(data)
+    answers = [r for r in rows if r.get("kind") == "answer"]
+    assert len(answers) == 1, answers
+    mine = [r for r in rows if r.get("kind") == "ack" and r.get("reply_to") == answers[0]["id"]]
+    assert len(mine) == 1, mine
+
+
+def t_d7_done_todo_counts(root):
+    """done prints todo counts beside DONE, and warns without failing when the section is missing."""
+    lane = gitlane(root, "d7_done_counts")
+    begin(lane, root, report=".matrixkoder-report-r1.md")
+    cli(lane, "progress", "work")
+    with open(os.path.join(lane, ".matrixkoder-report-r1.md"), "w") as f:
+        f.write("# report\n\n## Todo\n"
+                "[done] connect - self-test\n"
+                "[done] dedupe - one message\n"
+                "[skipped] hook for agy - catalog says no\n"
+                "[open] measure store - no store in this lane\n")
+    code, lines = cli(lane, "done")
+    assert code == 0, lines
+    assert lines[-1].endswith("DONE todo 2/4 done 1 skipped"), lines
+    lane2 = gitlane(root, "d7_done_warn")
+    begin(lane2, root, report=".matrixkoder-report-r1.md")
+    cli(lane2, "progress", "work")
+    with open(os.path.join(lane2, ".matrixkoder-report-r1.md"), "w") as f:
+        f.write("# report without todos\n")
+    code, lines = cli(lane2, "done")
+    assert code == 0 and any(x.startswith("todo warning:") for x in lines), lines
+    assert lines[-1].endswith(" DONE"), lines
+
+
+def t_d7_token_path_one_function(root):
+    """One function resolves the token file: MK_BUS_TOKEN_FILE, else the lane file, else
+    ~/.matrixkoder/bus-lanes/<hash>.json. The third is checked with HOME pointed at a temp dir."""
+    lane = mklane(root, "d7_token_lane")
+    override = os.path.join(root, "override.json")
+    with open(override, "w") as f:
+        f.write("{}\n")
+    # The function is what production code calls; drive it in-process with env, since no CLI
+    # prints the path. HOME is a temp dir either way.
+    saved = {k: os.environ.get(k) for k in ("HOME", "MK_HOME", "MK_BUS_TOKEN_FILE")}
+    try:
+        os.environ["HOME"] = os.path.join(root, "h")
+        os.makedirs(os.environ["HOME"], exist_ok=True)
+        os.environ.pop("MK_HOME", None)
+        os.environ["MK_BUS_TOKEN_FILE"] = override
+        assert bus_token_path(lane) == override
+        os.environ.pop("MK_BUS_TOKEN_FILE")
+        got = bus_token_path(lane)
+        assert got == os.path.join(os.environ["HOME"], ".matrixkoder", "bus-lanes",
+                                   lane_hash(lane) + ".json"), got
+        # a lane file wins over the home location
+        with open(os.path.join(lane, BUS_LANE_FILE), "w") as f:
+            f.write("{}\n")
+        assert bus_token_path(lane) == os.path.join(lane, BUS_LANE_FILE)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def t_skill_frontmatter(root):
