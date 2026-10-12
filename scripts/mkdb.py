@@ -655,6 +655,161 @@ def import_history(home, project, run, *, run_row=None, tasks=(), events=(), art
     return added
 
 
+# Live bus writers (D1D). change_log is written only when a task row changes — the same rule
+# import_history uses — so these helpers do not write change_log: they never touch tasks.status.
+LIVE_CHANS = ("state", "bus", "note")
+ARTIFACT_MAX = 256 * 1024
+
+
+def _require_run(con, run):
+    if not isinstance(run, str) or not run:
+        raise Fail(f"invalid run {run!r}")
+    if not con.execute("SELECT 1 FROM runs WHERE id=?", (run,)).fetchone():
+        raise Fail(f"no run {run}")
+
+
+def _require_task(con, run, task):
+    if task is None:
+        return
+    if not isinstance(task, str) or not task:
+        raise Fail(f"invalid task {task!r}")
+    if not con.execute("SELECT 1 FROM tasks WHERE run=? AND id=?", (run, task)).fetchone():
+        raise Fail(f"no task {run}:{task}")
+
+
+def append_event(home, project, run, *, task=None, chan, kind, from_id=None, to_id=None,
+                 reply_to=None, text="", meta=None, artifact_id=None, t=None, data_dir=None):
+    """Insert ONE live events row and return its id (the bus SSE Last-Event-ID).
+
+    Does not touch tasks.status and does not write change_log (import_history's rule: a change_log
+    row is written only when a task row changes). chan='state' with kind='transition' is refused —
+    status changes go through transition() only (C10).
+    """
+    if chan not in LIVE_CHANS:
+        raise Fail(f"unknown chan {chan!r}: expected state|bus|note")
+    if chan == "state" and kind == "transition":
+        raise Fail("chan='state' kind='transition' is refused; status changes go through transition()")
+    if not isinstance(kind, str) or not kind:
+        raise Fail(f"invalid kind {kind!r}")
+    if not isinstance(text, str):
+        raise Fail(f"event text must be a string, got {type(text).__name__}")
+    if meta is None:
+        meta_json = None
+    elif isinstance(meta, dict):
+        meta_json = json.dumps(meta, sort_keys=True, ensure_ascii=False)
+    else:
+        raise Fail(f"meta must be a dict or None, got {type(meta).__name__}")
+    con = open_project(home, project, data_dir)
+    try:
+        _begin(con)
+        try:
+            _require_run(con, run)
+            _require_task(con, run, task)
+            if artifact_id is not None:
+                art = con.execute("SELECT 1 FROM artifacts WHERE id=? AND run=?",
+                                  (artifact_id, run)).fetchone()
+                if not art:
+                    raise Fail(f"no artifact {artifact_id} in run {run}")
+            cur = con.execute(
+                "INSERT INTO events(run, task, t, chan, kind, from_id, to_id, reply_to, text,"
+                " artifact_id, meta_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (run, task, t or now(), chan, kind, from_id, to_id, reply_to, text,
+                 artifact_id, meta_json))
+            eid = cur.lastrowid
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+    finally:
+        con.close()
+    return eid
+
+
+def append_ack(home, project, run, msg, lane, level, *, t=None, data_dir=None):
+    """INSERT OR IGNORE into acks. Level never decreases. True when a row was inserted or upgraded."""
+    if not isinstance(msg, str) or not msg:
+        raise Fail(f"invalid msg {msg!r}")
+    if not isinstance(lane, str) or not lane:
+        raise Fail(f"invalid lane {lane!r}")
+    if isinstance(level, bool) or not isinstance(level, int):
+        raise Fail(f"invalid level {level!r}")
+    con = open_project(home, project, data_dir)
+    try:
+        _begin(con)
+        try:
+            _require_run(con, run)
+            row = con.execute("SELECT level FROM acks WHERE run=? AND msg=? AND lane=?",
+                              (run, msg, lane)).fetchone()
+            stamp = t or now()
+            if row is None:
+                con.execute("INSERT INTO acks(run, msg, lane, level, t) VALUES (?,?,?,?,?)",
+                            (run, msg, lane, level, stamp))
+                changed = True
+            elif level > row["level"]:
+                con.execute("UPDATE acks SET level=?, t=? WHERE run=? AND msg=? AND lane=?",
+                            (level, stamp, run, msg, lane))
+                changed = True
+            else:
+                changed = False
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+    finally:
+        con.close()
+    return changed
+
+
+def put_artifact(home, project, run, task, round, kind, text, *, event_id=None, data_dir=None):
+    """Insert one live artifact (src stays NULL). rev is 1 + the highest rev for the key.
+
+    When event_id is given, events.artifact_id is set on that event in the same transaction.
+    Text larger than 256 KiB is refused. A failure after the insert rolls the whole transaction
+    back, so neither the artifact nor the link is left behind.
+    """
+    if not isinstance(task, str) or not task:
+        raise Fail(f"invalid task {task!r}")
+    if isinstance(round, bool) or not isinstance(round, int):
+        raise Fail(f"invalid round {round!r}")
+    if not isinstance(kind, str) or not kind:
+        raise Fail(f"invalid kind {kind!r}")
+    if not isinstance(text, str):
+        raise Fail(f"artifact text must be a string, got {type(text).__name__}")
+    if len(text.encode("utf-8")) > ARTIFACT_MAX:
+        raise Fail(f"artifact text exceeds {ARTIFACT_MAX} bytes")
+    con = open_project(home, project, data_dir)
+    try:
+        _begin(con)
+        try:
+            _require_run(con, run)
+            _require_task(con, run, task)
+            if event_id is not None:
+                ev = con.execute("SELECT 1 FROM events WHERE id=? AND run=?", (event_id, run)).fetchone()
+                if not ev:
+                    raise Fail(f"no event {event_id} in run {run}")
+            top = con.execute(
+                "SELECT MAX(rev) m FROM artifacts WHERE run=? AND task=? AND round=? AND kind=?",
+                (run, task, round, kind)).fetchone()["m"]
+            rev = 1 if top is None else top + 1
+            cur = con.execute(
+                "INSERT INTO artifacts(run, task, round, kind, rev, text, created, src)"
+                " VALUES (?,?,?,?,?,?,?,NULL)",
+                (run, task, round, kind, rev, text, now()))
+            aid = cur.lastrowid
+            if event_id is not None:
+                con.execute("UPDATE events SET artifact_id=? WHERE id=? AND run=?",
+                            (aid, event_id, run))
+            if os.environ.get("MKDB_FAIL_AFTER_ARTIFACT"):
+                raise Fail("injected failure after the artifact insert")
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+    finally:
+        con.close()
+    return {"id": aid, "rev": rev}
+
+
 def timeline(home, project, run, task, data_dir=None):
     """SELECT … FROM events WHERE run=? AND task=? ORDER BY id."""
     con = open_project(home, project, data_dir)
@@ -807,6 +962,7 @@ def self_test():
         _import_reupdate(home)
         _import_cycle(home)
         _import_race(home)
+        _live_writers(home)
         _v1_upgrade(home)
         _lane_slots_v3(home)
         _single_writer()
@@ -1597,6 +1753,139 @@ def _v1_upgrade(home):
         _check(row["title"] == "keep me", f"row lost: {dict(row) if row else None}")
     finally:
         upgraded.close()
+
+
+def _seed_run(home, name, task="t"):
+    data = os.path.join(home, name)
+    con = open_project(home, data_dir=data)
+    try:
+        _begin(con)
+        con.execute("INSERT INTO runs(id, status) VALUES ('r', 'active')")
+        con.execute("COMMIT")
+        add_task(con, "r", task, "task")
+    finally:
+        con.close()
+    return data
+
+
+def _live_event_worker(home, data, slot, n):
+    for i in range(n):
+        append_event(home, "live", "r", task="t", chan="bus", kind="info",
+                     text=f"{slot}:{i}", data_dir=data)
+
+
+def _live_writers(home):
+    data = _seed_run(home, "live")
+    a = append_event(home, "live", "r", task="t", chan="bus", kind="info",
+                     from_id="a", to_id="b", reply_to="0", text="hello",
+                     meta={"k": 1}, t="2020-01-01T00:00:00+00:00", data_dir=data)
+    b = append_event(home, "live", "r", chan="note", kind="note", text="run-level", data_dir=data)
+    _check(b == a + 1, f"ids not increasing: {a}, {b}")
+    con = open_project(home, data_dir=data)
+    try:
+        row = dict(con.execute("SELECT * FROM events WHERE id=?", (a,)).fetchone())
+        _check(row["chan"] == "bus" and row["kind"] == "info" and row["text"] == "hello", row)
+        _check(row["from_id"] == "a" and row["to_id"] == "b" and row["reply_to"] == "0", row)
+        _check(json.loads(row["meta_json"]) == {"k": 1}, row["meta_json"])
+        _check(row["t"] == "2020-01-01T00:00:00+00:00", row["t"])
+        clog = con.execute("SELECT COUNT(*) c FROM change_log").fetchone()["c"]
+        status = con.execute("SELECT status FROM tasks WHERE id='t'").fetchone()["status"]
+        # add_task writes no change_log; append_event must not add one or move status.
+        _check(clog == 0 and status == "planned", f"live event touched status or change_log {clog} {status}")
+    finally:
+        con.close()
+    for chan, kind, blame in (("state", "transition", "transition()"), ("nope", "info", "unknown chan")):
+        try:
+            append_event(home, "live", "r", task="t", chan=chan, kind=kind, data_dir=data)
+        except Fail as e:
+            _check(blame in str(e), f"expected {blame} in {e}")
+        else:
+            raise SystemExit(f"SELF-TEST FAIL: chan={chan} kind={kind} accepted")
+    for kwargs, blame in (({"run": "missing"}, "no run"), ({"task": "missing"}, "no task")):
+        try:
+            append_event(home, "live", kwargs.get("run", "r"), task=kwargs.get("task", "t"),
+                         chan="bus", kind="info", data_dir=data)
+        except Fail as e:
+            _check(blame in str(e), f"expected {blame} in {e}")
+        else:
+            raise SystemExit(f"SELF-TEST FAIL: {blame} accepted")
+    _check(append_ack(home, "live", "r", "m1", "lane", 1, data_dir=data) is True, "ack insert")
+    _check(append_ack(home, "live", "r", "m1", "lane", 1, data_dir=data) is False, "ack not idempotent")
+    _check(append_ack(home, "live", "r", "m1", "lane", 0, data_dir=data) is False, "ack level decreased")
+    _check(append_ack(home, "live", "r", "m1", "lane", 2, data_dir=data) is True, "ack upgrade")
+    con = open_project(home, data_dir=data)
+    try:
+        level = con.execute("SELECT level FROM acks WHERE msg='m1'").fetchone()["level"]
+        _check(level == 2, f"ack level {level}")
+    finally:
+        con.close()
+    try:
+        append_ack(home, "live", "nope", "m", "lane", 1, data_dir=data)
+    except Fail as e:
+        _check("no run" in str(e), str(e))
+    else:
+        raise SystemExit("SELF-TEST FAIL: ack for unknown run accepted")
+    one = put_artifact(home, "live", "r", "t", 1, "report", "v1", data_dir=data)
+    two = put_artifact(home, "live", "r", "t", 1, "report", "v2", data_dir=data)
+    three = put_artifact(home, "live", "r", "t", 1, "report", "v3", data_dir=data)
+    other = put_artifact(home, "live", "r", "t", 2, "report", "other", data_dir=data)
+    _check([one["rev"], two["rev"], three["rev"], other["rev"]] == [1, 2, 3, 1],
+           f"revs {[one, two, three, other]}")
+    ev = append_event(home, "live", "r", task="t", chan="bus", kind="report", text="body", data_dir=data)
+    linked = put_artifact(home, "live", "r", "t", 1, "report", "linked", event_id=ev, data_dir=data)
+    con = open_project(home, data_dir=data)
+    try:
+        got = con.execute("SELECT artifact_id FROM events WHERE id=?", (ev,)).fetchone()["artifact_id"]
+        src = con.execute("SELECT src FROM artifacts WHERE id=?", (linked["id"],)).fetchone()["src"]
+        _check(got == linked["id"] and src is None, f"link {got} src {src}")
+        n_art = con.execute("SELECT COUNT(*) c FROM artifacts").fetchone()["c"]
+    finally:
+        con.close()
+    os.environ["MKDB_FAIL_AFTER_ARTIFACT"] = "1"
+    try:
+        try:
+            put_artifact(home, "live", "r", "t", 1, "report", "boom", event_id=ev, data_dir=data)
+        except Fail as e:
+            _check("injected" in str(e), str(e))
+        else:
+            raise SystemExit("SELF-TEST FAIL: injected artifact failure did not raise")
+    finally:
+        os.environ.pop("MKDB_FAIL_AFTER_ARTIFACT", None)
+    con = open_project(home, data_dir=data)
+    try:
+        after = con.execute("SELECT COUNT(*) c FROM artifacts").fetchone()["c"]
+        still = con.execute("SELECT artifact_id FROM events WHERE id=?", (ev,)).fetchone()["artifact_id"]
+        _check(after == n_art and still == linked["id"], f"partial write artifacts {after} link {still}")
+    finally:
+        con.close()
+    big = "x" * ARTIFACT_MAX
+    ok = put_artifact(home, "live", "r", "t", 3, "report", big, data_dir=data)
+    _check(ok["rev"] == 1, f"256 KiB rev {ok}")
+    try:
+        put_artifact(home, "live", "r", "t", 3, "report", big + "y", data_dir=data)
+    except Fail as e:
+        _check("256" in str(e) or str(ARTIFACT_MAX) in str(e), str(e))
+    else:
+        raise SystemExit("SELF-TEST FAIL: oversized artifact accepted")
+    procs = []
+    for slot in (0, 1):
+        proc = multiprocessing.get_context("fork").Process(
+            target=_live_event_worker, args=(home, data, slot, 50))
+        proc.start()
+        procs.append(proc)
+    for proc in procs:
+        proc.join(120)
+        _check(proc.exitcode == 0, f"live writer exit {proc.exitcode}")
+    con = open_project(home, data_dir=data)
+    try:
+        ids = [r[0] for r in con.execute(
+            "SELECT id FROM events WHERE chan='bus' AND kind='info' AND text LIKE '%:%'")]
+        _check(len(ids) == 100 and len(set(ids)) == 100, f"raced ids {len(ids)} distinct {len(set(ids))}")
+    finally:
+        con.close()
+    lines = [e["text"] for e in timeline(home, "live", "r", "t", data) if e["chan"] == "bus"]
+    _check(lines[0] == "hello" and "0:0" in lines and "1:49" in lines, f"timeline {lines[:3]}…{lines[-1:]}")
+    _check(lines.index("0:0") < lines.index("0:49"), "timeline not in id order")
 
 
 def _single_writer():
