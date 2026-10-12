@@ -614,13 +614,20 @@ class Store:
         """The tasks columns import_history accepts, plus the file fields it has no column for."""
         deps = t.get("deps") or []
         owned = t.get("owned") or []
+        # the file view shows readiness as a flag on a planned task; the store shows it as the
+        # status. Mapping the flag back stops the next import from demoting a ready task.
+        status = t.get("status") or "planned"
+        # only a planned task becomes the kanban status `ready`. A routed task keeps `routed`
+        # and the ready flag: mapping it to `ready` made the next load publish it as `planned`.
+        if status == "planned" and t.get("ready"):
+            status = "ready"
         return {"id": t["id"], "parent": t.get("parent"), "type": "task",
                 "title": t.get("title") or "", "acceptance": t.get("acceptance"),
                 "owned": ",".join(owned) if isinstance(owned, list) else (owned or ""),
                 "deps": ",".join(deps) if isinstance(deps, list) else (deps or ""),
                 "parallel": 1 if t.get("parallel") else 0,
                 "route_json": _route_json(t),
-                "status": t.get("status") or "planned", "lane": t.get("lane"), "slot": t.get("slot"),
+                "status": status, "lane": t.get("lane"), "slot": t.get("slot"),
                 "branch": t.get("branch"), "pane": t.get("pane"), "round": t.get("round") or 0,
                 "verdict": t.get("verdict"), "updated": t.get("updated")}
 
@@ -790,6 +797,13 @@ class Store:
             finally:
                 con.close()
         self._rewritten.discard(rid)
+        if os.environ.get(ROOT_CRASH) != "1":
+            # catch_up repairs a card whose status disagrees with the task row, including one
+            # whose change_log sits below the watermark the transition above just advanced.
+            # promote_ready then moves dependents and writes their cards in one root transaction.
+            self.db().catch_up(self.home_dir(), STORE_PROJECT, data_dir=self.data)
+            self.db().promote_ready(self.home_dir(), STORE_PROJECT, rid,
+                                    data_dir=self.data, sync_root=True)
 
     def store_transition(self, rid, tid, to, note, line=None):
         """One status change through mkdb.transition, root card included (C5)."""
@@ -847,11 +861,21 @@ class Store:
                     route = json.loads(t["route_json"]) or {}
             deps = [d for d in (t["deps"] or "").split(",") if d]
             owned = [d for d in (t["owned"] or "").split(",") if d]
+            # the store status `ready` is the kanban column; the file view keeps `planned`
+            # and shows readiness with the `ready` flag, so the two views stay byte-identical
+            status = t["status"] or "planned"
+            ready = bool(extra.get("ready"))
+            # store `ready` is the kanban column. The published status is file_status when the
+            # promotion remembered one (`routed`), otherwise `planned`, plus the ready flag.
+            if status == "ready":
+                published = t["file_status"] if t["file_status"] in ("planned", "routed") else "planned"
+                status, ready = published, True
             extra.update({
                 "id": t["id"], "title": t["title"] or "", "parent": t["parent"],
-                "deps": deps, "owned": owned, "status": t["status"] or "planned",
+                "deps": deps, "owned": owned, "status": status,
                 "lane": t["lane"], "slot": t["slot"], "branch": t["branch"], "pane": t["pane"],
                 "round": t["round"] or 0, "verdict": t["verdict"], "updated": t["updated"],
+                "ready": ready,
                 "agent": route.get("agent"), "model": route.get("model"), "effort": route.get("effort"),
             })
             if route.get("route"):
@@ -1198,6 +1222,10 @@ class Store:
                         " VALUES (?,?,?,?,?,?,?,?)",
                         (active_id, "_index", 0, STORE_INDEX, 1, blob, now(), src))
                 con.commit()
+                # a dep already met in the imported history makes its dependent ready, the same
+                # rule a live transition applies. One move per task, through the single writer.
+                for rid in imported:
+                    self.db().promote_ready(imp_home, STORE_PROJECT, rid, sync_root=False)
                 counts = {}
                 for rid in imported:
                     counts[rid] = (
@@ -4163,6 +4191,90 @@ def store_self_test(tmp, env):
     once(["store", "enable"], stale)
     assert not os.path.exists(old), "stale enable dir survived"
     assert os.path.exists(young), "young enable dir was removed"
+
+    # M2 R2: `ready` survives the next ordinary write, and a regress demotes it.
+    # Through the real CLI, not mkdb.promote_ready directly.
+    rd = os.path.join(tmp, "ready")
+    once(["run", "init", "--id", "rr", "--feature", "Ready", "--branch", "br"], rd)
+    once(["store", "enable"], rd)
+    once(["task", "add", "--id", "A", "--title", "dep", "--run", "rr"], rd)
+    once(["task", "add", "--id", "B", "--title", "needs A", "--deps", "A", "--run", "rr"], rd)
+    once(["task", "add", "--id", "Z", "--title", "unrelated", "--run", "rr"], rd)
+    once(["task", "set", "A", "status=done", "--run", "rr"], rd)
+
+    def store_status(tid):
+        c = _mkdb().open_project(os.path.join(rd, ".mk-home"), STORE_PROJECT, data_dir=rd)
+        try:
+            return c.execute("SELECT status FROM tasks WHERE run='rr' AND id=?", (tid,)).fetchone()["status"]
+        finally:
+            c.close()
+
+    assert store_status("B") == "ready", store_status("B")
+    view = once(["task", "get", "B", "--run", "rr"], rd)["task"]
+    assert view["status"] == "planned" and view["ready"] is True, view  # file view keeps the flag
+    # the next unrelated write must NOT demote B
+    once(["task", "set", "Z", "status=building", "--run", "rr"], rd)
+    assert store_status("B") == "ready", "an unrelated task set demoted B to " + store_status("B")
+    assert store_status("Z") == "building"
+    # the root card shows Ready
+    _mkdb().catch_up(os.path.join(rd, ".mk-home"), STORE_PROJECT, data_dir=rd)
+    cards = _mkdb().cards(os.path.join(rd, ".mk-home"), STORE_PROJECT)
+    col = next(c["col"] for c in cards if c["task"] == "B" and c["run"] == "rr")
+    assert col == "Ready", col
+    # a regress demotes: A done -> fix puts B back to planned
+    once(["task", "set", "A", "status=fix", "--run", "rr"], rd)
+    assert store_status("B") == "planned", "a regressed dep left B " + store_status("B")
+    view = once(["task", "get", "B", "--run", "rr"], rd)["task"]
+    assert view["ready"] is False, view
+
+    # M2 R3: a routed task whose deps are met stays routed, in both orders.
+    rt = os.path.join(tmp, "routed")
+    once(["run", "init", "--id", "rr", "--feature", "Routed", "--branch", "br"], rt)
+    once(["store", "enable"], rt)
+    once(["task", "add", "--id", "A", "--title", "dep", "--run", "rr"], rt)
+    once(["task", "add", "--id", "B", "--title", "needs A", "--deps", "A", "--run", "rr"], rt)
+    once(["task", "add", "--id", "Z", "--title", "unrelated", "--run", "rr"], rt)
+    once(["task", "set", "A", "status=done", "--run", "rr"], rt)
+    got = once(["task", "set", "B", "status=routed", "--run", "rr"], rt)
+    assert got["task"]["status"] == "routed" and got["task"]["ready"] is True, got["task"]
+    once(["task", "set", "Z", "status=building", "--run", "rr"], rt)
+    view = once(["task", "get", "B", "--run", "rr"], rt)["task"]
+    assert view["status"] == "routed" and view["ready"] is True, view
+
+    rt2 = os.path.join(tmp, "routed2")
+    once(["run", "init", "--id", "rr", "--feature", "Routed", "--branch", "br"], rt2)
+    once(["store", "enable"], rt2)
+    once(["task", "add", "--id", "A", "--title", "dep", "--run", "rr"], rt2)
+    once(["task", "add", "--id", "B", "--title", "needs A", "--deps", "A", "--run", "rr"], rt2)
+    once(["task", "set", "B", "status=routed", "--run", "rr"], rt2)
+    once(["task", "set", "A", "status=done", "--run", "rr"], rt2)
+    view = once(["task", "get", "B", "--run", "rr"], rt2)["task"]
+    assert view["status"] == "routed" and view["ready"] is True, view
+
+    # M2 R4: a routed task with met deps is not demoted and re-promoted on every write.
+    # Three unrelated writes after the promotion add no change_log row for B.
+    ch = os.path.join(tmp, "churn")
+    once(["run", "init", "--id", "rr", "--feature", "Churn", "--branch", "br"], ch)
+    once(["store", "enable"], ch)
+    once(["task", "add", "--id", "A", "--title", "dep", "--run", "rr"], ch)
+    once(["task", "add", "--id", "B", "--title", "needs A", "--deps", "A", "--run", "rr"], ch)
+    once(["task", "add", "--id", "Z", "--title", "unrelated", "--run", "rr"], ch)
+    once(["task", "set", "A", "status=done", "--run", "rr"], ch)
+    once(["task", "set", "B", "status=routed", "--run", "rr"], ch)
+
+    def b_changes():
+        c = _mkdb().open_project(os.path.join(ch, ".mk-home"), STORE_PROJECT, data_dir=ch)
+        try:
+            return c.execute("SELECT COUNT(*) n FROM change_log WHERE run='rr' AND task='B'").fetchone()["n"]
+        finally:
+            c.close()
+
+    after_promote = b_changes()
+    for status in ("building", "verifying", "review"):
+        once(["task", "set", "Z", "status=" + status, "--run", "rr"], ch)
+    assert b_changes() == after_promote, (after_promote, b_changes())
+    view = once(["task", "get", "B", "--run", "rr"], ch)["task"]
+    assert view["status"] == "routed" and view["ready"] is True, view
 
 
 if __name__ == "__main__":
