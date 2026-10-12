@@ -78,6 +78,6 @@ The catalog decides the hook. `todo_hook: yes` means the recipe was installed OU
 
 ## Reference
 
-- `reference/lane-rules.md` — builder and reviewer rules, R1-R29.
+- `reference/lane-rules.md` — builder and reviewer rules, R1-R32. R32: `rtk` only for read-heavy exploration; raw or `rtk proxy` when the exact text drives a decision; never `rtk test`.
 - `reference/status-contract.md` — the lane status file this script writes, R1-R42.
 - `reference/git-guard.md` — what the lane-local `git` wrapper refuses, G1-G30.

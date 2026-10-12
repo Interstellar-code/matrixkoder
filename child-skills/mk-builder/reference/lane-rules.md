@@ -226,6 +226,9 @@ checkable contract. Rules whose remainder stays per-brief say **(B)** and carry 
   the transcript shows the wait loop in the same turn as the start, and `done` warns when a
   lane child is still running.
 
+- **R32. (new)** Explore with `rtk grep`, `rtk read`, `rtk ls` and `rtk git status|log` when `rtk` is on PATH; if it is not, skip it silently and use the raw command. Use raw output, or `rtk proxy <cmd>`, for any text a decision reads exactly: mk-state, mk-lane, mk-bus and mk-builder JSON, `git diff --stat`, `git log --oneline` subjects, the selftest summary line, and failing test names. Never `rtk test` (it drops failing test names). The guard treats `rtk` and `rtk proxy` as wrappers, so a banned command stays banned inside them (R4). Codex is never a builder.
+  **Why:** grep, reads and diffs are where a builder's tokens go, and `rtk` cut those 62–73% (`mk-improvements.md` item 53); filters that rewrite JSON, subjects or the selftest line hide what the lane decides on (item 52). **Check:** decision text in the transcript is raw or `rtk proxy`, and no `rtk test`.
+
 ## 5. Research Part B mapping (S rows → rules)
 
 | row (research Part B) | convention (short) | rule | class note |
