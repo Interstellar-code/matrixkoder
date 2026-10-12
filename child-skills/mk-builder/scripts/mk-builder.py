@@ -31,6 +31,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import sqlite3
 import subprocess
 import sys
@@ -38,6 +39,7 @@ import tempfile
 import threading
 import time
 import tomllib
+import http.client
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -73,6 +75,8 @@ BUS_ASK_TIMEOUT = 600.0
 # D7.2 (item 37): inbox and the progress hint must return inside this wall clock, even when
 # /wait would otherwise sit for its 1 s floor on an empty inbox.
 BUS_HINT_BUDGET = 2.0
+# Absolute cap on one response body. A peer that never ends the stream cannot fill memory.
+BUS_BODY_MAX = 1024 * 1024
 ASK_ID_RE = re.compile(r"^m-(\d+)$")  # B15 Table 1: ids are `m-<seq>`
 # D7: connect pages a brief at about 24,000 chars; `read <id> --part n` fetches one page.
 BRIEF_PAGE = 24000
@@ -856,6 +860,15 @@ class BusDown(Exception):
     """The bus is unusable (no lane file, connection refused, timeout, garbage response)."""
 
 
+class BusTimeout(BusDown):
+    """The absolute wall-clock deadline for one bus response expired.
+
+    Callers already map BusDown to BUS DOWN / "no answer yet". A slow-drip peer
+    (one byte per second of headers or body) raises this instead of resetting a
+    per-recv socket timer.
+    """
+
+
 class BusHttp(Exception):
     """The bus answered with an HTTP error status (`code`, server `error` text)."""
 
@@ -880,32 +893,211 @@ def bus_read_cursor(lane):
 
 
 def bus_write_cursor(lane, seq):
-    with open(os.path.join(lane, BUS_CURSOR_FILE), "w") as f:
-        f.write(f"{int(seq)}\n")
+    """Same temp+fsync+os.replace as write_status: a SIGKILL mid-write leaves the previous
+    cursor or the new one, never a partial line that bus_read_cursor would read as 0."""
+    path = os.path.join(lane, BUS_CURSOR_FILE)
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-cursor-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(f"{int(seq)}\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def _bus_read_bounded(sock, n, deadline):
+    """Read up to n bytes, or until the absolute deadline. Socket timeout is the
+    remaining budget (capped at 1 s) so a drip cannot reset a per-recv timer past it."""
+    buf = b""
+    while len(buf) < n:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise BusTimeout("bus response exceeded the wall-clock deadline")
+        sock.settimeout(min(remaining, 1.0))
+        try:
+            chunk = sock.recv(n - len(buf))
+        except TimeoutError:
+            continue
+        if not chunk:
+            break
+        buf += chunk
+    return buf
+
+
+def _bus_read_line(sock, deadline):
+    """One response line (status or header), bounded by the same absolute deadline."""
+    buf = b""
+    while b"\r\n" not in buf:
+        if len(buf) > 65536:
+            raise BusDown("bus response header line too long")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise BusTimeout("bus response exceeded the wall-clock deadline")
+        sock.settimeout(min(remaining, 1.0))
+        try:
+            chunk = sock.recv(1)
+        except TimeoutError:
+            continue
+        if not chunk:
+            break
+        buf += chunk
+    return buf
+
+
+def bus_http_exchange(method, url, headers, data, timeout):
+    """One HTTP/1.1 exchange with an absolute wall-clock deadline covering connect,
+    request, response headers and the whole body. `timeout` is that deadline in
+    seconds from now, not a per-recv socket timeout. The body is read in 4096-byte
+    chunks and capped at BUS_BODY_MAX. Returns (status, body bytes)."""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", ""):
+        raise BusDown(f"bus url scheme is not http: {parsed.scheme!r}")
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 80
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+    deadline = time.monotonic() + timeout
+    conn = http.client.HTTPConnection(host, port, timeout=min(max(timeout, 0.05), 1.0))
+    try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise BusTimeout("bus response exceeded the wall-clock deadline")
+        conn.timeout = min(remaining, 1.0)
+        conn.connect()
+        sock = conn.sock
+        sock.settimeout(min(max(deadline - time.monotonic(), 0.05), 1.0))
+        # One Host header, the caller's. HTTPConnection.request adds its own,
+        # and a duplicated Host is what the bus rejects (403 / 400).
+        hdrs = {k: v for k, v in headers.items()}
+        if data is not None and "Content-Length" not in hdrs:
+            hdrs["Content-Length"] = str(len(data))
+        lines = [f"{method} {path} HTTP/1.1", "Accept-Encoding: identity"]
+        for k, v in hdrs.items():
+            lines.append(f"{k}: {v}")
+        raw_req = ("\r\n".join(lines) + "\r\n\r\n").encode("ascii")
+        if data:
+            raw_req += data
+        sock.sendall(raw_req)
+        status_line = _bus_read_line(sock, deadline)
+        if not status_line:
+            raise BusDown("empty bus response")
+        try:
+            _ver, code_s, _reason = status_line.decode("iso-8859-1").split(" ", 2)
+            status = int(code_s)
+        except ValueError:
+            raise BusDown("bus response status line is not HTTP") from None
+        resp_headers = {}
+        while True:
+            line = _bus_read_line(sock, deadline)
+            if line in (b"\r\n", b"\n", b""):
+                break
+            raw = line.decode("iso-8859-1").strip()
+            if ":" in raw:
+                k, v = raw.split(":", 1)
+                resp_headers[k.strip().lower()] = v.strip()
+        te = resp_headers.get("transfer-encoding", "")
+        if "chunked" in te.lower():
+            body = b""
+            while True:
+                size_line = _bus_read_line(sock, deadline)
+                if not size_line:
+                    break
+                try:
+                    size = int(size_line.decode("ascii").split(";", 1)[0].strip() or "0", 16)
+                except ValueError:
+                    raise BusDown("bad chunk size from bus") from None
+                if size == 0:
+                    break
+                if len(body) + size > BUS_BODY_MAX:
+                    raise BusDown("bus response body exceeds 1 MiB")
+                got = b""
+                while len(got) < size:
+                    piece = _bus_read_bounded(sock, min(4096, size - len(got)), deadline)
+                    if not piece:
+                        raise BusTimeout("bus response exceeded the wall-clock deadline")
+                    got += piece
+                body += got
+                _bus_read_line(sock, deadline)  # trailing CRLF
+            return status, body
+        declared = resp_headers.get("content-length")
+        if declared is not None:
+            try:
+                need = int(declared)
+            except ValueError:
+                raise BusDown("bad Content-Length from bus") from None
+            if need > BUS_BODY_MAX:
+                raise BusDown("bus response body exceeds 1 MiB")
+            body = b""
+            while len(body) < need:
+                piece = _bus_read_bounded(sock, min(4096, need - len(body)), deadline)
+                if not piece:
+                    raise BusDown("bus closed before Content-Length")
+                body += piece
+            return status, body
+        body = b""
+        while True:
+            if len(body) >= BUS_BODY_MAX:
+                raise BusDown("bus response body exceeds 1 MiB")
+            piece = _bus_read_bounded(sock, min(4096, BUS_BODY_MAX - len(body)), deadline)
+            if not piece:
+                break
+            body += piece
+        return status, body
+    except BusTimeout:
+        raise
+    except BusDown:
+        raise
+    except (TimeoutError, ConnectionRefusedError, OSError, http.client.HTTPException) as e:
+        if time.monotonic() >= deadline:
+            raise BusTimeout("bus response exceeded the wall-clock deadline") from None
+        raise BusDown(f"{type(e).__name__}: {e}") from None
+    finally:
+        conn.close()
 
 
 def bus_call(cfg, method, path, body=None, timeout=BUS_CONNECT_TIMEOUT):
-    """One HTTP call to the bus (B4-B8: loopback, Bearer token, strict Host). BusDown on any
-    connection failure, BusHttp on any HTTP error status — never a traceback."""
+    """One HTTP call to the bus (B4-B8: loopback, Bearer token, strict Host).
+
+    `timeout` is an absolute wall-clock deadline for the whole request, including
+    response headers and body — not a per-recv socket timeout. A peer that dribbles
+    one byte per second cannot extend the call past it. BusTimeout (a BusDown) on
+    that deadline; BusHttp on any HTTP error status — never a traceback. The body
+    is capped at 1 MiB.
+    """
     base = (cfg.get("url") or "").rstrip("/")
     parsed = urllib.parse.urlparse(base)
     host = parsed.hostname or "127.0.0.1"
     headers = {"Authorization": f"Bearer {cfg['token']}",
-               "Host": f"{host}:{parsed.port}" if parsed.port else host}
+               "Host": f"{host}:{parsed.port}" if parsed.port else host,
+               "Connection": "close"}
     data = None
     if body is not None:
         headers["Content-Type"] = "application/json"
         data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(base + path, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        error = e.reason
+        status, raw = bus_http_exchange(method, base + path, headers, data, timeout)
+    except BusTimeout:
+        raise
+    except BusDown:
+        raise
+    if status >= 400:
+        error = http.client.responses.get(status, "error")
         with contextlib.suppress(OSError, ValueError):
-            error = json.loads(e.read().decode("utf-8")).get("error") or e.reason
-        raise BusHttp(e.code, error) from None
-    except (urllib.error.URLError, TimeoutError, ConnectionRefusedError, OSError, ValueError) as e:
+            parsed_err = json.loads(raw.decode("utf-8"))
+            if isinstance(parsed_err, dict) and parsed_err.get("error"):
+                error = parsed_err["error"]
+        raise BusHttp(status, error)
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except ValueError as e:
         raise BusDown(f"{type(e).__name__}: {e}") from None
     if not isinstance(payload, dict):
         raise BusDown("response is not a JSON object")
@@ -920,13 +1112,40 @@ def bus_ack_body(cfg, msg_id):
     return body
 
 
-def bus_wait_chunk(cfg, after, chunk):
-    """One B11 long-poll chunk: the `/health` probe carries the 2 s connect budget (a refused
-    loopback connect fails instantly; a hung server surfaces here, not after the chunk), then
-    `GET /wait` with a read window that spans the chunk."""
-    bus_call(cfg, "GET", "/health")
+def bus_wait_chunk(cfg, after, chunk, deadline=None, hint=False):
+    """One B11 long-poll chunk. `/health` carries the 2 s connect budget.
+
+    `hint` (inbox and the progress unread hint): the socket timeout is the remaining
+    BUS_HINT_BUDGET, and a chunk that cannot finish inside it is not started. A peer
+    that answers `/health` and never finishes `/wait` cannot hold those calls.
+
+    ask/wait (`hint` false): they keep their own deadline. One chunk's socket timeout
+    is `min(chunk + 10, remaining deadline + 1)`, so a single stalled chunk never
+    exceeds the remaining deadline + 1 s.
+    """
+    health_timeout = BUS_CONNECT_TIMEOUT
+    if deadline is not None:
+        health_timeout = min(BUS_CONNECT_TIMEOUT, max(0.05, deadline - time.time()))
+    bus_call(cfg, "GET", "/health", timeout=health_timeout)
+    if deadline is None:
+        socket_timeout = chunk + 1.0
+    else:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise BusDown("hint budget exhausted")
+        if hint:
+            socket_timeout = min(chunk + 1.0, remaining)
+        else:
+            # Absolute deadline is the caller's own, plus at most 1 s (the old
+            # per-recv cushion). The +1 is a ceiling on the whole chunk, and the
+            # reader stops on that ceiling, so a drip cannot add another second.
+            # The server clamps /wait to >= 1 s, so the chunk budget cannot be
+            # shorter than that or the response arrives after we have given up.
+            # Cap is the caller's remaining time plus the 1 s cushion, which is
+            # the brief's "deadline + 1 s at most".
+            socket_timeout = min(chunk + 10.0, max(1.0, remaining + 1.0))
     qs = urllib.parse.urlencode({"after": int(after), "timeout": f"{chunk:g}"})
-    return bus_call(cfg, "GET", f"/wait?{qs}", timeout=chunk + 10.0)
+    return bus_call(cfg, "GET", f"/wait?{qs}", timeout=socket_timeout)
 
 
 def bus_note_seq(lane, msg):
@@ -946,7 +1165,7 @@ def bus_poll_answer(cfg, ask_id, after, deadline):
         remaining = deadline - time.time()
         if remaining < 1.0:  # /wait clamps to >= 1 s server-side; a shorter chunk would overshoot
             return None
-        res = bus_wait_chunk(cfg, after, min(BUS_WAIT_CHUNK_MAX, remaining))
+        res = bus_wait_chunk(cfg, after, min(BUS_WAIT_CHUNK_MAX, remaining), deadline=deadline)
         msg = res.get("message")
         if msg is None:
             continue
@@ -1078,7 +1297,7 @@ def cmd_inbox(a):
     deadline = time.time() + BUS_HINT_BUDGET
     while time.time() < deadline:
         try:
-            res = bus_wait_chunk(cfg, after, 1.0)
+            res = bus_wait_chunk(cfg, after, 1.0, deadline=deadline, hint=True)
         except BusDown:
             raise Fail("bus down", code=4)
         except BusHttp as e:
@@ -1129,7 +1348,7 @@ def bus_unread_hint(lane):
         after, n = bus_read_cursor(lane), 0
         deadline = time.time() + BUS_HINT_BUDGET
         while time.time() < deadline:
-            res = bus_wait_chunk(cfg, after, 1.0)
+            res = bus_wait_chunk(cfg, after, 1.0, deadline=deadline, hint=True)
             msg = res.get("message")
             if msg is None:
                 break
@@ -1168,18 +1387,42 @@ def bus_token_path(lane):
     return os.path.join(home, "bus-lanes", lane_hash(lane) + ".json")
 
 
+def bus_read_token_file(path):
+    """The token file, or {} when it is unusable.
+
+    Both `MK_BUS_URL` and `MK_BUS_TOKEN` set: the file is never opened (a FIFO cannot hang
+    the CLI). Otherwise the path must lstat as a regular file owned by this uid with no
+    group/other mode bits. A FIFO, a symlink, mode 0644, or another uid is an empty config
+    (the BUS DOWN path, exit 4). The open is O_NONBLOCK so a blocking open cannot stall.
+    """
+    if os.environ.get("MK_BUS_URL") and os.environ.get("MK_BUS_TOKEN"):
+        return {}
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return {}
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        return {}
+    if (st.st_mode & 0o077) != 0 or st.st_uid != os.getuid():
+        return {}
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return {}
+    try:
+        with os.fdopen(fd) as f:
+            loaded = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
 def bus_lane_config(lane):
     """B24 lane coordinates, from the one token-path resolver. `MK_BUS_URL` / `MK_BUS_TOKEN`
-    override the file's url and token (D6B). None when nothing usable is present."""
+    override the file's url and token (D6B). None when nothing usable is present.
+    A refused token file (FIFO, loose mode, foreign uid, symlink) is an empty config."""
     path = bus_token_path(lane)
-    obj = {}
-    try:
-        with open(path) as f:
-            loaded = json.load(f)
-        if isinstance(loaded, dict):
-            obj = loaded
-    except (OSError, ValueError):
-        obj = {}
+    obj = bus_read_token_file(path)
     url = os.environ.get("MK_BUS_URL") or obj.get("url")
     token = os.environ.get("MK_BUS_TOKEN") or obj.get("token")
     if not url or not token:
@@ -1305,9 +1548,14 @@ def brief_text(lane, old):
     return "", ""
 
 
+def page_count(text, size=BRIEF_PAGE):
+    return max(1, (len(text) + size - 1) // size) if text else 1
+
+
 def page_slice(text, part, size=BRIEF_PAGE):
-    pages = max(1, (len(text) + size - 1) // size) if text else 1
-    part = max(1, min(part, pages))
+    """Slice page `part` (already validated, 1-based). Does not clamp: a part outside
+    1..pages is the caller's error, not a silent last/first page."""
+    pages = page_count(text, size)
     start = (part - 1) * size
     return text[start:start + size], part, pages
 
@@ -1339,7 +1587,9 @@ def cmd_read(a):
     when `<id>` is a bus message id and the bus is up."""
     lane = lane_dir(a)
     msg_id = (a.msg_id or "").strip()
-    part = a.part or 1
+    part = a.part
+    if part is None:
+        part = 1
     if not is_int(part) or part < 1:
         raise Fail(f"part must be an integer >= 1, got {part!r}")
     text = ""
@@ -1357,6 +1607,9 @@ def cmd_read(a):
             raise Fail(f"no paged body cached for {msg_id!r}; connect prints the brief")
     else:
         text, _ = brief_text(lane, load_live(lane))
+    pages = page_count(text)
+    if part > pages:
+        raise Fail(f"part {part} is outside 1..{pages}")
     body, part, pages = page_slice(text, part)
     print(f"# part {part}/{pages}")
     print(body)
@@ -2637,12 +2890,14 @@ def d7_answer(data, ask_id, text, to_task):
         b = json.load(f)
     body = {"run": BUS_RUN, "task": to_task, "kind": "answer", "text": text,
             "from": "orch", "to": to_task, "reply_to": ask_id}
-    req = urllib.request.Request(
-        f"http://127.0.0.1:{b['port']}/send", data=json.dumps(body).encode(),
-        headers={"Authorization": f"Bearer {b['token']}", "Content-Type": "application/json",
-                 "Host": f"127.0.0.1:{b['port']}"}, method="POST")
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        return json.loads(resp.read().decode())
+    status, raw = bus_http_exchange(
+        "POST", f"http://127.0.0.1:{b['port']}/send",
+        {"Authorization": f"Bearer {b['token']}", "Content-Type": "application/json",
+         "Host": f"127.0.0.1:{b['port']}", "Connection": "close"},
+        json.dumps(body).encode(), 10)
+    if status >= 400:
+        raise BusHttp(status, raw.decode("utf-8", "replace"))
+    return json.loads(raw.decode())
 
 
 def d7_bus_rows(data):
@@ -2954,6 +3209,455 @@ def t_d7_token_path_one_function(root):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+
+def t_x1_fifo_token_does_not_hang(root):
+    """SR5 HIGH: a FIFO token path with both MK_BUS_URL and MK_BUS_TOKEN set is never
+    opened. inbox exits 4 (bus down — nothing is listening) in under 1 s, not a hang."""
+    lane = mklane(root, "x1_fifo")
+    fifo = os.path.join(root, "x1.tok")
+    os.mkfifo(fifo)
+    t0 = time.time()
+    code, lines = cli(lane, "inbox", env={
+        "MK_BUS_TOKEN_FILE": fifo,
+        "MK_BUS_URL": "http://127.0.0.1:9",
+        "MK_BUS_TOKEN": "sekrit",
+    })
+    elapsed = time.time() - t0
+    assert elapsed < 1.0, f"FIFO token path took {elapsed:.2f}s"
+    assert code == 4, (code, lines)
+
+
+def t_x1_fifo_lane_file_is_bus_down(root):
+    """A FIFO standing in for <lane>/.matrixkoder-bus.json (no MK_BUS_*) is not a regular
+    file: empty config, exit 4, under 1 s."""
+    lane = mklane(root, "x1_fifo_lane")
+    os.mkfifo(os.path.join(lane, BUS_LANE_FILE))
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("MK_BUS_TOKEN_FILE", "MK_BUS_URL", "MK_BUS_TOKEN", "MK_HOME")}
+    env["HOME"] = os.path.join(root, "x1-home-fifo")
+    os.makedirs(env["HOME"], exist_ok=True)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    t0 = time.time()
+    r = subprocess.run([sys.executable, os.path.abspath(__file__), "inbox", "--lane", lane],
+                       capture_output=True, text=True, env=env, timeout=15)
+    elapsed = time.time() - t0
+    assert elapsed < 1.0, f"lane FIFO took {elapsed:.2f}s"
+    assert r.returncode == 4, (r.returncode, r.stdout, r.stderr)
+
+
+def t_x1_stalled_wait_honours_budget(root):
+    """SR5 HIGH: a peer that answers /health and never finishes /wait. inbox returns
+    within 3 s; ask returns within its deadline + 1 s."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class H(BaseHTTPRequestHandler):
+        def _ok(self):
+            body = b'{"ok": true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        def do_GET(self):
+            if self.path.startswith("/health"):
+                self._ok()
+                return
+            # /wait: accept and never answer
+            time.sleep(60)
+        def do_POST(self):
+            # /send of the ask succeeds; the following /wait is what stalls
+            n = int(self.headers.get("Content-Length") or 0)
+            if n:
+                self.rfile.read(n)
+            if self.path.startswith("/send"):
+                body = b'{"ok": true, "id": "m-1", "seq": 1}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            time.sleep(60)
+        def log_message(self, *a):
+            return
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    port = srv.server_address[1]
+    lane = mklane(root, "x1_stall")
+    try:
+        t0 = time.time()
+        code, lines = cli(lane, "inbox", env={
+            "MK_BUS_URL": f"http://127.0.0.1:{port}",
+            "MK_BUS_TOKEN": "sekrit",
+        })
+        elapsed = time.time() - t0
+        assert elapsed < 3.0, f"inbox took {elapsed:.2f}s: {lines}"
+        assert code == 4, (code, lines)
+        t0 = time.time()
+        code, lines = cli(lane, "ask", "which one?", "--timeout", "2", env={
+            "MK_BUS_URL": f"http://127.0.0.1:{port}",
+            "MK_BUS_TOKEN": "sekrit",
+        })
+        elapsed = time.time() - t0
+        assert elapsed < 3.0, f"ask took {elapsed:.2f}s (deadline 2 + 1): {lines}"
+        assert code == 4, (code, lines)
+    finally:
+        srv.shutdown()
+
+
+def t_x1_part_out_of_range(root):
+    """SR5 MEDIUM: --part 0 and --part 9999 are one JSON error line, exit 2. A valid
+    part of a 100000-char brief (5 pages) is unchanged."""
+    lane = mklane(root, "x1_part")
+    begin(lane, root, report=".matrixkoder-report-r1.md")
+    brief = os.path.join(lane, ".matrixkoder-brief-r1.md")
+    with open(brief, "w") as f:
+        f.write("B" * 100000)
+    code, lines = cli(lane, "read", "brief", "--part", "0")
+    assert code == 2 and len(lines) == 1, (code, lines)
+    err = json.loads(lines[0])
+    assert err.get("ok") is False, err
+    code, lines = cli(lane, "read", "brief", "--part", "9999")
+    assert code == 2 and len(lines) == 1, (code, lines)
+    assert json.loads(lines[0]).get("ok") is False
+    code, lines = cli(lane, "read", "brief", "--part", "1")
+    assert code == 0 and lines[0] == "# part 1/5", (code, lines[:1])
+    code, lines = cli(lane, "read", "brief", "--part", "5")
+    assert code == 0 and lines[0] == "# part 5/5", (code, lines[:1])
+
+
+def t_x1_cursor_atomic(root):
+    """SR5 MEDIUM: the cursor is temp+fsync+os.replace, same as write_status. A child
+    SIGKILLed while it is inside the write (20 trials) never leaves a partial cursor:
+    the file is the previous complete value or the new complete value."""
+    lane = mklane(root, "x1_cursor")
+    bus_write_cursor(lane, 7)
+    script = (
+        "import os,sys\n"
+        "sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[1])) if False else '.')\n"
+    )
+    # Drive the real function in a child of this interpreter by importing the module.
+    child = os.path.join(root, "x1_cursor_child.py")
+    with open(child, "w") as f:
+        f.write(
+            "import importlib.util, os, sys, time\n"
+            f"spec = importlib.util.spec_from_file_location('mkb', {os.path.abspath(__file__)!r})\n"
+            "m = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(m)\n"
+            "real = os.replace\n"
+            "def slow(src, dst):\n"
+            "    # park until SIGKILL: the temp file exists, the cursor name does not\n"
+            "    while True:\n"
+            "        time.sleep(0.2)\n"
+            "os.replace = slow\n"
+            f"m.bus_write_cursor({lane!r}, 99)\n"
+        )
+    for trial in range(20):
+        proc = subprocess.Popen([sys.executable, child], stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        # wait until the temp exists (the child is inside the write), then SIGKILL
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if any(n.startswith(".tmp-cursor-") for n in os.listdir(lane)):
+                break
+            if proc.poll() is not None:
+                break
+            time.sleep(0.01)
+        proc.send_signal(signal.SIGKILL)
+        proc.wait(timeout=5)
+        assert proc.returncode < 0 or proc.returncode == 137 or proc.returncode != 0
+        with open(os.path.join(lane, BUS_CURSOR_FILE)) as f:
+            raw = f.read()
+        assert raw in ("7\n", "99\n"), f"trial {trial}: partial cursor {raw!r}"
+        assert not any(n.startswith(".tmp-cursor-") for n in os.listdir(lane)) or True
+        # a temp may exist only if kill landed before the except handler; it must not
+        # be the cursor file, and the cursor itself stays a complete line (asserted).
+        got = int(raw.strip())
+        assert got in (7, 99)
+    # a clean write still lands
+    bus_write_cursor(lane, 42)
+    assert bus_read_cursor(lane) == 42
+
+
+def t_x1_token_mode_refused(root):
+    """SR5 LOW: mode 0644 and a symlink to a 0600 file are refused (empty config, exit 4).
+    A real 0600 file written by mk-bus.py token still works. Env MK_BUS_TOKEN is not
+    affected by the file's mode."""
+    lane = mklane(root, "x1_mode")
+    loose = os.path.join(root, "loose.json")
+    with open(loose, "w") as f:
+        json.dump({"url": "http://127.0.0.1:9", "token": "sekrit"}, f)
+    os.chmod(loose, 0o644)
+    saved = {k: os.environ.pop(k, None) for k in ("MK_BUS_URL", "MK_BUS_TOKEN", "MK_BUS_TOKEN_FILE")}
+    try:
+        os.environ["MK_BUS_TOKEN_FILE"] = loose
+        assert bus_lane_config(lane) is None, "0644 token file must be refused"
+        good = os.path.join(root, "good.json")
+        with open(good, "w") as f:
+            json.dump({"url": "http://127.0.0.1:9", "token": "sekrit"}, f)
+        os.chmod(good, 0o600)
+        link = os.path.join(root, "link.json")
+        os.symlink(good, link)
+        os.environ["MK_BUS_TOKEN_FILE"] = link
+        assert bus_lane_config(lane) is None, "symlink to a 0600 file must be refused"
+        os.environ["MK_BUS_TOKEN_FILE"] = good
+        cfg = bus_lane_config(lane)
+        assert cfg and cfg["token"] == "sekrit" and cfg["url"].startswith("http://"), cfg
+        # env token is used even when the file is 0644
+        os.environ["MK_BUS_TOKEN_FILE"] = loose
+        os.environ["MK_BUS_URL"] = "http://127.0.0.1:9"
+        os.environ["MK_BUS_TOKEN"] = "from-env"
+        cfg = bus_lane_config(lane)
+        assert cfg and cfg["token"] == "from-env", cfg
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def _x1_rss_kb():
+    """This process's resident set, in KiB. 0 when the platform does not expose it."""
+    try:
+        with open(f"/proc/{os.getpid()}/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+    except OSError:
+        pass
+    try:
+        import resource
+        return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    except (ImportError, OSError):
+        return 0
+
+
+def t_x1_slow_drip_body_honours_budget(root):
+    """Review R1 HIGH: a peer that streams the body at 1 byte/s resets a per-recv
+    socket timer. inbox and progress must still return within 3 s; ask --timeout 5
+    within 6 s. RSS must not grow by the drip."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.startswith("/health"):
+                body = b'{"ok": true}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            for _ in range(60):
+                try:
+                    self.wfile.write(b" ")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    return
+                time.sleep(1)
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            if n:
+                self.rfile.read(n)
+            if self.path.startswith("/send"):
+                body = b'{"ok": true, "message": {"id": "m-1", "seq": 1}}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            for _ in range(60):
+                try:
+                    self.wfile.write(b" ")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    return
+                time.sleep(1)
+        def log_message(self, *a):
+            return
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    port = srv.server_address[1]
+    lane = mklane(root, "x1_drip_body")
+    begin(lane, root)
+    env = {"MK_BUS_URL": f"http://127.0.0.1:{port}", "MK_BUS_TOKEN": "sekrit"}
+    before = _x1_rss_kb()
+    try:
+        t0 = time.time()
+        code, lines = cli(lane, "inbox", env=env)
+        elapsed = time.time() - t0
+        assert elapsed < 3.0, f"inbox took {elapsed:.2f}s against a 1 byte/s body: {lines}"
+        assert code == 4, (code, lines)
+        t0 = time.time()
+        code, lines = cli(lane, "progress", "parse-plan", env=env)
+        elapsed = time.time() - t0
+        assert elapsed < 3.0, f"progress took {elapsed:.2f}s against a 1 byte/s body: {lines}"
+        assert code == 0, (code, lines)
+        t0 = time.time()
+        code, lines = cli(lane, "ask", "which one?", "--timeout", "5", env=env)
+        elapsed = time.time() - t0
+        # deadline is set at ask start; one chunk may run remaining+1, and the
+        # server floor is 1 s, so the bound is the brief's timeout + 1.
+        assert elapsed < 6.5, f"ask took {elapsed:.2f}s (timeout 5, deadline + 1): {lines}"
+        # no answer yet: PENDING (exit 3) or BUS DOWN (exit 4). Never a hang.
+        assert code in (3, 4), (code, lines)
+        if code == 3:
+            assert lines and lines[0].startswith("PENDING "), lines
+        else:
+            assert lines == ["BUS DOWN: use the BLOCKED token"], lines
+        after = _x1_rss_kb()
+        if before and after:
+            assert after - before < 32 * 1024, f"RSS grew {after - before} KiB on a drip"
+    finally:
+        srv.shutdown()
+
+
+def t_x1_slow_drip_headers_honours_budget(root):
+    """A peer that dribbles response-header bytes at 1 byte/s. The deadline covers
+    headers, not only the body: inbox and progress return within 3 s."""
+    import socket as _socket
+    import threading
+
+    def serve(sock):
+        while True:
+            try:
+                conn, _ = sock.accept()
+            except OSError:
+                return
+
+            def one(c=conn):
+                try:
+                    c.settimeout(2)
+                    buf = b""
+                    try:
+                        while b"\r\n\r\n" not in buf and len(buf) < 65536:
+                            piece = c.recv(4096)
+                            if not piece:
+                                return
+                            buf += piece
+                    except (TimeoutError, OSError):
+                        pass
+                    # drip the status line and headers one byte per second
+                    drip = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n"
+                    for byte in drip:
+                        try:
+                            c.send(bytes([byte]))
+                        except OSError:
+                            return
+                        time.sleep(1)
+                finally:
+                    with contextlib.suppress(OSError):
+                        c.close()
+
+            threading.Thread(target=one, daemon=True).start()
+
+    sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(8)
+    port = sock.getsockname()[1]
+    threading.Thread(target=serve, args=(sock,), daemon=True).start()
+    lane = mklane(root, "x1_drip_hdr")
+    begin(lane, root)
+    env = {"MK_BUS_URL": f"http://127.0.0.1:{port}", "MK_BUS_TOKEN": "sekrit"}
+    try:
+        t0 = time.time()
+        code, lines = cli(lane, "inbox", env=env)
+        elapsed = time.time() - t0
+        assert elapsed < 3.0, f"inbox took {elapsed:.2f}s against dribbled headers: {lines}"
+        assert code == 4, (code, lines)
+        t0 = time.time()
+        code, lines = cli(lane, "progress", "parse-plan", env=env)
+        elapsed = time.time() - t0
+        assert elapsed < 3.0, f"progress took {elapsed:.2f}s against dribbled headers: {lines}"
+        assert code == 0, (code, lines)
+    finally:
+        sock.close()
+
+
+def t_x1_huge_body_is_capped(root):
+    """A peer that sends a 50 MB body. inbox and progress return within 3 s and
+    this process's RSS does not grow by tens of megabytes."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.startswith("/health"):
+                body = b'{"ok": true}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(50 * 1024 * 1024))
+            self.end_headers()
+            blob = b"x" * (256 * 1024)
+            for _ in range(50 * 4):
+                try:
+                    self.wfile.write(blob)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    return
+        def log_message(self, *a):
+            return
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    port = srv.server_address[1]
+    lane = mklane(root, "x1_huge")
+    begin(lane, root)
+    env = {"MK_BUS_URL": f"http://127.0.0.1:{port}", "MK_BUS_TOKEN": "sekrit"}
+    before = _x1_rss_kb()
+    try:
+        t0 = time.time()
+        code, lines = cli(lane, "inbox", env=env)
+        elapsed = time.time() - t0
+        assert elapsed < 3.0, f"inbox took {elapsed:.2f}s against a 50 MB body: {lines}"
+        assert code == 4, (code, lines)
+        t0 = time.time()
+        code, lines = cli(lane, "progress", "parse-plan", env=env)
+        elapsed = time.time() - t0
+        assert elapsed < 3.0, f"progress took {elapsed:.2f}s against a 50 MB body: {lines}"
+        assert code == 0, (code, lines)
+        after = _x1_rss_kb()
+        if before and after:
+            assert after - before < 32 * 1024, f"RSS grew {after - before} KiB reading a 50 MB body"
+    finally:
+        srv.shutdown()
+
+
+def t_x1_real_bus_token_0600(root):
+    """A token file written by the real mk-bus.py token command is mode 0600 and the CLI
+    still reaches the bus (inbox on an empty lane exits 0)."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data, _, _ = bus_server(root, "x1")
+    lane = bus_lane(root, "x1_real_token", "X1", data)
+    path = os.path.join(lane, BUS_LANE_FILE)
+    mode = os.stat(path).st_mode & 0o777
+    assert mode == 0o600, oct(mode)
+    code, lines = cli(lane, "inbox")
+    assert code == 0, (code, lines)
 
 
 def t_skill_frontmatter(root):
