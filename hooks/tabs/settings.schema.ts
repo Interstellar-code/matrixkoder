@@ -172,6 +172,13 @@ export const SETTINGS_SCHEMA = {
       "type": "seg"
     },
     {
+      "default": 3,
+      "editable": true,
+      "key": "session.selftest_jobs_total",
+      "scope": "child",
+      "type": "num"
+    },
+    {
       "default": true,
       "editable": true,
       "key": "session.reuse_reviewer",

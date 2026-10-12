@@ -201,7 +201,7 @@ def load_run(data, run_id):
             "verdict": t.get("verdict"),
             "updated": t.get("updated") or doc.get("updated"),
         })
-    events, skipped = [], 0
+    events, skipped, skip_reasons = [], 0, []
     ev_path = os.path.join(run_dir, "events.jsonl")
     if os.path.isfile(ev_path):
         if not inside(run_dir, ev_path):
@@ -210,15 +210,19 @@ def load_run(data, run_id):
             for n, line in enumerate(fh, 1):
                 raw = line.strip()
                 if not raw:
+                    skipped += 1
+                    skip_reasons.append({"line": n, "reason": "blank line"})
                     continue
                 try:
                     ev = json.loads(raw)
                 except ValueError:
                     skipped += 1
+                    skip_reasons.append({"line": n, "reason": "malformed json"})
                     continue
                 kind = ev.get("type") or ev.get("kind")
                 if kind not in STATE_KINDS:
                     skipped += 1
+                    skip_reasons.append({"line": n, "reason": f"kind {kind!r}"})
                     continue
                 events.append({
                     "src": f"{run_id}:events.jsonl:{n}",
@@ -271,7 +275,7 @@ def load_run(data, run_id):
     for t in tasks:
         _, extra = _deps_of_task(t, by_id, run_id)
         unresolved.extend(extra)
-    return run_row, task_rows, events, artifacts, skipped, unresolved, skipped_artifacts
+    return run_row, task_rows, events, artifacts, skipped, unresolved, skipped_artifacts, skip_reasons
 
 
 def source_counts(data):
@@ -284,7 +288,7 @@ def source_counts(data):
         if not os.path.isfile(os.path.join(runs_dir, name, "run.json")):
             continue
         try:
-            _, tasks, events, artifacts, skipped, _, _ = load_run(data, name)
+            _, tasks, events, artifacts, skipped, _, _, _ = load_run(data, name)
         except Fail:
             continue  # a bad run is not part of the parity the store can hold
         counts["runs"] += 1
@@ -384,7 +388,7 @@ def import_one(home, project, data, run_id):
     check_run_id(run_id)
     run_dir = run_dir_of(data, run_id)
     before = tree_checksums(run_dir)
-    run_row, tasks, events, artifacts, skipped, unresolved, skipped_arts = load_run(data, run_id)
+    run_row, tasks, events, artifacts, skipped, unresolved, skipped_arts, skip_reasons = load_run(data, run_id)
     known = _known_tasks(home, project) | {(run_id, t["id"]) for t in tasks}
     tasks, dropped = _split_deps(tasks, run_id, known)
     added = mkdb.import_history(home, project, run_id, run_row=run_row, tasks=tasks,
@@ -393,6 +397,7 @@ def import_one(home, project, data, run_id):
     if tree_checksums(run_dir) != before:
         raise Fail("source files changed during import")
     return {"added": added, "cards": cards, "skipped_events": skipped,
+            "skipped_event_reasons": skip_reasons,
             "skipped_artifacts": skipped_arts,
             "unresolved_deps": list(unresolved) + dropped,
             "source": {"tasks": len(tasks), "events": len(events), "artifacts": len(artifacts)}}
@@ -420,14 +425,14 @@ def import_all(home, project, data):
     for name in _run_names(data):
         try:
             check_run_id(name)
-            loaded[name] = load_run(data, name)  # 7-tuple
+            loaded[name] = load_run(data, name)  # 8-tuple
         except Exception as e:  # one bad run.json must not stop the others
             failed.append({"run": name, "error": str(e)})
     # Runs land in dependency order, so a <run>:<id> dep finds its target task.
-    imported, unresolved_deps, skipped_events, skipped_artifacts = [], [], 0, []
+    imported, unresolved_deps, skipped_events, skipped_artifacts, skipped_event_reasons = [], [], 0, [], []
     known = _known_tasks(home, project)
     for name in _import_order(loaded):
-        run_row, tasks, events, artifacts, skipped, unresolved, skipped_arts = loaded[name]
+        run_row, tasks, events, artifacts, skipped, unresolved, skipped_arts, skip_reasons = loaded[name]
         known |= {(name, t["id"]) for t in tasks}
         tasks, dropped = _split_deps(tasks, name, known)
         try:
@@ -438,6 +443,7 @@ def import_all(home, project, data):
             continue
         imported.append(name)
         skipped_events += skipped
+        skipped_event_reasons.extend(skip_reasons)
         skipped_artifacts.extend(skipped_arts)
         unresolved_deps.extend(unresolved)
         unresolved_deps.extend(dropped)
@@ -445,7 +451,8 @@ def import_all(home, project, data):
     if tree_checksums(runs_dir) != before:
         raise Fail("source files changed during import")
     return {"imported": imported, "failed": failed, "cards": cards,
-            "skipped_events": skipped_events, "skipped_artifacts": skipped_artifacts,
+            "skipped_events": skipped_events, "skipped_event_reasons": skipped_event_reasons,
+            "skipped_artifacts": skipped_artifacts,
             "unresolved_deps": unresolved_deps,
             "source": source_counts(data), "store": store_counts(home, project),
             "exit": 0 if not failed else 4}
@@ -574,16 +581,42 @@ def self_test():
         _check({k: parity["source"][k] for k in shared} == {k: parity["store"][k] for k in shared},
                f"parity {parity}")
         _check(parity["skipped_events"] == 1, parity)
+        reasons = parity.get("skipped_event_reasons") or []
+        _check(any(r.get("reason") == "malformed json" for r in reasons), reasons)
         _check(parity["source"]["runs"] == 2 and parity["source"]["events"] == 7, parity["source"])
         _check(tree_checksums(os.path.join(data, "runs")) == before, "source changed by --all")
 
         _guards_r2(tmp)
+        _blank_events(tmp)
         _symlinks(tmp)
         _real_bus(tmp)
         print("mk-store-import self-test ok")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
+
+
+
+def _blank_events(tmp):
+    """A blank line in events.jsonl is counted in skipped_events with a reason; it is not imported."""
+    data = os.path.join(tmp, "blank")
+    home = os.path.join(tmp, "blank-home")
+    os.makedirs(home)
+    _write(os.path.join(data, "runs", "b1", "run.json"), json.dumps(
+        {"id": "b1", "status": "done", "tasks": [
+            {"id": "T", "title": "t", "status": "done", "parent": None, "deps": [], "verdict": "APPROVE"}]}))
+    note = json.dumps({"t": "2020-01-01T00:00:01+00:00", "task": "T", "type": "note", "text": "kept"})
+    _write(os.path.join(data, "runs", "b1", "events.jsonl"), "\n" + note + "\n   \nnot-json\n")
+    code, out, err = _run_cli(["run", "--project", "matrixkoder", "--data", data, "--run", "b1", "--home", home])
+    _check(code == 0, f"blank: {code} {out} {err}")
+    doc = json.loads(out)
+    _check(doc["skipped_events"] == 3, doc)
+    reasons = doc.get("skipped_event_reasons") or []
+    _check(sum(1 for r in reasons if r.get("reason") == "blank line") == 2, reasons)
+    _check(any(r.get("reason") == "malformed json" for r in reasons), reasons)
+    _check(doc["added"]["events"] == 1, doc["added"])
+    got = [c for c in mkdb.cards(home, "matrixkoder") if c["task"] == "T"]
+    _check(len(got) == 1 and got[0]["verdict"] == "APPROVE", got)
 
 
 def _guards_r2(tmp):

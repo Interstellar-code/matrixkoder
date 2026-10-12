@@ -15,6 +15,7 @@ import {
   emptyKanbanView,
   isAttention,
   kanbanFixtureView,
+  kanbanView,
   readCards,
   timeInStatus,
 } from './kanban'
@@ -263,4 +264,72 @@ test('D3A is under Building before the fixture transition and under Verify after
 
 test('timeInStatus of one hour before KANBAN_NOW is 1h', () => {
   expect(timeInStatus('2026-10-12T09:00:00+02:00', KANBAN_NOW)).toBe('1h')
+})
+
+
+/** Captured from a real corrupt mk.db: stdout empty, exit 1, this traceback on stderr. */
+const CORRUPT_MKDB_STDERR = '    return _migrate(_connect(os.path.join(home, "mk.db")), version, ((1, ROOT_DDL),) + tuple(migrations))\n                    ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File "/Users/rohits/Development/matrixkoder-mk-5/scripts/mkdb.py", line 144, in _connect\n    con.execute("PRAGMA journal_mode=WAL")\n    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^\nsqlite3.DatabaseError: file is not a database'
+
+
+test('a corrupt mk.db read (empty stdout, exit 1) is an error, not an empty board', async () => {
+  expect(CORRUPT_MKDB_STDERR).toContain('sqlite3.DatabaseError: file is not a database')
+  let calls = 0
+  const run: RunFn = async () => {
+    calls += 1
+    return { stdout: '', code: 1 }
+  }
+  const got = await readCards(run, '/plugin', '/tmp/mk-home', true, 0, 0)
+  expect(calls).toBe(1)
+  expect(got.empty).toBe(false)
+  expect(got.error).toBe('cards read failed: mkdb exited')
+  expect(got.cards).toEqual([])
+  const view = { ...kanbanView(KANBAN_FIXTURE, { needsYou: false, project: null }, KANBAN_NOW), error: got.error, stale: true }
+  const tree = KanbanTab(stubEls(), view, 46)
+  const texts = allOf(tree, 'Text').map(t => text(t))
+  expect(texts.some(t => t.includes('cards read failed: mkdb exited'))).toBe(true)
+  expect(texts.some(t => t.includes('stale'))).toBe(true)
+  expect(texts).not.toContain('no store yet')
+  expect(text(columnSection(tree, 'Building')!)).toContain('D3A')
+})
+
+test('non-JSON stdout, {ok:false}, a thrown spawn and a timeout are errors', async () => {
+  const cases: Array<{ name: string; run: RunFn; error: string }> = [
+    {
+      name: 'not json',
+      run: async () => ({ stdout: 'not-json', code: 0 }),
+      error: 'cards read failed: not JSON',
+    },
+    {
+      name: 'ok false',
+      run: async () => ({ stdout: JSON.stringify({ ok: false, error: 'locked' }), code: 0 }),
+      error: 'cards read failed: locked',
+    },
+    {
+      name: 'spawn throws',
+      run: async () => { throw new Error('spawn python3 ENOENT') },
+      error: 'cards read failed: cannot run mkdb',
+    },
+    {
+      name: 'timeout',
+      run: async () => { throw new Error('timed out after 5000ms') },
+      error: 'cards read timed out',
+    },
+  ]
+  for (const c of cases) {
+    const got = await readCards(c.run, '/plugin', '/tmp/mk-home', true, 0, 0)
+    expect(got.error, c.name).toBe(c.error)
+    expect(got.empty, c.name).toBe(false)
+    expect(got.cards, c.name).toEqual([])
+  }
+})
+
+test('a 1.5 MB cards payload parses and does not report an error', async () => {
+  const one = KANBAN_FIXTURE[0]!
+  const cards = Array.from({ length: 5000 }, (_, i) => ({ ...one, task: `T${String(i)}`, title: 'x'.repeat(40) }))
+  const stdout = JSON.stringify({ ok: true, cards })
+  expect(stdout.length).toBeGreaterThan(1_500_000)
+  const got = await readCards(async () => ({ stdout, code: 0 }), '/plugin', '/tmp/mk-home', true, 0, 0)
+  expect(got.error).toBeNull()
+  expect(got.cards).toHaveLength(5000)
+  expect(got.empty).toBe(false)
 })

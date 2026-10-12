@@ -91,7 +91,8 @@ checkable contract. Rules whose remainder stays per-brief say **(B)** and carry 
   `phases_done` mirror it so the dashboard shows lane progress
   (`/Users/rohits/Development/matrixkoder/.matrixkoder/plans/mk-improvements.md` item 11, open).
   **Check:** the todo list exists before the first file write. **(B)** the task skeleton it
-  mirrors — R27.
+  mirrors — R27. A reviewer or builder never sends a message to another lane directly; every
+  lane-to-lane message passes the orchestrator (R30).
 
 - **R10.** Commit in the fixed shape: `<type(scope): message>`, blank line,
   `Co-Authored-By: <identity>`, one commit whose subject matches the brief's `--commit-grep` — the
@@ -106,7 +107,10 @@ checkable contract. Rules whose remainder stays per-brief say **(B)** and carry 
   you ran.
   **Why:** the orchestrator treats reports as claims and reruns the gates — an overstated report
   is caught and the work comes back (`skills/matrixkoder/templates/brief.md:29`;
-  `skills/matrixkoder/reference/safety.md:39`). **(B)** the report path — R23.
+  `skills/matrixkoder/reference/safety.md:39`). The report's `## Todo` section is lines
+  `[done|skipped|open] <text> - <evidence>`; `done` prints the counts (`todo N/M done K skipped`)
+  and warns rather than fails when the section is missing or an item is `open` without a reason.
+  **(B)** the report path — R23.
 
 - **R12.** End the round by printing `<T> R<n> DONE` (or `<T> R<n> BLOCKED: <question>`) as the
   LAST line of the reply, alone on its line, after the last commit and the report — never inside a
@@ -206,6 +210,10 @@ checkable contract. Rules whose remainder stays per-brief say **(B)** and carry 
 - **R29.** The FIX section — review findings with their numbers to cite in the report
   (`skills/matrixkoder/templates/brief.md:38-40`) — plus reviewer mockups and extra must-check
   items (`skills/matrixkoder/templates/review.md:3`). Feeds R15-R18.
+- **R30. (new)** A reviewer or builder never sends a message to another lane directly; every
+  lane-to-lane message passes the orchestrator.
+  **Why:** a lane that messages another lane routes work the orchestrator owns (R1). **Check:**
+  the lane transcript shows no send addressed to another lane.
 
 ## 5. Research Part B mapping (S rows → rules)
 

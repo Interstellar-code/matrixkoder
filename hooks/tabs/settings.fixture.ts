@@ -149,6 +149,7 @@ export const SETTINGS_FIXTURE: SettingsView = {
       rows: [
         { key: 'session.fresh_session', scope: 'child', label: 'New round', type: 'seg', value: 'new', default: 'new', opts: [['new', 'new'], ['same', 'same']], help: 'Clear context per round; model stays.', editable: true },
         { key: 'session.todo_done_status', scope: 'child', label: 'Todo completed becomes', type: 'seg', value: 'verify', default: 'verify', opts: [['verify', 'verify'], ['done', 'done']], help: 'What a completed todo sets the task to.', editable: true },
+        { key: 'session.selftest_jobs_total', scope: 'child', label: 'Self-test jobs', type: 'num', value: 3, default: 3, min: 1, max: 16, help: 'Parallel self-tests when MK_SELFTEST_JOBS is unset. Default is derived: max(1, round(cores/3)).', editable: true },
         { key: 'session.subagents', scope: 'child', label: 'Subagents', type: 'bool', value: true, default: true, help: 'Plan default (template).', editable: true },
         { key: 'session.subagent_model', scope: 'child', label: 'Subagent model', type: 'select', value: '', default: '', opts: SUBAGENT_MODELS, help: 'Written to the lane oh-my-openagent categories.', editable: true },
       ],
