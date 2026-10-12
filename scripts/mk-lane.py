@@ -75,8 +75,10 @@ GIT_TIMEOUT, HERDR_TIMEOUT = 120, 300
 # any cwd. A missing source is a hard Fail, never a lane without its guard.
 SKILL_SRC = os.path.join(os.path.dirname(HERE), "child-skills", "mk-builder")
 GUARD_SRC = os.path.join(SKILL_SRC, "scripts", "git-guard")
-# Top-level `.matrixkoder-*` files that are never stale: the current brief and the watch state.
-LANE_KEEP_FILES = (".matrixkoder-brief.md", ".matrixkoder-watch.json", ".matrixkoder-watch.lock")
+# Top-level `.matrixkoder-*` files that are never stale. The brief is no longer copied into
+# the lane (D7B: it arrives over the bus), so only the watch state stays. A brief left by an
+# older acquire is archived with the other stale files.
+LANE_KEEP_FILES = (".matrixkoder-watch.json", ".matrixkoder-watch.lock")
 DEFAULTS = {"slots": 1, "pattern": "../{repo}-mk-{n}", "reuse": True, "cap": 3, "disposable": [],
             "copy": [], "integration_branch": "main"}
 
@@ -879,7 +881,7 @@ def copy_into_slot(cfg, main, lane):
 
 
 def archive_stale_lane_files(lane, run):
-    """Every top-level `.matrixkoder-*` FILE except the brief and the watch state moves into
+    """Every top-level `.matrixkoder-*` FILE except the watch state moves into
     <lane>/.matrixkoder-old-<run>/ before the install writes its own: a report from an earlier
     round would otherwise sit next to the fresh ones and read as this round's. Moved (shutil.move),
     never deleted; directories (.matrixkoder-bin/, an older archive) stay put; a name that already
@@ -1477,15 +1479,18 @@ def self_test():
         acq1 = mk("acquire", "--run", "r1", "--task", "t6a", "--base", "main")
         assert (acq1["ok"], acq1["skill_installed"], acq1["guard_path"]) == \
             (True, skill_dst, guard_dst), acq1
-        # the four stale files sit in the archive, byte-identical; only brief + watch remain at
-        # top level among `.matrixkoder-*` FILES (the archive and .matrixkoder-bin/ are dirs)
-        assert sorted(os.listdir(old1)) == sorted(stale_files), os.listdir(old1)
-        for name, body in stale_files.items():
+        # the four stale files plus the brief (no longer kept) sit in the archive, byte-identical;
+        # only the watch state remains at top level among `.matrixkoder-*` FILES
+        # (the archive and .matrixkoder-bin/ are dirs)
+        archived = dict(stale_files)
+        archived[".matrixkoder-brief.md"] = "# brief\n"
+        assert sorted(os.listdir(old1)) == sorted(archived), os.listdir(old1)
+        for name, body in archived.items():
             assert open(os.path.join(old1, name), "rb").read() == body.encode(), name
         top_files = sorted(x for x in os.listdir(slot1) if x.startswith(".matrixkoder-")
                            and os.path.isfile(os.path.join(slot1, x)))
-        assert top_files == [".matrixkoder-brief.md", ".matrixkoder-watch.json",
-                             ".matrixkoder-watch.lock"], top_files
+        assert top_files == [".matrixkoder-watch.json", ".matrixkoder-watch.lock"], top_files
+        assert not os.path.isfile(os.path.join(slot1, ".matrixkoder-brief.md"))
         # the install matches the plugin source, and the guard is executable
         assert open(os.path.join(skill_dst, "SKILL.md"), "rb").read() == \
             open(os.path.join(src_skill, "SKILL.md"), "rb").read()
@@ -1500,7 +1505,7 @@ def self_test():
         acq2 = mk("acquire", "--run", "r1", "--task", "t6b", "--base", "main")
         assert (acq2["ok"], acq2["skill_installed"], acq2["guard_path"]) == \
             (True, skill_dst, guard_dst), acq2
-        assert sorted(os.listdir(old1)) == sorted(stale_files), os.listdir(old1)
+        assert sorted(os.listdir(old1)) == sorted(archived), os.listdir(old1)
         assert open(os.path.join(skill_dst, "SKILL.md"), "rb").read() == \
             open(os.path.join(src_skill, "SKILL.md"), "rb").read()
         assert os.access(guard_dst, os.X_OK)
