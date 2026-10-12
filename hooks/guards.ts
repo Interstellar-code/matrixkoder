@@ -99,6 +99,9 @@ const WRAPPERS: Readonly<Record<string, readonly string[]>> = {
   command: [],
   builtin: [],
   nohup: [],
+  // rtk is a CLI proxy: `rtk git …` runs git, `rtk proxy`/`rtk run` run the next command.
+  // Global options that take a value are skipped; any other leading `-…` fails closed below.
+  rtk: ['-c', '--command'],
 }
 
 /** Drop leading `VAR=val`, `{`, `!` and wrapper commands with their options: the words of what really runs. */
@@ -113,11 +116,15 @@ function stripPrefixes(ws: readonly string[]): readonly string[] {
     }
     const valued = WRAPPERS[base(w)]
     if (!valued) break
+    const isRtk = base(w) === 'rtk'
     for (i++; i < ws.length; i++) {
       const opt = ws[i]
       if (!opt || !opt.startsWith('-')) break
       if (valued.includes(opt)) i++
+      else if (isRtk) { i++; break } // unknown rtk flag: drop it, then the normal walk (deny only if a banned git form follows)
     }
+    // `rtk proxy`/`rtk run` wrap the next command. `rtk git` stays: it is rtk's git subcommand, same git words.
+    if (isRtk && (ws[i] === 'proxy' || ws[i] === 'run')) i++
   }
   return ws.slice(i)
 }
