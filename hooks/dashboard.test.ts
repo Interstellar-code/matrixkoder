@@ -2194,3 +2194,122 @@ test('D8A R2: a present store with zero cards draws an empty board, not the fixt
   expect(await ui.find({ text: /alpha/ })).toBeUndefined()
 })
 
+
+test('FC: a corrupt cards read shows an error and keeps the last good cards', { plugins: [worldFixtures] }, async ($, on) => {
+  let mode: 'good' | 'corrupt' = 'good'
+  const calls: string[][] = []
+  const clock = mockWorld(on, {
+    env: { MK_HOME: '/tmp/mk-fc-home' },
+    process: argv => {
+      calls.push([...argv])
+      if (!argv.includes('cards')) return undefined
+      if (mode === 'corrupt') {
+        // real mkdb.py against a corrupt mk.db: empty stdout, exit 1
+        return { value: { exitCode: 1, stdout: '', stderr: 'sqlite3.DatabaseError: file is not a database', isStdoutTruncated: false, isStderrTruncated: false } }
+      }
+      const card = { project: 'alpha', run: 'r', task: 'D3A', parent: 'D3', type: 'task', title: 'Writer', status: 'building', col: 'Building', attention: 0, question: null, route_json: null, lane: null, round: 1, verdict: null, gates: null, updated: '2026-10-12T09:00:00+02:00', change_no: 1 }
+      return { value: { exitCode: 0, stdout: JSON.stringify({ ok: true, cards: [card] }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    },
+  })
+  on('fs.exists', (_$, e) => ({ value: String(e.path) === '/tmp/mk-fc-home/mk.db' }))
+  mockFs(on, worldFiles())
+  await $.session.start(sessionStart())
+  for (let i = 0; i < 20; i++) await clock.advance(0)
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-kanban' })
+  expect(await ui.find({ text: /D3A/ }), 'the good read draws the card').toBeTruthy()
+  mode = 'corrupt'
+  await clock.advance(5000)
+  for (let i = 0; i < 30; i++) await clock.advance(0)
+  expect(await ui.find({ text: /cards read failed/ }), 'the failed read is a visible error').toBeTruthy()
+  expect(await ui.find({ text: /stale/ }), 'last good cards are flagged stale').toBeTruthy()
+  expect(await ui.find({ text: /D3A/ }), 'last good card stays').toBeTruthy()
+  expect(await ui.find({ text: 'no store yet' }), 'an error is not the empty-store line').toBeUndefined()
+  expect(await ui.find({ text: 'Building 0' }), 'an error is not an empty column').toBeUndefined()
+})
+
+test('FC: {ok:false} shows an error, not empty columns', { plugins: [worldFixtures] }, async ($, on) => {
+  const clock = mockWorld(on, {
+    env: { MK_HOME: '/tmp/mk-fc-okfalse' },
+    process: argv => {
+      if (!argv.includes('cards')) return undefined
+      return { value: { exitCode: 0, stdout: '{"ok":false,"error":"locked"}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    },
+  })
+  on('fs.exists', (_$, e) => ({ value: String(e.path) === '/tmp/mk-fc-okfalse/mk.db' }))
+  mockFs(on, worldFiles())
+  await $.session.start(sessionStart())
+  for (let i = 0; i < 20; i++) await clock.advance(0)
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-kanban' })
+  expect(await ui.find({ text: /cards read failed: locked/ })).toBeTruthy()
+  expect(await ui.find({ text: 'no store yet' })).toBeUndefined()
+  expect(await ui.find({ text: 'Backlog 0' })).toBeUndefined()
+})
+
+test('FC: non-JSON stdout shows an error, not empty columns', { plugins: [worldFixtures] }, async ($, on) => {
+  const clock = mockWorld(on, {
+    env: { MK_HOME: '/tmp/mk-fc-nonjson' },
+    process: argv => {
+      if (!argv.includes('cards')) return undefined
+      return { value: { exitCode: 0, stdout: 'not-json', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    },
+  })
+  on('fs.exists', (_$, e) => ({ value: String(e.path) === '/tmp/mk-fc-nonjson/mk.db' }))
+  mockFs(on, worldFiles())
+  await $.session.start(sessionStart())
+  for (let i = 0; i < 20; i++) await clock.advance(0)
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-kanban' })
+  expect(await ui.find({ text: /cards read failed: not JSON/ })).toBeTruthy()
+  expect(await ui.find({ text: 'no store yet' })).toBeUndefined()
+  expect(await ui.find({ text: 'Backlog 0' })).toBeUndefined()
+})
+
+test('FC: a thrown spawn shows an error, not the empty-store line', { plugins: [worldFixtures] }, async ($, on) => {
+  const clock = mockWorld(on, {
+    env: { MK_HOME: '/tmp/mk-fc-throw' },
+    process: argv => {
+      if (!argv.includes('cards')) return undefined
+      throw new Error('spawn python3 ENOENT')
+    },
+  })
+  on('fs.exists', (_$, e) => ({ value: String(e.path) === '/tmp/mk-fc-throw/mk.db' }))
+  mockFs(on, worldFiles())
+  await $.session.start(sessionStart())
+  for (let i = 0; i < 20; i++) await clock.advance(0)
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-kanban' })
+  expect(await ui.find({ text: /cards read failed: cannot run mkdb/ })).toBeTruthy()
+  expect(await ui.find({ text: 'no store yet' })).toBeUndefined()
+  expect(await ui.find({ text: 'Backlog 0' })).toBeUndefined()
+})
+
+test('FC: a slow cards read does not hold the tick, and only one read is in flight', { plugins: [worldFixtures] }, async ($, on) => {
+  const held: Array<(v: { value: { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean; isStderrTruncated: boolean } }) => void> = []
+  let started = 0
+  const clock = mockWorld(on, {
+    env: { MK_HOME: '/tmp/mk-fc-slow' },
+    process: argv => {
+      if (!argv.includes('cards')) return undefined
+      started += 1
+      return new Promise<{ value: { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean; isStderrTruncated: boolean } }>(resolve => {
+        held.push(resolve)
+      })
+    },
+  })
+  on('fs.exists', (_$, e) => ({ value: String(e.path) === '/tmp/mk-fc-slow/mk.db' }))
+  mockFs(on, worldFiles())
+  await $.session.start(sessionStart())
+  for (let i = 0; i < 10; i++) await clock.advance(0)
+  expect(started, 'the read was started').toBe(1)
+  await clock.advance(5000)
+  for (let i = 0; i < 10; i++) await clock.advance(0)
+  expect(started, 'a second read does not start while one is in flight').toBe(1)
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  expect(await ui.find({ text: 'Overview' }), 'the pane still rendered').toBeTruthy()
+  held[0]?.({ value: { exitCode: 0, stdout: '{"ok":true,"cards":[]}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+  for (let i = 0; i < 20; i++) await clock.advance(0)
+  await ui.press({ key: 'dash-tab-kanban' })
+  expect(await ui.find({ text: 'Backlog 0' }), 'the landed read draws the empty board').toBeTruthy()
+})
