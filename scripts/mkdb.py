@@ -88,6 +88,13 @@ class Fail(Exception):
         self.code = code
 
 
+class _Unset:
+    """Sentinel: transition() leaves tasks.verdict unchanged unless the caller passes one."""
+
+
+_UNSET = _Unset()
+
+
 class Parser(argparse.ArgumentParser):
     def __init__(self, *a, **kw):
         kw.setdefault("allow_abbrev", False)
@@ -381,8 +388,12 @@ def add_task(con, run, task, type, title="", parent=None, deps="", route_json=No
         raise
 
 
-def transition(home, project, run, task, to, note="", round=0, sync_root=False, data_dir=None):
-    """The ONLY status writer (C10). One project transaction, then the root card iff sync_root."""
+def transition(home, project, run, task, to, note="", round=0, sync_root=False, data_dir=None, verdict=_UNSET):
+    """The ONLY status writer (C10). One project transaction, then the root card iff sync_root.
+
+    verdict defaults to leaving the task's stored verdict unchanged. Pass a string or None to
+    replace it; the root card (sync_root) and a later catch_up both copy that value.
+    """
     con = open_project(home, project, data_dir)
     try:
         # The read and the write share one immediate transaction, so a concurrent transition
@@ -390,16 +401,20 @@ def transition(home, project, run, task, to, note="", round=0, sync_root=False, 
         _begin(con)
         try:
             row = con.execute(
-                "SELECT parent, type, title, route_json, lane, status, prev_status FROM tasks"
+                "SELECT parent, type, title, route_json, lane, status, prev_status, verdict FROM tasks"
                 " WHERE run=? AND id=?", (run, task)).fetchone()
             if not row:
                 raise Fail(f"no task {run}:{task}")
             # An attention status keeps the column of the previous non-attention status (C4).
             col, attention = _placed(row, to)
             kept = row["prev_status"] if to in ATTENTION else (to if to in COLUMNS else row["prev_status"])
+            # verdict= is optional: a status-only transition leaves the stored verdict alone.
+            verdict = row["verdict"] if verdict is _UNSET else verdict
             con.execute(
-                "UPDATE tasks SET status=?, prev_status=?, round=?, updated=? WHERE run=? AND id=?",
-                (to, kept, round, now(), run, task))
+                "UPDATE tasks SET status=?, prev_status=?, round=?, verdict=?, updated=? WHERE run=? AND id=?",
+                (to, kept, round, verdict, now(), run, task))
+            row = dict(row)
+            row["verdict"] = verdict
             con.execute(
                 "INSERT INTO events(run, task, t, chan, kind, to_id, text) VALUES (?,?,?,?,?,?,?)",
                 (run, task, now(), "state", "transition", to, note))
@@ -431,12 +446,15 @@ def _upsert_card(home, project, run, task, row, status, col, attention, round, c
         try:
             root.execute(
                 "INSERT INTO cards(project, run, task, parent, type, title, status, col, attention,"
-                " route_json, lane, round, updated, change_no) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                " route_json, lane, round, verdict, updated, change_no)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(project, run, task) DO UPDATE SET status=excluded.status, col=excluded.col,"
-                " attention=excluded.attention, round=excluded.round, updated=excluded.updated,"
+                " attention=excluded.attention, round=excluded.round, verdict=excluded.verdict,"
+                " updated=excluded.updated,"
                 " change_no=MAX(cards.change_no, excluded.change_no)",
                 (project, run, task, row["parent"], row["type"], row["title"], status, col, attention,
-                 row["route_json"], row["lane"], round, now(), change_no))
+                 row["route_json"], row["lane"], round, row["verdict"] if "verdict" in row.keys() else None,
+                 now(), change_no))
             root.execute(
                 "INSERT INTO sync(project, last_change_no) VALUES (?,?)"
                 " ON CONFLICT(project) DO UPDATE SET last_change_no=MAX(sync.last_change_no, excluded.last_change_no)",
@@ -454,8 +472,8 @@ def catch_up(home, project, data_dir=None):
     con = open_project(home, project, data_dir)
     try:
         rows = con.execute("SELECT t.run, t.id, t.parent, t.type, t.title, t.route_json, t.lane,"
-                           " t.status, t.prev_status, t.round, c.change_no FROM change_log c JOIN tasks t"
-                           " ON t.run=c.run AND t.id=c.task ORDER BY c.change_no").fetchall()
+                           " t.status, t.prev_status, t.round, t.verdict, c.change_no FROM change_log c"
+                           " JOIN tasks t ON t.run=c.run AND t.id=c.task ORDER BY c.change_no").fetchall()
     finally:
         con.close()
     root = open_root(home)
@@ -965,6 +983,7 @@ def self_test():
         _live_writers(home)
         _v1_upgrade(home)
         _lane_slots_v3(home)
+        _card_verdict(home)
         _single_writer()
     print(json.dumps({"ok": True, "self_test": "pass"}))
     return 0
@@ -1886,6 +1905,43 @@ def _live_writers(home):
     lines = [e["text"] for e in timeline(home, "live", "r", "t", data) if e["chan"] == "bus"]
     _check(lines[0] == "hello" and "0:0" in lines and "1:49" in lines, f"timeline {lines[:3]}…{lines[-1:]}")
     _check(lines.index("0:0") < lines.index("0:49"), "timeline not in id order")
+
+
+
+def _card_verdict(home):
+    """A transition that changes the verdict updates the root card; catch_up copies it too."""
+    data = os.path.join(home, "verdict")
+    con = open_project(home, data_dir=data)
+    try:
+        add_task(con, "r", "t", "task")
+        con.execute("UPDATE tasks SET verdict=? WHERE run=? AND id=?", ("APPROVE", "r", "t"))
+        con.commit()
+    finally:
+        con.close()
+    transition(home, "verdict", "r", "t", "review", round=1, sync_root=True, data_dir=data)
+    got = cards(home, "verdict")
+    _check(len(got) == 1 and got[0]["verdict"] == "APPROVE", f"import-style verdict {got}")
+    transition(home, "verdict", "r", "t", "done", round=2, verdict="REQUEST CHANGES",
+               sync_root=True, data_dir=data)
+    got = cards(home, "verdict")
+    _check(len(got) == 1 and got[0]["verdict"] == "REQUEST CHANGES" and got[0]["status"] == "done",
+           f"transition verdict {got}")
+    con = open_project(home, data_dir=data)
+    try:
+        stored = con.execute("SELECT verdict FROM tasks WHERE id='t'").fetchone()["verdict"]
+        _check(stored == "REQUEST CHANGES", stored)
+        root = open_root(home)
+        try:
+            root.execute("UPDATE cards SET verdict=NULL WHERE project='verdict' AND task='t'")
+            root.execute("UPDATE sync SET last_change_no=0 WHERE project='verdict'")
+            root.commit()
+        finally:
+            root.close()
+    finally:
+        con.close()
+    caught = catch_up(home, "verdict", data)
+    got = cards(home, "verdict")
+    _check(caught >= 1 and got[0]["verdict"] == "REQUEST CHANGES", f"catch_up verdict {got} n={caught}")
 
 
 def _single_writer():
