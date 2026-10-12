@@ -51,12 +51,23 @@ export type WaitingView = {
  */
 export type PendingAsk = {
   id: string
+  /** ids are per run (`m-1` repeats), so the card key and the answer hint need it */
+  run?: string
   task?: string | null
   text?: string
   ts?: string
-  /** present only when the ask carried a decision; the bus message has none */
+  seq?: number
+  from?: string
+  to?: string
+  kind?: string
+  reply_to?: string | null
+  ack_level?: number
+  /** present only when the ask carried a decision; a real bus message has none */
   options?: WaitOption[]
 }
+
+/** How many asks one render draws; the rest collapse to a dim "+N more" row. */
+export const ASK_CAP = 8
 
 /** What one `mk-bus.py pending --json` stdout looks like (`cmd_pending`). */
 export type PendingPayload = { ok?: boolean; run?: string; pending?: readonly PendingAsk[]; error?: string }
@@ -112,7 +123,9 @@ export function askView(ask: PendingAsk, nowIso: string): WaitingView {
     timeCompact: age,
     question: ask.text ?? '',
     options,
-    actions: options.length === 0 ? [`mk-bus.py answer ${ask.id} "<text>"`] : ['or type "mk: pick A"'],
+    actions: options.length === 0
+      ? [`mk-bus.py answer ${ask.id}${ask.run != null && ask.run !== '' && ask.run !== '*' ? ` --run ${ask.run}` : ''} "<text>"`]
+      : ['or type "mk: pick A"'],
     footerLeft: ask.id,
     footerRight: age,
   }
@@ -156,15 +169,19 @@ export function emptyWaitingView(): WaitingView {
 }
 
 /**
- * One `mk-bus.py pending --json` per dashboard tick. The runner is injected:
- * the plugin test runtime cannot spawn. A missing script, a non-zero exit,
- * non-JSON or `{"ok": false}` is "bus down" (`down: true`) and spawns nothing
- * else — this never starts a bus and never creates a file. `{"ok": true}` with
- * an empty list is a real source (`live: true`, `asks: []`).
+ * One `mk-bus.py pending` per dashboard tick. The command already prints one
+ * JSON line and has no `--json` flag (`scripts/mk-bus.py` p_pend: only `--run`
+ * and `--data`). `dataDir` is the active project's data dir, passed as
+ * `--data` so the read does not depend on the plugin's cwd. The runner is
+ * injected: the plugin test runtime cannot spawn. A missing script, a non-zero
+ * exit, non-JSON or `{"ok": false}` is "bus down" (`down: true`) and spawns
+ * nothing else — this never starts a bus and never creates a file.
+ * `{"ok": true}` with an empty list is a real source (`live: true`, `asks: []`).
  */
-export async function readPending(run: RunFn, pluginRoot: string): Promise<PendingRead> {
+export async function readPending(run: RunFn, pluginRoot: string, dataDir?: string | null): Promise<PendingRead> {
   const down: PendingRead = { asks: [], live: false, down: true }
-  const argv = ['python3', `${pluginRoot}/scripts/mk-bus.py`, 'pending', '--json']
+  const argv = ['python3', `${pluginRoot}/scripts/mk-bus.py`, 'pending',
+    ...(dataDir != null && dataDir !== '' ? ['--data', dataDir] : [])]
   let result: { stdout?: string; code?: number }
   try {
     result = await run(argv, { timeoutMs: 5_000 })
@@ -365,13 +382,22 @@ export function WaitingTab(els: Els, view: WaitingView, cols: number, ui?: TabUi
   )
 }
 
-/** Several pending asks, one card each, in the order the bus returned them. */
+/** The card's key. Ids repeat across runs, so the run is part of it. */
+export function askKey(ask: PendingAsk): string {
+  return `${ask.run ?? ''}:${ask.id}`
+}
+
+/** Several pending asks, one card each, in the order the bus returned them.
+ *  Only the first ASK_CAP are drawn; the rest are a dim "+N more" row. */
 export function waitingAsks(els: Els, asks: readonly PendingAsk[], cols: number, nowIso: string, ui?: TabUi): RenderElement {
   const { Box, Text } = els
   if (asks.length === 0) return WaitingTab(els, emptyWaitingView(), cols, ui)
+  const shown = asks.slice(0, ASK_CAP)
+  const more = asks.length - shown.length
   return (
     <Box flexDirection="column">
-      {asks.map(ask => askCard(els, askView(ask, nowIso), cols, ui, ask.id))}
+      {shown.map(ask => askCard(els, askView(ask, nowIso), cols, ui, askKey(ask)))}
+      {more > 0 && <Text dimColor={true}>{cut(`+${String(more)} more`, cols)}</Text>}
       <Text dimColor={true}>{hintRow(`${String(asks.length)} waiting`, '', cols)}</Text>
     </Box>
   )

@@ -238,6 +238,7 @@ export function registerDashboard(on: On, options: PluginOptions): void {
     const snap = await read($, snapshotAtom) as MkPaneSnapshot
     const dashTab = await read($, dashTabAtom)
     const viewState = await read($, viewStateAtom)
+    const pane = waitingPane(viewState)
     const cols = e.props.bodyColumns || COLUMNS
     const compact = cols < NARROW
     // S2.3: `raster: false` hands the tabs a table without Raster, so every
@@ -308,9 +309,9 @@ export function registerDashboard(on: On, options: PluginOptions): void {
                       ? withViewState(EventsTab, tabEls, eventsView(), cols, ui)
                       : dashTab === 'kanban'
                         ? KanbanTab(tabEls, kanbanPaneView(viewState), cols)
-                        : waitingPane(viewState).src === 'live'
-                          ? waitingAsks(tabEls, waitingPane(viewState).asks, cols, new Date().toISOString(), ui)
-                          : withViewState(WaitingTab, tabEls, waitingPaneView(viewState, snap.run?.waiting ?? null), cols, ui)}
+                        : pane.src === 'live'
+                          ? waitingAsks(tabEls, pane.asks, cols, new Date().toISOString(), ui)
+                          : withViewState(WaitingTab, tabEls, waitingPaneView(pane, snap.run?.waiting ?? null), cols, ui)}
       </Box>
     )
   })
@@ -736,8 +737,9 @@ function contentSig(snap: MkSnapshot): string {
  *  (no tick yet, so the tab still shows the fixture). */
 const PENDING_KEY = 'waiting:pending'
 const PENDING_SRC_KEY = 'waiting:src'
+const PENDING_TICK_KEY = 'waiting:tick'
 
-function waitingPane(view: Record<string, string>): { src: string; asks: PendingAsk[] } {
+export function waitingPane(view: Record<string, string>): { src: string; asks: PendingAsk[] } {
   let asks: PendingAsk[] = []
   try {
     const parsed = JSON.parse(view[PENDING_KEY] ?? '[]') as unknown
@@ -748,11 +750,10 @@ function waitingPane(view: Record<string, string>): { src: string; asks: Pending
   return { src: view[PENDING_SRC_KEY] ?? '', asks }
 }
 
-function waitingPaneView(view: Record<string, string>, runWaiting: RunWait | null) {
-  const src = view[PENDING_SRC_KEY] ?? ''
+export function waitingPaneView(pane: { src: string; asks: PendingAsk[] }, runWaiting: RunWait | null) {
+  const { src, asks } = pane
   if (src === '') return waitingView()
   if (src === 'live') {
-    const { asks } = waitingPane(view)
     const first = asks[0]
     if (first == null) return emptyWaitingView()
     return askView(first, new Date().toISOString())
@@ -761,17 +762,24 @@ function waitingPaneView(view: Record<string, string>, runWaiting: RunWait | nul
   return waitingView()
 }
 
-/** One `mk-bus.py pending --json` per dashboard tick. Never starts a bus and
- *  never creates a file: `readPending` only runs the injected command. */
-let pendingInFlight = false
-
-async function refreshPending($: EngineInterface): Promise<void> {
-  if (pendingInFlight) return
-  pendingInFlight = true
+/** One `mk-bus.py pending` per dashboard tick, for the active project's data dir.
+ *  Never starts a bus and never creates a file: `readPending` only runs the
+ *  injected command. The in-flight guard is the tick counter on the view state,
+ *  not a module flag: a tick whose number is already recorded has a read in
+ *  flight or done, so a second call for the same tick returns. */
+async function refreshPending($: EngineInterface, cwd: string): Promise<void> {
+  const view = await read($, viewStateAtom)
+  const tick = String(Number(view[PENDING_TICK_KEY] ?? '0') + 1)
+  const current = await read($, viewStateAtom)
+  if (current[PENDING_TICK_KEY] === tick) return
+  await update($, viewStateAtom, prev => (
+    prev[PENDING_TICK_KEY] === tick ? prev : { ...prev, [PENDING_TICK_KEY]: tick }
+  ))
+  const dataDir = await resolveDataDir($, cwd, await homeDir($)).catch(() => null)
   const run = (argv: readonly string[], init?: { timeoutMs?: number }) =>
     $.process.run([...argv], init).then(r => ({ stdout: r.stdout, code: r.exitCode }))
   try {
-    const got = await readPending(run, $.plugin.root)
+    const got = await readPending(run, $.plugin.root, dataDir)
     if (!got.live && !got.down) return
     await update($, viewStateAtom, prev => ({
       ...prev,
@@ -780,8 +788,6 @@ async function refreshPending($: EngineInterface): Promise<void> {
     }))
   } catch {
     await update($, viewStateAtom, prev => ({ ...prev, [PENDING_SRC_KEY]: 'down' }))
-  } finally {
-    pendingInFlight = false
   }
 }
 
@@ -925,7 +931,7 @@ async function refreshSafe($: EngineInterface, options: PluginOptions, cwd: stri
       await update($, snapshotAtom, () => snap)
     }
     await refreshCards($)
-    await refreshPending($)
+    await refreshPending($, cwd)
   } catch (err) {
     try {
       await update($, snapshotAtom, () => ({ ...prev, error: `cannot read run.json (${String(err).slice(0, 40)})` }))

@@ -7,8 +7,9 @@
 import { test, expect } from 'claude-code/testing'
 import type { Elements } from 'claude-code'
 import { mockFs, mockWorld, paneProps, sessionStart, worldFiles, worldFixtures } from './../testkit'
-import { WaitingTab, askView, emptyWaitingView, optionChipRole, readPending, runWaitView, waitingActions, waitingAsks, waitingMoreKey, waitingPick, waitingPickKey, waitingView } from './waiting'
+import { ASK_CAP, WaitingTab, askKey, askView, emptyWaitingView, optionChipRole, readPending, runWaitView, waitingActions, waitingAsks, waitingMoreKey, waitingPick, waitingPickKey, waitingView } from './waiting'
 import type { PendingAsk, RunFn, TabUi, WaitOption } from './waiting'
+import { PENDING_CAPTURED } from './waiting.pending.fixture'
 import { ROLE } from './palette'
 
 const MOCK = /MOCK · fixture data · not this run/
@@ -321,6 +322,22 @@ const runner = (stdout: string, code = 0): RunFn & { calls: number } => {
   return fn
 }
 
+test('the captured real pending output renders its id, task, text and run', () => {
+  const payload = JSON.parse(PENDING_CAPTURED) as { ok: boolean; pending: PendingAsk[] }
+  expect(payload.ok).toBe(true)
+  const ask = payload.pending[0]
+  expect(ask?.id).toBe('m-1')
+  expect(ask?.run).toBe('r1')
+  const tree = waitingAsks(stubEls(), payload.pending, 46, '2026-10-12T12:26:53Z')
+  const texts = allOf(tree, 'Text').map(t => text(t))
+  expect(texts.some(t => t.includes('m-1'))).toBe(true)
+  expect(texts.some(t => t.includes('T1'))).toBe(true)
+  expect(texts.some(t => t.includes('how to proceed?'))).toBe(true)
+  expect(texts.some(t => t.includes('3m')), 'age from the captured ts').toBe(true)
+  expect(texts.some(t => t.includes('mk-bus.py answer m-1 --run r1')), 'the hint names the run').toBe(true)
+  expect(texts.some(t => MOCK.test(t))).toBe(false)
+})
+
 test('a seeded pending ask renders its id, task, text and age', () => {
   const tree = waitingAsks(stubEls(), [ASK_A], 46, NOW)
   const texts = allOf(tree, 'Text').map(t => text(t))
@@ -365,6 +382,34 @@ test('bus down falls back to the run snapshot wait, without the banner', () => {
   expect(view.mock).toBe(false)
 })
 
+test('the same id in two runs gets two keys, and the hint names the run', () => {
+  const a = { ...ASK_A, run: 'r1' }
+  const b = { ...ASK_A, run: 'r2', text: 'other run' }
+  expect(askKey(a)).not.toBe(askKey(b))
+  const texts = allOf(waitingAsks(stubEls(), [a, b], 46, NOW), 'Text').map(t => text(t))
+  expect(texts.some(t => t.includes('--run r1'))).toBe(true)
+  expect(texts.some(t => t.includes('--run r2'))).toBe(true)
+})
+
+test('50 asks cap at 8 cards plus a +N more row, and long, unicode and odd ids fit 46 and 36', () => {
+  const many: PendingAsk[] = Array.from({ length: 50 }, (_, i) => ({
+    id: i === 7 ? 'm-7-odd' : `m-${String(i)}`,
+    run: i % 2 === 0 ? 'r1' : 'r2',
+    task: 'T1',
+    text: i === 3 ? 'a very long question that would overflow a narrow pane if it were not cut: ' + 'x'.repeat(200) : 'ask',
+    ts: NOW,
+  }))
+  many.push({ id: 'm-ü', run: 'r1', task: 'TΩ', text: 'unicode: 質問 🤔 café', ts: NOW })
+  for (const cols of [46, 36]) {
+    const tree = waitingAsks(stubEls(), many, cols, NOW)
+    const widths = textWidths(tree)
+    expect(Math.max(...widths), `${String(cols)} cols`).toBeLessThanOrEqual(cols)
+    const texts = allOf(tree, 'Text').map(t => text(t))
+    expect(texts.filter(t => t.startsWith('m-')).length, 'capped').toBeLessThanOrEqual(ASK_CAP)
+    expect(texts.some(t => t.includes('+') && t.includes('more')), 'the overflow row').toBe(true)
+  }
+})
+
 test('46 and 36 col renders do not overflow', () => {
   for (const cols of [46, 36]) {
     const tree = waitingAsks(stubEls(), [ASK_A, ASK_B], cols, NOW)
@@ -375,12 +420,18 @@ test('46 and 36 col renders do not overflow', () => {
 })
 
 test('the tick calls the runner once, and a dead bus is down without a second spawn', async () => {
-  const live = runner(JSON.stringify({ ok: true, run: 'r1', pending: [ASK_A] }))
-  const got = await readPending(live, '/plugin')
-  expect(live.calls).toBe(1)
+  const seen: string[][] = []
+  const live = (async (argv: readonly string[]) => {
+    seen.push([...argv])
+    return { stdout: PENDING_CAPTURED, code: 0 }
+  }) as unknown as RunFn
+  const got = await readPending(live, '/plugin', '/tmp/proj')
+  expect(seen).toHaveLength(1)
+  expect(seen[0]?.slice(2)).toEqual(['pending', '--data', '/tmp/proj'])
+  expect(seen[0]?.join(' ').includes('--json')).toBe(false)
   expect(got.live).toBe(true)
   expect(got.asks.map(a => a.id)).toEqual(['m-1'])
-  expect(live).toBeTruthy()
+  expect(got.asks[0]?.run).toBe('r1')
   const dead = runner('{"ok": false, "error": "bus down"}', 2)
   const down = await readPending(dead, '/plugin')
   expect(dead.calls).toBe(1)

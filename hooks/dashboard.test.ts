@@ -6,6 +6,7 @@ import type { On, ConfigRow } from 'claude-code'
 import { DATA_DIR, NOW, PROJECT_DIR, RUN_PATH, RUNS_INDEX, USAGE_PATH, agentOf, agentsOf, mockFs, mockWorld, paneProps, sessionStart, sessionStartIn, setRun, setUsage, tasksOf, worldFiles, worldFixtures } from './testkit'
 import type { Files, MockWorld } from './testkit'
 import { parseYamlAgents } from './data'
+import { waitingPane, waitingPaneView } from './dashboard'
 import { mockTabCounts, waitingCount } from './tabs/header'
 
 /** a project matrixkoder.yaml in the wizard's emitter shape: agents block + usage providers */
@@ -2312,4 +2313,29 @@ test('FC: a slow cards read does not hold the tick, and only one read is in flig
   for (let i = 0; i < 20; i++) await clock.advance(0)
   await ui.press({ key: 'dash-tab-kanban' })
   expect(await ui.find({ text: 'Backlog 0' }), 'the landed read draws the empty board').toBeTruthy()
+})
+
+// D8B: the tick's view state feeds the Waiting tab. `waitingPane` parses the
+// stored asks once; `waitingPaneView` picks the fixture, the empty state or the
+// run-snapshot fallback from that one parse.
+test('the waiting tick feeds the tab: live, empty, down, then the fixture', () => {
+  const ask = { id: 'm-1', run: 'r1', task: 'T1', text: 'how to proceed?', ts: '2026-10-12T12:23:53Z' }
+  const live = waitingPane({ 'waiting:src': 'live', 'waiting:pending': JSON.stringify([ask]) })
+  expect(live.src).toBe('live')
+  expect(live.asks).toHaveLength(1)
+  expect(live.asks[0]?.id).toBe('m-1')
+  const again = waitingPane({ 'waiting:src': 'live', 'waiting:pending': JSON.stringify([ask]) })
+  expect(again.asks).toEqual(live.asks)
+  const empty = waitingPaneView({ src: 'live', asks: [] }, null)
+  expect(empty.mock).toBe(false)
+  expect(empty.question).toBe('')
+  const down = waitingPaneView({ src: 'down', asks: [] }, { question: 'hold the merge?', since: '17:41' })
+  expect(down.mock).toBe(false)
+  expect(down.question).toBe('hold the merge?')
+  const fixture = waitingPaneView({ src: 'down', asks: [] }, null)
+  expect(fixture.mock).toBe(true)
+  const unset = waitingPaneView({ src: '', asks: [] }, null)
+  expect(unset.mock).toBe(true)
+  const garbage = waitingPane({ 'waiting:src': 'live', 'waiting:pending': '{not json' })
+  expect(garbage.asks).toEqual([])
 })
