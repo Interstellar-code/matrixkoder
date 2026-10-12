@@ -47,8 +47,8 @@ OUT_FILE = REPO_ROOT / "hooks" / "tabs" / "settings.schema.ts"
 # MIN_YAML is the minimal yaml the schema needs to expose the rows the
 # fixture also draws. Why this exists at all: mk-config.py derives some
 # schema rows from the active yaml — without an `agents:` block, the
-# `agents.<name>.available` rows and the `picks.opencode` row (which is
-# sourced from `opencode.models`) do not appear. The committed file and
+# `agents.<name>.available` rows and the `picks.<agent>` rows (one per agent
+# that lists `models`) do not appear. The committed file and
 # the TS test both rely on those rows being present, so the schema has to
 # be captured with the same minimal yaml. The script writes this yaml into
 # a fresh temp data dir; the real `.matrixkoder/` is never touched.
@@ -60,8 +60,8 @@ MIN_YAML = (
     "agents:\n"
     "  opencode: { available: true, models: [a] }\n"
     "  claude: { available: true }\n"
-    "  codex: { available: true }\n"
-    "  agy: { available: true }\n"
+    "  codex: { available: true, models: [c] }\n"
+    "  agy: { available: true, models: [g] }\n"
     "  herdr: { available: true }\n"
 )
 
@@ -253,11 +253,14 @@ def self_test() -> int:
         "agents.codex.available",
         "agents.agy.available",
         "agents.herdr.available",
+        "picks.opencode",
+        "picks.codex",
+        "picks.agy",
     }
     missing = sorted(expected_agent_keys - schema_keys)
     if missing:
         print(
-            f"self-test FAIL: mk-config stopped emitting agents.* rows from MIN_YAML: {missing}",
+            f"self-test FAIL: mk-config stopped emitting agents.*/picks.* rows from MIN_YAML: {missing}",
             file=sys.stderr,
         )
         return 1
