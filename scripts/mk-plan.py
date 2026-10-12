@@ -13,11 +13,19 @@ Python 3 stdlib only.
                                    rebuild the markdown from the store; body kept verbatim
 
 A plan file: first line +++, TOML until the next +++ line, the rest is free
-markdown, never parsed. Every command prints ONE JSON line.
+markdown, never parsed. A leading UTF-8 BOM is kept: check, approve and export
+round-trip those bytes. Every command prints ONE JSON line.
 Errors: {"ok": false, "errors": ["line N: ..."]} exit 2; missing file exit 3.
 set/add-run rewrite only the target header key's line(s) — the markdown body and
 every other header line (comments included) stay byte-identical — via a temp
 file + os.replace, and the rewritten text is re-parsed before anything is written.
+
+Kill seam (tests only, never set in normal use): MK_PLAN_KILL_AFTER=commit|archive
+raises SystemExit at that step of approve-with-a-store. commit is after the plans
+row and tasks are committed and before the archive exists; archive is after the
+archive file is written and fsynced and before the original is replaced away.
+The next approve converges: it finishes a missing move, or is a no-op when the
+archive bytes already match.
 """
 import argparse, contextlib, datetime, fnmatch, hashlib, importlib.util, json, os, re, shutil, stat, sys, tempfile, tomllib
 
@@ -82,15 +90,18 @@ def load(path):
     except OSError as e:
         raise Fail([f"{type(e).__name__}: {e}"], code=3)
     try:
-        return raw.decode("utf-8").lstrip("\ufeff"), hashlib.sha256(raw).hexdigest()
+        text = raw.decode("utf-8")
     except UnicodeDecodeError:
         raise Fail([f"line 1: {path} is not valid UTF-8"])
+    # a BOM is kept on the text so a later rewrite writes it back; only the parse strips it
+    return text, hashlib.sha256(raw).hexdigest()
 
 
 def split_plan(text):
-    """(lines, close): lines[0] is the opening +++, lines[close] the closing one."""
+    """(lines, close): lines[0] is the opening +++, lines[close] the closing one.
+    A leading BOM stays on lines[0] so rewrites keep it; the +++ check ignores it."""
     lines = text.split("\n")
-    if not lines or lines[0].strip() != "+++":
+    if not lines or lines[0].lstrip("\ufeff").strip() != "+++":
         raise Fail(["line 1: first line must be '+++'"])
     for i in range(1, len(lines)):
         if lines[i].strip() == "+++":
@@ -366,9 +377,21 @@ def check_plan(header, out):
         if len(ws) > 1:
             errors.append(f"lane_group {g}: phases in different waves ({', '.join(str(w) for w in ws)})")
 
-    deps = {p["id"]: [str(d) for d in p["deps"] if ":" not in str(d)]
-            for p in phases if p["id"]}
-    cycle = find_cycle(deps)
+    # same graph validate_tree walks: phases, tasks and subtasks, keyed by id.
+    # a cross-run dep (<run>:<id>) is not an edge here — check cannot see the other run —
+    # and stays the warning recorded above. a self-dep is its own one-node cycle.
+    nodes = {}
+    def add_node(item_id, item_deps):
+        if not item_id or item_id in nodes:
+            return
+        nodes[item_id] = [str(d) for d in item_deps if ":" not in str(d)]
+    for p in phases:
+        add_node(p["id"], p["deps"])
+        for t in p["tasks"]:
+            add_node(t["id"], t.get("deps") or [])
+            for s in t.get("subtasks") or []:
+                add_node(s["id"], s.get("deps") or [])
+    cycle = find_cycle(nodes)
     if cycle:
         errors.append("dep cycle: " + " -> ".join(cycle))
     return errors, warnings
@@ -447,7 +470,8 @@ def rewrite(path, lines, start, end, newline):
 
 
 def write_atomic(path, text):
-    d = os.path.dirname(os.path.abspath(path))
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(d, exist_ok=True)
     try:
         mode = stat.S_IMODE(os.stat(path).st_mode)  # a read-only plan stays read-only
     except OSError:
@@ -461,6 +485,12 @@ def write_atomic(path, text):
             os.fsync(f.fileno())
         os.chmod(tmp, mode)  # mkstemp makes 0600; keep the file's own mode
         os.replace(tmp, path)
+        # fsync the directory so the new name survives a kill
+        dirfd = os.open(d, os.O_RDONLY)
+        try:
+            os.fsync(dirfd)
+        finally:
+            os.close(dirfd)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
@@ -470,11 +500,16 @@ def write_atomic(path, text):
 def set_status(path, value):
     if value not in STATUSES:
         raise Fail([f"bad status {value!r} ({'|'.join(STATUSES)})"])
+    note = None
     if value == "approved":  # F3.1: approving runs the check first; errors refuse the write
         header, out, _ = read_plan(path)
         errors, warnings = check_plan(header, out)
         if errors:
             raise Fail(errors, warnings=warnings)
+        # a cross-run dep stays a warning (check cannot see the other run) but the reply says so
+        cross = [w for w in warnings if "cross-run" in w]
+        if cross:
+            note = "; ".join(cross)
     text, _ = load(path)
     lines, close = split_plan(text)
     span = key_span(lines, "status", close)
@@ -489,7 +524,10 @@ def set_status(path, value):
     header = rewrite(path, lines, start, end, newline)
     if header.get("status") != value:
         raise Fail([f"refusing to write: status is {header.get('status')!r}, wanted {value!r}"])
-    return {"ok": True, "status": value}
+    out = {"ok": True, "status": value}
+    if note:
+        out["warnings"] = [note] if isinstance(note, str) else note
+    return out
 
 
 def add_run(path, run_id):
@@ -567,6 +605,19 @@ def resolve_data_arg(arg):
 
 def now_local():
     return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def approved_bytes(raw):
+    """The file bytes with the first draft status value flipped to approved. BOM and CRLF stay."""
+    if not isinstance(raw, (bytes, bytearray)):
+        raw = raw.encode("utf-8")
+    lines = raw.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        bare = line.lstrip(b"\xef\xbb\xbf").lstrip()
+        if bare.startswith(b"status") and b'"draft"' in line:
+            lines[i] = line.replace(b'"draft"', b'"approved"', 1)
+            break
+    return b"".join(lines)
 
 
 def flat_items(out):
@@ -693,28 +744,45 @@ def approve_file(path, data, home, run):
                 prev = json.loads(row["header_json"])
             except ValueError:
                 prev = {}
-        # the archived file is the approved bytes; a second approve of those bytes is a no-op
+        # the archived file is the approved bytes; a second approve of those bytes is a no-op.
+        # a kill after the archive was written leaves the original in place: finish the move.
         current = open(path, "rb").read()
+        approved = approved_bytes(current)
         if row and os.path.isfile(row["archived_path"] or ""):
-            if open(row["archived_path"], "rb").read() == current:
+            archived_now = open(row["archived_path"], "rb").read()
+            if archived_now == approved or archived_now == current:
+                # finish a kill that wrote the archive and died before the original was removed:
+                # the original is still the pre-approve bytes. a separate copy of the archive
+                # (the self-test no-op) already matches and is left in place.
+                if (archived_now == approved and current != approved
+                        and os.path.abspath(path) != os.path.abspath(row["archived_path"])):
+                    with contextlib.suppress(FileNotFoundError):
+                        os.remove(path)
                 return {"ok": True, "status": "approved", "store": True, "noop": True,
                         "version": row["version"], "archived": row["archived_path"]}
-        version = (row["version"] if row else 0) + 1
-        # a new version replaces this run's tasks from the previous import; other runs stay
-        # drop this plan's tasks whether or not a plans row exists yet: run init may have
-        # inserted the same ids, and a re-approve replaces them
-        for tid, *_rest in flat_items({"phases": (prev.get("phases") or out["phases"])}):
-            con.execute("DELETE FROM tasks WHERE run=? AND id=?", (run_id, tid))
-        con.commit()
+        # a kill after the plans row committed and before the archive existed: finish THAT
+        # version instead of inserting another. the row's archived_path is where it belongs.
+        resume = None
+        if row and row["archived_path"] and not os.path.isfile(row["archived_path"]):
+            resume = row["archived_path"]
+        version = row["version"] if resume else (row["version"] if row else 0) + 1
+        # a new version replaces this run's tasks from the previous import; other runs stay.
+        # a resume keeps the tasks the killed approve already committed.
+        if not resume:
+            # drop this plan's tasks whether or not a plans row exists yet: run init may have
+            # inserted the same ids, and a re-approve replaces them
+            for tid, *_rest in flat_items({"phases": (prev.get("phases") or out["phases"])}):
+                con.execute("DELETE FROM tasks WHERE run=? AND id=?", (run_id, tid))
+            con.commit()
         archive = os.path.join(data, "plans", "archive", f"{plan_id}-v{version}.md")
         header_json = json.dumps({
             "sha": sha, "status": "approved", "runs": out["runs"], "gates": out["gates"],
             "phases": out["phases"], "body": body_md,
         }, sort_keys=True)
-        # tasks first (each add_task commits its own transaction), plans row next, move last.
-        # a later failure deletes only the tasks this call inserted.
+        # tasks first (each add_task commits its own transaction), plans row next, archive last.
+        # a later failure deletes only the tasks this call inserted. a resume only writes the archive.
         try:
-            items = flat_items(out)
+            items = [] if resume else flat_items(out)
             # pass 1: insert with empty deps so a forward dep (a later phase or sibling) exists
             for tid, typ, parent, title, acceptance, owned, deps, parallel, route in items:
                 db.add_task(con, run_id, tid, typ, title=title, parent=parent,
@@ -751,24 +819,26 @@ def approve_file(path, data, home, run):
                 raise
             msg = getattr(e, "args", ("",))[0]
             raise Fail([str(msg)])
-        os.makedirs(os.path.dirname(archive), exist_ok=True)
+        # approved bytes go to the archive first (write_atomic fsyncs), then the original
+        # is replaced away. a kill after the commit but before the archive, or after the
+        # archive but before the original is gone, is recovered by the next approve.
+        if os.environ.get("MK_PLAN_KILL_AFTER") == "commit":
+            raise SystemExit("MK_PLAN_KILL_AFTER=commit")
         try:
-            if out["status"] != "approved":
-                lines = current.splitlines(keepends=True)
-                for i, line in enumerate(lines):
-                    if line.lstrip().startswith(b"status") and b'"draft"' in line:
-                        lines[i] = line.replace(b'"draft"', b'"approved"', 1)
-                        break
-                open(path, "wb").write(b"".join(lines))
-            shutil.move(path, archive)
+            write_atomic(archive, approved)
         except Exception as e:
             for tid in added:
                 con.execute("DELETE FROM tasks WHERE run=? AND id=?", (run_id, tid))
             con.execute("DELETE FROM plans WHERE id=? AND version=?", (plan_id, version))
             con.commit()
-            if os.path.exists(archive) and not os.path.exists(path):
-                shutil.move(archive, path)
             raise Fail([f"archive failed: {e}"])
+        if os.environ.get("MK_PLAN_KILL_AFTER") == "archive":
+            raise SystemExit("MK_PLAN_KILL_AFTER=archive")
+        try:
+            if os.path.abspath(path) != os.path.abspath(archive):
+                os.remove(path)
+        except FileNotFoundError:
+            pass
         return {"ok": True, "status": "approved", "store": True, "version": version,
                 "archived": archive, "run": run_id, "warnings": warnings}
     finally:
@@ -817,7 +887,7 @@ def export_plan(path, data, home):
     if archived and os.path.isfile(archived):
         with open(archived, "rb") as fh:
             raw = fh.read()
-        rebuilt = raw.decode("utf-8")
+        rebuilt = raw.decode("utf-8")  # BOM kept; split_plan accepts it
         split_plan(rebuilt)  # refuse a corrupt archive before writing it back
     else:
         raise Fail([f"archived plan missing: {archived}"])
@@ -1244,7 +1314,8 @@ def self_test():
         n_before = con.execute("SELECT COUNT(*) c FROM tasks").fetchone()["c"]
         con.close()
         bad = mk("approve", cyc, "--data", data, "--home", home, "--run", "r1", code=2)
-        assert any(e.startswith("cycle:") for e in bad["errors"]), bad
+        # check and approve share the graph, so the refusal is check's "dep cycle:" (ids named)
+        assert any("cycle:" in e and "P1.1" in e and "P1.1.1" in e for e in bad["errors"]), bad
         assert open(cyc, "rb").read() == blob
         con = db.open_project(home, data_dir=data)
         assert con.execute("SELECT COUNT(*) c FROM tasks").fetchone()["c"] == n_before
@@ -1299,8 +1370,8 @@ def self_test():
         want = {}
         for ph in parsed["phases"]:
             want[ph["id"]] = ",".join(str(d) for d in ph["deps"])
-            for task in ph["tasks"]:
-                want[task["id"]] = ",".join(str(d) for d in task["deps"])
+            for task_row in ph["tasks"]:
+                want[task_row["id"]] = ",".join(str(d) for d in task_row["deps"])
         out = mk("approve", copy, "--data", data, "--home", home, "--run", "mkstore")
         assert out["ok"] and not os.path.exists(copy), out
         assert os.path.isfile(real)  # the real plan was never moved
@@ -1330,6 +1401,78 @@ def self_test():
         bad = mk("check", noid, code=2)
         assert any("task has no id" in e for e in bad["errors"]), bad
         assert any("subtask has no id" in e for e in bad["errors"]), bad
+
+        # FB — a task-level cycle and a subtask self-dep are check errors, so set cannot approve them
+        tcyc = write("task-cycle.md", plan_text(phases=phase("P1", tasks=(
+            task("P1.1", extra='  deps = "P1.2"\n') + task("P1.2", extra='  deps = "P1.1"\n'))) + "\n"))
+        bad = mk("check", tcyc, code=2)
+        assert any(e.startswith("dep cycle:") and "P1.1" in e and "P1.2" in e for e in bad["errors"]), bad
+        before = open(tcyc, "rb").read()
+        refused = mk("set", tcyc, "--status", "approved", code=2)
+        assert any("dep cycle:" in e for e in refused["errors"])
+        assert open(tcyc, "rb").read() == before
+        refused = mk("approve", tcyc, "--data", empty_data, "--home", empty_home, code=2)
+        assert any("dep cycle:" in e for e in refused["errors"])
+        assert open(tcyc, "rb").read() == before
+        selfdep = write("self-sub.md", plan_text(phases=phase("P1", tasks=task("P1.1", extra=(
+            '  [[phase.task.subtask]]\n  id = "P1.1.1"\n  title = "s"\n  acceptance = "a"\n'
+            '  deps = "P1.1.1"\n  parallel = false\n  route = ""\n  owned = []\n'))) + "\n"))
+        bad = mk("check", selfdep, code=2)
+        assert any("dep cycle:" in e and "P1.1.1" in e for e in bad["errors"]), bad
+        before = open(selfdep, "rb").read()
+        mk("set", selfdep, "--status", "approved", code=2)
+        assert open(selfdep, "rb").read() == before
+
+        # FB — set --status approved names an unresolved cross-run dep instead of staying silent
+        xrefw = write("xref-warn.md", plan_text(phases=phase("P1", deps='"other-run:T1"') + "\n"))
+        warned = mk("set", xrefw, "--status", "approved")
+        assert warned["status"] == "approved", warned
+        assert any("cross-run" in w and "other-run:T1" in w for w in warned.get("warnings") or []), warned
+
+        # FB — a UTF-8 BOM survives check -> approve -> export byte for byte (status flip aside)
+        bom_text = plan_text(plan='plan = "bomplan"', phases=phase("P1", tasks=task("P1.1")) + "\n").replace("\n", "\r\n")
+        bom = write("bom.md", bom_text)
+        raw_bom = b"\xef\xbb\xbf" + open(bom, "rb").read()
+        open(bom, "wb").write(raw_bom)
+        assert mk("check", bom)["ok"] is True
+        out = mk("approve", bom, "--data", data, "--home", home, "--run", "rbom")
+        assert out["ok"] and not os.path.exists(bom), out
+        archived_bom = open(out["archived"], "rb").read()
+        assert archived_bom.startswith(b"\xef\xbb\xbf") and b"\r\n" in archived_bom
+        assert b'status = "approved"' in archived_bom
+        dest = os.path.join(tmp, "bomplan.md")
+        exp = mk("export", dest, "--data", data, "--home", home)
+        assert open(dest, "rb").read() == archived_bom
+
+        # FB — kill seam: 20 trials after the commit and 20 after the archive; the next approve converges
+        for step in ("commit", "archive"):
+            for n in range(20):
+                sdata = os.path.join(tmp, f"seam-{step}-{n}")
+                shome = os.path.join(sdata, ".mk-home")
+                os.makedirs(shome)
+                db.open_project(shome, data_dir=sdata).close()
+                src = write(f"seam-{step}-{n}.md", plan_text(
+                    plan=f'plan = "seam{step}{n}"', phases=phase("P1", tasks=task("P1.1")) + "\n"))
+                env = dict(os.environ, MATRIXKODER_DATA=sdata, MK_PLAN_KILL_AFTER=step)
+                r = subprocess.run([sys.executable, os.path.abspath(__file__), "approve", src,
+                                    "--data", sdata, "--home", shome, "--run", "s1"],
+                                   capture_output=True, text=True, env=env)
+                assert r.returncode != 0, (step, n, r.returncode, r.stdout, r.stderr)
+                env.pop("MK_PLAN_KILL_AFTER", None)
+                r2 = subprocess.run([sys.executable, os.path.abspath(__file__), "approve", src,
+                                     "--data", sdata, "--home", shome, "--run", "s1"],
+                                    capture_output=True, text=True, env=env)
+                assert r2.returncode == 0, (step, n, r2.returncode, r2.stdout, r2.stderr)
+                got = json.loads(r2.stdout.strip().splitlines()[-1])
+                # commit-kill: the next approve finishes the missing archive (same version).
+                # archive-kill: the archive already matches, so the next approve is a no-op
+                # and removes the original.
+                assert got["ok"] and got["version"] == 1, got
+                if step == "archive":
+                    assert got.get("noop") is True, got
+                assert not os.path.exists(src)
+                assert os.path.isfile(got["archived"])
+                assert b'status = "approved"' in open(got["archived"], "rb").read()
 
 
         # the run's plan path still resolves through mk-state after the file is archived
