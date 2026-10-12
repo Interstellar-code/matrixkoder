@@ -820,14 +820,11 @@ def parse_value(raw, r, lines=None):
             raise Fail(f"{r['key']} is a list of strings: {raw} is not")
         if r.get("maxlen") and len(v) > r["maxlen"]:
             raise Fail(f"{r['key']} takes at most {r['maxlen']} entries: {raw} has {len(v)}")
-        if r["key"] == "routing_preferences.builder_order" and any(x == "codex" for x in v):
+        if r["key"] == "routing_preferences.builder_order" and any(
+                x.strip().casefold() == "codex" for x in v):
             raise Fail(f"{r['key']}: codex is never a builder; {raw}")
-        for x in v:
-            if r.get("pool") and x not in r["pool"]:
-                saved = value_of(lines, r)[1] if lines is not None else []
-                if isinstance(saved, list) and x in saved:
-                    continue  # already saved and since dropped from the pool: kept, not a new pick
-                raise Fail(f"{r['key']}: {x} is not a model of that agent")
+        # pool membership is checked again under the lock (cmd_set re-reads). This pass only
+        # rejects a shape that cannot be a list of strings.
     else:
         if not isinstance(v, str):
             raise Fail(f"{r['key']} is a string: {raw} is not")
@@ -859,6 +856,10 @@ def cmd_list(path, lines):
             f["opts"] = opts
             if r["key"] in ROUTE_KEYS and any(n == "stale" for (_v, n) in opts):
                 f["stale"] = True  # a saved route the catalog no longer lists stays visible and flagged
+        if r["key"] == "routing_preferences.builder_order" and isinstance(value, list):
+            bad = [x for x in value if isinstance(x, str) and x.strip().casefold() == "codex"]
+            if bad:  # a hand edit from before the rule: shown, flagged, not silently dropped
+                f["unavailable"] = bad
         if r.get("pool") is not None:
             f["pool"] = list(r["pool"])  # the only models `set` accepts for this agent: one pool, picker and validator
             if r["type"] == "list" and isinstance(value, list):
@@ -917,6 +918,13 @@ def cmd_set(path, lines, args):
         lines = read_lines(path)  # the copy main() read is stale once another writer held the lock
         r = row_for(lines, key) or r
         found, current = value_of(lines, r)
+        if r.get("pool") and isinstance(value, list):
+            for x in value:
+                if x not in r["pool"]:
+                    saved = current if isinstance(current, list) else []
+                    if x in saved:
+                        continue  # already saved and since dropped from the pool: kept
+                    raise Fail(f"{r['key']}: {x} is not a model of that agent")
         if found and current == value:  # a save sends every row it holds, most of them unchanged
             return out({"ok": True, "key": key, "value": value, "file": path, "changed": False})
         new, count = patch(lines, r, value)  # refused shapes raise before anything is touched
@@ -1118,6 +1126,8 @@ def cmd_context(path, lines, usage_arg=None):
         "ok": True,
         "policy": val("routing_preferences.policy"),
         "builder_order": val("routing_preferences.builder_order"),
+        "builder_order_unavailable": [x for x in val("routing_preferences.builder_order")
+                                      if isinstance(x, str) and x.strip().casefold() == "codex"],
         "max_build_lanes": val("routing_preferences.max_build_lanes"),
         "reviewer": val("routing_preferences.reviewer"),
         "visual_reviewer": val("routing_preferences.visual_reviewer"),
@@ -1256,12 +1266,15 @@ def refresh_models(lines):
 
 
 def cmd_probe(path, lines):
+    """Probe without the lock (each CLI may take PROBE_TIMEOUT_S), then lock only to re-read,
+    apply the result and write. A set during the probes is not blocked."""
+    probed = _probe_collect(lines)
     with yaml_lock(path):
-        return _probe_locked(path, read_lines(path))
+        return _probe_write(path, read_lines(path), probed)
 
 
-def _probe_locked(path, lines):
-    """Probe body. Caller holds yaml_lock for the probes and the write, so a set waits."""
+def _probe_collect(lines):
+    """The probe results and the model ids, computed before the lock is taken."""
     herdr_status = probe_herdr()
     mcp_statuses = probe_claude_mcps()
     canary_status = probe_canary()
@@ -1276,7 +1289,16 @@ def _probe_locked(path, lines):
         "canary": canary_status,
         "probed_at": now_iso,
     }
+    models = {}
+    for agent, cli in MODEL_CLIS.items():
+        ids = probe_models(cli)
+        models[agent] = ids
+    return res, models
 
+
+def _probe_write(path, lines, probed):
+    """Apply a finished probe to the yaml. Caller holds yaml_lock and just re-read `lines`."""
+    res, models = probed
     helpers_line = (f"helpers: {{ herdr: {res['herdr']}, jev: {res['jev']}, "
                     f"context_mode: {res['context_mode']}, codebase_memory: {res['codebase_memory']}, "
                     f"canary: {res['canary']}, probed_at: {json.dumps(res['probed_at'])} }}")
@@ -1314,11 +1336,29 @@ def _probe_locked(path, lines):
 
     checks = [(f"helpers.{hid}", res[hid], row_for(new, f"helpers.{hid}"))
               for hid, _help in HELPERS]
-    new, res["models"], model_checks = refresh_models(new)
+    new, state, model_checks = _apply_models(new, models)
+    res["models"] = state
     checks += model_checks
     count = changed_lines(lines, new)
     write_yaml(path, lines, new, count, checks)
     return out(res)
+
+
+def _apply_models(lines, models):
+    """Patch agents.<a>.models from ids already collected. [] means the CLI did not answer:
+    leave that agent's list as it is."""
+    new, state, checks = lines, {}, []
+    for agent, ids in models.items():
+        state[agent] = "unchanged"
+        if not ids:
+            continue
+        r = agent_models_row(agent)
+        if not value_of(new, r)[0]:
+            continue
+        new, _count = patch(new, r, ids)
+        state[agent] = "updated"
+        checks.append((r["key"], ids, r))
+    return new, state, checks
 
 
 def main(argv=None):
@@ -2235,18 +2275,53 @@ def self_test():
         assert rd() == before and not os.path.exists(bak)
         refused = run("set", "routing_preferences.builder_order", '["opencode", "codex"]', ok=False)
         assert "never a builder" in refused["error"] and rd() == before
+        for shaped in ('["CODEX"]', '["Codex"]', '["agy", "codex "]', '[" codex"]'):
+            refused = run("set", "routing_preferences.builder_order", shaped, ok=False)
+            assert "never a builder" in refused["error"], (shaped, refused)
+            assert rd() == before and not os.path.exists(bak)
+
+        # a yaml that already names codex: list and context flag it, and a valid value re-saves
+        hand = before.replace("builder_order:", "builder_order: [opencode, codex, agy] #", 1)
+        if "builder_order:" not in before:
+            hand = before + "\nrouting_preferences:\n  builder_order: [opencode, codex, agy]\n"
+        # the fixture's builder_order line is replaced whole so the old value does not remain
+        lines_now = before.splitlines(keepends=True)
+        rewritten = []
+        for ln in lines_now:
+            if ln.lstrip().startswith("builder_order:"):
+                rewritten.append("  builder_order: [opencode, codex, agy]\n")
+            else:
+                rewritten.append(ln)
+        with open(yaml_path, "w") as f:
+            f.write("".join(rewritten))
+        listed = next(f for f in run("list", "--json")["fields"]
+                      if f["key"] == "routing_preferences.builder_order")
+        assert "codex" in listed["value"] and listed.get("unavailable") == ["codex"], listed
+        ctx = run("context")
+        assert ctx["builder_order_unavailable"] == ["codex"], ctx
+        run("set", "routing_preferences.builder_order", '["opencode", "agy"]')
+        assert run("get", "routing_preferences.builder_order")["value"] == ["opencode", "agy"]
+        with open(yaml_path, "w") as f:
+            f.write(before)
 
         # 32. the lock serialises two real set processes, and a holder that never releases it
-        #     makes set return the named error inside the wait bound with the yaml unchanged.
+        #     makes set return the named error inside a bound scaled from a measured spawn.
         import signal as _signal
         run("set", "session.stall_min", "15")
         before = rd()
+        devnull = subprocess.DEVNULL
+        t_spawn = time.monotonic()
+        warm = subprocess.Popen([sys.executable, "-c", "pass"], stdout=devnull, stderr=devnull)
+        warm.wait()
+        spawn_s = max(0.5, time.monotonic() - t_spawn)
         procs = [
-            subprocess.Popen([sys.executable, script, "set", "session.stall_min", "22"], env=env, cwd=tmp),
-            subprocess.Popen([sys.executable, script, "set", "session.max_wait_min", "40"], env=env, cwd=tmp),
+            subprocess.Popen([sys.executable, script, "set", "session.stall_min", "22"],
+                             env=env, cwd=tmp, stdout=devnull, stderr=devnull),
+            subprocess.Popen([sys.executable, script, "set", "session.max_wait_min", "40"],
+                             env=env, cwd=tmp, stdout=devnull, stderr=devnull),
         ]
         for proc in procs:
-            proc.wait(timeout=30)
+            proc.wait(timeout=max(30, LOCK_WAIT_S + spawn_s * 20))
         after = rd()
         assert "stall_min: 22" in after and "max_wait_min: 40" in after, after
         hold = os.path.join(data, "matrixkoder.yaml.lock")
@@ -2257,20 +2332,47 @@ def self_test():
             busy = run("set", "session.stall_min", "30", ok=False)
             waited = time.monotonic() - t0
             assert "matrixkoder.yaml.lock busy" in busy["error"], busy
-            assert waited < LOCK_WAIT_S + 2, waited
+            assert waited < LOCK_WAIT_S + max(2, spawn_s * 10), (waited, spawn_s)
             assert rd() == after
         finally:
             fcntl.flock(hf, fcntl.LOCK_UN)
             hf.close()
-        # kill -9 of a holder: the kernel drops the flock and the next set proceeds
+        # kill -9 only after the child has the lock, so the assertion cannot pass vacuously
+        ready = os.path.join(tmp, "lock-held")
         sleeper = subprocess.Popen(
             [sys.executable, "-c",
-             "import fcntl,time; f=open(%r,'a'); fcntl.flock(f,fcntl.LOCK_EX); time.sleep(60)" % hold])
-        time.sleep(0.2)
+             "import fcntl,time; f=open(%r,'a'); fcntl.flock(f,fcntl.LOCK_EX); "
+             "open(%r,'w').write('held'); time.sleep(60)" % (hold, ready)],
+            stdout=devnull, stderr=devnull)
+        deadline = time.monotonic() + max(5, spawn_s * 20)
+        while not os.path.exists(ready):
+            assert time.monotonic() < deadline, "the holder never took the lock"
+            assert sleeper.poll() is None, "the holder exited before taking the lock"
+            time.sleep(0.05)
         sleeper.send_signal(_signal.SIGKILL)
-        sleeper.wait(timeout=5)
+        sleeper.wait(timeout=max(5, spawn_s * 10))
         run("set", "session.stall_min", "18")
         assert "stall_min: 18" in rd()
+
+        # 33. a probe whose CLI sleeps does not block a concurrent set; both results land
+        make_bin("herdr", "#!/bin/sh\nsleep 8\nexit 0\n")
+        make_bin("claude", "#!/bin/sh\nexit 1\n")
+        make_bin("npx", "#!/bin/sh\nexit 1\n")
+        make_bin("opencode", "#!/bin/sh\nexit 1\n")
+        make_bin("agy", "#!/bin/sh\nexit 1\n")
+        before_set = rd()
+        probe_p = subprocess.Popen([sys.executable, script, "probe"], env=env, cwd=tmp,
+                                   stdout=devnull, stderr=devnull)
+        time.sleep(0.3)  # let the probe enter the slow CLI before set starts
+        t0 = time.monotonic()
+        set_during = run("set", "session.stall_min", "19")
+        set_dt = time.monotonic() - t0
+        assert set_during.get("ok") and set_dt < 5, (set_dt, set_during)
+        probe_p.wait(timeout=40)
+        final = rd()
+        assert "stall_min: 19" in final, final
+        assert "herdr: stale" in final or "herdr: ok" in final, final
+        assert "probed_at:" in final
     finally:
         if restore:
             restore()
