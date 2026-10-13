@@ -891,7 +891,7 @@ class BusState:
             mid = msg["id"]
             if mid in self.rung or mid in self._ring_inflight or any(q["id"] == mid for q in self._ring_queue):
                 return
-            self._ring_queue.append(dict(msg, queued_at=time.time()))
+            self._ring_queue.append(dict(msg, queued_at=msg.get("queued_at") or time.time()))
             self._ring_cap_locked()
         self._ring_wake.set()
 
@@ -938,6 +938,7 @@ class BusState:
                     batch.append(m)
                 self._ring_queue = []
                 self._ring_inflight = {m["id"] for m in batch}
+            self._save_ring_queue(batch)  # a kill mid-herdr-call must not lose the claimed rows
             still = []
             try:
                 agents = self._herdr_agents() if batch else []
@@ -946,6 +947,7 @@ class BusState:
                         self._drain_one(msg, agents, still)
                     except Exception as e:
                         sys.stderr.write("ring failed: %r\n" % (e,))
+                        self._ring_raised(msg, still)
             finally:
                 with self._ring_lock:
                     self._ring_queue = still + self._ring_queue
@@ -953,6 +955,23 @@ class BusState:
                     self._ring_cap_locked()
             self._save_ring_queue()
             self._flush_ring_notes()
+
+    def _ring_raised(self, msg, still):
+        """A claimed message whose drain raised: retry once on the next tick, then give up with a note."""
+        attempts = msg["_attempts"] = msg.get("_attempts", 0) + 1
+        final = attempts >= 2
+        with self._ring_lock:
+            self._ring_notes.append((
+                msg, "ring-failed",
+                "ring raised (attempt %d%s)" % (attempts, ", giving up" if final else ""),
+                {"final": final},
+            ))
+            if final:
+                self.rung.add(msg["id"])  # never queued again
+            else:
+                self.rung.discard(msg["id"])
+        if not final:
+            still.append(msg)
 
     def _drain_one(self, msg, agents, still):
         """One claimed message: ring it, keep it queued (append to `still`), or drop it."""
@@ -1097,7 +1116,8 @@ class BusState:
             if len(named) == 1:
                 return named[0], self._pane_id(named[0])
         if watch_pane:
-            known = [a for a in tier if self._pane_id(a) == watch_pane and a.get("agent_status") is not None]
+            known = [a for a in tier if self._pane_id(a) == watch_pane and a.get("agent_status") is not None
+                     and a.get("cwd") and os.path.realpath(a["cwd"]) in lanes]
             if len(known) == 1:
                 return known[0], self._pane_id(known[0])
         return "ambiguous"
@@ -1162,27 +1182,26 @@ class BusState:
     def _ring_queue_path(self):
         return os.path.join(self.data_dir, "ring-queue.json")
 
-    def _save_ring_queue(self):
+    def _save_ring_queue(self, claimed=()):
         """Persist queued rings so a restart can drain them once the lane is idle.
 
-        The queue is messages that arrived while the lane was working. It is
-        not the ring event itself; _ring still records that before typing.
+        The queue is messages that arrived while the lane was working, plus the
+        batch a drain has claimed and not finished. It is not the ring event
+        itself; _ring still records that before typing. restore_rings reads it.
         """
         if not self.use_store:
             return
         with self._ring_lock:
-            snapshot = list(self._ring_queue)
+            snapshot = list(claimed) + list(self._ring_queue)
         try:
             write_json(self._ring_queue_path(), snapshot, mode=0o600)
         except OSError as e:
             sys.stderr.write("ring queue save failed: %r\n" % (e,))
 
     def _load_ring_queue(self):
-        if not self.use_store:
-            return
+        """Rows saved by _save_ring_queue; anything unreadable is no rows."""
         saved = read_json(self._ring_queue_path(), default=[])
-        if isinstance(saved, list):
-            self._ring_queue = [m for m in saved if isinstance(m, dict) and m.get("id")]
+        return [m for m in saved if isinstance(m, dict) and m.get("id")] if isinstance(saved, list) else []
 
     def restore_rings(self):
         """On startup: a recorded-but-untyped ring is queued (never typed here); a typed one never again.
@@ -1213,15 +1232,27 @@ class BusState:
                 done.add(mid)
             elif row.get("kind") == "ring" and mid:
                 pending.append((mid, row))
+        self.rung |= {d for d in done if d}
+        # A saved row carries the whole message and its queued_at; a store `ring` row
+        # (recorded, not typed) adds the event id so the retry does not record a second.
+        saved = {m["id"]: m for m in self._load_ring_queue()}
+        now = time.time()
         for mid, row in pending:
-            self.rung.add(mid)
             if mid in done:
                 continue
-            self.rung.discard(mid)
-            self._ring_enqueue({
-                "id": mid, "run": row.get("run"), "to": row.get("to_id"),
-                "project": self.project, "_ring_eid": row.get("id"),
-            })
+            msg = saved.pop(mid, None) or {
+                "id": mid, "run": row.get("run"), "to": row.get("to_id"), "project": self.project,
+            }
+            msg["_ring_eid"] = row.get("id")
+            self._ring_enqueue(msg)
+        for mid, msg in saved.items():
+            if mid in done:
+                continue
+            if now - msg.get("queued_at", now) > RING_MAX_AGE:
+                with self._ring_lock:
+                    self._ring_notes.append((msg, "ring-dropped", "expired after 1 hour"))
+                continue
+            self._ring_enqueue(msg)
 
     def ring_worker(self, stop_event):
         """Run every herdr call: drain the doorbell queue when woken and on a fixed interval.
@@ -1594,10 +1625,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                     rstate = bus.get_run_state(run, project_dir)
                     cond = rstate["cond"]
 
+                run_ids = []  # run=* only: grows when a new run id appears
+
                 def fresh(last):
                     """Messages after `last` for the lane, oldest first; holds `cond`'s lock."""
                     if all_runs:
-                        states = [bus.get_run_state(r["id"], project_dir) for r in store.store_select("SELECT id FROM runs")]
+                        states = [bus.get_run_state(r, project_dir) for r in run_ids]
                     else:
                         states = [rstate]
                     got = [m for st in states for m in st["messages"] if m["seq"] > last and matches_lane(m, lane)]
@@ -1606,15 +1639,19 @@ class RequestHandler(BaseHTTPRequestHandler):
 
                 while True:
                     to_send = []
-                    with cond:
-                        for attempt in (0, 1):
+                    for attempt in (0, 1):
+                        if all_runs:
+                            # The run list is read once per wake, outside bus.lock.
+                            run_ids.extend(r["id"] for r in store.store_select("SELECT id FROM runs") if r["id"] not in run_ids)
+                        with cond:
                             for m in fresh(last_seq):
                                 to_send.append(dict(m))
                                 m["ack_level"] = max(m.get("ack_level", 1), 2)
                                 last_seq = m["seq"]
-                            if to_send or attempt:
-                                break
-                            cond.wait(timeout=15.0)
+                            if not to_send and not attempt:
+                                cond.wait(timeout=15.0)
+                        if to_send or attempt:
+                            break
 
                     # The lock is released before the socket write. A slow SSE
                     # client must not hold the run lock or a store connection.
@@ -2919,7 +2956,8 @@ def cmd_watch(args):
     main session as a notification. After a drop or a bus RESTART it resumes
     with Last-Event-ID and re-reads bus.json for the new port. Exit 4 only
     when the bus stays down for WATCH_DOWN_SEC (60 s), never on one blip.
-    Without --run it streams every run of the project (`run=*`). A 4xx from
+    Without --run it streams every run of the project (`run=*`; in file mode
+    the bus's own run, since `run=*` needs the project store). A 4xx from
     the bus prints the error on one line and exits 5, as ask/wait/inbox do.
     """
     data_dir = resolve_data(getattr(args, "data", None))
@@ -2956,7 +2994,8 @@ def cmd_watch(args):
             continue
 
         try:
-            qs = urllib.parse.urlencode({"lane": "*", "run": run or "*"})
+            # `run=*` needs the project store; a file-mode bus answers for its own run.
+            qs = urllib.parse.urlencode({"lane": "*", **({"run": run or "*"} if run or store_mode(data_dir) else {})})
             req = urllib.request.Request(
                 f"http://127.0.0.1:{port}/events?{qs}",
                 headers={
@@ -3740,6 +3779,10 @@ def _store_self_test_body(mod):
         os.environ["MK_BUS_RING_INTERVAL_SEC"] = "0.2"
         write_status("idle")
         kill(pid2)
+        # Messages queued in the earlier no-herdr phases now survive a restart; this
+        # block counts rings from a clean queue.
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(os.path.join(home, "ring-queue.json"))
         pid2, port2 = spawn(data, "r1")
         orch = mint_orch(data)
         btok = remint()
@@ -4024,6 +4067,8 @@ def _store_self_test_body(mod):
         # the worktree cwd is what finds pane wE:p2.
         os.environ["MK_BUS_RING_INTERVAL_SEC"] = "0.2"
         kill(pid2)
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(os.path.join(home, "ring-queue.json"))  # rows from the no-herdr phases above
         pid2, port2 = spawn(data, "r1")
         btok = remint()
         os.environ.pop("MK_BUS_RING_INTERVAL_SEC", None)
@@ -4235,7 +4280,75 @@ def _store_self_test_body(mod):
         wait_prompts(n0 + 1)
         time.sleep(0.6)
         assert len(prompt_calls()) == n0 + 1, prompt_calls()[n0:]
+
+        # E2 R4 (1): a message queued for a working lane has no `ring` row yet; it must
+        # survive a kill -9 through ring-queue.json and ring exactly once after restart.
+        os.environ["MK_BUS_RING_INTERVAL_SEC"] = "0.2"
+        kill(pid2)
+        pid2, port2 = spawn(data, "r1")
+        btok = remint()
+        set_agents(dict(p2, agent_status="working"))
+        n0 = len(prompt_calls())
+        code, queued_kill = send_to("queued across kill -9")
+        assert code == 200, (code, queued_kill)
+        queued_id = queued_kill["message"]["id"]
+        queue_file = os.path.join(home, "ring-queue.json")
+        deadline = time.time() + 5.0
+        while time.time() < deadline and not any(m.get("id") == queued_id for m in read_json(queue_file, default=[])):
+            time.sleep(0.1)
+        assert any(m.get("id") == queued_id for m in read_json(queue_file, default=[])), "queue file lacks the row"
+        os.kill(pid2, signal.SIGKILL)
+        deadline = time.time() + 5.0
+        while time.time() < deadline and is_pid_alive(pid2):
+            time.sleep(0.05)
+        assert not is_pid_alive(pid2), pid2
+        pid2, port2 = spawn(data, "r1")
+        btok = remint()
+        time.sleep(1.0)
+        assert len(prompt_calls()) == n0, ("restore typed into a working agent", prompt_calls()[n0:])
+        set_agents(p2)
+        wait_prompts(n0 + 1)
+        time.sleep(0.6)
+        assert len(prompt_calls()) == n0 + 1, ("queued row rings once after kill -9", prompt_calls()[n0:])
+
+        # E2 R4 (2): a drain that raises (the append-fail seam hits the ring row) puts the
+        # claimed message back; it rings on the next tick, with one non-final ring-failed note.
+        set_agents(dict(p2, agent_status="working"))
+        n0, failed0, ring0 = len(prompt_calls()), event_count("ring-failed"), event_count("ring")
+        assert send_to("drain raises")[0] == 200
+        time.sleep(0.6)
+        flag = os.path.join(data, "append-fail")
+        open(flag, "w").close()
+        set_agents(p2)
+        wait_prompts(n0 + 1)
+        time.sleep(0.6)
+        assert not os.path.exists(flag), "the seam was not consumed by the drain"
+        assert len(prompt_calls()) == n0 + 1, ("a raised drain is retried once", prompt_calls()[n0:])
+        assert event_count("ring-failed") == failed0 + 1, event_count("ring-failed") - failed0
+        assert event_count("ring") == ring0 + 1, event_count("ring") - ring0
         os.environ.pop("MK_BUS_RING_INTERVAL_SEC", None)
+        # The attempt counter bounds it: attempt 1 re-queues, attempt 2 gives up and keeps the id rung.
+        stub = BusState.__new__(BusState)
+        stub._ring_lock, stub._ring_notes, stub.rung = threading.Lock(), [], set()
+        raised_msg, raised_still = {"id": "m-raised"}, []
+        stub._ring_raised(raised_msg, raised_still)
+        assert raised_still == [raised_msg] and "m-raised" not in stub.rung, (raised_still, stub.rung)
+        assert stub._ring_notes[-1][1:2] == ("ring-failed",) and stub._ring_notes[-1][3] == {"final": False}
+        raised_still.clear()
+        stub._ring_raised(raised_msg, raised_still)
+        assert raised_still == [] and "m-raised" in stub.rung, (raised_still, stub.rung)
+        assert stub._ring_notes[-1][3] == {"final": True}, stub._ring_notes[-1]
+
+        # E2 R4 (4b): the pane recorded in the watch file counts only if that agent's cwd is the lane worktree.
+        lane_w = os.path.join(tmp, "lane-w")
+        os.makedirs(lane_w, exist_ok=True)
+        write_json(os.path.join(lane_w, ".matrixkoder-watch.json"), {"pane": "wE:p6"})
+        stub.data_dir = home
+        lanes_w = {os.path.realpath(lane_w)}
+        tier_w = [ag("wE:p5", "idle", "a", lane_w), ag("wE:p6", "idle", "b", os.path.join(tmp, "elsewhere"))]
+        assert stub._disambiguate(tier_w, lanes_w) == "ambiguous", "a reused pane id in another cwd was accepted"
+        tier_w[1]["cwd"] = lane_w
+        assert stub._disambiguate(tier_w, lanes_w)[1] == "wE:p6"
 
         # herdr missing entirely: no ring, no crash, the bus still serves.
         os.environ["PATH"] = os.path.join(tmp, "emptybin")
@@ -4440,6 +4553,98 @@ def _store_self_test_body(mod):
         assert rc_4xx.returncode == 5, (rc_4xx.returncode, rc_4xx.stderr)
         assert rc_4xx.stderr.strip() == "HTTP 400: invalid run id", rc_4xx.stderr
         assert rc_4xx.stdout == "" and time.time() - t0 < 10.0
+
+        # E2 R4 (4c): a 401 is a 4xx too: the real bus refuses a stale token, watch exits 5 at once.
+        stale_home = os.path.join(tmp, "stale-bus-home")
+        os.makedirs(stale_home)
+        write_json(os.path.join(stale_home, "bus.json"), {"port": port2, "token": "stale-" + "t" * 20}, mode=0o600)
+        t0 = time.time()
+        rc_401 = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "watch", "--data", data],
+            env=dict(os.environ, MK_BUS_DIR=stale_home),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20,
+        )
+        assert rc_401.returncode == 5, (rc_401.returncode, rc_401.stderr)
+        assert rc_401.stderr.strip().startswith("HTTP 401: "), rc_401.stderr
+        assert rc_401.stdout == "" and time.time() - t0 < 10.0
+
+        # E2 R4 (4c): `run=*` stays inside the token's project. projb (made above) holds
+        # its own run r1; the same run name in two projects is kept apart.
+        tok_b = secrets.token_urlsafe(32)
+        tokens_path_b = os.path.join(home, "bus-tokens.json")
+        toks_b = read_json(tokens_path_b, default={})
+        toks_b[tok_b] = {"token": tok_b, "role": "orch", "run": "r1", "task": "", "lane": "",
+                         "project": "projb", "created_at": now_iso()}
+        write_json(tokens_path_b, toks_b, mode=0o600)
+        assert post(port2, tok_b, {"run": "r1", "task": "T1", "kind": "info", "text": "star probe projb",
+                                   "from": "orch", "to": "T1", "project": "projb"})[0] == 200
+        assert post(port2, orch_nr, {"run": "r1", "task": "T9", "kind": "info", "text": "star probe proj",
+                                     "from": "orch", "to": "T9"})[0] == 200
+
+        def star_texts(token):
+            """Text of every message `run=*` replays for this token (read until the stream idles)."""
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port2}/events?lane=*&run=*",
+                headers={"Authorization": f"Bearer {token}", "Last-Event-ID": "m-0",
+                         "Host": f"127.0.0.1:{port2}"},
+            )
+            seen = []
+            try:
+                with urllib.request.urlopen(req, timeout=1.5) as resp:
+                    while True:
+                        ln = resp.readline()
+                        if not ln:
+                            break
+                        if ln.startswith(b"data:"):
+                            seen.append(json.loads(ln[5:].decode("utf-8")).get("text"))
+            except (TimeoutError, socket.timeout, urllib.error.URLError):
+                pass
+            return seen
+
+        texts_a, texts_b = star_texts(orch_nr), star_texts(tok_b)
+        assert "star probe proj" in texts_a and "star probe projb" not in texts_a, texts_a[-5:]
+        assert "star probe projb" in texts_b and "star probe proj" not in texts_b, texts_b[-5:]
+
+        # E2 R4 (3): a FILE-mode bus (no mk.db) started with --run: `run=*` is a 400 there, and
+        # `watch` without --run follows the bus's own run.
+        fm_home = os.path.join(tmp, "fm-home")
+        fm_data = os.path.join(tmp, "fm-data")
+        os.makedirs(fm_home)
+        os.makedirs(fm_data)
+        assert not store_mode(fm_data)
+        saved_bus_dir = os.environ["MK_BUS_DIR"]
+        os.environ["MK_BUS_DIR"] = fm_home
+        pid_fm = None
+        try:
+            pid_fm, port_fm = spawn(fm_data, "r1")
+            tok_fm = read_json(os.path.join(fm_home, "bus.json"))["token"]
+            try:
+                urllib.request.urlopen(urllib.request.Request(
+                    f"http://127.0.0.1:{port_fm}/events?lane=*&run=*",
+                    headers={"Authorization": f"Bearer {tok_fm}", "Host": f"127.0.0.1:{port_fm}"}), timeout=5.0)
+                raise AssertionError("file-mode run=* was served")
+            except urllib.error.HTTPError as e:
+                assert e.code == 400 and b"project store" in e.read(), e.code
+            watch_fm = subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__), "watch", "--data", fm_data, "--max-messages", "1"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
+            )
+            pids.append(watch_fm.pid)
+            try:
+                code, sent_fm = post(port_fm, tok_fm, {"run": "r1", "task": "T1", "kind": "info",
+                                                       "text": "file mode", "from": "orch", "to": "T1"})
+                assert code == 200, (code, sent_fm)
+                out_fm, err_fm = watch_fm.communicate(timeout=20)
+            finally:
+                if watch_fm.poll() is None:
+                    stop_process(watch_fm.pid)
+                    watch_fm.wait(timeout=10)
+            assert watch_fm.returncode == 0, (watch_fm.returncode, err_fm)
+            assert " r1 T1 info orch->T1: file mode" in out_fm, out_fm
+        finally:
+            if pid_fm:
+                kill(pid_fm)
+            os.environ["MK_BUS_DIR"] = saved_bus_dir
 
         os.environ.pop("MK_BUS_E2_HERDR_LOG", None)
         os.environ.pop("MK_BUS_E2_HERDR_JSON", None)
