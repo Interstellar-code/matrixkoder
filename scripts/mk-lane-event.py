@@ -2029,14 +2029,16 @@ def self_test():
         old = f"{int(time.time() - 300)} +0000"
         g(lanes["H5"], "commit", "-q", "--allow-empty", "-m", "chore: wip",
           dates={"GIT_COMMITTER_DATE": old, "GIT_AUTHOR_DATE": old})
+        for i in (1, 2):  # H5 has two modified files, old enough not to count as activity: the alive hint
+            wip = os.path.join(lanes["H5"], f"wip{i}.txt")
+            open(wip, "w").write("x")
+            os.utime(wip, (time.time() - 300, time.time() - 300))
         arm("H5", stall_min=1)
         patch_watch("H5", last_activity=time.time() - 90)  # silence since 90 s ago
         g(lanes["H6"], "commit", "-q", "--allow-empty", "-m", "chore: fresh")
         arm("H6", stall_min=1)
         open(status_f, "w").write("idle")
         open(pane_f, "w").write("quiet\n")
-        for i in (1, 2):  # H5 is silent but has two modified files: the alive hint
-            open(os.path.join(lanes["H5"], f"wip{i}.txt"), "w").write("x")
         r = cli("sweep")
         assert r["ok"] and r["checked"] == 3 and r["skipped"] == 3, r  # H3 H5 H6 checked, H1 H2 H4 skipped
         v = {x["task"]: x for x in r["verdicts"]}
