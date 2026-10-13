@@ -1,0 +1,222 @@
+// Captured mkdb reply, generated from plan-detail.json. Do not hand-edit.
+const data = {
+  "ok": true,
+  "id": "settings-plans-db",
+  "title": "Settings field mapping, plans in the DB, and Plan tab sub-tabs",
+  "status": "running",
+  "created": "2026-10-13",
+  "design": [
+    ".matrixkoder/plans/settings-tab.md",
+    ".matrixkoder/plans/settings-wire.md",
+    ".matrixkoder/plans/dashboard-v2.md",
+    ".matrixkoder/plans/mk-store.md"
+  ],
+  "integration": "main",
+  "version": 5,
+  "approved_at": "2026-10-13T21:30:56+02:00",
+  "runs": [
+    "settings-plans-db-r1"
+  ],
+  "live_run": "settings-plans-db-r1",
+  "counts": {
+    "merged": 8,
+    "done": 2,
+    "planned": 3,
+    "building": 1
+  },
+  "phases": [
+    {
+      "id": "R1",
+      "title": "Self-tests never write a real DB: one MK home variable, temp homes in every self-test, a write guard; matrixkoder registered by name",
+      "wave": 1,
+      "deps": [],
+      "status": "merged",
+      "tasks": [
+        {
+          "id": "R1.1",
+          "title": "One home rule: mkdb.py ($MK_HOME) and mk-state.py ($MATRIXKODER_HOME) resolve the MK home the same way; selftest.sh and every --self-test set it to a temp dir",
+          "status": "merged",
+          "parent": "R1",
+          "type": "task",
+          "round": 0,
+          "verdict": "approve",
+          "subtasks": []
+        },
+        {
+          "id": "R1.2",
+          "title": "Write guard: a process started with MK_SELFTEST=1 refuses to open a DB under the real ~/.matrixkoder or a real repo's .matrixkoder for writing (reads allowed)",
+          "status": "merged",
+          "parent": "R1",
+          "type": "task",
+          "round": 0,
+          "verdict": "approve",
+          "subtasks": []
+        },
+        {
+          "id": "R1.3",
+          "title": "Register matrixkoder in the root projects table with its name and repo path (the store-enable row has a hash slug and an empty repo)",
+          "status": "merged",
+          "parent": "R1",
+          "type": "task",
+          "round": 0,
+          "verdict": "approve",
+          "subtasks": []
+        }
+      ]
+    },
+    {
+      "id": "T1",
+      "title": "Plan template is the contract: every header key names its DB home, H1 title rule, import/approve lifecycle; plan check warns on gaps",
+      "wave": 1,
+      "deps": [],
+      "status": "done",
+      "tasks": [
+        {
+          "id": "T1.1",
+          "title": "templates/plan.md: each header key carries its DB home; H1 line rule; lifecycle note (import, approve, run init)",
+          "status": "done",
+          "parent": "T1",
+          "type": "task",
+          "round": 0,
+          "verdict": "approve",
+          "subtasks": []
+        },
+        {
+          "id": "T1.2",
+          "title": "SKILL.md stage 1 and docs/state-schema.md describe the same contract; `mk-plan.py check` warns on a missing header key or H1",
+          "status": "done",
+          "parent": "T1",
+          "type": "task",
+          "round": 0,
+          "verdict": "approve",
+          "subtasks": []
+        }
+      ]
+    },
+    {
+      "id": "D1",
+      "title": "Plans in the project DB: the four new columns, import without approval, the plans query, plan actions",
+      "wave": 2,
+      "deps": [
+        "T1",
+        "R1"
+      ],
+      "status": "ready",
+      "tasks": [
+        {
+          "id": "D1.1",
+          "title": "mkdb.py: plans gains status, created, design, integration (additive migration); `mkdb.py plans --json` and `plans <id> --json`",
+          "status": "merged",
+          "parent": "D1",
+          "type": "task",
+          "round": 1,
+          "verdict": null,
+          "subtasks": []
+        },
+        {
+          "id": "D1.2",
+          "title": "mk-plan.py: write the new columns; `import <file>`; `delete <id>`; pause/resume via status parked",
+          "status": "merged",
+          "parent": "D1",
+          "type": "task",
+          "round": 1,
+          "verdict": null,
+          "subtasks": []
+        },
+        {
+          "id": "D1.3",
+          "title": "docs/state-schema.md: drop the 'added by D1' marks; document `mkdb.py plans` and `mk-plan.py import|delete`",
+          "status": "merged",
+          "parent": "D1",
+          "type": "task",
+          "round": 1,
+          "verdict": null,
+          "subtasks": []
+        },
+        {
+          "id": "D1.4",
+          "title": "First real import: settings-plans-db.md into .matrixkoder/mk.db with `mk-plan.py import`",
+          "status": "planned",
+          "parent": "D1",
+          "type": "task",
+          "round": 0,
+          "verdict": null,
+          "subtasks": []
+        }
+      ]
+    },
+    {
+      "id": "S1",
+      "title": "Settings mapping: every key carries scope and home, dead keys removed, fixture drift fixed; yaml stays the home",
+      "wave": 4,
+      "deps": [
+        "V1"
+      ],
+      "status": "planned",
+      "tasks": [
+        {
+          "id": "S1.1",
+          "title": "Scope-home map: every SCHEMA key carries scope and home (userConfig|yaml); settings.schema.ts regenerated; `mk-config.py list` shows both",
+          "status": "planned",
+          "parent": "S1",
+          "type": "task",
+          "round": 0,
+          "verdict": null,
+          "subtasks": []
+        },
+        {
+          "id": "S1.2",
+          "title": "Dead keys and fixture drift: drop yaml dashboard: and usage.poll_min via migrate, retire ~/.matrixkoder/config.json, fix hive card and agents.*.available fixture values, available rows read-only",
+          "status": "planned",
+          "parent": "S1",
+          "type": "task",
+          "round": 0,
+          "verdict": null,
+          "subtasks": []
+        }
+      ]
+    },
+    {
+      "id": "V1",
+      "title": "Plan tab sub-tabs from the existing kit: List with plan actions, Detail grouped by phase and folded by default, Kanban for the selected plan",
+      "wave": 3,
+      "deps": [
+        "D1"
+      ],
+      "status": "building",
+      "tasks": [
+        {
+          "id": "V1.1",
+          "title": "List sub-tab: ongoing runs on top, plans below with status filter Segments, per-plan Start / Pause / Resume / Delete buttons",
+          "status": "merged",
+          "parent": "V1",
+          "type": "task",
+          "round": 1,
+          "verdict": "approve",
+          "subtasks": []
+        },
+        {
+          "id": "V1.2",
+          "title": "Detail sub-tab: the existing PlanTab regrouped by phase (one Card per phase, tasks as rows, subtasks as TreeRows), every phase folded by default, Expand all / Collapse all",
+          "status": "merged",
+          "parent": "V1",
+          "type": "task",
+          "round": 0,
+          "verdict": "approve",
+          "subtasks": []
+        },
+        {
+          "id": "V1.3",
+          "title": "Kanban sub-tab: the existing KanbanTab with a plan filter; sub-tab wiring in dashboard.tsx; loader in data.ts",
+          "status": "building",
+          "parent": "V1",
+          "type": "task",
+          "round": 0,
+          "verdict": null,
+          "subtasks": []
+        }
+      ]
+    }
+  ]
+} as const
+export default data

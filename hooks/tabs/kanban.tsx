@@ -30,6 +30,8 @@ export type RunFn = (
 export type KanbanFilters = {
   needsYou: boolean
   project: string | null
+  /** When a non-empty string, keep cards whose `run` is this id or `<id>-…`. */
+  plan?: string | null
 }
 
 export type KanbanView = {
@@ -62,6 +64,8 @@ export function applyFilters(cards: readonly KanbanCard[], filters: KanbanFilter
   return cards.filter(card => {
     if (filters.needsYou && card.attention !== 1 && !isAttention(card.status)) return false
     if (filters.project != null && filters.project !== '' && card.project !== filters.project) return false
+    const plan = filters.plan
+    if (plan != null && plan !== '' && card.run !== plan && !card.run.startsWith(`${plan}-`)) return false
     return true
   })
 }

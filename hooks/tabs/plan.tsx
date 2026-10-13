@@ -117,7 +117,7 @@ export function PlanTab(els: Els, view: PlanView, cols: number, ui?: TabUi): Ren
   }
   return (
     <Box flexDirection="column" gap={1}>
-      <Text bold={true} color="warning">MOCK · fixture data · not this run</Text>
+      {view.mock && <Text bold={true} color="warning">MOCK · fixture data · not this run</Text>}
       {view.plan != null && HeaderCard(els, view, W, compact)}
       <Box flexDirection="row" justifyContent="space-between" gap={1}>
         <Text bold={true} color="subtle">PHASES</Text>

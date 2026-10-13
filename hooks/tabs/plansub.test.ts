@@ -1,0 +1,142 @@
+// Plan sub-tab wiring (settings-plans-db, V1.3): the Segment row, selection
+// across sub-tabs, file mode (no store → today's Plan tab), and action submit.
+import { test, expect } from 'claude-code/testing'
+import type { BoxProps, ElementChildren, Elements, RenderChildren, RenderElement, RenderNode, TextProps } from 'claude-code'
+import { PlanPane, planSubOf, readPlans, selectedPlanId } from '../dashboard'
+import { planActionLine } from './plans'
+import { planView } from './plan'
+
+const scalarProps = (props: object): Record<string, string | boolean | number> => {
+  const out: Record<string, string | boolean | number> = {}
+  for (const [k, v] of Object.entries(props)) {
+    if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') out[k] = v
+  }
+  return out
+}
+const isNode = (k: RenderChildren): k is RenderNode =>
+  typeof k === 'string' || (typeof k === 'object' && k !== null && !Array.isArray(k))
+const kids = (c: RenderChildren | undefined): RenderNode[] | undefined => {
+  if (c == null) return undefined
+  const arr: readonly RenderChildren[] = Array.isArray(c) ? c : [c]
+  return arr.filter(isNode)
+}
+const stubEls: Elements[keyof Elements] = {
+  Box: (props: BoxProps & ElementChildren): RenderElement => ({ type: 'Box', props: scalarProps(props), children: kids(props.children) }),
+  Text: (props: TextProps & ElementChildren): RenderElement => ({ type: 'Text', props: scalarProps(props), children: kids(props.children) }),
+  Button: (props: Record<string, unknown>) => ({ type: 'Button', props, children: [] }),
+  Input: () => ({ type: 'Text', props: {}, children: [] }),
+  Select: () => ({ type: 'Text', props: {}, children: [] }),
+  Link: () => ({ type: 'Text', props: {}, children: [] }),
+  Code: () => ({ type: 'Text', props: {}, children: [] }),
+  Markdown: () => ({ type: 'Text', props: {}, children: [] }),
+  Client: () => ({ type: 'Text', props: {}, children: [] }),
+  Raster: (props: Record<string, unknown>) => ({ type: 'Raster', props: scalarProps(props), children: [] }),
+  Image: () => ({ type: 'Text', props: {}, children: [] }),
+} as unknown as Elements[keyof Elements]
+
+type Node = { type?: string; props?: Record<string, unknown>; children?: unknown[] }
+function nodesOf(n: unknown, type: string): Node[] {
+  const out: Node[] = []
+  const walk = (node: unknown): void => {
+    if (typeof node !== 'object' || node === null) return
+    const cur = node as Node
+    if (cur.type === type) out.push(cur)
+    for (const c of cur.children ?? []) walk(c)
+  }
+  walk(n)
+  return out
+}
+const allText = (n: unknown): string =>
+  nodesOf(n, 'Text').map(t => (t.children ?? []).map(c => (typeof c === 'string' ? c : '')).join('')).join('\n')
+  + '\n' + nodesOf(n, 'Button').map(b => String(b.props?.label ?? '')).join('\n')
+function press(drawn: unknown, key: string): void {
+  const b = nodesOf(drawn, 'Button').find(x => String(x.props?.key) === key)
+  expect(b, `button ${key}`).toBeDefined()
+  ;(b?.props?.onPress as () => void)()
+}
+
+const LIST = JSON.stringify({
+  ok: true,
+  plans: [
+    { id: 'alpha', title: 'Alpha', status: 'running', created: 'c', runs: ['alpha-r1'], live_run: 'alpha-r1', counts: { building: 1 } },
+    { id: 'beta', title: 'Beta', status: 'draft', created: 'c', runs: [], live_run: null, counts: {} },
+  ],
+})
+const DETAIL = JSON.stringify({
+  ok: true, id: 'alpha', title: 'Alpha', status: 'running', created: 'c', runs: ['alpha-r1'], live_run: 'alpha-r1',
+  integration: 'main', design: [], counts: { building: 1 },
+  phases: [{ id: 'P1', title: 'Phase', status: 'building', wave: 1, tasks: [{ id: 'T1', title: 'Task', status: 'building', subtasks: [] }] }],
+})
+
+test('file mode: no store draws today\'s Plan tab and no Segment row', () => {
+  const ui = new Map<string, string>()
+  const drawn = PlanPane(stubEls, {}, 80, { get: k => ui.get(k), set: (k, v) => { ui.set(k, v) } })
+  const text = allText(drawn)
+  expect(text).toContain('MOCK · fixture data · not this run')
+  expect(text).not.toContain('List')
+  expect(nodesOf(drawn, 'Button').some(b => String(b.props?.key) === 'plan-sub-list')).toBe(false)
+  // the fixture planView is what file mode mounts
+  expect(planView().mock).toBe(true)
+})
+
+test('store mode: Segment row List Detail Kanban, default list', () => {
+  const ui = new Map<string, string>()
+  const view: Record<string, string> = { 'plans:store': '1', 'plans:list': LIST }
+  const drawn = PlanPane(stubEls, view, 80, { get: k => ui.get(k), set: (k, v) => { ui.set(k, v) } })
+  const labels = nodesOf(drawn, 'Button').map(b => String(b.props?.label ?? ''))
+  expect(labels).toContain('List')
+  expect(labels).toContain('Detail')
+  expect(labels).toContain('Kanban')
+  expect(planSubOf(view)).toBe('list')
+  expect(allText(drawn)).toContain('ONGOING RUNS')
+})
+
+test('sub-tab switch keeps plans:sel', () => {
+  const ui = new Map<string, string>([['plans:sel', 'beta']])
+  const view: Record<string, string> = { 'plans:store': '1', 'plans:list': LIST, 'plans:sel': 'beta', 'plan:sub': 'list' }
+  const drawn = PlanPane(stubEls, view, 80, { get: k => ui.get(k), set: (k, v) => { ui.set(k, v) } })
+  press(drawn, 'plan-sub-detail')
+  expect(ui.get('plan:sub')).toBe('detail')
+  expect(ui.get('plans:sel') ?? view['plans:sel']).toBe('beta')
+  expect(selectedPlanId({ ...view, 'plan:sub': 'detail' }, [{ id: 'alpha', live_run: 'alpha-r1' }, { id: 'beta', live_run: null }])).toBe('beta')
+})
+
+test('open switches to detail; another action submits planActionLine once', () => {
+  const ui = new Map<string, string>()
+  const submitted: string[] = []
+  const view: Record<string, string> = { 'plans:store': '1', 'plans:list': LIST }
+  const handle = {
+    get: (k: string) => ui.get(k),
+    set: (k: string, v: string) => { ui.set(k, v) },
+    submit: (text: string) => { submitted.push(text) },
+  }
+  press(PlanPane(stubEls, view, 80, handle), 'plans-open-alpha')
+  expect(ui.get('plan:sub')).toBe('detail')
+  expect(ui.get('plans:sel')).toBe('alpha')
+  expect(submitted).toEqual([])
+  press(PlanPane(stubEls, view, 80, handle), 'plans-pause-alpha')
+  expect(submitted).toEqual([planActionLine('pause', 'alpha')])
+})
+
+test('readPlans does not spawn when the store is missing', async () => {
+  let calls = 0
+  const got = await readPlans(async () => { calls += 1; return { stdout: '', code: 0 } }, '/plugin', '/data', false, 'alpha')
+  expect(calls).toBe(0)
+  expect(got.missing).toBe(true)
+})
+
+test('readPlans maps a list reply and a detail reply', async () => {
+  const argvSeen: string[][] = []
+  const got = await readPlans(async argv => {
+    argvSeen.push([...argv])
+    const detail = argv.includes('alpha')
+    return { stdout: detail ? DETAIL : LIST, code: 0 }
+  }, '/plugin', '/data', true, 'alpha')
+  expect(got.error).toBeNull()
+  expect(argvSeen[0]?.slice(-3)).toEqual(['--json', '--data', '/data'])
+  expect(argvSeen[1]).toContain('alpha')
+  const list = got.list as { plans: { id: string }[] }
+  expect(list.plans[0]?.id).toBe('alpha')
+  const detail = got.detail as { id: string }
+  expect(detail.id).toBe('alpha')
+})
