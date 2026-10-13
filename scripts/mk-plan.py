@@ -217,6 +217,12 @@ def read_plan(path):
     return header, plan_json(header, sha), sha
 
 
+def body_md_of(text, close):
+    """The markdown below the closing +++, the same bytes approve_file stores in plans.body_md."""
+    body = "\n".join(text.split("\n")[close + 1:])
+    return body[1:] if body.startswith("\n") else body
+
+
 # ---------- glob overlap (same rules as mk-state.py owned globs) ----------
 
 def norm_glob(g):
@@ -276,15 +282,42 @@ def find_cycle(deps):
     return None
 
 
-def check_plan(header, out):
+def has_h1(body):
+    """True when the markdown body carries a level-1 heading — the line that becomes
+    plans.title. A '#' inside a fenced code block does not count."""
+    fenced = False
+    for line in body.split("\n"):
+        st = line.lstrip()
+        if st.startswith("```") or st.startswith("~~~"):
+            fenced = not fenced
+        elif not fenced and st.startswith("# "):
+            return True
+    return False
+
+
+def check_plan(header, out, body=None):
     """→ (errors, warnings). Errors are exactly the P1.2 contract rules; anything
-    advisory (cross-run deps, malformed id shapes) is a warning."""
+    advisory (cross-run deps, malformed id shapes) is a warning. `body` is the markdown
+    below the closing +++ when the caller has it: the T1 header-key gaps are warnings
+    there too, so a plan written before the key existed still checks ok."""
     errors, warnings = [], []
     phases = out["phases"]
     raw = as_list(header.get("phase"))
 
     if str(out["plan"]) and not PLAN_ID_RE.fullmatch(str(out["plan"])):
         warnings.append(f"plan id {out['plan']!r} does not match [a-z0-9][a-z0-9-]{{0,40}}")
+
+    # T1 contract: the header keys that fill a plans column. A missing one is a gap in the
+    # contract, never a rule violation, so it stays a warning (plans.status / plans.created
+    # are columns added by D1; the key is header_json until then).
+    if "status" not in header:
+        warnings.append("no status key in the header; it is plans.status (a column added by "
+                        "D1, header_json until then) — run init --plan wants approved")
+    if "created" not in header:
+        warnings.append("no created key in the header; it is plans.created (a column added by "
+                        "D1, header_json until then) — the date the plan was drafted")
+    if body is not None and not has_h1(body):
+        warnings.append("body has no H1 line; the first '# ' line is what becomes plans.title")
 
     ids = [p["id"] for p in phases if p["id"]]
     for pid in sorted({i for i in ids if ids.count(i) > 1}):
@@ -563,7 +596,9 @@ def cmd_parse(a):
 
 def cmd_check(a):
     header, out, _ = read_plan(a.path)
-    errors, warnings = check_plan(header, out)
+    text, _ = load(a.path)
+    _lines, close = split_plan(text)
+    errors, warnings = check_plan(header, out, body_md_of(text, close))
     if errors:
         raise Fail(errors, warnings=warnings)
     out["warnings"] = warnings
@@ -1140,6 +1175,58 @@ def self_test():
                            'qa = []\ncommit = ""\nsubagents = false\n\n'))
         out = mk("check", p)
         assert out["ok"] is True and out["warnings"] == [], out  # no optional keys: still quiet
+
+        # T1 — the header keys that fill a plans column: a missing one warns, never errors.
+        # each case is ok: true; on the pre-T1 code the warnings list is empty and these fail.
+        base = phase("P1", tasks=task("P1.1", acceptance="a")) + "\n"
+
+        p = write("no-created.md", '+++\nplan = "t1"\nstatus = "draft"\nruns = []\n'
+                                   '[gates]\ntest = "true"\n' + base + '+++\n\n# body\nmarkdown stays\n')
+        out = mk("check", p)
+        assert out["ok"] is True, out
+        assert any("created" in w and "plans.created" in w for w in out["warnings"]), out
+        assert not any("status" in w for w in out["warnings"]), out  # only the missing one
+
+        p = write("no-status.md", '+++\nplan = "t1"\ncreated = 2026-10-08\nruns = []\n'
+                                  '[gates]\ntest = "true"\n' + base + '+++\n\n# body\nmarkdown stays\n')
+        out = mk("check", p)
+        assert out["ok"] is True, out
+        assert any("status" in w and "plans.status" in w for w in out["warnings"]), out
+        assert not any("created" in w for w in out["warnings"]), out
+
+        p = write("no-h1.md", '+++\nplan = "t1"\nstatus = "draft"\ncreated = 2026-10-08\nruns = []\n'
+                               '[gates]\ntest = "true"\n' + base + '+++\n\n## Goal\nbody with no H1\n')
+        out = mk("check", p)
+        assert out["ok"] is True, out
+        assert any("H1" in w and "plans.title" in w for w in out["warnings"]), out
+        assert not any("status" in w or "created" in w for w in out["warnings"]), out
+
+        # a '#' inside a fenced block is not an H1; the fenced code is not a heading
+        p = write("fenced-h1.md", '+++\nplan = "t1"\nstatus = "draft"\ncreated = 2026-10-08\nruns = []\n'
+                                  '[gates]\ntest = "true"\n' + base + '+++\n\n```\n# not a heading\n```\n')
+        assert any("H1" in w for w in mk("check", p)["warnings"])
+
+        # both keys missing: both warnings, still ok: true (warnings never fail the check)
+        p = write("neither.md", '+++\nplan = "t1"\nruns = []\n[gates]\ntest = "true"\n' + base
+                               + '+++\n\nbody\n')
+        out = mk("check", p)
+        assert out["ok"] is True, out
+        assert any("created" in w for w in out["warnings"]) and any("status" in w for w in out["warnings"])
+        assert any("H1" in w for w in out["warnings"]), out
+
+        # the shipped template is the contract: it names every key's home and checks with
+        # no new warning (the whole set above is empty for it)
+        out = mk("check", template)
+        assert out["ok"] and out["warnings"] == [], out
+        with open(template, encoding="utf-8") as fh:
+            tmpl = fh.read()
+        assert tmpl.startswith("+++\n") and "# Lifecycle" in tmpl
+        for needle in ("plans.id", "plans.status", "plans.created", "plans.design",
+                       "plans.integration", "plans.header_json", "plans.title",
+                       "tasks.id", "tasks.title", "tasks.acceptance", "tasks.owned",
+                       "tasks.deps", "tasks.parallel", "tasks.route_json", "tasks.type",
+                       "tasks.parent", "header_json only"):
+            assert needle in tmpl, needle
 
         # P1.3 set — body byte-identical, only the status line changes
         import shutil as sh
