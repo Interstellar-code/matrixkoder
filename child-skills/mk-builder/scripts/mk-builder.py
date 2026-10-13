@@ -1314,6 +1314,52 @@ def bus_poll_answer(cfg, ask_id, after, deadline, floor=0):
         after = seq
 
 
+BUS_RECONNECT_SEC = 60.0   # same window as `mk-bus.py watch` (WATCH_DOWN_SEC)
+BUS_RECONNECT_RETRY = 0.5
+
+
+def bus_refresh_cfg(lane, cfg):
+    """Re-read the lane token file and, in file mode or under $MK_BUS_DIR, the bus.json beside
+    the data: a restarted bus may have a new port. Mutates and returns `cfg`; unreadable
+    sources leave it as it was."""
+    fresh = bus_lane_config(lane)
+    if fresh:
+        cfg.update(fresh)
+    home = os.environ.get("MK_BUS_DIR")
+    if not home:
+        data = bus_data_dir(cfg)
+        home = data if data and not store_present(data) else None
+    if home:
+        with contextlib.suppress(OSError, ValueError, TypeError):
+            with open(os.path.join(os.path.expanduser(home), "bus.json")) as f:
+                port = json.load(f).get("port")
+            if is_int(port) and 0 < port < 65536:
+                p = urllib.parse.urlparse(cfg["url"])
+                cfg["url"] = p._replace(netloc=f"{p.hostname or '127.0.0.1'}:{port}").geturl()
+    return cfg
+
+
+def bus_poll_answer_retry(lane, cfg, ask_id, after, deadline, floor=0):
+    """bus_poll_answer that rides out a bus restart: on a dropped connection, re-read the bus
+    coordinates and poll again from the same cursor (the ask is already on the bus, never
+    posted twice). BusDown only after BUS_RECONNECT_SEC of continuous downtime, or when the
+    caller's deadline has passed."""
+    down_since = None
+    while True:
+        try:
+            if down_since is None:
+                return bus_poll_answer(cfg, ask_id, after, deadline, floor=floor)
+            bus_call(cfg, "GET", "/health")  # back up? only then poll again
+            down_since = None
+        except BusDown:
+            now = time.time()
+            down_since = now if down_since is None else down_since
+            if now - down_since >= BUS_RECONNECT_SEC or now >= deadline:
+                raise
+            time.sleep(min(BUS_RECONNECT_RETRY, max(0.0, deadline - now)))
+            bus_refresh_cfg(lane, cfg)
+
+
 def status_block(lane, question):
     """ask's blocked write — cmd_blocked's own writer (R13.4/R15: state, raw question, commit
     and subagent cleared), so MB3 reads BLOCKED and no STALL fires while the call waits.
@@ -1381,7 +1427,7 @@ def cmd_ask(a):
     # resumed with `wait <id>`.
     print(f"ASK {ask_id}", flush=True)
     try:
-        answer, held = bus_poll_answer(cfg, ask_id, after, deadline, floor=bus_read_cursor(lane))
+        answer, held = bus_poll_answer_retry(lane, cfg, ask_id, after, deadline, floor=bus_read_cursor(lane))
     except BusDown:
         ask_down(lane, question)
     except (BusSeq, BusLock) as e:
@@ -1416,7 +1462,7 @@ def cmd_wait(a):
     if cfg is None:
         raise Fail("bus down", code=4)
     try:
-        answer, held = bus_poll_answer(cfg, ask_id, int(m.group(1)), deadline, floor=bus_read_cursor(lane))
+        answer, held = bus_poll_answer_retry(lane, cfg, ask_id, int(m.group(1)), deadline, floor=bus_read_cursor(lane))
     except BusDown:
         raise Fail("bus down", code=4)
     except (BusSeq, BusLock) as e:
@@ -3295,6 +3341,49 @@ def t_bus_ask_answer_roundtrip(root):
     assert answers[0]["to"] == "TQ" and answers[0]["from"] == "orch", answers[0]
     acks = [r for r in rows if r.get("kind") == "ack" and r.get("reply_to") == answers[0]["id"]]
     assert len(acks) == 1 and acks[0]["ack_level"] == 3, acks
+
+
+def t_bus_ask_survives_restart(root):
+    """F1: an `ask` started against a live bus rides out `kill -9` plus a restart on the same
+    port, gets the answer posted after the restart, and the bus holds exactly ONE ask."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data, pid, port = bus_server(root, "bus-restart")
+    lane = bus_lane(root, "bus_restart_lane", "TR", data)
+    begin(lane, root)
+    cli(lane, "progress", "build")
+    out = {}
+
+    def run_ask():
+        out["res"] = cli(lane, "ask", "survive the restart?", "--timeout", "60")
+
+    th = threading.Thread(target=run_ask)
+    th.start()
+    try:
+        row = bus_poll_until(lambda: next(
+            (r for r in bus_rows(data) if r.get("kind") == "ask" and r.get("task") == "TR"), None))
+        # the ask is in flight only once its POST returned and the lane went blocked
+        bus_poll_until(lambda: status(lane).get("state") == "blocked")
+        os.kill(pid, signal.SIGKILL)
+
+        def dead():
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                return True
+
+        bus_poll_until(dead)
+        _, res = bus_cli("ensure", "--data", data, "--run", BUS_RUN)
+        assert res.get("port") == port, ("same port after restart", port, res)
+        BUS_SERVERS.append((res["pid"], data))
+        bus_cli("answer", row["id"], "after the restart", "--run", BUS_RUN, "--data", data)
+    finally:
+        th.join(70)
+    code, lines = out["res"]
+    assert code == 0 and lines[0] == f"ASK {row['id']}" and lines[-1] == "after the restart", (code, lines)
+    asks = [r for r in bus_rows(data) if r.get("kind") == "ask" and r.get("task") == "TR"]
+    assert len(asks) == 1, asks
+    assert status(lane)["state"] == "working", status(lane)
 
 
 def t_bus_ask_pending_then_wait(root):
