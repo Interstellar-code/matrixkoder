@@ -18,13 +18,17 @@ import type { MkPaneSnapshot } from './data'
 import { AGENT_COLOR, AGENT_GLYPH, NARROW, STATUS_COLOR, STATUS_GLYPH, bar, leftCol, rightCol } from './tabs/ui'
 import { mockRunHeader, mockTabCounts, stageWord, STAGE_TOTAL } from './tabs/header'
 import type { RunHeaderData } from './tabs/header'
-import { Chip } from './tabs/kit'
+import { Chip, Segment } from './tabs/kit'
 import { PALETTE, ROLE } from './tabs/palette'
 import { withRaster } from './tabs/raster'
 import { EventsTab, eventsView } from './tabs/events'
 import { LanesTab, lanesView } from './tabs/lanes'
 import { OverviewTab, overviewView } from './tabs/overview'
 import { PlanTab, planView } from './tabs/plan'
+import type { PlanView } from './tabs/plan'
+import { PlansTab, planActionLine } from './tabs/plans'
+import type { PlansView } from './tabs/plans'
+import { planFromReply, plansErrorLine, plansFromReply } from './tabs/plans-map'
 import { SettingsTab } from './tabs/settings'
 import type { SettingsValue, SettingsView } from './tabs/settings'
 import {
@@ -258,6 +262,7 @@ export function registerDashboard(on: On, options: PluginOptions): void {
       set: (key, value) => { void update($, viewStateAtom, prev => ({ ...prev, [key]: value })) },
       save: payload => { void saveSettings($, payload) },
       recheck: () => { void recheckAbout($) },
+      submit: text => { void $.prompt.submit({ text }) },
     }
     // S3: the live Settings view once loaded. Before that a one-line
     // skeleton draws — never the fixture's mock rows (LOW 1). A tab opened
@@ -298,7 +303,7 @@ export function registerDashboard(on: On, options: PluginOptions): void {
             : dashTab === 'lanes'
               ? withViewState(LanesTab, tabEls, lanesView(), cols, ui)
               : dashTab === 'plan'
-                ? PlanTab(tabEls, planView(), cols, ui)
+                ? PlanPane(tabEls, viewState, cols, ui)
             : dashTab === 'settings'
               ? settingsLive != null
                 ? SettingsTab(tabEls, settingsLive, cols, ui)
@@ -325,6 +330,8 @@ type TabUi = {
   set(key: string, value: string): void
   save?: (payload: SavePayload) => void
   recheck?: () => void
+  /** Plan actions: the Waiting tab's prompt-submit path. The pane never writes state. */
+  submit?: (text: string) => void
 }
 
 /** C12 hands `ui` to all six tabs; V2's three still take three arguments, so
@@ -814,6 +821,267 @@ async function refreshPending($: EngineInterface, cwd: string): Promise<void> {
   })
 }
 
+/** Plan sub-tabs (V1.3). File mode (no project mk.db) is today's Plan tab:
+ *  the checkout fixture, no Segment row. Store mode draws List · Detail · Kanban. */
+const PLANS_KEY = 'plans:list'
+const PLANS_MS_KEY = 'plans:ms'
+const PLANS_AT_KEY = 'plans:at'
+const PLANS_SEL_AT_KEY = 'plans:sel-at'
+const PLANS_SUB_AT_KEY = 'plans:sub-at'
+const PLANS_ERROR_KEY = 'plans:error'
+const PLANS_STALE_KEY = 'plans:stale'
+const PLANS_EMPTY_KEY = 'plans:empty'
+const PLANS_STORE_KEY = 'plans:store'
+const PLAN_DETAIL_KEY = 'plans:detail'
+const PLAN_DETAIL_FOR_KEY = 'plans:detail-for'
+const PLANS_RELOAD_MS = 30_000
+const PLAN_SUBS = ['list', 'detail', 'kanban'] as const
+
+export function planSubOf(view: Record<string, string>): 'list' | 'detail' | 'kanban' {
+  const sub = view['plan:sub']
+  return sub === 'detail' || sub === 'kanban' ? sub : 'list'
+}
+
+/** Detail and Kanban with no selection: the first live plan, else the first plan. */
+export function selectedPlanId(view: Record<string, string>, plans: readonly { id: string; live_run: string | null }[]): string {
+  const sel = view['plans:sel'] ?? ''
+  if (sel !== '' && plans.some(p => p.id === sel)) return sel
+  const live = plans.find(p => p.live_run != null && p.live_run !== '')
+  return (live ?? plans[0])?.id ?? ''
+}
+
+function plansViewOf(view: Record<string, string>, onAction: (kind: string, id: string) => void): PlansView {
+  let parsed: unknown = null
+  try { parsed = JSON.parse(view[PLANS_KEY] ?? '') } catch { parsed = null }
+  const mapped = plansFromReply(parsed ?? {})
+  return { mock: false, runs: mapped.runs, plans: mapped.plans, onAction }
+}
+
+function planDetailViewOf(view: Record<string, string>, id: string): PlanView | null {
+  if ((view[PLAN_DETAIL_FOR_KEY] ?? '') !== id) return null
+  let parsed: unknown = null
+  try { parsed = JSON.parse(view[PLAN_DETAIL_KEY] ?? '') } catch { parsed = null }
+  if (parsed == null) return null
+  return planFromReply(parsed)
+}
+
+/** A task row from `plans <id>` onto a KanbanCard. Fields the task has no
+ *  source for stay at the type's empty value (project, type, col from status,
+ *  attention, question, route, lane, gates, change_no). */
+const STATUS_COL: Record<string, string> = {
+  planned: 'Backlog', routed: 'Ready', ready: 'Ready', dispatched: 'Ready',
+  building: 'Building', verifying: 'Verify', review: 'Review', fix: 'Fix', qa: 'Verify',
+  merged: 'Done', done: 'Done', blocked: 'Building', stalled: 'Building', quota: 'Building', provider: 'Building',
+}
+
+function tasksToCards(detail: PlanView, planId: string, runId: string): KanbanCard[] {
+  const cards: KanbanCard[] = []
+  for (const phase of detail.phases ?? []) {
+    for (const task of phase.rows) {
+      cards.push({
+        project: '',
+        run: runId !== '' ? runId : planId,
+        task: task.id,
+        parent: phase.id,
+        type: '',
+        title: task.title,
+        status: task.status,
+        col: STATUS_COL[task.status] ?? 'Backlog',
+        attention: 0,
+        question: null,
+        route_json: null,
+        lane: null,
+        round: null,
+        verdict: null,
+        gates: null,
+        updated: '',
+        change_no: 0,
+      })
+    }
+  }
+  return cards
+}
+
+export function PlanPane(els: Els, view: Record<string, string>, cols: number, ui: TabUi): RenderElement {
+  const { Box, Text } = els
+  if (view[PLANS_STORE_KEY] !== '1') return PlanTab(els, planView(), cols, ui)
+  const sub = planSubOf(view)
+  const onAction = (kind: string, id: string): void => {
+    if (kind === 'open') {
+      ui.set('plans:sel', id)
+      ui.set('plan:sub', 'detail')
+      return
+    }
+    ui.set('plans:reload', String(Date.now()))
+    void ui.submit?.(planActionLine(kind, id))
+  }
+  const plans = plansViewOf(view, onAction)
+  const sel = selectedPlanId(view, plans.plans)
+  const err = view[PLANS_ERROR_KEY] ?? ''
+  const errorLine = err === '' ? null : `⚠ ${view[PLANS_STALE_KEY] === '1' ? 'stale · ' : ''}${err}`
+  let body: RenderElement
+  if (view[PLANS_EMPTY_KEY] === '1' && plans.plans.length === 0 && err === '') {
+    body = <Text>no plans yet</Text>
+  } else if (sub === 'list') {
+    body = PlansTab(els, plans, cols, ui)
+  } else if (sel === '') {
+    body = <Text>no plan selected</Text>
+  } else if (sub === 'detail') {
+    const detail = planDetailViewOf(view, sel)
+    body = detail == null ? <Text>loading {sel}</Text> : PlanTab(els, detail, cols, ui)
+  } else {
+    const detail = planDetailViewOf(view, sel)
+    const runId = plans.plans.find(p => p.id === sel)?.live_run ?? ''
+    const cards = detail == null ? [] : tasksToCards(detail, sel, runId)
+    const kv = kanbanView(cards, { needsYou: false, project: null, plan: sel }, new Date().toISOString())
+    body = detail == null ? <Text>loading {sel}</Text> : KanbanTab(els, kv, cols)
+  }
+  return (
+    <Box flexDirection="column" gap={1}>
+      <Box flexDirection="row" gap={1}>
+        {PLAN_SUBS.map(name => Segment(els, {
+          key: `plan-sub-${name}`,
+          label: name === 'list' ? 'List' : name === 'detail' ? 'Detail' : 'Kanban',
+          on: sub === name,
+          onPress: () => { ui.set('plan:sub', name) },
+        }))}
+      </Box>
+      {errorLine != null ? <Text color="yellow" bold={true}>{errorLine}</Text> : null}
+      {body}
+    </Box>
+  )
+}
+
+export type PlansRead = {
+  list: unknown
+  detail: unknown
+  ms: number
+  skipped: boolean
+  empty: boolean
+  missing: boolean
+  error: string | null
+}
+
+/** One plans read. A missing store never spawns mkdb. `detailId` empty skips the detail call. */
+export async function readPlans(
+  run: (argv: readonly string[], init?: { timeoutMs?: number }) => Promise<{ stdout?: string; code?: number }>,
+  pluginRoot: string,
+  dataDir: string | null,
+  storeExists: boolean,
+  detailId: string,
+): Promise<PlansRead> {
+  const fail = (error: string, ms: number): PlansRead => ({ list: null, detail: null, ms, skipped: false, empty: false, missing: false, error })
+  if (dataDir == null || !storeExists) return { list: null, detail: null, ms: 0, skipped: true, empty: true, missing: true, error: null }
+  const started = Date.now()
+  const base = ['python3', `${pluginRoot}/scripts/mkdb.py`, 'plans']
+  const call = async (argv: string[]): Promise<{ parsed: unknown; error: string | null }> => {
+    let result: { stdout?: string; code?: number }
+    try {
+      result = await run(argv, { timeoutMs: 5_000 })
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      return { parsed: null, error: /timed out|timeout/i.test(msg) ? plansErrorLine('timeout') : plansErrorLine('spawn') }
+    }
+    if (result.code !== 0 && result.code != null) return { parsed: null, error: plansErrorLine('exit') }
+    const stdout = result.stdout ?? ''
+    if (stdout.trim() === '') return { parsed: null, error: plansErrorLine('json') }
+    try {
+      const parsed = JSON.parse(stdout) as { ok?: boolean; error?: string }
+      if (parsed == null || typeof parsed !== 'object' || parsed.ok !== true) {
+        return { parsed: null, error: plansErrorLine('ok', typeof parsed?.error === 'string' ? parsed.error : '') }
+      }
+      return { parsed, error: null }
+    } catch {
+      return { parsed: null, error: plansErrorLine('json') }
+    }
+  }
+  const list = await call([...base, '--json', '--data', dataDir])
+  if (list.error != null) return fail(list.error, Date.now() - started)
+  const detail = detailId === '' ? { parsed: null, error: null } : await call([...base, detailId, '--json', '--data', dataDir])
+  if (detail.error != null) return { list: list.parsed, detail: null, ms: Date.now() - started, skipped: false, empty: false, missing: false, error: detail.error }
+  const plans = (list.parsed as { plans?: unknown }).plans
+  return {
+    list: list.parsed,
+    detail: detail.parsed,
+    ms: Date.now() - started,
+    skipped: false,
+    empty: Array.isArray(plans) && plans.length === 0,
+    missing: false,
+    error: null,
+  }
+}
+
+let plansInFlight = false
+
+function plansDue(view: Record<string, string>, now: number): boolean {
+  if ((view[PLANS_KEY] ?? '') === '') return true
+  if ((view['plans:reload'] ?? '') !== (view['plans:reload-seen'] ?? '')) return true
+  if ((view['plan:sub'] ?? '') !== (view[PLANS_SUB_AT_KEY] ?? '')) return true
+  if ((view['plans:sel'] ?? '') !== (view[PLANS_SEL_AT_KEY] ?? '')) return true
+  const at = Number(view[PLANS_AT_KEY] ?? '0')
+  return now - at >= PLANS_RELOAD_MS
+}
+
+async function refreshPlans($: EngineInterface, cwd: string): Promise<void> {
+  const dataDir = await resolveDataDir($, cwd, await homeDir($)).catch(() => null)
+  const path = dataDir == null ? '' : join(dataDir, 'mk.db')
+  let exists = false
+  if (path !== '') {
+    try { exists = await $.fs.exists(path) } catch { exists = false }
+  }
+  if (dataDir == null || !exists) {
+    await update($, viewStateAtom, prev => ({ ...prev, [PLANS_STORE_KEY]: '0', [PLANS_EMPTY_KEY]: '1' }))
+    return
+  }
+  const view = await read($, viewStateAtom)
+  let now = Date.now()
+  try { now = await $.clock.now() } catch { /* wall clock */ }
+  if (!plansDue(view, now)) {
+    if (view[PLANS_STORE_KEY] !== '1') await update($, viewStateAtom, prev => ({ ...prev, [PLANS_STORE_KEY]: '1' }))
+    return
+  }
+  if (plansInFlight) return
+  plansInFlight = true
+  const sel = view['plans:sel'] ?? ''
+  const sub = view['plan:sub'] ?? ''
+  const reload = view['plans:reload'] ?? ''
+  const run = (argv: readonly string[], init?: { timeoutMs?: number }) =>
+    $.process.run([...argv], init).then(r => ({ stdout: r.stdout, code: r.exitCode }))
+  void readPlans(run, $.plugin.root, dataDir, exists, sel).then(async got => {
+    await update($, viewStateAtom, prev => {
+      if (got.missing) return { ...prev, [PLANS_STORE_KEY]: '0', [PLANS_EMPTY_KEY]: '1' }
+      const had = (prev[PLANS_KEY] ?? '') !== ''
+      const base = {
+        ...prev,
+        [PLANS_STORE_KEY]: '1',
+        [PLANS_AT_KEY]: String(now),
+        [PLANS_MS_KEY]: String(got.ms),
+        [PLANS_SEL_AT_KEY]: sel,
+        [PLANS_SUB_AT_KEY]: sub,
+        'plans:reload-seen': reload,
+      }
+      if (got.error != null) {
+        return { ...base, [PLANS_ERROR_KEY]: got.error, [PLANS_STALE_KEY]: had ? '1' : '0', ...(got.list != null ? { [PLANS_KEY]: JSON.stringify(got.list) } : {}) }
+      }
+      return {
+        ...base,
+        [PLANS_ERROR_KEY]: '',
+        [PLANS_STALE_KEY]: '0',
+        [PLANS_EMPTY_KEY]: got.empty ? '1' : '0',
+        [PLANS_KEY]: JSON.stringify(got.list),
+        ...(got.detail != null && sel !== '' ? { [PLAN_DETAIL_KEY]: JSON.stringify(got.detail), [PLAN_DETAIL_FOR_KEY]: sel } : {}),
+      }
+    })
+  }).catch(async () => {
+    await update($, viewStateAtom, prev => ({
+      ...prev,
+      [PLANS_STORE_KEY]: '1',
+      [PLANS_ERROR_KEY]: plansErrorLine('spawn'),
+      [PLANS_STALE_KEY]: (prev[PLANS_KEY] ?? '') !== '' ? '1' : '0',
+    }))
+  }).finally(() => { plansInFlight = false })
+}
+
 /** Cards JSON kept on the view-state atom so a tick is one read, not a render. */
 const CARDS_KEY = 'kanban:cards'
 const CARDS_MS_KEY = 'kanban:ms'
@@ -955,6 +1223,7 @@ async function refreshSafe($: EngineInterface, options: PluginOptions, cwd: stri
     }
     await refreshCards($)
     await refreshPending($, cwd)
+    await refreshPlans($, cwd)
   } catch (err) {
     try {
       await update($, snapshotAtom, () => ({ ...prev, error: `cannot read run.json (${String(err).slice(0, 40)})` }))

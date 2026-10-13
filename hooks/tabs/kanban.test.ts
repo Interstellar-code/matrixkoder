@@ -169,6 +169,20 @@ test('needs-you keeps only attention cards, project beta keeps beta, and both fi
   expect(both.map(c => c.task).sort()).toEqual(['P4', 'P6'])
   expect(kanbanFixtureView({ needsYou: true, project: 'beta' }).cards.map(c => c.task).sort()).toEqual(['P4', 'P6'])
 
+  const alpha = { ...KANBAN_FIXTURE[0]!, run: 'alpha-plan-r1', task: 'A1' }
+  const betaPlan = { ...KANBAN_FIXTURE[1]!, run: 'beta-plan-r1', task: 'B1' }
+  const planned = kanbanView([alpha, betaPlan], { needsYou: false, project: null, plan: 'alpha-plan' }, KANBAN_NOW)
+  expect(planned.cards.map(c => c.task)).toEqual(['A1'])
+  expect(planned.cards.every(c => c.run === 'alpha-plan-r1' || c.run.startsWith('alpha-plan-'))).toBe(true)
+
+  const omitted = kanbanView(KANBAN_FIXTURE, { needsYou: false, project: null }, KANBAN_NOW)
+  const planNull = kanbanView(KANBAN_FIXTURE, { needsYou: false, project: null, plan: null }, KANBAN_NOW)
+  const planEmpty = kanbanView(KANBAN_FIXTURE, { needsYou: false, project: null, plan: '' }, KANBAN_NOW)
+  const ids = (view: { cards: readonly { task: string }[]; projects: readonly string[] }) =>
+    ({ tasks: view.cards.map(c => c.task), projects: view.projects })
+  expect(ids(planNull)).toEqual(ids(omitted))
+  expect(ids(planEmpty)).toEqual(ids(omitted))
+
   const tree = KanbanTab(stubEls(), needs, 46)
   expect(text(columnSection(tree, 'Building')!)).toContain('P4')
   expect(text(columnSection(tree, 'Building')!)).not.toContain('D3A')
