@@ -678,7 +678,8 @@ def store_present(data):
 
 
 def mk_home():
-    return os.path.expanduser(os.environ.get("MATRIXKODER_HOME") or "~/.matrixkoder")
+    # one MK home rule (C16): either name; mkdb.resolve_home checks that both agree
+    return os.path.expanduser(os.environ.get("MK_HOME") or os.environ.get("MATRIXKODER_HOME") or "~/.matrixkoder")
 
 
 def main_worktree(top):
@@ -1207,9 +1208,11 @@ def delete_plan(plan_id, data, home):
     moved = None
     if os.path.isfile(src):
         dst = os.path.join(data, "plans", "archive", os.path.basename(src))
-        if os.path.exists(dst):
+        n = 0
+        while os.path.exists(dst):
             stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-            dst = os.path.join(data, "plans", "archive", f"{plan_id}-{stamp}.md")
+            n += 1
+            dst = os.path.join(data, "plans", "archive", f"{plan_id}-{stamp}" + (f"-{n}" if n > 1 else "") + ".md")
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.move(src, dst)
         moved = dst
