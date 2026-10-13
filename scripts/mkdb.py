@@ -1450,6 +1450,19 @@ def _phases_from_header(header):
     return out
 
 
+def _integration_of(text):
+    """mk-plan stores integration as a JSON array (one header key may hold one value); the pane
+    reads one branch name. A plain string is passed through."""
+    if isinstance(text, str) and text.startswith("["):
+        try:
+            got = json.loads(text)
+        except ValueError:
+            return text
+        if isinstance(got, list):
+            return ", ".join(str(x) for x in got) or None
+    return text
+
+
 def _plan_obj(con, row, detail=False):
     """One plans row as the C8 reply object. status/created fall back to header_json when the
     column is NULL (rows written before the v4 migration); design/integration have no fallback."""
@@ -1460,7 +1473,7 @@ def _plan_obj(con, row, detail=False):
         "status": row["status"] if row["status"] is not None else header.get("status"),
         "created": row["created"] if row["created"] is not None else header.get("created"),
         "design": _design_of(row),
-        "integration": row["integration"],
+        "integration": _integration_of(row["integration"]),
         "version": row["version"],
         "approved_at": row["approved_at"],
     }
@@ -2672,6 +2685,9 @@ def _plans_query(home):
     _check(b["status"] == "draft" and b["created"] == "2026-02-02T00:00:00Z",
            f"beta header fallback {b}")  # columns NULL, values from header_json
     _check(b["design"] == [] and b["integration"] is None, f"beta design/integration {b}")
+    # mk-plan writes integration as a JSON array text; the reply carries the branch name
+    _check(_integration_of('["main"]') == "main" and _integration_of("int-branch") == "int-branch"
+           and _integration_of(None) is None, "integration array text")
     _check(b["runs"] == [] and b["live_run"] is None and b["counts"] == {}, f"beta no-run {b}")
     proc = subprocess.run([sys.executable, os.path.abspath(__file__), "plans", "--home", home,
                            "--data", data, "--json"], capture_output=True, text=True)
