@@ -662,15 +662,16 @@ mkdb.py plans <id> --json [--data DIR] [--home DIR]
 mkdb.py --self-test
 ```
 
-<!-- check against D1.1 -->
 
 `plans --json` lists every plan. Each object has `id`, `title`, `status`, `created`, `design`,
 `integration`, `version`, `approved_at`, `runs`, `live_run` and `counts`. `live_run` is the id of
 the plan's live run, or null. `counts` is the task counts by status. `plans <id> --json` is that
 same object plus `phases`: each phase with its `tasks`, taken from the latest run (`tasks` joined
 to `runs` on `runs.plan = plans.id`), or from the `[[phase]]` / `[[phase.task]]` rows in
-`header_json` when the plan has no run. The field list is the D1.1 acceptance line; D1.1 is
-landing in parallel, so the reply shape above is not yet checked against `scripts/mkdb.py`.
+`header_json` when the plan has no run (status `planned`). Each phase is `{id, title, wave, deps,
+status, tasks}`, each task `{id, title, status, parent, type, round, verdict}`. An unknown id
+answers `ok: false` and exits 2. Both reads refuse a store still at v3 ("needs migration to v4;
+run a writer command"): any writer, such as `mk-plan.py import`, migrates it first.
 
 
 `timeline` is `SELECT … FROM events WHERE run=? AND task=? ORDER BY id`. `cards` reads the root
