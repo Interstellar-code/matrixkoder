@@ -871,7 +871,9 @@ def _bus_project(ctx):
     """The slug the bus actually uses for this project. project_slug_for derives
     one (`p` + hash) and registers it, so the `lt` row setup wrote is not it."""
     import sqlite3
-    con = sqlite3.connect(os.path.join(ctx["home"], "mk.db"))
+    from urllib.parse import quote
+    db = os.path.join(ctx["home"], "mk.db")
+    con = sqlite3.connect("file:" + quote(db) + "?mode=ro", uri=True)
     try:
         row = con.execute("SELECT slug FROM projects WHERE data_dir=?",
                           (os.path.realpath(ctx["data"]),)).fetchone()
@@ -1493,11 +1495,16 @@ def self_test():
                       and GATE_RANK[r["gate"]] <= GATE_RANK["G2"]}
         _check(g2_summary["summary"]["PENDING"] == len(g2_pending),
                f"G2 PENDING {g2_summary['summary']['PENDING']} != matrix {len(g2_pending)}")
-        _check(g2_summary.get("ok") is False, "a gate with a failure or a pending row reported ok")
+        # G2 is green once S1 writes project_summary. The invariant is that ok
+        # is true exactly when nothing failed and nothing is pending.
+        summary = g2_summary["summary"]
+        _check(g2_summary.get("ok") is (summary["fail"] == 0 and summary["PENDING"] == 0),
+               f"G2 ok={g2_summary.get('ok')} for fail={summary['fail']} PENDING={summary['PENDING']}")
         _check(all(l.get("status") != "pass" or not l.get("detail", "").startswith("pending")
                    for l in g2_lines if "row" in l), "a pending row was scored pass")
-        _check(proc.returncode == (1 if g2_summary["summary"]["fail"] else 3),
-               f"G2 exited {proc.returncode}")
+        want = 0 if summary["fail"] == 0 and summary["PENDING"] == 0 else (
+            1 if summary["fail"] else 3)
+        _check(proc.returncode == want, f"G2 exited {proc.returncode}, wanted {want}")
     finally:
         subprocess.run([sys.executable, os.path.abspath(__file__), "teardown", "--home", home],
                        check=True, capture_output=True, text=True)
@@ -1514,6 +1521,16 @@ def self_test():
     absent = [{"id": "X-absent", "contract": "C1", "gate": "G1", "kind": "scripted", "pending": "pending: DX"}]
     _, summary = scripted("G1", rows=absent)
     _check(summary["ok"] is False and summary["summary"]["PENDING"] == 1, "absent row was not PENDING")
+    failing = [{"id": "X-boom", "contract": "C1", "gate": "G1", "kind": "scripted", "pending": ""}]
+    saved_rows = dict(ROWS)
+    ROWS["X-boom"] = boom
+    try:
+        _, summary = scripted("G1", rows=failing)
+        _check(summary["ok"] is False and summary["summary"]["fail"] == 1,
+               f"a gate with a failing row reported ok: {summary}")
+    finally:
+        ROWS.clear()
+        ROWS.update(saved_rows)
     saved = dict(ROWS)
     try:
         ROWS["X-boom"] = boom
