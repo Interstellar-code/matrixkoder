@@ -2269,8 +2269,10 @@ def post_status(lane, old, state, note):
     `completed` maps to `session.todo_done_status` (C9: verify|done). The mapped value is
     what is announced. A lane token cannot POST kind=status (the bus reserves that for the
     orchestrator token), so the announcement is a `task` message whose text is
-    `status <mapped>` — the bus change this needs is listed in the D7 report — and with the
-    bus or the store absent nothing is sent (C12: the lane status file is the record)."""
+    `status <mapped>`; the store-mode bus maps the word (in_progress -> building, verify ->
+    verifying, done -> done) and moves the lane's own task (todo 67), and the reply says
+    whether it did. With the bus or the store absent nothing is sent (C12: the lane status
+    file is the record)."""
     task, round_n = old.get("task"), old.get("round")
     cfg = bus_lane_config(lane)
     data = bus_data_dir(cfg) if cfg else None
@@ -2283,11 +2285,12 @@ def post_status(lane, old, state, note):
                 "fallback": "lane-file"}
     text = f"status {mapped}\nround: {round_n}\n{note}"
     try:
-        bus_send(cfg, "task", text, task=task)
+        reply = bus_send(cfg, "task", text, task=task)
     except (BusDown, BusHttp):
         return {"sent": False, "deduped": False, "state": state, "mapped": mapped,
                 "fallback": "bus-down"}
-    return {"sent": True, "deduped": False, "state": state, "mapped": mapped, "note": note}
+    return {"sent": True, "deduped": False, "state": state, "mapped": mapped, "note": note,
+            "state_updated": reply.get("state_updated"), "state_error": reply.get("mk_state_error")}
 
 
 def cmd_todo(a):
@@ -3136,12 +3139,26 @@ def bus_cli(*args):
     return r.returncode, obj
 
 
+def pin_home(root, name, data):
+    """Todo 69: a store-mode bus case runs on its own temp home. The store-mode bus lives in the
+    MK home and registers every project it serves there, so without this the case falls back to
+    the real `~/.matrixkoder` (bus.json, mk.db). Everything that resolves a home or the data dir
+    is pinned for the rest of the case (run_self_test resets it before the next one)."""
+    home = os.path.join(root, f"{name}-home")
+    os.makedirs(home, exist_ok=True)
+    for key in ("MK_HOME", "MATRIXKODER_HOME", "MK_BUS_DIR"):
+        os.environ[key] = home
+    os.environ["MK_BUS_DATA"] = data
+
+
 def bus_server(root, name="bus"):
     """One REAL mk-bus server per (root, name): ensure → detached serve, ephemeral port,
     temp data dir. Returns (data dir, pid, port)."""
     key = (root, name)
+    data = os.path.join(root, f"{name}-data")
+    if store_present(data):
+        pin_home(root, name, data)
     if key not in BUS_SERVER_CACHE:
-        data = os.path.join(root, f"{name}-data")
         os.makedirs(data, exist_ok=True)
         _, res = bus_cli("ensure", "--data", data, "--run", BUS_RUN)
         # A root bus is one process for every project, so a second ensure
@@ -3894,6 +3911,26 @@ def d7_store(data, run, task):
     return mod
 
 
+def d7_task_state(data, run, task):
+    """The task's status in the project store and how often each status was entered
+    (chan='state' transitions): (status, {to: n}). Public mkdb API, read only."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "mkdb_state", os.path.join(os.path.dirname(MK_BUS_PY), "mkdb.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    con = mod.open_project(data, data_dir=data)
+    try:
+        status = con.execute("SELECT status FROM tasks WHERE run=? AND id=?", (run, task)).fetchone()["status"]
+        entered = {}
+        for r in con.execute("SELECT to_id FROM events WHERE chan='state' AND kind='transition' "
+                             "AND run=? AND task=?", (run, task)):
+            entered[r["to_id"]] = entered.get(r["to_id"], 0) + 1
+        return status, entered
+    finally:
+        con.close()
+
+
 def d7_answer(data, ask_id, text, to_task):
     """Post an answer with the orchestrator token. `mk-bus.py answer` reads bus.jsonl,
     which store mode does not write; the HTTP path is what the orchestrator actually uses.
@@ -4048,22 +4085,37 @@ def t_d7_todo_backup_and_dedupe(root):
     lane = bus_lane(root, "d7_todo_lane", "D7T", data)
     begin(lane, root, run=BUS_RUN, task="D7T")
     cli(lane, "progress", "work")
+    # Todo 67: the status the bus applies, on the real store-mode bus. in_progress -> building,
+    # done -> verifying (default); the same round twice moves the task once.
+    assert d7_task_state(data, BUS_RUN, "D7T")[0] == "planned"
+    code, lines = cli(lane, "todo", "in_progress", "D7.1", env={"MK_BUS_DATA": data})
+    first_ip = jline(lines)
+    assert code == 0 and first_ip["sent"] is True and first_ip["state_updated"] is True, first_ip
+    assert d7_task_state(data, BUS_RUN, "D7T")[0] == "building"
+    code, lines = cli(lane, "todo", "in_progress", "D7.1", env={"MK_BUS_DATA": data})
+    assert jline(lines)["deduped"] is True, lines
     code, lines = cli(lane, "todo", "done", "D7.1", env={"MK_BUS_DATA": data})
     assert code == 0, lines
     first = jline(lines)
     assert first["sent"] is True and first["deduped"] is False and first["mapped"] == "verify", first
+    assert first["state_updated"] is True, first
+    assert d7_task_state(data, BUS_RUN, "D7T")[0] == "verifying"
     code, lines = cli(lane, "todo", "done", "D7.1", env={"MK_BUS_DATA": data})
     second = jline(lines)
     assert second["deduped"] is True and second["sent"] is False, second
+    status_now, entered = d7_task_state(data, BUS_RUN, "D7T")
+    assert status_now == "verifying" and entered.get("building") == 1 and entered.get("verifying") == 1, (
+        status_now, entered)
     msgs = d7_task_msgs(data, "D7T")
-    assert len(msgs) == 1 and msgs[0]["text"].startswith("status verify\nround: 1\n"), msgs
+    assert len(msgs) == 2 and msgs[1]["text"].startswith("status verify\nround: 1\n"), msgs
     begin(lane, root, run=BUS_RUN, task="D7T", round=2)
     cli(lane, "progress", "fix")
     code, lines = cli(lane, "todo", "in_progress", "D7.1", env={"MK_BUS_DATA": data})
     assert code == 0 and jline(lines)["sent"] is True and jline(lines)["deduped"] is False, lines
+    assert d7_task_state(data, BUS_RUN, "D7T") == ("building", {"building": 2, "verifying": 1})
     code, lines = cli(lane, "todo", "in_progress", "D7.1", env={"MK_BUS_DATA": data})
     assert jline(lines)["deduped"] is True, lines
-    assert len(d7_task_msgs(data, "D7T")) == 2
+    assert len(d7_task_msgs(data, "D7T")) == 3
 
 
 def t_d7_todo_done_status_setting(root):
@@ -4081,6 +4133,8 @@ def t_d7_todo_done_status_setting(root):
     cli(lane, "progress", "work")
     code, lines = cli(lane, "todo", "done", "D7.1", env={"MK_BUS_DATA": data})
     assert code == 0 and jline(lines)["mapped"] == "done", lines
+    assert jline(lines)["state_updated"] is True, lines
+    assert d7_task_state(data, BUS_RUN, "D7S")[0] == "done"
 
 
 def t_d7_hook_install_outside(root):
@@ -5210,14 +5264,32 @@ def t_skill_frontmatter(root):
     assert "R9" in body, "the body must cite lane-rules R9 for the todo-list rule"
 
 
+def stat_of(path):
+    """(size, mtime_ns) of a file, None when absent. os.stat only: never opens the file."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_size, st.st_mtime_ns)
+
+
 def run_self_test():
     """Print one line per case, then `ok <n> cases`; exit non-zero if any case failed. Every
     bus server the cases started is stopped in the finally, and none may survive it (pgrep)."""
     root = tempfile.mkdtemp(prefix="mk-builder-selftest-")
     cases = sorted((n, f) for n, f in globals().items() if n.startswith("t_") and callable(f))
     failed, leftover = [], []
+    # Todo 69: the real home's root store, read with os.stat only, before anything runs.
+    real_db = os.path.join(os.path.expanduser("~"), ".matrixkoder", "mk.db")
+    real_before = stat_of(real_db)
+    pinned = {k: os.environ.get(k) for k in ("MK_HOME", "MATRIXKODER_HOME", "MK_BUS_DIR", "MK_BUS_DATA")}
     try:
         for name, fn in cases:
+            # Every case starts on the temp home; a store-mode bus case pins its own (pin_home).
+            # MK_BUS_DIR and MK_BUS_DATA stay unset here: a file-mode bus keeps bus.json in its data dir.
+            os.environ["MK_HOME"] = os.environ["MATRIXKODER_HOME"] = os.path.join(root, "pin-home")
+            os.environ.pop("MK_BUS_DIR", None)
+            os.environ.pop("MK_BUS_DATA", None)
             try:
                 fn(root)
                 print(f"ok {name}")
@@ -5228,6 +5300,14 @@ def run_self_test():
         stop_bus_servers()
         leftover = bus_serve_leftovers()
         shutil.rmtree(root, ignore_errors=True)
+        for k, v in pinned.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    if stat_of(real_db) != real_before:
+        failed.append("real_home_untouched")
+        print(f"not ok real_home_untouched: {real_db} was {real_before}, now {stat_of(real_db)}")
     if leftover:
         failed.append("bus_server_leftover")
         print(f"not ok bus_server_leftover: pgrep still shows a serve for: {leftover}")
