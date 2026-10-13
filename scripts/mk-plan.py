@@ -2005,9 +2005,11 @@ def self_test():
         os.makedirs(cols_home)
         db.open_project(cols_home, data_dir=cols_data).close()
         con = db.open_project(cols_home, data_dir=cols_data)
+        have = {r[1] for r in con.execute("PRAGMA table_info(plans)")}
         for col, decl in (("status", "TEXT"), ("created", "TEXT"),
                           ("design", "TEXT"), ("integration", "TEXT")):
-            con.execute(f"ALTER TABLE plans ADD COLUMN {col} {decl}")
+            if col not in have:  # a v4 store (D1.1) already has them
+                con.execute(f"ALTER TABLE plans ADD COLUMN {col} {decl}")
         con.commit()
         con.close()
         colp = write("cols.md", plan_text(
