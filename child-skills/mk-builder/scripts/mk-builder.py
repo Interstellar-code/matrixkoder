@@ -534,6 +534,37 @@ def cmd_done(a):
             token_for(obj, tail))
 
 
+def cmd_review_done(a):
+    """Reviewer lane: post the verdict, finding count and review file path as ONE bus message,
+    then move the status file to done (the same legal transition as `done`) and print
+    `<T> REVIEW R<n> DONE`. Store mode sends kind `review`; file mode refuses that kind, so it
+    sends `info` with the same text. A bus that cannot be reached is ask's contract: the status
+    file goes `blocked`, `BUS DOWN: use the BLOCKED token`, exit 4 (nothing moves to done)."""
+    lane, old = lane_dir(a), load_live(lane_dir(a))
+    require_state(old, "done")
+    if not is_int(a.findings) or a.findings < 0:
+        raise Fail(f"findings must be an integer >= 0, got {a.findings!r}")
+    path = (a.path or "").strip()
+    if not path or not os.path.isfile(os.path.join(lane, path)):
+        raise Fail(f"review_missing: {path!r} does not exist [R18]")
+    text = f"round: {old.get('round')}\nverdict: {a.verdict} findings: {a.findings} path: {path}"
+    cfg = bus_lane_config(lane)
+    if cfg is None:
+        ask_down(lane, " ".join(text.split()))
+    kind = "review" if store_present(bus_data_dir(cfg)) else "info"
+    try:
+        bus_send(cfg, kind, text)
+    except BusDown:
+        ask_down(lane, " ".join(text.split()))
+    except BusHttp as e:
+        raise Fail(bus_http_error(e), code=5)
+    obj = dict(old, state="done", question=None, subagent=None, commit=lane_head(lane))
+    write_status(lane, stamp(obj))
+    return ({"ok": True, "seq": obj["seq"], "state": obj["state"], "kind": kind,
+             "verdict": a.verdict, "findings": a.findings, "path": path},
+            f"{old['task']} REVIEW R{old['round']} DONE")
+
+
 def cmd_ctx(a):
     """R10: only an integer 0..100, and only this command ever writes `ctx_pct`."""
     lane, old = lane_dir(a), load_live(lane_dir(a))
@@ -2463,7 +2494,11 @@ def build_parser():
     sp = lane_cmd("blocked", cmd_blocked, "record the blocked question, print the token [R19]")
     sp.add_argument("question")
     lane_cmd("done", cmd_done, "record done: report file plus a readable HEAD [R18]")
-    sp = lane_cmd("ctx", cmd_ctx, "record the context percentage, 0..100 [R10]")
+    sp = lane_cmd("review-done", cmd_review_done, "reviewer: post verdict, counts and path on the bus, record done")
+    sp.add_argument("--verdict", required=True, choices=("APPROVE", "REQUEST_CHANGES"))
+    sp.add_argument("--findings", required=True, type=int)
+    sp.add_argument("--path", required=True, help="review file path relative to the lane root")
+    sp = lane_cmd("ctx", cmd_ctx,"record the context percentage, 0..100 [R10]")
     sp.add_argument("pct", type=int)
     sp = lane_cmd("phase-done", cmd_phase_done, "append a completed phase id [R8]")
     sp.add_argument("phase_id")
@@ -2516,7 +2551,7 @@ def main(argv=None):
             raise Fail("no command; --help lists the command set "
                        "(start, progress, blocked, done, ctx, phase-done, show, "
                        "ask, wait, inbox, ack, connect, read, todo, hook-install, "
-                       "commit, report, install, measure)")
+                       "commit, report, review-done, install, measure)")
         out, token = a.func(a)
     except Fail as e:
         print(json.dumps({"ok": False, "error": str(e), **e.extra}))
@@ -4426,6 +4461,73 @@ def t_d7_one_ack_per_answer(root):
     assert len(answers) == 1, answers
     mine = [r for r in rows if r.get("kind") == "ack" and r.get("reply_to") == answers[0]["id"]]
     assert len(mine) == 1, mine
+
+
+def review_lane(data, name, task, root):
+    """A reviewer lane on a real bus: started as `review`, working, with a review file."""
+    lane = bus_lane(root, name, task, data)
+    begin(lane, root, run=BUS_RUN, task=task, role="review", report=".matrixkoder-review-r1.md")
+    cli(lane, "progress", "reading the diff")
+    with open(os.path.join(lane, ".matrixkoder-review-r1.md"), "w") as f:
+        f.write("verdict: APPROVE\n")
+    return lane
+
+
+def t_review_done_store_mode_posts_review(root):
+    """Store mode: ONE `review` message `round: 1\\nverdict: V findings: N path: P`, the status
+    file goes done, and the last stdout line is `<T> REVIEW R1 DONE`."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data = os.path.join(root, "rd-store-data")
+    os.makedirs(data, exist_ok=True)
+    d7_store(data, BUS_RUN, "RD1")
+    bus_server(root, "rd-store")
+    lane = review_lane(data, "rd_store_lane", "RD1", root)
+    code, lines = cli(lane, "review-done", "--verdict", "REQUEST_CHANGES", "--findings", "3",
+                      "--path", ".matrixkoder-review-r1.md")
+    assert code == 0 and lines[-1] == "RD1 REVIEW R1 DONE", (code, lines)
+    assert status(lane)["state"] == "done", status(lane)
+    rows = [r for r in d7_bus_rows(data) if r.get("kind") == "review"]
+    assert len(rows) == 1, rows
+    assert rows[0]["text"] == ("round: 1\nverdict: REQUEST_CHANGES findings: 3 "
+                               "path: .matrixkoder-review-r1.md"), rows[0]
+    code, lines = cli(lane, "review-done", "--verdict", "APPROVE", "--findings", "0",
+                      "--path", ".matrixkoder-review-r1.md")
+    assert code != 0, "a second review-done must be an illegal transition"
+
+
+def t_review_done_file_mode_posts_info(root):
+    """File mode (no mk.db) refuses kind `review`: the same text goes out as `info`."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data, _pid, _ = bus_server(root, "rd-file")
+    assert not store_present(data), data
+    lane = review_lane(data, "rd_file_lane", "RD2", root)
+    code, lines = cli(lane, "review-done", "--verdict", "APPROVE", "--findings", "0",
+                      "--path", ".matrixkoder-review-r1.md")
+    assert code == 0 and lines[-1] == "RD2 REVIEW R1 DONE", (code, lines)
+    rows = [r for r in bus_rows(data) if "verdict: APPROVE" in (r.get("text") or "")]
+    assert len(rows) == 1 and rows[0]["kind"] == "info", rows
+    assert rows[0]["text"].startswith("round: 1\nverdict: APPROVE findings: 0 path: "), rows[0]
+    assert status(lane)["state"] == "done", status(lane)
+
+
+def t_review_done_bus_down_blocks(root):
+    """Bus stopped: ask's contract. Exit 4, `BUS DOWN: use the BLOCKED token`, status blocked
+    (never done). A missing review file or a bad verdict is refused before any bus call."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data, pid, _ = bus_server(root, "rd-down")
+    lane = review_lane(data, "rd_down_lane", "RD3", root)
+    refuse(lane, "review-done", "--verdict", "APPROVE", "--findings", "0", "--path", "nope.md")
+    code, lines = cli(lane, "review-done", "--verdict", "MAYBE", "--findings", "0",
+                      "--path", ".matrixkoder-review-r1.md")
+    assert code != 0 and status(lane)["state"] == "working", (code, lines)
+    stop_pid(pid)
+    code, lines = cli(lane, "review-done", "--verdict", "APPROVE", "--findings", "0",
+                      "--path", ".matrixkoder-review-r1.md")
+    assert code == 4 and lines == ["BUS DOWN: use the BLOCKED token"], (code, lines)
+    assert status(lane)["state"] == "blocked", status(lane)
 
 
 def t_done_warns_on_running_child(root):
