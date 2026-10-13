@@ -875,7 +875,11 @@ def cmd_dispatch(a):
                 if ist in RETRY_PANE_STATES:
                     text = connect_text(hit[1].get("lane") or "", wdata)
                 else:
-                    a = list(a) + ["--publish-error", f"pane not idle: {ist or iwhy}"]
+                    # a busy pane gets nothing typed: not the doorbell, not the full
+                    # prompt. The caller retries later.
+                    out({"ok": False, "delivered": False, "pane": pane,
+                         "publish_error": f"pane not idle: {ist or iwhy}"})
+                    sys.exit(1)
             elif publish_error:
                 # the full prompt is kept; the reply says why the doorbell was not typed
                 a = list(a) + ["--publish-error", publish_error]
@@ -2782,9 +2786,10 @@ def self_test():
             open(os.path.join(tmp, "calls.log"), "w").write("")
             n0 = len(prompt_calls())
             r = cli("dispatch", "--pane", pane_of("NB"), "--text", "the full prompt stays", "--connect",
-                    extra={"MK_DOORBELL_IDLE_WAIT_S": "0.3", "MK_DOORBELL_IDLE_POLL_S": "0.1"})
-            assert r["delivered"] is False or "connect" not in (prompt_calls()[n0:][-1] if prompt_calls()[n0:] else ""), r
-            assert all("mk-builder.py connect" not in c for c in prompt_calls()[n0:]), prompt_calls()[n0:]
+                    extra={"MK_DOORBELL_IDLE_WAIT_S": "0.3", "MK_DOORBELL_IDLE_POLL_S": "0.1"}, code=1)
+            # nothing at all is typed into a pane that stays working
+            assert r["delivered"] is False and "pane not idle" in r.get("publish_error", ""), r
+            assert prompt_calls()[n0:] == [], prompt_calls()[n0:]
             # E3 R2: lane and data are quoted, so a space or metacharacters stay one argument
             odd = os.path.join(tmp, "data dir;$(touch x)")
             os.makedirs(odd, exist_ok=True)

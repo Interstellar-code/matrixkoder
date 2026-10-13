@@ -106,38 +106,35 @@ def in_span(n, spans):
     return any(a <= n < b for a, b in spans)
 
 
-def _outside_code(line):
-    """The parts of a line that are not inside backticks."""
-    return "".join(part for i, part in enumerate(line.split("`")) if i % 2 == 0)
-
-
-def _template_slot(text):
-    """True for a raw-template slot: its text holds a space, a comma or a slash."""
-    return any(c in text for c in " ,/")
+def template_slots():
+    """Every `<...>` slot text in the raw brief template, longest first."""
+    tmpl = open(BRIEF, encoding="utf-8").read()
+    found = set(re.findall(r"<([^>\n]+)>", tmpl))
+    # a short token (`<path>`, `<id>`, `<question>`) appears in filled prose; only a
+    # slot whose text is distinctive marks a raw template
+    found = {x for x in found if len(x) >= 8}
+    return sorted(found, key=len, reverse=True)
 
 
 def placeholder_failures(text):
-    """Unfilled template slots, and a raw `# <PHASE> — <one-line goal>` title.
+    """A raw template, fenced or not, and a raw `# <PHASE>` title.
 
-    A slot counts only when it is the kind the raw template uses: a `<...>` whose text
-    holds a space, a comma or `/`, sitting outside backticks and outside a fenced block.
-    Short prose tokens (`<id>`, `<sha>`, `<path>`, `<data>`) are not slots. Names the line.
+    A brief fails when it holds three or more distinct exact template slot strings
+    (taken from templates/brief.md), anywhere, inside a fence or a code span or not,
+    or when its title is `# <PHASE>`. One slot-like token in prose (`<path>`, `<id>`)
+    is allowed. Names the line.
     """
     fails = []
-    spans = optional_spans(text)
-    fenced = False
+    slots = template_slots()
+    seen = set()
     for n, line in enumerate(text.splitlines(), 1):
-        if line.lstrip().startswith("```"):
-            fenced = not fenced
-            continue
-        if fenced or in_span(n - 1, spans):
-            continue
-        for slot in re.findall(r"<([^>`\n]+)>", _outside_code(line)):
-            if _template_slot(slot):
-                fails.append(f"line {n}: unfilled placeholder: {line.strip()}")
-                break
+        for slot in slots:
+            if f"<{slot}>" in line and slot not in seen:
+                seen.add(slot)
+                if len(seen) >= 3:
+                    fails.append(f"line {n}: unfilled placeholder: {line.strip()}")
     first = next((l for l in text.splitlines() if l.strip()), "")
-    if re.match(r"#\s+<PHASE>\s+—", first):
+    if re.match(r"#\s+<PHASE>", first):
         fails.insert(0, f"line 1: raw template title: {first.strip()}")
     return fails
 
@@ -155,44 +152,32 @@ def self_test():
     assert any("raw template title" in f for f in raw_fails), raw_fails
     assert any("unfilled placeholder" in f for f in raw_fails), raw_fails
 
-    # a filled brief passes. Placeholders inside the FIX block are allowed.
+    # a filled brief with one slot-like token in prose passes
     filled = "\n".join([
         "# W1 — the goal",
         "",
         "Repo: this folder (worktree `/tmp/lane`, branch `mk/r1/w1`, at `abc1234`).",
+        "The lane reads <path> and <round> from the token.",
         "",
         "## Rules",
         "- Use the mk-builder skill — round R2.",
         "",
-        "## FIX (review `review-r1.md`)",
-        "1. [HIGH] hooks/wake.ts:481 — cursor — baseline it",
-        "<what to build, as numbered parts>",
-        "",
     ])
     assert placeholder_failures(filled) == [], placeholder_failures(filled)
 
-    # the same placeholder OUTSIDE the FIX block fails, and the line is named
-    bad = filled.replace("## FIX (review `review-r1.md`)", "## Notes")
+    # three distinct exact template slots fail, and the line is named
+    bad = filled + "\n<list / globs>\n<lanes + their areas>\n<what to build, as numbered parts. Point to files with `path:line`; point to mockups by path; state the API contract the code must use. Never paste code.>\n"
     bad_fails = placeholder_failures(bad)
     assert any(f.startswith("line ") and "unfilled placeholder" in f for f in bad_fails), bad_fails
 
-    # a placeholder counts only when it is a raw-template slot. Short prose tokens,
-    # and anything inside backticks or a fence, pass.
-    table = [
-        ("# W1 — the goal", False),
-        ("# <PHASE> — <one-line goal>", True),
-        ("<what to build, as numbered parts>", True),
-        ("<list / globs>", True),
-        ("<cmd>", False),
-        ("<type(scope): message>", True),
-        ("history: `<data>/runs/<id>/tasks/<T>/` (read-only)", False),
-        ("point at files with `path:line`; the `<sha>` is filled", False),
-        ("```\n<what to build, as parts>\n```", False),
-        ("the lane reads <id>, <T>, <sha>, <path> and <data>", False),
-    ]
-    for sample, expect in table:
-        got = bool(placeholder_failures(sample))
-        assert got is expect, (sample, got)
+    # a fence does not hide a raw template: the whole template, retitled, still fails
+    fenced = "```\n" + raw.replace("# <PHASE>", "# W1", 1) + "\n```\n"
+    assert placeholder_failures(fenced), fenced[:80]
+
+    # one slot inside backticks still fails once a second distinct slot is present,
+    # and a single backticked slot on its own does not
+    assert placeholder_failures("Build `<what to build, as parts>` now") == []
+    assert placeholder_failures("Build `<one-line goal>` now, then <list / globs> and <lanes + their areas>"), "three slots, one backticked"
 
     # the live template passes
     fails = check_brief(BRIEF)
