@@ -345,18 +345,19 @@ the target status gets no transition (nothing moved).
 comment naming its DB home, and the table below is the same contract written out. Additive only —
 no key is renamed or removed, so every plan written against an older template stays valid.
 
-`plans(id, version, title, header_json, body_md, approved_at, archived_path)`. D1 adds four
-columns — `status`, `created`, `design`, `integration` — marked "added by D1"; until then those
-four keys live only in `header_json`.
+`plans(id, version, title, status, created, design, integration, header_json, body_md,
+approved_at, archived_path)`. `status`, `created`, `design` and `integration` are real columns
+(C1). `design` and `integration` are JSON array text. `runs`, the `[gates]` block and the
+`[[phase]]` blocks stay in `header_json`.
 
 | Header key | DB home |
 |---|---|
-| `plan` | `plans.id` (and `plans.title` until the H1 title lands) |
-| `status` | `plans.status` (added by D1; `header_json` until then) |
-| `created` | `plans.created` (added by D1; `header_json` until then) |
+| `plan` | `plans.id` |
+| `status` | `plans.status` |
+| `created` | `plans.created` |
 | `runs` | `plans.header_json` |
-| `design` | `plans.design` (added by D1; `header_json` until then) |
-| `integration` | `plans.integration` (added by D1; `header_json` until then) |
+| `design` | `plans.design` (JSON array text) |
+| `integration` | `plans.integration` (JSON array text) |
 | `[gates]` (`test`, `typecheck`, `selftest`, `validate`) | `plans.header_json` |
 | `[[phase]]` blocks | `plans.header_json` |
 | `[[phase]] id` / `[[phase.task]] id` / `[[phase.task.subtask]] id` | `tasks.id` |
@@ -369,21 +370,68 @@ four keys live only in `header_json`.
 | nesting of `[[phase.task]]` / `[[phase.task.subtask]]` | `tasks.type` (`phase\|task\|subtask`) and `tasks.parent` |
 | `wave`, `forbidden`, `reviewer`, `size`, `risk`, `review`, `qa`, `commit`, `subagents`, `lane_group`, `refs`, `subagent` | `header_json` only — no column |
 | the body below the closing `+++` | `plans.body_md` |
-| the body H1 line | `plans.title` (after D1; the plan id is the title until then) |
+| the body H1 line | `plans.title` — the H1 text after the em dash (`# <id> — <title>`); the plan id when there is no H1 (C3) |
 
 The task rows come from the importer `approve_file` (`scripts/mk-plan.py`): its `flat_items`
 yields `(id, type, parent, title, acceptance, owned, deps, parallel, route)` per phase, task and
 subtask, parent first, and each becomes one `tasks` row of the run.
 
-Lifecycle (C13): `import` loads the file into the store without approving it (command added by
-D1); `approve` checks the file, versions it, writes the tasks and copies it to
-`<data>/plans/archive/<id>-v<n>.md`, leaving the original in `<data>/plans/`; `run init --plan`
-starts the run. After import the run and this DB are the source — status, tasks, rounds and
-verdicts change there, and MK does not edit the plan file. When the plan is done the file moves to
-`<data>/plans/archive/`.
+Lifecycle (C13): `import` loads the file into the store without approving it; `approve` checks
+the file, versions it, writes the tasks and copies it to `<data>/plans/archive/<id>-v<n>.md`,
+leaving the original in `<data>/plans/`; `run init --plan` starts the run. After import the run
+and this DB are the source — status, tasks, rounds and verdicts change there, and MK does not
+edit the plan file. When the plan is done the file moves to `<data>/plans/archive/`.
 
 `mk-plan.py check` reports a missing `status`, a missing `created` and a body with no H1 line as
 **warnings**, never errors, so an older plan still checks `ok: true`.
+
+## Plan commands (`mk-plan.py`)
+
+`import`, `approve`, `delete` and pause/resume, as `scripts/mk-plan.py` `build_parser` ships them
+(C4, C10, C13). Every command prints one JSON line. `--data` and `--home` are optional on
+`import`, `approve`, `delete` and `set`.
+
+Data-dir resolution (`resolve_data_arg`), the same order as `mk-state` and copied rather than
+imported: `--data`, then `$MATRIXKODER_DATA`, then the data dir this repo registered (the root
+`projects.data_dir` row, else `<home>/projects.json`), else `<main checkout>/.matrixkoder`. A
+linked worktree uses the main checkout. None of these commands creates a store: a store exists
+only when `<data>/mk.db` is already a file.
+
+`import <file> [--dry-run] [--data DIR] [--home DIR]` loads one plan and does not approve it. It
+writes one `plans` row (status, created, design, integration, the H1 title, `header_json`,
+`body_md`) and no task rows, and it never edits the file. A file whose first line is not `+++`,
+or whose header does not parse, is refused (`ok: false`, `reason` set, exit 0). A header with no
+`plan` id is refused the same way. The same bytes imported again upsert the same row and change
+nothing (`noop: true`); version is left as stored, or `0` when the row is new. `--dry-run`
+returns the same reply and writes nothing. Import needs a store; without `<data>/mk.db` it errors.
+
+`approve <path> [--data DIR] [--home DIR] [--run ID]` checks the file, writes the plan version and
+its tasks, and copies the approved bytes to `<data>/plans/archive/<id>-v<n>.md`. The original
+stays in place (refreshed to those approved bytes, so `run init --plan <original path>` still
+resolves). The reply names the run id as `tasks_run` (the `--run` value, else the plan's first
+`runs` entry, else the plan id) — no run row exists until `run init`. Approving the same approved
+bytes again is a no-op. With no store, approve only flips the file status to `approved` and, when
+an `mk.db` sits beside the file that was not the resolved store, adds a warning naming it.
+
+`delete <id> [--data DIR] [--home DIR]` is refused while any `runs` row has `plan=<id>` and
+`status='active'` (exit 2, the live run ids named). Otherwise it removes the `plans` row and
+moves `<data>/plans/<id>.md` into `<data>/plans/archive/` (a timestamp suffix when that name is
+already taken). The file is never unlinked. Tasks of finished runs stay.
+
+Pause and resume are `set <path> --status parked` and `set` back to the previous status. The file
+is rewritten as before, and when the store has a `plans.status` column and a row for this plan,
+that column follows.
+
+### Notes
+
+- The plan text says import "refuses a non-`+++` file". The code does (`split_plan`), and it also
+  refuses a `+++` file whose header does not parse or has no `plan` id, with exit 0 and `reason`
+  rather than the usual exit 2.
+- The plan text says `set <id> status=parked`. The code is `set <path> --status parked`: the
+  argument is the plan file path, not the plan id, and the status is a flag.
+- Re-import updates `title`, `header_json` and `body_md` only. It does not overwrite `status`,
+  `created`, `design` or `integration` on a row that already exists (a conflicting upsert lists
+  those four in the insert but not in the update set).
 
 ## Plan link (C4)
 
@@ -490,7 +538,7 @@ Every open sets `journal_mode=WAL`, `busy_timeout=5000`, `foreign_keys=ON`. Ever
 
 ### `schema_version` and migrations
 
-Both stores carry `schema_version(version INTEGER PRIMARY KEY)`. `SCHEMA = 3`. Migrations are an
+Both stores carry `schema_version(version INTEGER PRIMARY KEY)`. `SCHEMA = 4`. Migrations are an
 ordered `(version, step)` list applied once. A step is either SQL or a Python callable. SQL steps
 are idempotent by construction (`CREATE TABLE IF NOT EXISTS`, `INSERT OR IGNORE`); an
 `ALTER TABLE ADD COLUMN` is not safe to run twice, so it goes through a guarded Python step that
@@ -513,6 +561,13 @@ upgraded in place on the next open and keeps every `lane_slots` row; opening it 
 nothing. A crash after the columns are added and before the version stamp is repaired by the next
 open, because each column is added only when it is missing.
 
+v4 (shipped, a guarded Python step, the same `PRAGMA table_info` pattern as v3) adds
+`plans.status`, `plans.created`, `plans.design` and `plans.integration`, each `TEXT` and NULL on
+rows written before the migration. `design` and `integration` hold JSON array text. A fresh store
+is created with those columns already on `plans`, then the v2, v3 and v4 steps run and stamp
+version 4. A v1, v2 or v3 store is upgraded in place on the next open and keeps every `plans`
+row; opening it again changes nothing.
+
 ### Project tables (C2)
 
 `tasks(run, id, parent, type, title, acceptance, owned, deps, parallel, route_json, status,
@@ -532,7 +587,9 @@ status is not transitioned again.
 artifact_id, meta_json)` with index `ev_task(run, task, id)`. `chan` is `state` or `bus` on rows
 `transition()` and `import_history` write; `append_event` also accepts `note`.
 `change_log(change_no INTEGER PRIMARY KEY, run, task, t)` — `change_no` is the rowid, gap-free.
-`lane_slots(slot TEXT PRIMARY KEY, lane_path, state, run, task, workspace, workspace_id, branch, lock_hash, updated)` — the five trailing columns are v3, each `TEXT`, and match the slot record in `lanes.json` (`workspace` and `workspace_id` are null for a plain git worktree; `branch`, `lock_hash` and `updated` are null until the slot is acquired). `plans`, `runs`, `acks`, `waits` as in contract C2.
+`lane_slots(slot TEXT PRIMARY KEY, lane_path, state, run, task, workspace, workspace_id, branch, lock_hash, updated)` — the five trailing columns are v3, each `TEXT`, and match the slot record in `lanes.json` (`workspace` and `workspace_id` are null for a plain git worktree; `branch`, `lock_hash` and `updated` are null until the slot is acquired). `runs`, `acks`, `waits` as in contract C2.
+
+`plans(id, version, title, status, created, design, integration, header_json, body_md, approved_at, archived_path)`. `status TEXT`, `created TEXT`, `design TEXT` (JSON array text) and `integration TEXT` are v4 (C1), NULL on a row written before the migration. `title` is the H1 text after the em dash, or the plan id when the body has no H1 (C3).
 `artifacts(id INTEGER PRIMARY KEY, run, task, round, kind, rev, text, created, src)` — `text` is
 stored byte-for-byte; `src` is the v2 source key.
 
@@ -600,8 +657,21 @@ is accepted; a larger body is refused.
 mkdb.py timeline --project P --run R --task T --json [--data DIR] [--home DIR]
 mkdb.py cards [--project P] --json [--home DIR]
 mkdb.py import-history --project P --run R --json-file F [--data DIR] [--home DIR]
+mkdb.py plans --json [--data DIR] [--home DIR]
+mkdb.py plans <id> --json [--data DIR] [--home DIR]
 mkdb.py --self-test
 ```
+
+<!-- check against D1.1 -->
+
+`plans --json` lists every plan. Each object has `id`, `title`, `status`, `created`, `design`,
+`integration`, `version`, `approved_at`, `runs`, `live_run` and `counts`. `live_run` is the id of
+the plan's live run, or null. `counts` is the task counts by status. `plans <id> --json` is that
+same object plus `phases`: each phase with its `tasks`, taken from the latest run (`tasks` joined
+to `runs` on `runs.plan = plans.id`), or from the `[[phase]]` / `[[phase.task]]` rows in
+`header_json` when the plan has no run. The field list is the D1.1 acceptance line; D1.1 is
+landing in parallel, so the reply shape above is not yet checked against `scripts/mkdb.py`.
+
 
 `timeline` is `SELECT … FROM events WHERE run=? AND task=? ORDER BY id`. `cards` reads the root
 store. `mk-catalog.py` follows the same rule for the root store: its read commands (`list`, `show`, `routes`, `model`) go through `read_catalog`, which returns an empty result when `<home>/mk.db` is absent (`list` and `routes` answer `{"ok": true, …: []}`) and never creates it, while the writers `seed` and `set` call `open_catalog` and do create it (`set` creates it even when the agent is unknown and the command then refuses). One JSON line per call; errors exit 2, a newer store exits 3.
