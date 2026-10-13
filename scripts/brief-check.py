@@ -85,7 +85,100 @@ def check_brief(path):
         return failures_for(render(f.read()))
 
 
+def optional_spans(text):
+    """Line ranges of the optional TAKEOVER / FIX / LEAD blocks: a placeholder there is allowed."""
+    lines = text.splitlines()
+    heads = ("## TAKEOVER", "## FIX", "## LEAD")
+    spans, i = [], 0
+    while i < len(lines):
+        if lines[i].startswith(heads):
+            start = i
+            i += 1
+            while i < len(lines) and not lines[i].startswith("## "):
+                i += 1
+            spans.append((start, i))
+        else:
+            i += 1
+    return spans
+
+
+def in_span(n, spans):
+    return any(a <= n < b for a, b in spans)
+
+
+def template_slots():
+    """Every `<...>` slot text in the raw brief template, longest first."""
+    tmpl = open(BRIEF, encoding="utf-8").read()
+    found = set(re.findall(r"<([^>\n]+)>", tmpl))
+    # a short token (`<path>`, `<id>`, `<question>`) appears in filled prose; only a
+    # slot whose text is distinctive marks a raw template
+    found = {x for x in found if len(x) >= 8}
+    return sorted(found, key=len, reverse=True)
+
+
+def placeholder_failures(text):
+    """A raw template, fenced or not, and a raw `# <PHASE>` title.
+
+    A brief fails when it holds three or more distinct exact template slot strings
+    (taken from templates/brief.md), anywhere, inside a fence or a code span or not,
+    or when its title is `# <PHASE>`. One slot-like token in prose (`<path>`, `<id>`)
+    is allowed. Names the line.
+    """
+    fails = []
+    slots = template_slots()
+    seen = set()
+    for n, line in enumerate(text.splitlines(), 1):
+        for slot in slots:
+            if f"<{slot}>" in line and slot not in seen:
+                seen.add(slot)
+                if len(seen) >= 3:
+                    fails.append(f"line {n}: unfilled placeholder: {line.strip()}")
+    first = next((l for l in text.splitlines() if l.strip()), "")
+    if re.match(r"#\s+<PHASE>", first):
+        fails.insert(0, f"line 1: raw template title: {first.strip()}")
+    return fails
+
+
+def check_placeholders(path):
+    """Exit-style check of one brief file. Returns the failures (empty = pass)."""
+    with open(path, encoding="utf-8") as f:
+        return placeholder_failures(f.read())
+
+
 def self_test():
+    # the raw template is rejected: its title is `# <PHASE>` and its body is unfilled
+    raw = open(BRIEF, encoding="utf-8").read()
+    raw_fails = placeholder_failures(raw)
+    assert any("raw template title" in f for f in raw_fails), raw_fails
+    assert any("unfilled placeholder" in f for f in raw_fails), raw_fails
+
+    # a filled brief with one slot-like token in prose passes
+    filled = "\n".join([
+        "# W1 — the goal",
+        "",
+        "Repo: this folder (worktree `/tmp/lane`, branch `mk/r1/w1`, at `abc1234`).",
+        "The lane reads <path> and <round> from the token.",
+        "",
+        "## Rules",
+        "- Use the mk-builder skill — round R2.",
+        "",
+    ])
+    assert placeholder_failures(filled) == [], placeholder_failures(filled)
+
+    # three distinct exact template slots fail, and the line is named
+    bad = filled + "\n<list / globs>\n<lanes + their areas>\n<what to build, as numbered parts. Point to files with `path:line`; point to mockups by path; state the API contract the code must use. Never paste code.>\n"
+    bad_fails = placeholder_failures(bad)
+    assert any(f.startswith("line ") and "unfilled placeholder" in f for f in bad_fails), bad_fails
+
+    # a fence does not hide a raw template: the whole template, retitled, still fails
+    fenced = "```\n" + raw.replace("# <PHASE>", "# W1", 1) + "\n```\n"
+    assert placeholder_failures(fenced), fenced[:80]
+
+    # one slot inside backticks still fails once a second distinct slot is present,
+    # and a single backticked slot on its own does not
+    assert placeholder_failures("Build `<what to build, as parts>` now") == []
+    assert placeholder_failures("Build `<one-line goal>` now, then <list / globs> and <lanes + their areas>"), "three slots, one backticked"
+
     # the live template passes
     fails = check_brief(BRIEF)
     assert not fails, fails
@@ -119,7 +212,19 @@ def self_test():
     print("brief-check self-test ok")
 
 
-def main():
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    # a path argument checks THAT brief for unfilled placeholders (exit non-zero, names the line)
+    if argv and argv[0] != "--self-test":
+        fails = []
+        for path in argv:
+            fails.extend(check_placeholders(path))
+        for line in fails:
+            print(line)
+        if fails:
+            return 1
+        print("brief-check ok")
+        return 0
     fails = check_brief(BRIEF)
     for line in fails:
         print(line)
