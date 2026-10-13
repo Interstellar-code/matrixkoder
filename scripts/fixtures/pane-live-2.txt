@@ -1,0 +1,63 @@
+# sanitised read-only capture of a working builder pane (w1P:p5), 2026-10-12
+  ┃  started
+  ┃
+
+  ┃
+  ┃  $ sleep 25; ps -p $(cat /tmp/t2-mkdb2.pid) >/dev/null && echo ALIVE || echo DEAD; tail -c 150 /tmp/t2-mkdb2.
+  ┃  out; echo; echo '--- builder ---'; ps -p $(cat /tmp/t2-builder.pid) >/dev/null && echo ALIVE || echo …
+  ┃
+  ┃  (2 earlier lines)
+  ┃      ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+  ┃  sqlite3.OperationalError: database is locked
+  ┃  SELF-TEST FAIL: writer 00000 exit 1
+  ┃
+  ┃  --- builder ---
+  ┃  ALIVE
+  ┃
+
+  ┃
+  ┃  $ sleep 40; ps -p $(cat /tmp/t2-builder.pid) >/dev/null && echo ALIVE || echo DEAD; tail -c 200 /tmp/t2-buil
+  ┃  der.out; echo
+  ┃
+  ┃  ALIVE
+  ┃
+
+  ┃
+  ┃  $ sleep 40; ps -p $(cat /tmp/t2-builder.pid) >/dev/null && echo ALIVE || echo DEAD; wc -c /tmp/t2-builder.ou
+  ┃  t; tail -c 160 /tmp/t2-builder.out; echo
+  ┃
+  ┃  ALIVE
+  ┃         0 /tmp/t2-builder.out
+  ┃
+
+  ┃
+  ┃  $ ps -p $(cat /tmp/t2-builder.pid) -o etime,command; pgrep -P $(cat /tmp/t2-builder.pid) | head
+  ┃
+  ┃  ELAPSED COMMAND
+  ┃    03:44 /opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/Versions/3.14/Resources/Python.
+  ┃  app/Contents/MacOS/Python child-skills/mk-builder/scripts/mk-builder.py --self-test
+  ┃  00000
+  ┃  00000
+  ┃
+
+  ┃
+  ┃  $ sleep 45; ps -p $(cat /tmp/t2-builder.pid) >/dev/null && echo ALIVE || echo DEAD; wc -c /tmp/t2-builder.ou
+  ┃  t; tail -c 180 /tmp/t2-builder.out; echo
+  ┃
+  ┃  ALIVE
+  ┃         0 /tmp/t2-builder.out
+  ┃
+
+  ┃
+  ┃  ⠇ sleep 50; ps -p $(cat /tmp/t2-builder.pid) >/dev/null && echo ALIVE || echo DEAD; wc -c /tmp/t2-builder.ou
+  ┃    t; tail -c 200 /tmp/t2-builder.out; echo
+  ┃
+  ┃   Background
+  ┃
+
+  ┃
+  ┃
+  ┃
+  ┃  Build auto · Manifest Auto Manifest · high
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ⬝⬝■■■■■■ esc interrupt                                               ↓ 1 shell · 165.8K (83%)  ctrl+p commands

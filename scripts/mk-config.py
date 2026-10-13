@@ -30,8 +30,12 @@ retry, a wrong write costs them a hand-edited config.
 
 The yaml parser (scalar, split_flow, strip_comment, flow_map, KEY_RE) lives here and mk-lane.py
 loads it from this file: one parser for both tools, so a value can never mean two things.
+
+session.selftest_jobs_total: integer 1..16, the whole-machine self-test job budget. When the yaml
+has no value the default is derived as max(1, round(cpu_count/3)); list/get/context show that
+number and say it is derived.
 """
-import contextlib, datetime, difflib, importlib.util, json, os, re, shutil, subprocess, sys, tempfile, time
+import contextlib, datetime, difflib, fcntl, importlib.util, json, os, re, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True  # no stray __pycache__ next to the scripts
@@ -200,6 +204,13 @@ SCHEMA = [
          "Reviewer split", "where the reviewer runs while the builder waits",
          opts=[("right", "the reviewer pane sits beside the lane"),
                ("down", "the reviewer runs after the builder stops")]),
+    _row("session.todo_done_status", "child", "seg", "verify", ["session"], "todo_done_status", None,
+         "Todo completed becomes", "what a completed todo sets the task to",
+         opts=[("verify", "a completed todo moves the task to verify"),
+               ("done", "a completed todo moves the task to done")]),
+    _row("session.selftest_jobs_total", "child", "num", None, ["session"], "selftest_jobs_total", None,
+         "Self-test jobs", "parallel self-tests when MK_SELFTEST_JOBS is unset (1..16)",
+         min=1, max=16, integer=True, derived=True),
     _row("session.reuse_reviewer", "child", "bool", True, ["session"], "reuse_reviewer", None,
          "Reuse reviewer", "one reviewer session serves the phase's rounds"),
     _row("bus.enabled", "child", "bool", True, ["bus"], "enabled", None,
@@ -315,15 +326,97 @@ def row_for(lines, key):
     return None
 
 
+ROUTE_KEYS = ("routing_preferences.reviewer", "routing_preferences.visual_reviewer")
+CATALOG_TIMEOUT_S = 10  # a settings screen that waits longer than this is broken, not loading
+_ROUTES_CACHE = {}  # one catalog read per process; the self-test clears it for a fresh read
+
+
+def catalog_home():
+    """The MK home `mk-catalog.py` would use: $MK_HOME, else ~/.matrixkoder — the same rule as
+    mkdb.resolve_home with no --home argument."""
+    return os.path.abspath(os.path.expanduser(os.environ.get("MK_HOME") or "~/.matrixkoder"))
+
+
+def catalog_routes():
+    """The runnable routes `mk-catalog.py routes --json` lists, or None when the catalog is absent
+    or errors. A settings screen must never crash because the catalog is missing, so every failure
+    — a missing script, a non-zero exit, a timeout, output that is not the documented shape — reads
+    as "no catalog" and the caller falls back to the current value alone.
+
+    The catalog command creates <home>/mk.db when none exists, so it is never called unless the
+    store is already there: opening Settings must not create ~/.matrixkoder/mk.db. The result is
+    cached for the process, so one `list` starts at most one subprocess."""
+    if "routes" in _ROUTES_CACHE:
+        return _ROUTES_CACHE["routes"]
+    if not os.path.isfile(os.path.join(catalog_home(), "mk.db")):
+        _ROUTES_CACHE["routes"] = None  # no store: do not call the catalog, it would create one
+        return None
+    try:
+        counter = os.environ.get("MK_CONFIG_COUNT_ROUTES")  # self-test only: counts the calls
+        if counter:
+            with open(counter, "a") as f:
+                f.write("1")
+        p = subprocess.run([sys.executable, os.path.join(HERE, "mk-catalog.py"), "routes", "--json"],
+                           capture_output=True, text=True, timeout=CATALOG_TIMEOUT_S)
+    except Exception:  # a timeout or a missing interpreter: the catalog is not there
+        _ROUTES_CACHE["routes"] = None
+        return None
+    if p.returncode != 0:
+        _ROUTES_CACHE["routes"] = None
+        return None
+    try:
+        data = json.loads(p.stdout)
+    except ValueError:
+        _ROUTES_CACHE["routes"] = None
+        return None
+    routes = data.get("routes") if isinstance(data, dict) and data.get("ok") is True else None
+    if not isinstance(routes, list) or not all(isinstance(x, str) and x.strip() for x in routes):
+        _ROUTES_CACHE["routes"] = None
+        return None
+    # a home with no catalog seeds an empty one and still exits 0: an empty pool is "no catalog",
+    # so the dropdown falls back to the current value instead of flagging it stale
+    if not routes:
+        _ROUTES_CACHE["routes"] = None
+        return None
+    got = list(dict.fromkeys(routes))  # the catalog's order, duplicates dropped
+    _ROUTES_CACHE["routes"] = got
+    return got
+
+
 def opts_of(r, lines):
     """The [[value, note]] option list a UI shows; session.subagent_model's options are the models
-    the yaml says this OpenCode build has, so they come from the file and never from a hard-coded list."""
+    the yaml says this OpenCode build has, so they come from the file and never from a hard-coded list.
+
+    The two reviewer rows take their options from the catalog's runnable routes. A saved value the
+    catalog no longer lists stays in the list and is flagged `stale` — dropping it would hide the
+    value the file holds, and re-saving it is refused (item 39). With the catalog absent the
+    dropdown falls back to the current value alone, so the screen still draws."""
     if r["key"] == "session.subagent_model":
         return [[m, ""] for m in dict(agents(lines)).get("opencode", {}).get("models", [])]
+    if r["key"] in ROUTE_KEYS:
+        current = value_of(lines, r)[1]
+        routes = catalog_routes()
+        pool = [current] if routes is None else list(routes)
+        if current not in pool:  # a saved route the catalog dropped: kept, and marked stale
+            pool.append(current)
+        return [[v, "stale" if routes is not None and v not in routes else ""] for v in pool]
     return [[v, note] for (v, note) in r["opts"]] if r.get("opts") else None
 
 
 # ---------- reading ----------
+
+def derived_selftest_jobs():
+    """The job budget when the yaml has no session.selftest_jobs_total: max(1, round(cores/3))."""
+    cores = os.cpu_count() or 1
+    return max(1, round(cores / 3))
+
+
+def effective_default(r):
+    """The default a read shows. A derived row has no fixed number in the schema."""
+    if r.get("derived") and r["key"] == "session.selftest_jobs_total":
+        return derived_selftest_jobs()
+    return r["default"]
+
 
 def coerce(type, raw, default):
     """A yaml scalar as the schema's type; anything unreadable falls back to the default rather than
@@ -339,10 +432,7 @@ def coerce(type, raw, default):
         try:
             return int(s)
         except ValueError:
-            try:
-                return float(s)
-            except ValueError:
-                return default
+            return default  # a float or a word is unreadable: the default, never a guessed number
     if type == "list":
         t = s.strip()
         if t.startswith("[") and t.endswith("]"):
@@ -352,38 +442,40 @@ def coerce(type, raw, default):
 
 
 def value_of(lines, r):
-    """-> (found, value): the yaml's value for a schema row, else the schema default."""
+    """-> (found, value): the yaml's value for a schema row, else the schema default
+    (a derived default when the row has one)."""
+    dflt = effective_default(r)
     if r["key"].startswith("helpers."):
         kl = key_lines(lines)
         hits = [i for (i, indent, k, _r) in kl if indent == 0 and k == "helpers"]
         if len(hits) != 1:
-            return False, r["default"]
+            return False, dflt
         rest = KEY_RE.match(lines[hits[0]]).group(3)
         m = flow_map(rest)
         if r["member"] in m:
-            return True, coerce(r["type"], m[r["member"]], r["default"])
+            return True, coerce(r["type"], m[r["member"]], dflt)
         sr = section_range(lines, kl, ["helpers"])
         if sr:
             ch_hits = [i for (i, indent, k, _r) in kl if sr[2] <= i < sr[3] and k == r["member"]]
             if len(ch_hits) == 1:
                 ch_rest = KEY_RE.match(lines[ch_hits[0]]).group(3)
-                return True, coerce(r["type"], ch_rest, r["default"])
-        return False, r["default"]
+                return True, coerce(r["type"], ch_rest, dflt)
+        return False, dflt
     kl, sr = key_lines(lines), section_range(lines, key_lines(lines), r["sec"])
     if not sr:
-        return False, r["default"]
+        return False, dflt
     hits = [i for (i, indent, k, _r) in kl if sr[2] <= i < sr[3] and k == r["line"]]
     if len(hits) != 1:
-        return False, r["default"]  # absent, or a duplicate: a read never guesses
+        return False, dflt  # absent, or a duplicate: a read never guesses
     rest = KEY_RE.match(lines[hits[0]]).group(3)
     if r["member"] is None:
-        return True, coerce(r["type"], rest, r["default"])
+        return True, coerce(r["type"], rest, dflt)
     m = flow_map(rest)
     if r["member"] not in m:
-        return False, r["default"]
+        return False, dflt
     got = m[r["member"]]
     # flow_map already gives a nested [ list ] back as a list; everything else is still a scalar
-    return True, got if r["type"] == "list" else coerce(r["type"], got, r["default"])
+    return True, got if r["type"] == "list" else coerce(r["type"], got, dflt)
 
 
 # ---------- writing: values as yaml text ----------
@@ -507,7 +599,41 @@ def patch(lines, r, value):
     return new, 1
 
 
-# ponytail: last-writer-wins, no lock; add mk_state lock if wizard+settings race
+LOCK_WAIT_S = 5  # a Settings save waits this long for another writer, then refuses; never hangs
+LOCK_NAME = "matrixkoder.yaml.lock"
+
+
+@contextlib.contextmanager
+def yaml_lock(path):
+    """Exclusive flock on a sibling lock file for the whole read-modify-write.
+
+    The kernel drops the lock when this process dies (kill -9 included). A holder that outlasts
+    LOCK_WAIT_S is a named error, not a second writer and not a hang. Reads never call this.
+    """
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    try:
+        os.makedirs(d, exist_ok=True)
+        f = open(os.path.join(d, LOCK_NAME), "a")
+    except OSError as e:
+        raise Fail(f"could not lock {path}: {e.strerror or e}")
+    try:
+        deadline = time.monotonic() + LOCK_WAIT_S
+        while True:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise Fail(f"{LOCK_NAME} busy")
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+    finally:
+        f.close()
+
+
 def write_yaml(path, old, new, count, checks):
     """Prove the patched text is the file we meant to write, back up the version being replaced, then
     replace it atomically. A yaml a human edited by hand is the only config there is: a wrong write is
@@ -619,10 +745,6 @@ def pin_tmp_data(tmp):
     data, home = os.path.join(tmp, "data"), os.path.join(tmp, "home")
     os.makedirs(data, exist_ok=True), os.makedirs(home, exist_ok=True)
     was = {k: os.environ.get(k) for k in ("MATRIXKODER_DATA", "MATRIXKODER_HOME")}
-    os.environ["MATRIXKODER_DATA"], os.environ["MATRIXKODER_HOME"] = data, home
-    got = os.path.realpath(mk_state.resolve_data(None))
-    assert got.startswith(os.path.realpath(tmp)), \
-        f"the self-test would resolve {got}, which is outside its temp dir {tmp}"
 
     def restore():
         for k, v in was.items():
@@ -630,6 +752,17 @@ def pin_tmp_data(tmp):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+    os.environ["MATRIXKODER_DATA"], os.environ["MATRIXKODER_HOME"] = data, home
+    try:
+        got = os.path.realpath(mk_state.resolve_data(None))
+        # the resolved dir, not the env value just written: a resolver that ignores the env and
+        # lands in a real checkout must fail this assert
+        assert os.path.commonpath([got, os.path.realpath(tmp)]) == os.path.realpath(tmp), \
+            f"the self-test would resolve {got}, which is outside its temp dir {tmp}"
+    except Exception:
+        restore()  # a failed pin must not leave the caller's environment mutated
+        raise
     return restore
 
 
@@ -658,7 +791,7 @@ def out(obj, code=0):
     return code
 
 
-def parse_value(raw, r):
+def parse_value(raw, r, lines=None):
     """`set` takes JSON so a number, a bool, a string and a list are told apart; a bare word is a
     string, and anything else is a refusal rather than a guess."""
     try:
@@ -671,32 +804,49 @@ def parse_value(raw, r):
             raise Fail(f"{r['key']} is a bool: {raw} is not true or false")
     elif t == "num":
         if isinstance(v, bool) or not isinstance(v, (int, float)):
+            if r.get("integer"):
+                raise Fail(f"{r['key']} must be an integer from {r.get('min')} to {r.get('max')}: {raw}")
             raise Fail(f"{r['key']} is a number: {raw} is not one")
+        if r.get("integer") and isinstance(v, float):
+            lo, hi = r.get("min"), r.get("max")
+            raise Fail(f"{r['key']} must be an integer from {lo} to {hi}: {raw}")
         if "min" in r and v < r["min"] or "max" in r and v > r["max"]:
-            raise Fail(f"{r['key']} must be between {r.get('min')} and {r.get('max')}: {raw}")
+            lo, hi = r.get("min"), r.get("max")
+            if r.get("integer"):
+                raise Fail(f"{r['key']} must be an integer from {lo} to {hi}: {raw}")
+            raise Fail(f"{r['key']} must be between {lo} and {hi}: {raw}")
     elif t == "list":
         if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
             raise Fail(f"{r['key']} is a list of strings: {raw} is not")
         if r.get("maxlen") and len(v) > r["maxlen"]:
             raise Fail(f"{r['key']} takes at most {r['maxlen']} entries: {raw} has {len(v)}")
-        for x in v:
-            if r.get("pool") and x not in r["pool"]:
-                raise Fail(f"{r['key']}: {x} is not a model of that agent")
+        if r["key"] == "routing_preferences.builder_order" and any(
+                x.strip().casefold() == "codex" for x in v):
+            raise Fail(f"{r['key']}: codex is never a builder; {raw}")
+        # pool membership is checked again under the lock (cmd_set re-reads). This pass only
+        # rejects a shape that cannot be a list of strings.
     else:
         if not isinstance(v, str):
             raise Fail(f"{r['key']} is a string: {raw} is not")
         if r.get("opts") and v not in [o[0] for o in r["opts"]]:
             raise Fail(f"{r['key']} must be one of {', '.join(o[0] for o in r['opts'])}: {raw}")
+        if r["key"] in ROUTE_KEYS:  # the dropdown's options are the catalog, not the schema row
+            allowed = [o[0] for o in (opts_of(r, lines) or [])]
+            if v not in allowed:
+                raise Fail(f"{r['key']} must be one of {', '.join(allowed)}: {raw}")
     return v
 
 
 def cmd_list(path, lines):
     fields = []
     for r in rows(lines):
-        value = value_of(lines, r)[1]
+        found, value = value_of(lines, r)
+        shown_default = effective_default(r)
         f = {"key": r["key"], "scope": r["scope"], "label": r["label"], "type": r["type"],
-             "value": value, "default": r["default"], "help": r["help"],
+             "value": value, "default": shown_default, "help": r["help"],
              "editable": r.get("editable", True)}
+        if r.get("derived") and not found:
+            f["derived"] = True  # the yaml has no value: value and default are the derived number
         if r["type"] == "num":
             f["min"], f["max"] = r.get("min"), r.get("max")
             if r.get("unit"):
@@ -704,8 +854,18 @@ def cmd_list(path, lines):
         opts = opts_of(r, lines)
         if opts is not None:
             f["opts"] = opts
+            if r["key"] in ROUTE_KEYS and any(n == "stale" for (_v, n) in opts):
+                f["stale"] = True  # a saved route the catalog no longer lists stays visible and flagged
+        if r["key"] == "routing_preferences.builder_order" and isinstance(value, list):
+            bad = [x for x in value if isinstance(x, str) and x.strip().casefold() == "codex"]
+            if bad:  # a hand edit from before the rule: shown, flagged, not silently dropped
+                f["unavailable"] = bad
         if r.get("pool") is not None:
             f["pool"] = list(r["pool"])  # the only models `set` accepts for this agent: one pool, picker and validator
+            if r["type"] == "list" and isinstance(value, list):
+                gone = [x for x in value if isinstance(x, str) and x not in r["pool"]]
+                if gone:  # a saved pick a later probe dropped: still shown, flagged unavailable
+                    f["unavailable"] = gone
         if not f["editable"]:
             f["why"] = r["why"]
         fields.append(f)
@@ -724,9 +884,23 @@ def cmd_get(path, lines, args):
             k, sep, raw = args[i + 1].partition("=") if i + 1 < len(args) else ("", "", "")
             if not sep or k != key:
                 raise Fail(f"--set needs KEY=VALUE for {key}")
-            return out({"ok": True, "key": key, "value": parse_value(raw, r)})  # the caller's value wins
+            return out({"ok": True, "key": key, "value": parse_value(raw, r, lines)})  # the caller's value wins
     found, value = value_of(lines, r)
-    return out({"ok": True, "key": key, "value": value})
+    ans = {"ok": True, "key": key, "value": value}
+    if r.get("derived") and not found:
+        ans["derived"] = True  # no yaml value: this number is max(1, round(cores/3))
+        ans["default"] = value
+    if r.get("integer"):
+        # the scalar as written. A hand edit of "abc" or 99 still resolves to a value, and a
+        # reader that must not trust it (selftest.sh) warns from this text.
+        kl = key_lines(lines)
+        sr = section_range(lines, kl, r["sec"])
+        hits = [i for (i, indent, k, _r) in kl if sr and sr[2] <= i < sr[3] and k == r["line"]]
+        if len(hits) == 1:
+            raw = scalar(KEY_RE.match(lines[hits[0]]).group(3))
+            if not (raw.isdigit() and r.get("min", 1) <= int(raw) <= r.get("max", 16)):
+                ans["raw"] = raw  # selftest.sh warns and uses 4; list/context keep the derived value
+    return out(ans)
 
 
 def cmd_set(path, lines, args):
@@ -739,12 +913,22 @@ def cmd_set(path, lines, args):
     # agents.*.available is editable=False in rows() for Settings UI, but allowed in set CLI for bootstrap / drift detection
     if not r.get("editable", True) and not r["key"].startswith("agents."):
         raise Fail(f"{key} is read-only: {r.get('why', 'not editable')}")
-    value = parse_value(raw, r)
-    found, current = value_of(lines, r)
-    if found and current == value:  # a save sends every row it holds, most of them unchanged
-        return out({"ok": True, "key": key, "value": value, "file": path, "changed": False})
-    new, count = patch(lines, r, value)  # refused shapes raise before anything is touched
-    write_yaml(path, lines, new, count, [(key, value, r)])
+    value = parse_value(raw, r, lines)
+    with yaml_lock(path):
+        lines = read_lines(path)  # the copy main() read is stale once another writer held the lock
+        r = row_for(lines, key) or r
+        found, current = value_of(lines, r)
+        if r.get("pool") and isinstance(value, list):
+            for x in value:
+                if x not in r["pool"]:
+                    saved = current if isinstance(current, list) else []
+                    if x in saved:
+                        continue  # already saved and since dropped from the pool: kept
+                    raise Fail(f"{r['key']}: {x} is not a model of that agent")
+        if found and current == value:  # a save sends every row it holds, most of them unchanged
+            return out({"ok": True, "key": key, "value": value, "file": path, "changed": False})
+        new, count = patch(lines, r, value)  # refused shapes raise before anything is touched
+        write_yaml(path, lines, new, count, [(key, value, r)])
     return out({"ok": True, "key": key, "value": value, "file": path, "changed": True,
                 "backup": path + ".bak", "backup_of": "previous"})
 
@@ -753,6 +937,12 @@ def cmd_migrate(path, lines):
     """Bring a config written before this schema up to it, and nothing else: the new sections and
     the two new routing keys get their schema defaults when absent. Idempotent, and it reports the
     dead yaml copies of plugin settings without ever writing or deleting them."""
+    with yaml_lock(path):
+        return _migrate_locked(path, read_lines(path))
+
+
+def _migrate_locked(path, lines):
+    """Migrate body. Caller holds yaml_lock, so this read is the file that gets written."""
     old = list(lines)
     new, changed, checks, count = list(lines), [], [], 0
     eol = file_ending(new)
@@ -762,7 +952,7 @@ def cmd_migrate(path, lines):
             block[0] = eol + block[0]
         for r in SCHEMA:
             if r["sec"] == [SESSION_SECTION]:
-                block.append(f"  {r['line']}: {emit(r['default'], r['type'])}{eol}")
+                block.append(f"  {r['line']}: {emit(effective_default(r), r['type'])}{eol}")
         new += block
         changed += [f"{SESSION_SECTION}.{r['line']}" for r in SCHEMA if r["sec"] == [SESSION_SECTION]]
         count += len(block)
@@ -936,12 +1126,18 @@ def cmd_context(path, lines, usage_arg=None):
         "ok": True,
         "policy": val("routing_preferences.policy"),
         "builder_order": val("routing_preferences.builder_order"),
+        "builder_order_unavailable": [x for x in val("routing_preferences.builder_order")
+                                      if isinstance(x, str) and x.strip().casefold() == "codex"],
         "max_build_lanes": val("routing_preferences.max_build_lanes"),
         "reviewer": val("routing_preferences.reviewer"),
         "visual_reviewer": val("routing_preferences.visual_reviewer"),
         "subagent_model": val("session.subagent_model"),
         "fresh_session": val("session.fresh_session"),
         "reviewer_split": val("session.reviewer_split"),
+        "todo_done_status": val("session.todo_done_status"),
+        "selftest_jobs_total": val("session.selftest_jobs_total"),
+        "selftest_jobs_total_derived": not value_of(
+            lines, schema_rows["session.selftest_jobs_total"])[0],
         "reuse_reviewer": val("session.reuse_reviewer"),
         "bus_ask_timeout_s": val("bus.ask_timeout_s"),
         "integration_branch": val("repo.integration_branch"),
@@ -1026,9 +1222,20 @@ def probe_models(cli):
         return []
     out = []
     for raw in (p.stdout or "").splitlines():
-        fields = raw.split()
-        if fields and fields[0] not in out:
-            out.append(fields[0])
+        line = raw.strip()
+        if not line:
+            continue
+        if "\t" in line:  # id<TAB>description: the description may end in "..." and still be an id
+            mid = line.split("\t", 1)[0].strip()
+        else:
+            # no tab: the whole line is the id, so a banner with spaces is not one
+            mid = line
+            if " " in mid or mid.endswith(":") or mid.endswith("...") or set(mid) <= set("-"):
+                continue
+        if not mid or not re.fullmatch(r"[A-Za-z0-9._:/@+-]+", mid):
+            continue
+        if mid not in out:
+            out.append(mid)
     return out
 
 
@@ -1059,6 +1266,15 @@ def refresh_models(lines):
 
 
 def cmd_probe(path, lines):
+    """Probe without the lock (each CLI may take PROBE_TIMEOUT_S), then lock only to re-read,
+    apply the result and write. A set during the probes is not blocked."""
+    probed = _probe_collect(lines)
+    with yaml_lock(path):
+        return _probe_write(path, read_lines(path), probed)
+
+
+def _probe_collect(lines):
+    """The probe results and the model ids, computed before the lock is taken."""
     herdr_status = probe_herdr()
     mcp_statuses = probe_claude_mcps()
     canary_status = probe_canary()
@@ -1073,7 +1289,16 @@ def cmd_probe(path, lines):
         "canary": canary_status,
         "probed_at": now_iso,
     }
+    models = {}
+    for agent, cli in MODEL_CLIS.items():
+        ids = probe_models(cli)
+        models[agent] = ids
+    return res, models
 
+
+def _probe_write(path, lines, probed):
+    """Apply a finished probe to the yaml. Caller holds yaml_lock and just re-read `lines`."""
+    res, models = probed
     helpers_line = (f"helpers: {{ herdr: {res['herdr']}, jev: {res['jev']}, "
                     f"context_mode: {res['context_mode']}, codebase_memory: {res['codebase_memory']}, "
                     f"canary: {res['canary']}, probed_at: {json.dumps(res['probed_at'])} }}")
@@ -1111,11 +1336,29 @@ def cmd_probe(path, lines):
 
     checks = [(f"helpers.{hid}", res[hid], row_for(new, f"helpers.{hid}"))
               for hid, _help in HELPERS]
-    new, res["models"], model_checks = refresh_models(new)
+    new, state, model_checks = _apply_models(new, models)
+    res["models"] = state
     checks += model_checks
     count = changed_lines(lines, new)
     write_yaml(path, lines, new, count, checks)
     return out(res)
+
+
+def _apply_models(lines, models):
+    """Patch agents.<a>.models from ids already collected. [] means the CLI did not answer:
+    leave that agent's list as it is."""
+    new, state, checks = lines, {}, []
+    for agent, ids in models.items():
+        state[agent] = "unchanged"
+        if not ids:
+            continue
+        r = agent_models_row(agent)
+        if not value_of(new, r)[0]:
+            continue
+        new, _count = patch(new, r, ids)
+        state[agent] = "updated"
+        checks.append((r["key"], ids, r))
+    return new, state, checks
 
 
 def main(argv=None):
@@ -1175,8 +1418,25 @@ FIVE = ('["opencode/space-bunny-free", "opencode/muse-spark-1.3-contributor-free
 
 def self_test():
     tmp = tempfile.mkdtemp(prefix="mk-config-selftest-")
-    restore = pin_tmp_data(tmp)  # the in-process calls below must resolve here, not in a real repo
+    # (a) the pin assert fires when resolution lands outside the temp dir, and a failed pin
+    # restores the environment itself. The sibling path starts with the temp path, so the old
+    # startswith check would have let it through.
+    real = mk_state.resolve_data
+    before = {k: os.environ.get(k) for k in ("MATRIXKODER_DATA", "MATRIXKODER_HOME")}
     try:
+        mk_state.resolve_data = lambda arg: os.path.realpath(tmp) + "-sibling"
+        try:
+            pin_tmp_data(tmp)
+        except AssertionError as e:
+            assert "outside its temp dir" in str(e), e
+        else:
+            raise AssertionError("pin_tmp_data did not fire when resolution landed outside the temp dir")
+        assert {k: os.environ.get(k) for k in before} == before, os.environ
+    finally:
+        mk_state.resolve_data = real
+    restore = None
+    try:
+        restore = pin_tmp_data(tmp)  # the in-process calls below must resolve here, not in a real repo
         data, home, yaml_path = os.path.join(tmp, "data"), os.path.join(tmp, "home"), None
         os.makedirs(data, exist_ok=True)
         yaml_path = os.path.join(data, "matrixkoder.yaml")
@@ -1187,8 +1447,13 @@ def self_test():
         script = os.path.join(HERE, "mk-config.py")
 
         def run(*args, ok=True):
+            run_env = dict(env)
+            if os.environ.get("MK_HOME"):  # a seeded temp catalog for the reviewer dropdowns
+                run_env["MK_HOME"] = os.environ["MK_HOME"]
+            if os.environ.get("MK_CONFIG_COUNT_ROUTES"):  # the subprocess-count probe
+                run_env["MK_CONFIG_COUNT_ROUTES"] = os.environ["MK_CONFIG_COUNT_ROUTES"]
             p = subprocess.run([sys.executable, script, *args], capture_output=True, text=True,
-                               env=env, cwd=tmp)
+                               env=run_env, cwd=tmp)
             lines = [x for x in (p.stdout or "").splitlines() if x.strip()]
             assert len(lines) == 1, f"{args}: expected ONE json line, got {p.stdout!r} {p.stderr!r}"
             obj = json.loads(lines[0])
@@ -1703,6 +1968,228 @@ def self_test():
         run("set", "bus.ask_timeout_s", "900")
         assert run("context")["bus_ask_timeout_s"] == 900
 
+        # 25. session.todo_done_status (C9): the schema default, then `done` changes what context
+        #     returns, and a value outside verify|done is refused with nothing written
+        assert run("get", "session.todo_done_status")["value"] == "verify"
+        row = next(f for f in run("list", "--json")["fields"] if f["key"] == "session.todo_done_status")
+        assert (row["type"], row["scope"], row["default"], row["label"]) == \
+            ("seg", "child", "verify", "Todo completed becomes"), row
+        assert [o[0] for o in row["opts"]] == ["verify", "done"], row
+        assert run("context")["todo_done_status"] == "verify"
+        run("set", "session.todo_done_status", '"done"')
+        assert run("context")["todo_done_status"] == "done"
+        before, bak = rd(), yaml_path + ".bak"
+        os.unlink(bak)
+        bad = run("set", "session.todo_done_status", '"merged"', ok=False)
+        assert "must be one of" in bad["error"], bad
+        assert rd() == before and not os.path.exists(bak)
+        with open(yaml_path, "w") as f:
+            f.write(fixture)
+
+        # 28. session.selftest_jobs_total: absent yaml derives max(1, round(cores/3)) and says so;
+        #     set writes an integer into session:; 0, 17, negatives, floats, strings and bools refuse
+        want = max(1, round((os.cpu_count() or 1) / 3))
+        got = run("get", "session.selftest_jobs_total")
+        assert got["value"] == want and got.get("derived") is True and got.get("default") == want, got
+        row = next(f for f in run("list", "--json")["fields"] if f["key"] == "session.selftest_jobs_total")
+        assert (row["type"], row["scope"], row["min"], row["max"], row["value"], row["default"],
+                row.get("derived"), row["label"]) == \
+            ("num", "child", 1, 16, want, want, True, "Self-test jobs"), row
+        ctx = run("context")
+        assert ctx["selftest_jobs_total"] == want and ctx["selftest_jobs_total_derived"] is True, ctx
+        run("set", "session.selftest_jobs_total", "2")
+        saved = run("get", "session.selftest_jobs_total")
+        assert saved["value"] == 2 and "derived" not in saved, saved
+        assert "  selftest_jobs_total: 2\n" in rd()
+        ctx = run("context")
+        assert ctx["selftest_jobs_total"] == 2 and ctx["selftest_jobs_total_derived"] is False, ctx
+        listed = next(f for f in run("list", "--json")["fields"] if f["key"] == "session.selftest_jobs_total")
+        assert listed["value"] == 2 and "derived" not in listed and listed["default"] == want, listed
+        before, bak = rd(), yaml_path + ".bak"
+        if os.path.exists(bak):
+            os.unlink(bak)
+        for bad_raw in ("0", "17", "-1", "1.5", '"abc"', "true"):
+            bad = run("set", "session.selftest_jobs_total", bad_raw, ok=False)
+            assert "integer from 1 to 16" in bad["error"], bad
+            assert rd() == before and not os.path.exists(bak)
+        # a hand-edited float or word is unreadable: the read falls back to the derived default
+        with open(yaml_path, "w") as f:
+            f.write(fixture + "  selftest_jobs_total: abc\n")
+        garbled = run("get", "session.selftest_jobs_total")
+        assert garbled["value"] == want and garbled.get("derived") is True, garbled
+        with open(yaml_path, "w") as f:
+            f.write(fixture)
+
+        # 29. selftest.sh: env wins; else the saved integer; garbage and a missing yaml fall back
+        #     to 4. Garbage warns once. A missing yaml is silent. MATRIXKODER_DATA stays inside tmp.
+        real_yaml = "/Users/rohits/Development/matrixkoder/.matrixkoder/matrixkoder.yaml"
+        prod = os.path.join(tmp, "prod")
+        os.makedirs(prod)
+        shutil.copy(real_yaml, os.path.join(prod, "matrixkoder.yaml"))
+        subprocess.run([sys.executable, script, "--data", prod, "set",
+                        "session.selftest_jobs_total", "2"], check=True,
+                       capture_output=True, text=True)
+        harness = os.path.join(tmp, "harness", "scripts")
+        os.makedirs(harness)
+        raw_sh = open(os.path.join(HERE, "selftest.sh")).read()
+        needle_data = 'cfg=$(python3 "$cfg_py" get session.selftest_jobs_total 2>/dev/null) || cfg=\n'
+        repl_data = 'cfg=$(python3 "$cfg_py" --data "$MATRIXKODER_DATA" get session.selftest_jobs_total 2>/dev/null) || cfg=\n'
+        if raw_sh.count(needle_data) != 1:
+            raise AssertionError("selftest.sh config call changed")
+        raw_sh = raw_sh.replace(needle_data, repl_data, 1)
+        needle = '  [ -e "$f" ] || continue\n  files+=("$f")\n'
+        repl = ('  [ -e "$f" ] || continue\n'
+                '  case "$(basename "$f")" in mk-config.py|mk-state.py) continue ;; esac\n'
+                '  files+=("$f")\n')
+        if raw_sh.count(needle) != 1:
+            raise AssertionError("selftest.sh file loop changed; the harness skip no longer matches")
+        with open(os.path.join(harness, "selftest.sh"), "w") as f:
+            f.write(raw_sh.replace(needle, repl, 1))
+        # the lane resolves mk-config.py beside selftest.sh; the copy must be the script under test
+        shutil.copy(script, os.path.join(harness, "mk-config.py"))
+        shutil.copy(os.path.join(HERE, "mk-state.py"), os.path.join(harness, "mk-state.py"))
+        for name in ("w1.py", "w2.py", "w3.py"):
+            with open(os.path.join(harness, name), "w") as f:
+                f.write(
+                    "import os, sys, time\n"
+                    "if '--self-test' in sys.argv:\n"
+                    "    d = os.environ['MK_JOBS_DIR']\n"
+                    "    os.makedirs(d, exist_ok=True)\n"
+                    "    open(os.path.join(d, str(os.getpid())), 'w').write(str(time.time()))\n"
+                    "    time.sleep(0.5)\n"
+                    "    print('ok')\n"
+                )
+
+        def trace(data, env_jobs, text=None):
+            if text is not None:
+                with open(os.path.join(data, "matrixkoder.yaml"), "w") as f:
+                    f.write(text)
+            stamp = os.path.join(tmp, "trace-%s" % time.time())
+            slots = stamp + ".slots"
+            env = dict(os.environ, MATRIXKODER_DATA=data, MATRIXKODER_HOME=home,
+                       MK_SELFTEST_TRACE=stamp, MK_JOBS_DIR=slots, PYTHONDONTWRITEBYTECODE="1",
+                       )
+            env.pop("MK_SELFTEST_JOBS", None)
+            if env_jobs is not None:
+                env["MK_SELFTEST_JOBS"] = env_jobs
+            p = subprocess.run(["bash", "selftest.sh"], cwd=harness, env=env,
+                               capture_output=True, text=True)
+            got = open(stamp).read().strip() if os.path.exists(stamp) else ""
+            times = []
+            if os.path.isdir(slots):
+                for name in os.listdir(slots):
+                    try:
+                        times.append(float(open(os.path.join(slots, name)).read()))
+                    except ValueError:
+                        pass
+            # how many workers had already started before the first one could finish (0.5s sleep)
+            peak = 1
+            if times:
+                t0 = min(times)
+                peak = sum(1 for t in times if t < t0 + 0.35)
+            return p, got, peak
+
+        base = open(os.path.join(prod, "matrixkoder.yaml")).read()
+        p_env, j_env, peak_env = trace(prod, "1")
+        assert p_env.returncode == 0 and j_env == "1" and peak_env == 1, (j_env, peak_env, p_env.stdout, p_env.stderr)
+        assert p_env.stderr == "", p_env.stderr
+        assert p_env.stdout.strip().splitlines()[-1] == "selftest: 3 run, 0 failed", p_env.stdout
+        p_saved, j_saved, peak_saved = trace(prod, None)
+        assert p_saved.returncode == 0 and j_saved == "2" and peak_saved == 2 and p_saved.stderr == "", \
+            (j_saved, peak_saved, p_saved.stderr, p_saved.stdout[-300:])
+        # three workers, jobs=2: the pid files exist, and the run is not serial.
+        # Serial would be 3 * 0.5s; two workers finish in about 1s. Bound it loosely.
+        p_g, j_g, peak_g = trace(prod, None, base.replace("selftest_jobs_total: 2", "selftest_jobs_total: abc"))
+        assert p_g.returncode == 0 and j_g == "4", (j_g, p_g.stderr)
+        warns = [ln for ln in p_g.stderr.splitlines() if ln.startswith("warning:")]
+        assert len(warns) == 1 and "abc" in warns[0], p_g.stderr
+        p_99, j_99, peak_99 = trace(prod, None, base.replace("selftest_jobs_total: 2", "selftest_jobs_total: 99"))
+        assert p_99.returncode == 0 and j_99 == "4", (j_99, p_99.stderr)
+        assert len([ln for ln in p_99.stderr.splitlines() if ln.startswith("warning:")]) == 1, p_99.stderr
+        assert "99" in p_99.stderr, p_99.stderr
+        empty = os.path.join(tmp, "empty-data")
+        os.makedirs(empty)
+        p_e, j_e, peak_e = trace(empty, None)
+        cfg_txt = open(p_e.stdout and "" or "").read() if False else ""
+        # the trace file's sibling holds the raw config line
+        assert p_e.returncode == 0 and j_e == "4" and peak_e == 3 and p_e.stderr == "", (j_e, peak_e, p_e.stderr, p_e.stdout[-200:])
+        # restore the fixture yaml the later cases read
+        with open(yaml_path, "w") as f:
+            f.write(fixture)
+
+        # 26. the reviewer dropdowns offer the catalog's routes, and every offered option passes set
+        cat_home = os.path.join(tmp, "catalog-home")
+        cat_yaml = os.path.join(tmp, "catalog.yaml")
+        with open(cat_yaml, "w") as f:
+            f.write("agents:\n  opencode: { available: true, models: [opencode/alpha] }\n"
+                    "  claude: { available: true, models: [claude-sonnet] }\n")
+        seeded = subprocess.run([sys.executable, os.path.join(HERE, "mk-catalog.py"),
+                                 "--home", cat_home, "seed", "--yaml", cat_yaml, "--no-probe"],
+                                capture_output=True, text=True)
+        assert seeded.returncode == 0, seeded.stderr
+        os.environ["MK_HOME"] = cat_home
+        try:
+            live = "opencode opencode/alpha low"  # a route the seeded catalog lists
+            run("set", "routing_preferences.reviewer", json.dumps(live))
+            run("set", "routing_preferences.visual_reviewer", json.dumps(live))
+            fields = {f["key"]: f for f in run("list", "--json")["fields"]}
+            for key in ("routing_preferences.reviewer", "routing_preferences.visual_reviewer"):
+                offered = [o[0] for o in fields[key]["opts"]]
+                assert offered and all(n == "" for (_v, n) in fields[key]["opts"]), fields[key]
+                assert "stale" not in fields[key], fields[key]
+                for route in offered:  # every option the dropdown shows is one set accepts
+                    run("set", key, json.dumps(route))
+                    assert run("get", key)["value"] == route
+            # a saved value the catalog no longer lists stays visible and is flagged stale
+            with open(yaml_path, "w") as f:
+                f.write(fixture)  # reviewer is the schema default, not a seeded route
+            stale = next(f for f in run("list", "--json")["fields"]
+                         if f["key"] == "routing_preferences.reviewer")
+            assert stale.get("stale") is True, stale
+            assert stale["opts"][-1] == ["claude sonnet medium", "stale"], stale["opts"]
+            run("set", "routing_preferences.reviewer", '"claude sonnet medium"')  # kept, so re-saving it passes
+        finally:
+            del os.environ["MK_HOME"]
+        with open(yaml_path, "w") as f:
+            f.write(fixture)
+
+        # 27. with the catalog absent the dropdown falls back to the current value alone and
+        #     the screen still answers — and an empty home stays empty: list and context must
+        #     never create <home>/mk.db (review R1 finding 1)
+        missing = os.path.join(tmp, "no-catalog")
+        os.makedirs(missing)
+        os.environ["MK_HOME"] = missing
+        try:
+            fb = next(f for f in run("list", "--json")["fields"]
+                      if f["key"] == "routing_preferences.reviewer")
+            assert fb["opts"] == [["claude sonnet medium", ""]], fb
+            assert "stale" not in fb, fb
+            run("context")
+            assert os.listdir(missing) == [], "list or context created a file in an empty home"
+            run("set", "routing_preferences.reviewer", '"claude sonnet medium"')
+            refused = run("set", "routing_preferences.reviewer", '"opencode opencode/alpha low"', ok=False)
+            assert "must be one of" in refused["error"], refused
+        finally:
+            del os.environ["MK_HOME"]
+        with open(yaml_path, "w") as f:
+            f.write(fixture)
+
+        # 28. one list reads the catalog once: two route rows share one subprocess (review R1 finding 2).
+        #     The count is taken inside the child process, where the cache lives.
+        os.environ["MK_HOME"] = cat_home
+        counter = os.path.join(tmp, "route-calls")
+        open(counter, "w").write("")
+        os.environ["MK_CONFIG_COUNT_ROUTES"] = counter
+        try:
+            run("list", "--json")
+            n = len(open(counter).read())
+            assert n <= 1, n
+        finally:
+            del os.environ["MK_HOME"]
+            del os.environ["MK_CONFIG_COUNT_ROUTES"]
+        with open(yaml_path, "w") as f:
+            f.write(fixture)
+
         # 24. probe refreshes agents.<a>.models from the agent CLIs through the safe patcher, and
         #     every model the refreshed pool lists is one `set picks.<a>` accepts
         with open(yaml_path, "w") as f:
@@ -1733,6 +2220,40 @@ def self_test():
         assert run("get", "picks.opencode")["value"] == ["ollama-cloud/minimax-m3"]
         # a model the refreshed pool no longer lists is refused: the tab cannot offer it either
         run("set", "picks.opencode", '["opencode/step-5-preview-free"]', ok=False)
+        refused = run("set", "picks.opencode", '["opencode/step-5-preview-free"]', ok=False)
+        assert "is not a model of that agent" in refused["error"], refused
+
+        # 29. a saved pick a later probe drops stays visible (flagged unavailable) and does not
+        #     refuse a set of the picks that remain
+        run("set", "picks.opencode", '["opencode/space-bunny-free", "ollama-cloud/minimax-m3"]')
+        make_bin("opencode", "#!/bin/sh\nprintf 'ollama-cloud/minimax-m3\\n'\n")
+        p_drop = run("probe")
+        assert p_drop["models"]["opencode"] == "updated", p_drop
+        field = next(f for f in run("list", "--json")["fields"] if f["key"] == "picks.opencode")
+        assert field["value"] == ["opencode/space-bunny-free", "ollama-cloud/minimax-m3"], field
+        assert field["unavailable"] == ["opencode/space-bunny-free"], field
+        assert field["pool"] == ["ollama-cloud/minimax-m3"], field
+        # keeping the dropped pick is allowed; a model that was never in the pool is still refused
+        run("set", "picks.opencode", '["opencode/space-bunny-free", "ollama-cloud/minimax-m3"]')
+        never = run("set", "picks.opencode", '["opencode/never-existed"]', ok=False)
+        run("set", "picks.opencode", '["ollama-cloud/minimax-m3"]')
+        assert run("get", "picks.opencode")["value"] == ["ollama-cloud/minimax-m3"]
+        assert "is not a model of that agent" in never["error"], never
+        make_bin("opencode", "#!/bin/sh\nprintf 'opencode/space-bunny-free\\nollama-cloud/minimax-m3\\n'\n")
+
+        # 30. a line with a TAB yields the id before it; a line without one must be a single
+        #     id token. Banners, labels and dashes are skipped.
+        make_bin("opencode", "#!/bin/sh\n"
+                 "printf 'Fetching available models...\\n"
+                 "Models: 3 available\\n"
+                 "Models:\\n"
+                 "-----\\n"
+                 "gemini-3.8-flash-high\\tGemini 3.8 Flash (High)...\\n"
+                 "opencode/big-pickle\\n'\n")
+        p_ban = run("probe")
+        assert p_ban["models"]["opencode"] == "updated", p_ban
+        assert ("  opencode: { available: true, models: [gemini-3.8-flash-high, "
+                "opencode/big-pickle] }") in agent_lines(), rd()
 
         # a failing CLI, an absent CLI and one that prints nothing all leave the list as it was
         before_agents = agent_lines()
@@ -1744,8 +2265,117 @@ def self_test():
         p_m3 = run("probe")
         assert p_m3["models"] == {"opencode": "unchanged", "agy": "unchanged"}, p_m3
         assert agent_lines() == before_agents, "a probe that could not read the models rewrote them"
+
+        # 31. codex is never a builder_order value: refused, yaml unchanged, no .bak
+        before, bak = rd(), yaml_path + ".bak"
+        if os.path.exists(bak):
+            os.unlink(bak)
+        refused = run("set", "routing_preferences.builder_order", '["codex"]', ok=False)
+        assert "never a builder" in refused["error"], refused
+        assert rd() == before and not os.path.exists(bak)
+        refused = run("set", "routing_preferences.builder_order", '["opencode", "codex"]', ok=False)
+        assert "never a builder" in refused["error"] and rd() == before
+        for shaped in ('["CODEX"]', '["Codex"]', '["agy", "codex "]', '[" codex"]'):
+            refused = run("set", "routing_preferences.builder_order", shaped, ok=False)
+            assert "never a builder" in refused["error"], (shaped, refused)
+            assert rd() == before and not os.path.exists(bak)
+
+        # a yaml that already names codex: list and context flag it, and a valid value re-saves
+        hand = before.replace("builder_order:", "builder_order: [opencode, codex, agy] #", 1)
+        if "builder_order:" not in before:
+            hand = before + "\nrouting_preferences:\n  builder_order: [opencode, codex, agy]\n"
+        # the fixture's builder_order line is replaced whole so the old value does not remain
+        lines_now = before.splitlines(keepends=True)
+        rewritten = []
+        for ln in lines_now:
+            if ln.lstrip().startswith("builder_order:"):
+                rewritten.append("  builder_order: [opencode, codex, agy]\n")
+            else:
+                rewritten.append(ln)
+        with open(yaml_path, "w") as f:
+            f.write("".join(rewritten))
+        listed = next(f for f in run("list", "--json")["fields"]
+                      if f["key"] == "routing_preferences.builder_order")
+        assert "codex" in listed["value"] and listed.get("unavailable") == ["codex"], listed
+        ctx = run("context")
+        assert ctx["builder_order_unavailable"] == ["codex"], ctx
+        run("set", "routing_preferences.builder_order", '["opencode", "agy"]')
+        assert run("get", "routing_preferences.builder_order")["value"] == ["opencode", "agy"]
+        with open(yaml_path, "w") as f:
+            f.write(before)
+
+        # 32. the lock serialises two real set processes, and a holder that never releases it
+        #     makes set return the named error inside a bound scaled from a measured spawn.
+        import signal as _signal
+        run("set", "session.stall_min", "15")
+        before = rd()
+        devnull = subprocess.DEVNULL
+        t_spawn = time.monotonic()
+        warm = subprocess.Popen([sys.executable, "-c", "pass"], stdout=devnull, stderr=devnull)
+        warm.wait()
+        spawn_s = max(0.5, time.monotonic() - t_spawn)
+        procs = [
+            subprocess.Popen([sys.executable, script, "set", "session.stall_min", "22"],
+                             env=env, cwd=tmp, stdout=devnull, stderr=devnull),
+            subprocess.Popen([sys.executable, script, "set", "session.max_wait_min", "40"],
+                             env=env, cwd=tmp, stdout=devnull, stderr=devnull),
+        ]
+        for proc in procs:
+            proc.wait(timeout=max(30, LOCK_WAIT_S + spawn_s * 20))
+        after = rd()
+        assert "stall_min: 22" in after and "max_wait_min: 40" in after, after
+        hold = os.path.join(data, "matrixkoder.yaml.lock")
+        hf = open(hold, "a")
+        fcntl.flock(hf, fcntl.LOCK_EX)
+        try:
+            t0 = time.monotonic()
+            busy = run("set", "session.stall_min", "30", ok=False)
+            waited = time.monotonic() - t0
+            assert "matrixkoder.yaml.lock busy" in busy["error"], busy
+            assert waited < LOCK_WAIT_S + max(2, spawn_s * 10), (waited, spawn_s)
+            assert rd() == after
+        finally:
+            fcntl.flock(hf, fcntl.LOCK_UN)
+            hf.close()
+        # kill -9 only after the child has the lock, so the assertion cannot pass vacuously
+        ready = os.path.join(tmp, "lock-held")
+        sleeper = subprocess.Popen(
+            [sys.executable, "-c",
+             "import fcntl,time; f=open(%r,'a'); fcntl.flock(f,fcntl.LOCK_EX); "
+             "open(%r,'w').write('held'); time.sleep(60)" % (hold, ready)],
+            stdout=devnull, stderr=devnull)
+        deadline = time.monotonic() + max(5, spawn_s * 20)
+        while not os.path.exists(ready):
+            assert time.monotonic() < deadline, "the holder never took the lock"
+            assert sleeper.poll() is None, "the holder exited before taking the lock"
+            time.sleep(0.05)
+        sleeper.send_signal(_signal.SIGKILL)
+        sleeper.wait(timeout=max(5, spawn_s * 10))
+        run("set", "session.stall_min", "18")
+        assert "stall_min: 18" in rd()
+
+        # 33. a probe whose CLI sleeps does not block a concurrent set; both results land
+        make_bin("herdr", "#!/bin/sh\nsleep 8\nexit 0\n")
+        make_bin("claude", "#!/bin/sh\nexit 1\n")
+        make_bin("npx", "#!/bin/sh\nexit 1\n")
+        make_bin("opencode", "#!/bin/sh\nexit 1\n")
+        make_bin("agy", "#!/bin/sh\nexit 1\n")
+        before_set = rd()
+        probe_p = subprocess.Popen([sys.executable, script, "probe"], env=env, cwd=tmp,
+                                   stdout=devnull, stderr=devnull)
+        time.sleep(0.3)  # let the probe enter the slow CLI before set starts
+        t0 = time.monotonic()
+        set_during = run("set", "session.stall_min", "19")
+        set_dt = time.monotonic() - t0
+        assert set_during.get("ok") and set_dt < 5, (set_dt, set_during)
+        probe_p.wait(timeout=40)
+        final = rd()
+        assert "stall_min: 19" in final, final
+        assert "herdr: stale" in final or "herdr: ok" in final, final
+        assert "probed_at:" in final
     finally:
-        restore()
+        if restore:
+            restore()
         shutil.rmtree(tmp, ignore_errors=True)
     print("mk-config self-test ok")
     return 0

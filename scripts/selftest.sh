@@ -2,24 +2,83 @@
 # Run every scripts/*.py and child-skills/*/scripts/*.py that has a --self-test; exit non-zero if any fails.
 # mk-bus.py --self-test runs as part of the *.py pattern below.
 # Tests use temp dirs and a temp MATRIXKODER_HOME, never the real ~/.matrixkoder.
-# MK_SELFTEST_JOBS=N (default 4) runs N self-tests at once, the slow ones first; each one's output is
-# buffered and printed after the run in discovery order, so the report and the last line match a serial
-# run. MK_SELFTEST_JOBS=1, or a value that is not a number >= 1 (with a warning), runs them one by one.
+# Jobs: MK_SELFTEST_JOBS when set (a non-number or a value < 1 warns and runs serially); otherwise
+# session.selftest_jobs_total from one `python3 mk-config.py get` in its own process group,
+# killed after 5 s (a missing yaml, a missing script, a timeout, a non-zero exit or any other
+# failure falls back to 4; only a timeout prints one stderr line; a saved value that is not an
+# integer from 1 to 16 warns once and uses 4); otherwise 4.
+# N runs N self-tests at once, the slow ones first; each one's output is buffered and printed after
+# the run in discovery order, so the report and the last line match a serial run.
 cd "$(dirname "$0")" || exit 2
 export PYTHONDONTWRITEBYTECODE=1
 # The self-tests play the orchestrator (merge, release, branch -D), so they need the real git:
 # drop a lane's git guard (<lane>/.matrixkoder-bin) from PATH when run inside a lane.
 PATH=$(tr ':' '\n' <<<"$PATH" | grep -v '/\.matrixkoder-bin/*$' | paste -sd: -)
 export PATH
-jobs=${MK_SELFTEST_JOBS:-4}
-case $jobs in *[!0-9]*) jobs=0 ;; esac
-if [ "$jobs" -lt 1 ]; then
-  echo "warning: MK_SELFTEST_JOBS=${MK_SELFTEST_JOBS} is not a number >= 1, running serially" >&2
-  jobs=1
+if [ -n "${MK_SELFTEST_JOBS:-}" ]; then
+  jobs=$MK_SELFTEST_JOBS
+  case $jobs in *[!0-9]*) jobs=0 ;; esac
+  if [ "$jobs" -lt 1 ]; then
+    echo "warning: MK_SELFTEST_JOBS=${MK_SELFTEST_JOBS} is not a number >= 1, running serially" >&2
+    jobs=1
+  fi
+else
+  jobs=4
+  cfg_py=$(dirname "$0")/mk-config.py
+  if [ -f "$cfg_py" ]; then
+    # Bound the lookup: a hung or blocked mk-config.py must not stall every lane's suite.
+    # macOS has no GNU timeout and bash 3.2 has no wait -n, so poll for 5 s then kill.
+    cfg_out=$(mktemp "${TMPDIR:-/tmp}/mk-selftest-cfg.XXXXXX") || exit 2
+    # Own process group so the 5 s kill reaches python, not only the waiting shell.
+    # macOS has no GNU timeout and bash 3.2 has no wait -n. The lookup line is unchanged.
+    set -m
+    { cfg=$(python3 "$cfg_py" get session.selftest_jobs_total 2>/dev/null) || cfg=
+      printf '%s' "$cfg" >"$cfg_out"; } &
+    cfg_pid=$!
+    cfg_i=0
+    # The shell exits once python starts, so wait on the output file, not on the shell.
+    while [ ! -s "$cfg_out" ] && kill -0 -"$cfg_pid" 2>/dev/null && [ "$cfg_i" -lt 50 ]; do sleep 0.1; cfg_i=$((cfg_i + 1)); done
+    if [ ! -s "$cfg_out" ] && kill -0 -"$cfg_pid" 2>/dev/null; then
+      kill -KILL -"$cfg_pid" 2>/dev/null
+      wait "$cfg_pid" 2>/dev/null
+      echo "warning: session.selftest_jobs_total lookup timed out after 5s, using 4" >&2
+      cfg=
+    else
+      wait "$cfg_pid" 2>/dev/null
+      cfg=$(cat "$cfg_out" 2>/dev/null) || cfg=
+    fi
+    set +m
+    rm -f "$cfg_out"
+    got=$(printf '%s' "$cfg" | python3 -c 'import json,sys
+try:
+    o=json.loads(sys.stdin.read())
+    v=o.get("value")
+    raw=o.get("raw")
+    derived=o.get("derived") is True
+except Exception:
+    v=None
+    raw=None
+    derived=False
+if raw is not None:
+    print("BAD:"+str(raw))
+elif (not derived) and isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= 16:
+    print(v)
+' 2>/dev/null) || got=
+    case $got in
+      ''|*[!0-9]*)
+        case $got in
+          BAD:*) echo "warning: session.selftest_jobs_total=${got#BAD:} is not an integer from 1 to 16, using 4" >&2 ;;
+        esac
+        ;;
+      *) jobs=$got ;;
+    esac
+  fi
 fi
+if [ -n "${MK_SELFTEST_TRACE:-}" ]; then printf '%s\n' "$jobs" >"$MK_SELFTEST_TRACE"; fi
 files=()
 for f in *.py ../child-skills/*/scripts/*.py; do
-  [ -e "$f" ] && files+=("$f")
+  [ -e "$f" ] || continue
+  files+=("$f")
 done
 if [ "$jobs" -gt 1 ]; then
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/mk-selftest.XXXXXX") || exit 2

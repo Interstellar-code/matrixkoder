@@ -560,3 +560,49 @@ The following capabilities are explicitly omitted from protocol `v: 1` (`mk-bus/
 - **Level 4 (`acted`) not a bus packet:** A bus protocol cannot verify intent or cognitive receipt;
   honest proof of action is observed exclusively through downstream repository state (git commits,
   reports, and state transitions).
+
+
+## 9. Store mode (D6A)
+
+File mode is unchanged and is the mode every live lane uses until a project store exists.
+Store mode starts only when `<data>/mk.db` is already a file. The bus never creates that file.
+With no `mk.db`, messages stay in `<data>/runs/<run>/bus.jsonl`, ids stay `m-<seq>`, and the
+SSE `id:` field stays the message `seq`. No store code runs.
+
+- **Where messages live.** In store mode every bus message is an `events` row with `chan='bus'`
+  in the project store. The run, task, sender, recipient, kind, reply, and text are columns on
+  that row. Acks are rows in `acks` (and an `events` row with `kind='ack'` so replay stays ordered).
+  `bus.jsonl` is not written.
+- **Id semantics.** The event row id returned by `append_event` is the SSE `Last-Event-ID` and the
+  message `seq`. The wire `id` is derived as `m-<row id>` and is not stored in `meta`. A client
+  that reconnects with `Last-Event-ID: <n>` is resumed at rows with id greater than `n`. A restart
+  replays from the store: the same rows, the same wire ids, no duplicate, none dropped.
+- **Kinds.** File mode keeps `ask`, `answer`, `info`, `ack`. Store mode also accepts `task`,
+  `status`, `commit`, `report`, `review`, `nudge`. Lane tokens may send `task`, `commit`,
+  `report`, `review`, and `nudge`. Lane tokens may not send `status` or `answer`.
+- **Artifacts.** A `report` or `review` message becomes an artifact for that task, round, and
+  kind, plus the bus event pointing at it. The round is the integer after a leading `round:N`
+  line; otherwise the round is 0. Sending the same task, round, and kind again stores `rev+1`.
+  The body may be paged with the `\x1e` separator and is at most 128 KiB. A larger body is refused.
+- **Status.** A `status` message calls `transition()` and never writes the task row itself. The
+  text is the new status. The status is validated and `transition()` runs before any bus event is
+  stored or streamed. An unknown status or a rejected transition is HTTP 400: nothing in `events`,
+  nothing in memory, nothing on SSE. If the transition commits and the bus event then fails, the
+  reply is HTTP 500 (the state change stands; resending the status is idempotent). Views and the
+  root card update because `transition()` is the only status writer.
+- **Connections.** One store connection per operation. No read transaction is held across an SSE
+  write, so a slow SSE client cannot lock the store.
+- **Tokens.** A lane token is bound to one run and one task. It cannot write another run. Project
+  isolation is the data directory: a token minted for project A's data dir is not in project B's
+  token file, so it cannot open B's store.
+
+
+## 10. Root bus (D6B)
+
+One bus per home: `<home>/bus.json` and `<home>/bus.lock`, with a per-project heartbeat map. The process exits only when no project has heartbeated within the owner timeout. File mode (no `<data>/mk.db`) is unchanged and keeps its own `<data>/bus.json`.
+
+- **Tokens.** A lane token is scoped to one project + run + task. An orchestrator token is scoped to one project. A root token is read-only: every POST, PUT, and DELETE returns 403 before the body is parsed. Every request resolves one project from the token; a query or body project that disagrees is 403 and changes nothing. An empty project slug is refused. Run state is cached by `(project, run)`.
+- **Token file.** Store mode writes the lane token to `<home>/bus-lanes/<sha256(realpath(lane))>.json`, mode 0600, atomically (temp file in the same directory, fsync, replace). `MK_BUS_TOKEN_FILE` overrides that path.
+- **Doorbell.** An unsolicited `nudge`, `info`, or answer-without-waiter addressed to an idle lane is typed once as the fixed line `Run: python3 <skill>/scripts/mk-builder.py inbox`. A working lane is queued; the queue drains on a 5s interval (`MK_BUS_RING_INTERVAL_SEC`) and when the lane goes idle. At most one ring per message id. The ring event is recorded before the line is typed; a recorded-but-untyped ring is typed once on restart, a typed one never again.
+- **Metrics.** `mk-bus.py metrics --run <id>` prints one JSON line: answer latency p50/p95, failed deliveries, obedience, false-STALL count.
+- **Lane status.** A lane token cannot POST `status`. Lanes announce status as a `task` message whose text is `status <mapped>` plus `round: <n>`.

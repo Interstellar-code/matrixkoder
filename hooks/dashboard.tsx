@@ -12,7 +12,7 @@ import type { MkDashTab, MkEvent, MkRun, MkRunIndexEntry, MkSnapshot, MkStatusMe
 import {
   AGENT_ORDER, PANE_ID, EMPTY_SNAPSHOT, activeEntries, basename, candidateDirs, coerceIndex, coerceRun, coerceUsage, join,
   globalDirPath, mainCheckout, mkSnapshot, normalizePath, orderAgents, parentOf, parseGitdir, parseJson, parseYamlAgents, parseYamlProviders,
-  projectDataDir, sanitizeText, timerRegistry,
+  projectDataDir, projectDirFromStore, sanitizeText, timerRegistry, type MkProjectRow,
 } from './data'
 import type { MkPaneSnapshot } from './data'
 import { AGENT_COLOR, AGENT_GLYPH, NARROW, STATUS_COLOR, STATUS_GLYPH, bar, leftCol, rightCol } from './tabs/ui'
@@ -33,7 +33,10 @@ import {
 } from './settings-io'
 import type { RunFn, SavePayload, YamlFieldIn } from './settings-io'
 import { UsageTab, usageView } from './tabs/usage'
-import { WaitingTab, waitingView } from './tabs/waiting'
+import { WaitingTab, waitingAsks, waitingView, readPending, askView, runWaitView, emptyWaitingView } from './tabs/waiting'
+import type { PendingAsk, RunWait } from './tabs/waiting'
+import { KanbanTab, kanbanView, readCards, emptyKanbanView, kanbanFixtureView, cardsErrorLine } from './tabs/kanban'
+import type { KanbanCard, KanbanFilters, CardsRead } from './tabs/kanban'
 import { chipText, toastsFor } from './status'
 
 // atoms are file-local consts (the scan reads this file's own consts); the
@@ -77,6 +80,7 @@ const TABS: readonly { key: MkDashTab; hotkey: string; label: string }[] = [
   { key: 'usage', hotkey: 'u', label: 'Usage' },
   { key: 'events', hotkey: 'e', label: 'Events' },
   { key: 'waiting', hotkey: 'w', label: 'Waiting' },
+  { key: 'kanban', hotkey: 'k', label: 'Kanban' },
   { key: 'old', hotkey: '0', label: 'Old' },
   { key: 'settings', hotkey: '9', label: 'Settings' },
 ]
@@ -234,6 +238,7 @@ export function registerDashboard(on: On, options: PluginOptions): void {
     const snap = await read($, snapshotAtom) as MkPaneSnapshot
     const dashTab = await read($, dashTabAtom)
     const viewState = await read($, viewStateAtom)
+    const pane = waitingPane(viewState)
     const cols = e.props.bodyColumns || COLUMNS
     const compact = cols < NARROW
     // S2.3: `raster: false` hands the tabs a table without Raster, so every
@@ -243,7 +248,7 @@ export function registerDashboard(on: On, options: PluginOptions): void {
     // V0.4: the header is the snapshot's run on Old, the mock world on the six mock tabs
     const realTab = dashTab === 'old' || dashTab === 'settings'
     const header = realTab ? realRunHeader(snap) : mockRunHeader()
-    const counts = realTab ? realTabCounts(snap.run) : mockTabCounts()
+    const counts = { ...(realTab ? realTabCounts(snap.run) : mockTabCounts()), kanban: '' }
     // C12: the tabs' view-state handle. `get` reads the atom's snapshot; `set`
     // writes it and is only ever called from an onPress (C10). `save`/`recheck`
     // are the Settings tab's live wires (S3): the ordered write and the About
@@ -302,7 +307,11 @@ export function registerDashboard(on: On, options: PluginOptions): void {
                     ? withViewState(UsageTab, tabEls, usageView(), cols, ui)
                     : dashTab === 'events'
                       ? withViewState(EventsTab, tabEls, eventsView(), cols, ui)
-                      : withViewState(WaitingTab, tabEls, waitingView(), cols, ui)}
+                      : dashTab === 'kanban'
+                        ? KanbanTab(tabEls, kanbanPaneView(viewState), cols)
+                        : pane.src === 'live'
+                          ? waitingAsks(tabEls, pane.asks, cols, new Date().toISOString(), ui)
+                          : withViewState(WaitingTab, tabEls, waitingPaneView(pane, snap.run?.waiting ?? null), cols, ui)}
       </Box>
     )
   })
@@ -478,7 +487,7 @@ function realRunHeader(snap: MkPaneSnapshot): RunHeaderData | null {
 /** The Old tab's tab-bar counts from the same snapshot (the mockup's count
  *  vocabulary): live lanes, done/total, one open decision. */
 function realTabCounts(run: MkRun | null): Record<MkDashTab, string> {
-  const none: Record<MkDashTab, string> = { overview: '', lanes: '', plan: '', usage: '', events: '', waiting: '', old: '', settings: '' }
+  const none: Record<MkDashTab, string> = { overview: '', lanes: '', plan: '', usage: '', events: '', waiting: '', kanban: '', old: '', settings: '' }
   if (run == null) return none
   const done = run.tasks.filter(t => DONE.has(t.status)).length
   return {
@@ -560,6 +569,43 @@ async function readText($: EngineInterface, path: string): Promise<string | null
 /** Schema rule (state-schema.md): MATRIXKODER_DATA → ~/.matrixkoder/projects.json entry for the repo → nearest .git
  *  toplevel's .matrixkoder; a linked worktree (.git FILE) resolves to its main checkout.
  *  The walk stops before home: ~/.matrixkoder is the GLOBAL dir, never project data. */
+
+/** The global dir ($MATRIXKODER_HOME, else ~/.matrixkoder): usage.json, projects.json. */
+async function globalDirOf($: EngineInterface, home: string | null): Promise<string | null> {
+  let envHome: string | undefined
+  try {
+    envHome = (await $.env.get('MATRIXKODER_HOME')) || undefined
+  } catch {
+    // env noun refused — the default
+  }
+  return globalDirPath(envHome, home)
+}
+
+
+/** Root store first (`mkdb.py projects --json`), then projects.json. null = neither names this
+ *  repo. File-local on purpose: the loader follows $ only into a function declared in this file. */
+async function listedDataDir($: EngineInterface, repoPaths: readonly string[], home: string | null): Promise<string | null> {
+  const gdir = await globalDirOf($, home)
+  if (gdir == null) return null
+  try {
+    const ran = await $.process.run(
+      ['python3', join($.plugin.root, 'scripts/mkdb.py'), 'projects', '--json', '--home', gdir],
+      { timeoutMs: 5000 },
+    )
+    if (ran.exitCode === 0) {
+      const parsed = parseJson(ran.stdout)
+      const rows = parsed !== null && typeof parsed === 'object' && 'projects' in parsed
+        ? (parsed as { projects?: unknown }).projects
+        : null
+      const fromStore = projectDirFromStore(Array.isArray(rows) ? rows as MkProjectRow[] : null, repoPaths, home)
+      if (fromStore != null) return fromStore
+    }
+  } catch {
+    // no python, or the command failed: projects.json still names the dir
+  }
+  return projectDataDir(await readJson($, join(gdir, 'projects.json')), repoPaths, home)
+}
+
 async function resolveDataDir($: EngineInterface, cwd: string, home: string | null): Promise<string | null> {
   try {
     const viaEnv = await $.env.get('MATRIXKODER_DATA')
@@ -587,9 +633,8 @@ async function resolveDataDir($: EngineInterface, cwd: string, home: string | nu
     }
     if (toplevel == null) continue
     // nearest repo boundary found: nested repos stop here (schema: pass --data for the outer)
-    // the wizard's projects.json (home mode) names the data dir of this repo; else <repo>/.matrixkoder
-    const gdir = await globalDirOf($, home)
-    const listed = gdir == null ? null : projectDataDir(await readJson($, join(gdir, 'projects.json')), [toplevel], home)
+    // the root store names the data dir of this repo; projects.json is the fallback; else <repo>/.matrixkoder
+    const listed = await listedDataDir($, [toplevel], home)
     const data = listed ?? join(toplevel, '.matrixkoder')
     try {
       const s = await $.fs.stat(data)
@@ -646,17 +691,6 @@ async function homeDir($: EngineInterface): Promise<string | null> {
     // no process either — usage stays empty
   }
   return null
-}
-
-/** The global dir ($MATRIXKODER_HOME, else ~/.matrixkoder): usage.json, projects.json. */
-async function globalDirOf($: EngineInterface, home: string | null): Promise<string | null> {
-  let envHome: string | undefined
-  try {
-    envHome = (await $.env.get('MATRIXKODER_HOME')) || undefined
-  } catch {
-    // env noun refused — the default
-  }
-  return globalDirPath(envHome, home)
 }
 
 function usagePath(globalDir: string): string {
@@ -722,6 +756,194 @@ function contentSig(snap: MkSnapshot): string {
   return JSON.stringify({ ...snap, now: 0 })
 }
 
+
+/** Pending asks kept on the view-state atom so a tick is one read, not a render.
+ *  `waiting:src` is `live` (the bus answered), `down` (it did not) or unset
+ *  (no tick yet, so the tab still shows the fixture). */
+const PENDING_KEY = 'waiting:pending'
+const PENDING_SRC_KEY = 'waiting:src'
+
+export function waitingPane(view: Record<string, string>): { src: string; asks: PendingAsk[] } {
+  let asks: PendingAsk[] = []
+  try {
+    const parsed = JSON.parse(view[PENDING_KEY] ?? '[]') as unknown
+    if (Array.isArray(parsed)) asks = parsed as PendingAsk[]
+  } catch {
+    asks = []
+  }
+  return { src: view[PENDING_SRC_KEY] ?? '', asks }
+}
+
+export function waitingPaneView(pane: { src: string; asks: PendingAsk[] }, runWaiting: RunWait | null) {
+  const { src, asks } = pane
+  if (src === '') return waitingView()
+  if (src === 'live') {
+    const first = asks[0]
+    if (first == null) return emptyWaitingView()
+    return askView(first, new Date().toISOString())
+  }
+  if (runWaiting != null && runWaiting.question !== '') return runWaitView(runWaiting)
+  return waitingView()
+}
+
+/** One `mk-bus.py pending` per dashboard tick, for the active project's data dir.
+ *  Never starts a bus and never creates a file: `readPending` only runs the
+ *  injected command. The read is fired and not awaited, like `refreshCards`, so
+ *  a slow one cannot hold the tick; `pendingInFlight` is set before it starts
+ *  and cleared in `finally`, so a tick that finds the previous read still
+ *  running skips instead of stacking another process. */
+let pendingInFlight = false
+
+async function refreshPending($: EngineInterface, cwd: string): Promise<void> {
+  if (pendingInFlight) return
+  pendingInFlight = true
+  const dataDir = await resolveDataDir($, cwd, await homeDir($)).catch(() => null)
+  const run = (argv: readonly string[], init?: { timeoutMs?: number }) =>
+    $.process.run([...argv], init).then(r => ({ stdout: r.stdout, code: r.exitCode }))
+  void readPending(run, $.plugin.root, dataDir).then(async got => {
+    if (!got.live && !got.down) return
+    await update($, viewStateAtom, prev => ({
+      ...prev,
+      [PENDING_SRC_KEY]: got.down ? 'down' : 'live',
+      ...(got.live ? { [PENDING_KEY]: JSON.stringify(got.asks) } : {}),
+    }))
+  }).catch(async () => {
+    await update($, viewStateAtom, prev => ({ ...prev, [PENDING_SRC_KEY]: 'down' }))
+  }).finally(() => {
+    pendingInFlight = false
+  })
+}
+
+/** Cards JSON kept on the view-state atom so a tick is one read, not a render. */
+const CARDS_KEY = 'kanban:cards'
+const CARDS_MS_KEY = 'kanban:ms'
+const CARDS_TICK_KEY = 'kanban:tick'
+const CARDS_EMPTY_KEY = 'kanban:empty'
+const CARDS_ERROR_KEY = 'kanban:error'
+const CARDS_STALE_KEY = 'kanban:stale'
+
+function kanbanFiltersOf(view: Record<string, string>): KanbanFilters {
+  return {
+    needsYou: view['kanban:needs'] === '1',
+    project: view['kanban:project'] ? view['kanban:project'] : null,
+  }
+}
+
+/** The Kanban body: empty until a root store has been seen, else the last cards read. */
+function kanbanPaneView(view: Record<string, string>) {
+  // Fixture only in the explicit mock mode the other tabs use (kanban:mock=1).
+  // Anything else with no store, or before the first tick, is the empty state —
+  // never the fixture cards.
+  if (view['kanban:mock'] === '1') return kanbanFixtureView()
+  const err = view[CARDS_ERROR_KEY] ?? ''
+  if ((view[CARDS_EMPTY_KEY] === '1' || (view[CARDS_KEY] ?? '') === '') && err === '') return emptyKanbanView()
+  let cards: KanbanCard[] = []
+  try {
+    const parsed = JSON.parse(view[CARDS_KEY] ?? '[]') as unknown
+    if (Array.isArray(parsed)) cards = parsed as KanbanCard[]
+  } catch {
+    cards = []
+  }
+  const viewOut = kanbanView(cards, kanbanFiltersOf(view), new Date().toISOString(), Number(view[CARDS_MS_KEY] ?? '0') > 100)
+  if (err === '') return viewOut
+  return { ...viewOut, error: err, stale: view[CARDS_STALE_KEY] === '1' }
+}
+
+/**
+ * One `mkdb.py cards --json` per dashboard tick. The root file is checked with
+ * fs.exists first: a missing ~/.matrixkoder/mk.db (or $MK_HOME/mk.db) never
+ * spawns mkdb, which would create the store. The read is started and not
+ * awaited, so a slow cards call cannot hold the tick; one read is in flight
+ * at most (the 5 s timeout lives in readCards). A read slower than 100 ms
+ * still skips every other tick.
+ */
+let cardsInFlight = false
+
+function applyCardsRead(
+  prev: Record<string, string>,
+  tick: number,
+  lastMs: number,
+  got: CardsRead,
+): Record<string, string> {
+  const had = (prev[CARDS_KEY] ?? '') !== ''
+  if (got.error != null) {
+    return {
+      ...prev,
+      [CARDS_TICK_KEY]: String(tick),
+      [CARDS_MS_KEY]: String(got.ms),
+      [CARDS_ERROR_KEY]: got.error,
+      [CARDS_STALE_KEY]: had ? '1' : '0',
+      [CARDS_EMPTY_KEY]: '0',
+    }
+  }
+  return {
+    ...prev,
+    [CARDS_TICK_KEY]: String(tick),
+    [CARDS_MS_KEY]: String(got.skipped ? lastMs : got.ms),
+    [CARDS_EMPTY_KEY]: got.empty ? '1' : '0',
+    [CARDS_ERROR_KEY]: '',
+    [CARDS_STALE_KEY]: '0',
+    ...(got.skipped ? {} : { [CARDS_KEY]: JSON.stringify(got.cards) }),
+  }
+}
+
+async function refreshCards($: EngineInterface): Promise<void> {
+  // storeHome is MK_HOME when set, otherwise $HOME/.matrixkoder. Both the
+  // exists-check and the --home handed to mkdb use that directory: cards()
+  // would create a missing root store, so exists() runs first.
+  let mkHome = ''
+  try {
+    mkHome = (await $.env.get('MK_HOME')) || ''
+  } catch {
+    mkHome = ''
+  }
+  const userHome = mkHome === '' ? await homeDir($) : null
+  const storeHome = mkHome !== '' ? mkHome : (userHome == null ? null : join(userHome, '.matrixkoder'))
+  const path = storeHome == null ? '' : join(storeHome, 'mk.db')
+  let exists = false
+  if (path !== '') {
+    try {
+      exists = await $.fs.exists(path)
+    } catch {
+      exists = false
+    }
+  }
+  const view = await read($, viewStateAtom)
+  const tick = Number(view[CARDS_TICK_KEY] ?? '0') + 1
+  const lastMs = Number(view[CARDS_MS_KEY] ?? '0')
+  const run = (argv: readonly string[], init?: { timeoutMs?: number }) => $.process.run([...argv], init)
+  // A missing store is synchronous inside readCards (no spawn). Record it
+  // before returning so the pane can show "no store yet" on this tick.
+  if (storeHome == null || !exists) {
+    const got = await readCards(async () => ({ stdout: '', code: 0 }), $.plugin.root, storeHome, exists, tick, lastMs)
+    await update($, viewStateAtom, prev => applyCardsRead(prev, tick, lastMs, got))
+    return
+  }
+  // A slow or failed read must not hold this tick. One read in flight.
+  if (cardsInFlight) {
+    await update($, viewStateAtom, prev => ({ ...prev, [CARDS_TICK_KEY]: String(tick) }))
+    return
+  }
+  cardsInFlight = true
+  const started = Date.now()
+  void readCards(
+    async (argv, init) => {
+      const r = await run(argv, init)
+      return { stdout: r.stdout, code: r.exitCode }
+    },
+    $.plugin.root, storeHome, exists, tick, lastMs,
+  ).then(async got => {
+    const ms = Math.max(got.ms, Date.now() - started)
+    await update($, viewStateAtom, prev => applyCardsRead(prev, tick, lastMs, { ...got, ms }))
+  }).catch(async () => {
+    await update($, viewStateAtom, prev => applyCardsRead(prev, tick, lastMs, {
+      cards: [], ms: Date.now() - started, skipped: false, empty: false, error: cardsErrorLine('spawn'),
+    }))
+  }).finally(() => {
+    cardsInFlight = false
+  })
+}
+
 /** Never throws: a failing load keeps the last good snapshot and flags the error. */
 async function refreshSafe($: EngineInterface, options: PluginOptions, cwd: string): Promise<void> {
   const prev = await read($, snapshotAtom)
@@ -731,6 +953,8 @@ async function refreshSafe($: EngineInterface, options: PluginOptions, cwd: stri
     if (contentSig(prev) !== contentSig(snap)) {
       await update($, snapshotAtom, () => snap)
     }
+    await refreshCards($)
+    await refreshPending($, cwd)
   } catch (err) {
     try {
       await update($, snapshotAtom, () => ({ ...prev, error: `cannot read run.json (${String(err).slice(0, 40)})` }))
@@ -807,7 +1031,15 @@ async function ensureBus($: EngineInterface, options: PluginOptions, cwd: string
     const snap = await read($, snapshotAtom) as MkPaneSnapshot
     if (snap.run == null) return // only an active run owns a bus
     const script = `${$.plugin.root}/scripts/mk-bus.py`
-    if ((await readText($, join(dataDir, 'bus.json'))) != null) {
+    // Root bus (C6): a project with a store heartbeats the one bus under the
+    // MK home. File mode (no mk.db) keeps the per-project bus.json.
+    let mkHome = ''
+    try { mkHome = (await $.env.get('MK_HOME')) || '' } catch { mkHome = '' }
+    const userHome = mkHome === '' ? await homeDir($) : null
+    const busHome = mkHome !== '' ? mkHome : (userHome == null ? null : join(userHome, '.matrixkoder'))
+    const rootBus = busHome != null && (await readText($, join(dataDir, 'mk.db'))) != null
+    const busFile = rootBus ? join(busHome as string, 'bus.json') : join(dataDir, 'bus.json')
+    if ((await readText($, busFile)) != null) {
       await $.process.run(['python3', script, 'heartbeat', '--data', dataDir, '--run', snap.run.id], { timeoutMs: BUS_TIMEOUT_MS })
       return
     }

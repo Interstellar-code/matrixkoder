@@ -494,3 +494,11 @@ and this is the reviewer's fresh file (`seq` restarts at 1).
   "updated_at": 1791630520.0
 }
 ```
+
+## 13. Bus and store (D7) — additive; R1-R42 unchanged
+
+- **Connect paging.** `connect` prints the brief paged at about 24,000 chars, then the phase task list as lines `[<id>] title parallel=… deps=…`. Further pages are `read <id> --part n`; the last page acks.
+- **Todo backup.** `todo done <id>` (and `todo in_progress <id>` when a task starts) is the backup reporter. The dedupe key is (task, state, round). `completed` maps to `session.todo_done_status` (verify|done).
+- **Bus-down ask.** When `ask` prints `BUS DOWN: use the BLOCKED token` (exit 4), it has already written the lane status file with `state=blocked` and the question. The watcher marks the task blocked from that write. `ask` and `wait` advance the inbox cursor when they ack an answer, so that answer is not re-acked.
+- **DONE token counts.** When the report has a `## Todo` section, `done` prints `<T> R<n> DONE todo N/M done K skipped`. A missing section, or an `open` item without a reason, warns and does not fail.
+- **Needed bus-contract change (not applied here).** A lane token cannot POST `kind=status` — the bus refuses it. The announcement is a `task` message whose text is `status <mapped>` plus `round: <n>`. The bus should accept that `task` message as the status transition.

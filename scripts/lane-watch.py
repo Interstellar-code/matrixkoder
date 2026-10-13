@@ -71,6 +71,18 @@ PHASE_ROUND_RE = re.compile(r"^(\S+)( REVIEW)? R(\d+)$")   # R27.5 round + R27.6
 _seen_seq = {}   # R27.9: (lane, run, task, round, role) -> highest seq THIS process accepted
 
 sys.dont_write_bytecode = True  # no stray __pycache__ next to the scripts
+STORE_PROJECT = "matrixkoder"  # slug only; the db is <data>/mk.db via data_dir (mk-state's rule)
+# D5A.3: a pane that is quiet is still working while a descendant runs one of these. The window
+# after the child exits is stall_min * max(1, loadavg_1m / cpu_count): a busy machine gets a
+# longer grace, an idle machine keeps today's stall_min. cpu_count 0 is treated as 1.
+# A load spike must not stretch one stall_min without limit, and a leaked matching child
+# must not refresh the grace forever (SR2). Factor and the total window share this cap.
+CHILD_SCALE_CAP = 4.0
+CHILD_PROGRESS_RE = re.compile(
+    r"(?:^|/)(?:selftest\.sh|pytest|tsc)(?:\s|$)"
+    r"|claude\s+plugin\s+test"
+    r"|python3?\b.*--self-test",
+    re.I)
 _spec = importlib.util.spec_from_file_location("lane_health", os.path.join(HERE, "lane-health.py"))
 lh = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(lh)
@@ -141,12 +153,181 @@ def running_task(text):
     return bool(RUNNING_TASK_RE.search(text))
 
 
+def store_on(data):
+    """True only when the project store already exists. Never creates mk.db (self-hosting guard)."""
+    return bool(data) and os.path.exists(os.path.join(data, "mk.db"))
+
+
+def store_con(data):
+    """The project store, opened only through mkdb.open_project. Caller closes it."""
+    db = _load_mkdb()
+    home = os.path.join(data, ".mk-home")
+    os.makedirs(home, exist_ok=True)
+    return db.open_project(home, STORE_PROJECT, data_dir=data)
+
+
+_mkdb_mod = None
+
+
+def _load_mkdb():
+    global _mkdb_mod
+    if _mkdb_mod is None:
+        spec = importlib.util.spec_from_file_location("mkdb", os.path.join(HERE, "mkdb.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _mkdb_mod = mod
+    return _mkdb_mod
+
+
+# A terminal row from the previous round must not decide this watch (SR2).
+STORE_TERMINAL = ("done", "verifying", "review", "merged", "blocked")
+
+
+def _row_epoch(updated):
+    """mkdb stores ISO-8601 text; an epoch float also parses. Unparseable is 0."""
+    try:
+        return float(updated)
+    except (TypeError, ValueError):
+        try:
+            import datetime
+            return datetime.datetime.fromisoformat(str(updated)).timestamp()
+        except (TypeError, ValueError):
+            return 0.0
+
+
+def store_status_row(data, armed):
+    """The tasks row for this armed round when the store is on and the row exists, else None.
+    A miss (store off, no row, wrong round) is the status-file fallback, never an exception.
+    A read failure is not a miss: it returns {"store_error": "<why>"} so the verdict can name
+    it. A terminal row (done/verifying/review/merged/blocked) whose updated is not after the
+    watch's armed_at is the previous round's outcome and is ignored."""
+    if not store_on(data) or not armed or not armed.get("run") or not armed.get("task"):
+        return None
+    m = PHASE_ROUND_RE.match(str(armed.get("phase") or ""))
+    if not m:
+        return None
+    rnd = int(m.group(3))
+    try:
+        con = store_con(data)
+        try:
+            row = con.execute(
+                "SELECT id, status, round, verdict, updated FROM tasks WHERE run=? AND id=?",
+                (armed["run"], armed["task"])).fetchone()
+        finally:
+            con.close()
+    except Exception as e:
+        return {"store_error": f"{type(e).__name__}: {e}"}
+    if not row or row["round"] != rnd:
+        return None
+    status = (row["status"] or "").lower()
+    # A terminal row whose updated is not after armed_at is the previous round's outcome
+    # (task round bumps the round but the row keeps its old timestamp). A row written in
+    # the same second as the arm still counts: ISO timestamps have whole seconds.
+    armed_at = armed.get("armed_at")
+    # 30s, not 1s: a loaded machine can take well over a second between the status
+    # write and the arm, and ISO timestamps are whole seconds. A row from the PREVIOUS
+    # round is minutes-to-hours older, so 30s still rejects it.
+    if (armed_at is not None and status in STORE_TERMINAL
+            and _row_epoch(row["updated"]) + 30.0 <= float(armed_at)):
+        return None
+    return row
+
+
+def store_report_ok(data, armed, report):
+    """With the store on, a report artifact for this task+round satisfies the report check.
+    Store off, or no such artifact: the caller keeps the file check. None = not decided here."""
+    if not report or not store_on(data) or not armed or not armed.get("run") or not armed.get("task"):
+        return None
+    m = PHASE_ROUND_RE.match(str(armed.get("phase") or ""))
+    rnd = int(m.group(3)) if m else None
+    try:
+        con = store_con(data)
+        try:
+            q = ("SELECT 1 FROM artifacts WHERE run=? AND task=? AND kind='report'"
+                 + (" AND round=?" if rnd is not None else "") + " LIMIT 1")
+            args = (armed["run"], armed["task"]) + ((rnd,) if rnd is not None else ())
+            hit = con.execute(q, args).fetchone()
+        finally:
+            con.close()
+    except Exception:
+        return None
+    return True if hit else None
+
+
+def child_progress(pane_pid, now=None):
+    """D5A.3: (active, scale). active when a descendant of the pane pid runs a test/build
+    command (selftest.sh, `claude plugin test`, pytest, `python3 ... --self-test`, tsc).
+    scale = max(1, loadavg_1m / cpu_count): the grace after the child exits is stall_min*scale.
+    (False, 1.0) when ps cannot be read — a read failure never holds a stall off."""
+    if not pane_pid:
+        return False, 1.0
+    try:
+        r = subprocess.run(["ps", "-ax", "-o", "pid=,ppid=,command="],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return False, 1.0
+    except Exception:
+        return False, 1.0
+    kids, cmd = {}, {}
+    for line in r.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 2:
+            continue
+        pid, ppid = parts[0], parts[1]
+        kids.setdefault(ppid, []).append(pid)
+        cmd[pid] = parts[2] if len(parts) > 2 else ""
+    stack, seen, hit = list(kids.get(str(pane_pid), [])), set(), False
+    while stack:
+        cur = stack.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        if CHILD_PROGRESS_RE.search(cmd.get(cur, "")):
+            hit = True
+            break
+        stack.extend(kids.get(cur, []))
+    try:
+        load1 = os.getloadavg()[0]
+        cpus = os.cpu_count() or 1
+    except Exception:
+        load1, cpus = 0.0, 1
+    return hit, min(CHILD_SCALE_CAP, max(1.0, float(load1) / float(cpus or 1)))
+
+
 def read_status(lane, armed):
     """The lane's .matrixkoder-status.json when it passes reader acceptance (status-contract.md
-    R27, in order), else None -> today's pane-text path unchanged (R28). No exception ever escapes
+    R27, in order), else None -> today's pane-text path unchanged (R28). With the project store
+    on, a tasks row for this run/task/round is preferred and shaped like the status file
+    (state done/blocked from the row); no row for the round falls back to this file. No exception
+    ever escapes
     (R29): a missing file, corrupt JSON or a wrong-typed field is a miss, never a crash. Unknown
     fields are ignored (R38). The only file this watcher ever gains; the caller passes the result
     to decide() as st."""
+    row = store_status_row((armed or {}).get("data"), armed)
+    if isinstance(row, dict) and row.get("store_error"):
+        # A failed store read is a named miss, not silence and not the pane path: decide()
+        # keeps watching (source=status) instead of grace-DONE or STALL on a quiet lane.
+        return {"v": 1, "seq": None, "run": (armed or {}).get("run"),
+                "task": (armed or {}).get("task"), "round": None, "role": "builder",
+                "state": "store_error", "question": None, "updated_at": 0.0,
+                "source": "status", "store_error": row["store_error"]}
+    if row is not None:
+        # the store row for this round wins; the status file is not read. seq stays None so the
+        # row never enters _seen_seq (that counter belongs to the file channel only).
+        status = (row["status"] or "").lower()
+        verdict = row["verdict"] or ""
+        fresh = True
+        if status == "blocked" or verdict.upper().startswith("BLOCKED"):
+            state, question = "blocked", verdict or "blocked"
+        elif status in ("verifying", "review", "merged", "done") or verdict.upper().startswith("DONE"):
+            state, question = "done", None
+        else:
+            # a non-terminal row is not a heartbeat: updated_at 0 so it never resets the idle clock
+            state, question, fresh = "started", None, False
+        upd = _row_epoch(row["updated"]) if fresh else 0.0
+        return {"v": 1, "seq": None, "run": armed.get("run"), "task": armed.get("task"),
+                "round": row["round"], "role": "builder", "state": state, "question": question,
+                "updated_at": upd, "source": "store"}
     try:
         with open(os.path.join(lane, STATUS_FILE)) as f:   # R27.1: <lane>/.matrixkoder-status.json
             st = json.load(f)
@@ -211,6 +392,11 @@ def decide(h, subj, rx, report_ok, text, phase, stall_min, st=None, armed=None):
     file accepted by read_status (R27) or None; a file that missed any R27 condition fell back to
     this pane-text path unchanged (R28). Every verdict's evidence ends with its source (R41):
     status = decided from the accepted file, pane = the pane-text path, grace = the no-token rule."""
+    if st and st.get("state") == "store_error":
+        # The store could not be read. Do not fall through to the pane/grace path: a quiet
+        # idle lane must not become DONE or STALL because of a locked or corrupt mk.db.
+        why = st.get("store_error") or "unknown"
+        return None, [f"store_error: {why}", "source=status"]
     done_tok, question = phase_tokens(text, phase)
     commit_ok = rx is None or bool(rx.search(subj.partition(" ")[2]) or rx.search(subj))  # subj = "<sha> <subject>"
     commit_ev = [] if rx is None else [f"commit {subj}"]
@@ -221,12 +407,19 @@ def decide(h, subj, rx, report_ok, text, phase, stall_min, st=None, armed=None):
     # of this branch; the commit and report checks stay exactly as today (commit_ok/report_ok feed it)
     if commit_ok and report_ok and (f_done or (h["state"] != "ERROR" and status != "working"
                                                and (done_tok or not phase))):
-        if f_done:   # R31 rows 1-2: pane token present or not, the accepted file decides; source=status
+        if f_done and (st.get("source") != "store" or (commit_ok and report_ok)):
+            # R31 rows 1-2: the accepted file decides. A store row (D5A.1) decides the same way
+            # but ONLY with the commit and the report artifact — DONE still needs both — and its
+            # tag is source=store with no file seq.
+            if st.get("source") == "store":
+                return "DONE", commit_ev + ["store row done", "source=store"]
             return "DONE", commit_ev + [f"status file done (seq {st['seq']})", "source=status"]
         return "DONE", commit_ev + ([f"{phase} DONE"] if phase else []) + ["source=pane"]
     if question:
         return "BLOCKED", [f"{phase} BLOCKED: {question}", "source=pane"]
     if f_blocked:   # R32: the file's question, the pane path's shape
+        if st.get("source") == "store":
+            return "BLOCKED", [f"store row blocked: {st['question']}", "source=store"]
         return "BLOCKED", [f"status file blocked: {st['question']}", "source=status"]
     idle = h.get("last_change_min")
     if (h["state"] != "ERROR" and commit_ok and report_ok and status in ("idle", "done") and phase
@@ -255,13 +448,53 @@ def decide(h, subj, rx, report_ok, text, phase, stall_min, st=None, armed=None):
     return None, []
 
 
+def _leaves(ts, task):
+    """Leaf descendants of task, in ts insertion order. ts items have id + parent."""
+    pid = next(str(t["id"]) for t in ts if str(t["id"]).lower() == task.lower())
+    parent_of = lambda tid: [str(c["id"]) for c in ts if c.get("parent") == tid]
+    kids, stack, seen = [], [pid], {pid}
+    while stack:  # a cyclic hand-edit must not hang this
+        cur = stack.pop()
+        next_ = [k for k in parent_of(cur) if k not in seen]
+        seen.update(next_)
+        stack.extend(next_)
+        if cur != pid and not next_:
+            kids.append(cur)  # a leaf descendant: it can hold a status
+    return [str(t["id"]) for t in ts if str(t["id"]) in kids]
+
+
 def child_tasks(task, data, run=None):
     """Stored ids of <task>'s status-holding descendants — every child, recursing past children
     that are parents themselves (mk-state refuses status= on ANY parent: "status rolls up from
     children"; intermediate parents get the verdict by roll-up, leaves by the write). [] for a
     leaf, an unknown task, an unreadable or ambiguous run: the mk-state write itself then decides,
-    exactly as before. Mirrors mk-state's run pick: --run names the run; else the single active
-    run; with several, the one that owns the task (ids match case-insensitively, as there)."""
+    exactly as before. With the project store on, the tasks table is the tree (parent column);
+    otherwise the run.json files. Mirrors mk-state's run pick: --run names the run; else the
+    single active run; with several, the one that owns the task (ids match case-insensitively)."""
+    if store_on(data):
+        try:
+            con = store_con(data)
+            try:
+                if run:
+                    rows = con.execute("SELECT id, parent FROM tasks WHERE run=?", (run,)).fetchall()
+                    if not any(str(r["id"]).lower() == task.lower() for r in rows):
+                        return []
+                else:
+                    actives = [r["id"] for r in con.execute(
+                        "SELECT id FROM runs WHERE status='active'").fetchall()]
+                    owners = []
+                    for rid in actives:
+                        rs = con.execute("SELECT id, parent FROM tasks WHERE run=?", (rid,)).fetchall()
+                        if any(str(r["id"]).lower() == task.lower() for r in rs):
+                            owners.append(rs)
+                    if len(owners) != 1:
+                        return []
+                    rows = owners[0]
+            finally:
+                con.close()
+        except Exception:
+            return []
+        return _leaves([{"id": r["id"], "parent": r["parent"]} for r in rows], task)
     runs = os.path.join(data, "runs")
 
     def load(rid):
@@ -292,18 +525,7 @@ def child_tasks(task, data, run=None):
             return []
         src = owners[0]
     ts = [t for t in src["tasks"] if isinstance(t, dict) and t.get("id")]
-    pid = next(str(t["id"]) for t in ts if str(t["id"]).lower() == task.lower())
-    # parent stored case-exactly like mk-state's roll-up compares it (c.get("parent") == t["id"])
-    parent_of = lambda tid: [str(c["id"]) for c in ts if c.get("parent") == tid]
-    kids, stack, seen = [], [pid], {pid}
-    while stack:  # walk the subtree; a cyclic hand-edit must not hang this
-        cur = stack.pop()
-        next_ = [k for k in parent_of(cur) if k not in seen]
-        seen.update(next_)
-        stack.extend(next_)
-        if cur != pid and not next_:
-            kids.append(cur)  # a leaf descendant: it can hold a status
-    return [str(t["id"]) for t in ts if str(t["id"]) in kids]  # run.json insertion order
+    return _leaves(ts, task)  # run.json insertion order
 
 
 def record(out, task, data, run=None):
@@ -379,6 +601,9 @@ def quota_beats_stall(agent, kind):
     is deliberately NOT searched: a banner the agent merely quotes is not a banner.
     -> ("QUOTA", evidence) or (None, [])."""
     text = pane_footer(lh.pane_text(agent))
+    # the same banner filter classify uses: a quota word inside a test log in the footer
+    # is not a wall, so it must not beat a stall or write the ledger
+    text = "\n".join(lh.banner_lines(text))
     hits = lh.quota_hits(text)
     if not hits:
         return None, []
@@ -389,6 +614,20 @@ def quota_beats_stall(agent, kind):
     until, window = lh.parse_reset(text)
     return "QUOTA", hits[-2:] + ([f"exhausted_until {until} ({window})"] if until
                                    else ["exhausted_until unknown"]) + ["source=pane"]   # R41 (R35)
+
+
+def child_grace_end(child_first, child_seen_until, running, stall_min, scale, max_wait, now):
+    """End of the child-progress grace, or None when a STALL is not suppressed.
+
+    While the child still runs, the window stays open until max(4*stall_min, the watch's
+    max-wait) after the child was FIRST seen. After it exits, only stall_min*scale remains
+    (scale <= 4), never past that same bound. A leaked child cannot hold a lane forever;
+    a real stall fires once the bound passes. Pure: the caller passes the clock."""
+    if child_seen_until is None:
+        return None
+    alive_until = child_first + max(stall_min * 60 * CHILD_SCALE_CAP, max_wait)
+    end = alive_until if running else min(child_seen_until + stall_min * 60 * scale, alive_until)
+    return end if now < end else None
 
 
 def watch(a):
@@ -402,12 +641,16 @@ def watch(a):
     rx = None if no_commit else re.compile(grep)  # --no-commit: no commit to match; decide() counts rx None as ok
     start, errors = time.time(), 0
     active, last_fp = start, None  # last time the pane showed new output
+    # D5A.3: last epoch a test/build descendant of the pane was seen. After it exits,
+    # grace = stall_min * max(1, loadavg_1m / cpu_count), measured when the child was last seen running.
+    child_seen_until, child_scale, child_first = 0.0, 1.0, 0.0
     t_one, t_list = opt(a, "--task"), opt(a, "--tasks")
     # the armed watch read_status() accepts against (R27): run/task/phase-round/role + armed_at;
     # a watch without --run, --task or a "<T>[ REVIEW] R<n>" phase never accepts a file (R27.3-5)
     armed = {"lane": lane, "run": opt(a, "--run"),
              "task": t_one or (t_list.split(",")[0].strip() if t_list else None),
-             "phase": phase, "armed_at": start, "max_wait_min": max_wait / 60}
+             "phase": phase, "armed_at": start, "max_wait_min": max_wait / 60,
+             "data": opt(a, "--data")}
     while True:
         subj = commit_subject(lane)
         # math.inf: lane-health judges only files/commits; STALL is decided in decide() with pane activity
@@ -425,7 +668,20 @@ def watch(a):
             # R33: the reader moves the lane's idle-clock mark to the file's write (never backwards)
             active = max(active, float(st["updated_at"]))
         report_ok = not report or os.path.exists(os.path.join(lane, report))
+        if not report_ok and store_report_ok(opt(a, "--data"), armed, report):
+            report_ok = True  # the report artifact is in the store; the file is absent
         state, ev = decide(h, subj, rx, report_ok, h.get("text", ""), phase, stall_min, st, armed)
+        # pane pid: herdr status if present, else MK_PANE_PID (tests). No herdr call of our own.
+        pane_pid = os.environ.get("MK_PANE_PID") or h.get("pane_pid")
+        running, scale = child_progress(pane_pid)
+        if running:
+            now_c = time.time()
+            if not child_first:
+                child_first = now_c
+            child_seen_until, child_scale = now_c, scale
+        if state == "STALL" and child_grace_end(
+                child_first, child_seen_until, running, stall_min, child_scale, max_wait, time.time()):
+            state = None  # quiet pane, but the test/build child (or its grace) is still in play
         errors = errors + 1 if state == "ERROR" else 0
         if state == "ERROR" and errors < ERROR_RETRIES and time.time() - start <= max_wait:
             time.sleep(poll)
@@ -449,6 +705,23 @@ def watch(a):
 
 
 def self_test():
+    # Load-proof windows (W1): one trivial spawn is timed and every stall window
+    # below is multiplied by it, so a loaded machine still gets several polls
+    # inside max-wait. The ratio stays, so a stall still fires inside the window.
+    _t0 = time.time()
+    subprocess.run([sys.executable, "-c", "pass"], check=True)
+    # named _spawn_scale, not _scale: self_test later rebinds `_hit, _scale` from
+    # child_progress, and a win() after that point must still see the spawn scale
+    _spawn_scale = max(1.0, (time.time() - _t0) / 0.05)
+
+    def win(stall, wait):
+        # last_change_min rounds UP to the next 0.1 min, so one slow poll reads as
+        # 0.2. The floor sits above that. Below scale ~4 the floor wins, so every
+        # pair comes out 0.25/0.75 (a 2:1 pair becomes 1:3); a stall still fires
+        # inside the window and a live pane still outlives it.
+        return f"{max(0.25, stall * _spawn_scale):.4f}", f"{max(0.75, wait * _spawn_scale):.4f}"
+
+
     rx = re.compile(r"^\w+ feat\(p1\)")
     ok = {"state": "OK", "evidence": [], "agent_status": "idle", "last_change_min": 1}
     good, other = "abc123 feat(p1): state core", "def456 chore: wip"
@@ -822,7 +1095,10 @@ def self_test():
         mks("task", "set", "P3", "status=building")
 
         def cli(*args, code=0):
-            r = subprocess.run([sys.executable, __file__, "--lane", lane, "--agent", "w1", *args], env=env,
+            # env was snapshotted before the store existed; the child must see the CURRENT
+            # MATRIXKODER_HOME or its store reads look at the real home
+            e = dict(env, MATRIXKODER_HOME=os.environ["MATRIXKODER_HOME"])
+            r = subprocess.run([sys.executable, __file__, "--lane", lane, "--agent", "w1", *args], env=e,
                                capture_output=True, text=True)
             assert r.returncode == code, r.stdout + r.stderr
             return json.loads(r.stdout.strip().splitlines()[-1]) if code == 0 else r
@@ -888,28 +1164,69 @@ def self_test():
         os.chmod(os.path.join(work_bin, "herdr"), 0o755)
         for grows, want in ((True, "WATCH_EXPIRED"), (False, "STALL")):
             e2 = dict(env, PATH=work_bin + os.pathsep + os.environ["PATH"], **({"MK_GROW": "1"} if grows else {}))
+            # the wider arguments only differ once the spawn scale passes ~4; below that
+            # win() returns the same 0.25/0.75 floor for both. The frozen pane keeps the
+            # smaller arguments so a stall still fires inside its window.
+            stall, wait = win(0.06, 0.18) if grows else win(0.02, 0.06)
             r = subprocess.run([sys.executable, __file__, "--lane", lane, "--agent", "w1", "--commit-grep", "nomatch",
                                 "--prompt-marker", "Read and follow brief-r3.md", "--poll", "0.1",
-                                "--stall-min", "0.02", "--max-wait-min", "0.06"], env=e2, capture_output=True, text=True)
+                                "--stall-min", stall, "--max-wait-min", wait], env=e2, capture_output=True, text=True)
             out = json.loads(r.stdout.strip().splitlines()[-1])
             assert out["state"] == want, (grows, out)
 
-        def probe(pane_txt, want, **extra):
+        # D5A.3: a quiet pane whose process tree runs a test/build command is not STALL until
+        # stall_min * scale after that child exits. The child is this interpreter with --self-test
+        # on its command line (CHILD_PROGRESS_RE); it is the pane pid. Never a server.
+        active0, scale0 = child_progress(None)
+        assert active0 is False and scale0 >= 1.0, (active0, scale0)
+        # a descendant running a matching command is seen; the pane pid itself is not.
+        # The watch-level suppression under load is proven by child_grace_end on an
+        # injected clock (below), not by this wall-clock watch: ps under heavy load
+        # outruns any fixed window.
+        script = os.path.join(lane, "selftest.sh")
+        wrap = os.path.join(lane, "wrap.py")
+        open(script, "w").write("import time\ntime.sleep(30)\n")
+        open(wrap, "w").write("import subprocess,sys\nsubprocess.run([sys.executable, sys.argv[1]])\n")
+        child = subprocess.Popen([sys.executable, wrap, script])
+        try:
+            time.sleep(0.3)
+            assert child_progress(child.pid)[0] is True, (child.pid, child.poll())
+        finally:
+            child.kill()
+            child.wait(timeout=5)
+        assert child_progress(child.pid)[0] is False, child.pid
+
+        # grace elapsed with the child: this watch is a fresh process (child_seen_until unset)
+        r = subprocess.run([sys.executable, __file__, "--lane", lane, "--agent", "w1",
+                            "--commit-grep", "nomatch", "--prompt-marker", "Read and follow brief-r3.md",
+                            "--poll", "0.1", "--stall-min", win(0.02, 0.06)[0], "--max-wait-min", win(0.02, 0.06)[1]],
+                           env=dict(env, PATH=work_bin + os.pathsep + os.environ["PATH"]),
+                           capture_output=True, text=True)
+        out = json.loads(r.stdout.strip().splitlines()[-1])
+        assert out["state"] == "STALL", out  # child gone, grace elapsed: pane-text STALL as before
+
+        _stall, _wait = win(0.02, 0.06)
+
+        def probe(pane_txt, want, stall=_stall, wait=_wait, **extra):
             """One watch run against the working-agent fake; assert its exit state."""
             open(grow, "w").write(pane_txt)
             e3 = dict(env, PATH=work_bin + os.pathsep + os.environ["PATH"], **extra)
             r = subprocess.run([sys.executable, __file__, "--lane", lane, "--agent", "w1", "--commit-grep", "nomatch",
                                 "--prompt-marker", "Read and follow brief-r3.md", "--poll", "0.1",
-                                "--stall-min", "0.02", "--max-wait-min", "0.06"], env=e3, capture_output=True, text=True)
+                                "--stall-min", stall, "--max-wait-min", wait], env=e3, capture_output=True, text=True)
             out = json.loads(r.stdout.strip().splitlines()[-1])
             assert out["state"] == want, (pane_txt or extra, out)
 
         # tonight's false STALL: a pane whose only life is a running subagent task line (spinner +
         # "Task —", text frozen between polls so the fingerprint never moves) is activity; a pane
         # with only finished "✓ … Task —" lines is not; a lone ticking ↳ N toolcalls counter is
-        probe("⠼ General Task — E2 reviewer key, quiet optional\n↳ 49 toolcalls · 12m 48s\n", "WATCH_EXPIRED")
+        # the task line counts only once a poll has seen it. Its arguments are larger, but
+        # below scale ~4 win() floors both to the same 0.25/0.75, so the window is only
+        # actually wider under load.
+        probe("⠼ General Task — E2 reviewer key, quiet optional\n↳ 49 toolcalls · 12m 48s\n", "WATCH_EXPIRED",
+              *win(0.06, 0.18))
         probe("✓ General Task — E2 reviewer key\n", "STALL")
-        probe("", "WATCH_EXPIRED", MK_COUNT="1")
+        probe("", "WATCH_EXPIRED", *win(0.06, 0.18), MK_COUNT="1")
         # lane-health CLI: QUOTA keyed by kind into $MATRIXKODER_HOME/usage.json, scope reported
         open(pane, "w").write("> Read and follow brief-r2.md\n■ You've hit your usage limit. Try again in 2 hours.\n")
         r = subprocess.run([sys.executable, os.path.join(HERE, "lane-health.py"), "--agent", "w1", "--lane", lane,
@@ -929,8 +1246,8 @@ def self_test():
             "$ cat brief-r2.md\n"
             "Read and follow brief-r2.md exactly. Work autonomously until complete.\n")
         out = cli("--commit-grep", "nomatch", "--kind", "opencode", "--prompt-marker",
-                  "Read and follow brief-r2.md", "--poll", "0.1", "--stall-min", "0.03",
-                  "--max-wait-min", "0.06", "--task", "P3", "--data", data)
+                  "Read and follow brief-r2.md", "--poll", "0.1", "--stall-min", win(0.03, 0.06)[0],
+                  "--max-wait-min", win(0.03, 0.06)[1], "--task", "P3", "--data", data)
         assert out["state"] == "QUOTA", out  # not STALL: the banner above the echo still counts
         assert "Free usage exceeded" in out["evidence"][0], out
         assert any(e.startswith("exhausted_until ") for e in out["evidence"]), out
@@ -952,8 +1269,8 @@ def self_test():
             "Read and follow brief-r2.md exactly. Work autonomously until complete.\n")
         mks("task", "set", "P3", "status=building")
         out = cli("--commit-grep", "nomatch", "--kind", "opencode", "--prompt-marker",
-                  "Read and follow brief-r2.md", "--poll", "0.1", "--stall-min", "0.03",
-                  "--max-wait-min", "0.06", "--task", "P3", "--data", data)
+                  "Read and follow brief-r2.md", "--poll", "0.1", "--stall-min", win(0.03, 0.06)[0],
+                  "--max-wait-min", win(0.03, 0.06)[1], "--task", "P3", "--data", data)
         assert out["state"] == "STALL" and out["evidence"][0].startswith("agent idle"), out
         assert json.load(open(os.path.join(tmp, "home", "usage.json")))["agents"]["opencode"][
             "exhausted_observed_at"] == oc_ev, "a quoted banner must not re-record the ledger"
@@ -962,11 +1279,161 @@ def self_test():
         open(pane, "w").write("> Read and follow brief-r2.md\nworking, then silence\n")
         mks("task", "set", "P3", "status=building")
         out = cli("--commit-grep", "nomatch", "--kind", "opencode", "--prompt-marker",
-                  "Read and follow brief-r2.md", "--poll", "0.1", "--stall-min", "0.03",
-                  "--max-wait-min", "0.06", "--task", "P3", "--data", data)
+                  "Read and follow brief-r2.md", "--poll", "0.1", "--stall-min", win(0.03, 0.06)[0],
+                  "--max-wait-min", win(0.03, 0.06)[1], "--task", "P3", "--data", data)
         assert out["state"] == "STALL" and out["evidence"][0].startswith("agent idle"), out
         assert json.load(open(os.path.join(tmp, "home", "usage.json")))["agents"]["opencode"][
             "exhausted_observed_at"] == oc_ev  # untouched: no quota line, no re-record
+
+        # --- the project store (D5A.1): reads go through mkdb; files are the fallback --------
+        # self-hosting guard: every run above was the file path; none of them created a store
+        assert not os.path.exists(os.path.join(data, "mk.db")), "a watch created mk.db"
+        out = cli("--commit-grep", "nomatch", "--poll", "0.1", "--stall-min", win(0.02, 0.06)[0],
+                  "--max-wait-min", win(0.02, 0.06)[1], "--task", "P3", "--data", data)
+        assert out["state"] == "STALL" and out["state_written"], out  # file path, still works
+        assert not os.path.exists(os.path.join(data, "mk.db")), "file-path run created mk.db"
+        # undo the E2 fixture (task.json is a directory) BEFORE enabling: store enable republishes
+        # every view, and a directory there fails the publish
+        shutil.rmtree(os.path.join(data, "runs", "r1", "tasks", "E2"), ignore_errors=True)
+        os.makedirs(os.path.join(data, "runs", "r1", "tasks", "E2"))
+        r = subprocess.run([sys.executable, MK_STATE, "store", "enable", "--data", data],
+                           capture_output=True, text=True)
+        assert r.returncode == 0 and os.path.getsize(os.path.join(data, "mk.db")) > 0, (r.stdout, r.stderr, os.listdir(data))
+
+        # store-first: no status file in the lane, the tasks row IS the channel -> DONE, source=store
+        mks("task", "add", "--id", "S4", "--title", "store")
+        mks("task", "add", "--id", "SK1", "--title", "k1", "--parent", "S4")  # child_tasks tree
+        mks("task", "set", "SK1", "status=building")
+        # the report lives in the TASK dir: task round stores whatever report-r<n>.md is there
+        td = os.path.join(data, "runs", "r1", "tasks", "S4")
+        open(os.path.join(td, "report-r1.md"), "w").write("# report r1\nstore test\n")
+        mks("task", "round", "S4", "--kind", "build")   # round 1 + report artifact stored
+        os.unlink(os.path.join(td, "report-r1.md"))     # the file is GONE: only the artifact remains
+        _c = store_con(data)
+        _arts = [dict(r) for r in _c.execute("SELECT task, round, kind FROM artifacts")]
+        _c.close()
+        assert any(a["task"] == "S4" and a["kind"] == "report" and a["round"] == 1 for a in _arts), _arts
+        subprocess.run(git + ["commit", "-q", "--allow-empty", "-m", "feat(s4): store read"], check=True)
+        mks("task", "set", "S4", "status=verifying")    # the row a finished builder leaves behind
+        assert not os.path.exists(os.path.join(lane, STATUS_FILE))
+        _armed = {"run": "r1", "task": "S4", "phase": "S4 R1", "data": data}
+        assert store_on(data), data
+        assert store_report_ok(data, _armed, "report-s1.md") is True, "report artifact not seen"
+        _row = store_status_row(data, _armed)
+        assert _row and _row["status"] == "verifying" and _row["round"] == 1, dict(_row) if _row else None
+        open(pane, "w").write("> Read and follow brief-s1.md\nquiet, no token\n")
+        out = cli("--commit-grep", r"feat\(s4\)", "--report", "report-s1.md", "--phase", "S4 R1", "--run", "r1",
+                  "--kind", "codex", "--prompt-marker", "Read and follow brief-s1.md",
+                  "--poll", "0.1", "--task", "S4", "--data", data)
+        assert out["state"] == "DONE" and out["state_written"], out
+        assert out["evidence"][-1] == "source=store" and "store row done" in out["evidence"], out
+        # the verdict reached the CHILD through the store tree (child_tasks read tasks.parent)
+        assert statuses()["SK1"]["status"] == "verifying", statuses()
+        # DONE still needs the commit: no matching commit -> never DONE
+        mks("task", "add", "--id", "S5", "--title", "store2")
+        mks("task", "set", "S5", "status=building")
+        mks("task", "round", "S5", "--kind", "build")
+        mks("task", "set", "S5", "status=verifying")
+        open(pane, "w").write("> Read and follow brief-s1.md\nquiet, no token\n")
+        out = cli("--commit-grep", "nomatch", "--report", "report-s1.md", "--phase", "S5 R1", "--run", "r1",
+                  "--kind", "codex", "--prompt-marker", "Read and follow brief-s1.md",
+                  "--poll", "0.1", "--stall-min", win(0.02, 0.06)[0], "--max-wait-min", win(0.02, 0.06)[1],
+                  "--task", "S5", "--data", data)
+        assert out["state"] == "STALL" and "matching commit" in out["evidence"][0], out
+        # ... and no report artifact for the round -> the file check fails -> STALL lists report
+        mks("task", "add", "--id", "S7", "--title", "store3")
+        mks("task", "set", "S7", "status=building")
+        mks("task", "round", "S7", "--kind", "build")   # round file never existed: no artifact
+        mks("task", "set", "S7", "status=verifying")
+        out = cli("--commit-grep", r"feat\(s4\)", "--report", "report-s1.md", "--phase", "S7 R1", "--run", "r1",
+                  "--kind", "codex", "--prompt-marker", "Read and follow brief-s1.md",
+                  "--poll", "0.1", "--stall-min", win(0.02, 0.06)[0], "--max-wait-min", win(0.02, 0.06)[1],
+                  "--task", "S7", "--data", data)
+        assert out["state"] == "STALL" and "report" in out["evidence"][0], out
+        # fallback: the row is round 2, so phase S8 R1 has no row -> the status file decides
+        mks("task", "add", "--id", "S8", "--title", "fallback")
+        mks("task", "set", "S8", "status=building")
+        mks("task", "round", "S8", "--kind", "build")
+        mks("task", "round", "S8", "--kind", "fix")     # round 2 now
+        mks("task", "set", "S8", "status=verifying")
+        j = {"v": 1, "seq": 3, "run": "r1", "task": "S8", "round": 1, "role": "builder",
+             "agent": "opencode", "state": "done", "step": "selftest", "phases_done": [],
+             "question": None, "commit": None, "report": "report-s1.md", "subagent": None,
+             "ctx_pct": None, "started_at": time.time(), "updated_at": time.time() + 5}
+        json.dump(j, open(os.path.join(lane, STATUS_FILE), "w"))
+        open(os.path.join(lane, "report-s1.md"), "w").write("# report\n")  # file fallback: no round-1 artifact
+        out = cli("--commit-grep", r"feat\(s4\)", "--report", "report-s1.md", "--phase", "S8 R1", "--run", "r1",
+                  "--kind", "codex", "--prompt-marker", "Read and follow brief-s1.md",
+                  "--poll", "0.1", "--task", "S8", "--data", data)
+        assert out["state"] == "DONE" and out["evidence"][-1] == "source=status", out
+        assert "status file done (seq 3)" in out["evidence"], out
+        os.unlink(os.path.join(lane, STATUS_FILE))
+
+        # W1: task round with the store on starts the new round non-terminal and clears verdict,
+        # in the tasks row the watcher reads (the file view is unchanged on purpose).
+        def w1row():
+            c = store_con(data)
+            try:
+                return dict(c.execute(
+                    "SELECT status, round, verdict FROM tasks WHERE run='r1' AND id='W1T'").fetchone())
+            finally:
+                c.close()
+        mks("task", "add", "--id", "W1T", "--title", "round reset")
+        mks("task", "set", "W1T", "status=done", "verdict=OLD")
+        mks("task", "round", "W1T", "--kind", "build")
+        got = w1row()
+        assert got["status"] == "planned" and got["verdict"] is None and got["round"] == 1, got
+        mks("task", "set", "W1T", "status=done", "verdict=OLD")
+        mks("task", "round", "W1T", "--kind", "fix")
+        got = w1row()
+        assert got["status"] == "fix" and got["verdict"] is None and got["round"] == 2, got
+        mks("task", "set", "W1T", "status=done", "verdict=OLD")
+        mks("task", "round", "W1T", "--kind", "takeover")
+        got = w1row()
+        assert got["status"] == "building" and got["verdict"] is None and got["round"] == 3, got
+        # a terminal row older than armed_at is the previous round's outcome: ignored
+        mks("task", "set", "W1T", "status=done", "verdict=OLD")
+        _c = store_con(data)
+        _upd = _c.execute("SELECT updated FROM tasks WHERE id='W1T'").fetchone()["updated"]
+        _c.close()
+        stale = store_status_row(data, {"run": "r1", "task": "W1T", "phase": "W1T R3",
+                                         "armed_at": _row_epoch(_upd) + 120, "data": data})
+        assert stale is None, dict(stale) if stale else stale
+        # a terminal row written after armed_at still decides
+        fresh = store_status_row(data, {"run": "r1", "task": "W1T", "phase": "W1T R3",
+                                         "armed_at": _row_epoch(_upd) - 5, "data": data})
+        assert fresh and fresh["status"] == "done", dict(fresh) if fresh else fresh
+
+        # W1: a store read failure is a named reason, never a silent None, and decide keeps watching
+        dbp = os.path.join(data, "mk.db")
+        os.rename(dbp, dbp + ".w1bak")
+        os.mkdir(dbp)
+        try:
+            err = store_status_row(data, {"run": "r1", "task": "W1T", "phase": "W1T R3", "data": data})
+            assert isinstance(err, dict) and str(err.get("store_error", "")).startswith("store_error") is False
+            assert "store_error" in err and err["store_error"], err
+            st_err = read_status(lane, {"run": "r1", "task": "W1T", "phase": "W1T R3",
+                                         "armed_at": 0, "data": data})
+            assert st_err["state"] == "store_error" and st_err["source"] == "status", st_err
+            quiet = {"state": "OK", "evidence": [], "agent_status": "idle", "last_change_min": 30}
+            dstate, dev = decide(quiet, "abc feat(p1): x", re.compile("feat"), True, "",
+                                 "W1T R3", 10, st_err, {"armed_at": 0})
+            assert dstate is None and dev[-1] == "source=status" and dev[0].startswith("store_error:"), dev
+        finally:
+            os.rmdir(dbp)
+            os.rename(dbp + ".w1bak", dbp)
+
+        # W1: the child-progress scale never exceeds 4
+        _hit, _scale = child_progress(os.getpid())
+        assert _scale <= CHILD_SCALE_CAP, _scale
+        # the cap itself, on an injected clock (no wall time, so load cannot flake it).
+        stall, mx = 15.0, 30 * 60.0
+        cap = max(stall * 60 * CHILD_SCALE_CAP, mx)
+        assert child_grace_end(0.0, 0.0, True, stall, 4.0, mx, cap - 1) is not None
+        assert child_grace_end(0.0, 0.0, True, stall, 100.0, mx, cap + 1) is None
+        assert child_grace_end(0.0, 100.0, False, stall, 4.0, mx, 100 + stall * 60 - 1) is not None
+        assert child_grace_end(0.0, 100.0, False, stall, 100.0, mx, 100 + stall * 60 * CHILD_SCALE_CAP + 1) is None
+        assert child_grace_end(0.0, None, False, stall, 1.0, mx, 0) is None
 
         # no flag and no yaml: the stall/max_wait defaults this script now uses are the schema's
         empty = os.path.join(tmp, "empty-data")
@@ -987,6 +1454,22 @@ def self_test():
     finally:
         restore_data()
         shutil.rmtree(tmp, ignore_errors=True)
+    # A2: the filter is what suppresses it, so the test drives quota_beats_stall itself.
+    # A quota phrase inside a bar-drawn command in the footer must not beat a stall;
+    # a real wall in the footer must. Removing the banner_lines line fails the first assert.
+    log = "\n".join(["  \u2503", "  \u2503  $ pytest",
+                      "  \u2503  Usage limit reached for 5 hour resets in 3h", "  \u2503"])
+    wall = "Usage limit reached for 5 hour. resets in 3h"
+    real_pane = lh.pane_text
+    try:
+        lh.pane_text = lambda agent, lines=300: log
+        assert quota_beats_stall("w1", "opencode") == (None, []), "a test log must not beat a stall"
+        lh.pane_text = lambda agent, lines=300: wall
+        state, ev = quota_beats_stall("w1", "opencode")
+        assert state == "QUOTA", (state, ev)
+    finally:
+        lh.pane_text = real_pane
+
     print("lane-watch self-test ok")
 
 

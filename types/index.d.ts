@@ -111,7 +111,7 @@ export type MkStatusMemory = {
 }
 
 /** dashboard.tsx (S0.2): the /mk pane's tabs — 'old' is the pre-tab pane, the rest are the six mock tabs */
-export type MkDashTab = 'old' | 'overview' | 'lanes' | 'plan' | 'usage' | 'events' | 'waiting' | 'settings'
+export type MkDashTab = 'old' | 'overview' | 'lanes' | 'plan' | 'usage' | 'events' | 'waiting' | 'kanban' | 'settings'
 
 declare module 'claude-code' {
   interface PluginState {

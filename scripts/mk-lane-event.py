@@ -11,12 +11,13 @@ Usage:
                              [--kind build|fix|takeover]
   mk-lane-event.py sweep [--data DIR]
   mk-lane-event.py disarm --lane DIR
+  mk-lane-event.py review-handoff --task T [--run R] [--data DIR] [--hold] [--min medium]
   mk-lane-event.py --self-test
 
 arm writes <lane>/.matrixkoder-watch.json and records the pane on the task (`mk-state task set T
 pane=<pane>`, best-effort: a task missing from run state still arms). When yaml bus.enabled is true
 (the mk-config schema default) arm also runs mk-bus.py ensure then token for the primary task (the
-lane's .matrixkoder-bus.json; its url reported as bus:{ok,url}) and disarm runs mk-bus.py revoke —
+token under the MK home, not in the lane; its url reported as bus:{ok,url}) and disarm runs mk-bus.py revoke —
 a bus failure rides in the reply as bus:{ok:false,error} and never fails the command ($MK_BUS_CMD
 overrides the script; bus.enabled:false runs no bus command at all). event is run by the herdr plugin
 for EVERY pane status
@@ -264,7 +265,10 @@ def verdict_for(w):
     subj = lw.commit_subject(w["lane"])
     armed = {"lane": w["lane"], "run": w.get("run"), "task": w.get("task"), "phase": w.get("phase"),
              "armed_at": float(w.get("armed_at") or 0.0),
-             "max_wait_min": float(cfg("session.max_wait_min"))}
+             "max_wait_min": float(cfg("session.max_wait_min")),
+             "data": w.get("data")}
+    if not report_ok and lw.store_report_ok(w.get("data"), armed, report):
+        report_ok = True  # report artifact in the store; the file is absent
     st = lw.read_status(w["lane"], armed)   # R27/R28; R42: inside the caller's per-lane flock
     since = float(w.get("last_activity") or w.get("armed_at") or time.time())
     if lw.status_activity(st, stall, armed):
@@ -279,6 +283,8 @@ def verdict_for(w):
         h = lh.check(w["pane"], w["lane"], w.get("kind"), stall, w["last_activity"], w.get("prompt_marker"))
     w["last_pane_fp"] = fp
     state, ev = lw.decide(h, subj, rx, report_ok, h.get("text", ""), w.get("phase"), stall, st, armed)
+    if st and st.get("source") == "store" and ev and ev[-1] == "source=status":
+        ev = ev[:-1] + ["source=store"]  # decided from the tasks row, not the status file
     return h, subj, state, ev
 
 
@@ -342,6 +348,7 @@ def apply_verdict(w, state, subj, evidence, h):
     evidence = list(evidence or [])
     if not any(str(e).startswith("source=") for e in evidence):   # R41: pane detections (R35)
         evidence = evidence + ["source=pane"]
+    # source is one of store|status|pane|grace (D5A.2); decide() already ends with one of them
     rec = lw.record({"state": state, "commit": subj, "evidence": evidence,
                      "agent_status": (h or {}).get("agent_status")}, watch_tasks(w), w["data"],
                     w.get("run"))
@@ -545,10 +552,27 @@ def run_bus(args_list):
     return j, err[:200]
 
 
+def lane_token_file(lane):
+    """Where the lane token lives. D6B moved it out of the worktree:
+    <home>/bus-lanes/<sha256(realpath(lane))>.json. $MK_BUS_TOKEN_FILE overrides (tests).
+    File mode still writes <lane>/.matrixkoder-bus.json; that path wins when the file is there,
+    so a bus that has not moved the token keeps working."""
+    override = os.environ.get("MK_BUS_TOKEN_FILE")
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    inside = os.path.join(lane, ".matrixkoder-bus.json")
+    if os.path.isfile(inside):
+        return inside
+    home = os.environ.get("MK_BUS_DIR") or os.environ.get("MK_HOME") or os.environ.get("MATRIXKODER_HOME") or os.path.expanduser("~/.matrixkoder")
+    digest = hashlib.sha256(os.path.realpath(lane).encode("utf-8")).hexdigest()
+    return os.path.join(os.path.abspath(os.path.expanduser(home)), "bus-lanes", digest + ".json")
+
+
 def arm_bus(lane, task, run, data):
-    """arm's bus wiring: ensure the server, then mint the lane token (which writes
-    <lane>/.matrixkoder-bus.json); on full success report the lane file's url. token only runs
-    after a good ensure, so a dead bus costs one command, and every failure lands in the reply."""
+    """arm's bus wiring: ensure the server, then mint the lane token. The token file is
+    outside the lane (D6B); on full success report its url. token only runs after a good
+    ensure, so a dead bus costs one command, and every failure lands in the reply.
+    arm itself never writes .matrixkoder-brief.md or .matrixkoder-bus.json into the lane."""
     _j, err = run_bus(["ensure", "--data", data, "--run", run])
     if err:
         return {"ok": False, "error": err}
@@ -556,7 +580,7 @@ def arm_bus(lane, task, run, data):
     if err:
         return {"ok": False, "error": err}
     try:
-        with open(os.path.join(lane, ".matrixkoder-bus.json")) as f:
+        with open(lane_token_file(lane)) as f:
             url = json.load(f).get("url")
     except (OSError, ValueError):
         return {"ok": False, "error": "lane bus file unreadable"}
@@ -632,6 +656,131 @@ def mark_armed_building(pane):
     return res
 
 
+def selftest_jobs_total(data):
+    """session.selftest_jobs_total from mk-config.py, looked up by the HERE path so the
+    cwd does not matter. Bounded at 5 s. A failure, or a value outside 1..16 (the same
+    range scripts/selftest.sh accepts), uses 4."""
+    try:
+        r = subprocess.run(
+            [sys.executable, os.path.join(HERE, "mk-config.py"), "get",
+             "session.selftest_jobs_total", "--data", data],
+            capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            j = json.loads(r.stdout.strip().splitlines()[-1])
+            v = j.get("value")
+            if isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= 16:
+                return v
+    except Exception:
+        pass
+    return 4
+
+
+def selftest_jobs_hint(data, active=None):
+    """The per-lane self-test job budget: max(1, total // active_lanes).
+
+    An existing MK_SELFTEST_JOBS in the environment wins and is returned as-is.
+    active overrides the armed-lane count (tests); otherwise it is the number of
+    armed lanes for this data dir, at least 1. The result is a number, never a
+    model or effort choice.
+    """
+    env = os.environ.get("MK_SELFTEST_JOBS")
+    if env and env.strip():
+        return env.strip()
+    total = selftest_jobs_total(data)
+    if active is None:
+        active = len(armed_lanes(data)) or 1
+    active = active or 1
+    return str(max(1, total // active))
+
+
+def bus_dir_for(data):
+    """Where bus.json lives, the same rule as mk-bus.bus_location: $MK_BUS_DIR, else the
+    MK home when <data>/mk.db exists (store mode), else the data dir (file mode)."""
+    override = os.environ.get("MK_BUS_DIR")
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    if data and os.path.isfile(os.path.join(data, "mk.db")):
+        # Same rule as mk-bus.root_bus_dir / mk_home: $MK_HOME, else ~/.matrixkoder.
+        # MATRIXKODER_HOME is the projects.json home, not the bus home.
+        home = os.environ.get("MK_HOME") or os.path.expanduser("~/.matrixkoder")
+        return os.path.abspath(os.path.expanduser(home))
+    return data
+
+
+def brief_message(round_n, text):
+    """The one brief format both publish_brief and review-handoff send, and the one
+    connect reads: `round:<n>\nkind:brief\n<body>`."""
+    return f"round:{round_n}\nkind:brief\n{text}"
+
+
+def bus_is_up(data):
+    """True only when a bus is already serving this data dir. Reads bus.json from the
+    mk-bus location and probes /health; never calls ensure, so a down bus stays down."""
+    if not data:
+        return False
+    bus_dir = bus_dir_for(data)
+    try:
+        with open(os.path.join(bus_dir, "bus.json")) as f:
+            info = json.load(f)
+        port = int(info.get("port"))
+    except (OSError, ValueError, TypeError):
+        return False
+    try:
+        r = subprocess.run(
+            [sys.executable, "-c",
+             "import json,sys,urllib.request\n"
+             "body=urllib.request.urlopen(sys.argv[1], timeout=2).read()\n"
+             "j=json.loads(body)\n"
+             "sys.exit(0 if isinstance(j, dict) and j.get('ok') and j.get('status')=='healthy' else 1)",
+             f"http://127.0.0.1:{port}/health"],
+            capture_output=True, text=True, timeout=5)
+    except Exception:
+        return False
+    return r.returncode == 0
+
+
+def brief_body_for(data, run, task):
+    """The brief the orchestrator would hand the lane: the newest brief-rN.md for the task."""
+    d = os.path.join(data, "runs", run, "tasks", task)
+    best, best_n = None, -1
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return None, None
+    for name in names:
+        m = re.fullmatch(r"brief-r(\d+)\.md", name)
+        if m and int(m.group(1)) > best_n:
+            best, best_n = os.path.join(d, name), int(m.group(1))
+    if not best:
+        return None, None
+    try:
+        return open(best).read(), best_n
+    except OSError:
+        return None, None
+
+
+def publish_brief(data, run, task):
+    """Send the task's current brief to the lane as the orchestrator. File mode uses kind
+    info (the only kinds a file-mode bus accepts); store mode uses kind task. -> (ok, error)."""
+    text, n = brief_body_for(data, run, task)
+    if not text or not str(text).strip():
+        return False, "no brief"
+    body = brief_message(n, text)
+    kind = "task" if os.path.isfile(os.path.join(data, "mk.db")) else "info"
+    _j, err = run_bus(["send", "--data", data, "--run", run, "--task", task,
+                       "--kind", kind, "--from", "orch", "--to", task, "--text", body])
+    return err is None, err
+
+
+def connect_text(lane, data):
+    """The one line a bus-up dispatch types: connect, plus the job-budget command."""
+    skill = os.path.join(lane, ".claude", "skills", "mk-builder")
+    n = selftest_jobs_hint(data) if data else "4"
+    # One line: the fake herdr and the prompt marker both keep only the first line.
+    # The hint is a command prefix, so typing it is how the builder's shell gets the var.
+    return (f"MK_SELFTEST_JOBS={n} python3 {skill}/scripts/mk-builder.py connect")
+
+
 def delivered_status(pane, role):
     """The board write a DELIVERED dispatch makes, by role. build (the default) →
     mark_armed_building: every armed task's children (or the task itself) go building. review →
@@ -696,6 +845,24 @@ def cmd_dispatch(a):
     pane, text = opt(a, "--pane"), opt(a, "--text")
     if not (pane and text):
         fail("dispatch needs --pane --text")
+    # --connect (bus on): the brief and the token are not in the lane, so the typed
+    # prompt is only the connect doorbell. Without the flag the caller's full prompt
+    # is typed unchanged — that is the bus-down path, and every dispatch that predates
+    # the doorbell.
+    # The doorbell replaces the prompt ONLY when the bus is actually up and the brief
+    # was published. A yaml flag is not enough: a bus that is enabled but down, or a
+    # publish that fails, keeps today's full prompt (C12).
+    if "--connect" in a and opt(a, "--role", "build") == "build":
+        hit = find_armed(pane)
+        wdata = (hit[1].get("data") or "") if hit else ""
+        wrun, wtask = (hit[1].get("run"), hit[1].get("task")) if hit else (None, None)
+        if hit and bus_enabled(wdata) and bus_is_up(wdata):
+            ok, publish_error = publish_brief(wdata, wrun, wtask)
+            if ok:
+                text = connect_text(hit[1].get("lane") or "", wdata)
+            elif publish_error:
+                # the full prompt is kept; the reply says why the doorbell was not typed
+                a = list(a) + ["--publish-error", publish_error]
     role = opt(a, "--role", "build")
     if role not in ("build", "review"):
         fail("--role must be build or review")
@@ -739,6 +906,7 @@ def cmd_dispatch(a):
             out({"ok": True, "delivered": True, "pane": pane, "agent_status": status, "timeout_ms": ms,
                  "attempts": attempts, "herdr_error": fail_why or why, "pane_entry": entry,
                  "fresh_session": fresh,
+                 **({"publish_error": opt(a, "--publish-error")} if opt(a, "--publish-error") else {}),
                  **({"pane_list_error": pl_err} if pl_err else {}), **delivered_status(pane, role)})
             return
         fail_why = why
@@ -842,6 +1010,308 @@ def cmd_disarm(a):
     bus = (disarm_bus(lane, wdata) if enabled
            else {"ok": True, "skipped": "bus.enabled is false"})
     out({"ok": True, "lane": lane, "removed": removed, "bus": bus})
+
+
+ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+SEV_RANK = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+SEV_ORDER = ("CRITICAL", "HIGH", "MEDIUM", "LOW")
+
+
+def review_verdict(text):
+    """The verdict token after the last em dash of the title line.
+
+    `templates/review.md` titles end `— APPROVE` or `— REQUEST CHANGES`. A title that
+    merely mentions both words (the unfilled template, or "APPROVE (no REQUEST CHANGES
+    needed)") matches neither.
+    """
+    head = (text or "").splitlines()[0] if text else ""
+    tail = head.rsplit("\u2014", 1)[-1] if "\u2014" in head else head.rsplit(" - ", 1)[-1]
+    token = tail.strip().rstrip(".").upper()
+    if token == "REQUEST CHANGES":
+        return "REQUEST CHANGES"
+    if token == "APPROVE":
+        return "APPROVE"
+    return ""
+
+
+def review_findings(text):
+    """Findings under the exact single-severity headings of templates/review.md.
+
+    A heading is `## CRITICAL` and nothing else: the template's own
+    `## CRITICAL / HIGH / MEDIUM / LOW` line is not a heading. A finding starts with
+    `- ` or `1. `; following indented lines stay with it. `###` headings and any other
+    `##` heading end the section.
+    """
+    out, sev, cur = [], None, None
+    for raw in (text or "").splitlines():
+        line = raw.rstrip()
+        m = re.fullmatch(r"##[ \t]+(CRITICAL|HIGH|MEDIUM|LOW)", line.strip())
+        if m:
+            if cur:
+                out.append(cur)
+                cur = None
+            sev = m.group(1)
+            continue
+        if line.startswith("#"):
+            if cur:
+                out.append(cur)
+                cur = None
+            sev = None
+            continue
+        if not sev:
+            continue
+        bullet = re.match(r"^(?:- |\d+\. )(.*)$", line)
+        if bullet:
+            if cur:
+                out.append(cur)
+            cur = {"severity": sev, "text": bullet.group(1).strip()}
+            continue
+        if cur and (line.startswith(" ") or line.startswith("\t")) and line.strip():
+            cur["text"] += " " + line.strip()
+    if cur:
+        out.append(cur)
+    return out
+
+
+def render_fix_section(findings, min_sev):
+    """The FIX section of templates/brief.md, from the findings at or above min_sev.
+
+    Findings below the minimum are listed and marked as not required.
+    """
+    floor = SEV_RANK.get(min_sev, SEV_RANK["LOW"])
+    lines = ["## FIX (only for review findings)",
+             "Findings: the review file — cite their numbers in the report."]
+    n = 0
+    for f in findings:
+        if SEV_RANK[f["severity"]] <= floor:
+            n += 1
+            lines.append(f"{n}. [{f['severity']}] {f['text']}")
+    listed = [f for f in findings if SEV_RANK[f["severity"]] > floor]
+    if listed:
+        lines.append("")
+        lines.append(f"Listed, not required (--min {min_sev}):")
+        for f in listed:
+            lines.append(f"- [{f['severity']}] {f['text']}")
+    if n == 0 and not listed:
+        lines.append("(no findings)")
+    return "\n".join(lines) + "\n"
+
+
+def review_path_for(data, run, task):
+    """The newest review-rN.md for the task, or None."""
+    d = os.path.join(data, "runs", run, "tasks", task)
+    best, best_n = None, -1
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return None
+    for name in names:
+        m = re.fullmatch(r"review-r(\d+)\.md", name)
+        if m and int(m.group(1)) > best_n:
+            best, best_n = os.path.join(d, name), int(m.group(1))
+    return best
+
+
+def send_brief_over_bus(data, run, task, text, round_n):
+    """The orchestrator sends the FIX brief to the builder. Store mode stores it as a
+    brief artifact (connect reads that); file mode sends it as info. Never a lane-to-lane
+    message: the sender is the orchestrator token."""
+    body = brief_message(round_n, text)
+    if os.path.isfile(os.path.join(data, "mk.db")):
+        return run_bus(["send", "--data", data, "--run", run, "--task", task,
+                        "--kind", "task", "--from", "orch", "--to", task, "--text", body])
+    return run_bus(["send", "--data", data, "--run", run, "--task", task,
+                    "--kind", "info", "--from", "orch", "--to", task, "--text", body])
+
+
+def set_children_fix(data, run, task):
+    """The task's children (or the task itself) go to status fix. Failures are reported."""
+    kids = child_ids(task, data, run)
+    targets = kids or [task]
+    done, errors = [], []
+    for t in targets:
+        r = subprocess.run(
+            [sys.executable, mk_state_cmd(), "--data", data, "--run", run,
+             "task", "set", t, "status=fix", "--by", "review-handoff"],
+            capture_output=True, text=True)
+        try:
+            j = json.loads(r.stdout.strip().splitlines()[-1])
+        except (json.JSONDecodeError, IndexError):
+            j = None
+        if r.returncode != 0 or not isinstance(j, dict) or not j.get("ok"):
+            errors.append(f"{t}: {(r.stderr or r.stdout).strip()[-160:] or f'exit {r.returncode}'}")
+        else:
+            done.append(t)
+    return done, errors
+
+
+def wake_orchestrator(data, run, task, round_n, hold):
+    """A short veto window for the orchestrator: one info message, held when --hold is set.
+    There is no pane here; the message is the wake."""
+    text = (f"review-handoff {task} round {round_n}: fix opened"
+            + ("; hold for veto" if hold else ""))
+    return run_bus(["send", "--data", data, "--run", run, "--task", task,
+                    "--kind", "info", "--from", "orch", "--to", "orch", "--text", text])
+
+
+def task_round_of(data, run, task):
+    """The task's current round, or 0 when the task cannot be read."""
+    r = subprocess.run(
+        [sys.executable, mk_state_cmd(), "--data", data, "--run", run, "task", "get", task],
+        capture_output=True, text=True)
+    try:
+        j = json.loads(r.stdout.strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError):
+        return 0
+    if r.returncode != 0 or not isinstance(j, dict) or not j.get("ok"):
+        return 0
+    return int((j.get("task") or {}).get("round") or 0)
+
+
+def review_round_of(path):
+    """The N in review-rN.md, or None."""
+    m = re.fullmatch(r"review-r(\d+)\.md", os.path.basename(path or ""))
+    return int(m.group(1)) if m else None
+
+
+def hold_path(data, run, task):
+    return os.path.join(data, "runs", run, "tasks", task, ".matrixkoder-handoff.json")
+
+
+def compose_brief(brief_path, fix):
+    """Append the FIX section to the brief that already exists. A missing brief starts
+    from templates/brief.md. Never replaces a brief the orchestrator already wrote."""
+    existing = ""
+    if brief_path and os.path.isfile(brief_path):
+        try:
+            existing = open(brief_path).read()
+        except OSError:
+            existing = ""
+    if not existing.strip():
+        tmpl = os.path.join(HERE, "..", "skills", "matrixkoder", "templates", "brief.md")
+        try:
+            existing = open(os.path.normpath(tmpl)).read()
+        except OSError:
+            existing = ""
+    body = existing.rstrip("\n")
+    if "## FIX (only for review findings)" in body:
+        body = body.split("## FIX (only for review findings)", 1)[0].rstrip("\n")
+    return (body + "\n\n" + fix) if body else fix
+
+
+def cmd_review_handoff(a):
+    """REQUEST CHANGES opens the fix round and sends the FIX brief to the builder through
+    the orchestrator. APPROVE only records the verdict. The reviewer never messages the builder.
+
+    Idempotent: acts only when the review's N equals the task's current round and no fix
+    round for that N exists yet. --hold records the pending handoff and nothing else; the
+    next call without --hold releases it.
+    """
+    task = opt(a, "--task")
+    if not task or not ID_RE.fullmatch(task):
+        fail("review-handoff needs a valid --task id")
+    data = opt(a, "--data") or cfg_data()
+    run = opt(a, "--run")
+    if not run or not ID_RE.fullmatch(run):
+        fail("review-handoff needs a valid --run id")
+    hold = "--hold" in a
+    min_sev = (opt(a, "--min", "LOW") or "LOW").upper()
+    if min_sev not in SEV_RANK:
+        fail("--min must be one of CRITICAL HIGH MEDIUM LOW")
+    path = opt(a, "--review") or review_path_for(data, run, task)
+    if not path or not os.path.isfile(path):
+        fail(f"no review file for {task}")
+    n = review_round_of(path)
+    if n is None:
+        fail("review file is not review-rN.md")
+    try:
+        text = open(path).read()
+    except OSError as e:
+        fail(f"review unreadable: {e}")
+    verdict = review_verdict(text)
+    if verdict == "APPROVE":
+        r = subprocess.run(
+            [sys.executable, mk_state_cmd(), "--data", data, "--run", run,
+             "task", "set", task, "verdict=approve", "--by", "review-handoff"],
+            capture_output=True, text=True)
+        out({"ok": True, "verdict": "APPROVE", "dispatched": False, "task": task,
+             "recorded": r.returncode == 0})
+        return
+    if verdict != "REQUEST CHANGES":
+        fail("review title has neither APPROVE nor REQUEST CHANGES")
+    cur = task_round_of(data, run, task)
+    if cur != n:
+        out({"ok": True, "dispatched": False, "task": task, "round": cur,
+             "reason": "already handed off" if cur > n else "review round is not the current round"})
+        return
+    findings = review_findings(text)
+    if not findings:
+        out({"ok": True, "dispatched": False, "task": task, "round": cur, "findings": 0,
+             "reason": "no findings; held for the orchestrator"})
+        return
+    pending = hold_path(data, run, task)
+    if hold:
+        # Record the pending handoff and nothing else: no round, no brief, no send.
+        blob = {"task": task, "run": run, "review": path, "round": n,
+                "min": min_sev, "cause": opt(a, "--cause", "verification gap")}
+        try:
+            os.makedirs(os.path.dirname(pending), exist_ok=True)
+            with open(pending, "w") as f:
+                json.dump(blob, f)
+        except OSError as e:
+            out({"ok": False, "error": f"hold write failed: {e}", "task": task})
+            return
+        out({"ok": True, "verdict": "REQUEST CHANGES", "dispatched": False, "held": True,
+             "task": task, "round": n, "findings": len(findings),
+             "reason": "held for veto"})
+        return
+    if os.path.isfile(pending):
+        try:
+            os.unlink(pending)
+        except OSError:
+            pass
+    cause = opt(a, "--cause", "verification gap")
+    rnd = subprocess.run(
+        [sys.executable, mk_state_cmd(), "--data", data, "--run", run,
+         "task", "round", task, "--kind", "fix", "--cause", cause, "--by", "review-handoff"],
+        capture_output=True, text=True)
+    try:
+        opened = json.loads(rnd.stdout.strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError):
+        opened = {"ok": False, "error": (rnd.stderr or rnd.stdout).strip()[-200:]}
+    if rnd.returncode != 0 or not opened.get("ok"):
+        out({"ok": False, "error": opened.get("error") or "task round failed", "task": task})
+        return
+    fix = render_fix_section(findings, min_sev)
+    brief_path = opened.get("brief")
+    written = compose_brief(brief_path, fix)
+    if brief_path:
+        try:
+            with open(brief_path, "w") as f:
+                f.write(written)
+        except OSError as e:
+            out({"ok": False, "error": f"brief write failed: {e}", "task": task})
+            return
+    sent, send_err = send_brief_over_bus(data, run, task, written, opened.get("round"))
+    fixed, fix_err = set_children_fix(data, run, task)
+    wake, wake_err = wake_orchestrator(data, run, task, opened.get("round"), False)
+    out({"ok": True, "verdict": "REQUEST CHANGES", "dispatched": True, "task": task,
+         "round": opened.get("round"), "kind": "fix", "brief": brief_path,
+         "findings": len(findings), "required": sum(
+             1 for f in findings if SEV_RANK[f["severity"]] <= SEV_RANK[min_sev]),
+         "children": fixed, "sent": bool(sent and not send_err),
+         "held": False, "wake": bool(wake and not wake_err),
+         **({"send_error": send_err} if send_err else {}),
+         **({"children_error": "; ".join(fix_err)} if fix_err else {}),
+         **({"wake_error": wake_err} if wake_err else {})})
+
+
+def cfg_data():
+    """The ambient data dir, for a review-handoff that passed no --data."""
+    try:
+        return mk_config.mk_state.resolve_data(None)
+    except Exception:
+        return os.path.abspath(".matrixkoder")
 
 
 def cmd_event():
@@ -1128,8 +1598,13 @@ def self_test():
                     "if os.path.exists(p_out):\n"
                     "    out = open(p_out).read()\n"
                     "elif cmd == 'token' and '--lane' in a:\n"
+                    "    import hashlib\n"
                     "    lane = a[a.index('--lane') + 1]\n"
-                    "    with open(os.path.join(lane, '.matrixkoder-bus.json'), 'w') as lf:\n"
+                    "    home = os.environ.get('MK_HOME') or os.environ.get('MATRIXKODER_HOME') or os.path.expanduser('~/.matrixkoder')\n"
+                    "    digest = hashlib.sha256(os.path.realpath(lane).encode('utf-8')).hexdigest()\n"
+                    "    dest = os.path.join(home, 'bus-lanes', digest + '.json')\n"
+                    "    os.makedirs(os.path.dirname(dest), exist_ok=True)\n"
+                    "    with open(dest, 'w') as lf:\n"
                     "        json.dump({'v': 1, 'url': 'http://127.0.0.1:9999', 'token': 'fake'}, lf)\n"
                     "    out = '{\"ok\": true, \"token\": \"fake\"}'\n"
                     "sys.stdout.write(out + chr(10))\n"
@@ -1845,8 +2320,10 @@ def self_test():
         assert r["ok"] is True and r["bus"] == {"ok": True, "url": "http://127.0.0.1:9999"}, r
         assert bus_calls() == [f"ensure --data {data} --run r1",
                                f"token --lane {lanes['HB']} --task HB --run r1 --data {data}"], bus_calls()
-        assert json.load(open(os.path.join(lanes["HB"], ".matrixkoder-bus.json")))["url"] == \
+        assert json.load(open(lane_token_file(lanes["HB"])))["url"] == \
             "http://127.0.0.1:9999"
+        # the token is not a coordination file inside the lane
+        assert not os.path.isfile(os.path.join(lanes["HB"], ".matrixkoder-bus.json"))
         # (b) a group arm (--tasks A,B): token's --task is the FIRST listed task
         open(bus_log, "w").write("")
         lanes["HG"] = os.path.join(tmp, "lane-hg")
@@ -1927,6 +2404,282 @@ def self_test():
         os.unlink(os.path.join(tmp, "bus_revoke_rc.txt"))
         os.unlink(os.path.join(tmp, "bus_revoke_out.txt"))
 
+        # --- the project store (D5A.2): verdict_for reads the store inside the per-lane lock ---
+        # self-hosting guard: every case above ran with no store and created none
+        assert not os.path.exists(os.path.join(data, "mk.db")), "an event created mk.db"
+        mks("store", "enable")
+        assert os.path.getsize(os.path.join(data, "mk.db")) > 0
+        # store-first: no lane status file, the tasks row + report artifact decide -> DONE, source=store
+        mks("task", "add", "--id", "S1", "--title", "store")
+        mks("task", "set", "S1", "status=building")
+        lanes["S1"] = os.path.join(tmp, "lane-s1")
+        g(repo, "worktree", "add", "-q", "--detach", lanes["S1"])
+        g(lanes["S1"], "commit", "-q", "--allow-empty", "-m", "feat(p1): store core")
+        td = os.path.join(data, "runs", "r1", "tasks", "S1")
+        open(os.path.join(td, "report-r1.md"), "w").write("# report\nstore\n")
+        mks("task", "round", "S1", "--kind", "build")
+        os.unlink(os.path.join(td, "report-r1.md"))   # only the artifact remains
+        mks("task", "set", "S1", "status=verifying")
+        open(pane_f, "w").write("> dispatch-s1\nquiet, no token\n")
+        open(status_f, "w").write("done")
+        arm("S1", phase="S1 R1", report="report.json", prompt_marker="dispatch-s1")
+        assert not os.path.exists(os.path.join(lanes["S1"], ".matrixkoder-status.json"))
+        r = event("done", tid="S1")
+        assert r["verdict"] == "DONE" and r["recorded"], r
+        s1 = [e for e in events() if e.get("task") == "S1" and "lane-watch" in (e.get("text") or "")][-1]["text"]
+        assert "source=store" in s1 and "source=status" not in s1, s1
+        # DONE still needs the commit: a store row of verifying with a non-matching subject is
+        # never DONE. decide() is what verdict_for feeds; the row comes from the store.
+        mks("task", "add", "--id", "S2", "--title", "store2")
+        mks("task", "set", "S2", "status=building")
+        mks("task", "round", "S2", "--kind", "build")
+        mks("task", "set", "S2", "status=verifying")
+        armed = {"run": "r1", "task": "S2", "phase": "S2 R1", "data": data}
+        st = lw.read_status(lanes["H1"], armed)  # the lane dir is irrelevant: the row is the channel
+        assert st and st["source"] == "store" and st["state"] == "done", st
+        h = {"state": "OK", "agent_status": "done", "last_change_min": 5}
+        state, ev = lw.decide(h, "abc chore: wip", re.compile("nomatch"), True, "", "S2 R1", 1, st, armed)
+        assert state == "STALL" and ev[-1] == "source=pane", (state, ev)
+
+        # fallback: the row is round 2, so phase S3 R1 has no row -> the status file decides
+        mks("task", "add", "--id", "S3", "--title", "fallback")
+        mks("task", "set", "S3", "status=building")
+        lanes["S3"] = os.path.join(tmp, "lane-s3")
+        g(repo, "worktree", "add", "-q", "--detach", lanes["S3"])
+        g(lanes["S3"], "commit", "-q", "--allow-empty", "-m", "feat(p1): file core")
+        open(os.path.join(lanes["S3"], "report.json"), "w").write("{}")
+        mks("task", "round", "S3", "--kind", "build")
+        mks("task", "round", "S3", "--kind", "fix")   # round 2: phase S3 R1 has no store row
+        mks("task", "set", "S3", "status=verifying")
+        open(pane_f, "w").write("> dispatch-s3\nquiet, no token\n")
+        open(status_f, "w").write("done")
+        arm("S3", phase="S3 R1", report="report.json", prompt_marker="dispatch-s3")
+        wstat("S3", "done", time.time() + 5)
+        r = event("done", tid="S3")
+        assert r["verdict"] == "DONE" and r["recorded"], r
+        s3 = [e for e in events() if e.get("task") == "S3" and "lane-watch" in (e.get("text") or "")][-1]["text"]
+        assert "source=status" in s3 and "source=store" not in s3, s3
+        # sweep reads the store too: a quiet lane whose row says done is DONE, source=store
+        mks("task", "add", "--id", "S4", "--title", "sweep")
+        mks("task", "set", "S4", "status=building")
+        lanes["S4"] = os.path.join(tmp, "lane-s4")
+        g(repo, "worktree", "add", "-q", "--detach", lanes["S4"])
+        g(lanes["S4"], "commit", "-q", "--allow-empty", "-m", "feat(p1): sweep core")
+        td = os.path.join(data, "runs", "r1", "tasks", "S4")
+        open(os.path.join(td, "report-r1.md"), "w").write("# report\n")
+        mks("task", "round", "S4", "--kind", "build")
+        os.unlink(os.path.join(td, "report-r1.md"))
+        mks("task", "set", "S4", "status=verifying")
+        open(pane_f, "w").write("quiet\n")
+        open(status_f, "w").write("idle")
+        arm("S4", phase="S4 R1", report="report.json")
+        r = cli("sweep", "--data", data)
+        v = {x["task"]: x for x in r["verdicts"]}
+        assert v.get("S4", {}).get("verdict") == "DONE", r
+        assert "source=store" in [e for e in events() if e.get("task") == "S4" and "lane-watch" in (e.get("text") or "")][-1]["text"]
+
+        # (D7B) the job hint calls the real function. The lookup uses the HERE path,
+        # so the cwd does not matter, and the arithmetic goes through selftest_jobs_hint.
+        os.environ.pop("MK_SELFTEST_JOBS", None)
+        saved_cwd = os.getcwd()
+        try:
+            os.chdir(tmp)
+            away = selftest_jobs_total(data)
+            os.chdir(os.path.join(tmp, "repo"))
+            home = selftest_jobs_total(data)
+        finally:
+            os.chdir(saved_cwd)
+        assert away == home and 1 <= away <= 16, (away, home)
+        for total, active, expect in ((4, 1, "4"), (4, 2, "2"), (4, 5, "1"),
+                                      (8, 1, "8"), (8, 2, "4"), (8, 5, "1")):
+            real_total = selftest_jobs_total(data)
+            got = selftest_jobs_hint(data, active=active)
+            assert got == str(max(1, real_total // active)), (got, real_total, active)
+            assert str(max(1, total // (active or 1))) == expect
+        os.environ["MK_SELFTEST_JOBS"] = "7"
+        try:
+            assert selftest_jobs_hint(data, active=1) == "7"
+        finally:
+            os.environ.pop("MK_SELFTEST_JOBS", None)
+        # a value outside 1..16 is refused by the same bound selftest.sh uses
+        # a value outside 1..16 is refused: the lookup is stubbed to print each one
+        real_here = HERE
+        for bad in (17, 0, -1, "abc"):
+            os.environ.pop("MK_SELFTEST_JOBS", None)
+            globals()["HERE"] = tmp
+            open(os.path.join(tmp, "mk-config.py"), "w").write(
+                "import json,sys\nprint(json.dumps({'ok':True,'value':%s}))\n" % json.dumps(bad))
+            assert selftest_jobs_total(data) == 4, bad
+        globals()["HERE"] = real_here
+
+        # (D7B) the bus is down here (the fake never listens), so --connect keeps the prompt
+        n0 = len(prompt_calls())
+        r = cli("dispatch", "--pane", pane_of("H1"), "--text", "the full prompt stays",
+                "--connect")
+        assert r["delivered"] is True, r
+        assert prompt_calls()[n0:][-1].endswith("the full prompt stays --wait --timeout 25000"), \
+            prompt_calls()[n0:]
+        n0 = len(prompt_calls())
+        r = cli("dispatch", "--pane", pane_of("H1"), "--text", "the full prompt stays")
+        assert prompt_calls()[n0:][-1].endswith("the full prompt stays --wait --timeout 25000"), \
+            prompt_calls()[n0:]
+
+        # (D7B R3) bus up: a real /health plus bus.json. The suite's bus is the fake, so
+        # "published" is the recorded send argv. No brief -> the full prompt and the reply names
+        # the error. A brief -> the doorbell. A send the fake refuses -> the full prompt again.
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        class _H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = b'{"ok": true, "status": "healthy"}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            def log_message(self, *a):
+                pass
+        _srv = ThreadingHTTPServer(("127.0.0.1", 0), _H)
+        threading.Thread(target=_srv.serve_forever, daemon=True).start()
+        # store enable earlier left mk.db. The bus home is $MK_HOME (mk-bus.root_bus_dir),
+        # not MATRIXKODER_HOME. Pin it for this block, then write bus.json AFTER arm:
+        # arm's ensure must not be the writer.
+        _saved_bus_home = os.environ.get("MK_HOME")
+        _bus_home = os.path.join(tmp, "home")
+        os.environ["MK_HOME"] = _bus_home
+        try:
+            _bus_dir = bus_dir_for(data)
+            assert _bus_dir == os.path.abspath(_bus_home), _bus_dir
+            os.makedirs(_bus_dir, exist_ok=True)
+            mks("task", "add", "--id", "NB", "--title", "no brief")
+            lanes["NB"] = os.path.join(tmp, "lane-nb")
+            g(repo, "worktree", "add", "-q", "--detach", lanes["NB"])
+            arm("NB")
+            open(os.path.join(_bus_dir, "bus.json"), "w").write(
+                json.dumps({"port": _srv.server_address[1]}))
+            assert bus_is_up(data) is True, (_bus_dir, open(os.path.join(_bus_dir, "bus.json")).read())
+            _td = os.path.join(data, "runs", "r1", "tasks", "NB")
+            os.makedirs(_td, exist_ok=True)
+            open(bus_log, "w").write("")
+            n0 = len(prompt_calls())
+            r = cli("dispatch", "--pane", pane_of("NB"), "--text", "the full prompt stays", "--connect")
+            assert r["delivered"] is True and r.get("publish_error"), r
+            assert prompt_calls()[n0:][-1].endswith("the full prompt stays --wait --timeout 25000"), \
+                prompt_calls()[n0:]
+            open(os.path.join(_td, "brief-r1.md"), "w").write("# the brief\nhello lane\n")
+            open(bus_log, "w").write("")
+            n0 = len(prompt_calls())
+            r = cli("dispatch", "--pane", pane_of("NB"), "--text", "the full prompt stays", "--connect")
+            assert r["delivered"] is True and "publish_error" not in r, r
+            _typed = prompt_calls()[n0:][-1]
+            assert "mk-builder.py connect" in _typed and "the full prompt stays" not in _typed, _typed
+            # mk.db is already present (store enable, above), so the send is kind task, not info
+            assert any("--kind task" in c and "kind:brief" in c for c in [" ".join(bus_calls())]), bus_calls()
+            # a refused send keeps the full prompt and names the error
+            open(os.path.join(tmp, "bus_send_rc.txt"), "w").write("2")
+            open(os.path.join(tmp, "bus_send_out.txt"), "w").write('{"ok": false, "error": "too big"}\n')
+            open(bus_log, "w").write("")
+            n0 = len(prompt_calls())
+            r = cli("dispatch", "--pane", pane_of("NB"), "--text", "the full prompt stays", "--connect")
+            assert r.get("publish_error") == "too big", r
+            assert prompt_calls()[n0:][-1].endswith("the full prompt stays --wait --timeout 25000"), \
+                prompt_calls()[n0:]
+            os.unlink(os.path.join(tmp, "bus_send_rc.txt"))
+            os.unlink(os.path.join(tmp, "bus_send_out.txt"))
+            os.unlink(os.path.join(_bus_dir, "bus.json"))
+        finally:
+            if _saved_bus_home is None:
+                os.environ.pop("MK_HOME", None)
+            else:
+                os.environ["MK_HOME"] = _saved_bus_home
+
+        # (D7B R3) store mode: mk.db present, so bus.json lives in the MK home, not the data dir.
+        # A stale <data>/bus.json must not win. A real store-mode bus, real acquire and arm.
+        open(os.path.join(data, "mk.db"), "w").write("")
+        _home = os.path.join(tmp, "mkhome")
+        os.makedirs(_home, exist_ok=True)
+        open(os.path.join(data, "bus.json"), "w").write(json.dumps({"port": 1}))
+        # no MK_BUS_DIR: a present mk.db resolves to the MK home, never the stale data-dir file
+        _saved_home = os.environ.get("MK_HOME")
+        os.environ["MK_HOME"] = _home
+        try:
+            assert bus_dir_for(data) == os.path.abspath(_home), bus_dir_for(data)
+            assert bus_is_up(data) is False
+            open(os.path.join(_home, "bus.json"), "w").write(
+                json.dumps({"port": _srv.server_address[1]}))
+            assert bus_is_up(data) is True  # the home bus, not the stale data-dir file
+        finally:
+            if _saved_home is None:
+                os.environ.pop("MK_HOME", None)
+            else:
+                os.environ["MK_HOME"] = _saved_home
+        _srv.shutdown()
+        os.unlink(os.path.join(data, "mk.db"))
+        os.unlink(os.path.join(data, "bus.json"))
+
+        # (D7B.2) review-handoff. The bus is the fake, so "sent" is the recorded argv.
+        rev_dir = os.path.join(data, "runs", "r1", "tasks", "RH")
+        os.makedirs(rev_dir, exist_ok=True)
+        mks("task", "add", "--id", "RH", "--title", "handoff")
+        mks("task", "round", "RH", "--kind", "build")
+        open(os.path.join(rev_dir, "review-r1.md"), "w").write(
+            "# RH review — REQUEST CHANGES\n\n## HIGH\n"
+            "- scripts/a.py:10 — leak — close it\n\n## LOW\n"
+            "- scripts/b.py:2 — nit — tidy\n")
+        open(bus_log, "w").write("")
+        r = cli("review-handoff", "--task", "RH", "--run", "r1", "--data", data, "--min", "medium")
+        assert r["ok"] is True and r["verdict"] == "REQUEST CHANGES" and r["dispatched"] is True, r
+        assert r["round"] == 2 and r["required"] == 1, r
+        brief = open(r["brief"]).read()
+        assert "## FIX" in brief and "[HIGH]" in brief and "not required" in brief and "[LOW]" in brief, brief
+        calls = bus_calls()
+        joined = " ".join(calls)
+        assert joined.startswith("send ") and "--from orch" in joined and "--kind info" in joined \
+            and "kind:brief" in joined, calls
+        # APPROVE records the verdict and dispatches nothing
+        mks("task", "add", "--id", "RA", "--title", "approve")
+        mks("task", "round", "RA", "--kind", "build")
+        ad = os.path.join(data, "runs", "r1", "tasks", "RA")
+        open(os.path.join(ad, "review-r1.md"), "w").write("# RA review — APPROVE\n\n## Verified\n- ok\n")
+        open(bus_log, "w").write("")
+        r = cli("review-handoff", "--task", "RA", "--run", "r1", "--data", data)
+        assert r["ok"] is True and r["verdict"] == "APPROVE" and r["dispatched"] is False, r
+        assert bus_calls() == [], bus_calls()
+        # --hold records the veto text and does not send the wake
+        mks("task", "add", "--id", "HH", "--title", "hold")
+        mks("task", "round", "HH", "--kind", "build")
+        hd = os.path.join(data, "runs", "r1", "tasks", "HH")
+        open(os.path.join(hd, "review-r1.md"), "w").write(
+            "# HH review — REQUEST CHANGES\n\n## CRITICAL\n- x:1 — boom — stop\n")
+        open(bus_log, "w").write("")
+        r = cli("review-handoff", "--task", "HH", "--run", "r1", "--data", data, "--hold")
+        assert r["ok"] is True and r["held"] is True and r["dispatched"] is False, r
+        hh = next(t for t in json.load(open(os.path.join(data, "runs", "r1", "run.json")))["tasks"]
+                  if t["id"] == "HH")
+        assert hh["round"] == 1, hh  # nothing opened while held
+        assert bus_calls() == [], bus_calls()
+        # the second call releases: one round, one send
+        r = cli("review-handoff", "--task", "HH", "--run", "r1", "--data", data)
+        assert r["ok"] is True and r["dispatched"] is True and r["round"] == 2, r
+        # a second run on the same review opens nothing more
+        r = cli("review-handoff", "--task", "RH", "--run", "r1", "--data", data)
+        assert r["ok"] is True and r["dispatched"] is False and r["reason"] == "already handed off", r
+        # a review with no parseable findings is held, not opened
+        mks("task", "add", "--id", "RZ", "--title", "empty")
+        mks("task", "round", "RZ", "--kind", "build")
+        zd = os.path.join(data, "runs", "r1", "tasks", "RZ")
+        open(os.path.join(zd, "review-r1.md"), "w").write(
+            "# RZ review — REQUEST CHANGES\n\nno headings here\n")
+        r = cli("review-handoff", "--task", "RZ", "--run", "r1", "--data", data)
+        assert r["ok"] is True and r["dispatched"] is False and r["findings"] == 0, r
+        # the template's own combined heading is not a severity heading
+        assert review_findings("## CRITICAL / HIGH / MEDIUM / LOW\n- a:1 — p — f\n") == []
+        # a wrapped bullet keeps its continuation
+        got = review_findings("## HIGH\n- a:1 — p —\n  the rest of it\n")
+        assert got == [{"severity": "HIGH", "text": "a:1 — p — the rest of it"}], got
+        # an odd id is refused
+        r = cli("review-handoff", "--task", "../x", "--run", "r1", "--data", data, code=2)
+        assert r["ok"] is False, r
+
         srv.shutdown()
         srv.server_close()
     finally:
@@ -1951,6 +2704,8 @@ def main():
             return cmd_sweep(rest)
         if cmd == "disarm":
             return cmd_disarm(rest)
+        if cmd == "review-handoff":
+            return cmd_review_handoff(rest)
     except SystemExit:
         raise
     except Exception as e:  # never die silently: one JSON line with the failure

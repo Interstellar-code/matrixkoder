@@ -11,6 +11,16 @@ Do NOT touch: <list>
 
 ## Tests (must exercise real code)
 <required tests, stated as acceptance ("Back with a dirty draft + Cancel keeps the draft"). Mock only the network edge (fetch / engine client), never the module under test. For every new client call, the server route must exist and be tested. Each fix/guard test must fail on the old code: <which tests>; prove it with the mk-builder skill's proof method (reference/lane-rules.md R13) — follow it as written.>
+The plugin test runtime cannot read files or spawn processes, so a TS test cannot check drift against a script directly: commit a generated JSON beside the fixture and add a `scripts/*-drift.py --self-test` that checks it against the real sources.
+Test guidance (mk-store-r1; keep this short):
+- A fixture of an external command (a CLI, a bus route, a tool) is CAPTURED from the real command, with its source noted, never hand-written. D8B called `mk-bus.py pending --json`, a flag that does not exist, and the tests passed on a hand-written payload.
+- A timing bound scales from a measured baseline (one spawn plus one round trip) or counts calls. A fixed wall-clock second failed 1 run in 3 under load (B1, W1, X1, D7).
+- Show each new test FAILING when the thing it checks is broken (a mutation, or the old file via `git show <sha>:<path>`). A test that passes on the old code is a regression guard and must say so. A1 `_tool_block` was dead code with green tests.
+- The plugin test runtime cannot read files or spawn processes (todo 29): inject the runner, and check a committed generated fixture with `scripts/*-drift.py --self-test` against the real sources.
+- Run the full suite from the python3 on PATH (3.14, not a 3.9 system python: no `tomllib`). Name any failing suite from the output file before reporting.
+
+## Real inputs
+<Name the REAL fixtures the tests must use: a copy of real run directories, real pane footers or API responses, the production code path with environment variables unset, forward references from the real plan. Require at least one test that runs the production path. Made-up data alone is not enough when real data exists.>
 
 ## Commands (wait for each)
 - Install: `<cmd>`
@@ -18,6 +28,8 @@ Do NOT touch: <list>
 - Types: `<typecheck cmd>` must stay at **<baseline>**; nothing new in <owned paths>
 - Lint/format ONLY changed files: `<lint cmd> <files>`, `<format cmd> <files>` — never repo-wide
 - Banned commands (repo list): <banned commands>
+- Start each finite check detached with its output in a file and the exit code appended (`cmd > out.txt 2>&1; echo EXIT:$? >> out.txt`), then in the SAME turn wait with a bounded loop (`until grep -q '^EXIT:' out.txt; do sleep 5; done; tail -n 5 out.txt`, upper bound 20 minutes; print a message if it expires) and never end a turn while a job you started is still running; read every result before committing, quote its last line, never start servers.
+- Run the full suite once before DONE and quote its summary line (the `selftest: N run, M failed` line the repo's suite prints). A red full suite means the round is not done even if the scoped tests pass.
 
 ## Parallel parts (default ON)
 <Name the separable parts and who takes them, for example "tests and fixtures: helper 1; docs: helper 2; the shared hot file and the integration: you". The rules for helpers (todo list first, only the lead runs the gates, the report section) are in the mk-builder skill, reference/lane-rules.md R9. Write "none, because <reason>" only when the plan turns the flag off.>

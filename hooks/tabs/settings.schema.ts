@@ -165,6 +165,20 @@ export const SETTINGS_SCHEMA = {
       "type": "seg"
     },
     {
+      "default": "verify",
+      "editable": true,
+      "key": "session.todo_done_status",
+      "scope": "child",
+      "type": "seg"
+    },
+    {
+      "default": 3,
+      "editable": true,
+      "key": "session.selftest_jobs_total",
+      "scope": "child",
+      "type": "num"
+    },
+    {
       "default": true,
       "editable": true,
       "key": "session.reuse_reviewer",
@@ -221,11 +235,25 @@ export const SETTINGS_SCHEMA = {
       "type": "bool"
     },
     {
+      "default": [],
+      "editable": true,
+      "key": "picks.codex",
+      "scope": "models",
+      "type": "list"
+    },
+    {
       "default": true,
       "editable": false,
       "key": "agents.agy.available",
       "scope": "agents",
       "type": "bool"
+    },
+    {
+      "default": [],
+      "editable": true,
+      "key": "picks.agy",
+      "scope": "models",
+      "type": "list"
     },
     {
       "default": true,

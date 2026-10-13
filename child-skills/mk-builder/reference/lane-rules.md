@@ -44,7 +44,8 @@ checkable contract. Rules whose remainder stays per-brief say **(B)** and carry 
   background task or background job and wait on it.
   **Why:** background tasks stall lanes and hide progress — a mode spun on its own background
   tasks for 10+ min with the work uncommitted (`skills/matrixkoder/templates/brief.md:24`;
-  `skills/matrixkoder/reference/lessons.md:26`, #22).
+  `skills/matrixkoder/reference/lessons.md:26`, #22). A finite check that must be detached is
+  R31: start it, then wait for it in the same turn.
 
 - **R4.** Never run the brief's banned commands — at minimum anything that starts a dev server,
   boots shared services, deploys, or restarts one.
@@ -91,7 +92,8 @@ checkable contract. Rules whose remainder stays per-brief say **(B)** and carry 
   `phases_done` mirror it so the dashboard shows lane progress
   (`/Users/rohits/Development/matrixkoder/.matrixkoder/plans/mk-improvements.md` item 11, open).
   **Check:** the todo list exists before the first file write. **(B)** the task skeleton it
-  mirrors — R27.
+  mirrors — R27. A reviewer or builder never sends a message to another lane directly; every
+  lane-to-lane message passes the orchestrator (R30).
   **Subagents (user, 2026-10-12):** every subagent you start does the same: its prompt begins
   "first write your own todo list with the todo tool, one item per step, one in_progress at a
   time". In 24 h of OpenCode sessions the lead sessions kept a todo list 28 of 32 times, the
@@ -111,7 +113,10 @@ checkable contract. Rules whose remainder stays per-brief say **(B)** and carry 
   you ran.
   **Why:** the orchestrator treats reports as claims and reruns the gates — an overstated report
   is caught and the work comes back (`skills/matrixkoder/templates/brief.md:29`;
-  `skills/matrixkoder/reference/safety.md:39`). **(B)** the report path — R23.
+  `skills/matrixkoder/reference/safety.md:39`). The report's `## Todo` section is lines
+  `[done|skipped|open] <text> - <evidence>`; `done` prints the counts (`todo N/M done K skipped`)
+  and warns rather than fails when the section is missing or an item is `open` without a reason.
+  **(B)** the report path — R23.
 
 - **R12.** End the round by printing `<T> R<n> DONE` (or `<T> R<n> BLOCKED: <question>`) as the
   LAST line of the reply, alone on its line, after the last commit and the report — never inside a
@@ -225,6 +230,23 @@ checkable contract. Rules whose remainder stays per-brief say **(B)** and carry 
 - **R29.** The FIX section — review findings with their numbers to cite in the report
   (`skills/matrixkoder/templates/brief.md:38-40`) — plus reviewer mockups and extra must-check
   items (`skills/matrixkoder/templates/review.md:3`). Feeds R15-R18.
+- **R30. (new)** A reviewer or builder never sends a message to another lane directly; every
+  lane-to-lane message passes the orchestrator.
+  **Why:** a lane that messages another lane routes work the orchestrator owns (R1). **Check:**
+  the lane transcript shows no send addressed to another lane.
+- **R31. (new)** Start each finite check detached with its output in a file and the exit code
+  appended (`cmd > out.txt 2>&1; echo EXIT:$? >> out.txt`), then in the SAME turn wait with a
+  bounded loop (`until grep -q '^EXIT:' out.txt; do sleep 5; done; tail -n 5 out.txt`, upper
+  bound 20 minutes; print a message if it expires) and never end a turn while a job you started
+  is still running. Read every result before committing. Never start servers (R4).
+  **Why:** OpenCode and AGY panes are not woken when a background job ends, so a builder that
+  ends its turn with the job still running sits idle until someone nudges it; Claude Code panes
+  are woken. Ending the turn used to strand the lane (`mk-improvements.md` item 59). **Check:**
+  the transcript shows the wait loop in the same turn as the start, and `done` warns when a
+  lane child is still running.
+
+- **R32. (new)** Explore with `rtk grep`, `rtk read`, `rtk ls` and `rtk git status|log` when `rtk` is on PATH; if it is not, skip it silently and use the raw command. Use raw output, or `rtk proxy <cmd>`, for any text a decision reads exactly: mk-state, mk-lane, mk-bus and mk-builder JSON, `git diff --stat`, `git log --oneline` subjects, the selftest summary line, and failing test names. Never `rtk test` (it drops failing test names). The guard treats `rtk` and `rtk proxy` as wrappers, so a banned command stays banned inside them (R4). Codex is never a builder.
+  **Why:** grep, reads and diffs are where a builder's tokens go, and `rtk` cut those 62–73% (`mk-improvements.md` item 53); filters that rewrite JSON, subjects or the selftest line hide what the lane decides on (item 52). **Check:** decision text in the transcript is raw or `rtk proxy`, and no `rtk test`.
 
 ## 5. Research Part B mapping (S rows → rules)
 

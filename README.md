@@ -53,6 +53,9 @@ Full walkthrough: [docs/howto.md](docs/howto.md).
 - **Tools**: `mk_state` (read run state, limited writes) and `mk_usage` (refresh usage).
 - **Wake**: optionally submits a prompt when a lane needs attention. Off by default.
 - **herdr plugin**: event-driven lane verdicts from pane status changes, with a dashboard sweep backstop. See `docs/herdr-events.md`.
+- **Root bus** (`scripts/mk-bus.py`): one bus per MK home for builder `connect`/`read`/`todo`/`commit`/`report`; bus-down falls back to lane files.
+- **Kanban tab** (`hooks/tabs/kanban.tsx`, hotkey `k`): per-tick `mkdb.py cards --json`. **Waiting tab** (`hooks/tabs/waiting.tsx`): real pending asks.
+- **Catalog** (`scripts/mk-catalog.py`): `routes --json`, `model --pane <pane>` for routing.
 - **Wizard**: `/mk setup`.
 - **Agents**: `matrixkoder:effort-low|medium|high|max`, effort-pinned workers.
 
@@ -76,13 +79,13 @@ Per-repo settings live in `<data>/matrixkoder.yaml`; `/mk setup` and `scripts/mk
 | Path | Content |
 |---|---|
 | `skills/matrixkoder/` | `SKILL.md` loop; `reference/` (loop, pool-and-usage, safety, onboarding, lessons); `templates/` |
-| `scripts/` | `mk-state.py` (only writer of run state), `mk-plan.py` (parse/check/edit TOML plan files), `mk-lane.py` (reusable lane worktree slots), `mk-release.py` (changelog + version bump + tag), `mk-usage.py`, `lane-health.py`, `lane-watch.py`, `selftest.sh` |
+| `scripts/` | `mk-state.py` (only writer of run state), `mkdb.py` (SQLite stores, `cards --json`), `mk-bus.py` (root bus), `mk-catalog.py` (`routes --json`, `model --pane`), `mk-plan.py` (parse/check/edit/approve TOML plan files; approve archives to `plans/archive/<plan>-v<n>.md`), `mk-lane.py` (reusable lane worktree slots), `mk-release.py` (changelog + version bump + tag), `mk-usage.py`, `lane-health.py`, `lane-watch.py`, `selftest.sh` |
 | `agents/` | effort-pinned workers |
-| `hooks/` | dashboard, wizard, guards, status chip, wake and tools (TypeScript) |
+| `hooks/` | dashboard, wizard, guards, status chip, wake and tools (TypeScript); tabs `kanban.tsx` (hotkey `k`) and `waiting.tsx` |
 | `types/` | plugin API types |
 | `docs/` | plan, spikes, state schema, dashboard design, user guide |
 
-Project data lives in `<repo>/.matrixkoder/` (or `~/.matrixkoder/projects/<slug>/`). Global state lives in `~/.matrixkoder/` (`usage.json`, `projects.json`, `locks/`).
+Project data lives in `<repo>/.matrixkoder/` today; `~/.matrixkoder/projects/<slug>/` is the home mode that lands after the data move (DM, still to come). Global state lives in `~/.matrixkoder/` (`usage.json`, `projects.json`, `locks/`). `~/.matrixkoder/projects.json` is still the repo→data_dir map (dual-written with the root store until D9). `scripts/skill-check.py` does not exist.
 
 ## Development
 

@@ -226,6 +226,19 @@ async function detect($: EngineInterface, options: PluginOptions): Promise<MkWiz
     d.gitignore = !d.gitignoreHas
     d.qaFrontend = pkg != null && /"(react|vue|svelte|next|vite|@tanstack\/react-start)"/.test(pkg)
   }
+  // Default to home mode (`<globalDir>/projects/<slug>/`) for a repo that has neither a
+  // data dir nor a project layout yet. A repo that already builds (a package.json, a
+  // pyproject, a Makefile) keeps repo mode, and so does one that already has
+  // `<repo>/.matrixkoder`. Registering the project in the root store needs a CLI that does
+  // not exist (`register_project` is a function in mk-state.py, not a command), so the
+  // wizard still only writes projects.json.
+  if (d.dataEnv == null && d.repo != null && d.globalDir != null) {
+    const repoData = await $.fs.exists(join(d.repo, '.matrixkoder')).catch(() => false)
+    const established = await $.fs.exists(join(d.repo, 'package.json')).catch(() => false)
+      || await $.fs.exists(join(d.repo, 'pyproject.toml')).catch(() => false)
+      || await $.fs.exists(join(d.repo, 'Makefile')).catch(() => false)
+    if (!repoData && !established) d.dataMode = 'home'
+  }
   const data = dataDirOf(d)
   d.existingYaml = data != null && (await $.fs.exists(join(data, 'matrixkoder.yaml')).catch(() => false))
   d.loaded = true
