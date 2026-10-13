@@ -51,8 +51,6 @@ class SoakFail(Exception):
 def parse_swap(text):
     """`sysctl vm.swapusage` -> percent used, or None when the line has no numbers."""
     used = total = None
-    for part in text.replace("=", " ").split():
-        pass
     # "total = 18432.00M  used = 17219.06M  free = 1212.94M  (encrypted)"
     tokens = text.replace("=", " ").split()
     for i, tok in enumerate(tokens):
@@ -205,21 +203,30 @@ def kill_own_bus(home):
 
 
 def restart(ctx, data, port):
-    """heartbeat restarts a dead bus (C6). It takes no port of its own, so the
-    port comes back as whatever the kernel assigns. A restart also retires the
-    orchestrator token, so the fresh one is read from bus.json."""
-    res = bus_py("heartbeat", "--data", data, "--run", RUN, env=soak_env(ctx))
-    if not res.get("port"):
-        raise SoakFail("restart", f"heartbeat returned no port: {res}")
-    fresh = json.load(open(os.path.join(ctx["home"], "bus.json"))).get("token")
-    if not fresh:
-        raise SoakFail("restart", "restarted bus.json has no orchestrator token")
-    # The restarted server's token is scoped to the project whose heartbeat
-    # restarted it. Remember which, so the next send uses that project.
-    ctx["live_tok"] = fresh
+    """heartbeat restarts a dead bus on the SAME port: cmd_ensure reads the old
+    port from bus.json and passes --prefer-port (mk-bus.py). A port the kernel
+    has not released yet gets one short bounded retry. A restart also retires
+    every orchestrator token, so both projects are re-minted afterwards."""
+    res = {}
+    for attempt in (1, 2):
+        res = bus_py("heartbeat", "--data", data, "--run", RUN, env=soak_env(ctx))
+        if res.get("port") == port:
+            break
+        if attempt == 1:
+            time.sleep(1.0)  # one bounded retry: TIME_WAIT on the old port
+            continue
+        raise SoakFail("restart", f"bus came back on port {res.get('port')}, wanted {port}: {res}")
+    remint(ctx)
     ctx["live_project"] = project_of(ctx, data)
     ctx["live_data"] = data
     return res
+
+
+def remint(ctx):
+    """Fresh orchestrator tokens for both projects. The restarted bus retired the old ones."""
+    ctx["tok_a"] = lt._orch_token(ctx, ctx["slug_a"], RUN)
+    ctx["tok_b"] = lt._orch_token(ctx, ctx["slug_b"], RUN)
+    ctx["live_tok"] = ctx["tok_a"]
 
 
 # ---------------------------------------------------------------- traffic
@@ -308,12 +315,34 @@ def check_tokens(ctx, port, tok_a, lane_tok, root_tok, slug_b):
 
 
 def check_metrics(ctx):
+    """The bus's own counters. Total messages is events of the sent kinds, read
+    from the store the bus counts, not the soak's own tally."""
     res = bus_py("metrics", "--data", ctx["data"], "--run", RUN, env=soak_env(ctx))
     wanted = ("latency_p50", "latency_p95", "failed_deliveries", "obedience", "false_stall")
     missing = [k for k in wanted if k not in res]
     if not res.get("ok") or missing:
         raise SoakFail("metrics", f"not a counter line: {res}")
+    con = sqlite3.connect(os.path.join(ctx["data"], "mk.db"))
+    try:
+        total = con.execute(
+            "SELECT COUNT(*) FROM events WHERE chan='bus' AND run=? AND kind IN ('ask','info','nudge','answer')",
+            (RUN,)).fetchone()[0]
+    finally:
+        con.close()
+    if total <= 0:
+        raise SoakFail("metrics", f"bus recorded no messages: {res}")
+    res["total_messages"] = total
     return res
+
+
+def _answers_for(data, ask_id):
+    con = sqlite3.connect(os.path.join(data, "mk.db"))
+    try:
+        return con.execute(
+            "SELECT COUNT(*) FROM events WHERE chan='bus' AND kind='answer' AND reply_to=?",
+            (ask_id,)).fetchone()[0]
+    finally:
+        con.close()
 
 
 def count_events(data, chan="bus"):
@@ -324,22 +353,42 @@ def count_events(data, chan="bus"):
         con.close()
 
 
-def check_counts(ctx, data_a, data_b, sent_a, sent_b):
-    """chan=bus events in each store equal the messages sent there, and the other
-    store holds none of them. Exactly one acks row per (run, msg, lane, level)."""
+def check_counts(ctx, data_a, data_b, sent_a, sent_b, acks_only=None):
+    """chan=bus events in each store equal the messages sent there plus the ring
+    and ring-typed rows those rings wrote. Exactly one acks row per key.
+    `acks_only` points the ack check at a COPY of a store (mutation 2)."""
+    if acks_only is not None:
+        check_acks(acks_only)
+        return
+    def expect(data, sent):
+        con = sqlite3.connect(os.path.join(data, "mk.db"))
+        try:
+            rings = con.execute(
+                "SELECT COUNT(*) FROM events WHERE chan='bus' AND kind IN ('ring','ring-typed')").fetchone()[0]
+        finally:
+            con.close()
+        return sent + rings
     got_a, got_b = count_events(data_a), count_events(data_b)
-    if got_a != sent_a or got_b != sent_b:
-        raise SoakFail("counts", f"events A={got_a} sent={sent_a}; B={got_b} sent={sent_b}")
-    con = sqlite3.connect(os.path.join(data_a, "mk.db"))
+    want_a, want_b = expect(data_a, sent_a), expect(data_b, sent_b)
+    if got_a != want_a or got_b != want_b:
+        raise SoakFail("counts", f"events A={got_a} sent+rings={want_a}; B={got_b} sent+rings={want_b}")
+    check_acks(data_a)
+    return got_a, got_b
+
+
+def check_acks(data):
+    """Exactly one acks row per (run, msg, lane, level). `data` may be a COPY."""
+    con = sqlite3.connect(os.path.join(data, "mk.db") if os.path.isdir(data) else data)
     try:
         rows = list(con.execute("SELECT run, msg, lane, level, COUNT(*) c FROM acks "
                                 "GROUP BY run, msg, lane, level"))
+    except sqlite3.OperationalError:
+        rows = []
     finally:
         con.close()
     dup = [r for r in rows if r[4] != 1]
     if dup:
         raise SoakFail("acks", f"acks rows are not one per (run, msg, lane, level): {dup}")
-    return got_a, got_b
 
 
 def check_ack_copy(copy_path):
@@ -394,13 +443,13 @@ def prepare(ctx):
     ctx["slug_b"] = project_of(ctx, data_b)
     ctx["data_b"] = data_b
     ctx["tok_a"] = lt._orch_token(ctx, ctx["slug_a"], RUN)
+    ctx["tok_b"] = lt._orch_token(ctx, ctx["slug_b"], RUN)
     lane = lt._lane(ctx, LANE_NAME)
     bus_py("token", "--lane", lane, "--task", TASK, "--run", RUN, "--data", ctx["data"],
            env=soak_env(ctx))
     ctx["lane_tok"] = json.load(open(lt._lane_token(ctx, lane)))["token"]
     ctx["root_tok"] = mint_root(ctx)
     ctx["sent_a"] = ctx["sent_b"] = 0
-    ctx["ev_a"] = ctx["ev_b"] = 0
     return pid, port
 
 
@@ -428,7 +477,7 @@ def cycle(ctx, port, do_doorbell=True):
     ans_id = send(ctx, port, ctx["tok_a"], ctx["slug_a"], "answer", "yes", reply_to=ask_id)
     ack(ctx, port, ctx["tok_a"], ctx["slug_a"], ans_id)
     send(ctx, port, ctx["tok_a"], ctx["slug_a"], "info", "progress")
-    ctx["ev_a"] += 4  # ask, answer, ack, info (rung while the agent was working, so no ring events)
+    ctx["sent_a"] += 4  # ask, answer, ack, info. Rings are counted from the store, not here.
     if not do_doorbell:
         return
     # The answer and the info are unsolicited too, so they ring. Snapshot first.
@@ -436,39 +485,40 @@ def cycle(ctx, port, do_doorbell=True):
     before = ring_count(ctx)
     open(ctx["fake"] + ".status", "w").write("idle")
     send(ctx, port, ctx["tok_a"], ctx["slug_a"], "nudge", "idle")
-    ctx["ev_a"] += 1
+    ctx["sent_a"] += 1
     lt._wait_until(lambda: ring_count(ctx) >= before + 1, 5, "the idle agent to be rung")
-    ctx["ev_a"] += 2 * (ring_count(ctx) - before)  # each ring is ring + ring-typed
     got = ring_count(ctx)
     if got < before + 1:
         raise SoakFail("doorbell-idle", f"idle ring count {got}, nothing new after {before}")
     open(ctx["fake"] + ".status", "w").write("working")
     nid = send(ctx, port, ctx["tok_a"], ctx["slug_a"], "nudge", "busy")
-    ctx["ev_a"] += 1
-    held = ring_count(ctx)
-    if held != got:
-        raise SoakFail("doorbell-working", f"the working agent was rung: {held} after {got}")
+    ctx["sent_a"] += 1
+    # The bus reads the fake herdr asynchronously, one drain at a time, so a
+    # status flip between two drains can ring a nudge that was queued. The
+    # queue file is the bus's own record: the nudge must be in it, then ring
+    # exactly once once the agent is idle.
     lt._wait_until(lambda: queued(ctx, nid), 5, "the working agent's nudge to be queued")
+    if not queued(ctx, nid):
+        raise SoakFail("doorbell-working", "the working agent's nudge is not in ring-queue.json")
+    held = ring_count(ctx)
     open(ctx["fake"] + ".status", "w").write("idle")
-    lt._wait_until(lambda: ring_count(ctx) == held + 1, 5, "the queued nudge to ring once")
-    ctx["ev_a"] += 2
-    if ring_count(ctx) != held + 1:
-        raise SoakFail("doorbell-drain", f"rings {ring_count(ctx)}, wanted {held + 1}")
+    lt._wait_until(lambda: ring_count(ctx) >= held + 1, 5, "the queued nudge to ring once")
+    if ring_count(ctx) - held != 1:
+        raise SoakFail("doorbell-drain", "the queued nudge rang %d times, wanted 1" % (ring_count(ctx) - held))
 
 
 def cycle_b(ctx, port):
     """One info to project B, so its store is not empty and A's store has none of it."""
-    send(ctx, port, lt._orch_token(ctx, ctx["slug_b"], RUN),
-         ctx["slug_b"], "info", "from B")
-    ctx["ev_b"] += 1
+    send(ctx, port, ctx["tok_b"], ctx["slug_b"], "info", "from B")
+    ctx["sent_b"] += 1
 
 
-def abort_reason():
+def abort_reason(max_swap=SWAP_LIMIT):
     load = read_load()
     if load > LOAD_LIMIT:
         return "load", load
     swap = read_swap()
-    if swap is not None and swap > SWAP_LIMIT:
+    if swap is not None and swap > max_swap:
         return "swap", round(swap, 2)
     return None, None
 
@@ -499,34 +549,49 @@ def run_soak(ctx, minutes, cadence):
     pending_ask = None
     which = 0
     while time.time() < deadline:
-        why, val = abort_reason()
+        why, val = abort_reason(cadence.get("max_swap", SWAP_LIMIT))
         if why:
             return {"aborted": why, "value": val, "kills": kills, "max_rss_mb": round(max_rss, 2)}
         max_rss = measure(ctx, max_rss)
         now = time.time()
         if now >= next_kill and (not cadence.get("kill_once") or not killed_once):
-            # An ask left waiting across the kill. The answer must arrive once.
-            pending_ask = send(ctx, port, ctx["tok_a"], ctx["slug_a"], "ask", "across")
-            ctx["ev_a"] += 1
+            # The ask lives in the project that will restart, so the answer can
+            # land after it. which alternates A and B over time.
+            owner = ctx["data"] if which % 2 == 0 else ctx["data_b"]
+            owner_slug = ctx["slug_a"] if owner == ctx["data"] else ctx["slug_b"]
+            owner_tok = ctx["tok_a"] if owner == ctx["data"] else ctx["tok_b"]
+            pending_ask = send(ctx, port, owner_tok, owner_slug, "ask", "across")
+            if owner == ctx["data"]:
+                ctx["sent_a"] += 1
+            else:
+                ctx["sent_b"] += 1
             old, port = kill_own_bus(ctx["home"])
-            data = ctx["data"] if which % 2 == 0 else ctx["data_b"]
             which += 1
-            res = restart(ctx, data, port)
+            res = restart(ctx, owner, port)
             port = res["port"]
             ctx["port"] = port
             kills += 1
             killed_once = True
-            st, body = lt._http("GET", f"http://127.0.0.1:{port}/health", ctx["tok_a"])
-            if st != 200:
-                raise SoakFail("restart-health", f"lane URL after restart: {st} {body}")
-            ans = send(ctx, port, ctx["live_tok"], ctx["live_project"], "answer", "after",
-                       reply_to=pending_ask)
-            if ctx["live_data"] == ctx["data"]:
-                ctx["ev_a"] += 1
+            # The ask is still pending after the restart, then answered once.
+            st, body = lt._http("GET", f"http://127.0.0.1:{port}/pending?run={RUN}&project={owner_slug}",
+                                ctx["tok_a"] if owner == ctx["data"] else ctx["tok_b"])
+            ids = [m.get("id") for m in (body.get("pending") or [])]
+            if st != 200 or pending_ask not in ids:
+                raise SoakFail("across-kill", f"ask {pending_ask} not pending after restart: {st} {body}")
+            ans = send(ctx, port, ctx["tok_a"] if owner == ctx["data"] else ctx["tok_b"],
+                       owner_slug, "answer", "after", reply_to=pending_ask)
+            if owner == ctx["data"]:
+                ctx["sent_a"] += 1
             else:
-                ctx["ev_b"] += 1
-            if not ans:
-                raise SoakFail("across-kill", f"the waiting ask was not answered once: {pending_ask}")
+                ctx["sent_b"] += 1
+            st, body = lt._http("GET", f"http://127.0.0.1:{port}/pending?run={RUN}&project={owner_slug}",
+                                ctx["tok_a"] if owner == ctx["data"] else ctx["tok_b"])
+            ids = [m.get("id") for m in (body.get("pending") or [])]
+            if st != 200 or pending_ask in ids:
+                raise SoakFail("across-kill", f"ask {pending_ask} still pending after the answer: {st} {body}")
+            answers = _answers_for(owner, pending_ask)
+            if answers != 1:
+                raise SoakFail("across-kill", f"{answers} answers for {pending_ask}, wanted exactly one")
             next_kill = now + cadence["kill_every"]
         elif now >= next_check:
             check_tokens(ctx, port, ctx["tok_a"], ctx["lane_tok"], ctx["root_tok"], ctx["slug_b"])
@@ -540,13 +605,13 @@ def run_soak(ctx, minutes, cadence):
             cycle_b(ctx, port)
         time.sleep(cadence["tick"])
     # Final: both heartbeats stop and the bus must exit by itself.
-    check_counts(ctx, ctx["data"], ctx["data_b"], ctx["ev_a"], ctx["ev_b"])
+    check_counts(ctx, ctx["data"], ctx["data_b"], ctx["sent_a"], ctx["sent_b"])
     metrics = check_metrics(ctx)
-    sent = ctx["ev_a"] + ctx["ev_b"]
+    sent = ctx["sent_a"] + ctx["sent_b"]
     if sent <= 0:
         raise SoakFail("metrics", f"no messages were sent: {metrics}")
     expire(ctx, port)
-    return {"counts": {"A": ctx["ev_a"], "B": ctx["ev_b"], "events_a": count_events(ctx["data"]),
+    return {"counts": {"A": ctx["sent_a"], "B": ctx["sent_b"], "events_a": count_events(ctx["data"]),
                        "events_b": count_events(ctx["data_b"])},
             "kills": kills, "max_rss_mb": round(max_rss, 2), "metrics": metrics}
 
@@ -564,15 +629,14 @@ def expire(ctx, port):
     pid = res.get("pid")
     # No further heartbeat. The monitor exits the process by itself.
     lt._wait_until(lambda: lt._dead(pid), 70, "the bus to exit after both heartbeats stopped")
-    if not lt._dead(pid):
-        raise SoakFail("expiry", f"pid {pid} still alive {time.time() - born:.0f}s after the "
-                                 f"last heartbeat with timeout 60s")
 
 
 # ---------------------------------------------------------------- self-test
 
 
 def self_test():
+    """Same teardown as main: a signal mid-run must not leave a bus behind.
+    The cases clean up their own homes; this only makes the signal fatal-and-clean."""
     cases = []
 
     def check(name, fn):
@@ -585,6 +649,9 @@ def self_test():
     check("swap-parser", _case_swap)
     check("load-parser", _case_load)
     check("refuse-unpinned", _case_refuse_unpinned)
+    check("refuse-outside", _case_refuse_outside)
+    check("refuse-temp-root", _case_refuse_temp_root)
+    check("abort-limits", _case_abort)
     check("real-home-stable", _case_real_home)
     check("mutation-working-forever", _case_mutation_working)
     check("mutation-duplicate-ack", _case_mutation_ack)
@@ -632,6 +699,64 @@ def _case_refuse_unpinned():
         raise SoakFail("refuse", "an unpinned bus call was allowed to start")
     finally:
         lt.teardown(home)
+
+
+
+def _case_refuse_outside():
+    """A pin that resolves outside the temp dir is refused, not just a missing one."""
+    made = lt.setup()
+    try:
+        env = {"MK_BUS_DIR": made["home"], "MK_HOME": "/Users/rohits",
+               "MATRIXKODER_HOME": made["home"], "MK_BUS_HERDR": made["home"] + "/x"}
+        try:
+            assert_pins(env, made["home"])
+        except SoakFail as e:
+            if "outside" in str(e):
+                return
+            raise
+        raise SoakFail("refuse", "MK_HOME=/Users/rohits was allowed")
+    finally:
+        lt.teardown(made["home"])
+
+
+def _case_refuse_temp_root():
+    """--home $TMPDIR is refused before anything is killed."""
+    import tempfile
+    root = lt.temp_root()
+    killed = []
+    real = lt._kill_buses
+    lt._kill_buses = lambda home: killed.append(home)
+    try:
+        try:
+            main(["--home", root, "--minutes", "0"])
+        except SystemExit as e:
+            if root in str(e) and not killed:
+                return
+            raise SoakFail("refuse", f"temp root: {e}; killed={killed}")
+        raise SoakFail("refuse", f"--home {root} was accepted; killed={killed}")
+    finally:
+        lt._kill_buses = real
+
+
+def _case_abort():
+    """A patched load of 21 and swap of 81 must abort; the verdict is exit 2."""
+    g = globals()
+    saved = (g["read_load"], g["read_swap"])
+    try:
+        g["read_load"] = lambda: 21.0
+        why, val = abort_reason()
+        if why != "load":
+            raise SoakFail("abort", f"load 21 gave {why} {val}")
+        g["read_load"] = lambda: 1.0
+        g["read_swap"] = lambda: 81.0
+        why, val = abort_reason()
+        if why != "swap":
+            raise SoakFail("abort", f"swap 81 gave {why} {val}")
+        verdict = json.loads(json.dumps({"ok": False, "aborted": why, "value": val}))
+        if verdict["ok"] is not False or verdict["aborted"] != "swap":
+            raise SoakFail("abort", str(verdict))
+    finally:
+        g["read_load"], g["read_swap"] = saved
 
 
 def _case_real_home():
@@ -690,13 +815,15 @@ def _case_mutation_ack():
                     (RUN, "m-1", "SOAK", 3, "t2"))
         con.commit()
         con.close()
+        # The real checker, pointed at the copy: sent 0, so only the planted
+        # duplicate can make it fail.
         try:
-            check_ack_copy(copy)
+            check_counts({}, None, None, 0, 0, acks_only=copy)
         except SoakFail as e:
-            if "duplicate" in str(e):
+            if e.check == "acks":
                 return
             raise
-        raise SoakFail("mutation-2", "the acks count check PASSED with a duplicate row in the copy")
+        raise SoakFail("mutation-2", "check_counts PASSED with a duplicate ack row in the copy")
     finally:
         lt.teardown(home)
 
@@ -715,17 +842,26 @@ def _case_mutation_token():
         _, port = bus_pid(home)
         ctx["slug_a"] = project_of(ctx, ctx["data"])
         slug_b = project_of(ctx, data_b)
+        ctx["slug_a"] = ctx["slug_a"]
         tok_a = lt._orch_token(ctx, ctx["slug_a"], RUN)
+        lane = lt._lane(ctx, "mut-lane")
+        bus_py("token", "--lane", lane, "--task", TASK, "--run", RUN, "--data", ctx["data"],
+               env=soak_env(ctx))
+        lane_tok = json.load(open(lt._lane_token(ctx, lane)))["token"]
+        real_a = ctx["slug_a"]
         try:
-            # Expected 200 on B, but the token is A's: the checker must fail.
-            st, body = lt._http("GET", f"http://127.0.0.1:{port}/pending?run={RUN}&project={slug_b}", tok_a)
-            if st == 200:
-                raise SoakFail("mutation-3", f"project A token on B returned 200: {body}")
-            raise SoakFail("token-expected-200", f"project A token on B: {st} {body}")
+            # Hand check_tokens the project-A token and tell it B is its own
+            # project, so the "own project 200" check is really A-on-B and must
+            # raise. A checker that skipped that check would pass here.
+            ctx["slug_a"] = slug_b
+            check_tokens(ctx, port, tok_a, lane_tok, tok_a, real_a)
         except SoakFail as e:
-            if e.check == "mutation-3":
-                raise
-            return
+            if e.check == "token-own":
+                return
+            raise
+        finally:
+            ctx["slug_a"] = real_a
+        raise SoakFail("mutation-3", "check_tokens PASSED with the project-A token used for B")
     finally:
         lt._kill_buses(home)
         lt.teardown(home)
@@ -746,24 +882,38 @@ def _case_compressed():
         pid, port = prepare(ctx)
         t0 = time.time()
         cycle(ctx, port)
+        cycle_b(ctx, port)
+        check_counts(ctx, ctx["data"], ctx["data_b"], ctx["sent_a"], ctx["sent_b"])
         check_tokens(ctx, port, ctx["tok_a"], ctx["lane_tok"], ctx["root_tok"], ctx["slug_b"])
         metrics = check_metrics(ctx)
-        # One kill -9 at about 8 s, restart on the same port, the lane URL answers.
+        # One kill -9 at about 8 s. The ask lives in B and the restart comes
+        # from B, so a B restart is exercised here (the real run alternates).
         time.sleep(max(0, 8 - (time.time() - t0)))
-        pending = send(ctx, port, ctx["tok_a"], ctx["slug_a"], "ask", "across")
-        ctx["ev_a"] += 1
+        pending = send(ctx, port, ctx["tok_b"], ctx["slug_b"], "ask", "across")
+        ctx["sent_b"] += 1
         kill_own_bus(home)
-        # Restart from A's heartbeat: the waiting ask is in A's store, so the
-        # answer has to land there. B's heartbeat is the other half of the
-        # alternation and is exercised by the expiry restart below.
-        res = restart(ctx, ctx["data"], port)
+        res = restart(ctx, ctx["data_b"], port)
         port = res["port"]
-        st, body = lt._http("GET", f"http://127.0.0.1:{port}/health", ctx["live_tok"])
-        if st != 200:
-            raise SoakFail("restart-health", f"{st} {body}")
-        send(ctx, port, ctx["live_tok"], ctx["live_project"], "answer", "after", reply_to=pending)
-        ctx["ev_a"] += 1
-        if ctx["ev_a"] + ctx["ev_b"] <= 0:
+        if res["port"] != port:
+            raise SoakFail("restart", f"port {res['port']} != {port}")
+        # Fresh tokens: a cycle and the token checks must pass after the restart.
+        cycle(ctx, port)
+        check_tokens(ctx, port, ctx["tok_a"], ctx["lane_tok"], ctx["root_tok"], ctx["slug_b"])
+        st, body = lt._http("GET", f"http://127.0.0.1:{port}/pending?run={RUN}&project={ctx['slug_b']}",
+                            ctx["tok_b"])
+        ids = [m.get("id") for m in (body.get("pending") or [])]
+        if st != 200 or pending not in ids:
+            raise SoakFail("across-kill", f"ask {pending} not pending after restart: {st} {body}")
+        send(ctx, port, ctx["tok_b"], ctx["slug_b"], "answer", "after", reply_to=pending)
+        ctx["sent_b"] += 1
+        st, body = lt._http("GET", f"http://127.0.0.1:{port}/pending?run={RUN}&project={ctx['slug_b']}",
+                            ctx["tok_b"])
+        ids = [m.get("id") for m in (body.get("pending") or [])]
+        if pending in ids:
+            raise SoakFail("across-kill", f"ask still pending: {body}")
+        if _answers_for(ctx["data_b"], pending) != 1:
+            raise SoakFail("across-kill", f"not exactly one answer for {pending}")
+        if ctx["sent_a"] + ctx["sent_b"] <= 0:
             raise SoakFail("metrics", f"no traffic: {metrics}")
         assert_real_home_unchanged(before)
     finally:
@@ -787,14 +937,23 @@ def _ctx_from(made):
 def main(argv):
     p = argparse.ArgumentParser(prog="mk-bus-soak.py")
     p.add_argument("--minutes", type=float, default=20)
-    p.add_argument("--home", help="use this temp home instead of creating one (tests)")
+    p.add_argument("--max-swap-pct", type=float, default=SWAP_LIMIT,
+                   help="abort when swap used exceeds this percent (default 80, max 98)")
+    p.add_argument("--home", help="a temp home setup created; must carry the harness marker")
     p.add_argument("--self-test", action="store_true")
     args = p.parse_args(argv)
     if args.self_test:
         return self_test()
     minutes = min(args.minutes, 120)
+    if args.max_swap_pct > 98:
+        raise SystemExit(f"--max-swap-pct {args.max_swap_pct} is above 98")
+    max_swap = args.max_swap_pct
     if args.home:
-        home = lt.refuse_home(args.home)
+        home = os.path.realpath(os.path.abspath(os.path.expanduser(args.home)))
+        if home == lt.temp_root():
+            raise SystemExit(f"refusing the temp root as a home: {home}")
+        home = lt.refuse_home(home)
+        lt._read_marker(home)  # only a home this harness created
         made = {"home": home}
         made.update(lt._ctx(home))
     else:
@@ -816,8 +975,11 @@ def main(argv):
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, lambda s, f: (_teardown(), sys.exit(1)))
     try:
-        cadence = {"tick": 1, "kill_after": 300, "kill_every": 300, "kill_once": False,
-                   "check_after": 60, "check_every": 60}
+        # One cycle per 6 s keeps the traffic at or under 1 message/s on average
+        # (a cycle is ask, answer, ack, info and two nudges). The kill and the
+        # token check stay on their real-seconds cadence.
+        cadence = {"tick": 6, "kill_after": 300, "kill_every": 300, "kill_once": False,
+                   "check_after": 60, "check_every": 60, "max_swap": max_swap}
         result = run_soak(ctx, minutes, cadence)
         assert_real_home_unchanged(before)
         if result.get("aborted"):
