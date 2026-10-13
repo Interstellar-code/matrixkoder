@@ -544,6 +544,40 @@ def herdr_list_workspace_id(main, path):
     return None, "herdr worktree list printed no worktree list"
 
 
+def herdr_pane_agent(path, workspace_id, new_name):
+    """-> {"pane_agent": ..., "pane_agent_note": ...} | {}: the first live agent herdr lists in this
+    slot (cwd is the slot path or inside it, or its workspace is the slot's) whose name is not the
+    new round's — a leftover from an earlier round. Report only. Any herdr failure, timeout, bad
+    JSON or exit != 0 is {}: acquire's reply stays exactly what it was without this check."""
+    if herdr_bin() == "none":
+        return {}
+    try:
+        r = run_cmd([herdr_bin(), "agent", "list"], 3)
+        if r.returncode != 0:
+            return {}
+        real = os.path.realpath(path)
+        for line in reversed([x for x in r.stdout.splitlines() if x.strip()]):
+            try:
+                d = json.loads(line)
+                agents = d["result"]["agents"]
+            except (ValueError, KeyError, TypeError):
+                continue
+            for e in agents:
+                if not isinstance(e, dict) or e.get("name") == new_name:
+                    continue
+                cwd = os.path.realpath(e["cwd"]) if isinstance(e.get("cwd"), str) and e["cwd"] else None
+                if (cwd is not None and (cwd == real or cwd.startswith(real + os.sep))) or \
+                        (workspace_id not in (None, STALE_WS_ID) and e.get("workspace_id") == workspace_id):
+                    return {"pane_agent": {"name": e.get("name"), "agent": e.get("agent"),
+                                           "status": e.get("agent_status"), "pane_id": e.get("pane_id")},
+                            "pane_agent_note": "an agent from an earlier round is running here; "
+                                               "start the round in a fresh session"}
+            return {}
+    except (Fail, TypeError, AttributeError):
+        pass
+    return {}
+
+
 def ensure_lane_exclude(lane):
     """`.matrixkoder-*`, `.omo/` and the installed skill dir into the slot's info/exclude (same
     pattern as mk-lane-event.py): lane reports, agent state and the skill install never read as
@@ -576,11 +610,13 @@ def omc_ignored_ok(path, has_tracked):
     write `.omc/project-memory.json`, `.omc/sessions/`, `.omc/state/` and nested `src/…/.omc/`
     that gitignore hides. Only while that `.omc` tree tracks nothing: a tracked `.omc/plans/`
     makes an ignored sibling inside it user data. A non-`!!` line never reaches here, so a
-    modified tracked plan still counts. This check never deletes."""
+    modified tracked plan still counts. `.omc/state/` (HUD cache) is judged on its own subtree,
+    so tracked plans beside it do not make it user data. This check never deletes."""
     parts = path.strip().rstrip("/").split("/")
     if ".omc" not in parts:
         return False
-    omc = "/".join(parts[:parts.index(".omc") + 1])
+    i = parts.index(".omc")
+    omc = "/".join(parts[:i + (2 if parts[i + 1:i + 2] == ["state"] else 1)])
     return has_tracked is None or not has_tracked(omc)
 
 
@@ -1040,6 +1076,7 @@ def cmd_acquire(a, cfg, data, main):
                "workspace_id": rec["workspace_id"], "branch": rec["branch"],
                "agent": nms["agent"], "created": created, "install_needed": install_needed,
                "skill_installed": skill_dst, "guard_path": guard_dst}
+        out.update(herdr_pane_agent(rec["path"], rec["workspace_id"], nms["agent"]))
         if len(tasks) > 1:
             out["tasks"] = tasks
         for t in tasks:
@@ -2084,6 +2121,44 @@ def self_test():
         assert (unk["ok"], unk["slot"], unk["workspace_id"]) == (True, 5, None), unk
         assert "herdr worktree list" not in unk.get("warning", ""), unk  # unknown path: left silently
 
+        # acquire reports a leftover agent from herdr's `agent list` (report only): one whose cwd is
+        # in the slot, or whose workspace is the slot's, under another name than the new round's
+        def pane_acquire(tid, body, rc=0):
+            assert mk("release", "--slot", "5", "--integration", "mk/r1/integration")["ok"]
+            st("task", "add", "--id", tid, "--title", tid, "--run", "r1")
+            fk = os.path.join(tmp, "fake-agents-" + tid)
+            write(fk, "#!/usr/bin/env python3\nimport sys\n"
+                      f"sys.stdout.write({body!r})\nsys.exit({rc})\n")
+            os.chmod(fk, 0o755)
+            return mk("acquire", "--run", "r1", "--task", tid, "--base", "main", e=dict(env, MK_HERDR=fk))
+
+        def agents_json(*es):
+            return json.dumps({"id": "cli:agent:list", "result": {"agents": [
+                dict({"agent": "claude", "agent_status": "done", "pane_id": "wP5:p1"}, **e) for e in es]}}) + "\n"
+
+        lanes = read_lanes(data)
+        lanes["slots"]["5"]["workspace_id"] = "wP5"
+        write_lanes(data, lanes)
+        pa = pane_acquire("pa1", agents_json({"cwd": os.path.join(slot5, "sub"), "name": "old-build-r1",
+                                              "workspace_id": "wX"}))
+        assert (pa["ok"], pa["slot"], pa["created"]) == (True, 5, False), pa
+        assert pa["pane_agent"] == {"name": "old-build-r1", "agent": "claude", "status": "done",
+                                    "pane_id": "wP5:p1"}, pa
+        assert "fresh session" in pa["pane_agent_note"], pa
+        pa = pane_acquire("pa2", agents_json({"cwd": "/nowhere", "workspace_id": "wP5"}))  # by workspace; no name
+        assert pa["ok"] and pa["pane_agent"]["name"] is None, pa
+        pa = pane_acquire("pa3", agents_json({"cwd": slot5, "name": "pa3-build-r1"}))  # same name: this round's own
+        assert pa["ok"] and "pane_agent" not in pa and "pane_agent_note" not in pa, pa
+        pa = pane_acquire("pa4", agents_json({"cwd": "/nowhere", "name": "x", "workspace_id": "wOther"}))
+        assert pa["ok"] and "pane_agent" not in pa, pa  # an agent elsewhere
+        pa = pane_acquire("pa5", agents_json({"cwd": slot5, "name": "x"}), rc=1)  # herdr exit 1
+        assert pa["ok"] and "pane_agent" not in pa and "warning" not in pa, pa
+        pa = pane_acquire("pa6", "not json\n")
+        assert pa["ok"] and "pane_agent" not in pa and "warning" not in pa, pa
+        lanes = read_lanes(data)
+        lanes["slots"]["5"]["workspace_id"] = None
+        write_lanes(data, lanes)
+
         # 12 acquire without --base uses repo.integration_branch from the yaml; an explicit --base
         # still wins; a bad yaml value still fails check_ref
         assert mk("release", "--slot", "5", "--integration", "mk/r1/integration")["ok"]
@@ -2391,6 +2466,28 @@ def self_test():
         assert open(os.path.join(outside_s, "SENTINEL")).read() == "do not delete\n"
         assert mk_at(omc_data, env_store, "release", "--slot", "1",
                      "--integration", "mk/r1/integration")["ok"]
+
+        # L1 (.omc/state): the HUD cache is disposable even while `.omc/plans/` is tracked, at any
+        # depth; an ignored sibling in the tracked plans and a modified tracked file stay dirty.
+        hud = os.path.join(tmp, "hud-repo")
+        os.makedirs(os.path.join(hud, ".omc", "plans"))
+        gh = lambda *a: g("-c", "user.name=t", "-c", "user.email=t@t", *a, cwd=hud)
+        gh("init", "-q")
+        write(os.path.join(hud, ".gitignore"), ".omc/state/\n.omc/plans/x.md\n")
+        write(os.path.join(hud, ".omc", "plans", "p.md"), "plan\n")
+        gh("add", ".gitignore", ".omc/plans/p.md")
+        gh("commit", "-q", "-m", "init")
+        hud_cfg = {"disposable": [], "copy": []}
+        write(os.path.join(hud, ".omc", "state", "hud.json"), "{}\n")
+        write(os.path.join(hud, ".omc", "state", "sessions", "x", "hud-state.json"), "{}\n")
+        assert clean_state(hud, hud_cfg)[0], clean_state(hud, hud_cfg)
+        write(os.path.join(hud, ".omc", "plans", "x.md"), "ignored sibling\n")
+        ok, dirty = clean_state(hud, hud_cfg)
+        assert not ok and dirty == ["!! .omc/plans/x.md"], dirty
+        os.unlink(os.path.join(hud, ".omc", "plans", "x.md"))
+        write(os.path.join(hud, ".omc", "plans", "p.md"), "plan\nedited\n")
+        ok, dirty = clean_state(hud, hud_cfg)
+        assert not ok and any(".omc/plans/p.md" in line for line in dirty), dirty
 
         print("mk-lane self-test ok")
     finally:

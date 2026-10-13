@@ -3132,14 +3132,28 @@ def cmd_watch(args):
 
 
 def cmd_metrics(args):
-    """C13f: one JSON line of bus metrics for a run, from the project store."""
+    """C13f: one JSON line of bus metrics for a run, from the project store.
+
+    Without --run: a `runs` array with the same object for every active run."""
     data_dir = resolve_data(getattr(args, "data", None))
     run = args.run
-    if not is_valid_id(run):
+    if run is not None and not is_valid_id(run):
         raise Fail("invalid run id")
     if not store_mode(data_dir):
         raise Fail("metrics need a project store")
     store = StoreAdapter(data_dir)
+    if run is None:
+        active = [r["id"] for r in store.store_select("SELECT id FROM runs WHERE status=? ORDER BY id", ("active",))
+                  if is_valid_id(r.get("id"))]
+        res = {"ok": True, "run": "*", "runs": [_run_metrics(store, r) for r in active]}
+        out(res)
+        return res
+    res = _run_metrics(store, run)
+    out(res)
+    return res
+
+
+def _run_metrics(store, run):
     events = store.store_select(
         "SELECT id, t, kind, reply_to, text, meta_json FROM events WHERE chan=? AND run=? ORDER BY id",
         ("bus", run),
@@ -3199,7 +3213,6 @@ def cmd_metrics(args):
         "obedience": (round(obeyed / len(sent), 3) if sent else None),
         "false_stall": false_stall,
     }
-    out(res)
     return res
 
 
@@ -4758,6 +4771,18 @@ def _store_self_test_body(mod):
         assert rc_m.returncode == 0, rc_m.stdout
         metrics = json.loads(rc_m.stdout.strip().splitlines()[-1])
         assert metrics["ok"] is True and "latency_p50" in metrics and "obedience" in metrics and "false_stall" in metrics, metrics
+        # metrics without --run: every active run, each equal to its --run output
+        rc_ma = subprocess.run([sys.executable, os.path.abspath(__file__), "metrics", "--data", data],
+                               stdout=subprocess.PIPE, text=True)
+        assert rc_ma.returncode == 0, rc_ma.stdout
+        all_m = json.loads(rc_ma.stdout.strip().splitlines()[-1])
+        assert all_m["ok"] is True and [m["run"] for m in all_m["runs"]] == ["r1", "r2"], all_m
+        assert all_m["runs"][0] == metrics, (all_m["runs"][0], metrics)
+        rc_m2 = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "metrics", "--run", "r2", "--data", data],
+            stdout=subprocess.PIPE, text=True,
+        )
+        assert all_m["runs"][1] == json.loads(rc_m2.stdout.strip().splitlines()[-1]), all_m["runs"][1]
 
         # no direct database-module import text anywhere in this script
         src = open(os.path.abspath(__file__), encoding="utf-8").read()
@@ -6221,7 +6246,7 @@ def main():
 
     p_tail = subparsers.add_parser("tail")
     p_metrics = subparsers.add_parser("metrics")
-    p_metrics.add_argument("--run", required=True)
+    p_metrics.add_argument("--run")
     p_metrics.add_argument("--data")
     p_metrics.set_defaults(func=cmd_metrics)
     p_tail.add_argument("--run", help="Run identifier")
