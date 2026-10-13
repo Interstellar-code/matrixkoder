@@ -402,6 +402,7 @@ export function registerTools(on: On, _options: PluginOptions): void {
         return `'${word.replace(/'/g, `'"'"'`)}'`
       }
 
+      // watch never streams: it returns the command the Monitor tool arms.
       if (actionRaw === 'watch') {
         const words = ['python3', scriptPath, 'watch', '--data', dataDir, ...(runArg ? ['--run', runArg] : [])]
         const quoted: string[] = []
@@ -495,7 +496,11 @@ export function registerTools(on: On, _options: PluginOptions): void {
           let askTask: string | null = taskArg ?? null
           let askFrom = taskArg ?? 'orch'
           if (!askRun || taskRaw === undefined) {
-            const listed = await httpBus(`/pending${askRun ? `?run=${encodeURIComponent(askRun)}` : ''}`)
+            const q = new URLSearchParams()
+            if (askRun) q.set('run', askRun)
+            if (projectArg) q.set('project', projectArg)
+            const qs = q.toString()
+            const listed = await httpBus(`/pending${qs ? `?${qs}` : ''}`)
             if (listed.isError) return listed
             const body = parseJson(String(listed.result).split('\n').slice(1).join('\n'))
             const pending = body !== null && typeof body === 'object' ? (body as { pending?: unknown }).pending : null
@@ -543,7 +548,10 @@ export function registerTools(on: On, _options: PluginOptions): void {
         if (new TextEncoder().encode(textRaw).length > BUS_TEXT_MAX_BYTES) {
           return { isError: true, result: 'mk_bus: answer text exceeds the 64 KiB (65536 UTF-8 bytes) limit' }
         }
-        // "--" ends option parsing so a text like "--run=evil" stays positional.
+        // "--" ends option parsing: a space-free text starting with "-" ("--run=evil",
+        // "-x", "--data=/x") would otherwise be swallowed as an option by argparse and
+        // could hijack --run/--data (review MEDIUM 1). After the terminator both the
+        // msg id and the text stay positional, stored verbatim.
         return runBus(['python3', scriptPath, 'answer', '--data', dataDir, ...(runArg ? ['--run', runArg] : []), ...(projectArg ? ['--project', projectArg] : []), '--', msgIdRaw, textRaw])
       }
       return runBus(['python3', scriptPath, actionRaw, '--data', dataDir, ...(runArg ? ['--run', runArg] : []), ...(projectArg ? ['--project', projectArg] : [])])

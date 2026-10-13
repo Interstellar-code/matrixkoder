@@ -857,6 +857,31 @@ test('mk_bus answer over HTTP reads /pending then posts /send', async ($, on) =>
   expect(parsed.message.text).toBe(JSON.stringify('use v3'))
 })
 
+test('mk_bus answer lookup keeps the project on the pending query', async ($, on) => {
+  mock.env(on, { MATRIXKODER_DATA: '/data' })
+  on('fs.read', (_$, e, next) => {
+    if (String(e.path).endsWith('bus.json')) return { value: JSON.stringify({ port: 8765, token: 'tok-1' }) }
+    return next(e)
+  })
+  const urls: string[] = []
+  on('http.fetch', (_$, e) => {
+    urls.push(e.url)
+    if (e.url.includes('/pending')) {
+      return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ ok: true, pending: [] }) } }
+    }
+    return { value: { status: 200, ok: true, headers: {}, text: '{}' } }
+  })
+
+  const ran = await callTool($, {
+    tool: 'mcp__matrixkoder__mk_bus', action: 'answer', msg_id: 'm-1', text: 'use v3', project: 'mk-store',
+  })
+
+  expect(ran.isError).toBe(true) // the ask is not in this project's pending list
+  const pendingUrl = urls.find(u => u.includes('/pending')) ?? ''
+  const q = new URL(pendingUrl).searchParams
+  expect(q.get('project')).toBe('mk-store')
+})
+
 test('mk_bus watch quotes a data dir with a space', async ($, on) => {
   mock.env(on, { MATRIXKODER_DATA: '/data/my dir' })
   const ran = await callTool($, { tool: 'mcp__matrixkoder__mk_bus', action: 'watch', run: 'r1' })
