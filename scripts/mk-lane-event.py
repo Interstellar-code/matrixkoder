@@ -845,7 +845,8 @@ def cmd_dispatch(a):
     status_unchanged:true instead. Every reply carries attempts (1 or 2), herdr_error (herdr's
     words for the attempt that did not deliver — the first attempt's when a retry lands, the final
     attempt's when both fail, the reply itself when nothing failed) and pane_entry (the freshest
-    raw `herdr pane list` row for the pane, null when no observation names it). A --kind
+    raw `herdr pane list` row for the pane, null when no observation names it). A delivered reply
+    never carries error: herdr's timeout words stay in herdr_error and note says what happened. A --kind
     fix|takeover build dispatch on session.fresh_session: new first sends the pane's agent its
     new-session command (/new OpenCode, /clear Claude — the armed watch's kind names the agent)
     and waits (bounded) for the pane to go idle; the reply's fresh_session names the command sent,
@@ -904,8 +905,9 @@ def cmd_dispatch(a):
         if why:
             legacy_note = f"legacy prompt: {why}"
 
-    def reply(d):
-        out({**d, "connect": connected, **({"note": legacy_note} if legacy_note else {})})
+    def reply(d, note=None):
+        n = "; ".join(x for x in (legacy_note, note) if x)
+        out({**d, "connect": connected, **({"note": n} if n else {})})
 
     role = opt(a, "--role", "build")
     if role not in ("build", "review"):
@@ -962,8 +964,9 @@ def cmd_dispatch(a):
         st, entry, pl_err = pane_state(pane)
         if st == "working":  # the wait gave up, the agent did not: the prompt is still being delivered
             reply({"ok": True, "delivered": True, "pane_state": "working", "pane": pane, "timed_out": True,
-                 "timeout_ms": ms, "attempts": attempts, "herdr_error": why, "error": why,
-                 "pane_entry": entry, "fresh_session": fresh, **delivered_status(pane, role)})
+                 "timeout_ms": ms, "attempts": attempts, "herdr_error": why,
+                 "pane_entry": entry, "fresh_session": fresh, **delivered_status(pane, role)},
+                  note="herdr status wait timed out; the pane is working")
             return
         if attempts == 1 and st in RETRY_PANE_STATES:  # idle/done: the prompt was lost — resend once
             time.sleep(retry_wait_s())
@@ -979,8 +982,9 @@ def cmd_dispatch(a):
             if marker_in_new_pane_text(pane, prompt_marker(text), pane_text_before):
                 reply({"ok": True, "delivered": True, "recovered": True, "pane_state": st, "pane": pane,
                      "timed_out": True, "timeout_ms": ms, "attempts": attempts, "herdr_error": why,
-                     "error": why, "pane_entry": entry, "fresh_session": fresh,
-                     **({"pane_list_error": pl_err} if pl_err else {}), **delivered_status(pane, role)})
+                     "pane_entry": entry, "fresh_session": fresh,
+                     **({"pane_list_error": pl_err} if pl_err else {}), **delivered_status(pane, role)},
+                      note="herdr wait timed out; the prompt had already landed")
                 return
         reply({"ok": False, "delivered": False, "pane_state": st, "pane": pane, "timed_out": True,
              "timeout_ms": ms, "attempts": attempts, "herdr_error": why, "error": why,
@@ -2061,6 +2065,8 @@ def self_test():
         r = cli("dispatch", "--pane", pane_of("H1"), "--text", "go")
         assert r["ok"] is True and r["delivered"] is True and r["pane_state"] == "working", r
         assert r["timed_out"] is True and "timeout" in r["herdr_error"], r
+        # (G1) delivered: no error field, herdr's words in herdr_error, the note says why
+        assert "error" not in r and r["note"] == "herdr status wait timed out; the pane is working", r
         # (c) timeout + agent_prompt_stalled (or the pane gone from the list) → delivered:false
         set_canned("pane_list_out.txt", json.dumps({"result": {"panes": [
             {"pane_id": pane_of("H1"), "agent_status": "agent_prompt_stalled"}]}}) + "\n")
@@ -2210,7 +2216,8 @@ def self_test():
         r = cli("dispatch", "--pane", pane_of("H8"), "--text", "go", extra=fast)
         assert r["ok"] is True and r["delivered"] is True and r["recovered"] is True and r["attempts"] == 2, r
         assert r["pane_state"] == "done" and r["pane_entry"] == done_row, r
-        assert "timeout" in r["herdr_error"] and "timeout" in r["error"] and r["timed_out"] is True, r
+        assert "timeout" in r["herdr_error"] and "error" not in r and r["timed_out"] is True, r
+        assert r["note"] == "herdr wait timed out; the prompt had already landed", r
         # (c) pane state null — missing from a readable list, or the list unreadable → NO retry
         set_canned("pane_list_out.txt", '{"result": {"panes": []}}\n')
         set_canned("prompt_q.txt", "- 2")  # a scripted second reply that must never be sent
