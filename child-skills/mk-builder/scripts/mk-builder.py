@@ -73,7 +73,9 @@ BUS_CURSOR_FILE = ".matrixkoder-bus-cursor"
 BUS_RUN = "bb"  # the self-test's run id (every fixture token and message uses it)
 BUS_CONNECT_TIMEOUT = 2.0
 BUS_WAIT_CHUNK_MAX = 90.0
-BUS_ASK_TIMEOUT = 600.0
+BUS_ASK_TIMEOUT = 90.0
+# E1: listen's own cap. A longer --timeout is refused, not clamped.
+LISTEN_TIMEOUT_MAX = 50.0
 # D7.2 (item 37): inbox and the progress hint must return inside this wall clock, even when
 # /wait would otherwise sit for its 1 s floor on an empty inbox.
 BUS_HINT_BUDGET = 2.0
@@ -371,8 +373,20 @@ def cmd_progress(a):
         require_state(old, "progress")
         obj = dict(old, step=step, state="working", question=None, subagent=None)
     write_status(lane, stamp(obj))
+    post_progress(lane, step)
     return ({"ok": True, "seq": obj["seq"], "state": obj["state"], "step": obj["step"],
              "subagent": obj["subagent"]}, bus_unread_hint(lane))
+
+
+def post_progress(lane, step):
+    """E1: also post `progress: <text>` as an info message. Best effort: a down bus
+    never blocks and never fails the status write that already happened."""
+    cfg = bus_lane_config(lane)
+    if cfg is None:
+        return
+    text = " ".join(str(step).splitlines())
+    with contextlib.suppress(BusDown, BusHttp, OSError, ValueError):
+        bus_send(cfg, "info", f"progress: {text}")
 
 
 def token_for(old, tail):
@@ -1124,6 +1138,28 @@ def bus_ack_body(cfg, msg_id):
     return body
 
 
+def ack_once(lane, cfg, msg_id):
+    """One level-3 ack per message for this lane (todos 37, 42).
+
+    The marker is lane-local. A second ask, wait, inbox or listen of the same id
+    does not POST again. Returns True when this call sent the ack."""
+    if not msg_id:
+        return False
+    path = os.path.join(lane, ".matrixkoder-ack-once")
+    seen = set()
+    try:
+        with open(path) as f:
+            seen = {ln.strip() for ln in f if ln.strip()}
+    except OSError:
+        seen = set()
+    if msg_id in seen:
+        return False
+    bus_call(cfg, "POST", "/ack", body=bus_ack_body(cfg, msg_id))
+    with open(path, "a") as f:
+        f.write(msg_id + "\n")
+    return True
+
+
 def bus_wait_chunk(cfg, after, chunk, deadline=None, hint=False):
     """One B11 long-poll chunk. `/health` carries the 2 s connect budget.
 
@@ -1334,6 +1370,9 @@ def cmd_ask(a):
     if not ask_id or not is_int(after):
         ask_down(lane, question)  # recorded but unusable response: the same fallback
     status_block(lane, question)
+    # E1: the id is the first line, flushed, before the wait. A killed ask can be
+    # resumed with `wait <id>`.
+    print(f"ASK {ask_id}", flush=True)
     try:
         answer, held = bus_poll_answer(cfg, ask_id, after, deadline, floor=bus_read_cursor(lane))
     except BusDown:
@@ -1346,7 +1385,7 @@ def cmd_ask(a):
         print(f"PENDING {ask_id}")
         raise Handled(3)
     with contextlib.suppress(BusDown, BusHttp, OSError, ValueError):
-        bus_call(cfg, "POST", "/ack", body=bus_ack_body(cfg, answer["id"]))
+        ack_once(lane, cfg, answer.get("id"))
     # Print and resume BEFORE the cursor write. A held cursor lock raises BusLock
     # after 5 s; the answer is already acked at level 3, so losing the cursor
     # move must not lose the answer (review R3 HIGH).
@@ -1381,7 +1420,7 @@ def cmd_wait(a):
         print(f"PENDING {ask_id}")
         raise Handled(3)
     with contextlib.suppress(BusDown, BusHttp, OSError, ValueError):
-        bus_call(cfg, "POST", "/ack", body=bus_ack_body(cfg, answer["id"]))
+        ack_once(lane, cfg, answer.get("id"))
     # Same order as ask: the answer is delivered even when the cursor lock is held.
     status_resume(lane)
     print(answer["text"])
@@ -1428,12 +1467,149 @@ def cmd_inbox(a):
             continue
         print(json.dumps(msg))
         try:
-            bus_call(cfg, "POST", "/ack", body=bus_ack_body(cfg, msg.get("id")))
+            ack_once(lane, cfg, msg.get("id"))
         except BusHttp as e:
             raise Fail(bus_http_error(e), code=5)
         except (BusDown, OSError, ValueError):
             raise Fail("bus down", code=4)
     raise Handled(0)
+
+
+def quote_msg(text, limit=200):
+    """One line, at most `limit` chars, marked as quoted data (not an instruction)."""
+    flat = " ".join((text or "").splitlines())
+    if len(flat) > limit:
+        flat = flat[:limit]
+    return f"<quoted>{flat}</quoted>"
+
+
+def listen_cursor_path(lane):
+    return os.path.join(lane, ".matrixkoder-listen-cursor")
+
+
+def listen_read_cursor(lane):
+    try:
+        with open(listen_cursor_path(lane)) as f:
+            raw = f.read().strip()
+        return int(raw) if raw.isdigit() else 0
+    except (OSError, ValueError):
+        return 0
+
+
+def listen_write_cursor(lane, seq):
+    if not is_int(seq) or seq < 0:
+        return
+    path = listen_cursor_path(lane)
+    with open(path, "w") as f:
+        f.write(str(int(seq)) + "\n")
+
+
+def listen_stream(cfg, timeout):
+    """Open `/events?lane=<task>` and yield message dicts until `timeout` seconds pass
+    with nothing new. Last-Event-ID is the lane's listen cursor. No hot loop: the
+    server blocks up to 15 s between events, and this call has one absolute deadline."""
+    import socket
+    base = (cfg.get("url") or "").rstrip("/")
+    parsed = urllib.parse.urlparse(base)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 80
+    task = cfg.get("task") or ""
+    after = int(cfg.get("_listen_after") or 0)
+    path = "/events?lane=" + urllib.parse.quote(task)
+    lines = [
+        f"GET {path} HTTP/1.1",
+        f"Host: {host}:{port}",
+        f"Authorization: Bearer {cfg['token']}",
+        "Accept: text/event-stream",
+        f"Last-Event-ID: {after}",
+        "Connection: close",
+        "",
+        "",
+    ]
+    req = "\r\n".join(lines)
+    deadline = time.time() + timeout
+    sock = socket.create_connection((host, port), timeout=min(BUS_CONNECT_TIMEOUT, max(0.2, timeout)))
+    try:
+        sock.settimeout(max(0.2, min(5.0, deadline - time.time())))
+        sock.sendall(req.encode("ascii"))
+        buf = b""
+        header = True
+        sep = b"\r\n\r\n"
+        while time.time() < deadline:
+            try:
+                chunk = sock.recv(8192)
+            except socket.timeout:
+                sock.settimeout(max(0.2, min(5.0, deadline - time.time())))
+                continue
+            if not chunk:
+                break
+            buf += chunk
+            if header:
+                if sep not in buf:
+                    continue
+                head, buf = buf.split(sep, 1)
+                status_line = head.split(b"\r\n", 1)[0].decode("iso-8859-1", "replace")
+                parts = status_line.split(" ", 2)
+                code = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+                if code >= 400 or code == 0:
+                    raise BusHttp(code, status_line)
+                header = False
+            while b"\n\n" in buf:
+                block, buf = buf.split(b"\n\n", 1)
+                data = []
+                for line in block.split(b"\n"):
+                    if line.startswith(b"data:"):
+                        data.append(line[5:].strip())
+                if not data:
+                    continue
+                try:
+                    msg = json.loads(b" ".join(data).decode("utf-8"))
+                except ValueError:
+                    continue
+                if isinstance(msg, dict):
+                    yield msg
+            sock.settimeout(max(0.2, min(5.0, deadline - time.time())))
+    finally:
+        with contextlib.suppress(OSError):
+            sock.close()
+
+
+def cmd_listen(a):
+    """E1: follow the bus SSE stream and print each new message as one quoted line.
+
+    Exits 0 when it printed something, 3 when the timeout passed with nothing, 4
+    when the bus is down. Each printed message is acked at level 3 exactly once.
+    """
+    lane = lane_dir(a)
+    timeout = a.timeout if a.timeout is not None else 5.0
+    if not is_num(timeout) or not (0 < timeout <= LISTEN_TIMEOUT_MAX):
+        raise Fail(f"listen timeout must be a number in (0, {LISTEN_TIMEOUT_MAX:g}], got {timeout!r}")
+    cfg = bus_lane_config(lane)
+    if cfg is None:
+        print("BUS DOWN: use the BLOCKED token")
+        raise Handled(4)
+    cfg = dict(cfg)
+    cfg["_listen_after"] = listen_read_cursor(lane)
+    printed = 0
+    try:
+        for msg in listen_stream(cfg, timeout):
+            seq = msg.get("seq")
+            if is_int(seq):
+                listen_write_cursor(lane, seq)
+            kind = msg.get("kind") or "?"
+            who = msg.get("from") or "?"
+            mid = msg.get("id") or "?"
+            print(f"MSG {mid} {kind} {who}: {quote_msg(msg.get('text') or '')}", flush=True)
+            printed += 1
+            with contextlib.suppress(BusDown, BusHttp, OSError, ValueError):
+                ack_once(lane, cfg, msg.get("id"))
+    except BusDown:
+        print("BUS DOWN: use the BLOCKED token")
+        raise Handled(4)
+    except (BusHttp, OSError, ValueError):
+        print("BUS DOWN: use the BLOCKED token")
+        raise Handled(4)
+    raise Handled(0 if printed else 3)
 
 
 def cmd_ack(a):
@@ -1556,8 +1732,8 @@ def bus_lane_config(lane):
 
 
 def bus_data_dir(cfg):
-    """The project data dir: `MK_BUS_DATA` wins, else the token file's `data` field.
-    Production token files omit it; without either, store mode stays off (C12)."""
+    """The project data dir: `MK_BUS_DATA` wins, else the token file's `data` field
+    (E2 writes it; E1 reads it). Without either, store mode stays off (C12)."""
     env = os.environ.get("MK_BUS_DATA")
     if env and os.path.isdir(env):
         return os.path.abspath(env)
@@ -1567,6 +1743,14 @@ def bus_data_dir(cfg):
     if isinstance(data, str) and os.path.isdir(data):
         return os.path.abspath(data)
     return None
+
+
+def resolve_data_dir(cfg, explicit=None):
+    """Where the brief lives. `--data` wins, then `MK_BUS_DATA`, then the token file's
+    `data` field. None when none of those names a directory."""
+    if explicit and os.path.isdir(explicit):
+        return os.path.abspath(explicit)
+    return bus_data_dir(cfg)
 
 
 def store_present(data):
@@ -1772,12 +1956,57 @@ def page_slice(text, part, size=BRIEF_PAGE):
     return text[start:start + size], part, pages
 
 
+def connect_identity(cfg):
+    """The round arm recorded in the lane token file: run, task, round. Missing fields
+    are None. A token with no round is round 1 (file mode, before E2 writes the field)."""
+    if not cfg:
+        return None, None, None
+    run = cfg.get("run") if isinstance(cfg.get("run"), str) and cfg.get("run") else None
+    task = cfg.get("task") if isinstance(cfg.get("task"), str) and cfg.get("task") else None
+    raw = cfg.get("round")
+    if raw is None or raw == "":
+        round_n = 1
+    else:
+        try:
+            round_n = int(raw)
+        except (TypeError, ValueError):
+            round_n = None
+    return run, task, round_n
+
+
+def implicit_start(lane, cfg):
+    """E1: a fresh lane has no status file. `connect` starts the round arm recorded
+    (run, task, round in the token file) instead of refusing. Returns the live file."""
+    run, task, round_n = connect_identity(cfg)
+    if not run or not task or not is_int(round_n) or round_n < 1:
+        raise Fail("connect: no armed round in the lane token file "
+                   "(need run, task, round); run `start` or re-arm the lane")
+    report = f".matrixkoder-report-r{round_n}.md"
+    obj = new_file(check_run(run), check_task(task), round_n, "builder",
+                   detect_agent(), check_report(report), time.time())
+    write_status(lane, obj)
+    return obj
+
+
 def cmd_connect(a):
-    """D7.1: print the brief (one page, ~24,000 chars) and the phase task list. The agent
-    adds one `[<id>] ` todo per task. Ack of the brief happens on `read` of the last page."""
+    """D7.1 / E1: print the brief (one page, ~24,000 chars) and the phase task list.
+
+    A fresh lane (no status file) is started from the round the orchestrator armed.
+    The data dir comes from `--data`, `MK_BUS_DATA`, or the token file's `data`
+    field. With none of those, and no brief already in the lane, connect exits
+    non-zero and names the fix. Ack of the brief happens on `read` of the last page."""
     lane = lane_dir(a)
-    old = load_live(lane)
+    cfg = bus_lane_config(lane)
+    data = resolve_data_dir(cfg, getattr(a, "data", None))
+    if data:
+        os.environ["MK_BUS_DATA"] = data
+    old = read_status(lane)
+    if old is None:
+        old = implicit_start(lane, cfg)
     text, path = brief_text(lane, old)
+    if not text and not data and not brief_from_files(lane, old)[0]:
+        raise Fail("connect: no data dir — pass --data <dir> or set MK_BUS_DATA, "
+                   "or re-arm so the lane token file has a data field")
     if not text:
         print("# brief: none found")
         raise Handled(0)
@@ -2089,8 +2318,12 @@ def build_parser():
     sp.add_argument("--timeout", type=float, default=BUS_ASK_TIMEOUT,
                     help="total seconds to wait for the answer (default 600)")
     lane_cmd("inbox", cmd_inbox, "print this lane's unread bus messages and ack them [BB]")
+    sp = lane_cmd("listen", cmd_listen, "follow the bus SSE stream and print new messages [E1]")
+    sp.add_argument("--timeout", type=float, default=5.0,
+                    help=f"seconds to wait, 1..{LISTEN_TIMEOUT_MAX:g} (default 5)")
     sp = lane_cmd("connect", cmd_connect, "print the brief (paged) and the phase task list [D7.1]")
     sp.add_argument("--plan", default=None, help="plan file; default $MK_PLAN")
+    sp.add_argument("--data", default=None, help="project data dir (else $MK_BUS_DATA or the token file)")
     sp = lane_cmd("read", cmd_read, "print one page of a paged brief or message [D7.1]")
     sp.add_argument("msg_id")
     sp.add_argument("--part", type=int, default=1)
@@ -2927,7 +3160,7 @@ def t_bus_ask_answer_roundtrip(root):
         code, lines = cli(lane, "ask", question, "--timeout", "30")
     finally:
         th.join(30)
-    assert code == 0 and lines == [answer_text], (code, lines)
+    assert code == 0 and lines[0].startswith("ASK m-") and lines[-1] == answer_text, (code, lines)
     st = status(lane)
     assert st["state"] == "working" and st["question"] is None, st
     assert seen["blocked"]["question"] == question, seen["blocked"]
@@ -2955,19 +3188,20 @@ def t_bus_ask_pending_then_wait(root):
     t0 = time.time()
     code, lines = cli(lane, "ask", "no answer coming", "--timeout", "2")
     assert time.time() - t0 < 10, "the 2 s ask must not hang"
-    assert code == 3 and len(lines) == 1 and lines[0].startswith("PENDING m-"), (code, lines)
+    assert code == 3 and lines[0].startswith("ASK m-") and lines[-1].startswith("PENDING m-"), (code, lines)
     ask_id = lines[0].split()[1]
+    assert lines[-1] == f"PENDING {ask_id}", lines
     st = status(lane)
     assert st["state"] == "blocked" and st["question"] == "no answer coming", st
     code, lines = cli(lane, "ask", "also unanswered", "--timeout", "2")
-    assert code == 3 and len(lines) == 1 and lines[0].startswith("PENDING m-"), (code, lines)
+    assert code == 3 and lines[0].startswith("ASK m-") and lines[-1].startswith("PENDING m-"), (code, lines)
     ask2 = lines[0].split()[1]
     code, lines = cli(lane, "wait", ask2, "--timeout", "2")
     assert code == 3 and lines == [f"PENDING {ask2}"], (code, lines)
     assert status(lane)["state"] == "blocked", "a PENDING wait leaves the status blocked"
     bus_cli("answer", ask_id, "late answer", "--run", BUS_RUN, "--data", data)
     code, lines = cli(lane, "wait", ask_id, "--timeout", "10")
-    assert code == 0 and lines == ["late answer"], (code, lines)
+    assert code == 0 and lines[-1] == "late answer", (code, lines)
     st = status(lane)
     assert st["state"] == "working" and st["question"] is None, st
     answers = [r for r in bus_rows(data)
@@ -3011,7 +3245,7 @@ def t_b1_ask_advances_cursor_no_second_ack(root):
         code, lines = cli(lane, "ask", question, "--timeout", "30")
     finally:
         th.join(30)
-    assert code == 0 and lines == ["cursor advanced"], (code, lines)
+    assert code == 0 and lines[0].startswith("ASK m-") and lines[-1] == "cursor advanced", (code, lines)
     code, lines = cli(lane, "inbox")
     assert code == 0 and lines == [], (code, lines)
     answers = [r for r in bus_rows(data)
@@ -3031,7 +3265,7 @@ def t_b1_wait_advances_cursor_no_second_ack(root):
     begin(lane, root)
     cli(lane, "progress", "build")
     code, lines = cli(lane, "ask", "hold", "--timeout", "2")
-    assert code == 3 and lines[0].startswith("PENDING m-"), (code, lines)
+    assert code == 3 and lines[0].startswith("ASK m-") and lines[-1].startswith("PENDING "), (code, lines)
     ask_id = lines[0].split()[1]
     bus_cli("answer", ask_id, "wait advanced", "--run", BUS_RUN, "--data", data)
     code, lines = cli(lane, "wait", ask_id, "--timeout", "10")
@@ -3055,7 +3289,7 @@ def t_b1_lower_seq_stays_unread(root):
     begin(lane, root)
     cli(lane, "progress", "build")
     code, lines = cli(lane, "ask", "gap?", "--timeout", "2")
-    assert code == 3, (code, lines)
+    assert code == 3 and lines[0].startswith("ASK m-"), (code, lines)
     ask_id = lines[0].split()[1]
     # info lands first (lower seq), then the answer (higher seq)
     bus_cli("send", "--run", BUS_RUN, "--task", "BG", "--kind", "info",
@@ -3098,7 +3332,7 @@ def t_b1_unread_older_than_the_ask(root):
         code, lines = cli(lane, "ask", "q?", "--timeout", "30")
     finally:
         th.join(30)
-    assert code == 0 and lines == ["A"], (code, lines)
+    assert code == 0 and lines[0].startswith("ASK m-") and lines[-1] == "A", (code, lines)
     code, lines = cli(lane, "inbox")
     assert code == 0 and len(lines) == 1, (code, lines)
     shown = json.loads(lines[0])
@@ -3108,7 +3342,7 @@ def t_b1_unread_older_than_the_ask(root):
     bus_cli("send", "--run", BUS_RUN, "--task", "BE", "--kind", "info",
             "--text", "early for wait", "--data", data)
     code, lines = cli(lane, "ask", "later?", "--timeout", "2")
-    assert code == 3 and lines[0].startswith("PENDING "), (code, lines)
+    assert code == 3 and lines[0].startswith("ASK m-") and lines[-1].startswith("PENDING "), (code, lines)
     ask_id = lines[0].split()[1]
     bus_cli("answer", ask_id, "W", "--run", BUS_RUN, "--data", data)
     code, lines = cli(lane, "wait", ask_id, "--timeout", "10")
@@ -3298,7 +3532,7 @@ def t_b1_held_lock_does_not_lose_the_answer(root):
     baseline = max(0.05, time.time() - b0)
     # wait path: ask goes PENDING, the answer lands, then the lock is taken
     code, lines = cli(lane, "ask", "held?", "--timeout", "2")
-    assert code == 3 and lines[0].startswith("PENDING "), (code, lines)
+    assert code == 3 and lines[0].startswith("ASK m-") and lines[-1].startswith("PENDING "), (code, lines)
     ask_id = lines[0].split()[1]
     bus_cli("answer", ask_id, "KEPT", "--run", BUS_RUN, "--data", data)
     holder = _b1_hold_lock(root, lane, "b1_held_wait")
@@ -3329,7 +3563,7 @@ def t_b1_held_lock_does_not_lose_the_answer(root):
     finally:
         th.join(20)
         holder.kill(); holder.wait(timeout=5)
-    assert code == 0 and lines == ["KEPT2"], (code, lines)
+    assert code == 0 and lines[0].startswith("ASK m-") and lines[-1] == "KEPT2", (code, lines)
     assert elapsed < max(8.0, 8 * baseline), elapsed
     # inbox with the lock held: the named error, and nothing printed
     bus_cli("send", "--run", BUS_RUN, "--task", "BH", "--kind", "info",
@@ -3820,7 +4054,7 @@ def t_d7_one_ack_per_answer(root):
     # the thread posts one answer, so a one-off comes from two runs sharing one
     # store (overlapping runs fall back to the shared MK-home bus.json), not from this code.
     assert errors.empty(), errors.get()
-    assert code == 0 and lines == ["the schema is v2"], (code, lines)
+    assert code == 0 and lines[0].startswith("ASK m-") and lines[-1] == "the schema is v2", (code, lines)
     code, lines = cli(lane, "inbox")
     assert code == 0 and lines == [], lines
     rows = d7_bus_rows(data)
@@ -4297,9 +4531,9 @@ def t_x1_slow_drip_body_honours_budget(root):
         # no answer yet: PENDING (exit 3) or BUS DOWN (exit 4). Never a hang.
         assert code in (3, 4), (code, lines)
         if code == 3:
-            assert lines and lines[0].startswith("PENDING "), lines
+            assert lines and lines[-1].startswith("PENDING "), lines
         else:
-            assert lines == ["BUS DOWN: use the BLOCKED token"], lines
+            assert "BUS DOWN: use the BLOCKED token" in lines, lines
         after = _x1_rss_kb()
         if before and after:
             assert after - before < 32 * 1024, f"RSS grew {after - before} KiB on a drip"
@@ -4445,6 +4679,161 @@ def t_x1_real_bus_token_0600(root):
     assert mode == 0o600, oct(mode)
     code, lines = cli(lane, "inbox")
     assert code == 0, (code, lines)
+
+
+def t_e1_connect_fresh_lane_prints_brief(root):
+    """E1: a fresh lane with no status file and no MK_BUS_* env runs connect and
+    gets brief page 1 plus the task list. The data dir comes from the token file."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data = os.path.join(root, "e1fresh-data")
+    os.makedirs(data, exist_ok=True)
+    bus_server(root, "e1fresh")
+    lane = bus_lane(root, "e1_fresh_lane", "E1F", data)
+    assert not os.path.isfile(status_path(lane))
+    body = "round:1\nkind:brief\n# e1 brief page\nbuild the doorbell\n"
+    code, res = bus_cli("send", "--data", data, "--run", BUS_RUN, "--task", "E1F",
+                        "--kind", "info", "--from", "orch", "--to", "E1F", "--text", body)
+    assert code == 0 and res.get("ok"), res
+    plan = os.path.join(root, "e1-plan.md")
+    with open(plan, "w") as f:
+        f.write('+++\nplan = "t"\nstatus = "running"\n[[phase]]\nid = "E1F"\n'
+                '[[phase.task]]\nid = "E1F.1"\ntitle = "doorbell"\nparallel = false\n'
+                'deps = []\n+++\n')
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("MK_BUS_DATA", "MK_BUS_URL", "MK_BUS_TOKEN", "MK_PLAN")}
+    code, lines = cli(lane, "connect", "--plan", plan, env=env)
+    assert code == 0, lines
+    text = "\n".join(lines)
+    assert text.startswith("# brief 1/"), text[:80]
+    assert "e1 brief page" in text and "build the doorbell" in text, text
+    assert "[E1F.1] doorbell parallel=false" in text, text
+    assert os.path.isfile(status_path(lane))
+    assert status(lane)["task"] == "E1F" and status(lane)["state"] == "started"
+
+
+def t_e1_connect_names_the_fix_without_data(root):
+    """No status file, no data dir, no env: connect exits non-zero and names --data."""
+    lane = mklane(root, "e1_nodata")
+    path = os.path.join(lane, BUS_LANE_FILE)
+    with open(path, "w") as f:
+        json.dump({"v": 1, "url": "http://127.0.0.1:9", "token": "t",
+                   "run": "bb", "task": "E1N"}, f)
+    os.chmod(path, 0o600)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("MK_")}
+    code, lines = cli(lane, "connect", env=env)
+    assert code != 0, lines
+    assert any("data" in ln for ln in lines), lines
+
+
+def t_e1_ask_id_first_then_resume(root):
+    """ask's first line is ASK <id>, then PENDING, under a short timeout. wait resumes it."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data, _, _ = bus_server(root, "e1ask")
+    lane = bus_lane(root, "e1_ask_lane", "E1A", data)
+    begin(lane, root, task="E1A")
+    cli(lane, "progress", "work")
+    t0 = time.time()
+    code, lines = cli(lane, "ask", "format?", "--timeout", "2")
+    assert time.time() - t0 < 8, "ask must not hang"
+    assert code == 3 and lines[0].startswith("ASK m-") and lines[1].startswith("PENDING "), (code, lines)
+    ask_id = lines[0].split()[1]
+    assert lines[1] == f"PENDING {ask_id}"
+    bus_cli("answer", ask_id, "format ok", "--run", BUS_RUN, "--data", data)
+    code, lines = cli(lane, "wait", ask_id, "--timeout", "10")
+    assert code == 0 and lines == ["format ok"], (code, lines)
+
+
+def t_e1_listen_two_messages_and_resume(root):
+    """listen prints two MSG lines, acks each once, and a second listen with the
+    cursor already past them prints nothing (Last-Event-ID resume) and exits 3."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data, _, _ = bus_server(root, "e1listen")
+    lane = bus_lane(root, "e1_listen_lane", "E1L", data)
+    begin(lane, root, task="E1L")
+    bus_cli("send", "--data", data, "--run", BUS_RUN, "--task", "E1L",
+            "--kind", "info", "--from", "orch", "--to", "E1L", "--text", "note one")
+    bus_cli("send", "--data", data, "--run", BUS_RUN, "--task", "E1L",
+            "--kind", "info", "--from", "orch", "--to", "E1L", "--text", "note two")
+    code, lines = cli(lane, "listen", "--timeout", "3")
+    assert code == 0, lines
+    msgs = [ln for ln in lines if ln.startswith("MSG ")]
+    assert len(msgs) == 2, lines
+    assert "<quoted>note one</quoted>" in msgs[0] and "<quoted>note two</quoted>" in msgs[1], msgs
+    acks = [r for r in bus_rows(data) if r.get("kind") == "ack" and r.get("task") == "E1L"]
+    assert len(acks) == 2 and all(r.get("ack_level") == 3 for r in acks), acks
+    code, lines = cli(lane, "listen", "--timeout", "2")
+    assert code == 3 and lines == [], (code, lines)
+    acks2 = [r for r in bus_rows(data) if r.get("kind") == "ack" and r.get("task") == "E1L"]
+    assert len(acks2) == 2, acks2
+
+
+def t_e1_listen_timeout_exits_3(root):
+    """Nothing on the bus: listen exits 3 and prints nothing."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data, _, _ = bus_server(root, "e1to")
+    lane = bus_lane(root, "e1_to_lane", "E1T", data)
+    begin(lane, root, task="E1T")
+    t0 = time.time()
+    code, lines = cli(lane, "listen", "--timeout", "2")
+    assert time.time() - t0 < 8
+    assert code == 3 and lines == [], (code, lines)
+
+
+def t_e1_progress_posts_info(root):
+    """progress writes the status file and posts `progress: <text>` to the orchestrator."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data, _, _ = bus_server(root, "e1prog")
+    lane = bus_lane(root, "e1_prog_lane", "E1P", data)
+    begin(lane, root, task="E1P")
+    code, lines = cli(lane, "progress", "reading the spec")
+    assert code == 0, lines
+    assert status(lane)["step"] == "reading the spec"
+    infos = [r for r in bus_rows(data)
+             if r.get("kind") == "info" and r.get("task") == "E1P" and (r.get("text") or "").startswith("progress:")]
+    assert len(infos) == 1 and infos[0]["text"] == "progress: reading the spec", infos
+    assert infos[0].get("from") == "E1P", infos[0]
+
+
+def t_e1_one_ack_per_answer(root):
+    """ask acks the answer once. A later inbox does not add a second level-3 ack row."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data, _, _ = bus_server(root, "e1ack")
+    lane = bus_lane(root, "e1_ack_lane", "E1K", data)
+    begin(lane, root, task="E1K")
+    cli(lane, "progress", "work")
+
+    def answer_when_blocked():
+        row = bus_poll_until(lambda: next(
+            (r for r in bus_rows(data) if r.get("kind") == "ask" and r.get("task") == "E1K"), None))
+        bus_cli("answer", row["id"], "once", "--run", BUS_RUN, "--data", data)
+
+    th = threading.Thread(target=answer_when_blocked)
+    th.start()
+    try:
+        code, lines = cli(lane, "ask", "once?", "--timeout", "20")
+    finally:
+        th.join(20)
+    assert code == 0 and lines[-1] == "once", (code, lines)
+    code, lines = cli(lane, "inbox")
+    assert code == 0, lines
+    answers = [r for r in bus_rows(data) if r.get("kind") == "answer" and r.get("text") == "once"]
+    assert len(answers) == 1, answers
+    acks = [r for r in bus_rows(data) if r.get("kind") == "ack" and r.get("reply_to") == answers[0]["id"]]
+    assert len(acks) == 1 and acks[0]["ack_level"] == 3, acks
+
+
+def t_e1_listen_bus_down_exits_4(root):
+    """No token file: listen exits 4 with the BLOCKED line."""
+    lane = mklane(root, "e1_down")
+    begin(lane, root)
+    code, lines = cli(lane, "listen", "--timeout", "2")
+    assert code == 4 and lines == ["BUS DOWN: use the BLOCKED token"], (code, lines)
 
 
 def t_skill_frontmatter(root):
