@@ -787,6 +787,21 @@ def publish_brief(data, run, task):
     return err is None, err
 
 
+def alert_publish_failure(data, run, task, error):
+    """A brief that did not reach the bus must not hide in the dispatch reply: post an info
+    message to the orchestrator (the stage 6 watch shows it) and a run event (the board shows
+    it). Best effort: a failure here never changes the dispatch."""
+    text = f"BRIEF NOT ON BUS: {task} brief publish failed ({error}); the full prompt was typed instead"
+    run_bus(["send", "--data", data, "--run", run, "--task", task, "--kind", "info",
+             "--from", "dispatch", "--to", "orch", "--text", text])
+    try:
+        subprocess.run([sys.executable, mk_state_cmd(), "--data", data, "--run", run, "event",
+                        "--task", task, "--type", "note", "--text", text],
+                       capture_output=True, text=True, timeout=30)
+    except Exception:
+        pass
+
+
 def connect_text(lane, data):
     """The one line a bus-up dispatch types: connect, plus the job-budget command.
 
@@ -914,6 +929,7 @@ def cmd_dispatch(a):
                 if publish_error:
                     # the full prompt is kept; the reply says why the doorbell was not typed
                     a = list(a) + ["--publish-error", publish_error]
+                    alert_publish_failure(wdata, wrun, wtask, publish_error)
         if why:
             legacy_note = f"legacy prompt: {why}"
 
@@ -2932,6 +2948,9 @@ def self_test():
             assert prompt_calls()[n0:][-1].endswith("the full prompt stays --wait --timeout 25000"), \
                 prompt_calls()[n0:]
             assert r["connect"] is False and r["note"] == "legacy prompt: publish failed: too big", r
+            # the failure is also posted for the stage 6 watch, not only named in the reply
+            alerts = [c for c in bus_calls() if "--kind info" in c and "BRIEF NOT ON BUS" in c]
+            assert alerts and "--to orch" in alerts[-1] and "too big" in alerts[-1], bus_calls()
             os.unlink(os.path.join(tmp, "bus_send_rc.txt"))
             os.unlink(os.path.join(tmp, "bus_send_out.txt"))
             os.unlink(os.path.join(_bus_dir, "bus.json"))

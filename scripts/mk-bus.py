@@ -5654,6 +5654,11 @@ def self_test():
         rc, send_info, _ = cli(["send", "--run", "r1", "--task", "T1", "--kind", "info", "--text", "update", "--from", "orch", "--to", "T1", "--data", data])
         assert rc == 0 and send_info["ok"] is True, send_info
         info_id = send_info["message"]["id"]
+        # todo 86: the CLI passes every kind to the server (dispatch sends kind task in store
+        # mode); only the server decides, so a file-mode bus refuses it there, not argparse
+        rc_k, res_k, err_k = cli(["send", "--run", "r1", "--task", "T1", "--kind", "task", "--text", "b",
+                                  "--from", "orch", "--to", "T1", "--data", data], check=False)
+        assert "invalid choice" not in err_k and rc_k != 0 and "invalid kind" in json.dumps(res_k) + err_k, (rc_k, res_k, err_k)
 
         th_nan.join(timeout=5.0)
         assert not th_nan.is_alive(), "nan wait thread did not terminate"
@@ -6376,7 +6381,8 @@ def main():
     p_send = subparsers.add_parser("send")
     p_send.add_argument("--run", required=True, help="Run identifier")
     p_send.add_argument("--task", help="Task identifier")
-    p_send.add_argument("--kind", required=True, choices=["ask", "answer", "info", "ack"], help="Message kind")
+    # every kind the server knows; the server refuses a store kind on a file-mode bus
+    p_send.add_argument("--kind", required=True, choices=list(STORE_KINDS), help="Message kind")
     p_send.add_argument("--text", required=True, help="Message text")
     p_send.add_argument("--from", dest="from_sender", help="Sender identifier")
     p_send.add_argument("--to", dest="to_recipient", help="Recipient identifier")

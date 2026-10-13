@@ -9,7 +9,7 @@ You are the orchestrator. Builders are other agents in herdr panes; you plan, ro
 
 ## Resume first
 
-The dashboard mod and its `prompt.compose` section surface the active run (id, stage, **Next action**, waiting item). Its kanban tab (hotkey `k`) shows cards across projects from `mkdb.py cards --json`. Fallback without the mod: `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/mk-state.py run list` then `run get --id <id>` (plain `run get` works when exactly one run is active). Read `<data>/runs/<id>/board.md`, `ctx_search` (sort timeline) for anything newer, check pane and watcher state, continue from **Next action**. Run state exists so that context compaction never loses the run.
+The dashboard mod and its `prompt.compose` section surface the active run (id, stage, **Next action**, waiting item). Its kanban tab (hotkey `k`) shows cards across projects from `mkdb.py cards --json`. Fallback without the mod: `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/mk-state.py run list` then `run get --id <id>` (plain `run get` works when exactly one run is active). Read `<data>/runs/<id>/board.md`, `ctx_search` (sort timeline) for anything newer, check pane and watcher state, continue from **Next action**. Run state exists so that context compaction never loses the run. With an active run, arm the stage 6 bus watch under the Monitor tool now (`mk-bus.py watch --data <data> --run <run>`) and re-arm it on every expiry or `BUS DOWN`: it carries both directions — lane messages, and `BRIEF NOT ON BUS` alerts that `dispatch` posts when a brief could not be published and the full prompt was typed instead.
 
 ## Helper skills and tools — probe, then use by stage
 
