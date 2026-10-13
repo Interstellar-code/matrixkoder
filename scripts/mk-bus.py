@@ -455,6 +455,54 @@ def _mk_state_task_set(data_dir, run, task, status, note, by="orchestrator"):
         return False, str(e)
 
 
+# Todo 67: the words a lane `task` message with head `status <word>` may announce -> (task status
+# it lands on, statuses it may start from). A lane moves its own task along the builder path
+# only: it never sets done/merged (only the orchestrator does), so `done` caps at `verifying`,
+# and a late or stale message after review, merged, qa, done, blocked, stalled, quota or
+# provider changes nothing (mkdb.transition has no legal-transition check of its own).
+_LANE_BUILD_FROM = ("planned", "ready", "fix", "building")
+_LANE_VERIFY_FROM = ("building",)
+LANE_STATUS_WORDS = {
+    "in_progress": ("building", _LANE_BUILD_FROM),
+    "verify": ("verifying", _LANE_VERIFY_FROM),
+    "verifying": ("verifying", _LANE_VERIFY_FROM),
+    "done": ("verifying", _LANE_VERIFY_FROM),
+}
+
+
+def _store_task_row(store, run, task):
+    rows = store.store_select("SELECT status, round FROM tasks WHERE run=? AND id=?", (run, task))
+    return rows[0] if rows else None
+
+
+def _store_move(store, run, task, to, note, allowed_from=None):
+    """Store-mode status write for the lane paths (todo status word, ask block, answer unblock).
+    -> (state_updated, reason). Never raises: the message is already delivered, a refusal rides
+    in the reply. `allowed_from` limits the move to a task in one of those statuses; any other
+    status is left alone and the reason says why. A task already at `to` is a quiet no-op.
+    The read and the write are two transactions (mkdb.transition takes no expected status and
+    is not an owned file), so an orchestrator move inside that few-ms window can be overwritten."""
+    try:
+        row = _store_task_row(store, run, task)
+        if row is None:
+            return False, f"no task {run}:{task} in the store"
+        if row["status"] == to:
+            return False, None
+        if allowed_from and row["status"] not in allowed_from:
+            return False, f"task {task} is {row['status']}, {to} only from {'|'.join(allowed_from)}"
+        store.store_transition(run, task, to, note=note, round_n=row.get("round") or 0)
+        return True, None
+    except Exception as e:
+        return False, f"{to} refused: {e}"
+
+
+def lane_status_word(text):
+    """`status verify\\nround: 1\\n...` -> the word (a LANE_STATUS_WORDS key), else None."""
+    head = (text or "").partition("\n")[0].strip()
+    word = head[7:].strip() if head.startswith("status ") else ""
+    return word if word in LANE_STATUS_WORDS else None
+
+
 def matches_lane(msg, lane):
     if not lane or lane == "*":
         return True
@@ -2072,10 +2120,33 @@ class RequestHandler(BaseHTTPRequestHandler):
                     # never fails the POST (the ask itself was already delivered).
                     ask_reply = {"state_updated": False, "mk_state_error": None}
                     if self.server.bus_state.mark_ask_once(run, msg["id"]):
-                        ask_reply["state_updated"], ask_reply["mk_state_error"] = _mk_state_task_set(
-                            self.server.bus_state.data_dir, run, task, "blocked",
-                            f"bus ask {msg['id']}: {text[:80]}", by="bus")
+                        note = f"bus ask {msg['id']}: {text[:80]}"
+                        if bus.use_store:
+                            # Todo 68d: the store is the state here; only a building task blocks.
+                            ask_reply["state_updated"], ask_reply["mk_state_error"] = _store_move(
+                                store, run, task, "blocked", note, allowed_from=("building",))
+                        else:
+                            ask_reply["state_updated"], ask_reply["mk_state_error"] = _mk_state_task_set(
+                                self.server.bus_state.data_dir, run, task, "blocked", note, by="bus")
                     self.send_json(200, {"ok": True, "message": msg, **ask_reply})
+                elif bus.use_store and kind == "answer" and task:
+                    # Todo 68d: the answer puts a blocked task back to building (file mode does
+                    # it in cmd_answer through mk-state).
+                    upd, err = _store_move(store, run, task, "building", "bus answer", allowed_from=("blocked",))
+                    if err and "only from blocked" in err:
+                        err = None  # not blocked: nothing to undo, not a failure
+                    self.send_json(200, {"ok": True, "message": msg, "state_updated": upd, "mk_state_error": err})
+                elif bus.use_store and kind == "task" and not is_orch and lane_status_word(text) and task:
+                    # Todo 67: a lane `task` message "status in_progress|verify|done" moves its own
+                    # task (the token fixes `task`) along the builder path; the message stays, so
+                    # the dedupe key still reads it. Not a legal move -> 200 and state_ignored.
+                    word = lane_status_word(text)
+                    to, from_ok = LANE_STATUS_WORDS[word]
+                    upd, why = _store_move(store, run, task, to, f"bus status {word}", allowed_from=from_ok)
+                    reply = {"ok": True, "message": msg, "state_updated": upd, "mk_state_error": None}
+                    if why:
+                        reply["state_ignored"] = why
+                    self.send_json(200, reply)
                 else:
                     self.send_json(200, {"ok": True, "message": msg})
 
@@ -2545,8 +2616,9 @@ def cmd_token(args):
         "run": run_val,
         "task": args.task,
         "data": data_dir,
-        "round": round_val,
     }
+    if round_val:
+        payload["round"] = round_val  # never 0: an unarmed token omits it, connect reads the brief
 
     write_json(lane_file, payload, mode=0o600)
 
@@ -2851,7 +2923,10 @@ def cmd_answer(args):
 
     state_updated = False
     mk_state_error = None
-    if task:
+    if "state_updated" in send_res:
+        # Store mode: the bus already moved the task through the store.
+        state_updated, mk_state_error = send_res["state_updated"], send_res.get("mk_state_error")
+    elif task:
         state_updated, mk_state_error = _mk_state_task_set(data_dir, target_run, task,
                                                            "building", "bus answer")
 
@@ -4663,8 +4738,186 @@ def _store_self_test_body(mod):
 
 
         kill(pid2)
+        _lane_state_self_test(mod)
     finally:
         os.environ["PATH"] = orig_path
+        for p in pids:
+            stop_process(p)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _lane_state_self_test(mod):
+    """E8 (todos 67, 68d) on the REAL bus in store mode, on a temp home: a lane `task`
+    message `status verify|done|in_progress` moves the lane's own task, an ask from a building
+    task blocks it and the answer (HTTP and CLI) puts it back, an ask from a planned task still
+    posts with a note. Mock-free: real serve, real store, real token and answer commands."""
+    import shutil
+
+    tmp = tempfile.mkdtemp(prefix="mk-bus-e8-")
+    pids = []
+    saved = {k: os.environ.get(k) for k in ("MK_BUS_DIR", "MK_HOME", "MATRIXKODER_HOME")}
+    home = os.path.join(tmp, "home")
+    data = os.path.join(tmp, "data")
+    os.makedirs(home)
+    os.makedirs(data)
+    for k in saved:
+        os.environ[k] = home
+
+    def call(port, token, path, body):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}{path}", data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}",
+                     "Host": f"127.0.0.1:{port}"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=10.0) as resp:
+                return resp.status, json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read().decode("utf-8", "replace") or "{}")
+
+    def status_of(task):
+        con = mod.open_project(data, data_dir=data)
+        try:
+            return con.execute("SELECT status FROM tasks WHERE run='r1' AND id=?", (task,)).fetchone()["status"]
+        finally:
+            con.close()
+
+    def set_status(task, to):
+        con = mod.open_project(data, data_dir=data)
+        try:
+            con.execute("UPDATE tasks SET status=? WHERE run='r1' AND id=?", (to, task))
+            con.commit()
+        finally:
+            con.close()
+
+    lane_tokens = {}
+
+    def lane_token(task):
+        if task in lane_tokens:
+            return lane_tokens[task]
+        lane = os.path.join(tmp, "lane-" + task)
+        os.makedirs(lane)
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), "token", "--lane", lane,
+                            "--task", task, "--run", "r1", "--data", data],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        assert r.returncode == 0, r.stderr
+        lane_tokens[task] = json.loads(r.stdout.strip().splitlines()[-1])["token"]
+        return lane_tokens[task]
+
+    try:
+        root = mod.open_root(home)
+        try:
+            root.execute("INSERT INTO projects(slug, name, repo, data_dir, mode, created) VALUES (?,?,?,?,?,?)",
+                         ("proj", "proj", "", data, "managed", "t"))
+            root.commit()
+        finally:
+            root.close()
+        mod.import_history(data, None, "r1", run_row={"id": "r1", "status": "active"}, data_dir=data)
+        con = mod.open_project(data, data_dir=data)
+        try:
+            for t in ("S1", "S2", "S3", "L1", "A1", "A2"):
+                mod.add_task(con, "r1", t, "task", title="e8 " + t)
+        finally:
+            con.close()
+        proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), "serve", "--data", data, "--run", "r1"],
+                                start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        pids.append(proc.pid)
+        port = None
+        deadline = time.time() + 15.0
+        while time.time() < deadline and port is None:
+            b = read_json(os.path.join(home, "bus.json")) or {}
+            if b.get("pid") == proc.pid and b.get("port"):
+                port = b["port"]
+            elif proc.poll() is not None:
+                raise AssertionError(f"serve exited {proc.returncode}")
+            else:
+                time.sleep(0.05)
+        assert port, "e8 serve did not publish bus.json"
+        orch = secrets.token_urlsafe(32)
+        toks = read_json(os.path.join(home, "bus-tokens.json"), default={})
+        toks[orch] = {"token": orch, "role": "orch", "run": "r1", "task": "", "lane": "",
+                      "project": "proj", "created_at": now_iso()}
+        write_json(os.path.join(home, "bus-tokens.json"), toks, mode=0o600)
+
+        def lane_word(task, word):
+            return call(port, lane_token(task), "/send", {"kind": "task", "text": f"status {word}\nround: 1\ntodo done X"})
+
+        def entered(task, to):
+            con = mod.open_project(data, data_dir=data)
+            try:
+                return con.execute("SELECT COUNT(*) c FROM events WHERE chan='state' AND kind='transition' "
+                                   "AND run='r1' AND task=? AND to_id=?", (task, to)).fetchone()["c"]
+            finally:
+                con.close()
+
+        # Todo 67: the lane words move the lane's own task along the builder path; `done` caps at
+        # verifying (only the orchestrator sets done); the same word again moves nothing twice.
+        for task, steps in (("S1", (("in_progress", "building"),)),
+                            ("S2", (("in_progress", "building"), ("verify", "verifying"))),
+                            ("S3", (("in_progress", "building"), ("done", "verifying")))):
+            for word, want in steps:
+                code, res = lane_word(task, word)
+                assert code == 200 and res.get("state_updated") is True and res.get("mk_state_error") is None, (word, res)
+                assert "state_ignored" not in res and status_of(task) == want, (word, status_of(task), res)
+        code, res = lane_word("S2", "verify")
+        assert code == 200 and res.get("state_updated") is False and "state_ignored" not in res, res
+        assert entered("S2", "building") == 1 and entered("S2", "verifying") == 1
+        tok_s1 = lane_token("S1")
+        code, res = call(port, tok_s1, "/send", {"kind": "task", "text": "status bogus\nround: 1\n"})
+        assert code == 200 and "state_updated" not in res and status_of("S1") == "building", res
+        code, res = call(port, tok_s1, "/send", {"kind": "task", "task": "S2", "text": "status done\nround: 1\n"})
+        assert code == 403 and status_of("S2") == "verifying", (code, res)
+
+        # A late or stale lane word never overwrites a state the orchestrator moved on to, and
+        # `done` from a lane never reaches done or merged (R2 HIGH).
+        for state in ("review", "merged", "qa", "done", "blocked", "stalled", "quota", "provider", "verifying"):
+            code, st = call(port, orch, "/send", {"run": "r1", "task": "L1", "kind": "status", "text": state,
+                                                  "from": "orch", "to": "L1"})
+            assert code == 200, (state, st)
+            for word in ("in_progress", "done", "verify"):
+                code, res = lane_word("L1", word)
+                if state == "verifying" and word in ("done", "verify"):
+                    assert res.get("state_updated") is False and "state_ignored" not in res, (state, word, res)
+                    continue
+                assert code == 200 and res.get("state_updated") is False and res.get("state_ignored"), (state, word, res)
+                assert status_of("L1") == state, (state, word, status_of("L1"))
+        code, st = call(port, orch, "/send", {"run": "r1", "task": "L1", "kind": "status", "text": "fix", "from": "orch", "to": "L1"})
+        code, res = lane_word("L1", "done")  # fix -> verifying is not a lane move
+        assert res.get("state_updated") is False and res.get("state_ignored") and status_of("L1") == "fix", res
+        code, res = lane_word("L1", "in_progress")
+        assert res.get("state_updated") is True and status_of("L1") == "building", res
+        code, res = lane_word("L1", "done")
+        assert res.get("state_updated") is True and status_of("L1") == "verifying", res
+        assert entered("L1", "done") == 1 and entered("L1", "merged") == 1  # the orchestrator's, not the lane's
+
+        # Todo 68d: a building task is blocked by its ask and unblocked by the answer.
+        set_status("A1", "building")
+        tok_a1 = lane_token("A1")
+        code, ask = call(port, tok_a1, "/send", {"kind": "ask", "text": "which fixture?"})
+        assert code == 200 and ask.get("state_updated") is True and ask.get("mk_state_error") is None, ask
+        assert status_of("A1") == "blocked", status_of("A1")
+        code, ans = call(port, orch, "/send", {"run": "r1", "task": "A1", "kind": "answer", "text": "the schema one",
+                                               "from": "orch", "to": "A1", "reply_to": ask["message"]["id"]})
+        assert code == 200 and ans.get("state_updated") is True and ans.get("mk_state_error") is None, ans
+        assert status_of("A1") == "building", status_of("A1")
+        # the answer CLI takes the same store path (no mk-state, no second write)
+        code, ask2 = call(port, tok_a1, "/send", {"kind": "ask", "text": "and the report?"})
+        assert code == 200 and ask2.get("state_updated") is True and status_of("A1") == "blocked", ask2
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), "answer", ask2["message"]["id"], "in the lane",
+                            "--run", "r1", "--data", data], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        out_ans = json.loads(r.stdout.strip().splitlines()[-1]) if r.stdout.strip() else {}
+        assert r.returncode == 0 and out_ans.get("state_updated") is True and out_ans.get("mk_state_error") is None, (r.stdout, r.stderr)
+        assert status_of("A1") == "building", status_of("A1")
+        # a planned task: the ask still posts, nothing moves, the note says why
+        code, ask3 = call(port, lane_token("A2"), "/send", {"kind": "ask", "text": "planned lane ask"})
+        assert code == 200 and ask3["ok"] is True and ask3.get("state_updated") is False, ask3
+        assert "planned" in (ask3.get("mk_state_error") or "") and "building" in ask3["mk_state_error"], ask3
+        assert status_of("A2") == "planned"
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
         for p in pids:
             stop_process(p)
         shutil.rmtree(tmp, ignore_errors=True)
