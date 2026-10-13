@@ -466,6 +466,18 @@ def _jload(s):
         return None
 
 
+def agent_in_pane(pane):
+    """True when `herdr agent list` shows an agent in <pane>; False when it shows none or herdr
+    cannot say (missing binary, failure, bad JSON, the 3 s bound) — the caller never hears an error."""
+    try:
+        r = subprocess.run([herdr_bin(), "agent", "list"], capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    j = _jload(r.stdout) if r.returncode == 0 else None
+    agents = ((j or {}).get("result") or {}).get("agents")
+    return isinstance(agents, list) and any(isinstance(x, dict) and x.get("pane_id") == pane for x in agents)
+
+
 def pane_state(pane):
     """(agent_status, raw list row, error) of <pane> from `herdr pane list`. The row is the exact
     dict the list named the pane with (None when it did not). A failed / malformed list is an
@@ -1034,8 +1046,16 @@ def cmd_arm(a):
     # never fatal — the lane is armed with or without the bus
     bus = (arm_bus(lane, listed[0], run, w["data"]) if bus_enabled(w["data"])
            else {"ok": True, "skipped": "bus.enabled is false"})
+    # the git guard is a PATH export that only reaches agents started after it: one already running
+    # in the pane never has it (false); no agent yet is unknown (null) — never claimed true
+    running = agent_in_pane(pane)
+    guard = ({"guard_active": False,
+              "guard_note": "an agent was already running when armed; the git guard on PATH only reaches "
+                            f"agents started after the export — restart the agent after exporting "
+                            f"{lane}/.matrixkoder-bin, or rely on the brief's banned-git list"}
+             if running else {"guard_active": None})
     out({"ok": True, "lane": lane, "pane": pane, "watch": os.path.join(lane, WATCH), "armed_at": now,
-         "bus": bus, **({"task_pane_error": "; ".join(errs)} if errs else {})})
+         "bus": bus, **guard, **({"task_pane_error": "; ".join(errs)} if errs else {})})
 
 
 def cmd_disarm(a):
@@ -1783,6 +1803,10 @@ def self_test():
                     "        nm = os.path.join(base, 'pane_list_out.txt')\n"
                     "    sys.stdout.write(open(nm).read())\n"
                     "    sys.exit(0)\n"
+                    "elif a[:2] == ['agent', 'list'] and os.path.exists(os.path.join(base, 'agent_list_out.txt')):\n"
+                    "    sys.stdout.write(open(os.path.join(base, 'agent_list_out.txt')).read())\n"
+                    "    sys.exit(int(open(os.path.join(base, 'agent_list_rc.txt')).read().strip() or '0')"
+                    " if os.path.exists(os.path.join(base, 'agent_list_rc.txt')) else 0)\n"
                     "else:\n"
                     "    print(json.dumps({'result': {}}))\n")
         os.chmod(os.path.join(bin_, "herdr"), 0o755)
@@ -1906,6 +1930,24 @@ def self_test():
         w = watch_of("H1")
         assert (w["pane"], w["task"], w["run"], w["phase"], w["data"]) == (pane_of("H1"), "H1", "r1", "P1", data)
         assert w["commit_grep"] == r"feat\(p1\)" and w["verdict"] is None and w["armed_at"] and w["last_activity"]
+        # (G1) arm reports the git guard: no agent in the pane yet = unknown (null), never true
+        assert a["guard_active"] is None and "guard_note" not in a, a
+        al_out, al_rc = os.path.join(tmp, "agent_list_out.txt"), os.path.join(tmp, "agent_list_rc.txt")
+        open(al_out, "w").write(json.dumps({"result": {"agents": [
+            {"agent": "opencode", "agent_status": "idle", "pane_id": pane_of("H1")}]}}) + "\n")
+        a2 = arm("H1", report="report.json", prompt_marker="dispatch-h1")
+        assert a2["guard_active"] is False, a2
+        assert f"{lanes['H1']}/.matrixkoder-bin" in a2["guard_note"] and "already running" in a2["guard_note"], a2
+        open(al_out, "w").write(json.dumps({"result": {"agents": [
+            {"agent": "opencode", "agent_status": "idle", "pane_id": "wD:elsewhere"}]}}) + "\n")
+        assert arm("H1", report="report.json", prompt_marker="dispatch-h1")["guard_active"] is None
+        open(al_out, "w").write("not json\n")  # a herdr that cannot say stays unknown, arm still ok
+        assert arm("H1", report="report.json", prompt_marker="dispatch-h1")["guard_active"] is None
+        open(al_rc, "w").write("1")
+        open(al_out, "w").write(json.dumps({"result": {"agents": [{"pane_id": pane_of("H1")}]}}) + "\n")
+        assert arm("H1", report="report.json", prompt_marker="dispatch-h1")["guard_active"] is None
+        os.unlink(al_out)
+        os.unlink(al_rc)
         # arm records the lane's pane on the task, so the board names it without reading the watch file
         def task_field(tid, key):
             run_ = json.load(open(os.path.join(data, "runs", "r1", "run.json")))
