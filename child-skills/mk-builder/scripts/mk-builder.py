@@ -1833,7 +1833,8 @@ def bus_token_path(lane):
         return lane_file
     if os.environ.get("MK_BUS_DIR"):
         home = os.path.abspath(os.path.expanduser(os.environ["MK_BUS_DIR"]))
-    elif os.environ.get("MK_HOME"):
+    elif os.environ.get("MK_HOME") or os.environ.get("MATRIXKODER_HOME"):
+        # C16: either name, the same home mk-bus.py writes the token under
         home = os.path.abspath(os.path.expanduser(_one_home()))
     else:
         home = os.path.join(os.path.expanduser("~"), ".matrixkoder")
@@ -4686,17 +4687,22 @@ def t_d7_token_path_one_function(root):
         f.write("{}\n")
     # The function is what production code calls; drive it in-process with env, since no CLI
     # prints the path. HOME is a temp dir either way.
-    saved = {k: os.environ.get(k) for k in ("HOME", "MK_HOME", "MK_BUS_TOKEN_FILE")}
+    saved = {k: os.environ.get(k) for k in ("HOME", "MK_HOME", "MATRIXKODER_HOME", "MK_BUS_TOKEN_FILE")}
     try:
         os.environ["HOME"] = os.path.join(root, "h")
         os.makedirs(os.environ["HOME"], exist_ok=True)
         os.environ.pop("MK_HOME", None)
+        os.environ.pop("MATRIXKODER_HOME", None)
         os.environ["MK_BUS_TOKEN_FILE"] = override
         assert bus_token_path(lane) == override
         os.environ.pop("MK_BUS_TOKEN_FILE")
         got = bus_token_path(lane)
         assert got == os.path.join(os.environ["HOME"], ".matrixkoder", "bus-lanes",
                                    lane_hash(lane) + ".json"), got
+        # todo 89 / C16: MATRIXKODER_HOME alone moves it, like MK_HOME (mk-bus.py writes there)
+        os.environ["MATRIXKODER_HOME"] = os.path.join(root, "mch")
+        assert bus_token_path(lane) == os.path.join(root, "mch", "bus-lanes", lane_hash(lane) + ".json")
+        os.environ.pop("MATRIXKODER_HOME")
         # a lane file wins over the home location
         with open(os.path.join(lane, BUS_LANE_FILE), "w") as f:
             f.write("{}\n")
