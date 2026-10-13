@@ -2173,6 +2173,10 @@ def cmd_connect(a):
     if not tasks:
         lines.append("# tasks: (none — no plan, or this phase has no tasks)")
     print("\n".join(lines))
+    # Once per connect (not per page; `read` posts nothing). Best effort: the brief is out.
+    if cfg is not None:
+        with contextlib.suppress(BusDown, BusHttp, OSError, ValueError):
+            bus_send(cfg, "info", f"lane connected {old.get('task')} R{old.get('round')}")
     raise Handled(0)
 
 
@@ -4164,6 +4168,35 @@ def t_d7b_connect_reads_the_bus_brief(root):
     begin(empty, root, run=BUS_RUN, task="D7E")
     code, lines = cli(empty, "connect")
     assert lines == ["# brief: none found"], (code, lines, brief_messages(bus_lane_config(empty)))
+
+
+def t_g1_connect_posts_one_info(root):
+    """connect posts ONE `lane connected <task> R<n>` info, even for a paged brief; a down
+    bus changes neither connect's exit code nor its stdout."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data, _, _ = bus_server(root, "g1conn")
+    brief = "# brief\n" + "x" * (BRIEF_PAGE * 2) + "\n"
+
+    def connect(name, task, env=None):
+        lane = bus_lane(root, name, task, data)
+        begin(lane, root, run=BUS_RUN, task=task)
+        with open(os.path.join(lane, ".matrixkoder-brief.md"), "w") as f:
+            f.write(brief)
+        return cli(lane, "connect", env=env)
+
+    def posted(task):
+        return [r["text"] for r in bus_rows(data)
+                if r.get("kind") == "info" and r.get("task") == task
+                and (r.get("text") or "").startswith("lane connected")]
+
+    code, up = connect("g1_up_lane", "G1U")
+    assert code == 0 and "# more: read <id> --part 2 .. 3" in up, (code, up[:1])
+    assert posted("G1U") == ["lane connected G1U R1"], posted("G1U")
+    code, down = connect("g1_down_lane", "G1D", env={"MK_BUS_URL": "http://127.0.0.1:1"})
+    # the header names the lane path, which differs; every other stdout line must match
+    assert code == 0 and down[1:] == up[1:] and down[0].startswith("# brief 1/3 "), (code, down[:1])
+    assert posted("G1D") == [], posted("G1D")
 
 
 def t_d7_todo_backup_and_dedupe(root):
