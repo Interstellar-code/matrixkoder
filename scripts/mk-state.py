@@ -34,6 +34,11 @@
       reviewing/merging/fixing are stored as review/merged/fix; a task whose deps are all met gets
       ready=true and a "deps met" event; an unreadable sibling run only produces a warnings entry
   task round T --kind build|fix|takeover [--cause TEXT]
+  task round --tasks C1,S1,P1 --kind ... — a lane_group in one round: the lead (first id) owns the one
+      brief/report/review path (tasks/C1/brief-rN.md); the round number and kind are recorded on EVERY
+      listed task, one event each. N is the highest current round of the listed tasks plus one. T, if
+      given, must equal the first id. Every id must exist and share the lead's lane_group (a child
+      task takes its parent's); else ok:false and nothing is written. Not with --undo.
       with the store on, also stores the brief/report/review files of that round as artifacts
       (task, round, kind) when they already exist, and still writes the task-folder files as views
   task round T --undo — drop the latest round again, but only while none of its brief/report/review
@@ -719,10 +724,10 @@ class Store:
         # task round: the tasks row (and its root card) must not keep the previous round's
         # terminal status or verdict. import_history already wrote the new status; the card
         # is updated here, in this same commit, with no second event line.
-        reset = getattr(self, "_round_reset", None)
-        if reset:
-            self._round_reset = None
-            tid, kind = reset
+        reset = getattr(self, "_round_reset", None) or []  # [(task, kind)]: a lane_group has several
+        self._round_reset = None
+        while reset:
+            tid, kind = reset.pop(0)
             task = next((t for t in run.get("tasks") or [] if t.get("id") == tid), None)
             if task:
                 to = ROUND_STATUS[kind]
@@ -1807,6 +1812,13 @@ def add_task(st, run, tid, title, wave, deps, owned, parent, by, extra=None):
 def cmd_task(a, st):
     with st.locked():
         st.repair()
+        if getattr(a, "tasks", None):  # round --tasks: the lead (first id) is the task
+            ids = csv(a.tasks)
+            if not ids or (a.task and a.task != ids[0]):
+                raise Fail(f"task {a.task!r} must be the first of --tasks (the lead): {a.tasks!r}")
+            a.task = ids[0]
+        elif a.action == "round" and not a.task:
+            raise Fail("task round needs a task id (or --tasks LEAD,...)")
         run = st.load(a.run, getattr(a, "task", None))
         if a.action == "get":
             t = find_task(run, a.task)
@@ -1881,8 +1893,8 @@ def cmd_task(a, st):
             elif a.note and not fanned:  # a fan-out already spent the note on each child
                 st.event(run, "note", a.note, task=t["id"], by=a.by)
         elif getattr(a, "undo", False):  # round --undo: drop the latest round, but only an empty one
-            if a.kind or a.cause:
-                raise Fail("task round --undo takes no --kind/--cause")
+            if a.kind or a.cause or a.tasks:
+                raise Fail("task round --undo takes no --kind/--cause/--tasks")
             if not t["rounds"]:
                 raise Fail(f"task {t['id']} has no round to undo")
             n = t["rounds"][-1]["n"]
@@ -1902,16 +1914,34 @@ def cmd_task(a, st):
         else:  # round
             if a.kind not in ROUND_KINDS:
                 raise Fail(f"bad kind {a.kind!r}; one of: {' '.join(ROUND_KINDS)}")
-            n = t["round"] + 1
-            t["round"] = n
-            t["rounds"].append({"n": n, "kind": a.kind, "cause": a.cause, "verdict": None, "sha": None,
-                                "started": now()})
-            st.event(run, "note", f"round {n} ({a.kind})" + (f": {a.cause}" if a.cause else ""),
-                     task=t["id"], by=a.by)
+            group = [t]  # a lane_group round: the lead first, the rest share its one round number
+            if a.tasks:
+                group += [find_task(run, i) for i in csv(a.tasks)[1:]]
+                if len({x["id"] for x in group}) < len(group):
+                    raise Fail(f"--tasks lists a task twice: {a.tasks!r}")
+
+                def lane_group(x):  # a child task has none of its own: its parent phase's
+                    return next((y.get("lane_group") for y in [x, *ancestor_chain(run, x.get("parent"))]
+                                 if y.get("lane_group")), None)
+                lg = lane_group(t)
+                for x in group:
+                    if not lg or lane_group(x) != lg:
+                        raise Fail(f"task {x['id']} is not in the lane_group of {t['id']} "
+                                   f"({lg or 'none'}; {x['id']}: {lane_group(x) or 'none'})")
+            n = max(x["round"] for x in group) + 1
+            for x in group:
+                x["round"] = n
+                x["rounds"].append({"n": n, "kind": a.kind, "cause": a.cause, "verdict": None,
+                                    "sha": None, "started": now()})
+                st.event(run, "note", f"round {n} ({a.kind})" + (f": {a.cause}" if a.cause else "")
+                         + (f" [group lead {t['id']}]" if x is not t else ""), task=x["id"], by=a.by)
+                if x is not t:  # save() below writes the lead's task.json only
+                    x["updated"] = now()
+                    write_json(os.path.join(st.task_dir(run["id"], x["id"]), "task.json"), x)
             # Store mode only, and only the store row: the file views (run.json, events,
             # task.json) stay exactly what the file path writes. The watcher reads the row.
             if st.store_on:
-                st._round_reset = (t["id"], a.kind)
+                st._round_reset = [(x["id"], a.kind) for x in group]
         t["updated"] = now()
         st.save(run, t, a.by)
         warnings = st.refresh_others(run, a.by) if a.action == "set" else []
@@ -1921,6 +1951,7 @@ def cmd_task(a, st):
             paths = {k: os.path.join(d, f"{k}-r{t['round']}.md") for k in ("brief", "report", "review")}
             stored = st.store_round_files(run, t) if st.store_on else []
             return {"ok": True, "task": t["id"], "round": t["round"], "kind": a.kind,
+                    **({"tasks": csv(a.tasks)} if a.tasks else {}),
                     **({"stored": stored} if stored else {}), **paths}
         return {"ok": True, "task": t, **({"warnings": warnings} if warnings else {})}
 
@@ -2365,7 +2396,8 @@ def build_parser():
     t.add_argument("task"), t.add_argument("pairs", nargs="+"), t.add_argument("--note")
     t.add_argument("--force", action="store_true")
     t = task.add_parser("round", parents=[data_p, run_p])
-    t.add_argument("task"), t.add_argument("--kind"), t.add_argument("--cause")
+    t.add_argument("task", nargs="?"), t.add_argument("--kind"), t.add_argument("--cause")
+    t.add_argument("--tasks")  # lane_group round: LEAD,T2,T3; the task arg is optional then
     t.add_argument("--undo", action="store_true")  # drop the latest (empty) round; kind checked in cmd
     t = task.add_parser("get", parents=[data_p, run_p])
     t.add_argument("task")
@@ -3202,6 +3234,43 @@ def self_test():
         assert r1run["plan_id"] is None and r1run["plan_sha"] is None and r1run["plan_status"] is None
         assert all(x.get("plan_phase") is None and x.get("plan_task") is None for x in r1run["tasks"])
         assert {r["id"]: r for r in mk("run", "list")["runs"]}["r1"]["plan"] is None
+
+        # task round --tasks: one lane_group round, recorded on every listed task (lead first)
+        def grp(i, g, kids=()):
+            return {**PLAN_BASE["phases"][1], "id": i, "title": i, "deps": [], "owned": [], "lane_group": g,
+                    "tasks": [{"id": k, "title": k, "acceptance": "a", "refs": [], "subagent": False,
+                               "owned": []} for k in kids]}
+        gfile = os.path.join(tmp, "lgplan.json")
+        json.dump({**PLAN_BASE, "phases": [grp("C1", "G", ["C1.1"]), grp("S1", "G"), grp("P1", "G"),
+                                           grp("X1", "H")]}, open(gfile, "w"))
+        pk("run", "init", "--id", "lg1", "--feature", "Group", "--branch", "b", "--plan", gfile)
+        pk("task", "round", "S1", "--kind", "build", "--run", "lg1")  # S1 is one round ahead
+        lgev = os.path.join(pd, "runs", "lg1", "events.jsonl")
+        n_ev = len(open(lgev).readlines())
+        for bad, why in ((("--tasks", "C1,NOPE"), "NOPE"), (("--tasks", "C1,X1"), "lane_group"),
+                         (("--tasks", "C1,C1"), "twice"), (("--tasks", "S1,C1", "C1"), "first of --tasks"),
+                         (("--tasks", "C1,S1", "--undo"), "takes no")):
+            e = pk("task", "round", *bad, "--kind", "build", "--run", "lg1", code=2)
+            assert e["ok"] is False and why in e["error"], (bad, e)
+        assert len(open(lgev).readlines()) == n_ev  # every refusal wrote nothing
+        assert pk("task", "get", "C1", "--run", "lg1")["task"]["round"] == 0
+        out = pk("task", "round", "--tasks", "C1,S1,P1,C1.1", "--kind", "build", "--run", "lg1")
+        assert out["round"] == 2 and out["tasks"] == ["C1", "S1", "P1", "C1.1"], out  # 1 + the max (S1's)
+        assert out["brief"].endswith(os.path.join("tasks", "C1", "brief-r2.md")), out  # lead's folder only
+        for tid in ("C1", "S1", "P1", "C1.1"):
+            tt = pk("task", "get", tid, "--run", "lg1")["task"]
+            assert tt["round"] == 2 and tt["rounds"][-1]["n"] == 2 and tt["rounds"][-1]["kind"] == "build", tt
+            on_disk = json.load(open(os.path.join(pd, "runs", "lg1", "tasks", tid, "task.json")))
+            assert on_disk["round"] == 2, on_disk
+        evs = [json.loads(x) for x in open(lgev)][n_ev:]
+        assert sorted(x["task"] for x in evs) == ["C1", "C1.1", "P1", "S1"], evs  # one event per task
+        assert pk("task", "get", "X1", "--run", "lg1")["task"]["round"] == 0  # another group: untouched
+        # the positional lead is optional, and without --tasks nothing changes
+        assert pk("task", "round", "C1", "--tasks", "C1,S1", "--kind", "fix", "--run", "lg1")["round"] == 3
+        assert pk("task", "round", "X1", "--kind", "build", "--run", "lg1")["round"] == 1
+        assert pk("task", "get", "P1", "--run", "lg1")["task"]["round"] == 2
+        assert "needs a task" in pk("task", "round", "--kind", "build", "--run", "lg1", code=2)["error"]
+        pk("run", "archive", "--id", "lg1")  # later cases expect one active run
 
         # --force init on an unapproved plan: allowed, and an event says so
         db["status"] = "draft"
