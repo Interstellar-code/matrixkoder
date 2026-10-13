@@ -488,6 +488,18 @@ def agent_in_pane(pane):
     return isinstance(agents, list) and any(isinstance(x, dict) and x.get("pane_id") == pane for x in agents)
 
 
+def pane_lacks_agent(pane):
+    """True only when `herdr agent list` answers with a list and <pane> is not in it. herdr
+    failing or answering oddly is "cannot say" (False), so an unknown never blocks a dispatch."""
+    try:
+        r = subprocess.run([herdr_bin(), "agent", "list"], capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    j = _jload(r.stdout) if r.returncode == 0 else None
+    agents = ((j or {}).get("result") or {}).get("agents") if isinstance(j, dict) else None
+    return isinstance(agents, list) and not any(isinstance(x, dict) and x.get("pane_id") == pane for x in agents)
+
+
 def pane_state(pane):
     """(agent_status, raw list row, error) of <pane> from `herdr pane list`. The row is the exact
     dict the list named the pane with (None when it did not). A failed / malformed list is an
@@ -965,6 +977,11 @@ def cmd_dispatch(a):
         # watch file names the run/task; the review brief goes as its own kind and the pane
         # gets `connect --role review`. No --lane keeps the typed review prompt (old callers).
         rlane = opt(a, "--lane")
+        if pane_lacks_agent(pane):
+            # todo 88: publishing first left one review-brief copy on the bus per failed retry
+            out({"ok": False, "delivered": False, "pane": pane, "connect": False,
+                 "error": f"no agent in pane {pane}; start the reviewer first (nothing published)"})
+            return
         w = read_watch(rlane) or {}
         rdata, rrun, rtask = w.get("data") or "", w.get("run"), w.get("task")
         why = None
@@ -2965,6 +2982,15 @@ def self_test():
             assert any("BRIEF NOT ON BUS" in c for c in bus_calls()[b0:]), bus_calls()[b0:]
             # with a review brief it is published as its own kind and the pane gets connect --role review
             open(os.path.join(_td, "review-brief-r1.md"), "w").write("# NB review brief\n")
+            # todo 88: herdr lists agents and none sits in the pane → refused, nothing published
+            open(os.path.join(tmp, "agent_list_out.txt"), "w").write(json.dumps(
+                {"result": {"agents": [{"pane_id": "elsewhere"}]}}) + "\n")
+            n0, b0 = len(prompt_calls()), len(bus_calls())
+            r = cli("dispatch", "--pane", pane_of("NB"), "--text", "the full prompt stays", "--role", "review",
+                    "--lane", lanes["NB"])
+            assert r["ok"] is False and "no agent in pane" in r["error"], r
+            assert bus_calls()[b0:] == [] and prompt_calls()[n0:] == [], (bus_calls()[b0:], prompt_calls()[n0:])
+            os.unlink(os.path.join(tmp, "agent_list_out.txt"))
             n0, b0 = len(prompt_calls()), len(bus_calls())
             r = cli("dispatch", "--pane", pane_of("NB"), "--text", "the full prompt stays", "--role", "review",
                     "--lane", lanes["NB"])
