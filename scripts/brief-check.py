@@ -106,20 +106,38 @@ def in_span(n, spans):
     return any(a <= n < b for a, b in spans)
 
 
-def placeholder_failures(text):
-    """Unfilled `<...>` outside the optional blocks, and a raw `# <PHASE>` title.
+def _outside_code(line):
+    """The parts of a line that are not inside backticks."""
+    return "".join(part for i, part in enumerate(line.split("`")) if i % 2 == 0)
 
-    Names the line. A filled brief has none of these.
+
+def _template_slot(text):
+    """True for a raw-template slot: its text holds a space, a comma or a slash."""
+    return any(c in text for c in " ,/")
+
+
+def placeholder_failures(text):
+    """Unfilled template slots, and a raw `# <PHASE> — <one-line goal>` title.
+
+    A slot counts only when it is the kind the raw template uses: a `<...>` whose text
+    holds a space, a comma or `/`, sitting outside backticks and outside a fenced block.
+    Short prose tokens (`<id>`, `<sha>`, `<path>`, `<data>`) are not slots. Names the line.
     """
     fails = []
     spans = optional_spans(text)
+    fenced = False
     for n, line in enumerate(text.splitlines(), 1):
-        if in_span(n - 1, spans):
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
             continue
-        if re.search(r"<[^>\n]+>", line):
-            fails.append(f"line {n}: unfilled placeholder: {line.strip()}")
+        if fenced or in_span(n - 1, spans):
+            continue
+        for slot in re.findall(r"<([^>`\n]+)>", _outside_code(line)):
+            if _template_slot(slot):
+                fails.append(f"line {n}: unfilled placeholder: {line.strip()}")
+                break
     first = next((l for l in text.splitlines() if l.strip()), "")
-    if re.match(r"#\s+<PHASE>", first):
+    if re.match(r"#\s+<PHASE>\s+—", first):
         fails.insert(0, f"line 1: raw template title: {first.strip()}")
     return fails
 
@@ -148,7 +166,7 @@ def self_test():
         "",
         "## FIX (review `review-r1.md`)",
         "1. [HIGH] hooks/wake.ts:481 — cursor — baseline it",
-        "- Commit: `fix: x` subject, blank line, `Co-Authored-By: <agent/model> <email>`.",
+        "<what to build, as numbered parts>",
         "",
     ])
     assert placeholder_failures(filled) == [], placeholder_failures(filled)
@@ -157,6 +175,24 @@ def self_test():
     bad = filled.replace("## FIX (review `review-r1.md`)", "## Notes")
     bad_fails = placeholder_failures(bad)
     assert any(f.startswith("line ") and "unfilled placeholder" in f for f in bad_fails), bad_fails
+
+    # a placeholder counts only when it is a raw-template slot. Short prose tokens,
+    # and anything inside backticks or a fence, pass.
+    table = [
+        ("# W1 — the goal", False),
+        ("# <PHASE> — <one-line goal>", True),
+        ("<what to build, as numbered parts>", True),
+        ("<list / globs>", True),
+        ("<cmd>", False),
+        ("<type(scope): message>", True),
+        ("history: `<data>/runs/<id>/tasks/<T>/` (read-only)", False),
+        ("point at files with `path:line`; the `<sha>` is filled", False),
+        ("```\n<what to build, as parts>\n```", False),
+        ("the lane reads <id>, <T>, <sha>, <path> and <data>", False),
+    ]
+    for sample, expect in table:
+        got = bool(placeholder_failures(sample))
+        assert got is expect, (sample, got)
 
     # the live template passes
     fails = check_brief(BRIEF)
