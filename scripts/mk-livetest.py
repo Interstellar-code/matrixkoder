@@ -463,15 +463,17 @@ def _state_mod():
 def row_c1_projects(ctx):
     """Register a project row through mk-state.register_project. usage.json and locks/ stay files."""
     ctx = _need(ctx)
-    saved = os.environ.get("MATRIXKODER_HOME")
+    saved = {k: os.environ.get(k) for k in ("MK_HOME", "MATRIXKODER_HOME")}
+    os.environ["MK_HOME"] = ctx["home"]
     os.environ["MATRIXKODER_HOME"] = ctx["home"]
     try:
         _state_mod().register_project(ctx["slug"], ctx["repo"], ctx["data"], name="live")
     finally:
-        if saved is None:
-            os.environ.pop("MATRIXKODER_HOME", None)
-        else:
-            os.environ["MATRIXKODER_HOME"] = saved
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
     con = mkdb.open_root(ctx["home"])
     try:
         row = con.execute("SELECT slug, name, repo, data_dir, mode FROM projects WHERE slug=?",
@@ -741,7 +743,7 @@ def row_c13_ask_blocked(ctx):
     with open(os.path.join(lane, ".matrixkoder-bus.json"), "w", encoding="utf-8") as fh:
         json.dump({"v": 1, "url": "http://127.0.0.1:1", "token": "tok_down",
                    "run": ctx["run"], "task": "C13A"}, fh)
-    env = dict(os.environ, MATRIXKODER_HOME=ctx["home"])
+    env = dict(os.environ, MATRIXKODER_HOME=ctx["home"], MK_HOME=ctx["home"], MK_BUS_DIR=ctx["home"])
     code, lines, err = _builder(lane, "start", "--run", ctx["run"], "--task", "C13A",
                                 "--round", "1", "--report", "r.md", env=env)
     if code != 0:
@@ -1420,6 +1422,11 @@ def _cli_fail(args):
 
 
 def self_test():
+    # One temp MK home under both names (C16) for the whole suite, plus the guard flag.
+    _live_home = tempfile.mkdtemp(prefix="mk-livetest-home-")
+    os.environ["MK_HOME"] = _live_home
+    os.environ["MATRIXKODER_HOME"] = _live_home
+    os.environ["MK_SELFTEST"] = "1"
     # The doc has a row for every contract C1..C13.
     rows = matrix_rows()
     have = {r["contract"] for r in rows}
@@ -1584,6 +1591,8 @@ def self_test():
     needle = "sqlite3" + ".connect("
     _check(not any(line.lstrip().startswith(needle) for line in src.splitlines()),
            "database connect call in the harness")
+    # R1.2: the mkdb write guard refuses the real home from this suite too.
+    mkdb.selftest_guard_probe(_live_home)
     print("SELF-TEST PASS")
 
 

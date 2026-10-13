@@ -123,8 +123,66 @@ def check_home(path):
         raise Fail(f"refusing a network or synced home: {path}")
 
 
+def _real_home():
+    """The real user MK home, independent of $MK_HOME/$MATRIXKODER_HOME and of $HOME.
+
+    A self-test may override $HOME (mk-state does), so the password database wins;
+    $HOME is only the fallback. Used by the MK_SELFTEST write guard (C16)."""
+    try:
+        import pwd
+        base = pwd.getpwuid(os.getuid()).pw_dir
+    except Exception:
+        base = os.path.expanduser("~")
+    return os.path.realpath(os.path.abspath(os.path.join(base, ".matrixkoder")))
+
+
+def _selftest_write_guard(path):
+    """Refuse a write open outside the temp tree while self-testing (C16).
+
+    Under MK_SELFTEST=1 a writer may only touch the temp tree: the system temp
+    dir ($TMPDIR/TEMP/TMP, tempfile.gettempdir()) or the pinned temp MK home
+    ($MK_HOME/$MATRIXKODER_HOME). Anything under the real ~/.matrixkoder, or any
+    other real path such as a repo's .matrixkoder, raises Fail naming the path.
+    Read-only opens (_connect_ro) never call this.
+    """
+    if os.environ.get("MK_SELFTEST") != "1":
+        return
+    rp = os.path.realpath(os.path.abspath(path))
+    real = _real_home()
+    if rp == os.path.join(real, "mk.db") or rp.startswith(real + os.sep):
+        raise Fail(f"refusing to write the real MK home {rp} under MK_SELFTEST=1 (C16)")
+    roots = set()
+    for key in ("TMPDIR", "TEMP", "TMP"):
+        val = os.environ.get(key)
+        if val:
+            with contextlib.suppress(Exception):
+                roots.add(os.path.realpath(os.path.abspath(val)))
+    with contextlib.suppress(Exception):
+        roots.add(os.path.realpath(os.path.abspath(tempfile.gettempdir())))
+    for key in ("MK_HOME", "MATRIXKODER_HOME"):
+        val = os.environ.get(key)
+        if val:
+            with contextlib.suppress(Exception):
+                roots.add(os.path.realpath(os.path.abspath(os.path.expanduser(val))))
+    if any(rp == root or rp.startswith(root + os.sep) for root in roots if root):
+        return
+    raise Fail(f"refusing to write {rp} under MK_SELFTEST=1: not under the temp dir (C16)")
+
+
 def resolve_home(arg):
-    home = os.path.abspath(os.path.expanduser(arg or os.environ.get("MK_HOME") or "~/.matrixkoder"))
+    """One MK home rule (C16): $MK_HOME and $MATRIXKODER_HOME are the same setting.
+
+    Either name is accepted; when both are set they must resolve to the same
+    directory, else Fail. An explicit --home arg wins over both.
+    """
+    mkh = os.environ.get("MK_HOME")
+    mch = os.environ.get("MATRIXKODER_HOME")
+    if mkh and mch:
+        left = os.path.realpath(os.path.abspath(os.path.expanduser(mkh)))
+        right = os.path.realpath(os.path.abspath(os.path.expanduser(mch)))
+        if left != right:
+            raise Fail(f"MK_HOME ({mkh}) and MATRIXKODER_HOME ({mch}) differ; set one MK home")
+    home = os.path.abspath(os.path.expanduser(arg or mkh or mch or "~/.matrixkoder"))
     check_home(home)
     return home
 
@@ -147,6 +205,7 @@ def project_dir(home, slug=None, data_dir=None):
 
 
 def _connect(path):
+    _selftest_write_guard(path)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     con = sqlite3.connect(path, timeout=5.0)
     con.row_factory = sqlite3.Row
@@ -261,6 +320,7 @@ def _migrate(con, version, migrations):
 def open_root(home, version=SCHEMA, migrations=()):
     """Open or create the root store <home>/mk.db (C1)."""
     check_home(home)
+    _selftest_write_guard(os.path.join(home, "mk.db"))
     return _migrate(_connect(os.path.join(home, "mk.db")), version, ((1, ROOT_DDL),) + tuple(migrations))
 
 
@@ -305,6 +365,7 @@ def _v3(con):
 def open_project(home, slug=None, data_dir=None, version=SCHEMA, migrations=()):
     """Open or create the project store (C2). check_home runs before any directory is created."""
     path = os.path.join(project_dir(home, slug, data_dir), "mk.db")
+    _selftest_write_guard(path)
     con = _migrate(_connect(path), version, ((1, PROJECT_DDL), (2, _v2), (3, _v3)) + tuple(migrations))
     _ensure_prev_status(con)
     _ensure_file_status(con)
@@ -1282,7 +1343,7 @@ def _cli(argv):
     # so a subcommand never sees them and the two positions cannot disagree.
     common = Parser(prog="mkdb.py", add_help=False)
     common.add_argument("--data", help="project data dir (overrides --project)")
-    common.add_argument("--home", help="MK home (default $MK_HOME or ~/.matrixkoder)")
+    common.add_argument("--home", help="MK home (default $MK_HOME or $MATRIXKODER_HOME or ~/.matrixkoder)")
     common.add_argument("--project", help="project slug")
     known, rest = common.parse_known_args(argv)
     p = Parser(prog="mkdb.py", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1388,9 +1449,93 @@ def _cycle_worker(home, data, slot):
         con.close()
 
 
+def _selftest_guard(home):
+    """C16: under MK_SELFTEST=1 a write open outside the temp dir raises; ro reads work."""
+    _check(os.environ.get("MK_SELFTEST") == "1", "guard case ran without MK_SELFTEST=1")
+    real = _real_home()
+    real_db = os.path.join(real, "mk.db")
+    # the real resolved home path, not a made-up one: with both vars unset the
+    # resolver must land on ~/.matrixkoder
+    kept = {k: os.environ.get(k) for k in ("MK_HOME", "MATRIXKODER_HOME")}
+    try:
+        os.environ.pop("MK_HOME", None)
+        os.environ.pop("MATRIXKODER_HOME", None)
+        _check(resolve_home(None) == os.path.abspath(os.path.expanduser("~/.matrixkoder")),
+               f"unset env did not resolve to the real home: {resolve_home(None)}")
+    finally:
+        for k, v in kept.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    sibling_data = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".matrixkoder")
+    for label, fn in (
+            ("root", lambda: open_root(real)),
+            ("project-by-slug", lambda: open_project(real, "guard-probe")),
+            ("project-by-data", lambda: open_project(home, data_dir=sibling_data))):
+        try:
+            con = fn()
+        except Fail as e:
+            _check("MK_SELFTEST=1" in str(e) and ("real" in str(e) or "temp dir" in str(e)),
+                   f"guard error names neither the path nor the rule: {e}")
+        else:
+            con.close()
+            raise SystemExit(f"SELF-TEST FAIL: the guard allowed a write open of {label}")
+    # a read-only open of the same real path stays allowed
+    con = _connect_ro(real_db)
+    try:
+        _check(con.execute("SELECT COUNT(*) c FROM projects").fetchone()["c"] >= 0, "ro read failed")
+    finally:
+        con.close()
+    # a write open under the temp dir works
+    con = open_project(home, "guard-ok")
+    try:
+        _check(con.execute("SELECT 1").fetchone()[0] == 1, "temp write failed")
+    finally:
+        con.close()
+
+
+def selftest_guard_probe(home):
+    """Shared C16 probe for every changed script's --self-test (R1.2).
+
+    Under MK_SELFTEST=1 a write open of the real home or of a real repo path
+    raises; a mode=ro open of the real root works; a write open under the temp
+    home works. Call it from a script's self_test with that suite's temp home.
+    """
+    _selftest_guard(home)
+
+
+def _home_env_parity(tmp):
+    """R1.1: with only one of the two vars set, mkdb and mk-state resolve the same temp home."""
+    state_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mk-state.py")
+    probe = ("import importlib.util, sys; "
+             "spec = importlib.util.spec_from_file_location('mkdb_probe', sys.argv[1]); "
+             "mkdb = importlib.util.module_from_spec(spec); spec.loader.exec_module(mkdb); "
+             "spec2 = importlib.util.spec_from_file_location('mk_state_probe', sys.argv[2]); "
+             "st = importlib.util.module_from_spec(spec2); spec2.loader.exec_module(st); "
+             "print(mkdb.resolve_home(None)); print(st.home())")
+    for key in ("MK_HOME", "MATRIXKODER_HOME"):
+        want = os.path.abspath(os.path.join(tmp, "parity-%s" % key))
+        os.makedirs(want, exist_ok=True)
+        env = {k: v for k, v in os.environ.items() if k not in ("MK_HOME", "MATRIXKODER_HOME")}
+        env[key] = want
+        env["MK_SELFTEST"] = "1"
+        proc = subprocess.run([sys.executable, "-c", probe, os.path.abspath(__file__), state_path],
+                              capture_output=True, text=True, env=env)
+        _check(proc.returncode == 0, "%s-only probe failed: rc=%s %s"
+               % (key, proc.returncode, proc.stderr[-500:]))
+        lines = proc.stdout.strip().splitlines()
+        _check(len(lines) == 2 and lines[0] == lines[1] == want,
+               "%s-only homes differ: %s want %s" % (key, lines, want))
+
+
 def self_test():
     with tempfile.TemporaryDirectory() as tmp:
         home = os.path.join(tmp, "home")
+        saved = {k: os.environ.get(k) for k in ("MK_HOME", "MATRIXKODER_HOME", "MK_SELFTEST")}
+        os.environ["MK_HOME"] = home
+        os.environ["MATRIXKODER_HOME"] = home
+        os.environ["MK_SELFTEST"] = "1"
         _stores(home)
         _guards(tmp, home)
         _migrations(home)
@@ -1423,6 +1568,13 @@ def self_test():
         _projects_read(home)
         _single_writer()
         _ready(home)
+        _selftest_guard(home)
+        _home_env_parity(tmp)
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
     print(json.dumps({"ok": True, "self_test": "pass"}))
     return 0
 

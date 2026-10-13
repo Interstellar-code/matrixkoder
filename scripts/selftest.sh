@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run every scripts/*.py and child-skills/*/scripts/*.py that has a --self-test; exit non-zero if any fails.
 # mk-bus.py --self-test runs as part of the *.py pattern below.
-# Tests use temp dirs and a temp MATRIXKODER_HOME, never the real ~/.matrixkoder.
+# Tests use temp dirs and one temp MK home for the whole run, never the real ~/.matrixkoder.
 # Jobs: MK_SELFTEST_JOBS when set (a non-number or a value < 1 warns and runs serially); otherwise
 # session.selftest_jobs_total from one `python3 mk-config.py get` in its own process group,
 # killed after 5 s (a missing yaml, a missing script, a timeout, a non-zero exit or any other
@@ -15,6 +15,14 @@ export PYTHONDONTWRITEBYTECODE=1
 # drop a lane's git guard (<lane>/.matrixkoder-bin) from PATH when run inside a lane.
 PATH=$(tr ':' '\n' <<<"$PATH" | grep -v '/\.matrixkoder-bin/*$' | paste -sd: -)
 export PATH
+# R1.1 (C16): one temp MK home under both names for the whole run, plus the
+# write-guard flag. Every suite inherits it; each --self-test pins its own temp
+# home under the same names. $MK_BUS_DIR is NOT set here: a file-mode bus keeps
+# bus.json in its data dir, and one MK_BUS_DIR is one bus for every data dir.
+# Removed after the run.
+mk_home=$(mktemp -d "${TMPDIR:-/tmp}/mk-selftest-home.XXXXXX") || exit 2
+export MK_HOME="$mk_home" MATRIXKODER_HOME="$mk_home" MK_SELFTEST=1
+cleanup_home() { rm -rf "$mk_home"; }
 if [ -n "${MK_SELFTEST_JOBS:-}" ]; then
   jobs=$MK_SELFTEST_JOBS
   case $jobs in *[!0-9]*) jobs=0 ;; esac
@@ -85,7 +93,7 @@ if [ "$jobs" -gt 1 ]; then
   export tmp
   xp=
   # Ctrl-C / SIGTERM: stop xargs and every test under it (its own process group), then drop the buffers.
-  cleanup() { [ -n "$xp" ] && { kill -TERM -- "-$xp"; wait "$xp"; } 2>/dev/null; rm -rf "$tmp"; }
+  cleanup() { [ -n "$xp" ] && { kill -TERM -- "-$xp"; wait "$xp"; } 2>/dev/null; rm -rf "$tmp"; cleanup_home; }
   trap cleanup EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
@@ -108,6 +116,8 @@ if [ "$jobs" -gt 1 ]; then
   xp=$!
   wait "$xp"
   xp=
+else
+  trap cleanup_home EXIT
 fi
 fail=0 ran=0
 for f in "${files[@]}"; do

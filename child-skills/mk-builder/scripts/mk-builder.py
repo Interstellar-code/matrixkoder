@@ -1801,6 +1801,22 @@ def lane_hash(lane):
     return hashlib.sha256(os.path.realpath(lane).encode("utf-8")).hexdigest()
 
 
+def _one_home():
+    """One MK home rule (C16): $MK_HOME and $MATRIXKODER_HOME are the same setting.
+
+    Returns the MK home or None when neither is set (the caller falls back to
+    ~/.matrixkoder). When both are set they must agree, else Fail.
+    """
+    mkh = os.environ.get("MK_HOME")
+    mch = os.environ.get("MATRIXKODER_HOME")
+    if mkh and mch:
+        left = os.path.realpath(os.path.abspath(os.path.expanduser(mkh)))
+        right = os.path.realpath(os.path.abspath(os.path.expanduser(mch)))
+        if left != right:
+            raise Fail(f"MK_HOME ({mkh}) and MATRIXKODER_HOME ({mch}) differ; set one MK home")
+    return mkh or mch
+
+
 def bus_token_path(lane):
     """ONE resolver for the lane token file (D6B moves it; this CLI must follow).
 
@@ -1818,7 +1834,7 @@ def bus_token_path(lane):
     if os.environ.get("MK_BUS_DIR"):
         home = os.path.abspath(os.path.expanduser(os.environ["MK_BUS_DIR"]))
     elif os.environ.get("MK_HOME"):
-        home = os.path.abspath(os.path.expanduser(os.environ["MK_HOME"]))
+        home = os.path.abspath(os.path.expanduser(_one_home()))
     else:
         home = os.path.join(os.path.expanduser("~"), ".matrixkoder")
     return os.path.join(home, "bus-lanes", lane_hash(lane) + ".json")
@@ -2006,6 +2022,19 @@ def parse_brief_message(text):
     return n, rest[len("kind:brief\n"):]
 
 
+def parse_review_brief_message(text):
+    """A published review brief is `round:<n>\nkind:review-brief\n<body>`. -> (round, body) or None.
+    Its own kind, so a reviewer sharing the lane never picks up the builder's brief (or the reverse)."""
+    head, sep, rest = (text or "").partition("\n")
+    if not (sep and head.startswith("round:") and rest.startswith("kind:review-brief\n")):
+        return None
+    try:
+        n = int(head[6:].strip())
+    except ValueError:
+        return None
+    return n, rest[len("kind:review-brief\n"):]
+
+
 def brief_messages(cfg):
     """Every bus message for this lane's task, newest last. The store when it exists,
     else bus.jsonl. One read, so an inbox of earlier messages cannot eat the budget.
@@ -2173,6 +2202,18 @@ def cmd_connect(a):
     data = resolve_data_dir(cfg, getattr(a, "data", None))
     if data:
         os.environ["MK_BUS_DATA"] = data
+    if ROLE_ALIASES.get(getattr(a, "role", None) or "builder") == "reviewer":
+        # a reviewer reads its own review brief from the bus and leaves the builder's status alone.
+        # shortcut: printed whole, not paged — review briefs are a few KB; page it if one passes BRIEF_PAGE.
+        found = None
+        for text in brief_messages(cfg) if cfg else []:
+            found = parse_review_brief_message(text) or found
+        if not found:
+            print("# review brief: none found")
+            raise Handled(0)
+        print(f"# review brief round {found[0]}")
+        print(found[1])
+        raise Handled(0)
     old = read_status(lane)
     if old is None:
         # Data dir is already exported, so the brief peek can see the bus copy.
@@ -2278,7 +2319,7 @@ def cmd_hook_install(a):
     """Dispatch-time hook install. Refuses to write inside the lane worktree."""
     lane = lane_dir(a)
     kind = check_agent(a.agent or detect_agent())
-    home = os.environ.get("MK_HOME") or os.path.expanduser("~/.matrixkoder")
+    home = _one_home() or os.path.expanduser("~/.matrixkoder")
     home = os.path.abspath(home)
     if os.path.commonpath([home, os.path.abspath(lane)]) == os.path.abspath(lane):
         raise Fail("hook install must be outside the worktree [C8]")
@@ -2517,6 +2558,7 @@ def build_parser():
     sp = lane_cmd("connect", cmd_connect, "print the brief (paged) and the phase task list [D7.1]")
     sp.add_argument("--plan", default=None, help="plan file; default $MK_PLAN")
     sp.add_argument("--data", default=None, help="project data dir (else $MK_BUS_DATA or the token file)")
+    sp.add_argument("--role", default="builder", help="builder | reviewer (alias: review): which brief to print")
     sp = lane_cmd("read", cmd_read, "print one page of a paged brief or message [D7.1]")
     sp.add_argument("msg_id")
     sp.add_argument("--part", type=int, default=1)
@@ -4069,7 +4111,7 @@ def d7_answer(data, ask_id, text, to_task):
     Store mode publishes bus.json in the MK home, not in the data dir."""
     bus_json = os.path.join(data, "bus.json")
     if not os.path.isfile(bus_json):
-        home = os.environ.get("MK_BUS_DIR") or os.environ.get("MK_HOME") or os.path.expanduser("~/.matrixkoder")
+        home = os.environ.get("MK_BUS_DIR") or _one_home() or os.path.expanduser("~/.matrixkoder")
         bus_json = os.path.join(home, "bus.json")
     with open(bus_json) as f:
         b = json.load(f)
@@ -4203,6 +4245,19 @@ def t_d7b_connect_reads_the_bus_brief(root):
     begin(empty, root, run=BUS_RUN, task="D7E")
     code, lines = cli(empty, "connect")
     assert lines == ["# brief: none found"], (code, lines, brief_messages(bus_lane_config(empty)))
+    # a review brief is its own kind: the reviewer gets it, the builder's connect does not
+    code, lines = cli(lane, "connect", "--role", "review")
+    assert lines == ["# review brief: none found"], (code, lines)
+    rb = "round:1\nkind:review-brief\n# D7B review brief\nreview the thing\n"
+    code, res = bus_cli("send", "--data", data, "--run", BUS_RUN, "--task", "D7B",
+                        "--kind", "info", "--from", "orch", "--to", "D7B", "--text", rb)
+    assert code == 0 and res.get("ok"), res
+    code, lines = cli(lane, "connect", "--role", "review")
+    text = "\n".join(lines)
+    assert code == 0 and "# review brief round 1" in text and "review the thing" in text, (code, lines)
+    code, lines = cli(lane, "connect")
+    text = "\n".join(lines)
+    assert "round two brief" in text and "review the thing" not in text, text
 
 
 def t_g1_connect_posts_one_info(root):
@@ -4386,7 +4441,7 @@ def t_d7_hook_install_outside(root):
     lane = gitlane(root, "d7_hook_lane")
     begin(lane, root)
     home = os.path.join(root, "mk-home")
-    code, lines = cli(lane, "hook-install", "--agent", "claude", env={"MK_HOME": home})
+    code, lines = cli(lane, "hook-install", "--agent", "claude", env={"MK_HOME": home, "MATRIXKODER_HOME": home})
     assert code == 0, lines
     out = jline(lines)
     assert out["installed"] is True and out["settings"].startswith(home), out
@@ -4394,7 +4449,7 @@ def t_d7_hook_install_outside(root):
     with open(out["settings"]) as f:
         doc = json.load(f)
     assert "recorded_payload" in doc
-    code, lines = cli(lane, "hook-install", "--agent", "agy", env={"MK_HOME": home})
+    code, lines = cli(lane, "hook-install", "--agent", "agy", env={"MK_HOME": home, "MATRIXKODER_HOME": home})
     assert code == 0 and jline(lines)["installed"] is False, lines
 
 
@@ -5593,12 +5648,13 @@ def run_self_test():
     # Todo 69: the real home's root store, read with os.stat only, before anything runs.
     real_db = os.path.join(os.path.expanduser("~"), ".matrixkoder", "mk.db")
     real_before = stat_of(real_db)
-    pinned = {k: os.environ.get(k) for k in ("MK_HOME", "MATRIXKODER_HOME", "MK_BUS_DIR", "MK_BUS_DATA")}
+    pinned = {k: os.environ.get(k) for k in ("MK_HOME", "MATRIXKODER_HOME", "MK_BUS_DIR", "MK_BUS_DATA", "MK_SELFTEST")}
     try:
         for name, fn in cases:
             # Every case starts on the temp home; a store-mode bus case pins its own (pin_home).
             # MK_BUS_DIR and MK_BUS_DATA stay unset here: a file-mode bus keeps bus.json in its data dir.
             os.environ["MK_HOME"] = os.environ["MATRIXKODER_HOME"] = os.path.join(root, "pin-home")
+            os.environ["MK_SELFTEST"] = "1"
             os.environ.pop("MK_BUS_DIR", None)
             os.environ.pop("MK_BUS_DATA", None)
             try:
@@ -5619,6 +5675,31 @@ def run_self_test():
     if stat_of(real_db) != real_before:
         failed.append("real_home_untouched")
         print(f"not ok real_home_untouched: {real_db} was {real_before}, now {stat_of(real_db)}")
+    # R1.2: the mkdb write guard refuses the real home; ro reads work. A temp
+    # home keeps the probe's write off the real store.
+    try:
+        import importlib.util as _iu
+        _spec = _iu.spec_from_file_location(
+            "mkdb", os.path.join(os.path.dirname(MK_BUS_PY), "mkdb.py"))
+        _mod = _iu.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        os.environ["MK_SELFTEST"] = "1"
+        probe_home = tempfile.mkdtemp(prefix="mk-builder-guard-")
+        os.environ["MK_HOME"] = os.environ["MATRIXKODER_HOME"] = probe_home
+        try:
+            _mod.selftest_guard_probe(probe_home)
+        finally:
+            shutil.rmtree(probe_home, ignore_errors=True)
+        print("ok selftest_guard")
+    except Exception as e:
+        failed.append("selftest_guard")
+        print(f"not ok selftest_guard: {type(e).__name__}: {e}")
+    finally:
+        for k, v in pinned.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
     if leftover:
         failed.append("bus_server_leftover")
         print(f"not ok bus_server_leftover: pgrep still shows a serve for: {leftover}")
