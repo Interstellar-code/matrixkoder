@@ -41,13 +41,19 @@ Subcommands:
 
 Every command prints ONE JSON line. Errors: {"ok": false, "error": ...} exit 2.
 """
-import argparse, contextlib, datetime, fcntl, hashlib, hmac, importlib.util, io, json, math, os, re, secrets, signal, socket, subprocess, sys, tempfile, threading, time
+import argparse, contextlib, datetime, fcntl, hashlib, hmac, importlib.util, io, json, math, os, re, secrets, shutil, signal, socket, subprocess, sys, tempfile, threading, time
 import urllib.error, urllib.parse, urllib.request
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 sys.dont_write_bytecode = True
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+# `watch` (E2 4): the bus must stay down this long before watch gives up with
+# exit 4. One blip, a dropped socket or a server restart resumes instead.
+WATCH_DOWN_SEC = 60.0
+WATCH_RETRY_SEC = 0.5
+WATCH_READ_SEC = 30.0
 
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -870,26 +876,101 @@ class BusState:
         self._ring_queue = still
         self._save_ring_queue()
 
+    def _lane_worktrees(self, task):
+        """Every lane worktree path a token for `task` was minted for.
+
+        Store mode keeps tokens in <bus dir>/bus-tokens.json, which records the
+        lane directory per token. The worktree path is how a real pane is
+        identified (herdr agents carry `cwd`), so the ring can find the lane's
+        pane without the orchestrator passing a pane id. A task can hold more
+        than one live token (re-armed in a fresh worktree, a fix round), so all
+        of them are candidates: matching the first one alone would miss the
+        pane that is actually running.
+        """
+        try:
+            tokens = read_json(os.path.join(self.data_dir, "bus-tokens.json"), default={})
+        except Exception:
+            return set()
+        lanes = set()
+        for v in (tokens or {}).values():
+            if isinstance(v, dict) and v.get("task") == task and v.get("lane"):
+                lanes.add(os.path.realpath(v["lane"]))
+        return lanes
+
+    def _herdr_agents(self):
+        """Every agent dict from the real `herdr agent list`.
+
+        $MK_BUS_HERDR stays the test seam: a program printing the same JSON,
+        invoked exactly as today. With it unset the REAL `herdr` binary on
+        PATH is called. Missing binary, non-zero exit, bad JSON or a timeout
+        all return [] — no ring and no crash (the bus-down rule's twin).
+        """
+        fake = os.environ.get("MK_BUS_HERDR")
+        if fake:
+            argv = [sys.executable, fake]
+        else:
+            if shutil.which("herdr") is None:
+                return []
+            argv = ["herdr", "agent", "list"]
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            return []
+        if proc.returncode != 0:
+            return []
+        try:
+            data = json.loads(proc.stdout)
+        except ValueError:
+            return []
+        if not isinstance(data, dict):
+            return []
+        if data.get("error") and "result" not in data:
+            return []
+        agents = ((data.get("result") or {}).get("agents"))
+        if agents is None:
+            agents = data.get("agents")
+        return agents if isinstance(agents, list) else []
+
+    def _herdr_pane_for(self, task):
+        """The pane id of the lane agent for `task`, or None.
+
+        Match order: the agent named after the task, then the agent whose cwd
+        IS the task's lane worktree (the real-lane case, todo 66a / F4). The
+        old `cwd.endswith("/" + task)` guess is kept last for the fake.
+        """
+        agents = self._herdr_agents()
+        if not agents:
+            return None
+        lanes = self._lane_worktrees(task)
+        by_name = by_cwd = by_suffix = None
+        for a in agents:
+            if not isinstance(a, dict):
+                continue
+            name = a.get("name") or ""
+            cwd = a.get("cwd") or ""
+            pane = a.get("pane_id") or a.get("pane") or name
+            if name == task and by_name is None:
+                by_name = (a, pane)
+            if lanes and cwd and os.path.realpath(cwd) in lanes and by_cwd is None:
+                by_cwd = (a, pane)
+            if cwd.endswith("/" + task) and by_suffix is None:
+                by_suffix = (a, pane)
+        for hit in (by_cwd, by_name, by_suffix):
+            if hit:
+                return hit[0], hit[1]
+        return None
+
     def _herdr_status(self, task):
         """agent_status of the pane whose name or cwd matches the task.
 
         $MK_BUS_HERDR is a fake: a program printing `herdr agent list` JSON.
-        Unset means no herdr, so nothing rings (the bus-down rule's twin).
+        Unset means the REAL herdr binary; missing or failing means None, so
+        nothing rings.
         """
-        fake = os.environ.get("MK_BUS_HERDR")
-        if not fake:
+        hit = self._herdr_pane_for(task)
+        if not hit:
             return None
-        try:
-            proc = subprocess.run([sys.executable, fake], capture_output=True, text=True, timeout=5)
-            data = json.loads(proc.stdout)
-        except (OSError, subprocess.TimeoutExpired, ValueError):
-            return None
-        agents = ((data.get("result") or {}).get("agents")) or []
-        for a in agents:
-            name = a.get("name") or ""
-            if name == task or a.get("cwd", "").endswith("/" + task):
-                return a.get("agent_status")
-        return None
+        return hit[0].get("agent_status")
 
     def _ring(self, msg):
         """Record the ring BEFORE typing it.
@@ -918,16 +999,34 @@ class BusState:
         self._type_ring(msg, line, eid, store)
 
     def _type_ring(self, msg, line, eid, store):
-        fake = os.environ.get("MK_BUS_HERDR")
-        if fake:
-            subprocess.run([sys.executable, fake, "prompt", msg.get("to") or "", line], timeout=5)
-        # Mark typed. A second event would re-ring on replay, so the typed
-        # bit is a sibling row kind=ring-typed that restart treats as done.
-        store.store_append_event(
-            msg["run"], task=None, kind="ring-typed",
-            from_id="bus", to_id=msg.get("to"), reply_to=str(msg["id"]), text=str(eid or ""),
-            meta={"typed": True, "msg": msg["id"]},
-        )
+        """Type the fixed doorbell line into the lane's pane.
+
+        One ring path: the test seam (`$MK_BUS_HERDR`, invoked as today) or the
+        REAL `herdr agent prompt <pane> <line>`. The line is fixed — a message
+        body never becomes typed text (C13a/C13b). A missing or failing herdr
+        is recorded as typed (nothing more to try) and never raises.
+        """
+        task = msg.get("to")
+        try:
+            fake = os.environ.get("MK_BUS_HERDR")
+            if fake:
+                subprocess.run([sys.executable, fake, "prompt", task or "", line], timeout=5)
+            else:
+                hit = self._herdr_pane_for(task)
+                if not hit:
+                    return  # herdr missing or no pane for the lane
+                _agent, pane = hit
+                subprocess.run(["herdr", "agent", "prompt", str(pane), line], timeout=30)
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            return
+        finally:
+            # Mark typed. A second event would re-ring on replay, so the typed
+            # bit is a sibling row kind=ring-typed that restart treats as done.
+            store.store_append_event(
+                msg["run"], task=None, kind="ring-typed",
+                from_id="bus", to_id=msg.get("to"), reply_to=str(msg["id"]), text=str(eid or ""),
+                meta={"typed": True, "msg": msg["id"]},
+            )
 
     def _ring_queue_path(self):
         return os.path.join(self.data_dir, "ring-queue.json")
@@ -1016,13 +1115,33 @@ class BusState:
 
             ts = now_iso()
             if self.use_store:
+                lane = from_val or "client"
+                # C13e / todo F7: ONE ack row per (run, msg, lane). The acks
+                # table dedupes itself in mkdb, but every call also wrote a
+                # kind=ack EVENT row, which is what a replay turned into two
+                # ack rows for one answer (m-4/m-5, m-9/m-10). A repeat at the
+                # same or a lower level is ignored: no event, no write. A
+                # genuine upgrade (1 -> 3) still records.
+                already = store.store_select(
+                    "SELECT level FROM acks WHERE run=? AND msg=? AND lane=?",
+                    (run, target_id, lane),
+                )
+                prior = 0
+                if already:
+                    try:
+                        prior = int(already[0]["level"] or 0)
+                    except (TypeError, ValueError):
+                        prior = 0
+                if prior >= ack_level:
+                    if target_msg:
+                        target_msg["ack_level"] = max(target_msg.get("ack_level", 1), prior)
+                    return False
                 eid = int(store.store_append_event(
                     run, task=target_task, kind="ack",
                     from_id=from_val or "client", to_id=to_val or "orch",
                     reply_to=target_id, text=f"ack {ack_level}", t=ts,
                     meta={"ack_level": ack_level},
                 ))
-                lane = from_val or "client"
                 store.store_append_ack(run, target_id, lane, ack_level, t=ts)
                 seq = eid
                 rstate["next_seq"] = max(rstate["next_seq"], seq + 1)
@@ -1613,6 +1732,14 @@ class RequestHandler(BaseHTTPRequestHandler):
                     if tok_project and asked and tok_project != asked:
                         self.send_error_json(403, "forbidden: project mismatch")
                         return
+                    # m-16 (E2 6): an orchestrator /send MUST name its run.
+                    # Falling back to the token's run or the server default
+                    # silently filed the message under the wrong run, so the
+                    # reply looked fine while the lane never saw it. A lane
+                    # token is different: its run comes from the token.
+                    if not body.get("run"):
+                        self.send_error_json(400, "missing run")
+                        return
                     run = body.get("run") or tok.get("run") or self.server.bus_state.default_run
                     task = body.get("task")
                     from_val = body.get("from") or "orch"
@@ -1668,7 +1795,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                         return
                     # Ack records are never messages: persist an ack record like
                     # POST /ack does, so live state and replayed state agree.
-                    self.server.bus_state.record_ack(
+                    recorded = self.server.bus_state.record_ack(
                         run=run,
                         target_id=reply_to,
                         ack_level=ack_level,
@@ -1683,6 +1810,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                         "id": reply_to,
                         "ack_level": target_msg.get("ack_level"),
                         "ack_recorded": True,
+                        "duplicate": not recorded,
                     })
                     return
 
@@ -1811,7 +1939,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     self.send_error_json(403, "cannot ack messages for other lanes")
                     return
 
-                self.server.bus_state.record_ack(
+                recorded = self.server.bus_state.record_ack(
                     run=run,
                     target_id=target_id,
                     ack_level=ack_level,
@@ -1820,7 +1948,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                     project=project,
                     project_dir=project_dir,
                 )
-                self.send_json(200, {"ok": True, "id": target_id, "ack_level": ack_level})
+                self.send_json(200, {"ok": True, "id": target_id, "ack_level": ack_level,
+                                     "duplicate": not recorded})
 
             else:
                 self.send_error_json(404, "not found")
@@ -2187,6 +2316,9 @@ def cmd_token(args):
     run_val = getattr(args, "run", "") or ""
     if run_val and not is_valid_id(run_val):
         raise Fail("invalid run id")
+    round_val = getattr(args, "round", 0) or 0
+    if not isinstance(round_val, int) or isinstance(round_val, bool) or round_val < 0:
+        raise Fail("invalid round")
 
     bus_json_path = os.path.join(bus_location(data_dir), "bus.json")
     port = None
@@ -2206,12 +2338,19 @@ def cmd_token(args):
         lane_file = os.path.join(lane_dir, ".matrixkoder-bus.json")
     os.makedirs(os.path.dirname(lane_file), exist_ok=True)
     # "v": 1 matches the contract B24 lane-file example (protocol version).
+    # todo 71 / E2 (1): `data` is the data dir, so a fresh lane can find the
+    # store with no MK_BUS_DATA in its env. Round fields are recorded so the
+    # doorbell's first command (`connect`) knows run/task/round. Existing
+    # fields are only ADDED to: the lane reader (E1 mk-builder.py) keeps
+    # working against an older token file, and token scope is unchanged.
     payload = {
         "v": 1,
         "url": f"http://127.0.0.1:{port}",
         "token": tok,
         "run": run_val,
-        "task": args.task
+        "task": args.task,
+        "data": data_dir,
+        "round": round_val,
     }
 
     write_json(lane_file, payload, mode=0o600)
@@ -2348,6 +2487,97 @@ def cmd_send(args):
         raise Fail("bus down")
 
 
+def _store_run_messages(data_dir, run):
+    """One run's messages from the PROJECT STORE (todo 68a, E2 (2)).
+
+    SELECT only, through StoreAdapter (mkdb is the single writer). This is the
+    same read `pending` uses server-side (`BusState._load_store_run`), reached
+    without a server: `cmd_answer` and `cmd_tail` are orchestrator-side CLIs
+    that run while the store holds the messages and no bus.jsonl exists.
+    Returns [] when the dir is not a registered project (file mode).
+    """
+    try:
+        store = StoreAdapter(data_dir)
+        rows = store.store_select(
+            "SELECT id, run, task, t, kind, from_id, to_id, reply_to, text, artifact_id, meta_json"
+            " FROM events WHERE chan=? AND run=? ORDER BY id",
+            ("bus", run),
+        )
+        ack_rows = store.store_select(
+            "SELECT msg, lane, level FROM acks WHERE run=?", (run,)
+        )
+    except Exception:
+        return []
+    ack_of = {}
+    for a in ack_rows:
+        try:
+            ack_of[a["msg"]] = max(ack_of.get(a["msg"], 1), int(a["level"] or 1))
+        except (TypeError, ValueError):
+            continue
+    messages = []
+    for row in rows:
+        eid = int(row["id"])
+        meta = {}
+        if row.get("meta_json"):
+            try:
+                meta = json.loads(row["meta_json"])
+            except (TypeError, ValueError):
+                meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+        if row.get("kind") == "ack":
+            continue  # ack records are not messages
+        msg = {
+            "seq": eid,
+            "id": f"m-{eid}",
+            "ts": row.get("t") or "",
+            "run": run,
+            "task": row.get("task"),
+            "from": row.get("from_id") or "",
+            "to": row.get("to_id") or "",
+            "kind": row.get("kind"),
+            "reply_to": row.get("reply_to"),
+            "text": row.get("text") or "",
+            "ack_level": ack_of.get(f"m-{eid}", 1),
+            "event_id": eid,
+        }
+        if row.get("artifact_id") is not None:
+            msg["artifact_id"] = row["artifact_id"]
+        messages.append(msg)
+    return messages
+
+
+def _read_run_messages(data_dir, run):
+    """Every message of one run: the project store in store mode, else bus.jsonl.
+
+    E2 (2): `answer` and `tail` must see a store-mode run, where the messages
+    live in mk.db and `<data>/runs/<run>/bus.jsonl` is absent. File mode keeps
+    reading bus.jsonl exactly as before.
+    """
+    if store_mode(data_dir):
+        msgs = _store_run_messages(data_dir, run)
+        if msgs:
+            return msgs
+    jsonl = os.path.join(data_dir, "runs", run, "bus.jsonl")
+    messages = []
+    if not os.path.exists(jsonl):
+        return messages
+    try:
+        with open(jsonl, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    m = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(m, dict) and m.get("kind") != "ack":
+                    messages.append(m)
+    except OSError:
+        return messages
+    return messages
+
+
 def cmd_answer(args):
     data_dir = resolve_data(getattr(args, "data", None))
     port, token = _get_client_conn(data_dir)
@@ -2359,6 +2589,14 @@ def cmd_answer(args):
     runs_to_search = [target_run] if target_run else []
     if not target_run and os.path.exists(runs_dir):
         runs_to_search = [d for d in os.listdir(runs_dir) if os.path.isdir(os.path.join(runs_dir, d)) and is_valid_id(d)]
+    if not target_run and not runs_to_search and store_mode(data_dir):
+        # Store mode: `<data>/runs/<run>` may not exist on disk at all, so the
+        # run list comes from the project store (SELECT only).
+        try:
+            store_rows = StoreAdapter(data_dir).store_select("SELECT id FROM runs")
+            runs_to_search = [r["id"] for r in store_rows if is_valid_id(r.get("id"))]
+        except Exception:
+            runs_to_search = []
 
     # Message ids are per run ("m-1" exists in every run), so without --run
     # the id can match in several runs. Collect every match instead of
@@ -2366,23 +2604,10 @@ def cmd_answer(args):
     # MEDIUM 2), then refuse when it is ambiguous.
     matches = []
     for r in runs_to_search:
-        jsonl = os.path.join(runs_dir, r, "bus.jsonl")
-        if os.path.exists(jsonl):
-            try:
-                with open(jsonl, "r", encoding="utf-8") as f:
-                    for line in f:
-                        if line.strip():
-                            try:
-                                m = json.loads(line)
-                            except Exception:
-                                continue
-                            if not isinstance(m, dict):
-                                continue
-                            if m.get("id") == args.msg_id:
-                                matches.append((r, m))
-                                break
-            except Exception:
-                pass
+        for m in _read_run_messages(data_dir, r):
+            if m.get("id") == args.msg_id:
+                matches.append((r, m))
+                break
 
     if not matches:
         raise Fail(f"message not found: {args.msg_id}")
@@ -2485,34 +2710,154 @@ def cmd_tail(args):
             runs = [d for d in os.listdir(runs_dir) if os.path.isdir(os.path.join(runs_dir, d)) and is_valid_id(d)]
             if len(runs) == 1:
                 run = runs[0]
+        if not run and store_mode(data_dir):
+            # Store mode: the run may exist only in mk.db (todo 68a).
+            try:
+                store_rows = StoreAdapter(data_dir).store_select("SELECT id FROM runs")
+                runs = [r["id"] for r in store_rows if is_valid_id(r.get("id"))]
+            except Exception:
+                runs = []
+            if len(runs) == 1:
+                run = runs[0]
     if not run or not is_valid_id(run):
         raise Fail("missing or invalid --run")
 
     lane_filter = getattr(args, "lane", None)
     after_seq = getattr(args, "after", 0) or 0
-    jsonl_path = os.path.join(data_dir, "runs", run, "bus.jsonl")
     n = getattr(args, "n", 10) or 10
 
+    # E2 (2): store mode reads the project store; file mode reads bus.jsonl.
     messages = []
-    if os.path.exists(jsonl_path):
-        with open(jsonl_path, "r", encoding="utf-8") as f:
-            lines = [l.strip() for l in f if l.strip()]
-        for l in lines:
-            try:
-                msg = json.loads(l)
-                if not isinstance(msg, dict):
-                    continue
-                if after_seq and msg.get("seq", 0) <= after_seq:
-                    continue
-                if lane_filter and not matches_lane(msg, lane_filter):
-                    continue
-                messages.append(msg)
-            except Exception:
-                pass
+    for msg in _read_run_messages(data_dir, run):
+        if after_seq and msg.get("seq", 0) <= after_seq:
+            continue
+        if lane_filter and not matches_lane(msg, lane_filter):
+            continue
+        messages.append(msg)
     res = {"ok": True, "messages": messages[-n:] if n > 0 else messages}
     out(res)
     return res
 
+
+
+def _watch_line(m):
+    """One MSG line per message: `MSG <id> <run> <task> <kind> <from>-><to>: <text>`.
+
+    The text is untrusted quoted data (C13a): collapsed to one line and cut to
+    200 characters so a pasted brief cannot break the stream or flood the pane.
+    """
+    text = re.sub(r"\s+", " ", str(m.get("text") or "")).strip()[:200]
+    return "MSG %s %s %s %s %s->%s: %s" % (
+        m.get("id", ""), m.get("run", ""), m.get("task", ""), m.get("kind", ""),
+        m.get("from", ""), m.get("to", ""), text,
+    )
+
+
+def _orch_token(data_dir):
+    """The live orchestrator token, from bus.json or bus-tokens.json."""
+    bus_json = read_json(os.path.join(bus_location(data_dir), "bus.json"))
+    if bus_json and bus_json.get("token"):
+        return bus_json["token"]
+    tokens = read_json(os.path.join(bus_location(data_dir), "bus-tokens.json"), default={})
+    for tok, v in (tokens or {}).items():
+        if isinstance(v, dict) and v.get("role") == "orch":
+            return tok
+    return None
+
+
+def cmd_watch(args):
+    """E2 (4): the orchestrator's stream. One flushed line per bus message.
+
+    Runs under the Claude Code Monitor tool so every lane message reaches the
+    main session as a notification. After a drop or a bus RESTART it resumes
+    with Last-Event-ID and re-reads bus.json for the new port. Exit 4 only
+    when the bus stays down for WATCH_DOWN_SEC (60 s), never on one blip.
+    """
+    data_dir = resolve_data(getattr(args, "data", None))
+    run = getattr(args, "run", "") or ""
+    task = getattr(args, "task", "") or ""
+    if run and not is_valid_id(run):
+        raise Fail("invalid run id")
+    if task and not is_valid_id(task):
+        raise Fail("invalid task id")
+    after = getattr(args, "after", 0) or 0
+    last_seq = int(str(after)[2:]) if str(after).startswith("m-") and str(after)[2:].isdigit() else int(after or 0)
+    max_messages = getattr(args, "max_messages", 0) or 0
+
+    down_since = None
+    printed = 0
+    while True:
+        port = None
+        try:
+            bdata = read_json(os.path.join(bus_location(data_dir), "bus.json"))
+            if bdata and bdata.get("port"):
+                port = int(bdata["port"])
+        except Exception:
+            port = None
+        token = _orch_token(data_dir)
+
+        if not port or not token:
+            # Bus down or not started yet: keep trying for the window, then 4.
+            if down_since is None:
+                down_since = time.time()
+            if time.time() - down_since >= WATCH_DOWN_SEC:
+                sys.stderr.write("BUS DOWN: watch gave up after %ds\n" % WATCH_DOWN_SEC)
+                return 4
+            time.sleep(WATCH_RETRY_SEC)
+            continue
+
+        try:
+            qs = urllib.parse.urlencode({"lane": "*"})
+            if run:
+                qs += "&run=" + urllib.parse.quote(run)
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/events?{qs}",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Last-Event-ID": f"m-{last_seq}",
+                    "Host": f"127.0.0.1:{port}",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=WATCH_READ_SEC) as resp:
+                down_since = None  # the bus answered: the window restarts
+                buf = ""
+                while True:
+                    chunk = resp.readline()
+                    if not chunk:
+                        raise ConnectionError("stream closed")
+                    buf += chunk.decode("utf-8", "replace")
+                    while "\n\n" in buf:
+                        block, buf = buf.split("\n\n", 1)
+                        data_lines = [ln[5:].strip() for ln in block.splitlines() if ln.startswith("data:")]
+                        if not data_lines:
+                            continue  # keepalive comment
+                        try:
+                            m = json.loads("".join(data_lines))
+                        except ValueError:
+                            continue
+                        if not isinstance(m, dict):
+                            continue
+                        if task and m.get("task") != task:
+                            continue
+                        try:
+                            last_seq = max(last_seq, int(m.get("seq") or 0))
+                        except (TypeError, ValueError):
+                            pass
+                        print(_watch_line(m), flush=True)
+                        printed += 1
+                        if max_messages and printed >= max_messages:
+                            return 0
+        except (urllib.error.URLError, ConnectionError, ConnectionRefusedError,
+                TimeoutError, socket.timeout, OSError, ValueError):
+            # A drop or a restart: resume from last_seq, re-reading bus.json
+            # for the new port on the next turn of the loop.
+            pass
+        if down_since is None:
+            down_since = time.time()
+        if time.time() - down_since >= WATCH_DOWN_SEC:
+            sys.stderr.write("BUS DOWN: watch gave up after %ds\n" % WATCH_DOWN_SEC)
+            return 4
+        time.sleep(WATCH_RETRY_SEC)
 
 
 def cmd_metrics(args):
@@ -2653,9 +2998,15 @@ def _store_self_test_body(mod):
                 parsed = {"error": raw}
             return e.code, parsed
 
-    def spawn(data_dir, run):
+    def spawn_prefer(data_dir, run, prefer):
+        return spawn(data_dir, run, prefer)
+
+    def spawn(data_dir, run, prefer=None):
+        argv = [sys.executable, os.path.abspath(__file__), "serve", "--data", data_dir, "--run", run]
+        if prefer:
+            argv += ["--prefer-port", str(prefer)]
         proc = subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__), "serve", "--data", data_dir, "--run", run],
+            argv,
             start_new_session=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -2770,6 +3121,7 @@ def _store_self_test_body(mod):
         try:
             mod.add_task(con, "r1", "T1", "task", title="store self-test")
             mod.add_task(con, "r1", "T2", "task", title="working lane")
+            mod.add_task(con, "r1", "T9", "task", title="real herdr lane")
         finally:
             con.close()
         assert os.path.isfile(os.path.join(data, "mk.db")), "open_project did not create mk.db"
@@ -3351,6 +3703,316 @@ def _store_self_test_body(mod):
         os.environ.pop("MK_BUS_HERDR", None)
         os.environ.pop("MK_BUS_RING_INTERVAL_SEC", None)
         os.environ.pop("MK_BUS_RING_KILL", None)
+
+        # ============ E2 (1) token carries data + round ============
+        lane_e2 = os.path.join(tmp, "lane-e2")
+        os.makedirs(lane_e2, exist_ok=True)
+        rc_tok = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "token",
+             "--lane", lane_e2, "--task", "T9", "--run", "r1", "--round", "2",
+             "--data", data],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        assert rc_tok.returncode == 0, rc_tok.stderr
+        e2_payload = json.loads(open(lane_token_path(lane_e2)).read())
+        # todo 71: a fresh lane finds the store with no MK_BUS_DATA in its env.
+        # Both sides compared as realpath: on macOS /var/folders is a symlink to
+        # /private/var/folders, so the strings need not be byte-identical.
+        assert e2_payload.get("data") and os.path.realpath(e2_payload["data"]) == os.path.realpath(data), e2_payload
+        assert store_mode(e2_payload["data"]), e2_payload
+        assert e2_payload.get("round") == 2, e2_payload
+        # Only ADDED: the pre-existing fields and their values are unchanged.
+        assert e2_payload.get("v") == 1 and e2_payload.get("run") == "r1", e2_payload
+        assert e2_payload.get("task") == "T9" and e2_payload.get("token"), e2_payload
+        assert (os.stat(lane_token_path(lane_e2)).st_mode & 0o777) == 0o600
+
+        # ============ E2 (2) answer + tail read the project store ============
+        # todo 68a: these two read mk.db, not runs/<run>/bus.jsonl, which does
+        # not exist for a store run.
+        assert store_mode(data), "store-mode fixtures expected"
+        assert not os.path.exists(os.path.join(data, "runs", "r1", "bus.jsonl")), \
+            "fixture must be store-only: a bus.jsonl here would mask the fix"
+        rc_ask = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "send",
+             "--run", "r1", "--task", "T1", "--kind", "ask",
+             "--text", "store mode ask", "--from", "T1", "--to", "orch", "--data", data],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        assert rc_ask.returncode == 0, (rc_ask.stdout, rc_ask.stderr)
+        store_ask_id = json.loads(rc_ask.stdout.strip().splitlines()[-1])["message"]["id"]
+
+        rc_ans = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "answer", store_ask_id,
+             "answered from the store", "--run", "r1", "--data", data],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        assert rc_ans.returncode == 0, (
+            f"answer {store_ask_id} failed in store mode: {rc_ans.stdout}{rc_ans.stderr}"
+        )
+        ans_res = json.loads(rc_ans.stdout.strip().splitlines()[-1])
+        # cmd_answer echoes the server's message record; its reply_to must be
+        # the ask, which is what proves the store lookup found the right ask.
+        assert ans_res["ok"] is True, ans_res
+        assert ans_res["message"]["reply_to"] == store_ask_id, (ans_res, store_ask_id)
+        assert ans_res["message"]["kind"] == "answer", ans_res
+
+        rc_tail = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "tail", "--run", "r1",
+             "--n", "100", "--data", data],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        assert rc_tail.returncode == 0, rc_tail.stderr
+        tail_res = json.loads(rc_tail.stdout.strip().splitlines()[-1])
+        tail_texts = [m.get("text") for m in tail_res["messages"]]
+        assert "store mode ask" in tail_texts, tail_res
+        assert "answered from the store" in tail_texts, tail_res
+
+        # ============ E2 (6) /send without run is 400 (m-16) ============
+        btok = remint()
+        code, norun = post(port2, btok, {"task": "T1", "kind": "nudge", "text": "no run", "project": "proj"})
+        assert code == 400, (code, norun)
+        assert "run" in (norun.get("error") or ""), norun
+
+        # ============ E2 (5) one ack row per (run, msg, lane) ============
+        # todo F7 / C13e: a second ack of the same message by the same lane
+        # records nothing (ask + inbox + progress all acked one answer).
+        code, ask_e2 = post(port2, btok, {
+            "run": "r1", "task": "T1", "kind": "ask", "text": "ack once",
+            "from": "orch", "to": "T1", "project": "proj",
+        })
+        assert code == 200, (code, ask_e2)
+        ack_target = ask_e2["message"]["id"]
+        acks_db = mod.open_project(data, data_dir=data)
+        try:
+            base_rows = acks_db.execute(
+                "SELECT COUNT(*) c FROM events WHERE kind='ack' AND reply_to=?", (ack_target,)
+            ).fetchone()["c"]
+        finally:
+            acks_db.close()
+        assert base_rows == 0, base_rows
+        for _ in range(2):
+            code, acked = post(port2, btok, {
+                "run": "r1", "task": "T1", "kind": "ack", "text": "",
+                "from": "orch", "to": "T1", "reply_to": ack_target, "ack_level": 3,
+            })
+            assert code == 200, (code, acked)
+        acks_db = mod.open_project(data, data_dir=data)
+        try:
+            after_rows = acks_db.execute(
+                "SELECT COUNT(*) c FROM events WHERE kind='ack' AND reply_to=?", (ack_target,)
+            ).fetchone()["c"]
+            ack_table = acks_db.execute(
+                "SELECT COUNT(*) c FROM acks WHERE run=? AND msg=? AND lane=?",
+                ("r1", ack_target, "orch"),
+            ).fetchone()["c"]
+        finally:
+            acks_db.close()
+        assert after_rows == 1, (after_rows, "a second ack must not add a row")
+        assert ack_table == 1, ack_table
+
+        # ============ E2 (3) real herdr on PATH, no $MK_BUS_HERDR ============
+        # The adapter calls the real `herdr agent list` / `herdr agent prompt`.
+        # herdr is the ONLY mock: a program on PATH that records its calls.
+        assert "MK_BUS_HERDR" not in os.environ, "real-adapter cases need the seam unset"
+        bindir = os.path.join(tmp, "realherdr-bin")
+        os.makedirs(bindir, exist_ok=True)
+        herdr_bin = os.path.join(bindir, "herdr")
+        calls_log = os.path.join(tmp, "herdr-calls.log")
+        agents_json = os.path.join(tmp, "herdr-agents.json")
+        # Fixture captured from the real command's shape: `herdr agent list`
+        # prints {"result": {"agents": [...]}}, the same shape herdr_agents()
+        # parses (see mk-lane-nudge.py).
+        with open(agents_json, "w") as fh:
+            json.dump({"result": {"agents": [
+                {"pane_id": "wE:p1", "agent_status": "idle",
+                 "name": "other", "cwd": os.path.join(tmp, "elsewhere")},
+                {"pane_id": "wE:p2", "agent_status": "idle",
+                 "name": "e2-t9-build-r1", "cwd": lane_e2},
+            ]}}, fh)
+        with open(herdr_bin, "w") as fh:
+            fh.write("#!" + sys.executable + "\n")
+            fh.write("import json, os, sys\n")
+            fh.write("log = os.environ['MK_BUS_E2_HERDR_LOG']\n")
+            fh.write("cmd = ' '.join(sys.argv[1:3])\n")
+            fh.write("with open(log, 'a') as f:\n")
+            fh.write("    f.write(cmd + ' ' + ' '.join(sys.argv[3:]) + chr(10))\n")
+            fh.write("if cmd == 'agent list':\n")
+            fh.write("    sys.stdout.write(open(os.environ['MK_BUS_E2_HERDR_JSON']).read())\n")
+            fh.write("    sys.exit(0)\n")
+            fh.write("sys.exit(0)\n")
+        os.chmod(herdr_bin, 0o755)
+        os.environ["MK_BUS_E2_HERDR_LOG"] = calls_log
+        os.environ["MK_BUS_E2_HERDR_JSON"] = agents_json
+        old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = bindir + os.pathsep + old_path
+
+        def herdr_calls():
+            if not os.path.isfile(calls_log):
+                return []
+            return [ln for ln in open(calls_log).read().splitlines() if ln.strip()]
+
+        def prompt_calls():
+            return [c for c in herdr_calls() if c.startswith("agent prompt")]
+
+        # The lane token for lane_e2 is what maps task T1 to the worktree, and
+        # the worktree cwd is what finds pane wE:p2.
+        os.environ["MK_BUS_RING_INTERVAL_SEC"] = "0.2"
+        kill(pid2)
+        pid2, port2 = spawn(data, "r1")
+        btok = remint()
+        os.environ.pop("MK_BUS_RING_INTERVAL_SEC", None)
+        assert shutil.which("herdr") == herdr_bin, shutil.which("herdr")
+        code, ring_e2 = post(port2, btok, {
+            "run": "r1", "task": "T9", "kind": "nudge", "text": "ring me",
+            "from": "orch", "to": "T9", "project": "proj",
+        })
+        assert code == 200, (code, ring_e2)
+        deadline = time.time() + 10.0
+        while time.time() < deadline and not prompt_calls():
+            time.sleep(0.1)
+        rings = prompt_calls()
+        assert len(rings) == 1, rings
+        assert rings[0].startswith("agent prompt wE:p2 "), rings
+        # C13a: the ring line is fixed, never the message body.
+        assert "ring me" not in rings[0], rings
+        assert "mk-builder.py inbox" in rings[0], rings
+
+        # A working agent queues: no second prompt while the lane is busy.
+        with open(agents_json, "w") as fh:
+            json.dump({"result": {"agents": [
+                {"pane_id": "wE:p2", "agent_status": "working",
+                 "name": "e2-t9-build-r1", "cwd": lane_e2},
+            ]}}, fh)
+        before_busy = len(prompt_calls())
+        code, busy_e2 = post(port2, btok, {
+            "run": "r1", "task": "T9", "kind": "nudge", "text": "busy now",
+            "from": "orch", "to": "T9", "project": "proj",
+        })
+        assert code == 200, (code, busy_e2)
+        time.sleep(1.0)
+        assert len(prompt_calls()) == before_busy, prompt_calls()
+        # ... and it goes idle, so the queued ring drains on the next tick.
+        with open(agents_json, "w") as fh:
+            json.dump({"result": {"agents": [
+                {"pane_id": "wE:p2", "agent_status": "idle",
+                 "name": "e2-t9-build-r1", "cwd": lane_e2},
+            ]}}, fh)
+        deadline = time.time() + 15.0
+        while time.time() < deadline and len(prompt_calls()) <= before_busy:
+            time.sleep(0.2)
+        assert len(prompt_calls()) == before_busy + 1, prompt_calls()
+
+        # herdr missing entirely: no ring, no crash, the bus still serves.
+        os.environ["PATH"] = os.path.join(tmp, "emptybin")
+        os.makedirs(os.path.join(tmp, "emptybin"), exist_ok=True)
+        assert shutil.which("herdr") is None
+        code, noherdr = post(port2, btok, {
+            "run": "r1", "task": "T9", "kind": "nudge", "text": "no herdr",
+            "from": "orch", "to": "T9", "project": "proj",
+        })
+        assert code == 200, (code, noherdr)
+        time.sleep(0.5)
+        code, still_ok = post(port2, btok, {
+            "run": "r1", "task": "T9", "kind": "info", "text": "still alive",
+            "from": "orch", "to": "T9", "project": "proj",
+        })
+        assert code == 200, (code, still_ok)
+        os.environ["PATH"] = old_path
+
+        # ============ E2 (4) watch: live, then across kill -9 + restart ============
+        kill(pid2)
+        pid2, port2 = spawn(data, "r1")
+        orch_w = mint_orch(data)
+        # The store already holds history (earlier blocks): watch replays from
+        # --after, so a baseline message fixes the point watch starts after and
+        # the test counts only the messages sent below.
+        code, base_w = post(port2, orch_w, {
+            "run": "r1", "task": "T9", "kind": "info", "text": "watch baseline",
+            "from": "orch", "to": "T9",
+        })
+        assert code == 200, (code, base_w)
+        base_id = base_w["message"]["id"]
+        watch = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "watch",
+             "--run", "r1", "--data", data, "--max-messages", "6",
+             "--after", base_id],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True,
+        )
+        pids.append(watch.pid)
+        watch_lines = []
+
+        def read_watch(n, secs=20.0):
+            deadline = time.time() + secs
+            while time.time() < deadline and len(watch_lines) < n:
+                ln = watch.stdout.readline()
+                if not ln:
+                    break
+                if ln.strip():
+                    watch_lines.append(ln.strip())
+
+        try:
+            for i in range(3):
+                code, wmsg = post(port2, orch_w, {
+                    "run": "r1", "task": "T9", "kind": "info",
+                    "text": f"watch message {i}", "from": "orch", "to": "T9",
+                })
+                assert code == 200, (code, wmsg)
+            read_watch(3)
+            assert len(watch_lines) == 3, watch_lines
+            for i, ln in enumerate(watch_lines):
+                assert ln.startswith("MSG m-"), ln
+                assert " r1 T9 info orch->T9: " in ln, ln
+                assert f"watch message {i}" in ln, ln
+            assert "watch baseline" not in "".join(watch_lines), watch_lines
+            first_ids = [ln.split()[1] for ln in watch_lines]
+
+            # kill -9 the bus (no clean shutdown), restart ON THE SAME PORT.
+            # The SAME watch process must resume with Last-Event-ID: no replay
+            # of the first 3, and all 3 new messages arrive.
+            os.kill(pid2, signal.SIGKILL)
+            deadline = time.time() + 5.0
+            while time.time() < deadline and is_pid_alive(pid2):
+                time.sleep(0.05)
+            assert not is_pid_alive(pid2), pid2
+            assert watch.poll() is None, "watch must outlive the bus"
+            pid_old, port_old = pid2, port2
+            pid2, port2 = spawn_prefer(data, "r1", port_old)
+            assert pid2 != pid_old and port2 == port_old, (pid2, port2, pid_old, port_old)
+            orch_w = mint_orch(data)
+            for i in range(3):
+                code, w2 = post(port2, orch_w, {
+                    "run": "r1", "task": "T9", "kind": "info",
+                    "text": f"after restart {i}", "from": "orch", "to": "T9",
+                })
+                assert code == 200, (code, w2)
+            read_watch(6)
+            assert len(watch_lines) == 6, watch_lines
+            assert watch.wait(timeout=10) == 0, watch.returncode
+            for i, ln in enumerate(watch_lines[3:]):
+                assert f"after restart {i}" in ln, ln
+            ids = [ln.split()[1] for ln in watch_lines]
+            assert len(set(ids)) == 6, ("a restart must not replay", ids)
+        finally:
+            if watch.poll() is None:
+                stop_process(watch.pid)
+                watch.wait(timeout=10)
+
+        # A multi-line body collapses to ONE line, cut to 200 chars (C13a).
+        noisy = "first line\nsecond\tline " + ("y" * 400)
+        code, noised = post(port2, orch_w, {
+            "run": "r1", "task": "T9", "kind": "info", "text": noisy,
+            "from": "orch", "to": "T9",
+        })
+        assert code == 200, (code, noised)
+        noisy_line = _watch_line(noised["message"])
+        assert "\n" not in noisy_line, repr(noisy_line)
+        assert len(noisy_line.split(": ", 1)[1]) <= 200, len(noisy_line)
+        assert noisy_line.endswith("y"), noisy_line[-40:]
+
+        os.environ.pop("MK_BUS_E2_HERDR_LOG", None)
+        os.environ.pop("MK_BUS_E2_HERDR_JSON", None)
+
         rc_m = subprocess.run(
             [sys.executable, os.path.abspath(__file__), "metrics", "--run", "r1", "--data", data],
             stdout=subprocess.PIPE, text=True,
@@ -4613,6 +5275,7 @@ def main():
     p_token.add_argument("--lane", required=True, help="Lane worktree directory")
     p_token.add_argument("--task", required=True, help="Task identifier")
     p_token.add_argument("--run", default="", help="Run identifier")
+    p_token.add_argument("--round", type=int, default=0, help="Round number recorded in the lane token")
     p_token.add_argument("--data", help="MatrixKoder data dir")
 
     p_revoke = subparsers.add_parser("revoke")
@@ -4650,6 +5313,13 @@ def main():
     p_tail.add_argument("--n", type=int, default=10, help="Number of messages (default 10)")
     p_tail.add_argument("--data", help="MatrixKoder data dir")
 
+    p_watch = subparsers.add_parser("watch")
+    p_watch.add_argument("--run", default="", help="Only this run id")
+    p_watch.add_argument("--task", default="", help="Only this task id")
+    p_watch.add_argument("--after", default="0", help="Resume after this message id or seq")
+    p_watch.add_argument("--max-messages", type=int, default=0, help="Exit after N lines (0 = never)")
+    p_watch.add_argument("--data", help="MatrixKoder data dir")
+
     try:
         args = parser.parse_args()
         if not args.cmd:
@@ -4666,6 +5336,7 @@ def main():
             "answer": cmd_answer,
             "pending": cmd_pending,
             "tail": cmd_tail,
+            "watch": cmd_watch,
             "metrics": cmd_metrics,
         }
         fn = dispatch.get(args.cmd)
