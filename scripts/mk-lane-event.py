@@ -92,6 +92,7 @@ def _load(name, path):
 lw = _load("lane_watch", os.path.join(HERE, "lane-watch.py"))  # verdict logic lives there — import it
 lh = _load("lane_health", os.path.join(HERE, "lane-health.py"))
 mk_config = _load("mk_config", os.path.join(HERE, "mk-config.py"))
+mkdb = _load("mkdb", os.path.join(HERE, "mkdb.py"))  # R1.2 write-guard probe only
 
 
 def cfg(key, flag=None):
@@ -166,7 +167,16 @@ def opt(a, f, d=None):
 # ---- discovery: pane → armed lane (worktrees of the repos MK knows) ------------------------------
 
 def mk_home():
-    return os.path.expanduser(os.environ.get("MATRIXKODER_HOME") or "~/.matrixkoder")
+    """One MK home rule (C16), identical to mkdb.resolve_home(None): $MK_HOME and
+    $MATRIXKODER_HOME are the same setting; when both are set they must agree."""
+    mkh = os.environ.get("MK_HOME")
+    mch = os.environ.get("MATRIXKODER_HOME")
+    if mkh and mch:
+        left = os.path.realpath(os.path.abspath(os.path.expanduser(mkh)))
+        right = os.path.realpath(os.path.abspath(os.path.expanduser(mch)))
+        if left != right:
+            raise RuntimeError(f"MK_HOME ({mkh}) and MATRIXKODER_HOME ({mch}) differ; set one MK home")
+    return os.path.expanduser(mkh or mch or "~/.matrixkoder")
 
 
 def worktrees(repo):
@@ -1687,7 +1697,11 @@ def self_test():
     tmp = tempfile.mkdtemp(prefix="mk-lane-event-test-")
     home, data = os.path.join(tmp, "home"), os.path.join(tmp, "data")
     os.makedirs(home)
+    # One temp MK home under every name (C16): mk-bus children read $MK_BUS_DIR/$MK_HOME.
+    os.environ["MK_HOME"] = home
     os.environ["MATRIXKODER_HOME"] = home
+    os.environ["MK_BUS_DIR"] = home
+    os.environ["MK_SELFTEST"] = "1"
     # every dispatch resolves the data dir through cfg(); pin it so no case reads a real config
     restore_data = mk_config.pin_tmp_data(tmp)
     # never drop this pop: a test run inside a herdr pane inherits the REAL herdr via this env var
@@ -2827,8 +2841,10 @@ def self_test():
         # not MATRIXKODER_HOME. Pin it for this block, then write bus.json AFTER arm:
         # arm's ensure must not be the writer.
         _saved_bus_home = os.environ.get("MK_HOME")
+        _saved_bus_mhome = os.environ.get("MATRIXKODER_HOME")
         _bus_home = os.path.join(tmp, "home")
         os.environ["MK_HOME"] = _bus_home
+        os.environ["MATRIXKODER_HOME"] = _bus_home
         try:
             _bus_dir = bus_dir_for(data)
             assert _bus_dir == os.path.abspath(_bus_home), _bus_dir
@@ -2940,6 +2956,10 @@ def self_test():
                 os.environ.pop("MK_HOME", None)
             else:
                 os.environ["MK_HOME"] = _saved_bus_home
+            if _saved_bus_mhome is None:
+                os.environ.pop("MATRIXKODER_HOME", None)
+            else:
+                os.environ["MATRIXKODER_HOME"] = _saved_bus_mhome
 
         # (D7B R3) store mode: mk.db present, so bus.json lives in the MK home, not the data dir.
         # A stale <data>/bus.json must not win. A real store-mode bus, real acquire and arm.
@@ -2949,7 +2969,11 @@ def self_test():
         open(os.path.join(data, "bus.json"), "w").write(json.dumps({"port": 1}))
         # no MK_BUS_DIR: a present mk.db resolves to the MK home, never the stale data-dir file
         _saved_home = os.environ.get("MK_HOME")
+        _saved_mhome = os.environ.get("MATRIXKODER_HOME")
+        _saved_bdir = os.environ.get("MK_BUS_DIR")
         os.environ["MK_HOME"] = _home
+        os.environ["MATRIXKODER_HOME"] = _home
+        os.environ.pop("MK_BUS_DIR", None)
         try:
             assert bus_dir_for(data) == os.path.abspath(_home), bus_dir_for(data)
             assert bus_is_up(data) is False
@@ -2961,6 +2985,14 @@ def self_test():
                 os.environ.pop("MK_HOME", None)
             else:
                 os.environ["MK_HOME"] = _saved_home
+            if _saved_mhome is None:
+                os.environ.pop("MATRIXKODER_HOME", None)
+            else:
+                os.environ["MATRIXKODER_HOME"] = _saved_mhome
+            if _saved_bdir is None:
+                os.environ.pop("MK_BUS_DIR", None)
+            else:
+                os.environ["MK_BUS_DIR"] = _saved_bdir
         _srv.shutdown()
         os.unlink(os.path.join(data, "mk.db"))
         os.unlink(os.path.join(data, "bus.json"))
@@ -3069,6 +3101,8 @@ def self_test():
 
         srv.shutdown()
         srv.server_close()
+        # R1.2: the mkdb write guard refuses the real home from this suite too.
+        mkdb.selftest_guard_probe(os.environ["MK_HOME"])
     finally:
         restore_data()
         shutil.rmtree(tmp, ignore_errors=True)

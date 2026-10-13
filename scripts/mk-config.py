@@ -332,9 +332,16 @@ _ROUTES_CACHE = {}  # one catalog read per process; the self-test clears it for 
 
 
 def catalog_home():
-    """The MK home `mk-catalog.py` would use: $MK_HOME, else ~/.matrixkoder — the same rule as
-    mkdb.resolve_home with no --home argument."""
-    return os.path.abspath(os.path.expanduser(os.environ.get("MK_HOME") or "~/.matrixkoder"))
+    """The MK home `mk-catalog.py` would use: $MK_HOME or $MATRIXKODER_HOME (both set must
+    agree), else ~/.matrixkoder — the same rule as mkdb.resolve_home with no --home argument."""
+    mkh = os.environ.get("MK_HOME")
+    mch = os.environ.get("MATRIXKODER_HOME")
+    if mkh and mch:
+        left = os.path.realpath(os.path.abspath(os.path.expanduser(mkh)))
+        right = os.path.realpath(os.path.abspath(os.path.expanduser(mch)))
+        if left != right:
+            raise Fail(f"MK_HOME ({mkh}) and MATRIXKODER_HOME ({mch}) differ; set one MK home")
+    return os.path.abspath(os.path.expanduser(mkh or mch or "~/.matrixkoder"))
 
 
 def catalog_routes():
@@ -744,7 +751,7 @@ def pin_tmp_data(tmp):
     touch) a real config. -> restore(), for the caller's finally."""
     data, home = os.path.join(tmp, "data"), os.path.join(tmp, "home")
     os.makedirs(data, exist_ok=True), os.makedirs(home, exist_ok=True)
-    was = {k: os.environ.get(k) for k in ("MATRIXKODER_DATA", "MATRIXKODER_HOME")}
+    was = {k: os.environ.get(k) for k in ("MATRIXKODER_DATA", "MATRIXKODER_HOME", "MK_HOME", "MK_SELFTEST")}
 
     def restore():
         for k, v in was.items():
@@ -753,7 +760,10 @@ def pin_tmp_data(tmp):
             else:
                 os.environ[k] = v
 
+    # One temp MK home under both names (C16), plus MK_SELFTEST=1 so the mkdb
+    # write guard refuses the real home for the whole self-test.
     os.environ["MATRIXKODER_DATA"], os.environ["MATRIXKODER_HOME"] = data, home
+    os.environ["MK_HOME"], os.environ["MK_SELFTEST"] = home, "1"
     try:
         got = os.path.realpath(mk_state.resolve_data(None))
         # the resolved dir, not the env value just written: a resolver that ignores the env and
@@ -1450,6 +1460,8 @@ def self_test():
             run_env = dict(env)
             if os.environ.get("MK_HOME"):  # a seeded temp catalog for the reviewer dropdowns
                 run_env["MK_HOME"] = os.environ["MK_HOME"]
+            if os.environ.get("MATRIXKODER_HOME"):  # kept in lockstep with MK_HOME (one home rule)
+                run_env["MATRIXKODER_HOME"] = os.environ["MATRIXKODER_HOME"]
             if os.environ.get("MK_CONFIG_COUNT_ROUTES"):  # the subprocess-count probe
                 run_env["MK_CONFIG_COUNT_ROUTES"] = os.environ["MK_CONFIG_COUNT_ROUTES"]
             p = subprocess.run([sys.executable, script, *args], capture_output=True, text=True,
@@ -2128,6 +2140,7 @@ def self_test():
                                 capture_output=True, text=True)
         assert seeded.returncode == 0, seeded.stderr
         os.environ["MK_HOME"] = cat_home
+        os.environ["MATRIXKODER_HOME"] = cat_home
         try:
             live = "opencode opencode/alpha low"  # a route the seeded catalog lists
             run("set", "routing_preferences.reviewer", json.dumps(live))
@@ -2150,6 +2163,7 @@ def self_test():
             run("set", "routing_preferences.reviewer", '"claude sonnet medium"')  # kept, so re-saving it passes
         finally:
             del os.environ["MK_HOME"]
+            os.environ["MATRIXKODER_HOME"] = home
         with open(yaml_path, "w") as f:
             f.write(fixture)
 
@@ -2159,6 +2173,7 @@ def self_test():
         missing = os.path.join(tmp, "no-catalog")
         os.makedirs(missing)
         os.environ["MK_HOME"] = missing
+        os.environ["MATRIXKODER_HOME"] = missing
         try:
             fb = next(f for f in run("list", "--json")["fields"]
                       if f["key"] == "routing_preferences.reviewer")
@@ -2171,12 +2186,14 @@ def self_test():
             assert "must be one of" in refused["error"], refused
         finally:
             del os.environ["MK_HOME"]
+            os.environ["MATRIXKODER_HOME"] = home
         with open(yaml_path, "w") as f:
             f.write(fixture)
 
         # 28. one list reads the catalog once: two route rows share one subprocess (review R1 finding 2).
         #     The count is taken inside the child process, where the cache lives.
         os.environ["MK_HOME"] = cat_home
+        os.environ["MATRIXKODER_HOME"] = cat_home
         counter = os.path.join(tmp, "route-calls")
         open(counter, "w").write("")
         os.environ["MK_CONFIG_COUNT_ROUTES"] = counter
@@ -2186,6 +2203,7 @@ def self_test():
             assert n <= 1, n
         finally:
             del os.environ["MK_HOME"]
+            os.environ["MATRIXKODER_HOME"] = home
             del os.environ["MK_CONFIG_COUNT_ROUTES"]
         with open(yaml_path, "w") as f:
             f.write(fixture)
@@ -2373,6 +2391,12 @@ def self_test():
         assert "stall_min: 19" in final, final
         assert "herdr: stale" in final or "herdr: ok" in final, final
         assert "probed_at:" in final
+        # R1.2: the mkdb write guard refuses the real home from this suite too.
+        import importlib.util as _iu
+        _spec = _iu.spec_from_file_location("mkdb", os.path.join(HERE, "mkdb.py"))
+        _mod = _iu.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        _mod.selftest_guard_probe(home)
     finally:
         if restore:
             restore()

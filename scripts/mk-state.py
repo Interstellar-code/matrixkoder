@@ -71,7 +71,7 @@
 Common: --data DIR (else $MATRIXKODER_DATA, else the root projects table by repo path, else
 <home>/projects.json, else <main checkout of cwd's git repo>/.matrixkoder; a linked worktree
 resolves to its main checkout, a nested repo to itself), --by WHO (default orchestrator), --run ID for
-task/event/wait/render (default: the single active run). Global dir: $MATRIXKODER_HOME or ~/.matrixkoder (locks/).
+task/event/wait/render (default: the single active run). Global dir: $MK_HOME or $MATRIXKODER_HOME or ~/.matrixkoder (locks/).
 Every command prints ONE JSON line. Errors: {"ok": false, "error": ...} exit 2; lock refused: exit 1.
 run.json is authoritative; events.jsonl may run one line ahead after a crash; `render` rebuilds board.md.
 Schema: docs/state-schema.md
@@ -149,7 +149,16 @@ def now():
 
 
 def home():
-    return os.path.expanduser(os.environ.get("MATRIXKODER_HOME") or "~/.matrixkoder")
+    """One MK home rule (C16), identical to mkdb.resolve_home(None): $MK_HOME and
+    $MATRIXKODER_HOME are the same setting; when both are set they must agree."""
+    mkh = os.environ.get("MK_HOME")
+    mch = os.environ.get("MATRIXKODER_HOME")
+    if mkh and mch:
+        left = os.path.realpath(os.path.abspath(os.path.expanduser(mkh)))
+        right = os.path.realpath(os.path.abspath(os.path.expanduser(mch)))
+        if left != right:
+            raise Fail(f"MK_HOME ({mkh}) and MATRIXKODER_HOME ({mch}) differ; set one MK home")
+    return os.path.expanduser(mkh or mch or "~/.matrixkoder")
 
 
 def repo_top():
@@ -2519,7 +2528,11 @@ PLAN_BASE = {"plan": "tplan", "status": "approved", "runs": [], "phases": [
 def self_test():
     import shutil, subprocess
     tmp = tempfile.mkdtemp(prefix="mk-state-test-")
-    env = dict(os.environ, MATRIXKODER_HOME=os.path.join(tmp, "home"))
+    tmp_home = os.path.join(tmp, "home")
+    os.environ["MK_HOME"] = tmp_home
+    os.environ["MATRIXKODER_HOME"] = tmp_home
+    os.environ["MK_SELFTEST"] = "1"
+    env = dict(os.environ, MATRIXKODER_HOME=tmp_home, MK_HOME=tmp_home, MK_SELFTEST="1")
     env.pop("MATRIXKODER_DATA", None)
     data = os.path.join(tmp, "data")
 
@@ -3474,6 +3487,8 @@ def self_test():
         print("mk-state self-test ok")
         store_self_test(tmp, env)
         print("mk-state store self-test ok")
+        # R1.2: the mkdb write guard refuses the real home from this suite too.
+        _mkdb().selftest_guard_probe(tmp_home)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -3879,7 +3894,7 @@ def store_self_test(tmp, env):
     # D3B: every transition upserts the root card; a kill between the two writes is repaired by sync
     root = os.path.join(tmp, "d3b-home")
     d3 = os.path.join(tmp, "d3b")
-    d3env = dict(env, MATRIXKODER_HOME=root)
+    d3env = dict(env, MATRIXKODER_HOME=root, MK_HOME=root)
     once(["run", "init", "--id", "d1", "--feature", "D", "--branch", "bd"], d3)
     once(["task", "add", "--id", "T1", "--title", "Rooted", "--run", "d1"], d3)
     r = subprocess.run([sys.executable, os.path.abspath(__file__), "store", "enable", "--data", d3],
@@ -3958,7 +3973,7 @@ def store_self_test(tmp, env):
     os.makedirs(os.path.join(repo, ".git"))
     r = subprocess.run([sys.executable, os.path.abspath(__file__), "run", "list"],
                        cwd=repo, capture_output=True, text=True,
-                       env=dict(env, MATRIXKODER_HOME=bare, HOME=os.path.join(tmp, "nowhere")))
+                       env=dict(env, MATRIXKODER_HOME=bare, MK_HOME=bare, HOME=os.path.join(tmp, "nowhere")))
     assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
     assert not os.path.exists(os.path.join(bare, "mk.db")), "resolve created a root store"
 
@@ -3974,24 +3989,27 @@ def store_self_test(tmp, env):
                {os.path.realpath(reg_repo): {"data_dir": from_json}})
     r = subprocess.run([sys.executable, os.path.abspath(__file__), "run", "init", "--id", "j1",
                         "--feature", "J", "--branch", "bj"], cwd=reg_repo,
-                       capture_output=True, text=True, env=dict(env, MATRIXKODER_HOME=reg_home))
+                       capture_output=True, text=True, env=dict(env, MATRIXKODER_HOME=reg_home, MK_HOME=reg_home))
     assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
     assert os.path.exists(os.path.join(from_json, "runs", "j1", "run.json"))
     assert not os.path.exists(os.path.join(reg_home, "mk.db"))
     # register writes BOTH, and the root table then wins over a stale projects.json
-    saved = os.environ.get("MATRIXKODER_HOME")
+    saved = {k: os.environ.get(k) for k in ("MK_HOME", "MATRIXKODER_HOME")}
+    os.environ["MK_HOME"] = reg_home
     os.environ["MATRIXKODER_HOME"] = reg_home
     try:
         register_project("reg", reg_repo, from_root)
     finally:
-        if saved is None:
-            os.environ.pop("MATRIXKODER_HOME", None)
-        else:
-            os.environ["MATRIXKODER_HOME"] = saved
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
     assert os.path.exists(os.path.join(reg_home, "mk.db"))
     # an invalid slug is refused before any file is written
     slug_home = os.path.join(tmp, "slug-home")
     os.makedirs(slug_home)
+    os.environ["MK_HOME"] = slug_home
     os.environ["MATRIXKODER_HOME"] = slug_home
     try:
         for bad in ("../x", "X", "", "a" * 42):
@@ -4005,15 +4023,16 @@ def store_self_test(tmp, env):
         assert not os.path.exists(os.path.join(slug_home, "mk.db"))
         assert os.listdir(slug_home) == []
     finally:
+        os.environ["MK_HOME"] = reg_home
         os.environ["MATRIXKODER_HOME"] = reg_home
     listed = json.load(open(os.path.join(reg_home, "projects.json")))
     assert listed[os.path.realpath(reg_repo)]["data_dir"] == os.path.abspath(from_root)
     r = subprocess.run([sys.executable, os.path.abspath(__file__), "run", "init", "--id", "rt1",
                         "--feature", "R", "--branch", "br"], cwd=reg_repo,
-                       capture_output=True, text=True, env=dict(env, MATRIXKODER_HOME=reg_home))
+                       capture_output=True, text=True, env=dict(env, MATRIXKODER_HOME=reg_home, MK_HOME=reg_home))
     assert r.returncode == 0, r.stdout
     assert os.path.exists(os.path.join(from_root, "runs", "rt1", "run.json"))
-    env_over = dict(env, MATRIXKODER_HOME=reg_home, MATRIXKODER_DATA=os.path.join(tmp, "env-over"))
+    env_over = dict(env, MATRIXKODER_HOME=reg_home, MK_HOME=reg_home, MATRIXKODER_DATA=os.path.join(tmp, "env-over"))
     r = subprocess.run([sys.executable, os.path.abspath(__file__), "run", "init", "--id", "ev1",
                         "--feature", "E", "--branch", "be"], cwd=reg_repo,
                        capture_output=True, text=True, env=env_over)
@@ -4111,7 +4130,7 @@ def store_self_test(tmp, env):
     # K2 store on: --tests 384/387 refused (task stays, no event); 350/0 still passes;
     # a raise on the 2nd promotion still lists the 1st.
     k2 = os.path.join(tmp, "k2on")
-    k2env = dict(env, MATRIXKODER_HOME=os.path.join(tmp, "k2on-home"))
+    k2env = dict(env, MATRIXKODER_HOME=os.path.join(tmp, "k2on-home"), MK_HOME=os.path.join(tmp, "k2on-home"))
     once(["run", "init", "--id", "k2", "--feature", "K2", "--branch", "bk"], k2, k2env)
     once(["task", "add", "--id", "V", "--title", "verify", "--run", "k2"], k2, k2env)
     once(["store", "enable"], k2, k2env)
@@ -4147,7 +4166,7 @@ def store_self_test(tmp, env):
     # two real processes, store already on, 10 task-set each: project tasks match root cards
     par = os.path.join(tmp, "par")
     par_home = os.path.join(tmp, "par-home")
-    parenv = dict(env, MATRIXKODER_HOME=par_home)
+    parenv = dict(env, MATRIXKODER_HOME=par_home, MK_HOME=par_home)
     once(["run", "init", "--id", "pr", "--feature", "Par", "--branch", "bp"], par, parenv)
     for i in range(20):
         once(["task", "add", "--id", f"P{i}", "--title", f"p{i}", "--run", "pr"], par, parenv)

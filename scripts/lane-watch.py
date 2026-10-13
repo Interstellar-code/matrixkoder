@@ -957,7 +957,10 @@ def self_test():
     # record(): writes status + transition event through mk-state, in a temp data dir
     import shutil, tempfile
     tmp = tempfile.mkdtemp(prefix="lane-watch-test-")
-    os.environ["MATRIXKODER_HOME"] = os.path.join(tmp, "home")
+    watch_home = os.path.join(tmp, "home")
+    os.environ["MK_HOME"] = watch_home
+    os.environ["MATRIXKODER_HOME"] = watch_home
+    os.environ["MK_SELFTEST"] = "1"
     data = os.path.join(tmp, "data")
     restore_data = mk_config.pin_tmp_data(tmp)  # cfg() resolves the data dir: keep it in temp
     try:
@@ -1096,8 +1099,9 @@ def self_test():
 
         def cli(*args, code=0):
             # env was snapshotted before the store existed; the child must see the CURRENT
-            # MATRIXKODER_HOME or its store reads look at the real home
-            e = dict(env, MATRIXKODER_HOME=os.environ["MATRIXKODER_HOME"])
+            # temp home under both names or its store reads look at the real home
+            e = dict(env, MATRIXKODER_HOME=os.environ["MATRIXKODER_HOME"],
+                     MK_HOME=os.environ["MATRIXKODER_HOME"], MK_SELFTEST="1")
             r = subprocess.run([sys.executable, __file__, "--lane", lane, "--agent", "w1", *args], env=e,
                                capture_output=True, text=True)
             assert r.returncode == code, r.stdout + r.stderr
@@ -1470,6 +1474,8 @@ def self_test():
     finally:
         lh.pane_text = real_pane
 
+    # R1.2: the mkdb write guard refuses the real home from this suite too.
+    _load_mkdb().selftest_guard_probe(watch_home)
     print("lane-watch self-test ok")
 
 

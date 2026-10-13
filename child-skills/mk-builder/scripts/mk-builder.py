@@ -1801,6 +1801,22 @@ def lane_hash(lane):
     return hashlib.sha256(os.path.realpath(lane).encode("utf-8")).hexdigest()
 
 
+def _one_home():
+    """One MK home rule (C16): $MK_HOME and $MATRIXKODER_HOME are the same setting.
+
+    Returns the MK home or None when neither is set (the caller falls back to
+    ~/.matrixkoder). When both are set they must agree, else Fail.
+    """
+    mkh = os.environ.get("MK_HOME")
+    mch = os.environ.get("MATRIXKODER_HOME")
+    if mkh and mch:
+        left = os.path.realpath(os.path.abspath(os.path.expanduser(mkh)))
+        right = os.path.realpath(os.path.abspath(os.path.expanduser(mch)))
+        if left != right:
+            raise Fail(f"MK_HOME ({mkh}) and MATRIXKODER_HOME ({mch}) differ; set one MK home")
+    return mkh or mch
+
+
 def bus_token_path(lane):
     """ONE resolver for the lane token file (D6B moves it; this CLI must follow).
 
@@ -1818,7 +1834,7 @@ def bus_token_path(lane):
     if os.environ.get("MK_BUS_DIR"):
         home = os.path.abspath(os.path.expanduser(os.environ["MK_BUS_DIR"]))
     elif os.environ.get("MK_HOME"):
-        home = os.path.abspath(os.path.expanduser(os.environ["MK_HOME"]))
+        home = os.path.abspath(os.path.expanduser(_one_home()))
     else:
         home = os.path.join(os.path.expanduser("~"), ".matrixkoder")
     return os.path.join(home, "bus-lanes", lane_hash(lane) + ".json")
@@ -2278,7 +2294,7 @@ def cmd_hook_install(a):
     """Dispatch-time hook install. Refuses to write inside the lane worktree."""
     lane = lane_dir(a)
     kind = check_agent(a.agent or detect_agent())
-    home = os.environ.get("MK_HOME") or os.path.expanduser("~/.matrixkoder")
+    home = _one_home() or os.path.expanduser("~/.matrixkoder")
     home = os.path.abspath(home)
     if os.path.commonpath([home, os.path.abspath(lane)]) == os.path.abspath(lane):
         raise Fail("hook install must be outside the worktree [C8]")
@@ -4069,7 +4085,7 @@ def d7_answer(data, ask_id, text, to_task):
     Store mode publishes bus.json in the MK home, not in the data dir."""
     bus_json = os.path.join(data, "bus.json")
     if not os.path.isfile(bus_json):
-        home = os.environ.get("MK_BUS_DIR") or os.environ.get("MK_HOME") or os.path.expanduser("~/.matrixkoder")
+        home = os.environ.get("MK_BUS_DIR") or _one_home() or os.path.expanduser("~/.matrixkoder")
         bus_json = os.path.join(home, "bus.json")
     with open(bus_json) as f:
         b = json.load(f)
@@ -4386,7 +4402,7 @@ def t_d7_hook_install_outside(root):
     lane = gitlane(root, "d7_hook_lane")
     begin(lane, root)
     home = os.path.join(root, "mk-home")
-    code, lines = cli(lane, "hook-install", "--agent", "claude", env={"MK_HOME": home})
+    code, lines = cli(lane, "hook-install", "--agent", "claude", env={"MK_HOME": home, "MATRIXKODER_HOME": home})
     assert code == 0, lines
     out = jline(lines)
     assert out["installed"] is True and out["settings"].startswith(home), out
@@ -4394,7 +4410,7 @@ def t_d7_hook_install_outside(root):
     with open(out["settings"]) as f:
         doc = json.load(f)
     assert "recorded_payload" in doc
-    code, lines = cli(lane, "hook-install", "--agent", "agy", env={"MK_HOME": home})
+    code, lines = cli(lane, "hook-install", "--agent", "agy", env={"MK_HOME": home, "MATRIXKODER_HOME": home})
     assert code == 0 and jline(lines)["installed"] is False, lines
 
 
@@ -5593,12 +5609,13 @@ def run_self_test():
     # Todo 69: the real home's root store, read with os.stat only, before anything runs.
     real_db = os.path.join(os.path.expanduser("~"), ".matrixkoder", "mk.db")
     real_before = stat_of(real_db)
-    pinned = {k: os.environ.get(k) for k in ("MK_HOME", "MATRIXKODER_HOME", "MK_BUS_DIR", "MK_BUS_DATA")}
+    pinned = {k: os.environ.get(k) for k in ("MK_HOME", "MATRIXKODER_HOME", "MK_BUS_DIR", "MK_BUS_DATA", "MK_SELFTEST")}
     try:
         for name, fn in cases:
             # Every case starts on the temp home; a store-mode bus case pins its own (pin_home).
             # MK_BUS_DIR and MK_BUS_DATA stay unset here: a file-mode bus keeps bus.json in its data dir.
             os.environ["MK_HOME"] = os.environ["MATRIXKODER_HOME"] = os.path.join(root, "pin-home")
+            os.environ["MK_SELFTEST"] = "1"
             os.environ.pop("MK_BUS_DIR", None)
             os.environ.pop("MK_BUS_DATA", None)
             try:
@@ -5619,6 +5636,31 @@ def run_self_test():
     if stat_of(real_db) != real_before:
         failed.append("real_home_untouched")
         print(f"not ok real_home_untouched: {real_db} was {real_before}, now {stat_of(real_db)}")
+    # R1.2: the mkdb write guard refuses the real home; ro reads work. A temp
+    # home keeps the probe's write off the real store.
+    try:
+        import importlib.util as _iu
+        _spec = _iu.spec_from_file_location(
+            "mkdb", os.path.join(os.path.dirname(MK_BUS_PY), "mkdb.py"))
+        _mod = _iu.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        os.environ["MK_SELFTEST"] = "1"
+        probe_home = tempfile.mkdtemp(prefix="mk-builder-guard-")
+        os.environ["MK_HOME"] = os.environ["MATRIXKODER_HOME"] = probe_home
+        try:
+            _mod.selftest_guard_probe(probe_home)
+        finally:
+            shutil.rmtree(probe_home, ignore_errors=True)
+        print("ok selftest_guard")
+    except Exception as e:
+        failed.append("selftest_guard")
+        print(f"not ok selftest_guard: {type(e).__name__}: {e}")
+    finally:
+        for k, v in pinned.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
     if leftover:
         failed.append("bus_server_leftover")
         print(f"not ok bus_server_leftover: pgrep still shows a serve for: {leftover}")

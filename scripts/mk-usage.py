@@ -101,9 +101,22 @@ EXHAUSTED_FIELDS = (
 )
 
 
+def _mk_home():
+    """One MK home rule (C16), identical to mkdb.resolve_home(None): $MK_HOME and
+    $MATRIXKODER_HOME are the same setting; when both are set they must agree."""
+    mkh = os.environ.get("MK_HOME")
+    mch = os.environ.get("MATRIXKODER_HOME")
+    if mkh and mch:
+        left = os.path.realpath(os.path.abspath(os.path.expanduser(mkh)))
+        right = os.path.realpath(os.path.abspath(os.path.expanduser(mch)))
+        if left != right:
+            raise RuntimeError(f"MK_HOME ({mkh}) and MATRIXKODER_HOME ({mch}) differ; set one MK home")
+    return os.path.expanduser(mkh or mch or "~/.matrixkoder")
+
+
 def default_ledger():
     return os.path.join(
-        os.path.expanduser(os.environ.get("MATRIXKODER_HOME") or "~/.matrixkoder"),
+        _mk_home(),
         "usage.json",
     )
 
@@ -114,7 +127,7 @@ def usage_lock():
     mark. Without it a poll read the file and its atomic replace then dropped a fresh mark. Fixed under
     <home>, not beside the ledger, so the two serialise even with different --out/--ledger paths."""
     path = os.path.join(
-        os.path.expanduser(os.environ.get("MATRIXKODER_HOME") or "~/.matrixkoder"),
+        _mk_home(),
         "usage.json.lock",
     )
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -688,9 +701,13 @@ def self_test():
     # usage_lock() resolves <home> independently of --out, so pin it to a temp dir before the first
     # poll: a run must never take a lock (or fall back to the ledger) inside the real ~/.matrixkoder
     mk_home = tempfile.mkdtemp(prefix="mk-usage-home-")
+    os.environ["MK_HOME"] = mk_home
     os.environ["MATRIXKODER_HOME"] = mk_home
+    os.environ["MK_SELFTEST"] = "1"
     try:
         self_test_body()
+        # R1.2: the mkdb write guard refuses the real home from this suite too.
+        _load("mkdb", os.path.join(HERE, "mkdb.py")).selftest_guard_probe(mk_home)
     finally:
         shutil.rmtree(mk_home, ignore_errors=True)
 
@@ -1066,7 +1083,7 @@ def self_test_body():
                     f" \"usedPercent\": 12, \"resetsAt\": \"{cb_reset}\"}}}}}}]')\n")
         os.chmod(os.path.join(race_bin, "codexbar"), 0o755)
         json.dump({"agents": {}}, open(race_ledger, "w"))
-        env = dict(os.environ, MATRIXKODER_HOME=race_home, RACE_DIR=race_dir,
+        env = dict(os.environ, MATRIXKODER_HOME=race_home, MK_HOME=race_home, RACE_DIR=race_dir,
                    PATH=race_bin + os.pathsep + os.environ["PATH"])
         poll_proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--providers", "zai",
                                       "--out", race_ledger], env=env, stdout=subprocess.PIPE,
