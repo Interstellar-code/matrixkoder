@@ -1216,7 +1216,8 @@ class BusState:
             argv = [sys.executable, fake, "prompt", pane, line] if fake else ["herdr", "agent", "prompt", pane, line]
             if not fake and shutil.which("herdr") is None:
                 return False
-            if subprocess.run(argv, timeout=5).returncode != 0:
+            # DEVNULL, not inherited: a bus started by `ensure` has a dead stdout pipe, and herdr's reply would SIGPIPE it (-13)
+            if subprocess.run(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5).returncode != 0:
                 return False
         except (OSError, subprocess.TimeoutExpired, ValueError):
             return False
@@ -3276,7 +3277,8 @@ def _store_self_test_body(mod):
     def spawn_prefer(data_dir, run, prefer):
         return spawn(data_dir, run, prefer)
 
-    def spawn(data_dir, run, prefer=None):
+    def spawn(data_dir, run, prefer=None, dead_stdout=False):
+        # dead_stdout: stdout is a pipe whose read end is closed once the bus is healthy, as after `ensure`
         argv = [sys.executable, os.path.abspath(__file__), "serve", "--data", data_dir]
         if run:
             argv += ["--run", run]
@@ -3285,7 +3287,7 @@ def _store_self_test_body(mod):
         proc = subprocess.Popen(
             argv,
             start_new_session=True,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE if dead_stdout else subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
         pids.append(proc.pid)
@@ -3304,6 +3306,8 @@ def _store_self_test_body(mod):
                         with urllib.request.urlopen(req, timeout=1.0) as resp:
                             body = json.loads(resp.read().decode())
                             if resp.status == 200 and body.get("pid") == proc.pid:
+                                if dead_stdout:
+                                    proc.stdout.close()
                                 return pid, port
                     except Exception:
                         pass
@@ -3810,6 +3814,7 @@ def _store_self_test_body(mod):
             fh.write("if len(sys.argv) > 1 and sys.argv[1] == 'prompt':\n")
             fh.write("    with open(log, 'a') as f:\n")
             fh.write("        f.write(sys.argv[2] + ' ' + sys.argv[3] + chr(10))\n")
+            fh.write("    print(json.dumps({'result': {'ok': True}}), flush=True)\n")
             fh.write("    sys.exit(0)\n")
             fh.write("import os\n")
             fh.write("sf = sys.argv[0] + '.status'\n")
@@ -3887,6 +3892,21 @@ def _store_self_test_body(mod):
         rang3 = open(fake + ".rang").read()
         assert inbox_count() == before3 + 2, rang3
         assert "T1" in rang3 and "mk-builder.py inbox" in rang3
+
+        # F2: a bus whose stdout reader is gone (started by `ensure`) still types its ring.
+        # The fake herdr writes a reply, so an inherited dead pipe would SIGPIPE it (-13).
+        write_status("idle")
+        kill(pid2)
+        pid2, port2 = spawn(data, "r1", dead_stdout=True)
+        btok = remint()
+        typed_f2, failed_f2 = event_count("ring-typed"), event_count("ring-failed")
+        code, f2 = post(port2, btok, {"run": "r1", "task": "T1", "kind": "nudge", "text": "dead stdout", "from": "orch", "to": "T1", "project": "proj"})
+        assert code == 200, (code, f2)
+        deadline = time.time() + 5.0
+        while time.time() < deadline and event_count("ring-typed") == typed_f2 and event_count("ring-failed") == failed_f2:
+            time.sleep(0.05)
+        assert event_count("ring-typed") == typed_f2 + 1, (event_count("ring-typed"), typed_f2)
+        assert event_count("ring-failed") == failed_f2, (event_count("ring-failed"), failed_f2)
 
         # FIX 4a: ring is recorded before typing. A kill between the two
         # leaves kind=ring and no rang line; restart types it once; a second
