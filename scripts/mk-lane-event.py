@@ -1601,9 +1601,19 @@ def cmd_event():
                  "recorded": True, "label": label, "toast": toast})
 
 
+def dirty_files(lane):
+    """Lines of `git status --porcelain` in the lane (agent-independent alive signal); None when git fails."""
+    try:
+        r = subprocess.run(["git", "-C", lane, "status", "--porcelain"],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return len(r.stdout.splitlines()) if r.returncode == 0 else None
+
+
 def cmd_sweep(a):
     data = opt(a, "--data")
-    checked, skipped, verdicts = 0, 0, []
+    checked, skipped, verdicts, lanes = 0, 0, [], []
     for wt, _ in armed_lanes(data and os.path.abspath(data)):
         if not os.path.isdir(wt):
             continue
@@ -1615,6 +1625,8 @@ def cmd_sweep(a):
                 skipped += 1
                 continue
             checked += 1
+            dirty = dirty_files(wt)
+            lanes.append({"lane": wt, "task": w.get("task"), "dirty_files": dirty})
             try:
                 h, subj, state, evidence = verdict_for(w)
             except Exception as e:
@@ -1627,9 +1639,12 @@ def cmd_sweep(a):
                 write_watch(wt, w)
                 continue
             rec, label, toast, status = apply_verdict(w, state, subj, evidence, h)
-            verdicts.append({"lane": wt, "task": w.get("task"), "verdict": state,
-                             "status": status, "recorded": rec.get("ok", False)})
-    out({"ok": True, "checked": checked, "skipped": skipped, "verdicts": verdicts})
+            entry = {"lane": wt, "task": w.get("task"), "verdict": state,
+                     "status": status, "recorded": rec.get("ok", False)}
+            if state == "STALL" and dirty:
+                entry["alive_hint"] = f"the lane has {dirty} modified files; it may be working in a subagent"
+            verdicts.append(entry)
+    out({"ok": True, "checked": checked, "skipped": skipped, "lanes": lanes, "verdicts": verdicts})
 
 
 def self_test():
@@ -2020,10 +2035,15 @@ def self_test():
         arm("H6", stall_min=1)
         open(status_f, "w").write("idle")
         open(pane_f, "w").write("quiet\n")
+        for i in (1, 2):  # H5 is silent but has two modified files: the alive hint
+            open(os.path.join(lanes["H5"], f"wip{i}.txt"), "w").write("x")
         r = cli("sweep")
         assert r["ok"] and r["checked"] == 3 and r["skipped"] == 3, r  # H3 H5 H6 checked, H1 H2 H4 skipped
         v = {x["task"]: x for x in r["verdicts"]}
         assert set(v) == {"H5"} and v["H5"]["verdict"] == "STALL" and v["H5"]["status"] == "stalled", r
+        dirty = {x["task"]: x["dirty_files"] for x in r["lanes"]}
+        assert set(dirty) == {"H3", "H5", "H6"} and dirty["H5"] == 2 and dirty["H6"] == 0, dirty
+        assert v["H5"]["alive_hint"] == "the lane has 2 modified files; it may be working in a subagent", v["H5"]
         assert task_status("H5") == "stalled" and watch_of("H6")["verdict"] is None
         assert task_status("H6") == "building" and task_status("H3") == "building"
         ntr = len(transitions())
