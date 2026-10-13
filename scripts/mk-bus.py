@@ -36,6 +36,10 @@ Subcommands:
       Lists asks without an answer where reply_to == ask.id.
   tail [--run ID] [--n N] [--lane L] [--after SEQ] [--data DIR]
       Lists messages from bus.jsonl.
+  watch [--run ID] [--task T] [--after ID|SEQ] [--replay] [--max-messages N] [--data DIR]
+      Streams bus messages, one line each. Keeps the last printed seq per (run, task) in
+      <data>/watch-cursors.json (0600): a new watch resumes after it. An explicit --after wins
+      over the cursor; --replay ignores it and starts from 0; the first watch ever replays history.
   --self-test
       Comprehensive self-test of server, round trip, auth, replay, lifecycle, security, error handling.
 
@@ -3035,6 +3039,11 @@ def cmd_watch(args):
     Without --run it streams every run of the project (`run=*`; in file mode
     the bus's own run, since `run=*` needs the project store). A 4xx from
     the bus prints the error on one line and exits 5, as ask/wait/inbox do.
+
+    The last printed seq is kept in <data>/watch-cursors.json under
+    "<run or *>|<task or *>", so a new watch does not replay what the last one
+    printed. Start point: explicit --after, else the cursor, else 0 (first arm);
+    --replay skips the cursor. Seq is the number in the message id (m-12 -> 12).
     """
     data_dir = resolve_data(getattr(args, "data", None))
     run = getattr(args, "run", "") or ""
@@ -3043,7 +3052,15 @@ def cmd_watch(args):
         raise Fail("invalid run id")
     if task and not is_valid_id(task):
         raise Fail("invalid task id")
-    after = getattr(args, "after", 0) or 0
+    after = getattr(args, "after", None)
+    cursor_path = os.path.join(data_dir, "watch-cursors.json")
+    cursor_key = "%s|%s" % (run or "*", task or "*")
+    if after is None or after == "":
+        after = 0
+        if not getattr(args, "replay", False):
+            saved = (read_json(cursor_path, default={}) or {}).get(cursor_key)
+            if isinstance(saved, int) and saved > 0:
+                after = saved
     last_seq = int(str(after)[2:]) if str(after).startswith("m-") and str(after)[2:].isdigit() else int(after or 0)
     max_messages = getattr(args, "max_messages", 0) or 0
 
@@ -3106,6 +3123,12 @@ def cmd_watch(args):
                         except (TypeError, ValueError):
                             pass
                         print(_watch_line(m), flush=True)
+                        # shortcut: unlocked read-modify-write, two watches of one data dir can
+                        # lose a cursor update (replays a few lines); lock if that ever bites.
+                        cursors = read_json(cursor_path, default={})
+                        cursors = cursors if isinstance(cursors, dict) else {}
+                        cursors[cursor_key] = last_seq
+                        write_json(cursor_path, cursors)
                         printed += 1
                         if max_messages and printed >= max_messages:
                             return 0
@@ -4587,6 +4610,42 @@ def _store_self_test_body(mod):
             if watch.poll() is None:
                 stop_process(watch.pid)
                 watch.wait(timeout=10)
+
+        # Decision 1: watch keeps a per-(run, task) cursor in <data>/watch-cursors.json. The
+        # watch above (--after, run r1, no task) printed 6 lines, so the cursor holds "r1|*".
+        cur_path = os.path.join(data, "watch-cursors.json")
+        assert (os.stat(cur_path).st_mode & 0o777) == 0o600, oct(os.stat(cur_path).st_mode)
+        cur_seq = read_json(cur_path)["r1|*"]
+        assert cur_seq == int(ids[-1][2:]), (cur_seq, ids[-1])
+        cur_new = []
+        for i in range(2):
+            code, cm = post(port2, orch_w, {"run": "r1", "task": "T9", "kind": "info",
+                                            "text": f"cursor message {i}", "from": "orch", "to": "T9"})
+            assert code == 200, (code, cm)
+            cur_new.append(cm["message"]["id"])
+        watch_cmd = [sys.executable, os.path.abspath(__file__), "watch", "--run", "r1", "--data", data]
+        # No --after: resumes after the cursor, so only the two new messages, no history replay.
+        res_cur = subprocess.run(watch_cmd + ["--max-messages", "2"], stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True, timeout=20)
+        assert res_cur.returncode == 0, (res_cur.returncode, res_cur.stderr)
+        assert [ln.split()[1] for ln in res_cur.stdout.splitlines()] == cur_new, res_cur.stdout
+        assert read_json(cur_path)["r1|*"] == int(cur_new[-1][2:]), read_json(cur_path)
+        assert (os.stat(cur_path).st_mode & 0o777) == 0o600
+        # A different filter has its own key: a task watch with no cursor replays from the start.
+        res_tk = subprocess.run(watch_cmd + ["--task", "T9", "--max-messages", "1"], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, timeout=20)
+        assert res_tk.returncode == 0, (res_tk.returncode, res_tk.stderr)
+        assert res_tk.stdout.split()[1] not in cur_new, res_tk.stdout
+        assert "r1|T9" in read_json(cur_path), read_json(cur_path)
+        # --replay ignores the cursor and starts from 0: the oldest message, not a new one.
+        res_rp = subprocess.run(watch_cmd + ["--replay", "--max-messages", "1"], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, timeout=20)
+        assert res_rp.returncode == 0, (res_rp.returncode, res_rp.stderr)
+        assert int(res_rp.stdout.split()[1][2:]) < int(base_id[2:]), (res_rp.stdout, base_id)
+        # An explicit --after wins over the cursor (here: replay the second new message only).
+        res_af = subprocess.run(watch_cmd + ["--after", cur_new[0], "--max-messages", "1"], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, timeout=20)
+        assert res_af.stdout.split()[1] == cur_new[1], res_af.stdout
 
         # A multi-line body collapses to ONE line, cut to 200 chars (C13a).
         noisy = "first line\nsecond\tline " + ("y" * 400)
@@ -6306,7 +6365,8 @@ def main():
     p_watch = subparsers.add_parser("watch")
     p_watch.add_argument("--run", default="", help="Only this run id")
     p_watch.add_argument("--task", default="", help="Only this task id")
-    p_watch.add_argument("--after", default="0", help="Resume after this message id or seq")
+    p_watch.add_argument("--after", default=None, help="Resume after this message id or seq (wins over the saved cursor)")
+    p_watch.add_argument("--replay", action="store_true", help="Ignore the saved cursor and replay from the start")
     p_watch.add_argument("--max-messages", type=int, default=0, help="Exit after N lines (0 = never)")
     p_watch.add_argument("--data", help="MatrixKoder data dir")
 
