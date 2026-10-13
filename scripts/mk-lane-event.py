@@ -64,7 +64,7 @@ idle and sends the prompt exactly as today. No armed watch kind, a kind without 
 --role review, or fresh_session: same: one prompt, no extra herdr call. The reply carries fresh_session (the
 command sent, or null).
 """
-import fcntl, hashlib, importlib.util, json, os, re, socket, subprocess, sys, tempfile, time
+import fcntl, shlex, hashlib, importlib.util, json, os, re, shutil, socket, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WATCH = ".matrixkoder-watch.json"
@@ -74,6 +74,9 @@ DISPATCH_RECHECK_S = 3  # wait before dispatch's one pane-text recheck; $MK_DISP
 RETRY_PANE_STATES = ("idle", "done")  # pane sat still through a failed wait → the prompt was lost
 FRESH_IDLE_WAIT_S = float(os.environ.get("MK_FRESH_IDLE_WAIT_S", "30"))  # bounded; $MK_FRESH_IDLE_WAIT_S shrinks it for a self-test
 FRESH_IDLE_POLL_S = float(os.environ.get("MK_FRESH_IDLE_POLL_S", "0.5"))
+# the doorbell wait is its own bound: a /new just before must finish before the line is typed
+DOORBELL_IDLE_WAIT_S = float(os.environ.get("MK_DOORBELL_IDLE_WAIT_S", "15"))
+DOORBELL_IDLE_POLL_S = float(os.environ.get("MK_DOORBELL_IDLE_POLL_S", "0.5"))
 FRESH_CMDS = {"opencode": "/new", "claude": "/clear"}
 
 sys.dont_write_bytecode = True  # no stray __pycache__ next to the scripts
@@ -773,12 +776,18 @@ def publish_brief(data, run, task):
 
 
 def connect_text(lane, data):
-    """The one line a bus-up dispatch types: connect, plus the job-budget command."""
+    """The one line a bus-up dispatch types: connect, plus the job-budget command.
+
+    `--data <dir>` is in the line so the lane's first command works with no env (E1 reads
+    it). The hint is a command prefix, so typing it is how the builder's shell gets the var.
+    One line: the fake herdr and the prompt marker both keep only the first line.
+    """
     skill = os.path.join(lane, ".claude", "skills", "mk-builder")
     n = selftest_jobs_hint(data) if data else "4"
-    # One line: the fake herdr and the prompt marker both keep only the first line.
-    # The hint is a command prefix, so typing it is how the builder's shell gets the var.
-    return (f"MK_SELFTEST_JOBS={n} python3 {skill}/scripts/mk-builder.py connect")
+    # MK_SELFTEST_JOBS=N stays in the production doorbell: it is the E6 job-budget hint
+    # and E1 reads it from the typed line.
+    data_arg = f" --data {shlex.quote(data)}" if data else ""
+    return (f"MK_SELFTEST_JOBS={n} python3 {shlex.quote(skill)}/scripts/mk-builder.py connect{data_arg}")
 
 
 def delivered_status(pane, role):
@@ -859,7 +868,18 @@ def cmd_dispatch(a):
         if hit and bus_enabled(wdata) and bus_is_up(wdata):
             ok, publish_error = publish_brief(wdata, wrun, wtask)
             if ok:
-                text = connect_text(hit[1].get("lane") or "", wdata)
+                # A /new sent just before must not merge with the typed line (todo 74):
+                # wait, bounded, until the pane agent is idle or done. A pane that is
+                # still busy after the wait keeps the full prompt and is not typed into.
+                ist, iwhy = wait_idle(pane, budget_s=float(os.environ.get('MK_DOORBELL_IDLE_WAIT_S', str(DOORBELL_IDLE_WAIT_S))), poll_s=float(os.environ.get('MK_DOORBELL_IDLE_POLL_S', str(DOORBELL_IDLE_POLL_S))))
+                if ist in RETRY_PANE_STATES:
+                    text = connect_text(hit[1].get("lane") or "", wdata)
+                else:
+                    # a busy pane gets nothing typed: not the doorbell, not the full
+                    # prompt. The caller retries later.
+                    out({"ok": False, "delivered": False, "pane": pane,
+                         "publish_error": f"pane not idle: {ist or iwhy}"})
+                    sys.exit(1)
             elif publish_error:
                 # the full prompt is kept; the reply says why the doorbell was not typed
                 a = list(a) + ["--publish-error", publish_error]
@@ -1097,6 +1117,24 @@ def render_fix_section(findings, min_sev):
     return "\n".join(lines) + "\n"
 
 
+
+def lane_review_for(data, run, task):
+    """The newest `<lane>/.matrixkoder-review-rN.md`, or None. The lane is the task's."""
+    lane = task_record(data, run, task).get("lane")
+    if not lane or not os.path.isdir(lane):
+        return None
+    best, best_n = None, -1
+    try:
+        names = os.listdir(lane)
+    except OSError:
+        return None
+    for name in names:
+        m = re.fullmatch(r"\.matrixkoder-review-r(\d+)\.md", name)
+        if m and int(m.group(1)) > best_n:
+            best, best_n = os.path.join(lane, name), int(m.group(1))
+    return best
+
+
 def review_path_for(data, run, task):
     """The newest review-rN.md for the task, or None."""
     d = os.path.join(data, "runs", run, "tasks", task)
@@ -1169,13 +1207,136 @@ def task_round_of(data, run, task):
 
 
 def review_round_of(path):
-    """The N in review-rN.md, or None."""
-    m = re.fullmatch(r"review-r(\d+)\.md", os.path.basename(path or ""))
+    """The N in review-rN.md or .matrixkoder-review-rN.md, or None."""
+    base = os.path.basename(path or "")
+    m = re.fullmatch(r"(?:\.matrixkoder-)?review-r(\d+)\.md", base)
     return int(m.group(1)) if m else None
 
 
 def hold_path(data, run, task):
     return os.path.join(data, "runs", run, "tasks", task, ".matrixkoder-handoff.json")
+
+
+def task_record(data, run, task):
+    """The task dict from `mk-state task get`, or {} when it cannot be read."""
+    r = subprocess.run(
+        [sys.executable, mk_state_cmd(), "--data", data, "--run", run, "task", "get", task],
+        capture_output=True, text=True)
+    try:
+        j = json.loads(r.stdout.strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError):
+        return {}
+    return j.get("task") or {} if isinstance(j, dict) and j.get("ok") else {}
+
+
+def git_out(repo, *args):
+    """One line of git output from <repo>, or '' when git cannot answer."""
+    if not repo:
+        return ""
+    try:
+        r = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def rules_block_of(text):
+    """The ## Rules section of a brief, header included, or '' when there is none."""
+    lines = (text or "").splitlines()
+    start = next((i for i, l in enumerate(lines) if l.strip() == "## Rules"), None)
+    if start is None:
+        return ""
+    out = []
+    for line in lines[start:]:
+        if out and line.startswith("## "):
+            break
+        out.append(line)
+    return "\n".join(out).strip()
+
+
+def commands_block_of(text):
+    """The ## Commands section of a brief, header included, or '' when there is none."""
+    lines = (text or "").splitlines()
+    start = next((i for i, l in enumerate(lines) if l.startswith("## Commands")), None)
+    if start is None:
+        return ""
+    out = []
+    for line in lines[start:]:
+        if out and line.startswith("## "):
+            break
+        out.append(line)
+    return "\n".join(out).strip()
+
+
+def filled_brief(data, run, task, round_n, review_path, fix):
+    """A fix brief filled from the task, never the raw template.
+
+    Repo, worktree, branch and sha come from the task's lane (git). Owned files come from
+    the task. The commit subject, the report path and the test/rules lines are copied from
+    the previous round's brief when it has them. The FIX section cites the review file and
+    lists each finding.
+    """
+    rec = task_record(data, run, task)
+    lane = rec.get("lane") or rec.get("workspace") or ""
+    branch = rec.get("branch") or (git_out(lane, "rev-parse", "--abbrev-ref", "HEAD") if lane else "")
+    sha = git_out(lane, "rev-parse", "--short", "HEAD") if lane else ""
+    owned = rec.get("owned") or []
+    owned_txt = ", ".join(owned) if isinstance(owned, list) else str(owned)
+    prev_text, prev_n = brief_body_for(data, run, task)
+    prev_text = prev_text or ""
+    report = ""
+    m = re.search(r"(?m)^- Report: write the report to `([^`]+)`", prev_text)
+    if not m:
+        m = re.search(r"(?m)^Report: (.+)$", prev_text)
+    if m:
+        report = m.group(1).strip().strip("`")
+    commit = ""
+    m = re.search(r"(?m)^- Commit: `([^`]+)`", prev_text)
+    if m:
+        commit = m.group(1).strip()
+    rules = rules_block_of(prev_text)
+    commands = commands_block_of(prev_text)
+    # the co-author is filled, never left as <agent/model>: the previous brief's commit
+    # line names it, else the task's agent record
+    coauthor = ""
+    cm = re.search(r"Co-Authored-By:\s*(\S[^\n]*?)\.?\s*$", prev_text)
+    if cm and "<agent/model>" not in cm.group(1):
+        coauthor = cm.group(1).strip().rstrip(".")
+    if not coauthor:
+        agent = rec.get("agent") or "the builder"
+        coauthor = f"{agent} <noreply@matrixkoder.local>"
+    # a fix round does not reuse the previous subject unchanged
+    if commit:
+        rest = re.sub(r"^[a-z]+\([^)]*\):\s*", "", commit)
+        commit = f"fix({task.lower()}): {rest}"
+    lines = [
+        f"# {task} — FIX round {round_n}: review R{review_round_of(review_path) or ''}",
+        "",
+        f"Repo: this folder (worktree `{lane or '(no lane recorded)'}`, branch `{branch or '(none)'}`, at `{sha or '(none)'}`).",
+        f"Plan phase task `{task}`. History: `{data}/runs/{run}/tasks/{task}/` (read-only). Do ONLY these fixes.",
+        "",
+        "## Files you own",
+        owned_txt or "(none recorded on the task)",
+        "Do NOT touch: everything else.",
+        "",
+        f"## FIX (review `{review_path}`)",
+        fix.strip(),
+        "",
+    ]
+    if commands:
+        lines += [commands, ""]
+    if rules:
+        lines += [rules, ""]
+    # append Commit/Report only when the copied blocks do not already carry them
+    copied = "\n".join(x for x in (commands, rules) if x)
+    if not re.search(r"(?m)^- Commit:", copied):
+        lines.append(f"- Commit: `{commit or 'fix: review findings'}` subject, blank line, "
+                     f"`Co-Authored-By: {coauthor}`.")
+    if not re.search(r"(?m)^- Report:", copied):
+        lines.append(f"- Report: write the report to `{report or '(set by the orchestrator)'}` "
+                     f"(cite the review findings).")
+    lines.append("")
+    return "\n".join(lines)
 
 
 def compose_brief(brief_path, fix):
@@ -1220,7 +1381,22 @@ def cmd_review_handoff(a):
         fail("--min must be one of CRITICAL HIGH MEDIUM LOW")
     path = opt(a, "--review") or review_path_for(data, run, task)
     if not path or not os.path.isfile(path):
-        fail(f"no review file for {task}")
+        # the reviewer writes into its own lane; copy that back into the task folder
+        found = lane_review_for(data, run, task)
+        if found:
+            # the lane file is copied into the task folder under the plain name, and the
+            # brief cites the copy so it survives a lane reset
+            dest_dir = os.path.join(data, "runs", run, "tasks", task)
+            os.makedirs(dest_dir, exist_ok=True)
+            n_found = review_round_of(found)
+            path = os.path.join(dest_dir, f"review-r{n_found}.md")
+            if not os.path.isfile(path):
+                shutil.copyfile(found, path)
+        else:
+            lane = (task_record(data, run, task).get("lane") or "<lane>")
+            fail(f"no review file for {task}: looked in "
+                 f"{os.path.join(data, 'runs', run, 'tasks', task)} and "
+                 f"{lane}/.matrixkoder-review-rN.md")
     n = review_round_of(path)
     if n is None:
         fail("review file is not review-rN.md")
@@ -1284,7 +1460,7 @@ def cmd_review_handoff(a):
         return
     fix = render_fix_section(findings, min_sev)
     brief_path = opened.get("brief")
-    written = compose_brief(brief_path, fix)
+    written = filled_brief(data, run, task, opened.get("round"), path, fix)
     if brief_path:
         try:
             with open(brief_path, "w") as f:
@@ -1567,7 +1743,17 @@ def self_test():
                     "    sys.exit(int(canned('prompt_rc').strip() or '0'))\n"
                     "elif a[:2] == ['pane', 'list']:\n"
                     "    open(os.path.join(base, 'calls.log'), 'a').write(' '.join(a) + chr(10))\n"
-                    "    sys.stdout.write(open(os.path.join(base, 'pane_list_out.txt')).read())\n"
+                    "    sfx = ''\n"
+                    "    q = os.path.join(base, 'pane_list_q.txt')\n"
+                    "    if os.path.exists(q):\n"
+                    "        toks = [t.strip() for t in open(q).read().split()]\n"
+                    "        if toks:\n"
+                    "            sfx = '' if toks[0] == '-' else toks[0]\n"
+                    "            open(q, 'w').write(' '.join(toks[1:]))\n"
+                    "    nm = os.path.join(base, 'pane_list_out' + sfx + '.txt')\n"
+                    "    if not os.path.exists(nm):\n"
+                    "        nm = os.path.join(base, 'pane_list_out.txt')\n"
+                    "    sys.stdout.write(open(nm).read())\n"
                     "    sys.exit(0)\n"
                     "else:\n"
                     "    print(json.dumps({'result': {}}))\n")
@@ -2566,12 +2752,57 @@ def self_test():
             assert prompt_calls()[n0:][-1].endswith("the full prompt stays --wait --timeout 25000"), \
                 prompt_calls()[n0:]
             open(os.path.join(_td, "brief-r1.md"), "w").write("# the brief\nhello lane\n")
+            open(os.path.join(tmp, "pane_list_out.txt"), "w").write(json.dumps(
+                {"result": {"panes": [{"pane_id": pane_of("NB"), "agent_status": "idle"}]}}) + "\n")
             open(bus_log, "w").write("")
             n0 = len(prompt_calls())
-            r = cli("dispatch", "--pane", pane_of("NB"), "--text", "the full prompt stays", "--connect")
+            r = cli("dispatch", "--pane", pane_of("NB"), "--text", "the full prompt stays", "--connect",
+                    extra={"MK_DOORBELL_IDLE_WAIT_S": "5", "MK_DOORBELL_IDLE_POLL_S": "0.05"})
             assert r["delivered"] is True and "publish_error" not in r, r
             _typed = prompt_calls()[n0:][-1]
             assert "mk-builder.py connect" in _typed and "the full prompt stays" not in _typed, _typed
+            # E3: the doorbell carries --data, so the lane's first command needs no env
+            assert f"--data {data}" in _typed, _typed
+            # E3: the doorbell waits for idle. The pane starts working; the first pane list
+            # says so, the second says idle. The typed line comes after the idle observation.
+            open(os.path.join(tmp, "pane_list_q.txt"), "w").write("1 2")
+            open(os.path.join(tmp, "pane_list_out1.txt"), "w").write(json.dumps(
+                {"result": {"panes": [{"pane_id": pane_of("NB"), "agent_status": "working"}]}}) + "\n")
+            open(os.path.join(tmp, "pane_list_out2.txt"), "w").write(json.dumps(
+                {"result": {"panes": [{"pane_id": pane_of("NB"), "agent_status": "idle"}]}}) + "\n")
+            open(os.path.join(tmp, "calls.log"), "w").write("")
+            r = cli("dispatch", "--pane", pane_of("NB"), "--text", "the full prompt stays", "--connect",
+                    extra={"MK_DOORBELL_IDLE_WAIT_S": "5", "MK_DOORBELL_IDLE_POLL_S": "0.05"})
+            assert r["delivered"] is True, r
+            log = open(os.path.join(tmp, "calls.log")).read().splitlines()
+            lists = [i for i, c in enumerate(log) if c.startswith("pane list")]
+            prompts = [i for i, c in enumerate(log) if "agent prompt" in c]
+            assert lists and prompts and min(lists) < min(prompts), log
+            assert any("connect --data" in c for c in log), log
+            # E3 R2: a pane that stays working is never typed the doorbell
+            open(os.path.join(tmp, "pane_list_q.txt"), "w").write("")
+            open(os.path.join(tmp, "pane_list_out.txt"), "w").write(json.dumps(
+                {"result": {"panes": [{"pane_id": pane_of("NB"), "agent_status": "working"}]}}) + "\n")
+            open(os.path.join(tmp, "calls.log"), "w").write("")
+            n0 = len(prompt_calls())
+            r = cli("dispatch", "--pane", pane_of("NB"), "--text", "the full prompt stays", "--connect",
+                    extra={"MK_DOORBELL_IDLE_WAIT_S": "0.3", "MK_DOORBELL_IDLE_POLL_S": "0.1"}, code=1)
+            # nothing at all is typed into a pane that stays working
+            assert r["delivered"] is False and "pane not idle" in r.get("publish_error", ""), r
+            assert prompt_calls()[n0:] == [], prompt_calls()[n0:]
+            # E3 R2: lane and data are quoted, so a space or metacharacters stay one argument
+            odd = os.path.join(tmp, "data dir;$(touch x)")
+            os.makedirs(odd, exist_ok=True)
+            open(os.path.join(odd, "mk.db"), "w").write("")
+            open(os.path.join(tmp, "pane_list_out.txt"), "w").write(json.dumps(
+                {"result": {"panes": [{"pane_id": pane_of("NB"), "agent_status": "idle"}]}}) + "\n")
+            n0 = len(prompt_calls())
+            r = cli("dispatch", "--pane", pane_of("NB"), "--text", "the full prompt stays", "--connect",
+                    extra={"MK_DOORBELL_IDLE_WAIT_S": "0.3"})
+            # the armed watch still points at the plain data dir; quote the builder directly
+            quoted = connect_text(os.path.join(tmp, "lane name"), odd)
+            assert "';$(touch x)'" in quoted or "data dir;" in quoted, quoted
+            assert "'" in quoted and "$(touch x)" in quoted, quoted
             # mk.db is already present (store enable, above), so the send is kind task, not info
             assert any("--kind task" in c and "kind:brief" in c for c in [" ".join(bus_calls())]), bus_calls()
             # a refused send keeps the full prompt and names the error
@@ -2631,6 +2862,19 @@ def self_test():
         assert r["round"] == 2 and r["required"] == 1, r
         brief = open(r["brief"]).read()
         assert "## FIX" in brief and "[HIGH]" in brief and "not required" in brief and "[LOW]" in brief, brief
+        # E3: the brief is filled from the task, never the raw template
+        assert "<PHASE>" not in brief and "<path>" not in brief, brief
+        assert "scripts/a.py:10" in brief and "review-r1.md" in brief, brief
+        # E3 R2: the generated brief passes brief-check, with and without a previous brief
+        import importlib.util as _iu
+        _spec = _iu.spec_from_file_location("briefcheck", os.path.join(HERE, "brief-check.py"))
+        _bc = _iu.module_from_spec(_spec)
+        _spec.loader.exec_module(_bc)
+        assert _bc.placeholder_failures(brief) == [], _bc.placeholder_failures(brief)
+        mks("task", "add", "--id", "RN", "--title", "no previous brief")
+        no_prev = filled_brief(data, "r1", "RN", 2, os.path.join(rev_dir, "review-r1.md"), "1. [HIGH] a:1 — p — f")
+        assert _bc.placeholder_failures(no_prev) == [], _bc.placeholder_failures(no_prev)
+        assert "Co-Authored-By: <" not in no_prev, no_prev
         calls = bus_calls()
         joined = " ".join(calls)
         assert joined.startswith("send ") and "--from orch" in joined and "--kind info" in joined \
@@ -2676,6 +2920,31 @@ def self_test():
         # a wrapped bullet keeps its continuation
         got = review_findings("## HIGH\n- a:1 — p —\n  the rest of it\n")
         assert got == [{"severity": "HIGH", "text": "a:1 — p — the rest of it"}], got
+        # E3: the review lives in the lane, not the task folder. It is copied in and used.
+        mks("task", "add", "--id", "RL", "--title", "lane review")
+        mks("task", "round", "RL", "--kind", "build")
+        lane_rl = os.path.join(tmp, "lane-rl")
+        os.makedirs(lane_rl, exist_ok=True)
+        mks("task", "set", "RL", "lane=" + lane_rl)
+        open(os.path.join(lane_rl, ".matrixkoder-review-r1.md"), "w").write(
+            "# RL review — REQUEST CHANGES\n\n## MEDIUM\n- scripts/c.py:4 — gap — cover it\n")
+        r = cli("review-handoff", "--task", "RL", "--run", "r1", "--data", data)
+        assert r["ok"] is True and r["dispatched"] is True, r
+        # E3 R2: the lane review is copied into the task folder and the brief cites the copy
+        copied = os.path.join(data, "runs", "r1", "tasks", "RL", "review-r1.md")
+        assert os.path.isfile(copied), copied
+        got = open(r["brief"]).read()
+        assert "scripts/c.py:4" in got and copied in got and "<PHASE>" not in got, got
+        # the real Commands heading (longer than the old exact text) is copied
+        prev = os.path.join(data, "runs", "r1", "tasks", "RL", "brief-r1.md")
+        open(prev, "w").write("## Commands (wait for each; ONE run each at the end)\n0. `B start`\n\n## Rules\n- Use the mk-builder skill.\n")
+        block = commands_block_of(open(prev).read())
+        assert block.startswith("## Commands") and "`B start`" in block, block
+        # a task with neither names both places
+        mks("task", "add", "--id", "RM", "--title", "missing review")
+        mks("task", "round", "RM", "--kind", "build")
+        r = cli("review-handoff", "--task", "RM", "--run", "r1", "--data", data, code=2)
+        assert r["ok"] is False and "review-rN.md" in r["error"] and "RM" in r["error"], r
         # an odd id is refused
         r = cli("review-handoff", "--task", "../x", "--run", "r1", "--data", data, code=2)
         assert r["ok"] is False, r

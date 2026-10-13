@@ -13,7 +13,8 @@ const ALLOWED_SUBCOMMANDS = new Set([
 
 // mk_bus: read-mostly bus access — pending/tail are reads, answer is the only write.
 // Validation runs before any process spawn so a malformed call never reaches mk-bus.py.
-const BUS_ACTIONS = new Set(['pending', 'tail', 'answer'])
+const BUS_ACTIONS = new Set(['pending', 'tail', 'answer', 'send', 'watch'])
+const BUS_SEND_KINDS = new Set(['ask', 'answer', 'info'])
 const BUS_MSG_ID_RE = /^m-\d+$/ // bus message ids are always m-<digits>
 const BUS_RUN_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/ // same shape as mk-state ID_RE
 const BUS_PROJECT_RE = /^[a-z0-9][a-z0-9-]{0,40}$/ // project slug passed as --project
@@ -186,17 +187,19 @@ export function registerTools(on: On, _options: PluginOptions): void {
       await $.tool.register({
         name: 'mk_bus',
         description:
-          'MatrixKoder orchestrator↔lane bus: list pending asks (action=pending), recent messages (action=tail), or answer an ask (action=answer).',
+          'MatrixKoder orchestrator↔lane bus: list pending asks (action=pending), recent messages (action=tail), answer an ask (action=answer), send a message (action=send, kind ask|answer|info), or the command line to arm under the Monitor tool (action=watch).',
         inputSchema: {
           type: 'object',
           properties: {
             action: {
               type: 'string',
-              enum: ['pending', 'tail', 'answer'],
+              enum: ['pending', 'tail', 'answer', 'send', 'watch'],
               description: 'bus operation to run',
             },
             msg_id: { type: 'string', description: 'msg id of the ask to answer (m-<n>)' },
-            text: { type: 'string', description: 'answer text' },
+            text: { type: 'string', description: 'answer or send text' },
+            kind: { type: 'string', enum: ['ask', 'answer', 'info'], description: 'send kind' },
+            task: { type: 'string', description: 'task id for send' },
             run: { type: 'string', description: 'run id filter' },
             project: { type: 'string', description: 'project slug (passed as --project)' },
           },
@@ -345,7 +348,7 @@ export function registerTools(on: On, _options: PluginOptions): void {
       if (typeof actionRaw !== 'string' || !BUS_ACTIONS.has(actionRaw)) {
         return {
           isError: true,
-          result: 'mk_bus: action must be one of pending, tail, answer',
+          result: 'mk_bus: action must be one of pending, tail, answer, send, watch',
         }
       }
       const msgIdRaw = inputObj.msg_id ?? nestedInput?.msg_id
@@ -367,62 +370,190 @@ export function registerTools(on: On, _options: PluginOptions): void {
       }
       const projectArg = typeof projectRaw === 'string' ? projectRaw : undefined
 
+      // A CLI failure line and a non-JSON 2xx body are bus text too.
+      const quotedOrRaw = (raw: string): string => {
+        const trimmed = raw.trim()
+        const quoted = quoteBusText(trimmed)
+        if (quoted !== trimmed) return quoted
+        return `${BUS_QUOTED_PREFIX}\n${trimmed}`
+      }
+
       const runBus = async (argv: readonly string[]): Promise<ToolCallResult> => {
         try {
-          const proc = await $.process.run([...argv], {
-            cwd,
-            timeoutMs: 30000,
-          })
+          const proc = await $.process.run([...argv], { cwd, timeoutMs: 30000 })
           if (proc.isStdoutTruncated || proc.isStderrTruncated) {
-            return {
-              isError: true,
-              result: 'mk_bus error: process output truncated (exceeded 4 MiB limit)',
-            }
+            return { isError: true, result: 'mk_bus error: process output truncated (exceeded 4 MiB limit)' }
           }
-          if (proc.exitCode === 0) {
-            return { result: quoteBusText(proc.stdout.trim()) }
-          }
-          return {
-            isError: true,
-            result: (proc.stderr || proc.stdout || `Process exited with code ${proc.exitCode}`).trim(),
-          }
+          if (proc.exitCode === 0) return { result: quotedOrRaw(proc.stdout) }
+          return { isError: true, result: quotedOrRaw(proc.stderr || proc.stdout || `Process exited with code ${proc.exitCode}`) }
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err)
-          return {
-            isError: true,
-            result: `mk_bus process error: ${msg}`,
-          }
+          return { isError: true, result: `mk_bus process error: ${msg}` }
         }
       }
 
       const scriptPath = `${pluginRoot}/scripts/mk-bus.py`
-      if (actionRaw === 'answer') {
-        if (typeof msgIdRaw !== 'string' || !BUS_MSG_ID_RE.test(msgIdRaw)) {
-          return {
-            isError: true,
-            result: 'mk_bus: answer requires msg_id of the form m-<n>',
+      const dataDir = await resolveDataDir($, { store: true })
+
+      // Single-quote a shell word. A newline or NUL cannot be quoted safely.
+      const shellWord = (word: string): string | null => {
+        if (word.includes('\n') || word.includes('\0')) return null
+        if (/^[A-Za-z0-9._\/-]+$/.test(word)) return word
+        return `'${word.replace(/'/g, `'"'"'`)}'`
+      }
+
+      // watch never streams: it returns the command the Monitor tool arms.
+      if (actionRaw === 'watch') {
+        const words = ['python3', scriptPath, 'watch', '--data', dataDir, ...(runArg ? ['--run', runArg] : [])]
+        const quoted: string[] = []
+        for (const w of words) {
+          const q = shellWord(w)
+          if (q === null) return { isError: true, result: quotedOrRaw('mk_bus: watch path contains a newline or NUL') }
+          quoted.push(q)
+        }
+        return { result: quoted.join(' ') }
+      }
+
+      // HTTP when bus.json names a port and the orchestrator token. tail has no
+      // HTTP route (mk-bus.py serves /pending and /send only), so tail is CLI.
+      let busConn: { port: number; token: string } | null = null
+      try {
+        const raw = await $.fs.read(`${dataDir}/bus.json`)
+        const parsed = parseJson(raw)
+        if (parsed !== null && typeof parsed === 'object') {
+          const row = parsed as { port?: unknown; token?: unknown }
+          if (typeof row.port === 'number' && Number.isInteger(row.port) && row.port > 0 && row.port < 65536
+              && typeof row.token === 'string' && row.token.length > 0) {
+            busConn = { port: row.port, token: row.token }
           }
+        }
+      } catch {
+        busConn = null
+      }
+
+      const httpBus = async (path: string, init?: { method?: string; body?: string }): Promise<ToolCallResult> => {
+        if (!busConn) return { isError: true, result: quotedOrRaw('mk_bus: bus down') }
+        try {
+          const res = await $.http.fetch(`http://127.0.0.1:${busConn.port}${path}`, {
+            method: init?.method ?? 'GET',
+            headers: { Authorization: `Bearer ${busConn.token}`, 'Content-Type': 'application/json' },
+            ...(init?.body !== undefined ? { body: init.body } : {}),
+          })
+          if (!res.ok) {
+            let err = ''
+            const body = parseJson(res.text)
+            if (body !== null && typeof body === 'object' && typeof (body as { error?: unknown }).error === 'string') {
+              err = (body as { error: string }).error
+            }
+            return { isError: true, result: quoteBusText(JSON.stringify({ ok: false, error: err || `HTTP ${res.status}` })) }
+          }
+          return { result: quotedOrRaw(res.text) }
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err)
+          return { isError: true, result: quoteBusText(JSON.stringify({ ok: false, error: `mk_bus http error: ${msg}` })) }
+        }
+      }
+
+      const taskRaw = inputObj.task ?? nestedInput?.task
+      const taskArg = typeof taskRaw === 'string' && BUS_RUN_RE.test(taskRaw) ? taskRaw : undefined
+      if (taskRaw !== undefined && taskArg === undefined) {
+        return { isError: true, result: 'mk_bus: task must be a task id (letter/digit start, then letters, digits, ., _, -)' }
+      }
+
+      const checkSend = (kindRaw: unknown): ToolCallResult | null => {
+        if (typeof kindRaw !== 'string' || !BUS_SEND_KINDS.has(kindRaw)) {
+          return { isError: true, result: 'mk_bus: send requires kind ask, answer or info' }
         }
         if (typeof textRaw !== 'string' || textRaw.length === 0) {
-          return {
-            isError: true,
-            result: 'mk_bus: answer requires a non-empty text',
-          }
+          return { isError: true, result: 'mk_bus: send requires a non-empty text' }
         }
         if (new TextEncoder().encode(textRaw).length > BUS_TEXT_MAX_BYTES) {
-          return {
-            isError: true,
-            result: 'mk_bus: answer text exceeds the 64 KiB (65536 UTF-8 bytes) limit',
-          }
+          return { isError: true, result: 'mk_bus: send text exceeds the 64 KiB (65536 UTF-8 bytes) limit' }
         }
-        const dataDir = await resolveDataDir($, { store: true })
+        if (!runArg) return { isError: true, result: 'mk_bus: send requires run' }
+        return null
+      }
+
+      if (busConn && (actionRaw === 'pending' || actionRaw === 'send' || actionRaw === 'answer')) {
+        if (actionRaw === 'pending') {
+          const q = new URLSearchParams()
+          if (runArg) q.set('run', runArg)
+          if (projectArg) q.set('project', projectArg)
+          const qs = q.toString()
+          return httpBus(`/pending${qs ? `?${qs}` : ''}`)
+        }
+        if (actionRaw === 'answer') {
+          if (typeof msgIdRaw !== 'string' || !BUS_MSG_ID_RE.test(msgIdRaw)) {
+            return { isError: true, result: 'mk_bus: answer requires msg_id of the form m-<n>' }
+          }
+          if (typeof textRaw !== 'string' || textRaw.length === 0) {
+            return { isError: true, result: 'mk_bus: answer requires a non-empty text' }
+          }
+          if (new TextEncoder().encode(textRaw).length > BUS_TEXT_MAX_BYTES) {
+            return { isError: true, result: 'mk_bus: answer text exceeds the 64 KiB (65536 UTF-8 bytes) limit' }
+          }
+          let askRun = runArg
+          let askTask: string | null = taskArg ?? null
+          let askFrom = taskArg ?? 'orch'
+          if (!askRun || taskRaw === undefined) {
+            const q = new URLSearchParams()
+            if (askRun) q.set('run', askRun)
+            if (projectArg) q.set('project', projectArg)
+            const qs = q.toString()
+            const listed = await httpBus(`/pending${qs ? `?${qs}` : ''}`)
+            if (listed.isError) return listed
+            const body = parseJson(String(listed.result).split('\n').slice(1).join('\n'))
+            const pending = body !== null && typeof body === 'object' ? (body as { pending?: unknown }).pending : null
+            const ask = (Array.isArray(pending) ? pending : []).find(
+              m => m !== null && typeof m === 'object' && (m as { id?: unknown }).id === msgIdRaw,
+            ) as { run?: unknown; task?: unknown; from?: unknown } | undefined
+            if (!ask) return { isError: true, result: quotedOrRaw(`mk_bus: message not found: ${msgIdRaw}`) }
+            if (!askRun && typeof ask.run === 'string') askRun = ask.run
+            if (typeof ask.task === 'string') askTask = ask.task
+            if (typeof ask.from === 'string') askFrom = ask.from
+          }
+          if (!askRun) return { isError: true, result: quotedOrRaw('mk_bus: answer requires run') }
+          const body: Record<string, unknown> = {
+            run: askRun, task: askTask, from: 'orch', to: askFrom, kind: 'answer', text: textRaw, reply_to: msgIdRaw,
+          }
+          if (projectArg) body.project = projectArg
+          return httpBus('/send', { method: 'POST', body: JSON.stringify(body) })
+        }
+        const kindRaw = inputObj.kind ?? nestedInput?.kind
+        const bad = checkSend(kindRaw)
+        if (bad) return bad
+        const body: Record<string, unknown> = {
+          run: runArg, kind: kindRaw, text: textRaw, from: 'orch',
+          to: taskArg ?? 'orch', reply_to: kindRaw === 'answer' ? (typeof msgIdRaw === 'string' ? msgIdRaw : null) : null,
+        }
+        if (taskArg) body.task = taskArg
+        if (projectArg) body.project = projectArg
+        return httpBus('/send', { method: 'POST', body: JSON.stringify(body) })
+      }
+
+      if (actionRaw === 'send') {
+        const kindRaw = inputObj.kind ?? nestedInput?.kind
+        const bad = checkSend(kindRaw)
+        if (bad) return bad
+        return runBus(['python3', scriptPath, 'send', '--data', dataDir, '--run', runArg as string, '--kind', kindRaw as string, '--text', textRaw as string, '--from', 'orch', ...(taskArg ? ['--task', taskArg, '--to', taskArg] : ['--to', 'orch']), ...(projectArg ? ['--project', projectArg] : []), ...(kindRaw === 'answer' && typeof msgIdRaw === 'string' ? ['--reply-to', msgIdRaw] : [])])
+      }
+
+      if (actionRaw === 'answer') {
+        if (typeof msgIdRaw !== 'string' || !BUS_MSG_ID_RE.test(msgIdRaw)) {
+          return { isError: true, result: 'mk_bus: answer requires msg_id of the form m-<n>' }
+        }
+        if (typeof textRaw !== 'string' || textRaw.length === 0) {
+          return { isError: true, result: 'mk_bus: answer requires a non-empty text' }
+        }
+        if (new TextEncoder().encode(textRaw).length > BUS_TEXT_MAX_BYTES) {
+          return { isError: true, result: 'mk_bus: answer text exceeds the 64 KiB (65536 UTF-8 bytes) limit' }
+        }
         // "--" ends option parsing: a space-free text starting with "-" ("--run=evil",
         // "-x", "--data=/x") would otherwise be swallowed as an option by argparse and
         // could hijack --run/--data (review MEDIUM 1). After the terminator both the
         // msg id and the text stay positional, stored verbatim.
         return runBus(['python3', scriptPath, 'answer', '--data', dataDir, ...(runArg ? ['--run', runArg] : []), ...(projectArg ? ['--project', projectArg] : []), '--', msgIdRaw, textRaw])
       }
-      const dataDir = await resolveDataDir($, { store: true })
       return runBus(['python3', scriptPath, actionRaw, '--data', dataDir, ...(runArg ? ['--run', runArg] : []), ...(projectArg ? ['--project', projectArg] : [])])
     }
 
