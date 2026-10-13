@@ -177,8 +177,10 @@ function PlanLine(els: Els, plan: PlanRow, view: PlansView, W: number, compact: 
   const fire = (kind: string): void => { view.onAction?.(kind, plan.id) }
   const specs: ActionSpec[] = actionsFor(plan.status).map(a => ({
     key: `plans-${a.kind}-${plan.id}`,
-    glyph: a.word,
-    word: '',
+    // a danger button draws its glyph as separate text and its word as the Button label
+    // (kit.tsx ActionButton split), so Delete carries the word, not the glyph
+    glyph: a.tone === 'danger' ? '✕' : a.word,
+    word: a.tone === 'danger' ? a.word : '',
     tone: a.tone,
     primary: a.primary,
     plain: true,
@@ -194,7 +196,7 @@ function PlanLine(els: Els, plan: PlanRow, view: PlansView, W: number, compact: 
         <Text color={ROLE[role].fg}>{glyph}</Text>
         <Text>{clip(plan.id, idBudget)}</Text>
         {ActionButton(els, {
-          key: `plans-row-${plan.id}`,
+          key: `plans-detail-${plan.id}`,
           glyph: '›',
           word: '',
           plain: true,
@@ -209,7 +211,7 @@ function PlanLine(els: Els, plan: PlanRow, view: PlansView, W: number, compact: 
         <Box flexDirection="row" gap={1}>
           <Text color={ROLE.err.fg}>{clip(`Delete ${plan.id}? File moves to plans/archive/.`, Math.max(1, W - 20))}</Text>
           {ActionButton(els, {
-            key: `plans-confirm-delete-${plan.id}`, glyph: 'Delete', word: '', tone: 'danger', plain: true,
+            key: `plans-confirm-delete-${plan.id}`, glyph: '✕', word: 'Delete', tone: 'danger', plain: true,
             onPress: () => { ui?.set('plans:confirm', ''); fire('delete') },
           })}
           {ActionButton(els, {

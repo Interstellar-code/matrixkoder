@@ -93,7 +93,7 @@ test('Plans list: each status shows exactly its buttons', () => {
     nodesOf(drawn, 'Button')
       .filter(b => {
         const k = String(b.props?.key ?? '')
-        return k.startsWith('plans-') && k.endsWith(`-${id}`) && !k.startsWith('plans-row-') && !k.includes('confirm')
+        return k.startsWith('plans-') && k.endsWith(`-${id}`) && !k.startsWith('plans-detail-') && !k.includes('confirm')
       })
       .map(b => String(b.props?.key ?? '').split('-')[1] ?? '')
   expect(of('lane-nudge').sort()).toEqual(['delete', 'start'])
@@ -162,7 +162,7 @@ test('Plans list: the filter Segments narrow the list', () => {
 
 test('Plans list: pressing a row sets plans:sel and plan:sub', () => {
   const ui = new Map<string, string>()
-  press(PlansTab(stubEls, PLANS_FIXTURE, 80, ui), 'plans-row-settings-plans-db')
+  press(PlansTab(stubEls, PLANS_FIXTURE, 80, ui), 'plans-detail-settings-plans-db')
   expect(ui.get('plans:sel')).toBe('settings-plans-db')
   expect(ui.get('plan:sub')).toBe('detail')
 })
