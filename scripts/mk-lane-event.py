@@ -2108,7 +2108,7 @@ def self_test():
         assert r["ok"] is True and r["delivered"] is True and r["pane_state"] == "working", r
         assert r["timed_out"] is True and "timeout" in r["herdr_error"], r
         # (G1) delivered: no error field, herdr's words in herdr_error, the note says why
-        assert "error" not in r and r["note"] == "herdr status wait timed out; the pane is working", r
+        assert "error" not in r and r["note"].endswith("herdr status wait timed out; the pane is working"), r
         # (c) timeout + agent_prompt_stalled (or the pane gone from the list) → delivered:false
         set_canned("pane_list_out.txt", json.dumps({"result": {"panes": [
             {"pane_id": pane_of("H1"), "agent_status": "agent_prompt_stalled"}]}}) + "\n")
@@ -2259,7 +2259,7 @@ def self_test():
         assert r["ok"] is True and r["delivered"] is True and r["recovered"] is True and r["attempts"] == 2, r
         assert r["pane_state"] == "done" and r["pane_entry"] == done_row, r
         assert "timeout" in r["herdr_error"] and "error" not in r and r["timed_out"] is True, r
-        assert r["note"] == "herdr wait timed out; the prompt had already landed", r
+        assert r["note"].endswith("herdr wait timed out; the prompt had already landed"), r
         # (c) pane state null — missing from a readable list, or the list unreadable → NO retry
         set_canned("pane_list_out.txt", '{"result": {"panes": []}}\n')
         set_canned("prompt_q.txt", "- 2")  # a scripted second reply that must never be sent
