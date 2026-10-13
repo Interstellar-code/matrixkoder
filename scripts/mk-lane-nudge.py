@@ -316,8 +316,21 @@ def round_of(watch):
     return int(m.group(1)) if m else 1
 
 
+def _mk_home():
+    """One MK home rule (C16), identical to mkdb.resolve_home(None): $MK_HOME and
+    $MATRIXKODER_HOME are the same setting; when both are set they must agree."""
+    mkh = os.environ.get("MK_HOME")
+    mch = os.environ.get("MATRIXKODER_HOME")
+    if mkh and mch:
+        left = os.path.realpath(os.path.abspath(os.path.expanduser(mkh)))
+        right = os.path.realpath(os.path.abspath(os.path.expanduser(mch)))
+        if left != right:
+            raise RuntimeError(f"MK_HOME ({mkh}) and MATRIXKODER_HOME ({mch}) differ; set one MK home")
+    return os.path.expanduser(mkh or mch or "~/.matrixkoder")
+
+
 def state_path(data):
-    base = data or os.environ.get("MATRIXKODER_HOME") or os.path.expanduser("~/.matrixkoder")
+    base = data or _mk_home()
     return os.path.join(base, STATE_NAME)
 
 
@@ -451,7 +464,7 @@ def dispatch(pane, text):
 
 
 def lock_path_for(data):
-    base = data or os.environ.get("MATRIXKODER_HOME") or os.path.expanduser("~/.matrixkoder")
+    base = data or _mk_home()
     return os.path.join(base, LOCK_NAME)
 
 
@@ -635,6 +648,11 @@ DISPATCH_STUB = (
 
 def self_test():
     fails = []
+    # One temp MK home under both names (C16) for the whole suite.
+    nudge_home = tempfile.mkdtemp(prefix="mk-nudge-home-")
+    os.environ["MK_HOME"] = nudge_home
+    os.environ["MATRIXKODER_HOME"] = nudge_home
+    os.environ["MK_SELFTEST"] = "1"
 
     def check(name, cond):
         if not cond:
@@ -755,7 +773,7 @@ def self_test():
         env.update({"MK_NUDGE_NOW": str(now), 
             "MK_NUDGE_LANES_JSON": lanes_file, "MK_NUDGE_HERDR_JSON": herdr_file,
             "MK_NUDGE_PS_FILE": ps_file, "MK_NUDGE_ROOT": root, "MK_NUDGE_SENT_LOG": sent_log,
-            "MK_NUDGE_SEQ_EPOCH": json.dumps(seq_epoch), "MATRIXKODER_HOME": data,
+            "MK_NUDGE_SEQ_EPOCH": json.dumps(seq_epoch), "MATRIXKODER_HOME": data, "MK_HOME": data,
         })
 
         def run(args):
@@ -897,6 +915,7 @@ def self_test():
         data2 = os.path.join(root, "data-share")
         os.makedirs(data2)
         env["MATRIXKODER_HOME"] = data2
+        env["MK_HOME"] = data2
         if os.path.exists(sent_log):
             os.remove(sent_log)
         code, doc = run(["scan", "--data", data2])
@@ -928,6 +947,7 @@ def self_test():
         data3 = os.path.join(root, "data-race")
         os.makedirs(data3)
         env["MATRIXKODER_HOME"] = data3
+        env["MK_HOME"] = data3
         sent2 = os.path.join(root, "sent-race.log")
         env["MK_NUDGE_SENT_LOG"] = sent2
         procs = []
@@ -949,6 +969,13 @@ def self_test():
     if fails:
         out({"ok": False, "failed": fails})
         return 1
+    # R1.2: the mkdb write guard refuses the real home from this suite too.
+    import importlib.util as _iu
+    _spec = _iu.spec_from_file_location("mkdb", os.path.join(HERE, "mkdb.py"))
+    _mod = _iu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    _mod.selftest_guard_probe(nudge_home)
+    shutil.rmtree(nudge_home, ignore_errors=True)
     print("mk-lane-nudge self-test ok")
     return 0
 

@@ -9,7 +9,7 @@
   model --pane <pane> [--text TEXT]
   --self-test
 
-Common: --home DIR (default $MK_HOME or ~/.matrixkoder). Every command prints ONE JSON line.
+Common: --home DIR (default $MK_HOME or $MATRIXKODER_HOME or ~/.matrixkoder). Every command prints ONE JSON line.
 Errors: {"ok": false, "error": ...} exit 2.
 
 The catalog lives in the root store that mkdb.py opens. This script never opens a database itself:
@@ -602,6 +602,10 @@ def self_test():
     _real_jev_check()
     with tempfile.TemporaryDirectory() as tmp:
         home = os.path.join(tmp, "home")
+        saved = {k: os.environ.get(k) for k in ("MK_HOME", "MATRIXKODER_HOME", "MK_SELFTEST")}
+        os.environ["MK_HOME"] = home
+        os.environ["MATRIXKODER_HOME"] = home
+        os.environ["MK_SELFTEST"] = "1"
         yaml = os.path.join(tmp, "matrixkoder.yaml")
         open(yaml, "w").write(
             "agents:\n"
@@ -742,6 +746,13 @@ def self_test():
         _check(shown["ok"] and shown["model"]["status"] == "picked", f"seeded show {shown}")
         got = _run(empty, "routes", "--json")["routes"]
         _check(got == [f"opencode opencode/alpha {e}" for e in ("low", "medium", "high")], f"seeded routes {got}")
+        # R1.2: the mkdb write guard refuses the real home from this suite too.
+        mkdb.selftest_guard_probe(home)
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
     print(json.dumps({"ok": True, "self_test": "pass"}))
     return 0
 

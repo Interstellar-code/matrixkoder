@@ -329,8 +329,15 @@ def store_db(data):
     no store code runs and no file is created. Opened only through mkdb.open_project."""
     if not os.path.isfile(os.path.join(data, "mk.db")):
         return None
-    home = os.environ.get("MK_HOME") or os.environ.get("MATRIXKODER_HOME") or "~/.matrixkoder"
-    return mkdb.open_project(os.path.abspath(os.path.expanduser(home)), data_dir=data)
+    home = os.environ.get("MK_HOME")
+    alt = os.environ.get("MATRIXKODER_HOME")
+    if home and alt:
+        left = os.path.realpath(os.path.abspath(os.path.expanduser(home)))
+        right = os.path.realpath(os.path.abspath(os.path.expanduser(alt)))
+        if left != right:
+            raise Fail(f"MK_HOME ({home}) and MATRIXKODER_HOME ({alt}) differ; set one MK home")
+    home = os.path.abspath(os.path.expanduser(home or alt or "~/.matrixkoder"))
+    return mkdb.open_project(home, data_dir=data)
 
 
 def _cell(value):
@@ -1274,7 +1281,11 @@ def main(argv):
 
 def self_test():
     tmp = os.path.realpath(tempfile.mkdtemp(prefix="mk-lane-test-"))  # realpath: paths are reported that way
-    env = dict(os.environ, MATRIXKODER_HOME=os.path.join(tmp, "home"), MK_HERDR="none")
+    lane_home = os.path.join(tmp, "home")
+    os.environ["MK_HOME"] = lane_home
+    os.environ["MATRIXKODER_HOME"] = lane_home
+    os.environ["MK_SELFTEST"] = "1"
+    env = dict(os.environ, MATRIXKODER_HOME=lane_home, MK_HOME=lane_home, MK_SELFTEST="1", MK_HERDR="none")
     env.pop("MATRIXKODER_DATA", None)
     data, repo = os.path.join(tmp, "data"), os.path.join(tmp, "repo")
     os.makedirs(data)
@@ -2240,7 +2251,7 @@ def self_test():
         # open the store the only allowed way, under a temp home, so the file exists before commands
         home = os.path.join(tmp, "mk-home")
         os.makedirs(home)
-        env_store = dict(env, MK_HOME=home)
+        env_store = dict(env, MK_HOME=home, MATRIXKODER_HOME=home)
         con = mkdb.open_project(home, data_dir=store_data)
         con.close()
         assert os.path.isfile(os.path.join(store_data, "mk.db"))
@@ -2490,6 +2501,8 @@ def self_test():
         assert not ok and any(".omc/plans/p.md" in line for line in dirty), dirty
 
         print("mk-lane self-test ok")
+        # R1.2: the mkdb write guard refuses the real home from this suite too.
+        mkdb.selftest_guard_probe(lane_home)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

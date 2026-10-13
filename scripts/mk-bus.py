@@ -86,8 +86,18 @@ SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
 
 
 def mk_home():
-    """MK home: $MK_HOME, else ~/.matrixkoder. Never the project data dir."""
-    return os.path.abspath(os.path.expanduser(os.environ.get("MK_HOME") or "~/.matrixkoder"))
+    """MK home: $MK_HOME or $MATRIXKODER_HOME (both set must agree), else ~/.matrixkoder.
+
+    One MK home rule (C16), identical to mkdb.resolve_home(None): either name is
+    accepted; when both are set they must resolve to the same directory."""
+    mkh = os.environ.get("MK_HOME")
+    mch = os.environ.get("MATRIXKODER_HOME")
+    if mkh and mch:
+        left = os.path.realpath(os.path.abspath(os.path.expanduser(mkh)))
+        right = os.path.realpath(os.path.abspath(os.path.expanduser(mch)))
+        if left != right:
+            raise Fail(f"MK_HOME ({mkh}) and MATRIXKODER_HOME ({mch}) differ; set one MK home")
+    return os.path.abspath(os.path.expanduser(mkh or mch or "~/.matrixkoder"))
 
 
 def root_bus_dir(home=None):
@@ -3344,6 +3354,15 @@ def _store_self_test_body(mod):
 
     tmp = tempfile.mkdtemp(prefix="mk-bus-store-")
     pids = []
+    # One temp MK home under every name (C16): the spawned serve and its
+    # mk-state children resolve $MK_HOME/$MATRIXKODER_HOME here, never real.
+    store_home = os.path.join(tmp, "home")
+    os.makedirs(store_home, exist_ok=True)
+    store_saved = {k: os.environ.get(k) for k in ("MK_BUS_DIR", "MK_HOME", "MATRIXKODER_HOME", "MK_SELFTEST")}
+    os.environ["MK_BUS_DIR"] = store_home
+    os.environ["MK_HOME"] = store_home
+    os.environ["MATRIXKODER_HOME"] = store_home
+    os.environ["MK_SELFTEST"] = "1"
     # The real herdr is never called from a test: drop every PATH dir that holds one.
     # Ring cases put their own fake `herdr` first.
     orig_path = os.environ.get("PATH", "")
@@ -3479,10 +3498,11 @@ def _store_self_test_body(mod):
         data = os.path.join(tmp, "data")
         os.makedirs(data, exist_ok=True)
         # Root bus: a store is used only when the data dir is a registered
-        # project. The test home is temp; MK_HOME keeps it off the real one.
-        home = os.path.join(tmp, "home")
-        os.makedirs(home, exist_ok=True)
+        # project. The test home is temp under every name, never the real one.
+        home = store_home
         os.environ["MK_BUS_DIR"] = home
+        os.environ["MK_HOME"] = home
+        os.environ["MATRIXKODER_HOME"] = home
         root = mod.open_root(home)
         try:
             root.execute(
@@ -4968,8 +4988,15 @@ def _store_self_test_body(mod):
 
         kill(pid2)
         _lane_state_self_test(mod)
+        # R1.2: the write guard refuses the real home here too, in store mode.
+        mod.selftest_guard_probe(store_home)
     finally:
         os.environ["PATH"] = orig_path
+        for k, v in store_saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
         for p in pids:
             stop_process(p)
         shutil.rmtree(tmp, ignore_errors=True)
@@ -5155,6 +5182,15 @@ def _lane_state_self_test(mod):
 def self_test():
     tmp = tempfile.mkdtemp(prefix="mk-bus-test-")
     pids = []
+    # One temp MK home under both home names (C16): children that read $MK_HOME
+    # or $MATRIXKODER_HOME land here, never in ~/.matrixkoder. $MK_BUS_DIR stays
+    # unset: a file-mode bus keeps bus.json in its data dir.
+    st_home = os.path.join(tmp, "home")
+    os.makedirs(st_home, exist_ok=True)
+    st_saved = {k: os.environ.get(k) for k in ("MK_HOME", "MATRIXKODER_HOME", "MK_SELFTEST")}
+    os.environ["MK_HOME"] = st_home
+    os.environ["MATRIXKODER_HOME"] = st_home
+    os.environ["MK_SELFTEST"] = "1"
 
     def cli(args_list, check=True):
         cmd = [sys.executable, os.path.abspath(__file__)] + args_list
@@ -6359,6 +6395,11 @@ def self_test():
         with contextlib.suppress(OSError):
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)
+        for k, v in st_saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
     _store_self_test()
     print("pass mk-bus.py: mk-bus self-test ok")

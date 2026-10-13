@@ -68,9 +68,19 @@ def real_home():
 
 
 def resolve_import_home(arg, allow_real):
-    """Temp home by default. The real ~/.matrixkoder is refused unless explicitly allowed."""
+    """Temp home by default. The real ~/.matrixkoder is refused unless explicitly allowed.
+
+    One MK home rule (C16): $MK_HOME and $MATRIXKODER_HOME are the same setting;
+    when both are set they must agree."""
+    mkh = os.environ.get("MK_HOME")
+    mch = os.environ.get("MATRIXKODER_HOME")
+    if mkh and mch:
+        left = os.path.realpath(os.path.abspath(os.path.expanduser(mkh)))
+        right = os.path.realpath(os.path.abspath(os.path.expanduser(mch)))
+        if left != right:
+            raise Fail(f"MK_HOME ({mkh}) and MATRIXKODER_HOME ({mch}) differ; set one MK home")
     home = os.path.realpath(os.path.abspath(os.path.expanduser(
-        arg or os.environ.get("MK_HOME") or "~/.matrixkoder")))
+        arg or mkh or mch or "~/.matrixkoder")))
     if home == real_home() and not allow_real:
         raise Fail("refusing the real ~/.matrixkoder; pass --allow-real-home to override")
     mkdb.check_home(home)
@@ -522,6 +532,11 @@ def _run_cli(args):
 
 def self_test():
     tmp = tempfile.mkdtemp(prefix="mk-store-import-")
+    # One temp MK home under both names (C16): CLI children inherit it, never the real one.
+    imp_home = os.path.join(tmp, "home")
+    os.environ["MK_HOME"] = imp_home
+    os.environ["MATRIXKODER_HOME"] = imp_home
+    os.environ["MK_SELFTEST"] = "1"
     try:
         data = os.path.join(tmp, "legacy")
         home = os.path.join(tmp, "home")
@@ -590,6 +605,8 @@ def self_test():
         _blank_events(tmp)
         _symlinks(tmp)
         _real_bus(tmp)
+        # R1.2: the mkdb write guard refuses the real home from this suite too.
+        mkdb.selftest_guard_probe(imp_home)
         print("mk-store-import self-test ok")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

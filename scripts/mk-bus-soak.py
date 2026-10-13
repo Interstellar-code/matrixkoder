@@ -658,6 +658,7 @@ def self_test():
     check("mutation-duplicate-ack", _case_mutation_ack)
     check("mutation-token", _case_mutation_token)
     check("compressed-soak", _case_compressed)
+    check("selftest-guard", _case_selftest_guard)
     bad = [c for c in cases if not c[1]]
     if bad:
         for name, _, detail in bad:
@@ -763,6 +764,26 @@ def _case_abort():
 def _case_real_home():
     before = real_home_stat()
     assert_real_home_unchanged(before)
+
+
+def _case_selftest_guard():
+    """R1.2: under MK_SELFTEST=1 the mkdb write guard refuses the real home; ro reads work."""
+    import tempfile
+    saved = {k: os.environ.get(k) for k in ("MK_HOME", "MATRIXKODER_HOME", "MK_SELFTEST")}
+    os.environ["MK_SELFTEST"] = "1"
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.join(tmp, "home")
+            os.makedirs(home, exist_ok=True)
+            os.environ["MK_HOME"] = home
+            os.environ["MATRIXKODER_HOME"] = home
+            mkdb.selftest_guard_probe(home)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def _case_mutation_working():

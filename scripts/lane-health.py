@@ -320,8 +320,21 @@ def record_quota(ledger, key, text, now=None, pool=None):
     return entry
 
 
+def _mk_home():
+    """One MK home rule (C16), identical to mkdb.resolve_home(None): $MK_HOME and
+    $MATRIXKODER_HOME are the same setting; when both are set they must agree."""
+    mkh = os.environ.get("MK_HOME")
+    mch = os.environ.get("MATRIXKODER_HOME")
+    if mkh and mch:
+        left = os.path.realpath(os.path.abspath(os.path.expanduser(mkh)))
+        right = os.path.realpath(os.path.abspath(os.path.expanduser(mch)))
+        if left != right:
+            raise RuntimeError(f"MK_HOME ({mkh}) and MATRIXKODER_HOME ({mch}) differ; set one MK home")
+    return os.path.expanduser(mkh or mch or "~/.matrixkoder")
+
+
 def default_ledger():
-    return os.path.join(os.path.expanduser(os.environ.get("MATRIXKODER_HOME") or "~/.matrixkoder"), "usage.json")
+    return os.path.join(_mk_home(), "usage.json")
 
 
 @contextlib.contextmanager
@@ -329,7 +342,7 @@ def usage_lock():
     """# ponytail: the one lock both writers of usage.json take — mk-usage.py's poll and this quota
     mark. Without it a poll read the file, and its atomic replace then dropped a fresh mark.
     Fixed under <home>, not beside the ledger, so the two serialise even with different --out paths."""
-    path = os.path.join(os.path.expanduser(os.environ.get("MATRIXKODER_HOME") or "~/.matrixkoder"),
+    path = os.path.join(_mk_home(),
                         "usage.json.lock")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "a+") as f:
@@ -360,7 +373,9 @@ def self_test():
     # every ledger path here is a temp file, but usage_lock() resolves <home> independently of --ledger:
     # pin it before the first write so a run can never create a lock in the real ~/.matrixkoder
     mk_home = tempfile.mkdtemp(prefix="lane-health-home-")
+    os.environ["MK_HOME"] = mk_home
     os.environ["MATRIXKODER_HOME"] = mk_home
+    os.environ["MK_SELFTEST"] = "1"
     tmp_data = tempfile.mkdtemp(prefix="lane-health-data-")
     restore_data = mk_config.pin_tmp_data(tmp_data)  # cfg() resolves the data dir: keep it in temp
     try:
@@ -543,6 +558,7 @@ def self_test_body(shutil):
         assert pane_e["exhausted_until"] == later(hours=GUESS_H)
         assert os.listdir(tmp) == ["usage.json"] and os.stat(ledger).st_mode & 0o777 == 0o644
         os.environ["MATRIXKODER_HOME"] = tmp
+        os.environ["MK_HOME"] = tmp
         assert default_ledger() == ledger
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -630,6 +646,12 @@ def self_test_body(shutil):
         assert e["exhausted_guess"] is False and e["exhausted_source"] == "pane-text" and e["exhausted_evidence"], e
     finally:
         shutil.rmtree(tmp_oc, ignore_errors=True)
+    # R1.2: the mkdb write guard refuses the real home from this suite too.
+    import importlib.util as _iu
+    _spec = _iu.spec_from_file_location("mkdb", os.path.join(HERE, "mkdb.py"))
+    _mod = _iu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    _mod.selftest_guard_probe(os.environ["MK_HOME"])
     print("lane-health self-test ok")
 
 
