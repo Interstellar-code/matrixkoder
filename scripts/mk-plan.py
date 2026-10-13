@@ -8,7 +8,14 @@ Python 3 stdlib only.
                                    approved runs check first; errors refuse the write
   add-run <path> --run ID          appends to runs; idempotent
   approve <path> [--data DIR] [--home DIR] [--run ID]
-                                   with a store: validate, import a plan version, archive the file
+                                   with a store: validate, import a plan version, copy the file
+                                   to plans/archive/<id>-v<n>.md and leave it in place (C13)
+  import <path> [--dry-run] [--data DIR] [--home DIR]
+                                   load one +++ plan into the store WITHOUT approving it (C4):
+                                   one plans row, no tasks, no file change
+  delete <id> [--data DIR] [--home DIR]
+                                   refused on a live run; else drops the plans row and moves the
+                                   file into plans/archive/ (never unlinks, C10)
   export <path> [--data DIR] [--home DIR]
                                    rebuild the markdown from the store; body kept verbatim
 
@@ -23,9 +30,9 @@ file + os.replace, and the rewritten text is re-parsed before anything is writte
 Kill seam (tests only, never set in normal use): MK_PLAN_KILL_AFTER=commit|archive
 raises SystemExit at that step of approve-with-a-store. commit is after the plans
 row and tasks are committed and before the archive exists; archive is after the
-archive file is written and fsynced and before the original is replaced away.
-The next approve converges: it finishes a missing move, or is a no-op when the
-archive bytes already match.
+archive file is written and fsynced and before the original is brought up to the
+approved bytes. The next approve converges: it finishes a missing archive, or is
+a no-op when the archive bytes already match. The original file is never removed.
 """
 import argparse, contextlib, datetime, fnmatch, hashlib, importlib.util, json, os, re, shutil, stat, sys, tempfile, tomllib
 
@@ -605,8 +612,44 @@ def cmd_check(a):
     return out
 
 
+def sync_store_status(path, data, home, status):
+    """Keep plans.status (a column only once D1.1 adds it) in step with the file. A store without
+    the column, no store at all, or a plan the store does not know: nothing to do, never an error —
+    the file is still the record for every command that does not read the store."""
+    data = resolve_data_arg(data)
+    if not store_present(data):
+        return None
+    try:
+        header, out, _sha = read_plan(path)
+    except Fail:
+        return None
+    plan_id = str(out.get("plan") or "")
+    if not plan_id:
+        return None
+    db = _mkdb()
+    home = db.resolve_home(home)
+    con = db.open_project(home, data_dir=data)
+    try:
+        if "status" not in plan_columns(con):
+            return None
+        if not con.execute("SELECT 1 FROM plans WHERE id=?", (plan_id,)).fetchone():
+            return None
+        con.execute("UPDATE plans SET status=? WHERE id=?", (status, plan_id))
+        con.commit()
+    finally:
+        con.close()
+    return plan_id
+
+
 def cmd_set(a):
-    return set_status(a.path, a.status)
+    """set --status parked and back is pause/resume (C10): the file is rewritten as before and,
+    when a store holds this plan, plans.status follows (guarded on the column existing)."""
+    out = set_status(a.path, a.status)
+    plan_id = sync_store_status(a.path, a.data, a.home, a.status)
+    if plan_id:
+        out["plan"] = plan_id
+        out["store"] = True
+    return out
 
 
 def cmd_add_run(a):
@@ -629,13 +672,94 @@ def store_present(data):
     return os.path.isfile(os.path.join(os.path.abspath(data), "mk.db"))
 
 
+# the data-dir resolution below is mk-state.py resolve_data's order, copied here on purpose:
+# mk-plan must never import mk-state (C3 — the plan tool is only ever a subprocess), and it must
+# not edit it. Same order, same "never create a store to answer a read" rule.
+
+
+def mk_home():
+    return os.path.expanduser(os.environ.get("MATRIXKODER_HOME") or "~/.matrixkoder")
+
+
+def main_worktree(top):
+    """A linked worktree (.git is a file + commondir) shares the main checkout's data dir."""
+    try:
+        with open(os.path.join(top, ".git")) as f:
+            gitdir = f.read().split("gitdir:", 1)[1].strip()
+        gitdir = os.path.join(top, gitdir)
+        with open(os.path.join(gitdir, "commondir")) as f:
+            common = os.path.normpath(os.path.join(gitdir, f.read().strip()))
+    except (OSError, IndexError):  # .git is a directory, or a submodule (no commondir)
+        return top
+    return os.path.dirname(common) if os.path.basename(common) == ".git" else top
+
+
+def repo_top():
+    """The main checkout of the nearest git repo above cwd, or None when there is none.
+    The walk stops before $HOME; a linked worktree maps to its main checkout."""
+    d, stop = os.path.realpath(os.getcwd()), os.path.realpath(os.path.expanduser("~"))
+    while not os.path.exists(os.path.join(d, ".git")):  # nearest repo wins
+        if os.path.dirname(d) == d or d == stop:
+            return None
+        d = os.path.dirname(d)
+    if d == stop:
+        return None
+    return main_worktree(d)
+
+
+def registered_data_dir(top):
+    """The data dir this repo registered: the root projects table first, then <home>/projects.json.
+    Neither read ever creates <home>/mk.db (the root store is checked before it is opened)."""
+    home = mk_home()
+    root = os.path.join(home, "mk.db")
+    if os.path.exists(root):
+        try:
+            con = _mkdb().open_root(home)
+            try:
+                row = con.execute(
+                    "SELECT data_dir FROM projects WHERE repo=? OR repo=? ORDER BY slug LIMIT 1",
+                    (top, os.path.realpath(top))).fetchone()
+            finally:
+                con.close()
+        except Exception:
+            row = None  # an unreadable root store is not a reason to fail a plan command
+        if row and isinstance(row["data_dir"], str) and row["data_dir"].strip():
+            return os.path.normpath(os.path.join(top, os.path.expanduser(row["data_dir"].strip())))
+    try:  # the wizard's home mode: ~/.matrixkoder/projects.json {"<repo>": {"data_dir": ...}}
+        with open(os.path.join(home, "projects.json")) as f:
+            projects = json.load(f)
+        entry = projects.get(top) or projects.get(os.path.realpath(top))
+        listed = entry.get("data_dir") if isinstance(entry, dict) else None
+    except (OSError, ValueError, AttributeError):
+        listed = None
+    if isinstance(listed, str) and listed.strip():
+        return os.path.normpath(os.path.join(top, os.path.expanduser(listed.strip())))
+    return None
+
+
 def resolve_data_arg(arg):
+    """--data > $MATRIXKODER_DATA > the data dir this repo registered > <main checkout>/.matrixkoder.
+    None means "no store": no --data, no env and no git repo above cwd (mk-state refuses instead;
+    here a plan file must stay usable without a store)."""
     if arg:
-        return os.path.abspath(arg)
+        return os.path.abspath(os.path.expanduser(arg))
     env = os.environ.get("MATRIXKODER_DATA")
     if env:
-        return os.path.abspath(env)
-    return None
+        return os.path.abspath(os.path.expanduser(env))
+    top = repo_top()
+    if top is None:
+        return None
+    return registered_data_dir(top) or os.path.join(top, ".matrixkoder")
+
+
+def side_store_warning(path):
+    """A file-only answer next to an existing mk.db is the hermes-switchui trap: approve silently
+    skipped the store that was on. Named in the reply instead of staying quiet."""
+    side = os.path.join(os.path.dirname(os.path.abspath(path)), "mk.db")
+    if not os.path.isfile(side):
+        return None
+    return (f"file-only: no store resolved, but {side} exists — pass "
+            f"--data {os.path.dirname(side)} or set MATRIXKODER_DATA to approve into it")
 
 
 def now_local():
@@ -686,6 +810,66 @@ def route_json_of(route):
     else:
         raise Fail([f'bad route {route!r} ("" or "<agent> <model> [<effort>]")'])
     return json.dumps({"agent": agent, "effort": effort, "model": model}, sort_keys=True)
+
+
+def plan_columns(con):
+    """The plans columns this store actually has. D1.1 adds status/created/design/integration;
+    until then they live in header_json only and must never appear in an INSERT."""
+    return {r["name"] for r in con.execute("PRAGMA table_info(plans)")}
+
+
+def plan_title(body_md, plan_id):
+    """C3: plans.title is the H1 text after the em dash (`# <id> — <title>`); no H1 -> the plan id.
+    A '#' inside a fenced block is not a heading, same rule as has_h1."""
+    fenced, h1 = False, None
+    for line in (body_md or "").split("\n"):
+        st = line.lstrip()
+        if st.startswith("```") or st.startswith("~~~"):
+            fenced = not fenced
+        elif not fenced and st.startswith("# "):
+            h1 = st[2:].strip()
+            break
+    if not h1:
+        return plan_id
+    head, dash, tail = h1.partition("—")
+    text = tail.strip() if (dash and tail.strip()) else h1
+    return text or plan_id
+
+
+def header_json_of(out, sha, body_md, status):
+    """The header_json approve and import both write: the sha of the file, the status, runs,
+    gates, phases and the body. Unknown header keys (created, design, integration, …) live here
+    on a store without the D1.1 columns."""
+    return json.dumps({"sha": sha, "status": status, "runs": out["runs"], "gates": out["gates"],
+                       "phases": out["phases"], "body": body_md}, sort_keys=True)
+
+
+def write_plan_row(con, plan_id, values, update=None):
+    """One plans row, upserted by id. Every column is filtered through PRAGMA table_info, so the
+    four D1.1 columns are written only once they exist and an older store is never sent a column
+    it lacks. `update` names the columns a conflicting row is overwritten with (default: all)."""
+    present = plan_columns(con)
+    values = {k: v for k, v in values.items() if k in present}
+    if not values:
+        return
+    cols = sorted(values)
+    updated = [c for c in cols if c in set(update)] if update else cols
+    if not updated:  # an upsert must update something; fall back to every written column
+        updated = cols
+    marks = ", ".join("?" * (len(cols) + 1))
+    sets = ", ".join(f"{c}=excluded.{c}" for c in updated)
+    con.execute(f"INSERT INTO plans(id, {', '.join(cols)}) VALUES ({marks}) "
+                f"ON CONFLICT(id) DO UPDATE SET {sets}",
+                [plan_id] + [values[c] for c in cols])
+
+
+def new_plan_columns(header, out):
+    """status, created, design and integration as column values. design and integration are JSON
+    arrays (the header key may be one value); created is the TOML date, stored as its text."""
+    return {"status": str(out.get("status") or "draft"),
+            "created": str(jsonable(header.get("created", ""))),
+            "design": json.dumps(as_list(header.get("design"))),
+            "integration": json.dumps(as_list(header.get("integration")))}
 
 
 def validate_tree(out, db, con, run):
@@ -741,17 +925,22 @@ def validate_tree(out, db, con, run):
 
 def approve_file(path, data, home, run):
     """No store: validate and mark approved, exactly as set --status approved.
-    With a store: import one plan version and archive the file last."""
+    With a store: validate, write the plan version and its tasks, copy the approved bytes into
+    the archive and leave the original file in place (C13 — approve copies, never moves)."""
     data = resolve_data_arg(data)
     header, out, sha = read_plan(path)
     errors, warnings = check_plan(header, out)
     if errors:
         raise Fail(errors, warnings=warnings)
     if not store_present(data):
+        side = side_store_warning(path)
+        if side:  # a store next to the file was skipped: say so instead of going quiet
+            warnings = warnings + [side]
         if out["status"] == "approved":
-            return {"ok": True, "status": "approved", "store": False, "noop": True}
+            return {"ok": True, "status": "approved", "store": False, "noop": True,
+                    "warnings": warnings}
         set_status(path, "approved")
-        return {"ok": True, "status": "approved", "store": False}
+        return {"ok": True, "status": "approved", "store": False, "warnings": warnings}
     db = _mkdb()
     home = db.resolve_home(home)
     plan_id = str(out["plan"])
@@ -779,22 +968,23 @@ def approve_file(path, data, home, run):
                 prev = json.loads(row["header_json"])
             except ValueError:
                 prev = {}
-        # the archived file is the approved bytes; a second approve of those bytes is a no-op.
-        # a kill after the archive was written leaves the original in place: finish the move.
+        # the archived file holds the approved bytes; a second approve of those bytes is a no-op.
+        # a kill after the archive was written leaves the original on its old bytes: copy them.
         current = open(path, "rb").read()
         approved = approved_bytes(current)
         if row and os.path.isfile(row["archived_path"] or ""):
             archived_now = open(row["archived_path"], "rb").read()
             if archived_now == approved or archived_now == current:
-                # finish a kill that wrote the archive and died before the original was removed:
-                # the original is still the pre-approve bytes. a separate copy of the archive
-                # (the self-test no-op) already matches and is left in place.
-                if (archived_now == approved and current != approved
+                # the archive is the approved version and the original stays (C13). a kill between
+                # the archive and the original leaves the file on its pre-approve bytes, so bring
+                # it back to what the archive holds; a separate copy that already matches is
+                # left byte-identical.
+                if (archived_now != current
                         and os.path.abspath(path) != os.path.abspath(row["archived_path"])):
-                    with contextlib.suppress(FileNotFoundError):
-                        os.remove(path)
+                    write_atomic(path, archived_now)
                 return {"ok": True, "status": "approved", "store": True, "noop": True,
-                        "version": row["version"], "archived": row["archived_path"]}
+                        "version": row["version"], "archived": row["archived_path"],
+                        "tasks_run": run_id, "warnings": warnings}
         # a kill after the plans row committed and before the archive existed: finish THAT
         # version instead of inserting another. the row's archived_path is where it belongs.
         resume = None
@@ -810,10 +1000,7 @@ def approve_file(path, data, home, run):
                 con.execute("DELETE FROM tasks WHERE run=? AND id=?", (run_id, tid))
             con.commit()
         archive = os.path.join(data, "plans", "archive", f"{plan_id}-v{version}.md")
-        header_json = json.dumps({
-            "sha": sha, "status": "approved", "runs": out["runs"], "gates": out["gates"],
-            "phases": out["phases"], "body": body_md,
-        }, sort_keys=True)
+        header_json = header_json_of(out, sha, body_md, "approved")
         # tasks first (each add_task commits its own transaction), plans row next, archive last.
         # a later failure deletes only the tasks this call inserted. a resume only writes the archive.
         try:
@@ -835,13 +1022,12 @@ def approve_file(path, data, home, run):
                 con.commit()
             db._begin(con)
             try:
-                con.execute(
-                    "INSERT INTO plans(id, version, title, header_json, body_md, approved_at, archived_path)"
-                    " VALUES (?,?,?,?,?,?,?)"
-                    " ON CONFLICT(id) DO UPDATE SET version=excluded.version, title=excluded.title,"
-                    " header_json=excluded.header_json, body_md=excluded.body_md,"
-                    " approved_at=excluded.approved_at, archived_path=excluded.archived_path",
-                    (plan_id, version, plan_id, header_json, body_md, now_local(), archive))
+                row_values = dict(version=version, title=plan_title(body_md, plan_id),
+                                  header_json=header_json, body_md=body_md,
+                                  approved_at=now_local(), archived_path=archive,
+                                  **new_plan_columns(header, out))
+                row_values["status"] = "approved"  # this write IS the approval, the file may say draft
+                write_plan_row(con, plan_id, row_values)
                 con.execute("COMMIT")
             except Exception:
                 con.execute("ROLLBACK")
@@ -855,8 +1041,8 @@ def approve_file(path, data, home, run):
             msg = getattr(e, "args", ("",))[0]
             raise Fail([str(msg)])
         # approved bytes go to the archive first (write_atomic fsyncs), then the original
-        # is replaced away. a kill after the commit but before the archive, or after the
-        # archive but before the original is gone, is recovered by the next approve.
+        # is brought up to the approved bytes. a kill after the commit but before the archive, or
+        # after the archive but before the original was refreshed, is recovered by the next approve.
         if os.environ.get("MK_PLAN_KILL_AFTER") == "commit":
             raise SystemExit("MK_PLAN_KILL_AFTER=commit")
         try:
@@ -869,13 +1055,14 @@ def approve_file(path, data, home, run):
             raise Fail([f"archive failed: {e}"])
         if os.environ.get("MK_PLAN_KILL_AFTER") == "archive":
             raise SystemExit("MK_PLAN_KILL_AFTER=archive")
-        try:
-            if os.path.abspath(path) != os.path.abspath(archive):
-                os.remove(path)
-        except FileNotFoundError:
-            pass
+        # C13: approve copies, it never moves. the original file stays in place and now carries
+        # the approved bytes, so `run init --plan <original path>` still resolves after an approve
+        # (the hermes-switchui issue). a write failure here is not a lost approve: the archive
+        # and the row are already there and the next approve converges.
+        if current != approved and os.path.abspath(path) != os.path.abspath(archive):
+            write_atomic(path, approved)
         return {"ok": True, "status": "approved", "store": True, "version": version,
-                "archived": archive, "run": run_id, "warnings": warnings}
+                "archived": archive, "tasks_run": run_id, "warnings": warnings}
     finally:
         con.close()
 
@@ -941,6 +1128,101 @@ def cmd_export(a):
     return out
 
 
+# ---------- import / delete (D1.2) ----------
+
+def import_file(path, data, home, dry_run=False):
+    """Load one +++ plan into the store without approving it (C4): a plans row and nothing else.
+    No task rows, no file change, no status flip — approve is the command that does those.
+    Idempotent: the same bytes upsert onto the same row and change nothing."""
+    data = resolve_data_arg(data)
+    text, sha = load(path)
+    # a file that is not a plan, or a header that does not parse, is refused with the reason in
+    # the reply and exit 0 — it is a "this file is not importable" answer, not a failed command.
+    try:
+        lines, close = split_plan(text)
+        header = parse_header(lines[1:close])
+    except Fail as e:
+        raise Fail(e.errors, code=0, reason=e.errors[0])
+    out = plan_json(header, sha)
+    plan_id = str(out["plan"])
+    if not plan_id:
+        raise Fail(["the header has no plan id (C4: only a +++ file with plan = \"<id>\" imports)"],
+                   code=0, reason="no plan id in the header")
+    body_md = body_md_of(text, close)
+    title = plan_title(body_md, plan_id)
+    if not store_present(data):
+        raise Fail([f"no store: import needs <data>/mk.db ({data})"])
+    db = _mkdb()
+    home = db.resolve_home(home)
+    header_json = header_json_of(out, sha, body_md, str(out["status"] or "draft"))
+    con = db.open_project(home, data_dir=data)
+    try:
+        row = con.execute("SELECT version FROM plans WHERE id=?", (plan_id,)).fetchone()
+        version = row["version"] if row and row["version"] is not None else 0
+        if not dry_run:
+            db._begin(con)
+            try:
+                write_plan_row(con, plan_id, dict(
+                    version=version, title=title, header_json=header_json, body_md=body_md,
+                    **new_plan_columns(header, out)),
+                    # a re-import must not move the plan's version or stamp it as approved again
+                    update=["title", "header_json", "body_md"])
+                con.execute("COMMIT")
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
+        return {"ok": True, "store": True, "plan": plan_id, "version": version,
+                "title": title, "noop": bool(row), "dry_run": bool(dry_run)}
+    finally:
+        con.close()
+
+
+def delete_plan(plan_id, data, home):
+    """C10: drop the plans row and archive the file — never unlink it (C13). Refused while any
+    run of this plan is still active; tasks of finished runs stay."""
+    if not PLAN_ID_RE.fullmatch(plan_id):
+        raise Fail([f"bad plan id {plan_id!r} ({PLAN_ID_RE.pattern})"])
+    data = resolve_data_arg(data)
+    if not store_present(data):
+        raise Fail([f"no store: delete needs <data>/mk.db ({data})"])
+    db = _mkdb()
+    home = db.resolve_home(home)
+    con = db.open_project(home, data_dir=data)
+    try:
+        row = con.execute("SELECT archived_path FROM plans WHERE id=?", (plan_id,)).fetchone()
+        if not row:
+            raise Fail([f"no plan {plan_id} in the store"])
+        live = [r["id"] for r in con.execute(
+            "SELECT id FROM runs WHERE plan=? AND status='active' ORDER BY id", (plan_id,))]
+        if live:
+            raise Fail([f"refusing to delete {plan_id}: live run(s) {', '.join(live)} — "
+                        f"close the run first (C10)"])
+        con.execute("DELETE FROM plans WHERE id=?", (plan_id,))
+        con.commit()
+    finally:
+        con.close()
+    # the file moves to the archive only after the row is gone; a name already taken gets a
+    # timestamp suffix so an earlier archived version is never overwritten
+    src = os.path.join(data, "plans", f"{plan_id}.md")
+    moved = None
+    if os.path.isfile(src):
+        dst = os.path.join(data, "plans", "archive", os.path.basename(src))
+        if os.path.exists(dst):
+            stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            dst = os.path.join(data, "plans", "archive", f"{plan_id}-{stamp}.md")
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.move(src, dst)
+        moved = dst
+    return {"ok": True, "plan": plan_id, "moved": moved}
+
+
+def cmd_import(a):
+    return import_file(a.path, a.data, a.home, a.dry_run)
+
+
+def cmd_delete(a):
+    return delete_plan(a.plan, a.data, a.home)
+
 
 def build_parser():
     p = Parser(prog="mk-plan.py")
@@ -951,18 +1233,26 @@ def build_parser():
         c.set_defaults(func=func)
     s = sub.add_parser("set")
     s.add_argument("path"), s.add_argument("--status", required=True)
+    s.add_argument("--data", default=None), s.add_argument("--home", default=None)
     s.set_defaults(func=cmd_set)
     r = sub.add_parser("add-run")
     r.add_argument("path"), r.add_argument("--run", required=True)
     r.set_defaults(func=cmd_add_run)
-    for name, func in (("approve", cmd_approve), ("export", cmd_export)):
+    for name, func in (("approve", cmd_approve), ("export", cmd_export), ("import", cmd_import)):
         c = sub.add_parser(name)
         c.add_argument("path")
         c.add_argument("--data", default=None)
         c.add_argument("--home", default=None)
         if name == "approve":
             c.add_argument("--run", default=None)
+        if name == "import":
+            c.add_argument("--dry-run", action="store_true")
         c.set_defaults(func=func)
+    d = sub.add_parser("delete")
+    d.add_argument("plan")
+    d.add_argument("--data", default=None)
+    d.add_argument("--home", default=None)
+    d.set_defaults(func=cmd_delete)
     return p
 
 
@@ -1358,7 +1648,10 @@ def self_test():
             ))) + "\n"))
         out = mk("approve", good, "--data", data, "--home", home, "--run", "r1")
         assert out["ok"] and out["store"] is True and out["version"] == 1, out
-        assert not os.path.exists(good)
+        # C13: approve copies, the original file stays (with the approved status line)
+        assert os.path.isfile(good), "approve must leave the original in place"
+        assert b'status = "approved"' in open(good, "rb").read()
+        assert "run" not in out and out["tasks_run"] == "r1", out
         arch = out["archived"]
         assert os.path.isfile(arch)
         archived_bytes = open(arch, "rb").read()
@@ -1388,7 +1681,7 @@ def self_test():
         open(good, "w").write(changed)
         out3 = mk("approve", good, "--data", data, "--home", home, "--run", "r1")
         assert out3["version"] == 2 and os.path.isfile(arch) and os.path.isfile(out3["archived"])
-        assert out3["archived"] != arch and not os.path.exists(good)
+        assert out3["archived"] != arch and os.path.isfile(good)  # still a copy, not a move
 
         # a named cycle leaves the file and the store unchanged
         cyc = write("cyc.md", plan_text(plan='plan = "cyc"', phases=phase(
@@ -1460,8 +1753,8 @@ def self_test():
             for task_row in ph["tasks"]:
                 want[task_row["id"]] = ",".join(str(d) for d in task_row["deps"])
         out = mk("approve", copy, "--data", data, "--home", home, "--run", "mkstore")
-        assert out["ok"] and not os.path.exists(copy), out
-        assert os.path.isfile(real)  # the real plan was never moved
+        assert out["ok"] and os.path.isfile(copy), out  # copied, not moved
+        assert os.path.isfile(real)  # the real plan was never touched
         con = db.open_project(home, data_dir=data)
         got = {r["id"]: r["deps"] for r in con.execute(
             "SELECT id, deps FROM tasks WHERE run='mkstore'")}
@@ -1523,8 +1816,9 @@ def self_test():
         open(bom, "wb").write(raw_bom)
         assert mk("check", bom)["ok"] is True
         out = mk("approve", bom, "--data", data, "--home", home, "--run", "rbom")
-        assert out["ok"] and not os.path.exists(bom), out
+        assert out["ok"] and os.path.isfile(bom), out  # the BOM file stays too
         archived_bom = open(out["archived"], "rb").read()
+        assert open(bom, "rb").read() == archived_bom  # original synced to the approved bytes
         assert archived_bom.startswith(b"\xef\xbb\xbf") and b"\r\n" in archived_bom
         assert b'status = "approved"' in archived_bom
         dest = os.path.join(tmp, "bomplan.md")
@@ -1553,11 +1847,14 @@ def self_test():
                 got = json.loads(r2.stdout.strip().splitlines()[-1])
                 # commit-kill: the next approve finishes the missing archive (same version).
                 # archive-kill: the archive already matches, so the next approve is a no-op
-                # and removes the original.
+                # and the original stays, now on the approved bytes.
                 assert got["ok"] and got["version"] == 1, got
                 if step == "archive":
                     assert got.get("noop") is True, got
-                assert not os.path.exists(src)
+                # C13: a kill leaves the original in place, and the converging approve brings it
+                # back to the approved bytes the archive holds
+                assert os.path.isfile(src), step
+                assert open(src, "rb").read() == open(got["archived"], "rb").read()
                 assert os.path.isfile(got["archived"])
                 assert b'status = "approved"' in open(got["archived"], "rb").read()
 
@@ -1571,12 +1868,207 @@ def self_test():
                            capture_output=True, text=True)
         assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
         ap = mk("approve", link, "--data", data, "--home", home, "--run", "lk")
-        assert ap["ok"] and not os.path.exists(link), ap
+        # the original path still resolves after the approve (the hermes-switchui issue): C13
+        # approve copies, so the file mk-state was pointed at is still there
+        assert ap["ok"] and os.path.isfile(link), ap
         r = subprocess.run([sys.executable, state, "--data", data, "plan", "sync", "--run", "lk"],
                            capture_output=True, text=True)
         assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
         got = json.loads(r.stdout.strip().splitlines()[-1])
         assert got["ok"] and got.get("plan") == "link", got
+
+        # D1.2 — approve copies (C13), data-dir fallback, tasks_run, import, delete, pause
+        def plans_rows(pid, datadir=data, homedir=home):
+            con = db.open_project(homedir, data_dir=datadir)
+            try:
+                n = con.execute("SELECT COUNT(*) c FROM plans WHERE id=?", (pid,)).fetchone()["c"]
+                row = con.execute("SELECT * FROM plans WHERE id=?", (pid,)).fetchone()
+            finally:
+                con.close()
+            return n, (dict(row) if row is not None else None)
+
+        # 1. a good file imports into exactly one plans row and touches no file byte.
+        # the stored version is 0 for a fresh id and the reply reports that same number.
+        imp1 = write("imp1.md", plan_text(plan='plan = "imp1"', status='status = "draft"',
+                                          phases=phase("P1", tasks=task("P1.1")) + "\n").replace(
+            "# body", "# imp1 — Sample Title"))
+        blob1 = open(imp1, "rb").read()
+        out = mk("import", imp1, "--data", data, "--home", home)
+        assert out["ok"] is True and out["store"] is True and out["plan"] == "imp1", out
+        assert out["title"] == "Sample Title", out  # the H1 text after the em dash
+        n, row1 = plans_rows("imp1")
+        assert n == 1, n
+        assert row1["version"] == 0 and out["version"] == row1["version"], (row1, out)
+        assert row1["title"] == "Sample Title"
+        con = db.open_project(home, data_dir=data)
+        n_tasks = con.execute(
+            "SELECT COUNT(*) c FROM tasks WHERE id IN ('P1','P1.1') AND run='imp1'").fetchone()["c"]
+        con.close()
+        assert n_tasks == 0, n_tasks  # import loads the plan, it does not approve the work
+        assert open(imp1, "rb").read() == blob1
+
+        # 2. the same bytes again: the upsert lands on the same row, byte for byte
+        out2 = mk("import", imp1, "--data", data, "--home", home)
+        assert out2["ok"] is True and out2["plan"] == "imp1", out2
+        n, row2 = plans_rows("imp1")
+        assert n == 1 and row2 == row1, (row1, row2)
+        assert out2["version"] == row1["version"]
+
+        # 3. no H1 in the body: the plan id is the title
+        imp3 = write("imp3.md", plan_text(plan='plan = "imp3"',
+                                          phases=phase("P1", tasks=task("P1.1")) + "\n").replace(
+            "# body", "## only a subheading\nbody text\n"))
+        out = mk("import", imp3, "--data", data, "--home", home)
+        assert out["ok"] is True and out["plan"] == "imp3" and out["title"] == "imp3", out
+        n, row3 = plans_rows("imp3")
+        assert n == 1 and row3["title"] == "imp3", (n, row3)
+
+        # 4. a file that is not a plan, and one whose header does not parse: both refused
+        # with ok:false and a reason, exit 0, and neither leaves a plans row behind
+        noopen = write("imp4a.md", 'plan = "imp4a"\n+++\n+++\nbody\n')
+        out = mk("import", noopen, "--data", data, "--home", home)
+        assert out["ok"] is False and isinstance(out.get("reason"), str) and out["reason"], out
+        badtoml = write("imp4b.md", '+++\nplan = "imp4b"\nstatus = "draft"\ncreated == 2026-10-08\n'
+                                    '+++\n\n# body\n')
+        out = mk("import", badtoml, "--data", data, "--home", home)
+        assert out["ok"] is False and isinstance(out.get("reason"), str) and out["reason"], out
+        assert plans_rows("imp4a")[0] == 0 and plans_rows("imp4b")[0] == 0
+
+        # 5. --dry-run reports exactly what a real import would, and writes nothing
+        imp5 = write("imp5.md", plan_text(plan='plan = "imp5"', status='status = "draft"',
+                                          phases=phase("P1", tasks=task("P1.1")) + "\n").replace(
+            "# body", "# imp5 — Dry Title"))
+        blob5 = open(imp5, "rb").read()
+        out = mk("import", imp5, "--dry-run", "--data", data, "--home", home)
+        assert out["ok"] is True and out["dry_run"] is True, out
+        assert out["plan"] == "imp5" and out["title"] == "Dry Title", out
+        assert plans_rows("imp5")[0] == 0
+        assert open(imp5, "rb").read() == blob5
+
+        # 6. delete moves the plan file into plans/archive and never unlinks it; a clash with an
+        # existing archive name gets a timestamp suffix
+        plans_dir = os.path.join(data, "plans")
+        arch_dir = os.path.join(plans_dir, "archive")
+        os.makedirs(arch_dir, exist_ok=True)
+        live = os.path.join(plans_dir, "imp6.md")
+        open(live, "w").write(plan_text(plan='plan = "imp6"', phases=phase("P1") + "\n"))
+        live_bytes = open(live, "rb").read()
+        clash = os.path.join(arch_dir, "imp6.md")
+        open(clash, "w").write("older archived copy\n")
+        clash_bytes = open(clash, "rb").read()
+        assert mk("import", live, "--data", data, "--home", home)["ok"]
+        out = mk("delete", "imp6", "--data", data, "--home", home)
+        assert out["ok"] is True and out["plan"] == "imp6", out
+        moved = out["moved"]
+        assert moved and os.path.dirname(os.path.abspath(moved)) == os.path.abspath(arch_dir), moved
+        assert os.path.abspath(moved) != os.path.abspath(clash)
+        assert os.path.isfile(moved) and open(moved, "rb").read() == live_bytes
+        assert not os.path.exists(live)
+        assert open(clash, "rb").read() == clash_bytes
+        assert plans_rows("imp6")[0] == 0
+
+        # 7. a plan an active run still points at is refused: the row and the file both stay
+        live7 = os.path.join(plans_dir, "imp7.md")
+        open(live7, "w").write(plan_text(plan='plan = "imp7"', phases=phase("P1") + "\n"))
+        assert mk("import", live7, "--data", data, "--home", home)["ok"]
+        con = db.open_project(home, data_dir=data)
+        con.execute("INSERT OR REPLACE INTO runs(id, plan, plan_version, branch, status, stage)"
+                    " VALUES ('imp7run','imp7',0,'br','active','build')")
+        con.commit()
+        con.close()
+        out = mk("delete", "imp7", "--data", data, "--home", home, code=2)
+        assert out["ok"] is False, out
+        said = " ".join(out.get("errors") or [])
+        assert "imp7run" in said and "live run" in said, out
+        assert plans_rows("imp7")[0] == 1
+        assert os.path.isfile(live7)
+
+        # a finished run does not block delete, and its tasks stay
+        con = db.open_project(home, data_dir=data)
+        con.execute("UPDATE runs SET status='done' WHERE id='imp7run'")
+        con.commit()
+        db.add_task(con, "imp7run", "P1", "phase", title="kept")
+        con.close()
+        out = mk("delete", "imp7", "--data", data, "--home", home)
+        assert out["ok"] is True and plans_rows("imp7")[0] == 0, out
+        con = db.open_project(home, data_dir=data)
+        kept = con.execute("SELECT id FROM tasks WHERE run='imp7run'").fetchall()
+        con.close()
+        assert [r["id"] for r in kept] == ["P1"]
+
+        # D1.1 columns: filled when present, harmless when absent
+        cols_data = os.path.join(tmp, "store-cols")
+        cols_home = os.path.join(cols_data, ".mk-home")
+        os.makedirs(cols_home)
+        db.open_project(cols_home, data_dir=cols_data).close()
+        con = db.open_project(cols_home, data_dir=cols_data)
+        for col, decl in (("status", "TEXT"), ("created", "TEXT"),
+                          ("design", "TEXT"), ("integration", "TEXT")):
+            con.execute(f"ALTER TABLE plans ADD COLUMN {col} {decl}")
+        con.commit()
+        con.close()
+        colp = write("cols.md", plan_text(
+            plan='plan = "cols"', top='design = ["a.py"]\nintegration = ["b.py"]',
+            phases=phase("P1", tasks=task("P1.1")) + "\n").replace("# body", "# cols — Col Title"))
+        out = mk("import", colp, "--data", cols_data, "--home", cols_home)
+        assert out["ok"] and out["title"] == "Col Title", out
+        n, crow = plans_rows("cols", cols_data, cols_home)
+        assert n == 1 and crow["status"] == "draft" and crow["created"] == "2026-10-08", crow
+        assert json.loads(crow["design"]) == ["a.py"] and json.loads(crow["integration"]) == ["b.py"]
+        out = mk("approve", colp, "--data", cols_data, "--home", cols_home, "--run", "colsrun")
+        assert out["ok"] and os.path.isfile(colp), out
+        n, crow = plans_rows("cols", cols_data, cols_home)
+        assert crow["status"] == "approved" and crow["version"] == 1, crow
+        # the shared store has none of the four columns: approve and import still succeed
+        plain = write("plain.md", plan_text(plan='plan = "plain"', phases=phase("P1") + "\n"))
+        assert mk("import", plain, "--data", data, "--home", home)["ok"]
+        assert mk("approve", plain, "--data", data, "--home", home, "--run", "plainrun")["ok"]
+
+        # pause and back: the file and, with the column, plans.status
+        parked = mk("set", colp, "--status", "parked", "--data", cols_data, "--home", cols_home)
+        assert parked["status"] == "parked" and parked.get("store") is True, parked
+        assert mk("parse", colp)["status"] == "parked"
+        n, crow = plans_rows("cols", cols_data, cols_home)
+        assert crow["status"] == "parked", crow
+        back = mk("set", colp, "--status", "approved", "--data", cols_data, "--home", cols_home)
+        assert back["status"] == "approved", back
+        n, crow = plans_rows("cols", cols_data, cols_home)
+        assert crow["status"] == "approved", crow
+        # a store without the column: set still rewrites the file and does not error
+        assert mk("set", plain, "--status", "parked", "--data", data, "--home", home)["status"] == "parked"
+        assert mk("parse", plain)["status"] == "parked"
+        assert mk("set", plain, "--status", "approved", "--data", data, "--home", home)["status"] == "approved"
+
+        # no --data, cwd = a temp repo whose .matrixkoder/mk.db exists -> store: true
+        repo = os.path.join(tmp, "repo")
+        os.makedirs(os.path.join(repo, ".matrixkoder"))
+        subprocess.run(["git", "init", "-q", repo], check=True)
+        db.open_project(os.path.join(repo, ".mk-home"),
+                        data_dir=os.path.join(repo, ".matrixkoder")).close()
+        rp = os.path.join(repo, "repoplan.md")
+        open(rp, "w").write(plan_text(plan='plan = "repoplan"', phases=phase("P1") + "\n"))
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), "approve", rp,
+                            "--home", os.path.join(repo, ".mk-home")],
+                           capture_output=True, text=True, cwd=repo,
+                           env={k: v for k, v in os.environ.items() if k != "MATRIXKODER_DATA"})
+        assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+        got = json.loads(r.stdout.strip().splitlines()[-1])
+        assert got["ok"] and got["store"] is True, got
+        assert os.path.isfile(rp) and os.path.isfile(got["archived"])
+        assert "tasks_run" in got and "run" not in got, got
+
+        # file-only next to an existing mk.db names that store in a warning
+        side = os.path.join(tmp, "side")
+        os.makedirs(side)
+        open(os.path.join(side, "mk.db"), "wb").close()
+        sp = os.path.join(side, "side.md")
+        open(sp, "w").write(plan_text(plan='plan = "sideplan"', phases=phase("P1") + "\n"))
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), "approve", sp],
+                           capture_output=True, text=True, cwd=tmp,
+                           env={k: v for k, v in os.environ.items() if k != "MATRIXKODER_DATA"})
+        assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+        got = json.loads(r.stdout.strip().splitlines()[-1])
+        assert got["store"] is False and any("mk.db" in w for w in got.get("warnings") or []), got
 
         print("mk-plan self-test ok")
     finally:
