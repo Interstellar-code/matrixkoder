@@ -1042,8 +1042,8 @@ class BusState:
         if status == "working":
             still.append(msg)  # queue until idle
             return
-        if status != "idle":
-            return  # unknown state: do not ring
+        if status not in ("idle", "done"):
+            return  # unknown state: do not ring; herdr reports a finished turn as "done"
         with self._ring_lock:
             self.rung.add(msg["id"])
         if self._ring(msg, pane):
@@ -4217,6 +4217,13 @@ def _store_self_test_body(mod):
         assert send_to("blocked lane")[0] == 200
         time.sleep(0.8)
         assert len(prompt_calls()) == n0, prompt_calls()
+
+        # herdr reports a lane whose turn just finished as `done`: it rings, exactly once.
+        set_agents(dict(p2, agent_status="done"))
+        assert send_to("done lane")[0] == 200
+        wait_prompts(n0 + 1)
+        time.sleep(0.8)
+        assert len(prompt_calls()) == n0 + 1, ("a done lane rings once", prompt_calls()[n0:])
 
         # (2) A herdr that hangs for 20 s must not hold /send; (1) two concurrent
         # sends plus the ticks type each message exactly once.
