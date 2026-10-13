@@ -3140,7 +3140,9 @@ def cmd_metrics(args):
     if run is not None and not is_valid_id(run):
         raise Fail("invalid run id")
     if not store_mode(data_dir):
-        raise Fail("metrics need a project store")
+        res = _file_metrics(data_dir, run)
+        out(res)
+        return res
     store = StoreAdapter(data_dir)
     if run is None:
         active = [r["id"] for r in store.store_select("SELECT id FROM runs WHERE status=? ORDER BY id", ("active",))
@@ -3151,6 +3153,31 @@ def cmd_metrics(args):
     res = _run_metrics(store, run)
     out(res)
     return res
+
+
+def _file_metrics(data_dir, run):
+    """File mode (no project store): counts from bus.jsonl via the shared reader.
+
+    Without --run: the run in this lane's bus token file, else the data dir's only run."""
+    if run is None:
+        run = (read_json(os.path.join(os.getcwd(), ".matrixkoder-bus.json"), {}) or {}).get("run")
+        if not is_valid_id(run):
+            runs = _known_runs(data_dir)
+            run = runs[0] if len(runs) == 1 else None
+        if not run:
+            raise Fail("missing --run")
+    messages = _read_run_messages(data_dir, run)
+    by_kind, last = {}, {}
+    for m in messages:
+        by_kind[m.get("kind")] = by_kind.get(m.get("kind"), 0) + 1
+        lane = m.get("task") or m.get("from")
+        if lane and m.get("ts"):
+            last[lane] = max(last.get(lane, ""), m["ts"])
+    answered = {m["reply_to"] for m in messages
+                if m.get("kind") == "answer" and isinstance(m.get("reply_to"), str)}
+    pending = sum(1 for m in messages if m.get("kind") == "ask" and m.get("id") not in answered)
+    return {"ok": True, "mode": "file", "run": run, "messages_by_kind": by_kind,
+            "last_message_by_lane": last, "pending_asks": pending}
 
 
 def _run_metrics(store, run):
@@ -3207,7 +3234,7 @@ def _run_metrics(store, run):
         return round(xs[k], 3)
 
     res = {
-        "ok": True, "run": run,
+        "ok": True, "mode": "store", "run": run,
         "latency_p50": pct(lat, 0.50), "latency_p95": pct(lat, 0.95),
         "failed_deliveries": failed,
         "obedience": (round(obeyed / len(sent), 3) if sent else None),
@@ -4783,6 +4810,27 @@ def _store_self_test_body(mod):
             stdout=subprocess.PIPE, text=True,
         )
         assert all_m["runs"][1] == json.loads(rc_m2.stdout.strip().splitlines()[-1]), all_m["runs"][1]
+
+        # item 8: file mode (no mk.db) degrades to counts from bus.jsonl instead of erroring
+        fdata = os.path.join(tmp, "fm-metrics")
+        os.makedirs(os.path.join(fdata, "runs", "rf"))
+        with open(os.path.join(fdata, "runs", "rf", "bus.jsonl"), "w", encoding="utf-8") as f:
+            for i, (kind, task, ts, rt) in enumerate([
+                ("info", "T1", "2026-10-13T10:00:00Z", None), ("ask", "T1", "2026-10-13T10:01:00Z", None),
+                ("ask", "T2", "2026-10-13T10:02:00Z", None), ("answer", "T1", "2026-10-13T10:03:00Z", "m-2"),
+            ], 1):
+                f.write(json.dumps({"seq": i, "id": "m-%d" % i, "ts": ts, "run": "rf", "task": task,
+                                    "from": task, "to": "orch", "kind": kind, "reply_to": rt, "text": "x"}) + "\n")
+        for extra in (["--run", "rf"], []):  # without --run: the data dir's only run
+            rc_f = subprocess.run([sys.executable, os.path.abspath(__file__), "metrics", "--data", fdata] + extra,
+                                  stdout=subprocess.PIPE, text=True, cwd=fdata)
+            assert rc_f.returncode == 0, rc_f.stdout
+            fm = json.loads(rc_f.stdout.strip().splitlines()[-1])
+            assert fm == {"ok": True, "mode": "file", "run": "rf",
+                          "messages_by_kind": {"info": 1, "ask": 2, "answer": 1},
+                          "last_message_by_lane": {"T1": "2026-10-13T10:03:00Z", "T2": "2026-10-13T10:02:00Z"},
+                          "pending_asks": 1}, fm
+        assert metrics["mode"] == "store", metrics
 
         # no direct database-module import text anywhere in this script
         src = open(os.path.abspath(__file__), encoding="utf-8").read()
