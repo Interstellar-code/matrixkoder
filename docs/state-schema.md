@@ -339,6 +339,52 @@ they move to `fix`. Each move is one `transition` event carrying the same `--by`
 `verify: pass` or `verify: fail — <why>` (the `--fail` text, or the drop list); a task already in
 the target status gets no transition (nothing moved).
 
+## Plan file → DB
+
+`skills/matrixkoder/templates/plan.md` is the contract: every header key there carries a trailing
+comment naming its DB home, and the table below is the same contract written out. Additive only —
+no key is renamed or removed, so every plan written against an older template stays valid.
+
+`plans(id, version, title, header_json, body_md, approved_at, archived_path)`. D1 adds four
+columns — `status`, `created`, `design`, `integration` — marked "added by D1"; until then those
+four keys live only in `header_json`.
+
+| Header key | DB home |
+|---|---|
+| `plan` | `plans.id` (and `plans.title` until the H1 title lands) |
+| `status` | `plans.status` (added by D1; `header_json` until then) |
+| `created` | `plans.created` (added by D1; `header_json` until then) |
+| `runs` | `plans.header_json` |
+| `design` | `plans.design` (added by D1; `header_json` until then) |
+| `integration` | `plans.integration` (added by D1; `header_json` until then) |
+| `[gates]` (`test`, `typecheck`, `selftest`, `validate`) | `plans.header_json` |
+| `[[phase]]` blocks | `plans.header_json` |
+| `[[phase]] id` / `[[phase.task]] id` / `[[phase.task.subtask]] id` | `tasks.id` |
+| `title` (phase, task, subtask) | `tasks.title` |
+| `acceptance` (task, subtask) | `tasks.acceptance` |
+| `owned` (phase, task, subtask) | `tasks.owned` |
+| `deps` (phase, task, subtask) | `tasks.deps` |
+| `parallel` (task, subtask) | `tasks.parallel` |
+| `route` (phase, task, subtask) | `tasks.route_json` (`{"agent","model","effort"}` or empty) |
+| nesting of `[[phase.task]]` / `[[phase.task.subtask]]` | `tasks.type` (`phase\|task\|subtask`) and `tasks.parent` |
+| `wave`, `forbidden`, `reviewer`, `size`, `risk`, `review`, `qa`, `commit`, `subagents`, `lane_group`, `refs`, `subagent` | `header_json` only — no column |
+| the body below the closing `+++` | `plans.body_md` |
+| the body H1 line | `plans.title` (after D1; the plan id is the title until then) |
+
+The task rows come from the importer `approve_file` (`scripts/mk-plan.py`): its `flat_items`
+yields `(id, type, parent, title, acceptance, owned, deps, parallel, route)` per phase, task and
+subtask, parent first, and each becomes one `tasks` row of the run.
+
+Lifecycle (C13): `import` loads the file into the store without approving it (command added by
+D1); `approve` checks the file, versions it, writes the tasks and copies it to
+`<data>/plans/archive/<id>-v<n>.md`, leaving the original in `<data>/plans/`; `run init --plan`
+starts the run. After import the run and this DB are the source — status, tasks, rounds and
+verdicts change there, and MK does not edit the plan file. When the plan is done the file moves to
+`<data>/plans/archive/`.
+
+`mk-plan.py check` reports a missing `status`, a missing `created` and a body with no H1 line as
+**warnings**, never errors, so an older plan still checks `ok: true`.
+
 ## Plan link (C4)
 
 `mk-state.py` never imports `mk-plan.py`; it runs it as a subprocess (`$MK_PLAN_CMD` overrides the

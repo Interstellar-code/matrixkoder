@@ -2715,7 +2715,7 @@ def _get_client_conn(data_dir):
     if not bdata or "port" not in bdata:
         raise Fail("bus down")
     port = bdata["port"]
-    token = bdata.get("token")
+    token = _orch_token(data_dir)
     if not token:
         lane_file = os.path.join(os.getcwd(), ".matrixkoder-bus.json")
         if os.path.exists(lane_file):
@@ -3028,15 +3028,33 @@ def _watch_line(m):
 
 
 def _orch_token(data_dir):
-    """The live orchestrator token, from bus.json or bus-tokens.json."""
-    bus_json = read_json(os.path.join(bus_location(data_dir), "bus.json"))
-    if bus_json and bus_json.get("token"):
+    """The orchestrator token for THIS data dir's project. The root bus is shared by every
+    repo on the machine and bus.json's token belongs to the project that started it; an
+    orchestrator of another project uses (or mints) its own project-scoped orch token in
+    bus-tokens.json, so its messages land in its own store and run, never the host's."""
+    home = bus_location(data_dir)
+    bus_json = read_json(os.path.join(home, "bus.json")) or {}
+    slug = project_slug_for(data_dir)
+    if bus_json.get("token") and (slug is None or bus_json.get("project") in (None, slug)):
         return bus_json["token"]
-    tokens = read_json(os.path.join(bus_location(data_dir), "bus-tokens.json"), default={})
-    for tok, v in (tokens or {}).items():
-        if isinstance(v, dict) and v.get("role") == "orch":
-            return tok
-    return None
+    tp, tl = os.path.join(home, "bus-tokens.json"), os.path.join(home, "bus-tokens.lock")
+    lfd = os.open(tl, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lfd, fcntl.LOCK_EX)
+        tokens = read_json(tp, default={}) or {}
+        for tok, v in tokens.items():
+            if isinstance(v, dict) and v.get("role") == "orch" and v.get("project") == slug:
+                return tok
+        if slug is None:
+            return None
+        tok = secrets.token_urlsafe(32)
+        tokens[tok] = {"token": tok, "role": "orch", "run": "*", "task": "", "lane": "",
+                       "project": slug, "created_at": now_iso()}
+        write_json(tp, tokens, mode=0o600)
+        return tok
+    finally:
+        fcntl.flock(lfd, fcntl.LOCK_UN)
+        os.close(lfd)
 
 
 def cmd_watch(args):
@@ -3816,6 +3834,16 @@ def _store_self_test_body(mod):
             os.close(lfd)
         code, sec_b = post(port2, orch_b, {"run": "r1", "task": "T1", "kind": "ask", "text": "SECRET FOR B", "from": "orch", "to": "T1", "project": "projb"})
         assert code == 200, (code, sec_b)
+        # the shared bus belongs to project A: the orchestrator CLI of project B uses B's own
+        # orch token, so its send lands in B's store and run, never in A's (live bug 2026-10-13)
+        assert _orch_token(data_b) == orch_b, "B's CLI must pick B's orch token, not bus.json's"
+        assert _orch_token(data) != orch_b
+        rc_cli = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "send", "--data", data_b, "--run", "r1", "--task", "T1",
+             "--kind", "task", "--from", "orch", "--to", "T1", "--text", "B CLI SEND"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        res_cli = json.loads(rc_cli.stdout.strip().splitlines()[-1])
+        assert rc_cli.returncode == 0 and res_cli["ok"] and res_cli["message"]["project"] == "projb", (rc_cli.stderr, res_cli)
         hash_before = _table_hash(data)
         con = mod.open_project(data, data_dir=data)
         try:
@@ -5690,6 +5718,11 @@ def self_test():
         rc, send_info, _ = cli(["send", "--run", "r1", "--task", "T1", "--kind", "info", "--text", "update", "--from", "orch", "--to", "T1", "--data", data])
         assert rc == 0 and send_info["ok"] is True, send_info
         info_id = send_info["message"]["id"]
+        # todo 86: the CLI passes every kind to the server (dispatch sends kind task in store
+        # mode); only the server decides, so a file-mode bus refuses it there, not argparse
+        rc_k, res_k, err_k = cli(["send", "--run", "r1", "--task", "T1", "--kind", "task", "--text", "b",
+                                  "--from", "orch", "--to", "T1", "--data", data], check=False)
+        assert "invalid choice" not in err_k and rc_k != 0 and "invalid kind" in json.dumps(res_k) + err_k, (rc_k, res_k, err_k)
 
         th_nan.join(timeout=5.0)
         assert not th_nan.is_alive(), "nan wait thread did not terminate"
@@ -6417,7 +6450,8 @@ def main():
     p_send = subparsers.add_parser("send")
     p_send.add_argument("--run", required=True, help="Run identifier")
     p_send.add_argument("--task", help="Task identifier")
-    p_send.add_argument("--kind", required=True, choices=["ask", "answer", "info", "ack"], help="Message kind")
+    # every kind the server knows; the server refuses a store kind on a file-mode bus
+    p_send.add_argument("--kind", required=True, choices=list(STORE_KINDS), help="Message kind")
     p_send.add_argument("--text", required=True, help="Message text")
     p_send.add_argument("--from", dest="from_sender", help="Sender identifier")
     p_send.add_argument("--to", dest="to_recipient", help="Recipient identifier")
