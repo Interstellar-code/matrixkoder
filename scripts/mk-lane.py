@@ -576,11 +576,13 @@ def omc_ignored_ok(path, has_tracked):
     write `.omc/project-memory.json`, `.omc/sessions/`, `.omc/state/` and nested `src/…/.omc/`
     that gitignore hides. Only while that `.omc` tree tracks nothing: a tracked `.omc/plans/`
     makes an ignored sibling inside it user data. A non-`!!` line never reaches here, so a
-    modified tracked plan still counts. This check never deletes."""
+    modified tracked plan still counts. `.omc/state/` (HUD cache) is judged on its own subtree,
+    so tracked plans beside it do not make it user data. This check never deletes."""
     parts = path.strip().rstrip("/").split("/")
     if ".omc" not in parts:
         return False
-    omc = "/".join(parts[:parts.index(".omc") + 1])
+    i = parts.index(".omc")
+    omc = "/".join(parts[:i + (2 if parts[i + 1:i + 2] == ["state"] else 1)])
     return has_tracked is None or not has_tracked(omc)
 
 
@@ -2391,6 +2393,28 @@ def self_test():
         assert open(os.path.join(outside_s, "SENTINEL")).read() == "do not delete\n"
         assert mk_at(omc_data, env_store, "release", "--slot", "1",
                      "--integration", "mk/r1/integration")["ok"]
+
+        # L1 (.omc/state): the HUD cache is disposable even while `.omc/plans/` is tracked, at any
+        # depth; an ignored sibling in the tracked plans and a modified tracked file stay dirty.
+        hud = os.path.join(tmp, "hud-repo")
+        os.makedirs(os.path.join(hud, ".omc", "plans"))
+        gh = lambda *a: g("-c", "user.name=t", "-c", "user.email=t@t", *a, cwd=hud)
+        gh("init", "-q")
+        write(os.path.join(hud, ".gitignore"), ".omc/state/\n.omc/plans/x.md\n")
+        write(os.path.join(hud, ".omc", "plans", "p.md"), "plan\n")
+        gh("add", ".gitignore", ".omc/plans/p.md")
+        gh("commit", "-q", "-m", "init")
+        hud_cfg = {"disposable": [], "copy": []}
+        write(os.path.join(hud, ".omc", "state", "hud.json"), "{}\n")
+        write(os.path.join(hud, ".omc", "state", "sessions", "x", "hud-state.json"), "{}\n")
+        assert clean_state(hud, hud_cfg)[0], clean_state(hud, hud_cfg)
+        write(os.path.join(hud, ".omc", "plans", "x.md"), "ignored sibling\n")
+        ok, dirty = clean_state(hud, hud_cfg)
+        assert not ok and dirty == ["!! .omc/plans/x.md"], dirty
+        os.unlink(os.path.join(hud, ".omc", "plans", "x.md"))
+        write(os.path.join(hud, ".omc", "plans", "p.md"), "plan\nedited\n")
+        ok, dirty = clean_state(hud, hud_cfg)
+        assert not ok and any(".omc/plans/p.md" in line for line in dirty), dirty
 
         print("mk-lane self-test ok")
     finally:
