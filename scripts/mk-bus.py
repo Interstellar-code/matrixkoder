@@ -119,6 +119,11 @@ def store_mode(data_dir):
     return os.path.isfile(project_store_path(data_dir))
 
 
+RING_QUEUE_MAX = 100
+RING_MAX_AGE = 3600
+PANE_RE = re.compile(r"^[A-Za-z0-9_:.-]+$")
+
+
 class StoreAdapter:
     """The only place mk-bus talks to the project store.
 
@@ -141,7 +146,7 @@ class StoreAdapter:
         return self._mkdb
 
     def store_append_event(self, run, *, task=None, kind, from_id=None, to_id=None,
-                            reply_to=None, text="", meta=None, artifact_id=None, t=None):
+                            reply_to=None, text="", meta=None, artifact_id=None, t=None, chan="bus"):
         fn = getattr(self._mod(), "append_event", None)
         if fn is None:
             raise Fail("store writer append_event is not available")
@@ -152,7 +157,7 @@ class StoreAdapter:
             os.remove(flag_path)
             raise RuntimeError("injected append failure")
         return fn(
-            self.data_dir, None, run, task=task, chan="bus", kind=kind,
+            self.data_dir, None, run, task=task, chan=chan, kind=kind,
             from_id=from_id, to_id=to_id, reply_to=reply_to, text=text,
             meta=meta, artifact_id=artifact_id, t=t, data_dir=self.data_dir,
         )
@@ -182,11 +187,22 @@ class StoreAdapter:
         )
 
     def store_select(self, sql, params=()):
-        """SELECT only, on the connection open_project returns. No writes."""
+        """SELECT only, on a real read-only open (mkdb._open_read: mode=ro, no migration, no write).
+
+        No store file yet means no rows. A locked, newer or unmigrated store raises Fail.
+        """
         mod = self._mod()
-        con = mod.open_project(self.data_dir, data_dir=self.data_dir)
+        path = os.path.join(mod.project_dir(self.data_dir, None, self.data_dir), "mk.db")
+        try:
+            con = mod._open_read(path, mod.SCHEMA)
+        except Exception as e:
+            raise Fail("store read failed: %s" % (e,))
+        if con is None:
+            return []
         try:
             return [dict(r) for r in con.execute(sql, params)]
+        except Exception as e:
+            raise Fail("store read failed: %s" % (e,))
         finally:
             con.close()
 
@@ -459,6 +475,8 @@ class BusState:
         # RLock: append_message/record_ack/get_pending hold self.lock and call
         # get_run_state, which also takes self.lock. A plain Lock would self-deadlock.
         self.lock = threading.RLock()
+        # Notified on every appended message: the all-runs /events stream waits on it.
+        self.any_cond = threading.Condition(self.lock)
         self.tokens = {}
         self.tokens_mtime = 0
         # Decided once at process start. A store that appears mid-process is ignored
@@ -475,6 +493,15 @@ class BusState:
         self.marked_asks = set()
         self.rung = set()
         self._ring_queue = []
+        # Ring state: _ring_lock guards the queue, rung, in-flight ids and the
+        # pending note events; _drain_lock serialises drains (one worker, plus
+        # tests that call _drain_rings directly); _ring_wake wakes the worker.
+        self._ring_lock = threading.RLock()
+        self._drain_lock = threading.Lock()
+        self._ring_wake = threading.Event()
+        self._ring_inflight = set()
+        self._ring_notes = []
+        self._ring_skipped = set()
         # Doorbell drain interval. A queued ring is delivered when the lane
         # goes idle even if no later message arrives to call _drain_rings.
         # Override with MK_BUS_RING_INTERVAL_SEC (seconds, minimum 0.05).
@@ -797,6 +824,7 @@ class BusState:
             rstate["messages"].append(msg)
             rstate["by_id"][msg_id] = msg
             rstate["cond"].notify_all()
+            self.any_cond.notify_all()
             ring = msg
         if ring is not None:
             try:
@@ -834,14 +862,16 @@ class BusState:
         return StoreAdapter(data_dir), data_dir
 
     def _maybe_ring(self, msg):
-        """C13b: ring an idle lane once for an unsolicited message.
+        """C13b: queue a doorbell for an unsolicited message. Never runs herdr.
 
         A solicited answer (one whose reply_to names an ask) needs no ring.
-        A nudge, an info, or an answer with no waiter does. The ring is one
-        fixed line, typed only while herdr says the lane is idle; a working
-        lane is queued and rung on a later tick. One ring per message id,
-        recorded as an event chan=bus kind=ring. With the bus down this
-        method is never called, so nothing rings.
+        A nudge, an info, or an answer with no waiter does. This only records
+        the message in the ring queue and wakes the ring worker: every herdr
+        call runs on that worker, so a slow herdr cannot block a request. The
+        worker types the fixed line only while herdr says the lane is idle; a
+        working lane stays queued. One ring per message id, recorded as an
+        event chan=bus kind=ring. With the bus down this method is never
+        called, so nothing rings.
         """
         if not self.use_store:
             return
@@ -853,39 +883,128 @@ class BusState:
         to_id = msg.get("to")
         if not to_id or to_id == "orch":
             return
-        if msg["id"] in self.rung:
-            return
-        self._ring_queue.append(msg)
-        self._save_ring_queue()
-        self._drain_rings()
+        self._ring_enqueue(msg)
+
+    def _ring_enqueue(self, msg):
+        """Add to the ring queue under the ring lock (once per id), then wake the worker."""
+        with self._ring_lock:
+            mid = msg["id"]
+            if mid in self.rung or mid in self._ring_inflight or any(q["id"] == mid for q in self._ring_queue):
+                return
+            self._ring_queue.append(dict(msg, queued_at=time.time()))
+            self._ring_cap_locked()
+        self._ring_wake.set()
+
+    def _ring_cap_locked(self):
+        """Hold the newest RING_QUEUE_MAX rows; each dropped row gets one ring-dropped note."""
+        while len(self._ring_queue) > RING_QUEUE_MAX:
+            old = self._ring_queue.pop(0)
+            self._ring_notes.append((old, "ring-dropped", "queue over %d rows" % RING_QUEUE_MAX))
+
+    def _flush_ring_notes(self):
+        """Write queued note events (chan=note). Worker thread only."""
+        with self._ring_lock:
+            notes, self._ring_notes = self._ring_notes, []
+        for msg, kind, text, *extra in notes:
+            try:
+                store, _ = self.store_for(msg.get("project"))
+                store.store_append_event(
+                    msg["run"], task=None, kind=kind, from_id="bus", to_id=msg.get("to"),
+                    reply_to=str(msg["id"]), text=text, chan="note",
+                    meta=dict(extra[0] if extra else {}, msg=msg["id"]),
+                )
+            except Exception as e:
+                sys.stderr.write("ring note failed: %r\n" % (e,))
 
     def _drain_rings(self):
-        still = []
-        for msg in self._ring_queue:
-            if msg["id"] in self.rung:
-                continue
-            status = self._herdr_status(msg.get("to"))
-            if status == "working":
-                still.append(msg)  # queue until idle
-                continue
-            if status != "idle":
-                continue  # unknown lane: do not ring
-            # Claim before typing so a second drain cannot ring the same id.
-            self.rung.add(msg["id"])
-            self._ring(msg)
-        self._ring_queue = still
-        self._save_ring_queue()
+        """Ring every queued message whose lane is idle. Runs on the ring worker.
 
-    def _lane_worktrees(self, task):
-        """Every lane worktree path a token for `task` was minted for.
+        The whole queue is CLAIMED under the ring lock before any subprocess
+        runs (moved out of the queue, ids marked in-flight), so a second drain
+        or a second sender cannot ring the same message. One `herdr agent list`
+        serves the whole queue.
+        """
+        with self._drain_lock:
+            self._flush_ring_notes()
+            now = time.time()
+            with self._ring_lock:
+                batch = []
+                for m in self._ring_queue:
+                    if m["id"] in self.rung:
+                        continue
+                    if now - m.get("queued_at", now) > RING_MAX_AGE:
+                        self._ring_notes.append((m, "ring-dropped", "expired after 1 hour"))
+                        continue
+                    batch.append(m)
+                self._ring_queue = []
+                self._ring_inflight = {m["id"] for m in batch}
+            still = []
+            try:
+                agents = self._herdr_agents() if batch else []
+                for msg in batch:
+                    try:
+                        self._drain_one(msg, agents, still)
+                    except Exception as e:
+                        sys.stderr.write("ring failed: %r\n" % (e,))
+            finally:
+                with self._ring_lock:
+                    self._ring_queue = still + self._ring_queue
+                    self._ring_inflight = set()
+                    self._ring_cap_locked()
+            self._save_ring_queue()
+            self._flush_ring_notes()
+
+    def _drain_one(self, msg, agents, still):
+        """One claimed message: ring it, keep it queued (append to `still`), or drop it."""
+        if not agents:
+            still.append(msg)  # herdr missing or failing: try again next tick
+            return
+        hit = self._pick_pane(msg, agents)
+        if hit == "ambiguous":
+            with self._ring_lock:
+                first = msg["id"] not in self._ring_skipped
+                self._ring_skipped.add(msg["id"])
+                if first:
+                    self._ring_notes.append((msg, "ring-skipped", "ambiguous pane"))
+            still.append(msg)
+            return
+        if not hit:
+            return  # no pane for this lane: nothing to ring
+        agent, pane = hit
+        status = agent.get("agent_status")
+        if status == "working":
+            still.append(msg)  # queue until idle
+            return
+        if status != "idle":
+            return  # unknown state: do not ring
+        with self._ring_lock:
+            self.rung.add(msg["id"])
+        if self._ring(msg, pane):
+            return
+        attempts = msg["_attempts"] = msg.get("_attempts", 0) + 1
+        final = attempts >= 2
+        with self._ring_lock:
+            self._ring_notes.append((
+                msg, "ring-failed",
+                "herdr prompt failed (attempt %d%s)" % (attempts, ", giving up" if final else ""),
+                {"final": final},
+            ))
+            if not final:
+                self.rung.discard(msg["id"])
+        if not final:
+            still.append(msg)  # one retry on the next tick
+        return
+
+    def _lane_worktrees(self, run, project, task):
+        """Every lane worktree path a token for (run, project, task) was minted for.
 
         Store mode keeps tokens in <bus dir>/bus-tokens.json, which records the
         lane directory per token. The worktree path is how a real pane is
         identified (herdr agents carry `cwd`), so the ring can find the lane's
-        pane without the orchestrator passing a pane id. A task can hold more
-        than one live token (re-armed in a fresh worktree, a fix round), so all
-        of them are candidates: matching the first one alone would miss the
-        pane that is actually running.
+        pane without the orchestrator passing a pane id. The token must match
+        the message's run AND project AND task: the same task id in another run
+        or project is another lane. A task can still hold more than one live
+        token (re-armed in a fresh worktree), so all of them are candidates.
         """
         try:
             tokens = read_json(os.path.join(self.data_dir, "bus-tokens.json"), default={})
@@ -893,7 +1012,8 @@ class BusState:
             return set()
         lanes = set()
         for v in (tokens or {}).values():
-            if isinstance(v, dict) and v.get("task") == task and v.get("lane"):
+            if (isinstance(v, dict) and v.get("task") == task and v.get("lane")
+                    and v.get("run") == run and (not project or v.get("project") == project)):
                 lanes.add(os.path.realpath(v["lane"]))
         return lanes
 
@@ -903,7 +1023,7 @@ class BusState:
         $MK_BUS_HERDR stays the test seam: a program printing the same JSON,
         invoked exactly as today. With it unset the REAL `herdr` binary on
         PATH is called. Missing binary, non-zero exit, bad JSON or a timeout
-        all return [] — no ring and no crash (the bus-down rule's twin).
+        (3 s) all return [] — no ring and no crash (the bus-down rule's twin).
         """
         fake = os.environ.get("MK_BUS_HERDR")
         if fake:
@@ -913,7 +1033,7 @@ class BusState:
                 return []
             argv = ["herdr", "agent", "list"]
         try:
-            proc = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=3)
         except (OSError, subprocess.TimeoutExpired):
             return []
         if proc.returncode != 0:
@@ -931,102 +1051,113 @@ class BusState:
             agents = data.get("agents")
         return agents if isinstance(agents, list) else []
 
-    def _herdr_pane_for(self, task):
-        """The pane id of the lane agent for `task`, or None.
+    @staticmethod
+    def _pane_id(agent):
+        return str(agent.get("pane_id") or agent.get("pane") or agent.get("name") or "")
 
-        Match order: the agent named after the task, then the agent whose cwd
-        IS the task's lane worktree (the real-lane case, todo 66a / F4). The
-        old `cwd.endswith("/" + task)` guess is kept last for the fake.
+    def _pick_pane(self, msg, agents):
+        """(agent, pane) of the lane agent for the message, "ambiguous", or None.
+
+        Match order: the agent whose cwd IS a lane worktree of this (run,
+        project, task) (the real-lane case, todo 66a / F4), then the agent
+        named after the task, then the old `cwd.endswith("/" + task)` guess
+        (kept for the fake). Two or more agents in the winning tier (builder
+        and reviewer share the lane cwd) are told apart by the lane's armed
+        agent name, then by the pane recorded in the lane's
+        .matrixkoder-watch.json; if that does not decide, "ambiguous" and the
+        caller does not ring.
         """
-        agents = self._herdr_agents()
-        if not agents:
-            return None
-        lanes = self._lane_worktrees(task)
-        by_name = by_cwd = by_suffix = None
-        for a in agents:
-            if not isinstance(a, dict):
-                continue
-            name = a.get("name") or ""
-            cwd = a.get("cwd") or ""
-            pane = a.get("pane_id") or a.get("pane") or name
-            if name == task and by_name is None:
-                by_name = (a, pane)
-            if lanes and cwd and os.path.realpath(cwd) in lanes and by_cwd is None:
-                by_cwd = (a, pane)
-            if cwd.endswith("/" + task) and by_suffix is None:
-                by_suffix = (a, pane)
-        for hit in (by_cwd, by_name, by_suffix):
-            if hit:
-                return hit[0], hit[1]
+        task = msg.get("to")
+        lanes = self._lane_worktrees(msg.get("run"), msg.get("project"), task)
+        valid = [a for a in agents if isinstance(a, dict)]
+        by_cwd = [a for a in valid if lanes and a.get("cwd") and os.path.realpath(a["cwd"]) in lanes]
+        by_name = [a for a in valid if (a.get("name") or "") == task]
+        by_suffix = [a for a in valid if (a.get("cwd") or "").endswith("/" + task)]
+        for tier in (by_cwd, by_name, by_suffix):
+            if len(tier) == 1:
+                return tier[0], self._pane_id(tier[0])
+            if tier:
+                return self._disambiguate(tier, lanes)
         return None
 
-    def _herdr_status(self, task):
-        """agent_status of the pane whose name or cwd matches the task.
+    def _disambiguate(self, tier, lanes):
+        armed = watch_pane = None
+        tokens = read_json(os.path.join(self.data_dir, "bus-tokens.json"), default={})
+        here = {os.path.realpath(a["cwd"]) for a in tier if a.get("cwd")} & lanes
+        for lane in here:
+            watch = read_json(os.path.join(lane, ".matrixkoder-watch.json"), default={})
+            if isinstance(watch, dict):
+                armed = armed or watch.get("agent")
+                watch_pane = watch_pane or watch.get("pane")
+        for v in (tokens or {}).values():
+            if isinstance(v, dict) and v.get("lane") and os.path.realpath(v["lane"]) in here:
+                armed = armed or v.get("agent")
+        if armed:
+            named = [a for a in tier if a.get("name") == armed]
+            if len(named) == 1:
+                return named[0], self._pane_id(named[0])
+        if watch_pane:
+            known = [a for a in tier if self._pane_id(a) == watch_pane and a.get("agent_status") is not None]
+            if len(known) == 1:
+                return known[0], self._pane_id(known[0])
+        return "ambiguous"
 
-        $MK_BUS_HERDR is a fake: a program printing `herdr agent list` JSON.
-        Unset means the REAL herdr binary; missing or failing means None, so
-        nothing rings.
-        """
-        hit = self._herdr_pane_for(task)
-        if not hit:
-            return None
-        return hit[0].get("agent_status")
-
-    def _ring(self, msg):
-        """Record the ring BEFORE typing it.
+    def _ring(self, msg, pane):
+        """Record the ring BEFORE typing it; True when herdr typed it.
 
         A crash between the two leaves kind=ring with meta typed=false. On
-        restart that row is typed once. A row with typed=true is never typed
-        again. MK_BUS_RING_KILL, when set to a path, is a test seam: the
-        process exits after the record and before the type.
+        restart that row is queued and rung once the lane is idle. A row with
+        typed=true is never typed again. MK_BUS_RING_KILL, when set to a path,
+        is a test seam: the process exits after the record and before the type.
+        A retry (msg carries `_ring_eid`) does not record a second ring row.
         """
         skill = os.environ.get("MK_BUS_SKILL_DIR") or os.path.join(HERE, "..", "child-skills", "mk-builder")
         line = "Run: python3 %s/scripts/mk-builder.py inbox" % os.path.abspath(skill)
         store, _ = self.store_for(msg.get("project"))
-        eid = store.store_append_event(
-            msg["run"], task=None, kind="ring",
-            from_id="bus", to_id=msg.get("to"), reply_to=msg["id"], text=line,
-            meta={"typed": False, "msg": msg["id"]},
-        )
-        self.rung.add(msg["id"])
-        kill = os.environ.get("MK_BUS_RING_KILL")
-        if kill:
-            try:
-                open(kill, "w").write(str(msg.get("id")))
-            except OSError:
-                pass
-            os._exit(86)
-        self._type_ring(msg, line, eid, store)
+        eid = msg.get("_ring_eid")
+        if eid is None:
+            eid = msg["_ring_eid"] = store.store_append_event(
+                msg["run"], task=None, kind="ring",
+                from_id="bus", to_id=msg.get("to"), reply_to=msg["id"], text=line,
+                meta={"typed": False, "msg": msg["id"]},
+            )
+            kill = os.environ.get("MK_BUS_RING_KILL")
+            if kill:
+                try:
+                    open(kill, "w").write(str(msg.get("id")))
+                except OSError:
+                    pass
+                os._exit(86)
+        return self._type_ring(msg, line, eid, store, pane)
 
-    def _type_ring(self, msg, line, eid, store):
-        """Type the fixed doorbell line into the lane's pane.
+    def _type_ring(self, msg, line, eid, store, pane):
+        """Type the fixed doorbell line into the lane's pane; True when herdr returned 0.
 
         One ring path: the test seam (`$MK_BUS_HERDR`, invoked as today) or the
-        REAL `herdr agent prompt <pane> <line>`. The line is fixed — a message
-        body never becomes typed text (C13a/C13b). A missing or failing herdr
-        is recorded as typed (nothing more to try) and never raises.
+        REAL `herdr agent prompt <pane> <line>` (5 s). The line is fixed — a
+        message body never becomes typed text (C13a/C13b). The pane id comes
+        from herdr, but it is still checked (`herdr agent prompt --help` does
+        not document `--`, so the id must not read as an option). Only a typed
+        ring gets the sibling row kind=ring-typed that restart treats as done;
+        a failure is the caller's ring-failed note. Never raises on herdr.
         """
-        task = msg.get("to")
+        if not pane or pane.startswith("-") or not PANE_RE.match(pane):
+            return False
         try:
             fake = os.environ.get("MK_BUS_HERDR")
-            if fake:
-                subprocess.run([sys.executable, fake, "prompt", task or "", line], timeout=5)
-            else:
-                hit = self._herdr_pane_for(task)
-                if not hit:
-                    return  # herdr missing or no pane for the lane
-                _agent, pane = hit
-                subprocess.run(["herdr", "agent", "prompt", str(pane), line], timeout=30)
+            argv = [sys.executable, fake, "prompt", pane, line] if fake else ["herdr", "agent", "prompt", pane, line]
+            if not fake and shutil.which("herdr") is None:
+                return False
+            if subprocess.run(argv, timeout=5).returncode != 0:
+                return False
         except (OSError, subprocess.TimeoutExpired, ValueError):
-            return
-        finally:
-            # Mark typed. A second event would re-ring on replay, so the typed
-            # bit is a sibling row kind=ring-typed that restart treats as done.
-            store.store_append_event(
-                msg["run"], task=None, kind="ring-typed",
-                from_id="bus", to_id=msg.get("to"), reply_to=str(msg["id"]), text=str(eid or ""),
-                meta={"typed": True, "msg": msg["id"]},
-            )
+            return False
+        store.store_append_event(
+            msg["run"], task=None, kind="ring-typed",
+            from_id="bus", to_id=msg.get("to"), reply_to=str(msg["id"]), text=str(eid or ""),
+            meta={"typed": True, "msg": msg["id"]},
+        )
+        return True
 
     def _ring_queue_path(self):
         return os.path.join(self.data_dir, "ring-queue.json")
@@ -1039,8 +1170,10 @@ class BusState:
         """
         if not self.use_store:
             return
+        with self._ring_lock:
+            snapshot = list(self._ring_queue)
         try:
-            write_json(self._ring_queue_path(), self._ring_queue, mode=0o600)
+            write_json(self._ring_queue_path(), snapshot, mode=0o600)
         except OSError as e:
             sys.stderr.write("ring queue save failed: %r\n" % (e,))
 
@@ -1052,14 +1185,19 @@ class BusState:
             self._ring_queue = [m for m in saved if isinstance(m, dict) and m.get("id")]
 
     def restore_rings(self):
-        """On startup: a recorded-but-untyped ring is typed once; a typed one never again."""
+        """On startup: a recorded-but-untyped ring is queued (never typed here); a typed one never again.
+
+        The idle check stays in _drain_rings, so a ring recorded just before a
+        crash is not typed into an agent that is working now.
+        """
         if not self.use_store:
             return
         rows = self.store.store_select(
-            "SELECT id, run, kind, to_id, reply_to, text, meta_json FROM events WHERE kind IN ('ring','ring-typed') ORDER BY id",
+            "SELECT id, run, kind, to_id, reply_to, text, meta_json FROM events"
+            " WHERE kind IN ('ring','ring-typed','ring-failed') ORDER BY id",
             (),
         )
-        typed = set()
+        done = set()
         pending = []
         for row in rows:
             meta = {}
@@ -1068,32 +1206,35 @@ class BusState:
                     meta = json.loads(row["meta_json"])
                 except (TypeError, ValueError):
                     meta = {}
-            mid = row.get("reply_to") or (meta or {}).get("msg")
-            if row.get("kind") == "ring-typed":
-                typed.add(mid)
-            elif mid:
+            if not isinstance(meta, dict):
+                meta = {}
+            mid = row.get("reply_to") or meta.get("msg")
+            if row.get("kind") == "ring-typed" or (row.get("kind") == "ring-failed" and meta.get("final")):
+                done.add(mid)
+            elif row.get("kind") == "ring" and mid:
                 pending.append((mid, row))
         for mid, row in pending:
             self.rung.add(mid)
-            if mid in typed:
+            if mid in done:
                 continue
-            msg = {"id": mid, "run": row.get("run"), "to": row.get("to_id"), "project": self.project}
-            try:
-                self._type_ring(msg, row.get("text") or "", row.get("id"), self.store)
-            except Exception as e:
-                sys.stderr.write("ring restore failed: %r\n" % (e,))
-        # A restart does not drain rings queued by the previous process: that
-        # queue is not durable. Only an untyped ring event is finished.
-        self._ring_queue = []
+            self.rung.discard(mid)
+            self._ring_enqueue({
+                "id": mid, "run": row.get("run"), "to": row.get("to_id"),
+                "project": self.project, "_ring_eid": row.get("id"),
+            })
 
     def ring_worker(self, stop_event):
-        """Drain the doorbell queue on a fixed interval and when a lane goes idle.
+        """Run every herdr call: drain the doorbell queue when woken and on a fixed interval.
 
-        _drain_rings also runs when a message arrives. This worker is what
-        delivers a ring that was queued while the lane was working, after the
-        lane becomes idle and no further message shows up.
+        _maybe_ring only queues and wakes this thread. The interval delivers a
+        ring that was queued while the lane was working, after the lane
+        becomes idle and no further message shows up.
         """
-        while not stop_event.wait(self.ring_interval):
+        while not stop_event.is_set():
+            self._ring_wake.wait(self.ring_interval)
+            self._ring_wake.clear()
+            if stop_event.is_set():
+                break
             try:
                 self._drain_rings()
             except Exception as e:
@@ -1389,7 +1530,14 @@ class RequestHandler(BaseHTTPRequestHandler):
                 # Disable socket timeout for long-lived SSE stream
                 self.request.settimeout(None)
 
-                if params.get("run") and not is_valid_id(params["run"]):
+                # `run=*` is the orchestrator's "every run of my project" stream
+                # (watch without --run). Store mode only: event ids are project-wide
+                # there, so one Last-Event-ID covers all runs.
+                all_runs = is_orch and params.get("run") == "*"
+                if all_runs and not self.server.bus_state.use_store:
+                    self.send_error_json(400, "run * needs the project store")
+                    return
+                if params.get("run") and not all_runs and not is_valid_id(params["run"]):
                     self.send_error_json(400, "invalid run id")
                     return
                 if params.get("lane") and params["lane"] != "*" and not is_valid_id(params["lane"]):
@@ -1412,14 +1560,14 @@ class RequestHandler(BaseHTTPRequestHandler):
                         self.send_error_json(403, "forbidden: run mismatch")
                         return
 
-                if not is_valid_id(run):
+                if not all_runs and not is_valid_id(run):
                     self.send_error_json(400, "invalid run id")
                     return
 
                 ctx = self.resolve_ctx(tok, params.get("project"))
                 if ctx is None:
                     return
-                _project, project_dir, _store = ctx
+                _project, project_dir, store = ctx
 
                 last_id_str = self.headers.get("Last-Event-ID", "").strip()
                 if last_id_str.startswith("m-"):
@@ -1439,24 +1587,34 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.send_header("X-Accel-Buffering", "no")
                 self.end_headers()
 
-                rstate = self.server.bus_state.get_run_state(run, project_dir)
+                bus = self.server.bus_state
+                if all_runs:
+                    cond = bus.any_cond
+                else:
+                    rstate = bus.get_run_state(run, project_dir)
+                    cond = rstate["cond"]
+
+                def fresh(last):
+                    """Messages after `last` for the lane, oldest first; holds `cond`'s lock."""
+                    if all_runs:
+                        states = [bus.get_run_state(r["id"], project_dir) for r in store.store_select("SELECT id FROM runs")]
+                    else:
+                        states = [rstate]
+                    got = [m for st in states for m in st["messages"] if m["seq"] > last and matches_lane(m, lane)]
+                    got.sort(key=lambda m: m["seq"])
+                    return got
 
                 while True:
                     to_send = []
-                    with rstate["cond"]:
-                        for m in rstate["messages"]:
-                            if m["seq"] > last_seq and matches_lane(m, lane):
+                    with cond:
+                        for attempt in (0, 1):
+                            for m in fresh(last_seq):
                                 to_send.append(dict(m))
                                 m["ack_level"] = max(m.get("ack_level", 1), 2)
                                 last_seq = m["seq"]
-
-                        if not to_send:
-                            rstate["cond"].wait(timeout=15.0)
-                            for m in rstate["messages"]:
-                                if m["seq"] > last_seq and matches_lane(m, lane):
-                                    to_send.append(dict(m))
-                                    m["ack_level"] = max(m.get("ack_level", 1), 2)
-                                    last_seq = m["seq"]
+                            if to_send or attempt:
+                                break
+                            cond.wait(timeout=15.0)
 
                     # The lock is released before the socket write. A slow SSE
                     # client must not hold the run lock or a store connection.
@@ -2496,18 +2654,15 @@ def _store_run_messages(data_dir, run):
     that run while the store holds the messages and no bus.jsonl exists.
     Returns [] when the dir is not a registered project (file mode).
     """
-    try:
-        store = StoreAdapter(data_dir)
-        rows = store.store_select(
-            "SELECT id, run, task, t, kind, from_id, to_id, reply_to, text, artifact_id, meta_json"
-            " FROM events WHERE chan=? AND run=? ORDER BY id",
-            ("bus", run),
-        )
-        ack_rows = store.store_select(
-            "SELECT msg, lane, level FROM acks WHERE run=?", (run,)
-        )
-    except Exception:
-        return []
+    store = StoreAdapter(data_dir)
+    rows = store.store_select(
+        "SELECT id, run, task, t, kind, from_id, to_id, reply_to, text, artifact_id, meta_json"
+        " FROM events WHERE chan=? AND run=? ORDER BY id",
+        ("bus", run),
+    )
+    ack_rows = store.store_select(
+        "SELECT msg, lane, level FROM acks WHERE run=?", (run,)
+    )
     ack_of = {}
     for a in ack_rows:
         try:
@@ -2547,6 +2702,19 @@ def _store_run_messages(data_dir, run):
     return messages
 
 
+def _known_runs(data_dir):
+    """Run ids from `<data>/runs/<run>` directories and, in store mode, the project store."""
+    runs_dir = os.path.join(data_dir, "runs")
+    runs = []
+    if os.path.isdir(runs_dir):
+        runs = [d for d in sorted(os.listdir(runs_dir)) if os.path.isdir(os.path.join(runs_dir, d)) and is_valid_id(d)]
+    if store_mode(data_dir):
+        for r in StoreAdapter(data_dir).store_select("SELECT id FROM runs"):
+            if is_valid_id(r.get("id")) and r["id"] not in runs:
+                runs.append(r["id"])
+    return runs
+
+
 def _read_run_messages(data_dir, run):
     """Every message of one run: the project store in store mode, else bus.jsonl.
 
@@ -2582,21 +2750,10 @@ def cmd_answer(args):
     data_dir = resolve_data(getattr(args, "data", None))
     port, token = _get_client_conn(data_dir)
 
-    runs_dir = os.path.join(data_dir, "runs")
     target_run = getattr(args, "run", None)
     if target_run and not is_valid_id(target_run):
         raise Fail("invalid run id")
-    runs_to_search = [target_run] if target_run else []
-    if not target_run and os.path.exists(runs_dir):
-        runs_to_search = [d for d in os.listdir(runs_dir) if os.path.isdir(os.path.join(runs_dir, d)) and is_valid_id(d)]
-    if not target_run and not runs_to_search and store_mode(data_dir):
-        # Store mode: `<data>/runs/<run>` may not exist on disk at all, so the
-        # run list comes from the project store (SELECT only).
-        try:
-            store_rows = StoreAdapter(data_dir).store_select("SELECT id FROM runs")
-            runs_to_search = [r["id"] for r in store_rows if is_valid_id(r.get("id"))]
-        except Exception:
-            runs_to_search = []
+    runs_to_search = [target_run] if target_run else _known_runs(data_dir)
 
     # Message ids are per run ("m-1" exists in every run), so without --run
     # the id can match in several runs. Collect every match instead of
@@ -2705,20 +2862,9 @@ def cmd_tail(args):
     data_dir = resolve_data(getattr(args, "data", None))
     run = getattr(args, "run", None)
     if not run:
-        runs_dir = os.path.join(data_dir, "runs")
-        if os.path.exists(runs_dir):
-            runs = [d for d in os.listdir(runs_dir) if os.path.isdir(os.path.join(runs_dir, d)) and is_valid_id(d)]
-            if len(runs) == 1:
-                run = runs[0]
-        if not run and store_mode(data_dir):
-            # Store mode: the run may exist only in mk.db (todo 68a).
-            try:
-                store_rows = StoreAdapter(data_dir).store_select("SELECT id FROM runs")
-                runs = [r["id"] for r in store_rows if is_valid_id(r.get("id"))]
-            except Exception:
-                runs = []
-            if len(runs) == 1:
-                run = runs[0]
+        runs = _known_runs(data_dir)
+        if len(runs) == 1:
+            run = runs[0]
     if not run or not is_valid_id(run):
         raise Fail("missing or invalid --run")
 
@@ -2746,9 +2892,10 @@ def _watch_line(m):
     The text is untrusted quoted data (C13a): collapsed to one line and cut to
     200 characters so a pasted brief cannot break the stream or flood the pane.
     """
-    text = re.sub(r"\s+", " ", str(m.get("text") or "")).strip()[:200]
+    text = re.sub(r"\s+", " ", str(m.get("text") or "")).strip()
+    text = re.sub(r"[\x00-\x1f\x7f]", "", text)[:200]
     return "MSG %s %s %s %s %s->%s: %s" % (
-        m.get("id", ""), m.get("run", ""), m.get("task", ""), m.get("kind", ""),
+        m.get("id", ""), m.get("run", ""), m.get("task") or "-", m.get("kind", ""),
         m.get("from", ""), m.get("to", ""), text,
     )
 
@@ -2772,6 +2919,8 @@ def cmd_watch(args):
     main session as a notification. After a drop or a bus RESTART it resumes
     with Last-Event-ID and re-reads bus.json for the new port. Exit 4 only
     when the bus stays down for WATCH_DOWN_SEC (60 s), never on one blip.
+    Without --run it streams every run of the project (`run=*`). A 4xx from
+    the bus prints the error on one line and exits 5, as ask/wait/inbox do.
     """
     data_dir = resolve_data(getattr(args, "data", None))
     run = getattr(args, "run", "") or ""
@@ -2807,9 +2956,7 @@ def cmd_watch(args):
             continue
 
         try:
-            qs = urllib.parse.urlencode({"lane": "*"})
-            if run:
-                qs += "&run=" + urllib.parse.quote(run)
+            qs = urllib.parse.urlencode({"lane": "*", "run": run or "*"})
             req = urllib.request.Request(
                 f"http://127.0.0.1:{port}/events?{qs}",
                 headers={
@@ -2847,6 +2994,15 @@ def cmd_watch(args):
                         printed += 1
                         if max_messages and printed >= max_messages:
                             return 0
+        except urllib.error.HTTPError as e:
+            if 400 <= e.code < 500:
+                # The bus is up and refused the request: retrying cannot help.
+                try:
+                    reason = json.loads(e.read().decode("utf-8")).get("error", "")
+                except Exception:
+                    reason = e.reason
+                sys.stderr.write("HTTP %d: %s\n" % (e.code, re.sub(r"\s+", " ", str(reason))))
+                return 5
         except (urllib.error.URLError, ConnectionError, ConnectionRefusedError,
                 TimeoutError, socket.timeout, OSError, ValueError):
             # A drop or a restart: resume from last_seq, re-reading bus.json
@@ -2975,6 +3131,11 @@ def _store_self_test_body(mod):
 
     tmp = tempfile.mkdtemp(prefix="mk-bus-store-")
     pids = []
+    # The real herdr is never called from a test: drop every PATH dir that holds one.
+    # Ring cases put their own fake `herdr` first.
+    orig_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = os.pathsep.join(
+        d for d in orig_path.split(os.pathsep) if not os.path.exists(os.path.join(d, "herdr")))
 
     def post(port, token, body, timeout=10.0):
         req = urllib.request.Request(
@@ -3002,7 +3163,9 @@ def _store_self_test_body(mod):
         return spawn(data_dir, run, prefer)
 
     def spawn(data_dir, run, prefer=None):
-        argv = [sys.executable, os.path.abspath(__file__), "serve", "--data", data_dir, "--run", run]
+        argv = [sys.executable, os.path.abspath(__file__), "serve", "--data", data_dir]
+        if run:
+            argv += ["--run", run]
         if prefer:
             argv += ["--prefer-port", str(prefer)]
         proc = subprocess.Popen(
@@ -3834,12 +3997,15 @@ def _store_self_test_body(mod):
             fh.write("import json, os, sys\n")
             fh.write("log = os.environ['MK_BUS_E2_HERDR_LOG']\n")
             fh.write("cmd = ' '.join(sys.argv[1:3])\n")
+            fh.write("import time\n")
             fh.write("with open(log, 'a') as f:\n")
             fh.write("    f.write(cmd + ' ' + ' '.join(sys.argv[3:]) + chr(10))\n")
             fh.write("if cmd == 'agent list':\n")
+            fh.write("    if os.path.exists(log + '.sleep'):\n")
+            fh.write("        time.sleep(float(open(log + '.sleep').read()))\n")
             fh.write("    sys.stdout.write(open(os.environ['MK_BUS_E2_HERDR_JSON']).read())\n")
             fh.write("    sys.exit(0)\n")
-            fh.write("sys.exit(0)\n")
+            fh.write("sys.exit(1 if os.path.exists(log + '.promptfail') else 0)\n")
         os.chmod(herdr_bin, 0o755)
         os.environ["MK_BUS_E2_HERDR_LOG"] = calls_log
         os.environ["MK_BUS_E2_HERDR_JSON"] = agents_json
@@ -3901,6 +4067,175 @@ def _store_self_test_body(mod):
         while time.time() < deadline and len(prompt_calls()) <= before_busy:
             time.sleep(0.2)
         assert len(prompt_calls()) == before_busy + 1, prompt_calls()
+
+        # ============ E2 R3: ring on the worker, claimed once, one pane, no real herdr ============
+        def ag(pane, status, name, cwd):
+            return {"pane_id": pane, "agent_status": status, "name": name, "cwd": cwd}
+
+        def set_agents(*agents):
+            with open(agents_json, "w") as fh:
+                json.dump({"result": {"agents": list(agents)}}, fh)
+
+        def list_calls():
+            return [c for c in herdr_calls() if c.startswith("agent list")]
+
+        def wait_prompts(n, secs=15.0):
+            deadline = time.time() + secs
+            while time.time() < deadline and len(prompt_calls()) < n:
+                time.sleep(0.1)
+
+        def send_to(text, to="T9"):
+            return post(port2, btok, {"run": "r1", "task": "T9", "kind": "nudge", "text": text,
+                                      "from": "orch", "to": to, "project": "proj"})
+
+        p2 = ag("wE:p2", "idle", "e2-t9-build-r1", lane_e2)
+        sleep_file = calls_log + ".sleep"
+
+        # A blocked agent is not rung (only idle is) and the message is not kept.
+        set_agents(dict(p2, agent_status="blocked"))
+        n0 = len(prompt_calls())
+        assert send_to("blocked lane")[0] == 200
+        time.sleep(0.8)
+        assert len(prompt_calls()) == n0, prompt_calls()
+
+        # (2) A herdr that hangs for 20 s must not hold /send; (1) two concurrent
+        # sends plus the ticks type each message exactly once.
+        set_agents(p2)
+        n0 = len(prompt_calls())
+        with open(sleep_file, "w") as fh:
+            fh.write("20")
+        t0 = time.time()
+        code, _slow = send_to("slow herdr")
+        assert code == 200, (code, _slow)
+        assert time.time() - t0 < 1.0, "/send waited on herdr: %.2fs" % (time.time() - t0)
+        os.remove(sleep_file)
+        senders = [threading.Thread(target=send_to, args=("concurrent %d" % i,)) for i in range(2)]
+        for th in senders:
+            th.start()
+        for th in senders:
+            th.join()
+        wait_prompts(n0 + 3)
+        time.sleep(1.0)
+        assert len(prompt_calls()) == n0 + 3, ("each message typed exactly once", prompt_calls()[n0:])
+
+        # (3) Two panes in the lane cwd: no guess, one ring-skipped note, no prompt.
+        p3 = ag("wE:p3", "idle", "rev", lane_e2)
+        set_agents(p3, p2)
+        n0 = len(prompt_calls())
+        skipped0 = event_count("ring-skipped")
+        assert send_to("two panes")[0] == 200
+        time.sleep(1.0)
+        assert len(prompt_calls()) == n0, prompt_calls()[n0:]
+        assert event_count("ring-skipped") == skipped0 + 1, event_count("ring-skipped")
+        # The pane recorded in the lane's watch file decides; the queued message rings.
+        watch_file = os.path.join(lane_e2, ".matrixkoder-watch.json")
+        write_json(watch_file, {"pane": "wE:p2"})
+        wait_prompts(n0 + 1)
+        time.sleep(0.6)
+        assert len(prompt_calls()) == n0 + 1, prompt_calls()[n0:]
+        assert prompt_calls()[-1].startswith("agent prompt wE:p2 "), prompt_calls()[-1]
+        # The armed agent's name beats the recorded pane.
+        write_json(watch_file, {"pane": "wE:p2", "agent": "rev"})
+        assert send_to("armed name")[0] == 200
+        wait_prompts(n0 + 2)
+        time.sleep(0.6)
+        assert len(prompt_calls()) == n0 + 2, prompt_calls()[n0:]
+        assert prompt_calls()[-1].startswith("agent prompt wE:p3 "), prompt_calls()[-1]
+        os.remove(watch_file)
+
+        # (4) The same task id in another run owns another pane; it is never rung.
+        lane_r2 = os.path.join(tmp, "lane-r2")
+        os.makedirs(lane_r2, exist_ok=True)
+        other_tok = secrets.token_urlsafe(32)
+        tokens_path = os.path.join(home, "bus-tokens.json")
+        toks = read_json(tokens_path, default={})
+        toks[other_tok] = {"token": other_tok, "role": "lane", "run": "r2", "task": "T9",
+                           "lane": lane_r2, "project": "proj", "created_at": now_iso()}
+        write_json(tokens_path, toks, mode=0o600)
+        set_agents(ag("wE:p9", "idle", "r2-t9", lane_r2), p2)
+        n0 = len(prompt_calls())
+        assert send_to("same task, other run")[0] == 200
+        wait_prompts(n0 + 1)
+        time.sleep(0.6)
+        assert [c.split(" ")[2] for c in prompt_calls()[n0:]] == ["wE:p2"], prompt_calls()[n0:]
+
+        # (6) Six queued messages for a working lane cost one `agent list` per
+        # tick (the old drain spawned one per message per tick), then ring once each.
+        set_agents(dict(p2, agent_status="working"))
+        l0 = len(list_calls())
+        n0 = len(prompt_calls())
+        for i in range(6):
+            assert send_to("queued %d" % i)[0] == 200
+        time.sleep(1.2)
+        used = len(list_calls()) - l0
+        assert used <= 14, ("list calls for 6 queued messages", used)
+        assert len(prompt_calls()) == n0
+        set_agents(p2)
+        wait_prompts(n0 + 6)
+        time.sleep(0.6)
+        assert len(prompt_calls()) == n0 + 6, prompt_calls()[n0:]
+
+        # (6) The queue holds 100 rows: the oldest are dropped, one note each.
+        set_agents(ag("wE:p8", "working", "T8", "/x/T8"), p2)
+        dropped0 = event_count("ring-dropped")
+        for i in range(105):
+            assert send_to("cap %d" % i, to="T8")[0] == 200
+        deadline = time.time() + 15.0
+        while time.time() < deadline and event_count("ring-dropped") < dropped0 + 5:
+            time.sleep(0.1)
+        time.sleep(0.6)
+        assert event_count("ring-dropped") == dropped0 + 5, event_count("ring-dropped") - dropped0
+        assert len(read_json(os.path.join(home, "ring-queue.json"), default=[])) == 100
+        set_agents(p2)  # T8 has no pane any more: the queue is dropped, nothing is typed
+        n0 = len(prompt_calls())
+        time.sleep(0.8)
+        assert len(prompt_calls()) == n0
+        assert read_json(os.path.join(home, "ring-queue.json"), default=[]) == []
+
+        # (9) A failing `herdr agent prompt` is ring-failed, retried once, then given up;
+        # it is never ring-typed.
+        with open(calls_log + ".promptfail", "w") as fh:
+            fh.write("1")
+        n0, failed0, typed0, ring0 = len(prompt_calls()), event_count("ring-failed"), event_count("ring-typed"), event_count("ring")
+        assert send_to("prompt fails")[0] == 200
+        time.sleep(1.5)
+        os.remove(calls_log + ".promptfail")
+        assert len(prompt_calls()) == n0 + 2, prompt_calls()[n0:]
+        assert event_count("ring-failed") == failed0 + 2
+        assert event_count("ring-typed") == typed0
+        assert event_count("ring") == ring0 + 1
+        # A pane id that reads as an option is refused before herdr is called.
+        assert BusState._type_ring(None, {"run": "r1", "id": "m-0"}, "line", 1, None, "-x") is False
+
+        # (5) A ring recorded but not typed (bus killed in between) is queued on restart,
+        # not typed into an agent that is working now; it rings once the agent is idle.
+        kill(pid2)
+        os.environ["MK_BUS_RING_KILL"] = os.path.join(tmp, "kill-seam-r3")
+        os.environ["MK_BUS_RING_INTERVAL_SEC"] = "0.2"
+        pid2, port2 = spawn(data, "r1")
+        os.environ.pop("MK_BUS_RING_KILL", None)
+        btok = remint()
+        set_agents(p2)
+        n0 = len(prompt_calls())
+        try:
+            send_to("die before typing")
+        except Exception:
+            pass
+        deadline = time.time() + 8.0
+        while time.time() < deadline and is_pid_alive(pid2):
+            time.sleep(0.1)
+        assert not is_pid_alive(pid2), "ring-kill seam did not exit"
+        assert len(prompt_calls()) == n0, prompt_calls()[n0:]
+        set_agents(dict(p2, agent_status="working"))
+        pid2, port2 = spawn(data, "r1")
+        btok = remint()
+        time.sleep(1.0)
+        assert len(prompt_calls()) == n0, ("restore typed into a working agent", prompt_calls()[n0:])
+        set_agents(p2)
+        wait_prompts(n0 + 1)
+        time.sleep(0.6)
+        assert len(prompt_calls()) == n0 + 1, prompt_calls()[n0:]
+        os.environ.pop("MK_BUS_RING_INTERVAL_SEC", None)
 
         # herdr missing entirely: no ring, no crash, the bus still serves.
         os.environ["PATH"] = os.path.join(tmp, "emptybin")
@@ -4010,6 +4345,102 @@ def _store_self_test_body(mod):
         assert len(noisy_line.split(": ", 1)[1]) <= 200, len(noisy_line)
         assert noisy_line.endswith("y"), noisy_line[-40:]
 
+        # E2 R3: _watch_line drops control characters and prints "-" for a null task.
+        ctl_line = _watch_line({"id": "m-1", "run": "r1", "task": None, "kind": "info",
+                                "from": "a", "to": "b", "text": "x\x1b[31mred\x00\x07 end"})
+        assert not re.search(r"[\x00-\x1f\x7f]", ctl_line), repr(ctl_line)
+        assert ctl_line.startswith("MSG m-1 r1 - info a->b: "), ctl_line
+
+        # E2 R3: store reads are real read-only opens. A write is refused, a missing
+        # store is empty, and a store that cannot be read is an error, not [].
+        ro = StoreAdapter(data)
+        assert ro.store_select("SELECT id FROM runs ORDER BY id")[0]["id"] == "r1"
+        try:
+            ro.store_select("CREATE TABLE ro_must_fail(a)")
+            raise AssertionError("store_select wrote to the store")
+        except Fail:
+            pass
+        empty_dir = os.path.join(tmp, "no-store")
+        os.makedirs(empty_dir)
+        assert StoreAdapter(empty_dir).store_select("SELECT 1") == []
+        assert not os.path.exists(os.path.join(empty_dir, "mk.db"))
+        broken_dir = os.path.join(tmp, "broken-store")
+        os.makedirs(broken_dir)
+        with open(os.path.join(broken_dir, "mk.db"), "w") as fh:
+            fh.write("this is not a database")
+        try:
+            StoreAdapter(broken_dir).store_select("SELECT 1")
+            raise AssertionError("an unreadable store returned rows")
+        except Fail:
+            pass
+        # answer/tail run lookup: runs/<x> directories no longer hide the store's runs.
+        os.makedirs(os.path.join(data, "runs", "rdisk"), exist_ok=True)
+        assert {"rdisk", "r1"} <= set(_known_runs(data)), _known_runs(data)
+
+        # E2 R3 (7): a bus started WITHOUT --run; `watch` without --run streams every run.
+        mod.import_history(data, None, "r2", run_row={"id": "r2", "status": "active"}, data_dir=data)
+        con = mod.open_project(data, data_dir=data)
+        try:
+            mod.add_task(con, "r2", "T9", "task", title="second run")
+        finally:
+            con.close()
+        kill(pid2)
+        pid2, port2 = spawn(data, None)
+        orch_nr = mint_orch(data)
+        code, base_nr = post(port2, orch_nr, {"run": "r1", "task": "T9", "kind": "info",
+                                              "text": "no-run baseline", "from": "orch", "to": "T9"})
+        assert code == 200, (code, base_nr)
+        watch_nr = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "watch", "--data", data,
+             "--task", "T9", "--max-messages", "2", "--after", base_nr["message"]["id"]],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
+        )
+        pids.append(watch_nr.pid)
+        try:
+            for run_nr in ("r1", "r2"):
+                code, sent_nr = post(port2, orch_nr, {"run": run_nr, "task": "T9", "kind": "info",
+                                                      "text": "from " + run_nr, "from": "orch", "to": "T9"})
+                assert code == 200, (code, sent_nr)
+            out_nr, err_nr = watch_nr.communicate(timeout=20)
+        finally:
+            if watch_nr.poll() is None:
+                stop_process(watch_nr.pid)
+                watch_nr.wait(timeout=10)
+        assert watch_nr.returncode == 0, (watch_nr.returncode, err_nr)
+        runs_nr = sorted(ln.split()[2] for ln in out_nr.splitlines())
+        assert runs_nr == ["r1", "r2"], out_nr
+
+        # E2 R3 (7): a 4xx from /events is not "bus down": one error line and exit 5, at once.
+        from http.server import HTTPServer
+
+        class Refuse(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = json.dumps({"ok": False, "error": "invalid run id"}).encode()
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        refuser = HTTPServer(("127.0.0.1", 0), Refuse)
+        threading.Thread(target=refuser.serve_forever, daemon=True).start()
+        fake_home = os.path.join(tmp, "fake-bus-home")
+        os.makedirs(fake_home)
+        write_json(os.path.join(fake_home, "bus.json"), {"port": refuser.server_address[1], "token": "t" * 20}, mode=0o600)
+        t0 = time.time()
+        rc_4xx = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "watch", "--data", data],
+            env=dict(os.environ, MK_BUS_DIR=fake_home),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20,
+        )
+        refuser.shutdown()
+        assert rc_4xx.returncode == 5, (rc_4xx.returncode, rc_4xx.stderr)
+        assert rc_4xx.stderr.strip() == "HTTP 400: invalid run id", rc_4xx.stderr
+        assert rc_4xx.stdout == "" and time.time() - t0 < 10.0
+
         os.environ.pop("MK_BUS_E2_HERDR_LOG", None)
         os.environ.pop("MK_BUS_E2_HERDR_JSON", None)
 
@@ -4028,6 +4459,7 @@ def _store_self_test_body(mod):
 
         kill(pid2)
     finally:
+        os.environ["PATH"] = orig_path
         for p in pids:
             stop_process(p)
         shutil.rmtree(tmp, ignore_errors=True)
@@ -5341,7 +5773,9 @@ def main():
         }
         fn = dispatch.get(args.cmd)
         if fn:
-            fn(args)
+            rc = fn(args)
+            if isinstance(rc, int) and not isinstance(rc, bool) and rc:
+                sys.exit(rc)  # watch: 4 bus down, 5 refused
         else:
             raise Fail(f"unknown command {args.cmd}")
     except Fail as f:
