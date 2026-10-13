@@ -1163,11 +1163,16 @@ def import_file(path, data, home, dry_run=False):
         if not dry_run:
             db._begin(con)
             try:
+                cols = new_plan_columns(header, out)
                 write_plan_row(con, plan_id, dict(
                     version=version, title=title, header_json=header_json, body_md=body_md,
-                    **new_plan_columns(header, out)),
-                    # a re-import must not move the plan's version or stamp it as approved again
-                    update=["title", "header_json", "body_md"])
+                    **cols),
+                    # a re-import must not move the plan's version or stamp it as approved again;
+                    # status stays the store's once set (after import the store is the source)
+                    update=["title", "header_json", "body_md", "created", "design", "integration"])
+                if row and "status" in plan_columns(con):
+                    con.execute("UPDATE plans SET status=? WHERE id=? AND status IS NULL",
+                                (cols["status"], plan_id))
                 con.execute("COMMIT")
             except Exception:
                 con.execute("ROLLBACK")
