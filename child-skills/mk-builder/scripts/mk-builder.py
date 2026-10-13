@@ -2040,14 +2040,15 @@ def page_slice(text, part, size=BRIEF_PAGE):
 
 def connect_identity(cfg):
     """The round arm recorded in the lane token file: run, task, round. Missing fields
-    are None. A token with no round is round 1 (file mode, before E2 writes the field)."""
+    are None. A token with no round, or the old E2 `round: 0`, is round 0 here: unarmed, and
+    implicit_start then reads the round off the newest brief, else 1."""
     if not cfg:
         return None, None, None
     run = cfg.get("run") if isinstance(cfg.get("run"), str) and cfg.get("run") else None
     task = cfg.get("task") if isinstance(cfg.get("task"), str) and cfg.get("task") else None
     raw = cfg.get("round")
     if raw is None or raw == "":
-        round_n = 1
+        round_n = 0
     else:
         try:
             round_n = int(raw)
@@ -2064,10 +2065,12 @@ def implicit_start(lane, cfg, brief=""):
     the brief names `round:<n>` and the token names a different round, refuse
     before writing the status file. Returns the live file."""
     run, task, round_n = connect_identity(cfg)
+    parsed = parse_brief_message(brief) if brief else None
+    if round_n == 0:  # unarmed token: the newest brief names the round, else it is round 1
+        round_n = parsed[0] if parsed else 1
     if not run or not task or not is_int(round_n) or round_n < 1:
         raise Fail("connect: no armed round in the lane token file "
                    "(need run, task, round); run `start` or re-arm the lane")
-    parsed = parse_brief_message(brief) if brief else None
     if parsed and parsed[0] != round_n:
         raise Fail(f"connect: token round {round_n} does not match the brief round {parsed[0]}; "
                    "re-arm the lane or pass the matching brief")
@@ -2269,9 +2272,9 @@ def post_status(lane, old, state, note):
     `completed` maps to `session.todo_done_status` (C9: verify|done). The mapped value is
     what is announced. A lane token cannot POST kind=status (the bus reserves that for the
     orchestrator token), so the announcement is a `task` message whose text is
-    `status <mapped>`; the store-mode bus maps the word (in_progress -> building, verify ->
-    verifying, done -> done) and moves the lane's own task (todo 67), and the reply says
-    whether it did. With the bus or the store absent nothing is sent (C12: the lane status
+    `status <mapped>`; the store-mode bus maps the word (in_progress -> building, verify and
+    done -> verifying: a lane never sets done) and moves the lane's own task only along the
+    builder path (todo 67); the reply says whether it did, or why it ignored the word. With the bus or the store absent nothing is sent (C12: the lane status
     file is the record)."""
     task, round_n = old.get("task"), old.get("round")
     cfg = bus_lane_config(lane)
@@ -2290,7 +2293,8 @@ def post_status(lane, old, state, note):
         return {"sent": False, "deduped": False, "state": state, "mapped": mapped,
                 "fallback": "bus-down"}
     return {"sent": True, "deduped": False, "state": state, "mapped": mapped, "note": note,
-            "state_updated": reply.get("state_updated"), "state_error": reply.get("mk_state_error")}
+            "state_updated": reply.get("state_updated"), "state_error": reply.get("mk_state_error"),
+            "state_ignored": reply.get("state_ignored")}
 
 
 def cmd_todo(a):
@@ -4080,7 +4084,7 @@ def t_d7_todo_backup_and_dedupe(root):
         return
     data = os.path.join(root, "d7todo-data")
     os.makedirs(data, exist_ok=True)
-    d7_store(data, BUS_RUN, "D7T")
+    mod = d7_store(data, BUS_RUN, "D7T")
     bus_server(root, "d7todo")
     lane = bus_lane(root, "d7_todo_lane", "D7T", data)
     begin(lane, root, run=BUS_RUN, task="D7T")
@@ -4108,11 +4112,12 @@ def t_d7_todo_backup_and_dedupe(root):
         status_now, entered)
     msgs = d7_task_msgs(data, "D7T")
     assert len(msgs) == 2 and msgs[1]["text"].startswith("status verify\nround: 1\n"), msgs
+    mod.transition(data, None, BUS_RUN, "D7T", "fix", data_dir=data)  # the fix round: the orchestrator sets fix
     begin(lane, root, run=BUS_RUN, task="D7T", round=2)
     cli(lane, "progress", "fix")
     code, lines = cli(lane, "todo", "in_progress", "D7.1", env={"MK_BUS_DATA": data})
     assert code == 0 and jline(lines)["sent"] is True and jline(lines)["deduped"] is False, lines
-    assert d7_task_state(data, BUS_RUN, "D7T") == ("building", {"building": 2, "verifying": 1})
+    assert d7_task_state(data, BUS_RUN, "D7T") == ("building", {"building": 2, "verifying": 1, "fix": 1})
     code, lines = cli(lane, "todo", "in_progress", "D7.1", env={"MK_BUS_DATA": data})
     assert jline(lines)["deduped"] is True, lines
     assert len(d7_task_msgs(data, "D7T")) == 3
@@ -4133,8 +4138,90 @@ def t_d7_todo_done_status_setting(root):
     cli(lane, "progress", "work")
     code, lines = cli(lane, "todo", "done", "D7.1", env={"MK_BUS_DATA": data})
     assert code == 0 and jline(lines)["mapped"] == "done", lines
+    # The setting picks the word the lane announces; the bus caps a lane at verifying (only the
+    # orchestrator sets done), and the first todo done also moves it out of planned.
+    assert jline(lines)["state_ignored"] is not None, lines  # planned -> verifying is not a builder move
+    assert d7_task_state(data, BUS_RUN, "D7S")[0] == "planned"
+    code, lines = cli(lane, "todo", "in_progress", "D7.0", env={"MK_BUS_DATA": data})
     assert jline(lines)["state_updated"] is True, lines
-    assert d7_task_state(data, BUS_RUN, "D7S")[0] == "done"
+    begin(lane, root, run=BUS_RUN, task="D7S", round=2)
+    cli(lane, "progress", "fix")
+    code, lines = cli(lane, "todo", "done", "D7.1", env={"MK_BUS_DATA": data})
+    assert code == 0 and jline(lines)["state_updated"] is True, lines
+    assert d7_task_state(data, BUS_RUN, "D7S")[0] == "verifying"
+
+
+def t_e8_late_todo_does_not_move_the_task(root):
+    """R2 HIGH: a lane may move its own task along the builder path only. After the
+    orchestrator set review / merged / done / blocked, a late `todo` changes nothing and the
+    reply says why; a lane `done` never sets done."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data = os.path.join(root, "e8late-data")
+    os.makedirs(data, exist_ok=True)
+    mod = d7_store(data, BUS_RUN, "E8L")
+    bus_server(root, "e8late")
+    lane = bus_lane(root, "e8_late_lane", "E8L", data)
+    begin(lane, root, run=BUS_RUN, task="E8L")
+    cli(lane, "progress", "work")
+    env = {"MK_BUS_DATA": data}
+    code, lines = cli(lane, "todo", "in_progress", "E8.1", env=env)
+    assert jline(lines)["state_updated"] is True and d7_task_state(data, BUS_RUN, "E8L")[0] == "building"
+    mod.transition(data, None, BUS_RUN, "E8L", "review", data_dir=data)  # the orchestrator moved on
+    begin(lane, root, run=BUS_RUN, task="E8L", round=2)  # a new round, so the dedupe key is new
+    cli(lane, "progress", "late")
+    fresh_round = 2
+    for status in ("review", "merged", "qa", "done", "blocked", "stalled", "quota", "provider"):
+        mod.transition(data, None, BUS_RUN, "E8L", status, data_dir=data)
+        for word in ("in_progress", "done"):
+            fresh_round += 1
+            begin(lane, root, run=BUS_RUN, task="E8L", round=fresh_round)  # fresh dedupe key every time
+            cli(lane, "progress", "late")
+            code, lines = cli(lane, "todo", word, "E8.2", env=env)
+            res = jline(lines)
+            assert code == 0 and res["state_updated"] is False and res["state_ignored"], (status, word, res)
+            assert d7_task_state(data, BUS_RUN, "E8L")[0] == status, (status, word)
+    # the allowed path moves once, and `done` from the lane is verifying, never done
+    mod.transition(data, None, BUS_RUN, "E8L", "fix", data_dir=data)
+    begin(lane, root, run=BUS_RUN, task="E8L", round=fresh_round + 1)
+    cli(lane, "progress", "fix")
+    code, lines = cli(lane, "todo", "in_progress", "E8.3", env=env)
+    assert jline(lines)["state_updated"] is True and d7_task_state(data, BUS_RUN, "E8L")[0] == "building", lines
+    code, lines = cli(lane, "todo", "done", "E8.3", env=env)
+    assert jline(lines)["state_updated"] is True, lines
+    status_now, entered = d7_task_state(data, BUS_RUN, "E8L")
+    assert status_now == "verifying" and entered.get("verifying") == 1, (status_now, entered)
+    code, lines = cli(lane, "todo", "done", "E8.3", env=env)
+    assert jline(lines)["deduped"] is True and d7_task_state(data, BUS_RUN, "E8L")[1] == entered, lines
+
+
+def t_e8_connect_unarmed_round(root):
+    """R2 MEDIUM: a token with no round, or the old `round: 0`, starts at the round of the
+    newest brief, else round 1. A token that names a round keeps it."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data = os.path.join(root, "e8round-data")
+    os.makedirs(data, exist_ok=True)
+    bus_server(root, "e8round")
+    for task, round_field, brief_round, want in (
+            ("E8A", "absent", None, 1), ("E8B", 0, None, 1), ("E8C", 0, 2, 2), ("E8D", "absent", 3, 3)):
+        lane = bus_lane(root, f"e8_round_{task}", task, data)
+        path = bus_token_path(lane)
+        with open(path) as f:
+            cfg = json.load(f)
+        assert "round" not in cfg, cfg  # mk-bus.py token without --round never writes 0
+        if round_field != "absent":
+            cfg["round"] = round_field  # the file an E2 token wrote
+        with open(path, "w") as f:
+            json.dump(cfg, f)
+        os.chmod(path, 0o600)
+        if brief_round:
+            bus_cli("send", "--data", data, "--run", BUS_RUN, "--task", task, "--kind", "info",
+                    "--from", "orch", "--to", task,
+                    "--text", f"round:{brief_round}\nkind:brief\n# brief r{brief_round}\nbody\n")
+        code, lines = cli(lane, "connect", env={"MK_BUS_DATA": data})
+        assert code == 0, (task, lines)
+        assert status(lane)["round"] == want and status(lane)["state"] == "started", (task, status(lane))
 
 
 def t_d7_hook_install_outside(root):
