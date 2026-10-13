@@ -787,6 +787,25 @@ def publish_brief(data, run, task):
     return err is None, err
 
 
+def publish_review_brief(data, run, task):
+    """Send the task's newest review-brief-rN.md to the lane as `round:<n>\nkind:review-brief\n<body>`
+    (its own kind: the builder's connect never picks it up). Same send rules as publish_brief."""
+    d = os.path.join(data, "runs", run, "tasks", task)
+    best, best_n = None, -1
+    for name in (os.listdir(d) if os.path.isdir(d) else []):
+        m = re.fullmatch(r"review-brief-r(\d+)\.md", name)
+        if m and int(m.group(1)) > best_n:
+            best, best_n = os.path.join(d, name), int(m.group(1))
+    if not best:
+        return False, "no review brief"
+    with open(best) as f:
+        body = f"round:{best_n}\nkind:review-brief\n{f.read()}"
+    kind = "task" if os.path.isfile(os.path.join(data, "mk.db")) else "info"
+    _j, err = run_bus(["send", "--data", data, "--run", run, "--task", task,
+                       "--kind", kind, "--from", "orch", "--to", task, "--text", body])
+    return err is None, err
+
+
 def alert_publish_failure(data, run, task, error):
     """A brief that did not reach the bus must not hide in the dispatch reply: post an info
     message to the orchestrator (the stage 6 watch shows it) and a run event (the board shows
@@ -930,6 +949,30 @@ def cmd_dispatch(a):
                     # the full prompt is kept; the reply says why the doorbell was not typed
                     a = list(a) + ["--publish-error", publish_error]
                     alert_publish_failure(wdata, wrun, wtask, publish_error)
+        if why:
+            legacy_note = f"legacy prompt: {why}"
+    elif opt(a, "--lane") and "--no-connect" not in a:
+        # review over the bus: the reviewer pane shares the builder's lane, so the lane's
+        # watch file names the run/task; the review brief goes as its own kind and the pane
+        # gets `connect --role review`. No --lane keeps the typed review prompt (old callers).
+        rlane = opt(a, "--lane")
+        w = read_watch(rlane) or {}
+        rdata, rrun, rtask = w.get("data") or "", w.get("run"), w.get("task")
+        why = None
+        if not (rdata and rrun and rtask):
+            why = f"no armed watch in {rlane}"
+        elif not bus_enabled(rdata):
+            why = "bus.enabled is false"
+        elif not bus_is_up(rdata):
+            why = "bus is down"
+        else:
+            ok, publish_error = publish_review_brief(rdata, rrun, rtask)
+            if ok:
+                text = connect_text(rlane, rdata) + " --role review"
+                connected = True
+            else:
+                why = f"publish failed: {publish_error}"
+                alert_publish_failure(rdata, rrun, rtask, publish_error or "no review brief")
         if why:
             legacy_note = f"legacy prompt: {why}"
 
@@ -2896,6 +2939,25 @@ def self_test():
             assert r["delivered"] is True and r["connect"] is False and "note" not in r, r
             assert prompt_calls()[n0:][-1].endswith("the full prompt stays --wait --timeout 25000"), \
                 prompt_calls()[n0:]
+            # review over the bus: --lane names the builder's armed lane; with no review brief the
+            # typed prompt stays and the failure is posted for the watch
+            open(os.path.join(tmp, "bus_log.txt"), "a").close()
+            n0, b0 = len(prompt_calls()), len(bus_calls())
+            r = cli("dispatch", "--pane", pane_of("NB"), "--text", "the full prompt stays", "--role", "review",
+                    "--lane", lanes["NB"])
+            assert r["delivered"] is True and r["connect"] is False, r
+            assert r["note"] == "legacy prompt: publish failed: no review brief", r
+            assert any("BRIEF NOT ON BUS" in c for c in bus_calls()[b0:]), bus_calls()[b0:]
+            # with a review brief it is published as its own kind and the pane gets connect --role review
+            open(os.path.join(_td, "review-brief-r1.md"), "w").write("# NB review brief\n")
+            n0, b0 = len(prompt_calls()), len(bus_calls())
+            r = cli("dispatch", "--pane", pane_of("NB"), "--text", "the full prompt stays", "--role", "review",
+                    "--lane", lanes["NB"])
+            assert r["delivered"] is True and r["connect"] is True and r.get("status_unchanged") is True, r
+            assert "kind:review-brief" in " ".join(bus_calls()[b0:]) and "NB review brief" in " ".join(bus_calls()[b0:]), bus_calls()[b0:]
+            assert "connect --data" in prompt_calls()[n0:][-1] and "--role review" in prompt_calls()[n0:][-1], \
+                prompt_calls()[n0:]
+            os.unlink(os.path.join(_td, "review-brief-r1.md"))
             # E3: the doorbell waits for idle. The pane starts working; the first pane list
             # says so, the second says idle. The typed line comes after the idle observation.
             open(os.path.join(tmp, "pane_list_q.txt"), "w").write("1 2")

@@ -2006,6 +2006,19 @@ def parse_brief_message(text):
     return n, rest[len("kind:brief\n"):]
 
 
+def parse_review_brief_message(text):
+    """A published review brief is `round:<n>\nkind:review-brief\n<body>`. -> (round, body) or None.
+    Its own kind, so a reviewer sharing the lane never picks up the builder's brief (or the reverse)."""
+    head, sep, rest = (text or "").partition("\n")
+    if not (sep and head.startswith("round:") and rest.startswith("kind:review-brief\n")):
+        return None
+    try:
+        n = int(head[6:].strip())
+    except ValueError:
+        return None
+    return n, rest[len("kind:review-brief\n"):]
+
+
 def brief_messages(cfg):
     """Every bus message for this lane's task, newest last. The store when it exists,
     else bus.jsonl. One read, so an inbox of earlier messages cannot eat the budget.
@@ -2173,6 +2186,18 @@ def cmd_connect(a):
     data = resolve_data_dir(cfg, getattr(a, "data", None))
     if data:
         os.environ["MK_BUS_DATA"] = data
+    if ROLE_ALIASES.get(getattr(a, "role", None) or "builder") == "reviewer":
+        # a reviewer reads its own review brief from the bus and leaves the builder's status alone.
+        # shortcut: printed whole, not paged — review briefs are a few KB; page it if one passes BRIEF_PAGE.
+        found = None
+        for text in brief_messages(cfg) if cfg else []:
+            found = parse_review_brief_message(text) or found
+        if not found:
+            print("# review brief: none found")
+            raise Handled(0)
+        print(f"# review brief round {found[0]}")
+        print(found[1])
+        raise Handled(0)
     old = read_status(lane)
     if old is None:
         # Data dir is already exported, so the brief peek can see the bus copy.
@@ -2517,6 +2542,7 @@ def build_parser():
     sp = lane_cmd("connect", cmd_connect, "print the brief (paged) and the phase task list [D7.1]")
     sp.add_argument("--plan", default=None, help="plan file; default $MK_PLAN")
     sp.add_argument("--data", default=None, help="project data dir (else $MK_BUS_DATA or the token file)")
+    sp.add_argument("--role", default="builder", help="builder | reviewer (alias: review): which brief to print")
     sp = lane_cmd("read", cmd_read, "print one page of a paged brief or message [D7.1]")
     sp.add_argument("msg_id")
     sp.add_argument("--part", type=int, default=1)
@@ -4203,6 +4229,19 @@ def t_d7b_connect_reads_the_bus_brief(root):
     begin(empty, root, run=BUS_RUN, task="D7E")
     code, lines = cli(empty, "connect")
     assert lines == ["# brief: none found"], (code, lines, brief_messages(bus_lane_config(empty)))
+    # a review brief is its own kind: the reviewer gets it, the builder's connect does not
+    code, lines = cli(lane, "connect", "--role", "review")
+    assert lines == ["# review brief: none found"], (code, lines)
+    rb = "round:1\nkind:review-brief\n# D7B review brief\nreview the thing\n"
+    code, res = bus_cli("send", "--data", data, "--run", BUS_RUN, "--task", "D7B",
+                        "--kind", "info", "--from", "orch", "--to", "D7B", "--text", rb)
+    assert code == 0 and res.get("ok"), res
+    code, lines = cli(lane, "connect", "--role", "review")
+    text = "\n".join(lines)
+    assert code == 0 and "# review brief round 1" in text and "review the thing" in text, (code, lines)
+    code, lines = cli(lane, "connect")
+    text = "\n".join(lines)
+    assert "round two brief" in text and "review the thing" not in text, text
 
 
 def t_g1_connect_posts_one_info(root):
