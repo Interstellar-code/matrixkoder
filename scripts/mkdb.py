@@ -4,6 +4,8 @@
   timeline --project P --run R --task T --json
   cards [--project P] --json
   projects --json
+  plans --project P|--data D [--json]          # every plan row (C5, C8)
+  plans --project P|--data D <id> --json       # one plan with its phases
   --self-test
 
 Common: --data DIR (the project data dir; until DM a project lives at <repo>/.matrixkoder/),
@@ -23,7 +25,7 @@ import argparse, contextlib, datetime, hashlib, json, multiprocessing, os, re, s
 
 sys.dont_write_bytecode = True
 
-SCHEMA = 3
+SCHEMA = 4
 ROOT_SCHEMA = 1  # open_root stamps v1 and never migrates the root store; project stores go to SCHEMA
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
 TYPES = ("phase", "task", "subtask")
@@ -56,7 +58,8 @@ CREATE TABLE IF NOT EXISTS schema_version(version INTEGER PRIMARY KEY);
 PROJECT_DDL = """
 CREATE TABLE IF NOT EXISTS plans(
   id TEXT PRIMARY KEY, version INTEGER, title TEXT, header_json TEXT, body_md TEXT,
-  approved_at TEXT, archived_path TEXT);
+  approved_at TEXT, archived_path TEXT, status TEXT, created TEXT, design TEXT,
+  integration TEXT);
 CREATE TABLE IF NOT EXISTS runs(
   id TEXT PRIMARY KEY, plan TEXT, plan_version INTEGER, branch TEXT, status TEXT, stage TEXT,
   next TEXT, started TEXT, ended TEXT);
@@ -362,11 +365,29 @@ def _v3(con):
             con.execute(f"ALTER TABLE lane_slots ADD COLUMN {name} TEXT")
 
 
+# plans columns added by D1 (C1): status, created, design (a JSON array as text), integration.
+PLAN_D1_COLS = ("status", "created", "design", "integration")
+
+
+def _v4(con):
+    """The shipped v4 step (D1.1, C1): plans gains status, created, design, integration.
+
+    Safe to run twice: each column is added only when table_info lacks it. Additive only —
+    no existing column or row changes; a fresh store reaches the same shape through PROJECT_DDL.
+    """
+    cols = [r["name"] for r in con.execute("PRAGMA table_info(plans)")]
+    if not cols:
+        return
+    for name in PLAN_D1_COLS:
+        if name not in cols:
+            con.execute(f"ALTER TABLE plans ADD COLUMN {name} TEXT")
+
+
 def open_project(home, slug=None, data_dir=None, version=SCHEMA, migrations=()):
     """Open or create the project store (C2). check_home runs before any directory is created."""
     path = os.path.join(project_dir(home, slug, data_dir), "mk.db")
     _selftest_write_guard(path)
-    con = _migrate(_connect(path), version, ((1, PROJECT_DDL), (2, _v2), (3, _v3)) + tuple(migrations))
+    con = _migrate(_connect(path), version, ((1, PROJECT_DDL), (2, _v2), (3, _v3), (4, _v4)) + tuple(migrations))
     _ensure_prev_status(con)
     _ensure_file_status(con)
     return con
@@ -1338,6 +1359,160 @@ def projects(home):
         root.close()
 
 
+def _runs_of(con, pid):
+    """The runs of plan pid, newest first (C5).
+
+    runs.plan holds the plan id on rows written after plan ids landed; older rows hold the
+    plan file path — '<repo>/.matrixkoder/plans/<id>.md' relative or absolute — so a path
+    whose leaf under a plans/ dir names the plan counts too. A plan id is a slug: no LIKE
+    metacharacters reach the pattern.
+    """
+    return con.execute(
+        "SELECT id, status FROM runs WHERE plan = ? OR plan = 'plans/' || ? || '.md'"
+        " OR plan LIKE '%/plans/' || ? || '.md' ORDER BY started DESC, rowid DESC",
+        (pid, pid, pid)).fetchall()
+
+
+def _hdr_of(row):
+    """The parsed header_json of a plans row, or {} when missing or not an object."""
+    try:
+        got = json.loads(row["header_json"] or "")
+    except (TypeError, ValueError):
+        return {}
+    return got if isinstance(got, dict) else {}
+
+
+def _design_of(row):
+    """The design column as a list. NULL or unparsable text is [] (the reply type is a list)."""
+    if not row["design"]:
+        return []
+    try:
+        got = json.loads(row["design"])
+    except (TypeError, ValueError):
+        return []
+    return got if isinstance(got, list) else []
+
+
+def _phases_from_run(rows, header):
+    """Phases with their tasks from one run's task rows, in row order (C5).
+
+    A phase row is a type='phase' row or any root (no parent): run init writes the plan's
+    phases as parentless task rows. Children of a phase are its tasks; deeper children
+    (type='subtask' or any row under a task) nest under their parent task as subtasks.
+    `wave` has no run column; it is cross-filled from header_json.phases by id.
+    """
+    hwave = {str(p.get("id")): p.get("wave") for p in header.get("phases") or []
+             if isinstance(p, dict) and p.get("id")}
+    ids = {r["id"] for r in rows}
+    phases, tasks, subs = {}, {}, {}
+    for r in rows:  # add_task and import insert a parent before its children, so one pass is safe
+        node = {"id": r["id"], "title": r["title"], "status": r["status"], "parent": r["parent"],
+                "type": r["type"], "round": r["round"], "verdict": r["verdict"], "subtasks": []}
+        if not r["parent"] or r["parent"] not in ids:
+            phases[r["id"]] = {"id": r["id"], "title": r["title"], "wave": hwave.get(r["id"]),
+                               "deps": _deps_of(r["deps"]), "status": r["status"], "tasks": []}
+        elif r["parent"] in phases:
+            tasks[r["id"]] = node
+            phases[r["parent"]]["tasks"].append(node)
+        else:
+            subs[r["id"]] = node
+    for r in rows:  # second pass: a subtask nests under its parent node, any depth
+        node = subs.get(r["id"])
+        if not node:
+            continue
+        parent = tasks.get(r["parent"]) or subs.get(r["parent"])
+        if parent:
+            parent["subtasks"].append(node)
+    return list(phases.values())
+
+
+def _phases_from_header(header):
+    """The same phase shape from header_json.phases, every status 'planned' (no run yet)."""
+    out = []
+    for ph in header.get("phases") or []:
+        if not isinstance(ph, dict):
+            continue
+        pid = str(ph.get("id", ""))
+        tasks = []
+        for t in ph.get("tasks") or []:
+            if not isinstance(t, dict):
+                continue
+            tid = str(t.get("id", ""))
+            task = {"id": tid, "title": t.get("title", ""), "status": "planned", "parent": pid,
+                    "type": "task", "round": None, "verdict": None,
+                    "subtasks": [{"id": str(s.get("id", "")), "title": s.get("title", ""),
+                                  "status": "planned", "parent": tid, "type": "subtask",
+                                  "round": None, "verdict": None, "subtasks": []}
+                                 for s in t.get("subtasks") or [] if isinstance(s, dict)]}
+            tasks.append(task)
+        out.append({"id": pid, "title": ph.get("title", ""), "wave": ph.get("wave"),
+                    "deps": list(ph.get("deps") or []), "status": "planned", "tasks": tasks})
+    return out
+
+
+def _plan_obj(con, row, detail=False):
+    """One plans row as the C8 reply object. status/created fall back to header_json when the
+    column is NULL (rows written before the v4 migration); design/integration have no fallback."""
+    header = _hdr_of(row)
+    obj = {
+        "id": row["id"],
+        "title": row["title"],
+        "status": row["status"] if row["status"] is not None else header.get("status"),
+        "created": row["created"] if row["created"] is not None else header.get("created"),
+        "design": _design_of(row),
+        "integration": row["integration"],
+        "version": row["version"],
+        "approved_at": row["approved_at"],
+    }
+    runs = _runs_of(con, row["id"])
+    obj["runs"] = [r["id"] for r in runs]
+    obj["live_run"] = next((r["id"] for r in runs if r["status"] == "active"), None)
+    counts = {}
+    phases = []
+    if runs:
+        newest = runs[0]["id"]
+        rows = con.execute(
+            "SELECT id, parent, type, title, status, deps, round, verdict FROM tasks"
+            " WHERE run=? ORDER BY rowid", (newest,)).fetchall()
+        ids = {r["id"] for r in rows}
+        roots = {r["id"] for r in rows if not r["parent"] or r["parent"] not in ids}
+        for r in rows:  # counts cover the run's tasks; phase-level (root) rows are not tasks
+            if r["id"] not in roots:
+                counts[r["status"]] = counts.get(r["status"], 0) + 1
+        if detail:
+            phases = _phases_from_run(rows, header)
+    elif detail:
+        phases = _phases_from_header(header)
+    obj["counts"] = counts
+    if detail:
+        obj["phases"] = phases
+    return obj
+
+
+def plans(home, project=None, data_dir=None, plan_id=None):
+    """Read the project store's plans (C5, C8). Read-only: mode=ro, never migrates, never writes.
+
+    A missing store is an empty list, like timeline/cards. An unknown plan id is a Fail (exit 2),
+    the same error shape as the other subcommands.
+    """
+    path = os.path.join(project_dir(home, project, data_dir), "mk.db")
+    con = _open_read(path, SCHEMA)
+    if con is None:
+        if plan_id:
+            raise Fail(f"no plan {plan_id!r}: no store at {path}")
+        return {"ok": True, "plans": []}
+    try:
+        if plan_id:
+            row = con.execute("SELECT * FROM plans WHERE id=?", (plan_id,)).fetchone()
+            if row is None:
+                raise Fail(f"no plan {plan_id!r} in {path}")
+            return {"ok": True, **_plan_obj(con, row, detail=True)}
+        rows = con.execute("SELECT * FROM plans ORDER BY id").fetchall()
+        return {"ok": True, "plans": [_plan_obj(con, row) for row in rows]}
+    finally:
+        con.close()
+
+
 def _cli(argv):
     # The common options are accepted before or after the subcommand. They are pulled out first,
     # so a subcommand never sees them and the two positions cannot disagree.
@@ -1356,6 +1531,9 @@ def _cli(argv):
     cd.add_argument("--json", action="store_true")
     pj = sub.add_parser("projects")
     pj.add_argument("--json", action="store_true")
+    pl = sub.add_parser("plans")
+    pl.add_argument("id", nargs="?", help="one plan id; omit for every plan")
+    pl.add_argument("--json", action="store_true")
     im = sub.add_parser("import-history")
     im.add_argument("--run", required=True)
     im.add_argument("--json-file", required=True)
@@ -1373,6 +1551,10 @@ def _cli(argv):
         return {"ok": True, "cards": cards(home, args.project)}
     if args.cmd == "projects":
         return {"ok": True, "projects": projects(home)}
+    if args.cmd == "plans":
+        if not args.project and not args.data:
+            raise Fail("plans needs --project or --data")
+        return plans(home, args.project, args.data, args.id)
     if args.cmd == "import-history":
         if not args.project:
             raise Fail("import-history needs --project")
@@ -1387,7 +1569,7 @@ def _cli(argv):
                                 tasks=doc.get("tasks") or (), events=doc.get("events") or (),
                                 artifacts=doc.get("artifacts") or (), data_dir=args.data)
         return {"ok": True, **counts}
-    raise Fail("usage: mkdb.py timeline|cards|projects|import-history --json  (or --self-test)")
+    raise Fail("usage: mkdb.py timeline|cards|projects|plans|import-history --json  (or --self-test)")
 
 
 def main(argv):
@@ -1398,7 +1580,7 @@ def main(argv):
 
 # --- self-test ----------------------------------------------------------------
 
-V3_SQL = "CREATE TABLE IF NOT EXISTS mkdb_v3_probe(id INTEGER PRIMARY KEY);"  # test migration past shipped v3, not shipped
+V3_SQL = "CREATE TABLE IF NOT EXISTS mkdb_v3_probe(id INTEGER PRIMARY KEY);"  # test migration past the shipped steps, not shipped
 
 
 def _check(cond, msg):
@@ -1557,6 +1739,9 @@ def self_test():
         _live_writers(home)
         _v1_upgrade(home)
         _lane_slots_v3(home)
+        _plans_cols_v4(home)
+        _plans_query(home)
+        _plans_detail(home)
         _card_verdict(home)
         _summary_transitions(home)
         _summary_regress(home)
@@ -1594,7 +1779,7 @@ def _stores(home):
         proj.close()
     again = open_project(home, "demo")  # re-open is a no-op: still one version row
     try:
-        _check(again.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == 3, "re-open")
+        _check(again.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == SCHEMA, "re-open")
         slot_cols = [r["name"] for r in again.execute("PRAGMA table_info(lane_slots)")]
         for name in LANE_SLOT_COLS:
             _check(name in slot_cols, f"fresh store missing {name}")
@@ -1886,7 +2071,7 @@ def _migrations(home):
     bare.close()
     reopened = open_project(home, data_dir=v1)
     try:
-        _check(reopened.execute("SELECT MAX(version) v FROM schema_version").fetchone()["v"] == 3,
+        _check(reopened.execute("SELECT MAX(version) v FROM schema_version").fetchone()["v"] == SCHEMA,
                "v2 not stamped after the crash")
         _check(reopened.execute("SELECT title FROM tasks WHERE id='kept'").fetchone()["title"] == "keep me",
                "v2 crash lost a row")
@@ -1897,26 +2082,26 @@ def _migrations(home):
     again = open_project(home, data_dir=v1)
     third = open_project(home, data_dir=v1)
     try:
-        _check(again.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == 3, "reopen grew")
+        _check(again.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == SCHEMA, "reopen grew")
         _check(third.execute("SELECT title FROM tasks WHERE id='kept'").fetchone()["title"] == "keep me",
                "second reopen lost a row")
     finally:
         again.close()
         third.close()
     data = os.path.join(home, "mig")
-    first = open_project(home, data_dir=data, version=4, migrations=((4, V3_SQL),))
+    first = open_project(home, data_dir=data, version=SCHEMA + 1, migrations=((SCHEMA + 1, V3_SQL),))
     _check(first.execute("SELECT 1 FROM sqlite_master WHERE name='mkdb_v3_probe'").fetchone(), "v2")
     first.close()
-    second = open_project(home, data_dir=data, version=4, migrations=((4, V3_SQL),))
-    _check(second.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == 4, "idempotent")
+    second = open_project(home, data_dir=data, version=SCHEMA + 1, migrations=((SCHEMA + 1, V3_SQL),))
+    _check(second.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == SCHEMA + 1, "idempotent")
     second.close()
     # Finding 8: a crash between executescript and the version stamp re-runs safely.
     con = sqlite3.connect(os.path.join(data, "mk.db"))
-    con.execute("DELETE FROM schema_version WHERE version=4")
+    con.execute(f"DELETE FROM schema_version WHERE version={SCHEMA + 1}")
     con.commit()
     con.close()
-    third = open_project(home, data_dir=data, version=4, migrations=((4, V3_SQL),))
-    _check(third.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == 4, "re-stamp")
+    third = open_project(home, data_dir=data, version=SCHEMA + 1, migrations=((SCHEMA + 1, V3_SQL),))
+    _check(third.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == SCHEMA + 1, "re-stamp")
     _check(third.execute("SELECT COUNT(*) c FROM mkdb_v3_probe").fetchone()["c"] == 0, "probe grew")
     third.close()
     try:
@@ -2322,7 +2507,7 @@ def _lane_slots_v3(home):
     bare.close()
     reopened = open_project(home, data_dir=data)
     try:
-        _check(reopened.execute("SELECT MAX(version) v FROM schema_version").fetchone()["v"] == 3,
+        _check(reopened.execute("SELECT MAX(version) v FROM schema_version").fetchone()["v"] == SCHEMA,
                "v3 not stamped after the crash")
         row = reopened.execute("SELECT lane_path, state, run, task, workspace, branch FROM lane_slots WHERE slot='1'").fetchone()
         _check(row["lane_path"] == "/tmp/lane" and row["state"] == "busy" and row["run"] == "r1"
@@ -2333,7 +2518,7 @@ def _lane_slots_v3(home):
     again = open_project(home, data_dir=data)
     third = open_project(home, data_dir=data)
     try:
-        _check(again.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == 3, "v3 reopen grew")
+        _check(again.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == SCHEMA, "v3 reopen grew")
         _check(third.execute("SELECT task FROM lane_slots WHERE slot='1'").fetchone()["task"] == "D5B",
                "second reopen lost the slot")
         names = [r["name"] for r in third.execute("PRAGMA table_info(lane_slots)")]
@@ -2356,12 +2541,200 @@ def _v1_upgrade(home):
         con.close()
     upgraded = open_project(home, data_dir=data)
     try:
-        _check(upgraded.execute("SELECT MAX(version) v FROM schema_version").fetchone()["v"] == 3, "not v3")
+        _check(upgraded.execute("SELECT MAX(version) v FROM schema_version").fetchone()["v"] == SCHEMA, "not at the current schema")
         _check("src" in [r["name"] for r in upgraded.execute("PRAGMA table_info(artifacts)")], "src missing")
         row = upgraded.execute("SELECT title FROM tasks WHERE id='kept'").fetchone()
         _check(row["title"] == "keep me", f"row lost: {dict(row) if row else None}")
     finally:
         upgraded.close()
+
+
+def _seed_plans(home, name):
+    """One store for the plans query/detail cases (C5, C8).
+
+    Plan alpha: two runs — r1 older and done (the bare relative plans/ path), r2 newest and
+    active (the absolute path form) — plus a same-prefix decoy run that must not match, and
+    the newest run carries a phase, tasks in four statuses, a subtask and a parentless row.
+    Plan beta: no run, NULL status/created columns (the header fallback) and the full phase
+    shape in header_json. plans and runs rows are plain SQL (no writer API for them yet);
+    the inserts commit before the first add_task (both take BEGIN IMMEDIATE).
+    """
+    data = os.path.join(home, name)
+    hdr_a = json.dumps({"status": "header-draft", "created": "header-created",
+                        "phases": [{"id": "ph1", "wave": 1}, {"id": "ph2", "wave": 2}]})
+    hdr_b = json.dumps({
+        "status": "draft", "created": "2026-02-02T00:00:00Z", "phases": [
+            {"id": "ph1", "title": "Phase one", "wave": 1, "deps": [], "tasks": [
+                {"id": "a1", "title": "Task A1", "subtasks": [{"id": "s1", "title": "Sub S1"}]}]},
+            {"id": "ph2", "title": "Phase two", "wave": 2, "deps": ["ph1"], "tasks": [
+                {"id": "a2", "title": "Task A2", "subtasks": []}]}]})
+    con = open_project(home, data_dir=data)
+    try:
+        _begin(con)
+        con.execute("INSERT INTO plans(id, version, title, header_json, approved_at, status,"
+                    " created, design, integration) VALUES (?,?,?,?,?,?,?,?,?)",
+                    ("alpha", 3, "Alpha", hdr_a, "2026-01-01T00:00:00Z", "approved",
+                     "2026-01-01T00:00:00Z", json.dumps(["d1", "d2"]), "int-branch"))
+        con.execute("INSERT INTO plans(id, version, title, header_json) VALUES (?,?,?,?)",
+                    ("beta", 2, "Beta", hdr_b))
+        con.execute("INSERT INTO runs(id, plan, status, started) VALUES (?,?,?,?)",
+                    ("r1", "plans/alpha.md", "done", "2026-01-03T00:00:00Z"))
+        con.execute("INSERT INTO runs(id, plan, status, started) VALUES (?,?,?,?)",
+                    ("r2", "/repo/.matrixkoder/plans/alpha.md", "active", "2026-01-04T00:00:00Z"))
+        con.execute("INSERT INTO runs(id, plan, status, started) VALUES (?,?,?,?)",
+                    ("zz", "plans/alpha2.md", "active", "2026-01-09T00:00:00Z"))
+        con.execute("COMMIT")
+        add_task(con, "r2", "ph1", "phase", title="Phase one")
+        add_task(con, "r2", "a1", "task", title="Task A1", parent="ph1", status="planned")
+        add_task(con, "r2", "a1s", "subtask", title="Sub S1", parent="a1", status="planned")
+        add_task(con, "r2", "a2", "task", title="Task A2", parent="ph1", status="building")
+        add_task(con, "r2", "a3", "task", title="Task A3", parent="ph1", status="done")
+        add_task(con, "r2", "a4", "task", title="Task A4", parent="ph1", status="blocked")
+        add_task(con, "r2", "loner", "task", title="root task row")  # parentless: phase-level
+        add_task(con, "r1", "old-ph", "phase")  # an older run must not reach alpha's counts
+        add_task(con, "r1", "old-t", "task", parent="old-ph", status="done")
+    finally:
+        con.close()
+    return data
+
+
+def _plans_cols_v4(home):
+    """A v3 store with a pre-v4 plans row migrates: the D1 columns land and the row survives;
+    a reopen stamps nothing new; a fresh store reaches the very same plans shape."""
+    data = os.path.join(home, "plans-v3")
+    os.makedirs(data, exist_ok=True)
+    # a real v3 file, built like _lane_slots_v3's fixture: the pre-v4 7-column plans
+    # shape, stamped 1..3, with one row
+    bare = sqlite3.connect(os.path.join(data, "mk.db"))
+    bare.executescript("""
+        CREATE TABLE plans(id TEXT PRIMARY KEY, version INTEGER, title TEXT, header_json TEXT,
+          body_md TEXT, approved_at TEXT, archived_path TEXT);
+        CREATE TABLE schema_version(version INTEGER PRIMARY KEY);
+        INSERT INTO schema_version(version) VALUES (1);
+        INSERT INTO schema_version(version) VALUES (2);
+        INSERT INTO schema_version(version) VALUES (3);
+        INSERT INTO plans(id, version, title, header_json) VALUES ('old', 2, 'Old plan', '{}');
+    """)
+    bare.commit()
+    bare.close()
+    migrated = open_project(home, data_dir=data)
+    try:
+        cols = [(r["name"], r["type"], r["notnull"], r["dflt_value"], r["pk"])
+                for r in migrated.execute("PRAGMA table_info(plans)")]
+        names = [c[0] for c in cols]
+        for name in PLAN_D1_COLS:
+            _check(names.count(name) == 1, f"v4 left {name} missing or duplicated: {names}")
+        _check(migrated.execute("SELECT MAX(version) v FROM schema_version").fetchone()["v"]
+               == SCHEMA, "v4 not stamped")
+        row = migrated.execute("SELECT title, header_json, status, created, design, integration"
+                               " FROM plans WHERE id='old'").fetchone()
+        _check(row["title"] == "Old plan" and row["header_json"] == "{}"
+               and all(row[n] is None for n in PLAN_D1_COLS),
+               f"v3 row lost: {dict(row) if row else None}")
+    finally:
+        migrated.close()
+    again = open_project(home, data_dir=data)  # a reopen is a no-op: no new stamp, no new column
+    try:
+        _check(again.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == SCHEMA,
+               "v4 reopen stamped again")
+        names = [r["name"] for r in again.execute("PRAGMA table_info(plans)")]
+        _check(sorted(names) == sorted(c[0] for c in cols), f"reopen changed plans columns: {names}")
+    finally:
+        again.close()
+    fresh = open_project(home, data_dir=os.path.join(home, "plans-fresh"))
+    try:
+        fresh_cols = [(r["name"], r["type"], r["notnull"], r["dflt_value"], r["pk"])
+                      for r in fresh.execute("PRAGMA table_info(plans)")]
+    finally:
+        fresh.close()
+    _check(fresh_cols == cols, f"fresh and migrated plans shapes differ: {fresh_cols} vs {cols}")
+
+
+def _plans_query(home):
+    """plans() lists both plans: runs match three plan forms, the newest run feeds counts and
+    live_run, root rows are not counted, and a header-only plan falls back and stays empty."""
+    data = _seed_plans(home, "plans-q")
+    got = plans(home, data_dir=data)
+    _check(got["ok"] is True and [p["id"] for p in got["plans"]] == ["alpha", "beta"],
+           f"plan order {[p['id'] for p in got['plans']]}")
+    a, b = got["plans"]
+    _check(set(a) == {"id", "title", "status", "created", "design", "integration", "version",
+                      "approved_at", "runs", "live_run", "counts"}, f"list keys {sorted(a)}")
+    _check("phases" not in a and "phases" not in b, "the list reply carries phases")
+    _check(a["status"] == "approved" and a["created"] == "2026-01-01T00:00:00Z"
+           and a["design"] == ["d1", "d2"] and a["integration"] == "int-branch"
+           and a["version"] == 3 and a["approved_at"] == "2026-01-01T00:00:00Z",
+           f"alpha columns {a}")
+    _check(a["runs"] == ["r2", "r1"], f"alpha runs {a['runs']}")  # newest first, decoy zz misses
+    _check(a["live_run"] == "r2", f"alpha live_run {a['live_run']}")
+    _check(a["counts"] == {"planned": 2, "building": 1, "done": 1, "blocked": 1},
+           f"alpha counts {a['counts']}")  # ph1 and loner are roots; old-t is another run
+    _check(b["status"] == "draft" and b["created"] == "2026-02-02T00:00:00Z",
+           f"beta header fallback {b}")  # columns NULL, values from header_json
+    _check(b["design"] == [] and b["integration"] is None, f"beta design/integration {b}")
+    _check(b["runs"] == [] and b["live_run"] is None and b["counts"] == {}, f"beta no-run {b}")
+    proc = subprocess.run([sys.executable, os.path.abspath(__file__), "plans", "--home", home,
+                           "--data", data, "--json"], capture_output=True, text=True)
+    _check(proc.returncode == 0 and "Traceback" not in proc.stderr,
+           f"plans cli rc={proc.returncode} err={proc.stderr[-300:]}")
+    cli = json.loads(proc.stdout)
+    _check(cli["ok"] is True and [p["id"] for p in cli["plans"]] == ["alpha", "beta"]
+           and cli["plans"][0]["counts"] == a["counts"] and cli["plans"][1]["live_run"] is None,
+           f"plans cli reply {cli}")
+
+
+def _plans_detail(home):
+    """plans(<id>) returns the phases: built from the newest run (waves cross-filled from
+    header_json, subtasks nested) or all 'planned' from header_json with no run; an unknown
+    id is a Fail, and the CLI turns it into ok:false exit 2."""
+    data = _seed_plans(home, "plans-d")
+    got = plans(home, data_dir=data, plan_id="alpha")
+    _check(got["ok"] is True and got["id"] == "alpha", f"detail id {got.get('id')}")
+    _check(set(got) == {"ok", "id", "title", "status", "created", "design", "integration",
+                        "version", "approved_at", "runs", "live_run", "counts", "phases"},
+           f"detail keys {sorted(got)}")
+    ids = [p["id"] for p in got["phases"]]
+    _check(ids == ["ph1", "loner"], f"detail phases {ids}")  # row order; header ph2 never ran
+    ph1, loner = got["phases"]
+    _check(ph1["wave"] == 1 and ph1["title"] == "Phase one" and ph1["status"] == "planned"
+           and ph1["deps"] == [], f"ph1 {ph1}")  # wave cross-filled from header_json
+    _check([t["id"] for t in ph1["tasks"]] == ["a1", "a2", "a3", "a4"], f"ph1 tasks {ph1['tasks']}")
+    a1 = ph1["tasks"][0]
+    _check(a1["parent"] == "ph1" and a1["type"] == "task" and a1["status"] == "planned"
+           and set(a1) == {"id", "title", "status", "parent", "type", "round", "verdict",
+                           "subtasks"}, f"a1 {a1}")
+    _check([s["id"] for s in a1["subtasks"]] == ["a1s"]
+           and a1["subtasks"][0]["parent"] == "a1" and a1["subtasks"][0]["type"] == "subtask"
+           and a1["subtasks"][0]["subtasks"] == [], f"a1 subtasks {a1['subtasks']}")
+    _check(loner["wave"] is None and loner["tasks"] == [], f"root row as phase {loner}")
+    proc = subprocess.run([sys.executable, os.path.abspath(__file__), "plans", "beta", "--home",
+                           home, "--data", data, "--json"], capture_output=True, text=True)
+    _check(proc.returncode == 0 and "Traceback" not in proc.stderr,
+           f"beta detail cli rc={proc.returncode} err={proc.stderr[-300:]}")
+    beta = json.loads(proc.stdout)
+    _check(beta["ok"] is True and beta["runs"] == [] and beta["counts"] == {}
+           and beta["live_run"] is None, f"beta detail {beta}")
+    _check([p["id"] for p in beta["phases"]] == ["ph1", "ph2"], f"beta phases {beta['phases']}")
+    ph1b, ph2b = beta["phases"]
+    _check(ph1b["wave"] == 1 and ph2b["wave"] == 2 and ph2b["deps"] == ["ph1"]
+           and ph1b["deps"] == [], f"beta waves/deps {beta['phases']}")
+    _check(all(p["status"] == t["status"] == s["status"] == "planned"
+               for p in beta["phases"] for t in p["tasks"] for s in t["subtasks"]),
+           f"beta statuses not all planned: {beta['phases']}")
+    s1 = ph1b["tasks"][0]["subtasks"][0]
+    _check(s1["id"] == "s1" and s1["parent"] == "a1" and s1["type"] == "subtask"
+           and ph1b["tasks"][0]["status"] == "planned", f"beta subtask {s1}")
+    try:
+        plans(home, data_dir=data, plan_id="nope")
+    except Fail:
+        pass
+    else:
+        raise SystemExit("SELF-TEST FAIL: plans() accepted an unknown id")
+    proc = subprocess.run([sys.executable, os.path.abspath(__file__), "plans", "nope", "--home",
+                           home, "--data", data, "--json"], capture_output=True, text=True)
+    _check(proc.returncode == 2 and "Traceback" not in proc.stderr,
+           f"unknown id rc={proc.returncode} err={proc.stderr[-300:]}")
+    _check(json.loads(proc.stdout)["ok"] is False, f"unknown id out {proc.stdout!r}")
 
 
 def _seed_run(home, name, task="t"):
