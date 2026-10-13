@@ -725,9 +725,8 @@ def bus_dir_for(data):
     if override:
         return os.path.abspath(os.path.expanduser(override))
     if data and os.path.isfile(os.path.join(data, "mk.db")):
-        # Same rule as mk-bus.root_bus_dir / mk_home: $MK_HOME, else ~/.matrixkoder.
-        # MATRIXKODER_HOME is the projects.json home, not the bus home.
-        home = os.environ.get("MK_HOME") or os.path.expanduser("~/.matrixkoder")
+        # One MK home rule (C16): mk_home() takes $MK_HOME or $MATRIXKODER_HOME.
+        home = mk_home()
         return os.path.abspath(os.path.expanduser(home))
     return data
 

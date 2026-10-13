@@ -1011,11 +1011,7 @@ def dead_notes(lines):
 def load_usage(usage_path_arg):
     path = usage_path_arg
     if not path:
-        home = os.environ.get("MATRIXKODER_HOME")
-        if home:
-            path = os.path.join(home, "usage.json")
-        else:
-            path = os.path.expanduser("~/.matrixkoder/usage.json")
+        path = os.path.join(catalog_home(), "usage.json")
     path = os.path.expanduser(path)
     if not os.path.isfile(path):
         return {}
