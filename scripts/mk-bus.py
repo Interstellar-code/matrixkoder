@@ -3055,12 +3055,27 @@ def cmd_watch(args):
     after = getattr(args, "after", None)
     cursor_path = os.path.join(data_dir, "watch-cursors.json")
     cursor_key = "%s|%s" % (run or "*", task or "*")
+    # File mode: a new run in the same data dir restarts seq from 1 and restarts the bus, so a cursor
+    # is trusted only for the bus start stamp it was written under (a mismatch replays: a duplicate,
+    # never a lost message). Store mode seqs never reset, so no stamp is kept or checked there.
+    file_mode = not store_mode(data_dir)
+
+    def bus_started():
+        try:
+            return (read_json(os.path.join(bus_location(data_dir), "bus.json")) or {}).get("started")
+        except Exception:
+            return None
+    cur_started = bus_started() if file_mode else None
     if after is None or after == "":
         after = 0
         if not getattr(args, "replay", False):
-            saved = (read_json(cursor_path, default={}) or {}).get(cursor_key)
-            if isinstance(saved, int) and saved > 0:
-                after = saved
+            cur = read_json(cursor_path, default={})
+            saved = cur.get(cursor_key) if isinstance(cur, dict) else None
+            if isinstance(saved, int):  # an old plain-integer value: no stamp
+                saved = {"seq": saved, "started": None}
+            if (isinstance(saved, dict) and isinstance(saved.get("seq"), int) and saved["seq"] > 0
+                    and (not file_mode or (cur_started is not None and saved.get("started") == cur_started))):
+                after = saved["seq"]
     last_seq = int(str(after)[2:]) if str(after).startswith("m-") and str(after)[2:].isdigit() else int(after or 0)
     max_messages = getattr(args, "max_messages", 0) or 0
 
@@ -3072,6 +3087,8 @@ def cmd_watch(args):
             bdata = read_json(os.path.join(bus_location(data_dir), "bus.json"))
             if bdata and bdata.get("port"):
                 port = int(bdata["port"])
+                if file_mode:
+                    cur_started = bdata.get("started")
         except Exception:
             port = None
         token = _orch_token(data_dir)
@@ -3127,7 +3144,7 @@ def cmd_watch(args):
                         # lose a cursor update (replays a few lines); lock if that ever bites.
                         cursors = read_json(cursor_path, default={})
                         cursors = cursors if isinstance(cursors, dict) else {}
-                        cursors[cursor_key] = last_seq
+                        cursors[cursor_key] = {"seq": last_seq, "started": cur_started}
                         write_json(cursor_path, cursors)
                         printed += 1
                         if max_messages and printed >= max_messages:
@@ -4615,7 +4632,7 @@ def _store_self_test_body(mod):
         # watch above (--after, run r1, no task) printed 6 lines, so the cursor holds "r1|*".
         cur_path = os.path.join(data, "watch-cursors.json")
         assert (os.stat(cur_path).st_mode & 0o777) == 0o600, oct(os.stat(cur_path).st_mode)
-        cur_seq = read_json(cur_path)["r1|*"]
+        cur_seq = read_json(cur_path)["r1|*"]["seq"]
         assert cur_seq == int(ids[-1][2:]), (cur_seq, ids[-1])
         cur_new = []
         for i in range(2):
@@ -4629,7 +4646,7 @@ def _store_self_test_body(mod):
                                  stderr=subprocess.PIPE, text=True, timeout=20)
         assert res_cur.returncode == 0, (res_cur.returncode, res_cur.stderr)
         assert [ln.split()[1] for ln in res_cur.stdout.splitlines()] == cur_new, res_cur.stdout
-        assert read_json(cur_path)["r1|*"] == int(cur_new[-1][2:]), read_json(cur_path)
+        assert read_json(cur_path)["r1|*"]["seq"] == int(cur_new[-1][2:]), read_json(cur_path)
         assert (os.stat(cur_path).st_mode & 0o777) == 0o600
         # A different filter has its own key: a task watch with no cursor replays from the start.
         res_tk = subprocess.run(watch_cmd + ["--task", "T9", "--max-messages", "1"], stdout=subprocess.PIPE,
@@ -4646,6 +4663,14 @@ def _store_self_test_body(mod):
         res_af = subprocess.run(watch_cmd + ["--after", cur_new[0], "--max-messages", "1"], stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, timeout=20)
         assert res_af.stdout.split()[1] == cur_new[1], res_af.stdout
+        # A cursor file that is valid JSON but not an object is no cursor: replay, never a crash.
+        for junk in ("[]", "3", '"x"'):
+            with open(cur_path, "w") as f:
+                f.write(junk)
+            res_junk = subprocess.run(watch_cmd + ["--max-messages", "1"], stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE, text=True, timeout=20)
+            assert res_junk.returncode == 0, (junk, res_junk.returncode, res_junk.stderr)
+            assert int(res_junk.stdout.split()[1][2:]) < int(base_id[2:]), (junk, res_junk.stdout)
 
         # A multi-line body collapses to ONE line, cut to 200 chars (C13a).
         noisy = "first line\nsecond\tline " + ("y" * 400)
@@ -4842,6 +4867,23 @@ def _store_self_test_body(mod):
                     watch_fm.wait(timeout=10)
             assert watch_fm.returncode == 0, (watch_fm.returncode, err_fm)
             assert " r1 T1 info orch->T1: file mode" in out_fm, out_fm
+            # File-mode cursor: valid only for the bus start stamp it was written under. A new run in
+            # the same data dir restarts seq from 1 and restarts the bus, so a stale cursor must replay.
+            fm_cur = os.path.join(fm_data, "watch-cursors.json")
+            fm_started = read_json(os.path.join(fm_home, "bus.json"))["started"]
+            assert read_json(fm_cur)["*|*"] == {"seq": 1, "started": fm_started}, read_json(fm_cur)
+            fm_watch = [sys.executable, os.path.abspath(__file__), "watch", "--data", fm_data, "--max-messages", "1"]
+
+            def fm_first():
+                r = subprocess.run(fm_watch, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20)
+                assert r.returncode == 0, (r.returncode, r.stderr)
+                return r.stdout.split()[1]
+            assert post(port_fm, tok_fm, {"run": "r1", "task": "T1", "kind": "info", "text": "file mode 2",
+                                          "from": "orch", "to": "T1"})[0] == 200
+            assert fm_first() == "m-2"  # same bus start stamp: resumes after the cursor
+            for stale in ({"seq": 50, "started": fm_started - 1000.0}, 50, {"seq": 50, "started": None}):
+                write_json(fm_cur, {"*|*": stale})
+                assert fm_first() == "m-1", stale  # another bus start, or no stamp: replay, no lost message
         finally:
             if pid_fm:
                 kill(pid_fm)
