@@ -75,3 +75,56 @@ export const PLAN_FIXTURE: PlanView = {
   ],
   footer: ['Plan: .matrixkoder/plans/checkout-v2.md', 'briefs r1 written for P4–P7'],
 }
+
+// The real plan, for the V1.2 detail tests. Source: `.matrixkoder/plans/settings-plans-db.md`
+// (status running, created 2026-10-13, runs settings-plans-db-r1, integration main, design
+// settings-tab / settings-wire / dashboard-v2 / mk-store; phases R1 T1 D1 S1 V1 with their
+// real task ids and titles). Statuses follow PlanDetail.dc.html: merged phases, S1 building,
+// V1 in progress. R1 and T1 share wave 1, so each row shows `with` the other.
+export const PLAN_REAL_FIXTURE: PlanView = {
+  mock: true,
+  plan: {
+    id: 'settings-plans-db',
+    title: 'Settings mapping, plans in the DB, Plan sub-tabs',
+    status: 'running',
+    statusChip: '● running · r1 · 7/12',
+    created: '2026-10-13',
+    runs: 'settings-plans-db-r1',
+    mergesTo: 'main',
+    design: 'settings-tab · settings-wire · dashboard-v2 · mk-store',
+    counts: '14 tasks · 5 phases',
+  },
+  phases: [
+    { id: 'R1', title: 'Self-tests never write a real DB', status: 'merged', header: '✓ merged', headerRole: 'ok', wave: 1,
+      rows: [
+        { id: 'R1.1', title: 'One home rule', status: 'merged', right: 'merged' },
+        { id: 'R1.2', title: 'Write guard', status: 'merged', right: 'merged' },
+        { id: 'R1.3', title: 'Register matrixkoder', status: 'done', right: 'done' },
+      ], note: 'lane mk-3 · merged to main' },
+    { id: 'T1', title: 'Plan template is the contract', status: 'merged', header: '✓ merged', headerRole: 'ok', wave: 1,
+      rows: [
+        { id: 'T1.1', title: 'templates/plan.md DB homes', status: 'merged', right: 'merged' },
+        { id: 'T1.2', title: 'SKILL.md and plan check', status: 'merged', right: 'merged' },
+      ] },
+    { id: 'D1', title: 'Plans in the project DB', status: 'merged', header: '✓ merged 21:10', headerRole: 'ok', wave: 2,
+      rows: [
+        { id: 'D1.1', title: 'plans columns, mkdb plans query', status: 'merged', right: 'a41f9c2' },
+        { id: 'D1.2', title: 'import, delete, pause', status: 'merged', right: '7c0e3d1' },
+        { id: 'D1.3', title: 'template and schema docs', status: 'merged', right: 'c3b7a08' },
+        { id: 'D1.4', title: 'First real import', status: 'done', right: 'done' },
+      ], note: 'lane mk-3 · merged to main' },
+    { id: 'S1', title: 'Settings mapping and cleanup', status: 'building', header: '● building 22m', headerRole: 'live', wave: 3,
+      rows: [
+        { id: 'S1.1', title: 'scope-home map', status: 'merged', right: 'r1' },
+        { id: 'S1.2', title: 'dead keys, fixture drift', status: 'building', right: 'building' },
+      ], note: 'lane mk-4 · opencode · 2 subagents' },
+    { id: 'V1', title: 'Plan tab sub-tabs', status: 'building', header: '2 findings', headerRole: 'warn', wave: 3,
+      rows: [
+        { id: 'V1.1', title: 'List with plan actions', status: 'merged', right: 'r1' },
+        { id: 'V1.2', title: 'Detail by phase, folded', status: 'fix', right: '2 findings',
+          subs: [{ id: 'V1.2a', title: 'fold state per phase', status: 'fix', right: '2 findings', rightRole: 'warn' }] },
+        { id: 'V1.3', title: 'Kanban filter, wiring', status: 'building', right: 'building' },
+      ], note: 'lane mk-3 · after D1 · 3 subagents' },
+  ],
+  footer: ['5 phases · all folded by default', 'source mk.db'],
+}
