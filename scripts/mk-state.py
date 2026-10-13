@@ -3270,6 +3270,7 @@ def self_test():
         assert pk("task", "round", "X1", "--kind", "build", "--run", "lg1")["round"] == 1
         assert pk("task", "get", "P1", "--run", "lg1")["task"]["round"] == 2
         assert "needs a task" in pk("task", "round", "--kind", "build", "--run", "lg1", code=2)["error"]
+        pk("run", "archive", "--id", "lg1")  # later cases expect one active run
 
         # --force init on an unapproved plan: allowed, and an event says so
         db["status"] = "draft"
