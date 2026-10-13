@@ -8,7 +8,7 @@ Usage:
                       [...]   # a shared lane group: one lane serving several phases of one plan
   mk-lane-event.py event                (herdr plugin hook: reads HERDR_PLUGIN_EVENT + HERDR_PLUGIN_EVENT_JSON)
   mk-lane-event.py dispatch --pane ID --text TEXT [--timeout-ms 25000] [--role build|review]
-                             [--kind build|fix|takeover]
+                             [--kind build|fix|takeover] [--connect|--no-connect]
   mk-lane-event.py sweep [--data DIR]
   mk-lane-event.py disarm --lane DIR
   mk-lane-event.py review-handoff --task T [--run R] [--data DIR] [--hold] [--min medium]
@@ -466,6 +466,18 @@ def _jload(s):
         return None
 
 
+def agent_in_pane(pane):
+    """True when `herdr agent list` shows an agent in <pane>; False when it shows none or herdr
+    cannot say (missing binary, failure, bad JSON, the 3 s bound) — the caller never hears an error."""
+    try:
+        r = subprocess.run([herdr_bin(), "agent", "list"], capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    j = _jload(r.stdout) if r.returncode == 0 else None
+    agents = ((j or {}).get("result") or {}).get("agents")
+    return isinstance(agents, list) and any(isinstance(x, dict) and x.get("pane_id") == pane for x in agents)
+
+
 def pane_state(pane):
     """(agent_status, raw list row, error) of <pane> from `herdr pane list`. The row is the exact
     dict the list named the pane with (None when it did not). A failed / malformed list is an
@@ -837,12 +849,16 @@ def cmd_dispatch(a):
     the second attempt deciding the verdict and never retrying again. When even that leaves the
     pane idle/done, one recheck after DISPATCH_RECHECK_S — a fresh pane list plus the pane text —
     searches for the prompt marker (the first words of --text): found → delivered:true with
-    recovered:true (herdr's wait gave up while the prompt had already landed). --role review
+    recovered:true (herdr's wait gave up while the prompt had already landed). A build dispatch to
+    an armed lane with a live bus types the connect doorbell instead of --text (--connect says so;
+    --no-connect forces the full prompt); every reply carries connect:true|false, and note
+    "legacy prompt: <why>" when the lane is armed and the full prompt went anyway. --role review
     (reviewer panes) delivers without the board write: no mark_armed_building, the reply says
     status_unchanged:true instead. Every reply carries attempts (1 or 2), herdr_error (herdr's
     words for the attempt that did not deliver — the first attempt's when a retry lands, the final
     attempt's when both fail, the reply itself when nothing failed) and pane_entry (the freshest
-    raw `herdr pane list` row for the pane, null when no observation names it). A --kind
+    raw `herdr pane list` row for the pane, null when no observation names it). A delivered reply
+    never carries error: herdr's timeout words stay in herdr_error and note says what happened. A --kind
     fix|takeover build dispatch on session.fresh_session: new first sends the pane's agent its
     new-session command (/new OpenCode, /clear Claude — the armed watch's kind names the agent)
     and waits (bounded) for the pane to go idle; the reply's fresh_session names the command sent,
@@ -854,18 +870,30 @@ def cmd_dispatch(a):
     pane, text = opt(a, "--pane"), opt(a, "--text")
     if not (pane and text):
         fail("dispatch needs --pane --text")
-    # --connect (bus on): the brief and the token are not in the lane, so the typed
-    # prompt is only the connect doorbell. Without the flag the caller's full prompt
-    # is typed unchanged — that is the bus-down path, and every dispatch that predates
-    # the doorbell.
+    # The doorbell (bus on): the brief and the token are not in the lane, so the typed
+    # prompt is only the connect doorbell. A build dispatch to an armed lane with a live
+    # bus rings it by default (--connect says so explicitly); --no-connect keeps the
+    # caller's full prompt unchanged, which is also the bus-down path and every dispatch
+    # that predates the doorbell. The reply says which one was typed: connect, and a note
+    # when the lane is armed but the full prompt went anyway.
     # The doorbell replaces the prompt ONLY when the bus is actually up and the brief
     # was published. A yaml flag is not enough: a bus that is enabled but down, or a
     # publish that fails, keeps today's full prompt (C12).
-    if "--connect" in a and opt(a, "--role", "build") == "build":
+    connected, legacy_note = False, None
+    if opt(a, "--role", "build") == "build":
         hit = find_armed(pane)
         wdata = (hit[1].get("data") or "") if hit else ""
         wrun, wtask = (hit[1].get("run"), hit[1].get("task")) if hit else (None, None)
-        if hit and bus_enabled(wdata) and bus_is_up(wdata):
+        why = None
+        if not hit:
+            pass
+        elif "--no-connect" in a:
+            why = "--no-connect given"
+        elif not bus_enabled(wdata):
+            why = "bus.enabled is false"
+        elif not bus_is_up(wdata):
+            why = "bus is down"
+        else:
             ok, publish_error = publish_brief(wdata, wrun, wtask)
             if ok:
                 # A /new sent just before must not merge with the typed line (todo 74):
@@ -874,15 +902,25 @@ def cmd_dispatch(a):
                 ist, iwhy = wait_idle(pane, budget_s=float(os.environ.get('MK_DOORBELL_IDLE_WAIT_S', str(DOORBELL_IDLE_WAIT_S))), poll_s=float(os.environ.get('MK_DOORBELL_IDLE_POLL_S', str(DOORBELL_IDLE_POLL_S))))
                 if ist in RETRY_PANE_STATES:
                     text = connect_text(hit[1].get("lane") or "", wdata)
+                    connected = True
                 else:
                     # a busy pane gets nothing typed: not the doorbell, not the full
                     # prompt. The caller retries later.
                     out({"ok": False, "delivered": False, "pane": pane,
                          "publish_error": f"pane not idle: {ist or iwhy}"})
                     sys.exit(1)
-            elif publish_error:
-                # the full prompt is kept; the reply says why the doorbell was not typed
-                a = list(a) + ["--publish-error", publish_error]
+            else:
+                why = f"publish failed: {publish_error}"
+                if publish_error:
+                    # the full prompt is kept; the reply says why the doorbell was not typed
+                    a = list(a) + ["--publish-error", publish_error]
+        if why:
+            legacy_note = f"legacy prompt: {why}"
+
+    def reply(d, note=None):
+        n = "; ".join(x for x in (legacy_note, note) if x)
+        out({**d, "connect": connected, **({"note": n} if n else {})})
+
     role = opt(a, "--role", "build")
     if role not in ("build", "review"):
         fail("--role must be build or review")
@@ -907,7 +945,7 @@ def cmd_dispatch(a):
         rkind, rwhy, rstatus, _rj = _prompt_attempt(pane, fresh, ms)
         ist, iwhy = wait_idle(pane)
         if rkind == "fail" or ist not in RETRY_PANE_STATES:
-            out({"ok": False, "delivered": False, "pane": pane, "fresh_session": fresh,
+            reply({"ok": False, "delivered": False, "pane": pane, "fresh_session": fresh,
                  "error": "fresh session not confirmed",
                  "fresh_session_error": rwhy if rkind == "fail" else (iwhy or "pane never went idle"),
                  "fresh_session_kind": rkind, "agent_status": rstatus})
@@ -923,7 +961,7 @@ def cmd_dispatch(a):
     while True:
         kind, why, status, j = _prompt_attempt(pane, text, ms)
         if kind == "ok":
-            out({"ok": True, "delivered": True, "pane": pane, "agent_status": status, "timeout_ms": ms,
+            reply({"ok": True, "delivered": True, "pane": pane, "agent_status": status, "timeout_ms": ms,
                  "attempts": attempts, "herdr_error": fail_why or why, "pane_entry": entry,
                  "fresh_session": fresh,
                  **({"publish_error": opt(a, "--publish-error")} if opt(a, "--publish-error") else {}),
@@ -931,15 +969,16 @@ def cmd_dispatch(a):
             return
         fail_why = why
         if kind == "fail":  # herdr failed some other way: its own words, no delivery, no pane check
-            out({"ok": False, "delivered": False, "pane": pane, "timeout_ms": ms, "attempts": attempts,
+            reply({"ok": False, "delivered": False, "pane": pane, "timeout_ms": ms, "attempts": attempts,
                  "herdr_error": why, "error": why, "pane_entry": entry, "fresh_session": fresh})
             return
         # exc / wait: a timeout proves nothing either way — the pane's own state decides delivery
         st, entry, pl_err = pane_state(pane)
         if st == "working":  # the wait gave up, the agent did not: the prompt is still being delivered
-            out({"ok": True, "delivered": True, "pane_state": "working", "pane": pane, "timed_out": True,
-                 "timeout_ms": ms, "attempts": attempts, "herdr_error": why, "error": why,
-                 "pane_entry": entry, "fresh_session": fresh, **delivered_status(pane, role)})
+            reply({"ok": True, "delivered": True, "pane_state": "working", "pane": pane, "timed_out": True,
+                 "timeout_ms": ms, "attempts": attempts, "herdr_error": why,
+                 "pane_entry": entry, "fresh_session": fresh, **delivered_status(pane, role)},
+                  note="herdr status wait timed out; the pane is working")
             return
         if attempts == 1 and st in RETRY_PANE_STATES:  # idle/done: the prompt was lost — resend once
             time.sleep(retry_wait_s())
@@ -953,12 +992,13 @@ def cmd_dispatch(a):
             time.sleep(recheck_wait_s())
             st, entry, pl_err = pane_state(pane)
             if marker_in_new_pane_text(pane, prompt_marker(text), pane_text_before):
-                out({"ok": True, "delivered": True, "recovered": True, "pane_state": st, "pane": pane,
+                reply({"ok": True, "delivered": True, "recovered": True, "pane_state": st, "pane": pane,
                      "timed_out": True, "timeout_ms": ms, "attempts": attempts, "herdr_error": why,
-                     "error": why, "pane_entry": entry, "fresh_session": fresh,
-                     **({"pane_list_error": pl_err} if pl_err else {}), **delivered_status(pane, role)})
+                     "pane_entry": entry, "fresh_session": fresh,
+                     **({"pane_list_error": pl_err} if pl_err else {}), **delivered_status(pane, role)},
+                      note="herdr wait timed out; the prompt had already landed")
                 return
-        out({"ok": False, "delivered": False, "pane_state": st, "pane": pane, "timed_out": True,
+        reply({"ok": False, "delivered": False, "pane_state": st, "pane": pane, "timed_out": True,
              "timeout_ms": ms, "attempts": attempts, "herdr_error": why, "error": why,
              "pane_entry": entry, "fresh_session": fresh, **({"pane_list_error": pl_err} if pl_err else {})})
         return
@@ -1006,8 +1046,16 @@ def cmd_arm(a):
     # never fatal — the lane is armed with or without the bus
     bus = (arm_bus(lane, listed[0], run, w["data"]) if bus_enabled(w["data"])
            else {"ok": True, "skipped": "bus.enabled is false"})
+    # the git guard is a PATH export that only reaches agents started after it: one already running
+    # in the pane never has it (false); no agent yet is unknown (null) — never claimed true
+    running = agent_in_pane(pane)
+    guard = ({"guard_active": False,
+              "guard_note": "an agent was already running when armed; the git guard on PATH only reaches "
+                            f"agents started after the export — restart the agent after exporting "
+                            f"{lane}/.matrixkoder-bin, or rely on the brief's banned-git list"}
+             if running else {"guard_active": None})
     out({"ok": True, "lane": lane, "pane": pane, "watch": os.path.join(lane, WATCH), "armed_at": now,
-         "bus": bus, **({"task_pane_error": "; ".join(errs)} if errs else {})})
+         "bus": bus, **guard, **({"task_pane_error": "; ".join(errs)} if errs else {})})
 
 
 def cmd_disarm(a):
@@ -1553,9 +1601,19 @@ def cmd_event():
                  "recorded": True, "label": label, "toast": toast})
 
 
+def dirty_files(lane):
+    """Lines of `git status --porcelain` in the lane (agent-independent alive signal); None when git fails."""
+    try:
+        r = subprocess.run(["git", "-C", lane, "status", "--porcelain"],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return len(r.stdout.splitlines()) if r.returncode == 0 else None
+
+
 def cmd_sweep(a):
     data = opt(a, "--data")
-    checked, skipped, verdicts = 0, 0, []
+    checked, skipped, verdicts, lanes = 0, 0, [], []
     for wt, _ in armed_lanes(data and os.path.abspath(data)):
         if not os.path.isdir(wt):
             continue
@@ -1567,6 +1625,8 @@ def cmd_sweep(a):
                 skipped += 1
                 continue
             checked += 1
+            dirty = dirty_files(wt)
+            lanes.append({"lane": wt, "task": w.get("task"), "dirty_files": dirty})
             try:
                 h, subj, state, evidence = verdict_for(w)
             except Exception as e:
@@ -1579,9 +1639,12 @@ def cmd_sweep(a):
                 write_watch(wt, w)
                 continue
             rec, label, toast, status = apply_verdict(w, state, subj, evidence, h)
-            verdicts.append({"lane": wt, "task": w.get("task"), "verdict": state,
-                             "status": status, "recorded": rec.get("ok", False)})
-    out({"ok": True, "checked": checked, "skipped": skipped, "verdicts": verdicts})
+            entry = {"lane": wt, "task": w.get("task"), "verdict": state,
+                     "status": status, "recorded": rec.get("ok", False)}
+            if state == "STALL" and dirty:
+                entry["alive_hint"] = f"the lane has {dirty} modified files; it may be working in a subagent"
+            verdicts.append(entry)
+    out({"ok": True, "checked": checked, "skipped": skipped, "lanes": lanes, "verdicts": verdicts})
 
 
 def self_test():
@@ -1755,6 +1818,10 @@ def self_test():
                     "        nm = os.path.join(base, 'pane_list_out.txt')\n"
                     "    sys.stdout.write(open(nm).read())\n"
                     "    sys.exit(0)\n"
+                    "elif a[:2] == ['agent', 'list'] and os.path.exists(os.path.join(base, 'agent_list_out.txt')):\n"
+                    "    sys.stdout.write(open(os.path.join(base, 'agent_list_out.txt')).read())\n"
+                    "    sys.exit(int(open(os.path.join(base, 'agent_list_rc.txt')).read().strip() or '0')"
+                    " if os.path.exists(os.path.join(base, 'agent_list_rc.txt')) else 0)\n"
                     "else:\n"
                     "    print(json.dumps({'result': {}}))\n")
         os.chmod(os.path.join(bin_, "herdr"), 0o755)
@@ -1878,6 +1945,24 @@ def self_test():
         w = watch_of("H1")
         assert (w["pane"], w["task"], w["run"], w["phase"], w["data"]) == (pane_of("H1"), "H1", "r1", "P1", data)
         assert w["commit_grep"] == r"feat\(p1\)" and w["verdict"] is None and w["armed_at"] and w["last_activity"]
+        # (G1) arm reports the git guard: no agent in the pane yet = unknown (null), never true
+        assert a["guard_active"] is None and "guard_note" not in a, a
+        al_out, al_rc = os.path.join(tmp, "agent_list_out.txt"), os.path.join(tmp, "agent_list_rc.txt")
+        open(al_out, "w").write(json.dumps({"result": {"agents": [
+            {"agent": "opencode", "agent_status": "idle", "pane_id": pane_of("H1")}]}}) + "\n")
+        a2 = arm("H1", report="report.json", prompt_marker="dispatch-h1")
+        assert a2["guard_active"] is False, a2
+        assert f"{lanes['H1']}/.matrixkoder-bin" in a2["guard_note"] and "already running" in a2["guard_note"], a2
+        open(al_out, "w").write(json.dumps({"result": {"agents": [
+            {"agent": "opencode", "agent_status": "idle", "pane_id": "wD:elsewhere"}]}}) + "\n")
+        assert arm("H1", report="report.json", prompt_marker="dispatch-h1")["guard_active"] is None
+        open(al_out, "w").write("not json\n")  # a herdr that cannot say stays unknown, arm still ok
+        assert arm("H1", report="report.json", prompt_marker="dispatch-h1")["guard_active"] is None
+        open(al_rc, "w").write("1")
+        open(al_out, "w").write(json.dumps({"result": {"agents": [{"pane_id": pane_of("H1")}]}}) + "\n")
+        assert arm("H1", report="report.json", prompt_marker="dispatch-h1")["guard_active"] is None
+        os.unlink(al_out)
+        os.unlink(al_rc)
         # arm records the lane's pane on the task, so the board names it without reading the watch file
         def task_field(tid, key):
             run_ = json.load(open(os.path.join(data, "runs", "r1", "run.json")))
@@ -1944,6 +2029,10 @@ def self_test():
         old = f"{int(time.time() - 300)} +0000"
         g(lanes["H5"], "commit", "-q", "--allow-empty", "-m", "chore: wip",
           dates={"GIT_COMMITTER_DATE": old, "GIT_AUTHOR_DATE": old})
+        for i in (1, 2):  # H5 has two modified files, old enough not to count as activity: the alive hint
+            wip = os.path.join(lanes["H5"], f"wip{i}.txt")
+            open(wip, "w").write("x")
+            os.utime(wip, (time.time() - 300, time.time() - 300))
         arm("H5", stall_min=1)
         patch_watch("H5", last_activity=time.time() - 90)  # silence since 90 s ago
         g(lanes["H6"], "commit", "-q", "--allow-empty", "-m", "chore: fresh")
@@ -1954,6 +2043,9 @@ def self_test():
         assert r["ok"] and r["checked"] == 3 and r["skipped"] == 3, r  # H3 H5 H6 checked, H1 H2 H4 skipped
         v = {x["task"]: x for x in r["verdicts"]}
         assert set(v) == {"H5"} and v["H5"]["verdict"] == "STALL" and v["H5"]["status"] == "stalled", r
+        dirty = {x["task"]: x["dirty_files"] for x in r["lanes"]}
+        assert set(dirty) == {"H3", "H5", "H6"} and dirty["H5"] == 2 and dirty["H6"] == 0, dirty
+        assert v["H5"]["alive_hint"] == "the lane has 2 modified files; it may be working in a subagent", v["H5"]
         assert task_status("H5") == "stalled" and watch_of("H6")["verdict"] is None
         assert task_status("H6") == "building" and task_status("H3") == "building"
         ntr = len(transitions())
@@ -2037,6 +2129,8 @@ def self_test():
         r = cli("dispatch", "--pane", pane_of("H1"), "--text", "go")
         assert r["ok"] is True and r["delivered"] is True and r["pane_state"] == "working", r
         assert r["timed_out"] is True and "timeout" in r["herdr_error"], r
+        # (G1) delivered: no error field, herdr's words in herdr_error, the note says why
+        assert "error" not in r and r["note"].endswith("herdr status wait timed out; the pane is working"), r
         # (c) timeout + agent_prompt_stalled (or the pane gone from the list) → delivered:false
         set_canned("pane_list_out.txt", json.dumps({"result": {"panes": [
             {"pane_id": pane_of("H1"), "agent_status": "agent_prompt_stalled"}]}}) + "\n")
@@ -2186,7 +2280,8 @@ def self_test():
         r = cli("dispatch", "--pane", pane_of("H8"), "--text", "go", extra=fast)
         assert r["ok"] is True and r["delivered"] is True and r["recovered"] is True and r["attempts"] == 2, r
         assert r["pane_state"] == "done" and r["pane_entry"] == done_row, r
-        assert "timeout" in r["herdr_error"] and "timeout" in r["error"] and r["timed_out"] is True, r
+        assert "timeout" in r["herdr_error"] and "error" not in r and r["timed_out"] is True, r
+        assert r["note"].endswith("herdr wait timed out; the prompt had already landed"), r
         # (c) pane state null — missing from a readable list, or the list unreadable → NO retry
         set_canned("pane_list_out.txt", '{"result": {"panes": []}}\n')
         set_canned("prompt_q.txt", "- 2")  # a scripted second reply that must never be sent
@@ -2709,6 +2804,8 @@ def self_test():
         r = cli("dispatch", "--pane", pane_of("H1"), "--text", "the full prompt stays")
         assert prompt_calls()[n0:][-1].endswith("the full prompt stays --wait --timeout 25000"), \
             prompt_calls()[n0:]
+        # (G1) the reply names the path: no doorbell, and why, on an armed lane whose bus is down
+        assert r["connect"] is False and r["note"] == "legacy prompt: bus is down", r
 
         # (D7B R3) bus up: a real /health plus bus.json. The suite's bus is the fake, so
         # "published" is the recorded send argv. No brief -> the full prompt and the reply names
@@ -2763,6 +2860,26 @@ def self_test():
             assert "mk-builder.py connect" in _typed and "the full prompt stays" not in _typed, _typed
             # E3: the doorbell carries --data, so the lane's first command needs no env
             assert f"--data {data}" in _typed, _typed
+            # (G1) no flag: a build dispatch to an armed lane with a live bus rings the doorbell
+            assert r["connect"] is True and "note" not in r, r
+            n0 = len(prompt_calls())
+            r = cli("dispatch", "--pane", pane_of("NB"), "--text", "the full prompt stays",
+                    extra={"MK_DOORBELL_IDLE_WAIT_S": "5", "MK_DOORBELL_IDLE_POLL_S": "0.05"})
+            assert r["delivered"] is True and r["connect"] is True, r
+            assert "mk-builder.py connect" in prompt_calls()[n0:][-1], prompt_calls()[n0:]
+            # (G1) --no-connect forces the legacy prompt and the reply says so
+            n0 = len(prompt_calls())
+            r = cli("dispatch", "--pane", pane_of("NB"), "--text", "the full prompt stays", "--no-connect")
+            assert r["delivered"] is True and r["connect"] is False, r
+            assert r["note"] == "legacy prompt: --no-connect given", r
+            assert prompt_calls()[n0:][-1].endswith("the full prompt stays --wait --timeout 25000"), \
+                prompt_calls()[n0:]
+            # (G1) --role review never rings the doorbell, and gets no legacy note
+            n0 = len(prompt_calls())
+            r = cli("dispatch", "--pane", pane_of("NB"), "--text", "the full prompt stays", "--role", "review")
+            assert r["delivered"] is True and r["connect"] is False and "note" not in r, r
+            assert prompt_calls()[n0:][-1].endswith("the full prompt stays --wait --timeout 25000"), \
+                prompt_calls()[n0:]
             # E3: the doorbell waits for idle. The pane starts working; the first pane list
             # says so, the second says idle. The typed line comes after the idle observation.
             open(os.path.join(tmp, "pane_list_q.txt"), "w").write("1 2")
@@ -2814,6 +2931,7 @@ def self_test():
             assert r.get("publish_error") == "too big", r
             assert prompt_calls()[n0:][-1].endswith("the full prompt stays --wait --timeout 25000"), \
                 prompt_calls()[n0:]
+            assert r["connect"] is False and r["note"] == "legacy prompt: publish failed: too big", r
             os.unlink(os.path.join(tmp, "bus_send_rc.txt"))
             os.unlink(os.path.join(tmp, "bus_send_out.txt"))
             os.unlink(os.path.join(_bus_dir, "bus.json"))
