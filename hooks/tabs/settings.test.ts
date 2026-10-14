@@ -182,7 +182,9 @@ test('Settings · Mode: scope bar 1-8, MOCK row, Solo/Orchestrator/Hive (no Hybr
   for (const name of ['Solo', 'Orchestrator', 'Hive']) expect(flat.includes(name), `the ${name} mode card`).toBe(true)
   expect(flat.includes('Hybrid'), 'no Hybrid mode').toBe(false)
   expect(flat.includes('reset Mode to defaults'), 'no danger row on Mode').toBe(false)
-  // pressing a mode card writes the edit; Hive then shows the checklist
+  // pressing a mode card writes the edit; Hive then shows the checklist card.
+  // L7.5: the hive rows came from the retired projects.json, so the fixture (and
+  // the live view) draws none — the card renders, empty, with no stale entries.
   press(drawn, 'set-mode-solo')
   expect(ui.get('settings:edit:mode')).toBe('"solo"')
   press(drawn, 'set-mode-hive')
@@ -190,9 +192,10 @@ test('Settings · Mode: scope bar 1-8, MOCK row, Solo/Orchestrator/Hive (no Hybr
   const hive = draw(ui)
   const hiveFlat = drawnText(hive)
   expect(hiveFlat.includes('HIVE · PROJECTS'), 'the hive checklist card').toBe(true)
-  for (const p of ['matrixkoder', 'hermes-switchui', 'hermes-desktop']) expect(hiveFlat.includes(p), `the ${p} project`).toBe(true)
-  press(hive, 'set-hive-hermes-desktop') // unchecked in the fixture → toggles on
-  expect(ui.get('settings:edit:hive.hermes-desktop')).toBe('true')
+  for (const p of ['matrixkoder', 'hermes-switchui', 'hermes-desktop']) {
+    expect(hiveFlat.includes(p), `no stale ${p} entry (projects.json retired)`).toBe(false)
+  }
+  expect(hiveFlat.includes('mode = hive'), 'the card names its live source').toBe(true)
 
   fitCheck(drawn, 46)
   fitCheck(draw(ui, 36), 36)
@@ -537,13 +540,19 @@ test('Settings · danger: every scope except Mode and About; the press clears th
     if (id in want) expect(flat.includes(want[id] ?? ''), `the danger row on ${id}`).toBe(true)
     else expect(flat.includes('reset'), `no danger row on ${id}`).toBe(false)
   }
-  // a press clears its own scope's edits and leaves another scope's alone
+  // a press clears its own scope's edits and leaves another scope's alone.
+  // L7.5: agents.*.available is read-only now, so the Agents-scope edit uses the
+  // usage.providers list row instead.
   const drawn = draw(ui, 46, 'routing')
   press(drawn, 'set-routing_preferences.reserve_floor.others.weekly_left_pct-inc')
-  press(draw(ui, 46, 'agents'), 'set-agents.agy.available-tog')
+  const agents = draw(ui, 46, 'agents')
+  const providers = nodesOf(agents, 'Input').find(i => String(i.props.key) === 'set-usage.providers')
+  expect(providers, 'the usage.providers Input').toBeDefined()
+  ;(providers?.props.onInput as (v: string) => void)('claude')
+  expect(ui.get('settings:edit:usage.providers')).toBe('"claude"')
   press(draw(ui, 46, 'routing'), 'set-danger')
   expect(ui.get('settings:edit:routing_preferences.reserve_floor.others.weekly_left_pct')).toBe('')
-  expect(ui.get('settings:edit:agents.agy.available')).toBe('true') // untouched (agy off → toggled on)
+  expect(ui.get('settings:edit:usage.providers')).toBe('"claude"') // untouched, another scope
   // on Models the danger row also clears pick edits
   const models = draw(ui, 46, 'models')
   press(models, 'set-model-claude-claude-haiku-5-5')
