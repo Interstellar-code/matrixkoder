@@ -25,6 +25,7 @@ Checked against `--help`. `B=python3 ${CLAUDE_SKILL_DIR}/scripts/mk-builder.py` 
 | Reply to the orchestrator | `$B progress "<your reply>"` — posts `info progress: <text>` to orch on the bus |
 | Read orchestrator messages | `$B inbox` (acks each); `$B listen --timeout 5` between steps |
 | Mark one message read | `$B ack <msg id>` |
+| Long check (over ~2 min), push result | `$B check --name <n> -- <cmd>` — returns at once; the result arrives as a typed line in your pane |
 | Ask a blocking question | `$B ask "<question>"`; on `PENDING <id>` (exit 3) run `$B wait <id>` |
 | Blocked, bus down | `$B blocked "<question>"`, then stop |
 | Todo item state | `$B todo in_progress <id>` / `$B todo done <id>` |

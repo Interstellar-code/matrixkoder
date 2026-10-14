@@ -28,7 +28,7 @@ Test guidance (mk-store-r1; keep this short):
 - Types: `<typecheck cmd>` must stay at **<baseline>**; nothing new in <owned paths>
 - Lint/format ONLY changed files: `<lint cmd> <files>`, `<format cmd> <files>` — never repo-wide
 - Banned commands (repo list): <banned commands>
-- Start each finite check detached with its output in a file and the exit code appended (`cmd > out.txt 2>&1; echo EXIT:$? >> out.txt`), then in the SAME turn wait with a bounded loop (`until grep -q '^EXIT:' out.txt; do sleep 5; done; tail -n 5 out.txt`, upper bound 20 minutes; print a message if it expires) and never end a turn while a job you started is still running; read every result before committing, quote its last line, never start servers.
+- A check over ~2 min runs via `mk-builder.py check --name <n> -- <cmd>`: it starts detached, returns at once, and its result comes back to you as a typed line in your pane (and to the orchestrator over the bus); post progress, then end your turn or keep working, and resume when that line arrives (`mk-builder.py inbox`). Shorter checks: start each finite check detached with its output in a file and the exit code appended (`cmd > out.txt 2>&1; echo EXIT:$? >> out.txt`), then in the SAME turn wait with a bounded loop (`until grep -q '^EXIT:' out.txt; do sleep 5; done; tail -n 5 out.txt`, upper bound 20 minutes; print a message if it expires) and never end a turn while a job you started is still running; read every result before committing, quote its last line, never start servers.
 - Run the full suite once before DONE and quote its summary line (the `selftest: N run, M failed` line the repo's suite prints). A red full suite means the round is not done even if the scoped tests pass.
 
 ## Parallel parts (default ON)
