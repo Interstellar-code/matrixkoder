@@ -536,7 +536,10 @@ def _is_descendant(store, run, tid, root):
 def apply_lane_todos(store, run, task, text):
     """Move the lane's subtasks named by `todo <state> <id>` lines -> (updated ids, ignored ids).
     in_progress -> building; completed|done -> verifying (a lane never sets done; todo_done_status is ignored here). An id that is
-    not a descendant of the token's task is ignored: a lane never moves another task."""
+    not a descendant of the token's task is ignored: a lane never moves another task.
+
+    Every line is applied in order, so an id named twice ends in its LAST state; the returned
+    list names each id once (review LOW), so a lane that moves one id twice does not report it twice."""
     updated, ignored = [], []
     for state, tid in LANE_TODO_RE.findall(text or ""):
         try:
@@ -551,7 +554,7 @@ def apply_lane_todos(store, run, task, text):
         else:
             upd, _ = _store_move(store, run, tid, "verifying", f"bus todo {state}",
                                  allowed_from=("building",))
-        if upd:
+        if upd and tid not in updated:
             updated.append(tid)
     return updated, ignored
 
@@ -603,6 +606,9 @@ class BusState:
         self._ring_inflight = set()
         self._ring_notes = []
         self._ring_skipped = set()
+        # Message ids whose Esc has already been sent (review LOW: one Esc per message id, so a
+        # ring retry of the same message cannot interrupt a second turn). Same lock as the queue.
+        self._ring_esc = set()
         # Doorbell drain interval. A queued ring is delivered when the lane
         # goes idle even if no later message arrives to call _drain_rings.
         # Override with MK_BUS_RING_INTERVAL_SEC (seconds, minimum 0.05).
@@ -983,8 +989,10 @@ class BusState:
           any kind, urgent message Esc (send-keys) first, then the doorbell
 
         STEER kinds default to claude,codex; $MK_BUS_STEER_KINDS (comma list,
-        empty = none) overrides. `urgent` comes from `send --urgent`; Esc
-        interrupts the turn, so it is for real redirects only. One ring per message id, recorded as an
+        empty = none) overrides. `urgent` comes from `send --urgent` and is honoured only from the
+        orchestrator — the one sender allowed to interrupt a lane's turn. Esc interrupts the turn,
+        so it is for real redirects only, and it goes out once per message id: a ring retry of the
+        same message must not interrupt a second turn. One ring per message id, recorded as an
         event chan=bus kind=ring. With the bus down this method is never
         called, so nothing rings.
         """
@@ -998,6 +1006,12 @@ class BusState:
         to_id = msg.get("to")
         if not to_id or to_id == "orch":
             return
+        # `urgent` is the orchestrator's alone: only the orchestrator may interrupt a working
+        # lane's turn. `from` is the sender identity the token fixed — a lane token's is its own
+        # task id, never "orch" — so another sender's urgent is still queued and delivered, and
+        # reaches the drain un-urgent.
+        if msg.get("urgent") and msg.get("from") != "orch":
+            msg = dict(msg, urgent=False)
         self._ring_enqueue(msg)
 
     def _ring_enqueue(self, msg):
@@ -1108,9 +1122,15 @@ class BusState:
         status = agent.get("agent_status")
         if status == "working":
             if msg.get("urgent"):
-                if not self._send_esc(pane):
+                # One Esc per message id: a ring retry of the same message must not interrupt a
+                # second turn (the first Esc already ended the one it was aimed at).
+                with self._ring_lock:
+                    esc_done = msg["id"] in self._ring_esc
+                if not esc_done and not self._send_esc(pane):
                     still.append(msg)  # Esc failed: stay queued rather than type into a busy turn
                     return
+                with self._ring_lock:
+                    self._ring_esc.add(msg["id"])
             elif not self._steers(agent):
                 still.append(msg)  # queue until idle
                 return
@@ -4688,6 +4708,81 @@ def _store_self_test_body(mod):
         # A pane id that reads as an option is refused before herdr is called.
         assert BusState._type_ring(None, {"run": "r1", "id": "m-0"}, "line", 1, None, "-x") is False
 
+        def esc_calls():
+            return [c for c in herdr_calls() if c.startswith("agent send-keys")]
+
+        # (10) `urgent` Escs once per message id: a ring retry of the same message must not
+        # interrupt a second turn, while a second id gets its own Esc.
+        def esc_once_proof(senders, status="idle"):
+            """-> (esc count, ring count, urgent flags queued): each sender's urgent message is
+            queued once by the real `_maybe_ring`, then drained twice by the real `_drain_one`
+            — the first attempt and the retry the ring queue uses. herdr is the only mock:
+            `_send_esc` and `_ring` become counters. Two ids per sender, so a retry is
+            distinguishable from a new message."""
+            bus = BusState(data, "r1", bus_dir=home)
+            bus.project = "proj"
+            escs, typed, queued = [], [], []
+            bus._send_esc = lambda pane: (escs.append(pane) or True)
+            bus._ring = lambda msg, pane: (typed.append(msg["id"]) or True)
+            bus._pick_pane = lambda msg, agents: (agents[0], "wE:p2")
+            agents = [{"pane_id": "wE:p2", "agent_status": status, "name": "e2-t9-build-r1",
+                       "cwd": lane_e2}]
+            base = {"run": "r1", "task": "T9", "to": "T9", "kind": "nudge", "urgent": True,
+                    "project": "proj", "queued_at": time.time()}
+            for i, sender in enumerate(senders):
+                for j in (1, 2):  # two ids: a retry is never a second interrupt
+                    bus._maybe_ring(dict(base, id=f"m-esc-{i}-{j}", **{"from": sender}))
+                    row = bus._ring_queue.pop()   # the row this send queued
+                    queued.append(bool(row.get("urgent")))
+                    bus._drain_one(row, agents, [])   # the attempt
+                    bus._drain_one(row, agents, [])   # its retry, same id
+            return len(escs), len(typed), queued
+
+        # (10) Two orchestrator ids on a WORKING lane, each retried once: four drains and two
+        # Escs — a ring retry of the same message never interrupts a second turn, while the
+        # second id interrupts its own.
+        assert esc_once_proof(["orch"], "working") == (2, 4, [True, True]), \
+            esc_once_proof(["orch"], "working")
+
+        # (11) `urgent` is honoured only from the orchestrator. On a WORKING lane the lane's
+        # two ids are still delivered and still queued, but un-urgent: they wait for idle
+        # instead of Escing, so the run Escs exactly twice, for the orchestrator alone.
+        assert esc_once_proof(["orch", "T9"], "working") == (2, 4, [True, True, False, False]), \
+            esc_once_proof(["orch", "T9"], "working")
+
+        def send_from(sender, text, **extra):
+            return post(port2, btok, {"run": "r1", "task": "T9", "kind": "nudge", "text": text,
+                                      "from": sender, "to": "T9", "project": "proj",
+                                      "urgent": True, **extra})
+
+        # End to end over the real server, both senders on the same working pane.
+        set_agents(dict(p2, agent_status="working"))
+        n_e, n_a = len(esc_calls()), len(list_calls())
+        code, lane_urgent_msg = send_from("T9", "lane urgent")
+        assert code == 200 and lane_urgent_msg["message"]["kind"] == "nudge", lane_urgent_msg
+        # Count-based: wait until the drain carrying this message has asked herdr for the agent
+        # list (one `agent list` more than before), so the ring has made its decision.
+        deadline = time.time() + 10.0
+        while time.time() < deadline and len(list_calls()) < n_a + 1:
+            time.sleep(0.1)
+        time.sleep(0.5)
+        assert len(esc_calls()) == n_e, ("a non-orch urgent must not Esc", esc_calls()[n_e:])
+        # The orchestrator's urgent on the same working lane does Esc.
+        assert send_from("orch", "orch urgent")[0] == 200
+        deadline = time.time() + 10.0
+        while time.time() < deadline and len(esc_calls()) < n_e + 1:
+            time.sleep(0.1)
+        assert len(esc_calls()) == n_e + 1, esc_calls()[n_e:]
+        # The lane's message is still queued (it waits for idle); the orchestrator's already
+        # rang. Drain the lane's, so nothing this block sent can ring into a later case's
+        # prompt count. Count-based: wait for the ring queue file to empty.
+        qp = os.path.join(home, "ring-queue.json")
+        set_agents(p2)
+        deadline = time.time() + 15.0
+        while time.time() < deadline and read_json(qp, default=[]):
+            time.sleep(0.1)
+        assert read_json(qp, default=[]) == [], "ring queue left dirty"
+
         # (5) A ring recorded but not typed (bus killed in between) is queued on restart,
         # not typed into an agent that is working now; it rings once the agent is idle.
         kill(pid2)
@@ -5344,7 +5439,18 @@ def _lane_state_self_test(mod):
         code, res = call(port, tok_s1, "/send", {"kind": "task", "text": "todo done S1c"})  # never started: no move
         assert code == 200 and res.get("todo_updated") == [] and status_of("S1c") == "planned", res
         code, res = call(port, tok_s1, "/send", {"kind": "task", "text": "todo in_progress S1c\ntodo completed S1c"})
-        assert code == 200 and res.get("todo_updated") == ["S1c", "S1c"] and status_of("S1c") == "verifying", res
+        # One entry per id (review LOW): both lines are applied in order, so S1c ends in its
+        # LAST state, and the reply names it once.
+        assert code == 200 and res.get("todo_updated") == ["S1c"] and status_of("S1c") == "verifying", res
+        con = mod.open_project(data, data_dir=data)
+        try:
+            for t in ("S1d", "S1e"):
+                mod.add_task(con, "r1", t, "task", title="e8 " + t, parent="S1")
+        finally:
+            con.close()
+        code, res = call(port, tok_s1, "/send", {"kind": "task", "text": "todo in_progress S1d\ntodo in_progress S1e\ntodo done S1d"})
+        assert code == 200 and res.get("todo_updated") == ["S1d", "S1e"], res  # distinct ids untouched
+        assert status_of("S1d") == "verifying" and status_of("S1e") == "building", (status_of("S1d"), status_of("S1e"))
 
         # A late or stale lane word never overwrites a state the orchestrator moved on to, and
         # `done` from a lane never reaches done or merged (R2 HIGH).
