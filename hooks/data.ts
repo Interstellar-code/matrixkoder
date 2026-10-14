@@ -69,12 +69,18 @@ export function globalDirPath(envHome: string | null | undefined, home: string |
   return home == null ? null : join(home, '.matrixkoder')
 }
 
-/** One row of `mkdb.py projects --json`: the root store's projects table. */
-export type MkProjectRow = { slug?: unknown; repo?: unknown; data_dir?: unknown }
+/** One row of `mkdb.py projects --json`: the root store's projects table. `db_path` is the C3
+ *  migrated marker (set by mk-migrate --switch); the same reply carries it for free. */
+export type MkProjectRow = { slug?: unknown; repo?: unknown; data_dir?: unknown; db_path?: unknown }
 
 /** Root-store lookup (`mkdb.py projects --json`): first repo path whose row has a data_dir wins.
  *  Same path rules as projectDataDir. A failed command or an empty list is not a match — the
- *  caller falls back to projects.json. */
+ *  caller falls back to projects.json.
+ *
+ *  C1 (L3): a row with `db_path` set is a MIGRATED project — its folder is the C2 target
+ *  `<home>/projects/<slug>` (dirname of db_path), which is what every path under it (the store,
+ *  the plan/run/task tree) hangs off. Mirrors mkpaths.project_dir: migrated → C2, else today's
+ *  data_dir. Unmigrated rows keep the old answer byte-for-byte. */
 export function projectDirFromStore(rows: readonly MkProjectRow[] | null | undefined, repoPaths: readonly string[], home: string | null): string | null {
   if (!Array.isArray(rows)) return null
   const wanted = new Set(repoPaths)
@@ -82,6 +88,8 @@ export function projectDirFromStore(rows: readonly MkProjectRow[] | null | undef
     if (row == null || typeof row !== 'object') continue
     const repo = typeof row.repo === 'string' ? row.repo : ''
     if (!wanted.has(repo)) continue
+    const dbPath = typeof row.db_path === 'string' ? row.db_path.trim() : ''
+    if (dbPath !== '') return normalizePath(parentOf(normalizePath(dbPath)))
     const dir = typeof row.data_dir === 'string' ? row.data_dir.trim() : ''
     if (dir === '') continue
     if (dir === '~' || dir.startsWith('~/')) return home == null ? null : normalizePath(dir === '~' ? home : join(home, dir.slice(2)))
