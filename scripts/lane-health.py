@@ -36,7 +36,7 @@ def cfg(key, flag=None):
         lines = []
     return mk_config.value_of(lines, mk_config.row_for(lines, key))[1]
 
-KINDS = ("claude", "codex", "opencode", "agy")
+KINDS = ("claude", "codex", "opencode", "agy", "omp")
 # A quota hit needs a quota noun: bare "rate limit"/429, "Context limit reached" and a lone "resets in 3s"
 # are throttles or compaction, not an exhausted plan. "(Free) usage exceeded" is one (OpenCode's free tier:
 # "Free usage exceeded, subscribe to Go"). Reset phrases only feed parse_reset, never trigger.
@@ -395,6 +395,7 @@ def self_test_body(shutil):
         assert cfg("session.stall_min") == mk_config.value_of(
             [], mk_config.row_for([], "session.stall_min"))[1], cfg("session.stall_min")
         assert cfg("session.stall_min", "9") == "9"  # a given flag wins
+        assert "omp" in KINDS  # the pi agent (omp) is a lane kind: lane-watch and arm accept --kind omp
     finally:
         if old_md is None:
             os.environ.pop("MATRIXKODER_DATA", None)

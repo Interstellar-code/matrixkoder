@@ -50,7 +50,7 @@ FALLBACK_VERSION = "0.3.0"
 STATUS_NAME = ".matrixkoder-status.json"
 STATES = ("started", "working", "subagent", "blocked", "done")
 ROLES = ("builder", "reviewer")
-AGENTS = ("claude", "codex", "opencode", "agy", "unknown")
+AGENTS = ("claude", "codex", "opencode", "agy", "omp", "unknown")
 # `review` is the spelling the brief and lane-rules R19 use for the reviewer's token.
 ROLE_ALIASES = {"builder": "builder", "review": "reviewer", "reviewer": "reviewer"}
 # Table 1: the mk-state id alphabet (letters, digits, `.`, `_`, `-`, max 64, mk-state.py:134-136)

@@ -3,7 +3,7 @@
 
 Usage:
   lane-watch.py --lane DIR --agent NAME|PANE --commit-grep REGEX [--report PATH] [--phase P1]
-                [--kind claude|codex|opencode|agy] [--prompt-marker TEXT]
+                [--kind claude|codex|opencode|agy|omp] [--prompt-marker TEXT]
                  [--then-send BRIEF_PATH] [--max-wait-min N] [--poll 20] [--stall-min N]
                  [--task T | --tasks A,B --data DIR [--run ID]] [--no-commit]
   lane-watch.py --self-test

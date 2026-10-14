@@ -3,7 +3,7 @@
 
 Usage:
   mk-lane-event.py arm --lane DIR --pane ID --task T --run R --data DIR --phase P --commit-grep RX
-                      [--report PATH] [--kind claude|codex|opencode|agy] [--prompt-marker TEXT] [--stall-min N]
+                      [--report PATH] [--kind claude|codex|opencode|agy|omp] [--prompt-marker TEXT] [--stall-min N]
   mk-lane-event.py arm --lane DIR --pane ID --tasks A,B --run R --data DIR --phase P --commit-grep RX
                       [...]   # a shared lane group: one lane serving several phases of one plan
   mk-lane-event.py event                (herdr plugin hook: reads HERDR_PLUGIN_EVENT + HERDR_PLUGIN_EVENT_JSON)
