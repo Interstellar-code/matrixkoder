@@ -525,20 +525,6 @@ LANE_TODO_RE = re.compile(r"(?m)^[ \t]*todo[ \t]+(in_progress|completed|done)[ \
 _TODO_START_FROM = ("planned", "routed", "dispatched", "ready", "fix")
 
 
-def _todo_done_target(data_dir):
-    """session.todo_done_status from <data>/matrixkoder.yaml (the line `todo_done_status: verify|done`):
-    verify -> verifying (default), done -> done. Same tiny scan the builder side uses."""
-    try:
-        with open(os.path.join(data_dir, "matrixkoder.yaml")) as f:
-            for line in f:
-                raw = line.split("#", 1)[0].strip()
-                if raw.startswith("todo_done_status:"):
-                    return "done" if raw.split(":", 1)[1].strip().strip("\"'") == "done" else "verifying"
-    except OSError:
-        pass
-    return "verifying"
-
-
 def _is_descendant(store, run, tid, root):
     """True when `tid` is a child, at any depth, of `root` in this run (parent chain, depth-capped)."""
     cur = tid
@@ -554,7 +540,7 @@ def _is_descendant(store, run, tid, root):
 
 def apply_lane_todos(store, run, task, text):
     """Move the lane's subtasks named by `todo <state> <id>` lines -> (updated ids, ignored ids).
-    in_progress -> building; completed|done -> verifying or done (todo_done_status). An id that is
+    in_progress -> building; completed|done -> verifying (a lane never sets done; todo_done_status is ignored here). An id that is
     not a descendant of the token's task is ignored: a lane never moves another task."""
     updated, ignored = [], []
     for state, tid in LANE_TODO_RE.findall(text or ""):
@@ -568,7 +554,7 @@ def apply_lane_todos(store, run, task, text):
         if state == "in_progress":
             upd, _ = _store_move(store, run, tid, "building", f"bus todo {state}", allowed_from=_TODO_START_FROM)
         else:
-            upd, _ = _store_move(store, run, tid, _todo_done_target(store.data_dir), f"bus todo {state}",
+            upd, _ = _store_move(store, run, tid, "verifying", f"bus todo {state}",
                                  allowed_from=("building",))
         if upd:
             updated.append(tid)
@@ -5299,6 +5285,8 @@ def _lane_state_self_test(mod):
         code, res = call(port, tok_s1, "/send", {"kind": "task", "text": "round: 1\ntodo done S1b\ntodo done S2x\ntodo done S2"})
         assert code == 200 and res.get("todo_updated") == ["S1b"] and res.get("todo_ignored") == ["S2x", "S2"], res
         assert status_of("S1b") == "verifying" and status_of("S2x") == "planned" and status_of("S2") == "verifying", (status_of("S1b"), status_of("S2x"))
+        with open(os.path.join(data, "matrixkoder.yaml"), "w") as yf:
+            yf.write("todo_done_status: done\n")  # a lane still stops at verifying
         assert status_of("S1a") == "verifying", status_of("S1a")  # rolled up from its only child
         code, res = call(port, tok_s1, "/send", {"kind": "task", "text": "todo done S1c"})  # never started: no move
         assert code == 200 and res.get("todo_updated") == [] and status_of("S1c") == "planned", res

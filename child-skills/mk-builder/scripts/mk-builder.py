@@ -240,6 +240,46 @@ def write_status(lane, obj):
     return path
 
 
+_HELD_LOCKS = set()
+
+
+@contextlib.contextmanager
+def status_lock(lane):
+    """Exclusive flock on a sibling `.lock` around a read-modify-write of the status file, so a
+    concurrent writer (progress, done, blocked, a check supervisor) is never reverted. LOCK_NB with
+    a retry up to BUS_LOCK_WAIT, the same shape as bus_advance_cursor; a held lock -> Fail."""
+    path = status_path(lane) + ".lock"
+    if path in _HELD_LOCKS:  # re-entrant: a locked cmd_* that calls status_block/set_check
+        yield
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as lf:
+        deadline = time.monotonic() + BUS_LOCK_WAIT
+        while True:
+            try:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise Fail(f"status file lock held {BUS_LOCK_WAIT:.0f}s")
+                time.sleep(0.05)
+        _HELD_LOCKS.add(path)
+        try:
+            yield
+        finally:
+            _HELD_LOCKS.discard(path)
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+
+def status_locked(fn):
+    """Run a cmd_* function (argparse namespace `a`) under status_lock of its lane."""
+    def wrapper(a):
+        with status_lock(lane_dir(a)):
+            return fn(a)
+    wrapper.__name__, wrapper.__doc__ = fn.__name__, fn.__doc__
+    return wrapper
+
+
 def stamp(obj):
     """R25: every accepted write bumps `seq` by exactly 1 and sets `updated_at` to the write
     time (R7: float epoch seconds, full precision)."""
@@ -322,6 +362,7 @@ def archive_other_rounds(lane, run, round_n, report):
 
 # ---------- commands ----------
 
+@status_locked
 def cmd_start(a):
     """R21/R22: a different (run, task, round, role) — or a `done` file — is an archive plus a
     fresh file; the same identity with a non-done state is a resume. The lane's round files of
@@ -353,6 +394,7 @@ def cmd_start(a):
              "role": role, "agent": agent, "file": status_path(lane)}, None)
 
 
+@status_locked
 def cmd_progress(a):
     """R13.1/R13.3/R13.5/R15 plain progress; R13.2/R15 `--subagent`, where a heartbeat in
     `subagent` bumps only `seq` and `updated_at` so the run's age stays readable (R9). BB: the
@@ -402,17 +444,17 @@ def check_out_path(lane, name):
 
 def set_check(lane, name, entry):
     """Add (entry dict) or clear (None) one running check in the status file's `checks` map.
-    shortcut: read-modify-write without a lock, so a `progress` landing in the same instant can
-    lose the entry; the next check or the pid probe in lane-watch heals it."""
-    old = read_status(lane)
-    if old is None:
-        return
-    checks = dict(old.get("checks") or {})
-    if entry is None:
-        checks.pop(name, None)
-    else:
-        checks[name] = entry
-    write_status(lane, stamp(dict(old, checks=checks)))
+    Under status_lock, so it never reverts a concurrent done/blocked write."""
+    with status_lock(lane):
+        old = read_status(lane)
+        if old is None:
+            return
+        checks = dict(old.get("checks") or {})
+        if entry is None:
+            checks.pop(name, None)
+        else:
+            checks[name] = entry
+        write_status(lane, stamp(dict(old, checks=checks)))
 
 
 def cmd_check(a):
@@ -504,6 +546,7 @@ def token_for(old, tail):
     return f"{old['task']} {'REVIEW ' if old.get('role') == 'reviewer' else ''}R{old['round']} {tail}"
 
 
+@status_locked
 def cmd_blocked(a):
     """R19: a non-empty question (whitespace-only is empty); R26 prints the token."""
     lane, old = lane_dir(a), load_live(lane_dir(a))
@@ -604,6 +647,7 @@ def running_lane_children(lane):
     return hits
 
 
+@status_locked
 def cmd_done(a):
     """R18: the report file at the lane root AND a readable HEAD; R20: final per identity, so the
     legality table refuses every second write. The report is checked first, so the error is
@@ -641,6 +685,7 @@ def cmd_done(a):
             token_for(obj, tail))
 
 
+@status_locked
 def cmd_review_done(a):
     """Reviewer lane: post the verdict, finding count and review file path as ONE bus message,
     then move the status file to done (the same legal transition as `done`) and print
@@ -672,6 +717,7 @@ def cmd_review_done(a):
             f"{old['task']} REVIEW R{old['round']} DONE")
 
 
+@status_locked
 def cmd_ctx(a):
     """R10: only an integer 0..100, and only this command ever writes `ctx_pct`."""
     lane, old = lane_dir(a), load_live(lane_dir(a))
@@ -683,6 +729,7 @@ def cmd_ctx(a):
     return ({"ok": True, "seq": obj["seq"], "ctx_pct": obj["ctx_pct"]}, None)
 
 
+@status_locked
 def cmd_phase_done(a):
     """R8: append-only, a phase id at most once per round; R17: only in `working`."""
     lane, old = lane_dir(a), load_live(lane_dir(a))
@@ -1503,10 +1550,11 @@ def status_block(lane, question):
     and subagent cleared), so MB3 reads BLOCKED and no STALL fires while the call waits.
     Best-effort: the bus round trip never dies on a refused status write."""
     try:
-        old = load_live(lane)
-        require_state(old, "blocked")
-        obj = dict(old, state="blocked", question=question, commit=None, subagent=None)
-        write_status(lane, stamp(obj))
+        with status_lock(lane):
+            old = load_live(lane)
+            require_state(old, "blocked")
+            obj = dict(old, state="blocked", question=question, commit=None, subagent=None)
+            write_status(lane, stamp(obj))
         return True
     except (Fail, OSError, ValueError):
         return False
@@ -1515,10 +1563,11 @@ def status_block(lane, question):
 def status_resume(lane):
     """The answer's write-back: `blocked -> working` (R13.5), the step kept. Best-effort."""
     try:
-        old = load_live(lane)
-        require_state(old, "progress")
-        obj = dict(old, state="working", question=None, subagent=None)
-        write_status(lane, stamp(obj))
+        with status_lock(lane):
+            old = load_live(lane)
+            require_state(old, "progress")
+            obj = dict(old, state="working", question=None, subagent=None)
+            write_status(lane, stamp(obj))
         return True
     except (Fail, OSError, ValueError):
         return False
@@ -2530,6 +2579,7 @@ def post_status(lane, old, state, note):
             "state_ignored": reply.get("state_ignored")}
 
 
+@status_locked
 def cmd_todo(a):
     """`todo done <id>` — the backup reporter (C7). `todo in_progress <id>` likewise.
     Both post a status; the bus dedupes by (task, state, round)."""
@@ -5441,6 +5491,24 @@ def t_e1_progress_posts_info(root):
              if r.get("kind") == "info" and r.get("task") == "E1P" and (r.get("text") or "").startswith("progress:")]
     assert len(infos) == 1 and infos[0]["text"] == "progress: reading the spec", infos
     assert infos[0].get("from") == "E1P", infos[0]
+
+
+def t_status_lock_keeps_concurrent_write(root):
+    """set_check/clear running while another process writes `blocked` never loses either write."""
+    lane = os.path.join(root, "lock_lane")
+    os.makedirs(lane)
+    begin(lane, root, task="LK")
+    code = ("import sys,importlib.util as u;s=u.spec_from_file_location('m',%r);m=u.module_from_spec(s);"
+            "s.loader.exec_module(m);[m.set_check(%r,'c%%d'%%i,{'pid':1}) for i in range(25)]") % (os.path.abspath(__file__), lane)
+    p = subprocess.Popen([sys.executable, "-c", code])
+    n = 0
+    while p.poll() is None or n < 3:
+        cli(lane, "progress", "step %d" % n)
+        n += 1
+    c, _ = cli(lane, "blocked", "why")
+    assert p.wait() == 0 and c == 0
+    st = status(lane)
+    assert st["state"] == "blocked" and len(st["checks"]) == 25 and st["step"].startswith("step"), st
 
 
 def t_check_pushes_result(root):

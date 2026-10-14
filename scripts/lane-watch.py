@@ -365,6 +365,9 @@ def read_status(lane, armed):
     return st
 
 
+CHECK_HOLD_MAX_S = 4 * 3600  # a check older than this no longer holds DONE/STALL
+
+
 def check_hold(lane, state, ev):
     """A check the lane started with `mk-builder.py check` and whose supervisor pid is alive keeps
     the lane busy: no STALL and no DONE verdict. A dead pid (a crash that left no clear) counts as
@@ -375,14 +378,14 @@ def check_hold(lane, state, ev):
         with open(os.path.join(lane, STATUS_FILE)) as f:
             checks = json.load(f).get("checks")
         for c in (checks or {}).values():
-            pid = c.get("pid")
+            pid, started = c.get("pid"), c.get("started")
+            if isinstance(started, (int, float)) and time.time() - started > CHECK_HOLD_MAX_S:
+                continue  # over the cap: a recycled pid must not hold the lane forever
             if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
                 try:
                     os.kill(pid, 0)
-                except ProcessLookupError:
-                    continue
-                except PermissionError:
-                    pass
+                except (ProcessLookupError, PermissionError):
+                    continue  # gone, or not ours (a recycled pid)
                 return None, []
     except (OSError, ValueError, AttributeError):
         pass
@@ -805,6 +808,9 @@ def self_test():
         assert _hold(os.getpid()) == ((None, []), (None, []))
         dead = subprocess.Popen([sys.executable, "-c", "pass"]); dead.wait()
         assert _hold(dead.pid) == (("STALL", ["x"]), ("DONE", ["y"]))
+        with open(os.path.join(_ck, STATUS_FILE), "w") as f:
+            json.dump({"checks": {"c": {"pid": os.getpid(), "started": time.time() - CHECK_HOLD_MAX_S - 60}}}, f)
+        assert check_hold(_ck, "STALL", ["x"]) == ("STALL", ["x"])  # live pid, over the cap
         assert check_hold(os.path.join(_ck, "nope"), "STALL", ["x"]) == ("STALL", ["x"])
         assert check_hold(_ck, "BLOCKED", ["z"]) == ("BLOCKED", ["z"])
     # --no-commit (rx None, a reviewer pane): no commit to match — any subject is fine, no commit evidence
