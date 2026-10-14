@@ -102,7 +102,7 @@ Scripts: `${CLAUDE_PLUGIN_ROOT}/scripts/`. **All run-state writes go through `mk
 ```
 mk-plan.py check <data>/plans/<id>.md      set <plan> --status <s>      add-run <plan> --run <run>
 mk-state.py run init --id <run> --feature "<F>" --branch <integration> --plan <data>/plans/<id>.md   # builds the run's tasks from the approved plan
-mk-state.py plan sync [--run <id>] [--apply]      # reconcile tasks after a plan edit (reference/loop.md §Stage notes)
+mk-state.py plan sync [--run <id>] [--apply]      # plan-file edits reconcile into tasks: ONLY before approval or when the user asks (reference/loop.md §Stage notes). With a live run, do not edit the plan file (user rule 2026-10-14): new work → `task add`; changed detail → the brief + a decision `event` (`task set` cannot yet change title/acceptance/owned/deps: todo 100)
 mk-state.py run set --next "<one line: what to do on resume>"      run stage <N>      run get [--id <run>]
 mk-state.py task add --id <T> --title "<t>" --wave <n> --deps A,<run>:B --owned 'glob,glob' [--parent <P>]
 #   deps gate dispatch (status=dispatched|building errors until every dep is merged/qa/done; --force overrides);
@@ -147,7 +147,7 @@ Decided per wave, after the routes. Stage 1 proposes `lane_group` per phase by t
 - **separate lanes** — one worktree and one build agent per phase (the default).
 - **one shared lane** — one worktree, one lead builder; the lead works each phase itself, or hands each task to one subagent on its own default model when the phase says `subagents = true`. That is the plan's `lane_group`: same value ⇒ same lane.
 
-Evidence: owned files, `risk`, `review`, `size`, the need for separate fix/merge rounds, quota. A layout named by the user overrides Jev. If Jev splits a proposed group, change `lane_group` in the plan and `plan sync --apply` before acquiring lanes. Rules:
+Evidence: owned files, `risk`, `review`, `size`, the need for separate fix/merge rounds, quota. A layout named by the user overrides Jev. If Jev splits a proposed group, decide the layout with the user or in the briefs before acquiring lanes; do not edit the plan file of a running plan. Rules:
 - Share a lane only between phases in the same wave with disjoint-owned files.
 - Keep lanes separate for data-loss/destructive phases that need their own fix rounds, phases on different agents or models, and test suites that would see each other's half-done work.
 
