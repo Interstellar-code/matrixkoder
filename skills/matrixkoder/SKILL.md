@@ -26,6 +26,20 @@ Nothing loads these for you; you call them. At preflight run `python3 ${CLAUDE_P
 | `effort-*` agents | listed in Agent types | review / QA / explore subagents with pinned effort |
 | Playwright (repo dep) | `node_modules/playwright` exists | 11 QA fallback: scripted checks (`scripts/` in the scratchpad) |
 
+## Bus cheat sheet (orchestrator side)
+
+All take `--data <data>`; `S=${CLAUDE_PLUGIN_ROOT}/scripts`. Or the `mk_bus` tool (actions pending, tail, answer, send, watch).
+
+| Job | Command |
+|---|---|
+| Message a lane | `python3 $S/mk-bus.py send --run <R> --task <T> --kind nudge --from orch --to <T> --text "<text>"` |
+| Answer a lane's ask | `python3 $S/mk-bus.py pending`, then `mk_bus` action `answer` with the ask's `msg_id` |
+| Watch (Monitor tool) | `python3 $S/mk-bus.py watch --run <R> [--task <T>] [--after <seq>]` — no `--to` filter; re-arm on expiry or `BUS DOWN` |
+| Recent messages | `mk_bus` action `tail` |
+| Bus up / lane token | `mk-bus.py ensure`; after a port change `mk-bus.py token --lane <lane> --task <T> --run <R>` |
+
+Kinds: `ask answer info ack task status commit report review nudge`. The bus rings the lane itself (fixed `mk-builder.py inbox` line, queued until the pane is idle) only for `nudge`, `info` and `answer` — so message a lane with `nudge` or `info`, not `ask`; an `ask` from you is never rung. Never type the doorbell by hand (`herdr pane send` does not exist; the bus uses `herdr agent prompt`). Briefs go out through `mk-lane-event.py dispatch` (stage 5), not `send`.
+
 ## Files
 
 `<data>` = the project data dir chosen in onboarding (default `<repo>/.matrixkoder/`, gitignored; `reference/onboarding.md`). Home mode (`~/.matrixkoder/projects/<slug>/`) lands only after the data move — until then the repo dir is current.
