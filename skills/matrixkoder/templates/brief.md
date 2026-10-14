@@ -32,7 +32,7 @@ Test guidance (mk-store-r1; keep this short):
 - Run the full suite once before DONE and quote its summary line (the `selftest: N run, M failed` line the repo's suite prints). A red full suite means the round is not done even if the scoped tests pass.
 
 ## Parallel parts (default ON)
-<Name the separable parts and who takes them, for example "tests and fixtures: helper 1; docs: helper 2; the shared hot file and the integration: you". The rules for helpers (todo list first, only the lead runs the gates, the report section) are in the mk-builder skill, reference/lane-rules.md R9. Write "none, because <reason>" only when the plan turns the flag off.>
+<Name the separable parts and who takes them, for example "tests and fixtures: helper 1; docs: helper 2; the shared hot file and the integration: you". The rules for helpers (todo list first, only the lead runs the gates, the report section) are in the mk-builder skill, reference/lane-rules.md R9. Write "none, because <reason>" only when the plan turns the flag off. omp is a lane agent like any other (Codex, OpenCode, AGY, Claude), but its helpers return without writing files (todo 97), so an omp brief always writes "none" here until that is fixed.>
 
 ## Rules
 - Use the mk-builder skill (installed in this lane at `.claude/skills/mk-builder/`) — round R<n>. Every lane rule is the skill's (`reference/lane-rules.md` R1-R29); never restate one here. This brief carries only the per-brief values: the round number <n>, and the end-of-round token `<PHASE> R<n> DONE` (or `<PHASE> R<n> BLOCKED: <question>`) as the LAST line of your reply, alone on its line.
