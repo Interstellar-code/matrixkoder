@@ -131,9 +131,23 @@ class Fail(Exception):
 
 # ---------- the schema: one row per setting, with its home in the yaml ----------
 
-def _row(key, scope, type, default, sec, line, member, label, help, **kw):
+# C8's two vocabularies. `home` names where a value lives: "yaml" (the project.yaml every SCHEMA
+# key reads) or "userConfig" (.claude-plugin/plugin.json, which mk-config never writes). `level`
+# follows from home: userConfig is one value for the user (global); yaml is per project.
+YAML_HOME, USERCONFIG_HOME = "yaml", "userConfig"
+
+# C8: every key declares a `level` (global|project) and a `home` (userConfig|yaml), NEW fields
+# beside the UI-tab `scope` (project|routing|agents|child), which stays untouched — a different
+# vocabulary. The userConfig keys (mode, defaultTab, hiddenTabs, raster, wake, guards,
+# usagePollMin, autoOpen, chip, toasts) live in `.claude-plugin/plugin.json` and are NOT SCHEMA
+# rows; EVERY SCHEMA key is a yaml key, so its home is "yaml" and its level "project" —
+# `lanes.default_agent` included (C2 has no root yaml; its UI `scope` says "global" and is left
+# alone). A future userConfig-backed row declares home="userConfig" and the level follows, so
+# `level global` can only ever name a userConfig key (C8).
+def _row(key, scope, type, default, sec, line, member, label, help, home=YAML_HOME, **kw):
     r = {"key": key, "scope": scope, "type": type, "default": default, "sec": sec, "line": line,
-         "member": member, "label": label, "help": help}
+         "member": member, "label": label, "help": help,
+         "home": home, "level": "global" if home == USERCONFIG_HOME else "project"}
     r.update(kw)
     return r
 
@@ -226,11 +240,15 @@ SCHEMA = [
 ]
 
 MIGRATED_KEYS = ("routing_preferences.reviewer", "routing_preferences.visual_reviewer")
-# Dead yaml copies of plugin settings: reported, never written or deleted (C3 — userConfig is the home).
+# Dead yaml copies of plugin settings (C8): the `dashboard:` block and `usage.poll_min` were the
+# yaml copies of userConfig keys before the plugin owned them. `migrate` removes them from the
+# yaml (never by hand). DEAD keeps the (section, key, setting, default) rows `dead_notes` reports;
+# DEAD_YAML_KEYS is the same set as (section, key) pairs the drop walks.
 DEAD = (("dashboard", "auto_open", "autoOpen", True),
         ("dashboard", "chip", "chip", True),
         ("dashboard", "toasts", "toasts", True),
         ("usage", "poll_min", "usagePollMin", 5))
+DEAD_YAML_KEYS = tuple((sec, key) for sec, key, _s, _d in DEAD)
 # The schema rows this tool writes as a whole block when the section is missing entirely.
 SESSION_SECTION, PICKS_SECTION = "session", "picks"
 AGENT_NAMES = {"opencode": "OpenCode", "claude": "Claude Code", "codex": "Codex", "agy": "AGY", "omp": "omp"}
@@ -743,6 +761,8 @@ def check_structure(reread):
 
 
 def verify(old, new, count, checks):
+    """Prove a PATCH's new text is exactly what was asked for, then nothing is written on a mismatch:
+    no line deleted, `count` lines added/replaced, and each `(key, value, r)` check reads value."""
     reread = "".join(new).splitlines(keepends=True)
     check_structure(reread)
     if changed_lines(old, new) != count:
@@ -751,6 +771,62 @@ def verify(old, new, count, checks):
         found, got = value_of(reread, r)
         if not found or got != value:
             raise Fail(f"{key}: the patched file reads {got!r}, not {value!r}; nothing written")
+
+
+def verify_drop(old, dropped, kill):
+    """Prove a dead-key drop removed EXACTLY the lines in `kill` and nothing else.
+
+    Structural, not diff-based: the dropped text must be `old` with precisely those line indexes
+    taken out, byte for byte. That is exact and order-independent — a diff's minimal edit script
+    can merge adjacent deletes, which would make the count ambiguous."""
+    want = [ln for i, ln in enumerate(old) if i not in set(kill)]
+    if dropped != want:
+        raise Fail("the dead-key drop did not remove exactly the lines it named; nothing written")
+
+
+def verify_migration(old, dropped, new, kill, count, checks):
+    """A migrate does the dead-key drop (old -> dropped) then a patch (dropped -> new); prove both."""
+    verify_drop(old, dropped, kill)
+    verify(dropped, new, count, checks)
+
+
+def dropped_key_spans(lines):
+    """The line indexes of every dead yaml key migrate removes (C8), plus the block header of a
+    section whose entries are ALL dead.
+
+    The dead keys are the yaml copies of userConfig settings (`dashboard:`, `usage.poll_min`). A
+    `dashboard:` block that holds nothing but dead keys loses its header too (no empty section
+    left behind); a section that keeps a live key keeps its header. Nothing deeper than the key's
+    own line is touched: a dead key is a scalar, never a block.
+    """
+    kl = key_lines(lines)
+    kill = set()
+    for sec, key in DEAD_YAML_KEYS:
+        sr = section_range(lines, kl, [sec])
+        if not sr:
+            continue
+        hits = [i for (i, _ind, k, _r) in kl if sr[2] <= i < sr[3] and k == key]
+        if len(hits) != 1:
+            continue  # absent or duplicated: this drop leaves it (the patcher's rule for ambiguity)
+        kill.add(hits[0])
+        # the header falls only when every child of the section is dead
+        children = [k for (i, _ind, k, _r) in kl if sr[2] <= i < sr[3]]
+        dead_names = {k for (s, k) in DEAD_YAML_KEYS if s == sec}
+        if children and all(c in dead_names for c in children):
+            kill.add(sr[0])
+    return kill
+
+
+def drop_dead_keys(old):
+    """-> (new lines, sorted deleted indexes). The dead yaml key lines migrate removes (C8).
+
+    Refuses nothing: an absent or duplicated key is left alone (dropped_key_spans skips it), so
+    migrate stays idempotent and a hand-edited file is never guessed at.
+    """
+    kill = dropped_key_spans(old)
+    if not kill:
+        return list(old), []
+    return [ln for i, ln in enumerate(old) if i not in kill], sorted(kill)
 
 
 # ---------- commands ----------
@@ -865,7 +941,9 @@ def cmd_list(path, lines):
         shown_default = effective_default(r)
         f = {"key": r["key"], "scope": r["scope"], "label": r["label"], "type": r["type"],
              "value": value, "default": shown_default, "help": r["help"],
-             "editable": r.get("editable", True)}
+             "editable": r.get("editable", True),
+             # C8: where the value lives, beside the UI-tab `scope` (a different vocabulary).
+             "level": r["level"], "home": r["home"]}
         if r.get("derived") and not found:
             f["derived"] = True  # the yaml has no value: value and default are the derived number
         if r["type"] == "num":
@@ -954,18 +1032,55 @@ def cmd_set(path, lines, args):
                 "backup": path + ".bak", "backup_of": "previous"})
 
 
-def cmd_migrate(path, lines):
-    """Bring a config written before this schema up to it, and nothing else: the new sections and
-    the two new routing keys get their schema defaults when absent. Idempotent, and it reports the
-    dead yaml copies of plugin settings without ever writing or deleting them."""
+def cmd_migrate(path, lines, dry_run=False):
+    """Bring a config written before this schema up to it: the new sections and the two new routing
+    keys get their schema defaults when absent, AND the dead yaml copies of plugin settings (C8:
+    `dashboard:`, `usage.poll_min`) are removed — the plugin setting is their only home.
+
+    `dry_run=True` computes the same answer and writes nothing (the `--dry-run` the plan asks for).
+    Idempotent; a write backs up (.bak) first; nothing is hand-edited."""
+    if dry_run:
+        return _migrate_plan(path, lines)
     with yaml_lock(path):
         return _migrate_locked(path, read_lines(path))
+
+
+def _migrate_plan(path, lines):
+    """The migrate answer without writing (for `--dry-run`): what would change and which dead keys
+    would go. Reads the file it was handed; never locks and never writes."""
+    old = list(lines)
+    _new, changed, _checks, _count, kill_dry, removed, _dropped = _migrate_body(old)
+    return out({"ok": True, "dry_run": True, "file": path, "changed": changed,
+                "removed": removed, "notes": dead_notes(old),
+                "would_write": bool(changed or kill_dry)})
 
 
 def _migrate_locked(path, lines):
     """Migrate body. Caller holds yaml_lock, so this read is the file that gets written."""
     old = list(lines)
-    new, changed, checks, count = list(lines), [], [], 0
+    new, changed, checks, count, kill, removed, dropped = _migrate_body(old)
+    notes = dead_notes(old)
+    if changed or kill:
+        verify_migration(old, dropped, new, kill, count, checks)
+        # write_yaml(dropped, new) backs up the file on disk — which is still `old` — so the .bak
+        # is the user's original (one-step undo), then writes the patched+drop result.
+        write_yaml(path, dropped, new, count, checks)
+    return out({"ok": True, "changed": changed, "removed": removed, "notes": notes})
+
+
+def _migrate_body(old):
+    """Shared body of migrate and its --dry-run: -> (new lines, changed keys, verify checks, changed
+    line count, dead-key line indexes, removed dead-key names). Pure — writes nothing.
+
+    The dead keys are dropped FIRST, on `old`, so the `kill` indexes are old-file line numbers
+    (which is what `verify` diffs against). The patch then runs on the dropped text — a dropped
+    dead key is a scalar in `dashboard:`/`usage:`, never a section the patch appends (session,
+    picks), so the two steps cannot interfere.
+    """
+    new, kill = drop_dead_keys(old)
+    removed = [f"{sec}.{key}" for (sec, key) in DEAD_YAML_KEYS if _dead_present(old, sec, key)]
+    dropped = list(new)
+    changed, checks, count = [], [], 0
     eol = file_ending(new)
     if not section_range(new, key_lines(new), [SESSION_SECTION]):
         block = [f"{SESSION_SECTION}:{eol}"]
@@ -1013,10 +1128,16 @@ def _migrate_locked(path, lines):
         new, count = patched, count + n
         changed.append("lanes.default_agent")
         checks.append(("lanes.default_agent", r["default"], r))
-    notes = dead_notes(new)
-    if changed:
-        write_yaml(path, old, new, count, checks)
-    return out({"ok": True, "changed": changed, "notes": notes})
+    return new, changed, checks, count, kill, removed, dropped
+
+
+def _dead_present(lines, sec, key):
+    """True when `sec.<key>` is a live single line in `lines` (what the drop will remove)."""
+    kl = key_lines(lines)
+    sr = section_range(lines, kl, [sec])
+    if not sr:
+        return False
+    return len([i for (i, _ind, k, _r) in kl if sr[2] <= i < sr[3] and k == key]) == 1
 
 
 def dead_notes(lines):
@@ -1037,6 +1158,28 @@ def dead_notes(lines):
             out_lines.append(f"{sec}.{key} is {got!r} here and is no longer read — the plugin "
                              f"setting {setting} owns it now (claude plugin configure matrixkoder)")
     return out_lines
+
+
+def project_yaml_path(data):
+    """The project yaml for the `--data` the caller passed.
+
+    mkpaths.project_yaml owns the pre-migration form (`<data>/matrixkoder.yaml`) and the legacy
+    form after a switch (the recorded `<repo>/.matrixkoder` resolves to the C2
+    `<home>/projects/<slug>/project.yaml`). The dashboard hands the Settings tab the C2 PROJECT
+    FOLDER (dirname of `projects.db_path`, hooks/data.ts projectDirFromStore), and mkpaths keys
+    its migrated lookup on the LEGACY data_dir — so that form would read (and `migrate` would
+    create) a phantom `<C2>/matrixkoder.yaml` while the real project.yaml goes untouched. The
+    C2 folder is the project folder, so its yaml comes from the slug.
+
+    Every path here is still asked of mkpaths (project_slug_of, db_path_of, target_project_yaml,
+    project_yaml): C1's one-path-module rule holds, mk-config only picks the right input. Once
+    mkpaths.project_yaml itself recognises the C2 folder this returns the same path (no double
+    handling). Never creates anything.
+    """
+    slug = mkpaths.project_slug_of(data)
+    if slug and mkpaths.db_path_of(slug=slug):
+        return mkpaths.target_project_yaml(slug)
+    return mkpaths.project_yaml(data)
 
 
 def load_usage(usage_path_arg):
@@ -1419,7 +1562,7 @@ def main(argv=None):
         usage_arg, argv = argv[i + 1], argv[:i] + argv[i + 2:]
     try:
         data = mk_state.resolve_data(data_arg)
-        path = mkpaths.project_yaml(data)
+        path = project_yaml_path(data)
         lines = read_lines(path)
         cmd, args = (argv[0], argv[1:]) if argv else (None, [])
         if cmd == "list":
@@ -1431,7 +1574,7 @@ def main(argv=None):
         if cmd == "set":
             return cmd_set(path, lines, args)
         if cmd == "migrate":
-            return cmd_migrate(path, lines)
+            return cmd_migrate(path, lines, dry_run="--dry-run" in args)
         if cmd == "context":
             return cmd_context(path, lines, usage_arg)
         if cmd == "probe":
@@ -1567,15 +1710,43 @@ def self_test():
         assert "  visual_reviewer: claude haiku" in rd().splitlines()
         assert out2["notes"] == [], out2["notes"]  # nothing dead yet differs from the plugin default
 
-        # 8. an absent key reads the schema default; a dead value differing from the plugin default is
-        #    reported and never written
+        # 8. an absent key reads the schema default; the dead yaml copies of plugin settings
+        #    (C8: dashboard:, usage.poll_min) are REMOVED by migrate, never hand-edited. Step 7's
+        #    migrate already dropped the fixture's copies, so re-add them and prove the drop, then
+        #    a --dry-run proves the dry run writes nothing.
         assert run("get", "session.max_wait_min")["value"] == 30
-        tampered_dead = rd().replace("  poll_min: 5", "  poll_min: 9")  # read before the file is opened
+        cur = rd().splitlines(keepends=True)
+        assert "dashboard:" not in "".join(cur), "step 7 did not drop the fixture's dashboard: block"
+        assert not any(ln.strip() == "poll_min: 5" for ln in cur), "step 7 did not drop usage.poll_min"
+        out_lines, inserted_poll = [], False
+        for ln in cur:
+            out_lines.append(ln)
+            if not inserted_poll and ln.startswith("  source:"):
+                out_lines.append("  poll_min: 9\n")  # a value that differs from the plugin default
+                inserted_poll = True
+        assert inserted_poll, "the test yaml surgery missed the usage source line"
+        out_lines += ["dashboard:\n", "  auto_open: false\n", "  chip: true\n", "  toasts: true\n"]
         with open(yaml_path, "w") as f:
-            f.write(tampered_dead)
+            f.writelines(out_lines)
+        assert any(ln.strip() == "poll_min: 9" for ln in rd().splitlines()) and "dashboard:" in rd()
+        # --dry-run reports the same removals and writes NOTHING
+        dry = run("migrate", "--dry-run")
+        assert dry.get("dry_run") is True, dry
+        assert set(dry["removed"]) == {"dashboard.auto_open", "dashboard.chip",
+                                       "dashboard.toasts", "usage.poll_min"}, dry["removed"]
+        assert any(ln.strip() == "poll_min: 9" for ln in rd().splitlines()), "--dry-run wrote something"
+        assert "dashboard:" in rd(), "--dry-run wrote something"
+        # the real migrate removes every dead key; nothing else moves
         notes = run("migrate")["notes"]
         assert any("poll_min" in n and "usagePollMin" in n for n in notes), notes
-        assert "  poll_min: 9" in rd().splitlines(), "migrate wrote a dead value"
+        after = rd().splitlines()
+        assert not any(ln.strip() == "poll_min: 9" for ln in after), "migrate left a dead usage.poll_min"
+        assert "dashboard:" not in rd(), "migrate left the dead dashboard: block"
+        assert "  toasts: true" not in after, "migrate left a dead dashboard key"
+        assert any(ln.startswith("  source:") for ln in after), "migrate dropped a live usage key"
+        # and a second migrate removes nothing more (idempotent over the drop too)
+        again = run("migrate")
+        assert again["removed"] == [] and again["changed"] == [], again
 
         # 9. flag > yaml > default
         assert run("get", "session.stall_min")["value"] == 12  # the yaml, not the default 15
@@ -1708,10 +1879,15 @@ def self_test():
         assert "  omp: { available: false, models: [manifest/auto] }" in migrated, migrated
         assert "default_agent: omp" in "\n".join(migrated)
         before_lines = fixture.splitlines()
-        # every original line is still present, byte for byte, in order
-        kept = [ln for ln in migrated if ln in before_lines or ln in ("lanes:", "  default_agent: omp",
-                "  omp: { available: false, models: [manifest/auto] }", "picks:")]
-        assert before_lines == [ln for ln in migrated if ln in before_lines], "migrate rewrote an existing line"
+        # every original line is still present, byte for byte, in order — EXCEPT the dead keys
+        # migrate now drops (C8, L7.5: the fixture's `dashboard:` block and `usage.poll_min`).
+        # A dropped line is never rewritten: the survivors keep their exact text and order.
+        dead_lines = {"dashboard:", "  auto_open: true   # only when fullscreen and >=144 cols",
+                      "  chip: true", "  toasts: true", "  poll_min: 5"}
+        survivors = [ln for ln in migrated if ln in before_lines]
+        expected = [ln for ln in before_lines if ln not in dead_lines]
+        assert survivors == expected, "migrate rewrote or dropped a live existing line"
+        assert not any(ln in migrated for ln in dead_lines), "migrate left a dead line"
         pool = next(f for f in run("list", "--json")["fields"] if f["key"] == "picks.omp")
         assert pool["pool"] == ["manifest/auto"], pool
         assert "ollama-cloud" not in pool["pool"]
@@ -2443,6 +2619,91 @@ def self_test():
         assert "stall_min: 19" in final, final
         assert "herdr: stale" in final or "herdr: ok" in final, final
         assert "probed_at:" in final
+
+        # 35. L7.4: every SCHEMA row carries C8's level + home beside the UI-tab `scope`
+        #     (which stays its own vocabulary). Every SCHEMA key is a yaml key, so all are
+        #     level=project / home=yaml; `lanes.default_agent` keeps its UI scope "global".
+        listed = run("list", "--json")["fields"]
+        assert listed, "list returned no fields"
+        for f in listed:
+            assert f.get("level") == "project", f
+            assert f.get("home") == "yaml", f
+            assert isinstance(f.get("scope"), str) and f["scope"] != "", f
+        lane_row = next(f for f in listed if f["key"] == "lanes.default_agent")
+        assert lane_row["scope"] == "global" and lane_row["level"] == "project", lane_row
+        # the static SCHEMA rows all carry the fields, not just what list happens to show
+        assert all("level" in r and "home" in r for r in SCHEMA), "a SCHEMA row is missing level/home"
+        # a userConfig home would be the only global level: none today (C8)
+        assert {r["home"] for r in SCHEMA} == {"yaml"}, sorted({r["home"] for r in SCHEMA})
+
+        # 34. L7.1: the dashboard hands the Settings tab the C2 PROJECT FOLDER (dirname of
+        #     projects.db_path, hooks/data.ts projectDirFromStore), not the legacy data_dir.
+        #     mkpaths.project_yaml keys its migrated lookup on the legacy data_dir, so without
+        #     project_yaml_path this would read — and `migrate` would CREATE — a phantom
+        #     <C2>/matrixkoder.yaml while the real project.yaml stayed untouched. Build a real
+        #     migrated project through L2's mk-migrate --switch (never hand-written SQL) and prove
+        #     both the legacy data dir and the C2 folder resolve to the same real project.yaml,
+        #     that migrate writes no phantom beside it, and that a `set` lands in project.yaml.
+        mig_home = os.path.join(tmp, "mig-home")
+        mig_repo = os.path.join(tmp, "mig-repo")
+        mig_data = os.path.join(mig_repo, ".matrixkoder")
+        os.makedirs(mig_data, exist_ok=True)
+
+        def _load(name, fn):
+            spec = importlib.util.spec_from_file_location(name, os.path.join(HERE, fn))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+
+        _mkdb = _load("mkdb", "mkdb.py")
+        _mkp = _load("mkpaths", "mkpaths.py")
+        if not os.path.isdir(os.path.join(mig_repo, ".git")):
+            subprocess.run(["git", "init", "-q", mig_repo], check=False)
+        con = _mkdb.open_root(mig_home)
+        try:
+            con.execute("INSERT OR REPLACE INTO projects(slug, name, repo, data_dir, mode, db_path)"
+                        " VALUES (?,?,?,?,?,NULL)",
+                        ("mig", "mig", os.path.realpath(mig_repo), os.path.realpath(mig_data), "home"))
+            con.execute("COMMIT")
+        finally:
+            con.close()
+        with open(os.path.join(mig_data, "matrixkoder.yaml"), "w") as f:
+            f.write(fixture)
+        _mkdb.open_project(mig_home, "mig", data_dir=mig_data).close()
+        switched = subprocess.run(
+            [sys.executable, os.path.join(HERE, "mk-migrate.py"), "--switch", "--slug", "mig",
+             "--data", mig_data, "--home", mig_home, "--repo", mig_repo],
+            capture_output=True, text=True, env=dict(os.environ, MK_SELFTEST="1"))
+        assert switched.returncode == 0, f"mk-migrate --switch: {switched.stdout}{switched.stderr}"
+        c2 = os.path.join(mig_home, "projects", "mig")
+        real_yaml = os.path.join(c2, "project.yaml")
+        assert os.path.isfile(real_yaml), f"the switch did not place project.yaml: {os.listdir(c2)}"
+
+        def run_mig(*args, ok=True, home_dir=mig_home):
+            run_env = dict(env, MATRIXKODER_HOME=home_dir, MK_HOME=home_dir)
+            p = subprocess.run([sys.executable, script, *args], capture_output=True, text=True,
+                               env=run_env, cwd=mig_repo)
+            lines = [x for x in (p.stdout or "").splitlines() if x.strip()]
+            assert len(lines) == 1, f"{args}: expected ONE json line, got {p.stdout!r} {p.stderr!r}"
+            obj = json.loads(lines[0])
+            assert obj.get("ok") is ok, f"{args}: {obj}"
+            return obj
+
+        # the legacy data dir and the C2 folder resolve to the SAME real project.yaml
+        legacy_file = run_mig("--data", mig_data, "list", "--json")["file"]
+        c2_file = run_mig("--data", c2, "list", "--json")["file"]
+        assert legacy_file == c2_file == real_yaml, (legacy_file, c2_file, real_yaml)
+        # migrate through the C2-folder form writes nothing new: no phantom matrixkoder.yaml
+        run_mig("--data", c2, "migrate")
+        assert not os.path.exists(os.path.join(c2, "matrixkoder.yaml")), \
+            f"migrate created a phantom beside project.yaml: {os.listdir(c2)}"
+        # and a set through the C2 folder lands in the real project.yaml, not a phantom
+        before_set = open(real_yaml).read()
+        run_mig("--data", c2, "set", "session.stall_min", "21")
+        after_set = open(real_yaml).read()
+        assert "stall_min: 21" in after_set and after_set != before_set, after_set
+        assert not os.path.exists(os.path.join(c2, "matrixkoder.yaml")), "set wrote a phantom yaml"
+
         # R1.2: the mkdb write guard refuses the real home from this suite too.
         import importlib.util as _iu
         _spec = _iu.spec_from_file_location("mkdb", os.path.join(HERE, "mkdb.py"))

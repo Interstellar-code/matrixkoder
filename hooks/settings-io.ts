@@ -107,6 +107,10 @@ function okOf(ans: unknown): { ok: true } | { ok: false; error: string } {
 export type YamlFieldIn = {
   key: unknown
   scope: unknown
+  /** C8: where the value lives (userConfig|yaml), beside the UI-tab `scope`. */
+  home?: unknown
+  /** C8: global (one value for the user) | project (per project). */
+  level?: unknown
   label: unknown
   type: unknown
   value: unknown
@@ -409,13 +413,23 @@ export function topChangelogEntry(text: string): SettingsAbout['whatsNew'] {
 
 // ---------- the live SettingsView (same shape the fixture built for) ----------
 
+/** The yaml rows' file label before the first live load (fixture / tests):
+ *  the basename, not a repo-specific spelling. The live load replaces it with
+ *  the real path `list --json` prints (`file`, L7.1). */
+const YAML_FILE_LABEL = 'project.yaml'
+
+/** The eight scopes, in hotkey order. Every yaml-backed scope (project,
+ *  routing, agents, models, child) carries YAML_FILE_LABEL as its `file`, so
+ *  the live load can swap in the REAL path `list --json` prints (L7.1) and the
+ *  scope-note line always names where the rows really live. `mode`, `tabs` and
+ *  `about` are userConfig/plugin scopes and keep their own labels. */
 const SCOPES: readonly SettingsScope[] = [
   { id: 'mode', label: 'Mode', file: 'plugin.json', note: 'all projects' },
-  { id: 'project', label: 'Project', file: '.matrixkoder/matrixkoder.yaml', note: 'this repo' },
-  { id: 'routing', label: 'Routing', file: 'matrixkoder.yaml', note: 'routing_preferences' },
-  { id: 'agents', label: 'Agents', file: 'matrixkoder.yaml', note: 'agents · usage' },
-  { id: 'models', label: 'Models', file: 'yaml agents.*.models', note: 'max 4 per agent' },
-  { id: 'child', label: 'Child', file: 'yaml lanes.child', note: 'lane sessions' },
+  { id: 'project', label: 'Project', file: YAML_FILE_LABEL, note: 'this repo' },
+  { id: 'routing', label: 'Routing', file: YAML_FILE_LABEL, note: 'routing_preferences' },
+  { id: 'agents', label: 'Agents', file: YAML_FILE_LABEL, note: 'agents · usage' },
+  { id: 'models', label: 'Models', file: YAML_FILE_LABEL, note: 'agents.*.models' },
+  { id: 'child', label: 'Child', file: YAML_FILE_LABEL, note: 'lanes.child' },
   { id: 'tabs', label: 'Tabs', file: 'userConfig', note: 'dashboard' },
   { id: 'about', label: 'About', file: 'plugin.json', note: 'read-only' },
 ]
@@ -464,12 +478,6 @@ const MODES: SettingsView['modes'] = [
   { id: 'solo', name: 'Solo', scope: 'one session', desc: 'MK without orchestration: dashboard, usage, guards, state. You build here.' },
   { id: 'orchestrator', name: 'Orchestrator', scope: 'one repo', desc: 'Full MK loop on this repo: plan, lanes, builders, reviews, merge.' },
   { id: 'hive', name: 'Hive', scope: 'many repos', desc: 'One MK coordinates several repos: shared quota, lanes and runs.' },
-]
-
-const PROJECTS: SettingsView['projects'] = [
-  { name: 'matrixkoder', since: '10-08', on: true },
-  { name: 'hermes-switchui', since: '10-07', on: true },
-  { name: 'hermes-desktop', since: '10-08', on: false },
 ]
 
 /** The agent cards the Models scope draws: who they are and where they run.
@@ -560,7 +568,12 @@ function toRow(f: YamlFieldIn, scope: SettingsScopeId): SettingsField | null {
  *  `picks.*` fields overlaid on the catalogue defaults, globals matched by
  *  suffix (isLocked → read-only), About from the probed data. Fields the
  *  roster does not know land in a trailing group named for their scope, so a
- *  schema addition still draws. mock is false — the MOCK row stays off. */
+ *  schema addition still draws. mock is false — the MOCK row stays off.
+ *
+ *  `file` is the LIVE yaml path from `list --json` (L7.1: the Project/Routing/
+ *  Agents rows name the real `<home>/projects/<slug>/project.yaml`, never a
+ *  hard-coded spelling); empty keeps the shape label for the fixture and the
+ *  pure tests. */
 export function buildSettingsView(args: {
   fields: YamlFieldIn[]
   file: string
@@ -569,6 +582,9 @@ export function buildSettingsView(args: {
   about: { installed: string; latest: string; whatsNew: SettingsAbout['whatsNew'] }
 }): SettingsView {
   const { fields, configRows, globalDefaults, about } = args
+  const yamlFile = args.file !== '' ? args.file : YAML_FILE_LABEL
+  // the yaml-backed scope notes name the REAL path (L7.1); the others keep theirs.
+  const scopes = SCOPES.map(s => (s.file === YAML_FILE_LABEL ? { ...s, file: yamlFile } : s))
   const byKey = new Map<string, YamlFieldIn>()
   for (const f of fields) {
     if (typeof f.key === 'string' && !byKey.has(f.key)) byKey.set(f.key, f)
@@ -712,10 +728,13 @@ export function buildSettingsView(args: {
 
   return {
     mock: false,
-    scopes: [...SCOPES],
+    scopes,
     groups,
     modes: MODES,
-    projects: PROJECTS,
+    // L7.1: the hive card listed projects from the retired projects.json; the live
+    // view has no hive source (the root store's projects are the DB's, not this tab's),
+    // so it draws no stale entries — the card renders only when there is nothing to show.
+    projects: [],
     agents: AGENT_CARDS
       .filter(c => isAvailable(byKey.get(`agents.${c.id}.available`)))
       .map(c => ({ ...c, off: false, models: poolOf(byKey.get(`picks.${c.id}`)).map(name => ({ name, note: '' })) })),

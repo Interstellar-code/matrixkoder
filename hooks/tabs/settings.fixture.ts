@@ -71,11 +71,11 @@ export const SETTINGS_FIXTURE: SettingsView = {
   mock: true,
   scopes: [
     { id: 'mode', label: 'Mode', file: 'plugin.json', note: 'all projects' },
-    { id: 'project', label: 'Project', file: '.matrixkoder/matrixkoder.yaml', note: 'this repo' },
-    { id: 'routing', label: 'Routing', file: 'matrixkoder.yaml', note: 'routing_preferences' },
-    { id: 'agents', label: 'Agents', file: 'matrixkoder.yaml', note: 'agents · usage' },
-    { id: 'models', label: 'Models', file: 'yaml agents.*.models', note: 'max 4 per agent' },
-    { id: 'child', label: 'Child', file: 'yaml lanes.child', note: 'lane sessions' },
+    { id: 'project', label: 'Project', file: 'project.yaml', note: 'this repo' },
+    { id: 'routing', label: 'Routing', file: 'project.yaml', note: 'routing_preferences' },
+    { id: 'agents', label: 'Agents', file: 'project.yaml', note: 'agents · usage' },
+    { id: 'models', label: 'Models', file: 'project.yaml', note: 'agents.*.models' },
+    { id: 'child', label: 'Child', file: 'project.yaml', note: 'lanes.child' },
     { id: 'tabs', label: 'Tabs', file: 'userConfig', note: 'dashboard' },
     { id: 'about', label: 'About', file: 'plugin.json', note: 'read-only' },
   ],
@@ -139,12 +139,12 @@ export const SETTINGS_FIXTURE: SettingsView = {
     {
       scope: 'agents', title: 'builders', right: 'agents.*.available',
       rows: [
-        { key: 'agents.opencode.available', scope: 'agents', label: 'OpenCode', type: 'bool', value: true, default: true, help: '12 models at bootstrap.', editable: true },
-        { key: 'agents.claude.available', scope: 'agents', label: 'Claude Code', type: 'bool', value: true, default: true, help: 'Shares this pane’s subscription.', editable: true },
-        { key: 'agents.herdr.available', scope: 'agents', label: 'herdr', type: 'bool', value: true, default: true, help: 'Panes and worktrees, not a builder.', editable: true },
-        { key: 'agents.codex.available', scope: 'agents', label: 'Codex', type: 'bool', value: false, default: false, help: 'Never routed (user rule).', editable: true },
-        { key: 'agents.agy.available', scope: 'agents', label: 'AGY', type: 'bool', value: false, default: false, help: 'Gemini models via the agy CLI.', editable: true },
-        { key: 'agents.omp.available', scope: 'agents', label: 'omp', type: 'bool', value: true, default: true, help: 'The pi agent. Model picks are the allow-list, not the full omp models table.', editable: true },
+        { key: 'agents.opencode.available', scope: 'agents', label: 'OpenCode', type: 'bool', value: true, default: true, help: 'Detected at bootstrap, logged in and installed.', editable: false, why: 'detected at bootstrap — not a typed setting' },
+        { key: 'agents.claude.available', scope: 'agents', label: 'Claude Code', type: 'bool', value: true, default: true, help: 'Detected at bootstrap, logged in and installed.', editable: false, why: 'detected at bootstrap — not a typed setting' },
+        { key: 'agents.herdr.available', scope: 'agents', label: 'herdr', type: 'bool', value: true, default: true, help: 'Detected at bootstrap, logged in and installed.', editable: false, why: 'detected at bootstrap — not a typed setting' },
+        { key: 'agents.codex.available', scope: 'agents', label: 'Codex', type: 'bool', value: false, default: false, help: 'Detected at bootstrap, logged in and installed.', editable: false, why: 'detected at bootstrap — not a typed setting' },
+        { key: 'agents.agy.available', scope: 'agents', label: 'AGY', type: 'bool', value: false, default: false, help: 'Detected at bootstrap, logged in and installed.', editable: false, why: 'detected at bootstrap — not a typed setting' },
+        { key: 'agents.omp.available', scope: 'agents', label: 'omp', type: 'bool', value: true, default: true, help: 'Detected at bootstrap, logged in and installed.', editable: false, why: 'detected at bootstrap — not a typed setting' },
       ],
     },
     {
@@ -239,11 +239,7 @@ export const SETTINGS_FIXTURE: SettingsView = {
     { id: 'orchestrator', name: 'Orchestrator', scope: 'one repo', desc: 'Full MK loop on this repo: plan, lanes, builders, reviews, merge.' },
     { id: 'hive', name: 'Hive', scope: 'many repos', desc: 'One MK coordinates several repos: shared quota, lanes and runs.' },
   ],
-  projects: [
-    { name: 'matrixkoder', since: '10-08', on: true },
-    { name: 'hermes-switchui', since: '10-07', on: true },
-    { name: 'hermes-desktop', since: '10-08', on: false },
-  ],
+  projects: [],
   // the artboard's catalogue: names + dim cost notes, no ranks or scores
   agents: [
     {

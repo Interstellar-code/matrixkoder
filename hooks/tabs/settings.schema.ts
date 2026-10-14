@@ -6,315 +6,405 @@ export const SETTINGS_SCHEMA = {
     {
       "default": 3,
       "editable": true,
+      "home": "yaml",
       "key": "repo.lanes.slots",
+      "level": "project",
       "scope": "project",
       "type": "num"
     },
     {
       "default": true,
       "editable": true,
+      "home": "yaml",
       "key": "repo.lanes.reuse",
+      "level": "project",
       "scope": "project",
       "type": "bool"
     },
     {
       "default": [],
       "editable": true,
+      "home": "yaml",
       "key": "repo.lanes.copy",
+      "level": "project",
       "scope": "project",
       "type": "list"
     },
     {
       "default": "main",
       "editable": true,
+      "home": "yaml",
       "key": "repo.integration_branch",
+      "level": "project",
       "scope": "project",
       "type": "text"
     },
     {
       "default": "local-main",
       "editable": true,
+      "home": "yaml",
       "key": "qa.integration_target",
+      "level": "project",
       "scope": "project",
       "type": "seg"
     },
     {
       "default": true,
       "editable": true,
+      "home": "yaml",
       "key": "autonomy_contract.builder_skip_permissions",
+      "level": "project",
       "scope": "project",
       "type": "bool"
     },
     {
       "default": "claude-sparing",
       "editable": true,
+      "home": "yaml",
       "key": "routing_preferences.policy",
+      "level": "project",
       "scope": "routing",
       "type": "seg"
     },
     {
       "default": [],
       "editable": true,
+      "home": "yaml",
       "key": "routing_preferences.builder_order",
+      "level": "project",
       "scope": "routing",
       "type": "list"
     },
     {
       "default": 3,
       "editable": true,
+      "home": "yaml",
       "key": "routing_preferences.max_build_lanes",
+      "level": "project",
       "scope": "routing",
       "type": "num"
     },
     {
       "default": 40,
       "editable": true,
+      "home": "yaml",
       "key": "routing_preferences.reserve_floor.claude.five_hour_left_pct",
+      "level": "project",
       "scope": "routing",
       "type": "num"
     },
     {
       "default": 30,
       "editable": true,
+      "home": "yaml",
       "key": "routing_preferences.reserve_floor.claude.weekly_left_pct",
+      "level": "project",
       "scope": "routing",
       "type": "num"
     },
     {
       "default": 10,
       "editable": true,
+      "home": "yaml",
       "key": "routing_preferences.reserve_floor.others.five_hour_left_pct",
+      "level": "project",
       "scope": "routing",
       "type": "num"
     },
     {
       "default": 15,
       "editable": true,
+      "home": "yaml",
       "key": "routing_preferences.reserve_floor.others.weekly_left_pct",
+      "level": "project",
       "scope": "routing",
       "type": "num"
     },
     {
       "default": "claude sonnet medium",
       "editable": true,
+      "home": "yaml",
       "key": "routing_preferences.reviewer",
+      "level": "project",
       "scope": "routing",
       "type": "select"
     },
     {
       "default": "claude haiku",
       "editable": true,
+      "home": "yaml",
       "key": "routing_preferences.visual_reviewer",
+      "level": "project",
       "scope": "routing",
       "type": "select"
     },
     {
       "default": "codexbar",
       "editable": true,
+      "home": "yaml",
       "key": "usage.source",
+      "level": "project",
       "scope": "agents",
       "type": "seg"
     },
     {
       "default": [],
       "editable": true,
+      "home": "yaml",
       "key": "usage.providers",
+      "level": "project",
       "scope": "agents",
       "type": "list"
     },
     {
       "default": "new",
       "editable": true,
+      "home": "yaml",
       "key": "session.fresh_session",
+      "level": "project",
       "scope": "child",
       "type": "seg"
     },
     {
       "default": true,
       "editable": true,
+      "home": "yaml",
       "key": "session.subagents",
+      "level": "project",
       "scope": "child",
       "type": "bool"
     },
     {
       "default": "",
       "editable": true,
+      "home": "yaml",
       "key": "session.subagent_model",
+      "level": "project",
       "scope": "child",
       "type": "select"
     },
     {
       "default": 15,
       "editable": true,
+      "home": "yaml",
       "key": "session.stall_min",
+      "level": "project",
       "scope": "child",
       "type": "num"
     },
     {
       "default": 30,
       "editable": true,
+      "home": "yaml",
       "key": "session.max_wait_min",
+      "level": "project",
       "scope": "child",
       "type": "num"
     },
     {
       "default": "right",
       "editable": true,
+      "home": "yaml",
       "key": "session.reviewer_split",
+      "level": "project",
       "scope": "child",
       "type": "seg"
     },
     {
       "default": "verify",
       "editable": true,
+      "home": "yaml",
       "key": "session.todo_done_status",
+      "level": "project",
       "scope": "child",
       "type": "seg"
     },
     {
       "default": 3,
       "editable": true,
+      "home": "yaml",
       "key": "session.selftest_jobs_total",
+      "level": "project",
       "scope": "child",
       "type": "num"
     },
     {
       "default": true,
       "editable": true,
+      "home": "yaml",
       "key": "session.reuse_reviewer",
+      "level": "project",
       "scope": "child",
       "type": "bool"
     },
     {
       "default": true,
       "editable": true,
+      "home": "yaml",
       "key": "bus.enabled",
+      "level": "project",
       "scope": "child",
       "type": "bool"
     },
     {
       "default": 30,
       "editable": true,
+      "home": "yaml",
       "key": "bus.owner_timeout_min",
+      "level": "project",
       "scope": "child",
       "type": "num"
     },
     {
       "default": 600,
       "editable": true,
+      "home": "yaml",
       "key": "bus.ask_timeout_s",
+      "level": "project",
       "scope": "child",
       "type": "num"
     },
     {
       "default": "omp",
       "editable": true,
+      "home": "yaml",
       "key": "lanes.default_agent",
+      "level": "project",
       "scope": "global",
       "type": "text"
     },
     {
       "default": true,
       "editable": false,
+      "home": "yaml",
       "key": "agents.opencode.available",
+      "level": "project",
       "scope": "agents",
       "type": "bool"
     },
     {
       "default": [],
       "editable": true,
+      "home": "yaml",
       "key": "picks.opencode",
+      "level": "project",
       "scope": "models",
       "type": "list"
     },
     {
       "default": true,
       "editable": false,
+      "home": "yaml",
       "key": "agents.claude.available",
+      "level": "project",
       "scope": "agents",
       "type": "bool"
     },
     {
       "default": true,
       "editable": false,
+      "home": "yaml",
       "key": "agents.codex.available",
+      "level": "project",
       "scope": "agents",
       "type": "bool"
     },
     {
       "default": [],
       "editable": true,
+      "home": "yaml",
       "key": "picks.codex",
+      "level": "project",
       "scope": "models",
       "type": "list"
     },
     {
       "default": true,
       "editable": false,
+      "home": "yaml",
       "key": "agents.agy.available",
+      "level": "project",
       "scope": "agents",
       "type": "bool"
     },
     {
       "default": [],
       "editable": true,
+      "home": "yaml",
       "key": "picks.agy",
+      "level": "project",
       "scope": "models",
       "type": "list"
     },
     {
       "default": true,
       "editable": false,
+      "home": "yaml",
       "key": "agents.herdr.available",
+      "level": "project",
       "scope": "agents",
       "type": "bool"
     },
     {
       "default": true,
       "editable": false,
+      "home": "yaml",
       "key": "agents.omp.available",
+      "level": "project",
       "scope": "agents",
       "type": "bool"
     },
     {
       "default": [],
       "editable": true,
+      "home": "yaml",
       "key": "picks.omp",
+      "level": "project",
       "scope": "models",
       "type": "list"
     },
     {
       "default": "not probed",
       "editable": false,
+      "home": "yaml",
       "key": "helpers.herdr",
+      "level": "project",
       "scope": "about",
       "type": "seg"
     },
     {
       "default": "not probed",
       "editable": false,
+      "home": "yaml",
       "key": "helpers.jev",
+      "level": "project",
       "scope": "about",
       "type": "seg"
     },
     {
       "default": "not probed",
       "editable": false,
+      "home": "yaml",
       "key": "helpers.context_mode",
+      "level": "project",
       "scope": "about",
       "type": "seg"
     },
     {
       "default": "not probed",
       "editable": false,
+      "home": "yaml",
       "key": "helpers.codebase_memory",
+      "level": "project",
       "scope": "about",
       "type": "seg"
     },
     {
       "default": "not probed",
       "editable": false,
+      "home": "yaml",
       "key": "helpers.canary",
+      "level": "project",
       "scope": "about",
       "type": "seg"
     }

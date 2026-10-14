@@ -182,7 +182,9 @@ test('Settings · Mode: scope bar 1-8, MOCK row, Solo/Orchestrator/Hive (no Hybr
   for (const name of ['Solo', 'Orchestrator', 'Hive']) expect(flat.includes(name), `the ${name} mode card`).toBe(true)
   expect(flat.includes('Hybrid'), 'no Hybrid mode').toBe(false)
   expect(flat.includes('reset Mode to defaults'), 'no danger row on Mode').toBe(false)
-  // pressing a mode card writes the edit; Hive then shows the checklist
+  // pressing a mode card writes the edit; Hive then shows the checklist card.
+  // L7.5: the hive rows came from the retired projects.json, so the fixture (and
+  // the live view) draws none — the card renders, empty, with no stale entries.
   press(drawn, 'set-mode-solo')
   expect(ui.get('settings:edit:mode')).toBe('"solo"')
   press(drawn, 'set-mode-hive')
@@ -190,9 +192,10 @@ test('Settings · Mode: scope bar 1-8, MOCK row, Solo/Orchestrator/Hive (no Hybr
   const hive = draw(ui)
   const hiveFlat = drawnText(hive)
   expect(hiveFlat.includes('HIVE · PROJECTS'), 'the hive checklist card').toBe(true)
-  for (const p of ['matrixkoder', 'hermes-switchui', 'hermes-desktop']) expect(hiveFlat.includes(p), `the ${p} project`).toBe(true)
-  press(hive, 'set-hive-hermes-desktop') // unchecked in the fixture → toggles on
-  expect(ui.get('settings:edit:hive.hermes-desktop')).toBe('true')
+  for (const p of ['matrixkoder', 'hermes-switchui', 'hermes-desktop']) {
+    expect(hiveFlat.includes(p), `no stale ${p} entry (projects.json retired)`).toBe(false)
+  }
+  expect(hiveFlat.includes('mode = hive'), 'the card names its live source').toBe(true)
 
   fitCheck(drawn, 46)
   fitCheck(draw(ui, 36), 36)
@@ -205,7 +208,7 @@ test('Settings · Project: lanes + QA rows, list row as comma-joined text, dange
   const drawn = draw(ui, 46, 'project')
   expect(ui.get('settings:scope'), 'the scope press landed').toBe('project')
   const flat = drawnText(drawn)
-  expect(flat.includes('.matrixkoder/matrixkoder.yaml · this repo'), 'the project scope-note').toBe(true)
+  expect(flat.includes('project.yaml · this repo'), 'the project scope-note').toBe(true)
   for (const sig of ['Worktree slots', 'Reuse slots', 'Copy into slot', '.claude-plugin/types', 'Integration branch', 'Merge target', 'Builders skip perms']) {
     expect(flat.includes(sig), `the ${sig} row`).toBe(true)
   }
@@ -218,7 +221,7 @@ test('Settings · Routing: policy, the four reserve-floor % rows with bars, revi
   const ui: FakeUi = new Map()
   const drawn = draw(ui, 46, 'routing')
   const flat = drawnText(drawn)
-  expect(flat.includes('matrixkoder.yaml · routing_preferences'), 'the routing scope-note').toBe(true)
+  expect(flat.includes('project.yaml · routing_preferences'), 'the routing scope-note').toBe(true)
   for (const sig of ['Policy', 'Builder order', 'opencode, claude', 'Max build lanes', 'Claude 5h', 'Claude week', 'Others 5h', 'Others week', 'Code reviewer', 'claude sonnet medium ▾', 'Visual reviewer']) {
     expect(flat.includes(sig), `the ${sig} row`).toBe(true)
   }
@@ -239,6 +242,24 @@ test('Settings · seg words stay short when the live config sends long notes (S2
   const flat = drawnText(SettingsTab(stubEls, live, 46, ui))
   for (const w of ['spare', 'bal', 'qual']) expect(flat.includes(w), `the ${w} button`).toBe(true)
   expect(flat.includes('orchestrates'), 'no note sentence in a button').toBe(false)
+})
+
+test('Settings · L7.1: a live view draws the REAL yaml path on every yaml scope note, never a hard-coded one', () => {
+  // a view as buildSettingsView returns it once `list --json` answered with the
+  // migrated C2 path: every yaml-backed scope-note carries that path (L7.1)
+  const livePath = '/srv/mkhome/projects/matrixkoder/project.yaml'
+  const v = settingsView()
+  const live = { ...v, scopes: v.scopes.map(s => (['project', 'routing', 'agents', 'models', 'child'].includes(s.id) ? { ...s, file: livePath } : s)) }
+  for (const id of ['project', 'routing', 'agents', 'models', 'child'] as const) {
+    const ui: FakeUi = new Map([['settings:scope', id]])
+    const flat = drawnText(SettingsTab(stubEls, live, 80, ui))
+    expect(flat.includes(livePath), `the ${id} note names the real path`).toBe(true)
+    expect(flat.includes('.matrixkoder/matrixkoder.yaml'), `no hard-coded path on ${id}`).toBe(false)
+  }
+  // and the fixture's own note is the shape label, not a repo-specific spelling
+  const fixture = drawnText(SettingsTab(stubEls, settingsView(), 46, new Map([['settings:scope', 'project']])))
+  expect(fixture.includes('.matrixkoder/matrixkoder.yaml'), 'no hard-coded path in the fixture').toBe(false)
+  expect(fixture.includes('project.yaml · this repo'), 'the fixture shape label').toBe(true)
 })
 
 test('Settings · Models: an agent with no picks row is read-only and never edits (S2b)', () => {
@@ -264,7 +285,7 @@ test('Settings · Agents: builder availability bools and the usage group', () =>
   const ui: FakeUi = new Map()
   const drawn = draw(ui, 46, 'agents')
   const flat = drawnText(drawn)
-  expect(flat.includes('matrixkoder.yaml · agents · usage'), 'the agents scope-note').toBe(true)
+  expect(flat.includes('project.yaml · agents · usage'), 'the agents scope-note').toBe(true)
   for (const sig of ['OpenCode', 'Claude Code', 'herdr', 'Codex', 'AGY', 'codexbar', 'claude, opencodego, ollama']) {
     expect(flat.includes(sig), `the ${sig} row`).toBe(true)
   }
@@ -277,7 +298,7 @@ test('Settings · Child: builder sessions, watch and reviewer panes', () => {
   const ui: FakeUi = new Map()
   const drawn = draw(ui, 46, 'child')
   const flat = drawnText(drawn)
-  expect(flat.includes('yaml lanes.child · lane sessions'), 'the child scope-note').toBe(true)
+  expect(flat.includes('project.yaml · lanes.child'), 'the child scope-note').toBe(true)
   for (const sig of ['New round', 'new', 'Subagents', 'Subagent model', 'Stall after', 'Give up after', 'Split', 'Reuse reviewer pane']) {
     expect(flat.includes(sig), `the ${sig} row`).toBe(true)
   }
@@ -305,7 +326,7 @@ test('Settings · Models: name-sorted rows, per-agent n/4 chips, pick-order numb
   const ui: FakeUi = new Map()
   const drawn = draw(ui, 46, 'models')
   const flat = drawnText(drawn)
-  expect(flat.includes('yaml agents.*.models · max 4 per agent'), 'the models scope-note').toBe(true)
+  expect(flat.includes('project.yaml · agents.*.models'), 'the models scope-note').toBe(true)
   // count chips: 3/4, 4/4, 0/4, 0/4
   for (const chip of [' 3/4 ', ' 4/4 ', ' 0/4 ']) expect(flat.includes(chip), `the ${chip.trim()} count chip`).toBe(true)
   expect(nodesOf(drawn, 'Text').filter(t => (t.children ?? []).join('') === ' 0/4 '), 'two empty agents').toHaveLength(2)
@@ -519,13 +540,19 @@ test('Settings · danger: every scope except Mode and About; the press clears th
     if (id in want) expect(flat.includes(want[id] ?? ''), `the danger row on ${id}`).toBe(true)
     else expect(flat.includes('reset'), `no danger row on ${id}`).toBe(false)
   }
-  // a press clears its own scope's edits and leaves another scope's alone
+  // a press clears its own scope's edits and leaves another scope's alone.
+  // L7.5: agents.*.available is read-only now, so the Agents-scope edit uses the
+  // usage.providers list row instead.
   const drawn = draw(ui, 46, 'routing')
   press(drawn, 'set-routing_preferences.reserve_floor.others.weekly_left_pct-inc')
-  press(draw(ui, 46, 'agents'), 'set-agents.agy.available-tog')
+  const agents = draw(ui, 46, 'agents')
+  const providers = nodesOf(agents, 'Input').find(i => String(i.props.key) === 'set-usage.providers')
+  expect(providers, 'the usage.providers Input').toBeDefined()
+  ;(providers?.props.onInput as (v: string) => void)('claude')
+  expect(ui.get('settings:edit:usage.providers')).toBe('"claude"')
   press(draw(ui, 46, 'routing'), 'set-danger')
   expect(ui.get('settings:edit:routing_preferences.reserve_floor.others.weekly_left_pct')).toBe('')
-  expect(ui.get('settings:edit:agents.agy.available')).toBe('true') // untouched (agy off → toggled on)
+  expect(ui.get('settings:edit:usage.providers')).toBe('"claude"') // untouched, another scope
   // on Models the danger row also clears pick edits
   const models = draw(ui, 46, 'models')
   press(models, 'set-model-claude-claude-haiku-5-5')

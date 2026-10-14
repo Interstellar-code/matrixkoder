@@ -238,6 +238,60 @@ test('S3 view: yaml fields group by scope; picks overlay; unknown shapes never b
   expect(chip?.editable).toBe(false)
 })
 
+// ---------- L7.4: level + home on every schema row ----------
+
+test('L7.4: every schema row carries level+home beside scope; all yaml, project; the UI scope is untouched', () => {
+  // C8: level (global|project) and home (userConfig|yaml) are NEW fields beside the
+  // UI-tab `scope`, which stays its own vocabulary. Every SCHEMA key is a yaml key,
+  // so level=project and home=yaml on all of them — `lanes.default_agent` included
+  // (its UI scope says "global" and must not change).
+  for (const row of SETTINGS_SCHEMA.schema) {
+    expect(row.level, `${row.key} level`).toBe('project')
+    expect(row.home, `${row.key} home`).toBe('yaml')
+    expect(String(row.scope).length, `${row.key} keeps a UI scope`).toBeGreaterThan(0)
+  }
+  // the UI-tab scope vocabulary is untouched: the four yaml scopes plus the
+  // read-only models/about rows and the one `global` label of lanes.default_agent
+  const scopes = new Set<string>(SETTINGS_SCHEMA.schema.map(r => r.scope as string))
+  for (const s of ['project', 'routing', 'agents', 'child', 'models', 'about', 'global']) {
+    expect(scopes.has(s), `the ${s} UI scope survives`).toBe(true)
+  }
+  const laneAgent = SETTINGS_SCHEMA.schema.find(r => r.key === 'lanes.default_agent')
+  expect(laneAgent?.scope, 'the UI scope stays the schema string').toBe('global')
+  expect(laneAgent?.level, 'but the C8 level is project').toBe('project')
+  expect(laneAgent?.home).toBe('yaml')
+  // and the UI-side mapping of that scope is unchanged: `lanes.default_agent` still
+  // lands in the Child tab (buildSettingsView's YAML_SCOPES -> child mapping)
+  const view = buildSettingsView({ fields: [...SETTINGS_LIST_FIXTURE], file: '', configRows: [], globalDefaults: {}, about: ABOUT })
+  const laneRow = view.groups.flatMap(g => g.rows).find(r => r.key === 'lanes.default_agent')
+  expect(laneRow?.scope, 'lanes.default_agent draws in Child').toBe('child')
+  expect(laneRow?.type, 'and is a select of the available agents').toBe('select')
+})
+
+test('L7.1: the live `file` from list --json reaches every yaml scope note; empty keeps the shape label', () => {
+  // the migrated layout's real path (C2) is what `list --json` prints
+  const live = '/srv/mkhome/projects/matrixkoder/project.yaml'
+  const view = buildSettingsView({
+    fields: [...SETTINGS_LIST_FIXTURE], file: live, configRows: [], globalDefaults: {}, about: ABOUT,
+  })
+  const byId = new Map<string, string>(view.scopes.map(s => [s.id as string, s.file]))
+  for (const id of ['project', 'routing', 'agents', 'models', 'child']) {
+    expect(byId.get(id), `the ${id} scope note names the live path`).toBe(live)
+  }
+  // the userConfig / plugin scopes are not the yaml: their labels stay
+  expect(byId.get('mode')).toBe('plugin.json')
+  expect(byId.get('tabs')).toBe('userConfig')
+  expect(byId.get('about')).toBe('plugin.json')
+  // no live path yet (fixture / first render): the shape label, never a hard-coded
+  // `.matrixkoder/matrixkoder.yaml` or `matrixkoder.yaml`
+  const pre = buildSettingsView({
+    fields: [...SETTINGS_LIST_FIXTURE], file: '', configRows: [], globalDefaults: {}, about: ABOUT,
+  })
+  for (const id of ['project', 'routing', 'agents', 'models', 'child']) {
+    expect(pre.scopes.find(s => s.id === id)?.file, `the ${id} label without a live path`).toBe('project.yaml')
+  }
+})
+
 /** The pool a `picks.<agent>` row carries in the list fixture — the one list the
  *  picker and `mk-config.py set` both read, so the test never restates it. */
 function fixturePool(agent: string): string[] {
@@ -391,7 +445,11 @@ test('S3 keys: savedEditKeys covers fields, picks and hive; settingsInputKeys on
   const keys = savedEditKeys(view)
   expect(keys).toContain('settings:edit:session.stall_min')
   expect(keys).toContain('settings:edit:models.opencode')
-  expect(keys).toContain('settings:edit:hive.matrixkoder')
+  // L7.5: the live view has no hive source (projects.json is retired), so it carries
+  // no stale hive edit keys — the fixture draws none either.
+  expect(view.projects).toEqual([])
+  expect(SETTINGS_FIXTURE.projects).toEqual([])
+  expect(keys.some(k => k.startsWith('settings:edit:hive.'))).toBe(false)
   const inputs = settingsInputKeys(view)
   expect(inputs.has('set-find-input')).toBe(true)
   expect(inputs.has('set-session.stall_min')).toBe(false) // a num row draws no Input
@@ -489,4 +547,23 @@ test('drift: global rows in SETTINGS_FIXTURE exactly match plugin.json userConfi
     const expected = USER_CONFIG[row.key as keyof typeof USER_CONFIG]
     expect(row.default, `default for ${row.key} must match plugin.json userConfig default`).toEqual(expected)
   }
+})
+
+test('L7.5: the fixture matches the live schema on `available` rows (read-only) and the hive list is retired', () => {
+  // the live `list --json` marks agents.*.available editable:false (detected at
+  // bootstrap); the fixture must agree, so the tab never draws a control the
+  // backend refuses and the schema-drift test sees the same row.
+  const schemaByKey = new Map<string, SchemaRow>(SCHEMA.map(f => [f.key as string, f]))
+  const fixtureAvail = SETTINGS_FIXTURE.groups
+    .flatMap(g => g.rows)
+    .filter(r => /^agents\..+\.available$/.test(r.key))
+  expect(fixtureAvail.length, 'the fixture still draws the availability rows').toBeGreaterThan(0)
+  for (const row of fixtureAvail) {
+    expect(row.editable, `${row.key} is read-only in the fixture`).toBe(false)
+    expect(row.why, `${row.key} says why it is read-only`).toBeTruthy()
+    const s = schemaByKey.get(row.key)
+    expect(s?.editable, `${row.key} is read-only in the generated schema`).toBe(false)
+  }
+  // and the hive card lists no projects: the source was the retired projects.json
+  expect(SETTINGS_FIXTURE.projects).toEqual([])
 })

@@ -89,6 +89,9 @@ def list_schema() -> list[dict]:
         rows.append({
             "key": f["key"],
             "scope": f.get("scope", ""),
+            # C8: level + home beside the UI-tab scope, so the committed file pins them too.
+            "level": f.get("level", ""),
+            "home": f.get("home", ""),
             "default": f.get("default"),
             "editable": bool(f.get("editable", True)),
             "type": f.get("type", ""),
