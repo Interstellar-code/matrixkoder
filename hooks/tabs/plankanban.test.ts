@@ -24,7 +24,14 @@ const kids = (v: unknown): N[] => {
   const arr = (v as { children?: unknown[] }).children
   return Array.isArray(arr) ? (arr as unknown[]).map(node) : []
 }
-const text = (v: unknown): string => kids(v).map(c => (typeof c === 'string' ? c : text(c))).join('')
+/** All text a card draws: Text children in order, and a Button's label (the
+ *  V1.5 card id is a pressable Button, not a Text). */
+const text = (v: unknown): string => {
+  if (typeof v === 'string') return v
+  const cur = node(v)
+  if (cur.type === 'Button') return String(cur.props.label ?? '')
+  return kids(v).map(c => (typeof c === 'string' ? c : text(c))).join('')
+}
 
 function allOf(root: unknown, type: string): N[] {
   const out: N[] = []
@@ -73,15 +80,15 @@ const FIXTURE_IDS = detail.phases.flatMap(p => p.tasks.map(t => t.id))
 const view = planKanbanView(detail)
 const W80 = 80
 
-test('planKanbanView maps the captured detail: 14 cards, 5 phases in plan order, no unknown statuses', () => {
+test('planKanbanView maps the captured detail: 32 cards, 8 phases in plan order, no unknown statuses', () => {
   expect(view.planId).toBe('settings-plans-db')
-  expect(view.phases).toEqual(['R1', 'T1', 'D1', 'S1', 'V1'])
-  expect(view.cards).toHaveLength(14)
+  expect(view.phases).toEqual(['R1', 'T1', 'D1', 'S1', 'V1', 'V1.4', 'D1.5', 'V1.5'])
+  expect(view.cards).toHaveLength(32)
   expect(view.unknownStatuses).toEqual([])
   // verdict survives the mapping (the NEEDS YOU rule reads it)
   expect(view.cards.find(c => c.id === 'R1.1')?.verdict).toBe('approve')
-  expect(view.cards.find(c => c.id === 'V1.3')?.status).toBe('building')
-  // no `updated` in the plans reply → no age
+  expect(view.cards.find(c => c.id === 'V1.5.1')?.status).toBe('building')
+  // no `updated` reading without a nowIso → no age
   expect(view.cards.every(c => c.age === '')).toBe(true)
 })
 
@@ -104,31 +111,35 @@ test('the status→column map: every status named by C15, unknown falls to PLANN
   expect(columnOfTask({ id: 'X', title: '', status: 'qa', phase: 'P', verdict: null, age: '' })).toBe('NEEDS YOU')
 })
 
-test('four headings with the right counts: PLANNED 3 · BUILDING 1 · NEEDS YOU 0 · ON MAIN 10', () => {
+test('four headings with the right counts: PLANNED 4 · BUILDING 9 · NEEDS YOU 0 · ON MAIN 19', () => {
   const tree = PlanKanbanTab(stubEls(), view, W80, uiOf().handle)
   const heads = allOf(tree, 'Text').filter(t => t.props.bold === true).map(t => text(t))
   expect(heads).toEqual([...PLAN_KANBAN_COLUMNS])
   const counts = PLAN_KANBAN_COLUMNS.map(col => countOf(columnBlock(tree, col)))
-  expect(counts).toEqual(['3', '1', '0', '10'])
+  expect(counts).toEqual(['4', '9', '0', '19'])
   // every fixture task id is drawn exactly once across the four columns
   const all = text(tree)
   for (const id of FIXTURE_IDS) expect(all.includes(id), id).toBe(true)
 })
 
-test('a card shows glyph, id, cut title and phase chip (V1.3 building, R1.1 merged)', () => {
+test('a card shows glyph, id, cut title, phase chip and the dim lane·agent tag (V1.5.1 building, R1.1 merged)', () => {
   const tree = PlanKanbanTab(stubEls(), view, W80, uiOf().handle)
   const building = columnBlock(tree, 'BUILDING')
-  expect(text(building)).toContain('●V1.3') // glyph and id are sibling Texts; the row's gap is layout, not text
+  expect(text(building)).toContain('●V1.5.1') // glyph and id are sibling Texts; the row's gap is layout, not text
   // 80 cols → each column 19 wide → card inner 15: the long title is cut, not wrapped
-  expect(text(building)).toContain('Kanban sub-tab…')
-  expect(text(building)).not.toContain('sub-tab wiring in dashboard.tsx')
-  expect(text(building)).toContain(' V1 ')
+  expect(text(building)).toContain('mkdb plans <id…')
+  expect(text(building)).not.toContain('node carries lane slot')
+  expect(text(building)).toContain(' V1.5 ')
   const onMain = columnBlock(tree, 'ON MAIN')
   expect(text(onMain)).toContain('✓R1.1')
   expect(text(onMain)).toContain('One home rule')
   expect(text(onMain)).not.toContain('$MK_HOME') // R1.1's long title is cut, not wrapped
   expect(text(onMain)).toContain(' R1 ')
-  // no `updated` in the data → no age text
+  // the live task-level routes draw their tag: D1.2 slot 4 · opencode/manifest/auto;
+  // V1.1/V1.2 slot 5 · route with an agent only
+  expect(text(onMain)).toContain('L4 · opencode auto')
+  expect(text(onMain)).toContain('L5 · opencode')
+  // no nowIso passed → no age text
   expect(text(tree)).not.toMatch(/\b\d+[mhd]\b/)
 })
 
@@ -187,7 +198,7 @@ test('narrow (36 cols) stacks the columns; wide keeps them side by side', () => 
     const block = columnBlock(narrow, col)
     expect(block, `narrow heading ${col}`).toBeDefined()
   }
-  expect(text(columnBlock(narrow, 'BUILDING'))).toContain('●V1.3')
+  expect(text(columnBlock(narrow, 'BUILDING'))).toContain('●V1.5.1')
   // wide: the same parent is a row
   const wide = PlanKanbanTab(stubEls(), view, W80, uiOf().handle)
   const wideParent = allOf(wide, 'Box').find(b => kids(b).includes(columnBlock(wide, 'PLANNED') as N) && kids(b).includes(columnBlock(wide, 'ON MAIN') as N))
@@ -196,7 +207,7 @@ test('narrow (36 cols) stacks the columns; wide keeps them side by side', () => 
 
 test('footer: <n> tasks · this plan only · source mk.db, following the filter', () => {
   const tree = PlanKanbanTab(stubEls(), view, W80, uiOf().handle)
-  expect(text(tree)).toContain('14 tasks · this plan only · source mk.db')
+  expect(text(tree)).toContain('32 tasks · this plan only · source mk.db')
   const { handle } = uiOf(new Map([['plankanban:phase', 'S1']]))
   const narrowed = PlanKanbanTab(stubEls(), view, W80, handle)
   expect(text(narrowed)).toContain('2 tasks · this plan only · source mk.db')
@@ -319,85 +330,169 @@ function renderLines(v: unknown, width?: number): string[] {
 const picture = (cols: number): string =>
   renderLines(PlanKanbanTab(stubEls(), view, cols, uiOf().handle), cols).map(l => l.replace(/\s+$/, '')).join('\n')
 
-test('report render: the captured fixture at 80 cols, exactly as pasted', () => {
-  expect(picture(80)).toBe(`all phases R1 T1 D1 S1 V1                                           k = all runs
+test('a card shows the dim lane·agent line and pressing it selects the task (V1.5)', () => {
+  const routed = planKanbanView({
+    ok: true, id: 'routed', phases: [{ id: 'P1', tasks: [
+      { id: 'T1', title: 'routed task', status: 'building', slot: 3, route: { agent: 'opencode', model: 'zai-coding-plan/glm-5.3', effort: 'high' } },
+      { id: 'T2', title: 'slot only', status: 'planned', slot: 5 },
+    ] }],
+  })
+  expect(routed.cards[0]?.slot).toBe(3)
+  expect(routed.cards[0]?.route).toEqual({ agent: 'opencode', model: 'zai-coding-plan/glm-5.3', effort: 'high' })
+  const { ui, handle } = uiOf()
+  const tree = PlanKanbanTab(stubEls(), routed, W80, handle)
+  const building = text(columnBlock(tree, 'BUILDING'))
+  expect(building).toContain('L3 · opencode glm-5.3')
+  const planned = text(columnBlock(tree, 'PLANNED'))
+  expect(planned).toContain('L5')
+  // the card is pressable: first press selects, second press clears
+  const card = allOf(tree, 'Button').find(b => String(b.props.key) === 'plankanban-card-T1')
+  expect(card, 'pressable card').toBeDefined()
+  ;(card?.props.onPress as () => void)()
+  expect(ui.get('plan:task')).toBe('T1')
+  ;(card?.props.onPress as () => void)()
+  expect(ui.get('plan:task')).toBe('')
+})
 
-PLANNED           3 BUILDING          1 NEEDS YOU         0 ON MAIN          10
+test('a card keeps its age beside the lane·agent tag (V1.5)', () => {
+  const aged = planKanbanView({
+    ok: true, id: 'aged', phases: [{ id: 'P1', tasks: [
+      { id: 'P1.1', title: 'busy', status: 'building', updated: '2026-10-14T11:38:00+02:00', slot: 2, route: { agent: 'opencode', model: 'provider/sonnet' } },
+    ] }],
+  }, '2026-10-14T12:00:00+02:00')
+  const tree = PlanKanbanTab(stubEls(), aged, W80, uiOf().handle)
+  const building = text(columnBlock(tree, 'BUILDING'))
+  expect(building).toContain('L2 · opencode sonnet')
+  expect(building).toContain('22m')
+})
+
+test('report render: the captured fixture at 80 cols, exactly as pasted', () => {
+  expect(picture(80)).toBe(`all phases R1 T1 D1 S1 V1 V1.4 D1.5 V1.5                            k = all runs
+
+PLANNED           4 BUILDING          9 NEEDS YOU         0 ON MAIN          19
 
 ╭─────────────────╮ ╭─────────────────╮ none                ╭─────────────────╮
-│ ○ D1.4          │ │ ● V1.3          │                     │ ✓ R1.1          │
-│ First real imp… │ │ Kanban sub-tab… │                     │ One home rule:… │
-│  D1             │ │  V1             │                     │  R1             │
+│ ○ S1.1          │ │ ● D1.5.1        │                     │ ✓ R1.1          │
+│ Scope-home map… │ │ run init --pla… │                     │ One home rule:… │
+│  S1             │ │  D1.5           │                     │  R1             │
 ╰─────────────────╯ ╰─────────────────╯                     ╰─────────────────╯
 
-╭─────────────────╮                                         ╭─────────────────╮
-│ ○ S1.1          │                                         │ ✓ R1.2          │
-│ Scope-home map… │                                         │ Write guard: a… │
-│  S1             │                                         │  R1             │
-╰─────────────────╯                                         ╰─────────────────╯
+╭─────────────────╮ ╭─────────────────╮                     ╭─────────────────╮
+│ ○ S1.2          │ │ ● D1.5.2        │                     │ ✓ R1.2          │
+│ Dead keys and … │ │ store mirror n… │                     │ Write guard: a… │
+│  S1             │ │  D1.5           │                     │  R1             │
+╰─────────────────╯ ╰─────────────────╯                     ╰─────────────────╯
 
-╭─────────────────╮                                         ╭─────────────────╮
-│ ○ S1.2          │                                         │ ✓ R1.3          │
-│ Dead keys and … │                                         │ Register matri… │
-│  S1             │                                         │  R1             │
-╰─────────────────╯                                         ╰─────────────────╯
+╭─────────────────╮ ╭─────────────────╮                     ╭─────────────────╮
+│ ○ V1.5.4        │ │ ● D1.5.3        │                     │ ✓ R1.3          │
+│ Detail panel: … │ │ dispatch recor… │                     │ Register matri… │
+│  V1.5           │ │  D1.5           │                     │  R1             │
+╰─────────────────╯ ╰─────────────────╯                     ╰─────────────────╯
 
-                                                            ╭─────────────────╮
-                                                            │ ✓ T1.1          │
-                                                            │ templates/plan… │
-                                                            │  T1             │
-                                                            ╰─────────────────╯
+╭─────────────────╮ ╭─────────────────╮                     ╭─────────────────╮
+│ ○ V1.5.5        │ │ ● D1.5.4        │                     │ ✓ T1.1          │
+│ Fixture recapt… │ │ mk-state task … │                     │ templates/plan… │
+│  V1.5           │ │  D1.5           │                     │  T1             │
+╰─────────────────╯ ╰─────────────────╯                     ╰─────────────────╯
 
-                                                            ╭─────────────────╮
-                                                            │ ✓ T1.2          │
-                                                            │ SKILL.md stage… │
-                                                            │  T1             │
-                                                            ╰─────────────────╯
+                    ╭─────────────────╮                     ╭─────────────────╮
+                    │ ● D1.5.5        │                     │ ✓ T1.2          │
+                    │ backfill setti… │                     │ SKILL.md stage… │
+                    │  D1.5           │                     │  T1             │
+                    ╰─────────────────╯                     ╰─────────────────╯
 
-                                                            ╭─────────────────╮
-                                                            │ ✓ D1.1          │
-                                                            │ mkdb.py: plans… │
-                                                            │  D1             │
-                                                            ╰─────────────────╯
+                    ╭─────────────────╮                     ╭─────────────────╮
+                    │ ● D1.5.6        │                     │ ✓ D1.1          │
+                    │ SKILL.md: task… │                     │ mkdb.py: plans… │
+                    │  D1.5           │                     │  D1  L3         │
+                    ╰─────────────────╯                     ╰─────────────────╯
 
-                                                            ╭─────────────────╮
-                                                            │ ✓ D1.2          │
-                                                            │ mk-plan.py: wr… │
-                                                            │  D1             │
-                                                            ╰─────────────────╯
+                    ╭─────────────────╮                     ╭─────────────────╮
+                    │ ● V1.5.1        │                     │ ✓ D1.2          │
+                    │ mkdb plans <id… │                     │ mk-plan.py: wr… │
+                    │  V1.5           │                     │  D1  L4 · openc │
+                    ╰─────────────────╯                     ╰─────────────────╯
 
-                                                            ╭─────────────────╮
-                                                            │ ✓ D1.3          │
-                                                            │ docs/state-sch… │
-                                                            │  D1             │
-                                                            ╰─────────────────╯
+                    ╭─────────────────╮                     ╭─────────────────╮
+                    │ ● V1.5.2        │                     │ ✓ D1.3          │
+                    │ Detail sub-tab… │                     │ docs/state-sch… │
+                    │  V1.5           │                     │  D1  L5         │
+                    ╰─────────────────╯                     ╰─────────────────╯
+
+                    ╭─────────────────╮                     ╭─────────────────╮
+                    │ ● V1.5.3        │                     │ ✓ D1.4          │
+                    │ Kanban card: i… │                     │ First real imp… │
+                    │  V1.5           │                     │  D1             │
+                    ╰─────────────────╯                     ╰─────────────────╯
 
                                                             ╭─────────────────╮
                                                             │ ✓ V1.1          │
                                                             │ List sub-tab: … │
-                                                            │  V1             │
+                                                            │  V1  L5 · openc │
                                                             ╰─────────────────╯
 
                                                             ╭─────────────────╮
                                                             │ ✓ V1.2          │
                                                             │ Detail sub-tab… │
-                                                            │  V1             │
+                                                            │  V1  L5 · openc │
                                                             ╰─────────────────╯
 
-14 tasks · this plan only · source mk.db`)
+                                                            ╭─────────────────╮
+                                                            │ ✓ V1.3          │
+                                                            │ Kanban sub-tab… │
+                                                            │  V1  L4         │
+                                                            ╰─────────────────╯
+
+                                                            ╭─────────────────╮
+                                                            │ ✓ V1.4.1        │
+                                                            │ New hooks/tabs… │
+                                                            │  V1.4           │
+                                                            ╰─────────────────╯
+
+                                                            ╭─────────────────╮
+                                                            │ ✓ V1.4.2        │
+                                                            │ Phase filter r… │
+                                                            │  V1.4           │
+                                                            ╰─────────────────╯
+
+                                                            ╭─────────────────╮
+                                                            │ ✓ V1.4.3        │
+                                                            │ Four columns s… │
+                                                            │  V1.4           │
+                                                            ╰─────────────────╯
+
+                                                            ╭─────────────────╮
+                                                            │ ✓ V1.4.4        │
+                                                            │ Cards: status … │
+                                                            │  V1.4           │
+                                                            ╰─────────────────╯
+
+                                                            ╭─────────────────╮
+                                                            │ ✓ V1.4.5        │
+                                                            │ Empty column s… │
+                                                            │  V1.4           │
+                                                            ╰─────────────────╯
+
+                                                            ╭─────────────────╮
+                                                            │ ✓ V1.4.6        │
+                                                            │ Narrow panes: … │
+                                                            │  V1.4           │
+                                                            ╰─────────────────╯
+
+                                                            ╭─────────────────╮
+                                                            │ ✓ V1.4.7        │
+                                                            │ Footer: <n> ta… │
+                                                            │  V1.4           │
+                                                            ╰─────────────────╯
+
+32 tasks · this plan only · source mk.db`)
 })
 
 test('report render: the captured fixture at 36 cols, exactly as pasted', () => {
-  expect(picture(36)).toBe(`all phases R1 T1 D1 S1 V1
+  expect(picture(36)).toBe(`all phases R1 T1 D1 S1 V1 V1.4 D1.5
                         k = all runs
 
-PLANNED                            3
-
-╭──────────────────────────────────╮
-│ ○ D1.4                           │
-│ First real import: settings-pla… │
-│  D1                              │
-╰──────────────────────────────────╯
+PLANNED                            4
 
 ╭──────────────────────────────────╮
 │ ○ S1.1                           │
@@ -411,19 +506,79 @@ PLANNED                            3
 │  S1                              │
 ╰──────────────────────────────────╯
 
-BUILDING                           1
+╭──────────────────────────────────╮
+│ ○ V1.5.4                         │
+│ Detail panel: select a task row… │
+│  V1.5                            │
+╰──────────────────────────────────╯
 
 ╭──────────────────────────────────╮
-│ ● V1.3                           │
-│ Kanban sub-tab: the existing Ka… │
-│  V1                              │
+│ ○ V1.5.5                         │
+│ Fixture recaptured from the liv… │
+│  V1.5                            │
+╰──────────────────────────────────╯
+
+BUILDING                           9
+
+╭──────────────────────────────────╮
+│ ● D1.5.1                         │
+│ run init --plan copies acceptan… │
+│  D1.5                            │
+╰──────────────────────────────────╯
+
+╭──────────────────────────────────╮
+│ ● D1.5.2                         │
+│ store mirror never blanks accep… │
+│  D1.5                            │
+╰──────────────────────────────────╯
+
+╭──────────────────────────────────╮
+│ ● D1.5.3                         │
+│ dispatch records agent, model, … │
+│  D1.5                            │
+╰──────────────────────────────────╯
+
+╭──────────────────────────────────╮
+│ ● D1.5.4                         │
+│ mk-state task check: mandatory … │
+│  D1.5                            │
+╰──────────────────────────────────╯
+
+╭──────────────────────────────────╮
+│ ● D1.5.5                         │
+│ backfill settings-plans-db-r1 t… │
+│  D1.5                            │
+╰──────────────────────────────────╯
+
+╭──────────────────────────────────╮
+│ ● D1.5.6                         │
+│ SKILL.md: task round and route … │
+│  D1.5                            │
+╰──────────────────────────────────╯
+
+╭──────────────────────────────────╮
+│ ● V1.5.1                         │
+│ mkdb plans <id> --json: each ta… │
+│  V1.5                            │
+╰──────────────────────────────────╯
+
+╭──────────────────────────────────╮
+│ ● V1.5.2                         │
+│ Detail sub-tab task row: id, ti… │
+│  V1.5                            │
+╰──────────────────────────────────╯
+
+╭──────────────────────────────────╮
+│ ● V1.5.3                         │
+│ Kanban card: id, cut title, lan… │
+│  V1.5                            │
 ╰──────────────────────────────────╯
 
 NEEDS YOU                          0
 
 none
 
-ON MAIN                           10
+ON MAIN                           19
 
 ╭──────────────────────────────────╮
 │ ✓ R1.1                           │
@@ -458,33 +613,87 @@ ON MAIN                           10
 ╭──────────────────────────────────╮
 │ ✓ D1.1                           │
 │ mkdb.py: plans gains status, cr… │
-│  D1                              │
+│  D1  L3                          │
 ╰──────────────────────────────────╯
 
 ╭──────────────────────────────────╮
 │ ✓ D1.2                           │
 │ mk-plan.py: write the new colum… │
-│  D1                              │
+│  D1  L4 · opencode auto          │
 ╰──────────────────────────────────╯
 
 ╭──────────────────────────────────╮
 │ ✓ D1.3                           │
 │ docs/state-schema.md: drop the … │
+│  D1  L5                          │
+╰──────────────────────────────────╯
+
+╭──────────────────────────────────╮
+│ ✓ D1.4                           │
+│ First real import: settings-pla… │
 │  D1                              │
 ╰──────────────────────────────────╯
 
 ╭──────────────────────────────────╮
 │ ✓ V1.1                           │
 │ List sub-tab: ongoing runs on t… │
-│  V1                              │
+│  V1  L5 · opencode               │
 ╰──────────────────────────────────╯
 
 ╭──────────────────────────────────╮
 │ ✓ V1.2                           │
 │ Detail sub-tab: the existing Pl… │
-│  V1                              │
+│  V1  L5 · opencode               │
 ╰──────────────────────────────────╯
 
-14 tasks · this plan only · source
+╭──────────────────────────────────╮
+│ ✓ V1.3                           │
+│ Kanban sub-tab: the existing Ka… │
+│  V1  L4                          │
+╰──────────────────────────────────╯
+
+╭──────────────────────────────────╮
+│ ✓ V1.4.1                         │
+│ New hooks/tabs/plankanban.tsx b… │
+│  V1.4                            │
+╰──────────────────────────────────╯
+
+╭──────────────────────────────────╮
+│ ✓ V1.4.2                         │
+│ Phase filter row: all phases + … │
+│  V1.4                            │
+╰──────────────────────────────────╯
+
+╭──────────────────────────────────╮
+│ ✓ V1.4.3                         │
+│ Four columns side by side with … │
+│  V1.4                            │
+╰──────────────────────────────────╯
+
+╭──────────────────────────────────╮
+│ ✓ V1.4.4                         │
+│ Cards: status glyph, task id, c… │
+│  V1.4                            │
+╰──────────────────────────────────╯
+
+╭──────────────────────────────────╮
+│ ✓ V1.4.5                         │
+│ Empty column shows none (dim)    │
+│  V1.4                            │
+╰──────────────────────────────────╯
+
+╭──────────────────────────────────╮
+│ ✓ V1.4.6                         │
+│ Narrow panes: columns stack ver… │
+│  V1.4                            │
+╰──────────────────────────────────╯
+
+╭──────────────────────────────────╮
+│ ✓ V1.4.7                         │
+│ Footer: <n> tasks · this plan o… │
+│  V1.4                            │
+╰──────────────────────────────────╯
+
+32 tasks · this plan only · source
 mk.db`)
 })

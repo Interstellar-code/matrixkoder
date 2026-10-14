@@ -1427,6 +1427,38 @@ def _design_of(row):
     return got if isinstance(got, list) else []
 
 
+def _col(row, name):
+    """A column read that tolerates a row without it (a v3-shaped row, a narrower SELECT)."""
+    return row[name] if name in row.keys() else None
+
+
+def _slot_of(text):
+    """tasks.slot is TEXT; the reply carries int when it parses, else null (V1.5.1)."""
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _route_of(text):
+    """route_json as {agent, model, effort}: null when empty, unparsable, or not an object."""
+    if not text:
+        return None
+    try:
+        got = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    return got if isinstance(got, dict) else None
+
+
+def _routing_of(r):
+    """The per-task routing fields every task/subtask node in a plans detail reply carries."""
+    return {"slot": _slot_of(_col(r, "slot")), "pane": _col(r, "pane"), "branch": _col(r, "branch"),
+            "updated": _col(r, "updated"), "acceptance": _col(r, "acceptance"),
+            "owned": _deps_of(_col(r, "owned")), "deps": _deps_of(_col(r, "deps")),
+            "route": _route_of(_col(r, "route_json"))}
+
+
 def _phases_from_run(rows, header):
     """Phases with their tasks from one run's task rows, in row order (C5).
 
@@ -1434,6 +1466,9 @@ def _phases_from_run(rows, header):
     phases as parentless task rows. Children of a phase are its tasks; deeper children
     (type='subtask' or any row under a task) nest under their parent task as subtasks.
     `wave` has no run column; it is cross-filled from header_json.phases by id.
+    V1.5.1: every phase-level node carries the routing keys too — a round's lane tasks sit
+    at phase level (root rows the live mirror may type 'phase' or 'task'), and their slot/
+    pane/branch/route live on the row itself, null-defaulted when the row carries none.
     """
     hwave = {str(p.get("id")): p.get("wave") for p in header.get("phases") or []
              if isinstance(p, dict) and p.get("id")}
@@ -1441,10 +1476,14 @@ def _phases_from_run(rows, header):
     phases, tasks, subs = {}, {}, {}
     for r in rows:  # add_task and import insert a parent before its children, so one pass is safe
         node = {"id": r["id"], "title": r["title"], "status": r["status"], "parent": r["parent"],
-                "type": r["type"], "round": r["round"], "verdict": r["verdict"], "subtasks": []}
+                "type": r["type"], "round": r["round"], "verdict": r["verdict"], **_routing_of(r),
+                "subtasks": []}
         if not r["parent"] or r["parent"] not in ids:
-            phases[r["id"]] = {"id": r["id"], "title": r["title"], "wave": hwave.get(r["id"]),
-                               "deps": _deps_of(r["deps"]), "status": r["status"], "tasks": []}
+            ph = {"id": r["id"], "title": r["title"], "wave": hwave.get(r["id"]),
+                  "deps": _deps_of(r["deps"]), "status": r["status"]}
+            ph.update(_routing_of(r))
+            ph["tasks"] = []
+            phases[r["id"]] = ph
         elif r["parent"] in phases:
             tasks[r["id"]] = node
             phases[r["parent"]]["tasks"].append(node)
@@ -1461,26 +1500,38 @@ def _phases_from_run(rows, header):
 
 
 def _phases_from_header(header):
-    """The same phase shape from header_json.phases, every status 'planned' (no run yet)."""
+    """The same phase shape from header_json.phases, every status 'planned' (no run yet).
+
+    Task/subtask nodes carry the same routing keys as _phases_from_run, defaulted: no run
+    has routed anything yet, so slot/pane/branch/updated/acceptance/route are null and
+    owned is []; deps comes from the header task dict when present (V1.5.1 shape parity).
+    Phase-level nodes carry the same defaulted keys, parity with the run view.
+    """
     out = []
     for ph in header.get("phases") or []:
         if not isinstance(ph, dict):
             continue
         pid = str(ph.get("id", ""))
+
+        def _node(nid, d, parent, type_):
+            return {"id": nid, "title": d.get("title", ""), "status": "planned", "parent": parent,
+                    "type": type_, "round": None, "verdict": None, "slot": None, "pane": None,
+                    "branch": None, "updated": None, "acceptance": None, "owned": [],
+                    "deps": list(d.get("deps") or []), "route": None, "subtasks": []}
+
         tasks = []
         for t in ph.get("tasks") or []:
             if not isinstance(t, dict):
                 continue
             tid = str(t.get("id", ""))
-            task = {"id": tid, "title": t.get("title", ""), "status": "planned", "parent": pid,
-                    "type": "task", "round": None, "verdict": None,
-                    "subtasks": [{"id": str(s.get("id", "")), "title": s.get("title", ""),
-                                  "status": "planned", "parent": tid, "type": "subtask",
-                                  "round": None, "verdict": None, "subtasks": []}
-                                 for s in t.get("subtasks") or [] if isinstance(s, dict)]}
+            task = _node(tid, t, pid, "task")
+            task["subtasks"] = [_node(str(s.get("id", "")), s, tid, "subtask")
+                                for s in t.get("subtasks") or [] if isinstance(s, dict)]
             tasks.append(task)
         out.append({"id": pid, "title": ph.get("title", ""), "wave": ph.get("wave"),
-                    "deps": list(ph.get("deps") or []), "status": "planned", "tasks": tasks})
+                    "deps": list(ph.get("deps") or []), "status": "planned", "slot": None,
+                    "pane": None, "branch": None, "updated": None, "acceptance": None,
+                    "owned": [], "route": None, "tasks": tasks})
     return out
 
 
@@ -1519,7 +1570,8 @@ def _plan_obj(con, row, detail=False):
     if runs:
         newest = runs[0]["id"]
         rows = con.execute(
-            "SELECT id, parent, type, title, status, deps, round, verdict FROM tasks"
+            "SELECT id, parent, type, title, status, deps, round, verdict, acceptance, owned,"
+            " route_json, slot, branch, pane, updated FROM tasks"
             " WHERE run=? ORDER BY rowid", (newest,)).fetchall()
         ids = {r["id"] for r in rows}
         roots = {r["id"] for r in rows if not r["parent"] or r["parent"] not in ids}
@@ -2694,7 +2746,7 @@ def _seed_plans(home, name):
             {"id": "ph1", "title": "Phase one", "wave": 1, "deps": [], "tasks": [
                 {"id": "a1", "title": "Task A1", "subtasks": [{"id": "s1", "title": "Sub S1"}]}]},
             {"id": "ph2", "title": "Phase two", "wave": 2, "deps": ["ph1"], "tasks": [
-                {"id": "a2", "title": "Task A2", "subtasks": []}]}]})
+                {"id": "a2", "title": "Task A2", "deps": ["a1"], "subtasks": []}]}]})
     con = open_project(home, data_dir=data)
     try:
         _begin(con)
@@ -2832,6 +2884,25 @@ def _plans_detail(home):
     header_json, subtasks nested) or all 'planned' from header_json with no run; an unknown
     id is a Fail, and the CLI turns it into ok:false exit 2."""
     data = _seed_plans(home, "plans-d")
+    # V1.5.1: task/subtask nodes carry the routing columns. add_task has no slot/pane/branch/
+    # acceptance/owned parameters (they are lane-orchestrator writes), so the seeded rows are
+    # updated in place: a1 fully routed, a2 garbage route_json, a3/a4 left empty, loner a
+    # parentless task row (the live store's D1.5-style round root) routed like a task.
+    con = open_project(home, data_dir=data)
+    try:
+        con.execute(
+            "UPDATE tasks SET slot='3', pane='mk:0.1', branch='mk/r2/v1',"
+            " updated='2026-01-05T00:00:00Z', acceptance='ac: a1 green', owned='a2, a3',"
+            " deps='a3', route_json=? WHERE run='r2' AND id='a1'",
+            (json.dumps({"agent": "opencode", "model": "zai-coding-plan/glm-5.3",
+                         "effort": "high"}),))
+        con.execute("UPDATE tasks SET route_json='{oops' WHERE run='r2' AND id='a2'")
+        con.execute("UPDATE tasks SET slot='7', pane='w1:p2', route_json=?"
+                    " WHERE run='r2' AND id='loner'",
+                    (json.dumps({"agent": "mk-lane", "model": None, "effort": "low"}),))
+        con.commit()
+    finally:
+        con.close()
     got = plans(home, data_dir=data, plan_id="alpha")
     _check(got["ok"] is True and got["id"] == "alpha", f"detail id {got.get('id')}")
     _check(set(got) == {"ok", "id", "title", "status", "created", "design", "integration",
@@ -2840,17 +2911,38 @@ def _plans_detail(home):
     ids = [p["id"] for p in got["phases"]]
     _check(ids == ["ph1", "loner"], f"detail phases {ids}")  # row order; header ph2 never ran
     ph1, loner = got["phases"]
+    phase_keys = {"id", "title", "wave", "deps", "status", "tasks", "slot", "pane", "branch",
+                  "updated", "acceptance", "owned", "route"}
     _check(ph1["wave"] == 1 and ph1["title"] == "Phase one" and ph1["status"] == "planned"
-           and ph1["deps"] == [], f"ph1 {ph1}")  # wave cross-filled from header_json
+           and ph1["deps"] == [] and set(ph1) == phase_keys and ph1["slot"] is None
+           and ph1["route"] is None, f"ph1 {ph1}")  # wave from header_json; routing null-defaulted
     _check([t["id"] for t in ph1["tasks"]] == ["a1", "a2", "a3", "a4"], f"ph1 tasks {ph1['tasks']}")
-    a1 = ph1["tasks"][0]
+    task_keys = {"id", "title", "status", "parent", "type", "round", "verdict", "slot", "pane",
+                 "branch", "updated", "acceptance", "owned", "deps", "route", "subtasks"}
+    a1, a2, a3, a4 = ph1["tasks"]
     _check(a1["parent"] == "ph1" and a1["type"] == "task" and a1["status"] == "planned"
-           and set(a1) == {"id", "title", "status", "parent", "type", "round", "verdict",
-                           "subtasks"}, f"a1 {a1}")
+           and set(a1) == task_keys, f"a1 {a1}")
+    _check(a1["slot"] == 3 and a1["pane"] == "mk:0.1" and a1["branch"] == "mk/r2/v1"
+           and a1["updated"] == "2026-01-05T00:00:00Z" and a1["acceptance"] == "ac: a1 green",
+           f"a1 routing {a1}")  # slot is TEXT '3' in the row; the reply carries int 3
+    _check(a1["owned"] == ["a2", "a3"] and a1["deps"] == ["a3"], f"a1 owned/deps {a1}")
+    _check(a1["route"] == {"agent": "opencode", "model": "zai-coding-plan/glm-5.3",
+                           "effort": "high"}, f"a1 route {a1['route']}")
+    _check(a2["route"] is None, f"garbage route_json must read as null: {a2}")  # '{oops'
+    _check(a3["route"] is None and a3["slot"] is None and a3["owned"] == [] and a3["deps"] == [],
+           f"a3 defaults {a3}")  # empty route_json and no routing columns set
+    a1s = a1["subtasks"][0]
     _check([s["id"] for s in a1["subtasks"]] == ["a1s"]
-           and a1["subtasks"][0]["parent"] == "a1" and a1["subtasks"][0]["type"] == "subtask"
-           and a1["subtasks"][0]["subtasks"] == [], f"a1 subtasks {a1['subtasks']}")
-    _check(loner["wave"] is None and loner["tasks"] == [], f"root row as phase {loner}")
+           and a1s["parent"] == "a1" and a1s["type"] == "subtask" and set(a1s) == task_keys
+           and a1s["slot"] is None and a1s["route"] is None and a1s["subtasks"] == [],
+           f"a1 subtasks {a1['subtasks']}")
+    # a parentless task row renders at phase level with the same key set: routing keys on,
+    # phase keys (wave/tasks) on, and no task-only keys (parent/type/round/verdict)
+    _check(loner["wave"] is None and loner["tasks"] == [] and set(loner) == phase_keys,
+           f"root task row as phase {loner}")
+    _check(loner["slot"] == 7 and loner["pane"] == "w1:p2"
+           and loner["route"] == {"agent": "mk-lane", "model": None, "effort": "low"},
+           f"root task row routing {loner}")
     proc = subprocess.run([sys.executable, os.path.abspath(__file__), "plans", "beta", "--home",
                            home, "--data", data, "--json"], capture_output=True, text=True)
     _check(proc.returncode == 0 and "Traceback" not in proc.stderr,
@@ -2868,6 +2960,18 @@ def _plans_detail(home):
     s1 = ph1b["tasks"][0]["subtasks"][0]
     _check(s1["id"] == "s1" and s1["parent"] == "a1" and s1["type"] == "subtask"
            and ph1b["tasks"][0]["status"] == "planned", f"beta subtask {s1}")
+    # V1.5.1 shape parity in the header fallback: same task_keys, all routing fields defaulted
+    bt = ph1b["tasks"][0]
+    _check(set(bt) == task_keys and bt["slot"] is None and bt["pane"] is None
+           and bt["branch"] is None and bt["updated"] is None and bt["acceptance"] is None
+           and bt["owned"] == [] and bt["deps"] == [] and bt["route"] is None,
+           f"beta header task shape {bt}")
+    _check(set(s1) == task_keys and s1["slot"] is None and s1["route"] is None
+           and s1["deps"] == [], f"beta header subtask shape {s1}")
+    _check(set(ph1b) == phase_keys and ph1b["slot"] is None and ph1b["route"] is None,
+           f"beta header phase shape {ph1b}")
+    _check(ph2b["tasks"][0]["deps"] == ["a1"],
+           f"beta header task deps {ph2b['tasks'][0]}")  # deps from the header task dict
     try:
         plans(home, data_dir=data, plan_id="nope")
     except Fail:

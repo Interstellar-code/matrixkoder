@@ -7,9 +7,11 @@
 // sub-tab changes.
 import type { Elements, RenderElement } from 'claude-code'
 import { NARROW } from './ui'
-import { Card, Chip, Section, Segment } from './kit'
+import { ActionButton, Card, Chip, Section, Segment } from './kit'
 import { PALETTE, ROLE } from './palette'
 import { timeInStatus } from './kanban'
+import { laneAgent, routeFields } from './plans-map'
+import type { PlanRoute } from './plan'
 
 type Els = Elements[keyof Elements]
 
@@ -39,7 +41,8 @@ export function verdictNeedsChanges(verdict: string | null): boolean {
 }
 
 /** One card: a task of this plan. `age` is precomputed by planKanbanView
- *  (`22m` / `8h` / `2d`); '' when the task carries no `updated`. */
+ *  (`22m` / `8h` / `2d`); '' when the task carries no `updated`. V1.5 adds the
+ *  routing fields (slot, route) the lane·agent line and the press read. */
 export type PlanKanbanCard = {
   readonly id: string
   readonly title: string
@@ -47,6 +50,8 @@ export type PlanKanbanCard = {
   readonly phase: string
   readonly verdict: string | null
   readonly age: string
+  readonly slot?: number | null
+  readonly route?: PlanRoute | null
 }
 
 /** The sub-tab's whole view: the plan's phases in plan order and its cards. */
@@ -95,6 +100,7 @@ export function planKanbanView(detail: unknown, nowIso = ''): PlanKanbanView {
         phase: raw.id,
         verdict: verdictRaw === '' ? null : verdictRaw,
         age: ageOf(str(task.updated), nowIso),
+        ...routeFields(task),
       })
     }
   }
@@ -132,21 +138,31 @@ const cut = (text: string, w: number): string => {
 }
 
 /** One card (mockup): line 1 the column glyph in its colour + the task id;
- *  line 2 the title cut to the column width; line 3 the phase Chip and the
- *  age when the data has one. BUILDING keeps the live border, NEEDS YOU the
- *  warn border, as the mockup's `.card.live` / amber border. */
-function planCard(els: Els, card: PlanKanbanCard, col: PlanKanbanColumn, inner: number): RenderElement {
+ *  line 2 the title cut to the column width; line 3 the phase Chip, the dim
+ *  lane·agent tag (V1.5) and the age when the data has one. The card is
+ *  pressable and selects the task (`plan:task`; pressing the selected task
+ *  again clears it). BUILDING keeps the live border, NEEDS YOU the warn
+ *  border, as the mockup's `.card.live` / amber border. */
+function planCard(els: Els, card: PlanKanbanCard, col: PlanKanbanColumn, inner: number, ui?: TabUi): RenderElement {
   const { Box, Text } = els
   const edge = col === 'BUILDING' ? { role: 'live' as const } : col === 'NEEDS YOU' ? { role: 'warn' as const } : {}
+  const lane = laneAgent(card)
   return Card(els, edge, (
     <Box key={card.id} flexDirection="column">
       <Box flexDirection="row" gap={1}>
         <Text color={COLUMN_FG[col]}>{COLUMN_GLYPH[col]}</Text>
-        <Text>{card.id}</Text>
+        {ActionButton(els, {
+          key: `plankanban-card-${card.id}`,
+          glyph: card.id,
+          word: '',
+          plain: true,
+          onPress: () => { if (ui != null) ui.set('plan:task', ui.get('plan:task') === card.id ? '' : card.id) },
+        })}
       </Box>
       <Text color="subtle" wrap="truncate-end">{cut(card.title, inner)}</Text>
       <Box flexDirection="row" gap={1}>
         {Chip(els, { label: card.phase, role: 'idle' })}
+        {lane !== '' && <Text dimColor={true} wrap="truncate-end">{lane}</Text>}
         {card.age !== '' && <Text dimColor={true}>{card.age}</Text>}
       </Box>
     </Box>
@@ -155,7 +171,7 @@ function planCard(els: Els, card: PlanKanbanCard, col: PlanKanbanColumn, inner: 
 
 /** One column: the Section heading with its count, then the cards — or the
  *  mockup's dim `none` when empty. `width` is the column's cell budget. */
-function planColumn(els: Els, col: PlanKanbanColumn, cards: readonly PlanKanbanCard[], width: number, fixedWidth: boolean): RenderElement {
+function planColumn(els: Els, col: PlanKanbanColumn, cards: readonly PlanKanbanCard[], width: number, fixedWidth: boolean, ui?: TabUi): RenderElement {
   const { Box, Text } = els
   const inner = Math.max(1, width - 4) // Card: border 2 + paddingX 1 each side
   return (
@@ -163,7 +179,7 @@ function planColumn(els: Els, col: PlanKanbanColumn, cards: readonly PlanKanbanC
       {Section(els, { label: col, right: String(cards.length) })}
       {cards.length === 0
         ? <Text dimColor={true}>none</Text>
-        : cards.map(card => planCard(els, card, col, inner))}
+        : cards.map(card => planCard(els, card, col, inner, ui))}
     </Box>
   )
 }
@@ -207,11 +223,11 @@ export function PlanKanbanTab(els: Els, view: PlanKanbanView, cols: number, ui?:
       {phaseRow(els, view, phase, ui)}
       {side ? (
         <Box flexDirection="row" gap={1}>
-          {PLAN_KANBAN_COLUMNS.map(col => planColumn(els, col, byColumn(col), colW, true))}
+          {PLAN_KANBAN_COLUMNS.map(col => planColumn(els, col, byColumn(col), colW, true, ui))}
         </Box>
       ) : (
         <Box flexDirection="column" gap={1}>
-          {PLAN_KANBAN_COLUMNS.map(col => planColumn(els, col, byColumn(col), colW, false))}
+          {PLAN_KANBAN_COLUMNS.map(col => planColumn(els, col, byColumn(col), colW, false, ui))}
         </Box>
       )}
       <Text dimColor={true}>{`${shown.length} tasks · this plan only · source mk.db`}</Text>
