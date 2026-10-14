@@ -137,16 +137,43 @@ const cut = (text: string, w: number): string => {
   return `${text.slice(0, w - 1)}…`
 }
 
+/** todo 94: the lane tag when the full `L4 · opencode model` form does not
+ *  fit — lane and agent only, no model and no ` · ` separator (`L4 opencode`).
+ *  The wide form stays `laneAgent`'s; this is the whole-word fallback so a
+ *  narrow card never cuts a word. */
+const laneOnly = (card: PlanKanbanCard): string =>
+  typeof card.slot === 'number' && Number.isFinite(card.slot) ? `L${card.slot}` : ''
+
+const narrowLane = (card: PlanKanbanCard): string => {
+  const lane = laneOnly(card)
+  const agent = card.route?.agent ?? ''
+  if (lane === '') return agent
+  return agent === '' ? lane : `${lane} ${agent}`
+}
+
 /** One card (mockup): line 1 the column glyph in its colour + the task id;
  *  line 2 the title cut to the column width; line 3 the phase Chip, the dim
- *  lane·agent tag (V1.5) and the age when the data has one. The card is
+ *  lane·agent tag (V1.5) and the age when the data has one. The tag takes the
+ *  narrow fallbacks below when the chip row cannot hold it whole. The card is
  *  pressable and selects the task (`plan:task`; pressing the selected task
  *  again clears it). BUILDING keeps the live border, NEEDS YOU the warn
  *  border, as the mockup's `.card.live` / amber border. */
 function planCard(els: Els, card: PlanKanbanCard, col: PlanKanbanColumn, inner: number, ui?: TabUi): RenderElement {
   const { Box, Text } = els
   const edge = col === 'BUILDING' ? { role: 'live' as const } : col === 'NEEDS YOU' ? { role: 'warn' as const } : {}
-  const lane = laneAgent(card)
+  const full = laneAgent(card)
+  const short = narrowLane(card)
+  // todo 94: never cut the tag mid-word. Two fallbacks, in order: the chip row
+  // gives the tag the inner width less the phase chip (label + 2), the gap
+  // before it, and the age with its gap when there is one. The full
+  // `L4 · opencode model` form wins when it fits there; else the model is
+  // dropped (`L4 opencode`). When that still does not fit, the tag moves to
+  // its own row (a plain Text, so the engine wraps it at word edges, never
+  // mid-word). The three-part form is untouched wherever it does fit.
+  const tagRoom = inner - (card.phase.length + 2) - 1 - (card.age !== '' ? 1 + card.age.length : 0)
+  const fits = (tag: string): boolean => tag !== '' && tag.length <= tagRoom
+  const rowTag = fits(full) ? full : fits(short) ? short : ''
+  const ownTag = rowTag !== '' ? '' : short !== '' ? short : full
   return Card(els, edge, (
     <Box key={card.id} flexDirection="column">
       <Box flexDirection="row" gap={1}>
@@ -162,9 +189,10 @@ function planCard(els: Els, card: PlanKanbanCard, col: PlanKanbanColumn, inner: 
       <Text color="subtle" wrap="truncate-end">{cut(card.title, inner)}</Text>
       <Box flexDirection="row" gap={1}>
         {Chip(els, { label: card.phase, role: 'idle' })}
-        {lane !== '' && <Text dimColor={true} wrap="truncate-end">{lane}</Text>}
+        {rowTag !== '' && <Text dimColor={true}>{rowTag}</Text>}
         {card.age !== '' && <Text dimColor={true}>{card.age}</Text>}
       </Box>
+      {ownTag !== '' && <Text dimColor={true}>{ownTag}</Text>}
     </Box>
   ))
 }
