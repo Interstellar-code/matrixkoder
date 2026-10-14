@@ -519,6 +519,62 @@ def lane_status_word(text):
     return word if word in LANE_STATUS_WORDS else None
 
 
+# A lane message body may carry `todo in_progress|completed|done <id>` lines (mk-builder todo).
+# They move the lane's own subtasks, never another task.
+LANE_TODO_RE = re.compile(r"(?m)^[ \t]*todo[ \t]+(in_progress|completed|done)[ \t]+(\S+)[ \t]*$")
+_TODO_START_FROM = ("planned", "routed", "dispatched", "ready", "fix")
+
+
+def _todo_done_target(data_dir):
+    """session.todo_done_status from <data>/matrixkoder.yaml (the line `todo_done_status: verify|done`):
+    verify -> verifying (default), done -> done. Same tiny scan the builder side uses."""
+    try:
+        with open(os.path.join(data_dir, "matrixkoder.yaml")) as f:
+            for line in f:
+                raw = line.split("#", 1)[0].strip()
+                if raw.startswith("todo_done_status:"):
+                    return "done" if raw.split(":", 1)[1].strip().strip("\"'") == "done" else "verifying"
+    except OSError:
+        pass
+    return "verifying"
+
+
+def _is_descendant(store, run, tid, root):
+    """True when `tid` is a child, at any depth, of `root` in this run (parent chain, depth-capped)."""
+    cur = tid
+    for _ in range(20):
+        rows = store.store_select("SELECT parent FROM tasks WHERE run=? AND id=?", (run, cur))
+        cur = rows[0]["parent"] if rows else None
+        if not cur:
+            return False
+        if cur == root:
+            return True
+    return False
+
+
+def apply_lane_todos(store, run, task, text):
+    """Move the lane's subtasks named by `todo <state> <id>` lines -> (updated ids, ignored ids).
+    in_progress -> building; completed|done -> verifying or done (todo_done_status). An id that is
+    not a descendant of the token's task is ignored: a lane never moves another task."""
+    updated, ignored = [], []
+    for state, tid in LANE_TODO_RE.findall(text or ""):
+        try:
+            ours = tid != task and _is_descendant(store, run, tid, task)
+        except Exception:
+            ours = False
+        if not ours:
+            ignored.append(tid)
+            continue
+        if state == "in_progress":
+            upd, _ = _store_move(store, run, tid, "building", f"bus todo {state}", allowed_from=_TODO_START_FROM)
+        else:
+            upd, _ = _store_move(store, run, tid, _todo_done_target(store.data_dir), f"bus todo {state}",
+                                 allowed_from=("building",))
+        if upd:
+            updated.append(tid)
+    return updated, ignored
+
+
 def matches_lane(msg, lane):
     if not lane or lane == "*":
         return True
@@ -2190,16 +2246,23 @@ class RequestHandler(BaseHTTPRequestHandler):
                     if err and "only from blocked" in err:
                         err = None  # not blocked: nothing to undo, not a failure
                     self.send_json(200, {"ok": True, "message": msg, "state_updated": upd, "mk_state_error": err})
-                elif bus.use_store and kind == "task" and not is_orch and lane_status_word(text) and task:
+                elif bus.use_store and kind == "task" and not is_orch and task and (
+                        lane_status_word(text) or LANE_TODO_RE.search(text)):
                     # Todo 67: a lane `task` message "status in_progress|verify|done" moves its own
                     # task (the token fixes `task`) along the builder path; the message stays, so
                     # the dedupe key still reads it. Not a legal move -> 200 and state_ignored.
                     word = lane_status_word(text)
-                    to, from_ok = LANE_STATUS_WORDS[word]
-                    upd, why = _store_move(store, run, task, to, f"bus status {word}", allowed_from=from_ok)
-                    reply = {"ok": True, "message": msg, "state_updated": upd, "mk_state_error": None}
-                    if why:
-                        reply["state_ignored"] = why
+                    reply = {"ok": True, "message": msg}
+                    if word:
+                        to, from_ok = LANE_STATUS_WORDS[word]
+                        upd, why = _store_move(store, run, task, to, f"bus status {word}", allowed_from=from_ok)
+                        reply.update(state_updated=upd, mk_state_error=None)
+                        if why:
+                            reply["state_ignored"] = why
+                    if LANE_TODO_RE.search(text):
+                        reply["todo_updated"], ignored = apply_lane_todos(store, run, task, text)
+                        if ignored:
+                            reply["todo_ignored"] = ignored
                     self.send_json(200, reply)
                 else:
                     self.send_json(200, {"ok": True, "message": msg})
@@ -5176,6 +5239,8 @@ def _lane_state_self_test(mod):
         try:
             for t in ("S1", "S2", "S3", "L1", "A1", "A2"):
                 mod.add_task(con, "r1", t, "task", title="e8 " + t)
+            for t, parent in (("S1a", "S1"), ("S1b", "S1a"), ("S1c", "S1"), ("S2x", "S2")):
+                mod.add_task(con, "r1", t, "task", title="e8 " + t, parent=parent)
         finally:
             con.close()
         proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), "serve", "--data", data, "--run", "r1"],
@@ -5226,6 +5291,19 @@ def _lane_state_self_test(mod):
         assert code == 200 and "state_updated" not in res and status_of("S1") == "building", res
         code, res = call(port, tok_s1, "/send", {"kind": "task", "task": "S2", "text": "status done\nround: 1\n"})
         assert code == 403 and status_of("S2") == "verifying", (code, res)
+
+        # Part 5: `todo <state> <id>` lines move the lane's own subtasks (any depth), never another task.
+        code, res = call(port, tok_s1, "/send", {"kind": "task", "text": "status in_progress\nround: 1\ntodo in_progress S1a\ntodo in_progress S1b"})
+        assert code == 200 and res.get("todo_updated") == ["S1a", "S1b"], res
+        assert status_of("S1a") == "building" and status_of("S1b") == "building", (status_of("S1a"), status_of("S1b"))
+        code, res = call(port, tok_s1, "/send", {"kind": "task", "text": "round: 1\ntodo done S1b\ntodo done S2x\ntodo done S2"})
+        assert code == 200 and res.get("todo_updated") == ["S1b"] and res.get("todo_ignored") == ["S2x", "S2"], res
+        assert status_of("S1b") == "verifying" and status_of("S2x") == "planned" and status_of("S2") == "verifying", (status_of("S1b"), status_of("S2x"))
+        assert status_of("S1a") == "verifying", status_of("S1a")  # rolled up from its only child
+        code, res = call(port, tok_s1, "/send", {"kind": "task", "text": "todo done S1c"})  # never started: no move
+        assert code == 200 and res.get("todo_updated") == [] and status_of("S1c") == "planned", res
+        code, res = call(port, tok_s1, "/send", {"kind": "task", "text": "todo in_progress S1c\ntodo completed S1c"})
+        assert code == 200 and res.get("todo_updated") == ["S1c", "S1c"] and status_of("S1c") == "verifying", res
 
         # A late or stale lane word never overwrites a state the orchestrator moved on to, and
         # `done` from a lane never reaches done or merged (R2 HIGH).
