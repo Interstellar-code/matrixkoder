@@ -9,6 +9,7 @@ Usage:
   mk-lane-event.py event                (herdr plugin hook: reads HERDR_PLUGIN_EVENT + HERDR_PLUGIN_EVENT_JSON)
   mk-lane-event.py dispatch --pane ID --text TEXT [--timeout-ms 25000] [--role build|review]
                              [--kind build|fix|takeover] [--connect|--no-connect]
+                             [--agent A] [--model M] [--effort E] [--force]
   mk-lane-event.py sweep [--data DIR]
   mk-lane-event.py disarm --lane DIR
   mk-lane-event.py review-handoff --task T [--run R] [--data DIR] [--hold] [--min medium]
@@ -32,6 +33,17 @@ land in the watch file so a repeated identical event is a no-op. pane.exited on 
 STALL "agent exited"; after any verdict an exit is just post-finish cleanup. A herdr ERROR probe is
 not a verdict (the next event retries). Silence (crash, hang) produces no event at all — `sweep` is
 the backstop: no file/commit/pane change for stall_min since last_activity → STALL by the same rules.
+A build dispatch to an armed lane also records the route and checks the task BEFORE anything is
+typed (D1.5.3/D1.5.4): --agent/--model/--effort write the route to every armed task via
+`mk-state task set <T> agent=.. model=.. effort=..` (one call per task, --by dispatch) — without
+--agent the armed watch's kind is the agent and model/effort stay empty — and a
+`mk-state task check <T>` on the lead task gates the dispatch: a missing mandatory field
+(title/acceptance/parent-unless-phase/owned-when-briefed/agent-at-dispatch) refuses it
+(ok:false, delivered:false, nothing typed — no prompt, no fresh-session reset) unless --force
+sends and the reply says the check was forced. Both run before the prompt is typed, so a refused
+check can still stop everything; a mk-state failure rides in the reply as task_route_error /
+task_check_error and never fails the delivery verdict; every reply carries the recorded route.
+--role review and unarmed panes skip both (status_unchanged already covers review).
 dispatch is the one-call prompt helper: `herdr agent prompt <pane> <text> --wait --timeout <ms>`
 (binary from $MK_HERDR, default herdr). A timeout proves nothing either way — the text may already
 be in flight — so the pane's own state decides delivery: pane list still `working` → delivered:true;
@@ -650,6 +662,89 @@ def child_ids(task, data, run):
             and (t.get("parent") or "").lower() == str(task).lower()]
 
 
+def mk_state_json(args_list, timeout=30):
+    """One mk-state command; -> (parsed JSON line, None) or (None, error). Never raises: a
+    failed or unreadable mk-state is the caller's error field, never this helper's exception.
+    A NON-ZERO exit with a JSON line still parses the line (mk-state prints its own
+    {"ok": false, "error": ...} and exits 2) — the caller reads ok off it; only an
+    unparseable line is an error here."""
+    try:
+        r = subprocess.run([sys.executable, mk_state_cmd(), *args_list],
+                           capture_output=True, text=True, timeout=timeout)
+    except Exception as e:  # missing script, timeout, …: reported, never raised
+        return None, f"{type(e).__name__}: {e}"[:200]
+    try:
+        return json.loads(r.stdout.strip().splitlines()[-1]), None
+    except (json.JSONDecodeError, IndexError):
+        # an argparse usage error exits 2 BEFORE main's JSON handlers: the line is on
+        # stderr. Surface it, so a `task check` mk-state predates is reported, not fatal.
+        tail = (r.stderr or r.stdout).strip()
+        return None, (tail.splitlines()[-1] if tail else f"exit {r.returncode}")[:200]
+
+
+def record_route(w, agent=None, model=None, effort=None):
+    """D1.5.3: a build dispatch records the route on every armed task itself (a group lane
+    writes it to each listed task — no children expansion, the lane is the build unit).
+    --agent/--model/--effort name the route; without --agent the armed watch's kind is the
+    agent and model/effort stay empty. Only the GIVEN fields are written: an absent flag
+    leaves the task's value alone (a re-dispatch without --model keeps the model), while an
+    explicitly empty one clears it (mk-state's `k=` rule). The write happens BEFORE the
+    prompt is typed, so a refused check below can still stop everything, and a mk-state
+    failure rides in the reply as task_route_error — never fatal to the delivery verdict.
+    -> the reply's route dict ({"agent","model","effort"}, each None when empty), plus an
+    error string or None. No armed watch (or no data / no tasks) → (None, None)."""
+    data = w.get("data")
+    group = watch_tasks(w)
+    if not (data and group):
+        return None, None
+    run = w.get("run")
+    route = {"agent": agent or w.get("kind") or None, "model": model or None, "effort": effort or None}
+    # the route write covers the given keys only: an absent flag leaves the task alone;
+    # an explicitly empty one clears it; the watch kind always supplies the agent
+    pairs = [("agent", route["agent"])] if route["agent"] else []
+    pairs += [("model", model)] if model is not None else []
+    pairs += [("effort", effort)] if effort is not None else []
+    if not pairs:
+        return route, None  # nothing to write (no flag, no watch kind): the route stays empty
+    common = ["--data", data, "--by", "dispatch"] + (["--run", run] if run else [])
+    errors = []
+    for t in group:
+        j, err = mk_state_json(["task", "set", t, *[f"{k}={v}" for k, v in pairs], *common])
+        if j is None or not isinstance(j, dict) or not j.get("ok"):
+            errors.append(f"{t}: {err or (j or {}).get('error', 'mk-state task set failed')}")
+    return route, ("; ".join(errors)[:300] if errors else None)
+
+
+def task_check(w, task):
+    """D1.5.4: the mandatory-field check on the armed task before anything is typed:
+    `mk-state task check <T> --data <watch data> [--run <watch run>]` -> (ok, missing, error).
+    Read-only. No data/task in the watch → (True, [], None): nothing to check. An mk-state
+    that cannot answer the check — an ok:false line with no missing list (an argparse usage
+    error from a build predating `task check`, or any refusal of the command itself) — is
+    treated as PASSING (True, [], error): the gate stops an incomplete task, not a dispatch
+    over a version mismatch; the error still rides in the reply as task_check_error."""
+    data = w.get("data")
+    if not (data and task):
+        return True, [], None
+    run = w.get("run")
+    j, err = mk_state_json(["task", "check", task, "--data", data]
+                           + (["--run", run] if run else []))
+    if not isinstance(j, dict):
+        return True, [], err or "mk-state task check unavailable"  # unparseable: never gates
+    if "ok" not in j:  # an ok-less line: mk-state could not answer the check at all
+        return True, [], err or (j.get("error") or "mk-state task check gave no verdict")
+    missing = j.get("missing")
+    has_missing = isinstance(missing, list)
+    missing = [str(x) for x in missing] if has_missing else []
+    ok = bool(j.get("ok"))
+    # an ok:false line that is NOT a check verdict (no missing key at all — mk-state refused
+    # the command itself, e.g. an argparse usage error from a build predating `task check`):
+    # reported, never gates — the gate stops an incomplete task, not a version mismatch
+    if not ok and not has_missing:
+        return True, [], j.get("error") or err or "mk-state task check gave no verdict"
+    return ok, missing, None if ok else (j.get("error") or None)
+
+
 def mark_armed_building(pane):
     """dispatch delivered:true → the lane's tasks move again: the children of EVERY armed task
     (or the task itself when it has none) are set building via mk-state, so the board shows the
@@ -1016,6 +1111,37 @@ def cmd_dispatch(a):
         ms = int(opt(a, "--timeout-ms", "25000"))
     except ValueError as e:
         fail(f"--timeout-ms: {e}")
+    # D1.5.3/D1.5.4, before ANY herdr call (before the fresh-session reset, before the prompt
+    # text, even when the bus doorbell would replace it): a build dispatch to an armed lane
+    # records its route on the armed tasks and runs the mandatory-field check on the lead
+    # task. The route write happens first so a refused check below can still stop everything
+    # (nothing typed, no reset). --role review skips both — the reviewer is not the route
+    # owner, and status_unchanged already covers it. An unarmed pane skips both: today's
+    # behaviour, unchanged.
+    route = route_err = None
+    check = None
+    check_unavailable = None
+    if role == "build":
+        hit = find_armed(pane)
+        if hit:
+            w = hit[1]
+            route, route_err = record_route(
+                w, agent=opt(a, "--agent"), model=opt(a, "--model"), effort=opt(a, "--effort"))
+            ok, missing, chk_err = task_check(w, w.get("task"))
+            if chk_err and ok:
+                check_unavailable = chk_err  # reported on every reply; never gates
+            if not ok and "--force" not in a:
+                # Refused: NOTHING is typed — no herdr prompt call at all, no fresh-session
+                # reset. The check gates the dispatch, not the prompt text.
+                reply({"ok": False, "delivered": False, "pane": pane,
+                       "check": {"ok": False, "missing": missing},
+                       "error": f"task check failed: missing {', '.join(missing) or chk_err or 'fields'}",
+                       **({"route": route} if route else {}),
+                       **({"task_route_error": route_err} if route_err else {}),
+                       **({"task_check_error": chk_err} if chk_err else {})})
+                return
+            if not ok:
+                check = {"ok": False, "missing": missing, "forced": True}
     # a fix/takeover round on fresh_session: new resets the agent's session first: the command,
     # then a bounded idle wait, then the prompt exactly as today. Everything else (build, review,
     # fresh_session: same, no armed kind, unknown kind) skips this and sends one prompt as before.
@@ -1042,6 +1168,13 @@ def cmd_dispatch(a):
     # counts the prompt marker when it appears in pane text that arrived AFTER this snapshot —
     # an old "Read and follow …" sitting in pane history from a sibling lane must not recover
     pane_text_before = pane_text_snapshot(pane)
+    # D1.5.3/D1.5.4 ride on every reply that gets past the gate: the recorded route (the
+    # write happened above, before anything was typed) and the check result (a forced
+    # failure says so). An unarmed pane carries neither.
+    carried = {**({"route": route} if route else {}),
+               **({"task_route_error": route_err} if route_err else {}),
+               **({"check": check} if check else {}),
+               **({"task_check_error": check_unavailable} if check_unavailable else {})}
     attempts, fail_why = 1, None
     while True:
         kind, why, status, j = _prompt_attempt(pane, text, ms)
@@ -1050,19 +1183,20 @@ def cmd_dispatch(a):
                  "attempts": attempts, "herdr_error": fail_why or why, "pane_entry": entry,
                  "fresh_session": fresh,
                  **({"publish_error": opt(a, "--publish-error")} if opt(a, "--publish-error") else {}),
-                 **({"pane_list_error": pl_err} if pl_err else {}), **delivered_status(pane, role)})
+                 **({"pane_list_error": pl_err} if pl_err else {}), **delivered_status(pane, role),
+                 **carried})
             return
         fail_why = why
         if kind == "fail":  # herdr failed some other way: its own words, no delivery, no pane check
             reply({"ok": False, "delivered": False, "pane": pane, "timeout_ms": ms, "attempts": attempts,
-                 "herdr_error": why, "error": why, "pane_entry": entry, "fresh_session": fresh})
+                 "herdr_error": why, "error": why, "pane_entry": entry, "fresh_session": fresh, **carried})
             return
         # exc / wait: a timeout proves nothing either way — the pane's own state decides delivery
         st, entry, pl_err = pane_state(pane)
         if st == "working":  # the wait gave up, the agent did not: the prompt is still being delivered
             reply({"ok": True, "delivered": True, "pane_state": "working", "pane": pane, "timed_out": True,
                  "timeout_ms": ms, "attempts": attempts, "herdr_error": why,
-                 "pane_entry": entry, "fresh_session": fresh, **delivered_status(pane, role)},
+                 "pane_entry": entry, "fresh_session": fresh, **delivered_status(pane, role), **carried},
                   note="herdr status wait timed out; the pane is working")
             return
         if attempts == 1 and st in RETRY_PANE_STATES:  # idle/done: the prompt was lost — resend once
@@ -1080,12 +1214,14 @@ def cmd_dispatch(a):
                 reply({"ok": True, "delivered": True, "recovered": True, "pane_state": st, "pane": pane,
                      "timed_out": True, "timeout_ms": ms, "attempts": attempts, "herdr_error": why,
                      "pane_entry": entry, "fresh_session": fresh,
-                     **({"pane_list_error": pl_err} if pl_err else {}), **delivered_status(pane, role)},
+                     **({"pane_list_error": pl_err} if pl_err else {}), **delivered_status(pane, role),
+                     **carried},
                       note="herdr wait timed out; the prompt had already landed")
                 return
         reply({"ok": False, "delivered": False, "pane_state": st, "pane": pane, "timed_out": True,
              "timeout_ms": ms, "attempts": attempts, "herdr_error": why, "error": why,
-             "pane_entry": entry, "fresh_session": fresh, **({"pane_list_error": pl_err} if pl_err else {})})
+             "pane_entry": entry, "fresh_session": fresh, **({"pane_list_error": pl_err} if pl_err else {}),
+             **carried})
         return
 
 
@@ -2268,6 +2404,14 @@ def self_test():
                     "import json, os, sys\n"
                     "base = os.environ['FAKE_MK_STATE_DIR']\n"
                     "open(os.path.join(base, 'mscalls.log'), 'a').write(' '.join(sys.argv[1:]) + chr(10))\n"
+                    # D1.5.4: the dispatch's `task check` is answered like a passing check
+                    # (an ok:false + missing list when ms_failcheck.txt exists)
+                    "if sys.argv[1:3] == ['task', 'check']:\n"
+                    "    if os.path.exists(os.path.join(base, 'ms_failcheck.txt')):\n"
+                    "        print(json.dumps({'ok': False, 'missing': ['acceptance']}))\n"
+                    "    else:\n"
+                    "        print(json.dumps({'ok': True, 'missing': []}))\n"
+                    "    sys.exit(0)\n"
                     "if os.path.exists(os.path.join(base, 'ms_badjson.txt')):\n"
                     "    sys.stdout.write('not json at all' + chr(10))\n"
                     "    sys.exit(0)\n"
@@ -2290,6 +2434,12 @@ def self_test():
         def ms_calls():
             return open(ms_log).read().splitlines() if os.path.exists(ms_log) else []
 
+        def building_calls():
+            # D1.5.3/D1.5.4 add a route write and a `task check` around every build dispatch
+            # to an armed lane; these pre-D1.5 cases assert the board writes exactly, so they
+            # filter the log to the set-status writes (the check line has no status= pair).
+            return [l for l in ms_calls() if l.startswith("task set ") and "status=" in l]
+
         # (f) delivered:true, armed task has children → exactly the children set building
         set_canned("prompt_out.txt", '{"result": {"agent": {"agent_status": "idle"}}}\n')
         set_canned("prompt_err.txt", "")
@@ -2298,14 +2448,20 @@ def self_test():
         r = cli("dispatch", "--pane", pane_of("H8"), "--text", "go", extra={"MK_STATE_CMD": fake_ms})
         assert r["ok"] is True and r["delivered"] is True and r["building"] == ["H8C1", "H8C2"], r
         assert "task_status_error" not in r, r
-        assert ms_calls() == [
+        # the D1.5.4 check ran once, on the armed task, before the prompt
+        assert ms_calls() == [f"task check H8 --data {data} --run r1",
+                              f"task set H8C1 status=building --data {data} --by dispatch --run r1",
+                              f"task set H8C2 status=building --data {data} --by dispatch --run r1"], ms_calls()
+        assert building_calls() == [
             f"task set H8C1 status=building --data {data} --by dispatch --run r1",
             f"task set H8C2 status=building --data {data} --by dispatch --run r1"], ms_calls()
         # (g) delivered:true, armed task has NO children → the task itself
         open(ms_log, "w").write("")
         r = cli("dispatch", "--pane", pane_of("H1"), "--text", "go", extra={"MK_STATE_CMD": fake_ms})
         assert r["ok"] is True and r["delivered"] is True and r["building"] == ["H1"], r
-        assert ms_calls() == [f"task set H1 status=building --data {data} --by dispatch --run r1"], ms_calls()
+        assert ms_calls() == [f"task check H1 --data {data} --run r1",
+                              f"task set H1 status=building --data {data} --by dispatch --run r1"], ms_calls()
+        assert building_calls() == [f"task set H1 status=building --data {data} --by dispatch --run r1"], ms_calls()
         # (h) delivered:false → no mk-state call at all
         set_canned("prompt_out.txt", "")
         set_canned("prompt_err.txt", "herdr: no such pane wZ:gone")
@@ -2313,7 +2469,10 @@ def self_test():
         open(ms_log, "w").write("")
         r = cli("dispatch", "--pane", pane_of("H8"), "--text", "go", extra={"MK_STATE_CMD": fake_ms})
         assert r["ok"] is False and r["delivered"] is False and "building" not in r, r
-        assert ms_calls() == [], ms_calls()
+        # a NOT-delivered dispatch passed the check (it ran, once, on the armed task) but
+        # never reached the board write — delivered:false calls no task set at all
+        assert ms_calls() == [f"task check H8 --data {data} --run r1"], ms_calls()
+        assert building_calls() == [], ms_calls()
         # (i) a failing mk-state (nonzero exit, or bad JSON) → the error rides in the JSON,
         # delivery verdict unchanged
         set_canned("prompt_out.txt", '{"result": {"agent": {"agent_status": "idle"}}}\n')
@@ -2324,12 +2483,16 @@ def self_test():
         r = cli("dispatch", "--pane", pane_of("H8"), "--text", "go", extra={"MK_STATE_CMD": fake_ms})
         assert r["ok"] is True and r["delivered"] is True and r["building"] == [], r
         assert "run state locked" in r["task_status_error"] and "H8C1" in r["task_status_error"], r
+        assert building_calls() == [f"task set H8C1 status=building --data {data} --by dispatch --run r1",
+                                    f"task set H8C2 status=building --data {data} --by dispatch --run r1"], ms_calls()
         os.unlink(os.path.join(tmp, "ms_err.txt"))
         open(os.path.join(tmp, "ms_badjson.txt"), "w").write("x")
         open(ms_log, "w").write("")
         r = cli("dispatch", "--pane", pane_of("H8"), "--text", "go", extra={"MK_STATE_CMD": fake_ms})
         assert r["ok"] is True and r["delivered"] is True and r["building"] == [], r
         assert "not json" in r["task_status_error"], r
+        assert building_calls() == [f"task set H8C1 status=building --data {data} --by dispatch --run r1",
+                                    f"task set H8C2 status=building --data {data} --by dispatch --run r1"], ms_calls()
         os.unlink(os.path.join(tmp, "ms_badjson.txt"))
 
         # (H2.1) one automatic retry: not delivered + pane idle/done → wait, send once more; every
@@ -2358,8 +2521,8 @@ def self_test():
         assert r["agent_status"] == "working" and "timeout" in r["herdr_error"], r
         assert r["pane_entry"] == done_row, r
         assert len(prompt_calls()) - n0 == 2, prompt_calls()
-        assert ms_calls() == [f"task set H8C1 status=building --data {data} --by dispatch --run r1",
-                              f"task set H8C2 status=building --data {data} --by dispatch --run r1"], ms_calls()
+        assert building_calls() == [f"task set H8C1 status=building --data {data} --by dispatch --run r1",
+                                    f"task set H8C2 status=building --data {data} --by dispatch --run r1"], ms_calls()
         # (b) the pane never becomes working (done through both attempts) but the prompt text
         # DID land in pane.txt (the fake herdr appends on every prompt call). The count check
         # sees the marker count go up and recovers — the prompt was delivered even though the
@@ -2420,7 +2583,9 @@ def self_test():
                 extra={"MK_STATE_CMD": fake_ms})
         assert r["ok"] is True and r["delivered"] is True and "status_unchanged" not in r, r
         assert r["building"] == ["H_R"], r  # childless task → itself
-        assert ms_calls() == [f"task set H_R status=building --data {data} --by dispatch --run r1"], ms_calls()
+        assert ms_calls() == [f"task check H_R --data {data} --run r1",
+                              f"task set H_R status=building --data {data} --by dispatch --run r1"], ms_calls()
+        assert building_calls() == [f"task set H_R status=building --data {data} --by dispatch --run r1"], ms_calls()
         assert cli("dispatch", "--pane", pane_of("H_R"), "--text", "x", "--role", "boss",
                    code=2)["ok"] is False  # --role takes exactly build|review
 
@@ -2446,8 +2611,8 @@ def self_test():
         assert r["ok"] is True and r["delivered"] is True and r["recovered"] is True, r
         assert r["attempts"] == 2 and r["pane_state"] == "idle" and r["pane_entry"] == idle_row8, r
         assert len(pane_list_calls()) - nl0 == 4, pane_list_calls()  # pre-read + 2 deciding + recheck
-        assert ms_calls() == [f"task set H8C1 status=building --data {data} --by dispatch --run r1",
-                              f"task set H8C2 status=building --data {data} --by dispatch --run r1"], ms_calls()
+        assert building_calls() == [f"task set H8C1 status=building --data {data} --by dispatch --run r1",
+                                    f"task set H8C2 status=building --data {data} --by dispatch --run r1"], ms_calls()
         # pane working → the existing working path decides on its own check, no recheck happens
         set_canned("prompt_out.txt", '{"error": {"code": "timeout", "message": "timed out waiting"}}\n')
         set_canned("prompt_rc.txt", "1")
@@ -2477,7 +2642,7 @@ def self_test():
                 extra=fast)
         assert r["ok"] is False and r["delivered"] is False, r
         assert "recovered" not in r and r["attempts"] == 2, r
-        assert ms_calls() == [], (r, ms_calls())
+        assert building_calls() == [] and r.get("check", {}).get("ok") is not False, (r, ms_calls())
         # the marker does NOT appear in old pane text — the new portion (fake appends) carries
         # the marker and it is genuinely new since this dispatch started → recover
         os.unlink(os.path.join(tmp, "no_pane.txt"))
@@ -2487,7 +2652,7 @@ def self_test():
                 "--text", "Read and follow /this/lane/brief.md\nread the brief and continue",
                 extra=fast)
         assert r["ok"] is True and r["delivered"] is True and r["recovered"] is True, r
-        assert r["attempts"] == 2 and ms_calls() == [
+        assert r["attempts"] == 2 and building_calls() == [
             f"task set H8C1 status=building --data {data} --by dispatch --run r1",
             f"task set H8C2 status=building --data {data} --by dispatch --run r1"], ms_calls()
         os.unlink(os.path.join(tmp, "prompt_q.txt"))
@@ -2652,8 +2817,12 @@ def self_test():
         open(ms_log, "w").write("")
         r = cli("dispatch", "--pane", pane_of("H9"), "--text", "go", extra={"MK_STATE_CMD": fake_ms})
         assert r["ok"] is True and r["delivered"] is True and r["building"] == ["H9C1", "H10"], r
-        assert ms_calls() == [f"task set H9C1 status=building --data {data} --by dispatch --run r1",
+        # the D1.5.4 check runs on the LEAD task only (H9); the board writes fan out as before
+        assert ms_calls() == [f"task check H9 --data {data} --run r1",
+                              f"task set H9C1 status=building --data {data} --by dispatch --run r1",
                               f"task set H10 status=building --data {data} --by dispatch --run r1"], ms_calls()
+        assert building_calls() == [f"task set H9C1 status=building --data {data} --by dispatch --run r1",
+                                    f"task set H10 status=building --data {data} --by dispatch --run r1"], ms_calls()
         # a verdict on a group lane records for every listed task: H9's children and childless H10
         g(lanes["H9"], "commit", "-q", "--allow-empty", "-m", "feat(p1): group core")
         open(pane_f, "w").write("> dispatch-h9\nall gates green\n⏺ P1 DONE\n")
@@ -2924,7 +3093,9 @@ def self_test():
             _bus_dir = bus_dir_for(data)
             assert _bus_dir == os.path.abspath(_bus_home), _bus_dir
             os.makedirs(_bus_dir, exist_ok=True)
-            mks("task", "add", "--id", "NB", "--title", "no brief")
+            # owned: the brief written below makes `task check` require it (D1.5.4) — a briefed task
+            # that owns no file is exactly what that check refuses, so the fixture declares one
+            mks("task", "add", "--id", "NB", "--title", "no brief", "--owned", "scripts/nb.py")
             lanes["NB"] = os.path.join(tmp, "lane-nb")
             g(repo, "worktree", "add", "-q", "--detach", lanes["NB"])
             arm("NB")
@@ -3066,6 +3237,189 @@ def self_test():
                 os.environ.pop("MATRIXKODER_HOME", None)
             else:
                 os.environ["MATRIXKODER_HOME"] = _saved_bus_mhome
+
+        # (D1.5.3/D1.5.4) the dispatch route write + the mandatory-field check, against the
+        # REAL mk-state (no fake: the route lands in run.json, and in mk.db's route_json now
+        # that store enable above turned the store on). The check gates the dispatch BEFORE
+        # anything is typed: a failing task refuses with ok:false/delivered:false, no herdr
+        # prompt call, no fresh-session reset; --force sends and the reply says it was forced.
+        # A passing task gets the route on it (and on every listed task of a group lane).
+        def task_get(tid):
+            r_ = subprocess.run([sys.executable, MK, "task", "get", tid, "--data", data,
+                                 "--run", "r1"], capture_output=True, text=True)
+            assert r_.returncode == 0, r_.stdout + r_.stderr
+            return json.loads(r_.stdout.strip().splitlines()[-1])["task"]
+
+        def route_json_of(tid):
+            import sqlite3
+            # read-only (mode=ro): the single-writer rule lets only mkdb.py open SQLite for
+            # writing (mkdb.py _single_writer), and this helper only reads a column
+            con = sqlite3.connect("file:%s?mode=ro" % os.path.join(data, "mk.db"), uri=True)
+            try:
+                row = con.execute("SELECT route_json FROM tasks WHERE run=? AND id=?",
+                                  ("r1", tid)).fetchone()
+            finally:
+                con.close()
+            return row[0] if row else None
+
+        # a passing task: title + acceptance + parent set, no brief file (so owned is not
+        # required), status building so the dispatch's board write has something to move
+        mks("task", "add", "--id", "DP1", "--title", "Phase one", "--run", "r1")
+        mks("task", "add", "--id", "DOK", "--title", "ok task", "--parent", "DP1", "--run", "r1")
+        mks("task", "set", "DOK", "status=building")
+        # the store is on here, so `task check` reads the tasks row: plant the acceptance the
+        # way `mk-plan approve` writes it (through mkdb, the one writer), then confirm via
+        # THIS dispatch module's own task_check (real mk-state) that the check passes
+        _c = mkdb.open_project(os.path.join(data, ".mk-home"), "matrixkoder", data_dir=data)
+        try:
+            _c.execute("UPDATE tasks SET acceptance=? WHERE run='r1' AND id='DOK'",
+                       ("the check passes",))
+            _c.commit()
+        finally:
+            _c.close()
+        ok_chk, missing_chk, _err = task_check({"data": data, "run": "r1"}, "DOK")
+        assert ok_chk is True and missing_chk == [], (ok_chk, missing_chk)
+        lanes["DOK"] = os.path.join(tmp, "lane-dok")
+        g(repo, "worktree", "add", "-q", "--detach", lanes["DOK"])
+        mks("task", "round", "DOK", "--kind", "build")  # a dispatched task has a round
+        arm("DOK", phase="DOK R1", kind="opencode")
+        set_canned("prompt_out.txt", '{"result": {"agent": {"agent_status": "idle"}}}\n')
+        set_canned("prompt_err.txt", "")
+        set_canned("prompt_rc.txt", "0")
+        set_canned("pane_list_out.txt", json.dumps({"result": {"panes": [
+            {"pane_id": pane_of("DOK"), "agent_status": "idle"}]}}) + "\n")
+        # (a) --agent/--model/--effort: delivered, the route is on the task (file + store) and
+        # the reply carries it
+        n0 = len(prompt_calls())
+        r = cli("dispatch", "--pane", pane_of("DOK"), "--text", "go build",
+                "--agent", "opencode", "--model", "m", "--effort", "high")
+        assert r["ok"] is True and r["delivered"] is True, r
+        assert r["route"] == {"agent": "opencode", "model": "m", "effort": "high"}, r
+        got = task_get("DOK")
+        assert (got["agent"], got["model"], got["effort"]) == ("opencode", "m", "high"), got
+        assert json.loads(route_json_of("DOK")) == {"agent": "opencode", "model": "m",
+                                                   "effort": "high"}, route_json_of("DOK")
+        assert len(prompt_calls()) - n0 == 1, prompt_calls()[n0:]
+        # (b) no --agent: the armed watch's kind is the agent, model/effort stay empty.
+        # The route write only names the non-empty fields, so `model=`/`effort=` are NOT
+        # sent — the flags were not given — and the previous round's values stay on the
+        # task. The reply's route is what THIS dispatch recorded.
+        n0 = len(prompt_calls())
+        r = cli("dispatch", "--pane", pane_of("DOK"), "--text", "go again")
+        assert r["ok"] is True and r["delivered"] is True, r
+        assert r["route"] == {"agent": "opencode", "model": None, "effort": None}, r
+        got = task_get("DOK")
+        assert got["agent"] == "opencode", got  # the watch kind overwrote the agent
+        assert json.loads(route_json_of("DOK"))["agent"] == "opencode", route_json_of("DOK")
+        assert len(prompt_calls()) - n0 == 1, prompt_calls()[n0:]
+        # (b2) explicit empty model/effort flags DO clear them (the flags were given)
+        r = cli("dispatch", "--pane", pane_of("DOK"), "--text", "go again",
+                "--model", "", "--effort", "")
+        assert r["ok"] is True and r["delivered"] is True, r
+        assert r["route"] == {"agent": "opencode", "model": None, "effort": None}, r
+        got = task_get("DOK")
+        assert got["agent"] == "opencode" and got["model"] is None and got["effort"] is None, got
+        assert json.loads(route_json_of("DOK")) == {"agent": "opencode", "model": None,
+                                                   "effort": None}, route_json_of("DOK")
+        # (c) a FAILING task (task add sets no acceptance): the dispatch is refused — nothing
+        # typed at all (no herdr prompt call, no fresh-session reset), the reply carries the
+        # missing fields, exit 0 (a completed check)
+        mks("task", "add", "--id", "DBAD", "--title", "bad task", "--parent", "DP1", "--run", "r1")
+        mks("task", "round", "DBAD", "--kind", "build")
+        lanes["DBAD"] = os.path.join(tmp, "lane-dbad")
+        g(repo, "worktree", "add", "-q", "--detach", lanes["DBAD"])
+        arm("DBAD", phase="DBAD R1", kind="claude")
+        # the failing task's check verdict, through this module's own task_check (real
+        # mk-state): task add sets no acceptance, so the check must refuse it
+        ok_bad, missing_bad, _err2 = task_check({"data": data, "run": "r1"}, "DBAD")
+        assert ok_bad is False and "acceptance" in missing_bad, (ok_bad, missing_bad)
+        n0 = len(prompt_calls())
+        n_calls0 = len(open(calls).read().splitlines()) if os.path.exists(calls) else 0
+        r = cli("dispatch", "--pane", pane_of("DBAD"), "--text", "go bad", "--kind", "fix")
+        assert r["ok"] is False and r["delivered"] is False, r
+        assert r["check"] == {"ok": False, "missing": missing_bad}, r
+        assert "task check failed" in r["error"] and "acceptance" in r["error"], r
+        assert r["route"] == {"agent": "claude", "model": None, "effort": None}, r  # written first
+        assert prompt_calls()[n0:] == [], prompt_calls()[n0:]  # NO herdr prompt call at all
+        n_calls1 = len(open(calls).read().splitlines()) if os.path.exists(calls) else 0
+        assert n_calls1 - n_calls0 == 0, "a refused dispatch made a herdr call"  # no reset either
+        # (d) the same failing task with --force: delivered, and the reply says it was forced
+        n0 = len(prompt_calls())
+        r = cli("dispatch", "--pane", pane_of("DBAD"), "--text", "go bad forced", "--force")
+        assert r["ok"] is True and r["delivered"] is True, r
+        assert r["check"] == {"ok": False, "missing": missing_bad, "forced": True}, r
+        assert len(prompt_calls()) - n0 == 1, prompt_calls()[n0:]
+        # (e) --role review skips the check entirely: the failing task is not gated, and no
+        # route is written. The stored route_json is STICKY (D1.5.2's merge-keep keeps the
+        # column when the file view's route is empty — it cannot tell "cleared" from "never
+        # set"), so the proof that review wrote nothing is that the route is UNCHANGED plus
+        # the reply carrying neither `check` nor `route`.
+        mks("task", "set", "DBAD", "agent=", "model=", "effort=")
+        before_review = route_json_of("DBAD")
+        n0 = len(prompt_calls())
+        r = cli("dispatch", "--pane", pane_of("DBAD"), "--text", "review it", "--role", "review")
+        assert r["ok"] is True and r["delivered"] is True and r["status_unchanged"] is True, r
+        assert "check" not in r and "route" not in r, r
+        assert "task_check_error" not in r, r
+        assert len(prompt_calls()) - n0 == 1, prompt_calls()[n0:]
+        assert route_json_of("DBAD") == before_review, (before_review, route_json_of("DBAD"))
+        # (f) an unarmed pane dispatch: no armed watch to check or route, so the prompt goes
+        # out exactly as today (the fake herdr settles) and the reply carries neither
+        n0 = len(prompt_calls())
+        r = cli("dispatch", "--pane", "wZ:free", "--text", "anyone there")
+        assert r["ok"] is True and r["delivered"] is True, r
+        assert "check" not in r and "route" not in r and "task_check_error" not in r, r
+        assert len(prompt_calls()) - n0 == 1, prompt_calls()[n0:]
+        # (f2) a pre-`task check` mk-state ($MK_STATE_CMD fake: argparse's usage error on
+        # stderr, exit 2): the dispatch is NOT gated — it delivers, and the reply carries
+        # the mk-state error as task_check_error, never failing the verdict
+        fake_old = ("#!/usr/bin/env python3\n"
+                    "import sys\n"
+                    "sys.stderr.write(\"mk-state.py task: error: argument action: "
+                    "invalid choice: 'check'...\\n\")\n"
+                    "sys.exit(2)\n")
+        with open(os.path.join(bin_, "mk-state-old"), "w") as f_:
+            f_.write(fake_old)
+        os.chmod(os.path.join(bin_, "mk-state-old"), 0o755)
+        lane_old = os.path.join(tmp, "lane-dold")
+        lanes["DOLD"] = lane_old
+        g(repo, "worktree", "add", "-q", "--detach", lane_old)
+        mks("task", "add", "--id", "DOLD", "--title", "old mk-state", "--parent", "DP1", "--run", "r1")
+        arm("DOLD", phase="DOLD R1", kind="opencode")
+        n0 = len(prompt_calls())
+        r = cli("dispatch", "--pane", pane_of("DOLD"), "--text", "go old",
+                extra={"MK_STATE_CMD": os.path.join(bin_, "mk-state-old")})
+        assert r["ok"] is True and r["delivered"] is True, r
+        assert "task_check_error" in r and "invalid choice" in r["task_check_error"], r
+        assert "check" not in r, r  # a passed-but-unavailable check is not a check verdict
+        assert len(prompt_calls()) - n0 == 1, prompt_calls()[n0:]
+        # (g) a group lane (--tasks): the route write lands on EVERY listed task, and the
+        # check runs on the lead task only
+        mks("task", "add", "--id", "DG1", "--title", "g1", "--parent", "DP1", "--run", "r1")
+        mks("task", "add", "--id", "DG2", "--title", "g2", "--run", "r1")
+        mks("task", "round", "DG1", "--kind", "build")
+        for tid in ("DG1", "DG2"):
+            # the store is the read source: plant the acceptance the way `mk-plan approve`
+            # writes it, through mkdb (the one writer)
+            _c = mkdb.open_project(os.path.join(data, ".mk-home"), "matrixkoder", data_dir=data)
+            try:
+                _c.execute("UPDATE tasks SET acceptance=? WHERE run='r1' AND id=?", ("group ok", tid))
+                _c.commit()
+            finally:
+                _c.close()
+        lanes["DG"] = os.path.join(tmp, "lane-dg")
+        g(repo, "worktree", "add", "-q", "--detach", lanes["DG"])
+        r = cli("arm", "--lane", lanes["DG"], "--pane", pane_of("DG"), "--tasks", "DG1,DG2",
+                "--run", "r1", "--data", data, "--phase", "P1", "--commit-grep", r"feat\(p1\)")
+        assert r["ok"] and "task_pane_error" not in r, r
+        r = cli("dispatch", "--pane", pane_of("DG"), "--text", "go group",
+                "--agent", "codex", "--model", "gpt-5", "--effort", "low")
+        assert r["ok"] is True and r["delivered"] is True, r
+        assert r["route"] == {"agent": "codex", "model": "gpt-5", "effort": "low"}, r
+        for tid in ("DG1", "DG2"):
+            got = task_get(tid)
+            assert (got["agent"], got["model"], got["effort"]) == ("codex", "gpt-5", "low"), (tid, got)
+            assert json.loads(route_json_of(tid))["agent"] == "codex", (tid, route_json_of(tid))
 
         # (D7B R3) store mode: mk.db present, so bus.json lives in the MK home, not the data dir.
         # A stale <data>/bus.json must not win. A real store-mode bus, real acquire and arm.
