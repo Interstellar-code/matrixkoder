@@ -36,6 +36,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tarfile
@@ -189,8 +190,16 @@ def _registry_rows(data):
         raise Fail(f"lane registry unreadable (C5 refusal): {path}: {e}", 3)
     if not isinstance(lanes, dict):
         raise Fail(f"lane registry unreadable (C5 refusal): {path}: not a JSON object", 3)
+    slots = lanes.get("slots")
+    if slots is None:
+        slots = {}
+    # Review R2 LOW: a syntactically valid lanes.json whose `slots` is a list, string or number
+    # would raise AttributeError on `.items()` — a traceback, not the C5 refusal. Anything but an
+    # object (or an absent/null slots) is unreadable.
+    if not isinstance(slots, dict):
+        raise Fail(f"lane registry unreadable (C5 refusal): {path}: slots is not an object", 3)
     out = []
-    for key, rec in (lanes.get("slots") or {}).items():
+    for key, rec in slots.items():
         if not isinstance(rec, dict):
             continue
         out.append({"slot": key, "lane_path": rec.get("path"), "state": rec.get("state"),
@@ -309,6 +318,21 @@ def copy_db(src_path, dst_path):
 
 # ---------- files ----------
 
+def _symlink_ref(real, linkname):
+    """The canonical reference to a symlink's target, or None when the target is outside the
+    given realpath base (or the link is unreadable). Used to compare a source symlink against the
+    copied one WITHOUT following either: both sides are realpath-resolved, so an in-repo link
+    compares equal and a link that escapes is named instead of silently dereferenced."""
+    try:
+        base = os.path.realpath(real)
+        tgt = os.path.realpath(os.path.join(base, os.readlink(linkname)))
+    except OSError:
+        return None
+    if tgt == base or tgt.startswith(base + os.sep):
+        return tgt
+    return None
+
+
 def _hash_file(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -317,15 +341,36 @@ def _hash_file(path):
     return h.hexdigest()
 
 
+def _hash_path(p):
+    """The hash of one file, or of a symlink (its own target string, never followed), or of a
+    special entry (a type tag). `os.walk(followlinks=False)` lists a symlink under `files` even
+    when its target is a directory; hashing it with `_hash_file` would follow it, so this branches
+    on `islink` first. A broken symlink and a fifo hash too, so a tree with one still verifies."""
+    st = os.lstat(p)
+    if stat.S_ISLNK(st.st_mode):
+        return "link:" + os.readlink(p)
+    if stat.S_ISREG(st.st_mode):
+        return _hash_file(p)
+    return "type:%o" % stat.S_IFMT(st.st_mode)
+
+
 def _tree_hash(root):
-    """sha256 over (relative path, file hash) of every file under root."""
+    """sha256 over (relative path, entry hash) of every non-directory entry under root. Symlinks
+    are hashed as symlinks (never followed), so a symlink that became a regular file — or vice
+    versa — changes the digest. `os.walk(followlinks=False)` never descends into a directory
+    symlink; the link itself is hashed, so a tree containing one verifies."""
     h = hashlib.sha256()
     for dirpath, dirs, files in os.walk(root):
         dirs.sort()
         for name in sorted(files):
             p = os.path.join(dirpath, name)
             h.update(os.path.relpath(p, root).encode())
-            h.update(_hash_file(p).encode())
+            h.update(_hash_path(p).encode())
+        for name in sorted(dirs):
+            p = os.path.join(dirpath, name)
+            if os.path.islink(p):
+                h.update(os.path.relpath(p, root).encode())
+                h.update(_hash_path(p).encode())
     return h.hexdigest()
 
 
@@ -438,8 +483,12 @@ def build_moves(data, home, slug, con, skips=None):
     return moves
 
 
-def copy_moves(moves):
-    """Copy every move; return [(move, sha)] so the verify can re-hash both sides."""
+def copy_moves(moves, repo):
+    """Copy every move; return [(move, sha)] so the verify can re-hash both sides. A symlink is
+    copied AS a symlink (`symlinks=True`), never dereferenced: a link whose target leaves the repo
+    must not pull that target's bytes into the C2 store. A link that escapes is the caller's
+    `Fail`, raised before the copy, so no partial tree is written. `repo` is the same base
+    `_safe_design_ref` resolves a design ref against (the project's checkout)."""
     done = []
     for m in moves:
         if m["kind"] == "file":
@@ -447,7 +496,17 @@ def copy_moves(moves):
             shutil.copy2(m["src"], m["dst"])
             done.append((m, _hash_file(m["src"])))
         else:
-            shutil.copytree(m["src"], m["dst"], dirs_exist_ok=True)
+            for dirpath, dirs, files in os.walk(m["src"]):
+                dirs.sort()
+                for name in sorted(files) + sorted(dirs):
+                    link = os.path.join(dirpath, name)
+                    if not os.path.islink(link):
+                        continue
+                    if _symlink_ref(repo, link) is None:
+                        raise Fail(f"assets symlink escapes the repo: {link} -> "
+                                   f"{os.readlink(link)}; remove it or point it inside the repo",
+                                   3)
+            shutil.copytree(m["src"], m["dst"], dirs_exist_ok=True, symlinks=True)
             done.append((m, None))
     return done
 
@@ -482,6 +541,14 @@ def _after_verify_hook():
         subprocess.run(cmd, shell=True, check=False)
 
 
+def _after_tar_hook():
+    """Test seam (never set in normal use): run a command after the archive tarball is written and
+    before the completeness recount, so a file the tar missed can be injected (M1.2b)."""
+    cmd = os.environ.get("MK_MIGRATE_AFTER_TAR")
+    if cmd:
+        subprocess.run(cmd, shell=True, check=False)
+
+
 # ---------- the copy + verify unit ----------
 
 def _prepare(args):
@@ -494,6 +561,19 @@ def _prepare(args):
         raise Fail("no root projects row names this data dir; pass --slug to register one", 3)
     repo = args.repo or os.path.dirname(data)
     return home, data, slug, repo
+
+
+def existing_copy_problem(home, data, slug, moves, src_counts, src_digest, dest):
+    """Non-empty label list when an EXISTING C2 copy does not match the source, else []. Shared by
+    the real path and `--dry-run`, so a dry run predicts the same refusal the copy would give
+    (M1.1a's rule, extended to the existing-copy case). Never follows a symlink: a source file
+    entry hashes with `_hash_path`, which returns the link's target string for a link."""
+    done = [(m, _hash_path(m["src"]) if m["kind"] == "file" else None) for m in moves]
+    bad = verify_moves(done)
+    dst_counts, dst_digest = state_of(dest)
+    if dst_counts != src_counts or dst_digest != src_digest:
+        bad.append("mk.db")
+    return bad
 
 
 def do_copy_verify(home, data, slug, dry_run=False):
@@ -518,6 +598,15 @@ def do_copy_verify(home, data, slug, dry_run=False):
     existing = os.path.exists(dest)
 
     if dry_run:
+        # M1.1a rule, extended: a dry run reports what the real command would do. If an existing
+        # C2 copy can never verify, the real copy would refuse — so refuse here too, before
+        # printing any plan, instead of advertising a copy that cannot converge.
+        if existing:
+            bad = existing_copy_problem(home, data, slug, moves, src_counts, src_digest, dest)
+            if bad:
+                raise Fail("an existing C2 copy does not match the source: "
+                           + "; ".join(sorted(set(bad))) + f" — inspect or remove {dest} and retry",
+                           3)
         for m in moves:
             print(f"{'verify' if existing else 'copy'} {m['src']} -> {m['dst']}")
         for label in skips:
@@ -529,11 +618,7 @@ def do_copy_verify(home, data, slug, dry_run=False):
 
     if existing:
         # a prior copy is present: verify it, never overwrite it silently.
-        done = [(m, _hash_file(m["src"]) if m["kind"] == "file" else None) for m in moves]
-        bad = verify_moves(done)
-        dst_counts, dst_digest = state_of(dest)
-        if dst_counts != src_counts or dst_digest != src_digest:
-            bad.append("mk.db")
+        bad = existing_copy_problem(home, data, slug, moves, src_counts, src_digest, dest)
         if bad:
             raise Fail("an existing C2 copy does not match the source: "
                        + "; ".join(sorted(set(bad))) + f" — inspect or remove {dest} and retry", 3)
@@ -542,21 +627,37 @@ def do_copy_verify(home, data, slug, dry_run=False):
                 "db_digest": src_digest}
 
     copy_db(source, dest)
-    done = copy_moves(moves)
-    _after_copy_hook()
-    # verify: the DB (counts AND digest) and every copied file, under the caller's lock.
-    dst_counts, dst_digest = state_of(dest)
-    bad = verify_moves(done)
-    if dst_counts != src_counts or dst_digest != src_digest:
-        bad.append("mk.db")
-    # re-read the source to catch a write that landed during the copy
-    now_counts, now_digest = state_of(source)
-    if now_counts != src_counts or now_digest != src_digest:
-        bad.append("mk.db (the source changed during the copy)")
-    if bad:
+    # `plan_moves` resolves design refs against dirname(data) (its own rule); the assets-symlink
+    # guard uses the same base, so an in-repo link is kept and a link out of the checkout refuses.
+    repo = os.path.dirname(os.path.abspath(data))
+    # A partial copy must never be left behind: ANY failure between here and a passing verify —
+    # an unreadable file, a fifo, a symlink that escapes the repo, a copy_moves raise — removes the
+    # NEW copy and becomes one JSON `Fail`, so no later retry sees a half-written C2 store and no
+    # future `--dry-run` advertises a copy that cannot verify. The old data is untouched.
+    try:
+        done = copy_moves(moves, repo)
+        _after_copy_hook()
+        # verify: the DB (counts AND digest) and every copied file, under the caller's lock.
+        dst_counts, dst_digest = state_of(dest)
+        bad = verify_moves(done)
+        if dst_counts != src_counts or dst_digest != src_digest:
+            bad.append("mk.db")
+        # re-read the source to catch a write that landed during the copy
+        now_counts, now_digest = state_of(source)
+        if now_counts != src_counts or now_digest != src_digest:
+            bad.append("mk.db (the source changed during the copy)")
+        if bad:
+            raise Fail("verify failed: " + "; ".join(sorted(set(bad)))
+                       + " — the NEW copy was removed, the old data is untouched", 3)
+    except BaseException as e:
+        # one place removes the partial copy for every failure kind; Fail (the verify's own
+        # refusal) and a user interrupt pass through unchanged, anything else becomes a clean
+        # one-line refusal. Never re-raise a bare traceback from a half-written store.
         _remove_new_copy(home, slug)
-        raise Fail("verify failed: " + "; ".join(sorted(set(bad))) + " — the NEW copy was removed,"
-                   " the old data is untouched", 3)
+        if isinstance(e, (Fail, KeyboardInterrupt, SystemExit)):
+            raise
+        raise Fail(f"copy failed: {type(e).__name__}: {e} — the NEW copy was removed, the old data"
+                   " is untouched", 3)
     return {"ok": True, "command": "copy", "slug": slug, "data": data, "target": dest,
             "moves": len(moves) + 1, "db_counts": src_counts, "db_digest": src_digest}
 
@@ -598,15 +699,16 @@ def switch_lock(home):
 
 def cmd_copy(args):
     home, data, slug, repo = _prepare(args)
+    # Review R2 MEDIUM: the already-migrated refusal runs BEFORE the --dry-run branch, so a dry
+    # run on a switched project exits 3 exactly like the real command. This check only reads
+    # (`root_row`, never `ensure_root_row`): a dry run still writes nothing.
+    row = root_row(home, slug)
+    if row and row.get("db_path"):
+        raise Fail(f"already migrated: projects.db_path = {row['db_path']}; use --rollback", 3)
     if args.dry_run:
         quiesce(data)
         return do_copy_verify(home, data, slug, dry_run=True)
     ensure_root_row(home, slug, data, repo)
-    # Review R1 guard: a switched project re-copied would re-run the verify against the LIVE C2
-    # store and could suggest removing it. Refuse before any copy or _remove_new_copy runs.
-    row = root_row(home, slug)
-    if row and row.get("db_path"):
-        raise Fail(f"already migrated: projects.db_path = {row['db_path']}; use --rollback", 3)
     with switch_lock(home):
         quiesce(data)
         return do_copy_verify(home, data, slug)
@@ -614,6 +716,11 @@ def cmd_copy(args):
 
 def cmd_switch(args):
     home, data, slug, repo = _prepare(args)
+    # Review R2 MEDIUM: the same refusal order as cmd_copy — before the --dry-run branch, and a
+    # dry run must not register a root row (`ensure_root_row` writes).
+    row = root_row(home, slug)
+    if row and row.get("db_path"):
+        raise Fail(f"already migrated: projects.db_path = {row['db_path']}", 3)
     if args.dry_run:
         quiesce(data)
         out = do_copy_verify(home, data, slug, dry_run=True)
@@ -621,9 +728,6 @@ def cmd_switch(args):
         out["command"] = "switch"
         return out
     ensure_root_row(home, slug, data, repo)
-    row = root_row(home, slug)
-    if row and row.get("db_path"):
-        raise Fail(f"already migrated: projects.db_path = {row['db_path']}", 3)
     with switch_lock(home):
         quiesce(data)
         out = do_copy_verify(home, data, slug)
@@ -664,18 +768,21 @@ def cmd_rollback(args):
         return {"ok": True, "command": "rollback", "dry_run": True, "slug": slug,
                 "from": row["db_path"], "to": src_db(data)}
     dest = mkpaths.target_project_db(slug, home)
-    new_state = state_of(dest)
-    old_state = state_of(src_db(data))
-    # C5: refuse when the NEW DB moved after the switch; a carry-back would lose that write.
-    if new_state is None:
-        raise Fail(f"the new store is gone: {dest}", 3)
-    if new_state[1] != marker.get("new_digest"):
-        raise Fail("the new DB changed after the switch; refusing to roll back (its writes would be"
-                   " lost). Re-run without changes, or keep the new layout", 3)
-    # the old DB is the destination of the carry-back: a change there would be overwritten.
-    if old_state is not None and old_state[1] != marker.get("old_digest"):
-        raise Fail("the OLD DB changed after the switch; refusing to overwrite it", 3)
+    # Review R1 LOW: the old/new state reads and the refusal checks run INSIDE the switch lock.
+    # Reading them before the lock left a window where a concurrent migrator (or a writer) could
+    # change either store between the check and the carry-back.
     with switch_lock(home):
+        new_state = state_of(dest)
+        old_state = state_of(src_db(data))
+        # C5: refuse when the NEW DB moved after the switch; a carry-back would lose that write.
+        if new_state is None:
+            raise Fail(f"the new store is gone: {dest}", 3)
+        if new_state[1] != marker.get("new_digest"):
+            raise Fail("the new DB changed after the switch; refusing to roll back (its writes would be"
+                       " lost). Re-run without changes, or keep the new layout", 3)
+        # the old DB is the destination of the carry-back: a change there would be overwritten.
+        if old_state is not None and old_state[1] != marker.get("old_digest"):
+            raise Fail("the OLD DB changed after the switch; refusing to overwrite it", 3)
         copy_db(dest, src_db(data))
         back = state_of(src_db(data))
         if back is None or back != new_state:
@@ -697,22 +804,50 @@ def cmd_archive(args):
         print(f"archive {data} -> {out} (the old folder stays)")
         return {"ok": True, "command": "archive", "dry_run": True, "slug": slug, "tar": out}
     os.makedirs(legacy, exist_ok=True)
-    with tarfile.open(out, "w:gz") as tf:
-        tf.add(data, arcname=os.path.basename(data.rstrip(os.sep)))
-    members = count_tar_files(out)
-    on_disk = sum(len(files) for _, _, files in os.walk(data))
-    if members != on_disk:
-        raise Fail(f"archive incomplete: {members} files in {out}, {on_disk} on disk", 3)
-    # the old folder and the old DB are never deleted here.
-    if not os.path.isdir(data) or not os.path.isfile(src_db(data)):
-        raise Fail("the old data folder or DB vanished during --archive", 3)
+    # Review R1 MEDIUM: on ANY failure the partial tarball is removed; the old folder and DB are
+    # never touched. tarfile stores a symlink as a symlink (dereference is False by default), so
+    # it never follows one out of the folder and never reads its target's bytes.
+    try:
+        with tarfile.open(out, "w:gz") as tf:
+            tf.add(data, arcname=os.path.basename(data.rstrip(os.sep)))
+        _after_tar_hook()
+        members = count_tar_files(out)
+        on_disk = count_disk_entries(data)
+        if members != on_disk:
+            raise Fail(f"archive incomplete: {members} files in {out}, {on_disk} on disk", 3)
+        # the old folder and the old DB are never deleted here.
+        if not os.path.isdir(data) or not os.path.isfile(src_db(data)):
+            raise Fail("the old data folder or DB vanished during --archive", 3)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(out)
+        raise
     return {"ok": True, "command": "archive", "slug": slug, "tar": out, "files": members}
 
 
 def count_tar_files(path):
-    """Regular-file members in a tar, with the handle closed."""
+    """Every non-directory member in a tar, with the handle closed.
+
+    Review R1 MEDIUM: `isfile()` is False for a symlink (and for a fifo), yet `os.walk` lists a
+    symlink among the files it descends. Counting only regular files made ANY symlink in the data
+    dir fail the completeness check. Directories are traversed, never counted; everything else
+    (regular file, symlink, fifo) counts — matching `count_disk_entries`."""
     with tarfile.open(path) as tf:
-        return sum(1 for m in tf if m.isfile())
+        return sum(1 for m in tf if not m.isdir())
+
+
+def count_disk_entries(root):
+    """Every non-directory entry under root, the disk side of `count_tar_files`.
+
+    `os.walk(followlinks=False)` lists a symlink to a file among `files` and a symlink to a
+    directory among `dirs` (and never descends into it); a fifo among `files`. Directories are not
+    counted; every symlink is, whatever its target, so a symlink that points inside, outside or at
+    a directory still balances against its tar member."""
+    n = 0
+    for dirpath, dirs, files in os.walk(root):
+        n += len(files)
+        n += sum(1 for name in dirs if os.path.islink(os.path.join(dirpath, name)))
+    return n
 
 
 def _write_marker(home, slug, marker):
@@ -858,7 +993,11 @@ def _seed(home, data, repo, *, busy=False, ask=False):
         con.commit()
     finally:
         con.close()
-    mkdb.add_task(mkdb.open_project(home, "fixture", data_dir=data), "r1", "P1.1", "task", title="one")
+    con = mkdb.open_project(home, "fixture", data_dir=data)
+    try:
+        mkdb.add_task(con, "r1", "P1.1", "task", title="one")
+    finally:
+        con.close()
     if ask:
         mkdb.append_event(home, "fixture", "r1", task="P1.1", chan="bus", kind="ask",
                           from_id="orch", to_id="P1.1", text="q", data_dir=data)
@@ -907,13 +1046,14 @@ def self_test():
     tmp = os.path.realpath(tempfile.mkdtemp(prefix="mk-migrate-test-"))
     saved = {k: os.environ.get(k) for k in
              ("MK_HOME", "MATRIXKODER_HOME", "MK_SELFTEST", "MK_MIGRATE_AFTER_COPY",
-              "MK_MIGRATE_AFTER_VERIFY")}
+              "MK_MIGRATE_AFTER_VERIFY", "MK_MIGRATE_AFTER_TAR")}
     home = os.path.join(tmp, "home")
     repo = os.path.join(tmp, "repo")
     data = os.path.join(repo, ".matrixkoder")
     os.environ.update({"MK_HOME": home, "MATRIXKODER_HOME": home, "MK_SELFTEST": "1"})
     os.environ.pop("MK_MIGRATE_AFTER_COPY", None)
     os.environ.pop("MK_MIGRATE_AFTER_VERIFY", None)
+    os.environ.pop("MK_MIGRATE_AFTER_TAR", None)
     checks = []
 
     def ok(name):
@@ -1258,6 +1398,193 @@ def self_test():
         shutil.rmtree(mkpaths.target_project_dir("fixture", home), ignore_errors=True)
         clear_db_path(home, "fixture")
 
+        # 10e. M1.1a (review R2 MEDIUM): the already-migrated refusal runs BEFORE the --dry-run
+        # branch in cmd_copy and cmd_switch, so a dry run on a switched project exits 3 exactly
+        # like the real command — and (the dry-run invariant) writes nothing at all.
+        shutil.rmtree(mkpaths.target_project_dir("fixture", home), ignore_errors=True)
+        clear_db_path(home, "fixture")
+        _check(_cli(home, ["--switch", "--slug", "fixture", "--data", data])[0] == 0,
+               "setup switch for dry-run refusal failed")
+        for extra in ([], ["--switch"]):
+            before = _tree_hash(tmp)
+            rc, out, err = _cli(home, ["--dry-run", *extra, "--slug", "fixture", "--data", data])
+            _check(rc == 3, f"dry-run{extra} on a switched project did not refuse (rc={rc}) {out[-200:]}")
+            _check("already migrated" in (_last_json(out) or {}).get("error", ""),
+                   f"dry-run{extra} wrong refusal: {out[-200:]}")
+            _check("SQLite backup API" not in out, f"dry-run{extra} still planned a copy: {out!r}")
+            _check(_tree_hash(tmp) == before, f"dry-run{extra} on a switched project wrote something")
+        ok("dry-run-refuses-after-switch")
+        shutil.rmtree(mkpaths.target_project_dir("fixture", home), ignore_errors=True)
+        clear_db_path(home, "fixture")
+
+        # 10f. M1.1b (review R2 LOW): a lanes.json whose `slots` is a list, string or number is a
+        # C5 refusal, never an AttributeError. An absent/null slots still reads as no lanes.
+        for label, slots in (("list", [1, 2]), ("string", "nope"), ("number", 7)):
+            d = os.path.join(tmp, f"slots-{label}")
+            os.makedirs(d, exist_ok=True)
+            with open(mkpaths.lanes_file(d), "w") as f:
+                json.dump({"schema": 1, "slots": slots}, f)
+            try:
+                _registry_rows(d)
+                raise SystemExit(f"SELF-TEST FAIL: slots={label} did not refuse")
+            except Fail as e:
+                _check(e.code == 3 and "slots is not an object" in str(e),
+                       f"slots={label} refusal: {e}")
+            try:
+                quiesce(d)
+                raise SystemExit(f"SELF-TEST FAIL: quiesce passed with slots={label}")
+            except Fail as e:
+                _check(e.code == 3 and "lane registry unreadable" in str(e),
+                       f"quiesce slots={label}: {e}")
+        d = os.path.join(tmp, "slots-absent")
+        os.makedirs(d, exist_ok=True)
+        with open(mkpaths.lanes_file(d), "w") as f:
+            json.dump({"schema": 1}, f)  # no `slots` key: an empty registry, not a refusal
+        _check(_registry_rows(d) == [], "an absent slots key must read as no lanes")
+        with open(mkpaths.lanes_file(d), "w") as f:
+            json.dump({"schema": 1, "slots": None}, f)
+        _check(_registry_rows(d) == [], "a null slots must read as no lanes")
+        ok("registry-slots-not-an-object")
+
+        # 10g. M1.2b (review R1 MEDIUM): a symlink inside the data dir is archived AS a symlink
+        # (never followed, never escaping the folder) and counted by the completeness check. On
+        # ANY failure the partial tarball is removed; the old folder stays.
+        sym_repo = os.path.join(tmp, "sym-repo")
+        sym_data = os.path.join(sym_repo, ".matrixkoder")
+        sym_home = os.path.join(tmp, "sym-home")
+        _seed(sym_home, sym_data, sym_repo)
+        os.symlink("/etc/hosts", os.path.join(sym_data, "outside-link"))
+        os.makedirs(os.path.join(sym_data, "subdir"), exist_ok=True)
+        os.symlink("subdir", os.path.join(sym_data, "dirlink"))
+        rc, _, err = _cli(sym_home, ["--switch", "--slug", "fixture", "--data", sym_data])
+        _check(rc == 0, f"sym setup switch failed: {err[-200:]}")
+        legacy = os.path.join(target_dir(sym_home, "fixture"), "legacy")
+        # the failure path FIRST: a file the tar missed makes the recount refuse AND the partial
+        # tarball is removed. (First, so the same-second tarball name cannot collide with the
+        # success case below — `now_stamp` is second-resolution.)
+        inject = "import sys; open(sys.argv[1], 'w').write('x')"
+        late = os.path.join(sym_data, "late.txt")
+        rc, out, err = _cli(sym_home, ["--archive", "--slug", "fixture", "--data", sym_data],
+                            env={"MK_MIGRATE_AFTER_TAR":
+                                 f"{sys.executable} -c {json.dumps(inject)} {late}"})
+        _check(rc == 3, f"an incomplete archive did not refuse (rc={rc}) {out[-200:]}")
+        _check("archive incomplete" in (_last_json(out) or {}).get("error", ""),
+               f"wrong archive refusal: {out[-200:]}")
+        _check(sorted(os.listdir(legacy)) == [],
+               f"the partial tarball was left behind: {os.listdir(legacy)}")
+        os.remove(os.path.join(sym_data, "late.txt"))
+        # now the success path: the symlink is archived AS a symlink (never followed), the
+        # recount balances, and the old folder is unchanged.
+        # the switch's own state reads create mk.db-wal/-shm in the source dir: take the
+        # unchanged-across-archive baseline now, after the switch (test 7 does the same).
+        sym_old_files = _tree_hash(sym_data)
+        rc, out, err = _cli(sym_home, ["--archive", "--slug", "fixture", "--data", sym_data])
+        _check(rc == 0, f"archive with symlinks rc={rc} {out[-300:]} {err[-300:]}")
+        tar_path = _last_json(out)["tar"]
+        _check(_last_json(out)["files"] == count_disk_entries(sym_data),
+               f"the symlink count did not balance: {out[-200:]}")
+        with tarfile.open(tar_path) as tf:
+            got = {m.name: m for m in tf}
+        link = next((m for n, m in got.items() if n.endswith("outside-link")), None)
+        _check(link is not None, "the symlink was not archived at all")
+        _check(link.issym() and link.linkname == "/etc/hosts",
+               f"the symlink was not stored as a symlink: {link}")
+        _check(_tree_hash(sym_data) == sym_old_files, "--archive changed the old folder")
+        _check(os.path.isdir(sym_data) and os.path.isfile(src_db(sym_data)),
+               "--archive removed the old data or DB")
+        ok("archive-symlinks-and-partial-cleanup")
+
+        # 10h. M1.2a (review R1 LOW): cmd_rollback reads the old and new state INSIDE switch_lock.
+        # Proof: hold the migrator lock AND make the new DB diverge from the switch marker. The new
+        # code refuses on the LOCK before reading any state; the old code read state first and
+        # reported the divergence. The refusal names the lock, not the DB.
+        shutil.rmtree(mkpaths.target_project_dir("fixture", home), ignore_errors=True)
+        clear_db_path(home, "fixture")
+        _check(_cli(home, ["--switch", "--slug", "fixture", "--data", data])[0] == 0,
+               "setup switch for the rollback-lock case failed")
+        locked_db = mkpaths.target_project_db("fixture", home)
+        mkdb.append_event(home, "fixture", "r1", task="P1.1", chan="bus", kind="info",
+                          from_id="orch", to_id="P1.1", text="diverge", data_dir=dest_dir_of(locked_db))
+        lp = switch_lock_path(home)
+        os.makedirs(os.path.dirname(lp), exist_ok=True)
+        holder = open(lp, "a")
+        _fcntl.flock(holder, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        try:
+            rc, out, err = _cli(home, ["--rollback", "--slug", "fixture", "--data", data])
+            msg = (_last_json(out) or {}).get("error", "")
+            _check(rc == 3 and "switch lock" in msg,
+                   f"rollback read state before taking the lock: {msg!r}")
+        finally:
+            _fcntl.flock(holder, _fcntl.LOCK_UN)
+            holder.close()
+        ok("rollback-takes-lock-before-state")
+        shutil.rmtree(mkpaths.target_project_dir("fixture", home), ignore_errors=True)
+        clear_db_path(home, "fixture")
+
+        # 10i. M1.3-S1 (helper finding, HIGH): a copy that raises mid-way must not leave a partial
+        # C2 copy behind. An unreadable round file makes copy_moves raise; the new code removes the
+        # NEW copy and prints one JSON refusal. On 179fa58 the raise escaped with a traceback, the
+        # partial C2 store stayed, and a later --dry-run reported ok:true.
+        shutil.rmtree(mkpaths.target_project_dir("fixture", home), ignore_errors=True)
+        clear_db_path(home, "fixture")
+        locked = os.path.join(data, "runs", "r1", "tasks", "P1.1", "brief-r1.md")
+        os.chmod(locked, 0o000)
+        try:
+            rc, out, err = _cli(home, ["--slug", "fixture", "--data", data])
+            _check(rc == 3, f"an unreadable file did not refuse cleanly (rc={rc}) {err[-200:]}")
+            _check("copy failed" in (_last_json(out) or {}).get("error", ""),
+                   f"wrong copy refusal: {out[-200:]}")
+            _check(not os.path.exists(mkpaths.target_project_db("fixture", home)),
+                   "the partial C2 copy was left behind")
+            # and a dry run must not advertise a copy that cannot verify
+            rc2, out2, _ = _cli(home, ["--dry-run", "--slug", "fixture", "--data", data])
+            _check(rc2 == 0 and (_last_json(out2) or {}).get("ok") is True,
+                   f"dry-run after a clean failure should still plan: rc={rc2} {out2[-120:]}")
+        finally:
+            os.chmod(locked, 0o644)
+        ok("partial-copy-removed-on-failure")
+
+        # 10j. M1.3-S2 (helper finding, MEDIUM): a symlink inside a plan's assets tree that points
+        # OUTSIDE the repo is refused, never dereferenced — its target's bytes must not enter the
+        # C2 store. On 179fa58 copytree followed it and stored a regular file.
+        shutil.rmtree(mkpaths.target_project_dir("fixture", home), ignore_errors=True)
+        clear_db_path(home, "fixture")
+        outside = os.path.join(tmp, "outside-assets")
+        os.makedirs(outside, exist_ok=True)
+        secret = os.path.join(outside, "leak.txt")
+        with open(secret, "w") as f:
+            f.write("SECRET-CONTENT")
+        pdir = mkpaths.plan_dir(data, "live")
+        os.makedirs(pdir, exist_ok=True)
+        os.symlink(secret, os.path.join(pdir, "leak-link"))
+        rc, out, err = _cli(home, ["--slug", "fixture", "--data", data])
+        _check(rc == 3, f"an out-of-repo assets symlink was not refused (rc={rc}) {out[-200:]}")
+        _check("escapes the repo" in (_last_json(out) or {}).get("error", ""),
+               f"wrong symlink refusal: {out[-200:]}")
+        _check(not os.path.exists(mkpaths.target_project_db("fixture", home))
+               and not os.path.exists(os.path.join(target_dir(home, "fixture"), "plans")),
+               "the refused copy left a partial C2 tree")
+        # an IN-repo symlink still copies, as a symlink. (The design ref `live-research.md` is
+        # dropped here: this seed's design entry lands in the SAME assets dst the tree copies from a
+        # different src, a pre-existing false verify refused below and not part of M1 — reported,
+        # not fixed.)
+        os.remove(os.path.join(pdir, "leak-link"))
+        con = mkdb.open_project(home, "fixture", data_dir=data)
+        con.execute("UPDATE plans SET header_json='{}' WHERE id='live'")
+        con.commit()
+        con.close()
+        inside_target = os.path.join(os.path.dirname(data), "inside-target.txt")
+        with open(inside_target, "w") as f:
+            f.write("inside")
+        os.symlink(inside_target, os.path.join(pdir, "in-link"))
+        rc, out, err = _cli(home, ["--slug", "fixture", "--data", data])
+        _check(rc == 0, f"an in-repo assets symlink was refused (rc={rc}) {out[-200:]}")
+        dst_link = os.path.join(
+            mkpaths.target_plan_dir("fixture", "live", home), "assets", "in-link")
+        _check(os.path.islink(dst_link), f"the in-repo symlink was dereferenced: {dst_link}")
+        os.remove(os.path.join(pdir, "in-link"))
+        ok("assets-symlink-escape-refused")
+
         # 11. mutation proofs (R13): each guard is shown load-bearing. A deliberately broken copy
         # of this file (recall disabled / quiesce disabled / old-folder delete enabled / switch
         # equality skipped) is run and shown to change the outcome — so the guard test is proven
@@ -1358,8 +1685,8 @@ def _mutation_recount(home, data, tmp):
     mutant = _mutant([
         ('if dst_counts != src_counts or dst_digest != src_digest:\n            bad.append("mk.db")',
          'if False:\n            bad.append("mk.db")'),
-        ('if now_counts != src_counts or now_digest != src_digest:\n        bad.append("mk.db (the source changed during the copy)")',
-         'if False:\n        bad.append("mk.db (the source changed during the copy)")'),
+        ('if now_counts != src_counts or now_digest != src_digest:\n            bad.append("mk.db (the source changed during the copy)")',
+         'if False:\n            bad.append("mk.db (the source changed during the copy)")'),
     ], sandbox)
     shutil.rmtree(mkpaths.target_project_dir("fixture", home), ignore_errors=True)
     clear_db_path(home, "fixture")
