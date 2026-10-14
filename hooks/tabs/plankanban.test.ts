@@ -74,6 +74,22 @@ const countOf = (block: N | undefined): string => {
   return dim == null ? '' : text(dim)
 }
 
+/** one card's outer Box, by the task id it carries as its element key. */
+const cardBox = (root: unknown, id: string): N | undefined =>
+  allOf(root, 'Box').find(b => b.props.key === id)
+
+/** the tag a card draws: the dim Texts on its chip row (the age has a `m`/`h`/
+ *  `d` suffix) plus the own-row dim Text the narrow fallback adds below it. */
+const tagsOf = (card: N | undefined): string[] => {
+  if (card == null) return []
+  const chipRow = kids(card).find(k => k.type === 'Box' && kids(k).some(t => t.type === 'Text' && t.props.backgroundColor != null))
+  const row = chipRow == null ? [] : kids(chipRow)
+  const own = kids(card)
+  return [...row, ...own]
+    .filter(t => t.type === 'Text' && t.props.dimColor === true)
+    .map(t => text(t))
+}
+
 /** every status the captured fixture's tasks carry, for the map test. */
 const FIXTURE_IDS = detail.phases.flatMap(p => p.tasks.map(t => t.id))
 
@@ -136,9 +152,12 @@ test('a card shows glyph, id, cut title, phase chip and the dim lane·agent tag 
   expect(text(onMain)).not.toContain('$MK_HOME') // R1.1's long title is cut, not wrapped
   expect(text(onMain)).toContain(' R1 ')
   // the live task-level routes draw their tag: D1.2 slot 4 · opencode/manifest/auto;
-  // V1.1/V1.2 slot 5 · route with an agent only
-  expect(text(onMain)).toContain('L4 · opencode auto')
-  expect(text(onMain)).toContain('L5 · opencode')
+  // V1.1/V1.2 slot 5 · route with an agent only. At 80 cols each card is 19 wide
+  // (inner 15), so the chip row cannot hold even `L4 opencode` (11 > the 10 cells
+  // left after the phase chip): todo 94 drops the model and the tag sits alone.
+  expect(text(onMain)).toContain('L4 opencode')
+  expect(text(onMain)).toContain('L5 opencode')
+  expect(text(onMain)).not.toContain('L4 · openc')
   // no nowIso passed → no age text
   expect(text(tree)).not.toMatch(/\b\d+[mhd]\b/)
 })
@@ -330,6 +349,49 @@ function renderLines(v: unknown, width?: number): string[] {
 const picture = (cols: number): string =>
   renderLines(PlanKanbanTab(stubEls(), view, cols, uiOf().handle), cols).map(l => l.replace(/\s+$/, '')).join('\n')
 
+/** A card whose title is long enough to be cut at a narrow width, with a lane,
+ *  an agent and a long model id — the shape todo 94 is about. The task id is
+ *  real (D1.2 of the captured fixture); only the model is a long stand-in. */
+const narrowFixture = (): ReturnType<typeof planKanbanView> => planKanbanView({
+  ok: true, id: 'narrow', phases: [{ id: 'D1', tasks: [
+    {
+      id: 'D1.2', title: 'mk-plan.py: write the new columns, import, delete and pause', status: 'merged',
+      updated: '2026-10-14T11:38:00+02:00', slot: 4,
+      route: { agent: 'opencode', model: 'zai-coding-plan/glm-5.3', effort: 'high' },
+    },
+  ] }],
+}, '2026-10-14T12:00:00+02:00')
+
+test('todo 94: a narrow card drops the model instead of cutting the tag mid-word, and keeps title, phase and age', () => {
+  // 21 cols stacked → column 21 → card inner 17 (Card border 2 + paddingX 1 each side)
+  const inner = 21 - 4
+  const tree = PlanKanbanTab(stubEls(), narrowFixture(), 21, uiOf().handle)
+  const card = cardBox(tree, 'D1.2')
+  expect(card, 'the D1.2 card').toBeDefined()
+  // the tag is lane + agent only, whole words — never the old `L4 · openc`
+  const tags = tagsOf(card).filter(t => t !== '22m')
+  expect(tags).toEqual(['L4 opencode'])
+  // and the whole card carries no mid-word cut of the tag
+  expect(text(card as N)).not.toContain('L4 · openc')
+  expect(text(card as N)).not.toMatch(/L4 · \S*…/)
+  // title, phase chip and age still render on the narrow card
+  const body = text(card as N)
+  expect(body).toContain('D1.2')
+  expect(body).toContain('mk-plan.py: writ…') // cut to the inner width, not wrapped
+  expect(body).toContain(' D1 ')
+  expect(body).toContain('22m')
+  expect(inner).toBe(17)
+})
+
+test('todo 94: a wide card keeps the three-part lane · agent · model tag', () => {
+  // 160 cols side by side → column 39 → card inner 35; chip ` D1 ` and the age
+  // `22m` leave 26 cells, so the 21-cell `L4 · opencode glm-5.3` still fits
+  const tree = PlanKanbanTab(stubEls(), narrowFixture(), 160, uiOf().handle)
+  const card = cardBox(tree, 'D1.2')
+  expect(card, 'the D1.2 card').toBeDefined()
+  expect(tagsOf(card).filter(t => t !== '22m')).toEqual(['L4 · opencode glm-5.3'])
+})
+
 test('a card shows the dim lane·agent line and pressing it selects the task (V1.5)', () => {
   const routed = planKanbanView({
     ok: true, id: 'routed', phases: [{ id: 'P1', tasks: [
@@ -342,7 +404,10 @@ test('a card shows the dim lane·agent line and pressing it selects the task (V1
   const { ui, handle } = uiOf()
   const tree = PlanKanbanTab(stubEls(), routed, W80, handle)
   const building = text(columnBlock(tree, 'BUILDING'))
-  expect(building).toContain('L3 · opencode glm-5.3')
+  // 80 cols → card inner 15 → chip row room 10: `L3 opencode` (11) does not fit
+  // beside the chip, so todo 94 moves it to its own row (whole words, no cut)
+  expect(tagsOf(cardBox(tree, 'T1'))).toContain('L3 opencode')
+  expect(building).not.toContain('L3 · openc')
   const planned = text(columnBlock(tree, 'PLANNED'))
   expect(planned).toContain('L5')
   // the card is pressable: first press selects, second press clears
@@ -362,8 +427,10 @@ test('a card keeps its age beside the lane·agent tag (V1.5)', () => {
   }, '2026-10-14T12:00:00+02:00')
   const tree = PlanKanbanTab(stubEls(), aged, W80, uiOf().handle)
   const building = text(columnBlock(tree, 'BUILDING'))
-  expect(building).toContain('L2 · opencode sonnet')
+  // inner 15, chip ` P1 ` (4), age `22m` (3): chip row room 6 → neither the full
+  // nor the model-dropped tag fits beside them; the tag takes its own row
   expect(building).toContain('22m')
+  expect(tagsOf(cardBox(tree, 'P1.1'))).toContain('L2 opencode')
 })
 
 test('report render: the captured fixture at 80 cols, exactly as pasted', () => {
@@ -410,31 +477,34 @@ PLANNED           4 BUILDING          9 NEEDS YOU         0 ON MAIN          19
                     ╭─────────────────╮                     ╭─────────────────╮
                     │ ● V1.5.1        │                     │ ✓ D1.2          │
                     │ mkdb plans <id… │                     │ mk-plan.py: wr… │
-                    │  V1.5           │                     │  D1  L4 · openc │
-                    ╰─────────────────╯                     ╰─────────────────╯
-
-                    ╭─────────────────╮                     ╭─────────────────╮
-                    │ ● V1.5.2        │                     │ ✓ D1.3          │
-                    │ Detail sub-tab… │                     │ docs/state-sch… │
-                    │  V1.5           │                     │  D1  L5         │
-                    ╰─────────────────╯                     ╰─────────────────╯
-
-                    ╭─────────────────╮                     ╭─────────────────╮
-                    │ ● V1.5.3        │                     │ ✓ D1.4          │
-                    │ Kanban card: i… │                     │ First real imp… │
                     │  V1.5           │                     │  D1             │
-                    ╰─────────────────╯                     ╰─────────────────╯
+                    ╰─────────────────╯                     │ L4 opencode     │
+                                                            ╰─────────────────╯
+                    ╭─────────────────╮
+                    │ ● V1.5.2        │                     ╭─────────────────╮
+                    │ Detail sub-tab… │                     │ ✓ D1.3          │
+                    │  V1.5           │                     │ docs/state-sch… │
+                    ╰─────────────────╯                     │  D1  L5         │
+                                                            ╰─────────────────╯
+                    ╭─────────────────╮
+                    │ ● V1.5.3        │                     ╭─────────────────╮
+                    │ Kanban card: i… │                     │ ✓ D1.4          │
+                    │  V1.5           │                     │ First real imp… │
+                    ╰─────────────────╯                     │  D1             │
+                                                            ╰─────────────────╯
 
                                                             ╭─────────────────╮
                                                             │ ✓ V1.1          │
                                                             │ List sub-tab: … │
-                                                            │  V1  L5 · openc │
+                                                            │  V1             │
+                                                            │ L5 opencode     │
                                                             ╰─────────────────╯
 
                                                             ╭─────────────────╮
                                                             │ ✓ V1.2          │
                                                             │ Detail sub-tab… │
-                                                            │  V1  L5 · openc │
+                                                            │  V1             │
+                                                            │ L5 opencode     │
                                                             ╰─────────────────╯
 
                                                             ╭─────────────────╮
