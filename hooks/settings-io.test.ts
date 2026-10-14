@@ -238,7 +238,35 @@ test('S3 view: yaml fields group by scope; picks overlay; unknown shapes never b
   expect(chip?.editable).toBe(false)
 })
 
-// ---------- L7.1: the scope notes name the real yaml path ----------
+// ---------- L7.4: level + home on every schema row ----------
+
+test('L7.4: every schema row carries level+home beside scope; all yaml, project; the UI scope is untouched', () => {
+  // C8: level (global|project) and home (userConfig|yaml) are NEW fields beside the
+  // UI-tab `scope`, which stays its own vocabulary. Every SCHEMA key is a yaml key,
+  // so level=project and home=yaml on all of them — `lanes.default_agent` included
+  // (its UI scope says "global" and must not change).
+  for (const row of SETTINGS_SCHEMA.schema) {
+    expect(row.level, `${row.key} level`).toBe('project')
+    expect(row.home, `${row.key} home`).toBe('yaml')
+    expect(String(row.scope).length, `${row.key} keeps a UI scope`).toBeGreaterThan(0)
+  }
+  // the UI-tab scope vocabulary is untouched: the four yaml scopes plus the
+  // read-only models/about rows and the one `global` label of lanes.default_agent
+  const scopes = new Set<string>(SETTINGS_SCHEMA.schema.map(r => r.scope as string))
+  for (const s of ['project', 'routing', 'agents', 'child', 'models', 'about', 'global']) {
+    expect(scopes.has(s), `the ${s} UI scope survives`).toBe(true)
+  }
+  const laneAgent = SETTINGS_SCHEMA.schema.find(r => r.key === 'lanes.default_agent')
+  expect(laneAgent?.scope, 'the UI scope stays the schema string').toBe('global')
+  expect(laneAgent?.level, 'but the C8 level is project').toBe('project')
+  expect(laneAgent?.home).toBe('yaml')
+  // and the UI-side mapping of that scope is unchanged: `lanes.default_agent` still
+  // lands in the Child tab (buildSettingsView's YAML_SCOPES -> child mapping)
+  const view = buildSettingsView({ fields: [...SETTINGS_LIST_FIXTURE], file: '', configRows: [], globalDefaults: {}, about: ABOUT })
+  const laneRow = view.groups.flatMap(g => g.rows).find(r => r.key === 'lanes.default_agent')
+  expect(laneRow?.scope, 'lanes.default_agent draws in Child').toBe('child')
+  expect(laneRow?.type, 'and is a select of the available agents').toBe('select')
+})
 
 test('L7.1: the live `file` from list --json reaches every yaml scope note; empty keeps the shape label', () => {
   // the migrated layout's real path (C2) is what `list --json` prints

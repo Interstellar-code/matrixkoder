@@ -131,9 +131,23 @@ class Fail(Exception):
 
 # ---------- the schema: one row per setting, with its home in the yaml ----------
 
-def _row(key, scope, type, default, sec, line, member, label, help, **kw):
+# C8's two vocabularies. `home` names where a value lives: "yaml" (the project.yaml every SCHEMA
+# key reads) or "userConfig" (.claude-plugin/plugin.json, which mk-config never writes). `level`
+# follows from home: userConfig is one value for the user (global); yaml is per project.
+YAML_HOME, USERCONFIG_HOME = "yaml", "userConfig"
+
+# C8: every key declares a `level` (global|project) and a `home` (userConfig|yaml), NEW fields
+# beside the UI-tab `scope` (project|routing|agents|child), which stays untouched — a different
+# vocabulary. The userConfig keys (mode, defaultTab, hiddenTabs, raster, wake, guards,
+# usagePollMin, autoOpen, chip, toasts) live in `.claude-plugin/plugin.json` and are NOT SCHEMA
+# rows; EVERY SCHEMA key is a yaml key, so its home is "yaml" and its level "project" —
+# `lanes.default_agent` included (C2 has no root yaml; its UI `scope` says "global" and is left
+# alone). A future userConfig-backed row declares home="userConfig" and the level follows, so
+# `level global` can only ever name a userConfig key (C8).
+def _row(key, scope, type, default, sec, line, member, label, help, home=YAML_HOME, **kw):
     r = {"key": key, "scope": scope, "type": type, "default": default, "sec": sec, "line": line,
-         "member": member, "label": label, "help": help}
+         "member": member, "label": label, "help": help,
+         "home": home, "level": "global" if home == USERCONFIG_HOME else "project"}
     r.update(kw)
     return r
 
@@ -865,7 +879,9 @@ def cmd_list(path, lines):
         shown_default = effective_default(r)
         f = {"key": r["key"], "scope": r["scope"], "label": r["label"], "type": r["type"],
              "value": value, "default": shown_default, "help": r["help"],
-             "editable": r.get("editable", True)}
+             "editable": r.get("editable", True),
+             # C8: where the value lives, beside the UI-tab `scope` (a different vocabulary).
+             "level": r["level"], "home": r["home"]}
         if r.get("derived") and not found:
             f["derived"] = True  # the yaml has no value: value and default are the derived number
         if r["type"] == "num":
@@ -2465,6 +2481,22 @@ def self_test():
         assert "stall_min: 19" in final, final
         assert "herdr: stale" in final or "herdr: ok" in final, final
         assert "probed_at:" in final
+
+        # 35. L7.4: every SCHEMA row carries C8's level + home beside the UI-tab `scope`
+        #     (which stays its own vocabulary). Every SCHEMA key is a yaml key, so all are
+        #     level=project / home=yaml; `lanes.default_agent` keeps its UI scope "global".
+        listed = run("list", "--json")["fields"]
+        assert listed, "list returned no fields"
+        for f in listed:
+            assert f.get("level") == "project", f
+            assert f.get("home") == "yaml", f
+            assert isinstance(f.get("scope"), str) and f["scope"] != "", f
+        lane_row = next(f for f in listed if f["key"] == "lanes.default_agent")
+        assert lane_row["scope"] == "global" and lane_row["level"] == "project", lane_row
+        # the static SCHEMA rows all carry the fields, not just what list happens to show
+        assert all("level" in r and "home" in r for r in SCHEMA), "a SCHEMA row is missing level/home"
+        # a userConfig home would be the only global level: none today (C8)
+        assert {r["home"] for r in SCHEMA} == {"yaml"}, sorted({r["home"] for r in SCHEMA})
 
         # 34. L7.1: the dashboard hands the Settings tab the C2 PROJECT FOLDER (dirname of
         #     projects.db_path, hooks/data.ts projectDirFromStore), not the legacy data_dir.

@@ -107,6 +107,10 @@ function okOf(ans: unknown): { ok: true } | { ok: false; error: string } {
 export type YamlFieldIn = {
   key: unknown
   scope: unknown
+  /** C8: where the value lives (userConfig|yaml), beside the UI-tab `scope`. */
+  home?: unknown
+  /** C8: global (one value for the user) | project (per project). */
+  level?: unknown
   label: unknown
   type: unknown
   value: unknown
