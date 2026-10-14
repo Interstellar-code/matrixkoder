@@ -958,6 +958,10 @@ def catch_up(home, project, data_dir=None):
 RUN_COLS = ("id", "plan", "plan_version", "branch", "status", "stage", "next", "started", "ended")
 TASK_COLS = ("id", "parent", "type", "title", "acceptance", "owned", "deps", "parallel",
              "route_json", "status", "lane", "slot", "branch", "pane", "round", "verdict", "updated")
+# D1.5.2: the columns the mirror (import_history's upsert) never blanks — the approved plan's
+# acceptance/owned/deps/route_json/type survive a re-import whose file view carries no value
+# for them (a run.json written before D1.5.1, or any task the file view does not populate).
+MERGE_KEEP = ("acceptance", "owned", "deps", "route_json", "type")
 EVENT_COLS = ("t", "chan", "kind", "from_id", "to_id", "reply_to", "text", "meta_json", "task")
 ARTIFACT_COLS = ("task", "round", "kind", "rev", "text", "created")
 
@@ -1093,18 +1097,45 @@ def import_history(home, project, run, *, run_row=None, tasks=(), events=(), art
                 cols = ["run"] + list(TASK_COLS) + ["prev_status", "file_status"]
                 values = [run] + [t.get(c) for c in TASK_COLS] + [prev, keep_file]
                 values[cols.index("status")] = status
+                # D1.5.2: the mirror never blanks an approved-plan column. A live file view
+                # that carries no value for acceptance/owned/deps/route_json/type keeps the
+                # stored one (COALESCE); an empty string from the file view counts as absent
+                # for the csv columns (the file view renders an empty list as ""), and an
+                # empty list counts as absent in the row dict. Status/lane/round/verdict keep
+                # the plain overwrite semantics.
+                keep_cols = []
+                for c in cols:
+                    if c in ("run", "id", "status", "prev_status", "file_status"):
+                        continue
+                    if c not in MERGE_KEEP:
+                        continue
+                    if c in ("owned", "deps") and values[cols.index(c)] == "":
+                        keep_cols.append(c)  # the file view's "no list" rides as ""
+                    elif c in ("acceptance", "route_json", "type") and values[cols.index(c)] in (None, ""):
+                        keep_cols.append(c)
+                assign = [f"{c}=excluded.{c}" for c in cols
+                          if c not in ("run", "id") and c not in keep_cols]
+                # NULLIF: the file view renders an empty list as "" for owned/deps and the
+                # importer writes "" for a missing acceptance, so "" must read as "absent"
+                # before COALESCE can keep the stored value.
+                assign += [f"{c}=COALESCE(NULLIF(excluded.{c}, ''), tasks.{c})" for c in keep_cols]
                 con.execute(
                     "INSERT INTO tasks(" + ",".join(cols) + ") VALUES (" + ",".join("?" * len(cols)) + ")"
-                    " ON CONFLICT(run, id) DO UPDATE SET " + ",".join(
-                        f"{c}=excluded.{c}" for c in cols if c not in ("run", "id")),
+                    " ON CONFLICT(run, id) DO UPDATE SET " + ",".join(assign),
                     tuple(values))
                 if not existed:
                     added["tasks"] += 1
                     _change_log(con, run, t["id"])
                 else:
                     # A re-import logs a change only when a column actually moved, so catch_up()
-                    # rebuilds the card; identical data adds nothing, change_log included.
-                    changed = any(existed[c] != v for c, v in zip(cols, values))
+                    # rebuilds the card; identical data adds nothing, change_log included. A kept
+                    # column compares its EFFECTIVE value (the stored one it did not blank), so a
+                    # re-import that omits a field never logs a change either.
+                    effective = list(values)
+                    for c in keep_cols:
+                        if effective[cols.index(c)] in (None, ""):
+                            effective[cols.index(c)] = existed[c]
+                    changed = any(existed[c] != v for c, v in zip(cols, effective))
                     if changed:
                         _change_log(con, run, t["id"])
             seen_src = set()
@@ -1753,6 +1784,7 @@ def self_test():
         _import_reupdate(home)
         _import_cycle(home)
         _import_race(home)
+        _import_keep_cols(home)
         _live_writers(home)
         _v1_upgrade(home)
         _lane_slots_v3(home)
@@ -2416,6 +2448,70 @@ def _import_reupdate(home):
         _check(after == before + 1, f"changed re-import logged {after - before}")
         _check(con.execute("SELECT title FROM tasks WHERE id='t'").fetchone()["title"] == "two",
                "update did not land")
+    finally:
+        con.close()
+
+
+def _import_keep_cols(home):
+    """D1.5.2: the mirror never blanks a column the file view carries no value for.
+
+    The approved plan's acceptance/owned/deps/route_json/type survive a re-import that omits
+    them (NULL, or "" for the csv columns — what the file view renders an empty list as),
+    while a real value always wins and a status change still overwrites.
+    """
+    data = os.path.join(home, "keepcols")
+    full = {"id": "t", "parent": None, "type": "phase", "title": "one", "acceptance": "the outcome",
+            "owned": "scripts/a.py", "deps": "other", "parallel": 0,
+            "route_json": '{"agent": "opencode", "effort": "", "model": "m"}', "status": "building"}
+    # the dep target exists first: a batch is checked parent/dep before its target
+    import_history(home, "keepcols", "hist", run_row={"id": "hist", "status": "active"},
+                   tasks=[{"id": "other", "type": "task", "title": "other", "status": "done"}],
+                   data_dir=data)
+    import_history(home, "keepcols", "hist", tasks=[full], data_dir=data)
+    bare = {"id": "t", "parent": None, "type": "phase", "title": "one", "acceptance": None,
+            "owned": "", "deps": "", "parallel": 0, "route_json": None, "status": "routed"}
+    import_history(home, "keepcols", "hist", tasks=[bare], data_dir=data)
+    con = open_project(home, data_dir=data)
+    try:
+        row = con.execute("SELECT * FROM tasks WHERE run='hist' AND id='t'").fetchone()
+        _check(row["acceptance"] == "the outcome", f"acceptance blanked: {row['acceptance']!r}")
+        _check(row["owned"] == "scripts/a.py", f"owned blanked: {row['owned']!r}")
+        _check(row["deps"] == "other", f"deps blanked: {row['deps']!r}")
+        # type is always present (the mirror derives it), so it overwrites like any real value
+        _check(row["type"] == "phase", f"the mirror's type did not land: {row['type']!r}")
+        _check(row["route_json"] == full["route_json"], f"route_json blanked: {row['route_json']!r}")
+        _check(row["status"] == "routed", f"status did not overwrite: {row['status']!r}")  # status still does
+        # a re-import that omits the kept columns logs no change at all
+        n_log = con.execute("SELECT MAX(change_no) c FROM change_log WHERE run='hist' AND task='t'").fetchone()["c"]
+        import_history(home, "keepcols", "hist", tasks=[dict(bare)], data_dir=data)
+        con = open_project(home, data_dir=data)
+        try:
+            again = con.execute("SELECT MAX(change_no) c FROM change_log"
+                                " WHERE run='hist' AND task='t'").fetchone()["c"]
+            _check(again == n_log, f"an omitted-only re-import logged a change: {n_log} -> {again}")
+        finally:
+            con.close()
+        con = open_project(home, data_dir=data)
+        try:
+            row = con.execute("SELECT * FROM tasks WHERE run='hist' AND id='t'").fetchone()
+            _check(row["acceptance"] == "the outcome" and row["owned"] == "scripts/a.py",
+                   f"the kept columns did not survive an identical re-import: {row['acceptance']!r}")
+        finally:
+            con.close()
+        # a real value always wins (deps stays as it is — a real one is below)
+        fresh = dict(bare, acceptance="new outcome", owned="scripts/b.py", deps="other")
+        import_history(home, "keepcols", "hist", tasks=[fresh], data_dir=data)
+        con = open_project(home, data_dir=data)
+        try:
+            row = con.execute("SELECT * FROM tasks WHERE run='hist' AND id='t'").fetchone()
+            _check(row["acceptance"] == "new outcome" and row["owned"] == "scripts/b.py",
+                   f"a real value did not win: {row['acceptance']!r} {row['owned']!r}")
+            _check(row["route_json"] == full["route_json"], "route_json lost after a real acceptance")
+            _check(row["type"] == "phase", "type lost after a real acceptance")
+            _check(con.execute("SELECT COUNT(*) c FROM tasks WHERE run='hist'").fetchone()["c"] == 2,
+                   "the keep-case inserted a second row")
+        finally:
+            con.close()
     finally:
         con.close()
 

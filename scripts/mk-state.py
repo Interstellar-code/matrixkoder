@@ -20,6 +20,14 @@
       (`promote_error`).
   run list | run get [--id ID | ID] | run set [--id ID] [--next TEXT] [--status active|done]
   run stage N [--id ID] | run archive --id ID | run archive ID
+  run backfill-fields [--run ID] — one-shot: fill the EMPTY acceptance/refs/owned/deps/type/route
+      of this run's tasks from the approved plan (D1.5.5). The plan tool is the only reader of
+      the plan file (C3). Links match case-insensitively: a phase item by plan_phase, a task
+      item by plan_task, a subtask item by its id. Plan items with no run task are reported as
+      unmatched; fields already set are never overwritten (idempotent). status/lane/round/
+      verdict/slot/branch/workspace/pane are not touched, route_json/agent/model/effort are not
+      touched (route_json comes from dispatch, D1.5.3). Writes through the normal save path, so
+      the store mirror and the run-doc artifact update together; ONE summary note event.
   task add --id T --title TEXT [--wave N] [--deps A,RUN:B] [--owned glob,glob] [--parent P]
       ids are case-insensitive unique; deps store the real id case and a self-dep is refused;
       RUN:B is a task in another run of the same data dir; --parent onto merged/qa/done is refused;
@@ -635,7 +643,8 @@ class Store:
         # and the ready flag: mapping it to `ready` made the next load publish it as `planned`.
         if status == "planned" and t.get("ready"):
             status = "ready"
-        return {"id": t["id"], "parent": t.get("parent"), "type": "task",
+        return {"id": t["id"], "parent": t.get("parent"),
+                "type": t.get("type") or task_type_of(run, t),
                 "title": t.get("title") or "", "acceptance": t.get("acceptance"),
                 "owned": ",".join(owned) if isinstance(owned, list) else (owned or ""),
                 "deps": ",".join(deps) if isinstance(deps, list) else (deps or ""),
@@ -886,6 +895,12 @@ class Store:
             if status == "ready":
                 published = t["file_status"] if t["file_status"] in ("planned", "routed") else "planned"
                 status, ready = published, True
+            # D1.5.2: the store is the read source, so a truthy acceptance column overlays the
+            # file view here; an empty/absent one (legacy tasks carry acceptance="") adds no key,
+            # which keeps the first publish after `store enable` byte-identical to the imported
+            # run.json. `type` is NOT overlaid for the same reason (it is derived per row, so a
+            # legacy task would gain a key it never had); `task check` and the mirror derive it
+            # from the tree instead (task_type_of).
             extra.update({
                 "id": t["id"], "title": t["title"] or "", "parent": t["parent"],
                 "deps": deps, "owned": owned, "status": status,
@@ -894,6 +909,8 @@ class Store:
                 "ready": ready,
                 "agent": route.get("agent"), "model": route.get("model"), "effort": route.get("effort"),
             })
+            if t["acceptance"]:
+                extra["acceptance"] = t["acceptance"]
             if route.get("route"):
                 extra["route"] = route["route"]
             out.append(extra)
@@ -1576,17 +1593,30 @@ def cmd_run(a, st):
                 pid = str(ph.get("id") or "")
                 _, w = add_task(st, run, pid, ph.get("title") or pid, ph.get("wave"),
                                 ph.get("deps") or [], ph.get("owned") or [], None, a.by,
-                                {"plan_phase": pid, "route": ph.get("route") or None,
-                                 "lane_group": ph.get("lane_group") or None,
-                                 "reviewer": ph.get("reviewer") or ""})
+                                plan_field_extra({"plan_phase": pid, "route": ph.get("route") or None,
+                                                  "lane_group": ph.get("lane_group") or None,
+                                                  "reviewer": ph.get("reviewer") or ""}, ph, "phase"))
                 warnings += w
                 for c in ph.get("tasks") or []:
                     _, w = add_task(st, run, str(c.get("id") or ""), c.get("title") or c.get("id"),
-                                    ph.get("wave"), [], c.get("owned") or [], pid, a.by,
-                                    {"plan_task": c.get("id")})
+                                    ph.get("wave"), c.get("deps") or [], c.get("owned") or [], pid, a.by,
+                                    plan_field_extra({"plan_task": c.get("id")}, c, "task"))
                     warnings += w
+                    for s in c.get("subtasks") or []:
+                        _, w = add_task(st, run, str(s.get("id") or ""), s.get("title") or s.get("id"),
+                                        ph.get("wave"), s.get("deps") or [], s.get("owned") or [],
+                                        str(c.get("id") or ""), a.by,
+                                        plan_field_extra({}, s, "subtask"))
+                        warnings += w
             st.flush()
         return {"ok": True, "run": run, **({"warnings": warnings} if warnings else {})}
+    if a.action == "backfill-fields":
+        with st.locked():
+            st.repair()
+            run = st.load(a.run)
+            if not (run.get("plan_id") and run.get("plan")):
+                raise Fail(f"run {run['id']} has no plan link (run init --plan)")
+            return backfill_fields(st, run, a.by)
     a.run = a.run or getattr(a, "pos_id", None)
     if a.action == "get":
         with st.locked():
@@ -1813,6 +1843,8 @@ def add_task(st, run, tid, title, wave, deps, owned, parent, by, extra=None):
             if hits:
                 warnings.append(f"owned overlaps {ref} ({x.get('status')}): {', '.join(hits)}; "
                                 f"consider --deps {ref}")
+    # D1.5.1: the plan fields ride the file view too, so run.json tasks carry what the store
+    # has (acceptance/refs/type) and the mirror proves them instead of blanking them.
     t = {"id": tid, "title": title, "wave": wave, "deps": deps, "owned": owned, "parent": parent,
          "ready": False, "status": "planned", "agent": None, "model": None, "effort": None, "lane": None,
          "pane": None, "branch": None, "workspace": None, "slot": None,
@@ -1823,6 +1855,72 @@ def add_task(st, run, tid, title, wave, deps, owned, parent, by, extra=None):
     st.save(run, t, by)
     warnings += st.refresh_others(run, by)  # their boards show "blocks"; ready stays correct
     return t, warnings
+
+
+def task_type_of(run, t):
+    """D1.5.1/D1.5.2: the store column for one task — the plan's id when run init copied it
+    (a [[phase]] row is a phase, a [[phase.task.subtask]] row is a subtask), else derived from
+    the tree: no parent -> phase, a parent that is itself a phase -> task, deeper -> subtask.
+    A task row never pretends to be a bare task when the plan said otherwise."""
+    if t.get("type") in ("phase", "task", "subtask"):
+        return t["type"]
+    parent = t.get("parent")
+    if not parent:
+        return "phase"
+    p = next((x for x in run.get("tasks") or [] if x.get("id") == parent), None)
+    if p is not None and not p.get("parent"):
+        return "task"
+    return "subtask"
+
+
+def task_has_brief(st, run, t):
+    """True when this task has a brief file for any round (tasks/<T>/brief-r<N>.md). A task that
+    was already briefed owns files, so the check can require `owned` from that round on."""
+    d = st.task_dir(run["id"], t["id"])
+    try:
+        return any(re.fullmatch(r"brief-r\d+\.md", name) for name in os.listdir(d))
+    except OSError:
+        return False
+
+
+def task_check(st, run, t, at_dispatch=False):
+    """D1.5.4: the mandatory-field check for one task -> {"ok", "missing": [...], ...}.
+
+    Mandatory: title (every row); acceptance, parent and owned for a task (a phase is the
+    parent of tasks, it carries no acceptance and needs no parent); owned once the task has a
+    brief; and agent when the check runs at dispatch (--at-dispatch: the route dispatch records
+    must be there before an agent is prompted). `type` is the plan's own, else derived from the
+    tree (task_type_of) — a legacy run.json without the key is still classified, not skipped.
+    Read-only: nothing is written and no status moves."""
+    typ = task_type_of(run, t)
+    missing = []
+    if not (t.get("title") or "").strip():
+        missing.append("title")
+    if typ != "phase":
+        if not (t.get("acceptance") or "").strip():
+            missing.append("acceptance")
+        if not t.get("parent"):
+            missing.append("parent")
+    if task_has_brief(st, run, t) and not (t.get("owned") or []):
+        missing.append("owned")
+    if at_dispatch and not (t.get("agent") or "").strip():
+        missing.append("agent")
+    return {"ok": not missing, "task": t["id"], "type": typ, "missing": missing,
+            **({"at_dispatch": True} if at_dispatch else {})}
+
+
+def plan_field_extra(extra, src, kind):
+    """D1.5.1: the plan fields (acceptance/refs/type) a `run init --plan` / `plan sync --apply`
+    add copies onto the new run.json task. The plan tool (C3, a subprocess) is the only reader
+    of the plan file; mk-state consumes what its `parse` already returned. Phases carry no
+    acceptance (the plan has no acceptance key there); their route stays a file field."""
+    out = dict(extra or {})
+    out["type"] = kind
+    if kind in ("task", "subtask"):
+        out["acceptance"] = (src.get("acceptance") or "") or None
+        refs = src.get("refs") or []
+        out["refs"] = list(refs) if isinstance(refs, list) else ([refs] if refs else [])
+    return out
 
 
 def cmd_task(a, st):
@@ -1843,6 +1941,8 @@ def cmd_task(a, st):
             t, warnings = add_task(st, run, a.id, a.title, a.wave, csv(a.deps), csv(a.owned), a.parent, a.by)
             st.flush()
             return {"ok": True, "task": t, **({"warnings": warnings} if warnings else {})}
+        if a.action == "check":
+            return task_check(st, run, find_task(run, a.task), at_dispatch=getattr(a, "at_dispatch", False))
         t = find_task(run, a.task)
         cur = t["rounds"][-1] if t["rounds"] else None
         if a.action == "verify":
@@ -2238,13 +2338,19 @@ def cmd_plan(a, st):
                 if kind == "phase":
                     add_task(st, run, str(src.get("id") or ""), src.get("title") or src.get("id"),
                              src.get("wave"), src.get("deps") or [], src.get("owned") or [], None, a.by,
-                             {"plan_phase": src.get("id"), "route": src.get("route") or None,
-                              "lane_group": src.get("lane_group") or None,
-                              "reviewer": src.get("reviewer") or ""})
+                             plan_field_extra({"plan_phase": src.get("id"), "route": src.get("route") or None,
+                                               "lane_group": src.get("lane_group") or None,
+                                               "reviewer": src.get("reviewer") or ""}, src, "phase"))
                 else:
                     add_task(st, run, str(src.get("id") or ""), src.get("title") or src.get("id"),
-                             ph.get("wave"), [], src.get("owned") or [], str(ph.get("id") or ""), a.by,
-                             {"plan_task": src.get("id")})
+                             ph.get("wave"), src.get("deps") or [], src.get("owned") or [],
+                             str(ph.get("id") or ""), a.by,
+                             plan_field_extra({"plan_task": src.get("id")}, src, "task"))
+                    for s in src.get("subtasks") or []:
+                        add_task(st, run, str(s.get("id") or ""), s.get("title") or s.get("id"),
+                                 ph.get("wave"), s.get("deps") or [], s.get("owned") or [],
+                                 str(src.get("id") or ""), a.by,
+                                 plan_field_extra({}, s, "subtask"))
             for t, src, d, child in updates:
                 t["title"] = str(src.get("title") or t["title"])
                 if not child:
@@ -2340,6 +2446,94 @@ def cmd_lock(a, st):
     return {"ok": True, "state": lock_state(cur), "lock": cur}
 
 
+def backfill_fields(st, run, by):
+    """D1.5.5: one-shot `run backfill-fields` — fill the EMPTY file-view plan fields
+    (acceptance/refs/owned/deps/type/route) of this run's tasks from the approved plan.
+    Self-contained: it re-derives everything from the plan tool's `parse` (C3: mk-plan.py is
+    a subprocess, never imported) and from the run's own link columns (plan_phase/plan_task);
+    it does not depend on the D1.5.1 helpers. Nothing else is written: status/lane/round/
+    verdict/slot/branch/workspace/pane keep their values, agent/model/effort are not invented
+    and route_json stays whatever dispatch (D1.5.3) put there. The writes go through the
+    normal save path, so the store mirror and the run-doc artifact update together, and the
+    field list lands on the file view where the D1.5.2 merge-keep then protects it."""
+    cur = plan_tool("parse", st.plan_file(run))
+    by_phase = {str(t.get("plan_phase")).lower(): t for t in run["tasks"] if t.get("plan_phase")}
+    by_task = {str(t.get("plan_task")).lower(): t for t in run["tasks"] if t.get("plan_task")}
+    by_id = {str(t.get("id")).lower(): t for t in run["tasks"] if t.get("id")}
+
+    def _route_str(route):
+        # the plan's route string or dict -> the file-view string form "" or
+        # "<agent> <model> [<effort>]"; a dict contributes its string form, never route_json
+        if route in (None, ""):
+            return ""
+        if isinstance(route, dict):
+            return " ".join(str(route.get(k) or "") for k in ("agent", "model", "effort")
+                            if route.get(k)).strip()
+        return str(route)
+
+    def _list(v):
+        if v is None:
+            return []
+        return list(v) if isinstance(v, list) else [v]
+
+    filled, unmatched, already_full, n_fields = {}, [], 0, 0
+    items = []  # (kind, plan item, run task | None)
+    for ph in cur.get("phases") or []:
+        if not isinstance(ph, dict):
+            continue
+        pid = str(ph.get("id") or "")
+        t = by_phase.get(pid.lower()) or by_id.get(pid.lower())
+        items.append(("phase", ph, t))
+        for c in ph.get("tasks") or []:
+            if not isinstance(c, dict):
+                continue
+            cid = str(c.get("id") or "")
+            ct = by_task.get(cid.lower()) or by_id.get(cid.lower())
+            items.append(("task", c, ct))
+            for s in c.get("subtasks") or []:  # no plan_task link today: match by id only
+                if not isinstance(s, dict):
+                    continue
+                sid = str(s.get("id") or "")
+                items.append(("subtask", s, by_id.get(sid.lower())))
+    for kind, src, t in items:
+        if t is None:
+            unmatched.append(src.get("id"))
+            continue
+        fields = []
+        # a field is written only when the PLAN carries a value for it: an empty plan
+        # acceptance/refs/owned/deps/route fills nothing (and counts nothing), so the reply
+        # names the fields that actually moved and a second run finds no work left
+        if kind in ("task", "subtask") and not t.get("acceptance") and (src.get("acceptance") or ""):
+            t["acceptance"] = src["acceptance"]
+            fields.append("acceptance")
+        if kind in ("task", "subtask") and not t.get("refs") and _list(src.get("refs")):
+            t["refs"] = _list(src.get("refs"))
+            fields.append("refs")
+        if not t.get("owned") and _list(src.get("owned")):
+            t["owned"] = _list(src.get("owned"))
+            fields.append("owned")
+        if not t.get("deps") and _list(src.get("deps")):
+            t["deps"] = _list(src.get("deps"))
+            fields.append("deps")
+        if not t.get("type"):
+            t["type"] = kind
+            fields.append("type")
+        if not t.get("route") and _route_str(src.get("route")):
+            t["route"] = _route_str(src.get("route"))
+            fields.append("route")
+        if fields:
+            filled[t["id"]] = fields
+            n_fields += len(fields)
+        else:
+            already_full += 1
+    st.event(run, "note", f"backfill-fields: {len(filled)} tasks filled ({n_fields} fields)"
+             + (f", {len(unmatched)} unmatched" if unmatched else ""), by=by)
+    st.save(run)
+    st.flush()
+    return {"ok": True, "run": run["id"], "plan": run["plan_id"], "filled": filled,
+            **({"unmatched": unmatched} if unmatched else {}), "already_full": already_full}
+
+
 def cmd_render(a, st):
     with st.locked():
         st.repair()
@@ -2388,7 +2582,7 @@ def build_parser():
     sub = p.add_subparsers(dest="cmd", required=True)
 
     run = sub.add_parser("run").add_subparsers(dest="action", required=True)
-    for name in ("init", "list", "get", "set", "stage", "archive"):
+    for name in ("init", "list", "get", "set", "stage", "archive", "backfill-fields"):
         r = run.add_parser(name, parents=[data_p])
         r.add_argument("--id", "--run", dest="run", default=argparse.SUPPRESS)
         r.set_defaults(func=cmd_run)
@@ -2418,6 +2612,10 @@ def build_parser():
     t.add_argument("--undo", action="store_true")  # drop the latest (empty) round; kind checked in cmd
     t = task.add_parser("get", parents=[data_p, run_p])
     t.add_argument("task")
+    t = task.add_parser("check", parents=[data_p, run_p])
+    t.add_argument("task")
+    t.add_argument("--at-dispatch", action="store_true",
+                   help="also require a recorded agent (the route dispatch writes)")
     t = task.add_parser("verify", parents=[data_p, run_p])
     t.add_argument("task")
     t.add_argument("--tests", required=True, metavar="<passed>/<failed>",
@@ -2532,6 +2730,131 @@ PLAN_BASE = {"plan": "tplan", "status": "approved", "runs": [], "phases": [
      "route": "", "reviewer": "", "size": "standard", "risk": "reversible", "review": "light",
      "qa": [], "commit": "feat: b", "subagents": False, "lane_group": "A", "tasks": [
         {"id": "P2.1", "title": "Third", "acceptance": "a3", "refs": [], "subagent": False, "owned": []}]}]}
+
+def d15_self_test(tmp, env, pd, penv):
+    """D1.5 — run init copies the plan fields, the store mirror keeps them, the mandatory-field
+    check lists what is missing, and `run backfill-fields` fills a stripped run from the plan.
+
+    Own data dir (the fixture plan tool through $MK_PLAN_CMD, like the plan block above), so the
+    run.json / store round trip is exercised end to end and every assertion reads a real file."""
+    plan = {"plan": "d15", "status": "approved", "runs": [], "phases": [
+        {"id": "DP", "title": "Phase", "wave": 1, "deps": [], "owned": ["scripts/a.py"], "route": "",
+         "reviewer": "", "size": "standard", "risk": "reversible", "review": "light", "qa": [],
+         "commit": "", "subagents": False, "lane_group": "", "tasks": [
+             {"id": "DP.1", "title": "Child", "acceptance": "child done", "refs": ["scripts/a.py:1"],
+              "subagent": False, "owned": ["scripts/a.py"], "deps": [], "parallel": False,
+              "subtasks": [{"id": "DP.1.1", "title": "Leaf", "acceptance": "leaf done", "refs": [],
+                            "owned": ["scripts/a.py"], "deps": [], "parallel": False, "route": ""}]}]},
+        {"id": "DQ", "title": "Other", "wave": 2, "deps": ["DP"], "owned": [], "route": "",
+         "reviewer": "", "size": "standard", "risk": "reversible", "review": "light", "qa": [],
+         "commit": "", "subagents": False, "lane_group": "", "tasks": [
+             {"id": "DQ.1", "title": "Other child", "acceptance": "other done", "refs": [],
+              "subagent": False, "owned": [], "deps": [], "parallel": False}]}]}
+    pfile = os.path.join(tmp, "d15plan.json")
+    json.dump(plan, open(pfile, "w"))
+
+    def pk(*x, code=0):
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), *x, "--data", pd],
+                           capture_output=True, text=True, env=penv)
+        lines = r.stdout.strip().splitlines()
+        assert len(lines) == 1, (x, r.stdout, r.stderr)
+        assert r.returncode == code, (x, r.returncode, r.stdout, r.stderr)
+        return json.loads(lines[0])
+
+    # --- D1.5.1: run init --plan copies acceptance/refs/type (and the subtask becomes a row)
+    out = pk("run", "init", "--id", "d1", "--feature", "D15", "--branch", "b", "--plan", pfile)
+    tasks = {t["id"]: t for t in out["run"]["tasks"]}
+    assert set(tasks) == {"DP", "DP.1", "DP.1.1", "DQ", "DQ.1"}, sorted(tasks)
+    assert tasks["DP"]["type"] == "phase" and "acceptance" not in tasks["DP"], tasks["DP"]
+    assert tasks["DP.1"]["type"] == "task" and tasks["DP.1"]["acceptance"] == "child done", tasks["DP.1"]
+    assert tasks["DP.1"]["refs"] == ["scripts/a.py:1"] and tasks["DP.1"]["owned"] == ["scripts/a.py"], tasks["DP.1"]
+    assert tasks["DP.1.1"]["type"] == "subtask" and tasks["DP.1.1"]["parent"] == "DP.1", tasks["DP.1.1"]
+    assert tasks["DP.1.1"]["acceptance"] == "leaf done", tasks["DP.1.1"]
+    assert tasks["DQ"]["deps"] == ["DP"] and tasks["DQ"]["type"] == "phase", tasks["DQ"]
+    # task check reads the same fields: the subtask has everything; a phase needs no acceptance
+    assert pk("task", "check", "DP.1.1", "--run", "d1")["ok"] is True
+    assert pk("task", "check", "DP", "--run", "d1")["ok"] is True
+
+    # --- D1.5.4: task check lists the missing mandatory fields
+    pk("task", "add", "--id", "DBAD", "--title", "", "--run", "d1", code=2)  # title is mandatory at add
+    pk("task", "add", "--id", "DBAD", "--title", "no acceptance", "--parent", "DP", "--run", "d1")
+    chk = pk("task", "check", "DBAD", "--run", "d1")
+    assert chk["ok"] is False and "acceptance" in chk["missing"], chk
+    assert "title" not in chk["missing"] and chk["type"] == "task", chk  # a child of a phase is a task
+    chk = pk("task", "check", "DBAD", "--run", "d1", "--at-dispatch")
+    assert chk["ok"] is False and "agent" in chk["missing"] and chk["at_dispatch"] is True, chk
+    pk("task", "set", "DBAD", "agent=opencode")
+    assert pk("task", "check", "DBAD", "--run", "d1", "--at-dispatch")["missing"] == ["acceptance"]
+    # a briefed task must own files (the check reads the brief-rN.md on disk)
+    pk("task", "add", "--id", "DCH", "--title", "child", "--parent", "DP", "--run", "d1")
+    chk = pk("task", "check", "DCH", "--run", "d1")
+    assert chk["ok"] is False and chk["type"] == "task" and "acceptance" in chk["missing"], chk
+    assert "owned" not in chk["missing"], chk  # no brief yet -> owned is not required
+    os.makedirs(os.path.join(pd, "runs", "d1", "tasks", "DCH"), exist_ok=True)
+    open(os.path.join(pd, "runs", "d1", "tasks", "DCH", "brief-r1.md"), "w").write("# b\n")
+    assert "owned" in pk("task", "check", "DCH", "--run", "d1")["missing"]  # briefed -> owned
+    # a parentless row is a phase: no acceptance and no parent are required of it
+    pk("task", "add", "--id", "DPH", "--title", "phase-ish", "--run", "d1")
+    assert pk("task", "check", "DPH", "--run", "d1") == {"ok": True, "task": "DPH", "type": "phase",
+                                                        "missing": []}
+    assert "no task" in pk("task", "check", "NOPE", "--run", "d1", code=2)["error"]
+
+    # --- D1.5.5: backfill-fields fills a stripped run from the plan, twice is a no-op
+    def strip_run(run_id):
+        path = os.path.join(pd, "runs", run_id, "run.json")
+        doc = json.load(open(path))
+        for t in doc["tasks"]:
+            for k in ("acceptance", "refs", "type"):
+                t.pop(k, None)
+            t["owned"], t["deps"], t["route"] = [], [], None
+        json.dump(doc, open(path, "w"), indent=2)
+
+    strip_run("d1")
+    bf = pk("run", "backfill-fields", "--run", "d1")
+    assert bf["ok"] and "DP.1" in bf["filled"], bf
+    back = json.load(open(os.path.join(pd, "runs", "d1", "run.json")))
+    bt = {t["id"]: t for t in back["tasks"]}
+    assert bt["DP.1"]["acceptance"] == "child done" and bt["DP.1"]["type"] == "task", bt["DP.1"]
+    assert bt["DP.1.1"]["type"] == "subtask" and bt["DP"]["type"] == "phase", bt["DP.1.1"]
+    assert bt["DP"]["owned"] == ["scripts/a.py"] and bt["DP"]["deps"] == [], bt["DP"]  # DQ dep is on DQ
+    assert bt["DQ"]["deps"] == ["DP"] and bt["DQ"]["owned"] == [], bt["DQ"]
+    again = pk("run", "backfill-fields", "--run", "d1")
+    assert again["filled"] == {} and again["already_full"] >= 5, again  # idempotent
+    # a plan-less run is refused
+    pk("run", "init", "--id", "d2", "--feature", "no plan", "--branch", "b")
+    e = pk("run", "backfill-fields", "--run", "d2", code=2)
+    assert "no plan link" in e["error"], e
+
+    # --- D1.5.2 (store): run init --plan into a store; the rows keep the fields after three
+    # unrelated task-set writes, and the phase/subtask types land as phase/task/subtask.
+    sd = os.path.join(tmp, "d15store")
+
+    def sk(*x, code=0):
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), *x, "--data", sd],
+                           capture_output=True, text=True, env=penv)
+        lines = r.stdout.strip().splitlines()
+        assert len(lines) == 1 and r.returncode == code, (x, r.returncode, r.stdout, r.stderr)
+        return json.loads(lines[0])
+
+    sk("run", "init", "--id", "s", "--feature", "S", "--branch", "b")
+    sk("task", "add", "--id", "SX", "--title", "x")
+    sk("store", "enable")
+    json.dump(plan, open(pfile, "w"))  # the fixture plan tool set it `running` above: re-seed
+    sk("run", "init", "--id", "s2", "--feature", "Store plan", "--branch", "b2", "--plan", pfile)
+    for i in range(3):  # three unrelated writes: none carries the plan fields
+        sk("task", "set", "DP.1", "pane=w%d:p" % i, "--run", "s2")
+    con = _mkdb().open_project(os.path.join(sd, ".mk-home"), STORE_PROJECT, data_dir=sd)
+    try:
+        rows = {r["id"]: r for r in con.execute(
+            "SELECT id, type, acceptance, owned, deps FROM tasks WHERE run='s2'")}
+    finally:
+        con.close()
+    assert rows["DP"]["type"] == "phase", dict(rows["DP"])
+    assert rows["DP.1"]["type"] == "task" and rows["DP.1"]["acceptance"] == "child done", dict(rows["DP.1"])
+    assert rows["DP.1.1"]["type"] == "subtask", dict(rows["DP.1.1"])
+    assert rows["DP.1"]["owned"] == "scripts/a.py", dict(rows["DP.1"])
+    assert rows["DQ"]["deps"] == "DP", dict(rows["DQ"])
+
 
 def self_test():
     import shutil, subprocess
@@ -3492,6 +3815,7 @@ def self_test():
         assert rest["ok"] and rest["promoted"] == ["H2"], rest
         assert "promote_error" not in rest
 
+        d15_self_test(tmp, env, pd, penv)
         print("mk-state self-test ok")
         store_self_test(tmp, env)
         print("mk-state store self-test ok")
