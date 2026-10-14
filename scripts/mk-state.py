@@ -646,7 +646,9 @@ class Store:
                 "verdict": t.get("verdict"), "updated": t.get("updated")}
 
     def run_row(self, run):
-        return {"id": run["id"], "plan": run.get("plan"), "plan_version": None,
+        # runs.plan is the plan id (C5); the file path stays in the run doc. Writing the path here
+        # left a run started from plans/archive/<id>-v<n>.md unlinked from its plan.
+        return {"id": run["id"], "plan": run.get("plan_id") or run.get("plan"), "plan_version": None,
                 "branch": run.get("branch"), "status": run.get("status"),
                 "stage": str(run.get("stage")) if run.get("stage") is not None else None,
                 "next": run.get("next"), "started": run.get("started"), "ended": run.get("ended")}
@@ -1597,8 +1599,13 @@ def cmd_run(a, st):
         st.repair()
         run = st.load(a.run)
         if a.action == "set":
-            if a.next is None and a.status is None:
-                raise Fail("run set needs --next and/or --status")
+            if a.next is None and a.status is None and a.plan_id is None:
+                raise Fail("run set needs --next, --status and/or --plan-id")
+            if a.plan_id is not None:  # repair: link a run to its plan by id
+                if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,40}", a.plan_id):
+                    raise Fail(f"bad plan id {a.plan_id!r}")
+                run["plan_id"] = a.plan_id
+                st.event(run, "note", f"run linked to plan {a.plan_id}")
             if a.next is not None:
                 run["next"] = a.next
             if a.status:
@@ -2391,6 +2398,7 @@ def build_parser():
     r.add_argument("--feature"), r.add_argument("--branch"), r.add_argument("--plan")
     r.add_argument("--force", action="store_true")  # run init --plan: init an unapproved plan
     run.choices["set"].add_argument("--next")
+    run.choices["set"].add_argument("--plan-id", help="link the run to plan <id> (repair)")
     run.choices["set"].add_argument("--status", choices=("active", "done"),
                                     help="done promotes this run's merged/qa tasks; "
                                          "already-done is not a no-op, it promotes again "

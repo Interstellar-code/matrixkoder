@@ -1367,10 +1367,14 @@ def _runs_of(con, pid):
     whose leaf under a plans/ dir names the plan counts too. A plan id is a slug: no LIKE
     metacharacters reach the pattern.
     """
-    return con.execute(
-        "SELECT id, status FROM runs WHERE plan = ? OR plan = 'plans/' || ? || '.md'"
-        " OR plan LIKE '%/plans/' || ? || '.md' ORDER BY started DESC, rowid DESC",
-        (pid, pid, pid)).fetchall()
+    rows = con.execute(
+        "SELECT id, status, plan FROM runs WHERE plan = ? OR plan = 'plans/' || ? || '.md'"
+        " OR plan LIKE '%/plans/' || ? || '.md' OR plan LIKE '%plans/archive/' || ? || '-v%.md'"
+        " ORDER BY started DESC, rowid DESC",
+        (pid, pid, pid, pid)).fetchall()
+    # an archive copy plans/archive/<id>-v<n>.md links too; the regex keeps plan "a" off "a-v2-v1.md"
+    arch = re.compile(r"(?:^|/)plans/archive/" + re.escape(pid) + r"-v\d+\.md$")
+    return [r for r in rows if "plans/archive/" not in (r["plan"] or "") or arch.search(r["plan"])]
 
 
 def _hdr_of(row):
@@ -2680,6 +2684,20 @@ def _plans_query(home):
            f"alpha columns {a}")
     _check(a["runs"] == ["r2", "r1"], f"alpha runs {a['runs']}")  # newest first, decoy zz misses
     _check(a["live_run"] == "r2", f"alpha live_run {a['live_run']}")
+    # a run started from the archive copy links too; "alpha" never claims plan "alpha-v2"'s archive
+    con = open_project(home, data_dir=data)
+    try:
+        con.execute("INSERT INTO runs(id, plan, status, started) VALUES (?,?,?,?)",
+                    ("ra", ".matrixkoder/plans/archive/alpha-v1.md", "done", "2026-01-02T00:00:00Z"))
+        con.execute("INSERT INTO runs(id, plan, status, started) VALUES (?,?,?,?)",
+                    ("rx", "plans/archive/alpha-v2-v1.md", "done", "2026-01-02T00:00:00Z"))
+        con.commit()
+        _check([r["id"] for r in _runs_of(con, "alpha")] == ["r2", "r1", "ra"],
+               f"archive-path runs {[r['id'] for r in _runs_of(con, 'alpha')]}")
+        con.execute("DELETE FROM runs WHERE id IN ('ra', 'rx')")
+        con.commit()
+    finally:
+        con.close()
     _check(a["counts"] == {"planned": 2, "building": 1, "done": 1, "blocked": 1},
            f"alpha counts {a['counts']}")  # ph1 and loner are roots; old-t is another run
     _check(b["status"] == "draft" and b["created"] == "2026-02-02T00:00:00Z",
