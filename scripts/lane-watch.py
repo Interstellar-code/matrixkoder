@@ -89,6 +89,9 @@ _spec.loader.exec_module(lh)
 _cspec = importlib.util.spec_from_file_location("mk_config", os.path.join(HERE, "mk-config.py"))
 mk_config = importlib.util.module_from_spec(_cspec)
 _cspec.loader.exec_module(mk_config)
+_pspec = importlib.util.spec_from_file_location("mkpaths", os.path.join(HERE, "mkpaths.py"))
+mkpaths = importlib.util.module_from_spec(_pspec)
+_pspec.loader.exec_module(mkpaths)
 
 
 def cfg(key, flag=None):
@@ -97,8 +100,8 @@ def cfg(key, flag=None):
     if flag is not None:
         return flag
     try:
-        lines = mk_config.read_lines(os.path.join(
-            mk_config.mk_state.resolve_data(None), "matrixkoder.yaml"))
+        lines = mk_config.read_lines(mkpaths.project_yaml(
+            mk_config.mk_state.resolve_data(None)))
     except Exception:  # outside a repo / unreadable data dir: the schema default, never a crash
         lines = []
     return mk_config.value_of(lines, mk_config.row_for(lines, key))[1]
@@ -155,7 +158,7 @@ def running_task(text):
 
 def store_on(data):
     """True only when the project store already exists. Never creates mk.db (self-hosting guard)."""
-    return bool(data) and os.path.exists(os.path.join(data, "mk.db"))
+    return bool(data) and os.path.exists(mkpaths.project_db(data=data))
 
 
 def store_con(data):
@@ -532,11 +535,10 @@ def child_tasks(task, data, run=None):
         except Exception:
             return []
         return _leaves([{"id": r["id"], "parent": r["parent"]} for r in rows], task)
-    runs = os.path.join(data, "runs")
 
     def load(rid):
         try:
-            with open(os.path.join(runs, rid, "run.json")) as f:
+            with open(mkpaths.run_doc(data, rid)) as f:
                 j = json.load(f)
             return j if isinstance(j, dict) else None
         except (OSError, ValueError):
@@ -552,7 +554,7 @@ def child_tasks(task, data, run=None):
             return []
     else:
         try:
-            with open(os.path.join(runs, "index.json")) as f:
+            with open(mkpaths.runs_index(data)) as f:
                 actives = [r["id"] for r in json.load(f)
                            if isinstance(r, dict) and r.get("status") == "active" and r.get("id")]
         except (OSError, ValueError):

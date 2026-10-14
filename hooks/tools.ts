@@ -1,6 +1,7 @@
 // MatrixKoder model tools: mk_state, mk_usage and mk_bus (strict types)
 import type { EngineInterface, On, PluginOptions, ToolCallResult } from 'claude-code'
-import { candidateDirs, globalDirPath, join, mainCheckout, parseGitdir, parseJson, projectDataDir, projectDirFromStore, type MkProjectRow } from './data'
+import { join, parseJson } from './data'
+import { paths, resolveDataDir } from './paths'
 
 const ALLOWED_SUBCOMMANDS = new Set([
   'run',
@@ -55,106 +56,11 @@ const isOverrideFlag = (arg: string): boolean => {
   return OVERRIDE_FLAGS.some((b) => name === b || b.startsWith(name))
 }
 
-/** File-local copy of wake.ts's resolveDataDir: the loader forbids passing $ across an
- *  import (the same reason dashboard.tsx keeps its own copy), and mk_bus needs the same
- *  canonical rule — MATRIXKODER_DATA, else the nearest .git (never above $HOME), a linked
- *  worktree resolving to its main checkout, the root store (projects.json fallback) naming the dir, else
- *  <repo>/.matrixkoder. Pure helpers come from data.ts ($ may not cross an import). */
-
-/** The global dir ($MATRIXKODER_HOME, else ~/.matrixkoder). */
-async function globalDirOf($: EngineInterface, home: string | null): Promise<string | null> {
-  let envHome: string | undefined
-  try {
-    envHome = (await $.env.get('MATRIXKODER_HOME')) || undefined
-  } catch {
-    // env noun refused — the default global dir
-  }
-  return globalDirPath(envHome, home)
-}
-
-/** Root store first (`mkdb.py projects --json`), then projects.json. null = neither names this
- *  repo. A failed command, bad JSON or an empty list falls through to projects.json. The
- *  command is opt-in (`store`): a caller whose tests count every process.run leaves it off.
- *  File-local on purpose — the loader follows $ only into a function declared in this file. */
-async function listedDataDir($: EngineInterface, repoPaths: readonly string[], home: string | null, opts: { store?: boolean } = {}): Promise<string | null> {
-  const gdir = await globalDirOf($, home)
-  if (gdir == null) return null
-  if (opts.store === true) {
-    try {
-      const ran = await $.process.run(
-        ['python3', join($.plugin.root, 'scripts/mkdb.py'), 'projects', '--json', '--home', gdir],
-        { timeoutMs: 5000 },
-      )
-      if (ran.exitCode === 0) {
-        const parsed = parseJson(ran.stdout)
-        const rows = parsed !== null && typeof parsed === 'object' && 'projects' in parsed
-          ? (parsed as { projects?: unknown }).projects
-          : null
-        const fromStore = projectDirFromStore(Array.isArray(rows) ? rows as MkProjectRow[] : null, repoPaths, home)
-        if (fromStore != null) return fromStore
-      }
-    } catch {
-      // no python, or the command failed: projects.json still names the dir
-    }
-  }
-  try {
-    return projectDataDir(parseJson(await $.fs.read(join(gdir, 'projects.json'))), repoPaths, home)
-  } catch {
-    return null
-  }
-}
-
-async function resolveDataDir($: EngineInterface, opts: { store?: boolean } = {}): Promise<string> {
-  try {
-    const envData = await $.env.get('MATRIXKODER_DATA')
-    if (envData) return envData.trim()
-  } catch {
-    // env noun error
-  }
-  let cwd = '.'
-  try {
-    cwd = await $.session.cwd()
-  } catch {
-    // fallback
-  }
-  let home: string | undefined
-  try {
-    home = (await $.env.get('HOME')) || undefined
-  } catch {
-    // no HOME: the walk only stops at /
-  }
-
-  for (const dir of candidateDirs(cwd, home)) {
-    const gitPath = join(dir, '.git')
-    let kind: string | null = null
-    try {
-      kind = (await $.fs.stat(gitPath)).kind
-    } catch {
-      continue // no .git here — keep walking up
-    }
-    // nearest repo boundary: never use an ancestor's data
-    let top = dir
-    if (kind === 'file') {
-      try {
-        const gitdir = parseGitdir(await $.fs.read(gitPath))
-        if (gitdir) {
-          const gd = gitdir.startsWith('/') ? gitdir : join(dir, gitdir)
-          const commondir = await $.fs.read(join(gd, 'commondir'))
-          const main = mainCheckout(gd, commondir)
-          if (main) top = main
-        }
-      } catch {
-        // unreadable git file or no commondir: this checkout's own dir
-      }
-    }
-    // the root store names this repo's data dir; projects.json is the fallback; else <repo>/.matrixkoder
-    const listed = await listedDataDir($, [top], home ?? null, opts)
-    if (listed != null) return listed
-    return join(top, '.matrixkoder')
-  }
-
-  return join(cwd, '.matrixkoder')
-}
+/** mk_bus's --data comes from paths.ts's resolveDataDir (the ONE resolver, C1/L0):
+ *  MATRIXKODER_DATA, else the nearest .git (never above $HOME), a linked worktree resolving
+ *  to its main checkout, the root store (projects.json fallback) naming the dir, else
+ *  <repo>/.matrixkoder. The walk reads $ itself — the loader follows $ only into a function
+ *  declared in paths.ts, which every hook imports. */
 
 export function registerTools(on: On, _options: PluginOptions): void {
   on('session.start', { cwd: /.*/ }, async ($, e, next) => {
@@ -393,7 +299,16 @@ export function registerTools(on: On, _options: PluginOptions): void {
       }
 
       const scriptPath = `${pluginRoot}/scripts/mk-bus.py`
-      const dataDir = await resolveDataDir($, { store: true })
+      // $HOME stays an env read (no printenv fallback): a watch call must not spawn a
+      // process. The walk itself is paths.resolveDataDir's — mk_bus opts into the root
+      // store read (`store: true`), the same opt-in the tools' tests account for.
+      let home: string | null = null
+      try {
+        home = (await $.env.get('HOME')) || null
+      } catch {
+        // no HOME: the walk only stops at /
+      }
+      const dataDir = (await resolveDataDir($, { cwd, home, store: true })) ?? join(cwd, '.matrixkoder')
 
       // Single-quote a shell word. A newline or NUL cannot be quoted safely.
       const shellWord = (word: string): string | null => {
@@ -418,7 +333,7 @@ export function registerTools(on: On, _options: PluginOptions): void {
       // HTTP route (mk-bus.py serves /pending and /send only), so tail is CLI.
       let busConn: { port: number; token: string } | null = null
       try {
-        const raw = await $.fs.read(`${dataDir}/bus.json`)
+        const raw = await $.fs.read(paths.busFile(dataDir))
         const parsed = parseJson(raw)
         if (parsed !== null && typeof parsed === 'object') {
           const row = parsed as { port?: unknown; token?: unknown }

@@ -2,10 +2,14 @@
 // loading — data-dir resolution math, JSON parsing, shape coercion, text
 // sanitising, and the cross-module timer registry. Atoms and $-bound reads
 // live in the files that use them: the engine's scan reads a module's own
-// consts, and $ may not cross an import. wake.ts / tools.ts reuse the path
-// helpers so every module resolves the data dir by the same schema rule
-// (MATRIXKODER_DATA → nearest .git toplevel, a linked worktree → its main
-// checkout; ~/.matrixkoder is the GLOBAL dir, never project data).
+// consts, and $ may not cross an import.
+//
+// The RULES over these primitives (the data-dir order, the MK home names, the
+// file names under the data dir) are declared once in paths.ts (C1): the
+// dashboard, tools and wake import them from there. This file stays the pure
+// math they are built on — MATRIXKODER_DATA → nearest .git toplevel, a linked
+// worktree → its main checkout; ~/.matrixkoder is the GLOBAL dir, never
+// project data.
 import type { MkRun, MkRunIndexEntry, MkSnapshot, MkUsage } from '../types'
 
 export const PANE_ID = 'matrixkoder'

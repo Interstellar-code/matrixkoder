@@ -24,6 +24,7 @@ import argparse, datetime, json, os, re, subprocess, sys, tempfile
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mkdb  # the only module allowed to open a store read-write
+import mkpaths  # C1: every MK path (home rule, data-dir order, runs/plans folders)
 
 CATALOG_DDL = """
 CREATE TABLE IF NOT EXISTS agents(
@@ -75,12 +76,16 @@ def now():
 
 
 def home_of(arg):
-    return mkdb.resolve_home(arg)
+    """<home>/mk.db's home: mkpaths.home (C16) — the same rule mkdb.resolve_home applies, with
+    mkdb.check_home's synced-home refusal kept here (C11)."""
+    home = mkpaths.home(arg)
+    mkdb.check_home(home)
+    return home
 
 
 def store_path(home):
     """The root store file mkdb.open_root would create. Reads check this before opening."""
-    return os.path.join(home, "mk.db")
+    return mkpaths.root_db(home)
 
 
 def open_catalog(home):
@@ -406,7 +411,7 @@ def read_catalog(home):
     Checked before open_catalog so a read never creates the root store. Writers keep calling
     open_catalog directly.
     """
-    if not os.path.isfile(store_path(home)):
+    if not os.path.isfile(mkpaths.root_db(home)):
         return None
     return open_catalog(home)
 

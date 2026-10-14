@@ -45,6 +45,36 @@ import http.client
 import urllib.error
 import urllib.parse
 import urllib.request
+import importlib.util
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+MKPATHS_PY = os.path.join(os.path.dirname(HERE), "..", "..", "scripts", "mkpaths.py")
+
+
+def _mkpaths():
+    """scripts/mkpaths.py (C1, L0): the ONE module for every MK home / data-dir / store /
+    bus-file / lane-token path. Loaded by path, never imported — each script stands alone."""
+    global _mkpaths_mod
+    if _mkpaths_mod is None:
+        _mkpaths_mod = importlib.util.spec_from_file_location(
+            "mkpaths", os.path.abspath(MKPATHS_PY))
+        _mod = importlib.util.module_from_spec(_mkpaths_mod)
+        _mkpaths_mod.loader.exec_module(_mod)
+        _mkpaths_mod = _mod
+    return _mkpaths_mod
+
+
+_mkpaths_mod = None
+
+
+def _paths(name, *args, **kwargs):
+    """One mkpaths call by function name. mkpaths.Fail is a RuntimeError; mk-builder's Fail
+    carries its own code and extra fields, so the two are converted here — one place."""
+    mod = _mkpaths()
+    try:
+        return getattr(mod, name)(*args, **kwargs)
+    except mod.Fail as e:
+        raise Fail(str(e))
 
 FALLBACK_VERSION = "0.3.0"
 STATUS_NAME = ".matrixkoder-status.json"
@@ -901,11 +931,11 @@ SOURCES = ("status", "pane", "grace")
 FALSE_STALL_WINDOW = datetime.timedelta(minutes=10)  # the acceptance's "within 10 min"
 
 
-def parse_events(run_dir):
+def parse_events(data, run):
     """`events.jsonl` as a list of dicts; a torn line from a crash mid-append is skipped, not
     fatal (mk-state.py:355-365). A missing file is an empty run, not an error."""
     try:
-        with open(os.path.join(run_dir, "events.jsonl")) as f:
+        with open(_paths("events_doc", data, run)) as f:
             lines = f.read().splitlines()
     except OSError:
         return []
@@ -977,12 +1007,12 @@ def false_stall(se, events):
     return False
 
 
-def brief_counts(run_dir):
+def brief_counts(data, run):
     """Per task, each `brief-rN.md`'s lines (splitlines of the decoded bytes — equals `wc -l` on
     the newline-terminated briefs mk-state writes) and bytes (the file's size, `wc -c`). Only
     `brief-rN.md` counts: `task.json`, `review-brief-rN.md` and reports are not briefs. Rounds
     sort numerically, so brief-r10 follows brief-r2."""
-    tasks_dir = os.path.join(run_dir, "tasks")
+    tasks_dir = _paths("tasks_dir", data, run)
     out = {}
     try:
         names = sorted(os.listdir(tasks_dir))
@@ -1018,13 +1048,13 @@ def cmd_measure(a):
     data = os.path.abspath(a.data)
     if not os.path.isdir(data):
         raise Fail(f"data dir {data!r} does not exist [measure]")
-    run_dir = os.path.join(data, "runs", run)
+    run_dir = _paths("run_dir", data, run)
     if not os.path.isdir(run_dir):
         raise Fail(f"unknown run {run!r}: no {run_dir} directory [measure]")
     if store_present(data):
         events = measure_store(data, run)
     else:
-        events = parse_events(run_dir)
+        events = parse_events(data, run)
     by_source = {s: 0 for s in SOURCES}
     by_source["none"] = 0
     missed, stalls, questions = 0, [], []
@@ -1042,7 +1072,7 @@ def cmd_measure(a):
         elif state == "BLOCKED":
             questions.append(blocked_question(text))
     false = sum(1 for se in stalls if false_stall(se, events))
-    return ({"ok": True, "run": run, "data": data, "briefs": brief_counts(run_dir),
+    return ({"ok": True, "run": run, "data": data, "briefs": brief_counts(data, run),
              "verdicts_by_source": by_source, "missed_done_lines": missed,
              "stalls": len(stalls), "false_stalls": false,
              "blocked": len(questions), "blocked_questions": questions}, None)
@@ -1510,14 +1540,15 @@ def bus_refresh_cfg(lane, cfg):
     fresh = bus_lane_config(lane)
     if fresh:
         cfg.update(fresh)
-    home = os.environ.get("MK_BUS_DIR")
-    if not home:
-        data = bus_data_dir(cfg)
-        home = data if data and not store_present(data) else None
-    if home:
-        with contextlib.suppress(OSError, ValueError, TypeError):
-            with open(os.path.join(os.path.expanduser(home), "bus.json")) as f:
-                port = json.load(f).get("port")
+    data = bus_data_dir(cfg)
+    # Store mode with no pinned bus home: the token's own URL stands, exactly as before.
+    if not os.environ.get("MK_BUS_DIR") and (not data or store_present(data)):
+        return cfg
+    with contextlib.suppress(OSError, ValueError, TypeError):
+        # bus_json is the ONE bus-location rule (mkpaths, L0): the pinned bus home, or the
+        # data dir while there is no project store.
+        with open(_paths("bus_json", data)) as f:
+            port = json.load(f).get("port")
             if is_int(port) and 0 < port < 65536:
                 p = urllib.parse.urlparse(cfg["url"])
                 cfg["url"] = p._replace(netloc=f"{p.hostname or '127.0.0.1'}:{port}").geturl()
@@ -1962,15 +1993,11 @@ def _one_home():
 
     Returns the MK home or None when neither is set (the caller falls back to
     ~/.matrixkoder). When both are set they must agree, else Fail.
+    The rule itself lives in mkpaths (L0); the None spelling is this CLI's.
     """
-    mkh = os.environ.get("MK_HOME")
-    mch = os.environ.get("MATRIXKODER_HOME")
-    if mkh and mch:
-        left = os.path.realpath(os.path.abspath(os.path.expanduser(mkh)))
-        right = os.path.realpath(os.path.abspath(os.path.expanduser(mch)))
-        if left != right:
-            raise Fail(f"MK_HOME ({mkh}) and MATRIXKODER_HOME ({mch}) differ; set one MK home")
-    return mkh or mch
+    if not (os.environ.get("MK_HOME") or os.environ.get("MATRIXKODER_HOME")):
+        return None
+    return _paths("home")
 
 
 def bus_token_path(lane):
@@ -1979,22 +2006,10 @@ def bus_token_path(lane):
     Order: `MK_BUS_TOKEN_FILE` when set, else `<lane>/.matrixkoder-bus.json` when that
     file exists (file mode), else `<home>/bus-lanes/<sha256(realpath(lane))>.json`.
     The hash and the home are the same ones `scripts/mk-bus.py` writes: realpath,
-    full sha256, `$MK_BUS_DIR` or `$MK_HOME` or `~/.matrixkoder`.
-    """
-    env = os.environ.get("MK_BUS_TOKEN_FILE")
-    if env:
-        return os.path.expanduser(env)
-    lane_file = os.path.join(lane, BUS_LANE_FILE)
-    if os.path.isfile(lane_file):
-        return lane_file
-    if os.environ.get("MK_BUS_DIR"):
-        home = os.path.abspath(os.path.expanduser(os.environ["MK_BUS_DIR"]))
-    elif os.environ.get("MK_HOME") or os.environ.get("MATRIXKODER_HOME"):
-        # C16: either name, the same home mk-bus.py writes the token under
-        home = os.path.abspath(os.path.expanduser(_one_home()))
-    else:
-        home = os.path.join(os.path.expanduser("~"), ".matrixkoder")
-    return os.path.join(home, "bus-lanes", lane_hash(lane) + ".json")
+    full sha256, `$MK_BUS_DIR` or the MK home, or ~/.matrixkoder.
+    The rule itself is mkpaths.lane_token (C6, L0): the same one mk-bus.py and
+    mk-lane-event.py use."""
+    return _paths("lane_token", lane)
 
 
 def bus_read_token_file(path):
@@ -2066,13 +2081,13 @@ def resolve_data_dir(cfg, explicit=None):
 
 
 def store_present(data):
-    """Self-hosting guard: store mode only when <data>/mk.db already exists."""
-    return bool(data) and os.path.isfile(os.path.join(data, "mk.db"))
+    """Self-hosting guard: store mode only when the project store already exists."""
+    return bool(data) and os.path.isfile(_paths("project_db", data=data))
 
 
 def store_rows(data, sql, params=()):
     """SELECT-only against the project store. Read-only URI so a lane CLI cannot write it."""
-    uri = "file:" + os.path.join(data, "mk.db") + "?mode=ro"
+    uri = "file:" + _paths("project_db", data=data) + "?mode=ro"
     con = sqlite3.connect(uri, uri=True, timeout=5)
     con.row_factory = sqlite3.Row
     try:
@@ -2083,7 +2098,7 @@ def store_rows(data, sql, params=()):
 
 def todo_done_status(data):
     """C9: `session.todo_done_status` from <data>/matrixkoder.yaml, else the schema default."""
-    path = os.path.join(data or "", "matrixkoder.yaml")
+    path = _paths("project_yaml", data or "")
     try:
         with open(path) as f:
             text = f.read()
@@ -2216,7 +2231,7 @@ def brief_messages(cfg):
         except (OSError, sqlite3.Error):
             return []
         return [r.get("text") or "" for r in rows]
-    path = os.path.join(data, "runs", run, "bus.jsonl")
+    path = os.path.join(_paths("run_dir", data, run), "bus.jsonl")
     out = []
     try:
         with open(path) as f:
@@ -2377,7 +2392,7 @@ def cmd_connect(a):
         raw_brief = ""
         if cfg:
             for text in brief_messages(cfg) or _jsonl_texts(
-                    os.path.join(data or "", "runs", cfg.get("run") or "", "bus.jsonl"),
+                    os.path.join(_paths("run_dir", data or "", cfg.get("run") or ""), "bus.jsonl"),
                     cfg.get("task")):
                 if parse_brief_message(text):
                     raw_brief = text
@@ -2479,8 +2494,7 @@ def cmd_hook_install(a):
     """Dispatch-time hook install. Refuses to write inside the lane worktree."""
     lane = lane_dir(a)
     kind = check_agent(a.agent or detect_agent())
-    home = _one_home() or os.path.expanduser("~/.matrixkoder")
-    home = os.path.abspath(home)
+    home = _paths("home")
     if os.path.commonpath([home, os.path.abspath(lane)]) == os.path.abspath(lane):
         raise Fail("hook install must be outside the worktree [C8]")
     path = hook_install(kind, home)
@@ -4276,10 +4290,7 @@ def d7_answer(data, ask_id, text, to_task):
     """Post an answer with the orchestrator token. `mk-bus.py answer` reads bus.jsonl,
     which store mode does not write; the HTTP path is what the orchestrator actually uses.
     Store mode publishes bus.json in the MK home, not in the data dir."""
-    bus_json = os.path.join(data, "bus.json")
-    if not os.path.isfile(bus_json):
-        home = os.environ.get("MK_BUS_DIR") or _one_home() or os.path.expanduser("~/.matrixkoder")
-        bus_json = os.path.join(home, "bus.json")
+    bus_json = _paths("bus_json", data)
     with open(bus_json) as f:
         b = json.load(f)
     body = {"run": BUS_RUN, "task": to_task, "kind": "answer", "text": text,
