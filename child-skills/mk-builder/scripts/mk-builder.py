@@ -48,7 +48,50 @@ import urllib.request
 import importlib.util
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-MKPATHS_PY = os.path.join(os.path.dirname(HERE), "..", "..", "scripts", "mkpaths.py")
+# The plugin checkout's own layout: child-skills/mk-builder/scripts → <root>/scripts (C1).
+MKPATHS_PLUGIN_PY = os.path.join(os.path.dirname(HERE), "..", "..", "scripts", "mkpaths.py")
+
+
+def _repo_top():
+    """The nearest ancestor holding `.git` (a file in a worktree), stopping before $HOME —
+    the walk mkpaths.repo_top makes, inlined because mkpaths is the module being looked up.
+    None when no repo sits above this script."""
+    d, home = HERE, os.path.realpath(os.path.expanduser("~"))
+    while True:
+        if os.path.exists(os.path.join(d, ".git")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d or os.path.realpath(d) == home:
+            return None
+        d = parent
+
+
+def mkpaths_candidates():
+    """Where mkpaths.py may be, most specific first (C1, L0):
+    1. beside this script — a skill copy installed by `install`, which carries the module (D2);
+    2. the plugin checkout's scripts/ tree;
+    3. the repo this copy sits in — `.claude/skills/mk-builder/` inside the plugin checkout,
+       or a lane repo whose installed copy carries no sibling.
+    A lane repo with an installed skill reaches case 1; without case 3 nothing resolves.
+    """
+    out = [os.path.join(HERE, "mkpaths.py"), os.path.abspath(MKPATHS_PLUGIN_PY)]
+    top = _repo_top()
+    if top:
+        out.append(os.path.join(top, "scripts", "mkpaths.py"))
+    seen, uniq = set(), []
+    for p in out:
+        if p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    return uniq
+
+
+def mkpaths_path():
+    """The first candidate that exists, else the plugin path the error names."""
+    for p in mkpaths_candidates():
+        if os.path.isfile(p):
+            return p
+    return os.path.abspath(MKPATHS_PLUGIN_PY)
 
 
 def _mkpaths():
@@ -57,7 +100,7 @@ def _mkpaths():
     global _mkpaths_mod
     if _mkpaths_mod is None:
         _mkpaths_mod = importlib.util.spec_from_file_location(
-            "mkpaths", os.path.abspath(MKPATHS_PY))
+            "mkpaths", mkpaths_path())
         _mod = importlib.util.module_from_spec(_mkpaths_mod)
         _mkpaths_mod.loader.exec_module(_mod)
         _mkpaths_mod = _mod
@@ -870,6 +913,20 @@ def copy_skill(src, dest):
     return count
 
 
+def copy_mkpaths(dest):
+    """The ONE path module (C1, L0) rides with the installed skill: a lane repo has no
+    scripts/ tree of its own, and `connect` resolves every store/bus path through it. The
+    copy is refreshed on every install, so it cannot drift behind the skill it serves.
+    Returns the number of files written (0 or 1)."""
+    src = mkpaths_path()
+    if not os.path.isfile(src):
+        return 0
+    out = os.path.join(dest, "scripts", "mkpaths.py")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    shutil.copy2(src, out)
+    return 1
+
+
 def ensure_exclude(repo, line):
     """R2: the lane keeps its `.matrixkoder-*` and the installed skill out of `git status`. The
     line is appended once; an existing exclude file is never rewritten."""
@@ -903,9 +960,11 @@ def ensure_exclude(repo, line):
 
 def cmd_install(a):
     """D2: idempotent self-install for a child that lacks the skill; prints the version."""
-    dest = os.path.join(os.path.abspath(a.into), ".claude", "skills", "mk-builder")
+    into = os.path.abspath(a.into)
+    dest = os.path.join(into, ".claude", "skills", "mk-builder")
     count = copy_skill(skill_root(), dest)
-    ensure_exclude(os.path.abspath(a.into), ".claude/skills/mk-builder/")
+    count += copy_mkpaths(dest)
+    ensure_exclude(into, ".claude/skills/mk-builder/")
     return ({"ok": True, "installed": dest, "version": plugin_version(), "files": count}, None)
 
 
@@ -5429,6 +5488,35 @@ def t_e1_connect_names_the_fix_without_data(root):
     code, lines = cli(lane, "connect", env=env)
     assert code != 0, lines
     assert any("data" in ln for ln in lines), lines
+
+
+def t_install_carries_mkpaths_so_connect_resolves(root):
+    """D2 + C1: the installed skill is self-sufficient — `install` writes mkpaths.py beside
+    the script, so `connect` in a lane repo (no scripts/ tree of its own) resolves every
+    home/data/store/bus path through the ONE module instead of dying on a missing file.
+    A repo that never installed the skill resolves nothing; the failure names the path."""
+    into = mklane(root, "carry-repo")
+    code, lines = cli_raw("install", "--into", into)
+    assert code == 0 and len(lines) == 1, lines
+    dest = jline(lines)["installed"]
+    carried = os.path.join(dest, "scripts", "mkpaths.py")
+    assert os.path.isfile(carried), "install must carry mkpaths.py beside the script"
+    with open(carried, "rb") as f, open(mkpaths_path(), "rb") as g:
+        assert f.read() == g.read(), "the carried module must be the plugin's own"
+    lane = mklane(root, "carry-lane")
+    with open(os.path.join(lane, BUS_LANE_FILE), "w") as f:
+        json.dump({"v": 1, "url": "http://127.0.0.1:9", "token": "t",
+                   "run": "bb", "task": "E1C"}, f)
+    os.chmod(os.path.join(lane, BUS_LANE_FILE), 0o600)
+    script = os.path.join(dest, "scripts", "mk-builder.py")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("MK_")}
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    r = subprocess.run([sys.executable, script, "connect", "--lane", lane],
+                       capture_output=True, text=True, timeout=120, env=env)
+    out = [x for x in r.stdout.splitlines() if x.strip()]
+    assert r.returncode != 0, out
+    assert "FileNotFoundError" not in r.stderr, r.stderr
+    assert any("data" in ln for ln in out), out  # E1: the no-data refusal, not a load crash
 
 
 def t_e1_ask_id_first_then_resume(root):
