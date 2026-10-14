@@ -180,6 +180,17 @@ test('the title wraps, it is never cut', () => {
   expect(lines.join('\n')).not.toContain('Backfill route_json for dispatched tasks so cards and rows can show the lane and agent')
 })
 
+test('a long subtask line is cut inside the card and keeps its status word', () => {
+  const long = 'mkdb plans <id> --json: each task and subtask node carries lane slot, pane, branch, updated, acceptance, refs, owned, deps and the route'
+  const row: PlanTask = { ...FULL, subs: [{ id: 'V1.5.1', title: long, status: 'done', right: 'done' }] }
+  const lines = picture(row, 80).split('\n')
+  for (const l of lines) expect(l.length, l).toBeLessThanOrEqual(80)
+  const sub = lines.find(l => l.includes('V1.5.1'))
+  expect(sub).toBeDefined()
+  expect(sub!).toContain('…')
+  expect(sub!.trimEnd().endsWith('done │')).toBe(true)
+})
+
 test('esc close is pressable and fires onClose', () => {
   let closed = 0
   const drawn = PlanTaskPanel(stubEls(), FULL, 80, () => { closed += 1 })
@@ -215,10 +226,10 @@ test('report render: the D1.5 panel at 80 cols, exactly as pasted (V1.5)', () =>
 │ · scripts/mk-lane-event.py                                                   │
 │ · skills/matrixkoder/SKILL.md                                                │
 │ subtasks                                                                     │
-│ ◐ D1.5.1 run init --plan copies acceptance, refs, owned, deps, type, route i │
-│ ◐ D1.5.2 store mirror never blanks acceptance/owned/deps/route_json/type the │
+│ ◐ D1.5.1 run init --plan copies acceptance, refs, owned, deps, type…  review │
+│ ◐ D1.5.2 store mirror never blanks acceptance/owned/deps/route_json…  review │
 │ ◐ D1.5.3 dispatch records agent, model, effort on the task  review           │
-│ ◐ D1.5.4 mk-state task check: mandatory fields; dispatch refuses a task that │
+│ ◐ D1.5.4 mk-state task check: mandatory fields; dispatch refuses a …  review │
 │ ◐ D1.5.5 backfill settings-plans-db-r1 task fields from the plan  review     │
 │ ◐ D1.5.6 SKILL.md: task round and route recorded at dispatch  review         │
 │ esc close                                                                    │
@@ -246,12 +257,12 @@ test('report render: the D1.5 panel at 36 cols, exactly as pasted (V1.5)', () =>
 │ · scripts/mk-lane-event.py       │
 │ · skills/matrixkoder/SKILL.md    │
 │ subtasks                         │
-│ ◐ D1.5.1 run init --plan copies  │
-│ ◐ D1.5.2 store mirror never blan │
-│ ◐ D1.5.3 dispatch records agent, │
-│ ◐ D1.5.4 mk-state task check: ma │
-│ ◐ D1.5.5 backfill settings-plans │
-│ ◐ D1.5.6 SKILL.md: task round an │
+│ ◐ D1.5.1 run init --pla…  review │
+│ ◐ D1.5.2 store mirror n…  review │
+│ ◐ D1.5.3 dispatch recor…  review │
+│ ◐ D1.5.4 mk-state task …  review │
+│ ◐ D1.5.5 backfill setti…  review │
+│ ◐ D1.5.6 SKILL.md: task…  review │
 │ esc close                        │
 ╰──────────────────────────────────╯`)
 })

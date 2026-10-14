@@ -11,7 +11,7 @@
 import type { Elements, RenderElement } from 'claude-code'
 import { ActionButton, Card } from './kit'
 import { ROLE } from './palette'
-import { planStatusGlyph, planStatusRole } from './plan'
+import { clip, planStatusGlyph, planStatusRole } from './plan'
 import type { PlanPhase, PlanSub, PlanTask } from './plan'
 
 type Els = Elements[keyof Elements]
@@ -61,14 +61,15 @@ function fieldRow(els: Els, key: string, value: string): RenderElement {
   )
 }
 
-/** One subtask line: its status glyph in the role colour, `id title` (the
- *  title wraps, never cuts), and its status word dim on the right. */
-function subRow(els: Els, sub: PlanSub): RenderElement {
+/** One subtask line: its status glyph in the role colour, `id title` cut to
+ *  the card width (a wrapped title in a row ran past the border), and its
+ *  status word dim on the right. `W` is the card's inner width. */
+function subRow(els: Els, sub: PlanSub, W: number): RenderElement {
   const { Box, Text } = els
   return (
-    <Box flexDirection="row" gap={1}>
+    <Box key={`plan-task-sub-${sub.id}`} flexDirection="row" gap={1}>
       <Text color={ROLE[planStatusRole(sub.status)].fg}>{planStatusGlyph(sub.status)}</Text>
-      <Text wrap="wrap">{`${sub.id} ${sub.title}`}</Text>
+      <Text wrap="truncate-end">{clip(`${sub.id} ${sub.title}`, Math.max(1, W - sub.status.length - 4))}</Text>
       <Box flexGrow={1} />
       <Text dimColor={true}>{sub.status}</Text>
     </Box>
@@ -119,7 +120,7 @@ export function PlanTaskPanel(els: Els, row: PlanTask, cols: number, onClose?: (
       {row.subs != null && row.subs.length > 0 && (
         <Box flexDirection="column">
           <Text dimColor={true}>subtasks</Text>
-          {row.subs.map(sub => subRow(els, sub))}
+          {row.subs.map(sub => subRow(els, sub, Math.max(1, cols - 4)))}
         </Box>
       )}
       {ActionButton(els, {

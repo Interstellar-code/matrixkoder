@@ -145,7 +145,7 @@ const glyphOf = (status: string): string => STATUS_GLYPH[status] ?? '○'
 export const planStatusRole = roleOf
 export const planStatusGlyph = glyphOf
 
-function clip(text: string, w: number): string {
+export function clip(text: string, w: number): string {
   if (text.length <= w) return text
   return `${text.slice(0, Math.max(1, w) - 1)}…`
 }
