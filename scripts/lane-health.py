@@ -212,7 +212,8 @@ def banner_lines(text):
         if re.match(r'\s*\{\s*"error"\s*:', ln) and PROVIDER_RE.search(ln):
             out.append(ln)
             continue
-        if PROVIDER_OMP_RE.search(ln) and not _tool_block(lines, i):
+        if PROVIDER_OMP_RE.search(ln) and not _tool_block(lines, i) and not TOOL_LINE_RE.search(ln) \
+                and not CODE_LINE_RE.search(ln):  # a diff/code/grep line quoting the banner is not one
             out.append(ln)
             continue
         if _tool_block(lines, i) or TOOL_LINE_RE.search(ln):
@@ -503,7 +504,10 @@ def self_test_body(shutil):
                 '    assert classify("Usage limit reached for 5 hour", "idle", 1, 10)[0] == "QUOTA"',
                 "scripts/lane-health.py:20:QUOTA_RE = re.compile(r'(usage limit|limit reached|quota exceeded)')",
                 "+    msg = 'Individual quota reached. Resets in 154h43m'",
-                "    171→    weekly usage limit reached handling", "    if text == 'usage limit reached':"):
+                "    171→    weekly usage limit reached handling", "    if text == 'usage limit reached':",
+                "+    msg = 'OpenAI API key was rejected (401)'",
+                "scripts/lane-health.py:69:# 401 \"OpenAI API key was rejected (401)\" fail",
+                '    assert x == "OpenAI API billing limit reached (402)"'):
         assert classify(msg, "working", 1, 10)[0] == "OK", msg
 
     # only text since dispatch counts: old scrollback above the prompt marker is ignored
