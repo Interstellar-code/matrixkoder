@@ -35,6 +35,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tarfile
@@ -152,62 +153,82 @@ def _read_json(path):
         return None
 
 
-def busy_lanes(data):
-    """The lane registry's held slots for this data dir. Store mode reads `lane_slots` (rows are
-    truth); file mode reads lanes.json. Read-only: never republishes the view."""
+def _registry_rows(data):
+    """The lane registry as rows (slot, lane_path, state, run, task), or None when the registry is
+    genuinely absent (no store, no `lane_slots` table, no lanes.json).
+
+    Review R1 HIGH 2: a registry that exists but cannot be read is a C5 refusal, never a quiet
+    "no lanes". Every read failure — a corrupt/non-SQLite store, a store at the wrong schema
+    version, malformed lanes.json — becomes `Fail(..., 3)`; only true absence stays quiet."""
     db = src_db(data)
-    out = []
     if db and os.path.isfile(db):
-        con = mkdb._open_read(db, mkdb.SCHEMA)
+        try:
+            con = mkdb._open_read(db, mkdb.SCHEMA)
+        except sqlite3.Error as e:
+            raise Fail(f"lane registry unreadable (C5 refusal): {db}: {e}", 3)
+        except Exception as e:  # mkdb.Fail: newer or unmigrated schema
+            raise Fail(f"lane registry unreadable (C5 refusal): {db}: {e}", 3)
         if con is None:
-            return out
+            raise Fail(f"lane registry unreadable (C5 refusal): cannot open {db}", 3)
         try:
             if not _has_table(con, "lane_slots"):
-                return out
-            for row in con.execute("SELECT slot, lane_path, state, run, task FROM lane_slots"
-                                   " WHERE state='busy' ORDER BY slot"):
-                out.append(dict(row))
+                return None
+            return [dict(r) for r in con.execute(
+                "SELECT slot, lane_path, state, run, task FROM lane_slots ORDER BY slot")]
+        except Exception as e:
+            raise Fail(f"lane registry unreadable (C5 refusal): {db}: {e}", 3)
         finally:
             con.close()
-        return out
-    lanes = _read_json(mkpaths.lanes_file(data))
-    if isinstance(lanes, dict) and isinstance(lanes.get("slots"), dict):
-        for key, rec in lanes["slots"].items():
-            if isinstance(rec, dict) and rec.get("state") == "busy":
-                out.append({"slot": key, "lane_path": rec.get("path"), "state": "busy",
-                            "run": rec.get("run"), "task": rec.get("task")})
+    path = mkpaths.lanes_file(data)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as f:
+            lanes = json.load(f)
+    except (OSError, ValueError) as e:
+        raise Fail(f"lane registry unreadable (C5 refusal): {path}: {e}", 3)
+    if not isinstance(lanes, dict):
+        raise Fail(f"lane registry unreadable (C5 refusal): {path}: not a JSON object", 3)
+    out = []
+    for key, rec in (lanes.get("slots") or {}).items():
+        if not isinstance(rec, dict):
+            continue
+        out.append({"slot": key, "lane_path": rec.get("path"), "state": rec.get("state"),
+                    "run": rec.get("run"), "task": rec.get("task")})
     return out
+
+
+def busy_lanes(data):
+    """The lane registry's held slots for this data dir. Store mode reads `lane_slots` (rows are
+    truth); file mode reads lanes.json. Read-only: never republishes the view. An unreadable
+    registry refuses through `_registry_rows`."""
+    rows = _registry_rows(data) or []
+    return [{"slot": r["slot"], "lane_path": r.get("lane_path"), "state": "busy",
+             "run": r.get("run"), "task": r.get("task")}
+            for r in rows if r.get("state") == "busy"]
 
 
 def armed_lane_paths(data):
     """Slot worktrees holding `.matrixkoder-watch.json` — the watch file is what makes a lane
     armed (mk-lane-event's rule). Read-only; the registry supplies the paths."""
-    db = src_db(data)
-    paths = []
-    if db and os.path.isfile(db):
-        con = mkdb._open_read(db, mkdb.SCHEMA)
-        if con is not None:
-            try:
-                if _has_table(con, "lane_slots"):
-                    paths = [r["lane_path"] for r in con.execute(
-                        "SELECT lane_path FROM lane_slots WHERE lane_path IS NOT NULL")]
-            finally:
-                con.close()
-    else:
-        lanes = _read_json(mkpaths.lanes_file(data))
-        if isinstance(lanes, dict) and isinstance(lanes.get("slots"), dict):
-            paths = [v.get("path") for v in lanes["slots"].values() if isinstance(v, dict)]
-    return [p for p in paths if p and os.path.isfile(os.path.join(p, ".matrixkoder-watch.json"))]
+    rows = _registry_rows(data) or []
+    paths = [r.get("lane_path") for r in rows if r.get("lane_path")]
+    return [p for p in paths if os.path.isfile(os.path.join(p, ".matrixkoder-watch.json"))]
 
 
 def pending_asks(data):
     """Unanswered asks in the project store, through mk-bus's own reader (never a bus file).
-    This is the `/pending` rule: an ask with no answer naming it."""
-    store = mkbus.StoreAdapter(data)
-    asks = store.store_select(
-        "SELECT id, run, t FROM events WHERE chan='bus' AND kind='ask' ORDER BY id")
-    answers = store.store_select(
-        "SELECT reply_to FROM events WHERE chan='bus' AND kind='answer' AND reply_to IS NOT NULL")
+    This is the `/pending` rule: an ask with no answer naming it. An unreadable inbox is a C5
+    refusal (review R1 HIGH 2), never a traceback and never "no asks"."""
+    try:
+        store = mkbus.StoreAdapter(data)
+        asks = store.store_select(
+            "SELECT id, run, t FROM events WHERE chan='bus' AND kind='ask' ORDER BY id")
+        answers = store.store_select(
+            "SELECT reply_to FROM events WHERE chan='bus' AND kind='answer'"
+            " AND reply_to IS NOT NULL")
+    except Exception as e:
+        raise Fail(f"bus inbox unreadable: {e}", 3)
     answered = {a["reply_to"] for a in answers if a.get("reply_to")}
     return [a for a in asks if f"m-{a['id']}" not in answered]
 
@@ -328,9 +349,26 @@ def live_plans(con):
         " WHERE r.status IN ('running','active') ORDER BY p.id")]
 
 
-def plan_moves(data, home, slug, con, pid):
+def _safe_design_ref(repo, rel):
+    """A design reference resolved strictly inside `repo`, or None (review R1 HIGH 1).
+
+    `os.path.join` discards the base for an absolute `rel`, and `..` escapes it: either would
+    copy a file from outside the repo into the C2 store. Both sides go through `realpath`, so a
+    symlink cannot escape either (a symlinked repo prefix is fine). Only a path strictly inside
+    the repo is accepted; the caller lists the skipped ones on `--dry-run`."""
+    if not isinstance(rel, str) or not rel or os.path.isabs(rel):
+        return None
+    base = os.path.realpath(repo)
+    src = os.path.realpath(os.path.join(base, rel))
+    if src != base and not src.startswith(base + os.sep):
+        return None
+    return src
+
+
+def plan_moves(data, home, slug, con, pid, skips=None):
     """Every file of ONE live plan: plan.md, assets (the plan's own dir plus its design refs),
-    its archived versions, and the round files of every task of every run of the plan."""
+    its archived versions, and the round files of every task of every run of the plan. A design
+    ref that escapes the repo is skipped and its label appended to `skips`."""
     out = []
     tdir = mkpaths.target_plan_dir(slug, pid, home)
     pf = mkpaths.plan_file(data, pid)
@@ -343,9 +381,11 @@ def plan_moves(data, home, slug, con, pid):
                     "dst": os.path.join(tdir, "assets")})
     repo = os.path.dirname(os.path.abspath(data))
     for rel in (_header(con, pid).get("design") or []):
-        if not isinstance(rel, str) or not rel:
+        src = _safe_design_ref(repo, rel)
+        if src is None:
+            if skips is not None:
+                skips.append(f"plans/{pid}/assets/{rel!r} (outside the repo)")
             continue
-        src = os.path.join(repo, rel)
         if os.path.isfile(src):
             out.append({"label": f"plans/{pid}/assets/{os.path.basename(rel)}", "kind": "file",
                         "src": src, "dst": os.path.join(tdir, "assets", os.path.basename(rel))})
@@ -373,9 +413,10 @@ def plan_moves(data, home, slug, con, pid):
     return out
 
 
-def build_moves(data, home, slug, con):
+def build_moves(data, home, slug, con, skips=None):
     """Every non-DB move: project.yaml, watch-cursors.json, the lanes registry file (only when
-    the store carries no rows) and every live plan's files. The DB itself moves via copy_db."""
+    the store carries no rows) and every live plan's files. The DB itself moves via copy_db.
+    Design refs that escape the repo are appended to `skips` (reported by --dry-run)."""
     moves = []
     yaml = mkpaths.project_yaml(data)
     if os.path.isfile(yaml):
@@ -393,7 +434,7 @@ def build_moves(data, home, slug, con):
         moves.append({"label": "lanes.json", "kind": "file", "src": lanes_json,
                       "dst": os.path.join(target_dir(home, slug), "lanes.json")})
     for pid in live_plans(con):
-        moves += plan_moves(data, home, slug, con, pid)
+        moves += plan_moves(data, home, slug, con, pid, skips=skips)
     return moves
 
 
@@ -432,6 +473,15 @@ def _after_copy_hook():
         subprocess.run(cmd, shell=True, check=False)
 
 
+def _after_verify_hook():
+    """Test seam (never set in normal use): run a command after do_copy_verify returns and before
+    cmd_switch re-reads both stores under the lock, so a write landing in that window can be
+    injected (review R1 HIGH 3)."""
+    cmd = os.environ.get("MK_MIGRATE_AFTER_VERIFY")
+    if cmd:
+        subprocess.run(cmd, shell=True, check=False)
+
+
 # ---------- the copy + verify unit ----------
 
 def _prepare(args):
@@ -459,8 +509,9 @@ def do_copy_verify(home, data, slug, dry_run=False):
     con = open_ro(source)
     if con is None:
         raise Fail(f"cannot read {source}")
+    skips = []
     try:
-        moves = build_moves(data, home, slug, con)
+        moves = build_moves(data, home, slug, con, skips=skips)
         src_counts, src_digest = db_state(con)
     finally:
         con.close()
@@ -469,10 +520,12 @@ def do_copy_verify(home, data, slug, dry_run=False):
     if dry_run:
         for m in moves:
             print(f"{'verify' if existing else 'copy'} {m['src']} -> {m['dst']}")
+        for label in skips:
+            print(f"skip {label}: outside the repo")
         print(f"{'verify' if existing else 'copy'} {source} -> {dest}"
               f" (SQLite backup API, {sum(src_counts.values())} rows)")
         return {"ok": True, "command": "copy", "dry_run": True, "slug": slug, "data": data,
-                "target": dest, "moves": len(moves) + 1, "db_counts": src_counts}
+                "target": dest, "moves": len(moves) + 1, "skips": skips, "db_counts": src_counts}
 
     if existing:
         # a prior copy is present: verify it, never overwrite it silently.
@@ -549,6 +602,11 @@ def cmd_copy(args):
         quiesce(data)
         return do_copy_verify(home, data, slug, dry_run=True)
     ensure_root_row(home, slug, data, repo)
+    # Review R1 guard: a switched project re-copied would re-run the verify against the LIVE C2
+    # store and could suggest removing it. Refuse before any copy or _remove_new_copy runs.
+    row = root_row(home, slug)
+    if row and row.get("db_path"):
+        raise Fail(f"already migrated: projects.db_path = {row['db_path']}; use --rollback", 3)
     with switch_lock(home):
         quiesce(data)
         return do_copy_verify(home, data, slug)
@@ -569,10 +627,18 @@ def cmd_switch(args):
     with switch_lock(home):
         quiesce(data)
         out = do_copy_verify(home, data, slug)
+        _after_verify_hook()
         dest = mkpaths.target_project_db(slug, home)
         before = src_db(data)
         old_state = state_of(before)
         new_state = state_of(dest)
+        # Review R1 HIGH 3: re-assert equality under the lock, right before the switch. A write
+        # that landed on the source after the copy leaves the two stores different; switching
+        # then would record mismatched digests. No switch has happened yet, so the NEW copy is
+        # removed and projects.db_path stays NULL.
+        if old_state is None or new_state is None or old_state != new_state:
+            _remove_new_copy(home, slug)
+            raise Fail("verify under switch lock failed: source and target stores differ", 3)
         set_db_path(home, slug, dest)
         marker = {"slug": slug, "data_dir": os.path.realpath(data), "db_path": dest,
                   "old_digest": old_state[1], "old_counts": old_state[0],
@@ -840,12 +906,14 @@ def _last_json(text):
 def self_test():
     tmp = os.path.realpath(tempfile.mkdtemp(prefix="mk-migrate-test-"))
     saved = {k: os.environ.get(k) for k in
-             ("MK_HOME", "MATRIXKODER_HOME", "MK_SELFTEST", "MK_MIGRATE_AFTER_COPY")}
+             ("MK_HOME", "MATRIXKODER_HOME", "MK_SELFTEST", "MK_MIGRATE_AFTER_COPY",
+              "MK_MIGRATE_AFTER_VERIFY")}
     home = os.path.join(tmp, "home")
     repo = os.path.join(tmp, "repo")
     data = os.path.join(repo, ".matrixkoder")
     os.environ.update({"MK_HOME": home, "MATRIXKODER_HOME": home, "MK_SELFTEST": "1"})
     os.environ.pop("MK_MIGRATE_AFTER_COPY", None)
+    os.environ.pop("MK_MIGRATE_AFTER_VERIFY", None)
     checks = []
 
     def ok(name):
@@ -1052,15 +1120,156 @@ def self_test():
                "the refused switch left the NEW copy behind")
         ok("switch-refuses-mismatch")
 
-        # 10. mutation proofs (R13): each guard is shown load-bearing. A deliberately broken copy
-        # of this file (recall disabled / quiesce disabled / old-folder delete enabled) is run and
-        # shown to change the outcome — so the guard test is proven to catch the bad version.
+        # 10. review R1 HIGH 2: an unreadable lane registry or inbox REFUSES quiesce (never a
+        # quiet "no lanes", never a traceback). Each failure mode gets its own temp data dir.
+        # (a) corrupt lanes.json (file mode: no mk.db)
+        d = os.path.join(tmp, "badlanes")
+        os.makedirs(d, exist_ok=True)
+        with open(mkpaths.lanes_file(d), "w") as f:
+            f.write('{"corrupt')
+        try:
+            _registry_rows(d)
+            raise SystemExit("SELF-TEST FAIL: a corrupt lanes.json did not refuse")
+        except Fail as e:
+            _check(e.code == 3 and "unreadable" in str(e), f"corrupt lanes.json: {e}")
+        try:
+            quiesce(d)
+            raise SystemExit("SELF-TEST FAIL: quiesce passed with a corrupt lanes.json")
+        except Fail as e:
+            _check(e.code == 3 and "lane registry unreadable" in str(e), f"quiesce: {e}")
+        ok("quiesce-corrupt-lanes")
+
+        # (b) a non-SQLite mk.db: a named refusal, no traceback
+        d = os.path.join(tmp, "notadb")
+        os.makedirs(d, exist_ok=True)
+        with open(src_db(d), "wb") as f:
+            f.write(b"this is not a sqlite database at all" * 4)
+        try:
+            _registry_rows(d)
+            raise SystemExit("SELF-TEST FAIL: a non-SQLite mk.db did not refuse")
+        except Fail as e:
+            _check(e.code == 3 and "lane registry unreadable" in str(e), f"non-SQLite mk.db: {e}")
+        ok("quiesce-non-sqlite-db")
+
+        # (c) a store at the wrong schema version
+        d = os.path.join(tmp, "badschema")
+        hm = os.path.join(tmp, "badschema-home")
+        os.makedirs(d, exist_ok=True)
+        con = mkdb.open_project(hm, "bad", data_dir=d)
+        con.execute("INSERT INTO schema_version(version) VALUES (999)")
+        con.commit()
+        con.close()
+        try:
+            _registry_rows(d)
+            raise SystemExit("SELF-TEST FAIL: a newer schema version did not refuse")
+        except Fail as e:
+            _check(e.code == 3 and "lane registry unreadable" in str(e), f"wrong schema: {e}")
+        ok("quiesce-wrong-schema")
+
+        # (d) an unreadable inbox (the ask read) refuses, never "no asks"
+        try:
+            pending_asks(os.path.join(tmp, "notadb"))
+            raise SystemExit("SELF-TEST FAIL: an unreadable inbox did not refuse")
+        except Fail as e:
+            _check(e.code == 3 and "bus inbox unreadable" in str(e), f"unreadable inbox: {e}")
+        ok("quiesce-unreadable-inbox")
+
+        # 10b. review R1 HIGH 1: a plan `design` entry that escapes the repo is skipped; the
+        # in-repo entry still copies. /etc/hosts, ../../x and a symlink out of the repo.
+        d = os.path.join(tmp, "esc-repo", ".matrixkoder")
+        hm = os.path.join(tmp, "esc-home")
+        rp = os.path.dirname(d)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(rp, "inside.md"), "w") as f:
+            f.write("# inside\n")
+        os.symlink("/etc/hosts", os.path.join(rp, "escape-link"))
+        design = ["inside.md", "/etc/hosts", "../../x", "escape-link"]
+        root = mkdb.open_root(hm)
+        root.execute("INSERT OR IGNORE INTO projects(slug, name, repo, data_dir, mode, created,"
+                     " last_activity) VALUES ('esc','esc',?,?,?,?,?)",
+                     (rp, os.path.realpath(d), "home", now_iso(), now_iso()))
+        root.commit()
+        root.close()
+        con = mkdb.open_project(hm, "esc", data_dir=d)
+        con.execute("INSERT INTO plans(id, version, title, status, header_json) VALUES"
+                    " ('live', 1, 'L', 'running', ?)", (json.dumps({"design": design}),))
+        con.execute("INSERT INTO runs(id, plan, status, started) VALUES ('r1', 'live', 'active', 't')")
+        con.commit()
+        con.close()
+        rc, out, err = _cli(hm, ["--dry-run", "--slug", "esc", "--data", d])
+        _check(rc == 0, f"design dry-run rc={rc} {err[-400:]}")
+        _check(out.count("skip ") >= 3, f"escaped design refs were not reported: {out!r}")
+        _check("inside.md" in out, f"the in-repo design ref was skipped: {out!r}")
+        rc, out, err = _cli(hm, ["--slug", "esc", "--data", d])
+        _check(rc == 0, f"design copy rc={rc} {err[-400:]}")
+        assets = os.path.join(mkpaths.target_plan_dir("esc", "live", hm), "assets")
+        _check(os.path.isfile(os.path.join(assets, "inside.md")),
+               "the in-repo design ref was not copied")
+        _check(not os.path.exists(os.path.join(assets, "hosts")),
+               "an escaped design ref (/etc/hosts) was copied")
+        _check(not os.path.exists(os.path.join(assets, "x")),
+               "an escaped design ref (../..) was copied")
+        ok("design-ref-escape-skipped")
+
+        # 10c. review R1 HIGH 3: a write to the source AFTER do_copy_verify but before the state
+        # read makes the switch refuse; db_path stays NULL, no marker, the NEW copy is removed.
+        shutil.rmtree(mkpaths.target_project_dir("fixture", home), ignore_errors=True)
+        clear_db_path(home, "fixture")
+        pre_events = state_of(src_db(data))[0]["events"]
+        inject = ("import importlib.util, os; "
+                  "s = importlib.util.spec_from_file_location('m', os.path.join(%r, 'mkdb.py')); "
+                  "m = importlib.util.module_from_spec(s); s.loader.exec_module(m); "
+                  "m.append_event(os.environ['MK_MIGRATE_HOME'], 'fixture', 'r1', task='P1.1',"
+                  " chan='bus', kind='info', from_id='orch', to_id='P1.1', text='post-verify', data_dir=%r)"
+                  % (HERE, data))
+        rc, out, err = _cli(home, ["--switch", "--slug", "fixture", "--data", data],
+                            env={"MK_MIGRATE_AFTER_VERIFY": f"{sys.executable} -c {json.dumps(inject)}",
+                                 "MK_MIGRATE_HOME": home})
+        _check(rc == 3, f"a post-verify write did not refuse the switch (rc={rc}) {out[-200:]}")
+        _check("source and target stores differ" in (_last_json(out) or {}).get("error", ""),
+               f"wrong refusal: {out[-200:]}")
+        _check(root_row(home, "fixture")["db_path"] is None, "the refused switch set db_path")
+        _check(not os.path.exists(os.path.join(target_dir(home, "fixture"), SWITCH_MARKER)),
+               "the refused switch wrote a marker")
+        _check(not os.path.exists(mkpaths.target_project_db("fixture", home)),
+               "the refused switch left the NEW copy behind")
+        _check(state_of(src_db(data))[0]["events"] == pre_events + 1,
+               "the refused switch disturbed the old DB")
+        ok("switch-source-target-must-match")
+
+        # 10d. review R1 guard: a plain copy on an ALREADY switched project refuses, before any
+        # copy or _remove_new_copy, and leaves the live C2 store byte-identical. (Switch it back
+        # first, write to the new DB, then read the hash across the refused copy.)
+        shutil.rmtree(mkpaths.target_project_dir("fixture", home), ignore_errors=True)
+        clear_db_path(home, "fixture")
+        _check(_cli(home, ["--switch", "--slug", "fixture", "--data", data])[0] == 0,
+               "setup switch failed")
+        switched_db = mkpaths.target_project_db("fixture", home)
+        mkdb.append_event(home, "fixture", "r1", task="P1.1", chan="bus", kind="info",
+                          from_id="orch", to_id="P1.1", text="post-switch",
+                          data_dir=dest_dir_of(switched_db))
+        live_hash = _hash_file(switched_db)
+        rc, out, err = _cli(home, ["--slug", "fixture", "--data", data])
+        _check(rc == 3 and "already migrated" in (_last_json(out) or {}).get("error", ""),
+               f"copy on a switched project did not refuse (rc={rc}) {out[-200:]}")
+        _check(_hash_file(switched_db) == live_hash, "the refused copy changed the live C2 store")
+        _check(root_row(home, "fixture")["db_path"] == switched_db, "the refused copy cleared db_path")
+        ok("copy-refuses-after-switch")
+        shutil.rmtree(mkpaths.target_project_dir("fixture", home), ignore_errors=True)
+        clear_db_path(home, "fixture")
+
+        # 11. mutation proofs (R13): each guard is shown load-bearing. A deliberately broken copy
+        # of this file (recall disabled / quiesce disabled / old-folder delete enabled / switch
+        # equality skipped) is run and shown to change the outcome — so the guard test is proven
+        # to catch the bad version.
         _mutation_recount(home, data, tmp)
         ok("mutation-recount")
         _mutation_quiesce(home, data, tmp)
         ok("mutation-quiesce")
         _mutation_delete(home, data, tmp)
         ok("mutation-delete-old")
+        _mutation_switch_cmp(home, data, tmp)
+        ok("mutation-switch-cmp")
 
     finally:
         for k, v in saved.items():
@@ -1103,6 +1312,43 @@ def _run_mutant(path, home, args, env=None):
         e.update(env)
     proc = subprocess.run([sys.executable, path, *args], capture_output=True, text=True, env=e)
     return proc.returncode, proc.stdout, proc.stderr
+
+
+def _mutation_switch_cmp(home, data, tmp):
+    """(4) skip the source==target check under the switch lock: with the real file a post-verify
+    write refuses the switch (db_path stays NULL); with the broken file the switch commits a
+    mismatched copy anyway. The difference IS the proof (review R1 HIGH 3)."""
+    sandbox = os.path.join(tmp, "mut-switch")
+    mutant = _mutant([
+        ("        if old_state is None or new_state is None or old_state != new_state:\n"
+         "            _remove_new_copy(home, slug)\n"
+         '            raise Fail("verify under switch lock failed: source and target stores differ", 3)',
+         "        pass  # the mutation: source==target check removed"),
+    ], sandbox)
+    inject = ("import importlib.util, os; "
+              "s = importlib.util.spec_from_file_location('m', os.path.join(os.path.dirname(%r), 'mkdb.py')); "
+              "m = importlib.util.module_from_spec(s); s.loader.exec_module(m); "
+              "m.append_event(os.environ['MK_MIGRATE_HOME'], 'fixture', 'r1', task='P1.1',"
+              " chan='bus', kind='info', from_id='orch', to_id='P1.1', text='post-v', data_dir=%r)"
+              % (mutant, data))
+    env = {"MK_MIGRATE_AFTER_VERIFY": f"{sys.executable} -c {json.dumps(inject)}",
+           "MK_MIGRATE_HOME": home}
+    shutil.rmtree(mkpaths.target_project_dir("fixture", home), ignore_errors=True)
+    clear_db_path(home, "fixture")
+    rc_real, out_real, _ = _run_mutant(os.path.abspath(__file__), home,
+                                       ["--switch", "--slug", "fixture", "--data", data], env=env)
+    _check(rc_real == 3, f"mutation-switch-cmp: the real file did not refuse (rc={rc_real})")
+    _check(root_row(home, "fixture")["db_path"] is None,
+           "mutation-switch-cmp: the real file switched anyway")
+    shutil.rmtree(mkpaths.target_project_dir("fixture", home), ignore_errors=True)
+    clear_db_path(home, "fixture")
+    rc_broken, out_broken, _ = _run_mutant(mutant, home,
+                                           ["--switch", "--slug", "fixture", "--data", data], env=env)
+    _check(rc_broken == 0, f"mutation-switch-cmp: the broken version still refused (rc={rc_broken})")
+    _check(root_row(home, "fixture")["db_path"],
+           "mutation-switch-cmp: the broken version did not switch — the guard is not the thing tested")
+    shutil.rmtree(mkpaths.target_project_dir("fixture", home), ignore_errors=True)
+    clear_db_path(home, "fixture")
 
 
 def _mutation_recount(home, data, tmp):
