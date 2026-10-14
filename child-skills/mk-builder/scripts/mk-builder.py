@@ -576,29 +576,66 @@ def lane_pane(lane):
         return None
 
 
+def under_lane(cwd, lane):
+    """True when `cwd` is the lane itself or a directory under it, compared as real paths
+    (`/tmp` vs `/private/tmp` on macOS must not read as outside)."""
+    if not isinstance(cwd, str) or not cwd:
+        return False
+    real, base = os.path.realpath(cwd), os.path.realpath(lane)
+    return real == base or real.startswith(base.rstrip(os.sep) + os.sep)
+
+
+def pane_cwd(herdr_bin, pane):
+    """(cwd, why): the pane's cwd from `herdr agent get <pane>`, and why it is unknown when it
+    cannot be read. The reply is one JSON line whose cwd sits at `result.agent.cwd` (shape
+    captured from the real command; a last-line fallback covers pretty-printed replies)."""
+    try:
+        r = subprocess.run([herdr_bin, "agent", "get", pane], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, f"herdr agent get failed: {e}"
+    if r.returncode != 0:
+        return None, f"herdr agent get exit {r.returncode}"
+    for line in ([r.stdout] + r.stdout.strip().splitlines()[::-1]):
+        try:
+            cwd = json.loads(line)["result"]["agent"]["cwd"]
+        except (ValueError, KeyError, TypeError):
+            continue
+        return (cwd, None) if isinstance(cwd, str) and cwd else (None, "reply has no cwd")
+    return None, "reply has no result.agent.cwd"
+
+
 def cmd_check_run(a):
     """Hidden supervisor: run the command with output in the .out file, append `EXIT:<code>`,
     clear the check from the status file, then push the result. The bus refuses a lane token that
     sends `to` anyone but orch, so a bus ring of the lane itself is not possible: the result goes
     to orch as an `info`, and the lane is woken by typing the same line into its own pane
     (`herdr agent prompt`, pane from .matrixkoder-watch.json; $MK_BUILDER_HERDR overrides the
-    binary). Bus down or no pane: the out file and its EXIT line are the fallback (C12)."""
+    binary). The typing is gated on the pane's cwd being under the lane. Bus down or no pane: the
+    out file and its EXIT line are the fallback (C12)."""
     lane, name = lane_dir(a), a.name
     cmd = list(a.cmd or [])
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
     out_path = check_out_path(lane, name)
-    with open(out_path, "w") as f:
-        try:
-            rc = subprocess.Popen(cmd, cwd=lane, stdin=subprocess.DEVNULL, stdout=f,
-                                  stderr=subprocess.STDOUT).wait()
-        except OSError as e:
-            f.write(f"{e}\n")
-            rc = 127
-    with open(out_path, "a") as f:
-        f.write(f"EXIT:{rc}\n")
-    with contextlib.suppress(Exception):
-        set_check(lane, name, None)
+    rc = 127
+    try:
+        with open(out_path, "w") as f:
+            try:
+                rc = subprocess.Popen(cmd, cwd=lane, stdin=subprocess.DEVNULL, stdout=f,
+                                      stderr=subprocess.STDOUT).wait()
+            except OSError as e:
+                f.write(f"{e}\n")
+                rc = 127
+    except OSError:
+        rc = 127  # the out file cannot be opened; the finally still records EXIT and clears
+    finally:
+        # The EXIT line and the clear happen whatever the run did: a failed open() must not
+        # leave a check stuck in the status file with no way to see that it ended.
+        with contextlib.suppress(OSError):
+            with open(out_path, "a") as f:
+                f.write(f"EXIT:{rc}\n")
+        with contextlib.suppress(Exception):
+            set_check(lane, name, None)
     text = f"check {name} EXIT {rc}: {check_summary(out_path)}"
     cfg = bus_lane_config(lane)
     if cfg is not None:
@@ -606,10 +643,19 @@ def cmd_check_run(a):
             bus_send(cfg, "info", text)
     pane = lane_pane(lane)
     if pane:
-        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
-            subprocess.run([os.environ.get("MK_BUILDER_HERDR") or "herdr", "agent", "prompt", pane,
-                            f"{text} (full output: {out_path})"], stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=10)
+        herdr_bin = os.environ.get("MK_BUILDER_HERDR") or "herdr"
+        cwd, why = pane_cwd(herdr_bin, pane)
+        if cwd is not None and under_lane(cwd, lane):
+            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                subprocess.run([herdr_bin, "agent", "prompt", pane,
+                                f"{text} (full output: {out_path})"], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=10)
+        else:
+            # A pane that moved out of this lane (or whose cwd cannot be read) is someone
+            # else's: type nothing, and leave the reason in the check result file.
+            with contextlib.suppress(OSError):
+                with open(out_path, "a") as f:
+                    f.write(f"pane {pane}: not typed ({why or 'cwd outside the lane: ' + cwd})\n")
     return {"ok": True, "exit": rc}, None
 
 
@@ -5619,14 +5665,13 @@ def t_check_pushes_result(root):
     lane = bus_lane(root, "chk_lane", "CHK", data)
     begin(lane, root, task="CHK")
     fake = os.path.join(root, "chk-herdr")
-    with open(fake, "w") as f:
-        f.write("#!/bin/sh\necho \"$@\" >> \"$0.log\"\n")
-    os.chmod(fake, 0o755)
+    fake_herdr(fake)
     with open(os.path.join(lane, ".matrixkoder-watch.json"), "w") as f:
         json.dump({"pane": "wX:p1"}, f)
     t0 = time.time()
     code, lines = cli_raw("check", "--lane", lane, "--name", "unit", "--", "sh", "-c",
-                          "sleep 1; echo ok; exit 3", env={"MK_BUILDER_HERDR": fake})
+                          "sleep 1; echo ok; exit 3",
+                          env={"MK_BUILDER_HERDR": fake, "FAKE_HERDR_CWD": os.path.realpath(lane)})
     assert code == 0 and time.time() - t0 < 0.9, (code, lines, time.time() - t0)
     out = jline(lines)
     assert out["ok"] and out["out"].endswith(".matrixkoder-check-unit.out"), out
@@ -5648,6 +5693,111 @@ def t_check_pushes_result(root):
     assert "agent prompt wX:p1 check unit EXIT 3: ok" in open(fake + ".log").read()
     code, lines = cli_raw("check", "--lane", lane, "--name", "bad name", "--", "true")
     assert code != 0, lines
+
+
+# `herdr agent get <pane>` reply, captured verbatim on 2026-10-14 in the mk-4 lane
+# (`herdr agent get w1Q:p1`, one JSON line on stdout). The fake runner swaps ONLY
+# `result.agent.cwd`, so the gate is exercised against the real reply shape.
+HERDR_AGENT_GET_REPLY = (
+    '{"id":"cli:agent:get","result":{"agent":{"agent":"omp","agent_session":{"agent":"omp",'
+    '"kind":"path","source":"herdr:omp","value":"/Users/rohits/.omp/agent/sessions/'
+    '-Development-matrixkoder-mk-4/2026-10-14T19-09-31-597Z_01a13bd1-dc4d-7493-a84c-69a80cd8e84d.jsonl"},'
+    '"agent_status":"working","cwd":"/Users/rohits/Development/matrixkoder-mk-4","focused":false,'
+    '"foreground_cwd":"/Users/rohits/Development/matrixkoder-mk-4","interactive_ready":true,'
+    '"name":"o2-build-r1","pane_id":"w1Q:p1","revision":67685,"screen_detection_skipped":true,'
+    '"state_change_seq":3911,"tab_id":"w1Q:t1","terminal_id":"term_65d90101a9ae550",'
+    '"terminal_title":"\\u03c0 \\u2839 \\ud83d\\udeaa MKBLDR: Start MK builder phase B1",'
+    '"terminal_title_stripped":"\\u03c0 \\u2839 \\ud83d\\udeaa MKBLDR: Start MK builder phase B1",'
+    '"workspace_id":"w1Q"},"type":"agent_info"}}'
+)
+
+
+def fake_herdr(path):
+    """A fake `herdr` binary: `agent get` prints the captured reply with its cwd taken from
+    $FAKE_HERDR_CWD; `agent prompt` appends its argv to <path>.log. No real herdr call."""
+    with open(path, "w") as f:
+        f.write(
+            "#!/bin/sh\n"
+            'case "$2" in\n'
+            '  get) python3 -c \'import json,os,sys;d=json.load(open(sys.argv[1]));'
+            'd["result"]["agent"]["cwd"]=os.environ["FAKE_HERDR_CWD"];print(json.dumps(d))\' '
+            '"$0.fixture" ;;\n'
+            '  prompt) echo "$@" >> "$0.log" ;;\n'
+            'esac\n')
+    os.chmod(path, 0o755)
+    with open(path + ".fixture", "w") as f:
+        f.write(HERDR_AGENT_GET_REPLY)
+
+
+def t_check_run_open_failure_still_writes_exit(root):
+    """(a) A failed open() of the check out file still leaves the EXIT line and clears the
+    check: the supervisor's finally owns both. The real cmd_check_run runs in a child
+    interpreter whose builtins.open fails the write-mode open of that one path."""
+    lane = os.path.join(root, "openfail_lane")
+    os.makedirs(lane)
+    begin(lane, root, task="OFR")
+    out = check_out_path(lane, "unit")
+    set_check(lane, "unit", {"pid": os.getpid(), "started": time.time(), "out": out})
+    assert status(lane).get("checks"), status(lane)
+    code = ("import builtins,importlib.util as u;s=u.spec_from_file_location('m',%r);"
+            "m=u.module_from_spec(s);s.loader.exec_module(m);"
+            "o=m.check_out_path(%r,'unit');r=builtins.open;"
+            "f=lambda p,mo='r',*a,**k:(_ for _ in ()).throw(OSError(28,'No space left on device'))"
+            " if (str(p)==o and 'w' in mo) else r(p,mo,*a,**k);"
+            "builtins.open=f;"
+            "print(m.cmd_check_run(m.build_parser().parse_args(['_check-run','--lane',%r,"
+            "'--name','unit','--','true']))[0]['exit'])") % (
+        os.path.abspath(__file__), lane, lane)
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert r.stdout.strip().splitlines()[-1] == "127", r.stdout
+    assert open(out).read().splitlines()[-1] == "EXIT:127", open(out).read()
+    assert not status(lane).get("checks"), status(lane)
+
+
+def t_check_result_typed_only_into_a_pane_in_the_lane(root):
+    """(b) A finished check's result is typed into the lane's pane only while that pane's
+    cwd is under the lane. Inside: one `agent prompt`. Outside: nothing typed, and the out
+    file says why. The herdr runner is the fake above, fed the captured real reply."""
+    fake = os.path.join(root, "cwdbg-herdr")
+    fake_herdr(fake)
+    outside = os.path.join(root, "cwdbg-outside")
+    os.makedirs(outside)
+    for name, cwd_is_lane, typed in (("in", True, True), ("out", False, False)):
+        lane = os.path.join(root, f"cwdbg_{name}")
+        os.makedirs(lane)
+        begin(lane, root, task="CWD")
+        with open(os.path.join(lane, ".matrixkoder-watch.json"), "w") as f:
+            json.dump({"pane": "wQ:p1"}, f)
+        if os.path.exists(fake + ".log"):
+            os.remove(fake + ".log")  # the log is per case: `prompt` lines carry the name
+        pane_cwd = os.path.realpath(lane if cwd_is_lane else outside)
+        env = {"MK_BUILDER_HERDR": fake, "FAKE_HERDR_CWD": pane_cwd}
+        # --lane BEFORE the subcommand: `check` takes a REMAINDER, so a trailing --lane would
+        # be swallowed into the command and the check would run in this process's cwd.
+        code, lines = cli_raw("check", "--lane", lane, "--name", name, "--", "sh", "-c", "echo ok",
+                              env=env)
+        assert code == 0, lines
+        path = jline(lines)["out"]
+        # Wait for the verdict, not just the EXIT line: the pane step runs after it, and for
+        # the typed case the only evidence is the fake herdr's prompt log.
+        want = f"agent prompt wQ:p1 check {name} EXIT 0: ok"
+        end = time.time() + 30
+        while time.time() < end:
+            body = open(path).read() if os.path.exists(path) else ""
+            logged = open(fake + ".log").read() if os.path.exists(fake + ".log") else ""
+            done = (want in logged) if typed else ("not typed" in body)
+            if "EXIT:" in body and done:
+                break
+            time.sleep(0.1)
+        text, logged = open(path).read(), open(fake + ".log").read() if os.path.exists(fake + ".log") else ""
+        assert "EXIT:0" in text, text
+        if typed:
+            assert want in logged, (logged, text)
+        else:
+            assert logged == "", (logged, text)
+            # the pane cwd is compared as a real path, so the message carries the realpath
+            assert f"pane wQ:p1: not typed (cwd outside the lane: {os.path.realpath(outside)})" in text, text
 
 
 def t_e1_listen_then_inbox_acks_once(root):

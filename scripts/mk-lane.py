@@ -661,8 +661,12 @@ def clean_state(path, cfg):
     byte or a leading `:`, and a quoted path matches nothing and reads as untracked. The flags are on
     the command line on purpose — `status.showUntrackedFiles=no` in the user's config would otherwise
     hide `??` lines, and this check is the only thing standing between a hidden untracked file and
-    `git worktree remove`."""
-    r = run_cmd(["git", "-C", path, "status", "--porcelain=v1", "-z", "--ignored",
+    `git worktree remove`.
+
+    `--no-optional-locks`: this is a read-only poll that runs on every status and acquire, and
+    without the flag git may take the index lock for it. A poll must never block a real
+    `git add` in the same worktree."""
+    r = run_cmd(["git", "--no-optional-locks", "-C", path, "status", "--porcelain=v1", "-z", "--ignored",
                  "--untracked-files=normal", "--ignore-submodules=none"], 60)
     if r.returncode != 0:
         raise Fail(f"git status in {path} failed", stderr=(r.stderr or r.stdout).strip()[:400])
@@ -2760,6 +2764,25 @@ def self_test():
         write(os.path.join(hud, ".omc", "plans", "p.md"), "plan\nedited\n")
         ok, dirty = clean_state(hud, hud_cfg)
         assert not ok and any(".omc/plans/p.md" in line for line in dirty), dirty
+
+        # A status poll must never take the index lock: the argv git is asked for carries
+        # --no-optional-locks. A repo of its own, so the assertion does not depend on what the
+        # cases above left behind, and the runner is injected so the assertion is on that argv
+        # rather than on whether this git build happens to lock anything.
+        lock_repo = os.path.join(tmp, "lock-repo")
+        os.makedirs(lock_repo)
+        gl = lambda *a: g(*a, cwd=lock_repo)
+        gl("init", "-q")
+        seen_argv = []
+        real_run_cmd = globals()["run_cmd"]
+        try:
+            globals()["run_cmd"] = lambda cmd, timeout=GIT_TIMEOUT: (
+                seen_argv.append(list(cmd)) or real_run_cmd(cmd, timeout))
+            assert clean_state(lock_repo, {"disposable": [], "copy": []})[0]
+        finally:
+            globals()["run_cmd"] = real_run_cmd
+        status_argv = [a for a in seen_argv if "status" in a]
+        assert status_argv and all("--no-optional-locks" in a for a in status_argv), status_argv
 
         # status: facts from git + status file + herdr, no agent asked (pure helpers, then real git)
         assert parse_ctx_pct("x 465.4K (44%) · $1\n 12K (7%)") == 7 and parse_ctx_pct("nothing") is None
