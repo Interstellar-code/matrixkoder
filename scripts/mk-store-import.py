@@ -23,6 +23,7 @@ import argparse, hashlib, json, os, re, shutil, subprocess, sys, tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mkdb  # the only writer; this script never opens sqlite itself
+import mkpaths  # C1: every MK path (home rule, data-dir order, runs/plans folders)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REAL_BUS = "/Users/rohits/Development/matrixkoder/.matrixkoder"
@@ -54,8 +55,8 @@ def check_run_id(run_id):
 def run_dir_of(data, run_id):
     """The run directory, refused when it is a symlink that escapes <data>/runs."""
     check_run_id(run_id)
-    runs = os.path.realpath(os.path.join(data, "runs"))
-    path = os.path.join(data, "runs", run_id)
+    runs = os.path.realpath(mkpaths.runs_dir(data))
+    path = mkpaths.run_dir(data, run_id)
     real = os.path.realpath(path)
     if os.path.islink(path) or not (real == runs or real.startswith(runs + os.sep)):
         if os.path.islink(path) or not real.startswith(runs + os.sep):
@@ -71,16 +72,13 @@ def resolve_import_home(arg, allow_real):
     """Temp home by default. The real ~/.matrixkoder is refused unless explicitly allowed.
 
     One MK home rule (C16): $MK_HOME and $MATRIXKODER_HOME are the same setting;
-    when both are set they must agree."""
-    mkh = os.environ.get("MK_HOME")
-    mch = os.environ.get("MATRIXKODER_HOME")
-    if mkh and mch:
-        left = os.path.realpath(os.path.abspath(os.path.expanduser(mkh)))
-        right = os.path.realpath(os.path.abspath(os.path.expanduser(mch)))
-        if left != right:
-            raise Fail(f"MK_HOME ({mkh}) and MATRIXKODER_HOME ({mch}) differ; set one MK home")
-    home = os.path.realpath(os.path.abspath(os.path.expanduser(
-        arg or mkh or mch or "~/.matrixkoder")))
+    when both are set they must agree (mkpaths.home, C1). This copy then realpaths and
+    abspaths the answer and keeps mkdb.check_home's refusal, as it always did."""
+    try:
+        home = mkpaths.home(arg)
+    except mkpaths.Fail as e:
+        raise Fail(str(e))
+    home = os.path.realpath(os.path.abspath(os.path.expanduser(home)))
     if home == real_home() and not allow_real:
         raise Fail("refusing the real ~/.matrixkoder; pass --allow-real-home to override")
     mkdb.check_home(home)
@@ -163,7 +161,7 @@ def _deps_of_task(task, by_id, run_id):
 def load_run(data, run_id):
     """Read one legacy run. Nothing here writes. The run id is checked before the path is built."""
     run_dir = run_dir_of(data, run_id)
-    run_path = os.path.join(run_dir, "run.json")
+    run_path = mkpaths.run_doc(data, run_id)
     if not os.path.isfile(run_path):
         raise Fail(f"no run.json for {run_id}")
     if not inside(run_dir, run_path):
@@ -212,7 +210,7 @@ def load_run(data, run_id):
             "updated": t.get("updated") or doc.get("updated"),
         })
     events, skipped, skip_reasons = [], 0, []
-    ev_path = os.path.join(run_dir, "events.jsonl")
+    ev_path = mkpaths.events_doc(data, run_id)
     if os.path.isfile(ev_path):
         if not inside(run_dir, ev_path):
             raise Fail(f"events.jsonl for {run_id} escapes the run dir")
@@ -246,7 +244,7 @@ def load_run(data, run_id):
                     "meta_json": json.dumps({"by": ev.get("by"), "line": n}),
                 })
     artifacts, skipped_artifacts = [], []
-    tasks_dir = os.path.join(run_dir, "tasks")
+    tasks_dir = mkpaths.tasks_dir(data, run_id)
     if os.path.isdir(tasks_dir):
         for dirpath, dirs, files in os.walk(tasks_dir):
             dirs.sort()
@@ -290,12 +288,12 @@ def load_run(data, run_id):
 
 def source_counts(data):
     """Count what the importer will read, without writing."""
-    runs_dir = os.path.join(data, "runs")
+    runs_dir = mkpaths.runs_dir(data)
     counts = {"runs": 0, "tasks": 0, "events": 0, "artifacts": 0, "skipped_events": 0}
     if not os.path.isdir(runs_dir):
         return counts
     for name in sorted(os.listdir(runs_dir)):
-        if not os.path.isfile(os.path.join(runs_dir, name, "run.json")):
+        if not os.path.isfile(mkpaths.run_doc(data, name)):
             continue
         try:
             _, tasks, events, artifacts, skipped, _, _, _ = load_run(data, name)
@@ -414,12 +412,12 @@ def import_one(home, project, data, run_id):
 
 
 def _run_names(data):
-    runs_dir = os.path.join(data, "runs")
+    runs_dir = mkpaths.runs_dir(data)
     names = []
     if not os.path.isdir(runs_dir):
         return names
     for name in sorted(os.listdir(runs_dir)):
-        if os.path.isfile(os.path.join(runs_dir, name, "run.json")):
+        if os.path.isfile(mkpaths.run_doc(data, name)):
             names.append(name)
     return names
 
@@ -427,7 +425,7 @@ def _run_names(data):
 def import_all(home, project, data):
     """One bad run is reported and skipped; the rest still import. Exit 4 when any failed."""
     mkdb.check_slug(project)
-    runs_dir = os.path.join(data, "runs")
+    runs_dir = mkpaths.runs_dir(data)
     if not os.path.isdir(runs_dir):
         raise Fail(f"no runs dir at {runs_dir}")
     before = tree_checksums(runs_dir)

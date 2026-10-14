@@ -37,11 +37,13 @@ def _load(name, path):
 try:
     mk_state = _load("mk_state", os.path.join(HERE, "mk-state.py"))
     mk_config = _load("mk_config", os.path.join(HERE, "mk-config.py"))
+    mkpaths = _load("mkpaths", os.path.join(HERE, "mkpaths.py"))
 except Exception as e:
     print(f"mk-usage: warning: mk-state/mk-config unavailable ({e}); yaml settings ignored",
           file=sys.stderr)
     mk_state = None
     mk_config = None
+    mkpaths = None
 
 
 def load_yaml_config():
@@ -51,7 +53,7 @@ def load_yaml_config():
         return {}
     try:
         data = mk_state.resolve_data(None)
-        path = os.path.join(data, "matrixkoder.yaml")
+        path = mkpaths.project_yaml(data)
         if not os.path.isfile(path):
             return {}
         lines = mk_config.read_lines(path)
@@ -108,23 +110,17 @@ EXHAUSTED_FIELDS = (
 
 
 def _mk_home():
-    """One MK home rule (C16), identical to mkdb.resolve_home(None): $MK_HOME and
-    $MATRIXKODER_HOME are the same setting; when both are set they must agree."""
-    mkh = os.environ.get("MK_HOME")
-    mch = os.environ.get("MATRIXKODER_HOME")
-    if mkh and mch:
-        left = os.path.realpath(os.path.abspath(os.path.expanduser(mkh)))
-        right = os.path.realpath(os.path.abspath(os.path.expanduser(mch)))
-        if left != right:
-            raise RuntimeError(f"MK_HOME ({mkh}) and MATRIXKODER_HOME ({mch}) differ; set one MK home")
-    return os.path.expanduser(mkh or mch or "~/.matrixkoder")
+    """One MK home rule (C16): $MK_HOME and $MATRIXKODER_HOME are the same setting; when both
+    are set they must agree. The rule itself is scripts/mkpaths.home (C1); this copy raised a
+    plain RuntimeError and keeps raising one for its callers."""
+    try:
+        return mkpaths.home()
+    except mkpaths.Fail as e:
+        raise RuntimeError(str(e))
 
 
 def default_ledger():
-    return os.path.join(
-        _mk_home(),
-        "usage.json",
-    )
+    return mkpaths.usage_ledger()
 
 
 @contextlib.contextmanager
@@ -132,10 +128,7 @@ def usage_lock():
     """# ponytail: the one lock both writers of usage.json take — this poll and lane-health.py's quota
     mark. Without it a poll read the file and its atomic replace then dropped a fresh mark. Fixed under
     <home>, not beside the ledger, so the two serialise even with different --out/--ledger paths."""
-    path = os.path.join(
-        _mk_home(),
-        "usage.json.lock",
-    )
+    path = mkpaths.usage_lock()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "a+") as f:
         fcntl.flock(f, fcntl.LOCK_EX)

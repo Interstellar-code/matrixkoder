@@ -105,6 +105,7 @@ lw = _load("lane_watch", os.path.join(HERE, "lane-watch.py"))  # verdict logic l
 lh = _load("lane_health", os.path.join(HERE, "lane-health.py"))
 mk_config = _load("mk_config", os.path.join(HERE, "mk-config.py"))
 mkdb = _load("mkdb", os.path.join(HERE, "mkdb.py"))  # R1.2 write-guard probe only
+mkpaths = _load("mkpaths", os.path.join(HERE, "mkpaths.py"))  # C1/L0: ONE module for every MK path
 
 
 def cfg(key, flag=None):
@@ -113,8 +114,7 @@ def cfg(key, flag=None):
     if flag is not None:
         return flag
     try:
-        lines = mk_config.read_lines(os.path.join(
-            mk_config.mk_state.resolve_data(None), "matrixkoder.yaml"))
+        lines = mk_config.read_lines(mkpaths.project_yaml(mk_config.mk_state.resolve_data(None)))
     except Exception:  # outside a repo / unreadable data dir: the schema default, never a crash
         lines = []
     return mk_config.value_of(lines, mk_config.row_for(lines, key))[1]
@@ -180,15 +180,9 @@ def opt(a, f, d=None):
 
 def mk_home():
     """One MK home rule (C16), identical to mkdb.resolve_home(None): $MK_HOME and
-    $MATRIXKODER_HOME are the same setting; when both are set they must agree."""
-    mkh = os.environ.get("MK_HOME")
-    mch = os.environ.get("MATRIXKODER_HOME")
-    if mkh and mch:
-        left = os.path.realpath(os.path.abspath(os.path.expanduser(mkh)))
-        right = os.path.realpath(os.path.abspath(os.path.expanduser(mch)))
-        if left != right:
-            raise RuntimeError(f"MK_HOME ({mkh}) and MATRIXKODER_HOME ({mch}) differ; set one MK home")
-    return os.path.expanduser(mkh or mch or "~/.matrixkoder")
+    $MATRIXKODER_HOME are the same setting; when both are set they must agree.
+    The rule itself lives in mkpaths (L0); this stays the mk-lane-event spelling of it."""
+    return mkpaths.home()
 
 
 def worktrees(repo):
@@ -216,7 +210,7 @@ def armed_lanes(data=None):
     file; --data filters to one data dir. Missing/invalid projects.json → nothing (the fast path:
     this runs for every pane event on the machine)."""
     try:
-        with open(os.path.join(mk_home(), "projects.json")) as f:
+        with open(mkpaths.projects_json()) as f:
             projects = json.load(f)
         keys = [k for k in projects if isinstance(k, str)] if isinstance(projects, dict) else []
     except (OSError, ValueError):
@@ -570,7 +564,7 @@ def bus_enabled(data):
     arm knows its --data, so this never resolves ambient. Missing/unreadable yaml → the schema
     default (true): a repo that never wrote the key still gets the bus."""
     try:
-        lines = mk_config.read_lines(os.path.join(data, "matrixkoder.yaml"))
+        lines = mk_config.read_lines(mkpaths.project_yaml(data))
         return bool(mk_config.value_of(lines, mk_config.row_for(lines, "bus.enabled"))[1])
     except Exception:  # never crash arm over a setting read
         return True
@@ -605,16 +599,9 @@ def lane_token_file(lane):
     """Where the lane token lives. D6B moved it out of the worktree:
     <home>/bus-lanes/<sha256(realpath(lane))>.json. $MK_BUS_TOKEN_FILE overrides (tests).
     File mode still writes <lane>/.matrixkoder-bus.json; that path wins when the file is there,
-    so a bus that has not moved the token keeps working."""
-    override = os.environ.get("MK_BUS_TOKEN_FILE")
-    if override:
-        return os.path.abspath(os.path.expanduser(override))
-    inside = os.path.join(lane, ".matrixkoder-bus.json")
-    if os.path.isfile(inside):
-        return inside
-    home = os.environ.get("MK_BUS_DIR") or os.environ.get("MK_HOME") or os.environ.get("MATRIXKODER_HOME") or os.path.expanduser("~/.matrixkoder")
-    digest = hashlib.sha256(os.path.realpath(lane).encode("utf-8")).hexdigest()
-    return os.path.join(os.path.abspath(os.path.expanduser(home)), "bus-lanes", digest + ".json")
+    so a bus that has not moved the token keeps working.
+    The rule itself is mkpaths.lane_token (C6, L0): the same one mk-bus and mk-builder use."""
+    return mkpaths.lane_token(lane)
 
 
 def arm_bus(lane, task, run, data):
@@ -654,7 +641,7 @@ def watch_tasks(w):
 def child_ids(task, data, run):
     """Stored ids of <task>'s children in <run>, [] when it has none or run state is unreadable."""
     try:
-        with open(os.path.join(data, "runs", run, "run.json")) as f:
+        with open(mkpaths.run_doc(data, run)) as f:
             tasks = json.load(f).get("tasks") or []
     except (OSError, ValueError):
         return []
@@ -826,16 +813,12 @@ def selftest_jobs_hint(data, active=None):
 
 
 def bus_dir_for(data):
-    """Where bus.json lives, the same rule as mk-bus.bus_location: $MK_BUS_DIR, else the
-    MK home when <data>/mk.db exists (store mode), else the data dir (file mode)."""
-    override = os.environ.get("MK_BUS_DIR")
-    if override:
-        return os.path.abspath(os.path.expanduser(override))
-    if data and os.path.isfile(os.path.join(data, "mk.db")):
-        # One MK home rule (C16): mk_home() takes $MK_HOME or $MATRIXKODER_HOME.
-        home = mk_home()
-        return os.path.abspath(os.path.expanduser(home))
-    return data
+    """Where bus.json lives, the same rule as mk-bus.bus_location — mkpaths.bus_dir (L0):
+    $MK_BUS_DIR, else the MK home when <data>/mk.db exists (store mode), else the data dir
+    (file mode)."""
+    if not data:
+        return data  # no data dir at all: file mode has nothing to resolve a bus for
+    return mkpaths.bus_dir(data)
 
 
 def brief_message(round_n, text):
@@ -849,9 +832,8 @@ def bus_is_up(data):
     mk-bus location and probes /health; never calls ensure, so a down bus stays down."""
     if not data:
         return False
-    bus_dir = bus_dir_for(data)
     try:
-        with open(os.path.join(bus_dir, "bus.json")) as f:
+        with open(mkpaths.bus_json(data)) as f:
             info = json.load(f)
         port = int(info.get("port"))
     except (OSError, ValueError, TypeError):
@@ -872,7 +854,7 @@ def bus_is_up(data):
 
 def brief_body_for(data, run, task):
     """The brief the orchestrator would hand the lane: the newest brief-rN.md for the task."""
-    d = os.path.join(data, "runs", run, "tasks", task)
+    d = mkpaths.task_dir(data, run, task)
     best, best_n = None, -1
     try:
         names = os.listdir(d)
@@ -897,7 +879,7 @@ def publish_brief(data, run, task):
     if not text or not str(text).strip():
         return False, "no brief"
     body = brief_message(n, text)
-    kind = "task" if os.path.isfile(os.path.join(data, "mk.db")) else "info"
+    kind = "task" if os.path.isfile(mkpaths.project_db(data=data)) else "info"
     _j, err = run_bus(["send", "--data", data, "--run", run, "--task", task,
                        "--kind", kind, "--from", "orch", "--to", task, "--text", body])
     return err is None, err
@@ -906,7 +888,7 @@ def publish_brief(data, run, task):
 def publish_review_brief(data, run, task):
     """Send the task's newest review-brief-rN.md to the lane as `round:<n>\nkind:review-brief\n<body>`
     (its own kind: the builder's connect never picks it up). Same send rules as publish_brief."""
-    d = os.path.join(data, "runs", run, "tasks", task)
+    d = mkpaths.task_dir(data, run, task)
     best, best_n = None, -1
     for name in (os.listdir(d) if os.path.isdir(d) else []):
         m = re.fullmatch(r"review-brief-r(\d+)\.md", name)
@@ -916,7 +898,7 @@ def publish_review_brief(data, run, task):
         return False, "no review brief"
     with open(best) as f:
         body = f"round:{best_n}\nkind:review-brief\n{f.read()}"
-    kind = "task" if os.path.isfile(os.path.join(data, "mk.db")) else "info"
+    kind = "task" if os.path.isfile(mkpaths.project_db(data=data)) else "info"
     _j, err = run_bus(["send", "--data", data, "--run", run, "--task", task,
                        "--kind", kind, "--from", "orch", "--to", task, "--text", body])
     return err is None, err
@@ -1406,7 +1388,7 @@ def lane_review_for(data, run, task):
 
 def review_path_for(data, run, task):
     """The newest review-rN.md for the task, or None."""
-    d = os.path.join(data, "runs", run, "tasks", task)
+    d = mkpaths.task_dir(data, run, task)
     best, best_n = None, -1
     try:
         names = os.listdir(d)
@@ -1424,7 +1406,7 @@ def send_brief_over_bus(data, run, task, text, round_n):
     brief artifact (connect reads that); file mode sends it as info. Never a lane-to-lane
     message: the sender is the orchestrator token."""
     body = brief_message(round_n, text)
-    if os.path.isfile(os.path.join(data, "mk.db")):
+    if os.path.isfile(mkpaths.project_db(data=data)):
         return run_bus(["send", "--data", data, "--run", run, "--task", task,
                         "--kind", "task", "--from", "orch", "--to", task, "--text", body])
     return run_bus(["send", "--data", data, "--run", run, "--task", task,
@@ -1483,7 +1465,7 @@ def review_round_of(path):
 
 
 def hold_path(data, run, task):
-    return os.path.join(data, "runs", run, "tasks", task, ".matrixkoder-handoff.json")
+    return os.path.join(mkpaths.task_dir(data, run, task), ".matrixkoder-handoff.json")
 
 
 def task_record(data, run, task):
@@ -1655,7 +1637,7 @@ def cmd_review_handoff(a):
         if found:
             # the lane file is copied into the task folder under the plain name, and the
             # brief cites the copy so it survives a lane reset
-            dest_dir = os.path.join(data, "runs", run, "tasks", task)
+            dest_dir = mkpaths.task_dir(data, run, task)
             os.makedirs(dest_dir, exist_ok=True)
             n_found = review_round_of(found)
             path = os.path.join(dest_dir, f"review-r{n_found}.md")
@@ -1664,7 +1646,7 @@ def cmd_review_handoff(a):
         else:
             lane = (task_record(data, run, task).get("lane") or "<lane>")
             fail(f"no review file for {task}: looked in "
-                 f"{os.path.join(data, 'runs', run, 'tasks', task)} and "
+                 f"{mkpaths.task_dir(data, run, task)} and "
                  f"{lane}/.matrixkoder-review-rN.md")
     n = review_round_of(path)
     if n is None:

@@ -40,6 +40,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 _cspec = importlib.util.spec_from_file_location("mk_config", os.path.join(HERE, "mk-config.py"))
 mk_config = importlib.util.module_from_spec(_cspec)
 _cspec.loader.exec_module(mk_config)
+_pspec = importlib.util.spec_from_file_location("mkpaths", os.path.join(HERE, "mkpaths.py"))
+mkpaths = importlib.util.module_from_spec(_pspec)
+_pspec.loader.exec_module(mkpaths)
 
 
 def session_subagents():
@@ -47,8 +50,8 @@ def session_subagents():
     without its own subagents key inherits this; any failure resolving or reading the config falls
     back to True — this tool must never fail because no config could be read."""
     try:
-        lines = mk_config.read_lines(os.path.join(
-            mk_config.mk_state.resolve_data(None), "matrixkoder.yaml"))
+        lines = mk_config.read_lines(mkpaths.project_yaml(
+            mk_config.mk_state.resolve_data(None)))
         return bool(mk_config.value_of(lines, mk_config.row_for(lines, "session.subagents"))[1])
     except Exception:
         return True
@@ -669,88 +672,41 @@ def store_present(data):
     """A store exists only when <data>/mk.db is already there. Never create one."""
     if not data:
         return False
-    return os.path.isfile(os.path.join(os.path.abspath(data), "mk.db"))
+    return os.path.isfile(mkpaths.project_db(data=data))
 
 
-# the data-dir resolution below is mk-state.py resolve_data's order, copied here on purpose:
-# mk-plan must never import mk-state (C3 — the plan tool is only ever a subprocess), and it must
-# not edit it. Same order, same "never create a store to answer a read" rule.
+# the data-dir resolution is mk-state.py resolve_data's order, now read out of scripts/mkpaths.py
+# (C1): mk-plan must never import mk-state (C3 — the plan tool is only ever a subprocess), and it
+# must not edit it. Same order, same "never create a store to answer a read" rule.
 
 
 def mk_home():
     # one MK home rule (C16): either name; mkdb.resolve_home checks that both agree
-    return os.path.expanduser(os.environ.get("MK_HOME") or os.environ.get("MATRIXKODER_HOME") or "~/.matrixkoder")
+    return mkpaths.home()
 
 
 def main_worktree(top):
     """A linked worktree (.git is a file + commondir) shares the main checkout's data dir."""
-    try:
-        with open(os.path.join(top, ".git")) as f:
-            gitdir = f.read().split("gitdir:", 1)[1].strip()
-        gitdir = os.path.join(top, gitdir)
-        with open(os.path.join(gitdir, "commondir")) as f:
-            common = os.path.normpath(os.path.join(gitdir, f.read().strip()))
-    except (OSError, IndexError):  # .git is a directory, or a submodule (no commondir)
-        return top
-    return os.path.dirname(common) if os.path.basename(common) == ".git" else top
+    return mkpaths.main_worktree(top)
 
 
 def repo_top():
     """The main checkout of the nearest git repo above cwd, or None when there is none.
     The walk stops before $HOME; a linked worktree maps to its main checkout."""
-    d, stop = os.path.realpath(os.getcwd()), os.path.realpath(os.path.expanduser("~"))
-    while not os.path.exists(os.path.join(d, ".git")):  # nearest repo wins
-        if os.path.dirname(d) == d or d == stop:
-            return None
-        d = os.path.dirname(d)
-    if d == stop:
-        return None
-    return main_worktree(d)
+    return mkpaths.repo_top()
 
 
 def registered_data_dir(top):
     """The data dir this repo registered: the root projects table first, then <home>/projects.json.
     Neither read ever creates <home>/mk.db (the root store is checked before it is opened)."""
-    home = mk_home()
-    root = os.path.join(home, "mk.db")
-    if os.path.exists(root):
-        try:
-            con = _mkdb().open_root(home)
-            try:
-                row = con.execute(
-                    "SELECT data_dir FROM projects WHERE repo=? OR repo=? ORDER BY slug LIMIT 1",
-                    (top, os.path.realpath(top))).fetchone()
-            finally:
-                con.close()
-        except Exception:
-            row = None  # an unreadable root store is not a reason to fail a plan command
-        if row and isinstance(row["data_dir"], str) and row["data_dir"].strip():
-            return os.path.normpath(os.path.join(top, os.path.expanduser(row["data_dir"].strip())))
-    try:  # the wizard's home mode: ~/.matrixkoder/projects.json {"<repo>": {"data_dir": ...}}
-        with open(os.path.join(home, "projects.json")) as f:
-            projects = json.load(f)
-        entry = projects.get(top) or projects.get(os.path.realpath(top))
-        listed = entry.get("data_dir") if isinstance(entry, dict) else None
-    except (OSError, ValueError, AttributeError):
-        listed = None
-    if isinstance(listed, str) and listed.strip():
-        return os.path.normpath(os.path.join(top, os.path.expanduser(listed.strip())))
-    return None
+    return mkpaths.root_data_dir(top) or mkpaths.projects_json_data(top)
 
 
 def resolve_data_arg(arg):
     """--data > $MATRIXKODER_DATA > the data dir this repo registered > <main checkout>/.matrixkoder.
     None means "no store": no --data, no env and no git repo above cwd (mk-state refuses instead;
     here a plan file must stay usable without a store)."""
-    if arg:
-        return os.path.abspath(os.path.expanduser(arg))
-    env = os.environ.get("MATRIXKODER_DATA")
-    if env:
-        return os.path.abspath(os.path.expanduser(env))
-    top = repo_top()
-    if top is None:
-        return None
-    return registered_data_dir(top) or os.path.join(top, ".matrixkoder")
+    return mkpaths.data_dir(arg, required=False)
 
 
 def side_store_warning(path):
@@ -1000,7 +956,7 @@ def approve_file(path, data, home, run):
             for tid, *_rest in flat_items({"phases": (prev.get("phases") or out["phases"])}):
                 con.execute("DELETE FROM tasks WHERE run=? AND id=?", (run_id, tid))
             con.commit()
-        archive = os.path.join(data, "plans", "archive", f"{plan_id}-v{version}.md")
+        archive = os.path.join(mkpaths.plan_archives_dir(data), f"{plan_id}-v{version}.md")
         header_json = header_json_of(out, sha, body_md, "approved")
         # tasks first (each add_task commits its own transaction), plans row next, archive last.
         # a later failure deletes only the tasks this call inserted. a resume only writes the archive.
@@ -1209,15 +1165,15 @@ def delete_plan(plan_id, data, home):
         con.close()
     # the file moves to the archive only after the row is gone; a name already taken gets a
     # timestamp suffix so an earlier archived version is never overwritten
-    src = os.path.join(data, "plans", f"{plan_id}.md")
+    src = mkpaths.plan_file(data, plan_id)
     moved = None
     if os.path.isfile(src):
-        dst = os.path.join(data, "plans", "archive", os.path.basename(src))
+        dst = os.path.join(mkpaths.plan_archives_dir(data), os.path.basename(src))
         n = 0
         while os.path.exists(dst):
             stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
             n += 1
-            dst = os.path.join(data, "plans", "archive", f"{plan_id}-{stamp}" + (f"-{n}" if n > 1 else "") + ".md")
+            dst = os.path.join(mkpaths.plan_archives_dir(data), f"{plan_id}-{stamp}" + (f"-{n}" if n > 1 else "") + ".md")
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.move(src, dst)
         moved = dst

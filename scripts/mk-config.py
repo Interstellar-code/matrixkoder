@@ -120,6 +120,7 @@ def _load(name, path):
 
 
 mk_state = _load("mk_state", os.path.join(HERE, "mk-state.py"))  # data dir resolution, Fail
+mkpaths = _load("mkpaths", os.path.join(HERE, "mkpaths.py"))  # C1: home, data-dir order, paths
 
 
 class Fail(Exception):
@@ -344,15 +345,14 @@ _ROUTES_CACHE = {}  # one catalog read per process; the self-test clears it for 
 
 def catalog_home():
     """The MK home `mk-catalog.py` would use: $MK_HOME or $MATRIXKODER_HOME (both set must
-    agree), else ~/.matrixkoder — the same rule as mkdb.resolve_home with no --home argument."""
-    mkh = os.environ.get("MK_HOME")
-    mch = os.environ.get("MATRIXKODER_HOME")
-    if mkh and mch:
-        left = os.path.realpath(os.path.abspath(os.path.expanduser(mkh)))
-        right = os.path.realpath(os.path.abspath(os.path.expanduser(mch)))
-        if left != right:
-            raise Fail(f"MK_HOME ({mkh}) and MATRIXKODER_HOME ({mch}) differ; set one MK home")
-    return os.path.abspath(os.path.expanduser(mkh or mch or "~/.matrixkoder"))
+    agree), else ~/.matrixkoder — mkpaths.home (C1), with mkdb.check_home's synced-home refusal
+    kept here (C11), as the old inline copy had it through mkdb.resolve_home."""
+    try:
+        home = mkpaths.home()
+    except mkpaths.Fail as e:
+        raise Fail(str(e))
+    mk_state._mkdb().check_home(home)
+    return home
 
 
 def catalog_routes():
@@ -631,7 +631,7 @@ def yaml_lock(path):
     d = os.path.dirname(os.path.abspath(path)) or "."
     try:
         os.makedirs(d, exist_ok=True)
-        f = open(os.path.join(d, LOCK_NAME), "a")
+        f = open(mkpaths.project_yaml_lock(d), "a")
     except OSError as e:
         raise Fail(f"could not lock {path}: {e.strerror or e}")
     try:
@@ -1419,7 +1419,7 @@ def main(argv=None):
         usage_arg, argv = argv[i + 1], argv[:i] + argv[i + 2:]
     try:
         data = mk_state.resolve_data(data_arg)
-        path = os.path.join(data, "matrixkoder.yaml")
+        path = mkpaths.project_yaml(data)
         lines = read_lines(path)
         cmd, args = (argv[0], argv[1:]) if argv else (None, [])
         if cmd == "list":
@@ -2101,7 +2101,7 @@ def self_test():
         raw_sh = raw_sh.replace(needle_data, repl_data, 1)
         needle = '  [ -e "$f" ] || continue\n  files+=("$f")\n'
         repl = ('  [ -e "$f" ] || continue\n'
-                '  case "$(basename "$f")" in mk-config.py|mk-state.py) continue ;; esac\n'
+                '  case "$(basename "$f")" in mk-config.py|mk-state.py|mkpaths.py) continue ;; esac\n'
                 '  files+=("$f")\n')
         if raw_sh.count(needle) != 1:
             raise AssertionError("selftest.sh file loop changed; the harness skip no longer matches")
@@ -2110,6 +2110,8 @@ def self_test():
         # the lane resolves mk-config.py beside selftest.sh; the copy must be the script under test
         shutil.copy(script, os.path.join(harness, "mk-config.py"))
         shutil.copy(os.path.join(HERE, "mk-state.py"), os.path.join(harness, "mk-state.py"))
+        # mk-config loads mkpaths beside itself (C1); the harness must carry it too
+        shutil.copy(os.path.join(HERE, "mkpaths.py"), os.path.join(harness, "mkpaths.py"))
         for name in ("w1.py", "w2.py", "w3.py"):
             with open(os.path.join(harness, name), "w") as f:
                 f.write(

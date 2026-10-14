@@ -77,9 +77,35 @@ STATUS_VALUES = (
 )
 
 
+def _load_mkpaths():
+    """scripts/mkpaths.py, the ONE module for every MK path (C1, L0): loaded as a sibling
+    by path, the way _load_mkdb loads mkdb (each script stands alone). mkpaths imports
+    nothing from the repo, so there is no cycle. Cached: it is stateless by design."""
+    global _mkpaths
+    if _mkpaths is None:
+        spec = importlib.util.spec_from_file_location("mkpaths", os.path.join(HERE, "mkpaths.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _mkpaths = mod
+    return _mkpaths
+
+
+_mkpaths = None
+
+
+def _paths(name, *args, **kwargs):
+    """One mkpaths call by function name. mkpaths.Fail is a RuntimeError, this module's is
+    its own (exit 2 / one JSON line), so the two are converted here — one place."""
+    mod = _load_mkpaths()
+    try:
+        return getattr(mod, name)(*args, **kwargs)
+    except mod.Fail as e:
+        raise Fail(str(e))
+
+
 def project_store_path(data_dir):
     """The project store lives at <data>/mk.db. Absent means file mode."""
-    return os.path.join(data_dir, "mk.db")
+    return _paths("project_db", data=data_dir)
 
 
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
@@ -89,15 +115,9 @@ def mk_home():
     """MK home: $MK_HOME or $MATRIXKODER_HOME (both set must agree), else ~/.matrixkoder.
 
     One MK home rule (C16), identical to mkdb.resolve_home(None): either name is
-    accepted; when both are set they must resolve to the same directory."""
-    mkh = os.environ.get("MK_HOME")
-    mch = os.environ.get("MATRIXKODER_HOME")
-    if mkh and mch:
-        left = os.path.realpath(os.path.abspath(os.path.expanduser(mkh)))
-        right = os.path.realpath(os.path.abspath(os.path.expanduser(mch)))
-        if left != right:
-            raise Fail(f"MK_HOME ({mkh}) and MATRIXKODER_HOME ({mch}) differ; set one MK home")
-    return os.path.abspath(os.path.expanduser(mkh or mch or "~/.matrixkoder"))
+    accepted; when both are set they must resolve to the same directory.
+    The rule itself lives in mkpaths (L0): this stays the mk-bus spelling of it."""
+    return _paths("home")
 
 
 def root_bus_dir(home=None):
@@ -110,14 +130,9 @@ def lane_token_path(lane_dir, home=None):
 
     ~/.matrixkoder/bus-lanes/<sha256(realpath(lane))>.json, mode 0600.
     $MK_BUS_TOKEN_FILE overrides the path (tests and a relocated home).
-    """
-    override = os.environ.get("MK_BUS_TOKEN_FILE")
-    if override:
-        return os.path.abspath(os.path.expanduser(override))
-    real = os.path.realpath(lane_dir)
-    digest = hashlib.sha256(real.encode("utf-8")).hexdigest()
-    base = home or os.environ.get("MK_BUS_DIR") or root_bus_dir()
-    return os.path.join(os.path.abspath(os.path.expanduser(base)), "bus-lanes", digest + ".json")
+    The rule itself lives in mkpaths (L0), the same one for mk-bus,
+    mk-lane-event and mk-builder."""
+    return _paths("lane_token", lane_dir)
 
 
 def _load_mkdb():
@@ -291,18 +306,10 @@ def out(obj):
 
 
 def resolve_data(arg=None):
-    if arg:
-        return os.path.abspath(os.path.expanduser(arg))
-    if os.environ.get("MATRIXKODER_DATA"):
-        return os.path.abspath(os.path.expanduser(os.environ["MATRIXKODER_DATA"]))
-    d = os.path.realpath(os.getcwd())
-    stop = os.path.realpath(os.path.expanduser("~"))
-    while not os.path.exists(os.path.join(d, ".git")):
-        parent = os.path.dirname(d)
-        if parent == d or d == stop:
-            break
-        d = parent
-    return os.path.join(d, ".matrixkoder")
+    """The data-dir order (C1): --data > $MATRIXKODER_DATA > root projects table >
+    <home>/projects.json > <main checkout>/.matrixkoder. mkpaths owns it (L0): the bus
+    now uses the FULL order, as the state side does."""
+    return _paths("data_dir", arg)
 
 
 def bus_location(data_dir):
@@ -311,13 +318,8 @@ def bus_location(data_dir):
     File mode (no <data>/mk.db): the data dir, exactly as before — the
     self-hosting guard. Store mode: the MK home, one bus for every project.
     $MK_BUS_DIR overrides (tests pin a temp home without touching ~/.matrixkoder).
-    """
-    override = os.environ.get("MK_BUS_DIR")
-    if override:
-        return os.path.abspath(os.path.expanduser(override))
-    if store_mode(data_dir):
-        return root_bus_dir()
-    return data_dir
+    The rule itself lives in mkpaths (L0)."""
+    return _paths("bus_dir", data_dir)
 
 
 def project_slug_for(data_dir):
@@ -325,28 +327,21 @@ def project_slug_for(data_dir):
 
     Validated against the root projects table (slug rule C11) BEFORE any
     project store is opened. A store with no matching root row is refused.
-    The root store is <home>/mk.db; $MK_BUS_DIR is that home in tests.
+    The root store is <home>/mk.db; $MK_BUS_DIR is that home in tests. The read
+    half is mkpaths.project_slug_of (L0); the "no row yet → register a derived
+    slug" write half stays here, it is the bus's own write.
     """
     if not store_mode(data_dir):
         return None
+    slug = _paths("project_slug_of", data_dir)
+    if slug:
+        return slug
     mod = _load_mkdb()
-    home = os.environ.get("MK_BUS_DIR") or mk_home()
-    real = os.path.realpath(data_dir)
-    con = mod.open_root(home)
-    try:
-        rows = con.execute("SELECT slug, data_dir FROM projects").fetchall()
-    finally:
-        con.close()
-    for row in rows:
-        slug = row["slug"]
-        if not isinstance(slug, str) or not SLUG_RE.match(slug):
-            continue
-        recorded = row["data_dir"]
-        if recorded and os.path.realpath(os.path.expanduser(recorded)) == real:
-            return slug
+    home = _paths("root_home")  # $MK_BUS_DIR when the bus is pinned, else the MK home
     # No root row yet. Register this store so it joins the root bus: a present
     # mk.db is store mode (task/status/report), and file mode would refuse
     # those kinds. The slug is derived from the data dir path.
+    real = os.path.realpath(data_dir)
     slug = "p" + hashlib.sha256(real.encode("utf-8")).hexdigest()[:16]
     try:
         con = mod.open_root(home)
@@ -435,7 +430,7 @@ def owner_timeout_s(data_dir):
             pass  # an unparseable hook falls through to the settings rather than crash the monitor
     if _mk_config is not None:
         try:
-            lines = _mk_config.read_lines(os.path.join(data_dir, "matrixkoder.yaml"))
+            lines = _mk_config.read_lines(_paths("project_yaml", data_dir))
             row = _mk_config.row_for(lines, "bus.owner_timeout_min")
             minutes = _mk_config.value_of(lines, row)[1]
             return float(max(5, min(120, minutes))) * 60.0
@@ -617,6 +612,13 @@ class BusState:
         except (TypeError, ValueError):
             self.ring_interval = 5.0
 
+    def _bus_file(self, name):
+        """One bus-file path from mkpaths (bus_json / bus_tokens / bus_tokens_lock /
+        ring_queue ...), resolved against this bus's project dir. A BusState assembled
+        with __new__ — a self-test stub — carries only `data_dir`, the bus dir itself,
+        so that is the fallback base; every real instance sets project_dir."""
+        return _paths(name, getattr(self, "project_dir", None) or self.data_dir)
+
     def mark_ask_once(self, run, ask_id):
         """True exactly once per (run, ask id): the caller may run its one blocked-marking write."""
         with self.lock:
@@ -629,7 +631,7 @@ class BusState:
     def get_token(self, token_str):
         if not token_str or not isinstance(token_str, str):
             return None
-        tokens_path = os.path.join(self.data_dir, "bus-tokens.json")
+        tokens_path = self._bus_file("bus_tokens")
         try:
             mtime = os.path.getmtime(tokens_path)
         except OSError:
@@ -655,8 +657,8 @@ class BusState:
             return None
 
     def add_token(self, token_str, run, task, lane, role="lane", project=None):
-        lock_path = os.path.join(self.data_dir, "bus-tokens.lock")
-        tokens_path = os.path.join(self.data_dir, "bus-tokens.json")
+        lock_path = self._bus_file("bus_tokens_lock")
+        tokens_path = self._bus_file("bus_tokens")
         os.makedirs(self.data_dir, exist_ok=True)
         lfd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         os.fchmod(lfd, 0o600)
@@ -686,8 +688,8 @@ class BusState:
         orch token since the data dir's birth stayed valid forever (review LOW 4).
         Same bus-tokens.lock + write_json 0600 pattern as add_token/cmd_revoke;
         lane tokens are untouched."""
-        lock_path = os.path.join(self.data_dir, "bus-tokens.lock")
-        tokens_path = os.path.join(self.data_dir, "bus-tokens.json")
+        lock_path = self._bus_file("bus_tokens_lock")
+        tokens_path = self._bus_file("bus_tokens")
         os.makedirs(self.data_dir, exist_ok=True)
         lfd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         os.fchmod(lfd, 0o600)
@@ -728,7 +730,7 @@ class BusState:
                 return self.runs[key]
 
             base = project_dir or self.project_dir
-            jsonl_path = os.path.join(base, "runs", run, "bus.jsonl")
+            jsonl_path = os.path.join(_paths("run_dir", base, run), "bus.jsonl")
             messages = []
             by_id = {}
             max_seq = 0
@@ -923,7 +925,7 @@ class BusState:
                     "kind": kind, "reply_to": reply_to or None, "text": text,
                     "ack_level": 1,
                 }
-                run_dir = os.path.join(project_dir, "runs", run)
+                run_dir = _paths("run_dir", project_dir, run)
                 line = json.dumps(msg, separators=(",", ":")) + "\n"
                 self._append_jsonl(run_dir, line)
 
@@ -948,6 +950,10 @@ class BusState:
         the store is opened. File mode has no projects and ignores the name.
         An empty slug is refused in store mode: only the explicit host project
         name maps to the host store. There is no default-project fallback.
+
+        The project DB path itself is resolved by mkpaths.project_db (L0): one
+        rule for the project store, root row lookup included. A slug with no
+        root row carrying a data_dir has no store, so it is an unknown project.
         """
         if not self.use_store:
             return self.store, self.project_dir
@@ -955,16 +961,10 @@ class BusState:
             raise Fail("invalid project slug")
         if project == self.project:
             return self.store, self.project_dir
-        mod = _load_mkdb()
-        home = os.environ.get("MK_BUS_DIR") or mk_home()
-        con = mod.open_root(home)
-        try:
-            row = con.execute("SELECT data_dir FROM projects WHERE slug=?", (project,)).fetchone()
-        finally:
-            con.close()
-        if not row or not row["data_dir"]:
+        db = _paths("project_db", slug=project)
+        if not db:
             raise Fail("unknown project")
-        data_dir = os.path.realpath(os.path.expanduser(row["data_dir"]))
+        data_dir = os.path.dirname(db)
         return StoreAdapter(data_dir), data_dir
 
     def _maybe_ring(self, msg):
@@ -1165,7 +1165,7 @@ class BusState:
         token (re-armed in a fresh worktree), so all of them are candidates.
         """
         try:
-            tokens = read_json(os.path.join(self.data_dir, "bus-tokens.json"), default={})
+            tokens = read_json(self._bus_file("bus_tokens"), default={})
         except Exception:
             return set()
         lanes = set()
@@ -1240,7 +1240,7 @@ class BusState:
 
     def _disambiguate(self, tier, lanes):
         armed = watch_pane = None
-        tokens = read_json(os.path.join(self.data_dir, "bus-tokens.json"), default={})
+        tokens = read_json(self._bus_file("bus_tokens"), default={})
         here = {os.path.realpath(a["cwd"]) for a in tier if a.get("cwd")} & lanes
         for lane in here:
             watch = read_json(os.path.join(lane, ".matrixkoder-watch.json"), default={})
@@ -1320,7 +1320,7 @@ class BusState:
         return True
 
     def _ring_queue_path(self):
-        return os.path.join(self.data_dir, "ring-queue.json")
+        return self._bus_file("ring_queue")
 
     def _save_ring_queue(self, claimed=()):
         """Persist queued rings so a restart can drain them once the lane is idle.
@@ -1467,7 +1467,7 @@ class BusState:
                     "to": to_val or "orch", "kind": "ack", "reply_to": target_id,
                     "text": f"ack {ack_level}", "ack_level": ack_level,
                 }
-                run_dir = os.path.join(project_dir, "runs", run)
+                run_dir = _paths("run_dir", project_dir, run)
                 line = json.dumps(ack_rec, separators=(",", ":")) + "\n"
                 self._append_jsonl(run_dir, line)
 
@@ -1536,7 +1536,7 @@ class BusState:
                     raise Fail("invalid run id")
                 runs_to_check = [self.get_run_state(run, base)]
             else:
-                runs_dir = os.path.join(base, "runs")
+                runs_dir = _paths("runs_dir", base)
                 names = set()
                 if os.path.exists(runs_dir):
                     for d in os.listdir(runs_dir):
@@ -2334,10 +2334,10 @@ class BusServer(ThreadingHTTPServer):
         pass
 
 
-def heartbeat_monitor(server, data_dir, stop_event):
+def heartbeat_monitor(server, bus_dir, data_dir, stop_event):
     check_interval = float(os.environ.get("MK_BUS_HEARTBEAT_CHECK_SEC", "60.0"))
-    timeout = owner_timeout_s(data_dir)  # env hook > bus.owner_timeout_min > schema default 30 min
-    bus_json_path = os.path.join(data_dir, "bus.json")
+    timeout = owner_timeout_s(bus_dir)  # env hook > bus.owner_timeout_min > schema default 30 min
+    bus_json_path = _paths("bus_json", data_dir)
 
     while not stop_event.wait(check_interval):
         try:
@@ -2381,8 +2381,8 @@ def cmd_serve(args):
     # every project. File mode keeps them in the data dir.
     bus_dir = bus_location(data_dir)
     os.makedirs(bus_dir, exist_ok=True)
-    lock_path = os.path.join(bus_dir, "bus.lock")
-    bus_json_path = os.path.join(bus_dir, "bus.json")
+    lock_path = _paths("bus_lock", data_dir)
+    bus_json_path = _paths("bus_json", data_dir)
 
     lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     os.fchmod(lock_fd, 0o600)
@@ -2431,7 +2431,7 @@ def cmd_serve(args):
     stop_event = threading.Event()
     hb_thread = threading.Thread(
         target=heartbeat_monitor,
-        args=(server, bus_dir, stop_event),
+        args=(server, bus_dir, data_dir, stop_event),
         daemon=True
     )
     hb_thread.start()
@@ -2488,7 +2488,7 @@ def cmd_ensure(args):
     bus_dir = bus_location(data_dir)
     os.makedirs(bus_dir, exist_ok=True)
     ensure_lock_path = os.path.join(bus_dir, "bus-ensure.lock")
-    bus_json_path = os.path.join(bus_dir, "bus.json")
+    bus_json_path = _paths("bus_json", data_dir)
 
     # Serialize ensure calls with dedicated flock
     efd = os.open(ensure_lock_path, os.O_CREAT | os.O_RDWR, 0o600)
@@ -2647,7 +2647,7 @@ def cmd_ensure(args):
 def cmd_heartbeat(args):
     data_dir = resolve_data(getattr(args, "data", None))
     bus_dir = bus_location(data_dir)
-    bus_json_path = os.path.join(bus_dir, "bus.json")
+    bus_json_path = _paths("bus_json", data_dir)
     # A project heartbeat. In root-bus mode the file records one timestamp per
     # project; the process exits only when EVERY project is past the timeout.
     project = None
@@ -2689,7 +2689,7 @@ def cmd_token(args):
     if not isinstance(round_val, int) or isinstance(round_val, bool) or round_val < 0:
         raise Fail("invalid round")
 
-    bus_json_path = os.path.join(bus_location(data_dir), "bus.json")
+    bus_json_path = _paths("bus_json", data_dir)
     port = None
     if os.path.exists(bus_json_path):
         d = read_json(bus_json_path)
@@ -2702,9 +2702,9 @@ def cmd_token(args):
     # C6: outside the worktree. File mode (no store) keeps the lane file
     # where mk-builder.py still reads it; store mode uses the home.
     if store_mode(data_dir) or os.environ.get("MK_BUS_TOKEN_FILE"):
-        lane_file = lane_token_path(lane_dir)
+        lane_file = _paths("lane_token", lane_dir)
     else:
-        lane_file = os.path.join(lane_dir, ".matrixkoder-bus.json")
+        lane_file = _paths("lane_token", lane_dir, file_mode=True)
     os.makedirs(os.path.dirname(lane_file), exist_ok=True)
     # "v": 1 matches the contract B24 lane-file example (protocol version).
     # todo 71 / E2 (1): `data` is the data dir, so a fresh lane can find the
@@ -2726,8 +2726,8 @@ def cmd_token(args):
     write_json(lane_file, payload, mode=0o600)
 
     bus_dir = bus_location(data_dir)
-    lock_path = os.path.join(bus_dir, "bus-tokens.lock")
-    tokens_path = os.path.join(bus_dir, "bus-tokens.json")
+    lock_path = _paths("bus_tokens_lock", data_dir)
+    tokens_path = _paths("bus_tokens", data_dir)
     lfd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     os.fchmod(lfd, 0o600)
     fcntl.flock(lfd, fcntl.LOCK_EX)
@@ -2771,8 +2771,8 @@ def cmd_revoke(args):
             pass
 
     bus_dir = bus_location(data_dir)
-    lock_path = os.path.join(bus_dir, "bus-tokens.lock")
-    tokens_path = os.path.join(bus_dir, "bus-tokens.json")
+    lock_path = _paths("bus_tokens_lock", data_dir)
+    tokens_path = _paths("bus_tokens", data_dir)
     lfd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     os.fchmod(lfd, 0o600)
     fcntl.flock(lfd, fcntl.LOCK_EX)
@@ -2796,7 +2796,7 @@ def cmd_revoke(args):
 
 
 def _get_client_conn(data_dir):
-    bus_json_path = os.path.join(bus_location(data_dir), "bus.json")
+    bus_json_path = _paths("bus_json", data_dir)
     if not os.path.exists(bus_json_path):
         raise Fail("bus down")
     bdata = read_json(bus_json_path)
@@ -2918,12 +2918,15 @@ def _store_run_messages(data_dir, run):
 
 def _known_runs(data_dir):
     """Run ids from `<data>/runs/<run>` directories and, in store mode, the project store."""
-    runs_dir = os.path.join(data_dir, "runs")
+    runs_dir = _paths("runs_dir", data_dir)
     runs = []
     if os.path.isdir(runs_dir):
         runs = [d for d in sorted(os.listdir(runs_dir)) if os.path.isdir(os.path.join(runs_dir, d)) and is_valid_id(d)]
-    if store_mode(data_dir):
-        for r in StoreAdapter(data_dir).store_select("SELECT id FROM runs"):
+    # The project store path is resolved by mkpaths only (L0): one rule for the
+    # project DB, whether the caller holds a slug or the data dir.
+    db = _paths("project_db", data=data_dir)
+    if db and os.path.isfile(db):
+        for r in StoreAdapter(os.path.dirname(db)).store_select("SELECT id FROM runs"):
             if is_valid_id(r.get("id")) and r["id"] not in runs:
                 runs.append(r["id"])
     return runs
@@ -2936,11 +2939,12 @@ def _read_run_messages(data_dir, run):
     live in mk.db and `<data>/runs/<run>/bus.jsonl` is absent. File mode keeps
     reading bus.jsonl exactly as before.
     """
-    if store_mode(data_dir):
-        msgs = _store_run_messages(data_dir, run)
+    db = _paths("project_db", data=data_dir)
+    if db and os.path.isfile(db):
+        msgs = _store_run_messages(os.path.dirname(db), run)
         if msgs:
             return msgs
-    jsonl = os.path.join(data_dir, "runs", run, "bus.jsonl")
+    jsonl = os.path.join(_paths("run_dir", data_dir, run), "bus.jsonl")
     messages = []
     if not os.path.exists(jsonl):
         return messages
@@ -3122,12 +3126,11 @@ def _orch_token(data_dir):
     repo on the machine and bus.json's token belongs to the project that started it; an
     orchestrator of another project uses (or mints) its own project-scoped orch token in
     bus-tokens.json, so its messages land in its own store and run, never the host's."""
-    home = bus_location(data_dir)
-    bus_json = read_json(os.path.join(home, "bus.json")) or {}
+    bus_json = read_json(_paths("bus_json", data_dir)) or {}
     slug = project_slug_for(data_dir)
     if bus_json.get("token") and (slug is None or bus_json.get("project") in (None, slug)):
         return bus_json["token"]
-    tp, tl = os.path.join(home, "bus-tokens.json"), os.path.join(home, "bus-tokens.lock")
+    tp, tl = _paths("bus_tokens", data_dir), _paths("bus_tokens_lock", data_dir)
     lfd = os.open(tl, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(lfd, fcntl.LOCK_EX)
@@ -3171,7 +3174,7 @@ def cmd_watch(args):
     if task and not is_valid_id(task):
         raise Fail("invalid task id")
     after = getattr(args, "after", None)
-    cursor_path = os.path.join(data_dir, "watch-cursors.json")
+    cursor_path = _paths("watch_cursors", data_dir)
     cursor_key = "%s|%s" % (run or "*", task or "*")
     # File mode: a new run in the same data dir restarts seq from 1 and restarts the bus, so a cursor
     # is trusted only for the bus start stamp it was written under (a mismatch replays: a duplicate,
@@ -3180,7 +3183,7 @@ def cmd_watch(args):
 
     def bus_started():
         try:
-            return (read_json(os.path.join(bus_location(data_dir), "bus.json")) or {}).get("started")
+            return (read_json(_paths("bus_json", data_dir)) or {}).get("started")
         except Exception:
             return None
     cur_started = bus_started() if file_mode else None
@@ -3202,7 +3205,7 @@ def cmd_watch(args):
     while True:
         port = None
         try:
-            bdata = read_json(os.path.join(bus_location(data_dir), "bus.json"))
+            bdata = read_json(_paths("bus_json", data_dir))
             if bdata and bdata.get("port"):
                 port = int(bdata["port"])
                 if file_mode:
@@ -4348,6 +4351,56 @@ def _store_self_test_body(mod):
         tail_texts = [m.get("text") for m in tail_res["messages"]]
         assert "store mode ask" in tail_texts, tail_res
         assert "answered from the store" in tail_texts, tail_res
+
+        # ============ L0 (3): the project DB path is resolved ONLY through mkpaths ============
+        # R13 proof: patch the loaded mkpaths module's project_db so the project's store
+        # answers to a different directory, then show that both the server-side
+        # store_for and the CLI-side _known_runs follow it. On the pre-L0 code each read
+        # the root projects table (or joined <data>/mk.db) itself, so the patch was
+        # ignored and this block fails.
+        proof = os.path.join(tmp, "l0-proof")
+        proj_dir = os.path.join(proof, "proj")
+        else_dir = os.path.join(proof, "elsewhere")
+        os.makedirs(proj_dir, exist_ok=True)
+        os.makedirs(else_dir, exist_ok=True)
+        # an empty project store in `<proj>`: store mode on, no run rows, no runs/ dir
+        _c = mod.open_project(proj_dir, data_dir=proj_dir)
+        _c.close()
+        # the store `<proj>` is patched to: a real store holding run rL0
+        mod.import_history(else_dir, None, "rL0", run_row={"id": "rL0", "status": "active"},
+                           data_dir=else_dir)
+
+        real_project_db, real = _load_mkpaths().project_db, os.path.realpath(proj_dir)
+
+        def patched_project_db(slug=None, data=None):
+            if slug == "proj" or (data and os.path.realpath(data) == real):
+                return os.path.join(else_dir, "mk.db")
+            return real_project_db(slug=slug, data=data)
+
+        mkpaths = _load_mkpaths()
+        mkpaths.project_db = patched_project_db
+        try:
+            server = BusState(proj_dir, "r1", bus_dir=home)
+            assert server.use_store, "the proof needs a store-mode project dir"
+            adapter, named = server.store_for("proj")
+            assert named == else_dir, (named, else_dir)
+            # the patched store is the one opened: its runs/, read through the adapter
+            assert adapter.store_select("SELECT id FROM runs") == [{"id": "rL0"}], adapter.data_dir
+            # _known_runs reads the store the patch names, not <data>/mk.db
+            assert _known_runs(proj_dir) == ["rL0"], _known_runs(proj_dir)
+            # a slug with no root row still has no store -> "unknown project"
+            try:
+                server.store_for("no-such-project")
+                raise AssertionError("a slug with no root row must be an unknown project")
+            except Fail as e:
+                assert str(e) == "unknown project", str(e)
+        finally:
+            _load_mkpaths().project_db = real_project_db
+        # unpatched, both read the project's own store again: no run rows there, and the
+        # registered project's store is the host one (realpath: tmp is under /var).
+        server = BusState(proj_dir, "r1", bus_dir=home)
+        assert _known_runs(proj_dir) == [], _known_runs(proj_dir)
+        assert server.store_for("proj")[1] == os.path.realpath(data), server.store_for("proj")[1]
 
         # ============ E2 (6) /send without run is 400 (m-16) ============
         btok = remint()

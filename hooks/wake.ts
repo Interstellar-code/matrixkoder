@@ -1,7 +1,8 @@
 // MatrixKoder wake on lane events: polls events.jsonl and submits prompt on transition events (strict types)
 import type { EngineInterface, On, PluginOptions, Timer } from 'claude-code'
 import type { MkWakePending } from '../types'
-import { candidateDirs, globalDirPath, join, mainCheckout, parseGitdir, parseJson, projectDataDir, projectDirFromStore, sanitizeText, type MkProjectRow } from './data'
+import { join, parseJson, sanitizeText } from './data'
+import { homeDir, paths, resolveDataDir, sessionCwd } from './paths'
 
 // $.state contract for wakeEventLines and wakeSentAt lives in types/index.d.ts
 
@@ -70,103 +71,16 @@ async function keepCursorForm($: EngineInterface, run: string, n: number): Promi
 
 
 
-/** Same rule as the dashboard and mk-state: MATRIXKODER_DATA, else the nearest .git (never above $HOME);
- *  a linked worktree resolves to its main checkout. Pure helpers are in data.ts ($ may not cross an import).
- *  tools.ts (mk_bus's --data) keeps its own file-local copy for the same loader rule. */
-
-/** The global dir ($MATRIXKODER_HOME, else ~/.matrixkoder). */
-async function globalDirOf($: EngineInterface, home: string | null): Promise<string | null> {
-  let envHome: string | undefined
-  try {
-    envHome = (await $.env.get('MATRIXKODER_HOME')) || undefined
-  } catch {
-    // env noun refused — the default global dir
-  }
-  return globalDirPath(envHome, home)
-}
-
-/** Root store first (`mkdb.py projects --json`), then projects.json. null = neither names this
- *  repo. A failed command, bad JSON or an empty list falls through to projects.json. The
- *  command is opt-in (`store`): a caller whose tests count every process.run leaves it off.
- *  File-local on purpose — the loader follows $ only into a function declared in this file. */
-async function listedDataDir($: EngineInterface, repoPaths: readonly string[], home: string | null, opts: { store?: boolean } = {}): Promise<string | null> {
-  const gdir = await globalDirOf($, home)
-  if (gdir == null) return null
-  if (opts.store === true) {
-    try {
-      const ran = await $.process.run(
-        ['python3', join($.plugin.root, 'scripts/mkdb.py'), 'projects', '--json', '--home', gdir],
-        { timeoutMs: 5000 },
-      )
-      if (ran.exitCode === 0) {
-        const parsed = parseJson(ran.stdout)
-        const rows = parsed !== null && typeof parsed === 'object' && 'projects' in parsed
-          ? (parsed as { projects?: unknown }).projects
-          : null
-        const fromStore = projectDirFromStore(Array.isArray(rows) ? rows as MkProjectRow[] : null, repoPaths, home)
-        if (fromStore != null) return fromStore
-      }
-    } catch {
-      // no python, or the command failed: projects.json still names the dir
-    }
-  }
-  try {
-    return projectDataDir(parseJson(await $.fs.read(join(gdir, 'projects.json'))), repoPaths, home)
-  } catch {
-    return null
-  }
-}
-
-async function resolveDataDir($: EngineInterface): Promise<string> {
-  try {
-    const envData = await $.env.get('MATRIXKODER_DATA')
-    if (envData) return envData.trim()
-  } catch {
-    // env noun error
-  }
-  let cwd = '.'
-  try {
-    cwd = await $.session.cwd()
-  } catch {
-    // fallback
-  }
-  let home: string | undefined
-  try {
-    home = (await $.env.get('HOME')) || undefined
-  } catch {
-    // no HOME: the walk only stops at /
-  }
-
-  for (const dir of candidateDirs(cwd, home)) {
-    const gitPath = join(dir, '.git')
-    let kind: string | null = null
-    try {
-      kind = (await $.fs.stat(gitPath)).kind
-    } catch {
-      continue // no .git here — keep walking up
-    }
-    // nearest repo boundary: never use an ancestor's data
-    let top = dir
-    if (kind === 'file') {
-      try {
-        const gitdir = parseGitdir(await $.fs.read(gitPath))
-        if (gitdir) {
-          const gd = gitdir.startsWith('/') ? gitdir : join(dir, gitdir)
-          const commondir = await $.fs.read(join(gd, 'commondir'))
-          const main = mainCheckout(gd, commondir)
-          if (main) top = main
-        }
-      } catch {
-        // unreadable git file or no commondir: this checkout's own dir
-      }
-    }
-    // the root store names this repo's data dir; projects.json is the fallback; else <repo>/.matrixkoder
-    const listed = await listedDataDir($, [top], home ?? null, { store: true })
-    if (listed != null) return listed
-    return join(top, '.matrixkoder')
-  }
-
-  return join(cwd, '.matrixkoder')
+/** The data dir is paths.resolveDataDir's (the ONE resolver, C1/L0): MATRIXKODER_DATA,
+ *  else the nearest .git (never above $HOME), a linked worktree resolving to its main
+ *  checkout, the root store (projects.json fallback) naming the dir, else
+ *  <repo>/.matrixkoder. Wake is always store mode, so the root-store read is always on.
+ *  Its own fallback is the no-repo answer: `<cwd>/.matrixkoder`, the dir a first
+ *  `mk-state run init` would write to. */
+async function wakeDataDir($: EngineInterface): Promise<string> {
+  const cwd = await sessionCwd($)
+  const resolved = await resolveDataDir($, { cwd, home: await homeDir($), store: true })
+  return resolved ?? join(cwd, '.matrixkoder')
 }
 
 async function readPending($: EngineInterface): Promise<Pending> {
@@ -186,7 +100,7 @@ function armDebounce($: EngineInterface): void {
  *  own task.json copy (state-schema v1). undefined = neither is readable — the caller
  *  keeps the item, a read error must not silently eat a wake. */
 async function currentTaskStatus($: EngineInterface, dataDir: string, run: string, task: string): Promise<string | undefined> {
-  const runObj = parseJson(await $.fs.read(`${dataDir}/runs/${run}/run.json`).catch(() => ''))
+  const runObj = parseJson(await $.fs.read(paths.runDoc(dataDir, run)).catch(() => ''))
   const tasks = runObj != null && typeof runObj === 'object' && Array.isArray((runObj as { tasks?: unknown }).tasks)
     ? (runObj as { tasks: unknown[] }).tasks
     : null
@@ -254,7 +168,7 @@ async function flushBatch($: EngineInterface): Promise<void> {
   }
   // A later status change may already have reversed a transition while the batch waited:
   // re-read each task's current status and drop items that no longer hold it.
-  const dataDir = await resolveDataDir($)
+  const dataDir = await wakeDataDir($)
   const items: PendingItem[] = []
   for (const p of pend.items) {
     const status = await currentTaskStatus($, dataDir, pend.run, p.task)
@@ -368,7 +282,7 @@ async function flushBatch($: EngineInterface): Promise<void> {
  *  the tick rather than guessing the cursor unit. */
 async function storeMode($: EngineInterface, dataDir: string): Promise<'store' | 'file' | 'skip'> {
   try {
-    const st = await $.fs.stat(join(dataDir, 'mk.db'))
+    const st = await $.fs.stat(paths.projectDb(dataDir))
     return st.kind === 'file' ? 'store' : 'skip'
   } catch {
     return 'file'
@@ -458,8 +372,8 @@ async function readFileEvents($: EngineInterface, eventsPath: string): Promise<W
 
 async function pollEvents($: EngineInterface): Promise<void> {
   try {
-    const dataDir = await resolveDataDir($)
-    const indexPath = `${dataDir}/runs/index.json`
+    const dataDir = await wakeDataDir($)
+    const indexPath = paths.runsIndex(dataDir)
     let runs: unknown
     try {
       runs = JSON.parse(await $.fs.read(indexPath))
@@ -480,7 +394,7 @@ async function pollEvents($: EngineInterface): Promise<void> {
 
     const mode = await storeMode($, dataDir)
     if (mode === 'skip') return // mk.db is there but not a readable file: do not guess the cursor unit
-    const eventsPath = `${dataDir}/runs/${active.id}/events.jsonl`
+    const eventsPath = paths.eventsDoc(dataDir, active.id)
     // Store mode never falls through to the file view: a failed read skips the tick so a
     // transient error cannot double-fire from events.jsonl (a different cursor unit).
     const events = mode === 'store'

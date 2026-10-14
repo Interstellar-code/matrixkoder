@@ -85,7 +85,8 @@
 Common: --data DIR (else $MATRIXKODER_DATA, else the root projects table by repo path, else
 <home>/projects.json, else <main checkout of cwd's git repo>/.matrixkoder; a linked worktree
 resolves to its main checkout, a nested repo to itself), --by WHO (default orchestrator), --run ID for
-task/event/wait/render (default: the single active run). Global dir: $MK_HOME or $MATRIXKODER_HOME or ~/.matrixkoder (locks/).
+task/event/wait/render (default: the single active run). Global dir (locks/) is the MK home — the
+rule (one of the two home env names, never both disagreeing) lives in scripts/mkpaths.py (C1).
 Every command prints ONE JSON line. Errors: {"ok": false, "error": ...} exit 2; lock refused: exit 1.
 run.json is authoritative; events.jsonl may run one line ahead after a crash; `render` rebuilds board.md.
 Schema: docs/state-schema.md
@@ -138,6 +139,11 @@ def _mkdb():
     return _load_sibling("mkdb")
 
 
+# C1: every MK path (home rule, data-dir order, runs/plans folders) lives in scripts/mkpaths.py
+# and nowhere else. mkpaths imports nothing from the repo, so there is no cycle.
+mkpaths = _load_sibling("mkpaths")
+
+
 def _importer():
     """Load scripts/mk-store-import.py by path. store enable reuses its import, unmodified."""
     return _load_sibling("mk-store-import")
@@ -163,82 +169,30 @@ def now():
 
 
 def home():
-    """One MK home rule (C16), identical to mkdb.resolve_home(None): $MK_HOME and
-    $MATRIXKODER_HOME are the same setting; when both are set they must agree."""
-    mkh = os.environ.get("MK_HOME")
-    mch = os.environ.get("MATRIXKODER_HOME")
-    if mkh and mch:
-        left = os.path.realpath(os.path.abspath(os.path.expanduser(mkh)))
-        right = os.path.realpath(os.path.abspath(os.path.expanduser(mch)))
-        if left != right:
-            raise Fail(f"MK_HOME ({mkh}) and MATRIXKODER_HOME ({mch}) differ; set one MK home")
-    return os.path.expanduser(mkh or mch or "~/.matrixkoder")
+    """One MK home rule (C16): $MK_HOME and $MATRIXKODER_HOME are the same setting; when both
+    are set they must agree. The rule itself lives in scripts/mkpaths.py (C1) — this wrapper
+    only turns its RuntimeError into this script's Fail, so the CLI stays one JSON line, exit 2."""
+    try:
+        return mkpaths.home()
+    except mkpaths.Fail as e:
+        raise Fail(str(e))
 
 
 def repo_top():
-    """The main checkout of the nearest git repo above cwd, or None when there is none.
-    The walk stops before $HOME; a linked worktree maps to its main checkout."""
-    d, stop = os.path.realpath(os.getcwd()), os.path.realpath(os.path.expanduser("~"))
-    while not os.path.exists(os.path.join(d, ".git")):  # nearest repo wins; nested repos must pass --data
-        if os.path.dirname(d) == d or d == stop:
-            return None
-        d = os.path.dirname(d)
-    if d == stop:
-        return None
-    return main_worktree(d)
-
-
-def root_data_dir(top):
-    """data_dir from the root projects table for this repo, or None.
-    A missing root store is not created: a read must never make <home>/mk.db."""
-    root = os.path.join(home(), "mk.db")
-    if not os.path.exists(root):
-        return None
-    db = _mkdb()
-    con = db.open_root(home())
-    try:
-        row = con.execute(
-            "SELECT data_dir FROM projects WHERE repo=? OR repo=? ORDER BY slug LIMIT 1",
-            (top, os.path.realpath(top))).fetchone()
-    finally:
-        con.close()
-    if row and isinstance(row["data_dir"], str) and row["data_dir"].strip():
-        return os.path.normpath(os.path.join(top, os.path.expanduser(row["data_dir"].strip())))
-    return None
-
-
-def projects_json_data(top):
-    """data_dir from <home>/projects.json for this repo, or None."""
-    try:  # the wizard's home mode: ~/.matrixkoder/projects.json {"<repo>": {"data_dir": ...}}
-        with open(os.path.join(home(), "projects.json")) as f:
-            projects = json.load(f)
-        entry = projects.get(top) or projects.get(os.path.realpath(top))
-        listed = entry.get("data_dir") if isinstance(entry, dict) else None
-    except (OSError, ValueError, AttributeError):
-        listed = None
-    if isinstance(listed, str) and listed.strip():
-        return os.path.normpath(os.path.join(top, os.path.expanduser(listed.strip())))
-    return None
+    """The main checkout of the nearest git repo above cwd, or None when there is none
+    (mkpaths.repo_top)."""
+    return mkpaths.repo_top()
 
 
 def resolve_data(arg):
     """--data > $MATRIXKODER_DATA > root projects table > <home>/projects.json > <main checkout>/.matrixkoder.
     The repo is the nearest .git above cwd (never $HOME itself); a linked worktree maps to its main checkout.
-    Reading the root table checks the file exists first, so a resolve never creates <home>/mk.db."""
-    if arg:
-        return os.path.abspath(os.path.expanduser(arg))
-    if os.environ.get("MATRIXKODER_DATA"):
-        return os.path.abspath(os.path.expanduser(os.environ["MATRIXKODER_DATA"]))
-    top = repo_top()
-    if top is None:
-        raise Fail("no git toplevel above cwd (the walk stops before $HOME); pass --data or set MATRIXKODER_DATA")
-    listed = root_data_dir(top)
-    if listed:
-        return listed
-    listed = projects_json_data(top)
-    if listed:
-        return listed
-    return os.path.join(top, ".matrixkoder")
+    Reading the root table checks the file exists first, so a resolve never creates <home>/mk.db.
+    The order itself is mkpaths.data_dir (C1); this wrapper converts its Fail for the CLI."""
+    try:
+        return mkpaths.data_dir(arg)
+    except mkpaths.Fail as e:
+        raise Fail(str(e))
 
 
 def register_project(slug, repo, data_dir, name=None):
@@ -263,7 +217,7 @@ def register_project(slug, repo, data_dir, name=None):
         raise
     finally:
         con.close()
-    path = os.path.join(home(), "projects.json")
+    path = mkpaths.projects_json()
     try:
         with open(path) as f:
             projects = json.load(f)
@@ -276,16 +230,9 @@ def register_project(slug, repo, data_dir, name=None):
 
 
 def main_worktree(top):
-    """A linked worktree (.git is a file + commondir) shares the main checkout's data dir."""
-    try:
-        with open(os.path.join(top, ".git")) as f:
-            gitdir = f.read().split("gitdir:", 1)[1].strip()
-        gitdir = os.path.join(top, gitdir)
-        with open(os.path.join(gitdir, "commondir")) as f:
-            common = os.path.normpath(os.path.join(gitdir, f.read().strip()))
-    except (OSError, IndexError):  # .git is a directory, or a submodule (no commondir)
-        return top
-    return os.path.dirname(common) if os.path.basename(common) == ".git" else top
+    """A linked worktree (.git is a file + commondir) shares the main checkout's data dir
+    (mkpaths.main_worktree). Kept as a name: mk-lane.py calls it."""
+    return mkpaths.main_worktree(top)
 
 
 def check_id(v, what):
@@ -337,13 +284,13 @@ def _route_json(t):
 class Store:
     def __init__(self, data):
         self.data = data
-        self.runs = os.path.join(data, "runs")
-        self.index_path = os.path.join(self.runs, "index.json")
+        self.runs = mkpaths.runs_dir(data)
+        self.index_path = mkpaths.runs_index(data)
         # plan sync --apply: events for this run id are counted and dropped (ONE summary event
         # comes after); other runs' upkeep events still write
         self.sink_run, self.sunk = None, 0
         # store on only when <data>/mk.db already exists; nothing here creates it
-        self.store_on = os.path.exists(os.path.join(data, "mk.db"))
+        self.store_on = os.path.exists(mkpaths.project_db(data=data))
         self.pending = None
         self._mkdb = None
         self._src = {}          # (run, task, kind) -> next live source-key counter
@@ -354,15 +301,15 @@ class Store:
     def locked(self):
         # ponytail: one flock for the whole data dir; per-run locks only if writers ever contend
         os.makedirs(self.runs, exist_ok=True)
-        with open(os.path.join(self.runs, ".lock"), "a") as f:
+        with open(mkpaths.runs_lock(self.data), "a") as f:
             fcntl.flock(f, fcntl.LOCK_EX)
             yield
 
     def run_dir(self, rid):
-        return os.path.join(self.runs, rid)
+        return mkpaths.run_dir(self.data, rid)
 
     def task_dir(self, rid, tid):
-        return os.path.join(self.runs, rid, "tasks", tid)
+        return mkpaths.task_dir(self.data, rid, tid)
 
     def index(self):
         return read_json(self.index_path, [])
@@ -373,7 +320,7 @@ class Store:
 
             def owns(r):  # a corrupt sibling must not crash the pick
                 try:
-                    src = read_json(os.path.join(self.run_dir(r), "run.json"))
+                    src = read_json(mkpaths.run_doc(self.data, r))
                 except (OSError, ValueError):
                     return False
                 return isinstance(src, dict) and any(
@@ -387,7 +334,7 @@ class Store:
         rid = check_id(rid, "run id")
         if self.store_on:
             return self.load_store(rid)
-        path = os.path.join(self.run_dir(rid), "run.json")
+        path = mkpaths.run_doc(self.data, rid)
         try:
             run = read_json(path)
         except ValueError as e:
@@ -404,8 +351,8 @@ class Store:
             self.pending = lambda run=run: run  # resolved at flush, after later edits to this dict
             return
         if task is not None:
-            write_json(os.path.join(self.task_dir(run["id"], task["id"]), "task.json"), task)
-        write_json(os.path.join(self.run_dir(run["id"]), "run.json"), run)
+            write_json(mkpaths.task_doc(self.data, run["id"], task["id"]), task)
+        write_json(mkpaths.run_doc(self.data, run["id"]), run)
         idx = [r for r in self.index() if r["id"] != run["id"]]
         entry = {k: run[k] for k in ("id", "feature", "status", "started", "ended")}
         entry["plan"] = run.get("plan_id")  # C4: the plan id, null for plan-less and legacy runs
@@ -421,7 +368,7 @@ class Store:
             src = run
         else:
             try:
-                src = read_json(os.path.join(self.run_dir(rid), "run.json"))
+                src = read_json(mkpaths.run_doc(self.data, rid))
             except (OSError, ValueError):
                 return None  # unreadable dep target: unknown, so unmet — never fatal
             if not isinstance(src, dict):
@@ -456,7 +403,7 @@ class Store:
             src = run
         else:
             try:
-                src = read_json(os.path.join(self.run_dir(rid), "run.json"))
+                src = read_json(mkpaths.run_doc(self.data, rid))
             except (OSError, ValueError):
                 src = {}
             if not isinstance(src, dict):  # valid JSON but not an object: dep stays unknown
@@ -475,7 +422,7 @@ class Store:
             if r.get("status") != "active" or rid in (None, run.get("id")):
                 continue
             try:
-                x = read_json(os.path.join(self.run_dir(rid), "run.json"))
+                x = read_json(mkpaths.run_doc(self.data, rid))
             except (OSError, ValueError) as e:
                 warnings.append(f"active run {rid} unreadable, skipped: {type(e).__name__}")
                 continue
@@ -532,7 +479,7 @@ class Store:
             # the store commit writes the line; remember it so a crash before the rewrite is repaired
             self._appended.setdefault(run["id"], []).append(line)
         else:
-            fd = os.open(os.path.join(self.run_dir(run["id"]), "events.jsonl"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+            fd = os.open(mkpaths.events_doc(self.data, run["id"]), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
             try:
                 os.write(fd, line)
             finally:
@@ -542,7 +489,7 @@ class Store:
 
     def events(self, rid, n):
         try:
-            with open(os.path.join(self.run_dir(rid), "events.jsonl")) as f:
+            with open(mkpaths.events_doc(self.data, rid)) as f:
                 lines = f.read().splitlines()  # ponytail: reads whole log; tail-seek if logs reach MBs
         except FileNotFoundError:
             return []
@@ -595,7 +542,7 @@ class Store:
             text = "" if e["text"] == move else e["text"]
             parts = [e["t"], e["task"] or "run", e["type"], move, text]
             out.append("- " + " · ".join(p for p in parts if p) + f" ({e['by']})")
-        path = os.path.join(self.run_dir(run["id"]), "board.md")
+        path = mkpaths.board_doc(self.data, run["id"])
         tmp = path + ".tmp"
         with open(tmp, "w") as f:
             f.write("\n".join(out) + "\n")
@@ -972,7 +919,7 @@ class Store:
     def _publish_views_killed(self, run):
         """Append this command's new event lines, then SIGKILL before the marker moves."""
         rid = run["id"]
-        path = os.path.join(self.run_dir(rid), "events.jsonl")
+        path = mkpaths.events_doc(self.data, rid)
         lines = []
         # the lines were stored with their original bytes in meta; re-read the new rows
         con = self.store_open()
@@ -1016,7 +963,7 @@ class Store:
                 (rid, STORE_INDEX)).fetchone()
         finally:
             con.close()
-        path = os.path.join(self.run_dir(rid), "events.jsonl")
+        path = mkpaths.events_doc(self.data, rid)
         marker = self._view_marker(rid)
         published = marker[0] if marker else None
         claimed = marker[1] if marker else None
@@ -1074,10 +1021,10 @@ class Store:
                 self._write_event_marker(rid, fresh[-1]["id"], got)
         elif ids:
             self._write_event_marker(rid, max(ids), len(raw))
-        write_json(os.path.join(self.run_dir(rid), "run.json"), view)
+        write_json(mkpaths.run_doc(self.data, rid), view)
         for t in view.get("tasks") or []:
             if t.get("id"):
-                write_json(os.path.join(self.task_dir(rid, t["id"]), "task.json"), t)
+                write_json(mkpaths.task_doc(self.data, rid, t["id"]), t)
         if idx is not None:
             write_json(self.index_path, json.loads(idx["text"]))
         self.render(view)
@@ -1103,7 +1050,7 @@ class Store:
         finally:
             con.close()
         latest = row["m"] or 0
-        run_path = os.path.join(self.run_dir(rid), "run.json")
+        run_path = mkpaths.run_doc(self.data, rid)
         view_bad = not os.path.exists(run_path)
         if not view_bad:
             try:
@@ -1186,7 +1133,7 @@ class Store:
             for name in sorted(os.listdir(self.runs)):
                 if name in seen:
                     continue
-                if os.path.isfile(os.path.join(self.runs, name, "run.json")):
+                if os.path.isfile(mkpaths.run_doc(self.data, name)):
                     names.append(name)
                     seen.add(name)
         return names
@@ -1208,7 +1155,7 @@ class Store:
         tmp_data = os.path.join(parent, "data")
         os.makedirs(tmp_data)
         tmp_legacy = os.path.join(parent, "runs-legacy")
-        db_path = os.path.join(self.data, "mk.db")
+        db_path = mkpaths.project_db(data=self.data)
         legacy = os.path.join(self.data, "runs-legacy")
         imp = _importer()
         # The importer does `import mkdb` for its own module object. A test (and any caller)
@@ -1232,7 +1179,7 @@ class Store:
                     raise self.db().Fail(err)
                 raise Fail("store enable import failed: " + msg)
             imported = result.get("imported") or []
-            src_db = os.path.join(imp_home, "projects", STORE_PROJECT, "mk.db")
+            src_db = mkpaths.target_project_db(STORE_PROJECT, imp_home)
             if not os.path.exists(src_db):
                 raise Fail("store enable import wrote no database")
             # run-doc artifacts keep the file-only fields load_store overlays onto the columns.
@@ -1240,7 +1187,7 @@ class Store:
             con = self.db().open_project(imp_home, STORE_PROJECT)
             try:
                 for rid in imported:
-                    doc_path = os.path.join(self.run_dir(rid), "run.json")
+                    doc_path = mkpaths.run_doc(self.data, rid)
                     doc = open(doc_path).read()
                     digest = hashlib.sha256(doc.encode()).hexdigest()[:16]
                     src = f"doc:{rid}::{STORE_RUN_DOC}:{digest}"
@@ -1275,7 +1222,7 @@ class Store:
             finally:
                 con.close()
             for rid, (got_t, got_e) in counts.items():
-                doc = json.load(open(os.path.join(self.run_dir(rid), "run.json")))
+                doc = json.load(open(mkpaths.run_doc(self.data, rid)))
                 n_tasks = len([t for t in doc.get("tasks") or [] if isinstance(t, dict) and t.get("id")])
                 if got_t != n_tasks:
                     raise Fail(f"store enable verify failed: {rid} tasks {got_t}/{n_tasks}")
@@ -1513,7 +1460,7 @@ def file_sha(path):
 
 def lock_path(res):
     # lower-case file name: APFS is case-insensitive, so "DB" and "db" must be the same lock
-    return os.path.join(home(), "locks", check_id(res, "lock resource").lower() + ".lock")
+    return mkpaths.lock_path(check_id(res, "lock resource").lower())
 
 
 def lock_state(rec):
@@ -1583,7 +1530,7 @@ def cmd_run(a, st):
                 plan_tool("set", a.plan, "--status", "running")
                 plan_tool("add-run", a.plan, "--run", rid)
                 cur = plan_tool("parse", a.plan)  # sha AFTER set/add-run: no board ⚠ at birth
-            os.makedirs(os.path.join(st.run_dir(rid), "tasks"), exist_ok=True)
+            os.makedirs(mkpaths.tasks_dir(st.data, rid), exist_ok=True)
             run = {"schema": SCHEMA, "id": rid, "feature": a.feature, "branch": a.branch, "plan": a.plan,
                    "plan_id": cur.get("plan") if cur else None, "plan_sha": cur.get("sha") if cur else None,
                    "plan_status": cur.get("status") if cur else None,
@@ -1739,7 +1686,7 @@ def promote_closed(st, run, by):
         frm = t["status"]
         st.event(run, "transition", note, task=t["id"], frm=frm, to="done", by=by)
         t["status"], t["updated"] = "done", now()
-        write_json(os.path.join(st.task_dir(run["id"], t["id"]), "task.json"), t)
+        write_json(mkpaths.task_doc(st.data, run["id"], t["id"]), t)
         n += 1
         yield t["id"]
 
@@ -1877,7 +1824,7 @@ def add_task(st, run, tid, title, wave, deps, owned, parent, by, extra=None, fol
     finally:
         st._rollup_keep = None
     if reopen is not None:  # the file view carries the phase's new status
-        write_json(os.path.join(st.task_dir(run["id"], reopen["id"]), "task.json"), reopen)
+        write_json(mkpaths.task_doc(st.data, run["id"], reopen["id"]), reopen)
     warnings += st.refresh_others(run, by)  # their boards show "blocks"; ready stays correct
     return t, warnings
 
@@ -2064,7 +2011,7 @@ def cmd_task(a, st):
                     elif a.note:
                         st.event(run, "note", a.note, task=c["id"], by=a.by)
                     c["status"], c["updated"] = s, now()
-                    write_json(os.path.join(st.task_dir(run["id"], c["id"]), "task.json"), c)
+                    write_json(mkpaths.task_doc(st.data, run["id"], c["id"]), c)
             if changes.get("status") in DEP_GATED and t["status"] not in DEP_GATED:
                 waiting = st.unmet_tree(run, t)  # the task's own deps plus every ancestor's
                 if waiting:
@@ -2129,7 +2076,7 @@ def cmd_task(a, st):
                          + (f" [group lead {t['id']}]" if x is not t else ""), task=x["id"], by=a.by)
                 if x is not t:  # save() below writes the lead's task.json only
                     x["updated"] = now()
-                    write_json(os.path.join(st.task_dir(run["id"], x["id"]), "task.json"), x)
+                    write_json(mkpaths.task_doc(st.data, run["id"], x["id"]), x)
             # Store mode only, and only the store row: the file views (run.json, events,
             # task.json) stay exactly what the file path writes. The watcher reads the row.
             if st.store_on:
@@ -2138,7 +2085,7 @@ def cmd_task(a, st):
         st.save(run, t, a.by)
         for x in moved:  # a re-parent moved T and rolled both parents up in this one save
             if x is not t:
-                write_json(os.path.join(st.task_dir(run["id"], x["id"]), "task.json"), x)
+                write_json(mkpaths.task_doc(st.data, run["id"], x["id"]), x)
         warnings = st.refresh_others(run, a.by) if a.action == "set" else []
         st.flush()
         if a.action == "round":
@@ -2269,7 +2216,7 @@ def task_verify(st, run, t, a):
         st.event(run, "transition", note, task=leaf["id"], frm=leaf["status"], to=target, by=a.by)
         leaf["status"], leaf["updated"] = target, now()
         moved.append(leaf["id"])
-        write_json(os.path.join(st.task_dir(run["id"], leaf["id"]), "task.json"), leaf)
+        write_json(mkpaths.task_doc(st.data, run["id"], leaf["id"]), leaf)
     st.save(run, t, a.by)
     st.flush()
     out = {"ok": True, "task": t, "result": "fail" if failed else "pass", "verdict": text, "moved": moved}

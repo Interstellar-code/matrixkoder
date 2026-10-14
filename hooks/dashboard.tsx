@@ -10,11 +10,12 @@ import type { Elements, EngineInterface, On, PluginOptions, RenderElement } from
 type Els = Elements[keyof Elements]
 import type { MkDashTab, MkEvent, MkRun, MkRunIndexEntry, MkSnapshot, MkStatusMemory, MkTask } from '../types'
 import {
-  AGENT_ORDER, PANE_ID, EMPTY_SNAPSHOT, activeEntries, basename, candidateDirs, coerceIndex, coerceRun, coerceUsage, join,
-  globalDirPath, mainCheckout, mkSnapshot, normalizePath, orderAgents, parentOf, parseGitdir, parseJson, parseYamlAgents, parseYamlProviders,
-  projectDataDir, projectDirFromStore, sanitizeText, timerRegistry, type MkProjectRow,
+  AGENT_ORDER, PANE_ID, EMPTY_SNAPSHOT, activeEntries, basename, coerceIndex, coerceRun, coerceUsage, join,
+  mkSnapshot, normalizePath, orderAgents, parentOf, parseJson, parseYamlAgents, parseYamlProviders,
+  sanitizeText, timerRegistry,
 } from './data'
 import type { MkPaneSnapshot } from './data'
+import { globalDirOf, homeDir, paths, resolveDataDir } from './paths'
 import { AGENT_COLOR, AGENT_GLYPH, NARROW, STATUS_COLOR, STATUS_GLYPH, bar, leftCol, rightCol } from './tabs/ui'
 import { mockRunHeader, mockTabCounts, stageWord, STAGE_TOTAL } from './tabs/header'
 import type { RunHeaderData } from './tabs/header'
@@ -535,7 +536,7 @@ async function startLoop($: EngineInterface, options: PluginOptions, cwd: string
   lastChipText = undefined
   await refreshSafe($, options, cwd) // first load populates pane + chip and never toasts
   const gdir = await globalDirOf($, await homeDir($))
-  const usageMissing = gdir == null || (await readJson($, usagePath(gdir))) == null
+  const usageMissing = gdir == null || (await readJson($, paths.usage(gdir))) == null
   if (usageMissing) void pollUsage($, cwd) // cold start: do not show "no ledger yet" for N minutes
 }
 
@@ -575,86 +576,10 @@ async function readText($: EngineInterface, path: string): Promise<string | null
   }
 }
 
-/** Schema rule (state-schema.md): MATRIXKODER_DATA → ~/.matrixkoder/projects.json entry for the repo → nearest .git
- *  toplevel's .matrixkoder; a linked worktree (.git FILE) resolves to its main checkout.
- *  The walk stops before home: ~/.matrixkoder is the GLOBAL dir, never project data. */
-
-/** The global dir ($MATRIXKODER_HOME, else ~/.matrixkoder): usage.json, projects.json. */
-async function globalDirOf($: EngineInterface, home: string | null): Promise<string | null> {
-  let envHome: string | undefined
-  try {
-    envHome = (await $.env.get('MATRIXKODER_HOME')) || undefined
-  } catch {
-    // env noun refused — the default
-  }
-  return globalDirPath(envHome, home)
-}
-
-
-/** Root store first (`mkdb.py projects --json`), then projects.json. null = neither names this
- *  repo. File-local on purpose: the loader follows $ only into a function declared in this file. */
-async function listedDataDir($: EngineInterface, repoPaths: readonly string[], home: string | null): Promise<string | null> {
-  const gdir = await globalDirOf($, home)
-  if (gdir == null) return null
-  try {
-    const ran = await $.process.run(
-      ['python3', join($.plugin.root, 'scripts/mkdb.py'), 'projects', '--json', '--home', gdir],
-      { timeoutMs: 5000 },
-    )
-    if (ran.exitCode === 0) {
-      const parsed = parseJson(ran.stdout)
-      const rows = parsed !== null && typeof parsed === 'object' && 'projects' in parsed
-        ? (parsed as { projects?: unknown }).projects
-        : null
-      const fromStore = projectDirFromStore(Array.isArray(rows) ? rows as MkProjectRow[] : null, repoPaths, home)
-      if (fromStore != null) return fromStore
-    }
-  } catch {
-    // no python, or the command failed: projects.json still names the dir
-  }
-  return projectDataDir(await readJson($, join(gdir, 'projects.json')), repoPaths, home)
-}
-
-async function resolveDataDir($: EngineInterface, cwd: string, home: string | null): Promise<string | null> {
-  try {
-    const viaEnv = await $.env.get('MATRIXKODER_DATA')
-    if (viaEnv) return viaEnv
-  } catch {
-    // env noun refused — fall through to the walk
-  }
-  for (const dir of candidateDirs(cwd, home ?? undefined)) {
-    const dotGit = join(dir, '.git')
-    let toplevel: string | null = null
-    try {
-      const stat = await $.fs.stat(dotGit)
-      if (stat.kind === 'dir') {
-        toplevel = dir
-      } else if (stat.kind === 'file') {
-        const gitdir = parseGitdir((await readText($, dotGit)) ?? '')
-        if (gitdir) {
-          const gd = gitdir.startsWith('/') ? gitdir : join(dir, gitdir)
-          const commondir = await readText($, join(gd, 'commondir'))
-          if (commondir != null) toplevel = mainCheckout(gd, commondir) ?? dir
-        }
-      }
-    } catch {
-      continue // no .git here — keep walking up
-    }
-    if (toplevel == null) continue
-    // nearest repo boundary found: nested repos stop here (schema: pass --data for the outer)
-    // the root store names the data dir of this repo; projects.json is the fallback; else <repo>/.matrixkoder
-    const listed = await listedDataDir($, [toplevel], home)
-    const data = listed ?? join(toplevel, '.matrixkoder')
-    try {
-      const s = await $.fs.stat(data)
-      if (s.kind === 'dir') return data
-    } catch {
-      // repo without a data dir yet → first-run
-    }
-    return null
-  }
-  return null
-}
+/** The data dir of this session (mk-state.py's resolve_data order) and the global dir
+ *  ($MK_HOME or $MATRIXKODER_HOME, else ~/.matrixkoder) are ONE rule, in paths.ts (C1):
+ *  globalDirOf, listedDataDir, resolveDataDir and homeDir. The dashboard asks them with
+ *  `requireExisting`, so a repo whose data dir is not there yet answers null (first-run). */
 
 /** Loads every active run, newest first. The NEWEST keeps the single-run
  *  semantics it always had — its run/error drive the ⚠ note, the NoRun panel
@@ -685,27 +610,6 @@ async function readRun($: EngineInterface, dataDir: string, entry: MkRunIndexEnt
   return { run, error: null }
 }
 
-async function homeDir($: EngineInterface): Promise<string | null> {
-  try {
-    const viaEnv = await $.env.get('HOME')
-    if (viaEnv) return viaEnv
-  } catch {
-    // env noun refused — fall through to the process
-  }
-  try {
-    const ran = await $.process.run(['printenv', 'HOME'])
-    const out = ran.stdout.trim()
-    if (ran.exitCode === 0 && out) return out
-  } catch {
-    // no process either — usage stays empty
-  }
-  return null
-}
-
-function usagePath(globalDir: string): string {
-  return join(globalDir, 'usage.json')
-}
-
 async function loadSnapshot($: EngineInterface, cwd: string): Promise<MkSnapshot> {
   let now = 0
   try {
@@ -714,7 +618,7 @@ async function loadSnapshot($: EngineInterface, cwd: string): Promise<MkSnapshot
     // clock refused — remaining times show as unknown
   }
   const home = await homeDir($)
-  const dataDir = await resolveDataDir($, cwd, home)
+  const dataDir = await resolveDataDir($, { cwd, home, requireExisting: true, store: true })
   let run: MkRun | null = null
   let activeRuns: MkRun[] = []
   let runs: ReturnType<typeof coerceIndex> = []
@@ -723,9 +627,9 @@ async function loadSnapshot($: EngineInterface, cwd: string): Promise<MkSnapshot
     ;({ run, activeRuns, runs, error } = await loadRuns($, dataDir))
   }
   const gdir = await globalDirOf($, home)
-  const usage = gdir ? coerceUsage(await readJson($, usagePath(gdir))) : null
+  const usage = gdir ? coerceUsage(await readJson($, paths.usage(gdir))) : null
   // the project yaml scopes the usage section (and its poll) to this project's agents and providers
-  const yaml = dataDir != null ? await readText($, join(dataDir, 'matrixkoder.yaml')) : null
+  const yaml = dataDir != null ? await readText($, paths.projectYaml(dataDir)) : null
   const projectAgents = orderAgents(parseYamlAgents(yaml ?? ''))
   return { ...mkSnapshot(now, dataDir, run, activeRuns, runs, usage, projectAgents), error }
 }
@@ -806,7 +710,7 @@ let pendingInFlight = false
 async function refreshPending($: EngineInterface, cwd: string): Promise<void> {
   if (pendingInFlight) return
   pendingInFlight = true
-  const dataDir = await resolveDataDir($, cwd, await homeDir($)).catch(() => null)
+  const dataDir = await resolveDataDir($, { cwd, home: await homeDir($), requireExisting: true, store: true }).catch(() => null)
   const run = (argv: readonly string[], init?: { timeoutMs?: number }) =>
     $.process.run([...argv], init).then(r => ({ stdout: r.stdout, code: r.exitCode }))
   void readPending(run, $.plugin.root, dataDir).then(async got => {
@@ -1006,8 +910,8 @@ function plansDue(view: Record<string, string>, now: number): boolean {
 }
 
 async function refreshPlans($: EngineInterface, cwd: string): Promise<void> {
-  const dataDir = await resolveDataDir($, cwd, await homeDir($)).catch(() => null)
-  const path = dataDir == null ? '' : join(dataDir, 'mk.db')
+  const dataDir = await resolveDataDir($, { cwd, home: await homeDir($), requireExisting: true, store: true }).catch(() => null)
+  const path = dataDir == null ? '' : paths.projectDb(dataDir)
   let exists = false
   if (path !== '') {
     try { exists = await $.fs.exists(path) } catch { exists = false }
@@ -1139,18 +1043,12 @@ function applyCardsRead(
 }
 
 async function refreshCards($: EngineInterface): Promise<void> {
-  // storeHome is MK_HOME when set, otherwise $HOME/.matrixkoder. Both the
-  // exists-check and the --home handed to mkdb use that directory: cards()
-  // would create a missing root store, so exists() runs first.
-  let mkHome = ''
-  try {
-    mkHome = (await $.env.get('MK_HOME')) || ''
-  } catch {
-    mkHome = ''
-  }
-  const userHome = mkHome === '' ? await homeDir($) : null
-  const storeHome = mkHome !== '' ? mkHome : (userHome == null ? null : join(userHome, '.matrixkoder'))
-  const path = storeHome == null ? '' : join(storeHome, 'mk.db')
+  // storeHome is the global dir (paths.globalDirOf: $MK_HOME, else
+  // $MATRIXKODER_HOME, else ~/.matrixkoder). Both the exists-check and the
+  // --home handed to mkdb use it: cards() would create a missing root store,
+  // so exists() runs first.
+  const storeHome = await globalDirOf($, await homeDir($))
+  const path = storeHome == null ? '' : paths.projectDb(storeHome)
   let exists = false
   if (path !== '') {
     try {
@@ -1276,21 +1174,20 @@ async function ensureBus($: EngineInterface, options: PluginOptions, cwd: string
   if (busInFlight) return
   busInFlight = true
   try {
-    const dataDir = await resolveDataDir($, cwd, await homeDir($))
+    const dataDir = await resolveDataDir($, { cwd, home: await homeDir($), requireExisting: true, store: true })
     if (dataDir == null) return // first-run: the wizard writes the data dir
     // the pane's own snapshot, not a second loadSnapshot: the refresh timer owns
     // reading run.json, and startLoop always populates this before either call site
     const snap = await read($, snapshotAtom) as MkPaneSnapshot
     if (snap.run == null) return // only an active run owns a bus
     const script = `${$.plugin.root}/scripts/mk-bus.py`
-    // Root bus (C6): a project with a store heartbeats the one bus under the
-    // MK home. File mode (no mk.db) keeps the per-project bus.json.
-    let mkHome = ''
-    try { mkHome = (await $.env.get('MK_HOME')) || '' } catch { mkHome = '' }
-    const userHome = mkHome === '' ? await homeDir($) : null
-    const busHome = mkHome !== '' ? mkHome : (userHome == null ? null : join(userHome, '.matrixkoder'))
-    const rootBus = busHome != null && (await readText($, join(dataDir, 'mk.db'))) != null
-    const busFile = rootBus ? join(busHome as string, 'bus.json') : join(dataDir, 'bus.json')
+    // Root bus (C6): a project with a store heartbeats the ONE bus under the
+    // global dir (paths.globalDirOf: $MK_HOME, else $MATRIXKODER_HOME, else
+    // ~/.matrixkoder). File mode (no mk.db) keeps the per-project bus.json —
+    // paths.busDirOf is mkpaths.bus_dir's rule.
+    const globalDir = await globalDirOf($, await homeDir($))
+    const busDir = paths.busDirOf(dataDir, await readText($, paths.projectDb(dataDir)) != null, globalDir)
+    const busFile = paths.busFile(busDir)
     if ((await readText($, busFile)) != null) {
       await $.process.run(['python3', script, 'heartbeat', '--data', dataDir, '--run', snap.run.id], { timeoutMs: BUS_TIMEOUT_MS })
       return
@@ -1322,9 +1219,9 @@ async function busDisabled($: EngineInterface, dataDir: string): Promise<boolean
 async function projectProviders($: EngineInterface, cwd: string): Promise<readonly string[] | null> {
   try {
     const home = await homeDir($)
-    const dataDir = await resolveDataDir($, cwd, home)
+    const dataDir = await resolveDataDir($, { cwd, home, requireExisting: true, store: true })
     if (dataDir == null) return null
-    const yaml = await readText($, join(dataDir, 'matrixkoder.yaml'))
+    const yaml = await readText($, paths.projectYaml(dataDir))
     if (yaml == null) return null
     const providers = parseYamlProviders(yaml)
     return providers != null && providers.length > 0 ? providers : null
@@ -1400,11 +1297,11 @@ async function ensureSettingsLoaded($: EngineInterface): Promise<void> {
     } catch {
       cwd = null
     }
-    const dataDir = cwd == null ? null : await resolveDataDir($, cwd, await homeDir($))
+    const dataDir = cwd == null ? null : await resolveDataDir($, { cwd, home: await homeDir($), requireExisting: true, store: true })
     let yamlExists = false
     if (dataDir != null) {
       try {
-        yamlExists = (await $.fs.stat(join(dataDir, 'matrixkoder.yaml'))).kind === 'file'
+        yamlExists = (await $.fs.stat(paths.projectYaml(dataDir))).kind === 'file'
       } catch {
         yamlExists = false
       }

@@ -29,6 +29,11 @@ import fcntl, json, os, re, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True
+import importlib.util
+
+_pspec = importlib.util.spec_from_file_location("mkpaths", os.path.join(HERE, "mkpaths.py"))
+mkpaths = importlib.util.module_from_spec(_pspec)
+_pspec.loader.exec_module(mkpaths)
 
 RATE_S = 600
 IDLE_MIN_DEFAULT = 3
@@ -317,21 +322,17 @@ def round_of(watch):
 
 
 def _mk_home():
-    """One MK home rule (C16), identical to mkdb.resolve_home(None): $MK_HOME and
-    $MATRIXKODER_HOME are the same setting; when both are set they must agree."""
-    mkh = os.environ.get("MK_HOME")
-    mch = os.environ.get("MATRIXKODER_HOME")
-    if mkh and mch:
-        left = os.path.realpath(os.path.abspath(os.path.expanduser(mkh)))
-        right = os.path.realpath(os.path.abspath(os.path.expanduser(mch)))
-        if left != right:
-            raise RuntimeError(f"MK_HOME ({mkh}) and MATRIXKODER_HOME ({mch}) differ; set one MK home")
-    return os.path.expanduser(mkh or mch or "~/.matrixkoder")
+    """One MK home rule (C16): $MK_HOME and $MATRIXKODER_HOME are the same setting; when both
+    are set they must agree. The rule itself is scripts/mkpaths.home (C1); this copy raised a
+    plain RuntimeError and keeps raising one for its callers."""
+    try:
+        return mkpaths.home()
+    except mkpaths.Fail as e:
+        raise RuntimeError(str(e))
 
 
 def state_path(data):
-    base = data or _mk_home()
-    return os.path.join(base, STATE_NAME)
+    return mkpaths.nudge_state(data)
 
 
 def load_state(path):
@@ -464,8 +465,7 @@ def dispatch(pane, text):
 
 
 def lock_path_for(data):
-    base = data or _mk_home()
-    return os.path.join(base, LOCK_NAME)
+    return mkpaths.nudge_state_lock(data)
 
 
 class NudgeLock:

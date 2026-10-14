@@ -93,6 +93,7 @@ def _load(name, path):
 
 mk_state = _load("mk_state", os.path.join(HERE, "mk-state.py"))  # data dir, atomic write, timestamp
 mkdb = _load("mkdb", os.path.join(HERE, "mkdb.py"))  # project store; opened only via open_project
+mkpaths = _load("mkpaths", os.path.join(HERE, "mkpaths.py"))  # C1: home, data-dir order, paths
 
 # lanes.json slot keys that have a lane_slots column. Anything else is data we must not drop.
 SLOT_KEYS = ("path", "workspace", "workspace_id", "state", "run", "task", "branch", "lock_hash", "updated")
@@ -148,7 +149,7 @@ def load_config(data):
     lanes_disposable or copy checks rejected."""
     cfg = dict(DEFAULTS, disposable=[], warnings=[])
     try:
-        with open(os.path.join(data, "matrixkoder.yaml")) as f:
+        with open(mkpaths.project_yaml(data)) as f:
             lines = f.read().splitlines()
     except OSError:
         return cfg
@@ -194,17 +195,15 @@ def load_config(data):
 
 def git_toplevel():
     """The nearest .git above cwd, exactly like mk-state.resolve_data's walk (never $HOME itself)."""
-    d, stop = os.path.realpath(os.getcwd()), os.path.realpath(os.path.expanduser("~"))
-    while not os.path.exists(os.path.join(d, ".git")):
-        if os.path.dirname(d) == d or d == stop:
-            raise Fail("no git toplevel above cwd (the walk stops before $HOME); pass --data")
-        d = os.path.dirname(d)
-    return d
+    top = mkpaths.repo_top()
+    if top is None:
+        raise Fail("no git toplevel above cwd (the walk stops before $HOME); pass --data")
+    return top
 
 
 def main_checkout():
     """A linked worktree resolves to its main checkout (mk-state.main_worktree)."""
-    return mk_state.main_worktree(git_toplevel())
+    return mkpaths.main_worktree(git_toplevel())
 
 
 def slot_path(cfg, main, n):
@@ -291,7 +290,7 @@ def locked(data, timeout):
     an error, never a second writer racing the first."""
     with contextlib.suppress(OSError):
         os.makedirs(data, exist_ok=True)
-    f = open(os.path.join(data, "lanes.lock"), "a")
+    f = open(mkpaths.lanes_lock(data), "a")
     try:
         deadline = time.monotonic() + timeout
         while True:
@@ -313,7 +312,7 @@ def locked(data, timeout):
 def read_lanes_file(data):
     """-> the registry from lanes.json. A missing or wrong-shaped file is an empty pool; corrupt
     JSON is an error (exit 2), because a pool we cannot read is not a pool we may quietly reset."""
-    d = mk_state.read_json(os.path.join(data, "lanes.json"), None)
+    d = mk_state.read_json(mkpaths.lanes_file(data), None)
     if not isinstance(d, dict) or not isinstance(d.get("slots"), dict):
         return {"schema": SCHEMA, "slots": {}}
     d["schema"] = SCHEMA
@@ -322,23 +321,15 @@ def read_lanes_file(data):
 
 
 def write_lanes_file(data, lanes):
-    mk_state.write_json(os.path.join(data, "lanes.json"), {"schema": SCHEMA, "slots": lanes["slots"]})
+    mk_state.write_json(mkpaths.lanes_file(data), {"schema": SCHEMA, "slots": lanes["slots"]})
 
 
 def store_db(data):
     """The project store, or None when <data>/mk.db is absent. Absence is the self-hosting guard:
     no store code runs and no file is created. Opened only through mkdb.open_project."""
-    if not os.path.isfile(os.path.join(data, "mk.db")):
+    if not os.path.isfile(mkpaths.project_db(data=data)):
         return None
-    home = os.environ.get("MK_HOME")
-    alt = os.environ.get("MATRIXKODER_HOME")
-    if home and alt:
-        left = os.path.realpath(os.path.abspath(os.path.expanduser(home)))
-        right = os.path.realpath(os.path.abspath(os.path.expanduser(alt)))
-        if left != right:
-            raise Fail(f"MK_HOME ({home}) and MATRIXKODER_HOME ({alt}) differ; set one MK home")
-    home = os.path.abspath(os.path.expanduser(home or alt or "~/.matrixkoder"))
-    return mkdb.open_project(home, data_dir=data)
+    return mkdb.open_project(mkpaths.home(), data_dir=data)
 
 
 def _cell(value):
@@ -412,7 +403,7 @@ def read_lanes(data):
         return read_lanes_file(data)
     try:
         rows = read_rows(con)
-        if not rows and os.path.isfile(os.path.join(data, "lanes.json")):
+        if not rows and os.path.isfile(mkpaths.lanes_file(data)):
             file_lanes = read_lanes_file(data)
             if file_lanes["slots"]:
                 con.execute("BEGIN IMMEDIATE")
@@ -427,7 +418,7 @@ def read_lanes(data):
                 return lanes_from_rows(rows)
         lanes = lanes_from_rows(rows)
         # repair a view that drifted from the rows (crash between commit and rewrite)
-        on_disk = read_lanes_file(data) if os.path.isfile(os.path.join(data, "lanes.json")) else None
+        on_disk = read_lanes_file(data) if os.path.isfile(mkpaths.lanes_file(data)) else None
         if on_disk != lanes:
             publish_view(data, lanes)
         return lanes
@@ -444,7 +435,7 @@ def write_lanes(data, lanes):
     try:
         con.execute("BEGIN IMMEDIATE")
         try:
-            if not read_rows(con) and os.path.isfile(os.path.join(data, "lanes.json")):
+            if not read_rows(con) and os.path.isfile(mkpaths.lanes_file(data)):
                 import_file(con, read_lanes_file(data))
             write_rows(con, lanes)
             con.execute("COMMIT")
@@ -796,7 +787,7 @@ def lock_hash(path):
 
 def run_ids(data):
     """-> the run ids mk-state knows: <data>/runs/index.json, the same list `run list` prints."""
-    idx = mk_state.read_json(os.path.join(data, "runs", "index.json"), [])
+    idx = mk_state.read_json(mkpaths.runs_index(data), [])
     if not isinstance(idx, list):
         return []
     return [r.get("id") for r in idx if isinstance(r, dict) and r.get("id")]
@@ -816,7 +807,7 @@ def resolve_task(data, rid, task):
     write must use the stored spelling). Falls back to `task` when the run or its task list cannot
     be read: the mk-state write stays best-effort, exactly as before."""
     try:
-        run = mk_state.read_json(os.path.join(data, "runs", rid, "run.json"), None)
+        run = mk_state.read_json(mkpaths.run_doc(data, rid), None)
     except (OSError, ValueError):
         return task
     for t in (run.get("tasks") if isinstance(run, dict) else None) or []:
