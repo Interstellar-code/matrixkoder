@@ -207,37 +207,45 @@ def projects_json_data(top, arg=None):
     return None
 
 
-def project_data_dir(slug):
+def project_data_dir(slug, root=None):
     """The data_dir the root projects table gives this slug, or None. Never creates mk.db.
 
     mk-bus.store_for's rule: realpath(expanduser(recorded)). A relative data_dir therefore
     resolves against cwd, not the repo — the bus runs from the repo or a lane of it, and that
     is the bus's rule to keep (state-side `root_data_dir` resolves it against the repo top).
+    `root` names the root store's home (default: `root_home()`), so a caller with an explicit
+    --home reads that store rather than the ambient one.
     """
-    row = _query(os.path.join(root_home(), ROOT_DB_NAME),
+    row = _query(os.path.join(root or root_home(), ROOT_DB_NAME),
                  "SELECT data_dir FROM projects WHERE slug=?", (slug,))
     if not row or not isinstance(row["data_dir"], str) or not row["data_dir"].strip():
         return None
     return os.path.realpath(os.path.expanduser(row["data_dir"].strip()))
 
 
-def project_slug_of(data_dir):
-    """The root projects.slug whose data_dir is this path, or None. Never creates mk.db.
+def project_slug_of(data_dir, root=None):
+    """The root projects.slug whose data_dir OR migrated db_path folder is this path, or None.
 
     mk-bus.project_slug_for's read half: realpath on both sides, slug rule C11 (an invalid
-    slug is skipped, so a matching row with a bad slug never wins). The bus keeps its own
-    "no row yet → register a derived slug" write path.
+    slug is skipped, so a matching row with a bad slug never wins). After a switch a project has
+    TWO known locations — the legacy data_dir still recorded on the row, and the C2 folder that
+    holds its store (dirname of db_path) — and the bus is launched with either one, so both must
+    resolve to the same slug (C7: the bus follows the switch). Never creates mk.db.
+    `root` as in `project_data_dir`.
     """
     real = os.path.realpath(data_dir)
-    con = _open_root_ro(os.path.join(root_home(), ROOT_DB_NAME))
+    con = _open_root_ro(os.path.join(root or root_home(), ROOT_DB_NAME))
     if con is None:
         return None
     try:
-        for row in con.execute("SELECT slug, data_dir FROM projects"):
-            slug, recorded = row["slug"], row["data_dir"]
+        for row in con.execute("SELECT slug, data_dir, db_path FROM projects"):
+            slug, recorded, db_path = row["slug"], row["data_dir"], row["db_path"]
             if not isinstance(slug, str) or not SLUG_RE.match(slug):
                 continue
             if recorded and os.path.realpath(os.path.expanduser(recorded)) == real:
+                return slug
+            if (isinstance(db_path, str) and db_path.strip()
+                    and os.path.realpath(os.path.dirname(os.path.expanduser(db_path.strip()))) == real):
                 return slug
     except sqlite3.Error:
         return None
@@ -246,31 +254,193 @@ def project_slug_of(data_dir):
     return None
 
 
+# ---- migration: today's layout vs the C2 target (L3) ----------------------------------------
+
+def _root_signature(root=None):
+    """A cheap change stamp for the root store: (path, mtime_ns, size) or None.
+
+    A resolve runs on hot paths (every run/plan/task folder build), so the migrated lookup below
+    is memoised against this stamp instead of hitting SQLite each call. A switch rewrites the root
+    mk.db (mk-migrate's UPDATE), which moves mtime/size and drops the memo.
+    """
+    path = os.path.join(root or root_home(), ROOT_DB_NAME)
+    try:
+        st = os.stat(path)
+    except OSError:
+        return path, None, None
+    return path, st.st_mtime_ns, st.st_size
+
+
+_MIGRATED_MEMO = None  # (signature, {slug: db_path}, {data_dir: slug})
+
+
+def _migrated_maps(root=None):
+    """({slug: db_path}, {realpath(data_dir): slug}) for the root store, memoised by its stamp.
+
+    db_path set is C3's migrated marker. A missing or unreadable root yields two empty maps; this
+    never creates a store and never raises, so a resolve can fall back to today's path.
+    """
+    global _MIGRATED_MEMO
+    sig = _root_signature(root)
+    if _MIGRATED_MEMO is not None and _MIGRATED_MEMO[0] == sig:
+        return _MIGRATED_MEMO[1], _MIGRATED_MEMO[2]
+    by_slug, by_data = {}, {}
+    con = _open_root_ro(sig[0])
+    if con is not None:
+        try:
+            for row in con.execute("SELECT slug, data_dir, db_path FROM projects"):
+                slug, data_dir, db_path = row["slug"], row["data_dir"], row["db_path"]
+                if not isinstance(slug, str) or not SLUG_RE.match(slug):
+                    continue
+                if isinstance(db_path, str) and db_path.strip():
+                    by_slug[slug] = db_path.strip()
+                if isinstance(data_dir, str) and data_dir.strip():
+                    by_data[os.path.realpath(os.path.expanduser(data_dir.strip()))] = slug
+        except sqlite3.Error:
+            by_slug, by_data = {}, {}
+        finally:
+            con.close()
+    _MIGRATED_MEMO = (sig, by_slug, by_data)
+    return by_slug, by_data
+
+
+def db_path_of(slug=None, data=None, root=None):
+    """The root projects.db_path for this project, or None (pre-migration).
+
+    Either form names the project: a slug directly, a data dir through the root row's data_dir.
+    A missing root, a missing row or an unreadable root is None — never an exception, so every
+    caller keeps today's path for a pre-migration project (C3).
+    """
+    by_slug, by_data = _migrated_maps(root)
+    if not slug and data:
+        slug = by_data.get(os.path.realpath(os.path.expanduser(data)))
+    return by_slug.get(slug) if slug else None
+
+
+def migrated_slug(data=None, slug=None, root=None):
+    """The slug of a migrated project named by `data` or `slug`, else None. db_path set = migrated."""
+    by_slug, by_data = _migrated_maps(root)
+    if not slug and data:
+        slug = by_data.get(os.path.realpath(os.path.expanduser(data)))
+    return slug if slug in by_slug else None
+
+
+def project_folder(data, home_arg=None):
+    """The folder a caller holding a data dir should use: the C2 project folder for a migrated
+    project, else the data dir itself.
+
+    mk-plan holds the repo's data dir (its `--data`), which after a switch is the project's LEGACY
+    location; the store, archives and round files must land in the C2 folder once the root row has
+    db_path set. mkdb.project_dir/open_project keep their `--data`-literal rule (mk-migrate's
+    rollback addresses the legacy store through exactly that form), so a writer resolves the folder
+    here instead. Never creates anything.
+    """
+    slug = migrated_slug(data=data, root=home_arg)
+    return target_project_dir(slug, home_arg) if slug else data
+
+
 # ---- stores ----------------------------------------------------------------------------------
 
 def project_db(slug=None, data=None):
-    """The project store: <data>/mk.db. `data` wins over the slug's root-projects data_dir.
+    """The project store (C2/C3). A migrated project's store is its root `db_path`; else <data>/mk.db.
 
-    Absent file means file mode; this never creates it. Returns None when a slug has no root
-    projects row carrying a data_dir (the caller owns that error).
+    The slug form follows a switch: a root `projects.db_path` set is L2's marker, so the bus's
+    `project_db(slug=…)` (L0.3) resolves the NEW store. The data form keeps today's `<data>/mk.db`:
+    a data dir is the project's *legacy* location after a switch, and mk-migrate's rollback reads
+    the source store through exactly this form (its copy-back must not follow the switch). Absent
+    file means file mode; this never creates it. Returns None when a slug has no root projects row
+    carrying a data_dir (the caller owns that error).
     """
     if data:
         return os.path.join(os.path.abspath(os.path.expanduser(data)), ROOT_DB_NAME)
     if not slug:
         raise Fail("project_db needs a slug or a data dir")
+    target = db_path_of(slug=slug)
+    if target:
+        return target
     data_dir_of_slug = project_data_dir(slug)
     if not data_dir_of_slug:
         return None
     return os.path.join(data_dir_of_slug, ROOT_DB_NAME)
 
 
+def project_dir(home_arg=None, slug=None, data_dir=None):
+    """The project's folder (C2): <home>/projects/<slug> once migrated, else today's answer.
+
+    The slug form follows a switch — a root `projects.db_path` set (L2's marker) resolves to the
+    C2 folder, so a slug-named reader (the bus, a DB reader) lands in the new tree. The `--data`
+    form keeps mkdb's original rule verbatim: it names a folder, and that folder is the answer
+    (mk-migrate's rollback and its fixtures address the LEGACY <data>/mk.db by exactly this form,
+    so it must not follow the switch). A pre-migration project is byte-for-byte today's path.
+    Never creates anything.
+    """
+    if data_dir:
+        return os.path.abspath(os.path.expanduser(data_dir))
+    if not slug:
+        raise Fail("pass --project or --data")
+    if db_path_of(slug=slug, root=home_arg):
+        return target_project_dir(slug, home_arg)
+    return os.path.join(home(home_arg), TARGET_PROJECTS_DIR, slug)
+
+
 # ---- run / plan / task folders (today: <data>/runs/**, <data>/plans/**) ----------------------
+#
+# Migrated projects (root db_path set) live in the C2 tree: `<home>/projects/<slug>/plans/<plan>/
+# runs/<run>/<task>/`. A run's folder needs its plan id, which only the project store records, so
+# `run_dir` reads it from there (read-only, memoised by the store's stamp) and falls back to
+# today's path when the plan cannot be resolved — a resolve never raises and never writes.
+
+_RUN_PLAN_MEMO = None  # (db path, mtime_ns, size, {run: plan})
+
+
+def _project_runs(db, run):
+    """`runs.plan` for one run from the project store at `db`, or None. Never raises."""
+    global _RUN_PLAN_MEMO
+    try:
+        st = os.stat(db)
+        sig = (db, st.st_mtime_ns, st.st_size)
+    except OSError:
+        sig = (db, None, None)
+    if _RUN_PLAN_MEMO is not None and _RUN_PLAN_MEMO[0] == sig:
+        return _RUN_PLAN_MEMO[1].get(run)
+    plans = {}
+    con = _open_root_ro(db)
+    if con is not None:
+        try:
+            for row in con.execute("SELECT id, plan FROM runs"):
+                if isinstance(row["id"], str) and isinstance(row["plan"], str):
+                    plans[row["id"]] = row["plan"]
+        except sqlite3.Error:
+            plans = {}
+        finally:
+            con.close()
+    _RUN_PLAN_MEMO = (sig, plans)
+    return plans.get(run)
+
+
+def _run_plan(data, run):
+    """The plan id of a run in a migrated project named by `data`, else None.
+
+    A run is only reachable in the C2 tree once its project is migrated and the store names its
+    plan; anything else (pre-migration, unknown run, unreadable store) is None, so the caller
+    keeps today's path.
+    """
+    slug = migrated_slug(data=data)
+    if not slug:
+        return None
+    plan = _project_runs(project_db(slug=slug), run)
+    return plan or None
+
 
 def runs_dir(data):
     return os.path.join(data, "runs")
 
 
 def run_dir(data, run):
+    """<data>/runs/<run>, or the C2 <project>/plans/<plan>/runs/<run> for a migrated project."""
+    plan = _run_plan(data, run)
+    if plan:
+        return target_run_dir(migrated_slug(data=data), plan, run)
     return os.path.join(runs_dir(data), run)
 
 
@@ -279,6 +449,10 @@ def tasks_dir(data, run):
 
 
 def task_dir(data, run, task):
+    """<data>/runs/<run>/tasks/<task>, or its C2 twin for a migrated project."""
+    plan = _run_plan(data, run)
+    if plan:
+        return target_task_dir(migrated_slug(data=data), plan, run, task)
     return os.path.join(tasks_dir(data, run), task)
 
 
@@ -307,20 +481,36 @@ def plans_dir(data):
 
 
 def plan_dir(data, plan):
+    """<data>/plans/<plan> today; the C2 <project>/plans/<plan> for a migrated project."""
+    slug = migrated_slug(data=data)
+    if slug:
+        return target_plan_dir(slug, plan)
     return os.path.join(plans_dir(data), plan)
 
 
-def plan_archives_dir(data):
+def plan_archives_dir(data, plan=None):
+    """The plan-version folder. Migrated and named: <project>/plans/<plan>/archive (C2).
+    Otherwise today's <data>/plans/archive — a migrated project with no plan id cannot be
+    placed, so it keeps the old answer rather than guess."""
+    slug = migrated_slug(data=data) if plan else None
+    if slug:
+        return os.path.join(target_plan_dir(slug, plan), "archive")
     return os.path.join(plans_dir(data), "archive")
 
 
 def plan_file(data, plan_id):
-    """The plan markdown: <data>/plans/<plan_id>.md."""
+    """The plan markdown: <data>/plans/<plan_id>.md today, or the C2 <project>/plans/<id>/plan.md."""
+    slug = migrated_slug(data=data)
+    if slug:
+        return os.path.join(target_plan_dir(slug, plan_id), "plan.md")
     return os.path.join(plans_dir(data), f"{plan_id}.md")
 
 
 def project_yaml(data):
-    """<data>/matrixkoder.yaml — the repo settings file (L3 moves it under projects/<slug>/)."""
+    """<data>/matrixkoder.yaml today; the C2 <project>/project.yaml for a migrated project."""
+    slug = migrated_slug(data=data)
+    if slug:
+        return target_project_yaml(slug)
     return os.path.join(data, "matrixkoder.yaml")
 
 
@@ -495,16 +685,17 @@ def _write_json(path, doc):
         json.dump(doc, f)
 
 
-def _seed_root(home_dir, slug, repo, data_dir_rel):
+def _seed_root(home_dir, slug, repo, data_dir_rel, db_path=None):
     """A root store with just the projects table the resolvers read (re-seedable).
 
     The store is created through mkdb.open_root: the single-writer guard (mkdb._single_writer)
     allows only mkdb.py to open SQLite read-write, and this is a fixture, so it borrows
     mkdb's own writer. mkpaths itself never writes a store — production code only ever calls
     _open_root_ro. mkdb is imported lazily, here in the self-test, because mkdb will delegate
-    to this module in L3.
+    to this module in L3. `db_path` set is the C3 migrated marker; only the fixture writes it.
     """
     import sqlite3  # noqa: F401  (only the connect call is banned outside mkdb; none here)
+    global _MIGRATED_MEMO
     here = os.path.dirname(os.path.abspath(__file__))
     spec = importlib.util.spec_from_file_location("mkdb", os.path.join(here, "mkdb.py"))
     mod = importlib.util.module_from_spec(spec)
@@ -513,18 +704,185 @@ def _seed_root(home_dir, slug, repo, data_dir_rel):
     try:
         con.execute("CREATE TABLE IF NOT EXISTS projects("
                     "slug TEXT PRIMARY KEY, name TEXT, repo TEXT, data_dir TEXT, mode TEXT,"
-                    " created TEXT, last_activity TEXT)")
+                    " created TEXT, last_activity TEXT, db_path TEXT)")
         con.execute("DELETE FROM projects")
-        con.execute("INSERT INTO projects(slug, name, repo, data_dir, mode) VALUES (?,?,?,?,?)",
-                    (slug, slug, repo, data_dir_rel, "home"))
+        con.execute("INSERT INTO projects(slug, name, repo, data_dir, mode, db_path)"
+                    " VALUES (?,?,?,?,?,?)", (slug, slug, repo, data_dir_rel, "home", db_path))
         con.commit()
     finally:
         con.close()
+    _MIGRATED_MEMO = None  # a re-seed changed the root; drop the memo this process may hold
+
+
+def _register_project(tmp_home, slug, repo, data):
+    """Register a project's root row (db_path NULL) and create its store. Insert-only: an
+    existing row is left alone, so a migrated row is never cleared. Never touches other rows."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    spec = importlib.util.spec_from_file_location("mkdb", os.path.join(here, "mkdb.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    os.makedirs(data, exist_ok=True)
+    con = mod.open_root(tmp_home)
+    try:
+        con.execute("INSERT OR IGNORE INTO projects(slug, name, repo, data_dir, mode, db_path)"
+                    " VALUES (?,?,?,?,?,NULL)",
+                    (slug, slug, os.path.realpath(repo), os.path.realpath(data), "home"))
+        con.commit()
+    finally:
+        con.close()
+    pcon = mod.open_project(tmp_home, slug, data_dir=data)
+    try:
+        pcon.execute("INSERT OR REPLACE INTO runs(id, plan, status) VALUES ('r1','p1','active')")
+        pcon.commit()
+    finally:
+        pcon.close()
+    mod.add_task(mod.open_project(tmp_home, slug, data_dir=data), "r1", "T1", "task", title="one")
+    return data
+
+
+def _migrate_fixture(tmp_home, repo, slug):
+    """Register a project then run L2's real `mk-migrate.py --switch` on it. Returns the data dir.
+
+    The migrated fixture is built through the production migration tool, never hand-written SQL:
+    the switch sets projects.db_path, which is exactly the C3 marker these resolvers read. A
+    minimal store (no plans, no runs, no lanes) is enough — quiesce passes on it.
+    """
+    import subprocess
+    global _MIGRATED_MEMO
+    data = os.path.join(repo, ".matrixkoder")
+    os.makedirs(data, exist_ok=True)
+    if not os.path.isdir(os.path.join(repo, ".git")):
+        subprocess.run(["git", "init", "-q", repo], check=False)
+    here = os.path.dirname(os.path.abspath(__file__))
+    spec = importlib.util.spec_from_file_location("mkdb", os.path.join(here, "mkdb.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    con = mod.open_root(tmp_home)
+    try:
+        con.execute("INSERT OR REPLACE INTO projects(slug, name, repo, data_dir, mode, db_path)"
+                    " VALUES (?,?,?,?,?,NULL)", (slug, slug, repo, os.path.realpath(data), "home"))
+        con.commit()
+    finally:
+        con.close()
+    mod.open_project(tmp_home, slug, data_dir=data).close()
+    proc = subprocess.run(
+        [sys.executable, os.path.join(here, "mk-migrate.py"), "--switch", "--slug", slug,
+         "--data", data, "--home", tmp_home, "--repo", repo],
+        capture_output=True, text=True, env=dict(os.environ, MK_SELFTEST="1"))
+    _check(proc.returncode == 0, f"mk-migrate --switch failed: {proc.stdout}{proc.stderr}")
+    # a run → plan mapping in the switched store: run_dir/task_dir read it to place the C2 tree,
+    # and the bus's store-kind writes (review/report artifacts) need the run's task row to exist
+    con = mod.open_project(tmp_home, slug)
+    try:
+        con.execute("INSERT OR REPLACE INTO plans(id, version, title, status) VALUES ('p1',1,'P1','running')")
+        con.execute("INSERT OR REPLACE INTO runs(id, plan, status) VALUES ('r1','p1','active')")
+        con.commit()
+    finally:
+        con.close()
+    mod.add_task(mod.open_project(tmp_home, slug), "r1", "T1", "task", title="one")
+    _MIGRATED_MEMO = None
+    return data
 
 
 def _clear_home_env():
     for key in ("MK_HOME", "MATRIXKODER_HOME", "MATRIXKODER_DATA", "MK_BUS_DIR", "MK_BUS_TOKEN_FILE"):
         os.environ.pop(key, None)
+
+
+def _bus_gate(tmp_home, repo, migrated_data, plain_data):
+    """C7: one temp bus (its own MK_BUS_DIR = tmp_home) serves a MIGRATED and a PRE-MIGRATION
+    project at once: connect, inbox, status, commit, report over the bus for both, plus a
+    reviewer's review-done for the migrated one. Drives the real `mk-builder.py` (present in the
+    plugin checkout where gates run); skips when it is absent (an installed lane copy has no
+    scripts/ tree). Returns None when skipped, else a check string."""
+    import subprocess
+    here = os.path.dirname(os.path.abspath(__file__))
+    builder = os.path.join(os.path.dirname(here), "child-skills", "mk-builder", "scripts",
+                           "mk-builder.py")
+    if not os.path.isfile(builder):
+        return None
+    bus = os.path.join(here, "mk-bus.py")
+    env = dict(os.environ, MK_HOME=tmp_home, MATRIXKODER_HOME=tmp_home, MK_BUS_DIR=tmp_home,
+               MK_SELFTEST="1")
+
+    def run(args, cwd=None, timeout=60):
+        return subprocess.run([sys.executable, *args], capture_output=True, text=True,
+                              env=env, cwd=cwd, timeout=timeout)
+
+    def jline(text):
+        for line in reversed([x for x in text.splitlines() if x.strip()]):
+            try:
+                return json.loads(line)
+            except ValueError:
+                continue
+        return {}
+
+    # start the one bus on the migrated project's RESOLVED data dir. Post-switch that is the C2
+    # folder (mkpaths.project_folder); the bus is launched by whoever holds the data dir, and
+    # L6.1 is the phase that moves the bus itself. The pre-migration project resolves through its
+    # token's slug either way, so one bus serves both.
+    bus_data = project_folder(migrated_data)
+    started = run([bus, "ensure", "--run", "r1", "--data", bus_data])
+    _check(started.returncode == 0, f"bus ensure failed: {started.stdout}{started.stderr}")
+    try:
+        for slug, data in (("migs", migrated_data), ("plain", plain_data)):
+            lane = os.path.join(tmp_home, f"gate-{slug}-lane")
+            os.makedirs(lane, exist_ok=True)
+            tok = run([bus, "token", "--lane", lane, "--task", "T1", "--run", "r1", "--data", data])
+            _check(tok.returncode == 0 and jline(tok.stdout).get("ok"), f"{slug} token: {tok.stdout}")
+            rep = os.path.join(lane, ".matrixkoder-report-r1.md")
+            with open(rep, "w") as f:
+                f.write("# report\n")
+            conn = run([builder, "connect", "--lane", lane, "--data", data])
+            _check(conn.returncode == 0, f"{slug} connect rc={conn.returncode}: {conn.stderr[-300:]}")
+            st = run([builder, "start", "--run", "r1", "--task", "T1", "--round", "1",
+                      "--role", "builder", "--report", ".matrixkoder-report-r1.md", "--lane", lane])
+            _check(st.returncode == 0, f"{slug} start: {st.stdout}{st.stderr}")
+            inbox = run([builder, "inbox", "--lane", lane])
+            _check(inbox.returncode == 0, f"{slug} inbox rc={inbox.returncode}: {inbox.stderr[-200:]}")
+            prog = run([builder, "progress", "working", "--lane", lane])
+            _check(prog.returncode == 0, f"{slug} progress: {prog.stdout}{prog.stderr}")
+            show = run([builder, "show", "--lane", lane])
+            _check(jline(show.stdout).get("ok"), f"{slug} show: {show.stdout}")
+            # commit: a real HEAD sha in the lane (the git guard is not on this PATH)
+            subprocess.run(["git", "init", "-q", lane], check=False)
+            subprocess.run(["git", "-C", lane, "config", "user.email", "g@example.com"], check=False)
+            subprocess.run(["git", "-C", lane, "config", "user.name", "g"], check=False)
+            subprocess.run(["git", "-C", lane, "add", "-A"], check=False)
+            subprocess.run(["git", "-C", lane, "commit", "-q", "-m", "x"], check=False)
+            sha = subprocess.run(["git", "-C", lane, "rev-parse", "HEAD"], capture_output=True,
+                                 text=True).stdout.strip()
+            cm = run([builder, "commit", sha, "--lane", lane])
+            _check(jline(cm.stdout).get("ok"), f"{slug} commit: {cm.stdout}{cm.stderr}")
+            rp = run([builder, "report", "--lane", lane])
+            _check(jline(rp.stdout).get("ok"), f"{slug} report: {rp.stdout}{rp.stderr}")
+        # a reviewer's review-done on the migrated project: start as the reviewer role first
+        rlane = os.path.join(tmp_home, "gate-review-lane")
+        os.makedirs(rlane, exist_ok=True)
+        rrep = os.path.join(rlane, ".matrixkoder-review-r1.md")
+        with open(rrep, "w") as f:
+            f.write("# review\n")
+        run([bus, "token", "--lane", rlane, "--task", "T1", "--run", "r1", "--data", migrated_data])
+        conn = run([builder, "connect", "--lane", rlane, "--data", migrated_data])
+        _check(conn.returncode == 0, f"review connect rc={conn.returncode}: {conn.stderr[-200:]}")
+        rst = run([builder, "start", "--run", "r1", "--task", "T1", "--round", "1",
+                   "--role", "review", "--report", ".matrixkoder-review-r1.md", "--lane", rlane])
+        _check(rst.returncode == 0, f"review start: {rst.stdout}{rst.stderr}")
+        rpr = run([builder, "progress", "reviewing", "--lane", rlane])
+        _check(rpr.returncode == 0, f"review progress: {rpr.stdout}{rpr.stderr}")
+        rd = run([builder, "review-done", "--verdict", "APPROVE", "--findings", "0",
+                  "--path", ".matrixkoder-review-r1.md", "--lane", rlane])
+        _check(rd.returncode == 0, f"review-done rc={rd.returncode}: {rd.stdout}{rd.stderr}")
+    finally:
+        bj = os.path.join(tmp_home, "bus.json")
+        if os.path.isfile(bj):
+            try:
+                pid = (json.load(open(bj)) or {}).get("pid")
+                if pid:
+                    os.kill(pid, 9)
+            except (OSError, ValueError):
+                pass
+    return "mixed-layout bus gate ok"
 
 
 def self_test():
@@ -674,8 +1032,69 @@ def self_test():
         _check(target_lane_token(lane) == os.path.join(tmp_home, "bus", "lanes", digest + ".json"),
                target_lane_token(lane))
 
-    def t_target(tmp_home):
+    def t_migrated(tmp_home):
+        """C1/C3 (L3): a migrated project (root db_path set by L2's mk-migrate --switch) resolves
+        every path to the C2 target; a pre-migration project beside it keeps today's paths, and
+        a missing root / unknown slug falls back without raising."""
+        global _MIGRATED_MEMO
+        _clear_home_env()
         os.environ["HOME"] = tmp_home
+        os.environ["MK_HOME"] = os.environ["MATRIXKODER_HOME"] = tmp_home
+        repo = os.path.join(root, "mig-repo")
+        os.makedirs(repo, exist_ok=True)
+        data = _migrate_fixture(tmp_home, repo, "migs")
+        proj = os.path.join(tmp_home, "projects", "migs")
+        # slug form: every path follows the switch
+        _check(project_dir(home_arg=tmp_home, slug="migs") == proj, project_dir(home_arg=tmp_home, slug="migs"))
+        _check(project_db(slug="migs") == os.path.join(proj, "mk.db"), project_db(slug="migs"))
+        _check(project_yaml(data) == os.path.join(proj, "project.yaml"), project_yaml(data))
+        _check(plan_dir(data, "p1") == os.path.join(proj, "plans", "p1"), plan_dir(data, "p1"))
+        _check(plan_file(data, "p1") == os.path.join(proj, "plans", "p1", "plan.md"), plan_file(data, "p1"))
+        _check(plan_archives_dir(data, "p1") == os.path.join(proj, "plans", "p1", "archive"),
+               plan_archives_dir(data, "p1"))
+        _check(project_folder(data) == proj, project_folder(data))
+        # the --data form of project_dir stays literal: mk-migrate's rollback and its fixtures
+        # address the LEGACY store by exactly this form, so it must not follow the switch
+        _check(project_dir(home_arg=tmp_home, data_dir=data) == data, project_dir(home_arg=tmp_home, data_dir=data))
+        # the run/task family resolves under the plan the store records for the run
+        _check(run_dir(data, "r1") == os.path.join(proj, "plans", "p1", "runs", "r1"),
+               run_dir(data, "r1"))
+        _check(task_dir(data, "r1", "T1") == os.path.join(proj, "plans", "p1", "runs", "r1", "T1"),
+               task_dir(data, "r1", "T1"))
+        # the data form of project_db stays today's <data>/mk.db: mk-migrate's rollback reads the
+        # source store through exactly this form (its copy-back must not follow the switch)
+        _check(project_db(data=data) == os.path.join(data, "mk.db"), project_db(data=data))
+
+        # a pre-migration project side by side keeps every path today's
+        other_repo = os.path.join(root, "plain-repo")
+        other_data = os.path.join(other_repo, ".matrixkoder")
+        os.makedirs(other_data, exist_ok=True)
+        # C7 gate: one temp bus serves the migrated project AND this pre-migration one.
+        # The plain project needs its own root row (db_path NULL) and its <data>/mk.db, so the
+        # bus's store_for resolves it to today's store. Insert-only: never clear the migrated row.
+        _register_project(tmp_home, "plain", other_repo, other_data)
+        gate = _bus_gate(tmp_home, other_repo, data, other_data)
+        if gate:
+            _check(gate == "mixed-layout bus gate ok", gate)
+        _check(project_yaml(other_data) == os.path.join(other_data, "matrixkoder.yaml"),
+               project_yaml(other_data))
+        _check(plan_file(other_data, "p1") == os.path.join(other_data, "plans", "p1.md"),
+               plan_file(other_data, "p1"))
+        _check(plan_archives_dir(other_data, "p1") == os.path.join(other_data, "plans", "archive"),
+               plan_archives_dir(other_data, "p1"))
+        _check(run_dir(other_data, "r1") == os.path.join(other_data, "runs", "r1"), run_dir(other_data, "r1"))
+        _check(task_dir(other_data, "r1", "T1") == os.path.join(other_data, "runs", "r1", "tasks", "T1"),
+               task_dir(other_data, "r1", "T1"))
+        # an unknown slug and a missing root fall back, never raise
+        _check(project_db(slug="nope") is None, "unknown slug")
+        missing = os.path.join(root, "no-such-home")
+        os.environ["MK_HOME"] = os.environ["MATRIXKODER_HOME"] = missing
+        _MIGRATED_MEMO = None
+        _check(project_yaml(other_data) == os.path.join(other_data, "matrixkoder.yaml"), "no root")
+        os.environ["MK_HOME"] = os.environ["MATRIXKODER_HOME"] = tmp_home
+        _MIGRATED_MEMO = None
+
+    def t_target(tmp_home):
         _clear_home_env()
         os.environ["MK_HOME"] = os.environ["MATRIXKODER_HOME"] = tmp_home
         proj = os.path.join(tmp_home, "projects", "matrixkoder")
@@ -712,6 +1131,7 @@ def self_test():
         t_project_db(tmp_home, repo)
         t_bus(tmp_home, repo)
         t_target(tmp_home)
+        t_migrated(tmp_home)
     except Fail as e:
         failures.append(str(e))
     finally:

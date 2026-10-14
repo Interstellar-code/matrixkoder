@@ -109,6 +109,45 @@ test('the root projects table names the data dir before projects.json', async ()
   expect(await resolveDataDir(withRun, { cwd: '/repo', home: '/home/mk', store: true })).toBe('/srv/data')
 })
 
+test('a migrated project resolves to the C2 folder (dirname of the root db_path)', async () => {
+  // C1 (L3): mk-migrate --switch sets projects.db_path; the same `mkdb.py projects --json` reply
+  // carries it, so the root-store reader follows the switch with no second reader.
+  const migrated = world({
+    env: { HOME: '/home/mk', MATRIXKODER_HOME: '/srv/mkhome' },
+    dirs: ['/repo/.git'],
+    files: { '/srv/mkhome/projects.json': JSON.stringify({ '/repo': { data_dir: 'from-json' } }) },
+    cwd: '/repo',
+    runs: () => ({
+      exitCode: 0,
+      stdout: JSON.stringify({ projects: [{
+        slug: 'matrixkoder', repo: '/repo', data_dir: '/repo/.matrixkoder',
+        db_path: '/srv/mkhome/projects/matrixkoder/mk.db',
+      }] }),
+      stderr: '',
+      isStdoutTruncated: false,
+      isStderrTruncated: false,
+    }),
+  })
+  expect(await resolveDataDir(migrated, { cwd: '/repo', home: '/home/mk', store: true }))
+    .toBe('/srv/mkhome/projects/matrixkoder')
+  // an unmigrated row (db_path empty) keeps today's data_dir
+  const unmigrated = world({
+    env: { HOME: '/home/mk', MATRIXKODER_HOME: '/srv/mkhome' },
+    dirs: ['/repo/.git'],
+    cwd: '/repo',
+    runs: () => ({
+      exitCode: 0,
+      stdout: JSON.stringify({ projects: [{
+        slug: 'matrixkoder', repo: '/repo', data_dir: '/srv/data', db_path: '',
+      }] }),
+      stderr: '',
+      isStdoutTruncated: false,
+      isStderrTruncated: false,
+    }),
+  })
+  expect(await resolveDataDir(unmigrated, { cwd: '/repo', home: '/home/mk', store: true })).toBe('/srv/data')
+})
+
 test('projects.json is the fallback when the root-store command fails', async () => {
   const $ = plainRepo({ '/srv/mkhome/projects.json': JSON.stringify({ '/repo': { data_dir: '/srv/json-data' } }) })
   const failing = world({

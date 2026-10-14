@@ -631,7 +631,7 @@ def sync_store_status(path, data, home, status):
         return None
     db = _mkdb()
     home = db.resolve_home(home)
-    con = db.open_project(home, data_dir=data)
+    con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
     try:
         if "status" not in plan_columns(con):
             return None
@@ -669,10 +669,17 @@ def _mkdb():
 
 
 def store_present(data):
-    """A store exists only when <data>/mk.db is already there. Never create one."""
+    """A store exists only when the resolved project mk.db is already there. Never create one.
+
+    C1 (L3): the resolved folder is mkpaths.project_folder's — the C2 target for a migrated
+    project, today's <data> for a pre-migration one — the same folder db.open_project will use.
+    """
     if not data:
         return False
-    return os.path.isfile(mkpaths.project_db(data=data))
+    try:
+        return os.path.isfile(os.path.join(mkpaths.project_folder(data), "mk.db"))
+    except mkpaths.Fail:
+        return False
 
 
 # the data-dir resolution is mk-state.py resolve_data's order, now read out of scripts/mkpaths.py
@@ -913,7 +920,7 @@ def approve_file(path, data, home, run):
         body_md = body[1:]
     else:
         body_md = body
-    con = db.open_project(home, data_dir=data)
+    con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
     added = []
     try:
         validate_tree(out, db, con, run_id)
@@ -956,7 +963,7 @@ def approve_file(path, data, home, run):
             for tid, *_rest in flat_items({"phases": (prev.get("phases") or out["phases"])}):
                 con.execute("DELETE FROM tasks WHERE run=? AND id=?", (run_id, tid))
             con.commit()
-        archive = os.path.join(mkpaths.plan_archives_dir(data), f"{plan_id}-v{version}.md")
+        archive = os.path.join(mkpaths.plan_archives_dir(data, plan_id), f"{plan_id}-v{version}.md")
         header_json = header_json_of(out, sha, body_md, "approved")
         # tasks first (each add_task commits its own transaction), plans row next, archive last.
         # a later failure deletes only the tasks this call inserted. a resume only writes the archive.
@@ -1018,6 +1025,15 @@ def approve_file(path, data, home, run):
         # and the row are already there and the next approve converges.
         if current != approved and os.path.abspath(path) != os.path.abspath(archive):
             write_atomic(path, approved)
+        # C2 (L3.2): a MIGRATED project keeps its live plan at <project>/plans/<id>/plan.md, the
+        # reference the run tree hangs off. Copy the approved bytes there too (still a copy — the
+        # user's file is untouched). A pre-migration project is unchanged: its plan_file is
+        # <data>/plans/<id>.md, which approve has never written. Best-effort: the archive and the
+        # row are the record.
+        if mkpaths.migrated_slug(data):
+            plan_md = mkpaths.plan_file(data, plan_id)
+            with contextlib.suppress(OSError):
+                write_atomic(plan_md, approved)
         return {"ok": True, "status": "approved", "store": True, "version": version,
                 "archived": archive, "tasks_run": run_id, "warnings": warnings}
     finally:
@@ -1051,7 +1067,7 @@ def export_plan(path, data, home):
         _h, out, _s = read_plan(path)
         if out.get("plan"):
             plan_id = str(out["plan"])
-    con = db.open_project(home, data_dir=data)
+    con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
     try:
         row = con.execute(
             "SELECT version, header_json, body_md, archived_path FROM plans WHERE id=? ORDER BY version DESC LIMIT 1",
@@ -1112,7 +1128,7 @@ def import_file(path, data, home, dry_run=False):
     db = _mkdb()
     home = db.resolve_home(home)
     header_json = header_json_of(out, sha, body_md, str(out["status"] or "draft"))
-    con = db.open_project(home, data_dir=data)
+    con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
     try:
         row = con.execute("SELECT version FROM plans WHERE id=?", (plan_id,)).fetchone()
         version = row["version"] if row and row["version"] is not None else 0
@@ -1149,7 +1165,7 @@ def delete_plan(plan_id, data, home):
         raise Fail([f"no store: delete needs <data>/mk.db ({data})"])
     db = _mkdb()
     home = db.resolve_home(home)
-    con = db.open_project(home, data_dir=data)
+    con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
     try:
         row = con.execute("SELECT archived_path FROM plans WHERE id=?", (plan_id,)).fetchone()
         if not row:
@@ -1168,12 +1184,12 @@ def delete_plan(plan_id, data, home):
     src = mkpaths.plan_file(data, plan_id)
     moved = None
     if os.path.isfile(src):
-        dst = os.path.join(mkpaths.plan_archives_dir(data), os.path.basename(src))
+        dst = os.path.join(mkpaths.plan_archives_dir(data, plan_id), os.path.basename(src))
         n = 0
         while os.path.exists(dst):
             stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
             n += 1
-            dst = os.path.join(mkpaths.plan_archives_dir(data), f"{plan_id}-{stamp}" + (f"-{n}" if n > 1 else "") + ".md")
+            dst = os.path.join(mkpaths.plan_archives_dir(data, plan_id), f"{plan_id}-{stamp}" + (f"-{n}" if n > 1 else "") + ".md")
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.move(src, dst)
         moved = dst
@@ -1603,7 +1619,7 @@ def self_test():
         os.makedirs(data)
         os.makedirs(home)
         db = _mkdb()
-        db.open_project(home, data_dir=data).close()
+        db.open_project(home, data_dir=mkpaths.project_folder(data, home)).close()
         good = write("sample.md", plan_text(
             plan='plan = "sample"',
             phases=phase("P1", tasks=task("P1.1", extra=(
@@ -1628,7 +1644,7 @@ def self_test():
             close = next(i for i in range(1, len(lines)) if lines[i].strip() == "+++")
             return "\n".join(lines[:close + 1]).encode()
         assert header_bytes(open(exp["path"], "rb").read()) == header_bytes(archived_bytes)
-        con = db.open_project(home, data_dir=data)
+        con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
         rows = {r["id"]: (r["type"], r["parent"], r["deps"]) for r in con.execute(
             "SELECT id, type, parent, deps FROM tasks WHERE run='r1'")}
         con.close()
@@ -1654,20 +1670,20 @@ def self_test():
                 '  acceptance = "a"\n  deps = "P1.1"\n  parallel = false\n  route = ""\n  owned = []\n'
             ))) + "\n"))
         blob = open(cyc, "rb").read()
-        con = db.open_project(home, data_dir=data)
+        con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
         n_before = con.execute("SELECT COUNT(*) c FROM tasks").fetchone()["c"]
         con.close()
         bad = mk("approve", cyc, "--data", data, "--home", home, "--run", "r1", code=2)
         # check and approve share the graph, so the refusal is check's "dep cycle:" (ids named)
         assert any("cycle:" in e and "P1.1" in e and "P1.1.1" in e for e in bad["errors"]), bad
         assert open(cyc, "rb").read() == blob
-        con = db.open_project(home, data_dir=data)
+        con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
         assert con.execute("SELECT COUNT(*) c FROM tasks").fetchone()["c"] == n_before
         assert con.execute("SELECT id FROM plans WHERE id='cyc'").fetchone() is None
         con.close()
 
         # <run>:<id> is validated: present passes, missing is named and changes nothing
-        con = db.open_project(home, data_dir=data)
+        con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
         db.add_task(con, "other", "T9", "task", title="ext")
         con.close()
         xref = write("xref.md", plan_text(plan='plan = "xref"', phases=phase("P1", deps='"other:T9"') + "\n"))
@@ -1686,7 +1702,7 @@ def self_test():
             + "\n" + phase("PC", wave=1) + "\n")))
         out = mk("approve", fwd, "--data", data, "--home", home, "--run", "rf")
         assert out["ok"] and out["version"] == 1, out
-        con = db.open_project(home, data_dir=data)
+        con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
         deps = {r["id"]: r["deps"] for r in con.execute("SELECT id, deps FROM tasks WHERE run='rf'")}
         con.close()
         assert deps["PA"] == "PC" and deps["PA.1"] == "PA.2" and deps["PA.2"] == "", deps
@@ -1695,13 +1711,13 @@ def self_test():
         cyc2 = write("cyc2.md", plan_text(plan='plan = "cyc2"', phases=(
             phase("PA", wave=1, deps='"PC"') + "\n" + phase("PC", wave=1, deps='"PA"') + "\n")))
         blob = open(cyc2, "rb").read()
-        con = db.open_project(home, data_dir=data)
+        con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
         n_before = con.execute("SELECT COUNT(*) c FROM tasks").fetchone()["c"]
         con.close()
         bad = mk("approve", cyc2, "--data", data, "--home", home, "--run", "rc", code=2)
         assert any("cycle:" in e and "PA" in e and "PC" in e for e in bad["errors"]), bad
         assert open(cyc2, "rb").read() == blob
-        con = db.open_project(home, data_dir=data)
+        con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
         assert con.execute("SELECT COUNT(*) c FROM tasks").fetchone()["c"] == n_before
         assert con.execute("SELECT id FROM plans WHERE id='cyc2'").fetchone() is None
         con.close()
@@ -1719,7 +1735,7 @@ def self_test():
         out = mk("approve", copy, "--data", data, "--home", home, "--run", "mkstore")
         assert out["ok"] and os.path.isfile(copy), out  # copied, not moved
         assert os.path.isfile(real)  # the real plan was never touched
-        con = db.open_project(home, data_dir=data)
+        con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
         got = {r["id"]: r["deps"] for r in con.execute(
             "SELECT id, deps FROM tasks WHERE run='mkstore'")}
         con.close()
@@ -1864,7 +1880,7 @@ def self_test():
         assert n == 1, n
         assert row1["version"] == 0 and out["version"] == row1["version"], (row1, out)
         assert row1["title"] == "Sample Title"
-        con = db.open_project(home, data_dir=data)
+        con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
         n_tasks = con.execute(
             "SELECT COUNT(*) c FROM tasks WHERE id IN ('P1','P1.1') AND run='imp1'").fetchone()["c"]
         con.close()
@@ -1935,7 +1951,7 @@ def self_test():
         live7 = os.path.join(plans_dir, "imp7.md")
         open(live7, "w").write(plan_text(plan='plan = "imp7"', phases=phase("P1") + "\n"))
         assert mk("import", live7, "--data", data, "--home", home)["ok"]
-        con = db.open_project(home, data_dir=data)
+        con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
         con.execute("INSERT OR REPLACE INTO runs(id, plan, plan_version, branch, status, stage)"
                     " VALUES ('imp7run','imp7',0,'br','active','build')")
         con.commit()
@@ -1948,14 +1964,14 @@ def self_test():
         assert os.path.isfile(live7)
 
         # a finished run does not block delete, and its tasks stay
-        con = db.open_project(home, data_dir=data)
+        con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
         con.execute("UPDATE runs SET status='done' WHERE id='imp7run'")
         con.commit()
         db.add_task(con, "imp7run", "P1", "phase", title="kept")
         con.close()
         out = mk("delete", "imp7", "--data", data, "--home", home)
         assert out["ok"] is True and plans_rows("imp7")[0] == 0, out
-        con = db.open_project(home, data_dir=data)
+        con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
         kept = con.execute("SELECT id FROM tasks WHERE run='imp7run'").fetchall()
         con.close()
         assert [r["id"] for r in kept] == ["P1"]
@@ -2035,6 +2051,55 @@ def self_test():
         assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
         got = json.loads(r.stdout.strip().splitlines()[-1])
         assert got["store"] is False and any("mk.db" in w for w in got.get("warnings") or []), got
+
+        # C2 (L3.2): on a MIGRATED project (root db_path set by L2's mk-migrate --switch) import,
+        # approve and delete write plans and archives under projects/<slug>/plans/<id>/ and leave
+        # the repo's .matrixkoder byte-identical.
+        def tree_hash(top):
+            h = hashlib.sha256()
+            for dirpath, dirnames, filenames in os.walk(top):
+                dirnames.sort()
+                for name in sorted(filenames):
+                    full = os.path.join(dirpath, name)
+                    h.update(os.path.relpath(full, top).encode())
+                    with open(full, "rb") as fh:
+                        h.update(fh.read())
+            return h.hexdigest()
+
+        mig_repo = os.path.join(tmp, "mig-repo")
+        mig_data = os.path.join(mig_repo, ".matrixkoder")
+        os.makedirs(os.path.join(mig_data, "plans", "archive"), exist_ok=True)
+        subprocess.run(["git", "init", "-q", mig_repo], check=True)
+        pre = os.path.join(mig_data, "plans", "old.md")
+        open(pre, "w").write(plan_text(plan='plan = "old"', phases=phase("P1") + "\n"))
+        open(os.path.join(mig_data, "matrixkoder.yaml"), "w").write("data_dir: .matrixkoder/\n")
+        home = os.environ["MK_HOME"]
+        db.open_project(home, "migs", data_dir=mig_data).close()
+        con = db.open_root(home)
+        con.execute("INSERT OR REPLACE INTO projects(slug, name, repo, data_dir, mode, db_path)"
+                    " VALUES (?,?,?,?,?,NULL)", ("migs", "migs", mig_repo, os.path.realpath(mig_data), "home"))
+        con.commit()
+        con.close()
+        r = subprocess.run([sys.executable, os.path.join(root, "scripts", "mk-migrate.py"),
+                            "--switch", "--slug", "migs", "--data", mig_data, "--home", home,
+                            "--repo", mig_repo],
+                           capture_output=True, text=True, env=dict(os.environ, MK_SELFTEST="1"))
+        assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+        proj = os.path.join(home, "projects", "migs")
+        before = tree_hash(mig_data)
+
+        mp = write("migplan.md", plan_text(plan='plan = "migplan"',
+                                           phases=phase("P1", tasks=task("P1.1")) + "\n"))
+        out = mk("import", mp, "--data", mig_data, "--home", home)
+        assert out["ok"], out
+        out = mk("approve", mp, "--data", mig_data, "--home", home, "--run", "migrun")
+        assert out["ok"] and out["version"] == 1, out
+        assert out["archived"] == os.path.join(proj, "plans", "migplan", "archive", "migplan-v1.md"), out
+        assert os.path.isfile(os.path.join(proj, "plans", "migplan", "archive", "migplan-v1.md"))
+        out = mk("delete", "migplan", "--data", mig_data, "--home", home)
+        assert out["ok"] and out["moved"] == os.path.join(proj, "plans", "migplan", "archive", "plan.md"), out
+        # nothing was written under the repo's .matrixkoder
+        assert tree_hash(mig_data) == before, "a migrated mk-plan wrote under the repo .matrixkoder"
 
         print("mk-plan self-test ok")
     finally:

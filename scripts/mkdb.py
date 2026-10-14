@@ -21,13 +21,30 @@ the only status writer, and the root card is a copy written afterwards, only whe
 
 Schema: docs/state-schema.md (store section).
 """
-import argparse, contextlib, datetime, hashlib, json, multiprocessing, os, re, sqlite3, subprocess, sys, tempfile
+import argparse, contextlib, datetime, hashlib, importlib.util, json, multiprocessing, os, re, sqlite3, subprocess, sys, tempfile
 
 sys.dont_write_bytecode = True
 
 SCHEMA = 4
 ROOT_SCHEMA = 2  # the root store migrates additively; project stores go to SCHEMA
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
+
+# C1 (L3): mkpaths.py is the ONE path authority (home rule, data dir, project folder, store
+# path). mkdb keeps its own check_home/check_slug refusals and _selftest_write_guard, and
+# delegates the path RULES to mkpaths — loaded as a sibling by path, the way mk-bus.py does,
+# because mkpaths imports nothing from the repo (no cycle).
+_mkpaths_mod = None
+
+
+def _mkpaths():
+    global _mkpaths_mod
+    if _mkpaths_mod is None:
+        here = os.path.dirname(os.path.abspath(__file__))
+        spec = importlib.util.spec_from_file_location("mkpaths", os.path.join(here, "mkpaths.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _mkpaths_mod = mod
+    return _mkpaths_mod
 TYPES = ("phase", "task", "subtask")
 # C4: the column a status lands in. Attention statuses keep their column and raise the flag.
 COLUMNS = {"planned": "Backlog", "routed": "Backlog", "ready": "Ready",
@@ -185,35 +202,31 @@ def resolve_home(arg):
     """One MK home rule (C16): $MK_HOME and $MATRIXKODER_HOME are the same setting.
 
     Either name is accepted; when both are set they must resolve to the same
-    directory, else Fail. An explicit --home arg wins over both.
+    directory, else Fail. An explicit --home arg wins over both. C1 (L3): the rule
+    itself is mkpaths.home(); mkdb keeps its own check_home refusal on the result.
     """
-    mkh = os.environ.get("MK_HOME")
-    mch = os.environ.get("MATRIXKODER_HOME")
-    if mkh and mch:
-        left = os.path.realpath(os.path.abspath(os.path.expanduser(mkh)))
-        right = os.path.realpath(os.path.abspath(os.path.expanduser(mch)))
-        if left != right:
-            raise Fail(f"MK_HOME ({mkh}) and MATRIXKODER_HOME ({mch}) differ; set one MK home")
-    home = os.path.abspath(os.path.expanduser(arg or mkh or mch or "~/.matrixkoder"))
+    home = _mkpaths().home(arg)
     check_home(home)
     return home
 
 
 def project_dir(home, slug=None, data_dir=None):
-    """--data wins; else <home>/projects/<slug>. The slug is checked before the path exists.
+    """--data wins; else <home>/projects/<slug> — the C2 folder for a migrated project (C1, L3).
 
-    Both routes pass check_home before anything is created: a synced or networked home, and a
-    --data dir that itself looks synced, are refused (C11).
+    The slug is checked before the path exists. Both routes pass check_home before
+    anything is created: a synced or networked home, and a --data dir that itself
+    looks synced, are refused (C11). The path RULE (migrated → C2 target, else
+    today's answer) is mkpaths.project_dir's; mkdb keeps the refusals.
     """
     if data_dir:
-        path = os.path.abspath(os.path.expanduser(data_dir))
+        path = _mkpaths().project_dir(home_arg=home, data_dir=data_dir)
         check_home(path)
         return path
     if not slug:
         raise Fail("pass --project or --data")
     check_slug(slug)
     check_home(home)
-    return os.path.join(home, "projects", slug)
+    return _mkpaths().project_dir(home_arg=home, slug=slug)
 
 
 def _connect(path):

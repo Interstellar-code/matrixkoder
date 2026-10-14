@@ -157,16 +157,28 @@ def running_task(text):
 
 
 def store_on(data):
-    """True only when the project store already exists. Never creates mk.db (self-hosting guard)."""
-    return bool(data) and os.path.exists(mkpaths.project_db(data=data))
+    """True only when the resolved project store already exists. Never creates mk.db.
+
+    C1 (L3): the resolved path is mkpaths.project_dir's — the C2 target for a migrated project,
+    today's <data> for a pre-migration one.
+    """
+    if not data:
+        return False
+    try:
+        return os.path.exists(os.path.join(mkpaths.project_dir(data_dir=data), "mk.db"))
+    except mkpaths.Fail:
+        return False
 
 
 def store_con(data):
-    """The project store, opened only through mkdb.open_project. Caller closes it."""
+    """The project store, opened only through mkdb.open_project. Caller closes it.
+
+    C1 (L3): no fake `<data>/.mk-home`. open_project resolves the store from the data dir itself
+    (its own `project_dir` rule: the C2 target for a migrated project, today's <data> otherwise),
+    and a slug-named route is never needed — the store lives beside its data dir.
+    """
     db = _load_mkdb()
-    home = os.path.join(data, ".mk-home")
-    os.makedirs(home, exist_ok=True)
-    return db.open_project(home, STORE_PROJECT, data_dir=data)
+    return db.open_project(mkpaths.home(), STORE_PROJECT, data_dir=data)
 
 
 _mkdb_mod = None
