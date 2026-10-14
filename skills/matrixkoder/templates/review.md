@@ -4,6 +4,10 @@ Commit(s): <sha range>. Brief: <path>. Mockups: <paths>. Read-only review of the
 
 You run as the mk-builder skill's reviewer role (a lane agent: read-only, writes ONLY `<lane>/.matrixkoder-review-rN.md`, findings under severities, ends with the `<PHASE> REVIEW R<n> DONE` token) — those rules are the skill's, not this template's (`.claude/skills/mk-builder/`, `reference/lane-rules.md` R15-R20).
 
+When the bus is up, this brief reaches you over it: `dispatch --role review --lane <lane>` publishes `<data>/runs/<run>/tasks/<T>/review-brief-rN.md` and types `connect --role review`, which prints `# review brief round <n>` and the body. Otherwise the prompt names this file by absolute path — read it.
+
+Review the commit (or the uncommitted diff) and report. Do NOT rerun the self-tests, typecheck or suite the builder and orchestrator already ran (user rule 2026-10-14) — read their output instead. Run a probe ONLY when a new proof is needed: an old-vs-new comparison, hostile input, or a temp-store trial.
+
 ## CRITICAL / HIGH / MEDIUM / LOW
 - `path:line` — problem — fix
 
