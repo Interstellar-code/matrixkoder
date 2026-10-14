@@ -205,7 +205,7 @@ test('Settings · Project: lanes + QA rows, list row as comma-joined text, dange
   const drawn = draw(ui, 46, 'project')
   expect(ui.get('settings:scope'), 'the scope press landed').toBe('project')
   const flat = drawnText(drawn)
-  expect(flat.includes('.matrixkoder/matrixkoder.yaml · this repo'), 'the project scope-note').toBe(true)
+  expect(flat.includes('project.yaml · this repo'), 'the project scope-note').toBe(true)
   for (const sig of ['Worktree slots', 'Reuse slots', 'Copy into slot', '.claude-plugin/types', 'Integration branch', 'Merge target', 'Builders skip perms']) {
     expect(flat.includes(sig), `the ${sig} row`).toBe(true)
   }
@@ -218,7 +218,7 @@ test('Settings · Routing: policy, the four reserve-floor % rows with bars, revi
   const ui: FakeUi = new Map()
   const drawn = draw(ui, 46, 'routing')
   const flat = drawnText(drawn)
-  expect(flat.includes('matrixkoder.yaml · routing_preferences'), 'the routing scope-note').toBe(true)
+  expect(flat.includes('project.yaml · routing_preferences'), 'the routing scope-note').toBe(true)
   for (const sig of ['Policy', 'Builder order', 'opencode, claude', 'Max build lanes', 'Claude 5h', 'Claude week', 'Others 5h', 'Others week', 'Code reviewer', 'claude sonnet medium ▾', 'Visual reviewer']) {
     expect(flat.includes(sig), `the ${sig} row`).toBe(true)
   }
@@ -239,6 +239,24 @@ test('Settings · seg words stay short when the live config sends long notes (S2
   const flat = drawnText(SettingsTab(stubEls, live, 46, ui))
   for (const w of ['spare', 'bal', 'qual']) expect(flat.includes(w), `the ${w} button`).toBe(true)
   expect(flat.includes('orchestrates'), 'no note sentence in a button').toBe(false)
+})
+
+test('Settings · L7.1: a live view draws the REAL yaml path on every yaml scope note, never a hard-coded one', () => {
+  // a view as buildSettingsView returns it once `list --json` answered with the
+  // migrated C2 path: every yaml-backed scope-note carries that path (L7.1)
+  const livePath = '/srv/mkhome/projects/matrixkoder/project.yaml'
+  const v = settingsView()
+  const live = { ...v, scopes: v.scopes.map(s => (['project', 'routing', 'agents', 'models', 'child'].includes(s.id) ? { ...s, file: livePath } : s)) }
+  for (const id of ['project', 'routing', 'agents', 'models', 'child'] as const) {
+    const ui: FakeUi = new Map([['settings:scope', id]])
+    const flat = drawnText(SettingsTab(stubEls, live, 80, ui))
+    expect(flat.includes(livePath), `the ${id} note names the real path`).toBe(true)
+    expect(flat.includes('.matrixkoder/matrixkoder.yaml'), `no hard-coded path on ${id}`).toBe(false)
+  }
+  // and the fixture's own note is the shape label, not a repo-specific spelling
+  const fixture = drawnText(SettingsTab(stubEls, settingsView(), 46, new Map([['settings:scope', 'project']])))
+  expect(fixture.includes('.matrixkoder/matrixkoder.yaml'), 'no hard-coded path in the fixture').toBe(false)
+  expect(fixture.includes('project.yaml · this repo'), 'the fixture shape label').toBe(true)
 })
 
 test('Settings · Models: an agent with no picks row is read-only and never edits (S2b)', () => {
@@ -264,7 +282,7 @@ test('Settings · Agents: builder availability bools and the usage group', () =>
   const ui: FakeUi = new Map()
   const drawn = draw(ui, 46, 'agents')
   const flat = drawnText(drawn)
-  expect(flat.includes('matrixkoder.yaml · agents · usage'), 'the agents scope-note').toBe(true)
+  expect(flat.includes('project.yaml · agents · usage'), 'the agents scope-note').toBe(true)
   for (const sig of ['OpenCode', 'Claude Code', 'herdr', 'Codex', 'AGY', 'codexbar', 'claude, opencodego, ollama']) {
     expect(flat.includes(sig), `the ${sig} row`).toBe(true)
   }
@@ -277,7 +295,7 @@ test('Settings · Child: builder sessions, watch and reviewer panes', () => {
   const ui: FakeUi = new Map()
   const drawn = draw(ui, 46, 'child')
   const flat = drawnText(drawn)
-  expect(flat.includes('yaml lanes.child · lane sessions'), 'the child scope-note').toBe(true)
+  expect(flat.includes('project.yaml · lanes.child'), 'the child scope-note').toBe(true)
   for (const sig of ['New round', 'new', 'Subagents', 'Subagent model', 'Stall after', 'Give up after', 'Split', 'Reuse reviewer pane']) {
     expect(flat.includes(sig), `the ${sig} row`).toBe(true)
   }
@@ -305,7 +323,7 @@ test('Settings · Models: name-sorted rows, per-agent n/4 chips, pick-order numb
   const ui: FakeUi = new Map()
   const drawn = draw(ui, 46, 'models')
   const flat = drawnText(drawn)
-  expect(flat.includes('yaml agents.*.models · max 4 per agent'), 'the models scope-note').toBe(true)
+  expect(flat.includes('project.yaml · agents.*.models'), 'the models scope-note').toBe(true)
   // count chips: 3/4, 4/4, 0/4, 0/4
   for (const chip of [' 3/4 ', ' 4/4 ', ' 0/4 ']) expect(flat.includes(chip), `the ${chip.trim()} count chip`).toBe(true)
   expect(nodesOf(drawn, 'Text').filter(t => (t.children ?? []).join('') === ' 0/4 '), 'two empty agents').toHaveLength(2)

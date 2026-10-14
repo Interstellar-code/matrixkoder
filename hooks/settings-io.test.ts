@@ -238,6 +238,32 @@ test('S3 view: yaml fields group by scope; picks overlay; unknown shapes never b
   expect(chip?.editable).toBe(false)
 })
 
+// ---------- L7.1: the scope notes name the real yaml path ----------
+
+test('L7.1: the live `file` from list --json reaches every yaml scope note; empty keeps the shape label', () => {
+  // the migrated layout's real path (C2) is what `list --json` prints
+  const live = '/srv/mkhome/projects/matrixkoder/project.yaml'
+  const view = buildSettingsView({
+    fields: [...SETTINGS_LIST_FIXTURE], file: live, configRows: [], globalDefaults: {}, about: ABOUT,
+  })
+  const byId = new Map<string, string>(view.scopes.map(s => [s.id as string, s.file]))
+  for (const id of ['project', 'routing', 'agents', 'models', 'child']) {
+    expect(byId.get(id), `the ${id} scope note names the live path`).toBe(live)
+  }
+  // the userConfig / plugin scopes are not the yaml: their labels stay
+  expect(byId.get('mode')).toBe('plugin.json')
+  expect(byId.get('tabs')).toBe('userConfig')
+  expect(byId.get('about')).toBe('plugin.json')
+  // no live path yet (fixture / first render): the shape label, never a hard-coded
+  // `.matrixkoder/matrixkoder.yaml` or `matrixkoder.yaml`
+  const pre = buildSettingsView({
+    fields: [...SETTINGS_LIST_FIXTURE], file: '', configRows: [], globalDefaults: {}, about: ABOUT,
+  })
+  for (const id of ['project', 'routing', 'agents', 'models', 'child']) {
+    expect(pre.scopes.find(s => s.id === id)?.file, `the ${id} label without a live path`).toBe('project.yaml')
+  }
+})
+
 /** The pool a `picks.<agent>` row carries in the list fixture — the one list the
  *  picker and `mk-config.py set` both read, so the test never restates it. */
 function fixturePool(agent: string): string[] {
@@ -391,7 +417,11 @@ test('S3 keys: savedEditKeys covers fields, picks and hive; settingsInputKeys on
   const keys = savedEditKeys(view)
   expect(keys).toContain('settings:edit:session.stall_min')
   expect(keys).toContain('settings:edit:models.opencode')
-  expect(keys).toContain('settings:edit:hive.matrixkoder')
+  // L7.1: the live view has no hive source (projects.json is retired), so it
+  // carries no stale hive edit keys; the fixture still lists projects for the card.
+  expect(view.projects).toEqual([])
+  const fixtureKeys = savedEditKeys(SETTINGS_FIXTURE)
+  expect(fixtureKeys).toContain('settings:edit:hive.matrixkoder')
   const inputs = settingsInputKeys(view)
   expect(inputs.has('set-find-input')).toBe(true)
   expect(inputs.has('set-session.stall_min')).toBe(false) // a num row draws no Input

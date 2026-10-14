@@ -1039,6 +1039,28 @@ def dead_notes(lines):
     return out_lines
 
 
+def project_yaml_path(data):
+    """The project yaml for the `--data` the caller passed.
+
+    mkpaths.project_yaml owns the pre-migration form (`<data>/matrixkoder.yaml`) and the legacy
+    form after a switch (the recorded `<repo>/.matrixkoder` resolves to the C2
+    `<home>/projects/<slug>/project.yaml`). The dashboard hands the Settings tab the C2 PROJECT
+    FOLDER (dirname of `projects.db_path`, hooks/data.ts projectDirFromStore), and mkpaths keys
+    its migrated lookup on the LEGACY data_dir — so that form would read (and `migrate` would
+    create) a phantom `<C2>/matrixkoder.yaml` while the real project.yaml goes untouched. The
+    C2 folder is the project folder, so its yaml comes from the slug.
+
+    Every path here is still asked of mkpaths (project_slug_of, db_path_of, target_project_yaml,
+    project_yaml): C1's one-path-module rule holds, mk-config only picks the right input. Once
+    mkpaths.project_yaml itself recognises the C2 folder this returns the same path (no double
+    handling). Never creates anything.
+    """
+    slug = mkpaths.project_slug_of(data)
+    if slug and mkpaths.db_path_of(slug=slug):
+        return mkpaths.target_project_yaml(slug)
+    return mkpaths.project_yaml(data)
+
+
 def load_usage(usage_path_arg):
     path = usage_path_arg
     if not path:
@@ -1419,7 +1441,7 @@ def main(argv=None):
         usage_arg, argv = argv[i + 1], argv[:i] + argv[i + 2:]
     try:
         data = mk_state.resolve_data(data_arg)
-        path = mkpaths.project_yaml(data)
+        path = project_yaml_path(data)
         lines = read_lines(path)
         cmd, args = (argv[0], argv[1:]) if argv else (None, [])
         if cmd == "list":
@@ -2443,6 +2465,75 @@ def self_test():
         assert "stall_min: 19" in final, final
         assert "herdr: stale" in final or "herdr: ok" in final, final
         assert "probed_at:" in final
+
+        # 34. L7.1: the dashboard hands the Settings tab the C2 PROJECT FOLDER (dirname of
+        #     projects.db_path, hooks/data.ts projectDirFromStore), not the legacy data_dir.
+        #     mkpaths.project_yaml keys its migrated lookup on the legacy data_dir, so without
+        #     project_yaml_path this would read — and `migrate` would CREATE — a phantom
+        #     <C2>/matrixkoder.yaml while the real project.yaml stayed untouched. Build a real
+        #     migrated project through L2's mk-migrate --switch (never hand-written SQL) and prove
+        #     both the legacy data dir and the C2 folder resolve to the same real project.yaml,
+        #     that migrate writes no phantom beside it, and that a `set` lands in project.yaml.
+        mig_home = os.path.join(tmp, "mig-home")
+        mig_repo = os.path.join(tmp, "mig-repo")
+        mig_data = os.path.join(mig_repo, ".matrixkoder")
+        os.makedirs(mig_data, exist_ok=True)
+
+        def _load(name, fn):
+            spec = importlib.util.spec_from_file_location(name, os.path.join(HERE, fn))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+
+        _mkdb = _load("mkdb", "mkdb.py")
+        _mkp = _load("mkpaths", "mkpaths.py")
+        if not os.path.isdir(os.path.join(mig_repo, ".git")):
+            subprocess.run(["git", "init", "-q", mig_repo], check=False)
+        con = _mkdb.open_root(mig_home)
+        try:
+            con.execute("INSERT OR REPLACE INTO projects(slug, name, repo, data_dir, mode, db_path)"
+                        " VALUES (?,?,?,?,?,NULL)",
+                        ("mig", "mig", os.path.realpath(mig_repo), os.path.realpath(mig_data), "home"))
+            con.execute("COMMIT")
+        finally:
+            con.close()
+        with open(os.path.join(mig_data, "matrixkoder.yaml"), "w") as f:
+            f.write(fixture)
+        _mkdb.open_project(mig_home, "mig", data_dir=mig_data).close()
+        switched = subprocess.run(
+            [sys.executable, os.path.join(HERE, "mk-migrate.py"), "--switch", "--slug", "mig",
+             "--data", mig_data, "--home", mig_home, "--repo", mig_repo],
+            capture_output=True, text=True, env=dict(os.environ, MK_SELFTEST="1"))
+        assert switched.returncode == 0, f"mk-migrate --switch: {switched.stdout}{switched.stderr}"
+        c2 = os.path.join(mig_home, "projects", "mig")
+        real_yaml = os.path.join(c2, "project.yaml")
+        assert os.path.isfile(real_yaml), f"the switch did not place project.yaml: {os.listdir(c2)}"
+
+        def run_mig(*args, ok=True, home_dir=mig_home):
+            run_env = dict(env, MATRIXKODER_HOME=home_dir, MK_HOME=home_dir)
+            p = subprocess.run([sys.executable, script, *args], capture_output=True, text=True,
+                               env=run_env, cwd=mig_repo)
+            lines = [x for x in (p.stdout or "").splitlines() if x.strip()]
+            assert len(lines) == 1, f"{args}: expected ONE json line, got {p.stdout!r} {p.stderr!r}"
+            obj = json.loads(lines[0])
+            assert obj.get("ok") is ok, f"{args}: {obj}"
+            return obj
+
+        # the legacy data dir and the C2 folder resolve to the SAME real project.yaml
+        legacy_file = run_mig("--data", mig_data, "list", "--json")["file"]
+        c2_file = run_mig("--data", c2, "list", "--json")["file"]
+        assert legacy_file == c2_file == real_yaml, (legacy_file, c2_file, real_yaml)
+        # migrate through the C2-folder form writes nothing new: no phantom matrixkoder.yaml
+        run_mig("--data", c2, "migrate")
+        assert not os.path.exists(os.path.join(c2, "matrixkoder.yaml")), \
+            f"migrate created a phantom beside project.yaml: {os.listdir(c2)}"
+        # and a set through the C2 folder lands in the real project.yaml, not a phantom
+        before_set = open(real_yaml).read()
+        run_mig("--data", c2, "set", "session.stall_min", "21")
+        after_set = open(real_yaml).read()
+        assert "stall_min: 21" in after_set and after_set != before_set, after_set
+        assert not os.path.exists(os.path.join(c2, "matrixkoder.yaml")), "set wrote a phantom yaml"
+
         # R1.2: the mkdb write guard refuses the real home from this suite too.
         import importlib.util as _iu
         _spec = _iu.spec_from_file_location("mkdb", os.path.join(HERE, "mkdb.py"))

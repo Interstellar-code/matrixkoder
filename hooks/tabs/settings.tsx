@@ -622,7 +622,7 @@ function ModeCards(els: Els, view: SettingsView, W: number, ui: TabUi | undefine
       ))}
       {mode === 'hive' && Card(els, { role: 'live' }, (
           <Box flexDirection="column" width={W}>
-            {SecHead(els, { label: 'hive · projects', right: 'projects.json' })}
+            {SecHead(els, { label: 'hive · projects', right: 'mode = hive' })}
             {view.projects.map(p => {
               const on = hiveEditOf(ui, p.name) ?? p.on
               const since = `onboarded ${p.since}`
@@ -704,7 +704,7 @@ function ModelsCards(els: Els, view: SettingsView, W: number, ui: TabUi | undefi
                 </Box>
               )
             })}
-            {readOnly && <Text dimColor={true}>{clip('read-only · no model list in matrixkoder.yaml', W)}</Text>}
+            {readOnly && <Text dimColor={true}>{clip('read-only · no model list in the project yaml', W)}</Text>}
             {full && <Text color={ROLE.warn.fg}>{clip('4 of 4 picked · untick one to swap', W)}</Text>}
             <Box flexDirection="row" justifyContent="space-between" gap={1}>
               <Text dimColor={true}>routing order = pick order</Text>
