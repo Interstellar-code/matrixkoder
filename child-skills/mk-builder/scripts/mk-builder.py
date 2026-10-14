@@ -1143,7 +1143,7 @@ def brief_counts(data, run):
                 text = r.get("text") or ""
                 raw = text.encode("utf-8")
                 out.setdefault(task, {})[f"brief-r{int(r.get('round') or 0)}.md"] = {
-                    "lines": len(text.decode("utf-8", "replace").splitlines()),
+                    "lines": len(text.splitlines()),
                     "bytes": len(raw)}
             return {t: dict(sorted(v.items(),
                                    key=lambda kv: (int(BRIEF_NAME_RE.match(kv[0]).group(1)), kv[0])))
@@ -1188,9 +1188,9 @@ def cmd_measure(a):
     run_dir = _paths("run_dir", data, run)
     if not os.path.isdir(run_dir):
         raise Fail(f"unknown run {run!r}: no {run_dir} directory [measure]")
-    if store_present(data):
-        events = measure_store(data, run)
-    else:
+    events = measure_store(data, run) if store_present(data) else None
+    if events is None:
+        # No store, or a store that cannot be read: events.jsonl stays the fallback.
         events = parse_events(data, run)
     by_source = {s: 0 for s in SOURCES}
     by_source["none"] = 0
@@ -2234,12 +2234,18 @@ def store_present(data):
 def store_rows(data, sql, params=()):
     """SELECT-only against the project store. Read-only URI so a lane CLI cannot write it."""
     uri = "file:" + _paths("project_db", data=data) + "?mode=ro"
-    con = sqlite3.connect(uri, uri=True, timeout=5)
-    con.row_factory = sqlite3.Row
+    con = None
     try:
+        con = sqlite3.connect(uri, uri=True, timeout=5)
+        con.row_factory = sqlite3.Row
         return [dict(r) for r in con.execute(sql, params)]
+    except sqlite3.Error:
+        # An unreadable or corrupt store file is not an error here: None sends every
+        # caller to the file view.
+        return None
     finally:
-        con.close()
+        if con is not None:
+            con.close()
 
 
 def store_artifacts(data, run, task, kind):
@@ -2405,7 +2411,9 @@ def brief_messages(cfg):
                     (run,))
         except (OSError, sqlite3.Error):
             return []
-        return [r.get("text") or "" for r in rows]
+        if rows is not None:
+            return [r.get("text") or "" for r in rows]
+        # The store exists but cannot be read: bus.jsonl stays the fallback.
     path = os.path.join(_paths("run_dir", data, run), "bus.jsonl")
     out = []
     try:
@@ -2768,7 +2776,7 @@ def status_seen_on_bus(cfg, data, task, mapped, round_n):
     except (OSError, sqlite3.Error):
         return False
     prefix = f"status {mapped}"
-    for row in rows:
+    for row in rows or []:
         text = row.get("text") or ""
         head, _, rest = text.partition("\n")
         if head.strip() != prefix:
@@ -2873,12 +2881,15 @@ def cmd_report(a):
 
 
 def measure_store(data, run):
-    """D7: when the project store exists, measure reads it instead of events.jsonl."""
+    """D7: when the project store exists, measure reads it instead of events.jsonl.
+    None when the store cannot be read: the caller falls back to events.jsonl."""
     events = store_rows(
         data,
         "SELECT id, task, t, chan, kind, text FROM events WHERE run=? ORDER BY id",
         (run,),
     )
+    if events is None:
+        return None
     # Adapt store rows to the events.jsonl shape parse_events/verdict_of already understand.
     adapted = []
     for e in events:
@@ -4741,6 +4752,142 @@ def t_l62_store_brief_and_review_brief(root):
     text = "\n".join(lines)
     assert "the store answers" in text and "store:brief-r1" in text, (code, lines)
     assert "bus text" not in text, ("the bus message must not win over the store", text)
+
+
+def t_l62r2_brief_counts_are_the_stored_brief_wc(root):
+    """L6.2 R2 HIGH 1: a stored `brief` artifact is a str, so its line count is its own
+    `splitlines()` — never a decode of itself. `measure` prints those counts (the one production
+    caller of brief_counts) and connect prints the same stored brief as page 1 with the phase
+    task list; the task folder holds a decoy brief-r1.md, so the counts prove the store is the
+    source (C4)."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data = os.path.join(root, "l62r2bc-data")
+    os.makedirs(data, exist_ok=True)
+    run, task = BUS_RUN, "L62B.1"
+    mod = d7_store(data, run, task)
+    os.makedirs(_paths("run_dir", data, run), exist_ok=True)
+    # newline-terminated (what mk-state writes) with a multi-byte line, so wc -c != len(text)
+    brief = "# stored brief\nbuild the doorbell — ünïcode ✓\nthird line\n"
+    mod.put_artifact(None, None, run, task, 1, "brief", brief, data_dir=data)
+    decoy = "decoy file-view brief\n"
+    task_dir = _paths("tasks_dir", data, run)
+    os.makedirs(os.path.join(task_dir, task), exist_ok=True)
+    with open(os.path.join(task_dir, task, "brief-r1.md"), "w") as f:
+        f.write(decoy)
+    code, lines = cli_raw("measure", "--data", data, "--run", run)
+    assert code == 0 and len(lines) == 1, lines
+    counted = jline(lines)["briefs"]
+    assert counted == {task: {"brief-r1.md": {"lines": len(brief.splitlines()),
+                                               "bytes": len(brief.encode("utf-8"))}}}, counted
+    assert (counted[task]["brief-r1.md"]["lines"] != len(decoy.splitlines())
+            and counted[task]["brief-r1.md"]["bytes"] != len(decoy.encode("utf-8"))), \
+        "the task folder's brief must not be what is counted"
+    lane = mklane(root, "l62r2bc_lane")
+    begin(lane, root, run=run, task=task)
+    plan = os.path.join(root, "l62r2bc-plan.md")
+    with open(plan, "w") as f:
+        f.write('+++\nplan = "l62r2bc"\nstatus = "running"\n[[phase]]\nid = "L62B"\n'
+                '[[phase.task]]\nid = "L62B.1"\ntitle = "store brief"\nparallel = false\n'
+                'deps = []\n[[phase.task]]\nid = "L62B.2"\ntitle = "corrupt store"\n'
+                'parallel = true\ndeps = ["L62B.1"]\n+++\n')
+    code, lines = cli(lane, "connect", "--data", data, "--plan", plan)
+    assert code == 0, lines
+    text = "\n".join(lines)
+    assert text.startswith("# brief 1/1 store:brief-r1"), text[:80]
+    assert "build the doorbell" in text and "third line" in text, text
+    assert "decoy" not in text, ("the store's brief, not the task folder's", text)
+    assert "[L62B.1] store brief parallel=false deps=" in text, text[-400:]
+    assert "[L62B.2] corrupt store parallel=true deps=L62B.1" in text, text[-400:]
+
+
+def t_l62r2_corrupt_store_reads_as_the_file_view(root):
+    """L6.2 R2 HIGH 2: a store file that cannot be opened or parsed never raises out of
+    `store_rows` — an unreadable mk.db and a non-sqlite mk.db both answer None, so every
+    caller reads the file view instead: store_artifacts finds no artifact, brief_counts counts
+    the task folder's brief-rN.md, and connect answers from the lane's own brief copy."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    lane_brief = "# lane copy\nthe lane file answers\n"
+    file_brief = "# file view brief\ntwo lines here\n"
+    task = "L62C"
+    for broken in ("unreadable", "garbage"):
+        data = os.path.join(root, f"l62r2cs-{broken}")
+        os.makedirs(data, exist_ok=True)
+        d7_store(data, BUS_RUN, task)
+        os.makedirs(_paths("run_dir", data, BUS_RUN), exist_ok=True)
+        db = _paths("project_db", data=data)
+        os.chmod(db, 0o600)
+        if broken == "unreadable":
+            if os.geteuid() == 0:
+                continue    # root opens a 0o000 file: this half cannot fail on this machine
+            os.chmod(db, 0o000)
+        else:
+            with open(db, "wb") as f:
+                f.write(b"this is not a sqlite database\n" * 64)
+        assert store_present(data), (broken, db)
+        try:
+            # the read itself: no raise, and None sends every caller to the file view
+            assert store_rows(data, "SELECT id FROM runs WHERE id=?", (BUS_RUN,)) is None, broken
+            assert store_artifacts(data, BUS_RUN, task, "brief") is None, broken
+            assert newest_stored_artifact(data, BUS_RUN, task, "brief") is None, broken
+            task_dir = _paths("tasks_dir", data, BUS_RUN)
+            os.makedirs(os.path.join(task_dir, task), exist_ok=True)
+            with open(os.path.join(task_dir, task, "brief-r1.md"), "w") as f:
+                f.write(file_brief)
+            assert brief_counts(data, BUS_RUN) == {task: {"brief-r1.md": {
+                "lines": len(file_brief.splitlines()),
+                "bytes": len(file_brief.encode("utf-8"))}}}, (broken, brief_counts(data, BUS_RUN))
+            lane = mklane(root, f"l62r2cs_{broken}_lane")
+            begin(lane, root, run=BUS_RUN, task=task)
+            code, lines = cli(lane, "connect", "--data", data)
+            assert code == 0 and lines == ["# brief: none found"], (broken, code, lines)
+            with open(os.path.join(lane, ".matrixkoder-brief-r1.md"), "w") as f:
+                f.write(lane_brief)
+            code, lines = cli(lane, "connect", "--data", data)
+            assert code == 0 and "the lane file answers" in "\n".join(lines), (broken, code, lines)
+            assert "store:" not in "\n".join(lines), (broken, lines)
+        finally:
+            os.chmod(db, 0o600)
+
+
+def t_l62r2_measure_corrupt_store_counts_the_events_file(root):
+    """L6.2 R2 HIGH 2: `measure` over a store it cannot read is the file view, not a crash —
+    a garbage mk.db and an unreadable mk.db both leave events.jsonl and the task folders' briefs
+    as the answer (exit 0, one JSON line), byte for byte what the same project measures with no
+    store at all. The store holds a DIFFERENT brief, so the equality is the fallback, not luck."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data = measure_fixture(root)
+    code, lines = cli_raw("measure", "--data", data, "--run", "fx")
+    assert code == 0 and len(lines) == 1, lines
+    want = jline(lines)
+    assert want["ok"] is True and want["data"] == data and want["briefs"], want
+    want.pop("data")     # the store-less project and the broken-store one differ by path only
+    for broken in ("unreadable", "garbage"):
+        other = os.path.join(root, f"l62r2ms-{broken}")
+        shutil.copytree(data, other)
+        mod = d7_store(other, "fx", "T1")
+        mod.put_artifact(None, None, "fx", "T1", 1, "brief",
+                         "# store brief\nthe store would answer\n", data_dir=other)
+        db = _paths("project_db", data=other)
+        assert store_present(other), (broken, db)
+        if broken == "unreadable":
+            if os.geteuid() == 0:
+                continue    # root opens a 0o000 file: this half cannot fail on this machine
+            os.chmod(db, 0o000)
+        else:
+            with open(db, "wb") as f:
+                f.write(b"this is not a sqlite database\n" * 64)
+        try:
+            assert store_rows(other, "SELECT id FROM runs WHERE id=?", ("fx",)) is None, broken
+            code, lines = cli_raw("measure", "--data", other, "--run", "fx")
+            assert code == 0 and len(lines) == 1, (broken, code, lines)
+            got = jline(lines)
+            assert got.pop("data") == other, (broken, got)
+            assert got == want, (broken, got)   # the same project, measured without a store
+        finally:
+            os.chmod(db, 0o600)
 
 
 def t_l62_migrated_project_connect_round_trip(root):

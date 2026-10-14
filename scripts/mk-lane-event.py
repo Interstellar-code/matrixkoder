@@ -626,14 +626,18 @@ def store_rows(data, sql, params=()):
     if not store_present(data):
         return None
     uri = "file:" + mkpaths.project_db(data=data) + "?mode=ro"
-    con = sqlite3.connect(uri, uri=True, timeout=5)
-    con.row_factory = sqlite3.Row
+    con = None
     try:
+        con = sqlite3.connect(uri, uri=True, timeout=5)
+        con.row_factory = sqlite3.Row
         return [dict(r) for r in con.execute(sql, params)]
     except sqlite3.Error:
+        # An unreadable or corrupt store file must not take the caller down: the file
+        # view stays the fallback.
         return None
     finally:
-        con.close()
+        if con is not None:
+            con.close()
 
 
 def store_artifact(data, run, task, kind):
@@ -3708,6 +3712,27 @@ def self_test():
         assert store_rows(_nod, "SELECT id FROM runs WHERE id=?", ("r1",)) is None
         got_text, got_n = brief_body_for(_nod, "r1", "FB")
         assert got_n == 2 and "file brief only" in got_text, (got_n, got_text)
+        # an UNREADABLE store file is not a crash: store_rows returns None (its connect is inside
+        # the try, like its execute) and every reader falls back to the file view. Without that,
+        # sqlite3.OperationalError escaped dispatch over a store file no one could read.
+        _bad = os.path.join(tmp, "badstore")
+        shutil.copytree(os.path.join(ddata, "runs"), os.path.join(_bad, "runs"))
+        bad_db = mkpaths.project_db(data=_bad)
+        open(bad_db, "w").close()
+        os.chmod(bad_db, 0o000)
+        try:
+            assert store_present(_bad), "an unreadable store is still a store"
+            assert store_rows(_bad, "SELECT id FROM runs WHERE id=?", ("r1",)) is None
+            got_text, got_n = brief_body_for(_bad, "r1", "FB")
+            assert got_n == 2 and "file brief only" in got_text, (got_n, got_text)
+            # dispatch's own read path publishes that same file brief
+            open(bus_log, "w").write("")
+            ok, err = publish_brief(_bad, "r1", "FB")
+            assert ok and err is None and "file brief only" in open(bus_log).read(), (ok, err)
+            # child ids come from run.json, not from a store nobody can open
+            assert child_ids("DB", _bad, "r1") == ["DB.1"], child_ids("DB", _bad, "r1")
+        finally:
+            os.chmod(bad_db, 0o600)
         # (c) the review is served from the DB, with the review round and no file
         mkd("task", "round", "DB", "--kind", "build")
         _c = mkdb.open_project(s_home, "matrixkoder", data_dir=ddata)
