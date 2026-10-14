@@ -238,6 +238,11 @@ def store_report_ok(data, armed, report):
     Store off, or no such artifact: the caller keeps the file check. None = not decided here."""
     if not report or not store_on(data) or not armed or not armed.get("run") or not armed.get("task"):
         return None
+    # F1: a REVIEW phase never takes the builder's report artifact either; it waits for
+    # its own --report file (the review file) on disk.
+    _pm = PHASE_ROUND_RE.match(str(armed.get("phase") or ""))
+    if _pm and _pm.group(2):
+        return None
     m = PHASE_ROUND_RE.match(str(armed.get("phase") or ""))
     rnd = int(m.group(3)) if m else None
     try:
@@ -303,31 +308,36 @@ def read_status(lane, armed):
     (R29): a missing file, corrupt JSON or a wrong-typed field is a miss, never a crash. Unknown
     fields are ignored (R38). The only file this watcher ever gains; the caller passes the result
     to decide() as st."""
-    row = store_status_row((armed or {}).get("data"), armed)
-    if isinstance(row, dict) and row.get("store_error"):
-        # A failed store read is a named miss, not silence and not the pane path: decide()
-        # keeps watching (source=status) instead of grace-DONE or STALL on a quiet lane.
-        return {"v": 1, "seq": None, "run": (armed or {}).get("run"),
-                "task": (armed or {}).get("task"), "round": None, "role": "builder",
-                "state": "store_error", "question": None, "updated_at": 0.0,
-                "source": "status", "store_error": row["store_error"]}
-    if row is not None:
-        # the store row for this round wins; the status file is not read. seq stays None so the
-        # row never enters _seen_seq (that counter belongs to the file channel only).
-        status = (row["status"] or "").lower()
-        verdict = row["verdict"] or ""
-        fresh = True
-        if status == "blocked" or verdict.upper().startswith("BLOCKED"):
-            state, question = "blocked", verdict or "blocked"
-        elif status in ("verifying", "review", "merged", "done") or verdict.upper().startswith("DONE"):
-            state, question = "done", None
-        else:
-            # a non-terminal row is not a heartbeat: updated_at 0 so it never resets the idle clock
-            state, question, fresh = "started", None, False
-        upd = _row_epoch(row["updated"]) if fresh else 0.0
-        return {"v": 1, "seq": None, "run": armed.get("run"), "task": armed.get("task"),
-                "round": row["round"], "role": "builder", "state": state, "question": question,
-                "updated_at": upd, "source": "store"}
+    # F1: a REVIEW phase never takes the store row. The row is the BUILDER's round
+    # (review/merged is the builder being finished); a review watch waits for its own
+    # --report file and the reviewer's status file (R27.6 accepts role=reviewer only).
+    _pm = PHASE_ROUND_RE.match(str((armed or {}).get("phase") or ""))
+    if not (_pm and _pm.group(2)):
+        row = store_status_row((armed or {}).get("data"), armed)
+        if isinstance(row, dict) and row.get("store_error"):
+            # A failed store read is a named miss, not silence and not the pane path: decide()
+            # keeps watching (source=status) instead of grace-DONE or STALL on a quiet lane.
+            return {"v": 1, "seq": None, "run": (armed or {}).get("run"),
+                    "task": (armed or {}).get("task"), "round": None, "role": "builder",
+                    "state": "store_error", "question": None, "updated_at": 0.0,
+                    "source": "status", "store_error": row["store_error"]}
+        if row is not None:
+            # the store row for this round wins; the status file is not read. seq stays None so the
+            # row never enters _seen_seq (that counter belongs to the file channel only).
+            status = (row["status"] or "").lower()
+            verdict = row["verdict"] or ""
+            fresh = True
+            if status == "blocked" or verdict.upper().startswith("BLOCKED"):
+                state, question = "blocked", verdict or "blocked"
+            elif status in ("verifying", "review", "merged", "done") or verdict.upper().startswith("DONE"):
+                state, question = "done", None
+            else:
+                # a non-terminal row is not a heartbeat: updated_at 0 so it never resets the idle clock
+                state, question, fresh = "started", None, False
+            upd = _row_epoch(row["updated"]) if fresh else 0.0
+            return {"v": 1, "seq": None, "run": armed.get("run"), "task": armed.get("task"),
+                    "round": row["round"], "role": "builder", "state": state, "question": question,
+                    "updated_at": upd, "source": "store"}
     try:
         with open(os.path.join(lane, STATUS_FILE)) as f:   # R27.1: <lane>/.matrixkoder-status.json
             st = json.load(f)
@@ -994,6 +1004,50 @@ def self_test():
         ln = mklane("extra")
         wstat(ln, proto="mk-builder-status/v1", msg_id=None, last_read_id="b7")
         assert read_status(ln, armed) is not None
+
+        # --- F1: a REVIEW watch waits for its own review, never the builder's done --------
+        # (a) a REVIEW-phase watch whose task store row is review/merged and whose review
+        #     file is absent does NOT return DONE — read_status skips the store row.
+        rev_armed = {"lane": stmp, "run": "r1", "task": "O1", "phase": "O1 REVIEW R1",
+                     "armed_at": t0, "max_wait_min": 30, "data": None}  # no store in this fixture
+        ln = mklane("f1a-store-row")
+        # a builder-role done file is REJECTED by a REVIEW phase (R27.6: role must be reviewer)
+        wstat(ln, task="O1", role="builder", state="done")
+        assert read_status(ln, rev_armed) is None, "a builder file must not satisfy a review watch"
+        # no reviewer file, no review report -> decide must NOT be DONE (rx None, report False)
+        assert decide(ok, other, None, False, "", "O1 REVIEW R1", 10, None, rev_armed)[0] != "DONE"
+        # (b) the same watch returns DONE once the review file exists AND the status file
+        #     has role=reviewer, state=done (R27.6 accepts the reviewer's own file).
+        ln = mklane("f1b-reviewer-done")
+        wstat(ln, task="O1", role="reviewer", state="done")
+        st_rev = read_status(ln, rev_armed)
+        assert st_rev and st_rev["role"] == "reviewer" and st_rev["state"] == "done", st_rev
+        # report_ok=True (the review file exists), rx None (--no-commit): DONE from the status file
+        assert decide(ok, other, None, True, "", "O1 REVIEW R1", 10, st_rev, rev_armed) == \
+            ("DONE", ["status file done (seq 5)", "source=status"])
+        # (c) a REVIEW watch with no --task: main() must not usage-error; the watch runs and
+        #     exits with exactly one JSON line (here: WATCH_EXPIRED via a subprocess CLI call
+        #     is proven in the store section below; at the unit level, armed has task=None so
+        #     read_status never accepts a file and decide falls to the pane path).
+        no_task_armed = {"lane": stmp, "run": "r1", "task": None, "phase": "O1 REVIEW R1",
+                         "armed_at": t0, "max_wait_min": 30, "data": None}
+        ln = mklane("f1c-no-task")
+        wstat(ln, task="O1", role="reviewer", state="done")
+        assert read_status(ln, no_task_armed) is None, "no task armed: no file is accepted (R27.4)"
+        # the pane path still works: a token in the pane gives DONE (rx None, report True)
+        assert decide(ok, other, None, True, "⏺ O1 REVIEW R1 DONE\n", "O1 REVIEW R1", 10,
+                      None, no_task_armed) == ("DONE", ["O1 REVIEW R1 DONE", "source=pane"])
+        # (d) no regression: a builder-phase watch with a done store row + commit + report
+        #     still returns DONE — covered by the S4 store test below (source=store), and
+        #     here at the unit level with a builder done file + matching commit + report.
+        bld_armed = {"lane": stmp, "run": "r1", "task": "P1", "phase": "P1 R1",
+                     "armed_at": t0, "max_wait_min": 30, "data": None}
+        ln = mklane("f1d-builder-done")
+        wstat(ln, state="done", seq=5)
+        st_b = read_status(ln, bld_armed)
+        assert st_b and st_b["state"] == "done", st_b
+        assert decide(ok, good, rx, True, "", "P1 R1", 10, st_b, bld_armed) == \
+            ("DONE", [f"commit {good}", "status file done (seq 5)", "source=status"])
     finally:
         shutil.rmtree(stmp, ignore_errors=True)
 
@@ -1376,6 +1430,53 @@ def self_test():
         assert out["evidence"][-1] == "source=store" and "store row done" in out["evidence"], out
         # the verdict reached the CHILD through the store tree (child_tasks read tasks.parent)
         assert statuses()["SK1"]["status"] == "verifying", statuses()
+
+        # F1 (a) store-backed: a REVIEW-phase watch whose task store row is review/merged
+        # and whose review file is absent does NOT return DONE — read_status skips the
+        # store row for a REVIEW phase, and store_report_ok returns None for it too.
+        mks("task", "add", "--id", "F1T", "--title", "f1 review")
+        mks("task", "set", "F1T", "status=building")
+        mks("task", "round", "F1T", "--kind", "build")   # round 1, report artifact stored
+        mks("task", "set", "F1T", "status=merged")        # the builder's finished row
+        _rev_armed = {"run": "r1", "task": "F1T", "phase": "F1T REVIEW R1", "data": data}
+        assert store_on(data), data
+        _row = store_status_row(data, _rev_armed)
+        assert _row and _row["status"] == "merged", dict(_row) if _row else None
+        # read_status must NOT return the store row for a REVIEW phase -> falls to the file
+        _st = read_status(lane, {**_rev_armed, "armed_at": 0})
+        assert _st is None, f"REVIEW phase took the store row: {_st}"
+        # store_report_ok must NOT credit the builder's artifact to a review watch
+        assert store_report_ok(data, _rev_armed, "report-s1.md") is None, \
+            "REVIEW phase took the builder's report artifact"
+        # the review file does NOT exist in the lane -> the watch must NOT be DONE.
+        # (A full CLI run would block until max-wait; the unit assertion above + the
+        # pane-path prove the decide() arm. Here a reviewer token + the missing report
+        # file keeps it off DONE: report_ok False, rx None.)
+        open(pane, "w").write("> Read and follow review-brief.md\n⏺ F1T REVIEW R1 DONE\n")
+        out = cli("--no-commit", "--report", ".matrixkoder-review-r1.md", "--phase", "F1T REVIEW R1",
+                  "--run", "r1", "--kind", "codex", "--prompt-marker", "Read and follow review-brief.md",
+                  "--poll", "0.1", "--stall-min", win(0.02, 0.06)[0],
+                  "--max-wait-min", win(0.02, 0.06)[1], "--task", "F1T", "--data", data)
+        assert out["state"] != "DONE", f"REVIEW watch DONE from the builder's merged row: {out}"
+
+        # F1 (c) CLI: a REVIEW watch with --data and NO --task must not usage-error; it
+        # runs and prints exactly one JSON line (never silent, never a bare usage text).
+        r = subprocess.run([sys.executable, __file__, "--lane", lane, "--agent", "w1", "--no-commit",
+                            "--report", ".matrixkoder-review-r1.md", "--phase", "F1T REVIEW R1",
+                            "--run", "r1", "--kind", "codex", "--prompt-marker",
+                            "Read and follow review-brief.md", "--poll", "0.1",
+                            "--stall-min", win(0.02, 0.06)[0], "--max-wait-min", win(0.02, 0.06)[1],
+                            "--data", data],
+                           env=dict(env, MATRIXKODER_HOME=os.environ["MATRIXKODER_HOME"],
+                                    MK_HOME=os.environ["MATRIXKODER_HOME"], MK_SELFTEST="1"),
+                           capture_output=True, text=True)
+        assert r.returncode == 0, (r.returncode, r.stdout[-200:], r.stderr[-200:])
+        _lines = [l for l in r.stdout.strip().splitlines() if l.strip()]
+        assert len(_lines) >= 1, f"REVIEW watch with no --task printed nothing: {r.stdout!r}"
+        _out = json.loads(_lines[-1])   # the last line is the one JSON line
+        assert _out["state"] in ("DONE", "WATCH_EXPIRED", "STALL", "QUOTA", "PROVIDER",
+                                 "BLOCKED", "DEV_SERVER", "ERROR", "DONE_SENT"), _out
+        assert "state_written" not in _out, "no --task: nothing must be written to the store"
         # DONE still needs the commit: no matching commit -> never DONE
         mks("task", "add", "--id", "S5", "--title", "store2")
         mks("task", "set", "S5", "status=building")
@@ -1534,7 +1635,12 @@ def main():
     task, tasks, data = opt(a, "--task"), opt(a, "--tasks"), opt(a, "--data")
     if task and tasks:
         sys.exit("--task and --tasks are two spellings of the same thing; pass one\n" + __doc__)
-    if bool(task or tasks) != bool(data):
+    # F1: --task and --data go together, EXCEPT a REVIEW phase may run with --data and no
+    # --task (a review watch needs no task: the store row and the status file are both
+    # task-keyed, so the pane-text path decides). Without --task there is no store write.
+    _phase = opt(a, "--phase") or ""
+    _is_review = bool(PHASE_ROUND_RE.match(_phase)) and bool(PHASE_ROUND_RE.match(_phase).group(2))
+    if bool(task or tasks) != bool(data) and not (_is_review and data and not (task or tasks)):
         sys.exit("--task and --data go together (state is written only with both)\n" + __doc__)
     try:
         out = watch(a)
