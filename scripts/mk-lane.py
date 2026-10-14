@@ -58,7 +58,8 @@ LOCKFILES = ("pnpm-lock.yaml", "package-lock.json", "yarn.lock", "bun.lock", "bu
 # tracks nothing. A tracked `.omc/plans/*.md` (or any other non-`!!` line) still counts. Listing
 # `.omc/` here would also swallow an ignored file inside a TRACKED `.omc/` (the 11g case).
 DISPOSABLE = (".matrixkoder-*", ".env", ".env.*", "node_modules/", ".omo/", ".serena/",
-              ".venv/", "__pycache__/", ".claude/", ".claude/skills/mk-builder/")
+              ".venv/", "__pycache__/", ".claude/", ".claude/skills/mk-builder/",
+              ".omp/", ".omp/skills/mk-builder/")
 # The build-cache dirs every package/venv path ends with: allowed as a path component at any depth,
 # so a monorepo's packages/a/node_modules/ does not read as dirty. Everything else stays root-only.
 ANY_DEPTH = ("node_modules/", "__pycache__/", ".venv/")
@@ -597,7 +598,8 @@ def ensure_lane_exclude(lane):
             ep = ep if os.path.isabs(ep) else os.path.join(lane, ep)
             if os.path.exists(os.path.dirname(ep)):
                 cur = open(ep).read() if os.path.exists(ep) else ""
-                add = [e for e in (".matrixkoder-*", ".omo/", ".claude/skills/mk-builder/")
+                add = [e for e in (".matrixkoder-*", ".omo/", ".claude/skills/mk-builder/",
+                                    ".omp/", ".omp/skills/mk-builder/")
                        if e not in cur]
                 if add:
                     with open(ep, "a") as f:
@@ -946,19 +948,55 @@ def archive_stale_lane_files(lane, run):
     return old if os.path.isdir(old) else None
 
 
+def user_omp_skill():
+    """The user-level omp skill DIRECTORY acquire compares against (the real
+    ~/.omp/agent/skills/mk-builder), or None when there is none. Read-only: acquire never writes
+    here. $MK_OMP_USER_SKILLS redirects the comparison at a stand-in (the self-test's temp dir), so
+    a test never reads or touches the real ~/.omp; it may name the skills dir or the skill itself.
+    """
+    d = os.environ.get("MK_OMP_USER_SKILLS")
+    if d:
+        # a skills dir is the parent; the skill dir is named `mk-builder` either way
+        return os.path.join(d, "mk-builder") if os.path.basename(d) != "mk-builder" else d
+    return os.path.join(os.path.expanduser("~"), ".omp", "agent", "skills", "mk-builder")
+
+
+def omp_user_skill_mismatch():
+    """A warning string when the user-level ~/.omp copy of mk-builder differs from the plugin's,
+    else None. The project `.omp/skills` copy is what an omp lane loads, so the user copy is only
+    ever reported, never overwritten — an acquire never writes outside its own slot."""
+    got = os.path.join(user_omp_skill(), "SKILL.md")
+    want = os.path.join(SKILL_SRC, "SKILL.md")
+    if not os.path.isfile(got) or not os.path.isfile(want):
+        return None
+    try:
+        if open(got, "rb").read() == open(want, "rb").read():
+            return None
+    except OSError:
+        return None
+    return (f"user-level omp skill {got} differs from the plugin copy {want}: version "
+            f"mismatch, left untouched (an omp lane reads the slot's .omp/skills copy instead)")
+
+
 def install_lane_skill(lane):
     """The mk-builder skill copy and its git guard into the slot, on EVERY acquire: overwrite, not
     merge — an existing install is always this tool's own untracked, excluded, disposable dir, and
     a wholesale replace is the only way the slot's version always matches the plugin. A missing
     source is a hard Fail (a lane silently missing its guard is worse than a refused acquire) and
-    leaves no half-installed skill dir behind. -> (skill dir, guard path), both absolute."""
+    leaves no half-installed skill dir behind.
+    TWO installs, because a lane's agent decides where it reads skills: `.claude/skills/mk-builder`
+    for a Claude/OpenCode lane and `.omp/skills/mk-builder` for an omp lane (omp's native project
+    skill dir, its loader joining `<cwd>/.omp` with `skills`). Both are overwritten, both are
+    git-excluded, and both hold the same bytes.
+    -> (claude skill dir, omp skill dir, guard path), all absolute."""
     skill = os.path.join(lane, ".claude", "skills", "mk-builder")
+    omp_skill = os.path.join(lane, ".omp", "skills", "mk-builder")
     guard = os.path.join(lane, ".matrixkoder-bin", "git")
     if not os.path.isdir(lane):
         # a herdr that answered ok but created no worktree: report the intended destinations,
         # install nothing (creating the path implicitly would poison the next pick_slot), and
         # let the acquire through exactly as before — the next real acquire installs for real.
-        return skill, guard
+        return skill, omp_skill, guard
     if not os.path.isdir(SKILL_SRC):
         raise Fail(f"mk-builder skill source {SKILL_SRC} not found in the plugin")
     if not os.path.isfile(GUARD_SRC):
@@ -971,23 +1009,31 @@ def install_lane_skill(lane):
         except ValueError:  # realpath outside this mount: never ours
             return False
 
-    if os.path.islink(skill) or os.path.isfile(skill):
-        os.unlink(skill)  # a link or a stray file goes by the link only; a link is never followed
-    elif os.path.isdir(skill):
-        if not inside_slot(skill):
-            raise Fail(f"mk-builder skill path {skill} resolves outside the slot, refused")
-        shutil.rmtree(skill)
+    def fresh(dst):
+        if os.path.islink(dst) or os.path.isfile(dst):
+            os.unlink(dst)  # a link or a stray file goes by the link only; never followed
+        elif os.path.isdir(dst):
+            if not inside_slot(dst):
+                raise Fail(f"mk-builder skill path {dst} resolves outside the slot, refused")
+            shutil.rmtree(dst)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        return dst
+
+    done = []
     try:
-        shutil.copytree(SKILL_SRC, skill)
+        for dst in (skill, omp_skill):
+            shutil.copytree(SKILL_SRC, fresh(dst))
+            done.append(dst)
         os.makedirs(os.path.join(lane, ".matrixkoder-bin"), exist_ok=True)
         guard = os.path.join(lane, ".matrixkoder-bin", "git")
         shutil.copy2(GUARD_SRC, guard)
         os.chmod(guard, 0o755)  # copy2 keeps the source mode; chmod guarantees the executable bit
     except (OSError, shutil.Error) as e:
-        if not os.path.islink(skill) and inside_slot(skill):
-            shutil.rmtree(skill, ignore_errors=True)  # no partial install left behind
+        for dst in done:  # no partial install left behind, either copy
+            if not os.path.islink(dst) and inside_slot(dst):
+                shutil.rmtree(dst, ignore_errors=True)
         raise Fail(f"mk-builder skill install into {lane} failed: {type(e).__name__}: {e}"[:400])
-    return skill, guard
+    return skill, omp_skill, guard
 
 
 def remove_slot(n, rec, main):
@@ -1060,7 +1106,9 @@ def cmd_acquire(a, cfg, data, main):
         # — then the skill copy + guard, overwritten so the version always matches the plugin.
         ensure_lane_exclude(rec["path"])
         archive_stale_lane_files(rec["path"], rid)
-        skill_dst, guard_dst = install_lane_skill(rec["path"])
+        skill_dst, omp_dst, guard_dst = install_lane_skill(rec["path"])
+        if (mm := omp_user_skill_mismatch()):  # user-level copy drifts: reported, never overwritten
+            warns.append(mm)
         # lanes.copy runs on EVERY acquire: a fresh slot gets everything, a reused slot only the
         # targets it is missing — an existing target is never overwritten (copy_into_slot).
         warns += copy_into_slot(cfg, main, rec["path"])
@@ -1082,7 +1130,8 @@ def cmd_acquire(a, cfg, data, main):
         out = {"ok": True, "slot": n, "path": rec["path"], "workspace": rec["workspace"],
                "workspace_id": rec["workspace_id"], "branch": rec["branch"],
                "agent": nms["agent"], "created": created, "install_needed": install_needed,
-               "skill_installed": skill_dst, "guard_path": guard_dst}
+               "skill_installed": skill_dst, "omp_skill_installed": omp_dst,
+               "guard_path": guard_dst}
         out.update(herdr_pane_agent(rec["path"], rec["workspace_id"], nms["agent"]))
         if len(tasks) > 1:
             out["tasks"] = tasks
@@ -1609,12 +1658,17 @@ def self_test():
         st("task", "add", "--id", "t1", "--title", "first", "--run", "r1")
 
         # 2 first acquire creates slot 1 on the task branch and records the task keys
+        omp_slot_skill = os.path.join(slot1, ".omp/skills/mk-builder")
         a1 = mk("acquire", "--run", "r1", "--task", "t1", "--base", "main")
         assert a1 == {"ok": True, "slot": 1, "path": slot1, "workspace": "mk:repo:1",
                       "workspace_id": None, "branch": "mk/r1/t1", "agent": "t1-build-r1",
                       "created": True, "install_needed": True,
                       "skill_installed": os.path.join(slot1, ".claude/skills/mk-builder"),
+                      "omp_skill_installed": omp_slot_skill,
                       "guard_path": os.path.join(slot1, ".matrixkoder-bin/git")}, a1
+        assert open(os.path.join(omp_slot_skill, "SKILL.md"), "rb").read() == \
+            open(os.path.join(os.path.dirname(HERE), "child-skills", "mk-builder", "SKILL.md"),
+                 "rb").read()  # an omp lane reads .omp/skills; it holds the plugin's bytes
         assert os.path.isdir(slot1)
         assert g("-C", slot1, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "mk/r1/t1"
         assert mk("list")["slots"][0]["state"] == "busy"
@@ -1624,7 +1678,7 @@ def self_test():
         ep = ep if os.path.isabs(ep) else os.path.join(slot1, ep)
         excl = open(ep).read()
         assert ".matrixkoder-*" in excl and ".omo/" in excl
-        assert ".claude/skills/mk-builder/" in excl
+        assert ".claude/skills/mk-builder/" in excl and ".omp/skills/mk-builder/" in excl
         t = st("task", "get", "t1")["task"]
         assert (t["lane"], t["branch"], t["workspace"], t["slot"]) == (slot1, "mk/r1/t1", "mk:repo:1", "1"), t
 
@@ -1718,12 +1772,13 @@ def self_test():
         write(os.path.join(slot1, ".matrixkoder-watch.lock"), "")
         old1 = os.path.join(slot1, ".matrixkoder-old-r1")
         skill_dst = os.path.join(slot1, ".claude", "skills", "mk-builder")
+        omp_dst = os.path.join(slot1, ".omp", "skills", "mk-builder")
         guard_dst = os.path.join(slot1, ".matrixkoder-bin", "git")
         src_skill = os.path.join(os.path.dirname(HERE), "child-skills", "mk-builder")
         st("task", "add", "--id", "t6a", "--title", "archive case a", "--run", "r1")
         acq1 = mk("acquire", "--run", "r1", "--task", "t6a", "--base", "main")
-        assert (acq1["ok"], acq1["skill_installed"], acq1["guard_path"]) == \
-            (True, skill_dst, guard_dst), acq1
+        assert (acq1["ok"], acq1["skill_installed"], acq1["omp_skill_installed"],
+                acq1["guard_path"]) == (True, skill_dst, omp_dst, guard_dst), acq1
         # the four stale files plus the brief (no longer kept) sit in the archive, byte-identical;
         # only the watch state remains at top level among `.matrixkoder-*` FILES
         # (the archive and .matrixkoder-bin/ are dirs)
@@ -1748,14 +1803,32 @@ def self_test():
         # and no duplicate archive content (nothing stale was left to move a second time)
         st("task", "add", "--id", "t6b", "--title", "archive case b", "--run", "r1")
         acq2 = mk("acquire", "--run", "r1", "--task", "t6b", "--base", "main")
-        assert (acq2["ok"], acq2["skill_installed"], acq2["guard_path"]) == \
-            (True, skill_dst, guard_dst), acq2
+        assert (acq2["ok"], acq2["skill_installed"], acq2["omp_skill_installed"],
+                acq2["guard_path"]) == (True, skill_dst, omp_dst, guard_dst), acq2
         assert sorted(os.listdir(old1)) == sorted(archived), os.listdir(old1)
         assert open(os.path.join(skill_dst, "SKILL.md"), "rb").read() == \
             open(os.path.join(src_skill, "SKILL.md"), "rb").read()
         assert os.access(guard_dst, os.X_OK)
         assert mk("release", "--slot", "1", "--integration", "mk/r1/integration")["ok"]
         # back on t5 at the integration tip, the state case 8 below expects
+        assert mk("acquire", "--run", "r1", "--task", "t5", "--base", "mk/r1/integration")["ok"]
+        # 6c (C4) the user-level ~/.omp copy is COMPARED, never written: a drifted copy rides in
+        # the acquire warning and is left exactly as it was; a matching one says nothing.
+        usr = os.path.join(tmp, "user-omp-skills", "mk-builder")
+        os.makedirs(usr)
+        write(os.path.join(usr, "SKILL.md"), "a stale user-level copy\n")
+        uenv = dict(env, MK_OMP_USER_SKILLS=os.path.join(tmp, "user-omp-skills"))
+        assert mk("release", "--slot", "1", "--integration", "mk/r1/integration")["ok"]
+        st("task", "add", "--id", "t6c", "--title", "user skill mismatch", "--run", "r1")
+        acq3 = mk("acquire", "--run", "r1", "--task", "t6c", "--base", "mk/r1/integration", e=uenv)
+        assert "mismatch" in acq3.get("warning", "") and usr in acq3["warning"], acq3
+        assert open(os.path.join(usr, "SKILL.md")).read() == "a stale user-level copy\n"  # untouched
+        write(os.path.join(usr, "SKILL.md"), open(os.path.join(src_skill, "SKILL.md")).read())
+        assert mk("release", "--slot", "1", "--integration", "mk/r1/integration")["ok"]
+        st("task", "add", "--id", "t6d", "--title", "user skill in sync", "--run", "r1")
+        acq4 = mk("acquire", "--run", "r1", "--task", "t6d", "--base", "mk/r1/integration", e=uenv)
+        assert "mismatch" not in acq4.get("warning", ""), acq4
+        assert mk("release", "--slot", "1", "--integration", "mk/r1/integration")["ok"]
         assert mk("acquire", "--run", "r1", "--task", "t5", "--base", "mk/r1/integration")["ok"]
 
         # 7 a nested build-cache dir is disposable at any depth; the same names at the root stay
