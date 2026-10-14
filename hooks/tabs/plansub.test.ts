@@ -66,7 +66,7 @@ const LIST = JSON.stringify({
 const DETAIL = JSON.stringify({
   ok: true, id: 'alpha', title: 'Alpha', status: 'running', created: 'c', runs: ['alpha-r1'], live_run: 'alpha-r1',
   integration: 'main', design: [], counts: { building: 1 },
-  phases: [{ id: 'P1', title: 'Phase', status: 'building', wave: 1, tasks: [{ id: 'T1', title: 'Task', status: 'building', subtasks: [] }] }],
+  phases: [{ id: 'P1', title: 'Phase', status: 'building', wave: 1, tasks: [{ id: 'T1', title: 'Task', status: 'building', subtasks: [], slot: 3, pane: 'mk-3', branch: 'mk/alpha-r1/t1', updated: '2026-10-14T11:00:00+02:00', acceptance: 'it works', owned: ['P2'], deps: ['P0'], route: { agent: 'opencode', model: 'zai-coding-plan/glm-5.3', effort: 'high' } }] }],
 })
 
 test('file mode: no store draws today\'s Plan tab and no Segment row', () => {
@@ -138,6 +138,68 @@ test('store mode: the Kanban sub-tab renders PlanKanbanTab (four columns, no Kan
   const labels = nodesOf(drawn, 'Button').map(b => String(b.props?.label ?? ''))
   expect(labels).toContain('Kanban · alpha')
   expect(labels).toContain('all phases')
+})
+
+/** ── V1.5: the task detail panel wiring ───────────────────────────────── */
+
+const panelView = (extra: Record<string, string> = {}): Record<string, string> => ({
+  'plans:store': '1', 'plans:list': LIST, 'plan:sub': 'detail', 'plans:sel': 'alpha',
+  'plans:detail': DETAIL, 'plans:detail-for': 'alpha',
+  ...extra,
+})
+
+test('with plan:task set the panel draws under the Detail body at 80 cols', () => {
+  const ui = new Map<string, string>()
+  const drawn = PlanPane(stubEls, panelView({ 'plan:task': 'T1' }), 80, { get: k => ui.get(k), set: (k, v) => { ui.set(k, v) } })
+  const text = allText(drawn)
+  expect(text).toContain('T1 · building') // the panel Card title
+  expect(text).toContain('lane')
+  expect(text).toContain('L3')
+  expect(text).toContain('zai-coding-plan/glm-5.3') // the model row, uncut
+  expect(text).toContain('effort')
+  expect(text).toContain('acceptance')
+  expect(text).toContain('esc close')
+  expect(text).toContain('PHASES') // the sub-tab body still draws above it
+})
+
+test('under 59 cols the panel replaces the body', () => {
+  const ui = new Map<string, string>()
+  const drawn = PlanPane(stubEls, panelView({ 'plan:task': 'T1' }), 36, { get: k => ui.get(k), set: (k, v) => { ui.set(k, v) } })
+  const text = allText(drawn)
+  expect(text).toContain('T1 · building')
+  expect(text).not.toContain('PHASES') // the body gave way to the panel
+})
+
+test('the panel also draws on the Kanban sub-tab (from the same detail reply)', () => {
+  const ui = new Map<string, string>()
+  const drawn = PlanPane(stubEls, panelView({ 'plan:sub': 'kanban', 'plan:task': 'T1' }), 80, { get: k => ui.get(k), set: (k, v) => { ui.set(k, v) } })
+  const text = allText(drawn)
+  expect(text).toContain('BUILDING')
+  expect(text).toContain('T1 · building')
+})
+
+test('selecting the same task again clears it; the close line clears it too', () => {
+  const ui = new Map<string, string>()
+  const handle = { get: (k: string) => ui.get(k), set: (k: string, v: string) => { ui.set(k, v) } }
+  const drawn = PlanPane(stubEls, panelView(), 80, handle)
+  press(drawn, 'plan-fold-P1') // open the phase so the task row draws
+  expect(ui.get('plan:phase:P1')).toBe('1')
+  press(PlanPane(stubEls, panelView(), 80, handle), 'plan-task-T1') // the Detail task row's press
+  expect(ui.get('plan:task')).toBe('T1')
+  const withPanel = PlanPane(stubEls, panelView({ 'plan:task': 'T1' }), 80, handle)
+  expect(allText(withPanel)).toContain('T1 · building')
+  press(withPanel, 'plan-task-T1') // the same row again: toggle off
+  expect(ui.get('plan:task')).toBe('')
+  press(PlanPane(stubEls, panelView({ 'plan:task': 'T1' }), 80, handle), 'plan-task-close-T1')
+  expect(ui.get('plan:task')).toBe('')
+})
+
+test('a plan:task naming no task of the shown plan draws no panel', () => {
+  const ui = new Map<string, string>()
+  const drawn = PlanPane(stubEls, panelView({ 'plan:task': 'ZZZ' }), 80, { get: k => ui.get(k), set: (k, v) => { ui.set(k, v) } })
+  const text = allText(drawn)
+  expect(text).not.toContain('ZZZ ·')
+  expect(text).toContain('PHASES')
 })
 
 test('readPlans does not spawn when the store is missing', async () => {

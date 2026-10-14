@@ -30,6 +30,7 @@ import { PlansTab, planActionLine } from './tabs/plans'
 import type { PlansView } from './tabs/plans'
 import { planFromReply, plansErrorLine, plansFromReply } from './tabs/plans-map'
 import { PlanKanbanTab, planKanbanView } from './tabs/plankanban'
+import { PlanTaskPanel, findPlanTask } from './tabs/plantask'
 import { SettingsTab } from './tabs/settings'
 import type { SettingsValue, SettingsView } from './tabs/settings'
 import {
@@ -884,6 +885,7 @@ export function PlanPane(els: Els, view: Record<string, string>, cols: number, u
   const err = view[PLANS_ERROR_KEY] ?? ''
   const errorLine = err === '' ? null : `⚠ ${view[PLANS_STALE_KEY] === '1' ? 'stale · ' : ''}${err}`
   let body: RenderElement
+  let detailView: PlanView | null = null // the shown plan's mapped view (V1.5 panel)
   if (view[PLANS_EMPTY_KEY] === '1' && plans.plans.length === 0 && err === '') {
     body = <Text>no plans yet</Text>
   } else if (sub === 'list') {
@@ -892,6 +894,7 @@ export function PlanPane(els: Els, view: Record<string, string>, cols: number, u
     body = <Text>no plan selected</Text>
   } else if (sub === 'detail') {
     const detail = planDetailViewOf(view, sel)
+    detailView = detail
     body = detail == null ? <Text>loading {sel}</Text> : PlanTab(els, detail, cols, ui)
   } else {
     // V1.4: PlanKanbanTab from the raw `plans <id>` reply — kept raw because
@@ -900,7 +903,21 @@ export function PlanPane(els: Els, view: Record<string, string>, cols: number, u
     if ((view[PLAN_DETAIL_FOR_KEY] ?? '') === sel) {
       try { raw = JSON.parse(view[PLAN_DETAIL_KEY] ?? '') } catch { raw = null }
     }
+    detailView = raw == null ? null : planFromReply(raw)
     body = raw == null ? <Text>loading {sel}</Text> : PlanKanbanTab(els, planKanbanView(raw, new Date().toISOString()), cols, ui)
+  }
+  // V1.5: when `plan:task` names a task of the shown plan, the task detail
+  // panel draws under the sub-tab body at ≥59 cols and in place of it below
+  // (the panel needs the width; under NARROW there is no room for both). Esc
+  // cannot be armed without a kit change, so the panel's `esc close` line is
+  // the pressable close.
+  const selTask = view['plan:task'] ?? ''
+  const selRow = selTask !== '' ? findPlanTask(detailView?.phases, selTask) : null
+  if (selRow != null) {
+    const panel = PlanTaskPanel(els, selRow, cols, () => { ui.set('plan:task', '') })
+    body = cols >= 59
+      ? <Box flexDirection="column" gap={1}>{body}{panel}</Box>
+      : panel
   }
   return (
     <Box flexDirection="column" gap={1}>

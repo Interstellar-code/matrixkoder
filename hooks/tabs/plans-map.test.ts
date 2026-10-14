@@ -2,7 +2,7 @@
 import { test, expect } from 'claude-code/testing'
 import list from './fixtures/plans-list'
 import detail from './fixtures/plan-detail'
-import { planFromReply, plansErrorLine, plansFromReply } from './plans-map'
+import { laneAgent, planFromReply, plansErrorLine, plansFromReply } from './plans-map'
 import type { PlansView } from './plans'
 
 const detailReply = detail as unknown as { id: string; phases: unknown[] }
@@ -38,9 +38,20 @@ test('planFromReply maps the captured detail', () => {
   expect(view.mock).toBe(false)
   expect(view.phases?.length).toBe(detailReply.phases.length)
   expect(view.plan?.id).toBe(detailReply.id)
-  expect(view.plan?.counts).toBe('14 tasks · 5 phases')
-  expect(view.footer).toEqual(['phases 5'])
+  expect(view.plan?.counts).toBe('32 tasks · 8 phases')
+  expect(view.footer).toEqual(['phases 8'])
   expect(view.phases?.[0]?.rows.length).toBe(3)
+})
+
+test('planFromReply carries phase-level routing onto the phase (V1.5)', () => {
+  const view = planFromReply(detail)
+  const d15 = view.phases?.find(p => p.id === 'D1.5')
+  expect(d15?.slot).toBe(5)
+  expect(d15?.pane).toBe('w1R:p1')
+  expect(d15?.branch).toBe('mk/settings-plans-db-r1/d1.5')
+  expect(d15?.route).toEqual({ agent: 'opencode', model: 'opencode/space-bunny-free', effort: 'medium' })
+  const v14 = view.phases?.find(p => p.id === 'V1.4')
+  expect(v14?.route).toEqual({ agent: 'opencode', model: 'zai-coding-plan/glm-5.3' })
 })
 
 test('a reply with no id is an empty view', () => {
@@ -62,4 +73,51 @@ test('integration as a branch name maps to mergesTo', () => {
   expect(mapped.plans[0]?.mergesTo).toBe('main')
   const view = planFromReply({ ok: true, id: 'p', title: 'T', status: 'draft', integration: 'main', phases: [] })
   expect(view.plan?.mergesTo).toBe('main')
+})
+
+/** ── V1.5: the lane·agent tag ─────────────────────────────────────────── */
+
+test('laneAgent: full, lane-only, agent-only, none', () => {
+  expect(laneAgent({ slot: 3, route: { agent: 'opencode', model: 'zai-coding-plan/glm-5.3', effort: 'high' } })).toBe('L3 · opencode glm-5.3')
+  expect(laneAgent({ slot: 5, route: { agent: 'opencode', model: 'opencode/space-bunny-free', effort: 'medium' } })).toBe('L5 · opencode space-bunny-free')
+  expect(laneAgent({ slot: 2 })).toBe('L2')
+  expect(laneAgent({ route: { agent: 'opencode', model: 'zai-coding-plan/glm-5.3' } })).toBe('opencode glm-5.3')
+  expect(laneAgent({})).toBe('')
+  expect(laneAgent({ slot: null, route: null })).toBe('')
+  // a slot that is not a number, a route without an agent: parts just omit
+  expect(laneAgent({ route: { model: 'provider/only' } })).toBe('only')
+})
+
+test('planFromReply carries the V1.5 routing fields onto tasks and subtasks', () => {
+  const view = planFromReply({
+    ok: true, id: 'p', title: 'T', status: 'running', phases: [{
+      id: 'P1', title: 'Phase', status: 'building',
+      tasks: [{
+        id: 'T1', title: 'Task', status: 'building', type: 'task', round: 2, verdict: 'approve',
+        slot: '3', pane: 'mk-3', branch: 'mk/p-r1/t1', updated: '2026-10-14T10:00:00+02:00',
+        acceptance: 'the panel shows every field', owned: ['D1.5', 'V1.4'], deps: ['D1'],
+        route: { agent: 'opencode', model: 'zai-coding-plan/glm-5.3', effort: 'high' },
+        subtasks: [{ id: 'T1a', title: 'Sub', status: 'planned', slot: '4' }],
+      }],
+    }],
+  })
+  const row = view.phases?.[0]?.rows[0]
+  expect(row?.slot).toBe(3) // the TEXT slot arrives as an int
+  expect(row?.pane).toBe('mk-3')
+  expect(row?.branch).toBe('mk/p-r1/t1')
+  expect(row?.updated).toBe('2026-10-14T10:00:00+02:00')
+  expect(row?.acceptance).toBe('the panel shows every field')
+  expect(row?.owned).toEqual(['D1.5', 'V1.4'])
+  expect(row?.deps).toEqual(['D1'])
+  expect(row?.route).toEqual({ agent: 'opencode', model: 'zai-coding-plan/glm-5.3', effort: 'high' })
+  expect(row?.type).toBe('task')
+  expect(row?.round).toBe(2)
+  expect(row?.verdict).toBe('approve')
+  expect(row?.subs?.[0]?.slot).toBe(4)
+  // a row without the fields keeps them absent (never null text downstream)
+  const bare = planFromReply({ ok: true, id: 'p', phases: [{ id: 'P1', tasks: [{ id: 'T2', title: 't', status: 'planned' }] }] })
+  const bareRow = bare.phases?.[0]?.rows[0]
+  expect(bareRow?.slot).toBeUndefined()
+  expect(bareRow?.route).toBeUndefined()
+  expect(bareRow?.owned).toBeUndefined()
 })

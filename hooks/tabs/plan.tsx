@@ -10,12 +10,21 @@ import { ActionButton, Card, Chip, TreeRow } from './kit'
 import { laneStrip, pickBar } from './raster'
 import { ROLE } from './palette'
 import type { PaletteRole } from './palette'
+import { laneAgent } from './plans-map'
 
 type Els = Elements[keyof Elements]
 
 /** C12: this tab's view-state handle — declared locally (structural typing; no
  *  import crosses lanes). */
 type TabUi = { get(key: string): string | undefined; set(key: string, value: string): void }
+
+/** The dispatch route of a task, from the store's route_json (V1.5). A member
+ *  that is missing is simply absent — never a `null` string. */
+export type PlanRoute = {
+  readonly agent?: string
+  readonly model?: string
+  readonly effort?: string
+}
 
 /** One subtask under a task row: its own status and a right-side chip. */
 export type PlanSub = {
@@ -24,6 +33,18 @@ export type PlanSub = {
   readonly status: string
   readonly right: string
   readonly rightRole?: PaletteRole
+  /** V1.5: the routing fields the plans reply carries, when it has them */
+  readonly slot?: number | null
+  readonly pane?: string | null
+  readonly branch?: string | null
+  readonly updated?: string | null
+  readonly acceptance?: string | null
+  readonly owned?: readonly string[]
+  readonly deps?: readonly string[]
+  readonly route?: PlanRoute | null
+  readonly type?: string
+  readonly round?: number
+  readonly verdict?: string
 }
 
 /** One task row inside a phase. `short` is the Narrow form.
@@ -38,10 +59,26 @@ export type PlanTask = {
   readonly subs?: readonly PlanSub[]
   /** legacy: a wave row that itself folds (the Checkout fixture) */
   readonly rows?: readonly PlanTask[]
+  /** V1.5: the routing fields the plans reply carries, when it has them */
+  readonly slot?: number | null
+  readonly pane?: string | null
+  readonly branch?: string | null
+  readonly updated?: string | null
+  readonly acceptance?: string | null
+  readonly owned?: readonly string[]
+  readonly deps?: readonly string[]
+  readonly route?: PlanRoute | null
+  readonly type?: string
+  readonly round?: number
+  readonly verdict?: string
 }
 
 /** One phase Card. `wave` is data only — never drawn as the word "wave"; when
- *  another phase carries the same number the row shows `with <id>`. */
+ *  another phase carries the same number the row shows `with <id>`.
+ *  V1.5: a phase can itself be a routed task row (the store roots a round's
+ *  lane tasks at phase level — D1.5, V1.4, V1.5 today): it then carries the
+ *  routing fields, draws its dim lane·agent tag, and its fold press also
+ *  selects it (`plan:task`). */
 export type PlanPhase = {
   readonly id: string
   readonly title: string
@@ -56,6 +93,15 @@ export type PlanPhase = {
   readonly wave?: number
   readonly rows: readonly PlanTask[]
   readonly note?: string
+  /** V1.5: routing fields a phase-level task row carries, when it has them */
+  readonly slot?: number | null
+  readonly pane?: string | null
+  readonly branch?: string | null
+  readonly updated?: string | null
+  readonly acceptance?: string | null
+  readonly owned?: readonly string[]
+  readonly deps?: readonly string[]
+  readonly route?: PlanRoute | null
 }
 
 /** The tab's whole view: the header card plus the phases. */
@@ -94,6 +140,10 @@ const SETTLED = new Set(['merged', 'done', 'routed', 'planned'])
 
 const roleOf = (status: string): PaletteRole => STATUS_ROLE[status] ?? 'idle'
 const glyphOf = (status: string): string => STATUS_GLYPH[status] ?? '○'
+
+/** V1.5: shared with the task detail panel (plantask.tsx). */
+export const planStatusRole = roleOf
+export const planStatusGlyph = glyphOf
 
 function clip(text: string, w: number): string {
   if (text.length <= w) return text
@@ -166,12 +216,22 @@ function HeaderCard(els: Els, view: PlanView, W: number, compact: boolean): Rend
   ))
 }
 
+/** V1.5: a phase node the store itself routed (slot/pane/branch or a route on
+ *  the root row — a round's lane task, D1.5/V1.4/V1.5 today). Such a row
+ *  draws its lane·agent tag and its fold press also selects it. */
+export function phaseRouted(phase: PlanPhase): boolean {
+  return laneAgent(phase) !== '' || phase.pane != null || phase.branch != null
+}
+
 /** One phase Card. Folded (the default) is one row: fold glyph, status glyph,
- *  `<id> · <title>`, the header chip and the laneStrip. */
+ *  `<id> · <title>`, the header chip and the laneStrip. A routed phase adds
+ *  its dim lane·agent tag right-aligned, and the fold press selects it too. */
 function PhaseCard(els: Els, phase: PlanPhase, waveMates: readonly string[], W: number, compact: boolean, ui?: TabUi): RenderElement {
   const { Box, Text } = els
   const legacy = phase.tone != null
   const expanded = legacy ? true : ui?.get(phaseKey(phase.id)) === '1'
+  const routed = phaseRouted(phase)
+  const lane = laneAgent(phase)
   const toneRole: PaletteRole = phase.tone === 'green' ? 'ok' : phase.tone === 'blue' ? 'live' : 'idle'
   const headRole = phase.headerRole ?? toneRole
   const live = (phase.tone === 'blue') || phase.rows.some(r => roleOf(r.status) === 'live' || roleOf(r.status) === 'warn')
@@ -190,40 +250,58 @@ function PhaseCard(els: Els, phase: PlanPhase, waveMates: readonly string[], W: 
         {!legacy && ActionButton(els, {
           key: `plan-fold-${phase.id}`,
           glyph: '›',
-          word: clip(`${phase.id} · ${phase.title}`, Math.max(1, W - phase.header.length - 12)),
+          word: clip(`${phase.id} · ${phase.title}`, Math.max(1, W - phase.header.length - 12 - (!compact && lane !== '' ? lane.length + 1 : 0))),
           plain: true,
           noHotkey: true,
-          onPress: () => { ui?.set(phaseKey(phase.id), expanded ? '' : '1') },
+          onPress: () => {
+            ui?.set(phaseKey(phase.id), expanded ? '' : '1')
+            if (routed) ui?.set('plan:task', ui?.get('plan:task') === phase.id ? '' : phase.id)
+          },
         })}
         {legacy && <Text bold={true} color="subtle">{phase.name ?? phase.id}</Text>}
         <Box flexGrow={1} />
+        {!compact && routed && lane !== '' && <Text dimColor={true} wrap="truncate-end">{lane}</Text>}
         {others.length > 0 && Chip(els, { label: `with ${others[0]}`, role: 'idle' })}
         {Chip(els, { label: compact && phase.shortHeader != null ? phase.shortHeader : phase.header, role: headRole })}
       </Box>
       {strip}
-      {expanded && !legacy && phase.rows.map(row => TaskBlock(els, row, W, compact))}
+      {expanded && !legacy && phase.rows.map(row => TaskBlock(els, row, W, compact, ui))}
       {legacy && phase.rows.map(row => LegacyRow(els, row, W, compact, ui))}
       {expanded && phase.note != null && <Text dimColor={true}>{clip(phase.note, W)}</Text>}
     </Box>
   ))
 }
 
-/** One task: the status row, and — the phase being open — its subtasks as TreeRows. */
-function TaskBlock(els: Els, row: PlanTask, W: number, compact: boolean): RenderElement {
+/** One task: the V1.5 row — status glyph, task id, the title cut to the space
+ *  left, and the dim lane·agent tag right-aligned. The row is pressable and
+ *  selects the task (`plan:task`); pressing the selected task again clears it.
+ *  When the width cannot fit id + ≥10 title cols + the tag, the tag drops
+ *  first — the title never shrinks below 10 to keep it. */
+function TaskBlock(els: Els, row: PlanTask, W: number, compact: boolean, ui?: TabUi): RenderElement {
   const { Box, Text } = els
   const role = roleOf(row.status)
-  const settled = SETTLED.has(row.status)
   const title = compact ? row.short?.title ?? row.title : row.title
-  const rightText = compact ? row.short?.right ?? row.right : row.right
+  const lane = laneAgent(row)
+  const chrome = 6 // '├ ' + gap + glyph + gap + the gap before the tag
+  const showLane = lane !== '' && chrome + row.id.length + 1 + 10 + lane.length <= W
+  const titleBudget = Math.max(1, showLane
+    ? W - chrome - row.id.length - 1 - lane.length
+    : W - chrome - row.id.length - 1)
   const subs = row.subs ?? []
   return (
     <Box key={row.id} flexDirection="column">
       <Box flexDirection="row" gap={1}>
         <Text dimColor={true}>{'├ '}</Text>
         <Text color={ROLE[role].fg}>{glyphOf(row.status)}</Text>
-        <Text wrap="truncate-end">{clip(`${row.id} ${title}`, Math.max(1, W - rightText.length - 8))}</Text>
+        {ActionButton(els, {
+          key: `plan-task-${row.id}`,
+          glyph: clip(`${row.id} ${title}`, titleBudget),
+          word: '',
+          plain: true,
+          onPress: () => { if (ui != null) ui.set('plan:task', ui.get('plan:task') === row.id ? '' : row.id) },
+        })}
         <Box flexGrow={1} />
-        <Text color={settled ? undefined : ROLE[role].fg} dimColor={settled} wrap="truncate-end">{rightText}</Text>
+        {showLane && <Text dimColor={true} wrap="truncate-end">{lane}</Text>}
       </Box>
       {subs.map((sub, i) => TreeRow(els, {
         depth: 1,

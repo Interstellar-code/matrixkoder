@@ -1,0 +1,135 @@
+// The /mk pane's Plan tab task detail panel (plan settings-plans-db, V1.5):
+// the full content of one task of the shown plan — a kit Card titled
+// `<id> · <status>`: the whole title (wrapped, never cut), type, round,
+// verdict, lane `L<slot>` + pane + branch, agent / model / effort, updated,
+// deps, owned (one per line, capped at 8 with `+n more`), acceptance
+// (wrapped) and the subtasks with their status glyphs. A field the row does
+// not carry is simply left out — no `null` text. The footer dim line
+// `esc close` is pressable (`onClose` clears `plan:task`): the pane cannot
+// arm a raw Esc without a kit change, so the press is the close that works.
+// Pure render — no $, no state, no scripts (C1).
+import type { Elements, RenderElement } from 'claude-code'
+import { ActionButton, Card } from './kit'
+import { ROLE } from './palette'
+import { planStatusGlyph, planStatusRole } from './plan'
+import type { PlanPhase, PlanSub, PlanTask } from './plan'
+
+type Els = Elements[keyof Elements]
+
+/** The task row `id` names in the view's phases (V1.5 wiring): the first task
+ *  row whose id matches, or — when the store rooted a round's lane task at
+ *  phase level (D1.5, V1.4, V1.5 today; its routing lives on the phase node)
+ *  — that phase as a task row with its children as subtasks. Null when the
+ *  id names nothing. */
+export function findPlanTask(phases: readonly PlanPhase[] | undefined, id: string): PlanTask | null {
+  if (id === '') return null
+  for (const phase of phases ?? []) {
+    for (const row of phase.rows) {
+      if (row.id === id) return row
+    }
+  }
+  for (const phase of phases ?? []) {
+    if (phase.id === id) {
+      return {
+        id: phase.id,
+        title: phase.title,
+        status: phase.status ?? 'planned',
+        right: phase.status ?? '',
+        slot: phase.slot ?? null,
+        pane: phase.pane ?? null,
+        branch: phase.branch ?? null,
+        updated: phase.updated ?? null,
+        acceptance: phase.acceptance ?? null,
+        owned: phase.owned,
+        deps: phase.deps,
+        route: phase.route ?? null,
+        subs: phase.rows,
+      }
+    }
+  }
+  return null
+}
+
+/** One dim-key row (the panel's `kv` lines). The value wraps, never cuts. */
+function fieldRow(els: Els, key: string, value: string): RenderElement {
+  const { Box, Text } = els
+  return (
+    <Box flexDirection="row" gap={1}>
+      <Text dimColor={true}>{key}</Text>
+      <Text wrap="wrap">{value}</Text>
+    </Box>
+  )
+}
+
+/** One subtask line: its status glyph in the role colour, `id title` (the
+ *  title wraps, never cuts), and its status word dim on the right. */
+function subRow(els: Els, sub: PlanSub): RenderElement {
+  const { Box, Text } = els
+  return (
+    <Box flexDirection="row" gap={1}>
+      <Text color={ROLE[planStatusRole(sub.status)].fg}>{planStatusGlyph(sub.status)}</Text>
+      <Text wrap="wrap">{`${sub.id} ${sub.title}`}</Text>
+      <Box flexGrow={1} />
+      <Text dimColor={true}>{sub.status}</Text>
+    </Box>
+  )
+}
+
+/** The V1.5 task detail panel. Pure render from one mapped task row; every
+ *  missing field is left out. `onClose` is the caller's callback for the
+ *  pressable `esc close` footer line. */
+export function PlanTaskPanel(els: Els, row: PlanTask, cols: number, onClose?: () => void): RenderElement {
+  const { Box, Text } = els
+  const owned = row.owned ?? []
+  const shown = owned.slice(0, 8)
+  const route = row.route
+  return Card(els, {}, (
+    <Box key={`plan-task-panel-${row.id}`} flexDirection="column">
+      <Text bold={true}>{`${row.id} · ${row.status}`}</Text>
+      <Text color="subtle" wrap="wrap">{row.title}</Text>
+      {row.type != null && fieldRow(els, 'type', row.type)}
+      {row.round != null && fieldRow(els, 'round', String(row.round))}
+      {row.verdict != null && fieldRow(els, 'verdict', row.verdict)}
+      {row.slot != null && fieldRow(els, 'lane', `L${row.slot}`)}
+      {row.pane != null && fieldRow(els, 'pane', row.pane)}
+      {row.branch != null && fieldRow(els, 'branch', row.branch)}
+      {route?.agent != null && fieldRow(els, 'agent', route.agent)}
+      {route?.model != null && fieldRow(els, 'model', route.model)}
+      {route?.effort != null && fieldRow(els, 'effort', route.effort)}
+      {row.updated != null && fieldRow(els, 'updated', row.updated)}
+      {row.deps != null && row.deps.length > 0 && fieldRow(els, 'deps', row.deps.join(' '))}
+      {owned.length > 0 && (
+        <Box flexDirection="column">
+          <Text dimColor={true}>owned</Text>
+          {shown.map(item => (
+            <Box key={`plan-task-owned-${row.id}-${item}`} flexDirection="row" gap={1}>
+              <Text dimColor={true}>·</Text>
+              <Text wrap="wrap">{item}</Text>
+            </Box>
+          ))}
+          {owned.length > 8 && <Text dimColor={true}>{`+${owned.length - 8} more`}</Text>}
+        </Box>
+      )}
+      {row.acceptance != null && (
+        <Box flexDirection="column">
+          <Text dimColor={true}>acceptance</Text>
+          <Text wrap="wrap">{row.acceptance}</Text>
+        </Box>
+      )}
+      {row.subs != null && row.subs.length > 0 && (
+        <Box flexDirection="column">
+          <Text dimColor={true}>subtasks</Text>
+          {row.subs.map(sub => subRow(els, sub))}
+        </Box>
+      )}
+      {ActionButton(els, {
+        key: `plan-task-close-${row.id}`,
+        glyph: 'esc close',
+        word: '',
+        plain: true,
+        tone: 'quiet',
+        onPress: () => { onClose?.() },
+      })}
+    </Box>
+  ))
+}
