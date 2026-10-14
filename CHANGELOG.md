@@ -2,6 +2,55 @@
 
 All notable changes to this project. Format: Keep a Changelog; versions: SemVer.
 
+## [0.5.5] - 2026-10-14
+
+### Added
+- **state:** follow-up tasks under a merged phase; task set parent= re-parents (5e49b25)
+- **routing:** omp is the default lane agent (14d3dbc)
+- **lanes:** omp lanes — skill install, watch, dispatch and fresh session (d7bf7b6)
+- **agents:** omp is a known agent with its own model picks (f2e892d)
+- **lanes:** omp (pi agent) is a lane kind — bootstrap for plan omp-lane-agent (4c0326b)
+- **dashboard:** Plan tab task cards show lane and agent; a detail panel shows the task (ed8c7a1)
+- **lanes:** long checks push their result over the bus instead of a polling wait (dd55f77)
+- **lanes:** mk-lane status pulls lane facts without asking the agent; bus rings steerable agents at once (2a06d3d)
+- **dashboard:** Plan tab Kanban sub-tab to the PlanKanban mockup (4100b26)
+- **dashboard:** Plan tab List · Detail · Kanban sub-tabs on the store's plans (4b1846c)
+- **db:** plans columns (status, created, design, integration) and the mkdb plans query (66f3b59)
+- **plan:** approve copies, store-mode data dir, import, delete and pause in mk-plan (1f5d203)
+- **dashboard:** Plan tab List and Detail sub-tabs on fixture data (c7da246)
+- **bus:** review briefs travel over the bus (915373f)
+
+### Fixed
+- **lane-watch:** a reviewer watch waits for its own review file and status, never the builder's done (f176b4a)
+- **lane-health:** omp provider banners are not matched inside code, diff or grep lines (O2 review HIGH) (a08548a)
+- **settings:** default lane agent is a dropdown of coding agents; omp picker keeps the user's yaml models (O1 review) (bb85a03)
+- **lanes:** review fixes — todo caps at verifying, status-file lock, check hold cap (9e623ae)
+- **dashboard:** task panel cuts long subtask lines inside the card and keeps their status (1057a45)
+- **bus:** a lane's todo lines move its subtasks (d9a91ab)
+- **store:** an omitted owned/deps no longer blanks the stored list (D1.5 review HIGH) (1c2b18d)
+- **state:** task fields survive the store mirror; dispatch records the route; task check (33c1241)
+- **store:** a run started from a plan archive copy links to its plan; run set --plan-id repairs old runs (9365e05)
+- **builder:** bus_token_path follows the one-home rule like mk-bus.py (todo 89) (7022323)
+- **lanes:** review dispatch refuses a pane with no agent before publishing the brief (todo 88) (ec59c33)
+- **db:** plans reply turns mk-plan's integration array text into the branch name (39ad998)
+- **plan:** re-import fills created/design/integration on a row approved before v4; keeps a set status (D1.4) (41be128)
+- **plan:** self-test column setup tolerates a v4 store (D1.1 merge) (0dfff1e)
+- **plan:** mk_home follows the one-home rule; delete never overwrites an archived name (D1.2 review LOWs) (454c57d)
+- **home:** bus_dir_for and load_usage follow the one-home rule (R1 review LOWs) (d180e1e)
+- **dashboard:** Delete buttons carry their label; distinct detail button key (V1 review MEDIUM, LOW) (b54ffc5)
+- **test:** self-tests use a temp MK home and never write ~/.matrixkoder or a real project mk.db (88a145c)
+- **bus:** each project's orchestrator uses its own token on the shared root bus (6f900a7)
+- **bus:** store-mode briefs reach the bus; a failed publish alerts the watch (ab3ebaf)
+
+### Docs
+- **builder:** lane command cheat sheet and traps (6d81fec)
+- **skill:** orchestrator command cheat sheet and traps (d73714d)
+- **skill:** orchestrator bus cheat sheet — send, watch, pending, which kinds ring (3a7b106)
+- **schema:** mkdb plans reply checked against D1.1's code (e0875be)
+- **schema:** plans columns, mkdb plans query and the plan commands (c89f857)
+- **skill:** approve moves the plan file until D1 lands (T1 review LOW) (9a948dc)
+- **plan:** template names the DB home of every key; plan check warns on missing header keys (9e82c27)
+
 ## [0.5.0] - 2026-10-13
 
 ### Added
