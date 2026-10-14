@@ -38,7 +38,7 @@ All take `--data <data>`; `S=${CLAUDE_PLUGIN_ROOT}/scripts`. Or the `mk_bus` too
 | Recent messages | `mk_bus` action `tail` |
 | Bus up / lane token | `mk-bus.py ensure`; after a port change `mk-bus.py token --lane <lane> --task <T> --run <R>` |
 
-Kinds: `ask answer info ack task status commit report review nudge`. The bus rings the lane itself (fixed `mk-builder.py inbox` line, queued until the pane is idle) only for `nudge`, `info` and `answer` — so message a lane with `nudge` or `info`, not `ask`; an `ask` from you is never rung. Never type the doorbell by hand (`herdr pane send` does not exist; the bus uses `herdr agent prompt`). Briefs go out through `mk-lane-event.py dispatch` (stage 5), not `send`.
+Kinds: `ask answer info ack task status commit report review nudge`. The bus rings the lane itself (fixed `mk-builder.py inbox` line, queued until the pane is idle) only for `nudge`, `info` and `answer`, and rings at once while the lane is working when the agent is a steer kind (`claude`, `codex`; env `MK_BUS_STEER_KINDS`) — `opencode` and `agy` wait for idle unless you add `--urgent`, which sends Esc (interrupts the turn, use only for real redirects) before the doorbell — so message a lane with `nudge` or `info`, not `ask`; an `ask` from you is never rung. Never type the doorbell by hand (`herdr pane send` does not exist; the bus uses `herdr agent prompt`). Briefs go out through `mk-lane-event.py dispatch` (stage 5), not `send`.
 
 
 ## Orchestrator command cheat sheet
@@ -55,6 +55,7 @@ Checked against `--help`. `S=${CLAUDE_PLUGIN_ROOT}/scripts`; mk-state and mk-lan
 | Read a task | `mk-state.py task get <T>` |
 | New brief round | `mk-state.py task round <T> [--kind fix --cause "<c>"]` → returns the `brief-rN.md` path |
 | Record your test run | `mk-state.py task verify <T> --tests <passed>/<failed> [--tsc 0] [--selftest ok]` |
+| Lane status, no agent needed | `python3 $S/mk-lane.py status [--slot N \| --task T] [--json]` |
 | Take a lane | `python3 $S/mk-lane.py acquire --run <R> --task <T> --role build` — first free slot; no way to pick a slot |
 | Agent name for a lane | `mk-lane.py names --run <R> --task <T> --role <role> --round <n>` |
 | Give a lane back | `mk-lane.py release --slot <n> --integration <branch>` (both required) |

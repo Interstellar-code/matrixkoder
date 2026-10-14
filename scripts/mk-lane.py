@@ -1214,6 +1214,195 @@ def cmd_list(a, cfg, data, main):
     return with_warnings({"ok": True, "slots": out, "cap": cfg["cap"]}, cfg)
 
 
+# ---------- status: lane facts pulled without asking the agent (read-only) ----------
+
+TUI_CHROME = set("┃╹╻▀▄█▌▐░▒▓⬝■□▪ │─┌┐└┘├┤┬┴┼═║╔╗╚╝\t")
+CTX_RE = re.compile(r"\d[\d.]*[KMkm]?\s*\((\d{1,3})%\)")
+HERDR_STATUS_TIMEOUT = 5
+
+
+def parse_ctx_pct(text):
+    """-> int | None: the last `465.4K (44%)` footer figure in a pane read."""
+    found = CTX_RE.findall(text or "")
+    return int(found[-1]) if found else None
+
+
+def strip_tui(text, n):
+    """-> the last n non-blank pane lines with TUI chrome gone: lines made only of box/bar glyphs
+    drop, a leading `┃ ` goes."""
+    out = []
+    for line in (text or "").splitlines():
+        if not line.strip() or all(c in TUI_CHROME for c in line):
+            continue
+        line = line.rstrip()
+        s = line.lstrip()
+        out.append(s[1:].strip() if s.startswith("┃") else line.strip())
+    return out[-n:] if n > 0 else []
+
+
+def _json_lines(text):
+    for line in reversed([x for x in (text or "").splitlines() if x.strip()]):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(d, dict):
+            return d
+    return {}
+
+
+def _status_git(path, base):
+    out = {"commits_ahead": None, "commits": [], "diff_shortstat": None, "modified": [],
+           "head_subject": None, "head_age_min": None, "git_error": None}
+    try:
+        r = git(["-C", path, "log", "--oneline", f"{base}..HEAD"])
+        lines = [x for x in r.stdout.splitlines() if x.strip()]
+        out["commits_ahead"], out["commits"] = len(lines), lines[:10]
+        out["diff_shortstat"] = git(["-C", path, "diff", "--shortstat", "HEAD"]).stdout.strip() or None
+        mods = [x for x in git(["-C", path, "status", "--porcelain"]).stdout.splitlines()
+                if x.strip() and not os.path.basename(x[3:].strip().strip('"')).startswith(".matrixkoder-")]
+        out["modified"] = mods[:20]
+        h = git(["-C", path, "log", "-1", "--format=%ct%x09%s"]).stdout.strip().split("\t", 1)
+        if len(h) == 2 and h[0].isdigit():
+            out["head_subject"], out["head_age_min"] = h[1], round((time.time() - int(h[0])) / 60, 1)
+    except Fail as e:
+        out["git_error"] = str(e)
+    return out
+
+
+def _status_file(path):
+    out = {"agent_state": None, "round": None, "role": None, "step": None, "step_age_min": None,
+           "ctx_pct": None, "report_present": None}
+    try:
+        with open(os.path.join(path, ".matrixkoder-status.json")) as f:
+            d = json.load(f)
+        if not isinstance(d, dict):
+            d = {}
+    except (OSError, ValueError):
+        d = {}
+    out.update(agent_state=d.get("state"), round=d.get("round"), role=d.get("role"), step=d.get("step"),
+               ctx_pct=d.get("ctx_pct"))
+    if isinstance(d.get("updated_at"), (int, float)):
+        out["step_age_min"] = round((time.time() - d["updated_at"]) / 60, 1)
+    if isinstance(d.get("round"), int):
+        out["report_present"] = os.path.isfile(os.path.join(path, f".matrixkoder-report-r{d['round']}.md"))
+    return out
+
+
+def _status_task(data, run, task):
+    out = {"task_status": None, "task_model": None, "task_effort": None, "task_pane": None,
+           "children": None, "task_error": None}
+    if not task:
+        return out
+    cmd = [sys.executable, os.path.join(HERE, "mk-state.py"), "--data", data]
+    if run:
+        cmd += ["--run", run]
+    try:
+        r = run_cmd(cmd + ["task", "get", task], GIT_TIMEOUT)
+        d = _json_lines(r.stdout)
+        t = d.get("task")
+        if not d.get("ok") or not isinstance(t, dict):
+            raise Fail(d.get("error") or (r.stderr or "task get failed").strip()[:200])
+        out.update(task_status=t.get("status"), task_model=t.get("model"), task_effort=t.get("effort"),
+                   task_pane=t.get("pane"))
+        kids = d.get("children") or t.get("children") or t.get("subtasks")
+        if isinstance(kids, list):
+            out["children"] = [{"id": k.get("id"), "status": k.get("status")} if isinstance(k, dict) else k
+                               for k in kids]
+    except Fail as e:
+        out["task_error"] = str(e)
+    return out
+
+
+def _status_herdr(path, workspace_id, pane, lines):
+    out = {"pane": pane, "agent": None, "agent_status": None, "pane_tail": None, "ctx_pct_pane": None,
+           "herdr_error": None}
+    if herdr_bin() == "none":
+        out["herdr_error"] = "herdr disabled (MK_HERDR=none)"
+        return out
+    try:
+        if not pane:
+            r = run_cmd([herdr_bin(), "agent", "list"], HERDR_STATUS_TIMEOUT)
+            real = os.path.realpath(path)
+            for e in (_json_lines(r.stdout).get("result") or {}).get("agents") or []:
+                cwd = os.path.realpath(e["cwd"]) if isinstance(e, dict) and e.get("cwd") else None
+                if isinstance(e, dict) and e.get("pane_id") and (
+                        (cwd and (cwd == real or cwd.startswith(real + os.sep)))
+                        or (workspace_id not in (None, STALE_WS_ID) and e.get("workspace_id") == workspace_id)):
+                    pane = out["pane"] = e["pane_id"]
+                    break
+        if not pane:
+            out["herdr_error"] = "no pane found for this lane"
+            return out
+        r = run_cmd([herdr_bin(), "agent", "get", pane], HERDR_STATUS_TIMEOUT)
+        a = ((_json_lines(r.stdout).get("result") or {}).get("agent")) or {}
+        out["agent"], out["agent_status"] = a.get("agent"), a.get("agent_status")
+        r = run_cmd([herdr_bin(), "agent", "read", pane, "--lines", str(max(lines * 3, 30))], HERDR_STATUS_TIMEOUT)
+        if r.returncode == 0:
+            out["pane_tail"], out["ctx_pct_pane"] = strip_tui(r.stdout, lines), parse_ctx_pct(r.stdout)
+        else:
+            out["herdr_error"] = (r.stderr or r.stdout).strip()[:150] or f"herdr read exit {r.returncode}"
+    except (Fail, TypeError, AttributeError, KeyError) as e:
+        out["herdr_error"] = str(e)
+    return out
+
+
+def cmd_status(a, cfg, data, main):
+    lanes = read_lanes(data)  # read-only, like cmd_list
+    rows = []
+    for n in slot_numbers(lanes):
+        rec = lanes["slots"][str(n)]
+        if a.slot is not None and n != a.slot:
+            continue
+        if a.task and rec.get("task") != a.task:
+            continue
+        if a.run and rec.get("run") != a.run:
+            continue
+        if a.slot is None and not a.task and rec.get("state") != "busy":
+            continue
+        path = rec.get("path") or ""
+        row = {"slot": n, "path": path, "run": rec.get("run"), "task": rec.get("task"),
+               "branch": rec.get("branch"), "state": rec.get("state")}
+        row.update(_status_git(path, rec.get("base") or "main") if os.path.isdir(path)
+                   else {"git_error": "lane path missing"})
+        row.update(_status_file(path))
+        row.update(_status_task(data, rec.get("run"), rec.get("task")))
+        row.update(_status_herdr(path, rec.get("workspace_id"), row["task_pane"], a.lines))
+        if row["ctx_pct"] is None:
+            row["ctx_pct"] = row["ctx_pct_pane"]
+        rows.append(row)
+    return {"ok": True, "lanes": rows}
+
+
+def fmt_status(rows):
+    def age(m):
+        return "?" if m is None else f"{m:g}m ago"
+    out = []
+    for r in rows:
+        out.append(f"== slot {r['slot']} {r['state']}  run {r['run']}  task {r['task']}  branch {r['branch']}")
+        out.append(f"   path {r['path']}")
+        out.append(f"   task: {r['task_status']} {r['task_model']} {r['task_effort']}"
+                   + (f"  children {r['children']}" if r.get("children") else "")
+                   + (f"  [task_error: {r['task_error']}]" if r.get("task_error") else ""))
+        out.append(f"   agent: {r['agent']} {r['agent_status']}  ctx {r['ctx_pct']}%  pane {r['pane']}"
+                   + (f"  [herdr: {r['herdr_error']}]" if r.get("herdr_error") else ""))
+        out.append(f"   status file: {r['agent_state']} round {r['round']} {r['role']}  step "
+                   f"\"{r['step']}\" {age(r['step_age_min'])}  report {r['report_present']}")
+        if r.get("git_error"):
+            out.append(f"   git: {r['git_error']}")
+        else:
+            out.append(f"   git: {r['commits_ahead']} ahead; uncommitted {r['diff_shortstat'] or 'none'}; "
+                       f"HEAD \"{r['head_subject']}\" {age(r['head_age_min'])}")
+            for c in r["commits"][:3]:
+                out.append(f"     + {c}")
+            if r["modified"]:
+                out.append("   modified: " + ", ".join(m.strip() for m in r["modified"][:8])
+                           + (f" (+{len(r['modified']) - 8})" if len(r["modified"]) > 8 else ""))
+        for t in r.get("pane_tail") or []:
+            out.append(f"   | {t}")
+    return "\n".join(out) if out else "no busy lanes"
+
+
 # ---------- cli ----------
 
 class Parser(argparse.ArgumentParser):
@@ -1259,10 +1448,15 @@ def build_parser():
     x.add_argument("--keep", type=int, default=1)
     x.set_defaults(func=cmd_gc)
     sub.add_parser("list", parents=[dp]).set_defaults(func=cmd_list)
+    x = sub.add_parser("status", parents=[dp])
+    x.add_argument("--slot", type=int), x.add_argument("--task"), x.add_argument("--run")
+    x.add_argument("--lines", type=int, default=12), x.add_argument("--json", action="store_true")
+    x.set_defaults(func=cmd_status)
     return p
 
 
 def main(argv):
+    a = None
     try:
         a = build_parser().parse_args(argv)
         if not math.isfinite(a.lock_timeout) or a.lock_timeout < 0:
@@ -1273,6 +1467,9 @@ def main(argv):
         out, code = {"ok": False, "error": str(e), **e.extra}, e.code
     except (OSError, ValueError) as e:  # unreadable file, corrupt JSON: still one JSON line
         out, code = {"ok": False, "error": f"{type(e).__name__}: {e}"}, 2
+    if code == 0 and out.get("ok") and getattr(a, "cmd", "") == "status" and not a.json:
+        print(fmt_status(out["lanes"]))
+        return 0
     print(json.dumps(out))
     return code
 
@@ -2499,6 +2696,60 @@ def self_test():
         write(os.path.join(hud, ".omc", "plans", "p.md"), "plan\nedited\n")
         ok, dirty = clean_state(hud, hud_cfg)
         assert not ok and any(".omc/plans/p.md" in line for line in dirty), dirty
+
+        # status: facts from git + status file + herdr, no agent asked (pure helpers, then real git)
+        assert parse_ctx_pct("x 465.4K (44%) · $1\n 12K (7%)") == 7 and parse_ctx_pct("nothing") is None
+        assert strip_tui("  ┃\n  ┃  hello\n  ╹▀▀▀▀\n   ■■■⬝⬝ \nplain  \n\n", 12) == ["hello", "plain"]
+        assert strip_tui("a\nb\nc", 2) == ["b", "c"]
+        sdata, sl = os.path.join(tmp, "sdata"), os.path.join(tmp, "status-lane")
+        os.makedirs(sdata)
+        g("worktree", "add", "-q", "-b", "mk/s1/t1", sl, "main")
+        write(os.path.join(sl, "new.txt"), "ahead\n"), g("add", "new.txt", cwd=sl)
+        g("commit", "-qm", "lane commit", cwd=sl)
+        write(os.path.join(sl, "README.md"), "base\nedited\n")           # uncommitted, tracked
+        write(os.path.join(sl, ".matrixkoder-scratch"), "x\n")            # scratch: excluded
+        write(os.path.join(sl, ".matrixkoder-status.json"), json.dumps(
+            {"state": "working", "round": 1, "role": "builder", "step": "S1.2 did it", "ctx_pct": None,
+             "updated_at": time.time() - 180}))
+        write(os.path.join(sl, ".matrixkoder-report-r1.md"), "r\n")
+        write(os.path.join(sdata, "lanes.json"), json.dumps({"schema": 1, "slots": {
+            "1": {"path": sl, "workspace": "w", "workspace_id": "wS", "state": "busy", "run": "s1", "task": "t1",
+                  "branch": "mk/s1/t1", "lock_hash": None, "updated": "x"},
+            "2": {"path": os.path.join(tmp, "gone"), "workspace": "w", "workspace_id": None, "state": "busy",
+                  "run": "s1", "task": "t2", "branch": None, "lock_hash": None, "updated": "x"},
+            "3": {"path": sl, "workspace": "w", "workspace_id": None, "state": "free", "run": None, "task": None,
+                  "branch": None, "lock_hash": None, "updated": "x"}}}))
+        sfake = os.path.join(tmp, "fake-status-herdr")
+        write(sfake, "#!/usr/bin/env python3\nimport json, sys\n"
+              "if sys.argv[2] == 'list':\n"
+              "    print(json.dumps({'result': {'agents': [{'pane_id': 'wS:p1', 'cwd': SLOT, 'workspace_id': 'wS'}]}}))\n"
+              "elif sys.argv[2] == 'get':\n"
+              "    print(json.dumps({'result': {'agent': {'agent': 'opencode', 'agent_status': 'working'}}}))\n"
+              "else:\n"
+              "    print('  ┃  doing it\\n  ╹▀▀▀\\n  ■■⬝⬝ esc interrupt   470.9K (45%) · $1')\n".replace("SLOT", repr(sl)))
+        os.chmod(sfake, 0o755)
+        senv = dict(env, MK_HERDR=sfake)
+        got = subprocess.run([sys.executable, self_path, "status", "--json", "--data", sdata],
+                             capture_output=True, text=True, env=senv, cwd=repo)
+        assert got.returncode == 0, got
+        sj = json.loads(got.stdout)
+        assert sj["ok"] and [r["slot"] for r in sj["lanes"]] == [1, 2], sj  # busy slots only
+        r1, r2 = sj["lanes"]
+        assert r1["commits_ahead"] == 1 and r1["modified"] == [" M README.md"], r1
+        assert r1["step"] == "S1.2 did it" and 2.5 < r1["step_age_min"] < 4, r1
+        assert r1["report_present"] is True and r1["agent_state"] == "working", r1
+        assert r1["agent"] == "opencode" and r1["agent_status"] == "working" and r1["pane"] == "wS:p1", r1
+        assert r1["pane_tail"] == ["doing it", "esc interrupt   470.9K (45%) · $1"] or r1["pane_tail"][0] == "doing it", r1
+        assert r1["ctx_pct"] == 45 and r1["task_error"], r1  # no such run in sdata: error field, not a crash
+        assert r2["git_error"] and r2["step"] is None and r2["round"] is None, r2  # missing path + status file
+        os.unlink(os.path.join(sl, ".matrixkoder-status.json"))
+        got = subprocess.run([sys.executable, self_path, "status", "--slot", "1", "--data", sdata],
+                             capture_output=True, text=True, env=dict(env, MK_HERDR="none"), cwd=repo)
+        assert got.returncode == 0 and "slot 1" in got.stdout and "herdr disabled" in got.stdout, got
+        got = subprocess.run([sys.executable, self_path, "status", "--slot", "1", "--json", "--data", sdata],
+                             capture_output=True, text=True, env=dict(env, MK_HERDR="none"), cwd=repo)
+        nf = json.loads(got.stdout)
+        assert nf["ok"] and nf["lanes"][0]["step"] is None and nf["lanes"][0]["commits_ahead"] == 1, nf
 
         print("mk-lane self-test ok")
         # R1.2: the mkdb write guard refuses the real home from this suite too.

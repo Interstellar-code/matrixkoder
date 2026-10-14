@@ -2245,6 +2245,9 @@ def cmd_connect(a):
         lines.append(f"[{t['id']}] {t['title']} parallel={str(t['parallel']).lower()} deps={deps}")
     if not tasks:
         lines.append("# tasks: (none — no plan, or this phase has no tasks)")
+    else:
+        lines.append('# per task: mk-builder.py todo in_progress <id> when you start it; when it is done: '
+                     'mk-builder.py todo done <id>, then mk-builder.py progress "<id>: <result>; tests <passed>/<failed>"')
     print("\n".join(lines))
     # Once per connect (not per page; `read` posts nothing). Best effort: the brief is out.
     if cfg is not None:
@@ -4198,6 +4201,7 @@ def t_d7_connect_pages_and_tasks(root):
     assert "[D7.1] connect parallel=false deps=" in text, text[-500:]
     assert "[D7.2] ask parallel=true deps=D7.1" in text
     assert "read <id> --part 2" in text
+    assert "todo done <id>" in text and 'progress "<id>:' in text, text[-400:]
     code, lines = cli(lane, "read", "brief", "--part", "2")
     assert code == 0 and lines[0].startswith("# part 2/"), lines[:1]
 

@@ -72,6 +72,8 @@ It prints the brief, paged at about 24,000 chars, then the phase task list as li
 2. You hand that step to a subagent: `python3 ${CLAUDE_SKILL_DIR}/scripts/mk-builder.py progress <step> --subagent`
 3. The subagent returned and you checked its files with `git status`: `python3 ${CLAUDE_SKILL_DIR}/scripts/mk-builder.py progress <step>` again
 
+After each subtask and each test run, run `todo done <id>` and post `progress "<subtask>: <result>; tests <passed>/<failed>"`; answer an orchestrator question the same way (lane has no answer command).
+
 (`ctx <pct>` exists for an agent that can report a context percentage; no agent is known to, so the field stays null.)
 
 ## 3. blocked
