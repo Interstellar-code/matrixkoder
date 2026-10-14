@@ -82,10 +82,12 @@
   lock take RES --reason TEXT [--ttl-min 30] [--scope a,b] [--force-stale]
   lock release RES [--force] (refuses a lock taken by another --by) | lock check RES
   render
-  store enable [--data D] — opt in: import the ACTIVE run's files into <data>/mk.db through mkdb
-      (import_history, original timestamps), copy <data>/runs/ to <data>/runs-legacy/ read-only
-      BEFORE the first view rewrite, then publish the legacy views from the store. Absent mk.db
-      means the store is off and every command is today's file path, byte for byte.
+  store enable [--data D] — opt in: import the ACTIVE run's files into the project store through
+      mkdb (import_history, original timestamps), copy <data>/runs/ to <data>/runs-legacy/ read-only
+      BEFORE the first view rewrite, then publish the legacy views from the store. The store is the
+      project folder's mk.db (mkpaths.project_folder: <home>/projects/<slug>/mk.db once migrated,
+      else <data>/mk.db). Absent mk.db means the store is off and every command is today's file
+      path, byte for byte.
   store status [--data D] — {"ok": true, "store": "on"|"off"}
   sync [--project SLUG] — with the store on, copy every project change above sync.last_change_no
       into the root cards (idempotent). File mode changes nothing.
@@ -133,8 +135,8 @@ DEP_MET = ("merged", "qa", "done")
 DEP_GATED = ("dispatched", "building")
 SIDE = ("blocked", "provider", "quota", "stalled")  # roll-up precedence: the first present wins
 
-# The project store is opt-in. With <data>/mk.db absent, nothing below runs.
-STORE_PROJECT = "matrixkoder"  # slug only; the db is <data>/mk.db via data_dir
+# The project store is opt-in. With the project store absent, nothing below runs.
+STORE_PROJECT = "matrixkoder"  # slug only; the db is the project folder's mk.db (L3B)
 STORE_RUN_DOC = "run-doc"      # artifact kind holding the run.json document
 STORE_INDEX = "index-doc"      # artifact kind holding runs/index.json (task id "_index")
 VIEW_CRASH = "MK_VIEW_CRASH"   # test seam: raise after the store commit, before the view rewrite
@@ -308,8 +310,8 @@ class Store:
         # plan sync --apply: events for this run id are counted and dropped (ONE summary event
         # comes after); other runs' upkeep events still write
         self.sink_run, self.sunk = None, 0
-        # store on only when <data>/mk.db already exists; nothing here creates it
-        self.store_on = os.path.exists(mkpaths.project_db(data=data))
+        # store on only when the project store already exists; nothing here creates it
+        self.store_on = os.path.exists(os.path.join(self.project_folder(), "mk.db"))
         self.pending = None
         self._mkdb = None
         self._src = {}          # (run, task, kind) -> next live source-key counter
@@ -581,8 +583,19 @@ class Store:
         os.makedirs(h, exist_ok=True)
         return h
 
+    def project_folder(self):
+        """The folder to pass as `data_dir` (L3B): mkpaths.project_folder(self.data) — the C2
+        project folder for a migrated project (a root `projects.db_path` set), else --data itself.
+
+        After `mk-migrate --switch` the repo data dir is the project's LEGACY location; passing it
+        as `data_dir` would open the old `<data>/mk.db` while the dashboard, mkdb and mk-plan read
+        the new one — a silent split. Every project-store open and write goes through the folder
+        this returns. Pre-migration it is `--data` exactly, so the store file, the fake home and
+        the bytes are unchanged."""
+        return mkpaths.project_folder(self.data)
+
     def store_open(self):
-        return self.db().open_project(self.home_dir(), STORE_PROJECT, data_dir=self.data)
+        return self.db().open_project(self.home_dir(), STORE_PROJECT, data_dir=self.project_folder())
 
     def next_src(self, rid, task, kind):
         key = (rid, task or "", kind)
@@ -657,7 +670,7 @@ class Store:
         arts = self._round_artifacts(run, t)
         if arts:
             self.db().import_history(self.home_dir(), STORE_PROJECT, run["id"], artifacts=arts,
-                                     data_dir=self.data)
+                                     data_dir=self.project_folder())
         return [a["kind"] for a in arts]
 
     def doc_artifact(self, rid, task, kind, text, created):
@@ -712,7 +725,7 @@ class Store:
             if t.get("id") and t.get("round"):
                 arts += self._round_artifacts(run, t)
         self.db().import_history(self.home_dir(), STORE_PROJECT, rid, run_row=self.run_row(run),
-                                 tasks=tasks, events=events, artifacts=arts, data_dir=self.data)
+                                 tasks=tasks, events=events, artifacts=arts, data_dir=self.project_folder())
         # task round: the tasks row (and its root card) must not keep the previous round's
         # terminal status or verdict. import_history already wrote the new status; the card
         # is updated here, in this same commit, with no second event line.
@@ -739,7 +752,7 @@ class Store:
                 self.db().transition(self.home_dir(), STORE_PROJECT, rid, tid, to,
                                      note=f"round {task.get('round')} ({kind}) reset",
                                      round=task.get("round") or 0, sync_root=True,
-                                     data_dir=self.data, verdict=None)
+                                     data_dir=self.project_folder(), verdict=None)
                 con = self.store_open()
                 try:
                     extra = con.execute(
@@ -775,7 +788,7 @@ class Store:
             task = next((t for t in run.get("tasks") or [] if t.get("id") == ev["task"]), {})
             self.db().transition(self.home_dir(), STORE_PROJECT, rid, ev["task"], ev["to_id"],
                                  note=ev.get("text") or "", round=task.get("round") or 0,
-                                 sync_root=True, data_dir=self.data)
+                                 sync_root=True, data_dir=self.project_folder())
             # transition() writes the change_log row, the root card and its own event. The
             # import already stored the view line, so the transition event is removed. Its id is
             # higher than every unpublished row, so removing it cannot hide one.
@@ -798,14 +811,15 @@ class Store:
             # catch_up repairs a card whose status disagrees with the task row, including one
             # whose change_log sits below the watermark the transition above just advanced.
             # promote_ready then moves dependents and writes their cards in one root transaction.
-            self.db().catch_up(self.home_dir(), STORE_PROJECT, data_dir=self.data)
+            self.db().catch_up(self.home_dir(), STORE_PROJECT, data_dir=self.project_folder())
             self.db().promote_ready(self.home_dir(), STORE_PROJECT, rid,
-                                    data_dir=self.data, sync_root=True)
+                                    data_dir=self.project_folder(), sync_root=True)
 
     def store_transition(self, rid, tid, to, note, line=None):
         """One status change through mkdb.transition, root card included (C5)."""
         self.db().transition(self.home_dir(), STORE_PROJECT, rid, tid, to, note=note,
-                             sync_root=os.environ.get(ROOT_CRASH) != "1", data_dir=self.data)
+                             sync_root=os.environ.get(ROOT_CRASH) != "1",
+                             data_dir=self.project_folder())
 
     def load_store(self, rid):
         """The store is the read source: runs and tasks tables, plus the file-only fields the
@@ -1174,7 +1188,7 @@ class Store:
         tmp_data = os.path.join(parent, "data")
         os.makedirs(tmp_data)
         tmp_legacy = os.path.join(parent, "runs-legacy")
-        db_path = mkpaths.project_db(data=self.data)
+        db_path = os.path.join(self.project_folder(), "mk.db")
         legacy = os.path.join(self.data, "runs-legacy")
         imp = _importer()
         # The importer does `import mkdb` for its own module object. A test (and any caller)
@@ -2647,7 +2661,7 @@ def cmd_sync(a, st):
     if not st.store_on:
         return {"ok": True, "store": "off", "copied": 0}
     project = a.project or STORE_PROJECT
-    copied = st.db().catch_up(st.home_dir(), project, data_dir=st.data)
+    copied = st.db().catch_up(st.home_dir(), project, data_dir=st.project_folder())
     return {"ok": True, "store": "on", "project": project, "copied": copied}
 
 
@@ -4065,6 +4079,8 @@ def self_test():
         print("mk-state self-test ok")
         store_self_test(tmp, env)
         print("mk-state store self-test ok")
+        migrated_store_self_test(tmp, env)
+        print("mk-state migrated-store self-test ok")
         # R1.2: the mkdb write guard refuses the real home from this suite too.
         _mkdb().selftest_guard_probe(tmp_home)
     finally:
@@ -4987,6 +5003,159 @@ def store_self_test(tmp, env):
           "--run", "r1"], rp)
     assert f2_rows()["P2"][2] == "building", f2_rows()
     assert f2_phases() == {"P1": [], "P2": ["T2"], "T1": []}, f2_phases()
+
+
+def migrated_store_self_test(tmp, env):
+    """L3B: after `mk-migrate --switch`, mk-state opens the project store in the C2 folder.
+
+    Every store open/write goes through mkpaths.project_folder(self.data): the migrated
+    <home>/projects/<slug>/mk.db, not the legacy <data>/mk.db the repo data dir still names.
+    Pre-migration, a missing/corrupt/old-schema root, and a home that resolves only from a temp
+    $HOME all fall back to <data>/mk.db and never raise.
+    """
+    import hashlib as _h
+    import sqlite3 as _sq
+    here = os.path.dirname(os.path.abspath(__file__))
+
+    def run(args, e, code=0, cwd=None):
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), *args],
+                           capture_output=True, text=True, env=e, cwd=cwd)
+        lines = r.stdout.strip().splitlines()
+        assert len(lines) == 1, (args, r.stdout, r.stderr)
+        assert r.returncode == code, (args, r.returncode, r.stdout, r.stderr)
+        return json.loads(lines[0])
+
+    def sha(path):
+        return _h.sha256(open(path, "rb").read()).hexdigest() if os.path.exists(path) else None
+
+    def migrated_env(home):
+        e = dict(env)
+        e.pop("MATRIXKODER_DATA", None)
+        e.update(MK_HOME=home, MATRIXKODER_HOME=home)
+        return e
+
+    db = _mkdb()
+    # case (a): a project migrated by L2's real tool. Writes must land in the NEW store and
+    # leave the OLD <d>/mk.db byte-identical.
+    base = os.path.join(tmp, "l3b")
+    home = os.path.join(base, "home")
+    repo = os.path.join(base, "repo")
+    data = os.path.join(repo, ".matrixkoder")
+    os.makedirs(repo, exist_ok=True)
+    subprocess.run(["git", "init", "-q", repo], check=False)
+    m = migrated_env(home)
+    d = ["--data", data]
+    # a real project store through mk-state itself (store enable), so the run-doc artifact and
+    # every column the reader needs are present before the switch
+    run(["run", "init", "--id", "r1", "--feature", "F", "--branch", "b1", *d], m, cwd=repo)
+    run(["task", "add", "--id", "P1.1", "--title", "one", "--run", "r1", *d], m, cwd=repo)
+    run(["store", "enable", *d], m, cwd=repo)
+    old_db = os.path.join(data, "mk.db")
+    new_db = mkpaths.target_project_db("fixture", home)
+    assert os.path.exists(old_db), "mk-state store enable wrote no <data>/mk.db"
+    rc = subprocess.run([sys.executable, os.path.join(here, "mk-migrate.py"),
+                         "--switch", "--slug", "fixture", "--data", data, "--home", home],
+                        capture_output=True, text=True, env=m)
+    assert rc.returncode == 0, (rc.stdout, rc.stderr)
+    assert os.path.exists(new_db), "switch wrote no new store"
+    old_sha = sha(old_db)
+
+    assert run(["store", "status", *d], m)["store"] == "on"  # the probe follows the C2 folder
+    run(["task", "set", "P1.1", "status=building", "--run", "r1", *d], m)
+    run(["event", "--task", "P1.1", "--type", "note", "--text", "after switch", "--run", "r1", *d], m)
+    run(["run", "set", "--id", "r1", "--next", "dispatch the next task", *d], m)
+    assert run(["sync", "--project", "fixture", *d], m)["ok"]
+    # the rows are in the NEW store
+    con = db.open_project(home, "fixture", data_dir=mkpaths.target_project_dir("fixture", home))
+    try:
+        status = con.execute("SELECT status FROM tasks WHERE run='r1' AND id='P1.1'").fetchone()["status"]
+        notes = con.execute("SELECT COUNT(*) c FROM events WHERE run='r1' AND text='after switch'").fetchone()["c"]
+        nxt = con.execute("SELECT next FROM runs WHERE id='r1'").fetchone()["next"]
+    finally:
+        con.close()
+    assert status == "building" and notes == 1 and nxt == "dispatch the next task", (status, notes, nxt)
+    # the OLD store never moved: no row landed there, and its bytes are unchanged
+    assert sha(old_db) == old_sha, "the legacy <data>/mk.db changed after the switch"
+    old = db.open_project(os.path.join(data, ".mk-home"), STORE_PROJECT, data_dir=data)
+    try:
+        assert old.execute("SELECT status FROM tasks WHERE run='r1' AND id='P1.1'").fetchone()["status"] == "planned"
+        assert old.execute("SELECT COUNT(*) c FROM events WHERE run='r1' AND text='after switch'").fetchone()["c"] == 0
+    finally:
+        old.close()
+
+    # case (b): a pre-migration project. Writes stay in <d>/mk.db and no projects/ folder appears.
+    bhome = os.path.join(base, "bhome")
+    brepo = os.path.join(base, "brepo")
+    bdata = os.path.join(brepo, ".matrixkoder")
+    os.makedirs(brepo, exist_ok=True)
+    subprocess.run(["git", "init", "-q", brepo], check=False)
+    bm = migrated_env(bhome)
+    run(["run", "init", "--id", "b1", "--feature", "B", "--branch", "bb", "--data", bdata], bm, cwd=brepo)
+    run(["task", "add", "--id", "BT", "--title", "t", "--run", "b1", "--data", bdata], bm, cwd=brepo)
+    run(["store", "enable", "--data", bdata], bm, cwd=brepo)
+    out = run(["task", "set", "BT", "status=building", "--run", "b1", "--data", bdata], bm, cwd=brepo)
+    assert out["task"]["status"] == "building", out
+    assert os.path.exists(os.path.join(bdata, "mk.db")), "pre-migration write left the legacy store"
+    assert not os.path.exists(os.path.join(bhome, "projects")), "pre-migration created a projects/ folder"
+    bcon = db.open_project(os.path.join(bdata, ".mk-home"), STORE_PROJECT, data_dir=bdata)
+    try:
+        assert bcon.execute("SELECT status FROM tasks WHERE run='b1' AND id='BT'").fetchone()["status"] == "building"
+    finally:
+        bcon.close()
+
+    # case (c1): the root store is missing, and $MK_HOME/$MATRIXKODER_HOME are unset — the home
+    # resolves from a temp $HOME only. The write falls back to <d>/mk.db and never raises.
+    chome = os.path.join(base, "chome")
+    crepo = os.path.join(base, "crepo")
+    cdata = os.path.join(crepo, ".matrixkoder")
+    os.makedirs(crepo, exist_ok=True)
+    subprocess.run(["git", "init", "-q", crepo], check=False)
+    ce = {k: v for k, v in env.items() if k not in ("MK_HOME", "MATRIXKODER_HOME", "MATRIXKODER_DATA")}
+    ce["HOME"] = chome
+    os.makedirs(chome, exist_ok=True)
+    run(["run", "init", "--id", "c1", "--feature", "C", "--branch", "cc", "--data", cdata], ce, cwd=crepo)
+    run(["task", "add", "--id", "CT", "--title", "t", "--run", "c1", "--data", cdata], ce, cwd=crepo)
+    run(["store", "enable", "--data", cdata], ce, cwd=crepo)
+    assert run(["task", "set", "CT", "status=building", "--run", "c1", "--data", cdata],
+               ce, cwd=crepo)["task"]["status"] == "building"
+    assert os.path.exists(os.path.join(cdata, "mk.db")), "a missing root lost the fallback store"
+
+    # case (c2): a corrupt root store must not raise — fall back to <d>/mk.db.
+    korrupt = os.path.join(base, "korrupt-home")
+    kdata = os.path.join(base, "krepo", ".matrixkoder")
+    os.makedirs(os.path.dirname(kdata), exist_ok=True)
+    os.makedirs(korrupt, exist_ok=True)
+    with open(os.path.join(korrupt, "mk.db"), "wb") as f:
+        f.write(b"this is not a sqlite database")
+    km = migrated_env(korrupt)
+    run(["run", "init", "--id", "k1", "--feature", "K", "--branch", "kk", "--data", kdata], km)
+    run(["task", "add", "--id", "KT", "--title", "t", "--run", "k1", "--data", kdata], km)
+    run(["store", "enable", "--data", kdata], km)
+    assert run(["task", "set", "KT", "status=building", "--run", "k1", "--data", kdata],
+               km)["task"]["status"] == "building"
+    assert os.path.exists(os.path.join(kdata, "mk.db")), "a corrupt root lost the fallback store"
+
+    # case (c3): a root store at an OLDER schema (no projects.db_path) — same safe fallback.
+    ohome = os.path.join(base, "old-home")
+    odata = os.path.join(base, "orepo", ".matrixkoder")
+    os.makedirs(os.path.dirname(odata), exist_ok=True)
+    os.makedirs(ohome, exist_ok=True)
+    old_root = _sq.connect(os.path.join(ohome, "mk.db"))
+    try:
+        old_root.execute("CREATE TABLE projects(slug TEXT, name TEXT, repo TEXT, data_dir TEXT)")
+        old_root.execute("INSERT INTO projects(slug, name, repo, data_dir) VALUES (?,?,?,?)",
+                         ("matrixkoder", "M", "/r", odata))
+        old_root.commit()
+    finally:
+        old_root.close()
+    om = migrated_env(ohome)
+    run(["run", "init", "--id", "o1", "--feature", "O", "--branch", "oo", "--data", odata], om)
+    run(["task", "add", "--id", "OT", "--title", "t", "--run", "o1", "--data", odata], om)
+    run(["store", "enable", "--data", odata], om)
+    assert run(["task", "set", "OT", "status=building", "--run", "o1", "--data", odata],
+               om)["task"]["status"] == "building"
+    assert os.path.exists(os.path.join(odata, "mk.db")), "an old-schema root lost the fallback store"
+    assert not os.path.exists(os.path.join(ohome, "projects")), "an old-schema root created a projects/ folder"
 
 
 if __name__ == "__main__":
