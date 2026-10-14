@@ -219,6 +219,9 @@ SCHEMA = [
          "Owner timeout", "bus self-exits after this many idle minutes.", min=5, max=120),
     _row("bus.ask_timeout_s", "child", "num", 600, ["bus"], "ask_timeout_s", None,
          "Ask timeout", "a lane ask waits this long for the answer.", min=60, max=3600),
+    # C3: the lane agent when no route is pinned. Global (not per-repo).
+    _row("lanes.default_agent", "global", "text", "omp", ["lanes"], "default_agent", None,
+         "Default lane agent", "the agent a lane uses when no route is pinned"),
 ]
 
 MIGRATED_KEYS = ("routing_preferences.reviewer", "routing_preferences.visual_reviewer")
@@ -229,7 +232,7 @@ DEAD = (("dashboard", "auto_open", "autoOpen", True),
         ("usage", "poll_min", "usagePollMin", 5))
 # The schema rows this tool writes as a whole block when the section is missing entirely.
 SESSION_SECTION, PICKS_SECTION = "session", "picks"
-AGENT_NAMES = {"opencode": "OpenCode", "claude": "Claude Code", "codex": "Codex", "agy": "AGY"}
+AGENT_NAMES = {"opencode": "OpenCode", "claude": "Claude Code", "codex": "Codex", "agy": "AGY", "omp": "omp"}
 HELPERS = [
     ("herdr", "Pane and worktree manager."),
     ("jev", "Judgement gates for routing."),
@@ -239,7 +242,11 @@ HELPERS = [
 ]
 # The agents whose model list a CLI can answer for, and the argv that asks. claude and codex have
 # no such command here: their picks are written by hand and the list is small enough to keep.
+# omp is NOT here. `omp models` is a box table (provider sections, thinking column), and the
+# Settings pool is a curated allow-list (C1), not that table. Probe must not overwrite it.
 MODEL_CLIS = {"opencode": "opencode", "agy": "agy"}
+# User-editable seed for agents.omp.models. Edit this list (or the yaml models list); probe does not.
+OMP_MODEL_ALLOWLIST = ["manifest/auto"]
 
 
 # ---------- structure: where each line is ----------
@@ -310,9 +317,13 @@ def rows(lines):
                         "detected at bootstrap, logged in and installed",
                         editable=False, why="detected at bootstrap — not a typed setting"))
         if isinstance(m.get("models"), list):
+            pool = list(m.get("models") or [])
+            if name == "omp":
+                # C1: the picker offers the allow-list, never the probed `omp models` table.
+                pool = list(OMP_MODEL_ALLOWLIST)
             out.append(_row(f"picks.{name}", "models", "list", [], [PICKS_SECTION], name, None,
                             f"{name} model picks", "this agent's models in preference order",
-                            maxlen=4, pool=list(m.get("models") or [])))
+                            maxlen=4, pool=pool))
     for hid, hhelp in HELPERS:
         out.append(_row(f"helpers.{hid}", "about", "seg", "not probed", ["helpers"], "helpers", hid,
                         hid, hhelp, editable=False, why="Read-only: probed at preflight"))
@@ -982,6 +993,26 @@ def _migrate_locked(path, lines):
             new, count = patched, count + n
             changed.append(key)
             checks.append((key, r["default"], r))
+    # omp (C1): an agents block with no omp line gains one whose models are the allow-list.
+    # Inserted as its own line at the end of the agents block; every other line stays.
+    kl = key_lines(new)
+    sr = section_range(new, kl, ["agents"])
+    if sr and not any(k == "omp" and sr[2] <= i < sr[3] for (i, _ind, k, _r) in kl):
+        ind, pos = child_indent(new, sr), sr[3]
+        models = ", ".join(OMP_MODEL_ALLOWLIST)
+        line = " " * ind + f"omp: {{ available: false, models: [{models}] }}{eol}"
+        if pos and not new[pos - 1].endswith("\n"):
+            line = eol + line
+        new = new[:pos] + [line] + new[pos:]
+        changed.append("agents.omp")
+        count += 1
+    # lanes.default_agent (C3) through the same patcher the other migrated keys use.
+    r = row_for(old, "lanes.default_agent")
+    if r and not value_of(new, r)[0]:
+        patched, n = patch(new, r, r["default"])
+        new, count = patched, count + n
+        changed.append("lanes.default_agent")
+        checks.append(("lanes.default_agent", r["default"], r))
     notes = dead_notes(new)
     if changed:
         write_yaml(path, old, new, count, checks)
@@ -1072,6 +1103,7 @@ def cmd_context(path, lines, usage_arg=None):
             "codex": ["--dangerously-bypass-approvals-and-sandbox"],
             "opencode": [],
             "agy": [],
+            "omp": [],
         }
     else:
         launch_flags = {
@@ -1079,6 +1111,7 @@ def cmd_context(path, lines, usage_arg=None):
             "codex": [],
             "opencode": [],
             "agy": [],
+            "omp": [],
         }
 
     usage_data = load_usage(usage_arg)
@@ -1152,6 +1185,7 @@ def cmd_context(path, lines, usage_arg=None):
         "usage_source": val("usage.source"),
         "providers": val("usage.providers"),
         "launch_flags": launch_flags,
+        "default_agent": val("lanes.default_agent"),
         "agents": agents_map,
     })
 
@@ -1670,6 +1704,17 @@ def self_test():
         assert "  herdr: []" not in migrated, "migrate added a herdr picks row"
         for agent in ("codex", "opencode", "agy"):  # exact lines: `codex:[]` is a string to a real parser
             assert f"  {agent}: []" in migrated, f"migrate did not write `{agent}: []`"
+        # omp (C1/C3): migrate adds the agent line and lanes.default_agent; every other line stays
+        assert "  omp: { available: false, models: [manifest/auto] }" in migrated, migrated
+        assert "default_agent: omp" in "\n".join(migrated)
+        before_lines = fixture.splitlines()
+        # every original line is still present, byte for byte, in order
+        kept = [ln for ln in migrated if ln in before_lines or ln in ("lanes:", "  default_agent: omp",
+                "  omp: { available: false, models: [manifest/auto] }", "picks:")]
+        assert before_lines == [ln for ln in migrated if ln in before_lines], "migrate rewrote an existing line"
+        pool = next(f for f in run("list", "--json")["fields"] if f["key"] == "picks.omp")
+        assert pool["pool"] == ["manifest/auto"], pool
+        assert "ollama-cloud" not in pool["pool"]
 
         # 19. HIGH 1: every line migrate or set writes is a `key: value` (colon + space) or a bare
         # section header — a missing space parses as a string in a real YAML reader
@@ -1695,6 +1740,8 @@ def self_test():
         assert ctx["launch_flags"]["codex"] == ["--dangerously-bypass-approvals-and-sandbox"]
         assert ctx["launch_flags"]["opencode"] == []
         assert ctx["launch_flags"]["agy"] == []
+        assert ctx["launch_flags"]["omp"] == []
+        assert ctx["default_agent"] == "omp"
         assert ctx["agents"]["opencode"]["available"] is True
         assert ctx["agents"]["codex"]["available"] is False
         assert ctx["agents"]["opencode"]["picks"] == []
@@ -1713,7 +1760,7 @@ def self_test():
         run("set", "autonomy_contract.builder_skip_permissions", "false")
         ctx3 = run("context")
         assert ctx3["builder_skip_permissions"] is False
-        assert ctx3["launch_flags"] == {"claude": [], "codex": [], "opencode": [], "agy": []}
+        assert ctx3["launch_flags"] == {"claude": [], "codex": [], "opencode": [], "agy": [], "omp": []}
         run("set", "autonomy_contract.builder_skip_permissions", "true")
 
         # below_floor true / false / null for claude and for one non-Claude agent (opencode)

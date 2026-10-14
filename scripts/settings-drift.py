@@ -63,6 +63,7 @@ MIN_YAML = (
     "  codex: { available: true, models: [c] }\n"
     "  agy: { available: true, models: [g] }\n"
     "  herdr: { available: true }\n"
+    "  omp: { available: true, models: [manifest/auto] }\n"
 )
 
 

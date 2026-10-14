@@ -484,6 +484,7 @@ const AGENT_CARDS: readonly AgentCard[] = [
   { id: 'claude', name: 'Claude Code', provider: 'anthropic subscription' },
   { id: 'agy', name: 'AGY', provider: 'google' },
   { id: 'codex', name: 'Codex', provider: 'openai' },
+  { id: 'omp', name: 'omp', provider: 'pi' },
 ]
 
 const DEFAULT_PICKS: readonly { agent: string; models: readonly string[] }[] = [
@@ -491,6 +492,7 @@ const DEFAULT_PICKS: readonly { agent: string; models: readonly string[] }[] = [
   { agent: 'claude', models: ['claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-opus-5-5', 'claude-fable-5-1'] },
   { agent: 'agy', models: [] },
   { agent: 'codex', models: [] },
+  { agent: 'omp', models: ['manifest/auto'] },
 ]
 
 /** The models an agent's picker may offer: exactly its picks row's `pool` —
@@ -583,9 +585,19 @@ export function buildSettingsView(args: {
   for (const f of fields) {
     if (typeof f.key !== 'string') continue
     if (f.key.startsWith('picks.')) continue
-    if (typeof f.scope !== 'string' || !YAML_SCOPES.includes(f.scope)) continue
-    const row = toRow(f, f.scope as SettingsScopeId)
-    if (row != null) pushRow(f.scope, row)
+    const scope = f.key === 'lanes.default_agent' ? 'child' : f.scope
+    if (typeof scope !== 'string' || !YAML_SCOPES.includes(scope)) continue
+    const row = toRow(f, scope as SettingsScopeId)
+    if (row == null) continue
+    let drawn = row
+    if (row.key === 'lanes.default_agent') {
+      const avail = fields
+        .filter((a): a is YamlFieldIn & { key: string } => typeof a.key === 'string' && a.key.startsWith('agents.') && a.key.endsWith('.available') && a.value !== false)
+        .map(a => a.key.slice('agents.'.length, -'.available'.length))
+      const ids = [...new Set(['omp', ...avail])]
+      drawn = { ...row, opts: ids.map(id => [id, ''] as [string, string]) }
+    }
+    pushRow(scope, drawn)
   }
   const groups: SettingsGroup[] = []
   for (const [scope, defs] of Object.entries(YAML_GROUPS) as [keyof typeof YAML_GROUPS, readonly GroupDef[]][]) {

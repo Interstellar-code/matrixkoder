@@ -50,8 +50,11 @@ SEEDS = {
             "todo_hook": "no", "hook_recipe": ""},
     "herdr": {"kind": "herdr", "cli": "herdr", "efforts": [],
               "todo_hook": "no", "hook_recipe": ""},
+    # Efforts live on each model row (C2), read from `omp models`' thinking column. The agent stays [].
+    "omp": {"kind": "omp", "cli": "omp", "efforts": [],
+            "todo_hook": "unknown", "hook_recipe": ""},
 }
-PROBE_CLIS = {"opencode": "opencode", "agy": "agy"}
+PROBE_CLIS = {"opencode": "opencode", "agy": "agy", "omp": "omp"}
 AGENT_FIELDS = ("kind", "cli", "provider_plans_json", "capabilities_json", "status", "notes")
 MODEL_FIELDS = ("provider", "display", "context_tokens", "effort_levels_json", "benchmarks_json",
                 "cost_json", "quota_pool", "status", "notes", "capabilities_json")
@@ -216,19 +219,69 @@ def known_displays():
     return out
 
 
-def probe_models(cli):
-    """Model ids `<cli> models` prints. [] when the CLI is absent or fails — never an error."""
+_OMP_HEADER = re.compile(r"^([A-Za-z0-9._-]+) \((\d+)\)\s*$")
+
+
+def probe_cli(cli):
+    """stdout of `<cli> models`, or "" when the CLI is absent or fails — never an error."""
     try:
         proc = subprocess.run([cli, "models"], capture_output=True, text=True, timeout=20)
     except Exception:
-        return []
+        return ""
     if proc.returncode != 0:
-        return []
+        return ""
+    return proc.stdout or ""
+
+
+def probe_models(cli):
+    """Model ids `<cli> models` prints. [] when the CLI is absent or fails — never an error."""
     out = []
-    for raw in (proc.stdout or "").splitlines():
+    for raw in probe_cli(cli).splitlines():
         fields = raw.split()
         if fields and fields[0] not in out:
             out.append(fields[0])
+    return out
+
+
+def parse_omp_models(text):
+    """(id, efforts) from an `omp models` table. Id is `<provider>/<model>`.
+
+    One box table per provider section. The thinking column is a comma list; `-` (or empty) is no
+    efforts. Stored on the model, never on the agent (C2).
+    """
+    provider, cols, out = None, None, []
+    seen = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        m = _OMP_HEADER.match(line)
+        if m:
+            provider, cols = m.group(1), None
+            continue
+        if "│" not in line or provider is None:
+            continue
+        cells = [c.strip() for c in line.split("│")]
+        cells = [c for c in cells if c != ""]
+        if not cells:
+            continue
+        if cells[0] == "model":
+            cols = cells
+            continue
+        if set(line) <= set("┌┐└┘├┤┬┴┼─│ "):
+            continue
+        if cols is None or "thinking" not in cols or len(cells) < len(cols):
+            continue
+        model = cells[cols.index("model")]
+        thinking = cells[cols.index("thinking")]
+        if not model or model == "model":
+            continue
+        if thinking in ("-", ""):
+            efforts = []
+        else:
+            efforts = [p.strip() for p in thinking.split(",") if p.strip() and p.strip() != "-"]
+        mid = f"{provider}/{model}"
+        if mid not in seen:
+            seen.add(mid)
+            out.append((mid, efforts))
     return out
 
 
@@ -315,12 +368,24 @@ def seed(home, yaml_path, jev_path, probe=True):
                 upsert_agent(con, name, caps, seed_row["kind"], seed_row["cli"],
                              "enabled" if enabled else "disabled", _user_fields(con, name))
                 picked = list(info.get("models") or [])
-                probed = probe_models(PROBE_CLIS[name]) if probe and name in PROBE_CLIS else []
                 displays = known_displays()
-                for model in list(dict.fromkeys(picked + probed)):
-                    upsert_model(con, name, model, seed_row["efforts"], seed_row["kind"],
-                                 "picked" if model in picked else "probed",
-                                 _user_fields(con, name, model), displays.get(model))
+                if probe and name == "omp" and name in PROBE_CLIS:
+                    # per-model efforts from the thinking column; a yaml pick not in the table
+                    # keeps the agent seed (omp's is [])
+                    probed_rows = parse_omp_models(probe_cli(PROBE_CLIS[name]))
+                    by_id = {mid: eff for mid, eff in probed_rows}
+                    ordered = list(dict.fromkeys(picked + [mid for mid, _e in probed_rows]))
+                    for model in ordered:
+                        efforts = by_id.get(model, seed_row["efforts"])
+                        upsert_model(con, name, model, efforts, seed_row["kind"],
+                                     "picked" if model in picked else "probed",
+                                     _user_fields(con, name, model), displays.get(model))
+                else:
+                    probed = probe_models(PROBE_CLIS[name]) if probe and name in PROBE_CLIS else []
+                    for model in list(dict.fromkeys(picked + probed)):
+                        upsert_model(con, name, model, seed_row["efforts"], seed_row["kind"],
+                                     "picked" if model in picked else "probed",
+                                     _user_fields(con, name, model), displays.get(model))
             for agent, model in jev_models(jev_path):
                 efforts = SEEDS.get(agent, {}).get("efforts", [])
                 upsert_model(con, agent, model, efforts, SEEDS.get(agent, {}).get("kind", agent),
@@ -746,6 +811,44 @@ def self_test():
         _check(shown["ok"] and shown["model"]["status"] == "picked", f"seeded show {shown}")
         got = _run(empty, "routes", "--json")["routes"]
         _check(got == [f"opencode opencode/alpha {e}" for e in ("low", "medium", "high")], f"seeded routes {got}")
+        # omp: per-model efforts from a fake `omp models` table; the agent seed stays []
+        omp_home = os.path.join(side, "omp-home")
+        bindir = os.path.join(side, "bin")
+        os.makedirs(bindir)
+        omp_bin = os.path.join(bindir, "omp")
+        open(omp_bin, "w").write(
+            "#!/bin/sh\n"
+            "cat <<'EOF'\n"
+            "manifest (1)\n"
+            "│ model │ context │ max-out │ thinking │ images │\n"
+            "│ auto │ 128K │ 8.2K │ minimal,low,medium,high,xhigh │ no │\n"
+            "apple (1)\n"
+            "│ model │ context │ max-out │ thinking │ images │\n"
+            "│ on-device │ 8.2K │ 8.2K │ - │ yes │\n"
+            "EOF\n")
+        os.chmod(omp_bin, 0o755)
+        omp_yaml = os.path.join(side, "omp.yaml")
+        open(omp_yaml, "w").write("agents:\n  omp: { available: true, models: [] }\n")
+        omp_jev = os.path.join(side, "empty-jev.md")
+        open(omp_jev, "w").write("")
+        saved_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = bindir + os.pathsep + saved_path
+        try:
+            seeded = _run(omp_home, "seed", "--yaml", omp_yaml, "--jev", omp_jev)
+        finally:
+            os.environ["PATH"] = saved_path
+        shown = _run(omp_home, "show", "omp", "manifest/auto")
+        _check(_load(shown["model"]["effort_levels_json"], None) ==
+               ["minimal", "low", "medium", "high", "xhigh"], f"omp efforts {shown}")
+        bare = _run(omp_home, "show", "omp", "apple/on-device")
+        _check(_load(bare["model"]["effort_levels_json"], None) == [], f"dash efforts {bare}")
+        agent = _run(omp_home, "show", "omp")
+        caps = _load(agent["agent"]["capabilities_json"], {})
+        _check("efforts" not in caps or caps.get("efforts") in (None, [], ""), f"agent efforts {caps}")
+        routes_got = _run(omp_home, "routes", "--json")["routes"]
+        _check("omp manifest/auto minimal" in routes_got, f"omp routes {routes_got}")
+        _check("omp apple/on-device" in routes_got, f"dash route missing {routes_got}")
+        _check(not any(r.startswith("omp apple/on-device ") for r in routes_got), routes_got)
         # R1.2: the mkdb write guard refuses the real home from this suite too.
         mkdb.selftest_guard_probe(home)
         for k, v in saved.items():
