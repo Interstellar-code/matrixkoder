@@ -40,6 +40,45 @@ All take `--data <data>`; `S=${CLAUDE_PLUGIN_ROOT}/scripts`. Or the `mk_bus` too
 
 Kinds: `ask answer info ack task status commit report review nudge`. The bus rings the lane itself (fixed `mk-builder.py inbox` line, queued until the pane is idle) only for `nudge`, `info` and `answer` — so message a lane with `nudge` or `info`, not `ask`; an `ask` from you is never rung. Never type the doorbell by hand (`herdr pane send` does not exist; the bus uses `herdr agent prompt`). Briefs go out through `mk-lane-event.py dispatch` (stage 5), not `send`.
 
+
+## Orchestrator command cheat sheet
+
+Checked against `--help`. `S=${CLAUDE_PLUGIN_ROOT}/scripts`; mk-state and mk-lane take `--data <data>` (and `--run <R>` once two runs are active).
+
+| Job | Command |
+|---|---|
+| Start a run | `python3 $S/mk-state.py run init --id <R> --plan <plan path> [--branch <integration>]` |
+| Link an old run to its plan | `python3 $S/mk-state.py run set --id <R> --plan-id <plan id>` |
+| Stage / next action | `mk-state.py run stage --id <R> <n>`; `run set --id <R> --next "<text>"` |
+| Add a task | `mk-state.py task add --id <T> --title "<t>" --wave <n> --deps <a,b> --owned <paths> [--parent <P>]` |
+| Set task fields | `mk-state.py task set <T> status=building model=<m> effort=<e> --note "<why>"` — `key=value` pairs, never `--status` |
+| Read a task | `mk-state.py task get <T>` |
+| New brief round | `mk-state.py task round <T> [--kind fix --cause "<c>"]` → returns the `brief-rN.md` path |
+| Record your test run | `mk-state.py task verify <T> --tests <passed>/<failed> [--tsc 0] [--selftest ok]` |
+| Take a lane | `python3 $S/mk-lane.py acquire --run <R> --task <T> --role build` — first free slot; no way to pick a slot |
+| Agent name for a lane | `mk-lane.py names --run <R> --task <T> --role <role> --round <n>` |
+| Give a lane back | `mk-lane.py release --slot <n> --integration <branch>` (both required) |
+| Lane state | `mk-lane.py list` |
+| Start an agent | `herdr agent start <name> --kind <opencode\|agy\|claude…> --pane <pane>` |
+| Reviewer pane | `herdr pane split <pane> --direction right\|down` |
+| Arm a lane | `mk-lane-event.py arm --lane --pane --task --run --data --phase --commit-grep` (all required) |
+| Prompt a lane | `mk-lane-event.py dispatch --pane <pane> --text "<text>" [--connect \| --role review]` |
+| Approve a plan | `python3 $S/mk-plan.py approve <plan path>` |
+| Routes and models | `python3 $S/mk-catalog.py routes --json`; AGY ids from `agy models` |
+| Settings | `mk-config.py --data <data> get <KEY>`, `set <KEY> <VALUE>`, `context` |
+
+### Traps
+
+- `mk-bus.py answer` takes `msg_id` and `text` as positional arguments, not flags.
+- `task add --parent <P>` is refused when P is already merged. Add a new top-level task and give it subtasks instead.
+- herdr agent names cannot contain a dot. If a prompt by agent name prints nothing, prompt by pane id (`w9:pA`).
+- AGY has only the ids `agy models` lists. Never guess a model name.
+- For long test runs, start `lane-watch.py` with `--stall-min 40`. A long read otherwise shows as STALL.
+- `git stash` and `git checkout` to undo work are blocked by the MK guard. Never use them.
+- `mkdb.py plans` refuses a v3 store. Migrate it first (`mkdb.open_project`).
+- `dispatch --role review` refuses a pane with no agent. Start the reviewer first.
+- After a quota block where the user changes the lane's model, record it: `task set <T> status=building model=<m> effort=<e>`.
+
 ## Files
 
 `<data>` = the project data dir chosen in onboarding (default `<repo>/.matrixkoder/`, gitignored; `reference/onboarding.md`). Home mode (`~/.matrixkoder/projects/<slug>/`) lands only after the data move — until then the repo dir is current.
