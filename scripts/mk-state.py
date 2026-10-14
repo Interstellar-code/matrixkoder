@@ -29,13 +29,19 @@
       touched (route_json comes from dispatch, D1.5.3). Writes through the normal save path, so
       the store mirror and the run-doc artifact update together; ONE summary note event.
   task add --id T --title TEXT [--wave N] [--deps A,RUN:B] [--owned glob,glob] [--parent P]
+      [--followup]
       ids are case-insensitive unique; deps store the real id case and a self-dep is refused;
-      RUN:B is a task in another run of the same data dir; --parent onto merged/qa/done is refused;
-      warns when an owned glob overlaps an unmerged task in any active run
+      RUN:B is a task in another run of the same data dir; --parent onto merged/qa/done is
+      refused unless --followup, which adds the task anyway and rolls that phase back to
+      `building` with a "follow-up <id> added" note, so its status rolls up from its children
+      again; warns when an owned glob overlaps an unmerged task in any active run
       (the new task's own --parent chain is not an overlap: a parent owns its children's globs)
   task set T key=value ... [--note TEXT] [--force]   keys: status agent model effort lane pane
-      branch workspace slot last_commit gates verdict reviewer (branch/workspace/slot are written by
-      mk-lane.py acquire; reviewer comes from the plan's phase or task set)
+      branch workspace slot last_commit gates verdict reviewer parent (branch/workspace/slot are
+      written by mk-lane.py acquire; reviewer comes from the plan's phase or task set)
+      parent=P re-parents T (P must exist in this run and may not be T or anything below T);
+      parent= with an empty value makes T a root, i.e. a phase. T's type and the types under it
+      are re-derived, and the old and the new parent roll up in the same save.
       status=dispatched|building needs every own AND ancestor dep merged/qa/done (--force overrides);
       status= on a parent fans out: every child is set (one transition each, the same --note; the
       parent itself is never set directly, it rolls up from the children); status aliases
@@ -92,7 +98,7 @@ STATUSES = ("planned routed dispatched building verifying review fix merged qa d
 STATUS_ALIASES = {"reviewing": "review", "merging": "merged", "fixing": "fix"}  # input aliases (F2.2)
 EVENT_TYPES = ("transition", "decision", "verdict", "quota", "note")
 TASK_KEYS = ("status", "agent", "model", "effort", "lane", "pane", "branch", "workspace", "slot",
-             "last_commit", "gates", "verdict", "reviewer")
+             "last_commit", "gates", "verdict", "reviewer", "parent")  # parent= re-parents a task
 ROUND_KINDS = ("build", "fix", "takeover")
 # A new round must not inherit the previous round's terminal row. File mode never wrote
 # status on `task round` (the row stays whatever it was); the store path maps each kind
@@ -1377,10 +1383,12 @@ def tree(tasks):
 def rollup(st, run, by):
     """A parent's status follows its children: a side state if any child is in one, else the least
     advanced child — only ever raised to `building` (never lowered) when work has started: any
-    child past `routed` and the least advanced child below `building`."""
+    child past `routed` and the least advanced child below `building`.
+    `st._rollup_keep` names the ids this save sets on purpose (a re-opened follow-up phase): their
+    rollback is the point of the command, so roll-up does not read their children over it."""
     order = {s: i for i, s in enumerate(STATUSES)}
     for t, _ in reversed(tree(run.get("tasks") or [])):  # leaves first, so nested parents see rolled-up children
-        if not t.get("id"):
+        if not t.get("id") or t["id"] in (getattr(st, "_rollup_keep", None) or ()):
             continue
         kids = [c.get("status") for c in run["tasks"] if c.get("parent") == t["id"]]
         if not kids:
@@ -1810,9 +1818,11 @@ def plan_owned(owned, who):
     return owned
 
 
-def add_task(st, run, tid, title, wave, deps, owned, parent, by, extra=None):
+def add_task(st, run, tid, title, wave, deps, owned, parent, by, extra=None, followup=False):
     """The ONE task-add path (`task add`, `run init --plan`, `plan sync --apply`): validate, append,
     save (rollup, ready, board, other runs included). `extra` rides on the new task (C4 plan links).
+    `--followup` is the only way onto a merged/qa/done parent: it adds the child and rolls that
+    phase back to `building`, so its status keeps rolling up from its children.
     -> (task, warnings)"""
     tid = check_id(tid, "task id")
     clash = [t["id"] for t in run["tasks"] if t["id"].lower() == tid.lower()]
@@ -1828,7 +1838,9 @@ def add_task(st, run, tid, title, wave, deps, owned, parent, by, extra=None):
     if parent:
         p = find_task(run, parent)
         if p["status"] in DEP_MET:
-            raise Fail(f"--parent onto {p['id']} ({p['status']}) is refused: status rolls up from children")
+            if not followup:
+                raise Fail(f"--parent onto {p['id']} ({p['status']}) is refused: status rolls up from "
+                           "children (pass --followup to add a follow-up under a merged phase)")
     active, _ = st.active_runs(run)
     own = {x["id"] for x in ancestor_chain(run, parent)}  # our own parent chain: not a collision
     for o in active:
@@ -1852,17 +1864,31 @@ def add_task(st, run, tid, title, wave, deps, owned, parent, by, extra=None):
          "created": now(), "updated": now(), **(extra or {})}
     run["tasks"].append(t)
     st.event(run, "transition", f"task added: {title}", task=tid, to="planned", by=by)
-    st.save(run, t, by)
+    reopen = p if (followup and parent and p["status"] in DEP_MET) else None
+    if reopen is not None:  # a follow-up re-opens its phase: back to building, and it says so
+        frm = reopen["status"]
+        reopen["status"], reopen["updated"] = "building", now()
+        st.event(run, "transition", f"follow-up {tid} added: {frm} → building", task=reopen["id"],
+                 frm=frm, to="building", by=by)
+        st.event(run, "note", f"follow-up {tid} added", task=reopen["id"], by=by)
+        st._rollup_keep = {reopen["id"]}  # the rollback is the point: roll-up does not read it back
+    try:
+        st.save(run, t, by)
+    finally:
+        st._rollup_keep = None
+    if reopen is not None:  # the file view carries the phase's new status
+        write_json(os.path.join(st.task_dir(run["id"], reopen["id"]), "task.json"), reopen)
     warnings += st.refresh_others(run, by)  # their boards show "blocks"; ready stays correct
     return t, warnings
 
 
-def task_type_of(run, t):
+def task_type_of(run, t, fresh=False):
     """D1.5.1/D1.5.2: the store column for one task — the plan's id when run init copied it
     (a [[phase]] row is a phase, a [[phase.task.subtask]] row is a subtask), else derived from
     the tree: no parent -> phase, a parent that is itself a phase -> task, deeper -> subtask.
-    A task row never pretends to be a bare task when the plan said otherwise."""
-    if t.get("type") in ("phase", "task", "subtask"):
+    A task row never pretends to be a bare task when the plan said otherwise. `fresh` ignores the
+    stored value and re-derives from the tree — what a re-parent needs for T and its subtree."""
+    if not fresh and t.get("type") in ("phase", "task", "subtask"):
         return t["type"]
     parent = t.get("parent")
     if not parent:
@@ -1871,6 +1897,52 @@ def task_type_of(run, t):
     if p is not None and not p.get("parent"):
         return "task"
     return "subtask"
+
+
+def descendants_of(tasks, task_id):
+    """-> {id, ...} every task below `task_id`, at any depth."""
+    children_of = {}
+    for x in tasks:
+        p = (x.get("parent") or "").lower()
+        if p:
+            children_of.setdefault(p, []).append(x)
+    out, frontier = set(), [task_id.lower()]
+    while frontier:
+        for c in children_of.get(frontier.pop(), []):
+            out.add(c["id"])
+            frontier.append(str(c["id"]).lower())
+    return out
+
+
+def reparent(st, run, t, new_parent, by):
+    """`task set T parent=P` — move T under P; an empty value makes T a root, i.e. a phase.
+
+    P must exist in this run, and it may not be T itself or anything below T (that would make a
+    cycle). T's own type and every type under it are re-derived from the tree (task_type_of), so
+    a root that becomes a child is a task and a task that becomes a root is a phase again. The
+    move goes through the caller's normal save, so the old and the new parent roll up and the
+    file view and the store agree.
+    -> [task, ...] the tasks whose own task.json this move touched (T, old and new parent)."""
+    below = descendants_of(run["tasks"], t["id"])
+    new_id = None
+    if new_parent not in (None, ""):
+        p = next((x for x in run["tasks"] if str(x["id"]).lower() == str(new_parent).lower()), None)
+        if p is None:
+            raise Fail(f"no task {new_parent!r} in run {run['id']}")
+        if p["id"] == t["id"]:
+            raise Fail(f"task {t['id']} cannot be its own parent")
+        if p["id"] in below:
+            raise Fail(f"parent {p['id']} is under {t['id']}: the move would make a cycle")
+        new_id = p["id"]
+    old = t.get("parent")
+    if new_id == old:
+        return [t]
+    t["parent"] = new_id
+    for x in [t, *(y for y in run["tasks"] if y.get("id") in below)]:
+        x["type"] = task_type_of(run, x, fresh=True)
+    st.event(run, "note", f"parent: {old or 'root'} → {new_id or 'root'}", task=t["id"], by=by)
+    touched = [t] + [x for x in run["tasks"] if x.get("id") in {old, new_id} and x is not t]
+    return touched
 
 
 def task_has_brief(st, run, t):
@@ -1938,13 +2010,15 @@ def cmd_task(a, st):
             t = find_task(run, a.task)
             return {"ok": True, "task": t, "dir": st.task_dir(run["id"], t["id"])}
         if a.action == "add":
-            t, warnings = add_task(st, run, a.id, a.title, a.wave, csv(a.deps), csv(a.owned), a.parent, a.by)
+            t, warnings = add_task(st, run, a.id, a.title, a.wave, csv(a.deps), csv(a.owned), a.parent,
+                                   a.by, followup=a.followup)
             st.flush()
             return {"ok": True, "task": t, **({"warnings": warnings} if warnings else {})}
         if a.action == "check":
             return task_check(st, run, find_task(run, a.task), at_dispatch=getattr(a, "at_dispatch", False))
         t = find_task(run, a.task)
         cur = t["rounds"][-1] if t["rounds"] else None
+        moved = []  # task.json files a re-parent touched besides T's; written after the save
         if a.action == "verify":
             return task_verify(st, run, t, a)
         if a.action == "set":
@@ -1959,6 +2033,8 @@ def cmd_task(a, st):
                 changes["status"] = STATUS_ALIASES.get(changes["status"], changes["status"])
                 if changes["status"] not in STATUSES:
                     raise Fail(f"bad status {changes['status']!r}; one of: {' '.join(STATUSES)}")
+            if "parent" in changes:
+                moved = reparent(st, run, t, changes.pop("parent"), a.by)
             kids = [c for c in run["tasks"] if c.get("parent") == t["id"]]
             fanned = "status" in changes and bool(kids)
             if fanned:
@@ -2060,6 +2136,9 @@ def cmd_task(a, st):
                 st._round_reset = [(x["id"], a.kind) for x in group]
         t["updated"] = now()
         st.save(run, t, a.by)
+        for x in moved:  # a re-parent moved T and rolled both parents up in this one save
+            if x is not t:
+                write_json(os.path.join(st.task_dir(run["id"], x["id"]), "task.json"), x)
         warnings = st.refresh_others(run, a.by) if a.action == "set" else []
         st.flush()
         if a.action == "round":
@@ -2603,6 +2682,8 @@ def build_parser():
     t = task.add_parser("add", parents=[data_p, run_p])
     t.add_argument("--id"), t.add_argument("--title"), t.add_argument("--wave", type=int)
     t.add_argument("--deps"), t.add_argument("--owned"), t.add_argument("--parent")
+    t.add_argument("--followup", action="store_true",
+                   help="--parent may be a merged/qa/done phase: it rolls back to building")
     t = task.add_parser("set", parents=[data_p, run_p])
     t.add_argument("task"), t.add_argument("pairs", nargs="+"), t.add_argument("--note")
     t.add_argument("--force", action="store_true")
@@ -3268,6 +3349,51 @@ def self_test():
         dk("task", "add", "--id", "Q3C", "--title", "child", "--parent", "Q3", "--run", "rb")
         assert dk("task", "get", "Q3", "--run", "rb")["task"]["status"] == "planned"  # rolled back by the child
         assert dk("task", "get", "D3", "--run", "ra")["task"]["ready"] is False  # refreshed, still correct
+
+        # F2: a follow-up under a merged phase, and `task set T parent=P` re-parenting
+        dk("task", "add", "--id", "FU", "--title", "Follow-up phase", "--run", "rb")
+        dk("task", "add", "--id", "FU.1", "--title", "first child", "--parent", "FU", "--run", "rb")
+        dk("task", "set", "FU.1", "status=merged", "--run", "rb")
+        assert dk("task", "get", "FU", "--run", "rb")["task"]["status"] == "merged"
+        # (a) without --followup the merged phase still refuses the add, and nothing was written
+        e = dk("task", "add", "--id", "FU.2", "--title", "follow-up", "--parent", "FU", "--run", "rb", code=2)
+        assert "merged" in e["error"] and "rolls up" in e["error"], e
+        assert dk("task", "get", "FU", "--run", "rb")["task"]["status"] == "merged"
+        assert not any(x["id"] == "FU.2" for x in dk("run", "get", "--id", "rb")["run"]["tasks"])
+        # (b) with --followup the task lands under the phase, which rolls back to building
+        t = dk("task", "add", "--id", "FU.2", "--title", "follow-up", "--parent", "FU",
+               "--followup", "--run", "rb")["task"]
+        assert t["parent"] == "FU" and t["status"] == "planned", t
+        assert dk("task", "get", "FU", "--run", "rb")["task"]["status"] == "building"
+        fu_ev = [json.loads(x) for x in open(os.path.join(d2[1], "runs", "rb", "events.jsonl"))]
+        assert any(x["task"] == "FU" and "follow-up FU.2 added" in x["text"] for x in fu_ev), fu_ev[-3:]
+        dk("task", "set", "FU.2", "status=merged", "--run", "rb")
+        assert dk("task", "get", "FU", "--run", "rb")["task"]["status"] == "merged"  # rolled up again
+        # --followup on a phase that is not merged is a plain --parent (no rollback, no note)
+        dk("task", "add", "--id", "FU.3", "--title", "open child", "--parent", "Q3", "--followup", "--run", "rb")
+        assert dk("task", "get", "Q3", "--run", "rb")["task"]["status"] == "planned"
+
+        # (c) a root with children moves under a phase: T is re-typed and so is everything below
+        dk("task", "add", "--id", "RP", "--title", "movable", "--run", "rb")
+        dk("task", "add", "--id", "RP.1", "--title", "under it", "--parent", "RP", "--run", "rb")
+        ty = lambda i: dk("task", "check", i, "--run", "rb")["type"]  # task_type_of, the store's own word
+        stored = lambda: {x["id"]: x.get("type") for x in dk("run", "get", "--id", "rb")["run"]["tasks"]}
+        assert (ty("RP"), ty("RP.1")) == ("phase", "task"), (ty("RP"), ty("RP.1"))
+        moved = dk("task", "set", "RP", "parent=Q3", "--run", "rb")["task"]
+        assert moved["parent"] == "Q3" and moved["type"] == "task", moved
+        assert (ty("RP"), ty("RP.1")) == ("task", "subtask"), (ty("RP"), ty("RP.1"))
+        assert (stored()["RP"], stored()["RP.1"]) == ("task", "subtask"), stored()  # re-derived, then stored
+        # the new parent rolls up from its new child
+        assert dk("task", "get", "Q3", "--run", "rb")["task"]["status"] == "planned"
+        # (e) an empty value makes T a root again, i.e. a phase, and its children follow
+        root = dk("task", "set", "RP", "parent=", "--run", "rb")["task"]
+        assert root["parent"] is None and root["type"] == "phase", root
+        assert (ty("RP"), ty("RP.1")) == ("phase", "task"), (ty("RP"), ty("RP.1"))
+        # (d) a cycle (T's own child), an unknown parent and T itself are refused; nothing moves
+        for bad, why in (("RP.1", "cycle"), ("NOPE", "no task"), ("RP", "own parent")):
+            e = dk("task", "set", "RP", f"parent={bad}", "--run", "rb", code=2)
+            assert e["ok"] is False and why in e["error"], (bad, e)
+        assert dk("task", "get", "RP", "--run", "rb")["task"]["parent"] is None
 
         # owned overlap: a child's globs inside its parent's are the plan, not a collision
         overlap_refs = lambda w: [x.split("owned overlaps ", 1)[1].split(" ")[0]
@@ -4695,6 +4821,52 @@ def store_self_test(tmp, env):
     assert b_changes() == after_promote, (after_promote, b_changes())
     view = once(["task", "get", "B", "--run", "rr"], ch)["task"]
     assert view["status"] == "routed" and view["ready"] is True, view
+
+    # F2: a follow-up and a re-parent reach the store, so `mkdb plans` nests the moved task
+    # under its new parent and both parents roll up there too.
+    rp = os.path.join(tmp, "reparent")
+    once(["run", "init", "--id", "r1", "--feature", "F2", "--branch", "br"], rp)
+    once(["store", "enable"], rp)
+    con = db.open_project(os.path.join(rp, ".mk-home"), STORE_PROJECT, data_dir=rp)
+    try:
+        con.execute("INSERT INTO plans(id, version, title, approved_at, archived_path) VALUES (?,?,?,?,?)",
+                    ("f2plan", 1, "F2", "2026-01-01T00:00:00+00:00", os.path.join(tmp, "f2plan-v1.md")))
+        con.commit()
+    finally:
+        con.close()
+    once(["run", "set", "--id", "r1", "--plan-id", "f2plan"], rp)
+    once(["task", "add", "--id", "P1", "--title", "phase", "--run", "r1"], rp)
+    once(["task", "add", "--id", "P2", "--title", "other phase", "--run", "r1"], rp)
+    once(["task", "add", "--id", "T1", "--title", "movable", "--run", "r1"], rp)
+    once(["task", "set", "T1", "parent=P1", "--run", "r1"], rp)
+
+    def f2_rows():
+        c = db.open_project(os.path.join(rp, ".mk-home"), STORE_PROJECT, data_dir=rp)
+        try:
+            return {r["id"]: (r["parent"], r["type"], r["status"]) for r in
+                    c.execute("SELECT id, parent, type, status FROM tasks WHERE run='r1'")}
+        finally:
+            c.close()
+
+    def f2_phases():
+        got = db.plans(os.path.join(rp, ".mk-home"), STORE_PROJECT, data_dir=rp, plan_id="f2plan")
+        return {p["id"]: [x["id"] for x in p["tasks"]] for p in got["phases"]}
+
+    assert f2_rows()["T1"][:2] == ("P1", "task"), f2_rows()  # the store row carries parent and type
+    assert f2_phases() == {"P1": ["T1"], "P2": []}, f2_phases()  # nested under the new parent
+    once(["task", "set", "T1", "status=merged", "--run", "r1"], rp)
+    assert f2_rows()["P1"][2] == "merged", f2_rows()  # the new parent rolls up from its new child
+    once(["task", "set", "T1", "parent=", "--run", "r1"], rp)
+    assert f2_rows()["T1"][:2] == (None, "phase"), f2_rows()  # a root again, and a phase
+    assert f2_phases() == {"P1": [], "P2": [], "T1": []}, f2_phases()
+
+    # a follow-up under the merged phase P2 lands there and rolls it back to building
+    once(["task", "set", "T1", "status=merged", "--run", "r1"], rp)
+    once(["task", "set", "P2", "status=merged", "--run", "r1"], rp)
+    once(["task", "add", "--id", "T2", "--title", "follow-up", "--parent", "P2", "--followup",
+          "--run", "r1"], rp)
+    assert f2_rows()["P2"][2] == "building", f2_rows()
+    assert f2_phases() == {"P1": [], "P2": ["T2"], "T1": []}, f2_phases()
 
 
 if __name__ == "__main__":

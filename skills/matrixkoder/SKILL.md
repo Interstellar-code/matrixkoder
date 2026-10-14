@@ -50,7 +50,8 @@ Checked against `--help`. `S=${CLAUDE_PLUGIN_ROOT}/scripts`; mk-state and mk-lan
 | Start a run | `python3 $S/mk-state.py run init --id <R> --plan <plan path> [--branch <integration>]` |
 | Link an old run to its plan | `python3 $S/mk-state.py run set --id <R> --plan-id <plan id>` |
 | Stage / next action | `mk-state.py run stage --id <R> <n>`; `run set --id <R> --next "<text>"` |
-| Add a task | `mk-state.py task add --id <T> --title "<t>" --wave <n> --deps <a,b> --owned <paths> [--parent <P>]` |
+| Add a task | `mk-state.py task add --id <T> --title "<t>" --wave <n> --deps <a,b> --owned <paths> [--parent <P> [--followup]]` |
+| Move a task | `mk-state.py task set <T> parent=<P>` — `parent=` (empty) makes it a root again |
 | Set task fields | `mk-state.py task set <T> status=building model=<m> effort=<e> --note "<why>"` — `key=value` pairs, never `--status` |
 | Read a task | `mk-state.py task get <T>` |
 | New brief round | `mk-state.py task round <T> [--kind fix --cause "<c>"]` → returns the `brief-rN.md` path |
@@ -71,7 +72,7 @@ Checked against `--help`. `S=${CLAUDE_PLUGIN_ROOT}/scripts`; mk-state and mk-lan
 ### Traps
 
 - `mk-bus.py answer` takes `msg_id` and `text` as positional arguments, not flags.
-- `task add --parent <P>` is refused when P is already merged. Add a new top-level task and give it subtasks instead.
+- `task add --parent <P>` is refused when P is already merged; add `--followup` to land a follow-up there anyway (P rolls back to `building`). To move a task that already exists, use `task set <T> parent=<P>` (`parent=` makes it a root).
 - herdr agent names cannot contain a dot. If a prompt by agent name prints nothing, prompt by pane id (`w9:pA`).
 - AGY has only the ids `agy models` lists. Never guess a model name.
 - For long test runs, start `lane-watch.py` with `--stall-min 40`. A long read otherwise shows as STALL.
