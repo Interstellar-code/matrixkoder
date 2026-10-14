@@ -91,6 +91,12 @@ PROVIDER_POOL = {
     "opencode": "zen",
 }
 
+# CodexBar `pi` is an estimated local counter (every window null), not a 5h/weekly limit. It must
+# never be polled into an agent ledger entry: a null-window payload has no used_pct to report, and
+# treating it as one turns "no local data" into a phantom exhausted window. omp limits belong to the
+# picked model's provider, and real hits come from pane text (lane-health).
+SKIP_PROVIDERS = ("pi",)
+
 EXHAUSTED_FIELDS = (
     "exhausted_until",
     "exhausted_window",
@@ -312,6 +318,12 @@ def normalize_provider_entry(provider, raw_result_or_json, existing_entry=None, 
 
     agent_key = PROVIDER_MAP.get(provider, provider)
     provider_pool = PROVIDER_POOL.get(provider)
+
+    # A skipped provider's payload is not a limit source at all: the estimated local `pi` counter
+    # has every window null, so normalising it would publish a fake ok/no-window entry where the
+    # router expects one entry per agent. It becomes omp's unknown entry instead.
+    if provider in SKIP_PROVIDERS:
+        return omp_entry(existing_entry)
 
     raw_error = None
     is_timeout = False
@@ -636,13 +648,32 @@ def merge_opencode_entries(entries):
     return merged
 
 
+def omp_entry(existing=None):
+    """omp's usage ledger entry: unknown with the reason, never a poll.
+
+    omp has no subscription window of its own — CodexBar's `pi` payload is an estimated local
+    counter with every window null. Limits belong to the picked model's provider, so the router
+    reads `state: unknown`, not a percentage. A lane-health pane-text mark (`exhausted_*`, from a
+    QUOTA/PROVIDER line) is the only evidence that can make omp unavailable, and it survives here.
+    """
+    entry = {
+        "state": "unknown",
+        "reason": "no subscription; limits belong to the picked model's provider",
+    }
+    for k in EXHAUSTED_FIELDS:
+        if existing and k in existing:
+            entry[k] = existing[k]
+    return entry
+
+
 def poll_and_update(providers, out_path, now=None):
     now = now or datetime.datetime.now().astimezone()
 
     # Every CodexBar fetch first, outside the lock: it is a slow external call, and holding an
     # exclusive lock across it would make every other writer (a lane-health quota mark) queue behind
     # the network. Nothing below depends on the fetch order, so this is the same read-modify-write.
-    raw = [(pid, run_codexbar_provider(pid, timeout=60)) for pid in providers]
+    polled = [pid for pid in providers if pid not in SKIP_PROVIDERS]
+    raw = [(pid, run_codexbar_provider(pid, timeout=60)) for pid in polled]
 
     with usage_lock():
         ledger_data = load_ledger(out_path)
@@ -689,6 +720,7 @@ def poll_and_update(providers, out_path, now=None):
                 error_agents.append("opencode")
 
         ledger_data["updated_at"] = now.isoformat(timespec="seconds")
+        agents["omp"] = omp_entry(agents.get("omp"))
         ledger_data["agents"] = agents
 
         atomic_write_ledger(out_path, ledger_data)
@@ -1286,6 +1318,60 @@ def self_test_body():
                 watch_proc.wait(timeout=5)
     finally:
         shutil.rmtree(c3_dir, ignore_errors=True)
+
+    # 14. omp is never a polled CodexBar provider. CodexBar's `pi` payload is an estimated local
+    # counter (primary/secondary/tertiary all null), not a 5h/weekly limit: a null-window payload
+    # normalised as a quota would either show a phantom limit or an ok/no-window entry the router
+    # reads as a real agent. Real omp limit hits come from pane text (lane-health), not codexbar.
+    pi_payload = {
+        "provider": "pi",
+        "source": "local",
+        "usage": {"dataConfidence": "estimated", "primary": None, "secondary": None, "tertiary": None},
+    }
+    pi_norm = normalize_provider_entry("pi", pi_payload)
+    assert pi_norm["state"] == "unknown", pi_norm
+    assert pi_norm.get("exhausted_until") is None, pi_norm
+    for limit_key in ("five_hour", "weekly", "windows", "available_pools"):
+        assert limit_key not in pi_norm, (limit_key, pi_norm)
+
+    # 14b. A poll that names pi never fetches it and still writes omp's unknown entry; a lane-health
+    # pane-text mark on omp survives that poll (the only real omp limit evidence).
+    omp_dir = tempfile.mkdtemp(prefix="mk-usage-omp-")
+    try:
+        omp_ledger = os.path.join(omp_dir, "usage.json")
+        omp_mark = {"exhausted_until": "2026-10-08T16:16:57+02:00",
+                    "exhausted_window": "5h", "exhausted_guess": False,
+                    "exhausted_source": "pane-text",
+                    "exhausted_observed_at": "2026-10-08T15:00:00+02:00",
+                    "exhausted_evidence": ["Usage limit reached"]}
+        json.dump({"agents": {"omp": omp_mark, "claude": {
+            "status": "ok", "source": "codexbar", "windows": [], "exhausted_until": None}}},
+            open(omp_ledger, "w"))
+        omp_polled = []
+
+        def fake_run_omp(provider, timeout=60):
+            omp_polled.append(provider)
+            return {"returncode": 0, "stdout": json.dumps([{"usage": {}}]),
+                    "stderr": "", "timeout": False}
+
+        mod.run_codexbar_provider = fake_run_omp
+        try:
+            summary = poll_and_update(["pi", "claude"], omp_ledger, now=ref_now_future)
+            assert omp_polled == ["claude"], omp_polled
+            assert "pi" not in summary["ok"] and "pi" not in summary["error"], summary
+            ledger = load_ledger(omp_ledger)
+            assert "pi" not in ledger["agents"], sorted(ledger["agents"])
+            omp = ledger["agents"]["omp"]
+            assert omp["state"] == "unknown", omp
+            assert omp["reason"] == "no subscription; limits belong to the picked model's provider", omp
+            for k, v in omp_mark.items():
+                assert omp[k] == v, (k, omp.get(k), v)
+            assert "five_hour" not in omp and "windows" not in omp, omp
+            assert ledger["agents"]["claude"]["status"] == "ok"
+        finally:
+            mod.run_codexbar_provider = real_run
+    finally:
+        shutil.rmtree(omp_dir, ignore_errors=True)
 
     print("mk-usage self-test ok")
 

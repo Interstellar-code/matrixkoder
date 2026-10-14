@@ -1,6 +1,6 @@
 # MatrixKoder
 
-MatrixKoder is a Claude Code plugin that runs a multi-phase build across several coding agents (Claude Code, Codex, OpenCode, AGY). Each agent works in its own herdr pane and git worktree. You say "orchestrate …"; the `matrixkoder` skill plans the phases, routes each one to an agent that still has quota, writes briefs, dispatches, watches, verifies, reviews, fixes, merges, QAs and opens one PR. Run state is durable on disk, usage comes from CodexBar, and a dashboard pane docks beside your session.
+MatrixKoder is a Claude Code plugin that runs a multi-phase build across several coding agents (Claude Code, Codex, OpenCode, AGY, omp). Each agent works in its own herdr pane and git worktree. You say "orchestrate …"; the `matrixkoder` skill plans the phases, routes each one to an agent that still has quota, writes briefs, dispatches, watches, verifies, reviews, fixes, merges, QAs and opens one PR. Run state is durable on disk, usage comes from CodexBar, and a dashboard pane docks beside your session.
 
 ```
 ┌ MatrixKoder ───────────────────────┐
@@ -20,7 +20,7 @@ MatrixKoder is a Claude Code plugin that runs a multi-phase build across several
 - Claude Code with the fullscreen layout: `/tui fullscreen`
 - `herdr` (panes and worktrees), `git`, `python3`
 - CodexBar CLI (`codexbar`) for usage across agents
-- Optional: Jev MCP for routing and gates; builder CLIs `codex`, `opencode`, `agy`
+- Optional: Jev MCP for routing and gates; builder CLIs `codex`, `opencode`, `agy`, `omp`
 
 ## Install
 
