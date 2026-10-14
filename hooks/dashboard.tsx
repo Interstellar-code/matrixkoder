@@ -29,6 +29,7 @@ import type { PlanView } from './tabs/plan'
 import { PlansTab, planActionLine } from './tabs/plans'
 import type { PlansView } from './tabs/plans'
 import { planFromReply, plansErrorLine, plansFromReply } from './tabs/plans-map'
+import { PlanKanbanTab, planKanbanView } from './tabs/plankanban'
 import { SettingsTab } from './tabs/settings'
 import type { SettingsValue, SettingsView } from './tabs/settings'
 import {
@@ -865,43 +866,6 @@ function planDetailViewOf(view: Record<string, string>, id: string): PlanView | 
   return planFromReply(parsed)
 }
 
-/** A task row from `plans <id>` onto a KanbanCard. Fields the task has no
- *  source for stay at the type's empty value (project, type, col from status,
- *  attention, question, route, lane, gates, change_no). */
-const STATUS_COL: Record<string, string> = {
-  planned: 'Backlog', routed: 'Ready', ready: 'Ready', dispatched: 'Ready',
-  building: 'Building', verifying: 'Verify', review: 'Review', fix: 'Fix', qa: 'Verify',
-  merged: 'Done', done: 'Done', blocked: 'Building', stalled: 'Building', quota: 'Building', provider: 'Building',
-}
-
-function tasksToCards(detail: PlanView, planId: string, runId: string): KanbanCard[] {
-  const cards: KanbanCard[] = []
-  for (const phase of detail.phases ?? []) {
-    for (const task of phase.rows) {
-      cards.push({
-        project: '',
-        run: runId !== '' ? runId : planId,
-        task: task.id,
-        parent: phase.id,
-        type: '',
-        title: task.title,
-        status: task.status,
-        col: STATUS_COL[task.status] ?? 'Backlog',
-        attention: 0,
-        question: null,
-        route_json: null,
-        lane: null,
-        round: null,
-        verdict: null,
-        gates: null,
-        updated: '',
-        change_no: 0,
-      })
-    }
-  }
-  return cards
-}
-
 export function PlanPane(els: Els, view: Record<string, string>, cols: number, ui: TabUi): RenderElement {
   const { Box, Text } = els
   if (view[PLANS_STORE_KEY] !== '1') return PlanTab(els, planView(), cols, ui)
@@ -930,18 +894,20 @@ export function PlanPane(els: Els, view: Record<string, string>, cols: number, u
     const detail = planDetailViewOf(view, sel)
     body = detail == null ? <Text>loading {sel}</Text> : PlanTab(els, detail, cols, ui)
   } else {
-    const detail = planDetailViewOf(view, sel)
-    const runId = plans.plans.find(p => p.id === sel)?.live_run ?? ''
-    const cards = detail == null ? [] : tasksToCards(detail, sel, runId)
-    const kv = kanbanView(cards, { needsYou: false, project: null, plan: sel }, new Date().toISOString())
-    body = detail == null ? <Text>loading {sel}</Text> : KanbanTab(els, kv, cols)
+    // V1.4: PlanKanbanTab from the raw `plans <id>` reply — kept raw because
+    // the mapped PlanView drops `verdict`, which the NEEDS YOU column reads.
+    let raw: unknown = null
+    if ((view[PLAN_DETAIL_FOR_KEY] ?? '') === sel) {
+      try { raw = JSON.parse(view[PLAN_DETAIL_KEY] ?? '') } catch { raw = null }
+    }
+    body = raw == null ? <Text>loading {sel}</Text> : PlanKanbanTab(els, planKanbanView(raw, new Date().toISOString()), cols, ui)
   }
   return (
     <Box flexDirection="column" gap={1}>
       <Box flexDirection="row" gap={1}>
         {PLAN_SUBS.map(name => Segment(els, {
           key: `plan-sub-${name}`,
-          label: name === 'list' ? 'List' : name === 'detail' ? 'Detail' : 'Kanban',
+          label: name === 'list' ? 'List' : name === 'detail' ? 'Detail' : sub === 'kanban' && sel !== '' ? `Kanban · ${sel}` : 'Kanban',
           on: sub === name,
           onPress: () => { ui.set('plan:sub', name) },
         }))}

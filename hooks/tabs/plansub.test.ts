@@ -1,5 +1,6 @@
-// Plan sub-tab wiring (settings-plans-db, V1.3): the Segment row, selection
-// across sub-tabs, file mode (no store → today's Plan tab), and action submit.
+// Plan sub-tab wiring (settings-plans-db, V1.3 + V1.4): the Segment row,
+// selection across sub-tabs, file mode (no store → today's Plan tab), action
+// submit, and the Kanban sub-tab's PlanKanbanTab mount.
 import { test, expect } from 'claude-code/testing'
 import type { BoxProps, ElementChildren, Elements, RenderChildren, RenderElement, RenderNode, TextProps } from 'claude-code'
 import { PlanPane, planSubOf, readPlans, selectedPlanId } from '../dashboard'
@@ -116,6 +117,27 @@ test('open switches to detail; another action submits planActionLine once', () =
   expect(submitted).toEqual([])
   press(PlanPane(stubEls, view, 80, handle), 'plans-pause-alpha')
   expect(submitted).toEqual([planActionLine('pause', 'alpha')])
+})
+
+test('store mode: the Kanban sub-tab renders PlanKanbanTab (four columns, no KanbanTab list)', () => {
+  const ui = new Map<string, string>()
+  const view: Record<string, string> = {
+    'plans:store': '1', 'plans:list': LIST, 'plan:sub': 'kanban', 'plans:sel': 'alpha',
+    'plans:detail': DETAIL, 'plans:detail-for': 'alpha',
+  }
+  const drawn = PlanPane(stubEls, view, 80, { get: k => ui.get(k), set: (k, v) => { ui.set(k, v) } })
+  const text = allText(drawn)
+  expect(text).toContain('PLANNED')
+  expect(text).toContain('BUILDING')
+  expect(text).toContain('NEEDS YOU')
+  expect(text).toContain('ON MAIN')
+  expect(text).toContain('T1')
+  expect(text).not.toContain('Needs you off')
+  expect(text).toContain('1 tasks · this plan only · source mk.db')
+  // the active Segment carries the plan id (V1.4 spec 2)
+  const labels = nodesOf(drawn, 'Button').map(b => String(b.props?.label ?? ''))
+  expect(labels).toContain('Kanban · alpha')
+  expect(labels).toContain('all phases')
 })
 
 test('readPlans does not spawn when the store is missing', async () => {
