@@ -207,6 +207,13 @@ export const SETTINGS_SCHEMA = {
       "type": "num"
     },
     {
+      "default": "omp",
+      "editable": true,
+      "key": "lanes.default_agent",
+      "scope": "global",
+      "type": "text"
+    },
+    {
       "default": true,
       "editable": false,
       "key": "agents.opencode.available",
@@ -261,6 +268,20 @@ export const SETTINGS_SCHEMA = {
       "key": "agents.herdr.available",
       "scope": "agents",
       "type": "bool"
+    },
+    {
+      "default": true,
+      "editable": false,
+      "key": "agents.omp.available",
+      "scope": "agents",
+      "type": "bool"
+    },
+    {
+      "default": [],
+      "editable": true,
+      "key": "picks.omp",
+      "scope": "models",
+      "type": "list"
     },
     {
       "default": "not probed",

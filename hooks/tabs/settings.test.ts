@@ -314,7 +314,7 @@ test('Settings · Models: name-sorted rows, per-agent n/4 chips, pick-order numb
   const marks = nodesOf(drawn, 'Text')
     .map(t => (t.children ?? []).map(c => (typeof c === 'string' ? c : '')).join(''))
     .filter(t => /^ [1-4] $/.test(t))
-  expect([...marks].sort(), `the pick-order numbers: ${marks.join('|')}`).toEqual([' 1 ', ' 1 ', ' 2 ', ' 2 ', ' 3 ', ' 3 ', ' 4 '])
+  expect([...marks].sort(), `the pick-order numbers: ${marks.join('|')}`).toEqual([' 1 ', ' 1 ', ' 1 ', ' 2 ', ' 2 ', ' 3 ', ' 3 ', ' 4 '])
   // rows sorted by name (the departure: no ranks, no scores); long names are
   // clipped in the row, so each is sought by its shortest unique prefix
   const opencode = settingsView().agents.find(a => a.id === 'opencode')
@@ -338,6 +338,9 @@ test('Settings · Models: name-sorted rows, per-agent n/4 chips, pick-order numb
   expect(flat.includes('4 of 4 picked · untick one to swap'), 'the full card note at 46').toBe(true)
   // off agents (Codex, AGY) are dimmed out with the artboard's note
   expect(nodesOf(drawn, 'Text').filter(t => (t.children ?? []).join('') === 'agent off in Agents · not routed')).toHaveLength(2)
+  // omp's pool is the allow-list: one model, one pick
+  expect(flat.includes('manifest/auto'), 'the omp model').toBe(true)
+  expect(flat.includes(' 1/4 '), 'the omp count chip').toBe(true)
 
   // the 5th pick: opencode has 3 — a 4th lands, a 5th is refused
   press(drawn, 'set-model-opencode-opencode-go/claude-haiku-5-5')
@@ -360,6 +363,15 @@ test('Settings · Models: name-sorted rows, per-agent n/4 chips, pick-order numb
 })
 
 // ---------- About scope: read-only rows, version card, c check, what's new
+
+
+test('Settings · Models: an omp pick writes one picks.omp edit', () => {
+  const ui: FakeUi = new Map()
+  const drawn = draw(ui, 46, 'models')
+  press(drawn, 'set-model-omp-manifest/auto')
+  expect(ui.get('settings:edit:models.omp'), 'untick writes one edit').toBe(JSON.stringify([]))
+})
+
 
 test('Settings · About: read-only plugin options + helper probes, version card, c check, what\'s new, no danger row', () => {
   const ui: FakeUi = new Map()

@@ -55,6 +55,16 @@ export const SETTINGS_LIST_FIXTURE: readonly YamlFieldIn[] = [
     value: [], default: [], pool: [],
     help: "this agent's models in preference order", editable: true,
   },
+  {
+    key: 'lanes.default_agent', scope: 'global', label: 'Default lane agent', type: 'text',
+    value: 'omp', default: 'omp',
+    help: 'the agent a lane uses when no route is pinned', editable: true,
+  },
+  {
+    key: 'picks.omp', scope: 'models', label: 'omp model picks', type: 'list',
+    value: ['manifest/auto'], default: [], pool: ['manifest/auto'],
+    help: "this agent's models in preference order", editable: true,
+  },
 ]
 
 export const SETTINGS_FIXTURE: SettingsView = {
@@ -134,6 +144,7 @@ export const SETTINGS_FIXTURE: SettingsView = {
         { key: 'agents.herdr.available', scope: 'agents', label: 'herdr', type: 'bool', value: true, default: true, help: 'Panes and worktrees, not a builder.', editable: true },
         { key: 'agents.codex.available', scope: 'agents', label: 'Codex', type: 'bool', value: false, default: false, help: 'Never routed (user rule).', editable: true },
         { key: 'agents.agy.available', scope: 'agents', label: 'AGY', type: 'bool', value: false, default: false, help: 'Gemini models via the agy CLI.', editable: true },
+        { key: 'agents.omp.available', scope: 'agents', label: 'omp', type: 'bool', value: true, default: true, help: 'The pi agent. Model picks are the allow-list, not the full omp models table.', editable: true },
       ],
     },
     {
@@ -147,6 +158,7 @@ export const SETTINGS_FIXTURE: SettingsView = {
     {
       scope: 'child', title: 'builder sessions', right: 'lanes.child',
       rows: [
+        { key: 'lanes.default_agent', scope: 'child', label: 'Default lane agent', type: 'select', value: 'omp', default: 'omp', opts: [['omp', ''], ['opencode', ''], ['claude', ''], ['agy', '']], help: 'The agent a lane uses when no route is pinned.', editable: true },
         { key: 'session.fresh_session', scope: 'child', label: 'New round', type: 'seg', value: 'new', default: 'new', opts: [['new', 'new'], ['same', 'same']], help: 'Clear context per round; model stays.', editable: true },
         { key: 'session.todo_done_status', scope: 'child', label: 'Todo completed becomes', type: 'seg', value: 'verify', default: 'verify', opts: [['verify', 'verify'], ['done', 'done']], help: 'What a completed todo sets the task to.', editable: true },
         { key: 'session.selftest_jobs_total', scope: 'child', label: 'Self-test jobs', type: 'num', value: 3, default: 3, min: 1, max: 16, help: 'Parallel self-tests when MK_SELFTEST_JOBS is unset. Default is derived: max(1, round(cores/3)).', editable: true },
@@ -272,6 +284,12 @@ export const SETTINGS_FIXTURE: SettingsView = {
         { name: 'gpt-6.1-mini', note: 'sub' },
       ],
     },
+    {
+      id: 'omp', name: 'omp', provider: 'pi', off: false,
+      models: [
+        { name: 'manifest/auto', note: '' },
+      ],
+    },
   ],
   // the artboard's PICKS0: ordered, max 4 per agent
   picks: [
@@ -279,6 +297,7 @@ export const SETTINGS_FIXTURE: SettingsView = {
     { agent: 'claude', models: ['claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-opus-5-5', 'claude-fable-5-1'] },
     { agent: 'agy', models: [] },
     { agent: 'codex', models: [] },
+    { agent: 'omp', models: ['manifest/auto'] },
   ],
   about: {
     installed: '0.2.0',

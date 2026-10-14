@@ -257,7 +257,7 @@ test('W3.1 models: every option a picker shows is a model `set picks.<agent>` ac
   for (const card of view.agents) {
     expect(card.models.map(m => m.name)).toEqual(fixturePool(card.id))
   }
-  expect(view.agents.map(a => a.id)).toEqual(['opencode', 'claude', 'agy', 'codex'])
+  expect(view.agents.map(a => a.id)).toEqual(['opencode', 'claude', 'agy', 'codex', 'omp'])
   // the reported failure (2026-10-11): a model no pool lists is not offered, so `set` cannot
   // refuse it — the hard-coded catalogue offered exactly this one
   expect(fixturePool('opencode')).not.toContain('opencode/step-5-preview-free')
@@ -326,7 +326,7 @@ test('W3.1 models: only the agents the yaml has switched on draw a card', () => 
     globalDefaults: {},
     about: ABOUT,
   })
-  expect(view.agents.map(a => a.id)).toEqual(['opencode', 'claude', 'agy'])
+  expect(view.agents.map(a => a.id)).toEqual(['opencode', 'claude', 'agy', 'omp'])
   // an agent that is on is never labelled off beside it
   expect(view.agents.every(a => a.off === false)).toBe(true)
   expect(view.agents.find(a => a.id === 'agy')?.models.map(m => m.name)).toEqual(fixturePool('agy'))
@@ -334,7 +334,27 @@ test('W3.1 models: only the agents the yaml has switched on draw a card', () => 
   const noRows = buildSettingsView({
     fields: [...SETTINGS_LIST_FIXTURE], file: '', configRows: [], globalDefaults: {}, about: ABOUT,
   })
-  expect(noRows.agents.map(a => a.id)).toEqual(['opencode', 'claude', 'agy', 'codex'])
+  expect(noRows.agents.map(a => a.id)).toEqual(['opencode', 'claude', 'agy', 'codex', 'omp'])
+})
+
+
+test('O1: the omp card offers only the allow-list, and the default lane agent lists available agents', () => {
+  const view = buildSettingsView({
+    fields: [
+      ...SETTINGS_LIST_FIXTURE,
+      { key: 'agents.opencode.available', scope: 'agents', label: 'OpenCode', type: 'bool', value: true, default: true, help: '', editable: false },
+      { key: 'agents.claude.available', scope: 'agents', label: 'Claude Code', type: 'bool', value: true, default: true, help: '', editable: false },
+      { key: 'agents.agy.available', scope: 'agents', label: 'AGY', type: 'bool', value: false, default: false, help: '', editable: false },
+      { key: 'agents.omp.available', scope: 'agents', label: 'omp', type: 'bool', value: true, default: true, help: '', editable: false },
+      { key: 'lanes.default_agent', scope: 'global', label: 'Default lane agent', type: 'text', value: 'omp', default: 'omp', help: 'the agent a lane uses when no route is pinned', editable: true },
+    ],
+    file: '', configRows: [], globalDefaults: {}, about: ABOUT,
+  })
+  expect(view.agents.find(a => a.id === 'omp')?.models.map(m => m.name)).toEqual(['manifest/auto'])
+  expect(view.picks.find(p => p.agent === 'omp')?.models).toEqual(['manifest/auto'])
+  const row = view.groups.flatMap(g => g.rows).find(r => r.key === 'lanes.default_agent')
+  expect(row, 'the default lane agent row').toBeTruthy()
+  expect(row!.opts?.map(([v]) => v)).toEqual(['omp', 'opencode', 'claude'])
 })
 
 test('S3.2 about: version, latest tag, what is new, helpers fall back to not probed', () => {
