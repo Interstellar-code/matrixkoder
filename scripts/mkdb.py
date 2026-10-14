@@ -1109,9 +1109,8 @@ def import_history(home, project, run, *, run_row=None, tasks=(), events=(), art
                         continue
                     if c not in MERGE_KEEP:
                         continue
-                    if c in ("owned", "deps") and values[cols.index(c)] == "":
-                        keep_cols.append(c)  # the file view's "no list" rides as ""
-                    elif c in ("acceptance", "route_json", "type") and values[cols.index(c)] in (None, ""):
+                    # the file view's "no list" rides as ""; an omitted key reads as None
+                    if values[cols.index(c)] in (None, ""):
                         keep_cols.append(c)
                 assign = [f"{c}=excluded.{c}" for c in cols
                           if c not in ("run", "id") and c not in keep_cols]
@@ -2510,6 +2509,21 @@ def _import_keep_cols(home):
             _check(row["type"] == "phase", "type lost after a real acceptance")
             _check(con.execute("SELECT COUNT(*) c FROM tasks WHERE run='hist'").fetchone()["c"] == 2,
                    "the keep-case inserted a second row")
+            n_log = con.execute("SELECT MAX(change_no) c FROM change_log"
+                                " WHERE run='hist' AND task='t'").fetchone()["c"]
+        finally:
+            con.close()
+        # owned/deps OMITTED (None, not "") keep the stored lists too, and log no change
+        omitted = {k: v for k, v in fresh.items() if k not in ("owned", "deps")}
+        import_history(home, "keepcols", "hist", tasks=[omitted], data_dir=data)
+        con = open_project(home, data_dir=data)
+        try:
+            row = con.execute("SELECT * FROM tasks WHERE run='hist' AND id='t'").fetchone()
+            _check(row["owned"] == "scripts/b.py" and row["deps"] == "other",
+                   f"omitted owned/deps blanked: {row['owned']!r} {row['deps']!r}")
+            again = con.execute("SELECT MAX(change_no) c FROM change_log"
+                                " WHERE run='hist' AND task='t'").fetchone()["c"]
+            _check(again == n_log, f"an omitted owned/deps logged a change: {n_log} -> {again}")
         finally:
             con.close()
     finally:
