@@ -67,6 +67,11 @@ python3 ${CLAUDE_SKILL_DIR}/scripts/mk-builder.py connect
 
 It prints the brief, paged at about 24,000 chars, then the phase task list as lines `[<id>] title parallel=… deps=…`. Add one `[<id>] ` todo per task. Further pages: `read <id> --part n`. The last page acks. A reviewer pane has no bus brief: `connect` prints `# brief: none found`, which is expected; read the absolute review-brief path from your prompt, and skip `progress` when the lane's builder is already `done` (`illegal transition done -> working`).
 
+The brief comes from the project store when it has it (`connect` prints `store:brief-rN` as its
+source label) — plan storage-layout L6.2, contract C4. A project whose store is absent or does
+not know the run still reads the file view, and a bus-published `kind:brief` message is the last
+fallback. Nothing changes for a lane: `connect` prints the same brief either way.
+
 ## 2. progress, per task step
 
 1. You begin a step: `python3 ${CLAUDE_SKILL_DIR}/scripts/mk-builder.py progress <step>`

@@ -9,7 +9,12 @@ Stdlib only. One JSON line on stdout per invocation, like `scripts/mk-state.py:1
 the lane token on the last line for `done` and `blocked` (R26).
 
 `measure` (plan MB5.1) is the one orchestrator-side exception: read-only counters over a run's
-`events.jsonl` and `tasks/*/brief-r*.md` under a `<data>` root — no lane file is read or written.
+events and briefs under a `<data>` root — no lane file is read or written.
+
+Plan storage-layout L6.2 (contract C4): run state is read from the project DB where it has it —
+the `brief`, `review-brief` and other round artifacts of `connect`/`read`, and the briefs
+`measure` counts. A pre-migration project with no store (or a run the store does not know) still
+reads the file view, so the fallback stays.
 
 The bus client (plan BB) adds `ask`, `wait`, `inbox` and `ack` against `scripts/mk-bus.py`
 (`child-skills/mk-builder/reference/bus-contract.md`): the lane's coordinates come from
@@ -20,6 +25,9 @@ never a traceback.
 Plan D7 adds `connect`, `read`, `todo`, `commit` and `report` over the same bus (contracts C7,
 C8, C9, C12). With no project store (`<data>/mk.db` absent) or the bus down, those commands
 fall back to the lane status file, the report file and the brief copy, so a lane never stalls.
+
+The lane token path comes from mkpaths (`lane_token`); when that file is absent and a token is
+still at the pre-L6.1 `<home>/bus-lanes/<hash>.json`, that path is used instead (C7).
 """
 import argparse
 import contextlib
@@ -1113,10 +1121,33 @@ def false_stall(se, events):
 
 
 def brief_counts(data, run):
-    """Per task, each `brief-rN.md`'s lines (splitlines of the decoded bytes — equals `wc -l` on
-    the newline-terminated briefs mk-state writes) and bytes (the file's size, `wc -c`). Only
-    `brief-rN.md` counts: `task.json`, `review-brief-rN.md` and reports are not briefs. Rounds
-    sort numerically, so brief-r10 follows brief-r2."""
+    """Per task, each brief's lines (splitlines of the decoded bytes — equals `wc -l` on
+    the newline-terminated briefs mk-state writes) and bytes (the stored text's size, `wc -c`).
+    Only briefs count: `task.json`, `review-brief-rN.md` and reports are not briefs. Rounds
+    sort numerically, so brief-r10 follows brief-r2.
+    C4: the store's `brief` artifacts are the source when it has them; the task folders'
+    brief-rN.md files are the fallback for a pre-migration project."""
+    out = {}
+    if store_present(data):
+        try:
+            rows = store_rows(data,
+                              "SELECT task, round, text FROM artifacts WHERE run=? AND kind='brief'"
+                              " ORDER BY task, round, id", (run,))
+        except (OSError, sqlite3.Error):
+            rows = None
+        if rows:
+            for r in rows:
+                task = r.get("task")
+                if not task:
+                    continue
+                text = r.get("text") or ""
+                raw = text.encode("utf-8")
+                out.setdefault(task, {})[f"brief-r{int(r.get('round') or 0)}.md"] = {
+                    "lines": len(text.decode("utf-8", "replace").splitlines()),
+                    "bytes": len(raw)}
+            return {t: dict(sorted(v.items(),
+                                   key=lambda kv: (int(BRIEF_NAME_RE.match(kv[0]).group(1)), kv[0])))
+                    for t, v in out.items()}
     tasks_dir = _paths("tasks_dir", data, run)
     out = {}
     try:
@@ -1135,8 +1166,9 @@ def brief_counts(data, run):
             if not BRIEF_NAME_RE.match(fn):
                 continue
             with open(os.path.join(tasks_dir, name, fn), "rb") as f:
-                data = f.read()
-            briefs[fn] = {"lines": len(data.decode("utf-8", "replace").splitlines()), "bytes": len(data)}
+                blob = f.read()
+            briefs[fn] = {"lines": len(blob.decode("utf-8", "replace").splitlines()),
+                          "bytes": len(blob)}
         out[name] = dict(sorted(briefs.items(),
                                 key=lambda kv: (int(BRIEF_NAME_RE.match(kv[0]).group(1)), kv[0])))
     return out
@@ -2109,12 +2141,21 @@ def bus_token_path(lane):
     """ONE resolver for the lane token file (D6B moves it; this CLI must follow).
 
     Order: `MK_BUS_TOKEN_FILE` when set, else `<lane>/.matrixkoder-bus.json` when that
-    file exists (file mode), else `<home>/bus-lanes/<sha256(realpath(lane))>.json`.
+    file exists (file mode), else the mkpaths lane-token location.
     The hash and the home are the same ones `scripts/mk-bus.py` writes: realpath,
     full sha256, `$MK_BUS_DIR` or the MK home, or ~/.matrixkoder.
     The rule itself is mkpaths.lane_token (C6, L0): the same one mk-bus.py and
-    mk-lane-event.py use."""
-    return _paths("lane_token", lane)
+    mk-lane-event.py use.
+
+    L6.1 moves that file to <home>/bus/lanes/<hash>.json inside mkpaths. A lane token
+    written before the move is still at <home>/bus-lanes/<hash>.json, so a missing NEW
+    file falls back to the OLD one instead of leaving the lane busless (C7)."""
+    path = _paths("lane_token", lane)
+    if os.path.exists(path):
+        return path
+    base = _paths("bus_env_dir") or _paths("home")
+    old = os.path.join(os.path.abspath(os.path.expanduser(base)), "bus-lanes", lane_hash(lane) + ".json")
+    return old if old != path and os.path.exists(old) else path
 
 
 def bus_read_token_file(path):
@@ -2199,6 +2240,35 @@ def store_rows(data, sql, params=()):
         return [dict(r) for r in con.execute(sql, params)]
     finally:
         con.close()
+
+
+def store_artifacts(data, run, task, kind):
+    """Every (round, text) the project store holds for one artifact kind of one task, oldest
+    round first. None when the store does not know the RUN (no store, or a run nothing
+    imported) so the caller falls back to the file view; [] means the store knows the run and
+    holds no artifact of that kind. C4: the DB wins whenever it has the data."""
+    if not store_present(data):
+        return None
+    try:
+        if not store_rows(data, "SELECT id FROM runs WHERE id=?", (run,)):
+            return None
+        rows = store_rows(
+            data,
+            "SELECT round, text FROM artifacts WHERE run=? AND task=? AND kind=? ORDER BY round, id",
+            (run, task, kind))
+    except (OSError, sqlite3.Error):
+        return None
+    if rows is None:
+        return None
+    return [(int(r.get("round") or 0), r.get("text") or "") for r in rows]
+
+
+def newest_stored_artifact(data, run, task, kind):
+    """The newest NON-EMPTY (round, text) the store holds for that kind, or None."""
+    for n, text in reversed(store_artifacts(data, run, task, kind) or []):
+        if text.strip():
+            return n, text
+    return None
 
 
 def todo_done_status(data):
@@ -2400,10 +2470,45 @@ def brief_from_bus(lane, old):
     return (best, f"bus:brief-r{best_n}") if best else ("", "")
 
 
-def brief_text(lane, old):
-    """The brief this round was given. A lane file wins (file mode, unchanged); otherwise
-    the brief the orchestrator published on the bus."""
+def brief_from_store(lane, old, cfg, data):
+    """The brief this round was given, from the project DB. C4: the store's `brief` artifact
+    is the source; the bus messages and the lane file are the fallbacks. A report naming round
+    N asks for that round only. -> (text, label) or ("", "")."""
+    run = (cfg or {}).get("run") or (old or {}).get("run")
+    task = (cfg or {}).get("task") or (old or {}).get("task")
+    if not data or not run or not task:
+        return "", ""
+    got = newest_stored_artifact(data, run, task, "brief")
+    if not got:
+        return "", ""
+    n, text = got
+    report = (old or {}).get("report") or ""
+    m = re.search(r"-r(\d+)\.", os.path.basename(report)) if report else None
+    if m and int(m.group(1)) != n:
+        return "", ""
+    return text, f"store:brief-r{n}"
+
+
+def review_brief_from_store(cfg, data):
+    """The reviewer's brief from the project DB, else None. Its own artifact kind, so a
+    reviewer sharing the lane never picks up the builder's brief."""
+    run = (cfg or {}).get("run")
+    task = (cfg or {}).get("task")
+    if not data or not run or not task:
+        return None
+    return newest_stored_artifact(data, run, task, "review-brief")
+
+
+def brief_text(lane, old, cfg=None, data=None):
+    """The brief this round was given. A lane file wins (file mode, unchanged); then the
+    project DB's `brief` artifact (C4 — the source once the orchestrator publishes through
+    mk-state); then the brief message on the bus."""
     text, path = brief_from_files(lane, old)
+    if text:
+        return text, path
+    cfg = cfg if cfg is not None else bus_lane_config(lane)
+    data = data or resolve_data_dir(cfg)
+    text, path = brief_from_store(lane, old, cfg, data)
     if text:
         return text, path
     return brief_from_bus(lane, old)
@@ -2482,9 +2587,11 @@ def cmd_connect(a):
     if ROLE_ALIASES.get(getattr(a, "role", None) or "builder") == "reviewer":
         # a reviewer reads its own review brief from the bus and leaves the builder's status alone.
         # shortcut: printed whole, not paged — review briefs are a few KB; page it if one passes BRIEF_PAGE.
-        found = None
-        for text in brief_messages(cfg) if cfg else []:
-            found = parse_review_brief_message(text) or found
+        # C4: the store's review-brief artifact first, then the published bus message.
+        found = review_brief_from_store(cfg, data)
+        if not found:
+            for text in brief_messages(cfg) if cfg else []:
+                found = parse_review_brief_message(text) or found
         if not found:
             print("# review brief: none found")
             raise Handled(0)
@@ -2501,8 +2608,14 @@ def cmd_connect(a):
                     cfg.get("task")):
                 if parse_brief_message(text):
                     raw_brief = text
+        if not raw_brief:
+            # C4: no published message yet — the store's brief artifact names the round too.
+            stored, _label = brief_from_store(lane, None, cfg, data)
+            got = newest_stored_artifact(data or "", cfg.get("run") or "", cfg.get("task") or "",
+                                         "brief")
+            raw_brief = f"round:{got[0]}\nkind:brief\n{stored}" if got and stored else ""
         old = implicit_start(lane, cfg, raw_brief)
-    text, path = brief_text(lane, old)
+    text, path = brief_text(lane, old, cfg, data)
     if not text and not data and not brief_from_files(lane, old)[0]:
         raise Fail("connect: no data dir — pass --data <dir> or set MK_BUS_DATA, "
                    "or re-arm so the lane token file has a data field")
@@ -4542,6 +4655,239 @@ def t_d7b_connect_reads_the_bus_brief(root):
     code, lines = cli(lane, "connect")
     text = "\n".join(lines)
     assert "round two brief" in text and "review the thing" not in text, text
+
+
+
+def _mkdb_mod():
+    """The production mkdb module, loaded by path (the self-test never imports by name)."""
+    import importlib.util as _iu
+    spec = _iu.spec_from_file_location("mkdb_l62", os.path.join(os.path.dirname(MK_BUS_PY), "mkdb.py"))
+    mod = _iu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def t_l62_store_brief_and_review_brief(root):
+    """C4/L6.2 (a)+(b): connect prints the brief and the review brief straight out of the
+    project store when no file and no bus message exist; a task the store knows but holds no
+    artifact for falls back to the file view, and a store that does not know the run is not
+    asked at all."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data = os.path.join(root, "l62-data")
+    os.makedirs(data, exist_ok=True)
+    mod = d7_store(data, BUS_RUN, "L62")
+    bus_server(root, "l62")
+    lane = bus_lane(root, "l62_lane", "L62", data)
+    # (a) the brief lives only in the DB — no brief file, no published message
+    mod.put_artifact(None, None, BUS_RUN, "L62", 1, "brief",
+                     "# stored brief\nprove the DB path\n", data_dir=data)
+    mod.put_artifact(None, None, BUS_RUN, "L62", 1, "review-brief",
+                     "# stored review brief\nread both\n", data_dir=data)
+    assert newest_stored_artifact(data, BUS_RUN, "L62", "brief")[0] == 1
+    code, lines = cli(lane, "connect")
+    text = "\n".join(lines)
+    assert code == 0 and "prove the DB path" in text, (code, lines)
+    assert "store:brief-r1" in text, text
+    code, lines = cli(lane, "connect", "--role", "review")
+    text = "\n".join(lines)
+    assert code == 0 and "# review brief round 1" in text and "read both" in text, (code, lines)
+    # the builder's connect still never picks up the review brief
+    code, lines = cli(lane, "connect")
+    assert "read both" not in "\n".join(lines), lines
+    # (b) the file fallbacks stay. mk-builder's file views are the lane's own brief copy and
+    # bus.jsonl — a lane file still wins over both.
+    fb = bus_lane(root, "l62_fb_lane", "L62F", data)
+    begin(fb, root, run=BUS_RUN, task="L62F")
+    _con = mod.open_project(None, data_dir=data)
+    try:
+        mod.add_task(_con, BUS_RUN, "L62F", "task", title="fallback")
+    finally:
+        _con.close()
+    with open(os.path.join(fb, ".matrixkoder-brief-r1.md"), "w") as f:
+        f.write("# lane copy\nthe lane file answers\n")
+    code, lines = cli(fb, "connect")
+    text = "\n".join(lines)
+    assert code == 0 and "the lane file answers" in text and "store:" not in text, (code, lines)
+    os.unlink(os.path.join(fb, ".matrixkoder-brief-r1.md"))
+    # no store row, no lane file: a bus.jsonl message answers on a store-less project
+    plain = os.path.join(root, "l62-plain")
+    os.makedirs(os.path.join(plain, "runs", BUS_RUN), exist_ok=True)
+    with open(os.path.join(plain, "runs", BUS_RUN, "bus.jsonl"), "w") as f:
+        f.write(json.dumps({"t": "2026-10-15T09:00:00Z", "run": BUS_RUN, "task": "L62J",
+                            "type": "info", "text": "round:1\nkind:brief\n# jsonl brief\n"
+                                                    "the jsonl answers\n"}) + "\n")
+    assert not store_present(plain)
+    text, label = brief_from_store(None, {"run": BUS_RUN, "task": "L62J"},
+                                   {"run": BUS_RUN, "task": "L62J"}, plain)
+    assert text == "" and label == "", (text, label)
+    _bus_data = os.environ.pop("MK_BUS_DATA", None)  # the export would name the other project
+    try:
+        assert "the jsonl answers" in "\n".join(
+            brief_messages({"run": BUS_RUN, "task": "L62J", "data": plain})), "bus.jsonl fell back"
+    finally:
+        if _bus_data is not None:
+            os.environ["MK_BUS_DATA"] = _bus_data
+    # a run the store does not know, and a store that is not there at all, are both "no row"
+    assert store_artifacts(data, "nosuchrun", "L62F", "brief") is None
+    assert store_artifacts(os.path.join(root, "nostore"), BUS_RUN, "L62", "brief") is None
+    # the store beats a brief published on the bus for the same task (C4: the DB wins)
+    bus_cli("send", "--data", data, "--run", BUS_RUN, "--task", "L62F", "--kind", "info",
+            "--from", "orch", "--to", "L62F",
+            "--text", "round:1\nkind:brief\n# bus brief\nbus text\n")
+    mod.put_artifact(None, None, BUS_RUN, "L62F", 1, "brief",
+                     "# stored brief\nthe store answers\n", data_dir=data)
+    code, lines = cli(fb, "connect")
+    text = "\n".join(lines)
+    assert "the store answers" in text and "store:brief-r1" in text, (code, lines)
+    assert "bus text" not in text, ("the bus message must not win over the store", text)
+
+
+def t_l62_migrated_project_connect_round_trip(root):
+    """C4/L6.2 (d): on a project the REAL mk-migrate.py --switch has moved to the C2 tree,
+    connect/inbox/dispatch still work and the brief comes from the migrated store. Uses a
+    temp $HOME with MK_HOME/MATRIXKODER_HOME/MATRIXKODER_DATA unset, and no fixed sleeps."""
+    migrate = os.path.join(os.path.dirname(MK_BUS_PY), "mk-migrate.py")
+    if not (os.path.isfile(MK_BUS_PY) and os.path.isfile(migrate)):
+        return
+    repo = os.path.join(root, "l62mig-repo")
+    home = os.path.join(root, "l62mig-home")
+    os.makedirs(repo, exist_ok=True)
+    os.makedirs(home, exist_ok=True)
+    subprocess.run(["git", "init", "-q", repo], check=True, capture_output=True)
+    data = os.path.join(repo, ".matrixkoder")
+    run, task, slug = "r1", "L62M", "l62mig"
+    td = os.path.join(data, "runs", run, "tasks", task)
+    os.makedirs(td, exist_ok=True)
+    with open(os.path.join(data, "matrixkoder.yaml"), "w") as f:
+        f.write("data_dir: .matrixkoder/\n")
+    with open(os.path.join(data, "runs", run, "run.json"), "w") as f:
+        json.dump({"id": run, "feature": "F", "branch": "b", "status": "running",
+                   "tasks": [{"id": task, "type": "task", "title": "migrated",
+                              "status": "building"}]}, f)
+    with open(os.path.join(td, "task.json"), "w") as f:
+        json.dump({"id": task, "run": run, "title": "migrated", "status": "building"}, f)
+    with open(os.path.join(td, "brief-r1.md"), "w") as f:
+        f.write("# migrated brief\nthe store answers\n")
+    with open(os.path.join(td, "review-brief-r1.md"), "w") as f:
+        f.write("# migrated review brief\nreview the store\n")
+    mod = _mkdb_mod()
+    mod.import_history(home, None, run, run_row={"id": run, "status": "running"},
+                       tasks=[{"id": task, "type": "task", "title": "migrated", "status": "building"}],
+                       artifacts=[{"src": f"file:{run}:{task}:brief:1:l62", "task": task, "round": 1,
+                                   "kind": "brief", "rev": 1,
+                                   "text": "# migrated brief\nthe store answers\n",
+                                   "created": "2026-10-15T09:00:00+00:00"},
+                                  {"src": f"file:{run}:{task}:review-brief:1:l62", "task": task,
+                                   "round": 1, "kind": "review-brief", "rev": 1,
+                                   "text": "# migrated review brief\nreview the store\n",
+                                   "created": "2026-10-15T09:00:00+00:00"}],
+                       data_dir=data)
+    # the real migration, in its own temp home; every MK env var is pointed there or unset.
+    # TMPDIR travels with it: mkdb's C16 write guard (MK_SELFTEST=1) only allows the temp tree.
+    env = {"PATH": os.environ["PATH"], "HOME": home, "MK_SELFTEST": "1"}
+    for key in ("TMPDIR", "TEMP", "TMP"):
+        if os.environ.get(key):
+            env[key] = os.environ[key]
+    r = subprocess.run([sys.executable, migrate, "--switch", "--slug", slug, "--data", data,
+                        "--home", home, "--repo", repo],
+                       capture_output=True, text=True, env=env, timeout=180)
+    assert r.returncode == 0, (r.returncode, r.stdout[-2000:], r.stderr[-2000:])
+    new_db = os.path.join(home, "projects", slug, "mk.db")
+    assert os.path.isfile(new_db), new_db
+    # the root store the switch wrote, next to the C2 project folder
+    assert os.path.getsize(os.path.join(home, "mk.db")) > 0, "no root store"
+    saved = {k: os.environ.pop(k, None) for k in
+             ("MK_HOME", "MATRIXKODER_HOME", "MATRIXKODER_DATA", "MK_BUS_DIR")}
+    real_home = os.environ.get("HOME")
+    os.environ["HOME"] = home
+    try:
+        # the C2 project folder is the data dir a migrated project's readers get. Its store is
+        # the migrated one, and it answers the brief and the review brief with no file read.
+        c2 = os.path.join(home, "projects", slug)
+        assert _paths("project_db", data=c2) == new_db, _paths("project_db", data=c2)
+        assert store_present(c2), "the migrated project must resolve to its store"
+        assert newest_stored_artifact(c2, run, task, "brief")[1].startswith("# migrated brief")
+        text, label = brief_from_store(None, {"run": run, "task": task},
+                                       {"run": run, "task": task}, c2)
+        assert "the store answers" in text and label == "store:brief-r1", (text, label)
+        assert review_brief_from_store({"run": run, "task": task}, c2)[1].startswith(
+            "# migrated review brief")
+        # a lane on a project served by a real temp bus: connect → published brief → inbox.
+        # The brief the lane reads is the one the orchestrator sent on that bus (C7 over HTTP).
+        data_served = os.path.join(root, "l62mig-bus-data")
+        os.makedirs(data_served, exist_ok=True)
+        pin_home(root, "l62mig", data_served)
+        served, _pid, _port = bus_server(root, "l62mig")
+        lane = bus_lane(root, "l62mig_lane", task, served)
+        code, lines = cli(lane, "connect", env={"MK_BUS_DATA": served})
+        assert code == 0 and lines == ["# brief: none found"], (code, lines)
+        code, res = bus_cli("send", "--data", served, "--run", BUS_RUN, "--task", task,
+                            "--kind", "info", "--from", "orch", "--to", task,
+                            "--text", "round:1\nkind:brief\n# served brief\nhello lane\n")
+        assert code == 0 and res.get("ok"), res
+        code, lines = cli(lane, "connect", env={"MK_BUS_DATA": served})
+        text_out = "\n".join(lines)
+        assert code == 0 and "hello lane" in text_out, (code, lines)
+        bus_cli("send", "--data", served, "--run", BUS_RUN, "--task", task, "--kind", "info",
+                "--from", "orch", "--to", task, "--text", "ping the lane")
+        code, lines = cli(lane, "inbox", env={"MK_BUS_DATA": served})
+        assert code == 0 and any("ping the lane" in x for x in lines), (code, lines)
+        # the round really is live in the lane after the bus round trip
+        assert status(lane)["state"] == "started", status(lane)
+        cli(lane, "progress", "working", env={"MK_BUS_DATA": served})
+        assert status(lane)["state"] == "working", status(lane)
+    finally:
+        os.environ["HOME"] = real_home
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+
+
+def t_l62_token_path_old_layout_fallback(root):
+    """C4/C7/L6.2 (c): the token path comes from mkpaths, and a token still sitting at the OLD
+    <home>/bus-lanes/<hash>.json is found when the mkpaths location has no file — so a lane never
+    reads as busless across L6.1's move.
+
+    L6.1 has not moved the directory yet, so the new location is simulated here by pointing
+    mkpaths' own constant at `bus/lanes` for the length of the case (the module is loaded by
+    path and cached; the file on disk is untouched). That is what makes the fallback reachable
+    on today's tree, and it is exactly the state L6.1 leaves behind."""
+    lane = mklane(root, "l62_tok_lane")
+    base = os.path.abspath(os.path.expanduser(_paths("bus_env_dir") or _paths("home")))
+    digest = lane_hash(lane)
+    old = os.path.join(base, "bus-lanes", digest + ".json")
+    new = os.path.join(base, "bus", "lanes", digest + ".json")
+    os.makedirs(os.path.dirname(old), exist_ok=True)
+    os.makedirs(os.path.dirname(new), exist_ok=True)
+    with open(old, "w") as f:
+        json.dump({"v": 1, "url": "http://127.0.0.1:9", "token": "old"}, f)
+    os.chmod(old, 0o600)
+    mod = _mkpaths()
+    saved_dir = mod.BUS_LANES_DIR
+    try:
+        mod.BUS_LANES_DIR = os.path.join("bus", "lanes")   # L6.1's location, simulated
+        # no token at the mkpaths location yet: the resolver must fall back to the old one
+        assert not os.path.exists(new)
+        assert bus_token_path(lane) == old, (bus_token_path(lane), old)
+        cfg = bus_lane_config(lane)
+        assert cfg is not None and cfg["token"] == "old", (
+            "the lane read as busless while its token sat at the old path", cfg)
+        # the mkpaths location wins the moment a token is written there
+        with open(new, "w") as f:
+            json.dump({"v": 1, "url": "http://127.0.0.1:9", "token": "new"}, f)
+        os.chmod(new, 0o600)
+        assert bus_token_path(lane) == new, (bus_token_path(lane), new)
+        assert bus_lane_config(lane)["token"] == "new", bus_lane_config(lane)
+        os.unlink(new)
+        # today's layout is what the resolver answers when nothing has moved
+        mod.BUS_LANES_DIR = saved_dir
+        assert bus_token_path(lane) == old, (bus_token_path(lane), old)
+    finally:
+        mod.BUS_LANES_DIR = saved_dir
+        for path in (old, new):
+            if os.path.exists(path):
+                os.unlink(path)
 
 
 def t_g1_connect_posts_one_info(root):

@@ -76,7 +76,7 @@ to go idle and sends the prompt exactly as today. No armed watch kind, a kind wi
 --role review, or fresh_session: same: one prompt, no extra herdr call. The reply carries fresh_session (the
 command sent, or null).
 """
-import fcntl, shlex, hashlib, importlib.util, json, os, re, shutil, socket, subprocess, sys, tempfile, time
+import fcntl, hashlib, importlib.util, json, os, re, shlex, shutil, socket, sqlite3, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WATCH = ".matrixkoder-watch.json"
@@ -600,8 +600,67 @@ def lane_token_file(lane):
     <home>/bus-lanes/<sha256(realpath(lane))>.json. $MK_BUS_TOKEN_FILE overrides (tests).
     File mode still writes <lane>/.matrixkoder-bus.json; that path wins when the file is there,
     so a bus that has not moved the token keeps working.
-    The rule itself is mkpaths.lane_token (C6, L0): the same one mk-bus and mk-builder use."""
-    return mkpaths.lane_token(lane)
+    The rule itself is mkpaths.lane_token (C6, L0): the same one mk-bus and mk-builder use.
+
+    L6.1 moves the file to <home>/bus/lanes/<hash>.json inside mkpaths. Between L6.1 and this
+    caller's next token write the two layouts can both exist, so a missing NEW file falls back
+    to the OLD one instead of reporting the lane as busless (C7: the bus path never breaks)."""
+    path = mkpaths.lane_token(lane)
+    if os.path.exists(path):
+        return path
+    base = mkpaths.bus_env_dir() or mkpaths.home()
+    old = os.path.join(os.path.abspath(os.path.expanduser(base)), "bus-lanes",
+                       hashlib.sha256(os.path.realpath(lane).encode("utf-8")).hexdigest() + ".json")
+    return old if old != path and os.path.exists(old) else path
+
+
+def store_present(data):
+    """The self-hosting guard: the project store exists for this data dir (C4)."""
+    return bool(data) and os.path.isfile(mkpaths.project_db(data=data))
+
+
+def store_rows(data, sql, params=()):
+    """SELECT-only against the project store, read-only URI so this file can never write it.
+    None when there is no store (a pre-migration project keeps the file view as the truth),
+    [] when the store answers with no rows."""
+    if not store_present(data):
+        return None
+    uri = "file:" + mkpaths.project_db(data=data) + "?mode=ro"
+    con = sqlite3.connect(uri, uri=True, timeout=5)
+    con.row_factory = sqlite3.Row
+    try:
+        return [dict(r) for r in con.execute(sql, params)]
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+
+
+def store_artifact(data, run, task, kind):
+    """Every (round, text) the store holds for one artifact kind of one task, oldest round
+    first. None when the store does not have the RUN (no store, or a run nothing imported):
+    the caller then falls back to the file view. [] means the store knows the run and holds
+    no artifact of that kind."""
+    runs = store_rows(data, "SELECT id FROM runs WHERE id=?", (run,))
+    if not runs:
+        return None
+    rows = store_rows(
+        data,
+        "SELECT round, text FROM artifacts WHERE run=? AND task=? AND kind=? ORDER BY round, id",
+        (run, task, kind))
+    if rows is None:
+        return None
+    return [(int(r.get("round") or 0), r.get("text") or "") for r in rows]
+
+
+def newest_stored_artifact(data, run, task, kind):
+    """The newest NON-EMPTY (round, text) the store holds for that kind, or None. An empty
+    text never wins: the file view is checked next."""
+    got = store_artifact(data, run, task, kind)
+    for n, text in reversed(got or []):
+        if text.strip():
+            return n, text
+    return None
 
 
 def arm_bus(lane, task, run, data):
@@ -639,7 +698,13 @@ def watch_tasks(w):
 
 
 def child_ids(task, data, run):
-    """Stored ids of <task>'s children in <run>, [] when it has none or run state is unreadable."""
+    """Stored ids of <task>'s children in <run>, [] when it has none or run state is unreadable.
+    C4: the store's tasks rows are the source; run.json is the fallback for a project that
+    has not been imported (file mode) or whose store does not know the run."""
+    rows = store_rows(data, "SELECT id, parent FROM tasks WHERE run=?", (run,))
+    if rows is not None:
+        return [r.get("id") for r in rows if r.get("id")
+                and (r.get("parent") or "").lower() == str(task).lower()]
     try:
         with open(mkpaths.run_doc(data, run)) as f:
             tasks = json.load(f).get("tasks") or []
@@ -853,7 +918,12 @@ def bus_is_up(data):
 
 
 def brief_body_for(data, run, task):
-    """The brief the orchestrator would hand the lane: the newest brief-rN.md for the task."""
+    """The brief the orchestrator would hand the lane: the newest brief for the task.
+    C4: the store's `brief` artifact wins; the task folder's brief-rN.md is the fallback for
+    a pre-migration project or a round nothing stored yet."""
+    got = newest_stored_artifact(data, run, task, "brief")
+    if got:
+        return got[1], got[0]
     d = mkpaths.task_dir(data, run, task)
     best, best_n = None, -1
     try:
@@ -886,19 +956,25 @@ def publish_brief(data, run, task):
 
 
 def publish_review_brief(data, run, task):
-    """Send the task's newest review-brief-rN.md to the lane as `round:<n>\nkind:review-brief\n<body>`
-    (its own kind: the builder's connect never picks it up). Same send rules as publish_brief."""
-    d = mkpaths.task_dir(data, run, task)
-    best, best_n = None, -1
-    for name in (os.listdir(d) if os.path.isdir(d) else []):
-        m = re.fullmatch(r"review-brief-r(\d+)\.md", name)
-        if m and int(m.group(1)) > best_n:
-            best, best_n = os.path.join(d, name), int(m.group(1))
-    if not best:
-        return False, "no review brief"
-    with open(best) as f:
-        body = f"round:{best_n}\nkind:review-brief\n{f.read()}"
-    kind = "task" if os.path.isfile(mkpaths.project_db(data=data)) else "info"
+    """Send the task's newest review brief to the lane as `round:<n>\nkind:review-brief\n<body>`
+    (its own kind: the builder's connect never picks it up). Same send rules as publish_brief.
+    C4: the store's `review-brief` artifact wins; review-brief-rN.md in the task folder is the
+    fallback for a pre-migration project."""
+    got = newest_stored_artifact(data, run, task, "review-brief")
+    if got:
+        body = f"round:{got[0]}\nkind:review-brief\n{got[1]}"
+    else:
+        d = mkpaths.task_dir(data, run, task)
+        best, best_n = None, -1
+        for name in (os.listdir(d) if os.path.isdir(d) else []):
+            m = re.fullmatch(r"review-brief-r(\d+)\.md", name)
+            if m and int(m.group(1)) > best_n:
+                best, best_n = os.path.join(d, name), int(m.group(1))
+        if not best:
+            return False, "no review brief"
+        with open(best) as f:
+            body = f"round:{best_n}\nkind:review-brief\n{f.read()}"
+    kind = "task" if store_present(data) else "info"
     _j, err = run_bus(["send", "--data", data, "--run", run, "--task", task,
                        "--kind", kind, "--from", "orch", "--to", task, "--text", body])
     return err is None, err
@@ -1401,6 +1477,30 @@ def review_path_for(data, run, task):
     return best
 
 
+def review_body_for(data, run, task):
+    """The newest review for the task as (round, text, ref), or (None, None, None).
+
+    C4: the store's `review` artifact wins. `ref` names where the text came from — the task
+    folder's review-rN.md when a file exists (the brief cites it), else the DB location, so
+    the FIX section never points a lane at a file that was never written.
+    The lane's own .matrixkoder-review-rN.md is NOT consulted here: cmd_review_handoff copies
+    it into the task folder first, which lands it in the store on the next mk-state commit."""
+    got = newest_stored_artifact(data, run, task, "review")
+    if got:
+        n, text = got
+        path = review_path_for(data, run, task)
+        ref = path or f"project DB review artifact (round {n}, task {task})"
+        return n, text, ref
+    path = review_path_for(data, run, task)
+    if not path:
+        return None, None, None
+    n = review_round_of(path)
+    try:
+        return n, open(path).read(), path
+    except OSError:
+        return None, None, None
+
+
 def send_brief_over_bus(data, run, task, text, round_n):
     """The orchestrator sends the FIX brief to the builder. Store mode stores it as a
     brief artifact (connect reads that); file mode sends it as info. Never a lane-to-lane
@@ -1519,13 +1619,14 @@ def commands_block_of(text):
     return "\n".join(out).strip()
 
 
-def filled_brief(data, run, task, round_n, review_path, fix):
+def filled_brief(data, run, task, round_n, review_ref, fix, review_n=None):
     """A fix brief filled from the task, never the raw template.
 
     Repo, worktree, branch and sha come from the task's lane (git). Owned files come from
     the task. The commit subject, the report path and the test/rules lines are copied from
-    the previous round's brief when it has them. The FIX section cites the review file and
-    lists each finding.
+    the previous round's brief when it has them. The FIX section cites the review (`review_ref`,
+    a file path or the DB location) and lists each finding. `review_n` is the review's round
+    when `review_ref` is not a filename to parse.
     """
     rec = task_record(data, run, task)
     lane = rec.get("lane") or rec.get("workspace") or ""
@@ -1560,8 +1661,9 @@ def filled_brief(data, run, task, round_n, review_path, fix):
     if commit:
         rest = re.sub(r"^[a-z]+\([^)]*\):\s*", "", commit)
         commit = f"fix({task.lower()}): {rest}"
+    review_n = review_n if review_n is not None else review_round_of(review_ref)
     lines = [
-        f"# {task} — FIX round {round_n}: review R{review_round_of(review_path) or ''}",
+        f"# {task} — FIX round {round_n}: review R{review_n if review_n is not None else ''}",
         "",
         f"Repo: this folder (worktree `{lane or '(no lane recorded)'}`, branch `{branch or '(none)'}`, at `{sha or '(none)'}`).",
         f"Plan phase task `{task}`. History: `{data}/runs/{run}/tasks/{task}/` (read-only). Do ONLY these fixes.",
@@ -1570,7 +1672,7 @@ def filled_brief(data, run, task, round_n, review_path, fix):
         owned_txt or "(none recorded on the task)",
         "Do NOT touch: everything else.",
         "",
-        f"## FIX (review `{review_path}`)",
+        f"## FIX (review `{review_ref}`)",
         fix.strip(),
         "",
     ]
@@ -1630,11 +1732,25 @@ def cmd_review_handoff(a):
     min_sev = (opt(a, "--min", "LOW") or "LOW").upper()
     if min_sev not in SEV_RANK:
         fail("--min must be one of CRITICAL HIGH MEDIUM LOW")
-    path = opt(a, "--review") or review_path_for(data, run, task)
-    if not path or not os.path.isfile(path):
-        # the reviewer writes into its own lane; copy that back into the task folder
-        found = lane_review_for(data, run, task)
-        if found:
+    path = opt(a, "--review")
+    if path:
+        n = review_round_of(path)
+        if n is None:
+            fail("review file is not review-rN.md")
+        try:
+            text, ref = open(path).read(), path
+        except OSError as e:
+            fail(f"review unreadable: {e}")
+    else:
+        n, text, ref = review_body_for(data, run, task)
+        if text is None:
+            # the reviewer writes into its own lane; copy that back into the task folder
+            found = lane_review_for(data, run, task)
+            if not found:
+                lane = (task_record(data, run, task).get("lane") or "<lane>")
+                fail(f"no review file for {task}: looked in "
+                     f"{mkpaths.task_dir(data, run, task)} and "
+                     f"{lane}/.matrixkoder-review-rN.md")
             # the lane file is copied into the task folder under the plain name, and the
             # brief cites the copy so it survives a lane reset
             dest_dir = mkpaths.task_dir(data, run, task)
@@ -1643,18 +1759,11 @@ def cmd_review_handoff(a):
             path = os.path.join(dest_dir, f"review-r{n_found}.md")
             if not os.path.isfile(path):
                 shutil.copyfile(found, path)
-        else:
-            lane = (task_record(data, run, task).get("lane") or "<lane>")
-            fail(f"no review file for {task}: looked in "
-                 f"{mkpaths.task_dir(data, run, task)} and "
-                 f"{lane}/.matrixkoder-review-rN.md")
-    n = review_round_of(path)
-    if n is None:
-        fail("review file is not review-rN.md")
-    try:
-        text = open(path).read()
-    except OSError as e:
-        fail(f"review unreadable: {e}")
+            n, ref = n_found, path
+            try:
+                text = open(path).read()
+            except OSError as e:
+                fail(f"review unreadable: {e}")
     verdict = review_verdict(text)
     if verdict == "APPROVE":
         r = subprocess.run(
@@ -1679,7 +1788,7 @@ def cmd_review_handoff(a):
     pending = hold_path(data, run, task)
     if hold:
         # Record the pending handoff and nothing else: no round, no brief, no send.
-        blob = {"task": task, "run": run, "review": path, "round": n,
+        blob = {"task": task, "run": run, "review": ref, "round": n,
                 "min": min_sev, "cause": opt(a, "--cause", "verification gap")}
         try:
             os.makedirs(os.path.dirname(pending), exist_ok=True)
@@ -1711,7 +1820,7 @@ def cmd_review_handoff(a):
         return
     fix = render_fix_section(findings, min_sev)
     brief_path = opened.get("brief")
-    written = filled_brief(data, run, task, opened.get("round"), path, fix)
+    written = filled_brief(data, run, task, opened.get("round"), ref, fix, n)
     if brief_path:
         try:
             with open(brief_path, "w") as f:
@@ -3548,6 +3657,107 @@ def self_test():
         # an odd id is refused
         r = cli("review-handoff", "--task", "../x", "--run", "r1", "--data", data, code=2)
         assert r["ok"] is False, r
+
+        # --- C4/L6.2: briefs, review briefs, reviews and child ids come from the project DB,
+        # and the file view stays the fallback. Its own data dir, because the D7B.3 case above
+        # removed <data>/mk.db and the first `store enable` left a read-only runs-legacy there.
+        ddata = os.path.join(tmp, "dbdata")
+
+        def mkd(*args):
+            r = subprocess.run([sys.executable, MK, *args, "--data", ddata],
+                               capture_output=True, text=True)
+            assert r.returncode == 0, r.stdout + r.stderr
+
+        mkd("run", "init", "--id", "r1", "--feature", "DB", "--branch", "b")
+        mkd("task", "add", "--id", "DB", "--title", "db reads")
+        mkd("task", "add", "--id", "DB.1", "--title", "db child", "--parent", "DB")
+        mkd("store", "enable")
+        s_home = os.path.join(ddata, ".mk-home")   # mk-state's own store home for this data dir
+        assert sorted(child_ids("DB", ddata, "r1")) == ["DB.1"], child_ids("DB", ddata, "r1")
+        db_dir = os.path.join(ddata, "runs", "r1", "tasks", "DB")
+        os.makedirs(db_dir, exist_ok=True)
+        # (a) the brief and review brief are served from the DB with NO file on disk
+        _c = mkdb.open_project(s_home, "matrixkoder", data_dir=ddata)
+        try:
+            assert _c.execute("SELECT 1 FROM runs WHERE id='r1'").fetchone(), "no run r1 in the store"
+            mkdb.put_artifact(s_home, "matrixkoder", "r1", "DB", 1, "brief",
+                              "# DB brief\nfrom the store\n", data_dir=ddata)
+            mkdb.put_artifact(s_home, "matrixkoder", "r1", "DB", 1, "review-brief",
+                              "# DB review brief\nfrom the store\n", data_dir=ddata)
+        finally:
+            _c.close()
+        assert not os.path.exists(os.path.join(db_dir, "brief-r1.md")), "no file should exist yet"
+        got_text, got_n = brief_body_for(ddata, "r1", "DB")
+        assert got_n == 1 and "from the store" in got_text, (got_n, got_text)
+        open(bus_log, "w").write("")
+        ok, err = publish_review_brief(ddata, "r1", "DB")
+        assert ok and err is None and "DB review brief" in open(bus_log).read(), (ok, err)
+        # (b) the file fallback: a task the store knows but holds no brief for
+        open(os.path.join(db_dir, "brief-r1.md"), "w").write("# file brief\nfallback\n")
+        got_text, got_n = brief_body_for(ddata, "r1", "DB")
+        assert got_n == 1 and "from the store" in got_text, "the DB must still win"
+        mkd("task", "add", "--id", "FB", "--title", "fallback")
+        fb_dir = os.path.join(ddata, "runs", "r1", "tasks", "FB")
+        os.makedirs(fb_dir, exist_ok=True)
+        open(os.path.join(fb_dir, "brief-r2.md"), "w").write("# file brief only\n")
+        got_text, got_n = brief_body_for(ddata, "r1", "FB")
+        assert got_n == 2 and "file brief only" in got_text, (got_n, got_text)
+        # no store at all: the file view is the only truth (a pre-migration project)
+        _nod = os.path.join(tmp, "nostore")
+        shutil.copytree(os.path.join(ddata, "runs"), os.path.join(_nod, "runs"))
+        assert store_rows(_nod, "SELECT id FROM runs WHERE id=?", ("r1",)) is None
+        got_text, got_n = brief_body_for(_nod, "r1", "FB")
+        assert got_n == 2 and "file brief only" in got_text, (got_n, got_text)
+        # (c) the review is served from the DB, with the review round and no file
+        mkd("task", "round", "DB", "--kind", "build")
+        _c = mkdb.open_project(s_home, "matrixkoder", data_dir=ddata)
+        try:
+            mkdb.put_artifact(s_home, "matrixkoder", "r1", "DB", 1, "review",
+                              "# DB review — REQUEST CHANGES\n\n## HIGH\n"
+                              "- scripts/x.py:9 — leak — close it\n", data_dir=ddata)
+        finally:
+            _c.close()
+        assert not os.path.exists(os.path.join(db_dir, "review-r1.md"))
+        rn, rtext, rref = review_body_for(ddata, "r1", "DB")
+        assert rn == 1 and "scripts/x.py:9" in rtext and "project DB" in rref, (rn, rtext, rref)
+        # a full handoff off the DB review: the FIX brief cites the DB location, not a file
+        open(bus_log, "w").write("")
+        r = cli("review-handoff", "--task", "DB", "--run", "r1", "--data", ddata)
+        assert r["ok"] is True and r["dispatched"] is True and r["round"] == 2, r
+        got = open(r["brief"]).read()
+        assert "scripts/x.py:9" in got and "project DB" in got, got
+        assert "<PHASE>" not in got and "<path>" not in got, got
+        # (d) the token path: mkpaths decides, and a token still at the OLD <home>/bus-lanes
+        # path is found once L6.1 points mkpaths at bus/lanes. The move is simulated by setting
+        # mkpaths' own constant (the module is loaded by path; no file on disk changes).
+        lane_tok = os.path.join(tmp, "lane-token")
+        os.makedirs(lane_tok, exist_ok=True)
+        base = os.path.abspath(os.path.expanduser(mkpaths.bus_env_dir() or mkpaths.home()))
+        digest = hashlib.sha256(os.path.realpath(lane_tok).encode("utf-8")).hexdigest()
+        old_tok = os.path.join(base, "bus-lanes", digest + ".json")
+        new_tok = os.path.join(base, "bus", "lanes", digest + ".json")
+        os.makedirs(os.path.dirname(old_tok), exist_ok=True)
+        os.makedirs(os.path.dirname(new_tok), exist_ok=True)
+        with open(old_tok, "w") as f:
+            json.dump({"v": 1, "url": "http://127.0.0.1:9999", "token": "old"}, f)
+        saved_dir = mkpaths.BUS_LANES_DIR
+        try:
+            assert lane_token_file(lane_tok) == old_tok, (lane_token_file(lane_tok), old_tok)
+            mkpaths.BUS_LANES_DIR = os.path.join("bus", "lanes")
+            assert not os.path.exists(new_tok)
+            assert lane_token_file(lane_tok) == old_tok, (
+                "the old-layout token must still be found", lane_token_file(lane_tok), old_tok)
+            with open(new_tok, "w") as f:
+                json.dump({"v": 1, "url": "http://127.0.0.1:9998", "token": "new"}, f)
+            assert lane_token_file(lane_tok) == new_tok, (lane_token_file(lane_tok), new_tok)
+            os.unlink(new_tok)
+            mkpaths.BUS_LANES_DIR = saved_dir
+            assert lane_token_file(lane_tok) == old_tok, (lane_token_file(lane_tok), old_tok)
+        finally:
+            mkpaths.BUS_LANES_DIR = saved_dir
+            for path in (old_tok, new_tok):
+                if os.path.exists(path):
+                    os.unlink(path)
 
         srv.shutdown()
         srv.server_close()
