@@ -28,7 +28,7 @@ Test guidance (mk-store-r1; keep this short):
 - Types: `<typecheck cmd>` must stay at **<baseline>**; nothing new in <owned paths>
 - Lint/format ONLY changed files: `<lint cmd> <files>`, `<format cmd> <files>` — never repo-wide
 - Banned commands (repo list): <banned commands>
-- Start each finite check detached with its output in a file and the exit code appended (`cmd > out.txt 2>&1; echo EXIT:$? >> out.txt`), then in the SAME turn wait with a bounded loop (`until grep -q '^EXIT:' out.txt; do sleep 5; done; tail -n 5 out.txt`, upper bound 20 minutes; print a message if it expires) and never end a turn while a job you started is still running; read every result before committing, quote its last line, never start servers.
+- A check over ~2 min runs via `mk-builder.py check --name <n> -- <cmd>`: it starts detached, returns at once, and its result comes back to you as a typed line in your pane (and to the orchestrator over the bus); post progress, then end your turn or keep working, and resume when that line arrives (`mk-builder.py inbox`). Shorter checks: start each finite check detached with its output in a file and the exit code appended (`cmd > out.txt 2>&1; echo EXIT:$? >> out.txt`), then in the SAME turn wait with a bounded loop (`until grep -q '^EXIT:' out.txt; do sleep 5; done; tail -n 5 out.txt`, upper bound 20 minutes; print a message if it expires) and never end a turn while a job you started is still running; read every result before committing, quote its last line, never start servers.
 - Run the full suite once before DONE and quote its summary line (the `selftest: N run, M failed` line the repo's suite prints). A red full suite means the round is not done even if the scoped tests pass.
 
 ## Parallel parts (default ON)
@@ -38,6 +38,7 @@ Test guidance (mk-store-r1; keep this short):
 - Use the mk-builder skill (installed in this lane at `.claude/skills/mk-builder/`) — round R<n>. Every lane rule is the skill's (`reference/lane-rules.md` R1-R29); never restate one here. This brief carries only the per-brief values: the round number <n>, and the end-of-round token `<PHASE> R<n> DONE` (or `<PHASE> R<n> BLOCKED: <question>`) as the LAST line of your reply, alone on its line.
 - Commit: `<type(scope): message>` subject, blank line, `Co-Authored-By: <agent/model> <email>`.
 - Report: write the report to `<report path in this lane>`.
+- After each subtask and each test run, run `mk-builder.py todo done <id>` and post `mk-builder.py progress "<subtask>: <result>; tests <passed>/<failed>"` so the orchestrator sees progress without asking; reply to an orchestrator question the same way (a lane has no answer command).
 - No skill support in your runtime? Read `.claude/skills/mk-builder/SKILL.md` (in this lane) and follow it.
 
 ## TAKEOVER (only when another agent stopped mid-phase)

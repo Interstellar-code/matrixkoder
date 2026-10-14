@@ -365,6 +365,33 @@ def read_status(lane, armed):
     return st
 
 
+CHECK_HOLD_MAX_S = 4 * 3600  # a check older than this no longer holds DONE/STALL
+
+
+def check_hold(lane, state, ev):
+    """A check the lane started with `mk-builder.py check` and whose supervisor pid is alive keeps
+    the lane busy: no STALL and no DONE verdict. A dead pid (a crash that left no clear) counts as
+    finished, so a stall is never hidden forever. Reads the file directly: it needs no R27 acceptance."""
+    if state not in ("DONE", "STALL"):
+        return state, ev
+    try:
+        with open(os.path.join(lane, STATUS_FILE)) as f:
+            checks = json.load(f).get("checks")
+        for c in (checks or {}).values():
+            pid, started = c.get("pid"), c.get("started")
+            if isinstance(started, (int, float)) and time.time() - started > CHECK_HOLD_MAX_S:
+                continue  # over the cap: a recycled pid must not hold the lane forever
+            if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+                try:
+                    os.kill(pid, 0)
+                except (ProcessLookupError, PermissionError):
+                    continue  # gone, or not ours (a recycled pid)
+                return None, []
+    except (OSError, ValueError, AttributeError):
+        pass
+    return state, ev
+
+
 def status_activity(st, stall_min, armed):
     """R33/R34: an accepted working/subagent file whose updated_at is inside stall_min is activity
     for this poll — a writer that stops moving lets the clock run out. The comparison is in SECONDS
@@ -671,6 +698,7 @@ def watch(a):
         if not report_ok and store_report_ok(opt(a, "--data"), armed, report):
             report_ok = True  # the report artifact is in the store; the file is absent
         state, ev = decide(h, subj, rx, report_ok, h.get("text", ""), phase, stall_min, st, armed)
+        state, ev = check_hold(lane, state, ev)
         # pane pid: herdr status if present, else MK_PANE_PID (tests). No herdr call of our own.
         pane_pid = os.environ.get("MK_PANE_PID") or h.get("pane_pid")
         running, scale = child_progress(pane_pid)
@@ -770,6 +798,21 @@ def self_test():
     assert decide({**ok, "agent_status": "working", "last_change_min": 4}, good, rx, True, "", "P1", 10)[0] is None
     st, ev = decide({**ok, "last_change_min": 11}, good, rx, False, "", "P1", 10)
     assert st == "STALL" and "report" in ev[0] and "matching commit" not in ev[0]
+    # a live check holds DONE and STALL; a dead pid does not
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as _ck:
+        def _hold(pid):
+            with open(os.path.join(_ck, STATUS_FILE), "w") as f:
+                json.dump({"checks": {"c": {"pid": pid}}}, f)
+            return check_hold(_ck, "STALL", ["x"]), check_hold(_ck, "DONE", ["y"])
+        assert _hold(os.getpid()) == ((None, []), (None, []))
+        dead = subprocess.Popen([sys.executable, "-c", "pass"]); dead.wait()
+        assert _hold(dead.pid) == (("STALL", ["x"]), ("DONE", ["y"]))
+        with open(os.path.join(_ck, STATUS_FILE), "w") as f:
+            json.dump({"checks": {"c": {"pid": os.getpid(), "started": time.time() - CHECK_HOLD_MAX_S - 60}}}, f)
+        assert check_hold(_ck, "STALL", ["x"]) == ("STALL", ["x"])  # live pid, over the cap
+        assert check_hold(os.path.join(_ck, "nope"), "STALL", ["x"]) == ("STALL", ["x"])
+        assert check_hold(_ck, "BLOCKED", ["z"]) == ("BLOCKED", ["z"])
     # --no-commit (rx None, a reviewer pane): no commit to match — any subject is fine, no commit evidence
     assert decide(ok, other, None, True, "P1 DONE", "P1", 10) == ("DONE", ["P1 DONE", "source=pane"])
     assert decide(ok, other, None, True, "I will reply with P1 DONE", "P1", 10)[0] is None  # token still required

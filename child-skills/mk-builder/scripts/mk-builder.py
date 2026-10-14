@@ -240,6 +240,46 @@ def write_status(lane, obj):
     return path
 
 
+_HELD_LOCKS = set()
+
+
+@contextlib.contextmanager
+def status_lock(lane):
+    """Exclusive flock on a sibling `.lock` around a read-modify-write of the status file, so a
+    concurrent writer (progress, done, blocked, a check supervisor) is never reverted. LOCK_NB with
+    a retry up to BUS_LOCK_WAIT, the same shape as bus_advance_cursor; a held lock -> Fail."""
+    path = status_path(lane) + ".lock"
+    if path in _HELD_LOCKS:  # re-entrant: a locked cmd_* that calls status_block/set_check
+        yield
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as lf:
+        deadline = time.monotonic() + BUS_LOCK_WAIT
+        while True:
+            try:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise Fail(f"status file lock held {BUS_LOCK_WAIT:.0f}s")
+                time.sleep(0.05)
+        _HELD_LOCKS.add(path)
+        try:
+            yield
+        finally:
+            _HELD_LOCKS.discard(path)
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+
+def status_locked(fn):
+    """Run a cmd_* function (argparse namespace `a`) under status_lock of its lane."""
+    def wrapper(a):
+        with status_lock(lane_dir(a)):
+            return fn(a)
+    wrapper.__name__, wrapper.__doc__ = fn.__name__, fn.__doc__
+    return wrapper
+
+
 def stamp(obj):
     """R25: every accepted write bumps `seq` by exactly 1 and sets `updated_at` to the write
     time (R7: float epoch seconds, full precision)."""
@@ -322,6 +362,7 @@ def archive_other_rounds(lane, run, round_n, report):
 
 # ---------- commands ----------
 
+@status_locked
 def cmd_start(a):
     """R21/R22: a different (run, task, round, role) — or a `done` file — is an archive plus a
     fresh file; the same identity with a non-done state is a resume. The lane's round files of
@@ -353,6 +394,7 @@ def cmd_start(a):
              "role": role, "agent": agent, "file": status_path(lane)}, None)
 
 
+@status_locked
 def cmd_progress(a):
     """R13.1/R13.3/R13.5/R15 plain progress; R13.2/R15 `--subagent`, where a heartbeat in
     `subagent` bumps only `seq` and `updated_at` so the run's age stays readable (R9). BB: the
@@ -391,12 +433,120 @@ def post_progress(lane, step):
         bus_send(cfg, "info", f"progress: {text}")
 
 
+# ---------- check: a long command run detached, its result pushed over the bus ----------
+
+CHECK_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,40}$")
+
+
+def check_out_path(lane, name):
+    return os.path.join(lane, f".matrixkoder-check-{name}.out")
+
+
+def set_check(lane, name, entry):
+    """Add (entry dict) or clear (None) one running check in the status file's `checks` map.
+    Under status_lock, so it never reverts a concurrent done/blocked write."""
+    with status_lock(lane):
+        old = read_status(lane)
+        if old is None:
+            return
+        checks = dict(old.get("checks") or {})
+        if entry is None:
+            checks.pop(name, None)
+        else:
+            checks[name] = entry
+        write_status(lane, stamp(dict(old, checks=checks)))
+
+
+def cmd_check(a):
+    """`check [--name N] -- <cmd...>`: start <cmd> detached in the lane (new session, output in
+    .matrixkoder-check-N.out), record it in the status file, tell the bus, and return at once.
+    A detached supervisor (`_check-run`) appends EXIT:<code> and pushes the result."""
+    lane = lane_dir(a)
+    cmd = list(a.cmd or [])
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    name = a.name
+    if not CHECK_NAME_RE.match(name or ""):
+        raise Fail(f"check name must match {CHECK_NAME_RE.pattern}")
+    if not cmd:
+        raise Fail("check: no command; use `check --name <n> -- <cmd...>`")
+    load_live(lane)
+    out_path = check_out_path(lane, name)
+    proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), "_check-run", "--lane", lane,
+                             "--name", name, "--", *cmd], cwd=lane, start_new_session=True,
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    set_check(lane, name, {"pid": proc.pid, "started": time.time(), "out": out_path})
+    cfg = bus_lane_config(lane)
+    if cfg is not None:
+        with contextlib.suppress(BusDown, BusHttp, OSError, ValueError):
+            bus_send(cfg, "info", f"check {name} started")
+    return {"ok": True, "name": name, "pid": proc.pid, "out": out_path}, None
+
+
+def check_summary(out_path):
+    """Last non-blank output line before the EXIT line, 200 chars. Best effort."""
+    try:
+        with open(out_path, errors="replace") as f:
+            lines = [x.strip() for x in f.read().splitlines() if x.strip() and not x.startswith("EXIT:")]
+    except OSError:
+        return ""
+    return lines[-1][:200] if lines else ""
+
+
+def lane_pane(lane):
+    """The lane agent's pane from the watch file the orchestrator armed, else None."""
+    try:
+        with open(os.path.join(lane, ".matrixkoder-watch.json")) as f:
+            pane = json.load(f).get("pane")
+        return pane if isinstance(pane, str) and re.match(r"^[A-Za-z0-9_:.-]+$", pane) and not pane.startswith("-") else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def cmd_check_run(a):
+    """Hidden supervisor: run the command with output in the .out file, append `EXIT:<code>`,
+    clear the check from the status file, then push the result. The bus refuses a lane token that
+    sends `to` anyone but orch, so a bus ring of the lane itself is not possible: the result goes
+    to orch as an `info`, and the lane is woken by typing the same line into its own pane
+    (`herdr agent prompt`, pane from .matrixkoder-watch.json; $MK_BUILDER_HERDR overrides the
+    binary). Bus down or no pane: the out file and its EXIT line are the fallback (C12)."""
+    lane, name = lane_dir(a), a.name
+    cmd = list(a.cmd or [])
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    out_path = check_out_path(lane, name)
+    with open(out_path, "w") as f:
+        try:
+            rc = subprocess.Popen(cmd, cwd=lane, stdin=subprocess.DEVNULL, stdout=f,
+                                  stderr=subprocess.STDOUT).wait()
+        except OSError as e:
+            f.write(f"{e}\n")
+            rc = 127
+    with open(out_path, "a") as f:
+        f.write(f"EXIT:{rc}\n")
+    with contextlib.suppress(Exception):
+        set_check(lane, name, None)
+    text = f"check {name} EXIT {rc}: {check_summary(out_path)}"
+    cfg = bus_lane_config(lane)
+    if cfg is not None:
+        with contextlib.suppress(BusDown, BusHttp, OSError, ValueError):
+            bus_send(cfg, "info", text)
+    pane = lane_pane(lane)
+    if pane:
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            subprocess.run([os.environ.get("MK_BUILDER_HERDR") or "herdr", "agent", "prompt", pane,
+                            f"{text} (full output: {out_path})"], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=10)
+    return {"ok": True, "exit": rc}, None
+
+
 def token_for(old, tail):
     """R26: the exact line `lane-watch.py:72-83` matches — `{task} R{round}` for a builder,
     `{task} REVIEW R{round}` for a reviewer."""
     return f"{old['task']} {'REVIEW ' if old.get('role') == 'reviewer' else ''}R{old['round']} {tail}"
 
 
+@status_locked
 def cmd_blocked(a):
     """R19: a non-empty question (whitespace-only is empty); R26 prints the token."""
     lane, old = lane_dir(a), load_live(lane_dir(a))
@@ -497,6 +647,7 @@ def running_lane_children(lane):
     return hits
 
 
+@status_locked
 def cmd_done(a):
     """R18: the report file at the lane root AND a readable HEAD; R20: final per identity, so the
     legality table refuses every second write. The report is checked first, so the error is
@@ -534,6 +685,7 @@ def cmd_done(a):
             token_for(obj, tail))
 
 
+@status_locked
 def cmd_review_done(a):
     """Reviewer lane: post the verdict, finding count and review file path as ONE bus message,
     then move the status file to done (the same legal transition as `done`) and print
@@ -565,6 +717,7 @@ def cmd_review_done(a):
             f"{old['task']} REVIEW R{old['round']} DONE")
 
 
+@status_locked
 def cmd_ctx(a):
     """R10: only an integer 0..100, and only this command ever writes `ctx_pct`."""
     lane, old = lane_dir(a), load_live(lane_dir(a))
@@ -576,6 +729,7 @@ def cmd_ctx(a):
     return ({"ok": True, "seq": obj["seq"], "ctx_pct": obj["ctx_pct"]}, None)
 
 
+@status_locked
 def cmd_phase_done(a):
     """R8: append-only, a phase id at most once per round; R17: only in `working`."""
     lane, old = lane_dir(a), load_live(lane_dir(a))
@@ -1396,10 +1550,11 @@ def status_block(lane, question):
     and subagent cleared), so MB3 reads BLOCKED and no STALL fires while the call waits.
     Best-effort: the bus round trip never dies on a refused status write."""
     try:
-        old = load_live(lane)
-        require_state(old, "blocked")
-        obj = dict(old, state="blocked", question=question, commit=None, subagent=None)
-        write_status(lane, stamp(obj))
+        with status_lock(lane):
+            old = load_live(lane)
+            require_state(old, "blocked")
+            obj = dict(old, state="blocked", question=question, commit=None, subagent=None)
+            write_status(lane, stamp(obj))
         return True
     except (Fail, OSError, ValueError):
         return False
@@ -1408,10 +1563,11 @@ def status_block(lane, question):
 def status_resume(lane):
     """The answer's write-back: `blocked -> working` (R13.5), the step kept. Best-effort."""
     try:
-        old = load_live(lane)
-        require_state(old, "progress")
-        obj = dict(old, state="working", question=None, subagent=None)
-        write_status(lane, stamp(obj))
+        with status_lock(lane):
+            old = load_live(lane)
+            require_state(old, "progress")
+            obj = dict(old, state="working", question=None, subagent=None)
+            write_status(lane, stamp(obj))
         return True
     except (Fail, OSError, ValueError):
         return False
@@ -2245,6 +2401,9 @@ def cmd_connect(a):
         lines.append(f"[{t['id']}] {t['title']} parallel={str(t['parallel']).lower()} deps={deps}")
     if not tasks:
         lines.append("# tasks: (none — no plan, or this phase has no tasks)")
+    else:
+        lines.append('# per task: mk-builder.py todo in_progress <id> when you start it; when it is done: '
+                     'mk-builder.py todo done <id>, then mk-builder.py progress "<id>: <result>; tests <passed>/<failed>"')
     print("\n".join(lines))
     # Once per connect (not per page; `read` posts nothing). Best effort: the brief is out.
     if cfg is not None:
@@ -2420,6 +2579,7 @@ def post_status(lane, old, state, note):
             "state_ignored": reply.get("state_ignored")}
 
 
+@status_locked
 def cmd_todo(a):
     """`todo done <id>` — the backup reporter (C7). `todo in_progress <id>` likewise.
     Both post a status; the bus dedupes by (task, state, round)."""
@@ -2566,6 +2726,12 @@ def build_parser():
     sp = lane_cmd("todo", cmd_todo, "backup todo reporter: todo in_progress|done <id> [C7]")
     sp.add_argument("which")
     sp.add_argument("task_id")
+    sp = lane_cmd("check", cmd_check, "run a long command detached; its result is pushed over the bus")
+    sp.add_argument("--name", default="check")
+    sp.add_argument("cmd", nargs=argparse.REMAINDER, help="-- <command...>")
+    sp = lane_cmd("_check-run", cmd_check_run, argparse.SUPPRESS)  # internal supervisor
+    sp.add_argument("--name", required=True)
+    sp.add_argument("cmd", nargs=argparse.REMAINDER)
     sp = lane_cmd("hook-install", cmd_hook_install, "install the todo hook outside the worktree [C8]")
     sp.add_argument("--agent", default=None)
     sp = lane_cmd("commit", cmd_commit_msg, "announce the commit sha on the bus [C7]")
@@ -4198,6 +4364,7 @@ def t_d7_connect_pages_and_tasks(root):
     assert "[D7.1] connect parallel=false deps=" in text, text[-500:]
     assert "[D7.2] ask parallel=true deps=D7.1" in text
     assert "read <id> --part 2" in text
+    assert "todo done <id>" in text and 'progress "<id>:' in text, text[-400:]
     code, lines = cli(lane, "read", "brief", "--part", "2")
     assert code == 0 and lines[0].startswith("# part 2/"), lines[:1]
 
@@ -5324,6 +5491,64 @@ def t_e1_progress_posts_info(root):
              if r.get("kind") == "info" and r.get("task") == "E1P" and (r.get("text") or "").startswith("progress:")]
     assert len(infos) == 1 and infos[0]["text"] == "progress: reading the spec", infos
     assert infos[0].get("from") == "E1P", infos[0]
+
+
+def t_status_lock_keeps_concurrent_write(root):
+    """set_check/clear running while another process writes `blocked` never loses either write."""
+    lane = os.path.join(root, "lock_lane")
+    os.makedirs(lane)
+    begin(lane, root, task="LK")
+    code = ("import sys,importlib.util as u;s=u.spec_from_file_location('m',%r);m=u.module_from_spec(s);"
+            "s.loader.exec_module(m);[m.set_check(%r,'c%%d'%%i,{'pid':1}) for i in range(25)]") % (os.path.abspath(__file__), lane)
+    p = subprocess.Popen([sys.executable, "-c", code])
+    n = 0
+    while p.poll() is None or n < 3:
+        cli(lane, "progress", "step %d" % n)
+        n += 1
+    c, _ = cli(lane, "blocked", "why")
+    assert p.wait() == 0 and c == 0
+    st = status(lane)
+    assert st["state"] == "blocked" and len(st["checks"]) == 25 and st["step"].startswith("step"), st
+
+
+def t_check_pushes_result(root):
+    """check returns at once; the out file gets EXIT:3; the bus gets `check n started` and
+    `check n EXIT 3: ok`; the status file's checks entry is cleared; the lane's pane is prompted."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data, _, _ = bus_server(root, "chk")
+    lane = bus_lane(root, "chk_lane", "CHK", data)
+    begin(lane, root, task="CHK")
+    fake = os.path.join(root, "chk-herdr")
+    with open(fake, "w") as f:
+        f.write("#!/bin/sh\necho \"$@\" >> \"$0.log\"\n")
+    os.chmod(fake, 0o755)
+    with open(os.path.join(lane, ".matrixkoder-watch.json"), "w") as f:
+        json.dump({"pane": "wX:p1"}, f)
+    t0 = time.time()
+    code, lines = cli_raw("check", "--lane", lane, "--name", "unit", "--", "sh", "-c",
+                          "sleep 1; echo ok; exit 3", env={"MK_BUILDER_HERDR": fake})
+    assert code == 0 and time.time() - t0 < 0.9, (code, lines, time.time() - t0)
+    out = jline(lines)
+    assert out["ok"] and out["out"].endswith(".matrixkoder-check-unit.out"), out
+    assert "unit" in (status(lane).get("checks") or {}), status(lane)  # running: recorded
+    end = time.time() + 20
+    while time.time() < end and "EXIT:" not in (open(out["out"]).read() if os.path.exists(out["out"]) else ""):
+        time.sleep(0.1)
+    assert open(out["out"]).read().splitlines()[-1] == "EXIT:3", open(out["out"]).read()
+    texts = []
+    while time.time() < end:
+        texts = [r.get("text") for r in bus_rows(data) if r.get("kind") == "info" and r.get("task") == "CHK"]
+        if "check unit EXIT 3: ok" in texts and not status(lane).get("checks"):
+            break
+        time.sleep(0.1)
+    assert "check unit started" in texts and "check unit EXIT 3: ok" in texts, texts
+    assert not status(lane).get("checks"), status(lane)
+    while time.time() < end and not os.path.exists(fake + ".log"):
+        time.sleep(0.1)
+    assert "agent prompt wX:p1 check unit EXIT 3: ok" in open(fake + ".log").read()
+    code, lines = cli_raw("check", "--lane", lane, "--name", "bad name", "--", "true")
+    assert code != 0, lines
 
 
 def t_e1_listen_then_inbox_acks_once(root):

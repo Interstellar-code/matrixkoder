@@ -239,7 +239,10 @@ checkable contract. Rules whose remainder stays per-brief say **(B)** and carry 
   lane-to-lane message passes the orchestrator.
   **Why:** a lane that messages another lane routes work the orchestrator owns (R1). **Check:**
   the lane transcript shows no send addressed to another lane.
-- **R31. (new)** Start each finite check detached with its output in a file and the exit code
+- **R31. (new)** A check over about 2 minutes runs as `mk-builder.py check --name <n> -- <cmd>`: it is
+  detached, returns at once, and pushes `check <n> EXIT <code>: <summary>` to the orchestrator and
+  into your pane when it ends; post progress and resume on that line instead of waiting in a loop.
+  Shorter checks: start each finite check detached with its output in a file and the exit code
   appended (`cmd > out.txt 2>&1; echo EXIT:$? >> out.txt`), then in the SAME turn wait with a
   bounded loop (`until grep -q '^EXIT:' out.txt; do sleep 5; done; tail -n 5 out.txt`, upper
   bound 20 minutes; print a message if it expires) and never end a turn while a job you started

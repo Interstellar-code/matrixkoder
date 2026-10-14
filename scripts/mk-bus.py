@@ -135,6 +135,8 @@ def store_mode(data_dir):
 
 RING_QUEUE_MAX = 100
 RING_MAX_AGE = 3600
+# Agent kinds that take typed input into a running turn (a ring needs no idle wait).
+STEER_KINDS_DEFAULT = frozenset({"claude", "codex"})
 PANE_RE = re.compile(r"^[A-Za-z0-9_:.-]+$")
 
 
@@ -517,6 +519,48 @@ def lane_status_word(text):
     return word if word in LANE_STATUS_WORDS else None
 
 
+# A lane message body may carry `todo in_progress|completed|done <id>` lines (mk-builder todo).
+# They move the lane's own subtasks, never another task.
+LANE_TODO_RE = re.compile(r"(?m)^[ \t]*todo[ \t]+(in_progress|completed|done)[ \t]+(\S+)[ \t]*$")
+_TODO_START_FROM = ("planned", "routed", "dispatched", "ready", "fix")
+
+
+def _is_descendant(store, run, tid, root):
+    """True when `tid` is a child, at any depth, of `root` in this run (parent chain, depth-capped)."""
+    cur = tid
+    for _ in range(20):
+        rows = store.store_select("SELECT parent FROM tasks WHERE run=? AND id=?", (run, cur))
+        cur = rows[0]["parent"] if rows else None
+        if not cur:
+            return False
+        if cur == root:
+            return True
+    return False
+
+
+def apply_lane_todos(store, run, task, text):
+    """Move the lane's subtasks named by `todo <state> <id>` lines -> (updated ids, ignored ids).
+    in_progress -> building; completed|done -> verifying (a lane never sets done; todo_done_status is ignored here). An id that is
+    not a descendant of the token's task is ignored: a lane never moves another task."""
+    updated, ignored = [], []
+    for state, tid in LANE_TODO_RE.findall(text or ""):
+        try:
+            ours = tid != task and _is_descendant(store, run, tid, task)
+        except Exception:
+            ours = False
+        if not ours:
+            ignored.append(tid)
+            continue
+        if state == "in_progress":
+            upd, _ = _store_move(store, run, tid, "building", f"bus todo {state}", allowed_from=_TODO_START_FROM)
+        else:
+            upd, _ = _store_move(store, run, tid, "verifying", f"bus todo {state}",
+                                 allowed_from=("building",))
+        if upd:
+            updated.append(tid)
+    return updated, ignored
+
+
 def matches_lane(msg, lane):
     if not lane or lane == "*":
         return True
@@ -834,7 +878,7 @@ class BusState:
         finally:
             os.close(fd)
 
-    def append_message(self, run, task, from_val, to_val, kind, text, reply_to, project=None):
+    def append_message(self, run, task, from_val, to_val, kind, text, reply_to, project=None, urgent=False):
         if not is_valid_id(run):
             raise Fail("invalid run id")
         if task and not is_valid_id(task):
@@ -887,7 +931,7 @@ class BusState:
             rstate["by_id"][msg_id] = msg
             rstate["cond"].notify_all()
             self.any_cond.notify_all()
-            ring = msg
+            ring = dict(msg, urgent=True) if urgent else msg
         if ring is not None:
             try:
                 self._maybe_ring(ring)
@@ -930,8 +974,17 @@ class BusState:
         A nudge, an info, or an answer with no waiter does. This only records
         the message in the ring queue and wakes the ring worker: every herdr
         call runs on that worker, so a slow herdr cannot block a request. The
-        worker types the fixed line only while herdr says the lane is idle; a
-        working lane stays queued. One ring per message id, recorded as an
+        worker types the fixed line when herdr says the lane is idle. A working
+        lane depends on the agent kind (`agent` in herdr's agent list):
+
+          kind                     working lane
+          claude, codex (STEER)    rung at once: typed input joins the running turn
+          opencode, agy, other     stays queued until idle
+          any kind, urgent message Esc (send-keys) first, then the doorbell
+
+        STEER kinds default to claude,codex; $MK_BUS_STEER_KINDS (comma list,
+        empty = none) overrides. `urgent` comes from `send --urgent`; Esc
+        interrupts the turn, so it is for real redirects only. One ring per message id, recorded as an
         event chan=bus kind=ring. With the bus down this method is never
         called, so nothing rings.
         """
@@ -1054,9 +1107,14 @@ class BusState:
         agent, pane = hit
         status = agent.get("agent_status")
         if status == "working":
-            still.append(msg)  # queue until idle
-            return
-        if status not in ("idle", "done"):
+            if msg.get("urgent"):
+                if not self._send_esc(pane):
+                    still.append(msg)  # Esc failed: stay queued rather than type into a busy turn
+                    return
+            elif not self._steers(agent):
+                still.append(msg)  # queue until idle
+                return
+        if status not in ("idle", "done", "working"):  # working only gets here when steered or urgent
             return  # unknown state: do not ring; herdr reports a finished turn as "done"
         with self._ring_lock:
             self.rung.add(msg["id"])
@@ -1075,6 +1133,25 @@ class BusState:
         if not final:
             still.append(msg)  # one retry on the next tick
         return
+
+    @staticmethod
+    def _steers(agent):
+        env = os.environ.get("MK_BUS_STEER_KINDS")
+        kinds = STEER_KINDS_DEFAULT if env is None else {k.strip() for k in env.split(",") if k.strip()}
+        return agent.get("agent") in kinds
+
+    def _send_esc(self, pane):
+        """Interrupt a working lane's turn: `herdr agent send-keys <pane> esc` (fake seam: $MK_BUS_HERDR). True on exit 0."""
+        if not pane or pane.startswith("-") or not PANE_RE.match(pane):
+            return False
+        fake = os.environ.get("MK_BUS_HERDR")
+        if not fake and shutil.which("herdr") is None:
+            return False
+        argv = [sys.executable, fake, "send-keys", pane, "esc"] if fake else ["herdr", "agent", "send-keys", pane, "esc"]
+        try:
+            return subprocess.run(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5).returncode == 0
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            return False
 
     def _lane_worktrees(self, run, project, task):
         """Every lane worktree path a token for (run, project, task) was minted for.
@@ -1926,6 +2003,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                     self.send_error_json(400, "text must be non-empty")
                     return
 
+                urgent = body.get("urgent", False)
+                if not isinstance(urgent, bool):
+                    self.send_error_json(400, "urgent must be a boolean")
+                    return
                 reply_to = body.get("reply_to")
                 if reply_to is not None and not isinstance(reply_to, str):
                     self.send_error_json(400, "reply_to must be a string or null")
@@ -2096,7 +2177,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     msg = bus.append_message(
                         run=run, task=task, from_val=from_val, to_val=to_val,
                         kind=kind, text=text, reply_to=reply_to,
-                        project=project,
+                        project=project, urgent=urgent,
                     )
                 except Fail as e:
                     # Transition already committed: the state change is the truth.
@@ -2151,16 +2232,23 @@ class RequestHandler(BaseHTTPRequestHandler):
                     if err and "only from blocked" in err:
                         err = None  # not blocked: nothing to undo, not a failure
                     self.send_json(200, {"ok": True, "message": msg, "state_updated": upd, "mk_state_error": err})
-                elif bus.use_store and kind == "task" and not is_orch and lane_status_word(text) and task:
+                elif bus.use_store and kind == "task" and not is_orch and task and (
+                        lane_status_word(text) or LANE_TODO_RE.search(text)):
                     # Todo 67: a lane `task` message "status in_progress|verify|done" moves its own
                     # task (the token fixes `task`) along the builder path; the message stays, so
                     # the dedupe key still reads it. Not a legal move -> 200 and state_ignored.
                     word = lane_status_word(text)
-                    to, from_ok = LANE_STATUS_WORDS[word]
-                    upd, why = _store_move(store, run, task, to, f"bus status {word}", allowed_from=from_ok)
-                    reply = {"ok": True, "message": msg, "state_updated": upd, "mk_state_error": None}
-                    if why:
-                        reply["state_ignored"] = why
+                    reply = {"ok": True, "message": msg}
+                    if word:
+                        to, from_ok = LANE_STATUS_WORDS[word]
+                        upd, why = _store_move(store, run, task, to, f"bus status {word}", allowed_from=from_ok)
+                        reply.update(state_updated=upd, mk_state_error=None)
+                        if why:
+                            reply["state_ignored"] = why
+                    if LANE_TODO_RE.search(text):
+                        reply["todo_updated"], ignored = apply_lane_todos(store, run, task, text)
+                        if ignored:
+                            reply["todo_ignored"] = ignored
                     self.send_json(200, reply)
                 else:
                     self.send_json(200, {"ok": True, "message": msg})
@@ -2743,6 +2831,8 @@ def cmd_send(args):
         "to": getattr(args, "to_recipient", None) or getattr(args, "task", None) or "orch",
         "reply_to": getattr(args, "reply_to", None)
     }
+    if getattr(args, "urgent", False):
+        payload["urgent"] = True
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/send",
         data=json.dumps(payload).encode("utf-8"),
@@ -3944,11 +4034,17 @@ def _store_self_test_body(mod):
             fh.write("        f.write(sys.argv[2] + ' ' + sys.argv[3] + chr(10))\n")
             fh.write("    print(json.dumps({'result': {'ok': True}}), flush=True)\n")
             fh.write("    sys.exit(0)\n")
+            fh.write("if len(sys.argv) > 1 and sys.argv[1] == 'send-keys':\n")
+            fh.write("    with open(log, 'a') as f:\n")
+            fh.write("        f.write(sys.argv[2] + ' ' + sys.argv[3] + chr(10))\n")
+            fh.write("    sys.exit(0)\n")
             fh.write("import os\n")
             fh.write("sf = sys.argv[0] + '.status'\n")
             fh.write("status = open(sf).read().strip() if os.path.exists(sf) else 'idle'\n")
+            fh.write("kf = sys.argv[0] + '.kind'\n")
+            fh.write("agent = {'agent': open(kf).read().strip()} if os.path.exists(kf) else {}\n")
             fh.write("print(json.dumps({'result': {'agents': [\n")
-            fh.write("    {'name': 'T1', 'agent_status': status, 'cwd': '/x/T1'}]}}))\n")
+            fh.write("    dict({'name': 'T1', 'agent_status': status, 'cwd': '/x/T1'}, **agent)]}}))\n")
         os.chmod(fake, 0o755)
 
         def write_status(text):
@@ -4080,6 +4176,63 @@ def _store_self_test_body(mod):
         pid2, port2 = spawn(data, "r1")
         time.sleep(0.5)
         assert inbox_count() == before4 + 1, open(fake + ".rang").read()
+
+        # Steer kinds: a working claude rings at once, a working opencode stays queued, an urgent
+        # message to a working opencode sends Esc and then rings, an empty steer list queues claude.
+        def rang_lines():
+            return open(fake + ".rang").read().splitlines() if os.path.isfile(fake + ".rang") else []
+
+        def wait_inbox(n, secs=3.0):
+            end = time.time() + secs
+            while time.time() < end and inbox_count() < n:
+                time.sleep(0.05)
+            return inbox_count()
+
+        def nudge(text, **extra):
+            return post(port2, remint(), dict({"run": "r1", "task": "T1", "kind": "nudge", "text": text,
+                                               "from": "orch", "to": "T1", "project": "proj"}, **extra))
+
+        write_status("idle")  # drain whatever earlier cases left queued
+        time.sleep(1.0)
+        with open(fake + ".kind", "w") as kf:
+            kf.write("claude")
+        write_status("working")
+        n0 = inbox_count()
+        assert nudge("steer claude")[0] == 200
+        assert wait_inbox(n0 + 1) == n0 + 1, rang_lines()
+        assert not any(l.endswith(" esc") for l in rang_lines()), rang_lines()
+        with open(fake + ".kind", "w") as kf:
+            kf.write("opencode")
+        assert nudge("queue opencode")[0] == 200
+        time.sleep(1.0)
+        assert inbox_count() == n0 + 1, rang_lines()
+        code_u, bad_u = nudge("bad urgent", urgent="yes")
+        assert code_u == 400 and "urgent" in bad_u.get("error", ""), (code_u, bad_u)
+        n_lines = len(rang_lines())
+        assert nudge("urgent opencode", urgent=True)[0] == 200
+        assert wait_inbox(n0 + 2) == n0 + 2, rang_lines()
+        new = rang_lines()[n_lines:]
+        assert new[0] == "T1 esc" and "inbox" in new[1], new
+        write_status("idle")  # the queued non-urgent message rings now
+        assert wait_inbox(n0 + 3) == n0 + 3, rang_lines()
+        kill(pid2)
+        os.environ["MK_BUS_STEER_KINDS"] = ""
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(os.path.join(home, "ring-queue.json"))
+        pid2, port2 = spawn(data, "r1")
+        with open(fake + ".kind", "w") as kf:
+            kf.write("claude")
+        write_status("working")
+        n1 = inbox_count()
+        assert nudge("claude, steer none")[0] == 200
+        time.sleep(1.0)
+        assert inbox_count() == n1, rang_lines()
+        write_status("idle")
+        assert wait_inbox(n1 + 1) == n1 + 1, rang_lines()
+        kill(pid2)
+        del os.environ["MK_BUS_STEER_KINDS"]
+        os.remove(fake + ".kind")
+        pid2, port2 = spawn(data, "r1")
 
         # FIX 4b: an explicit empty project slug is 403 and changes nothing.
         st = mod.open_project(data, data_dir=data)
@@ -5072,6 +5225,8 @@ def _lane_state_self_test(mod):
         try:
             for t in ("S1", "S2", "S3", "L1", "A1", "A2"):
                 mod.add_task(con, "r1", t, "task", title="e8 " + t)
+            for t, parent in (("S1a", "S1"), ("S1b", "S1a"), ("S1c", "S1"), ("S2x", "S2")):
+                mod.add_task(con, "r1", t, "task", title="e8 " + t, parent=parent)
         finally:
             con.close()
         proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), "serve", "--data", data, "--run", "r1"],
@@ -5122,6 +5277,21 @@ def _lane_state_self_test(mod):
         assert code == 200 and "state_updated" not in res and status_of("S1") == "building", res
         code, res = call(port, tok_s1, "/send", {"kind": "task", "task": "S2", "text": "status done\nround: 1\n"})
         assert code == 403 and status_of("S2") == "verifying", (code, res)
+
+        # Part 5: `todo <state> <id>` lines move the lane's own subtasks (any depth), never another task.
+        code, res = call(port, tok_s1, "/send", {"kind": "task", "text": "status in_progress\nround: 1\ntodo in_progress S1a\ntodo in_progress S1b"})
+        assert code == 200 and res.get("todo_updated") == ["S1a", "S1b"], res
+        assert status_of("S1a") == "building" and status_of("S1b") == "building", (status_of("S1a"), status_of("S1b"))
+        code, res = call(port, tok_s1, "/send", {"kind": "task", "text": "round: 1\ntodo done S1b\ntodo done S2x\ntodo done S2"})
+        assert code == 200 and res.get("todo_updated") == ["S1b"] and res.get("todo_ignored") == ["S2x", "S2"], res
+        assert status_of("S1b") == "verifying" and status_of("S2x") == "planned" and status_of("S2") == "verifying", (status_of("S1b"), status_of("S2x"))
+        with open(os.path.join(data, "matrixkoder.yaml"), "w") as yf:
+            yf.write("todo_done_status: done\n")  # a lane still stops at verifying
+        assert status_of("S1a") == "verifying", status_of("S1a")  # rolled up from its only child
+        code, res = call(port, tok_s1, "/send", {"kind": "task", "text": "todo done S1c"})  # never started: no move
+        assert code == 200 and res.get("todo_updated") == [] and status_of("S1c") == "planned", res
+        code, res = call(port, tok_s1, "/send", {"kind": "task", "text": "todo in_progress S1c\ntodo completed S1c"})
+        assert code == 200 and res.get("todo_updated") == ["S1c", "S1c"] and status_of("S1c") == "verifying", res
 
         # A late or stale lane word never overwrites a state the orchestrator moved on to, and
         # `done` from a lane never reaches done or merged (R2 HIGH).
@@ -6456,6 +6626,8 @@ def main():
     p_send.add_argument("--from", dest="from_sender", help="Sender identifier")
     p_send.add_argument("--to", dest="to_recipient", help="Recipient identifier")
     p_send.add_argument("--reply-to", dest="reply_to", help="Replied message id")
+    p_send.add_argument("--urgent", action="store_true",
+                        help="ring a working lane of any kind now: Esc interrupts its turn, then the doorbell")
     p_send.add_argument("--data", help="MatrixKoder data dir")
 
     p_ans = subparsers.add_parser("answer")

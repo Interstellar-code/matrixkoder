@@ -25,6 +25,7 @@ Checked against `--help`. `B=python3 ${CLAUDE_SKILL_DIR}/scripts/mk-builder.py` 
 | Reply to the orchestrator | `$B progress "<your reply>"` — posts `info progress: <text>` to orch on the bus |
 | Read orchestrator messages | `$B inbox` (acks each); `$B listen --timeout 5` between steps |
 | Mark one message read | `$B ack <msg id>` |
+| Long check (over ~2 min), push result | `$B check --name <n> -- <cmd>` — returns at once; the result arrives as a typed line in your pane |
 | Ask a blocking question | `$B ask "<question>"`; on `PENDING <id>` (exit 3) run `$B wait <id>` |
 | Blocked, bus down | `$B blocked "<question>"`, then stop |
 | Todo item state | `$B todo in_progress <id>` / `$B todo done <id>` |
@@ -71,6 +72,8 @@ It prints the brief, paged at about 24,000 chars, then the phase task list as li
 1. You begin a step: `python3 ${CLAUDE_SKILL_DIR}/scripts/mk-builder.py progress <step>`
 2. You hand that step to a subagent: `python3 ${CLAUDE_SKILL_DIR}/scripts/mk-builder.py progress <step> --subagent`
 3. The subagent returned and you checked its files with `git status`: `python3 ${CLAUDE_SKILL_DIR}/scripts/mk-builder.py progress <step>` again
+
+After each subtask and each test run, run `todo done <id>` and post `progress "<subtask>: <result>; tests <passed>/<failed>"`; answer an orchestrator question the same way (lane has no answer command).
 
 (`ctx <pct>` exists for an agent that can report a context percentage; no agent is known to, so the field stays null.)
 
