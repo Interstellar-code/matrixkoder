@@ -319,8 +319,8 @@ def rows(lines):
         if isinstance(m.get("models"), list):
             pool = list(m.get("models") or [])
             if name == "omp":
-                # C1: the picker offers the allow-list, never the probed `omp models` table.
-                pool = list(OMP_MODEL_ALLOWLIST)
+                # C1: the picker offers the allow-list plus the user's yaml models, never the probed `omp models` table.
+                pool = list(dict.fromkeys(OMP_MODEL_ALLOWLIST + pool))
             out.append(_row(f"picks.{name}", "models", "list", [], [PICKS_SECTION], name, None,
                             f"{name} model picks", "this agent's models in preference order",
                             maxlen=4, pool=pool))
@@ -1715,6 +1715,13 @@ def self_test():
         pool = next(f for f in run("list", "--json")["fields"] if f["key"] == "picks.omp")
         assert pool["pool"] == ["manifest/auto"], pool
         assert "ollama-cloud" not in pool["pool"]
+        # a model the user added to agents.omp.models in the yaml stays in the picker (O1 review LOW)
+        text = rd().replace("  omp: { available: false, models: [manifest/auto] }",
+                            "  omp: { available: false, models: [manifest/auto, opencode-go/kimi-k3] }")
+        with open(yaml_path, "w") as f:
+            f.write(text)
+        pool = next(f for f in run("list", "--json")["fields"] if f["key"] == "picks.omp")
+        assert pool["pool"] == ["manifest/auto", "opencode-go/kimi-k3"], pool
 
         # 19. HIGH 1: every line migrate or set writes is a `key: value` (colon + space) or a bare
         # section header — a missing space parses as a string in a real YAML reader

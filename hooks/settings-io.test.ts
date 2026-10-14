@@ -346,6 +346,7 @@ test('O1: the omp card offers only the allow-list, and the default lane agent li
       { key: 'agents.claude.available', scope: 'agents', label: 'Claude Code', type: 'bool', value: true, default: true, help: '', editable: false },
       { key: 'agents.agy.available', scope: 'agents', label: 'AGY', type: 'bool', value: false, default: false, help: '', editable: false },
       { key: 'agents.omp.available', scope: 'agents', label: 'omp', type: 'bool', value: true, default: true, help: '', editable: false },
+      { key: 'agents.herdr.available', scope: 'agents', label: 'herdr', type: 'bool', value: true, default: true, help: '', editable: false },
       { key: 'lanes.default_agent', scope: 'global', label: 'Default lane agent', type: 'text', value: 'omp', default: 'omp', help: 'the agent a lane uses when no route is pinned', editable: true },
     ],
     file: '', configRows: [], globalDefaults: {}, about: ABOUT,
@@ -354,6 +355,7 @@ test('O1: the omp card offers only the allow-list, and the default lane agent li
   expect(view.picks.find(p => p.agent === 'omp')?.models).toEqual(['manifest/auto'])
   const row = view.groups.flatMap(g => g.rows).find(r => r.key === 'lanes.default_agent')
   expect(row, 'the default lane agent row').toBeTruthy()
+  expect(row!.type, 'a dropdown of agents, not a text box').toBe('select')
   expect(row!.opts?.map(([v]) => v)).toEqual(['omp', 'opencode', 'claude'])
 })
 

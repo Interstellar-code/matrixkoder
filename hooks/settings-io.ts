@@ -594,8 +594,9 @@ export function buildSettingsView(args: {
       const avail = fields
         .filter((a): a is YamlFieldIn & { key: string } => typeof a.key === 'string' && a.key.startsWith('agents.') && a.key.endsWith('.available') && a.value !== false)
         .map(a => a.key.slice('agents.'.length, -'.available'.length))
+        .filter(id => id !== 'herdr') // herdr runs the panes; it is not a coding agent
       const ids = [...new Set(['omp', ...avail])]
-      drawn = { ...row, opts: ids.map(id => [id, ''] as [string, string]) }
+      drawn = { ...row, type: 'select', opts: ids.map(id => [id, ''] as [string, string]) }
     }
     pushRow(scope, drawn)
   }
