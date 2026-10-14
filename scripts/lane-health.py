@@ -43,7 +43,12 @@ KINDS = ("claude", "codex", "opencode", "agy", "omp")
 QUOTA_RE = re.compile(r"\b(?:(?:usage|weekly|week|5-hour|5h|hourly|daily|session|plan|individual)\s+(?:limit|quota)\s+"
                       r"(?:reached|hit|exceeded)|(?:hit|reached)\s+your\s+(?:usage\s+|weekly\s+|5-hour\s+)?limit"
                       r"|quota\s+(?:reached|exceeded)|(?:free\s+)?usage\s+exceeded"
-                      r"|reached\s+your\s+pro\s+5-hour\s+limit)", re.I)
+                      r"|reached\s+your\s+pro\s+5-hour\s+limit"
+                      # omp banners (dist/cli.js, v18.10.4): the Claude subscription wall it notifies
+                      # with ("Claude session limit reached — continuing at low priority until …")
+                      # and its account-pool message ("all eligible accounts are quota-exhausted or
+                      # temporarily blocked"). Both name a limit or a quota, so they are walls.
+                      r"|session\s+limit\s+reached|all\s+eligible\s+accounts\s+are\s+quota-exhausted)", re.I)
 # Lines that are code, diffs, grep hits or tool views — an agent editing this very file prints quota words.
 # ponytail: heuristic; a real CLI message with a double quote or "==" in it would be ignored
 CODE_LINE_RE = re.compile(r"[\"`]|\b(?:assert|def|return|import)\b|re\.compile|==|\w\s*=\s*['(\[]|\(\s*'"
@@ -60,6 +65,10 @@ PROVIDER_TZ = datetime.timezone(datetime.timedelta(hours=8))
 GUESS_H = 5  # reset unknown → assume the 5h window, flagged exhausted_guess, so the agent is re-tried
 # Provider/account failures: the agent is up but every request fails — fail over like QUOTA.
 PROVIDER_RE = re.compile(r"(unsupported model|subscription is required|model service is temporarily unavailable|invalid api key|unauthori[sz]ed|insufficient (credit|balance))", re.I)
+# omp's own per-status provider errors (dist/cli.js Qku(), the OpenAI Responses API error map):
+# 401 "OpenAI API key was rejected (401)" and 402 "OpenAI API billing limit reached (402)" fail
+# every request on that account — a provider wall, so the lane fails over like QUOTA.
+PROVIDER_OMP_RE = re.compile(r"(openai api key was rejected|api billing limit reached)", re.I)
 # Only real command lines or dev-server output — not prose like "do not run pnpm dev".
 DEV_RE = re.compile(r"(?m)^\s*(?:\$|>|●\s*Bash\(|Bash\(|Running:?)\s*.{0,40}?\b(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?dev\b"
                     r"|\[hermes-agent\] Exited|ELIFECYCLE|VITE v\d+[.\d]* +ready|Local:\s+https?://localhost", re.I)
@@ -143,7 +152,7 @@ def last_change_min(lane, since=0.0):
 # reached" — _QUOTA_LEAD accepts only that one lead word), and a real banner whose line also
 # holds a double quote (CODE_LINE_RE). A mid-line "hit your limit" is NOT one of these: it is
 # anchored to the line start, so prose no longer reads as a wall.
-_QUOTA_LEAD = r"(?:(?:usage|weekly|week|5-hour|5h|hourly|daily|session|plan|individual)\s+(?:limit|quota)\s+(?:reached|hit|exceeded)|quota\s+(?:reached|exceeded)|(?:free\s+)?usage\s+exceeded)"
+_QUOTA_LEAD = r"(?:(?:usage|weekly|week|5-hour|5h|hourly|daily|session|plan|individual)\s+(?:limit|quota)\s+(?:reached|hit|exceeded)|quota\s+(?:reached|exceeded)|(?:free\s+)?usage\s+exceeded|all\s+eligible\s+accounts\s+are\s+quota-exhausted)"
 _QUOTA_FREE = r"^\W*(?:you(?:'ve|\s+have)?\s+)?(?:hit|reached)\s+your\s+(?:usage\s+|weekly\s+|5-hour\s+|pro\s+5-hour\s+)?limit"
 BANNER_RE = re.compile(
     r"(?i)(?:"
@@ -198,8 +207,12 @@ def banner_lines(text):
     lines = text.splitlines()[-TAIL_LINES:]
     out = []
     for i, ln in enumerate(lines):
-        # a JSON error object is the harness's own line, even though it holds quotes
+        # a JSON error object is the harness's own line, even though it holds quotes; so is one of
+        # omp's own per-status provider errors, which lead with the provider and carry "(401)"
         if re.match(r'\s*\{\s*"error"\s*:', ln) and PROVIDER_RE.search(ln):
+            out.append(ln)
+            continue
+        if PROVIDER_OMP_RE.search(ln) and not _tool_block(lines, i):
             out.append(ln)
             continue
         if _tool_block(lines, i) or TOOL_LINE_RE.search(ln):
@@ -217,7 +230,7 @@ def classify(text, status, idle_min, stall_min):
     hits = quota_hits(banner)
     if hits:
         return "QUOTA", hits[-2:]
-    prov = PROVIDER_RE.search(banner)
+    prov = PROVIDER_RE.search(banner) or PROVIDER_OMP_RE.search(banner)
     if prov:
         return "PROVIDER", [prov.group(0)]
     if status == "blocked":
@@ -474,6 +487,15 @@ def self_test_body(shutil):
                 "5-hour limit reached ∙ resets 3pm", "Weekly limit reached · resets Oct 13, 9am",
                 "Quota exceeded for model gemini-pro"):
         assert classify(msg, "idle", 1, 10)[0] == "QUOTA", msg
+    # O2.2: omp's own banners, quoted from @oh-my-pi/pi-coding-agent v18.10.4 dist/cli.js —
+    # the Claude subscription wall it notifies with, and its exhausted account pool.
+    for msg in ("Claude session limit reached — continuing at low priority until 4pm. "
+                "Your weekly limit still applies",
+                "all eligible accounts are quota-exhausted or temporarily blocked"):
+        assert classify(msg, "idle", 1, 10)[0] == "QUOTA", msg
+    # its per-status provider errors (Qku()): the account serves nothing, so PROVIDER
+    for msg in ("OpenAI API key was rejected (401)", "OpenAI API billing limit reached (402)"):
+        assert classify(msg, "working", 1, 10)[0] == "PROVIDER", msg
 
     # false positives (each matched the r1 regex): throttles, compaction, code / grep / diff text
     for msg in ("API Error: 429 rate limit exceeded, retrying in 5s", "Rate limit hit, backing off",

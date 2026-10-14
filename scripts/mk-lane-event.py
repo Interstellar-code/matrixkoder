@@ -71,8 +71,8 @@ replaced watch file). One JSON line per command.
 session.stall_min, else the mk-config schema default.
 dispatch --kind fix|takeover (a fix/takeover round; default build) with --role build on session.fresh_session: new
 (<data>/matrixkoder.yaml, else the schema default) first sends the pane's agent its new-session command — /new for
-an OpenCode lane, /clear for a Claude lane, from the armed watch's kind — then waits (bounded) for the pane to go
-idle and sends the prompt exactly as today. No armed watch kind, a kind without a known command, --kind build,
+an OpenCode or omp lane, /clear for a Claude lane, from the armed watch's kind — then waits (bounded) for the pane
+to go idle and sends the prompt exactly as today. No armed watch kind, a kind without a known command, --kind
 --role review, or fresh_session: same: one prompt, no extra herdr call. The reply carries fresh_session (the
 command sent, or null).
 """
@@ -89,7 +89,7 @@ FRESH_IDLE_POLL_S = float(os.environ.get("MK_FRESH_IDLE_POLL_S", "0.5"))
 # the doorbell wait is its own bound: a /new just before must finish before the line is typed
 DOORBELL_IDLE_WAIT_S = float(os.environ.get("MK_DOORBELL_IDLE_WAIT_S", "15"))
 DOORBELL_IDLE_POLL_S = float(os.environ.get("MK_DOORBELL_IDLE_POLL_S", "0.5"))
-FRESH_CMDS = {"opencode": "/new", "claude": "/clear"}
+FRESH_CMDS = {"opencode": "/new", "claude": "/clear", "omp": "/new"}
 
 sys.dont_write_bytecode = True  # no stray __pycache__ next to the scripts
 
@@ -528,8 +528,8 @@ def pane_state(pane):
 
 
 def fresh_session_cmd(kind):
-    """The new-session command for an agent kind: /new for OpenCode, /clear for Claude. None for a
-    kind with no known command (or no kind at all): that round keeps today's single-prompt
+    """The new-session command for an agent kind: /new for OpenCode and for omp, /clear for Claude.
+    None for a kind with no known command (or no kind at all): that round keeps today's single-prompt
     behaviour — guessing a slash command an agent does not support would be worse than skipping."""
     return FRESH_CMDS.get(kind or "")
 
@@ -2713,6 +2713,14 @@ def self_test():
         got = prompt_calls()[n0:]
         assert got[0] == f"agent prompt {pane_of('H8')} /new --wait --timeout 25000" and \
             got[1] == f"agent prompt {pane_of('H8')} take over --wait --timeout 25000", got
+        # an omp lane: its own /new before the text (same command, a different kind's agent)
+        patch_watch("H8", kind="omp")
+        n0 = len(prompt_calls())
+        r = cli("dispatch", "--pane", pane_of("H8"), "--text", "omp round", "--kind", "fix", extra=fnew)
+        assert r["ok"] is True and r["delivered"] is True and r["fresh_session"] == "/new", r
+        assert prompt_calls()[n0:] == [
+            f"agent prompt {pane_of('H8')} /new --wait --timeout 25000",
+            f"agent prompt {pane_of('H8')} omp round --wait --timeout 25000"], prompt_calls()[n0:]
         # a build round (the default kind): one prompt, exactly as today
         n0 = len(prompt_calls())
         r = cli("dispatch", "--pane", pane_of("H8"), "--text", "go build", extra=fnew)
