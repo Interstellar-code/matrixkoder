@@ -37,8 +37,14 @@
       again; warns when an owned glob overlaps an unmerged task in any active run
       (the new task's own --parent chain is not an overlap: a parent owns its children's globs)
   task set T key=value ... [--note TEXT] [--force]   keys: status agent model effort lane pane
-      branch workspace slot last_commit gates verdict reviewer parent (branch/workspace/slot are
-      written by mk-lane.py acquire; reviewer comes from the plan's phase or task set)
+      branch workspace slot last_commit gates verdict reviewer parent title acceptance owned deps refs
+      (branch/workspace/slot are written by mk-lane.py acquire; reviewer comes from the plan's phase
+      or task set; owned/deps/refs take comma lists, an empty value clears)
+      title/acceptance/owned/deps/refs may be edited only while the task is planned or routed: on a
+      started task the key is dropped (nothing written) and the reply carries a warning, exit 0 —
+      the same rule plan sync applies; each edited key writes one decision event with old and new
+      value plus the --note; deps are validated like task add (stored id case, a self-dep refused,
+      an unknown target warned)
       parent=P re-parents T (P must exist in this run and may not be T or anything below T);
       parent= with an empty value makes T a root, i.e. a phase. T's type and the types under it
       are re-derived, and the old and the new parent roll up in the same save.
@@ -65,6 +71,11 @@
       context); pass moves T (and its children) to review, fail (--fail or a drop) to fix — one
       transition each (verify: pass | verify: fail — <why>)
   task get T
+  plan sync [--run R] [--apply] [--from-file] — diff the run's plan file against its tasks and add or
+      update the planned ones. Dry run by default (nothing written). On a live run — at least one
+      task not merged/done — it REFUSES (the tasks are the source; `task set` edits are the way to
+      change them) unless --from-file, which applies the file anyway. An all-terminal or task-less
+      run is unchanged either way. A started task's plan diff is a warning, never a write.
   event [--task T] --type transition|decision|verdict|quota|note --text TEXT [--from S] [--to S]  (transition
       needs --to; --from/--to take the status aliases and store the canonical word)
   wait set --question TEXT --options a,b [--rec TEXT] | wait clear
@@ -99,7 +110,15 @@ STATUSES = ("planned routed dispatched building verifying review fix merged qa d
 STATUS_ALIASES = {"reviewing": "review", "merging": "merged", "fixing": "fix"}  # input aliases (F2.2)
 EVENT_TYPES = ("transition", "decision", "verdict", "quota", "note")
 TASK_KEYS = ("status", "agent", "model", "effort", "lane", "pane", "branch", "workspace", "slot",
-             "last_commit", "gates", "verdict", "reviewer", "parent")  # parent= re-parents a task
+             "last_commit", "gates", "verdict", "reviewer", "parent",  # parent= re-parents a task
+             "title", "acceptance", "owned", "deps", "refs")  # T1: the plan text task set can edit
+# T1: the keys that take a comma list (task add's --owned/--deps parsing; an empty value clears)
+SET_LIST_KEYS = ("owned", "deps", "refs")
+# T1: the keys only a task that has not started accepts. A started task (building, verifying,
+# review, fix, merged, done, ...) keeps its text: the key is dropped and the reply warns —
+# the same rule `plan sync` applies, one writer's worth of it.
+SET_START_KEYS = ("title", "acceptance", "owned", "deps", "refs")
+EDITABLE_WHILE = ("planned", "routed")
 ROUND_KINDS = ("build", "fix", "takeover")
 # A new round must not inherit the previous round's terminal row. File mode never wrote
 # status on `task round` (the row stays whatever it was); the store path maps each kind
@@ -1419,6 +1438,12 @@ def parse_value(v):
     return v
 
 
+def short_val(v, n=80):
+    """One event line's worth of a task field: JSON for lists/None, cut at n chars (T1)."""
+    s = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
 # ---------- plan tool (C3: mk-plan.py only ever as a subprocess, never imported) ----------
 
 def plan_tool(*args):
@@ -1970,16 +1995,40 @@ def cmd_task(a, st):
             return task_verify(st, run, t, a)
         if a.action == "set":
             changes = {}
+            set_warnings = []  # T1: the started-task drops and the dep notes, merged into the reply
             for pair in a.pairs:
                 k, sep, v = pair.partition("=")
                 if not sep or k not in TASK_KEYS:
                     raise Fail(f"bad pair {pair!r}; keys: {' '.join(TASK_KEYS)}")
-                changes[k] = parse_value(v)
+                if k in SET_LIST_KEYS:  # T1: owned/deps/refs parse like task add's flags
+                    changes[k] = csv(v) or None  # an empty value clears, like every other key
+                else:
+                    changes[k] = parse_value(v)
             if "status" in changes:
                 # F2.2: the alias resolves before the check; the canonical word is what is stored
                 changes["status"] = STATUS_ALIASES.get(changes["status"], changes["status"])
                 if changes["status"] not in STATUSES:
                     raise Fail(f"bad status {changes['status']!r}; one of: {' '.join(STATUSES)}")
+            # T1: a task that already started keeps the text its round ran under. The pair is
+            # dropped, not refused: the reply carries the warning and exits 0.
+            started = [k for k in SET_START_KEYS if k in changes]
+            if started and t["status"] not in EDITABLE_WHILE:
+                for k in started:
+                    changes.pop(k)
+                set_warnings.append(f"task {t['id']} is {t['status']} (started): "
+                                    f"{', '.join(started)} changed; not updated")
+            if changes.get("deps"):
+                # the task add rule, on an edit: stored id case, a self-dep refused, an unknown
+                # target warned (never fatal — it may be added later).
+                fixed, missing = [], []
+                for d in changes["deps"]:
+                    nd = st.norm_dep(run, t["id"], d)
+                    fixed.append(nd)
+                    if st.dep_status(run, nd) is None:
+                        missing.append(nd)
+                changes["deps"] = fixed
+                set_warnings += [f"dep {d} not found (yet)" for d in missing]
+            olds = {k: t.get(k) for k in SET_START_KEYS if k in changes}  # for the decision events
             if "parent" in changes:
                 moved = reparent(st, run, t, changes.pop("parent"), a.by)
             kids = [c for c in run["tasks"] if c.get("parent") == t["id"]]
@@ -2022,6 +2071,13 @@ def cmd_task(a, st):
                              f"(unmet: {', '.join(waiting)})", task=t["id"], by=a.by)
             frm = t["status"]
             t.update(changes)
+            # T1: one decision event per edited key, old and new value (short) plus the --note.
+            for k, old in olds.items():
+                new = changes[k]
+                if old != new:  # a key set to its current value is not an edit: no event
+                    st.event(run, "decision", f"task set {t['id']} {k}: {short_val(old)} → "
+                             f"{short_val(new)}" + (f" — {a.note}" if a.note else ""),
+                             task=t["id"], by=a.by)
             if cur and "verdict" in changes:
                 cur["verdict"] = changes["verdict"]
             if cur and "last_commit" in changes:
@@ -2086,7 +2142,7 @@ def cmd_task(a, st):
         for x in moved:  # a re-parent moved T and rolled both parents up in this one save
             if x is not t:
                 write_json(mkpaths.task_doc(st.data, run["id"], x["id"]), x)
-        warnings = st.refresh_others(run, a.by) if a.action == "set" else []
+        warnings = (set_warnings + st.refresh_others(run, a.by)) if a.action == "set" else []
         st.flush()
         if a.action == "round":
             d = st.task_dir(run["id"], t["id"])
@@ -2303,6 +2359,16 @@ def cmd_plan(a, st):
         run = st.load(a.run)
         if not (run.get("plan_id") and run.get("plan")):
             raise Fail(f"run {run['id']} has no plan link (run init --plan)")
+        # T1: the tasks are the source once a run is live. A plan sync rewrites title/acceptance/
+        # owned/deps from the file, which silently drops `task set` edits — so it refuses while
+        # any task is not terminal (merged/done), dry-run included. --from-file is the explicit
+        # "the plan file wins" override; an all-terminal or empty run is unchanged.
+        live = [t["id"] for t in run.get("tasks") or []
+                if t.get("status") not in ("merged", "done")]
+        if live and not getattr(a, "from_file", False):
+            raise Fail("plan sync on a live run overwrites task edits made with task set; "
+                       "change tasks with 'task set T title=… acceptance=… owned=… deps=…' "
+                       "or pass --from-file", live=live)
         cur = plan_tool("parse", st.plan_file(run))
         stored = plan_store_row(st, run["plan_id"])
         version_diff = plan_version_diff(stored, cur) if st.store_on else []
@@ -2631,7 +2697,11 @@ def build_parser():
     t.add_argument("--deps"), t.add_argument("--owned"), t.add_argument("--parent")
     t.add_argument("--followup", action="store_true",
                    help="--parent may be a merged/qa/done phase: it rolls back to building")
-    t = task.add_parser("set", parents=[data_p, run_p])
+    t = task.add_parser("set", parents=[data_p, run_p],
+                        help="edit one task: status agent model effort lane pane branch workspace "
+                             "slot last_commit gates verdict reviewer parent title acceptance owned "
+                             "deps refs (owned/deps/refs are comma lists; title/acceptance/owned/"
+                             "deps/refs edit a planned|routed task only)")
     t.add_argument("task"), t.add_argument("pairs", nargs="+"), t.add_argument("--note")
     t.add_argument("--force", action="store_true")
     t = task.add_parser("round", parents=[data_p, run_p])
@@ -2656,8 +2726,12 @@ def build_parser():
         t.set_defaults(func=cmd_task)
 
     pn = sub.add_parser("plan").add_subparsers(dest="action", required=True)
-    ps = pn.add_parser("sync", parents=[data_p, run_p])
+    ps = pn.add_parser("sync", parents=[data_p, run_p],
+                       help="diff the run's plan file against its tasks; dry run unless --apply; "
+                            "refuses on a live run unless --from-file")
     ps.add_argument("--apply", action="store_true")  # default: dry run, nothing written
+    ps.add_argument("--from-file", action="store_true",
+                    help="the plan file wins: sync even while the run has non-terminal tasks")
     ps.set_defaults(func=cmd_plan)
 
     e = sub.add_parser("event", parents=[data_p, run_p])
@@ -2883,6 +2957,21 @@ def d15_self_test(tmp, env, pd, penv):
     assert rows["DP.1"]["owned"] == "scripts/a.py", dict(rows["DP.1"])
     assert rows["DQ"]["deps"] == "DP", dict(rows["DQ"])
 
+    # --- T1: task set edits reach the store row and task get (the plan text is not file-only)
+    sk("task", "set", "DP.1", "title=Edited child", "acceptance=edited outcome",
+       "owned=scripts/b.py,scripts/c.py", "deps=DP", "--run", "s2")
+    con = _mkdb().open_project(os.path.join(sd, ".mk-home"), STORE_PROJECT, data_dir=sd)
+    try:
+        row = con.execute("SELECT title, acceptance, owned, deps FROM tasks"
+                          " WHERE run='s2' AND id='DP.1'").fetchone()
+    finally:
+        con.close()
+    assert row["title"] == "Edited child" and row["acceptance"] == "edited outcome", dict(row)
+    assert row["owned"] == "scripts/b.py,scripts/c.py" and row["deps"] == "DP", dict(row)
+    got = sk("task", "get", "DP.1", "--run", "s2")["task"]
+    assert got["title"] == "Edited child" and got["acceptance"] == "edited outcome", got
+    assert got["owned"] == ["scripts/b.py", "scripts/c.py"] and got["deps"] == ["DP"], got
+
 
 def self_test():
     import shutil, subprocess
@@ -2988,6 +3077,58 @@ def self_test():
         assert "mk/r1/t1 · slot 1 · mk:repo:1" in board, board  # the lane cell names the slot
         for k in ("branch", "workspace", "slot"):
             assert mk("task", "set", "T1", f"{k}=")["task"][k] is None  # empty clears, like lane=
+
+        # T1: task set edits the plan text of a task that has not started. Own data dir: the r1
+        # fixture above must stay exactly T1/T2 for the blocks below.
+        td = os.path.join(tmp, "t1set")
+        tdir = os.path.join(td, "runs", "r1")
+
+        def tk(*x, code=0):
+            r = subprocess.run([sys.executable, os.path.abspath(__file__), *x, "--data", td],
+                               capture_output=True, text=True, env=env)
+            lines = r.stdout.strip().splitlines()
+            assert len(lines) == 1 and r.returncode == code, (x, r.returncode, r.stdout, r.stderr)
+            return json.loads(lines[0])
+
+        tk("run", "init", "--id", "r1", "--feature", "T1", "--branch", "b")
+        tk("task", "add", "--id", "T1", "--title", "Base")
+        assert {"title", "acceptance", "owned", "deps", "refs"} <= set(TASK_KEYS)
+        tk("task", "add", "--id", "E1", "--title", "Old title", "--owned", "a.py")
+        e1 = tk("task", "set", "E1", "title=New title", "acceptance=the outcome",
+                "owned=src/x.py,src/y.py", "refs=docs/a.md:10,scripts/b.py", "--note", "brief gap")
+        assert e1["task"]["title"] == "New title" and e1["task"]["acceptance"] == "the outcome"
+        assert e1["task"]["owned"] == ["src/x.py", "src/y.py"], e1["task"]
+        assert e1["task"]["refs"] == ["docs/a.md:10", "scripts/b.py"], e1["task"]
+        got = tk("task", "get", "E1")["task"]  # the file view reads the new values back
+        assert got["title"] == "New title" and got["owned"] == ["src/x.py", "src/y.py"]
+        assert got["refs"] == ["docs/a.md:10", "scripts/b.py"] and got["acceptance"] == "the outcome"
+        # one decision event per changed key, old and new (short), plus the --note
+        evs = [json.loads(x) for x in open(os.path.join(tdir, "events.jsonl"))]
+        dec = [x for x in evs if x["type"] == "decision" and x.get("task") == "E1"]
+        assert len(dec) == 4, dec
+        assert "task set E1 title: Old title → New title" in dec[0]["text"], dec[0]
+        assert "brief gap" in dec[0]["text"], dec[0]  # the --note rides the decision event
+        assert "task set E1 owned:" in dec[2]["text"] and "task set E1 refs:" in dec[3]["text"], dec
+        # deps are validated like task add: stored id case, unknown warned, self-dep refused
+        w = tk("task", "set", "E1", "deps=t1,NOPE1")["warnings"]
+        assert any("dep NOPE1 not found (yet)" in x for x in w), w
+        assert tk("task", "get", "E1")["task"]["deps"] == ["T1", "NOPE1"]  # unknown stays, warned
+        assert "cannot depend on itself" in tk("task", "set", "E1", "deps=E1", code=2)["error"]
+        assert tk("task", "get", "E1")["task"]["deps"] == ["T1", "NOPE1"]  # the refusal wrote nothing
+        assert tk("task", "set", "E1", "owned=")["task"]["owned"] is None  # empty clears, like lane=
+        # a started task keeps its text: the key is dropped (nothing written), warned, exit 0
+        tk("task", "set", "E1", "owned=a.py")
+        tk("task", "set", "E1", "status=building", "--force")  # E1 depends on T1: unmet, forced
+        out = tk("task", "set", "E1", "title=After start", "owned=z.py", "agent=codex")
+        assert out["task"]["title"] == "New title" and out["task"]["owned"] == ["a.py"], out["task"]
+        assert out["task"]["agent"] == "codex", out["task"]  # a non-text key still writes
+        warns = out["warnings"]
+        assert any("task E1 is building (started): title, owned changed; not updated" in x
+                   for x in warns), warns
+        assert tk("task", "get", "E1")["task"]["title"] == "New title"  # nothing was written
+        # back to planned: the plan text is editable again
+        tk("task", "set", "E1", "status=planned")
+        assert tk("task", "set", "E1", "title=Editable again")["task"]["title"] == "Editable again"
         plain = open(mk("render")["board"]).read()  # the lane cell is back to the bare path
         assert "| T1 |" in plain and "mk/r1/t1" not in plain, plain
         for bad in ("bran=mk/r1/t1", "workspac=mk:repo:1", "slotx=1"):
@@ -3727,7 +3868,7 @@ def self_test():
         board = open(pk("render")["board"]).read()
         assert "⚠ plan file changed since run start" in board, board  # the file moved under the run
         before_run, before_board = open(runjson).read(), open(boardp).read()
-        out = pk("plan", "sync")
+        out = pk("plan", "sync", "--from-file")
         assert out["apply"] is False and open(runjson).read() == before_run
         assert open(boardp).read() == before_board  # the dry run does not even re-render
         assert any("phase P2" in c and "title" in c for c in out["changes"]), out["changes"]
@@ -3741,7 +3882,7 @@ def self_test():
         # --apply: adds through the add path, updates in place, ONE event, new sha stored
         evpath = os.path.join(pd, "runs", "pr1", "events.jsonl")
         n_ev = len(open(evpath).readlines())
-        out = pk("plan", "sync", "--apply")
+        out = pk("plan", "sync", "--apply", "--from-file")
         assert out["apply"] is True
         newev = [json.loads(x) for x in open(evpath)][n_ev:]
         assert len(newev) == 1 and newev[0]["type"] == "note" and "plan sync" in newev[0]["text"], newev
@@ -3757,6 +3898,38 @@ def self_test():
         assert run["plan_sha"] == file_sha(pfile)
         board = open(pk("render")["board"]).read()
         assert "⚠" not in board and "Phase two v2" in board, board
+
+        # T1: on a live run plan sync refuses (dry run and --apply), --from-file overrides,
+        # an all-terminal run is unchanged
+        db = json.load(open(pfile))
+        db["phases"][1]["title"] = "Phase two v3"  # a diff a sync would write
+        putdb(db)
+        before_run = open(runjson).read()
+        e = pk("plan", "sync", code=2)
+        assert "plan sync on a live run overwrites task edits made with task set" in e["error"], e
+        assert "or pass --from-file" in e["error"], e
+        assert open(runjson).read() == before_run, "the refusal wrote nothing"
+        e = pk("plan", "sync", "--apply", code=2)
+        assert "live run" in e["error"] and open(runjson).read() == before_run, e
+        out = pk("plan", "sync", "--from-file")  # the explicit override still dry-runs first
+        assert out["apply"] is False, out
+        assert any("phase P2" in c and "title" in c for c in out["changes"]), out["changes"]
+        # every task terminal: a plain sync runs again
+        tiny = {"plan": "tiny", "status": "approved", "runs": [], "phases": [
+            {"id": "Z1", "title": "Solo", "wave": 1, "deps": [], "owned": [], "route": "",
+             "reviewer": "", "size": "standard", "risk": "reversible", "review": "light",
+             "qa": [], "commit": "feat: z", "subagents": False, "lane_group": "",
+             "tasks": [{"id": "Z1.1", "title": "only child", "acceptance": "z", "refs": [],
+                        "subagent": False, "owned": [], "deps": [], "parallel": False}]}]}
+        tfile = os.path.join(tmp, "tinyplan.json")
+        json.dump(tiny, open(tfile, "w"))
+        pk("run", "init", "--id", "pr5", "--feature", "Tiny", "--branch", "b5", "--plan", tfile)
+        pk("task", "set", "Z1.1", "status=done", "--run", "pr5")  # the roll-up makes Z1 done too
+        tiny["phases"][0]["title"] = "Solo v2"
+        json.dump(tiny, open(tfile, "w"))
+        out = pk("plan", "sync", "--run", "pr5")  # no live task: allowed without --from-file
+        assert out["ok"] and out["changes"] == [], out  # the existing started-task rule, unchanged
+        assert any("phase Z1 is done (started)" in w for w in out["warnings"]), out["warnings"]
 
         # last run done → plan done; a non-last run finishing leaves the plan alone
         putdb({**json.load(open(pfile)), "status": "running"})
@@ -4081,7 +4254,7 @@ def store_self_test(tmp, env):
         con.commit()
     finally:
         con.close()
-    out = mk("plan", "sync", "--run", "s3", e=e2)  # parses through the archived path, not the missing one
+    out = mk("plan", "sync", "--run", "s3", "--from-file", e=e2)  # parses through the archived path, not the missing one
     assert out["ok"] and out["plan"] == "gp", out
 
     # a crash between the store commit and the view rewrite: the next command repairs the views
@@ -4465,7 +4638,7 @@ def store_self_test(tmp, env):
     finally:
         con.close()
     r = subprocess.run([sys.executable, os.path.abspath(__file__), "plan", "sync", "--run", "p1",
-                        "--data", d3], capture_output=True, text=True, env=penv)
+                        "--from-file", "--data", d3], capture_output=True, text=True, env=penv)
     assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
     dry = json.loads(r.stdout)
     assert dry["apply"] is False and "sha" in dry["version_diff"], dry
@@ -4476,7 +4649,7 @@ def store_self_test(tmp, env):
         con.close()
     assert still == 1  # dry run wrote nothing
     r = subprocess.run([sys.executable, os.path.abspath(__file__), "plan", "sync", "--run", "p1",
-                        "--apply", "--data", d3], capture_output=True, text=True, env=penv)
+                        "--apply", "--from-file", "--data", d3], capture_output=True, text=True, env=penv)
     assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
     applied = json.loads(r.stdout)
     assert applied["version"] == 2, applied
@@ -4487,7 +4660,7 @@ def store_self_test(tmp, env):
         con.close()
     assert row["version"] == 2 and json.loads(row["header_json"])["sha"] == applied["sha"]
     r = subprocess.run([sys.executable, os.path.abspath(__file__), "plan", "sync", "--run", "p1",
-                        "--data", d3], capture_output=True, text=True, env=penv)
+                        "--from-file", "--data", d3], capture_output=True, text=True, env=penv)
     quiet = json.loads(r.stdout)
     assert quiet["version_diff"] == [], quiet  # the stored version now matches
 
