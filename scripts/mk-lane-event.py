@@ -8,7 +8,7 @@ Usage:
                       [...]   # a shared lane group: one lane serving several phases of one plan
   mk-lane-event.py event                (herdr plugin hook: reads HERDR_PLUGIN_EVENT + HERDR_PLUGIN_EVENT_JSON)
   mk-lane-event.py dispatch --pane ID --text TEXT [--timeout-ms 25000] [--role build|review]
-                             [--kind build|fix|takeover] [--connect|--no-connect]
+                             [--kind build|fix|takeover|rework] [--connect|--no-connect]
                              [--task T] [--agent A] [--model M] [--effort E] [--force]
   mk-lane-event.py sweep [--data DIR]
   mk-lane-event.py disarm --lane DIR
@@ -77,7 +77,7 @@ happens under an fcntl.flock on <lane>/.matrixkoder-watch.lock (a stable inode n
 replaced watch file). One JSON line per command.
 --stall-min absent (arm, and the verdict fallback for a watch that records none): <data>/matrixkoder.yaml
 session.stall_min, else the mk-config schema default.
-dispatch --kind fix|takeover (a fix/takeover round; default build) with --role build on session.fresh_session: new
+dispatch --kind fix|takeover|rework (a fix/takeover/rework round; default build) with --role build on session.fresh_session: new
 (<data>/matrixkoder.yaml, else the schema default) first sends the pane's agent its new-session command — /new for
 an OpenCode or omp lane, /clear for a Claude lane, from the armed watch's kind — then waits (bounded) for the pane
 to go idle and sends the prompt exactly as today. No armed watch kind, a kind without a known command, --kind
@@ -383,6 +383,10 @@ def apply_verdict(w, state, subj, evidence, h):
                     w.get("run"))
     if not rec.get("ok"):
         return rec, False, False, None
+    if state == "DONE":
+        missing = ingest_report(w)  # F.4: a claimed test absent from the branch opens claim_mismatch
+        if missing:
+            rec = dict(rec, claim_mismatch=missing)
     status = lw.STATUS_MAP.get(state, state.lower())
     label = label_pane(w["pane"], w["task"], status)
     toast = toast_pane(w["task"], state, status)
@@ -888,7 +892,7 @@ def task_check(w, task):
     return ok, missing, None if ok else (j.get("error") or None)
 
 
-def mark_armed_building(pane):
+def mark_armed_building(pane, rework=False):
     """dispatch delivered:true → the lane's tasks move again: the children of EVERY armed task
     (or the task itself when it has none) are set building via mk-state, so the board shows the
     lane working before the agent's first event lands — in a shared lane group one delivered
@@ -924,12 +928,14 @@ def mark_armed_building(pane):
         if rows is not None:
             statuses = {str(r.get("id") or "").lower(): (r.get("status") or "") for r in rows}
     common = ["--data", data, "--by", "dispatch"] + (["--run", run] if run else [])
-    done, skipped, errors = [], [], []
+    done, skipped, errors, reopened = [], [], [], []
     for t in targets:
         cur = statuses.get(str(t).lower())
-        if cur in TERMINAL_STATUSES:
+        if cur in TERMINAL_STATUSES and not rework:
             skipped.append(t)  # a finished task stays finished: never moved back to building
             continue
+        if cur in TERMINAL_STATUSES:
+            reopened.append(t)  # F.4: a rework dispatch is the one exception to the merged guard
         r = subprocess.run([sys.executable, mk_state_cmd(), "task", "set", t, "status=building", *common],
                            capture_output=True, text=True)
         try:
@@ -943,6 +949,8 @@ def mark_armed_building(pane):
     res = {"building": done}
     if skipped:
         res["skipped_terminal"] = skipped
+    if reopened:
+        res["reopened"] = reopened
     if errors:
         res["task_status_error"] = "; ".join(errors)[:300]
     return res
@@ -1140,14 +1148,14 @@ def connect_text(lane, data, role_arg=""):
     return (f"MK_SELFTEST_JOBS={n} python3 {shlex.quote(skill)}/scripts/mk-builder.py connect{data_arg}{role_arg} {DOORBELL_ACT}")
 
 
-def delivered_status(pane, role):
+def delivered_status(pane, role, rework=False):
     """The board write a DELIVERED dispatch makes, by role. build (the default) →
     mark_armed_building: every armed task's children (or the task itself) go building. review →
     no write at all — the task under review stays at review, and status_unchanged:true in the
     reply says the verdict knowingly moved nothing."""
     if role == "review":
         return {"status_unchanged": True}
-    return mark_armed_building(pane) or {}
+    return mark_armed_building(pane, rework) or {}
 
 
 def _prompt_attempt(pane, text, ms):
@@ -1197,7 +1205,7 @@ def cmd_dispatch(a):
     attempt's when both fail, the reply itself when nothing failed) and pane_entry (the freshest
     raw `herdr pane list` row for the pane, null when no observation names it). A delivered reply
     never carries error: herdr's timeout words stay in herdr_error and note says what happened. A --kind
-    fix|takeover build dispatch on session.fresh_session: new first sends the pane's agent its
+    fix|takeover|rework build dispatch on session.fresh_session: new first sends the pane's agent its
     new-session command (/new OpenCode, /clear Claude — the armed watch's kind names the agent)
     and waits (bounded) for the pane to go idle; the reply's fresh_session names the command sent,
     or null. A reset herdr refuses outright, or a pane that never goes idle, ends the round with
@@ -1222,8 +1230,8 @@ def cmd_dispatch(a):
     if role not in ("build", "review"):
         fail("--role must be build or review")
     round_kind = opt(a, "--kind", "build")
-    if round_kind not in ("build", "fix", "takeover"):
-        fail("--kind must be build, fix or takeover")
+    if round_kind not in ("build", "fix", "takeover", "rework"):
+        fail("--kind must be build, fix, takeover or rework")
     try:
         ms = int(opt(a, "--timeout-ms", "25000"))
     except ValueError as e:
@@ -1352,7 +1360,7 @@ def cmd_dispatch(a):
     # then a bounded idle wait, then the prompt exactly as today. Everything else (build, review,
     # fresh_session: same, no armed kind, unknown kind) skips this and sends one prompt as before.
     fresh = (fresh_session_cmd(armed_kind(pane))
-             if role == "build" and round_kind in ("fix", "takeover")
+             if role == "build" and round_kind in ("fix", "takeover", "rework")
              and cfg("session.fresh_session") == "new" else None)
     if fresh:
         # The reset gates the round, but only a CONFIRMED failure blocks it: `wait`/`exc` mean
@@ -1389,7 +1397,7 @@ def cmd_dispatch(a):
                  "attempts": attempts, "herdr_error": fail_why or why, "pane_entry": entry,
                  "fresh_session": fresh,
                  **({"publish_error": opt(a, "--publish-error")} if opt(a, "--publish-error") else {}),
-                 **({"pane_list_error": pl_err} if pl_err else {}), **delivered_status(pane, role),
+                 **({"pane_list_error": pl_err} if pl_err else {}), **delivered_status(pane, role, round_kind == "rework"),
                  **carried})
             return
         fail_why = why
@@ -1402,7 +1410,7 @@ def cmd_dispatch(a):
         if st == "working":  # the wait gave up, the agent did not: the prompt is still being delivered
             reply({"ok": True, "delivered": True, "pane_state": "working", "pane": pane, "timed_out": True,
                  "timeout_ms": ms, "attempts": attempts, "herdr_error": why,
-                 "pane_entry": entry, "fresh_session": fresh, **delivered_status(pane, role), **carried},
+                 "pane_entry": entry, "fresh_session": fresh, **delivered_status(pane, role, round_kind == "rework"), **carried},
                   note="herdr status wait timed out; the pane is working")
             return
         if attempts == 1 and st in RETRY_PANE_STATES:  # idle/done: the prompt was lost — resend once
@@ -1420,7 +1428,7 @@ def cmd_dispatch(a):
                 reply({"ok": True, "delivered": True, "recovered": True, "pane_state": st, "pane": pane,
                      "timed_out": True, "timeout_ms": ms, "attempts": attempts, "herdr_error": why,
                      "pane_entry": entry, "fresh_session": fresh,
-                     **({"pane_list_error": pl_err} if pl_err else {}), **delivered_status(pane, role),
+                     **({"pane_list_error": pl_err} if pl_err else {}), **delivered_status(pane, role, round_kind == "rework"),
                      **carried},
                       note="herdr wait timed out; the prompt had already landed")
                 return
@@ -1763,6 +1771,111 @@ def git_out(repo, *args):
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
+# F.4: the orchestrator-side risk reasons this tool opens, with their points (mk-state `risk add`
+# is the only writer; a builder command never calls it)
+RISK_POINTS = {"review_changes": 2, "medium_parked": 1, "claim_mismatch": 2, "no_evidence": 1}
+
+
+def open_risk(data, run, task, kind, source):
+    """Open one risk reason through `mk-state risk add`. The same open kind+source on the task
+    is not added twice. -> (opened, error)."""
+    base = [sys.executable, mk_state_cmd(), "--data", data, "--run", run]
+    listed = subprocess.run(base + ["risk", "list", task], capture_output=True, text=True).stdout.strip().splitlines()
+    lst = _jload(listed[-1] if listed else "") or {}
+    for x in lst.get("reasons") or []:
+        if x.get("kind") == kind and (x.get("source") or "") == source and not x.get("cleared"):
+            return False, None
+    r = subprocess.run(base + ["risk", "add", task, "--kind", kind, "--points", str(RISK_POINTS[kind]),
+                               "--source", source], capture_output=True, text=True)
+    lines = r.stdout.strip().splitlines()
+    j = _jload(lines[-1] if lines else "")
+    if r.returncode == 0 and isinstance(j, dict) and j.get("ok"):
+        return True, None
+    return False, ((j or {}).get("error") or r.stderr.strip()[-160:] or f"exit {r.returncode}")
+
+
+def review_acceptance(text):
+    """The rows of the review's `## Acceptance` table as [{criterion, verdict}]. A row counts
+    when its verdict cell is exactly MET, NOT MET or UNVERIFIED (the template's placeholder
+    row and the header do not). [] when the section or its rows are missing."""
+    m = re.search(r"(?m)^##[ \t]+Acceptance[ \t]*$", text or "")
+    if not m:
+        return []
+    body = text[m.end():]
+    nxt = re.search(r"(?m)^##[ \t]", body)
+    rows = []
+    for line in (body[:nxt.start()] if nxt else body).splitlines():
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if line.strip().startswith("|") and len(cells) >= 3 and cells[2].upper() in ("MET", "NOT MET", "UNVERIFIED"):
+            rows.append({"criterion": cells[1], "verdict": cells[2].upper()})
+    return rows
+
+
+# The same claim rule is in mk-builder.py `done` (a lane script, so it cannot import this one):
+# a backticked test file in a report clause (split on `;`, `. `, newline) that says it was added/new/wrote/created is a claim.
+CLAIM_TEST_RE = re.compile(r"`([\w./-]*(?:test_[\w.-]+\.py|[\w.-]*_test\.py|[\w.-]+\.test\.tsx?))`")
+CLAIM_VERB_RE = re.compile(r"\b(added|adds|new|wrote|writes|created|creates)\b", re.I)
+
+
+def claimed_tests(report):
+    out = []
+    for clause in re.split(r";|\. |\n", report or ""):
+        if CLAIM_VERB_RE.search(clause):
+            out += [t for t in CLAIM_TEST_RE.findall(clause) if t not in out]
+    return out
+
+
+def claim_in(test, files):
+    """A claimed test matches a changed path when it equals it, is a path suffix of it, or equals
+    its basename (a bare `plans-map.test.ts`). Same rule as mk-builder.py `done`."""
+    return any(f == test or f.endswith("/" + test) or os.path.basename(f) == os.path.basename(test)
+               and "/" not in test for f in files)
+
+
+def branch_files(lane):
+    """Files the lane's commits changed since the merge-base with main (or master); None when
+    git cannot say, so an unknown never reads as a mismatch."""
+    for base in ("main", "master"):
+        mb = git_out(lane, "merge-base", "HEAD", base)
+        if mb:
+            try:
+                r = subprocess.run(["git", "-C", lane, "diff", "--name-only", f"{mb}..HEAD"],
+                                   capture_output=True, text=True, timeout=10)
+            except (OSError, subprocess.TimeoutExpired):
+                return None
+            return set(r.stdout.splitlines()) if r.returncode == 0 else None  # a git error is unknown, not empty
+    return None
+
+
+def ingest_report(w):
+    """F.4: when a lane finishes, the report's claimed tests must be in the branch diff; a claimed
+    test that is absent opens a claim_mismatch reason. Best-effort: never raises. -> missing list."""
+    try:
+        data, run, task, lane = w.get("data"), w.get("run"), w.get("task"), w.get("lane")
+        if not (data and run and task and lane):
+            return []
+        text, rnd = None, "?"
+        path = os.path.join(lane, w.get("report") or "")
+        if w.get("report") and os.path.isfile(path):
+            text = open(path).read()
+            m = re.search(r"-r(\d+)\.md$", os.path.basename(path))
+            if m:
+                rnd = m.group(1)
+        else:
+            got = newest_stored_artifact(data, run, task, "report")
+            if got:
+                rnd, text = got
+        files = branch_files(lane)
+        if not text or files is None:
+            return []
+        missing = [t for t in claimed_tests(text) if not claim_in(t, files)]
+        if missing:
+            open_risk(data, run, task, "claim_mismatch", f"report R{rnd}: {', '.join(missing)}"[:200])
+        return missing
+    except Exception:
+        return []
+
+
 def rules_block_of(text):
     """The ## Rules section of a brief, header included, or '' when there is none."""
     lines = (text or "").splitlines()
@@ -1789,6 +1902,27 @@ def commands_block_of(text):
             break
         out.append(line)
     return "\n".join(out).strip()
+
+
+def risk_gates_section(data, run, task, rec):
+    """F.4: the brief's `## Risk and gates` section from the store: the derived risk with its open
+    reasons (`mk-state risk list`) and the task's gates, so a fix or rework brief shows both."""
+    listed = subprocess.run([sys.executable, mk_state_cmd(), "--data", data, "--run", run, "risk", "list", task],
+                            capture_output=True, text=True).stdout.strip().splitlines()
+    j = _jload(listed[-1] if listed else "") or {}
+    reasons = [x for x in j.get("reasons") or [] if not x.get("cleared")]
+    risk = (j.get("risk") or {}).get(task) or rec.get("risk") or 1
+    why = "; ".join(f"{x.get('kind')} +{x.get('points')} ({x.get('source') or '-'})" for x in reasons)
+    gates = rec.get("gates")
+    if isinstance(gates, (list, tuple)):
+        gate_lines = [f"- {g}" for g in gates] or ["- none"]
+    elif isinstance(gates, dict):
+        gate_lines = [f"- {k}: {v}" for k, v in gates.items()] or ["- none"]
+    else:
+        gate_lines = [f"- {gates}" if gates else "- none"]
+    return "\n".join(["## Risk and gates", f"- Risk: {risk}" + (f" — {why}" if why else ", no open reasons"),
+                      "- Gates:", *["  " + g for g in gate_lines],
+                      "- Risk is the orchestrator's: a builder never writes a risk reason.", ""])
 
 
 def filled_brief(data, run, task, round_n, review_ref, fix, review_n=None):
@@ -1844,6 +1978,7 @@ def filled_brief(data, run, task, round_n, review_ref, fix, review_n=None):
         owned_txt or "(none recorded on the task)",
         "Do NOT touch: everything else.",
         "",
+        risk_gates_section(data, run, task, rec),
         f"## FIX (review `{review_ref}`)",
         fix.strip(),
         "",
@@ -1933,24 +2068,35 @@ def cmd_review_handoff(a):
                 shutil.copyfile(src, path)
             ref = path
     verdict = review_verdict(text)
+    # F.4: the acceptance table is part of a review; one without it is flagged on every reply
+    rows = review_acceptance(text)
+    table = {"acceptance_table": bool(rows),
+             **({} if rows else {"flag": "review has no acceptance table"})}
+    findings_all = review_findings(text)
     if verdict == "APPROVE":
         r = subprocess.run(
             [sys.executable, mk_state_cmd(), "--data", data, "--run", run,
              "task", "set", task, "verdict=approve", "--by", "review-handoff"],
             capture_output=True, text=True)
+        wanted = []
+        if any(x["verdict"] == "UNVERIFIED" for x in rows):
+            wanted.append("no_evidence")  # APPROVE over an UNVERIFIED row is approval without evidence
+        if any(f["severity"] == "MEDIUM" for f in findings_all):
+            wanted.append("medium_parked")  # an APPROVE parks every MEDIUM it lists
+        risk = open_risks(data, run, task, wanted, f"review R{n}")
         out({"ok": True, "verdict": "APPROVE", "dispatched": False, "task": task,
-             "recorded": r.returncode == 0})
+             "recorded": r.returncode == 0, **table, **risk})
         return
     if verdict != "REQUEST CHANGES":
         fail("review title has neither APPROVE nor REQUEST CHANGES")
     cur = task_round_of(data, run, task)
     if cur != n:
-        out({"ok": True, "dispatched": False, "task": task, "round": cur,
+        out({"ok": True, "dispatched": False, "task": task, "round": cur, **table,
              "reason": "already handed off" if cur > n else "review round is not the current round"})
         return
-    findings = review_findings(text)
+    findings = findings_all
     if not findings:
-        out({"ok": True, "dispatched": False, "task": task, "round": cur, "findings": 0,
+        out({"ok": True, "dispatched": False, "task": task, "round": cur, "findings": 0, **table,
              "reason": "no findings; held for the orchestrator"})
         return
     pending = hold_path(data, run, task)
@@ -1966,7 +2112,7 @@ def cmd_review_handoff(a):
             out({"ok": False, "error": f"hold write failed: {e}", "task": task})
             return
         out({"ok": True, "verdict": "REQUEST CHANGES", "dispatched": False, "held": True,
-             "task": task, "round": n, "findings": len(findings),
+             "task": task, "round": n, "findings": len(findings), **table,
              "reason": "held for veto"})
         return
     if os.path.isfile(pending):
@@ -1986,6 +2132,12 @@ def cmd_review_handoff(a):
     if rnd.returncode != 0 or not opened.get("ok"):
         out({"ok": False, "error": opened.get("error") or "task round failed", "task": task})
         return
+    # F.4: opened before the brief is filled, so the brief shows them: changes were requested → review_changes; MEDIUMs below --min are parked → medium_parked
+    floor = SEV_RANK[min_sev]
+    wanted = ["review_changes"]
+    if any(f["severity"] == "MEDIUM" and SEV_RANK["MEDIUM"] > floor for f in findings):
+        wanted.append("medium_parked")
+    risk = open_risks(data, run, task, wanted, f"review R{n}")
     fix = render_fix_section(findings, min_sev)
     brief_path = opened.get("brief")
     written = filled_brief(data, run, task, opened.get("round"), ref, fix, n)
@@ -1999,7 +2151,7 @@ def cmd_review_handoff(a):
     sent, send_err = send_brief_over_bus(data, run, task, written, opened.get("round"))
     fixed, fix_err = set_children_fix(data, run, task)
     wake, wake_err = wake_orchestrator(data, run, task, opened.get("round"), False)
-    out({"ok": True, "verdict": "REQUEST CHANGES", "dispatched": True, "task": task,
+    out({"ok": True, "verdict": "REQUEST CHANGES", "dispatched": True, "task": task, **table, **risk,
          "round": opened.get("round"), "kind": "fix", "brief": brief_path,
          "findings": len(findings), "required": sum(
              1 for f in findings if SEV_RANK[f["severity"]] <= SEV_RANK[min_sev]),
@@ -2008,6 +2160,18 @@ def cmd_review_handoff(a):
          **({"send_error": send_err} if send_err else {}),
          **({"children_error": "; ".join(fix_err)} if fix_err else {}),
          **({"wake_error": wake_err} if wake_err else {})})
+
+
+def open_risks(data, run, task, kinds, source):
+    """open_risk for each kind -> {"risk_opened": [...]} plus risk_error when one failed."""
+    opened, errs = [], []
+    for k in kinds:
+        ok, err = open_risk(data, run, task, k, source)
+        if ok:
+            opened.append(k)
+        if err:
+            errs.append(f"{k}: {err}")
+    return {"risk_opened": opened, **({"risk_error": "; ".join(errs)} if errs else {})}
 
 
 def cfg_data():
@@ -2078,7 +2242,8 @@ def cmd_event():
                      "error": f"mk-state: {rec.get('error')}"})
                 sys.exit(2)
             out({"ok": True, "pane": pane, "lane": lane, "verdict": state, "status": status,
-                 "recorded": True, "label": label, "toast": toast})
+                 "recorded": True, "label": label, "toast": toast,
+                 **({"claim_mismatch": rec["claim_mismatch"]} if rec.get("claim_mismatch") else {})})
 
 
 def dirty_files(lane):
@@ -3865,6 +4030,94 @@ def self_test():
         r = cli("review-handoff", "--task", "../x", "--run", "r1", "--data", data, code=2)
         assert r["ok"] is False, r
 
+        # --- F.4: review-handoff opens risk reasons and checks the acceptance table
+        def reasons(tid):
+            return sorted((x["kind"], x["points"], x["source"]) for x in store_read(
+                "SELECT kind, points, source FROM risk_reasons WHERE run='r1' AND task=? AND cleared IS NULL", (tid,)))
+        table_ok = ("\n## Acceptance\n| # | Criterion | Verdict | Evidence |\n|---|---|---|---|\n"
+                    "| 1 | a | MET | x:1 |\n| 2 | b | UNVERIFIED | no run |\n")
+        assert review_acceptance(table_ok) == [{"criterion": "a", "verdict": "MET"},
+                                               {"criterion": "b", "verdict": "UNVERIFIED"}]
+        tmpl = open(os.path.join(HERE, "..", "skills", "matrixkoder", "templates", "review.md")).read()
+        assert review_acceptance(tmpl) == [], "the template's placeholder row is not a verdict"
+        assert review_acceptance("# t\n\n## HIGH\n- a\n") == []
+        # APPROVE with an UNVERIFIED row -> no_evidence; the table is present, so no flag
+        mks("task", "add", "--id", "F4A", "--title", "approve unverified")
+        mks("task", "round", "F4A", "--kind", "build")
+        fd = os.path.join(data, "runs", "r1", "tasks", "F4A")
+        os.makedirs(fd, exist_ok=True)
+        open(os.path.join(fd, "review-r1.md"), "w").write("# F4A review — APPROVE\n" + table_ok)
+        r = cli("review-handoff", "--task", "F4A", "--run", "r1", "--data", data)
+        assert r["verdict"] == "APPROVE" and r["acceptance_table"] is True and "flag" not in r, r
+        assert r["risk_opened"] == ["no_evidence"], r
+        assert reasons("F4A") == [("no_evidence", 1, "review R1")], reasons("F4A")
+        # a repeat does not add the reason twice
+        cli("review-handoff", "--task", "F4A", "--run", "r1", "--data", data)
+        assert len(reasons("F4A")) == 1, reasons("F4A")
+        # APPROVE, every row MET, a MEDIUM listed: medium_parked only
+        mks("task", "add", "--id", "F4B", "--title", "approve met")
+        mks("task", "round", "F4B", "--kind", "build")
+        fd = os.path.join(data, "runs", "r1", "tasks", "F4B")
+        os.makedirs(fd, exist_ok=True)
+        open(os.path.join(fd, "review-r1.md"), "w").write(
+            "# F4B review — APPROVE\n\n## MEDIUM\n- a:1 — gap — later\n"
+            "\n## Acceptance\n| # | Criterion | Verdict | Evidence |\n|---|---|---|---|\n| 1 | a | MET | x |\n")
+        r = cli("review-handoff", "--task", "F4B", "--run", "r1", "--data", data)
+        assert r["risk_opened"] == ["medium_parked"], r
+        assert [x[0] for x in reasons("F4B")] == ["medium_parked"], reasons("F4B")
+        # REQUEST CHANGES, --min high: review_changes + the parked MEDIUM; the fix brief shows risk + gates
+        mks("task", "add", "--id", "F4C", "--title", "changes")
+        mks("task", "round", "F4C", "--kind", "build")
+        fd = os.path.join(data, "runs", "r1", "tasks", "F4C")
+        os.makedirs(fd, exist_ok=True)
+        open(os.path.join(fd, "review-r1.md"), "w").write(
+            "# F4C review — REQUEST CHANGES\n\n## HIGH\n- a:1 — leak — close\n\n## MEDIUM\n- b:2 — gap — later\n")
+        r = cli("review-handoff", "--task", "F4C", "--run", "r1", "--data", data, "--min", "high")
+        assert r["dispatched"] is True and sorted(r["risk_opened"]) == ["medium_parked", "review_changes"], r
+        assert r["acceptance_table"] is False and r["flag"] == "review has no acceptance table", r
+        assert [x[0] for x in reasons("F4C")] == ["medium_parked", "review_changes"], reasons("F4C")
+        got = open(r["brief"]).read()
+        assert "## Risk and gates" in got and "review_changes +2" in got and "Gates:" in got, got
+        # claim_mismatch: a test the report says it added, absent from the branch diff
+        crepo = os.path.join(tmp, "claim-repo")
+        subprocess.run(["git", "init", "-q", "-b", "main", crepo], check=True)
+        g(crepo, "commit", "-q", "--allow-empty", "-m", "init")
+        g(crepo, "switch", "-q", "-c", "work")
+        os.makedirs(os.path.join(crepo, "tests"))
+        open(os.path.join(crepo, "tests", "a_test.py"), "w").write("x = 1\n")
+        g(crepo, "add", "-A")
+        g(crepo, "commit", "-q", "-m", "feat: a")
+        assert branch_files(crepo) == {"tests/a_test.py"}, branch_files(crepo)
+        rep = "Added `tests/a_test.py` and a new `tests/b_test.py`; ran `tests/old_test.py` unchanged.\n"
+        assert claimed_tests(rep) == ["tests/a_test.py", "tests/b_test.py"], claimed_tests(rep)
+        mks("task", "add", "--id", "F4D", "--title", "claims")
+        mks("task", "round", "F4D", "--kind", "build")
+        open(os.path.join(crepo, ".matrixkoder-report-r1.md"), "w").write(rep)
+        w4 = {"data": data, "run": "r1", "task": "F4D", "lane": crepo, "report": ".matrixkoder-report-r1.md"}
+        assert ingest_report(w4) == ["tests/b_test.py"], ingest_report(w4)
+        assert reasons("F4D") == [("claim_mismatch", 2, "report R1: tests/b_test.py")], reasons("F4D")
+        assert len(reasons("F4D")) == 1 and ingest_report(w4) == ["tests/b_test.py"] and len(reasons("F4D")) == 1
+        # F.4 R2: bare-basename and path-suffix claims match; the round comes from report-rN.md
+        assert claim_in("b_test.py", {"tests/b_test.py"}) and claim_in("tests/b_test.py", {"x/tests/b_test.py"})
+        assert not claim_in("c_test.py", {"tests/b_test.py"})
+        mks("task", "add", "--id", "F4F", "--title", "round name")
+        mks("task", "round", "F4F", "--kind", "build")
+        open(os.path.join(crepo, ".matrixkoder-report-r2.md"), "w").write("Added `tests/zz_test.py`.\n")
+        assert ingest_report(dict(w4, task="F4F", report=".matrixkoder-report-r2.md")) == ["tests/zz_test.py"]
+        assert reasons("F4F") == [("claim_mismatch", 2, "report R2: tests/zz_test.py")], reasons("F4F")
+        # a git error on the diff is unknown: nothing is claimed missing
+        _bf = globals()["branch_files"]
+        globals()["branch_files"] = lambda lane_: None
+        try:
+            assert ingest_report(dict(w4, task="F4F", report=".matrixkoder-report-r2.md")) == []
+        finally:
+            globals()["branch_files"] = _bf
+        # a report whose claimed tests are all in the diff opens nothing
+        mks("task", "add", "--id", "F4E", "--title", "honest")
+        mks("task", "round", "F4E", "--kind", "build")
+        open(os.path.join(crepo, ".matrixkoder-report-r1.md"), "w").write("Added `tests/a_test.py`.\n")
+        assert ingest_report(dict(w4, task="F4E")) == [] and reasons("F4E") == []
+
         # --- C4/L6.2: briefs, review briefs, reviews and child ids come from the project DB,
         # and the file view stays the fallback. Its own data dir, because the D7B.3 case above
         # removed <data>/mk.db and the first `store enable` left a read-only runs-legacy there.
@@ -4072,6 +4325,13 @@ def self_test():
         res31b = mark_armed_building(pane_of("H31"))
         assert res31b["building"] == [] and sorted(res31b["skipped_terminal"]) == ["H31", "H32"], res31b
         mkx("task", "set", "H31", "status=merged")
+        # F.4: a rework dispatch is the one exception to the merged guard: the merged task moves
+        # to building and the reply names it in reopened
+        res31r = mark_armed_building(pane_of("H31"), True)
+        assert sorted(res31r["reopened"]) == ["H31", "H32"] and "H31" in res31r["building"], res31r  # H32 is qa here
+        assert "skipped_terminal" not in res31r, res31r
+        assert mkx("task", "get", "H31")["task"]["status"] == "building", "rework did not reopen H31"
+        mkx("task", "set", "H31", "status=merged")
 
         # (todo 130b) dispatch refuses when --task names a task OUTSIDE the pane's armed group,
         # and when the slot's acquired group disagrees. Nothing is typed. The lane above is
@@ -4088,6 +4348,15 @@ def self_test():
                 extra={"MK_BUS_DIR": nobus})
         assert r["ok"] is False and r["delivered"] is False and "H99" in r["error"], r
         assert len(prompt_calls()) == n0, "a mismatched dispatch typed a prompt"
+        # F.4: --kind rework is accepted and is the merged guard's one exception: the merged task
+        # H31 moves to building; an unknown kind is still a usage error
+        r = cli("dispatch", "--pane", pane_of("H31"), "--text", "go", "--task", "H31", "--kind", "rework",
+                extra={"MK_BUS_DIR": nobus, "MK_DISPATCH_RETRY_S": "0", "MK_DISPATCH_RECHECK_S": "0"})
+        assert r["ok"] is True and r["delivered"] is True and r.get("reopened") == ["H31"], r
+        assert mkx("task", "get", "H31")["task"]["status"] == "building", "rework dispatch did not reopen H31"
+        mkx("task", "set", "H31", "status=merged")
+        r = cli("dispatch", "--pane", pane_of("H31"), "--text", "go", "--kind", "nap", code=2)
+        assert r["ok"] is False and "rework" in r["error"], r
         # the slot registry disagrees: slot 1 belongs to a DIFFERENT task than the armed one
         mkx("task", "set", "H31", "slot=1")
         _c = mkdb.open_project(s_home14, "matrixkoder", data_dir=xdata)

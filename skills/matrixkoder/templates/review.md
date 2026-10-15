@@ -11,6 +11,12 @@ Review the commit (or the uncommitted diff) and report. Do NOT rerun the self-te
 ## CRITICAL / HIGH / MEDIUM / LOW
 - `path:line` — problem — fix
 
+## Acceptance
+One row per acceptance line of the task (the brief's Spec / Tests). Verdict is exactly MET, NOT MET or UNVERIFIED; evidence is a `path:line` or the command output you read. An APPROVE with an UNVERIFIED row opens a `no_evidence` risk reason (review-handoff), and a review without this table is flagged.
+| # | Criterion | Verdict | Evidence |
+|---|---|---|---|
+| 1 | <acceptance line> | <MET / NOT MET / UNVERIFIED> | <path:line or output> |
+
 ## Must-check list (state OK or finding for each)
 - Invented data: every status/label/count shown comes from an API field; unknown shows "—".
 - Theming: no literal colours outside theme tokens; non-default themes render.
