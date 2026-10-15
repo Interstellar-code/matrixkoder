@@ -276,8 +276,16 @@ test('without ui the recommended state draws and every press is a no-op', () => 
   const tree = WaitingTab(stubEls(), view, 46)
   const labels = allOf(tree, 'Button').map(b => String(b.props.label))
   expect(labels).toEqual(['a Hold P6', '⋯ More'])
-  for (const key of ['waiting-ask', 'waiting-a']) {
-    expect(() => (buttonByKey(tree, key)?.props.onPress as () => void)()).not.toThrow()
+  // At 46 cols the row folds to the primary plus `⋯ More`, so `waiting-ask` and
+  // `waiting-b/c` do not draw — press every button that does.
+  for (const b of allOf(tree, 'Button')) {
+    expect(() => (b.props.onPress as () => void)()).not.toThrow()
+  }
+  // No fold at 120 cols: every action draws, so its press is proven a no-op too.
+  const wide = WaitingTab(stubEls(), view, 120)
+  expect(allOf(wide, 'Button').map(b => String(b.props.label)), 'no fold at 120: every action draws').toEqual(['a Hold P6', 'b Rebase later', 'c Fold', '? ask in chat'])
+  for (const b of allOf(wide, 'Button')) {
+    expect(() => (b.props.onPress as () => void)()).not.toThrow()
   }
   expect(allOf(WaitingTab(stubEls(), view, 46), 'Button').map(b => String(b.props.label))).toEqual(labels)
   expect(waitingPickKey()).toBe('waiting:pick') // the key the pick is written under

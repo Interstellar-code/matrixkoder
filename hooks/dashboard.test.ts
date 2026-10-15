@@ -2513,6 +2513,14 @@ test('FC: a slow per-project read does not hold the tick, and only one read is i
         return { value: { exitCode: 0, stdout: JSON.stringify({ ok: true, projects: [{ slug: 'alpha', repo: '/r/alpha', data_dir: '/d/alpha', db_path: null }], plans: [] }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
       }
       if (!argv.includes('run-snapshot')) return undefined
+      // Hold ONLY the Kanban cards read — the overview row's store (/d/alpha). The
+      // pane's OWN per-project read (L5: `--data <session data dir>`) is awaited by the
+      // refresh tick by design, so holding it would hold the tick and prove nothing about
+      // the fire-and-forget read this test is about. Answer it "no store" so the tick
+      // proceeds to the file fallback.
+      if (argv[argv.indexOf('--data') + 1] !== '/d/alpha') {
+        return { value: { exitCode: 0, stdout: JSON.stringify({ ok: true, store: false, runs: [] }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      }
       started += 1
       return new Promise<{ value: { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean; isStderrTruncated: boolean } }>(resolve => {
         held.push(resolve)
