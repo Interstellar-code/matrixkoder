@@ -9,7 +9,7 @@ Usage:
   mk-lane-event.py event                (herdr plugin hook: reads HERDR_PLUGIN_EVENT + HERDR_PLUGIN_EVENT_JSON)
   mk-lane-event.py dispatch --pane ID --text TEXT [--timeout-ms 25000] [--role build|review]
                              [--kind build|fix|takeover] [--connect|--no-connect]
-                             [--agent A] [--model M] [--effort E] [--force]
+                             [--task T] [--agent A] [--model M] [--effort E] [--force]
   mk-lane-event.py sweep [--data DIR]
   mk-lane-event.py disarm --lane DIR
   mk-lane-event.py review-handoff --task T [--run R] [--data DIR] [--hold] [--min medium]
@@ -76,7 +76,7 @@ to go idle and sends the prompt exactly as today. No armed watch kind, a kind wi
 --role review, or fresh_session: same: one prompt, no extra herdr call. The reply carries fresh_session (the
 command sent, or null).
 """
-import fcntl, hashlib, importlib.util, json, os, re, shlex, shutil, socket, sqlite3, subprocess, sys, tempfile, time
+import contextlib, fcntl, hashlib, importlib.util, json, os, re, shlex, shutil, socket, sqlite3, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WATCH = ".matrixkoder-watch.json"
@@ -84,6 +84,8 @@ LOCK = ".matrixkoder-watch.lock"
 DISPATCH_RETRY_S = 5  # wait before dispatch's one automatic retry; $MK_DISPATCH_RETRY_S overrides
 DISPATCH_RECHECK_S = 3  # wait before dispatch's one pane-text recheck; $MK_DISPATCH_RECHECK_S overrides
 RETRY_PANE_STATES = ("idle", "done")  # pane sat still through a failed wait → the prompt was lost
+# todo 130: a task that reached one of these is finished; dispatch never moves it back to building
+TERMINAL_STATUSES = ("merged", "qa", "done")
 FRESH_IDLE_WAIT_S = float(os.environ.get("MK_FRESH_IDLE_WAIT_S", "30"))  # bounded; $MK_FRESH_IDLE_WAIT_S shrinks it for a self-test
 FRESH_IDLE_POLL_S = float(os.environ.get("MK_FRESH_IDLE_POLL_S", "0.5"))
 # the doorbell wait is its own bound: a /new just before must finish before the line is typed
@@ -718,6 +720,56 @@ def child_ids(task, data, run):
             and (t.get("parent") or "").lower() == str(task).lower()]
 
 
+def slot_acquired_task(data, slot):
+    """The task `mk-lane.py acquire` recorded for <slot>: the lane registry's row. C4: the
+    store's `lane_slots` rows are the truth; lanes.json is the fallback for a project with no
+    store. -> (task, error): task None when the slot is free/unknown, error names a read
+    failure (a registry we cannot read is refused, never assumed to match)."""
+    if slot in (None, ""):
+        return None, "no slot recorded on the task"
+    rows = store_rows(data, "SELECT slot, task, state FROM lane_slots WHERE slot=?", (str(slot),))
+    if rows is None:  # no store: the published view
+        try:
+            with open(mkpaths.lanes_file(data)) as f:
+                doc = json.load(f)
+            rec = (doc.get("slots") or {}).get(str(slot))
+        except (OSError, ValueError) as e:
+            return None, f"lane registry unreadable: {type(e).__name__}"
+        return ((rec or {}).get("task") or None), (None if rec else f"slot {slot} not in lanes.json")
+    if not rows:
+        return None, f"slot {slot} not in the lane registry"
+    r = rows[0]
+    if (r.get("state") or "") != "busy":
+        return None, f"slot {slot} is {r.get('state') or 'free'}, not busy"
+    return (r.get("task") or None), None
+
+
+def dispatch_task_mismatch(w, named, data, run):
+    """todo 130: dispatch must refuse when the pane's armed task is not the task
+    `mk-lane.py acquire` recorded for that slot — the bug that published the previous task's
+    brief after a slot was reused. -> error string, or None when they agree / the registry
+    cannot be read (an unknown never blocks a dispatch).
+
+    Reads the store directly (one read-only SELECT): a child mk-state call here would show up
+    in a caller's fake-$MK_STATE_CMD log, and this is only a read."""
+    armed = (w or {}).get("task")
+    if not armed:
+        return None
+    if named and str(named).lower() != str(armed).lower():
+        return (f"dispatch names task {named} but the pane's armed task is {armed}")
+    if not (data and run):
+        return None
+    rows = store_rows(data, "SELECT slot FROM tasks WHERE run=? AND lower(id)=lower(?)", (run, str(armed)))
+    slot = rows[0].get("slot") if rows else None
+    acquired, err = slot_acquired_task(data, slot)
+    if err:
+        return None  # an unreadable registry is "cannot say": never blocks a dispatch
+    if acquired and str(acquired).lower() != str(armed).lower():
+        return (f"the pane's armed task {armed} is not the task {acquired} acquire recorded "
+                f"for slot {slot}")
+    return None
+
+
 def mk_state_json(args_list, timeout=30):
     """One mk-state command; -> (parsed JSON line, None) or (None, error). Never raises: a
     failed or unreadable mk-state is the caller's error field, never this helper's exception.
@@ -808,7 +860,10 @@ def mark_armed_building(pane):
     prompt arms every listed phase (tonight's two-phase lane only moved the first phase's).
     No armed watch file → None, nothing else in the JSON. mk-state failures are returned, never
     swallowed and never fatal: the delivery already happened (a parent is never set directly —
-    its status rolls up, so its children are set instead)."""
+    its status rolls up, so its children are set instead).
+    todo 130: a finished target is NEVER demoted. When a re-delivered prompt lands on a lane
+    whose task already reached merged/qa/done (L7.3, Z3, Z5 were set back to building this way),
+    the write is skipped and the reply names the target in skipped_terminal."""
     hit = find_armed(pane)
     if not hit:
         return None
@@ -825,9 +880,21 @@ def mark_armed_building(pane):
             if str(kid).lower() not in seen:
                 seen.add(str(kid).lower())
                 targets.append(kid)
+    # todo 130: the statuses as the store holds them, one read for the whole target list.
+    # Store-only: with no store (or an unreadable one) nothing is known, so nothing is
+    # skipped and no extra mk-state call is made.
+    statuses = {}
+    if run:
+        rows = store_rows(data, "SELECT id, status FROM tasks WHERE run=?", (run,))
+        if rows is not None:
+            statuses = {str(r.get("id") or "").lower(): (r.get("status") or "") for r in rows}
     common = ["--data", data, "--by", "dispatch"] + (["--run", run] if run else [])
-    done, errors = [], []
+    done, skipped, errors = [], [], []
     for t in targets:
+        cur = statuses.get(str(t).lower())
+        if cur in TERMINAL_STATUSES:
+            skipped.append(t)  # a finished task stays finished: never moved back to building
+            continue
         r = subprocess.run([sys.executable, mk_state_cmd(), "task", "set", t, "status=building", *common],
                            capture_output=True, text=True)
         try:
@@ -839,6 +906,8 @@ def mark_armed_building(pane):
         else:
             done.append(t)
     res = {"building": done}
+    if skipped:
+        res["skipped_terminal"] = skipped
     if errors:
         res["task_status_error"] = "; ".join(errors)[:300]
     return res
@@ -944,6 +1013,24 @@ def brief_body_for(data, run, task):
         return open(best).read(), best_n
     except OSError:
         return None, None
+
+
+def write_lane_brief(lane, text):
+    """The bus-down fallback copy: <lane>/.matrixkoder-brief.md, written atomically like the
+    watch file. The ONLY writer of that path (the docs say "bus-down-fallback-only"; until now
+    the orchestrator did it by hand, so a bus-down lane had no brief at all). Returns the path,
+    or None when there is nothing to write / the lane is not a directory."""
+    if not (lane and text and str(text).strip()) or not os.path.isdir(lane):
+        return None
+    try:
+        fd, tmp = tempfile.mkstemp(dir=lane, prefix=".brief-")
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        dest = os.path.join(lane, ".matrixkoder-brief.md")
+        os.replace(tmp, dest)
+        return dest
+    except OSError:
+        return None
 
 
 def publish_brief(data, run, task):
@@ -1091,7 +1178,7 @@ def cmd_dispatch(a):
     # The doorbell replaces the prompt ONLY when the bus is actually up and the brief
     # was published. A yaml flag is not enough: a bus that is enabled but down, or a
     # publish that fails, keeps today's full prompt (C12).
-    connected, legacy_note = False, None
+    connected, legacy_note, lane_brief = False, None, None
     if opt(a, "--role", "build") == "build":
         hit = find_armed(pane)
         wdata = (hit[1].get("data") or "") if hit else ""
@@ -1129,6 +1216,12 @@ def cmd_dispatch(a):
                     alert_publish_failure(wdata, wrun, wtask, publish_error)
         if why:
             legacy_note = f"legacy prompt: {why}"
+            # A2/X3.2: the bus-down fallback copies the DB brief into the lane. Only here —
+            # when the bus is up the lane reads the brief over the bus (connect) and no copy
+            # is written (docs: "bus-down-fallback-only").
+            if hit:
+                btext, _bn = brief_body_for(wdata, wrun, wtask)
+                lane_brief = write_lane_brief(hit[1].get("lane") or "", btext)
     elif opt(a, "--lane") and "--no-connect" not in a:
         # review over the bus: the reviewer pane shares the builder's lane, so the lane's
         # watch file names the run/task; the review brief goes as its own kind and the pane
@@ -1161,7 +1254,8 @@ def cmd_dispatch(a):
 
     def reply(d, note=None):
         n = "; ".join(x for x in (legacy_note, note) if x)
-        out({**d, "connect": connected, **({"note": n} if n else {})})
+        out({**d, "connect": connected, **({"lane_brief": lane_brief} if lane_brief else {}),
+             **({"note": n} if n else {})})
 
     role = opt(a, "--role", "build")
     if role not in ("build", "review"):
@@ -1187,6 +1281,14 @@ def cmd_dispatch(a):
         hit = find_armed(pane)
         if hit:
             w = hit[1]
+            # todo 130: the mismatch refusal runs BEFORE the route write and the field check —
+            # a dispatch aimed at a slot whose acquire recorded a different task must type
+            # nothing. An unreadable registry is "cannot say" and never blocks.
+            mismatch = dispatch_task_mismatch(w, opt(a, "--task"), w.get("data"), w.get("run"))
+            if mismatch and "--force" not in a:
+                reply({"ok": False, "delivered": False, "pane": pane,
+                       "armed_task": w.get("task"), "error": mismatch})
+                return
             route, route_err = record_route(
                 w, agent=opt(a, "--agent"), model=opt(a, "--model"), effort=opt(a, "--effort"))
             ok, missing, chk_err = task_check(w, w.get("task"))
@@ -1481,28 +1583,52 @@ def review_path_for(data, run, task):
     return best
 
 
-def review_body_for(data, run, task):
-    """The newest review for the task as (round, text, ref), or (None, None, None).
+def newest_review(data, run, task):
+    """todo 114: the newest ROUND wins, whatever its source. -> (round, text, ref, src).
 
-    C4: the store's `review` artifact wins. `ref` names where the text came from — the task
-    folder's review-rN.md when a file exists (the brief cites it), else the DB location, so
-    the FIX section never points a lane at a file that was never written.
-    The lane's own .matrixkoder-review-rN.md is NOT consulted here: cmd_review_handoff copies
-    it into the task folder first, which lands it in the store on the next mk-state commit."""
+    A stored round-N-1 `review` artifact must not shadow the lane's newer
+    .matrixkoder-review-rN.md — that bug reported round N "already handed off" while the
+    reviewer's fresh review sat unread in the lane. Candidates: the store's `review` artifact
+    (C4), the task folder's review-rN.md and the lane's .matrixkoder-review-rN.md. Ties go to
+    the store. `ref` names where the text came from: the task folder's copy of that round when
+    it exists (the brief cites it), else the lane file, else the DB location — never a file of
+    another round. `src` is the lane file to copy in when the text came from there, else None.
+    """
+    cands = []  # (round, store-first rank, text, task-folder path, lane file)
     got = newest_stored_artifact(data, run, task, "review")
-    if got:
-        n, text = got
-        path = review_path_for(data, run, task)
-        ref = path or f"project DB review artifact (round {n}, task {task})"
-        return n, text, ref
+    n_file, text_file = None, None
     path = review_path_for(data, run, task)
-    if not path:
-        return None, None, None
-    n = review_round_of(path)
-    try:
-        return n, open(path).read(), path
-    except OSError:
-        return None, None, None
+    if path:
+        n_file = review_round_of(path)
+        try:
+            text_file = open(path).read()
+        except OSError:
+            n_file, text_file = None, None
+    if got:
+        cands.append((got[0], 0, got[1], path if n_file == got[0] else None, None))
+    if n_file is not None:
+        cands.append((n_file, 1, text_file, path, None))
+    lane_path = lane_review_for(data, run, task)
+    if lane_path:
+        n_lane = review_round_of(lane_path)
+        try:
+            text_lane = open(lane_path).read()
+        except OSError:
+            text_lane = None
+        if n_lane is not None and text_lane is not None:
+            cands.append((n_lane, 2, text_lane, path if n_file == n_lane else None, lane_path))
+    if not cands:
+        return None, None, None, None
+    n, _rank, text, cited, src = max(cands, key=lambda c: (c[0], -c[1]))
+    ref = cited or src or f"project DB review artifact (round {n}, task {task})"
+    return n, text, ref, src
+
+
+def review_body_for(data, run, task):
+    """The newest review for the task as (round, text, ref), or (None, None, None). See
+    newest_review: the newest ROUND wins whatever its source (todo 114)."""
+    n, text, ref, _src = newest_review(data, run, task)
+    return n, text, ref
 
 
 def send_brief_over_bus(data, run, task, text, round_n):
@@ -1746,28 +1872,24 @@ def cmd_review_handoff(a):
         except OSError as e:
             fail(f"review unreadable: {e}")
     else:
-        n, text, ref = review_body_for(data, run, task)
+        # todo 114: the newest ROUND wins, whatever its source — a stored review of round
+        # N-1 must not shadow the lane's fresh .matrixkoder-review-rN.md and report round N
+        # "already handed off".
+        n, text, ref, src = newest_review(data, run, task)
         if text is None:
+            lane = (task_record(data, run, task).get("lane") or "<lane>")
+            fail(f"no review file for {task}: looked in "
+                 f"{mkpaths.task_dir(data, run, task)} and "
+                 f"{lane}/.matrixkoder-review-rN.md")
+        if src:
             # the reviewer writes into its own lane; copy that back into the task folder
-            found = lane_review_for(data, run, task)
-            if not found:
-                lane = (task_record(data, run, task).get("lane") or "<lane>")
-                fail(f"no review file for {task}: looked in "
-                     f"{mkpaths.task_dir(data, run, task)} and "
-                     f"{lane}/.matrixkoder-review-rN.md")
-            # the lane file is copied into the task folder under the plain name, and the
-            # brief cites the copy so it survives a lane reset
+            # under the plain name, and the brief cites the copy so it survives a lane reset
             dest_dir = mkpaths.task_dir(data, run, task)
             os.makedirs(dest_dir, exist_ok=True)
-            n_found = review_round_of(found)
-            path = os.path.join(dest_dir, f"review-r{n_found}.md")
+            path = os.path.join(dest_dir, f"review-r{n}.md")
             if not os.path.isfile(path):
-                shutil.copyfile(found, path)
-            n, ref = n_found, path
-            try:
-                text = open(path).read()
-            except OSError as e:
-                fail(f"review unreadable: {e}")
+                shutil.copyfile(src, path)
+            ref = path
     verdict = review_verdict(text)
     if verdict == "APPROVE":
         r = subprocess.run(
@@ -2048,13 +2170,34 @@ def self_test():
             mks("task", "add", "--id", tid, "--title", tid)
             mks("task", "set", tid, "status=building")
 
+        # L4 (C4): there is no runs/<run>/run.json or events.jsonl any more — the store's
+        # tasks/events rows are the record. These harness readers open it read-only.
+        def store_read(sql, params=()):
+            path = os.path.join(data, "mk.db")
+            if not os.path.isfile(path):
+                return []
+            con = sqlite3.connect("file:%s?mode=ro" % path, uri=True)
+            con.row_factory = sqlite3.Row
+            try:
+                return [dict(r) for r in con.execute(sql, params)]
+            finally:
+                con.close()
+
         def task_status(tid):
-            run_ = json.load(open(os.path.join(data, "runs", "r1", "run.json")))
-            return next(t["status"] for t in run_["tasks"] if t["id"].lower() == tid.lower())
+            rows = store_read("SELECT status FROM tasks WHERE run='r1' AND lower(id)=lower(?)", (tid,))
+            return rows[0]["status"] if rows else None
 
         def events():
-            with open(os.path.join(data, "runs", "r1", "events.jsonl")) as f:
-                return [json.loads(x) for x in f if x.strip()]
+            out = []
+            for r in store_read("SELECT task, kind, from_id, to_id, text, meta_json FROM events"
+                                " WHERE run='r1' AND chan='state' ORDER BY id"):
+                by = None
+                if r.get("meta_json"):
+                    with contextlib.suppress(ValueError):
+                        by = json.loads(r["meta_json"]).get("by")
+                out.append({"task": r["task"], "type": r["kind"], "from": r["from_id"],
+                            "to": r["to_id"], "text": r["text"], "by": by})
+            return out
 
         def transitions():
             return [e for e in events() if e.get("type") == "transition" and e.get("from")]
@@ -2287,8 +2430,12 @@ def self_test():
         os.unlink(al_rc)
         # arm records the lane's pane on the task, so the board names it without reading the watch file
         def task_field(tid, key):
-            run_ = json.load(open(os.path.join(data, "runs", "r1", "run.json")))
-            return next(t for t in run_["tasks"] if t["id"].lower() == tid.lower())[key]
+            # a direct read-only store read, never a child mk-state: a case with $MK_STATE_CMD
+            # faked would otherwise see this probe in its call log
+            rows = store_read("SELECT * FROM tasks WHERE run='r1' AND lower(id)=lower(?)", (tid,))
+            assert rows, f"task {tid} not in the store"
+            val = rows[0][key]
+            return json.loads(val) if key in ("deps", "owned", "refs") and isinstance(val, str) else val
 
         assert task_field("H1", "pane") == pane_of("H1")
         r = event("done", tid="H1")
@@ -2934,8 +3081,8 @@ def self_test():
         open(status_f, "w").write("done")
         r = event("done", tid="H9")
         assert r["verdict"] == "DONE" and r["recorded"], r
-        st_ = json.load(open(os.path.join(data, "runs", "r1", "run.json")))["tasks"]
-        got = {t["id"]: t["status"] for t in st_}
+        got = {t["id"]: t["status"] for t in store_read(
+            "SELECT id, status FROM tasks WHERE run='r1'")}
         assert got["H9C1"] == "verifying" and got["H10"] == "verifying", got
         assert got["H9"] == "verifying", got  # rolled up from its child
 
@@ -3049,9 +3196,8 @@ def self_test():
         os.unlink(os.path.join(tmp, "bus_revoke_out.txt"))
 
         # --- the project store (D5A.2): verdict_for reads the store inside the per-lane lock ---
-        # self-hosting guard: every case above ran with no store and created none
-        assert not os.path.exists(os.path.join(data, "mk.db")), "an event created mk.db"
-        mks("store", "enable")
+        # L4 (C4): the store is always on — every mk-state write above created and used mk.db
+        # (no file views, no `store enable` gate any more).
         assert os.path.getsize(os.path.join(data, "mk.db")) > 0
         # store-first: no lane status file, the tasks row + report artifact decide -> DONE, source=store
         mks("task", "add", "--id", "S1", "--title", "store")
@@ -3060,6 +3206,7 @@ def self_test():
         g(repo, "worktree", "add", "-q", "--detach", lanes["S1"])
         g(lanes["S1"], "commit", "-q", "--allow-empty", "-m", "feat(p1): store core")
         td = os.path.join(data, "runs", "r1", "tasks", "S1")
+        os.makedirs(td, exist_ok=True)
         open(os.path.join(td, "report-r1.md"), "w").write("# report\nstore\n")
         mks("task", "round", "S1", "--kind", "build")
         os.unlink(os.path.join(td, "report-r1.md"))   # only the artifact remains
@@ -3110,6 +3257,7 @@ def self_test():
         g(repo, "worktree", "add", "-q", "--detach", lanes["S4"])
         g(lanes["S4"], "commit", "-q", "--allow-empty", "-m", "feat(p1): sweep core")
         td = os.path.join(data, "runs", "r1", "tasks", "S4")
+        os.makedirs(td, exist_ok=True)
         open(os.path.join(td, "report-r1.md"), "w").write("# report\n")
         mks("task", "round", "S4", "--kind", "build")
         os.unlink(os.path.join(td, "report-r1.md"))
@@ -3528,11 +3676,13 @@ def self_test():
 
         # (D7B R3) store mode: mk.db present, so bus.json lives in the MK home, not the data dir.
         # A stale <data>/bus.json must not win. A real store-mode bus, real acquire and arm.
-        open(os.path.join(data, "mk.db"), "w").write("")
+        # L4 (C4): <data>/mk.db is the real store now, not an empty marker. It must survive
+        # this case (deleting it would take run r1 with it — there is no file view to fall
+        # back on). The stale <data>/bus.json below is the point: bus.json resolves to the
+        # MK home when the store is present, never the leftover data-dir file.
         _home = os.path.join(tmp, "mkhome")
         os.makedirs(_home, exist_ok=True)
         open(os.path.join(data, "bus.json"), "w").write(json.dumps({"port": 1}))
-        # no MK_BUS_DIR: a present mk.db resolves to the MK home, never the stale data-dir file
         _saved_home = os.environ.get("MK_HOME")
         _saved_mhome = os.environ.get("MATRIXKODER_HOME")
         _saved_bdir = os.environ.get("MK_BUS_DIR")
@@ -3540,6 +3690,7 @@ def self_test():
         os.environ["MATRIXKODER_HOME"] = _home
         os.environ.pop("MK_BUS_DIR", None)
         try:
+            assert os.path.isfile(os.path.join(data, "mk.db")), "the store must exist here"
             assert bus_dir_for(data) == mkpaths.target_bus_dir(), bus_dir_for(data)
             assert bus_is_up(data) is False
             os.makedirs(mkpaths.target_bus_dir(), exist_ok=True)
@@ -3560,7 +3711,6 @@ def self_test():
             else:
                 os.environ["MK_BUS_DIR"] = _saved_bdir
         _srv.shutdown()
-        os.unlink(os.path.join(data, "mk.db"))
         os.unlink(os.path.join(data, "bus.json"))
 
         # (D7B.2) review-handoff. The bus is the fake, so "sent" is the recorded argv.
@@ -3591,14 +3741,15 @@ def self_test():
         no_prev = filled_brief(data, "r1", "RN", 2, os.path.join(rev_dir, "review-r1.md"), "1. [HIGH] a:1 — p — f")
         assert _bc.placeholder_failures(no_prev) == [], _bc.placeholder_failures(no_prev)
         assert "Co-Authored-By: <" not in no_prev, no_prev
-        calls = bus_calls()
-        joined = " ".join(calls)
+        bcalls = bus_calls()
+        joined = " ".join(bcalls)
         assert joined.startswith("send ") and "--from orch" in joined and "--kind info" in joined \
-            and "kind:brief" in joined, calls
+            and "kind:brief" in joined, bcalls
         # APPROVE records the verdict and dispatches nothing
         mks("task", "add", "--id", "RA", "--title", "approve")
         mks("task", "round", "RA", "--kind", "build")
         ad = os.path.join(data, "runs", "r1", "tasks", "RA")
+        os.makedirs(ad, exist_ok=True)
         open(os.path.join(ad, "review-r1.md"), "w").write("# RA review — APPROVE\n\n## Verified\n- ok\n")
         open(bus_log, "w").write("")
         r = cli("review-handoff", "--task", "RA", "--run", "r1", "--data", data)
@@ -3608,13 +3759,13 @@ def self_test():
         mks("task", "add", "--id", "HH", "--title", "hold")
         mks("task", "round", "HH", "--kind", "build")
         hd = os.path.join(data, "runs", "r1", "tasks", "HH")
+        os.makedirs(hd, exist_ok=True)
         open(os.path.join(hd, "review-r1.md"), "w").write(
             "# HH review — REQUEST CHANGES\n\n## CRITICAL\n- x:1 — boom — stop\n")
         open(bus_log, "w").write("")
         r = cli("review-handoff", "--task", "HH", "--run", "r1", "--data", data, "--hold")
         assert r["ok"] is True and r["held"] is True and r["dispatched"] is False, r
-        hh = next(t for t in json.load(open(os.path.join(data, "runs", "r1", "run.json")))["tasks"]
-                  if t["id"] == "HH")
+        hh = store_read("SELECT id, round FROM tasks WHERE run='r1' AND id='HH'")[0]
         assert hh["round"] == 1, hh  # nothing opened while held
         assert bus_calls() == [], bus_calls()
         # the second call releases: one round, one send
@@ -3627,6 +3778,7 @@ def self_test():
         mks("task", "add", "--id", "RZ", "--title", "empty")
         mks("task", "round", "RZ", "--kind", "build")
         zd = os.path.join(data, "runs", "r1", "tasks", "RZ")
+        os.makedirs(zd, exist_ok=True)
         open(os.path.join(zd, "review-r1.md"), "w").write(
             "# RZ review — REQUEST CHANGES\n\nno headings here\n")
         r = cli("review-handoff", "--task", "RZ", "--run", "r1", "--data", data)
@@ -3653,6 +3805,7 @@ def self_test():
         assert "scripts/c.py:4" in got and copied in got and "<PHASE>" not in got, got
         # the real Commands heading (longer than the old exact text) is copied
         prev = os.path.join(data, "runs", "r1", "tasks", "RL", "brief-r1.md")
+        os.makedirs(os.path.dirname(prev), exist_ok=True)
         open(prev, "w").write("## Commands (wait for each; ONE run each at the end)\n0. `B start`\n\n## Rules\n- Use the mk-builder skill.\n")
         block = commands_block_of(open(prev).read())
         assert block.startswith("## Commands") and "`B start`" in block, block
@@ -3720,6 +3873,10 @@ def self_test():
         # sqlite3.OperationalError escaped dispatch over a store file no one could read.
         _bad = os.path.join(tmp, "badstore")
         shutil.copytree(os.path.join(ddata, "runs"), os.path.join(_bad, "runs"))
+        # a pre-migration file view: L4 writes no run.json, but the fallback path still reads
+        # one, so the fixture must supply it (this is the case that proves the fallback works)
+        open(mkpaths.run_doc(_bad, "r1"), "w").write(json.dumps(
+            {"id": "r1", "tasks": [{"id": "DB", "parent": None}, {"id": "DB.1", "parent": "DB"}]}))
         bad_db = mkpaths.project_db(data=_bad)
         open(bad_db, "w").close()
         os.chmod(bad_db, 0o000)
@@ -3787,6 +3944,168 @@ def self_test():
             for path in (old_tok, new_tok):
                 if os.path.exists(path):
                     os.unlink(path)
+
+        # --- X3.2: todo 114 (newest review ROUND wins whatever its source), todo 130
+        # (mark_armed_building never demotes a finished task; dispatch refuses a task/slot
+        # mismatch), and the bus-down lane brief copy. Its own data dir, so the DB cases
+        # above cannot leak state into these.
+        xdata = os.path.join(tmp, "x32data")
+        os.makedirs(xdata)
+
+        def mkx(*args):
+            r = subprocess.run([sys.executable, MK, *args, "--data", xdata],
+                               capture_output=True, text=True)
+            assert r.returncode == 0, r.stdout + r.stderr
+            return json.loads(r.stdout.strip().splitlines()[-1])
+
+        mkx("run", "init", "--id", "r1", "--feature", "X32", "--branch", "b")
+        mkx("store", "enable")
+
+        # (todo 114) the store holds round 1's review; the lane has a NEWER round 2. The
+        # round-2 review must win — the bug returned round 1 and reported "already handed off".
+        mkx("task", "add", "--id", "R14", "--title", "round wins")
+        mkx("task", "round", "R14", "--kind", "build")
+        s_home14 = os.path.join(xdata, ".mk-home")
+        _c = mkdb.open_project(s_home14, "matrixkoder", data_dir=xdata)
+        try:
+            mkdb.put_artifact(s_home14, "matrixkoder", "r1", "R14", 1, "review",
+                              "# R14 review — REQUEST CHANGES\n\n## HIGH\n- a:1 — old — stale\n",
+                              data_dir=xdata)
+        finally:
+            _c.close()
+        lane14 = os.path.join(tmp, "lane-r14")
+        os.makedirs(lane14, exist_ok=True)
+        mkx("task", "set", "R14", "lane=" + lane14)
+        mkx("task", "set", "R14", "slot=1")
+        mkx("task", "round", "R14", "--kind", "fix", "--cause", "verification gap")  # now round 2
+        assert task_round_of(xdata, "r1", "R14") == 2, "fixture: R14 must be at round 2"
+        open(os.path.join(lane14, ".matrixkoder-review-r2.md"), "w").write(
+            "# R14 review — REQUEST CHANGES\n\n## MEDIUM\n- b:2 — new — fresh\n")
+        n14, text14, ref14 = review_body_for(xdata, "r1", "R14")
+        assert n14 == 2 and "fresh" in text14 and "stale" not in text14, (n14, text14, ref14)
+        # the FIX handoff opens off round 2, not round 1, and copies the lane file in
+        r = cli("review-handoff", "--task", "R14", "--run", "r1", "--data", xdata)
+        assert r["ok"] is True and r["dispatched"] is True and r["round"] == 3, r
+        got = open(r["brief"]).read()
+        assert "b:2" in got and "a:1" not in got, got
+        copied14 = os.path.join(xdata, "runs", "r1", "tasks", "R14", "review-r2.md")
+        assert os.path.isfile(copied14), copied14
+        # the store's OLDER review must not shadow the newer lane file: the same call again
+        # ("already handed off" is the correct answer now that round 3 IS open)
+        r = cli("review-handoff", "--task", "R14", "--run", "r1", "--data", xdata)
+        assert r["ok"] is True and r["dispatched"] is False and r["reason"] == "already handed off", r
+        # the store still wins a tie: a round-2 artifact written after the file is the same
+        # round, and the round is what decides
+        n14b, _t14b, _r14b = review_body_for(xdata, "r1", "R14")
+        assert n14b == 2, n14b
+
+        # (todo 130a) mark_armed_building never demotes a merged/done/qa task. H31 is merged
+        # in the store; H32 is building. Both are armed on one lane; a delivered dispatch may
+        # only move H32.
+        mkx("task", "add", "--id", "H31", "--title", "finished")
+        mkx("task", "add", "--id", "H32", "--title", "open")
+        mkx("task", "set", "H31", "status=merged")
+        mkx("task", "set", "H32", "status=building")
+        lane31 = os.path.join(tmp, "lane-h31")
+        g(repo, "worktree", "add", "-q", "--detach", lane31)
+        lanes["H31"] = lane31
+        mkx("task", "set", "H31", "pane=" + pane_of("H31"))
+        mkx("task", "set", "H32", "pane=" + pane_of("H31"))
+        r = cli("arm", "--lane", lane31, "--pane", pane_of("H31"), "--tasks", "H31,H32",
+                "--run", "r1", "--data", xdata, "--phase", "P1", "--commit-grep", r"feat\(p1\)")
+        assert r["ok"] and "task_pane_error" not in r, r
+        res31 = mark_armed_building(pane_of("H31"))
+        assert res31 is not None and res31.get("skipped_terminal") == ["H31"], res31
+        assert "H32" in res31["building"] and "H31" not in res31["building"], res31
+        assert mkx("task", "get", "H31")["task"]["status"] == "merged", "H31 was demoted"
+        assert mkx("task", "get", "H32")["task"]["status"] == "building", "H32 not moved"
+        # an all-terminal lane is a no-op: nothing in building, everything named skipped
+        mkx("task", "set", "H31", "status=done")
+        mkx("task", "set", "H32", "status=qa")
+        res31b = mark_armed_building(pane_of("H31"))
+        assert res31b["building"] == [] and sorted(res31b["skipped_terminal"]) == ["H31", "H32"], res31b
+        mkx("task", "set", "H31", "status=merged")
+
+        # (todo 130b) dispatch refuses when --task names a different task than the pane's
+        # armed task, and when the slot's acquired task disagrees. Nothing is typed.
+        # The bus is pinned down (an empty MK_BUS_DIR) so the legacy path decides: no doorbell.
+        nobus = os.path.join(tmp, "nobus")
+        os.makedirs(nobus, exist_ok=True)
+        set_canned("prompt_out.txt", '{"result": {"agent": {"agent_status": "idle"}}}\n')
+        set_canned("prompt_rc.txt", "0")
+        n0 = len(prompt_calls())
+        r = cli("dispatch", "--pane", pane_of("H31"), "--text", "go", "--task", "H32",
+                extra={"MK_BUS_DIR": nobus})
+        assert r["ok"] is False and r["delivered"] is False and "H32" in r["error"], r
+        assert len(prompt_calls()) == n0, "a mismatched dispatch typed a prompt"
+        # the slot registry disagrees: slot 1 belongs to a DIFFERENT task than the armed one
+        mkx("task", "set", "H31", "slot=1")
+        _c = mkdb.open_project(s_home14, "matrixkoder", data_dir=xdata)
+        try:
+            _c.execute("DELETE FROM lane_slots")
+            _c.execute("INSERT INTO lane_slots(slot, lane_path, state, run, task)"
+                       " VALUES ('1', ?, 'busy', 'r1', 'OTHER')", (lane31,))
+            _c.commit()
+        finally:
+            _c.close()
+        n0 = len(prompt_calls())
+        r = cli("dispatch", "--pane", pane_of("H31"), "--text", "go", extra={"MK_BUS_DIR": nobus})
+        assert r["ok"] is False and r["delivered"] is False and "OTHER" in r["error"], r
+        assert len(prompt_calls()) == n0, "a slot-mismatched dispatch typed a prompt"
+        # --force is the documented escape hatch: the dispatch goes through
+        n0 = len(prompt_calls())
+        r = cli("dispatch", "--pane", pane_of("H31"), "--text", "go", "--force",
+                extra={"MK_BUS_DIR": nobus})
+        assert r["ok"] is True and r["delivered"] is True, r
+        assert len(prompt_calls()) == n0 + 1, prompt_calls()[n0:]
+        # a free slot is not a mismatch: the registry has no task to disagree with
+        _c = mkdb.open_project(s_home14, "matrixkoder", data_dir=xdata)
+        try:
+            _c.execute("UPDATE lane_slots SET state='free', task=NULL")
+            _c.commit()
+        finally:
+            _c.close()
+        n0 = len(prompt_calls())
+        r = cli("dispatch", "--pane", pane_of("H31"), "--text", "go", extra={"MK_BUS_DIR": nobus})
+        assert r["ok"] is True and r["delivered"] is True, r
+        assert len(prompt_calls()) == n0 + 1, prompt_calls()[n0:]
+
+        # (A2/X3.2) the bus-down fallback copies the brief into the lane. The bus is pinned
+        # down; the store holds a brief artifact for the lane's lead task (dispatch publishes
+        # for the watch's lead), so the legacy path writes <lane>/.matrixkoder-brief.md.
+        _c = mkdb.open_project(s_home14, "matrixkoder", data_dir=xdata)
+        try:
+            mkdb.put_artifact(s_home14, "matrixkoder", "r1", "H31", 1, "brief",
+                              "# H31 brief\nfrom the store, into the lane\n", data_dir=xdata)
+        finally:
+            _c.close()
+        assert not os.path.exists(os.path.join(lane31, ".matrixkoder-brief.md"))
+        r = cli("dispatch", "--pane", pane_of("H31"), "--text", "the full prompt stays",
+                extra={"MK_BUS_DIR": nobus})
+        assert r["ok"] is True and r["connect"] is False, r
+        assert r.get("lane_brief") and os.path.realpath(r["lane_brief"]) == \
+            os.path.realpath(os.path.join(lane31, ".matrixkoder-brief.md")), r
+        assert "into the lane" in open(os.path.join(lane31, ".matrixkoder-brief.md")).read()
+        # the copy falls back to the task folder's brief when the store holds none (C4's
+        # fallback, kept): delete the artifact and give the lead task a brief-rN.md file
+        os.unlink(os.path.join(lane31, ".matrixkoder-brief.md"))
+        fb_dir = os.path.join(xdata, "runs", "r1", "tasks", "H31")
+        os.makedirs(fb_dir, exist_ok=True)
+        open(os.path.join(fb_dir, "brief-r1.md"), "w").write("# file brief\nfallback into lane\n")
+        _c = mkdb.open_project(s_home14, "matrixkoder", data_dir=xdata)
+        try:
+            # a briefed task must own files; a started task drops `owned` through task set,
+            # so plant it the way mk-plan approve writes it — through mkdb, the one writer
+            _c.execute("UPDATE tasks SET owned=? WHERE run='r1' AND id='H31'", ("scripts/h31.py",))
+            _c.execute("DELETE FROM artifacts WHERE run='r1' AND task='H31' AND kind='brief'")
+            _c.commit()
+        finally:
+            _c.close()
+        r = cli("dispatch", "--pane", pane_of("H31"), "--text", "the full prompt stays",
+                extra={"MK_BUS_DIR": nobus})
+        assert r["ok"] is True and r.get("lane_brief"), r
+        assert "fallback into lane" in open(os.path.join(lane31, ".matrixkoder-brief.md")).read()
+        os.unlink(os.path.join(lane31, ".matrixkoder-brief.md"))
 
         srv.shutdown()
         srv.server_close()
