@@ -181,6 +181,13 @@ def store_con(data):
     return db.open_project(mkpaths.home(), STORE_PROJECT, data_dir=data)
 
 
+def store_run_id(con, run):
+    """-> the stored run id for `run`, matched case-insensitively — mk-lane's resolve_run rule, so
+    both readers accept the same spelling of a run. None when the store knows no such run."""
+    return next((r["id"] for r in con.execute("SELECT id FROM runs").fetchall()
+                 if str(r["id"]).lower() == run.lower()), None)
+
+
 _mkdb_mod = None
 
 
@@ -520,15 +527,20 @@ def child_tasks(task, data, run=None):
     that are parents themselves (mk-state refuses status= on ANY parent: "status rolls up from
     children"; intermediate parents get the verdict by roll-up, leaves by the write). [] for a
     leaf, an unknown task, an unreadable or ambiguous run: the mk-state write itself then decides,
-    exactly as before. With the project store on, the tasks table is the tree (parent column);
-    otherwise the run.json files. Mirrors mk-state's run pick: --run names the run; else the
-    single active run; with several, the one that owns the task (ids match case-insensitively)."""
-    if store_on(data):
+    exactly as before. The project store is the source — the tasks table is the tree (parent
+    column) and the runs table the run list; only a project with no store falls back to the run.json
+    files (the pre-L4 layout). Mirrors mk-state's run pick and mk-lane's resolve_run: --run names
+    the run, matched case-insensitively against the stored spelling; else the single active run;
+    with several, the one that owns the task (task ids match case-insensitively too)."""
+    if store_on(data):  # the store is the read source; the file reads below are the pre-L4 fallback
         try:
             con = store_con(data)
             try:
                 if run:
-                    rows = con.execute("SELECT id, parent FROM tasks WHERE run=?", (run,)).fetchall()
+                    rid = store_run_id(con, run)  # the stored spelling, as mk-lane resolves it
+                    if rid is None:
+                        return []
+                    rows = con.execute("SELECT id, parent FROM tasks WHERE run=?", (rid,)).fetchall()
                     if not any(str(r["id"]).lower() == task.lower() for r in rows):
                         return []
                 else:
@@ -548,6 +560,7 @@ def child_tasks(task, data, run=None):
             return []
         return _leaves([{"id": r["id"], "parent": r["parent"]} for r in rows], task)
 
+    # pre-L4 fallback: a project with no store still has <data>/runs/<rid>/run.json + index.json.
     def load(rid):
         try:
             with open(mkpaths.run_doc(data, rid)) as f:
@@ -1584,6 +1597,70 @@ def self_test():
         finally:
             os.rmdir(dbp)
             os.rename(dbp + ".w1bak", dbp)
+
+        # L5: child_tasks reads the store — the tasks/runs tables are the tree and the run list,
+        # with the run id resolved case-insensitively exactly as mk-lane's resolve_run does. The
+        # file views (runs/index.json + the run documents) are the pre-L4 fallback, exercised
+        # below in a project that has no store at all.
+        cw = os.path.join(tmp, "data-child-tasks")
+        os.makedirs(cw)
+
+        def cwks(*args):
+            r = subprocess.run([sys.executable, MK_STATE, *args, "--data", cw],
+                               capture_output=True, text=True)
+            assert r.returncode == 0, r.stdout + r.stderr
+
+        cwks("run", "init", "--id", "cr1", "--feature", "F", "--branch", "b")
+        cwks("task", "add", "--id", "CW", "--title", "group")
+        for _c in ("Ca", "Cb", "Cc"):
+            cwks("task", "add", "--id", _c, "--title", _c, "--parent", "CW")
+        cwks("task", "add", "--id", "CLeaf", "--title", "leaf")
+        # (e) pre-migration: no store, so the run documents answer
+        assert not store_on(cw) and not os.path.exists(os.path.join(cw, "mk.db"))
+        assert child_tasks("CW", cw) == ["Ca", "Cb", "Cc"], child_tasks("CW", cw)
+        assert child_tasks("CW", cw, "cr1") == ["Ca", "Cb", "Cc"]
+        assert child_tasks("CLeaf", cw) == [], "a leaf has no children"
+        assert child_tasks("nope", cw) == [], "an unknown task"
+        assert child_tasks("CW", cw, "nosuch") == [], "an unknown run"
+        # the store comes on: same answers off the tables, with the files still present (b)
+        cwks("store", "enable")
+        assert store_on(cw)
+        for _t in os.listdir(os.path.join(cw, "runs", "cr1", "tasks")):
+            _p = os.path.join(cw, "runs", "cr1", "tasks", _t)
+            shutil.rmtree(_p) if os.path.isdir(_p) else os.unlink(_p)
+        assert child_tasks("CW", cw) == ["Ca", "Cb", "Cc"], child_tasks("CW", cw)
+        assert child_tasks("CLeaf", cw) == [] and child_tasks("nope", cw) == []
+        # (a) the file views are gone: the store alone answers, identically
+        os.unlink(mkpaths.runs_index(cw))
+        os.unlink(mkpaths.run_doc(cw, "cr1"))
+        assert not os.path.exists(mkpaths.run_doc(cw, "cr1"))
+        assert not os.path.exists(mkpaths.runs_index(cw))
+        assert child_tasks("CW", cw) == ["Ca", "Cb", "Cc"], child_tasks("CW", cw)
+        assert child_tasks("CLeaf", cw) == [] and child_tasks("nope", cw) == []
+        # (c) case-insensitive: the task, and the --run id typed in any case
+        assert child_tasks("cw", cw) == ["Ca", "Cb", "Cc"], child_tasks("cw", cw)
+        assert child_tasks("CW", cw, "CR1") == ["Ca", "Cb", "Cc"], child_tasks("CW", cw, "CR1")
+        assert child_tasks("CW", cw, "Cr1") == ["Ca", "Cb", "Cc"]
+        assert child_tasks("cW", cw, "cr1") == ["Ca", "Cb", "Cc"]
+        # (d) a run the store does not know still yields []: the mk-state write decides
+        assert child_tasks("CW", cw, "nosuch") == []
+        assert child_tasks("CW", cw, "NOPE") == []
+        # the same, with no MK home in the environment at all: a temp $HOME and nothing set
+        bare = {k: v for k, v in os.environ.items()
+                if k not in ("MK_HOME", "MATRIXKODER_HOME", "MATRIXKODER_DATA")}
+        bare["HOME"] = os.path.join(tmp, "bare-home")
+        os.makedirs(bare["HOME"])
+        assert not os.path.exists(os.path.join(bare["HOME"], ".matrixkoder"))
+        got = subprocess.run([sys.executable, "-c",
+                              "import importlib.util as u; "
+                              "s = u.spec_from_file_location('lw', %r); "
+                              "m = u.module_from_spec(s); s.loader.exec_module(m); "
+                              "print(m.child_tasks('CW', %r, 'CR1'))" % (
+                                  os.path.abspath(__file__), cw)],
+                             capture_output=True, text=True, env=bare, cwd=cw)
+        assert got.returncode == 0 and got.stdout.strip() == "['Ca', 'Cb', 'Cc']", (
+            got.returncode, got.stdout, got.stderr)
+        assert not os.path.exists(os.path.join(bare["HOME"], ".matrixkoder")), "a read created a home"
 
         # W1: the child-progress scale never exceeds 4
         _hit, _scale = child_progress(os.getpid())
