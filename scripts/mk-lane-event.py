@@ -1121,19 +1121,23 @@ def alert_publish_failure(data, run, task, error):
         pass
 
 
-def connect_text(lane, data):
+DOORBELL_ACT = "then carry out what it delivers (brief, round, nudge) without asking; ask only over the bus for a real decision."
+
+
+def connect_text(lane, data, role_arg=""):
     """The one line a bus-up dispatch types: connect, plus the job-budget command.
 
     `--data <dir>` is in the line so the lane's first command works with no env (E1 reads
     it). The hint is a command prefix, so typing it is how the builder's shell gets the var.
-    One line: the fake herdr and the prompt marker both keep only the first line.
+    One line: the fake herdr and the prompt marker both keep only the first line. The closing
+    sentence tells the lane to act on what connect delivers; role_arg goes before it.
     """
     skill = os.path.join(lane, ".claude", "skills", "mk-builder")
     n = selftest_jobs_hint(data) if data else "4"
     # MK_SELFTEST_JOBS=N stays in the production doorbell: it is the E6 job-budget hint
     # and E1 reads it from the typed line.
     data_arg = f" --data {shlex.quote(data)}" if data else ""
-    return (f"MK_SELFTEST_JOBS={n} python3 {shlex.quote(skill)}/scripts/mk-builder.py connect{data_arg}")
+    return (f"MK_SELFTEST_JOBS={n} python3 {shlex.quote(skill)}/scripts/mk-builder.py connect{data_arg}{role_arg} {DOORBELL_ACT}")
 
 
 def delivered_status(pane, role):
@@ -1336,7 +1340,7 @@ def cmd_dispatch(a):
         else:
             ok, publish_error = publish_review_brief(rdata, rrun, rtask)
             if ok:
-                text = connect_text(rlane, rdata) + " --role review"
+                text = connect_text(rlane, rdata, " --role review")
                 connected = True
             else:
                 why = f"publish failed: {publish_error}"
@@ -3413,6 +3417,9 @@ def self_test():
             assert "mk-builder.py connect" in _typed and "the full prompt stays" not in _typed, _typed
             # E3: the doorbell carries --data, so the lane's first command needs no env
             assert f"--data {data}" in _typed, _typed
+            # 151a: the doorbell ends with the act-without-asking sentence, on a single line
+            # (prompt_calls keeps the first line only, so the sentence surviving proves one line)
+            assert DOORBELL_ACT in _typed, _typed
             # (G1) no flag: a build dispatch to an armed lane with a live bus rings the doorbell
             assert r["connect"] is True and "note" not in r, r
             n0 = len(prompt_calls())
@@ -3501,6 +3508,8 @@ def self_test():
             quoted = connect_text(os.path.join(tmp, "lane name"), odd)
             assert "';$(touch x)'" in quoted or "data dir;" in quoted, quoted
             assert "'" in quoted and "$(touch x)" in quoted, quoted
+            assert quoted.endswith(DOORBELL_ACT) and "\n" not in quoted, quoted
+            assert connect_text("l", "", " --role review").endswith(" --role review " + DOORBELL_ACT)
             # mk.db is already present (store enable, above), so the send is kind task, not info
             assert any("--kind task" in c and "kind:brief" in c for c in [" ".join(bus_calls())]), bus_calls()
             # a refused send keeps the full prompt and names the error

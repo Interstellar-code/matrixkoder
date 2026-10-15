@@ -59,6 +59,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 sys.dont_write_bytecode = True
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+RING_ACT = "then carry out what it delivers (brief, round, nudge) without asking; ask only over the bus for a real decision."
 
 # `watch` (E2 4): the bus must stay down this long before watch gives up with
 # exit 4. One blip, a dropped socket or a server restart resumes instead.
@@ -1489,7 +1490,7 @@ class BusState:
         A retry (msg carries `_ring_eid`) does not record a second ring row.
         """
         skill = os.environ.get("MK_BUS_SKILL_DIR") or os.path.join(HERE, "..", "child-skills", "mk-builder")
-        line = "Run: python3 %s/scripts/mk-builder.py inbox" % os.path.abspath(skill)
+        line = "Run: python3 %s/scripts/mk-builder.py inbox %s" % (os.path.abspath(skill), RING_ACT)
         store, _ = self.store_for(msg.get("project"))
         eid = msg.get("_ring_eid")
         if eid is None:
@@ -5196,6 +5197,8 @@ def _store_self_test_body(mod):
         time.sleep(0.3)
         rang = open(fake + ".rang").read() if os.path.isfile(fake + ".rang") else ""
         assert "T1" in rang and "mk-builder.py inbox" in rang, rang
+        # 151a: the ring line carries the act-without-asking sentence (the fake herdr keeps the first line only)
+        assert RING_ACT in rang, rang
         # Second nudge while working must not ring.
         write_status("working")
         code, work = post(port2, btok, {"run": "r1", "task": "T1", "kind": "nudge", "text": "busy", "from": "orch", "to": "T1", "project": "proj"})
@@ -5613,7 +5616,7 @@ def _store_self_test_body(mod):
         assert rings[0].startswith("agent prompt wE:p2 "), rings
         # C13a: the ring line is fixed, never the message body.
         assert "ring me" not in rings[0], rings
-        assert "mk-builder.py inbox" in rings[0], rings
+        assert "mk-builder.py inbox" in rings[0] and RING_ACT in rings[0], rings
 
         # A working agent queues: no second prompt while the lane is busy.
         with open(agents_json, "w") as fh:
