@@ -25,7 +25,7 @@ import argparse, contextlib, datetime, hashlib, importlib.util, json, multiproce
 
 sys.dont_write_bytecode = True
 
-SCHEMA = 4
+SCHEMA = 5
 ROOT_SCHEMA = 2  # the root store migrates additively; project stores go to SCHEMA
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
 
@@ -88,11 +88,11 @@ CREATE TABLE IF NOT EXISTS plans(
   integration TEXT);
 CREATE TABLE IF NOT EXISTS runs(
   id TEXT PRIMARY KEY, plan TEXT, plan_version INTEGER, branch TEXT, status TEXT, stage TEXT,
-  next TEXT, started TEXT, ended TEXT);
+  next TEXT, started TEXT, ended TEXT, extra_json TEXT);
 CREATE TABLE IF NOT EXISTS tasks(
   run TEXT, id TEXT, parent TEXT, type TEXT, title TEXT, acceptance TEXT, owned TEXT, deps TEXT,
   parallel INTEGER, route_json TEXT, status TEXT, prev_status TEXT, file_status TEXT, lane TEXT, slot TEXT, branch TEXT, pane TEXT,
-  round INTEGER, verdict TEXT, updated TEXT, PRIMARY KEY(run, id));
+  round INTEGER, verdict TEXT, updated TEXT, extra_json TEXT, PRIMARY KEY(run, id));
 CREATE TABLE IF NOT EXISTS events(
   id INTEGER PRIMARY KEY, run TEXT, task TEXT, t TEXT, chan TEXT, kind TEXT, from_id TEXT,
   to_id TEXT, reply_to TEXT, text TEXT, artifact_id INTEGER, meta_json TEXT);
@@ -424,11 +424,24 @@ def _v4(con):
             con.execute(f"ALTER TABLE plans ADD COLUMN {name} TEXT")
 
 
+def _v5(con):
+    """The shipped v5 step (L4, C4): runs and tasks gain extra_json, the TEXT column holding the
+    fields the tables have no column for (run: feature/waiting/recent/plan_sha/plan_status/... ;
+    task: wave/ready/workspace/gates/rounds/... ). Additive only, and safe to run twice: each
+    column is added only when table_info lacks it, so a fresh store reaches the same shape
+    through PROJECT_DDL and an existing v4 store keeps every row and gains the columns NULL.
+    """
+    for table in ("runs", "tasks"):
+        cols = [r["name"] for r in con.execute(f"PRAGMA table_info({table})")]
+        if cols and "extra_json" not in cols:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN extra_json TEXT")
+
+
 def open_project(home, slug=None, data_dir=None, version=SCHEMA, migrations=()):
     """Open or create the project store (C2). check_home runs before any directory is created."""
     path = os.path.join(project_dir(home, slug, data_dir), "mk.db")
     _selftest_write_guard(path)
-    con = _migrate(_connect(path), version, ((1, PROJECT_DDL), (2, _v2), (3, _v3), (4, _v4)) + tuple(migrations))
+    con = _migrate(_connect(path), version, ((1, PROJECT_DDL), (2, _v2), (3, _v3), (4, _v4), (5, _v5)) + tuple(migrations))
     _ensure_prev_status(con)
     _ensure_file_status(con)
     return con
@@ -1087,13 +1100,16 @@ def catch_up(home, project, data_dir=None):
     return n
 
 
-RUN_COLS = ("id", "plan", "plan_version", "branch", "status", "stage", "next", "started", "ended")
+RUN_COLS = ("id", "plan", "plan_version", "branch", "status", "stage", "next", "started", "ended",
+            "extra_json")
 TASK_COLS = ("id", "parent", "type", "title", "acceptance", "owned", "deps", "parallel",
-             "route_json", "status", "lane", "slot", "branch", "pane", "round", "verdict", "updated")
+             "route_json", "status", "lane", "slot", "branch", "pane", "round", "verdict", "updated",
+             "extra_json")
 # D1.5.2: the columns the mirror (import_history's upsert) never blanks — the approved plan's
 # acceptance/owned/deps/route_json/type survive a re-import whose file view carries no value
 # for them (a run.json written before D1.5.1, or any task the file view does not populate).
-MERGE_KEEP = ("acceptance", "owned", "deps", "route_json", "type")
+# L4 adds extra_json: a mirror write whose file view carries no extras must keep the stored ones.
+MERGE_KEEP = ("acceptance", "owned", "deps", "route_json", "type", "extra_json")
 EVENT_COLS = ("t", "chan", "kind", "from_id", "to_id", "reply_to", "text", "meta_json", "task")
 ARTIFACT_COLS = ("task", "round", "kind", "rev", "text", "created")
 
@@ -1168,9 +1184,14 @@ def import_history(home, project, run, *, run_row=None, tasks=(), events=(), art
                 if row["id"] != run:
                     raise Fail(f"run_row id {row['id']!r} != run {run!r}")
                 before = con.execute("SELECT 1 FROM runs WHERE id=?", (run,)).fetchone()
+                # L4 (L4.1c): a run_row that carries no extras must not blank the stored ones.
+                # extra_json keeps the stored value when the incoming one is NULL, exactly the
+                # MERGE_KEEP rule the task upsert below applies to its own columns.
+                run_assign = [f"{c}=excluded.{c}" for c in RUN_COLS if c not in ("id", "extra_json")]
+                run_assign += ["extra_json=COALESCE(excluded.extra_json, runs.extra_json)"]
                 con.execute(
                     "INSERT INTO runs(" + ",".join(RUN_COLS) + ") VALUES (" + ",".join("?" * len(RUN_COLS)) + ")"
-                    " ON CONFLICT(id) DO UPDATE SET " + ",".join(f"{c}=excluded.{c}" for c in RUN_COLS if c != "id"),
+                    " ON CONFLICT(id) DO UPDATE SET " + ",".join(run_assign),
                     tuple(row[c] for c in RUN_COLS))
                 if not before:
                     added["runs"] = 1
@@ -2016,6 +2037,7 @@ def self_test():
         _v1_upgrade(home)
         _lane_slots_v3(home)
         _plans_cols_v4(home)
+        _extra_json_v5(home)
         _plans_query(home)
         _plans_detail(home)
         _card_verdict(home)
@@ -3008,6 +3030,71 @@ def _plans_cols_v4(home):
     finally:
         fresh.close()
     _check(fresh_cols == cols, f"fresh and migrated plans shapes differ: {fresh_cols} vs {cols}")
+
+
+def _extra_json_v5(home):
+    """A v4 store with runs and tasks rows migrates to v5: extra_json lands on both tables and
+    every row survives; a reopen stamps nothing new; a fresh store reaches the same shape.
+    The grant for L4 (m-5862) asks exactly this case."""
+    data = os.path.join(home, "extras-v4")
+    os.makedirs(data, exist_ok=True)
+    # a real v4 file: the pre-v5 runs/tasks shapes (no extra_json), stamped 1..4, with rows
+    bare = sqlite3.connect(os.path.join(data, "mk.db"))
+    bare.executescript("""
+        CREATE TABLE runs(id TEXT PRIMARY KEY, plan TEXT, plan_version INTEGER, branch TEXT,
+          status TEXT, stage TEXT, next TEXT, started TEXT, ended TEXT);
+        CREATE TABLE tasks(run TEXT, id TEXT, parent TEXT, type TEXT, title TEXT, acceptance TEXT,
+          owned TEXT, deps TEXT, parallel INTEGER, route_json TEXT, status TEXT, prev_status TEXT,
+          file_status TEXT, lane TEXT, slot TEXT, branch TEXT, pane TEXT, round INTEGER,
+          verdict TEXT, updated TEXT, PRIMARY KEY(run, id));
+        CREATE TABLE schema_version(version INTEGER PRIMARY KEY);
+        INSERT INTO schema_version(version) VALUES (1);
+        INSERT INTO schema_version(version) VALUES (2);
+        INSERT INTO schema_version(version) VALUES (3);
+        INSERT INTO schema_version(version) VALUES (4);
+        INSERT INTO runs(id, plan, status, started) VALUES ('rv', 'plans/x.md', 'active', '2026-01-01');
+        INSERT INTO tasks(run, id, parent, type, title, status, round) VALUES
+          ('rv', 'T1', NULL, 'task', 'kept', 'building', 2);
+    """)
+    bare.commit()
+    bare.close()
+    migrated = open_project(home, data_dir=data)
+    try:
+        for table in ("runs", "tasks"):
+            names = [r["name"] for r in migrated.execute(f"PRAGMA table_info({table})")]
+            _check(names.count("extra_json") == 1, f"v5 left {table}.extra_json wrong: {names}")
+        _check(migrated.execute("SELECT MAX(version) v FROM schema_version").fetchone()["v"]
+               == SCHEMA, "v5 not stamped")
+        row = migrated.execute("SELECT title, status, round, extra_json FROM tasks WHERE id='T1'").fetchone()
+        _check(row["title"] == "kept" and row["status"] == "building" and row["round"] == 2
+               and row["extra_json"] is None, f"v4 task row lost: {dict(row) if row else None}")
+        rrow = migrated.execute("SELECT plan, status, extra_json FROM runs WHERE id='rv'").fetchone()
+        _check(rrow["plan"] == "plans/x.md" and rrow["status"] == "active" and rrow["extra_json"] is None,
+               f"v4 run row lost: {dict(rrow) if rrow else None}")
+    finally:
+        migrated.close()
+    again = open_project(home, data_dir=data)  # a reopen is a no-op: no new stamp, no new column
+    try:
+        _check(again.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == SCHEMA,
+               "v5 reopen stamped again")
+        for table in ("runs", "tasks"):
+            names = [r["name"] for r in again.execute(f"PRAGMA table_info({table})")]
+            _check(names.count("extra_json") == 1, f"v5 reopen changed {table}: {names}")
+    finally:
+        again.close()
+    fresh_data = os.path.join(home, "extras-fresh")
+    fresh = open_project(home, data_dir=fresh_data)
+    try:
+        for table in ("runs", "tasks"):
+            fresh_names = [r["name"] for r in fresh.execute(f"PRAGMA table_info({table})")]
+            ref = open_project(home, data_dir=data)
+            try:
+                ref_names = [r["name"] for r in ref.execute(f"PRAGMA table_info({table})")]
+            finally:
+                ref.close()
+            _check(fresh_names == ref_names, f"fresh and migrated {table} shapes differ: {fresh_names} vs {ref_names}")
+    finally:
+        fresh.close()
 
 
 def _plans_query(home):

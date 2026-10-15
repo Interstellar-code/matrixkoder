@@ -187,6 +187,7 @@ def load_run(data, run_id):
         "next": doc.get("next") if isinstance(doc.get("next"), str) else None,
         "started": doc.get("started"),
         "ended": doc.get("ended"),
+        "extra_json": _extras_json(_run_extras(doc)),
     }
     task_rows = []
     for t in tasks:
@@ -208,6 +209,7 @@ def load_run(data, run_id):
             "round": t.get("round") or 0,
             "verdict": t.get("verdict"),
             "updated": t.get("updated") or doc.get("updated"),
+            "extra_json": _extras_json(_task_extras(t)),
         })
     events, skipped, skip_reasons = [], 0, []
     ev_path = mkpaths.events_doc(data, run_id)
@@ -390,50 +392,31 @@ def _import_order(loaded):
     return order
 
 
-# L4: the run/task fields the tables have no column for live in the project DB's run_state
-# table (mk-state writes it too). The importer populates it from the legacy run.json so an
-# imported store reads the same extras a live one does.
+# L4: the run/task fields the tables have no column for ride runs.extra_json / tasks.extra_json
+# (mk-state writes them too). The importer populates them from the legacy run.json so an imported
+# store reads the same extras a live one does, in the same single transaction (never a second write).
 RUN_FILE_KEYS = ("feature", "waiting", "recent", "plan_sha", "plan_status", "updated", "plan", "plan_id")
 TASK_FILE_KEYS = ("wave", "ready", "workspace", "last_commit", "gates", "rounds", "created",
                   "plan_phase", "plan_task", "route", "lane_group", "reviewer", "refs")
 
 
-def _run_state_rows(data, run_id):
-    """(run_x, task_x) from the legacy run.json, matching mk-state's run_state layout."""
-    path = mkpaths.run_doc(data, run_id)
-    try:
-        with open(path, encoding="utf-8") as fh:
-            doc = json.load(fh)
-    except (OSError, ValueError):
-        return {}, {}
-    if not isinstance(doc, dict):
-        return {}, {}
-    run_x = {k: doc[k] for k in RUN_FILE_KEYS if k in doc}
-    run_x["task_order"] = [t.get("id") for t in doc.get("tasks") or []
-                           if isinstance(t, dict) and t.get("id")]
-    task_x = {t["id"]: {k: t[k] for k in TASK_FILE_KEYS if k in t}
-              for t in doc.get("tasks") or [] if isinstance(t, dict) and t.get("id")}
-    return run_x, task_x
+def _extras_json(obj):
+    """The extra_json column value: compact JSON, or None when empty (a stored NULL keeps the
+    same shape as a pre-L4 row and lets import_history's COALESCE-keep fire)."""
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True) if obj else None
 
 
-def _write_run_state(home, project, data, run_id):
-    """Upsert one run's run_state rows from its legacy run.json. Idempotent (replace)."""
-    run_x, task_x = _run_state_rows(data, run_id)
-    if not run_x and not task_x:
-        return
-    con = mkdb.open_project(home, project)
-    try:
-        con.execute("CREATE TABLE IF NOT EXISTS run_state(run TEXT, task TEXT, data TEXT,"
-                    " PRIMARY KEY(run, task))")
-        con.execute("DELETE FROM run_state WHERE run=?", (run_id,))
-        con.execute("INSERT INTO run_state(run, task, data) VALUES (?,?,?)",
-                    (run_id, "", json.dumps(run_x, ensure_ascii=False, sort_keys=True)))
-        for tid, data_x in task_x.items():
-            con.execute("INSERT INTO run_state(run, task, data) VALUES (?,?,?)",
-                        (run_id, tid, json.dumps(data_x, ensure_ascii=False, sort_keys=True)))
-        con.commit()
-    finally:
-        con.close()
+def _run_extras(doc):
+    """The run-level fields with no column, from a legacy run.json, plus the task order."""
+    out = {k: doc[k] for k in RUN_FILE_KEYS if k in doc}
+    out["task_order"] = [t.get("id") for t in doc.get("tasks") or []
+                         if isinstance(t, dict) and t.get("id")]
+    return out
+
+
+def _task_extras(t):
+    """The task-level fields with no column, from one legacy run.json task object."""
+    return {k: t[k] for k in TASK_FILE_KEYS if k in t}
 
 
 def import_one(home, project, data, run_id):
@@ -447,7 +430,6 @@ def import_one(home, project, data, run_id):
     tasks, dropped = _split_deps(tasks, run_id, known)
     added = mkdb.import_history(home, project, run_id, run_row=run_row, tasks=tasks,
                                 events=events, artifacts=artifacts)
-    _write_run_state(home, project, data, run_id)
     cards = mkdb.catch_up(home, project)
     if tree_checksums(run_dir) != before:
         raise Fail("source files changed during import")
@@ -493,7 +475,6 @@ def import_all(home, project, data):
         try:
             mkdb.import_history(home, project, name, run_row=run_row, tasks=tasks,
                                 events=events, artifacts=artifacts)
-            _write_run_state(home, project, data, name)
         except Exception as e:
             failed.append({"run": name, "error": str(e)})
             continue

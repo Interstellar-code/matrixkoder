@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""MatrixKoder run state — the ONLY writer of <data>/runs/**. Python 3 stdlib only.
+"""MatrixKoder run state — the ONLY writer of the project store. Python 3 stdlib only.
+
+L4 (C4): the project DB is the ONLY source of truth — no run.json / index.json / task.json /
+events.jsonl / board.md / run-doc artifact is written or read. The store is always on and is
+created through mkdb.open_project on first use; `store enable` / `export-legacy` are kept as
+no-op commands for callers. `render` prints the board text from the DB (stdout), never board.md.
+Legacy projects whose runs live only in files migrate through mk-store-import.py.
 
   run init --id ID --feature F --branch B [--plan PATH --force]
       --plan: the plan file drives the run — the plan tool (mk-plan.py, or $MK_PLAN_CMD) `check`
@@ -81,18 +87,15 @@
   wait set --question TEXT --options a,b [--rec TEXT] | wait clear
   lock take RES --reason TEXT [--ttl-min 30] [--scope a,b] [--force-stale]
   lock release RES [--force] (refuses a lock taken by another --by) | lock check RES
-  render
-  store enable [--data D] — opt in: import the ACTIVE run's files into the project store through
-      mkdb (import_history, original timestamps), copy <data>/runs/ to <data>/runs-legacy/ read-only
-      BEFORE the first view rewrite, then publish the legacy views from the store. The store is the
-      project folder's mk.db (mkpaths.project_folder: <home>/projects/<slug>/mk.db once migrated,
-      else <data>/mk.db). Absent mk.db means the store is off and every command is today's file
-      path, byte for byte.
-  store status [--data D] — {"ok": true, "store": "on"|"off"}
-  sync [--project SLUG] — with the store on, copy every project change above sync.last_change_no
-      into the root cards (idempotent). File mode changes nothing.
-  export-legacy --run R [--data D] — rebuild run.json, events.jsonl, board.md and runs/index.json
-      from the store (the rollback path; needs the store on)
+  render — print the board text from the project DB (stdout, never board.md)
+  store enable [--data D] — L4 no-op kept for callers: the store is always on. It reports store on
+      and imports nothing; the project store (mkpaths.project_folder: <home>/projects/<slug>/mk.db
+      once migrated, else <data>/mk.db) is created through mkdb.open_project on first use.
+  store status [--data D] — {"ok": true, "store": "on"}
+  sync [--project SLUG] — copy every project change above sync.last_change_no into the root cards
+      (idempotent).
+  export-legacy --run R [--data D] — L4 no-op kept for callers: no file view is written, so there
+      is nothing to rebuild; the store is the only record.
   --self-test
 
 Common: --data DIR (else $MATRIXKODER_DATA, else the root projects table by repo path, else
@@ -101,10 +104,11 @@ resolves to its main checkout, a nested repo to itself), --by WHO (default orche
 task/event/wait/render (default: the single active run). Global dir (locks/) is the MK home — the
 rule (one of the two home env names, never both disagreeing) lives in scripts/mkpaths.py (C1).
 Every command prints ONE JSON line. Errors: {"ok": false, "error": ...} exit 2; lock refused: exit 1.
-run.json is authoritative; events.jsonl may run one line ahead after a crash; `render` rebuilds board.md.
+The project DB is the only truth (C4); run.json / index.json / task.json / events.jsonl / board.md
+are never written. Legacy projects migrate through mk-store-import.py.
 Schema: docs/state-schema.md
 """
-import argparse, contextlib, datetime, fcntl, fnmatch, hashlib, importlib.util, json, math, os, re, shlex, shutil, socket, stat, subprocess, sys, tempfile, time
+import argparse, contextlib, datetime, fcntl, fnmatch, hashlib, importlib.util, json, math, os, re, shlex, shutil, socket, subprocess, sys, tempfile
 
 SCHEMA = 1
 STATUSES = ("planned routed dispatched building verifying review fix merged qa done "
@@ -137,25 +141,18 @@ SIDE = ("blocked", "provider", "quota", "stalled")  # roll-up precedence: the fi
 
 # The project store is opt-in. With the project store absent, nothing below runs.
 STORE_PROJECT = "matrixkoder"  # slug only; the db is the project folder's mk.db (L3B)
-STORE_RUN_DOC = "run-doc"      # artifact kind holding the run.json document
-STORE_INDEX = "index-doc"      # artifact kind holding runs/index.json (task id "_index")
+STORE_RUN_DOC = "run-doc"      # artifact kind holding the run.json document (legacy fallback)
 VIEW_CRASH = "MK_VIEW_CRASH"   # test seam: raise after the store commit, before the view rewrite
 ROOT_CRASH = "MK_ROOT_CRASH"   # test seam: project commit lands, the root card upsert is skipped
-# fields the tasks table has no column for; they live in the project DB's run_state table
-# (C4: a new table of the existing project schema, never a duplicated field)
+# fields the tasks table has no column for; they live in the project DB's tasks.extra_json
+# column (L4, C4: a new column of the existing project schema, never a duplicated field)
 TASK_FILE_KEYS = ("wave", "ready", "workspace", "last_commit", "gates", "rounds", "created",
                   "plan_phase", "plan_task", "route", "lane_group", "reviewer", "refs", "deps")
-# run-level fields the runs table has no column for; same table, task = '' for the run row.
+# run-level fields the runs table has no column for; they live in the runs.extra_json column.
 # `plan` (the file path) and `plan_id` ride here, not the runs.plan column: that column holds
-# the plan id for a plan-tool run and the bare path for a legacy one, so it cannot carry both.
+# the plan id for a plan-tool run and the bare path for a legacy one, so it cannot carry both. `task_order` is the task-add order (the rows store parent-before-child, which is not that order).
 RUN_FILE_KEYS = ("feature", "waiting", "recent", "plan_sha", "plan_status", "updated",
                  "plan_id", "plan")
-# run/task rows of the run_state table: task = '' is the run's own row. Created by mk-state
-# (the writer side owns it); mkdb's migrations are additive and never drop a table they did not
-# create, so this coexists with schema_version. One row per run and per task, JSON in `data`.
-RUN_STATE_DDL = ("CREATE TABLE IF NOT EXISTS run_state(run TEXT, task TEXT, data TEXT,"
-                 " PRIMARY KEY(run, task))")
-RUN_STATE_RUN = ""  # the task column value that holds the run's own extras
 
 
 def _load_sibling(name):
@@ -175,11 +172,6 @@ def _mkdb():
 # C1: every MK path (home rule, data-dir order, runs/plans folders) lives in scripts/mkpaths.py
 # and nowhere else. mkpaths imports nothing from the repo, so there is no cycle.
 mkpaths = _load_sibling("mkpaths")
-
-
-def _importer():
-    """Load scripts/mk-store-import.py by path. store enable reuses its import, unmodified."""
-    return _load_sibling("mk-store-import")
 
 
 class Fail(Exception):
@@ -278,6 +270,23 @@ def csv(v):
     return [x.strip() for x in (v or "").split(",") if x.strip()]
 
 
+def _json_obj(text):
+    """A JSON object from an extra_json column, or {} for NULL/bad/non-object text."""
+    if not text:
+        return {}
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def extras_json(obj):
+    """The extra_json column value for a dict: compact JSON, or None when empty (a stored NULL
+    keeps the same shape as a pre-L4 row and lets COALESCE-keep fire on a mirror write)."""
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True) if obj else None
+
+
 def write_json(path, obj):
     """Atomic: write a temp file in the same dir, fsync, os.replace. Readers never see a partial file."""
     d = os.path.dirname(path)
@@ -318,7 +327,6 @@ class Store:
     def __init__(self, data):
         self.data = data
         self.runs = mkpaths.runs_dir(data)
-        self.index_path = mkpaths.runs_index(data)
         # plan sync --apply: events for this run id are counted and dropped (ONE summary event
         # comes after); other runs' upkeep events still write
         self.sink_run, self.sunk = None, 0
@@ -330,7 +338,6 @@ class Store:
         self._mkdb = None
         self._src = {}          # (run, task, kind) -> next live source-key counter
         self._appended = {}     # run id -> events.jsonl lines appended during this command
-        self._rewritten = set() # run ids whose run.json/board were republished this command
 
     @contextlib.contextmanager
     def locked(self):
@@ -355,7 +362,7 @@ class Store:
             con.close()
         out = []
         for r in rows:
-            run_x, _ = self.run_state_read(r["id"])
+            run_x, _ = self.extras_read(r["id"])
             out.append({"id": r["id"], "feature": run_x.get("feature"), "status": r["status"],
                         "started": r["started"], "ended": r["ended"],
                         "plan": run_x.get("plan_id")})
@@ -611,28 +618,12 @@ class Store:
 
     def store_open(self):
         con = self.db().open_project(self.home_dir(), STORE_PROJECT, data_dir=self.project_folder())
-        self._ensure_run_state(con)
         return con
-
-    def _ensure_run_state(self, con):
-        """Create the run_state table once per connection. It holds the run/task fields the
-        runs/tasks tables have no column for (C4: a new table of the existing project schema)."""
-        if getattr(con, "_mk_run_state", False):
-            return
-        try:
-            con.execute(RUN_STATE_DDL)
-            con.commit()
-        except Exception:
-            pass  # a read-only connection (open_read) cannot create it; reads then see no extras
-        try:
-            con._mk_run_state = True
-        except Exception:
-            pass
 
     def _run_doc_extras(self, rid):
         """(run_x, task_x) from the legacy run-doc artifact, or ({}, {}) when there is none.
         The pre-L4 migration route: the fields that used to ride the run.json document are read
-        once so L4's first write migrates them into run_state instead of blanking them."""
+        once so L4's first write migrates them into runs/tasks.extra_json instead of blanking them."""
         try:
             con = self.store_open()
         except Exception:
@@ -660,48 +651,26 @@ class Store:
                   for t in base.get("tasks") or [] if isinstance(t, dict) and t.get("id")}
         return run_x, task_x
 
-    def run_state_read(self, rid):
-        """-> ({extras...}, {task_id: {extras...}}) for one run from the run_state table.
-        An absent row/table is empty dicts, never an error (a pre-L4 store has no extras yet)."""
+    def extras_read(self, rid):
+        """-> ({extras...}, {task_id: {extras...}}) for one run from runs.extra_json and the
+        tasks' extra_json columns (L4, C4: a new column, never a duplicated field). A NULL column
+        is an empty dict. A pre-L4 store (both NULL) falls back to the legacy run-doc artifact
+        ONCE, so the first post-L4 write migrates the extras instead of blanking them."""
         con = self.store_open()
         try:
-            rows = con.execute("SELECT task, data FROM run_state WHERE run=?", (rid,)).fetchall()
-        except Exception:
-            return {}, {}
+            rrow = con.execute("SELECT extra_json FROM runs WHERE id=?", (rid,)).fetchone()
+            trows = con.execute("SELECT id, extra_json FROM tasks WHERE run=?", (rid,)).fetchall()
         finally:
             con.close()
-        run_x, task_x = {}, {}
-        for r in rows:
-            try:
-                data = json.loads(r["data"]) if r["data"] else {}
-            except ValueError:
-                data = {}
-            if not isinstance(data, dict):
-                data = {}
-            if r["task"] == RUN_STATE_RUN:
-                run_x = data
-            else:
-                task_x[r["task"]] = data
+        run_x = _json_obj(rrow["extra_json"] if rrow else None)
+        task_x = {}
+        for r in trows:
+            data = _json_obj(r["extra_json"])
+            if data:
+                task_x[r["id"]] = data
+        if not run_x and not task_x:
+            run_x, task_x = self._run_doc_extras(rid)
         return run_x, task_x
-
-    def run_state_write(self, rid, run_x, task_x):
-        """Upsert this run's extras: one row for the run (task = '') and one per task.
-        Replaces the previous set for the run so a removed task leaves no stale row."""
-        con = self.store_open()
-        try:
-            con.execute("BEGIN IMMEDIATE")
-            con.execute("DELETE FROM run_state WHERE run=?", (rid,))
-            con.execute("INSERT INTO run_state(run, task, data) VALUES (?,?,?)",
-                        (rid, RUN_STATE_RUN, json.dumps(run_x, ensure_ascii=False, sort_keys=True)))
-            for tid, data in task_x.items():
-                con.execute("INSERT INTO run_state(run, task, data) VALUES (?,?,?)",
-                            (rid, tid, json.dumps(data, ensure_ascii=False, sort_keys=True)))
-            con.execute("COMMIT")
-        except Exception:
-            con.execute("ROLLBACK")
-            raise
-        finally:
-            con.close()
 
     def next_src(self, rid, task, kind):
         key = (rid, task or "", kind)
@@ -729,7 +698,7 @@ class Store:
         owned = t.get("owned") or []
         # D1.5/CLI: an unknown dep id is kept in the run (warned, never fatal — it may be added
         # later). import_history refuses such a dep, so the COLUMN carries only the deps that
-        # resolve now; the full list rides run_state (task_extras) and load_store restores it.
+        # resolve now; the full list rides tasks.extra_json and load_store restores it.
         in_run = {x.get("id") for x in run.get("tasks") or []}
         deps_col = [d for d in deps if d in in_run or self.dep_status(run, d) is not None]
         # the file view shows readiness as a flag on a planned task; the store shows it as the
@@ -752,15 +721,17 @@ class Store:
                 "route_json": _route_json(t),
                 "status": status, "lane": t.get("lane"), "slot": t.get("slot"),
                 "branch": t.get("branch"), "pane": t.get("pane"), "round": t.get("round") or 0,
-                "verdict": t.get("verdict"), "updated": t.get("updated")}
+                "verdict": t.get("verdict"), "updated": t.get("updated"),
+                "extra_json": extras_json(self.task_extras(t))}
 
     def run_row(self, run):
-        # runs.plan is the plan id (C5); the file path stays in the run doc. Writing the path here
-        # left a run started from plans/archive/<id>-v<n>.md unlinked from its plan.
+        # runs.plan is the plan id (C5); the file path stays in runs.extra_json. Writing the path
+        # here left a run started from plans/archive/<id>-v<n>.md unlinked from its plan.
         return {"id": run["id"], "plan": run.get("plan_id") or run.get("plan"), "plan_version": None,
                 "branch": run.get("branch"), "status": run.get("status"),
                 "stage": str(run.get("stage")) if run.get("stage") is not None else None,
-                "next": run.get("next"), "started": run.get("started"), "ended": run.get("ended")}
+                "next": run.get("next"), "started": run.get("started"), "ended": run.get("ended"),
+                "extra_json": extras_json(self.run_extras(run))}
 
     def _round_artifacts(self, run, t):
         """brief/report/review of the task's current round, when the view files exist."""
@@ -826,10 +797,10 @@ class Store:
     def store_commit(self, run, task=None):
         """Mirror the result into the store. Status changes go ONLY through mkdb.transition() (one
         store event, one change_log row). Other events go through import_history. The run/task
-        fields the tables have no column for go to the run_state table (C4: a new table)."""
+        fields the tables have no column for ride runs.extra_json / tasks.extra_json (L4, C4)."""
         rid = run["id"]
         lines = self._appended.pop(rid, [])
-        events, transitions = [], []
+        events = []
         for line in lines:
             ev = json.loads(line.decode())
             events.append({"t": ev["t"], "chan": "state", "kind": ev["type"], "task": ev.get("task"),
@@ -838,15 +809,12 @@ class Store:
                                                    sort_keys=True, ensure_ascii=False),
                            "src": self.next_src(rid, ev.get("task"), ev["type"])})
         tasks = [self.task_row(run, t) for t in run.get("tasks") or [] if t.get("id")]
-        run_x = self.run_extras(run)
-        task_x = {t["id"]: self.task_extras(t) for t in run.get("tasks") or [] if t.get("id")}
         arts = []
         for t in run.get("tasks") or []:
             if t.get("id") and t.get("round"):
                 arts += self._round_artifacts(run, t)
         self.db().import_history(self.home_dir(), STORE_PROJECT, rid, run_row=self.run_row(run),
                                  tasks=tasks, events=events, artifacts=arts, data_dir=self.project_folder())
-        self.run_state_write(rid, run_x, task_x)
         # task round: the tasks row (and its root card) must not keep the previous round's
         # terminal status or verdict. import_history already wrote the new status; the card
         # is updated here, in this same commit, with no second event line.
@@ -927,7 +895,6 @@ class Store:
                 con.commit()
             finally:
                 con.close()
-        self._rewritten.discard(rid)
         if os.environ.get(ROOT_CRASH) != "1":
             # catch_up repairs a card whose status disagrees with the task row, including one
             # whose change_log sits below the watermark the transition above just advanced.
@@ -943,9 +910,9 @@ class Store:
                              data_dir=self.project_folder())
 
     def load_store(self, rid):
-        """The store is the read source: runs and tasks tables, plus the fields they have no
-        column for from the run_state table (C4). A status another writer set through
-        mkdb.transition() wins over the stored extras."""
+        """The store is the read source: runs and tasks tables (runs.extra_json / tasks.extra_json
+        carry the fields with no column; C4). A status another writer set through mkdb.transition()
+        wins over the stored extras."""
         con = self.store_open()
         try:
             row = con.execute("SELECT * FROM runs WHERE id=?", (rid,)).fetchone()
@@ -954,16 +921,21 @@ class Store:
             tasks = con.execute("SELECT * FROM tasks WHERE run=? ORDER BY rowid", (rid,)).fetchall()
         finally:
             con.close()
-        run_x, task_x = self.run_state_read(rid)
+        run_x = _json_obj(row["extra_json"])
+        task_x = {}
+        for t in tasks:
+            data = _json_obj(t["extra_json"])
+            if data:
+                task_x[t["id"]] = data
         if not run_x and not task_x:
             # L4 migration route: a pre-L4 store kept these extras only in the run-doc artifact.
             # Read it once (read-only) so the first post-L4 write does not blank them; the next
-            # write repopulates run_state and this fallback stops firing.
+            # write repopulates the columns and this fallback stops firing.
             run_x, task_x = self._run_doc_extras(rid)
         run = dict(run_x)
-        # A pre-L4 store has no run_state rows: the extras are absent, never fatal. runs.plan
+        # A pre-L4 store has NULL extra_json: the extras are absent, never fatal. runs.plan
         # carries the plan id for a plan-tool run (C5) or the bare path for a legacy one; the
-        # run_state row separates them (plan_id + the file path).
+        # extra_json separates them (plan_id + the file path).
         run.update({"id": row["id"], "branch": row["branch"],
                     "status": row["status"] or "active",
                     "stage": int(row["stage"]) if str(row["stage"] or "").isdigit() else (run_x.get("stage") or 0),
@@ -971,7 +943,7 @@ class Store:
         if "plan" not in run_x:
             run["plan"] = row["plan"]  # legacy/hand-written row: the column is the only path we have
         if "plan_id" not in run_x and row["plan"]:
-            # a run_state-less row: runs.plan is the plan id only when it is not a file path
+            # an extra_json-less row: runs.plan is the plan id only when it is not a file path
             run["plan_id"] = None if ("/" in row["plan"] or row["plan"].endswith(".md")) else row["plan"]
         # Task order is not a column: the run row's `task_order` list is the order the tasks were
         # added (the runs table stores parent-before-child, which is not that order).
@@ -1014,8 +986,8 @@ class Store:
                 "ready": ready,
                 "agent": route.get("agent"), "model": route.get("model"), "effort": route.get("effort"),
             })
-            # the full dep list rides run_state (an unknown dep cannot sit in the column);
-            # a pre-L4 store with no run_state row falls back to the column's list.
+            # the full dep list rides tasks.extra_json (an unknown dep cannot sit in the column);
+            # a pre-L4 store with no extra_json falls back to the column's list.
             if "deps" not in extras:
                 extra["deps"] = deps
             if t["acceptance"]:
@@ -1050,122 +1022,10 @@ class Store:
               "by": (meta.get("by") if isinstance(meta, dict) else None) or "orchestrator"}
         return json.dumps(ev, ensure_ascii=False) + "\n"
 
-    def _view_marker(self, rid):
-        """(event id, byte offset) of the last recorded publish, or None when no marker exists.
-        A marker written before the offset was stored is a bare integer; the offset is then None."""
-        path = os.path.join(self.run_dir(rid), ".store-event")
-        if not os.path.exists(path):
-            return None
-        with contextlib.suppress(ValueError, OSError):
-            parts = open(path).read().split()
-            if not parts:
-                return (0, 0)
-            eid = int(parts[0])
-            off = int(parts[1]) if len(parts) > 1 else None
-            return (eid, off)
-        return None
-
-    def _write_event_marker(self, rid, eid, offset):
-        """Atomically record the event id together with the byte offset where its line ends."""
-        path = os.path.join(self.run_dir(rid), ".store-event")
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            f.write(f"{int(eid)} {int(offset)}\n")
-        os.replace(tmp, path)
-
-    def _publish_views_killed(self, run):
-        """Append this command's new event lines, then SIGKILL before the marker moves."""
-        rid = run["id"]
-        path = mkpaths.events_doc(self.data, rid)
-        lines = []
-        # the lines were stored with their original bytes in meta; re-read the new rows
-        con = self.store_open()
-        try:
-            rows = con.execute(
-                "SELECT id, run, task, t, chan, kind, from_id, to_id, text, meta_json"
-                " FROM events WHERE run=? AND chan='state' ORDER BY id", (rid,)).fetchall()
-        finally:
-            con.close()
-        marker = self._view_marker(rid)
-        published = marker[0] if marker else 0
-        fresh = [r for r in rows if r["id"] > (published or 0)]
-        if fresh:
-            blob = "".join(self.event_line(r) for r in fresh).encode()
-            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
-            try:
-                os.write(fd, blob)
-            finally:
-                os.close(fd)
-        os.kill(os.getpid(), 9)
-
-    def publish(self, run):
-        """L4: nothing to publish. The store is the only truth; there are no file views to rewrite
-        and no events.jsonl to append. Kept as the single name callers (export_legacy, the run
-        paths) used, so a removed view is simply not produced."""
-        return
-
     def repair(self):
         """L4: nothing to repair. Views no longer exist, so there is no lag to converge; the store
         is always current. Kept as the name the read commands call."""
         return
-
-    def _readonly_tree(self, dest):
-        def readonly(path):
-            mode = os.stat(path).st_mode
-            os.chmod(path, mode & ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
-        for dirpath, dirnames, filenames in os.walk(dest):
-            for name in dirnames + filenames:
-                readonly(os.path.join(dirpath, name))
-            readonly(dirpath)
-
-    def legacy_copy(self, dest, readonly=True):
-        """Copy <data>/runs/ onto dest. Read-only only after the copy is in its final place:
-        a read-only directory cannot be renamed into place."""
-        src = self.runs
-        if os.path.isdir(src):
-            shutil.copytree(src, dest)
-        else:
-            os.makedirs(dest, exist_ok=True)
-        if readonly:
-            self._readonly_tree(dest)
-        return dest
-
-    def _sweep_enable_dirs(self, keep):
-        """Remove stale mk-enable-* dirs left by a killed enable. A dir younger than a minute,
-        or one this process did not create that still holds a live flock, is left alone."""
-        now_s = time.time()
-        for name in os.listdir(self.data):
-            if not name.startswith("mk-enable-"):
-                continue
-            path = os.path.join(self.data, name)
-            if path == keep or not os.path.isdir(path):
-                continue
-            age = now_s - os.path.getmtime(path)
-            if age < 60:
-                continue
-            lock = os.path.join(path, ".lock")
-            busy = False
-            if os.path.exists(lock):
-                try:
-                    # O_NONBLOCK: flock LOCK_NB on a FIFO-like wait is not enough on its own
-                    # when open itself blocks. A lock we cannot take means a live enable.
-                    fd = os.open(lock, os.O_RDWR | os.O_NONBLOCK)
-                    try:
-                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        fcntl.flock(fd, fcntl.LOCK_UN)
-                    except OSError:
-                        busy = True
-                    finally:
-                        os.close(fd)
-                except OSError:
-                    busy = True
-            if not busy:
-                shutil.rmtree(path, ignore_errors=True)
-
-    def _runs_to_import(self):
-        """Legacy migration helper: every run the store holds. Kept for the reporter/importer
-        path; the store is always on, so this reads the runs table."""
-        return [r["id"] for r in self.index() if r.get("id")]
 
     def enable_store(self):
         """L4: there is no file mode to opt into — the store is always on, created through
@@ -2767,20 +2627,18 @@ def d15_self_test(tmp, env, pd, penv):
 
     # --- D1.5.5: backfill-fields fills a stripped run from the plan, twice is a no-op
     def strip_run(run_id):
-        """L4: no run.json. Blank the plan fields on the tasks rows (and refs/route extras),
-        exactly the file view a legacy run had before backfill."""
+        """L4: no run.json. Blank the plan fields on the tasks rows (and refs/route extras in
+        tasks.extra_json), exactly the file view a legacy run had before backfill."""
         con = _mkdb().open_project(os.path.join(pd, ".mk-home"), STORE_PROJECT, data_dir=pd)
         try:
             for tid in [r["id"] for r in con.execute("SELECT id FROM tasks WHERE run=?", (run_id,))]:
-                con.execute("UPDATE tasks SET acceptance='', owned='', deps='', route_json=NULL"
-                            " WHERE run=? AND id=?", (run_id, tid))
-                row = con.execute("SELECT data FROM run_state WHERE run=? AND task=?",
-                                  (run_id, tid)).fetchone()
-                extra = json.loads(row["data"]) if row and row["data"] else {}
+                extra = _json_obj(con.execute("SELECT extra_json FROM tasks WHERE run=? AND id=?",
+                                              (run_id, tid)).fetchone()["extra_json"])
                 for k in ("refs", "route", "type"):
                     extra.pop(k, None)
-                con.execute("UPDATE run_state SET data=? WHERE run=? AND task=?",
-                            (json.dumps(extra, sort_keys=True), run_id, tid))
+                con.execute("UPDATE tasks SET acceptance='', owned='', deps='', route_json=NULL,"
+                            " extra_json=? WHERE run=? AND id=?",
+                            (extras_json(extra), run_id, tid))
             con.commit()
         finally:
             con.close()
@@ -2789,11 +2647,9 @@ def d15_self_test(tmp, env, pd, penv):
         con = _mkdb().open_project(os.path.join(pd, ".mk-home"), STORE_PROJECT, data_dir=pd)
         try:
             out = {}
-            for r in con.execute("SELECT id, type, acceptance, owned, deps FROM tasks WHERE run=?",
-                                 (run_id,)):
-                row = con.execute("SELECT data FROM run_state WHERE run=? AND task=?",
-                                  (run_id, r["id"])).fetchone()
-                extra = json.loads(row["data"]) if row and row["data"] else {}
+            for r in con.execute("SELECT id, type, acceptance, owned, deps, extra_json FROM tasks"
+                                 " WHERE run=?", (run_id,)):
+                extra = _json_obj(r["extra_json"])
                 out[r["id"]] = {"type": r["type"], "acceptance": r["acceptance"],
                                 "owned": [x for x in (r["owned"] or "").split(",") if x],
                                 "deps": [x for x in (r["deps"] or "").split(",") if x],
@@ -3083,7 +2939,7 @@ def self_test():
         mk("run", "stage", "3")
         run = mk("run", "get")["run"]
         assert run["next"] == "dispatch T2" and run["stage"] == 3 and run["waiting"]["question"] == "Merge now?"
-        assert q1(data, "SELECT data FROM run_state WHERE run='r1' AND task=''")["data"].find("Merge now?") >= 0
+        assert q1(data, "SELECT extra_json FROM runs WHERE id='r1'")["extra_json"].find("Merge now?") >= 0
         assert mk("wait", "clear")["waiting"] is None
 
         events = events_of(data, "r1")
@@ -3925,14 +3781,14 @@ def self_test():
            data_arg=False, e=env)
         board = mk("render", "--data", lg, data_arg=False, e=env)["board"]
         assert "plan:" not in board, board
-        # L4: the legacy file path lives in the run_state run row (runs.plan holds the plan id);
+        # L4: the legacy file path lives in runs.extra_json (runs.plan holds the plan id);
         # set it there, then the board carries the plain path line.
         lcon = DB.open_project(os.path.join(lg, ".mk-home"), STORE_PROJECT, data_dir=lg)
         try:
-            row = lcon.execute("SELECT data FROM run_state WHERE run='l1' AND task=''").fetchone()
-            data = json.loads(row["data"]) if row and row["data"] else {}
+            row = lcon.execute("SELECT extra_json FROM runs WHERE id='l1'").fetchone()
+            data = _json_obj(row["extra_json"])
             data["plan"] = "plans/legacy.md"
-            lcon.execute("UPDATE run_state SET data=? WHERE run='l1' AND task=''",
+            lcon.execute("UPDATE runs SET extra_json=? WHERE id='l1'",
                          (json.dumps(data, sort_keys=True),))
             lcon.commit()
         finally:
@@ -4751,7 +4607,7 @@ def store_self_test(tmp, env):
         assert after.count(f"ev{trial}") == 1, (trial, after.count(f"ev{trial}"))
         assert ev_count(kills, "s1") == before_n + 1, (trial, ev_count(kills, "s1"), before_n)
 
-    # L4: task order is the run_state `task_order` list, so it survives every write
+    # L4: task order is the runs.extra_json `task_order` list, so it survives every write
     order = os.path.join(tmp, "order")
     once(["run", "init", "--id", "o1", "--feature", "O", "--branch", "bo"], order)
     once(["task", "add", "--id", "BA", "--title", "ba", "--run", "o1"], order)
