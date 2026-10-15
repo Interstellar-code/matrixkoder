@@ -165,6 +165,10 @@ BUS_BODY_MAX = 1024 * 1024
 ASK_ID_RE = re.compile(r"^m-(\d+)$")  # B15 Table 1: ids are `m-<seq>`
 # D7: connect pages a brief at about 24,000 chars; `read <id> --part n` fetches one page.
 BRIEF_PAGE = 24000
+# X2.3: a body paged out of the project DB (a report/review artifact) is sliced at PAGE_BYTES,
+# the same size mk-bus.py chunks a store send at. Kept in bytes, not chars: the bus limit and
+# the artifact are byte-measured, so a page boundary is where the transport splits.
+PAGE_BYTES = 65536
 # C9: completed maps to this setting; verify is the schema default when config is unreadable.
 TODO_DONE_DEFAULT = "verify"
 TODO_STATES = ("in_progress", "completed", "done")  # `done` is the backup spelling of completed
@@ -776,15 +780,22 @@ def running_lane_children(lane):
 
 @status_locked
 def cmd_done(a):
-    """R18: the report file at the lane root AND a readable HEAD; R20: final per identity, so the
-    legality table refuses every second write. The report is checked first, so the error is
+    """R18: the report file at the lane root OR the round's `report` artifact in the project DB
+    (X2.1/C4 — `report` sent it over the bus), AND a readable HEAD; R20: final per identity, so
+    the legality table refuses every second write. The report is checked first, so the error is
     deterministic. R31: a still-running lane child is a WARNING before the token, never a failure
     and never a change to the token being the last line."""
     lane, old = lane_dir(a), load_live(lane_dir(a))
     require_state(old, "done")
     report = old.get("report") or ""
-    if not report or not os.path.isfile(os.path.join(lane, report)):
-        raise Fail(f"report_missing: {report!r} does not exist at the lane root [R18]")
+    path = os.path.join(lane, report) if report else ""
+    stored = None
+    if not path or not os.path.isfile(path):
+        # The lane file is the fallback, not the only source: when the bus carried the body it
+        # is the round's report artifact (C4), and a lane that lost its file still finishes.
+        stored = round_artifact_text(lane, old, "report")
+        if stored is None:
+            raise Fail(f"report_missing: {report!r} does not exist at the lane root [R18]")
     sha = lane_head(lane)
     if not sha:
         raise Fail("no_head: `git -C <lane> rev-parse HEAD` failed [R18]")
@@ -795,12 +806,15 @@ def cmd_done(a):
     # Todo reporting: the report's `## Todo` section rides on the DONE token. A missing
     # section or an `open` item without a reason warns and does not fail the round.
     warn = ""
-    try:
-        with open(os.path.join(lane, report)) as f:
-            items, warn = parse_todo_section(f.read())
-    except OSError:
-        items = []
-        warn = "todo section missing"
+    if stored is not None:
+        items, warn = parse_todo_section(stored)
+    else:
+        try:
+            with open(path) as f:
+                items, warn = parse_todo_section(f.read())
+        except OSError:
+            items = []
+            warn = "todo section missing"
     done_n, skipped_n, total = todo_counts(items)
     tail = "DONE"
     if items:
@@ -826,15 +840,25 @@ def cmd_review_done(a):
     path = (a.path or "").strip()
     if not path or not os.path.isfile(os.path.join(lane, path)):
         raise Fail(f"review_missing: {path!r} does not exist [R18]")
-    text = f"round: {old.get('round')}\nverdict: {a.verdict} findings: {a.findings} path: {path}"
+    # X2.1: the WHOLE review body travels, not a pointer to it — the bus stores it as the
+    # round's `review` artifact (C4) and the file stays only the bus-down fallback. The text
+    # is the documented `round:<n>\n<body>` shape `report` already uses, so the stored
+    # artifact IS the review document: mk-lane-event's review_verdict/review_findings read
+    # its title line directly, and the path is recovered where it always was (the task
+    # folder / the lane).
+    with open(os.path.join(lane, path)) as f:
+        body = f.read()
+    text = f"round: {old.get('round')}\n{body}"
     cfg = bus_lane_config(lane)
     if cfg is None:
-        ask_down(lane, " ".join(text.split()))
+        ask_down(lane, f"review {old.get('task')} R{old.get('round')}: {a.verdict} "
+                       f"findings: {a.findings} path: {path}")
     kind = "review" if store_present(bus_data_dir(cfg)) else "info"
     try:
         bus_send(cfg, kind, text)
     except BusDown:
-        ask_down(lane, " ".join(text.split()))
+        ask_down(lane, f"review {old.get('task')} R{old.get('round')}: {a.verdict} "
+                       f"findings: {a.findings} path: {path}")
     except BusHttp as e:
         raise Fail(bus_http_error(e), code=5)
     obj = dict(old, state="done", question=None, subagent=None, commit=lane_head(lane))
@@ -2295,6 +2319,33 @@ def newest_stored_artifact(data, run, task, kind):
     return None
 
 
+def round_artifact_text(lane, old, kind):
+    """X2.1/X2.3: the round's `<kind>` artifact text from the project DB (C4), else None.
+
+    The body travelled on the bus when the lane sent it (`report`, `review-done`), so the DB
+    copy is the same text the lane file held. The round is the one the report path names
+    (`-rN.`), else the status file's `round`; a store that holds no such artifact, and a
+    bus-down lane (no token or no store), answer None — the caller keeps its file requirement,
+    which is the documented bus-down fallback."""
+    cfg = bus_lane_config(lane)
+    data = bus_data_dir(cfg) if cfg else None
+    if not data or not store_present(data):
+        return None
+    run = (cfg or {}).get("run") or (old or {}).get("run")
+    task = (cfg or {}).get("task") or (old or {}).get("task")
+    if not run or not task:
+        return None
+    report = (old or {}).get("report") or ""
+    m = re.search(r"-r(\d+)\.", os.path.basename(report)) if report else None
+    want = int(m.group(1)) if m else int((old or {}).get("round") or 0)
+    for n, text in reversed(store_artifacts(data, run, task, kind) or []):
+        if want and n != want:
+            continue
+        if text.strip():
+            return text
+    return None
+
+
 def todo_done_status(data):
     """C9: `session.todo_done_status` from <data>/matrixkoder.yaml, else the schema default."""
     path = _paths("project_yaml", data or "")
@@ -2552,6 +2603,58 @@ def page_slice(text, part, size=BRIEF_PAGE):
     return text[start:start + size], part, pages
 
 
+def byte_page_parts(text, size=PAGE_BYTES):
+    """Split `text` into chunks whose UTF-8 encoding is at most `size` bytes each. X2.3: the
+    bus measures a body in bytes (STORE_TEXT_MAX), so a page boundary is a byte boundary too."""
+    parts, cur, n = [], [], 0
+    for ch in text:
+        b = len(ch.encode("utf-8"))
+        if cur and n + b > size:
+            parts.append("".join(cur))
+            cur, n = [], 0
+        cur.append(ch)
+        n += b
+    if cur or not parts:
+        parts.append("".join(cur))
+    return parts
+
+
+def byte_page_count(text, size=PAGE_BYTES):
+    return len(byte_page_parts(text, size))
+
+
+def byte_page_slice(text, part, size=PAGE_BYTES):
+    """One page of a byte-paged body, and the page count. `part` is validated by the caller."""
+    parts = byte_page_parts(text, size)
+    return parts[part - 1], part, len(parts)
+
+
+def message_artifact_text(cfg, msg_id):
+    """X2.3: the body of the bus message `<id>` straight from the project DB, or None.
+
+    The bus stores a `report`/`review` body as an artifact and links it from the event
+    (`events.artifact_id`), and in store mode the event row id IS the wire seq — so `m-<n>`
+    finds the artifact in one read-only query. No lane cache is involved: the file the old
+    `.matrixkoder-pages` path read was never written by anything."""
+    data = bus_data_dir(cfg)
+    if not data or not store_present(data):
+        return None
+    m = ASK_ID_RE.fullmatch(msg_id or "")
+    if not m:
+        return None
+    seq = int(m.group(1))
+    rows = store_rows(
+        data,
+        "SELECT a.text AS text FROM events e JOIN artifacts a ON a.id = e.artifact_id"
+        " WHERE e.id=? AND e.chan='bus' AND e.artifact_id IS NOT NULL",
+        (seq,))
+    for r in rows or []:
+        text = r.get("text")
+        if isinstance(text, str) and text:
+            return text
+    return None
+
+
 def connect_identity(cfg):
     """The round arm recorded in the lane token file: run, task, round. Missing fields
     are None. A token with no round, or the old E2 `round: 0`, is round 0 here: unarmed, and
@@ -2672,8 +2775,10 @@ def cmd_connect(a):
 
 
 def cmd_read(a):
-    """D7.1: one page of a paged body. `--part` is 1-based. The last page acks the message
-    when `<id>` is a bus message id and the bus is up."""
+    """D7.1/X2.3: one page of a paged body. `--part` is 1-based. A message id pages its
+    artifact straight out of the project DB (the bus stored the `report`/`review` body —
+    C4; no `.matrixkoder-pages` cache exists). The last page acks the message when the bus
+    is up."""
     lane = lane_dir(a)
     msg_id = (a.msg_id or "").strip()
     part = a.part
@@ -2682,24 +2787,30 @@ def cmd_read(a):
     if not is_int(part) or part < 1:
         raise Fail(f"part must be an integer >= 1, got {part!r}")
     text = ""
+    byte_sized = False
     if msg_id and msg_id != "brief":
         cfg = bus_lane_config(lane)
         if cfg is None:
             raise Fail("bus down", code=4)
-        # The body was delivered as a message; re-fetch by walking /wait is not how paging
-        # works — the sender pages, and `read` slices a body the lane already stored.
-        cache = os.path.join(lane, ".matrixkoder-pages", msg_id)
-        try:
-            with open(cache) as f:
-                text = f.read()
-        except OSError:
-            raise Fail(f"no paged body cached for {msg_id!r}; connect prints the brief")
+        # The body travelled as a message and the bus stored it as an artifact; the DB copy
+        # is the source. A pre-migration project (or a run nothing stored) keeps the file
+        # view below.
+        text = message_artifact_text(cfg, msg_id)
+        if not text:
+            raise Fail(f"no stored body for {msg_id!r}; connect prints the brief")
+        byte_sized = True
     else:
         text, _ = brief_text(lane, load_live(lane))
-    pages = page_count(text)
-    if part > pages:
-        raise Fail(f"part {part} is outside 1..{pages}")
-    body, part, pages = page_slice(text, part)
+    if byte_sized:
+        pages = byte_page_count(text)
+        if part > pages:
+            raise Fail(f"part {part} is outside 1..{pages}")
+        body, part, pages = byte_page_slice(text, part)
+    else:
+        pages = page_count(text)
+        if part > pages:
+            raise Fail(f"part {part} is outside 1..{pages}")
+        body, part, pages = page_slice(text, part)
     print(f"# part {part}/{pages}")
     print(body)
     if part == pages and msg_id and msg_id != "brief":
@@ -5479,30 +5590,44 @@ def review_lane(data, name, task, root):
 
 
 def t_review_done_store_mode_posts_review(root):
-    """Store mode: ONE `review` message `round: 1\\nverdict: V findings: N path: P`, the status
-    file goes done, and the last stdout line is `<T> REVIEW R1 DONE`."""
+    """X2.1: store mode sends ONE `review` message carrying the WHOLE review file
+    (`round: 1\\n<body>`) and the bus stores it as the round's `review` artifact; the status
+    file goes done and the last stdout line is `<T> REVIEW R1 DONE`."""
     if not os.path.isfile(MK_BUS_PY):
         return
     data = os.path.join(root, "rd-store-data")
     os.makedirs(data, exist_ok=True)
-    d7_store(data, BUS_RUN, "RD1")
+    mod = d7_store(data, BUS_RUN, "RD1")
     bus_server(root, "rd-store")
     lane = review_lane(data, "rd_store_lane", "RD1", root)
+    with open(os.path.join(lane, ".matrixkoder-review-r1.md"), "w") as f:
+        f.write("# RD1 review R1 — REQUEST CHANGES\n\n## HIGH\n\n- a body finding\n")
     code, lines = cli(lane, "review-done", "--verdict", "REQUEST_CHANGES", "--findings", "3",
                       "--path", ".matrixkoder-review-r1.md")
     assert code == 0 and lines[-1] == "RD1 REVIEW R1 DONE", (code, lines)
     assert status(lane)["state"] == "done", status(lane)
     rows = [r for r in d7_bus_rows(data) if r.get("kind") == "review"]
     assert len(rows) == 1, rows
-    assert rows[0]["text"] == ("round: 1\nverdict: REQUEST_CHANGES findings: 3 "
-                               "path: .matrixkoder-review-r1.md"), rows[0]
+    # the whole body travelled, not a pointer to it
+    assert rows[0]["text"] == ("round: 1\n# RD1 review R1 — REQUEST CHANGES\n\n"
+                               "## HIGH\n\n- a body finding\n"), rows[0]
+    con = mod.open_project(data, data_dir=data)
+    try:
+        art = con.execute(
+            "SELECT round, kind, text FROM artifacts WHERE run=? AND task=? AND kind='review'",
+            (BUS_RUN, "RD1")).fetchone()
+    finally:
+        con.close()
+    assert art and art["round"] == 1 and art["kind"] == "review", dict(art) if art else None
+    assert art["text"].endswith("- a body finding\n"), art["text"]
+    assert not art["text"].startswith("round:"), art["text"]
     code, lines = cli(lane, "review-done", "--verdict", "APPROVE", "--findings", "0",
                       "--path", ".matrixkoder-review-r1.md")
     assert code != 0, "a second review-done must be an illegal transition"
 
 
 def t_review_done_file_mode_posts_info(root):
-    """File mode (no mk.db) refuses kind `review`: the same text goes out as `info`."""
+    """File mode (no mk.db) refuses kind `review`: the same body goes out as `info`."""
     if not os.path.isfile(MK_BUS_PY):
         return
     data, _pid, _ = bus_server(root, "rd-file")
@@ -5511,9 +5636,9 @@ def t_review_done_file_mode_posts_info(root):
     code, lines = cli(lane, "review-done", "--verdict", "APPROVE", "--findings", "0",
                       "--path", ".matrixkoder-review-r1.md")
     assert code == 0 and lines[-1] == "RD2 REVIEW R1 DONE", (code, lines)
-    rows = [r for r in bus_rows(data) if "verdict: APPROVE" in (r.get("text") or "")]
+    rows = [r for r in bus_rows(data) if (r.get("text") or "").startswith("round: 1\n")]
     assert len(rows) == 1 and rows[0]["kind"] == "info", rows
-    assert rows[0]["text"].startswith("round: 1\nverdict: APPROVE findings: 0 path: "), rows[0]
+    assert rows[0]["text"].startswith("round: 1\n"), rows[0]
     assert status(lane)["state"] == "done", status(lane)
 
 
@@ -5533,6 +5658,79 @@ def t_review_done_bus_down_blocks(root):
                       "--path", ".matrixkoder-review-r1.md")
     assert code == 4 and lines == ["BUS DOWN: use the BLOCKED token"], (code, lines)
     assert status(lane)["state"] == "blocked", status(lane)
+
+
+def t_x2_done_accepts_the_db_report_artifact(root):
+    """X2.1 (c): the bus carried the whole report as the round's artifact, so `done` finishes a
+    lane whose report FILE is gone. The Todo section rides on the artifact too. With no store
+    (or no artifact) the file stays required — the bus-down fallback."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data = os.path.join(root, "x2done-data")
+    os.makedirs(data, exist_ok=True)
+    d7_store(data, BUS_RUN, "X2D")
+    bus_server(root, "x2done")
+    lane = gitlane(root, "x2done_lane")
+    bus_cli("token", "--lane", lane, "--task", "X2D", "--run", BUS_RUN, "--data", data)
+    begin(lane, root, run=BUS_RUN, task="X2D", report=".matrixkoder-report-r1.md")
+    cli(lane, "progress", "writing the report")
+    report = os.path.join(lane, ".matrixkoder-report-r1.md")
+    with open(report, "w") as f:
+        f.write("# report\n\n## Todo\n\n[done] the work - tests 5/5\n")
+    code, lines = cli(lane, "report", env={"MK_BUS_DATA": data})
+    assert code == 0 and jline(lines)["sent"] is True, lines
+    # the file is gone (a lane reset, a wiped worktree): the DB artifact still finishes it
+    os.unlink(report)
+    code, lines = cli(lane, "done", env={"MK_BUS_DATA": data})
+    assert code == 0 and lines[-1] == "X2D R1 DONE todo 1/1 done 0 skipped", (code, lines)
+    assert status(lane)["state"] == "done", status(lane)
+    # nothing stored for this lane (a bus-down / file-mode project): the file requirement stands
+    plain = os.path.join(root, "x2done-plain-data")
+    os.makedirs(plain, exist_ok=True)
+    lane2 = gitlane(root, "x2done_nofile")
+    begin(lane2, root, run=BUS_RUN, task="X2N", report=".matrixkoder-report-r1.md")
+    cli(lane2, "progress", "work")
+    out = refuse(lane2, "done", env={"MK_BUS_DATA": plain})
+    assert "report_missing" in out["error"], out
+
+
+def t_x2_review_done_and_read_page_the_stored_body(root):
+    """X2.1 (b) + X2.3: `review-done` sends the whole review; `read <id> --part n` pages that
+    artifact straight out of the DB (no `.matrixkoder-pages` cache) at PAGE_BYTES a page, and a
+    pre-migration lane with no stored body keeps the bus-down refusal."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data = os.path.join(root, "x2read-data")
+    os.makedirs(data, exist_ok=True)
+    d7_store(data, BUS_RUN, "X2R")
+    bus_server(root, "x2read")
+    lane = review_lane(data, "x2read_lane", "X2R", root)
+    # line-shaped, no blank lines and no trailing newline: the harness drops blank lines, so a
+    # byte-for-byte reconstruction is only fair on this shape (a page boundary cuts mid-line).
+    body = "# X2R review R1 — APPROVE\n" + "\n".join(["a finding line"] * 12000)
+    assert len(body.encode("utf-8")) > PAGE_BYTES
+    with open(os.path.join(lane, ".matrixkoder-review-r1.md"), "w") as f:
+        f.write(body)
+    code, lines = cli(lane, "review-done", "--verdict", "APPROVE", "--findings", "0",
+                      "--path", ".matrixkoder-review-r1.md", env={"MK_BUS_DATA": data})
+    assert code == 0 and lines[-1] == "X2R REVIEW R1 DONE", (code, lines)
+    # the reviewer's own message id: the newest review row
+    rows = [r for r in d7_bus_rows(data) if r.get("kind") == "review"]
+    assert len(rows) == 1, rows
+    msg_id = rows[0]["id"]
+    pages = byte_page_count(body)
+    assert pages > 1, pages
+    for n in range(1, pages + 1):
+        code, lines = cli(lane, "read", msg_id, "--part", str(n), env={"MK_BUS_DATA": data})
+        assert code == 0 and lines[0] == f"# part {n}/{pages}", (n, lines[:1])
+        want, _p, _n = byte_page_slice(body, n)
+        # the harness drops whitespace-only lines, so the page is compared line-wise
+        assert lines[1:] == [ln for ln in want.splitlines() if ln.strip()], \
+            (n, len(lines[1:]), want[:60])
+    # no lane cache was written; the body came from the DB
+    assert not os.path.exists(os.path.join(lane, ".matrixkoder-pages")), "a page cache was written"
+    code, lines = cli(lane, "read", msg_id, "--part", str(pages + 1), env={"MK_BUS_DATA": data})
+    assert code != 0, "a part past the last must be refused"
 
 
 def t_done_warns_on_running_child(root):
