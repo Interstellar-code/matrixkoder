@@ -351,3 +351,41 @@ test('denies all other git stash forms', async ($, on) => {
   expect(await misses(c => $.tool.call(c), stashDeny, true)).toEqual([])
 })
 
+
+test('denies raw sqlite3 writes to mk.db', async ($, on) => {
+  stubBash(on)
+  const d = '~/.matrixkoder/projects/p/mk.db'
+  const sqlDeny = [
+    `sqlite3 ${d} "INSERT INTO tasks VALUES (1)"`,
+    `sqlite3 ${d} "update tasks set status='done'"`,
+    `sqlite3 ${d} 'DELETE FROM tasks'`,
+    `sqlite3 ${d} "DROP TABLE tasks"`,
+    `sqlite3 ${d} "ALTER TABLE tasks ADD c"`,
+    `sqlite3 ${d} "CREATE TABLE x(a)"`,
+    `sqlite3 ${d} "REPLACE INTO tasks VALUES (1)"`,
+    `sqlite3 ${d} "VACUUM INTO '${d}'"`,
+    `sqlite3 ${d} ".import /tmp/x.csv tasks"`,
+    `sqlite3 ${d}`,
+    `sqlite3 ${d} < /tmp/w.sql`,
+    `echo "DELETE FROM tasks" | sqlite3 ${d}`,
+    `cd /tmp && /usr/bin/sqlite3 mk.db "delete from tasks"`,
+    `bash -c "sqlite3 ${d} 'drop table tasks'"`,
+  ]
+  expect(await misses(c => $.tool.call(c), sqlDeny, true)).toEqual([])
+})
+
+test('allows read-only sqlite3 on mk.db and writes to other dbs', async ($, on) => {
+  stubBash(on)
+  const d = '~/.matrixkoder/projects/p/mk.db'
+  const sqlAllow = [
+    `sqlite3 -readonly ${d} "select * from tasks"`,
+    `sqlite3 -readonly ${d}`,
+    `sqlite3 "file:${d}?mode=ro" "select 1"`,
+    `sqlite3 ${d} "select count(*) from tasks"`,
+    `sqlite3 ${d} .schema`,
+    `sqlite3 ${d} "VACUUM INTO '/tmp/copy.db'"`,
+    `sqlite3 /tmp/scratch.db "INSERT INTO t VALUES (1)"`,
+    `echo mk.db`,
+  ]
+  expect(await misses(c => $.tool.call(c), sqlAllow, false)).toEqual([])
+})
