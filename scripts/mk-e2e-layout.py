@@ -201,6 +201,20 @@ def _default_home():
         base = os.path.expanduser("~")
     return os.path.realpath(os.path.abspath(os.path.join(base, ".matrixkoder")))
 
+# The temp roots R15 treats as the caller's own throwaway tree. macOS is why there are four:
+# tempfile.gettempdir() is /var/folders/... while every STORED path is a realpath
+# (/private/var/folders/...), so the literal spellings alone matched nothing; /tmp and
+# /private/tmp name that other spelling of the temp tree.
+TEMP_ROOTS = tuple(sorted({r.rstrip("/") for r in (
+    tempfile.gettempdir(), os.path.realpath(tempfile.gettempdir()), "/tmp", "/private/tmp")}))
+
+
+def _temp_row(value):
+    """Does a stored `data_dir`/`db_path` point inside a temp root? The comparison is on a
+    PATH BOUNDARY, so `/tmp` never matches `/tmpfoo` — a real project folder."""
+    return bool(value) and any(value == root or value.startswith(root + "/") for root in TEMP_ROOTS)
+
+
 def _real_projects_rows():
     """The real home's temp-pointing projects rows, read-only, as 'slug -> data'
     strings. Snapshot for R15: only rows the run ADDED are a leak."""
@@ -217,8 +231,7 @@ def _real_projects_rows():
         return sorted(
             f"{slug} -> {data or dbp}" for slug, data, dbp in con.execute(
                 "SELECT slug, data_dir, db_path FROM projects")
-            if (data or "").startswith(tempfile.gettempdir())
-            or (dbp or "").startswith(tempfile.gettempdir()))
+            if _temp_row(data) or _temp_row(dbp))
     finally:
         con.close()
 
@@ -265,8 +278,10 @@ def _guard_refuses_real_home():
         os.environ.pop("MATRIXKODER_HOME", None)
         try:
             mkdb.open_root(real).close()
-        except BaseException:
-            return      # refused: the case under test
+        except Exception:
+            # refused: the case under test. Exception, not BaseException: mkdb.Fail is a subclass,
+            # but a KeyboardInterrupt/SystemExit from the open must NOT read as "the guard refused".
+            return
         raise FAIL(f"the guard ALLOWED a write into the real default home {real}")
     finally:
         for k, v in kept.items():
@@ -1440,6 +1455,72 @@ def self_test():
                f"alias row with same db_path makes R11 fail: {results['R11']['detail']}")
     finally:
         shutil.rmtree(f["root"], ignore_errors=True)
+    # R15 (Z21): the temp-row detector sees the REALPATH spelling of the temp tree. On macOS
+    # tempfile.gettempdir() is /var/folders/<xx>/<hash>/T while every STORED path is a realpath
+    # (/private/var/folders/...), so `startswith(tempfile.gettempdir())` matched nothing and R15
+    # never fired. /tmpfoo is a real folder, not a temp root: the match is on a path boundary.
+    f = _fixture(None)
+    try:
+        tmp_lit, tmp_real = tempfile.gettempdir(), os.path.realpath(tempfile.gettempdir())
+        rows = [("pf1", tmp_real + "/x", None),          # the realpath spelling: the bug
+                ("pf2", "/private/tmp/x", None),         # /tmp's own realpath spelling
+                ("pf3", "/tmp/x", None),                 # the literal /tmp spelling
+                ("pf4", tmp_lit + "/x", None),           # gettempdir() spelled out
+                ("pf5", "/tmpfoo/x", None),              # NOT a temp root
+                ("pf6", None, "/private/tmp/y/mk.db")]   # db_path counts, not only data_dir
+        con = mkdb.open_root(f["home"])    # the one SQLite writer (single-writer rule)
+        try:
+            for slug, data, dbp in rows:
+                con.execute("INSERT INTO projects(slug, name, repo, data_dir, mode, db_path, created)"
+                            " VALUES (?,?,?,?,?,?,?)",
+                            (slug, slug, os.path.realpath(f["repo"]), data, "home", dbp, "e2e"))
+            con.commit()
+        finally:
+            con.close()
+        # the detector resolves the REAL home through _default_home(); patch the MODULE global at
+        # the fixture's home so the case exercises _real_projects_rows itself, not a predicate
+        # stand-in. globals() because a plain assignment would make _default_home local to
+        # self_test and shadow every use of it in this function.
+        def _fixture_home():
+            return f["home"]
+
+        saved_home = globals()["_default_home"]
+        globals()["_default_home"] = _fixture_home
+        try:
+            got = _real_projects_rows()
+        finally:
+            globals()["_default_home"] = saved_home
+        _check(not any(g.startswith("pf5 ") for g in got), f"/tmpfoo matched a temp root: {got}")
+        for slug in ("pf1", "pf2", "pf3", "pf4", "pf6"):
+            _check(any(g.startswith(slug + " ->") for g in got), f"{slug} not read as a temp row: {got}")
+        # the fixture's own rows are realpath temp paths — the exact shape the old rule missed
+        _check(any(g.startswith("fix ->") for g in got),
+               f"a realpath temp row went unseen: {got}")
+        # the boundary rule itself, spelled out: a prefix is not a match
+        _check(_temp_row("/tmp") and _temp_row("/tmp/x") and _temp_row("/private/tmp/x")
+               and _temp_row(tmp_real + "/x") and _temp_row(tmp_lit + "/x")
+               and not _temp_row("/tmpfoo") and not _temp_row("/tmpfoo/x")
+               and not _temp_row(tmp_real + "x")     # the boundary: .../T is not .../Tx
+               and not _temp_row(None) and not _temp_row(""), "the temp-root boundary rule drifted")
+    finally:
+        shutil.rmtree(f["root"], ignore_errors=True)
+    # Z21: the refusal catch is `except Exception`, so a KeyboardInterrupt from the open is NOT
+    # swallowed as "the guard refused" — only mkdb.Fail (an Exception subclass) takes that path.
+    real_open_root = mkdb.open_root
+
+    def _interrupted(home, *a, **kw):
+        raise KeyboardInterrupt
+
+    mkdb.open_root = _interrupted
+    try:
+        raised = False
+        try:
+            _guard_refuses_real_home()
+        except KeyboardInterrupt:
+            raised = True
+        _check(raised, "a KeyboardInterrupt from the open was swallowed as a refused write")
+    finally:
+        mkdb.open_root = real_open_root
     # the refusal, before anything is created
     _cli_fail(["--home", os.path.expanduser("~/.matrixkoder"), "check"])
     _cli_fail(["--home", os.path.join(ROOT, ".matrixkoder-e2e-probe"), "run"])
