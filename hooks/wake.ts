@@ -7,7 +7,7 @@ import { homeDir, paths, resolveDataDir, sessionCwd } from './paths'
 
 // $.state contract for wakeEventLines and wakeSentAt lives in types/index.d.ts
 
-const WAKE_STATUSES = new Set(['verifying', 'blocked', 'quota', 'stalled', 'provider'])
+const WAKE_STATUSES: Record<string, true> = { verifying: true, blocked: true, quota: true, stalled: true, provider: true, rework: true }
 const TASK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 const COOLDOWN_MS = 5 * 60 * 1000 // 5 minutes
 const HOLD_MS = 10 * 60 * 1000 // 10 minutes: a submit that threw may still have been queued
@@ -550,7 +550,7 @@ async function pollEvents($: EngineInterface): Promise<void> {
         // ignore orchestrator's own events to avoid self-wake loops.
         const isTransition = ev.type === 'transition'
         const isValidTask = typeof ev.task === 'string' && TASK_ID_RE.test(ev.task)
-        const isValidTo = typeof ev.to === 'string' && WAKE_STATUSES.has(ev.to)
+        const isValidTo = typeof ev.to === 'string' && WAKE_STATUSES[ev.to] === true
         const isNotOrchestrator = ev.by !== 'orchestrator'
 
         if (isTransition && isValidTask && isValidTo && isNotOrchestrator) {

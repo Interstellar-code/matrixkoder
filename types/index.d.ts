@@ -26,6 +26,11 @@ export type MkTask = {
   last_commit?: string | null
   round?: number
   updated?: string | null
+  /** F.1 contract: the derived risk (int 1-5), its critical flag and the open
+   *  reasons (each {kind, points, source, opened}). Optional — an old row has none. */
+  risk?: number
+  critical?: boolean
+  open_reasons?: readonly { readonly kind: string; readonly points: number; readonly source: string; readonly opened: string }[]
 }
 
 export type MkEvent = {

@@ -222,3 +222,57 @@ test('Z18.3: branch-selection absent from matrixkoder list, matrixkoder plans pr
   expect(ids).toContain('settings-plans-db')
   expect(ids).toContain('omp-lane-agent')
 })
+/** ── F.8: the raw task row's risk / critical / open_reasons pass through ──
+ *  F.1 contract fixture: `planFromReply` → `taskOf` copies them onto the
+ *  mapped PlanTask (found via the view's phases) when they are present, and
+ *  leaves them ABSENT (undefined, not null / 0 / false) when the raw row
+ *  carries none. */
+
+test('F.8: planFromReply maps a task row\'s risk, critical and open_reasons onto the PlanTask', () => {
+  const RAW_REASON = { kind: 'review', points: 3, source: 'rv', opened: '2026-10-15T10:00:00Z' }
+  const view = planFromReply({
+    ok: true,
+    id: 'riskplan',
+    title: 'T',
+    status: 'running',
+    phases: [{
+      id: 'P1',
+      title: '',
+      status: 'building',
+      tasks: [{
+        id: 'T9', title: 'risky task', status: 'building', type: 'task', round: 0, verdict: null,
+        risk: 4,
+        critical: true,
+        open_reasons: [RAW_REASON],
+      }],
+    }],
+  })
+  const row = view.phases?.find(p => p.id === 'P1')?.rows.find(t => t.id === 'T9')
+  expect(row, 'the risky task is mapped').toBeDefined()
+  expect(row?.risk, 'the raw `risk: 4` passes through').toBe(4)
+  expect(row?.critical, 'the raw `critical: true` passes through').toBe(true)
+  expect(row?.openReasons, 'the open_reasons list is landed as the same objects').toEqual([RAW_REASON])
+  expect(row?.openReasons?.[0]?.kind).toBe('review')
+  expect(row?.openReasons?.[0]?.points).toBe(3)
+  expect(row?.openReasons?.[0]?.source).toBe('rv')
+  expect(row?.openReasons?.[0]?.opened).toBe('2026-10-15T10:00:00Z')
+})
+
+test('F.8: a task row with none of the three keys maps WITHOUT them — undefined, not null/0/false', () => {
+  const view = planFromReply({
+    ok: true,
+    id: 'calmplan',
+    title: 'T',
+    status: 'draft',
+    phases: [{ id: 'P1', title: '', status: 'planned', tasks: [{ id: 'T1', title: 'calm', status: 'planned' }] }],
+  })
+  const calm = view.phases?.[0]?.rows[0]
+  expect(calm, 'the bare task is mapped').toBeDefined()
+  expect(calm?.risk, 'risk stays absent (undefined, not 0)').toBeUndefined()
+  expect(calm?.critical, 'critical stays absent (undefined, not false)').toBeUndefined()
+  expect(calm?.openReasons, 'openReasons stays absent (undefined, not [])').toBeUndefined()
+  // the keys are absent, never a made-up value
+  expect('risk' in (calm ?? {})).toBe(false)
+  expect('critical' in (calm ?? {})).toBe(false)
+  expect('openReasons' in (calm ?? {})).toBe(false)
+})

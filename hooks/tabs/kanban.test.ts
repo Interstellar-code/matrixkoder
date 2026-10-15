@@ -11,6 +11,7 @@ import {
   KANBAN_NOW,
   applyFilters,
   cardLine,
+  cardOfTask,
   columnOf,
   emptyKanbanView,
   isAttention,
@@ -442,4 +443,10 @@ test('two distinct stores are each read once and both are returned under their o
   expect(got.cards.map(c => c.task).sort()).toEqual(['ALPHA1', 'BETA1'])
   expect(got.cards.find(c => c.task === 'ALPHA1')?.project).toBe('alpha')
   expect(got.cards.find(c => c.task === 'BETA1')?.project).toBe('beta')
+})
+test('F.8: a rework task is a Fix-column card with attention', () => {
+  // contract fixture until F.1 merges
+  const card = cardOfTask('p', 'r', { id: 'X9', status: 'rework', title: 't' })
+  expect(card.col, 'rework opens the Fix column, not Backlog').toBe('Fix')
+  expect(card.attention, 'a rework card is an attention card').toBe(1)
 })

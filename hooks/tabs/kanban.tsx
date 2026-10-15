@@ -52,7 +52,8 @@ export type KanbanView = {
 const ATTENTION = ['blocked', 'stalled', 'quota', 'provider'] as const
 
 export function isAttention(status: string): boolean {
-  return (ATTENTION as readonly string[]).includes(status)
+  // F.8: a rework task needs the user, same as the four attention statuses.
+  return (ATTENTION as readonly string[]).includes(status) || status === 'rework'
 }
 
 /** Column from the card's `col` key. Unknown columns are dropped, not remapped. */
@@ -121,7 +122,9 @@ const STATUS_COLUMN: Readonly<Record<string, string>> = {
   verifying: 'Verify', review: 'Review', fix: 'Fix',
   merged: 'Done', qa: 'Done', done: 'Done',
   blocked: 'Building', stalled: 'Building', quota: 'Building', provider: 'Building',
+  rework: 'Fix',
 }
+
 
 /** One task row from `mkdb.py run-snapshot --json` onto a Kanban card. The reader returns
  *  the run document's tasks; the column and the attention flag are the pane's own rule

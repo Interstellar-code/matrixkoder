@@ -45,6 +45,10 @@ export type PlanSub = {
   readonly type?: string
   readonly round?: number
   readonly verdict?: string
+  /** F.1 contract: the derived risk, its critical flag and the open reasons. */
+  readonly risk?: number
+  readonly critical?: boolean
+  readonly openReasons?: readonly { readonly kind: string; readonly points: number; readonly source: string; readonly opened: string }[]
 }
 
 /** One task row inside a phase. `short` is the Narrow form.
@@ -71,6 +75,11 @@ export type PlanTask = {
   readonly type?: string
   readonly round?: number
   readonly verdict?: string
+  /** F.1 contract: the derived risk (int 1-5), its critical flag, and the open
+   *  reasons. All optional — an old row carries none of them. */
+  readonly risk?: number
+  readonly critical?: boolean
+  readonly openReasons?: readonly { readonly kind: string; readonly points: number; readonly source: string; readonly opened: string }[]
 }
 
 /** One phase Card. `wave` is data only — never drawn as the word "wave"; when

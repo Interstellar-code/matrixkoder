@@ -1846,3 +1846,47 @@ test('the root store alone names the data dir when projects.json is absent', { o
   await clock.advance(60000)
   expect(w.submitted).toEqual(['MatrixKoder: F6 → verifying. Continue the run from its Next action.'])
 })
+test('F.8: a rework transition DOES wake — one submit, "F6 → rework"', { options: { wake: true } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const submitted: string[] = []
+
+  const files: Record<string, string> = {
+    '/data/runs/index.json': JSON.stringify([{ id: 'test-run-rework', status: 'active' }]),
+    '/data/runs/test-run-rework/events.jsonl':
+      JSON.stringify({
+        t: '2026-10-07T20:00:00+02:00',
+        run: 'test-run-rework',
+        task: 'F6',
+        type: 'transition',
+        from: 'building',
+        to: 'rework',
+      }) + '\n',
+  }
+
+  mock.env(on, { MATRIXKODER_DATA: '/data' })
+
+  on('fs.read', (_$, e) => (e.path in files ? { value: files[e.path] ?? '' } : { value: '' }))
+  on('prompt.submit', (_$, e) => {
+    submitted.push(e.text)
+    return { text: e.text }
+  })
+  on('state.get', (_$, e, next) => {
+    if (e.key === 'wakeEventLines' && e.id === 'test-run-rework') {
+      return { value: { value: 0, version: 1 } }
+    }
+    if (e.key === 'wakeSentAt') {
+      return { value: { value: undefined, version: 0 } }
+    }
+    return next(e)
+  })
+  on('session.start', (_$, e, next) => ({ cwd: '/tmp' }))
+
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await clock.advance(30000)
+  await clock.advance(60000)
+
+  expect(submitted.length, 'exactly one submit: rework is a wake status').toBe(1)
+  expect(submitted[0], 'the prompt names the rework transition').toBe(
+    'MatrixKoder: F6 → rework. Continue the run from its Next action.'
+  )
+})

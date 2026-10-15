@@ -6,7 +6,7 @@ import type { On, ConfigRow } from 'claude-code'
 import { DATA_DIR, NOW, PROJECT_DIR, RUN_PATH, RUNS_INDEX, USAGE_PATH, agentOf, agentsOf, mockFs, mockWorld, paneProps, sessionStart, sessionStartIn, setRun, setUsage, tasksOf, worldFiles, worldFixtures } from './testkit'
 import type { Files, MockWorld } from './testkit'
 import { parseYamlAgents } from './data'
-import { waitingPane, waitingPaneView } from './dashboard'
+import { DONE_STATUSES_FOR_TEST, waitingPane, waitingPaneView } from './dashboard'
 import { mockTabCounts, waitingCount } from './tabs/header'
 import { RUN_SNAPSHOT } from './fixtures/run-snapshot'
 
@@ -2681,4 +2681,9 @@ test('L7.2: the top-level k reads open tasks of every linked project — migrate
   })
   expect(dirs, 'the migrated row read the C2 project folder').toContain(MIGRATED_DIR)
   expect(dirs, 'the db_path-NULL row fell back to its legacy data_dir').toContain(LEGACY_DIR)
+})
+test('F.8: rework is not a DONE status — the dashboard DONE set keeps done and merged only', () => {
+  expect(DONE_STATUSES_FOR_TEST.has('rework'), 'a reworked task is not silently counted done').toBe(false)
+  expect(DONE_STATUSES_FOR_TEST.has('done')).toBe(true)
+  expect(DONE_STATUSES_FOR_TEST.has('merged')).toBe(true)
 })
