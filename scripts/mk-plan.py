@@ -887,6 +887,13 @@ def validate_tree(out, db, con, run):
             raise Fail(["cycle: " + " -> ".join(f"{r}:{t}" for r, t in path)])
 
 
+def _ensure_plan_assets(data, plan_id):
+    """C2: a migrated project's plan folder carries `assets/` beside plan.md, even when the plan
+    has no asset yet. Best-effort like the plan.md copy — the row and the archive are the record."""
+    with contextlib.suppress(OSError):
+        os.makedirs(os.path.join(mkpaths.plan_dir(data, plan_id), "assets"), exist_ok=True)
+
+
 def approve_file(path, data, home, run):
     """No store: validate and mark approved, exactly as set --status approved.
     With a store: validate, write the plan version and its tasks, copy the approved bytes into
@@ -1034,6 +1041,7 @@ def approve_file(path, data, home, run):
             plan_md = mkpaths.plan_file(data, plan_id)
             with contextlib.suppress(OSError):
                 write_atomic(plan_md, approved)
+            _ensure_plan_assets(data, plan_id)
         return {"ok": True, "status": "approved", "store": True, "version": version,
                 "archived": archive, "tasks_run": run_id, "warnings": warnings}
     finally:
@@ -1128,6 +1136,8 @@ def import_file(path, data, home, dry_run=False):
     db = _mkdb()
     home = db.resolve_home(home)
     header_json = header_json_of(out, sha, body_md, str(out["status"] or "draft"))
+    if not dry_run and mkpaths.migrated_slug(data):
+        _ensure_plan_assets(data, plan_id)
     con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
     try:
         row = con.execute("SELECT version FROM plans WHERE id=?", (plan_id,)).fetchone()
@@ -2094,10 +2104,24 @@ def self_test():
                                            phases=phase("P1", tasks=task("P1.1")) + "\n"))
         out = mk("import", mp, "--data", mig_data, "--home", home)
         assert out["ok"], out
+        # Z15 (R02): import on a migrated project ensures the plan folder's assets/ too
+        assert os.path.isdir(os.path.join(proj, "plans", "migplan", "assets")), \
+            "a migrated import did not create the plan folder's assets/"
         out = mk("approve", mp, "--data", mig_data, "--home", home, "--run", "migrun")
         assert out["ok"] and out["version"] == 1, out
         assert out["archived"] == os.path.join(proj, "plans", "migplan", "archive", "migplan-v1.md"), out
         assert os.path.isfile(os.path.join(proj, "plans", "migplan", "archive", "migplan-v1.md"))
+        # Z15 (R02): approve keeps the plan.md copy AND ensures assets/ exists (C2). This FAILS on
+        # e83e6e9 (proof in the report): assets/ was never created.
+        assert os.path.isfile(os.path.join(proj, "plans", "migplan", "plan.md")), \
+            "the approved plan.md is missing from the migrated plan folder"
+        assert os.path.isdir(os.path.join(proj, "plans", "migplan", "assets")), \
+            "a migrated approve did not create the plan folder's assets/ (R02)"
+        # a second approve on the same bytes stays a no-op and keeps the folder intact
+        out = mk("approve", mp, "--data", mig_data, "--home", home, "--run", "migrun")
+        assert out["ok"] and out.get("noop") is True, out
+        assert os.path.isdir(os.path.join(proj, "plans", "migplan", "assets")), \
+            "the no-op approve dropped the plan folder's assets/"
         out = mk("delete", "migplan", "--data", mig_data, "--home", home)
         assert out["ok"] and out["moved"] == os.path.join(proj, "plans", "migplan", "archive", "plan.md"), out
         # nothing was written under the repo's .matrixkoder
