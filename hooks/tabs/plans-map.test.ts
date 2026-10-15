@@ -2,7 +2,7 @@
 import { test, expect } from 'claude-code/testing'
 import list from './fixtures/plans-list'
 import detail from './fixtures/plan-detail'
-import { laneAgent, planFromReply, plansErrorLine, plansFromReply } from './plans-map'
+import { laneAgent, planFromReply, plansErrorLine, plansFromOverview, plansFromReply } from './plans-map'
 import type { PlansView } from './plans'
 
 const detailReply = detail as unknown as { id: string; phases: unknown[] }
@@ -120,4 +120,70 @@ test('planFromReply carries the V1.5 routing fields onto tasks and subtasks', ()
   expect(bareRow?.slot).toBeUndefined()
   expect(bareRow?.route).toBeUndefined()
   expect(bareRow?.owned).toBeUndefined()
+})
+
+/** ── L7.2: the List shows only the ACTIVE project's plans ─────────────── */
+
+// Two root `plan_summary` rows for two projects, each with its own store.
+const TWO_PROJECTS = {
+  ok: true,
+  projects: [
+    { slug: 'alpha', repo: '/srv/alpha', db_path: '/home/mk/projects/alpha/mk.db' },
+    { slug: 'beta', repo: '/srv/beta', db_path: '/home/mk/projects/beta/mk.db' },
+  ],
+  plans: [
+    { project: 'alpha', plan: 'alpha-plan', title: 'Alpha plan', status: 'running', counts: { building: 1 } },
+    { project: 'beta', plan: 'beta-plan', title: 'Beta plan', status: 'draft', counts: {} },
+  ],
+}
+
+test('plansFromOverview keeps only the active project\'s plans', () => {
+  const all = plansFromOverview(TWO_PROJECTS)
+  expect(all.plans.map(p => p.id)).toEqual(['alpha-plan', 'beta-plan']) // no activeDir: as before
+
+  const active = plansFromOverview(TWO_PROJECTS, '/home/mk/projects/alpha')
+  expect(active.plans.map(p => p.id)).toEqual(['alpha-plan'])
+  expect(active.plans[0]?.title).toBe('Alpha plan')
+
+  const other = plansFromOverview(TWO_PROJECTS, '/home/mk/projects/beta')
+  expect(other.plans.map(p => p.id)).toEqual(['beta-plan'])
+})
+
+test('plansFromOverview keeps all plans when the active dir matches no root row', () => {
+  const mapped = plansFromOverview(TWO_PROJECTS, '/home/mk/projects/gamma')
+  expect(mapped.plans.map(p => p.id)).toEqual(['alpha-plan', 'beta-plan'])
+  // an empty activeDir is the no-filter case too
+  expect(plansFromOverview(TWO_PROJECTS, '').plans.map(p => p.id)).toEqual(['alpha-plan', 'beta-plan'])
+})
+
+test('plansFromOverview accepts an alias row sharing the active store', () => {
+  // The live root carries the project name AND a legacy alias for ONE store.
+  const aliased = {
+    ok: true,
+    projects: [
+      { slug: 'alpha', repo: '/srv/alpha', db_path: '/home/mk/projects/alpha/mk.db' },
+      { slug: 'a1b2c3', repo: '', db_path: '/home/mk/projects/alpha/mk.db' },
+      { slug: 'beta', repo: '/srv/beta', db_path: '/home/mk/projects/beta/mk.db' },
+    ],
+    plans: [
+      { project: 'alpha', plan: 'alpha-plan', title: 'Alpha plan', status: 'running', counts: { building: 1 } },
+      { project: 'a1b2c3', plan: 'alias-plan', title: 'Alias plan', status: 'draft', counts: {} },
+      { project: 'beta', plan: 'beta-plan', title: 'Beta plan', status: 'draft', counts: {} },
+    ],
+  }
+  const active = plansFromOverview(aliased, '/home/mk/projects/alpha')
+  expect(active.plans.map(p => p.id)).toEqual(['alpha-plan', 'alias-plan'])
+  // a pre-migration row is read at its data_dir, so that dir matches too
+  const legacy = {
+    ok: true,
+    projects: [
+      { slug: 'alpha', repo: '/srv/alpha', data_dir: '/data/alpha' },
+      { slug: 'beta', repo: '/srv/beta', data_dir: '/data/beta' },
+    ],
+    plans: [
+      { project: 'alpha', plan: 'alpha-plan', title: 'Alpha plan', status: 'running', counts: {} },
+      { project: 'beta', plan: 'beta-plan', title: 'Beta plan', status: 'draft', counts: {} },
+    ],
+  }
+  expect(plansFromOverview(legacy, '/data/alpha').plans.map(p => p.id)).toEqual(['alpha-plan'])
 })

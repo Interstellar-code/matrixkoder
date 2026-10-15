@@ -80,6 +80,38 @@ export const projectStoreDir = (row: ProjectRow): string => {
   return typeof row.data_dir === 'string' ? row.data_dir.trim() : ''
 }
 
+/** One distinct store directory and the slug its cards carry. */
+export type StoreGroup = { dir: string; slug: string }
+
+/** The slug a store's cards are labelled with: the row whose slug is the project
+ *  NAME (basename of a non-empty `repo`), else the first row's slug, else ''. The
+ *  live root carries both `matrixkoder` and a legacy alias for one store; the
+ *  named row is the one a user recognises. */
+const labelSlug = (group: readonly ProjectRow[]): string => {
+  for (const row of group) {
+    const repo = typeof row.repo === 'string' ? row.repo.trim() : ''
+    const name = repo === '' ? '' : repo.replace(/\/+$/, '').split('/').pop() ?? ''
+    if (name !== '' && typeof row.slug === 'string' && row.slug === name) return row.slug
+  }
+  const first = group[0]
+  return typeof first?.slug === 'string' ? first.slug : ''
+}
+
+/** Group rows by their store directory (L7.2 R2): ONE read per distinct store, in
+ *  first-seen order, so two rows sharing a `db_path` (the live alias) spawn one
+ *  `run-snapshot`. Rows that name no store are dropped. Pure — the rows are the test's. */
+export function storeGroups(rows: readonly ProjectRow[]): StoreGroup[] {
+  const byDir = new Map<string, ProjectRow[]>()
+  for (const row of rows) {
+    const dir = projectStoreDir(row)
+    if (dir === '') continue
+    const group = byDir.get(dir)
+    if (group == null) byDir.set(dir, [row])
+    else group.push(row)
+  }
+  return [...byDir.entries()].map(([dir, group]) => ({ dir, slug: labelSlug(group) }))
+}
+
 /** The pane's status → column map, for cards built from a per-project task read
  *  (`run-snapshot`) rather than the retired root `cards` table. Attention statuses keep
  *  their own column and are badged; an unknown status falls to Backlog, never dropped. */
@@ -371,18 +403,21 @@ export async function readCards(
   let failures = 0
   let attempted = 0
   let firstError: string | null = null
-  for (const row of rows) {
-    const dir = projectStoreDir(row)
-    if (dir === '') continue
-    const slug = typeof row.slug === 'string' ? row.slug : ''
+  // L7.2 R2: TWO root rows can name ONE store — the live root has both `matrixkoder`
+  // and the legacy alias slug, sharing a `db_path`. Reading per ROW would spawn
+  // `run-snapshot` twice and push every task twice, so group by store directory and
+  // read once per distinct store. `labelRow` chooses the slug those cards carry: the
+  // row whose slug IS the project name (basename of `repo`), else the first row.
+  const groups = storeGroups(rows)
+  for (const group of groups) {
     attempted += 1
-    const got = await call(['python3', mkdb, '--data', dir, 'run-snapshot', '--json'])
+    const got = await call(['python3', mkdb, '--data', group.dir, 'run-snapshot', '--json'])
     if (got.error != null) {
       failures += 1
       if (firstError == null) firstError = got.error
       continue
     }
-    cards.push(...cardsOfSnapshot(slug, got.parsed))
+    cards.push(...cardsOfSnapshot(group.slug, got.parsed))
   }
   const ms = Date.now() - started
   if (attempted > 0 && failures === attempted) return fail(firstError ?? cardsErrorLine('exit'), ms)

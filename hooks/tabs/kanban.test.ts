@@ -354,3 +354,92 @@ test('a per-project snapshot with 5000 open tasks parses and does not report an 
   expect(got.cards).toHaveLength(5000)
   expect(got.empty).toBe(false)
 })
+
+test('two root rows sharing one store read it once, each task once, cards under the named slug', async () => {
+  // L7.2 R2: the live root carries both the project's own slug and a legacy alias
+  // for the SAME store (same db_path, same repo). Reading per root row would spawn
+  // run-snapshot twice and push every task twice; the fix groups by store dir.
+  const snapCalls: string[] = []
+  const run: RunFn = async argv => {
+    expect(argv).toContain('--json')
+    if (argv.includes('--home')) {
+      return {
+        stdout: JSON.stringify({
+          ok: true,
+          projects: [
+            { slug: 'alias-legacy', repo: '/r/matrixkoder', data_dir: null, db_path: '/d/matrixkoder/mk.db' },
+            { slug: 'matrixkoder', repo: '/r/matrixkoder', data_dir: null, db_path: '/d/matrixkoder/mk.db' },
+          ],
+          plans: [],
+        }),
+        code: 0,
+      }
+    }
+    expect(argv).toContain('run-snapshot')
+    expect(argv).toContain('--data')
+    const dataAt = argv.indexOf('--data')
+    snapCalls.push(String(argv[dataAt + 1]))
+    return {
+      stdout: JSON.stringify({
+        ok: true, runs: [], active: 'r', waits: [],
+        run: { id: 'matrixkoder-r1', plan: null, status: 'active', tasks: [
+          { id: 'D3A', title: 'Writer', status: 'building', parent: 'D3', updated: '2026-10-12T09:00:00+02:00' },
+          { id: 'D4A', title: 'Reader', status: 'blocked', parent: 'D4', updated: '2026-10-12T09:00:00+02:00' },
+        ] },
+      }),
+      code: 0,
+    }
+  }
+
+  const got = await readCards(run, '/plugin', '/tmp/mk-home', true, 0, 0)
+  expect(snapCalls, 'one run-snapshot per distinct store').toHaveLength(1)
+  expect(snapCalls[0]).toBe('/d/matrixkoder')
+  expect(got.error).toBeNull()
+  expect(got.empty).toBe(false)
+  expect(got.cards, 'each task exactly once').toHaveLength(2)
+  expect(got.cards.map(c => c.task).sort()).toEqual(['D3A', 'D4A'])
+  // The store's cards carry the NAMED row's slug (slug === basename(repo)), not the alias.
+  expect(got.cards.find(c => c.task === 'D3A')?.project).toBe('matrixkoder')
+  expect(got.cards.find(c => c.task === 'D4A')?.project).toBe('matrixkoder')
+  expect(got.cards.every(c => c.project === 'matrixkoder')).toBe(true)
+})
+
+test('two distinct stores are each read once and both are returned under their own slugs', async () => {
+  const snapCalls: string[] = []
+  const run: RunFn = async argv => {
+    if (argv.includes('--home')) {
+      return {
+        stdout: JSON.stringify({
+          ok: true,
+          projects: [
+            { slug: 'alpha', repo: '/r/alpha', data_dir: null, db_path: '/d/alpha/mk.db' },
+            { slug: 'beta', repo: '/r/beta', data_dir: null, db_path: '/d/beta/mk.db' },
+          ],
+          plans: [],
+        }),
+        code: 0,
+      }
+    }
+    expect(argv).toContain('run-snapshot')
+    const dataAt = argv.indexOf('--data')
+    const dir = String(argv[dataAt + 1])
+    snapCalls.push(dir)
+    const name = dir.split('/').pop() ?? ''
+    return {
+      stdout: JSON.stringify({
+        ok: true, runs: [], active: 'r', waits: [],
+        run: { id: `${name}-r1`, plan: null, status: 'active', tasks: [
+          { id: `${name.toUpperCase()}1`, title: 'x', status: 'building', parent: null, updated: '2026-10-12T09:00:00+02:00' },
+        ] },
+      }),
+      code: 0,
+    }
+  }
+
+  const got = await readCards(run, '/plugin', '/tmp/mk-home', true, 0, 0)
+  expect(snapCalls.slice().sort(), 'one read per distinct store').toEqual(['/d/alpha', '/d/beta'])
+  expect(got.error).toBeNull()
+  expect(got.cards.map(c => c.task).sort()).toEqual(['ALPHA1', 'BETA1'])
+  expect(got.cards.find(c => c.task === 'ALPHA1')?.project).toBe('alpha')
+  expect(got.cards.find(c => c.task === 'BETA1')?.project).toBe('beta')
+})

@@ -738,6 +738,8 @@ const PLANS_ERROR_KEY = 'plans:error'
 const PLANS_STALE_KEY = 'plans:stale'
 const PLANS_EMPTY_KEY = 'plans:empty'
 const PLANS_STORE_KEY = 'plans:store'
+/** The active project's data dir, so the List can keep only ITS plans (L7.2 R2). */
+const PLANS_DIR_KEY = 'plans:dir'
 const PLAN_DETAIL_KEY = 'plans:detail'
 const PLAN_DETAIL_FOR_KEY = 'plans:detail-for'
 const PLANS_RELOAD_MS = 30_000
@@ -759,7 +761,9 @@ export function selectedPlanId(view: Record<string, string>, plans: readonly { i
 function plansViewOf(view: Record<string, string>, onAction: (kind: string, id: string) => void): PlansView {
   let parsed: unknown = null
   try { parsed = JSON.parse(view[PLANS_KEY] ?? '') } catch { parsed = null }
-  const mapped = plansFromOverview(parsed ?? {})
+  // L7.2 R2: the root overview holds every project's plan_summary; keep only the
+  // active project's plans (the alias row sharing its store dir counts).
+  const mapped = plansFromOverview(parsed ?? {}, view[PLANS_DIR_KEY] ?? '')
   return { mock: false, runs: mapped.runs, plans: mapped.plans, onAction }
 }
 
@@ -973,6 +977,7 @@ async function refreshPlans($: EngineInterface, cwd: string, overview: RootOverv
       const base = {
         ...prev,
         [PLANS_STORE_KEY]: '1',
+        [PLANS_DIR_KEY]: dataDir ?? '',
         [PLANS_AT_KEY]: String(now),
         [PLANS_MS_KEY]: String(got.ms),
         [PLANS_SEL_AT_KEY]: sel,
