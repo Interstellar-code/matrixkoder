@@ -65,8 +65,13 @@ Legacy projects whose runs live only in files migrate through mk-store-import.py
       listed task, one event each. N is the highest current round of the listed tasks plus one. T, if
       given, must equal the first id. Every id must exist and share the lead's lane_group (a child
       task takes its parent's); else ok:false and nothing is written. Not with --undo.
-      with the store on, also stores the brief/report/review files of that round as artifacts
-      (task, round, kind) when they already exist, and still writes the task-folder files as views
+      X3.1: the round's artifacts are store-authored — `task brief T --run R --file P | --stdin`
+      stores the brief (kind brief, rev replaces) and rewrites the view file from it; a bus
+      report/review lands as artifacts the same way (X2). `task round` still prints the paths
+      of the three round files (recreated from the artifacts by `task export T --run R`, X3.3)
+  task brief T --file P | --stdin — X3.1: store the CURRENT round's brief now; replace-per-round
+  task export T — X3.3: write brief/report/review-rN.md back FROM the artifacts (all rounds),
+      idempotent; a file whose content differs from the artifact is left and named, not clobbered
   task round T --undo — drop the latest round again, but only while none of its brief/report/review
       files exist (the paths task round printed); else ok:false naming them; one event
   task verify T --tests '<passed>/<failed>' [--tsc N] [--lint N] [--selftest '<run>/<failed>'] [--fail TEXT]
@@ -870,23 +875,40 @@ class Store:
                 "extra_json": extras_json(self.run_extras(run))}
 
     def _round_artifacts(self, run, t):
-        """brief/report/review of the task's current round, when the view files exist."""
+        """brief/report/review of the task's current round FROM the store (C4). `task brief`
+        authors the brief (put_artifact replaces by rev+1); a bus report/review lands the
+        same way (X2). One dict per kind that has a row — none when the round has no artifact."""
         n = t.get("round") or 0
-        d = self.task_dir(run["id"], t["id"])
-        arts = []
-        for kind in ("brief", "report", "review"):
-            fp = os.path.join(d, f"{kind}-r{n}.md")
-            if not os.path.exists(fp):
-                continue
-            text = open(fp).read()
-            digest = hashlib.sha256(text.encode()).hexdigest()[:16]
-            arts.append({"task": t["id"], "round": n, "kind": kind, "rev": 1, "text": text,
-                         "created": t.get("updated") or now(),
-                         "src": f"file:{run['id']}:{t['id']}:{kind}:{n}:{digest}"})
-        return arts
+        if not self.store_on:
+            return []
+        con = self.store_open()
+        try:
+            arts = []
+            for kind in ("brief", "report", "review"):
+                row = con.execute(
+                    "SELECT rev, text FROM artifacts WHERE run=? AND task=? AND round=? AND kind=?"
+                    " ORDER BY rev DESC, id DESC LIMIT 1",
+                    (run["id"], t["id"], n, kind)).fetchone()
+                if not row or not (row["text"] or "").strip():
+                    continue
+                arts.append({"task": t["id"], "round": n, "kind": kind, "rev": row["rev"],
+                             "text": row["text"], "created": now(),
+                             "src": f"file:{run['id']}:{t['id']}:{kind}:{n}:r{row['rev']}"})
+            return arts
+        finally:
+            con.close()
+
+    def doc_artifact(self, rid, task, kind, text, created):
+        # src includes the text: import_history skips a src it already has, so a changed
+        # document is a new row and the newest one (highest id) is the view
+        digest = hashlib.sha256(text.encode()).hexdigest()[:16]
+        return {"task": task, "round": 0, "kind": kind, "rev": 1, "text": text,
+                "created": created, "src": f"doc:{rid}:{task or ''}:{kind}:{digest}"}
+
 
     def store_round_files(self, run, t):
-        """Store the current round's files now (task round, after the views exist)."""
+        """Store the current round's files now (task round, after the views exist). X3.1: when
+        the artifact already holds the round's text, the view files are not re-read at all."""
         if not self.store_on:
             return []
         arts = self._round_artifacts(run, t)
@@ -895,13 +917,6 @@ class Store:
                                      data_dir=self.project_folder(),
                                      sync_root=not self._skip_root_projection())
         return [a["kind"] for a in arts]
-
-    def doc_artifact(self, rid, task, kind, text, created):
-        # src includes the text: import_history skips a src it already has, so a changed
-        # document is a new row and the newest one (highest id) is the view
-        digest = hashlib.sha256(text.encode()).hexdigest()[:16]
-        return {"task": task, "round": 0, "kind": kind, "rev": 1, "text": text,
-                "created": created, "src": f"doc:{rid}:{task or ''}:{kind}:{digest}"}
 
     def flush(self):
         """Commit every run this command saved, in the order saved. A command that saves before it
@@ -1868,6 +1883,10 @@ def cmd_task(a, st):
             return {"ok": True, "task": t, **({"warnings": warnings} if warnings else {})}
         if a.action == "check":
             return task_check(st, run, find_task(run, a.task), at_dispatch=getattr(a, "at_dispatch", False))
+        if a.action == "brief":
+            return task_brief(st, run, find_task(run, a.task), a)
+        if a.action == "export":
+            return task_export(st, run, find_task(run, a.task), a)
         t = find_task(run, a.task)
         cur = t["rounds"][-1] if t["rounds"] else None
         if a.action == "verify":
@@ -2025,8 +2044,103 @@ def cmd_task(a, st):
         return {"ok": True, "task": t, **({"warnings": warnings} if warnings else {})}
 
 
+def task_brief(st, run, t, a):
+    """X3.1: author the round's brief into the project DB in ONE command — the store is the
+    source (C4); the file was the hand-written detour today's flow used.
+
+    Shape picked: `task brief T --run R --file PATH | --stdin`, a separate subcommand rather
+    than a `task round` flag, because `task round` is a pure transition (it must stay runnable
+    before any brief exists, and a lane re-runs `task brief` without re-rounding). Re-running
+    for the round REPLACES the brief: mkdb.put_artifact inserts rev = last+1 for the key
+    (run, task, round, kind), so exactly one newest row per round; no duplicate pile. The view
+    file brief-rN.md is rewritten to match the artifact (the view follows the store; a hand
+    edit to the view is named in the reply's `previous_view_body` before it is overwritten)."""
+    if not st.store_on:
+        raise Fail("task brief needs the project store on (C4)")
+    if not t.get("rounds"):
+        raise Fail(f"task {t['id']} has no round; 'task round {t['id']} --kind build' first")
+    n = t["round"] or t["rounds"][-1]["n"]
+    if a.file:
+        if not os.path.exists(a.file):
+            raise Fail(f"--file {a.file!r} does not exist")
+        with open(a.file, encoding="utf-8") as f:
+            text = f.read()
+    else:
+        text = sys.stdin.read()
+    con = st.store_open()
+    try:
+        row = con.execute(
+            "SELECT text, rev FROM artifacts WHERE run=? AND task=? AND round=? AND kind='brief'"
+            " ORDER BY rev DESC, id DESC LIMIT 1", (run["id"], t["id"], n)).fetchone()
+    finally:
+        con.close()
+    # put_artifact replaces by rev (one newest row per (task, round, kind)); the same bytes
+    # already stored: no rev bump, idempotent. The view file follows the artifact either way.
+    if row and row["text"] == text:
+        stored = {"rev": row["rev"]}
+    else:
+        got = st.root_write(st.db().put_artifact, st.home_dir(), st.project_slug(), run["id"],
+                            t["id"], n, "brief", text, data_dir=st.project_folder())
+        if not got:
+            raise Fail("could not store the brief artifact")
+        stored = got
+    fp = os.path.join(st.task_dir(run["id"], t["id"]), f"brief-r{n}.md")
+    out = {"ok": True, "task": t["id"], "round": n, "stored": True, "view": fp,
+           "rev": stored["rev"]}
+    os.makedirs(os.path.dirname(fp), exist_ok=True)
+    if os.path.exists(fp):
+        with open(fp, encoding="utf-8") as f:
+            old = f.read()
+        if old != text:
+            out["previous_view_body"] = old  # the hand edit, preserved in the reply before overwrite
+    with open(fp, "w", encoding="utf-8") as f:
+        f.write(text)
+    return out
+
+
+def task_export(st, run, t, a):
+    """X3.3: write the task folder's round files FROM the artifacts — an audit view, for a
+    bus-down lane. Every round of this task; a kind exports only when an artifact holds it.
+
+    Idempotent: the same bytes may be rewritten (content cannot drift), but a differing file
+    is left in place and NAMED — the export never clobbers a hand edit without saying so."""
+    if not st.store_on:
+        raise Fail("the project store is off; task export needs it")
+    con = st.store_open()
+    try:
+        rows = con.execute(
+            "SELECT kind, round, text FROM artifacts WHERE run=? AND task=?"
+            " AND kind IN ('brief','report','review') ORDER BY round, kind, id",  # last wins
+            (run["id"], t["id"])).fetchall()
+    finally:
+        con.close()
+    newest = {}  # (round, round-canonical kind) -> text: the last row per (round, kind) wins
+    for r in rows:
+        newest[(r["round"], r["kind"])] = r["text"]
+    d = st.task_dir(run["id"], t["id"])
+    diff, written = [], []
+    for (n, kind), text in sorted(newest.items()):
+        if not n:
+            continue  # round 0 is the run-doc shape, not a task-folder round file (X3.3 scope)
+        fp = os.path.join(d, f"{kind}-r{n}.md")
+        os.makedirs(d, exist_ok=True)
+        if os.path.exists(fp):
+            with open(fp, encoding="utf-8") as f:  # the audit view: differing file is not clobbered
+                if f.read() != text:
+                    diff.append(fp)
+                    continue
+        with open(fp, "w", encoding="utf-8") as f:
+            f.write(text)
+        written.append(fp)
+    out = {"ok": True, "task": t["id"], "written": written,
+           **({"differing": diff} if diff else {}),
+           **({"empty": True} if not written and not diff else {})}
+    if not written and not diff:
+        out["why"] = "no brief/report/review artifacts for this task (or no rounds yet)"
+    return out
+
+
 def count_pair(v, flag):
-    """--tests/--selftest '<int>/<int>' -> (first, second); anything else is refused."""
     m = re.fullmatch(r"(\d+)/(\d+)", v or "")
     if not m:
         raise Fail(f"bad {flag} {v!r}; expected '<int>/<int>'")
@@ -2595,6 +2709,15 @@ def build_parser():
     t.add_argument("--lint", type=int)
     t.add_argument("--selftest")  # '<run>/<failed>'
     t.add_argument("--fail")
+    t = task.add_parser("brief", parents=[data_p, run_p],
+                        help="store the round's brief text as an artifact: --file PATH or --stdin")
+    t.add_argument("task")
+    _b = t.add_mutually_exclusive_group(required=True)
+    _b.add_argument("--file", metavar="PATH")
+    _b.add_argument("--stdin", action="store_true")
+    t = task.add_parser("export", parents=[data_p, run_p],
+                        help="write brief/report/review round files BACK from the artifacts (all rounds)")
+    t.add_argument("task")
     for t in task.choices.values():
         t.set_defaults(func=cmd_task)
 
@@ -4228,9 +4351,10 @@ def store_self_test(tmp, env):
     import shutil as _sh
     data = os.path.join(tmp, "store")
 
-    def mk(*args, code=0, e=None):
+    def mk(*args, code=0, e=None, stdin_text=None):
         r = subprocess.run([sys.executable, os.path.abspath(__file__), *args, "--data", data],
-                           capture_output=True, text=True, env=e or env)
+                           capture_output=True, text=True, env=e or env,
+                           input=stdin_text)
         lines = r.stdout.strip().splitlines()
         assert len(lines) == 1, (args, r.stdout, r.stderr)
         assert r.returncode == code, (args, r.returncode, r.stdout, r.stderr)
@@ -4383,25 +4507,40 @@ def store_self_test(tmp, env):
     assert after > before, (before, after)
     assert hit, "transition event missing from the store"
 
-    # task round stores the brief/report/review content as artifacts and still writes the files.
-    # The files are written by the caller after `task round` prints the paths, so the NEXT
-    # command (here a note) is what commits them — the same shape the orchestrator uses.
+    # X3.1: `task brief` authors the round's brief into the store in ONE command; re-running
+    # REPLACES it (rev+1 for the same task+round, no duplicate pile) and the view file follows
+    # the artifact. Same-bytes re-run is idempotent (no rev bump).
     paths = mk("task", "round", "B", "--kind", "fix", "--cause", "gap", "--run", "s2")
-    for kind in ("brief", "report", "review"):
-        os.makedirs(os.path.dirname(paths[kind]), exist_ok=True)  # L4: no task.json creates the dir
-        with open(paths[kind], "w") as f:
-            f.write(f"{kind} body\n")
-    mk("event", "--type", "note", "--text", "round files", "--run", "s2")
+    brief_file = os.path.join(tmp, "brief-file.md")
+    with open(brief_file, "w") as f:
+        f.write("brief body v1\n")
+    b1 = mk("task", "brief", "B", "--file", brief_file)
+    assert b1["round"] == paths["round"] and b1["stored"] is True and b1["rev"] == 1, b1
+    assert os.path.exists(paths["brief"]) and open(paths["brief"]).read() == "brief body v1\n"
+    with open(brief_file, "w") as f:
+        f.write("brief body v2\n")
+    b2 = mk("task", "brief", "B", "--file", brief_file)
+    assert b2["rev"] == 2 and b2["previous_view_body"] == "brief body v1\n", b2
+    b3 = mk("task", "brief", "B", "--file", brief_file)
+    assert b3["rev"] == 2, b3  # same bytes: no rev bump
+    stdin_body = mk("task", "brief", "B", "--stdin", stdin_text="stdin brief\n")
+    assert stdin_body["rev"] == 3, stdin_body
     con = db.open_project(H, STORE_PROJECT_FALLBACK, data_dir=data)
     try:
-        rows = {r["kind"]: r["text"] for r in con.execute(
-            "SELECT kind, text FROM artifacts WHERE run='s2' AND task='B' AND round=? AND kind IN"
-            " ('brief','report','review')", (paths["round"],))}
+        n_brief = con.execute(
+            "SELECT COUNT(*) c FROM artifacts WHERE run='s2' AND task='B' AND kind='brief'"
+        ).fetchone()["c"]
     finally:
         con.close()
-    assert rows == {"brief": "brief body\n", "report": "report body\n", "review": "review body\n"}, rows
-    for kind in rows:  # the task-folder files are still there, as views
-        assert open(paths[kind]).read() == rows[kind]
+    assert n_brief == 3, n_brief  # three revisions, one newest row each; no duplicate pile
+    # X3.3: export writes the round files back FROM the artifacts (all rounds)
+    os.unlink(paths["brief"])
+    ex = mk("task", "export", "B")
+    assert ex["ok"] and paths["brief"] in ex["written"], ex
+    with open(paths["brief"]) as f:
+        assert f.read() == "stdin brief\n"
+    ex2 = mk("task", "export", "B")
+    assert ex2["ok"] and not ex2.get("differing"), ex2  # idempotent: same bytes rewritten, no drift
 
     # L4: export-legacy is a no-op (no file views exist to rebuild)
     saved_rows = rows_of(data, "s2")
