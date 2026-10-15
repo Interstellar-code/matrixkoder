@@ -108,6 +108,44 @@ function sumCounts(counts: unknown): number {
   }
   return total
 }
+/** Map a task status to its run-card bucket: done / live / planned. Shared with
+ *  the run-card counts and the plan-row per-status tally. */
+const STATUS_BUCKET: Record<string, 'done' | 'live' | 'planned'> = {
+  merged: 'done', done: 'done',
+  dispatched: 'live', building: 'live', verifying: 'live', review: 'live', fix: 'live', qa: 'live',
+  planned: 'planned', routed: 'planned',
+}
+
+/** Sum the per-status counts into the run-card bucket totals. */
+function bucketCounts(counts: unknown): { done: number; live: number; planned: number } {
+  const out = { done: 0, live: 0, planned: 0 }
+  if (typeof counts !== 'object' || counts === null) return out
+  for (const [status, n] of Object.entries(counts)) {
+    const bucket = STATUS_BUCKET[status]
+    if (bucket != null && typeof n === 'number') out[bucket] += n
+  }
+  return out
+}
+
+/** The raw per-status counts as a { status: count } record, for the plan row. */
+function statusCounts(counts: unknown): Record<string, number> {
+  const out: Record<string, number> = {}
+  if (typeof counts !== 'object' || counts === null) return out
+  for (const [status, n] of Object.entries(counts)) {
+    if (typeof n === 'number') out[status] = n
+  }
+  return out
+}
+
+/** A human-readable counts line from the raw per-status counts. */
+function countsLineFrom(counts: unknown): string {
+  const sc = statusCounts(counts)
+  const parts: string[] = []
+  for (const [status, n] of Object.entries(sc)) {
+    parts.push(`${n} ${status}`)
+  }
+  return parts.join(' · ')
+}
 
 function taskOf(raw: unknown): PlanTask | null {
   if (!isRecord(raw) || typeof raw.id !== 'string') return null
@@ -160,20 +198,21 @@ export function plansFromReply(reply: unknown): { plans: PlanRow[]; runs: RunRow
       created: str(raw.created),
       runs: strList(raw.runs),
       live_run: live,
-      counts: { tasks: sumCounts(raw.counts), phases: 0 },
+      counts: { tasks: sumCounts(raw.counts), phases: 0, byStatus: statusCounts(raw.counts) },
       ...(str(raw.project) !== '' ? { project: str(raw.project) } : {}),
       ...(Array.isArray(raw.design) ? { design: strList(raw.design) } : {}),
       ...(branchOf(raw.integration) !== '' ? { mergesTo: branchOf(raw.integration) } : {}),
     }
     plans.push(row)
     if (live != null) {
+      const buckets = bucketCounts(raw.counts)
       runs.push({
         id: live,
         plan: row.id,
         title: row.title,
-        stage: '',
-        counts: { done: 0, live: 0, planned: 0 },
-        countsLine: '',
+        stage: str(raw.stage),
+        counts: buckets,
+        countsLine: countsLineFrom(raw.counts),
       })
     }
   }
@@ -220,18 +259,19 @@ export function plansFromOverview(reply: unknown, activeDir?: string | null): { 
       created: str(raw.created),
       runs: [],
       live_run: live,
-      counts: { tasks: sumCounts(raw.counts), phases: 0 },
+      counts: { tasks: sumCounts(raw.counts), phases: 0, byStatus: statusCounts(raw.counts) },
       ...(project !== '' ? { project } : {}),
     }
     plans.push(row)
     if (live != null) {
+      const buckets = bucketCounts(raw.counts)
       runs.push({
         id: live,
         plan: row.id,
         title: row.title,
-        stage: '',
-        counts: { done: 0, live: 0, planned: 0 },
-        countsLine: '',
+        stage: str(raw.stage),
+        counts: buckets,
+        countsLine: countsLineFrom(raw.counts),
       })
     }
   }
@@ -247,7 +287,12 @@ function activeSlugs(reply: Record<string, unknown>, activeDir: string | null | 
   const out = new Set<string>()
   for (const raw of reply.projects) {
     if (!isRecord(raw)) continue
-    if (projectStoreDir(raw) !== dir) continue
+    // Match both the migrated store dir (from db_path) and the pre-migration data_dir.
+    // activeDir is the data_dir; projectStoreDir returns the db_path folder for
+    // migrated rows, so we check both.
+    const storeDir = projectStoreDir(raw)
+    const dataDir = typeof raw.data_dir === 'string' ? raw.data_dir.trim() : ''
+    if (storeDir !== dir && dataDir !== dir) continue
     const slug = str(raw.slug)
     if (slug !== '') out.add(slug)
   }

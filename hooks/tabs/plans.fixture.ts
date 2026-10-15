@@ -36,7 +36,7 @@ export const PLANS_FIXTURE: PlansView = {
       created: '2026-10-13',
       runs: ['settings-plans-db-r1'],
       live_run: 'settings-plans-db-r1',
-      counts: { tasks: 14, phases: 5 },
+      counts: { tasks: 14, phases: 5, byStatus: { merged: 8, done: 2, planned: 3, building: 1 } },
       mergesTo: 'main',
       design: ['settings-tab', 'settings-wire', 'dashboard-v2', 'mk-store'],
     },
@@ -47,7 +47,7 @@ export const PLANS_FIXTURE: PlansView = {
       created: '2026-10-11',
       runs: ['mk-bus-e2e-r1'],
       live_run: 'mk-bus-e2e-r1',
-      counts: { tasks: 8, phases: 3 },
+      counts: { tasks: 8, phases: 3, byStatus: { merged: 4, building: 2, planned: 2 } },
     },
     {
       id: 'checkout-v2',
@@ -56,7 +56,7 @@ export const PLANS_FIXTURE: PlansView = {
       created: '2026-10-09',
       runs: [],
       live_run: null,
-      counts: { tasks: 9, phases: 3 },
+      counts: { tasks: 9, phases: 3, byStatus: { done: 5, planned: 4 } },
       project: 'matrixkoder',
     },
     {
@@ -66,7 +66,7 @@ export const PLANS_FIXTURE: PlansView = {
       created: '2026-10-08',
       runs: ['hive-cards-r1'],
       live_run: null,
-      counts: { tasks: 4, phases: 2 },
+      counts: { tasks: 4, phases: 2, byStatus: { parked: 4 } },
     },
     {
       id: 'workflows-v2',
@@ -75,7 +75,7 @@ export const PLANS_FIXTURE: PlansView = {
       created: '2026-10-02',
       runs: ['workflows-v2-r1'],
       live_run: null,
-      counts: { tasks: 6, phases: 2 },
+      counts: { tasks: 6, phases: 2, byStatus: { done: 6 } },
     },
     {
       id: 'lane-nudge',
@@ -84,7 +84,7 @@ export const PLANS_FIXTURE: PlansView = {
       created: '2026-10-12',
       runs: [],
       live_run: null,
-      counts: { tasks: 2, phases: 1 },
+      counts: { tasks: 2, phases: 1, byStatus: { planned: 2 } },
     },
     {
       id: 'orphan-run',
@@ -93,7 +93,7 @@ export const PLANS_FIXTURE: PlansView = {
       created: '2026-10-10',
       runs: [],
       live_run: null,
-      counts: { tasks: 1, phases: 1 },
+      counts: { tasks: 1, phases: 1, byStatus: { building: 1 } },
     },
   ],
 }

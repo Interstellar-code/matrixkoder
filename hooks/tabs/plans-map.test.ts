@@ -3,6 +3,7 @@ import { test, expect } from 'claude-code/testing'
 import list from './fixtures/plans-list'
 import detail from './fixtures/plan-detail'
 import { laneAgent, planFromReply, plansErrorLine, plansFromOverview, plansFromReply } from './plans-map'
+import liveOverview from './fixtures/overview-live'
 import type { PlansView } from './plans'
 
 const detailReply = detail as unknown as { id: string; phases: unknown[] }
@@ -186,4 +187,38 @@ test('plansFromOverview accepts an alias row sharing the active store', () => {
     ],
   }
   expect(plansFromOverview(legacy, '/data/alpha').plans.map(p => p.id)).toEqual(['alpha-plan'])
+})
+
+// ── Z18: live overview fixture tests ─────────────────────────────────────
+// Captured: python3 scripts/mkdb.py overview --json (2026-10-15)
+const LIVE = liveOverview as unknown as { ok: boolean; projects: Record<string, unknown>[]; plans: Record<string, unknown>[] }
+
+// The real matrixkoder dataDir from the live overview's matrixkoder row.
+const MATRIXKODER_DIR = '/Users/rohits/Development/matrixkoder/.matrixkoder'
+
+test('Z18.1: storage-layout-r1 run card has non-zero counts and countsLine', () => {
+  const { runs } = plansFromOverview(LIVE, MATRIXKODER_DIR)
+  const run = runs.find(r => r.id === 'storage-layout-r1')
+  expect(run).toBeDefined()
+  expect(run!.counts.done).toBeGreaterThan(0)
+  expect(run!.counts.live).toBeGreaterThan(0)
+  expect(run!.countsLine).not.toBe('')
+})
+
+test('Z18.2: plan rows carry per-status counts', () => {
+  const { plans } = plansFromOverview(LIVE, MATRIXKODER_DIR)
+  const storage = plans.find(p => p.id === 'storage-layout')
+  expect(storage).toBeDefined()
+  expect(storage!.counts.byStatus.merged).toBe(53)
+  expect(storage!.counts.byStatus.building).toBe(2)
+  expect(storage!.counts.byStatus.planned).toBe(30)
+})
+
+test('Z18.3: branch-selection absent from matrixkoder list, matrixkoder plans present', () => {
+  const { plans } = plansFromOverview(LIVE, MATRIXKODER_DIR)
+  const ids = plans.map(p => p.id)
+  expect(ids).not.toContain('branch-selection')
+  expect(ids).toContain('storage-layout')
+  expect(ids).toContain('settings-plans-db')
+  expect(ids).toContain('omp-lane-agent')
 })

@@ -5,3 +5,4 @@ __pycache__/
 .serena/
 .claude-plugin/types/
 /.matrixkoder/
+.matrixkoder-report-r1.md
