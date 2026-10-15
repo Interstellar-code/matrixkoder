@@ -207,6 +207,25 @@ def home():
         raise Fail(str(e))
 
 
+def _default_home():
+    """True when neither $MK_HOME nor $MATRIXKODER_HOME is set: home() then resolves the
+    default ~/.matrixkoder. Z8: only the DEFAULT home is protected from a throwaway data dir;
+    an explicit home (tests, mk-e2e-layout, mk-livetest) keeps registering as it always did."""
+    return not (os.environ.get("MK_HOME") or os.environ.get("MATRIXKODER_HOME"))
+
+
+def _under_system_temp(path):
+    """True when path's realpath is the system temp dir or under it (tempfile.gettempdir(),
+    /tmp, /private/tmp — the same spellings mkdb's MK_SELFTEST guard accepts). Z8: a data dir
+    here is a throwaway (a one-off --data, a test fixture), not a project a user pointed at."""
+    real = os.path.realpath(path)
+    for root in (tempfile.gettempdir(), "/tmp", "/private/tmp"):
+        base = os.path.realpath(root)
+        if real == base or real.startswith(base + os.sep):
+            return True
+    return False
+
+
 def repo_top():
     """The main checkout of the nearest git repo above cwd, or None when there is none
     (mkpaths.repo_top)."""
@@ -660,6 +679,14 @@ class Store:
                     return slug
         return None
 
+    def _skip_root_projection(self):
+        """Z8: True when this data dir is a throwaway under the system temp dir AND the home is
+        the default one. root_register then inserts no root row and root_write projects nothing,
+        so a one-off `mk-state.py --data /tmp/x ...` cannot add a junk row to the user's real
+        ~/.matrixkoder. An explicit MK_HOME/MATRIXKODER_HOME (tests, mk-e2e-layout, mk-livetest)
+        or a data dir outside temp keeps registering exactly as before."""
+        return _under_system_temp(self.data) and _default_home()
+
     def root_register(self):
         """Give this project its root row (the C3 linkage) if it has none, then return the slug.
 
@@ -668,9 +695,13 @@ class Store:
         INSERT OR IGNORE mkpaths._register_project / mk-bus / mk-migrate use (same columns, same
         derivation). An existing row is left alone, so a migrated row's db_path and repo survive.
         A self-test fixture (MK_SELFTEST_FALLBACK_SLUG) is skipped: it needs no row and must add
-        none. Called from the write path only, never from a read."""
+        none. Z8: a throwaway temp data dir on the DEFAULT home registers nothing either — the
+        slug is returned, but the user's real root store gains no row. Called from the write path
+        only, never from a read."""
         slug = self.project_slug()
         if os.environ.get("MK_SELFTEST_FALLBACK_SLUG") or mkpaths.project_slug_of(self.data):
+            return slug
+        if self._skip_root_projection():
             return slug
         if self._canonical_slug():
             return self._canonical_slug()
@@ -699,7 +730,10 @@ class Store:
         missing/unreadable/corrupt root store — or a corrupt ~/.matrixkoder/mk.db — must never
         abort a project write; the card is simply not written and `sync` heals it later. A real
         refusal still propagates: mkdb.Fail (a synced/unwritable home, a newer schema) names a
-        condition the caller must see, so it is re-raised."""
+        condition the caller must see, so it is re-raised. Z8: nothing is projected for a
+        throwaway temp data dir on the default home (see _skip_root_projection)."""
+        if self._skip_root_projection():
+            return None
         try:
             return fn(*a, **kw)
         except self.db().Fail:
@@ -2481,7 +2515,10 @@ def cmd_sync(a, st):
     if not st.store_on:
         return {"ok": True, "store": "off", "copied": 0}
     project = a.project or st.root_register()
-    copied = st.db().catch_up(st.home_dir(), project, data_dir=st.project_folder())
+    # Z8: a throwaway temp data dir on the default home projects nothing (root_register already
+    # added no row); copied stays 0 and catch_up is not called.
+    copied = 0 if st._skip_root_projection() else \
+        st.db().catch_up(st.home_dir(), project, data_dir=st.project_folder())
     return {"ok": True, "store": "on", "project": project, "copied": copied}
 
 
@@ -2899,6 +2936,109 @@ def self_test():
         return q1(datadir, "SELECT COUNT(*) c FROM events WHERE run=?", (rid,))["c"]
 
     try:
+        # Z8: a throwaway data dir under the system temp dir must not register a root row in the
+        # DEFAULT home. root_register inserts a projects row on the write path (store_commit); that
+        # is right for a real project and for an explicit MK_HOME, and wrong for a temp data dir on
+        # the default home, where home_dir() is the user's real ~/.matrixkoder. The harness pins
+        # MK_SELFTEST_FALLBACK_SLUG (a different skip), so these cases drop that pin.
+        import sqlite3 as _z8sq
+
+        def _root_counts(home_dir):
+            dbp = os.path.join(home_dir, "mk.db")
+            if not os.path.exists(dbp):
+                return 0, 0
+            con = _z8sq.connect(dbp)
+            try:
+                nproj = con.execute("SELECT COUNT(*) c FROM projects").fetchone()[0]
+                try:
+                    nplan = con.execute("SELECT COUNT(*) c FROM plan_summary").fetchone()[0]
+                except _z8sq.OperationalError:
+                    nplan = 0
+            finally:
+                con.close()
+            return nproj, nplan
+
+        def _bare_env(home_dir):
+            """Default-home env: HOME pinned, both home names and the fallback slug unset."""
+            e = {k: v for k, v in env.items()
+                 if k not in ("MK_HOME", "MATRIXKODER_HOME", "MATRIXKODER_DATA",
+                              "MK_SELFTEST_FALLBACK_SLUG")}
+            e["HOME"] = home_dir
+            e["MK_SELFTEST"] = "1"
+            return e
+
+        def _status_write(data_dir, run_env):
+            """run init + task add + task set status=building. The status write reaches
+            store_commit -> root_register (and plan_summary, once a plan exists)."""
+            script = os.path.abspath(__file__)
+            for args in (
+                ["run", "init", "--id", "z8", "--feature", "Z", "--branch", "bz",
+                 "--data", data_dir],
+                ["task", "add", "--id", "Z1", "--title", "t", "--run", "z8", "--data", data_dir],
+                ["task", "set", "Z1", "status=building", "--run", "z8", "--data", data_dir],
+            ):
+                r = subprocess.run([sys.executable, script, *args],
+                                   capture_output=True, text=True, env=run_env)
+                assert r.returncode == 0, (args, r.returncode, r.stdout, r.stderr)
+                assert len(r.stdout.strip().splitlines()) == 1, (args, r.stdout, r.stderr)
+            assert json.loads(r.stdout)["task"]["status"] == "building"
+
+        # (a) temp data dir + default home: the status write succeeds, and the default home gains
+        # neither a projects row nor a plan_summary row.
+        a_home = os.path.join(tmp, "z8-default-home")
+        a_data = os.path.join(tempfile.gettempdir(), "z8-data-" + os.path.basename(tmp))
+        os.makedirs(a_home, exist_ok=True)
+        os.makedirs(a_data, exist_ok=True)
+        assert os.path.realpath(a_data).startswith(
+            os.path.realpath(tempfile.gettempdir()) + os.sep)
+        _status_write(a_data, _bare_env(a_home))
+        a_root = os.path.join(a_home, ".matrixkoder")
+        assert _root_counts(a_root) == (0, 0), _root_counts(a_root)
+        assert os.path.exists(os.path.join(a_data, "mk.db")), "the project write itself must land"
+
+        # (b) temp data dir + explicit MK_HOME: registers as today (one projects row; a plan-less
+        # write never writes a plan_summary row).
+        b_home = os.path.join(tmp, "z8-explicit-home")
+        b_data = os.path.join(tempfile.gettempdir(), "z8-data-b-" + os.path.basename(tmp))
+        os.makedirs(b_home, exist_ok=True)
+        os.makedirs(b_data, exist_ok=True)
+        b_env = _bare_env(os.path.join(tmp, "z8-unused-home"))
+        b_env["MK_HOME"] = b_home
+        b_env["MATRIXKODER_HOME"] = b_home
+        _status_write(b_data, b_env)
+        assert _root_counts(b_home)[0] == 1, _root_counts(b_home)
+        assert _root_counts(b_home)[1] == 0, "a plan-less write must not invent a plan_summary row"
+
+        # (c) non-temp data dir + default home: registers as today. A temp HOME is inside the
+        # system temp dir on macOS, so a real outside-temp data dir cannot be paired with a default
+        # home MK_SELFTEST accepts. Drive the predicate with a fake temp root: the data dir is not
+        # under it, the home is still the default (~/.matrixkoder of HOME).
+        saved_tmp = {k: os.environ.get(k) for k in ("TMPDIR", "TEMP", "TMP")}
+        fake_tmp = os.path.join(tmp, "z8-fake-temp")
+        os.makedirs(fake_tmp, exist_ok=True)
+        c_home = os.path.join(tmp, "z8-default-home-c")
+        c_data = os.path.join(tmp, "z8-outside-temp")  # under the real temp dir, not the fake one
+        os.makedirs(c_home, exist_ok=True)
+        os.makedirs(c_data, exist_ok=True)
+        c_env = _bare_env(c_home)
+        # the MK_SELFTEST guard refuses any write outside the (faked) temp root; case (c) writes
+        # to a temp HOME on purpose, so the guard is not needed here.
+        c_env.pop("MK_SELFTEST", None)
+        c_env["TMPDIR"] = c_env["TEMP"] = c_env["TMP"] = fake_tmp
+        for k in ("TMPDIR", "TEMP", "TMP"):
+            os.environ[k] = fake_tmp
+        try:
+            assert not os.path.realpath(c_data).startswith(os.path.realpath(fake_tmp) + os.sep)
+            _status_write(c_data, c_env)
+        finally:
+            for k, v in saved_tmp.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        assert _root_counts(os.path.join(c_home, ".matrixkoder"))[0] == 1, \
+            _root_counts(os.path.join(c_home, ".matrixkoder"))
+
         rdir = os.path.join(data, "runs", "r1")
         # run init --plan now runs the plan tool (check/approved) — plans/f.md does not exist and
         # no MK_PLAN_CMD is set here, so r1 is a plan-less run; plan links get their own block below
