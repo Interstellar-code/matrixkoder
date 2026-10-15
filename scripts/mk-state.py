@@ -363,9 +363,11 @@ class Store:
         out = []
         for r in rows:
             run_x, _ = self.extras_read(r["id"])
+            # R2 HIGH 2: a legacy run keeps its plan path in runs.plan, never in plan_id; fall
+            # back to the column so `run list` does not report plan None for those runs.
             out.append({"id": r["id"], "feature": run_x.get("feature"), "status": r["status"],
                         "started": r["started"], "ended": r["ended"],
-                        "plan": run_x.get("plan_id")})
+                        "plan": run_x.get("plan_id") or r["plan"]})
         return sorted(out, key=lambda x: x.get("started") or "")
 
     def load(self, rid=None, task=None):
@@ -416,7 +418,7 @@ class Store:
                          if isinstance(t, dict) and str(t.get("id") or "").lower() == tid.lower()), None)
         con = self.store_open()
         try:
-            row = con.execute("SELECT status FROM tasks WHERE run=? AND lower(id)=lower(?)",
+            row = con.execute("SELECT status FROM tasks WHERE lower(run)=lower(?) AND lower(id)=lower(?)",
                               (rid, tid)).fetchone()
         except Exception:
             return None
@@ -983,6 +985,9 @@ class Store:
                 "owned": owned, "status": status,
                 "lane": t["lane"], "slot": t["slot"], "branch": t["branch"], "pane": t["pane"],
                 "round": t["round"] or 0, "verdict": t["verdict"], "updated": t["updated"],
+                # R2 HIGH 1: every column task_row writes must be read back, or a load+save
+                # resets it. parallel is a column, not an extra: bool(...) restores the flag.
+                "parallel": bool(t["parallel"]),
                 "ready": ready,
                 "agent": route.get("agent"), "model": route.get("model"), "effort": route.get("effort"),
             })
@@ -3881,6 +3886,8 @@ def self_test():
         print("mk-state cross-run-dep self-test ok")
         no_field_blanked_self_test(tmp, env)
         print("mk-state no-field-blanked self-test ok")
+        r2_fixes_self_test(tmp, env)
+        print("mk-state r2-fixes self-test ok")
         # R1.2: the mkdb write guard refuses the real home from this suite too.
         _mkdb().selftest_guard_probe(tmp_home)
     finally:
@@ -4919,6 +4926,87 @@ def no_field_blanked_self_test(tmp, env):
         row = con.execute("SELECT route_json, status FROM tasks WHERE run='kf' AND id='T'").fetchone()
         assert row["status"] == "building"
         assert json.loads(row["route_json"])["agent"] == "codex"
+    finally:
+        con.close()
+
+
+def r2_fixes_self_test(tmp, env):
+    """R2 review fixes: (1) a load+save round trip keeps every stored task column, `parallel`
+    included; (2) `run list` reads a legacy run's plan path from runs.plan and its feature from
+    the run-doc extras on a pre-L4 store; (3) dep_status matches a cross-run id case-insensitively;
+    (4) the importer's TASK_FILE_KEYS carries deps. (1) and (2) FAIL on bf55ee0."""
+    data = os.path.join(tmp, "r2fix")
+    home = os.path.join(data, ".mk-home")
+
+    def mk(*args, code=0):
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), *args, "--data", data],
+                           capture_output=True, text=True, env=env)
+        lines = r.stdout.strip().splitlines()
+        assert len(lines) == 1, (args, r.stdout, r.stderr)
+        assert r.returncode == code, (args, r.returncode, r.stdout, r.stderr)
+        return json.loads(lines[0])
+
+    db = _mkdb()
+    # (1) parallel round trip: set the column, load, save through an ordinary write, read it back
+    mk("run", "init", "--id", "par", "--feature", "P", "--branch", "b")
+    mk("task", "add", "--id", "PT", "--title", "par", "--run", "par")
+    con = db.open_project(home, STORE_PROJECT, data_dir=data)
+    try:
+        con.execute("UPDATE tasks SET parallel=1 WHERE run='par' AND id='PT'")
+        con.commit()
+    finally:
+        con.close()
+    assert mk("task", "get", "PT", "--run", "par")["task"].get("parallel") is True, \
+        "load_store dropped the parallel column"
+    mk("task", "set", "PT", "status=building", "--run", "par")  # an ordinary load+save
+    con = db.open_project(home, STORE_PROJECT, data_dir=data)
+    try:
+        assert con.execute("SELECT parallel FROM tasks WHERE run='par' AND id='PT'").fetchone()["parallel"] == 1, \
+            "a load+save reset tasks.parallel to 0"
+    finally:
+        con.close()
+    # every other column task_row writes must round-trip too: compare the stored row to the load
+    con = db.open_project(home, STORE_PROJECT, data_dir=data)
+    try:
+        stored = dict(con.execute("SELECT * FROM tasks WHERE run='par' AND id='PT'").fetchone())
+    finally:
+        con.close()
+    loaded = mk("task", "get", "PT", "--run", "par")["task"]
+    for col in ("id", "parent", "type", "title", "status", "lane", "slot", "branch", "pane",
+                "round", "verdict", "updated"):
+        got = loaded.get(col)
+        assert got == (stored[col] if col != "round" else (stored[col] or 0)), (col, got, stored[col])
+
+    # (2) legacy run list: a run-doc artifact + runs.plan only (no extra_json, no plan_id)
+    mk("run", "init", "--id", "leg", "--feature", "Legacy", "--branch", "b2")
+    con = db.open_project(home, STORE_PROJECT, data_dir=data)
+    try:
+        # a pre-L4 store keeps the run-level extras only in the run-doc artifact (the old
+        # mk-state wrote it); write one directly, then blank the columns exactly as L4 sees them
+        con.execute("INSERT INTO artifacts(run, task, round, kind, rev, text, created)"
+                    " VALUES ('leg', NULL, 0, 'run-doc', 1, ?, '2020-01-01T00:00:00+00:00')",
+                    (json.dumps({"id": "leg", "feature": "LegacyFromDoc", "plan": "plans/legacy.md",
+                                 "tasks": [{"id": "LG", "title": "lg", "status": "planned"}]}),))
+        con.execute("UPDATE runs SET plan='plans/legacy.md', extra_json=NULL WHERE id='leg'")
+        con.execute("UPDATE tasks SET extra_json=NULL WHERE run='leg'")
+        con.commit()
+    finally:
+        con.close()
+    rows = {r["id"]: r for r in mk("run", "list")["runs"]}
+    assert rows["leg"]["plan"] == "plans/legacy.md", rows["leg"]
+    assert rows["leg"]["feature"] == "LegacyFromDoc", rows["leg"]  # from the run-doc extras fallback
+
+    # (3) dep_status matches a cross-run id case-insensitively
+    mk("run", "init", "--id", "ra", "--feature", "A", "--branch", "a")
+    mk("task", "add", "--id", "RT", "--title", "dep", "--run", "ra")
+    mk("run", "init", "--id", "rb", "--feature", "B", "--branch", "b")
+    mk("task", "add", "--id", "B2", "--title", "waits", "--deps", "RA:RT", "--run", "rb")
+    mk("task", "set", "RT", "status=merged", "--run", "ra")
+    mk("task", "set", "B2", "status=building", "--run", "rb")
+    con = db.open_project(home, STORE_PROJECT, data_dir=data)
+    try:
+        assert con.execute("SELECT status FROM tasks WHERE run='rb' AND id='B2'").fetchone()["status"] == "building", \
+            "an upper-case run id in a dep did not resolve"
     finally:
         con.close()
 

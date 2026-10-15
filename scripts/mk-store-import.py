@@ -397,7 +397,7 @@ def _import_order(loaded):
 # store reads the same extras a live one does, in the same single transaction (never a second write).
 RUN_FILE_KEYS = ("feature", "waiting", "recent", "plan_sha", "plan_status", "updated", "plan", "plan_id")
 TASK_FILE_KEYS = ("wave", "ready", "workspace", "last_commit", "gates", "rounds", "created",
-                  "plan_phase", "plan_task", "route", "lane_group", "reviewer", "refs")
+                  "plan_phase", "plan_task", "route", "lane_group", "reviewer", "refs", "deps")
 
 
 def _extras_json(obj):
@@ -604,6 +604,10 @@ def self_test():
             _check(report == "report \u2014 no newline" and not report.endswith("\n"), "no-newline file")
             row = con.execute("SELECT parent, deps FROM tasks WHERE id='P.1'").fetchone()
             _check(row["parent"] == "P" and row["deps"] == "P.2", dict(row))
+            # R2 fix 4: the importer's TASK_FILE_KEYS carries deps, so the raw dep list also
+            # rides tasks.extra_json (mk-state reads it back there), matching mk-state.
+            xrow = con.execute("SELECT extra_json FROM tasks WHERE id='P.1'").fetchone()
+            _check(json.loads(xrow["extra_json"]).get("deps") == ["P.2"], xrow["extra_json"])
         finally:
             con.close()
 
