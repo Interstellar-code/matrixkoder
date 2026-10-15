@@ -1264,9 +1264,10 @@ def put_artifact(home, project, run, task, round, kind, text, *, event_id=None, 
 def timeline(home, project, run, task, data_dir=None):
     """SELECT … FROM events WHERE run=? AND task=? ORDER BY id.
 
-    A missing store is an empty timeline: no file and no directory is created.
+    A missing store is an empty timeline: no file and no directory is created. L5: the reader
+    opens the store _store_path resolves, so a migrated project's events are read (Z6).
     """
-    path = os.path.join(project_dir(home, project, data_dir), "mk.db")
+    path = _store_path(home, project, data_dir)
     con = _open_read(path, SCHEMA)
     if con is None:
         return []
@@ -1575,9 +1576,10 @@ def plans(home, project=None, data_dir=None, plan_id=None):
     """Read the project store's plans (C5, C8). Read-only: mode=ro, never migrates, never writes.
 
     A missing store is an empty list, like timeline(). An unknown plan id is a Fail (exit 2),
-    the same error shape as the other subcommands.
+    the same error shape as the other subcommands. L5: the store _store_path resolves is the
+    one read, so a migrated project's plans are the C2 store's (Z6).
     """
-    path = os.path.join(project_dir(home, project, data_dir), "mk.db")
+    path = _store_path(home, project, data_dir)
     con = _open_read(path, SCHEMA)
     if con is None:
         if plan_id:
@@ -1699,12 +1701,14 @@ def _run_obj(con, row, doc):
 
 
 def _store_path(home, project=None, data_dir=None):
-    """The store a READER opens for this project (L5). mkpaths.project_folder's rule: a migrated
-    project's store is the C2 `<home>/projects/<slug>/mk.db` its root row points at, a
-    pre-migration project's is `<data>/mk.db`. The other readers here keep project_dir's
-    --data-literal rule on purpose (mk-migrate's rollback addresses the legacy store through
-    exactly that form); a pane holding a data dir must follow the switch instead, or it would
-    read the pre-switch copy that is still sitting in the data dir. Never creates anything."""
+    """The store a READER opens for this project (L5, Z6). mkpaths.project_folder's rule: a
+    migrated project's store is the C2 `<home>/projects/<slug>/mk.db` its root row points at,
+    a pre-migration project's is `<data>/mk.db`. The DATA-literal join is not a reader rule:
+    only writers keep it — `open_project` migrates whatever `--data` names, and mk-migrate's
+    rollback addresses the legacy store through `mkpaths.project_db(data=…)` on purpose (it
+    must read the pre-switch copy). A pane holding a data dir must follow the switch instead,
+    or it would read the pre-switch copy that is still sitting in the data dir. Never creates
+    anything."""
     folder = (_mkpaths().project_folder(data_dir, home_arg=home) if data_dir
               else project_dir(home, project))
     return os.path.join(folder, "mk.db")
@@ -2027,6 +2031,9 @@ def self_test():
         _run_snapshot_migrated(home)
         _run_snapshot_no_store(home)
         _run_snapshot_zero_runs(home)
+        _plans_timeline_migrated(home)
+        _plans_timeline_premigration(home)
+        _plans_timeline_no_store(home)
         _task_type_default(home)
         _root_v2_migration(home, tmp)
         _plan_summary_transitions(home)
@@ -4459,6 +4466,175 @@ def _run_snapshot_no_store(home):
     # and the read stays read-only: no file, no directory, under the path it was pointed at
     _check(sorted(os.listdir(missing)) == before, f"the no-store read created a file: {before}")
     _check(not os.path.exists(os.path.join(missing, "mk.db")), "the no-store read created a store")
+
+
+def _plans_timeline_migrated(home):
+    """plans() and timeline() follow the switch to the C2 store, like run_snapshot() (Z6).
+
+    The _run_snapshot_migrated fixture with plan rows: a migrated project whose pre-switch copy
+    is still sitting in the data dir, holding DIFFERENT plan, task and event rows. A pane holding
+    the data dir reads the root row's db_path — the live store — or mk-plan, the dashboard and
+    wake would publish the stale plan, the stale task status and the stale events of a project
+    that moved to the C2 tree long ago.
+    """
+    data = os.path.join(home, "plans-mig", "data")   # the legacy location, post-switch
+    slug = "demo2"
+    c2 = os.path.join(home, "projects", slug)        # the C2 project folder
+    os.makedirs(data, exist_ok=True)
+    os.makedirs(c2, exist_ok=True)
+    live = open_project(home, data_dir=c2)           # the live store, in the C2 folder
+    stale = open_project(home, data_dir=data)        # the pre-switch copy, left in the data dir
+    try:
+        live.execute("INSERT INTO plans(id, version, title, header_json)"
+                     " VALUES ('p1',1,'Live plan','{}')")
+        live.execute("INSERT INTO runs(id, plan, status, started)"
+                     " VALUES ('r-live','p1','active','2026-03-01T00:00:00Z')")
+        live.commit()
+        add_task(live, "r-live", "ph1", "phase", title="Phase one")
+        add_task(live, "r-live", "t1", "task", title="Live task", parent="ph1", status="merged")
+        stale.execute("INSERT INTO plans(id, version, title, header_json)"
+                      " VALUES ('p1',1,'Stale plan','{}')")
+        stale.execute("INSERT INTO runs(id, plan, status, started)"
+                      " VALUES ('r-stale','p1','active','2026-03-02T00:00:00Z')")
+        stale.commit()
+        add_task(stale, "r-stale", "ph1", "phase", title="Phase one")
+        add_task(stale, "r-stale", "t1", "task", title="Stale task", parent="ph1", status="ready")
+        for con, run, text in ((live, "r-live", "live merged"), (stale, "r-stale", "stale ready")):
+            con.execute("INSERT INTO events(run, task, t, chan, kind, text)"
+                        " VALUES (?,?,?,?,?,?)",
+                        (run, "t1", "2026-03-03T00:00:00Z", "state", "transition", text))
+            con.commit()
+        # the root row: this project's live store is db_path (L2's switch marker)
+        root = open_root(home)
+        try:
+            root.execute("INSERT INTO projects(slug, name, repo, data_dir, mode, db_path)"
+                         " VALUES (?,'demo','',?,'home',?)", (slug, data, os.path.join(c2, "mk.db")))
+            root.commit()
+        finally:
+            root.close()
+    finally:
+        live.close()
+        stale.close()
+
+    # plans(): the detail reply is the live plan and the live task's merged status
+    got = plans(home, data_dir=data, plan_id="p1")
+    _check(got["ok"] is True and got["id"] == "p1", f"plans detail id {got.get('id')}")
+    _check(got["title"] == "Live plan", f"plans read the pre-switch store: {got['title']}")
+    t1 = got["phases"][0]["tasks"][0]
+    _check(t1["id"] == "t1" and t1["status"] == "merged", f"plans task {t1}")
+    _check(got["counts"] == {"merged": 1}, f"plans counts {got['counts']}")
+    _check(got["runs"] == ["r-live"] and got["live_run"] == "r-live", f"plans runs {got['runs']}")
+    # the list reply follows the same store: one plan, counted off the live run
+    listing = plans(home, data_dir=data)
+    _check([p["id"] for p in listing["plans"]] == ["p1"], f"plans list {listing}")
+    _check(listing["plans"][0]["title"] == "Live plan"
+           and listing["plans"][0]["counts"] == {"merged": 1},
+           f"plans list entry {listing['plans'][0]}")
+    # timeline(): the live store's events, and none of the stale copy's
+    feed = timeline(home, slug, "r-live", "t1", data_dir=data)
+    _check([e["text"] for e in feed] == ["live merged"], f"timeline {feed}")
+    _check(timeline(home, slug, "r-stale", "t1", data_dir=data) == [],
+           "timeline read the pre-switch store in the data dir")
+    # the CLI reaches the same store through --data (--project only names the project)
+    _check(_cli(["plans", "p1", "--json", "--home", home, "--project", slug,
+                 "--data", data]) == got, "cli plans differs from the api")
+    _check(_cli(["timeline", "--json", "--home", home, "--project", slug, "--data", data,
+                 "--run", "r-live", "--task", "t1"]) == {"ok": True, "events": feed},
+           "cli timeline differs from the api")
+    # and a read still leaves the pre-switch copy untouched: no write, no migration
+    names = ("mk.db", "mk.db-wal", "mk.db-shm")
+    before = {n: _file_hash(os.path.join(data, n)) for n in names}
+    plans(home, data_dir=data)
+    timeline(home, slug, "r-live", "t1", data_dir=data)
+    after = {n: _file_hash(os.path.join(data, n)) for n in names}
+    _check(after == before, f"the reader wrote the pre-switch store: {before} -> {after}")
+
+
+def _plans_timeline_premigration(home):
+    """A pre-migration project keeps <data>/mk.db for plans() and timeline() (Z6).
+
+    The reader follows the switch only when the root row says so. A row that is registered but
+    never switched (db_path NULL) must not move plans() or timeline() off the store in the
+    project's own data dir, or a project that has not migrated loses its plans and events.
+    """
+    data = os.path.join(home, "plans-plain")
+    con = open_project(home, data_dir=data)
+    try:
+        con.execute("INSERT INTO plans(id, version, title, header_json)"
+                    " VALUES ('p1',1,'Plain plan','{}')")
+        con.execute("INSERT INTO runs(id, plan, status, started)"
+                    " VALUES ('r','p1','active','2026-03-01T00:00:00Z')")
+        con.commit()
+        add_task(con, "r", "ph1", "phase", title="Phase one")
+        add_task(con, "r", "t1", "task", title="Plain task", parent="ph1", status="ready")
+        con.execute("INSERT INTO events(run, task, t, chan, kind, text)"
+                    " VALUES ('r','t1','2026-03-03T00:00:00Z','state','transition','plain ready')")
+        con.commit()
+    finally:
+        con.close()
+    # registered, never switched: the row is there and its db_path is NULL
+    root = open_root(home)
+    try:
+        root.execute("INSERT INTO projects(slug, name, repo, data_dir, mode, db_path)"
+                     " VALUES ('plain','Plain','',?,'home',NULL)", (data,))
+        root.commit()
+    finally:
+        root.close()
+
+    _check(_store_path(home, data_dir=data) == os.path.join(data, "mk.db"),
+           f"a pre-migration project lost its own store: {_store_path(home, data_dir=data)}")
+    got = plans(home, data_dir=data, plan_id="p1")
+    _check(got["title"] == "Plain plan", f"pre-migration plans {got}")
+    _check(got["phases"][0]["tasks"][0]["status"] == "ready", f"pre-migration task {got}")
+    _check(got["counts"] == {"ready": 1} and got["live_run"] == "r",
+           f"pre-migration counts {got['counts']}")
+    feed = timeline(home, "plain", "r", "t1", data_dir=data)
+    _check([e["text"] for e in feed] == ["plain ready"], f"pre-migration timeline {feed}")
+    _check(_cli(["plans", "p1", "--json", "--home", home, "--project", "plain",
+                 "--data", data]) == got, "cli plans on a pre-migration project")
+    _check(_cli(["timeline", "--json", "--home", home, "--project", "plain", "--data", data,
+                 "--run", "r", "--task", "t1"]) == {"ok": True, "events": feed},
+           "cli timeline on a pre-migration project")
+
+
+def _plans_timeline_no_store(home):
+    """plans() and timeline() on a project with NO store answer as they always have (Z6).
+
+    plans() answers an empty list (exit 0), a named plan a Fail (exit 2) and timeline() an empty
+    list. Neither answer may create the data dir, the store or a WAL on the way, or a pane
+    pointed at a fresh project would materialise an empty store and read it as a real one.
+    """
+    missing = os.path.join(home, "plans-none")
+    _check(not os.path.exists(missing), "fixture dir already exists")
+    _check(plans(home, data_dir=missing) == {"ok": True, "plans": []},
+           f"plans on a missing store: {plans(home, data_dir=missing)}")
+    try:
+        plans(home, data_dir=missing, plan_id="p1")
+    except Fail as e:
+        _check(e.code == 2 and "no store" in str(e), f"a named plan on a missing store: {e}")
+    else:
+        raise SystemExit("SELF-TEST FAIL: plans named a plan in a store that does not exist")
+    _check(timeline(home, "ghost", "r", "t", data_dir=missing) == [],
+           f"timeline on a missing store: {timeline(home, 'ghost', 'r', 't', missing)}")
+    _check(_cli(["plans", "--json", "--home", home, "--data", missing]) == {"ok": True, "plans": []},
+           "cli plans on a missing store")
+    _check(_cli(["timeline", "--json", "--home", home, "--project", "ghost", "--data", missing,
+                 "--run", "r", "--task", "t"]) == {"ok": True, "events": []},
+           "cli timeline on a missing store")
+    proc = subprocess.run([sys.executable, os.path.abspath(__file__), "plans", "p1", "--json",
+                           "--home", home, "--data", missing], capture_output=True, text=True)
+    _check(proc.returncode == 2 and json.loads(proc.stdout)["ok"] is False,
+           f"cli named plan on a missing store rc={proc.returncode}: {proc.stdout!r}")
+
+    # an existing but empty data dir gains nothing either
+    empty = os.path.join(home, "plans-empty")
+    os.makedirs(empty)
+    _check(plans(home, data_dir=empty) == {"ok": True, "plans": []}, "plans on an empty data dir")
+    _check(timeline(home, "ghost", "r", "t", data_dir=empty) == [], "timeline on an empty data dir")
+    _check(_cli(["plans", "--json", "--home", home, "--data", empty]) == {"ok": True, "plans": []},
+           "cli plans on an empty data dir")
+    _check(os.listdir(empty) == [], f"the empty data dir grew: {os.listdir(empty)}")
+    _check(not os.path.exists(missing), f"the missing-store read created {missing}")
 
 
 def _run_snapshot_zero_runs(home):
