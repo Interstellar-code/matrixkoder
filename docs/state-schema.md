@@ -195,6 +195,22 @@ writer auto-migrates, so the first v6 write upgrades an existing store in place.
   contract. A legacy run has none and is exempt from every evidence check below.
 - `final_gates` (list of `{id, cmd, expect, every, timeout, needs, covers}`): the plan's `[[final_gate]]`s.
 
+### Reconcile (F.5)
+
+- A fidelity run writes one `reconcile_due(run, scope=<phase id>, created, done NULL)` row when the
+  last task of a phase closes (a plain INSERT; no gate runs inside that write). A legacy run writes none.
+- `reconcile --run R [--phase P]` runs the due and STALE gates (closed tasks whose latest evidence is
+  missing, red or not on the current tree, and final gates) through the one gate runner and writes
+  evidence rows. A red gate is rerun once: red twice on the same `tree_sha` is reproducible and moves
+  the gate's `covers` tasks (or the task itself for a task gate) `merged` -> `rework`; red then green
+  is flaky and changes nothing; timeout/error/deferred are inconclusive and open a `risk_reasons` row
+  (kind `reconcile-inconclusive`, 1 point) per covered task without changing any status. A clean scope
+  stamps its due rows done; a passing reconcile changes nothing else.
+- `run set --status done` and `run archive` are refused in a fidelity run while any task is at
+  `rework`, any risk reason is open, or any `reconcile_due` row is not done.
+- `task round T --kind rework` moves a MERGED task to `rework` (round status `rework`); it is
+  refused on any non-merged task.
+
 ### Gate evidence and the fidelity gate (F.3)
 
 - `gate run <T> | --final | --due [--ref R]`: runs the gates in the integration checkout through
@@ -417,7 +433,7 @@ everything else `default`.
 | `run list` / `run get` | `run get [--id ID \| ID]` (default: the single active run) |
 | `run set` | `[--id ID] [--next TEXT] [--status active\|done]` (at least one) |
 | `run stage` / `run archive` | `run stage N` (N >= 0, `[--id ID]`); `run archive ID` sets the row `archived` and, first, `VACUUM INTO`s the project DB to `<data>/archive/<run>.db` (temp file first, verified to hold the run and its task count; an existing backup is never overwritten — the new one lands as `<run>-<UTC timestamp>.db`; a failed backup leaves the run active) |
-| `task add` | `--id T --title TEXT [--wave N] [--deps A,RUN:B] [--owned glob,glob] [--parent P]` — deps are stored in the target's stored id case and a self-dep is refused; `--parent` onto a task in `merged`/`qa`/`done` fails; returns `warnings` for unknown deps, owned globs overlapping an unmerged task in any active run (the new task's own `--parent` chain is not an overlap: a parent owns its children's globs), and active sibling runs that could not be read |
+| `task add` | `--id T --title TEXT [--wave N] [--deps A,RUN:B] [--owned glob,glob] (--parent P | --root)` — F.11: one of `--parent` (nest it) or `--root` (a top-level phase) is required and the two exclude each other; plain `task add` without either is refused with the fix; deps are stored in the target's stored id case and a self-dep is refused; `--parent` onto a task in `merged`/`qa`/`done` fails; returns `warnings` for unknown deps, owned globs overlapping an unmerged task in any active run (the new task's own `--parent` chain is not an overlap: a parent owns its children's globs), and active sibling runs that could not be read |
 | `task set` | `T key=value ... [--note TEXT] [--force]` (`--force`: dispatch past unmet own+ancestor deps; writes a `decision` event naming `--by`); `status=` on a task with children fans out to every child — one transition each, the same `--note`, the parent itself never set directly (it rolls up), the dep gate applied per child before any write; status aliases `reviewing`/`merging`/`fixing` store as `review`/`merged`/`fix`; keys `status agent model effort lane pane branch workspace slot last_commit gates verdict reviewer parent title acceptance owned deps refs`; a value starting `{`/`[` is parsed as JSON, empty = null. This is the way to change a task in a RUNNING plan: the change lands in the DB, never in the plan `.md` |
 | `task round` | `T --kind build\|fix\|takeover [--cause TEXT]`; `T --undo` drops the latest round — but only while none of its brief/report/review files exist (the paths `task round` returned) in `plans/<plan-id>/runs/<run-id>/<task-id>/`, else `ok:false` naming them; exactly one note event (`round N undone`); no rounds / `--kind` with `--undo` are refused |
 | `task verify` | `T --tests '<passed>/<failed>' [--tsc N] [--lint N] [--selftest '<run>/<failed>'] [--fail TEXT]` — stage 7; one `verdict` event, baseline compare, status move (see the subsection below). A failed count larger than the passed count is refused |

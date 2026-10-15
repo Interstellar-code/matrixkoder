@@ -1806,7 +1806,7 @@ def self_test():
         yaml_cap(1, 1)
 
         st("run", "init", "--id", "r1", "--feature", "Lanes", "--branch", "mk/r1/integration")
-        st("task", "add", "--id", "t1", "--title", "first", "--run", "r1")
+        st("task", "add", "--root", "--id", "t1", "--title", "first", "--run", "r1")
 
         # 2 first acquire creates slot 1 on the task branch and records the task keys
         omp_slot_skill = os.path.join(slot1, ".omp/skills/mk-builder")
@@ -1928,7 +1928,7 @@ def self_test():
         omp_dst = os.path.join(slot1, ".omp", "skills", "mk-builder")
         guard_dst = os.path.join(slot1, ".matrixkoder-bin", "git")
         src_skill = os.path.join(os.path.dirname(HERE), "child-skills", "mk-builder")
-        st("task", "add", "--id", "t6a", "--title", "archive case a", "--run", "r1")
+        st("task", "add", "--root", "--id", "t6a", "--title", "archive case a", "--run", "r1")
         acq1 = mk("acquire", "--run", "r1", "--task", "t6a", "--base", "main")
         assert (acq1["ok"], acq1["skill_installed"], acq1["omp_skill_installed"],
                 acq1["guard_path"]) == (True, skill_dst, omp_dst, guard_dst), acq1
@@ -1954,7 +1954,7 @@ def self_test():
         assert mk("release", "--slot", "1", "--integration", "mk/r1/integration")["ok"]
         # a second acquire on the clean slot is idempotent: same fields, byte-identical install,
         # and no duplicate archive content (nothing stale was left to move a second time)
-        st("task", "add", "--id", "t6b", "--title", "archive case b", "--run", "r1")
+        st("task", "add", "--root", "--id", "t6b", "--title", "archive case b", "--run", "r1")
         acq2 = mk("acquire", "--run", "r1", "--task", "t6b", "--base", "main")
         assert (acq2["ok"], acq2["skill_installed"], acq2["omp_skill_installed"],
                 acq2["guard_path"]) == (True, skill_dst, omp_dst, guard_dst), acq2
@@ -1972,13 +1972,13 @@ def self_test():
         write(os.path.join(usr, "SKILL.md"), "a stale user-level copy\n")
         uenv = dict(env, MK_OMP_USER_SKILLS=os.path.join(tmp, "user-omp-skills"))
         assert mk("release", "--slot", "1", "--integration", "mk/r1/integration")["ok"]
-        st("task", "add", "--id", "t6c", "--title", "user skill mismatch", "--run", "r1")
+        st("task", "add", "--root", "--id", "t6c", "--title", "user skill mismatch", "--run", "r1")
         acq3 = mk("acquire", "--run", "r1", "--task", "t6c", "--base", "mk/r1/integration", e=uenv)
         assert "mismatch" in acq3.get("warning", "") and usr in acq3["warning"], acq3
         assert open(os.path.join(usr, "SKILL.md")).read() == "a stale user-level copy\n"  # untouched
         write(os.path.join(usr, "SKILL.md"), open(os.path.join(src_skill, "SKILL.md")).read())
         assert mk("release", "--slot", "1", "--integration", "mk/r1/integration")["ok"]
-        st("task", "add", "--id", "t6d", "--title", "user skill in sync", "--run", "r1")
+        st("task", "add", "--root", "--id", "t6d", "--title", "user skill in sync", "--run", "r1")
         acq4 = mk("acquire", "--run", "r1", "--task", "t6d", "--base", "mk/r1/integration", e=uenv)
         assert "mismatch" not in acq4.get("warning", ""), acq4
         assert mk("release", "--slot", "1", "--integration", "mk/r1/integration")["ok"]
@@ -2080,7 +2080,7 @@ def self_test():
         g("-C", integ, "add", ".gitignore"), g("-C", integ, "commit", "-qm", "ignore build-out")
         # re-acquire so the slot sits on the tip that ignores build-out/ (the release above parked
         # it on the older tip, where the folder would read `??` — a different rule than this case's)
-        st("task", "add", "--id", "t8d", "--title", "other ignored leftover", "--run", "r1")
+        st("task", "add", "--root", "--id", "t8d", "--title", "other ignored leftover", "--run", "r1")
         assert mk("acquire", "--run", "r1", "--task", "t8d", "--base", "mk/r1/integration")["slot"] == 1
         write(os.path.join(slot1, "build-out", "b.js"), "x\n")
         write(os.path.join(slot1, ".ruff_cache", "cache.db"), "x\n")
@@ -2367,7 +2367,7 @@ def self_test():
             else:
                 shutil.rmtree(link)
         os.symlink(outside, link)
-        st("task", "add", "--id", "t12b", "--title", "skill symlink", "--run", "r1")
+        st("task", "add", "--root", "--id", "t12b", "--title", "skill symlink", "--run", "r1")
         acq = mk("acquire", "--run", "r1", "--task", "t12b", "--base", "main")
         assert acq["slot"] == 1 and acq["ok"], acq
         assert not os.path.islink(link) and os.path.isdir(link)
@@ -2436,8 +2436,8 @@ def self_test():
 
         # a task group: one slot, the lane fields on every listed task
         yaml_cap(3, 3)
-        st("task", "add", "--id", "t10", "--title", "ten", "--run", "r1")
-        st("task", "add", "--id", "t11", "--title", "eleven", "--run", "r1")
+        st("task", "add", "--root", "--id", "t10", "--title", "ten", "--run", "r1")
+        st("task", "add", "--root", "--id", "t11", "--title", "eleven", "--run", "r1")
         grp = mk("acquire", "--run", "r1", "--tasks", "t10,t11", "--base", "main")
         assert (grp["ok"], grp["slot"], grp["created"], grp["tasks"]) == (True, 3, True, ["t10", "t11"]), grp
         slot3 = os.path.join(tmp, "repo-mk-3")
@@ -2450,7 +2450,7 @@ def self_test():
                   code=2)["error"] == "acquire needs --task T or --tasks A,B (no empty entries)"
 
         # task ids keep their case for the mk-state write; only branch and agent names are lowercased
-        st("task", "add", "--id", "T2", "--title", "upper", "--run", "r1")
+        st("task", "add", "--root", "--id", "T2", "--title", "upper", "--run", "r1")
         yaml_cap(4, 4)
         up = mk("acquire", "--run", "r1", "--task", "T2", "--base", "main")
         assert (up["slot"], up["agent"], up["branch"]) == (4, "t2-build-r1", "mk/r1/t2"), up
@@ -2482,7 +2482,7 @@ def self_test():
               'repo:\n  lanes: { slots: 5, pattern: "../{repo}-mk-{n}", reuse: true, '
               'copy: ["README.md", "src", ".env"] }\n'
               'routing_preferences:\n  max_build_lanes: 5\n')
-        st("task", "add", "--id", "t14", "--title", "fourteen", "--run", "r1")
+        st("task", "add", "--root", "--id", "t14", "--title", "fourteen", "--run", "r1")
         cp = mk("acquire", "--run", "r1", "--task", "t14", "--base", "main")
         assert (cp["ok"], cp["slot"], cp["created"]) == (True, 5, True), cp
         slot5 = os.path.join(tmp, "repo-mk-5")
@@ -2514,7 +2514,7 @@ def self_test():
                     "\"worktree\":{\"open_workspace_id\":\"wW\"}}}')\n")
         os.chmod(fake, 0o755)
         yaml_cap(6, 6)
-        st("task", "add", "--id", "t15", "--title", "fifteen", "--run", "r1")
+        st("task", "add", "--root", "--id", "t15", "--title", "fifteen", "--run", "r1")
         h = mk("acquire", "--run", "r1", "--task", "t15", "--base", "main", e=dict(env, MK_HERDR=fake))
         assert (h["ok"], h["slot"], h["workspace_id"]) == (True, 6, "wW"), h
         assert next(s for s in mk("list")["slots"] if s["slot"] == 6)["workspace_id"] == "wW"
@@ -2545,7 +2545,7 @@ def self_test():
               'repo:\n  lanes: { slots: 5, pattern: "../{repo}-mk-{n}", reuse: true, '
               'copy: ["README.md", "src", ".env"] }\n'
               'routing_preferences:\n  max_build_lanes: 5\n')
-        st("task", "add", "--id", "t16", "--title", "sixteen", "--run", "r1")
+        st("task", "add", "--root", "--id", "t16", "--title", "sixteen", "--run", "r1")
         # integration must ignore .env too: release parks the slot there, and there the copied
         # .env would read `??` untracked — dirty — instead of ignored-and-disposable
         write(os.path.join(integ, ".gitignore"),
@@ -2559,7 +2559,7 @@ def self_test():
         assert open(os.path.join(slot5, ".env")).read() == "TOKEN=fresh\n", ru  # missing → copied
         assert ru["warning"].count("lanes copy") == 2, ru  # tracked README.md/src still refuse
         assert next(s for s in mk("list")["slots"] if s["slot"] == 5)["clean"] is True
-        st("task", "add", "--id", "t17", "--title", "seventeen", "--run", "r1")
+        st("task", "add", "--root", "--id", "t17", "--title", "seventeen", "--run", "r1")
         assert mk("release", "--slot", "5", "--integration", "mk/r1/integration")["ok"]
         write(os.path.join(repo, ".env"), "TOKEN=newer\n")
         keep = mk("acquire", "--run", "r1", "--task", "t17", "--base", "main")
@@ -2583,7 +2583,7 @@ def self_test():
         lanes = read_lanes(data)
         lanes["slots"]["5"]["workspace_id"] = "cli:worktree:create"  # the stale capture
         write_lanes(data, lanes)
-        st("task", "add", "--id", "t18", "--title", "eighteen", "--run", "r1")
+        st("task", "add", "--root", "--id", "t18", "--title", "eighteen", "--run", "r1")
         ws = mk("acquire", "--run", "r1", "--task", "t18", "--base", "main",
                 e=dict(env, MK_HERDR=fake_list_herdr([(slot1, "wL1"), (slot5, "wL5")])))
         assert (ws["ok"], ws["slot"], ws["workspace_id"]) == (True, 5, "wL5"), ws
@@ -2592,7 +2592,7 @@ def self_test():
         lanes = read_lanes(data)
         lanes["slots"]["5"]["workspace_id"] = None
         write_lanes(data, lanes)
-        st("task", "add", "--id", "t19", "--title", "nineteen", "--run", "r1")
+        st("task", "add", "--root", "--id", "t19", "--title", "nineteen", "--run", "r1")
         unk = mk("acquire", "--run", "r1", "--task", "t19", "--base", "main",
                  e=dict(env, MK_HERDR=fake_list_herdr([(slot1, "wL1")])))
         assert (unk["ok"], unk["slot"], unk["workspace_id"]) == (True, 5, None), unk
@@ -2602,7 +2602,7 @@ def self_test():
         # in the slot, or whose workspace is the slot's, under another name than the new round's
         def pane_acquire(tid, body, rc=0):
             assert mk("release", "--slot", "5", "--integration", "mk/r1/integration")["ok"]
-            st("task", "add", "--id", tid, "--title", tid, "--run", "r1")
+            st("task", "add", "--root", "--id", tid, "--title", tid, "--run", "r1")
             fk = os.path.join(tmp, "fake-agents-" + tid)
             write(fk, "#!/usr/bin/env python3\nimport sys\n"
                       f"sys.stdout.write({body!r})\nsys.exit({rc})\n")
@@ -2641,7 +2641,7 @@ def self_test():
         assert mk("release", "--slot", "5", "--integration", "mk/r1/integration")["ok"]
         write(os.path.join(data, "matrixkoder.yaml"),
               'repo:\n  integration_branch: mk/r1/integration\n  lanes: { slots: 5, reuse: true }\n')
-        st("task", "add", "--id", "t20", "--title", "twenty", "--run", "r1")
+        st("task", "add", "--root", "--id", "t20", "--title", "twenty", "--run", "r1")
         acq_nobase = mk("acquire", "--run", "r1", "--task", "t20")
         assert (acq_nobase["ok"], acq_nobase["slot"]) == (True, 5), acq_nobase
         integ_sha = g("rev-parse", "--verify", "mk/r1/integration^{commit}").stdout.strip()
@@ -2651,7 +2651,7 @@ def self_test():
 
         # an explicit --base still wins
         assert mk("release", "--slot", "5", "--integration", "mk/r1/integration")["ok"]
-        st("task", "add", "--id", "t21", "--title", "twenty-one", "--run", "r1")
+        st("task", "add", "--root", "--id", "t21", "--title", "twenty-one", "--run", "r1")
         acq_exp = mk("acquire", "--run", "r1", "--task", "t21", "--base", "main")
         assert (acq_exp["ok"], acq_exp["slot"]) == (True, 5), acq_exp
         assert g("-C", slot5, "rev-parse", "HEAD^{commit}").stdout.strip() == main_sha
@@ -2660,7 +2660,7 @@ def self_test():
         assert mk("release", "--slot", "5", "--integration", "mk/r1/integration")["ok"]
         write(os.path.join(data, "matrixkoder.yaml"),
               'repo:\n  integration_branch: nosuchbranch\n  lanes: { slots: 5, reuse: true }\n')
-        st("task", "add", "--id", "t22", "--title", "twenty-two", "--run", "r1")
+        st("task", "add", "--root", "--id", "t22", "--title", "twenty-two", "--run", "r1")
         bad_yaml = mk("acquire", "--run", "r1", "--task", "t22", code=2)
         assert "does not resolve to a commit" in bad_yaml["error"]
         assert bad_yaml["ok"] is False
@@ -2668,7 +2668,7 @@ def self_test():
         # absent from yaml falls back to schema default "main"
         write(os.path.join(data, "matrixkoder.yaml"),
               'repo:\n  lanes: { slots: 5, reuse: true }\n')
-        st("task", "add", "--id", "t23", "--title", "twenty-three", "--run", "r1")
+        st("task", "add", "--root", "--id", "t23", "--title", "twenty-three", "--run", "r1")
         acq_dflt = mk("acquire", "--run", "r1", "--task", "t23")
         assert (acq_dflt["ok"], acq_dflt["slot"]) == (True, 5), acq_dflt
         assert g("-C", slot5, "rev-parse", "HEAD^{commit}").stdout.strip() == main_sha
@@ -2775,10 +2775,10 @@ def self_test():
 
         # exit 4 when every slot is busy — its own data dir, so no slot path from the parity pattern
         # cap 1: one acquire succeeds, the next is exit 4. Need a known task.
-        st("task", "add", "--id", "storeA", "--title", "store A", "--run", "r1")
-        st("task", "add", "--id", "storeB", "--title", "store B", "--run", "r1")
-        st("task", "add", "--id", "parA", "--title", "par A", "--run", "r1")
-        st("task", "add", "--id", "parB", "--title", "par B", "--run", "r1")
+        st("task", "add", "--root", "--id", "storeA", "--title", "store A", "--run", "r1")
+        st("task", "add", "--root", "--id", "storeB", "--title", "store B", "--run", "r1")
+        st("task", "add", "--root", "--id", "parA", "--title", "par A", "--run", "r1")
+        st("task", "add", "--root", "--id", "parB", "--title", "par B", "--run", "r1")
 
         def seed_cap(ddir, yaml_text):
             """A fresh store-backed dir carrying the run r1 mk-state just wrote, with an empty lane
@@ -2906,8 +2906,8 @@ def self_test():
 
         # L1 in store mode: ignored `.omc` state alone leaves the slot releasable, a modified
         # tracked plan still refuses, and the outside skill symlink is not followed.
-        st("task", "add", "--id", "omcs", "--title", "omc store", "--run", "r1")
-        st("task", "add", "--id", "omcs2", "--title", "omc store 2", "--run", "r1")
+        st("task", "add", "--root", "--id", "omcs", "--title", "omc store", "--run", "r1")
+        st("task", "add", "--root", "--id", "omcs2", "--title", "omc store 2", "--run", "r1")
         omc_data = os.path.join(tmp, "data-omc-store")
         seed_cap(omc_data, 'repo:\n  lanes: { slots: 2, pattern: "../{repo}-omc-{n}", reuse: true }\n'
                            "routing_preferences:\n  max_build_lanes: 2\n")
@@ -2952,7 +2952,7 @@ def self_test():
         # L4: the run lives in the store, so the new task must be written there (a runs/ copy would
         # leave 'syms' unknown); the existing lane pool and its slot 1 registration are kept
         r = subprocess.run([sys.executable, os.path.join(HERE, "mk-state.py"), "--data", omc_data,
-                            "task", "add", "--id", "syms", "--title", "symlink store", "--run", "r1"],
+                            "task", "add", "--root", "--id", "syms", "--title", "symlink store", "--run", "r1"],
                            capture_output=True, text=True, env=env, cwd=repo)
         assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
         got = mk_at(omc_data, env_store, "acquire", "--run", "r1", "--task", "syms", "--base", "main")
@@ -3075,9 +3075,9 @@ def self_test():
 
         # a run id is slug-shaped (lowercase): `store enable` refuses any other
         st_at(rsd, "run", "init", "--id", "rs1", "--feature", "F", "--branch", "b")
-        st_at(rsd, "task", "add", "--id", "Rt1", "--title", "one")
-        st_at(rsd, "task", "add", "--id", "Rt2", "--title", "two")
-        st_at(rsd, "task", "add", "--id", "Rt3", "--title", "three")
+        st_at(rsd, "task", "add", "--root", "--id", "Rt1", "--title", "one")
+        st_at(rsd, "task", "add", "--root", "--id", "Rt2", "--title", "two")
+        st_at(rsd, "task", "add", "--root", "--id", "Rt3", "--title", "three")
         st_at(rsd, "store", "enable")
         assert os.path.isfile(os.path.join(rsd, "mk.db")), "store enable wrote no mk.db"
 

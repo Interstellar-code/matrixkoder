@@ -1092,7 +1092,7 @@ def self_test():
             r = subprocess.run([sys.executable, MK_STATE, *args, "--data", data], capture_output=True, text=True)
             assert r.returncode == 0, r.stdout + r.stderr
         mks("run", "init", "--id", "r1", "--feature", "F", "--branch", "b")
-        mks("task", "add", "--id", "P1", "--title", "State core")
+        mks("task", "add", "--root", "--id", "P1", "--title", "State core")
         mks("task", "set", "P1", "status=building")
         r = record({"state": "STALL", "commit": other, "evidence": ["agent idle 11 min"]}, "P1", data)
         assert r["ok"] and r["task"]["status"] == "stalled", r
@@ -1113,7 +1113,7 @@ def self_test():
 
         # a parent task: mk-state refuses status= on it ("status rolls up from children"), so the
         # verdict goes to every child, never the parent (which only rolls up)
-        mks("task", "add", "--id", "P2", "--title", "group")
+        mks("task", "add", "--root", "--id", "P2", "--title", "group")
         for c in ("C1", "C2", "C3"):
             mks("task", "add", "--id", c, "--title", c, "--parent", "P2")
             mks("task", "set", c, "status=building")
@@ -1145,7 +1145,7 @@ def self_test():
         assert any(e.get("task") == "C2" and "status review kept" in e.get("text", "") for e in evs2)
         # nested groups: a child that is itself a parent never gets the write either — the verdict
         # lands on the subtree's leaves, intermediate parents roll up
-        mks("task", "add", "--id", "P5", "--title", "nested")
+        mks("task", "add", "--root", "--id", "P5", "--title", "nested")
         mks("task", "add", "--id", "C4", "--title", "mid", "--parent", "P5")
         mks("task", "add", "--id", "G1", "--title", "grandchild", "--parent", "C4")
         mks("task", "add", "--id", "C5", "--title", "leaf", "--parent", "P5")
@@ -1159,11 +1159,11 @@ def self_test():
 
         # a lane GROUP (--tasks QG1,QG2): one verdict reaches every listed task's children, the
         # parents only roll up — the same list one delivered dispatch marks building
-        mks("task", "add", "--id", "QG1", "--title", "group one")
+        mks("task", "add", "--root", "--id", "QG1", "--title", "group one")
         for c in ("A1", "A2"):
             mks("task", "add", "--id", c, "--title", c, "--parent", "QG1")
             mks("task", "set", c, "status=building")
-        mks("task", "add", "--id", "QG2", "--title", "group two")
+        mks("task", "add", "--root", "--id", "QG2", "--title", "group two")
         for c in ("B1", "B2"):
             mks("task", "add", "--id", c, "--title", c, "--parent", "QG2")
             mks("task", "set", c, "status=building")
@@ -1190,7 +1190,7 @@ def self_test():
 
         # one child's write fails (its task.json is a directory): ok is False and the error
         # names the child — never dropped, and the healthy child still got the verdict
-        mks("task", "add", "--id", "P6", "--title", "errors")
+        mks("task", "add", "--root", "--id", "P6", "--title", "errors")
         mks("task", "add", "--id", "E1", "--title", "e1", "--parent", "P6")
         mks("task", "add", "--id", "E2", "--title", "e2", "--parent", "P6")
         mks("task", "set", "E1", "status=building")
@@ -1218,7 +1218,7 @@ def self_test():
         git = ["git", "-C", lane, "-c", "user.name=t", "-c", "user.email=t@t"]
         subprocess.run(["git", "init", "-q", lane], check=True)
         subprocess.run(git + ["commit", "-q", "--allow-empty", "-m", "feat(p1): state core"], check=True)
-        mks("task", "add", "--id", "P3", "--title", "cli")
+        mks("task", "add", "--root", "--id", "P3", "--title", "cli")
         mks("task", "set", "P3", "status=building")
 
         def cli(*args, code=0):
@@ -1236,7 +1236,7 @@ def self_test():
         assert out["state"] == "DONE" and out["state_written"] is True, out
         assert json.load(open(os.path.join(data, "runs", "r1", "run.json")))["tasks"][-1]["status"] == "verifying"
         # CLI end to end on a parent: the verdict reaches its children through the same record()
-        mks("task", "add", "--id", "P4", "--title", "cli group")
+        mks("task", "add", "--root", "--id", "P4", "--title", "cli group")
         for c in ("D1", "D2", "D3"):
             mks("task", "add", "--id", c, "--title", c, "--parent", "P4")
             mks("task", "set", c, "status=building")
@@ -1429,7 +1429,7 @@ def self_test():
         assert r.returncode == 0 and os.path.getsize(os.path.join(data, "mk.db")) > 0, (r.stdout, r.stderr, os.listdir(data))
 
         # store-first: no status file in the lane, the tasks row IS the channel -> DONE, source=store
-        mks("task", "add", "--id", "S4", "--title", "store")
+        mks("task", "add", "--root", "--id", "S4", "--title", "store")
         mks("task", "add", "--id", "SK1", "--title", "k1", "--parent", "S4")  # child_tasks tree
         mks("task", "set", "SK1", "status=building")
         # the report lives in the TASK dir: task round stores whatever report-r<n>.md is there
@@ -1461,7 +1461,7 @@ def self_test():
         # F1 (a) store-backed: a REVIEW-phase watch whose task store row is review/merged
         # and whose review file is absent does NOT return DONE — read_status skips the
         # store row for a REVIEW phase, and store_report_ok returns None for it too.
-        mks("task", "add", "--id", "F1T", "--title", "f1 review")
+        mks("task", "add", "--root", "--id", "F1T", "--title", "f1 review")
         mks("task", "set", "F1T", "status=building")
         mks("task", "round", "F1T", "--kind", "build")   # round 1, report artifact stored
         mks("task", "set", "F1T", "status=merged")        # the builder's finished row
@@ -1505,7 +1505,7 @@ def self_test():
                                  "BLOCKED", "DEV_SERVER", "ERROR", "DONE_SENT"), _out
         assert "state_written" not in _out, "no --task: nothing must be written to the store"
         # DONE still needs the commit: no matching commit -> never DONE
-        mks("task", "add", "--id", "S5", "--title", "store2")
+        mks("task", "add", "--root", "--id", "S5", "--title", "store2")
         mks("task", "set", "S5", "status=building")
         mks("task", "round", "S5", "--kind", "build")
         mks("task", "set", "S5", "status=verifying")
@@ -1516,7 +1516,7 @@ def self_test():
                   "--task", "S5", "--data", data)
         assert out["state"] == "STALL" and "matching commit" in out["evidence"][0], out
         # ... and no report artifact for the round -> the file check fails -> STALL lists report
-        mks("task", "add", "--id", "S7", "--title", "store3")
+        mks("task", "add", "--root", "--id", "S7", "--title", "store3")
         mks("task", "set", "S7", "status=building")
         mks("task", "round", "S7", "--kind", "build")   # round file never existed: no artifact
         mks("task", "set", "S7", "status=verifying")
@@ -1526,7 +1526,7 @@ def self_test():
                   "--task", "S7", "--data", data)
         assert out["state"] == "STALL" and "report" in out["evidence"][0], out
         # fallback: the row is round 2, so phase S8 R1 has no row -> the status file decides
-        mks("task", "add", "--id", "S8", "--title", "fallback")
+        mks("task", "add", "--root", "--id", "S8", "--title", "fallback")
         mks("task", "set", "S8", "status=building")
         mks("task", "round", "S8", "--kind", "build")
         mks("task", "round", "S8", "--kind", "fix")     # round 2 now
@@ -1553,7 +1553,7 @@ def self_test():
                     "SELECT status, round, verdict FROM tasks WHERE run='r1' AND id='W1T'").fetchone())
             finally:
                 c.close()
-        mks("task", "add", "--id", "W1T", "--title", "round reset")
+        mks("task", "add", "--root", "--id", "W1T", "--title", "round reset")
         mks("task", "set", "W1T", "status=done", "verdict=OLD")
         mks("task", "round", "W1T", "--kind", "build")
         got = w1row()
@@ -1611,10 +1611,10 @@ def self_test():
             assert r.returncode == 0, r.stdout + r.stderr
 
         cwks("run", "init", "--id", "cr1", "--feature", "F", "--branch", "b")
-        cwks("task", "add", "--id", "CW", "--title", "group")
+        cwks("task", "add", "--root", "--id", "CW", "--title", "group")
         for _c in ("Ca", "Cb", "Cc"):
             cwks("task", "add", "--id", _c, "--title", _c, "--parent", "CW")
-        cwks("task", "add", "--id", "CLeaf", "--title", "leaf")
+        cwks("task", "add", "--root", "--id", "CLeaf", "--title", "leaf")
         # (e) pre-migration: no store, so the run documents answer
         assert not store_on(cw) and not os.path.exists(os.path.join(cw, "mk.db"))
         assert child_tasks("CW", cw) == ["Ca", "Cb", "Cc"], child_tasks("CW", cw)

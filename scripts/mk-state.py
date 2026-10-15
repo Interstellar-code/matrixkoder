@@ -47,7 +47,7 @@ Legacy projects whose runs live only in files migrate through mk-store-import.py
       verdict/slot/branch/workspace/pane are not touched, route_json/agent/model/effort are not
       touched (route_json comes from dispatch, D1.5.3). Writes through the normal save path, so
       the store mirror and the run-doc artifact update together; ONE summary note event.
-  task add --id T --title TEXT [--wave N] [--deps A,RUN:B] [--owned glob,glob] [--parent P]
+  task add --id T --title TEXT [--wave N] [--deps A,RUN:B] [--owned glob,glob] (--parent P | --root)
       [--followup]
       ids are case-insensitive unique; deps store the real id case and a self-dep is refused;
       RUN:B is a task in another run of the same data dir; --parent onto merged/qa/done is
@@ -72,7 +72,7 @@ Legacy projects whose runs live only in files migrate through mk-store-import.py
       parent itself is never set directly, it rolls up from the children); status aliases
       reviewing/merging/fixing are stored as review/merged/fix; a task whose deps are all met gets
       ready=true and a "deps met" event; an unreadable sibling run only produces a warnings entry
-  task round T --kind build|fix|takeover [--cause TEXT]
+  task round T --kind build|fix|takeover|rework [--cause TEXT]
   task round --tasks C1,S1,P1 --kind ... — a lane_group in one round: the lead (first id) owns the one
       brief/report/review path (tasks/C1/brief-rN.md); the round number and kind are recorded on EVERY
       listed task, one event each. N is the highest current round of the listed tasks plus one. T, if
@@ -145,11 +145,11 @@ SET_START_KEYS = ("title", "acceptance", "owned", "deps", "refs")
 EDITABLE_WHILE = ("planned", "routed")
 # F.2: the plan's gate fields (and the stored names they ride under) are never settable by task set
 GATE_READONLY_KEYS = ("gate", "manual", "critical", "risk", "base_risk", "acceptance_lines")
-ROUND_KINDS = ("build", "fix", "takeover")
+ROUND_KINDS = ("build", "fix", "takeover", "rework")
 # A new round must not inherit the previous round's terminal row. File mode never wrote
 # status on `task round` (the row stays whatever it was); the store path maps each kind
 # onto the status the board already uses for that kind, in the same commit as the bump.
-ROUND_STATUS = {"build": "planned", "fix": "fix", "takeover": "building"}
+ROUND_STATUS = {"build": "planned", "fix": "fix", "takeover": "building", "rework": "rework"}
 # A terminal status is the one thing a new round must never inherit; a non-terminal one stays
 # (demoting building -> planned would skew every later transition's "from" against the file path).
 ROUND_TERMINAL = ("done", "verifying", "review", "merged", "blocked")
@@ -1602,6 +1602,7 @@ def cmd_run(a, st):
             run["stage"] = a.n
             st.event(run, "note", f"stage {a.n}")
         else:  # archive
+            reconcile_open(st, run)  # first: a failing reconcile leaves red evidence the gate would quote instead
             fidelity_gate(st, run, [t["id"] for t in run.get("tasks") or []
                                     if t.get("id") and t.get("status") in CLOSED_STATUSES], final=True)
             if st.store_on:
@@ -1891,6 +1892,31 @@ def _gate_line(g):
     return str(v) if v not in (None, "") else None
 
 
+def gate_record(st, rid, tid, name, g, where, tree, load, by, ref):
+    """Run ONE gate (or defer it above GATE_LOAD_MAX) and write its evidence row -> the reply row.
+    The one code path `gate run` and `reconcile` both write evidence through."""
+    if load > GATE_LOAD_MAX:
+        result, tail, sha = (f"deferred load={load:g}", f"deferred: load average above {GATE_LOAD_MAX:g}", None)
+    else:
+        result, tail, sha = _gate_exec(g, where)
+    enum = _evidence_result(result)
+    with st.locked():
+        con = st.store_open()
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            cur = con.execute(
+                "INSERT INTO evidence(run, task, line, gate, result, tree_sha, by, ref, output_tail,"
+                " output_sha256, created) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (rid, tid, _gate_line(g), name, enum, tree, by, ref, tail, sha, now()))
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+        finally:
+            con.close()
+    return {"id": cur.lastrowid, "task": tid, "gate": name, "result": enum, "detail": result, "tree_sha": tree}
+
+
 def cmd_gate(a, st):
     """`gate run <T> | --final | --due`: run gates in the integration checkout through the F.0
     runner and write ONE evidence row per gate run. <T> = the task's extra_json `gate` list
@@ -1932,33 +1958,9 @@ def cmd_gate(a, st):
                 jobs += task_jobs(tid)
     where, note = integration_checkout(st)
     load = load_avg()
-    deferred = load > GATE_LOAD_MAX
     tree = current_tree_sha(where)
-    rows = []
-    for tid, name, g in jobs:
-        if deferred:
-            result, tail, sha = (f"deferred load={load:g}",
-                                 f"deferred: load average above {GATE_LOAD_MAX:g}", None)
-        else:
-            result, tail, sha = _gate_exec(g, where)
-        enum = _evidence_result(result)
-        with st.locked():
-            con = st.store_open()
-            try:
-                con.execute("BEGIN IMMEDIATE")
-                cur = con.execute(
-                    "INSERT INTO evidence(run, task, line, gate, result, tree_sha, by, ref, output_tail,"
-                    " output_sha256, created) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                    (run["id"], tid, _gate_line(g), name, enum, tree, getattr(a, "by", "orchestrator"),
-                     a.ref, tail, sha, now()))
-                con.execute("COMMIT")
-            except Exception:
-                con.execute("ROLLBACK")
-                raise
-            finally:
-                con.close()
-        rows.append({"id": cur.lastrowid, "task": tid, "gate": name, "result": enum, "detail": result,
-                     "tree_sha": tree})
+    rows = [gate_record(st, run["id"], tid, name, g, where, tree, load, getattr(a, "by", "orchestrator"), a.ref)
+            for tid, name, g in jobs]
     out = {"ok": True, "evidence": rows, "where": where, "all_green": all(r["result"] == "green" for r in rows)}
     if note:
         out["note"] = note
@@ -2050,6 +2052,166 @@ def cmd_gate_signoff(a, st):
     return {"ok": True, "evidence": cur.lastrowid, "task": t["id"]}
 
 
+RECONCILE_KIND = "reconcile-inconclusive"
+
+
+def reconcile_mark_due(st, run, t):
+    """F.5: the phase (top-level ancestor of t) whose subtree is now all closed gets ONE
+    reconcile_due row (scope = phase id, done NULL). A plain INSERT: no gate runs in the write that
+    closes the phase. No row while one is already open for the scope; none in a legacy run."""
+    if not run.get("fidelity"):
+        return
+    chain = ancestor_chain(run, t.get("parent"))
+    root = chain[-1] if chain else t
+    ids = {root["id"], *descendant_ids(root["id"], run["tasks"])}
+    if any(x.get("status") not in CLOSED_STATUSES for x in run["tasks"] if x.get("id") in ids):
+        return
+    con = st.store_open()
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        if not con.execute("SELECT 1 FROM reconcile_due WHERE run=? AND scope=? AND done IS NULL",
+                           (run["id"], root["id"])).fetchone():
+            con.execute("INSERT INTO reconcile_due(run, scope, created) VALUES (?,?,?)",
+                        (run["id"], root["id"], now()))
+        con.execute("COMMIT")
+    except BaseException:
+        if con.in_transaction:
+            con.execute("ROLLBACK")
+        raise
+    finally:
+        con.close()
+
+
+def reconcile_open(st, run):
+    """F.5: what stops a fidelity run from closing/archiving: tasks at `rework`, open risk_reasons
+    rows, reconcile_due rows not done. Raises Fail naming them; legacy runs are exempt."""
+    if not run.get("fidelity"):
+        return
+    parts = []
+    rework = [t["id"] for t in run.get("tasks") or [] if t.get("id") and t.get("status") == "rework"]
+    if rework:
+        parts.append("task(s) at rework: " + ", ".join(rework))
+    con = _evidence_con(st)
+    try:
+        if con:
+            rr = [f"{r['task']}:{r['kind']}" for r in con.execute(
+                "SELECT task, kind FROM risk_reasons WHERE run=? AND cleared IS NULL ORDER BY id", (run["id"],))]
+            if rr:
+                parts.append("open risk reason(s): " + ", ".join(rr))
+            due = [r["scope"] for r in con.execute(
+                "SELECT scope FROM reconcile_due WHERE run=? AND done IS NULL ORDER BY id", (run["id"],))]
+            if due:
+                parts.append("reconcile due for: " + ", ".join(due) + " (run `reconcile`)")
+    finally:
+        if con:
+            con.close()
+    if parts:
+        raise Fail(f"run {run['id']} has open reconcile work: " + "; ".join(parts), reconcile=parts)
+
+
+def cmd_reconcile(a, st):
+    """`reconcile --run R [--phase P]` (F.5): run the due and STALE gates (final gates + task gates
+    of closed tasks) through gate_record, so evidence is written exactly as `gate run` does. A red
+    gate reruns once: red twice on the same tree_sha = reproducible, so the tasks it covers (a task
+    gate: the task itself) go merged -> rework; red then green = flaky, nothing changes. timeout /
+    error / deferred are inconclusive: an open risk row per covered task, no status change. The due
+    rows of the scope are stamped done unless a task went to rework or an inconclusive gate has no
+    task to hold its reason. A clean run changes nothing but evidence rows and the due stamp."""
+    with st.locked():
+        st.repair()
+        run = st.load(a.run)
+    out = {"ok": True, "ran": [], "green": [], "reworked": [], "inconclusive": [], "flaky": []}
+    if not run.get("fidelity"):
+        return {**out, "note": "legacy run: nothing to reconcile"}
+    rid, tasks = run["id"], run.get("tasks") or []
+    byid = {t["id"]: t for t in tasks if t.get("id")}
+    if a.phase:
+        find_task(run, a.phase)
+    scope = {x for x in byid if not a.phase or x == a.phase or x in descendant_ids(a.phase, tasks)}
+    con = _evidence_con(st)
+    try:
+        due = [r["scope"] for r in con.execute(
+            "SELECT scope FROM reconcile_due WHERE run=? AND done IS NULL ORDER BY id", (rid,))
+            if r["scope"] in scope]
+    finally:
+        con.close()
+    where, _ = integration_checkout(st)
+    tree, load = current_tree_sha(where), load_avg()
+
+    def stale(tid, name):
+        c = _evidence_con(st)
+        try:
+            r = c.execute("SELECT result, tree_sha FROM evidence WHERE run=? AND task IS ? AND gate=?"
+                          " ORDER BY id DESC LIMIT 1", (rid, tid, name)).fetchone()
+        finally:
+            c.close()
+        return r is None or r["result"] != "green" or tree is None or r["tree_sha"] != tree
+
+    jobs = []  # (task or None, gate name, gate, tasks it covers)
+    for tid in scope:
+        if byid[tid].get("status") in CLOSED_STATUSES:
+            jobs += [(tid, g.get("id") or f"{tid}#{i}", g, [tid])
+                     for i, g in enumerate(byid[tid].get("gate") or [], 1)
+                     if stale(tid, g.get("id") or f"{tid}#{i}")]
+    for i, g in enumerate(run.get("final_gates") or [], 1):
+        if due or stale(None, g.get("id") or f"final#{i}"):
+            jobs.append((None, g.get("id") or f"final#{i}", g, [c for c in g.get("covers") or [] if c in byid]))
+    by = getattr(a, "by", "orchestrator")
+    rework, inconclusive, unheld = [], [], False
+    for tid, name, g, covered in jobs:
+        row = gate_record(st, rid, tid, name, g, where, tree, load, by, None)
+        out["ran"].append(name)
+        res = row["result"]
+        if res == "red":  # one rerun on the same tree decides: red twice = reproducible
+            row = gate_record(st, rid, tid, name, g, where, current_tree_sha(where), load, by, None)
+            res = "reproducible" if row["result"] == "red" and row["tree_sha"] == tree else row["result"]
+            if res == "green":
+                out["flaky"].append(name)
+                continue
+        if res == "green":
+            out["green"].append(name)
+        elif res == "reproducible":
+            rework += covered
+        else:
+            inconclusive += covered
+            unheld = unheld or not covered
+    with st.locked():
+        st.repair()
+        run = st.load(a.run)
+        byid = {t["id"]: t for t in run["tasks"] if t.get("id")}
+        for cid in dict.fromkeys(rework):  # a covered parent reworks its merged leaves
+            for lid in leaf_descendants(cid, run["tasks"]):
+                t = next((x for x in run["tasks"] if (x.get("id") or "").lower() == lid), None)
+                if t and t["status"] == "merged":
+                    st.event(run, "transition", "reconcile: gate failed twice on the same tree",
+                             task=t["id"], frm="merged", to="rework", by=by)
+                    t["status"], t["updated"] = "rework", now()
+                    out["reworked"].append(t["id"])
+        if out["reworked"]:
+            st.save(run)
+            st.flush()
+        out["inconclusive"] = list(dict.fromkeys(inconclusive))
+        c = st.store_open()
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            for tid in out["inconclusive"]:
+                if not c.execute("SELECT 1 FROM risk_reasons WHERE run=? AND task=? AND kind=? AND cleared IS NULL",
+                                 (rid, tid, RECONCILE_KIND)).fetchone():
+                    c.execute("INSERT INTO risk_reasons(run, task, kind, points, source, opened)"
+                              " VALUES (?,?,?,?,?,?)", (rid, tid, RECONCILE_KIND, 1, "reconcile", now()))
+            if due and not rework and not unheld:
+                c.execute("UPDATE reconcile_due SET done=? WHERE run=? AND done IS NULL AND scope IN (%s)"
+                          % ",".join("?" * len(due)), (now(), rid, *due))
+            c.execute("COMMIT")
+        except BaseException:
+            if c.in_transaction:
+                c.execute("ROLLBACK")
+            raise
+        finally:
+            c.close()
+    return out
+
+
 def cmd_risk(a, st):
     """`risk add <T> --kind K --points N [--source S]` | `risk list [<T>]` | `risk clear <id>
     --evidence <id>`. Rows live in risk_reasons (F.1); the derived risk is mkdb._task_risk. A
@@ -2126,6 +2288,7 @@ def close_checks(st, run):
                    open=opens)
     fidelity_gate(st, run, [t["id"] for t in run.get("tasks") or []
                             if t.get("id") and t.get("status") in CLOSED_STATUSES], final=True)
+    reconcile_open(st, run)
     if not run.get("plan"):
         return {}
     try:
@@ -2427,6 +2590,9 @@ def cmd_task(a, st):
             t = find_task(run, a.task)
             return {"ok": True, "task": t, "dir": st.task_dir(run["id"], t["id"])}
         if a.action == "add":
+            if a.root == bool(a.parent):  # F.11: a parent or an explicit --root, never both, never neither
+                raise Fail("--parent and --root exclude each other" if a.root else
+                           "task add needs --parent <id> to nest it, or --root to create a top-level phase")
             t, warnings = add_task(st, run, a.id, a.title, a.wave, csv(a.deps), csv(a.owned), a.parent,
                                    a.by, followup=a.followup)
             st.flush()
@@ -2565,6 +2731,10 @@ def cmd_task(a, st):
             if a.kind not in ROUND_KINDS:
                 raise Fail(f"bad kind {a.kind!r}; one of: {' '.join(ROUND_KINDS)}")
             group = [t]  # a lane_group round: the lead first, the rest share its one round number
+            if a.kind == "rework" and any(x["status"] != "merged" for x in [t] + [
+                    find_task(run, i) for i in csv(a.tasks)[1:]]):
+                raise Fail("round --kind rework moves a merged task to rework; "
+                           "every task of the round must be merged")
             if a.tasks:
                 group += [find_task(run, i) for i in csv(a.tasks)[1:]]
                 if len({x["id"] for x in group}) < len(group):
@@ -2592,6 +2762,9 @@ def cmd_task(a, st):
         st.save(run, t, a.by)
         warnings = (set_warnings + st.refresh_others(run, a.by)) if a.action == "set" else []
         st.flush()
+        if a.action == "set" and (fanned or changes.get("status") in CLOSED_STATUSES) \
+                and t["status"] in CLOSED_STATUSES:
+            reconcile_mark_due(st, run, t)  # F.5: the phase's last close; a plain INSERT, no gate run
         if a.action == "round":
             d = st.task_dir(run["id"], t["id"])
             paths = {k: os.path.join(d, f"{k}-r{t['round']}.md") for k in ("brief", "report", "review")}
@@ -3259,6 +3432,7 @@ def build_parser():
     t = task.add_parser("add", parents=[data_p, run_p])
     t.add_argument("--id"), t.add_argument("--title"), t.add_argument("--wave", type=int)
     t.add_argument("--deps"), t.add_argument("--owned"), t.add_argument("--parent")
+    t.add_argument("--root", action="store_true", help="create a top-level phase (no --parent)")
     t.add_argument("--followup", action="store_true",
                    help="--parent may be a merged/qa/done phase: it rolls back to building")
     t = task.add_parser("set", parents=[data_p, run_p],
@@ -3327,6 +3501,9 @@ def build_parser():
     gs = g.add_parser("signoff", parents=[data_p, run_p])
     gs.add_argument("task"), gs.add_argument("--ref")
     gs.set_defaults(func=cmd_gate_signoff)
+    rc = sub.add_parser("reconcile", parents=[data_p, run_p])
+    rc.add_argument("--phase")
+    rc.set_defaults(func=cmd_reconcile)
     rk = sub.add_parser("risk").add_subparsers(dest="action", required=True)
     for name in ("add", "list", "clear"):
         x = rk.add_parser(name, parents=[data_p, run_p])
@@ -3470,7 +3647,7 @@ def d15_self_test(tmp, env, pd, penv):
     assert pk("task", "check", "DP", "--run", "d1")["ok"] is True
 
     # --- D1.5.4: task check lists the missing mandatory fields
-    pk("task", "add", "--id", "DBAD", "--title", "", "--run", "d1", code=2)  # title is mandatory at add
+    pk("task", "add", "--root", "--id", "DBAD", "--title", "", "--run", "d1", code=2)  # title is mandatory at add
     pk("task", "add", "--id", "DBAD", "--title", "no acceptance", "--parent", "DP", "--run", "d1")
     chk = pk("task", "check", "DBAD", "--run", "d1")
     assert chk["ok"] is False and "acceptance" in chk["missing"], chk
@@ -3488,7 +3665,7 @@ def d15_self_test(tmp, env, pd, penv):
     open(os.path.join(pd, "runs", "d1", "tasks", "DCH", "brief-r1.md"), "w").write("# b\n")
     assert "owned" in pk("task", "check", "DCH", "--run", "d1")["missing"]  # briefed -> owned
     # a parentless row is a phase: no acceptance and no parent are required of it
-    pk("task", "add", "--id", "DPH", "--title", "phase-ish", "--run", "d1")
+    pk("task", "add", "--root", "--id", "DPH", "--title", "phase-ish", "--run", "d1")
     assert pk("task", "check", "DPH", "--run", "d1") == {"ok": True, "task": "DPH", "type": "phase",
                                                         "missing": []}
     assert "no task" in pk("task", "check", "NOPE", "--run", "d1", code=2)["error"]
@@ -3553,7 +3730,7 @@ def d15_self_test(tmp, env, pd, penv):
         return json.loads(lines[0])
 
     sk("run", "init", "--id", "s", "--feature", "S", "--branch", "b")
-    sk("task", "add", "--id", "SX", "--title", "x")
+    sk("task", "add", "--root", "--id", "SX", "--title", "x")
     sk("store", "enable")
     json.dump(plan, open(pfile, "w"))  # the fixture plan tool set it `running` above: re-seed
     sk("run", "init", "--id", "s2", "--feature", "Store plan", "--branch", "b2", "--plan", pfile)
@@ -3770,7 +3947,7 @@ def self_test():
             for args in (
                 ["run", "init", "--id", "z8", "--feature", "Z", "--branch", "bz",
                  "--data", data_dir],
-                ["task", "add", "--id", "Z1", "--title", "t", "--run", "z8", "--data", data_dir],
+                ["task", "add", "--root", "--id", "Z1", "--title", "t", "--run", "z8", "--data", data_dir],
                 ["task", "set", "Z1", "status=building", "--run", "z8", "--data", data_dir],
             ):
                 r = subprocess.run([sys.executable, script, *args],
@@ -3915,10 +4092,15 @@ def self_test():
         assert mk("run", "init", "--id", "../evil", "--feature", "F", "--branch", "b", code=2)["ok"] is False
         assert [r["id"] for r in mk("run", "list")["runs"]] == ["r1"]
 
-        mk("task", "add", "--id", "T1", "--title", "State core", "--wave", "1")
-        t2 = mk("task", "add", "--id", "T2", "--title", "Usage", "--wave", "2", "--deps", "T1", "--owned", "a/*,b.py")["task"]
+        mk("task", "add", "--root", "--id", "T1", "--title", "State core", "--wave", "1")
+        t2 = mk("task", "add", "--root", "--id", "T2", "--title", "Usage", "--wave", "2", "--deps", "T1", "--owned", "a/*,b.py")["task"]
         assert t2["deps"] == ["T1"] and t2["owned"] == ["a/*", "b.py"] and t2["status"] == "planned"
-        assert mk("task", "add", "--id", "T1", "--title", "dup", code=2)["ok"] is False
+        assert mk("task", "add", "--root", "--id", "T1", "--title", "dup", code=2)["ok"] is False
+        # F.11 lint: a task needs --parent or --root; the refusal names the fix; both together are refused
+        err = mk("task", "add", "--id", "L1", "--title", "orphan", code=2)["error"]
+        assert "--parent" in err and "--root" in err, err
+        assert "exclude" in mk("task", "add", "--id", "L1", "--title", "both", "--parent", "T1", "--root", code=2)["error"]
+        assert t2["parent"] is None  # --root works (T1/T2 above); --parent works (the DP/DCH and Z cases below)
         assert q1(data, "SELECT 1 x FROM tasks WHERE run='r1' AND id='T2'"), "no T2 row"
 
         assert "bad status" in mk("task", "set", "T1", "status=bogus", code=2)["error"]
@@ -4002,9 +4184,9 @@ def self_test():
             return json.loads(lines[0])
 
         tk("run", "init", "--id", "r1", "--feature", "T1", "--branch", "b")
-        tk("task", "add", "--id", "T1", "--title", "Base")
+        tk("task", "add", "--root", "--id", "T1", "--title", "Base")
         assert {"title", "acceptance", "owned", "deps", "refs"} <= set(TASK_KEYS)
-        tk("task", "add", "--id", "E1", "--title", "Old title", "--owned", "a.py")
+        tk("task", "add", "--root", "--id", "E1", "--title", "Old title", "--owned", "a.py")
         e1 = tk("task", "set", "E1", "title=New title", "acceptance=the outcome",
                 "owned=src/x.py,src/y.py", "refs=docs/a.md:10,scripts/b.py", "--note", "brief gap")
         assert e1["task"]["title"] == "New title" and e1["task"]["acceptance"] == "the outcome"
@@ -4082,7 +4264,7 @@ def self_test():
         assert mk("task", "get", "T1")["task"]["id"] == "T1"  # only r1 owns T1
         assert mk("event", "--task", "T1", "--type", "note", "--text", "owner pick")["ok"]
         assert mk("run", "get", "--id", "r1")["run"]["recent"][-1]["text"] == "owner pick"
-        mk("task", "add", "--id", "T1", "--title", "Clash", "--wave", "1", "--run", "r2")
+        mk("task", "add", "--root", "--id", "T1", "--title", "Clash", "--wave", "1", "--run", "r2")
         assert "active runs" in mk("task", "get", "T1", code=2)["error"]  # both own T1: still ambiguous
         assert "active runs" in mk("run", "get", code=2)["error"]
         assert mk("task", "get", "T1", "--run", "r1")["task"]["id"] == "T1"
@@ -4103,7 +4285,7 @@ def self_test():
         assert mk("run", "get", "r1")["run"]["id"] == "r1" and mk("run", "get", "--id", "r1")["run"]["id"] == "r1"
 
         # review r1: case-insensitive task ids, input validation, one JSON line on corrupt files
-        assert "exists as T1" in mk("task", "add", "--id", "t1", "--title", "lower", code=2)["error"]
+        assert "exists as T1" in mk("task", "add", "--root", "--id", "t1", "--title", "lower", code=2)["error"]
         assert mk("task", "get", "T1")["task"]["title"] == "State core"
         assert mk("event", "--type", "note", "--text", "  ", code=2)["ok"] is False
         assert mk("event", "--type", "transition", "--text", "x", code=2)["ok"] is False
@@ -4231,23 +4413,23 @@ def self_test():
         dk = lambda *x, code=0: mk(*x, *d2, code=code, data_arg=False)
         dk("run", "init", "--id", "ra", "--feature", "A", "--branch", "a")
         dk("run", "init", "--id", "rb", "--feature", "B", "--branch", "b")
-        dk("task", "add", "--id", "R", "--title", "Reasoning", "--owned", "src/server/hermes-api.ts", "--run", "ra")
-        dk("task", "add", "--id", "X", "--title", "Base", "--run", "rb")
+        dk("task", "add", "--root", "--id", "R", "--title", "Reasoning", "--owned", "src/server/hermes-api.ts", "--run", "ra")
+        dk("task", "add", "--root", "--id", "X", "--title", "Base", "--run", "rb")
         # deps normalise to the stored id case (ids are case-insensitive); a self-dep is refused
-        assert dk("task", "add", "--id", "N1", "--title", "n", "--deps", "x", "--run", "rb")["task"]["deps"] == ["X"]
-        assert dk("task", "add", "--id", "N2", "--title", "n", "--deps", "ra:r", "--run", "rb")["task"]["deps"] == ["ra:R"]
-        assert dk("task", "add", "--id", "N3", "--title", "n", "--deps", "RA:R", "--run", "rb")["task"]["deps"] == ["ra:R"]
+        assert dk("task", "add", "--root", "--id", "N1", "--title", "n", "--deps", "x", "--run", "rb")["task"]["deps"] == ["X"]
+        assert dk("task", "add", "--root", "--id", "N2", "--title", "n", "--deps", "ra:r", "--run", "rb")["task"]["deps"] == ["ra:R"]
+        assert dk("task", "add", "--root", "--id", "N3", "--title", "n", "--deps", "RA:R", "--run", "rb")["task"]["deps"] == ["ra:R"]
         for selfdep in ("Z", "z", "RB:Z", "rb:z"):
-            assert dk("task", "add", "--id", "Z", "--title", "self", "--deps", selfdep,
+            assert dk("task", "add", "--root", "--id", "Z", "--title", "self", "--deps", selfdep,
                       "--run", "rb", code=2)["ok"] is False
-        assert dk("task", "add", "--id", "S", "--title", "same-run dep", "--deps", "RA:R",
+        assert dk("task", "add", "--root", "--id", "S", "--title", "same-run dep", "--deps", "RA:R",
                   "--run", "ra")["task"]["deps"] == ["ra:R"]
-        w = dk("task", "add", "--id", "A", "--title", "Archive", "--owned", "src/server/*.ts", "--run", "rb")
+        w = dk("task", "add", "--root", "--id", "A", "--title", "Archive", "--owned", "src/server/*.ts", "--run", "rb")
         assert any("ra:R" in x and "--deps ra:R" in x for x in w["warnings"]), w  # overlap across runs
-        w = dk("task", "add", "--id", "A2", "--title", "Archive 2", "--owned", "src/server/*.ts",
+        w = dk("task", "add", "--root", "--id", "A2", "--title", "Archive 2", "--owned", "src/server/*.ts",
                "--deps", "ra:R,X", "--run", "rb")
         assert not any("ra:R" in x for x in w.get("warnings", [])), w  # dep already declared: no warning
-        assert "dep ra:Q not found" in dk("task", "add", "--id", "A3", "--title", "t", "--deps", "ra:Q",
+        assert "dep ra:Q not found" in dk("task", "add", "--root", "--id", "A3", "--title", "t", "--deps", "ra:Q",
                                            "--run", "rb")["warnings"][0]
         assert globs_overlap("src/a.ts", "src/*.ts") and not globs_overlap("src/a.ts", "src/b.ts")
         assert not globs_overlap("docs/*", "src/*")
@@ -4275,7 +4457,7 @@ def self_test():
         dk("task", "set", "A3", "status=building", "--force", "--run", "rb")
         # parent roll-up: a side state wins, else building while any child is past routed and not
         # all are met, else the least advanced child; nested parents too
-        dk("task", "add", "--id", "P", "--title", "Parent", "--run", "rb")
+        dk("task", "add", "--root", "--id", "P", "--title", "Parent", "--run", "rb")
         dk("task", "add", "--id", "C1", "--title", "Child 1", "--parent", "P", "--run", "rb")
         dk("task", "add", "--id", "C2", "--title", "Child 2", "--parent", "P", "--run", "rb")
         dk("task", "add", "--id", "G", "--title", "Grandchild", "--parent", "C2", "--run", "rb")
@@ -4292,14 +4474,14 @@ def self_test():
         assert rows[-4:] == ["P", "↳ C1", "↳ C2", "↳ ↳ G"], rows
 
         # an ancestor's unmet deps gate the child's dispatch; a parent's status= fans out (F2.1)
-        dk("task", "add", "--id", "P2", "--title", "Parent 2", "--deps", "A3", "--run", "rb")
+        dk("task", "add", "--root", "--id", "P2", "--title", "Parent 2", "--deps", "A3", "--run", "rb")
         dk("task", "add", "--id", "C4", "--title", "Child 4", "--parent", "P2", "--run", "rb")
         e = dk("task", "set", "C4", "status=dispatched", "--run", "rb", code=2)
         assert "waits on A3" in e["error"] and e["unmet"] == ["A3"], e
         assert dk("task", "set", "C4", "status=dispatched", "--force", "--run", "rb")["ok"]
         # F2.1: status= on a parent fans out to every child (never written on the parent directly);
         # the dep gate applies per child — an unmet one refuses the whole fan-out before any write
-        dk("task", "add", "--id", "PG", "--title", "Parent gated", "--deps", "A3", "--run", "rb")
+        dk("task", "add", "--root", "--id", "PG", "--title", "Parent gated", "--deps", "A3", "--run", "rb")
         dk("task", "add", "--id", "CG", "--title", "Child gated", "--parent", "PG", "--run", "rb")
         e = dk("task", "set", "PG", "status=building", "--run", "rb", code=2)  # CG behind PG's dep A3
         assert "waits on A3" in e["error"] and e["unmet"] == ["A3"], e
@@ -4308,8 +4490,8 @@ def self_test():
         assert dk("task", "get", "P2", "--run", "rb")["task"]["status"] == "review"  # rolled up
 
         # --force past the dep gate: ONE decision event naming --by (default: orchestrator)
-        dk("task", "add", "--id", "F1", "--title", "forced", "--deps", "A3", "--run", "rb")
-        dk("task", "add", "--id", "F2", "--title", "forced too", "--deps", "A3", "--run", "rb")
+        dk("task", "add", "--root", "--id", "F1", "--title", "forced", "--deps", "A3", "--run", "rb")
+        dk("task", "add", "--root", "--id", "F2", "--title", "forced too", "--deps", "A3", "--run", "rb")
         dec = lambda: [x for x in events_of(ddeps, "rb") if x["type"] == "decision"]
         n_dec = len(dec())
         e = dk("task", "set", "F1", "status=dispatched", "--run", "rb", code=2)  # unforced: still refused
@@ -4330,7 +4512,7 @@ def self_test():
         # the decision text (the old code missed the f-prefix and wrote the literal
         # "{', '.join(waiting)}" into the event). Parent has dep A3 (unmet); the forced
         # fan-out produces a decision event whose text names the unmet dep.
-        dk("task", "add", "--id", "RFG", "--title", "r2-l2 fan-out gated", "--deps", "A3", "--run", "rb")
+        dk("task", "add", "--root", "--id", "RFG", "--title", "r2-l2 fan-out gated", "--deps", "A3", "--run", "rb")
         dk("task", "add", "--id", "RFGC", "--title", "r2-l2 fan-out gated child", "--parent", "RFG", "--run", "rb")
         n_dec = len(dec())
         out = dk("task", "set", "RFG", "status=dispatched", "--force", "--run", "rb")
@@ -4342,24 +4524,24 @@ def self_test():
         # the unmet list is rendered into the text (A3), not the literal format string
         assert "(fan-out, unmet: A3)" in d[0]["text"], d[0]
         assert "{'" not in d[0]["text"], d[0]  # the old bug wrote a literal "{', '.join(waiting)}"        # --parent onto merged/qa/done is refused; other runs' ready stays correct after an add
-        dk("task", "add", "--id", "Q2", "--title", "q2", "--run", "rb")
-        dk("task", "add", "--id", "D2", "--title", "waits on rb:Q2", "--deps", "rb:Q2", "--run", "ra")
+        dk("task", "add", "--root", "--id", "Q2", "--title", "q2", "--run", "rb")
+        dk("task", "add", "--root", "--id", "D2", "--title", "waits on rb:Q2", "--deps", "rb:Q2", "--run", "ra")
         dk("task", "set", "Q2", "status=merged", "--run", "rb")
         assert dk("task", "get", "D2", "--run", "ra")["task"]["ready"] is True
         e = dk("task", "add", "--id", "Q2C", "--title", "child", "--parent", "Q2", "--run", "rb", code=2)
         assert "merged" in e["error"] and "rolls up" in e["error"], e
         assert dk("task", "get", "Q2", "--run", "rb")["task"]["status"] == "merged"
         assert dk("task", "get", "D2", "--run", "ra")["task"]["ready"] is True  # no stale ready
-        dk("task", "add", "--id", "Q3", "--title", "q3", "--run", "rb")
+        dk("task", "add", "--root", "--id", "Q3", "--title", "q3", "--run", "rb")
         dk("task", "set", "Q3", "status=building", "--run", "rb")
-        dk("task", "add", "--id", "D3", "--title", "waits on rb:Q3", "--deps", "rb:Q3", "--run", "ra")
+        dk("task", "add", "--root", "--id", "D3", "--title", "waits on rb:Q3", "--deps", "rb:Q3", "--run", "ra")
         assert dk("task", "get", "D3", "--run", "ra")["task"]["ready"] is False
         dk("task", "add", "--id", "Q3C", "--title", "child", "--parent", "Q3", "--run", "rb")
         assert dk("task", "get", "Q3", "--run", "rb")["task"]["status"] == "planned"  # rolled back by the child
         assert dk("task", "get", "D3", "--run", "ra")["task"]["ready"] is False  # refreshed, still correct
 
         # F2: a follow-up under a merged phase, and `task set T parent=P` re-parenting
-        dk("task", "add", "--id", "FU", "--title", "Follow-up phase", "--run", "rb")
+        dk("task", "add", "--root", "--id", "FU", "--title", "Follow-up phase", "--run", "rb")
         dk("task", "add", "--id", "FU.1", "--title", "first child", "--parent", "FU", "--run", "rb")
         dk("task", "set", "FU.1", "status=merged", "--run", "rb")
         assert dk("task", "get", "FU", "--run", "rb")["task"]["status"] == "merged"
@@ -4382,7 +4564,7 @@ def self_test():
         assert dk("task", "get", "Q3", "--run", "rb")["task"]["status"] == "planned"
 
         # (c) a root with children moves under a phase: T is re-typed and so is everything below
-        dk("task", "add", "--id", "RP", "--title", "movable", "--run", "rb")
+        dk("task", "add", "--root", "--id", "RP", "--title", "movable", "--run", "rb")
         dk("task", "add", "--id", "RP.1", "--title", "under it", "--parent", "RP", "--run", "rb")
         ty = lambda i: dk("task", "check", i, "--run", "rb")["type"]  # task_type_of, the store's own word
         stored = lambda: {x["id"]: x.get("type") for x in dk("run", "get", "--id", "rb")["run"]["tasks"]}
@@ -4406,7 +4588,7 @@ def self_test():
         # owned overlap: a child's globs inside its parent's are the plan, not a collision
         overlap_refs = lambda w: [x.split("owned overlaps ", 1)[1].split(" ")[0]
                                   for x in w.get("warnings", []) if x.startswith("owned overlaps ")]
-        dk("task", "add", "--id", "OW", "--title", "Owner", "--owned", "scripts/*.py", "--run", "rb")
+        dk("task", "add", "--root", "--id", "OW", "--title", "Owner", "--owned", "scripts/*.py", "--run", "rb")
         w = dk("task", "add", "--id", "OWC", "--title", "child", "--parent", "OW",
                "--owned", "scripts/mk-state.py", "--run", "rb")
         assert not overlap_refs(w), w
@@ -4415,11 +4597,11 @@ def self_test():
                "--owned", "scripts/mk-state.py", "--run", "rb")
         assert not ({"OW", "OWM"} & set(overlap_refs(w))), w  # ancestors skipped...
         assert "OWC" in overlap_refs(w), w  # ...a cousin branch sharing the glob still warns
-        dk("task", "add", "--id", "OWR", "--title", "same id, other run", "--owned", "scripts/*.py", "--run", "ra")
-        w = dk("task", "add", "--id", "OWX", "--title", "unrelated", "--owned", "scripts/*.py", "--run", "rb")
+        dk("task", "add", "--root", "--id", "OWR", "--title", "same id, other run", "--owned", "scripts/*.py", "--run", "ra")
+        w = dk("task", "add", "--root", "--id", "OWX", "--title", "unrelated", "--owned", "scripts/*.py", "--run", "rb")
         assert "ra:OWR" in overlap_refs(w), w  # cross-run overlap is still reported
-        dk("task", "add", "--id", "OWS", "--title", "sibling", "--owned", "scripts/lane-*.py", "--run", "rb")
-        w = dk("task", "add", "--id", "OWY", "--title", "another sibling", "--owned", "scripts/lane-*.py", "--run", "rb")
+        dk("task", "add", "--root", "--id", "OWS", "--title", "sibling", "--owned", "scripts/lane-*.py", "--run", "rb")
+        w = dk("task", "add", "--root", "--id", "OWY", "--title", "another sibling", "--owned", "scripts/lane-*.py", "--run", "rb")
         assert "OWS" in overlap_refs(w), w  # a real same-run collision is untouched
 
         # roll-up only raises to building, never lowers; verify every rule in the acceptance
@@ -4431,7 +4613,7 @@ def self_test():
             ("P8", ("planned", "planned"), "planned"),
         )
         for pid, (s1, s2), want in cases:
-            dk("task", "add", "--id", pid, "--title", pid, "--run", "rb")
+            dk("task", "add", "--root", "--id", pid, "--title", pid, "--run", "rb")
             dk("task", "add", "--id", f"{pid}C1", "--title", "c1", "--parent", pid, "--run", "rb")
             dk("task", "set", f"{pid}C1", f"status={s1}", "--run", "rb")
             dk("task", "add", "--id", f"{pid}C2", "--title", "c2", "--parent", pid, "--run", "rb")
@@ -4439,7 +4621,7 @@ def self_test():
             assert dk("task", "get", pid, "--run", "rb")["task"]["status"] == want, (pid, want)
 
         # building + planned rolls up to building; an unknown child status never crashes the roll-up
-        dk("task", "add", "--id", "P3", "--title", "p3", "--run", "rb")
+        dk("task", "add", "--root", "--id", "P3", "--title", "p3", "--run", "rb")
         dk("task", "add", "--id", "K1", "--title", "k1", "--parent", "P3", "--run", "rb")
         dk("task", "add", "--id", "K2", "--title", "k2", "--parent", "P3", "--run", "rb")
         dk("task", "set", "K1", "status=building", "--run", "rb")
@@ -4459,7 +4641,7 @@ def self_test():
         sk = lambda *x, code=0: mk(*x, *d3, code=code, data_arg=False)
         sk("run", "init", "--id", "good", "--feature", "G", "--branch", "g")
         sk("run", "init", "--id", "sick", "--feature", "S", "--branch", "s")
-        sk("task", "add", "--id", "T", "--title", "t", "--run", "good")
+        sk("task", "add", "--root", "--id", "T", "--title", "t", "--run", "good")
         # L4: a sibling runs row is what load_store reads; a malformed one is a warning, not a crash
         ksick = os.path.join(tmp, "sick")
         con = DB.open_project(H, STORE_PROJECT_FALLBACK, data_dir=ksick)
@@ -4489,14 +4671,14 @@ def self_test():
             assert sk("task", "get", "T")["task"]["status"] == "building"
         set_sick("UPDATE runs SET branch=? WHERE id='sick'", (keep_branch,))
         # a sibling task whose dep names the healthy run must not crash render or commands there
-        sk("task", "add", "--id", "ghost", "--title", "ghost", "--deps", "good:T", "--run", "sick")
+        sk("task", "add", "--root", "--id", "ghost", "--title", "ghost", "--deps", "good:T", "--run", "sick")
         assert sk("render", "--run", "good")["ok"]
         assert sk("task", "set", "T", "status=review")["ok"]
         assert sk("task", "get", "T")["task"]["status"] == "review"
         # a dep whose target run has no row: unmet with a warning, no traceback
-        assert sk("task", "add", "--id", "BD", "--title", "bad dep", "--deps", "baddep:X",
+        assert sk("task", "add", "--root", "--id", "BD", "--title", "bad dep", "--deps", "baddep:X",
                   "--run", "good")["warnings"][0].startswith("dep baddep:X not found"), "baddep dep"
-        assert sk("task", "add", "--id", "N", "--title", "n", "--owned", "src/*.ts", "--run", "good")["ok"]
+        assert sk("task", "add", "--root", "--id", "N", "--title", "n", "--owned", "src/*.ts", "--run", "good")["ok"]
 
         # F2.1/F2.2/F2.3: parent status fan-out, status aliases, task verify — own data dir
         f2 = ["--data", os.path.join(tmp, "f2")]
@@ -4507,7 +4689,7 @@ def self_test():
 
         # F2.1: a 3-child parent — status= fans out, one transition per child with the same --note,
         # the parent itself is never set directly (roll-up derives it from the children)
-        fk("task", "add", "--id", "PF", "--title", "fan-out parent")
+        fk("task", "add", "--root", "--id", "PF", "--title", "fan-out parent")
         for i in (1, 2, 3):
             fk("task", "add", "--id", f"FC{i}", "--title", f"child {i}", "--parent", "PF")
         fk("task", "set", "PF", "status=fix", "--note", "fix round")
@@ -4522,7 +4704,7 @@ def self_test():
         assert fk("task", "set", "PF", "agent=codex")["task"]["agent"] == "codex"
 
         # F2.2: aliases are accepted and stored canonically; unknown words still fail with the list
-        fk("task", "add", "--id", "AL", "--title", "aliases")
+        fk("task", "add", "--root", "--id", "AL", "--title", "aliases")
         assert fk("task", "set", "AL", "status=reviewing")["task"]["status"] == "review"
         assert fk("task", "set", "AL", "status=merging")["task"]["status"] == "merged"
         assert fk("task", "set", "AL", "status=fixing")["task"]["status"] == "fix"
@@ -4536,7 +4718,7 @@ def self_test():
                   "--to", "exploding", code=2)["ok"] is False
 
         # F2.3 pass: counts at baseline → review, one verdict event carrying the counts and --by
-        fk("task", "add", "--id", "VT", "--title", "verify target")
+        fk("task", "add", "--root", "--id", "VT", "--title", "verify target")
         fk("event", "--type", "decision", "--text", "baseline: tests 100/0 · tsc 0 · lint 0 · selftest 8/0")
         out = fk("task", "verify", "VT", "--tests", "100/0", "--tsc", "0", "--lint", "0",
                  "--selftest", "8/0", "--by", "reviewer-x")
@@ -4565,7 +4747,7 @@ def self_test():
         assert tr and tr[-1]["text"] == "verify: fail — gate exploded", tr
 
         # F2.3 on a parent: the children move too; --tests must be <int>/<int>
-        fk("task", "add", "--id", "VP", "--title", "verify parent")
+        fk("task", "add", "--root", "--id", "VP", "--title", "verify parent")
         fk("task", "add", "--id", "VC1", "--title", "c1", "--parent", "VP")
         fk("task", "add", "--id", "VC2", "--title", "c2", "--parent", "VP")
         fk("task", "verify", "VP", "--tests", "100/0", "--selftest", "8/0")
@@ -4635,7 +4817,7 @@ def self_test():
         fk("run", "init", "--id", "fr2", "--feature", "F2 r2", "--branch", "b")
         fk2 = lambda *x, code=0: mk(*x, "--data", os.path.join(tmp, "f2"), "--run", "fr2",
                                     code=code, data_arg=False)
-        fk2("task", "add", "--id", "VT2", "--title", "verify no baseline")
+        fk2("task", "add", "--root", "--id", "VT2", "--title", "verify no baseline")
         out = fk2("task", "verify", "VT2", "--tests", "240/5", "--selftest", "8/3")
         assert out["result"] == "fail", out  # tests fail → still fix even without baseline
         assert out.get("warnings") and "no baseline" in " ".join(out["warnings"]), out
@@ -4643,7 +4825,7 @@ def self_test():
         assert "no baseline" in verd["text"], verd
 
         # F2.3 M3: descendants — verify reaches leaves, never writes on a parent
-        fk("task", "add", "--id", "VGP", "--title", "verify grand", "--run", "fr")
+        fk("task", "add", "--root", "--id", "VGP", "--title", "verify grand", "--run", "fr")
         fk("task", "add", "--id", "VGC", "--title", "verify grand child", "--parent", "VGP", "--run", "fr")
         fk("task", "add", "--id", "VGGC", "--title", "verify grand grand child", "--parent", "VGC", "--run", "fr")
         fk("event", "--run", "fr", "--task", "VGP", "--type", "decision", "--text",
@@ -4660,7 +4842,7 @@ def self_test():
         assert ss["VGGC"] == "fix" and ss["VGC"] == "fix" and ss["VGP"] == "fix", ss
 
         # F2.1 M3: fan-out reaches leaves too; never writes status onto a task that has children
-        fk("task", "add", "--id", "FGP", "--title", "fan grand", "--run", "fr")
+        fk("task", "add", "--root", "--id", "FGP", "--title", "fan grand", "--run", "fr")
         fk("task", "add", "--id", "FGC", "--title", "fan grand child", "--parent", "FGP", "--run", "fr")
         fk("task", "add", "--id", "FGGC", "--title", "fan grand grand child", "--parent", "FGC", "--run", "fr")
         out = fk("task", "set", "FGP", "status=fix", "--note", "fix leaves", "--run", "fr")
@@ -4938,10 +5120,10 @@ def self_test():
         pm("run", "init", "--id", "other", "--feature", "Other", "--branch", "o")
         for tid, stt in (("M", "merged"), ("Q", "qa"), ("B", "building"),
                          ("K", "blocked"), ("P", "planned")):
-            pm("task", "add", "--id", tid, "--title", tid, "--run", "close")
+            pm("task", "add", "--root", "--id", tid, "--title", tid, "--run", "close")
             if stt != "planned":
                 pm("task", "set", tid, f"status={stt}", "--run", "close")
-        pm("task", "add", "--id", "PAR", "--title", "parent", "--run", "close")
+        pm("task", "add", "--root", "--id", "PAR", "--title", "parent", "--run", "close")
         pm("task", "add", "--id", "C1", "--title", "c1", "--parent", "PAR", "--run", "close")
         pm("task", "add", "--id", "C2", "--title", "c2", "--parent", "PAR", "--run", "close")
         pm("task", "set", "C1", "status=merged", "--run", "close")
@@ -4957,7 +5139,7 @@ def self_test():
             con.commit()
         finally:
             con.close()
-        pm("task", "add", "--id", "OM", "--title", "other merged", "--run", "other")
+        pm("task", "add", "--root", "--id", "OM", "--title", "other merged", "--run", "other")
         pm("task", "set", "OM", "status=merged", "--run", "other")
         n_ev = n_events(pdata, "close")
         # F.0: B/K/P are open and so is the parent PAR (whose children are already merged/qa but
@@ -4999,8 +5181,8 @@ def self_test():
         # K2.2: a raise on the 2nd promotion still reports the task already moved.
         # The list is built by the caller; MK_PROMOTE_FAIL_AFTER=1 fails inside promote_closed.
         pm("run", "init", "--id", "half", "--feature", "Half", "--branch", "h")
-        pm("task", "add", "--id", "H1", "--title", "first", "--run", "half")
-        pm("task", "add", "--id", "H2", "--title", "second", "--run", "half")
+        pm("task", "add", "--root", "--id", "H1", "--title", "first", "--run", "half")
+        pm("task", "add", "--root", "--id", "H2", "--title", "second", "--run", "half")
         pm("task", "set", "H1", "status=merged", "--run", "half")
         pm("task", "set", "H2", "status=qa", "--run", "half")
         boom = dict(env)
@@ -5060,7 +5242,7 @@ def self_test():
         # 1. one planned task: refused, naming it with its status; the store is untouched
         f0put({"manual": "echo manual"})
         f0("run", "init", "--id", "f0", "--feature", "F0", "--branch", "b", "--plan", f0plan)
-        f0("task", "add", "--id", "F0.1", "--title", "open", "--run", "f0")
+        f0("task", "add", "--root", "--id", "F0.1", "--title", "open", "--run", "f0")
         before = f0store()
         e = f0("run", "set", "--id", "f0", "--status", "done", code=2)
         assert e["ok"] is False, e
@@ -5123,7 +5305,7 @@ def self_test():
         def rw(*args, code=0):
             return mk(*args, "--data", rwdata, code=code, data_arg=False)
         rw("run", "init", "--id", "rw", "--feature", "RW", "--branch", "b")
-        rw("task", "add", "--id", "P", "--title", "phase", "--run", "rw")
+        rw("task", "add", "--root", "--id", "P", "--title", "phase", "--run", "rw")
         rw("task", "add", "--id", "A", "--title", "merged", "--run", "rw", "--parent", "P")
         rw("task", "add", "--id", "B", "--title", "rework", "--run", "rw", "--parent", "P")
         rw("task", "set", "A", "status=merged", "--run", "rw")
@@ -5163,11 +5345,183 @@ def self_test():
         print("mk-state x31-r2-fixes self-test ok")
         gate_run_self_test(tmp, env)
         fidelity_self_test(tmp, env)
+        rework_round_self_test(tmp, env)
+        lessons_lint_self_test()
+        reconcile_self_test(tmp, env)
         print("mk-state gate-run self-test ok")
         # R1.2: the mkdb write guard refuses the real home from this suite too.
         _mkdb().selftest_guard_probe(tmp_home)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def reconcile_self_test(tmp, env):
+    """F.5: `reconcile`. The phase's last close writes a reconcile_due row (no gate run in that
+    write); reconcile reruns due and stale gates, maps a final-gate failure to its covers via
+    `covers`, moves merged -> rework only on a failure that repeats on the same tree, records
+    inconclusive (timeout / deferred) as an open risk reason; run done / archive are refused while a
+    rework task, an open reason or a due row remains; a legacy run writes and refuses nothing.
+    Every case FAILS on c97e8c5 (no `reconcile` command, no due rows, no refusal)."""
+    H = env["MK_HOME"]
+    DB = _mkdb()
+    repo, data = os.path.join(tmp, "rc-repo"), os.path.join(tmp, "rc-data")
+    os.makedirs(repo)
+    subprocess.run(["git", "-C", repo, "init", "-q"], check=True)
+    open(os.path.join(repo, "f.txt"), "w").write("0")
+    subprocess.run(["git", "-C", repo, "add", "."], check=True)
+    subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "c0"],
+                   check=True, capture_output=True)
+    con = DB.open_root(H)
+    try:
+        con.execute("INSERT OR REPLACE INTO projects(slug, name, repo, data_dir, mode, db_path)"
+                    " VALUES ('rcproj','rcproj',?,?,'home',NULL)", (repo, data))
+        con.commit()
+    finally:
+        con.close()
+
+    def rc(*args, code=0, e=None):
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), *args, "--data", data],
+                           capture_output=True, text=True, env=e or dict(env, MK_STATE_LOADAVG="0"),
+                           cwd=tmp, timeout=120)
+        lines = r.stdout.strip().splitlines()
+        assert len(lines) == 1, (args, r.stdout, r.stderr)
+        assert r.returncode == code, (args, r.returncode, r.stdout, r.stderr)
+        return json.loads(lines[0])
+
+    def sql(q, *args, write=False):
+        c = DB.open_project(H, STORE_PROJECT_FALLBACK, data_dir=data)
+        try:
+            rows = [tuple(r) for r in c.execute(q, args)]
+            if write:
+                c.commit()
+            return rows
+        finally:
+            c.close()
+
+    def setx(table, where, key, val):
+        cur = json.loads(sql(f"SELECT extra_json FROM {table} WHERE {where}")[0][0] or "{}")
+        cur[key] = val
+        sql(f"UPDATE {table} SET extra_json=? WHERE {where}", json.dumps(cur), write=True)
+
+    def final(rid, cmd, covers, **kw):
+        setx("runs", f"id='{rid}'", "final_gates",
+             [{"id": "fin", "cmd": cmd, "every": "merge", "covers": covers, **kw}])
+
+    def mkrun(rid, tasks, fidelity=True):
+        rc("run", "init", "--id", rid, "--feature", rid, "--branch", "b")
+        for tid, parent in tasks:
+            rc("task", "add", "--id", tid, "--title", tid, "--run", rid, *(["--parent", parent] if parent else ["--root"]))
+            setx("tasks", f"run='{rid}' AND id='{tid}'", "gate", [{"cmd": "true"}])
+        if fidelity:
+            setx("runs", f"id='{rid}'", "fidelity", True)
+
+    def merge(rid, *tids):
+        for tid in tids:
+            rc("gate", "run", tid, "--run", rid)
+            rc("task", "set", tid, "status=merged", "--run", rid)
+
+    def status(rid, tid):
+        return rc("task", "get", tid, "--run", rid)["task"]["status"]
+
+    def due(rid):
+        return sql("SELECT scope, done IS NULL FROM reconcile_due WHERE run=? ORDER BY id", rid)
+
+    def refused(out, *words):
+        assert out["ok"] is False and all(w in out["error"] for w in words), out
+
+    # 1. a final gate that is always red: its covered task goes to rework, B stays merged
+    mkrun("c1", [("A", None), ("B", None)])
+    final("c1", "false", ["A"])
+    merge("c1", "A", "B")
+    assert due("c1") == [("A", 1), ("B", 1)], due("c1")
+    assert status("c1", "A") == "merged"  # the close ran no final gate
+    out = rc("reconcile", "--run", "c1")
+    assert out["reworked"] == ["A"] and out["flaky"] == [] and out["inconclusive"] == [], out
+    assert status("c1", "A") == "rework" and status("c1", "B") == "merged"
+    refused(rc("run", "set", "--id", "c1", "--status", "done", code=2), "A")
+    refused(rc("run", "archive", "--id", "c1", code=2), "rework", "A")
+    # the fix: gate green, the task re-merged (its evidence is still fresh), reconcile again
+    final("c1", "true", ["A"])
+    rc("task", "set", "A", "status=merged", "--run", "c1")
+    out = rc("reconcile", "--run", "c1")
+    assert out["reworked"] == [] and "fin" in out["green"], out
+    assert all(d == 0 for _, d in due("c1")), due("c1")
+    assert rc("run", "set", "--id", "c1", "--status", "done")["run"]["status"] == "done"
+
+    # 2. red once, then green on the same tree: flaky, nothing changes
+    mark = os.path.join(tmp, "rc-flaky-mark")
+    mkrun("c2", [("A", None)])
+    final("c2", f"test -e {mark} || {{ touch {mark}; exit 1; }}", ["A"])
+    merge("c2", "A")
+    out = rc("reconcile", "--run", "c2")
+    assert out["flaky"] == ["fin"] and out["reworked"] == [] and status("c2", "A") == "merged", out
+    assert sql("SELECT result FROM evidence WHERE run='c2' AND gate='fin' ORDER BY id") == [("red",), ("green",)]
+    assert rc("run", "set", "--id", "c2", "--status", "done")["run"]["status"] == "done"
+
+    # 3. a passing reconcile changes no status and no risk row; it adds evidence and stamps the row
+    mkrun("c3", [("A", None), ("B", None)])
+    final("c3", "true", ["A", "B"])
+    merge("c3", "A", "B")
+    before = (sql("SELECT id, status FROM tasks WHERE run='c3' ORDER BY id"),
+              sql("SELECT * FROM risk_reasons WHERE run='c3'"), sql("SELECT COUNT(*) FROM evidence WHERE run='c3'"))
+    out = rc("reconcile", "--run", "c3")
+    assert out["green"] == ["fin"] and not out["reworked"] and not out["inconclusive"] and not out["flaky"], out
+    assert before[:2] == (sql("SELECT id, status FROM tasks WHERE run='c3' ORDER BY id"),
+                          sql("SELECT * FROM risk_reasons WHERE run='c3'")), "reconcile changed state"
+    assert sql("SELECT COUNT(*) FROM evidence WHERE run='c3'")[0][0] == before[2][0][0] + 1
+    assert all(d == 0 for _, d in due("c3"))
+    again = rc("reconcile", "--run", "c3")  # nothing due, nothing stale
+    assert again["ran"] == [], again
+
+    # 4. timeout and deferred are inconclusive: a risk reason, no status change, close refused
+    mkrun("c4", [("A", None)])
+    final("c4", "sleep 5", ["A"], timeout=1)
+    merge("c4", "A")
+    out = rc("reconcile", "--run", "c4")
+    assert out["inconclusive"] == ["A"] and out["reworked"] == [], out
+    assert status("c4", "A") == "merged"
+    assert sql("SELECT kind, points FROM risk_reasons WHERE run='c4' AND cleared IS NULL") == [("reconcile-inconclusive", 1)]
+    assert rc("reconcile", "--run", "c4")["inconclusive"] == ["A"]  # a second run opens no second reason
+    assert len(sql("SELECT id FROM risk_reasons WHERE run='c4'")) == 1
+    final("c4", "true", ["A"])
+    rc("gate", "run", "--final", "--run", "c4")  # fresh green evidence; only the open reason is left
+    refused(rc("run", "set", "--id", "c4", "--status", "done", code=2), "reconcile-inconclusive")
+    refused(rc("run", "archive", "--id", "c4", code=2), "reconcile-inconclusive")
+    ev = rc("gate", "run", "A", "--run", "c4")["evidence"][0]["id"]
+    rid = sql("SELECT id FROM risk_reasons WHERE run='c4'")[0][0]
+    rc("risk", "clear", str(rid), "--evidence", str(ev), "--run", "c4")
+    assert rc("run", "set", "--id", "c4", "--status", "done")["run"]["status"] == "done"
+    mkrun("c4d", [("A", None)])
+    final("c4d", "true", ["A"])
+    merge("c4d", "A")
+    out = rc("reconcile", "--run", "c4d", e=dict(env, MK_STATE_LOADAVG="41"))
+    assert out["inconclusive"] == ["A"] and status("c4d", "A") == "merged", out
+    assert sql("SELECT result FROM evidence WHERE run='c4d' AND gate='fin'") == [("deferred",)]
+    refused(rc("run", "archive", "--id", "c4d", code=2), "reconcile-inconclusive")
+
+    # 5. the due row: written by the phase's LAST close only, once; a legacy run writes none
+    mkrun("c5", [("P", None), ("K1", "P"), ("K2", "P")])
+    final("c5", "true", ["P"])
+    merge("c5", "K1")
+    assert due("c5") == [], due("c5")
+    rc("gate", "run", "P", "--run", "c5")  # the phase's own gate, so the roll-up may close it
+    merge("c5", "K2")
+    assert due("c5") == [("P", 1)], due("c5")
+    rc("task", "set", "K2", "status=merged", "--run", "c5", "--note", "again")
+    assert len(due("c5")) == 1, due("c5")
+    rc("gate", "run", "--final", "--run", "c5")  # fresh evidence; only the due row is left
+    refused(rc("run", "set", "--id", "c5", "--status", "done", code=2), "reconcile due", "P")
+    refused(rc("run", "archive", "--id", "c5", code=2), "reconcile due", "P")
+    rc("reconcile", "--run", "c5", "--phase", "P")
+    assert due("c5") == [("P", 0)], due("c5")
+    assert rc("run", "archive", "--id", "c5")["run"]["status"] == "archived"
+    mkrun("c6", [("L", None)], fidelity=False)
+    final("c6", "false", ["L"])
+    rc("task", "set", "L", "status=merged", "--run", "c6")
+    assert due("c6") == []
+    out = rc("reconcile", "--run", "c6")
+    assert out["ran"] == [] and status("c6", "L") == "merged", out
+    assert rc("run", "set", "--id", "c6", "--status", "done")["run"]["status"] == "done"
 
 
 _CLOCK = {"t": None}  # the parity test pins now() so the two paths share one clock
@@ -5197,7 +5551,7 @@ def store_self_test(tmp, env):
     # `store status` reports on. No file view exists to snapshot or to publish.
     assert mk("store", "status")["store"] == "on"
     mk("run", "init", "--id", "s1", "--feature", "Store", "--branch", "b")
-    mk("task", "add", "--id", "T1", "--title", "One")
+    mk("task", "add", "--root", "--id", "T1", "--title", "One")
     mk("task", "set", "T1", "status=routed")
     mk("event", "--task", "T1", "--type", "note", "--text", "hello")
     assert os.path.exists(os.path.join(data, "mk.db")), "the store is always on: mk.db must exist"
@@ -5228,8 +5582,8 @@ def store_self_test(tmp, env):
 
     script = [
         ("run", "init", "--id", "s2", "--feature", "Twin", "--branch", "b2"),
-        ("task", "add", "--id", "A", "--title", "Alpha", "--run", "s2"),
-        ("task", "add", "--id", "B", "--title", "Beta", "--deps", "A", "--run", "s2"),
+        ("task", "add", "--root", "--id", "A", "--title", "Alpha", "--run", "s2"),
+        ("task", "add", "--root", "--id", "B", "--title", "Beta", "--deps", "A", "--run", "s2"),
         ("task", "set", "A", "status=building", "--run", "s2"),
         ("task", "round", "A", "--kind", "build", "--run", "s2"),
         ("event", "--task", "A", "--type", "note", "--text", "working", "--run", "s2"),
@@ -5430,7 +5784,7 @@ def store_self_test(tmp, env):
     # re-init on the race dir (mk() wrote into `data`)
     once(["run", "init", "--id", "rr", "--feature", "Race", "--branch", "br"], race)
     for i in range(20):
-        once(["task", "add", "--id", f"R{i}", "--title", f"r{i}", "--run", "rr"], race)
+        once(["task", "add", "--root", "--id", f"R{i}", "--title", f"r{i}", "--run", "rr"], race)
     once(["store", "enable"], race)
     procs = []
     for side in (0, 1):
@@ -5455,8 +5809,8 @@ def store_self_test(tmp, env):
     # CRITICAL review :246 — a direct transition survives the next task set
     keep = os.path.join(tmp, "keep")
     once(["run", "init", "--id", "k1", "--feature", "K", "--branch", "bk"], keep)
-    once(["task", "add", "--id", "T1", "--title", "One", "--run", "k1"], keep)
-    once(["task", "add", "--id", "T2", "--title", "Two", "--run", "k1"], keep)
+    once(["task", "add", "--root", "--id", "T1", "--title", "One", "--run", "k1"], keep)
+    once(["task", "add", "--root", "--id", "T2", "--title", "Two", "--run", "k1"], keep)
     once(["store", "enable"], keep)
     db.transition(H, STORE_PROJECT_FALLBACK, "k1", "T1", "building", data_dir=keep)
     once(["task", "set", "T2", "status=building", "--run", "k1"], keep)
@@ -5541,7 +5895,7 @@ def store_self_test(tmp, env):
     # to be torn). The runs/task.json-is-a-directory fault injected by the old file path is gone.
     corrupt = os.path.join(tmp, "corrupt")
     once(["run", "init", "--id", "c1", "--feature", "C", "--branch", "bc"], corrupt)
-    once(["task", "add", "--id", "T", "--title", "Tee", "--run", "c1"], corrupt)
+    once(["task", "add", "--root", "--id", "T", "--title", "Tee", "--run", "c1"], corrupt)
     cc = db.open_project(H, STORE_PROJECT_FALLBACK, data_dir=corrupt)
     try:
         cc.execute("UPDATE tasks SET route_json='{not json' WHERE run='c1' AND id='T'")
@@ -5572,7 +5926,7 @@ def store_self_test(tmp, env):
     d3 = os.path.join(tmp, "d3b")
     d3env = dict(env, MATRIXKODER_HOME=root, MK_HOME=root)
     once(["run", "init", "--id", "d1", "--feature", "D", "--branch", "bd"], d3)
-    once(["task", "add", "--id", "T1", "--title", "Rooted", "--run", "d1"], d3)
+    once(["task", "add", "--root", "--id", "T1", "--title", "Rooted", "--run", "d1"], d3)
     r = subprocess.run([sys.executable, os.path.abspath(__file__), "task", "set", "T1",
                         "status=building", "--run", "d1", "--data", d3],
                        capture_output=True, text=True, env=d3env)
@@ -5786,7 +6140,7 @@ def store_self_test(tmp, env):
     k2 = os.path.join(tmp, "k2on")
     k2env = dict(env, MATRIXKODER_HOME=os.path.join(tmp, "k2on-home"), MK_HOME=os.path.join(tmp, "k2on-home"))
     once(["run", "init", "--id", "k2", "--feature", "K2", "--branch", "bk"], k2, k2env)
-    once(["task", "add", "--id", "V", "--title", "verify", "--run", "k2"], k2, k2env)
+    once(["task", "add", "--root", "--id", "V", "--title", "verify", "--run", "k2"], k2, k2env)
     once(["store", "enable"], k2, k2env)
     once(["event", "--type", "decision", "--text", "baseline: tests 0/0 · selftest 0/0", "--run", "k2"], k2, k2env)
     r = subprocess.run([sys.executable, os.path.abspath(__file__), "task", "verify", "V",
@@ -5801,8 +6155,8 @@ def store_self_test(tmp, env):
     assert not any("384/387" in e.get("text", "") for e in events_rows(k2, "k2"))
     passed = once(["task", "verify", "V", "--tests", "350/0", "--run", "k2"], k2, k2env)
     assert passed["result"] == "pass" and passed["task"]["status"] == "review", passed
-    once(["task", "add", "--id", "A", "--title", "a", "--run", "k2"], k2, k2env)
-    once(["task", "add", "--id", "B", "--title", "b", "--run", "k2"], k2, k2env)
+    once(["task", "add", "--root", "--id", "A", "--title", "a", "--run", "k2"], k2, k2env)
+    once(["task", "add", "--root", "--id", "B", "--title", "b", "--run", "k2"], k2, k2env)
     once(["task", "set", "A", "status=merged", "--run", "k2"], k2, k2env)
     once(["task", "set", "B", "status=qa", "--run", "k2"], k2, k2env)
     # F.0: V is at review (open), so the close is refused naming it first
@@ -5830,7 +6184,7 @@ def store_self_test(tmp, env):
     parenv = dict(env, MATRIXKODER_HOME=par_home, MK_HOME=par_home)
     once(["run", "init", "--id", "pr", "--feature", "Par", "--branch", "bp"], par, parenv)
     for i in range(20):
-        once(["task", "add", "--id", f"P{i}", "--title", f"p{i}", "--run", "pr"], par, parenv)
+        once(["task", "add", "--root", "--id", f"P{i}", "--title", f"p{i}", "--run", "pr"], par, parenv)
     once(["store", "enable"], par, parenv)
     assert os.path.exists(os.path.join(par, "mk.db"))
     script = os.path.abspath(__file__)
@@ -5872,7 +6226,7 @@ def store_self_test(tmp, env):
     # L4: an event row appears exactly once (there is no events.jsonl marker to rewind)
     rew = os.path.join(tmp, "rew")
     once(["run", "init", "--id", "s1", "--feature", "S", "--branch", "bs"], rew)
-    once(["task", "add", "--id", "A1", "--title", "a", "--run", "s1"], rew)
+    once(["task", "add", "--root", "--id", "A1", "--title", "a", "--run", "s1"], rew)
     once(["event", "--run", "s1", "--type", "note", "--text", "grow1"], rew)
     once(["event", "--run", "s1", "--type", "note", "--text", "after"], rew)
     texts = [e["text"] for e in events_rows(rew, "s1")]
@@ -5883,7 +6237,7 @@ def store_self_test(tmp, env):
     # append. The store commit is the only write, so each event lands exactly once.
     kills = os.path.join(tmp, "kills")
     once(["run", "init", "--id", "s1", "--feature", "S", "--branch", "bs"], kills)
-    once(["task", "add", "--id", "A1", "--title", "a", "--run", "s1"], kills)
+    once(["task", "add", "--root", "--id", "A1", "--title", "a", "--run", "s1"], kills)
     script = os.path.abspath(__file__)
     for trial in range(5):
         before_n = ev_count(kills, "s1")
@@ -5895,10 +6249,10 @@ def store_self_test(tmp, env):
     # L4: task order is the runs.extra_json `task_order` list, so it survives every write
     order = os.path.join(tmp, "order")
     once(["run", "init", "--id", "o1", "--feature", "O", "--branch", "bo"], order)
-    once(["task", "add", "--id", "BA", "--title", "ba", "--run", "o1"], order)
+    once(["task", "add", "--root", "--id", "BA", "--title", "ba", "--run", "o1"], order)
     once(["task", "add", "--id", "BA.1", "--title", "ba1", "--parent", "BA", "--run", "o1"], order)
     once(["task", "add", "--id", "BA.2", "--title", "ba2", "--parent", "BA", "--run", "o1"], order)
-    once(["task", "add", "--id", "BB", "--title", "bb", "--run", "o1"], order)
+    once(["task", "add", "--root", "--id", "BB", "--title", "bb", "--run", "o1"], order)
     pre_ids = [t["id"] for t in once(["run", "get", "--id", "o1"], order)["run"]["tasks"]]
     assert pre_ids == ["BA", "BA.1", "BA.2", "BB"], pre_ids
     once(["task", "set", "BB", "status=building", "--run", "o1"], order)  # an ordinary write
@@ -5921,9 +6275,9 @@ def store_self_test(tmp, env):
     rd = os.path.join(tmp, "ready")
     once(["run", "init", "--id", "rr", "--feature", "Ready", "--branch", "br"], rd)
     once(["store", "enable"], rd)
-    once(["task", "add", "--id", "A", "--title", "dep", "--run", "rr"], rd)
-    once(["task", "add", "--id", "B", "--title", "needs A", "--deps", "A", "--run", "rr"], rd)
-    once(["task", "add", "--id", "Z", "--title", "unrelated", "--run", "rr"], rd)
+    once(["task", "add", "--root", "--id", "A", "--title", "dep", "--run", "rr"], rd)
+    once(["task", "add", "--root", "--id", "B", "--title", "needs A", "--deps", "A", "--run", "rr"], rd)
+    once(["task", "add", "--root", "--id", "Z", "--title", "unrelated", "--run", "rr"], rd)
     once(["task", "set", "A", "status=done", "--run", "rr"], rd)
 
     def store_status(tid):
@@ -5951,9 +6305,9 @@ def store_self_test(tmp, env):
     rt = os.path.join(tmp, "routed")
     once(["run", "init", "--id", "rr", "--feature", "Routed", "--branch", "br"], rt)
     once(["store", "enable"], rt)
-    once(["task", "add", "--id", "A", "--title", "dep", "--run", "rr"], rt)
-    once(["task", "add", "--id", "B", "--title", "needs A", "--deps", "A", "--run", "rr"], rt)
-    once(["task", "add", "--id", "Z", "--title", "unrelated", "--run", "rr"], rt)
+    once(["task", "add", "--root", "--id", "A", "--title", "dep", "--run", "rr"], rt)
+    once(["task", "add", "--root", "--id", "B", "--title", "needs A", "--deps", "A", "--run", "rr"], rt)
+    once(["task", "add", "--root", "--id", "Z", "--title", "unrelated", "--run", "rr"], rt)
     once(["task", "set", "A", "status=done", "--run", "rr"], rt)
     got = once(["task", "set", "B", "status=routed", "--run", "rr"], rt)
     assert got["task"]["status"] == "routed" and got["task"]["ready"] is True, got["task"]
@@ -5964,8 +6318,8 @@ def store_self_test(tmp, env):
     rt2 = os.path.join(tmp, "routed2")
     once(["run", "init", "--id", "rr", "--feature", "Routed", "--branch", "br"], rt2)
     once(["store", "enable"], rt2)
-    once(["task", "add", "--id", "A", "--title", "dep", "--run", "rr"], rt2)
-    once(["task", "add", "--id", "B", "--title", "needs A", "--deps", "A", "--run", "rr"], rt2)
+    once(["task", "add", "--root", "--id", "A", "--title", "dep", "--run", "rr"], rt2)
+    once(["task", "add", "--root", "--id", "B", "--title", "needs A", "--deps", "A", "--run", "rr"], rt2)
     once(["task", "set", "B", "status=routed", "--run", "rr"], rt2)
     once(["task", "set", "A", "status=done", "--run", "rr"], rt2)
     view = once(["task", "get", "B", "--run", "rr"], rt2)["task"]
@@ -5976,9 +6330,9 @@ def store_self_test(tmp, env):
     ch = os.path.join(tmp, "churn")
     once(["run", "init", "--id", "rr", "--feature", "Churn", "--branch", "br"], ch)
     once(["store", "enable"], ch)
-    once(["task", "add", "--id", "A", "--title", "dep", "--run", "rr"], ch)
-    once(["task", "add", "--id", "B", "--title", "needs A", "--deps", "A", "--run", "rr"], ch)
-    once(["task", "add", "--id", "Z", "--title", "unrelated", "--run", "rr"], ch)
+    once(["task", "add", "--root", "--id", "A", "--title", "dep", "--run", "rr"], ch)
+    once(["task", "add", "--root", "--id", "B", "--title", "needs A", "--deps", "A", "--run", "rr"], ch)
+    once(["task", "add", "--root", "--id", "Z", "--title", "unrelated", "--run", "rr"], ch)
     once(["task", "set", "A", "status=done", "--run", "rr"], ch)
     once(["task", "set", "B", "status=routed", "--run", "rr"], ch)
 
@@ -6009,9 +6363,9 @@ def store_self_test(tmp, env):
     finally:
         con.close()
     once(["run", "set", "--id", "r1", "--plan-id", "f2plan"], rp)
-    once(["task", "add", "--id", "P1", "--title", "phase", "--run", "r1"], rp)
-    once(["task", "add", "--id", "P2", "--title", "other phase", "--run", "r1"], rp)
-    once(["task", "add", "--id", "T1", "--title", "movable", "--run", "r1"], rp)
+    once(["task", "add", "--root", "--id", "P1", "--title", "phase", "--run", "r1"], rp)
+    once(["task", "add", "--root", "--id", "P2", "--title", "other phase", "--run", "r1"], rp)
+    once(["task", "add", "--root", "--id", "T1", "--title", "movable", "--run", "r1"], rp)
     once(["task", "set", "T1", "parent=P1", "--run", "r1"], rp)
 
     def f2_rows():
@@ -6098,7 +6452,7 @@ def no_file_views_self_test(tmp, env):
 
     step("run", "init", "--id", "nfv", "--feature", "NoFileViews", "--branch", "b",
          "--plan", plan, "--force", e=e2)
-    step("task", "add", "--id", "X1", "--title", "extra", "--run", "nfv")
+    step("task", "add", "--root", "--id", "X1", "--title", "extra", "--run", "nfv")
     step("task", "set", "X1", "status=routed", "--run", "nfv")
     step("task", "set", "X1", "status=building", "--note", "start", "--run", "nfv")
     step("event", "--task", "X1", "--type", "note", "--text", "hello", "--run", "nfv")
@@ -6152,8 +6506,8 @@ def cross_run_dep_from_db_self_test(tmp, env):
 
     mk("run", "init", "--id", "ra", "--feature", "A", "--branch", "a")
     mk("run", "init", "--id", "rb", "--feature", "B", "--branch", "b")
-    mk("task", "add", "--id", "R", "--title", "Reasoning", "--run", "ra")
-    mk("task", "add", "--id", "A2", "--title", "Waits", "--deps", "ra:R", "--run", "rb")
+    mk("task", "add", "--root", "--id", "R", "--title", "Reasoning", "--run", "ra")
+    mk("task", "add", "--root", "--id", "A2", "--title", "Waits", "--deps", "ra:R", "--run", "rb")
     assert mk("task", "get", "A2", "--run", "rb")["task"]["ready"] is False
     # remove any file view the other run might still have: the DB is the only source now
     for name in ("run.json", "task.json"):
@@ -6190,7 +6544,7 @@ def no_field_blanked_self_test(tmp, env):
         return json.loads(lines[0])
 
     mk("run", "init", "--id", "kf", "--feature", "Keep", "--branch", "b")
-    mk("task", "add", "--id", "T", "--title", "Keep me", "--wave", "3", "--owned", "a.py,b.py", "--run", "kf")
+    mk("task", "add", "--root", "--id", "T", "--title", "Keep me", "--wave", "3", "--owned", "a.py,b.py", "--run", "kf")
     mk("task", "set", "T", "status=routed", "--run", "kf")
     mk("task", "set", "T", "agent=codex", "model=gpt-5", "effort=high", "lane=/tmp/lane",
        "workspace=mk:repo:1", "branch=mk/kf/t", "slot=1", "gates={\"test\":\"pass\"}",
@@ -6236,7 +6590,7 @@ def r2_fixes_self_test(tmp, env):
     db = _mkdb()
     # (1) parallel round trip: set the column, load, save through an ordinary write, read it back
     mk("run", "init", "--id", "par", "--feature", "P", "--branch", "b")
-    mk("task", "add", "--id", "PT", "--title", "par", "--run", "par")
+    mk("task", "add", "--root", "--id", "PT", "--title", "par", "--run", "par")
     con = db.open_project(home, STORE_PROJECT_FALLBACK, data_dir=data)
     try:
         con.execute("UPDATE tasks SET parallel=1 WHERE run='par' AND id='PT'")
@@ -6285,9 +6639,9 @@ def r2_fixes_self_test(tmp, env):
 
     # (3) dep_status matches a cross-run id case-insensitively
     mk("run", "init", "--id", "ra", "--feature", "A", "--branch", "a")
-    mk("task", "add", "--id", "RT", "--title", "dep", "--run", "ra")
+    mk("task", "add", "--root", "--id", "RT", "--title", "dep", "--run", "ra")
     mk("run", "init", "--id", "rb", "--feature", "B", "--branch", "b")
-    mk("task", "add", "--id", "B2", "--title", "waits", "--deps", "RA:RT", "--run", "rb")
+    mk("task", "add", "--root", "--id", "B2", "--title", "waits", "--deps", "RA:RT", "--run", "rb")
     mk("task", "set", "RT", "status=merged", "--run", "ra")
     mk("task", "set", "B2", "status=building", "--run", "rb")
     con = db.open_project(home, STORE_PROJECT_FALLBACK, data_dir=data)
@@ -6342,7 +6696,7 @@ def gate_run_self_test(tmp, env):
 
     pidfile = os.path.join(tmp, "gr-child.pid")
     gr("run", "init", "--id", "gr", "--feature", "GR", "--branch", "b")
-    gr("task", "add", "--id", "G1", "--title", "gated", "--run", "gr")
+    gr("task", "add", "--root", "--id", "G1", "--title", "gated", "--run", "gr")
     def setx(table, where, key, val):
         """Merge one key into a row's extra_json (what helper A's `gate` key does), keeping the rest."""
         c = DB.open_project(H, STORE_PROJECT_FALLBACK, data_dir=data)
@@ -6433,6 +6787,42 @@ def gate_run_self_test(tmp, env):
     assert gr("gate", "run", "G1", "--final", "--run", "gr", code=2)["ok"] is False
 
 
+def lessons_lint_self_test():
+    """F.11: every lessons.md row names what enforces its rule (a script path or `prose only`),
+    and at most 20 rows may be prose only."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "skills", "matrixkoder", "reference", "lessons.md")
+    rows = [[c.strip() for c in ln.strip().strip("|").split("|")]
+            for ln in open(path, encoding="utf-8").read().splitlines() if ln.startswith("|")]
+    assert rows[0][-1] == "Enforced by", rows[0]
+    data = [r for r in rows[2:] if r[0]]
+    assert data and all(len(r) >= len(rows[0]) and r[-1] for r in data)  # >=: a cell may hold `a|b`, [r[0] for r in data if not r[-1]]
+    prose = [r[0] for r in data if r[-1] == "prose only"]
+    assert len(prose) <= 20, f"{len(prose)} lessons are prose only (cap 20): {prose}"
+
+
+def rework_round_self_test(tmp, env):
+    """F.4 needs: `task round --kind rework` moves a MERGED task to rework and is refused on any
+    other status. Both cases fail on c97e8c5 (the kind does not exist there)."""
+    data = os.path.join(tmp, "rw-data")
+
+    def rw(*args, code=0):
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), *args, "--data", data],
+                           capture_output=True, text=True, env=dict(env, MK_STATE_LOADAVG="0"),
+                           cwd=tmp, timeout=120)
+        lines = r.stdout.strip().splitlines()
+        assert len(lines) == 1 and r.returncode == code, (args, r.returncode, r.stdout, r.stderr)
+        return json.loads(lines[0])
+
+    rw("run", "init", "--id", "rw", "--feature", "rw", "--branch", "b")
+    rw("task", "add", "--id", "W", "--title", "w", "--run", "rw", "--root")
+    bad = rw("task", "round", "W", "--kind", "rework", "--run", "rw", code=2)
+    assert bad["ok"] is False and "merged" in bad["error"], bad  # planned: refused
+    rw("task", "set", "W", "status=merged", "--run", "rw")
+    out = rw("task", "round", "W", "--kind", "rework", "--run", "rw")
+    assert out["ok"] is True and out["kind"] == "rework", out
+    assert rw("task", "get", "W", "--run", "rw")["task"]["status"] == "rework"
+
+
 def fidelity_self_test(tmp, env):
     """F.3: ONE fidelity_gate on every closing path (task set, fan-out, promote_closed, run set
     --status done, run archive), stale evidence does not count, manual lines need a sign-off, a
@@ -6485,7 +6875,7 @@ def fidelity_self_test(tmp, env):
     def mkrun(rid, fidelity=True, tasks=(), final=True):
         fi("run", "init", "--id", rid, "--feature", rid, "--branch", "b")
         for tid, parent in tasks:
-            fi("task", "add", "--id", tid, "--title", tid, "--run", rid, *(["--parent", parent] if parent else []))
+            fi("task", "add", "--id", tid, "--title", tid, "--run", rid, *(["--parent", parent] if parent else ["--root"]))
             if not parent or True:
                 setx("tasks", f"run='{rid}' AND id='{tid}'", "gate", GATE)
         if fidelity:
@@ -6565,6 +6955,8 @@ def fidelity_self_test(tmp, env):
     bump(2)  # X's evidence is now stale
     refused(fi("run", "set", "--id", "f3", "--status", "done", code=2), "X:X#1 evidence is stale", "final:fin no evidence")
     fi("gate", "run", "X", "--run", "f3"), fi("gate", "run", "--final", "--run", "f3")
+    refused(fi("run", "set", "--id", "f3", "--status", "done", code=2), "reconcile due", "X")  # F.5
+    fi("reconcile", "--run", "f3")
     out = fi("run", "set", "--id", "f3", "--status", "done")
     assert out["run"]["status"] == "done" and out["promoted"] == ["X"], out
 
@@ -6696,7 +7088,7 @@ def x31_r2_fixes_self_test(tmp, env):
     assert not os.path.exists(os.path.join(a_home, ".matrixkoder")), \
         "the default home already has a root projection; the case wants a clean default home"
     a_mk("run", "init", "--id", "x31a", "--feature", "X31", "--branch", "ba")
-    a_mk("task", "add", "--id", "T", "--title", "brief me", "--run", "x31a")
+    a_mk("task", "add", "--root", "--id", "T", "--title", "brief me", "--run", "x31a")
     a_mk("task", "round", "T", "--kind", "build", "--run", "x31a")
     try:
         b1 = a_mk("task", "brief", "T", "--file", b_path)
@@ -6721,7 +7113,7 @@ def x31_r2_fixes_self_test(tmp, env):
     # so every later commit inserted one row per rev again (2 revs -> 4).
     b_data = os.path.join(tmp, "x31-dup")
     mk(b_data, "run", "init", "--id", "x31b", "--feature", "B", "--branch", "bb", e=env)
-    mk(b_data, "task", "add", "--id", "B", "--title", "dup", "--run", "x31b", e=env)
+    mk(b_data, "task", "add", "--root", "--id", "B", "--title", "dup", "--run", "x31b", e=env)
     def b2_mk(*args, code=0):
         return mk(b_data, *args, e=env, code=code)
     v1 = os.path.join(tmp, "x31-b-v1.md")
@@ -6760,7 +7152,7 @@ def x31_r2_fixes_self_test(tmp, env):
     def c_mk(*args, code=0):
         return mk(c_data, *args, e=env, code=code)
     c_mk("run", "init", "--id", "x31c", "--feature", "C", "--branch", "bc")
-    c_mk("task", "add", "--id", "C1", "--title", "c", "--run", "x31c")
+    c_mk("task", "add", "--root", "--id", "C1", "--title", "c", "--run", "x31c")
     c_con = data_con(c_data)
     try:
         c_con.execute("UPDATE tasks SET round=1 WHERE run='x31c' AND id='C1'")
@@ -6856,7 +7248,7 @@ def migrated_store_self_test(tmp, env):
     # a real project store through mk-state itself (store enable), so the run-doc artifact and
     # every column the reader needs are present before the switch
     run(["run", "init", "--id", "r1", "--feature", "F", "--branch", "b1", *d], m, cwd=repo)
-    run(["task", "add", "--id", "P1.1", "--title", "one", "--run", "r1", *d], m, cwd=repo)
+    run(["task", "add", "--root", "--id", "P1.1", "--title", "one", "--run", "r1", *d], m, cwd=repo)
     run(["store", "enable", *d], m, cwd=repo)
     old_db = os.path.join(data, "mk.db")
     new_db = mkpaths.target_project_db("fixture", home)
@@ -6899,7 +7291,7 @@ def migrated_store_self_test(tmp, env):
     subprocess.run(["git", "init", "-q", brepo], check=False)
     bm = migrated_env(bhome)
     run(["run", "init", "--id", "b1", "--feature", "B", "--branch", "bb", "--data", bdata], bm, cwd=brepo)
-    run(["task", "add", "--id", "BT", "--title", "t", "--run", "b1", "--data", bdata], bm, cwd=brepo)
+    run(["task", "add", "--root", "--id", "BT", "--title", "t", "--run", "b1", "--data", bdata], bm, cwd=brepo)
     run(["store", "enable", "--data", bdata], bm, cwd=brepo)
     out = run(["task", "set", "BT", "status=building", "--run", "b1", "--data", bdata], bm, cwd=brepo)
     assert out["task"]["status"] == "building", out
@@ -6922,7 +7314,7 @@ def migrated_store_self_test(tmp, env):
     ce["HOME"] = chome
     os.makedirs(chome, exist_ok=True)
     run(["run", "init", "--id", "c1", "--feature", "C", "--branch", "cc", "--data", cdata], ce, cwd=crepo)
-    run(["task", "add", "--id", "CT", "--title", "t", "--run", "c1", "--data", cdata], ce, cwd=crepo)
+    run(["task", "add", "--root", "--id", "CT", "--title", "t", "--run", "c1", "--data", cdata], ce, cwd=crepo)
     run(["store", "enable", "--data", cdata], ce, cwd=crepo)
     assert run(["task", "set", "CT", "status=building", "--run", "c1", "--data", cdata],
                ce, cwd=crepo)["task"]["status"] == "building"
@@ -6937,7 +7329,7 @@ def migrated_store_self_test(tmp, env):
         f.write(b"this is not a sqlite database")
     km = migrated_env(korrupt)
     run(["run", "init", "--id", "k1", "--feature", "K", "--branch", "kk", "--data", kdata], km)
-    run(["task", "add", "--id", "KT", "--title", "t", "--run", "k1", "--data", kdata], km)
+    run(["task", "add", "--root", "--id", "KT", "--title", "t", "--run", "k1", "--data", kdata], km)
     run(["store", "enable", "--data", kdata], km)
     assert run(["task", "set", "KT", "status=building", "--run", "k1", "--data", kdata],
                km)["task"]["status"] == "building"
@@ -6958,7 +7350,7 @@ def migrated_store_self_test(tmp, env):
         old_root.close()
     om = migrated_env(ohome)
     run(["run", "init", "--id", "o1", "--feature", "O", "--branch", "oo", "--data", odata], om)
-    run(["task", "add", "--id", "OT", "--title", "t", "--run", "o1", "--data", odata], om)
+    run(["task", "add", "--root", "--id", "OT", "--title", "t", "--run", "o1", "--data", odata], om)
     run(["store", "enable", "--data", odata], om)
     assert run(["task", "set", "OT", "status=building", "--run", "o1", "--data", odata],
                om)["task"]["status"] == "building"

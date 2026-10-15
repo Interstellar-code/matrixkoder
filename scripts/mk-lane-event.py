@@ -2209,7 +2209,7 @@ def self_test():
 
         mks("run", "init", "--id", "r1", "--feature", "F", "--branch", "b")
         for tid in tasks:
-            mks("task", "add", "--id", tid, "--title", tid)
+            mks("task", "add", "--root", "--id", tid, "--title", tid)
             mks("task", "set", tid, "status=building")
 
         # L4 (C4): there is no runs/<run>/run.json or events.jsonl any more — the store's
@@ -2712,7 +2712,7 @@ def self_test():
         # an armed task that HAS children: H8 with H8C1 + H8C2
         lanes["H8"] = os.path.join(tmp, "lane-h8")
         g(repo, "worktree", "add", "-q", "--detach", lanes["H8"])
-        mks("task", "add", "--id", "H8", "--title", "H8", "--run", "r1")
+        mks("task", "add", "--root", "--id", "H8", "--title", "H8", "--run", "r1")
         mks("task", "add", "--id", "H8C1", "--title", "c1", "--parent", "H8", "--run", "r1")
         mks("task", "add", "--id", "H8C2", "--title", "c2", "--parent", "H8", "--run", "r1")
         arm("H8")
@@ -2851,7 +2851,7 @@ def self_test():
         # stays at review, real mk-state is never called, the reply says status_unchanged:true
         lanes["H_R"] = os.path.join(tmp, "lane-hr")
         g(repo, "worktree", "add", "-q", "--detach", lanes["H_R"])
-        mks("task", "add", "--id", "H_R", "--title", "rev", "--run", "r1")
+        mks("task", "add", "--root", "--id", "H_R", "--title", "rev", "--run", "r1")
         mks("task", "set", "H_R", "status=review")
         arm("H_R")
         set_canned("prompt_out.txt", '{"result": {"agent": {"agent_status": "idle"}}}\n')
@@ -3091,9 +3091,9 @@ def self_test():
         # building — tonight's two-phase lane only moved the first phase's children.
         lanes["H9"] = os.path.join(tmp, "lane-h9")
         g(repo, "worktree", "add", "-q", "--detach", lanes["H9"])
-        mks("task", "add", "--id", "H9", "--title", "g1", "--run", "r1")
+        mks("task", "add", "--root", "--id", "H9", "--title", "g1", "--run", "r1")
         mks("task", "add", "--id", "H9C1", "--title", "c1", "--parent", "H9", "--run", "r1")
-        mks("task", "add", "--id", "H10", "--title", "g2", "--run", "r1")
+        mks("task", "add", "--root", "--id", "H10", "--title", "g2", "--run", "r1")
         mks("task", "set", "H9C1", "status=building")  # H9 rolls up from its child (a parent takes no status)
         mks("task", "set", "H10", "status=building")
         r = cli("arm", "--lane", lanes["H9"], "--pane", pane_of("H9"), "--tasks", "H9,H10",
@@ -3147,7 +3147,7 @@ def self_test():
         open(bus_log, "w").write("")
         lanes["HB"] = os.path.join(tmp, "lane-hb")
         g(repo, "worktree", "add", "-q", "--detach", lanes["HB"])
-        mks("task", "add", "--id", "HB", "--title", "bus lane", "--run", "r1")
+        mks("task", "add", "--root", "--id", "HB", "--title", "bus lane", "--run", "r1")
         r = cli("arm", "--lane", lanes["HB"], "--pane", pane_of("HB"), "--task", "HB", "--run", "r1",
                 "--data", data, "--phase", "P1", "--commit-grep", "x")
         assert r["ok"] is True and r["bus"] == {"ok": True, "url": "http://127.0.0.1:9999"}, r
@@ -3161,8 +3161,8 @@ def self_test():
         open(bus_log, "w").write("")
         lanes["HG"] = os.path.join(tmp, "lane-hg")
         g(repo, "worktree", "add", "-q", "--detach", lanes["HG"])
-        mks("task", "add", "--id", "HG1", "--title", "g1", "--run", "r1")
-        mks("task", "add", "--id", "HG2", "--title", "g2", "--run", "r1")
+        mks("task", "add", "--root", "--id", "HG1", "--title", "g1", "--run", "r1")
+        mks("task", "add", "--root", "--id", "HG2", "--title", "g2", "--run", "r1")
         r = cli("arm", "--lane", lanes["HG"], "--pane", pane_of("HG"), "--tasks", "HG1,HG2",
                 "--run", "r1", "--data", data, "--phase", "P1", "--commit-grep", "x")
         assert r["ok"] is True and r["bus"]["ok"] is True and "task_pane_error" not in r, r
@@ -3180,7 +3180,7 @@ def self_test():
             assert r_.returncode == 0, r_.stdout + r_.stderr
 
         mks_in(databus, "run", "init", "--id", "r1", "--feature", "F", "--branch", "b")
-        mks_in(databus, "task", "add", "--id", "HO", "--title", "off", "--run", "r1")
+        mks_in(databus, "task", "add", "--root", "--id", "HO", "--title", "off", "--run", "r1")
         open(bus_log, "w").write("")
         lanes["HO"] = os.path.join(tmp, "lane-ho")
         g(repo, "worktree", "add", "-q", "--detach", lanes["HO"])
@@ -3225,7 +3225,7 @@ def self_test():
         assert bus_calls() == [f"revoke --lane {lanes['HB']}"], bus_calls()
         lanes["HB2"] = os.path.join(tmp, "lane-hb2")
         g(repo, "worktree", "add", "-q", "--detach", lanes["HB2"])
-        mks("task", "add", "--id", "HB2", "--title", "b2", "--run", "r1")
+        mks("task", "add", "--root", "--id", "HB2", "--title", "b2", "--run", "r1")
         r = cli("arm", "--lane", lanes["HB2"], "--pane", pane_of("HB2"), "--task", "HB2",
                 "--run", "r1", "--data", data, "--phase", "P1", "--commit-grep", "x")
         assert r["ok"] is True and r["bus"]["ok"] is True, r
@@ -3242,7 +3242,7 @@ def self_test():
         # (no file views, no `store enable` gate any more).
         assert os.path.getsize(os.path.join(data, "mk.db")) > 0
         # store-first: no lane status file, the tasks row + report artifact decide -> DONE, source=store
-        mks("task", "add", "--id", "S1", "--title", "store")
+        mks("task", "add", "--root", "--id", "S1", "--title", "store")
         mks("task", "set", "S1", "status=building")
         lanes["S1"] = os.path.join(tmp, "lane-s1")
         g(repo, "worktree", "add", "-q", "--detach", lanes["S1"])
@@ -3263,7 +3263,7 @@ def self_test():
         assert "source=store" in s1 and "source=status" not in s1, s1
         # DONE still needs the commit: a store row of verifying with a non-matching subject is
         # never DONE. decide() is what verdict_for feeds; the row comes from the store.
-        mks("task", "add", "--id", "S2", "--title", "store2")
+        mks("task", "add", "--root", "--id", "S2", "--title", "store2")
         mks("task", "set", "S2", "status=building")
         mks("task", "round", "S2", "--kind", "build")
         mks("task", "set", "S2", "status=verifying")
@@ -3275,7 +3275,7 @@ def self_test():
         assert state == "STALL" and ev[-1] == "source=pane", (state, ev)
 
         # fallback: the row is round 2, so phase S3 R1 has no row -> the status file decides
-        mks("task", "add", "--id", "S3", "--title", "fallback")
+        mks("task", "add", "--root", "--id", "S3", "--title", "fallback")
         mks("task", "set", "S3", "status=building")
         lanes["S3"] = os.path.join(tmp, "lane-s3")
         g(repo, "worktree", "add", "-q", "--detach", lanes["S3"])
@@ -3293,7 +3293,7 @@ def self_test():
         s3 = [e for e in events() if e.get("task") == "S3" and "lane-watch" in (e.get("text") or "")][-1]["text"]
         assert "source=status" in s3 and "source=store" not in s3, s3
         # sweep reads the store too: a quiet lane whose row says done is DONE, source=store
-        mks("task", "add", "--id", "S4", "--title", "sweep")
+        mks("task", "add", "--root", "--id", "S4", "--title", "sweep")
         mks("task", "set", "S4", "status=building")
         lanes["S4"] = os.path.join(tmp, "lane-s4")
         g(repo, "worktree", "add", "-q", "--detach", lanes["S4"])
@@ -3390,7 +3390,7 @@ def self_test():
             os.makedirs(_bus_dir, exist_ok=True)
             # owned: the brief written below makes `task check` require it (D1.5.4) — a briefed task
             # that owns no file is exactly what that check refuses, so the fixture declares one
-            mks("task", "add", "--id", "NB", "--title", "no brief", "--owned", "scripts/nb.py")
+            mks("task", "add", "--root", "--id", "NB", "--title", "no brief", "--owned", "scripts/nb.py")
             lanes["NB"] = os.path.join(tmp, "lane-nb")
             g(repo, "worktree", "add", "-q", "--detach", lanes["NB"])
             arm("NB")
@@ -3564,7 +3564,7 @@ def self_test():
 
         # a passing task: title + acceptance + parent set, no brief file (so owned is not
         # required), status building so the dispatch's board write has something to move
-        mks("task", "add", "--id", "DP1", "--title", "Phase one", "--run", "r1")
+        mks("task", "add", "--root", "--id", "DP1", "--title", "Phase one", "--run", "r1")
         mks("task", "add", "--id", "DOK", "--title", "ok task", "--parent", "DP1", "--run", "r1")
         mks("task", "set", "DOK", "status=building")
         # the store is on here, so `task check` reads the tasks row: plant the acceptance the
@@ -3696,7 +3696,7 @@ def self_test():
         # (g) a group lane (--tasks): the route write lands on EVERY listed task, and the
         # check runs on the lead task only
         mks("task", "add", "--id", "DG1", "--title", "g1", "--parent", "DP1", "--run", "r1")
-        mks("task", "add", "--id", "DG2", "--title", "g2", "--run", "r1")
+        mks("task", "add", "--root", "--id", "DG2", "--title", "g2", "--run", "r1")
         mks("task", "round", "DG1", "--kind", "build")
         for tid in ("DG1", "DG2"):
             # the store is the read source: plant the acceptance the way `mk-plan approve`
@@ -3763,7 +3763,7 @@ def self_test():
         # (D7B.2) review-handoff. The bus is the fake, so "sent" is the recorded argv.
         rev_dir = os.path.join(data, "runs", "r1", "tasks", "RH")
         os.makedirs(rev_dir, exist_ok=True)
-        mks("task", "add", "--id", "RH", "--title", "handoff")
+        mks("task", "add", "--root", "--id", "RH", "--title", "handoff")
         mks("task", "round", "RH", "--kind", "build")
         open(os.path.join(rev_dir, "review-r1.md"), "w").write(
             "# RH review — REQUEST CHANGES\n\n## HIGH\n"
@@ -3784,7 +3784,7 @@ def self_test():
         _bc = _iu.module_from_spec(_spec)
         _spec.loader.exec_module(_bc)
         assert _bc.placeholder_failures(brief) == [], _bc.placeholder_failures(brief)
-        mks("task", "add", "--id", "RN", "--title", "no previous brief")
+        mks("task", "add", "--root", "--id", "RN", "--title", "no previous brief")
         no_prev = filled_brief(data, "r1", "RN", 2, os.path.join(rev_dir, "review-r1.md"), "1. [HIGH] a:1 — p — f")
         assert _bc.placeholder_failures(no_prev) == [], _bc.placeholder_failures(no_prev)
         assert "Co-Authored-By: <" not in no_prev, no_prev
@@ -3793,7 +3793,7 @@ def self_test():
         assert joined.startswith("send ") and "--from orch" in joined and "--kind info" in joined \
             and "kind:brief" in joined, bcalls
         # APPROVE records the verdict and dispatches nothing
-        mks("task", "add", "--id", "RA", "--title", "approve")
+        mks("task", "add", "--root", "--id", "RA", "--title", "approve")
         mks("task", "round", "RA", "--kind", "build")
         ad = os.path.join(data, "runs", "r1", "tasks", "RA")
         os.makedirs(ad, exist_ok=True)
@@ -3803,7 +3803,7 @@ def self_test():
         assert r["ok"] is True and r["verdict"] == "APPROVE" and r["dispatched"] is False, r
         assert bus_calls() == [], bus_calls()
         # --hold records the veto text and does not send the wake
-        mks("task", "add", "--id", "HH", "--title", "hold")
+        mks("task", "add", "--root", "--id", "HH", "--title", "hold")
         mks("task", "round", "HH", "--kind", "build")
         hd = os.path.join(data, "runs", "r1", "tasks", "HH")
         os.makedirs(hd, exist_ok=True)
@@ -3822,7 +3822,7 @@ def self_test():
         r = cli("review-handoff", "--task", "RH", "--run", "r1", "--data", data)
         assert r["ok"] is True and r["dispatched"] is False and r["reason"] == "already handed off", r
         # a review with no parseable findings is held, not opened
-        mks("task", "add", "--id", "RZ", "--title", "empty")
+        mks("task", "add", "--root", "--id", "RZ", "--title", "empty")
         mks("task", "round", "RZ", "--kind", "build")
         zd = os.path.join(data, "runs", "r1", "tasks", "RZ")
         os.makedirs(zd, exist_ok=True)
@@ -3836,7 +3836,7 @@ def self_test():
         got = review_findings("## HIGH\n- a:1 — p —\n  the rest of it\n")
         assert got == [{"severity": "HIGH", "text": "a:1 — p — the rest of it"}], got
         # E3: the review lives in the lane, not the task folder. It is copied in and used.
-        mks("task", "add", "--id", "RL", "--title", "lane review")
+        mks("task", "add", "--root", "--id", "RL", "--title", "lane review")
         mks("task", "round", "RL", "--kind", "build")
         lane_rl = os.path.join(tmp, "lane-rl")
         os.makedirs(lane_rl, exist_ok=True)
@@ -3857,7 +3857,7 @@ def self_test():
         block = commands_block_of(open(prev).read())
         assert block.startswith("## Commands") and "`B start`" in block, block
         # a task with neither names both places
-        mks("task", "add", "--id", "RM", "--title", "missing review")
+        mks("task", "add", "--root", "--id", "RM", "--title", "missing review")
         mks("task", "round", "RM", "--kind", "build")
         r = cli("review-handoff", "--task", "RM", "--run", "r1", "--data", data, code=2)
         assert r["ok"] is False and "review-rN.md" in r["error"] and "RM" in r["error"], r
@@ -3876,7 +3876,7 @@ def self_test():
             assert r.returncode == 0, r.stdout + r.stderr
 
         mkd("run", "init", "--id", "r1", "--feature", "DB", "--branch", "b")
-        mkd("task", "add", "--id", "DB", "--title", "db reads")
+        mkd("task", "add", "--root", "--id", "DB", "--title", "db reads")
         mkd("task", "add", "--id", "DB.1", "--title", "db child", "--parent", "DB")
         mkd("store", "enable")
         s_home = os.path.join(ddata, ".mk-home")   # mk-state's own store home for this data dir
@@ -3903,7 +3903,7 @@ def self_test():
         open(os.path.join(db_dir, "brief-r1.md"), "w").write("# file brief\nfallback\n")
         got_text, got_n = brief_body_for(ddata, "r1", "DB")
         assert got_n == 1 and "from the store" in got_text, "the DB must still win"
-        mkd("task", "add", "--id", "FB", "--title", "fallback")
+        mkd("task", "add", "--root", "--id", "FB", "--title", "fallback")
         fb_dir = os.path.join(ddata, "runs", "r1", "tasks", "FB")
         os.makedirs(fb_dir, exist_ok=True)
         open(os.path.join(fb_dir, "brief-r2.md"), "w").write("# file brief only\n")
@@ -4010,7 +4010,7 @@ def self_test():
 
         # (todo 114) the store holds round 1's review; the lane has a NEWER round 2. The
         # round-2 review must win — the bug returned round 1 and reported "already handed off".
-        mkx("task", "add", "--id", "R14", "--title", "round wins")
+        mkx("task", "add", "--root", "--id", "R14", "--title", "round wins")
         mkx("task", "round", "R14", "--kind", "build")
         s_home14 = os.path.join(xdata, ".mk-home")
         _c = mkdb.open_project(s_home14, "matrixkoder", data_dir=xdata)
@@ -4049,8 +4049,8 @@ def self_test():
         # (todo 130a) mark_armed_building never demotes a merged/done/qa task. H31 is merged
         # in the store; H32 is building. Both are armed on one lane; a delivered dispatch may
         # only move H32.
-        mkx("task", "add", "--id", "H31", "--title", "finished")
-        mkx("task", "add", "--id", "H32", "--title", "open")
+        mkx("task", "add", "--root", "--id", "H31", "--title", "finished")
+        mkx("task", "add", "--root", "--id", "H32", "--title", "open")
         mkx("task", "set", "H31", "status=merged")
         mkx("task", "set", "H32", "status=building")
         lane31 = os.path.join(tmp, "lane-h31")
