@@ -4042,7 +4042,7 @@ def self_test():
         assert review_acceptance(tmpl) == [], "the template's placeholder row is not a verdict"
         assert review_acceptance("# t\n\n## HIGH\n- a\n") == []
         # APPROVE with an UNVERIFIED row -> no_evidence; the table is present, so no flag
-        mks("task", "add", "--id", "F4A", "--title", "approve unverified")
+        mks("task", "add", "--root", "--id", "F4A", "--title", "approve unverified")
         mks("task", "round", "F4A", "--kind", "build")
         fd = os.path.join(data, "runs", "r1", "tasks", "F4A")
         os.makedirs(fd, exist_ok=True)
@@ -4055,7 +4055,7 @@ def self_test():
         cli("review-handoff", "--task", "F4A", "--run", "r1", "--data", data)
         assert len(reasons("F4A")) == 1, reasons("F4A")
         # APPROVE, every row MET, a MEDIUM listed: medium_parked only
-        mks("task", "add", "--id", "F4B", "--title", "approve met")
+        mks("task", "add", "--root", "--id", "F4B", "--title", "approve met")
         mks("task", "round", "F4B", "--kind", "build")
         fd = os.path.join(data, "runs", "r1", "tasks", "F4B")
         os.makedirs(fd, exist_ok=True)
@@ -4066,7 +4066,7 @@ def self_test():
         assert r["risk_opened"] == ["medium_parked"], r
         assert [x[0] for x in reasons("F4B")] == ["medium_parked"], reasons("F4B")
         # REQUEST CHANGES, --min high: review_changes + the parked MEDIUM; the fix brief shows risk + gates
-        mks("task", "add", "--id", "F4C", "--title", "changes")
+        mks("task", "add", "--root", "--id", "F4C", "--title", "changes")
         mks("task", "round", "F4C", "--kind", "build")
         fd = os.path.join(data, "runs", "r1", "tasks", "F4C")
         os.makedirs(fd, exist_ok=True)
@@ -4090,7 +4090,7 @@ def self_test():
         assert branch_files(crepo) == {"tests/a_test.py"}, branch_files(crepo)
         rep = "Added `tests/a_test.py` and a new `tests/b_test.py`; ran `tests/old_test.py` unchanged.\n"
         assert claimed_tests(rep) == ["tests/a_test.py", "tests/b_test.py"], claimed_tests(rep)
-        mks("task", "add", "--id", "F4D", "--title", "claims")
+        mks("task", "add", "--root", "--id", "F4D", "--title", "claims")
         mks("task", "round", "F4D", "--kind", "build")
         open(os.path.join(crepo, ".matrixkoder-report-r1.md"), "w").write(rep)
         w4 = {"data": data, "run": "r1", "task": "F4D", "lane": crepo, "report": ".matrixkoder-report-r1.md"}
@@ -4100,7 +4100,7 @@ def self_test():
         # F.4 R2: bare-basename and path-suffix claims match; the round comes from report-rN.md
         assert claim_in("b_test.py", {"tests/b_test.py"}) and claim_in("tests/b_test.py", {"x/tests/b_test.py"})
         assert not claim_in("c_test.py", {"tests/b_test.py"})
-        mks("task", "add", "--id", "F4F", "--title", "round name")
+        mks("task", "add", "--root", "--id", "F4F", "--title", "round name")
         mks("task", "round", "F4F", "--kind", "build")
         open(os.path.join(crepo, ".matrixkoder-report-r2.md"), "w").write("Added `tests/zz_test.py`.\n")
         assert ingest_report(dict(w4, task="F4F", report=".matrixkoder-report-r2.md")) == ["tests/zz_test.py"]
@@ -4113,7 +4113,7 @@ def self_test():
         finally:
             globals()["branch_files"] = _bf
         # a report whose claimed tests are all in the diff opens nothing
-        mks("task", "add", "--id", "F4E", "--title", "honest")
+        mks("task", "add", "--root", "--id", "F4E", "--title", "honest")
         mks("task", "round", "F4E", "--kind", "build")
         open(os.path.join(crepo, ".matrixkoder-report-r1.md"), "w").write("Added `tests/a_test.py`.\n")
         assert ingest_report(dict(w4, task="F4E")) == [] and reasons("F4E") == []
