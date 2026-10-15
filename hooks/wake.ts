@@ -321,11 +321,29 @@ async function flushBatch($: EngineInterface): Promise<void> {
   await $.state.set(pendingRef, EMPTY_PENDING).catch(() => {})
 }
 
-/** mk.db present (a regular file) → store mode, cursor is events.id. Absent → file mode.
- *  `$.fs.stat` rejects ENOENT, which is absence. A stat that resolves to something other
- *  than a file (or a read of a present mk.db that fails) is unreadable: the caller skips
- *  the tick rather than guessing the cursor unit. */
-async function storeMode($: EngineInterface, dataDir: string): Promise<'store' | 'file' | 'skip'> {
+/** `mkdb.py run-snapshot` already says whether the store is there (`store`, L5 R2), and it is the
+ *  store that decides the cursor unit: store mode counts events.id, file mode a line. Wake
+ *  already spawns this reader every tick to pick the active run, so the mode comes off that SAME
+ *  reply — no extra process, and no dependence on the literal `<dataDir>/mk.db`, which on a
+ *  migrated project is the frozen pre-switch copy that `mk--archive` removes (todo 123).
+ *
+ *  undefined when the reader could not answer (a refused spawn, a non-zero exit, a payload with
+ *  no runs). The caller then keeps today's file probe, so a pre-migration project with no python
+ *  still falls back to events.jsonl exactly as before. */
+type StoreProbe = { store: boolean; activeId: string | null | undefined }
+
+/** Store vs file mode for a tick. `probe` is the tick's one run-snapshot read: its `store` key
+ *  answers directly (`true` → store mode, `false` → file mode, including a migrated project
+ *  whose legacy `<dataDir>/mk.db` is gone). Only when the reader could not answer does the
+ *  legacy `<dataDir>/mk.db` probe decide: a present regular file → store mode; a present path
+ *  that is not a file → 'skip' (unreadable: the caller must not guess the cursor unit); absent →
+ *  file mode. */
+async function storeMode(
+  $: EngineInterface,
+  dataDir: string,
+  probe: StoreProbe | undefined,
+): Promise<'store' | 'file' | 'skip'> {
+  if (probe !== undefined) return probe.store ? 'store' : 'file'
   try {
     const st = await $.fs.stat(paths.projectDb(dataDir))
     return st.kind === 'file' ? 'store' : 'skip'
@@ -407,20 +425,19 @@ async function readFileEvents($: EngineInterface, eventsPath: string): Promise<W
   return out
 }
 
-/** The active run id, from the project store (C4/L5) with the runs index as the FALLBACK.
- *
- *  null means the store could not answer (a pre-migration project with no store, or a refused
- *  spawn) and the retired `<data>/runs/index.json` is read instead; a store that answers with
- *  no active run is not null, it is the end of the poll.
+/** The store's one run-snapshot read for a tick: its `store` key (store mode vs file mode) and
+ *  the active run it names (or null: end of the poll). undefined when the reader could not answer
+ *  — a pre-migration project with no store, a refused spawn, a non-zero exit, or a payload with
+ *  no `runs` array. The caller then reads the retired `<data>/runs/index.json` for the run and
+ *  keeps today's `<data>/mk.db` stat for the mode.
  *
  *  `store: false` is how the reader says the store is MISSING: without it, its no-store reply
- *  (`{ok: true, store: false, runs: []}`) reads as a store with no active run and the index
- *  fallback never runs.
+ *  (`{ok: true, store: false, runs: []}`) is indistinguishable from a store with no active run.
  *
  *  The pick stays the index file's: the FIRST active entry in a list ordered by `started`
  *  ascending, i.e. the OLDEST active run. The reader's own `active` field is the NEWEST one
  *  (the dashboard's pick), which would move wake onto a different run of a busy project. */
-async function activeRunId($: EngineInterface, dataDir: string): Promise<string | null | undefined> {
+async function storeProbe($: EngineInterface, dataDir: string): Promise<StoreProbe | undefined> {
   let ran: { exitCode: number; stdout: string }
   try {
     ran = await $.process.run(
@@ -435,12 +452,17 @@ async function activeRunId($: EngineInterface, dataDir: string): Promise<string 
   if (doc === null || typeof doc !== 'object' || !Array.isArray(doc.runs)) {
     return undefined
   }
-  if (doc.store === false) return undefined // no store: the index file answers
+  // The reader always marks the reply (store true/false). Anything else is not an answer this
+  // reader can use, so the caller keeps the file probe rather than reading the marker as false.
+  if (doc.store !== true && doc.store !== false) return undefined
   const list = (doc as { runs: unknown[] }).runs
   const first = list.find(r =>
     r !== null && typeof r === 'object' && (r as { status?: unknown }).status === 'active'
     && typeof (r as { id?: unknown }).id === 'string')
-  return first === undefined ? null : (first as { id: string }).id
+  // store: false → no store file at all: the index file names the run (activeId undefined).
+  // store: true  → the reader answered; an empty list is the end of the poll (activeId null).
+  if (doc.store === false) return { store: false, activeId: undefined }
+  return { store: true, activeId: first === undefined ? null : (first as { id: string }).id }
 }
 
 /** FALLBACK (C4/L5): the retired `<data>/runs/index.json`, first active entry. */
@@ -456,8 +478,12 @@ async function activeRunIdFromFiles($: EngineInterface, dataDir: string): Promis
 async function pollEvents($: EngineInterface): Promise<void> {
   try {
     const dataDir = await wakeDataDir($)
-    const fromStore = await activeRunId($, dataDir)
-    const activeId = fromStore === undefined ? await activeRunIdFromFiles($, dataDir) : fromStore
+    const probe = await storeProbe($, dataDir)
+    // Store mode: the store named the run (null = no active run, the end of the poll). File mode
+    // (store:false, or a reader that could not answer): the retired index file names it.
+    const activeId = probe !== undefined && probe.store
+      ? probe.activeId
+      : await activeRunIdFromFiles($, dataDir)
     const active = activeId == null ? undefined : { id: activeId }
     // a batch found before a reload (or a held/failed submit) is still owed, but only to the run that is still active
     const owed = await readPending($)
@@ -470,7 +496,7 @@ async function pollEvents($: EngineInterface): Promise<void> {
     }
     if (!active?.id) return
 
-    const mode = await storeMode($, dataDir)
+    const mode = await storeMode($, dataDir, probe)
     if (mode === 'skip') return // mk.db is there but not a readable file: do not guess the cursor unit
     const eventsPath = paths.eventsDoc(dataDir, active.id)
     // Store mode never falls through to the file view: a failed read skips the tick so a
