@@ -116,6 +116,7 @@ export function PlanTaskPanel(els: Els, row: PlanTask, cols: number, onClose?: (
       {route?.model != null && fieldRow(els, 'model', route.model)}
       {route?.effort != null && fieldRow(els, 'effort', route.effort)}
       {row.updated != null && fieldRow(els, 'updated', row.updated)}
+      {row.deps != null && row.deps.length > 0 && fieldRow(els, 'deps', row.deps.join(' '))}
       {owned.length > 0 && (
         <Box flexDirection="column">
           <Text dimColor={true}>owned</Text>

@@ -43,8 +43,9 @@ export type PlanRow = {
   readonly counts: {
     readonly tasks: number
     readonly phases: number
-    /** per-status tally from the overview's `counts` column (e.g. { merged: 53, building: 2, planned: 30 }) */
-    readonly byStatus: Readonly<Record<string, number>>
+    /** per-status tally from the overview's `counts` column (e.g. { merged: 53,
+     *  building: 2, planned: 30 }); a bare row may carry none */
+    readonly byStatus?: Readonly<Record<string, number>>
   }
   /** the owning project slug, when the source named one (the root overview's `plan_summary.project`) */
   readonly project?: string

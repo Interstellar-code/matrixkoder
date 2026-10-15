@@ -125,20 +125,25 @@ function sumCounts(counts: unknown): number {
   return total
 }
 /** Map a task status to its run-card bucket: done / live / planned. Shared with
- *  the run-card counts and the plan-row per-status tally. */
+ *  the run-card counts and the plan-row per-status tally. ready and parked are
+ *  still-to-start work; the stalled/quota/provider/rework/takeover states are
+ *  live — a run needs the user. A status not in the table lands in planned:
+ *  every task counts, nothing is dropped. */
 const STATUS_BUCKET: Record<string, 'done' | 'live' | 'planned'> = {
   merged: 'done', done: 'done',
   dispatched: 'live', building: 'live', verifying: 'live', review: 'live', fix: 'live', qa: 'live',
-  planned: 'planned', routed: 'planned',
+  blocked: 'live', stalled: 'live', quota: 'live', provider: 'live', rework: 'live', takeover: 'live',
+  planned: 'planned', routed: 'planned', ready: 'planned', parked: 'planned',
 }
 
-/** Sum the per-status counts into the run-card bucket totals. */
+/** Sum the per-status counts into the run-card bucket totals. A status not in
+ *  STATUS_BUCKET lands in planned: every task counts. */
 function bucketCounts(counts: unknown): { done: number; live: number; planned: number } {
   const out = { done: 0, live: 0, planned: 0 }
   if (typeof counts !== 'object' || counts === null) return out
   for (const [status, n] of Object.entries(counts)) {
-    const bucket = STATUS_BUCKET[status]
-    if (bucket != null && typeof n === 'number') out[bucket] += n
+    if (typeof n !== 'number') continue
+    out[STATUS_BUCKET[status] ?? 'planned'] += n
   }
   return out
 }
@@ -255,8 +260,10 @@ export function plansFromReply(reply: unknown): { plans: PlanRow[]; runs: RunRow
  * rows whose `project` slug belongs to that store are kept. The slug set follows
  * `projects`: every root row sharing the active store directory (a migrated row's
  * `db_path` folder, a pre-migration row's `data_dir`), so the live legacy alias
- * is accepted too. An empty `activeDir`, or one no root row matches, keeps every
- * row — the previous behavior, never a blank list.
+ * is accepted too. An empty (or absent) `activeDir` keeps every row — the
+ * previous behavior; so does an overview whose `projects` lists nothing (a
+ * pre-projects root). A non-empty `activeDir` and projects list that match
+ * nothing keep none: the dir cannot name this store (Z20).
  */
 export function plansFromOverview(reply: unknown, activeDir?: string | null): { plans: PlanRow[]; runs: RunRow[] } {
   const plans: PlanRow[] = []
@@ -294,12 +301,16 @@ export function plansFromOverview(reply: unknown, activeDir?: string | null): { 
   return { plans, runs }
 }
 
-/** The slugs of the root rows that name the active store dir (L7.2 R2). null when
- *  there is nothing to filter by — an empty `activeDir`, a reply with no `projects`,
- *  or a dir no row matches — and the caller then keeps every row. */
+/** The slugs of the root rows that name the active store dir (L7.2 R2; Z20).
+ *  null when there is nothing to filter by — an empty (or absent) activeDir,
+ *  or a reply whose `projects` is empty or missing (a pre-projects root has
+ *  listed nothing yet: no filter). A NON-EMPTY projects list that matches no
+ *  row is the leak case: a dir that is not on the root can never name this
+ *  store, so the EMPTY set stands and the caller keeps no row. */
 function activeSlugs(reply: Record<string, unknown>, activeDir: string | null | undefined): Set<string> | null {
   const dir = typeof activeDir === 'string' ? activeDir.trim() : ''
-  if (dir === '' || !Array.isArray(reply.projects)) return null
+  if (dir === '') return null
+  if (!Array.isArray(reply.projects) || reply.projects.length === 0) return null
   const out = new Set<string>()
   for (const raw of reply.projects) {
     if (!isRecord(raw)) continue
@@ -312,7 +323,7 @@ function activeSlugs(reply: Record<string, unknown>, activeDir: string | null | 
     const slug = str(raw.slug)
     if (slug !== '') out.add(slug)
   }
-  return out.size > 0 ? out : null
+  return out
 }
 
 
