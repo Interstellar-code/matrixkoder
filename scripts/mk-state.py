@@ -5568,7 +5568,8 @@ def x31_r2_fixes_self_test(tmp, env):
     b_data = os.path.join(tmp, "x31-dup")
     mk(b_data, "run", "init", "--id", "x31b", "--feature", "B", "--branch", "bb", e=env)
     mk(b_data, "task", "add", "--id", "B", "--title", "dup", "--run", "x31b", e=env)
-    b2_mk = lambda *args, code=0: mk(b_data, *args, e=env, code=code)
+    def b2_mk(*args, code=0):
+        return mk(b_data, *args, e=env, code=code)
     v1 = os.path.join(tmp, "x31-b-v1.md")
     with open(v1, "w") as f:
         f.write("dup brief v1\n")
@@ -5602,7 +5603,8 @@ def x31_r2_fixes_self_test(tmp, env):
     # FAILS on 96fdbc3 (duplicate import, like (b)) and on any rev where the ingest src
     # changed per commit.
     c_data = os.path.join(tmp, "x31-file-ingest")
-    c_mk = lambda *args, code=0: mk(c_data, *args, e=env, code=code)
+    def c_mk(*args, code=0):
+        return mk(c_data, *args, e=env, code=code)
     c_mk("run", "init", "--id", "x31c", "--feature", "C", "--branch", "bc")
     c_mk("task", "add", "--id", "C1", "--title", "c", "--run", "x31c")
     c_con = data_con(c_data)
