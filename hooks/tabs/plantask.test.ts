@@ -109,8 +109,8 @@ const FULL: PlanTask = {
   type: 'task', round: 1, verdict: 'approve',
   slot: 5, pane: 'mk-5', branch: 'mk/settings-plans-db-r1/d1.5',
   updated: '2026-10-14T11:20:00+02:00', acceptance: 'plans --json carries route for every dispatched task',
-  owned: ['D1.1', 'D1.2', 'D1.3', 'D1.4', 'V1.1', 'V1.2', 'V1.3', 'V1.4', 'S1.1', 'S1.2'],
-  deps: ['D1.4'],
+  owned: ['D1.1', 'D1.2', 'D1.3', 'D1.5', 'V1.1', 'V1.2', 'V1.3', 'V1.4', 'S1.1', 'S1.2'],
+  deps: ['D0.9'],
   route: { agent: 'opencode', model: 'opencode/space-bunny-free', effort: 'medium' },
   subs: [
     { id: 'D1.5a', title: 'write route at dispatch', status: 'done', right: 'done' },
@@ -132,7 +132,8 @@ test('the panel draws every present field', () => {
   expect(text80).toContain('opencode/space-bunny-free')
   expect(text80).toContain('medium')
   expect(text80).toContain('2026-10-14T11:20:00+02:00')
-  expect(text80).toContain('D1.4') // deps
+  expect(text80).toContain('deps') // the deps kv row's own label
+  expect(text80).toContain('D0.9') // a deps-only id — owned never names it
   expect(text80).toContain('acceptance')
   expect(text80).toContain('plans --json carries route for every dispatched task')
   expect(text80).toContain('subtasks')
@@ -159,6 +160,13 @@ test('a missing field is left out — no null text', () => {
   expect(t).not.toContain('acceptance')
   expect(t).not.toContain('subtasks')
   expect(t).toContain('esc close')
+  // deps, explicitly: null and [] both render nothing — no id, no label
+  const tFull = allText(PlanTaskPanel(stubEls(), { ...FULL, deps: undefined }, 80))
+  expect(tFull).not.toContain('deps')
+  expect(tFull).not.toContain('D0.9')
+  const tEmpty = allText(PlanTaskPanel(stubEls(), { ...FULL, deps: [] }, 80))
+  expect(tEmpty).not.toContain('deps')
+  expect(tEmpty).not.toContain('D0.9')
 })
 
 test('owned caps at 8 lines with +n more', () => {

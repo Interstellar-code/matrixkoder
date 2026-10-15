@@ -150,11 +150,35 @@ test('plansFromOverview keeps only the active project\'s plans', () => {
   expect(other.plans.map(p => p.id)).toEqual(['beta-plan'])
 })
 
-test('plansFromOverview keeps all plans when the active dir matches no root row', () => {
-  const mapped = plansFromOverview(TWO_PROJECTS, '/home/mk/projects/gamma')
-  expect(mapped.plans.map(p => p.id)).toEqual(['alpha-plan', 'beta-plan'])
-  // an empty activeDir is the no-filter case too
-  expect(plansFromOverview(TWO_PROJECTS, '').plans.map(p => p.id)).toEqual(['alpha-plan', 'beta-plan'])
+test('Z20.4a: an empty or missing activeDir keeps every plan (null, not an empty filter)', () => {
+  expect(plansFromOverview(TWO_PROJECTS, null).plans.map(p => p.id)).toEqual(['alpha-plan', 'beta-plan'])
+  // a reply whose projects lists nothing is a pre-projects root: no filter
+  const noProjects = { ok: true, projects: [], plans: [{ project: 'alpha', plan: 'alpha-plan', title: 'A', status: 'running', counts: {} }] }
+  expect(plansFromOverview(noProjects, '/home/mk/projects/alpha').plans.map(p => p.id)).toEqual(['alpha-plan'])
+})
+
+test('Z20.4b: a non-empty dir matching no project row empties the list, never keeps all', () => {
+  // The old activeSlugs returned null here (0 matching rows), so the caller
+  // kept FOREIGN plans in this project's List. The empty set stays a set and
+  // the caller's `!wanted.has(project)` drops every row.
+  const mismatched = plansFromOverview(TWO_PROJECTS, '/home/mk/projects/gamma')
+  expect(mismatched.plans).toEqual([])
+  expect(mismatched.runs).toEqual([])
+  // the pre-migration data_dir shape mismatches the same way
+  const legacy = {
+    ok: true,
+    projects: [
+      { slug: 'alpha', repo: '/srv/alpha', data_dir: '/data/alpha' },
+      { slug: 'beta', repo: '/srv/beta', data_dir: '/data/beta' },
+    ],
+    plans: [
+      { project: 'alpha', plan: 'alpha-plan', title: 'Alpha plan', status: 'running', counts: {} },
+      { project: 'beta', plan: 'beta-plan', title: 'Beta plan', status: 'draft', counts: {} },
+    ],
+  }
+  expect(plansFromOverview(legacy, '/data/gamma').plans).toEqual([])
+  // a whitespace-only dir trims to '' and is the null case, not an empty filter
+  expect(plansFromOverview(TWO_PROJECTS, '   ').plans.map(p => p.id)).toEqual(['alpha-plan', 'beta-plan'])
 })
 
 test('plansFromOverview accepts an alias row sharing the active store', () => {
@@ -209,9 +233,9 @@ test('Z18.2: plan rows carry per-status counts', () => {
   const { plans } = plansFromOverview(LIVE, MATRIXKODER_DIR)
   const storage = plans.find(p => p.id === 'storage-layout')
   expect(storage).toBeDefined()
-  expect(storage!.counts.byStatus.merged).toBe(53)
-  expect(storage!.counts.byStatus.building).toBe(2)
-  expect(storage!.counts.byStatus.planned).toBe(30)
+  expect(storage?.counts.byStatus?.merged).toBe(53)
+  expect(storage?.counts.byStatus?.building).toBe(2)
+  expect(storage?.counts.byStatus?.planned).toBe(30)
 })
 
 test('Z18.3: branch-selection absent from matrixkoder list, matrixkoder plans present', () => {
@@ -275,4 +299,45 @@ test('F.8: a task row with none of the three keys maps WITHOUT them — undefine
   expect('risk' in (calm ?? {})).toBe(false)
   expect('critical' in (calm ?? {})).toBe(false)
   expect('openReasons' in (calm ?? {})).toBe(false)
+})
+
+/** ── Z20: the run-card buckets lose no task ─────────────────────────────
+ *  Z18's bucket table dropped every status it did not list (a counts map
+ *  with ready/quota/etc. under-counted the run cards). ready and parked are
+ *  planned, the needs-you statuses are live, and any status not in the
+ *  table lands in planned — done+live+planned then equals the task total.
+ */
+
+const Z20_COUNTS = { merged: 3, ready: 4, blocked: 2, rework: 1, finishing: 2 } // 12 tasks
+
+test('Z20.5: the run-card buckets keep every task — ready/helpless/unknown all count', () => {
+  const { runs } = plansFromReply({
+    ok: true,
+    plans: [{ id: 'p', title: 'T', status: 'running', created: '', runs: ['p-r1'], live_run: 'p-r1', counts: Z20_COUNTS }],
+  })
+  expect(runs).toHaveLength(1)
+  expect(runs[0]?.counts).toEqual({ done: 3, live: 3, planned: 6 })
+  // nothing dropped: the buckets sum to the task total
+  const c = runs[0]!.counts
+  expect(c.done + c.live + c.planned).toBe(12)
+})
+
+test('Z20.5: the same totals come through the overview mapping', () => {
+  const { runs } = plansFromOverview({
+    ok: true,
+    projects: [{ slug: 'alpha', repo: '/srv/alpha', db_path: '/home/mk/projects/alpha/mk.db' }],
+    plans: [{ project: 'alpha', plan: 'p', title: 'T', status: 'running', counts: Z20_COUNTS, live_run: 'p-r1', stage: 's' }],
+  })
+  expect(runs).toHaveLength(1)
+  const c = runs[0]!.counts
+  expect(c.done).toBe(3)
+  expect(c.live).toBe(3)
+  expect(c.planned).toBe(6)
+  expect(c.done + c.live + c.planned).toBe(12)
+})
+
+test('Z20.5: the plan row tally still shows the raw statuses', () => {
+  const { plans } = plansFromReply({ ok: true, plans: [{ id: 'p', title: 'T', status: 'running', created: '', runs: [], live_run: null, counts: Z20_COUNTS }] })
+  expect(plans[0]?.counts.byStatus).toEqual(Z20_COUNTS)
+  expect(plans[0]?.counts.tasks).toBe(12)
 })

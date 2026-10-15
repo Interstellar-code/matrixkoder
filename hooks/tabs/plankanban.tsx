@@ -99,16 +99,6 @@ export function planKanbanView(detail: unknown, nowIso = ''): PlanKanbanView {
       if (!isRecord(task) || typeof task.id !== 'string') continue
       const status = str(task.status)
       if (status !== '' && !(status in STATUS_TO_COLUMN) && !unknownStatuses.includes(status)) unknownStatuses.push(status)
-      const riskRaw = 'risk' in task ? task.risk : undefined
-      const risk = typeof riskRaw === 'number' && Number.isInteger(riskRaw) && riskRaw >= 1 && riskRaw <= 5
-        ? riskRaw : undefined
-      const critical = 'critical' in task && task.critical === true ? true : undefined
-      const reasonsRaw = 'open_reasons' in task ? task.open_reasons : undefined
-      const openReasons = Array.isArray(reasonsRaw)
-        ? reasonsRaw.filter((r): r is { kind: string; points: number; source: string; opened: string } =>
-            isRecord(r) && typeof r.kind === 'string' && typeof r.points === 'number' &&
-            typeof r.source === 'string' && typeof r.opened === 'string')
-        : []
       const verdictRaw = str(task.verdict)
       cards.push({
         id: task.id,
@@ -117,10 +107,9 @@ export function planKanbanView(detail: unknown, nowIso = ''): PlanKanbanView {
         phase: raw.id,
         verdict: verdictRaw === '' ? null : verdictRaw,
         age: ageOf(str(task.updated), nowIso),
+        // routeFields already maps risk (1-5), critical and open_reasons —
+        // an old row out of the range or without them maps to absent.
         ...routeFields(task),
-        ...(risk !== undefined ? { risk } : {}),
-        ...(critical !== undefined ? { critical } : {}),
-        ...(openReasons.length > 0 ? { openReasons } : {}),
       })
     }
   }
