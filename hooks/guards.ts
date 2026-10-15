@@ -244,6 +244,21 @@ function gitBan(ws: readonly string[]): Ban | undefined {
   return undefined
 }
 
+const MKDB = /(^|\/)mk\.db(\?|$)/
+// ponytail: keyword scan, so a SELECT that quotes "update" is denied too; add -readonly. Upgrade if it bites.
+const SQL_WRITE = /\b(insert|update|delete|drop|alter|create|reindex|replace\s+into)\b|\bvacuum\s+into\s+\S*mk\.db|^\s*\.(import|restore)\b/i
+
+/** Raw `sqlite3` that may write an mk.db. Read-only (`-readonly`, `mode=ro`) and `VACUUM INTO <tmp>` pass; SQL fed by
+ * stdin cannot be seen, so a bare `sqlite3 mk.db` is denied. */
+function sqliteBan(ws: readonly string[]): Ban | undefined {
+  if (base(ws[0] ?? '') !== 'sqlite3') return undefined
+  const args = ws.slice(1)
+  if (!args.some(w => MKDB.test(w.replace(/^file:/, ''))) || args.some(w => /^--?readonly$/.test(w) || /mode=ro\b/.test(w))) return undefined
+  const sql = args.filter(w => !w.startsWith('-') && !MKDB.test(w.replace(/^file:/, '')))
+  if (sql.length && !args.some(w => w.startsWith('<')) && !sql.some(w => SQL_WRITE.test(w))) return undefined
+  return { cmd: 'sqlite3 write to mk.db', why: 'use mk-state / mkdb.py, or sqlite3 -readonly' }
+}
+
 /** A command's short flag letters, other flags and positional words; rm's -R/--recursive/--force fold to r/f. */
 function shape(ws: readonly string[]) {
   const rm = base(ws[0] ?? '') === 'rm'
@@ -285,7 +300,7 @@ function check(command: string, banned: readonly string[], depth = 0): Ban | und
   const subs: string[] = []
   for (const raw of tokenize(command, subs)) {
     const ws = stripPrefixes(raw)
-    const ban = gitBan(ws) ?? bannedHit(ws, banned)
+    const ban = gitBan(ws) ?? sqliteBan(ws) ?? bannedHit(ws, banned)
     if (ban) return ban
     const inner = depth < MAX_DEPTH ? innerScript(ws) : undefined
     const nested = inner === undefined ? undefined : check(inner, banned, depth + 1)
