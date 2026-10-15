@@ -875,28 +875,39 @@ class Store:
                 "extra_json": extras_json(self.run_extras(run))}
 
     def _round_artifacts(self, run, t):
-        """brief/report/review of the task's current round FROM the store (C4). `task brief`
-        authors the brief (put_artifact replaces by rev+1); a bus report/review lands the
-        same way (X2). One dict per kind that has a row — none when the round has no artifact."""
-        n = t.get("round") or 0
+        """brief/report/review of the task's current round — ingest list for import_history.
+
+        The store, when it has the artifact, IS the source (C4): such a kind yields NOTHING
+        here (re-importing a stored row under a synthetic src wrote a duplicate row per rev —
+        R2 FIX HIGH). A kind with NO artifact row falls back to the task folder's round file:
+        hand-written briefs (the orchestrator's flow today) and pre-X3 report/review files are
+        ingested once, keyed on the file's digest (src as before X3), so a repeat import adds
+        nothing. Returns one dict per ingested kind; [] when nothing to import."""
         if not self.store_on:
             return []
+        n = t.get("round") or 0
+        d = self.task_dir(run["id"], t["id"])
         con = self.store_open()
         try:
-            arts = []
-            for kind in ("brief", "report", "review"):
-                row = con.execute(
-                    "SELECT rev, text FROM artifacts WHERE run=? AND task=? AND round=? AND kind=?"
-                    " ORDER BY rev DESC, id DESC LIMIT 1",
-                    (run["id"], t["id"], n, kind)).fetchone()
-                if not row or not (row["text"] or "").strip():
-                    continue
-                arts.append({"task": t["id"], "round": n, "kind": kind, "rev": row["rev"],
-                             "text": row["text"], "created": now(),
-                             "src": f"file:{run['id']}:{t['id']}:{kind}:{n}:r{row['rev']}"})
-            return arts
+            have = {r["kind"]: r["rev"] for r in con.execute(
+                "SELECT kind, MAX(rev) rev FROM artifacts WHERE run=? AND task=? AND round=?"
+                " AND kind IN ('brief','report','review') GROUP BY kind",
+                (run["id"], t["id"], n)).fetchall()}
         finally:
             con.close()
+        arts = []
+        for kind in ("brief", "report", "review"):
+            if kind in have:
+                continue  # the artifact is the source; re-importing it would duplicate the row
+            fp = os.path.join(d, f"{kind}-r{n}.md")
+            if not os.path.exists(fp):
+                continue
+            text = open(fp, encoding="utf-8").read()
+            digest = hashlib.sha256(text.encode()).hexdigest()[:16]
+            arts.append({"task": t["id"], "round": n, "kind": kind, "rev": 1, "text": text,
+                         "created": t.get("updated") or now(),
+                         "src": f"file:{run['id']}:{t['id']}:{kind}:{n}:{digest}"})
+        return arts
 
     def doc_artifact(self, rid, task, kind, text, created):
         # src includes the text: import_history skips a src it already has, so a changed
@@ -2076,14 +2087,15 @@ def task_brief(st, run, t, a):
         con.close()
     # put_artifact replaces by rev (one newest row per (task, round, kind)); the same bytes
     # already stored: no rev bump, idempotent. The view file follows the artifact either way.
+    # R2 FIX (CRITICAL): this is a PROJECT store write — put_artifact is called directly
+    # (root_write is for the root projection and short-circuits to None under
+    # _skip_root_projection, which made `task brief` fail on a temp/default-home data dir).
     if row and row["text"] == text:
-        stored = {"rev": row["rev"]}
+        stored = {"id": None, "rev": row["rev"]}  # idempotent re-run: no rev bump
     else:
-        got = st.root_write(st.db().put_artifact, st.home_dir(), st.project_slug(), run["id"],
-                            t["id"], n, "brief", text, data_dir=st.project_folder())
-        if not got:
-            raise Fail("could not store the brief artifact")
-        stored = got
+        stored = st.db().put_artifact(st.home_dir(), st.project_slug(), run["id"],
+                                      t["id"], n, "brief", text,
+                                      data_dir=st.project_folder())
     fp = os.path.join(st.task_dir(run["id"], t["id"]), f"brief-r{n}.md")
     out = {"ok": True, "task": t["id"], "round": n, "stored": True, "view": fp,
            "rev": stored["rev"]}
