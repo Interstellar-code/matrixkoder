@@ -3604,12 +3604,13 @@ def archive_run(data_dir, run):
     msgs, acks, arts = _archive_rows(store, run)
     groups = _archive_groups(msgs, acks, arts)
     counts, seq_range, digest = _archive_state(groups)
-    # The archive belongs beside the run it holds. A switched run lives in the C2 plan
-    # folder, and `run_dir`'s data-dir form answers today's path as soon as a derived
-    # root row shadows the switched one, so the migrated case names the slug and takes
-    # mkpaths' target rule (the same folder mk-state writes the round files to).
+    # The archive belongs beside the run it holds: the FOLDER of the store it was
+    # read from, not a slug. A slug can name an alias row (`p<hash>` registered for
+    # a dir it has no row for) and building the path from that slug creates a stray
+    # project folder beside the real one; `folder` IS the db_path folder
+    # _own_project_store resolved, the same tree mkpaths' target rule names.
     if slug:
-        path = os.path.join(_paths("target_run_dir", slug, plan, run), "bus.jsonl")
+        path = os.path.join(folder, _load_mkpaths().TARGET_PLANS_DIR, plan, "runs", run, "bus.jsonl")
     else:
         path = os.path.join(_paths("run_dir", data_dir, run), "bus.jsonl")
     if not any(counts.values()):
@@ -6597,6 +6598,139 @@ def _load_script_module(name, path):
 # The home env names every MK script honours (mkpaths._clear_home_env's set).
 _ARCHIVE_HOME_KEYS = ("MK_HOME", "MATRIXKODER_HOME", "MATRIXKODER_DATA", "MK_BUS_DIR",
                       "MK_BUS_TOKEN_FILE")
+def _z14_seed_project(home, slug, data, run_id, migrated, plan="alpha", task="T1"):
+    """One project store for the Z14 path cases, through mkdb's own writers.
+
+    A migrated project's store is the C2 one (target_project_db), and an EMPTY
+    legacy <data>/mk.db stays on disk — store_mode's guard only checks the file,
+    and _own_project_store must be the one that resolves the folder. Pre-migration
+    the store IS <data>/mk.db and nothing else exists. Alias rows have no mkdb
+    writer; the caller INSERTs them into the root directly (the fixture convention)."""
+    mod = _load_mkdb()
+    mp = _load_mkpaths()
+    store_dir = mp.target_project_dir(slug) if migrated else data
+    os.makedirs(store_dir, exist_ok=True)
+    if migrated:
+        # an EMPTY legacy store at <data>/mk.db: store_mode only checks the file
+        mod.open_project(home, None, data).close()
+        if not os.path.isfile(os.path.join(store_dir, "mk.db")):
+            mod.open_project(home, slug, None).close()
+    con = mod.open_project(home, slug if migrated else None, store_dir)
+    try:
+        con.execute("INSERT OR REPLACE INTO runs(id, plan, plan_version, branch, status,"
+                    " stage, next, started, ended, extra_json)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,NULL)",
+                    (run_id, plan, 1, "mk/%s/%s" % (plan, run_id), "done", "1", None,
+                     "2026-10-12T09:00:00+00:00", "2026-10-12T15:00:00+00:00"))
+        con.execute(
+            "INSERT OR REPLACE INTO tasks(run, id, parent, type, title, acceptance, owned,"
+            " deps, parallel, route_json, status, prev_status, file_status, lane, slot,"
+            " branch, pane, round, verdict, updated)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (run_id, task, None, "task", task, None, None, "", None, None,
+             "done", None, None, None, None, None, None, 0, None, None))
+        con.commit()
+    finally:
+        con.close()
+    mod.append_event(home, slug, run_id, task=task, chan="bus", kind="info",
+                     text="the archived message", from_id="orch", to_id=task,
+                     data_dir=store_dir, t="2026-10-12T10:00:00+00:00")
+    return store_dir
+
+
+def _z14_path_self_test():
+    """Z14: the archive FILE path is derived from the db_path FOLDER, never a slug.
+
+    The BUGGY main (e83e6e9) builds `path = os.path.join(_paths("target_run_dir",
+    slug, plan, run), "bus.jsonl")` from the slug _own_project_store returned, and
+    with a derived ALIAS row (`p<hash>` of a data dir it had no row for, LEFT behind
+    by project_slug_for after the real slug took over) that slug CAN win the read:
+    the buggy build then CREATES a stray projects/p<hash>/plans/... tree beside the
+    real project folder and names its bus.jsonl there. The FIX derives the path
+    from the db_path FOLDER (`<folder>/plans/<plan>/runs/<run>/bus.jsonl`), so no
+    alias slug can ever name the folder:
+
+      (a) the alias row: the archive still lands at projects/<slug>/plans/<plan>/
+          runs/<run>/bus.jsonl and no projects/p66677a607f481f16/ folder exists
+          afterwards. Fails on the buggy main (the alias folder IS created);
+      (b) a SINGLE migrated row — no-op: same folder, no stray beside it;
+      (c) PRE-migration (db_path NULL or '') — unchanged: <data>/runs/<run>/bus.jsonl
+          and no projects/ tree at all.
+
+    Fails on a tree without archive-run (exit 2, "unknown command")."""
+    def cli(args, env):
+        p = subprocess.run([sys.executable, os.path.abspath(__file__)] + args,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                           env=env, timeout=120)
+        lines = [ln.strip() for ln in p.stdout.strip().splitlines() if ln.strip()]
+        try:
+            doc = json.loads(lines[-1]) if lines else {}
+        except ValueError:
+            doc = {}
+        return p.returncode, doc, (p.stderr or "") + (p.stdout or "")
+
+    tmp = tempfile.mkdtemp(prefix="mk-bus-z14-path-")
+    saved = {k: os.environ.get(k) for k in _ARCHIVE_HOME_KEYS}
+    try:
+        for tag, slug, data_name, alias_row, migrated, db_value in (
+                ("(a) alias slug never names the archive folder",
+                 "e2e", "repo-a", True, True, "db"),
+                ("(b) single migrated row (no-op)", "mig", "repo-b", False, True, "db"),
+                ("(c) pre-migration (db_path NULL)", "premig", "repo-c", False, False, None)):
+            home = os.path.join(tmp, "home-" + slug)
+            data = os.path.join(tmp, data_name, ".matrixkoder")
+            os.makedirs(home)
+            os.makedirs(data)
+            # pin the process env BEFORE seeding: _z14_seed_project resolves mp.home(),
+            # which must be the temp home (and never the real one under MK_SELFTEST)
+            for _k in _ARCHIVE_HOME_KEYS:
+                os.environ.pop(_k, None)
+            os.environ["MK_HOME"] = os.environ["MATRIXKODER_HOME"] = os.environ["MK_BUS_DIR"] = home
+            os.environ["MK_SELFTEST"] = "1"
+            db_path = os.path.join(home, "projects", slug, "mk.db") if migrated else None
+            con = _load_mkdb().open_root(home)
+            try:
+                # the derived alias row FIRST: project_slug_for registers it before
+                # the real row exists, and it stays after the switch takes over
+                if alias_row:
+                    con.execute(
+                        "INSERT INTO projects(slug, name, repo, data_dir, mode, created,"
+                        " last_activity, db_path) VALUES (?,?,?,?,?,?,?,?)",
+                        ("p66677a607f481f16", slug + "-alias", None, data, "home",
+                         "2026-10-12T09:00:00+00:00", "2026-10-12T09:00:00+00:00", db_path))
+                con.execute(
+                    "INSERT INTO projects(slug, name, repo, data_dir, mode, created,"
+                    " last_activity, db_path) VALUES (?,?,?,?,?,?,?,?)",
+                    (slug, slug, None, data, "home", "2026-10-12T09:00:00+00:00",
+                     "2026-10-12T09:00:00+00:00", db_path))
+                con.commit()
+            finally:
+                con.close()
+            store_dir = _z14_seed_project(home, slug, data, "rZ", migrated)
+            env = {k: v for k, v in os.environ.items() if k not in _ARCHIVE_HOME_KEYS}
+            env["MK_HOME"] = env["MATRIXKODER_HOME"] = env["MK_BUS_DIR"] = home
+            env["MK_SELFTEST"] = "1"
+            rc, res, blob = cli(["archive-run", "--data", data, "--run", "rZ"], env)
+            assert rc == 0 and res.get("ok") is True and res.get("written") is True, \
+                (rc, res, blob)
+            want = (os.path.join(store_dir, "plans", res["plan"], "runs", "rZ", "bus.jsonl")
+                    if migrated else os.path.join(data, "runs", "rZ", "bus.jsonl"))
+            assert res["path"] == want, (res["path"], want)
+            assert os.path.isfile(want), want
+            projects_dir = os.path.join(home, "projects")
+            listing = sorted(os.listdir(projects_dir)) if os.path.isdir(projects_dir) else []
+            assert listing == ([slug] if migrated else []), listing
+            if alias_row:
+                alias_dir = os.path.join(projects_dir, "p66677a607f481f16")
+                assert not os.path.exists(alias_dir), "the ALIAS folder was created"
+            print("pass mk-bus.py: z14 archive-path %s" % tag)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 class _ArchiveFixture:
@@ -8984,6 +9118,7 @@ def self_test():
     _layout_self_test()
     _legacy_bus_token_self_test()
     _archive_run_self_test()
+    _z14_path_self_test()
     print("pass mk-bus.py: mk-bus self-test ok")
     print(json.dumps({"ok": True, "tests": len(checks), "passed": len(checks)}))
     return 0
