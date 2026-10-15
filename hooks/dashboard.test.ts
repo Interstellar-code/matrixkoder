@@ -2186,14 +2186,14 @@ test('D8A: hotkey k opens the Kanban tab between Waiting and Old', { plugins: [w
   expect(await ui.find({ text: 'no store yet' }), 'missing root store draws the empty state').toBeTruthy()
 })
 
-test('D8A: a dashboard tick reads cards once when the root store exists, and never when it does not', { plugins: [worldFixtures] }, async ($, on) => {
+test('D8A: a dashboard tick reads the root overview once when the root store exists, and never when it does not', { plugins: [worldFixtures] }, async ($, on) => {
   const calls: string[][] = []
   const clock = mockWorld(on, {
     env: { MK_HOME: '/tmp/mk-d8a-home' },
     process: argv => {
       calls.push([...argv])
-      if (argv.includes('cards')) {
-        return { value: { exitCode: 0, stdout: '{"ok":true,"cards":[]}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      if (argv.includes('overview')) {
+        return { value: { exitCode: 0, stdout: '{"ok":true,"projects":[],"plans":[]}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
       }
       return undefined
     },
@@ -2202,13 +2202,13 @@ test('D8A: a dashboard tick reads cards once when the root store exists, and nev
   mockFs(on, worldFiles())
   await $.session.start(sessionStart())
   await clock.advance(0)
-  const cardCalls = () => calls.filter(a => a.includes('cards'))
-  expect(cardCalls(), 'the opening tick reads cards once').toHaveLength(1)
+  const cardCalls = () => calls.filter(a => a.includes('overview'))
+  expect(cardCalls(), 'the opening tick reads the root overview once').toHaveLength(1)
   expect(cardCalls()[0]).toContain('--json')
   expect(cardCalls()[0]).toContain('--home')
   const before = cardCalls().length
   await clock.advance(5000)
-  expect(cardCalls().length, 'the next tick reads cards once more').toBe(before + 1)
+  expect(cardCalls().length, 'the next tick reads the overview once more').toBe(before + 1)
 })
 
 
@@ -2242,13 +2242,13 @@ test('D8A R2: MK_HOME unset reads ~/.matrixkoder/mk.db and shows no store yet', 
   expect(await ui.find({ text: /gamma/ })).toBeUndefined()
 })
 
-test('D8A R2: a present store with zero cards draws an empty board, not the fixture', { plugins: [worldFixtures] }, async ($, on) => {
+test('D8A R2: a present store with zero linked projects draws an empty board, not the fixture', { plugins: [worldFixtures] }, async ($, on) => {
   const calls: string[][] = []
   const clock = mockWorld(on, {
     process: argv => {
       calls.push([...argv])
-      if (argv.includes('cards')) {
-        return { value: { exitCode: 0, stdout: '{"ok":true,"cards":[]}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      if (argv.includes('overview')) {
+        return { value: { exitCode: 0, stdout: '{"ok":true,"projects":[],"plans":[]}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
       }
       return undefined
     },
@@ -2257,8 +2257,8 @@ test('D8A R2: a present store with zero cards draws an empty board, not the fixt
   mockFs(on, worldFiles())
   await $.session.start(sessionStart())
   await clock.advance(0)
-  const cardCalls = calls.filter(a => a.includes('cards'))
-  expect(cardCalls, 'one cards read').toHaveLength(1)
+  const cardCalls = calls.filter(a => a.includes('overview'))
+  expect(cardCalls, 'one overview read').toHaveLength(1)
   const homeAt = cardCalls[0]!.indexOf('--home')
   expect(cardCalls[0]![homeAt + 1]).toBe('/home/mk/.matrixkoder')
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
@@ -2269,20 +2269,23 @@ test('D8A R2: a present store with zero cards draws an empty board, not the fixt
 })
 
 
-test('FC: a corrupt cards read shows an error and keeps the last good cards', { plugins: [worldFixtures] }, async ($, on) => {
+test('FC: a corrupt per-project read shows an error and keeps the last good cards', { plugins: [worldFixtures] }, async ($, on) => {
   let mode: 'good' | 'corrupt' = 'good'
   const calls: string[][] = []
   const clock = mockWorld(on, {
     env: { MK_HOME: '/tmp/mk-fc-home' },
     process: argv => {
       calls.push([...argv])
-      if (!argv.includes('cards')) return undefined
+      if (argv.includes('overview')) {
+        return { value: { exitCode: 0, stdout: JSON.stringify({ ok: true, projects: [{ slug: 'alpha', repo: '/r/alpha', data_dir: '/srv/alpha/.matrixkoder', db_path: null }], plans: [] }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      }
+      if (!argv.includes('run-snapshot')) return undefined
       if (mode === 'corrupt') {
         // real mkdb.py against a corrupt mk.db: empty stdout, exit 1
         return { value: { exitCode: 1, stdout: '', stderr: 'sqlite3.DatabaseError: file is not a database', isStdoutTruncated: false, isStderrTruncated: false } }
       }
-      const card = { project: 'alpha', run: 'r', task: 'D3A', parent: 'D3', type: 'task', title: 'Writer', status: 'building', col: 'Building', attention: 0, question: null, route_json: null, lane: null, round: 1, verdict: null, gates: null, updated: '2026-10-12T09:00:00+02:00', change_no: 1 }
-      return { value: { exitCode: 0, stdout: JSON.stringify({ ok: true, cards: [card] }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      const snap = { ok: true, runs: [], active: 'r', waits: [], run: { id: 'r', plan: null, status: 'active', tasks: [{ id: 'D3A', title: 'Writer', status: 'building', parent: 'D3', updated: '2026-10-12T09:00:00+02:00' }] } }
+      return { value: { exitCode: 0, stdout: JSON.stringify(snap), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     },
   })
   on('fs.exists', (_$, e) => ({ value: String(e.path) === '/tmp/mk-fc-home/mk.db' }))
@@ -2299,14 +2302,16 @@ test('FC: a corrupt cards read shows an error and keeps the last good cards', { 
   expect(await ui.find({ text: /stale/ }), 'last good cards are flagged stale').toBeTruthy()
   expect(await ui.find({ text: /D3A/ }), 'last good card stays').toBeTruthy()
   expect(await ui.find({ text: 'no store yet' }), 'an error is not the empty-store line').toBeUndefined()
-  expect(await ui.find({ text: 'Building 0' }), 'an error is not an empty column').toBeUndefined()
 })
 
 test('FC: {ok:false} shows an error, not empty columns', { plugins: [worldFixtures] }, async ($, on) => {
   const clock = mockWorld(on, {
     env: { MK_HOME: '/tmp/mk-fc-okfalse' },
     process: argv => {
-      if (!argv.includes('cards')) return undefined
+      if (argv.includes('overview')) {
+        return { value: { exitCode: 0, stdout: JSON.stringify({ ok: true, projects: [{ slug: 'alpha', repo: '/r/alpha', data_dir: '/d/alpha', db_path: null }], plans: [] }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      }
+      if (!argv.includes('run-snapshot')) return undefined
       return { value: { exitCode: 0, stdout: '{"ok":false,"error":"locked"}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     },
   })
@@ -2344,7 +2349,10 @@ test('FC: a thrown spawn shows an error, not the empty-store line', { plugins: [
   const clock = mockWorld(on, {
     env: { MK_HOME: '/tmp/mk-fc-throw' },
     process: argv => {
-      if (!argv.includes('cards')) return undefined
+      if (argv.includes('overview')) {
+        return { value: { exitCode: 0, stdout: JSON.stringify({ ok: true, projects: [{ slug: 'alpha', repo: '/r/alpha', data_dir: '/d/alpha', db_path: null }], plans: [] }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      }
+      if (!argv.includes('run-snapshot')) return undefined
       throw new Error('spawn python3 ENOENT')
     },
   })
@@ -2359,13 +2367,16 @@ test('FC: a thrown spawn shows an error, not the empty-store line', { plugins: [
   expect(await ui.find({ text: 'Backlog 0' })).toBeUndefined()
 })
 
-test('FC: a slow cards read does not hold the tick, and only one read is in flight', { plugins: [worldFixtures] }, async ($, on) => {
+test('FC: a slow per-project read does not hold the tick, and only one read is in flight', { plugins: [worldFixtures] }, async ($, on) => {
   const held: Array<(v: { value: { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean; isStderrTruncated: boolean } }) => void> = []
   let started = 0
   const clock = mockWorld(on, {
     env: { MK_HOME: '/tmp/mk-fc-slow' },
     process: argv => {
-      if (!argv.includes('cards')) return undefined
+      if (argv.includes('overview')) {
+        return { value: { exitCode: 0, stdout: JSON.stringify({ ok: true, projects: [{ slug: 'alpha', repo: '/r/alpha', data_dir: '/d/alpha', db_path: null }], plans: [] }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      }
+      if (!argv.includes('run-snapshot')) return undefined
       started += 1
       return new Promise<{ value: { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean; isStderrTruncated: boolean } }>(resolve => {
         held.push(resolve)
@@ -2382,7 +2393,7 @@ test('FC: a slow cards read does not hold the tick, and only one read is in flig
   expect(started, 'a second read does not start while one is in flight').toBe(1)
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   expect(await ui.find({ text: 'Overview' }), 'the pane still rendered').toBeTruthy()
-  held[0]?.({ value: { exitCode: 0, stdout: '{"ok":true,"cards":[]}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+  held[0]?.({ value: { exitCode: 0, stdout: JSON.stringify({ ok: true, runs: [], active: null, waits: [], run: null }), isStdoutTruncated: false, isStderrTruncated: false, stderr: '' } })
   for (let i = 0; i < 20; i++) await clock.advance(0)
   await ui.press({ key: 'dash-tab-kanban' })
   expect(await ui.find({ text: 'Backlog 0' }), 'the landed read draws the empty board').toBeTruthy()
@@ -2441,4 +2452,89 @@ test('a slow pending read stays one in flight across four ticks', { plugins: [wo
   await clock.advance(5000)
   for (let j = 0; j < 5; j++) await clock.advance(0)
   expect(started, 'the next tick starts exactly one new read').toBe(2)
+})
+
+// ── L7.2: the Plan list from the root overview, and k across linked projects ──
+
+test('L7.2: the Plan List renders from the root overview with the project DB unavailable', { plugins: [worldFixtures] }, async ($, on) => {
+  const calls: string[][] = []
+  const clock = mockWorld(on, {
+    env: { MK_HOME: '/tmp/mk-l72-list' },
+    process: argv => {
+      calls.push([...argv])
+      const reply = (body: unknown) => ({ value: { exitCode: 0, stdout: JSON.stringify(body), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+      if (argv.includes('overview')) {
+        return reply({
+          ok: true, projects: [],
+          plans: [{ project: 'matrixkoder', plan: 'alpha', title: 'Alpha plan', status: 'running', created: 'c', live_run: 'alpha-r1', counts: { building: 2 } }],
+        })
+      }
+      // EVERY project-DB subcommand fails: the List must still render (acceptance).
+      if (argv.includes('plans')) return { value: { exitCode: 2, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      return undefined
+    },
+  })
+  on('fs.exists', (_$, e) => ({ value: String(e.path).endsWith('/tmp/mk-l72-list/mk.db') }))
+  mockFs(on, worldFiles())
+  await $.session.start(sessionStart())
+  for (let i = 0; i < 5; i++) await clock.advance(0)
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-plan' })
+  for (let i = 0; i < 5; i++) await clock.advance(0)
+  expect(await ui.find({ text: /alpha/ }), 'the plan row from the root overview').toBeTruthy()
+  expect(await ui.find({ text: /Alpha plan/ }), 'the title from the root plan_summary').toBeTruthy()
+  expect(calls.some(a => a.includes('overview')), 'the list read the root overview').toBe(true)
+  // The retired List read was `mkdb.py plans --json --data <project>` (it opened the project
+  // DB). It must not appear: the list is the root overview alone (acceptance).
+  expect(calls.some(a => a.includes('plans') && a.includes('--data')), 'the list never opened a project DB').toBe(false)
+  expect(await ui.find({ text: /⚠/ }), 'no error line: the list is not the failing read').toBeUndefined()
+})
+
+test('L7.2: the top-level k reads open tasks of every linked project — migrated via db_path, pre-migration via its data_dir', { plugins: [worldFixtures] }, async ($, on) => {
+  const HOME = '/tmp/mk-l72-k'
+  const MIGRATED_DIR = `${HOME}/projects/alpha`
+  const MIGRATED_DB = `${MIGRATED_DIR}/mk.db`
+  const LEGACY_DIR = '/srv/legacy/.matrixkoder'
+  const calls: string[][] = []
+  const clock = mockWorld(on, {
+    env: { MK_HOME: HOME },
+    process: argv => {
+      calls.push([...argv])
+      const reply = (body: unknown) => ({ value: { exitCode: 0, stdout: JSON.stringify(body), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+      if (argv.includes('overview')) {
+        return reply({
+          ok: true,
+          projects: [
+            { slug: 'alpha', name: 'alpha', repo: '/srv/alpha', data_dir: '/srv/alpha/.matrixkoder', mode: 'home', db_path: MIGRATED_DB },
+            { slug: 'legacy', name: 'legacy', repo: '/srv/legacy', data_dir: LEGACY_DIR, mode: 'home', db_path: null },
+          ],
+          plans: [],
+        })
+      }
+      const taskSnap = (id: string, title: string) => ({
+        ok: true, runs: [], active: 'r1', waits: [],
+        run: { id: 'r1', plan: null, status: 'active', tasks: [{ id, title, status: 'building', parent: null, updated: '2026-10-12T09:00:00+02:00' }] },
+      })
+      const dataAt = argv.indexOf('--data')
+      const dir = dataAt >= 0 ? argv[dataAt + 1] ?? '' : ''
+      if (dir === MIGRATED_DIR) return reply(taskSnap('A-OPEN', 'alpha open task'))
+      if (dir === LEGACY_DIR) return reply(taskSnap('L-OPEN', 'legacy open task'))
+      return undefined
+    },
+  })
+  on('fs.exists', (_$, e) => ({ value: [`${HOME}/mk.db`, MIGRATED_DB, `${LEGACY_DIR}/mk.db`].includes(String(e.path)) }))
+  mockFs(on, worldFiles())
+  await $.session.start(sessionStart())
+  for (let i = 0; i < 5; i++) await clock.advance(0)
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-kanban' })
+  for (let i = 0; i < 5; i++) await clock.advance(0)
+  expect(await ui.find({ text: /A-OPEN/ }), 'the migrated project’s open task').toBeTruthy()
+  expect(await ui.find({ text: /L-OPEN/ }), 'the pre-migration project’s open task').toBeTruthy()
+  const dirs = calls.map(a => {
+    const i = a.indexOf('--data')
+    return i >= 0 ? a[i + 1] ?? '' : ''
+  })
+  expect(dirs, 'the migrated row read the C2 project folder').toContain(MIGRATED_DIR)
+  expect(dirs, 'the db_path-NULL row fell back to its legacy data_dir').toContain(LEGACY_DIR)
 })

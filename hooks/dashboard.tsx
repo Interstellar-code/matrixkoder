@@ -29,7 +29,7 @@ import { PlanTab, planView } from './tabs/plan'
 import type { PlanView } from './tabs/plan'
 import { PlansTab, planActionLine } from './tabs/plans'
 import type { PlansView } from './tabs/plans'
-import { planFromReply, plansErrorLine, plansFromReply } from './tabs/plans-map'
+import { planFromReply, plansErrorLine, plansFromOverview } from './tabs/plans-map'
 import { PlanKanbanTab, planKanbanView } from './tabs/plankanban'
 import { PlanTaskPanel, findPlanTask } from './tabs/plantask'
 import { SettingsTab } from './tabs/settings'
@@ -759,7 +759,7 @@ export function selectedPlanId(view: Record<string, string>, plans: readonly { i
 function plansViewOf(view: Record<string, string>, onAction: (kind: string, id: string) => void): PlansView {
   let parsed: unknown = null
   try { parsed = JSON.parse(view[PLANS_KEY] ?? '') } catch { parsed = null }
-  const mapped = plansFromReply(parsed ?? {})
+  const mapped = plansFromOverview(parsed ?? {})
   return { mock: false, runs: mapped.runs, plans: mapped.plans, onAction }
 }
 
@@ -849,18 +849,35 @@ export type PlansRead = {
   error: string | null
 }
 
-/** One plans read. A missing store never spawns mkdb. `detailId` empty skips the detail call. */
+/** Where readPlans reads from (L7.2): the ROOT store for the list, one project store
+ *  for the Detail/Kanban. `rootExists` gates the list read, `projectExists` the detail.
+ *  `overview` is the root `overview --json` document already read this tick (the top-level
+ *  `k` needs the same read); when given, the list call is skipped (C1: one read per tick). */
+export type PlansReadSources = {
+  home: string | null
+  rootExists: boolean
+  dataDir: string | null
+  projectExists: boolean
+  detailId: string
+  overview?: { doc: unknown; failure: { kind: 'exit' | 'json' | 'ok' | 'spawn' | 'timeout'; detail: string } | null }
+}
+
+/**
+ * One plans read (L7.2). The LIST comes from the ROOT store's `mkdb.py overview --json`
+ * (C3: numbers and linkage; no project DB is opened), so the List renders on a project
+ * whose own store is unavailable. The DETAIL still comes from the project DB
+ * (`mkdb.py plans <id> --json --data <dir>`), which is what Detail and Kanban need.
+ * Neither read spawns mkdb when its store is known to be missing.
+ */
 export async function readPlans(
   run: (argv: readonly string[], init?: { timeoutMs?: number }) => Promise<{ stdout?: string; code?: number }>,
   pluginRoot: string,
-  dataDir: string | null,
-  storeExists: boolean,
-  detailId: string,
+  sources: PlansReadSources,
 ): Promise<PlansRead> {
+  const { home, rootExists, dataDir, projectExists, detailId } = sources
   const fail = (error: string, ms: number): PlansRead => ({ list: null, detail: null, ms, skipped: false, empty: false, missing: false, error })
-  if (dataDir == null || !storeExists) return { list: null, detail: null, ms: 0, skipped: true, empty: true, missing: true, error: null }
+  if (home == null || !rootExists) return { list: null, detail: null, ms: 0, skipped: true, empty: true, missing: true, error: null }
   const started = Date.now()
-  const base = ['python3', `${pluginRoot}/scripts/mkdb.py`, 'plans']
   const call = async (argv: string[]): Promise<{ parsed: unknown; error: string | null }> => {
     let result: { stdout?: string; code?: number }
     try {
@@ -882,11 +899,20 @@ export async function readPlans(
       return { parsed: null, error: plansErrorLine('json') }
     }
   }
-  const list = await call([...base, '--json', '--data', dataDir])
+  const base = `${pluginRoot}/scripts/mkdb.py`
+  const list = sources.overview != null
+    ? (sources.overview.failure != null
+      ? { parsed: null, error: plansErrorLine(sources.overview.failure.kind, sources.overview.failure.detail) }
+      : { parsed: sources.overview.doc, error: null })
+    : await call(['python3', base, '--home', home, 'overview', '--json'])
   if (list.error != null) return fail(list.error, Date.now() - started)
-  const detail = detailId === '' ? { parsed: null, error: null } : await call([...base, detailId, '--json', '--data', dataDir])
+  const detail = detailId === '' || dataDir == null || !projectExists
+    ? { parsed: null, error: null }
+    : await call(['python3', base, 'plans', detailId, '--json', '--data', dataDir])
   if (detail.error != null) return { list: list.parsed, detail: null, ms: Date.now() - started, skipped: false, empty: false, missing: false, error: detail.error }
-  const plans = (list.parsed as { plans?: unknown }).plans
+  const plans = list.parsed != null && typeof list.parsed === 'object' && 'plans' in list.parsed
+    ? list.parsed.plans
+    : undefined
   return {
     list: list.parsed,
     detail: detail.parsed,
@@ -909,16 +935,19 @@ function plansDue(view: Record<string, string>, now: number): boolean {
   return now - at >= PLANS_RELOAD_MS
 }
 
-async function refreshPlans($: EngineInterface, cwd: string): Promise<void> {
-  const dataDir = await resolveDataDir($, { cwd, home: await homeDir($), requireExisting: true, store: true }).catch(() => null)
-  const path = dataDir == null ? '' : paths.projectDb(dataDir)
-  let exists = false
-  if (path !== '') {
-    try { exists = await $.fs.exists(path) } catch { exists = false }
-  }
-  if (dataDir == null || !exists) {
+async function refreshPlans($: EngineInterface, cwd: string, overview: RootOverview): Promise<void> {
+  const storeHome = overview.home
+  // The LIST reads the ROOT store (its plan_summary, read once per tick in readRootOverview),
+  // the DETAIL the project DB (L7.2).
+  if (storeHome == null || !overview.exists) {
     await update($, viewStateAtom, prev => ({ ...prev, [PLANS_STORE_KEY]: '0', [PLANS_EMPTY_KEY]: '1' }))
     return
+  }
+  const dataDir = await resolveDataDir($, { cwd, home: storeHome, requireExisting: true, store: true }).catch(() => null)
+  let exists = false
+  if (dataDir != null) {
+    const projectPath = paths.projectDb(dataDir)
+    try { exists = await $.fs.exists(projectPath) } catch { exists = false }
   }
   const view = await read($, viewStateAtom)
   let now = Date.now()
@@ -934,7 +963,10 @@ async function refreshPlans($: EngineInterface, cwd: string): Promise<void> {
   const reload = view['plans:reload'] ?? ''
   const run = (argv: readonly string[], init?: { timeoutMs?: number }) =>
     $.process.run([...argv], init).then(r => ({ stdout: r.stdout, code: r.exitCode }))
-  void readPlans(run, $.plugin.root, dataDir, exists, sel).then(async got => {
+  void readPlans(run, $.plugin.root, {
+    home: storeHome, rootExists: overview.exists, dataDir, projectExists: exists, detailId: sel,
+    overview: { doc: overview.doc, failure: overview.failure },
+  }).then(async got => {
     await update($, viewStateAtom, prev => {
       if (got.missing) return { ...prev, [PLANS_STORE_KEY]: '0', [PLANS_EMPTY_KEY]: '1' }
       const had = (prev[PLANS_KEY] ?? '') !== ''
@@ -1042,21 +1074,12 @@ function applyCardsRead(
   }
 }
 
-async function refreshCards($: EngineInterface): Promise<void> {
+async function refreshCards($: EngineInterface, overview: RootOverview): Promise<void> {
   // storeHome is the global dir (paths.globalDirOf: $MK_HOME, else
-  // $MATRIXKODER_HOME, else ~/.matrixkoder). Both the exists-check and the
-  // --home handed to mkdb use it: cards() would create a missing root store,
-  // so exists() runs first.
-  const storeHome = await globalDirOf($, await homeDir($))
-  const path = storeHome == null ? '' : paths.projectDb(storeHome)
-  let exists = false
-  if (path !== '') {
-    try {
-      exists = await $.fs.exists(path)
-    } catch {
-      exists = false
-    }
-  }
+  // $MATRIXKODER_HOME, else ~/.matrixkoder). The exists-check ran in readRootOverview:
+  // a missing root store never spawns mkdb, which would create it.
+  const storeHome = overview.home
+  const exists = overview.exists
   const view = await read($, viewStateAtom)
   const tick = Number(view[CARDS_TICK_KEY] ?? '0') + 1
   const lastMs = Number(view[CARDS_MS_KEY] ?? '0')
@@ -1080,7 +1103,7 @@ async function refreshCards($: EngineInterface): Promise<void> {
       const r = await run(argv, init)
       return { stdout: r.stdout, code: r.exitCode }
     },
-    $.plugin.root, storeHome, exists, tick, lastMs,
+    $.plugin.root, storeHome, exists, tick, lastMs, { doc: overview.doc, failure: overview.failure },
   ).then(async got => {
     const ms = Math.max(got.ms, Date.now() - started)
     await update($, viewStateAtom, prev => applyCardsRead(prev, tick, lastMs, { ...got, ms }))
@@ -1093,6 +1116,50 @@ async function refreshCards($: EngineInterface): Promise<void> {
   })
 }
 
+/** One root-store read per tick (L7.2): the Plan list and the top-level `k` both need
+ *  the root `overview --json` (numbers + linkage). Reading it once and handing the same
+ *  document to both readers keeps a tick at one spawn, not two (C1: no second reader of
+ *  the same data). `exists` is the fs probe of the root store so neither reader spawns
+ *  mkdb for a store that is not there (which would create it).
+ *
+ *  A failure carries the neutral `kind`/`detail`, never a rendered line: the Plan list and
+ *  `k` each label it with their own `plansErrorLine`/`cardsErrorLine`. */
+export type RootOverview = {
+  home: string | null
+  exists: boolean
+  doc: unknown
+  failure: { kind: 'exit' | 'json' | 'ok' | 'spawn' | 'timeout'; detail: string } | null
+}
+
+async function readRootOverview($: EngineInterface): Promise<RootOverview> {
+  const home = await globalDirOf($, await homeDir($))
+  const dbPath = home == null ? '' : paths.projectDb(home)
+  let exists = false
+  if (dbPath !== '') {
+    try { exists = await $.fs.exists(dbPath) } catch { exists = false }
+  }
+  if (home == null || !exists) return { home, exists: false, doc: null, failure: null }
+  let ran: { exitCode: number; stdout: string }
+  try {
+    ran = await $.process.run(['python3', `${$.plugin.root}/scripts/mkdb.py`, '--home', home, 'overview', '--json'], { timeoutMs: 5_000 })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    return { home, exists, doc: null, failure: { kind: /timed out|timeout/i.test(msg) ? 'timeout' : 'spawn', detail: '' } }
+  }
+  if (ran.exitCode !== 0) return { home, exists, doc: null, failure: { kind: 'exit', detail: '' } }
+  const stdout = ran.stdout ?? ''
+  if (stdout.trim() === '') return { home, exists, doc: null, failure: { kind: 'json', detail: '' } }
+  try {
+    const parsed = JSON.parse(stdout) as { ok?: boolean; error?: string }
+    if (parsed == null || typeof parsed !== 'object' || parsed.ok !== true) {
+      return { home, exists, doc: null, failure: { kind: 'ok', detail: typeof parsed?.error === 'string' ? parsed.error : '' } }
+    }
+    return { home, exists, doc: parsed, failure: null }
+  } catch {
+    return { home, exists, doc: null, failure: { kind: 'json', detail: '' } }
+  }
+}
+
 /** Never throws: a failing load keeps the last good snapshot and flags the error. */
 async function refreshSafe($: EngineInterface, options: PluginOptions, cwd: string): Promise<void> {
   const prev = await read($, snapshotAtom)
@@ -1102,9 +1169,12 @@ async function refreshSafe($: EngineInterface, options: PluginOptions, cwd: stri
     if (contentSig(prev) !== contentSig(snap)) {
       await update($, snapshotAtom, () => snap)
     }
-    await refreshCards($)
+    // One root `overview --json` for the whole tick (C1): the Plan list and the
+    // top-level `k` read the same document, so it is spawned once here and handed on.
+    const overview = await readRootOverview($)
+    await refreshCards($, overview)
     await refreshPending($, cwd)
-    await refreshPlans($, cwd)
+    await refreshPlans($, cwd, overview)
   } catch (err) {
     try {
       await update($, snapshotAtom, () => ({ ...prev, error: `cannot read run.json (${String(err).slice(0, 40)})` }))

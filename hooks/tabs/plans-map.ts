@@ -158,8 +158,54 @@ export function plansFromReply(reply: unknown): { plans: PlanRow[]; runs: RunRow
       runs: strList(raw.runs),
       live_run: live,
       counts: { tasks: sumCounts(raw.counts), phases: 0 },
+      ...(str(raw.project) !== '' ? { project: str(raw.project) } : {}),
       ...(Array.isArray(raw.design) ? { design: strList(raw.design) } : {}),
       ...(branchOf(raw.integration) !== '' ? { mergesTo: branchOf(raw.integration) } : {}),
+    }
+    plans.push(row)
+    if (live != null) {
+      runs.push({
+        id: live,
+        plan: row.id,
+        title: row.title,
+        stage: '',
+        counts: { done: 0, live: 0, planned: 0 },
+        countsLine: '',
+      })
+    }
+  }
+  return { plans, runs }
+}
+
+
+/**
+ * L7.2: the ROOT store's `mkdb.py overview --json` reply onto the same list
+ * rows — the List sub-tab renders from this and never opens a project DB.
+ *
+ * Every field the List draws (`id`, `title`, `status`, `live_run`, plus the
+ * `counts` tally) is a column of the root `plan_summary` row, so the mapping is
+ * lossless for the list. `created`, `runs`, `mergesTo` and `design` are Detail
+ * header fields the root row does not carry: they stay empty here and the
+ * Detail still reads them from the project DB.
+ *
+ * An overview with no `plans` (a pre-migration root, or none) maps to no rows.
+ */
+export function plansFromOverview(reply: unknown): { plans: PlanRow[]; runs: RunRow[] } {
+  const plans: PlanRow[] = []
+  const runs: RunRow[] = []
+  if (!isRecord(reply) || !Array.isArray(reply.plans)) return { plans, runs }
+  for (const raw of reply.plans) {
+    if (!isRecord(raw) || typeof raw.plan !== 'string' || raw.plan === '') continue
+    const live = typeof raw.live_run === 'string' && raw.live_run !== '' ? raw.live_run : null
+    const row: PlanRow = {
+      id: raw.plan,
+      title: str(raw.title),
+      status: str(raw.status),
+      created: str(raw.created),
+      runs: [],
+      live_run: live,
+      counts: { tasks: sumCounts(raw.counts), phases: 0 },
+      ...(str(raw.project) !== '' ? { project: str(raw.project) } : {}),
     }
     plans.push(row)
     if (live != null) {
@@ -233,6 +279,11 @@ export function planFromReply(reply: unknown): PlanView {
       runs: strList(reply.runs).join(' '),
       mergesTo: branchOf(reply.integration),
       design: Array.isArray(reply.design) ? strList(reply.design).join(' ') : '',
+      // C5/L7.2: a DONE plan's round files left the project folder for the legacy
+      // tarball the migration wrote, so the Detail names that instead of letting them
+      // read as absent. Any other plan keeps them in its project folder (the running
+      // plan renders exactly as before), so no row is added.
+      ...(status === 'done' ? { roundFiles: 'archived · legacy tarball' } : {}),
       counts: `${taskCount} tasks · ${phases.length} phases`,
     },
     phases,

@@ -223,16 +223,22 @@ test('emptyKanbanView shows "no store yet" and no column headers', () => {
   }
 })
 
-test('readCards skips a missing store, parses one cards call, and skips a slow odd tick', async () => {
+test('readCards skips a missing root store, reads the overview then per-project, and skips a slow odd tick', async () => {
   let calls = 0
   const run: RunFn = async argv => {
     calls += 1
-    expect(argv).toContain('cards')
     expect(argv).toContain('--json')
-    expect(argv).toContain('--home')
     const homeAt = argv.indexOf('--home')
-    expect(argv[homeAt + 1]).toBe('/tmp/mk-home')
-    return { stdout: JSON.stringify({ ok: true, cards: [KANBAN_FIXTURE[0]] }), code: 0 }
+    if (homeAt >= 0) {
+      expect(argv).toContain('overview')
+      expect(argv[homeAt + 1]).toBe('/tmp/mk-home')
+      return { stdout: JSON.stringify({ ok: true, projects: [{ slug: 'alpha', repo: '/r/alpha', data_dir: '/d/alpha', db_path: null }], plans: [] }), code: 0 }
+    }
+    expect(argv).toContain('run-snapshot')
+    expect(argv).toContain('--data')
+    const dataAt = argv.indexOf('--data')
+    expect(argv[dataAt + 1]).toBe('/d/alpha')
+    return { stdout: JSON.stringify({ ok: true, runs: [], active: 'r', waits: [], run: { id: 'r', plan: null, status: 'active', tasks: [{ id: 'D3A', title: 'Writer', status: 'building', parent: 'D3', updated: '2026-10-12T09:00:00+02:00' }] } }), code: 0 }
   }
 
   calls = 0
@@ -243,10 +249,11 @@ test('readCards skips a missing store, parses one cards call, and skips a slow o
 
   calls = 0
   const fresh = await readCards(run, '/plugin', '/tmp/mk-home', true, 0, 0)
-  expect(calls).toBe(1)
+  expect(calls, 'one overview + one per linked project').toBe(2)
   expect(fresh.empty).toBe(false)
   expect(fresh.skipped).toBe(false)
-  expect(fresh.cards).toEqual([KANBAN_FIXTURE[0]])
+  expect(fresh.cards).toHaveLength(1)
+  expect(fresh.cards[0]?.task).toBe('D3A')
   expect(typeof fresh.ms).toBe('number')
 
   calls = 0
@@ -257,7 +264,7 @@ test('readCards skips a missing store, parses one cards call, and skips a slow o
 
   calls = 0
   const even = await readCards(run, '/plugin', '/tmp/mk-home', true, 0, 150)
-  expect(calls).toBe(1)
+  expect(calls).toBe(2)
   expect(even.skipped).toBe(false)
   expect(typeof even.ms).toBe('number')
 })
@@ -285,15 +292,13 @@ test('timeInStatus of one hour before KANBAN_NOW is 1h', () => {
 const CORRUPT_MKDB_STDERR = '    return _migrate(_connect(os.path.join(home, "mk.db")), version, ((1, ROOT_DDL),) + tuple(migrations))\n                    ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File "/Users/rohits/Development/matrixkoder-mk-5/scripts/mkdb.py", line 144, in _connect\n    con.execute("PRAGMA journal_mode=WAL")\n    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^\nsqlite3.DatabaseError: file is not a database'
 
 
-test('a corrupt mk.db read (empty stdout, exit 1) is an error, not an empty board', async () => {
+test('a corrupt root store read (empty stdout, exit 1) is an error, not an empty board', async () => {
   expect(CORRUPT_MKDB_STDERR).toContain('sqlite3.DatabaseError: file is not a database')
-  let calls = 0
-  const run: RunFn = async () => {
-    calls += 1
+  const run: RunFn = async argv => {
+    expect(argv).toContain('overview')
     return { stdout: '', code: 1 }
   }
   const got = await readCards(run, '/plugin', '/tmp/mk-home', true, 0, 0)
-  expect(calls).toBe(1)
   expect(got.empty).toBe(false)
   expect(got.error).toBe('cards read failed: mkdb exited')
   expect(got.cards).toEqual([])
@@ -306,7 +311,7 @@ test('a corrupt mk.db read (empty stdout, exit 1) is an error, not an empty boar
   expect(text(columnSection(tree, 'Building')!)).toContain('D3A')
 })
 
-test('non-JSON stdout, {ok:false}, a thrown spawn and a timeout are errors', async () => {
+test('non-JSON overview stdout, {ok:false}, a thrown spawn and a timeout are errors', async () => {
   const cases: Array<{ name: string; run: RunFn; error: string }> = [
     {
       name: 'not json',
@@ -337,12 +342,14 @@ test('non-JSON stdout, {ok:false}, a thrown spawn and a timeout are errors', asy
   }
 })
 
-test('a 1.5 MB cards payload parses and does not report an error', async () => {
-  const one = KANBAN_FIXTURE[0]!
-  const cards = Array.from({ length: 5000 }, (_, i) => ({ ...one, task: `T${String(i)}`, title: 'x'.repeat(40) }))
-  const stdout = JSON.stringify({ ok: true, cards })
-  expect(stdout.length).toBeGreaterThan(1_500_000)
-  const got = await readCards(async () => ({ stdout, code: 0 }), '/plugin', '/tmp/mk-home', true, 0, 0)
+test('a per-project snapshot with 5000 open tasks parses and does not report an error', async () => {
+  const tasks = Array.from({ length: 5000 }, (_, i) => ({ id: `T${String(i)}`, title: 'x'.repeat(40), status: 'building', parent: null, updated: '2026-10-12T09:00:00+02:00' }))
+  const snap = JSON.stringify({ ok: true, runs: [], active: 'r', waits: [], run: { id: 'r', plan: null, status: 'active', tasks } })
+  expect(snap.length).toBeGreaterThan(100_000)
+  const run: RunFn = async argv => argv.includes('overview')
+    ? { stdout: JSON.stringify({ ok: true, projects: [{ slug: 'alpha', repo: '/r/alpha', data_dir: '/d/alpha', db_path: null }], plans: [] }), code: 0 }
+    : { stdout: snap, code: 0 }
+  const got = await readCards(run, '/plugin', '/tmp/mk-home', true, 0, 0)
   expect(got.error).toBeNull()
   expect(got.cards).toHaveLength(5000)
   expect(got.empty).toBe(false)
