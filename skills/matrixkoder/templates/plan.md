@@ -12,6 +12,17 @@
 #   After import the run and the project DB are the source: status, tasks, rounds and verdicts
 #   change there, never in this file — MK does not edit the file, it is a reference.
 #   When the plan is done, the file stays where it is, with its versions in archive/.
+#
+# F.2 gates — two levels, one rule each:
+#   [[final_gate]]      the plan-level gate: the command that proves the whole plan once its
+#                       tasks are done. `every` says when the run reruns it, `covers` is the
+#                       list of task ids it proves and is REQUIRED — mk-plan check refuses a
+#                       final gate without it and warns when the plan has none at all.
+#   gate / manual       every task and every subtask carries exactly ONE of the two: `gate` is
+#                       a command table this task must pass, `manual` is the reason no command
+#                       exists (a string, never run). Both in one table is a check error;
+#                       neither is a check warning. `critical`/`risk` (task level) feed the
+#                       same approval guard as the phase-level risk.
 plan = "feature-id"                       # id [a-z0-9][a-z0-9-]{0,40}; the file is <project>/plans/<id>/plan.md — plans.id (plans.title until D1 fills the H1 title)
 status = "draft"                          # draft|approved|running|done|parked; run init --plan wants approved — plans.status (column added by D1; header_json until then)
 created = 2026-10-08                      # date the plan was drafted — plans.created (column added by D1; header_json until then)
@@ -24,6 +35,15 @@ test = "<test cmd>"                       # e.g. pnpm vitest run — plans.heade
 typecheck = "<typecheck cmd>"             # e.g. pnpm exec tsc --noEmit — plans.header_json
 selftest = "<self-test cmd of the changed scripts>"  # e.g. python3 scripts/<name>.py --self-test; the full bash scripts/selftest.sh runs once on the integration tip, not per task — plans.header_json
 validate = "<validate cmd>"               # e.g. claude plugin validate . — plans.header_json
+
+[[final_gate]]                            # F.2: the plan-level gate; F.2 wants one with covers, and mk-plan check warns when the header has none — plans.header_json
+id = "F1"                                 # optional: names the gate in errors and in the change report (`final_gate[F1]` vs `final_gate[1]`) — plans.header_json
+cmd = "<the command that proves the whole plan>"  # the command the run executes at every `every`; keep it the one end-to-end proof of the plan — plans.header_json
+expect = 0                                # int, default 0: the exit code that means pass — plans.header_json
+every = "merge"                           # merge|phase|run_end, default merge: run it at every lane merge, at each phase end, or once when the run ends — bad values are a check error — plans.header_json
+timeout = 600                             # int seconds, default 600 — plans.header_json
+needs = []                                # optional: things the gate needs in place before it runs, e.g. ["bus"]; list, default [] — plans.header_json
+covers = ["P1.1", "P1.2"]                 # required, non-empty: the task ids of THIS plan the gate proves; mk-plan check refuses a final gate without covers and errors on an id that is not a task here — plans.header_json
 
 [[phase]]                                 # one block per phase; phases in one wave must own disjoint files — plans.header_json
 id = "P1"                                 # [A-Z][A-Z0-9]{0,7}, unique; tasks are <phase id>.<n> — tasks.id
@@ -45,10 +65,13 @@ lane_group = ""                           # same value = same wave, one shared w
   [[phase.task]]                          # optional: splits a phase into separately accepted tasks — plans.header_json; the rows below are what the importer writes
   id = "P1.1"                             # <phase id>.<n> — tasks.id
   title = "what this task delivers, one line"  # tasks.title
-  acceptance = "the outcome that decides done, checkable by the reviewer"  # tasks.acceptance
+  acceptance = ["the outcome that decides done, checkable by the reviewer", "the second outcome the same task must also meet"]  # tasks.acceptance; a list = two acceptance lines, and every line gets an id by position: <task id>.a1, <task id>.a2 (a plain string is the single line <task id>.a1)
   refs = []                               # optional: path:line pointers the brief quotes — header_json only
   subagent = false                        # true only inside a subagents=true phase; then owned is required — header_json only
   owned = []                              # required when subagent = true; subset of the phase's owned — tasks.owned
+  gate = { cmd = "<the command that proves this task>", expect = 0, timeout = 600, lines = ["P1.1.a1"] }  # the task must pass this command; `lines` names the acceptance line ids (above) it proves and mk-plan check errors on an id that is not one of <task id>'s lines; `gate` may also be a LIST of such tables when the task needs several commands — plans.header_json
+  critical = true                         # bool, default false: a task the plan cannot ship without; approving a file that flips this true -> false needs --user-ack — header_json only
+  risk = 3                                # this task's base risk as an int 1-5 (default 1): approving a file that LOWERS it needs --user-ack; separate from the phase-level risk string above — header_json only
 
   [[phase.task.subtask]]                  # optional: splits a task into subtasks; id is <phase>.<n>.<m> — plans.header_json
   id = "P1.1.1"                           # <phase id>.<n>.<m>; the importer derives tasks.type="subtask" and tasks.parent from the nesting
@@ -58,6 +81,16 @@ lane_group = ""                           # same value = same wave, one shared w
   parallel = false                        # true: parallel-flagged siblings with no dep between them may run at once — tasks.parallel
   route = ""                              # "" or "<agent> <model> [<effort>]"; or an inline table {agent, model, effort} — tasks.route_json
   owned = []                              # files this subtask touches — tasks.owned
+  manual = "<why this subtask has no command of its own>"  # a subtask carries gate OR manual, never both: `manual` is a string and is never run, it just records why the acceptance cannot be a command — header_json only
+
+  [[phase.task]]                          # a phase may hold more than one task; each is accepted on its own
+  id = "P1.2"                             # <phase id>.<n> — tasks.id
+  title = "the second task this phase delivers"  # tasks.title
+  acceptance = "the outcome that decides this task done"  # tasks.acceptance (plain string = the one line P1.2.a1)
+  refs = []                               # optional: path:line pointers the brief quotes — header_json only
+  subagent = false                        # true only inside a subagents=true phase; then owned is required — header_json only
+  owned = []                              # required when subagent = true; subset of the phase's owned — tasks.owned
+  manual = "<why no command exists for this task>"  # gate OR manual, never both (mk-plan check errors on both, warns on neither); `manual` is a string: say who checks this outcome and how — header_json only
 +++
 
 # <plan id> — <one line: what this plan delivers>

@@ -68,12 +68,14 @@ PLAN_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,40}")
 PHASE_ID_RE = re.compile(r"[A-Z][A-Z0-9]{0,7}")
 RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 ROUTE_RE = re.compile(r"\S+( \S+){1,2}")  # "<agent> <model> [<effort>]"; "" means Jev
-TOP_KEYS = ("plan", "status", "runs", "gates", "phase")  # header keys consumed by C2
+TOP_KEYS = ("plan", "status", "runs", "gates", "final_gate", "phase")  # header keys consumed by C2
+FINAL_EVERY = ("merge", "phase", "run_end")  # when a [[final_gate]] runs (F.2)
 PHASE_KEYS = ("id", "title", "wave", "deps", "owned", "forbidden", "route", "reviewer", "size",
               "risk", "review", "qa", "commit", "subagents", "lane_group", "task", "parallel")
 TASK_KEYS = ("id", "title", "acceptance", "refs", "subagent", "owned", "deps", "parallel",
-             "route", "subtask")
-SUB_KEYS = ("id", "title", "acceptance", "refs", "owned", "deps", "parallel", "route")
+             "route", "subtask", "gate", "manual", "critical", "risk")
+SUB_KEYS = ("id", "title", "acceptance", "refs", "owned", "deps", "parallel", "route",
+            "gate", "manual", "critical", "risk")
 TOML_LINE_RE = re.compile(r"line (\d+)")
 
 
@@ -171,11 +173,74 @@ def route_of(item):
     return "" if route is None else str(route)
 
 
+def acceptance_lines_of(item_id, value):
+    """F.2 acceptance → (flat text, lines). A TOML array is one line per entry; the flat text joins
+    them with a newline so `tasks.acceptance` (one TEXT column) still holds every line. A plain
+    string is one line. Each line is named `<item id>.a<n>` by position, which is what a gate's
+    `lines` refers to."""
+    if isinstance(value, list):
+        texts = [str(x) for x in value]
+    elif value is None or value == "":
+        texts = []
+    else:
+        texts = [str(value)]
+    base = f"{item_id}" if item_id else ""
+    return "\n".join(texts), [{"id": f"{base}.a{i + 1}", "text": t} for i, t in enumerate(texts)]
+
+
+def gate_list_of(value):
+    """F.2 task gate: a table `{cmd, expect = 0, timeout = 600, lines = []}` or a list of them.
+    Always a list so a caller can walk it; absent is []. A malformed element (a string, an int)
+    stays RAW here for check_plan to reject — the same "fill only when the key is absent" rule the
+    F.0 header gates follow."""
+    if value is None or value == "":
+        return []
+    items = value if isinstance(value, list) else [value]
+    out = []
+    for g in items:
+        if not isinstance(g, dict):
+            out.append(g)
+            continue
+        lines = g.get("lines", [])
+        out.append({"cmd": g.get("cmd"), "expect": g.get("expect", 0),
+                    "timeout": g.get("timeout", 600),
+                    "lines": list(lines) if isinstance(lines, list) else lines})
+    return out
+
+
+def gate_item_json(item_id, item):
+    """F.2: the per-item keys shared by task_json and sub_json — acceptance (flat text) plus its
+    lines, gate (always a list), manual, critical (default false) and risk (the plan's base risk,
+    an int 1-5, default 1)."""
+    text, lines = acceptance_lines_of(item_id, item.get("acceptance"))
+    return {"acceptance": text, "acceptance_lines": lines,
+            "gate": gate_list_of(item.get("gate")), "manual": item.get("manual", ""),
+            "critical": bool(item.get("critical", False)), "risk": item.get("risk", 1)}
+
+
+def final_gates_of(header):
+    """F.2 header [[final_gate]]: id, cmd, expect (default 0), every (default "merge"), timeout
+    (default 600), needs (default []), covers (default []). One block or a list of them; a
+    malformed element stays raw for check_plan. F.0's [gates] tables are untouched."""
+    raw = header.get("final_gate")
+    items = raw if isinstance(raw, list) else ([] if raw is None else [raw])
+    out = []
+    for g in items:
+        if not isinstance(g, dict):
+            out.append(g)
+            continue
+        out.append({"id": str(g.get("id", "")), "cmd": g.get("cmd"), "expect": g.get("expect", 0),
+                    "every": g.get("every", "merge"), "timeout": g.get("timeout", 600),
+                    "needs": as_list(g.get("needs")), "covers": as_list(g.get("covers"))})
+    return out
+
+
 def sub_json(s):
     out = {"id": str(s.get("id", "")), "title": s.get("title", ""),
-           "acceptance": s.get("acceptance", ""), "refs": as_list(s.get("refs")),
+           "refs": as_list(s.get("refs")),
            "owned": as_list(s.get("owned")), "deps": deps_list(s.get("deps")),
            "parallel": parallel_of(s), "route": route_of(s)}
+    out.update(gate_item_json(out["id"], s))
     for k, v in s.items():
         if k not in SUB_KEYS:
             out[k] = jsonable(v)
@@ -184,10 +249,11 @@ def sub_json(s):
 
 def task_json(t):
     out = {"id": str(t.get("id", "")), "title": t.get("title", ""),
-           "acceptance": t.get("acceptance", ""), "refs": as_list(t.get("refs")),
+           "refs": as_list(t.get("refs")),
            "subagent": bool(t.get("subagent", False)), "owned": as_list(t.get("owned")),
            "deps": deps_list(t.get("deps")), "parallel": parallel_of(t), "route": route_of(t),
            "subtasks": [sub_json(s) for s in as_list(t.get("subtask"))]}
+    out.update(gate_item_json(out["id"], t))
     for k, v in t.items():  # unknown keys pass through
         if k not in TASK_KEYS:
             out[k] = jsonable(v)
@@ -227,6 +293,7 @@ def plan_json(header, sha):
     out = {"ok": True, "plan": header.get("plan", ""), "status": header.get("status", "draft"),
            "runs": as_list(header.get("runs")), "sha": sha,
            "gates": {k: _gate_json(v) for k, v in (gates if isinstance(gates, dict) else {}).items()},
+           "final_gates": final_gates_of(header),
            "phases": [phase_json(p) for p in as_list(header.get("phase"))]}
     for k, v in header.items():  # created/design/integration/unknown keys pass through
         if k not in TOP_KEYS:
@@ -473,7 +540,76 @@ def check_plan(header, out, body=None):
     cycle = find_cycle(nodes)
     if cycle:
         errors.append("dep cycle: " + " -> ".join(cycle))
+    check_gate_fields(out, errors, warnings)
     return errors, warnings
+
+
+def check_gate_fields(out, errors, warnings):
+    """F.2: the per-task gate/manual/critical/risk rules and the header [[final_gate]] blocks.
+    A plan written before F keeps checking clean: no gate and no final gate are WARNINGS, never
+    errors. A gate is an exact command, so a malformed one is an error here and a `lines id` must
+    name an acceptance line of the SAME item."""
+    # F.2 task/subtask fields. ids collect every task and subtask id for `covers`.
+    items = [(t, t["id"] or "") for p in out["phases"] for t in p["tasks"]]
+    items += [(s, s["id"] or "") for t, _tid in items for s in t.get("subtasks") or []]
+    task_ids = [tid for t, tid in items if tid]
+    for t, tid in items:
+        rid = tid or "task"
+        gates = t.get("gate") or []
+        manual = t.get("manual", "")
+        if gates and manual:
+            errors.append(f"{rid}: gate and manual are exclusive; pick one")
+        elif not gates and not manual:
+            warnings.append(f"{rid}: neither gate nor manual line")
+        lines = {ln["id"] for ln in t.get("acceptance_lines") or []}
+        for i, g in enumerate(gates):
+            glabel = f"{tid} gate" if len(gates) == 1 else f"{rid} gate {i + 1}"
+            if not isinstance(g, dict):
+                errors.append(f"{glabel}: a gate is a table (cmd/expect/timeout/lines), "
+                              f"not {type(g).__name__}")
+                continue
+            if not isinstance(g.get("cmd"), str) or not g["cmd"].strip():
+                errors.append(f"{glabel}: needs cmd (a non-empty string)")
+            if type(g.get("expect")) is not int:
+                errors.append(f"{glabel}: expect must be an int, not {g.get('expect')!r}")
+            if type(g.get("timeout")) is not int:
+                errors.append(f"{glabel}: timeout must be an int, not {g.get('timeout')!r}")
+            glines = g.get("lines", [])
+            if not isinstance(glines, list):
+                errors.append(f"{glabel}: lines must be a list of acceptance line ids")
+                continue
+            for lid in glines:
+                if str(lid) not in lines:
+                    errors.append(f"{glabel}: lines id {lid!r} is not an acceptance line of {rid}")
+        risk = t.get("risk", 1)
+        if type(risk) is not int or isinstance(risk, bool) or not 1 <= risk <= 5:
+            errors.append(f"{rid}: risk {risk!r} is not an int 1-5")
+    # F.2 header [[final_gate]] blocks. F.0's [gates] tables and string gates are checked above,
+    # unchanged: only the shape of the new key is added here.
+    finals = out.get("final_gates") or []
+    for i, g in enumerate(finals):
+        if not isinstance(g, dict):
+            label = f"final gate {i + 1}"
+            errors.append(f"{label}: a final gate is a table "
+                          f"(id/cmd/expect/every/timeout/needs/covers), not {type(g).__name__}")
+            continue
+        label = f"final gate {g.get('id')}" if g.get("id") else f"final gate {i + 1}"
+        if not isinstance(g.get("cmd"), str) or not g["cmd"].strip():
+            errors.append(f"{label}: needs cmd (a non-empty string)")
+        if type(g.get("expect")) is not int:
+            errors.append(f"{label}: expect must be an int, not {g.get('expect')!r}")
+        if type(g.get("timeout")) is not int:
+            errors.append(f"{label}: timeout must be an int, not {g.get('timeout')!r}")
+        if g["every"] not in FINAL_EVERY:
+            errors.append(f"{label}: bad every {g['every']!r} ({'|'.join(FINAL_EVERY)})")
+        covers = g.get("covers") or []
+        if not covers:
+            errors.append(f"{label}: covers is required (the task ids this gate proves)")
+        for cid in covers:
+            if str(cid) not in task_ids:
+                errors.append(f"{label}: covers {cid!r} is not a task in this plan")
+    if not finals:
+        warnings.append("no final_gate in the plan: F.2 wants one plan-level gate with covers")
 
 
 # ---------- set / add-run (P1.3): rewrite only the key's line(s) ----------
@@ -838,10 +974,11 @@ def plan_title(body_md, plan_id):
 
 def header_json_of(out, sha, body_md, status):
     """The header_json approve and import both write: the sha of the file, the status, runs,
-    gates, phases and the body. Unknown header keys (created, design, integration, …) live here
-    on a store without the D1.1 columns."""
+    gates, the F.2 final gates, phases and the body. Unknown header keys (created, design,
+    integration, …) live here on a store without the D1.1 columns."""
     return json.dumps({"sha": sha, "status": status, "runs": out["runs"], "gates": out["gates"],
-                       "phases": out["phases"], "body": body_md}, sort_keys=True)
+                       "final_gates": out["final_gates"], "phases": out["phases"],
+                       "body": body_md}, sort_keys=True)
 
 
 def write_plan_row(con, plan_id, values, update=None):
@@ -930,24 +1067,48 @@ def _ensure_plan_assets(data, plan_id):
         os.makedirs(os.path.join(mkpaths.plan_dir(data, plan_id), "assets"), exist_ok=True)
 
 
-def approve_file(path, data, home, run):
+def changed_gate_names(prev, out):
+    """F.2: which frozen gate fields differ from the approved version in the store. `prev` is the
+    stored header_json; with no stored version at all there is nothing to differ from, so the
+    reply names nothing (a first approve is not a change). Keys are per item id, and a pre-F
+    header that carries the same ids compares equal on the defaults, so only a real move is
+    named. Sorted; [] when nothing moved."""
+    if not (prev.get("phases") or prev.get("gates") or prev.get("final_gates")):
+        return []
+    old, new = gate_fields_of(prev), gate_fields_of(out)
+    return sorted(k for k in set(old) | set(new) if old.get(k) != new.get(k))
+
+
+def approve_file(path, data, home, run, user_ack=None):
     """No store: validate and mark approved, exactly as set --status approved.
     With a store: validate, write the plan version and its tasks, copy the approved bytes into
-    the archive and leave the original file in place (C13 — approve copies, never moves)."""
+    the archive and leave the original file in place (C13 — approve copies, never moves).
+
+    F.2 freezes the gate fields of an approved version: a changed file is a NEW version, never an
+    overwrite, and the reply names the fields that moved (`P1.1.gate`, `gates.test`,
+    `final_gate[fg1]`, …). Lowering a task's `risk` or flipping `critical` true -> false is refused
+    unless `--user-ack "<quote>"` is given. The quote is recorded VERBATIM in the reply; the tool
+    cannot prove it came from the user (anyone who can run mk-plan can pass a quote), so
+    `user_ack` is a record of intent, not an authority check — the honest limit stated in the
+    skill."""
     data = resolve_data_arg(data)
     header, out, sha = read_plan(path)
     errors, warnings = check_plan(header, out)
     if errors:
         raise Fail(errors, warnings=warnings)
+    counts = gate_counts_of(out)
     if not store_present(data):
         side = side_store_warning(path)
         if side:  # a store next to the file was skipped: say so instead of going quiet
             warnings = warnings + [side]
+        reply = {"ok": True, "status": "approved", "store": False, "gate_counts": counts,
+                 "changed_gates": [], "warnings": warnings}
+        if user_ack is not None:  # recorded verbatim, the same way the store path does
+            reply["user_ack"] = user_ack
         if out["status"] == "approved":
-            return {"ok": True, "status": "approved", "store": False, "noop": True,
-                    "warnings": warnings}
+            return {**reply, "noop": True}
         set_status(path, "approved")
-        return {"ok": True, "status": "approved", "store": False, "warnings": warnings}
+        return reply
     db = _mkdb()
     home = db.resolve_home(home)
     plan_id = str(out["plan"])
@@ -975,6 +1136,18 @@ def approve_file(path, data, home, run):
                 prev = json.loads(row["header_json"])
             except ValueError:
                 prev = {}
+        # F.2: the gate fields of the approved version are frozen. Name what moved, and refuse a
+        # lowering of the bar (risk down, critical off) unless the caller recorded the user's word.
+        changed = changed_gate_names(prev, out)
+        lowered = lowered_gate_fields(changed, gate_fields_of(prev), gate_fields_of(out))
+        if lowered and not user_ack:
+            raise Fail([f"gate field(s) lowered: {', '.join(lowered)} — the approved version is "
+                        f"frozen; approve again with --user-ack \"<the user's words>\" to record "
+                        f"the decision"])
+        reply = {"ok": True, "status": "approved", "store": True, "gate_counts": counts,
+                 "changed_gates": changed}
+        if user_ack is not None:
+            reply["user_ack"] = user_ack
         # the archived file holds the approved bytes; a second approve of those bytes is a no-op.
         # a kill after the archive was written leaves the original on its old bytes: copy them.
         current = open(path, "rb").read()
@@ -989,9 +1162,9 @@ def approve_file(path, data, home, run):
                 if (archived_now != current
                         and os.path.abspath(path) != os.path.abspath(row["archived_path"])):
                     write_atomic(path, archived_now)
-                return {"ok": True, "status": "approved", "store": True, "noop": True,
-                        "version": row["version"], "archived": row["archived_path"],
-                        "tasks_run": run_id, "warnings": warnings}
+                return {**reply, "noop": True, "version": row["version"],
+                        "archived": row["archived_path"], "tasks_run": run_id,
+                        "warnings": warnings}
         # a kill after the plans row committed and before the archive existed: finish THAT
         # version instead of inserting another. the row's archived_path is where it belongs.
         resume = None
@@ -1078,10 +1251,67 @@ def approve_file(path, data, home, run):
             with contextlib.suppress(OSError):
                 write_atomic(plan_md, approved)
             _ensure_plan_assets(data, plan_id)
-        return {"ok": True, "status": "approved", "store": True, "version": version,
-                "archived": archive, "tasks_run": run_id, "warnings": warnings}
+        return {**reply, "version": version, "archived": archive, "tasks_run": run_id,
+                "warnings": warnings}
     finally:
         con.close()
+
+
+def gate_fields_of(out):
+    """F.2: the snapshot of every gate field an approved version freezes — per task/subtask `gate`,
+    `manual`, `critical` and `risk`, the header `[[final_gate]]` blocks and the F.0 `[gates]`
+    values. The names are what the approve reply reports when they change. A key whose stored
+    value is missing counts as changed when the new plan carries it, so a gate ADDED to an
+    approved plan is named too."""
+    snap = {}
+    for p in out.get("phases") or []:
+        for t in p["tasks"]:
+            for item in [t] + list(t.get("subtasks") or []):
+                iid = item.get("id") or ""
+                if not iid:
+                    continue
+                snap[f"{iid}.gate"] = jsonable(item.get("gate") or [])
+                snap[f"{iid}.manual"] = item.get("manual", "")
+                snap[f"{iid}.critical"] = bool(item.get("critical", False))
+                snap[f"{iid}.risk"] = item.get("risk", 1)
+    for k, v in (out.get("gates") or {}).items():
+        snap[f"gates.{k}"] = jsonable(v)
+    for i, g in enumerate(out.get("final_gates") or []):
+        named = isinstance(g, dict) and g.get("id")
+        snap[f"final_gate[{g.get('id') if named else i}]"] = jsonable(g)
+    return snap
+
+
+def lowered_gate_fields(changed, old, new):
+    """F.2: the changed field names that LOWER the plan's bar — a task `risk` int going down, or
+    `critical` flipping true -> false. Those need `--user-ack`. Raising risk, adding a gate or
+    setting critical true is a tightening and stays a plain version bump."""
+    out = []
+    for k in changed:
+        if k.endswith(".risk"):
+            before, after = old.get(k), new.get(k)
+            if type(before) is int and type(after) is int and after < before:
+                out.append(k)
+        elif k.endswith(".critical") and old.get(k) is True and new.get(k) is False:
+            out.append(k)
+    return sorted(out)
+
+
+def gate_counts_of(out):
+    """F.2 approve counts: `gated N, manual M, final K`. N counts every task or subtask that
+    carries at least one gate; M counts the ones whose only acceptance path is a `manual` line
+    (a manual beside a gate is refused by check, so the two never double-count)."""
+    gated = manual = 0
+    for p in out["phases"]:
+        for t in p["tasks"]:
+            for item in [t] + list(t.get("subtasks") or []):
+                if item.get("gate"):
+                    gated += 1
+                elif item.get("manual"):
+                    manual += 1
+    final = len(out.get("final_gates") or [])
+    return {"gated": gated, "manual": manual, "final": final,
+            "line": f"gated {gated}, manual {manual}, final {final}"}
 
 
 def toml_quote(s):
@@ -1136,7 +1366,7 @@ def export_plan(path, data, home):
 
 
 def cmd_approve(a):
-    return approve_file(a.path, a.data, a.home, a.run)
+    return approve_file(a.path, a.data, a.home, a.run, a.user_ack)
 
 
 def cmd_export(a):
@@ -1271,6 +1501,7 @@ def build_parser():
         c.add_argument("--home", default=None)
         if name == "approve":
             c.add_argument("--run", default=None)
+            c.add_argument("--user-ack", default=None)
         if name == "import":
             c.add_argument("--dry-run", action="store_true")
         c.set_defaults(func=func)
@@ -1293,6 +1524,293 @@ def main(argv):
 
 
 # ---------- self-test ----------
+
+
+def f2_check_self_test(tmp, mk, write, plan_text, phase, task):
+    # ---------- parse: acceptance array -> acceptance_lines (<id>.a1, <id>.a2, in order) ----------
+    text = plan_text(phases=phase("P1", tasks=task("P1.1", acceptance="ARR")) + "\n")
+    arr = 'acceptance = ["alpha", "beta"]'
+    p = write("f2-acc-arr.md", text.replace('acceptance = "ARR"', arr))
+    t = mk("parse", p)["phases"][0]["tasks"][0]
+    assert arr in open(p).read() and t["acceptance"] == "alpha\nbeta" \
+        and t.get("acceptance_lines") == [{"id": "P1.1.a1", "text": "alpha"},
+                                          {"id": "P1.1.a2", "text": "beta"}], t
+
+    # a plain string stays that string and is exactly one line, <id>.a1
+    p = write("f2-acc-str.md", plan_text(
+        phases=phase("P1", tasks=task("P1.1", acceptance="only line")) + "\n"))
+    t = mk("parse", p)["phases"][0]["tasks"][0]
+    assert t["acceptance"] == "only line" \
+        and t.get("acceptance_lines") == [{"id": "P1.1.a1", "text": "only line"}], t
+
+    # ---------- parse: gate is ALWAYS a list; absent = []; manual ""; critical bool; risk 1 ----------
+    p = write("f2-gate-one.md", plan_text(phases=phase(
+        "P1", tasks=task("P1.1", acceptance="a", extra='  gate = { cmd = "true" }\n')) + "\n"))
+    t = mk("parse", p)["phases"][0]["tasks"][0]
+    assert t.get("gate") == [{"cmd": "true", "expect": 0, "timeout": 600, "lines": []}], t.get("gate")
+
+    p = write("f2-gate-two.md", plan_text(phases=phase("P1", tasks=task(
+        "P1.1", acceptance="a",
+        extra='  gate = [{ cmd = "a" }, { cmd = "b", expect = 1, timeout = 2, lines = ["P1.1.a1"] }]\n')) + "\n"))
+    t = mk("parse", p)["phases"][0]["tasks"][0]
+    assert t.get("gate") == [{"cmd": "a", "expect": 0, "timeout": 600, "lines": []},
+                             {"cmd": "b", "expect": 1, "timeout": 2, "lines": ["P1.1.a1"]}], t.get("gate")
+
+    p = write("f2-none.md", plan_text(phases=phase("P1", tasks=task("P1.1", acceptance="a")) + "\n"))
+    t = mk("parse", p)["phases"][0]["tasks"][0]
+    assert "gate" in t and t["gate"] == [] and t["manual"] == "" and t["risk"] == 1 and \
+        t["critical"] is False, t  # absent gate is [], manual "", risk 1, critical bool(False)
+
+    # ---------- parse: [[final_gate]] defaults, and explicit values overriding them ----------
+    fg_min = '[[final_gate]]\nid = "F1"\ncmd = "true"\ncovers = ["P1.1"]\n'
+    manual_task = task("P1.1", acceptance="a", extra='  manual = "by hand"\n')
+    p = write("f2-fg-default.md", plan_text(top=fg_min, phases=phase("P1", tasks=manual_task) + "\n"))
+    out = mk("parse", p)
+    assert out.get("final_gates") == [{"id": "F1", "cmd": "true", "expect": 0, "every": "merge",
+                                       "timeout": 600, "needs": [], "covers": ["P1.1"]}] \
+        and out["gates"] == {"test": "true"}, out  # F.0 header gates untouched by the new key
+
+    p = write("f2-fg-explicit.md", plan_text(
+        top='[[final_gate]]\nid = "F1"\ncmd = "true"\ncovers = ["P1.1"]\n'
+            'expect = 3\ntimeout = 5\nevery = "phase"\nneeds = ["P1.1"]\n',
+        phases=phase("P1", tasks=manual_task) + "\n"))
+    fgs = mk("parse", p).get("final_gates") or []
+    assert len(fgs) == 1, fgs
+    fg = fgs[0] if fgs and isinstance(fgs[0], dict) else {}
+    assert (fg["id"], fg["cmd"], fg["expect"], fg["every"], fg["timeout"], fg["needs"], fg["covers"]) \
+        == ("F1", "true", 3, "phase", 5, ["P1.1"], ["P1.1"]), fg
+
+    # ---------- check errors: one case per rule. each ok:false, exit 2, parse stays ok:true ----------
+    def bad(name, phases, top="", want=None):
+        q = write(name, plan_text(top=top, phases=phases))
+        got = mk("check", q, code=2)
+        parsed = mk("parse", q)  # parse never runs the check rules: the file is still parseable
+        assert got["ok"] is False and parsed["ok"] is True \
+            and "acceptance_lines" in parsed["phases"][0]["tasks"][0], (name, got, parsed)
+        if want is not None:
+            assert want in [str(e) for e in got["errors"]], (name, got["errors"])
+        return got
+
+    gated = task("P1.1", acceptance="a", extra='  gate = { cmd = "true" }\n')
+
+    # E1: gate and manual are exclusive
+    bad("f2-e1.md", phase("P1", tasks=task(
+        "P1.1", acceptance="a", extra='  gate = { cmd = "true" }\n  manual = "by hand"\n')) + "\n",
+        want="P1.1: gate and manual are exclusive; pick one")
+
+    # E2: a gate table needs a non-empty cmd
+    bad("f2-e2.md", phase("P1", tasks=task(
+        "P1.1", acceptance="a", extra='  gate = { expect = 0 }\n')) + "\n",
+        want="P1.1 gate: needs cmd (a non-empty string)")
+
+    # E5: a gate line that is ANOTHER task's acceptance line
+    bad("f2-e5.md", phase("P1", tasks=task(
+        "P1.1", acceptance="a", extra='  gate = { cmd = "true", lines = ["P1.2.a1"] }\n')
+        + task("P1.2", acceptance="b")) + "\n",
+        want="P1.1 gate: lines id 'P1.2.a1' is not an acceptance line of P1.1")
+
+    # E6: a gate list element that is not a table. one element -> "P1.1 gate", two -> "P1.1 gate 2"
+    bad("f2-e6-single.md", phase("P1", tasks=task(
+        "P1.1", acceptance="a", extra='  gate = ["true"]\n')) + "\n",
+        want="P1.1 gate: a gate is a table (cmd/expect/timeout/lines), not str")
+    bad("f2-e6-second.md", phase("P1", tasks=task(
+        "P1.1", acceptance="a", extra='  gate = [{ cmd = "true" }, "true"]\n')) + "\n",
+        want="P1.1 gate 2: a gate is a table (cmd/expect/timeout/lines), not str")
+
+    # E7: lines must be a list of acceptance line ids
+    bad("f2-e7.md", phase("P1", tasks=task(
+        "P1.1", acceptance="a", extra='  gate = { cmd = "true", lines = "P1.1.a1" }\n')) + "\n",
+        want="P1.1 gate: lines must be a list of acceptance line ids")
+
+    # E8: risk is an int 1-5 (an out-of-range int and a string)
+    bad("f2-e8-int.md", phase("P1", tasks=task(
+        "P1.1", acceptance="a", extra="  risk = 9\n")) + "\n",
+        want="P1.1: risk 9 is not an int 1-5")
+    bad("f2-e8-str.md", phase("P1", tasks=task(
+        "P1.1", acceptance="a", extra='  risk = "high"\n')) + "\n",
+        want="P1.1: risk 'high' is not an int 1-5")
+
+    # E9: a final gate needs covers
+    bad("f2-e9.md", phase("P1", tasks=task("P1.1", acceptance="a")) + "\n",
+        top='[[final_gate]]\nid = "F1"\ncmd = "true"\n',
+        want="final gate F1: covers is required (the task ids this gate proves)")
+
+    # E10: covers names something that is not a task in this plan
+    bad("f2-e10.md", phase("P1", tasks=task("P1.1", acceptance="a")) + "\n",
+        top='[[final_gate]]\nid = "F1"\ncmd = "true"\ncovers = ["NOPE"]\n',
+        want="final gate F1: covers 'NOPE' is not a task in this plan")
+
+    # E11: every is merge|phase|run_end
+    bad("f2-e11.md", phase("P1", tasks=task("P1.1", acceptance="a")) + "\n",
+        top='[[final_gate]]\nid = "F1"\ncmd = "true"\ncovers = ["P1.1"]\nevery = "weekly"\n',
+        want="final gate F1: bad every 'weekly' (merge|phase|run_end)")
+
+    # E12/E13: a final gate's expect/timeout must be ints
+    bad("f2-e12.md", phase("P1", tasks=task("P1.1", acceptance="a")) + "\n",
+        top='[[final_gate]]\nid = "F1"\ncmd = "true"\ncovers = ["P1.1"]\nexpect = "0"\n',
+        want="final gate F1: expect must be an int, not '0'")
+    bad("f2-e13.md", phase("P1", tasks=task("P1.1", acceptance="a")) + "\n",
+        top='[[final_gate]]\nid = "F1"\ncmd = "true"\ncovers = ["P1.1"]\ntimeout = "60"\n',
+        want="final gate F1: timeout must be an int, not '60'")
+
+    # E15: a final gate is a table; with no id the label is its 1-based index
+    bad("f2-e15.md", phase("P1", tasks=task("P1.1", acceptance="a")) + "\n",
+        top='final_gate = ["x"]\n',
+        want="final gate 1: a final gate is a table (id/cmd/expect/every/timeout/needs/covers), not str")
+
+    # ---------- check warnings: W1, W2, and the plan that carries neither ----------
+    def t1(w):  # the pre-existing T1 warnings: created/status/H1
+        return ("created" in w) or ("status" in w) or ("H1" in w)
+
+    out = mk("check", write("f2-w1.md", plan_text(phases=phase("P1", tasks=gated) + "\n")))
+    assert out["ok"] is True and not [w for w in out["warnings"] if "neither gate nor manual" in w] \
+        and "no final_gate in the plan: F.2 wants one plan-level gate with covers" in out["warnings"], out
+
+    out = mk("check", write("f2-w2.md", plan_text(
+        top=fg_min, phases=phase("P1", tasks=task("P1.1", acceptance="a")) + "\n")))
+    assert out["ok"] is True and not [w for w in out["warnings"] if "no final_gate" in w] \
+        and "P1.1: neither gate nor manual line" in out["warnings"], out
+
+    # a gate on one task, a manual on another and one final gate over both: no W1 and no W2
+    out = mk("check", write("f2-quiet.md", plan_text(
+        top='[[final_gate]]\nid = "F1"\ncmd = "true"\ncovers = ["P1.1", "P1.2"]\n',
+        phases=phase("P1", tasks=gated
+                     + task("P1.2", acceptance="b", extra='  manual = "by hand"\n')) + "\n")))
+    # [w for w in ... ] must be empty AND the gate-bearing task must still report its F.2 keys
+    qg = mk("parse", os.path.join(tmp, "f2-quiet.md"))["phases"][0]["tasks"][0].get("gate")
+    assert out["ok"] is True and [w for w in out["warnings"] if not t1(w)] == [] \
+        and isinstance(qg, list) and qg == [{"cmd": "true", "expect": 0, "timeout": 600, "lines": []}], \
+        (out, qg)
+
+    # ---------- subtask gates: a foreign line is E5, its own line checks clean ----------
+    def sub(line_id):
+        return ('  [[phase.task.subtask]]\n  id = "P1.1.1"\n  title = "s"\n  acceptance = "sub"\n'
+                '  refs = []\n  owned = []\n'
+                f'  gate = {{ cmd = "true", lines = ["{line_id}"] }}\n')
+
+    bad("f2-sub-foreign.md", phase("P1", tasks=task(
+        "P1.1", acceptance="a", extra='  manual = "by hand"\n' + sub("P1.1.a1"))) + "\n",
+        want="P1.1.1 gate: lines id 'P1.1.a1' is not an acceptance line of P1.1.1")
+
+    p = write("f2-sub-own.md", plan_text(
+        top=fg_min, phases=phase("P1", tasks=task(
+            "P1.1", acceptance="a", extra='  manual = "by hand"\n' + sub("P1.1.1.a1"))) + "\n"))
+    out = mk("parse", p)
+    subs = out["phases"][0]["tasks"][0].get("subtasks") or []
+    st = subs[0] if subs and isinstance(subs[0], dict) else {}
+    assert mk("check", p)["ok"] is True \
+        and st.get("gate") == [{"cmd": "true", "expect": 0, "timeout": 600, "lines": ["P1.1.1.a1"]}] \
+        and st.get("acceptance_lines") == [{"id": "P1.1.1.a1", "text": "sub"}], (out, st)
+
+    # ---------- F.0 regression guard: the header [gates] contract has not moved ----------
+    # F.0 regression guard, on purpose: the first four clauses ([gates.slow] and [gates.strict]
+    # unchanged, a plain string gate still a string, the plan still checking clean) must hold on
+    # main and on the F.2 tip alike. The F.2 clause that follows them — an absent task `gate` is a
+    # list — is what makes this same assert fail on main, so the guard is never a no-op there.
+    p = write("f2-f0.md", plan_text(
+        head_extra='slow = { cmd = "sleep 1", expect = 7, timeout = 99 }\nstrict = "npm run strict"\n',
+        phases=phase("P1", tasks=task("P1.1", acceptance="a")) + "\n"))
+    out = mk("parse", p)
+    assert out["gates"]["test"] == "true" \
+        and out["gates"]["slow"] == {"cmd": "sleep 1", "expect": 7, "timeout": 99} \
+        and out["gates"]["strict"] == "npm run strict" \
+        and mk("check", p)["ok"] is True \
+        and out["phases"][0]["tasks"][0].get("gate") == [], out
+
+
+def f2_approve_self_test(tmp, mk, write, plan_text, phase, task, db, mkpaths):
+    """F.2: approve counts every gate and manual line, a changed gate field is a NEW version that
+    names the field, and lowering the bar (risk down, critical off) needs --user-ack. FAILS on
+    main: no gate_counts, no changed_gates, and --user-ack does not exist there."""
+    data = os.path.join(tmp, "f2-store")
+    home = os.path.join(data, ".mk-home")
+    os.makedirs(home, exist_ok=True)
+    db.open_project(home, data_dir=mkpaths.project_folder(data, home)).close()
+
+    def doc(pid, risk=4, gate='pytest -q', final="", head_test="true", crit=False, body="# body\n"):
+        return plan_text(plan=f'plan = "{pid}"', top=final,
+                         head_extra="", status='status = "draft"',
+                         phases=phase("P1", tasks=task(
+                             "P1.1", acceptance="a",
+                             extra=(f'  gate = {{ cmd = "{gate}" }}\n'
+                                    f'  critical = {str(crit).lower()}\n  risk = {risk}\n'))) + "\n").replace(
+            'test = "true"', f'test = "{head_test}"') + body
+
+    def approve(path, *args, code=0):
+        return mk("approve", path, "--data", data, "--home", home, *args, code=code)
+
+    # 1. no store: the reply still counts the gate lines (no version to compare against)
+    d1, h1 = os.path.join(tmp, "f2-empty"), os.path.join(tmp, "f2-empty-home")
+    counts = mk("approve", write("f2-counts.md", plan_text(
+        top='[[final_gate]]\nid = "F1"\ncmd = "true"\ncovers = ["P1.1", "P1.2"]\n',
+        phases=phase("P1", tasks=(
+            task("P1.1", acceptance="a", extra='  gate = { cmd = "true" }\n')
+            + task("P1.2", acceptance="b", extra='  manual = "read it by eye"\n'))) + "\n")),
+        "--data", d1, "--home", h1)
+    assert counts["gate_counts"]["line"] == "gated 1, manual 1, final 1", counts
+    assert (counts["gate_counts"]["gated"], counts["gate_counts"]["manual"],
+            counts["gate_counts"]["final"]) == (1, 1, 1), counts
+
+    # 2. first approve with a store: version 1, nothing named as changed, no user_ack key
+    p = write("f2a.md", doc("f2a"))
+    v1 = approve(p, "--run", "f2r")
+    assert v1["ok"] and v1["version"] == 1 and v1["changed_gates"] == [], v1
+    assert "user_ack" not in v1, v1
+    again = approve(p, "--run", "f2r")
+    assert again.get("noop") is True and again["changed_gates"] == [], again
+
+    # 3. a changed gate command is a NEW version naming the field; the old archive stays, and the
+    #    file itself is left in place (C13)
+    write("f2a.md", doc("f2a", gate="pytest -q -x"))
+    v2 = approve(p, "--run", "f2r")
+    assert v2["version"] == 2 and "P1.1.gate" in v2["changed_gates"], v2
+    assert os.path.isfile(v1["archived"]) and v2["archived"] != v1["archived"], (v1, v2)
+    assert os.path.isfile(p), "approve must leave the original file in place"
+
+    # 4. lowering risk 4 -> 2 is refused without --user-ack (file and store unchanged), and
+    #    accepted with it: the quote is recorded verbatim
+    write("f2a.md", doc("f2a", risk=2, gate="pytest -q -x"))
+    before = open(p, "rb").read()
+    refused = approve(p, "--run", "f2r", code=2)
+    assert refused["ok"] is False, refused
+    assert any("gate field(s) lowered:" in e and "P1.1.risk" in e for e in refused["errors"]), refused
+    assert open(p, "rb").read() == before
+    con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
+    try:
+        assert con.execute("SELECT version FROM plans WHERE id='f2a'").fetchone()["version"] == 2
+    finally:
+        con.close()
+    acked = approve(p, "--run", "f2r", "--user-ack", "the user said ship it")
+    assert acked["version"] == 3 and acked["user_ack"] == "the user said ship it", acked
+    assert "P1.1.risk" in acked["changed_gates"], acked
+
+    # 5. critical true -> false is refused without the ack; false -> true is a plain version bump
+    write("f2a.md", doc("f2a", risk=2, gate="pytest -q -x", crit=True))
+    on = approve(p, "--run", "f2r")
+    assert on["version"] == 4 and "P1.1.critical" in on["changed_gates"], on
+    write("f2a.md", doc("f2a", risk=2, gate="pytest -q -x", crit=False))
+    off = approve(p, "--run", "f2r", code=2)
+    assert any("gate field(s) lowered:" in e and "P1.1.critical" in e for e in off["errors"]), off
+
+    # 6. RAISING risk 2 -> 4 is a tightening: no ack needed, still a new version naming the field
+    acked_off = approve(p, "--run", "f2r", "--user-ack", "drop the critical flag")
+    assert acked_off["version"] == 5 and "P1.1.critical" in acked_off["changed_gates"], acked_off
+    write("f2a.md", doc("f2a", risk=4, gate="pytest -q -x", crit=False))
+    up = approve(p, "--run", "f2r")
+    assert up["version"] == 6 and "P1.1.risk" in up["changed_gates"], up
+
+    # 7. a NEW [[final_gate]] block and a changed header [gates] value are both named; the counts
+    #    follow the file
+    write("f2a.md", doc("f2a", risk=4, gate="pytest -q -x", crit=False,
+                        final='[[final_gate]]\nid = "fg1"\ncmd = "true"\ncovers = ["P1.1"]\n'))
+    fg = approve(p, "--run", "f2r")
+    assert fg["version"] == 7 and fg["changed_gates"] == ["final_gate[fg1]"], fg
+    assert fg["gate_counts"]["line"] == "gated 1, manual 0, final 1", fg
+    write("f2a.md", doc("f2a", risk=4, gate="pytest -q -x", crit=False, head_test="false",
+                        final='[[final_gate]]\nid = "fg1"\ncmd = "true"\ncovers = ["P1.1"]\n'))
+    hg = approve(p, "--run", "f2r")
+    assert hg["version"] == 8 and hg["changed_gates"] == ["gates.test"], hg
+
 
 def self_test():
     import shutil, subprocess
@@ -1341,6 +1859,13 @@ def self_test():
         return (f"  [[phase.task]]\n  id = \"{tid}\"\n  title = \"{title}\"\n"
                 f"  acceptance = \"{acceptance}\"\n  {rf}\n  subagent = {sa}\n  {ow}\n{extra}")
 
+    def f2_warnings(warnings):
+        """F.2: the two advisory warnings a pre-F plan now carries (no plan-level final gate, an
+        item with neither gate nor manual). The assertions below compare against the warnings
+        that are NOT these, so an old plan still has to be otherwise quiet."""
+        return [w for w in warnings if "no final_gate in the plan" not in w
+                and not w.endswith(": neither gate nor manual line")]
+
     try:
         # P1.1 parse — the two real files (read-only) must give the C2 JSON
         out = mk("parse", template)
@@ -1362,12 +1887,16 @@ def self_test():
         assert all(p["reviewer"] == "" for p in out["phases"])  # optional key defaults to ""
         assert out["phases"][0]["review"] == "data-loss" and out["phases"][0]["size"] == "standard"
 
-        # P1.2 check — both real files are clean (ok:true, exit 0, no warnings):
-        # missing optional keys are quiet, and neither file carries a real problem
+        # P1.2 check — both real files are clean (ok:true, exit 0): neither carries a real
+        # problem. F.2 adds the two advisories a plan written before F earns (no final gate, an
+        # item with neither gate nor manual), and the shipped template carries the F.2 fields, so
+        # only the fixture plan-link.md — which is NOT part of this change and stays as it is —
+        # is allowed to carry them.
         out = mk("check", template)
-        assert out["ok"] and out["warnings"] == [] and out["sha"]
+        assert out["ok"] and out["warnings"] == [] and out["sha"], out.get("warnings")
         out = mk("check", real_plan)
-        assert out["ok"] and out["sha"] and out["warnings"] == [], out["plan"]
+        assert out["ok"] and out["sha"] and f2_warnings(out["warnings"]) == [], out["plan"]
+        assert any("no final_gate in the plan" in w for w in out["warnings"])  # the F.2 advisory
 
         # a phase without its own subagents key inherits session.subagents (yaml), else the
         # schema default true; a phase that sets it keeps its own value
@@ -1474,7 +2003,7 @@ def self_test():
             phases=phase("P1", extra='reviewer = "opencode opencode-go/kimi-k3"\n') + "\n"))
         out = mk("parse", p)
         assert out["phases"][0]["reviewer"] == "opencode opencode-go/kimi-k3"
-        assert mk("check", p)["warnings"] == []
+        assert f2_warnings(mk("check", p)["warnings"]) == []
 
         # warnings: advisories never fail the check
         p = write("warn.md", plan_text(
@@ -1490,7 +2019,7 @@ def self_test():
                            'route = ""\nsize = "standard"\nrisk = "read_only"\nreview = "light"\n'
                            'qa = []\ncommit = ""\nsubagents = false\n\n'))
         out = mk("check", p)
-        assert out["ok"] is True and out["warnings"] == [], out  # no optional keys: still quiet
+        assert out["ok"] is True and f2_warnings(out["warnings"]) == [], out  # no optional keys: still quiet
 
         # T1 — the header keys that fill a plans column: a missing one warns, never errors.
         # each case is ok: true; on the pre-T1 code the warnings list is empty and these fail.
@@ -1543,6 +2072,16 @@ def self_test():
                        "tasks.deps", "tasks.parallel", "tasks.route_json", "tasks.type",
                        "tasks.parent", "header_json only"):
             assert needle in tmpl, needle
+        # F.2: the template documents the new contract and carries a working example — one task
+        # with a gate, one with a manual, critical/risk, an acceptance list and a final gate.
+        for needle in ("[[final_gate]]", "covers", "gate = { cmd", "manual = \"<why",
+                       "critical = true", "risk = 3"):
+            assert needle in tmpl, needle
+        p0 = out["phases"][0]
+        assert p0["tasks"][0]["gate"] and p0["tasks"][0]["acceptance_lines"] \
+            and len(p0["tasks"][0]["acceptance_lines"]) == 2, p0["tasks"][0]
+        assert any(t["manual"] for t in p0["tasks"]), p0["tasks"]
+        assert out["final_gates"] and out["final_gates"][0]["covers"], out["final_gates"]
 
         # F0-BLOCK-BEGIN — F.0: a table gate is runnable, a plain string gate stays manual
         p = write("gate-table.md", plan_text(head_extra=(
@@ -1565,6 +2104,10 @@ def self_test():
             assert e["ok"] is False, e
             assert any("gate x" in x and why in x for x in e["errors"]), (name, e)
         # F0-BLOCK-END
+
+        # F.2 — the plan contract: acceptance lines, per-task gate OR manual, critical/risk,
+        # header [[final_gate]] with covers, and the frozen-gate rules in approve.
+        f2_check_self_test(tmp, mk, write, plan_text, phase, task)
 
         # P1.3 set — body byte-identical, only the status line changes
         import shutil as sh
@@ -2184,6 +2727,10 @@ def self_test():
         assert out["ok"] and out["moved"] == os.path.join(proj, "plans", "migplan", "archive", "plan.md"), out
         # nothing was written under the repo's .matrixkoder
         assert tree_hash(mig_data) == before, "a migrated mk-plan wrote under the repo .matrixkoder"
+
+        # F.2 approve — counts, the frozen gate fields (a change is a new version naming the field)
+        # and the --user-ack refusal. db and mkpaths are already in scope here.
+        f2_approve_self_test(tmp, mk, write, plan_text, phase, task, db, mkpaths)
 
         print("mk-plan self-test ok")
     finally:
