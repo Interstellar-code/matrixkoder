@@ -329,6 +329,25 @@ def bus_location(data_dir):
     return _paths("bus_dir", data_dir)
 
 
+def live_bus_dir(data_dir):
+    """The directory whose bus.json describes the bus actually serving this data dir.
+
+    mkpaths resolves the L6.1 bus/ folder under the MK home the moment a project
+    store exists. A data dir that gains its store while a file-mode bus is still
+    running — mk-state, driven by `answer`, creates that store — moves every bus
+    file to a bus/ folder with no bus.json in it, so a client answered "bus down"
+    against a bus that was alive and a freshly minted lane token was written where
+    no bus reads it (401 on that lane's next request). The live bus.json names the
+    directory the running bus serves, so it wins over the resolution.
+    """
+    new_dir = bus_location(data_dir)
+    if os.path.isfile(os.path.join(new_dir, "bus.json")):
+        return new_dir
+    if os.path.isfile(os.path.join(data_dir, "bus.json")):
+        return data_dir
+    return new_dir
+
+
 def project_slug_for(data_dir):
     """The root projects.slug whose data_dir is this path, or None in file mode.
 
@@ -590,6 +609,11 @@ class BusState:
         self.any_cond = threading.Condition(self.lock)
         self.tokens = {}
         self.tokens_mtime = 0
+        # Bus-file paths, pinned on first use (see _bus_file). mkpaths re-decides
+        # bus_dir per call and a project store appearing mid-process would move a
+        # live server's files under it, so this cache is the file-side twin of
+        # use_store below.
+        self._bus_files = {}
         # Decided once at process start. A store that appears mid-process is ignored
         # so a file-mode server never starts writing the store halfway through.
         self.use_store = store_mode(self.project_dir)
@@ -627,10 +651,32 @@ class BusState:
 
     def _bus_file(self, name):
         """One bus-file path from mkpaths (bus_json / bus_tokens / bus_tokens_lock /
-        ring_queue ...), resolved against this bus's project dir. A BusState assembled
-        with __new__ — a self-test stub — carries only `data_dir`, the bus dir itself,
-        so that is the fallback base; every real instance sets project_dir."""
-        return _paths(name, getattr(self, "project_dir", None) or self.data_dir)
+        ring_queue ...), resolved against this bus's project dir and then PINNED for
+        this server's lifetime.
+
+        mkpaths resolves bus_dir per call, and its rule flips the moment a project
+        store exists: file mode keeps the data dir, store mode moves the files to the
+        MK home's bus/ folder. A live server must not have its token file, ring queue
+        or lock move under it, because the files it reads and writes were placed at the
+        serve-time location by the very process it serves: mk-state, driven by an
+        `answer`, creates <data>/mk.db while the bus runs, which moved a file-mode
+        bus's tokens to a bus/ folder that holds none of its tokens, so every lane
+        token answered 401 on a bus that was alive and delivering (Z4). First use is
+        serve time (retire_orch_tokens + add_token in cmd_serve), so the pinned path is
+        the one the bus registered its own tokens in.
+
+        A BusState assembled with __new__ — a self-test stub — carries neither
+        project_dir nor _bus_files, so both are read defensively and such a state
+        resolves per call as before."""
+        base = getattr(self, "project_dir", None) or self.data_dir
+        pinned = getattr(self, "_bus_files", None)
+        if pinned is None:
+            return _paths(name, base)
+        path = pinned.get(name)
+        if path is None:
+            path = _paths(name, base)
+            pinned[name] = path
+        return path
 
     def mark_ask_once(self, run, ask_id):
         """True exactly once per (run, ask id): the caller may run its one blocked-marking write."""
@@ -2829,9 +2875,11 @@ def cmd_token(args):
 
     write_json(lane_file, payload, mode=0o600)
 
-    bus_dir = bus_location(data_dir)
-    lock_path = _paths("bus_tokens_lock", data_dir)
-    tokens_path = _paths("bus_tokens", data_dir)
+    # The token must land in the file the bus actually reads: the live bus's dir,
+    # not the resolution a store appearing mid-flight would name (Z4).
+    bus_dir = live_bus_dir(data_dir)
+    lock_path = os.path.join(bus_dir, "bus-tokens.lock")
+    tokens_path = os.path.join(bus_dir, "bus-tokens.json")
     entry = {
         "project": project_slug_for(data_dir) if store_mode(data_dir) else None,
         "token": tok,
@@ -2878,9 +2926,9 @@ def cmd_revoke(args):
         except OSError:
             pass
 
-    bus_dir = bus_location(data_dir)
-    lock_path = _paths("bus_tokens_lock", data_dir)
-    tokens_path = _paths("bus_tokens", data_dir)
+    bus_dir = live_bus_dir(data_dir)
+    lock_path = os.path.join(bus_dir, "bus-tokens.lock")
+    tokens_path = os.path.join(bus_dir, "bus-tokens.json")
     lfd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     os.fchmod(lfd, 0o600)
     fcntl.flock(lfd, fcntl.LOCK_EX)
@@ -2904,7 +2952,7 @@ def cmd_revoke(args):
 
 
 def _get_client_conn(data_dir):
-    bus_json_path = _paths("bus_json", data_dir)
+    bus_json_path = os.path.join(live_bus_dir(data_dir), "bus.json")
     if not os.path.exists(bus_json_path):
         raise Fail("bus down")
     bdata = read_json(bus_json_path)
@@ -3582,11 +3630,15 @@ def _orch_token(data_dir):
     repo on the machine and bus.json's token belongs to the project that started it; an
     orchestrator of another project uses (or mints) its own project-scoped orch token in
     bus-tokens.json, so its messages land in its own store and run, never the host's."""
-    bus_json = read_json(_paths("bus_json", data_dir)) or {}
+    # The live bus's dir, not the resolution a store appearing mid-flight names: the
+    # token must be one the bus that is actually running accepts (Z4).
+    base = live_bus_dir(data_dir)
+    bus_json = read_json(os.path.join(base, "bus.json")) or {}
     slug = project_slug_for(data_dir)
     if bus_json.get("token") and (slug is None or bus_json.get("project") in (None, slug)):
         return bus_json["token"]
-    tp, tl = _paths("bus_tokens", data_dir), _paths("bus_tokens_lock", data_dir)
+    tp = os.path.join(base, "bus-tokens.json")
+    tl = os.path.join(base, "bus-tokens.lock")
     lfd = os.open(tl, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(lfd, fcntl.LOCK_EX)
@@ -7730,6 +7782,64 @@ def self_test():
         except urllib.error.HTTPError as e:
             assert e.code == 400, f"Expected 400 for ack with unknown reply_to, got {e.code}"
         done("ask->answer round trip + honest acks")
+
+        # 7c. Z4: a store appearing mid-flight must not move a live bus's files.
+        # `answer` runs mk-state, which creates <data>/mk.db while the server above
+        # is still running; mkpaths then resolves this bus's token file into the MK
+        # home's bus/ folder, which holds none of the tokens registered here. The bus
+        # pins its file paths at serve time (the file-side twin of use_store), so the
+        # lane token above keeps answering instead of 401 on a live, delivering bus.
+        data_flip = os.path.join(tmp, "data_flip")
+        os.makedirs(data_flip, exist_ok=True)
+        rc, res_flip, _ = cli(["ensure", "--data", data_flip, "--run", "rf"])
+        assert rc == 0 and res_flip["ok"] is True, res_flip
+        pids.append(res_flip["pid"])
+        port_flip = res_flip["port"]
+        lane_flip = os.path.join(tmp, "lane_flip")
+        os.makedirs(lane_flip, exist_ok=True)
+        rc, res_flip_tok, _ = cli(["token", "--lane", lane_flip, "--task", "T1", "--run", "rf",
+                                   "--data", data_flip])
+        assert rc == 0 and res_flip_tok["ok"] is True, res_flip_tok
+        token_flip = res_flip_tok["token"]
+        with urllib.request.urlopen(urllib.request.Request(
+                f"http://127.0.0.1:{port_flip}/wait?lane=T1&after=0&timeout=1",
+                headers={"Authorization": f"Bearer {token_flip}",
+                         "Host": f"127.0.0.1:{port_flip}"}), timeout=5.0) as resp:
+            assert json.loads(resp.read().decode("utf-8"))["ok"] is True, "flip bus: token before"
+        # The flip: a project store appears under the data dir mid-flight, exactly
+        # what mk-state does for this bus when a lane's ask is answered.
+        with open(os.path.join(data_flip, "mk.db"), "wb") as f:
+            f.write(b"")
+        with urllib.request.urlopen(urllib.request.Request(
+                f"http://127.0.0.1:{port_flip}/wait?lane=T1&after=0&timeout=1",
+                headers={"Authorization": f"Bearer {token_flip}",
+                         "Host": f"127.0.0.1:{port_flip}"}), timeout=5.0) as resp:
+            flip_ok = json.loads(resp.read().decode("utf-8"))["ok"]
+        assert flip_ok is True, "a mid-flight store must not move the bus's token file (401)"
+        # a lane ask + its ack, straight over HTTP (the CLI resolves the bus through
+        # bus.json, which the flip legitimately moves): both must still answer 200
+        req_flip_ask = urllib.request.Request(
+            f"http://127.0.0.1:{port_flip}/send",
+            data=json.dumps({"run": "rf", "task": "T1", "kind": "ask", "text": "still mine?",
+                             "from": "T1", "to": "orch"}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token_flip}",
+                     "Host": f"127.0.0.1:{port_flip}"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req_flip_ask, timeout=5.0) as resp:
+            flip_ask = json.loads(resp.read().decode("utf-8"))
+        assert flip_ask["ok"] is True, flip_ask
+        req_flip_ack = urllib.request.Request(
+            f"http://127.0.0.1:{port_flip}/ack",
+            data=json.dumps({"id": flip_ask["message"]["id"], "ack_level": 3, "run": "rf"}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token_flip}",
+                     "Host": f"127.0.0.1:{port_flip}"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req_flip_ack, timeout=5.0) as resp:
+            flip_ack = json.loads(resp.read().decode("utf-8"))
+        assert flip_ack["ok"] is True, flip_ack
+        done("a store appearing mid-flight never moves the bus's token file")
 
         # 7b. Cross-lane ack forgery refused on EVERY ack path (MEDIUM 1):
         # T1 must not ack T2's messages, via /send kind=ack AND via /ack.
