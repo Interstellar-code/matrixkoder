@@ -126,7 +126,7 @@ The project DB is the only truth (C4); run.json / index.json / task.json / event
 are never written. Legacy projects migrate through mk-store-import.py.
 Schema: docs/state-schema.md
 """
-import argparse, contextlib, datetime, fcntl, fnmatch, hashlib, importlib.util, json, math, os, re, shlex, shutil, socket, subprocess, sys, tempfile
+import argparse, contextlib, datetime, fcntl, fnmatch, hashlib, importlib.util, json, math, os, re, shlex, shutil, signal, socket, subprocess, sys, tempfile, threading, time
 
 SCHEMA = 1
 STATUSES = ("planned routed dispatched building verifying review fix rework merged qa done "
@@ -143,6 +143,8 @@ SET_LIST_KEYS = ("owned", "deps", "refs")
 # the same rule `plan sync` applies, one writer's worth of it.
 SET_START_KEYS = ("title", "acceptance", "owned", "deps", "refs")
 EDITABLE_WHILE = ("planned", "routed")
+# F.2: the plan's gate fields (and the stored names they ride under) are never settable by task set
+GATE_READONLY_KEYS = ("gate", "manual", "critical", "risk", "base_risk", "acceptance_lines")
 ROUND_KINDS = ("build", "fix", "takeover")
 # A new round must not inherit the previous round's terminal row. File mode never wrote
 # status on `task round` (the row stays whatever it was); the store path maps each kind
@@ -164,6 +166,11 @@ CLOSED_STATUSES = ("merged", "qa", "done")
 GATE_LOAD_MAX = 40.0        # 1-minute load average above this defers a gate: it blocks, never passes
 GATE_TIMEOUT_DEFAULT = 600
 GATE_OUTPUT_LINES = 20      # output lines a gate failure quotes
+GATE_TAIL_BYTES = 4000      # bytes of a gate's output kept as its evidence tail
+# `gate run` writes one evidence row per gate run; its result is one of these (the evidence table
+# has no CHECK, so this tuple is the enum). pass -> green, fail exit=N -> red, invalid -> error.
+EVIDENCE_RESULTS = ("green", "red", "timeout", "deferred", "error")
+GATE_DUE_TASK_STATUSES = ("verifying", "review")  # --due: tasks in these statuses have their gates due
 
 # The project store is opt-in. With the project store absent, nothing below runs.
 # Z3: the root projection's slug is the project's OWN slug, resolved from the data dir through
@@ -177,12 +184,17 @@ ROOT_CRASH = "MK_ROOT_CRASH"   # test seam: project commit lands, the root card 
 # fields the tasks table has no column for; they live in the project DB's tasks.extra_json
 # column (L4, C4: a new column of the existing project schema, never a duplicated field)
 TASK_FILE_KEYS = ("wave", "ready", "workspace", "last_commit", "gates", "rounds", "created",
-                  "plan_phase", "plan_task", "route", "lane_group", "reviewer", "refs", "deps")
+                  "plan_phase", "plan_task", "route", "lane_group", "reviewer", "refs", "deps",
+                  # F.2 plan contract, copied from `mk-plan parse` and read-only after that (task set
+                  # refuses them). `gate` is a list of {cmd, expect, timeout, lines} tables, the shape
+                  # _gate_run already runs; `manual` is a line nobody runs. `base_risk` is the plan's
+                  # `risk` under the name mkdb._task_risk reads (derived risk = base + open reasons).
+                  "gate", "manual", "critical", "base_risk", "acceptance_lines")
 # run-level fields the runs table has no column for; they live in the runs.extra_json column.
 # `plan` (the file path) and `plan_id` ride here, not the runs.plan column: that column holds
 # the plan id for a plan-tool run and the bare path for a legacy one, so it cannot carry both. `task_order` is the task-add order (the rows store parent-before-child, which is not that order).
 RUN_FILE_KEYS = ("feature", "waiting", "recent", "plan_sha", "plan_status", "updated",
-                 "plan_id", "plan")
+                 "plan_id", "plan", "fidelity", "final_gates")  # F.2: set only for a plan with the contract
 
 
 def _load_sibling(name):
@@ -1491,6 +1503,9 @@ def cmd_run(a, st):
                    "plan_status": cur.get("status") if cur else None,
                    "status": "active", "stage": 0, "next": None, "waiting": None,
                    "started": now(), "ended": None, "updated": None, "tasks": [], "recent": []}
+            fid = plan_fidelity(cur) if cur else False
+            if fid:  # F.2: the run carries the plan's gate contract; a pre-F plan sets nothing
+                run["fidelity"], run["final_gates"] = True, list(cur.get("final_gates") or [])
             st.event(run, "note", f"run init: {a.feature} on {a.branch}")
             if cur and gate.get("status") != "approved":
                 st.event(run, "note", f"plan {run['plan_id']} was {gate.get('status')!r}, not approved; "
@@ -1510,13 +1525,13 @@ def cmd_run(a, st):
                 for c in ph.get("tasks") or []:
                     _, w = add_task(st, run, str(c.get("id") or ""), c.get("title") or c.get("id"),
                                     ph.get("wave"), c.get("deps") or [], c.get("owned") or [], pid, a.by,
-                                    plan_field_extra({"plan_task": c.get("id")}, c, "task"))
+                                    plan_field_extra({"plan_task": c.get("id")}, c, "task", fid))
                     warnings += w
                     for s in c.get("subtasks") or []:
                         _, w = add_task(st, run, str(s.get("id") or ""), s.get("title") or s.get("id"),
                                         ph.get("wave"), s.get("deps") or [], s.get("owned") or [],
                                         str(c.get("id") or ""), a.by,
-                                        plan_field_extra({}, s, "subtask"))
+                                        plan_field_extra({}, s, "subtask", fid))
                         warnings += w
             st.flush()
         return {"ok": True, "run": run, **({"warnings": warnings} if warnings else {})}
@@ -1569,6 +1584,8 @@ def cmd_run(a, st):
             run["stage"] = a.n
             st.event(run, "note", f"stage {a.n}")
         else:  # archive
+            fidelity_gate(st, run, [t["id"] for t in run.get("tasks") or []
+                                    if t.get("id") and t.get("status") in CLOSED_STATUSES], final=True)
             if st.store_on:
                 archive_backup(st, run)  # before the status commit: a failed backup leaves the run active
             set_run_status(st, run, "archived")
@@ -1636,6 +1653,8 @@ def promote_closed(st, run, by):
     so the caller can keep the ones that landed when a later one raises."""
     note = "promoted by closing the run"
     n = 0
+    fidelity_gate(st, run, [t["id"] for t in run.get("tasks") or []
+                            if t.get("id") and t.get("status") in ("merged", "qa")])
     for t in run.get("tasks") or []:
         if t.get("status") not in ("merged", "qa") or not t.get("id"):
             continue
@@ -1675,41 +1694,51 @@ def load_avg():
 
 
 def integration_checkout(st):
-    """The checkout a run's gates run in (F.0): the repo this run belongs to, resolved the way
-    mk-state already resolves its repo — first the nearest git repo above cwd (mkpaths.repo_top,
-    what --data resolution uses; a lane's linked worktree maps to its main checkout), else the
-    root projects row that names this project AND whose `repo` is a checkout, else the project
-    folder. -> (dir, note). The row is a fallback only: an auto-registered row records
-    dirname(data_dir), which is not necessarily a git checkout. Never raises. F.0 never switches
-    a branch — the orchestrator keeps this checkout on the plan's integration branch, which is
-    why a deferred or failing gate blocks instead of being retried elsewhere."""
+    """The checkout a run's gates run in (F.0, todo 140): the repo this run belongs to.
+    Order: (1) the root projects row that names THIS project's data dir (data_dir, or the folder
+    of db_path) AND whose `repo` is a checkout — the registered repo wins, so `--data X` from an
+    unrelated cwd still gates X's own repo; (2) the nearest git repo above cwd (mkpaths.repo_top;
+    a lane's linked worktree maps to its main checkout); (3) a row with this project's slug;
+    (4) the project folder. -> (dir, note). An auto-registered row records dirname(data_dir),
+    which is not necessarily a git checkout, so a row only counts when `repo` has a .git. Never
+    raises. It never switches a branch — the orchestrator keeps this checkout on the plan's
+    integration branch, which is why a deferred or failing gate blocks instead of being retried
+    elsewhere."""
+    folder = os.path.realpath(st.project_folder())
+    rows, slug = [], None
+    with contextlib.suppress(Exception):
+        rows = st.db().projects(st.home_dir()) or []
+    with contextlib.suppress(Exception):
+        slug = st.project_slug()
+
+    def registered(want):
+        for r in rows:
+            repo = r.get("repo")
+            if not isinstance(repo, str) or not repo.strip():
+                continue
+            if want is not None:
+                hit = any(isinstance(v, str) and v.strip()
+                          and os.path.realpath(os.path.expanduser(
+                              os.path.dirname(v.strip()) if k == "db_path" else v.strip())) == want
+                          for k, v in (("data_dir", r.get("data_dir")), ("db_path", r.get("db_path"))))
+                if not hit:
+                    continue
+            elif not slug or r.get("slug") != slug:
+                continue
+            d = os.path.realpath(os.path.expanduser(repo.strip()))
+            if os.path.exists(os.path.join(d, ".git")):  # a checkout, never a bare folder
+                return d
+        return None
+
+    hit = registered(folder)
+    if hit:
+        return hit, ""
     top = repo_top()
     if top:
         return top, ""
-    folder = os.path.realpath(st.project_folder())
-    with contextlib.suppress(Exception):
-        rows = st.db().projects(st.home_dir()) or []
-        slug = None
-        with contextlib.suppress(Exception):
-            slug = st.project_slug()
-        for want in (folder, None):
-            for r in rows:
-                repo = r.get("repo")
-                if not isinstance(repo, str) or not repo.strip():
-                    continue
-                if want is not None:
-                    named = [r.get("data_dir"), r.get("db_path")]
-                    hit = any(isinstance(v, str) and v.strip()
-                              and os.path.realpath(os.path.expanduser(
-                                  os.path.dirname(v.strip()) if k == "db_path" else v.strip())) == want
-                              for k, v in zip(("data_dir", "db_path"), named))
-                    if not hit:
-                        continue
-                elif not slug or r.get("slug") != slug:
-                    continue
-                d = os.path.realpath(os.path.expanduser(repo.strip()))
-                if os.path.exists(os.path.join(d, ".git")):  # a checkout, never a bare folder
-                    return d, ""
+    hit = registered(None)
+    if hit:
+        return hit, ""
     return st.project_folder(), "no git repo resolved for this run"
 
 
@@ -1718,28 +1747,73 @@ def _gate_tail(text, n=GATE_OUTPUT_LINES):
     return "\n".join((text or "").splitlines()[-n:])
 
 
+def _read_tail(pipe, box):
+    """Reader thread: drain a gate's merged output; keep only the last GATE_TAIL_BYTES and a
+    sha256 of the whole stream, so a gate printing 1 GB holds ~64 KB in memory."""
+    h, tail = hashlib.sha256(), bytearray()
+    for chunk in iter(lambda: pipe.read(65536), b""):
+        h.update(chunk)
+        tail += chunk
+        if len(tail) > GATE_TAIL_BYTES:
+            del tail[:-GATE_TAIL_BYTES]
+    box["sha"], box["tail"] = h.hexdigest(), bytes(tail)
+
+
+def _gate_exec(g, cwd):
+    """Run ONE table gate in cwd -> (result, output tail text, sha256 of the full output).
+    The gate gets its own process group (start_new_session); on timeout the WHOLE group is
+    SIGKILLed, so no child outlives the gate (todo 140; subprocess.run only killed the shell).
+    stdout+stderr are merged into one stream. The tail is bounded to GATE_TAIL_BYTES."""
+    cmd, expect, timeout = g.get("cmd"), g.get("expect", 0), g.get("timeout", GATE_TIMEOUT_DEFAULT)
+    empty = hashlib.sha256(b"").hexdigest()
+    if not isinstance(cmd, str) or not cmd.strip():
+        return "invalid", "no cmd (mk-plan check refuses a table gate without one)", empty
+    if type(expect) is not int:
+        return "invalid", f"expect {expect!r} is not an int", empty
+    if type(timeout) is not int:
+        return "invalid", f"timeout {timeout!r} is not an int", empty
+    try:
+        proc = subprocess.Popen(cmd, shell=True, cwd=cwd, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+    except OSError as e:  # cwd gone, or the shell cannot start: a failure, never a pass
+        return "fail exit=127", f"{type(e).__name__}: {e}", empty
+    box = {"sha": empty, "tail": b""}
+    reader = threading.Thread(target=_read_tail, args=(proc.stdout, box), daemon=True)
+    reader.start()
+
+    def kill_group():
+        with contextlib.suppress(OSError):  # ProcessLookupError: the group is already gone
+            os.killpg(proc.pid, signal.SIGKILL)
+
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        kill_group()
+        proc.wait()
+    reader.join(5)
+    if reader.is_alive():  # a straggler in the group still holds the pipe: end the group
+        kill_group()
+        reader.join(5)
+    with contextlib.suppress(OSError):
+        proc.stdout.close()
+    out = box["tail"].decode("utf-8", "replace")
+    if timed_out:
+        return "timeout", out, box["sha"]
+    if proc.returncode == expect:
+        return "pass", out, box["sha"]
+    return f"fail exit={proc.returncode}", out, box["sha"]
+
+
 def _gate_run(g, cwd):
     """F.0: run ONE table gate in cwd -> (result, output tail). Result vocabulary: `pass`,
     `fail exit=N`, `timeout`, or `invalid` for a gate the plan tool would have refused (this
     reads `parse`, which does not check shape). A wrong exit code, a timeout and a malformed
-    gate all block; only exit == expect passes."""
-    cmd, expect, timeout = g.get("cmd"), g.get("expect", 0), g.get("timeout", GATE_TIMEOUT_DEFAULT)
-    if not isinstance(cmd, str) or not cmd.strip():
-        return "invalid", "no cmd (mk-plan check refuses a table gate without one)"
-    if type(expect) is not int:
-        return "invalid", f"expect {expect!r} is not an int"
-    if type(timeout) is not int:
-        return "invalid", f"timeout {timeout!r} is not an int"
-    try:
-        r = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired as e:
-        return "timeout", _gate_tail(f"{e.stdout or ''}{e.stderr or ''}")
-    except OSError as e:  # cwd gone, or the shell cannot start: a failure, never a pass
-        return "fail exit=127", f"{type(e).__name__}: {e}"
-    out = f"{r.stdout or ''}{r.stderr or ''}"
-    if r.returncode == expect:
-        return "pass", ""
-    return f"fail exit={r.returncode}", _gate_tail(out)
+    gate all block; only exit == expect passes. The tail is the last GATE_OUTPUT_LINES lines."""
+    result, out, _sha = _gate_exec(g, cwd)
+    return result, "" if result == "pass" else _gate_tail(out)
 
 
 def run_gates(st, gates):
@@ -1764,6 +1838,245 @@ def run_gates(st, gates):
     return results, failures, where, note
 
 
+def current_tree_sha(where):
+    """The git tree id of HEAD in the checkout `where` (`git rev-parse HEAD^{tree}`), or None when
+    it is not a git repo with a commit. A TREE id (not the commit id) so an amend or empty commit
+    that changes no file keeps earlier green evidence current. Evidence rows store this; the
+    'is the evidence for the current tip' comparison later calls this same function."""
+    try:
+        r = subprocess.run(["git", "-C", where, "rev-parse", "HEAD^{tree}"],
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    sha = r.stdout.strip()
+    return sha if r.returncode == 0 and sha else None
+
+
+def _evidence_result(result):
+    """Map a _gate_exec result to the EVIDENCE_RESULTS enum."""
+    if result == "pass":
+        return "green"
+    if result == "timeout":
+        return "timeout"
+    if result.startswith("deferred"):
+        return "deferred"
+    if result.startswith("fail exit="):
+        return "red"
+    return "error"
+
+
+def _gate_line(g):
+    """The evidence `line` of a gate: its `lines` (task gate) or `covers` (final gate), joined."""
+    v = g.get("lines", g.get("covers"))
+    if isinstance(v, (list, tuple)):
+        v = ",".join(str(x) for x in v)
+    return str(v) if v not in (None, "") else None
+
+
+def cmd_gate(a, st):
+    """`gate run <T> | --final | --due`: run gates in the integration checkout through the F.0
+    runner and write ONE evidence row per gate run. <T> = the task's extra_json `gate` list
+    ({cmd, expect, timeout, lines}); --final = the run's extra_json `final_gates` ({id, cmd,
+    expect, every, timeout, needs, covers}; `needs` is not enforced here); --due = final gates
+    with every == "merge" once any task is merged, plus the gates of tasks in
+    GATE_DUE_TASK_STATUSES. Plan-level [gates] stay with `run set --status done`.
+    Load above GATE_LOAD_MAX records `deferred` and runs nothing. Reply ok=true when the command ran;
+    `all_green` says whether every gate was green."""
+    if bool(a.task) + bool(a.final) + bool(a.due) != 1:
+        raise Fail("gate run needs exactly one of <task>, --final, --due")
+    with st.locked():
+        st.repair()
+        run = st.load(a.run, a.task)
+        run_x, task_x = st.extras_read(run["id"])
+        status = {t["id"]: t.get("status") for t in run.get("tasks") or [] if isinstance(t, dict)}
+    if a.task:
+        find_task(run, a.task)
+
+    def task_jobs(tid):
+        gl = (task_x.get(tid) or {}).get("gate")
+        gl = gl if isinstance(gl, list) else []
+        return [(tid, g.get("id") or f"{tid}#{i}", g) for i, g in enumerate(gl, 1) if isinstance(g, dict)]
+
+    def final_jobs(only_merge=False):
+        fl = run_x.get("final_gates")
+        fl = fl if isinstance(fl, list) else []
+        return [(None, g.get("id") or f"final#{i}", g) for i, g in enumerate(fl, 1)
+                if isinstance(g, dict) and (not only_merge or g.get("every") == "merge")]
+
+    if a.task:
+        jobs = task_jobs(a.task)
+    elif a.final:
+        jobs = final_jobs()
+    else:
+        jobs = final_jobs(True) if "merged" in status.values() else []
+        for tid, stt in status.items():
+            if stt in GATE_DUE_TASK_STATUSES:
+                jobs += task_jobs(tid)
+    where, note = integration_checkout(st)
+    load = load_avg()
+    deferred = load > GATE_LOAD_MAX
+    tree = current_tree_sha(where)
+    rows = []
+    for tid, name, g in jobs:
+        if deferred:
+            result, tail, sha = (f"deferred load={load:g}",
+                                 f"deferred: load average above {GATE_LOAD_MAX:g}", None)
+        else:
+            result, tail, sha = _gate_exec(g, where)
+        enum = _evidence_result(result)
+        with st.locked():
+            con = st.store_open()
+            try:
+                con.execute("BEGIN IMMEDIATE")
+                cur = con.execute(
+                    "INSERT INTO evidence(run, task, line, gate, result, tree_sha, by, ref, output_tail,"
+                    " output_sha256, created) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (run["id"], tid, _gate_line(g), name, enum, tree, getattr(a, "by", "orchestrator"),
+                     a.ref, tail, sha, now()))
+                con.execute("COMMIT")
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
+            finally:
+                con.close()
+        rows.append({"id": cur.lastrowid, "task": tid, "gate": name, "result": enum, "detail": result,
+                     "tree_sha": tree})
+    out = {"ok": True, "evidence": rows, "where": where, "all_green": all(r["result"] == "green" for r in rows)}
+    if note:
+        out["note"] = note
+    return out
+
+
+def _evidence_con(st):
+    """A store connection for evidence reads, or None when the run has no project store."""
+    return st.store_open() if st.store_on else None
+
+
+def fidelity_gate(st, run, task_ids, final=False):
+    """F.3: the ONE check every closing path calls. In a fidelity run (run.fidelity, set by run
+    init for a plan with the F.2 contract) each task in `task_ids` needs, for every gate of its
+    `gate` list, a latest evidence row that is green AND whose tree_sha is the integration
+    checkout's current tree (older evidence is STALE and does not count); a `manual` line needs a
+    recorded green sign-off (gate 'manual', any tree). `final=True` adds every final gate.
+    Legacy (non-fidelity) runs are exempt. Raises Fail naming each missing gate; writes nothing."""
+    if not run.get("fidelity"):
+        return
+    byid = {t["id"]: t for t in run.get("tasks") or [] if t.get("id")}
+    need = []  # (task or None, gate name)
+    for tid in task_ids:
+        t = byid.get(tid) or {}
+        for i, g in enumerate(t.get("gate") or [], 1):
+            need.append((tid, g.get("id") or f"{tid}#{i}"))
+        if t.get("manual"):
+            need.append((tid, "manual"))
+    if final:
+        need += [(None, g.get("id") or f"final#{i}") for i, g in enumerate(run.get("final_gates") or [], 1)]
+    if not need:
+        return
+    where, _ = integration_checkout(st)
+    tree = current_tree_sha(where)
+    con = _evidence_con(st)
+    missing = []
+    try:
+        for tid, name in need:
+            row = con.execute(
+                "SELECT result, tree_sha FROM evidence WHERE run=? AND task IS ? AND gate=? ORDER BY id DESC LIMIT 1",
+                (run["id"], tid, name)).fetchone() if con else None
+            label = f"{tid or 'final'}:{name}"
+            if row is None:
+                missing.append(f"{label} no evidence")
+            elif row["result"] != "green":
+                missing.append(f"{label} latest evidence is {row['result']}")
+            elif name != "manual" and (tree is None or row["tree_sha"] != tree):
+                missing.append(f"{label} evidence is stale (tree {str(row['tree_sha'])[:8]} != {str(tree)[:8]})")
+    finally:
+        if con:
+            con.close()
+    if missing:
+        raise Fail("fidelity run " + run["id"] + " needs fresh green evidence (gate run / gate signoff): "
+                   + "; ".join(missing), missing=missing)
+
+
+def cmd_gate_signoff(a, st):
+    """`gate signoff <T>`: record the human sign-off of a task's `manual` line as a green evidence
+    row (gate 'manual'). The line is never run."""
+    with st.locked():
+        st.repair()
+        run = st.load(a.run, a.task)
+        t = find_task(run, a.task)
+        if not t.get("manual"):
+            raise Fail(f"task {t['id']} has no manual line to sign off")
+        if not a.ref:
+            raise Fail("gate signoff needs --ref (who/what signed off)")
+        con = st.store_open()
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            cur = con.execute(
+                "INSERT INTO evidence(run, task, line, gate, result, tree_sha, by, ref, output_tail,"
+                " output_sha256, created) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (run["id"], t["id"], None, "manual", "green", current_tree_sha(integration_checkout(st)[0]),
+                 getattr(a, "by", "orchestrator"), a.ref, t["manual"], None, now()))
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+        finally:
+            con.close()
+    return {"ok": True, "evidence": cur.lastrowid, "task": t["id"]}
+
+
+def cmd_risk(a, st):
+    """`risk add <T> --kind K --points N [--source S]` | `risk list [<T>]` | `risk clear <id>
+    --evidence <id>`. Rows live in risk_reasons (F.1); the derived risk is mkdb._task_risk. A
+    clear needs the id of a green evidence row of that task whose tree_sha is the current tree."""
+    with st.locked():
+        st.repair()
+        run = st.load(a.run, a.task if a.action != "clear" else None)
+        db = st.db()
+        con = st.store_open()
+        try:
+            if a.action == "list":
+                q, args = "SELECT * FROM risk_reasons WHERE run=?", [run["id"]]
+                if a.task:
+                    q, args = q + " AND task=?", args + [find_task(run, a.task)["id"]]
+                rows = [dict(r) for r in con.execute(q + " ORDER BY id", args)]
+                risks = {tid: db._task_risk(con, run["id"], tid) for tid in {r["task"] for r in rows}}
+                return {"ok": True, "reasons": rows, "risk": risks}
+            con.execute("BEGIN IMMEDIATE")
+            if a.action == "add":
+                t = find_task(run, a.task)
+                if not a.kind or a.points is None or a.points < 1:
+                    raise Fail("risk add needs --kind and --points >= 1")
+                cur = con.execute("INSERT INTO risk_reasons(run, task, kind, points, source, opened)"
+                                  " VALUES (?,?,?,?,?,?)", (run["id"], t["id"], a.kind, a.points, a.source, now()))
+                out = {"ok": True, "id": cur.lastrowid, "task": t["id"]}
+                tid = t["id"]
+            else:  # clear
+                r = con.execute("SELECT * FROM risk_reasons WHERE id=? AND run=?", (a.task, run["id"])).fetchone()
+                if r is None or r["cleared"]:
+                    raise Fail(f"risk reason {a.task!r} is not an open reason of run {run['id']}")
+                tid = r["task"]
+                if a.evidence is None:
+                    raise Fail("risk clear needs --evidence <id> of a fresh green gate run")
+                ev = con.execute("SELECT * FROM evidence WHERE id=? AND run=? AND task IS ?",
+                                 (a.evidence, run["id"], tid)).fetchone()
+                tree = current_tree_sha(integration_checkout(st)[0])
+                if ev is None or ev["result"] != "green" or ev["gate"] == "manual" or ev["tree_sha"] != tree or tree is None:
+                    raise Fail(f"evidence {a.evidence} is not a green gate run of {tid} on the current tree")
+                con.execute("UPDATE risk_reasons SET cleared=?, cleared_by=? WHERE id=?",
+                            (now(), f"evidence:{a.evidence}", r["id"]))
+                out = {"ok": True, "cleared": r["id"], "task": tid}
+            out["risk"] = db._task_risk(con, run["id"], tid)
+            con.execute("COMMIT")
+            return out
+        except BaseException:
+            if con.in_transaction:
+                con.execute("ROLLBACK")
+            raise
+        finally:
+            con.close()
+
+
 def gate_refusal(failures, where):
     """The refusal text: each failing gate with its result and the last 20 lines of its output."""
     parts = [f"{len(failures)} plan gate(s) failed in {where}:"]
@@ -1786,6 +2099,8 @@ def close_checks(st, run):
                    + ", ".join(f"{o['id']} ({o['status']})" for o in opens)
                    + " — close them (task set <id> status=done) or leave the run open",
                    open=opens)
+    fidelity_gate(st, run, [t["id"] for t in run.get("tasks") or []
+                            if t.get("id") and t.get("status") in CLOSED_STATUSES], final=True)
     if not run.get("plan"):
         return {}
     try:
@@ -2040,7 +2355,21 @@ def task_check(st, run, t, at_dispatch=False):
             **({"at_dispatch": True} if at_dispatch else {})}
 
 
-def plan_field_extra(extra, src, kind):
+def plan_fidelity(cur):
+    """F.2: True when the parsed plan carries the gate contract: any final gate, or any task or
+    subtask with a gate, a manual line, critical, or a risk other than the default 1. A pre-F plan
+    parses to all defaults and gets no flag. (An explicit `risk = 1` alone is not detectable.)"""
+    if cur.get("final_gates"):
+        return True
+    for ph in cur.get("phases") or []:
+        for c in ph.get("tasks") or []:
+            for it in [c] + list(c.get("subtasks") or []):
+                if it.get("gate") or it.get("manual") or it.get("critical") or it.get("risk", 1) != 1:
+                    return True
+    return False
+
+
+def plan_field_extra(extra, src, kind, fid=False):
     """D1.5.1: the plan fields (acceptance/refs/type) a `run init --plan` / `plan sync --apply`
     add copies onto the new run.json task. The plan tool (C3, a subprocess) is the only reader
     of the plan file; mk-state consumes what its `parse` already returned. Phases carry no
@@ -2051,6 +2380,10 @@ def plan_field_extra(extra, src, kind):
         out["acceptance"] = (src.get("acceptance") or "") or None
         refs = src.get("refs") or []
         out["refs"] = list(refs) if isinstance(refs, list) else ([refs] if refs else [])
+        if fid:  # F.2: the gate contract rides tasks.extra_json; a pre-F plan adds no key
+            out.update({"gate": list(src.get("gate") or []), "manual": src.get("manual") or "",
+                        "critical": bool(src.get("critical")), "base_risk": src.get("risk", 1),
+                        "acceptance_lines": list(src.get("acceptance_lines") or [])})
     return out
 
 
@@ -2088,6 +2421,10 @@ def cmd_task(a, st):
             set_warnings = []  # T1: the started-task drops and the dep notes, merged into the reply
             for pair in a.pairs:
                 k, sep, v = pair.partition("=")
+                if k in GATE_READONLY_KEYS or (k.startswith(("gate", "risk")) and k != "gates"):
+                    raise Fail(f"{k} is a plan gate field and is read-only: task set never edits "
+                               "gate/manual/critical/risk; change it in the plan text and approve "
+                               "a new version")
                 if not sep or k not in TASK_KEYS:
                     raise Fail(f"bad pair {pair!r}; keys: {' '.join(TASK_KEYS)}")
                 if k in SET_LIST_KEYS:  # T1: owned/deps/refs parse like task add's flags
@@ -2133,6 +2470,8 @@ def cmd_task(a, st):
                 leaves = [next((x for x in run["tasks"] if x.get("id", "").lower() == lid), None)
                           for lid in leaf_ids]
                 leaves = [x for x in leaves if x is not None]
+                if s in CLOSED_STATUSES:  # F.3: no leaf closes without fresh green evidence
+                    fidelity_gate(st, run, [c["id"] for c in leaves if c["status"] != s])
                 for c in leaves:
                     if s in DEP_GATED and c["status"] not in DEP_GATED:
                         waiting = st.unmet_tree(run, c)
@@ -2159,6 +2498,8 @@ def cmd_task(a, st):
                     st.event(run, "decision", f"forced by {a.by}: task set {t['id']} status={changes['status']} "
                              f"(unmet: {', '.join(waiting)})", task=t["id"], by=a.by)
             frm = t["status"]
+            if changes.get("status") in CLOSED_STATUSES and changes["status"] != frm:
+                fidelity_gate(st, run, [t["id"]])  # F.3: before any write
             t.update(changes)
             # T1: one decision event per edited key, old and new value (short) plus the --note.
             for k, old in olds.items():
@@ -2522,6 +2863,8 @@ def plan_version_diff(stored, cur):
         diffs.append("sha")
     if header.get("status") != cur.get("status"):
         diffs.append("status")
+    if (header.get("final_gates") or []) != (cur.get("final_gates") or []):
+        diffs.append("final_gates")  # F.2: the header [[final_gate]] blocks
     phases = header.get("phases") or []
     if phases != (cur.get("phases") or []):
         diffs.append("phases")
@@ -2602,7 +2945,10 @@ def cmd_plan(a, st):
             if not child and "deps" in d:  # a self-dep in the new deps fails before any write
                 [st.norm_dep(run, t["id"], x) for x in src.get("deps") or []]
         st.sink_run, st.sunk = run["id"], 0
+        fid = plan_fidelity(cur)
         try:
+            if fid:  # F.2: existing tasks keep their frozen gate fields; the run learns the contract
+                run["fidelity"], run["final_gates"] = True, list(cur.get("final_gates") or [])
             for kind, src, ph in adds:
                 if kind == "phase":
                     add_task(st, run, str(src.get("id") or ""), src.get("title") or src.get("id"),
@@ -2614,12 +2960,12 @@ def cmd_plan(a, st):
                     add_task(st, run, str(src.get("id") or ""), src.get("title") or src.get("id"),
                              ph.get("wave"), src.get("deps") or [], src.get("owned") or [],
                              str(ph.get("id") or ""), a.by,
-                             plan_field_extra({"plan_task": src.get("id")}, src, "task"))
+                             plan_field_extra({"plan_task": src.get("id")}, src, "task", fid))
                     for s in src.get("subtasks") or []:
                         add_task(st, run, str(s.get("id") or ""), s.get("title") or s.get("id"),
                                  ph.get("wave"), s.get("deps") or [], s.get("owned") or [],
                                  str(src.get("id") or ""), a.by,
-                                 plan_field_extra({}, s, "subtask"))
+                                 plan_field_extra({}, s, "subtask", fid))
             for t, src, d, child in updates:
                 t["title"] = str(src.get("title") or t["title"])
                 if not child:
@@ -2646,6 +2992,7 @@ def cmd_plan(a, st):
             body = open(st.plan_file(run)).read()
             plan_store_write(st, run["plan_id"], prev + 1, str(cur.get("plan") or ""),
                              {"sha": cur.get("sha"), "status": cur.get("status"),
+                              "final_gates": cur.get("final_gates") or [],
                               "phases": cur.get("phases") or []},
                              body, st.plan_file(run))
     return {"ok": True, "run": run["id"], "plan": run["plan_id"], "apply": True, "sha": cur.get("sha"),
@@ -2935,6 +3282,22 @@ def build_parser():
     for x in w.choices.values():
         x.set_defaults(func=cmd_wait)
 
+    g = sub.add_parser("gate").add_subparsers(dest="action", required=True)
+    gr = g.add_parser("run", parents=[data_p, run_p])
+    gr.add_argument("task", nargs="?"), gr.add_argument("--ref")
+    gr.add_argument("--final", action="store_true"), gr.add_argument("--due", action="store_true")
+    gr.set_defaults(func=cmd_gate)
+    gs = g.add_parser("signoff", parents=[data_p, run_p])
+    gs.add_argument("task"), gs.add_argument("--ref")
+    gs.set_defaults(func=cmd_gate_signoff)
+    rk = sub.add_parser("risk").add_subparsers(dest="action", required=True)
+    for name in ("add", "list", "clear"):
+        x = rk.add_parser(name, parents=[data_p, run_p])
+        x.add_argument("task", nargs="?")  # clear: the risk reason id
+        x.add_argument("--kind"), x.add_argument("--points", type=int), x.add_argument("--source")
+        x.add_argument("--evidence", type=int)
+        x.set_defaults(func=cmd_risk)
+
     lk = sub.add_parser("lock").add_subparsers(dest="action", required=True)
     for name in ("take", "release", "check"):
         x = lk.add_parser(name, parents=[data_p])
@@ -2995,7 +3358,8 @@ if cmd in ("parse", "check"):
     extra = {"warnings": db.get("warnings", [])} if cmd == "check" else {}
     print(json.dumps({"ok": True, "plan": db.get("plan"), "status": db.get("status"),
                       "runs": db.get("runs", []), "sha": hashlib.sha256(open(path, "rb").read()).hexdigest(),
-                      "gates": db.get("gates", {}), "phases": db.get("phases", []), **extra}))
+                      "gates": db.get("gates", {}), "final_gates": db.get("final_gates", []),
+                      "phases": db.get("phases", []), **extra}))
 elif cmd == "set":
     db["status"] = sys.argv[sys.argv.index("--status") + 1]
     json.dump(db, open(path, "w"), indent=1)
@@ -3184,6 +3548,71 @@ def d15_self_test(tmp, env, pd, penv):
     got = sk("task", "get", "DP.1", "--run", "s2")["task"]
     assert got["title"] == "Edited child" and got["acceptance"] == "edited outcome", got
     assert got["owned"] == ["scripts/b.py", "scripts/c.py"] and got["deps"] == ["DP"], got
+
+    # --- F.2 (later round): run init / plan sync copy the gate contract; task set cannot touch it
+    def f2_task(tid, **gate_fields):
+        return {"id": tid, "title": tid, "acceptance": "a", "refs": [], "subagent": False, "owned": [],
+                "deps": [], "parallel": False, "acceptance_lines": [{"id": "A1", "text": "a"}],
+                "gate": [], "manual": "", "critical": False, "risk": 1, **gate_fields}
+
+    def f2_plan(plan_id, tasks, final_gates=()):
+        return {"plan": plan_id, "status": "approved", "runs": [], "final_gates": list(final_gates),
+                "phases": [{"id": "FP", "title": "Phase", "wave": 1, "deps": [], "owned": [], "route": "",
+                            "reviewer": "", "size": "standard", "risk": "reversible", "review": "light",
+                            "qa": [], "commit": "", "subagents": False, "lane_group": "", "tasks": tasks}]}
+
+    def run_extra(run_id):
+        con = _mkdb().open_project(H, STORE_PROJECT_FALLBACK, data_dir=pd)
+        try:
+            return _json_obj(con.execute("SELECT extra_json FROM runs WHERE id=?", (run_id,)).fetchone()["extra_json"])
+        finally:
+            con.close()
+
+    gate = {"cmd": "true", "expect": 0, "timeout": 30, "lines": ["A1"]}
+    fg = {"id": "FG1", "cmd": "true", "expect": 0, "every": "merge", "timeout": 600, "needs": [],
+          "covers": ["FP.1"]}
+    f2file = os.path.join(tmp, "f2plan.json")
+    json.dump(f2_plan("f2gate", [f2_task("FP.1", gate=[gate], critical=True, risk=4),
+                                 f2_task("FP.2", manual="read it by eye")], [fg]), open(f2file, "w"))
+    out = pk("run", "init", "--id", "f2g", "--feature", "F2", "--branch", "b", "--plan", f2file)
+    ft = {t["id"]: t for t in out["run"]["tasks"]}
+    assert ft["FP.1"]["gate"] == [gate] and ft["FP.1"]["critical"] is True, ft["FP.1"]
+    assert ft["FP.1"]["base_risk"] == 4 and ft["FP.1"]["manual"] == "", ft["FP.1"]
+    assert ft["FP.1"]["acceptance_lines"] == [{"id": "A1", "text": "a"}], ft["FP.1"]
+    assert ft["FP.2"]["manual"] == "read it by eye" and ft["FP.2"]["gate"] == [], ft["FP.2"]
+    assert out["run"]["fidelity"] is True and out["run"]["final_gates"] == [fg], out["run"]
+    # the store keeps all of it: runs.extra_json.fidelity + final_gates, tasks.extra_json per task
+    rx = run_extra("f2g")
+    assert rx.get("fidelity") is True and rx.get("final_gates") == [fg], rx
+    stored = pk("task", "get", "FP.1", "--run", "f2g")["task"]
+    assert stored["gate"] == [gate] and stored["base_risk"] == 4 and stored["critical"] is True, stored
+    # the stored gate is the table shape the F.0 runner executes (one runner), a manual line is a
+    # plain string that run_gates never runs
+    assert _gate_run(stored["gate"][0], tmp)[0] == "pass"
+    assert not isinstance(ft["FP.2"]["manual"], dict)
+    # task set refuses every gate field, clearly, and writes nothing
+    for pair in ("risk=2", "gate=x", "manual=x", "critical=false", "base_risk=1", "acceptance_lines=x", "risk_note=x"):
+        e = pk("task", "set", "FP.1", pair, "--run", "f2g", code=2)
+        assert e["ok"] is False and "read-only" in e["error"], (pair, e)
+    after = pk("task", "get", "FP.1", "--run", "f2g")["task"]
+    assert after["base_risk"] == 4 and after["critical"] is True and after["gate"] == [gate], after
+    pk("task", "set", "FP.1", "gates=test=pass", "--run", "f2g")  # the existing `gates` result key still sets
+    # a pre-F plan (all defaults) sets no fidelity flag and no gate keys
+    pre = os.path.join(tmp, "f2pre.json")
+    json.dump(f2_plan("f2pre", [f2_task("FP.1")]), open(pre, "w"))
+    out = pk("run", "init", "--id", "f2p", "--feature", "pre", "--branch", "b", "--plan", pre)
+    pt = {t["id"]: t for t in out["run"]["tasks"]}
+    assert "fidelity" not in out["run"] and "final_gates" not in out["run"], out["run"]
+    assert "fidelity" not in run_extra("f2p"), run_extra("f2p")
+    assert not ({"gate", "manual", "critical", "base_risk", "acceptance_lines"} & set(pt["FP.1"])), pt["FP.1"]
+    # plan sync --apply: the plan grows the contract; the run learns it and the new task carries it
+    json.dump(f2_plan("f2pre", [f2_task("FP.1"), f2_task("FP.3", gate=[gate], risk=3)], [fg]), open(pre, "w"))
+    out = pk("plan", "sync", "--run", "f2p", "--apply", "--from-file")
+    assert out["ok"] is True, out
+    rx = run_extra("f2p")
+    assert rx.get("fidelity") is True and rx.get("final_gates") == [fg], rx
+    st3 = pk("task", "get", "FP.3", "--run", "f2p")["task"]
+    assert st3["gate"] == [gate] and st3["base_risk"] == 3, st3
 
 
 def self_test():
@@ -4557,7 +4986,7 @@ def self_test():
         f0tool = os.path.join(tmp, "f0-planfix.py")
         with open(f0tool, "w") as f:
             f.write(PLAN_FIXTURE)
-        f0env = dict(env, MK_PLAN_CMD=" ".join([sys.executable, f0tool]))
+        f0env = dict(env, MK_STATE_LOADAVG="0", MK_PLAN_CMD=" ".join([sys.executable, f0tool]))
         f0plan = os.path.join(tmp, "f0-plan.json")
         # the gate's cwd must be THIS project's checkout: only it holds the marker
         open(os.path.join(f0repo, "gate-marker.txt"), "w").write("here\n")
@@ -4695,6 +5124,9 @@ def self_test():
         print("mk-state r2-fixes self-test ok")
         x31_r2_fixes_self_test(tmp, env)
         print("mk-state x31-r2-fixes self-test ok")
+        gate_run_self_test(tmp, env)
+        fidelity_self_test(tmp, env)
+        print("mk-state gate-run self-test ok")
         # R1.2: the mkdb write guard refuses the real home from this suite too.
         _mkdb().selftest_guard_probe(tmp_home)
     finally:
@@ -5827,6 +6259,305 @@ def r2_fixes_self_test(tmp, env):
             "an upper-case run id in a dep did not resolve"
     finally:
         con.close()
+
+
+def gate_run_self_test(tmp, env):
+    """`gate run`: evidence rows (enum result, tree_sha), a timeout that kills the whole process
+    group, load deferral, a bounded output tail with the full-stream sha256, and the registered
+    repo winning over the cwd repo. Every case FAILS on 7ae641f (no `gate` command, and
+    subprocess.run leaves the timed-out gate's children alive)."""
+    H = env["MK_HOME"]  # the home the child processes use (os.environ drifts in earlier cases)
+    DB = _mkdb()
+    repo, other, data = (os.path.join(tmp, n) for n in ("gr-repo", "gr-other", "gr-data"))
+    for d in (repo, other):
+        os.makedirs(d)
+        subprocess.run(["git", "init", "-q", d], check=True)
+        open(os.path.join(d, "f.txt"), "w").write(d)
+        subprocess.run(["git", "-C", d, "add", "."], check=True)
+        subprocess.run(["git", "-C", d, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "c"],
+                       check=True)
+    open(os.path.join(repo, "marker.txt"), "w").write("here\n")  # only the registered repo has it
+    tree = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD^{tree}"], capture_output=True,
+                          text=True, check=True).stdout.strip()
+    con = DB.open_root(H)
+    try:
+        con.execute("INSERT OR REPLACE INTO projects(slug, name, repo, data_dir, mode, db_path)"
+                    " VALUES ('grproj','grproj',?,?,'home',NULL)", (repo, data))
+        con.commit()
+    finally:
+        con.close()
+
+    def gr(*args, code=0, e=None):
+        # cwd is a DIFFERENT git repo: only the registered row can point the gate at `repo`
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), *args, "--data", data],
+                           capture_output=True, text=True, env=e or dict(env, MK_STATE_LOADAVG="0"), cwd=other, timeout=120)
+        lines = r.stdout.strip().splitlines()
+        assert len(lines) == 1, (args, r.stdout, r.stderr)
+        assert r.returncode == code, (args, r.returncode, r.stdout, r.stderr)
+        return json.loads(lines[0])
+
+    def evidence():
+        c = DB.open_project(H, STORE_PROJECT_FALLBACK, data_dir=data)
+        try:
+            return [dict(r) for r in c.execute("SELECT * FROM evidence ORDER BY id")]
+        finally:
+            c.close()
+
+    pidfile = os.path.join(tmp, "gr-child.pid")
+    gr("run", "init", "--id", "gr", "--feature", "GR", "--branch", "b")
+    gr("task", "add", "--id", "G1", "--title", "gated", "--run", "gr")
+    def setx(table, where, key, val):
+        """Merge one key into a row's extra_json (what helper A's `gate` key does), keeping the rest."""
+        c = DB.open_project(H, STORE_PROJECT_FALLBACK, data_dir=data)
+        try:
+            cur = json.loads(c.execute(f"SELECT extra_json FROM {table} WHERE {where}").fetchone()[0] or "{}")
+            cur[key] = val
+            c.execute(f"UPDATE {table} SET extra_json=? WHERE {where}", (json.dumps(cur),))
+            c.commit()
+        finally:
+            c.close()
+
+    g1 = "run='gr' AND id='G1'"
+    setx("tasks", g1, "gate", [
+        {"cmd": "test -f marker.txt", "lines": ["L1", "L2"]},
+        {"cmd": "exit 3"},
+        {"cmd": f"sleep 60 & echo $! > {pidfile}; wait", "timeout": 1},
+        {"cmd": "yes abcdefghi | head -c 1048576", "id": "big"}])
+    setx("runs", "id='gr'", "final_gates", [
+        {"id": "fin", "cmd": "true", "every": "merge", "covers": ["L1"]},
+        {"id": "fin2", "cmd": "true", "every": "end"}])
+
+    out = gr("gate", "run", "G1", "--run", "gr", "--ref", "abc")
+    assert out["ok"] is True and out["all_green"] is False, out
+    assert os.path.realpath(out["where"]) == os.path.realpath(repo), out  # registered repo, not cwd
+    rows = evidence()
+    assert [r["result"] for r in rows] == ["green", "red", "timeout", "green"], rows
+    assert all(r["result"] in EVIDENCE_RESULTS for r in rows)
+    assert all(r["tree_sha"] == tree and r["run"] == "gr" and r["task"] == "G1" for r in rows), rows
+    assert rows[0]["line"] == "L1,L2" and rows[0]["by"] == "orchestrator" and rows[0]["ref"] == "abc", rows[0]
+    assert rows[0]["gate"] == "G1#1" and rows[3]["gate"] == "big", rows
+    assert rows[1]["output_sha256"] == hashlib.sha256(b"").hexdigest(), rows[1]
+    # timeout kills the whole process group: the gate's `sleep` child is dead
+    child = int(open(pidfile).read())
+    for _ in range(50):
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.1)
+    else:
+        os.kill(child, 9)
+        raise AssertionError("the timed-out gate's child process survived")
+    # bounded tail + full-stream sha256
+    full = (b"abcdefghi\n" * 200000)[:1048576]
+    big = rows[3]
+    assert 0 < len(big["output_tail"].encode()) <= GATE_TAIL_BYTES, len(big["output_tail"])
+    assert full.endswith(big["output_tail"].encode()), "the tail is not the end of the output"
+    assert big["output_sha256"] == hashlib.sha256(full).hexdigest(), big["output_sha256"]
+    # the same kill/bound through the F.0 runner directly (its contract is unchanged)
+    res, tail = _gate_run({"cmd": f"sleep 60 & echo $! > {pidfile}; wait", "timeout": 1}, repo)
+    assert res == "timeout" and tail == "", (res, tail)
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(int(open(pidfile).read()), 0)
+        raise AssertionError("_gate_run left the child alive")
+    assert _gate_run({"cmd": "echo hi; exit 2"}, repo) == ("fail exit=2", "hi")
+
+    # deferred under load: a deferred row, nothing run
+    before = len(evidence())
+    marker = os.path.join(tmp, "gr-ran")
+    task_gates = [{"cmd": f"touch {marker}"}]
+    final_gates = [{"id": "fin", "cmd": "true", "every": "merge", "covers": ["L1"]},
+                   {"id": "fin2", "cmd": "true", "every": "end"}]
+
+    def regate():  # a task/run write rewrites extra_json from the file keys; helper A makes these keys ride
+        setx("tasks", g1, "gate", task_gates)
+        setx("runs", "id='gr'", "final_gates", final_gates)
+    regate()
+    out = gr("gate", "run", "G1", "--run", "gr", e=dict(env, MK_STATE_LOADAVG="41"))
+    rows = evidence()
+    assert len(rows) == before + 1 and rows[-1]["result"] == "deferred" and not os.path.exists(marker), rows[-1]
+    assert out["all_green"] is False, out
+
+    # --final runs every final gate; --due runs the merge gates only once a task is merged
+    out = gr("gate", "run", "--final", "--run", "gr")
+    rows = evidence()
+    assert [r["gate"] for r in rows[-2:]] == ["fin", "fin2"] and rows[-1]["task"] is None, rows[-2:]
+    assert rows[-2]["line"] == "L1" and out["all_green"] is True, rows[-2:]
+    assert gr("gate", "run", "--due", "--run", "gr")["evidence"] == []
+    gr("task", "set", "G1", "status=review", "--run", "gr")
+    regate()
+    due = gr("gate", "run", "--due", "--run", "gr")
+    assert [r["gate"] for r in due["evidence"]] == ["G1#1"], due
+    gr("task", "set", "G1", "status=merged", "--run", "gr")
+    regate()
+    assert [r["gate"] for r in gr("gate", "run", "--due", "--run", "gr")["evidence"]] == ["fin"]
+    # exactly one of <task> | --final | --due
+    assert gr("gate", "run", "--run", "gr", code=2)["ok"] is False
+    assert gr("gate", "run", "G1", "--final", "--run", "gr", code=2)["ok"] is False
+
+
+def fidelity_self_test(tmp, env):
+    """F.3: ONE fidelity_gate on every closing path (task set, fan-out, promote_closed, run set
+    --status done, run archive), stale evidence does not count, manual lines need a sign-off, a
+    legacy run is exempt, task set refuses risk keys, risk clear needs a fresh green evidence id.
+    Every case FAILS on 7ae641f (no gate/risk commands, no fidelity check)."""
+    H = env["MK_HOME"]
+    DB = _mkdb()
+    repo, data = os.path.join(tmp, "fi-repo"), os.path.join(tmp, "fi-data")
+    os.makedirs(repo)
+
+    def git(*args):
+        return subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", *args],
+                              capture_output=True, text=True, check=True).stdout.strip()
+
+    def bump(n):  # a new commit = a new tree = every earlier evidence is stale
+        open(os.path.join(repo, "f.txt"), "w").write(str(n))
+        git("add", "."), git("commit", "-qm", f"c{n}")
+
+    git("init", "-q")
+    bump(0)
+    con = DB.open_root(H)
+    try:
+        con.execute("INSERT OR REPLACE INTO projects(slug, name, repo, data_dir, mode, db_path)"
+                    " VALUES ('fiproj','fiproj',?,?,'home',NULL)", (repo, data))
+        con.commit()
+    finally:
+        con.close()
+
+    def fi(*args, code=0, e=None):
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), *args, "--data", data],
+                           capture_output=True, text=True, env=e or dict(env, MK_STATE_LOADAVG="0"), cwd=tmp, timeout=120)
+        lines = r.stdout.strip().splitlines()
+        assert len(lines) == 1, (args, r.stdout, r.stderr)
+        assert r.returncode == code, (args, r.returncode, r.stdout, r.stderr)
+        return json.loads(lines[0])
+
+    def setx(table, where, key, val):
+        c = DB.open_project(H, STORE_PROJECT_FALLBACK, data_dir=data)
+        try:
+            cur = json.loads(c.execute(f"SELECT extra_json FROM {table} WHERE {where}").fetchone()[0] or "{}")
+            cur[key] = val
+            c.execute(f"UPDATE {table} SET extra_json=? WHERE {where}", (json.dumps(cur),))
+            c.commit()
+        finally:
+            c.close()
+
+    GATE = [{"cmd": "true"}]
+    FIN = [{"id": "fin", "cmd": "true", "every": "merge", "covers": ["T"]}]
+
+    def mkrun(rid, fidelity=True, tasks=(), final=True):
+        fi("run", "init", "--id", rid, "--feature", rid, "--branch", "b")
+        for tid, parent in tasks:
+            fi("task", "add", "--id", tid, "--title", tid, "--run", rid, *(["--parent", parent] if parent else []))
+            if not parent or True:
+                setx("tasks", f"run='{rid}' AND id='{tid}'", "gate", GATE)
+        if fidelity:
+            setx("runs", f"id='{rid}'", "fidelity", True)
+        if final:
+            setx("runs", f"id='{rid}'", "final_gates", FIN)
+
+    def refused(out, *words):
+        assert out["ok"] is False and all(w in out["error"] for w in words), out
+        return out
+
+    def evidence_id(*args):
+        out = fi("gate", "run", *args)
+        assert out["all_green"] is True, out
+        return out["evidence"][0]["id"]
+
+    # 1. task set to a closed status
+    mkrun("f1", tasks=[("A", None), ("B", None), ("M", None)], final=False)
+    refused(fi("task", "set", "A", "status=done", "--run", "f1", code=2), "fidelity", "A:A#1 no evidence")
+    ea = evidence_id("A", "--run", "f1")
+    fi("task", "set", "A", "status=done", "--run", "f1")
+    # stale: evidence from before a new commit does not count
+    evidence_id("B", "--run", "f1")
+    bump(1)
+    refused(fi("task", "set", "B", "status=merged", "--run", "f1", code=2), "stale")
+    evidence_id("B", "--run", "f1")
+    fi("task", "set", "B", "status=merged", "--run", "f1")
+    # a red latest row does not count either
+    setx("tasks", "run='f1' AND id='M'", "gate", [{"cmd": "false"}])
+    fi("gate", "run", "M", "--run", "f1")
+    refused(fi("task", "set", "M", "status=done", "--run", "f1", code=2), "red")
+    # manual line: never run, clears only on a recorded sign-off
+    setx("tasks", "run='f1' AND id='M'", "gate", [])
+    setx("tasks", "run='f1' AND id='M'", "manual", "eyeball it")
+    refused(fi("task", "set", "M", "status=done", "--run", "f1", code=2), "M:manual no evidence")
+    refused(fi("gate", "signoff", "M", "--run", "f1", code=2), "--ref")
+    fi("gate", "signoff", "M", "--ref", "user", "--run", "f1")
+    fi("task", "set", "M", "status=done", "--run", "f1")
+    # a non-closing status needs no evidence
+    mkrun("f1b", tasks=[("N", None)], final=False)
+    fi("task", "set", "N", "status=building", "--run", "f1b")
+
+    # 2. parent fan-out
+    mkrun("f2", tasks=[("P", None), ("K1", "P"), ("K2", "P")], final=False)
+    refused(fi("task", "set", "P", "status=done", "--run", "f2", code=2), "K1:K1#1", "K2:K2#1")
+    fi("gate", "run", "K1", "--run", "f2"), fi("gate", "run", "K2", "--run", "f2")
+    assert fi("task", "set", "P", "status=done", "--run", "f2")["ok"] is True
+
+    # 3. run set --status done (open work first, then final gates, then stale tasks)
+    mkrun("f3", tasks=[("X", None)])
+    fi("gate", "run", "X", "--run", "f3")
+    fi("task", "set", "X", "status=merged", "--run", "f3")
+    bump(2)  # X's evidence is now stale
+    refused(fi("run", "set", "--id", "f3", "--status", "done", code=2), "X:X#1 evidence is stale", "final:fin no evidence")
+    fi("gate", "run", "X", "--run", "f3"), fi("gate", "run", "--final", "--run", "f3")
+    out = fi("run", "set", "--id", "f3", "--status", "done")
+    assert out["run"]["status"] == "done" and out["promoted"] == ["X"], out
+
+    # 4. run archive
+    mkrun("f4")
+    refused(fi("run", "archive", "--id", "f4", code=2), "final:fin no evidence")
+    fi("gate", "run", "--final", "--run", "f4")
+    assert fi("run", "archive", "--id", "f4")["run"]["status"] == "archived"
+
+    # 5. promote_closed called directly (run set done swallows its errors after the status write)
+    mkrun("f5", tasks=[("Y", None)], final=False)
+    fi("gate", "run", "Y", "--run", "f5")
+    fi("task", "set", "Y", "status=merged", "--run", "f5")
+    bump(3)
+    old = os.environ.copy()
+    os.environ.update(env)
+    try:
+        st = Store(data)
+        run = st.load("f5")
+        try:
+            list(promote_closed(st, run, "t"))
+        except Fail as e:
+            assert "Y:Y#1 evidence is stale" in str(e), e
+        else:
+            raise AssertionError("promote_closed promoted a task on stale evidence")
+        assert run["tasks"][0]["status"] == "merged", run["tasks"]
+    finally:
+        os.environ.clear(), os.environ.update(old)
+
+    # 6. a legacy (non-fidelity) run is exempt, gates or not
+    mkrun("f6", fidelity=False, tasks=[("L", None)], final=True)
+    fi("task", "set", "L", "status=done", "--run", "f6")
+    assert fi("run", "set", "--id", "f6", "--status", "done")["run"]["status"] == "done"
+
+    # 7. task set refuses every risk/gate key
+    for k in ("risk=2", "base_risk=1", "gate=x", "critical=true", "manual=x"):
+        refused(fi("task", "set", "A", k, "--run", "f1", code=2), "read-only")
+
+    # 8. risk add / list / clear
+    mkrun("f8", tasks=[("R", None)], final=False)
+    rid = fi("risk", "add", "R", "--kind", "touches-auth", "--points", "2", "--run", "f8")
+    assert rid["risk"] == 3, rid
+    lst = fi("risk", "list", "R", "--run", "f8")
+    assert [r["kind"] for r in lst["reasons"]] == ["touches-auth"] and lst["risk"] == {"R": 3}, lst
+    refused(fi("risk", "clear", str(rid["id"]), "--run", "f8", code=2), "--evidence")
+    refused(fi("risk", "clear", str(rid["id"]), "--evidence", "99999", "--run", "f8", code=2), "not a green gate run")
+    refused(fi("risk", "clear", str(rid["id"]), "--evidence", str(ea), "--run", "f8", code=2), "not a green gate run")  # other task's
+    er = evidence_id("R", "--run", "f8")
+    bump(4)  # stale
+    refused(fi("risk", "clear", str(rid["id"]), "--evidence", str(er), "--run", "f8", code=2), "not a green gate run")
+    er = evidence_id("R", "--run", "f8")
+    out = fi("risk", "clear", str(rid["id"]), "--evidence", str(er), "--run", "f8")
+    assert out["risk"] == 1, out
+    refused(fi("risk", "clear", str(rid["id"]), "--evidence", str(er), "--run", "f8", code=2), "not an open")
 
 
 def x31_r2_fixes_self_test(tmp, env):

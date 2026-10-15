@@ -544,6 +544,13 @@ def check_plan(header, out, body=None):
     return errors, warnings
 
 
+def final_gate_id(g, i):
+    """The one name of a final gate: its id, else its 1-based position. check_gate_fields (the
+    error label) and gate_fields_of (the frozen-field key) both use it, so an unnamed gate is
+    called the same thing in a check error and in an approve `changed_gates` reply."""
+    return g["id"] if isinstance(g, dict) and g.get("id") else i + 1
+
+
 def check_gate_fields(out, errors, warnings):
     """F.2: the per-task gate/manual/critical/risk rules and the header [[final_gate]] blocks.
     A plan written before F keeps checking clean: no gate and no final gate are WARNINGS, never
@@ -589,11 +596,11 @@ def check_gate_fields(out, errors, warnings):
     finals = out.get("final_gates") or []
     for i, g in enumerate(finals):
         if not isinstance(g, dict):
-            label = f"final gate {i + 1}"
+            label = f"final gate {final_gate_id(g, i)}"
             errors.append(f"{label}: a final gate is a table "
                           f"(id/cmd/expect/every/timeout/needs/covers), not {type(g).__name__}")
             continue
-        label = f"final gate {g.get('id')}" if g.get("id") else f"final gate {i + 1}"
+        label = f"final gate {final_gate_id(g, i)}"
         if not isinstance(g.get("cmd"), str) or not g["cmd"].strip():
             errors.append(f"{label}: needs cmd (a non-empty string)")
         if type(g.get("expect")) is not int:
@@ -1277,8 +1284,7 @@ def gate_fields_of(out):
     for k, v in (out.get("gates") or {}).items():
         snap[f"gates.{k}"] = jsonable(v)
     for i, g in enumerate(out.get("final_gates") or []):
-        named = isinstance(g, dict) and g.get("id")
-        snap[f"final_gate[{g.get('id') if named else i}]"] = jsonable(g)
+        snap[f"final_gate[{final_gate_id(g, i)}]"] = jsonable(g)
     return snap
 
 
@@ -1406,8 +1412,22 @@ def import_file(path, data, home, dry_run=False):
         _ensure_plan_assets(data, plan_id)
     con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
     try:
-        row = con.execute("SELECT version FROM plans WHERE id=?", (plan_id,)).fetchone()
+        row = con.execute("SELECT version, approved_at, header_json FROM plans WHERE id=?",
+                          (plan_id,)).fetchone()
         version = row["version"] if row and row["version"] is not None else 0
+        if row and row["approved_at"]:
+            # F.2: an approved version's gate fields are frozen. Overwriting header_json here would
+            # make the next approve compare the file against itself and skip the --user-ack check
+            # for a lowered risk/critical, so an import that would move a gate field is refused.
+            try:
+                prev = json.loads(row["header_json"] or "{}")
+            except ValueError:
+                prev = {}
+            moved = changed_gate_names(prev if isinstance(prev, dict) else {}, out)
+            if moved:
+                raise Fail([f"plan {plan_id} is approved; import would change frozen gate field(s): "
+                            f"{', '.join(moved)} — approve the edited file instead (a new version, "
+                            f"--user-ack if it lowers risk or critical)"])
         if not dry_run:
             db._begin(con)
             try:
@@ -1810,6 +1830,41 @@ def f2_approve_self_test(tmp, mk, write, plan_text, phase, task, db, mkpaths):
                         final='[[final_gate]]\nid = "fg1"\ncmd = "true"\ncovers = ["P1.1"]\n'))
     hg = approve(p, "--run", "f2r")
     assert hg["version"] == 8 and hg["changed_gates"] == ["gates.test"], hg
+
+    # 8. import never rewrites an approved version's frozen gate fields: a file that LOWERS risk is
+    #    refused (else the next approve would compare the file with itself and skip --user-ack);
+    #    the store row stays, the approve still demands the ack, and a same-gates import is a noop
+    imp = write("f2imp.md", doc("f2imp", risk=4))
+    approve(imp, "--run", "f2ir")
+    same = mk("import", imp, "--data", data, "--home", home)
+    assert same["ok"] and same["noop"] is True, same
+    write("f2imp.md", doc("f2imp", risk=2))
+    refused = mk("import", imp, "--data", data, "--home", home, code=2)
+    assert refused["ok"] is False and any("P1.1.risk" in e and "frozen gate field" in e
+                                          for e in refused["errors"]), refused
+    con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
+    try:
+        stored = json.loads(con.execute("SELECT header_json FROM plans WHERE id='f2imp'").fetchone()[0])
+    finally:
+        con.close()
+    assert stored["phases"][0]["tasks"][0]["risk"] == 4, stored["phases"][0]["tasks"][0]
+    low = approve(imp, "--run", "f2ir", code=2)
+    assert any("gate field(s) lowered:" in e for e in low["errors"]), low
+
+    # 9. an unnamed final gate has ONE number: the check error label and the changed_gates key
+    #    both call the second unnamed gate "2" (1-based)
+    def two_unnamed(cmd2):
+        fin = ('[[final_gate]]\ncmd = "true"\ncovers = ["P1.1"]\n'
+               f'[[final_gate]]\ncmd = {json.dumps(cmd2)}\ncovers = ["P1.1"]\n')
+        return doc("f2un", final=fin)
+    approve(write("f2un.md", two_unnamed("true")), "--run", "f2ur")
+    write("f2un.md", two_unnamed("false"))
+    moved = approve(os.path.join(tmp, "f2un.md"), "--run", "f2ur")
+    assert moved["changed_gates"] == ["final_gate[2]"], moved
+    nocmd = write("f2un2.md", doc("f2un2", final='[[final_gate]]\ncmd = "true"\ncovers = ["P1.1"]\n'
+                                  '[[final_gate]]\ncovers = ["P1.1"]\n'))
+    bad2 = mk("check", nocmd, code=2)
+    assert any(e.startswith("final gate 2: needs cmd") for e in bad2["errors"]), bad2
 
 
 def self_test():
