@@ -140,9 +140,29 @@ const STATUS_BUCKET: Record<string, 'done' | 'live' | 'planned'> = {
  *  slot may already hold another task, so the plan tree shows no lane tag. */
 export const isDoneStatus = (status: string): boolean => STATUS_BUCKET[status] === 'done'
 
+/** Natural compare without ICU: digit runs compare as numbers, everything else by code point. */
+export function naturalCompare(a: string, b: string): number {
+  const pa = a.match(/\d+|\D+/g) ?? []
+  const pb = b.match(/\d+|\D+/g) ?? []
+  for (let i = 0; i < Math.min(pa.length, pb.length); i++) {
+    const x = pa[i] as string
+    const y = pb[i] as string
+    if (x === y) continue
+    const nx = /^\d/.test(x)
+    const ny = /^\d/.test(y)
+    if (nx && ny) {
+      const d = Number(x) - Number(y)
+      if (d !== 0) return d
+    } else {
+      const d = x < y ? -1 : 1
+      return nx !== ny ? (nx ? -1 : 1) : d
+    }
+  }
+  return pa.length - pb.length
+}
+
 /** Natural order by task id within one parent: F.2 < F.4 < F.10 < F.S. */
-const byTaskId = (a: { id: string }, b: { id: string }): number =>
-  a.id.localeCompare(b.id, 'en', { numeric: true })
+const byTaskId = (a: { id: string }, b: { id: string }): number => naturalCompare(a.id, b.id)
 
 /** Sum the per-status counts into the run-card bucket totals. A status not in
  *  STATUS_BUCKET lands in planned: every task counts. */
