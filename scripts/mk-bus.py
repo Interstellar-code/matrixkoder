@@ -40,6 +40,13 @@ Subcommands:
       Streams bus messages, one line each. Keeps the last printed seq per (run, task) in
       <data>/watch-cursors.json (0600): a new watch resumes after it. An explicit --after wins
       over the cursor; --replay ignores it and starts from 0; the first watch ever replays history.
+  archive-run [--run ID] [--data DIR]
+      L6.3 (C6): archive ONE closed run's bus messages, acks and bus artifacts to
+      <run dir>/bus.jsonl (mkpaths-resolved), count-check the file against the rows, then
+      delete the rows in one transaction. Refuses a run that is not closed (run status
+      done|archived and every task done|merged|blocked). The seq high-water mark is kept
+      above the archived range, so no later message reuses a deleted seq. A second call
+      is a no-op. A mismatch deletes nothing and removes the partial file.
   --self-test
       Comprehensive self-test of server, round trip, auth, replay, lifecycle, security, error handling.
 
@@ -3065,6 +3072,354 @@ def _read_run_messages(data_dir, run):
     return messages
 
 
+# --- L6.3 run-end archive (C6) -------------------------------------------------------------------
+#
+# A closed run's bus rows leave the project store: every bus message (events
+# chan='bus'), every ack and every bus artifact of the run is written to the
+# run's bus.jsonl under mkpaths (one JSON object per line), the file is
+# count-checked against the rows, and ONLY THEN are the rows deleted in one
+# transaction. Any mismatch or error deletes nothing and removes the file.
+
+# Test-only seam (never set in normal use): drop 1-based line N from the lines
+# about to be written, so the count check fails. Self-test case (c) uses it.
+ARCHIVE_DROP_LINE_ENV = "MK_BUS_ARCHIVE_DROP_LINE"
+
+# Column order of the SELECTs the readers above use; the canonical row JSON of
+# one archived row is these columns in this order, tight separators.
+ARCHIVE_MSG_COLS = ("id", "run", "task", "t", "chan", "kind", "from_id", "to_id",
+                    "reply_to", "text", "artifact_id", "meta_json")
+ARCHIVE_ACK_COLS = ("run", "msg", "lane", "level", "t")
+ARCHIVE_ART_COLS = ("id", "run", "task", "round", "kind", "rev", "text", "created", "src")
+ARCHIVE_GROUPS = (("msg", ARCHIVE_MSG_COLS), ("ack", ARCHIVE_ACK_COLS), ("artifact", ARCHIVE_ART_COLS))
+
+# mk-state's run statuses are active|done|archived; done and archived both close
+# a run (run set --status done, run archive).
+ARCHIVE_CLOSED_STATUSES = ("done", "archived")
+# A task that cannot still be working when the run closes. This is NOT mk-state's
+# ROUND_TERMINAL: a round reset may legitimately inherit `review`/`verifying`,
+# but for a run end those two mean a reviewer or verifier lane is live or
+# scheduled — its messages, reports and reviews would be deleted out from under
+# it. Refusing costs one retry once the task lands; archiving early loses data.
+ARCHIVE_TASK_TERMINAL = ("done", "merged", "blocked")
+
+# mk-state's slug-only project name; the --data form below wins, so it is a label.
+_ARCHIVE_STORE_PROJECT = "matrixkoder"
+
+# events.id is the wire seq and the SSE Last-Event-ID. The column is a plain
+# INTEGER PRIMARY KEY: SQLite hands out max(id)+1 over the rows PRESENT in the
+# table, so deleting the top seqs of a run would let the next message reuse a seq
+# a live watch / SSE / lane /wait cursor has already passed — that reader would
+# then skip every new message that lands on a reused seq. One guard row per
+# archived run pins the high-water mark instead: chan='seq' is a chan no reader
+# of bus rows selects, and the run id fails is_valid_id, so no run-scoped reader
+# (dashboard Events, mk-state, mk-builder task history) ever sees it either.
+ARCHIVE_SEQ_RUN = "_seq-guard"
+ARCHIVE_SEQ_CHAN = "seq"
+ARCHIVE_SEQ_KIND = "guard"
+
+
+def _archive_canonical(cols, row):
+    """One row as its canonical JSON: the SELECT column order, tight separators."""
+    return json.dumps([row[c] for c in cols], separators=(",", ":"), ensure_ascii=False)
+
+
+def _archive_digest(rows_by_group):
+    """sha256 over every canonical row of the archive, in file order, newline-fed."""
+    h = hashlib.sha256()
+    for _name, cols, rows in rows_by_group:
+        for row in rows:
+            h.update(_archive_canonical(cols, row).encode("utf-8"))
+            h.update(b"\n")
+    return h.hexdigest()
+
+
+def _own_project_store(data_dir):
+    """(store, folder) of the project this data dir names, resolved the way the bus
+    resolves its own store (L6.1, todo 108): a switched project's rows live in the
+    C2 project folder, and mkpaths.project_db(slug) is the one rule that follows
+    the switch. Pre-migration the answer is exactly <data>/mk.db."""
+    try:
+        slug = project_slug_for(data_dir)
+    except Fail:
+        slug = None
+    if slug:
+        try:
+            db = _paths("project_db", slug=slug)
+        except Fail:
+            db = None
+        if db and os.path.isfile(db):
+            folder = os.path.dirname(db)
+            if os.path.realpath(folder) != os.path.realpath(data_dir):
+                return StoreAdapter(folder), folder
+    return StoreAdapter(data_dir), data_dir
+
+
+def _archive_rows(store, run):
+    """(messages, acks, artifacts) of ONE run. SELECT only, through StoreAdapter.
+
+    Messages are events chan='bus' (the row id IS the wire seq).
+
+    Bus artifacts are the rows THAT A BUS MESSAGE CARRIES: the events.artifact_id
+    link mkdb.put_artifact writes for the event it was stored for. src IS NULL is
+    NOT the discriminator: mk-lane-event and mk-builder use the very same live
+    writer (put_artifact, src NULL) to store a task's brief, review-brief and
+    review in the project DB, and those rows are not bus traffic — archiving a run
+    must never take them. Each revision the bus put also carries its own event
+    link, so a revision a later one superseded is archived with the rest instead
+    of being orphaned. An importer row (src set) is mk-state's run-doc/index data
+    and is unreferenced either way.
+    """
+    msgs = store.store_select(
+        "SELECT id, run, task, t, chan, kind, from_id, to_id, reply_to, text, artifact_id, meta_json"
+        " FROM events WHERE chan=? AND run=? ORDER BY id",
+        ("bus", run),
+    )
+    acks = store.store_select(
+        "SELECT run, msg, lane, level, t FROM acks WHERE run=? ORDER BY msg, lane",
+        (run,),
+    )
+    arts = store.store_select(
+        "SELECT id, run, task, round, kind, rev, text, created, src FROM artifacts"
+        " WHERE run=? AND id IN (SELECT artifact_id FROM events"
+        " WHERE chan=? AND run=? AND artifact_id IS NOT NULL) ORDER BY id",
+        (run, "bus", run),
+    )
+    return msgs, acks, arts
+
+
+def _archive_groups(msgs, acks, arts):
+    """[(name, cols, rows)] in file order: messages, acks, artifacts."""
+    return [("msg", ARCHIVE_MSG_COLS, msgs),
+            ("ack", ARCHIVE_ACK_COLS, acks),
+            ("artifact", ARCHIVE_ART_COLS, arts)]
+
+
+def _archive_state(groups):
+    """The DB-side (counts, seq range, digest) the written file must carry."""
+    counts = {name: len(rows) for name, _cols, rows in groups}
+    seqs = [int(r["id"]) for r in groups[0][2]]
+    return counts, (min(seqs), max(seqs)) if seqs else (None, None), _archive_digest(groups)
+
+
+def _archive_lines(groups):
+    """One JSON object per archived row, in file order.
+
+    Each line carries its own sha256 of the canonical row, so the count check
+    can re-derive every digest from the file alone."""
+    lines = []
+    for name, cols, rows in groups:
+        for row in rows:
+            canon = _archive_canonical(cols, row)
+            lines.append(json.dumps(
+                {"type": name, "sha256": hashlib.sha256(canon.encode("utf-8")).hexdigest(),
+                 "row": {c: row[c] for c in cols}},
+                separators=(",", ":"), ensure_ascii=False))
+    return lines
+
+
+def _archive_write_file(path, lines):
+    """Write the archive file atomically (temp in the same dir, fsync, replace), 0600.
+
+    The one seam a test wraps (or shrinks through ARCHIVE_DROP_LINE_ENV) to
+    force a count mismatch without reaching into the finished file."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    drop = os.environ.get(ARCHIVE_DROP_LINE_ENV)
+    if drop:
+        try:
+            n = int(drop)
+        except ValueError:
+            n = 0
+        if 1 <= n <= len(lines):
+            lines = lines[:n - 1] + lines[n:]
+    fd, tmp = tempfile.mkstemp(prefix=".bus.jsonl.", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            for line in lines:
+                f.write(line + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def _archive_verify_file(path, groups):
+    """Count-check the written file against the rows it was written from.
+
+    Re-reads the file and recomputes FROM THE FILE the per-group counts, the seq
+    range and the aggregate digest, and every line's own sha256. A truncated,
+    reordered or edited file fails here: the caller deletes nothing."""
+    cols_of = {name: cols for name, cols, _rows in groups}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = [ln for ln in f.read().split("\n") if ln]
+    except OSError as e:
+        raise Fail(f"archive file unreadable after the write: {e}")
+    file_rows = {name: [] for name, _cols, _rows in groups}
+    for ln in raw:
+        try:
+            obj = json.loads(ln)
+        except ValueError:
+            raise Fail(f"archive file holds a non-JSON line: {ln[:120]}")
+        name = obj.get("type") if isinstance(obj, dict) else None
+        row = obj.get("row") if isinstance(obj, dict) else None
+        if name not in cols_of or not isinstance(row, dict):
+            raise Fail(f"archive file holds a malformed line: {ln[:120]}")
+        cols = cols_of[name]
+        if any(c not in row for c in cols):
+            raise Fail(f"archive file line is missing columns: {ln[:120]}")
+        canon = json.dumps([row[c] for c in cols], separators=(",", ":"), ensure_ascii=False)
+        if hashlib.sha256(canon.encode("utf-8")).hexdigest() != obj.get("sha256"):
+            raise Fail("archive file line digest mismatch: the file changed after the write")
+        file_rows[name].append(row)
+    counts = {name: len(rows) for name, rows in file_rows.items()}
+    want_counts = {name: len(rows) for name, _cols, rows in groups}
+    if counts != want_counts:
+        raise Fail(f"archive count mismatch: the file holds {counts}, the rows were {want_counts}")
+    seqs = [int(r["id"]) for r in file_rows["msg"]]
+    want_seqs = [int(r["id"]) for r in groups[0][2]]
+    got_range = (min(seqs), max(seqs)) if seqs else (None, None)
+    want_range = (min(want_seqs), max(want_seqs)) if want_seqs else (None, None)
+    if got_range != want_range:
+        raise Fail(f"archive seq range mismatch: the file holds {got_range}, the rows were {want_range}")
+    digest = _archive_digest([(name, cols_of[name], file_rows[name]) for name, _cols, _rows in groups])
+    if digest != _archive_digest(groups):
+        raise Fail("archive sha256 mismatch: the file rows do not hash to the store rows")
+
+
+def _archive_refuse_unless_closed(store, run):
+    """(plan, status) of a CLOSED run; Fail before anything is written otherwise.
+
+    Closed means the run row says so (done or archived) AND every task of the run
+    is terminal: an active run, or one with a live task, is never archived."""
+    rows = store.store_select("SELECT id, plan, status FROM runs WHERE id=?", (run,))
+    if not rows:
+        raise Fail(f"unknown run {run!r}: no run row in the project store")
+    status = (rows[0].get("status") or "").strip().lower()
+    if status not in ARCHIVE_CLOSED_STATUSES:
+        raise Fail(f"run {run} is not closed (status {status or 'unset'}): refusing to archive")
+    tasks = store.store_select("SELECT id, status FROM tasks WHERE run=?", (run,))
+    open_tasks = [t.get("id") for t in tasks
+                  if (t.get("status") or "").strip().lower() not in ARCHIVE_TASK_TERMINAL]
+    if open_tasks:
+        raise Fail(f"run {run} has non-terminal tasks {open_tasks}: refusing to archive")
+    return rows[0].get("plan"), status
+
+
+def _archive_hold_seq(con, seq_max, last_t, run):
+    """Pin the seq high-water mark above the archived range, in the same transaction.
+
+    Called AFTER the run's bus rows are gone and before COMMIT, so it rolls back
+    with them. `seq_max` is the highest archived message id; when some other row
+    already sits above it the counter cannot reuse the archived range and no
+    guard row is written. `last_t` keeps the guard's own timestamp the archived
+    run's, so MAX(t) readers (cards/project_summary) see no change."""
+    if not seq_max:
+        return
+    top = con.execute("SELECT MAX(id) AS m FROM events").fetchone()["m"]
+    if top is not None and int(top) >= int(seq_max):
+        return
+    con.execute(
+        "INSERT INTO events(id, run, task, t, chan, kind, from_id, to_id, reply_to,"
+        " text, artifact_id, meta_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (int(seq_max), ARCHIVE_SEQ_RUN, None, last_t or "", ARCHIVE_SEQ_CHAN,
+         ARCHIVE_SEQ_KIND, None, None, None, run, None, None))
+
+
+def _archive_delete(mod, folder, run, want):
+    """Delete the run's bus rows in ONE transaction, re-checked inside it.
+
+    The count check runs again under BEGIN IMMEDIATE: a row that landed between
+    the read and the delete changes the state, and the archive refuses rather
+    than delete a row the file never carried. Artifacts go first: their ids come
+    from the bus events, so the events must still be there when they are read."""
+    con = mod.open_project(mk_home(), _ARCHIVE_STORE_PROJECT, data_dir=folder)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            msgs, acks, arts = _archive_rows(StoreAdapter(folder), run)
+            now = _archive_state(_archive_groups(msgs, acks, arts))
+            if now != want:
+                raise Fail("the run's rows changed while the archive was written: nothing deleted")
+            art_ids = [(r["id"],) for r in arts]
+            if art_ids:
+                con.executemany("DELETE FROM artifacts WHERE id=?", art_ids)
+            con.execute("DELETE FROM events WHERE chan=? AND run=?", ("bus", run))
+            con.execute("DELETE FROM acks WHERE run=?", (run,))
+            _archive_hold_seq(con, want[1][1], msgs[-1]["t"] if msgs else None, run)
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+    finally:
+        con.close()
+
+
+def archive_run(data_dir, run):
+    """L6.3 (C6): archive ONE closed run's bus rows to bus.jsonl, then delete them.
+
+    Refuses an active run before anything is written. A count mismatch or any
+    error deletes nothing and removes the partial file. A second call finds
+    nothing to archive and does nothing: no empty second file, and an archive
+    file that already exists is left alone. Returns the reply dict.
+
+    A bus process that is serving this data dir while the archive runs keeps the
+    run's messages in its own cache until it restarts: the CLI holds no channel
+    into a live serve loop, so a /pending or /events?replay=true against THAT
+    process answers from memory. Watch, /wait, cmd_pending and every fresh serve
+    read the store and see the archive. Restart the bus of an archived run to
+    drop the cache."""
+    if not is_valid_id(run):
+        raise Fail("invalid run id")
+    if not store_mode(data_dir):
+        raise Fail("archive-run needs the project store: file mode holds no bus rows")
+    store, folder = _own_project_store(data_dir)
+    plan, _status = _archive_refuse_unless_closed(store, run)
+    msgs, acks, arts = _archive_rows(store, run)
+    groups = _archive_groups(msgs, acks, arts)
+    counts, seq_range, digest = _archive_state(groups)
+    path = os.path.join(_paths("run_dir", data_dir, run), "bus.jsonl")
+    if not any(counts.values()):
+        # Idempotent: the rows are already gone. An archive file that already
+        # exists with matching content is left alone; no empty second file.
+        return {"ok": True, "op": "archive-run", "run": run, "plan": plan, "path": path,
+                "messages": 0, "acks": 0, "artifacts": 0, "seq_min": None, "seq_max": None,
+                "sha256": None, "written": False, "archived": False}
+    if os.path.exists(path):
+        raise Fail(f"archive file already exists while rows remain: {path} — refusing to overwrite it")
+    _archive_write_file(path, _archive_lines(groups))
+    try:
+        _archive_verify_file(path, groups)
+    except BaseException:
+        # The partial file never survives a failed check.
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        raise
+    try:
+        _archive_delete(_load_mkdb(), folder, run, (counts, seq_range, digest))
+    except BaseException:
+        # Nothing was deleted, but a file on disk while the rows remain would
+        # refuse every later attempt. Clear it so the next archive can retry.
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        raise
+    return {"ok": True, "op": "archive-run", "run": run, "plan": plan, "path": path,
+            "messages": counts["msg"], "acks": counts["ack"], "artifacts": counts["artifact"],
+            "seq_min": seq_range[0], "seq_max": seq_range[1], "sha256": digest,
+            "written": True, "archived": True}
+
+
+def cmd_archive_run(args):
+    """C6: the run-end archive CLI. See archive_run for the contract."""
+    data_dir = resolve_data(getattr(args, "data", None))
+    res = archive_run(data_dir, getattr(args, "run", "") or "")
+    out(res)
+    return res
+
+
 def cmd_answer(args):
     data_dir = resolve_data(getattr(args, "data", None))
     port, token = _get_client_conn(data_dir)
@@ -5969,6 +6324,936 @@ def _lane_state_self_test(mod):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _load_script_module(name, path):
+    """One script loaded by absolute path through importlib — the way _load_mkpaths and
+    _load_mkdb load their siblings (each script stands alone)."""
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# The home env names every MK script honours (mkpaths._clear_home_env's set).
+_ARCHIVE_HOME_KEYS = ("MK_HOME", "MATRIXKODER_HOME", "MATRIXKODER_DATA", "MK_BUS_DIR",
+                      "MK_BUS_TOKEN_FILE")
+
+
+class _ArchiveFixture:
+    """One temp project for the L6.3 archive-run cases: every path through mkpaths, every
+    row through mkdb's live writers, a real bus on a temp home. Same shape as the file's
+    other store-mode self-tests, kept local so the cases stand alone in this file."""
+
+    def __init__(self, tmp, slug, home_env=True, plan="alpha"):
+        self.mod = _mkdb_helpers_ready()
+        self.mp = _load_mkpaths()
+        self._slug, self._plan = slug, plan
+        self._saved = {k: os.environ.get(k) for k in _ARCHIVE_HOME_KEYS + ("HOME",)}
+        self._procs = {}
+        home_root = os.path.join(tmp, "home")
+        # the MK home is <tmp>/home when MK_HOME pins it, else the production
+        # $HOME/.matrixkoder under a temp $HOME
+        home = home_root if home_env else os.path.join(home_root, ".matrixkoder")
+        repo, data = os.path.join(tmp, "repo-" + slug), os.path.join(tmp, "repo-" + slug, ".matrixkoder")
+        os.makedirs(home, exist_ok=True)
+        os.makedirs(data, exist_ok=True)
+        self.tmp, self.home, self.repo, self.data = tmp, home, repo, data
+        self._env = {k: v for k, v in os.environ.items() if k not in _ARCHIVE_HOME_KEYS}
+        self._env["MK_SELFTEST"] = "1"
+        self._env["HOME"] = home_root
+        if home_env:
+            self._env["MK_HOME"] = self._env["MATRIXKODER_HOME"] = self._env["MK_BUS_DIR"] = home
+        # the same env in process, so mkpaths/mkdb resolve this temp home here too
+        for key in _ARCHIVE_HOME_KEYS:
+            os.environ.pop(key, None)
+        os.environ["HOME"] = home_root
+        os.environ["MK_SELFTEST"] = "1"
+        if home_env:
+            os.environ["MK_HOME"] = os.environ["MATRIXKODER_HOME"] = home
+            os.environ["MK_BUS_DIR"] = home
+        # the root projects row (db_path NULL): no mkdb helper owns it, the repo's own
+        # fixture convention (mkpaths._seed_root)
+        con = self.mod.open_root(home)
+        try:
+            con.execute(
+                "INSERT OR IGNORE INTO projects(slug, name, repo, data_dir, mode, created,"
+                " last_activity) VALUES (?,?,?,?,?,?,?)",
+                (slug, slug, os.path.realpath(repo), os.path.realpath(data), "home",
+                 "2026-10-12T09:00:00+00:00", "2026-10-12T09:00:00+00:00"))
+            con.commit()
+        finally:
+            con.close()
+        self.mod.open_project(home, slug, data_dir=data).close()
+
+    # ---- paths ---------------------------------------------------------------------------------
+    @property
+    def slug(self):
+        return self._slug
+
+    @property
+    def plan(self):
+        return self._plan
+
+    def env(self):
+        """A fresh child env for CLI subprocesses (MK_SELFTEST plus this fixture's home)."""
+        return dict(self._env)
+
+    def folder(self):
+        """The project folder every writer and reader must use: <data> before the switch,
+        the C2 project folder after it — mkpaths.project_folder's one rule, the same
+        _own_project_store and run_dir follow. Never hand-built."""
+        return _paths("project_folder", self.data)
+
+    def store_path(self):
+        return os.path.join(self.folder(), "mk.db")
+
+    def paths(self):
+        """The paths the cases assert against, every one resolved through mkpaths."""
+        return {"home": self.home, "data": self.data, "store": self.store_path(),
+                "project_folder": self.folder()}
+
+    # ---- rows ----------------------------------------------------------------------------------
+    def add_run(self, run_id, status="active", tasks=()):
+        """One import_history call: the run row plus its task rows (a task spec may be a
+        plain id or a dict with status)."""
+        specs = []
+        for t in tasks:
+            spec = {"id": t, "type": "task", "title": t} if isinstance(t, str) else dict(t)
+            spec.setdefault("type", "task")
+            spec.setdefault("title", spec["id"])
+            spec.setdefault("status", "planned")
+            specs.append(spec)
+        run_row = {"id": run_id, "plan": self._plan, "plan_version": 1,
+                   "branch": "mk/%s/%s" % (self._plan, run_id), "status": status, "stage": "1",
+                   "next": None, "started": "2026-10-12T09:00:00+00:00",
+                   "ended": None if status == "active" else "2026-10-12T15:00:00+00:00"}
+        self.mod.import_history(self.home, self._slug, run_id, run_row=run_row, tasks=specs,
+                                data_dir=self.folder())
+        return run_id
+
+    def set_run_status(self, run_id, status):
+        con = self.mod.open_project(self.home, self._slug, data_dir=self.folder())
+        try:
+            con.execute("UPDATE runs SET status=? WHERE id=?", (status, run_id))
+            con.commit()
+        finally:
+            con.close()
+        return status
+
+    def event(self, run, *, chan="bus", kind, task=None, from_id=None, to_id=None,
+              reply_to=None, text="", meta=None, artifact_id=None, t=None):
+        """mkdb.append_event -> the new event id; the message id is 'm-<id>'."""
+        return self.mod.append_event(self.home, self._slug, run, task=task, chan=chan,
+                                     kind=kind, from_id=from_id, to_id=to_id,
+                                     reply_to=reply_to, text=text, meta=meta,
+                                     artifact_id=artifact_id, t=t, data_dir=self.folder())
+
+    def ack(self, run, msg, lane, level=2, t=None):
+        return self.mod.append_ack(self.home, self._slug, run, msg, lane, level, t=t,
+                                   data_dir=self.folder())
+
+    def artifact(self, run, task, round_n, kind, text, event_id=None):
+        return self.mod.put_artifact(self.home, self._slug, run, task, round_n, kind, text,
+                                     event_id=event_id, data_dir=self.folder())
+
+    def import_artifacts(self, run, specs):
+        """Importer-path artifacts (src SET) through mkdb's history writer — the same writer
+        mk-state's store-enable path uses, so the rows carry src exactly like production.
+        -> the ids of the rows written (a repeat adds nothing)."""
+        before = set(self.imported_artifact_ids(run))
+        self.mod.import_history(self.home, self._slug, run, artifacts=list(specs),
+                                data_dir=self.folder())
+        return [i for i in self.imported_artifact_ids(run) if i not in before]
+
+    def imported_artifact_ids(self, run_id):
+        """The artifact ids archive-run must LEAVE: the importer's rows of this run (src set
+        — mk-state's run-doc/index artifacts carry it). The discriminator that proves the
+        live-path filter."""
+        con = self.mod._open_read(self.store_path(), self.mod.SCHEMA)
+        if con is None:
+            return []
+        try:
+            return [r["id"] for r in con.execute(
+                "SELECT id FROM artifacts WHERE run=? AND src IS NOT NULL ORDER BY id", (run_id,))]
+        finally:
+            con.close()
+
+    # ---- the C2 layout --------------------------------------------------------------------------
+    def migrate(self):
+        """The real mk-migrate --switch: the project joins the C2 tree and every mkpaths
+        resolve follows — the store the writers above use, the store archive-run reads
+        (_own_project_store follows db_path) and the bus.jsonl path (run_dir). Call it
+        AFTER the last store write: the switch copies the store, so a pre-switch write is
+        what lands in the C2 store."""
+        if not os.path.isdir(os.path.join(self.repo, ".git")):
+            subprocess.run(["git", "init", "-q", self.repo], check=True, env=self.env(),
+                           capture_output=True)
+        proc = subprocess.run(
+            [sys.executable, os.path.join(HERE, "mk-migrate.py"), "--switch", "--slug", self._slug,
+             "--data", self.data, "--home", self.home, "--repo", self.repo],
+            capture_output=True, text=True, env=self.env(), timeout=300)
+        if proc.returncode != 0:
+            raise AssertionError("mk-migrate --switch failed rc=%s:\n%s\n%s"
+                                 % (proc.returncode, proc.stdout, proc.stderr))
+        self.mp._MIGRATED_MEMO = None  # a re-seeded root: drop the memo this process holds
+        self.mp._RUN_PLAN_MEMO = None
+        return self.paths()
+
+    # ---- the real bus ---------------------------------------------------------------------------
+    def start_bus(self, run):
+        """The real `serve --data <data> --run <run>`: spawn, poll bus.json for this pid's
+        port, then /health. No fixed sleeps — every wait is a bounded poll."""
+        argv = [sys.executable, os.path.join(HERE, "mk-bus.py"), "serve",
+                "--data", self.data, "--run", run]
+        err_path = os.path.join(self.tmp, "serve-%s-%s.stderr" % (self._slug, run))
+        with open(err_path, "wb") as err:
+            proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=err,
+                                    env=self.env(), start_new_session=True)
+        self._procs[proc.pid] = (proc, err_path)
+        try:
+            port = self._wait_bus_json(proc.pid)
+            self._wait_healthy(port)
+        except BaseException:
+            self.stop_bus(proc.pid)
+            raise
+        return proc.pid, port
+
+    def _wait_bus_json(self, pid, timeout=30.0):
+        path = _paths("bus_json", self.data)
+        deadline = time.monotonic() + timeout
+        last = None
+        while time.monotonic() < deadline:
+            entry = self._procs.get(pid)
+            if entry is not None and entry[0].poll() is not None:
+                raise AssertionError("serve exited %s before publishing its port (stderr=%s)"
+                                     % (entry[0].returncode, self._stderr_tail(pid)))
+            try:
+                with open(path) as f:
+                    doc = json.load(f)
+                last = doc
+                if isinstance(doc, dict) and doc.get("pid") == pid and isinstance(doc.get("port"), int):
+                    return doc["port"]
+            except (OSError, ValueError):
+                pass
+            time.sleep(0.02)
+        raise AssertionError("serve pid %s never published its port (bus.json=%r, stderr=%s)"
+                             % (pid, last, self._stderr_tail(pid)))
+
+    def _wait_healthy(self, port, timeout=30.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:%d/health" % port, timeout=2) as r:
+                    if json.loads(r.read().decode()).get("status") == "healthy":
+                        return
+            except (urllib.error.URLError, ValueError, OSError):
+                pass
+            time.sleep(0.02)  # a poll, never a fixed sleep: the deadline above bounds it
+        raise AssertionError("bus on port %d never became healthy" % port)
+
+    def _stderr_tail(self, pid, limit=2000):
+        entry = self._procs.get(pid)
+        if not entry:
+            return "<gone>"
+        try:
+            with open(entry[1]) as f:
+                return f.read()[-limit:]
+        except OSError:
+            return "<unreadable>"
+
+    def mint_orch(self):
+        """The live orch (server) token from bus-tokens.json: serve retires every earlier
+        orch entry on start, so exactly one role=="orch" token is valid."""
+        with open(_paths("bus_tokens", self.data)) as f:
+            tokens = json.load(f)
+        orch = [tok for tok, v in tokens.items()
+                if isinstance(v, dict) and v.get("role") == "orch"]
+        if len(orch) != 1:
+            raise AssertionError("expected exactly one orch token, got %r" % (sorted(orch),))
+        return orch[0]
+
+    def lane_token(self, run, task):
+        """The real `token` CLI for a lane worktree (<tmp>/lane-<run>-<task>) -> the bearer
+        token; the lane's token file lands at mkpaths.lane_token(lane)."""
+        lane = os.path.join(self.tmp, "lane-%s-%s-%s" % (self._slug, run, task))
+        os.makedirs(lane, exist_ok=True)
+        proc = subprocess.run(
+            [sys.executable, os.path.join(HERE, "mk-bus.py"), "token", "--lane", lane,
+             "--task", task, "--run", run, "--data", self.data],
+            capture_output=True, text=True, env=self.env(), timeout=60)
+        if proc.returncode != 0:
+            raise AssertionError("token failed rc=%s: %s %s"
+                                 % (proc.returncode, proc.stdout, proc.stderr))
+        return read_json(_paths("lane_token", lane))["token"]
+
+    def post(self, port, token, body, path="/send"):
+        """A real HTTP POST against the running bus -> (status, reply-dict)."""
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d%s" % (port, path),
+            data=json.dumps(body).encode("utf-8"), method="POST",
+            headers={"Content-Type": "application/json",
+                     "Authorization": "Bearer %s" % token,
+                     "Host": "127.0.0.1:%d" % port})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                raw = r.read().decode()
+                return r.status, (json.loads(raw) if raw.strip() else {})
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode()
+            try:
+                return e.code, json.loads(raw)
+            except ValueError:
+                return e.code, {"raw": raw}
+
+    def stop_bus(self, pid):
+        """Terminate one pid, escalate once, bounded poll until dead (never a fixed wait).
+        Liveness goes through Popen.poll(): a serve spawned here is this process's child,
+        so a killed one lingers as a zombie that kill(pid, 0) still reports as alive."""
+        entry = self._procs.get(pid)
+        proc = entry[0] if entry else None
+
+        def alive():
+            if proc is not None:
+                return proc.poll() is None
+            try:
+                os.kill(pid, 0)
+                return True  # not ours to reap: trust the signal
+            except OSError:
+                return False
+
+        if not alive():
+            self._forget(pid)
+            return
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.kill(pid, sig)
+            except OSError:
+                break
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and alive():
+                time.sleep(0.02)
+            if not alive():
+                break
+        if alive():
+            raise AssertionError("bus pid %s did not stop (stderr=%s)"
+                                 % (pid, self._stderr_tail(pid)))
+        self._forget(pid)
+
+    def _forget(self, pid):
+        self._procs.pop(pid, None)
+
+    def cleanup(self):
+        """Reap every bus this fixture started, restore the env it pinned, and remove the
+        fixture's own tree. The shared <tmp>/home is left to the caller's outer cleanup."""
+        for pid in list(self._procs):
+            try:
+                self.stop_bus(pid)
+            except AssertionError:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+        for proc, _ in list(self._procs.values()):
+            if proc.poll() is None:
+                proc.kill()
+        self._procs = {}
+        for key, val in self._saved.items():
+            if val is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = val
+        for name in sorted(os.listdir(self.tmp)):
+            if name == "home" or not name.startswith(("repo-" + self._slug, "lane-" + self._slug,
+                                                      "serve-" + self._slug)):
+                continue
+            shutil.rmtree(os.path.join(self.tmp, name), ignore_errors=True)
+
+
+def _archive_fixture(tmp, slug, home_env=True):
+    """One temp project for the L6.3 cases (see _ArchiveFixture)."""
+    return _ArchiveFixture(tmp, slug, home_env=home_env)
+
+
+def _archive_run_self_test():
+    """L6.3 (C6) archive-run, on the REAL bus and the REAL project store.
+
+    Seven cases. Each fails on a tree without `archive-run`, where the CLI exits 2
+    with "unknown command archive-run":
+
+      (a) a closed run is archived ON THE SWITCHED C2 LAYOUT (the fixture runs the real
+          mk-migrate --switch): the file lands at the mkpaths run dir — <project folder>/
+          plans/<plan>/runs/<run>/bus.jsonl, never hand-built — its line count is this run's
+          messages+acks+artifacts read from the store BEFORE the call, the counts, the seq
+          range and the sha256 on stdout match a recomputation from those rows AND from the
+          file itself, and those rows are gone afterwards while the run row, its tasks, its
+          chan='state' events, its importer artifacts (src SET), its LIVE-PATH artifacts
+          (brief / review-brief / review, src NULL — task data, not bus traffic) and another
+          run's rows are not; every revision of a bus report is archived and none of those
+          decoys is; a message sent on a live run still lands above the archived seq range;
+      (b) an ACTIVE run is refused before anything is written, and so is a closed run with a
+          non-terminal task — including `review` and `verifying`, where a reviewer or verifier
+          lane is still live: exit 2, the reason named, no file, the rows untouched. The other
+          closed spelling (archived) is accepted;
+      (c) a dropped archive line fails the count check: nothing is deleted and the partial
+          file is removed — through the writer seam wrapped in process, and through the CLI
+          with the documented drop-line env;
+      (d) a cursor that points at a deleted seq resumes at the NEXT existing seq: the watch
+          stream, the SSE stream and the lane /wait path never replay what was already seen,
+          never reset to 0 and never error;
+      (e) a second archive of the same run is a no-op: exit 0, nothing written, the file's
+          bytes unchanged — on a temp $HOME with MK_HOME/MATRIXKODER_HOME/MATRIXKODER_DATA
+          unset;
+      (f) an archived run's seqs are never reused: the run held the highest seqs, they are
+          gone from the table, and the live run's next message still lands above them (the
+          high-water guard row is the only events row left holding the range, invisible to
+          every run-scoped, chan='bus' and bus-kind reader);
+      (g) a message that lands between the count check and the delete makes the transaction
+          re-check refuse: nothing is deleted, the archive file does not survive, and the
+          retry archives the run whole, that message included.
+    """
+    import shutil
+
+    if _mkdb_helpers_ready() is None:
+        print("archive-run self-test skipped: mkdb live writers not present")
+        return
+    bus_py = os.path.abspath(__file__)
+    tmp = tempfile.mkdtemp(prefix="mk-bus-archive-")
+    # The canonical row JSON of one archived row is the SELECT column order, tight
+    # separators. Recomputed here from the store so the digest checks below are independent
+    # of the code under test rather than a call back into it.
+    cols_of = {
+        "msg": ("id", "run", "task", "t", "chan", "kind", "from_id", "to_id",
+                "reply_to", "text", "artifact_id", "meta_json"),
+        "ack": ("run", "msg", "lane", "level", "t"),
+        "artifact": ("id", "run", "task", "round", "kind", "rev", "text", "created", "src"),
+    }
+    sql_of = {
+        "msg": "SELECT %s FROM events WHERE chan='bus' AND run=? ORDER BY id" % ", ".join(cols_of["msg"]),
+        "ack": "SELECT %s FROM acks WHERE run=? ORDER BY msg, lane" % ", ".join(cols_of["ack"]),
+        # bus artifacts are the rows a BUS MESSAGE carries: the events.artifact_id
+        # link put_artifact writes for the event it was stored for. src IS NULL is
+        # NOT the filter — mk-lane-event and mk-builder use the same live writer
+        # (src NULL) for a task's brief / review-brief / review, and those rows
+        # are not bus traffic and must survive. An importer row (src set) is
+        # mk-state's run-doc/index data and is unreferenced either way.
+        # one binding: the subquery correlates on the run the outer row names
+        "artifact": ("SELECT %s FROM artifacts WHERE run=? AND id IN"
+                     " (SELECT artifact_id FROM events WHERE chan='bus'"
+                     " AND run=artifacts.run AND artifact_id IS NOT NULL) ORDER BY id"
+                     % ", ".join(cols_of["artifact"])),
+    }
+
+    def rows_of(f, run):
+        """One run's (msg, ack, artifact) rows straight from the store every reader uses, in
+        archive order. f.folder() is <data> before a switch and the C2 project folder after,
+        the one rule mkpaths.project_folder gives."""
+        folder = f.folder()
+        con = f.mod.open_project(folder, data_dir=folder)
+        try:
+            return {name: [dict(r) for r in con.execute(sql, (run,))]
+                    for name, sql in sql_of.items()}
+        finally:
+            con.close()
+
+    def canonical(name, row):
+        return json.dumps([row[c] for c in cols_of[name]], separators=(",", ":"), ensure_ascii=False)
+
+    def digest_of(rows_by_group):
+        h = hashlib.sha256()
+        for name in ("msg", "ack", "artifact"):
+            for row in rows_by_group[name]:
+                h.update(canonical(name, row).encode("utf-8"))
+                h.update(b"\n")
+        return h.hexdigest()
+
+    def digest_of_file(path):
+        """(aggregate digest, lines) FROM THE FILE, checking every line's own sha256 too."""
+        with open(path, "r", encoding="utf-8") as fh:
+            objs = [json.loads(ln) for ln in fh.read().split("\n") if ln]
+        h = hashlib.sha256()
+        for name in ("msg", "ack", "artifact"):
+            for obj in [o for o in objs if o["type"] == name]:
+                canon = canonical(name, obj["row"])
+                assert obj["sha256"] == hashlib.sha256(canon.encode("utf-8")).hexdigest(), \
+                    "archive-run: a %s line's own sha256 does not match its row" % name
+                h.update(canon.encode("utf-8"))
+                h.update(b"\n")
+        return h.hexdigest(), objs
+
+    def cli(args, env=None, timeout=60):
+        p = subprocess.run([sys.executable, bus_py] + args, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, text=True, env=env, timeout=timeout)
+        lines = [ln.strip() for ln in p.stdout.strip().splitlines() if ln.strip()]
+        try:
+            doc = json.loads(lines[-1]) if lines else {}
+        except ValueError:
+            doc = {}
+        # A refusal rides in the one JSON line on stdout (the file-mode Fail convention),
+        # so the blob is what the reason assertions search.
+        return p.returncode, doc, (p.stderr or "") + (p.stdout or "")
+
+    def set_statuses(f, run, run_status=None, tasks=()):
+        folder = f.folder()
+        con = f.mod.open_project(folder, data_dir=folder)
+        try:
+            if run_status is not None:
+                con.execute("UPDATE runs SET status=? WHERE id=?", (run_status, run))
+            for task, status in tasks:
+                con.execute("UPDATE tasks SET status=? WHERE run=? AND id=?", (status, run, task))
+            con.commit()
+        finally:
+            con.close()
+
+    def scalar(f, sql, args=()):
+        folder = f.folder()
+        con = f.mod.open_project(folder, data_dir=folder)
+        try:
+            return con.execute(sql, args).fetchone()[0]
+        finally:
+            con.close()
+
+    def get(port, path, token=None, timeout=5.0, last_event_id=None):
+        """One real GET against the running bus (the /wait and /events paths)."""
+        headers = {"Host": "127.0.0.1:%d" % port}
+        if token:
+            headers["Authorization"] = "Bearer " + token
+        if last_event_id:
+            headers["Last-Event-ID"] = last_event_id
+        req = urllib.request.Request("http://127.0.0.1:%d%s" % (port, path), headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read().decode("utf-8")
+
+    def ask(f, port, token, run, task, text, to="orch"):
+        """One ask over the real bus: an ask never rings, so no ring row can appear later."""
+        code, msg = f.post(port, token, {"run": run, "task": task, "kind": "ask", "text": text,
+                                         "from": task, "to": to})
+        assert code == 200 and msg.get("ok") is True, (code, msg)
+        return msg["message"]
+
+    def case(name):
+        print("pass mk-bus.py: archive-run " + name)
+
+    try:
+        # ---- (a) a closed run is archived; a live run keeps sending ---------------------------
+        f = _archive_fixture(tmp, "proj")
+        f.add_run("rA", status="active", tasks=("T1",))
+        f.add_run("rB", status="active", tasks=("T1",))
+        pid, port = f.start_bus("rA")
+        orch = f.mint_orch()
+        tokA, tokB = f.lane_token("rA", "T1"), f.lane_token("rB", "T1")
+        askmsg = ask(f, port, tokA, "rA", "T1", "which fixture?")
+        code, ans = f.post(port, orch, {"run": "rA", "task": "T1", "kind": "answer",
+                                        "text": "the schema one", "from": "orch", "to": "T1",
+                                        "reply_to": askmsg["id"]})
+        assert code == 200 and ans["ok"] is True, (code, ans)
+        code, acked = f.post(port, tokA, {"run": "rA", "task": "T1", "kind": "ack", "text": "",
+                                          "from": "T1", "to": "orch",
+                                          "reply_to": ans["message"]["id"], "ack_level": 3})
+        assert code == 200 and acked.get("ack_recorded") is True, (code, acked)
+        code, rep = f.post(port, tokA, {"run": "rA", "task": "T1", "kind": "report",
+                                        "text": "round:1\nthe report body", "from": "T1", "to": "orch"})
+        assert code == 200 and rep.get("artifact", {}).get("rev") == 1, (code, rep)
+        # a second report for the same (task, round, kind) SUPERSEDES it: rev 2, its own
+        # event link. Both revisions are bus rows and both must be archived, not orphaned.
+        code, rep2 = f.post(port, tokA, {"run": "rA", "task": "T1", "kind": "report",
+                                        "text": "round:1\nthe report body, revised",
+                                        "from": "T1", "to": "orch"})
+        assert code == 200 and rep2.get("artifact", {}).get("rev") == 2, (code, rep2)
+        # LIVE-PATH decoys: mk-lane-event and mk-builder store a task's brief,
+        # review-brief and review through the very same live writer put_artifact
+        # (src NULL) the bus uses. They are task data, not bus traffic: an archive
+        # that took them would delete the brief and review of the run's task.
+        decoys = {kind: f.artifact("rA", "T1", 1, kind, "the %s body" % kind)
+                  for kind in ("brief", "review-brief", "review")}
+        # a state event of the same run is not bus data: it must survive the archive
+        code, st = f.post(port, orch, {"run": "rA", "task": "T1", "kind": "status", "text": "done",
+                                       "from": "orch", "to": "T1"})
+        assert code == 200 and st["ok"] is True, (code, st)
+        # the live run keeps a message: it must survive the archive, and answering it drains
+        # the inbox so the switch below can quiesce
+        ask_b = ask(f, port, tokB, "rB", "T1", "run B before the archive")
+        code, ans_b = f.post(port, orch, {"run": "rB", "task": "T1", "kind": "answer",
+                                          "text": "answered before the archive", "from": "orch",
+                                          "to": "T1", "reply_to": ask_b["id"]})
+        assert code == 200 and ans_b["ok"] is True, (code, ans_b)
+        set_statuses(f, "rA", run_status="done", tasks=(("T1", "done"),))
+        want, want_b = rows_of(f, "rA"), rows_of(f, "rB")
+        assert want["msg"] and want["ack"] and want["artifact"], \
+            "case (a) needs messages, an ack and a bus artifact: %s" % {k: len(v) for k, v in want.items()}
+        state_before = scalar(f, "SELECT COUNT(*) FROM events WHERE run=? AND chan<>'bus'", ("rA",))
+        tasks_before = scalar(f, "SELECT COUNT(*) FROM tasks WHERE run=?", ("rA",))
+        assert state_before >= 1, "the status send must have left a state event behind"
+        # IMPORTER artifacts (src set, written through mkdb's history writer) are mk-state's
+        # run-doc and index data, not bus traffic: they are the discriminator that proves the
+        # live-path artifact filter
+        imported = f.import_artifacts("rA", [
+            {"src": "run-doc-rA", "task": None, "round": 0, "kind": "run-doc", "rev": 1,
+             "text": "the run document", "created": "2026-10-12T09:00:00+00:00"},
+            {"src": "index-rA", "task": None, "round": 0, "kind": "index", "rev": 1,
+             "text": "the runs index", "created": "2026-10-12T09:00:01+00:00"}])
+        assert imported, "the importer rows must land"
+        # the real C2 switch (L2's mk-migrate --switch): the archive must land in the project
+        # folder's plans/<plan>/runs/<run>, resolved through mkpaths and never hand-built
+        f.stop_bus(pid)
+        f.migrate()
+        path = os.path.join(_paths("run_dir", f.data, "rA"), "bus.jsonl")
+        # the mkpaths answer above is the assertion under test; this is the documented C2
+        # shape it must carry, so a switch that never happened cannot pass the case
+        assert f.folder() != f.data, (f.folder(), f.data)
+        assert path == os.path.join(f.paths()["project_folder"], "plans", f.plan, "runs", "rA",
+                                    "bus.jsonl"), path
+
+        rc, res, blob = cli(["archive-run", "--data", f.data, "--run", "rA"], env=f.env())
+        assert rc == 0 and res.get("ok") is True, (rc, res, blob)
+        assert res["op"] == "archive-run" and res["run"] == "rA" and res["written"] is True, res
+        assert res["path"] == path, (res["path"], path)
+        assert os.path.isfile(path), path
+        assert oct(os.stat(path).st_mode & 0o777) == "0o600", oct(os.stat(path).st_mode & 0o777)
+        assert (res["messages"], res["acks"], res["artifacts"]) == \
+            tuple(len(want[n]) for n in ("msg", "ack", "artifact")), \
+            (res, {k: len(v) for k, v in want.items()})
+        ids = [r["id"] for r in want["msg"]]
+        assert (res["seq_min"], res["seq_max"]) == (min(ids), max(ids)), (res, ids)
+        assert res["sha256"] == digest_of(want), (res["sha256"], digest_of(want))
+        got, objs = digest_of_file(path)
+        assert got == res["sha256"], (got, res["sha256"])
+        assert len(objs) == len(ids) + len(want["ack"]) + len(want["artifact"]), len(objs)
+        assert [o["row"]["id"] for o in objs if o["type"] == "msg"] == ids, "archived message order"
+        art_ids = [o["row"]["id"] for o in objs if o["type"] == "artifact"]
+        assert not (set(imported) & set(art_ids)), "an importer artifact row must not be archived"
+        # the archived artifacts are the run's BUS revisions only: every revision of the
+        # report, and none of the live-path brief / review-brief / review rows the same
+        # live writer stored for the run's task (the CRITICAL a src-based filter hit)
+        art_rows = [o["row"] for o in objs if o["type"] == "artifact"]
+        assert {r["kind"] for r in art_rows} == {"report"}, art_rows
+        assert sorted(r["rev"] for r in art_rows) == [1, 2], art_rows
+        for kind, art in decoys.items():
+            assert scalar(f, "SELECT COUNT(*) FROM artifacts WHERE id=?", (art["id"],)) == 1, \
+                "archive-run took the run's live-path %s artifact (%s)" % (kind, art)
+        # the rows are gone; the run, its tasks, its STATE events and the importer rows are not
+        assert rows_of(f, "rA") == {"msg": [], "ack": [], "artifact": []}, "archived rows must be gone"
+        assert f.imported_artifact_ids("rA") == imported, \
+            "the importer rows (src set) must survive: %s -> %s" % (imported, f.imported_artifact_ids("rA"))
+        assert rows_of(f, "rB") == want_b, "another run's rows must survive this run's archive"
+        assert scalar(f, "SELECT COUNT(*) FROM events WHERE run=? AND chan<>'bus'", ("rA",)) == state_before
+        assert scalar(f, "SELECT COUNT(*) FROM tasks WHERE run=?", ("rA",)) == tasks_before
+        assert scalar(f, "SELECT status FROM runs WHERE id=?", ("rA",)) == "done"
+        # a live run still takes messages on the real bus, above the archived seq range. The
+        # bus restarts after the switch, so its own store resolves to the C2 project folder.
+        pid, port = f.start_bus("rB")
+        live = ask(f, port, f.lane_token("rB", "T1"), "rB", "T1", "run B after the archive")
+        assert live["seq"] > res["seq_max"], (live, res)
+        assert scalar(f, "SELECT COUNT(*) FROM events WHERE id=? AND chan='bus' AND run='rB'",
+                      (live["seq"],)) == 1, "the post-archive send did not land"
+        f.stop_bus(pid)
+        case("(a) closed run archived: file, counts, digest, seq range, rows gone, live run sends")
+        f.cleanup()
+
+        # ---- (b) an active run, and a closed run with a live task, are refused ----------------
+        f = _archive_fixture(tmp, "projb")
+        f.add_run("rA", status="active", tasks=("T1",))
+        pid, port = f.start_bus("rA")
+        tokA = f.lane_token("rA", "T1")
+        for text in ("one", "two"):
+            ask(f, port, tokA, "rA", "T1", text)
+        before = rows_of(f, "rA")
+        path = os.path.join(_paths("run_dir", f.data, "rA"), "bus.jsonl")
+
+        rc, res, blob = cli(["archive-run", "--data", f.data, "--run", "rA"], env=f.env())
+        assert rc != 0 and res.get("ok") is False, (rc, res, blob)
+        assert "not closed" in blob and "active" in blob, blob
+        assert not os.path.exists(path), "a refused archive wrote a file"
+        assert rows_of(f, "rA") == before, "a refused archive deleted rows"
+
+        # closed, but the task is still live: refused with the task named
+        set_statuses(f, "rA", run_status="done")
+        rc, res, blob = cli(["archive-run", "--data", f.data, "--run", "rA"], env=f.env())
+        assert rc != 0 and "non-terminal" in blob and "T1" in blob, (rc, res, blob)
+        assert not os.path.exists(path), "a refused archive wrote a file"
+        assert rows_of(f, "rA") == before, "a refused archive deleted rows"
+
+        # `review` and `verifying` are LIVE for a run end: a reviewer or verifier lane is
+        # working the task and its messages are still bus traffic. mk-state's ROUND_TERMINAL
+        # treats them as terminal for a round RESET; a closure that archive'd under them
+        # would delete the messages of a lane that is still running.
+        for live_status in ("review", "verifying"):
+            set_statuses(f, "rA", run_status="done", tasks=(("T1", live_status),))
+            rc, res, blob = cli(["archive-run", "--data", f.data, "--run", "rA"], env=f.env())
+            assert rc != 0 and "non-terminal" in blob and "T1" in blob, (live_status, rc, res, blob)
+            assert not os.path.exists(path), "a refused archive wrote a file"
+            assert rows_of(f, "rA") == before, "a refused archive deleted rows"
+
+        # the other closed spelling is accepted once every task is terminal
+        set_statuses(f, "rA", run_status="archived", tasks=(("T1", "merged"),))
+        rc, res, blob = cli(["archive-run", "--data", f.data, "--run", "rA"], env=f.env())
+        assert rc == 0 and res.get("ok") is True and res["written"] is True, (rc, res, blob)
+        assert res["messages"] == len(before["msg"]), (res, len(before["msg"]))
+        assert rows_of(f, "rA") == {"msg": [], "ack": [], "artifact": []}, "archived rows must be gone"
+        f.stop_bus(pid)
+        case("(b) active run and live tasks refused before any write; archived accepted")
+        f.cleanup()
+
+        # ---- (c) a dropped archive line fails the count check ---------------------------------
+        f = _archive_fixture(tmp, "projc")
+        f.add_run("rA", status="active", tasks=("T1",))
+        pid, port = f.start_bus("rA")
+        orch = f.mint_orch()
+        for i in range(3):
+            ask(f, port, orch, "rA", "T1", "ask %d" % i)
+        set_statuses(f, "rA", run_status="done", tasks=(("T1", "done"),))
+        before = rows_of(f, "rA")
+        path = os.path.join(_paths("run_dir", f.data, "rA"), "bus.jsonl")
+        run_dir = os.path.dirname(path)
+        # THE SEAM: mk-bus.py loaded by absolute path, its writer step wrapped so ONE line is
+        # dropped before the file is written. Nothing is reached into after the fact.
+        under_test = _load_script_module("mk_bus_archive_case", bus_py)
+        written = []
+        orig_writer = under_test._archive_write_file
+
+        def dropping_writer(path_, lines):
+            written.append(len(lines))
+            return orig_writer(path_, lines[:-1])
+
+        under_test._archive_write_file = dropping_writer
+        try:
+            try:
+                under_test.archive_run(f.data, "rA")
+            except under_test.Fail as e:
+                reason = str(e)
+            else:
+                raise AssertionError("archive-run (c): a file one line short of the rows was accepted")
+        finally:
+            under_test._archive_write_file = orig_writer
+        assert "mismatch" in reason, reason
+        assert written == [sum(len(before[n]) for n in ("msg", "ack", "artifact"))], written
+        assert not os.path.exists(path), "the partial file survived the failed check"
+        if os.path.isdir(run_dir):
+            assert os.listdir(run_dir) == [], os.listdir(run_dir)
+        assert rows_of(f, "rA") == before, "a failed check deleted rows"
+
+        # the same property through the CLI, on the documented drop-line env
+        env = f.env()
+        env[under_test.ARCHIVE_DROP_LINE_ENV] = "2"
+        rc, res, blob = cli(["archive-run", "--data", f.data, "--run", "rA"], env=env)
+        assert rc != 0 and "mismatch" in blob, (rc, res, blob)
+        assert not os.path.exists(path), "the CLI left a partial file behind"
+        assert rows_of(f, "rA") == before, "the CLI's failed check deleted rows"
+        f.stop_bus(pid)
+        case("(c) dropped archive line: count check fails, nothing deleted, no partial file")
+        f.cleanup()
+
+        # ---- (d) a cursor on a deleted seq resumes at the NEXT existing seq -------------------
+        f = _archive_fixture(tmp, "projd")
+        f.add_run("rB", status="active", tasks=("T1",))
+        f.add_run("rA", status="active", tasks=("T1",))
+        pid, port = f.start_bus("rA")
+        tokA, tokB = f.lane_token("rA", "T1"), f.lane_token("rB", "T1")
+        orch = f.mint_orch()
+        # run B first, and the LOW seqs are what a reader has ALREADY SEEN: an ask and its
+        # answer, both below the cursor this case sets. The answer is addressed to the lane,
+        # so a reader that reset to 0 would hand back an already-seen message.
+        ask1 = ask(f, port, tokB, "rB", "T1", "run B one")
+        code, ans1 = f.post(port, orch, {"run": "rB", "task": "T1", "kind": "answer",
+                                         "text": "answered one", "from": "orch", "to": "T1",
+                                         "reply_to": ask1["id"]})
+        assert code == 200 and ans1["ok"] is True, (code, ans1)
+        keep = [ask1["seq"], int(ans1["message"]["seq"])]
+        # then the closed run: its seqs are the HIGHEST so far, and they are the deleted ones
+        doomed = [ask(f, port, tokA, "rA", "T1", "run A one")["seq"],
+                  ask(f, port, tokA, "rA", "T1", "run A two")["seq"]]
+        assert doomed[0] > keep[-1], (keep, doomed)
+        # a message of the live run sits ABOVE the doomed range and is still unshown: that is
+        # the next existing seq every reader below must land on
+        ask2 = ask(f, port, tokB, "rB", "T1", "run B two")
+        next_seq = ask2["seq"]
+        assert next_seq > doomed[-1], (next_seq, doomed)
+        set_statuses(f, "rA", run_status="done", tasks=(("T1", "done"),))
+        rc, res, blob = cli(["archive-run", "--data", f.data, "--run", "rA"], env=f.env())
+        assert rc == 0 and res["written"] is True, (rc, res, blob)
+        assert (res["seq_min"], res["seq_max"]) == (doomed[0], doomed[-1]), (res, doomed)
+        # the bus rebuilds its run state from the store: every reader below sees the
+        # post-archive rows, never the deleted ones
+        f.stop_bus(pid)
+        pid, port = f.start_bus("rB")
+        tokB = f.lane_token("rB", "T1")
+        orch = f.mint_orch()
+        # a solicited answer on the live run, addressed to the lane, above the deleted range
+        code, live = f.post(port, orch, {"run": "rB", "task": "T1", "kind": "answer",
+                                         "text": "answered after the archive", "from": "orch",
+                                         "to": "T1", "reply_to": ask2["id"]})
+        assert code == 200 and live["ok"] is True, (code, live)
+        live_seq = int(live["message"]["seq"])
+        assert live_seq > doomed[-1], (live_seq, doomed)
+        # every cursor below sits ON a deleted seq
+        cursor = doomed[-1]
+
+        # 1. the watch cursor sits on a deleted seq: the next watch prints the NEXT existing
+        #    message and nothing it had already passed (a reset to 0 would replay both)
+        write_json(_paths("watch_cursors", f.data), {"*|*": {"seq": cursor, "started": None}},
+                   mode=0o600)
+        w = subprocess.run([sys.executable, bus_py, "watch", "--data", f.data, "--max-messages", "2"],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                           env=f.env(), timeout=30)
+        assert w.returncode == 0, (w.returncode, w.stderr)
+        seen = [ln.split()[1] for ln in w.stdout.splitlines() if ln.strip()]
+        assert seen == ["m-%d" % next_seq, "m-%d" % live_seq], (seen, next_seq, live_seq)
+
+        # 2. the SSE stream (what watch, mk-builder's listen and every lane stream use) with
+        #    Last-Event-ID on a deleted seq: the events are the next existing ones, in order
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d/events?lane=*&run=*" % port,
+            headers={"Authorization": "Bearer " + orch, "Last-Event-ID": "m-%d" % cursor,
+                     "Host": "127.0.0.1:%d" % port})
+        sse_ids = []
+        try:
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                while len(sse_ids) < 2:
+                    ln = resp.readline()
+                    if not ln:
+                        break
+                    if ln.startswith(b"id: "):
+                        sse_ids.append(ln[4:].strip().decode())
+        except (TimeoutError, socket.timeout, urllib.error.URLError):
+            pass
+        assert sse_ids == [str(next_seq), str(live_seq)], (sse_ids, next_seq, live_seq)
+
+        # 3. the lane's /wait path (mk-builder's inbox long-poll) after the same deleted seq:
+        #    the first message above the cursor for this lane, never an already-seen one
+        status, body = get(port, "/wait?after=%d&timeout=2" % cursor, token=tokB, timeout=6.0)
+        assert status == 200, (status, body)
+        doc = json.loads(body)
+        assert doc["ok"] is True and int(doc["message"]["seq"]) == live_seq, (doc, live_seq)
+        assert doc["message"]["seq"] > cursor, (doc, cursor)
+        f.stop_bus(pid)
+        case("(d) cursor on a deleted seq resumes at the next existing seq (watch, SSE, /wait)")
+        f.cleanup()
+
+        # ---- (e) a second archive is a no-op, on a temp $HOME with the MK_* names unset --------
+        f = _archive_fixture(tmp, "proje", home_env=False)
+        child = f.env()
+        for k in ("MK_HOME", "MATRIXKODER_HOME", "MATRIXKODER_DATA"):
+            assert k not in child, "case (e) must run with %s unset" % k
+        assert child.get("HOME") == os.path.join(f.tmp, "home"), child.get("HOME")
+        f.add_run("rA", status="done", tasks=({"id": "T1", "status": "merged"},))
+        for i in range(3):
+            f.event("rA", kind="ask", task="T1", from_id="T1", to_id="orch", text="ask %d" % i)
+        eid = f.event("rA", kind="report", task="T1", from_id="T1", to_id="orch", text="round:1\nreport")
+        f.ack("rA", "m-%d" % eid, "T1", 2)
+        f.artifact("rA", "T1", 1, "report", "the report body", event_id=eid)
+        # an importer row (src set) is not bus data: it stays behind and is not archived
+        imported = f.import_artifacts("rA", [
+            {"src": "run-doc-rA-e", "task": None, "round": 0, "kind": "run-doc", "rev": 1,
+             "text": "the run document", "created": "2026-10-12T09:00:00+00:00"}])
+        assert imported, "the importer row must land"
+        want = rows_of(f, "rA")
+        assert want["msg"] and want["ack"] and want["artifact"], \
+            {k: len(v) for k, v in want.items()}
+        path = os.path.join(_paths("run_dir", f.data, "rA"), "bus.jsonl")
+
+        rc, res, blob = cli(["archive-run", "--data", f.data, "--run", "rA"], env=child)
+        assert rc == 0 and res.get("ok") is True and res["written"] is True, (rc, res, blob)
+        assert res["path"] == path, (res["path"], path)
+        assert res["messages"] == len(want["msg"]) and res["acks"] == len(want["ack"]), res
+        assert res["artifacts"] == len(want["artifact"]), res
+        assert res["sha256"] == digest_of(want), (res["sha256"], digest_of(want))
+        before_bytes = open(path, "rb").read()
+
+        # the second call: no empty second file, no error, the bytes untouched
+        rc2, res2, blob2 = cli(["archive-run", "--data", f.data, "--run", "rA"], env=child)
+        assert rc2 == 0 and res2.get("ok") is True, (rc2, res2, blob2)
+        assert res2["written"] is False, res2
+        assert (res2["messages"], res2["acks"], res2["artifacts"]) == (0, 0, 0), res2
+        assert res2["path"] == path, res2
+        assert open(path, "rb").read() == before_bytes, "the second archive rewrote the file"
+        assert rows_of(f, "rA") == {"msg": [], "ack": [], "artifact": []}, "the second archive deleted rows"
+        assert f.imported_artifact_ids("rA") == imported, "the second archive deleted importer rows"
+        assert os.listdir(os.path.dirname(path)) == ["bus.jsonl"], os.listdir(os.path.dirname(path))
+        case("(e) second archive is a no-op on a temp $HOME with the MK_* names unset")
+        f.cleanup()
+
+        # ---- (f) an archived run's seqs are never handed out again ----------------------------
+        f = _archive_fixture(tmp, "projf")
+        f.add_run("rA", status="active", tasks=("T1",))
+        f.add_run("rB", status="active", tasks=("T1",))
+        pid, port = f.start_bus("rA")
+        orch = f.mint_orch()
+        # the closed run takes the HIGHEST seqs and nothing is sent after them: its rows are
+        # the top of the events table, so a plain max(id)+1 would hand them straight back out
+        # and a cursor past the archived range would skip every message that landed on them
+        doomed = [ask(f, port, orch, "rA", "T1", "run A one")["seq"],
+                  ask(f, port, orch, "rA", "T1", "run A two")["seq"]]
+        set_statuses(f, "rA", run_status="done", tasks=(("T1", "done"),))
+        rc, res, blob = cli(["archive-run", "--data", f.data, "--run", "rA"], env=f.env())
+        assert rc == 0 and res["written"] is True, (rc, res, blob)
+        assert (res["seq_min"], res["seq_max"]) == (doomed[0], doomed[-1]), (res, doomed)
+        assert rows_of(f, "rA") == {"msg": [], "ack": [], "artifact": []}, rows_of(f, "rA")
+        # the live run sends next, on the real bus: the seq must sit ABOVE the archived range,
+        # never inside it
+        f.stop_bus(pid)
+        pid, port = f.start_bus("rB")
+        live = ask(f, port, f.mint_orch(), "rB", "T1", "run B after the archive")
+        # never a reused seq: without the high-water guard this is doomed[0] or doomed[1],
+        # and the send above is the top row of the table (the guard held it until then)
+        assert live["seq"] > doomed[-1], (live["seq"], doomed)
+        # one guard row pins the high-water mark; nothing that scopes by run, chan='bus' or
+        # a bus kind ever sees it
+        assert scalar(f, "SELECT COUNT(*) FROM events WHERE chan=?", ("seq",)) == 1
+        assert scalar(f, "SELECT MAX(id) FROM events") == live["seq"]
+        assert scalar(f, "SELECT COUNT(*) FROM events WHERE run=?", ("rA",)) == 0
+        # the store row of the live message is that seq: the run's rows are the bus rows
+        assert rows_of(f, "rB")["msg"][-1]["id"] == live["seq"], rows_of(f, "rB")
+        f.stop_bus(pid)
+        case("(f) no seq reuse: the live run's message lands above the archived range")
+        f.cleanup()
+
+        # ---- (g) a delete that fails after the write clears the file; the retry works -------
+        f = _archive_fixture(tmp, "projg")
+        f.add_run("rA", status="active", tasks=("T1",))
+        pid, port = f.start_bus("rA")
+        orch = f.mint_orch()
+        for i in range(2):
+            ask(f, port, orch, "rA", "T1", "ask %d" % i)
+        set_statuses(f, "rA", run_status="done", tasks=(("T1", "done"),))
+        before = rows_of(f, "rA")
+        path = os.path.join(_paths("run_dir", f.data, "rA"), "bus.jsonl")
+        # THE SEAM again: a message of the run landing between the count check and the delete.
+        # The transaction re-check must refuse, and the archive must not leave its file on
+        # disk with the rows still there — that combination refuses every later attempt.
+        under_test = _load_script_module("mk_bus_archive_case_g", bus_py)
+        orig_writer = under_test._archive_write_file
+        late_text = "a late answer that arrived after the count check"
+
+        def late_message_writer(path_, lines):
+            orig_writer(path_, lines)
+            f.event("rA", kind="info", task="T1", from_id="T1", to_id="orch", text=late_text)
+
+        under_test._archive_write_file = late_message_writer
+        try:
+            try:
+                under_test.archive_run(f.data, "rA")
+            except under_test.Fail as e:
+                reason = str(e)
+            else:
+                raise AssertionError("archive-run (g): a late message was archived away")
+        finally:
+            under_test._archive_write_file = orig_writer
+        assert "changed" in reason, reason
+        assert not os.path.exists(path), "a failed delete left the archive file behind"
+        after = rows_of(f, "rA")
+        assert len(after["msg"]) == len(before["msg"]) + 1, (len(after["msg"]), len(before["msg"]))
+        assert after["msg"][-1]["text"] == late_text, after["msg"][-1]
+        assert after["ack"] == before["ack"] and after["artifact"] == before["artifact"], after
+        # with the file cleared, the retry archives the run whole, the late message included
+        rc, res, blob = cli(["archive-run", "--data", f.data, "--run", "rA"], env=f.env())
+        assert rc == 0 and res["written"] is True, (rc, res, blob)
+        assert res["messages"] == len(after["msg"]), (res, after["msg"])
+        assert rows_of(f, "rA") == {"msg": [], "ack": [], "artifact": []}, rows_of(f, "rA")
+        f.stop_bus(pid)
+        case("(g) failed delete clears the file; the retry archives the run whole")
+        f.cleanup()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def self_test():
     tmp = tempfile.mkdtemp(prefix="mk-bus-test-")
     pids = []
@@ -7194,6 +8479,7 @@ def self_test():
     _store_self_test()
     _layout_self_test()
     _legacy_bus_token_self_test()
+    _archive_run_self_test()
     print("pass mk-bus.py: mk-bus self-test ok")
     print(json.dumps({"ok": True, "tests": len(checks), "passed": len(checks)}))
     return 0
@@ -7281,6 +8567,10 @@ def main():
     p_watch.add_argument("--max-messages", type=int, default=0, help="Exit after N lines (0 = never)")
     p_watch.add_argument("--data", help="MatrixKoder data dir")
 
+    p_arch = subparsers.add_parser("archive-run")
+    p_arch.add_argument("--run", required=True, help="Run identifier (must be closed)")
+    p_arch.add_argument("--data", help="MatrixKoder data dir")
+
     try:
         args = parser.parse_args()
         if not args.cmd:
@@ -7299,6 +8589,7 @@ def main():
             "tail": cmd_tail,
             "watch": cmd_watch,
             "metrics": cmd_metrics,
+            "archive-run": cmd_archive_run,
         }
         fn = dispatch.get(args.cmd)
         if fn:
