@@ -170,6 +170,7 @@ def bus_py(*args, env, timeout=30):
 
 
 def bus_pid(home):
+    # soak_env pins MK_BUS_DIR to the home, which IS the bus dir: bus.json sits at its root
     path = os.path.join(home, "bus.json")
     try:
         data = json.load(open(path))
@@ -284,7 +285,7 @@ def ring_count(ctx):
 
 
 def queued(ctx, msg_id):
-    path = os.path.join(ctx["home"], "ring-queue.json")
+    path = os.path.join(ctx["home"], "ring-queue.json")  # the pinned bus dir is the home
     if not os.path.isfile(path):
         return False
     try:
@@ -458,8 +459,9 @@ def mint_root(ctx):
     """A root token in the temp home's token file. Writes only there."""
     import fcntl
     tok = lt.secrets.token_urlsafe(32)
-    path = os.path.join(ctx["home"], "bus-tokens.json")
-    fd = os.open(os.path.join(ctx["home"], "bus-tokens.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    bus_dir = ctx["home"]  # soak_env pins MK_BUS_DIR to the home: the bus dir itself
+    path = os.path.join(bus_dir, "bus-tokens.json")
+    fd = os.open(os.path.join(bus_dir, "bus-tokens.lock"), os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         tokens = json.load(open(path))
@@ -658,6 +660,7 @@ def self_test():
     check("mutation-duplicate-ack", _case_mutation_ack)
     check("mutation-token", _case_mutation_token)
     check("compressed-soak", _case_compressed)
+    check("mixed-layout", _case_mixed_layout)
     check("selftest-guard", _case_selftest_guard)
     bad = [c for c in cases if not c[1]]
     if bad:
@@ -942,6 +945,72 @@ def _case_compressed():
         if ctx["sent_a"] + ctx["sent_b"] <= 0:
             raise SoakFail("metrics", f"no traffic: {metrics}")
         assert_real_home_unchanged(before)
+    finally:
+        lt._kill_buses(home)
+        lt.teardown(home)
+    if os.path.isdir(home):
+        raise SoakFail("leftover", f"temp home survived teardown: {home}")
+    if pid and not lt._dead(pid):
+        raise SoakFail("leftover", f"bus pid {pid} survived teardown")
+
+
+def _case_mixed_layout():
+    """C7 (L6.1): one bus serving a MIGRATED project and a PRE-MIGRATION project side by
+    side, with the migrated one as the bus's OWN project — `mk-migrate --switch` sets the
+    root `db_path` the bus resolves its own store through. A kill -9 plus a restart must
+    lose and duplicate no seq, and every message stays in the store it was sent to."""
+    made = lt.setup()
+    home = made["home"]
+    ctx = lt._ctx(home)
+    ctx.update({"repo": made["repo"]})
+    pid = None
+    try:
+        # A migrates through the production tool (L2). Its store already sits in the C2
+        # folder, so the switch only sets the root row's db_path — the marker every
+        # own-store resolve reads. B is created afterwards and stays pre-migration.
+        mig = subprocess.run([sys.executable, os.path.join(HERE, "mk-migrate.py"), "--switch",
+                              "--slug", ctx["slug"], "--data", ctx["data"], "--home", home,
+                              "--repo", made["repo"]],
+                             capture_output=True, text=True,
+                             env=dict(lt._bus_env(ctx), MK_SELFTEST="1"))
+        if mig.returncode != 0:
+            raise SoakFail("switch", f"mk-migrate --switch: rc={mig.returncode} "
+                                     f"{mig.stdout[-200:]} {mig.stderr[-200:]}")
+        _, data_b = lt._second_project(ctx)
+        pid, port = prepare(ctx)  # seeds A and B, mints the tokens, starts the bus
+        # L6.1: the lane token file is <bus dir>/lanes/<hash>.json — with soak_env's pin the
+        # bus dir is the home itself, so it is <home>/lanes/. mkpaths owns the rule; this
+        # only proves the bus and the harness agree on it.
+        lane_dir = os.path.join(home, "lanes")
+        if not os.path.isdir(lane_dir):
+            raise SoakFail("layout", "the lane token file is not under <bus dir>/lanes/")
+        cycle(ctx, port, do_doorbell=False)  # no doorbell: the ring-drain timing is not this case
+        cycle_b(ctx, port)
+        check_counts(ctx, ctx["data"], data_b, ctx["sent_a"], ctx["sent_b"])
+        check_tokens(ctx, port, ctx["tok_a"], ctx["lane_tok"], ctx["root_tok"], ctx["slug_b"])
+        # kill -9 and restart on the same port, then answer the pre-kill ask exactly once
+        pending = send(ctx, port, ctx["tok_a"], ctx["slug_a"], "ask", "across")
+        ctx["sent_a"] += 1
+        _old_pid, old_port = kill_own_bus(home)
+        res = restart(ctx, ctx["data"], old_port)
+        port = res["port"]
+        if port != old_port:
+            raise SoakFail("restart", f"port {port} != {old_port}")
+        cycle(ctx, port, do_doorbell=False)
+        check_tokens(ctx, port, ctx["tok_a"], ctx["lane_tok"], ctx["root_tok"], ctx["slug_b"])
+        st, body = lt._http("GET", f"http://127.0.0.1:{port}/pending?run={RUN}&project={ctx['slug_a']}",
+                            ctx["tok_a"])
+        ids = [m.get("id") for m in (body.get("pending") or [])]
+        if st != 200 or pending not in ids:
+            raise SoakFail("across-kill", f"ask {pending} not pending after restart: {st} {body}")
+        send(ctx, port, ctx["tok_a"], ctx["slug_a"], "answer", "after", reply_to=pending)
+        ctx["sent_a"] += 1
+        if _answers_for(ctx["data"], pending) != 1:
+            raise SoakFail("across-kill", f"not exactly one answer for {pending}")
+        check_counts(ctx, ctx["data"], data_b, ctx["sent_a"], ctx["sent_b"])
+        check_metrics(ctx)
+        # the real-home guard is _case_real_home's job: the live bus heartbeats ~/.matrixkoder/bus.json
+        # every 15 s, so reading it here would flake on a heartbeat landing inside this window.
     finally:
         lt._kill_buses(home)
         lt.teardown(home)

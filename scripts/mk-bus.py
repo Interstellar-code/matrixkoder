@@ -960,18 +960,57 @@ class BusState:
         The project DB path itself is resolved by mkpaths.project_db (L0): one
         rule for the project store, root row lookup included. A slug with no
         root row carrying a data_dir has no store, so it is an unknown project.
+
+        The bus's OWN project resolves the same way (L6.1, todo 108): a host
+        started with a legacy `--data` follows `mk-migrate --switch` instead of
+        writing the legacy store — see `_resolve_own_store`.
         """
         if not self.use_store:
             return self.store, self.project_dir
         if not isinstance(project, str) or project == "" or not SLUG_RE.match(project):
             raise Fail("invalid project slug")
         if project == self.project:
-            return self.store, self.project_dir
+            # todo 108: the host project resolves like every other one, through
+            # mkpaths, so `mk-migrate --switch` moves this bus's own store too.
+            return self._resolve_own_store()
         db = _paths("project_db", slug=project)
         if not db:
             raise Fail("unknown project")
         data_dir = os.path.dirname(db)
         return StoreAdapter(data_dir), data_dir
+
+    def _resolve_own_store(self):
+        """The host project's (store, folder), re-resolved through mkpaths on every call.
+
+        A bus started with a legacy `--data` kept writing the legacy store after the project
+        switched (todo 108). The store now resolves through `mkpaths.project_db(slug)`, whose
+        slug form follows the root row's `db_path` (L2's switch marker) and is memoised by the
+        root store's stamp, so a switch is picked up on the next own-project lookup — no
+        restart, and one stat on the hot path. Pre-migration the resolve answers exactly
+        today's store and folder, so nothing moves.
+
+        The moved run's cached state goes with the store: it holds the pre-switch messages and
+        seq counter, and the switched store already carries them (mk-migrate copies the project
+        DB whole), so a reload rebuilds both from one place.
+        """
+        project = self.project
+        try:
+            db = _paths("project_db", slug=project)
+        except Fail:
+            db = None
+        if not db or os.path.realpath(db) == os.path.realpath(
+                os.path.join(self.project_dir, "mk.db")):
+            return self.store, self.project_dir  # no root row, or still today's store
+        folder = os.path.dirname(db)
+        with self.lock:
+            stale = [key for key in self.runs
+                     if isinstance(key, tuple) and key[0] in (project, self.project_dir)]
+            for key in stale:
+                del self.runs[key]
+            self.project_dir = folder
+            self.store = StoreAdapter(folder)
+        sys.stderr.write("bus: own project %s moved to %s\n" % (project, folder))
+        return self.store, folder
 
     def _maybe_ring(self, msg):
         """C13b: queue a doorbell for an unsolicited message. Never runs herdr.
@@ -2532,6 +2571,12 @@ def cmd_ensure(args):
             pid = (bdata or {}).get("pid")
             port = (bdata or {}).get("port")
             if pid and port and is_pid_alive(pid):
+                # This bus is ours when it serves the project THIS data dir names. After
+                # `mk-migrate --switch` the bus follows the root row's db_path and reports the
+                # C2 folder, so a caller still holding the legacy dir must recognise it
+                # instead of tearing a healthy bus down (L6.1, todo 108).
+                mine = {os.path.realpath(data_dir),
+                        os.path.realpath(_paths("project_folder", data_dir))}
                 stale = False
                 probe_deadline = time.time() + 5.0
                 while time.time() < probe_deadline:
@@ -2544,7 +2589,7 @@ def cmd_ensure(args):
                         with urllib.request.urlopen(req, timeout=1.0) as resp:
                             if resp.status == 200:
                                 h = json.loads(resp.read().decode("utf-8"))
-                                if isinstance(h, dict) and h.get("project_dir") == os.path.realpath(data_dir):
+                                if isinstance(h, dict) and h.get("project_dir") in mine:
                                     # Healthy and provably ours: refresh heartbeat.
                                     bdata["owner_heartbeat"] = time.time()
                                     proj = getattr(args, "_project", None)
@@ -2691,6 +2736,38 @@ def cmd_heartbeat(args):
     return res
 
 
+def _mirror_legacy_tokens(data_dir, entry):
+    """R2 HIGH 2: an adopted pre-L6.1 bus still validates tokens against the LEGACY
+    <home>/bus-tokens.json, so a token minted only under bus/ would 401 on it until the
+    bus restarts. When the legacy bus is alive (legacy bus.json, live pid) the same entry
+    is merged into the legacy file under the legacy lock, with the write pattern the old
+    bus's own writers use — so the running bus accepts the new token at once. When no
+    legacy bus is alive nothing is written at any legacy path (no legacy file is ever
+    created by L6.1 code). Returns True when the mirror happened."""
+    legacy_json = _paths("legacy_bus_json", data_dir)
+    if not os.path.exists(legacy_json):
+        return False
+    bdata = read_json(legacy_json)
+    pid = (bdata or {}).get("pid")
+    if not is_pid_alive(pid):
+        return False
+    lock_path = _paths("legacy_bus_tokens_lock", data_dir)
+    tokens_path = _paths("legacy_bus_tokens", data_dir)
+    lfd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    os.fchmod(lfd, 0o600)
+    fcntl.flock(lfd, fcntl.LOCK_EX)
+    try:
+        tokens = read_json(tokens_path, default={})
+        if not isinstance(tokens, dict):
+            tokens = {}
+        tokens[entry["token"]] = entry
+        write_json(tokens_path, tokens, mode=0o600)
+    finally:
+        fcntl.flock(lfd, fcntl.LOCK_UN)
+        os.close(lfd)
+    return True
+
+
 def cmd_token(args):
     data_dir = resolve_data(getattr(args, "data", None))
     # Same realpath lane_token_path hashes, so revoke matches a symlinked lane.
@@ -2748,24 +2825,28 @@ def cmd_token(args):
     bus_dir = bus_location(data_dir)
     lock_path = _paths("bus_tokens_lock", data_dir)
     tokens_path = _paths("bus_tokens", data_dir)
+    entry = {
+        "project": project_slug_for(data_dir) if store_mode(data_dir) else None,
+        "token": tok,
+        "role": "lane",
+        "run": run_val,
+        "task": args.task,
+        "lane": lane_dir,
+        "created_at": now_iso()
+    }
     lfd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     os.fchmod(lfd, 0o600)
     fcntl.flock(lfd, fcntl.LOCK_EX)
     try:
         tokens = read_json(tokens_path, default={})
-        tokens[tok] = {
-            "project": project_slug_for(data_dir) if store_mode(data_dir) else None,
-            "token": tok,
-            "role": "lane",
-            "run": run_val,
-            "task": args.task,
-            "lane": lane_dir,
-            "created_at": now_iso()
-        }
+        tokens[tok] = entry
         write_json(tokens_path, tokens, mode=0o600)
     finally:
         fcntl.flock(lfd, fcntl.LOCK_UN)
         os.close(lfd)
+    # While a pre-L6.1 bus is still alive it reads the legacy tokens file, so the mint
+    # lands in both places (R2 HIGH 2); with no old bus alive only the new path is written.
+    _mirror_legacy_tokens(data_dir, entry)
 
     res = {"ok": True, "token": tok, "lane": lane_dir, "task": args.task, "run": run_val}
     out(res)
@@ -3457,6 +3538,385 @@ def _store_self_test():
     _store_self_test_body(mod)
 
 
+def _layout_self_test():
+    """L6.1 (C6/C7): the bus on the C2 layout, exercised on the production path.
+
+    One temp $HOME with MK_HOME, MATRIXKODER_HOME, MATRIXKODER_DATA, MK_BUS_DIR and
+    MK_BUS_TOKEN_FILE all UNSET, so mkpaths.home() answers $HOME/.matrixkoder exactly as a
+    real machine resolves it. Three projects share ONE bus: a MIGRATED one (L2's real
+    `mk-migrate --switch`), a PRE-MIGRATION one beside it, and the bus's OWN project, which
+    is pre-migration when the bus starts and switches while the bus runs. Real CLI, real
+    HTTP, real migration tool:
+
+      1. every bus file lands in <home>/.matrixkoder/bus/ and nowhere else;
+      2. a message sent to each project lands in that project's own store;
+      3. after the switch of the bus's OWN project the next message lands in the NEW
+         project DB and not in the legacy one, with no restart (todo 108);
+      4. the watch cursor of the switched project is written to the project folder, and
+         the pre-migration file is read once and carried over;
+      5. a bus, its tokens and an armed lane's token file published at the pre-L6.1 paths
+         are ADOPTED — copied, never deleted — and keep working: one bus for the home, and
+         the lane's token still authenticates a message.
+    """
+    import shutil
+
+    mod = _mkdb_helpers_ready()
+    if mod is None:
+        print("layout self-test skipped: mkdb live writers not present")
+        return
+    tmp = tempfile.mkdtemp(prefix="mk-bus-layout-")
+    pids = []
+    saved = {k: os.environ.get(k) for k in
+             ("HOME", "MK_HOME", "MATRIXKODER_HOME", "MATRIXKODER_DATA", "MK_BUS_DIR",
+              "MK_BUS_TOKEN_FILE", "MK_SELFTEST")}
+    home_dir = os.path.join(tmp, "home")
+    os.makedirs(home_dir, exist_ok=True)
+    for key in ("MK_HOME", "MATRIXKODER_HOME", "MATRIXKODER_DATA", "MK_BUS_DIR",
+                "MK_BUS_TOKEN_FILE"):
+        os.environ.pop(key, None)   # the production path: no pin resolves the home
+    os.environ["HOME"] = home_dir
+    os.environ["MK_SELFTEST"] = "1"  # mkdb's C16 guard: writes stay in the temp tree
+    mkh = os.path.join(home_dir, ".matrixkoder")
+    bus_dir = os.path.join(mkh, "bus")
+
+    def cli(args, check=True):
+        p = subprocess.run([sys.executable, os.path.abspath(__file__)] + args,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        lines = [x.strip() for x in p.stdout.strip().splitlines() if x.strip()]
+        last = json.loads(lines[-1]) if lines else {}
+        if check and p.returncode != 0:
+            raise AssertionError(f"CLI {args} rc={p.returncode}: {p.stderr.strip()[-300:]}")
+        return p.returncode, last, p.stderr
+
+    def texts(db_path):
+        con = mod._connect_ro(db_path)
+        try:
+            return [r[0] for r in con.execute(
+                "SELECT text FROM events WHERE chan='bus' ORDER BY id")]
+        finally:
+            con.close()
+
+    def project(slug, repo_name):
+        """A registered project with a run and a task: root row + project store."""
+        repo = os.path.join(tmp, repo_name)
+        data = os.path.join(repo, ".matrixkoder")
+        os.makedirs(data, exist_ok=True)
+        con = mod.open_root(mkh)
+        try:
+            con.execute("INSERT OR IGNORE INTO projects(slug, name, repo, data_dir, mode, db_path)"
+                        " VALUES (?,?,?,?,?,NULL)",
+                        (slug, slug, os.path.realpath(repo), os.path.realpath(data), "home"))
+            con.commit()
+        finally:
+            con.close()
+        con = mod.open_project(mkh, slug, data_dir=data)
+        try:
+            con.execute("INSERT OR IGNORE INTO runs(id, status) VALUES ('r1', 'active')")
+            con.commit()
+            mod.add_task(con, "r1", "T1", "task", title="one")
+        finally:
+            con.close()
+        return data
+
+    def switch(slug, data, repo_name):
+        """L2's real migration tool, on the temp store, with the bus left running."""
+        p = subprocess.run([sys.executable, os.path.join(HERE, "mk-migrate.py"), "--switch",
+                            "--slug", slug, "--data", data, "--home", mkh,
+                            "--repo", os.path.join(tmp, repo_name)],
+                           capture_output=True, text=True)
+        if p.returncode != 0:
+            raise AssertionError(f"mk-migrate --switch {slug}: "
+                                 f"{p.stdout[-200:]} {p.stderr[-200:]}")
+
+    def serve_lines():
+        out = subprocess.run(["ps", "-ax", "-o", "pid=,command="], capture_output=True,
+                             text=True, timeout=10).stdout
+        return [line.strip() for line in out.splitlines()
+                if "mk-bus.py" in line and "serve" in line and home_dir in line]
+
+    def one_bus(what, timeout=10.0):
+        """Exactly one serve for this home. Bounded: `ensure`'s adopt path spawns a child that
+        exits with "bus already running" the moment it loses the lock, so a count taken
+        mid-adopt sees it. A second LONG-LIVED bus is what this refuses."""
+        deadline = time.time() + timeout
+        seen = serve_lines()
+        while time.time() < deadline:
+            seen = serve_lines()
+            if len(seen) <= 1:
+                return len(seen)
+            time.sleep(0.1)
+        raise AssertionError(f"{what}: {len(seen)} buses for one home: {seen}")
+
+    def stop_bus():
+        path = os.path.join(bus_dir, "bus.json")
+        if not os.path.isfile(path):
+            return
+        pid = (read_json(path) or {}).get("pid")
+        if isinstance(pid, int) and pid > 1:
+            stop_process(pid)
+        deadline = time.time() + 5.0
+        while time.time() < deadline and os.path.isfile(path):
+            time.sleep(0.05)
+
+    try:
+        # ---- fixtures: one migrated, one pre-migration, one still on the legacy layout ----
+        migs_data = project("migs", "migs-repo")
+        switch("migs", migs_data, "migs-repo")
+        migs_folder = os.path.join(mkh, "projects", "migs")
+        assert os.path.isfile(os.path.join(migs_folder, "mk.db")), \
+            "the switched store is not in the C2 project folder"
+        plain_data = project("plain", "plain-repo")
+        own_data = project("own", "own-repo")
+
+        # ---- 1. one bus, started on the migrated project's folder -------------------------
+        rc, res, err = cli(["ensure", "--run", "r1", "--data", migs_folder])
+        assert rc == 0 and res.get("started") is True, (res, err)
+        pids.append(res["pid"])
+        first_pid = res["pid"]
+        for name in ("bus.json", "bus-tokens.json", "bus-tokens.lock", "bus.lock",
+                     "bus-ensure.lock"):
+            assert os.path.isfile(os.path.join(bus_dir, name)), f"{name} is not in <home>/bus/"
+        assert oct(os.stat(os.path.join(bus_dir, "bus.json")).st_mode & 0o777) == "0o600", \
+            "bus.json is not 0600"
+        for legacy in ("bus.json", "bus-tokens.json", "bus-tokens.lock", "bus.lock",
+                       "bus-ensure.lock", "ring-queue.json", "bus-lanes"):
+            assert not os.path.exists(os.path.join(mkh, legacy)), \
+                f"{legacy} is still at the pre-L6.1 home root"
+        assert not os.path.exists(os.path.join(migs_folder, "bus.json")), \
+            "store mode wrote a per-project bus.json"
+
+        # ---- 2. one message per project, each in its own store -----------------------------
+        lane = os.path.join(tmp, "lane")
+        os.makedirs(lane, exist_ok=True)
+        rc, tok, _ = cli(["token", "--lane", lane, "--task", "T1", "--run", "r1",
+                          "--data", migs_folder])
+        assert rc == 0 and tok.get("ok"), tok
+        lanes_dir = os.path.join(bus_dir, "lanes")
+        assert os.path.isdir(lanes_dir) and os.listdir(lanes_dir), \
+            "the lane token file is not under <bus dir>/lanes/"
+        lane_tok_file = os.path.join(lanes_dir, os.listdir(lanes_dir)[0])
+        assert oct(os.stat(lane_tok_file).st_mode & 0o777) == "0o600", "lane token is not 0600"
+        cfg = read_json(lane_tok_file)
+        base, host = cfg["url"], cfg["url"].split("//", 1)[1]
+
+        def post(body, token=None):
+            req = urllib.request.Request(
+                base + "/send", data=json.dumps(body).encode("utf-8"),
+                headers={"Content-Type": "application/json",
+                         "Authorization": "Bearer " + (token or cfg["token"]),
+                         "Host": host}, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    return r.status, json.loads(r.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                raw = e.read().decode("utf-8", "replace")
+                try:
+                    return e.code, json.loads(raw)
+                except ValueError:
+                    return e.code, {"error": raw}
+
+        st, out = post({"run": "r1", "task": "T1", "kind": "info", "text": "for migs"})
+        assert st == 200 and out.get("message", {}).get("project") == "migs", (st, out)
+        for slug, data, text in (("plain", plain_data, "for plain"),
+                                 ("own", own_data, "before switch")):
+            rc, res, err = cli(["send", "--data", data, "--run", "r1", "--task", "T1",
+                                "--kind", "info", "--from", "orch", "--to", "T1", "--text", text])
+            assert rc == 0 and res.get("ok"), (res, err)
+            assert res["message"]["project"] == slug, res
+        migs_texts = texts(os.path.join(migs_folder, "mk.db"))
+        plain_texts = texts(os.path.join(plain_data, "mk.db"))
+        assert "for migs" in migs_texts and "for plain" not in migs_texts, migs_texts
+        assert "for plain" in plain_texts and "for migs" not in plain_texts, plain_texts
+
+        # ---- 3. the bus's OWN project switches while the bus runs (todo 108) ---------------
+        assert "before switch" in texts(os.path.join(own_data, "mk.db")), \
+            "the pre-switch message must be in the legacy store"
+        switch("own", own_data, "own-repo")   # the bus keeps running through the switch
+        own_folder = os.path.join(mkh, "projects", "own")
+        rc, res, err = cli(["send", "--data", own_data, "--run", "r1", "--task", "T1",
+                            "--kind", "info", "--from", "orch", "--to", "T1",
+                            "--text", "after switch"])
+        assert rc == 0 and res.get("ok"), (res, err)
+        new_texts = texts(os.path.join(own_folder, "mk.db"))
+        old_texts = texts(os.path.join(own_data, "mk.db"))
+        assert "before switch" in new_texts, "the switch did not carry the pre-switch message"
+        assert "after switch" in new_texts, f"the new project DB missed the message: {new_texts}"
+        assert "after switch" not in old_texts, \
+            f"the legacy store was written after the switch: {old_texts}"
+        # the bus followed without a restart, and an ensure sees the SAME bus, never a second
+        rc, again, err = cli(["ensure", "--run", "r1", "--data", migs_folder])
+        assert rc == 0 and again.get("started") is False and again.get("pid") == first_pid, \
+            (again, err)
+        assert one_bus("after the own-project switch") == 1
+
+        # ---- 4. the watch cursor lives in the project folder; the old one is carried over --
+        legacy_cursor = os.path.join(own_data, "watch-cursors.json")
+        write_json(legacy_cursor, {"r1|*": {"seq": 1}}, mode=0o600)
+        os.remove(_paths("watch_cursors", own_data))
+        w = subprocess.run([sys.executable, os.path.abspath(__file__), "watch", "--data",
+                            own_data, "--run", "r1", "--max-messages", "1"],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+        seen = [x for x in w.stdout.strip().splitlines() if x.strip()]
+        assert len(seen) == 1 and "after switch" in seen[0], (w.stdout, w.stderr)
+        cursor_path = _paths("watch_cursors", own_data)
+        assert cursor_path == os.path.join(own_folder, "watch-cursors.json"), cursor_path
+        assert (read_json(cursor_path) or {}).get("r1|*", {}).get("seq") == 2, read_json(cursor_path)
+        assert os.path.isfile(legacy_cursor), "the legacy cursor file must survive a take-over"
+
+        # ---- 5. a pre-L6.1 bus is adopted, never duplicated ---------------------------------
+        # SIGKILL, not a stop: a killed server leaves its bus.json behind, which is exactly
+        # the pre-L6.1 state the take-over has to adopt (a clean stop removes the file).
+        dead = first_pid
+        os.kill(dead, signal.SIGKILL)
+        deadline = time.time() + 5.0
+        while time.time() < deadline and is_pid_alive(dead):
+            time.sleep(0.05)
+        assert not is_pid_alive(dead), "the killed bus is still alive"
+        assert os.path.isfile(os.path.join(bus_dir, "bus.json")), "a killed bus leaves bus.json"
+        for name in ("bus.json", "bus-tokens.json", "bus-tokens.lock", "bus.lock",
+                     "bus-ensure.lock"):
+            shutil.copy2(os.path.join(bus_dir, name), os.path.join(mkh, name))
+            os.remove(os.path.join(bus_dir, name))
+        os.makedirs(os.path.join(mkh, "bus-lanes"), exist_ok=True)
+        shutil.copy2(lane_tok_file, os.path.join(mkh, "bus-lanes",
+                                                 os.path.basename(lane_tok_file)))
+        os.remove(lane_tok_file)
+        rc, res2, err = cli(["ensure", "--run", "r1", "--data", migs_folder])
+        assert rc == 0 and res2.get("started") is True, (res2, err)
+        pids.append(res2["pid"])
+        assert isinstance(res2.get("port"), int) and res2["port"] > 0, res2
+        assert os.path.isfile(os.path.join(bus_dir, "bus.json")), "the new bus.json is missing"
+        assert one_bus("after the take-over") == 1
+        for legacy in ("bus.json", "bus-tokens.json", "bus-tokens.lock", "bus-lanes"):
+            assert os.path.exists(os.path.join(mkh, legacy)), \
+                f"the legacy {legacy} was deleted by the take-over"
+        adopted_path = _paths("lane_token", lane)
+        assert adopted_path == lane_tok_file, adopted_path
+        assert (read_json(adopted_path) or {}).get("token") == cfg["token"], \
+            "the armed lane's token was not carried over"
+        st, out = post({"run": "r1", "task": "T1", "kind": "info", "text": "adopted token"},
+                       token=cfg["token"])
+        assert st == 200, (st, out)
+        assert "adopted token" in texts(os.path.join(migs_folder, "mk.db")), texts(
+            os.path.join(migs_folder, "mk.db"))
+    finally:
+        stop_bus()
+        for p in pids:
+            stop_process(p)
+        for line in subprocess.run(["ps", "-ax", "-o", "pid=,command="], capture_output=True,
+                                   text=True, timeout=10).stdout.splitlines():
+            if "mk-bus.py" in line and "serve" in line and home_dir in line:
+                head = line.strip().split(None, 1)[0]
+                if head.isdigit():
+                    with contextlib.suppress(OSError):
+                        os.kill(int(head), signal.SIGKILL)
+        shutil.rmtree(tmp, ignore_errors=True)
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def _legacy_bus_token_self_test():
+    """R2 (review HIGH 2): an ADOPTED pre-L6.1 bus still validates tokens against the
+    LEGACY <home>/bus-tokens.json, so a token minted only under bus/ answers 401 on that
+    bus until it restarts.
+
+    One temp $HOME with every MK pin unset (the production resolution) and a store-mode
+    project. A legacy bus is alive — its pid sits in the pre-L6.1 bus.json at the home
+    root — and `token` must then write the mint BOTH at the new path and into the legacy
+    file under the legacy lock, so the running old bus accepts it at once. With NO legacy
+    bus alive the mint must create no legacy path at all: no bus.json, no bus-tokens.json,
+    no lock, no bus-lanes/."""
+    import shutil
+
+    mod = _mkdb_helpers_ready()
+    if mod is None:
+        print("legacy-bus-token self-test skipped: mkdb live writers not present")
+        return
+    tmp = tempfile.mkdtemp(prefix="mk-bus-legacy-token-")
+    pids = []
+    saved = {k: os.environ.get(k) for k in
+             ("HOME", "MK_HOME", "MATRIXKODER_HOME", "MATRIXKODER_DATA", "MK_BUS_DIR",
+              "MK_BUS_TOKEN_FILE", "MK_SELFTEST")}
+
+    def cli(args, home):
+        p = subprocess.run([sys.executable, os.path.abspath(__file__)] + args,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                           env=dict(os.environ, HOME=home))
+        lines = [x.strip() for x in p.stdout.strip().splitlines() if x.strip()]
+        last = json.loads(lines[-1]) if lines else {}
+        if p.returncode != 0:
+            raise AssertionError(f"CLI {args} rc={p.returncode}: {p.stderr.strip()[-300:]}")
+        return last
+
+    def scrub(home):
+        for key in ("MK_HOME", "MATRIXKODER_HOME", "MATRIXKODER_DATA", "MK_BUS_DIR",
+                    "MK_BUS_TOKEN_FILE"):
+            os.environ.pop(key, None)   # the production path: no pin resolves the home
+        os.environ["HOME"] = home
+        os.environ["MK_SELFTEST"] = "1"  # mkdb's C16 guard: writes stay in the temp tree
+
+    def seed(home, name):
+        """A store-mode project: mkdb creates the project store the mint resolves to."""
+        mkh = os.path.join(home, ".matrixkoder")
+        os.makedirs(mkh, exist_ok=True)
+        data = os.path.join(tmp, name, "data")
+        os.makedirs(data, exist_ok=True)
+        mod.open_project(mkh, "matrixkoder", data_dir=data).close()
+        return mkh, data
+
+    try:
+        # ---- a legacy bus is ALIVE: its pid sits in the pre-L6.1 bus.json --------------
+        home = os.path.join(tmp, "home")
+        os.makedirs(home, exist_ok=True)
+        scrub(home)
+        mkh, data = seed(home, "r1")
+        legacy_bus_json = os.path.join(mkh, "bus.json")           # pre-L6.1: the home root
+        legacy_bus_tokens = os.path.join(mkh, "bus-tokens.json")  # pre-L6.1: the home root
+        proc = subprocess.Popen(["sleep", "120"])
+        pids.append(proc.pid)
+        write_json(legacy_bus_json, {"pid": proc.pid, "port": 1, "token": "t"}, mode=0o600)
+        write_json(legacy_bus_tokens, {}, mode=0o600)
+
+        lane = os.path.join(tmp, "lane")
+        os.makedirs(lane, exist_ok=True)
+        res = cli(["token", "--data", data, "--lane", lane, "--task", "T9", "--run", "r1"], home)
+        assert res.get("ok"), res
+        new_tokens = read_json(_paths("bus_tokens", data), {}) or {}
+        assert res["token"] in new_tokens, "the mint is not in <home>/bus/bus-tokens.json"
+        legacy = read_json(legacy_bus_tokens, {}) or {}
+        assert res["token"] in legacy, \
+            "HIGH 2: the minted token is missing from the legacy bus-tokens.json the " \
+            "adopted pre-L6.1 bus still validates against"
+
+        # ---- no legacy bus alive: NO legacy file may appear -----------------------------
+        home2 = os.path.join(tmp, "home2")
+        os.makedirs(home2, exist_ok=True)
+        scrub(home2)
+        mkh2, data2 = seed(home2, "r2")
+        lane2 = os.path.join(tmp, "lane2")
+        os.makedirs(lane2, exist_ok=True)
+        res2 = cli(["token", "--data", data2, "--lane", lane2, "--task", "T9",
+                    "--run", "r1"], home2)
+        assert res2.get("ok"), res2
+        for name in ("bus.json", "bus-tokens.json", "bus-tokens.lock", "bus-lanes"):
+            assert not os.path.exists(os.path.join(mkh2, name)), \
+                f"token created the legacy {os.path.join(mkh2, name)} with no old bus alive"
+        new2 = read_json(_paths("bus_tokens", data2), {}) or {}
+        assert res2["token"] in new2, "the mint is not in <home2>/bus/bus-tokens.json"
+    finally:
+        for pid in pids:
+            stop_process(pid)
+        shutil.rmtree(tmp, ignore_errors=True)
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 def _store_self_test_body(mod):
     """Real store round-trip. Runs only after append_event exists.
 
@@ -3868,8 +4328,9 @@ def _store_self_test_body(mod):
         assert not os.path.isfile(os.path.join(data, "bus.json")), "store mode wrote a per-project bus.json"
         lane_file_old = os.path.join(lane, ".matrixkoder-bus.json")
         assert not os.path.isfile(lane_file_old), "token file still inside the lane"
-        lanes_dir = os.path.join(home, "bus-lanes")
-        assert os.path.isdir(lanes_dir) and os.listdir(lanes_dir), "token file not under bus-lanes"
+        # L6.1: <bus dir>/lanes/<sha>.json. store_home is MK_BUS_DIR, which IS the bus dir.
+        lanes_dir = os.path.join(home, "lanes")
+        assert os.path.isdir(lanes_dir) and os.listdir(lanes_dir), "token file not under lanes/"
         tok_path = os.path.join(lanes_dir, os.listdir(lanes_dir)[0])
         assert oct(os.stat(tok_path).st_mode & 0o777) == "0o600", oct(os.stat(tok_path).st_mode)
         # orchestrator token of project A cannot write project B
@@ -6731,6 +7192,8 @@ def self_test():
                 os.environ[k] = v
 
     _store_self_test()
+    _layout_self_test()
+    _legacy_bus_token_self_test()
     print("pass mk-bus.py: mk-bus self-test ok")
     print(json.dumps({"ok": True, "tests": len(checks), "passed": len(checks)}))
     return 0

@@ -16,8 +16,13 @@ L0 folded these copies into this module:
                   mk-lane.py:195 (git_toplevel)
     lane token  — mk-bus.py:108, mk-lane-event.py:589, mk-builder.py:1955
     bus files   — mk-bus.py bus_location, mk-lane-event.py:831 bus_dir_for
-Python 3 stdlib only; `mkdb.py` is deliberately NOT imported (mkpaths must stay importable
-from mkdb once it delegates here in L3).
+
+L6.1 moves the bus files into <home>/bus/ (C6) and the watch cursors into the project folder.
+The pre-L6.1 file of a moved path is READ ONCE and copied over (`_take_over`) when the new
+one is missing — never deleted, never written — so a bus, an armed lane or a watch that was
+started before the switch keeps working against the same bytes. Every WRITE lands at the new
+path, because these getters answer with the new path. Python 3 stdlib only; `mkdb.py` is
+deliberately NOT imported (mkpaths must stay importable from mkdb once it delegates here in L3).
 """
 import hashlib
 import importlib.util
@@ -26,6 +31,7 @@ import os
 import re
 import sqlite3
 import sys
+import tempfile
 
 DEFAULT_HOME = "~/.matrixkoder"
 ROOT_DB_NAME = "mk.db"
@@ -33,6 +39,9 @@ PROJECTS_JSON = "projects.json"
 USAGE_LEDGER = "usage.json"
 LANE_BUS_FILE = ".matrixkoder-bus.json"
 BUS_LANES_DIR = "bus-lanes"
+# L6.1: the lane token files move with the bus into <bus dir>/lanes/ (C6). BUS_LANES_DIR
+# stays the pre-L6.1 spelling: it is the read-once source a take-over copies from.
+TARGET_LANES_DIR = "lanes"
 # the project slug rule (C11), the same shape mk-bus and mkdb check
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
 
@@ -537,11 +546,27 @@ def runs_lock(data):
 # ---- bus ------------------------------------------------------------------------------------
 
 def bus_dir(data):
-    """Where bus.json / bus.lock / bus-tokens.json / ring-queue.json live for this data dir.
+    """Where bus.json / bus.lock / bus-tokens.json / ring-queue.json / lanes/ live for this
+    data dir (C6, L6.1).
 
-    $MK_BUS_DIR wins. File mode (no <data>/mk.db): the data dir, exactly as before — the
-    self-hosting guard. Store mode: the MK home, one bus for every project.
+    $MK_BUS_DIR wins: the test seam pins the bus home, and the bus files live directly in
+    it, so a pinned bus keeps today's layout. File mode (no <data>/mk.db): the data dir,
+    exactly as before — the self-hosting guard. Store mode with no pin: the MK home's
+    `bus/` folder, one bus for every project (`~/.matrixkoder/bus/`; the pre-L6.1 location
+    was the home root itself, read once).
     """
+    override = bus_env_dir()
+    if override:
+        return override
+    if os.path.isfile(project_db(data=data)):
+        return target_bus_dir()
+    return data
+
+
+def _legacy_bus_dir(data):
+    """Where the bus files lived before L6.1: $MK_BUS_DIR, else the home root in store mode,
+    else the data dir. The read-once source of every bus-scoped file below — a caller that
+    still finds its data there copies it over and never deletes it (C6)."""
     override = bus_env_dir()
     if override:
         return override
@@ -550,14 +575,73 @@ def bus_dir(data):
     return data
 
 
+def _take_over(new_path, old_path):
+    """The read-once rule for a moved file (C6, L6.1).
+
+    Read the NEW place. When it is missing and the OLD one holds data, copy that data over
+    first, atomically and 0600, and return the new path. The old file is never deleted and
+    never written, so a downgrade, a second reader and the rollback all still see it. An
+    empty or unreadable old file is ignored (nothing to carry over), and a failed copy falls
+    back to reading the old file, which holds the same bytes. Idempotent: once the new file
+    exists this is one stat.
+    """
+    if not old_path or old_path == new_path or os.path.exists(new_path):
+        return new_path
+    try:
+        with open(old_path, "rb") as f:
+            blob = f.read()
+    except OSError:
+        return new_path
+    if not blob:
+        return new_path
+    dst_dir = os.path.dirname(new_path)
+    fd = None
+    tmp = None
+    try:
+        os.makedirs(dst_dir, exist_ok=True)
+        # A UNIQUE temp name per copier (review HIGH 1): the old fixed
+        # `new_path + ".take-over"` was shared by every copier, so one racer's
+        # os.replace deleted another's temp mid-write — installing a truncated
+        # 0-byte file, or raising FileNotFoundError so callers diverged (one
+        # answered new_path, another old_path). mkstemp opens 0600; the chmod
+        # only makes that explicit.
+        fd, tmp = tempfile.mkstemp(dir=dst_dir, prefix=".take-over-")
+        with os.fdopen(fd, "wb") as f:
+            fd = None  # closed by fdopen on every path out of the with
+            f.write(blob)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, new_path)
+        tmp = None  # installed: nothing to clean up
+    except OSError:
+        if fd is not None:
+            os.close(fd)
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        return old_path
+    return new_path
+
+
+def _bus_path(data, name):
+    """One bus-scoped file: the L6.1 path under bus_dir, read-once from the pre-L6.1 one."""
+    return _take_over(os.path.join(bus_dir(data), name),
+                     os.path.join(_legacy_bus_dir(data), name))
+
+
 def lane_token(lane, file_mode=False):
     """C6: the ONE lane-token rule for mk-bus, mk-lane-event and mk-builder.
 
     $MK_BUS_TOKEN_FILE wins (tests and a relocated home), else the file-mode token inside the
     lane (<lane>/.matrixkoder-bus.json) — when it is there, and in file mode even when it is
-    not — else <home>/bus-lanes/<sha256(realpath(lane))>.json, mode 0600. The home is
-    $MK_BUS_DIR when the bus is pinned to one, else $MK_HOME, else $MATRIXKODER_HOME,
-    else ~/.matrixkoder.
+    not — else <bus dir>/lanes/<sha256(realpath(lane))>.json, mode 0600. With the bus pinned
+    by $MK_BUS_DIR that file lives in it, else under $MK_HOME, else $MATRIXKODER_HOME, else
+    ~/.matrixkoder — L6.1 puts the bus under ~/.matrixkoder/bus/, so the home form is
+    ~/.matrixkoder/bus/lanes/<hash>.json. The pre-L6.1 <home>/bus-lanes/<hash>.json is read
+    once and copied over, never deleted, so an armed lane keeps its token across the switch.
     """
     override = os.environ.get("MK_BUS_TOKEN_FILE")
     if override:
@@ -565,30 +649,51 @@ def lane_token(lane, file_mode=False):
     inside = os.path.join(lane, LANE_BUS_FILE)
     if file_mode or os.path.isfile(inside):
         return inside
-    base = bus_env_dir() or home()
+    base = os.path.abspath(os.path.expanduser(bus_env_dir() or home()))
     digest = hashlib.sha256(os.path.realpath(lane).encode("utf-8")).hexdigest()
-    return os.path.join(os.path.abspath(os.path.expanduser(base)), BUS_LANES_DIR, digest + ".json")
+    # the token file lives in the bus dir, exactly like bus.json: the $MK_BUS_DIR pin is
+    # that dir, and with no pin the bus dir is the home's bus/ folder (C6, L6.1)
+    bus = base if bus_env_dir() else os.path.join(base, TARGET_BUS_DIR)
+    return _take_over(os.path.join(bus, TARGET_LANES_DIR, digest + ".json"),
+                      os.path.join(base, BUS_LANES_DIR, digest + ".json"))
 
 
 def ring_queue(data):
-    return os.path.join(bus_dir(data), "ring-queue.json")
+    return _bus_path(data, "ring-queue.json")
 
 
 def bus_json(data):
     """<bus>/bus.json — pid, port, started, owner_heartbeat, token (0600)."""
-    return os.path.join(bus_dir(data), "bus.json")
+    return _bus_path(data, "bus.json")
 
 
 def bus_lock(data):
-    return os.path.join(bus_dir(data), "bus.lock")
+    return _bus_path(data, "bus.lock")
 
 
 def bus_tokens(data):
-    return os.path.join(bus_dir(data), "bus-tokens.json")
+    return _bus_path(data, "bus-tokens.json")
 
 
 def bus_tokens_lock(data):
-    return os.path.join(bus_dir(data), "bus-tokens.lock")
+    return _bus_path(data, "bus-tokens.lock")
+
+
+def legacy_bus_json(data):
+    """The pre-L6.1 bus.json, at the legacy bus dir: its live pid proves an OLD bus is
+    still running (R2 HIGH 2) — the one signal that tokens minted at the new path must
+    ALSO land in the legacy bus-tokens.json the old bus still validates against."""
+    return os.path.join(_legacy_bus_dir(data), "bus.json")
+
+
+def legacy_bus_tokens(data):
+    """The pre-L6.1 bus-tokens.json an adopted old bus reads its tokens from."""
+    return os.path.join(_legacy_bus_dir(data), "bus-tokens.json")
+
+
+def legacy_bus_tokens_lock(data):
+    """The flock beside legacy_bus_tokens — the old bus's writers take this one."""
+    return os.path.join(_legacy_bus_dir(data), "bus-tokens.lock")
 
 
 # ---- home-level files -----------------------------------------------------------------------
@@ -609,8 +714,11 @@ def lock_path(res):
 
 
 def watch_cursors(data):
-    """The orchestrator bus watch cursors: <data>/watch-cursors.json (0600)."""
-    return os.path.join(data, "watch-cursors.json")
+    """The orchestrator bus watch cursors (0600): projects/<slug>/watch-cursors.json for a
+    migrated project (C6, mkpaths.project_folder), else today's <data>/watch-cursors.json.
+    The pre-migration file is read once and copied over, never deleted."""
+    return _take_over(os.path.join(project_folder(data), "watch-cursors.json"),
+                      os.path.join(data, "watch-cursors.json"))
 
 
 def nudge_state(data):
@@ -623,7 +731,7 @@ def nudge_state_lock(data):
     return os.path.join(data or home(), "nudge-state.lock")
 
 
-# ---- C2 target tree (unused until L3) --------------------------------------------------------
+# ---- C2 target tree (the bus entries below are live from L6.1) ------------------------------
 
 def target_projects_dir(arg=None):
     return os.path.join(home(arg), TARGET_PROJECTS_DIR)
@@ -683,6 +791,11 @@ def _write_json(path, doc):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         json.dump(doc, f)
+
+
+def _read_json(path):
+    with open(path) as f:
+        return json.load(f)
 
 
 def _seed_root(home_dir, slug, repo, data_dir_rel, db_path=None):
@@ -1002,22 +1115,53 @@ def self_test():
         # file mode: the data dir, as before
         _check(bus_dir(data) == data, bus_dir(data))
         _check(ring_queue(data) == os.path.join(data, "ring-queue.json"), ring_queue(data))
-        # store mode: the MK home, one bus per home
+        _check(bus_json(data) == os.path.join(data, "bus.json"), bus_json(data))
+        # store mode: the MK home's bus/ folder (C6, L6.1), one bus for every project
         os.makedirs(data, exist_ok=True)
         open(os.path.join(data, "mk.db"), "w").close()
-        _check(bus_dir(data) == tmp_home, bus_dir(data))
-        # $MK_BUS_DIR overrides both
+        _check(bus_dir(data) == os.path.join(tmp_home, "bus"), bus_dir(data))
+        _check(bus_json(data) == os.path.join(tmp_home, "bus", "bus.json"), bus_json(data))
+        _check(bus_tokens(data) == os.path.join(tmp_home, "bus", "bus-tokens.json"), bus_tokens(data))
+        _check(bus_tokens_lock(data) == os.path.join(tmp_home, "bus", "bus-tokens.lock"),
+               bus_tokens_lock(data))
+        _check(bus_lock(data) == os.path.join(tmp_home, "bus", "bus.lock"), bus_lock(data))
+        _check(ring_queue(data) == os.path.join(tmp_home, "bus", "ring-queue.json"), ring_queue(data))
+        # the pre-L6.1 files are read once and copied over, never deleted or rewritten
+        legacy_bus = os.path.join(tmp_home, "bus.json")
+        _write_json(legacy_bus, {"pid": 7, "port": 1234, "token": "t" * 20})
+        _write_json(os.path.join(tmp_home, "bus-tokens.json"), {"tok": {"role": "orch"}})
+        _write_json(os.path.join(tmp_home, "ring-queue.json"), [{"id": "m-1"}])
+        got = bus_json(data)
+        _check(got == os.path.join(tmp_home, "bus", "bus.json"), got)
+        _check(_read_json(got) == {"pid": 7, "port": 1234, "token": "t" * 20}, _read_json(got))
+        _check(_read_json(bus_tokens(data)) == {"tok": {"role": "orch"}}, bus_tokens(data))
+        _check(_read_json(ring_queue(data)) == [{"id": "m-1"}], ring_queue(data))
+        _check(os.path.isfile(legacy_bus), "the legacy bus.json must survive a take-over")
+        # a second read never re-copies: the new file wins and the legacy bytes stay put
+        _write_json(legacy_bus, {"pid": 99})
+        _check(_read_json(bus_json(data)) == {"pid": 7, "port": 1234, "token": "t" * 20},
+               "the new file must win once it exists")
+        # $MK_BUS_DIR overrides both: the seam pins the bus dir itself, files inside it
         pinned = os.path.join(root, "pinned-bus")
         os.environ["MK_BUS_DIR"] = pinned
         _check(bus_dir(data) == pinned, bus_dir(data))
         _check(ring_queue(data) == os.path.join(pinned, "ring-queue.json"), ring_queue(data))
+        _check(bus_json(data) == os.path.join(pinned, "bus.json"), bus_json(data))
         os.environ.pop("MK_BUS_DIR")
         # the lane token: one rule for mk-bus, mk-lane-event and mk-builder
         lane = os.path.join(root, "lane")
         os.makedirs(lane, exist_ok=True)
         digest = hashlib.sha256(os.path.realpath(lane).encode("utf-8")).hexdigest()
-        _check(lane_token(lane) == os.path.join(tmp_home, BUS_LANES_DIR, digest + ".json"),
+        _check(lane_token(lane) == os.path.join(tmp_home, "bus", "lanes", digest + ".json"),
                lane_token(lane))
+        # an armed lane's pre-L6.1 token file is read once and copied over
+        new_tok = os.path.join(tmp_home, "bus", "lanes", digest + ".json")
+        old_tok = os.path.join(tmp_home, BUS_LANES_DIR, digest + ".json")
+        _write_json(old_tok, {"token": "armed"})
+        _write_json(new_tok, {"token": "placeholder"})
+        os.remove(new_tok)
+        _check(_read_json(lane_token(lane)) == {"token": "armed"}, _read_json(lane_token(lane)))
+        _check(os.path.isfile(old_tok), "the legacy lane token must survive")
         # file mode keeps the token inside the lane; a file there wins even in store mode
         inside = os.path.join(lane, LANE_BUS_FILE)
         open(inside, "w").close()
@@ -1031,6 +1175,68 @@ def self_test():
         os.environ.pop("MK_BUS_TOKEN_FILE")
         _check(target_lane_token(lane) == os.path.join(tmp_home, "bus", "lanes", digest + ".json"),
                target_lane_token(lane))
+        # the lane token follows the bus dir: with $MK_BUS_DIR it is directly in the pin, and
+        # the pre-L6.1 <pin>/bus-lanes/<hash>.json is read once and copied over
+        os.environ["MK_BUS_DIR"] = pinned
+        _check(lane_token(lane) == os.path.join(pinned, "lanes", digest + ".json"),
+               lane_token(lane))
+        _write_json(os.path.join(pinned, "bus-lanes", digest + ".json"), {"token": "pinned"})
+        _check(_read_json(lane_token(lane)) == {"token": "pinned"}, lane_token(lane))
+        os.environ.pop("MK_BUS_DIR")
+
+    def t_take_over_race():
+        """C6 (review HIGH 1): the read-once copy behind every bus / lane-token /
+        watch-cursor getter must be race-safe. Several processes take the SAME file over
+        at once — two lanes arming against one bus, an orchestrator watch beside a bus
+        command — and the pre-fix FIXED scratch name let one racer's os.replace delete
+        another's temp mid-write: either a truncated file was installed at the new path,
+        or one copier answered old_path while the rest answered new_path. The scratch copy
+        is therefore per copier. Twelve threads per round on a fresh target, thirty
+        rounds: no exception, one identical answer, the old bytes intact, nothing left
+        behind. The rule reads no env, so this case needs no home fixture."""
+        import threading
+
+        blob = b'{"k": "' + b"x" * 200000 + b'"}'
+        fails, answers = [], []
+        base = os.path.join(root, "take-over-race")
+        bus_sub = os.path.join(base, "bus")
+        old_path = os.path.join(base, "bus-tokens.json")
+        new_path = os.path.join(bus_sub, "bus-tokens.json")
+
+        def copier(i):
+            barrier.wait(timeout=30)
+            try:
+                answers.append(_take_over(new_path, old_path))
+            except OSError as e:
+                fails.append(type(e).__name__)
+
+        try:
+            os.makedirs(base, exist_ok=True)
+            with open(old_path, "wb") as f:
+                f.write(blob)
+            for rnd in range(30):
+                shutil.rmtree(bus_sub, ignore_errors=True)
+                fails.clear()
+                answers.clear()
+                barrier = threading.Barrier(12)
+                threads = [threading.Thread(target=copier, args=(i,)) for i in range(12)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join(60)
+                _check(not fails, "round %d: copiers raised %s" % (rnd, sorted(set(fails))))
+                _check(len(answers) == 12 and all(a == new_path for a in answers),
+                       "round %d: every copier must answer the new path, got %s"
+                       % (rnd, sorted({str(a) for a in answers})))
+                with open(new_path, "rb") as f:
+                    _check(f.read() == blob, "round %d: the new file must hold the old bytes" % rnd)
+                _check(oct(os.stat(new_path).st_mode & 0o777) == "0o600",
+                       "round %d: mode %s" % (rnd, oct(os.stat(new_path).st_mode & 0o777)))
+                _check(sorted(os.listdir(bus_sub)) == ["bus-tokens.json"],
+                       "round %d: a scratch copy was left behind: %s"
+                       % (rnd, os.listdir(bus_sub)))
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
 
     def t_migrated(tmp_home):
         """C1/C3 (L3): a migrated project (root db_path set by L2's mk-migrate --switch) resolves
@@ -1064,6 +1270,15 @@ def self_test():
         # the data form of project_db stays today's <data>/mk.db: mk-migrate's rollback reads the
         # source store through exactly this form (its copy-back must not follow the switch)
         _check(project_db(data=data) == os.path.join(data, "mk.db"), project_db(data=data))
+        # C6 (L6.1): the watch cursors move into the project folder with the project; the
+        # pre-migration file is read once and copied over, never deleted
+        _check(watch_cursors(data) == os.path.join(proj, "watch-cursors.json"), watch_cursors(data))
+        _write_json(os.path.join(proj, "watch-cursors.json"), {"r1|*": {"seq": 3}})
+        _write_json(os.path.join(data, "watch-cursors.json"), {"r1|*": {"seq": 9}})
+        os.remove(os.path.join(proj, "watch-cursors.json"))
+        _check(_read_json(watch_cursors(data)) == {"r1|*": {"seq": 9}}, watch_cursors(data))
+        _check(os.path.isfile(os.path.join(data, "watch-cursors.json")),
+               "the legacy cursor file must survive a take-over")
 
         # a pre-migration project side by side keeps every path today's
         other_repo = os.path.join(root, "plain-repo")
@@ -1130,6 +1345,7 @@ def self_test():
         t_folders(tmp_home, repo)
         t_project_db(tmp_home, repo)
         t_bus(tmp_home, repo)
+        t_take_over_race()
         t_target(tmp_home)
         t_migrated(tmp_home)
     except Fail as e:

@@ -181,6 +181,7 @@ def _kill_buses(home):
     into bus.json, so this re-reads the file rather than trusting the pid a row remembered."""
     import signal
     home = os.path.realpath(home)
+    # $MK_BUS_DIR (lt._bus_env) pins the bus dir to the home, so bus.json sits at its root
     path = os.path.join(home, "bus.json")
     pids = set()
     if os.path.isfile(path):
@@ -649,10 +650,12 @@ def _bus(ctx, *args, timeout=30):
 
 
 def _lane_token(ctx, lane):
-    """The token file mk-bus writes in store mode: <home>/bus-lanes/<sha256(lane)>.json."""
+    """The token file mk-bus writes in store mode: <bus dir>/lanes/<sha256(lane)>.json.
+    `_bus_env` pins MK_BUS_DIR to the home, which IS the bus dir, so this is
+    <home>/lanes/<hash>.json."""
     import hashlib
     digest = hashlib.sha256(os.path.realpath(lane).encode()).hexdigest()
-    return os.path.join(ctx["home"], "bus-lanes", digest + ".json")
+    return os.path.join(ctx["home"], "lanes", digest + ".json")
 
 
 def _lane(ctx, name):
@@ -889,7 +892,7 @@ def _bus_project(ctx):
 def _orch_token(ctx, project, run):
     """Mint an orchestrator token the way the bus self-test does, in the root token file."""
     import fcntl
-    bus_dir = ctx["home"]
+    bus_dir = ctx["home"]  # _bus_env pins MK_BUS_DIR to the home: the bus dir itself
     tok = secrets.token_urlsafe(32)
     path = os.path.join(bus_dir, "bus-tokens.json")
     lock = os.path.join(bus_dir, "bus-tokens.lock")
@@ -1283,9 +1286,10 @@ def row_c13_doorbell(ctx):
     if open(fake + ".rang").read().count("mk-builder.py inbox") != 1:
         raise Fail("the working agent's nudge was rung: %r" % open(fake + ".rang").read())
     # The bus persists a nudge for a working lane in <bus dir>/ring-queue.json.
+    ring_path = os.path.join(ctx["home"], "ring-queue.json")
     queued = _wait_until(
-        lambda: second_id in json.dumps(json.load(open(os.path.join(ctx["home"], "ring-queue.json"))))
-        if os.path.isfile(os.path.join(ctx["home"], "ring-queue.json")) else False,
+        lambda: second_id in json.dumps(json.load(open(ring_path)))
+        if os.path.isfile(ring_path) else False,
         5, "the second nudge to be queued")
     if not queued:
         raise Fail("the working agent's nudge is not in ring-queue.json")
