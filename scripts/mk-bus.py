@@ -75,6 +75,12 @@ STORE_KINDS = FILE_KINDS + ("task", "status", "commit", "report", "review", "nud
 FILE_TEXT_MAX = 65536
 STORE_TEXT_MAX = 131072
 PAGE_BYTES = 65536
+# X2.3: a `report`/`review` body above STORE_TEXT_MAX is not refused — the bus pages it at
+# PAGE_BYTES (the `\x1e` separator the contract already names) and stores the WHOLE body as
+# one artifact. The ceiling is the artifact writer's own (mkdb.ARTIFACT_MAX), so a body the
+# store cannot hold is still refused rather than half-written.
+PAGED_TEXT_MAX = 256 * 1024
+SEP = "\x1e"
 NONEMPTY_KINDS = ("ask", "answer", "info", "task", "status", "commit", "report", "review", "nudge")
 # status values transition() already accepts (COLUMNS plus attention).
 STATUS_VALUES = (
@@ -265,6 +271,25 @@ def is_valid_id(val):
         and ID_RE.match(val)
         and ".." not in val
     )
+
+
+def page_body(text, size=PAGE_BYTES):
+    """X2.3: split a `report`/`review` body into `size`-byte pages joined by the SEP separator
+    the contract names. A body that already fits one page is returned unchanged, so the wire
+    shape of every ordinary message is untouched; a bigger one travels paged and is reassembled
+    whole (SEP stripped) into its artifact."""
+    parts, cur, n = [], [], 0
+    for ch in text:
+        b = len(ch.encode("utf-8"))
+        if cur and n + b > size:
+            parts.append("".join(cur))
+            cur, n = [], 0
+        cur.append(ch)
+        n += b
+    parts.append("".join(cur))
+    if len(parts) <= 1:
+        return text
+    return SEP.join(parts)
 
 
 class Fail(Exception):
@@ -1684,9 +1709,13 @@ class BusState:
             return
         if not task:
             raise Fail(f"{kind} requires a task")
-        body = (text or "").replace("\x1e", "")
-        if len(body.encode("utf-8")) > STORE_TEXT_MAX:
-            raise Fail("text exceeds 128 KiB")
+        body = (text or "").replace(SEP, "")
+        # X2.3: a `report`/`review` body above STORE_TEXT_MAX is paged, not refused — the whole
+        # text still goes into ONE artifact, so the ceiling is the artifact writer's. Every
+        # other store kind keeps the 128 KiB contract.
+        ceiling = PAGED_TEXT_MAX if kind in ("report", "review") else STORE_TEXT_MAX
+        if len(body.encode("utf-8")) > ceiling:
+            raise Fail(f"text exceeds {ceiling // 1024} KiB")
 
     def apply_store_kind(self, msg, store=None):
         """status -> transition(); report/review -> artifact linked to the bus event.
@@ -1700,9 +1729,10 @@ class BusState:
             return {"change_no": msg.get("change_no")}
         if not task:
             raise Fail(f"{kind} requires a task")
-        body = msg["text"].replace("\x1e", "")
-        if len(body.encode("utf-8")) > STORE_TEXT_MAX:
-            raise Fail("text exceeds 128 KiB")
+        body = msg["text"].replace(SEP, "")
+        ceiling = PAGED_TEXT_MAX if kind in ("report", "review") else STORE_TEXT_MAX
+        if len(body.encode("utf-8")) > ceiling:
+            raise Fail(f"text exceeds {ceiling // 1024} KiB")
         round_n = 0
         head, sep, rest = body.partition("\n")
         if head.startswith("round:"):
@@ -2134,7 +2164,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             except ValueError:
                 content_len = 0
 
-            limit = STORE_TEXT_MAX + 4096 if self.server.bus_state.use_store else 65536
+            limit = PAGED_TEXT_MAX + 4096 if self.server.bus_state.use_store else 65536
             if content_len > limit:
                 self.send_error_json(413, "payload too large")
                 return
@@ -2186,10 +2216,23 @@ class RequestHandler(BaseHTTPRequestHandler):
                     # would raise) -> reject at the door as 400, never a 500.
                     self.send_error_json(400, "text is not valid UTF-8")
                     return
-                text_max = STORE_TEXT_MAX if self.server.bus_state.use_store else FILE_TEXT_MAX
+                # X2.3: a `report`/`review` body above STORE_TEXT_MAX is paged by the bus, not
+                # refused; every other kind keeps the store's 128 KiB ceiling.
+                paged_kind = kind in ("report", "review")
+                text_max = (PAGED_TEXT_MAX if paged_kind else STORE_TEXT_MAX) \
+                    if self.server.bus_state.use_store else FILE_TEXT_MAX
                 if text_len > text_max:
-                    self.send_error_json(400, "text exceeds 64 KiB" if text_max == FILE_TEXT_MAX else "text exceeds 128 KiB")
+                    self.send_error_json(
+                        400,
+                        "text exceeds 64 KiB" if text_max == FILE_TEXT_MAX
+                        else ("text exceeds 256 KiB" if paged_kind else "text exceeds 128 KiB"))
                     return
+                # X2.3: an oversized `report`/`review` body travels PAGED — split at PAGE_BYTES
+                # and joined with the contract's SEP separator — and the store strips the
+                # separators, so the artifact is the whole body. A body inside one page keeps
+                # the plain wire shape every other message uses.
+                if paged_kind and text_len > PAGE_BYTES:
+                    text = page_body(text)
                 # B18: text is non-empty for ask/answer/info; empty is allowed
                 # only for ack.
                 if kind in NONEMPTY_KINDS and not text:
@@ -4853,9 +4896,26 @@ def _store_self_test_body(mod):
         big = "a" * 100000
         code, big_res = post(port2, token, {"kind": "report", "text": "round:2\n" + big}, timeout=20.0)
         assert code == 200 and big_res["ok"] is True, (code, big_res.get("error"))
-        over = "b" * (131072 + 1)
-        code, over_res = post(port2, token, {"kind": "report", "text": over}, timeout=20.0)
-        assert code == 400, (code, over_res)
+        # X2.3: a body above 128 KiB is PAGED, not refused — the whole text still lands as the
+        # round's artifact (2 revisions above), and the reply carries it. Only a body past the
+        # artifact writer's own ceiling (mkdb.ARTIFACT_MAX) is an error.
+        over = "b" * (STORE_TEXT_MAX + 1)
+        code, over_res = post(port2, token,
+                              {"kind": "report", "text": "round:3\n" + over}, timeout=20.0)
+        assert code == 200 and over_res["ok"] is True, (code, over_res.get("error"))
+        assert over_res["artifact"]["rev"] == 1, over_res
+        con = mod.open_project(data, data_dir=data)
+        try:
+            row = con.execute(
+                "SELECT length(text) n FROM artifacts WHERE run='r1' AND task='T1'"
+                " AND kind='report' AND round=3").fetchone()
+        finally:
+            con.close()
+        assert row and row["n"] == STORE_TEXT_MAX + 1, row
+        too_big = "c" * (PAGED_TEXT_MAX + 1)
+        code, too_big_res = post(port2, token,
+                                 {"kind": "report", "text": too_big}, timeout=20.0)
+        assert code == 400, (code, too_big_res)
 
         data_b = os.path.join(tmp, "data-b")
         os.makedirs(data_b, exist_ok=True)
