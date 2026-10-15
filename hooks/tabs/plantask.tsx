@@ -9,7 +9,7 @@
 // arm a raw Esc without a kit change, so the press is the close that works.
 // Pure render — no $, no state, no scripts (C1).
 import type { Elements, RenderElement } from 'claude-code'
-import { ActionButton, Card } from './kit'
+import { ActionButton, Card, Chip } from './kit'
 import { ROLE } from './palette'
 import { clip, planStatusGlyph, planStatusRole } from './plan'
 import type { PlanPhase, PlanSub, PlanTask } from './plan'
@@ -91,6 +91,24 @@ export function PlanTaskPanel(els: Els, row: PlanTask, cols: number, onClose?: (
       {row.type != null && fieldRow(els, 'type', row.type)}
       {row.round != null && fieldRow(els, 'round', String(row.round))}
       {row.verdict != null && fieldRow(els, 'verdict', row.verdict)}
+      {row.risk != null && row.risk >= 1 && row.risk <= 5 && (
+        <Box flexDirection="row" gap={1}>
+          <Text dimColor={true}>risk</Text>
+          {Chip(els, { label: `R${row.risk}`, role: row.risk <= 2 ? 'ok' : row.risk >= 4 ? 'warn' : 'idle', solid: row.critical === true })}
+          {row.critical === true && <Text color={ROLE.err.fg}>{'!!'}</Text>}
+        </Box>
+      )}
+      {row.openReasons != null && row.openReasons.length > 0 && (
+        <Box flexDirection="column">
+          <Text dimColor={true}>open reasons</Text>
+          {row.openReasons.map(reason => (
+            <Box key={`plan-task-reason-${row.id}-${reason.kind}-${reason.opened}`} flexDirection="row" gap={1}>
+              <Text dimColor={true}>·</Text>
+              <Text wrap="wrap">{`${reason.kind} ${reason.points}`}</Text>
+            </Box>
+          ))}
+        </Box>
+      )}
       {row.slot != null && fieldRow(els, 'lane', `L${row.slot}`)}
       {row.pane != null && fieldRow(els, 'pane', row.pane)}
       {row.branch != null && fieldRow(els, 'branch', row.branch)}
@@ -98,7 +116,6 @@ export function PlanTaskPanel(els: Els, row: PlanTask, cols: number, onClose?: (
       {route?.model != null && fieldRow(els, 'model', route.model)}
       {route?.effort != null && fieldRow(els, 'effort', route.effort)}
       {row.updated != null && fieldRow(els, 'updated', row.updated)}
-      {row.deps != null && row.deps.length > 0 && fieldRow(els, 'deps', row.deps.join(' '))}
       {owned.length > 0 && (
         <Box flexDirection="column">
           <Text dimColor={true}>owned</Text>

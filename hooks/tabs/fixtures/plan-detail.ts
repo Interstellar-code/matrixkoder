@@ -855,4 +855,9 @@ const data = {
     }
   ]
 } as const
+// F.1 contract note: `risk` (int 1-5), `critical` (bool) and `open_reasons`
+// ({ kind, points, source, opened } each) are contract fixtures for the F.8
+// lane's tests until F.1 merges — appended by the F.8 lane so the live
+// captured reply stays an old-shape row and the pinned 80/36-col pictures do
+// not shift under the F.1 work.
 export default data

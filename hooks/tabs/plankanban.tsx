@@ -9,6 +9,7 @@ import type { Elements, RenderElement } from 'claude-code'
 import { NARROW } from './ui'
 import { ActionButton, Card, Chip, Section, Segment } from './kit'
 import { PALETTE, ROLE } from './palette'
+import type { PaletteRole } from './palette'
 import { timeInStatus } from './kanban'
 import { laneAgent, routeFields } from './plans-map'
 import type { PlanRoute } from './plan'
@@ -31,6 +32,7 @@ export const STATUS_TO_COLUMN: Readonly<Record<string, PlanKanbanColumn>> = {
   planned: 'PLANNED', routed: 'PLANNED', ready: 'PLANNED',
   dispatched: 'BUILDING', building: 'BUILDING', verifying: 'BUILDING', review: 'BUILDING', fix: 'BUILDING',
   blocked: 'NEEDS YOU', stalled: 'NEEDS YOU', quota: 'NEEDS YOU', provider: 'NEEDS YOU', qa: 'NEEDS YOU',
+  rework: 'NEEDS YOU',
   merged: 'ON MAIN', done: 'ON MAIN',
 }
 
@@ -52,6 +54,11 @@ export type PlanKanbanCard = {
   readonly age: string
   readonly slot?: number | null
   readonly route?: PlanRoute | null
+  /** F.1 contract: derived risk (int 1-5) and its critical flag. Absent/unknown
+   *  shows nothing — never a made-up badge. */
+  readonly risk?: number
+  readonly critical?: boolean
+  readonly openReasons?: readonly { readonly kind: string; readonly points: number; readonly source: string; readonly opened: string }[]
 }
 
 /** The sub-tab's whole view: the plan's phases in plan order and its cards. */
@@ -92,6 +99,16 @@ export function planKanbanView(detail: unknown, nowIso = ''): PlanKanbanView {
       if (!isRecord(task) || typeof task.id !== 'string') continue
       const status = str(task.status)
       if (status !== '' && !(status in STATUS_TO_COLUMN) && !unknownStatuses.includes(status)) unknownStatuses.push(status)
+      const riskRaw = 'risk' in task ? task.risk : undefined
+      const risk = typeof riskRaw === 'number' && Number.isInteger(riskRaw) && riskRaw >= 1 && riskRaw <= 5
+        ? riskRaw : undefined
+      const critical = 'critical' in task && task.critical === true ? true : undefined
+      const reasonsRaw = 'open_reasons' in task ? task.open_reasons : undefined
+      const openReasons = Array.isArray(reasonsRaw)
+        ? reasonsRaw.filter((r): r is { kind: string; points: number; source: string; opened: string } =>
+            isRecord(r) && typeof r.kind === 'string' && typeof r.points === 'number' &&
+            typeof r.source === 'string' && typeof r.opened === 'string')
+        : []
       const verdictRaw = str(task.verdict)
       cards.push({
         id: task.id,
@@ -101,6 +118,9 @@ export function planKanbanView(detail: unknown, nowIso = ''): PlanKanbanView {
         verdict: verdictRaw === '' ? null : verdictRaw,
         age: ageOf(str(task.updated), nowIso),
         ...routeFields(task),
+        ...(risk !== undefined ? { risk } : {}),
+        ...(critical !== undefined ? { critical } : {}),
+        ...(openReasons.length > 0 ? { openReasons } : {}),
       })
     }
   }
@@ -170,7 +190,14 @@ function planCard(els: Els, card: PlanKanbanCard, col: PlanKanbanColumn, inner: 
   // dropped (`L4 opencode`). When that still does not fit, the tag moves to
   // its own row (a plain Text, so the engine wraps it at word edges, never
   // mid-word). The three-part form is untouched wherever it does fit.
+  // F.8: a risk badge (R1..R5, theme tokens only — ok ≤2 / idle 3 / warn ≥4,
+  // never a made-up value when the row carries none) and the critical marker.
+  // Badge cells come out of the chip row's room before the lane tag is sized.
+  const riskTag = typeof card.risk === 'number' && card.risk >= 1 && card.risk <= 5 ? `R${card.risk}` : ''
+  const riskRole: PaletteRole = riskTag === '' ? 'idle' : card.risk! <= 2 ? 'ok' : card.risk! >= 4 ? 'warn' : 'idle'
+  const criticalTag = card.critical === true ? '!!' : ''
   const tagRoom = inner - (card.phase.length + 2) - 1 - (card.age !== '' ? 1 + card.age.length : 0)
+    - (riskTag !== '' ? 1 + riskTag.length : 0) - (criticalTag !== '' ? 1 + criticalTag.length : 0)
   const fits = (tag: string): boolean => tag !== '' && tag.length <= tagRoom
   const rowTag = fits(full) ? full : fits(short) ? short : ''
   const ownTag = rowTag !== '' ? '' : short !== '' ? short : full
@@ -189,6 +216,8 @@ function planCard(els: Els, card: PlanKanbanCard, col: PlanKanbanColumn, inner: 
       <Text color="subtle" wrap="truncate-end">{cut(card.title, inner)}</Text>
       <Box flexDirection="row" gap={1}>
         {Chip(els, { label: card.phase, role: 'idle' })}
+        {criticalTag !== '' && <Text color={ROLE.err.fg}>{criticalTag}</Text>}
+        {riskTag !== '' && Chip(els, { label: riskTag, role: riskRole, solid: card.critical === true })}
         {rowTag !== '' && <Text dimColor={true}>{rowTag}</Text>}
         {card.age !== '' && <Text dimColor={true}>{card.age}</Text>}
       </Box>

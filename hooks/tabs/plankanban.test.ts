@@ -15,6 +15,7 @@ import {
   planKanbanSideBySide,
   verdictNeedsChanges,
 } from './plankanban'
+import type { PlanKanbanView } from './plankanban'
 import detail from './fixtures/plan-detail'
 
 type N = { type: string; props: Record<string, unknown>; children: unknown[] }
@@ -113,6 +114,7 @@ test('the status→column map: every status named by C15, unknown falls to PLANN
     planned: 'PLANNED', routed: 'PLANNED', ready: 'PLANNED',
     dispatched: 'BUILDING', building: 'BUILDING', verifying: 'BUILDING', review: 'BUILDING', fix: 'BUILDING',
     blocked: 'NEEDS YOU', stalled: 'NEEDS YOU', quota: 'NEEDS YOU', provider: 'NEEDS YOU', qa: 'NEEDS YOU',
+    rework: 'NEEDS YOU',
     merged: 'ON MAIN', done: 'ON MAIN',
   })
   for (const [status, col] of Object.entries(STATUS_TO_COLUMN)) {
@@ -766,4 +768,128 @@ ON MAIN                           19
 
 32 tasks · this plan only · source
 mk.db`)
+})
+test('F.8: a rework status maps to NEEDS YOU via the map, and its card lands in the NEEDS YOU column', () => {
+  // independent map assertion, extending (not editing) the map-equality test's spec:
+  expect(columnOfTask({ id: 'X', title: '', status: 'rework', phase: 'P', verdict: null, age: '' })).toBe('NEEDS YOU')
+  const reworkedView = planKanbanView({
+    ok: true,
+    id: 'rework',
+    phases: [{
+      id: 'P1',
+      tasks: [
+        { id: 'P1.9', title: 'proved wrong', status: 'rework', verdict: 'changes' },
+        { id: 'P1.8', title: 'fine again', status: 'merged', verdict: 'approve' },
+      ],
+    }],
+  })
+  const tree = PlanKanbanTab(stubEls(), reworkedView, 80, uiOf().handle)
+  const needs = columnBlock(tree, 'NEEDS YOU')
+  expect(needs, 'NEEDS YOU column is drawn').toBeDefined()
+  const card = cardBox(tree, 'P1.9')
+  expect(card, 'the P1.9 card is drawn').toBeDefined()
+  const needsText = text(needs)
+  expect(needsText, 'the P1.9 card text sits in the NEEDS YOU column block').toContain('proved wrong')
+  expect(needsText, 'the P1.9 card id sits in the NEEDS YOU column block').toContain('P1.9')
+})
+// F.8: risk, critical and open reasons on the cards (F.1 contract).
+// Task rows may carry `risk` (int 1-5), `critical` (bool) and `open_reasons`
+// ({ kind, points, source, opened } each); a row without them (or with an
+// out-of-range risk) renders byte-identically to how it does on main today —
+// never a made-up badge. The assertions read `planKanbanView`'s own cards
+// (its output shape is F.1's editable turnout, so no `import type` edit here)
+// and the elements PlanKanbanTab actually builds, with this file's own
+// `stubEls` / `cardBox` / `columnBlock` / `text` / `allOf` helpers.
+
+// the whole F.8 fixture: a shield of seven cards — five risk warriors in
+// rank order (R1..R5), one card with no risk keys at all and one card whose
+// risk is out of range (7 > 5; the mapper drops it, never a made-up badge)
+// — then, off the wall, one critical card. Plain `building` rows: the
+// builder column is the badge's home ground.
+const shieldView = (): PlanKanbanView => planKanbanView({
+  ok: true, id: 'shield', phases: [{ id: 'S', tasks: [
+    { id: 'X.none', title: 'shield plain', status: 'building' },
+    { id: 'X.bad', title: 'shield over worst rank', status: 'building', risk: 7 },
+    { id: 'X.R1', title: 'rank one', status: 'building', risk: 1 },
+    { id: 'X.R2', title: 'rank two', status: 'building', risk: 2 },
+    { id: 'X.R3', title: 'rank three', status: 'building', risk: 3 },
+    { id: 'X.R4', title: 'rank four', status: 'building', risk: 4 },
+    { id: 'X.R5', title: 'rank five', status: 'building', risk: 5 },
+    { id: 'X.R9', title: 'shield breach', status: 'building', risk: 4, critical: true },
+  ] }],
+})
+
+test('F.8: a card carries the risk the raw row gave it — 1..5 kept, 7 dropped as out of range, absent stays undefined', () => {
+  const view = shieldView()
+  const rankOf = new Map(view.cards.map(c => [c.id, c.risk]))
+  expect(rankOf, 'all eight shield cards are mapped').toEqual(new Map([
+    ['X.none', undefined],   // no risk key → no rank, never 0 or a made-up badge
+    ['X.bad', undefined],   // 7 is out of the 1-5 range: dropped, not clamped
+    ['X.R1', 1],
+    ['X.R2', 2],
+    ['X.R3', 3],
+    ['X.R4', 4],
+    ['X.R5', 5],
+    ['X.R9', 4],           // the critical card's own rank
+  ]))
+})
+
+test('F.8: the R1..R5 badges draw through the narrow 36-col stack; the critical card adds !!, no one else does', () => {
+  // 36 cols is the stacked fallback (planKanbanSideBySide false): the badge
+  // is one Text in the card Box, so it survives the narrow stack
+  expect(planKanbanSideBySide(36)).toBe(false)
+  const narrow = PlanKanbanTab(stubEls(), shieldView(), 36, uiOf().handle)
+  for (const tag of ['R1', 'R2', 'R3', 'R4', 'R5']) {
+    const card = cardBox(narrow, `X.${tag}`)
+    expect(card, `the ${tag} card survives the narrow stack`).toBeDefined()
+    expect(text(card as N), `the ${tag} card draws its badge at 36 cols`).toContain(` ${tag} `)
+  }
+  expect(text(narrow)).not.toContain(' R0 ')
+  expect(text(narrow)).not.toContain(' R7 ')
+
+  // the critical row: `!!` right by its R4 badge — and no non-critical card
+  // ever draws the marker
+  const wide = PlanKanbanTab(stubEls(), shieldView(), W80, uiOf().handle)
+  const critCard = cardBox(wide, 'X.R9')
+  expect(critCard, 'the critical shield card is drawn').toBeDefined()
+  expect(text(critCard as N), 'the critical card draws !! by its badge').toContain('!!')
+  for (const tag of ['R1', 'R2', 'R3', 'R4', 'R5']) {
+    const tagCard = cardBox(wide, `X.${tag}`)
+    expect(text(tagCard as N), `${tag} is not critical → no !! marker`).not.toContain('!!')
+  }
+  expect(text(cardBox(wide, 'X.none') as N), 'the absent-risk card shows no !! either').not.toContain('!!')
+})
+
+
+// The regression guard: a task that carries none of the new keys draws
+// byte-identical Text content whether or not some OTHER task in the same
+// plan was given them. On main today the two renders agree exactly.
+test('F.8: a row without the risk keys renders byte-identically even when a sibling task carries them', () => {
+  const bare = planKanbanView({
+    ok: true, id: 'byteguard',
+    phases: [{ id: 'P1', tasks: [
+      { id: 'P1.1', title: 'first, untouched', status: 'building' },
+      { id: 'P1.2', title: 'second, untouched', status: 'planned' },
+    ] }],
+  })
+  // same plan, same first task — but the OTHER task now carries the keys
+  const withRisky = planKanbanView({
+    ok: true, id: 'byteguard',
+    phases: [{ id: 'P1', tasks: [
+      { id: 'P1.1', title: 'first, untouched', status: 'building' },
+      { id: 'P1.2', title: 'second, untouched', status: 'planned', risk: 2, critical: false },
+    ] }],
+  })
+  const plainTree = PlanKanbanTab(stubEls(), bare, W80, uiOf().handle)
+  const riskyTree = PlanKanbanTab(stubEls(), withRisky, W80, uiOf().handle)
+  const plainCard = cardBox(plainTree, 'P1.1')
+  const riskyCard = cardBox(riskyTree, 'P1.1')
+  expect(plainCard, 'the P1.1 card is drawn in the plain render').toBeDefined()
+  expect(riskyCard, 'the P1.1 card is drawn in the second render too').toBeDefined()
+  // every Text run of the first task, in order, is byte-identical across
+  // the two renders — absent rows render exactly as on main (no badge, no
+  // marker, no made-up value may leak in)
+  expect(allOf(plainCard, 'Text').map(t => text(t)),
+    'the absent row renders exactly as on main: byte-identical with a risky sibling beside it')
+    .toEqual(allOf(riskyCard, 'Text').map(t => text(t)))
 })

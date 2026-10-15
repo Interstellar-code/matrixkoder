@@ -51,6 +51,11 @@ export function routeFields(raw: Record<string, unknown>): {
   owned?: readonly string[]
   deps?: readonly string[]
   route?: PlanRoute | null
+  /** F.1 contract: the derived risk (int 1-5), its critical flag, and the open
+   *  reasons. All optional — an old row carries none of them. */
+  risk?: number
+  critical?: boolean
+  openReasons?: readonly { readonly kind: string; readonly points: number; readonly source: string; readonly opened: string }[]
 } {
   const out: {
     slot?: number | null
@@ -61,6 +66,9 @@ export function routeFields(raw: Record<string, unknown>): {
     owned?: readonly string[]
     deps?: readonly string[]
     route?: PlanRoute | null
+    risk?: number
+    critical?: boolean
+    openReasons?: readonly { readonly kind: string; readonly points: number; readonly source: string; readonly opened: string }[]
   } = {}
   const slot = slotOf(raw.slot)
   if (slot != null) out.slot = slot
@@ -78,6 +86,14 @@ export function routeFields(raw: Record<string, unknown>): {
   if (deps.length > 0) out.deps = deps
   const route = routeOf(raw.route)
   if (route != null) out.route = route
+  if (typeof raw.risk === 'number' && Number.isInteger(raw.risk) && raw.risk >= 1 && raw.risk <= 5) out.risk = raw.risk
+  if (raw.critical === true) out.critical = true
+  if (Array.isArray(raw.open_reasons)) {
+    const reasons = raw.open_reasons.filter((r): r is { kind: string; points: number; source: string; opened: string } =>
+      isRecord(r) && typeof r.kind === 'string' && typeof r.points === 'number' &&
+      typeof r.source === 'string' && typeof r.opened === 'string')
+    if (reasons.length > 0) out.openReasons = reasons
+  }
   return out
 }
 

@@ -121,6 +121,8 @@ const STATUS_SHORT: Record<string, string> = {
   building: 'build', verifying: 'verify', dispatched: 'disp', stalled: 'stall', planned: 'plan',
 }
 const DONE = new Set(['done', 'merged'])
+/** test-visible alias: the F.8 not-done-count tests read the set directly */
+export const DONE_STATUSES_FOR_TEST = DONE
 const IN_PROGRESS = new Set(['dispatched', 'building', 'verifying', 'review', 'fix', 'qa', 'merged'])
 const SIDE_STATE = new Set(['blocked', 'quota', 'stalled', 'provider'])
 const LANE_LIVE = new Set(['dispatched', 'building', 'verifying', 'review', 'fix', 'stalled', 'blocked'])

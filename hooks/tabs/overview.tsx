@@ -58,15 +58,19 @@ export function overviewView(): OverviewView {
 // the boards' status vocabulary: the Overview's own glyphs (Main.dc.html's W2
 // glyphs '●◐!⊘' — blocked is '!' here, quota '⊘') and the palette role each
 // status paints with
-const TASK_GLYPH: Record<string, string> = { building: '●', review: '◐', blocked: '!', quota: '⊘', planned: '○' }
+const TASK_GLYPH: Record<string, string> = { building: '●', review: '◐', blocked: '!', quota: '⊘', planned: '○', rework: '▲' }
 const TASK_ROLE: Record<string, PaletteRole> = {
   dispatched: 'live', building: 'live', verifying: 'live', review: 'live', fix: 'live', qa: 'live',
   merged: 'ok', done: 'ok',
   blocked: 'warn', quota: 'warn', stalled: 'warn', provider: 'warn',
   planned: 'idle', routed: 'idle',
+  // F.8: a rework task is the user's again — warn, like the other NEEDS YOU states
+  rework: 'warn',
 }
 const WAVE_ROLE: Record<OverviewData['waves'][number]['tone'], PaletteRole> = { done: 'ok', active: 'live', planned: 'idle' }
 const DONE = new Set(['done', 'merged'])
+/** test-visible alias: the F.8 not-done-count tests read the set directly */
+export const DONE_STATUSES_FOR_TEST = DONE
 /** the usage bar's heat stops (Main.dc.html's heat(): green → amber → red). */
 const USAGE_STOPS: readonly string[] = [PALETTE.grn, PALETTE.amb, PALETTE.red]
 /** the usage row's fixed columns: the 8-cell name, then the numbers' width. */

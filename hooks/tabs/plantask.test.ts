@@ -266,3 +266,37 @@ test('report render: the D1.5 panel at 36 cols, exactly as pasted (V1.5)', () =>
 │ esc close                        │
 ╰──────────────────────────────────╯`)
 })
+/** ── F.8: risk / critical / open_reasons on the task-detail panel (F.1) ──
+ *  A PlanTask that carries the F.1 keys draws `R<n>` (its risk rank), the
+ *  `!!` critical marker when critical is true, and one `kind points` line
+ *  per open reason. A panel without them shows none of those — the old
+ *  binds render exactly as they do on main today. */
+
+test('F.8: the RISKY panel draws R5, the !! critical marker and one kind-points line per open reason', () => {
+  const risky: PlanTask = {
+    id: 'X9', title: 'shield had a breach', status: 'stalled', right: 'stalled',
+    risk: 5,
+    critical: true,
+    openReasons: [
+      { kind: 'review', points: 3, source: 'rv', opened: '2026-10-15T10:00:00Z' },
+      { kind: 'gate', points: 2, source: 'tsc', opened: '2026-10-14T09:00:00Z' },
+    ],
+  }
+  const drawn = PlanTaskPanel(stubEls(), risky, 80)
+  const t = allText(drawn)
+  expect(t, 'the risk rank is drawn as the R5 badge').toContain('R5')
+  expect(t, 'the critical marker !! is drawn near the badge').toContain('!!')
+  expect(t, 'each reason lands its kind and points — review 3').toContain('review 3')
+  expect(t, 'each reason lands its kind and points — gate 2').toContain('gate 2')
+})
+
+test('F.8: a panel without the risk keys shows no R badge, no !! and no reasons block', () => {
+  const bare: PlanTask = { id: 'B1', title: 'calm', status: 'planned', right: 'planned' }
+  const t = allText(PlanTaskPanel(stubEls(), bare, 80))
+  expect(t).not.toContain('R5')
+  expect(t).not.toContain('!!')
+  expect(t).not.toContain('review 3')
+  expect(t).not.toContain('gate 2')
+  // the bare panel never invents a made-up reasons block either
+  expect(t).not.toContain('open reasons')
+})

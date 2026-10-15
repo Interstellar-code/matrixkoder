@@ -6,7 +6,7 @@
 import { test, expect } from 'claude-code/testing'
 import type { BoxProps, ElementChildren, Elements, RenderChildren, RenderElement, RenderNode, TextProps } from 'claude-code'
 import { mockFs, mockWorld, paneProps, sessionStart, worldFiles, worldFixtures } from './../testkit'
-import { OverviewTab, overviewView } from './overview'
+import { DONE_STATUSES_FOR_TEST, OverviewTab, overviewView } from './overview'
 import { PALETTE, ROLE } from './palette'
 
 // ---------- row widths (review r1 HIGH): a row is a horizontal Box (or a
@@ -279,4 +279,9 @@ test('the Waiting options are a/b/c Buttons; the pick and the ⋯ reveal are vie
   expect(map.get('overview:waiting:pick'), 'pressing b records b').toBe('b')
   const pickedB = buttonsOf(OverviewTab(stubEls(true), overviewView(), 100, map)).find(b => String(b.props.key) === 'waiting-opt-b')
   expect(pickedB?.props.variant, 'the Overview shows the b pick').toBe('primary')
+})
+test('F.8: rework is not a DONE status — the DONE set keeps done and merged only', () => {
+  expect(DONE_STATUSES_FOR_TEST.has('rework'), 'rework is back on the board, not counted done').toBe(false)
+  expect(DONE_STATUSES_FOR_TEST.has('done')).toBe(true)
+  expect(DONE_STATUSES_FOR_TEST.has('merged')).toBe(true)
 })
