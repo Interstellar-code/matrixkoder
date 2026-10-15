@@ -359,10 +359,20 @@ def db_path_of(slug=None, data=None, root=None):
 
 
 def migrated_slug(data=None, slug=None, root=None):
-    """The slug of a migrated project named by `data` or `slug`, else None. db_path set = migrated."""
+    """The slug of a migrated project named by `data` or `slug`, else None. db_path set = migrated.
+
+    `data` is either form of a migrated project: the legacy data_dir on the root row, or the C2
+    project folder (dirname of that row's db_path), so run/task folder helpers answer the same for both.
+    """
     by_slug, by_data = _migrated_maps(root)
     if not slug and data:
-        slug = by_data.get(os.path.realpath(os.path.expanduser(data)))
+        real = os.path.realpath(os.path.expanduser(data))
+        slug = by_data.get(real)
+        if not slug:
+            # several rows can share one db_path (Z19's p<hash> alias): the one named like the folder wins
+            hits = [s for s, db in by_slug.items()
+                    if os.path.realpath(os.path.dirname(os.path.expanduser(db))) == real]
+            slug = os.path.basename(real) if os.path.basename(real) in hits else next(iter(hits), None)
     return slug if slug in by_slug else None
 
 
@@ -1419,6 +1429,31 @@ def self_test():
                run_dir(data, "r1"))
         _check(task_dir(data, "r1", "T1") == os.path.join(proj, "plans", "p1", "runs", "r1", "T1"),
                task_dir(data, "r1", "T1"))
+        # Z23: the C2 project folder as --data answers the same as the legacy form; an unknown run,
+        # an unmigrated folder and a non-project folder keep today's <data>/runs/** paths
+        _check(run_dir(proj, "r1") == run_dir(data, "r1"), run_dir(proj, "r1"))
+        _check(task_dir(proj, "r1", "T1") == task_dir(data, "r1", "T1"), task_dir(proj, "r1", "T1"))
+        _check(migrated_slug(data=proj) == "migs", migrated_slug(data=proj))
+        _check(task_dir(proj, "nope", "T1") == os.path.join(proj, "runs", "nope", "tasks", "T1"),
+               task_dir(proj, "nope", "T1"))
+        # a p<hash> alias row ahead of the real row shares the db_path (live store today): the row
+        # named like the folder still wins
+        import sqlite3 as _sq
+        rcon = _sq.connect(os.path.join(tmp_home, ROOT_DB_NAME))
+        cols = "name, repo, data_dir, mode, db_path"
+        try:
+            rcon.execute(f"INSERT INTO projects(slug, {cols}) SELECT 'pzz', {cols} FROM projects WHERE slug='migs'")
+            rcon.execute("DELETE FROM projects WHERE slug='migs'")
+            rcon.execute(f"INSERT INTO projects(slug, {cols}) SELECT 'migs', {cols} FROM projects WHERE slug='pzz'")
+            rcon.commit()
+        finally:
+            rcon.close()
+        _check(migrated_slug(data=proj) == "migs", migrated_slug(data=proj))
+        _check(task_dir(proj, "r1", "T1") == task_dir(data, "r1", "T1"), task_dir(proj, "r1", "T1"))
+        for plain in (os.path.join(tmp_home, "projects", "unmigrated"), os.path.join(root, "elsewhere")):
+            _check(migrated_slug(data=plain) is None, migrated_slug(data=plain))
+            _check(task_dir(plain, "r1", "T1") == os.path.join(plain, "runs", "r1", "tasks", "T1"),
+                   task_dir(plain, "r1", "T1"))
         # the data form of project_db stays today's <data>/mk.db: mk-migrate's rollback reads the
         # source store through exactly this form (its copy-back must not follow the switch)
         _check(project_db(data=data) == os.path.join(data, "mk.db"), project_db(data=data))
