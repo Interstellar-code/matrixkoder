@@ -141,6 +141,9 @@ SHA_RE = re.compile(r"[0-9a-f]{40}")
 ARCHIVE_RE = re.compile(r"^status-[A-Za-z0-9._-]+-r\d+-(?:builder|reviewer)-\d+\.json$")
 # The MB2 stale-lane-file rule: only these names, only when their round is not this start's.
 STALE_RE = re.compile(r"^\.matrixkoder-(?:report-r(\d+)\.md|review-r(\d+)\.md|status.*\.json)$")
+# Todo 146: bodies go over the bus, so `done` warns on every other lane md/txt/patch file.
+STRAY_RE = re.compile(r"^\.matrixkoder-.+\.(?:md|txt|patch)$")
+BRIEF_COPY_RE = re.compile(r"^\.matrixkoder-brief-r\d+\.md$")  # todo 150: `connect`/`inbox` write it
 KEYS = ("v", "seq", "run", "task", "round", "role", "agent", "state", "step", "phases_done",
         "question", "commit", "report", "subagent", "ctx_pct", "started_at", "updated_at")
 
@@ -443,6 +446,42 @@ def archive_other_rounds(lane, run, round_n, report):
         move_into(lane, run, path, name)
         moved.append(name)
     return moved
+
+
+def fallback_names(old):
+    """The round's bus-down fallback files (C12): the report path, the review and the proof file."""
+    n = old.get("round")
+    return {old.get("report"), f".matrixkoder-review-r{n}.md", f".matrixkoder-proof-r{n}.md"}
+
+
+def stray_lane_files(lane, old):
+    """Todo 146/148: every `.matrixkoder-*.md|txt|patch` file and every `*.db` file in the lane
+    root that is not one of the round's fallback files or a brief copy, sorted. Only names are
+    inspected; nothing is moved or read."""
+    try:
+        names = sorted(os.listdir(lane))
+    except OSError:
+        return []
+    keep = fallback_names(old)
+    return [n for n in names
+            if ((STRAY_RE.match(n) and n not in keep and not BRIEF_COPY_RE.match(n))
+                or n.endswith(".db"))
+            and os.path.isfile(os.path.join(lane, n))]
+
+
+def stdin_body(cmd):
+    """`--stdin`: the whole body; an empty one is refused, since there is nothing to send."""
+    text = sys.stdin.read()
+    if not text.strip():
+        raise Fail(f"empty_body: `{cmd} --stdin` read nothing from stdin")
+    return text
+
+
+def write_fallback(lane, name, text, append=False):
+    """C12: a `--stdin` body the bus did not take lands in the lane root, so it is never lost."""
+    with open(os.path.join(lane, name), "a" if append else "w") as f:
+        f.write(text)
+    return name
 
 
 # ---------- commands ----------
@@ -784,7 +823,7 @@ def cmd_done(a):
     (X2.1/C4 — `report` sent it over the bus), AND a readable HEAD; R20: final per identity, so
     the legality table refuses every second write. The report is checked first, so the error is
     deterministic. R31: a still-running lane child is a WARNING before the token, never a failure
-    and never a change to the token being the last line."""
+    and never a change to the token being the last line; so is a stray lane file (todo 146)."""
     lane, old = lane_dir(a), load_live(lane_dir(a))
     require_state(old, "done")
     report = old.get("report") or ""
@@ -803,6 +842,8 @@ def cmd_done(a):
     write_status(lane, stamp(obj))
     for command in running_lane_children(lane):
         print(f"WARNING: a lane child is still running: {command}")
+    for name in stray_lane_files(lane, old):
+        print(f"WARNING: stray lane file {name}")
     # Todo reporting: the report's `## Todo` section rides on the DONE token. A missing
     # section or an `open` item without a reason warns and does not fail the round.
     warn = ""
@@ -832,13 +873,15 @@ def cmd_review_done(a):
     then move the status file to done (the same legal transition as `done`) and print
     `<T> REVIEW R<n> DONE`. Store mode sends kind `review`; file mode refuses that kind, so it
     sends `info` with the same text. A bus that cannot be reached is ask's contract: the status
-    file goes `blocked`, `BUS DOWN: use the BLOCKED token`, exit 4 (nothing moves to done)."""
+    file goes `blocked`, `BUS DOWN: use the BLOCKED token`, exit 4 (nothing moves to done).
+    `--stdin` takes the body from stdin instead of `--path` (todo 146); a send that fails writes
+    it to `.matrixkoder-review-rN.md` first (C12), so the body is never lost."""
     lane, old = lane_dir(a), load_live(lane_dir(a))
     require_state(old, "done")
     if not is_int(a.findings) or a.findings < 0:
         raise Fail(f"findings must be an integer >= 0, got {a.findings!r}")
     path = (a.path or "").strip()
-    if not path or not os.path.isfile(os.path.join(lane, path)):
+    if not a.stdin and (not path or not os.path.isfile(os.path.join(lane, path))):
         raise Fail(f"review_missing: {path!r} does not exist [R18]")
     # X2.1: the WHOLE review body travels, not a pointer to it — the bus stores it as the
     # round's `review` artifact (C4) and the file stays only the bus-down fallback. The text
@@ -846,21 +889,29 @@ def cmd_review_done(a):
     # artifact IS the review document: mk-lane-event's review_verdict/review_findings read
     # its title line directly, and the path is recovered where it always was (the task
     # folder / the lane).
-    with open(os.path.join(lane, path)) as f:
-        body = f.read()
+    if a.stdin:
+        body, path = a.body, None
+    else:
+        with open(os.path.join(lane, path)) as f:
+            body = f.read()
     text = f"round: {old.get('round')}\n{body}"
+
+    def keep():
+        """Where the body is on disk: `--path`, or the `--stdin` fallback file written now."""
+        return path or write_fallback(lane, f".matrixkoder-review-r{old.get('round')}.md", body)
+
+    down = (f"review {old.get('task')} R{old.get('round')}: {a.verdict} "
+            f"findings: {a.findings} path: ")
     cfg = bus_lane_config(lane)
     if cfg is None:
-        ask_down(lane, f"review {old.get('task')} R{old.get('round')}: {a.verdict} "
-                       f"findings: {a.findings} path: {path}")
+        ask_down(lane, down + keep())
     kind = "review" if store_present(bus_data_dir(cfg)) else "info"
     try:
         bus_send(cfg, kind, text)
     except BusDown:
-        ask_down(lane, f"review {old.get('task')} R{old.get('round')}: {a.verdict} "
-                       f"findings: {a.findings} path: {path}")
+        ask_down(lane, down + keep())
     except BusHttp as e:
-        raise Fail(bus_http_error(e), code=5)
+        raise Fail(bus_http_error(e), code=5, path=keep())
     obj = dict(old, state="done", question=None, subagent=None, commit=lane_head(lane))
     write_status(lane, stamp(obj))
     return ({"ok": True, "seq": obj["seq"], "state": obj["state"], "kind": kind,
@@ -1897,6 +1948,10 @@ def cmd_inbox(a):
             raise Fail(str(e), code=5)
         if msg.get("ack_level") == 3:
             continue
+        parsed = parse_brief_message(msg.get("text")) if msg.get("kind") == "task" else None
+        copy = save_brief_copy(lane, parsed[0], parsed[1]) if parsed else None
+        if copy:  # todo 150: before the JSON line, which a compression hook may replace
+            print(brief_path_line(copy))
         print(json.dumps(msg))
         try:
             ack_once(lane, cfg, msg.get("id"))
@@ -2421,8 +2476,9 @@ def brief_from_files(lane, old):
         m = re.search(r"-r(\d+)\.", base)
         n = m.group(1) if m else "1"
         candidates.append(os.path.join(lane, os.path.dirname(report), f"brief-r{n}.md"))
-        candidates.append(os.path.join(lane, f".matrixkoder-brief-r{n}.md"))
     candidates.append(os.path.join(lane, ".matrixkoder-brief.md"))
+    if report:  # last: `connect` writes this copy itself (todo 150), so a placed file must beat it
+        candidates.append(os.path.join(lane, f".matrixkoder-brief-r{n}.md"))
     for path in candidates:
         try:
             with open(path) as f:
@@ -2635,7 +2691,8 @@ def message_artifact_text(cfg, msg_id):
     The bus stores a `report`/`review` body as an artifact and links it from the event
     (`events.artifact_id`), and in store mode the event row id IS the wire seq — so `m-<n>`
     finds the artifact in one read-only query. No lane cache is involved: the file the old
-    `.matrixkoder-pages` path read was never written by anything."""
+    `.matrixkoder-pages` path read was never written by anything. An `info` event of the lane's
+    own run with no artifact (a `note --kind proof` body, todo 146) is its own text."""
     data = bus_data_dir(cfg)
     if not data or not store_present(data):
         return None
@@ -2648,11 +2705,64 @@ def message_artifact_text(cfg, msg_id):
         "SELECT a.text AS text FROM events e JOIN artifacts a ON a.id = e.artifact_id"
         " WHERE e.id=? AND e.chan='bus' AND e.artifact_id IS NOT NULL",
         (seq,))
+    if not rows:
+        rows = store_rows(
+            data,
+            "SELECT text FROM events WHERE id=? AND chan='bus' AND kind='info'"
+            " AND artifact_id IS NULL AND run=?",
+            (seq, cfg.get("run")))
     for r in rows or []:
         text = r.get("text")
         if isinstance(text, str) and text:
             return text
     return None
+
+
+def save_brief_copy(lane, round_n, body):
+    """Todo 150: the brief body in the git-excluded lane file `.matrixkoder-brief-rN.md`, so a
+    tool-output hook that compresses the paged body still leaves a readable path. -> the absolute
+    path, or None when the write fails (the paged brief is still printed)."""
+    path = os.path.join(lane, f".matrixkoder-brief-r{round_n}.md")
+    try:
+        with open(path, "w") as f:
+            f.write(body)
+    except OSError:
+        return None
+    return os.path.abspath(path)
+
+
+def brief_path_line(path):
+    return f"brief: {path} (read it with your file reader)"
+
+
+def newest_brief(cfg, data):
+    """Todo 148: (round, body) of the highest-round builder brief the bus or the store holds, or
+    None. Unlike `brief_text` it ignores the lane's own round, so a newer round is seen."""
+    best = None
+    for text in brief_messages(cfg) if cfg else []:
+        parsed = parse_brief_message(text)
+        if parsed and (best is None or parsed[0] >= best[0]):
+            best = parsed
+    run, task = (cfg or {}).get("run"), (cfg or {}).get("task")
+    got = newest_stored_artifact(data, run, task, "brief") if data and run and task else None
+    if got and (best is None or got[0] > best[0]):
+        best = got
+    return best
+
+
+def brief_kind(body):
+    """build | fix | takeover, from the brief's title line (`# Z25 R2 — TAKEOVER: ...`)."""
+    title = next((ln for ln in (body or "").splitlines() if ln.strip()), "").lower()
+    return "takeover" if "takeover" in title else "fix" if re.search(r"\bfix", title) else "build"
+
+
+def new_round_lines(old, n, body):
+    """Todo 148: the exact `start` line for a brief round newer than the lane's. `start` takes
+    only builder|reviewer, so the brief kind is named in the comment and the role stays builder."""
+    start = (f"python3 {os.path.abspath(__file__)} start --run {old.get('run')} --task "
+             f"{old.get('task')} --round {n} --role builder --report .matrixkoder-report-r{n}.md")
+    return [f"# NEW ROUND {n} ({brief_kind(body)}): the lane is at round {old.get('round')}. "
+            "Run this first, then follow the brief below:", start]
 
 
 def connect_identity(cfg):
@@ -2728,6 +2838,7 @@ def cmd_connect(a):
         print(found[1])
         raise Handled(0)
     old = read_status(lane)
+    fresh = old is None
     if old is None:
         # Data dir is already exported, so the brief peek can see the bus copy.
         raw_brief = ""
@@ -2744,7 +2855,15 @@ def cmd_connect(a):
                                          "brief")
             raw_brief = f"round:{got[0]}\nkind:brief\n{stored}" if got and stored else ""
         old = implicit_start(lane, cfg, raw_brief)
-    text, path = brief_text(lane, old, cfg, data)
+    # A lane brief file the orchestrator placed still wins (file mode); our own copy does not.
+    placed = brief_from_files(lane, old)[1]
+    placed = placed and not BRIEF_COPY_RE.match(os.path.basename(placed))
+    newer = None if fresh or placed else newest_brief(cfg, data)
+    if newer and is_int(old.get("round")) and newer[0] > old["round"]:
+        text, path, shown = newer[1], f"bus:brief-r{newer[0]}", newer[0]
+    else:
+        newer, shown = None, old.get("round")
+        text, path = brief_text(lane, old, cfg, data)
     if not text and not data and not brief_from_files(lane, old)[0]:
         raise Fail("connect: no data dir — pass --data <dir> or set MK_BUS_DATA, "
                    "or re-arm so the lane token file has a data field")
@@ -2754,7 +2873,13 @@ def cmd_connect(a):
     plan = a.plan or os.environ.get("MK_PLAN") or ""
     tasks = plan_tasks(plan, old.get("task") or "") if plan else []
     body, part, pages = page_slice(text, 1)
-    lines = [f"# brief {part}/{pages}" + (f" {path}" if path else ""), body]
+    # Todo 150: the path line comes first, so a compressed body still leaves it readable.
+    copy = (os.path.abspath(path) if path and os.path.isfile(path)
+            else save_brief_copy(lane, shown, text) if is_int(shown) else None)
+    lines = [brief_path_line(copy)] if copy else []
+    if newer:
+        lines += new_round_lines(old, newer[0], text)
+    lines += [f"# brief {part}/{pages}" + (f" {path}" if path else ""), body]
     if pages > 1:
         lines.append(f"# more: read <id> --part 2 .. {pages}")
     lines.append("# tasks")
@@ -2989,24 +3114,55 @@ def cmd_commit_msg(a):
 
 def cmd_report(a):
     """Send the report file as a `report` message (paged by the bus at 128 KiB). With the
-    bus down the file on disk stays the record (C12)."""
+    bus down the file on disk stays the record (C12). `--stdin` sends the piped body instead
+    (todo 146): the bus stores it as the round's `report` artifact, which `done` accepts, and
+    only a send that fails writes it to the report path."""
     lane, old = lane_dir(a), load_live(lane_dir(a))
     report = old.get("report") or ""
     path = os.path.join(lane, report)
-    if not report or not os.path.isfile(path):
+    if a.stdin:
+        text = a.body
+    elif not report or not os.path.isfile(path):
         raise Fail(f"report_missing: {report!r} does not exist at the lane root")
-    with open(path) as f:
-        text = f.read()
+    else:
+        with open(path) as f:
+            text = f.read()
     body = f"round: {old.get('round')}\n{text}"
     cfg = bus_lane_config(lane)
     data = bus_data_dir(cfg) if cfg else None
     if cfg is None or not store_present(data):
+        if a.stdin:
+            write_fallback(lane, report, text)
         return ({"ok": True, "sent": False, "fallback": "file", "report": report}, None)
     try:
         bus_send(cfg, "report", body)
     except (BusDown, BusHttp):
+        if a.stdin:
+            write_fallback(lane, report, text)
+            return ({"ok": True, "sent": False, "fallback": "file", "report": report}, None)
         return ({"ok": True, "sent": False, "fallback": "bus-down", "report": report}, None)
     return ({"ok": True, "sent": True, "report": report}, None)
+
+
+def cmd_note(a):
+    """Todo 146 (ask m-7436): an old-code proof or real-input result goes over the bus as ONE
+    `info` message, first line `proof round: <n>`, then the body (the store's 128 KiB ceiling).
+    It lives in the project DB as that bus event, so no lane file collects it; the reviewer
+    prints it with `read <msg id>`. A send that fails appends it to the round's
+    `.matrixkoder-proof-rN.md` (C12), which `done` does not warn on."""
+    lane, old = lane_dir(a), load_live(lane_dir(a))
+    text = f"{a.kind} round: {old.get('round')}\n{a.body}"
+    cfg = bus_lane_config(lane)
+    if cfg is not None and store_present(bus_data_dir(cfg)):
+        try:
+            reply = bus_send(cfg, "info", text)
+            return ({"ok": True, "sent": True, "kind": a.kind,
+                     "id": (reply.get("message") or {}).get("id")}, None)
+        except (BusDown, BusHttp):
+            pass
+    name = write_fallback(lane, f".matrixkoder-{a.kind}-r{old.get('round')}.md",
+                          text if text.endswith("\n") else text + "\n", append=True)
+    return ({"ok": True, "sent": False, "fallback": "file", "kind": a.kind, "path": name}, None)
 
 
 def measure_store(data, run):
@@ -3068,10 +3224,12 @@ def build_parser():
     sp = lane_cmd("blocked", cmd_blocked, "record the blocked question, print the token [R19]")
     sp.add_argument("question")
     lane_cmd("done", cmd_done, "record done: report file plus a readable HEAD [R18]")
-    sp = lane_cmd("review-done", cmd_review_done, "reviewer: post verdict, counts and path on the bus, record done")
+    sp = lane_cmd("review-done", cmd_review_done, "reviewer: post verdict, counts and the review on the bus, record done")
     sp.add_argument("--verdict", required=True, choices=("APPROVE", "REQUEST_CHANGES"))
     sp.add_argument("--findings", required=True, type=int)
-    sp.add_argument("--path", required=True, help="review file path relative to the lane root")
+    src = sp.add_mutually_exclusive_group(required=True)
+    src.add_argument("--path", help="review file path relative to the lane root")
+    src.add_argument("--stdin", action="store_true", help="read the review body from stdin")
     sp = lane_cmd("ctx", cmd_ctx,"record the context percentage, 0..100 [R10]")
     sp.add_argument("pct", type=int)
     sp = lane_cmd("phase-done", cmd_phase_done, "append a completed phase id [R8]")
@@ -3108,7 +3266,11 @@ def build_parser():
     sp.add_argument("--agent", default=None)
     sp = lane_cmd("commit", cmd_commit_msg, "announce the commit sha on the bus [C7]")
     sp.add_argument("sha", nargs="?", default=None)
-    lane_cmd("report", cmd_report, "send the report file on the bus [C7]")
+    sp = lane_cmd("report", cmd_report, "send the report file on the bus [C7]")
+    sp.add_argument("--stdin", action="store_true", help="read the report body from stdin, no lane file")
+    sp = lane_cmd("note", cmd_note, "send an old-code proof or real-input result on the bus")
+    sp.add_argument("--kind", required=True, choices=("proof",))
+    sp.add_argument("--stdin", action="store_true", required=True, help="read the body from stdin")
     sp = lane_cmd("ack", cmd_ack, "record a bus message as read, level 3 [BB]")
     sp.add_argument("msg_id")
     sp = lane_cmd("show", cmd_show, "read-only: apply the R27 reader conditions and print the verdict")
@@ -3132,7 +3294,9 @@ def main(argv=None):
             raise Fail("no command; --help lists the command set "
                        "(start, progress, blocked, done, ctx, phase-done, show, "
                        "ask, wait, inbox, ack, connect, read, todo, hook-install, "
-                       "commit, report, review-done, install, measure)")
+                       "commit, report, note, review-done, install, measure)")
+        if getattr(a, "stdin", False):  # read before any status lock is taken
+            a.body = stdin_body(a.cmd)
         out, token = a.func(a)
     except Fail as e:
         print(json.dumps({"ok": False, "error": str(e), **e.extra}))
@@ -3154,16 +3318,23 @@ def main(argv=None):
 # tested, not an internal helper. The one exception is the rollback case, which runs in-process
 # so `os.replace` can be made to fail.
 
-def cli_raw(*args, env=None):
+def cli_raw(*args, env=None, stdin=None):
     e = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
     e.update(env or {})
     r = subprocess.run([sys.executable, os.path.abspath(__file__), *args],
-                       capture_output=True, text=True, env=e, timeout=180)
+                       capture_output=True, text=True, env=e, timeout=180,
+                       input=stdin if stdin is not None else "")
     return r.returncode, [x for x in r.stdout.splitlines() if x.strip()]
 
 
 def cli(lane, *args, **kw):
     return cli_raw(*args, "--lane", lane, **kw)
+
+
+def no_path_line(lines):
+    """Todo 150: `connect` prints `brief: <path> (...)` first; the older cases check the rest."""
+    assert lines and lines[0].startswith("brief: ") and len(lines[0]) < 200, lines[:1]
+    return lines[1:]
 
 
 def jline(lines):
@@ -4728,7 +4899,7 @@ def t_d7_connect_pages_and_tasks(root):
                 'parallel = true\ndeps = ["D7.1"]\n+++\n')
     code, lines = cli(lane, "connect", "--plan", plan)
     assert code == 0, lines
-    text = "\n".join(lines)
+    text = "\n".join(no_path_line(lines))
     assert text.startswith("# brief 1/"), text[:40]
     assert "[D7.1] connect parallel=false deps=" in text, text[-500:]
     assert "[D7.2] ask parallel=true deps=D7.1" in text
@@ -4923,6 +5094,7 @@ def t_l62r2_brief_counts_are_the_stored_brief_wc(root):
     code, lines = cli(lane, "connect", "--data", data, "--plan", plan)
     assert code == 0, lines
     text = "\n".join(lines)
+    text = "\n".join(no_path_line(lines))
     assert text.startswith("# brief 1/1 store:brief-r1"), text[:80]
     assert "build the doorbell" in text and "third line" in text, text
     assert "decoy" not in text, ("the store's brief, not the task folder's", text)
@@ -5346,7 +5518,8 @@ def t_g1_connect_posts_one_info(root):
     assert posted("G1U") == ["lane connected G1U R1"], posted("G1U")
     code, down = connect("g1_down_lane", "G1D", env={"MK_BUS_URL": "http://127.0.0.1:1"})
     # the header names the lane path, which differs; every other stdout line must match
-    assert code == 0 and down[1:] == up[1:] and down[0].startswith("# brief 1/3 "), (code, down[:1])
+    assert code == 0 and no_path_line(down)[1:] == no_path_line(up)[1:] \
+        and no_path_line(down)[0].startswith("# brief 1/3 "), (code, down[:2])
     assert posted("G1D") == [], posted("G1D")
 
 
@@ -5731,6 +5904,246 @@ def t_x2_review_done_and_read_page_the_stored_body(root):
     assert not os.path.exists(os.path.join(lane, ".matrixkoder-pages")), "a page cache was written"
     code, lines = cli(lane, "read", msg_id, "--part", str(pages + 1), env={"MK_BUS_DATA": data})
     assert code != 0, "a part past the last must be refused"
+
+
+def z25_lane(root, name, task):
+    """A git lane on a real store-mode bus, started as a builder with no report file written."""
+    data = os.path.join(root, f"{name}-data")
+    os.makedirs(data, exist_ok=True)
+    mod = d7_store(data, BUS_RUN, task)
+    bus_server(root, name)
+    lane = gitlane(root, f"{name}_lane")
+    bus_cli("token", "--lane", lane, "--task", task, "--run", BUS_RUN, "--data", data)
+    begin(lane, root, run=BUS_RUN, task=task, report=".matrixkoder-report-r1.md")
+    cli(lane, "progress", "work")
+    return data, mod, lane
+
+
+def z25_artifacts(mod, data, task):
+    """(round, kind, length(text)) of every artifact row of the task, newest last."""
+    con = mod.open_project(data, data_dir=data)
+    try:
+        return [(r["round"], r["kind"], r["n"]) for r in con.execute(
+            "SELECT round, kind, length(text) AS n FROM artifacts WHERE run=? AND task=? "
+            "ORDER BY id", (BUS_RUN, task))]
+    finally:
+        con.close()
+
+
+def t_z25_report_stdin_needs_no_lane_file(root):
+    """Todo 146 (1): `report --stdin` posts the piped body as the `report` message and the bus
+    stores it as the round's `report` artifact; no lane file is written, and `done` then passes
+    on that artifact. Printed rows are the real temp store's (kind, round, length)."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data, mod, lane = z25_lane(root, "z25rep", "Z25A")
+    body = "# report\n\n## Todo\n\n[done] the work - tests 5/5\n"
+    code, lines = cli(lane, "report", "--stdin", env={"MK_BUS_DATA": data}, stdin=body)
+    assert code == 0 and jline(lines)["sent"] is True, (code, lines)
+    assert not os.path.exists(os.path.join(lane, ".matrixkoder-report-r1.md")), os.listdir(lane)
+    rows = [r for r in d7_bus_rows(data) if r.get("kind") == "report"]
+    assert len(rows) == 1 and rows[0]["text"] == f"round: 1\n{body}", rows
+    arts = z25_artifacts(mod, data, "Z25A")
+    assert arts == [(1, "report", len(body))], arts
+    code, lines = cli(lane, "done", env={"MK_BUS_DATA": data})
+    assert code == 0 and lines[-1] == "Z25A R1 DONE todo 1/1 done 0 skipped", (code, lines)
+    assert not [ln for ln in lines if ln.startswith("WARNING")], lines
+
+
+def t_z25_report_stdin_bus_down_writes_the_file(root):
+    """Todo 146 (1): no bus (no token file) → the body lands in the lane report path, the JSON
+    says `fallback: file`, and `done` finishes on that file. An empty pipe is refused."""
+    lane = gitlane(root, "z25repdown")
+    begin(lane, root, run="r1", task="Z25B", report=".matrixkoder-report-r1.md")
+    cli(lane, "progress", "work")
+    code, lines = cli(lane, "report", "--stdin", stdin="# report\n\nbody text\n")
+    out = jline(lines)
+    assert code == 0 and out["sent"] is False and out["fallback"] == "file", (code, lines)
+    with open(os.path.join(lane, ".matrixkoder-report-r1.md")) as f:
+        assert f.read() == "# report\n\nbody text\n"
+    code, lines = cli(lane, "report", "--stdin", stdin="  \n")
+    assert code != 0 and "empty_body" in jline(lines)["error"], (code, lines)
+
+
+def t_z25_report_file_path_unchanged(root):
+    """Todo 146 (6): `report` with no flag still reads the lane file and fails without it."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data, mod, lane = z25_lane(root, "z25repfile", "Z25C")
+    out = refuse(lane, "report", env={"MK_BUS_DATA": data})
+    assert "report_missing" in out["error"], out
+    with open(os.path.join(lane, ".matrixkoder-report-r1.md"), "w") as f:
+        f.write("# report\n")
+    code, lines = cli(lane, "report", env={"MK_BUS_DATA": data})
+    assert code == 0 and jline(lines)["sent"] is True, (code, lines)
+    assert z25_artifacts(mod, data, "Z25C") == [(1, "report", len("# report\n"))]
+
+
+def t_z25_review_done_stdin_stores_the_review(root):
+    """Todo 146 (2): `review-done --stdin` sends the piped review as the round's `review`
+    artifact, no `--path` and no lane file; the status goes done with the token line. A call
+    with neither `--path` nor `--stdin` is refused."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data = os.path.join(root, "z25rev-data")
+    os.makedirs(data, exist_ok=True)
+    mod = d7_store(data, BUS_RUN, "Z25D")
+    bus_server(root, "z25rev")
+    lane = review_lane(data, "z25rev_lane", "Z25D", root)
+    os.unlink(os.path.join(lane, ".matrixkoder-review-r1.md"))
+    body = "# Z25D review R1 - REQUEST CHANGES\n\n## HIGH\n\n- a piped finding\n"
+    code, lines = cli(lane, "review-done", "--verdict", "REQUEST_CHANGES", "--findings", "1",
+                      "--stdin", env={"MK_BUS_DATA": data}, stdin=body)
+    assert code == 0 and lines[-1] == "Z25D REVIEW R1 DONE", (code, lines)
+    assert status(lane)["state"] == "done", status(lane)
+    assert not os.path.exists(os.path.join(lane, ".matrixkoder-review-r1.md")), os.listdir(lane)
+    rows = [r for r in d7_bus_rows(data) if r.get("kind") == "review"]
+    assert len(rows) == 1 and rows[0]["text"] == f"round: 1\n{body}", rows
+    assert z25_artifacts(mod, data, "Z25D") == [(1, "review", len(body))]
+    refuse(lane, "review-done", "--verdict", "APPROVE", "--findings", "0")
+
+
+def t_z25_review_done_stdin_bus_down_writes_the_file(root):
+    """Todo 146 (2): bus stopped → exit 4, `BUS DOWN: use the BLOCKED token`, and the piped
+    review is kept in `.matrixkoder-review-r1.md` so it is not lost."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data, pid, _ = bus_server(root, "z25revdown")
+    lane = review_lane(data, "z25revdown_lane", "Z25E", root)
+    os.unlink(os.path.join(lane, ".matrixkoder-review-r1.md"))
+    stop_pid(pid)
+    code, lines = cli(lane, "review-done", "--verdict", "APPROVE", "--findings", "0",
+                      "--stdin", stdin="# review\n\nlooks fine\n")
+    assert code == 4 and lines == ["BUS DOWN: use the BLOCKED token"], (code, lines)
+    with open(os.path.join(lane, ".matrixkoder-review-r1.md")) as f:
+        assert f.read() == "# review\n\nlooks fine\n"
+
+
+def t_z25_note_proof_is_an_info_event_read_prints_it(root):
+    """Todo 146 (3, ask m-7436 A): `note --kind proof --stdin` posts ONE `info` message
+    `proof round: 1\\n<body>`; `read <id>` prints it; another run cannot read it. Bus down →
+    `.matrixkoder-proof-r1.md` appended, and `done` does not warn on that file."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data, mod, lane = z25_lane(root, "z25note", "Z25F")
+    body = "old code: FAIL test_x\nnew code: ok\n"
+    code, lines = cli(lane, "note", "--kind", "proof", "--stdin",
+                      env={"MK_BUS_DATA": data}, stdin=body)
+    out = jline(lines)
+    assert code == 0 and out["sent"] is True and out["id"], (code, lines)
+    rows = [r for r in d7_bus_rows(data) if r.get("kind") == "info"
+            and (r.get("text") or "").startswith("proof round: 1\n")]
+    assert len(rows) == 1 and rows[0]["text"] == f"proof round: 1\n{body}", rows
+    assert z25_artifacts(mod, data, "Z25F") == []
+    code, lines = cli(lane, "read", out["id"], env={"MK_BUS_DATA": data})
+    assert code == 0 and lines == ["# part 1/1", "proof round: 1", "old code: FAIL test_x",
+                                   "new code: ok"], (code, lines)
+    # another run's lane cannot read this event (same run only)
+    other = bus_lane(root, "z25note_other", "Z25X", data)
+    cfg_path = bus_token_path(other) if os.path.isfile(bus_token_path(other)) \
+        else os.path.join(other, BUS_LANE_FILE)
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    cfg["run"] = "some-other-run"
+    with open(cfg_path, "w") as f:
+        json.dump(cfg, f)
+    code, lines = cli(other, "read", out["id"], env={"MK_BUS_DATA": data})
+    assert "proof round" not in "\n".join(lines), (code, lines)
+    # bus down (no token file): the fallback file, no stray warning from `done`
+    plain = gitlane(root, "z25notedown")
+    begin(plain, root, run="r1", task="Z25G", report=".matrixkoder-report-r1.md")
+    cli(plain, "progress", "work")
+    code, lines = cli(plain, "note", "--kind", "proof", "--stdin", stdin="one\n")
+    assert code == 0 and jline(lines)["fallback"] == "file", (code, lines)
+    cli(plain, "note", "--kind", "proof", "--stdin", stdin="two\n")
+    with open(os.path.join(plain, ".matrixkoder-proof-r1.md")) as f:
+        assert f.read() == "proof round: 1\none\nproof round: 1\ntwo\n"
+    with open(os.path.join(plain, ".matrixkoder-report-r1.md"), "w") as f:
+        f.write("# report\n")
+    code, lines = cli(plain, "done")
+    assert code == 0 and lines[-1].startswith("Z25G R1 DONE"), (code, lines)
+    assert not [ln for ln in lines if ln.startswith("WARNING")], lines
+
+
+def t_z25_done_warns_on_stray_lane_files(root):
+    """Todo 146 (4) + 148: `done` prints `WARNING: stray lane file <name>` per stray
+    `.matrixkoder-*.md|txt|patch` and per `*.db`, never for the round's fallback files, a brief
+    copy, a non-`.matrixkoder-` file or the status file; the exit code and the last (token) line do not change."""
+    lane = gitlane(root, "z25stray")
+    begin(lane, root, run="r1", task="Z25H", report=".matrixkoder-report-r1.md")
+    cli(lane, "progress", "work")
+    for name in (".matrixkoder-report-r1.md", ".matrixkoder-review-r1.md",
+                 ".matrixkoder-proof-r1.md", ".matrixkoder-x-proof.md", ".matrixkoder-old.patch",
+                 ".matrixkoder-scratch.txt", "notes.md", ".matrixkoder-report-r0.md",
+                 ".matrixkoder-brief-r1.md", "mk.db"):
+        with open(os.path.join(lane, name), "w") as f:
+            f.write("x\n")
+    code, lines = cli(lane, "done")
+    assert code == 0 and lines[-1].startswith("Z25H R1 DONE"), (code, lines)
+    warned = sorted(ln for ln in lines if ln.startswith("WARNING: stray lane file "))
+    assert warned == ["WARNING: stray lane file .matrixkoder-old.patch",
+                      "WARNING: stray lane file .matrixkoder-report-r0.md",
+                      "WARNING: stray lane file .matrixkoder-scratch.txt",
+                      "WARNING: stray lane file .matrixkoder-x-proof.md",
+                      "WARNING: stray lane file mk.db"], lines
+
+
+def t_z25_connect_follows_the_newest_round_and_writes_the_brief(root):
+    """Todos 148 + 150: a lane at round 1 with a round-2 takeover brief on the bus gets a
+    connect that prints the brief path line FIRST, announces round 2 with the exact `start` line
+    (role builder: `start` takes no other), and serves the round-2 body. The copy
+    `.matrixkoder-brief-r2.md` holds the body. A `brief-rN.md` the orchestrator placed in the
+    lane still wins. `inbox` prints the path line before a brief message."""
+    if not os.path.isfile(MK_BUS_PY):
+        return
+    data = os.path.join(root, "z25conn-data")
+    os.makedirs(data, exist_ok=True)
+    mod = d7_store(data, BUS_RUN, "Z25J")  # store mode: only it accepts the `task` kind
+    con = mod.open_project(data, data_dir=data)
+    try:
+        mod.add_task(con, BUS_RUN, "Z25K", "task", title="z25")
+    finally:
+        con.close()
+    bus_server(root, "z25conn")
+    lane = bus_lane(root, "z25conn_lane", "Z25J", data)
+    begin(lane, root, run=BUS_RUN, task="Z25J", report=".matrixkoder-report-r1.md")
+    for rnd, title in ((1, "# Z25J R1 - build"), (2, "# Z25J R2 - TAKEOVER: finish it")):
+        code, res = bus_cli("send", "--data", data, "--run", BUS_RUN, "--task", "Z25J",
+                            "--kind", "task", "--from", "orch", "--to", "Z25J",
+                            "--text", f"round:{rnd}\nkind:brief\n{title}\nbody {rnd}\n")
+        assert code == 0 and res.get("ok"), res
+    code, lines = cli(lane, "connect")
+    assert code == 0, lines
+    want = os.path.join(os.path.realpath(lane), ".matrixkoder-brief-r2.md")
+    assert lines[0] == f"brief: {want} (read it with your file reader)" or \
+        lines[0].endswith("/.matrixkoder-brief-r2.md (read it with your file reader)"), lines[:2]
+    assert len(lines[0]) < 200, lines[0]
+    assert lines[1].startswith("# NEW ROUND 2 (takeover): the lane is at round 1."), lines[:3]
+    assert lines[2].endswith(f"start --run {BUS_RUN} --task Z25J --round 2 --role builder "
+                             "--report .matrixkoder-report-r2.md"), lines[2]
+    assert any(ln == "body 2" for ln in lines) and "body 1" not in lines, lines
+    with open(os.path.join(lane, ".matrixkoder-brief-r2.md")) as f:
+        assert f.read() == "# Z25J R2 - TAKEOVER: finish it\nbody 2\n"
+    assert status(lane)["round"] == 1, "connect must not start the round silently"
+    # the printed start line runs as written
+    code, lines2 = cli(lane, "start", "--run", BUS_RUN, "--task", "Z25J", "--round", "2",
+                       "--role", "builder", "--report", ".matrixkoder-report-r2.md")
+    assert code == 0 and status(lane)["round"] == 2, (code, lines2)
+    code, lines = cli(lane, "connect")
+    assert not any(ln.startswith("# NEW ROUND") for ln in lines), lines
+    # a brief the orchestrator placed in the lane keeps winning
+    with open(os.path.join(lane, ".matrixkoder-brief.md"), "w") as f:
+        f.write("placed by hand\n")
+    code, lines = cli(lane, "connect")
+    assert "placed by hand" in "\n".join(lines), lines
+    # inbox: path line before the JSON line of a brief message
+    other = bus_lane(root, "z25conn_inbox", "Z25K", data)
+    begin(other, root, run=BUS_RUN, task="Z25K", report=".matrixkoder-report-r1.md")
+    bus_cli("send", "--data", data, "--run", BUS_RUN, "--task", "Z25K", "--kind", "task",
+            "--from", "orch", "--to", "Z25K", "--text", "round:3\nkind:brief\n# Z25K R3\nx\n")
+    code, lines = cli(other, "inbox")
+    assert code == 0 and lines[0].startswith("brief: ") and "/.matrixkoder-brief-r3.md" in lines[0] \
+        and json.loads(lines[1])["kind"] == "task", (code, lines)
 
 
 def t_done_warns_on_running_child(root):
@@ -6380,7 +6793,7 @@ def t_e1_connect_fresh_lane_prints_brief(root):
            if k not in ("MK_BUS_DATA", "MK_BUS_URL", "MK_BUS_TOKEN", "MK_PLAN")}
     code, lines = cli(lane, "connect", "--plan", plan, env=env)
     assert code == 0, lines
-    text = "\n".join(lines)
+    text = "\n".join(no_path_line(lines))
     assert text.startswith("# brief 1/"), text[:80]
     assert "e1 brief page" in text and "build the doorbell" in text, text
     assert "[E1F.1] doorbell parallel=false" in text, text

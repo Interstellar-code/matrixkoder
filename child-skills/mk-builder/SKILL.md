@@ -29,10 +29,11 @@ Checked against `--help`. `B=python3 ${CLAUDE_SKILL_DIR}/scripts/mk-builder.py` 
 | Ask a blocking question | `$B ask "<question>"`; on `PENDING <id>` (exit 3) run `$B wait <id>` |
 | Blocked, bus down | `$B blocked "<question>"`, then stop |
 | Todo item state | `$B todo in_progress <id>` / `$B todo done <id>` |
-| Commit / report on the bus | `$B commit [sha]` / `$B report` |
+| Commit / report on the bus | `$B commit [sha]` / `$B report --stdin` (body piped on stdin; no flag reads the lane file) |
+| Proof (old-code failure, real-input result) | `$B note --kind proof --stdin` — one `info` message, first line `proof round: <n>`; the reviewer prints it with `read <msg id>` |
 | Context % | `$B ctx <0..100>` |
 | Round finished | `$B done` — last stdout line is your reply's last line |
-| Reviewer finished | `$B review-done --verdict APPROVE\|REQUEST_CHANGES --findings <n> --path <review file>` |
+| Reviewer finished | `$B review-done --verdict APPROVE\|REQUEST_CHANGES --findings <n> --stdin` (`--path <review file>` still works) |
 | What the lane status says | `$B show` |
 
 ### Traps
@@ -44,6 +45,8 @@ Checked against `--help`. `B=python3 ${CLAUDE_SKILL_DIR}/scripts/mk-builder.py` 
 - Never `git stash`, `git checkout` or `git reset` to undo work. The lane git guard refuses them.
 - Never pick or switch your model, effort or agent. Subagents use your default model.
 - `done` before the commit and the report exist fails the round.
+- Do not ask the user or orchestrator to confirm starting; after connect/inbox, carry out what it delivers (brief, round, nudge) without asking. Ask only over the bus (`mk-builder.py ask`) for a real decision.
+- Lane `.md`/`.txt`/`.patch` files are only the bus-down fallback (`.matrixkoder-report-rN.md`, `.matrixkoder-review-rN.md`, `.matrixkoder-proof-rN.md`); `done` prints `WARNING: stray lane file <name>` (warning only) for any other `.matrixkoder-*.md|txt|patch` in the lane root, and for a stray `*.db` file.
 
 ## 1. start
 
@@ -64,6 +67,8 @@ First command after `start` (or the doorbell line the orchestrator typed, `conne
 ```
 python3 ${CLAUDE_SKILL_DIR}/scripts/mk-builder.py connect
 ```
+
+When the newest brief round on the bus is above the lane status round, `connect` announces that round and prints the exact `start ... --round N --role builder --report .matrixkoder-report-rN.md` line (the brief kind build/fix/takeover is named in the announcement); run it, `connect` does not start silently. `connect`/`inbox` also write the brief body to the git-excluded `.matrixkoder-brief-rN.md` and print `brief: <abs path> (read it with your file reader)` first; read that file, a compression hook can replace a paged brief.
 
 It prints the brief, paged at about 24,000 chars, then the phase task list as lines `[<id>] title parallel=… deps=…`. Add one `[<id>] ` todo per task. Further pages: `read <id> --part n`. The last page acks. A reviewer pane has no bus brief: `connect` prints `# brief: none found`, which is expected; read the absolute review-brief path from your prompt, and skip `progress` when the lane's builder is already `done` (`illegal transition done -> working`).
 

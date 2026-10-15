@@ -37,7 +37,8 @@ Test guidance (mk-store-r1; keep this short):
 ## Rules
 - Use the mk-builder skill (installed in this lane at `.claude/skills/mk-builder/`) — round R<n>. Every lane rule is the skill's (`reference/lane-rules.md` R1-R29); never restate one here. This brief carries only the per-brief values: the round number <n>, and the end-of-round token `<PHASE> R<n> DONE` (or `<PHASE> R<n> BLOCKED: <question>`) as the LAST line of your reply, alone on its line.
 - Commit: `<type(scope): message>` subject, blank line, `Co-Authored-By: <agent/model> <email>`.
-- Report: write the report to `<report path in this lane>`.
+- Report: send it with `mk-builder.py report --stdin` (body on stdin); proofs with `mk-builder.py note --kind proof --stdin`. The lane file `<report path in this lane>` is only the bus-down fallback.
+- Do not ask the user or orchestrator to confirm starting; after connect/inbox, carry out what it delivers (brief, round, nudge) without asking. Ask only over the bus (`mk-builder.py ask`) for a real decision.
 - After each subtask and each test run, run `mk-builder.py todo done <id>` and post `mk-builder.py progress "<subtask>: <result>; tests <passed>/<failed>"` so the orchestrator sees progress without asking; reply to an orchestrator question the same way (a lane has no answer command).
 - No skill support in your runtime? Read `.claude/skills/mk-builder/SKILL.md` (in this lane) and follow it.
 

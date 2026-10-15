@@ -596,7 +596,7 @@ Messages live in the project DB, `<home>/projects/<slug>/mk.db` — the only sou
   ids, no duplicate, none dropped.
 - **Kinds.** Accepted kinds are `ask`, `answer`, `info`, `ack`, plus `task`, `status`, `commit`,
   `report`, `review`, `nudge`. Lane tokens may send `task`, `commit`, `report`, `review`, and
-  `nudge`. Lane tokens may not send `status` or `answer`. (Before the projects/ layout, until
+  `nudge`. Lane tokens may not send `status` or `answer`. `mk-builder.py report|review-done --stdin` send `report`/`review` bodies; `note --kind proof --stdin` sends an `info` whose first line is `proof round: <n>`. (Before the projects/ layout, until
   2026-10-15, only `ask`, `answer`, `info`, `ack` were accepted.)
 - **Artifacts.** A `report` or `review` message becomes an artifact for that task, round, and
   kind, plus the bus event pointing at it. The round is the integer after a leading `round:N`
@@ -626,6 +626,6 @@ project has heartbeated within the owner timeout.
 
 - **Tokens.** A lane token is scoped to one project + run + task. An orchestrator token is scoped to one project. A root token is read-only: every POST, PUT, and DELETE returns 403 before the body is parsed. Every request resolves one project from the token; a query or body project that disagrees is 403 and changes nothing. An empty project slug is refused. Run state is cached by `(project, run)`.
 - **Token file.** The lane token is written to `<home>/bus/lanes/<sha256(realpath(lane))>.json`, mode 0600, atomically (temp file in the same directory, fsync, replace). `MK_BUS_TOKEN_FILE` overrides that path.
-- **Doorbell.** An unsolicited `nudge`, `info`, or answer-without-waiter addressed to an idle lane is typed once as the fixed line `Run: python3 <skill>/scripts/mk-builder.py inbox`. A working lane is queued; the queue drains on a 5s interval (`MK_BUS_RING_INTERVAL_SEC`) and when the lane goes idle. At most one ring per message id. The ring event is recorded before the line is typed; a recorded-but-untyped ring is typed once on restart, a typed one never again.
+- **Doorbell.** An unsolicited `nudge`, `info`, or answer-without-waiter addressed to an idle lane is typed once as the fixed line `Run: python3 <skill>/scripts/mk-builder.py inbox then carry out what it delivers (brief, round, nudge) without asking; ask only over the bus for a real decision.` A working lane is queued; the queue drains on a 5s interval (`MK_BUS_RING_INTERVAL_SEC`) and when the lane goes idle. At most one ring per message id. The ring event is recorded before the line is typed; a recorded-but-untyped ring is typed once on restart, a typed one never again.
 - **Metrics.** `mk-bus.py metrics --run <id>` prints one JSON line: answer latency p50/p95, failed deliveries, obedience, false-STALL count.
 - **Lane status.** A lane token cannot POST `status`. Lanes announce status as a `task` message whose text is `status <mapped>` plus `round: <n>`.
