@@ -1,6 +1,9 @@
 // Pure mappers from mkdb plans JSON to the Plan tab view types. No I/O.
 import type { PlanRow, RunRow } from './plans'
 import type { PlanPhase, PlanRoute, PlanSub, PlanTask, PlanView } from './plan'
+// the ONE store-directory rule (C3): a migrated row's `db_path` folder, else its
+// `data_dir`. Shared with `k` so the Plan list and the board agree on one store.
+import { projectStoreDir } from './kanban'
 
 export type PlansListReply = { ok?: boolean; plans?: unknown; error?: string }
 export type PlanDetailReply = { ok?: boolean; id?: string; phases?: unknown; error?: string }
@@ -158,6 +161,7 @@ export function plansFromReply(reply: unknown): { plans: PlanRow[]; runs: RunRow
       runs: strList(raw.runs),
       live_run: live,
       counts: { tasks: sumCounts(raw.counts), phases: 0 },
+      ...(str(raw.project) !== '' ? { project: str(raw.project) } : {}),
       ...(Array.isArray(raw.design) ? { design: strList(raw.design) } : {}),
       ...(branchOf(raw.integration) !== '' ? { mergesTo: branchOf(raw.integration) } : {}),
     }
@@ -174,6 +178,80 @@ export function plansFromReply(reply: unknown): { plans: PlanRow[]; runs: RunRow
     }
   }
   return { plans, runs }
+}
+
+
+/**
+ * L7.2: the ROOT store's `mkdb.py overview --json` reply onto the same list
+ * rows — the List sub-tab renders from this and never opens a project DB.
+ *
+ * Every field the List draws (`id`, `title`, `status`, `live_run`, plus the
+ * `counts` tally) is a column of the root `plan_summary` row, so the mapping is
+ * lossless for the list. `created`, `runs`, `mergesTo` and `design` are Detail
+ * header fields the root row does not carry: they stay empty here and the
+ * Detail still reads them from the project DB.
+ *
+ * An overview with no `plans` (a pre-migration root, or none) maps to no rows.
+ *
+ * L7.2 R2: the root holds EVERY project's `plan_summary`, so an unfiltered map
+ * leaks other projects' plans into the List (hermes-switchui's plan showed in
+ * this project's Plan tab, and Detail then asked the active project's store for a
+ * plan it does not have). When `activeDir` names the ACTIVE project's store, only
+ * rows whose `project` slug belongs to that store are kept. The slug set follows
+ * `projects`: every root row sharing the active store directory (a migrated row's
+ * `db_path` folder, a pre-migration row's `data_dir`), so the live legacy alias
+ * is accepted too. An empty `activeDir`, or one no root row matches, keeps every
+ * row — the previous behavior, never a blank list.
+ */
+export function plansFromOverview(reply: unknown, activeDir?: string | null): { plans: PlanRow[]; runs: RunRow[] } {
+  const plans: PlanRow[] = []
+  const runs: RunRow[] = []
+  if (!isRecord(reply) || !Array.isArray(reply.plans)) return { plans, runs }
+  const wanted = activeSlugs(reply, activeDir)
+  for (const raw of reply.plans) {
+    if (!isRecord(raw) || typeof raw.plan !== 'string' || raw.plan === '') continue
+    const project = str(raw.project)
+    if (wanted != null && !wanted.has(project)) continue
+    const live = typeof raw.live_run === 'string' && raw.live_run !== '' ? raw.live_run : null
+    const row: PlanRow = {
+      id: raw.plan,
+      title: str(raw.title),
+      status: str(raw.status),
+      created: str(raw.created),
+      runs: [],
+      live_run: live,
+      counts: { tasks: sumCounts(raw.counts), phases: 0 },
+      ...(project !== '' ? { project } : {}),
+    }
+    plans.push(row)
+    if (live != null) {
+      runs.push({
+        id: live,
+        plan: row.id,
+        title: row.title,
+        stage: '',
+        counts: { done: 0, live: 0, planned: 0 },
+        countsLine: '',
+      })
+    }
+  }
+  return { plans, runs }
+}
+
+/** The slugs of the root rows that name the active store dir (L7.2 R2). null when
+ *  there is nothing to filter by — an empty `activeDir`, a reply with no `projects`,
+ *  or a dir no row matches — and the caller then keeps every row. */
+function activeSlugs(reply: Record<string, unknown>, activeDir: string | null | undefined): Set<string> | null {
+  const dir = typeof activeDir === 'string' ? activeDir.trim() : ''
+  if (dir === '' || !Array.isArray(reply.projects)) return null
+  const out = new Set<string>()
+  for (const raw of reply.projects) {
+    if (!isRecord(raw)) continue
+    if (projectStoreDir(raw) !== dir) continue
+    const slug = str(raw.slug)
+    if (slug !== '') out.add(slug)
+  }
+  return out.size > 0 ? out : null
 }
 
 
@@ -233,6 +311,11 @@ export function planFromReply(reply: unknown): PlanView {
       runs: strList(reply.runs).join(' '),
       mergesTo: branchOf(reply.integration),
       design: Array.isArray(reply.design) ? strList(reply.design).join(' ') : '',
+      // C5/L7.2: a DONE plan's round files left the project folder for the legacy
+      // tarball the migration wrote, so the Detail names that instead of letting them
+      // read as absent. Any other plan keeps them in its project folder (the running
+      // plan renders exactly as before), so no row is added.
+      ...(status === 'done' ? { roundFiles: 'archived · legacy tarball' } : {}),
       counts: `${taskCount} tasks · ${phases.length} phases`,
     },
     phases,

@@ -173,6 +173,15 @@ test('Plans list: a running plan with no live run says so', () => {
   expect(text).toContain('running · r1')
 })
 
+test('Plans list: Delete names the C2 archive path, not the old relative one (L7.2)', () => {
+  const ui = new Map<string, string>()
+  const view = viewWith(() => undefined)
+  press(PlansTab(stubEls, view, 200, ui), 'plans-delete-checkout-v2')
+  const confirm = allText(PlansTab(stubEls, view, 200, ui))
+  expect(confirm).toContain('~/.matrixkoder/projects/matrixkoder/plans/checkout-v2/archive/')
+  expect(confirm).not.toContain('plans/archive/.')
+})
+
 test('Plans list: the narrow layout at 36 cols still renders', () => {
   const drawn = PlansTab(stubEls, PLANS_FIXTURE, 36, new Map())
   const text = allText(drawn)

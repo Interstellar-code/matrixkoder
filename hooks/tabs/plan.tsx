@@ -117,6 +117,11 @@ export type PlanView = {
     readonly mergesTo: string
     readonly design: string
     readonly counts: string
+    /** L7.2: where this plan's round files (briefs/reports/reviews) are — a DONE
+     *  plan's were archived (the legacy tarball), `archived · legacy tarball
+     *  <path>`; anything else reads `missing` (they are not in the project
+     *  folder the Detail can name). '' leaves the row out (a bare C8 row). */
+    readonly roundFiles?: string
   }
   readonly phases?: readonly PlanPhase[]
   /** legacy Checkout fixture: wave cards. Mapped onto phases at render. */
@@ -211,6 +216,7 @@ function HeaderCard(els: Els, view: PlanView, W: number, compact: boolean): Rend
       {kv('runs', head.runs)}
       {kv('merges to', head.mergesTo)}
       {kv('design', head.design)}
+      {head.roundFiles != null && head.roundFiles !== '' && kv('round files', head.roundFiles)}
       <Text dimColor={true}>{head.counts}</Text>
     </Box>
   ))

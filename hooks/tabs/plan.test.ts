@@ -317,7 +317,21 @@ PHASES                                               ▾ Expand all ▸ Collapse
 phases 8`)
 })
 
-test('report render: the Detail sub-tab with phase D1 open at 36 cols, exactly as pasted (V1.5)', () => {
+test('a DONE plan\u2019s absent round files read archived \u00b7 legacy tarball (L7.2); a running plan adds no such row', () => {
+  const done = planFromReply({ ok: true, id: 'workflows-v2', title: 'Workflows v2', status: 'done', created: '2026-10-02', integration: 'main', design: [], runs: ['workflows-v2-r1'], live_run: null, counts: { merged: 6 }, phases: [] })
+  const doneText = allText(PlanTab(stubEls, done, 120, new Map()))
+  expect(doneText).toContain('round files')
+  expect(doneText).toContain('archived \u00b7 legacy tarball')
+  expect(doneText).not.toContain('missing')
+  // a running plan (the same shape, status running) keeps the render byte-identical:
+  // no round-files row at all.
+  const running = planFromReply({ ok: true, id: 'workflows-v2', title: 'Workflows v2', status: 'running', created: '2026-10-02', integration: 'main', design: [], runs: ['workflows-v2-r1'], live_run: 'workflows-v2-r1', counts: { merged: 6 }, phases: [] })
+  const runningText = allText(PlanTab(stubEls, running, 120, new Map()))
+  expect(runningText).not.toContain('round files')
+  expect(runningText).not.toContain('archived')
+})
+
+test('the report render: the Detail sub-tab with phase D1 open at 36 cols, exactly as pasted (V1.5)', () => {
   expect(liveDetailPic(36)).toBe(`╭──────────────────────────────────╮
 │ settings-plans-db       running  │
 │ Settings field mapping, plans i… │

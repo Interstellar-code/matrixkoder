@@ -56,13 +56,17 @@ function press(drawn: unknown, key: string): void {
   ;(b?.props?.onPress as () => void)()
 }
 
-const LIST = JSON.stringify({
+// L7.2: the List renders from the ROOT `overview --json` reply (plan_summary rows),
+// so `plans:list` holds that shape — `project` + `plan`, not `id`.
+const OVERVIEW = JSON.stringify({
   ok: true,
+  projects: [],
   plans: [
-    { id: 'alpha', title: 'Alpha', status: 'running', created: 'c', runs: ['alpha-r1'], live_run: 'alpha-r1', counts: { building: 1 } },
-    { id: 'beta', title: 'Beta', status: 'draft', created: 'c', runs: [], live_run: null, counts: {} },
+    { project: 'matrixkoder', plan: 'alpha', title: 'Alpha', status: 'running', created: 'c', live_run: 'alpha-r1', counts: { building: 1 } },
+    { project: 'matrixkoder', plan: 'beta', title: 'Beta', status: 'draft', created: 'c', live_run: null, counts: {} },
   ],
 })
+const LIST = OVERVIEW
 const DETAIL = JSON.stringify({
   ok: true, id: 'alpha', title: 'Alpha', status: 'running', created: 'c', runs: ['alpha-r1'], live_run: 'alpha-r1',
   integration: 'main', design: [], counts: { building: 1 },
@@ -202,25 +206,101 @@ test('a plan:task naming no task of the shown plan draws no panel', () => {
   expect(text).toContain('PHASES')
 })
 
-test('readPlans does not spawn when the store is missing', async () => {
+test('readPlans does not spawn when the root store is missing', async () => {
   let calls = 0
-  const got = await readPlans(async () => { calls += 1; return { stdout: '', code: 0 } }, '/plugin', '/data', false, 'alpha')
+  const got = await readPlans(async () => { calls += 1; return { stdout: '', code: 0 } }, '/plugin',
+    { home: '/home/mk', rootExists: false, dataDir: '/data', projectExists: true, detailId: 'alpha' })
   expect(calls).toBe(0)
   expect(got.missing).toBe(true)
 })
 
-test('readPlans maps a list reply and a detail reply', async () => {
+test('readPlans reads the LIST from the root overview and the DETAIL from the project DB', async () => {
   const argvSeen: string[][] = []
   const got = await readPlans(async argv => {
     argvSeen.push([...argv])
     const detail = argv.includes('alpha')
-    return { stdout: detail ? DETAIL : LIST, code: 0 }
-  }, '/plugin', '/data', true, 'alpha')
+    return { stdout: detail ? DETAIL : OVERVIEW, code: 0 }
+  }, '/plugin', { home: '/home/mk', rootExists: true, dataDir: '/data', projectExists: true, detailId: 'alpha' })
   expect(got.error).toBeNull()
-  expect(argvSeen[0]?.slice(-3)).toEqual(['--json', '--data', '/data'])
+  // the LIST spawn: `mkdb.py --home <g> overview --json` — no project DB, no --data
+  expect(argvSeen[0]).toContain('overview')
+  expect(argvSeen[0]).toContain('--home')
+  expect(argvSeen[0]).not.toContain('--data')
+  // the DETAIL spawn still reads the project DB
   expect(argvSeen[1]).toContain('alpha')
-  const list = got.list as { plans: { id: string }[] }
-  expect(list.plans[0]?.id).toBe('alpha')
+  expect(argvSeen[1]?.slice(-2)).toEqual(['--data', '/data'])
+  const list = got.list as { plans: { plan: string }[] }
+  expect(list.plans[0]?.plan).toBe('alpha')
   const detail = got.detail as { id: string }
   expect(detail.id).toBe('alpha')
+})
+
+test('readPlans renders the LIST with the project DB unavailable (L7.2 acceptance)', async () => {
+  const argvSeen: string[][] = []
+  const got = await readPlans(async argv => {
+    argvSeen.push([...argv])
+    // every project-DB subcommand fails; the root overview answers
+    if (argv.includes('plans')) return { stdout: '', code: 2 }
+    return { stdout: OVERVIEW, code: 0 }
+  }, '/plugin', { home: '/home/mk', rootExists: true, dataDir: '/data', projectExists: true, detailId: 'alpha' })
+  const list = got.list as { plans: unknown[] }
+  expect(list.plans.length, 'the list still rendered').toBeGreaterThan(0)
+  expect(argvSeen.some(a => a.includes('overview')), 'the list came from the root overview').toBe(true)
+  expect(got.detail, 'the detail that failed is null, not an error').toBeNull()
+})
+
+/** ── L7.2 R2: the Plan List shows only the ACTIVE project's plans ──────── */
+
+// The root overview carries TWO projects, each with its own plan.
+const TWO_PROJECTS = JSON.stringify({
+  ok: true,
+  projects: [
+    { slug: 'alpha', repo: '/srv/alpha', db_path: '/home/mk/projects/alpha/mk.db' },
+    { slug: 'beta', repo: '/srv/beta', db_path: '/home/mk/projects/beta/mk.db' },
+  ],
+  plans: [
+    { project: 'alpha', plan: 'alpha-plan', title: 'Alpha plan', status: 'running', created: 'c', live_run: null, counts: { building: 1 } },
+    { project: 'beta', plan: 'beta-plan', title: 'Beta plan', status: 'draft', created: 'c', live_run: null, counts: {} },
+  ],
+})
+
+test('the List renders only the plans of the active project (plans:dir)', () => {
+  const ui = new Map<string, string>()
+  const view: Record<string, string> = {
+    'plans:store': '1', 'plans:list': TWO_PROJECTS, 'plans:dir': '/home/mk/projects/alpha',
+  }
+  const text = allText(PlanPane(stubEls, view, 80, { get: k => ui.get(k), set: (k, v) => { ui.set(k, v) } }))
+  expect(text).toContain('alpha-plan')
+  expect(text).not.toContain('beta-plan')
+})
+
+test('the List keeps every project\'s plans with no plans:dir', () => {
+  const ui = new Map<string, string>()
+  const view: Record<string, string> = { 'plans:store': '1', 'plans:list': TWO_PROJECTS }
+  const text = allText(PlanPane(stubEls, view, 80, { get: k => ui.get(k), set: (k, v) => { ui.set(k, v) } }))
+  expect(text).toContain('alpha-plan')
+  expect(text).toContain('beta-plan')
+})
+
+test('the List accepts a legacy alias row sharing the active store', () => {
+  const ui = new Map<string, string>()
+  const aliased = JSON.stringify({
+    ok: true,
+    projects: [
+      { slug: 'alpha', repo: '/srv/alpha', db_path: '/home/mk/projects/alpha/mk.db' },
+      { slug: 'a1b2c3', repo: '', db_path: '/home/mk/projects/alpha/mk.db' },
+      { slug: 'beta', repo: '/srv/beta', db_path: '/home/mk/projects/beta/mk.db' },
+    ],
+    plans: [
+      { project: 'alpha', plan: 'alpha-plan', title: 'Alpha plan', status: 'running', created: 'c', live_run: null, counts: { building: 1 } },
+      { project: 'a1b2c3', plan: 'alias-plan', title: 'Alias plan', status: 'draft', created: 'c', live_run: null, counts: {} },
+      { project: 'beta', plan: 'beta-plan', title: 'Beta plan', status: 'draft', created: 'c', live_run: null, counts: {} },
+    ],
+  })
+  const view: Record<string, string> = {
+    'plans:store': '1', 'plans:list': aliased, 'plans:dir': '/home/mk/projects/alpha',
+  }
+  const text = allText(PlanPane(stubEls, view, 80, { get: k => ui.get(k), set: (k, v) => { ui.set(k, v) } }))
+  expect(text).toContain('alpha-plan')
+  expect(text).not.toContain('beta-plan')
 })

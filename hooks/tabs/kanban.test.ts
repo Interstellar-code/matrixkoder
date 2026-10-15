@@ -223,16 +223,22 @@ test('emptyKanbanView shows "no store yet" and no column headers', () => {
   }
 })
 
-test('readCards skips a missing store, parses one cards call, and skips a slow odd tick', async () => {
+test('readCards skips a missing root store, reads the overview then per-project, and skips a slow odd tick', async () => {
   let calls = 0
   const run: RunFn = async argv => {
     calls += 1
-    expect(argv).toContain('cards')
     expect(argv).toContain('--json')
-    expect(argv).toContain('--home')
     const homeAt = argv.indexOf('--home')
-    expect(argv[homeAt + 1]).toBe('/tmp/mk-home')
-    return { stdout: JSON.stringify({ ok: true, cards: [KANBAN_FIXTURE[0]] }), code: 0 }
+    if (homeAt >= 0) {
+      expect(argv).toContain('overview')
+      expect(argv[homeAt + 1]).toBe('/tmp/mk-home')
+      return { stdout: JSON.stringify({ ok: true, projects: [{ slug: 'alpha', repo: '/r/alpha', data_dir: '/d/alpha', db_path: null }], plans: [] }), code: 0 }
+    }
+    expect(argv).toContain('run-snapshot')
+    expect(argv).toContain('--data')
+    const dataAt = argv.indexOf('--data')
+    expect(argv[dataAt + 1]).toBe('/d/alpha')
+    return { stdout: JSON.stringify({ ok: true, runs: [], active: 'r', waits: [], run: { id: 'r', plan: null, status: 'active', tasks: [{ id: 'D3A', title: 'Writer', status: 'building', parent: 'D3', updated: '2026-10-12T09:00:00+02:00' }] } }), code: 0 }
   }
 
   calls = 0
@@ -243,10 +249,11 @@ test('readCards skips a missing store, parses one cards call, and skips a slow o
 
   calls = 0
   const fresh = await readCards(run, '/plugin', '/tmp/mk-home', true, 0, 0)
-  expect(calls).toBe(1)
+  expect(calls, 'one overview + one per linked project').toBe(2)
   expect(fresh.empty).toBe(false)
   expect(fresh.skipped).toBe(false)
-  expect(fresh.cards).toEqual([KANBAN_FIXTURE[0]])
+  expect(fresh.cards).toHaveLength(1)
+  expect(fresh.cards[0]?.task).toBe('D3A')
   expect(typeof fresh.ms).toBe('number')
 
   calls = 0
@@ -257,7 +264,7 @@ test('readCards skips a missing store, parses one cards call, and skips a slow o
 
   calls = 0
   const even = await readCards(run, '/plugin', '/tmp/mk-home', true, 0, 150)
-  expect(calls).toBe(1)
+  expect(calls).toBe(2)
   expect(even.skipped).toBe(false)
   expect(typeof even.ms).toBe('number')
 })
@@ -285,15 +292,13 @@ test('timeInStatus of one hour before KANBAN_NOW is 1h', () => {
 const CORRUPT_MKDB_STDERR = '    return _migrate(_connect(os.path.join(home, "mk.db")), version, ((1, ROOT_DDL),) + tuple(migrations))\n                    ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File "/Users/rohits/Development/matrixkoder-mk-5/scripts/mkdb.py", line 144, in _connect\n    con.execute("PRAGMA journal_mode=WAL")\n    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^\nsqlite3.DatabaseError: file is not a database'
 
 
-test('a corrupt mk.db read (empty stdout, exit 1) is an error, not an empty board', async () => {
+test('a corrupt root store read (empty stdout, exit 1) is an error, not an empty board', async () => {
   expect(CORRUPT_MKDB_STDERR).toContain('sqlite3.DatabaseError: file is not a database')
-  let calls = 0
-  const run: RunFn = async () => {
-    calls += 1
+  const run: RunFn = async argv => {
+    expect(argv).toContain('overview')
     return { stdout: '', code: 1 }
   }
   const got = await readCards(run, '/plugin', '/tmp/mk-home', true, 0, 0)
-  expect(calls).toBe(1)
   expect(got.empty).toBe(false)
   expect(got.error).toBe('cards read failed: mkdb exited')
   expect(got.cards).toEqual([])
@@ -306,7 +311,7 @@ test('a corrupt mk.db read (empty stdout, exit 1) is an error, not an empty boar
   expect(text(columnSection(tree, 'Building')!)).toContain('D3A')
 })
 
-test('non-JSON stdout, {ok:false}, a thrown spawn and a timeout are errors', async () => {
+test('non-JSON overview stdout, {ok:false}, a thrown spawn and a timeout are errors', async () => {
   const cases: Array<{ name: string; run: RunFn; error: string }> = [
     {
       name: 'not json',
@@ -337,13 +342,104 @@ test('non-JSON stdout, {ok:false}, a thrown spawn and a timeout are errors', asy
   }
 })
 
-test('a 1.5 MB cards payload parses and does not report an error', async () => {
-  const one = KANBAN_FIXTURE[0]!
-  const cards = Array.from({ length: 5000 }, (_, i) => ({ ...one, task: `T${String(i)}`, title: 'x'.repeat(40) }))
-  const stdout = JSON.stringify({ ok: true, cards })
-  expect(stdout.length).toBeGreaterThan(1_500_000)
-  const got = await readCards(async () => ({ stdout, code: 0 }), '/plugin', '/tmp/mk-home', true, 0, 0)
+test('a per-project snapshot with 5000 open tasks parses and does not report an error', async () => {
+  const tasks = Array.from({ length: 5000 }, (_, i) => ({ id: `T${String(i)}`, title: 'x'.repeat(40), status: 'building', parent: null, updated: '2026-10-12T09:00:00+02:00' }))
+  const snap = JSON.stringify({ ok: true, runs: [], active: 'r', waits: [], run: { id: 'r', plan: null, status: 'active', tasks } })
+  expect(snap.length).toBeGreaterThan(100_000)
+  const run: RunFn = async argv => argv.includes('overview')
+    ? { stdout: JSON.stringify({ ok: true, projects: [{ slug: 'alpha', repo: '/r/alpha', data_dir: '/d/alpha', db_path: null }], plans: [] }), code: 0 }
+    : { stdout: snap, code: 0 }
+  const got = await readCards(run, '/plugin', '/tmp/mk-home', true, 0, 0)
   expect(got.error).toBeNull()
   expect(got.cards).toHaveLength(5000)
   expect(got.empty).toBe(false)
+})
+
+test('two root rows sharing one store read it once, each task once, cards under the named slug', async () => {
+  // L7.2 R2: the live root carries both the project's own slug and a legacy alias
+  // for the SAME store (same db_path, same repo). Reading per root row would spawn
+  // run-snapshot twice and push every task twice; the fix groups by store dir.
+  const snapCalls: string[] = []
+  const run: RunFn = async argv => {
+    expect(argv).toContain('--json')
+    if (argv.includes('--home')) {
+      return {
+        stdout: JSON.stringify({
+          ok: true,
+          projects: [
+            { slug: 'alias-legacy', repo: '/r/matrixkoder', data_dir: null, db_path: '/d/matrixkoder/mk.db' },
+            { slug: 'matrixkoder', repo: '/r/matrixkoder', data_dir: null, db_path: '/d/matrixkoder/mk.db' },
+          ],
+          plans: [],
+        }),
+        code: 0,
+      }
+    }
+    expect(argv).toContain('run-snapshot')
+    expect(argv).toContain('--data')
+    const dataAt = argv.indexOf('--data')
+    snapCalls.push(String(argv[dataAt + 1]))
+    return {
+      stdout: JSON.stringify({
+        ok: true, runs: [], active: 'r', waits: [],
+        run: { id: 'matrixkoder-r1', plan: null, status: 'active', tasks: [
+          { id: 'D3A', title: 'Writer', status: 'building', parent: 'D3', updated: '2026-10-12T09:00:00+02:00' },
+          { id: 'D4A', title: 'Reader', status: 'blocked', parent: 'D4', updated: '2026-10-12T09:00:00+02:00' },
+        ] },
+      }),
+      code: 0,
+    }
+  }
+
+  const got = await readCards(run, '/plugin', '/tmp/mk-home', true, 0, 0)
+  expect(snapCalls, 'one run-snapshot per distinct store').toHaveLength(1)
+  expect(snapCalls[0]).toBe('/d/matrixkoder')
+  expect(got.error).toBeNull()
+  expect(got.empty).toBe(false)
+  expect(got.cards, 'each task exactly once').toHaveLength(2)
+  expect(got.cards.map(c => c.task).sort()).toEqual(['D3A', 'D4A'])
+  // The store's cards carry the NAMED row's slug (slug === basename(repo)), not the alias.
+  expect(got.cards.find(c => c.task === 'D3A')?.project).toBe('matrixkoder')
+  expect(got.cards.find(c => c.task === 'D4A')?.project).toBe('matrixkoder')
+  expect(got.cards.every(c => c.project === 'matrixkoder')).toBe(true)
+})
+
+test('two distinct stores are each read once and both are returned under their own slugs', async () => {
+  const snapCalls: string[] = []
+  const run: RunFn = async argv => {
+    if (argv.includes('--home')) {
+      return {
+        stdout: JSON.stringify({
+          ok: true,
+          projects: [
+            { slug: 'alpha', repo: '/r/alpha', data_dir: null, db_path: '/d/alpha/mk.db' },
+            { slug: 'beta', repo: '/r/beta', data_dir: null, db_path: '/d/beta/mk.db' },
+          ],
+          plans: [],
+        }),
+        code: 0,
+      }
+    }
+    expect(argv).toContain('run-snapshot')
+    const dataAt = argv.indexOf('--data')
+    const dir = String(argv[dataAt + 1])
+    snapCalls.push(dir)
+    const name = dir.split('/').pop() ?? ''
+    return {
+      stdout: JSON.stringify({
+        ok: true, runs: [], active: 'r', waits: [],
+        run: { id: `${name}-r1`, plan: null, status: 'active', tasks: [
+          { id: `${name.toUpperCase()}1`, title: 'x', status: 'building', parent: null, updated: '2026-10-12T09:00:00+02:00' },
+        ] },
+      }),
+      code: 0,
+    }
+  }
+
+  const got = await readCards(run, '/plugin', '/tmp/mk-home', true, 0, 0)
+  expect(snapCalls.slice().sort(), 'one read per distinct store').toEqual(['/d/alpha', '/d/beta'])
+  expect(got.error).toBeNull()
+  expect(got.cards.map(c => c.task).sort()).toEqual(['ALPHA1', 'BETA1'])
+  expect(got.cards.find(c => c.task === 'ALPHA1')?.project).toBe('alpha')
+  expect(got.cards.find(c => c.task === 'BETA1')?.project).toBe('beta')
 })
