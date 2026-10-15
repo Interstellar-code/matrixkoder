@@ -120,25 +120,67 @@ def ensure_root_row(home, slug, data, repo):
     return root_row(home, slug)
 
 
-def set_db_path(home, slug, db_path):
-    """--switch: set projects.db_path through mkdb.open_root (the C3 column; the L1 migration
-    comment names mk-migrate as its writer). No other root column is touched."""
+def switch_slugs(home, slug, data):
+    """Every root slug the switch must move: the rows whose data_dir realpath IS this data
+    dir, plus the --slug row (todo 117).
+
+    One data dir can have TWO root rows — the canonical `--slug` row and the derived alias
+    (`p`+sha256 of the data dir) mk-bus/mk-state register on first use, which every lane
+    token and the bus resolve through. Switching only the slug row used to leave the alias
+    row's db_path NULL, so the bus kept writing the OLD store. Rows that record ANOTHER
+    data dir are never returned. A read never creates the root store."""
+    real = os.path.realpath(os.path.abspath(data))
+    out = []
+
+    def add(one):
+        if one and one not in out:
+            out.append(one)
+
+    for row in mkdb.projects(home):
+        recorded = row.get("data_dir")
+        if recorded and os.path.realpath(os.path.expanduser(recorded)) == real:
+            add(row.get("slug"))
+    add(slug)
+    return out
+
+
+def _slug_list(slugs):
+    """One slug or many, deduped in order (the self-test passes a single slug)."""
+    if isinstance(slugs, str):
+        return [slugs] if slugs else []
+    return list(dict.fromkeys(s for s in slugs if s))
+
+
+def set_db_path(home, slugs, db_path):
+    """--switch: set projects.db_path on EVERY row of the data dir through mkdb.open_root
+    (the C3 column; the L1 migration comment names mk-migrate as its writer). No other root
+    column is touched. One transaction, so a row that vanished (rowcount 0) leaves no row
+    half-switched — the whole update is rolled back and the caller sees Fail."""
+    slugs = _slug_list(slugs)
+    if not slugs:
+        raise Fail("no projects row to switch")
     con = mkdb.open_root(home)
     try:
-        cur = con.execute("UPDATE projects SET db_path=?, last_activity=? WHERE slug=?",
-                          (db_path, now_iso(), slug))
+        for one in slugs:
+            cur = con.execute("UPDATE projects SET db_path=?, last_activity=? WHERE slug=?",
+                              (db_path, now_iso(), one))
+            if cur.rowcount != 1:
+                raise Fail(f"no projects row for slug {one!r} to switch")
         con.commit()
-        if cur.rowcount != 1:
-            raise Fail(f"no projects row for slug {slug!r} to switch")
     finally:
         con.close()
 
 
-def clear_db_path(home, slug):
+def clear_db_path(home, slugs):
+    """--rollback: clear db_path on the same set of rows the switch had set."""
+    slugs = _slug_list(slugs)
+    if not slugs:
+        raise Fail("no projects row to roll back")
     con = mkdb.open_root(home)
     try:
-        con.execute("UPDATE projects SET db_path=NULL, last_activity=? WHERE slug=?",
-                    (now_iso(), slug))
+        for one in slugs:
+            con.execute("UPDATE projects SET db_path=NULL, last_activity=? WHERE slug=?",
+                        (now_iso(), one))
         con.commit()
     finally:
         con.close()
@@ -724,10 +766,13 @@ def cmd_switch(args):
     if args.dry_run:
         quiesce(data)
         out = do_copy_verify(home, data, slug, dry_run=True)
-        print(f"switch {slug}: set projects.db_path = {mkpaths.target_project_db(slug, home)}")
+        dest = mkpaths.target_project_db(slug, home)
+        for one in switch_slugs(home, slug, data):
+            print(f"switch {one}: set projects.db_path = {dest}")
         out["command"] = "switch"
         return out
     ensure_root_row(home, slug, data, repo)
+    slugs = switch_slugs(home, slug, data)
     with switch_lock(home):
         quiesce(data)
         out = do_copy_verify(home, data, slug)
@@ -743,8 +788,9 @@ def cmd_switch(args):
         if old_state is None or new_state is None or old_state != new_state:
             _remove_new_copy(home, slug)
             raise Fail("verify under switch lock failed: source and target stores differ", 3)
-        set_db_path(home, slug, dest)
+        set_db_path(home, slugs, dest)
         marker = {"slug": slug, "data_dir": os.path.realpath(data), "db_path": dest,
+                  "slugs": slugs,
                   "old_digest": old_state[1], "old_counts": old_state[0],
                   "new_digest": new_state[1], "new_counts": new_state[0],
                   "switched_at": now_iso()}
@@ -763,8 +809,16 @@ def cmd_rollback(args):
     if not marker:
         raise Fail(f"no switch record at {os.path.join(target_dir(home, slug), SWITCH_MARKER)};"
                    " refusing to guess what to roll back", 3)
+    # Todo 117: the marker names every slug the switch moved. A marker written before that
+    # (scalar `slug` only) falls back to the data-dir match, which resolves the same rows.
+    recorded = marker.get("slugs")
+    slugs = [s for s in recorded if isinstance(s, str)] if isinstance(recorded, list) else []
+    if not slugs:
+        slugs = switch_slugs(home, slug, data)
     if args.dry_run:
         print(f"rollback {slug}: carry {row['db_path']} back to {src_db(data)}, clear db_path")
+        for one in slugs:
+            print(f"rollback {one}: clear projects.db_path")
         return {"ok": True, "command": "rollback", "dry_run": True, "slug": slug,
                 "from": row["db_path"], "to": src_db(data)}
     dest = mkpaths.target_project_db(slug, home)
@@ -787,7 +841,7 @@ def cmd_rollback(args):
         back = state_of(src_db(data))
         if back is None or back != new_state:
             raise Fail("rollback verify failed: the carried-back DB does not match the new DB", 3)
-        clear_db_path(home, slug)
+        clear_db_path(home, slugs)
         _remove_new_copy(home, slug)
     return {"ok": True, "command": "rollback", "slug": slug, "from": dest, "to": src_db(data),
             "counts": new_state[0]}
@@ -1040,6 +1094,38 @@ def _last_json(text):
         except ValueError:
             continue
     return None
+
+
+def alias_slug(data):
+    """The derived root alias mk-bus registers for a data dir: `p` + sha256[0:16] of its
+    realpath (mk-bus.py:356-359). Every lane token and the bus resolve the project through
+    that row, so a switch that skips it leaves the bus on the OLD store (Z7, todo 117)."""
+    return "p" + hashlib.sha256(os.path.realpath(data).encode()).hexdigest()[:16]
+
+
+def _root_rows_set(home, rows):
+    """Insert root rows through the same open_root path _seed uses (no fixture-only writes)."""
+    con = mkdb.open_root(home)
+    try:
+        for slug, data_dir in rows:
+            con.execute(
+                "INSERT OR IGNORE INTO projects(slug, name, repo, data_dir, mode, created,"
+                " last_activity) VALUES (?,?,?,?,?,?,?)",
+                (slug, slug, os.path.dirname(os.path.realpath(data_dir)),
+                 os.path.realpath(data_dir), "home", now_iso(), now_iso()))
+        con.commit()
+    finally:
+        con.close()
+
+
+def _alias_root_row(home, data, repo):
+    """A SECOND root row for the same data dir, exactly as mk-bus registers its alias."""
+    _root_rows_set(home, [(alias_slug(data), data)])
+
+
+def _other_root_row(home, data, repo):
+    """A root row for a DIFFERENT data dir: the set the switch must never touch."""
+    _root_rows_set(home, [("otherproj", data)])
 
 
 def self_test():
@@ -1597,6 +1683,108 @@ def self_test():
         ok("mutation-delete-old")
         _mutation_switch_cmp(home, data, tmp)
         ok("mutation-switch-cmp")
+
+        # 12. Z7 (todo 117): one data dir can have TWO root rows — the canonical --slug row and
+        # the derived alias (`p`+sha256 of the data dir) mk-bus/mk-state register on first use,
+        # which every lane token and the bus resolve through. A `WHERE slug=?` switch left the
+        # alias row's db_path NULL, so the bus kept writing the OLD store after the switch.
+        # Each case FAILS on ee0d2a9 (proof in the report): the alias row stayed NULL.
+        _alias_root_row(home, data, repo)
+        other_data = os.path.join(tmp, "other-repo", ".matrixkoder")
+        os.makedirs(other_data, exist_ok=True)
+        _other_root_row(home, other_data, os.path.join(tmp, "other-repo"))
+        slugs = switch_slugs(home, "fixture", data)
+        _check(slugs[0] == "fixture" and alias_slug(data) in slugs and len(slugs) == 2,
+               f"switch_slugs missed a row of this data dir: {slugs}")
+        ok("switch-slugs-enumerates-the-data-dir")
+
+        # 12a. --dry-run names every row it would change. It writes nothing: db_path stays NULL
+        # and the C2 tree is not created. (A whole-tree hash is not used here: a subprocess read
+        # of the root store leaves SQLite's -shm/-wal beside it, which is not a write of ours.)
+        rc, out, err = _cli(home, ["--dry-run", "--switch", "--slug", "fixture", "--data", data])
+        _check(rc == 0, f"dry-run switch rc={rc} {err[-300:]}")
+        _check("switch fixture: set projects.db_path = " in out,
+               f"the dry run did not name the slug row: {out!r}")
+        _check(f"switch {alias_slug(data)}: set projects.db_path = " in out,
+               f"the dry run did not name the alias row: {out!r}")
+        _check(root_row(home, "fixture")["db_path"] is None
+               and root_row(home, alias_slug(data))["db_path"] is None,
+               "the dry-run switch changed a root row")
+        _check(not os.path.exists(mkpaths.target_project_dir("fixture", home)),
+               "the dry-run switch created the C2 tree")
+        ok("dry-run-switch-names-every-row")
+
+        # 12b. the real switch sets db_path on BOTH rows of this data dir; the third row, whose
+        # data_dir is a DIFFERENT directory, is never touched.
+        rc, out, err = _cli(home, ["--switch", "--slug", "fixture", "--data", data])
+        _check(rc == 0, f"switch rc={rc} {err[-400:]}")
+        _check(root_row(home, "fixture")["db_path"] == mkpaths.target_project_db("fixture", home),
+               "the slug row did not switch")
+        _check(root_row(home, alias_slug(data))["db_path"] == mkpaths.target_project_db("fixture", home),
+               "the alias row did not switch (the bug: the bus keeps the OLD store)")
+        _check(root_row(home, "otherproj")["db_path"] is None,
+               "a row of another data dir was switched")
+        marker = _read_marker(home, "fixture") or {}
+        _check(sorted(marker.get("slugs") or []) == sorted(slugs),
+               f"the marker did not record the switched slugs: {marker.get('slugs')}")
+        ok("switch-sets-db-path-on-every-row")
+
+        # 12c. --rollback clears db_path on the same set, and names it in the dry run.
+        rc, out, err = _cli(home, ["--dry-run", "--rollback", "--slug", "fixture", "--data", data])
+        _check(rc == 0, f"dry-run rollback rc={rc} {err[-300:]}")
+        _check(f"rollback {alias_slug(data)}: clear projects.db_path" in out,
+               f"the rollback dry run did not name the alias row: {out!r}")
+        rc, out, err = _cli(home, ["--rollback", "--slug", "fixture", "--data", data])
+        _check(rc == 0, f"rollback rc={rc} {err[-400:]}")
+        _check(root_row(home, "fixture")["db_path"] is None, "the slug row was not rolled back")
+        _check(root_row(home, alias_slug(data))["db_path"] is None,
+               "the alias row was not rolled back (a rollback would leave the bus on the new store)")
+        _check(root_row(home, "otherproj")["db_path"] is None,
+               "a row of another data dir was rolled back")
+        ok("rollback-clears-every-row")
+
+        # 12d. a marker written before the slugs list (scalar `slug` only) still rolls back every
+        # row of the data dir, through the data-dir match.
+        shutil.rmtree(mkpaths.target_project_dir("fixture", home), ignore_errors=True)
+        clear_db_path(home, "fixture")
+        rc, out, err = _cli(home, ["--switch", "--slug", "fixture", "--data", data])
+        _check(rc == 0, f"the setup switch for the old-marker case failed (rc={rc}) {err[-300:]}")
+        old_marker = _read_marker(home, "fixture") or {}
+        old_marker.pop("slugs", None)
+        _write_marker(home, "fixture", old_marker)
+        rc, out, err = _cli(home, ["--rollback", "--slug", "fixture", "--data", data])
+        _check(rc == 0, f"rollback over an old marker failed (rc={rc}) {err[-300:]}")
+        _check(root_row(home, alias_slug(data))["db_path"] is None,
+               "an old marker left the alias row switched")
+        _check(root_row(home, "otherproj")["db_path"] is None,
+               "an old marker rolled back another data dir")
+        clear_db_path(home, [alias_slug(data), "fixture", "otherproj"])
+        ok("rollback-old-marker-covers-every-row")
+
+        # 12e. Z7 (helper finding, MEDIUM): a --dry-run --rollback over a LIVE switched tree
+        # (every row of the home's data dir already migrated) must change nothing: the same
+        # "dry run writes nothing" invariant case 2 asserts on the fresh layout, asserted on the
+        # switched one — the real layout the live run operated on.
+        z7_repo = os.path.join(tmp, "z7-repo")
+        z7_data = os.path.join(z7_repo, ".matrixkoder")
+        z7_home = os.path.join(tmp, "z7-home")
+        _seed(z7_home, z7_data, z7_repo)
+        z7_alias = "p" + hashlib.sha256(os.path.realpath(z7_data).encode()).hexdigest()[:16]
+        _root_rows_set(z7_home, [(z7_alias, z7_data)])
+        rc, out, err = _cli(z7_home, ["--switch", "--slug", "fixture", "--data", z7_data])
+        _check(rc == 0, f"the 12e setup switch failed (rc={rc}) {err[-300:]}")
+        rc, out, err = _cli(z7_home, ["--dry-run", "--rollback", "--slug", "fixture",
+                                      "--data", z7_data])
+        _check(rc == 0, f"the 12e dry-run rollback failed (rc={rc}) {err[-300:]}")
+        _check(root_row(z7_home, "fixture")["db_path"] ==
+               mkpaths.target_project_db("fixture", z7_home),
+               "the 12e dry-run rollback cleared db_path")
+        _check(root_row(z7_home, z7_alias)["db_path"] ==
+               mkpaths.target_project_db("fixture", z7_home),
+               "the 12e dry-run rollback cleared the alias row")
+        shutil.rmtree(mkpaths.target_project_dir("fixture", z7_home), ignore_errors=True)
+        clear_db_path(z7_home, [z7_alias, "fixture"])
+        ok("dry-run-names-only-what-it-would-change")
 
     finally:
         for k, v in saved.items():
