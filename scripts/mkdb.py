@@ -929,7 +929,8 @@ def _parents_first(tasks):
     return [by_id[t] for t in order]
 
 
-def import_history(home, project, run, *, run_row=None, tasks=(), events=(), artifacts=(), data_dir=None):
+def import_history(home, project, run, *, run_row=None, tasks=(), events=(), artifacts=(), data_dir=None,
+                   sync_root=True):
     """Import one historical run with its original values (D1B). The only history writer.
 
     One BEGIN IMMEDIATE transaction for the whole call; any error rolls it back, so the store is
@@ -939,6 +940,11 @@ def import_history(home, project, run, *, run_row=None, tasks=(), events=(), art
     C3: the plan_summary rows ARE refreshed after the commit, in their own root transaction,
     because an import moves task statuses (and a run row, which live_run reads); a store with
     no plans row writes nothing. Returns counts of rows actually added.
+
+    Z9: `sync_root=False` skips ONLY that root plan_summary refresh — the import itself is
+    identical. Every other caller keeps the default, so behaviour is unchanged for it. mk-state
+    passes it for a throwaway temp data dir on the DEFAULT home (Store._skip_root_projection),
+    which must not leave a plan_summary row in the user's real ~/.matrixkoder.
     """
     con = open_project(home, project, data_dir)
     try:
@@ -1102,7 +1108,8 @@ def import_history(home, project, run, *, run_row=None, tasks=(), events=(), art
         plans = _plan_summary_values(con)
     finally:
         con.close()
-    _write_plan_summaries_root(home, project, plans)
+    if sync_root:
+        _write_plan_summaries_root(home, project, plans)
     return added
 
 
@@ -2011,6 +2018,7 @@ def self_test():
         _import_cycle(home)
         _import_race(home)
         _import_keep_cols(home)
+        _import_sync_root(home)
         _live_writers(home)
         _v1_upgrade(home)
         _lane_slots_v3(home)
@@ -2714,6 +2722,49 @@ def _import_keep_cols(home):
             con.close()
     finally:
         con.close()
+
+
+def _import_sync_root(home):
+    """Z9: `sync_root=False` imports everything and refreshes no root plan_summary; the default
+    call keeps writing them.
+
+    A throwaway temp data dir on the DEFAULT home must leave nothing in the user's real root, and
+    the only root write an import makes is the plan_summary batch, so the caller needs a switch
+    that changes nothing else. The reload case proves the projection is reachable again through
+    the default, so `sync_root=False` is a gate and not a dead parameter.
+    """
+    data = _seed_plan_summary_store(home, "z9sync")
+    _add_plan_summary_tasks(data)
+    run_row, tasks, events, artifacts = _sample()
+    con = open_project(home, data_dir=data)
+    try:
+        _check(con.execute("SELECT COUNT(*) c FROM plans").fetchone()["c"] > 0,
+               "_import_sync_root: no plans row: the case proves nothing")
+    finally:
+        con.close()
+    counts = import_history(home, "z9sync", "hist", run_row=run_row, tasks=tasks, events=events,
+                            artifacts=artifacts, data_dir=data, sync_root=False)
+    _check(counts["tasks"] == 3 and counts["events"] == 5 and counts["artifacts"] == 2,
+           f"_import_sync_root: sync_root=False imported nothing: {counts}")
+    con = open_project(home, data_dir=data)
+    try:
+        n_tasks = con.execute("SELECT COUNT(*) c FROM tasks WHERE run='hist'").fetchone()["c"]
+        n_ev = con.execute("SELECT COUNT(*) c FROM events WHERE run='hist'").fetchone()["c"]
+    finally:
+        con.close()
+    _check(n_tasks == 3 and n_ev == 5, "_import_sync_root: the store lost the imported rows")
+    rows = [r for r in root_rows(home) if r["project"] == "z9sync"]
+    _check(rows == [], f"_import_sync_root: sync_root=False still wrote plan_summary rows {rows}")
+    # the DEFAULT is unchanged: the same import shape writes the rows back
+    again = import_history(home, "z9sync", "hist2", run_row=dict(run_row, id="hist2"), tasks=tasks,
+                           events=events, artifacts=artifacts, data_dir=data)
+    _check(again["runs"] == 1 and again["tasks"] == 3, f"_import_sync_root: second import {again}")
+    rows = [r for r in root_rows(home) if r["project"] == "z9sync"]
+    _check(len(rows) >= 1, f"_import_sync_root: the default import wrote no plan_summary row {rows}")
+    for plan in ("alpha", "beta"):
+        got = json.loads(_stored_plan(home, "z9sync", plan)["counts_json"])
+        want = _plan_recount(home, data, plan)
+        _check(got == want, f"_import_sync_root: {plan} counts {got} != project DB {want}")
 
 
 def _import_atomic(home):
