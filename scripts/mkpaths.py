@@ -31,6 +31,7 @@ import os
 import re
 import sqlite3
 import sys
+import tempfile
 
 DEFAULT_HOME = "~/.matrixkoder"
 ROOT_DB_NAME = "mk.db"
@@ -593,20 +594,34 @@ def _take_over(new_path, old_path):
         return new_path
     if not blob:
         return new_path
-    tmp = new_path + ".take-over"
+    dst_dir = os.path.dirname(new_path)
+    fd = None
+    tmp = None
     try:
-        os.makedirs(os.path.dirname(new_path), exist_ok=True)
-        with open(tmp, "wb") as f:
+        os.makedirs(dst_dir, exist_ok=True)
+        # A UNIQUE temp name per copier (review HIGH 1): the old fixed
+        # `new_path + ".take-over"` was shared by every copier, so one racer's
+        # os.replace deleted another's temp mid-write — installing a truncated
+        # 0-byte file, or raising FileNotFoundError so callers diverged (one
+        # answered new_path, another old_path). mkstemp opens 0600; the chmod
+        # only makes that explicit.
+        fd, tmp = tempfile.mkstemp(dir=dst_dir, prefix=".take-over-")
+        with os.fdopen(fd, "wb") as f:
+            fd = None  # closed by fdopen on every path out of the with
             f.write(blob)
             f.flush()
             os.fsync(f.fileno())
         os.chmod(tmp, 0o600)
         os.replace(tmp, new_path)
+        tmp = None  # installed: nothing to clean up
     except OSError:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        if fd is not None:
+            os.close(fd)
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
         return old_path
     return new_path
 
@@ -662,6 +677,23 @@ def bus_tokens(data):
 
 def bus_tokens_lock(data):
     return _bus_path(data, "bus-tokens.lock")
+
+
+def legacy_bus_json(data):
+    """The pre-L6.1 bus.json, at the legacy bus dir: its live pid proves an OLD bus is
+    still running (R2 HIGH 2) — the one signal that tokens minted at the new path must
+    ALSO land in the legacy bus-tokens.json the old bus still validates against."""
+    return os.path.join(_legacy_bus_dir(data), "bus.json")
+
+
+def legacy_bus_tokens(data):
+    """The pre-L6.1 bus-tokens.json an adopted old bus reads its tokens from."""
+    return os.path.join(_legacy_bus_dir(data), "bus-tokens.json")
+
+
+def legacy_bus_tokens_lock(data):
+    """The flock beside legacy_bus_tokens — the old bus's writers take this one."""
+    return os.path.join(_legacy_bus_dir(data), "bus-tokens.lock")
 
 
 # ---- home-level files -----------------------------------------------------------------------
@@ -1152,6 +1184,60 @@ def self_test():
         _check(_read_json(lane_token(lane)) == {"token": "pinned"}, lane_token(lane))
         os.environ.pop("MK_BUS_DIR")
 
+    def t_take_over_race():
+        """C6 (review HIGH 1): the read-once copy behind every bus / lane-token /
+        watch-cursor getter must be race-safe. Several processes take the SAME file over
+        at once — two lanes arming against one bus, an orchestrator watch beside a bus
+        command — and the pre-fix FIXED scratch name let one racer's os.replace delete
+        another's temp mid-write: either a truncated file was installed at the new path,
+        or one copier answered old_path while the rest answered new_path. The scratch copy
+        is therefore per copier. Twelve threads per round on a fresh target, thirty
+        rounds: no exception, one identical answer, the old bytes intact, nothing left
+        behind. The rule reads no env, so this case needs no home fixture."""
+        import threading
+
+        blob = b'{"k": "' + b"x" * 200000 + b'"}'
+        fails, answers = [], []
+        base = os.path.join(root, "take-over-race")
+        bus_sub = os.path.join(base, "bus")
+        old_path = os.path.join(base, "bus-tokens.json")
+        new_path = os.path.join(bus_sub, "bus-tokens.json")
+
+        def copier(i):
+            barrier.wait(timeout=30)
+            try:
+                answers.append(_take_over(new_path, old_path))
+            except OSError as e:
+                fails.append(type(e).__name__)
+
+        try:
+            os.makedirs(base, exist_ok=True)
+            with open(old_path, "wb") as f:
+                f.write(blob)
+            for rnd in range(30):
+                shutil.rmtree(bus_sub, ignore_errors=True)
+                fails.clear()
+                answers.clear()
+                barrier = threading.Barrier(12)
+                threads = [threading.Thread(target=copier, args=(i,)) for i in range(12)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join(60)
+                _check(not fails, "round %d: copiers raised %s" % (rnd, sorted(set(fails))))
+                _check(len(answers) == 12 and all(a == new_path for a in answers),
+                       "round %d: every copier must answer the new path, got %s"
+                       % (rnd, sorted({str(a) for a in answers})))
+                with open(new_path, "rb") as f:
+                    _check(f.read() == blob, "round %d: the new file must hold the old bytes" % rnd)
+                _check(oct(os.stat(new_path).st_mode & 0o777) == "0o600",
+                       "round %d: mode %s" % (rnd, oct(os.stat(new_path).st_mode & 0o777)))
+                _check(sorted(os.listdir(bus_sub)) == ["bus-tokens.json"],
+                       "round %d: a scratch copy was left behind: %s"
+                       % (rnd, os.listdir(bus_sub)))
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
     def t_migrated(tmp_home):
         """C1/C3 (L3): a migrated project (root db_path set by L2's mk-migrate --switch) resolves
         every path to the C2 target; a pre-migration project beside it keeps today's paths, and
@@ -1259,6 +1345,7 @@ def self_test():
         t_folders(tmp_home, repo)
         t_project_db(tmp_home, repo)
         t_bus(tmp_home, repo)
+        t_take_over_race()
         t_target(tmp_home)
         t_migrated(tmp_home)
     except Fail as e:

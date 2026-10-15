@@ -2736,6 +2736,38 @@ def cmd_heartbeat(args):
     return res
 
 
+def _mirror_legacy_tokens(data_dir, entry):
+    """R2 HIGH 2: an adopted pre-L6.1 bus still validates tokens against the LEGACY
+    <home>/bus-tokens.json, so a token minted only under bus/ would 401 on it until the
+    bus restarts. When the legacy bus is alive (legacy bus.json, live pid) the same entry
+    is merged into the legacy file under the legacy lock, with the write pattern the old
+    bus's own writers use — so the running bus accepts the new token at once. When no
+    legacy bus is alive nothing is written at any legacy path (no legacy file is ever
+    created by L6.1 code). Returns True when the mirror happened."""
+    legacy_json = _paths("legacy_bus_json", data_dir)
+    if not os.path.exists(legacy_json):
+        return False
+    bdata = read_json(legacy_json)
+    pid = (bdata or {}).get("pid")
+    if not is_pid_alive(pid):
+        return False
+    lock_path = _paths("legacy_bus_tokens_lock", data_dir)
+    tokens_path = _paths("legacy_bus_tokens", data_dir)
+    lfd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    os.fchmod(lfd, 0o600)
+    fcntl.flock(lfd, fcntl.LOCK_EX)
+    try:
+        tokens = read_json(tokens_path, default={})
+        if not isinstance(tokens, dict):
+            tokens = {}
+        tokens[entry["token"]] = entry
+        write_json(tokens_path, tokens, mode=0o600)
+    finally:
+        fcntl.flock(lfd, fcntl.LOCK_UN)
+        os.close(lfd)
+    return True
+
+
 def cmd_token(args):
     data_dir = resolve_data(getattr(args, "data", None))
     # Same realpath lane_token_path hashes, so revoke matches a symlinked lane.
@@ -2793,24 +2825,28 @@ def cmd_token(args):
     bus_dir = bus_location(data_dir)
     lock_path = _paths("bus_tokens_lock", data_dir)
     tokens_path = _paths("bus_tokens", data_dir)
+    entry = {
+        "project": project_slug_for(data_dir) if store_mode(data_dir) else None,
+        "token": tok,
+        "role": "lane",
+        "run": run_val,
+        "task": args.task,
+        "lane": lane_dir,
+        "created_at": now_iso()
+    }
     lfd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     os.fchmod(lfd, 0o600)
     fcntl.flock(lfd, fcntl.LOCK_EX)
     try:
         tokens = read_json(tokens_path, default={})
-        tokens[tok] = {
-            "project": project_slug_for(data_dir) if store_mode(data_dir) else None,
-            "token": tok,
-            "role": "lane",
-            "run": run_val,
-            "task": args.task,
-            "lane": lane_dir,
-            "created_at": now_iso()
-        }
+        tokens[tok] = entry
         write_json(tokens_path, tokens, mode=0o600)
     finally:
         fcntl.flock(lfd, fcntl.LOCK_UN)
         os.close(lfd)
+    # While a pre-L6.1 bus is still alive it reads the legacy tokens file, so the mint
+    # lands in both places (R2 HIGH 2); with no old bus alive only the new path is written.
+    _mirror_legacy_tokens(data_dir, entry)
 
     res = {"ok": True, "token": tok, "lane": lane_dir, "task": args.task, "run": run_val}
     out(res)
@@ -3774,6 +3810,105 @@ def _layout_self_test():
                 if head.isdigit():
                     with contextlib.suppress(OSError):
                         os.kill(int(head), signal.SIGKILL)
+        shutil.rmtree(tmp, ignore_errors=True)
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def _legacy_bus_token_self_test():
+    """R2 (review HIGH 2): an ADOPTED pre-L6.1 bus still validates tokens against the
+    LEGACY <home>/bus-tokens.json, so a token minted only under bus/ answers 401 on that
+    bus until it restarts.
+
+    One temp $HOME with every MK pin unset (the production resolution) and a store-mode
+    project. A legacy bus is alive — its pid sits in the pre-L6.1 bus.json at the home
+    root — and `token` must then write the mint BOTH at the new path and into the legacy
+    file under the legacy lock, so the running old bus accepts it at once. With NO legacy
+    bus alive the mint must create no legacy path at all: no bus.json, no bus-tokens.json,
+    no lock, no bus-lanes/."""
+    import shutil
+
+    mod = _mkdb_helpers_ready()
+    if mod is None:
+        print("legacy-bus-token self-test skipped: mkdb live writers not present")
+        return
+    tmp = tempfile.mkdtemp(prefix="mk-bus-legacy-token-")
+    pids = []
+    saved = {k: os.environ.get(k) for k in
+             ("HOME", "MK_HOME", "MATRIXKODER_HOME", "MATRIXKODER_DATA", "MK_BUS_DIR",
+              "MK_BUS_TOKEN_FILE", "MK_SELFTEST")}
+
+    def cli(args, home):
+        p = subprocess.run([sys.executable, os.path.abspath(__file__)] + args,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                           env=dict(os.environ, HOME=home))
+        lines = [x.strip() for x in p.stdout.strip().splitlines() if x.strip()]
+        last = json.loads(lines[-1]) if lines else {}
+        if p.returncode != 0:
+            raise AssertionError(f"CLI {args} rc={p.returncode}: {p.stderr.strip()[-300:]}")
+        return last
+
+    def scrub(home):
+        for key in ("MK_HOME", "MATRIXKODER_HOME", "MATRIXKODER_DATA", "MK_BUS_DIR",
+                    "MK_BUS_TOKEN_FILE"):
+            os.environ.pop(key, None)   # the production path: no pin resolves the home
+        os.environ["HOME"] = home
+        os.environ["MK_SELFTEST"] = "1"  # mkdb's C16 guard: writes stay in the temp tree
+
+    def seed(home, name):
+        """A store-mode project: mkdb creates the project store the mint resolves to."""
+        mkh = os.path.join(home, ".matrixkoder")
+        os.makedirs(mkh, exist_ok=True)
+        data = os.path.join(tmp, name, "data")
+        os.makedirs(data, exist_ok=True)
+        mod.open_project(mkh, "matrixkoder", data_dir=data).close()
+        return mkh, data
+
+    try:
+        # ---- a legacy bus is ALIVE: its pid sits in the pre-L6.1 bus.json --------------
+        home = os.path.join(tmp, "home")
+        os.makedirs(home, exist_ok=True)
+        scrub(home)
+        mkh, data = seed(home, "r1")
+        legacy_bus_json = os.path.join(mkh, "bus.json")           # pre-L6.1: the home root
+        legacy_bus_tokens = os.path.join(mkh, "bus-tokens.json")  # pre-L6.1: the home root
+        proc = subprocess.Popen(["sleep", "120"])
+        pids.append(proc.pid)
+        write_json(legacy_bus_json, {"pid": proc.pid, "port": 1, "token": "t"}, mode=0o600)
+        write_json(legacy_bus_tokens, {}, mode=0o600)
+
+        lane = os.path.join(tmp, "lane")
+        os.makedirs(lane, exist_ok=True)
+        res = cli(["token", "--data", data, "--lane", lane, "--task", "T9", "--run", "r1"], home)
+        assert res.get("ok"), res
+        new_tokens = read_json(_paths("bus_tokens", data), {}) or {}
+        assert res["token"] in new_tokens, "the mint is not in <home>/bus/bus-tokens.json"
+        legacy = read_json(legacy_bus_tokens, {}) or {}
+        assert res["token"] in legacy, \
+            "HIGH 2: the minted token is missing from the legacy bus-tokens.json the " \
+            "adopted pre-L6.1 bus still validates against"
+
+        # ---- no legacy bus alive: NO legacy file may appear -----------------------------
+        home2 = os.path.join(tmp, "home2")
+        os.makedirs(home2, exist_ok=True)
+        scrub(home2)
+        mkh2, data2 = seed(home2, "r2")
+        lane2 = os.path.join(tmp, "lane2")
+        os.makedirs(lane2, exist_ok=True)
+        res2 = cli(["token", "--data", data2, "--lane", lane2, "--task", "T9",
+                    "--run", "r1"], home2)
+        assert res2.get("ok"), res2
+        for name in ("bus.json", "bus-tokens.json", "bus-tokens.lock", "bus-lanes"):
+            assert not os.path.exists(os.path.join(mkh2, name)), \
+                f"token created the legacy {os.path.join(mkh2, name)} with no old bus alive"
+        new2 = read_json(_paths("bus_tokens", data2), {}) or {}
+        assert res2["token"] in new2, "the mint is not in <home2>/bus/bus-tokens.json"
+    finally:
+        for pid in pids:
+            stop_process(pid)
         shutil.rmtree(tmp, ignore_errors=True)
         for k, v in saved.items():
             if v is None:
@@ -7058,6 +7193,7 @@ def self_test():
 
     _store_self_test()
     _layout_self_test()
+    _legacy_bus_token_self_test()
     print("pass mk-bus.py: mk-bus self-test ok")
     print(json.dumps({"ok": True, "tests": len(checks), "passed": len(checks)}))
     return 0
