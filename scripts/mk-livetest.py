@@ -385,13 +385,14 @@ def row_c4_columns(ctx):
         con.close()
     want = [("planned", "Backlog", 0), ("building", "Building", 0), ("review", "Review", 0),
             ("done", "Done", 0), ("blocked", "Done", 1)]
-    # planned is the insert status; transition the rest, syncing the root so cards can see it.
+    # planned is the insert status; transition the rest. The root `cards` copy and the
+    # `cards` subcommand are gone (L7.3), so a reader derives the column from the stored
+    # status and prev_status instead of reading a card.
     for status, col, attention in want[1:]:
         mkdb.transition(ctx["home"], ctx["slug"], ctx["run"], "col-" + ctx["run"], status, sync_root=True, data_dir=ctx["data"])
-        got = mkdb.cards(ctx["home"], ctx["slug"])
-        card = next((c for c in got if c["task"] == "col-" + ctx["run"]), None)
-        if not card or card["col"] != col or card["attention"] != attention:
-            raise Fail(f"{status}: card {card}")
+        got = _task_view(ctx, "col-" + ctx["run"])
+        if got["status"] != status or got["col"] != col or got["attention"] != attention:
+            raise Fail(f"{status}: {got}")
 
 
 def row_c10(ctx):
@@ -494,22 +495,32 @@ def row_c1_projects(ctx):
         raise Fail("locks is not a directory")
 
 
-def _card_col(ctx, task):
-    """The kanban column from the real `mkdb.py cards --json`, not a stored status."""
-    out = _py(os.path.join(HERE, "mkdb.py"), "--home", ctx["home"], "--project", ctx["slug"],
-              "cards", "--json")
-    card = next((c for c in out.get("cards") or [] if c.get("task") == task and c.get("run") == ctx["run"]), None)
-    if not card:
-        raise Fail(f"cards --json has no card for {task}: {out}")
-    return card.get("col"), card.get("status")
+def _task_view(ctx, task):
+    """The kanban column and attention flag a reader derives for one task.
+
+    L7.3 dropped the root `cards` copy and the `cards` subcommand, so this reads the project
+    store's own row and asks mkdb.column_of the same question the card answered: the column is
+    a pure function of the stored status and prev_status, never a copied field.
+    """
+    con = mkdb.open_project(ctx["home"], data_dir=ctx["data"])
+    try:
+        row = con.execute("SELECT status, prev_status FROM tasks WHERE run=? AND id=?",
+                          (ctx["run"], task)).fetchone()
+    finally:
+        con.close()
+    if row is None:
+        raise Fail(f"no task row for {task} in run {ctx['run']}")
+    col, attention = mkdb.column_of(row["status"], row["prev_status"])
+    return {"status": row["status"], "col": col, "attention": attention}
 
 
 def row_c3_ready(ctx):
-    """C3/C4: before the dep is done the card is Backlog; after it is Ready.
+    """C3/C4: before the dep is done the task shows Backlog; after it is Ready.
 
-    `col` is what `cards --json` returns. Two siblings with no dep between them are both
-    startable (both may be building). The production status writer is mkdb.transition;
-    mk-state.py store mode calls that same function.
+    The column is derived from the project store's own row (L7.3 dropped the root cards).
+    Two siblings with no dep between them are both startable (both may be building). The
+    production status writer is mkdb.transition; mk-state.py store mode calls that same
+    function.
     """
     ctx = _need(ctx)
     con = mkdb.open_project(ctx["home"], data_dir=ctx["data"])
@@ -520,67 +531,145 @@ def row_c3_ready(ctx):
         mkdb.add_task(con, ctx["run"], "sib-2", "task", title="s2")
     finally:
         con.close()
-    # Cards are the root copy. Sync so cards --json can see them before the dep is done.
     mkdb.transition(ctx["home"], ctx["slug"], ctx["run"], "rdy-b", "planned",
                     sync_root=True, data_dir=ctx["data"])
-    before, before_status = _card_col(ctx, "rdy-b")
-    if before != "Backlog":
-        raise Fail(f"rdy-b col is {before!r} (status {before_status}) before the dep is done, not Backlog")
+    before = _task_view(ctx, "rdy-b")
+    if before["col"] != "Backlog":
+        raise Fail(f"rdy-b col is {before['col']!r} before the dep is done, not Backlog")
     mkdb.transition(ctx["home"], ctx["slug"], ctx["run"], "rdy-a", "done",
                     sync_root=True, data_dir=ctx["data"])
-    after, after_status = _card_col(ctx, "rdy-b")
-    if after != "Ready":
-        raise Fail(f"rdy-b col is {after!r} (status {after_status}) after rdy-a is done, not Ready")
+    after = _task_view(ctx, "rdy-b")
+    if after["col"] != "Ready" or after["status"] != "ready":
+        raise Fail(f"rdy-b is {after} after rdy-a is done, not Ready")
     for sib in ("sib-1", "sib-2"):
         mkdb.transition(ctx["home"], ctx["slug"], ctx["run"], sib, "building",
                         sync_root=True, data_dir=ctx["data"])
-    cols = [_card_col(ctx, sib)[0] for sib in ("sib-1", "sib-2")]
+    cols = [_task_view(ctx, sib)["col"] for sib in ("sib-1", "sib-2")]
     if cols != ["Building", "Building"]:
         raise Fail(f"siblings not both startable: {cols}")
+    # The run document is what a pane reads. It publishes `ready` the way mk-state's load_store
+    # does: file_status plus ready=True, not the raw column.
+    snap = _py(os.path.join(HERE, "mkdb.py"), "--home", ctx["home"], "--project", ctx["slug"],
+               "run-snapshot", "--run", ctx["run"], "--json")
+    published = {t["id"]: t for t in (snap.get("run") or {}).get("tasks") or []}
+    for task, status, ready in (("rdy-b", "planned", True), ("sib-1", "building", False),
+                                ("sib-2", "building", False)):
+        got = published.get(task, {})
+        if got.get("status") != status or bool(got.get("ready")) is not ready:
+            raise Fail(f"run-snapshot publishes {got} for {task}, store says {status}/ready={ready}")
+
+
+def _plan_project(ctx):
+    """A scratch project of this row's own, for the rows that need a plans row.
+
+    The root plan_summary only fires for a store that holds a plans row, and mk-bus's
+    StoreAdapter passes its data dir as mkdb's `home` (mk-bus.py:223): on a store WITH a plans
+    row the plan_summary write then opens the project store as a root and refuses the v5 schema
+    (a mk-bus bug, its owner's file). Keeping these rows off ctx["data"] leaves the bus rows on a
+    plan-free store, where they passed before, and gives the plan rows their own project.
+    """
+    slug = "ltplan"
+    data = os.path.join(ctx["home"], "projects", slug)
+    if not os.path.isfile(os.path.join(data, "mk.db")):
+        mkdb.open_project(ctx["home"], slug).close()
+        root = mkdb.open_root(ctx["home"])
+        try:
+            root.execute(
+                "INSERT OR IGNORE INTO projects(slug, name, repo, data_dir, mode, created)"
+                " VALUES (?,?,?,?,?,?)",
+                (slug, slug, os.path.realpath(ctx["repo"]), os.path.abspath(data), "home", "lt"))
+            root.commit()
+        finally:
+            root.close()
+    return slug, data
+
+def _plan_root_row(home, project, plan):
+    """The root plan_summary row of one plan, or None."""
+    root = mkdb.open_root(home)
+    try:
+        row = root.execute("SELECT project, plan, title, status, counts_json, live_run"
+                           " FROM plan_summary WHERE project=? AND plan=?",
+                           (project, plan)).fetchone()
+        return dict(row) if row else None
+    finally:
+        root.close()
 
 
 def row_c5_sync(ctx):
-    """A transition with sync writes the root card. A later one without sync is the crash
-    between the two writes; mkdb.catch_up (what mk-state.py sync calls) replays from
-    sync.last_change_no. Only the card columns cross."""
+    """C5: the root projection is written after the project commit, so a kill in between leaves
+    it stale; mkdb.catch_up (what mk-state.py sync calls) heals it against the project store.
+
+    L7.3 dropped the root cards and the sync watermark, so the projection that can still lag is
+    the C3 plan_summary batch. MKDB_FAIL_BEFORE_ROOT is mkdb's own crash hook for exactly that
+    window, so the row drives the real code path instead of poking the root table by hand.
+    """
     ctx = _need(ctx)
-    con = mkdb.open_project(ctx["home"], data_dir=ctx["data"])
+    slug, data = _plan_project(ctx)
+    plan = "c5-" + secrets.token_hex(3)
+    run = "r-" + plan
+    con = mkdb.open_project(ctx["home"], data_dir=data)
     try:
-        mkdb.add_task(con, ctx["run"], "sync-t", "task", title="sync me")
+        mkdb._begin(con)
+        con.execute("INSERT INTO plans(id, version, title, header_json, status, created)"
+                    " VALUES (?,?,?,?,?,?)",
+                    (plan, 1, "Sync plan", json.dumps({"plan": plan, "status": "running"}),
+                     "running", "2026-01-01T00:00:00+00:00"))
+        con.execute("INSERT INTO runs(id, plan, status, started) VALUES (?,?,?,?)",
+                    (run, plan, "active", "2026-01-01T00:00:00+00:00"))
+        con.execute("COMMIT")
+        # A phase row plus a child task: the C3 counts cover tasks, not phase-level rows.
+        mkdb.add_task(con, run, "sync-phase", "phase", title="phase")
+        mkdb.add_task(con, run, "sync-t", "task", title="sync me", parent="sync-phase")
     finally:
         con.close()
-    mkdb.transition(ctx["home"], ctx["slug"], ctx["run"], "sync-t", "building",
-                    sync_root=True, data_dir=ctx["data"])
-    mkdb.transition(ctx["home"], ctx["slug"], ctx["run"], "sync-t", "review",
-                    sync_root=False, data_dir=ctx["data"])
+    # The happy path: the root projection follows the committed status.
+    mkdb.transition(ctx["home"], slug, run, "sync-t", "building",
+                    sync_root=True, data_dir=data)
+    live = _plan_root_row(ctx["home"], slug, plan)
+    if not live or json.loads(live["counts_json"] or "{}") != {"building": 1}:
+        raise Fail(f"root plan_summary did not follow the transition: {live}")
+    # The crash: the project change is durable, the root write never lands.
+    os.environ["MKDB_FAIL_BEFORE_ROOT"] = "1"
+    try:
+        try:
+            mkdb.transition(ctx["home"], slug, run, "sync-t", "review",
+                            sync_root=True, data_dir=data)
+        except mkdb.Fail:
+            pass
+        else:
+            raise Fail("the injected root failure did not fire")
+    finally:
+        os.environ.pop("MKDB_FAIL_BEFORE_ROOT", None)
+    stale = _plan_root_row(ctx["home"], slug, plan)
+    if stale != live:
+        raise Fail(f"the failed root write moved plan_summary: {stale} != {live}")
+    healed = mkdb.catch_up(ctx["home"], slug, data_dir=data)
+    if healed < 1:
+        raise Fail(f"catch_up healed nothing: {healed}")
+    after = _plan_root_row(ctx["home"], slug, plan)
+    if json.loads(after["counts_json"] or "{}") != {"review": 1}:
+        raise Fail(f"plan_summary did not catch up: {after}")
+    if after["live_run"] != run or after["title"] != "Sync plan":
+        raise Fail(f"plan_summary linkage wrong after catch up: {after}")
+    if mkdb.catch_up(ctx["home"], slug, data_dir=data) != 0:
+        raise Fail("catch_up over a healed store rewrote plan_summary")
+    # C3: the projection is numbers and linkage only. No card columns crossed, and the dropped
+    # tables gained nothing.
     root = mkdb.open_root(ctx["home"])
     try:
-        stale = root.execute("SELECT status FROM cards WHERE project=? AND run=? AND task=?",
-                             (ctx["slug"], ctx["run"], "sync-t")).fetchone()
+        cols = {r[1] for r in root.execute("PRAGMA table_info(plan_summary)")}
+        counts = {t: root.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"]
+                  for t in ("cards", "project_summary", "sync")}
     finally:
         root.close()
-    if not stale or stale["status"] != "building":
-        raise Fail(f"root card was not left behind the project: {dict(stale) if stale else None}")
-    # mk-state.py sync is the file-mode command; on a store it calls mkdb.catch_up.
-    copied = mkdb.catch_up(ctx["home"], ctx["slug"], data_dir=ctx["data"])
-    if copied < 1:
-        raise Fail(f"sync copied nothing: {copied}")
-    root = mkdb.open_root(ctx["home"])
-    try:
-        card = root.execute(
-            "SELECT status, title, change_no FROM cards WHERE project=? AND run=? AND task=?",
-            (ctx["slug"], ctx["run"], "sync-t")).fetchone()
-        seen = root.execute("SELECT last_change_no FROM sync WHERE project=?", (ctx["slug"],)).fetchone()
-        cols = {r[1] for r in root.execute("PRAGMA table_info(cards)")}
-    finally:
-        root.close()
-    if not card or card["status"] != "review" or card["title"] != "sync me":
-        raise Fail(f"root card did not catch up: {dict(card) if card else None}")
-    if not seen or seen["last_change_no"] < card["change_no"]:
-        raise Fail("sync.last_change_no did not catch the card")
-    leaked = cols & {"deps", "events", "note"}
+    # C3: the projection is one row per plan. A task-shaped column crossing means the old card
+    # write is back; the dropped root tables must have gained nothing.
+    leaked = cols & {"task", "parent", "col", "attention", "deps", "events", "note", "lane",
+                     "round", "verdict", "change_no"}
     if leaked:
-        raise Fail(f"non-C1 fields on the root card: {leaked}")
+        raise Fail(f"non-C3 fields on plan_summary: {leaked}")
+    if any(counts.values()):
+        raise Fail(f"a dropped root table gained a row: {counts}")
 
 
 def row_c8_catalog(ctx):
@@ -927,49 +1016,68 @@ def _restore_run(ctx):
         ctx["run"] = prev
 
 def row_c1_summary(ctx):
-    """C1: after transitions, project_summary and sync match the project store."""
+    """C1: after transitions, the root plan_summary row matches the project store.
+
+    L7.3 dropped the root project_summary (one row per project) and the sync watermark; the C3
+    projection that carries those numbers now is one plan_summary row per plan. The counts come
+    from the project store, counted here the way plans() counts them, and the same numbers must
+    come back through the public `overview --json` reader.
+    """
     ctx = _own_run(_need(ctx), "sum")
-    con = mkdb.open_project(ctx["home"], data_dir=ctx["data"])
+    slug, data = _plan_project(ctx)
+    plan = "c1-" + secrets.token_hex(3)
+    con = mkdb.open_project(ctx["home"], data_dir=data)
     try:
         mkdb._begin(con)
-        con.execute("INSERT INTO runs(id, status) VALUES (?, ?)", (ctx["run"], "active"))
+        con.execute("INSERT INTO plans(id, version, title, header_json, status, created)"
+                    " VALUES (?,?,?,?,?,?)",
+                    (plan, 1, "Summary plan", json.dumps({"plan": plan, "status": "running"}),
+                     "running", "2026-01-01T00:00:00+00:00"))
+        con.execute("INSERT INTO runs(id, plan, status, started) VALUES (?,?,?,?)",
+                    (ctx["run"], plan, "active", "2026-01-01T00:00:00+00:00"))
         con.execute("COMMIT")
-        mkdb.add_task(con, ctx["run"], "sum-a", "task", title="a")
-        mkdb.add_task(con, ctx["run"], "sum-b", "task", title="b")
+        mkdb.add_task(con, ctx["run"], "sum-phase", "phase", title="phase")
+        mkdb.add_task(con, ctx["run"], "sum-a", "task", title="a", parent="sum-phase")
+        mkdb.add_task(con, ctx["run"], "sum-b", "task", title="b", parent="sum-phase")
     finally:
         con.close()
-    mkdb.transition(ctx["home"], ctx["slug"], ctx["run"], "sum-a", "building",
-                    sync_root=True, data_dir=ctx["data"])
-    mkdb.transition(ctx["home"], ctx["slug"], ctx["run"], "sum-b", "blocked",
-                    sync_root=True, data_dir=ctx["data"])
-    proj = mkdb.open_project(ctx["home"], data_dir=ctx["data"])
+    mkdb.transition(ctx["home"], slug, ctx["run"], "sum-a", "building",
+                    sync_root=True, data_dir=data)
+    mkdb.transition(ctx["home"], slug, ctx["run"], "sum-b", "blocked",
+                    sync_root=True, data_dir=data)
+    # The store's own numbers, counted over the run's tasks with the phase row excluded.
+    proj = mkdb.open_project(ctx["home"], data_dir=data)
     try:
-        active = proj.execute("SELECT COUNT(*) c FROM runs WHERE status='active'").fetchone()["c"]
-        # Per project, not per run: project_summary is one row per project (plan C1).
-        by_status = {}
-        for row in proj.execute("SELECT status, COUNT(*) c FROM tasks GROUP BY status"):
-            by_status[row["status"]] = row["c"]
-        attention = proj.execute(
-            "SELECT COUNT(*) c FROM tasks WHERE status IN ('blocked','stalled','quota','provider')"
-            ).fetchone()["c"]
-        last = proj.execute("SELECT MAX(change_no) m FROM change_log WHERE run=?",
-                            (ctx["run"],)).fetchone()["m"]
+        rows = proj.execute("SELECT id, parent, status FROM tasks WHERE run=? ORDER BY rowid",
+                            (ctx["run"],)).fetchall()
     finally:
         proj.close()
+    ids = {r["id"] for r in rows}
+    by_status = {}
+    for r in rows:
+        if r["parent"] and r["parent"] in ids:  # a root row is the phase, not a task
+            by_status[r["status"]] = by_status.get(r["status"], 0) + 1
+    summary = _plan_root_row(ctx["home"], slug, plan)
+    if summary is None:
+        raise Fail("plan_summary has no row for the plan after transitions")
+    if json.loads(summary["counts_json"] or "{}") != by_status:
+        raise Fail(f"plan_summary {summary} != store by_status={by_status}")
+    if summary["live_run"] != ctx["run"] or summary["title"] != "Summary plan":
+        raise Fail(f"plan_summary linkage wrong: {summary}")
+    # The same numbers through the public reader, and the dropped tables stay empty.
+    out = _py(os.path.join(HERE, "mkdb.py"), "--home", ctx["home"], "overview", "--json")
+    row = next((p for p in out.get("plans") or []
+                if p.get("project") == slug and p.get("plan") == plan), None)
+    if row is None or row.get("counts") != by_status or row.get("live_run") != ctx["run"]:
+        raise Fail(f"overview --json {row} != store by_status={by_status}")
     root = mkdb.open_root(ctx["home"])
     try:
-        summary = root.execute("SELECT * FROM project_summary WHERE project=?", (ctx["slug"],)).fetchone()
-        sync = root.execute("SELECT last_change_no FROM sync WHERE project=?", (ctx["slug"],)).fetchone()
+        leftovers = {t: root.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"]
+                     for t in ("cards", "project_summary", "sync")}
     finally:
         root.close()
-    if summary is None:
-        raise Fail("project_summary has no row for the project after transitions")
-    got = json.loads(summary["by_status_json"] or "{}")
-    if summary["active_runs"] != active or got != by_status or summary["attention"] != attention:
-        raise Fail(f"project_summary {dict(summary)} != store "
-                   f"active={active} by_status={by_status} attention={attention}")
-    if not sync or sync["last_change_no"] != last:
-        raise Fail(f"sync.last_change_no {dict(sync) if sync else None} != change_log {last}")
+    if any(leftovers.values()):
+        raise Fail(f"a dropped root table gained a row: {leftovers}")
 
 
 def row_c6_lifecycle(ctx):
