@@ -140,7 +140,11 @@ DEP_GATED = ("dispatched", "building")
 SIDE = ("blocked", "provider", "quota", "stalled")  # roll-up precedence: the first present wins
 
 # The project store is opt-in. With the project store absent, nothing below runs.
-STORE_PROJECT = "matrixkoder"  # slug only; the db is the project folder's mk.db (L3B)
+# Z3: the root projection's slug is the project's OWN slug, resolved from the data dir through
+# the root linkage (mkpaths.project_slug_of). This constant is only the fixture/fallback slug a
+# self-test uses when a temp data dir has no root row; production never relies on it.
+STORE_PROJECT_FALLBACK = "matrixkoder"
+_DERIVED_SLUG = re.compile(r"^p[0-9a-f]{16}$")  # mk-bus/mk-state's own derivation (no root row yet)
 STORE_RUN_DOC = "run-doc"      # artifact kind holding the run.json document (legacy fallback)
 VIEW_CRASH = "MK_VIEW_CRASH"   # test seam: raise after the store commit, before the view rewrite
 ROOT_CRASH = "MK_ROOT_CRASH"   # test seam: project commit lands, the root card upsert is skipped
@@ -602,10 +606,106 @@ class Store:
         return self._mkdb
 
     def home_dir(self):
-        """A home mkdb will accept. The real ~/.matrixkoder is never used: the db lives at --data."""
-        h = os.path.join(self.data, ".mk-home")
-        os.makedirs(h, exist_ok=True)
-        return h
+        """The REAL MK home (mkpaths.home(): --home > $MK_HOME > $MATRIXKODER_HOME > ~/.matrixkoder).
+
+        Z3: the root projection (cards, sync, plan_summary) must land in the live root store
+        (<home>/mk.db) so the Plan tab and `k` see it, not in a per-data-dir fake home. This
+        creates NOTHING: mkdb.open_root makes <home>/mk.db when a root write needs it, and a
+        self-test pins $MK_HOME/$MATRIXKODER_HOME to a temp dir (the mkdb MK_SELFTEST guard
+        refuses a write under the real ~/.matrixkoder)."""
+        return home()
+
+    def project_slug(self):
+        """This project's OWN slug for the root projection (its own row's slug, from the data dir).
+
+        Read-only: never registers. A write path calls root_register() for that. A self-test pins
+        MK_SELFTEST_FALLBACK_SLUG so its temp data dirs keep the fixture slug they assert on (and
+        add no root row); production with no root row yet derives one exactly as mk-bus does. The
+        project store itself resolves by data_dir (self.project_folder()), so this slug only keys
+        the root projection (cards, sync, plan_summary).
+
+        A root row may exist under a DERIVED alias (`p` + sha256, what mk-bus/mk-state create when
+        the project has no row yet) as well as the project's canonical slug (registered by the
+        wizard / mk-migrate / mk-state.register_project). The canonical one is the project's OWN
+        slug — the Plan tab lists it — so it wins when both name this data dir."""
+        slug = mkpaths.project_slug_of(self.data)
+        if slug and not _DERIVED_SLUG.fullmatch(slug):
+            return slug
+        canonical = self._canonical_slug()
+        if canonical:
+            return canonical
+        if slug:
+            return slug  # a derived alias that exists now; root_register derives the same one
+        return os.environ.get("MK_SELFTEST_FALLBACK_SLUG") or \
+            "p" + hashlib.sha256(os.path.realpath(self.data).encode("utf-8")).hexdigest()[:16]
+
+    def _canonical_slug(self):
+        """The non-derived slug of a root row naming this data dir (its data_dir or db_path folder),
+        or None. Read-only: mkdb.projects never creates the root store. A derived alias
+        (`p`+sha256, mk-bus's own derivation) is skipped, so the project's canonical slug wins."""
+        try:
+            rows = self.db().projects(self.home_dir())
+        except Exception:
+            return None
+        want = os.path.realpath(self.data)
+        for r in rows:
+            slug = r.get("slug")
+            if not isinstance(slug, str) or _DERIVED_SLUG.fullmatch(slug):
+                continue
+            for raw in (r.get("data_dir"), r.get("db_path")):
+                if not isinstance(raw, str) or not raw.strip():
+                    continue
+                p = os.path.realpath(os.path.expanduser(raw.strip()))
+                if os.path.dirname(p) == want or p == want:
+                    return slug
+        return None
+
+    def root_register(self):
+        """Give this project its root row (the C3 linkage) if it has none, then return the slug.
+
+        The root projection (and the Plan tab that reads it) hangs off a root `projects` row keyed
+        by the slug. A project with no row yet — a brand-new project — is registered here, the same
+        INSERT OR IGNORE mkpaths._register_project / mk-bus / mk-migrate use (same columns, same
+        derivation). An existing row is left alone, so a migrated row's db_path and repo survive.
+        A self-test fixture (MK_SELFTEST_FALLBACK_SLUG) is skipped: it needs no row and must add
+        none. Called from the write path only, never from a read."""
+        slug = self.project_slug()
+        if os.environ.get("MK_SELFTEST_FALLBACK_SLUG") or mkpaths.project_slug_of(self.data):
+            return slug
+        if self._canonical_slug():
+            return self._canonical_slug()
+        try:
+            con = self.db().open_root(self.home_dir())
+            try:
+                con.execute("INSERT OR IGNORE INTO projects(slug, name, repo, data_dir, mode, db_path)"
+                            " VALUES (?,?,?,?,?,NULL)",
+                            (slug, slug, os.path.dirname(os.path.abspath(self.data)),
+                             os.path.abspath(self.data), "home"))
+                con.commit()
+            finally:
+                con.close()
+        except self.db().Fail:
+            raise  # a real refusal (a synced/unwritable home) must still fail the command
+        except Exception:
+            # a missing/unreadable/corrupt root store: register nothing. The project store is the
+            # truth; the root projection is a derived rollup and must never abort a project write.
+            pass
+        return slug
+
+    def root_write(self, fn, *a, **kw):
+        """Run a ROOT-store projection write (a card upsert, catch_up, promote_ready, transition).
+
+        Z3: the root projection is a derived rollup (the project store is the truth). A
+        missing/unreadable/corrupt root store — or a corrupt ~/.matrixkoder/mk.db — must never
+        abort a project write; the card is simply not written and `sync` heals it later. A real
+        refusal still propagates: mkdb.Fail (a synced/unwritable home, a newer schema) names a
+        condition the caller must see, so it is re-raised."""
+        try:
+            return fn(*a, **kw)
+        except self.db().Fail:
+            raise
+        except Exception:
+            return None
 
     def project_folder(self):
         """The folder to pass as `data_dir` (L3B): mkpaths.project_folder(self.data) — the C2
@@ -619,7 +719,7 @@ class Store:
         return mkpaths.project_folder(self.data)
 
     def store_open(self):
-        con = self.db().open_project(self.home_dir(), STORE_PROJECT, data_dir=self.project_folder())
+        con = self.db().open_project(self.home_dir(), self.project_slug(), data_dir=self.project_folder())
         return con
 
     def _run_doc_extras(self, rid):
@@ -757,7 +857,7 @@ class Store:
             return []
         arts = self._round_artifacts(run, t)
         if arts:
-            self.db().import_history(self.home_dir(), STORE_PROJECT, run["id"], artifacts=arts,
+            self.db().import_history(self.home_dir(), self.project_slug(), run["id"], artifacts=arts,
                                      data_dir=self.project_folder())
         return [a["kind"] for a in arts]
 
@@ -801,6 +901,9 @@ class Store:
         store event, one change_log row). Other events go through import_history. The run/task
         fields the tables have no column for ride runs.extra_json / tasks.extra_json (L4, C4)."""
         rid = run["id"]
+        # Z3: a project with no root row yet gets one here (write path only), so its root
+        # projection (cards, sync, plan_summary) is keyed by its own slug and the Plan tab sees it.
+        self.root_register()
         lines = self._appended.pop(rid, [])
         events = []
         for line in lines:
@@ -815,7 +918,7 @@ class Store:
         for t in run.get("tasks") or []:
             if t.get("id") and t.get("round"):
                 arts += self._round_artifacts(run, t)
-        self.db().import_history(self.home_dir(), STORE_PROJECT, rid, run_row=self.run_row(run),
+        self.db().import_history(self.home_dir(), self.project_slug(), rid, run_row=self.run_row(run),
                                  tasks=tasks, events=events, artifacts=arts, data_dir=self.project_folder())
         # task round: the tasks row (and its root card) must not keep the previous round's
         # terminal status or verdict. import_history already wrote the new status; the card
@@ -840,10 +943,10 @@ class Store:
                 # ALWAYS cleared: a stale "DONE ..." verdict decides the watch on its own.
                 if cur and cur not in ROUND_TERMINAL:
                     to = cur
-                self.db().transition(self.home_dir(), STORE_PROJECT, rid, tid, to,
-                                     note=f"round {task.get('round')} ({kind}) reset",
-                                     round=task.get("round") or 0, sync_root=True,
-                                     data_dir=self.project_folder(), verdict=None)
+                self.root_write(self.db().transition, self.home_dir(), self.project_slug(), rid, tid, to,
+                                note=f"round {task.get('round')} ({kind}) reset",
+                                round=task.get("round") or 0, sync_root=True,
+                                data_dir=self.project_folder(), verdict=None)
                 con = self.store_open()
                 try:
                     extra = con.execute(
@@ -877,9 +980,10 @@ class Store:
                     con.close()
                 continue
             task = next((t for t in run.get("tasks") or [] if t.get("id") == ev["task"]), {})
-            self.db().transition(self.home_dir(), STORE_PROJECT, rid, ev["task"], ev["to_id"],
-                                 note=ev.get("text") or "", round=task.get("round") or 0,
-                                 sync_root=True, data_dir=self.project_folder())
+            self.root_write(self.db().transition, self.home_dir(), self.project_slug(), rid,
+                            ev["task"], ev["to_id"],
+                            note=ev.get("text") or "", round=task.get("round") or 0,
+                            sync_root=True, data_dir=self.project_folder())
             # transition() writes the change_log row, the root card and its own event. The
             # import already stored the view line, so the transition event is removed. Its id is
             # higher than every unpublished row, so removing it cannot hide one.
@@ -901,15 +1005,16 @@ class Store:
             # catch_up repairs a card whose status disagrees with the task row, including one
             # whose change_log sits below the watermark the transition above just advanced.
             # promote_ready then moves dependents and writes their cards in one root transaction.
-            self.db().catch_up(self.home_dir(), STORE_PROJECT, data_dir=self.project_folder())
-            self.db().promote_ready(self.home_dir(), STORE_PROJECT, rid,
-                                    data_dir=self.project_folder(), sync_root=True)
+            self.root_write(self.db().catch_up, self.home_dir(), self.project_slug(),
+                            data_dir=self.project_folder())
+            self.root_write(self.db().promote_ready, self.home_dir(), self.project_slug(), rid,
+                            data_dir=self.project_folder(), sync_root=True)
 
     def store_transition(self, rid, tid, to, note, line=None):
         """One status change through mkdb.transition, root card included (C5)."""
-        self.db().transition(self.home_dir(), STORE_PROJECT, rid, tid, to, note=note,
-                             sync_root=os.environ.get(ROOT_CRASH) != "1",
-                             data_dir=self.project_folder())
+        self.root_write(self.db().transition, self.home_dir(), self.project_slug(), rid, tid, to,
+                        note=note, sync_root=os.environ.get(ROOT_CRASH) != "1",
+                        data_dir=self.project_folder())
 
     def load_store(self, rid):
         """The store is the read source: runs and tasks tables (runs.extra_json / tasks.extra_json
@@ -2375,7 +2480,7 @@ def cmd_sync(a, st):
     File mode (no <data>/mk.db) changes nothing and creates no store."""
     if not st.store_on:
         return {"ok": True, "store": "off", "copied": 0}
-    project = a.project or STORE_PROJECT
+    project = a.project or st.root_register()
     copied = st.db().catch_up(st.home_dir(), project, data_dir=st.project_folder())
     return {"ok": True, "store": "on", "project": project, "copied": copied}
 
@@ -2568,6 +2673,8 @@ def d15_self_test(tmp, env, pd, penv):
 
     Own data dir (the fixture plan tool through $MK_PLAN_CMD, like the plan block above), so the
     run.json / store round trip is exercised end to end and every assertion reads a real file."""
+    # Z3: the root projection lives in ONE real home (H) per suite, not a per-data-dir fake one.
+    H = os.environ["MK_HOME"]
     plan = {"plan": "d15", "status": "approved", "runs": [], "phases": [
         {"id": "DP", "title": "Phase", "wave": 1, "deps": [], "owned": ["scripts/a.py"], "route": "",
          "reviewer": "", "size": "standard", "risk": "reversible", "review": "light", "qa": [],
@@ -2634,7 +2741,7 @@ def d15_self_test(tmp, env, pd, penv):
     def strip_run(run_id):
         """L4: no run.json. Blank the plan fields on the tasks rows (and refs/route extras in
         tasks.extra_json), exactly the file view a legacy run had before backfill."""
-        con = _mkdb().open_project(os.path.join(pd, ".mk-home"), STORE_PROJECT, data_dir=pd)
+        con = _mkdb().open_project(H, STORE_PROJECT_FALLBACK, data_dir=pd)
         try:
             for tid in [r["id"] for r in con.execute("SELECT id FROM tasks WHERE run=?", (run_id,))]:
                 extra = _json_obj(con.execute("SELECT extra_json FROM tasks WHERE run=? AND id=?",
@@ -2649,7 +2756,7 @@ def d15_self_test(tmp, env, pd, penv):
             con.close()
 
     def task_rows(run_id):
-        con = _mkdb().open_project(os.path.join(pd, ".mk-home"), STORE_PROJECT, data_dir=pd)
+        con = _mkdb().open_project(H, STORE_PROJECT_FALLBACK, data_dir=pd)
         try:
             out = {}
             for r in con.execute("SELECT id, type, acceptance, owned, deps, extra_json FROM tasks"
@@ -2696,7 +2803,7 @@ def d15_self_test(tmp, env, pd, penv):
     sk("run", "init", "--id", "s2", "--feature", "Store plan", "--branch", "b2", "--plan", pfile)
     for i in range(3):  # three unrelated writes: none carries the plan fields
         sk("task", "set", "DP.1", "pane=w%d:p" % i, "--run", "s2")
-    con = _mkdb().open_project(os.path.join(sd, ".mk-home"), STORE_PROJECT, data_dir=sd)
+    con = _mkdb().open_project(H, STORE_PROJECT_FALLBACK, data_dir=sd)
     try:
         rows = {r["id"]: r for r in con.execute(
             "SELECT id, type, acceptance, owned, deps FROM tasks WHERE run='s2'")}
@@ -2711,7 +2818,7 @@ def d15_self_test(tmp, env, pd, penv):
     # --- T1: task set edits reach the store row and task get (the plan text is not file-only)
     sk("task", "set", "DP.1", "title=Edited child", "acceptance=edited outcome",
        "owned=scripts/b.py,scripts/c.py", "deps=DP", "--run", "s2")
-    con = _mkdb().open_project(os.path.join(sd, ".mk-home"), STORE_PROJECT, data_dir=sd)
+    con = _mkdb().open_project(H, STORE_PROJECT_FALLBACK, data_dir=sd)
     try:
         row = con.execute("SELECT title, acceptance, owned, deps FROM tasks"
                           " WHERE run='s2' AND id='DP.1'").fetchone()
@@ -2731,7 +2838,13 @@ def self_test():
     os.environ["MK_HOME"] = tmp_home
     os.environ["MATRIXKODER_HOME"] = tmp_home
     os.environ["MK_SELFTEST"] = "1"
-    env = dict(os.environ, MATRIXKODER_HOME=tmp_home, MK_HOME=tmp_home, MK_SELFTEST="1")
+    # Z3: every fixture root projection is keyed by this one slug, so the assertions below keep
+    # the spelling they had under the old <data>/.mk-home. It also tells mk-state NOT to register
+    # a root row for a temp data dir (a self-test must add none).
+    os.environ["MK_SELFTEST_FALLBACK_SLUG"] = STORE_PROJECT_FALLBACK
+    H = tmp_home  # the ONE real home the root projection lands in
+    env = dict(os.environ, MATRIXKODER_HOME=tmp_home, MK_HOME=tmp_home, MK_SELFTEST="1",
+               MK_SELFTEST_FALLBACK_SLUG=STORE_PROJECT_FALLBACK)
     env.pop("MATRIXKODER_DATA", None)
     data = os.path.join(tmp, "data")
 
@@ -2748,7 +2861,7 @@ def self_test():
 
     def q(datadir, sql, args=()):
         """One query against a data dir's project DB; None-safe helpers over it."""
-        con = DB.open_project(os.path.join(datadir, ".mk-home"), STORE_PROJECT, data_dir=datadir)
+        con = DB.open_project(H, STORE_PROJECT_FALLBACK, data_dir=datadir)
         try:
             return con.execute(sql, args).fetchall()
         finally:
@@ -2760,7 +2873,7 @@ def self_test():
 
     def events_of(datadir, rid):
         """The run's state events, as the events table holds them (was events.jsonl)."""
-        con = DB.open_project(os.path.join(datadir, ".mk-home"), STORE_PROJECT, data_dir=datadir)
+        con = DB.open_project(H, STORE_PROJECT_FALLBACK, data_dir=datadir)
         try:
             rows = con.execute(
                 "SELECT id, run, task, t, chan, kind, from_id, to_id, reply_to, text, meta_json"
@@ -2991,7 +3104,7 @@ def self_test():
         for f in ("run.json", "events.jsonl", "board.md", os.path.join("tasks", "T1", "task.json")):
             assert not os.path.exists(os.path.join(rdir, f)), f  # L4 writes no view file
         # a torn event row in the store never crashes render (was a torn events.jsonl line)
-        con = DB.open_project(os.path.join(data, ".mk-home"), STORE_PROJECT, data_dir=data)
+        con = DB.open_project(H, STORE_PROJECT_FALLBACK, data_dir=data)
         try:
             con.execute("INSERT INTO events(run, task, t, chan, kind, text, meta_json)"
                         " VALUES ('r1', NULL, 't', 'state', 'note', 'torn', '{\"line\": \"{\\\"t\\\": \\\"torn')")
@@ -3324,7 +3437,7 @@ def self_test():
         got = dk("task", "get", "P3", "--run", "rb")["task"]["status"]
         assert got == "building", got
         # a status mk-state never wrote: written straight into the tasks row (was a run.json edit)
-        con = DB.open_project(os.path.join(ddeps, ".mk-home"), STORE_PROJECT, data_dir=ddeps)
+        con = DB.open_project(H, STORE_PROJECT_FALLBACK, data_dir=ddeps)
         try:
             con.execute("UPDATE tasks SET status='weird' WHERE run='rb' AND id='K2'")
             con.commit()
@@ -3340,14 +3453,14 @@ def self_test():
         sk("task", "add", "--id", "T", "--title", "t", "--run", "good")
         # L4: a sibling runs row is what load_store reads; a malformed one is a warning, not a crash
         ksick = os.path.join(tmp, "sick")
-        con = DB.open_project(os.path.join(ksick, ".mk-home"), STORE_PROJECT, data_dir=ksick)
+        con = DB.open_project(H, STORE_PROJECT_FALLBACK, data_dir=ksick)
         try:
             keep_branch = con.execute("SELECT branch FROM runs WHERE id='sick'").fetchone()["branch"]
         finally:
             con.close()
 
         def set_sick(sql, args=()):
-            c = DB.open_project(os.path.join(ksick, ".mk-home"), STORE_PROJECT, data_dir=ksick)
+            c = DB.open_project(H, STORE_PROJECT_FALLBACK, data_dir=ksick)
             try:
                 c.execute(sql, args)
                 c.commit()
@@ -3788,7 +3901,7 @@ def self_test():
         assert "plan:" not in board, board
         # L4: the legacy file path lives in runs.extra_json (runs.plan holds the plan id);
         # set it there, then the board carries the plain path line.
-        lcon = DB.open_project(os.path.join(lg, ".mk-home"), STORE_PROJECT, data_dir=lg)
+        lcon = DB.open_project(H, STORE_PROJECT_FALLBACK, data_dir=lg)
         try:
             row = lcon.execute("SELECT extra_json FROM runs WHERE id='l1'").fetchone()
             data = _json_obj(row["extra_json"])
@@ -3823,7 +3936,7 @@ def self_test():
         # roll-up already lifted PAR to merged; put it back so the close promotes the
         # children and the following save rolls the parent up to done (not a direct set)
         pdata = os.path.join(tmp, "promote")
-        con = DB.open_project(os.path.join(pdata, ".mk-home"), STORE_PROJECT, data_dir=pdata)
+        con = DB.open_project(H, STORE_PROJECT_FALLBACK, data_dir=pdata)
         try:
             par = con.execute("SELECT status FROM tasks WHERE run='close' AND id='PAR'").fetchone()
             assert par["status"] == "merged", dict(par)
@@ -3903,6 +4016,8 @@ def _frozen_now():
 
 def store_self_test(tmp, env):
     """D3A: the store is opt-in. Off = no mk.db and byte-identical files; on = views from the store."""
+
+    H = os.environ["MK_HOME"]  # Z3: the one real home (root projection)
     import shutil as _sh
     data = os.path.join(tmp, "store")
 
@@ -3932,7 +4047,7 @@ def store_self_test(tmp, env):
     assert mk("store", "status")["store"] == "on"
 
     db = _mkdb()
-    con = db.open_project(os.path.join(data, ".mk-home"), STORE_PROJECT, data_dir=data)
+    con = db.open_project(H, STORE_PROJECT_FALLBACK, data_dir=data)
     try:
         n_ev = con.execute("SELECT COUNT(*) c FROM events WHERE run='s1' AND chan='state'").fetchone()["c"]
         n_tasks = con.execute("SELECT COUNT(*) c FROM tasks WHERE run='s1'").fetchone()["c"]
@@ -3966,7 +4081,7 @@ def store_self_test(tmp, env):
     now = real_now  # the rest of the test uses the real clock
 
     def rows_of(d, rid):
-        con = db.open_project(os.path.join(d, ".mk-home"), STORE_PROJECT, data_dir=d)
+        con = db.open_project(H, STORE_PROJECT_FALLBACK, data_dir=d)
         try:
             tasks = {r["id"]: dict(r) for r in con.execute("SELECT * FROM tasks WHERE run=?", (rid,))}
             events = [dict(r) for r in con.execute(
@@ -3993,14 +4108,14 @@ def store_self_test(tmp, env):
 
     # every event row is unique and the log only grows (both stores are DB-only now)
     def ev_count(d, rid):
-        con = db.open_project(os.path.join(d, ".mk-home"), STORE_PROJECT, data_dir=d)
+        con = db.open_project(H, STORE_PROJECT_FALLBACK, data_dir=d)
         try:
             return con.execute("SELECT COUNT(*) c FROM events WHERE run=?", (rid,)).fetchone()["c"]
         finally:
             con.close()
 
     def q1_dir(d, sql, args=()):
-        con = db.open_project(os.path.join(d, ".mk-home"), STORE_PROJECT, data_dir=d)
+        con = db.open_project(H, STORE_PROJECT_FALLBACK, data_dir=d)
         try:
             return con.execute(sql, args).fetchone()
         finally:
@@ -4009,7 +4124,7 @@ def store_self_test(tmp, env):
     def events_rows(d, rid):
         """The run's state events as their JSON lines (was events.jsonl). A direct transition
         (meta_json NULL) renders in today's format, exactly as Store.event_line does."""
-        con = db.open_project(os.path.join(d, ".mk-home"), STORE_PROJECT, data_dir=d)
+        con = db.open_project(H, STORE_PROJECT_FALLBACK, data_dir=d)
         try:
             out = []
             for r in con.execute("SELECT run, task, t, kind, from_id, to_id, text, meta_json"
@@ -4045,13 +4160,13 @@ def store_self_test(tmp, env):
         _CLOCK["t"] = None
 
     # a status change goes through transition(): change_log grew and the event is in the store
-    con = db.open_project(os.path.join(data, ".mk-home"), STORE_PROJECT, data_dir=data)
+    con = db.open_project(H, STORE_PROJECT_FALLBACK, data_dir=data)
     try:
         before = con.execute("SELECT COUNT(*) c FROM change_log WHERE run='s2'").fetchone()["c"]
     finally:
         con.close()
     mk("task", "set", "B", "status=building", "--note", "start", "--run", "s2")
-    con = db.open_project(os.path.join(data, ".mk-home"), STORE_PROJECT, data_dir=data)
+    con = db.open_project(H, STORE_PROJECT_FALLBACK, data_dir=data)
     try:
         after = con.execute("SELECT COUNT(*) c FROM change_log WHERE run='s2'").fetchone()["c"]
         hit = con.execute("SELECT 1 FROM events WHERE run='s2' AND task='B' AND kind='transition'"
@@ -4070,7 +4185,7 @@ def store_self_test(tmp, env):
         with open(paths[kind], "w") as f:
             f.write(f"{kind} body\n")
     mk("event", "--type", "note", "--text", "round files", "--run", "s2")
-    con = db.open_project(os.path.join(data, ".mk-home"), STORE_PROJECT, data_dir=data)
+    con = db.open_project(H, STORE_PROJECT_FALLBACK, data_dir=data)
     try:
         rows = {r["kind"]: r["text"] for r in con.execute(
             "SELECT kind, text FROM artifacts WHERE run='s2' AND task='B' AND round=? AND kind IN"
@@ -4099,7 +4214,7 @@ def store_self_test(tmp, env):
     mk("run", "init", "--id", "s3", "--feature", "P", "--branch", "bp", "--plan", plan, "--force", e=e2)
     _sh.copy(plan, archived)
     os.remove(plan)
-    con = db.open_project(os.path.join(data, ".mk-home"), STORE_PROJECT, data_dir=data)
+    con = db.open_project(H, STORE_PROJECT_FALLBACK, data_dir=data)
     try:
         con.execute("INSERT INTO plans(id, version, title, approved_at, archived_path) VALUES (?,?,?,?,?)",
                     ("gp", 1, "gp", "2026-01-01T00:00:00+00:00", archived))
@@ -4114,7 +4229,7 @@ def store_self_test(tmp, env):
     crashed = dict(env, MK_VIEW_CRASH="1")
     bad = mk("event", "--type", "note", "--text", "crash me", "--run", "s2", code=2, e=crashed)
     assert "injected crash" in bad["error"], bad
-    con = db.open_project(os.path.join(data, ".mk-home"), STORE_PROJECT, data_dir=data)
+    con = db.open_project(H, STORE_PROJECT_FALLBACK, data_dir=data)
     try:
         stored = con.execute("SELECT text FROM events WHERE run='s2' AND text='crash me'").fetchone()
     finally:
@@ -4151,7 +4266,7 @@ def store_self_test(tmp, env):
     final = once(["run", "get", "--id", "rr"], race)["run"]
     got = {t["id"]: t["status"] for t in final["tasks"]}
     assert all(got[f"R{i}"] == "building" for i in range(20)), got
-    con = db.open_project(os.path.join(race, ".mk-home"), STORE_PROJECT, data_dir=race)
+    con = db.open_project(H, STORE_PROJECT_FALLBACK, data_dir=race)
     try:
         rows = {r["id"]: r["status"] for r in con.execute("SELECT id, status FROM tasks WHERE run='rr'")}
     finally:
@@ -4164,9 +4279,9 @@ def store_self_test(tmp, env):
     once(["task", "add", "--id", "T1", "--title", "One", "--run", "k1"], keep)
     once(["task", "add", "--id", "T2", "--title", "Two", "--run", "k1"], keep)
     once(["store", "enable"], keep)
-    db.transition(os.path.join(keep, ".mk-home"), STORE_PROJECT, "k1", "T1", "building", data_dir=keep)
+    db.transition(H, STORE_PROJECT_FALLBACK, "k1", "T1", "building", data_dir=keep)
     once(["task", "set", "T2", "status=building", "--run", "k1"], keep)
-    con = db.open_project(os.path.join(keep, ".mk-home"), STORE_PROJECT, data_dir=keep)
+    con = db.open_project(H, STORE_PROJECT_FALLBACK, data_dir=keep)
     try:
         st1 = con.execute("SELECT status FROM tasks WHERE run='k1' AND id='T1'").fetchone()["status"]
     finally:
@@ -4176,7 +4291,7 @@ def store_self_test(tmp, env):
     assert once(["task", "get", "T1", "--run", "k1"], keep)["task"]["status"] == "building"
 
     # HIGH review :563 — exactly one transition event, and a direct transition is in the store
-    con = db.open_project(os.path.join(keep, ".mk-home"), STORE_PROJECT, data_dir=keep)
+    con = db.open_project(H, STORE_PROJECT_FALLBACK, data_dir=keep)
     try:
         count = con.execute("SELECT COUNT(*) c FROM events WHERE run='k1' AND task='T2'"
                             " AND kind='transition' AND to_id='building'").fetchone()["c"]
@@ -4187,7 +4302,7 @@ def store_self_test(tmp, env):
     lines = [e for e in events_rows(keep, "k1")]
     state_lines = [x for x in lines if x.get("task") == "T1" and x.get("to") == "building"]
     assert len(state_lines) == 1, lines
-    tl = db.timeline(os.path.join(keep, ".mk-home"), STORE_PROJECT, "k1", "T1", data_dir=keep)
+    tl = db.timeline(H, STORE_PROJECT_FALLBACK, "k1", "T1", data_dir=keep)
     store_t1 = [x for x in lines if x.get("task") == "T1"]
     assert len(tl) == len(store_t1), (len(tl), len(store_t1), tl, store_t1)
 
@@ -4203,7 +4318,7 @@ def store_self_test(tmp, env):
     real_db.import_history = fail_import
     try:
         st.task_row({"id": "b1", "tasks": []}, {"id": "X", "title": "x"})
-        real_db.import_history(st.home_dir(), STORE_PROJECT, "b1", data_dir=boom,
+        real_db.import_history(st.home_dir(), STORE_PROJECT_FALLBACK, "b1", data_dir=boom,
                                run_row={"id": "b1", "status": "active"},
                                tasks=[st.task_row({"id": "b1", "tasks": []}, {"id": "X", "title": "x"})])
         raise AssertionError("the injected import failure did not raise")
@@ -4215,7 +4330,7 @@ def store_self_test(tmp, env):
 
     # HIGH review :733 — a direct transition is visible through the store after the next read
     once(["run", "get", "--id", "k1"], keep)
-    db.transition(os.path.join(keep, ".mk-home"), STORE_PROJECT, "k1", "T1", "review", data_dir=keep)
+    db.transition(H, STORE_PROJECT_FALLBACK, "k1", "T1", "review", data_dir=keep)
     once(["export-legacy", "--run", "k1"], keep)  # no-op under L4
     assert once(["task", "get", "T1", "--run", "k1"], keep)["task"]["status"] == "review"
 
@@ -4231,7 +4346,7 @@ def store_self_test(tmp, env):
     import shutil as _sh2
     _sh2.copy(plan, archived)
     os.remove(plan)
-    con = db.open_project(os.path.join(keep, ".mk-home"), STORE_PROJECT, data_dir=keep)
+    con = db.open_project(H, STORE_PROJECT_FALLBACK, data_dir=keep)
     try:
         con.execute("INSERT OR REPLACE INTO plans(id, version, title, approved_at, archived_path)"
                     " VALUES (?,?,?,?,?)",
@@ -4248,7 +4363,7 @@ def store_self_test(tmp, env):
     corrupt = os.path.join(tmp, "corrupt")
     once(["run", "init", "--id", "c1", "--feature", "C", "--branch", "bc"], corrupt)
     once(["task", "add", "--id", "T", "--title", "Tee", "--run", "c1"], corrupt)
-    cc = db.open_project(os.path.join(corrupt, ".mk-home"), STORE_PROJECT, data_dir=corrupt)
+    cc = db.open_project(H, STORE_PROJECT_FALLBACK, data_dir=corrupt)
     try:
         cc.execute("UPDATE tasks SET route_json='{not json' WHERE run='c1' AND id='T'")
         cc.commit()
@@ -4261,7 +4376,7 @@ def store_self_test(tmp, env):
     assert "Traceback" not in r.stderr, r.stderr
     body = json.loads(r.stdout.strip().splitlines()[0])
     assert body["ok"] is True, body
-    cc = db.open_project(os.path.join(corrupt, ".mk-home"), STORE_PROJECT, data_dir=corrupt)
+    cc = db.open_project(H, STORE_PROJECT_FALLBACK, data_dir=corrupt)
     try:
         assert cc.execute("SELECT status FROM tasks WHERE run='c1' AND id='T'").fetchone()["status"] == "building"
     finally:
@@ -4281,11 +4396,11 @@ def store_self_test(tmp, env):
                         "status=building", "--run", "d1", "--data", d3],
                        capture_output=True, text=True, env=d3env)
     assert r.returncode == 0, r.stdout
-    rootdb = db.open_root(os.path.join(d3, ".mk-home"))
+    rootdb = db.open_root(root)
     try:
         card = rootdb.execute(
             "SELECT status, change_no FROM cards WHERE project=? AND run='d1' AND task='T1'",
-            (STORE_PROJECT,)).fetchone()
+            (STORE_PROJECT_FALLBACK,)).fetchone()
     finally:
         rootdb.close()
     assert card and card["status"] == "building", card
@@ -4294,17 +4409,17 @@ def store_self_test(tmp, env):
                         "status=review", "--run", "d1", "--data", d3],
                        capture_output=True, text=True, env=killed)
     assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
-    con = db.open_project(os.path.join(d3, ".mk-home"), STORE_PROJECT, data_dir=d3)
+    con = db.open_project(H, STORE_PROJECT_FALLBACK, data_dir=d3)
     try:
         proj = con.execute("SELECT status FROM tasks WHERE run='d1' AND id='T1'").fetchone()["status"]
     finally:
         con.close()
     assert proj == "review", proj  # the project commit landed
-    rootdb = db.open_root(os.path.join(d3, ".mk-home"))
+    rootdb = db.open_root(root)
     try:
         stale = rootdb.execute(
             "SELECT status FROM cards WHERE project=? AND run='d1' AND task='T1'",
-            (STORE_PROJECT,)).fetchone()["status"]
+            (STORE_PROJECT_FALLBACK,)).fetchone()["status"]
     finally:
         rootdb.close()
     assert stale == "building", stale  # the root write was the one that died
@@ -4313,13 +4428,13 @@ def store_self_test(tmp, env):
     assert r.returncode == 0, r.stdout
     first = json.loads(r.stdout)
     assert first["copied"] >= 1, first
-    rootdb = db.open_root(os.path.join(d3, ".mk-home"))
+    rootdb = db.open_root(root)
     try:
         fixed = rootdb.execute(
             "SELECT status FROM cards WHERE project=? AND run='d1' AND task='T1'",
-            (STORE_PROJECT,)).fetchone()["status"]
+            (STORE_PROJECT_FALLBACK,)).fetchone()["status"]
         seen = rootdb.execute("SELECT last_change_no FROM sync WHERE project=?",
-                              (STORE_PROJECT,)).fetchone()["last_change_no"]
+                              (STORE_PROJECT_FALLBACK,)).fetchone()["last_change_no"]
     finally:
         rootdb.close()
     assert fixed == "review", fixed
@@ -4327,10 +4442,10 @@ def store_self_test(tmp, env):
                        capture_output=True, text=True, env=d3env)
     second = json.loads(r.stdout)
     assert second["copied"] == 0, second  # idempotent
-    rootdb = db.open_root(os.path.join(d3, ".mk-home"))
+    rootdb = db.open_root(root)
     try:
         again = rootdb.execute("SELECT last_change_no FROM sync WHERE project=?",
-                               (STORE_PROJECT,)).fetchone()["last_change_no"]
+                               (STORE_PROJECT_FALLBACK,)).fetchone()["last_change_no"]
     finally:
         rootdb.close()
     assert again == seen
@@ -4369,7 +4484,10 @@ def store_self_test(tmp, env):
                        capture_output=True, text=True, env=dict(env, MATRIXKODER_HOME=reg_home, MK_HOME=reg_home))
     assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
     assert q1_dir(from_json, "SELECT 1 x FROM runs WHERE id='j1'"), "j1 not in from-json"
-    assert not os.path.exists(os.path.join(reg_home, "mk.db"))
+    # Z3: a WRITE maintains the root projection in the REAL home (the old code wrote a fake
+    # <data>/.mk-home instead), so run init creates <home>/mk.db here. A read (the `bare` case
+    # above) still creates nothing.
+    assert os.path.exists(os.path.join(reg_home, "mk.db")), "a write must maintain the real root store"
     # register writes BOTH, and the root table then wins over a stale projects.json
     saved = {k: os.environ.get(k) for k in ("MK_HOME", "MATRIXKODER_HOME")}
     os.environ["MK_HOME"] = reg_home
@@ -4427,7 +4545,7 @@ def store_self_test(tmp, env):
                         "--feature", "P", "--branch", "bp", "--plan", plan, "--data", d3],
                        capture_output=True, text=True, env=penv)
     assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
-    con = db.open_project(os.path.join(d3, ".mk-home"), STORE_PROJECT, data_dir=d3)
+    con = db.open_project(H, STORE_PROJECT_FALLBACK, data_dir=d3)
     try:
         con.execute("INSERT INTO plans(id, version, title, header_json, body_md, approved_at)"
                     " VALUES (?,?,?,?,?,?)",
@@ -4441,7 +4559,7 @@ def store_self_test(tmp, env):
     assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
     dry = json.loads(r.stdout)
     assert dry["apply"] is False and "sha" in dry["version_diff"], dry
-    con = db.open_project(os.path.join(d3, ".mk-home"), STORE_PROJECT, data_dir=d3)
+    con = db.open_project(H, STORE_PROJECT_FALLBACK, data_dir=d3)
     try:
         still = con.execute("SELECT version FROM plans WHERE id='tplan'").fetchone()["version"]
     finally:
@@ -4452,7 +4570,7 @@ def store_self_test(tmp, env):
     assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
     applied = json.loads(r.stdout)
     assert applied["version"] == 2, applied
-    con = db.open_project(os.path.join(d3, ".mk-home"), STORE_PROJECT, data_dir=d3)
+    con = db.open_project(H, STORE_PROJECT_FALLBACK, data_dir=d3)
     try:
         row = con.execute("SELECT version, header_json FROM plans WHERE id='tplan'").fetchone()
     finally:
@@ -4486,7 +4604,7 @@ def store_self_test(tmp, env):
     assert open(backup, "rb").read()  # the first backup is still a file
     # an injected VACUUM failure leaves the old backup, the run status and no tmp file
     def k2_status():
-        c = db.open_project(os.path.join(d3, ".mk-home"), STORE_PROJECT, data_dir=d3)
+        c = db.open_project(H, STORE_PROJECT_FALLBACK, data_dir=d3)
         try:
             return c.execute("SELECT status FROM tasks WHERE run='d1' AND id='T1'").fetchone()["status"]
         finally:
@@ -4560,16 +4678,16 @@ def store_self_test(tmp, env):
         procs.append(subprocess.Popen([sys.executable, "-c", code], env=parenv))
     for proc in procs:
         assert proc.wait() == 0, proc.returncode
-    con = db.open_project(os.path.join(par, ".mk-home"), STORE_PROJECT, data_dir=par)
+    con = db.open_project(H, STORE_PROJECT_FALLBACK, data_dir=par)
     try:
         proj = {r["id"]: r["status"] for r in con.execute(
             "SELECT id, status FROM tasks WHERE run='pr'")}
     finally:
         con.close()
-    rootdb = db.open_root(os.path.join(par, ".mk-home"))
+    rootdb = db.open_root(par_home)
     try:
         cards = {r["task"]: r["status"] for r in rootdb.execute(
-            "SELECT task, status FROM cards WHERE project=? AND run='pr'", (STORE_PROJECT,))}
+            "SELECT task, status FROM cards WHERE project=? AND run='pr'", (STORE_PROJECT_FALLBACK,))}
     finally:
         rootdb.close()
     assert set(proj) == {f"P{i}" for i in range(20)}, proj
@@ -4649,7 +4767,7 @@ def store_self_test(tmp, env):
     once(["task", "set", "A", "status=done", "--run", "rr"], rd)
 
     def store_status(tid):
-        c = _mkdb().open_project(os.path.join(rd, ".mk-home"), STORE_PROJECT, data_dir=rd)
+        c = _mkdb().open_project(H, STORE_PROJECT_FALLBACK, data_dir=rd)
         try:
             return c.execute("SELECT status FROM tasks WHERE run='rr' AND id=?", (tid,)).fetchone()["status"]
         finally:
@@ -4663,8 +4781,8 @@ def store_self_test(tmp, env):
     assert store_status("B") == "ready", "an unrelated task set demoted B to " + store_status("B")
     assert store_status("Z") == "building"
     # the root card shows Ready
-    _mkdb().catch_up(os.path.join(rd, ".mk-home"), STORE_PROJECT, data_dir=rd)
-    cards = _mkdb().cards(os.path.join(rd, ".mk-home"), STORE_PROJECT)
+    _mkdb().catch_up(H, STORE_PROJECT_FALLBACK, data_dir=rd)
+    cards = _mkdb().cards(H, STORE_PROJECT_FALLBACK)
     col = next(c["col"] for c in cards if c["task"] == "B" and c["run"] == "rr")
     assert col == "Ready", col
     # a regress demotes: A done -> fix puts B back to planned
@@ -4709,7 +4827,7 @@ def store_self_test(tmp, env):
     once(["task", "set", "B", "status=routed", "--run", "rr"], ch)
 
     def b_changes():
-        c = _mkdb().open_project(os.path.join(ch, ".mk-home"), STORE_PROJECT, data_dir=ch)
+        c = _mkdb().open_project(H, STORE_PROJECT_FALLBACK, data_dir=ch)
         try:
             return c.execute("SELECT COUNT(*) n FROM change_log WHERE run='rr' AND task='B'").fetchone()["n"]
         finally:
@@ -4727,7 +4845,7 @@ def store_self_test(tmp, env):
     rp = os.path.join(tmp, "reparent")
     once(["run", "init", "--id", "r1", "--feature", "F2", "--branch", "br"], rp)
     once(["store", "enable"], rp)
-    con = db.open_project(os.path.join(rp, ".mk-home"), STORE_PROJECT, data_dir=rp)
+    con = db.open_project(H, STORE_PROJECT_FALLBACK, data_dir=rp)
     try:
         con.execute("INSERT INTO plans(id, version, title, approved_at, archived_path) VALUES (?,?,?,?,?)",
                     ("f2plan", 1, "F2", "2026-01-01T00:00:00+00:00", os.path.join(tmp, "f2plan-v1.md")))
@@ -4741,7 +4859,7 @@ def store_self_test(tmp, env):
     once(["task", "set", "T1", "parent=P1", "--run", "r1"], rp)
 
     def f2_rows():
-        c = db.open_project(os.path.join(rp, ".mk-home"), STORE_PROJECT, data_dir=rp)
+        c = db.open_project(H, STORE_PROJECT_FALLBACK, data_dir=rp)
         try:
             return {r["id"]: (r["parent"], r["type"], r["status"]) for r in
                     c.execute("SELECT id, parent, type, status FROM tasks WHERE run='r1'")}
@@ -4749,7 +4867,7 @@ def store_self_test(tmp, env):
             c.close()
 
     def f2_phases():
-        got = db.plans(os.path.join(rp, ".mk-home"), STORE_PROJECT, data_dir=rp, plan_id="f2plan")
+        got = db.plans(H, STORE_PROJECT_FALLBACK, data_dir=rp, plan_id="f2plan")
         return {p["id"]: [x["id"] for x in p["tasks"]] for p in got["phases"]}
 
     assert f2_rows()["T1"][:2] == ("P1", "task"), f2_rows()  # the store row carries parent and type
@@ -4774,6 +4892,8 @@ def no_file_views_self_test(tmp, env):
     run.json / index.json / task.json / events.jsonl / board.md is written (and no run-doc /
     index-doc artifact). FAILS on main, where every command rewrites the file views and the
     store stays off until `store enable` — a command L4 drops, so this helper never calls it."""
+
+    H = os.environ["MK_HOME"]  # Z3: the one real home (root projection)
     data = os.path.join(tmp, "no-file-views")
 
     def mk(*args, code=0, e=None):
@@ -4788,7 +4908,7 @@ def no_file_views_self_test(tmp, env):
 
     def view_roots():
         roots = [os.path.join(data, "runs")]              # today: <data>/runs/**
-        c2 = os.path.join(data, ".mk-home", "projects")   # migrated C2 folder
+        c2 = os.path.join(H, "projects")   # migrated C2 folder
         if os.path.isdir(c2):
             roots.append(c2)
         return roots
@@ -4833,7 +4953,7 @@ def no_file_views_self_test(tmp, env):
     step("plan", "sync", "--run", "nfv", "--apply", "--from-file", e=e2)
     step("run", "set", "--id", "nfv", "--status", "done")  # "run close"
 
-    con = _mkdb().open_project(os.path.join(data, ".mk-home"), STORE_PROJECT, data_dir=data)
+    con = _mkdb().open_project(H, STORE_PROJECT_FALLBACK, data_dir=data)
     try:
         run_row = con.execute("SELECT id, status FROM runs WHERE id='nfv'").fetchone()
         assert run_row is not None, "L4.1a: the store holds no run row for nfv"
@@ -4857,6 +4977,8 @@ def cross_run_dep_from_db_self_test(tmp, env):
     """L4.1b: a <run>:<id> dep resolves from the project DB, not from runs/<other>/run.json.
     FAILS on main: with no store, dep_status reads runs/ra/run.json; delete it and the dep is
     unknown, so the dependent never becomes ready."""
+
+    H = os.environ["MK_HOME"]  # Z3: the one real home (root projection)
     data = os.path.join(tmp, "xdep")
 
     def mk(*args, code=0):
@@ -4883,7 +5005,7 @@ def cross_run_dep_from_db_self_test(tmp, env):
     mk("task", "set", "R", "status=merged", "--run", "ra")   # writes ra only
     assert mk("task", "get", "A2", "--run", "rb")["task"]["ready"] is True, \
         "cross-run dep did not resolve from the DB"
-    con = _mkdb().open_project(os.path.join(data, ".mk-home"), STORE_PROJECT, data_dir=data)
+    con = _mkdb().open_project(H, STORE_PROJECT_FALLBACK, data_dir=data)
     try:
         assert con.execute("SELECT status FROM tasks WHERE run='ra' AND id='R'").fetchone()["status"] == "merged"
     finally:
@@ -4894,6 +5016,8 @@ def no_field_blanked_self_test(tmp, env):
     """L4.1c: a status write must not reset agent/model/lane/owned/deps/acceptance/title, nor the
     artifact-only fields wave/gates/rounds/last_commit/workspace. FAILS on main if the store
     overlay drops them (or, pre-L4, never stores them at all)."""
+
+    H = os.environ["MK_HOME"]  # Z3: the one real home (root projection)
     data = os.path.join(tmp, "keepfields")
 
     def mk(*args, code=0):
@@ -4921,7 +5045,7 @@ def no_field_blanked_self_test(tmp, env):
     assert after["status"] == "building", after
     for k in keep_keys:
         assert after.get(k) == snap[k], (k, snap[k], after.get(k))
-    con = _mkdb().open_project(os.path.join(data, ".mk-home"), STORE_PROJECT, data_dir=data)
+    con = _mkdb().open_project(H, STORE_PROJECT_FALLBACK, data_dir=data)
     try:
         row = con.execute("SELECT route_json, status FROM tasks WHERE run='kf' AND id='T'").fetchone()
         assert row["status"] == "building"
@@ -4935,8 +5059,10 @@ def r2_fixes_self_test(tmp, env):
     included; (2) `run list` reads a legacy run's plan path from runs.plan and its feature from
     the run-doc extras on a pre-L4 store; (3) dep_status matches a cross-run id case-insensitively;
     (4) the importer's TASK_FILE_KEYS carries deps. (1) and (2) FAIL on bf55ee0."""
+
+    H = os.environ["MK_HOME"]  # Z3: the one real home (root projection)
     data = os.path.join(tmp, "r2fix")
-    home = os.path.join(data, ".mk-home")
+    home = H
 
     def mk(*args, code=0):
         r = subprocess.run([sys.executable, os.path.abspath(__file__), *args, "--data", data],
@@ -4950,7 +5076,7 @@ def r2_fixes_self_test(tmp, env):
     # (1) parallel round trip: set the column, load, save through an ordinary write, read it back
     mk("run", "init", "--id", "par", "--feature", "P", "--branch", "b")
     mk("task", "add", "--id", "PT", "--title", "par", "--run", "par")
-    con = db.open_project(home, STORE_PROJECT, data_dir=data)
+    con = db.open_project(home, STORE_PROJECT_FALLBACK, data_dir=data)
     try:
         con.execute("UPDATE tasks SET parallel=1 WHERE run='par' AND id='PT'")
         con.commit()
@@ -4959,14 +5085,14 @@ def r2_fixes_self_test(tmp, env):
     assert mk("task", "get", "PT", "--run", "par")["task"].get("parallel") is True, \
         "load_store dropped the parallel column"
     mk("task", "set", "PT", "status=building", "--run", "par")  # an ordinary load+save
-    con = db.open_project(home, STORE_PROJECT, data_dir=data)
+    con = db.open_project(home, STORE_PROJECT_FALLBACK, data_dir=data)
     try:
         assert con.execute("SELECT parallel FROM tasks WHERE run='par' AND id='PT'").fetchone()["parallel"] == 1, \
             "a load+save reset tasks.parallel to 0"
     finally:
         con.close()
     # every other column task_row writes must round-trip too: compare the stored row to the load
-    con = db.open_project(home, STORE_PROJECT, data_dir=data)
+    con = db.open_project(home, STORE_PROJECT_FALLBACK, data_dir=data)
     try:
         stored = dict(con.execute("SELECT * FROM tasks WHERE run='par' AND id='PT'").fetchone())
     finally:
@@ -4979,7 +5105,7 @@ def r2_fixes_self_test(tmp, env):
 
     # (2) legacy run list: a run-doc artifact + runs.plan only (no extra_json, no plan_id)
     mk("run", "init", "--id", "leg", "--feature", "Legacy", "--branch", "b2")
-    con = db.open_project(home, STORE_PROJECT, data_dir=data)
+    con = db.open_project(home, STORE_PROJECT_FALLBACK, data_dir=data)
     try:
         # a pre-L4 store keeps the run-level extras only in the run-doc artifact (the old
         # mk-state wrote it); write one directly, then blank the columns exactly as L4 sees them
@@ -5003,7 +5129,7 @@ def r2_fixes_self_test(tmp, env):
     mk("task", "add", "--id", "B2", "--title", "waits", "--deps", "RA:RT", "--run", "rb")
     mk("task", "set", "RT", "status=merged", "--run", "ra")
     mk("task", "set", "B2", "status=building", "--run", "rb")
-    con = db.open_project(home, STORE_PROJECT, data_dir=data)
+    con = db.open_project(home, STORE_PROJECT_FALLBACK, data_dir=data)
     try:
         assert con.execute("SELECT status FROM tasks WHERE run='rb' AND id='B2'").fetchone()["status"] == "building", \
             "an upper-case run id in a dep did not resolve"
@@ -5019,6 +5145,8 @@ def migrated_store_self_test(tmp, env):
     Pre-migration, a missing/corrupt/old-schema root, and a home that resolves only from a temp
     $HOME all fall back to <data>/mk.db and never raise.
     """
+
+    H = os.environ["MK_HOME"]  # Z3: the one real home (root projection)
     import hashlib as _h
     import sqlite3 as _sq
     here = os.path.dirname(os.path.abspath(__file__))
@@ -5082,7 +5210,7 @@ def migrated_store_self_test(tmp, env):
     assert status == "building" and notes == 1 and nxt == "dispatch the next task", (status, notes, nxt)
     # the OLD store never moved: no row landed there, and its bytes are unchanged
     assert sha(old_db) == old_sha, "the legacy <data>/mk.db changed after the switch"
-    old = db.open_project(os.path.join(data, ".mk-home"), STORE_PROJECT, data_dir=data)
+    old = db.open_project(H, STORE_PROJECT_FALLBACK, data_dir=data)
     try:
         assert old.execute("SELECT status FROM tasks WHERE run='r1' AND id='P1.1'").fetchone()["status"] == "planned"
         assert old.execute("SELECT COUNT(*) c FROM events WHERE run='r1' AND text='after switch'").fetchone()["c"] == 0
@@ -5103,7 +5231,7 @@ def migrated_store_self_test(tmp, env):
     assert out["task"]["status"] == "building", out
     assert os.path.exists(os.path.join(bdata, "mk.db")), "pre-migration write left the legacy store"
     assert not os.path.exists(os.path.join(bhome, "projects")), "pre-migration created a projects/ folder"
-    bcon = db.open_project(os.path.join(bdata, ".mk-home"), STORE_PROJECT, data_dir=bdata)
+    bcon = db.open_project(H, STORE_PROJECT_FALLBACK, data_dir=bdata)
     try:
         assert bcon.execute("SELECT status FROM tasks WHERE run='b1' AND id='BT'").fetchone()["status"] == "building"
     finally:
