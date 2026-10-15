@@ -72,6 +72,20 @@ def refuse_home(path):
     system temp dir. mk-livetest.py:61-69, reused rather than re-implemented."""
     return livetest.refuse_home(path)
 
+def _check_root(root):
+    """The run root: a real directory named mk-e2e-layout-* directly under the temp dir
+    (mk-livetest._check_root's shape, this script's prefix). Never the temp dir itself,
+    the root, or the real home."""
+    root = os.path.realpath(root)
+    parent, name = os.path.split(root)
+    if parent != temp_root() or not name.startswith(PREFIX):
+        raise FAIL(f"refusing a run root that is not {PREFIX}* under the temp dir: {root}")
+    if os.path.islink(root) or not os.path.isdir(root):
+        raise FAIL(f"refusing a run root that is not a real directory: {root}")
+    if root in (temp_root(), os.path.realpath("/"), os.path.realpath(os.path.expanduser("~"))):
+        raise FAIL(f"refusing to remove {root}")
+    return root
+
 
 def temp_root():
     return livetest.temp_root()
@@ -176,14 +190,48 @@ def _wait_until(fn, seconds, what):
     return fn()
 
 
-# --------------------------------------------------------------------------- the env
+def _default_home():
+    """The USER's real home (C16), NOT this process's: the password database wins
+    (mkdb._real_home copies it), $HOME is the fallback, so a temp-HOME test still
+    names the real default home it must never write."""
+    try:
+        import pwd
+        base = pwd.getpwuid(os.getuid()).pw_dir
+    except Exception:
+        base = os.path.expanduser("~")
+    return os.path.realpath(os.path.abspath(os.path.join(base, ".matrixkoder")))
+
+def _real_projects_rows():
+    """The real home's temp-pointing projects rows, read-only, as 'slug -> data'
+    strings. Snapshot for R15: only rows the run ADDED are a leak."""
+    real = _default_home()
+    db = os.path.join(real, "mk.db")
+    if not os.path.isfile(db):
+        return []
+    con = sqlite3.connect("file:" + db + "?mode=ro", uri=True)
+    try:
+        tables = {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        if "projects" not in tables:
+            return []
+        return sorted(
+            f"{slug} -> {data or dbp}" for slug, data, dbp in con.execute(
+                "SELECT slug, data_dir, db_path FROM projects")
+            if (data or "").startswith(tempfile.gettempdir())
+            or (dbp or "").startswith(tempfile.gettempdir()))
+    finally:
+        con.close()
+
 
 def mk_env(home, data=None, extra=None):
-    """A child env dict with BOTH home names (mkpaths.home(), mkpaths.py:59-76) and the
-    data dir. This process's own os.environ is never mutated."""
+    """A child env dict with BOTH home names (mkpaths.home(), mkpaths.py:59-76), the
+    data dir and MK_SELFTEST=1. Every write the child makes is refused outside the
+    temp tree by mkdb's C16 guard (mkdb.py:170-200). This process's own os.environ
+    is NOT read again here: do_run pins the parent once, at :185's setter."""
     env = dict(os.environ)
     env["MK_HOME"] = home
     env["MATRIXKODER_HOME"] = home
+    env["MK_SELFTEST"] = "1"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     for key in ("MK_BUS_DIR", "MK_BUS_TOKEN_FILE", "MATRIXKODER_DATA"):
         env.pop(key, None)
@@ -192,6 +240,40 @@ def mk_env(home, data=None, extra=None):
     if extra:
         env.update(extra)
     return env
+
+
+def _pin_parent_env(home):
+    """Pin the PARENT's own env to the temp home BEFORE any in-process mkdb/mk-state
+    call resolves the DEFAULT home (mkpaths.home() -> ~/.matrixkoder, mkpaths.py:76):
+    that is the leak that put the `e2e` row in the real root store. The pins stay for
+    the process's whole life; the guard flag arms mkdb's C16 write refusal."""
+    os.environ["MK_HOME"] = home
+    os.environ["MATRIXKODER_HOME"] = home
+    os.environ["MK_SELFTEST"] = "1"
+
+
+def _guard_refuses_real_home():
+    """C16, case (c): a planted UNPINNED write to the REAL default home is refused
+    by mkdb's own guard, in-process, before it can exist. Proves the guard fires
+    even when the caller has cleared the pins. MK_SELFTEST stays armed; only the
+    HOME pins are cleared."""
+    real = _default_home()
+    kept = {k: os.environ.get(k) for k in ("MK_HOME", "MATRIXKODER_HOME", "MK_SELFTEST")}
+    try:
+        os.environ["MK_SELFTEST"] = "1"
+        os.environ.pop("MK_HOME", None)
+        os.environ.pop("MATRIXKODER_HOME", None)
+        try:
+            mkdb.open_root(real).close()
+        except BaseException:
+            return      # refused: the case under test
+        raise FAIL(f"the guard ALLOWED a write into the real default home {real}")
+    finally:
+        for k, v in kept.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def _last_json(text):
@@ -418,6 +500,9 @@ def do_run(slug="e2e", keep=False):
     mkdb.check_slug(slug)
     # realpath: refuse_home and mkpaths both realpath, so a symlinked temp dir would make
     # every relative path in the audit come out as ../..
+    # Z17: snapshot the real home's projects rows BEFORE the run; R15 faults only on
+    # junk this run added (pre-existing junk is the user's call, listed, never a leak).
+    _real_before = _real_projects_rows()
     parent = os.path.realpath(tempfile.mkdtemp(prefix=PREFIX))
     home = refuse_home(os.path.join(parent, "home"))
     os.makedirs(home)
@@ -447,6 +532,11 @@ def do_run(slug="e2e", keep=False):
         return run_tool(script, *args, home=home, data=data, **kw)
 
     tool("mk-config.py", "list", "--json", "--data", data, timeout=60)
+    # Z17: pin THIS process's env before the in-process registrations below (mkstate.register_
+    # project -> mk-state.py:258's mkdb.open_root(home()), and _register at :663) resolve
+    # mkpaths.home(): without the pins they resolve the REAL ~/.matrixkoder and write the
+    # e2e row into the user's root store (the leak this task fixes).
+    _pin_parent_env(home)
     mkstate.register_project(slug, repo, data, name="e2e")
     mkdb.open_project(home, slug, data_dir=data).close()
 
@@ -562,6 +652,7 @@ def do_run(slug="e2e", keep=False):
         "bus_rows_before_archive": archived_before, "bus_rows_after_archive": archived_after,
         "archive_run_available": has_archive, "run_end_error": run_end_error,
         "bus_files_up": bus.files_up, "migrate_moves": moves, "migrate_skips": skips,
+        "real_home_junk_before": _real_before, "real_home_junk_after": _real_projects_rows(),
     }
     with open(os.path.join(home, "manifest.json"), "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=2, sort_keys=True)
@@ -580,6 +671,8 @@ def do_run(slug="e2e", keep=False):
         "new_store_written": before_writes != _store_digest(new_db),
         "run_end_error": run_end_error,
         "kept": True,
+        "real_home_junk_before": _real_before,
+        "real_home_junk_after": _real_projects_rows(),
     }
     if not keep:
         print(json.dumps(payload))
@@ -832,7 +925,7 @@ def build_rules():
             want = mkpaths.target_watch_cursors(slug, ctx["home"])
             if not os.path.isfile(want):
                 continue                                  # no watch ran: nothing to assert
-            if os.stat(want).st_mode & 0o777 != 0o600:
+            if (os.stat(want).st_mode & 0o777) != 0o600:
                 bad.append(f"{_rel(ctx, want)} mode != 0600")
             # the C2 answer is the ONLY watch-cursors.json anywhere under the temp root
             for rel in _walk(ctx["root"]):
@@ -904,6 +997,19 @@ def build_rules():
         return not bad, f"{len(rows)} plan rows in the root overview" + \
             (f"; wrong {bad}" if bad else ""), bad
 
+    def r15(ctx):
+        # C16 (Z17): the CALLER's real home never GAINS a temp-pointing projects row.
+        # Compare the after snapshot (from the payload) against the before one:
+        # pre-existing junk is the user's call, listed in the payload, never a new leak.
+        after = ctx.get("real_home_junk_after")
+        if after is None:
+            return True, "no after snapshot (older manifest): skipped", []
+        before = set(ctx.get("real_home_junk_before") or [])
+        bad = sorted(s for s in after if s not in before)
+        return not bad, "no NEW temp-pointing row in the real home" \
+            + (f"; new junk {bad}" if bad else ""), bad
+
+
     return [
         Rule("R01", "C2", "exactly the root mk.db and one mk.db per project", r01),
         Rule("R02", "C2", "the plan folder holds plan.md, assets/ and archive/", r02),
@@ -920,6 +1026,7 @@ def build_rules():
         Rule("R12", "C3", "the root store carries numbers and linkage only", r12),
         Rule("R13", "C2", "no per-plan DB and no bus DB", r13),
         Rule("R14", "C3", "the root overview alone carries every plan row the Plan tab needs", r14),
+        Rule("R15", "C16", "the caller's REAL home never gains an e2e row", r15),
     ]
 
 
@@ -973,6 +1080,8 @@ def build_context(home):
         "legacy_db": manifest.get("legacy_db") or {},
         "legacy_digest_after": manifest.get("legacy_digest_after") or {},
         "new_store_before": manifest.get("new_store_before") or {},
+        "real_home_junk_before": manifest.get("real_home_junk_before"),
+        "real_home_junk_after": manifest.get("real_home_junk_after"),
     }
 
 
@@ -1035,7 +1144,9 @@ def teardown(home, quiet=False):
     home = refuse_home(home)
     livetest._kill_buses(home)
     data = _read_marker(home)
-    root = livetest._check_root(data["root"])
+    # Z17: the run root is this script's OWN prefix, never livetest's mk-livetest-*
+    # (that mismatch made teardown dead code for its own run roots).
+    root = _check_root(data["root"])
     if not _inside(root, home):
         raise FAIL(f"home is not inside the run root: {home}")
     repos = [os.path.realpath(p) for p in (data.get("repos") or [])]
@@ -1334,6 +1445,16 @@ def self_test():
     _cli_fail(["--home", os.path.join(ROOT, ".matrixkoder-e2e-probe"), "run"])
     _check(not os.path.exists(os.path.join(ROOT, ".matrixkoder-e2e-probe")),
            "a refused run created a directory")
+    # C16 case (c): a planted UNPINNED write to the REAL default home is refused, in-process.
+    _guard_refuses_real_home()
+    # clean teardown: a run root named mk-e2e-layout-* is removable after the same prefix
+    # (Z17: livetest._check_root demanded mk-livetest-* here, so teardown was dead code).
+    root = os.path.realpath(tempfile.mkdtemp(prefix=PREFIX))
+    home = os.path.join(root, "home")
+    os.makedirs(home)
+    _write_marker(root, home, [])
+    teardown(home, quiet=True)
+    _check(not os.path.exists(root), "teardown left the run root behind")
     print("SELF-TEST PASS")
     return 0
 
