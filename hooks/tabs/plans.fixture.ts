@@ -57,6 +57,7 @@ export const PLANS_FIXTURE: PlansView = {
       runs: [],
       live_run: null,
       counts: { tasks: 9, phases: 3 },
+      project: 'matrixkoder',
     },
     {
       id: 'hive-cards',

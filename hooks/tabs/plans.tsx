@@ -30,7 +30,9 @@ export type RunRow = {
 }
 
 /** C8: one plan row. `counts` is the header's task/phase tally the Detail
- *  header card reads; `live_run` is the run a `running` plan is on. */
+ *  header card reads; `live_run` is the run a `running` plan is on. `project` is
+ *  the root `plan_summary.project` (the slug) — the List renders from the root
+ *  overview and needs it to name the C2 archive path (L7.2). */
 export type PlanRow = {
   readonly id: string
   readonly title: string
@@ -39,6 +41,8 @@ export type PlanRow = {
   readonly runs: readonly string[]
   readonly live_run: string | null
   readonly counts: { readonly tasks: number; readonly phases: number }
+  /** the owning project slug, when the source named one (the root overview's `plan_summary.project`) */
+  readonly project?: string
   /** Detail header extras the loader will fill; optional so a bare C8 row renders */
   readonly mergesTo?: string
   readonly design?: readonly string[]
@@ -98,6 +102,14 @@ function actionsFor(status: string): readonly PlanAction[] {
 function clip(text: string, w: number): string {
   if (text.length <= w) return text
   return `${text.slice(0, Math.max(1, w) - 1)}…`
+}
+
+/** C2: the folder a deleted plan's file moves to — `~/.matrixkoder/projects/<slug>/plans/<plan>/archive/`.
+ *  A slug is needed; the row's `project` carries it, and `matrixkoder` is the C16 default when
+ *  the source named none (the live project). Never the old `<repo>/.matrixkoder/plans/archive`. */
+export function planArchiveDir(plan: Pick<PlanRow, 'id' | 'project'>): string {
+  const slug = plan.project != null && plan.project !== '' ? plan.project : 'matrixkoder'
+  return `~/.matrixkoder/projects/${slug}/plans/${plan.id}/archive/`
 }
 
 /** Pure render: elements only, no $, no state (C1); `ui` is the C12 view state. */
@@ -209,7 +221,7 @@ function PlanLine(els: Els, plan: PlanRow, view: PlansView, W: number, compact: 
       </Box>
       {confirming && (
         <Box flexDirection="row" gap={1}>
-          <Text color={ROLE.err.fg}>{clip(`Delete ${plan.id}? File moves to plans/archive/.`, Math.max(1, W - 20))}</Text>
+          <Text color={ROLE.err.fg}>{clip(`Delete ${plan.id}? File moves to ${planArchiveDir(plan)}.`, Math.max(1, W - 20))}</Text>
           {ActionButton(els, {
             key: `plans-confirm-delete-${plan.id}`, glyph: '✕', word: 'Delete', tone: 'danger', plain: true,
             onPress: () => { ui?.set('plans:confirm', ''); fire('delete') },
