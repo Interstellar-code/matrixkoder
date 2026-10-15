@@ -427,6 +427,23 @@ def _header(con, plan_id):
         return {}
 
 
+def _design_refs(con, plan_id):
+    """The plan's design/asset references (paths under the checkout). The `design` COLUMN holds
+    them from D1.1 on; a store without the column keeps them in `header_json` (C3: the header was
+    their only home). Both shapes are read; the column wins when it carries a value."""
+    cols = {r["name"] for r in con.execute("PRAGMA table_info(plans)")}
+    if "design" in cols:
+        row = con.execute("SELECT design FROM plans WHERE id=?", (plan_id,)).fetchone()
+        if row and row["design"]:
+            try:
+                got = json.loads(row["design"])
+            except ValueError:
+                got = None
+            if isinstance(got, list):
+                return [x for x in got if isinstance(x, str) and x]
+    return [x for x in (_header(con, plan_id).get("design") or []) if isinstance(x, str) and x]
+
+
 def live_plans(con):
     """Plan ids with an active run (C5: only live plans move their files)."""
     if not _has_table(con, "plans"):
@@ -452,22 +469,70 @@ def _safe_design_ref(repo, rel):
     return src
 
 
+def _newest_archive(archive_dir, pid):
+    """The newest archived version `<archive_dir>/<pid>-v<n>.md`, or None. The version is read as
+    an integer, so v10 beats v9."""
+    if not os.path.isdir(archive_dir):
+        return None
+    best = None
+    for name in sorted(os.listdir(archive_dir)):
+        m = re.fullmatch(re.escape(pid) + r"-v(\d+)\.md", name)
+        if m and (best is None or int(m.group(1)) > best[0]):
+            best = (int(m.group(1)), os.path.join(archive_dir, name))
+    return best[1] if best else None
+
+
+def _approved_plan_file(data, con, pid):
+    """The plan's approved bytes (C5), in the order the contract names them: the file the row's
+    `archived_path` records (the newest version approve wrote), the newest archived version beside
+    the plan, then the plan file the current layout keeps (`<data>/plans/<id>.md`). None when the
+    plan has no markdown anywhere — the plan folder then still gets its empty `assets/`."""
+    row = con.execute("SELECT archived_path FROM plans WHERE id=?", (pid,)).fetchone()
+    for src in (row["archived_path"] if row else None,
+                _newest_archive(mkpaths.plan_archives_dir(data), pid),
+                mkpaths.plan_file(data, pid)):
+        if src and os.path.isfile(src):
+            return src
+    return None
+
+
+def _asset_sources(data, pid):
+    """Every pre-switch folder holding this plan's assets (C2): the plan's own dir
+    (`<data>/plans/<id>/` today) and the sibling `<id>-assets/` or `assets/` dir beside the plan
+    file. A missing one is simply absent. All of them land in the one `assets/` folder."""
+    plans = mkpaths.plans_dir(data)
+    out = []
+    for path in (mkpaths.plan_dir(data, pid), os.path.join(plans, f"{pid}-assets"),
+                 os.path.join(plans, "assets")):
+        if path not in out and os.path.isdir(path):
+            out.append(path)
+    return out
+
+
 def plan_moves(data, home, slug, con, pid, skips=None):
-    """Every file of ONE live plan: plan.md, assets (the plan's own dir plus its design refs),
-    its archived versions, and the round files of every task of every run of the plan. A design
+    """Every file of ONE live plan: plan.md, assets (the plan's own dir, a sibling assets dir and
+    its design refs), its archived versions, and the round files of every task of every run of the
+    plan. The plan folder always gets a `plan.md` and an `assets/`, even when the plan was approved
+    before the switch and left its file in the checkout — that is what R02 audits (C2). A design
     ref that escapes the repo is skipped and its label appended to `skips`."""
     out = []
     tdir = mkpaths.target_plan_dir(slug, pid, home)
-    pf = mkpaths.plan_file(data, pid)
-    if os.path.isfile(pf):
+    pf = _approved_plan_file(data, con, pid)
+    if pf:
         out.append({"label": f"plans/{pid}/plan.md", "kind": "file", "src": pf,
                     "dst": os.path.join(tdir, "plan.md")})
-    assets = mkpaths.plan_dir(data, pid)
-    if os.path.isdir(assets):
-        out.append({"label": f"plans/{pid}/assets/", "kind": "tree", "src": assets,
-                    "dst": os.path.join(tdir, "assets")})
+    adir = os.path.join(tdir, "assets")
+    for src in _asset_sources(data, pid):
+        out.append({"label": f"plans/{pid}/assets/ [{os.path.basename(src)}]", "kind": "tree",
+                    "src": src, "dst": adir})
+    # C2: the plan folder carries plan.md, assets/ and archive/ even when the plan has no asset
+    # file and no archived version of its own (an empty folder, never a missing one — that is what
+    # the e2e audit's R02 checks). `mkdir` moves are created, never hashed.
+    for name in ("assets", "archive"):
+        out.append({"label": f"plans/{pid}/{name}/", "kind": "mkdir",
+                    "dst": os.path.join(tdir, name)})
     repo = os.path.dirname(os.path.abspath(data))
-    for rel in (_header(con, pid).get("design") or []):
+    for rel in _design_refs(con, pid):
         src = _safe_design_ref(repo, rel)
         if src is None:
             if skips is not None:
@@ -533,7 +598,10 @@ def copy_moves(moves, repo):
     `_safe_design_ref` resolves a design ref against (the project's checkout)."""
     done = []
     for m in moves:
-        if m["kind"] == "file":
+        if m["kind"] == "mkdir":
+            os.makedirs(m["dst"], exist_ok=True)
+            done.append((m, None))
+        elif m["kind"] == "file":
             os.makedirs(os.path.dirname(m["dst"]), exist_ok=True)
             shutil.copy2(m["src"], m["dst"])
             done.append((m, _hash_file(m["src"])))
@@ -554,10 +622,14 @@ def copy_moves(moves, repo):
 
 
 def verify_moves(done):
-    """Labels whose bytes moved on either side since the copy (a write landed during the copy)."""
+    """Labels whose bytes moved on either side since the copy (a write landed during the copy).
+    A `mkdir` move writes no bytes: it is checked as "the folder exists", never re-hashed."""
     bad = []
     for m, want in done:
-        if m["kind"] == "file":
+        if m["kind"] == "mkdir":
+            if not os.path.isdir(m["dst"]):
+                bad.append(m["label"])
+        elif m["kind"] == "file":
             if _hash_file(m["src"]) != want or _hash_file(m["dst"]) != want:
                 bad.append(m["label"])
         else:
@@ -650,6 +722,9 @@ def do_copy_verify(home, data, slug, dry_run=False):
                            + "; ".join(sorted(set(bad))) + f" — inspect or remove {dest} and retry",
                            3)
         for m in moves:
+            if m["kind"] == "mkdir":
+                print(f"{'verify' if existing else 'mkdir'} {m['dst']}")
+                continue
             print(f"{'verify' if existing else 'copy'} {m['src']} -> {m['dst']}")
         for label in skips:
             print(f"skip {label}: outside the repo")
@@ -997,6 +1072,46 @@ lane_group = ""
 """
 
 
+Z15_PLAN = """+++
+plan = "z15plan"
+status = "draft"
+created = 2026-10-15
+runs = []
+design = ["z15-research.md"]
+integration = "main"
+
+[gates]
+test = "true"
+
+[[phase]]
+id = "P1"
+title = "one phase"
+wave = 1
+deps = []
+owned = []
+forbidden = []
+route = ""
+reviewer = ""
+size = "standard"
+risk = "reversible"
+review = "light"
+qa = []
+commit = "feat: p1"
+subagents = false
+lane_group = ""
+
+  [[phase.task]]
+  id = "P1.1"
+  title = "one task"
+  acceptance = "it works"
+  subagent = false
+  owned = []
++++
+
+# z15plan — the live plan of the Z15 case
+"""
+
+
 def _plan_fixture():
     """One REAL small plan file (its bytes) when the main checkout's plans/archive is reachable,
     else a synthetic one with the same header shape."""
@@ -1083,6 +1198,18 @@ def _cli(home, args, env=None):
     if env:
         e.update(env)
     proc = subprocess.run([sys.executable, os.path.abspath(__file__), *args],
+                          capture_output=True, text=True, env=e)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def _tool(script, home, *args, env=None):
+    """One SIBLING production script (mk-plan.py, mk-state.py), one JSON line — the same env
+    `_cli` pins, so a temp home and a temp data dir travel in the child's own env."""
+    e = dict(os.environ)
+    e.update({"MK_HOME": home, "MATRIXKODER_HOME": home, "MK_SELFTEST": "1"})
+    if env:
+        e.update(env)
+    proc = subprocess.run([sys.executable, os.path.join(HERE, script), *[str(a) for a in args]],
                           capture_output=True, text=True, env=e)
     return proc.returncode, proc.stdout, proc.stderr
 
@@ -1785,6 +1912,111 @@ def self_test():
         shutil.rmtree(mkpaths.target_project_dir("fixture", z7_home), ignore_errors=True)
         clear_db_path(z7_home, [z7_alias, "fixture"])
         ok("dry-run-names-only-what-it-would-change")
+
+        # 13. Z15 (todo: R02): a plan approved BEFORE the switch must still land in its plan
+        # folder with a plan.md and an assets/ — the C2 tree the e2e audit's R02 checks. Each
+        # case FAILS on e83e6e9 (proof in the report): the plan folder held only archive/.
+        z15_repo = os.path.join(tmp, "z15-repo")
+        z15_data = os.path.join(z15_repo, ".matrixkoder")
+        z15_home = os.path.join(tmp, "z15-home")
+        os.makedirs(os.path.join(z15_data, "plans"), exist_ok=True)
+        os.makedirs(z15_home, exist_ok=True)
+        subprocess.run(["git", "init", "-q", z15_repo], check=False)
+        # the design doc the plan header lists; it rides into assets/ (C2)
+        with open(os.path.join(z15_repo, "z15-research.md"), "w") as f:
+            f.write("# the design note assets/ carries\n")
+        z15_plan = os.path.join(z15_repo, "z15plan.md")
+        with open(z15_plan, "w") as f:
+            f.write(Z15_PLAN)
+        mkdb.open_project(z15_home, "fixture", data_dir=z15_data).close()
+        _root_rows_set(z15_home, [("fixture", z15_data)])
+        # import + approve BEFORE the switch, then start a run so the plan is live
+        rc, out, err = _tool("mk-plan.py", z15_home, "import", z15_plan,
+                             "--data", z15_data, "--home", z15_home)
+        _check(rc == 0, f"Z15 import rc={rc} {out[-300:]}")
+        rc, out, err = _tool("mk-plan.py", z15_home, "approve", z15_plan,
+                             "--data", z15_data, "--home", z15_home)
+        _check(rc == 0, f"Z15 approve rc={rc} {out[-300:]}")
+        rc, out, err = _tool("mk-state.py", z15_home, "run", "init", "--data", z15_data,
+                             "--by", "orch", "--id", "z15plan-r1", "--feature", "z15plan",
+                             "--branch", "mk/z15plan/lane", "--plan", z15_plan,
+                             env={"MATRIXKODER_DATA": z15_data})
+        _check(rc == 0, f"Z15 run init rc={rc} {out[-300:]}")
+        # BEFORE the switch the plan folder does not exist at all (the gap this task closes)
+        z15_pdir = mkpaths.target_plan_dir("fixture", "z15plan", z15_home)
+        _check(not os.path.exists(z15_pdir), "Z15: the C2 plan folder already existed before the switch")
+        z15_old = _tree_hash(z15_data)
+        # (a) switch: plan.md (the approved bytes), assets/ (the design ref) and archive/
+        rc, out, err = _cli(z15_home, ["--switch", "--slug", "fixture", "--data", z15_data,
+                                       "--repo", z15_repo])
+        _check(rc == 0, f"Z15 switch rc={rc} {out[-400:]}")
+        z15_md = os.path.join(z15_pdir, "plan.md")
+        _check(os.path.isfile(z15_md), f"Z15: no plan.md in the plan folder ({z15_pdir})")
+        _check(os.path.isdir(os.path.join(z15_pdir, "assets")),
+               "Z15: the plan folder has no assets/")
+        _check(os.path.isdir(os.path.join(z15_pdir, "archive")),
+               "Z15: the plan folder has no archive/")
+        with open(z15_md, "rb") as f:
+            z15_md_bytes = f.read()
+        with open(os.path.join(z15_pdir, "archive", "z15plan-v1.md"), "rb") as f:
+            z15_arch_bytes = f.read()
+        _check(z15_md_bytes == z15_arch_bytes,
+               "Z15: plan.md is not the approved version's bytes")
+        _check(b'status = "approved"' in z15_md_bytes,
+               "Z15: plan.md does not carry the approved status")
+        _check(os.path.isfile(os.path.join(z15_pdir, "assets", "z15-research.md")),
+               "Z15: the design ref was not carried into assets/")
+        _check(_tree_hash(z15_data) == z15_old,
+               "Z15: the switch changed the old data dir (copy, never move)")
+        ok("z15-live-plan-folder-after-switch")
+
+        # (b) rollback removes what the copy wrote: plan.md, assets/ and archive/ go with it.
+        _check(os.path.isfile(z15_md) and os.path.isdir(os.path.join(z15_pdir, "assets")),
+               "Z15: the copied plan folder is not there to roll back")
+        rc, out, err = _cli(z15_home, ["--rollback", "--slug", "fixture", "--data", z15_data])
+        _check(rc == 0, f"Z15 rollback rc={rc} {out[-400:]}")
+        _check(not os.path.exists(z15_pdir),
+               f"Z15: rollback left the plan folder behind ({z15_pdir})")
+        _check(os.path.isfile(os.path.join(z15_data, "mk.db")),
+               "Z15: rollback removed the OLD store")
+        ok("z15-rollback-removes-the-plan-folder")
+
+        # 13c. a plan with NO asset file at all still gets an empty assets/ (C2: the folder is
+        # part of the tree, not a side effect of having an asset).
+        z15b_repo = os.path.join(tmp, "z15b-repo")
+        z15b_data = os.path.join(z15b_repo, ".matrixkoder")
+        z15b_home = os.path.join(tmp, "z15b-home")
+        os.makedirs(os.path.join(z15b_data, "plans"), exist_ok=True)
+        os.makedirs(z15b_home, exist_ok=True)
+        subprocess.run(["git", "init", "-q", z15b_repo], check=False)
+        z15b_plan = os.path.join(z15b_repo, "z15bplan.md")
+        with open(z15b_plan, "w") as f:
+            f.write(Z15_PLAN.replace('design = ["z15-research.md"]', "design = []")
+                    .replace('plan = "z15plan"', 'plan = "z15bplan"'))
+        mkdb.open_project(z15b_home, "fixture", data_dir=z15b_data).close()
+        _root_rows_set(z15b_home, [("fixture", z15b_data)])
+        rc, out, err = _tool("mk-plan.py", z15b_home, "import", z15b_plan,
+                             "--data", z15b_data, "--home", z15b_home)
+        _check(rc == 0, f"Z15c import rc={rc} {out[-300:]}")
+        rc, out, err = _tool("mk-plan.py", z15b_home, "approve", z15b_plan,
+                             "--data", z15b_data, "--home", z15b_home)
+        _check(rc == 0, f"Z15c approve rc={rc} {out[-300:]}")
+        rc, out, err = _tool("mk-state.py", z15b_home, "run", "init", "--data", z15b_data,
+                             "--by", "orch", "--id", "z15bplan-r1", "--feature", "z15bplan",
+                             "--branch", "mk/z15bplan/lane", "--plan", z15b_plan,
+                             env={"MATRIXKODER_DATA": z15b_data})
+        _check(rc == 0, f"Z15c run init rc={rc} {out[-300:]}")
+        rc, out, err = _cli(z15b_home, ["--switch", "--slug", "fixture", "--data", z15b_data,
+                                        "--repo", z15b_repo])
+        _check(rc == 0, f"Z15c switch rc={rc} {out[-400:]}")
+        z15b_pdir = mkpaths.target_plan_dir("fixture", "z15bplan", z15b_home)
+        _check(os.path.isdir(os.path.join(z15b_pdir, "assets")),
+               "Z15c: a plan with no asset file got no assets/ folder")
+        _check(os.listdir(os.path.join(z15b_pdir, "assets")) == [],
+               "Z15c: assets/ should be empty when the plan has no asset")
+        _check(os.path.isfile(os.path.join(z15b_pdir, "plan.md")),
+               "Z15c: the plan folder has no plan.md")
+        ok("z15-empty-assets-folder")
 
     finally:
         for k, v in saved.items():
