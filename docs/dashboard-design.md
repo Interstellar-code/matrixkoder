@@ -222,7 +222,7 @@ Plan  3/6 done  W0 ✓  W1 ◐◐●  W2 ○
 
 ### 3.3 State Variation: No Active Run (Empty State)
 
-Shown when no run is active in `<data>/runs/` or after a run has been archived.
+Shown when no run is live in the project DB (`~/.matrixkoder/projects/<slug>/mk.db`) or after a run has been archived.
 
 ```
 Run
@@ -246,14 +246,14 @@ codex     ░░░░░░░░          n/a    n/a
 
 ### 3.4 State Variation: First-Run Setup (Wizard Incomplete)
 
-Shown when repository configuration (`.matrixkoder/matrixkoder.yaml`) is missing (global plugin prefs live in the plugin's userConfig, not a file).
+Shown when the project's configuration (`~/.matrixkoder/projects/<slug>/project.yaml`) is missing (global plugin prefs live in the plugin's userConfig, not a file).
 
 ```
 Setup
 ⬡ Welcome to MatrixKoder!
 
 Configuration required for this project:
-[!] Missing .matrixkoder/matrixkoder.yaml
+[!] Missing projects/<slug>/project.yaml
 
 ▶ Type /mk setup to launch the wizard
 
@@ -751,27 +751,28 @@ Only props verified in `claude-code.d.ts` are used.
 
 ## 7. Schema Requests & Field Inventory
 
-Every data field displayed across the dashboard mockups was checked against `docs/state-schema.md` (`run.json`, `usage.json`):
+Every data field displayed across the dashboard mockups was checked against `docs/state-schema.md` (the project DB `~/.matrixkoder/projects/<slug>/mk.db`, plus `usage.json`):
 
 ### 7.1 Field Inventory & Verification
-* `run.id`: **Exists** (`run.json` `id`).
-* `run.feature`: **Exists** (`run.json` `feature`).
-* `run.branch`: **Exists** (`run.json` `branch`).
-* `run.stage`: **Exists** (`run.json` `stage`, int 0–12).
-* `run.next`: **Exists** (`run.json` `next`, string | null).
-* `run.waiting`: **Exists** (`run.json` `waiting`: `{ question, options, rec, since }`).
-* `tasks[].id`, `title`, `wave`, `status`, `last_commit`: **Exists** in `run.json` `tasks[]`.
-* `tasks[].agent`, `model`, `lane`: **Exists** in `run.json` `tasks[]`.
-* `recent[].t`, `text`, `type`: **Exists** in `run.json` `recent[]`.
+The dashboard reads the project DB (the ONLY source of truth); the root `~/.matrixkoder/mk.db` holds only overview numbers and linkage (`projects`, `plan_summary`). No `run.json` snapshot is written or read.
+* `run.id`: **Exists** (project DB run row `id`).
+* `run.feature`: **Exists** (project DB run row `feature`).
+* `run.branch`: **Exists** (project DB run row `branch`).
+* `run.stage`: **Exists** (project DB run row `stage`, int 0–12).
+* `run.next`: **Exists** (project DB run row `next`, string | null).
+* `run.waiting`: **Exists** (project DB run row `waiting`: `{ question, options, rec, since }`).
+* `tasks[].id`, `title`, `wave`, `status`, `last_commit`: **Exists** in project DB `tasks`.
+* `tasks[].agent`, `model`, `lane`: **Exists** in project DB `tasks`.
+* `recent[].t`, `text`, `type`: **Exists** in the project DB `events` rows.
 * `usage.agents.<kind>.pools`: **Exists** per `B-usage-fix1.md`.
 * `usage.agents.<kind>.available_pools`: **Exists** per `B-usage-fix1.md`.
 
 ### 7.2 Formal Schema Requests
 To ensure no fields are invented or assumed without schema contract:
 
-1. **Schema Request 1: `run.head_sha` on `run.json`**
-   * *Motivation*: The mockups display the current commit SHA of the run branch (`main@82252eb`). Currently, `run.json` carries `"branch": "main"` but no root commit SHA (only individual tasks carry `last_commit`).
-   * *Requested Addition*: Add optional field `"head_sha": string | null` to `run.json` root object in `docs/state-schema.md`.
+1. **Schema Request 1: `run.head_sha` on the project DB run row**
+   * *Motivation*: The mockups display the current commit SHA of the run branch (`main@82252eb`). The run row carries `"branch": "main"` but no root commit SHA (only individual tasks carry `last_commit`).
+   * *Requested Addition*: Add optional field `"head_sha": string | null` to the project DB run row in `docs/state-schema.md`.
    * *Fallback in Mod*: If `head_sha` is absent, the dashboard renders `main` without `@<sha>`.
 2. **Schema Request 2: Confirmation of `pools` Ledger Structure**
    * *Status*: Confirmed aligned with `B-usage-fix1.md` §1–3 (`pools: { <name>: { five_hour, weekly, exhausted_until } }`).

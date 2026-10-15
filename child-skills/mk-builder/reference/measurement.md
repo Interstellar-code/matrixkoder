@@ -12,24 +12,27 @@ invented or rounded into prose.
 python3 child-skills/mk-builder/scripts/mk-builder.py measure --data <data> --run <id>
 ```
 
+`--data <data>` points at the project's data home; the run's records live in the project DB.
+
 One JSON line on stdout. Read-only: the `--self-test` case `t_measure_read_only` asserts that no
 file under `<data>` changes (paths, sizes and mtimes identical before and after) and that a
-second run is byte-identical. It reads `<data>/runs/<id>/events.jsonl` and
-`<data>/runs/<id>/tasks/*/brief-r*.md` and nothing else; torn event lines are skipped, not fatal
-(`mk-state.py:355-365`).
+second run is byte-identical. It reads the project DB `<home>/projects/<slug>/mk.db` — the run's
+DONE/STALL verdict events and its brief records — and nothing else; torn event rows are skipped,
+not fatal (`mk-state.py:355-365`). (Before the projects/ layout, until 2026-10-15, it read
+`<data>/runs/<id>/events.jsonl` and `<data>/runs/<id>/tasks/*/brief-r*.md`.)
 
 ## 2. The three metrics (exactly as `measure` reports them)
 
-1. **Brief lines and bytes per task** — every `brief-rN.md` under the run's `tasks/<T>/`, lines
-   (`wc -l` on the newline-terminated briefs mk-state writes) and bytes (`wc -c`). `task.json`,
-   `review-brief-rN.md` and reports are not briefs.
+1. **Brief lines and bytes per task** — every `brief-rN.md` under the run's task records in the
+   project DB, lines (`wc -l` on the newline-terminated briefs mk-state writes) and bytes
+   (`wc -c`). `review-brief-rN.md` and reports are not briefs.
 2. **Missed DONE lines per run** — DONE verdict events that needed the grace rule: evidence
    `source=grace`, or the pre-MB3 shape `no <phase> DONE token (...)` (`lane-watch.py:233-240`;
    settings-tab-r1 wrote `no S2 R3 DONE token (commit + report, agent idle 3.1 min)`). Counted
    per EVENT: `record()` writes one event per child task, and once more as a kept-status note
    (`lane-watch.py:317-345`), so a 4-child lane records one verdict up to 8×. Compare event
    counts across runs (same rule every time); when the number moves, read the incident in the
-   events themselves.
+   events themselves. Verdict events are rows in the project DB (`events`), not a file.
 3. **False STALLs per run** — STALL verdict events followed by a DONE verdict, or by any event
    mentioning a commit sha (7-40 hex), for the SAME task within 10 minutes. A deliberately
    strict proxy: it undercounts. In settings-tab-r1 both STALL waves were false (the lead
@@ -43,7 +46,7 @@ runs that predate the MB3 source tag — plan C4, `mk-lane-event.py:330-340`) an
 `(status … kept)` suffix, and the `<phase> BLOCKED: ` / `status file blocked: ` prefix
 stripped).
 
-## 3. Baseline — run `settings-tab-r1` (2026-10-10, before the skill existed)
+## 3. Baseline — run `settings-tab-r1` (2026-10-10, before the skill existed; its `data` field names the pre-projects/ layout, until 2026-10-15)
 
 Real output, verbatim (rerun any time with §1's command):
 
@@ -75,8 +78,8 @@ The reading:
 
 The orchestrator runs the same `measure` on the next two runs whose briefs come from the slim
 (MB4) template, after `mk-builder-skill` merges, and appends each run's JSON line plus the
-reading to `.matrixkoder/plans/mk-improvements.md` (§6). Two runs, not one, because round-1
-brief sizes vary by phase; two give the >= 20% rule something to bite on.
+reading to the plan `~/.matrixkoder/projects/<slug>/plans/mk-improvements/plan.md` (§6). Two runs,
+not one, because round-1 brief sizes vary by phase; two give the >= 20% rule something to bite on.
 
 ## 5. The verdict rule
 
@@ -97,15 +100,15 @@ worktrees — and THAT list, not the raw numbers, is what would justify per-agen
 
 ## 6. Where the numbers are recorded
 
-Results are appended to `.matrixkoder/plans/mk-improvements.md` under the run's own section
-(`## Run <id>` — the baseline's findings under `## Run settings-tab-r1`, line 112 today), with
-the final verdict cross-referenced from item 1 — **by the orchestrator, never by a lane agent**
-(lane agents cannot read other runs' data dirs).
+Results are appended to the plan `~/.matrixkoder/projects/<slug>/plans/mk-improvements/plan.md`
+under the run's own section (`## Run <id>` — the baseline's findings under `## Run
+settings-tab-r1`), with the final verdict cross-referenced from item 1 — **by the
+orchestrator, never by a lane agent** (lane agents cannot read other projects' DBs).
 
 ## 7. Results
 
-- Baseline (`settings-tab-r1`): recorded in §3 of this file; to be appended to
-  mk-improvements.md by the orchestrator.
+- Baseline (`settings-tab-r1`): recorded in §3 of this file; to be appended to the
+  `mk-improvements` plan by the orchestrator.
 - After runs: **pending** — two runs post-merge, taken by the orchestrator per §4.
 - Wrapper smoke test (plan `qa`): **pending orchestrator smoke test** — one pane per agent
   kind, `git stash` refused with the guard line, `git status` works; a Claude pane whose shell

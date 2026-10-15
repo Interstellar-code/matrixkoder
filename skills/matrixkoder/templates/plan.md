@@ -7,17 +7,17 @@
 # Lifecycle (C13):
 #   import <file>    loads the file into the store WITHOUT approving it (command added by D1)
 #   approve <file>   checks it, versions it, writes the tasks, copies the file to
-#                    <data>/plans/archive/<id>-v<n>.md and leaves it in <data>/plans/
+#                    <project>/plans/<id>/archive/plan-v<n>.md and leaves <project>/plans/<id>/plan.md
 #   run init --plan  starts the run for an approved plan
-#   After import the run and mk.db are the source: status, tasks, rounds and verdicts change
-#   there, never in this file — MK does not edit the file, it is a reference.
-#   When the plan is done, the file moves to <data>/plans/archive/.
-plan = "feature-id"                       # id [a-z0-9][a-z0-9-]{0,40}; the file is <data>/plans/<id>.md — plans.id (plans.title until D1 fills the H1 title)
+#   After import the run and the project DB are the source: status, tasks, rounds and verdicts
+#   change there, never in this file — MK does not edit the file, it is a reference.
+#   When the plan is done, the file stays where it is, with its versions in archive/.
+plan = "feature-id"                       # id [a-z0-9][a-z0-9-]{0,40}; the file is <project>/plans/<id>/plan.md — plans.id (plans.title until D1 fills the H1 title)
 status = "draft"                          # draft|approved|running|done|parked; run init --plan wants approved — plans.status (column added by D1; header_json until then)
 created = 2026-10-08                      # date the plan was drafted — plans.created (column added by D1; header_json until then)
 runs = []                                 # run ids; mk-plan.py add-run appends, never by hand — plans.header_json
 design = []                               # optional: research/spike docs behind the decisions (paths) — plans.design (column added by D1; header_json until then)
-integration = "mk/<feature>/integration"  # optional: branch the lanes merge into; default from matrixkoder.yaml — plans.integration (column added by D1; header_json until then)
+integration = "mk/<feature>/integration"  # optional: branch the lanes merge into; default from the project.yaml `repo.integration_branch` — plans.integration (column added by D1; header_json until then)
 
 [gates]                                   # full-suite gates the orchestrator reruns at merge and QA; scoped forms go in briefs — plans.header_json
 test = "<test cmd>"                       # e.g. pnpm vitest run — plans.header_json

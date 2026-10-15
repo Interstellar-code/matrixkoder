@@ -4,6 +4,14 @@ Rebuild of the `stellar-orchestrator` skill (`~/.claude/skills/stellar-orchestra
 plugin named **MatrixKoder**: skill + scripts + agents + a mod (right-side in-session dashboard, status
 chip, toasts, guards, resume, onboarding wizard). The old name is retired.
 
+> **Superseded storage decisions.** D5, D7 and §2c/§4 below are the 2026-10-07 design. The
+> projects/ layout replaced them (the old layout ran until 2026-10-15): two SQLite stores only, the root
+> `~/.matrixkoder/mk.db` (overview numbers and linkage) and `~/.matrixkoder/projects/<slug>/mk.db`
+> (the ONLY source of truth). The repo keeps no MK data, and `run.json`/`events.jsonl`/`task.json`/
+> `board.md` are no longer written or read. The authoritative layout is
+> [docs/state-schema.md](state-schema.md) and the storage-layout plan; read every old-layout
+> mention below as history.
+
 ## 1. Decisions made
 
 | # | Decision | By |
@@ -12,9 +20,9 @@ chip, toasts, guards, resume, onboarding wizard). The old name is retired.
 | D2 | Dashboard lives inside the Claude Code session, docked right (mod Pane), not a herdr/terminal pane | user |
 | D3 | Usage library: **CodexBar CLI** (one source for all agents) — chosen over OpenUsage, ClaudeBar, codeburn, agentsview | user + probe |
 | D4 | Develop locally in hermes-switchui first; dedicated repo `Interstellar-code/matrixkoder` later | user |
-| D5 | Project data in repo root `.matrixkoder/`, gitignored (for hermes-switchui) | user |
-| D6 | Wizard offers both install mode (local dev folder / marketplace) and data location (repo / home) | user |
-| D7 | Run state = `run.json` snapshot + `events.jsonl` history + per-task folders with per-round Markdown | user |
+| D5 | ~~Project data in repo root `.matrixkoder/`, gitignored~~ (superseded: project data lives in `~/.matrixkoder/projects/<slug>/`) | user |
+| D6 | ~~Wizard offers both install mode (local dev folder / marketplace) and data location (repo / home)~~ (superseded: install mode only; data location is always the project folder) | user |
+| D7 | Run state = the project DB (run/task rows, events); per-task folders hold per-round Markdown | user |
 | D8 | Worktree agents read only their brief; brief points read-only at the task's history folder | user |
 | D9 | Dashboard phase 1 read-only; buttons later | agreed |
 
@@ -25,10 +33,10 @@ chip, toasts, guards, resume, onboarding wizard). The old name is retired.
 ```
 ~/Development/
 ├─ matrixkoder/                    ← plugin SOURCE, own git repo; later: gh repo create + push as-is
-└─ hermes-switchui/
-   ├─ .gitignore                   + "/.matrixkoder/"
-   └─ .matrixkoder/                ← project DATA for hermes-switchui runs
+└─ hermes-switchui/                ← the repo keeps NO MK data (no .matrixkoder/)
 ```
+
+Project data for hermes-switchui runs lives in `~/.matrixkoder/projects/hermes-switchui/`.
 
 Load while developing: `claude --plugin-dir ~/Development/matrixkoder`
 (or `CLAUDE_CODE_PLUGIN_DIRS`). Plugin-dir folders hot-reload in an interactive session.
@@ -38,14 +46,27 @@ Load while developing: `claude --plugin-dir ~/Development/matrixkoder`
 `/plugin install matrixkoder --marketplace Interstellar-code/matrixkoder` — repo carries
 `.claude-plugin/marketplace.json`. Wizard step 1 detects which mode is active.
 
-### 2c. Global (always)
+### 2c. Global / per-project (the projects/ layout)
 
 ```
 ~/.matrixkoder/
+├─ mk.db              root: overview numbers and linkage (projects, plan_summary)
 ├─ usage.json         normalised quota ledger, all agents (one per user, not per project)
-├─ projects.json      { "<repo path>": { "data_dir": "...", "onboarded_at": "..." } }
-└─ locks/             cross-session locks (exclusive create + expires_at)
+├─ bus/               bus.json, bus-tokens.json, lanes/<sha256(lane)>.json, ring-queue.json
+└─ projects/<slug>/
+   ├─ mk.db           the project DB — the ONLY source of truth
+   ├─ project.yaml    today's matrixkoder.yaml
+   ├─ watch-cursors.json   orchestrator bus watch cursors
+   └─ plans/<plan-id>/
+      ├─ plan.md  assets/  archive/  (plan-v1.md, plan-v2.md …)
+      └─ runs/<run-id>/
+         ├─ bus.jsonl          archived bus messages, acks, bus artifacts (run end)
+         └─ <task-id>/         brief-rN.md, report-rN.md, review-rN.md
 ```
+
+`scripts/mkpaths.py` / `hooks/paths.ts` are the only path authority (C1); `scripts/mk-migrate.py`
+is the one migration tool (dry-run, copy, switch, rollback, archive). The 2026-10-07 design's
+`projects.json` repo→data_dir map is gone.
 
 ## 3. Plugin source structure
 
@@ -64,7 +85,7 @@ matrixkoder/
 │  │  └─ lessons.md                26 lessons carried over + new ones
 │  └─ templates/
 │     ├─ brief.md  review.md
-│     └─ matrixkoder.yaml          project settings template (was stellar.yaml)
+│     └─ project.yaml               project settings template (was stellar.yaml, then matrixkoder.yaml)
 ├─ agents/                         effort-low|medium|high|max.md (moved from ~/.claude/agents)
 ├─ hooks/
 │  ├─ hooks.json                   { "modules": ["./register.tsx"] }
@@ -78,7 +99,9 @@ matrixkoder/
 │  └─ *.test.ts                    claude plugin test
 ├─ types/index.d.ts                $.state contract (pane open, selected run, wizard step)
 ├─ scripts/
-│  ├─ mk-state.py                  ONLY writer of run state (init/task/set/event/lock/render/archive)
+│  ├─ mk-state.py                  ONLY writer of run state (init/task/set/event/lock/archive/render; the board text is printed to stdout from the DB)
+│  ├─ mkpaths.py                   the only path authority (project DB, plan/run/task folders, lane token, watch cursors)
+│  ├─ mk-migrate.py                the one migration tool (dry-run, copy, switch, rollback, archive)
 │  ├─ mk-usage.py                  codexbar → ~/.matrixkoder/usage.json (normalise, expire resets)
 │  ├─ lane-health.py               OK|STALL|QUOTA|PROVIDER|BLOCKED|DEV_SERVER|ERROR (fixed)
 │  ├─ lane-watch.py                watch → writes task state via mk-state (fixed)
@@ -89,30 +112,36 @@ matrixkoder/
 Skill-in-plugin and agents-in-plugin follow the standard Claude Code plugin layout; the mod docs only cover
 the hooks module, so P0 confirms all three load from one plugin.
 
-## 4. Project data structure (`<repo>/.matrixkoder/`)
+## 4. Project data structure (`~/.matrixkoder/projects/<slug>/`)
 
 ```
-.matrixkoder/
-├─ matrixkoder.yaml                gates, baselines, banned cmds, agents, routing, autonomy, QA
-├─ plans/<feature>.md              human plan (phases, waves, ownership matrix, contract)
-└─ runs/
-   ├─ index.json                   [{ id, feature, status: active|done|archived, started, ended }]
-   └─ <run-id>/
-      ├─ run.json                  snapshot (atomic tmp+rename) — dashboard reads only this
-      ├─ events.jsonl              append-only: transitions, decisions, verdicts, quota events
-      ├─ board.md                  generated by `mk-state render` (human / resume reading)
-      └─ tasks/<TASK>/
-         ├─ task.json              status, wave, deps, lane, owned files, agent·model·effort,
-         │                         gates, rounds[{n, kind, cause, verdict, sha}]
-         ├─ brief-r1.md   report-r1.md   review-r1.md
-         └─ brief-r2-fix.md   report-r2.md   review-r2.md
+projects/<slug>/
+├─ mk.db                           the project DB — the ONLY source of truth; no run.json,
+│                                  events.jsonl, task.json, board.md or run-doc artifact
+├─ project.yaml                    gates, baselines, banned cmds, agents, routing, autonomy, QA
+├─ watch-cursors.json              orchestrator bus watch cursors
+└─ plans/<plan-id>/
+   ├─ plan.md                      human plan (phases, waves, ownership matrix, contract)
+   ├─ assets/                      mockups, design files
+   ├─ archive/                     plan-v1.md, plan-v2.md …
+   └─ runs/<run-id>/
+      ├─ bus.jsonl                 archived bus messages, acks, bus artifacts (run end)
+      └─ <task-id>/                brief-r1.md report-r1.md review-r1.md; brief-r2-fix.md report-r2.md review-r2.md
 ```
 
 - Task status: `planned → routed → dispatched → building → verifying → review → fix → merged → qa → done`,
   side states `blocked | quota | stalled | provider`.
-- New project = new run folder + `index.json` line. Archive = status flag; folder never moves.
-- Briefs copied into a worktree are copies; the canonical file stays in the task folder.
-- Event line: `{"t":"2026-10-07T18:31","task":"FIX6","from":"building","to":"stalled","by":"lane-watch","evidence":"no change 11m"}`
+- New project = a root `projects` row + the project DB; new run = rows in the project DB. Archive = a
+  status flag; nothing moves.
+- Briefs copied into a worktree are copies; the canonical brief is the DB record.
+- Plan changes in a RUNNING plan go in the DB (`task set`, `task add`), not the plan `.md`;
+  `plan sync` needs `--from-file` on a live run.
+- Event row: `{"t":"2026-10-07T18:31","task":"FIX6","from":"building","to":"stalled","by":"lane-watch","evidence":"no change 11m"}`, stored in the project DB.
+
+The root `~/.matrixkoder/mk.db` holds only overview: `projects(slug, repo, data_dir, mode, db_path)`
+(`db_path` set = migrated) and `plan_summary(project, plan, title, status, counts_json, live_run, updated)`,
+PK (project, plan). `cards`, `project_summary` and `sync` stay until L7.3 drops them; cards live in the
+root only as a read-only view until dropped.
 
 ## 5. Usage tracking (CodexBar) — verified 2026-10-07
 
@@ -159,7 +188,7 @@ Mockup: see conversation 2026-10-07 (46-col right pane); becomes `matrixkoder/do
 Runs as pane steps; falls back to chat questions when not fullscreen. Every step pre-filled, one confirm at the end.
 
 1. Install mode detected (dev `--plugin-dir` / marketplace) — info only
-2. Data location: `<repo>/.matrixkoder/` (+ add to `.gitignore`) or `~/.matrixkoder/projects/<slug>/`
+2. Data: project folder detected (`~/.matrixkoder/projects/<slug>/`), the project DB created on confirm
 3. Agents: detect claude / codex / opencode / agy / herdr + model lists; tick to enable
 4. Usage: codexbar present? (show install cmd if not) → enable providers → live probe per agent; z.ai key entry
 5. Gates: detect test / typecheck / lint / format; measure baselines
@@ -167,7 +196,7 @@ Runs as pane steps; falls back to chat questions when not fullscreen. Every step
 7. Autonomy: pre-authorised list, builder permission-skip flags
 8. QA: dev URL, themes, mockups dir
 9. Dashboard prefs: auto-open, chip, toasts, poll intervals
-10. Review → write `matrixkoder.yaml`, `projects.json` (dashboard prefs are plugin settings, not a written file)
+10. Review → write `projects/<slug>/project.yaml`; update the root `mk.db` `projects` row (dashboard prefs are plugin settings, not a written file)
 
 Bootstrap of the old skill (read-only checks) becomes steps 3–8's detection.
 
@@ -180,7 +209,7 @@ Bootstrap of the old skill (read-only checks) becomes steps 3–8's detection.
 | 3 idle-without-commit waits 30 min | STALL on idle + no matching commit + no change N min; match `<PHASE> BLOCKED:` | P1 |
 | 4 quota regex misfires (scrollback, 429, weekly as 5h) | scan only text since dispatch; drop bare `rate limit`; window from codexbar | P2 |
 | 5 exhausted quota never clears | `resetsAt` passed → available | P2 |
-| 6 locks only on paper | `mk-state lock take/release/check` + `~/.matrixkoder/locks/` | P1 |
+| 6 locks only on paper | `mk-state lock take/release/check` (locks in the project DB) | P1 |
 | 7 DONE token never checked | lane-watch matches `<PHASE> DONE` in pane | P1 |
 | 8 stray `__pycache__` | not carried over | P3 |
 
@@ -188,12 +217,12 @@ Bootstrap of the old skill (read-only checks) becomes steps 3–8's detection.
 
 | # | Phase | Exit criteria |
 |---|---|---|
-| P0 | Spikes: (a) pane docks right in fullscreen; (b) skill + agents + hooks load from one plugin via `--plugin-dir`; (c) `$.command.run` starts an orchestrator turn when idle; (d) mod `$.fs`/`$.process` can read `.matrixkoder/` and run `codexbar`; (e) z.ai via codexbar with key | each answered yes/no in this file |
-| P1 | State core: `mk-state.py` (schema, run/task/event/lock/render/archive), lane-health + lane-watch fixes | `--self-test` passes; dry run creates a run, 2 tasks, events, board.md |
+| P0 | Spikes (done 2026-10-07, under the 2026-10-07 storage design): (a) pane docks right in fullscreen; (b) skill + agents + hooks load from one plugin via `--plugin-dir`; (c) `$.command.run` starts an orchestrator turn when idle; (d) mod `$.fs`/`$.process` can read the old data dir and run `codexbar`; (e) z.ai via codexbar with key | each answered yes/no in this file |
+| P1 | State core: `mk-state.py` (schema, run/task/event/lock/render/archive), lane-health + lane-watch fixes | `--self-test` passes; dry run creates a run and 2 tasks (before the projects/ layout that meant `run.json`, `events.jsonl`, `board.md`; today the rows land in the project DB) |
 | P2 | Usage: `mk-usage.py` normaliser + background poll | `usage.json` live for claude + agy; codex n/a; zai if key given |
 | P3 | Scaffold `matrixkoder/` (nested git), port skill/refs/templates/agents with renames, `.gitignore` entries | `claude plugin validate` clean; skill triggers on "orchestrate" |
 | P4 | Mod read-only: pane, chip, toasts, resume section | `claude plugin test`; visual check in fullscreen vs mockup |
-| P5 | Wizard | fresh repo onboarding writes all three files |
+| P5 | Wizard | fresh repo onboarding writes `project.yaml`, creates the project DB and the root `projects` row |
 | P6 | Guards, `mk_state` tool, wake (if P0c yes) | tests: denied commands, state writes, wake turn |
 | P7 | Pane buttons (approve waiting item, re-arm watcher, open review) | tests |
 | P8 | Publish: `gh repo create Interstellar-code/matrixkoder`, push nested repo, marketplace install test | install works in a clean session — user go required |

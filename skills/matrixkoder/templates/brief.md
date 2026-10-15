@@ -1,6 +1,6 @@
 # <PHASE> — <one-line goal>
 
-Repo: this folder (worktree `<path>`, branch `<branch>`, at `<sha>`: <what is already in>). Stack: <stack>. Plan `<plan id>`: `<data>/plans/<plan id>.md` (read-only) — phase `<PHASE id>`, its tasks `<P.n>`, `<P.n>` (acceptance lines in the plan header); history for this task: `<data>/runs/<id>/tasks/<T>/` (read-only). Do ONLY <PHASE>. Other agents work on: <lanes + their areas> — do not touch them.
+Repo: this folder (worktree `<path>`, branch `<branch>`, at `<sha>`: <what is already in>). Stack: <stack>. Plan `<plan id>`: `<project>/plans/<plan id>/plan.md` (read-only) — phase `<PHASE id>`, its tasks `<P.n>`, `<P.n>` (acceptance lines in the plan header); history for this task: `<project>/plans/<plan>/runs/<run>/<T>/` (read-only). Do ONLY <PHASE>. Other agents work on: <lanes + their areas> — do not touch them.
 
 ## Spec
 <what to build, as numbered parts. Point to files with `path:line`; point to mockups by path; state the API contract the code must use. Never paste code.>
@@ -48,7 +48,7 @@ You inherit uncommitted work — KEEP it and build on it:
 - Do, in order: <ordered finishing steps>. Do not start over.
 
 ## FIX (only for review findings)
-Findings: `<data>/runs/<id>/tasks/<T>/review-rN.md` — cite their numbers in the report.
+Findings: `<project>/plans/<plan>/runs/<run>/<T>/review-rN.md` — cite their numbers in the report.
 <numbered findings with acceptance per finding; same files/commands/rules as above>
 
 ## LEAD (only when phases share a lane_group)

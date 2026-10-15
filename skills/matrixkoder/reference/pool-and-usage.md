@@ -14,7 +14,7 @@
 
 Reviewer ≠ builder, preferably a different model family.
 
-## Model menu (snapshot 2026-10-08 — verify ids with each CLI at bootstrap and date them in `<data>/matrixkoder.yaml`)
+## Model menu (snapshot 2026-10-08 — verify ids with each CLI at bootstrap and date them in the project's `project.yaml`)
 
 This is the menu `jev_decide` picks from, not a size → model mapping. Put the "Jev note" into each candidate's description: Jev judges from the description, so a bare id gives it nothing to weigh. Older generations are left out on purpose.
 
@@ -70,7 +70,7 @@ Rules:
 
 ## Routing preferences (in the master plan)
 
-Stage 1 writes `## Routing preferences` from `matrixkoder.yaml` defaults; if the user never stated any, propose these and ask once:
+Stage 1 writes `## Routing preferences` from the project `project.yaml` defaults; if the user never stated any, propose these and ask once:
 - **Claude-sparing:** Claude Code orchestrates only; builders Codex → OpenCode → AGY → Claude.
 - **Reserve floors:** Claude ≥40% of 5h and ≥30% weekly left; others may go down to 10% / 15%.
 - The orchestrator saves Claude too: the watch/dispatch loop runs in scripts, the main thread can drop to sonnet between verify/merge stages; the reviewer route comes from `routing_preferences.reviewer` (`visual_reviewer` for visual/UI reviews) unless a phase pins its own.
@@ -100,7 +100,7 @@ Not every lane needs a separate human reviewer. Depth follows risk, and the revi
 | Shared run state, data-loss, security, guards, auth, shell, YAML/config writers, cross-run or concurrency logic | **Full reviewer.** (Evidence 2026-10-08: two full reviews on `mk-state` found 9 then 6 real bugs that passed every gate.) |
 
 **Reviewer choice** is generic, from the repo's MK config:
-- Candidates = agents with `available: true` in `<data>/matrixkoder.yaml` `agents:`, excluding the builder's model family, with quota left in `~/.matrixkoder/usage.json`.
+- Candidates = agents with `available: true` in the project `project.yaml` `agents:`, excluding the builder's model family, with quota left in `~/.matrixkoder/usage.json`.
 - Prefer a non-Claude agent in a herdr pane to spare Claude.
 - Use a Claude subagent only when it is the only family left or Jev routes it there.
 - Jev still picks agent + model + effort from those candidates.
