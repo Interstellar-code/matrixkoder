@@ -1460,33 +1460,38 @@ def _phases_from_run(rows, header):
     V1.5.1: every phase-level node carries the routing keys too — a round's lane tasks sit
     at phase level (root rows the live mirror may type 'phase' or 'task'), and their slot/
     pane/branch/route live on the row itself, null-defaulted when the row carries none.
+    Z13: the ATTACH pass does not assume a parent row precedes its children. rowid order only
+    holds at insert time (add_task, import_history's _parents_first); a re-parent (`task set
+    <id> parent=<later row>`) points a child at a row with a HIGHER rowid, so grouping in one
+    pass dropped such a task from its phase. Pass 1 builds every node, pass 2 attaches it,
+    which keeps today's order: phases and tasks stay in rowid order.
     """
     hwave = {str(p.get("id")): p.get("wave") for p in header.get("phases") or []
              if isinstance(p, dict) and p.get("id")}
     ids = {r["id"] for r in rows}
-    phases, tasks, subs = {}, {}, {}
-    for r in rows:  # add_task and import insert a parent before its children, so one pass is safe
-        node = {"id": r["id"], "title": r["title"], "status": r["status"], "parent": r["parent"],
-                "type": r["type"], "round": r["round"], "verdict": r["verdict"], **_routing_of(r),
-                "subtasks": []}
-        if not r["parent"] or r["parent"] not in ids:
+    roots = {r["id"] for r in rows if not r["parent"] or r["parent"] not in ids}
+    phases, nodes = {}, {}
+    for r in rows:  # pass 1: one node per row; a root row is a phase, everything else a child
+        if r["id"] in roots:
             ph = {"id": r["id"], "title": r["title"], "wave": hwave.get(r["id"]),
                   "deps": _deps_of(r["deps"]), "status": r["status"]}
             ph.update(_routing_of(r))
             ph["tasks"] = []
             phases[r["id"]] = ph
-        elif r["parent"] in phases:
-            tasks[r["id"]] = node
+        else:
+            nodes[r["id"]] = {"id": r["id"], "title": r["title"], "status": r["status"],
+                              "parent": r["parent"], "type": r["type"], "round": r["round"],
+                              "verdict": r["verdict"], **_routing_of(r), "subtasks": []}
+    for r in rows:  # pass 2: attach in rowid order — the parent node already exists, any depth
+        node = nodes.get(r["id"])
+        if node is None:
+            continue
+        if r["parent"] in phases:
             phases[r["parent"]]["tasks"].append(node)
         else:
-            subs[r["id"]] = node
-    for r in rows:  # second pass: a subtask nests under its parent node, any depth
-        node = subs.get(r["id"])
-        if not node:
-            continue
-        parent = tasks.get(r["parent"]) or subs.get(r["parent"])
-        if parent:
-            parent["subtasks"].append(node)
+            parent = nodes.get(r["parent"])
+            if parent:
+                parent["subtasks"].append(node)
     return list(phases.values())
 
 
@@ -2026,6 +2031,7 @@ def self_test():
         _extra_json_v5(home)
         _plans_query(home)
         _plans_detail(home)
+        _plans_reparent(home)
         _card_verdict(home)
         _summary_idempotent(home)
         _summary_two_projects(home)
@@ -3233,6 +3239,63 @@ def _plans_detail(home):
     _check(proc.returncode == 2 and "Traceback" not in proc.stderr,
            f"unknown id rc={proc.returncode} err={proc.stderr[-300:]}")
     _check(json.loads(proc.stdout)["ok"] is False, f"unknown id out {proc.stdout!r}")
+
+
+def _plans_reparent(home):
+    """Z13: grouping attaches by parent, never by row visit order.
+
+    rowid order only holds at insert time (add_task, import_history's _parents_first);
+    `task set <id> parent=<later row>` points a row at a parent inserted AFTER it. Case a: a
+    phase row created after its two tasks (the live store's Z1..Z11 under a later Z). Case b:
+    a subtask re-parented under a task that is itself re-parented under a later phase — the
+    one-pass grouping read the whole chain as subtasks and dropped it from the tree.
+    """
+    data = os.path.join(home, "plans-rp")
+    hdr = json.dumps({"status": "running", "created": "2026-03-01T00:00:00Z",
+                      "phases": [{"id": "P", "wave": 1}]})
+    con = open_project(home, data_dir=data)
+    try:
+        _begin(con)
+        for plan, run in (("rp-a", "rr-a"), ("rp-b", "rr-b")):
+            con.execute("INSERT INTO plans(id, version, title, header_json) VALUES (?,?,?,?)",
+                        (plan, 1, plan, hdr))
+            con.execute("INSERT INTO runs(id, plan, status, started) VALUES (?,?,?,?)",
+                        (run, "plans/" + plan + ".md", "active", "2026-03-01T00:00:00Z"))
+        con.execute("COMMIT")
+        add_task(con, "rr-a", "T1", "task", title="One")
+        add_task(con, "rr-a", "T2", "task", title="Two")
+        add_task(con, "rr-a", "P", "phase", title="Late phase")  # rowid AFTER its children
+        add_task(con, "rr-b", "S", "subtask", title="Deep child")
+        add_task(con, "rr-b", "B", "task", title="Later task")  # rowid after S
+        add_task(con, "rr-b", "P2", "phase", title="Latest phase")  # rowid after B
+        con.execute("UPDATE tasks SET parent='P' WHERE run='rr-a' AND id IN ('T1','T2')")
+        con.execute("UPDATE tasks SET parent='B' WHERE run='rr-b' AND id='S'")
+        con.execute("UPDATE tasks SET parent='P2' WHERE run='rr-b' AND id='B'")
+        con.commit()  # a re-parent, not an insert: the row orders above are the store's truth
+    finally:
+        con.close()
+    got = plans(home, data_dir=data, plan_id="rp-a")
+    pids = [p["id"] for p in got["phases"]]
+    _check(pids == ["P"], f"reparent phases {pids}")  # T1/T2 are no phase card of their own
+    _check([t["id"] for t in got["phases"][0]["tasks"]] == ["T1", "T2"],
+           f"reparent phase tasks {[t['id'] for t in got['phases'][0]['tasks']]}")
+    _check(got["counts"] == {"planned": 2}, f"reparent counts {got['counts']}")
+    proc = subprocess.run([sys.executable, os.path.abspath(__file__), "plans", "rp-a", "--home",
+                           home, "--data", data, "--json"], capture_output=True, text=True)
+    _check(proc.returncode == 0 and "Traceback" not in proc.stderr,
+           f"reparent cli rc={proc.returncode} err={proc.stderr[-300:]}")
+    cli = json.loads(proc.stdout)
+    _check([p["id"] for p in cli["phases"]] == ["P"]
+           and [t["id"] for t in cli["phases"][0]["tasks"]] == ["T1", "T2"],
+           f"reparent cli phases {cli['phases']}")
+    got = plans(home, data_dir=data, plan_id="rp-b")
+    pids = [p["id"] for p in got["phases"]]
+    _check(pids == ["P2"], f"reparent nested phases {pids}")
+    _check([t["id"] for t in got["phases"][0]["tasks"]] == ["B"],
+           f"reparent nested task {got['phases'][0]['tasks']}")
+    b = got["phases"][0]["tasks"][0]
+    _check([s["id"] for s in b["subtasks"]] == ["S"] and b["subtasks"][0]["subtasks"] == [],
+           f"reparent nested subtask {b['subtasks']}")
 
 
 def _seed_run(home, name, task="t"):
