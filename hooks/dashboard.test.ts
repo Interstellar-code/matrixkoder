@@ -8,6 +8,53 @@ import type { Files, MockWorld } from './testkit'
 import { parseYamlAgents } from './data'
 import { waitingPane, waitingPaneView } from './dashboard'
 import { mockTabCounts, waitingCount } from './tabs/header'
+import { RUN_SNAPSHOT } from './fixtures/run-snapshot'
+
+/* ---------------------------------------------------------------------------
+ * The REAL `mkdb.py run-snapshot --data <dir> --json` replies, captured by
+ * RUNNING the command on 2026-10-15 (see .mk-scratch-r2/reply-*.json, written by
+ * .mk-scratch-r2/build-store.py). The data dirs are real: one with no mk.db at
+ * all, one holding a real store built exactly the way mkdb.py's own --self-test
+ * builds a temp store (open_project + add_task + transition + a waits row).
+ *
+ * The capture is the PRE-fix shape: mkdb.py does not yet print a `store` key, so
+ * these two payloads are BYTE-IDENTICAL — which is the bug. A no-store reply
+ * `{ok:true, runs: [], active:null, run:null, waits:[]}` at exit 0 is exactly what a
+ * store that exists and holds no run also prints, so readStoreSnapshot cannot tell
+ * them apart and loadRunsFromFiles never runs on a pre-migration project.
+ *
+ * The fix adds ONE key: `"store": false` on a missing store, `"store": true` when
+ * the store opened. Everything else, the exit code and every existing key are
+ * unchanged. So the constants below are the captured bytes plus that key, and the
+ * tests are written against the POST-fix shape. Verified verbatim:
+ *   no store   `{"ok": true, "runs": [], "active": null, "run": null, "waits": []}`
+ *   0-run store (identical, apart from `mk.db` existing on disk)
+ * -------------------------------------------------------------------------- */
+
+/** the captured no-store reply + `"store": false` — the store is MISSING */
+const NO_STORE_SNAPSHOT = '{"ok": true, "runs": [], "active": null, "run": null, "waits": [], "store": false}'
+
+/** the captured 0-run-store reply + `"store": true` — the store is THERE and holds no run */
+const EMPTY_STORE_SNAPSHOT = '{"ok": true, "runs": [], "active": null, "run": null, "waits": [], "store": true}'
+
+/** The `process` answer for the pane's store read (C4/L5): `mkdb.py run-snapshot` replies
+ *  with the captured real payload, every other spawn with today's empty answer. The reply is
+ *  always a stdout STRING, because that is what `mkdb.py run-snapshot` really does: a missing
+ *  store is a successful exit-0 empty snapshot, NOT a failing exit code, so the only way the
+ *  pane learns the store is missing is the `store:false` key in the payload. Handed to
+ *  `mockWorld`, so it stays the ONE process.run registration the test has; the reply is read
+ *  through `state` because a test cannot register a second handler after the first `$.` call. */
+type StoreState = { reply: string; argv: string[][] }
+
+function storeSnapshot(state: StoreState): (argv: readonly string[]) => {
+  value: { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean; isStderrTruncated: boolean }
+} | undefined {
+  return a => {
+    state.argv.push([...a] as string[])
+    if (!a.includes('run-snapshot')) return undefined
+    return { value: { exitCode: 0, stdout: state.reply, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  }
+}
 
 /** a project matrixkoder.yaml in the wizard's emitter shape: agents block + usage providers */
 const PROJECT_YAML = [
@@ -24,6 +71,95 @@ const PROJECT_YAML = [
   '  poll_min: 5',
   '  providers: [claude, codex, antigravity]',
 ].join('\n')
+
+// --- C4/L5: the pane reads the project store; the file views are a fallback ---------------
+
+/** The captured reply's run as the file-view fixture the pane used to read: the same
+ *  document, so the two paths can be compared by what they DRAW, not by what they hold.
+ *  Only the run document feeds the pane (the chip, the run header, ▶ Next, the waiting
+ *  block, the task rows); the index list feeds the NoRun panel. */
+function storeRun(): Record<string, unknown> {
+  return JSON.parse(JSON.stringify(RUN_SNAPSHOT.run)) as Record<string, unknown>
+}
+
+test('C4/L5: the store reply renders the pane with the file views deleted', async ($, on) => {
+  const files: Files = {} // post-L4: no runs/index.json, no run.json, nothing
+  mockFs(on, files, [DATA_DIR, `${PROJECT_DIR}/.git`])
+  const store: StoreState = { reply: JSON.stringify(RUN_SNAPSHOT), argv: [] }
+  mockWorld(on, { process: storeSnapshot(store) })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  expect(await ui.find({ text: 'L5 fixtures' }), 'the run name comes from the store').toBeTruthy()
+  expect(await ui.find({ text: /▶ Next: verify T1 gates/ }), 'the next-action line').toBeTruthy()
+  expect(await ui.find({ text: /Merge T1 now\?/ }), 'the wait block').toBeTruthy()
+  expect(await ui.find({ text: /T1/ }), 'a task row').toBeTruthy()
+  const snap = store.argv.find(a => a.includes('run-snapshot'))
+  expect(snap?.[0]).toBe('python3')
+  expect(snap?.slice(2)).toEqual(['--data', DATA_DIR, 'run-snapshot', '--json'])
+})
+
+test('C4/L5: the store reply and the retired file views draw the same text', async ($, on) => {
+  // The same run, read twice: once off the store with no file view anywhere, and once off a
+  // run.json carrying the very document the store answered with. An identical draw is the
+  // acceptance: the reader is a drop-in for the view it replaces. One world, switched
+  // between the two reads — a test cannot register a second handler after the first `$.` call.
+  const files: Files = {}
+  mockFs(on, files, [DATA_DIR, `${PROJECT_DIR}/.git`])
+  const store: StoreState = { reply: JSON.stringify(RUN_SNAPSHOT), argv: [] }
+  const clock = mockWorld(on, { process: storeSnapshot(store) })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  const fromStore = rowTexts(await ui.drawn()).join('\n')
+  expect(fromStore.length, 'the store drew something').toBeGreaterThan(0)
+
+  files[`${DATA_DIR}/runs/l5fix/run.json`] = JSON.stringify(storeRun())
+  files[RUNS_INDEX] = JSON.stringify([{ id: 'l5fix', feature: 'L5 fixtures', status: 'active', started: '2026-10-07T16:00:00+02:00' }])
+  store.reply = NO_STORE_SNAPSHOT // mk.db is gone: the real exit-0 `store:false` reply, so the file views answer
+  await clock.advance(5000)
+  const fromFiles = rowTexts(await ui.drawn()).join('\n')
+  expect(fromStore, 'the store and the file view must draw the same text').toEqual(fromFiles)
+})
+
+test('C4/L5: no store falls back to the file views', async ($, on) => {
+  // The REAL mkdb.py answer for a project with no mk.db, captured verbatim (exit 0, `store:false`).
+  // This is the pre-migration project the fallback exists for: mkdb.py exits 0, not 2, so the pane
+  // can only see "no store" through the `store:false` key. The run drawn is the fixture's, not
+  // the store's (the reply names no runs at all), and run.json is really read off the fs mock.
+  const files = worldFiles()
+  const fs = mockFs(on, files)
+  mockWorld(on, { process: storeSnapshot({ reply: NO_STORE_SNAPSHOT, argv: [] }) })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  expect(await ui.find({ text: 'workflows-v2' }), 'the fallback drew the run').toBeTruthy()
+  expect(fs.reads, 'the fallback really read run.json').toContain(RUN_PATH)
+})
+
+test('C4/L5: a store that EXISTS with no run is not a missing store — no file fallback', async ($, on) => {
+  // The discriminating half of the pair above: a real mk.db holding zero runs prints the very
+  // same payload, and the only difference is `"store": true`. That is the NoRun panel, not a
+  // fallback — a stale run.json beside a live empty store must NOT be resurrected. Before the
+  // `store` key existed this reply and the no-store reply were byte-identical, so the pane read
+  // this one as a successful empty store by accident and only ever drew NoRun by luck.
+  const files = worldFiles()
+  const fs = mockFs(on, files)
+  mockWorld(on, { process: storeSnapshot({ reply: EMPTY_STORE_SNAPSHOT, argv: [] }) })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  expect(await ui.find({ text: 'No active orchestration run.' }), 'an empty store is the NoRun panel').toBeTruthy()
+  expect(await ui.find({ text: 'workflows-v2' }), 'the stale run.json is not resurrected').toBeUndefined()
+  expect(fs.reads, 'the store answered, so the file views are never consulted').not.toContain(RUN_PATH)
+})
+
+test('C4/L5: the store wins over the file views when both are present', async ($, on) => {
+  const files = worldFiles()
+  setRun(files, run => { run.feature = 'from-the-file-view' })
+  mockFs(on, files)
+  mockWorld(on, { process: storeSnapshot({ reply: JSON.stringify(RUN_SNAPSHOT), argv: [] }) })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  expect(await ui.find({ text: 'L5 fixtures' }), 'the store is the source of truth').toBeTruthy()
+  expect(await ui.find({ text: 'from-the-file-view' }), 'the file view is not consulted').toBeUndefined()
+})
 
 test('renders section titles, a task row and the agy pool sub-row', { plugins: [worldFixtures] }, async ($, on) => {
   const files = worldFiles()

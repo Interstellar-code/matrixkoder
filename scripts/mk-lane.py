@@ -789,8 +789,29 @@ def lock_hash(path):
     return None
 
 
+def store_snapshot(data, run=None):
+    """-> mkdb.run_snapshot's answer for the project store, or None when the store cannot
+    answer: no mk.db (a pre-migration project), an unreadable/newer one, or — with `run` named —
+    a run the store does not know. Read-only (mode=ro) like every other mkdb reader: it never
+    creates, migrates or writes mk.db, and the file's existence is the gate, exactly as store_db.
+    The gate is mkpaths.project_folder's — the same store run_snapshot opens — so a migrated
+    project is gated on its C2 store, never on the pre-switch copy left in the data dir."""
+    try:
+        if not data or not os.path.isfile(os.path.join(
+                mkpaths.project_folder(data, home_arg=mkpaths.home()), "mk.db")):
+            return None
+        return mkdb.run_snapshot(mkpaths.home(), None, run, data_dir=data)
+    except Exception:  # a store we cannot read must not fail an acquire: the file view answers
+        return None
+
+
 def run_ids(data):
-    """-> the run ids mk-state knows: <data>/runs/index.json, the same list `run list` prints."""
+    """-> the run ids mk-state knows, the same list `run list` prints. The project store's runs
+    table is the source; <data>/runs/index.json is only the pre-L4 fallback a project with no
+    store (or a store that has not imported its runs yet) still needs."""
+    snap = store_snapshot(data)
+    if snap is not None and snap["runs"]:
+        return [r["id"] for r in snap["runs"]]
     idx = mk_state.read_json(mkpaths.runs_index(data), [])
     if not isinstance(idx, list):
         return []
@@ -799,7 +820,8 @@ def run_ids(data):
 
 def resolve_run(data, run):
     """-> the stored run id for `run`, matched case-insensitively (ids are case-insensitive, run
-    dirs are not on every filesystem). None when mk-state knows no such run."""
+    dirs are not on every filesystem). None when neither the store nor the pre-L4 index knows such
+    a run — cmd_acquire refuses on it, and the mk-state write below must use the stored spelling."""
     for rid in run_ids(data):
         if str(rid).lower() == run.lower():
             return rid
@@ -807,9 +829,17 @@ def resolve_run(data, run):
 
 
 def resolve_task(data, rid, task):
-    """-> the task id as stored in the run's run.json (mk-state matches task ids by case, so the
-    write must use the stored spelling). Falls back to `task` when the run or its task list cannot
-    be read: the mk-state write stays best-effort, exactly as before."""
+    """-> the task id as stored in run `rid` (mk-state matches task ids by case, so the write must
+    use the stored spelling). The store's task list for that run is the source; the pre-L4
+    <data>/runs/<rid>/run.json is the fallback a project with no store still needs. Falls back to
+    `task` as typed when neither can be read: the mk-state write stays best-effort, exactly as
+    before."""
+    snap = store_snapshot(data, rid)
+    if snap is not None:  # the store knows this run: its task list is the answer, no file read
+        for t in (snap.get("run") or {}).get("tasks") or []:
+            if isinstance(t, dict) and str(t.get("id") or "").lower() == task.lower():
+                return t["id"]
+        return task
     try:
         run = mk_state.read_json(mkpaths.run_doc(data, rid), None)
     except (OSError, ValueError):
@@ -2837,6 +2867,128 @@ def self_test():
                              capture_output=True, text=True, env=dict(env, MK_HERDR="none"), cwd=repo)
         nf = json.loads(got.stdout)
         assert nf["ok"] and nf["lanes"][0]["step"] is None and nf["lanes"][0]["commits_ahead"] == 1, nf
+
+        # ---- L5: run/task resolution reads the project store; the run files are the fallback ----
+        # A store-backed project, built the way mk-state builds one: the files first, then
+        # `store enable` imports them and republishes the views. Every resolution assertion below
+        # holds with those file views present AND with <data>/runs deleted outright — the post-L4
+        # world, where mk-state writes none of them.
+        rsd = os.path.join(tmp, "data-resolve-store")
+        os.makedirs(rsd)
+        write(os.path.join(rsd, "matrixkoder.yaml"),
+              'repo:\n  lanes: { slots: 1, pattern: "../{repo}-res-{n}", reuse: true }\n')
+
+        def st_at(ddir, *args, code=0):
+            r = subprocess.run([sys.executable, os.path.join(HERE, "mk-state.py"), *args,
+                                "--data", ddir], capture_output=True, text=True, env=env, cwd=repo)
+            assert r.returncode == code, (args, r.returncode, r.stdout, r.stderr)
+            return json.loads(r.stdout.strip()) if r.stdout.strip() else {}
+
+        # a run id is slug-shaped (lowercase): `store enable` refuses any other
+        st_at(rsd, "run", "init", "--id", "rs1", "--feature", "F", "--branch", "b")
+        st_at(rsd, "task", "add", "--id", "Rt1", "--title", "one")
+        st_at(rsd, "task", "add", "--id", "Rt2", "--title", "two")
+        st_at(rsd, "task", "add", "--id", "Rt3", "--title", "three")
+        st_at(rsd, "store", "enable")
+        assert os.path.isfile(os.path.join(rsd, "mk.db")), "store enable wrote no mk.db"
+
+        def resolutions(ddir):
+            """Every answer run_ids/resolve_run/resolve_task give for the store fixture, as one dict."""
+            return {"ids": run_ids(ddir),
+                    "exact": resolve_run(ddir, "rs1"), "upper": resolve_run(ddir, "RS1"),
+                    "mixed": resolve_run(ddir, "Rs1"), "unknown": resolve_run(ddir, "nope"),
+                    "task_exact": resolve_task(ddir, "rs1", "Rt1"),
+                    "task_upper": resolve_task(ddir, "rs1", "RT1"),
+                    "task_lower": resolve_task(ddir, "rs1", "rt1"),
+                    "task_other": resolve_task(ddir, "rs1", "RT2"),
+                    "task_unknown": resolve_task(ddir, "rs1", "nope"),
+                    "task_no_run": resolve_task(ddir, "nosuch", "rt1")}
+
+        want = {"ids": ["rs1"], "exact": "rs1", "upper": "rs1", "mixed": "rs1", "unknown": None,
+                "task_exact": "Rt1", "task_upper": "Rt1", "task_lower": "Rt1", "task_other": "Rt2",
+                "task_unknown": "nope", "task_no_run": "rt1"}
+        # (b) the file views are present — today's world, and the store is already the source
+        assert os.path.isfile(mkpaths.run_doc(rsd, "rs1")), "store enable published no run.json"
+        assert os.path.isfile(mkpaths.runs_index(rsd))
+        assert resolutions(rsd) == want, resolutions(rsd)
+        # (d) an unknown run still resolves to None, and acquire refuses naming the store's runs
+        assert resolve_run(rsd, "nope") is None
+        bad = mk_at(rsd, env, "acquire", "--run", "nope", "--task", "Rt1", "--base", "main", code=2)
+        assert bad["ok"] is False and "unknown run 'nope'" in bad["error"], bad
+        assert bad["known_runs"] == ["rs1"], bad
+        assert not os.path.exists(os.path.join(rsd, "lanes.json")), "a refused acquire wrote lanes.json"
+        # (c) the whole acquire off the store, with both ids typed in the wrong case: the writes
+        # must carry the stored spelling, which only a store-backed resolve can produce
+        acq = mk_at(rsd, env, "acquire", "--run", "RS1", "--task", "rt1", "--base", "main")
+        assert acq["ok"] and acq["slot"] == 1, acq
+        assert "mk-state task set" not in (acq.get("warning") or ""), acq
+        con = mkdb.open_project(lane_home, data_dir=rsd)
+        try:
+            row = dict(con.execute("SELECT id, lane, slot FROM tasks"
+                                   " WHERE run='rs1' AND id='Rt1'").fetchone())
+        finally:
+            con.close()
+        assert row["id"] == "Rt1" and row["lane"] and row["slot"] == "1", row
+        assert mk_at(rsd, env, "release", "--slot", "1",
+                     "--integration", "mk/r1/integration")["ok"]
+        # (a) the two files the readers used to read are gone: runs/index.json and the run
+        # documents. That is the whole post-L4 world for a reader — mk-state writes neither, and
+        # only the store is left to answer. The directory itself stays: mk-state's own store
+        # writer still wants <data>/runs/<rid>/ to exist (L4's business, not this reader's).
+        os.unlink(mkpaths.runs_index(rsd))
+        for _t in os.listdir(os.path.join(rsd, "runs", "rs1", "tasks")):
+            _p = os.path.join(rsd, "runs", "rs1", "tasks", _t)
+            _sh.rmtree(_p) if os.path.isdir(_p) else os.unlink(_p)
+        os.unlink(mkpaths.run_doc(rsd, "rs1"))
+        assert not os.path.exists(mkpaths.run_doc(rsd, "rs1"))
+        assert not os.path.exists(mkpaths.runs_index(rsd))
+        assert resolutions(rsd) == want, resolutions(rsd)
+        # and an acquire still resolves both ids off the store with neither file present
+        acq2 = mk_at(rsd, env, "acquire", "--run", "Rs1", "--task", "rt2", "--base", "main")
+        assert acq2["ok"] and acq2["slot"] == 1, acq2
+        assert "mk-state task set" not in (acq2.get("warning") or ""), acq2
+        con = mkdb.open_project(lane_home, data_dir=rsd)
+        try:
+            row = dict(con.execute("SELECT id, lane, slot FROM tasks"
+                                   " WHERE run='rs1' AND id='Rt2'").fetchone())
+        finally:
+            con.close()
+        assert row["id"] == "Rt2" and row["lane"] and row["slot"] == "1", row
+        assert mk_at(rsd, env, "release", "--slot", "1",
+                     "--integration", "mk/r1/integration")["ok"]
+        # the same, with no MK home in the environment at all: a temp $HOME and nothing set
+        bare = {k: v for k, v in env.items()
+                if k not in ("MK_HOME", "MATRIXKODER_HOME", "MATRIXKODER_DATA")}
+        bare["HOME"] = os.path.join(tmp, "bare-home")
+        os.makedirs(bare["HOME"])
+        assert not os.path.exists(os.path.join(bare["HOME"], ".matrixkoder"))
+        got = subprocess.run([sys.executable, self_path, "acquire", "--run", "Rs1", "--task", "RT3",
+                              "--base", "main", "--data", rsd], capture_output=True, text=True,
+                             env=bare, cwd=repo)
+        assert got.returncode == 0 and json.loads(got.stdout)["ok"], (got.returncode, got.stdout,
+                                                                       got.stderr)
+        assert not os.path.exists(os.path.join(bare["HOME"], ".matrixkoder")), "a read created a home"
+        r = subprocess.run([sys.executable, self_path, "release", "--slot", "1", "--integration",
+                            "mk/r1/integration", "--data", rsd], capture_output=True, text=True,
+                           env=bare, cwd=repo)
+        assert r.returncode == 0 and json.loads(r.stdout)["ok"], (r.returncode, r.stdout, r.stderr)
+
+        # (e) a pre-migration project: no store at all, so the run files are still the source
+        nsd = os.path.join(tmp, "data-resolve-file")
+        os.makedirs(nsd)
+        st_at(nsd, "run", "init", "--id", "Fs1", "--feature", "F", "--branch", "b")
+        st_at(nsd, "task", "add", "--id", "Ft1", "--title", "one")
+        assert not os.path.exists(os.path.join(nsd, "mk.db")), "a file-mode run created mk.db"
+        assert store_snapshot(nsd) is None
+        assert run_ids(nsd) == ["Fs1"], run_ids(nsd)
+        assert resolve_run(nsd, "fS1") == "Fs1" and resolve_run(nsd, "nope") is None
+        assert resolve_task(nsd, "Fs1", "FT1") == "Ft1", resolve_task(nsd, "Fs1", "FT1")
+        assert resolve_task(nsd, "Nosuch", "ft1") == "ft1"
+        assert resolve_task(nsd, "Fs1", "nope") == "nope"
+        # with no store the ids come from index.json alone: a run.json that is gone is still known
+        os.unlink(mkpaths.run_doc(nsd, "Fs1"))
+        assert run_ids(nsd) == ["Fs1"], run_ids(nsd)
+        assert resolve_run(nsd, "Fs1") == "Fs1" and resolve_task(nsd, "Fs1", "ft1") == "ft1"
 
         print("mk-lane self-test ok")
         # R1.2: the mkdb write guard refuses the real home from this suite too.

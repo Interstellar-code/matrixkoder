@@ -7,6 +7,8 @@
   plans --project P|--data D [--json]          # every plan row (C5, C8)
   plans --project P|--data D <id> --json       # one plan with its phases
   overview --json                            # the root's projects + plans: numbers and db_path (C3)
+  run-snapshot --project P [--run R] --json    # the runs list, the active run and its tasks (L5)
+  events --project P --run R [--task T] [--chan C] [--since N] --json   # the run's events (L5)
 
 Common: --data DIR (the project data dir; until DM a project lives at <repo>/.matrixkoder/),
 --home DIR (the MK home, default $MK_HOME or ~/.matrixkoder), --project SLUG.
@@ -1491,6 +1493,50 @@ def timeline(home, project, run, task, data_dir=None):
         con.close()
 
 
+EVENT_COLS_READ = ("id", "run", "task", "t", "chan", "kind", "from_id", "to_id", "reply_to",
+                   "text", "meta_json")
+
+
+def events(home, project, run, data_dir=None, task=None, chan="state", since=None):
+    """One run's events, in id order — the run-wide feed timeline() cannot serve (L5).
+
+    timeline() needs --task and drops from_id/reply_to/meta_json; wake.ts polls the whole run
+    with the events.id cursor, so this adds the two selectors it needs: --task narrows to one
+    task and --since returns the rows past that id (the cursor, one indexed range scan).
+    `chan` defaults to 'state' — the chan mk-state writes the run document and events.jsonl
+    from; pass '' for every channel. Read-only like timeline(): a missing store is an empty
+    list, no file and no directory is created. meta_json carries `by` and the source key; a
+    direct mkdb.transition() leaves it NULL, which the reader maps to "orchestrator".
+    """
+    con = _open_read(_store_path(home, project, data_dir), SCHEMA)
+    if con is None:
+        return []
+    where, params = ["run=?"], [run]
+    if task:
+        where.append("task=?")
+        params.append(task)
+    if chan:
+        where.append("chan=?")
+        params.append(chan)
+    if since is not None:
+        where.append("id>?")
+        params.append(since)
+    try:
+        return [dict(r) for r in con.execute(
+            f"SELECT {', '.join(EVENT_COLS_READ)} FROM events WHERE {' AND '.join(where)}"
+            " ORDER BY id", params)]
+    finally:
+        con.close()
+
+
+def _store_present(home, project, data_dir):
+    """Whether this project's store file exists — the marker a read-only CLI reply carries.
+
+    A stat, not an open: a reader that already holds the connection gets the flag from
+    _store_open, and one that only needs the flag does not pay for a second open."""
+    return os.path.isfile(_store_path(home, project, data_dir))
+
+
 def cards(home, project=None):
     """Read the root store's cards, optionally one project.
 
@@ -1783,6 +1829,174 @@ def plans(home, project=None, data_dir=None, plan_id=None):
         con.close()
 
 
+# The run-doc artifact kind mk-state writes: the run.json document, minus the columns the runs
+# and tasks tables carry. L5: run-snapshot reads the tables for the columns and this artifact for
+# the file-only keys (feature, waiting, recent, and each task's wave/ready/gates/rounds/last_commit).
+RUN_DOC = "run-doc"
+
+
+def _run_doc(con, run):
+    """The newest run-doc artifact of run as a dict, or {} when there is none (or it is not JSON).
+
+    The artifact is a whole run.json written by mk-state on every store commit; mk-state's own
+    load_store overlays the columns on top of it, and so does run_snapshot. A run with no
+    artifact (a plain mkdb writer, an imported row set) still reads: the columns carry it.
+    """
+    row = con.execute(
+        "SELECT text FROM artifacts WHERE run=? AND kind=? AND task IS NULL ORDER BY id DESC LIMIT 1",
+        (run, RUN_DOC)).fetchone()
+    if row is None:
+        return {}
+    try:
+        got = json.loads(row["text"] or "")
+    except (TypeError, ValueError):
+        return {}
+    return got if isinstance(got, dict) else {}
+
+
+def _stage_of(row):
+    """runs.stage is TEXT ('6'); the run document carries an int. A non-numeric column is 0."""
+    text = str(row["stage"] or "")
+    return int(text) if text.isdigit() else 0
+
+
+def _published_status(row, ready):
+    """The status the run document published. The store's `ready` is a kanban column, not a
+    status: it publishes as file_status (`planned` or `routed`) plus ready=True. Every other
+    status is the column's own word. load_store computes the pair exactly this way."""
+    status = row["status"] or "planned"
+    if status == "ready":
+        return (row["file_status"] if row["file_status"] in ("planned", "routed") else "planned"), True
+    return status, ready
+
+
+def _task_obj(row, extra):
+    """One task as the run document held it: the artifact dict overlaid with the table columns.
+
+    The columns win (the store is the read source); the artifact supplies the file-only keys
+    (wave, ready, gates, rounds, last_commit, reviewer, plan_phase). `type` is not overlaid,
+    matching load_store: it is derived per row, so a legacy task keeps the spelling it was
+    written with. acceptance is overlaid only when the column is non-empty, so a legacy task
+    does not gain a key it never had.
+    """
+    route = _route_of(row["route_json"]) or {}
+    obj = dict(extra)
+    status, ready = _published_status(row, bool(obj.get("ready")))
+    obj.update({
+        "id": row["id"], "title": row["title"] or "", "parent": row["parent"],
+        "deps": _deps_of(row["deps"]), "owned": _deps_of(row["owned"]), "status": status,
+        "lane": row["lane"], "slot": row["slot"], "branch": row["branch"], "pane": row["pane"],
+        "round": row["round"] or 0, "verdict": row["verdict"], "updated": row["updated"],
+        "ready": ready,
+        "agent": route.get("agent"), "model": route.get("model"), "effort": route.get("effort"),
+    })
+    if "type" not in obj:  # no run-doc artifact, or one that omits it: the column is the only source
+        obj["type"] = row["type"] or "task"
+    if row["acceptance"]:
+        obj["acceptance"] = row["acceptance"]
+    if route.get("route"):
+        obj["route"] = route["route"]
+    return obj
+
+
+def _run_obj(con, row, doc):
+    """One run as the run document held it, with its tasks in the document's order.
+
+    runs.plan holds the plan id on rows mk-state wrote; the artifact's `plan` is the plan file
+    path, and it wins when the column only repeated the id (load_store's rule). A task row the
+    artifact does not list yet still appears, after the listed ones, in rowid order.
+    """
+    plan = row["plan"]
+    if doc.get("plan_id") and plan == doc.get("plan_id") and doc.get("plan"):
+        plan = doc["plan"]
+    rows = con.execute("SELECT * FROM tasks WHERE run=? ORDER BY rowid", (row["id"],)).fetchall()
+    by_id = {r["id"]: r for r in rows}
+    extra = {t.get("id"): t for t in doc.get("tasks") or []
+             if isinstance(t, dict) and t.get("id")}
+    ordered, seen = [], set()
+    for tid in extra:  # the artifact's order; the table inserts parent-before-child, a different one
+        if tid in by_id and tid not in seen:
+            ordered.append(by_id[tid])
+            seen.add(tid)
+    ordered += [r for r in rows if r["id"] not in seen]
+    obj = dict(doc)
+    obj.update({
+        "id": row["id"], "plan": plan, "branch": row["branch"], "status": row["status"] or "active",
+        "stage": _stage_of(row), "next": row["next"], "started": row["started"], "ended": row["ended"],
+        "tasks": [_task_obj(r, extra.get(r["id"]) or {}) for r in ordered],
+    })
+    obj.setdefault("feature", None)
+    obj.setdefault("waiting", None)
+    obj.setdefault("recent", [])
+    obj.setdefault("plan_id", None)
+    return obj
+
+
+def _store_path(home, project=None, data_dir=None):
+    """The store a READER opens for this project (L5). mkpaths.project_folder's rule: a migrated
+    project's store is the C2 `<home>/projects/<slug>/mk.db` its root row points at, a
+    pre-migration project's is `<data>/mk.db`. The other readers here keep project_dir's
+    --data-literal rule on purpose (mk-migrate's rollback addresses the legacy store through
+    exactly that form); a pane holding a data dir must follow the switch instead, or it would
+    read the pre-switch copy that is still sitting in the data dir. Never creates anything."""
+    folder = (_mkpaths().project_folder(data_dir, home_arg=home) if data_dir
+              else project_dir(home, project))
+    return os.path.join(folder, "mk.db")
+
+
+def _store_open(home, project, data_dir):
+    """(con, store) for a READER of this project's store (L5). Never creates anything.
+
+    `store` is the marker the readers report: False when the store file does not exist (a
+    pre-migration project), True when it does. A missing store answers with exit 0 and an
+    empty result, which a TypeScript reader cannot tell from a real store that holds no run —
+    so without this marker the dashboard and wake would treat "no store" as "no active run"
+    and never fall back to the file views."""
+    path = _store_path(home, project, data_dir)
+    con = _open_read(path, SCHEMA)
+    return con, con is not None
+
+
+def run_snapshot(home, project=None, run=None, data_dir=None):
+    """The runs list plus one run's document — what run.json and runs/index.json held (L5).
+
+    Read-only like plans(): mode=ro, never migrates, never writes. The reply carries `store`:
+    False when the store is missing (an empty snapshot, no file and no directory created), True
+    when it exists — including when it holds no run. A named run that is not there is a Fail
+    (exit 2), the same error shape as the other subcommands. Without --run the run is the
+    newest active one (runs.status='active', newest `started` first — the pane's own active-run
+    order), or null when no run is active.
+    """
+    con, store = _store_open(home, project, data_dir)
+    if con is None:
+        if run:
+            raise Fail(f"no run {run!r}: no store at {_store_path(home, project, data_dir)}")
+        return {"ok": True, "store": False, "runs": [], "active": None, "run": None, "waits": []}
+    try:
+        runs, docs = [], {}
+        for r in con.execute("SELECT id, plan, status, started, ended FROM runs"
+                             " ORDER BY started, rowid"):
+            doc = _run_doc(con, r["id"])
+            docs[r["id"]] = doc
+            runs.append({"id": r["id"], "feature": doc.get("feature"), "status": r["status"],
+                         "started": r["started"], "ended": r["ended"], "plan": r["plan"]})
+        active = next((r["id"] for r in reversed(runs) if r["status"] == "active"), None)
+        want = run or active
+        if run and not any(r["id"] == run for r in runs):
+            raise Fail(f"no run {run!r} in {_store_path(home, project, data_dir)}")
+        snapshot = {"ok": True, "store": store, "runs": runs, "active": active,
+                    "run": None, "waits": []}
+        if want is None:
+            return snapshot
+        row = con.execute("SELECT * FROM runs WHERE id=?", (want,)).fetchone()
+        snapshot["run"] = _run_obj(con, row, docs[want])
+        snapshot["waits"] = [dict(w) for w in con.execute(
+            "SELECT id, run, question, opened, cleared FROM waits WHERE run=? ORDER BY id", (want,))]
+        return snapshot
+    finally:
+        con.close()
+
+
 def _cli(argv):
     # The common options are accepted before or after the subcommand. They are pulled out first,
     # so a subcommand never sees them and the two positions cannot disagree.
@@ -1806,6 +2020,15 @@ def _cli(argv):
     pl = sub.add_parser("plans")
     pl.add_argument("id", nargs="?", help="one plan id; omit for every plan")
     pl.add_argument("--json", action="store_true")
+    rs = sub.add_parser("run-snapshot")
+    rs.add_argument("--run", help="one run id; omit for the newest active run")
+    rs.add_argument("--json", action="store_true")
+    ev = sub.add_parser("events")
+    ev.add_argument("--run", required=True)
+    ev.add_argument("--task")
+    ev.add_argument("--chan", default="state", help="channel; '' reads every channel")
+    ev.add_argument("--since", type=int, help="only rows past this events.id (the wake cursor)")
+    ev.add_argument("--json", action="store_true")
     im = sub.add_parser("import-history")
     im.add_argument("--run", required=True)
     im.add_argument("--json-file", required=True)
@@ -1829,6 +2052,17 @@ def _cli(argv):
         if not args.project and not args.data:
             raise Fail("plans needs --project or --data")
         return plans(home, args.project, args.data, args.id)
+    if args.cmd == "run-snapshot":
+        if not args.project and not args.data:
+            raise Fail("run-snapshot needs --project or --data")
+        return run_snapshot(home, args.project, args.run, args.data)
+    if args.cmd == "events":
+        if not args.project and not args.data:
+            raise Fail("events needs --project or --data")
+        return {"ok": True,
+                "store": _store_present(home, args.project, args.data),
+                "events": events(home, args.project, args.run, args.data, args.task,
+                                 args.chan, args.since)}
     if args.cmd == "import-history":
         if not args.project:
             raise Fail("import-history needs --project")
@@ -1843,8 +2077,8 @@ def _cli(argv):
                                 tasks=doc.get("tasks") or (), events=doc.get("events") or (),
                                 artifacts=doc.get("artifacts") or (), data_dir=args.data)
         return {"ok": True, **counts}
-    raise Fail("usage: mkdb.py timeline|cards|projects|overview|plans|import-history --json"
-               "  (or --self-test)")
+    raise Fail("usage: mkdb.py timeline|cards|projects|overview|plans|run-snapshot|events"
+               "|import-history --json  (or --self-test)")
 
 
 def main(argv):
@@ -2027,6 +2261,12 @@ def self_test():
         _summary_two_projects(home)
         _reads_create_nothing(home)
         _projects_read(home)
+        _run_snapshot(home)
+        _run_events(home)
+        _run_snapshot_migrated(home)
+        _run_snapshot_no_store(home)
+        _run_snapshot_zero_runs(home)
+        _task_type_default(home)
         _root_v2_migration(home, tmp)
         _plan_summary_transitions(home)
         _plan_summary_atomic(home)
@@ -4180,6 +4420,358 @@ def _projects_read(home):
     cli = _cli(["projects", "--json", "--home", bare])
     _check(cli == {"ok": True, "projects": []}, f"bare cli {cli}")
     _check(not os.path.exists(os.path.join(bare, "mk.db")), "projects created mk.db")
+
+
+def _run_snapshot(home):
+    """run-snapshot() reads the runs list and one run's document off the store (L5).
+
+    The columns win over the run-doc artifact (that is the store's read rule), the artifact's
+    file-only keys survive, the newest active run is the default subject, a missing store is an
+    empty snapshot that creates nothing, an unknown run is a Fail, and a read never writes.
+    """
+    data = os.path.join(home, "snap")
+    con = open_project(home, data_dir=data)
+    try:
+        con.execute("INSERT INTO runs(id, plan, branch, status, stage, next, started, ended)"
+                    " VALUES ('r-old','p-old','main','done','3','all merged',"
+                    "'2026-01-01T00:00:00+00:00','2026-01-02T00:00:00+00:00')")
+        con.execute("INSERT INTO runs(id, plan, branch, status, stage, next, started)"
+                    " VALUES ('r-a','p-a','mk/a','active','7','merge L5','2026-01-03T00:00:00+00:00')")
+        con.execute("INSERT INTO runs(id, plan, branch, status, stage, next, started)"
+                    " VALUES ('r-b','p-b','mk/b','active','1','start T1','2026-01-04T00:00:00+00:00')")
+        con.commit()  # add_task opens its own transaction
+        add_task(con, "r-a", "P1", "phase", title="Phase one")
+        add_task(con, "r-a", "T1", "task", title="One", parent="P1",
+                 route_json=json.dumps({"agent": "omp", "model": "Space Bunny", "effort": "high"}))
+        add_task(con, "r-a", "T2", "task", title="Two", parent="P1", deps="T1")
+        add_task(con, "r-b", "B1", "task", title="Bee")
+        # the columns mk-state would have written: the kanban column, the published status, a route
+        con.execute("UPDATE tasks SET status='ready', file_status='routed', lane='/wt/t1',"
+                    " slot='2', branch='mk/a/t1', pane='w1P:pN', round=2, verdict='APPROVE',"
+                    " owned='scripts/x.py', acceptance='it works' WHERE run='r-a' AND id='T1'")
+        # the run document: feature/waiting/recent are file-only, T2 carries wave + last_commit
+        doc = {"id": "r-a", "feature": "Snapshot lane", "plan": ".matrixkoder/plans/p-a.md",
+               "plan_id": "p-a", "plan_sha": "abc123", "plan_status": "running", "status": "active",
+               "stage": 7, "next": "merge L5", "waiting": {"question": "Merge now?",
+               "options": ["yes", "no"], "rec": "yes", "since": "2026-01-03T01:00:00+00:00"},
+               "started": "2026-01-03T00:00:00+00:00", "ended": None,
+               "updated": "2026-01-03T02:00:00+00:00",
+               "recent": [{"t": "2026-01-03T01:30:00+00:00", "run": "r-a", "task": "T1",
+                           "type": "note", "text": "gates green", "from": None, "to": None,
+                           "by": "lane-watch"}],
+               "tasks": [{"id": "T1", "type": "task", "wave": 2, "last_commit": "1de932a",
+                          "ready": True, "reviewer": "agy", "created": "2026-01-03T00:05:00+00:00",
+                          "rounds": [{"n": 2, "kind": "build", "sha": "1de932a"}]},
+                         {"id": "P1", "type": "phase", "wave": 1, "last_commit": None},
+                         {"id": "T2", "type": "task", "wave": 2, "status": "building",
+                          "last_commit": "beeface"}]}
+        con.execute("INSERT INTO artifacts(run, task, round, kind, rev, text, created)"
+                    " VALUES ('r-a',NULL,0,'run-doc',1,?,'2026-01-03T02:00:00+00:00')",
+                    (json.dumps(doc),))
+        con.execute("INSERT INTO artifacts(run, task, round, kind, rev, text, created)"
+                    " VALUES ('r-b',NULL,0,'run-doc',1,?,'2026-01-04T01:00:00+00:00')",
+                    (json.dumps({"id": "r-b", "feature": "Second lane"}),))
+        con.execute("INSERT INTO waits(run, question, opened) VALUES"
+                    " ('r-a','Merge now?','2026-01-03T01:00:00+00:00')")
+        con.commit()
+    finally:
+        con.close()
+
+    got = run_snapshot(home, data_dir=data)
+    _check(got["ok"] is True, f"snapshot ok flag {got['ok']}")
+    _check([r["id"] for r in got["runs"]] == ["r-old", "r-a", "r-b"],
+           f"snapshot run order {[r['id'] for r in got['runs']]}")
+    _check(got["runs"][1] == {"id": "r-a", "feature": "Snapshot lane", "status": "active",
+                             "started": "2026-01-03T00:00:00+00:00", "ended": None, "plan": "p-a"},
+           f"snapshot index entry {got['runs'][1]}")
+    _check(got["runs"][0]["feature"] is None, "a run with no run-doc invented a feature")
+    _check(got["active"] == "r-b", f"active is {got['active']}, newest started wins")
+    run = got["run"]
+    _check(run["id"] == "r-b" and run["feature"] == "Second lane", f"default subject {run['id']}")
+    # `type` is the artifact's when the run document carries one; a task the document does not
+    # list falls back to its own column, and an empty column to "task" — never a missing key
+    _check(run["tasks"][0].get("type") == "task", f"task type default: {run['tasks'][0]}")
+
+    got = run_snapshot(home, data_dir=data, run="r-a")
+    run = got["run"]
+    _check(got["active"] == "r-b" and run["id"] == "r-a", f"named run {run['id']}")
+    # the run columns win, the artifact supplies the file-only keys
+    _check(run["stage"] == 7 and isinstance(run["stage"], int), f"stage is {run['stage']!r}")
+    _check(run["next"] == "merge L5" and run["branch"] == "mk/a" and run["status"] == "active",
+           f"run columns {run}")
+    _check(run["plan"] == ".matrixkoder/plans/p-a.md", f"the plan path lost to the column: {run['plan']}")
+    _check(run["plan_id"] == "p-a" and run["plan_sha"] == "abc123", f"plan link {run}")
+    _check(run["waiting"]["question"] == "Merge now?" and run["waiting"]["options"] == ["yes", "no"],
+           f"waiting {run['waiting']}")
+    _check(len(run["recent"]) == 1 and run["recent"][0]["text"] == "gates green", f"recent {run['recent']}")
+    _check(run["updated"] == "2026-01-03T02:00:00+00:00", f"updated {run['updated']}")
+    # the document's task order, not the table's parent-before-child one
+    _check([t["id"] for t in run["tasks"]] == ["T1", "P1", "T2"],
+           f"task order {[t['id'] for t in run['tasks']]}")
+    t1 = run["tasks"][0]
+    _check(t1["title"] == "One" and t1["parent"] == "P1" and t1["type"] == "task", f"T1 {t1}")
+    _check(t1["agent"] == "omp" and t1["model"] == "Space Bunny" and t1["effort"] == "high",
+           f"T1 route {t1}")
+    _check(t1["lane"] == "/wt/t1" and t1["slot"] == "2" and t1["branch"] == "mk/a/t1"
+           and t1["pane"] == "w1P:pN", f"T1 lane {t1}")
+    _check(t1["owned"] == ["scripts/x.py"] and t1["acceptance"] == "it works", f"T1 owned {t1}")
+    _check(t1["round"] == 2 and t1["verdict"] == "APPROVE", f"T1 round/verdict {t1}")
+    # the store's `ready` publishes as `routed` plus the ready flag, never as a status
+    _check(t1["status"] == "routed" and t1["ready"] is True, f"T1 status {t1['status']}/{t1['ready']}")
+    _check(t1["wave"] == 2 and t1["last_commit"] == "1de932a", f"T1 file-only keys {t1}")
+    _check(t1["reviewer"] == "agy" and t1["rounds"][0]["sha"] == "1de932a", f"T1 rounds {t1}")
+    t2 = run["tasks"][2]
+    _check(t2["deps"] == ["T1"] and t2["status"] == "planned" and t2["ready"] is False, f"T2 {t2}")
+    _check(t2["last_commit"] == "beeface" and t2["agent"] is None, f"T2 {t2}")
+    # the column beat the document's stale `building` above; merged beats it the same way
+    con = open_project(home, data_dir=data)
+    try:
+        con.execute("UPDATE tasks SET status='merged' WHERE run='r-a' AND id='T2'")
+        con.commit()
+    finally:
+        con.close()
+    t2 = run_snapshot(home, data_dir=data, run="r-a")["run"]["tasks"][2]
+    _check(t2["status"] == "merged", f"the artifact won over the column: {t2['status']}")
+    # waits come from the waits table, for the selected run only
+    _check(got["waits"] == [{"id": 1, "run": "r-a", "question": "Merge now?",
+                             "opened": "2026-01-03T01:00:00+00:00", "cleared": None}],
+           f"waits {got['waits']}")
+    _check(run_snapshot(home, data_dir=data, run="r-b")["waits"] == [], "another run's waits leaked")
+
+    cli = _cli(["run-snapshot", "--json", "--home", home, "--data", data, "--run", "r-a"])
+    _check(cli == run_snapshot(home, data_dir=data, run="r-a"), "cli run-snapshot differs from the api")
+    try:
+        run_snapshot(home, data_dir=data, run="nope")
+    except Fail as e:
+        _check(e.code == 2 and "no run" in str(e), f"unknown run error: {e}")
+    else:
+        raise SystemExit("SELF-TEST FAIL: run-snapshot accepted an unknown run")
+
+    missing = os.path.join(home, "snap-missing")
+    _check(not os.path.exists(missing), "fixture dir already exists")
+    empty = {"ok": True, "store": False, "runs": [], "active": None, "run": None, "waits": []}
+    _check(run_snapshot(home, data_dir=missing) == empty,
+           f"a missing store is not an empty snapshot: {run_snapshot(home, data_dir=missing)}")
+    _check(_cli(["run-snapshot", "--json", "--home", home, "--data", missing]) == empty,
+           "cli run-snapshot on a missing store")
+    _check(not os.path.exists(missing), "run-snapshot created a missing data dir")
+    try:
+        run_snapshot(home, data_dir=missing, run="r-a")
+    except Fail as e:
+        _check(e.code == 2 and "no store" in str(e), f"missing-store error: {e}")
+    else:
+        raise SystemExit("SELF-TEST FAIL: run-snapshot named a run in a store that does not exist")
+    _check(not os.path.exists(missing), "the refused read created a data dir")
+
+    # a read must not write or migrate: hash the store, read, hash again
+    names = ("mk.db", "mk.db-wal", "mk.db-shm")
+    before = {n: _file_hash(os.path.join(data, n)) for n in names}
+    run_snapshot(home, data_dir=data, run="r-a")
+    after = {n: _file_hash(os.path.join(data, n)) for n in names}
+    _check(after == before, f"run-snapshot wrote the store: {before} -> {after}")
+
+
+def _run_events(home):
+    """events() is the run-wide feed timeline() cannot serve (L5): id order, chan='state' by
+    default, --task and --since as the two selectors wake.ts needs (the events.id cursor).
+
+    meta_json survives (it carries `by`, and a direct transition() leaves it NULL — the reader
+    maps that to the orchestrator), a missing store is an empty list, and a read writes nothing.
+    """
+    data = os.path.join(home, "events")
+    con = open_project(home, data_dir=data)
+    try:
+        con.execute("INSERT INTO runs(id, branch, status, stage, started)"
+                    " VALUES ('r','main','active','0','2026-01-01T00:00:00+00:00')")
+        con.commit()  # add_task opens its own transaction
+        add_task(con, "r", "T1", "task", title="one")
+        add_task(con, "r", "T2", "task", title="two")
+        transition(home, "demo", "r", "T1", "building", note="picked up", data_dir=data)
+        eid = transition(home, "demo", "r", "T2", "blocked", note="needs a decision", data_dir=data)
+        # a bus-channel row the default chan must not return, and the --chan '' escape hatch
+        # a live row: chan='bus' (the default --chan state must not return it), meta carrying `by`
+        append_event(home, "demo", "r", task="T1", chan="bus", kind="info", text="hi",
+                     meta={"by": "mk-builder"}, data_dir=data)
+    finally:
+        con.close()
+
+    got = events(home, "demo", "r", data_dir=data)
+    kinds = [(g["task"], g["kind"]) for g in got]
+    _check([g["id"] for g in got] == sorted(g["id"] for g in got), f"events not in id order {got}")
+    _check(all(g["chan"] == "state" for g in got), f"a bus row leaked into chan=state: {got}")
+    _check(kinds[-1] == ("T2", "transition") and got[-1]["id"] == eid,
+           f"the newest transition is missing: {kinds}")
+    _check(got[-1]["to_id"] == "blocked" and got[-1]["text"] == "needs a decision",
+           f"transition fields {got[-1]}")
+    # a direct transition() writes no meta_json — a reader maps NULL to "orchestrator", which is
+    # exactly how the file view renders such a row. A live event's `by` rides in meta_json, and
+    # the bus row below carries it.
+    _check(got[-1]["meta_json"] is None, f"a direct transition grew meta_json: {got[-1]}")
+    _check(any(g["meta_json"] and "mk-builder" in g["meta_json"]
+               for g in events(home, "demo", "r", data_dir=data, chan="")),
+           "the live event's meta_json (the `by` a wake reads) did not survive")
+    _check(set(EVENT_COLS_READ) <= set(got[-1]), f"reply columns {sorted(got[-1])}")
+    # --task narrows, --since is the cursor
+    _check([g["task"] for g in events(home, "demo", "r", data_dir=data, task="T1")] == ["T1"],
+           "task selector")
+    _check([g["id"] for g in events(home, "demo", "r", data_dir=data, since=eid)] == [],
+           "since returned a consumed row")
+    _check(len(events(home, "demo", "r", data_dir=data, since=got[0]["id"])) == len(got) - 1,
+           "since did not return exactly the rows past it")
+    # another run's rows never leak
+    _check(events(home, "demo", "other", data_dir=data) == [], "another run's events leaked")
+    # every channel on request
+    every = events(home, "demo", "r", data_dir=data, chan="")
+    _check(len(every) == len(got) + 1 and any(g["chan"] == "bus" for g in every),
+           f"chan='' did not read every channel: {[g['chan'] for g in every]}")
+
+    cli = _cli(["events", "--json", "--home", home, "--data", data, "--run", "r"])
+    _check(cli == {"ok": True, "store": True, "events": got}, f"cli events differs from the api: {cli}")
+    missing = os.path.join(home, "events-missing")
+    _check(events(home, "demo", "r", data_dir=missing) == [], "a missing store is not an empty feed")
+    _check(not os.path.exists(missing), "events created a missing data dir")
+
+    names = ("mk.db", "mk.db-wal", "mk.db-shm")
+    before = {n: _file_hash(os.path.join(data, n)) for n in names}
+    events(home, "demo", "r", data_dir=data)
+    after = {n: _file_hash(os.path.join(data, n)) for n in names}
+    _check(after == before, f"events wrote the store: {before} -> {after}")
+
+
+def _run_snapshot_migrated(home):
+    """A reader holding a data dir follows the switch to the C2 store (L5).
+
+    mk-migrate's rollback deliberately addresses the pre-switch store by the data dir's literal
+    path, and that copy stays behind in the data dir. A pane holding the data dir must NOT read
+    it: the root row's db_path is the live store. mkpaths.project_folder is the rule; this proves
+    run_snapshot and events use it and that the stale copy is ignored.
+    """
+    data = os.path.join(home, "mig", "data")          # the legacy location, post-switch
+    slug = "demo"
+    c2 = os.path.join(home, "projects", slug)          # the C2 project folder
+    os.makedirs(data, exist_ok=True)
+    os.makedirs(c2, exist_ok=True)
+    live = open_project(home, data_dir=c2)             # write the live store through the C2 folder
+    stale = open_project(home, data_dir=data)          # and a DIFFERENT store in the legacy dir
+    try:
+        live.execute("INSERT INTO runs(id, branch, status, stage, started)"
+                     " VALUES ('live','main','active','3','2026-02-02T00:00:00+00:00')")
+        live.commit()
+        add_task(live, "live", "A1", "task", title="live task")
+        stale.execute("INSERT INTO runs(id, branch, status, stage, started)"
+                      " VALUES ('stale','main','active','9','2026-02-03T00:00:00+00:00')")
+        stale.commit()
+        add_task(stale, "stale", "B1", "task", title="stale task")
+        # the root row: this project's live store is db_path (L2's switch marker)
+        root = open_root(home)
+        try:
+            root.execute("INSERT INTO projects(slug, name, repo, data_dir, mode, db_path)"
+                         " VALUES (?,'demo','',?,'home',?)", (slug, data, os.path.join(c2, "mk.db")))
+            root.commit()
+        finally:
+            root.close()
+    finally:
+        live.close()
+        stale.close()
+
+    got = run_snapshot(home, data_dir=data)
+    _check([r["id"] for r in got["runs"]] == ["live"],
+           f"the reader followed the stale pre-switch store: {[r['id'] for r in got['runs']]}")
+    _check(got["active"] == "live" and got["run"]["stage"] == 3, f"live run {got['active']}")
+    _check([t["id"] for t in got["run"]["tasks"]] == ["A1"], f"live tasks {got['run']['tasks']}")
+    _check(events(home, "demo", "live", data_dir=data) == [],
+           "events read a store with no rows for the live run")
+    # --data wins over --project (the existing mkdb rule), and the slug form reaches the same store
+    _check(run_snapshot(home, project=slug, data_dir=data) == got,
+           "--project and --data disagree about the store")
+    _check(_store_path(home, data_dir=data) == os.path.join(c2, "mk.db"),
+           f"the store path is {_store_path(home, data_dir=data)}")
+    # a pre-migration project (no root row) keeps today's literal <data>/mk.db
+    plain = os.path.join(home, "plain")
+    plain_db = open_project(home, data_dir=plain)
+    try:
+        plain_db.execute("INSERT INTO runs(id, branch, status, stage, started)"
+                         " VALUES ('p','main','active','1','2026-02-04T00:00:00+00:00')")
+        plain_db.commit()
+    finally:
+        plain_db.close()
+    _check(_store_path(home, data_dir=plain) == os.path.join(plain, "mk.db"),
+           "a pre-migration project lost its own store path")
+    _check(run_snapshot(home, data_dir=plain)["active"] == "p", "the pre-migration read failed")
+
+
+def _run_snapshot_no_store(home):
+    """A project with NO store answers store=false, and the read creates nothing (L5).
+
+    The reply is otherwise identical to a real store that holds no run — an empty runs list, an
+    empty feed, exit 0 — and hooks/dashboard.tsx readStoreSnapshot/loadRuns and wake.ts
+    activeRunId could not tell the two apart, so their file fallback never ran. `store` is the
+    marker: false when the store file is absent, true when it is there (empty or not). The
+    events reply carries the same key, and nothing under the data path is created.
+    """
+    missing = os.path.join(home, "no-store")
+    os.makedirs(missing)                       # a real, empty data dir: no mk.db in it
+    before = sorted(os.listdir(missing))
+    _check(before == [], f"the fresh data dir is not empty: {before}")
+    _check(not os.path.exists(os.path.join(missing, "mk.db")), "fixture has a store")
+
+    got = run_snapshot(home, data_dir=missing)
+    _check(got == {"ok": True, "store": False, "runs": [], "active": None, "run": None, "waits": []},
+           f"the no-store reply is not marked store=false: {got}")
+    _check(got["store"] is False and got["ok"] is True and got["runs"] == [], f"no-store keys {got}")
+    _check(_cli(["run-snapshot", "--json", "--home", home, "--data", missing]) == got,
+           "cli run-snapshot on a missing store")
+    # the same marker on the events reply, so wake.ts can tell "no store" from "no event"
+    feed = _cli(["events", "--json", "--home", home, "--data", missing, "--run", "r"])
+    _check(feed.get("store") is False and feed["events"] == [], f"no-store events reply {feed}")
+    # and the read stays read-only: no file, no directory, under the path it was pointed at
+    _check(sorted(os.listdir(missing)) == before, f"the no-store read created a file: {before}")
+    _check(not os.path.exists(os.path.join(missing, "mk.db")), "the no-store read created a store")
+
+
+def _run_snapshot_zero_runs(home):
+    """A real store that holds no run is store=true — not the no-store answer (L5).
+
+    The two replies differ in exactly one key, so this is what keeps the file fallback honest:
+    a project that has a store must never read as one that has none.
+    """
+    data = os.path.join(home, "zero-runs")
+    con = open_project(home, data_dir=data)    # a real store, no rows
+    con.close()
+    _check(os.path.exists(os.path.join(data, "mk.db")), "the empty store was not created")
+
+    got = run_snapshot(home, data_dir=data)
+    _check(got["store"] is True, f"an existing store is not marked store=true: {got}")
+    _check(got == {"ok": True, "store": True, "runs": [], "active": None, "run": None, "waits": []},
+           f"the zero-run reply is wrong: {got}")
+    _check(_cli(["run-snapshot", "--json", "--home", home, "--data", data]) == got,
+           "cli run-snapshot on a store with no run")
+
+
+def _task_type_default(home):
+    """A task row with an empty type and no run-doc entry still reads as type 'task' (L5).
+
+    The artifact's `type` is still the spelling of record — this only covers the row that has
+    none of its own: without a default the reader published a key-less task and the dashboard's
+    task grouping dropped it.
+    """
+    data = os.path.join(home, "empty-type")
+    con = open_project(home, data_dir=data)
+    try:
+        con.execute("INSERT INTO runs(id, branch, status, stage, started)"
+                    " VALUES ('r','main','active','0','2026-03-01T00:00:00+00:00')")
+        con.commit()
+        # a row written by an older writer: the type column is empty and there is no run-doc
+        con.execute("INSERT INTO tasks(run, id, type, title, status, updated)"
+                    " VALUES ('r','T1','','legacy row','planned','2026-03-01T00:00:00+00:00')")
+        con.commit()
+    finally:
+        con.close()
+
+    task = run_snapshot(home, data_dir=data)["run"]["tasks"][0]
+    _check(task["id"] == "T1" and task["type"] == "task", f"the empty type read as {task}")
+
+
 def _ready(home):
     """A task whose deps are all merged/done becomes ready; a regress demotes it; the move is
     one transaction with no event and no `updated` rewrite; the scan stays inside the run."""
