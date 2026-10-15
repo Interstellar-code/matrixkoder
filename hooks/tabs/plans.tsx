@@ -40,7 +40,12 @@ export type PlanRow = {
   readonly created: string
   readonly runs: readonly string[]
   readonly live_run: string | null
-  readonly counts: { readonly tasks: number; readonly phases: number }
+  readonly counts: {
+    readonly tasks: number
+    readonly phases: number
+    /** per-status tally from the overview's `counts` column (e.g. { merged: 53, building: 2, planned: 30 }) */
+    readonly byStatus: Readonly<Record<string, number>>
+  }
   /** the owning project slug, when the source named one (the root overview's `plan_summary.project`) */
   readonly project?: string
   /** Detail header extras the loader will fill; optional so a bare C8 row renders */
@@ -219,6 +224,11 @@ function PlanLine(els: Els, plan: PlanRow, view: PlansView, W: number, compact: 
         {Chip(els, { label: clip(chip, compact ? 18 : 28), role })}
         {ActionButtons(els, specs, W, () => { ui?.set(`plans:more:${plan.id}`, '1') })}
       </Box>
+      {plan.counts.byStatus && Object.keys(plan.counts.byStatus).length > 0 && (
+        <Text dimColor={true} wrap="truncate-end">
+          {clip(Object.entries(plan.counts.byStatus).map(([s, n]) => `${n} ${s}`).join(' · '), Math.max(1, W - 4))}
+        </Text>
+      )}
       {confirming && (
         <Box flexDirection="row" gap={1}>
           <Text color={ROLE.err.fg}>{clip(`Delete ${plan.id}? File moves to ${planArchiveDir(plan)}.`, Math.max(1, W - 20))}</Text>
