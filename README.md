@@ -72,20 +72,20 @@ Six options, set with `claude plugin configure matrixkoder`:
 | `usagePollMin` | 5 | Minutes between `mk-usage.py` runs (minimum 1) |
 | `wake` | off | Submit a prompt when lanes hit verifying, blocked, quota, stalled or provider |
 
-Per-repo settings live in `<data>/matrixkoder.yaml`; `/mk setup` and `scripts/mk-config.py` own that file, and the plugin settings above own the rest.
+Each setting key declares a `level` (`global` or `project`) and a `home` (`userConfig` or `yaml`); the existing `scope` field is the Settings tab's UI category (`project|routing|agents|child`) and is unchanged. Every `yaml` key — `lanes.default_agent` included — is level `project` and lives in the project's `project.yaml`; `userConfig` keys are level `global`. Per-project settings live in `~/.matrixkoder/projects/<slug>/project.yaml` (today's `matrixkoder.yaml`); `/mk setup` and `scripts/mk-config.py` own that file, and the plugin `userConfig` settings above own the rest.
 
 ## Folder map
 
 | Path | Content |
 |---|---|
 | `skills/matrixkoder/` | `SKILL.md` loop; `reference/` (loop, pool-and-usage, safety, onboarding, lessons); `templates/` |
-| `scripts/` | `mk-state.py` (only writer of run state), `mkdb.py` (SQLite stores, `cards --json`), `mk-bus.py` (root bus), `mk-catalog.py` (`routes --json`, `model --pane`), `mk-plan.py` (parse/check/edit/approve TOML plan files; approve archives to `plans/archive/<plan>-v<n>.md`), `mk-lane.py` (reusable lane worktree slots), `mk-release.py` (changelog + version bump + tag), `mk-usage.py`, `lane-health.py`, `lane-watch.py`, `selftest.sh` |
+| `scripts/` | `mk-state.py` (only writer of run state), `mkdb.py` (SQLite stores, `cards --json`), `mk-bus.py` (root bus), `mk-catalog.py` (`routes --json`, `model --pane`), `mk-plan.py` (parse/check/edit/approve TOML plan files; approve validates and imports the version into the project store and archives it to `projects/<slug>/plans/<plan>/archive/plan-v<n>.md`), `mkpaths.py` (the only path authority), `mk-migrate.py` (the one migration tool: dry-run, copy, switch, rollback, archive), `mk-lane.py` (reusable lane worktree slots), `mk-release.py` (changelog + version bump + tag), `mk-usage.py`, `lane-health.py`, `lane-watch.py`, `selftest.sh` |
 | `agents/` | effort-pinned workers |
 | `hooks/` | dashboard, wizard, guards, status chip, wake and tools (TypeScript); tabs `kanban.tsx` (hotkey `k`) and `waiting.tsx` |
 | `types/` | plugin API types |
 | `docs/` | plan, spikes, state schema, dashboard design, user guide |
 
-Project data lives in `<repo>/.matrixkoder/` today; `~/.matrixkoder/projects/<slug>/` is the home mode that lands after the data move (DM, still to come). Global state lives in `~/.matrixkoder/` (`usage.json`, `projects.json`, `locks/`). `~/.matrixkoder/projects.json` is still the repo→data_dir map (dual-written with the root store until D9). `scripts/skill-check.py` does not exist.
+Two SQLite stores and nothing else: the root `~/.matrixkoder/mk.db` holds overview numbers and linkage only, and `~/.matrixkoder/projects/<slug>/mk.db` is the project's ONLY source of truth. The repo keeps no MK data. Global state lives in `~/.matrixkoder/` (`mk.db`, `usage.json`, `bus/`, `projects/<slug>/`); bus files are `bus/bus.json`, `bus/bus-tokens.json`, `bus/lanes/<sha256(lane)>.json` and `bus/ring-queue.json`, and the orchestrator's bus watch cursors are `projects/<slug>/watch-cursors.json`. `scripts/mkpaths.py` / `hooks/paths.ts` are the only path authority. `scripts/mk-migrate.py` is the one migration tool (dry-run, copy, switch, rollback, archive). Before the projects/ layout (until 2026-10-15) project data lived in `<repo>/.matrixkoder/` and a `~/.matrixkoder/projects.json` repo→data_dir map; both are gone. `scripts/skill-check.py` does not exist.
 
 ## Development
 

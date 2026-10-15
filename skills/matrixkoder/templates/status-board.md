@@ -1,4 +1,4 @@
-<!-- Reference for <data>/runs/<id>/board.md as `mk-state render` writes it (scripts/mk-state.py Store.render). Never hand-edit a real board: change state with mk-state, then `render`. This comment line is not in the real output. -->
+<!-- Reference for the board as `mk-state render` PRINTS it to stdout from the project DB (scripts/mk-state.py Store.render). The board is not a file: mk-state writes no board.md and no run.json — the project DB (<project>/mk.db) is the one source of truth (C4). Never hand-edit a board: change state with mk-state, then `render` to print the current one. This comment line is not in the real output. -->
 # <run id> — <feature>
 
 branch `<branch>` · stage <N> · <active|done|archived> · updated <ISO time>

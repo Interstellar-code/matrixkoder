@@ -19,7 +19,7 @@ Version rule: breaking (`type!:` or `BREAKING CHANGE` in a body) → major (mino
 
 ## Steps
 
-1. **Preflight** — clean tree (`git status --porcelain` empty), on the default branch, up to date with the remote (`git fetch` + compare), the repo's own gates green (from `<data>/matrixkoder.yaml` `gates` when MK is set up, else the project's test command). Stop and report on any failure.
+1. **Preflight** — clean tree (`git status --porcelain` empty), on the default branch, up to date with the remote (`git fetch` + compare), the repo's own gates green (from the project's `project.yaml` `gates` when MK is set up, else the project's test command). Stop and report on any failure.
 2. **Plan** — run `plan` and `notes`. Show the user: current → next version, bump kind, commit count, and the notes. Point out commits that are not Conventional (they land under "Other") and any that look mis-typed (a `fix` that adds a feature, a missing `!` on a breaking change); offer `--version` instead of rewriting history.
 3. **Confirm** — ask the user to approve the version (or give one). Never pick a major bump on your own.
 4. **Apply** — `apply [--version …]`. Report the commit, tag and changed files. Read the new `CHANGELOG.md` section once; fix wording only by a follow-up `docs(changelog):` commit before pushing — never amend, never move the tag.

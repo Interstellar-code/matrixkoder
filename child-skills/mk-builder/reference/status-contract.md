@@ -7,10 +7,11 @@ in round 2 against review r1 (HIGH 1-2, MEDIUM 3-7, LOW 8-9, bus forward-fit). T
 folder (`child-skills/`) is not a registered skill; it is reference material for those phases and
 for the lane-agent skill. Carried items from MB1 review r2 were applied in MB2: R17a (the
 `progress` / `progress --subagent` row split), R18 and R27.6 (reviewer identity), R27.9
-(monotonic `seq`), R33-R34 (seconds), and the stamp below. Source:
-`.matrixkoder/plans/mk-builder-skill-research.md` § "Status-file contract
-(`mk-builder-status/v1`)". Every `file:line` below was re-verified in this tree at
-`1d8cf51`.
+(monotonic `seq`), R33-R34 (seconds), and the stamp below. Source: the
+`mk-builder-skill-research` plan note, § "Status-file contract (`mk-builder-status/v1`)". Every
+`file:line` below was re-verified in this tree at `1d8cf51`. A `.matrixkoder/plans/...` path is a
+research-file citation from before the projects/ layout (until 2026-10-15); plans now live at
+`~/.matrixkoder/projects/<slug>/plans/<plan-id>/plan.md`.
 
 ## 1. Path, scope, writer
 
@@ -282,7 +283,7 @@ Table 1 — required fields. Identity key = `(run, task, round, role)` (R27).
 
   | field | reserved meaning |
   |---|---|
-  | `proto` | fixed `"mk-builder-status/v1"`; tells this file apart from the planned `.matrixkoder-bus.json`, which also uses a `v` for its own protocol |
+  | `proto` | fixed `"mk-builder-status/v1"`; tells this file apart from the lane bus token file `<home>/bus/lanes/<sha256(lane)>.json`, which also uses a `v` for its own protocol |
   | `msg_id` | id of the bus message this write answers |
   | `question_id` | id of the bus `ask` this `question` pairs with |
   | `answer_id` | id of the bus `answer` sent for the current `question` |
@@ -294,7 +295,8 @@ Table 1 — required fields. Identity key = `(run, task, round, role)` (R27).
 ## 10. Verdict source (plan contract C4)
 
 - **R41.** Every verdict event derived from a lane poll carries `source` as a **top-level key on
-  the `events.jsonl` record**, beside the record's fixed fields (`t`, `run`, `task`, `type`,
+  the `events` record in the project DB** (`~/.matrixkoder/projects/<slug>/mk.db`), beside the
+  record's fixed fields (`t`, `run`, `task`, `type`,
   `text`, `from`, `to`, `by`, `docs/state-schema.md:108-116`): `status` = decided from an accepted
   status file; `pane` = today's pane-text path; `grace` = the no-token DONE rule
   `TOKEN_GRACE_MIN` (`scripts/lane-watch.py:52`, applied `scripts/lane-watch.py:122-127`).

@@ -1,6 +1,12 @@
-# <data>/matrixkoder.yaml — written by the MatrixKoder onboarding wizard after the user confirms.
+# Template for the project's project.yaml — the MatrixKoder onboarding wizard fills this in and,
+# after the user's one confirm, writes it to ~/.matrixkoder/projects/<slug>/project.yaml (C2/C8).
+# Today's matrixkoder.yaml name and the repo-local location are the pre-2026-10-15 layout; every
+# path now comes from scripts/mkpaths.py / hooks/paths.ts (C1) and the repo keeps no MK data.
 # Re-checked for drift on every run; the user's explicit statements override any value.
-data_dir: .matrixkoder/               # project data dir (default <repo>/.matrixkoder/, or ~/.matrixkoder/projects/<slug>/)
+# Every key is a yaml key: level `project`, home `yaml` (C8). The `userConfig` keys (dashboard
+# prefs, guards, wake, usagePollMin) live in the plugin config, not here — `mk-config.py migrate`
+# drops the dead yaml copies (`dashboard:`, `usage.poll_min`); ~/.matrixkoder/config.json is retired.
+data_dir: .matrixkoder/               # the data dir the path resolvers record for this project (C1)
 repo:
   integration_branch: main            # lanes merge here; one PR to main at the end
   lanes: { slots: 1, pattern: "../{repo}-mk-{n}", reuse: true, copy: [] }   # reusable worktree slots; the cap is max_build_lanes; copy = untracked paths a new slot needs (.env, generated types)
@@ -23,7 +29,7 @@ qa:
   dev_url: ""                         # e.g. https://localhost:3000 (always running)
   port: null
   themes: []
-  mockups: ""                         # e.g. <data>/designs/
+  mockups: ""                         # e.g. <project>/plans/<id>/assets/
 agents:                               # installed + logged in, verified at bootstrap
   codex: { available: null, models: [] }
   opencode: { available: null, models: [] }
@@ -57,7 +63,7 @@ autonomy_contract:
   preauthorised: [routing, failover, fix-loops, worktrees, lane-merges, push-non-main, open-pr]
   builder_skip_permissions: true      # builders only, in their own worktree; never orchestrator/reviewers/runtime lanes
 deploy:
-  readme: <data>/deploys/README.md      # repo-specific checklist; always user-gated
+  readme: <project>/deploys/README.md   # repo-specific checklist; always user-gated (<project> = the project folder)
 locks:
   dir: ~/.matrixkoder/locks            # managed via mk-state lock take|release|check
 usage:

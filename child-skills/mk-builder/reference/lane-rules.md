@@ -9,8 +9,11 @@ of restating these rules. Only the stamp below changed in MB2; no rule text did.
 review template (`skills/matrixkoder/templates/review.md`); this file makes it one numbered,
 checkable contract. Rules whose remainder stays per-brief say **(B)** and carry a pointer to §4 —
 §4 names the part, never its content. Every `file:line` below was re-verified in this tree at
-`1d8cf51`. Source: `.matrixkoder/plans/mk-builder-skill-research.md` Part B, rows classed `S`
+`1d8cf51`. Source: the `mk-builder-skill-research` plan note, Part B, rows classed `S`
 (1-12, 15, 16); §5 maps each row to exactly one rule. Rules marked **new** have no Part B row.
+The `.matrixkoder/plans/...` paths quoted below are research-file citations from before the
+projects/ layout (until 2026-10-15); plans now live at
+`~/.matrixkoder/projects/<slug>/plans/<plan-id>/plan.md`.
 
 ## 1. Shared — every lane agent, builder or reviewer
 
@@ -22,8 +25,7 @@ checkable contract. Rules whose remainder stays per-brief say **(B)** and carry 
   **Why:** a lane builder once applied the user's global orchestrator rules — it ran Jev and
   picked a model for its subagent (`mk-improvements.md` item 11, fixed `94d3044`: "a lane builder
   applied the user's global orchestrator rules"; the brief template and the global `CLAUDE.md` now
-  scope routing to the orchestrator,
-  `/Users/rohits/Development/matrixkoder/.matrixkoder/plans/mk-improvements.md`), and the brief
+  scope routing to the orchestrator), and the brief
   states the split (`skills/matrixkoder/templates/brief.md:22`). **Check:** the lane transcript
   shows no `jev_*` call, no model/effort switch, no started agent, pane or worktree.
 
@@ -57,15 +59,16 @@ checkable contract. Rules whose remainder stays per-brief say **(B)** and carry 
 
 - **R5.** Keep secrets out of the lane's code, logs and report: no tokens, keys or credentials in
   any form, including in diffs quoted into the report.
-  **Why:** briefs and reports leave the lane — the data dir is gitignored, so briefs and reviews
-  are copied between worktrees (`skills/matrixkoder/reference/lessons.md:15`, #11: "Main repo is
+  **Why:** briefs and reports leave the lane — the project folder is not in the repo, so briefs and
+  reviews are copied between worktrees (`skills/matrixkoder/reference/lessons.md:15`, #11: "Main repo is
   canonical; copy briefs in, reports out"; `skills/matrixkoder/templates/brief.md:26`) — and
   anything sent to a Jev tool leaves the machine (`skills/matrixkoder/reference/safety.md:43`).
 
 - **R6.** Commit no code or test that reads a lane-only `.matrixkoder-*` file; test fixtures live
   in the repo's fixtures directory (`scripts/fixtures/` in this repo).
   **Why:** those files exist only inside this lane and have no meaning in another checkout
-  (`skills/matrixkoder/templates/brief.md:27`).
+  (`skills/matrixkoder/templates/brief.md:27`). Lane worktree files (`.matrixkoder-*` in a lane) are
+  not MK data: the two DBs hold no lane file, and `mk-lane.py release` keeps them bounded (§6).
 
 ## 2. Builder rules
 
@@ -90,7 +93,7 @@ checkable contract. Rules whose remainder stays per-brief say **(B)** and carry 
   todo tool and showed no progress, while the slots that kept one were legible; the user made it a
   hard rule for every builder brief and for this file — later the status file's `step` /
   `phases_done` mirror it so the dashboard shows lane progress
-  (`/Users/rohits/Development/matrixkoder/.matrixkoder/plans/mk-improvements.md` item 11, open).
+  (`mk-improvements.md` item 11, open).
   **Check:** the todo list exists before the first file write. **(B)** the task skeleton it
   mirrors — R27. A reviewer or builder never sends a message to another lane directly; every
   lane-to-lane message passes the orchestrator (R30).
@@ -279,3 +282,12 @@ New rules with no Part B row (review r1, 2026-10-10): R9 (builder todo list, use
 (reviewer DONE token), R15's rerun allowance. Rows 13, 14 (TAKEOVER, FIX) are class **B** in the
 research: carried by the brief, restated here only as §4 pointers R28-R29. Rows 17-20 are class
 **B**/**O** and stay where they are.
+
+## 6. Lane cleanup (orchestrator, not a lane agent)
+
+`mk-lane.py release` returns a lane slot to the pool and leaves its ignored scratch clean: it
+removes `.ruff_cache`, the builder's `.scratch-*` files, and keeps `.matrixkoder-old-*` (the
+archived lane status files, R21) to the last 3. Lane worktree files (`.matrixkoder-*` in a lane)
+are not MK data and stay out of the two DBs; the release step only bounds them. The orchestrator
+runs this release step (see `skills/matrixkoder/SKILL.md`); a lane agent never releases its own
+slot.

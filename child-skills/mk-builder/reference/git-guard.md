@@ -100,8 +100,7 @@ scanner and the same holds here (§7). Only G21's why and the stamp below change
   that holds an executable file named `git` (`[ -x "<entry>/git" ]`). If no entry remains: print
   one line `mk git-guard: no real git on PATH` and exit 127.
   **Why:** this machine has two gits — `/usr/bin/git` and `/opt/homebrew/bin/git`
-  (`which -a git`, research `[local]`,
-  `/Users/rohits/Development/matrixkoder/.matrixkoder/plans/mk-builder-skill-research.md:39`) —
+  (`which -a git`, research `[local]`, `mk-builder-skill-research.md:39`) —
   so a fixed path can pin the wrong install and goes stale at the next update; `realpath` on both
   sides makes a symlinked wrapper directory match, and dropping only entries equal to that
   directory — rather than every directory that merely holds a `git` — keeps the *other* install

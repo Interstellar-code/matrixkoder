@@ -4,97 +4,120 @@ Contract between `scripts/mk-state.py` (the **only writer**), `lane-watch.py`, `
 dashboard mod (TypeScript, read-only). Field names are snake_case and stable; adding fields is
 allowed, renaming or removing one needs `schema` bumped.
 
+Since the `projects/` layout (C2–C7 of the storage-layout plan) the project DB is the only source of
+truth: no `run.json`, `task.json`, `events.jsonl`, `board.md` or run-doc artifact is written or read
+any more, and file mode is dropped (`/mk setup` always creates the project DB). Everything below is
+the DB contract; the file shapes that lived here before the `projects/` layout (until 2026-10-15) are
+gone, and `mk-migrate.py` is the ONE migration tool.
+
 ## Locations
 
 | What | Path |
 |---|---|
-| Project data dir | `--data DIR` → `$MATRIXKODER_DATA` → the repo's entry in `<global>/projects.json` (`{ "<repo path>": { "data_dir": "..." } }`, written by the onboarding wizard's "home" mode; keyed by the **main checkout** path; `~` allowed, a relative path is resolved against the repo) → `<toplevel>/.matrixkoder`. toplevel = the nearest `.git` above cwd, never `$HOME` itself (a dotfiles repo is not a project); a linked worktree (`.git` file with `commondir`) resolves to its **main checkout**, a nested repo to itself (pass `--data` to reach the outer repo). One order in `scripts/mk-state.py`, `hooks/dashboard.tsx` and `hooks/wake.ts`; the pure helpers are in `hooks/data.ts` (`projectDataDir`) |
-| Global dir | `$MATRIXKODER_HOME` → `~/.matrixkoder` (TS: `globalDirPath` in `hooks/data.ts`; the wizard writes `projects.json` here — plugin prefs live in the plugin's userConfig, not in this dir) |
-| Run index | `<data>/runs/index.json` |
-| Run snapshot | `<data>/runs/<run_id>/run.json` — written atomically (temp file + `os.replace`); **the dashboard reads only this** |
-| Event log | `<data>/runs/<run_id>/events.jsonl` — append-only (`O_APPEND`), one JSON object per line |
-| Board | `<data>/runs/<run_id>/board.md` — regenerated on every write and by `render` |
-| Lane registry | `<data>/lanes.json` — written **only** by `mk-lane.py` (see below); `mk-state.py` never touches it |
-| Task | `<data>/runs/<run_id>/tasks/<task_id>/task.json` (copy of the task object in `run.json`) |
-| Round files | same folder: `brief-rN.md`, `report-rN.md`, `review-rN.md` (paths returned by `task round`; written by the orchestrator / agents, not by mk-state; `task round --undo` refuses while any of them exists for the latest round) |
+| Project data dir | `--data DIR` → `$MATRIXKODER_DATA` → the repo's `projects.data_dir` row in the root store (keyed by the **main checkout** path; `mkpaths.data_dir`) → the repo folder. toplevel = the nearest `.git` above cwd, never `$HOME` itself (a dotfiles repo is not a project); a linked worktree (`.git` file with `commondir`) resolves to its **main checkout**, a nested repo to itself (pass `--data` to reach the outer repo). Once the project is migrated (its root `projects.db_path` is set) the data dir is the project's **legacy** location; the store and every live folder come from `mkpaths.project_db(slug)` / `mkpaths.project_folder` |
+| Global dir | `$MK_HOME` / `$MATRIXKODER_HOME` → `~/.matrixkoder` (`mkpaths.home` — **one** rule: both env names are the MK home and must agree; TS: `mkHomeEnv`/`globalDirOf` in `hooks/paths.ts`). Plugin prefs live in the plugin's userConfig, not in this dir |
+| Root store | `<home>/mk.db` — the overview only: the `projects` row per project and one `plan_summary` row per plan (C3). No task row, no event |
+| Project store | `<home>/projects/<slug>/mk.db` — the project DB, the only per-project DB and the ONE source of truth (C4). A migrated project's root `projects.db_path` names this file; `mkpaths.project_db(slug)` resolves it (the bus follows every switch through it) |
+| Project folder | `<home>/projects/<slug>/` — holds `mk.db`, `project.yaml` (today's `matrixkoder.yaml`), `watch-cursors.json`, `legacy/` and `plans/` (the C2 tree below) |
+| Plan folder | `<home>/projects/<slug>/plans/<plan-id>/` — `plan.md`, `assets/`, `archive/` (`plan-v1.md`, `plan-v2.md` …) and `runs/` |
+| Run folder | `plans/<plan-id>/runs/<run-id>/` — `bus.jsonl` (C6) and one folder per task |
+| Task round files | `plans/<plan-id>/runs/<run-id>/<task-id>/`: `brief-rN.md`, `report-rN.md`, `review-rN.md` (paths returned by `task round`; written by the orchestrator / agents, not by mk-state; `task round --undo` refuses while any of them exists for the latest round) |
+| Lane registry | `<data>/lanes.json` — written **only** by `mk-lane.py` (see below); `mk-state.py` never touches it. It is a project-level file (the reusable worktree slots), not lane data |
+| Bus files | `<home>/bus/` — `bus.json`, `bus-tokens.json`, `bus-tokens.lock`, `bus.lock`, `bus-ensure.lock`, `ring-queue.json`, `lanes/<sha256(lane)>.json` (C6) |
+| Watch cursors | `<home>/projects/<slug>/watch-cursors.json` (0600) — the orchestrator's bus watch cursors (C6) |
 | Locks | `<home>/locks/<resource lower-cased>.lock` |
 | Usage ledger | `<home>/usage.json` (owned by `mk-usage.py`; lane-health only adds `exhausted_*` fields, on the agent or on one pool, see below) |
 | Usage ledger lock | `<home>/usage.json.lock` — an empty sidecar every read-modify-write of `usage.json` takes as an exclusive `fcntl.flock` (`mk-usage.py`'s poll and lane-health's quota mark; the two would otherwise lose each other's fields). It holds no data, and it is derived from `<home>` rather than from the ledger path, so writers pointed at different `--out`/`--ledger` paths still serialise |
+| Run backup | `<data>/archive/<run>.db` — `run archive`'s `VACUUM INTO` copy under the legacy data dir (see `run archive`) |
 
-IDs (run, task, lock resource): `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`. Timestamps: ISO 8601 local time
-with offset, seconds precision (`2026-10-07T20:09:01+02:00`). Unknown values are `null`, never guessed.
+Every one of these paths comes from `scripts/mkpaths.py` (Python) or `hooks/paths.ts` (TS) — C1: no
+other file implements the MK home rule, the data-dir order, the project DB path, a plan/run/task
+folder, the lane-token path or the watch-cursor path (`hooks/data.ts` keeps only the pure string
+math they build on).
 
-## `runs/index.json`
+### The folder tree (C2)
 
-```json
-[{ "id": "mk-p1", "feature": "MatrixKoder P1", "status": "active", "started": "2026-10-07T20:09:00+02:00", "ended": null, "plan": "plan-link" }]
+```
+~/.matrixkoder/
+├── mk.db                         root: overview only (C3)
+├── usage.json
+├── bus/                          bus.json, bus-tokens.json, lanes/<sha256(lane)>.json, ring-queue.json (C6)
+└── projects/<slug>/
+    ├── mk.db                     the project DB (C4) — the only per-project DB
+    ├── project.yaml              today's matrixkoder.yaml
+    ├── watch-cursors.json        orchestrator bus watch cursors
+    ├── legacy/                   read-only tarball of the project's old data dir (C5, after user confirm)
+    └── plans/<plan-id>/
+        ├── plan.md               the plan (reference after import)
+        ├── assets/               mockups, design files
+        ├── archive/              plan-v1.md, plan-v2.md …
+        └── runs/<run-id>/
+            ├── bus.jsonl         archived bus messages, acks, bus artifacts (C6)
+            └── <task-id>/        brief-rN.md, report-rN.md, review-rN.md
 ```
 
-`status`: `active | done | archived`. Sorted by `started`. Archive is a flag; the folder never moves.
-`plan` (C4): the plan id of the run this entry was built from (`run init --plan`); `null` for plan-less
-and legacy path-only runs.
+Exactly two DB kinds: the root and one per project. No per-plan DB, no bus DB. The repo keeps **no**
+MK data — `project.yaml` (today's `matrixkoder.yaml`) lives in the project folder. Lane-worktree
+files (`.matrixkoder-*` in a lane) are not data and stay.
 
-## `run.json`
+### Who writes what
 
-```json
-{
-  "schema": 1,
-  "id": "mk-p1",
-  "feature": "MatrixKoder P1",
-  "branch": "main",
-  "head_sha": null,
-  "plan": ".matrixkoder/plans/matrixkoder.md",
-  "plan_id": "plan-link",
-  "plan_sha": "9f2c7ab1c8...",
-  "plan_status": "running",
-  "status": "active",
-  "stage": 5,
-  "next": "watch P1",
-  "waiting": { "question": "Merge P1 now?", "options": ["yes", "later"], "rec": "yes", "since": "2026-10-07T20:09:01+02:00" },
-  "started": "2026-10-07T20:09:00+02:00",
-  "ended": null,
-  "updated": "2026-10-07T20:09:01+02:00",
-  "tasks": [
-    {
-      "id": "P1", "title": "State core", "wave": 1, "deps": [], "owned": ["scripts/mk-state.py", "scripts/lane-*.py"],
-      "status": "building", "agent": "codex", "model": "gpt-5.5", "effort": "high", "lane": "../wt-p1",
-      "pane": "wK:p1",
-      "last_commit": null, "gates": null, "verdict": null,
-      "round": 1,
-      "rounds": [{ "n": 1, "kind": "build", "cause": null, "verdict": null, "sha": null, "started": "2026-10-07T20:09:00+02:00" }],
-      "created": "2026-10-07T20:09:00+02:00", "updated": "2026-10-07T20:09:00+02:00"
-    }
-  ],
-  "recent": [
-    { "t": "2026-10-07T20:09:01+02:00", "run": "mk-p1", "task": "P1", "type": "decision", "text": "Jev: codex high", "from": null, "to": null, "by": "orchestrator" }
-  ]
-}
-```
+| Writer | Writes | Never touches |
+|---|---|---|
+| `mk-state.py` | the project DB (runs, tasks, events, artifacts, waits, and its `ack`/`artifact` helpers); the board text it prints; the lane locks under `<home>/locks/` (the root store only through `mkdb`'s `plan_summary` refresh / `catch_up`) | `lanes.json` |
+| `mk-plan.py` | the project DB (`plans`, the task rows) and the plan folder (`plan.md`, `archive/<id>-v<n>.md`) | the root store |
+| `mk-lane.py` | `lanes.json` (its **only** writer) and the `lane_slots` rows of the project DB (best-effort mirror onto the task) | the run/task state tables |
+| `mk-migrate.py` | the root `projects.db_path` column (the ONLY root column it moves), the C2 project folder and the `legacy/` tarball | anything else |
+| `mkdb.py` | the root's `plan_summary` rows and (until L7.3 drops them) the `cards`; every project-table write | — |
+| `mk-bus.py` | `<home>/bus/` files and the live bus rows of the project DB (`events` chan='bus', `acks`, bus `artifacts`) | the state tables |
+| `lane-watch.py` / `lane-health.py` | events and the quota mark in `<home>/usage.json` (see below) | `lanes.json` |
+
+## The project DB
+
+`<home>/projects/<slug>/mk.db` is the only source of truth (C4). The tables `plans`, `runs`, `tasks`,
+`events`, `artifacts`, `acks`, `lane_slots`, `waits` and `change_log` are described under
+[SQLite stores](#sqlite-stores-scriptsmkdbpy) below. No file view of the run state is written (L4) or
+read (L5, L6.2); the board is **printed to stdout** from the DB by
+`mk-state.py render`. New data goes into a new column or a new table of the existing project schema —
+never a duplicated field. File mode is dropped: `/mk setup` always creates the project DB.
+
+A run row (`runs`): `id`, `plan` (the plan **id**, C4), `plan_version`, `branch`, `status`, `stage`,
+`next`, `started`, `ended` (C4). The run's task order is the `tasks` table's insertion order (parents
+before children); the file-only fields the tables have no column for — `feature`, `waiting`, and the
+computed `recent`/`ready`/`rounds` views — are derived at read time.
+
+### Run fields (one `runs` row)
 
 | Field | Type | Meaning |
 |---|---|---|
-| `schema` | int | `1` |
+| `id` | string | run id, unique in the project |
+| `feature` | string \| null | `--feature` |
+| `branch` | string \| null | `--branch` |
+| `plan` | string \| null | the plan **id** the run was built from (`run init --plan`); `null` for plan-less runs. The plan's file path is resolved through the plan folder, never stored as the linkage |
+| `plan_id`, `plan_sha`, `plan_status` | string \| null | **C4 plan link**: the plan's id (also the `runs.plan` column); the sha256 of the plan file bytes taken from a final `mk-plan.py parse` **after** the `set --status running` + `add-run` mutations (so the board's ⚠ does not fire at birth); the plan status then (`running`). `plan sync --apply` refreshes `plan_sha`/`plan_status`; the last plan-linked run set `done` flips `plan_status` to `done` (best-effort). `null` on plan-less runs |
+| `plan_version` | int \| null | the plan version the run was built from (`runs.plan_version`) |
 | `status` | `active \| done \| archived` | `ended` is set when it leaves `active`, cleared when it returns. `run set --status` takes `active\|done`; `archived` only via `run archive` |
-| `stage` | int | loop stage 0–12 (SKILL.md) |
-| `head_sha` | string \| null | optional (design §7.2): the run branch's current commit; the dashboard shows the branch only while absent |
-| `plan` | string \| null | the plan file path, as passed to `run init --plan` (legacy runs store only this) |
-| `plan_id`, `plan_sha`, `plan_status` | string \| null | **C4 plan link**: the plan's id; the sha256 of the plan file bytes taken from a final `mk-plan.py parse` **after** the `set --status running` + `add-run` mutations (so the board's ⚠ does not fire at birth); the plan status then (`running`). `plan sync --apply` refreshes `plan_sha`/`plan_status`; the last plan-linked run set `done` flips `plan_status` to `done` (best-effort). `null` on plan-less runs |
-| `next` | string \| null | next action, shown in the dashboard header and resume section |
-| `waiting` | object \| null | the one question waiting on the user: `question`, `options` (string[]), `rec` (string \| null), `since` (ts) |
-| `tasks` | array | task objects in insertion order (below) |
-| `recent` | array | last 10 events, same shape as `events.jsonl` lines |
-| `updated` | ts | last write |
+| `stage` | int \| null | loop stage 0–12 (SKILL.md) |
+| `next` | string \| null | next action, shown by `render` and in the dashboard's resume section |
+| `waiting` | object \| null | the one question waiting on the user: `question`, `options` (string[]), `rec` (string \| null), `since` (ts) — the `waits` table (cleared when answered) |
+| `started`, `ended`, `updated` | ts | timestamps |
+| `recent` | array | last 10 events, read from the `events` table (`chan='state'`) |
+| `tasks` | array | task rows in insertion order (below) |
 
-### Task object
+`run list` is ordered by `started`; `run get` defaults to the
+single active run. Archive is a flag on the row; nothing moves.
+
+### Task object (one `tasks` row)
 
 | Field | Type | Meaning |
 |---|---|---|
 | `id`, `title` | string | `id` unique case-insensitively within the run (`T1` and `t1` clash) |
+| `type`, `parent` | string \| null | `phase \| task \| subtask`; parent task id (same run). `--parent` onto a task in `merged`/`qa`/`done` is refused |
 | `wave` | int \| null | |
 | `deps`, `owned` | string[] | tasks it waits on (`T` in this run, `RUN:T` in another run of the same data dir); file globs it owns. Stored in the target's stored id case (ids match case-insensitively; a self-dep is refused at add). `task set status=dispatched\|building` fails while a dep of the task **or of any ancestor** is not `merged`/`qa`/`done` (`--force` overrides) |
-| `parent` | string \| null | parent task id (same run); `--parent` onto a task in `merged`/`qa`/`done` is refused. The parent's status rolls up from its children: a side state if any child is in one (`blocked` > `provider` > `quota` > `stalled`), else the least advanced child, raised to `building` only when at least one child is past `routed` and the least advanced child is below `building` (parents are never lowered); manual `status=` on a task with children **fans out**: every child is set to it (one transition event each, the same `--note`), and the parent itself is never written directly |
-| `ready` | bool | written by mk-state: has deps, `planned`/`routed`, every dep met. A flip to true logs a `deps met` note; the dashboard toasts it |
-| `status` | enum | `planned → routed → dispatched → building → verifying → review → fix → merged → qa → done`; side states `blocked \| quota \| stalled \| provider`. Input aliases, stored as the canonical word (also on `event --from`/`--to`): `reviewing`→`review`, `merging`→`merged`, `fixing`→`fix` |
+| `parent` | string \| null | the parent task's id (same run); the same value the `type` cell's parent carries |
+| `ready` | bool | derived (not a column): has deps, the published status is `planned`/`routed`, every dep met. The store status is `ready` (the kanban column) and the published status is kept in `tasks.file_status`; a flip to true logs a `deps met` note; the dashboard toasts it |
+| `status` | enum | `planned → routed → dispatched → building → verifying → review → fix → merged → qa → done`; side states `blocked \| quota \| stalled \| provider`. Input aliases, stored as the canonical word (also on `event --from`/`--to`): `reviewing`→`review`, `merging`→`merged`, `fixing`→`fix`. A parent's status **rolls up** from its children (`mkdb.transition`): a side state if any child is in one (`blocked` > `stalled` > `quota` > `provider`), else the least advanced child, raised to `building` only when at least one child is past `routed` and the least advanced child is below `building` (parents are never lowered); the last non-attention status is kept in `tasks.prev_status`. Manual `status=` on a task with children **fans out**: every child is set to it (one transition event each, the same `--note`), and the parent itself is never written directly |
 | `agent` | string \| null | agent kind or pane (`codex`, `agy`, ...) |
 | `model`, `effort`, `lane`, `pane` | string \| null | `lane` = worktree (slot) path; `pane` = herdr pane id of that lane (`wK:p1`), written by `mk-lane-event.py arm` (`mk-state task set <T> pane=<pane>`, best-effort) |
 | `branch`, `workspace`, `slot` | string \| null | the lane's own names, written by `mk-lane.py acquire`: `branch` = `mk/<run>/<task>`, `workspace` = herdr workspace label `mk:<repo>:<n>`, `slot` = slot number as a string. Empty value clears (`branch=`), like `lane=`/`pane=`; the board shows all three on the lane cell when set |
@@ -102,29 +125,37 @@ and legacy path-only runs.
 | `gates` | any JSON \| null | e.g. `{"test": "pass", "tsc": "pass"}` (pass a JSON value to `task set`) |
 | `verdict` | string \| null | latest review verdict; also copied to the current round's `verdict` |
 | `round` | int | current round number (0 = none yet) |
-| `rounds` | array | `{n, kind: build\|fix\|takeover, cause, verdict, sha, started}` |
-| `plan_phase`, `route`, `lane_group`, `reviewer` | string \| null | **C4**: set on a *phase* task created by `run init --plan` — the plan phase id, its pinned `route` (`""` = Jev decides, stored `null`), its `lane_group` (phases sharing a value share one worktree), and the phase's `reviewer` (`""` = orchestrator decides, stored `""` — the plan's value or `""` when absent; `task set reviewer=` rewrites it). `null` on ad-hoc tasks (`task add`) and children; the `reviewer` key is absent there until `task set` adds it || `plan_task` | string \| null | **C4**: set on a *child* task created from a `[[phase.task]]` — the plan task id (`P1.1`); its `parent` is the phase task. `null` on ad-hoc and phase tasks |
+| `rounds` | array | derived (not a column): the round history from the round events and the round `artifacts` rows, `{n, kind: build\|fix\|takeover, cause, verdict, sha, started}` |
+| `plan_phase`, `route`, `lane_group`, `reviewer` | string \| null | **C4**: set on a *phase* task created by `run init --plan` — the plan phase id, its pinned `route` (`""` = Jev decides, stored `null`), its `lane_group` (phases sharing a value share one worktree), and the phase's `reviewer` (`""` = orchestrator decides, stored `""` — the plan's value or `""` when absent; `task set reviewer=` rewrites it). `null` on ad-hoc tasks (`task add`) and children; the `reviewer` key is absent there until `task set` adds it |
+| `plan_task` | string \| null | **C4**: set on a *child* task created from a `[[phase.task]]` — the plan task id (`P1.1`); its `parent` is the phase task. `null` on ad-hoc and phase tasks |
 
-## `events.jsonl` line
+## Events (the `events` table)
 
 ```json
 {"t": "2026-10-07T20:09:00+02:00", "run": "mk-p1", "task": "P1", "type": "transition", "text": "lane-watch STALL: agent idle, no change 11 min", "from": "building", "to": "stalled", "by": "lane-watch"}
 ```
 
-`type`: `transition | decision | verdict | quota | note`. `task` is `null` for run-level events.
-`from`/`to` are task statuses (`from` is `null` when a task is added; the status aliases resolve here
-too, the canonical word is stored). `by` = writer (`orchestrator`,
-`lane-watch`, ...; `--by` flag). `text` carries the evidence (plan §4 called it `evidence`).
-`task set status=...` appends the transition event itself. Every `--force` override of a safety gate
-writes exactly one `decision` event `forced by <by>: <command summary>` (`by` = the `--by` flag,
-default `orchestrator`): `task set` past unmet own+ancestor deps, `run init --plan` past an unapproved
-plan status. `text` must be non-empty; a `transition`
-event needs `to`. Readers skip a line that is not valid JSON (a crash mid-append); `run.json` is
-authoritative, so `events.jsonl` may hold one event more than `recent` after a crash.
+One `events` row per event: `id` (the integer primary key, `mk-bus`'s SSE `Last-Event-ID`), `run`,
+`task`, `t`, `chan`, `kind`, `from_id`, `to_id`, `reply_to`, `text`, `artifact_id`, `meta_json`.
+`type` is `kind` in the object above: `transition | decision | verdict | quota | note`. `task` is
+`null` for run-level events. `from`/`to` are task statuses (`from` is `null` when a task is added; the
+status aliases resolve here too, the canonical word is stored). `by` = writer (`orchestrator`,
+`lane-watch`, ...; `--by` flag); it rides in `meta_json`. `text` carries the evidence (plan §4 called
+it `evidence`). `task set status=...` appends the transition event itself. Every `--force` override of
+a safety gate writes exactly one `decision` event `forced by <by>: <command summary>` (`by` = the
+`--by` flag, default `orchestrator`): `task set` past unmet own+ancestor deps, `run init --plan` past
+an unapproved plan status. `text` must be non-empty; a `transition` event needs `to`.
+
+`chan` is `state` on a state event, `bus` on a live bus message (C6) and `note` for an ad-hoc note.
+Status changes go **only** through `mkdb.transition()`: `append_event` refuses `chan='state'` with
+`kind='transition'`. A live bus message stays in the project DB while the run is open; at run end the
+run's messages, acks and bus artifacts are archived (count-checked) to
+`plans/<plan>/runs/<run>/bus.jsonl` and leave the DB — the watch/wake/lane cursors tolerate the gap.
 
 ## `lanes.json` (slot registry, `scripts/mk-lane.py`)
 
-Lives outside `runs/`: it describes the reusable **worktree slots** of this project, not a run.
+It describes the reusable **worktree slots** of this project, not a run (a project-level file beside
+the data dir, not inside a run folder).
 `mk-lane.py` is its only writer and mirrors the lane it hands out onto the task (`lane`, `branch`,
 `workspace`, `slot` task keys, best-effort: a failed write there is a warning on the acquire, never a
 failed one). `mk-state.py` never reads or writes it.
@@ -274,23 +305,22 @@ everything else `default`.
 
 | Command | Flags |
 |---|---|
-| `run init` | `--id ID --feature F --branch B [--plan PATH --force]` — with `--plan`: the plan tool (`mk-plan.py`, or `$MK_PLAN_CMD`) `check` must pass and its status be `approved` (refused before any local write); `--force` overrides an unapproved status and writes a `decision` event naming `--by`. The plan then gets `set --status running` + `add-run --run ID`, the run stores `plan_id`/`plan_sha`/`plan_status`, and phase + child tasks are created through the `task add` path |
-| `plan sync` | `[--run ID] [--apply]` — diff the run's plan against its tasks (dry run by default, nothing written): new phase/task → added via the add path; changed `title`/`wave`/`owned`/`deps` on a `planned\|routed` task → updated, on a started task → warning only; removed → warning, **never deleted**. `--apply` stores the new `plan_sha` and writes exactly ONE summary event (the reused paths' per-task events are suppressed) |
+| `run init` | `--id ID --feature F --branch B [--plan PATH --force]` — with `--plan`: the plan tool (`mk-plan.py`, or `$MK_PLAN_CMD`) `check` must pass and its status be `approved` (refused before any local write); `--force` overrides an unapproved status and writes a `decision` event naming `--by`. The plan then gets `set --status running` + `add-run --run ID`, the run's `runs` row stores `plan`/`plan_version` and the run's `plan_id`/`plan_sha`/`plan_status`, and phase + child tasks are created through the `task add` path |
+| `plan sync` | `[--run ID] [--apply] [--from-file]` — diff the run's plan `.md` against its tasks (dry run by default, nothing written): new phase/task → added via the add path; changed `title`/`wave`/`owned`/`deps` on a `planned\|routed` task → updated, on a started task → warning only; removed → warning, **never deleted**. On a **live** run (any task not `merged`/`done`) it REFUSES — the DB tasks are the source, and `task set` is how they change; `--from-file` is the explicit "the plan file wins" override. `--apply` stores the new `plan_sha` and writes exactly ONE summary event (the reused paths' per-task events are suppressed) |
 | `run list` / `run get` | `run get [--id ID \| ID]` (default: the single active run) |
 | `run set` | `[--id ID] [--next TEXT] [--status active\|done]` (at least one) |
-| `run stage` / `run archive` | `run stage N` (N >= 0, `[--id ID]`); `run archive --id ID` or `run archive ID` |
+| `run stage` / `run archive` | `run stage N` (N >= 0, `[--id ID]`); `run archive ID` sets the row `archived` and, first, `VACUUM INTO`s the project DB to `<data>/archive/<run>.db` (temp file first, verified to hold the run and its task count; an existing backup is never overwritten — the new one lands as `<run>-<UTC timestamp>.db`; a failed backup leaves the run active) |
 | `task add` | `--id T --title TEXT [--wave N] [--deps A,RUN:B] [--owned glob,glob] [--parent P]` — deps are stored in the target's stored id case and a self-dep is refused; `--parent` onto a task in `merged`/`qa`/`done` fails; returns `warnings` for unknown deps, owned globs overlapping an unmerged task in any active run (the new task's own `--parent` chain is not an overlap: a parent owns its children's globs), and active sibling runs that could not be read |
-| `task set` | `T key=value ... [--note TEXT] [--force]` (`--force`: dispatch past unmet own+ancestor deps; writes a `decision` event naming `--by`); `status=` on a task with children fans out to every child — one transition each, the same `--note`, the parent itself never set directly (it rolls up), the dep gate applied per child before any write; status aliases `reviewing`/`merging`/`fixing` store as `review`/`merged`/`fix`; keys `status agent model effort lane pane branch workspace slot last_commit gates verdict reviewer`; a value starting `{`/`[` is parsed as JSON, empty = null |
-| `task round` | `T --kind build\|fix\|takeover [--cause TEXT]`; `T --undo` drops the latest round — but only while none of its brief/report/review files exist (the paths `task round` returned), else `ok:false` naming them; exactly one note event (`round N undone`); no rounds / `--kind` with `--undo` are refused |
+| `task set` | `T key=value ... [--note TEXT] [--force]` (`--force`: dispatch past unmet own+ancestor deps; writes a `decision` event naming `--by`); `status=` on a task with children fans out to every child — one transition each, the same `--note`, the parent itself never set directly (it rolls up), the dep gate applied per child before any write; status aliases `reviewing`/`merging`/`fixing` store as `review`/`merged`/`fix`; keys `status agent model effort lane pane branch workspace slot last_commit gates verdict reviewer parent title acceptance owned deps refs`; a value starting `{`/`[` is parsed as JSON, empty = null. This is the way to change a task in a RUNNING plan: the change lands in the DB, never in the plan `.md` |
+| `task round` | `T --kind build\|fix\|takeover [--cause TEXT]`; `T --undo` drops the latest round — but only while none of its brief/report/review files exist (the paths `task round` returned) in `plans/<plan-id>/runs/<run-id>/<task-id>/`, else `ok:false` naming them; exactly one note event (`round N undone`); no rounds / `--kind` with `--undo` are refused |
 | `task verify` | `T --tests '<passed>/<failed>' [--tsc N] [--lint N] [--selftest '<run>/<failed>'] [--fail TEXT]` — stage 7; one `verdict` event, baseline compare, status move (see the subsection below). A failed count larger than the passed count is refused |
 | `task get` | `T` |
 | `event` | `[--task T] --type transition\|decision\|verdict\|quota\|note --text TEXT [--from S] [--to S]` |
 | `wait set` / `wait clear` | `--question TEXT --options a,b [--rec TEXT]` |
 | `lock take` / `release` / `check` | `RES --reason TEXT [--ttl-min 30] [--scope a,b] [--force-stale]`; `release RES [--force]` |
-| `render` | regenerate `board.md` |
-| `store enable` / `store status` | opt-in to the SQLite store (see below) |
-| `sync` | `[--project SLUG]` — root-card catch-up (see below) |
-| `export-legacy` | `--run R` — rebuild the legacy files from the tables (see below) |
+| `render` | print the board to **stdout** from the project DB (`{"ok": true, "board": "…"}`) |
+| `store status` / `store enable` | the project DB's presence (`on`) or the legacy one-way import (see Store mode) |
+| `sync` | `[--project SLUG]` — root-card catch-up (see Store mode) |
 
 Common flags: `--data DIR`, `--by WHO` (default `orchestrator`; written to events and locks), `--run ID`
 for task/event/wait/render (`run *` commands take `--id`, alias `--run`).
@@ -298,19 +328,18 @@ for task/event/wait/render (`run *` commands take `--id`, alias `--run`).
 ### Output
 
 Every `mk-state.py` command prints exactly one JSON line: `{"ok": true, ...}` exit 0;
-`{"ok": false, "error": "..."}` exit 2 on bad input or a corrupt/unreadable state file; lock refused →
+`{"ok": false, "error": "..."}` exit 2 on bad input or an unreadable store; lock refused →
 exit 1 with `state` and `lock`. A malformed sibling active run only produces a `warnings` entry
 and is skipped for cross-run `ready`/board upkeep. Flags never prefix-match (`--fo` is an unknown
-argument). `task round` returns `{round, kind, brief, report, review}` absolute paths for that round;
+argument). `task round` returns `{round, kind, brief, report, review}` absolute paths for that round
+(under `plans/<plan-id>/runs/<run-id>/<task-id>/`);
 `task round --undo` returns `{round, undone}` with `round` back to the remaining round number.
 
 Every lane-watch verdict's evidence ends with a source tag saying which channel decided it:
-`source=store` (the project store's `tasks` row — `store row done` / `store row blocked`),
-`source=status` (the accepted status file — `status file done (seq N)`), `source=pane` (the
-pane text: the DONE token, QUOTA, STALL, ERROR, WATCH_EXPIRED), or `source=grace` (the
-no-token rule: commit and report present, agent idle, token missing). The store is read only
-when `<data>/mk.db` already exists — a watch never creates it, and without it the status file
-and the pane text decide.
+`source=store` (the project DB's `tasks` row — `store row done` / `store row blocked`),
+`source=pane` (the pane text: the DONE token, QUOTA, STALL, ERROR, WATCH_EXPIRED), or
+`source=grace` (the no-token rule: commit and report present, agent idle, token missing). The
+project DB is the only source (C4); a watch reads it read-only and never creates it.
 
 lane-watch exit → task status (with `--task --data`, both required together): `DONE`/`DONE_SENT → verifying`,
 `QUOTA → quota`, `STALL → stalled`, `PROVIDER → provider`, `BLOCKED → blocked` — only while the task is
@@ -377,10 +406,11 @@ yields `(id, type, parent, title, acceptance, owned, deps, parallel, route)` per
 subtask, parent first, and each becomes one `tasks` row of the run.
 
 Lifecycle (C13): `import` loads the file into the store without approving it; `approve` checks
-the file, versions it, writes the tasks and copies it to `<data>/plans/archive/<id>-v<n>.md`,
-leaving the original in `<data>/plans/`; `run init --plan` starts the run. After import the run
+the file, versions it, writes the tasks and copies it to
+`<home>/projects/<slug>/plans/<id>/archive/<id>-v<n>.md`, leaving the original as the plan's
+`plan.md`; `run init --plan` starts the run. After import the run
 and this DB are the source — status, tasks, rounds and verdicts change there, and MK does not
-edit the plan file. When the plan is done the file moves to `<data>/plans/archive/`.
+edit the plan file. When the plan is done the file moves into the plan folder's `archive/`.
 
 `mk-plan.py check` reports a missing `status`, a missing `created` and a body with no H1 line as
 **warnings**, never errors, so an older plan still checks `ok: true`.
@@ -393,9 +423,12 @@ edit the plan file. When the plan is done the file moves to `<data>/plans/archiv
 
 Data-dir resolution (`resolve_data_arg`), the same order as `mk-state` and copied rather than
 imported: `--data`, then `$MATRIXKODER_DATA`, then the data dir this repo registered (the root
-`projects.data_dir` row, else `<home>/projects.json`), else `<main checkout>/.matrixkoder`. A
+`projects.data_dir` row), else the repo folder. A
 linked worktree uses the main checkout. None of these commands creates a store: a store exists
-only when `<data>/mk.db` is already a file.
+only when the project DB (`<home>/projects/<slug>/mk.db` for a migrated project, else
+`<data>/mk.db`) is already a file. Once the project is migrated, the store and the plan folder
+come from `mkpaths.project_folder` / `mkpaths.plan_dir`, so nothing is written under the legacy
+data dir.
 
 `import <file> [--dry-run] [--data DIR] [--home DIR]` loads one plan and does not approve it. It
 writes one `plans` row (status, created, design, integration, the H1 title, `header_json`,
@@ -403,19 +436,19 @@ writes one `plans` row (status, created, design, integration, the H1 title, `hea
 or whose header does not parse, is refused (`ok: false`, `reason` set, exit 0). A header with no
 `plan` id is refused the same way. The same bytes imported again upsert the same row and change
 nothing (`noop: true`); version is left as stored, or `0` when the row is new. `--dry-run`
-returns the same reply and writes nothing. Import needs a store; without `<data>/mk.db` it errors.
+returns the same reply and writes nothing. Import needs a store; without the project DB it errors.
 
 `approve <path> [--data DIR] [--home DIR] [--run ID]` checks the file, writes the plan version and
-its tasks, and copies the approved bytes to `<data>/plans/archive/<id>-v<n>.md`. The original
+its tasks, and copies the approved bytes to `plans/<id>/archive/<id>-v<n>.md` in the project
+folder. The original
 stays in place (refreshed to those approved bytes, so `run init --plan <original path>` still
 resolves). The reply names the run id as `tasks_run` (the `--run` value, else the plan's first
 `runs` entry, else the plan id) — no run row exists until `run init`. Approving the same approved
-bytes again is a no-op. With no store, approve only flips the file status to `approved` and, when
-an `mk.db` sits beside the file that was not the resolved store, adds a warning naming it.
+bytes again is a no-op.
 
 `delete <id> [--data DIR] [--home DIR]` is refused while any `runs` row has `plan=<id>` and
 `status='active'` (exit 2, the live run ids named). Otherwise it removes the `plans` row and
-moves `<data>/plans/<id>.md` into `<data>/plans/archive/` (a timestamp suffix when that name is
+moves the plan's `plan.md` into the plan folder's `archive/` (a timestamp suffix when that name is
 already taken). The file is never unlinked. Tasks of finished runs stay.
 
 Pause and resume are `set <path> --status parked` and `set` back to the previous status. The file
@@ -437,10 +470,10 @@ that column follows.
 
 `mk-state.py` never imports `mk-plan.py`; it runs it as a subprocess (`$MK_PLAN_CMD` overrides the
 command) and consumes its one JSON line (`parse`, `check`, `set --status`, `add-run`). Stored fields:
-`run.json` `plan_id`/`plan_sha`/`plan_status` + index `plan`; phase task `plan_phase`/`route`/
+the run's `plan_id`/`plan_sha`/`plan_status` (plus the `runs.plan`/`plan_version` columns); phase
+task `plan_phase`/`route`/
 `lane_group`/`reviewer`; child task `plan_task` (its `parent` names the phase task). All `null` for
-plan-less runs/tasks (a phase's `reviewer` is `""`, never `null`, when the plan has none); a legacy
-run keeps its path-only `plan` field and the plain `plan: \`path\`` board line.
+plan-less runs/tasks (a phase's `reviewer` is `""`, never `null`, when the plan has none).
 The board of a plan-linked run shows `plan: \`id\` · status · sha \`…12\`` and, when the plan file's
 current sha256 (plain read) differs from `plan_sha`, a `⚠ plan file changed since run start` line —
 an unreadable plan file means no warning and no crash. Setting the **last** run of a plan `done`
@@ -455,77 +488,99 @@ carries `promote_error` (`"<Error>: <message>"`) — a key present only on that 
 it repairs a partial promotion.
 `task add` stays for ad-hoc tasks.
 
-## Store mode (`store enable`)
+## Store mode
 
-Off by default: `store status` answers `{"store": "off"}` while `<data>/mk.db` does not exist, and
-every command keeps using the JSON files. `store enable` is the opt-in. It creates the project
-store, and imports every run: each entry in `runs/index.json`, plus any `runs/<id>/run.json`
-the index does not list. The importer (`scripts/mk-store-import.py`) lands them in dependency
+File mode is **dropped** (C4): `/mk setup` always creates the project DB, and `store status` answers
+`{"store": "on"}` once it exists (`{"store": "off"}` only while the project DB is absent, which now
+only a project that never ran `/mk setup` is). `store enable` is the legacy opt-in path kept for a
+pre-store project: it creates the project store and imports every run from the legacy file views.
+The importer (`scripts/mk-store-import.py`) lands them in dependency
 order, so a `<run>:<id>` dep finds its target; deps that still cannot be resolved are reported in
 `unresolved_deps` and do not abort the import. One run that fails to import aborts the whole
-enable and `<data>` is left exactly as it was — all or nothing. The reply is `{"store": "on",
+enable and the data dir is left exactly as it was — all or nothing. The reply is `{"store": "on",
 "imported": "<run>" | ["<run>", …], "events": N, "tasks": N, "legacy": "<data>/runs-legacy"}`
 (`imported` is the single id only when that id is the one active run, otherwise the list, in
-dependency order). The current `runs/` tree moves to `<data>/runs-legacy/` — a read-only copy
-taken at enable time, not updated again. `run.json`'s task order is kept: the tasks table inserts
-parents before children, and the republished view overlays those rows back onto the artifact's
-order. Before the import, stale `mk-enable-*` directories in `<data>` older than a minute are
-swept (a directory younger than a minute, or one holding a live lock, is left alone).
+dependency order). The task order of the imported run is kept: the tasks table inserts parents
+before children, and the reader overlays those rows back onto the imported order. Before the
+import, stale `mk-enable-*` directories in the data dir older than a minute are
+swept (a directory younger than a minute, or one holding a live lock, is left alone). This is a
+one-way import (the pre-migration file views are the source); **new** projects are created straight
+into the DB and none of these file views is written again.
 
-With the store on, all writes go through the store and the legacy views under `runs/` are
-republished from it: `run.json`, `tasks/` and `board.md` are rewritten, and `events.jsonl` is
-append-only — new events are appended, the file is never rewritten. `runs/<run>/.store-event`
-holds the last published event id and the byte offset where its line ends, written before the
-append. A crash between the two leaves the marker ahead of the file; the next publish appends
-exactly the missing bytes, and a marker that was rewound skips lines that are already the tail,
-so a crash never duplicates a line. `store status` then answers `{"store": "on"}`.
-
-`export-legacy --run R` rebuilds that run's legacy files from the tables (reply `{"ok": true, "run": R}`).
+`export-legacy --run R` is removed with file mode: nothing rebuilds the old file views from the
+tables any more.
 
 `sync [--project SLUG]` catches the root `cards` up from `sync.last_change_no`: it copies the
 `change_log` rows the root is behind on and answers `{"store": "on", "project": "<slug>", "copied": N}`.
 Run again it copies nothing (`"copied": 0`) — it is idempotent, and `last_change_no` only moves
-forward. The project defaults to `matrixkoder`.
+forward. The project defaults to `matrixkoder`. `cards`/`project_summary`/`sync` stay in the root as
+a read-only view until L7.3 drops them; the root's numbers now come from `plan_summary` (C3).
 
-`run archive` with the store on first backs the project store up: `VACUUM INTO` a temp file
+`run archive` first backs the project store up: `VACUUM INTO` a temp file
 (`<data>/archive/<run>.db.tmp`), checked to hold the run and its task count, then renamed to
 `<data>/archive/<run>.db`. The backup is written to the temp file first, and an existing backup is
 never overwritten — when `<run>.db` is already there the new one lands beside it as
 `<run>-<UTC timestamp>.db` (e.g. `r1-20261012T031854Z.db`). The backup happens before the status
 commit: if it fails, the temp file is removed and the run stays active.
 
-`plan sync` on the store adds `version_diff` to its reply — the list of plan fields whose stored
+`plan sync` adds `version_diff` to its reply — the list of plan fields whose stored
 version differs from the parsed file (`[]` when they match). The dry run still writes nothing.
 `--apply` writes the new plan version into the `plans` table (version + 1) when there is a diff,
 and the reply gains `version`, the stored version number.
 
 ## Data dir resolution
 
-`<data>` resolves in this order: `--data` > `$MATRIXKODER_DATA` > the root `projects` table (by
-repo path) > `<home>/projects.json` > `<main checkout>/.matrixkoder`. The repo is the nearest
+`<data>` resolves in this order: `--data` > `$MATRIXKODER_DATA` > the root `projects.data_dir` row
+(by repo path) > the repo folder. The repo is the nearest
 `.git` above the cwd, never `$HOME` itself, and a linked worktree maps to its main checkout.
 Reading the root table checks that `<home>/mk.db` exists first, so resolving never creates it.
-`projects.json` is `{"<repo>": {"data_dir": ...}}`, keyed by the repo's real path. Registering a
-project writes both the root `projects` table and `projects.json`; the slug is checked against
-`^[a-z0-9][a-z0-9-]{0,40}$` before either is touched, and a bad slug writes nothing.
+Registering a project writes the root `projects` row (the single registry); the slug is checked
+against `^[a-z0-9][a-z0-9-]{0,40}$` before either is touched, and a bad slug writes nothing. The
+`db_path` column is the migrated marker: once set, `mkpaths.project_db(slug)` /
+`project_folder` name the project folder, and `<data>` is only the project's legacy location.
+
+## Migration (`mk-migrate.py`, C5)
+
+`mk-migrate.py` is the ONE migration tool, and the only writer of `projects.db_path`. Default (no
+flag): quiesce, copy, verify — which leaves the C2 copy in place and `projects.db_path` NULL, so
+every reader keeps the old path. `--dry-run` prints every move and writes nothing.
+
+- **quiesce** refuses unless no lane is armed/working and the project's bus inbox is drained.
+- **copy** moves the WHOLE project DB (all runs stay queryable), `project.yaml`, the watch cursors
+  and the live plans' `plan.md` + `assets` + `archive` + round files into the C2 tree. Only plans
+  with an active run move their files; files of non-live plans live only in the `legacy/` tarball.
+- **verify** re-counts and hashes under the switch lock; a mismatch removes the NEW copy ONLY (the
+  old data is untouched) and refuses the switch.
+- `--switch` repeats copy+verify under the lock, then sets `projects.db_path` and writes the switch
+  record; a second switch refuses (use `--rollback`).
+- `--rollback` refuses when the new DB has writes after the switch (or carries them back new→old
+  with the same verify), then clears `db_path`.
+- `--archive` (separate, only on the user's word) tars the old data dir into
+  `projects/<slug>/legacy/`. **No command deletes the old folder** — the user does that.
+
+The checklist after a switch: `mk-state` reads the new store, `mk-plan.py check`/`import` write the
+plan folder, `mkdb.py plans`/`overview --json` answer, the dashboard's Plan and Settings tabs load,
+and the C7 bus gate (the bus never breaks: `mk-bus-soak.py` sees no lost or duplicated seq, and the
+bus e2e passes with one migrated and one pre-migration project) holds.
 
 
 ## SQLite stores (`scripts/mkdb.py`)
 
 `mkdb.py` is the only module that opens a store read-write (research §8: a test greps `scripts/`
-for `sqlite3.connect` and fails if any other script opens one without `mode=ro`). Nothing else
-calls it yet — the run still uses the JSON/file state above. Every self-test and caller passes a
-temp home; the real `~/.matrixkoder` is never created here.
+for `sqlite3.connect` and fails if any other script opens one without `mode=ro`). Every writer above
+goes through it, and it is the ONE place a project-table write happens. Every self-test and caller
+passes a temp home; the real `~/.matrixkoder` is never created by a test.
 
 ### Locations
 
 | Store | Path | Holds |
 |---|---|---|
-| Root (C1) | `<home>/mk.db` | `projects`, `cards`, `project_summary`, `sync` |
-| Project (C2) | `<data>/mk.db`, or `<home>/projects/<slug>/mk.db` when only a slug is given | `plans`, `runs`, `tasks`, `events`, `artifacts`, `acks`, `lane_slots`, `waits`, `change_log` |
+| Root (C3) | `<home>/mk.db` | `projects` (with `db_path`), `plan_summary`; `cards`, `project_summary`, `sync` until L7.3 drops them |
+| Project (C4) | `<home>/projects/<slug>/mk.db` for a migrated project; a slug resolves it through `projects.db_path` (`mkpaths.project_db`). A `--data` (or pre-migration slug) opens `<data>/mk.db`, the legacy location | `plans`, `runs`, `tasks`, `events`, `artifacts`, `acks`, `lane_slots`, `waits`, `change_log` |
 
-`<home>` is `--home` → `$MK_HOME` → `~/.matrixkoder`. `<data>` is `--data` / `data_dir`: until DM a
-project lives at `<repo>/.matrixkoder/`, not under the home. The slug is checked against
+`<home>` is `--home` → `$MK_HOME` → `~/.matrixkoder`. `<data>` is `--data` / `data_dir`: it names
+either the project folder or (pre-migration, and for `mk-migrate`'s rollback) the project's legacy
+folder. The slug is checked against
 `^[a-z0-9][a-z0-9-]{0,40}$` **before** any path is built from it. A home whose path contains
 `Mobile Documents`, `CloudStorage`, `iCloud` or `Dropbox`, or starts with `/Volumes/`, is refused —
 a path-string heuristic, so a custom sync root or a volume mounted elsewhere slips through
@@ -538,7 +593,8 @@ Every open sets `journal_mode=WAL`, `busy_timeout=5000`, `foreign_keys=ON`. Ever
 
 ### `schema_version` and migrations
 
-Both stores carry `schema_version(version INTEGER PRIMARY KEY)`. `SCHEMA = 4`. Migrations are an
+Both stores carry `schema_version(version INTEGER PRIMARY KEY)`. The project store is `SCHEMA = 4`;
+the root store is `ROOT_SCHEMA = 2` (it migrates additively and independently). Migrations are an
 ordered `(version, step)` list applied once. A step is either SQL or a Python callable. SQL steps
 are idempotent by construction (`CREATE TABLE IF NOT EXISTS`, `INSERT OR IGNORE`); an
 `ALTER TABLE ADD COLUMN` is not safe to run twice, so it goes through a guarded Python step that
@@ -546,6 +602,11 @@ checks `PRAGMA table_info` and adds the column only when it is missing. The step
 stamp are two transactions, so a crash between them re-runs the step. A store whose version is
 newer than the code is refused:
 `{"ok": false, "error": "store schema vN is newer …"}`, exit 3.
+
+Root v2 (shipped, a guarded Python step) adds `projects.db_path` — last, matching the base
+`CREATE TABLE`'s column order — and creates the `plan_summary` table empty. Additive only: a v1
+root keeps every row it had (including its `cards`) and reaches the same shape a fresh root gets,
+and re-running the step changes nothing (the column is added only when `table_info` lacks it).
 
 v2 (shipped, a Python step) adds `artifacts.src TEXT` — the importer's stable source key, NULL
 on rows the live path writes — the index `art_run_src(run, src)`, and `event_src(run, src,
@@ -568,32 +629,50 @@ is created with those columns already on `plans`, then the v2, v3 and v4 steps r
 version 4. A v1, v2 or v3 store is upgraded in place on the next open and keeps every `plans`
 row; opening it again changes nothing.
 
-### Project tables (C2)
+### Project tables (C4)
+
+`plans(id, version, title, status, created, design, integration, header_json, body_md,
+approved_at, archived_path)`.
+
+`runs(id TEXT PRIMARY KEY, plan, plan_version, branch, status, stage, next, started, ended)` —
+`plan` is the plan **id** (C4); `status` is `active|done|archived`.
 
 `tasks(run, id, parent, type, title, acceptance, owned, deps, parallel, route_json, status,
-prev_status, lane, slot, branch, pane, round, verdict, updated, PRIMARY KEY(run, id))` — `type` is
+prev_status, file_status, lane, slot, branch, pane, round, verdict, updated, PRIMARY KEY(run, id))` — `type` is
 `phase|task|subtask`; `prev_status` is the last non-attention status (NULL until the first one);
-`deps` is one TEXT CSV of ids in the same plan, or `<run>:<id>` in the same project. Validated on
-write: the dep must exist, a self-dep is refused, a cycle is refused with the path named
+`file_status` is the published status (`planned` or `routed`) while `status` is the kanban column
+`ready`; `deps` is one TEXT CSV of ids in the same plan, or `<run>:<id>` in the same project.
+Validated on write: the dep must exist, a self-dep is refused, a cycle is refused with the path named
 (`cycle: r:phase -> r:task -> r:phase`). `route_json` is `{"agent","model","effort"}` or empty.
 Status rolls up subtask → task → phase through `transition()`: if any child is in an
 attention status the parent takes that status, first match in the order `blocked`, `stalled`,
-`quota`, `provider`, so the parent keeps its previous column through `prev_status` and gets
-`attention=1`; when no child is in an attention status the parent returns to the least-done
-column of its children's non-attention statuses, attention 0. A parent already at the rolled
-status is not transitioned again.
+`quota`, `provider`, so the parent keeps its previous status through `prev_status` (it drives the
+kanban column); when no child is in an attention status the parent returns to the least-done
+status of its children's non-attention statuses. A parent already at the rolled
+status is not transitioned again. The tasks table inserts parents before children (`_parents_first`);
+the reader overlays the rows back onto the run's task order.
 
 `events(id INTEGER PRIMARY KEY, run, task, t, chan, kind, from_id, to_id, reply_to, text,
-artifact_id, meta_json)` with index `ev_task(run, task, id)`. `chan` is `state` or `bus` on rows
-`transition()` and `import_history` write; `append_event` also accepts `note`.
+artifact_id, meta_json)` with index `ev_task(run, task, id)`. `chan` is `state`, `bus` or `note`;
+`kind` is the event type. Status changes go only through `transition()` (`chan='state'`,
+`kind='transition'`); `append_event` refuses that pair.
 `change_log(change_no INTEGER PRIMARY KEY, run, task, t)` — `change_no` is the rowid, gap-free.
-`lane_slots(slot TEXT PRIMARY KEY, lane_path, state, run, task, workspace, workspace_id, branch, lock_hash, updated)` — the five trailing columns are v3, each `TEXT`, and match the slot record in `lanes.json` (`workspace` and `workspace_id` are null for a plain git worktree; `branch`, `lock_hash` and `updated` are null until the slot is acquired). `runs`, `acks`, `waits` as in contract C2.
-
-`plans(id, version, title, status, created, design, integration, header_json, body_md, approved_at, archived_path)`. `status TEXT`, `created TEXT`, `design TEXT` (JSON array text) and `integration TEXT` are v4 (C1), NULL on a row written before the migration. `title` is the H1 text after the em dash, or the plan id when the body has no H1 (C3).
+`lane_slots(slot TEXT PRIMARY KEY, lane_path, state, run, task, workspace, workspace_id, branch, lock_hash, updated)` — the five trailing columns are v3, each `TEXT`, and match the slot record in `lanes.json` (a published view of these rows; `workspace` and `workspace_id` are null for a plain git worktree; `branch`, `lock_hash` and `updated` are null until the slot is acquired).
+`waits(id INTEGER PRIMARY KEY, run, question, opened, cleared)` — the run's one live `waiting`
+question. `acks(run, msg, lane, level, t, PRIMARY KEY(run, msg, lane))` — the bus's ack levels (C6).
 `artifacts(id INTEGER PRIMARY KEY, run, task, round, kind, rev, text, created, src)` — `text` is
-stored byte-for-byte; `src` is the v2 source key.
+stored byte-for-byte; `src` is the v2 source key. A round's `brief`/`report`/`review` content is
+stored here (and written to the task's folder as the round files) — no per-task file copy.
+`event_src(run, src, PRIMARY KEY(run, src))` — the importer's stable source keys.
 
-### Root tables (C1)
+
+### Root tables (C3)
+
+`projects(slug TEXT PRIMARY KEY, name, repo, data_dir, mode, created, last_activity,
+db_path)` — `db_path` is new; **set = migrated**. `plan_summary(project, plan, title, status,
+counts_json, live_run, updated, PRIMARY KEY(project, plan))` — new; one row per plan with the
+numbers (`counts_json`: the task counts by status) and the linkage (`live_run`), refreshed by every
+writer. The root holds **no task row and no event**.
 
 `cards(project, run, task, parent, type, title, status, col, attention, question, route_json, lane,
 round, verdict, gates, updated, change_no, PRIMARY KEY(project, run, task))`. The root card carries
@@ -604,9 +683,11 @@ from `status`: Backlog (`planned`, `routed`) · Ready · Building (`dispatched`,
 status (`blocked`, `stalled`, `quota`, `provider`) keeps the column of the task's previous
 non-attention status — `tasks.prev_status`, written by `transition()` — and sets `attention=1`.
 A task with no previous non-attention status uses Backlog. `column_of(status, prev_status=None)`
-is pure; `transition()` and the rollup do the lookup. `sync(project PRIMARY KEY, last_change_no)`
-records how far the root copy got and only ever moves forward (`MAX` of the stored value and the
-new `change_no`); a card's own `change_no` is monotonic the same way.
+is pure; `transition()` and the rollup do the lookup.
+`cards`, `project_summary` and `sync(project PRIMARY KEY, last_change_no)` — how far the root copy
+got, only ever moving forward (`MAX` of the stored value and the new `change_no`) — are a read-only
+view kept **until L7.3 drops them**; only `plan_summary` and `projects.db_path` are the root's real
+content.
 
 ### `transition(home, project, run, task, to, note="", round=0, sync_root=False, data_dir=None, verdict=<unchanged>)`
 
@@ -614,9 +695,10 @@ The only status writer (C10). `verdict` is optional: omitted, the task's stored 
 unchanged; a string or `None` replaces it, and the root card (when `sync_root=True`) and a later
 `catch_up()` both copy that value. One project-store transaction updates the task row, appends an
 `events` row (`chan='state'`, `kind='transition'`) and a `change_log` row, and returns `change_no`.
-A failure inside it leaves nothing. The C5 root card upsert is a **second** transaction and runs
-only when `sync_root=True`; the default is `False`, so D1 and D3A do not write `cards`. A crash
-between the two leaves the project change durable and the root behind; `catch_up()` replays
+A failure inside it leaves nothing. The root upserts (the C5 card, `plan_summary`) are a **second**
+transaction and run only when `sync_root=True`; with `sync_root=False` the `plan_summary` refresh
+lands in its own root transaction right after the project commit, so the two can never interleave.
+A crash between them leaves the project change durable and the root behind; `catch_up()` replays
 `change_log` from `sync.last_change_no`.
 
 ### API and CLI
@@ -625,7 +707,8 @@ API: `open_root(home)`, `open_project(home, slug=None, data_dir=None)`,
 `add_task(con, run, task, type, title="", parent=None, deps="", route_json=None, status="planned")`,
 `transition(home, project, run, task, to, note="", round=0, sync_root=False, data_dir=None)`,
 `catch_up(home, project, data_dir=None)`, `timeline(home, project, run, task, data_dir=None)`,
-`cards(home, project=None)`, `check_slug`, `check_home`, `column_of(status, prev_status=None)`,
+`cards(home, project=None)`, `overview(home)` (the root's projects + plans: numbers and `db_path`,
+read-only, never creates the root), `check_slug`, `check_home`, `column_of(status, prev_status=None)`,
 `import_history(home, project, run, *, run_row=None, tasks=(), events=(), artifacts=(), data_dir=None)`.
 
 ### Live writers (`append_event`, `append_ack`, `put_artifact`)
@@ -656,6 +739,7 @@ is accepted; a larger body is refused.
 ```
 mkdb.py timeline --project P --run R --task T --json [--data DIR] [--home DIR]
 mkdb.py cards [--project P] --json [--home DIR]
+mkdb.py overview --json [--home DIR]
 mkdb.py import-history --project P --run R --json-file F [--data DIR] [--home DIR]
 mkdb.py plans --json [--data DIR] [--home DIR]
 mkdb.py plans <id> --json [--data DIR] [--home DIR]
@@ -675,7 +759,8 @@ run a writer command"): any writer, such as `mk-plan.py import`, migrates it fir
 
 
 `timeline` is `SELECT … FROM events WHERE run=? AND task=? ORDER BY id`. `cards` reads the root
-store. `mk-catalog.py` follows the same rule for the root store: its read commands (`list`, `show`, `routes`, `model`) go through `read_catalog`, which returns an empty result when `<home>/mk.db` is absent (`list` and `routes` answer `{"ok": true, …: []}`) and never creates it, while the writers `seed` and `set` call `open_catalog` and do create it (`set` creates it even when the agent is unknown and the command then refuses). One JSON line per call; errors exit 2, a newer store exits 3.
+store's read-only card view; `overview` reads the root's `projects` + `plan_summary` (C3).
+`mk-catalog.py` follows the same rule for the root store: its read commands (`list`, `show`, `routes`, `model`) go through `read_catalog`, which returns an empty result when `<home>/mk.db` is absent (`list` and `routes` answer `{"ok": true, …: []}`) and never creates it, while the writers `seed` and `set` call `open_catalog` and do create it (`set` creates it even when the agent is unknown and the command then refuses). One JSON line per call; errors exit 2, a newer store exits 3.
 
 ### `import_history(home, project, run, *, run_row=None, tasks=(), events=(), artifacts=(), data_dir=None)`
 
@@ -695,8 +780,8 @@ is one `BEGIN IMMEDIATE` transaction; any error rolls it back and the store is u
 - `events` are dicts `t chan kind from_id to_id reply_to text meta_json task` plus `src`, the
   stable source key. They are stored with the original `t`, `chan` and `kind` — no `now()`, no
   forced `kind='transition'` — in the order given, so ids ascend with the input. `src` is written
-  into `meta_json` as `"src"` and recorded in `event_src`. The importer counts a blank line in
-  `events.jsonl` (and a malformed line, and a line whose kind is not a state kind) in
+  into `meta_json` as `"src"` and recorded in `event_src`. The importer counts a blank line in a
+  legacy event log (and a malformed line, and a line whose kind is not a state kind) in
   `skipped_events`, with the line number and reason in `skipped_event_reasons`; a blank line is
   not imported.
 - `artifacts` are dicts `task round kind rev text created` plus `src`. `text` is stored
@@ -704,9 +789,9 @@ is one `BEGIN IMMEDIATE` transaction; any error rolls it back and the store is u
 
 Idempotent: an event or artifact whose `src` is already stored is skipped, and tasks and the run
 row upsert, so the same call twice adds nothing. Each task actually added gets one `change_log`
-row, so `catch_up()` can build its root card later. `sync_root` stays off; this function never
-writes the root store. It returns `{runs, tasks, events, artifacts}`, the counts of rows actually
-added.
+row, so `catch_up()` can build its root card later, and the `plan_summary` rows are refreshed after
+the commit (in their own root transaction). It returns `{runs, tasks, events, artifacts}`, the
+counts of rows actually added.
 
 ```
 mkdb.py import-history --project P --run R --json-file F [--data DIR] [--home DIR]
