@@ -120,7 +120,7 @@ class Fail(Exception):
         self.code, self.extra = code, extra
 
 
-# ---------- config: <data>/matrixkoder.yaml, line-wise (no YAML dependency) ----------
+# ---------- config: the project settings file, line-wise (no YAML dependency) ----------
 
 def literal_names(items):
     """-> (accepted, rejected) lanes_disposable entries: literal names only, so the clean check's
@@ -148,14 +148,27 @@ def copy_paths(items):
     return ok, bad
 
 
+def settings_file(data):
+    """The file load_config reads: `mkpaths.project_yaml(data)` — the C2 `<project>/project.yaml`
+    for a migrated project, the legacy `<data>/matrixkoder.yaml` for an unmigrated one (Z24, the
+    same path authority mk-config reads) — and that legacy file when the project file does not
+    exist, so a migrated project whose project.yaml is gone falls back to its old config instead
+    of silently reading DEFAULTS."""
+    path = mkpaths.project_yaml(data)
+    return path if os.path.exists(path) else os.path.join(data, "matrixkoder.yaml")
+
+
 def load_config(data):
-    """<data>/matrixkoder.yaml: `  lanes: { slots, pattern, reuse, copy }` under repo, `max_build_lanes`
-    (indent >= 2, any block) as the lane cap and one-line `lanes_disposable: [a, b]` on top of the
-    clean-check allowlist. Defaults when absent or unreadable; `warnings` carries entries the
+    """`  lanes: { slots, pattern, reuse, copy }` under repo, `max_build_lanes` (indent >= 2, any
+    block) as the lane cap and one-line `lanes_disposable: [a, b]` on top of the clean-check
+    allowlist, read from settings_file(data) — the project settings file, never a second copy of
+    it. `cap` is exactly that `max_build_lanes`, so it equals mk-config's
+    `routing_preferences.max_build_lanes` for the same project (Z24: `repo.lanes.slots` is the
+    pool's ask, never the cap). DEFAULTS when absent or unreadable; `warnings` carries entries the
     lanes_disposable or copy checks rejected."""
     cfg = dict(DEFAULTS, disposable=[], warnings=[])
     try:
-        with open(mkpaths.project_yaml(data)) as f:
+        with open(settings_file(data)) as f:
             lines = f.read().splitlines()
     except OSError:
         return cfg
@@ -193,7 +206,6 @@ def load_config(data):
                 cfg["warnings"] += [f"lanes copy: ignored {p!r} (not a literal path)" for p in bad]
             elif "copy" in block:
                 cfg["warnings"].append("lanes copy: expected a [list]; nothing copied")
-    cfg["cap"] = max(cfg["slots"], cfg["cap"])  # the pool never grows past the lane cap
     return cfg
 
 
@@ -1706,9 +1718,9 @@ def self_test():
         assert load_config(data) == {**DEFAULTS, "slots": 2, "pattern": "../{repo}-lanes-{n}",
                                      "cap": 2, "disposable": ["build"], "warnings": []}, load_config(data)
         yaml_cap(1, 3)
-        assert load_config(data)["cap"] == 3, load_config(data)  # max(slots, max_build_lanes)
-        yaml_cap(4, 2)
-        assert load_config(data)["cap"] == 4, load_config(data)
+        assert load_config(data)["cap"] == 3, load_config(data)  # the cap is max_build_lanes
+        yaml_cap(4, 2)  # a bigger pool ask never raises the cap: mk-config's value wins (Z24)
+        assert load_config(data)["cap"] == 2, load_config(data)
         write(os.path.join(data, "matrixkoder.yaml"),
               "repo:\n  lanes: { slots: 1, pattern: ../{repo}-mk-{n}, reuse: false }\n")
         assert load_config(data) == {**DEFAULTS, "slots": 1, "reuse": False,
@@ -1732,6 +1744,49 @@ def self_test():
         cfg = load_config(data)
         assert cfg["copy"] == ["ok-dir/"] and len(cfg["warnings"]) == 4, cfg
         yaml_cap(1, 1)
+
+        # Z24: the lane cap comes from the project settings file — the C2 project.yaml a migrated
+        # root row points at — never from the legacy matrixkoder.yaml beside the old data dir, and
+        # never raised by repo.lanes.slots. Both data forms of a migrated project must answer the
+        # value mk-config reports for routing_preferences.max_build_lanes.
+        slug, legacy = "cap-proj", os.path.join(tmp, "cap-legacy")
+        c2 = os.path.join(lane_home, "projects", slug)
+        write(os.path.join(c2, "project.yaml"),
+              "repo:\n  lanes: { slots: 5, pattern: ../{repo}-mk-{n}, reuse: true }\n"
+              "routing_preferences:\n  max_build_lanes: 4\n")
+        write(os.path.join(legacy, "matrixkoder.yaml"),
+              "repo:\n  lanes: { slots: 1, pattern: ../{repo}-mk-{n}, reuse: true }\n"
+              "routing_preferences:\n  max_build_lanes: 5\n")
+        root = mkdb.open_root(lane_home)  # C3's migrated marker is this row's db_path
+        try:
+            root.execute("CREATE TABLE IF NOT EXISTS projects("
+                         "slug TEXT PRIMARY KEY, name TEXT, repo TEXT, data_dir TEXT, mode TEXT,"
+                         " created TEXT, last_activity TEXT, db_path TEXT)")
+            root.execute("INSERT OR REPLACE INTO projects(slug, name, repo, data_dir, mode, db_path)"
+                         " VALUES (?,?,?,?,?,?)",
+                         # repo: a path of its own, so data_dir(None)'s repo lookup never finds this row
+                         (slug, slug, os.path.join(tmp, "cap-repo"), legacy, "home",
+                          os.path.join(c2, "mk.db")))
+            root.commit()
+        finally:
+            root.close()
+        mkpaths._MIGRATED_MEMO = None  # a new root row: drop the memo this process holds
+        for d in (legacy, c2):  # the legacy data dir, and the C2 project folder as --data
+            cap = load_config(d)["cap"]
+            r = subprocess.run([sys.executable, os.path.join(HERE, "mk-config.py"), "--data", d,
+                                "get", "routing_preferences.max_build_lanes"],
+                               capture_output=True, text=True, env=env, cwd=repo)
+            assert (cap, r.returncode) == (4, 0), (d, cap, r.stdout, r.stderr)
+            assert json.loads(r.stdout)["value"] == cap, (d, cap, r.stdout)
+        # unmigrated: no root row, so the legacy file in the data dir is still the config
+        plain = os.path.join(tmp, "cap-plain")
+        write(os.path.join(plain, "matrixkoder.yaml"),
+              "repo:\n  lanes: { slots: 1, pattern: ../{repo}-mk-{n}, reuse: true }\n"
+              "routing_preferences:\n  max_build_lanes: 6\n")
+        assert load_config(plain)["cap"] == 6, load_config(plain)
+        # a migrated project whose project.yaml is gone falls back to its legacy file, not DEFAULTS
+        os.unlink(os.path.join(c2, "project.yaml"))
+        assert load_config(legacy)["cap"] == 5, load_config(legacy)
 
         # 1 names: lowercased, digit-prefixed agent, the 32-char limit, integration branch
         n = mk("names", "--run", "R1", "--task", "T1")
