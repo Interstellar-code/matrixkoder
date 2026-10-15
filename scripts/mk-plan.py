@@ -22,6 +22,10 @@ Python 3 stdlib only.
 A plan file: first line +++, TOML until the next +++ line, the rest is free
 markdown, never parsed. A leading UTF-8 BOM is kept: check, approve and export
 round-trip those bytes. Every command prints ONE JSON line.
+A header [gates] value is either a plain string — a manual gate, never run and never
+blocking — or a table [gates.<name>] whose cmd is the command, expect the exit code
+(default 0) and timeout the seconds (default 600): a table gate is runnable, and check
+rejects one without a cmd, or with an expect/timeout that is not an int.
 Errors: {"ok": false, "errors": ["line N: ..."]} exit 2; missing file exit 3.
 set/add-run rewrite only the target header key's line(s) — the markdown body and
 every other header line (comments included) stay byte-identical — via a temp
@@ -208,10 +212,21 @@ def phase_json(ph):
     return out
 
 
+def _gate_json(v):
+    """One gate for C2. A plain string gate stays that string: it is manual — never run and it
+    never blocks a run. A [gates.<name>] table is runnable and becomes {cmd, expect, timeout},
+    with expect 0 and timeout 600 filled in only when the key is ABSENT, so a malformed
+    expect = "zero" passes through for check_plan to reject."""
+    if not isinstance(v, dict):
+        return jsonable(v)
+    return {"cmd": v.get("cmd"), "expect": v.get("expect", 0), "timeout": v.get("timeout", 600)}
+
+
 def plan_json(header, sha):
+    gates = header.get("gates")
     out = {"ok": True, "plan": header.get("plan", ""), "status": header.get("status", "draft"),
            "runs": as_list(header.get("runs")), "sha": sha,
-           "gates": dict(header.get("gates") or {}),
+           "gates": {k: _gate_json(v) for k, v in (gates if isinstance(gates, dict) else {}).items()},
            "phases": [phase_json(p) for p in as_list(header.get("phase"))]}
     for k, v in header.items():  # created/design/integration/unknown keys pass through
         if k not in TOP_KEYS:
@@ -316,6 +331,27 @@ def check_plan(header, out, body=None):
 
     if str(out["plan"]) and not PLAN_ID_RE.fullmatch(str(out["plan"])):
         warnings.append(f"plan id {out['plan']!r} does not match [a-z0-9][a-z0-9-]{{0,40}}")
+
+    # F.0 gate shape: a plain string gate is manual (never run, never blocks), a
+    # [gates.<name>] table is runnable. Only its shape is checked here — running it is the
+    # run's job. expect/timeout may be absent (0 / 600); a present-but-wrong value is an error.
+    header_gates = header.get("gates")
+    if "gates" in header and not isinstance(header_gates, dict):
+        errors.append("gates is not a table")
+    elif isinstance(header_gates, dict):
+        for name, g in header_gates.items():
+            if isinstance(g, str):
+                continue  # manual: never run, never blocks
+            if not isinstance(g, dict):
+                errors.append(f"gate {name}: a gate is a string (manual) or a table "
+                              f"(cmd/expect/timeout), not {type(g).__name__}")
+                continue
+            if not isinstance(g.get("cmd"), str) or not g["cmd"].strip():
+                errors.append(f"gate {name}: a table gate needs cmd (a non-empty string)")
+            if "expect" in g and type(g["expect"]) is not int:
+                errors.append(f"gate {name}: expect must be an int, not {g['expect']!r}")
+            if "timeout" in g and type(g["timeout"]) is not int:
+                errors.append(f"gate {name}: timeout must be an int, not {g['timeout']!r}")
 
     # T1 contract: the header keys that fill a plans column. A missing one is a gap in the
     # contract, never a rule violation, so it stays a warning (plans.status / plans.created
@@ -1507,6 +1543,28 @@ def self_test():
                        "tasks.deps", "tasks.parallel", "tasks.route_json", "tasks.type",
                        "tasks.parent", "header_json only"):
             assert needle in tmpl, needle
+
+        # F0-BLOCK-BEGIN — F.0: a table gate is runnable, a plain string gate stays manual
+        p = write("gate-table.md", plan_text(head_extra=(
+            '\n[gates.slow]\ncmd = "sleep 5"\ntimeout = 1\n'
+            '\n[gates.strict]\ncmd = "true"\nexpect = 3\n')))
+        out = mk("parse", p)
+        assert out["gates"]["test"] == "true", out  # a plain string gate stays a string (manual)
+        assert out["gates"]["slow"] == {"cmd": "sleep 5", "expect": 0, "timeout": 1}, out
+        assert out["gates"]["strict"] == {"cmd": "true", "expect": 3, "timeout": 600}, out
+        assert mk("check", p)["ok"] is True, "a well-formed table gate must check clean"
+
+        # check rejects a table gate without cmd, and a non-int expect / timeout
+        for name, body, why in (("gate-nocmd.md", '[gates.x]\nexpect = 1\n', "needs cmd"),
+                                ("gate-badexpect.md", '[gates.x]\ncmd = "true"\nexpect = "zero"\n',
+                                 "expect must be an int"),
+                                ("gate-badtimeout.md", '[gates.x]\ncmd = "true"\ntimeout = "fast"\n',
+                                 "timeout must be an int")):
+            p = write(name, plan_text(head_extra="\n" + body))
+            e = mk("check", p, code=2)
+            assert e["ok"] is False, e
+            assert any("gate x" in x and why in x for x in e["errors"]), (name, e)
+        # F0-BLOCK-END
 
         # P1.3 set — body byte-identical, only the status line changes
         import shutil as sh
