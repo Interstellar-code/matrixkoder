@@ -892,7 +892,8 @@ class Store:
         arts = self._round_artifacts(run, t)
         if arts:
             self.db().import_history(self.home_dir(), self.project_slug(), run["id"], artifacts=arts,
-                                     data_dir=self.project_folder())
+                                     data_dir=self.project_folder(),
+                                     sync_root=not self._skip_root_projection())
         return [a["kind"] for a in arts]
 
     def doc_artifact(self, rid, task, kind, text, created):
@@ -953,7 +954,8 @@ class Store:
             if t.get("id") and t.get("round"):
                 arts += self._round_artifacts(run, t)
         self.db().import_history(self.home_dir(), self.project_slug(), rid, run_row=self.run_row(run),
-                                 tasks=tasks, events=events, artifacts=arts, data_dir=self.project_folder())
+                                 tasks=tasks, events=events, artifacts=arts, data_dir=self.project_folder(),
+                                 sync_root=not self._skip_root_projection())
         # task round: the tasks row (and its root card) must not keep the previous round's
         # terminal status or verdict. import_history already wrote the new status; the card
         # is updated here, in this same commit, with no second event line.
@@ -2995,6 +2997,71 @@ def self_test():
         a_root = os.path.join(a_home, ".matrixkoder")
         assert _root_counts(a_root) == (0, 0), _root_counts(a_root)
         assert os.path.exists(os.path.join(a_data, "mk.db")), "the project write itself must land"
+
+        # Z9: the SAME store WITH a plans row. Z8 only proved the status write leaves no projects
+        # row; the root projection mkdb rebuilds on that path is the C3 plan_summary of import_history
+        # (mkdb.py:~1108), which Z8's guard does not cover — store_commit still called it directly.
+        # The fix threads sync_root=not Store._skip_root_projection() through import_history, so the
+        # (a) case now holds for the root plan_summary too, and the (b) case keeps every other
+        # caller's behaviour byte for byte.
+        def _plan_dir(data_dir):
+            """The project store mkpaths picks for a data dir (its own folder until migrated)."""
+            return os.path.join(data_dir, "mk.db")
+
+        def _z9(which):
+            h = os.path.join(tmp, "z9-default-home-" + which)
+            d = os.path.join(tempfile.gettempdir(),
+                             "z9-data-" + which + "-" + os.path.basename(tmp))
+            os.makedirs(h, exist_ok=True)
+            os.makedirs(d, exist_ok=True)
+            return h, d
+
+        def _plan_in_store(data_dir, plan_id):
+            """One plans row in the project store — the C3 state a tool such as mk-plan leaves."""
+            script_local = os.path.abspath(__file__)
+            code = (
+                "import importlib.util, sys\n"
+                "spec = importlib.util.spec_from_file_location('mkstate_plan', %r)\n"
+                "m = importlib.util.module_from_spec(spec)\n"
+                "spec.loader.exec_module(m)\n"
+                "st = m.Store(sys.argv[1])\n"
+                "m.plan_store_write(st, %r, 1, 'Z9 plan', {'plan': %r, 'status': 'approved'},\n"
+                "                 '# Z9 plan\\n', None)\n"
+                "con = st.store_open()\n"
+                "print(con.execute('SELECT COUNT(*) c FROM plans').fetchone()['c'])\n"
+            ) % (script_local, plan_id, plan_id)
+            r = subprocess.run([sys.executable, "-c", code, data_dir],
+                               capture_output=True, text=True)
+            assert r.returncode == 0, ("plan write failed", r.returncode, r.stderr[-400:])
+            assert r.stdout.strip() == "1", ("plans rows", r.stdout, r.stderr[-400:])
+
+        # Z9 (a): temp data dir + default home + A PLAN. The status write must land in the project
+        # store and leave the default home's plan_summary empty.
+        z9a_home, z9a_data = _z9("a")
+        _plan_in_store(z9a_data, "z9plan")
+        _status_write(z9a_data, _bare_env(z9a_home))
+        z9a_root = os.path.join(z9a_home, ".matrixkoder")
+        assert _root_counts(z9a_root) == (0, 0), (
+            "a temp data dir with a plan wrote into the default home: " + repr(_root_counts(z9a_root)))
+        z9a_con = _z8sq.connect(_plan_dir(z9a_data))
+        try:
+            z9a_events = z9a_con.execute("SELECT COUNT(*) c FROM events WHERE kind='transition'"
+                                         " AND to_id='building'").fetchone()[0]
+        finally:
+            z9a_con.close()
+        assert z9a_events == 1, "the status write itself was lost (events=%s)" % z9a_events
+
+        # Z9 (b): the identical setup with an explicit MK_HOME registers as today: the root row and
+        # the plan_summary rows for the plan are both written.
+        z9b_home, z9b_data = _z9("b")
+        z9b_env = _bare_env(z9b_home)
+        z9b_env["MK_HOME"] = z9b_home
+        z9b_env["MATRIXKODER_HOME"] = z9b_home
+        _plan_in_store(z9b_data, "z9plan")
+        _status_write(z9b_data, z9b_env)
+        assert _root_counts(z9b_home)[0] == 1, _root_counts(z9b_home)
+        assert _root_counts(z9b_home)[1] >= 1, (
+            "an explicit MK_HOME lost the root plan_summary written today: " + repr(_root_counts(z9b_home)))
 
         # (b) temp data dir + explicit MK_HOME: registers as today (one projects row; a plan-less
         # write never writes a plan_summary row).
