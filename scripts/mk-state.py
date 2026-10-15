@@ -72,7 +72,7 @@ Legacy projects whose runs live only in files migrate through mk-store-import.py
       parent itself is never set directly, it rolls up from the children); status aliases
       reviewing/merging/fixing are stored as review/merged/fix; a task whose deps are all met gets
       ready=true and a "deps met" event; an unreadable sibling run only produces a warnings entry
-  task round T --kind build|fix|takeover [--cause TEXT]
+  task round T --kind build|fix|takeover|rework [--cause TEXT]
   task round --tasks C1,S1,P1 --kind ... — a lane_group in one round: the lead (first id) owns the one
       brief/report/review path (tasks/C1/brief-rN.md); the round number and kind are recorded on EVERY
       listed task, one event each. N is the highest current round of the listed tasks plus one. T, if
@@ -145,11 +145,11 @@ SET_START_KEYS = ("title", "acceptance", "owned", "deps", "refs")
 EDITABLE_WHILE = ("planned", "routed")
 # F.2: the plan's gate fields (and the stored names they ride under) are never settable by task set
 GATE_READONLY_KEYS = ("gate", "manual", "critical", "risk", "base_risk", "acceptance_lines")
-ROUND_KINDS = ("build", "fix", "takeover")
+ROUND_KINDS = ("build", "fix", "takeover", "rework")
 # A new round must not inherit the previous round's terminal row. File mode never wrote
 # status on `task round` (the row stays whatever it was); the store path maps each kind
 # onto the status the board already uses for that kind, in the same commit as the bump.
-ROUND_STATUS = {"build": "planned", "fix": "fix", "takeover": "building"}
+ROUND_STATUS = {"build": "planned", "fix": "fix", "takeover": "building", "rework": "rework"}
 # A terminal status is the one thing a new round must never inherit; a non-terminal one stays
 # (demoting building -> planned would skew every later transition's "from" against the file path).
 ROUND_TERMINAL = ("done", "verifying", "review", "merged", "blocked")
@@ -1602,6 +1602,7 @@ def cmd_run(a, st):
             run["stage"] = a.n
             st.event(run, "note", f"stage {a.n}")
         else:  # archive
+            reconcile_open(st, run)  # first: a failing reconcile leaves red evidence the gate would quote instead
             fidelity_gate(st, run, [t["id"] for t in run.get("tasks") or []
                                     if t.get("id") and t.get("status") in CLOSED_STATUSES], final=True)
             if st.store_on:
@@ -1891,6 +1892,31 @@ def _gate_line(g):
     return str(v) if v not in (None, "") else None
 
 
+def gate_record(st, rid, tid, name, g, where, tree, load, by, ref):
+    """Run ONE gate (or defer it above GATE_LOAD_MAX) and write its evidence row -> the reply row.
+    The one code path `gate run` and `reconcile` both write evidence through."""
+    if load > GATE_LOAD_MAX:
+        result, tail, sha = (f"deferred load={load:g}", f"deferred: load average above {GATE_LOAD_MAX:g}", None)
+    else:
+        result, tail, sha = _gate_exec(g, where)
+    enum = _evidence_result(result)
+    with st.locked():
+        con = st.store_open()
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            cur = con.execute(
+                "INSERT INTO evidence(run, task, line, gate, result, tree_sha, by, ref, output_tail,"
+                " output_sha256, created) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (rid, tid, _gate_line(g), name, enum, tree, by, ref, tail, sha, now()))
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+        finally:
+            con.close()
+    return {"id": cur.lastrowid, "task": tid, "gate": name, "result": enum, "detail": result, "tree_sha": tree}
+
+
 def cmd_gate(a, st):
     """`gate run <T> | --final | --due`: run gates in the integration checkout through the F.0
     runner and write ONE evidence row per gate run. <T> = the task's extra_json `gate` list
@@ -1932,33 +1958,9 @@ def cmd_gate(a, st):
                 jobs += task_jobs(tid)
     where, note = integration_checkout(st)
     load = load_avg()
-    deferred = load > GATE_LOAD_MAX
     tree = current_tree_sha(where)
-    rows = []
-    for tid, name, g in jobs:
-        if deferred:
-            result, tail, sha = (f"deferred load={load:g}",
-                                 f"deferred: load average above {GATE_LOAD_MAX:g}", None)
-        else:
-            result, tail, sha = _gate_exec(g, where)
-        enum = _evidence_result(result)
-        with st.locked():
-            con = st.store_open()
-            try:
-                con.execute("BEGIN IMMEDIATE")
-                cur = con.execute(
-                    "INSERT INTO evidence(run, task, line, gate, result, tree_sha, by, ref, output_tail,"
-                    " output_sha256, created) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                    (run["id"], tid, _gate_line(g), name, enum, tree, getattr(a, "by", "orchestrator"),
-                     a.ref, tail, sha, now()))
-                con.execute("COMMIT")
-            except Exception:
-                con.execute("ROLLBACK")
-                raise
-            finally:
-                con.close()
-        rows.append({"id": cur.lastrowid, "task": tid, "gate": name, "result": enum, "detail": result,
-                     "tree_sha": tree})
+    rows = [gate_record(st, run["id"], tid, name, g, where, tree, load, getattr(a, "by", "orchestrator"), a.ref)
+            for tid, name, g in jobs]
     out = {"ok": True, "evidence": rows, "where": where, "all_green": all(r["result"] == "green" for r in rows)}
     if note:
         out["note"] = note
@@ -2050,6 +2052,166 @@ def cmd_gate_signoff(a, st):
     return {"ok": True, "evidence": cur.lastrowid, "task": t["id"]}
 
 
+RECONCILE_KIND = "reconcile-inconclusive"
+
+
+def reconcile_mark_due(st, run, t):
+    """F.5: the phase (top-level ancestor of t) whose subtree is now all closed gets ONE
+    reconcile_due row (scope = phase id, done NULL). A plain INSERT: no gate runs in the write that
+    closes the phase. No row while one is already open for the scope; none in a legacy run."""
+    if not run.get("fidelity"):
+        return
+    chain = ancestor_chain(run, t.get("parent"))
+    root = chain[-1] if chain else t
+    ids = {root["id"], *descendant_ids(root["id"], run["tasks"])}
+    if any(x.get("status") not in CLOSED_STATUSES for x in run["tasks"] if x.get("id") in ids):
+        return
+    con = st.store_open()
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        if not con.execute("SELECT 1 FROM reconcile_due WHERE run=? AND scope=? AND done IS NULL",
+                           (run["id"], root["id"])).fetchone():
+            con.execute("INSERT INTO reconcile_due(run, scope, created) VALUES (?,?,?)",
+                        (run["id"], root["id"], now()))
+        con.execute("COMMIT")
+    except BaseException:
+        if con.in_transaction:
+            con.execute("ROLLBACK")
+        raise
+    finally:
+        con.close()
+
+
+def reconcile_open(st, run):
+    """F.5: what stops a fidelity run from closing/archiving: tasks at `rework`, open risk_reasons
+    rows, reconcile_due rows not done. Raises Fail naming them; legacy runs are exempt."""
+    if not run.get("fidelity"):
+        return
+    parts = []
+    rework = [t["id"] for t in run.get("tasks") or [] if t.get("id") and t.get("status") == "rework"]
+    if rework:
+        parts.append("task(s) at rework: " + ", ".join(rework))
+    con = _evidence_con(st)
+    try:
+        if con:
+            rr = [f"{r['task']}:{r['kind']}" for r in con.execute(
+                "SELECT task, kind FROM risk_reasons WHERE run=? AND cleared IS NULL ORDER BY id", (run["id"],))]
+            if rr:
+                parts.append("open risk reason(s): " + ", ".join(rr))
+            due = [r["scope"] for r in con.execute(
+                "SELECT scope FROM reconcile_due WHERE run=? AND done IS NULL ORDER BY id", (run["id"],))]
+            if due:
+                parts.append("reconcile due for: " + ", ".join(due) + " (run `reconcile`)")
+    finally:
+        if con:
+            con.close()
+    if parts:
+        raise Fail(f"run {run['id']} has open reconcile work: " + "; ".join(parts), reconcile=parts)
+
+
+def cmd_reconcile(a, st):
+    """`reconcile --run R [--phase P]` (F.5): run the due and STALE gates (final gates + task gates
+    of closed tasks) through gate_record, so evidence is written exactly as `gate run` does. A red
+    gate reruns once: red twice on the same tree_sha = reproducible, so the tasks it covers (a task
+    gate: the task itself) go merged -> rework; red then green = flaky, nothing changes. timeout /
+    error / deferred are inconclusive: an open risk row per covered task, no status change. The due
+    rows of the scope are stamped done unless a task went to rework or an inconclusive gate has no
+    task to hold its reason. A clean run changes nothing but evidence rows and the due stamp."""
+    with st.locked():
+        st.repair()
+        run = st.load(a.run)
+    out = {"ok": True, "ran": [], "green": [], "reworked": [], "inconclusive": [], "flaky": []}
+    if not run.get("fidelity"):
+        return {**out, "note": "legacy run: nothing to reconcile"}
+    rid, tasks = run["id"], run.get("tasks") or []
+    byid = {t["id"]: t for t in tasks if t.get("id")}
+    if a.phase:
+        find_task(run, a.phase)
+    scope = {x for x in byid if not a.phase or x == a.phase or x in descendant_ids(a.phase, tasks)}
+    con = _evidence_con(st)
+    try:
+        due = [r["scope"] for r in con.execute(
+            "SELECT scope FROM reconcile_due WHERE run=? AND done IS NULL ORDER BY id", (rid,))
+            if r["scope"] in scope]
+    finally:
+        con.close()
+    where, _ = integration_checkout(st)
+    tree, load = current_tree_sha(where), load_avg()
+
+    def stale(tid, name):
+        c = _evidence_con(st)
+        try:
+            r = c.execute("SELECT result, tree_sha FROM evidence WHERE run=? AND task IS ? AND gate=?"
+                          " ORDER BY id DESC LIMIT 1", (rid, tid, name)).fetchone()
+        finally:
+            c.close()
+        return r is None or r["result"] != "green" or tree is None or r["tree_sha"] != tree
+
+    jobs = []  # (task or None, gate name, gate, tasks it covers)
+    for tid in scope:
+        if byid[tid].get("status") in CLOSED_STATUSES:
+            jobs += [(tid, g.get("id") or f"{tid}#{i}", g, [tid])
+                     for i, g in enumerate(byid[tid].get("gate") or [], 1)
+                     if stale(tid, g.get("id") or f"{tid}#{i}")]
+    for i, g in enumerate(run.get("final_gates") or [], 1):
+        if due or stale(None, g.get("id") or f"final#{i}"):
+            jobs.append((None, g.get("id") or f"final#{i}", g, [c for c in g.get("covers") or [] if c in byid]))
+    by = getattr(a, "by", "orchestrator")
+    rework, inconclusive, unheld = [], [], False
+    for tid, name, g, covered in jobs:
+        row = gate_record(st, rid, tid, name, g, where, tree, load, by, None)
+        out["ran"].append(name)
+        res = row["result"]
+        if res == "red":  # one rerun on the same tree decides: red twice = reproducible
+            row = gate_record(st, rid, tid, name, g, where, current_tree_sha(where), load, by, None)
+            res = "reproducible" if row["result"] == "red" and row["tree_sha"] == tree else row["result"]
+            if res == "green":
+                out["flaky"].append(name)
+                continue
+        if res == "green":
+            out["green"].append(name)
+        elif res == "reproducible":
+            rework += covered
+        else:
+            inconclusive += covered
+            unheld = unheld or not covered
+    with st.locked():
+        st.repair()
+        run = st.load(a.run)
+        byid = {t["id"]: t for t in run["tasks"] if t.get("id")}
+        for cid in dict.fromkeys(rework):  # a covered parent reworks its merged leaves
+            for lid in leaf_descendants(cid, run["tasks"]):
+                t = next((x for x in run["tasks"] if (x.get("id") or "").lower() == lid), None)
+                if t and t["status"] == "merged":
+                    st.event(run, "transition", "reconcile: gate failed twice on the same tree",
+                             task=t["id"], frm="merged", to="rework", by=by)
+                    t["status"], t["updated"] = "rework", now()
+                    out["reworked"].append(t["id"])
+        if out["reworked"]:
+            st.save(run)
+            st.flush()
+        out["inconclusive"] = list(dict.fromkeys(inconclusive))
+        c = st.store_open()
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            for tid in out["inconclusive"]:
+                if not c.execute("SELECT 1 FROM risk_reasons WHERE run=? AND task=? AND kind=? AND cleared IS NULL",
+                                 (rid, tid, RECONCILE_KIND)).fetchone():
+                    c.execute("INSERT INTO risk_reasons(run, task, kind, points, source, opened)"
+                              " VALUES (?,?,?,?,?,?)", (rid, tid, RECONCILE_KIND, 1, "reconcile", now()))
+            if due and not rework and not unheld:
+                c.execute("UPDATE reconcile_due SET done=? WHERE run=? AND done IS NULL AND scope IN (%s)"
+                          % ",".join("?" * len(due)), (now(), rid, *due))
+            c.execute("COMMIT")
+        except BaseException:
+            if c.in_transaction:
+                c.execute("ROLLBACK")
+            raise
+        finally:
+            c.close()
+    return out
+
+
 def cmd_risk(a, st):
     """`risk add <T> --kind K --points N [--source S]` | `risk list [<T>]` | `risk clear <id>
     --evidence <id>`. Rows live in risk_reasons (F.1); the derived risk is mkdb._task_risk. A
@@ -2126,6 +2288,7 @@ def close_checks(st, run):
                    open=opens)
     fidelity_gate(st, run, [t["id"] for t in run.get("tasks") or []
                             if t.get("id") and t.get("status") in CLOSED_STATUSES], final=True)
+    reconcile_open(st, run)
     if not run.get("plan"):
         return {}
     try:
@@ -2565,6 +2728,10 @@ def cmd_task(a, st):
             if a.kind not in ROUND_KINDS:
                 raise Fail(f"bad kind {a.kind!r}; one of: {' '.join(ROUND_KINDS)}")
             group = [t]  # a lane_group round: the lead first, the rest share its one round number
+            if a.kind == "rework" and any(x["status"] != "merged" for x in [t] + [
+                    find_task(run, i) for i in csv(a.tasks)[1:]]):
+                raise Fail("round --kind rework moves a merged task to rework; "
+                           "every task of the round must be merged")
             if a.tasks:
                 group += [find_task(run, i) for i in csv(a.tasks)[1:]]
                 if len({x["id"] for x in group}) < len(group):
@@ -2592,6 +2759,9 @@ def cmd_task(a, st):
         st.save(run, t, a.by)
         warnings = (set_warnings + st.refresh_others(run, a.by)) if a.action == "set" else []
         st.flush()
+        if a.action == "set" and (fanned or changes.get("status") in CLOSED_STATUSES) \
+                and t["status"] in CLOSED_STATUSES:
+            reconcile_mark_due(st, run, t)  # F.5: the phase's last close; a plain INSERT, no gate run
         if a.action == "round":
             d = st.task_dir(run["id"], t["id"])
             paths = {k: os.path.join(d, f"{k}-r{t['round']}.md") for k in ("brief", "report", "review")}
@@ -3327,6 +3497,9 @@ def build_parser():
     gs = g.add_parser("signoff", parents=[data_p, run_p])
     gs.add_argument("task"), gs.add_argument("--ref")
     gs.set_defaults(func=cmd_gate_signoff)
+    rc = sub.add_parser("reconcile", parents=[data_p, run_p])
+    rc.add_argument("--phase")
+    rc.set_defaults(func=cmd_reconcile)
     rk = sub.add_parser("risk").add_subparsers(dest="action", required=True)
     for name in ("add", "list", "clear"):
         x = rk.add_parser(name, parents=[data_p, run_p])
@@ -5163,11 +5336,182 @@ def self_test():
         print("mk-state x31-r2-fixes self-test ok")
         gate_run_self_test(tmp, env)
         fidelity_self_test(tmp, env)
+        rework_round_self_test(tmp, env)
+        reconcile_self_test(tmp, env)
         print("mk-state gate-run self-test ok")
         # R1.2: the mkdb write guard refuses the real home from this suite too.
         _mkdb().selftest_guard_probe(tmp_home)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def reconcile_self_test(tmp, env):
+    """F.5: `reconcile`. The phase's last close writes a reconcile_due row (no gate run in that
+    write); reconcile reruns due and stale gates, maps a final-gate failure to its covers via
+    `covers`, moves merged -> rework only on a failure that repeats on the same tree, records
+    inconclusive (timeout / deferred) as an open risk reason; run done / archive are refused while a
+    rework task, an open reason or a due row remains; a legacy run writes and refuses nothing.
+    Every case FAILS on c97e8c5 (no `reconcile` command, no due rows, no refusal)."""
+    H = env["MK_HOME"]
+    DB = _mkdb()
+    repo, data = os.path.join(tmp, "rc-repo"), os.path.join(tmp, "rc-data")
+    os.makedirs(repo)
+    subprocess.run(["git", "-C", repo, "init", "-q"], check=True)
+    open(os.path.join(repo, "f.txt"), "w").write("0")
+    subprocess.run(["git", "-C", repo, "add", "."], check=True)
+    subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "c0"],
+                   check=True, capture_output=True)
+    con = DB.open_root(H)
+    try:
+        con.execute("INSERT OR REPLACE INTO projects(slug, name, repo, data_dir, mode, db_path)"
+                    " VALUES ('rcproj','rcproj',?,?,'home',NULL)", (repo, data))
+        con.commit()
+    finally:
+        con.close()
+
+    def rc(*args, code=0, e=None):
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), *args, "--data", data],
+                           capture_output=True, text=True, env=e or dict(env, MK_STATE_LOADAVG="0"),
+                           cwd=tmp, timeout=120)
+        lines = r.stdout.strip().splitlines()
+        assert len(lines) == 1, (args, r.stdout, r.stderr)
+        assert r.returncode == code, (args, r.returncode, r.stdout, r.stderr)
+        return json.loads(lines[0])
+
+    def sql(q, *args, write=False):
+        c = DB.open_project(H, STORE_PROJECT_FALLBACK, data_dir=data)
+        try:
+            rows = [tuple(r) for r in c.execute(q, args)]
+            if write:
+                c.commit()
+            return rows
+        finally:
+            c.close()
+
+    def setx(table, where, key, val):
+        cur = json.loads(sql(f"SELECT extra_json FROM {table} WHERE {where}")[0][0] or "{}")
+        cur[key] = val
+        sql(f"UPDATE {table} SET extra_json=? WHERE {where}", json.dumps(cur), write=True)
+
+    def final(rid, cmd, covers, **kw):
+        setx("runs", f"id='{rid}'", "final_gates",
+             [{"id": "fin", "cmd": cmd, "every": "merge", "covers": covers, **kw}])
+
+    def mkrun(rid, tasks, fidelity=True):
+        rc("run", "init", "--id", rid, "--feature", rid, "--branch", "b")
+        for tid, parent in tasks:
+            rc("task", "add", "--id", tid, "--title", tid, "--run", rid, *(["--parent", parent] if parent else []))
+            setx("tasks", f"run='{rid}' AND id='{tid}'", "gate", [{"cmd": "true"}])
+        if fidelity:
+            setx("runs", f"id='{rid}'", "fidelity", True)
+
+    def merge(rid, *tids):
+        for tid in tids:
+            rc("gate", "run", tid, "--run", rid)
+            rc("task", "set", tid, "status=merged", "--run", rid)
+
+    def status(rid, tid):
+        return rc("task", "get", tid, "--run", rid)["task"]["status"]
+
+    def due(rid):
+        return sql("SELECT scope, done IS NULL FROM reconcile_due WHERE run=? ORDER BY id", rid)
+
+    def refused(out, *words):
+        assert out["ok"] is False and all(w in out["error"] for w in words), out
+
+    # 1. a final gate that is always red: its covered task goes to rework, B stays merged
+    mkrun("c1", [("A", None), ("B", None)])
+    final("c1", "false", ["A"])
+    merge("c1", "A", "B")
+    assert due("c1") == [("A", 1), ("B", 1)], due("c1")
+    assert status("c1", "A") == "merged"  # the close ran no final gate
+    out = rc("reconcile", "--run", "c1")
+    assert out["reworked"] == ["A"] and out["flaky"] == [] and out["inconclusive"] == [], out
+    assert status("c1", "A") == "rework" and status("c1", "B") == "merged"
+    refused(rc("run", "set", "--id", "c1", "--status", "done", code=2), "A")
+    refused(rc("run", "archive", "--id", "c1", code=2), "rework", "A")
+    # the fix: gate green, the task re-merged (its evidence is still fresh), reconcile again
+    final("c1", "true", ["A"])
+    rc("task", "set", "A", "status=merged", "--run", "c1")
+    out = rc("reconcile", "--run", "c1")
+    assert out["reworked"] == [] and "fin" in out["green"], out
+    assert all(d == 0 for _, d in due("c1")), due("c1")
+    assert rc("run", "set", "--id", "c1", "--status", "done")["run"]["status"] == "done"
+
+    # 2. red once, then green on the same tree: flaky, nothing changes
+    mark = os.path.join(tmp, "rc-flaky-mark")
+    mkrun("c2", [("A", None)])
+    final("c2", f"test -e {mark} || {{ touch {mark}; exit 1; }}", ["A"])
+    merge("c2", "A")
+    out = rc("reconcile", "--run", "c2")
+    assert out["flaky"] == ["fin"] and out["reworked"] == [] and status("c2", "A") == "merged", out
+    assert sql("SELECT result FROM evidence WHERE run='c2' AND gate='fin' ORDER BY id") == [("red",), ("green",)]
+    assert rc("run", "set", "--id", "c2", "--status", "done")["run"]["status"] == "done"
+
+    # 3. a passing reconcile changes no status and no risk row; it adds evidence and stamps the row
+    mkrun("c3", [("A", None), ("B", None)])
+    final("c3", "true", ["A", "B"])
+    merge("c3", "A", "B")
+    before = (sql("SELECT id, status FROM tasks WHERE run='c3' ORDER BY id"),
+              sql("SELECT * FROM risk_reasons WHERE run='c3'"), sql("SELECT COUNT(*) FROM evidence WHERE run='c3'"))
+    out = rc("reconcile", "--run", "c3")
+    assert out["green"] == ["fin"] and not out["reworked"] and not out["inconclusive"] and not out["flaky"], out
+    assert before[:2] == (sql("SELECT id, status FROM tasks WHERE run='c3' ORDER BY id"),
+                          sql("SELECT * FROM risk_reasons WHERE run='c3'")), "reconcile changed state"
+    assert sql("SELECT COUNT(*) FROM evidence WHERE run='c3'")[0][0] == before[2][0][0] + 1
+    assert all(d == 0 for _, d in due("c3"))
+    again = rc("reconcile", "--run", "c3")  # nothing due, nothing stale
+    assert again["ran"] == [], again
+
+    # 4. timeout and deferred are inconclusive: a risk reason, no status change, close refused
+    mkrun("c4", [("A", None)])
+    final("c4", "sleep 5", ["A"], timeout=1)
+    merge("c4", "A")
+    out = rc("reconcile", "--run", "c4")
+    assert out["inconclusive"] == ["A"] and out["reworked"] == [], out
+    assert status("c4", "A") == "merged"
+    assert sql("SELECT kind, points FROM risk_reasons WHERE run='c4' AND cleared IS NULL") == [("reconcile-inconclusive", 1)]
+    assert rc("reconcile", "--run", "c4")["inconclusive"] == ["A"]  # a second run opens no second reason
+    assert len(sql("SELECT id FROM risk_reasons WHERE run='c4'")) == 1
+    final("c4", "true", ["A"])
+    rc("gate", "run", "--final", "--run", "c4")  # fresh green evidence; only the open reason is left
+    refused(rc("run", "set", "--id", "c4", "--status", "done", code=2), "reconcile-inconclusive")
+    refused(rc("run", "archive", "--id", "c4", code=2), "reconcile-inconclusive")
+    ev = rc("gate", "run", "A", "--run", "c4")["evidence"][0]["id"]
+    rid = sql("SELECT id FROM risk_reasons WHERE run='c4'")[0][0]
+    rc("risk", "clear", str(rid), "--evidence", str(ev), "--run", "c4")
+    assert rc("run", "set", "--id", "c4", "--status", "done")["run"]["status"] == "done"
+    mkrun("c4d", [("A", None)])
+    final("c4d", "true", ["A"])
+    merge("c4d", "A")
+    out = rc("reconcile", "--run", "c4d", e=dict(env, MK_STATE_LOADAVG="41"))
+    assert out["inconclusive"] == ["A"] and status("c4d", "A") == "merged", out
+    assert sql("SELECT result FROM evidence WHERE run='c4d' AND gate='fin'") == [("deferred",)]
+    refused(rc("run", "archive", "--id", "c4d", code=2), "reconcile-inconclusive")
+
+    # 5. the due row: written by the phase's LAST close only, once; a legacy run writes none
+    mkrun("c5", [("P", None), ("K1", "P"), ("K2", "P")])
+    final("c5", "true", ["P"])
+    merge("c5", "K1")
+    assert due("c5") == [], due("c5")
+    rc("gate", "run", "P", "--run", "c5")  # the phase's own gate, so the roll-up may close it
+    merge("c5", "K2")
+    assert due("c5") == [("P", 1)], due("c5")
+    rc("task", "set", "K2", "status=merged", "--run", "c5", "--note", "again")
+    assert len(due("c5")) == 1, due("c5")
+    rc("gate", "run", "--final", "--run", "c5")  # fresh evidence; only the due row is left
+    refused(rc("run", "set", "--id", "c5", "--status", "done", code=2), "reconcile due", "P")
+    refused(rc("run", "archive", "--id", "c5", code=2), "reconcile due", "P")
+    rc("reconcile", "--run", "c5", "--phase", "P")
+    assert due("c5") == [("P", 0)], due("c5")
+    assert rc("run", "archive", "--id", "c5")["run"]["status"] == "archived"
+    mkrun("c6", [("L", None)], fidelity=False)
+    final("c6", "false", ["L"])
+    rc("task", "set", "L", "status=merged", "--run", "c6")
+    assert due("c6") == []
+    out = rc("reconcile", "--run", "c6")
+    assert out["ran"] == [] and status("c6", "L") == "merged", out
+    assert rc("run", "set", "--id", "c6", "--status", "done")["run"]["status"] == "done"
 
 
 _CLOCK = {"t": None}  # the parity test pins now() so the two paths share one clock
@@ -6433,6 +6777,29 @@ def gate_run_self_test(tmp, env):
     assert gr("gate", "run", "G1", "--final", "--run", "gr", code=2)["ok"] is False
 
 
+def rework_round_self_test(tmp, env):
+    """F.4 needs: `task round --kind rework` moves a MERGED task to rework and is refused on any
+    other status. Both cases fail on c97e8c5 (the kind does not exist there)."""
+    data = os.path.join(tmp, "rw-data")
+
+    def rw(*args, code=0):
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), *args, "--data", data],
+                           capture_output=True, text=True, env=dict(env, MK_STATE_LOADAVG="0"),
+                           cwd=tmp, timeout=120)
+        lines = r.stdout.strip().splitlines()
+        assert len(lines) == 1 and r.returncode == code, (args, r.returncode, r.stdout, r.stderr)
+        return json.loads(lines[0])
+
+    rw("run", "init", "--id", "rw", "--feature", "rw", "--branch", "b")
+    rw("task", "add", "--id", "W", "--title", "w", "--run", "rw")
+    bad = rw("task", "round", "W", "--kind", "rework", "--run", "rw", code=2)
+    assert bad["ok"] is False and "merged" in bad["error"], bad  # planned: refused
+    rw("task", "set", "W", "status=merged", "--run", "rw")
+    out = rw("task", "round", "W", "--kind", "rework", "--run", "rw")
+    assert out["ok"] is True and out["kind"] == "rework", out
+    assert rw("task", "get", "W", "--run", "rw")["task"]["status"] == "rework"
+
+
 def fidelity_self_test(tmp, env):
     """F.3: ONE fidelity_gate on every closing path (task set, fan-out, promote_closed, run set
     --status done, run archive), stale evidence does not count, manual lines need a sign-off, a
@@ -6565,6 +6932,8 @@ def fidelity_self_test(tmp, env):
     bump(2)  # X's evidence is now stale
     refused(fi("run", "set", "--id", "f3", "--status", "done", code=2), "X:X#1 evidence is stale", "final:fin no evidence")
     fi("gate", "run", "X", "--run", "f3"), fi("gate", "run", "--final", "--run", "f3")
+    refused(fi("run", "set", "--id", "f3", "--status", "done", code=2), "reconcile due", "X")  # F.5
+    fi("reconcile", "--run", "f3")
     out = fi("run", "set", "--id", "f3", "--status", "done")
     assert out["run"]["status"] == "done" and out["promoted"] == ["X"], out
 
