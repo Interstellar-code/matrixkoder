@@ -129,7 +129,7 @@ Schema: docs/state-schema.md
 import argparse, contextlib, datetime, fcntl, fnmatch, hashlib, importlib.util, json, math, os, re, shlex, shutil, socket, subprocess, sys, tempfile
 
 SCHEMA = 1
-STATUSES = ("planned routed dispatched building verifying review fix merged qa done "
+STATUSES = ("planned routed dispatched building verifying review fix rework merged qa done "
             "blocked quota stalled provider").split()
 STATUS_ALIASES = {"reviewing": "review", "merging": "merged", "fixing": "fix"}  # input aliases (F2.2)
 EVENT_TYPES = ("transition", "decision", "verdict", "quota", "note")
@@ -155,7 +155,7 @@ ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 RECENT, BOARD_EVENTS = 10, 15
 DEP_MET = ("merged", "qa", "done")
 DEP_GATED = ("dispatched", "building")
-SIDE = ("blocked", "provider", "quota", "stalled")  # roll-up precedence: the first present wins
+SIDE = ("rework", "blocked", "provider", "quota", "stalled")  # roll-up precedence: the first present wins
 # F.0: a run closes (`run set --status done`) only when nothing is open and every runnable plan
 # gate passes. Closed = merged/qa/done (a task that reached the integration branch or was waived);
 # every other status is open. A plan gate is a plain string (manual: never run, never blocks) or a
@@ -4651,6 +4651,32 @@ def self_test():
         assert out["ok"] is True and out["run"]["status"] == "active", out
         assert "gates" not in out, out
         # F0-BLOCK-END
+
+        # F.1: rework status — rollup, close refusal, DEP_MET exclusion
+        rwdata = os.path.join(tmp, "rework")
+        rw = lambda *args, code=0: mk(*args, "--data", rwdata, code=code, data_arg=False)
+        rw("run", "init", "--id", "rw", "--feature", "RW", "--branch", "b")
+        rw("task", "add", "--id", "P", "--title", "phase", "--run", "rw")
+        rw("task", "add", "--id", "A", "--title", "merged", "--run", "rw", "--parent", "P")
+        rw("task", "add", "--id", "B", "--title", "rework", "--run", "rw", "--parent", "P")
+        rw("task", "set", "A", "status=merged", "--run", "rw")
+        rw("task", "set", "B", "status=rework", "--run", "rw")
+        # The phase rolls up to rework
+        out = rw("task", "get", "P", "--run", "rw")
+        assert out["task"]["status"] == "rework", f"phase status {out['task']['status']} != rework"
+        # run set --status done refuses: B is rework (not in CLOSED_STATUSES)
+        out = rw("run", "set", "--id", "rw", "--status", "done", code=2)
+        assert out["ok"] is False, out
+        assert "not closed" in out["error"], out
+        assert any(o["id"] == "B" and o["status"] == "rework" for o in out.get("open", [])), out
+        # rework is NOT in DEP_MET — a dependent cannot dispatch
+        assert "rework" not in CLOSED_STATUSES, "rework in CLOSED_STATUSES"
+        # Fix B, phase rolls back to merged, run closes
+        rw("task", "set", "B", "status=merged", "--run", "rw")
+        out = rw("task", "get", "P", "--run", "rw")
+        assert out["task"]["status"] == "merged", f"phase status {out['task']['status']} != merged"
+        out = rw("run", "set", "--id", "rw", "--status", "done")
+        assert out["ok"] is True and out["run"]["status"] == "done", out
 
         d15_self_test(tmp, env, pd, penv)
         print("mk-state self-test ok")
