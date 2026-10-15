@@ -43,7 +43,9 @@ Subcommands:
   archive-run [--run ID] [--data DIR]
       L6.3 (C6): archive ONE closed run's bus messages, acks and bus artifacts to
       <run dir>/bus.jsonl (mkpaths-resolved), count-check the file against the rows, then
-      delete the rows in one transaction. Refuses a run that is not closed. A second call
+      delete the rows in one transaction. Refuses a run that is not closed (run status
+      done|archived and every task done|merged|blocked). The seq high-water mark is kept
+      above the archived range, so no later message reuses a deleted seq. A second call
       is a no-op. A mismatch deletes nothing and removes the partial file.
   --self-test
       Comprehensive self-test of server, round trip, auth, replay, lifecycle, security, error handling.
@@ -3093,11 +3095,27 @@ ARCHIVE_GROUPS = (("msg", ARCHIVE_MSG_COLS), ("ack", ARCHIVE_ACK_COLS), ("artifa
 # mk-state's run statuses are active|done|archived; done and archived both close
 # a run (run set --status done, run archive).
 ARCHIVE_CLOSED_STATUSES = ("done", "archived")
-# mk-state ROUND_TERMINAL: every task of a closed run sits in one of these.
-ARCHIVE_TASK_TERMINAL = ("done", "verifying", "review", "merged", "blocked")
+# A task that cannot still be working when the run closes. This is NOT mk-state's
+# ROUND_TERMINAL: a round reset may legitimately inherit `review`/`verifying`,
+# but for a run end those two mean a reviewer or verifier lane is live or
+# scheduled — its messages, reports and reviews would be deleted out from under
+# it. Refusing costs one retry once the task lands; archiving early loses data.
+ARCHIVE_TASK_TERMINAL = ("done", "merged", "blocked")
 
 # mk-state's slug-only project name; the --data form below wins, so it is a label.
 _ARCHIVE_STORE_PROJECT = "matrixkoder"
+
+# events.id is the wire seq and the SSE Last-Event-ID. The column is a plain
+# INTEGER PRIMARY KEY: SQLite hands out max(id)+1 over the rows PRESENT in the
+# table, so deleting the top seqs of a run would let the next message reuse a seq
+# a live watch / SSE / lane /wait cursor has already passed — that reader would
+# then skip every new message that lands on a reused seq. One guard row per
+# archived run pins the high-water mark instead: chan='seq' is a chan no reader
+# of bus rows selects, and the run id fails is_valid_id, so no run-scoped reader
+# (dashboard Events, mk-state, mk-builder task history) ever sees it either.
+ARCHIVE_SEQ_RUN = "_seq-guard"
+ARCHIVE_SEQ_CHAN = "seq"
+ARCHIVE_SEQ_KIND = "guard"
 
 
 def _archive_canonical(cols, row):
@@ -3139,13 +3157,18 @@ def _own_project_store(data_dir):
 def _archive_rows(store, run):
     """(messages, acks, artifacts) of ONE run. SELECT only, through StoreAdapter.
 
-    Messages are events chan='bus' (the row id IS the wire seq). Bus artifacts
-    are the rows the LIVE writer put_artifact made for this run — src IS NULL,
-    mkdb's live-path marker — NOT every artifacts row of the run: mk-state's
-    run-doc and index rows are importer rows (src set) and are not bus data.
-    The set is taken by src rather than by the events.artifact_id link so a
-    revision a later rev superseded (its event now points at the newer row) is
-    archived and deleted with the rest instead of being orphaned in the store."""
+    Messages are events chan='bus' (the row id IS the wire seq).
+
+    Bus artifacts are the rows THAT A BUS MESSAGE CARRIES: the events.artifact_id
+    link mkdb.put_artifact writes for the event it was stored for. src IS NULL is
+    NOT the discriminator: mk-lane-event and mk-builder use the very same live
+    writer (put_artifact, src NULL) to store a task's brief, review-brief and
+    review in the project DB, and those rows are not bus traffic — archiving a run
+    must never take them. Each revision the bus put also carries its own event
+    link, so a revision a later one superseded is archived with the rest instead
+    of being orphaned. An importer row (src set) is mk-state's run-doc/index data
+    and is unreferenced either way.
+    """
     msgs = store.store_select(
         "SELECT id, run, task, t, chan, kind, from_id, to_id, reply_to, text, artifact_id, meta_json"
         " FROM events WHERE chan=? AND run=? ORDER BY id",
@@ -3157,8 +3180,9 @@ def _archive_rows(store, run):
     )
     arts = store.store_select(
         "SELECT id, run, task, round, kind, rev, text, created, src FROM artifacts"
-        " WHERE run=? AND src IS NULL ORDER BY id",
-        (run,),
+        " WHERE run=? AND id IN (SELECT artifact_id FROM events"
+        " WHERE chan=? AND run=? AND artifact_id IS NOT NULL) ORDER BY id",
+        (run, "bus", run),
     )
     return msgs, acks, arts
 
@@ -3285,6 +3309,26 @@ def _archive_refuse_unless_closed(store, run):
     return rows[0].get("plan"), status
 
 
+def _archive_hold_seq(con, seq_max, last_t, run):
+    """Pin the seq high-water mark above the archived range, in the same transaction.
+
+    Called AFTER the run's bus rows are gone and before COMMIT, so it rolls back
+    with them. `seq_max` is the highest archived message id; when some other row
+    already sits above it the counter cannot reuse the archived range and no
+    guard row is written. `last_t` keeps the guard's own timestamp the archived
+    run's, so MAX(t) readers (cards/project_summary) see no change."""
+    if not seq_max:
+        return
+    top = con.execute("SELECT MAX(id) AS m FROM events").fetchone()["m"]
+    if top is not None and int(top) >= int(seq_max):
+        return
+    con.execute(
+        "INSERT INTO events(id, run, task, t, chan, kind, from_id, to_id, reply_to,"
+        " text, artifact_id, meta_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (int(seq_max), ARCHIVE_SEQ_RUN, None, last_t or "", ARCHIVE_SEQ_CHAN,
+         ARCHIVE_SEQ_KIND, None, None, None, run, None, None))
+
+
 def _archive_delete(mod, folder, run, want):
     """Delete the run's bus rows in ONE transaction, re-checked inside it.
 
@@ -3305,6 +3349,7 @@ def _archive_delete(mod, folder, run, want):
                 con.executemany("DELETE FROM artifacts WHERE id=?", art_ids)
             con.execute("DELETE FROM events WHERE chan=? AND run=?", ("bus", run))
             con.execute("DELETE FROM acks WHERE run=?", (run,))
+            _archive_hold_seq(con, want[1][1], msgs[-1]["t"] if msgs else None, run)
             con.execute("COMMIT")
         except Exception:
             con.execute("ROLLBACK")
@@ -3319,7 +3364,14 @@ def archive_run(data_dir, run):
     Refuses an active run before anything is written. A count mismatch or any
     error deletes nothing and removes the partial file. A second call finds
     nothing to archive and does nothing: no empty second file, and an archive
-    file that already exists is left alone. Returns the reply dict."""
+    file that already exists is left alone. Returns the reply dict.
+
+    A bus process that is serving this data dir while the archive runs keeps the
+    run's messages in its own cache until it restarts: the CLI holds no channel
+    into a live serve loop, so a /pending or /events?replay=true against THAT
+    process answers from memory. Watch, /wait, cmd_pending and every fresh serve
+    read the store and see the archive. Restart the bus of an archived run to
+    drop the cache."""
     if not is_valid_id(run):
         raise Fail("invalid run id")
     if not store_mode(data_dir):
@@ -3346,7 +3398,14 @@ def archive_run(data_dir, run):
         with contextlib.suppress(OSError):
             os.unlink(path)
         raise
-    _archive_delete(_load_mkdb(), folder, run, (counts, seq_range, digest))
+    try:
+        _archive_delete(_load_mkdb(), folder, run, (counts, seq_range, digest))
+    except BaseException:
+        # Nothing was deleted, but a file on disk while the rows remain would
+        # refuse every later attempt. Clear it so the next archive can retry.
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        raise
     return {"ok": True, "op": "archive-run", "run": run, "plan": plan, "path": path,
             "messages": counts["msg"], "acks": counts["ack"], "artifacts": counts["artifact"],
             "seq_min": seq_range[0], "seq_max": seq_range[1], "sha256": digest,
@@ -6617,8 +6676,8 @@ def _archive_fixture(tmp, slug, home_env=True):
 def _archive_run_self_test():
     """L6.3 (C6) archive-run, on the REAL bus and the REAL project store.
 
-    Five cases. Each fails on a tree without `archive-run`, where the CLI exits 2 with
-    "unknown command archive-run":
+    Seven cases. Each fails on a tree without `archive-run`, where the CLI exits 2
+    with "unknown command archive-run":
 
       (a) a closed run is archived ON THE SWITCHED C2 LAYOUT (the fixture runs the real
           mk-migrate --switch): the file lands at the mkpaths run dir — <project folder>/
@@ -6626,10 +6685,13 @@ def _archive_run_self_test():
           messages+acks+artifacts read from the store BEFORE the call, the counts, the seq
           range and the sha256 on stdout match a recomputation from those rows AND from the
           file itself, and those rows are gone afterwards while the run row, its tasks, its
-          chan='state' events, its importer artifacts (src SET) and another run's rows are
-          not; a message sent on a live run still lands above the archived seq range;
+          chan='state' events, its importer artifacts (src SET), its LIVE-PATH artifacts
+          (brief / review-brief / review, src NULL — task data, not bus traffic) and another
+          run's rows are not; every revision of a bus report is archived and none of those
+          decoys is; a message sent on a live run still lands above the archived seq range;
       (b) an ACTIVE run is refused before anything is written, and so is a closed run with a
-          non-terminal task: exit 2, the reason named, no file, the rows untouched. The other
+          non-terminal task — including `review` and `verifying`, where a reviewer or verifier
+          lane is still live: exit 2, the reason named, no file, the rows untouched. The other
           closed spelling (archived) is accepted;
       (c) a dropped archive line fails the count check: nothing is deleted and the partial
           file is removed — through the writer seam wrapped in process, and through the CLI
@@ -6639,7 +6701,14 @@ def _archive_run_self_test():
           never reset to 0 and never error;
       (e) a second archive of the same run is a no-op: exit 0, nothing written, the file's
           bytes unchanged — on a temp $HOME with MK_HOME/MATRIXKODER_HOME/MATRIXKODER_DATA
-          unset.
+          unset;
+      (f) an archived run's seqs are never reused: the run held the highest seqs, they are
+          gone from the table, and the live run's next message still lands above them (the
+          high-water guard row is the only events row left holding the range, invisible to
+          every run-scoped, chan='bus' and bus-kind reader);
+      (g) a message that lands between the count check and the delete makes the transaction
+          re-check refuse: nothing is deleted, the archive file does not survive, and the
+          retry archives the run whole, that message included.
     """
     import shutil
 
@@ -6660,10 +6729,16 @@ def _archive_run_self_test():
     sql_of = {
         "msg": "SELECT %s FROM events WHERE chan='bus' AND run=? ORDER BY id" % ", ".join(cols_of["msg"]),
         "ack": "SELECT %s FROM acks WHERE run=? ORDER BY msg, lane" % ", ".join(cols_of["ack"]),
-        # bus artifacts are the rows the LIVE writer put_artifact made (src IS NULL, mkdb's
-        # live-path marker): an importer row (src set) is mk-state's run-doc/index data, not
-        # bus traffic, and must survive the archive
-        "artifact": ("SELECT %s FROM artifacts WHERE run=? AND src IS NULL ORDER BY id"
+        # bus artifacts are the rows a BUS MESSAGE carries: the events.artifact_id
+        # link put_artifact writes for the event it was stored for. src IS NULL is
+        # NOT the filter — mk-lane-event and mk-builder use the same live writer
+        # (src NULL) for a task's brief / review-brief / review, and those rows
+        # are not bus traffic and must survive. An importer row (src set) is
+        # mk-state's run-doc/index data and is unreferenced either way.
+        # one binding: the subquery correlates on the run the outer row names
+        "artifact": ("SELECT %s FROM artifacts WHERE run=? AND id IN"
+                     " (SELECT artifact_id FROM events WHERE chan='bus'"
+                     " AND run=artifacts.run AND artifact_id IS NOT NULL) ORDER BY id"
                      % ", ".join(cols_of["artifact"])),
     }
 
@@ -6777,6 +6852,18 @@ def _archive_run_self_test():
         code, rep = f.post(port, tokA, {"run": "rA", "task": "T1", "kind": "report",
                                         "text": "round:1\nthe report body", "from": "T1", "to": "orch"})
         assert code == 200 and rep.get("artifact", {}).get("rev") == 1, (code, rep)
+        # a second report for the same (task, round, kind) SUPERSEDES it: rev 2, its own
+        # event link. Both revisions are bus rows and both must be archived, not orphaned.
+        code, rep2 = f.post(port, tokA, {"run": "rA", "task": "T1", "kind": "report",
+                                        "text": "round:1\nthe report body, revised",
+                                        "from": "T1", "to": "orch"})
+        assert code == 200 and rep2.get("artifact", {}).get("rev") == 2, (code, rep2)
+        # LIVE-PATH decoys: mk-lane-event and mk-builder store a task's brief,
+        # review-brief and review through the very same live writer put_artifact
+        # (src NULL) the bus uses. They are task data, not bus traffic: an archive
+        # that took them would delete the brief and review of the run's task.
+        decoys = {kind: f.artifact("rA", "T1", 1, kind, "the %s body" % kind)
+                  for kind in ("brief", "review-brief", "review")}
         # a state event of the same run is not bus data: it must survive the archive
         code, st = f.post(port, orch, {"run": "rA", "task": "T1", "kind": "status", "text": "done",
                                        "from": "orch", "to": "T1"})
@@ -6833,6 +6920,15 @@ def _archive_run_self_test():
         assert [o["row"]["id"] for o in objs if o["type"] == "msg"] == ids, "archived message order"
         art_ids = [o["row"]["id"] for o in objs if o["type"] == "artifact"]
         assert not (set(imported) & set(art_ids)), "an importer artifact row must not be archived"
+        # the archived artifacts are the run's BUS revisions only: every revision of the
+        # report, and none of the live-path brief / review-brief / review rows the same
+        # live writer stored for the run's task (the CRITICAL a src-based filter hit)
+        art_rows = [o["row"] for o in objs if o["type"] == "artifact"]
+        assert {r["kind"] for r in art_rows} == {"report"}, art_rows
+        assert sorted(r["rev"] for r in art_rows) == [1, 2], art_rows
+        for kind, art in decoys.items():
+            assert scalar(f, "SELECT COUNT(*) FROM artifacts WHERE id=?", (art["id"],)) == 1, \
+                "archive-run took the run's live-path %s artifact (%s)" % (kind, art)
         # the rows are gone; the run, its tasks, its STATE events and the importer rows are not
         assert rows_of(f, "rA") == {"msg": [], "ack": [], "artifact": []}, "archived rows must be gone"
         assert f.imported_artifact_ids("rA") == imported, \
@@ -6874,6 +6970,17 @@ def _archive_run_self_test():
         assert rc != 0 and "non-terminal" in blob and "T1" in blob, (rc, res, blob)
         assert not os.path.exists(path), "a refused archive wrote a file"
         assert rows_of(f, "rA") == before, "a refused archive deleted rows"
+
+        # `review` and `verifying` are LIVE for a run end: a reviewer or verifier lane is
+        # working the task and its messages are still bus traffic. mk-state's ROUND_TERMINAL
+        # treats them as terminal for a round RESET; a closure that archive'd under them
+        # would delete the messages of a lane that is still running.
+        for live_status in ("review", "verifying"):
+            set_statuses(f, "rA", run_status="done", tasks=(("T1", live_status),))
+            rc, res, blob = cli(["archive-run", "--data", f.data, "--run", "rA"], env=f.env())
+            assert rc != 0 and "non-terminal" in blob and "T1" in blob, (live_status, rc, res, blob)
+            assert not os.path.exists(path), "a refused archive wrote a file"
+            assert rows_of(f, "rA") == before, "a refused archive deleted rows"
 
         # the other closed spelling is accepted once every task is terminal
         set_statuses(f, "rA", run_status="archived", tasks=(("T1", "merged"),))
@@ -7061,6 +7168,87 @@ def _archive_run_self_test():
         assert f.imported_artifact_ids("rA") == imported, "the second archive deleted importer rows"
         assert os.listdir(os.path.dirname(path)) == ["bus.jsonl"], os.listdir(os.path.dirname(path))
         case("(e) second archive is a no-op on a temp $HOME with the MK_* names unset")
+        f.cleanup()
+
+        # ---- (f) an archived run's seqs are never handed out again ----------------------------
+        f = _archive_fixture(tmp, "projf")
+        f.add_run("rA", status="active", tasks=("T1",))
+        f.add_run("rB", status="active", tasks=("T1",))
+        pid, port = f.start_bus("rA")
+        orch = f.mint_orch()
+        # the closed run takes the HIGHEST seqs and nothing is sent after them: its rows are
+        # the top of the events table, so a plain max(id)+1 would hand them straight back out
+        # and a cursor past the archived range would skip every message that landed on them
+        doomed = [ask(f, port, orch, "rA", "T1", "run A one")["seq"],
+                  ask(f, port, orch, "rA", "T1", "run A two")["seq"]]
+        set_statuses(f, "rA", run_status="done", tasks=(("T1", "done"),))
+        rc, res, blob = cli(["archive-run", "--data", f.data, "--run", "rA"], env=f.env())
+        assert rc == 0 and res["written"] is True, (rc, res, blob)
+        assert (res["seq_min"], res["seq_max"]) == (doomed[0], doomed[-1]), (res, doomed)
+        assert rows_of(f, "rA") == {"msg": [], "ack": [], "artifact": []}, rows_of(f, "rA")
+        # the live run sends next, on the real bus: the seq must sit ABOVE the archived range,
+        # never inside it
+        f.stop_bus(pid)
+        pid, port = f.start_bus("rB")
+        live = ask(f, port, f.mint_orch(), "rB", "T1", "run B after the archive")
+        # never a reused seq: without the high-water guard this is doomed[0] or doomed[1],
+        # and the send above is the top row of the table (the guard held it until then)
+        assert live["seq"] > doomed[-1], (live["seq"], doomed)
+        # one guard row pins the high-water mark; nothing that scopes by run, chan='bus' or
+        # a bus kind ever sees it
+        assert scalar(f, "SELECT COUNT(*) FROM events WHERE chan=?", ("seq",)) == 1
+        assert scalar(f, "SELECT MAX(id) FROM events") == live["seq"]
+        assert scalar(f, "SELECT COUNT(*) FROM events WHERE run=?", ("rA",)) == 0
+        # the store row of the live message is that seq: the run's rows are the bus rows
+        assert rows_of(f, "rB")["msg"][-1]["id"] == live["seq"], rows_of(f, "rB")
+        f.stop_bus(pid)
+        case("(f) no seq reuse: the live run's message lands above the archived range")
+        f.cleanup()
+
+        # ---- (g) a delete that fails after the write clears the file; the retry works -------
+        f = _archive_fixture(tmp, "projg")
+        f.add_run("rA", status="active", tasks=("T1",))
+        pid, port = f.start_bus("rA")
+        orch = f.mint_orch()
+        for i in range(2):
+            ask(f, port, orch, "rA", "T1", "ask %d" % i)
+        set_statuses(f, "rA", run_status="done", tasks=(("T1", "done"),))
+        before = rows_of(f, "rA")
+        path = os.path.join(_paths("run_dir", f.data, "rA"), "bus.jsonl")
+        # THE SEAM again: a message of the run landing between the count check and the delete.
+        # The transaction re-check must refuse, and the archive must not leave its file on
+        # disk with the rows still there — that combination refuses every later attempt.
+        under_test = _load_script_module("mk_bus_archive_case_g", bus_py)
+        orig_writer = under_test._archive_write_file
+        late_text = "a late answer that arrived after the count check"
+
+        def late_message_writer(path_, lines):
+            orig_writer(path_, lines)
+            f.event("rA", kind="info", task="T1", from_id="T1", to_id="orch", text=late_text)
+
+        under_test._archive_write_file = late_message_writer
+        try:
+            try:
+                under_test.archive_run(f.data, "rA")
+            except under_test.Fail as e:
+                reason = str(e)
+            else:
+                raise AssertionError("archive-run (g): a late message was archived away")
+        finally:
+            under_test._archive_write_file = orig_writer
+        assert "changed" in reason, reason
+        assert not os.path.exists(path), "a failed delete left the archive file behind"
+        after = rows_of(f, "rA")
+        assert len(after["msg"]) == len(before["msg"]) + 1, (len(after["msg"]), len(before["msg"]))
+        assert after["msg"][-1]["text"] == late_text, after["msg"][-1]
+        assert after["ack"] == before["ack"] and after["artifact"] == before["artifact"], after
+        # with the file cleared, the retry archives the run whole, the late message included
+        rc, res, blob = cli(["archive-run", "--data", f.data, "--run", "rA"], env=f.env())
+        assert rc == 0 and res["written"] is True, (rc, res, blob)
+        assert res["messages"] == len(after["msg"]), (res, after["msg"])
+        assert rows_of(f, "rA") == {"msg": [], "ack": [], "artifact": []}, rows_of(f, "rA")
+        f.stop_bus(pid)
+        case("(g) failed delete clears the file; the retry archives the run whole")
         f.cleanup()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
