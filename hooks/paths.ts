@@ -15,7 +15,7 @@
 // ~/.matrixkoder is never project data), and a linked worktree resolves to its
 // main checkout. The MK home is $MK_HOME and $MATRIXKODER_HOME read as ONE
 // setting (C16), as mkpaths.home() reads them on the Python side.
-import { candidateDirs, globalDirPath, join, mainCheckout, parseGitdir, parseJson, projectDataDir, projectDirFromStore, type MkProjectRow } from './data'
+import { candidateDirs, globalDirPath, join, mainCheckout, normalizePath, parentOf, parseGitdir, parseJson, projectDataDir, projectDirFromStore, type MkProjectRow } from './data'
 import type { EngineInterface } from 'claude-code'
 
 /** `mkdb.py projects --json` answer: the root store's projects table. */
@@ -82,6 +82,53 @@ export async function sessionCwd($: EngineInterface): Promise<string> {
   }
 }
 
+/** The root store's projects table: the ONE `mkdb.py projects --json` spawn
+ * `listedDataDir` and `projectYamlPath` share (C1 — no second reader of the same
+ * table). null when the command fails or answers nothing; a caller then keeps
+ * today's pre-migration paths. */
+async function storeRows($: EngineInterface, home: string | null): Promise<MkProjectRow[] | null> {
+  const gdir = await globalDirOf($, home)
+  if (gdir == null) return null
+  try {
+    const ran = await $.process.run(
+      ['python3', join($.plugin.root, 'scripts/mkdb.py'), 'projects', '--json', '--home', gdir],
+      { timeoutMs: 5000 },
+    )
+    if (ran.exitCode !== 0) return null
+    const parsed = parseJson(ran.stdout)
+    const rows = isProjectsReply(parsed) ? parsed.projects : null
+    return Array.isArray(rows) ? rows as MkProjectRow[] : null
+  } catch {
+    return null // no python, or the command failed
+  }
+}
+
+/** C3's migrated marker for a data dir: a root row whose `db_path` names THIS
+ * folder (dirname of db_path — the C2 project folder, what
+ * `projectDirFromStore` hands the dashboard after a switch). Same test
+ * `mk-config.project_yaml_path` makes with `project_slug_of` + `db_path_of`:
+ * the slug's db_path folder is this path. Pure — the rows are the test's. */
+export function isMigratedFolder(rows: readonly MkProjectRow[] | null | undefined, dataDir: string): boolean {
+  if (!Array.isArray(rows)) return false
+  const wanted = normalizePath(dataDir)
+  return rows.some(row => {
+    const dbPath = typeof row.db_path === 'string' ? row.db_path.trim() : ''
+    return dbPath !== '' && normalizePath(parentOf(normalizePath(dbPath))) === wanted
+  })
+}
+
+/** The repo settings file for a data dir (mkpaths.project_yaml): the C2
+ * `<project>/project.yaml` once the project is MIGRATED, else
+ * `<dataDir>/matrixkoder.yaml`. `migrated` is `isMigratedFolder`'s answer —
+ * the caller owns the store read, this stays pure string math. */
+export async function projectYamlPath(
+  $: EngineInterface,
+  dataDir: string,
+  opts: { home?: string | null; store?: boolean } = {},
+): Promise<string> {
+  const migrated = opts.store === true && isMigratedFolder(await storeRows($, opts.home ?? await homeDir($)), dataDir)
+  return paths.projectYaml(dataDir, migrated)
+}
 /** Root store first (`mkdb.py projects --json`), then projects.json. null = neither
  *  names this repo. The root-store read is opt-in (`store`): a caller whose tests
  *  count every process.run leaves it off. One place, every hook, no file-local
@@ -91,20 +138,8 @@ export async function listedDataDir($: EngineInterface, repoPaths: readonly stri
   const gdir = await globalDirOf($, home)
   if (gdir == null) return null
   if (opts.store === true) {
-    try {
-      const ran = await $.process.run(
-        ['python3', join($.plugin.root, 'scripts/mkdb.py'), 'projects', '--json', '--home', gdir],
-        { timeoutMs: 5000 },
-      )
-      if (ran.exitCode === 0) {
-        const parsed = parseJson(ran.stdout)
-        const rows = isProjectsReply(parsed) ? parsed.projects : null
-        const fromStore = projectDirFromStore(Array.isArray(rows) ? rows as MkProjectRow[] : null, repoPaths, home)
-        if (fromStore != null) return fromStore
-      }
-    } catch {
-      // no python, or the command failed: projects.json still names the dir
-    }
+    const fromStore = projectDirFromStore(await storeRows($, home), repoPaths, home)
+    if (fromStore != null) return fromStore
   }
   try {
     return projectDataDir(parseJson(await $.fs.read(paths.projectsJson(gdir))), repoPaths, home)
@@ -173,8 +208,10 @@ export const paths = {
   usage: (globalDir: string): string => join(globalDir, 'usage.json'),
   /** The project store: <data>/mk.db. Its presence is the store-mode probe. */
   projectDb: (dataDir: string): string => join(dataDir, 'mk.db'),
-  /** The repo settings file: <data>/matrixkoder.yaml. */
-  projectYaml: (dataDir: string): string => join(dataDir, 'matrixkoder.yaml'),
+  /** The repo settings file: `<dataDir>/matrixkoder.yaml` today; the C2
+   *  `<project>/project.yaml` for a migrated project (a root `projects.db_path`
+   *  set — `projectYamlPath` supplies the flag, `isMigratedFolder` the rule). */
+  projectYaml: (dataDir: string, migrated = false): string => join(dataDir, migrated ? 'project.yaml' : 'matrixkoder.yaml'),
   /** The run registry: <data>/runs/index.json. */
   runsIndex: (dataDir: string): string => join(dataDir, 'runs/index.json'),
   /** One run's document: <data>/runs/<run>/run.json. */

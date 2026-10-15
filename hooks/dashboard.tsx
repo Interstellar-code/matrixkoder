@@ -15,7 +15,7 @@ import {
   sanitizeText, timerRegistry,
 } from './data'
 import type { MkPaneSnapshot } from './data'
-import { globalDirOf, homeDir, paths, resolveDataDir } from './paths'
+import { globalDirOf, homeDir, paths, projectYamlPath, resolveDataDir } from './paths'
 import { AGENT_COLOR, AGENT_GLYPH, NARROW, STATUS_COLOR, STATUS_GLYPH, bar, leftCol, rightCol } from './tabs/ui'
 import { mockRunHeader, mockTabCounts, stageWord, STAGE_TOTAL } from './tabs/header'
 import type { RunHeaderData } from './tabs/header'
@@ -1297,11 +1297,16 @@ async function ensureSettingsLoaded($: EngineInterface): Promise<void> {
     } catch {
       cwd = null
     }
-    const dataDir = cwd == null ? null : await resolveDataDir($, { cwd, home: await homeDir($), requireExisting: true, store: true })
+    const home = await homeDir($)
+    const dataDir = cwd == null ? null : await resolveDataDir($, { cwd, home, requireExisting: true, store: true })
+    // the LIVE yaml path: the C2 `<project>/project.yaml` once this project is
+    // migrated, `<dataDir>/matrixkoder.yaml` before (paths.projectYamlPath is
+    // mkpaths.project_yaml's rule — a data dir alone cannot tell them apart).
+    const yamlPath = dataDir == null ? null : await projectYamlPath($, dataDir, { home, store: true })
     let yamlExists = false
-    if (dataDir != null) {
+    if (yamlPath != null) {
       try {
-        yamlExists = (await $.fs.stat(paths.projectYaml(dataDir))).kind === 'file'
+        yamlExists = (await $.fs.stat(yamlPath)).kind === 'file'
       } catch {
         yamlExists = false
       }
@@ -1309,16 +1314,19 @@ async function ensureSettingsLoaded($: EngineInterface): Promise<void> {
     const root = $.plugin.root
     const run: RunFn = (argv, init) => $.process.run(argv, init)
     let fields: YamlFieldIn[] = []
+    let file = ''
     let loadError = ''
     if (!yamlExists) {
-      loadError = 'No matrixkoder.yaml — run /mk setup'
+      loadError = `No ${yamlPath ?? 'matrixkoder.yaml'} — run /mk setup`
     } else if (dataDir != null) {
       try {
         if (!st.migrated) {
           await runMigrate(run, root, dataDir)
           await setViewKey($, 'settings:migrated', '1')
         }
-        fields = (await runListFields(run, root, dataDir)).fields
+        const listed = await runListFields(run, root, dataDir)
+        fields = listed.fields
+        file = listed.file
       } catch (e) {
         loadError = String(e instanceof Error ? e.message : e).slice(0, 120)
       }
@@ -1330,7 +1338,8 @@ async function ensureSettingsLoaded($: EngineInterface): Promise<void> {
       cfg = [] // the config noun refused — yaml rows still draw, globals drop out
     }
     const about = await loadAbout($, run, root)
-    const view = buildSettingsView({ fields, file: '', configRows: cfg, globalDefaults: about.defaults, about })
+    // the live path `list --json` reported, so every scope note names the file it reads
+    const view = buildSettingsView({ fields, file: file || yamlPath || '', configRows: cfg, globalDefaults: about.defaults, about })
     try {
       await update($, viewStateAtom, prev => ({
         ...prev,
