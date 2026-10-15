@@ -4996,30 +4996,30 @@ def t_l62_token_path_old_layout_fallback(root):
     <home>/bus-lanes/<hash>.json is found when the mkpaths location has no file — so a lane never
     reads as busless across L6.1's move.
 
-    L6.1 has not moved the directory yet, so the new location is simulated here by pointing
-    mkpaths' own constant at `bus/lanes` for the length of the case (the module is loaded by
-    path and cached; the file on disk is untouched). That is what makes the fallback reachable
-    on today's tree, and it is exactly the state L6.1 leaves behind."""
+    Both paths are asked of mkpaths rather than spelled here (C6, L6.4): the OLD one from the
+    `BUS_LANES_DIR` constant the read-once take-over copies from, the NEW one from the bus-dir
+    rule plus `TARGET_BUS_DIR`/`TARGET_LANES_DIR` — so the case follows the layout wherever
+    mkpaths puts it. The old token is written where the pre-L6.1 tree kept it and the resolver
+    carries it over, leaving the old file in place."""
     lane = mklane(root, "l62_tok_lane")
+    mod = _mkpaths()
     base = os.path.abspath(os.path.expanduser(_paths("bus_env_dir") or _paths("home")))
-    digest = lane_hash(lane)
-    old = os.path.join(base, "bus-lanes", digest + ".json")
-    new = os.path.join(base, "bus", "lanes", digest + ".json")
+    bus = base if _paths("bus_env_dir") else os.path.join(base, mod.TARGET_BUS_DIR)
+    old = os.path.join(base, mod.BUS_LANES_DIR, lane_hash(lane) + ".json")
+    new = os.path.join(bus, mod.TARGET_LANES_DIR, lane_hash(lane) + ".json")
     os.makedirs(os.path.dirname(old), exist_ok=True)
-    os.makedirs(os.path.dirname(new), exist_ok=True)
     with open(old, "w") as f:
         json.dump({"v": 1, "url": "http://127.0.0.1:9", "token": "old"}, f)
     os.chmod(old, 0o600)
-    mod = _mkpaths()
-    saved_dir = mod.BUS_LANES_DIR
     try:
-        mod.BUS_LANES_DIR = os.path.join("bus", "lanes")   # L6.1's location, simulated
         # no token at the mkpaths location yet: the resolver must fall back to the old one
         assert not os.path.exists(new)
-        assert bus_token_path(lane) == old, (bus_token_path(lane), old)
+        assert bus_token_path(lane) == new, (bus_token_path(lane), new)
+        # the take-over copied the old bytes over: the lane is not busless and the old file stays
         cfg = bus_lane_config(lane)
         assert cfg is not None and cfg["token"] == "old", (
             "the lane read as busless while its token sat at the old path", cfg)
+        assert os.path.isfile(old), "the legacy lane token must survive the take-over"
         # the mkpaths location wins the moment a token is written there
         with open(new, "w") as f:
             json.dump({"v": 1, "url": "http://127.0.0.1:9", "token": "new"}, f)
@@ -5027,11 +5027,10 @@ def t_l62_token_path_old_layout_fallback(root):
         assert bus_token_path(lane) == new, (bus_token_path(lane), new)
         assert bus_lane_config(lane)["token"] == "new", bus_lane_config(lane)
         os.unlink(new)
-        # today's layout is what the resolver answers when nothing has moved
-        mod.BUS_LANES_DIR = saved_dir
+        # an empty old file carries nothing over, so the resolver answers the old path itself
+        os.truncate(old, 0)
         assert bus_token_path(lane) == old, (bus_token_path(lane), old)
     finally:
-        mod.BUS_LANES_DIR = saved_dir
         for path in (old, new):
             if os.path.exists(path):
                 os.unlink(path)
@@ -5455,8 +5454,9 @@ def t_d7_done_todo_counts(root):
 
 
 def t_d7_token_path_one_function(root):
-    """One function resolves the token file: MK_BUS_TOKEN_FILE, else the lane file, else
-    ~/.matrixkoder/bus-lanes/<hash>.json. The third is checked with HOME pointed at a temp dir."""
+    """One function resolves the token file: MK_BUS_TOKEN_FILE, else the lane file, else the
+    mkpaths lane-token path under <home>/bus/lanes/<hash>.json (C6). The third is checked with
+    HOME pointed at a temp dir."""
     lane = mklane(root, "d7_token_lane")
     override = os.path.join(root, "override.json")
     with open(override, "w") as f:
@@ -5473,11 +5473,12 @@ def t_d7_token_path_one_function(root):
         assert bus_token_path(lane) == override
         os.environ.pop("MK_BUS_TOKEN_FILE")
         got = bus_token_path(lane)
-        assert got == os.path.join(os.environ["HOME"], ".matrixkoder", "bus-lanes",
-                                   lane_hash(lane) + ".json"), got
+        # the expected path comes from mkpaths (C6): <home>/bus/lanes/<hash>.json, the
+        # location L6.1 moved the token to — never a spelling copied into this case
+        assert got == _paths("target_lane_token", lane), got
         # todo 89 / C16: MATRIXKODER_HOME alone moves it, like MK_HOME (mk-bus.py writes there)
         os.environ["MATRIXKODER_HOME"] = os.path.join(root, "mch")
-        assert bus_token_path(lane) == os.path.join(root, "mch", "bus-lanes", lane_hash(lane) + ".json")
+        assert bus_token_path(lane) == _paths("target_lane_token", lane)
         os.environ.pop("MATRIXKODER_HOME")
         # a lane file wins over the home location
         with open(os.path.join(lane, BUS_LANE_FILE), "w") as f:
