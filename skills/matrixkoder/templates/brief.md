@@ -2,6 +2,11 @@
 
 Repo: this folder (worktree `<path>`, branch `<branch>`, at `<sha>`: <what is already in>). Stack: <stack>. Plan `<plan id>`: `<project>/plans/<plan id>/plan.md` (read-only) — phase `<PHASE id>`, its tasks `<P.n>`, `<P.n>` (acceptance lines in the plan header); history for this task: `<project>/plans/<plan>/runs/<run>/<T>/` (read-only). Do ONLY <PHASE>. Other agents work on: <lanes + their areas> — do not touch them.
 
+## Risk and gates
+- Risk: <derived risk 1-5 from `mk-state risk list <T>`: base + open reasons (kind, points, source); "1, no open reasons" when none>. Critical: <yes | no>.
+- Gates: <the task's plan gates, one per line as `name: cmd` (expect, timeout); "none" when it has none>. The orchestrator runs them; you run the ones in Commands.
+- Risk is the orchestrator's: a builder never writes a risk reason (no `risk add`/`risk clear`).
+
 ## Spec
 <what to build, as numbered parts. Point to files with `path:line`; point to mockups by path; state the API contract the code must use. Never paste code.>
 

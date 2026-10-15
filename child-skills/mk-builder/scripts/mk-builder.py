@@ -817,6 +817,48 @@ def running_lane_children(lane):
     return hits
 
 
+# F.4: the claim rule, the same one scripts/mk-lane-event.py applies when the orchestrator ingests
+# the report (a lane script cannot import it): a backticked test file in a report clause (split on `;`, `. `, newline) that says
+# it was added/new/wrote/created is a claim, and it must be in the branch's diff.
+CLAIM_TEST_RE = re.compile(r"`([\w./-]*(?:test_[\w.-]+\.py|[\w.-]*_test\.py|[\w.-]+\.test\.tsx?))`")
+CLAIM_VERB_RE = re.compile(r"\b(added|adds|new|wrote|writes|created|creates)\b", re.I)
+
+
+def claimed_tests(report):
+    out = []
+    for clause in re.split(r";|\. |\n", report or ""):
+        if CLAIM_VERB_RE.search(clause):
+            out += [t for t in CLAIM_TEST_RE.findall(clause) if t not in out]
+    return out
+
+
+def lane_git(lane, *args):
+    """stdout of one git call in the lane, or None when git cannot answer."""
+    try:
+        r = subprocess.run(["git", "-C", lane, *args], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def dirty_tree(lane):
+    """Porcelain lines of tracked files that are modified, staged or deleted; [] for a clean
+    tree or a lane git cannot read. Untracked files are the stray-file WARNING's job, not a
+    refusal (a lane keeps `.matrixkoder-*` files and a scratch `mk.db` untracked)."""
+    out = lane_git(lane, "status", "--porcelain", "--untracked-files=no")
+    return [ln for ln in (out or "").splitlines() if ln.strip()]
+
+
+def branch_files(lane):
+    """Files the lane's commits changed since the merge-base with main (or master); None when
+    git cannot say, so an unknown never reads as a mismatch."""
+    for base in ("main", "master"):
+        mb = (lane_git(lane, "merge-base", "HEAD", base) or "").strip()
+        if mb:
+            return set((lane_git(lane, "diff", "--name-only", f"{mb}..HEAD") or "").splitlines())
+    return None
+
+
 @status_locked
 def cmd_done(a):
     """R18: the report file at the lane root OR the round's `report` artifact in the project DB
@@ -838,6 +880,21 @@ def cmd_done(a):
     sha = lane_head(lane)
     if not sha:
         raise Fail("no_head: `git -C <lane> rev-parse HEAD` failed [R18]")
+    # F.4: refuse before anything is written. A dirty tree means the commit is not what the
+    # lane holds; a claimed test missing from the branch means the report says more than the diff.
+    dirty = dirty_tree(lane)
+    if dirty:
+        raise Fail("dirty_tree: uncommitted changes in the lane, commit or remove them first: "
+                   + "; ".join(dirty[:5]) + (f" (+{len(dirty) - 5} more)" if len(dirty) > 5 else ""))
+    try:
+        claim_text = stored if stored is not None else open(path).read()
+    except OSError:
+        claim_text = ""
+    files = branch_files(lane)
+    absent = [t for t in claimed_tests(claim_text) if files is not None and t not in files]
+    if absent:
+        raise Fail("claim_mismatch: the report claims test file(s) not in the branch's commits: "
+                   + ", ".join(absent))
     obj = dict(old, state="done", question=None, subagent=None, commit=sha)
     write_status(lane, stamp(obj))
     for command in running_lane_children(lane):
@@ -3596,6 +3653,57 @@ def t_done_token_builder_and_reviewer(root):
     code, lines = cli(lane2, "done")
     assert code == 0 and lines[-1] == "S1 REVIEW R1 DONE", lines
     assert status(lane2)["role"] == "reviewer"
+
+
+def t_done_refuses_dirty_tree_and_claim_mismatch(root):
+    """F.4: `done` refuses a dirty tree and a report that claims a test the branch never
+    committed; both leave the status file unchanged, and a clean honest round still finishes."""
+    lane = gitlane(root, "done_f4")
+    git(lane, "switch", "-q", "-c", "work")
+    os.makedirs(os.path.join(lane, "tests"))
+    with open(os.path.join(lane, "tests", "a_test.py"), "w") as f:
+        f.write("x = 1\n")
+    git(lane, "add", "-A")
+    git(lane, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", "feat: a")
+    rep = os.path.join(lane, ".matrixkoder-report-r1.md")
+    with open(rep, "w") as f:
+        f.write("Added `tests/a_test.py` and a new `tests/b_test.py`.\n")
+    begin(lane, root, report=".matrixkoder-report-r1.md")
+    cli(lane, "progress", "work")
+    out = refuse(lane, "done")
+    assert "claim_mismatch" in out["error"] and "tests/b_test.py" in out["error"] \
+        and "tests/a_test.py" not in out["error"], out
+    assert status(lane)["state"] == "working" and status(lane)["commit"] is None
+    with open(rep, "w") as f:
+        f.write("Added `tests/a_test.py`.\n")
+    with open(os.path.join(lane, "tests", "a_test.py"), "a") as f:  # a tracked file edited after the commit
+        f.write("y = 2\n")
+    out = refuse(lane, "done")
+    assert "dirty_tree" in out["error"] and "tests/a_test.py" in out["error"], out
+    assert status(lane)["state"] == "working"
+    with open(os.path.join(lane, "tests", "a_test.py"), "w") as f:
+        f.write("x = 1\n")
+    with open(os.path.join(lane, "scratch.txt"), "w") as f:  # untracked: warned about elsewhere, never refused
+        f.write("x")
+    code, lines = cli(lane, "done")
+    assert code == 0 and lines[-1] == "S1 R1 DONE", lines
+    # a tracked file modified after the commit is dirty too
+    lane2 = gitlane(root, "done_f4_dirty")
+    with open(os.path.join(lane2, "README"), "a") as f:
+        f.write("more\n")
+    with open(os.path.join(lane2, ".matrixkoder-report-r1.md"), "w") as f:
+        f.write("report")
+    begin(lane2, root, report=".matrixkoder-report-r1.md")
+    cli(lane2, "progress", "work")
+    assert "dirty_tree" in refuse(lane2, "done")["error"]
+
+
+def t_builder_has_no_risk_command(root):
+    """F.4: risk reasons are the orchestrator's; mk-builder has no command that writes one."""
+    lane = mklane(root, "norisk")
+    for args in (("risk", "add", "T1", "--kind", "no_evidence", "--points", "1"), ("risk", "clear", "1")):
+        code, _lines = cli(lane, *args)
+        assert code != 0, f"{args} must not be a mk-builder command"
 
 
 def t_illegal_transitions(root):
