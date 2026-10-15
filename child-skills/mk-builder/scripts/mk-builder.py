@@ -2226,14 +2226,32 @@ def resolve_data_dir(cfg, explicit=None):
     return bus_data_dir(cfg)
 
 
+def project_store(data):
+    """The project store a `--data` dir's readers must use (C2/C4).
+
+    After a switch, `<data>/mk.db` is the project's FROZEN pre-switch copy; the live store is the
+    root row's `db_path` (`~/.matrixkoder/projects/<slug>/mk.db`). `mkpaths.project_db(data=…)`
+    deliberately keeps the `<data>/mk.db` spelling (mk-migrate's rollback addresses the legacy
+    store through exactly that form), so a READER resolves the migration itself: the slug from
+    the root row, then the slug form of the store. Pre-migration (no `db_path`) and a data dir
+    already inside the C2 tree are byte-for-byte the old answer. None without a data dir."""
+    if not data:
+        return None
+    slug = _paths("migrated_slug", data=data)
+    if slug:
+        return _paths("project_db", slug=slug)
+    return _paths("project_db", data=data)
+
+
 def store_present(data):
     """Self-hosting guard: store mode only when the project store already exists."""
-    return bool(data) and os.path.isfile(_paths("project_db", data=data))
+    path = project_store(data)
+    return bool(path) and os.path.isfile(path)
 
 
 def store_rows(data, sql, params=()):
     """SELECT-only against the project store. Read-only URI so a lane CLI cannot write it."""
-    uri = "file:" + _paths("project_db", data=data) + "?mode=ro"
+    uri = "file:" + project_store(data) + "?mode=ro"
     con = None
     try:
         con = sqlite3.connect(uri, uri=True, timeout=5)
@@ -4989,6 +5007,162 @@ def t_l62_migrated_project_connect_round_trip(root):
         for k, v in saved.items():
             if v is not None:
                 os.environ[k] = v
+
+
+def t_z10_migrated_connect_reads_the_store(root):
+    """C2/C4 (Z10): `connect --data <legacy data dir>` on a MIGRATED project reads the C2 store
+    the root row's `db_path` names, not the frozen pre-switch `<data>/mk.db`.
+
+    Every lane hit this live: the orchestrator types `connect --data <legacy>` after the switch,
+    the new task's brief lives only in `~/.matrixkoder/projects/<slug>/mk.db`, and connect printed
+    `# brief: none found` (or an old task's brief from the frozen copy). The fix resolves the slug
+    through `mkpaths.migrated_slug` and then the slug form of the store (`project_store`), so the
+    same `--data` finds the live store. Pre-migration is unchanged, and the INSTALLED copy behaves
+    the same (it carries the same code). Uses a temp $HOME; the real store is never touched."""
+    migrate = os.path.join(os.path.dirname(MK_BUS_PY), "mk-migrate.py")
+    if not (os.path.isfile(MK_BUS_PY) and os.path.isfile(migrate)):
+        return
+    repo = os.path.join(root, "z10-repo")
+    home = os.path.join(root, "z10-home")
+    os.makedirs(repo, exist_ok=True)
+    os.makedirs(home, exist_ok=True)
+    subprocess.run(["git", "init", "-q", repo], check=True, capture_output=True)
+    data = os.path.join(repo, ".matrixkoder")
+    run, old_task, new_task, slug = "r1", "Z10OLD", "Z10NEW", "z10mig"
+    # legacy data dir: an OLD task whose brief is frozen into the pre-switch store
+    os.makedirs(os.path.join(data, "runs", run, "tasks", old_task), exist_ok=True)
+    with open(os.path.join(data, "matrixkoder.yaml"), "w") as f:
+        f.write("data_dir: .matrixkoder/\n")
+    mod = _mkdb_mod()
+    mod.import_history(home, None, run, run_row={"id": run, "status": "running"},
+                       tasks=[{"id": old_task, "type": "task", "title": "old",
+                               "status": "merged"}],
+                       artifacts=[{"src": f"file:{run}:{old_task}:brief:1:z10", "task": old_task,
+                                   "round": 1, "kind": "brief", "rev": 1,
+                                   "text": "# OLD brief\nthe frozen legacy brief\n",
+                                   "created": "2026-10-15T09:00:00+00:00"}],
+                       data_dir=data)
+    # the real migration, in its own temp home (the same env shape t_l62_migrated... uses)
+    env = {"PATH": os.environ["PATH"], "HOME": home, "MK_SELFTEST": "1"}
+    for key in ("TMPDIR", "TEMP", "TMP"):
+        if os.environ.get(key):
+            env[key] = os.environ[key]
+    r = subprocess.run([sys.executable, migrate, "--switch", "--slug", slug, "--data", data,
+                        "--home", home, "--repo", repo],
+                       capture_output=True, text=True, env=env, timeout=180)
+    assert r.returncode == 0, (r.returncode, r.stdout[-2000:], r.stderr[-2000:])
+    new_db = os.path.join(home, "projects", slug, "mk.db")
+    assert os.path.isfile(new_db), new_db
+    # the NEW task's brief lands in the C2 store and its C2 task folder (what mk-state's
+    # `task round` does), NOT in the frozen legacy store
+    c2 = os.path.join(home, "projects", slug)
+    con = mod.open_project(home, slug, data_dir=c2)
+    try:
+        mod.add_task(con, run, new_task, "task", title="new")
+    finally:
+        con.close()
+    mod.put_artifact(home, slug, run, new_task, 1, "brief",
+                     "# NEW brief\nthe live store brief\n", data_dir=c2)
+    new_td = os.path.join(c2, "plans", "p", "runs", run, new_task)
+    os.makedirs(new_td, exist_ok=True)
+    with open(os.path.join(new_td, "brief-r1.md"), "w") as f:
+        f.write("# NEW brief\nthe live store brief\n")
+
+    saved = {k: os.environ.pop(k, None) for k in
+             ("MK_HOME", "MATRIXKODER_HOME", "MATRIXKODER_DATA", "MK_BUS_DIR")}
+    real_home = os.environ.get("HOME")
+    os.environ["HOME"] = home
+    # the readers' home rule is MK_HOME, not $HOME: point both at the temp home so the
+    # resolver assertions below read the root store the switch wrote there.
+    os.environ["MK_HOME"] = home
+    os.environ["MATRIXKODER_HOME"] = home
+
+    def armed(lane, task):
+        """A lane whose token arms this task and names the LEGACY data dir as `data`."""
+        os.makedirs(lane, exist_ok=True)
+        path = os.path.join(lane, BUS_LANE_FILE)
+        with open(path, "w") as f:
+            json.dump({"url": "http://127.0.0.1:1/", "token": "t", "run": run, "task": task,
+                       "round": 1, "role": "builder", "data": data}, f)
+        os.chmod(path, 0o600)
+
+    def connect(builder, lane):
+        return subprocess.run(
+            [sys.executable, builder, "connect", "--lane", lane, "--data", data],
+            capture_output=True, text=True, cwd=os.path.dirname(os.path.dirname(MK_BUS_PY)),
+            env=dict(os.environ, HOME=home, MK_HOME=home, MATRIXKODER_HOME=home,
+                     MK_BUS_DATA=data))
+
+    try:
+        # the resolver itself: the legacy --data names the C2 store, not <legacy>/mk.db
+        assert _paths("migrated_slug", data=data) == slug, _paths("migrated_slug", data=data)
+        assert store_present(data), "the migrated project must resolve to its store"
+        # (a) the repo checkout prints the NEW task's brief, not the frozen OLD one. On the
+        # pre-fix reader this is `# brief: none found` (the frozen <data>/mk.db holds only OLD).
+        lane_a = mklane(root, "z10_lane_a")
+        armed(lane_a, new_task)
+        p = connect(os.path.abspath(__file__), lane_a)
+        assert p.returncode == 0 and "# NEW brief" in p.stdout, (p.returncode, p.stdout, p.stderr)
+        assert "frozen legacy brief" not in p.stdout, ("the frozen copy leaked", p.stdout)
+        # (b) the INSTALLED skill copy behaves the same
+        lane_b = mklane(root, "z10_lane_b")
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), "install", "--into", lane_b],
+                           capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr[-500:]
+        installed = os.path.join(lane_b, ".claude", "skills", "mk-builder", "scripts",
+                                 "mk-builder.py")
+        armed(lane_b, new_task)
+        p = connect(installed, lane_b)
+        assert p.returncode == 0 and "# NEW brief" in p.stdout, ("installed copy", p.returncode, p.stdout)
+        # a task with no brief anywhere prints the marker, unchanged
+        lane_c = mklane(root, "z10_lane_c")
+        armed(lane_c, "Z10NONE")
+        p = connect(os.path.abspath(__file__), lane_c)
+        assert p.returncode == 0 and p.stdout.strip() == "# brief: none found", p.stdout
+    finally:
+        os.environ["HOME"] = real_home
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+
+    # (c) pre-migration: no root db_path -> the legacy <data>/mk.db still answers
+    home2 = os.path.join(root, "z10-home2")
+    repo2 = os.path.join(root, "z10-repo2")
+    os.makedirs(home2, exist_ok=True)
+    os.makedirs(repo2, exist_ok=True)
+    subprocess.run(["git", "init", "-q", repo2], check=True, capture_output=True)
+    data2 = os.path.join(repo2, ".matrixkoder")
+    os.makedirs(os.path.join(data2, "runs", run, "tasks", old_task), exist_ok=True)
+    mod.import_history(home2, None, run, run_row={"id": run, "status": "running"},
+                       tasks=[{"id": old_task, "type": "task", "title": "old",
+                               "status": "building"}],
+                       artifacts=[{"src": f"file:{run}:{old_task}:brief:1:z10pm", "task": old_task,
+                                   "round": 1, "kind": "brief", "rev": 1,
+                                   "text": "# PRE-MIGRATION brief\nthe legacy store answers\n",
+                                   "created": "2026-10-15T09:00:00+00:00"}],
+                       data_dir=data2)
+    assert os.path.isfile(os.path.join(data2, "mk.db")), "the legacy store must exist"
+    os.environ["HOME"] = home2
+    os.environ["MK_HOME"] = home2
+    os.environ["MATRIXKODER_HOME"] = home2
+    try:
+        assert _paths("migrated_slug", data=data2) is None, "a pre-migration project has no slug"
+        assert project_store(data2) == os.path.join(data2, "mk.db"), project_store(data2)
+        lane_d = mklane(root, "z10_lane_d")
+        os.makedirs(lane_d, exist_ok=True)
+        path = os.path.join(lane_d, BUS_LANE_FILE)
+        with open(path, "w") as f:
+            json.dump({"url": "http://127.0.0.1:1/", "token": "t", "run": run, "task": old_task,
+                       "round": 1, "role": "builder", "data": data2}, f)
+        os.chmod(path, 0o600)
+        p = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "connect", "--lane", lane_d, "--data", data2],
+            capture_output=True, text=True, cwd=os.path.dirname(os.path.dirname(MK_BUS_PY)),
+            env=dict(os.environ, HOME=home2, MK_HOME=home2, MATRIXKODER_HOME=home2,
+                     MK_BUS_DATA=data2))
+        assert p.returncode == 0 and "# PRE-MIGRATION brief" in p.stdout, (p.returncode, p.stdout)
+    finally:
+        os.environ["HOME"] = real_home
 
 
 def t_l62_token_path_old_layout_fallback(root):
