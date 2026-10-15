@@ -27,7 +27,7 @@ import argparse, contextlib, datetime, hashlib, importlib.util, json, multiproce
 
 sys.dont_write_bytecode = True
 
-SCHEMA = 5
+SCHEMA = 6
 ROOT_SCHEMA = 2  # the root store migrates additively; project stores go to SCHEMA
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
 
@@ -51,9 +51,9 @@ TYPES = ("phase", "task", "subtask")
 # C4: the column a status lands in. Attention statuses keep their column and raise the flag.
 COLUMNS = {"planned": "Backlog", "routed": "Backlog", "ready": "Ready",
            "dispatched": "Building", "building": "Building", "takeover": "Building",
-           "verifying": "Verify", "review": "Review", "fix": "Fix",
+           "verifying": "Verify", "review": "Review", "fix": "Fix", "rework": "Fix",
            "merged": "Done", "qa": "Done", "done": "Done"}
-ATTENTION = ("blocked", "stalled", "quota", "provider")
+ATTENTION = ("rework", "blocked", "stalled", "quota", "provider")
 ROUTE_KEYS = ("agent", "model", "effort")
 # shortcut: the synced-folder check is a path-string heuristic, not a mount probe. It catches the
 # macOS iCloud container ("Mobile Documents"), the CloudStorage symlink tree, Dropbox, and anything
@@ -108,6 +108,16 @@ CREATE TABLE IF NOT EXISTS lane_slots(
 CREATE TABLE IF NOT EXISTS waits(id INTEGER PRIMARY KEY, run TEXT, question TEXT, opened TEXT, cleared TEXT);
 CREATE TABLE IF NOT EXISTS change_log(change_no INTEGER PRIMARY KEY, run TEXT, task TEXT, t TEXT);
 CREATE TABLE IF NOT EXISTS schema_version(version INTEGER PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS evidence(
+  id INTEGER PRIMARY KEY, run TEXT, task TEXT, line TEXT, gate TEXT, result TEXT,
+  tree_sha TEXT, by TEXT, ref TEXT, output_tail TEXT, output_sha256 TEXT, created TEXT);
+CREATE TABLE IF NOT EXISTS risk_reasons(
+  id INTEGER PRIMARY KEY, run TEXT, task TEXT, kind TEXT, points INTEGER,
+  source TEXT, opened TEXT, cleared TEXT, cleared_by TEXT);
+CREATE TABLE IF NOT EXISTS reconcile_due(
+  id INTEGER PRIMARY KEY, run TEXT, scope TEXT, created TEXT, done TEXT);
+CREATE INDEX IF NOT EXISTS evidence_run_task ON evidence(run, task);
+CREATE INDEX IF NOT EXISTS risk_reasons_run_task ON risk_reasons(run, task);
 """
 # v2: artifacts.src is the importer's stable source key. NULL on rows written by the live path.
 # event_src mirrors meta_json.src so a repeat import is one indexed lookup, not a table scan.
@@ -438,12 +448,30 @@ def _v5(con):
         if cols and "extra_json" not in cols:
             con.execute(f"ALTER TABLE {table} ADD COLUMN extra_json TEXT")
 
+def _v6(con):
+    """The shipped v6 step (F.1, phase F): evidence, risk_reasons, reconcile_due tables + indexes.
+
+    Additive only — creates three empty tables and two indexes. No existing table, column or
+    row changes; a v5 store keeps every row it had and gains the new tables. Safe to run twice:
+    CREATE TABLE IF NOT EXISTS and CREATE INDEX IF NOT EXISTS are idempotent.
+    """
+    con.execute("""CREATE TABLE IF NOT EXISTS evidence(
+      id INTEGER PRIMARY KEY, run TEXT, task TEXT, line TEXT, gate TEXT, result TEXT,
+      tree_sha TEXT, by TEXT, ref TEXT, output_tail TEXT, output_sha256 TEXT, created TEXT)""")
+    con.execute("""CREATE TABLE IF NOT EXISTS risk_reasons(
+      id INTEGER PRIMARY KEY, run TEXT, task TEXT, kind TEXT, points INTEGER,
+      source TEXT, opened TEXT, cleared TEXT, cleared_by TEXT)""")
+    con.execute("""CREATE TABLE IF NOT EXISTS reconcile_due(
+      id INTEGER PRIMARY KEY, run TEXT, scope TEXT, created TEXT, done TEXT)""")
+    con.execute("CREATE INDEX IF NOT EXISTS evidence_run_task ON evidence(run, task)")
+    con.execute("CREATE INDEX IF NOT EXISTS risk_reasons_run_task ON risk_reasons(run, task)")
+
 
 def open_project(home, slug=None, data_dir=None, version=SCHEMA, migrations=()):
     """Open or create the project store (C2). check_home runs before any directory is created."""
     path = os.path.join(project_dir(home, slug, data_dir), "mk.db")
     _selftest_write_guard(path)
-    con = _migrate(_connect(path), version, ((1, PROJECT_DDL), (2, _v2), (3, _v3), (4, _v4), (5, _v5)) + tuple(migrations))
+    con = _migrate(_connect(path), version, ((1, PROJECT_DDL), (2, _v2), (3, _v3), (4, _v4), (5, _v5), (6, _v6)) + tuple(migrations))
     _ensure_prev_status(con)
     _ensure_file_status(con)
     return con
@@ -539,7 +567,11 @@ def column_of(status, prev_status=None):
     An attention status keeps the column of prev_status (the task's previous non-attention
     status). With no previous status the column is Backlog. column_of stays pure: the caller
     looks prev_status up.
+
+    `rework` is special: it always maps to Fix (it is in ATTENTION but has its own column).
     """
+    if status == "rework":
+        return "Fix", 1
     if status in ATTENTION:
         if prev_status in COLUMNS:
             return COLUMNS[prev_status], 1
@@ -558,8 +590,8 @@ def _prev_status(con, run, task):
 def _rollup(con, run, task):
     """The status a parent should hold, or None when it has no children.
 
-    Any child in an attention status wins, first match in ATTENTION order (blocked, stalled,
-    quota, provider): the parent takes that status, and transition() then keeps the parent's
+    Any child in an attention status wins, first match in ATTENTION order (rework, blocked,
+    stalled, quota, provider): the parent takes that status, and transition() then keeps the
     previous column and sets attention=1. Otherwise the parent takes the least-done column of
     its children's non-attention statuses.
     """
@@ -1449,8 +1481,54 @@ def _routing_of(r):
             "owned": _deps_of(_col(r, "owned")), "deps": _deps_of(_col(r, "deps")),
             "route": _route_of(_col(r, "route_json"))}
 
+def _task_extra(con, run, task_id):
+    """The parsed extra_json dict for one task, or {} when absent/unparsable."""
+    row = con.execute("SELECT extra_json FROM tasks WHERE run=? AND id=?", (run, task_id)).fetchone()
+    if not row or not row["extra_json"]:
+        return {}
+    try:
+        got = json.loads(row["extra_json"])
+    except (TypeError, ValueError):
+        return {}
+    return got if isinstance(got, dict) else {}
 
-def _phases_from_run(rows, header):
+
+def _open_reasons(con, run, task_id):
+    """The task's OPEN risk_reasons as [{kind, points, source, opened}], ordered by id.
+
+    points is coerced to a non-negative int (non-int, bool, or negative → 0).
+    NULL source/opened → "" (F.8 drops non-string reasons).
+    """
+    rows = con.execute(
+        "SELECT kind, points, source, opened FROM risk_reasons"
+        " WHERE run=? AND task=? AND cleared IS NULL ORDER BY id",
+        (run, task_id)).fetchall()
+    out = []
+    for r in rows:
+        pts = r["points"]
+        if not isinstance(pts, int) or isinstance(pts, bool) or pts < 0:
+            pts = 0
+        out.append({"kind": r["kind"], "points": pts,
+                    "source": r["source"] or "", "opened": r["opened"] or ""})
+    return out
+
+
+def _task_risk(con, run, task_id):
+    """Derived risk = min(5, base_risk + sum(points of OPEN risk_reasons)).
+
+    Read-only: never stored, never settable by task set. base_risk defaults to 1.
+    Returns an int in [1, 5].
+    """
+    extra = _task_extra(con, run, task_id)
+    base = extra.get("base_risk", 1)
+    if not isinstance(base, int) or isinstance(base, bool):
+        base = 1
+    base = max(1, min(5, base))
+    open_sum = sum(r["points"] for r in _open_reasons(con, run, task_id))
+    return max(1, min(5, base + open_sum))
+
+
+def _phases_from_run(rows, header, run, con):
     """Phases with their tasks from one run's task rows, in row order (C5).
 
     A phase row is a type='phase' row or any root (no parent): run init writes the plan's
@@ -1482,6 +1560,11 @@ def _phases_from_run(rows, header):
             nodes[r["id"]] = {"id": r["id"], "title": r["title"], "status": r["status"],
                               "parent": r["parent"], "type": r["type"], "round": r["round"],
                               "verdict": r["verdict"], **_routing_of(r), "subtasks": []}
+            # F.1: risk fields from extra_json + risk_reasons
+            extra = _task_extra(con, run, r["id"])
+            nodes[r["id"]]["risk"] = _task_risk(con, run, r["id"])
+            nodes[r["id"]]["critical"] = extra.get("critical") is True
+            nodes[r["id"]]["open_reasons"] = _open_reasons(con, run, r["id"])
     for r in rows:  # pass 2: attach in rowid order — the parent node already exists, any depth
         node = nodes.get(r["id"])
         if node is None:
@@ -1513,7 +1596,8 @@ def _phases_from_header(header):
             return {"id": nid, "title": d.get("title", ""), "status": "planned", "parent": parent,
                     "type": type_, "round": None, "verdict": None, "slot": None, "pane": None,
                     "branch": None, "updated": None, "acceptance": None, "owned": [],
-                    "deps": list(d.get("deps") or []), "route": None, "subtasks": []}
+                    "deps": list(d.get("deps") or []), "route": None, "subtasks": [],
+                    "risk": 1, "critical": False, "open_reasons": []}
 
         tasks = []
         for t in ph.get("tasks") or []:
@@ -1575,7 +1659,7 @@ def _plan_obj(con, row, detail=False):
             if r["id"] not in roots:
                 counts[r["status"]] = counts.get(r["status"], 0) + 1
         if detail:
-            phases = _phases_from_run(rows, header)
+            phases = _phases_from_run(rows, header, newest, con)
     elif detail:
         phases = _phases_from_header(header)
     obj["counts"] = counts
@@ -1998,6 +2082,325 @@ def _home_env_parity(tmp):
                "%s-only homes differ: %s want %s" % (key, lines, want))
 
 
+def _schema6_v6(home):
+    """F.1: v6 migration — a fresh store has evidence/risk_reasons/reconcile_due at schema 6;
+    a v5 store built by old code upgrades to 6 with every row of every table kept; running
+    the upgrade twice changes nothing."""
+    data = os.path.join(home, "schema6-v5")
+    os.makedirs(data, exist_ok=True)
+    # Build a v5 store using the old migration chain (no _v6)
+    bare = sqlite3.connect(os.path.join(data, "mk.db"))
+    bare.executescript("""
+        CREATE TABLE plans(
+          id TEXT PRIMARY KEY, version INTEGER, title TEXT, header_json TEXT, body_md TEXT,
+          approved_at TEXT, archived_path TEXT, status TEXT, created TEXT, design TEXT,
+          integration TEXT);
+        CREATE TABLE runs(
+          id TEXT PRIMARY KEY, plan TEXT, plan_version INTEGER, branch TEXT, status TEXT, stage TEXT,
+          next TEXT, started TEXT, ended TEXT, extra_json TEXT);
+        CREATE TABLE tasks(
+          run TEXT, id TEXT, parent TEXT, type TEXT, title TEXT, acceptance TEXT, owned TEXT, deps TEXT,
+          parallel INTEGER, route_json TEXT, status TEXT, prev_status TEXT, file_status TEXT,
+          lane TEXT, slot TEXT, branch TEXT, pane TEXT, round INTEGER, verdict TEXT,
+          updated TEXT, extra_json TEXT, PRIMARY KEY(run, id));
+        CREATE TABLE events(
+          id INTEGER PRIMARY KEY, run TEXT, task TEXT, t TEXT, chan TEXT, kind TEXT, from_id TEXT,
+          to_id TEXT, reply_to TEXT, text TEXT, artifact_id INTEGER, meta_json TEXT);
+        CREATE INDEX ev_task ON events(run, task, id);
+        CREATE TABLE artifacts(
+          id INTEGER PRIMARY KEY, run TEXT, task TEXT, round INTEGER, kind TEXT, rev INTEGER,
+          text TEXT, created TEXT);
+        CREATE TABLE acks(run TEXT, msg TEXT, lane TEXT, level INTEGER, t TEXT, PRIMARY KEY(run, msg, lane));
+        CREATE TABLE lane_slots(
+          slot TEXT PRIMARY KEY, lane_path TEXT, state TEXT, run TEXT, task TEXT,
+          workspace TEXT, workspace_id TEXT, branch TEXT, lock_hash TEXT, updated TEXT);
+        CREATE TABLE waits(id INTEGER PRIMARY KEY, run TEXT, question TEXT, opened TEXT, cleared TEXT);
+        CREATE TABLE change_log(change_no INTEGER PRIMARY KEY, run TEXT, task TEXT, t TEXT);
+        CREATE TABLE schema_version(version INTEGER PRIMARY KEY);
+    """)
+    bare.execute("INSERT INTO schema_version(version) VALUES (5)")
+    # Add some rows to verify they survive the upgrade
+    bare.execute("INSERT INTO runs(id, plan, status, started) VALUES ('r1','p1','active','2026-01-01')")
+    bare.execute("INSERT INTO tasks(run, id, parent, type, title, status, updated)"
+                 " VALUES ('r1','T1',NULL,'phase','Phase 1','planned','2026-01-01')")
+    bare.execute("INSERT INTO tasks(run, id, parent, type, title, status, updated)"
+                 " VALUES ('r1','T2','T1','task','Task 2','merged','2026-01-01')")
+    bare.execute("INSERT INTO events(run, task, t, chan, kind, text)"
+                 " VALUES ('r1','T1','2026-01-01','state','transition','added')")
+    bare.execute("INSERT INTO events(run, task, t, chan, kind, text)"
+                 " VALUES ('r1','T2','2026-01-02','state','transition','merged')")
+    bare.execute("INSERT INTO artifacts(run, task, round, kind, rev, text, created)"
+                 " VALUES ('r1','T1',0,'brief',1,'hello','2026-01-01')")
+    bare.execute("INSERT INTO change_log(run, task, t) VALUES ('r1','T1','2026-01-01')")
+    bare.commit()
+    bare.close()
+
+    # Open with new code — migrates v5 to v6
+    con = open_project(home, data_dir=data)
+    try:
+        # Schema is 6
+        v = con.execute("SELECT MAX(version) v FROM schema_version").fetchone()["v"]
+        _check(v == 6, f"schema version is {v}, expected 6")
+        # Three new tables exist
+        for tbl in ("evidence", "risk_reasons", "reconcile_due"):
+            row = con.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (tbl,)).fetchone()
+            _check(row is not None, f"table {tbl} missing after v6 migration")
+        # Indexes exist
+        for idx in ("evidence_run_task", "risk_reasons_run_task"):
+            row = con.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?", (idx,)).fetchone()
+            _check(row is not None, f"index {idx} missing after v6 migration")
+        # Every pre-existing row is kept
+        runs_n = con.execute("SELECT COUNT(*) c FROM runs").fetchone()["c"]
+        tasks_n = con.execute("SELECT COUNT(*) c FROM tasks").fetchone()["c"]
+        events_n = con.execute("SELECT COUNT(*) c FROM events").fetchone()["c"]
+        artifacts_n = con.execute("SELECT COUNT(*) c FROM artifacts").fetchone()["c"]
+        change_n = con.execute("SELECT COUNT(*) c FROM change_log").fetchone()["c"]
+        _check(runs_n == 1, f"runs count {runs_n} != 1")
+        _check(tasks_n == 2, f"tasks count {tasks_n} != 2")
+        _check(events_n == 2, f"events count {events_n} != 2")
+        _check(artifacts_n == 1, f"artifacts count {artifacts_n} != 1")
+        _check(change_n == 1, f"change_log count {change_n} != 1")
+        # Content spot-check
+        t2 = con.execute("SELECT status FROM tasks WHERE run='r1' AND id='T2'").fetchone()
+        _check(t2["status"] == "merged", f"T2 status {t2['status']} != merged")
+    finally:
+        con.close()
+
+    # Idempotent: open again, nothing changes
+    con = open_project(home, data_dir=data)
+    try:
+        v2 = con.execute("SELECT MAX(version) v FROM schema_version").fetchone()["v"]
+        _check(v2 == 6, f"second open schema {v2} != 6")
+        tasks_n2 = con.execute("SELECT COUNT(*) c FROM tasks").fetchone()["c"]
+        _check(tasks_n2 == 2, f"second open tasks count {tasks_n2} != 2")
+    finally:
+        con.close()
+
+    # A fresh store also has the tables at schema 6
+    fresh_data = os.path.join(home, "schema6-fresh")
+    con = open_project(home, data_dir=fresh_data)
+    try:
+        v3 = con.execute("SELECT MAX(version) v FROM schema_version").fetchone()["v"]
+        _check(v3 == 6, f"fresh store schema {v3} != 6")
+        for tbl in ("evidence", "risk_reasons", "reconcile_due"):
+            row = con.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (tbl,)).fetchone()
+            _check(row is not None, f"fresh store table {tbl} missing")
+    finally:
+        con.close()
+
+    # An old reader (version=5) refuses the v6 store
+    try:
+        _open_read(os.path.join(data, "mk.db"), 5)
+    except Fail as e:
+        _check(e.code == 3, f"old reader exit code {e.code} != 3")
+        _check("newer than this code" in str(e), f"old reader message: {e}")
+    else:
+        raise SystemExit("SELF-TEST FAIL: old reader did not refuse v6 store")
+
+
+def _derived_risk(home):
+    """F.1: derived risk = min(5, base_risk + sum(OPEN reason points)); plans --json carries
+    risk, critical, open_reasons."""
+    data = os.path.join(home, "risk-v6")
+    con = open_project(home, data_dir=data)
+    try:
+        con.execute("INSERT INTO plans(id, version, title, header_json)"
+                    " VALUES ('rp',1,'Risk plan','{}')")
+        con.execute("INSERT INTO runs(id, plan, status, started)"
+                    " VALUES ('rr','rp','active','2026-01-01T00:00:00Z')")
+        con.commit()
+        add_task(con, "rr", "P1", "phase", title="phase")
+        add_task(con, "rr", "R1", "task", title="low risk", parent="P1")
+        add_task(con, "rr", "R2", "task", title="medium risk", parent="P1")
+        add_task(con, "rr", "R3", "task", title="capped risk", parent="P1")
+        add_task(con, "rr", "R4", "task", title="cleared risk", parent="P1")
+        con.execute("UPDATE tasks SET extra_json='{\"base_risk\":2,\"critical\":true}'"
+                    " WHERE run='rr' AND id='R2'")
+        con.execute("UPDATE tasks SET extra_json='{\"base_risk\":3,\"critical\":false}'"
+                    " WHERE run='rr' AND id='R3'")
+        con.execute("UPDATE tasks SET extra_json='{\"base_risk\":1}'"
+                    " WHERE run='rr' AND id='R4'")
+        con.commit()
+        # R1: base 1, no reasons → risk 1
+        # R2: base 2, one open reason +2 → risk 4
+        con.execute("INSERT INTO risk_reasons(run, task, kind, points, source, opened)"
+                    " VALUES ('rr','R2','review_changes',2,'review R1','2026-01-01')")
+        # R3: base 3, two open reasons +2+1 → capped at 5
+        con.execute("INSERT INTO risk_reasons(run, task, kind, points, source, opened)"
+                    " VALUES ('rr','R3','gate_red',2,'gate run','2026-01-01')")
+        con.execute("INSERT INTO risk_reasons(run, task, kind, points, source, opened)"
+                    " VALUES ('rr','R3','no_evidence',1,'merge','2026-01-01')")
+        # R4: base 1, one open +2, one cleared +3 → risk 3 (only open counts)
+        con.execute("INSERT INTO risk_reasons(run, task, kind, points, source, opened, cleared, cleared_by)"
+                    " VALUES ('rr','R4','review_changes',2,'review R1','2026-01-01',NULL,NULL)")
+        con.execute("INSERT INTO risk_reasons(run, task, kind, points, source, opened, cleared, cleared_by)"
+                    " VALUES ('rr','R4','gate_red',3,'gate run','2026-01-01','2026-01-02','42')")
+        con.commit()
+
+        # Verify through _task_risk
+        _check(_task_risk(con, "rr", "R1") == 1, f"R1 risk {_task_risk(con, 'rr', 'R1')} != 1")
+        _check(_task_risk(con, "rr", "R2") == 4, f"R2 risk {_task_risk(con, 'rr', 'R2')} != 4")
+        _check(_task_risk(con, "rr", "R3") == 5, f"R3 risk {_task_risk(con, 'rr', 'R3')} != 5")
+        _check(_task_risk(con, "rr", "R4") == 3, f"R4 risk {_task_risk(con, 'rr', 'R4')} != 3")
+
+        # Verify open_reasons
+        r2_reasons = _open_reasons(con, "rr", "R2")
+        _check(len(r2_reasons) == 1 and r2_reasons[0]["kind"] == "review_changes"
+               and r2_reasons[0]["points"] == 2, f"R2 reasons {r2_reasons}")
+        r4_reasons = _open_reasons(con, "rr", "R4")
+        _check(len(r4_reasons) == 1 and r4_reasons[0]["points"] == 2,
+               f"R4 open reasons {r4_reasons}")
+        # R2: bad points coerced to 0
+        con.execute("INSERT INTO risk_reasons(run, task, kind, points, source, opened)"
+                    " VALUES ('rr','R1','text_points','x','bad','2026-01-01')")
+        con.execute("INSERT INTO risk_reasons(run, task, kind, points, source, opened)"
+                    " VALUES ('rr','R1','neg_points',-4,'bad','2026-01-01')")
+        con.execute("INSERT INTO risk_reasons(run, task, kind, points, source, opened)"
+                    " VALUES ('rr','R1','real_points',1.5,'bad','2026-01-01')")
+        con.execute("INSERT INTO risk_reasons(run, task, kind, points, source, opened)"
+                    " VALUES ('rr','R1','str_points','true','bad','2026-01-01')")
+        # NULL source/opened → ""
+        con.execute("INSERT INTO risk_reasons(run, task, kind, points, source, opened)"
+                    " VALUES ('rr','R1','null_fields',0,NULL,NULL)")
+        con.commit()
+        _check(_task_risk(con, "rr", "R1") == 1, f"R1 risk with bad points {_task_risk(con, 'rr', 'R1')} != 1")
+        r1_reasons = _open_reasons(con, "rr", "R1")
+        _check(len(r1_reasons) == 5, f"R1 should have 5 open reasons, got {len(r1_reasons)}")
+        for reason in r1_reasons:
+            _check(reason["points"] == 0, f"bad points coerced to {reason['points']} != 0")
+        null_reason = [r for r in r1_reasons if r["kind"] == "null_fields"][0]
+        _check(null_reason["source"] == "" and null_reason["opened"] == "",
+               f"NULL source/opened not coerced: {null_reason}")
+    finally:
+        con.close()
+
+    # plans --json carries risk, critical, open_reasons
+    got = plans(home, data_dir=data, plan_id="rp")
+    tasks = got["phases"][0]["tasks"] if got["phases"] else []
+    by_id = {t["id"]: t for t in tasks}
+    _check(by_id["R1"]["risk"] == 1, f"R1 plans risk {by_id['R1']['risk']} != 1")
+    _check(by_id["R1"]["critical"] is False, f"R1 critical {by_id['R1']['critical']} != False")
+    _check(len(by_id["R1"]["open_reasons"]) == 5, f"R1 open_reasons {by_id['R1']['open_reasons']} should have 5")
+    _check(by_id["R2"]["risk"] == 4, f"R2 plans risk {by_id['R2']['risk']} != 4")
+    _check(by_id["R2"]["critical"] is True, f"R2 critical {by_id['R2']['critical']} != True")
+    _check(len(by_id["R2"]["open_reasons"]) == 1, f"R2 plans open_reasons {by_id['R2']['open_reasons']}")
+    _check(by_id["R3"]["risk"] == 5, f"R3 plans risk {by_id['R3']['risk']} != 5")
+    _check(by_id["R4"]["risk"] == 3, f"R4 plans risk {by_id['R4']['risk']} != 3")
+    # Existing keys unchanged
+    _check("id" in by_id["R1"] and "title" in by_id["R1"] and "status" in by_id["R1"],
+           "existing task keys missing")
+    # R2: critical as string "false" → False (is True, not bool())
+    con2 = open_project(home, data_dir=data)
+    try:
+        con2.execute("UPDATE tasks SET extra_json='{\"base_risk\":1,\"critical\":\"false\"}'"
+                     " WHERE run='rr' AND id='R1'")
+        con2.commit()
+    finally:
+        con2.close()
+    got2 = plans(home, data_dir=data, plan_id="rp")
+    tasks2 = got2["phases"][0]["tasks"] if got2["phases"] else []
+    by_id2 = {t["id"]: t for t in tasks2}
+    _check(by_id2["R1"]["critical"] is False,
+           f"critical string 'false' → {by_id2['R1']['critical']!r} (should be False)")
+    # critical as string "true" → False (is True, not truthy)
+    con3 = open_project(home, data_dir=data)
+    try:
+        con3.execute("UPDATE tasks SET extra_json='{\"base_risk\":1,\"critical\":\"true\"}'"
+                     " WHERE run='rr' AND id='R1'")
+        con3.commit()
+    finally:
+        con3.close()
+    got3 = plans(home, data_dir=data, plan_id="rp")
+    tasks3 = got3["phases"][0]["tasks"] if got3["phases"] else []
+    by_id3 = {t["id"]: t for t in tasks3}
+    _check(by_id3["R1"]["critical"] is False,
+           f"critical string 'true' → {by_id3['R1']['critical']!r} (should be False)")
+    # critical as int 1 → False (is True)
+    con4 = open_project(home, data_dir=data)
+    try:
+        con4.execute("UPDATE tasks SET extra_json='{\"base_risk\":1,\"critical\":1}'"
+                     " WHERE run='rr' AND id='R1'")
+        con4.commit()
+    finally:
+        con4.close()
+    got4 = plans(home, data_dir=data, plan_id="rp")
+    tasks4 = got4["phases"][0]["tasks"] if got4["phases"] else []
+    by_id4 = {t["id"]: t for t in tasks4}
+    _check(by_id4["R1"]["critical"] is False,
+           f"critical int 1 → {by_id4['R1']['critical']!r} (should be False)")
+
+
+
+def _rework_rollup(home):
+    """F.1: a phase with one rework child and merged siblings rolls up to rework; rework is in
+    COLUMNS (-> Fix) and ATTENTION (card raises the flag); rework is NOT in DEP_MET."""
+    data = os.path.join(home, "rework-v6")
+    con = open_project(home, data_dir=data)
+    try:
+        add_task(con, "rw", "P1", "phase", title="Phase 1")
+        add_task(con, "rw", "A", "task", title="merged task", parent="P1", status="merged")
+        add_task(con, "rw", "B", "task", title="rework task", parent="P1", status="rework")
+        con.commit()
+    finally:
+        con.close()
+
+    # transition B to rework — the rollup should lift P1 to rework
+    transition(home, "matrixkoder", "rw", "B", "rework", note="found wrong", data_dir=data)
+    con = open_project(home, data_dir=data)
+    try:
+        p1 = con.execute("SELECT status FROM tasks WHERE run='rw' AND id='P1'").fetchone()
+        _check(p1["status"] == "rework", f"P1 status {p1['status']} != rework")
+        a = con.execute("SELECT status FROM tasks WHERE run='rw' AND id='A'").fetchone()
+        _check(a["status"] == "merged", f"A status {a['status']} != merged")
+        b = con.execute("SELECT status FROM tasks WHERE run='rw' AND id='B'").fetchone()
+        _check(b["status"] == "rework", f"B status {b['status']} != rework")
+        # rework is in COLUMNS -> Fix column
+        _check(COLUMNS["rework"] == "Fix", f"COLUMNS[rework] = {COLUMNS['rework']} != Fix")
+        # rework is in ATTENTION
+        _check("rework" in ATTENTION, "rework not in ATTENTION")
+        # rework is NOT in DEP_MET
+        _check("rework" not in DEP_MET, "rework in DEP_MET")
+        # R2: column_of('rework') always returns ("Fix", 1) regardless of prev_status
+        _check(column_of("rework", "merged") == ("Fix", 1),
+               f"column_of('rework','merged') = {column_of('rework', 'merged')} != ('Fix', 1)")
+        _check(column_of("rework", "review") == ("Fix", 1),
+               f"column_of('rework','review') = {column_of('rework', 'review')} != ('Fix', 1)")
+        _check(column_of("rework", None) == ("Fix", 1),
+               f"column_of('rework',None) = {column_of('rework', None)} != ('Fix', 1)")
+        _check(column_of("rework", "blocked") == ("Fix", 1),
+               f"column_of('rework','blocked') = {column_of('rework', 'blocked')} != ('Fix', 1)")
+    finally:
+        con.close()
+
+    # Now clear B back to merged — P1 should roll up to merged
+    transition(home, "matrixkoder", "rw", "B", "merged", note="fixed", data_dir=data)
+    con = open_project(home, data_dir=data)
+    try:
+        p1 = con.execute("SELECT status FROM tasks WHERE run='rw' AND id='P1'").fetchone()
+        _check(p1["status"] == "merged", f"P1 status {p1['status']} != merged")
+    finally:
+        con.close()
+
+    # Two children: one rework, one blocked — rework wins (first in ATTENTION)
+    con = open_project(home, data_dir=data)
+    try:
+        add_task(con, "rw2", "P2", "phase", title="Phase 2")
+        add_task(con, "rw2", "C", "task", title="blocked task", parent="P2")
+        add_task(con, "rw2", "D", "task", title="rework task 2", parent="P2")
+        con.commit()
+    finally:
+        con.close()
+    transition(home, "matrixkoder", "rw2", "C", "blocked", note="blocked", data_dir=data)
+    transition(home, "matrixkoder", "rw2", "D", "rework", note="found wrong", data_dir=data)
+    con = open_project(home, data_dir=data)
+    try:
+        p2 = con.execute("SELECT status FROM tasks WHERE run='rw2' AND id='P2'").fetchone()
+        _check(p2["status"] == "rework", f"P2 status {p2['status']} != rework (rework should win over blocked)")
+    finally:
+        con.close()
 def self_test():
     with tempfile.TemporaryDirectory() as tmp:
         home = os.path.join(tmp, "home")
@@ -2056,6 +2459,9 @@ def self_test():
         _overview_production_home(home, tmp)
         _single_writer()
         _ready(home)
+        _schema6_v6(home)
+        _derived_risk(home)
+        _rework_rollup(home)
         _selftest_guard(home)
         _home_env_parity(tmp)
         for k, v in saved.items():
@@ -2290,6 +2696,8 @@ def _cycle_race(home):
             edges[(row["run"], row["id"])] = [_dep_target(row["run"], d) for d in _deps_of(row["deps"])]
         for node in list(edges):
             _check(node not in _reaches(node, edges), f"cycle survived: {node}")
+        _check(_reaches('a', {'a': ['b'], 'b': ['c']}) == {'b', 'c'}, "_reaches doesn't traverse")
+        _check(_reaches('a', {'a': ['a']}) == {'a'}, "_reaches doesn't catch self-cycle")
     finally:
         con.close()
 
@@ -3174,7 +3582,8 @@ def _plans_detail(home):
            and ph1["route"] is None, f"ph1 {ph1}")  # wave from header_json; routing null-defaulted
     _check([t["id"] for t in ph1["tasks"]] == ["a1", "a2", "a3", "a4"], f"ph1 tasks {ph1['tasks']}")
     task_keys = {"id", "title", "status", "parent", "type", "round", "verdict", "slot", "pane",
-                 "branch", "updated", "acceptance", "owned", "deps", "route", "subtasks"}
+                 "branch", "updated", "acceptance", "owned", "deps", "route", "subtasks",
+                 "risk", "critical", "open_reasons"}
     a1, a2, a3, a4 = ph1["tasks"]
     _check(a1["parent"] == "ph1" and a1["type"] == "task" and a1["status"] == "planned"
            and set(a1) == task_keys, f"a1 {a1}")

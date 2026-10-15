@@ -129,6 +129,85 @@ single active run. Archive is a flag on the row; nothing moves.
 | `plan_phase`, `route`, `lane_group`, `reviewer` | string \| null | **C4**: set on a *phase* task created by `run init --plan` — the plan phase id, its pinned `route` (`""` = Jev decides, stored `null`), its `lane_group` (phases sharing a value share one worktree), and the phase's `reviewer` (`""` = orchestrator decides, stored `""` — the plan's value or `""` when absent; `task set reviewer=` rewrites it). `null` on ad-hoc tasks (`task add`) and children; the `reviewer` key is absent there until `task set` adds it |
 | `plan_task` | string \| null | **C4**: set on a *child* task created from a `[[phase.task]]` — the plan task id (`P1.1`); its `parent` is the phase task. `null` on ad-hoc and phase tasks |
 
+
+## Schema 6 (additive: evidence, risk, reconcile)
+
+Schema 6 adds three tables plus per-task risk fields. It is **additive**: every
+writer auto-migrates, so the first v6 write upgrades an existing store in place.
+
+### `evidence` (one row per gate/check run)
+
+| Column | Type | Meaning |
+|---|---|---|
+| `id` | INTEGER PRIMARY KEY | |
+| `run`, `task` | TEXT | the run and task the check belongs to |
+| `line` | TEXT | the check's identity (file:line or command) |
+| `gate` | TEXT | the gate name |
+| `result` | TEXT | one of `pass fail timeout deferred error manual` (checked in the writer helper, not a DB CHECK) |
+| `tree_sha` | TEXT | the git tree SHA the check ran against |
+| `by` | TEXT | writer |
+| `ref` | TEXT | external reference (log, artifact) |
+| `output_tail` | TEXT | tail of the check output |
+| `output_sha256` | TEXT | sha256 of the full output |
+| `created` | TEXT | timestamp |
+
+### `risk_reasons` (one row per open risk reason)
+
+| Column | Type | Meaning |
+|---|---|---|
+| `id` | INTEGER PRIMARY KEY | |
+| `run`, `task` | TEXT | the run and task the risk belongs to |
+| `kind` | TEXT | risk kind |
+| `points` | INTEGER | risk weight (feeds the derived risk rule below) |
+| `source` | TEXT | what raised it |
+| `opened` | TEXT | timestamp |
+| `cleared` | TEXT | timestamp; **open** = `cleared IS NULL` |
+| `cleared_by` | TEXT | an evidence id or a note |
+
+### `reconcile_due` (one row per reconcile obligation)
+
+| Column | Type | Meaning |
+|---|---|---|
+| `id` | INTEGER PRIMARY KEY | |
+| `run` | TEXT | the run |
+| `scope` | TEXT | what must be reconciled |
+| `created` | TEXT | timestamp |
+| `done` | TEXT | timestamp; pending = `done IS NULL` |
+
+### Indexes
+
+`evidence_run_task ON evidence(run, task)`,
+`risk_reasons_run_task ON risk_reasons(run, task)`.
+
+### Per-task fields in `tasks.extra_json`
+
+- `critical` (bool, default false)
+- `base_risk` (int 1–5, default 1)
+- `gates` (any JSON, stored and returned; F.2 defines the format)
+
+### Derived risk rule
+
+`risk = min(5, base_risk + sum(points of the task's OPEN risk_reasons))`.
+Read-only, never stored, never settable by `task set`. The `plans --json` reply
+carries `risk`, `critical`, and `open_reasons` (list of
+`{kind, points, source, opened}`) on every task row.
+
+### The `rework` status
+
+In `COLUMNS` (maps to `Fix`) and in `ATTENTION` (card raises the flag). `column_of` always
+returns `("Fix", 1)` for `rework` regardless of previous status. A phase with one `rework`
+child rolls up to `rework` even when siblings are merged. NOT in `DEP_MET`, NOT in
+`CLOSED_STATUSES` — an open status that blocks run close.
+
+### Schema 6 rollout
+
+Any `mkdb.py` copy older than this commit (an installed plugin cache such as
+`~/.claude/plugins/cache/matrixkoder/<ver>`, a worktree cut before the merge)
+refuses the store after the first v6 write: `_open_read` and `_migrate` exit 3
+with "store schema v6 is newer than this code". The fix is to update the
+`mkdb.py` copy. All writers auto-migrate, so the first v6 write upgrades the
+store in place.
+
 ## Events (the `events` table)
 
 ```json
