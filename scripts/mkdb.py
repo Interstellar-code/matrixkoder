@@ -2,7 +2,6 @@
 """MatrixKoder SQLite stores — the ONLY module that opens a store read-write. Python 3 stdlib only.
 
   timeline --project P --run R --task T --json
-  cards [--project P] --json
   projects --json
   plans --project P|--data D [--json]          # every plan row (C5, C8)
   plans --project P|--data D <id> --json       # one plan with its phases
@@ -15,11 +14,12 @@ Common: --data DIR (the project data dir; until DM a project lives at <repo>/.ma
 Every command prints ONE JSON line. Errors: {"ok": false, "error": ...} exit 2;
 a store newer than this code: exit 3.
 
-Two stores. The root store <home>/mk.db holds the cross-project cards (C1). The project store
-<data>/mk.db (or <home>/projects/<slug>/mk.db when only --project is given) holds that project's
-plans, runs, tasks, events and change_log (C2). The project store is the truth: transition() is
-the only status writer, and the root card is a copy written afterwards, only when sync_root=True
-(default False — D3B turns it on).
+Two stores. The root store <home>/mk.db holds the projects linkage and plan_summary (C1, C3).
+The project store <data>/mk.db (or <home>/projects/<slug>/mk.db when only --project is given)
+holds that project's plans, runs, tasks, events and change_log (C2). The project store is the
+truth: transition() is the only status writer, and the root plan_summary is a projection written
+afterwards. L7.3 dropped the old root copies (`cards`, `project_summary`, `sync`) from every read
+and write; their CREATE TABLE lines stay for one more migration.
 
 Schema: docs/state-schema.md (store section).
 """
@@ -555,13 +555,6 @@ def _prev_status(con, run, task):
     return row["prev_status"] if row else None
 
 
-def _placed(row, status=None):
-    """Column and attention for a task row. The one path transition() and catch_up() both use."""
-    status = row["status"] if status is None else status
-    prev = row["prev_status"] if status in ATTENTION else None
-    return column_of(status, prev)
-
-
 def _rollup(con, run, task):
     """The status a parent should hold, or None when it has no children.
 
@@ -643,9 +636,9 @@ def promote_ready(home, project, run, changed=None, data_dir=None, sync_root=Fal
     ONE transaction: no event (the file view's "deps met" note is the one event), `updated`
     unchanged. `file_status` keeps `planned` or `routed` so the published view can restore it.
     Idempotent: a task already `ready` is not in READY_FROM, and a demoted task has an unmet
-    dep, so a second pass moves nothing. When sync_root is set, every card that does not match
-    its row is repaired in ONE root transaction at the end of the pass (a missing card is
-    recorded, so a task with no change_log is visited once). -> ids moved."""
+    dep, so a second pass moves nothing. L7.3: the root card is gone, so the pass no longer
+    repairs one; each move still refreshes the root plan_summary through transition().
+    `sync_root` is kept for callers and drives nothing here any more. -> ids moved."""
     con = open_project(home, project, data_dir)
     try:
         cand = con.execute(
@@ -663,28 +656,9 @@ def promote_ready(home, project, run, changed=None, data_dir=None, sync_root=Fal
         marks = {(x["run"], x["id"]): x["status"] for x in
                  con.execute("SELECT run, id, status FROM tasks WHERE run IN (%s)"
                              % ",".join("?" * len(runs)), tuple(sorted(runs)))}
-        # change_no and the full row, read once, so the card repair does not reopen per task
-        full = {}
-        nos = {}
-        if sync_root:
-            for r in rows:
-                key = (r["run"], r["id"])
-                full[key] = con.execute("SELECT * FROM tasks WHERE run=? AND id=?", key).fetchone()
-                nos[key] = con.execute(
-                    "SELECT MAX(change_no) c FROM change_log WHERE run=? AND task=?", key).fetchone()["c"]
     finally:
         con.close()
-    card_status = {}
-    if sync_root:
-        root = open_root(home)
-        try:
-            card_status = {(c["run"], c["task"]): c["status"] for c in
-                           root.execute("SELECT run, task, status FROM cards WHERE project=?",
-                                        (project,))}
-        finally:
-            root.close()
     moved = []
-    repairs = []
     for r in rows:
         deps = _deps_of(r["deps"])
         if not deps:
@@ -702,7 +676,6 @@ def promote_ready(home, project, run, changed=None, data_dir=None, sync_root=Fal
         else:
             to = None
         key = (r["run"], r["id"])
-        status_now = r["status"]
         if to is not None:
             con = open_project(home, project, data_dir)
             try:
@@ -720,67 +693,10 @@ def promote_ready(home, project, run, changed=None, data_dir=None, sync_root=Fal
                        note="" if to == "ready" else "dep no longer met",
                        data_dir=data_dir, sync_root=False, event=False, keep_updated=True,
                        file_status=file_status)
-            status_now = to
-            if sync_root:
-                con = open_project(home, project, data_dir)
-                try:
-                    full[key] = con.execute("SELECT * FROM tasks WHERE run=? AND id=?", key).fetchone()
-                    nos[key] = con.execute(
-                        "SELECT MAX(change_no) c FROM change_log WHERE run=? AND task=?",
-                        key).fetchone()["c"]
-                finally:
-                    con.close()
             if to == "ready":
                 moved.append(r["id"])
-        if sync_root and card_status.get(key) != status_now:
-            row = full.get(key)
-            no = nos.get(key)
-            if row and no:
-                repairs.append((r, dict(row) if not isinstance(row, dict) else row, status_now, no))
-            else:
-                # no change_log, or no row: remember it so the next pass does not reopen it
-                card_status[key] = status_now
-    if repairs:
-        _repair_cards(home, project, repairs, data_dir)
     return moved
 
-
-ACTIVE_RUN_STATUSES = ("running", "active")  # mk-state writes 'active'; 'running' kept for older rows
-
-
-def _summary_values(con):
-    """C1 project_summary aggregates from an OPEN project connection: three aggregate
-    statements, no per-task scan and no second connection.
-
-    active_runs counts the runs the store holds as running/active; by_status_json is the
-    sorted-keys JSON object of task-status counts over ALL tasks of the project (every run);
-    attention reuses the card rule (column_of): a status in ATTENTION; last_event is the
-    newest events.t of the project (NULL with no events). change_no is the caller's — the
-    change just committed.
-    """
-    by, attention = {}, 0
-    for r in con.execute("SELECT status, COUNT(*) c FROM tasks GROUP BY status"):
-        by[r["status"]] = r["c"]
-        if r["status"] in ATTENTION:
-            attention += r["c"]
-    active = con.execute(
-        "SELECT COUNT(*) c FROM runs WHERE status IN (?,?)", ACTIVE_RUN_STATUSES).fetchone()["c"]
-    last_event = con.execute("SELECT MAX(t) m FROM events").fetchone()["m"]
-    return active, json.dumps(by, sort_keys=True), attention, last_event
-
-
-def _write_summary(root, project, values, change_no):
-    """The C1 summary upsert, INSIDE the caller's open root transaction (C5: it lands with
-    the card). change_no never lowers: a replay carrying an older change keeps the stored one.
-    """
-    active, by_json, attention, last_event = values
-    root.execute(
-        "INSERT INTO project_summary(project, active_runs, by_status_json, attention, last_event, change_no)"
-        " VALUES (?,?,?,?,?,?)"
-        " ON CONFLICT(project) DO UPDATE SET active_runs=excluded.active_runs,"
-        " by_status_json=excluded.by_status_json, attention=excluded.attention,"
-        " last_event=excluded.last_event, change_no=MAX(project_summary.change_no, excluded.change_no)",
-        (project, active, by_json, attention, last_event, change_no))
 
 def _plan_summary_values(con):
     """C3: one plan_summary value tuple per plans row, from an OPEN project connection.
@@ -800,10 +716,11 @@ def _plan_summary_values(con):
 def _write_plan_summaries(root, project, values):
     """The C3 plan_summary upserts, INSIDE the caller's open root transaction.
 
-    Same contract as _write_summary: the rows land with the card that triggered them (or in the
-    caller's own transaction when sync_root is off), so a kill before the commit leaves the
-    previous row and catch_up rebuilds it. counts_json is rewritten whole; no column is merged,
-    because the row is a projection of the project store, never an independent fact.
+    Same contract as the card write it used to ride with (C5): the rows land with the commit
+    that triggered them (or in the caller's own transaction when sync_root is off), so a kill
+    before it leaves the previous rows and catch_up rebuilds them. counts_json is rewritten
+    whole; no column is merged, because the row is a projection of the project store, never an
+    independent fact.
     """
     if not values:
         return
@@ -854,60 +771,12 @@ def refresh_plan_summaries(home, project, data_dir=None):
     return len(values)
 
 
-def _repair_cards(home, project, repairs, data_dir):
-    """Write every mismatched card and advance the watermark in ONE root transaction.
-
-    change_no is the task's own MAX(change_log), which can sit below the watermark the
-    triggering transition already advanced. The watermark moves to at least that number and
-    at least its current value, so a later catch_up still replays anything newer.
-    The batch also writes the summary ONCE (not per card), in the same transaction, and the
-    plan_summary rows (C3) in that same transaction.
-    """
-    con = open_project(home, project, data_dir)
-    try:
-        summary = _summary_values(con)
-        plans = _plan_summary_values(con)
-    finally:
-        con.close()
-    root = open_root(home)
-    try:
-        _begin(root)
-        try:
-            hi = 0
-            for r, row, status, no in repairs:
-                col, attention = _placed(row, status)
-                root.execute(
-                    "INSERT INTO cards(project, run, task, parent, type, title, status, col, attention,"
-                    " route_json, lane, round, verdict, updated, change_no)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
-                    " ON CONFLICT(project, run, task) DO UPDATE SET status=excluded.status, col=excluded.col,"
-                    " attention=excluded.attention, round=excluded.round, verdict=excluded.verdict,"
-                    " updated=excluded.updated,"
-                    " change_no=MAX(cards.change_no, excluded.change_no)",
-                    (project, r["run"], r["id"], row["parent"], row["type"], row["title"], status, col,
-                     attention, row["route_json"], row["lane"], row["round"],
-                     row["verdict"] if "verdict" in row.keys() else None, row["updated"], no))
-                hi = max(hi, no)
-            root.execute(
-                "INSERT INTO sync(project, last_change_no) VALUES (?,?)"
-                " ON CONFLICT(project) DO UPDATE SET last_change_no=MAX(sync.last_change_no, excluded.last_change_no)",
-                (project, hi))
-            _write_summary(root, project, summary, hi)
-            _write_plan_summaries(root, project, plans)
-            root.execute("COMMIT")
-        except Exception:
-            root.execute("ROLLBACK")
-            raise
-    finally:
-        root.close()
-
-
 def transition(home, project, run, task, to, note="", round=0, sync_root=False, data_dir=None, verdict=_UNSET,
                  event=True, keep_updated=False, file_status=_UNSET):
-    """The ONLY status writer (C10). One project transaction, then the root card iff sync_root.
+    """The ONLY status writer (C10). One project transaction, then the root plan_summary (C3).
 
     verdict defaults to leaving the task's stored verdict unchanged. Pass a string or None to
-    replace it; the root card (sync_root) and a later catch_up both copy that value.
+    replace it; L7.3 removed the root card that used to copy it.
     """
     con = open_project(home, project, data_dir)
     try:
@@ -920,8 +789,6 @@ def transition(home, project, run, task, to, note="", round=0, sync_root=False, 
                 " FROM tasks WHERE run=? AND id=?", (run, task)).fetchone()
             if not row:
                 raise Fail(f"no task {run}:{task}")
-            # An attention status keeps the column of the previous non-attention status (C4).
-            col, attention = _placed(row, to)
             kept = row["prev_status"] if to in ATTENTION else (to if to in COLUMNS else row["prev_status"])
             # verdict= is optional: a status-only transition leaves the stored verdict alone.
             verdict = row["verdict"] if verdict is _UNSET else verdict
@@ -947,18 +814,11 @@ def transition(home, project, run, task, to, note="", round=0, sync_root=False, 
         except Exception:
             con.execute("ROLLBACK")
             raise
-        # The child's card lands before the parent rollup, so a lower change_no cannot follow a
-        # higher one into the root. sync.last_change_no is also monotonic inside the upsert.
-        # The summary is computed from the just-committed rows on the same connection, then
-        # written in the SAME root transaction as the card (C5): a kill before it leaves both
-        # missing, and catch_up heals both. plan_summary (C3) rides in that same transaction, so
-        # the root's plan numbers can never lag the status this transition just committed; with
-        # sync_root off it lands in its own root transaction right after the project commit.
+        # L7.3: the root card and its sync watermark are gone. Each commit now refreshes the
+        # root plan_summary (C3), so the root's plan numbers can never lag the status this
+        # transition just committed. sync_root is kept for callers and drives nothing here.
         plans = _plan_summary_values(con)
-        if sync_root:
-            _upsert_card(home, project, run, task, row, to, col, attention, round, change_no, data_dir,
-                         updated=stamped, summary=_summary_values(con), plans=plans)
-        elif plans:
+        if plans:
             _write_plan_summaries_root(home, project, plans)
         rolled = _rollup(con, run, row["parent"]) if row["parent"] else None
         if rolled and rolled != con.execute("SELECT status FROM tasks WHERE run=? AND id=?",
@@ -976,130 +836,34 @@ def transition(home, project, run, task, to, note="", round=0, sync_root=False, 
     return change_no
 
 
-def _upsert_card(home, project, run, task, row, status, col, attention, round, change_no, data_dir,
-                  updated=None, summary=None, plans=None):
-    """C5: the root copy, in its own transaction. A failure here leaves the project change durable.
-
-    summary (C1 project_summary values from _summary_values) and plans (C3 plan_summary values
-    from _plan_summary_values) are written in the SAME root transaction, so the card and both
-    rollups always land together; None skips either (a caller that only repairs a card leaves
-    the rollups to its own batch).
-    """
-    root = open_root(home)
-    try:
-        _begin(root)
-        try:
-            root.execute(
-                "INSERT INTO cards(project, run, task, parent, type, title, status, col, attention,"
-                " route_json, lane, round, verdict, updated, change_no)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
-                " ON CONFLICT(project, run, task) DO UPDATE SET status=excluded.status, col=excluded.col,"
-                " attention=excluded.attention, round=excluded.round, verdict=excluded.verdict,"
-                " updated=excluded.updated,"
-                " change_no=MAX(cards.change_no, excluded.change_no)",
-                (project, run, task, row["parent"], row["type"], row["title"], status, col, attention,
-                 row["route_json"], row["lane"], round, row["verdict"] if "verdict" in row.keys() else None,
-                 updated or now(), change_no))
-            root.execute(
-                "INSERT INTO sync(project, last_change_no) VALUES (?,?)"
-                " ON CONFLICT(project) DO UPDATE SET last_change_no=MAX(sync.last_change_no, excluded.last_change_no)",
-                (project, change_no))
-            if summary is not None:
-                _write_summary(root, project, summary, change_no)
-            if plans is not None:
-                _write_plan_summaries(root, project, plans)
-            root.execute("COMMIT")
-        except Exception:
-            root.execute("ROLLBACK")
-            raise
-    finally:
-        root.close()
-
-
 def catch_up(home, project, data_dir=None):
-    """Replay project changes the root has not seen yet (C5 sync.last_change_no).
+    """L7.3: heal the root plan_summary against the project store, and nothing else.
 
-    Also repairs a card whose status disagrees with the task row even when every change_log
-    row for that task sits at or below the watermark: a kill between a transition and the
-    card repair leaves exactly that. The repair uses the task's own MAX(change_no) and does
-    not move the watermark backwards.
-
-    C1: the summary is written ONCE after the replays (never per card), carrying the
-    watermark as its change_no — so a store whose cards are current but whose summary is
-    missing or stale (a kill between the card writes and this one) heals here too. The
-    write is skipped when the stored row already equals the recomputed one, so a second
-    catch_up over a synced store writes nothing.
+    The root cards and the sync watermark are gone, so there is no change_log replay any more.
+    What can still lag is the C3 plan_summary batch: a kill between the project commit and the
+    root write (the MKDB_FAIL_BEFORE_ROOT window) leaves it stale. This recomputes the rows and
+    writes only when a row is missing or differs, so a second call over a synced store writes
+    nothing and returns 0. Returns the number of plan rows written.
     """
     con = open_project(home, project, data_dir)
     try:
-        rows = con.execute("SELECT t.run, t.id, t.parent, t.type, t.title, t.route_json, t.lane,"
-                           " t.status, t.prev_status, t.round, t.verdict, t.updated, c.change_no FROM change_log c"
-                           " JOIN tasks t ON t.run=c.run AND t.id=c.task ORDER BY c.change_no").fetchall()
-        tasks = con.execute("SELECT run, id, parent, type, title, route_json, lane, status,"
-                            " prev_status, round, verdict, updated FROM tasks").fetchall()
-        nos = {(r["run"], r["task"]): r["c"] for r in con.execute(
-            "SELECT run, task, MAX(change_no) c FROM change_log GROUP BY run, task")}
-        summary = _summary_values(con)
         plans = _plan_summary_values(con)
     finally:
         con.close()
+    if not plans:
+        return 0
     root = open_root(home)
     try:
-        seen = root.execute("SELECT last_change_no FROM sync WHERE project=?", (project,)).fetchone()
-        cards_now = {(c["run"], c["task"]): c["status"] for c in
-                     root.execute("SELECT run, task, status FROM cards WHERE project=?", (project,))}
+        have = {r["plan"]: (r["title"], r["status"], r["counts_json"], r["live_run"]) for r in
+                root.execute("SELECT plan, title, status, counts_json, live_run"
+                             " FROM plan_summary WHERE project=?", (project,))}
     finally:
         root.close()
-    last = seen["last_change_no"] if seen else 0
-    n = 0
-    for r in rows:
-        if r["change_no"] <= last:
-            continue
-        col, attention = _placed(r)
-        _upsert_card(home, project, r["run"], r["id"], r, r["status"], col, attention,
-                     r["round"], r["change_no"], data_dir, updated=r["updated"])
-        cards_now[(r["run"], r["id"])] = r["status"]
-        n += 1
-    for t in tasks:
-        key = (t["run"], t["id"])
-        if cards_now.get(key) == t["status"]:
-            continue
-        no = nos.get(key)
-        if not no:
-            continue
-        col, attention = _placed(t)
-        _upsert_card(home, project, t["run"], t["id"], t, t["status"], col, attention,
-                     t["round"], no, data_dir, updated=t["updated"])
-        n += 1
-    # C1/C3: the one rollup write. The compare-then-write reads happen outside a transaction
-    # (single writer: nothing else moves the root between them), and the write only opens
-    # one when a row is missing or differs, so the idempotent pass commits nothing. plan_summary
-    # compares on the five value columns only — `updated` is the writer's stamp, so including it
-    # would make every pass differ and break idempotence.
-    root = open_root(home)
-    try:
-        seen = root.execute("SELECT last_change_no FROM sync WHERE project=?", (project,)).fetchone()
-        have = root.execute(
-            "SELECT active_runs, by_status_json, attention, last_event, change_no"
-            " FROM project_summary WHERE project=?", (project,)).fetchone()
-        want_no = seen["last_change_no"] if seen else 0
-        want_plans = {p: (title, status, counts, live) for p, title, status, counts, live in plans}
-        have_plans = {r["plan"]: (r["title"], r["status"], r["counts_json"], r["live_run"]) for r in
-                      root.execute("SELECT plan, title, status, counts_json, live_run"
-                                   " FROM plan_summary WHERE project=?", (project,))}
-        if have is None or tuple(have) != (*summary, want_no) or have_plans != want_plans:
-            _begin(root)
-            try:
-                if have is None or tuple(have) != (*summary, want_no):
-                    _write_summary(root, project, summary, want_no)
-                _write_plan_summaries(root, project, plans)
-                root.execute("COMMIT")
-            except Exception:
-                root.execute("ROLLBACK")
-                raise
-    finally:
-        root.close()
-    return n
+    want = {p: (title, status, counts, live) for p, title, status, counts, live in plans}
+    if have == want:
+        return 0
+    _write_plan_summaries_root(home, project, plans)
+    return len(want)
 
 
 RUN_COLS = ("id", "plan", "plan_version", "branch", "status", "stage", "next", "started", "ended",
@@ -1171,7 +935,7 @@ def import_history(home, project, run, *, run_row=None, tasks=(), events=(), art
     One BEGIN IMMEDIATE transaction for the whole call; any error rolls it back, so the store is
     unchanged. Idempotent: events and artifacts carry a stable source key (meta_json.src, and the
     artifacts.src column) and a repeat imports nothing. Tasks and the run row upsert. No card
-    is written here — change_log rows are written so catch_up() can build the cards later.
+    is written here — L7.3 removed the root cards, so nothing reads change_log for a replay.
     C3: the plan_summary rows ARE refreshed after the commit, in their own root transaction,
     because an import moves task statuses (and a run row, which live_run reads); a store with
     no plans row writes nothing. Returns counts of rows actually added.
@@ -1558,25 +1322,6 @@ def _store_present(home, project, data_dir):
     return os.path.isfile(_store_path(home, project, data_dir))
 
 
-def cards(home, project=None):
-    """Read the root store's cards, optionally one project.
-
-    A missing root store is an empty card list: <home>/mk.db is not created.
-    """
-    check_home(home)
-    root = _open_read(os.path.join(home, "mk.db"), ROOT_SCHEMA)
-    if root is None:
-        return []
-    try:
-        if project:
-            rows = root.execute("SELECT * FROM cards WHERE project=? ORDER BY change_no", (project,))
-        else:
-            rows = root.execute("SELECT * FROM cards ORDER BY project, change_no")
-        return [dict(r) for r in rows]
-    finally:
-        root.close()
-
-
 def projects(home):
     """Read the root store's projects, ordered by slug.
 
@@ -1600,7 +1345,7 @@ def overview(home):
     """The root store's numbers and linkage (C3): every project with its db_path, every plan with
     its counts and live run. Nothing else — no card, no task, no event, no project store.
 
-    Read-only like cards()/projects(): mode=ro, never migrates, never writes. A missing root
+    Read-only like projects()/plans(): mode=ro, never migrates, never writes. A missing root
     store is an empty overview, not an error, and <home>/mk.db is not created. counts_json
     arrives as a parsed object ({} when NULL or unparsable), never as a JSON string.
     """
@@ -1829,7 +1574,7 @@ def _plan_obj(con, row, detail=False):
 def plans(home, project=None, data_dir=None, plan_id=None):
     """Read the project store's plans (C5, C8). Read-only: mode=ro, never migrates, never writes.
 
-    A missing store is an empty list, like timeline/cards. An unknown plan id is a Fail (exit 2),
+    A missing store is an empty list, like timeline(). An unknown plan id is a Fail (exit 2),
     the same error shape as the other subcommands.
     """
     path = os.path.join(project_dir(home, project, data_dir), "mk.db")
@@ -2032,8 +1777,6 @@ def _cli(argv):
     tl.add_argument("--run", required=True)
     tl.add_argument("--task", required=True)
     tl.add_argument("--json", action="store_true")
-    cd = sub.add_parser("cards")
-    cd.add_argument("--json", action="store_true")
     pj = sub.add_parser("projects")
     pj.add_argument("--json", action="store_true")
     ov = sub.add_parser("overview")
@@ -2063,8 +1806,6 @@ def _cli(argv):
         if not args.project:
             raise Fail("timeline needs --project")
         return {"ok": True, "events": timeline(home, args.project, args.run, args.task, args.data)}
-    if args.cmd == "cards":
-        return {"ok": True, "cards": cards(home, args.project)}
     if args.cmd == "projects":
         return {"ok": True, "projects": projects(home)}
     if args.cmd == "overview":  # the root store only: no --project, no --data, nothing opened
@@ -2098,7 +1839,7 @@ def _cli(argv):
                                 tasks=doc.get("tasks") or (), events=doc.get("events") or (),
                                 artifacts=doc.get("artifacts") or (), data_dir=args.data)
         return {"ok": True, **counts}
-    raise Fail("usage: mkdb.py timeline|cards|projects|overview|plans|run-snapshot|events"
+    raise Fail("usage: mkdb.py timeline|projects|overview|plans|run-snapshot|events"
                "|import-history --json  (or --self-test)")
 
 
@@ -2133,7 +1874,7 @@ def _flip_worker(home, data, slot, n):
         transition(home, "flip", "r", "shared", to, note=f"{slot}:{i}", sync_root=True, data_dir=data)
 
 
-def _worker(home, data, slot, n, bad, sync=False, project="probe"):
+def _worker(home, data, slot, n, bad, project="probe"):
     """One of 8 writer processes, each writing its own task row."""
     os.environ.pop("MKDB_FAIL_BEFORE_ROOT", None)
     os.environ.pop("MKDB_FAIL_IN_TXN", None)
@@ -2142,7 +1883,7 @@ def _worker(home, data, slot, n, bad, sync=False, project="probe"):
             if bad and i == n - 1:
                 os.environ["MKDB_FAIL_IN_TXN"] = "1"
             transition(home, project, "r", f"w{slot}", "building", note=str(i),
-                       sync_root=sync, data_dir=data)
+                       sync_root=False, data_dir=data)
     except Exception:
         if not bad:
             raise
@@ -2252,7 +1993,6 @@ def self_test():
         _guards(tmp, home)
         _migrations(home)
         _writers(home)
-        _sync_monotonic(home)
         _attention(home)
         _flip(home)
         _cycle_race(home)
@@ -2275,12 +2015,11 @@ def self_test():
         _plans_query(home)
         _plans_detail(home)
         _card_verdict(home)
-        _summary_transitions(home)
-        _summary_regress(home)
-        _summary_import(home)
-        _summary_kill(home)
         _summary_idempotent(home)
         _summary_two_projects(home)
+        _orphan_root_untouched(home)
+        _orphan_root_absent(home)
+        _cards_subcommand_gone(home)
         _reads_create_nothing(home)
         _projects_read(home)
         _run_snapshot(home)
@@ -2364,73 +2103,28 @@ def _guards(tmp, home):
     # the CLI takes the same route and must exit non-zero without creating the dir
     cli_bad = os.path.join(tmp, "Mobile Documents", "cli")
     rc = subprocess.call([sys.executable, os.path.abspath(__file__), "--data", cli_bad,
-                          "--home", home, "cards", "--json"],
+                          "--home", home, "projects", "--json"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     _check(rc != 0, f"CLI --data exited {rc}")
     _check(not os.path.exists(cli_bad), "CLI --data created a directory")
 
 
-def _sync_monotonic(home):
-    """Finding 1: a child rollup must not rewind sync.last_change_no or a card's change_no."""
-    data = os.path.join(home, "syncm")
+def _rows(home, data, run="r"):
+    """The task rows of one run as {id: row} — the project-store replacement for the old root
+    card read in the self-tests (L7.3). The card view is derived with column_of()."""
     con = open_project(home, data_dir=data)
     try:
-        add_task(con, "r", "phase", "phase")
-        add_task(con, "r", "t1", "task", parent="phase")
+        return {r["id"]: dict(r) for r in
+                con.execute("SELECT id, status, prev_status FROM tasks WHERE run=?", (run,))}
     finally:
         con.close()
-    transition(home, "syncm", "r", "t1", "done", sync_root=True, data_dir=data)
-    root = open_root(home)
-    try:
-        last = root.execute("SELECT last_change_no FROM sync WHERE project='syncm'").fetchone()[0]
-        _check(last == 2, f"sync.last_change_no rewound to {last}")
-        nums = {r["task"]: r["change_no"] for r in root.execute(
-            "SELECT task, change_no FROM cards WHERE project='syncm'")}
-        _check(nums.get("t1") == 1 and nums.get("phase") == 2, f"card change_no {nums}")
-    finally:
-        root.close()
-    # a later upsert carrying a lower change_no must not lower the watermark or the card
-    con = open_project(home, data_dir=data)
-    try:
-        row = con.execute("SELECT parent, type, title, route_json, lane FROM tasks WHERE id='t1'").fetchone()
-    finally:
-        con.close()
-    _upsert_card(home, "syncm", "r", "t1", row, "done", "Done", 0, 0, 1, data)
-    root = open_root(home)
-    try:
-        last = root.execute("SELECT last_change_no FROM sync WHERE project='syncm'").fetchone()[0]
-        card = root.execute("SELECT change_no FROM cards WHERE project='syncm' AND task='t1'").fetchone()[0]
-        _check(last == 2 and card == 1, f"lower change_no moved sync={last} card={card}")
-    finally:
-        root.close()
-    # 8 concurrent sync_root writers: the watermark equals MAX(change_log.change_no)
-    wdata = os.path.join(home, "syncw")
-    con = open_project(home, data_dir=wdata)
-    try:
-        for i in range(8):
-            add_task(con, "r", f"w{i}", "task")
-    finally:
-        con.close()
-    procs = []
-    for i in range(8):
-        proc = multiprocessing.get_context("fork").Process(
-            target=_worker, args=(home, wdata, i, 5, False, True, "syncw"))
-        proc.start()
-        procs.append(proc)
-    for proc in procs:
-        proc.join(60)
-        _check(proc.exitcode == 0, f"sync writer exit {proc.exitcode}")
-    con = open_project(home, data_dir=wdata)
-    try:
-        top = con.execute("SELECT MAX(change_no) c FROM change_log").fetchone()["c"]
-    finally:
-        con.close()
-    root = open_root(home)
-    try:
-        last = root.execute("SELECT last_change_no FROM sync WHERE project='syncw'").fetchone()[0]
-        _check(last == top, f"sync.last_change_no {last} != MAX(change_log) {top}")
-    finally:
-        root.close()
+
+
+def _view(rows, tid):
+    """The kanban column and attention flag a task shows, from its stored row."""
+    r = rows[tid]
+    col, attention = column_of(r["status"], r["prev_status"])
+    return {"status": r["status"], "col": col, "attention": attention}
 
 
 def _attention(home):
@@ -2445,7 +2139,7 @@ def _attention(home):
         con.close()
     transition(home, "attn", "r", "t", "building", sync_root=True, data_dir=data)
     transition(home, "attn", "r", "t", "blocked", sync_root=True, data_dir=data)
-    got = {c["task"]: c for c in cards(home, "attn")}
+    got = {t: _view(_rows(home, data), t) for t in ("t", "phase")}
     _check(got["t"]["col"] == "Building" and got["t"]["attention"] == 1, f"blocked card {got.get('t')}")
     _check(got["phase"]["status"] == "blocked" and got["phase"]["col"] == "Building"
            and got["phase"]["attention"] == 1, f"parent unflagged: {got.get('phase')}")
@@ -2464,12 +2158,12 @@ def _attention(home):
     finally:
         con.close()
     transition(home, "attn", "r", "t", "building", sync_root=True, data_dir=data)
-    got = {c["task"]: c for c in cards(home, "attn")}
+    got = {t: _view(_rows(home, data), t) for t in ("t", "phase")}
     _check(got["t"]["col"] == "Building" and got["t"]["attention"] == 0, f"attention stuck {got.get('t')}")
     _check(got["phase"]["status"] == "building" and got["phase"]["attention"] == 0,
            f"phase did not return: {got.get('phase')}")
     transition(home, "attn", "r", "fresh", "blocked", sync_root=True, data_dir=data)
-    fresh = {c["task"]: c for c in cards(home, "attn")}["fresh"]
+    fresh = _view(_rows(home, data), "fresh")
     _check(fresh["col"] == "Backlog" and fresh["attention"] == 1, f"no-history attention {fresh}")
     _check(column_of("blocked") == ("Backlog", 1), "column_of(blocked) without prev")
     _check(column_of("blocked", "building") == ("Building", 1), "column_of keeps prev column")
@@ -2481,11 +2175,11 @@ def _attention(home):
         con.close()
     transition(home, "attn", "r", "t", "blocked", sync_root=True, data_dir=data)
     transition(home, "attn", "r", "t2", "building", sync_root=True, data_dir=data)
-    got = {c["task"]: c for c in cards(home, "attn")}
+    got = {t: _view(_rows(home, data), t) for t in ("phase",)}
     _check(got["phase"]["status"] == "blocked" and got["phase"]["attention"] == 1,
            f"sibling cleared the flag: {got.get('phase')}")
     transition(home, "attn", "r", "t", "building", sync_root=True, data_dir=data)
-    got = {c["task"]: c for c in cards(home, "attn")}
+    got = {t: _view(_rows(home, data), t) for t in ("phase",)}
     _check(got["phase"]["status"] == "building" and got["phase"]["attention"] == 0,
            f"flag stuck after both clear: {got.get('phase')}")
     # three levels: subtask -> task -> phase
@@ -2496,36 +2190,16 @@ def _attention(home):
         con.close()
     transition(home, "attn", "r", "sub", "building", sync_root=True, data_dir=data)
     transition(home, "attn", "r", "sub", "blocked", sync_root=True, data_dir=data)
-    got = {c["task"]: c for c in cards(home, "attn")}
+    got = {t: _view(_rows(home, data), t) for t in ("t", "phase")}
     _check(got["t"]["status"] == "blocked" and got["t"]["attention"] == 1, f"task not flagged {got.get('t')}")
     _check(got["phase"]["status"] == "blocked" and got["phase"]["col"] == "Building"
            and got["phase"]["attention"] == 1, f"phase not flagged {got.get('phase')}")
-    # catch_up replays the attention column onto a fresh root, and leaves a plain task unchanged
-    root = open_root(home)
-    try:
-        root.execute("DELETE FROM cards WHERE project='attn'")
-        root.execute("DELETE FROM sync WHERE project='attn'")
-        root.commit()
-    finally:
-        root.close()
-    caught = catch_up(home, "attn", data)
-    _check(caught > 0, "catch_up replayed nothing")
-    got = {c["task"]: c for c in cards(home, "attn")}
-    _check(got["sub"]["col"] == "Building" and got["sub"]["attention"] == 1, f"replayed sub {got.get('sub')}")
-    _check(got["phase"]["col"] == "Building" and got["phase"]["attention"] == 1,
-           f"replayed phase {got.get('phase')}")
-    plain = dict(got["t2"])
-    root = open_root(home)
-    try:
-        root.execute("DELETE FROM cards WHERE project='attn' AND task='t2'")
-        root.execute("UPDATE sync SET last_change_no=0 WHERE project='attn'")
-        root.commit()
-    finally:
-        root.close()
-    catch_up(home, "attn", data)
-    again = {c["task"]: c for c in cards(home, "attn")}["t2"]
-    _check(again["status"] == plain["status"] and again["col"] == plain["col"]
-           and again["attention"] == plain["attention"], f"plain card changed {plain} -> {again}")
+    # L7.3: the flag is a stored fact, so a reload re-derives it — no root copy to replay.
+    again = {t: _view(_rows(home, data), t) for t in ("sub", "t2")}
+    _check(again["sub"]["col"] == "Building" and again["sub"]["attention"] == 1,
+           f"reloaded sub {again.get('sub')}")
+    plain = again["t2"]
+    _check(plain["status"] == "building" and plain["attention"] == 0, f"plain task changed {plain}")
 
 
 def _flip(home):
@@ -2551,13 +2225,13 @@ def _flip(home):
         nums = [r[0] for r in con.execute("SELECT change_no FROM change_log ORDER BY change_no")]
     finally:
         con.close()
-    card = {c["task"]: c for c in cards(home, "flip")}["shared"]
+    col, attention = column_of(row["status"], row["prev_status"])
     _check(row["prev_status"] == "building", f"prev_status lost: {dict(row)}")
-    _check(card["col"] == "Building", f"column fell to {card['col']} for a task that was building")
+    _check(col == "Building", f"column fell to {col} for a task that was building")
     if row["status"] == "blocked":
-        _check(card["attention"] == 1, "blocked without attention")
+        _check(attention == 1, "blocked without attention")
     else:
-        _check(row["status"] == "building" and card["attention"] == 0, f"status {row['status']}")
+        _check(row["status"] == "building" and attention == 0, f"status {row['status']}")
     _check(nums == list(range(1, len(nums) + 1)), "change_no not gap-free")
 
 
@@ -2728,54 +2402,65 @@ def _reads(home):
     transition(home, "reads", "r", "t", "done", note="two", data_dir=data)
     ids = [e["id"] for e in timeline(home, "reads", "r", "t", data)]
     _check(ids == sorted(ids) and len(ids) == 2, f"timeline {ids}")
-    _check(cards(home, "reads") == [], "cards must be empty when sync_root is off")
+    # L7.3: a synced write leaves the root card tables untouched — they never gain a row.
     transition(home, "reads", "r", "t", "done", note="synced", sync_root=True, data_dir=data)
-    got = cards(home, "reads")
-    _check(len(got) == 1 and got[0]["change_no"] == 3, f"cards {got}")
+    root = open_root(home)
+    try:
+        for table in ("cards", "project_summary", "sync"):
+            n = root.execute(f"SELECT COUNT(*) c FROM {table}").fetchone()["c"]
+            _check(n == 0, f"{table} gained a row: {n}")
+    finally:
+        root.close()
 
 
 def _crashes(home):
-    data = os.path.join(home, "crash")
-    con = open_project(home, data_dir=data)
-    try:
-        add_task(con, "r", "t", "task")
-    finally:
-        con.close()
+    """Injected failures: a root-write failure leaves the project change durable, an in-project
+    failure leaves nothing. L7.3: the pre-root hook now guards the plan_summary write, so the
+    store needs a plans row for it to fire."""
+    data = _seed_plan_summary_store(home, "crash")
+    _add_plan_summary_tasks(data)
     os.environ["MKDB_FAIL_BEFORE_ROOT"] = "1"
     try:
         try:
-            transition(home, "crash", "r", "t", "building", sync_root=True, data_dir=data)
+            transition(home, "crash", "r-alpha", "ALPHA1", "building", sync_root=True, data_dir=data)
         except Fail:
             pass
         else:
             raise SystemExit("SELF-TEST FAIL: the injected root failure did not fire")
         con = open_project(home, data_dir=data)
         try:
-            _check(con.execute("SELECT status FROM tasks WHERE id='t'").fetchone()["status"] == "building",
-                   "project change lost")
+            _check(con.execute("SELECT status FROM tasks WHERE id='ALPHA1'").fetchone()["status"]
+                   == "building", "project change lost")
         finally:
             con.close()
-        _check(cards(home, "crash") == [], "root card written despite the failure")
         os.environ.pop("MKDB_FAIL_BEFORE_ROOT", None)
-        caught = catch_up(home, "crash", data)
-        _check(caught == 1 and len(cards(home, "crash")) == 1, "catch-up did not repair the card")
         os.environ["MKDB_FAIL_IN_TXN"] = "1"
+        before = _counts_log(data)
         try:
-            transition(home, "crash", "r", "t", "done", data_dir=data)
+            transition(home, "crash", "r-alpha", "ALPHA1", "done", sync_root=True, data_dir=data)
         except Fail:
             pass
         else:
             raise SystemExit("SELF-TEST FAIL: the injected txn failure did not fire")
         con = open_project(home, data_dir=data)
         try:
-            _check(con.execute("SELECT status FROM tasks WHERE id='t'").fetchone()["status"] == "building",
-                   "a failed transaction left a change")
-            _check(con.execute("SELECT COUNT(*) c FROM change_log").fetchone()["c"] == 1, "change_log grew")
+            _check(con.execute("SELECT status FROM tasks WHERE id='ALPHA1'").fetchone()["status"]
+                   == "building", "a failed transaction left a change")
         finally:
             con.close()
+        _check(_counts_log(data) == before, "change_log grew")
     finally:
         os.environ.pop("MKDB_FAIL_BEFORE_ROOT", None)
         os.environ.pop("MKDB_FAIL_IN_TXN", None)
+
+
+def _counts_log(data):
+    """The change_log row count of one store — a small crash-test probe."""
+    con = open_project(os.path.dirname(data), data_dir=data)
+    try:
+        return con.execute("SELECT COUNT(*) c FROM change_log").fetchone()["c"]
+    finally:
+        con.close()
 
 
 
@@ -2854,7 +2539,6 @@ def _import(home):
         n_events = con.execute("SELECT COUNT(*) c FROM events").fetchone()["c"]
     finally:
         con.close()
-    _check(cards(home, "imp") == [], "import wrote the root store")
     again = import_history(home, "imp", "hist", run_row=run_row, tasks=tasks, events=events,
                            artifacts=artifacts, data_dir=data)
     _check(again == {"runs": 0, "tasks": 0, "events": 0, "artifacts": 0}, f"second import {again}")
@@ -3628,7 +3312,7 @@ def _live_writers(home):
 
 
 def _card_verdict(home):
-    """A transition that changes the verdict updates the root card; catch_up copies it too."""
+    """A transition that changes the verdict stores it on the task row (the root card is gone)."""
     data = os.path.join(home, "verdict")
     con = open_project(home, data_dir=data)
     try:
@@ -3638,295 +3322,255 @@ def _card_verdict(home):
     finally:
         con.close()
     transition(home, "verdict", "r", "t", "review", round=1, sync_root=True, data_dir=data)
-    got = cards(home, "verdict")
-    _check(len(got) == 1 and got[0]["verdict"] == "APPROVE", f"import-style verdict {got}")
-    transition(home, "verdict", "r", "t", "done", round=2, verdict="REQUEST CHANGES",
-               sync_root=True, data_dir=data)
-    got = cards(home, "verdict")
-    _check(len(got) == 1 and got[0]["verdict"] == "REQUEST CHANGES" and got[0]["status"] == "done",
-           f"transition verdict {got}")
     con = open_project(home, data_dir=data)
     try:
-        stored = con.execute("SELECT verdict FROM tasks WHERE id='t'").fetchone()["verdict"]
-        _check(stored == "REQUEST CHANGES", stored)
-        root = open_root(home)
-        try:
-            root.execute("UPDATE cards SET verdict=NULL WHERE project='verdict' AND task='t'")
-            root.execute("UPDATE sync SET last_change_no=0 WHERE project='verdict'")
-            root.commit()
-        finally:
-            root.close()
+        row = con.execute("SELECT verdict, status FROM tasks WHERE id='t'").fetchone()
+        _check(row["verdict"] == "APPROVE", f"import-style verdict {dict(row)}")
     finally:
         con.close()
-    caught = catch_up(home, "verdict", data)
-    got = cards(home, "verdict")
-    _check(caught >= 1 and got[0]["verdict"] == "REQUEST CHANGES", f"catch_up verdict {got} n={caught}")
+    transition(home, "verdict", "r", "t", "done", round=2, verdict="REQUEST CHANGES",
+               sync_root=True, data_dir=data)
+    con = open_project(home, data_dir=data)
+    try:
+        row = con.execute("SELECT verdict, status FROM tasks WHERE id='t'").fetchone()
+        _check(row["verdict"] == "REQUEST CHANGES" and row["status"] == "done",
+               f"transition verdict {dict(row)}")
+    finally:
+        con.close()
 
 
 # --- S1 summary self-tests: extract this whole region for the old-code probe ---
-def _summary_row(root, project):
-    """The stored project_summary row as a plain tuple, or None while the writer is absent."""
-    r = root.execute(
-        "SELECT active_runs, by_status_json, attention, last_event, change_no"
-        " FROM project_summary WHERE project=?", (project,)).fetchone()
-    return tuple(r) if r else None
-
-
-def _summary_recount(home, data_dir):
-    """Independent recount of the summary contract, computed here with fresh SQL (C1).
-
-    active_runs = runs with status IN ('running','active'); by_status_json = json.dumps of
-    {status: count} over every task, sort_keys=True; attention = tasks in blocked/stalled/
-    quota/provider; last_event = MAX(t) over events, NULL with no events. No writer helper
-    is reused: the recount must not inherit the bug it polices.
-    """
-    con = open_project(home, data_dir=data_dir)
-    try:
-        counts = {r["status"]: r["c"] for r in
-                  con.execute("SELECT status, COUNT(*) c FROM tasks GROUP BY status")}
-        active = con.execute(
-            "SELECT COUNT(*) c FROM runs WHERE status IN ('running','active')").fetchone()["c"]
-        last = con.execute("SELECT MAX(t) FROM events").fetchone()[0]
-    finally:
-        con.close()
-    return (active, json.dumps(counts, sort_keys=True),
-            sum(n for s, n in counts.items() if s in ATTENTION), last)
-
-
-def _summary_import_sample():
-    """One small historical run: a done task, an attention task, two past-timestamped events."""
-    run_row = {"id": "hist", "plan": "p", "plan_version": 1, "branch": "b", "status": "done",
-               "stage": None, "next": None, "started": "2021-01-01T00:00:00+00:00",
-               "ended": "2021-01-02T00:00:00+00:00"}
-    tasks = [
-        {"id": "a", "type": "task", "title": "a", "status": "done",
-         "updated": "2021-01-01T01:00:00+00:00"},
-        {"id": "b", "type": "task", "title": "b", "status": "quota",
-         "updated": "2021-01-01T02:00:00+00:00"},
-    ]
-    events = [
-        {"src": "s1", "task": "a", "t": "2021-01-01T00:00:01+00:00", "chan": "state",
-         "kind": "transition", "text": "started"},
-        {"src": "s2", "task": "b", "t": "2021-01-01T00:00:09+00:00", "chan": "bus",
-         "kind": "note", "text": "hit the quota"},
-    ]
-    return run_row, tasks, events
-
-
-def _summary_transitions(home):
-    """Transitions across two seeded runs: the row equals an independent recount (C1).
-
-    One run is 'active', one 'done', so active_runs must count only the first; the blocked
-    task must raise attention; change_no must equal the sync watermark — the last change
-    the root has seen for the project.
-    """
-    data = os.path.join(home, "sumtr")
-    con = open_project(home, data_dir=data)
-    try:
-        _begin(con)
-        con.execute("INSERT INTO runs(id, status) VALUES ('r1', 'active')")
-        con.execute("INSERT INTO runs(id, status) VALUES ('r2', 'done')")
-        con.execute("COMMIT")
-        add_task(con, "r1", "t1", "task")
-        add_task(con, "r1", "t2", "task")
-        add_task(con, "r2", "t3", "task")
-        add_task(con, "r2", "t4", "task")
-    finally:
-        con.close()
-    transition(home, "sumtr", "r1", "t1", "building", sync_root=True, data_dir=data)
-    transition(home, "sumtr", "r1", "t2", "blocked", sync_root=True, data_dir=data)
-    transition(home, "sumtr", "r2", "t3", "done", sync_root=True, data_dir=data)
-    transition(home, "sumtr", "r2", "t4", "review", sync_root=True, data_dir=data)
+def _plan_summary_snapshot(home, project):
+    """Every plan_summary row of one project as {plan: (title, status, counts_json, live_run)}."""
     root = open_root(home)
     try:
-        row = _summary_row(root, "sumtr")
-        _check(row is not None, "_summary_transitions: no project_summary row for 'sumtr'")
-        expect = _summary_recount(home, data)
-        _check(row[:4] == expect, f"_summary_transitions: row {row[:4]} != recount {expect}")
-        last = root.execute("SELECT last_change_no FROM sync WHERE project='sumtr'").fetchone()
-        _check(last and row[4] == last[0],
-               f"_summary_transitions: change_no {row[4]} != watermark {last[0] if last else None}")
+        return {r["plan"]: (r["title"], r["status"], r["counts_json"], r["live_run"]) for r in
+                root.execute("SELECT plan, title, status, counts_json, live_run"
+                             " FROM plan_summary WHERE project=?", (project,))}
     finally:
         root.close()
-
-
-def _summary_regress(home):
-    """done -> fix rewrites the summary: by_status_json differs and matches the recount again."""
-    data = os.path.join(home, "sumre")
-    con = open_project(home, data_dir=data)
-    try:
-        add_task(con, "r", "tmain", "task")
-        add_task(con, "r", "tdep", "task", deps="tmain")
-    finally:
-        con.close()
-    transition(home, "sumre", "r", "tmain", "done", sync_root=True, data_dir=data)
-    root = open_root(home)
-    try:
-        row = _summary_row(root, "sumre")
-        _check(row is not None, "_summary_regress: no project_summary row for 'sumre'")
-        old_json, old_no = row[1], row[4]
-    finally:
-        root.close()
-    transition(home, "sumre", "r", "tmain", "fix", sync_root=True, data_dir=data)
-    root = open_root(home)
-    try:
-        row = _summary_row(root, "sumre")
-        expect = _summary_recount(home, data)
-        _check(row[:4] == expect, f"_summary_regress: row {row[:4]} != recount {expect}")
-        _check(row[1] != old_json, "_summary_regress: done->fix left by_status_json unchanged")
-        last = root.execute("SELECT last_change_no FROM sync WHERE project='sumre'").fetchone()
-        _check(last and row[4] == last[0] and row[4] >= old_no,
-               f"_summary_regress: change_no {row[4]} vs watermark {last[0] if last else None},"
-               f" previously {old_no}")
-    finally:
-        root.close()
-
-
-def _summary_import(home):
-    """An imported run: catch_up builds the summary; last_event is the newest imported t."""
-    data = os.path.join(home, "sumim")
-    run_row, tasks, events = _summary_import_sample()
-    import_history(home, "sumim", "hist", run_row=run_row, tasks=tasks, events=events, data_dir=data)
-    caught = catch_up(home, "sumim", data_dir=data)
-    _check(caught >= 1, f"_summary_import: catch_up replayed nothing (n={caught})")
-    root = open_root(home)
-    try:
-        row = _summary_row(root, "sumim")
-        _check(row is not None, "_summary_import: no project_summary row for 'sumim'")
-        expect = _summary_recount(home, data)
-        _check(row[:4] == expect, f"_summary_import: row {row[:4]} != recount {expect}")
-        newest = max(e["t"] for e in events)
-        _check(row[3] == newest, f"_summary_import: last_event {row[3]} != max imported t {newest}")
-    finally:
-        root.close()
-
-
-def _summary_kill(home):
-    """A kill between the two writes: the project moved, the root got neither card nor
-    summary; catch_up heals both and the healed row equals the recount."""
-    data = os.path.join(home, "sumki")
-    con = open_project(home, data_dir=data)
-    try:
-        add_task(con, "r", "t", "task")
-    finally:
-        con.close()
-    os.environ["MKDB_FAIL_BEFORE_ROOT"] = "1"
-    try:
-        try:
-            transition(home, "sumki", "r", "t", "building", sync_root=True, data_dir=data)
-        except Fail:
-            pass
-        else:
-            raise SystemExit("SELF-TEST FAIL: _summary_kill: the injected root failure did not fire")
-        con = open_project(home, data_dir=data)
-        try:
-            _check(con.execute("SELECT status FROM tasks WHERE id='t'").fetchone()["status"]
-                   == "building", "_summary_kill: project change lost")
-        finally:
-            con.close()
-        root = open_root(home)
-        try:
-            _check(cards(home, "sumki") == [], "_summary_kill: root card written despite the failure")
-            _check(_summary_row(root, "sumki") is None,
-                   "_summary_kill: summary written despite the failure")
-        finally:
-            root.close()
-        os.environ.pop("MKDB_FAIL_BEFORE_ROOT", None)
-        caught = catch_up(home, "sumki", data_dir=data)
-        _check(caught >= 1 and len(cards(home, "sumki")) == 1,
-               f"_summary_kill: catch_up did not heal the card (n={caught})")
-        root = open_root(home)
-        try:
-            row = _summary_row(root, "sumki")
-            _check(row is not None, "_summary_kill: no project_summary row after catch_up")
-            expect = _summary_recount(home, data)
-            _check(row[:4] == expect, f"_summary_kill: row {row[:4]} != recount {expect}")
-        finally:
-            root.close()
-    finally:
-        os.environ.pop("MKDB_FAIL_BEFORE_ROOT", None)
 
 
 def _summary_idempotent(home):
-    """A second catch_up over an already-synced store writes nothing.
+    """A second catch_up over an already-synced store writes nothing (C3 plan_summary heal).
 
     One root connection stays open across both calls: PRAGMA data_version on it moves only
-    when another connection commits to the file, so it doubles the row/watermark/cards
-    checks. If data_version ever proves unusable here, those three checks below are the
-    idempotence contract on their own.
+    when another connection commits to the file, so it doubles the row checks. If data_version
+    ever proves unusable here, the row checks below are the idempotence contract on their own.
     """
-    data = os.path.join(home, "sumid")
-    con = open_project(home, data_dir=data)
+    data = _seed_plan_summary_store(home, "psid")
+    _add_plan_summary_tasks(data)
+    # a root write that fails leaves plan_summary stale (the project change is durable), so the
+    # first catch_up has real work to do; catch_up only heals, it never runs on the happy path.
+    os.environ["MKDB_FAIL_BEFORE_ROOT"] = "1"
     try:
-        add_task(con, "r", "t1", "task")
-        add_task(con, "r", "t2", "task")
+        try:
+            transition(home, "psi", "r-alpha", "ALPHA1", "building", sync_root=False, data_dir=data)
+        except Fail:
+            pass
+        else:
+            raise SystemExit("SELF-TEST FAIL: _summary_idempotent: the injected failure did not fire")
     finally:
-        con.close()
-    transition(home, "sumid", "r", "t1", "building", sync_root=True, data_dir=data)
-    transition(home, "sumid", "r", "t2", "done", sync_root=True, data_dir=data)
-    # one change the root has not seen, so the first catch_up has real work to do
-    transition(home, "sumid", "r", "t1", "review", sync_root=False, data_dir=data)
-    caught = catch_up(home, "sumid", data_dir=data)
-    _check(caught >= 1, f"_summary_idempotent: first catch_up replayed nothing (n={caught})")
+        os.environ.pop("MKDB_FAIL_BEFORE_ROOT", None)
+    _check(not _plan_summary_snapshot(home, "psi"), "_summary_idempotent: root not left stale")
+    caught = catch_up(home, "psi", data_dir=data)
+    _check(caught >= 1, f"_summary_idempotent: first catch_up wrote nothing (n={caught})")
     root = open_root(home)
     try:
-        row = _summary_row(root, "sumid")
-        _check(row is not None, "_summary_idempotent: no project_summary row for 'sumid'")
         dv = root.execute("PRAGMA data_version").fetchone()[0]
-        before = [tuple(c) for c in root.execute(
-            "SELECT run, task, status, change_no FROM cards WHERE project='sumid'"
-            " ORDER BY run, task")]
-        wm = root.execute("SELECT last_change_no FROM sync WHERE project='sumid'").fetchone()[0]
-        again = catch_up(home, "sumid", data_dir=data)
-        _check(again == 0, f"_summary_idempotent: second catch_up replayed {again}")
+        before = _plan_summary_snapshot(home, "psi")
+        _check(before, "_summary_idempotent: no plan_summary rows after catch_up")
+        again = catch_up(home, "psi", data_dir=data)
+        _check(again == 0, f"_summary_idempotent: second catch_up wrote {again}")
         dv2 = root.execute("PRAGMA data_version").fetchone()[0]
-        row2 = _summary_row(root, "sumid")
-        after = [tuple(c) for c in root.execute(
-            "SELECT run, task, status, change_no FROM cards WHERE project='sumid'"
-            " ORDER BY run, task")]
-        wm2 = root.execute("SELECT last_change_no FROM sync WHERE project='sumid'").fetchone()[0]
+        after = _plan_summary_snapshot(home, "psi")
         _check(dv == dv2, f"_summary_idempotent: data_version moved {dv} -> {dv2}")
-        _check(row == row2, f"_summary_idempotent: row changed {row} -> {row2}")
-        _check(before == after, "_summary_idempotent: cards changed")
-        _check(wm == wm2, f"_summary_idempotent: watermark moved {wm} -> {wm2}")
+        _check(before == after, f"_summary_idempotent: rows changed {before} -> {after}")
     finally:
         root.close()
 
 
 def _summary_two_projects(home):
-    """Two data-dir projects under one root: each row matches its own recount, and the
-    rows differ — no project's summary leaks into the other's."""
-    p1, p2 = os.path.join(home, "p1data"), os.path.join(home, "p2data")
-    con = open_project(home, data_dir=p1)
-    try:
-        add_task(con, "r", "a1", "task")
-        add_task(con, "r", "a2", "task")
-    finally:
-        con.close()
-    con = open_project(home, data_dir=p2)
-    try:
-        add_task(con, "r", "b1", "task")
-        add_task(con, "r", "b2", "task")
-        add_task(con, "r", "b3", "task")
-    finally:
-        con.close()
-    transition(home, "sump1", "r", "a1", "building", sync_root=True, data_dir=p1)
-    transition(home, "sump1", "r", "a2", "blocked", sync_root=True, data_dir=p1)
-    transition(home, "sump2", "r", "b1", "done", sync_root=True, data_dir=p2)
-    transition(home, "sump2", "r", "b2", "review", sync_root=True, data_dir=p2)
-    transition(home, "sump2", "r", "b3", "stalled", sync_root=True, data_dir=p2)
+    """Two projects under one root: each project's plan_summary matches its own store, and the
+    rows differ — no project's plan numbers leak into the other's."""
+    d1 = _seed_plan_summary_store(home, "psp1")
+    _add_plan_summary_tasks(d1)
+    transition(home, "psp1", "r-alpha", "ALPHA1", "building", sync_root=True, data_dir=d1)
+    d2 = _seed_plan_summary_store(home, "psp2")
+    _add_plan_summary_tasks(d2)
+    transition(home, "psp2", "r-alpha", "ALPHA1", "done", sync_root=True, data_dir=d2)
+    transition(home, "psp2", "r-beta", "BETA1", "stalled", sync_root=True, data_dir=d2)
+    r1, r2 = _plan_summary_snapshot(home, "psp1"), _plan_summary_snapshot(home, "psp2")
+    _check(r1 and r2, f"_summary_two_projects: missing rows {r1} / {r2}")
+    for plan in ("alpha", "beta"):
+        got1 = json.loads(r1[plan][2])
+        _check(got1 == _plan_recount(home, d1, plan),
+               f"_summary_two_projects: psp1 {plan} counts {got1} != store")
+        got2 = json.loads(r2[plan][2])
+        _check(got2 == _plan_recount(home, d2, plan),
+               f"_summary_two_projects: psp2 {plan} counts {got2} != store")
+    _check(r1["alpha"] != r2["alpha"], "_summary_two_projects: the two projects share one row")
+# --- end S1 summary self-tests ---
+
+
+# --- L7.3 orphan-root self-tests: extract this whole region for the old-code probe ---
+# C3 (L7.3): cards, project_summary and sync are the pre-linkage copies of the project store.
+# After the drop nothing in mkdb reads or writes them; a status write leaves them exactly as
+# they were, and a root that never had them still serves every path that stays.
+ROOT_ORPHAN_TABLES = ("cards", "project_summary", "sync")
+
+
+def _root_orphan_dump(home):
+    """Every row of the three orphan tables as one canonical text block.
+
+    Rows are read in rowid order and rendered with sort_keys, so a rewritten value, an inserted
+    row or a moved row shows up as a difference. `updated` is the writer's own stamp, so a table
+    nothing writes renders byte-identically.
+    """
     root = open_root(home)
     try:
-        r1, r2 = _summary_row(root, "sump1"), _summary_row(root, "sump2")
-        _check(r1 is not None, "_summary_two_projects: no project_summary row for 'sump1'")
-        _check(r2 is not None, "_summary_two_projects: no project_summary row for 'sump2'")
-        e1, e2 = _summary_recount(home, p1), _summary_recount(home, p2)
-        _check(r1[:4] == e1, f"_summary_two_projects: sump1 row {r1[:4]} != recount {e1}")
-        _check(r2[:4] == e2, f"_summary_two_projects: sump2 row {r2[:4]} != recount {e2}")
-        _check(r1 != r2, "_summary_two_projects: the two projects share one summary row")
+        out = []
+        for table in ROOT_ORPHAN_TABLES:
+            rows = [list(r) for r in root.execute(f"SELECT * FROM {table} ORDER BY rowid")]
+            out.append(table + "=" + json.dumps(rows, sort_keys=True))
+        return "\n".join(out)
     finally:
         root.close()
-# --- end S1 summary self-tests ---
+
+
+def _copy_store(src_dir, dst_dir):
+    """Copy a root store byte for byte into dst_dir.
+
+    mk.db and a non-empty -wal travel; -shm is left behind, because SQLite rebuilds it from the
+    WAL on the next open (a stale copy of it would be the one way to read a wrong state).
+    """
+    for name in ("mk.db", "mk.db-wal"):
+        src = os.path.join(src_dir, name)
+        if not os.path.exists(src) or not os.path.getsize(src):
+            continue
+        os.makedirs(dst_dir, exist_ok=True)
+        with open(src, "rb") as fh:
+            blob = fh.read()
+        with open(os.path.join(dst_dir, name), "wb") as fh:
+            fh.write(blob)
+
+
+def _seed_orphan_root(home, name):
+    """A root shaped like a live one: a projects row and a row in each orphan table.
+
+    The rows go in as direct SQL — the pre-linkage writers are exactly what L7.3 removes, so the
+    fixture cannot borrow them. sync carries a LOW watermark and the card belongs to another
+    project, so a writer that still touches these tables has to move them.
+    """
+    live = os.path.join(home, name)
+    root = open_root(live)
+    try:
+        root.execute("INSERT INTO projects(slug, name, repo, data_dir, mode, created,"
+                     " last_activity, db_path) VALUES (?,?,?,?,?,?,?,?)",
+                     ("legacy", "Legacy", "/r/legacy", "/d/legacy", "local", "t1", "t2", None))
+        root.execute("INSERT INTO cards(project, run, task, parent, type, title, status, col,"
+                     " attention, updated, change_no) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                     ("legacy", "r", "t", None, "task", "Kept", "done", "Done", 0, "t3", 7))
+        root.execute("INSERT INTO sync(project, last_change_no) VALUES ('legacy', 7)")
+        root.execute("INSERT INTO project_summary(project, active_runs, by_status_json, attention,"
+                     " last_event, change_no) VALUES (?,?,?,?,?,?)",
+                     ("legacy", 1, json.dumps({"done": 1}), 0, "t3", 7))
+        root.commit()
+        root.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        root.close()
+    return live
+
+
+def _orphan_root_untouched(home):
+    """L7.3 (C3): a status write leaves cards/project_summary/sync alone.
+
+    Fresh root: the three tables keep 0 rows through transition(sync_root=True) — their only
+    writer is gone, and plan_summary, the rollup that stays, moves instead. A root that already
+    holds rows, copied into a temp home exactly as a live root would be, keeps them
+    byte-identical. Both halves FAIL on the pre-L7.3 code, which writes a card, a summary and a
+    watermark on every sync_root move.
+    """
+    data = _seed_plan_summary_store(home, "oruntu")
+    _add_plan_summary_tasks(data)
+
+    fresh = os.path.join(home, "oruntu-fresh")
+    open_root(fresh).close()
+    transition(fresh, "oruntu", "r-alpha", "ALPHA1", "building", sync_root=True, data_dir=data)
+    root = open_root(fresh)
+    try:
+        counts = {t: root.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"]
+                  for t in ROOT_ORPHAN_TABLES}
+        _check(all(n == 0 for n in counts.values()),
+               f"_orphan_root_untouched: a fresh root gained rows in the dropped tables: {counts}")
+        _check(root.execute("SELECT COUNT(*) c FROM plan_summary").fetchone()["c"] >= 1,
+               "_orphan_root_untouched: the transition did not update plan_summary")
+    finally:
+        root.close()
+
+    live = _seed_orphan_root(home, "oruntu-live")
+    copy = os.path.join(home, "oruntu-copy")
+    _copy_store(live, copy)
+    before = _root_orphan_dump(copy)
+    transition(copy, "oruntu", "r-alpha", "ALPHA2", "building", sync_root=True, data_dir=data)
+    after = _root_orphan_dump(copy)
+    _check(after == before,
+           "_orphan_root_untouched: a status write moved the copied root's dropped tables\n"
+           f"  before: {before}\n  after:  {after}")
+
+
+def _orphan_root_absent(home):
+    """L7.3 (C3): a root with NO cards/project_summary/sync still serves transition, overview
+    and plans.
+
+    The three tables are dropped on a temp root — the shape a root built after the drop has, or
+    one whose pre-linkage copies are already gone. None of these paths may read, need or recreate
+    them. The transition runs with the default sync_root=False, since the card path is exactly
+    what the drop removes; plans() and overview() must answer from plan_summary alone.
+    """
+    sub = os.path.join(home, "orunta-root")
+    data = _seed_plan_summary_store(home, "orunta")
+    _add_plan_summary_tasks(data)
+    root = open_root(sub)
+    try:
+        for table in ROOT_ORPHAN_TABLES:
+            root.execute(f"DROP TABLE {table}")
+        root.commit()
+    finally:
+        root.close()
+    transition(sub, "orunta", "r-alpha", "ALPHA1", "building", data_dir=data)
+    got = overview(sub)
+    _check(got["ok"] is True and len(got["plans"]) == 2,
+           f"_orphan_root_absent: overview without the dropped tables: {got}")
+    listed = plans(sub, "orunta", data)
+    _check(listed["ok"] is True and len(listed["plans"]) == 2,
+           f"_orphan_root_absent: plans without the dropped tables: {listed}")
+    root = open_root(sub)
+    try:
+        back = [t for t in ROOT_ORPHAN_TABLES if root.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (t,)).fetchone()]
+        _check(back == [], f"_orphan_root_absent: a dropped table came back: {back}")
+    finally:
+        root.close()
+
+
+def _cards_subcommand_gone(home):
+    """L7.3 (C3): mkdb.py cards is gone — the subcommand exits 2 through argparse's own error
+    path, the same as any unknown command, while a read that stays still answers 0.
+
+    FAILS on the pre-L7.3 code, where cards is a real subcommand and exits 0.
+    """
+    gone = subprocess.run([sys.executable, __file__, "--home", home, "cards", "--json"],
+                          capture_output=True, text=True)
+    _check(gone.returncode == 2,
+           f"_cards_subcommand_gone: cards exited {gone.returncode}, wanted 2"
+           f" (stdout {gone.stdout.strip()!r}, stderr {gone.stderr.strip()[-200:]!r})")
+    kept = subprocess.run([sys.executable, __file__, "--home", home, "overview", "--json"],
+                          capture_output=True, text=True)
+    _check(kept.returncode == 0,
+           f"_cards_subcommand_gone: overview exited {kept.returncode}"
+           f": {kept.stderr.strip()[-200:]}")
+# --- end L7.3 orphan-root self-tests ---
 
 
 # --- L1 plan_summary self-tests: extract this whole region for the old-code probe ---
@@ -4362,19 +4006,20 @@ def _file_hash(path):
 
 
 def _reads_create_nothing(home):
-    """Y1: cards and timeline never create a store, and a read never writes or migrates one."""
+    """Y1: projects and timeline never create a store, and a read never writes or migrates one."""
     empty = os.path.join(home, "empty-read")
     os.makedirs(empty)
     before = _listing(empty)
     got = json.loads(subprocess.check_output(
-        [sys.executable, __file__, "--home", empty, "cards", "--json"], text=True))
-    _check(got == {"ok": True, "cards": []}, f"empty cards {got}")
+        [sys.executable, __file__, "--home", empty, "projects", "--json"], text=True))
+    _check(got == {"ok": True, "projects": []}, f"empty projects {got}")
     got = json.loads(subprocess.check_output(
         [sys.executable, __file__, "--home", empty, "--project", "ghost",
          "timeline", "--run", "r", "--task", "t", "--json"], text=True))
     _check(got == {"ok": True, "events": []}, f"empty timeline {got}")
     _check(_listing(empty) == before == [], f"empty home grew: {_listing(empty)}")
-    _check(cards(empty) == [] and timeline(empty, "ghost", "r", "t") == [], "api read created a store")
+    _check(projects(empty) == [] and overview(empty)["plans"] == [] and timeline(empty, "ghost", "r", "t") == [],
+           "api read created a store")
     _check(_listing(empty) == [], "api read created a file")
 
     data = os.path.join(home, "ro-read")
@@ -4416,7 +4061,7 @@ def _reads_create_nothing(home):
     bare.close()
     root_hash = _file_hash(os.path.join(root_old, "mk.db"))
     try:
-        cards(root_old)
+        overview(root_old)
     except Fail as e:
         _check(e.code == 2 and "needs migration" in str(e), f"old root error: {e}")
     else:
@@ -4959,14 +4604,15 @@ def _single_writer():
     _check(offenders == [], f"read-write sqlite outside mkdb.py: {offenders}")
 
 
-# failure injection for the crash tests — env so the worker processes see it too
-_real_upsert, _real_change_log = _upsert_card, _change_log
+# failure injection for the crash tests — env so the worker processes see it too.
+# L7.3: the pre-root hook now guards the plan_summary root write (the card write is gone).
+_real_plan_root, _real_change_log = _write_plan_summaries_root, _change_log
 
 
-def _guarded_upsert(*a, **k):
+def _guarded_plan_root(*a, **k):
     if os.environ.get("MKDB_FAIL_BEFORE_ROOT"):
         raise Fail("injected failure before the root upsert")
-    return _real_upsert(*a, **k)
+    return _real_plan_root(*a, **k)
 
 
 def _guarded_change_log(con, run, task):
@@ -4975,7 +4621,7 @@ def _guarded_change_log(con, run, task):
     return _real_change_log(con, run, task)
 
 
-_upsert_card, _change_log = _guarded_upsert, _guarded_change_log
+_write_plan_summaries_root, _change_log = _guarded_plan_root, _guarded_change_log
 
 
 if __name__ == "__main__":

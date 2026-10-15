@@ -3,12 +3,12 @@
 
 Reads <data>/runs read-only and writes only through mkdb.import_history (original timestamps,
 one transaction, idempotent on a per-event and per-artifact source key) plus mkdb.catch_up
-(root cards). Never opens SQLite itself and never modifies a source file.
+(which heals the root plan_summary).
 
   run --project SLUG --data DIR --run ID [--home DIR]
       Import one run: run.json (run row + task tree), events.jsonl (chan=state, original t),
       and every file under tasks/<T>/ as an artifact (task, round, kind). Then catch_up so the
-      root cards exist. Importing the same run twice adds nothing.
+      root plan_summary is current. Importing the same run twice adds nothing.
   run --project SLUG --data DIR --all [--home DIR]
       Import every run under <data>/runs and print a parity report: source counts vs store
       counts for runs, tasks, events and artifacts.
@@ -611,8 +611,13 @@ def self_test():
         finally:
             con.close()
 
-        ids = sorted(c["task"] for c in mkdb.cards(home, "matrixkoder"))
-        _check(ids == ["P", "P.1", "P.2"], f"cards {ids}")
+        # L7.3: the root card is gone; the imported task ids are a project-store fact.
+        con = mkdb.open_project(home, "matrixkoder")
+        try:
+            ids = sorted(r["id"] for r in con.execute("SELECT id FROM tasks WHERE run=?", (run,)))
+        finally:
+            con.close()
+        _check(ids == ["P", "P.1", "P.2"], f"tasks {ids}")
 
         code, out, err = _run_cli(["run", "--project", "matrixkoder", "--data", data, "--run", run, "--home", home])
         _check(code == 0, f"second import: {out} {err}")
@@ -663,8 +668,13 @@ def _blank_events(tmp):
     _check(sum(1 for r in reasons if r.get("reason") == "blank line") == 2, reasons)
     _check(any(r.get("reason") == "malformed json" for r in reasons), reasons)
     _check(doc["added"]["events"] == 1, doc["added"])
-    got = [c for c in mkdb.cards(home, "matrixkoder") if c["task"] == "T"]
-    _check(len(got) == 1 and got[0]["verdict"] == "APPROVE", got)
+    # L7.3: the root card is gone; the imported verdict is a project-store fact.
+    con = mkdb.open_project(home, "matrixkoder")
+    try:
+        row = con.execute("SELECT verdict FROM tasks WHERE run='b1' AND id='T'").fetchone()
+    finally:
+        con.close()
+    _check(row is not None and row["verdict"] == "APPROVE", dict(row) if row else None)
 
 
 def _guards_r2(tmp):
@@ -895,8 +905,7 @@ def _real_bus(tmp):
         _check(n > 0, "no BA artifacts")
     finally:
         con.close()
-    cards = mkdb.cards(home, "matrixkoder")
-    _check(any(c["task"] == "BA" and c["run"] == "mk-bus-r1" for c in cards), "BA card missing")
+    # L7.3: the root card is gone, so nothing to assert about mkdb.cards() here.
     print(f"mk-bus-r1 ok: BA events {len(got)}")
 
 
