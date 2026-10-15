@@ -10,7 +10,7 @@ import { ActionButton, Card, Chip, TreeRow } from './kit'
 import { laneStrip, pickBar } from './raster'
 import { ROLE } from './palette'
 import type { PaletteRole } from './palette'
-import { laneAgent } from './plans-map'
+import { isDoneStatus, laneAgent } from './plans-map'
 
 type Els = Elements[keyof Elements]
 
@@ -246,7 +246,7 @@ function PhaseCard(els: Els, phase: PlanPhase, waveMates: readonly string[], W: 
   const legacy = phase.tone != null
   const expanded = legacy ? true : ui?.get(phaseKey(phase.id)) === '1'
   const routed = phaseRouted(phase)
-  const lane = laneAgent(phase)
+  const lane = isDoneStatus(phase.status ?? '') ? '' : laneAgent(phase)
   const toneRole: PaletteRole = phase.tone === 'green' ? 'ok' : phase.tone === 'blue' ? 'live' : 'idle'
   const headRole = phase.headerRole ?? toneRole
   const live = (phase.tone === 'blue') || phase.rows.some(r => roleOf(r.status) === 'live' || roleOf(r.status) === 'warn')
@@ -296,7 +296,7 @@ function TaskBlock(els: Els, row: PlanTask, W: number, compact: boolean, ui?: Ta
   const { Box, Text } = els
   const role = roleOf(row.status)
   const title = compact ? row.short?.title ?? row.title : row.title
-  const lane = laneAgent(row)
+  const lane = isDoneStatus(row.status) ? '' : laneAgent(row)
   const chrome = 6 // '├ ' + gap + glyph + gap + the gap before the tag
   const showLane = lane !== '' && chrome + row.id.length + 1 + 10 + lane.length <= W
   const titleBudget = Math.max(1, showLane

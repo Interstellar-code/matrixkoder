@@ -341,3 +341,14 @@ test('Z20.5: the plan row tally still shows the raw statuses', () => {
   expect(plans[0]?.counts.byStatus).toEqual(Z20_COUNTS)
   expect(plans[0]?.counts.tasks).toBe(12)
 })
+
+test('planFromReply orders a phase\'s tasks and a task\'s subtasks by natural task id (Z26)', () => {
+  const t = (id: string, subtasks: { id: string }[] = []) => ({ id, title: id, status: 'planned', subtasks })
+  const view = planFromReply({
+    id: 'p', phases: [{ id: 'F', tasks: [t('F.10'), t('F.2'), t('F.S'), t('F.4'),
+      t('L10', [{ id: 'L10.12b' }, { id: 'L10.12a' }, { id: 'L10.13' }])] }],
+  })
+  const rows = view.phases?.[0]?.rows ?? []
+  expect(rows.map(r => r.id)).toEqual(['F.2', 'F.4', 'F.10', 'F.S', 'L10'])
+  expect(rows[4]?.subs?.map(s => s.id)).toEqual(['L10.12a', 'L10.12b', 'L10.13'])
+})
