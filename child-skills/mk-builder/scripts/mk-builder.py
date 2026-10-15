@@ -855,8 +855,16 @@ def branch_files(lane):
     for base in ("main", "master"):
         mb = (lane_git(lane, "merge-base", "HEAD", base) or "").strip()
         if mb:
-            return set((lane_git(lane, "diff", "--name-only", f"{mb}..HEAD") or "").splitlines())
+            diff = lane_git(lane, "diff", "--name-only", f"{mb}..HEAD")
+            return None if diff is None else set(diff.splitlines())  # a git error is unknown, not empty
     return None
+
+
+def claim_in(test, files):
+    """A claimed test matches a changed path when it equals it, is a path suffix of it
+    (`plans-map.test.ts` vs `hooks/tabs/plans-map.test.ts`), or equals its basename."""
+    return any(f == test or f.endswith("/" + test) or os.path.basename(f) == os.path.basename(test)
+               and "/" not in test for f in files)
 
 
 @status_locked
@@ -891,7 +899,10 @@ def cmd_done(a):
     except OSError:
         claim_text = ""
     files = branch_files(lane)
-    absent = [t for t in claimed_tests(claim_text) if files is not None and t not in files]
+    claims = claimed_tests(claim_text)
+    if files is None and claims:
+        print("WARNING: claim check skipped: git could not list the branch's changed files")
+    absent = [t for t in claims if files is not None and not claim_in(t, files)]
     if absent:
         raise Fail("claim_mismatch: the report claims test file(s) not in the branch's commits: "
                    + ", ".join(absent))
@@ -3696,6 +3707,54 @@ def t_done_refuses_dirty_tree_and_claim_mismatch(root):
     begin(lane2, root, report=".matrixkoder-report-r1.md")
     cli(lane2, "progress", "work")
     assert "dirty_tree" in refuse(lane2, "done")["error"]
+
+
+def t_done_claim_matches_basenames_and_unknown_git_skips(root):
+    """F.4 R2: a claim matches a changed path by equality, path suffix or bare basename; a name
+    absent from the commit is still refused; a git error makes the claim unknown: a WARNING, no refusal."""
+    lane = gitlane(root, "done_f4r2")
+    git(lane, "switch", "-q", "-c", "work")
+    os.makedirs(os.path.join(lane, "hooks", "tabs"))
+    with open(os.path.join(lane, "hooks", "tabs", "plans-map.test.ts"), "w") as f:
+        f.write("x\n")
+    git(lane, "add", "-A")
+    git(lane, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", "feat: a")
+    files = branch_files(lane)
+    assert files == {"hooks/tabs/plans-map.test.ts"}, files
+    for claim in ("plans-map.test.ts", "tabs/plans-map.test.ts", "hooks/tabs/plans-map.test.ts"):
+        assert claim_in(claim, files), claim
+    assert not claim_in("wake.test.ts", files) and not claim_in("map.test.ts", files)
+    rep = os.path.join(lane, ".matrixkoder-report-r1.md")
+    with open(rep, "w") as f:  # the real Z20 report phrasing: a bare basename
+        f.write("Added `plans-map.test.ts` assertions.\n")
+    begin(lane, root, report=".matrixkoder-report-r1.md")
+    cli(lane, "progress", "work")
+    with open(rep, "w") as f:
+        f.write("Added `wake.test.ts` and `plans-map.test.ts`.\n")
+    out = refuse(lane, "done")
+    assert "claim_mismatch" in out["error"] and "wake.test.ts" in out["error"] \
+        and "plans-map" not in out["error"], out
+    with open(rep, "w") as f:
+        f.write("New `plans-map.test.ts` cases.\n")
+    code, lines = cli(lane, "done")
+    assert code == 0 and lines[-1] == "S1 R1 DONE", lines
+    # a git error on the diff is unknown, not an empty branch
+    real = globals()["lane_git"]
+    globals()["lane_git"] = lambda ln, *a: None if a[0] == "diff" else "abc123\n"
+    try:
+        assert branch_files(lane) is None
+    finally:
+        globals()["lane_git"] = real
+    # no main/master to diff against: unknown too, so a claimed test is a WARNING, never a refusal
+    lane2 = gitlane(root, "done_f4r2_nobase")
+    git(lane2, "branch", "-m", "trunk")
+    with open(os.path.join(lane2, ".matrixkoder-report-r1.md"), "w") as f:
+        f.write("Added `ghost.test.ts`.\n")
+    begin(lane2, root, report=".matrixkoder-report-r1.md")
+    cli(lane2, "progress", "work")
+    code, lines = cli(lane2, "done")
+    assert code == 0 and lines[-1] == "S1 R1 DONE", lines
+    assert any(ln.startswith("WARNING: claim check skipped") for ln in lines), lines
 
 
 def t_builder_has_no_risk_command(root):

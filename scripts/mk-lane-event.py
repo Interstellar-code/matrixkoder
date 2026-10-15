@@ -1825,14 +1825,25 @@ def claimed_tests(report):
     return out
 
 
+def claim_in(test, files):
+    """A claimed test matches a changed path when it equals it, is a path suffix of it, or equals
+    its basename (a bare `plans-map.test.ts`). Same rule as mk-builder.py `done`."""
+    return any(f == test or f.endswith("/" + test) or os.path.basename(f) == os.path.basename(test)
+               and "/" not in test for f in files)
+
+
 def branch_files(lane):
     """Files the lane's commits changed since the merge-base with main (or master); None when
     git cannot say, so an unknown never reads as a mismatch."""
     for base in ("main", "master"):
         mb = git_out(lane, "merge-base", "HEAD", base)
         if mb:
-            names = git_out(lane, "diff", "--name-only", f"{mb}..HEAD")
-            return set(names.splitlines())
+            try:
+                r = subprocess.run(["git", "-C", lane, "diff", "--name-only", f"{mb}..HEAD"],
+                                   capture_output=True, text=True, timeout=10)
+            except (OSError, subprocess.TimeoutExpired):
+                return None
+            return set(r.stdout.splitlines()) if r.returncode == 0 else None  # a git error is unknown, not empty
     return None
 
 
@@ -1847,6 +1858,9 @@ def ingest_report(w):
         path = os.path.join(lane, w.get("report") or "")
         if w.get("report") and os.path.isfile(path):
             text = open(path).read()
+            m = re.search(r"-r(\d+)\.md$", os.path.basename(path))
+            if m:
+                rnd = m.group(1)
         else:
             got = newest_stored_artifact(data, run, task, "report")
             if got:
@@ -1854,7 +1868,7 @@ def ingest_report(w):
         files = branch_files(lane)
         if not text or files is None:
             return []
-        missing = [t for t in claimed_tests(text) if t not in files]
+        missing = [t for t in claimed_tests(text) if not claim_in(t, files)]
         if missing:
             open_risk(data, run, task, "claim_mismatch", f"report R{rnd}: {', '.join(missing)}"[:200])
         return missing
@@ -4081,8 +4095,23 @@ def self_test():
         open(os.path.join(crepo, ".matrixkoder-report-r1.md"), "w").write(rep)
         w4 = {"data": data, "run": "r1", "task": "F4D", "lane": crepo, "report": ".matrixkoder-report-r1.md"}
         assert ingest_report(w4) == ["tests/b_test.py"], ingest_report(w4)
-        assert reasons("F4D") == [("claim_mismatch", 2, "report R?: tests/b_test.py")], reasons("F4D")
+        assert reasons("F4D") == [("claim_mismatch", 2, "report R1: tests/b_test.py")], reasons("F4D")
         assert len(reasons("F4D")) == 1 and ingest_report(w4) == ["tests/b_test.py"] and len(reasons("F4D")) == 1
+        # F.4 R2: bare-basename and path-suffix claims match; the round comes from report-rN.md
+        assert claim_in("b_test.py", {"tests/b_test.py"}) and claim_in("tests/b_test.py", {"x/tests/b_test.py"})
+        assert not claim_in("c_test.py", {"tests/b_test.py"})
+        mks("task", "add", "--id", "F4F", "--title", "round name")
+        mks("task", "round", "F4F", "--kind", "build")
+        open(os.path.join(crepo, ".matrixkoder-report-r2.md"), "w").write("Added `tests/zz_test.py`.\n")
+        assert ingest_report(dict(w4, task="F4F", report=".matrixkoder-report-r2.md")) == ["tests/zz_test.py"]
+        assert reasons("F4F") == [("claim_mismatch", 2, "report R2: tests/zz_test.py")], reasons("F4F")
+        # a git error on the diff is unknown: nothing is claimed missing
+        _bf = globals()["branch_files"]
+        globals()["branch_files"] = lambda lane_: None
+        try:
+            assert ingest_report(dict(w4, task="F4F", report=".matrixkoder-report-r2.md")) == []
+        finally:
+            globals()["branch_files"] = _bf
         # a report whose claimed tests are all in the diff opens nothing
         mks("task", "add", "--id", "F4E", "--title", "honest")
         mks("task", "round", "F4E", "--kind", "build")
