@@ -25,6 +25,19 @@ Legacy projects whose runs live only in files migrate through mk-store-import.py
       Tasks already moved are listed in `promoted` even when a later promotion raises
       (`promote_error`).
   run list | run get [--id ID | ID] | run set [--id ID] [--next TEXT] [--status active|done]
+      --status done (F.0) closes a run ONLY when nothing of it is open and every runnable plan
+      gate passes. Open = any task or phase not in merged/qa/done; the refusal lists each open
+      id with its status (`open`) and writes nothing. Then the plan's `[gates]` run in the run's
+      integration checkout (the repo this run belongs to, resolved the way --data resolves its
+      repo; never a hard-coded path): a plain string gate is `manual` — never run, never blocks;
+      a `[gates.<name>]` table {cmd, expect = 0, timeout = 600} must exit `expect`, inside its
+      timeout, with the 1-minute load average at or below 40 (above that every gate is
+      `deferred` and blocks; the load reader is `load_avg()`). A failure names the gate, its
+      result (`fail exit=N` | `timeout` | `deferred load=X`) and the last 20 lines of its output,
+      and writes nothing. The accepted reply lists every gate with its result (`gates`).
+      `run set` takes no --force, and none is added: F.0 has no bypass. Reading the gates is
+      best-effort like the plan update below (no plan link, a missing plan file or a plan-tool
+      error reports `gate_error` instead of blocking).
   run stage N [--id ID] | run archive --id ID | run archive ID
   run backfill-fields [--run ID] — one-shot: fill the EMPTY acceptance/refs/owned/deps/type/route
       of this run's tasks from the approved plan (D1.5.5). The plan tool is the only reader of
@@ -143,6 +156,14 @@ RECENT, BOARD_EVENTS = 10, 15
 DEP_MET = ("merged", "qa", "done")
 DEP_GATED = ("dispatched", "building")
 SIDE = ("blocked", "provider", "quota", "stalled")  # roll-up precedence: the first present wins
+# F.0: a run closes (`run set --status done`) only when nothing is open and every runnable plan
+# gate passes. Closed = merged/qa/done (a task that reached the integration branch or was waived);
+# every other status is open. A plan gate is a plain string (manual: never run, never blocks) or a
+# table {cmd, expect = 0, timeout = 600} run in the repo's integration checkout.
+CLOSED_STATUSES = ("merged", "qa", "done")
+GATE_LOAD_MAX = 40.0        # 1-minute load average above this defers a gate: it blocks, never passes
+GATE_TIMEOUT_DEFAULT = 600
+GATE_OUTPUT_LINES = 20      # output lines a gate failure quotes
 
 # The project store is opt-in. With the project store absent, nothing below runs.
 # Z3: the root projection's slug is the project's OWN slug, resolved from the data dir through
@@ -1528,6 +1549,10 @@ def cmd_run(a, st):
             if a.next is not None:
                 run["next"] = a.next
             if a.status:
+                # F.0: the open-work and plan-gate checks run BEFORE anything is written and
+                # --force does not bypass them (no bypass in F.0). A refusal leaves the store
+                # untouched.
+                checks = close_checks(st, run) if a.status == "done" else {}
                 warn = set_run_status(st, run, a.status)
                 promoted, perr = [], None
                 if a.status == "done" and run["status"] == "done":
@@ -1551,6 +1576,7 @@ def cmd_run(a, st):
         st.flush()
     out = {"ok": True, "run": run, **({"warning": warn} if warn else {})}
     if a.action == "set" and a.status == "done":
+        out.update(checks)
         out["promoted"] = promoted
         if perr:
             out["promote_error"] = perr
@@ -1622,6 +1648,161 @@ def promote_closed(st, run, by):
         t["status"], t["updated"] = "done", now()
         n += 1
         yield t["id"]
+
+
+def open_work(run):
+    """F.0: [{"id", "status"}] for every task AND phase of the run that is not closed
+    (closed = merged/qa/done). The run's own task order, so the refusal reads like the board."""
+    return [{"id": t["id"], "status": t.get("status")}
+            for t in run.get("tasks") or []
+            if isinstance(t, dict) and t.get("id") and t.get("status") not in CLOSED_STATUSES]
+
+
+def load_avg():
+    """The 1-minute load average, the deferral input (F.0). $MK_STATE_LOADAVG injects one, the
+    same kind of test seam as MK_PROMOTE_FAIL_AFTER: it pins the reader's VALUE, never the
+    module under test. A platform without getloadavg never defers."""
+    override = os.environ.get("MK_STATE_LOADAVG")
+    if override is not None:
+        try:
+            return float(override)
+        except ValueError:
+            raise Fail(f"bad MK_STATE_LOADAVG {override!r} (a number)")
+    try:
+        return os.getloadavg()[0]
+    except OSError:
+        return 0.0
+
+
+def integration_checkout(st):
+    """The checkout a run's gates run in (F.0): the repo this run belongs to, resolved the way
+    mk-state already resolves its repo — first the nearest git repo above cwd (mkpaths.repo_top,
+    what --data resolution uses; a lane's linked worktree maps to its main checkout), else the
+    root projects row that names this project AND whose `repo` is a checkout, else the project
+    folder. -> (dir, note). The row is a fallback only: an auto-registered row records
+    dirname(data_dir), which is not necessarily a git checkout. Never raises. F.0 never switches
+    a branch — the orchestrator keeps this checkout on the plan's integration branch, which is
+    why a deferred or failing gate blocks instead of being retried elsewhere."""
+    top = repo_top()
+    if top:
+        return top, ""
+    folder = os.path.realpath(st.project_folder())
+    with contextlib.suppress(Exception):
+        rows = st.db().projects(st.home_dir()) or []
+        slug = None
+        with contextlib.suppress(Exception):
+            slug = st.project_slug()
+        for want in (folder, None):
+            for r in rows:
+                repo = r.get("repo")
+                if not isinstance(repo, str) or not repo.strip():
+                    continue
+                if want is not None:
+                    named = [r.get("data_dir"), r.get("db_path")]
+                    hit = any(isinstance(v, str) and v.strip()
+                              and os.path.realpath(os.path.expanduser(
+                                  os.path.dirname(v.strip()) if k == "db_path" else v.strip())) == want
+                              for k, v in zip(("data_dir", "db_path"), named))
+                    if not hit:
+                        continue
+                elif not slug or r.get("slug") != slug:
+                    continue
+                d = os.path.realpath(os.path.expanduser(repo.strip()))
+                if os.path.exists(os.path.join(d, ".git")):  # a checkout, never a bare folder
+                    return d, ""
+    return st.project_folder(), "no git repo resolved for this run"
+
+
+def _gate_tail(text, n=GATE_OUTPUT_LINES):
+    """The last n lines of a gate's output (stdout+stderr), as the refusal quotes them."""
+    return "\n".join((text or "").splitlines()[-n:])
+
+
+def _gate_run(g, cwd):
+    """F.0: run ONE table gate in cwd -> (result, output tail). Result vocabulary: `pass`,
+    `fail exit=N`, `timeout`, or `invalid` for a gate the plan tool would have refused (this
+    reads `parse`, which does not check shape). A wrong exit code, a timeout and a malformed
+    gate all block; only exit == expect passes."""
+    cmd, expect, timeout = g.get("cmd"), g.get("expect", 0), g.get("timeout", GATE_TIMEOUT_DEFAULT)
+    if not isinstance(cmd, str) or not cmd.strip():
+        return "invalid", "no cmd (mk-plan check refuses a table gate without one)"
+    if type(expect) is not int:
+        return "invalid", f"expect {expect!r} is not an int"
+    if type(timeout) is not int:
+        return "invalid", f"timeout {timeout!r} is not an int"
+    try:
+        r = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        return "timeout", _gate_tail(f"{e.stdout or ''}{e.stderr or ''}")
+    except OSError as e:  # cwd gone, or the shell cannot start: a failure, never a pass
+        return "fail exit=127", f"{type(e).__name__}: {e}"
+    out = f"{r.stdout or ''}{r.stderr or ''}"
+    if r.returncode == expect:
+        return "pass", ""
+    return f"fail exit={r.returncode}", _gate_tail(out)
+
+
+def run_gates(st, gates):
+    """F.0: run every runnable gate of the run's plan in its integration checkout.
+    -> (results, failures, where, note). `results` names every gate as the reply lists it: a
+    plain string gate is `manual` (never run, never blocks); a table gate is `pass`,
+    `fail exit=N`, `timeout` or `deferred load=X`. Deferral blocks: a 1-minute load average
+    above GATE_LOAD_MAX means the machine is busy, so NO gate passes and none is run."""
+    where, note = integration_checkout(st)
+    load = load_avg()
+    deferred = load > GATE_LOAD_MAX
+    results, failures = {}, []
+    for name, g in gates.items():
+        if not isinstance(g, dict):
+            results[name] = "manual"
+            continue
+        result, out = (f"deferred load={load:g}", "deferred: load average above "
+                       f"{GATE_LOAD_MAX:g}") if deferred else _gate_run(g, where)
+        results[name] = result
+        if result != "pass":
+            failures.append({"gate": name, "result": result, "output": out})
+    return results, failures, where, note
+
+
+def gate_refusal(failures, where):
+    """The refusal text: each failing gate with its result and the last 20 lines of its output."""
+    parts = [f"{len(failures)} plan gate(s) failed in {where}:"]
+    for f in failures:
+        parts.append(f"  gate {f['gate']}: {f['result']}")
+        parts += [f"    {line}" for line in f["output"].splitlines()]
+    return "\n".join(parts)
+
+
+def close_checks(st, run):
+    """F.0: everything `run set --status done` must clear, AFTER which the run may close.
+    -> the reply keys to add. Raises Fail (having written nothing) when a task or phase of the
+    run is still open, or when a runnable plan gate fails, times out or is deferred. A plain
+    string gate is `manual`: it is reported and never blocks. A plan whose gates cannot be read
+    (no plan link, a missing plan file, a plan-tool error) is not a close gate: the close keeps
+    its best-effort plan behaviour, and gate_error says so."""
+    opens = open_work(run)
+    if opens:
+        raise Fail(f"run {run['id']} is not closed: "
+                   + ", ".join(f"{o['id']} ({o['status']})" for o in opens)
+                   + " — close them (task set <id> status=done) or leave the run open",
+                   open=opens)
+    if not run.get("plan"):
+        return {}
+    try:
+        cur = plan_tool("parse", st.plan_file(run))
+    except Fail as e:
+        return {"gate_error": f"plan gates not run: {e}"}
+    gates = cur.get("gates") if isinstance(cur.get("gates"), dict) else {}
+    if not gates:
+        return {}
+    results, failures, where, note = run_gates(st, gates)
+    if failures:
+        raise Fail(gate_refusal(failures, where), gates=results,
+                   failed=[f["gate"] for f in failures])
+    out = {"gates": results}
+    if note:
+        out["gate_error"] = note
+    return out
 
 
 def set_run_status(st, run, status):
@@ -2814,7 +2995,7 @@ if cmd in ("parse", "check"):
     extra = {"warnings": db.get("warnings", [])} if cmd == "check" else {}
     print(json.dumps({"ok": True, "plan": db.get("plan"), "status": db.get("status"),
                       "runs": db.get("runs", []), "sha": hashlib.sha256(open(path, "rb").read()).hexdigest(),
-                      "gates": {}, "phases": db.get("phases", []), **extra}))
+                      "gates": db.get("gates", {}), "phases": db.get("phases", []), **extra}))
 elif cmd == "set":
     db["status"] = sys.argv[sys.argv.index("--status") + 1]
     json.dump(db, open(path, "w"), indent=1)
@@ -3071,6 +3252,18 @@ def self_test():
 
     def n_events(datadir, rid):
         return q1(datadir, "SELECT COUNT(*) c FROM events WHERE run=?", (rid,))["c"]
+
+    def close_all(datadir, rid, e=None):
+        """F.0: put every OPEN task of a run at `done` through the real task-set path, so a
+        `run set --status done` clears the open-work gate. -> the ids it moved."""
+        moved = []
+        for r in q(datadir, "SELECT id, status FROM tasks WHERE run=? ORDER BY rowid", (rid,)):
+            if r["status"] in CLOSED_STATUSES:
+                continue
+            mk("task", "set", r["id"], "status=done", "--run", rid, "--data", datadir,
+               data_arg=False, e=e or env)
+            moved.append(r["id"])
+        return moved
 
     try:
         # Z8: a throwaway data dir under the system temp dir must not register a root row in the
@@ -3431,6 +3624,14 @@ def self_test():
         assert {r["id"]: r["status"] for r in mk("run", "list")["runs"]} == {"r1": "active", "r2": "archived"}
         assert mk("run", "archive", code=2)["ok"] is False
         assert mk("task", "get", "T1")["task"]["id"] == "T1"
+        # F.0: a run with open work cannot close; the refusal names each open task, and
+        # closing (merged/qa/done) lets it through
+        o = mk("run", "set", "--status", "done", code=2)
+        assert o["ok"] is False and "T1 (routed)" in o["error"] and "T2 (planned)" in o["error"], o
+        assert [x["id"] for x in o["open"]] == ["T1", "T2"], o
+        assert mk("run", "get")["run"]["status"] == "active"  # nothing was written
+        mk("task", "set", "T1", "status=done")
+        mk("task", "set", "T2", "status=done")
         assert mk("run", "set", "--status", "done")["run"]["ended"]
         assert mk("run", "set", "--id", "r1", "--status", "active")["run"]["ended"] is None  # reopen clears ended
         assert mk("run", "get", "r1")["run"]["id"] == "r1" and mk("run", "get", "--id", "r1")["run"]["id"] == "r1"
@@ -4190,10 +4391,14 @@ def self_test():
         assert out["ok"] and out["changes"] == [], out  # the existing started-task rule, unchanged
         assert any("phase Z1 is done (started)" in w for w in out["warnings"]), out["warnings"]
 
-        # last run done → plan done; a non-last run finishing leaves the plan alone
+        # last run done → plan done; a non-last run finishing leaves the plan alone.
+        # F.0: the close needs both runs closed of work, so their tasks go to done first.
         putdb({**json.load(open(pfile)), "status": "running"})
         pk("run", "init", "--id", "pr3", "--feature", "F3", "--branch", "b3", "--plan", pfile, "--force")
         assert json.load(open(pfile))["runs"] == ["pr1", "pf1", "pr3"]
+        o = pk("run", "set", "--id", "pr1", "--status", "done", code=2)
+        assert o["ok"] is False and "not closed" in o["error"], o
+        assert close_all(pd, "pr1") and close_all(pd, "pr3"), "the fixture runs had no open task"
         pk("run", "set", "--id", "pr1", "--status", "done")
         assert json.load(open(pfile))["status"] == "running"  # pr1 is not the last run
         assert pk("run", "get", "--id", "pr1")["run"]["plan_status"] == "running"
@@ -4289,19 +4494,35 @@ def self_test():
         pm("task", "add", "--id", "OM", "--title", "other merged", "--run", "other")
         pm("task", "set", "OM", "status=merged", "--run", "other")
         n_ev = n_events(pdata, "close")
+        # F.0: B/K/P are open and so is the parent PAR (whose children are already merged/qa but
+        # which the SQL above put back to building), so the close is refused naming each of them
+        # and the exit-2 reply carries no promotion at all — nothing of the run moved
+        e = pm("run", "set", "--id", "close", "--status", "done", code=2)
+        assert e["ok"] is False and "not closed" in e["error"], e
+        assert [x["id"] for x in e["open"]] == ["B", "K", "P", "PAR"], e
+        assert n_events(pdata, "close") == n_ev, "the open-work refusal wrote an event"
+        assert pm("task", "get", "Q", "--run", "close")["task"]["status"] == "qa"
+        # every task closed through the real task-set path. PAR is a phase and is never set
+        # directly: closing the other tasks saves the run, and the roll-up lifts PAR off the
+        # children it already has at merged/qa.
+        for tid in ("B", "K", "P"):
+            pm("task", "set", tid, "status=done", "--run", "close")
+        assert pm("task", "get", "PAR", "--run", "close")["task"]["status"] in CLOSED_STATUSES
         out = pm("run", "set", "--id", "close", "--status", "done")
         assert out["ok"] and out["run"]["status"] == "done", out
-        assert out["promoted"] == ["M", "Q", "C1", "C2"], out
+        # the roll-up from B/K/P's save already lifted PAR back to merged, so the close
+        # promotes it too (its children are merged/qa)
+        assert out["promoted"] == ["M", "Q", "PAR", "C1", "C2"], out
         assert "promote_error" not in out, out
         got = {t["id"]: t["status"] for t in pm("run", "get", "--id", "close")["run"]["tasks"]}
         assert got["M"] == "done" and got["Q"] == "done", got
-        assert got["B"] == "building" and got["K"] == "blocked" and got["P"] == "planned", got
+        assert got["B"] == "done" and got["K"] == "done" and got["P"] == "done", got
         assert got["PAR"] == "done" and got["C1"] == "done" and got["C2"] == "done", got
         assert pm("task", "get", "OM", "--run", "other")["task"]["status"] == "merged"
         newev = events_of(pdata, "close")[n_ev:]
         promo = [e for e in newev if e.get("type") == "transition" and e.get("to") == "done"
                  and e.get("text") == "promoted by closing the run"]
-        assert [e["task"] for e in promo] == ["M", "Q", "C1", "C2"], newev
+        assert [e["task"] for e in promo] == ["M", "Q", "PAR", "C1", "C2"], newev
         assert all(e["from"] in ("merged", "qa") for e in promo), promo
         again = pm("run", "set", "--id", "close", "--status", "done")
         assert again["ok"] and again["promoted"] == [], again
@@ -4328,6 +4549,108 @@ def self_test():
         rest = pm("run", "set", "--id", "half", "--status", "done")
         assert rest["ok"] and rest["promoted"] == ["H2"], rest
         assert "promote_error" not in rest
+
+        # F0-BLOCK-BEGIN — F.0: `run set --status done` is refused while work is open or a gate fails
+        f0data = os.path.join(tmp, "f0")
+        f0repo = os.path.join(tmp, "f0repo")
+        os.makedirs(os.path.join(f0repo, ".git"))
+        f0tool = os.path.join(tmp, "f0-planfix.py")
+        with open(f0tool, "w") as f:
+            f.write(PLAN_FIXTURE)
+        f0env = dict(env, MK_PLAN_CMD=" ".join([sys.executable, f0tool]))
+        f0plan = os.path.join(tmp, "f0-plan.json")
+        # the gate's cwd must be THIS project's checkout: only it holds the marker
+        open(os.path.join(f0repo, "gate-marker.txt"), "w").write("here\n")
+
+        def f0(*args, code=0, e=None):
+            return mk(*args, "--data", f0data, code=code, data_arg=False, e=e or f0env)
+
+        def f0put(gates):
+            json.dump({"plan": "f0plan", "status": "approved", "runs": ["f0"], "gates": gates,
+                       "phases": []}, open(f0plan, "w"), indent=1)
+
+        def f0store():
+            """The f0 run's store slice: nothing here may move on a refusal."""
+            con = DB.open_project(H, STORE_PROJECT_FALLBACK, data_dir=f0data)
+            try:
+                return {"run": dict(con.execute("SELECT * FROM runs WHERE id='f0'").fetchone()),
+                        "tasks": {r["id"]: dict(r) for r in
+                                  con.execute("SELECT * FROM tasks WHERE run='f0'")},
+                        "events": con.execute("SELECT COUNT(*) c FROM events WHERE run='f0'").fetchone()["c"],
+                        "log": con.execute("SELECT COUNT(*) c FROM change_log WHERE run='f0'").fetchone()["c"]}
+            finally:
+                con.close()
+
+        # the gates run in THIS project's checkout: the root projects row naming this data dir
+        # (the real resolution, not a hard-coded path)
+        con = DB.open_root(H)
+        try:
+            con.execute("INSERT OR REPLACE INTO projects(slug, name, repo, data_dir, mode, db_path)"
+                        " VALUES ('f0proj','f0proj',?,?,'home',NULL)", (f0repo, f0data))
+            con.commit()
+        finally:
+            con.close()
+
+        # 1. one planned task: refused, naming it with its status; the store is untouched
+        f0put({"manual": "echo manual"})
+        f0("run", "init", "--id", "f0", "--feature", "F0", "--branch", "b", "--plan", f0plan)
+        f0("task", "add", "--id", "F0.1", "--title", "open", "--run", "f0")
+        before = f0store()
+        e = f0("run", "set", "--id", "f0", "--status", "done", code=2)
+        assert e["ok"] is False, e
+        assert "not closed" in e["error"] and "F0.1 (planned)" in e["error"], e
+        assert [o["id"] for o in e["open"]] == ["F0.1"] and e["open"][0]["status"] == "planned", e
+        assert f0store() == before, "the open-work refusal wrote something"
+        # 5. no bypass: run set has no --force, so the flag is not even parsed
+        e = f0("run", "set", "--id", "f0", "--status", "done", "--force", code=2)
+        assert e["ok"] is False and "unrecognized arguments" in e["error"], e
+        assert f0store() == before, "the --force attempt wrote something"
+
+        # 2a. every task closed, a table gate exits non-zero: refused with its exit code and the
+        # last 20 lines of its output
+        f0("task", "set", "F0.1", "status=merged", "--run", "f0")
+        noisy = "i=1; while [ $i -le 30 ]; do echo line$i; i=$((i+1)); done; false"
+        f0put({"manual": "echo manual", "noisy": {"cmd": noisy}})
+        snap = f0store()
+        e = f0("run", "set", "--id", "f0", "--status", "done", code=2)
+        assert e["ok"] is False and "noisy: fail exit=1" in e["error"], e
+        assert e["gates"]["noisy"] == "fail exit=1" and e["failed"] == ["noisy"], e
+        assert e["gates"]["manual"] == "manual", e  # a string gate is reported, never run
+        assert "    line11" in e["error"] and "    line30" in e["error"], e
+        assert "line10" not in e["error"], e  # exactly the last 20 lines
+        assert f0store() == snap, "the gate refusal wrote something"
+
+        # 2b. timeout
+        f0put({"slow": {"cmd": "sleep 5", "timeout": 1}})
+        e = f0("run", "set", "--id", "f0", "--status", "done", code=2)
+        assert e["ok"] is False and "slow: timeout" in e["error"], e
+        assert e["gates"]["slow"] == "timeout", e
+        assert f0store() == snap, "the timeout refusal wrote something"
+
+        # 2c. deferral: a 1-minute load average above 40 blocks and no gate is run at all
+        f0put({"ok": {"cmd": "true"}, "manual": "echo manual"})
+        loaded = dict(f0env, MK_STATE_LOADAVG="41")
+        e = f0("run", "set", "--id", "f0", "--status", "done", code=2, e=loaded)
+        assert e["ok"] is False and "deferred load=41" in e["error"], e
+        assert e["gates"] == {"ok": "deferred load=41", "manual": "manual"}, e
+        assert f0store() == snap, "the deferral wrote something"
+
+        # 3. every task closed and the gate passes (load 40 is not above 40): the run closes, and
+        # the reply lists each gate with its result. The gate's own cwd is asserted with the
+        # marker file only this project's checkout carries.
+        f0put({"ok": {"cmd": "test -f gate-marker.txt"}, "ok2": {"cmd": "true"}, "manual": "echo hi"})
+        out = f0("run", "set", "--id", "f0", "--status", "done", e=dict(f0env, MK_STATE_LOADAVG="40"))
+        assert out["ok"] is True and out["run"]["status"] == "done", out
+        assert out["gates"] == {"ok": "pass", "ok2": "pass", "manual": "manual"}, out
+        assert out["promoted"] == ["F0.1"], out
+        assert "gate_error" not in out, out
+
+        # reopening is not gated: --status active never runs a gate
+        f0put({"ok": {"cmd": "false"}})
+        out = f0("run", "set", "--id", "f0", "--status", "active")
+        assert out["ok"] is True and out["run"]["status"] == "active", out
+        assert "gates" not in out, out
+        # F0-BLOCK-END
 
         d15_self_test(tmp, env, pd, penv)
         print("mk-state self-test ok")
@@ -4986,6 +5309,13 @@ def store_self_test(tmp, env):
     once(["task", "add", "--id", "B", "--title", "b", "--run", "k2"], k2, k2env)
     once(["task", "set", "A", "status=merged", "--run", "k2"], k2, k2env)
     once(["task", "set", "B", "status=qa", "--run", "k2"], k2, k2env)
+    # F.0: V is at review (open), so the close is refused naming it first
+    bad = subprocess.run([sys.executable, os.path.abspath(__file__), "run", "set", "--id", "k2",
+                          "--status", "done", "--data", k2], capture_output=True, text=True, env=k2env)
+    assert bad.returncode == 2, (bad.returncode, bad.stdout, bad.stderr)
+    bad = json.loads(bad.stdout.strip())
+    assert bad["ok"] is False and "V (review)" in bad["error"], bad
+    once(["task", "set", "V", "status=done", "--run", "k2"], k2, k2env)
     boom = dict(k2env, MK_PROMOTE_FAIL_AFTER="1")
     r = subprocess.run([sys.executable, os.path.abspath(__file__), "run", "set", "--id", "k2",
                         "--status", "done", "--data", k2], capture_output=True, text=True, env=boom)
@@ -5281,6 +5611,11 @@ def no_file_views_self_test(tmp, env):
          "--selftest", "8/0", "--run", "nfv")
     step("run", "set", "--id", "nfv", "--next", "dispatch the next task")
     step("plan", "sync", "--run", "nfv", "--apply", "--from-file", e=e2)
+    # F.0: P1, P1.1 and X1 are still open, so the close is refused naming them
+    e = step("run", "set", "--id", "nfv", "--status", "done", code=2)
+    assert "not closed" in e["error"] and "X1 (review)" in e["error"], e
+    for tid in ("P1", "P1.1", "X1"):
+        step("task", "set", tid, "status=done", "--run", "nfv")  # the real close path
     step("run", "set", "--id", "nfv", "--status", "done")  # "run close"
 
     con = _mkdb().open_project(H, STORE_PROJECT_FALLBACK, data_dir=data)
@@ -5291,7 +5626,7 @@ def no_file_views_self_test(tmp, env):
         tasks = {r["id"]: r["status"] for r in
                  con.execute("SELECT id, status FROM tasks WHERE run='nfv'")}
         assert {"P1", "P1.1", "X1"} <= set(tasks), tasks
-        assert tasks["X1"] == "review", tasks  # task verify passed -> review
+        assert tasks["X1"] == "done", tasks  # F.0: task verify passed -> review, then the close path moved it
         n_ev = con.execute("SELECT COUNT(*) c FROM events WHERE run='nfv'").fetchone()["c"]
         assert n_ev > 0, n_ev
         n_log = con.execute("SELECT COUNT(*) c FROM change_log WHERE run='nfv'").fetchone()["c"]
