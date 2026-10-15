@@ -241,26 +241,46 @@ def project_slug_of(data_dir, root=None):
     holds its store (dirname of db_path) — and the bus is launched with either one, so both must
     resolve to the same slug (C7: the bus follows the switch). Never creates mk.db.
     `root` as in `project_data_dir`.
+
+    Z19: one data dir can be named by SEVERAL rows — the bus's own project_slug_for registers
+    a derived `p<hash>` alias for a dir it has no row for (mk-bus.py:3322-3328 documents the
+    same problem), and that row STAYS after the project switches under its real slug. Row order
+    must not choose the answer. Among the matching rows the canonical one wins: the row whose
+    db_path folder is `<root>/projects/<that row's slug>` (the C2 rule's own shape); else
+    any matching row that has db_path set (C3's migrated marker); else the first match.
     """
     real = os.path.realpath(data_dir)
-    con = _open_root_ro(os.path.join(root or root_home(), ROOT_DB_NAME))
+    root_dir = os.path.realpath(os.path.abspath(os.path.expanduser(root or root_home())))
+    con = _open_root_ro(os.path.join(root_dir, ROOT_DB_NAME))
     if con is None:
         return None
     try:
+        canonical = with_db = first = None
         for row in con.execute("SELECT slug, data_dir, db_path FROM projects"):
             slug, recorded, db_path = row["slug"], row["data_dir"], row["db_path"]
             if not isinstance(slug, str) or not SLUG_RE.match(slug):
                 continue
-            if recorded and os.path.realpath(os.path.expanduser(recorded)) == real:
-                return slug
-            if (isinstance(db_path, str) and db_path.strip()
-                    and os.path.realpath(os.path.dirname(os.path.expanduser(db_path.strip()))) == real):
-                return slug
+            match = ((recorded and isinstance(recorded, str) and recorded.strip()
+                      and os.path.realpath(os.path.expanduser(recorded.strip())) == real)
+                     or (isinstance(db_path, str) and db_path.strip()
+                         and os.path.realpath(os.path.dirname(os.path.expanduser(db_path.strip()))) == real))
+            if not match:
+                continue
+            if first is None:
+                first = slug
+            if db_path and isinstance(db_path, str) and db_path.strip():
+                if with_db is None:
+                    with_db = slug
+                folder = os.path.dirname(os.path.expanduser(db_path.strip()))
+                if os.path.realpath(os.path.abspath(os.path.expanduser(folder))) == \
+                        os.path.join(root_dir, TARGET_PROJECTS_DIR, slug):
+                    canonical = slug
+                    break  # the canonical row wins outright; the sweep is over
     except sqlite3.Error:
         return None
     finally:
         con.close()
-    return None
+    return canonical or with_db or first
 
 
 # ---- migration: today's layout vs the C2 target (L3) ----------------------------------------
@@ -1105,6 +1125,80 @@ def self_test():
         _check(project_db(slug="nope") is None, project_db(slug="nope"))
         _check(project_slug_of(data) == "matrixkoder", project_slug_of(data))
         _check(project_slug_of(os.path.join(root, "nowhere")) is None, project_slug_of("x"))
+
+    def t_canonical(tmp_home, repo):
+        """Z19: one data dir named by several root rows — the canonical row wins: the row
+        whose db_path folder is <home>/projects/<that row's slug>; else any matching row
+        with db_path set; else the first match (an unmigrated dir keeps today's rule)."""
+        os.environ["HOME"] = tmp_home
+        _clear_home_env()
+        os.environ["MK_HOME"] = os.environ["MATRIXKODER_HOME"] = tmp_home
+        os.chdir(repo)
+        data = os.path.realpath(os.path.join(repo, ".matrixkoder"))
+        canon = os.path.join(tmp_home, "projects", "matrixkoder")
+        spec = importlib.util.spec_from_file_location(
+            "mkdb", os.path.join(os.path.dirname(os.path.abspath(__file__)), "mkdb.py"))
+        mkdb = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mkdb)
+        # case 1: the alias row first, the canonical row last; only the canonical row is
+        # migrated, and both name the same data dir — the slug must not follow the alias.
+        _seed_root(tmp_home, "pdceb35c892fc86bb", repo, ".matrixkoder")
+        con = mkdb.open_root(tmp_home)
+        try:
+            con.execute("INSERT INTO projects(slug, name, repo, data_dir, mode, db_path)"
+                        " VALUES (?,?,?,?,?,?)",
+                        ("matrixkoder", "matrixkoder", repo, ".matrixkoder", "home",
+                         os.path.join(canon, "mk.db")))
+            con.commit()
+        finally:
+            con.close()
+        _check(project_slug_of(data) == "matrixkoder", project_slug_of(data))
+        _check(project_folder(data) == canon, project_folder(data))
+        # case 2: the same two rows in reverse order — row order must not decide the answer.
+        _seed_root(tmp_home, "matrixkoder", repo, ".matrixkoder", os.path.join(canon, "mk.db"))
+        con = mkdb.open_root(tmp_home)
+        try:
+            con.execute("INSERT INTO projects(slug, name, repo, data_dir, mode, db_path)"
+                        " VALUES (?,?,?,?,?,NULL)",
+                        ("pdceb35c892fc86bb", "pdceb35c892fc86bb", repo, ".matrixkoder", "home"))
+            con.commit()
+        finally:
+            con.close()
+        _check(project_slug_of(data) == "matrixkoder", project_slug_of(data))
+        _check(target_project_yaml("matrixkoder") == os.path.join(canon, "project.yaml"),
+               target_project_yaml("matrixkoder"))
+        _check(target_run_dir("matrixkoder", "p1", "r1")
+               == os.path.join(canon, "plans", "p1", "runs", "r1"),
+               target_run_dir("matrixkoder", "p1", "r1"))
+        # case 3: for that data dir the C2 targets and the project folder resolve under
+        # projects/<canonical>/ — target_* are slug-driven, project_folder follows the switch.
+        _seed_root(tmp_home, "pdceb35c892fc86bb", repo, ".matrixkoder")
+        con = mkdb.open_root(tmp_home)
+        try:
+            con.execute("INSERT INTO projects(slug, name, repo, data_dir, mode, db_path)"
+                        " VALUES (?,?,?,?,?,?)",
+                        ("matrixkoder", "matrixkoder", repo, ".matrixkoder", "home",
+                         os.path.join(canon, "mk.db")))
+            con.commit()
+        finally:
+            con.close()
+        _check(target_project_yaml("matrixkoder") == os.path.join(canon, "project.yaml"),
+               target_project_yaml("matrixkoder"))
+        _check(target_run_dir("matrixkoder", "p1", "r1")
+               == os.path.join(canon, "plans", "p1", "runs", "r1"),
+               target_run_dir("matrixkoder", "p1", "r1"))
+        _check(project_folder(data) == canon, project_folder(data))
+        # case 4: no row carries db_path — an unmigrated dir keeps today's FIRST-MATCH rule.
+        _seed_root(tmp_home, "pdceb35c892fc86bb", repo, ".matrixkoder")
+        con = mkdb.open_root(tmp_home)
+        try:
+            con.execute("INSERT INTO projects(slug, name, repo, data_dir, mode, db_path)"
+                        " VALUES (?,?,?,?,?,NULL)",
+                        ("matrixkoder", "matrixkoder", repo, ".matrixkoder", "home"))
+            con.commit()
+        finally:
+            con.close()
+        _check(project_slug_of(data) == "pdceb35c892fc86bb", project_slug_of(data))
 
     def t_bus(tmp_home, repo):
         os.environ["HOME"] = tmp_home
