@@ -1519,13 +1519,16 @@ def _task_risk(con, run, task_id):
     Read-only: never stored, never settable by task set. base_risk defaults to 1.
     Returns an int in [1, 5].
     """
-    extra = _task_extra(con, run, task_id)
+    return _risk_of(_task_extra(con, run, task_id), _open_reasons(con, run, task_id))
+
+
+def _risk_of(extra, reasons):
+    """min(5, base_risk + OPEN points) from an already-read extra dict and reasons list."""
     base = extra.get("base_risk", 1)
     if not isinstance(base, int) or isinstance(base, bool):
         base = 1
     base = max(1, min(5, base))
-    open_sum = sum(r["points"] for r in _open_reasons(con, run, task_id))
-    return max(1, min(5, base + open_sum))
+    return max(1, min(5, base + sum(r["points"] for r in reasons)))
 
 
 def _phases_from_run(rows, header, run, con):
@@ -1562,9 +1565,10 @@ def _phases_from_run(rows, header, run, con):
                               "verdict": r["verdict"], **_routing_of(r), "subtasks": []}
             # F.1: risk fields from extra_json + risk_reasons
             extra = _task_extra(con, run, r["id"])
-            nodes[r["id"]]["risk"] = _task_risk(con, run, r["id"])
+            reasons = _open_reasons(con, run, r["id"])
+            nodes[r["id"]]["risk"] = _risk_of(extra, reasons)
             nodes[r["id"]]["critical"] = extra.get("critical") is True
-            nodes[r["id"]]["open_reasons"] = _open_reasons(con, run, r["id"])
+            nodes[r["id"]]["open_reasons"] = reasons
     for r in rows:  # pass 2: attach in rowid order — the parent node already exists, any depth
         node = nodes.get(r["id"])
         if node is None:
@@ -2088,38 +2092,12 @@ def _schema6_v6(home):
     the upgrade twice changes nothing."""
     data = os.path.join(home, "schema6-v5")
     os.makedirs(data, exist_ok=True)
-    # Build a v5 store using the old migration chain (no _v6)
-    bare = sqlite3.connect(os.path.join(data, "mk.db"))
-    bare.executescript("""
-        CREATE TABLE plans(
-          id TEXT PRIMARY KEY, version INTEGER, title TEXT, header_json TEXT, body_md TEXT,
-          approved_at TEXT, archived_path TEXT, status TEXT, created TEXT, design TEXT,
-          integration TEXT);
-        CREATE TABLE runs(
-          id TEXT PRIMARY KEY, plan TEXT, plan_version INTEGER, branch TEXT, status TEXT, stage TEXT,
-          next TEXT, started TEXT, ended TEXT, extra_json TEXT);
-        CREATE TABLE tasks(
-          run TEXT, id TEXT, parent TEXT, type TEXT, title TEXT, acceptance TEXT, owned TEXT, deps TEXT,
-          parallel INTEGER, route_json TEXT, status TEXT, prev_status TEXT, file_status TEXT,
-          lane TEXT, slot TEXT, branch TEXT, pane TEXT, round INTEGER, verdict TEXT,
-          updated TEXT, extra_json TEXT, PRIMARY KEY(run, id));
-        CREATE TABLE events(
-          id INTEGER PRIMARY KEY, run TEXT, task TEXT, t TEXT, chan TEXT, kind TEXT, from_id TEXT,
-          to_id TEXT, reply_to TEXT, text TEXT, artifact_id INTEGER, meta_json TEXT);
-        CREATE INDEX ev_task ON events(run, task, id);
-        CREATE TABLE artifacts(
-          id INTEGER PRIMARY KEY, run TEXT, task TEXT, round INTEGER, kind TEXT, rev INTEGER,
-          text TEXT, created TEXT);
-        CREATE TABLE acks(run TEXT, msg TEXT, lane TEXT, level INTEGER, t TEXT, PRIMARY KEY(run, msg, lane));
-        CREATE TABLE lane_slots(
-          slot TEXT PRIMARY KEY, lane_path TEXT, state TEXT, run TEXT, task TEXT,
-          workspace TEXT, workspace_id TEXT, branch TEXT, lock_hash TEXT, updated TEXT);
-        CREATE TABLE waits(id INTEGER PRIMARY KEY, run TEXT, question TEXT, opened TEXT, cleared TEXT);
-        CREATE TABLE change_log(change_no INTEGER PRIMARY KEY, run TEXT, task TEXT, t TEXT);
-        CREATE TABLE schema_version(version INTEGER PRIMARY KEY);
-    """)
-    bare.execute("INSERT INTO schema_version(version) VALUES (5)")
-    # Add some rows to verify they survive the upgrade
+    # Build the v5 store with the real old chain (stops before _v6): event_src, artifacts.src, art_run_src
+    bare = open_project(home, data_dir=data, version=5)
+    _check(bare.execute("SELECT MAX(version) v FROM schema_version").fetchone()["v"] == 5, "v5 store is not at 5")
+    _check("src" in [c[1] for c in bare.execute("PRAGMA table_info(artifacts)")]
+           and bare.execute("SELECT 1 FROM sqlite_master WHERE name IN ('event_src','art_run_src')").fetchone(),
+           "v5 chain store lacks artifacts.src / event_src / art_run_src")
     bare.execute("INSERT INTO runs(id, plan, status, started) VALUES ('r1','p1','active','2026-01-01')")
     bare.execute("INSERT INTO tasks(run, id, parent, type, title, status, updated)"
                  " VALUES ('r1','T1',NULL,'phase','Phase 1','planned','2026-01-01')")

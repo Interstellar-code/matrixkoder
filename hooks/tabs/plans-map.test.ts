@@ -2,7 +2,7 @@
 import { test, expect } from 'claude-code/testing'
 import list from './fixtures/plans-list'
 import detail from './fixtures/plan-detail'
-import { laneAgent, planFromReply, plansErrorLine, plansFromOverview, plansFromReply } from './plans-map'
+import { laneAgent, naturalCompare, planFromReply, plansErrorLine, plansFromOverview, plansFromReply } from './plans-map'
 import liveOverview from './fixtures/overview-live'
 import type { PlansView } from './plans'
 
@@ -351,4 +351,11 @@ test('planFromReply orders a phase\'s tasks and a task\'s subtasks by natural ta
   const rows = view.phases?.[0]?.rows ?? []
   expect(rows.map(r => r.id)).toEqual(['F.2', 'F.4', 'F.10', 'F.S', 'L10'])
   expect(rows[4]?.subs?.map(s => s.id)).toEqual(['L10.12a', 'L10.12b', 'L10.13'])
+})
+
+test('natural task id order without ICU: Z9 < Z10 < Z20, digits before text (Z27)', () => {
+  const t = (id: string) => ({ id, title: id, status: 'planned', subtasks: [] })
+  const view = planFromReply({ id: 'p', phases: [{ id: 'Z', tasks: [t('Z20'), t('Z9'), t('Z10'), t('Z2a'), t('Z')] }] })
+  expect((view.phases?.[0]?.rows ?? []).map(r => r.id)).toEqual(['Z', 'Z2a', 'Z9', 'Z10', 'Z20'])
+  expect(naturalCompare('F.10', 'F.S')).toBeLessThan(0)
 })

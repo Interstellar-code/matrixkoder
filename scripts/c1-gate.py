@@ -22,6 +22,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import tokenize
 from pathlib import Path
 
 NAMES = ("mk.db", "matrixkoder.yaml", "project.yaml", "lanes.json", "watch-cursors.json",
@@ -49,11 +50,40 @@ def wanted(rel):
     return not {"__tests__", "tests", "fixtures", "__pycache__", "node_modules"} & set(p.parts)
 
 
+def _line_hits(rel, first, text, src, out):
+    for off, chunk in enumerate(text.split("\n")):
+        for m in NAME_RE.finditer(chunk):
+            out.append((rel, first + off, m.group(1), src[first + off - 1].strip()))
+
+
+def _py_hits(rel, text):
+    """Name hits inside string tokens only: comments and docstrings (a lone string statement) are skipped."""
+    src = text.splitlines()
+    out, prev = [], None
+    toks = list(tokenize.generate_tokens(io.StringIO(text).readline))
+    for i, tok in enumerate(toks):
+        kind = tokenize.tok_name[tok.type]
+        if kind == "STRING" and prev in (None, "NEWLINE", "INDENT", "DEDENT", "NL"):
+            nxt = next((t for t in toks[i + 1:] if t.type not in (tokenize.NL, tokenize.COMMENT)), None)
+            if nxt is None or nxt.type in (tokenize.NEWLINE, tokenize.ENDMARKER):
+                prev = kind
+                continue
+        if kind in ("STRING", "FSTRING_MIDDLE"):
+            _line_hits(rel, tok.start[0], tok.string, src, out)
+        if kind not in ("NL", "COMMENT"):
+            prev = kind
+    return out
+
+
 def hits_in(rel, text):
+    if rel.endswith(".py"):
+        try:
+            return _py_hits(rel, text)
+        except (tokenize.TokenError, SyntaxError):
+            pass  # shortcut: an untokenizable file falls back to the line scan, which counts docstrings
     out = []
     for i, line in enumerate(text.splitlines(), 1):
         s = line.strip()
-        # shortcut: a docstring body line still counts, upgrade to ast/tokenize if it gets noisy
         if s.startswith(COMMENT) or not any(q in line for q in "\"'`"):
             continue
         for m in NAME_RE.finditer(line):
@@ -149,6 +179,13 @@ def self_test():
         assert [fmt(h) for h in hits] == ["hooks/tabs/v.ts:1: events.jsonl", "scripts/a.py:1: mk.db",
                                           "scripts/a.py:2: run.json"], hits  # mkpaths, tests, comments not counted
         assert cmd_check(t, 3, None) == 0
+        # a docstring and an inline comment naming a store file are not counted
+        (t / "scripts" / "d.py").write_text('"""Module doc: mk.db lives here."""\n\n\ndef f():\n    """Reads "run.json"."""\n'
+                                            '    x = 1  # "mk.db" note\n    return x\n')
+        assert len(scan_dir(t)) == 3, scan_dir(t)
+        # --root is accepted after the subcommand
+        out = subprocess.run([sys.executable, __file__, "count", "--root", d], capture_output=True, text=True)
+        assert out.stdout.splitlines()[0] == "3", out
         with open(t / "scripts" / "a.py", "a") as f:
             f.write('z = "lanes.json"\n')
         assert cmd_check(t, 3, None) == 1  # rise fails
@@ -176,13 +213,16 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--root", default=str(ROOT))
+    # SUPPRESS keeps a --root given before the subcommand when the subcommand's own is absent
+    rootopt = argparse.ArgumentParser(add_help=False)
+    rootopt.add_argument("--root", default=argparse.SUPPRESS)
     sub = ap.add_subparsers(dest="cmd")
-    c = sub.add_parser("count")
+    c = sub.add_parser("count", parents=[rootopt])
     c.add_argument("--json", action="store_true")
-    k = sub.add_parser("check")
+    k = sub.add_parser("check", parents=[rootopt])
     k.add_argument("--baseline", type=int, required=True)
     k.add_argument("--base")
-    r = sub.add_parser("ratchet")
+    r = sub.add_parser("ratchet", parents=[rootopt])
     r.add_argument("--baseline", type=int, required=True)
     a = ap.parse_args()
     if a.self_test:
