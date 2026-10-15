@@ -660,22 +660,37 @@ def build_rules():
 
     def r01(ctx):
         # C2: exactly two DB kinds. Under the whole temp root that is the root store, one
-        # store per C2 project, and the pre-migration project's own <data>/mk.db. Any other
-        # mk.db would be a third kind.
+        # store per data dir, and the pre-migration project's own <data>/mk.db. Any other
+        # mk.db would be a third kind. A "project" = one data dir (realpath); its store =
+        # the root rows' db_path. All rows of one data dir must agree on db_path.
+        # C5: the legacy <data>/mk.db of a migrated project is the frozen pre-switch copy
+        # until --archive runs, so it is expected too.
         found = sorted(_rel(ctx, os.path.join(ctx["root"], p)) for p in _all_mkdb(ctx["root"]))
         want = {_rel(ctx, os.path.join(ctx["home"], "mk.db"))}
-        want.update(_rel(ctx, mkpaths.target_project_db(s, ctx["home"])) for s in ctx["slugs"])
+        by_data = {}
         for slug in ctx["known"]:
-            if slug not in ctx["slugs"]:        # pre-migration: the store stays at <data>
-                data = ctx["data_of"].get(slug)
-                if data:
-                    want.add(_rel(ctx, os.path.join(data, "mk.db")))
+            data = ctx["data_of"].get(slug)
+            if data:
+                by_data.setdefault(os.path.realpath(data), []).append(slug)
+        bad = []
+        for data, slugs in sorted(by_data.items()):
+            paths = {ctx["db_paths"].get(s) for s in slugs}
+            paths.discard(None)
+            if len(paths) > 1:
+                bad.append(f"data dir {data} has disagreeing db_paths: {sorted(paths)}")
+                continue
+            if len(paths) == 1:
+                want.add(_rel(ctx, paths.pop()))
+                want.add(_rel(ctx, os.path.join(data, "mk.db")))  # legacy frozen copy
+            else:
+                want.add(_rel(ctx, os.path.join(data, "mk.db")))
         stray = sorted(p for p in found if p not in want)
         missing = sorted(p for p in want if p not in found)
-        ok = not stray and not missing
+        ok = not stray and not missing and not bad
         return ok, f"{len(found)} mk.db under the temp root: {found}" \
+            + (f"; disagreeing {bad}" if bad else "") \
             + (f"; stray {stray}" if stray else "") \
-            + (f"; missing {missing}" if missing else ""), stray or missing
+            + (f"; missing {missing}" if missing else ""), stray or missing or bad
 
     def r02(ctx):
         # A migrated plan lives under the C2 project folder; a pre-migration one under its
@@ -827,18 +842,26 @@ def build_rules():
             (f"; wrong {bad}" if bad else ""), bad
 
     def r11(ctx):
+        # One entry per data dir: the NEW store is the db_path the root rows agree on
+        # (R01 enforces agreement), the legacy store is <data>/mk.db, frozen until --archive.
         bad = []
+        by_data = {}
         for slug in ctx["migrated"]:
-            new_db = mkpaths.target_project_db(slug, ctx["home"])
-            legacy = ctx["legacy_digest_after"].get(slug)
-            if not os.path.isfile(new_db):
-                bad.append(f"no NEW store at {_rel(ctx, new_db)}")
+            data = ctx["data_of"].get(slug)
+            if data:
+                by_data.setdefault(os.path.realpath(data), []).append(slug)
+        for data, slugs in sorted(by_data.items()):
+            new_db = ctx["db_paths"].get(slugs[0])
+            if not new_db or not os.path.isfile(new_db):
+                bad.append(f"no NEW store at {_rel(ctx, new_db or os.path.join(data, 'mk.db'))}")
                 continue
-            if _store_digest(new_db) == ctx["new_store_before"].get(slug):
+            if _store_digest(new_db) == ctx["new_store_before"].get(slugs[0]):
                 bad.append(f"{_rel(ctx, new_db)} did not change after the switch")
-            if legacy is not None and _store_digest(ctx["legacy_db"][slug]) != legacy:
-                bad.append(f"legacy store {_rel(ctx, ctx['legacy_db'][slug])} changed after the switch")
-        return not bad, f"{len(ctx['migrated'])} migrated projects" + \
+            for slug in slugs:
+                legacy = ctx["legacy_digest_after"].get(slug)
+                if legacy is not None and _store_digest(ctx["legacy_db"][slug]) != legacy:
+                    bad.append(f"legacy store {_rel(ctx, ctx['legacy_db'][slug])} changed")
+        return not bad, f"{len(by_data)} migrated projects" + \
             (f"; wrong {bad}" if bad else ""), bad
 
     def r12(ctx):
@@ -944,6 +967,7 @@ def build_context(home):
         "slugs": migrated, "known": sorted(known), "migrated": migrated,
         "plans": plans, "runs": runs, "lanes": sorted(str(p) for p in manifest.get("lanes", [])),
         "data_of": data_of, "live_dir": live_dir,
+        "db_paths": {s: r.get("db_path") for s, r in known.items() if r.get("db_path")},
         "bus_files_up": manifest.get("bus_files_up") or [],
         "archived_counts": manifest.get("archived_counts") or {},
         "legacy_db": manifest.get("legacy_db") or {},
@@ -1240,6 +1264,23 @@ def _mutations(_unused):
         finally:
             con.close()
 
+
+    @m("R01", "disagreeing db_paths for one data dir", "disagreeing")
+    def _(f):
+        con = mkdb.open_root(f["home"])
+        try:
+            con.execute("INSERT INTO projects(slug, name, repo, data_dir, mode, db_path, created)"
+                        " VALUES (?,?,?,?,?,?,?)",
+                        (f["slug"] + "-alias", f["slug"] + "-alias", os.path.realpath(f["repo"]),
+                         f["data"], "home", os.path.join(f["home"], "projects", f["slug"] + "-alias", "mk.db"),
+                         "e2e"))
+            con.commit()
+        finally:
+            con.close()
+
+    @m("R01", "a missing second project store", "fixb")
+    def _(f):
+        os.unlink(os.path.join(f["data_b"], "mk.db"))
     return out
 
 
@@ -1265,6 +1306,27 @@ def self_test():
     try:
         broken = [r["id"] for r in _results_of(f["home"]) if not r["ok"]]
         _check(not broken, f"the clean fixture fails {broken}")
+    finally:
+        shutil.rmtree(f["root"], ignore_errors=True)
+    # (a) alias + canonical rows with one db_path: R01 and R11 must PASS, not fail
+    f = _fixture(None)
+    try:
+        con = mkdb.open_root(f["home"])
+        try:
+            row = con.execute("SELECT db_path FROM projects WHERE slug=?",
+                              (f["slug"],)).fetchone()
+            con.execute("INSERT INTO projects(slug, name, repo, data_dir, mode, db_path, created)"
+                        " VALUES (?,?,?,?,?,?,?)",
+                        (f["slug"] + "-alias", f["slug"] + "-alias", os.path.realpath(f["repo"]),
+                         f["data"], "home", row["db_path"], "e2e"))
+            con.commit()
+        finally:
+            con.close()
+        results = {r["id"]: r for r in _results_of(f["home"])}
+        _check(results["R01"]["ok"],
+               f"alias row with same db_path makes R01 fail: {results['R01']['detail']}")
+        _check(results["R11"]["ok"],
+               f"alias row with same db_path makes R11 fail: {results['R11']['detail']}")
     finally:
         shutil.rmtree(f["root"], ignore_errors=True)
     # the refusal, before anything is created
