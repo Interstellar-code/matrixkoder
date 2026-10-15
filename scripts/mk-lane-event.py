@@ -33,17 +33,25 @@ land in the watch file so a repeated identical event is a no-op. pane.exited on 
 STALL "agent exited"; after any verdict an exit is just post-finish cleanup. A herdr ERROR probe is
 not a verdict (the next event retries). Silence (crash, hang) produces no event at all — `sweep` is
 the backstop: no file/commit/pane change for stall_min since last_activity → STALL by the same rules.
-A build dispatch to an armed lane also records the route and checks the task BEFORE anything is
-typed (D1.5.3/D1.5.4): --agent/--model/--effort write the route to every armed task via
-`mk-state task set <T> agent=.. model=.. effort=..` (one call per task, --by dispatch) — without
---agent the armed watch's kind is the agent and model/effort stay empty — and a
+A build dispatch to an armed lane runs EVERY guard BEFORE anything is published, written or typed
+(todo 130/R2): the task/slot mismatch refusal (below), the route write and the mandatory-field
+check all run first, so a refused dispatch leaves the bus and the lane exactly as they were — it
+publishes no brief to the bus, writes no <lane>.matrixkoder-brief.md and types no prompt. Order:
+mismatch refusal, then (D1.5.3/D1.5.4) --agent/--model/--effort write the route to every armed task
+via `mk-state task set <T> agent=.. model=.. effort=..` (one call per task, --by dispatch) —
+without --agent the armed watch's kind is the agent and model/effort stay empty — and a
 `mk-state task check <T>` on the lead task gates the dispatch: a missing mandatory field
 (title/acceptance/parent-unless-phase/owned-when-briefed/agent-at-dispatch) refuses it
-(ok:false, delivered:false, nothing typed — no prompt, no fresh-session reset) unless --force
-sends and the reply says the check was forced. Both run before the prompt is typed, so a refused
-check can still stop everything; a mk-state failure rides in the reply as task_route_error /
-task_check_error and never fails the delivery verdict; every reply carries the recorded route.
---role review and unarmed panes skip both (status_unchanged already covers review).
+(ok:false, delivered:false, nothing published or typed) unless --force sends and the reply says
+the check was forced. Only after the guards pass does the doorbell/publish run, and it publishes
+the DISPATCHED task's brief — --task when it names a member of the armed group, else the lead
+(todo 130/HIGH: a group lane's --task B must publish B's brief, never always the lead's).
+todo 130 (group lanes): the mismatch refusal compares against the whole ARMED GROUP
+(watch_tasks(w) = [A, B]) and the slot's recorded group (mk-lane.py acquire records "A,B"), so a
+group lane dispatches with no --task or with --task <member>; only a --task outside the group, or
+a slot whose acquire recorded a different group, is refused. A mk-state failure rides in the reply
+as task_route_error / task_check_error and never fails the delivery verdict; every reply carries
+the recorded route. --role review and unarmed panes skip all of it (status_unchanged covers review).
 dispatch is the one-call prompt helper: `herdr agent prompt <pane> <text> --wait --timeout <ms>`
 (binary from $MK_HERDR, default herdr). A timeout proves nothing either way — the text may already
 be in flight — so the pane's own state decides delivery: pane list still `working` → delivered:true;
@@ -744,29 +752,56 @@ def slot_acquired_task(data, slot):
     return (r.get("task") or None), None
 
 
+def _task_group(value):
+    """A comma string as a task list: "A,B" → ["A", "B"]; "" → []. `mk-lane.py acquire` records
+    a group lane's slot task as the raw --tasks string, so the comparison below splits it."""
+    return [x.strip() for x in str(value or "").split(",") if x.strip()]
+
+
+def dispatched_task(w, named):
+    """The task a dispatch delivers for: --task when it names a member of the armed group (the
+    group's own spelling), else the lead task. todo 130/HIGH: the brief published on the bus and
+    copied into a bus-down lane must be the DISPATCHED task's, never always the lead's."""
+    group = watch_tasks(w)
+    if named:
+        for t in group:
+            if str(t).lower() == str(named).lower():
+                return t
+    return group[0] if group else (w or {}).get("task")
+
+
 def dispatch_task_mismatch(w, named, data, run):
     """todo 130: dispatch must refuse when the pane's armed task is not the task
     `mk-lane.py acquire` recorded for that slot — the bug that published the previous task's
     brief after a slot was reused. -> error string, or None when they agree / the registry
     cannot be read (an unknown never blocks a dispatch).
 
+    GROUP LANES: a lane armed `arm --tasks A,B` has the armed GROUP watch_tasks(w) = [A, B],
+    while acquire records the slot's task as "A,B". So --task must name a member of the armed
+    group (never compare it to the lead alone), and the slot's recorded group (split on `,`)
+    must equal the armed group — case- and order-insensitively. Comparing single ids rejected
+    every group dispatch, and every `--task B` on a group lane.
+
     Reads the store directly (one read-only SELECT): a child mk-state call here would show up
     in a caller's fake-$MK_STATE_CMD log, and this is only a read."""
-    armed = (w or {}).get("task")
-    if not armed:
+    group = watch_tasks(w)
+    if not group:
         return None
-    if named and str(named).lower() != str(armed).lower():
-        return (f"dispatch names task {named} but the pane's armed task is {armed}")
+    if named and str(named).lower() not in {t.lower() for t in group}:
+        return (f"dispatch names task {named} but the pane's armed tasks are {', '.join(group)}")
     if not (data and run):
         return None
-    rows = store_rows(data, "SELECT slot FROM tasks WHERE run=? AND lower(id)=lower(?)", (run, str(armed)))
+    rows = store_rows(data, "SELECT slot FROM tasks WHERE run=? AND lower(id)=lower(?)",
+                      (run, str(group[0])))
     slot = rows[0].get("slot") if rows else None
     acquired, err = slot_acquired_task(data, slot)
     if err:
         return None  # an unreadable registry is "cannot say": never blocks a dispatch
-    if acquired and str(acquired).lower() != str(armed).lower():
-        return (f"the pane's armed task {armed} is not the task {acquired} acquire recorded "
-                f"for slot {slot}")
+    if not acquired:
+        return None
+    if {t.lower() for t in _task_group(acquired)} != {t.lower() for t in group}:
+        return (f"the pane's armed tasks {', '.join(group)} are not the tasks {acquired} "
+                f"acquire recorded for slot {slot}")
     return None
 
 
@@ -1179,21 +1214,79 @@ def cmd_dispatch(a):
     # was published. A yaml flag is not enough: a bus that is enabled but down, or a
     # publish that fails, keeps today's full prompt (C12).
     connected, legacy_note, lane_brief = False, None, None
-    if opt(a, "--role", "build") == "build":
-        hit = find_armed(pane)
-        wdata = (hit[1].get("data") or "") if hit else ""
-        wrun, wtask = (hit[1].get("run"), hit[1].get("task")) if hit else (None, None)
+    role = opt(a, "--role", "build")
+    if role not in ("build", "review"):
+        fail("--role must be build or review")
+    round_kind = opt(a, "--kind", "build")
+    if round_kind not in ("build", "fix", "takeover"):
+        fail("--kind must be build, fix or takeover")
+    try:
+        ms = int(opt(a, "--timeout-ms", "25000"))
+    except ValueError as e:
+        fail(f"--timeout-ms: {e}")
+
+    def reply(d, note=None):
+        n = "; ".join(x for x in (legacy_note, note) if x)
+        out({**d, "connect": connected, **({"lane_brief": lane_brief} if lane_brief else {}),
+             **({"note": n} if n else {})})
+
+    # todo 130/R2: EVERY guard runs BEFORE anything is published, written or typed. A refused
+    # dispatch (a task/slot mismatch, --task outside the armed group, or the mandatory-field
+    # check) leaves the bus and the lane exactly as they were — the live bug this round fixes
+    # published the stale lead's brief before the mismatch was even checked.
+    hit = find_armed(pane) if role == "build" else None
+    route = route_err = None
+    check = None
+    check_unavailable = None
+    disp_task = None
+    if hit:
+        w = hit[1]
+        mismatch = dispatch_task_mismatch(w, opt(a, "--task"), w.get("data"), w.get("run"))
+        if mismatch and "--force" not in a:
+            reply({"ok": False, "delivered": False, "pane": pane,
+                   "armed_task": w.get("task"), "error": mismatch})
+            return
+        # HIGH: publish/copy the DISPATCHED task's brief, never always the lead's: --task names
+        # the round being handed off, so its brief is the one that belongs on the bus.
+        disp_task = dispatched_task(w, opt(a, "--task"))
+        route, route_err = record_route(
+            w, agent=opt(a, "--agent"), model=opt(a, "--model"), effort=opt(a, "--effort"))
+        ok, missing, chk_err = task_check(w, w.get("task"))
+        if chk_err and ok:
+            check_unavailable = chk_err  # reported on every reply; never gates
+        if not ok and "--force" not in a:
+            # Refused: NOTHING is typed — no herdr prompt call at all, no fresh-session reset.
+            reply({"ok": False, "delivered": False, "pane": pane,
+                   "check": {"ok": False, "missing": missing},
+                   "error": f"task check failed: missing {', '.join(missing) or chk_err or 'fields'}",
+                   **({"route": route} if route else {}),
+                   **({"task_route_error": route_err} if route_err else {}),
+                   **({"task_check_error": chk_err} if chk_err else {})})
+            return
+        if not ok:
+            check = {"ok": False, "missing": missing, "forced": True}
+    # The doorbell (bus on): the brief and the token are not in the lane, so the typed
+    # prompt is only the connect doorbell. A build dispatch to an armed lane with a live
+    # bus rings it by default (--connect says so explicitly); --no-connect keeps the
+    # caller's full prompt unchanged, which is also the bus-down path and every dispatch
+    # that predates the doorbell. The reply says which one was typed: connect, and a note
+    # when the lane is armed but the full prompt went anyway.
+    # The doorbell replaces the prompt ONLY when the bus is actually up and the brief
+    # was published. A yaml flag is not enough: a bus that is enabled but down, or a
+    # publish that fails, keeps today's full prompt (C12). It runs only AFTER the guards
+    # above: a refused dispatch publishes nothing (todo 130/R2).
+    if role == "build" and hit:
+        wdata = hit[1].get("data") or ""
+        wrun = hit[1].get("run")
         why = None
-        if not hit:
-            pass
-        elif "--no-connect" in a:
+        if "--no-connect" in a:
             why = "--no-connect given"
         elif not bus_enabled(wdata):
             why = "bus.enabled is false"
         elif not bus_is_up(wdata):
             why = "bus is down"
         else:
-            ok, publish_error = publish_brief(wdata, wrun, wtask)
+            ok, publish_error = publish_brief(wdata, wrun, disp_task)
             if ok:
                 # A /new sent just before must not merge with the typed line (todo 74):
                 # wait, bounded, until the pane agent is idle or done. A pane that is
@@ -1213,16 +1306,15 @@ def cmd_dispatch(a):
                 if publish_error:
                     # the full prompt is kept; the reply says why the doorbell was not typed
                     a = list(a) + ["--publish-error", publish_error]
-                    alert_publish_failure(wdata, wrun, wtask, publish_error)
+                    alert_publish_failure(wdata, wrun, disp_task, publish_error)
         if why:
             legacy_note = f"legacy prompt: {why}"
             # A2/X3.2: the bus-down fallback copies the DB brief into the lane. Only here —
             # when the bus is up the lane reads the brief over the bus (connect) and no copy
             # is written (docs: "bus-down-fallback-only").
-            if hit:
-                btext, _bn = brief_body_for(wdata, wrun, wtask)
-                lane_brief = write_lane_brief(hit[1].get("lane") or "", btext)
-    elif opt(a, "--lane") and "--no-connect" not in a:
+            btext, _bn = brief_body_for(wdata, wrun, disp_task)
+            lane_brief = write_lane_brief(hit[1].get("lane") or "", btext)
+    elif role == "review" and opt(a, "--lane") and "--no-connect" not in a:
         # review over the bus: the reviewer pane shares the builder's lane, so the lane's
         # watch file names the run/task; the review brief goes as its own kind and the pane
         # gets `connect --role review`. No --lane keeps the typed review prompt (old callers).
@@ -1252,60 +1344,6 @@ def cmd_dispatch(a):
         if why:
             legacy_note = f"legacy prompt: {why}"
 
-    def reply(d, note=None):
-        n = "; ".join(x for x in (legacy_note, note) if x)
-        out({**d, "connect": connected, **({"lane_brief": lane_brief} if lane_brief else {}),
-             **({"note": n} if n else {})})
-
-    role = opt(a, "--role", "build")
-    if role not in ("build", "review"):
-        fail("--role must be build or review")
-    round_kind = opt(a, "--kind", "build")
-    if round_kind not in ("build", "fix", "takeover"):
-        fail("--kind must be build, fix or takeover")
-    try:
-        ms = int(opt(a, "--timeout-ms", "25000"))
-    except ValueError as e:
-        fail(f"--timeout-ms: {e}")
-    # D1.5.3/D1.5.4, before ANY herdr call (before the fresh-session reset, before the prompt
-    # text, even when the bus doorbell would replace it): a build dispatch to an armed lane
-    # records its route on the armed tasks and runs the mandatory-field check on the lead
-    # task. The route write happens first so a refused check below can still stop everything
-    # (nothing typed, no reset). --role review skips both — the reviewer is not the route
-    # owner, and status_unchanged already covers it. An unarmed pane skips both: today's
-    # behaviour, unchanged.
-    route = route_err = None
-    check = None
-    check_unavailable = None
-    if role == "build":
-        hit = find_armed(pane)
-        if hit:
-            w = hit[1]
-            # todo 130: the mismatch refusal runs BEFORE the route write and the field check —
-            # a dispatch aimed at a slot whose acquire recorded a different task must type
-            # nothing. An unreadable registry is "cannot say" and never blocks.
-            mismatch = dispatch_task_mismatch(w, opt(a, "--task"), w.get("data"), w.get("run"))
-            if mismatch and "--force" not in a:
-                reply({"ok": False, "delivered": False, "pane": pane,
-                       "armed_task": w.get("task"), "error": mismatch})
-                return
-            route, route_err = record_route(
-                w, agent=opt(a, "--agent"), model=opt(a, "--model"), effort=opt(a, "--effort"))
-            ok, missing, chk_err = task_check(w, w.get("task"))
-            if chk_err and ok:
-                check_unavailable = chk_err  # reported on every reply; never gates
-            if not ok and "--force" not in a:
-                # Refused: NOTHING is typed — no herdr prompt call at all, no fresh-session
-                # reset. The check gates the dispatch, not the prompt text.
-                reply({"ok": False, "delivered": False, "pane": pane,
-                       "check": {"ok": False, "missing": missing},
-                       "error": f"task check failed: missing {', '.join(missing) or chk_err or 'fields'}",
-                       **({"route": route} if route else {}),
-                       **({"task_route_error": route_err} if route_err else {}),
-                       **({"task_check_error": chk_err} if chk_err else {})})
-                return
-            if not ok:
-                check = {"ok": False, "missing": missing, "forced": True}
     # a fix/takeover round on fresh_session: new resets the agent's session first: the command,
     # then a bounded idle wait, then the prompt exactly as today. Everything else (build, review,
     # fresh_session: same, no armed kind, unknown kind) skips this and sends one prompt as before.
@@ -4026,17 +4064,20 @@ def self_test():
         assert res31b["building"] == [] and sorted(res31b["skipped_terminal"]) == ["H31", "H32"], res31b
         mkx("task", "set", "H31", "status=merged")
 
-        # (todo 130b) dispatch refuses when --task names a different task than the pane's
-        # armed task, and when the slot's acquired task disagrees. Nothing is typed.
+        # (todo 130b) dispatch refuses when --task names a task OUTSIDE the pane's armed group,
+        # and when the slot's acquired group disagrees. Nothing is typed. The lane above is
+        # armed `--tasks H31,H32`, so H32 is a MEMBER of the armed group and a --task H32 is a
+        # legitimate group-lane dispatch — the old assertion here that it must fail was the
+        # group-lane bug itself (R2).
         # The bus is pinned down (an empty MK_BUS_DIR) so the legacy path decides: no doorbell.
         nobus = os.path.join(tmp, "nobus")
         os.makedirs(nobus, exist_ok=True)
         set_canned("prompt_out.txt", '{"result": {"agent": {"agent_status": "idle"}}}\n')
         set_canned("prompt_rc.txt", "0")
         n0 = len(prompt_calls())
-        r = cli("dispatch", "--pane", pane_of("H31"), "--text", "go", "--task", "H32",
+        r = cli("dispatch", "--pane", pane_of("H31"), "--text", "go", "--task", "H99",
                 extra={"MK_BUS_DIR": nobus})
-        assert r["ok"] is False and r["delivered"] is False and "H32" in r["error"], r
+        assert r["ok"] is False and r["delivered"] is False and "H99" in r["error"], r
         assert len(prompt_calls()) == n0, "a mismatched dispatch typed a prompt"
         # the slot registry disagrees: slot 1 belongs to a DIFFERENT task than the armed one
         mkx("task", "set", "H31", "slot=1")
@@ -4069,6 +4110,96 @@ def self_test():
         r = cli("dispatch", "--pane", pane_of("H31"), "--text", "go", extra={"MK_BUS_DIR": nobus})
         assert r["ok"] is True and r["delivered"] is True, r
         assert len(prompt_calls()) == n0 + 1, prompt_calls()[n0:]
+
+        # (R2 a/b/c) the R2 fixes: a refused dispatch publishes NOTHING and writes nothing, a
+        # group lane dispatches with or without --task and publishes the DISPATCHED task's
+        # brief, and a merged lead is never demoted by a delivered dispatch. Distinct briefs on
+        # H31 (lead, merged) and H32 (member) let the published text name the task.
+        _c = mkdb.open_project(s_home14, "matrixkoder", data_dir=xdata)
+        try:
+            for _tid in ("H31", "H32"):
+                _c.execute("DELETE FROM artifacts WHERE run='r1' AND task=? AND kind='brief'", (_tid,))
+            _c.commit()
+        finally:
+            _c.close()
+        mkdb.put_artifact(s_home14, "matrixkoder", "r1", "H31", 1, "brief",
+                          "# H31 brief\nLEADTEXT\n", data_dir=xdata)
+        mkdb.put_artifact(s_home14, "matrixkoder", "r1", "H32", 1, "brief",
+                          "# H32 brief\nSECONDTEXT\n", data_dir=xdata)
+        lane_brief31 = os.path.join(lane31, ".matrixkoder-brief.md")
+        # the 130a case above leaves H31=merged and H32=qa; the merged-led lane needs H32 open
+        # (building) so a delivered dispatch has a non-terminal member to arm.
+        mkx("task", "set", "H32", "status=building")
+        # (a) bus DOWN: the mismatched dispatch publishes nothing, writes no lane brief, types no
+        # prompt — the guards run before write_lane_brief (the live wrong-brief bug).
+        for p_ in (lane_brief31,):
+            if os.path.exists(p_):
+                os.unlink(p_)
+        n0 = len(prompt_calls())
+        r = cli("dispatch", "--pane", pane_of("H31"), "--text", "go", "--task", "H99",
+                extra={"MK_BUS_DIR": nobus})
+        assert r["ok"] is False and "H99" in r["error"], r
+        assert not os.path.exists(lane_brief31), "a refused dispatch wrote the lane brief"
+        assert len(prompt_calls()) == n0, prompt_calls()[n0:]
+        # (a) bus UP: a pinned $MK_BUS_DIR with a real /health and the fake mk-bus that records
+        # every argv; the refused dispatch sends nothing to the bus.
+        from http.server import ThreadingHTTPServer as _THS
+        class _HB(BaseHTTPRequestHandler):
+            def do_GET(self):
+                b = b'{"ok": true, "status": "healthy"}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+            def log_message(self, *a):
+                pass
+        buspin = os.path.join(tmp, "buspin")
+        os.makedirs(buspin, exist_ok=True)
+        # the doorbell waits for the pane to read idle before it types, so the fake list must
+        # name this pane idle (the canned list from earlier cases names other panes)
+        set_canned("pane_list_out.txt", json.dumps({"result": {"panes": [
+            {"pane_id": pane_of("H31"), "agent_status": "idle"}]}}) + "\n")
+        _bsrv = _THS(("127.0.0.1", 0), _HB)
+        threading.Thread(target=_bsrv.serve_forever, daemon=True).start()
+        open(os.path.join(buspin, "bus.json"), "w").write(
+            json.dumps({"port": _bsrv.server_address[1]}))
+        try:
+            n0, b0 = len(prompt_calls()), len(bus_calls())
+            r = cli("dispatch", "--pane", pane_of("H31"), "--text", "go", "--task", "H99",
+                    extra={"MK_BUS_DIR": buspin})
+            assert r["ok"] is False and "H99" in r["error"], r
+            assert bus_calls()[b0:] == [], bus_calls()[b0:]
+            assert not os.path.exists(lane_brief31), "a refused dispatch wrote the lane brief"
+            assert len(prompt_calls()) == n0, prompt_calls()[n0:]
+            # (b) a GROUP lane: no --task publishes the LEAD's brief; --task H32 publishes H32's
+            n0, b0 = len(prompt_calls()), len(bus_calls())
+            r = cli("dispatch", "--pane", pane_of("H31"), "--text", "go", extra={"MK_BUS_DIR": buspin})
+            assert r["ok"] is True and r["delivered"] is True, r
+            assert "LEADTEXT" in " ".join(bus_calls()[b0:]) and "SECONDTEXT" not in " ".join(bus_calls()[b0:]), \
+                bus_calls()[b0:]
+            assert len(prompt_calls()) == n0 + 1, prompt_calls()[n0:]
+            n0, b0 = len(prompt_calls()), len(bus_calls())
+            r = cli("dispatch", "--pane", pane_of("H31"), "--text", "go", "--task", "H32",
+                    extra={"MK_BUS_DIR": buspin})
+            assert r["ok"] is True and r["delivered"] is True, r
+            assert "SECONDTEXT" in " ".join(bus_calls()[b0:]) and "LEADTEXT" not in " ".join(bus_calls()[b0:]), \
+                bus_calls()[b0:]
+            assert len(prompt_calls()) == n0 + 1, prompt_calls()[n0:]
+            # (c) the merged LEAD is never demoted by those delivered dispatches
+            assert mkx("task", "get", "H31")["task"]["status"] == "merged", "the merged lead was demoted"
+            assert mkx("task", "get", "H32")["task"]["status"] == "building", "the member was not building"
+        finally:
+            _bsrv.shutdown()
+            _bsrv.server_close()
+        # (b, bus-down) the same group lane falls back to the DISPATCHED task's brief file
+        if os.path.exists(lane_brief31):
+            os.unlink(lane_brief31)
+        r = cli("dispatch", "--pane", pane_of("H31"), "--text", "go", "--task", "H32",
+                extra={"MK_BUS_DIR": nobus})
+        assert r["ok"] is True and r.get("lane_brief"), r
+        assert "SECONDTEXT" in open(lane_brief31).read(), open(lane_brief31).read()
+        if os.path.exists(lane_brief31):
+            os.unlink(lane_brief31)
 
         # (A2/X3.2) the bus-down fallback copies the brief into the lane. The bus is pinned
         # down; the store holds a brief artifact for the lane's lead task (dispatch publishes
