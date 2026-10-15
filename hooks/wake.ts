@@ -1,4 +1,5 @@
-// MatrixKoder wake on lane events: polls events.jsonl and submits prompt on transition events (strict types)
+// MatrixKoder wake on lane events: polls the project store's events and submits prompt on
+// transition events (the retired events.jsonl is a labelled fallback, C4/L5) (strict types)
 import type { EngineInterface, On, PluginOptions, Timer } from 'claude-code'
 import type { MkWakePending } from '../types'
 import { join, parseJson, sanitizeText } from './data'
@@ -14,7 +15,8 @@ const CLAIM_DEAD_MS = 2 * 60 * 1000 // 2 minutes: a claim without a completed se
 const HOLD_GONE = -1 // a hold that already gave up: never blocks a later identical text
 const STORE_READ_MS = 5000 // one-shot mkdb read; a timeout skips the tick (file mode is not a fallback)
 
-/** One events.jsonl object, or the same shape mapped from a store row. `id` is set only in store mode. */
+/** One events.jsonl object (fallback mode), or the same shape mapped from a store row.
+ *  `id` is set only in store mode. */
 type WakeEvent = {
   type?: unknown
   task?: unknown
@@ -96,9 +98,50 @@ function armDebounce($: EngineInterface): void {
   })
 }
 
-/** The task's CURRENT status at flush time: run.json is authoritative, else the task's
- *  own task.json copy (state-schema v1). undefined = neither is readable — the caller
- *  keeps the item, a read error must not silently eat a wake. */
+/** The task's CURRENT status at flush time, from the project store (C4/L5): one
+ *  `mkdb.py run-snapshot --run <R>` read for the whole batch, since every pending item belongs
+ *  to the same run. null means the store could not answer (a pre-migration project with no
+ *  store, or a refused spawn) and the caller falls back to the file views.
+ *
+ *  The file reads below are the FALLBACK ONLY: run.json, else the task's own task.json copy
+ *  (state-schema v1). mk-state stops writing both in L4. Note the store's `ready` is a kanban
+ *  column, not a status: the reader publishes it as `planned`/`routed` plus a `ready` flag, so
+ *  a task promoted to ready never reads as a wake status. */
+async function storeTaskStatuses(
+  $: EngineInterface,
+  dataDir: string,
+  run: string,
+): Promise<Map<string, string> | null> {
+  let ran: { exitCode: number; stdout: string }
+  try {
+    ran = await $.process.run(
+      ['python3', `${$.plugin.root}/scripts/mkdb.py`, '--data', dataDir, 'run-snapshot',
+       '--run', run, '--json'],
+      { timeoutMs: STORE_READ_MS },
+    )
+  } catch {
+    return null
+  }
+  if (ran.exitCode !== 0) return null
+  const doc = parseJson(ran.stdout)
+  if (doc === null || typeof doc !== 'object' || !('run' in doc)) return null
+  const tasks = (doc as { run: unknown }).run
+  if (tasks === null || typeof tasks !== 'object' || !Array.isArray((tasks as { tasks?: unknown }).tasks)) {
+    return null // the run is not there: not an answer this reader can use
+  }
+  const out = new Map<string, string>()
+  for (const t of (tasks as { tasks: unknown[] }).tasks) {
+    if (t !== null && typeof t === 'object') {
+      const o = t as { id?: unknown; status?: unknown }
+      if (typeof o.id === 'string' && typeof o.status === 'string') out.set(o.id, o.status)
+    }
+  }
+  return out
+}
+
+/** FALLBACK (C4/L5): the retired file views — run.json first, then the task's own task.json
+ *  copy. Only reached when the store could not answer. undefined = neither is readable — the
+ *  caller keeps the item, a read error must not silently eat a wake. */
 async function currentTaskStatus($: EngineInterface, dataDir: string, run: string, task: string): Promise<string | undefined> {
   const runObj = parseJson(await $.fs.read(paths.runDoc(dataDir, run)).catch(() => ''))
   const tasks = runObj != null && typeof runObj === 'object' && Array.isArray((runObj as { tasks?: unknown }).tasks)
@@ -169,9 +212,11 @@ async function flushBatch($: EngineInterface): Promise<void> {
   // A later status change may already have reversed a transition while the batch waited:
   // re-read each task's current status and drop items that no longer hold it.
   const dataDir = await wakeDataDir($)
+  // one store read answers every item's current status; null falls back to the file views
+  const store = await storeTaskStatuses($, dataDir, pend.run)
   const items: PendingItem[] = []
   for (const p of pend.items) {
-    const status = await currentTaskStatus($, dataDir, pend.run, p.task)
+    const status = store?.get(p.task) ?? await currentTaskStatus($, dataDir, pend.run, p.task)
     if (status === undefined || status === p.to) items.push(p)
   }
   if (items.length === 0) {
@@ -289,26 +334,18 @@ async function storeMode($: EngineInterface, dataDir: string): Promise<'store' |
   }
 }
 
-/** Read-only events for one run, via mkdb._open_read (the only opener). Rows map onto the
- *  events.jsonl shape mk-state's event_line uses: type=kind, to=to_id, text=text, and by
- *  from meta_json (a direct transition() leaves meta_json NULL, which the view renders as
- *  orchestrator — so those rows do not self-wake). */
-const STORE_EVENTS_PY = [
-  'import json,sys,os',
-  'sys.path.insert(0, sys.argv[1])',
-  'import mkdb',
-  'p=os.path.join(sys.argv[2], "mk.db")',
-  'c=mkdb._open_read(p, mkdb.SCHEMA)',
-  'rows=[]',
-  'if c is not None:',
-  '    try:',
-  '        rows=[dict(r) for r in c.execute(',
-  '            "SELECT id, run, task, t, chan, kind, to_id, text, meta_json FROM events WHERE run=? ORDER BY id",',
-  '            (sys.argv[3],))]',
-  '    finally:',
-  '        c.close()',
-  'print(json.dumps({"ok": True, "events": rows}))',
-].join('\n')
+/** Read-only events for one run, through `mkdb.py events` (C4/L5) — the ONE store reader.
+ * It replaces the inline `python3 -c` probe that imported mkdb and opened `<data>/mk.db`
+ * itself; `--data` now resolves the store through mkpaths.project_folder, so a migrated
+ * project is read from its C2 store instead of the pre-switch copy. `--chan state` is the
+ * reader's default. The rows map onto the events.jsonl shape mk-state's event_line renders:
+ * type=kind, to=to_id, text=text, and by from meta_json (a direct transition() leaves
+ * meta_json NULL, which the view renders as orchestrator — so those rows do not self-wake).
+ * The whole run comes back, exactly as the probe returned it: the poll's cursor is an
+ * events.id compared against the rows in hand. */
+function storeEventsArgv(root: string, dataDir: string, runId: string): readonly string[] {
+  return ['python3', `${root}/scripts/mkdb.py`, '--data', dataDir, 'events', '--run', runId, '--json']
+}
 
 function storeRowToEvent(row: Record<string, unknown>): WakeEvent {
   let by: unknown = 'orchestrator'
@@ -327,13 +364,13 @@ function storeRowToEvent(row: Record<string, unknown>): WakeEvent {
   return { type: row.kind, task: row.task, to: row.to_id, text: row.text, by, id }
 }
 
+/** One `mkdb.py events` spawn, or undefined when it could not answer. Undefined skips the
+ *  tick: store mode never falls through to the file view, because the two use different
+ *  cursor units (events.id vs a line count). */
 async function readStoreEvents($: EngineInterface, dataDir: string, runId: string): Promise<WakeEvent[] | undefined> {
   let ran: { exitCode: number; stdout: string }
   try {
-    ran = await $.process.run(
-      ['python3', '-c', STORE_EVENTS_PY, join($.plugin.root, 'scripts'), dataDir, runId],
-      { timeoutMs: STORE_READ_MS },
-    )
+    ran = await $.process.run(storeEventsArgv($.plugin.root, dataDir, runId), { timeoutMs: STORE_READ_MS })
   } catch {
     return undefined
   }
@@ -370,17 +407,53 @@ async function readFileEvents($: EngineInterface, eventsPath: string): Promise<W
   return out
 }
 
+/** The active run id, from the project store (C4/L5) with the runs index as the FALLBACK.
+ *
+ *  null means the store could not answer (a pre-migration project with no store, or a refused
+ *  spawn) and the retired `<data>/runs/index.json` is read instead; a store that answers with
+ *  no active run is not null, it is the end of the poll.
+ *
+ *  The pick stays the index file's: the FIRST active entry in a list ordered by `started`
+ *  ascending, i.e. the OLDEST active run. The reader's own `active` field is the NEWEST one
+ *  (the dashboard's pick), which would move wake onto a different run of a busy project. */
+async function activeRunId($: EngineInterface, dataDir: string): Promise<string | null | undefined> {
+  let ran: { exitCode: number; stdout: string }
+  try {
+    ran = await $.process.run(
+      ['python3', `${$.plugin.root}/scripts/mkdb.py`, '--data', dataDir, 'run-snapshot', '--json'],
+      { timeoutMs: STORE_READ_MS },
+    )
+  } catch {
+    return undefined
+  }
+  if (ran.exitCode !== 0) return undefined
+  const doc = parseJson(ran.stdout)
+  if (doc === null || typeof doc !== 'object' || !Array.isArray((doc as { runs?: unknown }).runs)) {
+    return undefined
+  }
+  const list = (doc as { runs: unknown[] }).runs
+  const first = list.find(r =>
+    r !== null && typeof r === 'object' && (r as { status?: unknown }).status === 'active'
+    && typeof (r as { id?: unknown }).id === 'string')
+  return first === undefined ? null : (first as { id: string }).id
+}
+
+/** FALLBACK (C4/L5): the retired `<data>/runs/index.json`, first active entry. */
+async function activeRunIdFromFiles($: EngineInterface, dataDir: string): Promise<string | null> {
+  const runs = parseJson(await $.fs.read(paths.runsIndex(dataDir)).catch(() => ''))
+  if (!Array.isArray(runs)) return null
+  const entry = runs.find((r): r is { id: string } =>
+    r !== null && typeof r === 'object' && (r as { status?: unknown }).status === 'active'
+    && typeof (r as { id?: unknown }).id === 'string')
+  return entry?.id ?? null
+}
+
 async function pollEvents($: EngineInterface): Promise<void> {
   try {
     const dataDir = await wakeDataDir($)
-    const indexPath = paths.runsIndex(dataDir)
-    let runs: unknown
-    try {
-      runs = JSON.parse(await $.fs.read(indexPath))
-    } catch {
-      runs = null
-    }
-    const active = Array.isArray(runs) ? (runs.find((r: { status?: string }) => r.status === 'active') as { id?: string } | undefined) : undefined
+    const fromStore = await activeRunId($, dataDir)
+    const activeId = fromStore === undefined ? await activeRunIdFromFiles($, dataDir) : fromStore
+    const active = activeId == null ? undefined : { id: activeId }
     // a batch found before a reload (or a held/failed submit) is still owed, but only to the run that is still active
     const owed = await readPending($)
     if (owed.items.length > 0 && (!active?.id || owed.run !== active.id)) {

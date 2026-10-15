@@ -1392,6 +1392,42 @@ test('same task and ask id in a new run wakes again inside 5 min', { options: { 
 const storeRow = (id: number, task: string, to: string, by: string, text = '') =>
   ({ id, run: 'r1', task, t: '2026-10-07T20:00:00+02:00', chan: 'state', kind: 'transition', to_id: to, text, meta_json: JSON.stringify({ by }) })
 
+/** Answers the two read-only store reads wake makes (C4/L5), and nothing else:
+ *  `mkdb.py run-snapshot` (the active run and, at flush time, every task's status) and
+ *  `mkdb.py events` (the run's feed). Every other spawn gets today's empty answer, so a test
+ *  that means to run in store mode names the reader it expects.
+ *
+ *  `tasks` maps a task id to its CURRENT status — the run-snapshot reply the flush reads to
+ *  drop a transition a later status reversed. An empty map means "the store did not name this
+ *  task", which is not an answer: the caller then falls back to the file views. */
+function storeReader(
+  on: On,
+  state: { rows: Record<string, unknown>[]; active?: string; tasks?: Record<string, string> },
+  seen?: string[][],
+): void {
+  const ok = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+  on('process.run', (_$, e) => {
+    const argv = [...e.argv] as string[]
+    seen?.push(argv)
+    const sub = argv.find(a => a === 'events' || a === 'run-snapshot')
+    if (sub === 'events') return ok(JSON.stringify({ ok: true, events: state.rows }))
+    if (sub === 'run-snapshot') {
+      const run = argv[argv.indexOf('--run') + 1]
+      const withRun = argv.includes('--run')
+      const doc = {
+        ok: true,
+        runs: [{ id: state.active ?? 'r1', status: 'active', started: '2026-10-07T16:00:00+02:00' }],
+        active: state.active ?? null,
+        run: withRun
+          ? { id: run, status: 'active', stage: 0, tasks: Object.entries(state.tasks ?? {}).map(([id, status]) => ({ id, status })) }
+          : null,
+      }
+      return ok(JSON.stringify(doc))
+    }
+    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+}
+
 test('store mode: the cursor is the last consumed events.id and never re-fires', { options: { wake: true } }, async ($, on) => {
   // mk.db present selects the store. The cursor baselines to the max id (no wake for
   // history), then a higher id wakes once; a later poll of the same rows does not.
@@ -1404,27 +1440,22 @@ test('store mode: the cursor is the last consumed events.id and never re-fires',
     '/data/runs/r1/events.jsonl': EV('F6', 'verifying') + EV('F8', 'stalled'),
   }
   const w = wakeWorld(on, files, [], { MATRIXKODER_DATA: '/data' }, '/tmp')
-  let rows = [storeRow(1, 'F6', 'verifying', 'lane-watch')]
+  const feed = { rows: [storeRow(1, 'F6', 'verifying', 'lane-watch')], active: 'r1', tasks: {} as Record<string, string> }
   const runs: string[][] = []
-  on('process.run', (_$, e) => {
-    if (!e.argv.includes('-c')) {
-      return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
-    }
-    runs.push([...e.argv])
-    return { value: { exitCode: 0, stdout: JSON.stringify({ ok: true, events: rows }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
-  })
+  storeReader(on, feed, runs)
   await $.session.start(START('/tmp'))
 
   await clock.advance(30000) // first poll: baseline to id 1, no submit
   expect(w.submitted, 'history does not wake').toEqual([])
   expect(w.store.get('wakeEventLines:r1'), 'baseline is the max id').toBe(-2)
-  expect(runs[0]?.[0]).toBe('python3')
-  expect(runs[0]?.[1]).toBe('-c')
-  expect(runs[0]?.slice(4)).toEqual(['/data', 'r1'])
-  expect(String(runs[0]?.[2])).toContain('_open_read')
+  const ev = runs.find(a => a.includes('events'))
+  expect(ev?.[1]).toMatch(/scripts[/\\]mkdb\.py$/)
+  expect(ev?.slice(2)).toEqual(['--data', '/data', 'events', '--run', 'r1', '--json'])
 
-  rows = [storeRow(1, 'F6', 'verifying', 'lane-watch'), storeRow(2, 'F8', 'stalled', 'lane-watch')]
+  feed.tasks = { F6: 'verifying', F8: 'stalled' } // the store's CURRENT status per task
+  feed.rows = [storeRow(1, 'F6', 'verifying', 'lane-watch'), storeRow(2, 'F8', 'stalled', 'lane-watch')]
   await clock.advance(30000) // poll sees id 2
+  await clock.advance(30000) // the tick's async tail (one store read per poll) lands here
   await clock.advance(60000) // debounce submits
   expect(w.submitted).toEqual(['MatrixKoder: F8 → stalled. Continue the run from its Next action.'])
   expect(w.store.get('wakeEventLines:r1')).toBe(-3)
@@ -1433,14 +1464,16 @@ test('store mode: the cursor is the last consumed events.id and never re-fires',
   await clock.advance(60000)
   expect(w.submitted.length, 'the same ids do not wake again').toBe(1)
 
-  rows = [storeRow(1, 'F6', 'verifying', 'lane-watch'), storeRow(2, 'F8', 'stalled', 'lane-watch'), storeRow(4, 'F9', 'quota', 'lane-watch')]
+  feed.tasks = { F6: 'verifying', F8: 'stalled', F9: 'quota' }
+  feed.rows = [storeRow(1, 'F6', 'verifying', 'lane-watch'), storeRow(2, 'F8', 'stalled', 'lane-watch'), storeRow(4, 'F9', 'quota', 'lane-watch')]
   await clock.advance(30000)
   await clock.advance(60000)
   expect(w.submitted.length).toBe(2)
   expect(w.submitted[1]).toBe('MatrixKoder: F9 → quota. Continue the run from its Next action.')
   expect(w.store.get('wakeEventLines:r1'), 'a gap leaves the cursor at the highest id').toBe(-5)
 
-  rows = [...rows, storeRow(5, 'F2', 'provider', 'lane-watch')]
+  feed.tasks = { F6: 'verifying', F8: 'stalled', F9: 'quota', F2: 'provider' }
+  feed.rows = [...feed.rows, storeRow(5, 'F2', 'provider', 'lane-watch')]
   await clock.advance(30000)
   await clock.advance(60000)
   expect(w.submitted.length, 'id 5 wakes once; id 2 is not repeated').toBe(3)
@@ -1460,13 +1493,8 @@ test('store mode: a saved line-count cursor baselines to the max events.id witho
   }
   const w = wakeWorld(on, files, [], { MATRIXKODER_DATA: '/data' }, '/tmp')
   w.store.set('wakeEventLines:r1', 1) // old line count; the form key is absent
-  let rows = [storeRow(1, 'F6', 'verifying', 'lane-watch'), storeRow(2, 'F8', 'stalled', 'lane-watch'), storeRow(4, 'F9', 'quota', 'lane-watch')]
-  on('process.run', (_$, e) => {
-    if (!e.argv.includes('-c')) {
-      return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
-    }
-    return { value: { exitCode: 0, stdout: JSON.stringify({ ok: true, events: rows }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
-  })
+  const feed = { rows: [storeRow(1, 'F6', 'verifying', 'lane-watch'), storeRow(2, 'F8', 'stalled', 'lane-watch'), storeRow(4, 'F9', 'quota', 'lane-watch')], active: 'r1', tasks: {} as Record<string, string> }
+  storeReader(on, feed)
   await $.session.start(START('/tmp'))
 
   await clock.advance(30000)
@@ -1474,7 +1502,8 @@ test('store mode: a saved line-count cursor baselines to the max events.id witho
   expect(w.submitted, 'the old line count is not read as an events.id').toEqual([])
   expect(w.store.get('wakeEventLines:r1'), 'baseline is the max id, marked as an id cursor').toBe(-5)
 
-  rows = [...rows, storeRow(5, 'F2', 'provider', 'lane-watch')]
+  feed.tasks = { F6: 'verifying', F8: 'stalled', F9: 'quota', F2: 'provider' }
+  feed.rows = [...feed.rows, storeRow(5, 'F2', 'provider', 'lane-watch')]
   await clock.advance(30000)
   await clock.advance(60000)
   expect(w.submitted).toEqual(['MatrixKoder: F2 → provider. Continue the run from its Next action.'])
@@ -1485,6 +1514,40 @@ test('store mode: a saved line-count cursor baselines to the max events.id witho
   await clock.advance(60000)
   expect(w.submitted.length, 'a preserved id cursor does not re-fire').toBe(1)
   expect(w.store.get('wakeEventLines:r1')).toBe(-6)
+})
+
+test('store mode: the run and its events come from the store with no file views at all', { options: { wake: true } }, async ($, on) => {
+  // The post-L4 world (C4/L5): `<data>/runs/index.json` and `events.jsonl` are gone. mk.db is
+  // there, and the two read-only readers — `mkdb.py run-snapshot` for the active run and every
+  // task's current status, `mkdb.py events` for the feed — are the only sources. The wake still
+  // fires, and the flush still keeps only the transitions that hold.
+  const clock = mock.clock(on)
+  const files: Record<string, string> = { '/data/mk.db': '' } // no index.json, no events.jsonl
+  const w = wakeWorld(on, files, [], { MATRIXKODER_DATA: '/data' }, '/tmp')
+  const feed = { rows: [storeRow(1, 'F6', 'verifying', 'lane-watch')], active: 'r1', tasks: { F6: 'verifying' } as Record<string, string> }
+  storeReader(on, feed)
+  await $.session.start(START('/tmp'))
+
+  await clock.advance(30000) // first tick: baseline to the max id, no wake for history
+  expect(w.submitted, 'history does not wake').toEqual([])
+  expect(w.store.get('wakeEventLines:r1'), 'baseline is the max id').toBe(-2)
+
+  // id 2 names a transition the store shows already reversed: the batch is dropped, the
+  // cursor still moves past it, and nothing reaches the prompt.
+  feed.rows = [...feed.rows, storeRow(2, 'F8', 'stalled', 'lane-watch')]
+  feed.tasks = { F6: 'verifying', F8: 'verifying' }
+  await clock.advance(30000)
+  await clock.advance(30000)
+  await clock.advance(60000)
+  expect(w.submitted, 'a transition the store shows reversed does not wake').toEqual([])
+
+  // id 3 is one the store still reports: that is the prompt.
+  feed.rows = [...feed.rows, storeRow(3, 'F9', 'quota', 'lane-watch')]
+  feed.tasks = { F6: 'verifying', F8: 'verifying', F9: 'quota' }
+  await clock.advance(30000)
+  await clock.advance(30000)
+  await clock.advance(60000)
+  expect(w.submitted).toEqual(['MatrixKoder: F9 → quota. Continue the run from its Next action.'])
 })
 
 test('file mode: a preserved line-count cursor does not re-fire, and a failed store read does not fall through', { options: { wake: true } }, async ($, on) => {

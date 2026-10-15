@@ -73,6 +73,10 @@ const SWEEP_INTERVAL_MS = 120_000
 // stays short — a slow one is swallowed and the next tick retries.
 const BUS_INTERVAL_MS = 15_000
 const BUS_TIMEOUT_MS = 10_000
+// The store read (mkdb.py run-snapshot): one python3 spawn per refresh tick (5 s). The
+// reader opens the store mode=ro, so it is a query, not a lock; the timeout only covers a
+// wedged spawn, and a refused one falls back to the file views.
+const STORE_READ_MS = 5000
 const PRIMARY_POOL: Record<string, string> = { agy: 'gemini', claude: 'default' }
 // the pane's glyph/colour vocabularies moved to tabs/ui.ts: one copy for the
 // pane and the tab modules (T1/T2)
@@ -581,11 +585,64 @@ async function readText($: EngineInterface, path: string): Promise<string | null
  *  globalDirOf, listedDataDir, resolveDataDir and homeDir. The dashboard asks them with
  *  `requireExisting`, so a repo whose data dir is not there yet answers null (first-run). */
 
+/** The runs list + the active run's document, from the project store (C4/L5).
+ *
+ *  `mkdb.py run-snapshot --data <dir> --json` is the ONE read-only reader the pane uses for
+ *  what run.json and runs/index.json used to hold (L5's addition to scripts/mkdb.py). It opens
+ *  the store `mode=ro`, never migrates and never creates it; `--data` resolves through
+ *  mkpaths.project_folder, so a migrated project is read from its C2 store and not from the
+ *  pre-switch copy still sitting in the data dir.
+ *
+ *  null means "the store could not answer" — a pre-migration project with no store, a store
+ *  this code is too new/old for, a refused or slow spawn. The caller then falls back to the
+ *  file views. An empty but successful answer ({runs: [], run: null}) is NOT null: it means
+ *  the store is there and holds no active run, which is the NoRun panel, not a fallback. */
+async function readStoreSnapshot($: EngineInterface, dataDir: string): Promise<{
+  runs: MkRunIndexEntry[]
+  run: MkRun | null
+  error: string | null
+} | null> {
+  let ran: { exitCode: number; stdout: string }
+  try {
+    ran = await $.process.run(
+      ['python3', `${$.plugin.root}/scripts/mkdb.py`, '--data', dataDir, 'run-snapshot', '--json'],
+      { timeoutMs: STORE_READ_MS },
+    )
+  } catch {
+    return null
+  }
+  if (ran.exitCode !== 0) return null
+  const doc = parseJson(ran.stdout) as { runs?: unknown; run?: unknown } | null
+  if (doc === null || typeof doc !== 'object' || !Array.isArray(doc.runs)) return null
+  const run = coerceRun(doc.run)
+  if (doc.run != null && run == null) return null // a run the store named that we cannot read
+  return { runs: coerceIndex(doc.runs), run, error: null }
+}
+
 /** Loads every active run, newest first. The NEWEST keeps the single-run
  *  semantics it always had — its run/error drive the ⚠ note, the NoRun panel
- *  and the chip/toasts/wake inputs (snap.run); an OLDER run whose run.json
- *  cannot be read is skipped, never blanking the pane. */
+ *  and the chip/toasts/wake inputs (snap.run); an OLDER run that cannot be read
+ *  is skipped, never blanking the pane.
+ *
+ *  C4/L5: the project store is the only source of truth. The store answers the whole
+ *  question in one read (the runs list and the newest active run's document), so the
+ *  file views below are a FALLBACK ONLY: a pre-migration project with no store, or a
+ *  store this code cannot read. mk-state stops writing run.json/index.json in L4, so
+ *  the fallback stops firing the moment the store exists. */
 async function loadRuns($: EngineInterface, dataDir: string): Promise<{ run: MkRun | null; activeRuns: MkRun[]; runs: ReturnType<typeof coerceIndex>; error: string | null }> {
+  const store = await readStoreSnapshot($, dataDir)
+  if (store != null) {
+    const activeRuns = store.run == null ? [] : [store.run]
+    return { run: store.run, activeRuns, runs: store.runs, error: null }
+  }
+  return loadRunsFromFiles($, dataDir)
+}
+
+/** FALLBACK (C4/L5): the retired file views — `<data>/runs/index.json` and each
+ *  `runs/<id>/run.json`. Only reached when the project store cannot answer: a
+ *  pre-migration project, or a store this code is too new/old for. Everything here
+ *  goes away with the views in L4. */
+async function loadRunsFromFiles($: EngineInterface, dataDir: string): Promise<{ run: MkRun | null; activeRuns: MkRun[]; runs: ReturnType<typeof coerceIndex>; error: string | null }> {
   const runs = coerceIndex(await readJson($, join(dataDir, 'runs/index.json')))
   const active = activeEntries(runs)
   const head = active[0]
@@ -600,7 +657,7 @@ async function loadRuns($: EngineInterface, dataDir: string): Promise<{ run: MkR
   return { run: first.run, activeRuns, runs, error: null }
 }
 
-/** One run.json → a coerced run, or the error the loader reports for it. */
+/** FALLBACK (C4/L5): one `run.json` → a coerced run, or the error the loader reports for it. */
 async function readRun($: EngineInterface, dataDir: string, entry: MkRunIndexEntry): Promise<{ run: MkRun | null; error: string | null }> {
   const runPath = join(dataDir, 'runs', entry.id, 'run.json')
   const text = await readText($, runPath)
@@ -628,10 +685,41 @@ async function loadSnapshot($: EngineInterface, cwd: string): Promise<MkSnapshot
   }
   const gdir = await globalDirOf($, home)
   const usage = gdir ? coerceUsage(await readJson($, paths.usage(gdir))) : null
-  // the project yaml scopes the usage section (and its poll) to this project's agents and providers
-  const yaml = dataDir != null ? await readText($, paths.projectYaml(dataDir)) : null
+  // the project yaml scopes the usage section (and its poll) to this project's agents and
+  // providers. yamlPathFor, not paths.projectYaml: on a MIGRATED project the file is the C2
+  // `<project>/project.yaml`, and the pre-migration `<data>/matrixkoder.yaml` is gone.
+  const yaml = dataDir != null
+    ? await readText($, await yamlPathFor($, dataDir, home)).catch(() => null)
+    : null
   const projectAgents = orderAgents(parseYamlAgents(yaml ?? ''))
   return { ...mkSnapshot(now, dataDir, run, activeRuns, runs, usage, projectAgents), error }
+}
+
+// --- the project yaml path, resolved once per refresh tick (todo 118) ---
+// projectYamlPath answers with the C2 `project.yaml` on a migrated project and
+// `<data>/matrixkoder.yaml` before it. It costs one `mkdb.py projects --json` spawn
+// (paths.ts's single storeRows reader), and three callers want it per tick: the
+// snapshot's usage scoping, the usage poll's providers, and the Settings loader.
+// One memo per tick gives them one spawn; `storeRows` itself stays private to paths.ts.
+let yamlPathMemo: { dataDir: string; path: string } | null = null
+
+/** The project's yaml path for this tick (see yamlPathMemo). A refused resolve
+ *  answers the pre-migration path, which is also the FALLBACK a store-less project has. */
+async function yamlPathFor($: EngineInterface, dataDir: string, home: string | null): Promise<string> {
+  if (yamlPathMemo?.dataDir === dataDir) return yamlPathMemo.path
+  let path = paths.projectYaml(dataDir)
+  try {
+    path = await projectYamlPath($, dataDir, { home, store: true })
+  } catch {
+    // the store read refused — the pre-migration path is also what a store-less project has
+  }
+  yamlPathMemo = { dataDir, path }
+  return path
+}
+
+/** Drops the memo at the start of a tick, so the next tick re-reads the root store. */
+function resetYamlPathMemo(): void {
+  yamlPathMemo = null
 }
 
 async function applyStatus($: EngineInterface, options: PluginOptions, snap: MkSnapshot): Promise<void> {
@@ -1095,6 +1183,7 @@ async function refreshCards($: EngineInterface): Promise<void> {
 
 /** Never throws: a failing load keeps the last good snapshot and flags the error. */
 async function refreshSafe($: EngineInterface, options: PluginOptions, cwd: string): Promise<void> {
+  resetYamlPathMemo() // one store read for the yaml path per tick, not one per caller
   const prev = await read($, snapshotAtom)
   try {
     const snap = await loadSnapshot($, cwd)
@@ -1107,7 +1196,7 @@ async function refreshSafe($: EngineInterface, options: PluginOptions, cwd: stri
     await refreshPlans($, cwd)
   } catch (err) {
     try {
-      await update($, snapshotAtom, () => ({ ...prev, error: `cannot read run.json (${String(err).slice(0, 40)})` }))
+      await update($, snapshotAtom, () => ({ ...prev, error: `cannot read the run state (${String(err).slice(0, 40)})` }))
     } catch {
       // even the atom write failed — nothing more to do
     }
@@ -1177,7 +1266,7 @@ async function ensureBus($: EngineInterface, options: PluginOptions, cwd: string
     const dataDir = await resolveDataDir($, { cwd, home: await homeDir($), requireExisting: true, store: true })
     if (dataDir == null) return // first-run: the wizard writes the data dir
     // the pane's own snapshot, not a second loadSnapshot: the refresh timer owns
-    // reading run.json, and startLoop always populates this before either call site
+    // reading the run state, and startLoop always populates this before either call site
     const snap = await read($, snapshotAtom) as MkPaneSnapshot
     if (snap.run == null) return // only an active run owns a bus
     const script = `${$.plugin.root}/scripts/mk-bus.py`
@@ -1221,7 +1310,7 @@ async function projectProviders($: EngineInterface, cwd: string): Promise<readon
     const home = await homeDir($)
     const dataDir = await resolveDataDir($, { cwd, home, requireExisting: true, store: true })
     if (dataDir == null) return null
-    const yaml = await readText($, paths.projectYaml(dataDir))
+    const yaml = await readText($, await yamlPathFor($, dataDir, home))
     if (yaml == null) return null
     const providers = parseYamlProviders(yaml)
     return providers != null && providers.length > 0 ? providers : null
@@ -1302,7 +1391,7 @@ async function ensureSettingsLoaded($: EngineInterface): Promise<void> {
     // the LIVE yaml path: the C2 `<project>/project.yaml` once this project is
     // migrated, `<dataDir>/matrixkoder.yaml` before (paths.projectYamlPath is
     // mkpaths.project_yaml's rule — a data dir alone cannot tell them apart).
-    const yamlPath = dataDir == null ? null : await projectYamlPath($, dataDir, { home, store: true })
+    const yamlPath = dataDir == null ? null : await yamlPathFor($, dataDir, home)
     let yamlExists = false
     if (yamlPath != null) {
       try {

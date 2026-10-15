@@ -8,6 +8,28 @@ import type { Files, MockWorld } from './testkit'
 import { parseYamlAgents } from './data'
 import { waitingPane, waitingPaneView } from './dashboard'
 import { mockTabCounts, waitingCount } from './tabs/header'
+import { RUN_SNAPSHOT } from './fixtures/run-snapshot'
+
+/** The `process` answer for the pane's store read (C4/L5): `mkdb.py run-snapshot` replies
+ *  with the captured real payload, every other spawn with today's empty answer. A number is
+ *  that exit code — the "the store could not answer" case, which sends the pane to the file
+ *  views (what a pre-migration project gets). Handed to `mockWorld`, so it stays the ONE
+ *  process.run registration the test has; the reply is read through `state` because a test
+ *  cannot register a second handler after the first `$.` call. */
+type StoreState = { reply: unknown; argv: string[][] }
+
+function storeSnapshot(state: StoreState): (argv: readonly string[]) => {
+  value: { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean; isStderrTruncated: boolean }
+} | undefined {
+  return a => {
+    state.argv.push([...a] as string[])
+    if (!a.includes('run-snapshot')) return undefined
+    const blank = { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
+    const reply = state.reply
+    if (typeof reply === 'number') return { value: { ...blank, exitCode: reply } }
+    return { value: { ...blank, stdout: typeof reply === 'string' ? reply : JSON.stringify(reply) } }
+  }
+}
 
 /** a project matrixkoder.yaml in the wizard's emitter shape: agents block + usage providers */
 const PROJECT_YAML = [
@@ -24,6 +46,75 @@ const PROJECT_YAML = [
   '  poll_min: 5',
   '  providers: [claude, codex, antigravity]',
 ].join('\n')
+
+// --- C4/L5: the pane reads the project store; the file views are a fallback ---------------
+
+/** The captured reply's run as the file-view fixture the pane used to read: the same
+ *  document, so the two paths can be compared by what they DRAW, not by what they hold.
+ *  Only the run document feeds the pane (the chip, the run header, ▶ Next, the waiting
+ *  block, the task rows); the index list feeds the NoRun panel. */
+function storeRun(): Record<string, unknown> {
+  return JSON.parse(JSON.stringify(RUN_SNAPSHOT.run)) as Record<string, unknown>
+}
+
+test('C4/L5: the store reply renders the pane with the file views deleted', async ($, on) => {
+  const files: Files = {} // post-L4: no runs/index.json, no run.json, nothing
+  mockFs(on, files, [DATA_DIR, `${PROJECT_DIR}/.git`])
+  const store: StoreState = { reply: RUN_SNAPSHOT, argv: [] }
+  mockWorld(on, { process: storeSnapshot(store) })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  expect(await ui.find({ text: 'L5 fixtures' }), 'the run name comes from the store').toBeTruthy()
+  expect(await ui.find({ text: /▶ Next: verify T1 gates/ }), 'the next-action line').toBeTruthy()
+  expect(await ui.find({ text: /Merge T1 now\?/ }), 'the wait block').toBeTruthy()
+  expect(await ui.find({ text: /T1/ }), 'a task row').toBeTruthy()
+  const snap = store.argv.find(a => a.includes('run-snapshot'))
+  expect(snap?.[0]).toBe('python3')
+  expect(snap?.slice(2)).toEqual(['--data', DATA_DIR, 'run-snapshot', '--json'])
+})
+
+test('C4/L5: the store reply and the retired file views draw the same text', async ($, on) => {
+  // The same run, read twice: once off the store with no file view anywhere, and once off a
+  // run.json carrying the very document the store answered with. An identical draw is the
+  // acceptance: the reader is a drop-in for the view it replaces. One world, switched
+  // between the two reads — a test cannot register a second handler after the first `$.` call.
+  const files: Files = {}
+  mockFs(on, files, [DATA_DIR, `${PROJECT_DIR}/.git`])
+  const store: StoreState = { reply: RUN_SNAPSHOT, argv: [] }
+  const clock = mockWorld(on, { process: storeSnapshot(store) })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  const fromStore = rowTexts(await ui.drawn()).join('\n')
+  expect(fromStore.length, 'the store drew something').toBeGreaterThan(0)
+
+  files[`${DATA_DIR}/runs/l5fix/run.json`] = JSON.stringify(storeRun())
+  files[RUNS_INDEX] = JSON.stringify([{ id: 'l5fix', feature: 'L5 fixtures', status: 'active', started: '2026-10-07T16:00:00+02:00' }])
+  store.reply = 2 // the store refuses: the file views answer
+  await clock.advance(5000)
+  const fromFiles = rowTexts(await ui.drawn()).join('\n')
+  expect(fromStore, 'the store and the file view must draw the same text').toEqual(fromFiles)
+})
+
+test('C4/L5: a store that cannot answer falls back to the file views', async ($, on) => {
+  const files = worldFiles()
+  const fs = mockFs(on, files)
+  mockWorld(on, { process: storeSnapshot({ reply: 2, argv: [] }) }) // no store, or unreadable
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  expect(await ui.find({ text: 'workflows-v2' }), 'the fallback drew the run').toBeTruthy()
+  expect(fs.reads, 'the fallback really read run.json').toContain(RUN_PATH)
+})
+
+test('C4/L5: the store wins over the file views when both are present', async ($, on) => {
+  const files = worldFiles()
+  setRun(files, run => { run.feature = 'from-the-file-view' })
+  mockFs(on, files)
+  mockWorld(on, { process: storeSnapshot({ reply: RUN_SNAPSHOT, argv: [] }) })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  expect(await ui.find({ text: 'L5 fixtures' }), 'the store is the source of truth').toBeTruthy()
+  expect(await ui.find({ text: 'from-the-file-view' }), 'the file view is not consulted').toBeUndefined()
+})
 
 test('renders section titles, a task row and the agy pool sub-row', { plugins: [worldFixtures] }, async ($, on) => {
   const files = worldFiles()
