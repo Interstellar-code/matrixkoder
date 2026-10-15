@@ -1851,8 +1851,10 @@ def self_test():
         # the original path still resolves after the approve (the hermes-switchui issue): C13
         # approve copies, so the file mk-state was pointed at is still there
         assert ap["ok"] and os.path.isfile(link), ap
-        r = subprocess.run([sys.executable, state, "--data", data, "plan", "sync", "--run", "lk"],
-                           capture_output=True, text=True)
+        # the run is live (P1 is planned, not terminal): T1's rule refuses a bare sync,
+        # so this mechanics test passes --from-file ("the plan file wins")
+        r = subprocess.run([sys.executable, state, "--data", data, "plan", "sync", "--run", "lk",
+                            "--from-file"], capture_output=True, text=True)
         assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
         got = json.loads(r.stdout.strip().splitlines()[-1])
         assert got["ok"] and got.get("plan") == "link", got
