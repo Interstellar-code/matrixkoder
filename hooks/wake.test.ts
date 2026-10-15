@@ -1646,6 +1646,99 @@ test('an existing store with no run is NOT a missing store — the index file is
   expect(reads, 'the runs index is never consulted once the store answers').not.toContain('/data/runs/index.json')
 })
 
+// ---------- Z11: the mode comes off the reader, not the literal <data>/mk.db ----------
+
+test('migrated project: no legacy mk.db, the reader says store:true — the store feed is read', { options: { wake: true } }, async ($, on) => {
+  // todo 123. A migrated project keeps its store at the C2 `~/.matrixkoder/projects/<slug>/mk.db`
+  // (the root row's db_path); the legacy `<dataDir>/mk.db` is a frozen pre-switch copy that
+  // `mk-migrate --archive` removes. Here it is already gone — NO `/data/mk.db` in the world — while
+  // the reader's run-snapshot reply says `store:true`. The old storeMode stat'ed `<data>/mk.db`,
+  // saw absence and fell to FILE mode, so wake polled the retired `<data>/runs/r1/events.jsonl`
+  // (also gone) and never woke again. The mode must follow the reader, and the run-snapshot read
+  // that names the active run is the one that already carries the answer: no extra spawn.
+  const clock = mock.clock(on)
+  const files: Record<string, string> = {} // no mk.db, no index.json, no events.jsonl: store only
+  const reads: string[] = []
+  const w = wakeWorld(on, files, [], { MATRIXKODER_DATA: '/data' }, '/tmp', reads)
+  const feed = { rows: [storeRow(1, 'F6', 'verifying', 'lane-watch')], active: 'r1', tasks: {} as Record<string, string> }
+  const runs: string[][] = []
+  storeReader(on, feed, runs)
+  await $.session.start(START('/tmp'))
+
+  await clock.advance(30000) // first tick: baseline to the max id, no wake for history
+  const ev = runs.find(a => a.includes('events'))
+  expect(ev, 'the store feed is read even though <data>/mk.db is absent').toBeDefined()
+  expect(ev?.slice(2)).toEqual(['--data', '/data', 'events', '--run', 'r1', '--json'])
+  expect(reads, 'the retired events.jsonl is never opened').not.toContain('/data/runs/r1/events.jsonl')
+  expect(w.store.get('wakeEventLines:r1'), 'the cursor is the store form').toBe(-2)
+
+  feed.tasks = { F6: 'verifying', F8: 'stalled' }
+  feed.rows = [...feed.rows, storeRow(2, 'F8', 'stalled', 'lane-watch')]
+  await clock.advance(30000)
+  await clock.advance(30000)
+  await clock.advance(60000)
+  expect(w.submitted).toEqual(['MatrixKoder: F8 → stalled. Continue the run from its Next action.'])
+})
+
+test('pre-migration project with <data>/mk.db: still store mode (unchanged)', { options: { wake: true } }, async ($, on) => {
+  // The other half of todo 123: a project whose own `<data>/mk.db` is live keeps store mode. The
+  // reader says store:true, and the same mode is reached whether the answer comes off the reader
+  // or off the legacy stat — so this path is deliberately unchanged by the fix.
+  const clock = mock.clock(on)
+  const files: Record<string, string> = { '/data/mk.db': '' } // the live store, no file views
+  const reads: string[] = []
+  const w = wakeWorld(on, files, [], { MATRIXKODER_DATA: '/data' }, '/tmp', reads)
+  const feed = { rows: [storeRow(1, 'F6', 'verifying', 'lane-watch')], active: 'r1', tasks: { F6: 'verifying' } as Record<string, string> }
+  const runs: string[][] = []
+  storeReader(on, feed, runs)
+  await $.session.start(START('/tmp'))
+
+  await clock.advance(30000) // baseline
+  expect(runs.find(a => a.includes('events')), 'store mode reads the store feed').toBeDefined()
+  expect(reads, 'no file view under a live store').not.toContain('/data/runs/r1/events.jsonl')
+
+  feed.rows = [...feed.rows, storeRow(2, 'F8', 'stalled', 'lane-watch')]
+  feed.tasks = { F6: 'verifying', F8: 'stalled' }
+  await clock.advance(30000)
+  await clock.advance(30000)
+  await clock.advance(60000)
+  expect(w.submitted).toEqual(['MatrixKoder: F8 → stalled. Continue the run from its Next action.'])
+})
+
+test('no store anywhere (store:false): file mode, the store feed is never spawned', { options: { wake: true } }, async ($, on) => {
+  // The third leg: a project with no store at all. The real captured reply says `store:false`, the
+  // index file names the run, and the retired events.jsonl is the feed. Nothing here changed.
+  const clock = mock.clock(on)
+  const files: Record<string, string> = {
+    '/data/runs/index.json': JSON.stringify([{ id: 'r1', status: 'active' }]),
+    '/data/runs/r1/events.jsonl': EV('F6', 'verifying'),
+  }
+  const reads: string[] = []
+  const w = wakeWorld(on, files, [], { MATRIXKODER_DATA: '/data' }, '/tmp', reads)
+  const runs: string[][] = []
+  on('process.run', (_$, e) => {
+    const argv = [...e.argv] as string[]
+    runs.push(argv)
+    return {
+      value: {
+        exitCode: 0,
+        stdout: argv.includes('run-snapshot') ? NO_STORE_SNAPSHOT : '',
+        stderr: '',
+        isStdoutTruncated: false,
+        isStderrTruncated: false,
+      },
+    }
+  })
+  w.store.set('wakeEventLines:r1', 0)
+  await $.session.start(START('/tmp'))
+
+  await clock.advance(30000) // the store says no store: the index file names the run
+  await clock.advance(60000)
+  expect(runs.some(a => a.includes('events')), 'no store: the store feed is never spawned').toBe(false)
+  expect(reads, 'the retired events.jsonl is the feed').toContain('/data/runs/r1/events.jsonl')
+  expect(w.submitted).toEqual(['MatrixKoder: F6 → verifying. Continue the run from its Next action.'])
+})
+
 test('file mode: a preserved line-count cursor does not re-fire, and a failed store read does not fall through', { options: { wake: true } }, async ($, on) => {
   const clock = mock.clock(on)
   const files: Record<string, string> = {
