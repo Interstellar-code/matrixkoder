@@ -4343,6 +4343,8 @@ def self_test():
         print("mk-state no-field-blanked self-test ok")
         r2_fixes_self_test(tmp, env)
         print("mk-state r2-fixes self-test ok")
+        x31_r2_fixes_self_test(tmp, env)
+        print("mk-state x31-r2-fixes self-test ok")
         # R1.2: the mkdb write guard refuses the real home from this suite too.
         _mkdb().selftest_guard_probe(tmp_home)
     finally:
@@ -5463,6 +5465,194 @@ def r2_fixes_self_test(tmp, env):
             "an upper-case run id in a dep did not resolve"
     finally:
         con.close()
+
+
+def x31_r2_fixes_self_test(tmp, env):
+    """X3.1 R2 review fixes: (a) `task brief` stores on a temp data dir with the DEFAULT home
+    (root_write short-circuited on 96fdbc3 -> nothing landed) and the default home gains no
+    root projection; (b) a later store_commit re-importing the STORE-authored brief duplicated
+    each rev row (2 revs -> 4 rows on 96fdbc3); (c) a hand-written brief file is ingested once
+    and idempotently on later commits. All three FAIL on 96fdbc3."""
+
+    H = os.environ["MK_HOME"]  # Z3: the one real home (root projection)
+    db = _mkdb()
+
+    # R2 scratch runner: x31_a_fails=1 marks a KNOWN-BUG run (the base 96fdbc3). A failing
+    # base case stops its own run short so the other cases still get a fresh outcome.
+    A_BUG = os.environ.get("x31_a_fails") == "1"
+    RESULTS = {}
+
+    def data_con(datadir):
+        """One open_project connection for a data dir, caller closes (or use q_art)."""
+        return db.open_project(H, STORE_PROJECT_FALLBACK, data_dir=datadir)
+
+    def q_art(datadir, sql, args=()):
+        con = data_con(datadir)
+        try:
+            return con.execute(sql, args).fetchall()
+        finally:
+            con.close()
+
+    def bare_env(home_dir):
+        """Default-home env: HOME pinned, both home names and the fallback slug unset."""
+        e = {k: v for k, v in env.items()
+             if k not in ("MK_HOME", "MATRIXKODER_HOME", "MATRIXKODER_DATA",
+                          "MK_SELFTEST_FALLBACK_SLUG")}
+        e["HOME"] = home_dir
+        e["MK_SELFTEST"] = "1"
+        return e
+
+    # (a) temp data dir + default home (no MK_HOME/MATRIXKODER_HOME): run init, task add,
+    # task round, task brief --file must store a kind='brief' artifact, byte-equal body,
+    # ok/rev as asserted. FAILS on 96fdbc3: task_brief wrote through root_write, which
+    # short-circuits to None under _skip_root_projection, so the reply was
+    # {"ok": false, "error": "could not store the brief artifact"} and the project store
+    # stayed empty. The guard is REAL_HOME-aware, so all writes here land under $HOME.
+    def mk(data_dir, *args, code=0, e=None, stdin_text=None):
+        """One CLI invocation against one data dir; -> its one JSON line.
+        Zero extra args runs --self-test (a bare invocation needs one arg)."""
+        assert args, "mk() needs at least one CLI argument"
+        r = subprocess.run([sys.executable, os.path.abspath(__file__),
+                            *args, "--data", data_dir],
+                           capture_output=True, text=True, env=e or env,
+                           input=stdin_text)
+        lines = r.stdout.strip().splitlines()
+        assert len(lines) == 1, (args, r.stdout, r.stderr)
+        assert r.returncode == code, (args, r.returncode, r.stdout, r.stderr)
+        return json.loads(lines[0])
+
+    def raw(data_dir, *args, e=None):
+        """A raw subprocess.run (no JSON shape check) for the expected-failure case."""
+        return subprocess.run([sys.executable, os.path.abspath(__file__),
+                               *args, "--data", data_dir],
+                              capture_output=True, text=True, env=e or env)
+
+    a_home = os.path.join(tmp, "x31-default-home")
+    a_data = os.path.join(tempfile.gettempdir(), "x31-data-" + os.path.basename(tmp))
+    os.makedirs(a_home, exist_ok=True)
+    os.makedirs(a_data, exist_ok=True)
+    assert os.path.realpath(a_data).startswith(
+        os.path.realpath(tempfile.gettempdir()) + os.sep)
+    b_path = os.path.join(tmp, "x31-a-brief.md")
+    with open(b_path, "w") as f:
+        f.write("X31 R2 brief, round 1, default home\n")
+
+    def a_mk(*args, code=0):
+        return mk(a_data, *args, code=code, e=bare_env(a_home))
+    assert not os.path.exists(os.path.join(a_home, ".matrixkoder")), \
+        "the default home already has a root projection; the case wants a clean default home"
+    a_mk("run", "init", "--id", "x31a", "--feature", "X31", "--branch", "ba")
+    a_mk("task", "add", "--id", "T", "--title", "brief me", "--run", "x31a")
+    a_mk("task", "round", "T", "--kind", "build", "--run", "x31a")
+    try:
+        b1 = a_mk("task", "brief", "T", "--file", b_path)
+    except AssertionError as e:
+        RESULTS["a"] = f"FAIL: task brief refused: {e!r}"
+        if A_BUG:  # expected on the base; the other cases follow
+            return RESULTS
+        raise
+    assert b1["ok"] is True and b1["round"] == 1 and b1["stored"] is True and b1["rev"] == 1, b1
+    RESULTS["a"] = "ok"
+    assert os.path.exists(b1["view"]) and open(b1["view"]).read() == open(b_path).read()
+    rows = q_art(a_data, "SELECT text, rev FROM artifacts WHERE run='x31a' AND task='T'"
+                         " AND round=1 AND kind='brief'")
+    assert len(rows) == 1 and rows[0]["rev"] == 1 and rows[0]["text"] == open(b_path).read(), rows
+    assert not os.path.exists(os.path.join(a_home, ".matrixkoder")), (  # no root projection
+        "a temp data dir wrote a root projection into the default home")
+
+    # (b) duplicate import: two brief revisions (v1 then v2 via --file), then one `task set`
+    # and two `event --type note` writes, each reaching store_commit. Exactly TWO brief rows
+    # (one per rev), the newest rev is 2 and holds the v2 bytes. FAILS on 96fdbc3: store_commit
+    # walked _round_artifacts, which handed the STORE row back with a synthetic per-commit src,
+    # so every later commit inserted one row per rev again (2 revs -> 4).
+    b_data = os.path.join(tmp, "x31-dup")
+    mk(b_data, "run", "init", "--id", "x31b", "--feature", "B", "--branch", "bb", e=env)
+    mk(b_data, "task", "add", "--id", "B", "--title", "dup", "--run", "x31b", e=env)
+    b2_mk = lambda *args, code=0: mk(b_data, *args, e=env, code=code)
+    v1 = os.path.join(tmp, "x31-b-v1.md")
+    with open(v1, "w") as f:
+        f.write("dup brief v1\n")
+    paths = b2_mk("task", "round", "B", "--kind", "build", "--run", "x31b")
+    b2_mk("task", "brief", "B", "--file", v1)
+    with open(v1, "w") as f:
+        f.write("dup brief v2\n")
+    b2_mk("task", "brief", "B", "--file", v1)                     # second revision: rev 2
+    b2_mk("task", "set", "B", "status=building", "--run", "x31b")  # a later store_commit
+    b2_mk("event", "--run", "x31b", "--type", "note", "--text", "e1")
+    b2_mk("event", "--run", "x31b", "--type", "note", "--text", "e2")
+    rows = q_art(b_data, "SELECT rev, text FROM artifacts WHERE run='x31b' AND task='B'"
+                         " AND kind='brief' ORDER BY rev")
+    newest = rows[-1] if rows else None
+    reason = None
+    if len(rows) != 2:
+        reason = f"expected exactly 2 brief rows (one per rev), got {len(rows)}: {rows!r}"
+    elif [r["rev"] for r in rows] != [1, 2]:
+        reason = f"revs are not [1, 2]: {rows!r}"
+    elif newest["rev"] != 2 or newest["text"] != "dup brief v2\n":
+        reason = f"newest is not rev 2 with the v2 bytes: {rows!r}"
+    if reason:
+        if A_BUG:
+            RESULTS["b"] = f"FAIL: {reason}"  # expected on the base: recorded and continued
+            return RESULTS
+        raise AssertionError(f"x31 R2 (b): {reason}")
+    RESULTS["b"] = "ok"
+
+    # (c) hand-written brief file with no artifact rows: ONE row after ONE store_commit
+    # (ingested once off the task folder), still ONE after a second commit (idempotent).
+    # FAILS on 96fdbc3 (duplicate import, like (b)) and on any rev where the ingest src
+    # changed per commit.
+    c_data = os.path.join(tmp, "x31-file-ingest")
+    c_mk = lambda *args, code=0: mk(c_data, *args, e=env, code=code)
+    c_mk("run", "init", "--id", "x31c", "--feature", "C", "--branch", "bc")
+    c_mk("task", "add", "--id", "C1", "--title", "c", "--run", "x31c")
+    c_con = data_con(c_data)
+    try:
+        c_con.execute("UPDATE tasks SET round=1 WHERE run='x31c' AND id='C1'")
+        c_con.commit()
+    finally:
+        c_con.close()
+    c_brief_dir = os.path.join(c_data, "runs", "x31c", "tasks", "C1")
+    os.makedirs(c_brief_dir, exist_ok=True)
+    with open(os.path.join(c_brief_dir, "brief-r1.md"), "w") as f:
+        f.write("hand-written brief, ingest-once\n")
+    c_mk("task", "set", "C1", "status=building", "--run", "x31c")  # commit 1: ingests once
+    con = data_con(c_data)
+    try:
+        n = con.execute("SELECT COUNT(*) c FROM artifacts WHERE run='x31c' AND task='C1'"
+                        " AND kind='brief'").fetchone()["c"]
+    finally:
+        con.close()
+    if n != 1:
+        if A_BUG:
+            RESULTS["c"] = f"FAIL: after the first commit expected ONE brief row, got {n}"
+            return RESULTS
+        raise AssertionError(f"x31 R2 (c): after the first commit expected ONE hand-written"
+                             f" brief artifact row, got {n}")
+    c_mk("task", "set", "C1", "status=review", "--run", "x31c")    # commit 2: still ONE
+    con = data_con(c_data)
+    try:
+        n2 = con.execute("SELECT COUNT(*) c FROM artifacts WHERE run='x31c' AND task='C1'"
+                         " AND kind='brief'").fetchone()["c"]
+    finally:
+        con.close()
+    if n2 != 1:
+        if A_BUG:
+            RESULTS["c"] = f"FAIL: after the second commit expected ONE brief row, got {n2}"
+            return RESULTS
+        raise AssertionError(f"x31 R2 (c): after the second commit the hand-written brief was"
+                             f" re-imported; expected ONE row, got {n2}")
+    con = data_con(c_data)
+    try:
+        got = con.execute("SELECT text FROM artifacts WHERE run='x31c' AND task='C1'"
+                          " AND kind='brief' LIMIT 1").fetchall()
+    finally:
+        con.close()
+    assert got[0]["text"] == "hand-written brief, ingest-once\n", got
+    RESULTS["c"] = "ok"
+    print("x31-r2 scratch: %s" % RESULTS)
+    # a KNOWN-BUG run still signals the failure it proved (x31_a_fails was set only when a
+    # case was recorded FAIL above); a clean run reaches the normal return.
+    return RESULTS
 
 
 def migrated_store_self_test(tmp, env):
