@@ -389,3 +389,31 @@ test('allows read-only sqlite3 on mk.db and writes to other dbs', async ($, on) 
   ]
   expect(await misses(c => $.tool.call(c), sqlAllow, false)).toEqual([])
 })
+
+const MK = '~/.matrixkoder/projects/p/mk.db'
+// Z28 items 1 and 2: allowed before, denied now.
+const Z28_DENY = [
+  `echo "DELETE FROM tasks" | sqlite3 ${MK} -cmd "select 1"`,
+  `sqlite3 ${MK} -cmd "select 1" <<EOF\nDELETE FROM tasks;\nEOF`,
+  `sqlite3 /tmp/other.db "VACUUM INTO '/p/mk.db'"`,
+  `sqlite3 /tmp/other.db "ATTACH '/p/mk.db' AS m; INSERT INTO m.tasks VALUES (1)"`,
+]
+// Z28 item 3: denied before, allowed now; plus the neighbours that must keep working.
+const Z28_ALLOW = [
+  `sqlite3 ${MK} "SELECT * FROM tasks WHERE status = 'update'"`,
+  `sqlite3 ${MK} 'select "delete" as k'`,
+  `sqlite3 /tmp/other.db "select 'mk.db'"`,
+  `sqlite3 /tmp/other.db "ATTACH '/p/mk.db' AS m; select * from m.tasks"`,
+  `echo "select 1" | sqlite3 /tmp/other.db`,
+  `echo "select 1" | sqlite3 -readonly ${MK}`,
+]
+
+test('Z28: stdin SQL and mk.db paths inside SQL are denied', async ($, on) => {
+  stubBash(on)
+  expect(await misses(c => $.tool.call(c), Z28_DENY, true)).toEqual([])
+})
+
+test('Z28: keywords inside string literals and read-only forms are allowed', async ($, on) => {
+  stubBash(on)
+  expect(await misses(c => $.tool.call(c), Z28_ALLOW, false)).toEqual([])
+})
