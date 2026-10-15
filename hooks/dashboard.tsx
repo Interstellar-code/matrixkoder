@@ -596,7 +596,11 @@ async function readText($: EngineInterface, path: string): Promise<string | null
  *  null means "the store could not answer" — a pre-migration project with no store, a store
  *  this code is too new/old for, a refused or slow spawn. The caller then falls back to the
  *  file views. An empty but successful answer ({runs: [], run: null}) is NOT null: it means
- *  the store is there and holds no active run, which is the NoRun panel, not a fallback. */
+ *  the store is there and holds no active run, which is the NoRun panel, not a fallback.
+ *
+ *  `store: false` is how the reader says the store is MISSING. Without it a no-store reply
+ *  (`{ok: true, store: false, runs: []}`) is indistinguishable from a store that holds no run,
+ *  and the file fallback would never run on a pre-migration project. */
 async function readStoreSnapshot($: EngineInterface, dataDir: string): Promise<{
   runs: MkRunIndexEntry[]
   run: MkRun | null
@@ -612,8 +616,9 @@ async function readStoreSnapshot($: EngineInterface, dataDir: string): Promise<{
     return null
   }
   if (ran.exitCode !== 0) return null
-  const doc = parseJson(ran.stdout) as { runs?: unknown; run?: unknown } | null
+  const doc = parseJson(ran.stdout) as { runs?: unknown; run?: unknown; store?: unknown } | null
   if (doc === null || typeof doc !== 'object' || !Array.isArray(doc.runs)) return null
+  if (doc.store === false) return null // no store: the file views answer, not this reader
   const run = coerceRun(doc.run)
   if (doc.run != null && run == null) return null // a run the store named that we cannot read
   return { runs: coerceIndex(doc.runs), run, error: null }

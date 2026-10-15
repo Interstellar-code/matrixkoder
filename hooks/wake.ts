@@ -413,6 +413,10 @@ async function readFileEvents($: EngineInterface, eventsPath: string): Promise<W
  *  spawn) and the retired `<data>/runs/index.json` is read instead; a store that answers with
  *  no active run is not null, it is the end of the poll.
  *
+ *  `store: false` is how the reader says the store is MISSING: without it, its no-store reply
+ *  (`{ok: true, store: false, runs: []}`) reads as a store with no active run and the index
+ *  fallback never runs.
+ *
  *  The pick stays the index file's: the FIRST active entry in a list ordered by `started`
  *  ascending, i.e. the OLDEST active run. The reader's own `active` field is the NEWEST one
  *  (the dashboard's pick), which would move wake onto a different run of a busy project. */
@@ -427,10 +431,11 @@ async function activeRunId($: EngineInterface, dataDir: string): Promise<string 
     return undefined
   }
   if (ran.exitCode !== 0) return undefined
-  const doc = parseJson(ran.stdout)
-  if (doc === null || typeof doc !== 'object' || !Array.isArray((doc as { runs?: unknown }).runs)) {
+  const doc = parseJson(ran.stdout) as { runs?: unknown; store?: unknown } | null
+  if (doc === null || typeof doc !== 'object' || !Array.isArray(doc.runs)) {
     return undefined
   }
+  if (doc.store === false) return undefined // no store: the index file answers
   const list = (doc as { runs: unknown[] }).runs
   const first = list.find(r =>
     r !== null && typeof r === 'object' && (r as { status?: unknown }).status === 'active'

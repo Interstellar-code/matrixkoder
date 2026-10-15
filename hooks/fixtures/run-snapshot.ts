@@ -144,6 +144,7 @@ export const RUN_SNAPSHOT = {
         "slot": null,
         "status": "building",
         "title": "Phase one",
+        "type": "phase",
         "updated": "<updated>",
         "verdict": null,
         "wave": 1,
@@ -171,6 +172,7 @@ export const RUN_SNAPSHOT = {
         "slot": "1",
         "status": "merged",
         "title": "First",
+        "type": "task",
         "updated": "<updated>",
         "verdict": null,
         "wave": 1,
@@ -202,6 +204,7 @@ export const RUN_SNAPSHOT = {
         "slot": null,
         "status": "building",
         "title": "Second",
+        "type": "task",
         "updated": "<updated>",
         "verdict": null,
         "wave": 2,
@@ -227,6 +230,7 @@ export const RUN_SNAPSHOT = {
         "slot": null,
         "status": "blocked",
         "title": "Third",
+        "type": "phase",
         "updated": "<updated>",
         "verdict": null,
         "wave": 1,
@@ -252,6 +256,7 @@ export const RUN_SNAPSHOT = {
         "slot": null,
         "status": "planned",
         "title": "Fourth",
+        "type": "phase",
         "updated": "<updated>",
         "verdict": null,
         "wave": 2,
@@ -279,5 +284,6 @@ export const RUN_SNAPSHOT = {
       "status": "active"
     }
   ],
+  "store": true,
   "waits": []
 } as const
