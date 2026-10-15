@@ -4654,7 +4654,8 @@ def self_test():
 
         # F.1: rework status — rollup, close refusal, DEP_MET exclusion
         rwdata = os.path.join(tmp, "rework")
-        rw = lambda *args, code=0: mk(*args, "--data", rwdata, code=code, data_arg=False)
+        def rw(*args, code=0):
+            return mk(*args, "--data", rwdata, code=code, data_arg=False)
         rw("run", "init", "--id", "rw", "--feature", "RW", "--branch", "b")
         rw("task", "add", "--id", "P", "--title", "phase", "--run", "rw")
         rw("task", "add", "--id", "A", "--title", "merged", "--run", "rw", "--parent", "P")

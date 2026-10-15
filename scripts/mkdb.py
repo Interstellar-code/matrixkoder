@@ -499,6 +499,7 @@ def _reaches(start, edges):
             if nxt not in seen:
                 seen.add(nxt)
                 stack.append(nxt)
+    return seen
 
 
 def _cycle_through(me, edges):
@@ -566,7 +567,11 @@ def column_of(status, prev_status=None):
     An attention status keeps the column of prev_status (the task's previous non-attention
     status). With no previous status the column is Backlog. column_of stays pure: the caller
     looks prev_status up.
+
+    `rework` is special: it always maps to Fix (it is in ATTENTION but has its own column).
     """
+    if status == "rework":
+        return "Fix", 1
     if status in ATTENTION:
         if prev_status in COLUMNS:
             return COLUMNS[prev_status], 1
@@ -585,8 +590,8 @@ def _prev_status(con, run, task):
 def _rollup(con, run, task):
     """The status a parent should hold, or None when it has no children.
 
-    Any child in an attention status wins, first match in ATTENTION order (blocked, stalled,
-    quota, provider): the parent takes that status, and transition() then keeps the parent's
+    Any child in an attention status wins, first match in ATTENTION order (rework, blocked,
+    stalled, quota, provider): the parent takes that status, and transition() then keeps the
     previous column and sets attention=1. Otherwise the parent takes the least-done column of
     its children's non-attention statuses.
     """
@@ -1489,19 +1494,30 @@ def _task_extra(con, run, task_id):
 
 
 def _open_reasons(con, run, task_id):
-    """The task's OPEN risk_reasons as [{kind, points, source, opened}], ordered by id."""
+    """The task's OPEN risk_reasons as [{kind, points, source, opened}], ordered by id.
+
+    points is coerced to a non-negative int (non-int, bool, or negative → 0).
+    NULL source/opened → "" (F.8 drops non-string reasons).
+    """
     rows = con.execute(
         "SELECT kind, points, source, opened FROM risk_reasons"
         " WHERE run=? AND task=? AND cleared IS NULL ORDER BY id",
         (run, task_id)).fetchall()
-    return [{"kind": r["kind"], "points": r["points"] or 0,
-             "source": r["source"], "opened": r["opened"]} for r in rows]
+    out = []
+    for r in rows:
+        pts = r["points"]
+        if not isinstance(pts, int) or isinstance(pts, bool) or pts < 0:
+            pts = 0
+        out.append({"kind": r["kind"], "points": pts,
+                    "source": r["source"] or "", "opened": r["opened"] or ""})
+    return out
 
 
 def _task_risk(con, run, task_id):
     """Derived risk = min(5, base_risk + sum(points of OPEN risk_reasons)).
 
     Read-only: never stored, never settable by task set. base_risk defaults to 1.
+    Returns an int in [1, 5].
     """
     extra = _task_extra(con, run, task_id)
     base = extra.get("base_risk", 1)
@@ -1509,7 +1525,7 @@ def _task_risk(con, run, task_id):
         base = 1
     base = max(1, min(5, base))
     open_sum = sum(r["points"] for r in _open_reasons(con, run, task_id))
-    return min(5, base + open_sum)
+    return max(1, min(5, base + open_sum))
 
 
 def _phases_from_run(rows, header, run, con):
@@ -1547,7 +1563,7 @@ def _phases_from_run(rows, header, run, con):
             # F.1: risk fields from extra_json + risk_reasons
             extra = _task_extra(con, run, r["id"])
             nodes[r["id"]]["risk"] = _task_risk(con, run, r["id"])
-            nodes[r["id"]]["critical"] = bool(extra.get("critical", False))
+            nodes[r["id"]]["critical"] = extra.get("critical") is True
             nodes[r["id"]]["open_reasons"] = _open_reasons(con, run, r["id"])
     for r in rows:  # pass 2: attach in rowid order — the parent node already exists, any depth
         node = nodes.get(r["id"])
@@ -2237,6 +2253,27 @@ def _derived_risk(home):
         r4_reasons = _open_reasons(con, "rr", "R4")
         _check(len(r4_reasons) == 1 and r4_reasons[0]["points"] == 2,
                f"R4 open reasons {r4_reasons}")
+        # R2: bad points coerced to 0
+        con.execute("INSERT INTO risk_reasons(run, task, kind, points, source, opened)"
+                    " VALUES ('rr','R1','text_points','x','bad','2026-01-01')")
+        con.execute("INSERT INTO risk_reasons(run, task, kind, points, source, opened)"
+                    " VALUES ('rr','R1','neg_points',-4,'bad','2026-01-01')")
+        con.execute("INSERT INTO risk_reasons(run, task, kind, points, source, opened)"
+                    " VALUES ('rr','R1','real_points',1.5,'bad','2026-01-01')")
+        con.execute("INSERT INTO risk_reasons(run, task, kind, points, source, opened)"
+                    " VALUES ('rr','R1','str_points','true','bad','2026-01-01')")
+        # NULL source/opened → ""
+        con.execute("INSERT INTO risk_reasons(run, task, kind, points, source, opened)"
+                    " VALUES ('rr','R1','null_fields',0,NULL,NULL)")
+        con.commit()
+        _check(_task_risk(con, "rr", "R1") == 1, f"R1 risk with bad points {_task_risk(con, 'rr', 'R1')} != 1")
+        r1_reasons = _open_reasons(con, "rr", "R1")
+        _check(len(r1_reasons) == 5, f"R1 should have 5 open reasons, got {len(r1_reasons)}")
+        for reason in r1_reasons:
+            _check(reason["points"] == 0, f"bad points coerced to {reason['points']} != 0")
+        null_reason = [r for r in r1_reasons if r["kind"] == "null_fields"][0]
+        _check(null_reason["source"] == "" and null_reason["opened"] == "",
+               f"NULL source/opened not coerced: {null_reason}")
     finally:
         con.close()
 
@@ -2246,7 +2283,7 @@ def _derived_risk(home):
     by_id = {t["id"]: t for t in tasks}
     _check(by_id["R1"]["risk"] == 1, f"R1 plans risk {by_id['R1']['risk']} != 1")
     _check(by_id["R1"]["critical"] is False, f"R1 critical {by_id['R1']['critical']} != False")
-    _check(by_id["R1"]["open_reasons"] == [], f"R1 open_reasons {by_id['R1']['open_reasons']} != []")
+    _check(len(by_id["R1"]["open_reasons"]) == 5, f"R1 open_reasons {by_id['R1']['open_reasons']} should have 5")
     _check(by_id["R2"]["risk"] == 4, f"R2 plans risk {by_id['R2']['risk']} != 4")
     _check(by_id["R2"]["critical"] is True, f"R2 critical {by_id['R2']['critical']} != True")
     _check(len(by_id["R2"]["open_reasons"]) == 1, f"R2 plans open_reasons {by_id['R2']['open_reasons']}")
@@ -2255,6 +2292,45 @@ def _derived_risk(home):
     # Existing keys unchanged
     _check("id" in by_id["R1"] and "title" in by_id["R1"] and "status" in by_id["R1"],
            "existing task keys missing")
+    # R2: critical as string "false" → False (is True, not bool())
+    con2 = open_project(home, data_dir=data)
+    try:
+        con2.execute("UPDATE tasks SET extra_json='{\"base_risk\":1,\"critical\":\"false\"}'"
+                     " WHERE run='rr' AND id='R1'")
+        con2.commit()
+    finally:
+        con2.close()
+    got2 = plans(home, data_dir=data, plan_id="rp")
+    tasks2 = got2["phases"][0]["tasks"] if got2["phases"] else []
+    by_id2 = {t["id"]: t for t in tasks2}
+    _check(by_id2["R1"]["critical"] is False,
+           f"critical string 'false' → {by_id2['R1']['critical']!r} (should be False)")
+    # critical as string "true" → False (is True, not truthy)
+    con3 = open_project(home, data_dir=data)
+    try:
+        con3.execute("UPDATE tasks SET extra_json='{\"base_risk\":1,\"critical\":\"true\"}'"
+                     " WHERE run='rr' AND id='R1'")
+        con3.commit()
+    finally:
+        con3.close()
+    got3 = plans(home, data_dir=data, plan_id="rp")
+    tasks3 = got3["phases"][0]["tasks"] if got3["phases"] else []
+    by_id3 = {t["id"]: t for t in tasks3}
+    _check(by_id3["R1"]["critical"] is False,
+           f"critical string 'true' → {by_id3['R1']['critical']!r} (should be False)")
+    # critical as int 1 → False (is True)
+    con4 = open_project(home, data_dir=data)
+    try:
+        con4.execute("UPDATE tasks SET extra_json='{\"base_risk\":1,\"critical\":1}'"
+                     " WHERE run='rr' AND id='R1'")
+        con4.commit()
+    finally:
+        con4.close()
+    got4 = plans(home, data_dir=data, plan_id="rp")
+    tasks4 = got4["phases"][0]["tasks"] if got4["phases"] else []
+    by_id4 = {t["id"]: t for t in tasks4}
+    _check(by_id4["R1"]["critical"] is False,
+           f"critical int 1 → {by_id4['R1']['critical']!r} (should be False)")
 
 
 
@@ -2287,6 +2363,15 @@ def _rework_rollup(home):
         _check("rework" in ATTENTION, "rework not in ATTENTION")
         # rework is NOT in DEP_MET
         _check("rework" not in DEP_MET, "rework in DEP_MET")
+        # R2: column_of('rework') always returns ("Fix", 1) regardless of prev_status
+        _check(column_of("rework", "merged") == ("Fix", 1),
+               f"column_of('rework','merged') = {column_of('rework', 'merged')} != ('Fix', 1)")
+        _check(column_of("rework", "review") == ("Fix", 1),
+               f"column_of('rework','review') = {column_of('rework', 'review')} != ('Fix', 1)")
+        _check(column_of("rework", None) == ("Fix", 1),
+               f"column_of('rework',None) = {column_of('rework', None)} != ('Fix', 1)")
+        _check(column_of("rework", "blocked") == ("Fix", 1),
+               f"column_of('rework','blocked') = {column_of('rework', 'blocked')} != ('Fix', 1)")
     finally:
         con.close()
 
@@ -2611,6 +2696,8 @@ def _cycle_race(home):
             edges[(row["run"], row["id"])] = [_dep_target(row["run"], d) for d in _deps_of(row["deps"])]
         for node in list(edges):
             _check(node not in _reaches(node, edges), f"cycle survived: {node}")
+        _check(_reaches('a', {'a': ['b'], 'b': ['c']}) == {'b', 'c'}, "_reaches doesn't traverse")
+        _check(_reaches('a', {'a': ['a']}) == {'a'}, "_reaches doesn't catch self-cycle")
     finally:
         con.close()
 

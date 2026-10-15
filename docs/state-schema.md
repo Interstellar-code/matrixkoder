@@ -194,9 +194,10 @@ carries `risk`, `critical`, and `open_reasons` (list of
 
 ### The `rework` status
 
-In `COLUMNS` (maps to `Fix`) and in `ATTENTION` (card raises the flag). A phase
-with one `rework` child rolls up to `rework` even when siblings are merged. NOT in
-`DEP_MET`, NOT in `CLOSED_STATUSES` — an open status that blocks run close.
+In `COLUMNS` (maps to `Fix`) and in `ATTENTION` (card raises the flag). `column_of` always
+returns `("Fix", 1)` for `rework` regardless of previous status. A phase with one `rework`
+child rolls up to `rework` even when siblings are merged. NOT in `DEP_MET`, NOT in
+`CLOSED_STATUSES` — an open status that blocks run close.
 
 ### Schema 6 rollout
 
