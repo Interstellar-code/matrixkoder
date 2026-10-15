@@ -8,7 +8,7 @@
 // itself is never mocked — env, fs, process and session answers are the test's own.
 import { test, expect } from 'claude-code/testing'
 import type { EngineInterface, ProcessRunResult } from 'claude-code'
-import { globalDirOf, paths, resolveDataDir } from './paths'
+import { globalDirOf, isMigratedFolder, paths, projectYamlPath, resolveDataDir } from './paths'
 
 /** The calls paths.ts makes on `$`, and no others. */
 type PathsDouble = {
@@ -146,6 +146,42 @@ test('a migrated project resolves to the C2 folder (dirname of the root db_path)
     }),
   })
   expect(await resolveDataDir(unmigrated, { cwd: '/repo', home: '/home/mk', store: true })).toBe('/srv/data')
+})
+
+test('the repo settings file is project.yaml on a migrated project, matrixkoder.yaml before', async () => {
+  // L7.6: the same root-store reply mkpaths.project_yaml reads. A `db_path` set (C3's
+  // migrated marker) makes the data dir the C2 project folder, and its yaml is
+  // `<project>/project.yaml` — mk-config.project_yaml_path's answer, byte for byte.
+  const c2 = '/srv/mkhome/projects/matrixkoder'
+  const rows = (dbPath: string) => () => ({
+    exitCode: 0,
+    stdout: JSON.stringify({ projects: [{ slug: 'matrixkoder', repo: '/repo', data_dir: '/repo/.matrixkoder', db_path: dbPath }] }),
+    stderr: '',
+    isStdoutTruncated: false,
+    isStderrTruncated: false,
+  })
+  const world1 = (dbPath: string) => world({
+    env: { HOME: '/home/mk', MATRIXKODER_HOME: '/srv/mkhome' },
+    dirs: ['/repo/.git'],
+    cwd: '/repo',
+    runs: rows(dbPath),
+  })
+
+  // the migrated project: db_path set → the C2 folder, and project.yaml there
+  const migrated = world1(`${c2}/mk.db`)
+  expect(await resolveDataDir(migrated, { cwd: '/repo', home: '/home/mk', store: true })).toBe(c2)
+  expect(await projectYamlPath(migrated, c2, { home: '/home/mk', store: true })).toBe(`${c2}/project.yaml`)
+
+  // pre-migration: db_path empty → today's <data>/matrixkoder.yaml, unchanged
+  const legacy = world1('')
+  expect(await projectYamlPath(legacy, '/srv/data', { home: '/home/mk', store: true })).toBe('/srv/data/matrixkoder.yaml')
+
+  // a data dir no row names is not migrated (C2's rule, no guessing)
+  expect(isMigratedFolder([{ db_path: `${c2}/mk.db` }], '/srv/data')).toBe(false)
+  expect(isMigratedFolder([{ db_path: '' }], c2)).toBe(false)
+  expect(isMigratedFolder([{ db_path: `${c2}/mk.db` }], `${c2}/`)).toBe(true)
+  // store:false never asks the store — the pre-migration name stands
+  expect(await projectYamlPath(migrated, c2, { home: '/home/mk' })).toBe(`${c2}/matrixkoder.yaml`)
 })
 
 test('projects.json is the fallback when the root-store command fails', async () => {

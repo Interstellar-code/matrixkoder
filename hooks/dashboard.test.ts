@@ -2019,10 +2019,64 @@ test('MEDIUM 3: without matrixkoder.yaml neither migrate nor list runs; globals 
   for (let i = 0; i < 20; i++) await clock.advance(0)
   await ui.redraw(paneProps(46))
   expect(mkConfigCalls(calls), 'no mk-config.py call at all').toEqual([])
-  expect(await ui.find({ text: /No matrixkoder\.yaml — run \/mk setup/ }), 'the setup note').toBeTruthy()
+  // L7.6: the note names the REAL path it probed (project.yaml on a migrated
+  // project), not a hardcoded file name — this is the pre-migration answer here.
+  // the note truncates at the pane width; the probed folder prefix fits
+  expect(await ui.find({ text: new RegExp(`No ${DATA_DIR.replace(/[/.]/g, ch => `\\${ch}`)}`) }), 'the note names the probed data dir').toBeTruthy()
   expect(await ui.find({ text: /MOCK · fixture data/ }), 'never mock rows').toBeUndefined()
   await ui.press({ key: 'set-scope-about' })
   expect(await ui.find({ text: /Status chip/ }), 'the global row still shows').toBeTruthy()
+})
+
+test('L7.6: the Settings tab loads on a MIGRATED project — the C2 project.yaml, not matrixkoder.yaml', { plugins: [worldFixtures] }, async ($, on) => {
+  // The real layout mk-migrate --switch produces, captured from its own output:
+  // the root row's db_path is `<home>/projects/<slug>/mk.db`, so the data dir the
+  // dashboard resolves IS the C2 folder and the yaml there is `project.yaml`
+  // (mkpaths.project_yaml / mk-config.project_yaml_path's answer).
+  const slug = 'matrixkoder'
+  const c2 = `/home/mk/.matrixkoder/projects/${slug}`
+  const projectYaml = `${c2}/project.yaml`
+  const files = worldFiles()
+  files[projectYaml] = 'session:\n  stall_min: 20\n'
+  mockFs(on, files, [c2, `${PROJECT_DIR}/.git`], [projectYaml])
+  const calls: (readonly string[])[] = []
+  const clock = mockWorld(on, {
+    process: argv => {
+      if (isBus(argv) || isBusEnabledGet(argv)) return undefined
+      calls.push(argv)
+      // the root store, as `mkdb.py projects --json` answers it after a switch
+      if (argv.some(a => a.endsWith('scripts/mkdb.py'))) {
+        return { value: { exitCode: 0, stdout: `${JSON.stringify({ projects: [{ slug, repo: PROJECT_DIR, data_dir: DATA_DIR, db_path: `${c2}/mk.db` }] })}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      }
+      if (!argv.some(a => a.endsWith('scripts/mk-config.py'))) return undefined
+      const sub = argv[argv.indexOf('--data') + 2]
+      const stdout = sub === 'migrate'
+        ? '{"ok":true,"changed":[],"notes":[]}\n'
+        : `${JSON.stringify({ ok: true, file: projectYaml, fields: S3_FIELDS })}\n`
+      return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    },
+  })
+  on('session.cwd', () => ({ value: PROJECT_DIR }))
+  on('config.list', () => ({ value: [] }))
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-settings' })
+  await loadLiveSettings(clock, ui, calls)
+  await ui.press({ key: 'set-scope-child' }) // S3_FIELDS' rows live in the Child scope
+  await ui.redraw(paneProps(46))
+
+  // the tab runs migrate + list with the C2 folder as --data, exactly as before
+  const mk = mkConfigCalls(calls)
+  expect(mk.map(a => a[a.length - 1])).toEqual(['migrate', '--json'])
+  for (const a of mk) expect(a[a.indexOf('--data') + 1]).toBe(c2)
+  // no "No matrixkoder.yaml" note: the probed file is the C2 project.yaml
+  expect(await ui.find({ text: /No matrixkoder\.yaml/ }), 'never the pre-migration note').toBeUndefined()
+  // the live rows arrived from the migrated project
+  expect(await ui.find({ text: /MOCK · fixture data/ }), 'no fixture rows').toBeUndefined()
+  expect(await ui.find({ text: /^20m$/ }), 'the live yaml value draws').toBeTruthy()
+  // the scope note names the real file, not the bare shape label; the line
+  // truncates at the pane width, so match the folder prefix that fits
+  expect(await ui.find({ text: new RegExp(c2.replace(/[/.]/g, ch => `\\${ch}`)) }), 'the scope note carries the live path').toBeTruthy()
 })
 
 test('LOW 1: a failed load shows the ⚠ line over live rows, never the fixture', { plugins: [worldFixtures] }, async ($, on) => {
