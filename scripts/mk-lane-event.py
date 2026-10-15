@@ -2175,7 +2175,9 @@ def self_test():
                     "    lane = a[a.index('--lane') + 1]\n"
                     "    home = os.environ.get('MK_HOME') or os.environ.get('MATRIXKODER_HOME') or os.path.expanduser('~/.matrixkoder')\n"
                     "    digest = hashlib.sha256(os.path.realpath(lane).encode('utf-8')).hexdigest()\n"
-                    "    dest = os.path.join(home, 'bus-lanes', digest + '.json')\n"
+                    # the bus dir this self-test pins with $MK_BUS_DIR is that dir itself, so the
+                    # lane token lands in <pin>/lanes/ — mkpaths' rule (C6, L6.4), not the old root
+                    "    dest = os.path.join(home, 'lanes', digest + '.json')\n"
                     "    os.makedirs(os.path.dirname(dest), exist_ok=True)\n"
                     "    with open(dest, 'w') as lf:\n"
                     "        json.dump({'v': 1, 'url': 'http://127.0.0.1:9999', 'token': 'fake'}, lf)\n"
@@ -3538,9 +3540,10 @@ def self_test():
         os.environ["MATRIXKODER_HOME"] = _home
         os.environ.pop("MK_BUS_DIR", None)
         try:
-            assert bus_dir_for(data) == os.path.abspath(_home), bus_dir_for(data)
+            assert bus_dir_for(data) == mkpaths.target_bus_dir(), bus_dir_for(data)
             assert bus_is_up(data) is False
-            open(os.path.join(_home, "bus.json"), "w").write(
+            os.makedirs(mkpaths.target_bus_dir(), exist_ok=True)
+            open(mkpaths.bus_json(data), "w").write(
                 json.dumps({"port": _srv.server_address[1]}))
             assert bus_is_up(data) is True  # the home bus, not the stale data-dir file
         finally:
@@ -3752,34 +3755,35 @@ def self_test():
         got = open(r["brief"]).read()
         assert "scripts/x.py:9" in got and "project DB" in got, got
         assert "<PHASE>" not in got and "<path>" not in got, got
-        # (d) the token path: mkpaths decides, and a token still at the OLD <home>/bus-lanes
-        # path is found once L6.1 points mkpaths at bus/lanes. The move is simulated by setting
-        # mkpaths' own constant (the module is loaded by path; no file on disk changes).
+        # (d) the token path: mkpaths decides. A token still at the pre-L6.1 <home>/bus-lanes
+        # is carried over to the bus dir's lanes/ once it is there (C6, L6.4). Both paths come
+        # from mkpaths' own constants and its bus-dir rule — the OLD one from the
+        # `BUS_LANES_DIR` the take-over copies from — so the old-layout fallback is tested,
+        # never a spelling copied here.
         lane_tok = os.path.join(tmp, "lane-token")
         os.makedirs(lane_tok, exist_ok=True)
         base = os.path.abspath(os.path.expanduser(mkpaths.bus_env_dir() or mkpaths.home()))
+        bus = base if mkpaths.bus_env_dir() else os.path.join(base, mkpaths.TARGET_BUS_DIR)
         digest = hashlib.sha256(os.path.realpath(lane_tok).encode("utf-8")).hexdigest()
-        old_tok = os.path.join(base, "bus-lanes", digest + ".json")
-        new_tok = os.path.join(base, "bus", "lanes", digest + ".json")
+        old_tok = os.path.join(base, mkpaths.BUS_LANES_DIR, digest + ".json")
+        new_tok = os.path.join(bus, mkpaths.TARGET_LANES_DIR, digest + ".json")
         os.makedirs(os.path.dirname(old_tok), exist_ok=True)
-        os.makedirs(os.path.dirname(new_tok), exist_ok=True)
         with open(old_tok, "w") as f:
             json.dump({"v": 1, "url": "http://127.0.0.1:9999", "token": "old"}, f)
-        saved_dir = mkpaths.BUS_LANES_DIR
         try:
-            assert lane_token_file(lane_tok) == old_tok, (lane_token_file(lane_tok), old_tok)
-            mkpaths.BUS_LANES_DIR = os.path.join("bus", "lanes")
             assert not os.path.exists(new_tok)
-            assert lane_token_file(lane_tok) == old_tok, (
-                "the old-layout token must still be found", lane_token_file(lane_tok), old_tok)
+            assert lane_token_file(lane_tok) == new_tok, (
+                "the old-layout token must still be found", lane_token_file(lane_tok), new_tok)
+            assert json.load(open(new_tok))["token"] == "old", json.load(open(new_tok))
+            assert os.path.isfile(old_tok), "the legacy lane token must survive the take-over"
             with open(new_tok, "w") as f:
                 json.dump({"v": 1, "url": "http://127.0.0.1:9998", "token": "new"}, f)
             assert lane_token_file(lane_tok) == new_tok, (lane_token_file(lane_tok), new_tok)
             os.unlink(new_tok)
-            mkpaths.BUS_LANES_DIR = saved_dir
+            # an empty old file carries nothing over, so the resolver answers the old path
+            os.truncate(old_tok, 0)
             assert lane_token_file(lane_tok) == old_tok, (lane_token_file(lane_tok), old_tok)
         finally:
-            mkpaths.BUS_LANES_DIR = saved_dir
             for path in (old_tok, new_tok):
                 if os.path.exists(path):
                     os.unlink(path)
