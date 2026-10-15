@@ -4386,7 +4386,9 @@ def store_self_test(tmp, env):
     for rel in ("runs/c1/run.json", "runs/c1/board.md", "runs/c1/events.jsonl"):
         assert not os.path.exists(os.path.join(corrupt, rel)), rel
 
-    # D3B: every transition upserts the root card; a kill between the two writes is repaired by sync
+    # L7.3: the root card and sync watermark are gone, so this checks the surviving facts —
+    # the project store is the truth whether or not the root write runs, and `sync` (catch_up)
+    # is idempotent and creates no root card table rows.
     root = os.path.join(tmp, "d3b-home")
     d3 = os.path.join(tmp, "d3b")
     d3env = dict(env, MATRIXKODER_HOME=root, MK_HOME=root)
@@ -4396,14 +4398,12 @@ def store_self_test(tmp, env):
                         "status=building", "--run", "d1", "--data", d3],
                        capture_output=True, text=True, env=d3env)
     assert r.returncode == 0, r.stdout
-    rootdb = db.open_root(root)
+    con = db.open_project(H, STORE_PROJECT_FALLBACK, data_dir=d3)
     try:
-        card = rootdb.execute(
-            "SELECT status, change_no FROM cards WHERE project=? AND run='d1' AND task='T1'",
-            (STORE_PROJECT_FALLBACK,)).fetchone()
+        assert con.execute("SELECT status FROM tasks WHERE run='d1' AND id='T1'").fetchone()["status"] \
+            == "building"
     finally:
-        rootdb.close()
-    assert card and card["status"] == "building", card
+        con.close()
     killed = dict(d3env, MK_ROOT_CRASH="1")
     r = subprocess.run([sys.executable, os.path.abspath(__file__), "task", "set", "T1",
                         "status=review", "--run", "d1", "--data", d3],
@@ -4414,41 +4414,18 @@ def store_self_test(tmp, env):
         proj = con.execute("SELECT status FROM tasks WHERE run='d1' AND id='T1'").fetchone()["status"]
     finally:
         con.close()
-    assert proj == "review", proj  # the project commit landed
-    rootdb = db.open_root(root)
-    try:
-        stale = rootdb.execute(
-            "SELECT status FROM cards WHERE project=? AND run='d1' AND task='T1'",
-            (STORE_PROJECT_FALLBACK,)).fetchone()["status"]
-    finally:
-        rootdb.close()
-    assert stale == "building", stale  # the root write was the one that died
+    assert proj == "review", proj  # the project commit landed, root write or not
     r = subprocess.run([sys.executable, os.path.abspath(__file__), "sync", "--data", d3],
                        capture_output=True, text=True, env=d3env)
     assert r.returncode == 0, r.stdout
-    first = json.loads(r.stdout)
-    assert first["copied"] >= 1, first
+    assert json.loads(r.stdout)["copied"] == 0, r.stdout  # plan_summary already current
     rootdb = db.open_root(root)
     try:
-        fixed = rootdb.execute(
-            "SELECT status FROM cards WHERE project=? AND run='d1' AND task='T1'",
-            (STORE_PROJECT_FALLBACK,)).fetchone()["status"]
-        seen = rootdb.execute("SELECT last_change_no FROM sync WHERE project=?",
-                              (STORE_PROJECT_FALLBACK,)).fetchone()["last_change_no"]
+        for table in ("cards", "project_summary", "sync"):
+            n = rootdb.execute(f"SELECT COUNT(*) c FROM {table}").fetchone()["c"]
+            assert n == 0, f"{table} gained a row: {n}"
     finally:
         rootdb.close()
-    assert fixed == "review", fixed
-    r = subprocess.run([sys.executable, os.path.abspath(__file__), "sync", "--data", d3],
-                       capture_output=True, text=True, env=d3env)
-    second = json.loads(r.stdout)
-    assert second["copied"] == 0, second  # idempotent
-    rootdb = db.open_root(root)
-    try:
-        again = rootdb.execute("SELECT last_change_no FROM sync WHERE project=?",
-                               (STORE_PROJECT_FALLBACK,)).fetchone()["last_change_no"]
-    finally:
-        rootdb.close()
-    assert again == seen
 
     # L4: sync finds the store always on — it copies any un-synced changes and creates no view
     off = os.path.join(tmp, "d3b-off")
@@ -4487,7 +4464,10 @@ def store_self_test(tmp, env):
     # Z3: a WRITE maintains the root projection in the REAL home (the old code wrote a fake
     # <data>/.mk-home instead), so run init creates <home>/mk.db here. A read (the `bare` case
     # above) still creates nothing.
-    assert os.path.exists(os.path.join(reg_home, "mk.db")), "a write must maintain the real root store"
+    # L7.3 retired the root cards writes that used to create <home>/mk.db on a bare write: with no
+    # plan there is no plan_summary row to write, so the root file is only created by a registration
+    # or a plan. What must still hold: no fake home inside the data dir.
+    assert not os.path.exists(os.path.join(from_json, ".mk-home")), "a fake home must not be created"
     # register writes BOTH, and the root table then wins over a stale projects.json
     saved = {k: os.environ.get(k) for k in ("MK_HOME", "MATRIXKODER_HOME")}
     os.environ["MK_HOME"] = reg_home
@@ -4684,14 +4664,8 @@ def store_self_test(tmp, env):
             "SELECT id, status FROM tasks WHERE run='pr'")}
     finally:
         con.close()
-    rootdb = db.open_root(par_home)
-    try:
-        cards = {r["task"]: r["status"] for r in rootdb.execute(
-            "SELECT task, status FROM cards WHERE project=? AND run='pr'", (STORE_PROJECT_FALLBACK,))}
-    finally:
-        rootdb.close()
     assert set(proj) == {f"P{i}" for i in range(20)}, proj
-    assert proj == cards, (proj, cards)
+    # L7.3: the root card copy is gone, so there is nothing to compare the project store against.
 
     # D3C: store enable imports every run, not only the active one
     many = os.path.join(tmp, "many")
@@ -4780,11 +4754,7 @@ def store_self_test(tmp, env):
     once(["task", "set", "Z", "status=building", "--run", "rr"], rd)
     assert store_status("B") == "ready", "an unrelated task set demoted B to " + store_status("B")
     assert store_status("Z") == "building"
-    # the root card shows Ready
-    _mkdb().catch_up(H, STORE_PROJECT_FALLBACK, data_dir=rd)
-    cards = _mkdb().cards(H, STORE_PROJECT_FALLBACK)
-    col = next(c["col"] for c in cards if c["task"] == "B" and c["run"] == "rr")
-    assert col == "Ready", col
+    # L7.3: the root card copy is gone; the ready flag is a project-store fact (checked above).
     # a regress demotes: A done -> fix puts B back to planned
     once(["task", "set", "A", "status=fix", "--run", "rr"], rd)
     assert store_status("B") == "planned", "a regressed dep left B " + store_status("B")

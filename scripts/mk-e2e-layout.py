@@ -1164,7 +1164,7 @@ def _mutations(_unused):
 
     @m("R06", "a wrong plan_summary count", "plan_summary")
     def _(f):
-        con = sqlite3.connect(os.path.join(f["home"], "mk.db"))
+        con = mkdb.open_root(f["home"])  # the one SQLite writer (single-writer rule)
         try:
             con.execute("UPDATE plan_summary SET counts_json=? WHERE plan=?",
                         (json.dumps({"done": 99}), f["plan"]))
@@ -1218,7 +1218,7 @@ def _mutations(_unused):
 
     @m("R12", "a tasks table in the root store", "tasks")
     def _(f):
-        con = sqlite3.connect(os.path.join(f["home"], "mk.db"))
+        con = mkdb.open_root(f["home"])  # the one SQLite writer (single-writer rule)
         try:
             con.execute("CREATE TABLE tasks(run TEXT, id TEXT)")
             con.commit()
@@ -1233,7 +1233,7 @@ def _mutations(_unused):
 
     @m("R14", "a missing plan_summary row", "no plan_summary row")
     def _(f):
-        con = sqlite3.connect(os.path.join(f["home"], "mk.db"))
+        con = mkdb.open_root(f["home"])  # the one SQLite writer (single-writer rule)
         try:
             con.execute("DELETE FROM plan_summary")
             con.commit()
