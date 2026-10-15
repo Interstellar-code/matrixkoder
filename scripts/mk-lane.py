@@ -1556,7 +1556,12 @@ def self_test():
     os.environ["MK_HOME"] = lane_home
     os.environ["MATRIXKODER_HOME"] = lane_home
     os.environ["MK_SELFTEST"] = "1"
-    env = dict(os.environ, MATRIXKODER_HOME=lane_home, MK_HOME=lane_home, MK_SELFTEST="1", MK_HERDR="none")
+    # MK_OMP_USER_SKILLS points the user-level skill comparison at a temp stand-in (empty until 6c
+    # fills it), so no case ever reads the machine's real ~/.omp copy: a version drift there must
+    # not decide this test's outcome.
+    user_skills = os.path.join(tmp, "user-omp-skills")
+    env = dict(os.environ, MATRIXKODER_HOME=lane_home, MK_HOME=lane_home, MK_SELFTEST="1",
+               MK_HERDR="none", MK_OMP_USER_SKILLS=user_skills)
     env.pop("MATRIXKODER_DATA", None)
     data, repo = os.path.join(tmp, "data"), os.path.join(tmp, "repo")
     os.makedirs(data)
@@ -1587,6 +1592,12 @@ def self_test():
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as f:
             f.write(text)
+
+    def stable(obj):
+        """The reply without its conditional keys. `warning` (a drifted user-level skill copy) and
+        `warnings` (a lanes: line we could not parse) appear only when the machine says so; the
+        assertions below are about the STABLE keys, so neither may flip a comparison."""
+        return {k: v for k, v in obj.items() if k not in ("warning", "warnings")}
 
     def yaml_cap(slots, cap, pattern="../{repo}-mk-{n}", disposable=None):
         with open(os.path.join(data, "matrixkoder.yaml"), "w") as f:
@@ -1685,12 +1696,14 @@ def self_test():
         # 2 first acquire creates slot 1 on the task branch and records the task keys
         omp_slot_skill = os.path.join(slot1, ".omp/skills/mk-builder")
         a1 = mk("acquire", "--run", "r1", "--task", "t1", "--base", "main")
-        assert a1 == {"ok": True, "slot": 1, "path": slot1, "workspace": "mk:repo:1",
-                      "workspace_id": None, "branch": "mk/r1/t1", "agent": "t1-build-r1",
-                      "created": True, "install_needed": True,
-                      "skill_installed": os.path.join(slot1, ".claude/skills/mk-builder"),
-                      "omp_skill_installed": omp_slot_skill,
-                      "guard_path": os.path.join(slot1, ".matrixkoder-bin/git")}, a1
+        # the STABLE keys, compared exactly: `warning`/`warnings` are conditional (a drifted user
+        # skill copy, a config line we could not parse) and must never enter this assertion
+        assert stable(a1) == {"ok": True, "slot": 1, "path": slot1, "workspace": "mk:repo:1",
+                             "workspace_id": None, "branch": "mk/r1/t1", "agent": "t1-build-r1",
+                             "created": True, "install_needed": True,
+                             "skill_installed": os.path.join(slot1, ".claude/skills/mk-builder"),
+                             "omp_skill_installed": omp_slot_skill,
+                             "guard_path": os.path.join(slot1, ".matrixkoder-bin/git")}, a1
         assert open(os.path.join(omp_slot_skill, "SKILL.md"), "rb").read() == \
             open(os.path.join(os.path.dirname(HERE), "child-skills", "mk-builder", "SKILL.md"),
                  "rb").read()  # an omp lane reads .omp/skills; it holds the plugin's bytes
@@ -2294,7 +2307,9 @@ def self_test():
         low = mk("acquire", "--run", "r1", "--task", "t2", "--base", "main")
         assert low["slot"] == 4, low  # the lowest free slot, path gone → recreated
         assert "mk-state task set" not in low.get("warning", ""), low  # the stored-case id was written
-        ids = [t["id"] for t in mk_state.read_json(os.path.join(data, "runs", "r1", "run.json"))["tasks"]]
+        # L4 (C4): the store is the record — no runs/<rid>/run.json to read, so the task list
+        # comes from the same snapshot resolve_task uses
+        ids = [t["id"] for t in ((store_snapshot(data, "r1") or {}).get("run") or {}).get("tasks") or []]
         assert ids.count("T2") == 1 and "t2" not in ids, ids
         tt = st("task", "get", "T2")["task"]
         assert (tt["lane"], tt["slot"]) == (os.path.join(tmp, "repo-mk-4"), "4"), tt
@@ -2503,8 +2518,10 @@ def self_test():
         assert g("-C", slot5, "rev-parse", "HEAD^{commit}").stdout.strip() == main_sha
         assert mk("release", "--slot", "5", "--integration", "mk/r1/integration")["ok"]
 
-        # ---- store mode (D5B): same script, mk.db present. File mode above never created one. ----
-        assert not os.path.exists(os.path.join(data, "mk.db")), "file mode must not create mk.db"
+        # ---- store parity (D5B): the same script against two independent stores. L4 (C4) dropped
+        # file mode, so there is no "file dir without mk.db" left to compare against: mk-state
+        # writes a store into every data dir it is asked about, and what this replays is that two
+        # separate stores answer the same commands with the same lane semantics. ----
 
         def norm(obj):
             """Outputs equal except paths: temp dirs differ between the two data dirs."""
@@ -2531,18 +2548,34 @@ def self_test():
             return (f'repo:\n  lanes: {{ slots: 2, pattern: "../{{repo}}-{tag}-{{n}}", reuse: true }}\n'
                     "routing_preferences:\n  max_build_lanes: 2\n")
 
-        store_data = os.path.join(tmp, "data-store")
-        os.makedirs(store_data)
-        # copy the run mk-state knows about, and the yaml, so acquire's run check passes
+        # Two independent store-backed dirs, seeded from the same data dir so they start equal
+        # (L4: every data dir carries a store; there is no storeless side to compare against).
+        # lanes.json is the one thing left out, so each side builds its own slot pool.
         import shutil as _sh
-        for name in os.listdir(data):
-            src, dst = os.path.join(data, name), os.path.join(store_data, name)
-            if name == "lanes.json":
-                continue  # store mode starts empty, then we migrate a copy separately
-            if os.path.isdir(src):
-                _sh.copytree(src, dst)
-            else:
-                _sh.copy2(src, dst)
+
+        def seed(ddir, tag):
+            os.makedirs(ddir)
+            for name in os.listdir(data):
+                if name == "lanes.json":
+                    continue
+                src, dst = os.path.join(data, name), os.path.join(ddir, name)
+                if os.path.isdir(src):
+                    _sh.copytree(src, dst)
+                else:
+                    _sh.copy2(src, dst)
+            write(os.path.join(ddir, "matrixkoder.yaml"), parity_yaml(tag))
+            # the copied store carries the source run's slot rows: empty the pool so each side
+            # builds its own, exactly as the old file-mode side started with no lanes.json
+            con = mkdb.open_project(mkpaths.home(), data_dir=ddir)
+            try:
+                con.execute("BEGIN IMMEDIATE")
+                con.execute("DELETE FROM lane_slots")
+                con.execute("COMMIT")
+            finally:
+                con.close()
+
+        store_data = os.path.join(tmp, "data-store")
+        seed(store_data, "store")
         # open the store the only allowed way, under a temp home, so the file exists before commands
         home = os.path.join(tmp, "mk-home")
         os.makedirs(home)
@@ -2559,15 +2592,9 @@ def self_test():
             assert r.returncode == code, (args, r.returncode, r.stdout, r.stderr)
             return json.loads(lines[0])
 
-        # parity: a fresh file dir and the store dir, same commands, outputs equal except paths
+        # parity: two independent stores, same commands, outputs equal except paths
         file_data = os.path.join(tmp, "data-file")
-        os.makedirs(file_data)
-        write(os.path.join(file_data, "matrixkoder.yaml"), parity_yaml("file"))
-        write(os.path.join(store_data, "matrixkoder.yaml"), parity_yaml("store"))
-        # the run registry lives under data/runs — copy it
-        if os.path.isdir(os.path.join(data, "runs")):
-            _sh.copytree(os.path.join(data, "runs"), os.path.join(file_data, "runs"))
-            _sh.copytree(os.path.join(data, "runs"), os.path.join(store_data, "runs"), dirs_exist_ok=True)
+        seed(file_data, "file")
         def mapped(args, task):
             return [task if a == "s1" else a for a in args]
 
@@ -2576,8 +2603,8 @@ def self_test():
             # both try to create the branch mk/r1/s1. Outputs compared after normalising paths.
             fa = mk_at(file_data, env, *mapped(args, "s1"), code=0)
             sa = mk_at(store_data, env_store, *mapped(args, "s2"), code=0)
-            # task-set warnings differ (file mode has no store; store mode has no legacy run row).
-            # Slot semantics are the comparable part: same keys, same non-path values.
+            # slot semantics are the comparable part: same keys, same non-path values (each store
+            # owns its own task rows, so the task-set warnings are never compared)
             def core(obj):
                 if isinstance(obj, dict) and "slots" in obj:
                     return {"cap": obj.get("cap"), "slots": [
@@ -2588,27 +2615,41 @@ def self_test():
                     return {k: norm(obj[k]) for k in keep if k in obj}
                 return norm(obj)
             assert core(fa) == core(sa), (args, fa, sa)
-        assert not os.path.exists(os.path.join(file_data, "mk.db"))
+        assert os.path.isfile(os.path.join(file_data, "mk.db"))  # both sides are stores now
 
         # exit 4 when every slot is busy — its own data dir, so no slot path from the parity pattern
-        cap_data = os.path.join(tmp, "data-cap")
-        os.makedirs(cap_data)
-        if os.path.isdir(os.path.join(data, "runs")):
-            _sh.copytree(os.path.join(data, "runs"), os.path.join(cap_data, "runs"))
-        write(os.path.join(cap_data, "matrixkoder.yaml"),
-              'repo:\n  lanes: { slots: 1, pattern: "../{repo}-cap-{n}", reuse: true }\n'
-              "routing_preferences:\n  max_build_lanes: 1\n")
-        mkdb.open_project(home, data_dir=cap_data).close()
-        store_data_cap = cap_data
         # cap 1: one acquire succeeds, the next is exit 4. Need a known task.
-        st_args_base = ["--data", data]  # tasks were added on the original data dir
-        # point both dirs at runs already copied. Add a fresh task on the ORIGINAL data, then recopy runs.
         st("task", "add", "--id", "storeA", "--title", "store A", "--run", "r1")
         st("task", "add", "--id", "storeB", "--title", "store B", "--run", "r1")
         st("task", "add", "--id", "parA", "--title", "par A", "--run", "r1")
         st("task", "add", "--id", "parB", "--title", "par B", "--run", "r1")
-        _sh.rmtree(os.path.join(store_data, "runs"), ignore_errors=True)
-        _sh.copytree(os.path.join(data, "runs"), os.path.join(store_data, "runs"))
+
+        def seed_cap(ddir, yaml_text):
+            """A fresh store-backed dir carrying the run r1 mk-state just wrote, with an empty lane
+            pool. L4: the run lives in mk.db, so a runs/ copy alone would leave it unknown."""
+            _sh.rmtree(ddir, ignore_errors=True)
+            os.makedirs(ddir)
+            for name in os.listdir(data):
+                if name == "lanes.json":
+                    continue
+                src, dst = os.path.join(data, name), os.path.join(ddir, name)
+                if os.path.isdir(src):
+                    _sh.copytree(src, dst)
+                else:
+                    _sh.copy2(src, dst)
+            write(os.path.join(ddir, "matrixkoder.yaml"), yaml_text)
+            con = mkdb.open_project(mkpaths.home(), data_dir=ddir)
+            try:
+                con.execute("BEGIN IMMEDIATE")
+                con.execute("DELETE FROM lane_slots")
+                con.execute("COMMIT")
+            finally:
+                con.close()
+
+        cap_data = os.path.join(tmp, "data-cap")
+        seed_cap(cap_data, 'repo:\n  lanes: { slots: 1, pattern: "../{repo}-cap-{n}", reuse: true }\n'
+                           "routing_preferences:\n  max_build_lanes: 1\n")
+        store_data_cap = cap_data
         one = mk_at(store_data_cap, env_store, "acquire", "--run", "r1", "--task", "storeA", "--base", "main")
         assert one["ok"] and one["slot"] == 1, one
         busy = mk_at(store_data_cap, env_store, "acquire", "--run", "r1", "--task", "storeB",
@@ -2618,26 +2659,18 @@ def self_test():
 
         # two parallel acquires never get the same slot (cap 2), own data dir
         par_data = os.path.join(tmp, "data-par")
-        os.makedirs(par_data)
-        if os.path.isdir(os.path.join(store_data, "runs")):
-            _sh.copytree(os.path.join(store_data, "runs"), os.path.join(par_data, "runs"))
-        mkdb.open_project(home, data_dir=par_data).close()
-        write(os.path.join(par_data, "matrixkoder.yaml"),
-              'repo:\n  lanes: { slots: 2, pattern: "../{repo}-par-{n}", reuse: true }\n'
-              "routing_preferences:\n  max_build_lanes: 2\n")
+        seed_cap(par_data, 'repo:\n  lanes: { slots: 2, pattern: "../{repo}-par-{n}", reuse: true }\n'
+                           "routing_preferences:\n  max_build_lanes: 2\n")
+        env_store_par = dict(env_store)
         import threading
         got = {}
 
         def grab(task, key):
             r = subprocess.run([sys.executable, self_path, "acquire", "--run", "r1", "--task", task,
                                 "--base", "main", "--data", par_data], capture_output=True,
-                               text=True, env=env_store, cwd=repo)
+                               text=True, env=env_store_par, cwd=repo)
             got[key] = (r.returncode, r.stdout.strip())
 
-        _sh.rmtree(os.path.join(par_data, "runs"), ignore_errors=True)
-        _sh.copytree(os.path.join(data, "runs"), os.path.join(par_data, "runs"))
-        _sh.rmtree(os.path.join(store_data_cap, "runs"), ignore_errors=True)
-        _sh.copytree(os.path.join(data, "runs"), os.path.join(store_data_cap, "runs"))
         t1 = threading.Thread(target=grab, args=("parA", "a"))
         t2 = threading.Thread(target=grab, args=("parB", "b"))
         t1.start(); t2.start(); t1.join(); t2.join()
@@ -2710,8 +2743,9 @@ def self_test():
         view2 = mk_state.read_json(os.path.join(mig, "lanes.json"))
         assert view2["slots"]["1"]["state"] == "busy" and view2["slots"]["1"]["task"] == "storeA"
         assert repaired["slots"][0]["state"] == "busy"
-        # and the file-mode data dir from the long test still has no mk.db
-        assert not os.path.exists(os.path.join(data, "mk.db"))
+        # L4 (C4): there is no file-mode data dir left — every dir mk-state is asked about gets a
+        # store, so `data` above carries mk.db like any other, and that is the expected state
+        assert os.path.isfile(os.path.join(data, "mk.db"))
         assert before  # the pre-import bytes were captured; import did not need them afterwards
 
         # L1 in store mode: ignored `.omc` state alone leaves the slot releasable, a modified
@@ -2719,12 +2753,8 @@ def self_test():
         st("task", "add", "--id", "omcs", "--title", "omc store", "--run", "r1")
         st("task", "add", "--id", "omcs2", "--title", "omc store 2", "--run", "r1")
         omc_data = os.path.join(tmp, "data-omc-store")
-        os.makedirs(omc_data)
-        _sh.copytree(os.path.join(data, "runs"), os.path.join(omc_data, "runs"))
-        write(os.path.join(omc_data, "matrixkoder.yaml"),
-              'repo:\n  lanes: { slots: 2, pattern: "../{repo}-omc-{n}", reuse: true }\n'
-              "routing_preferences:\n  max_build_lanes: 2\n")
-        mkdb.open_project(home, data_dir=omc_data).close()
+        seed_cap(omc_data, 'repo:\n  lanes: { slots: 2, pattern: "../{repo}-omc-{n}", reuse: true }\n'
+                           "routing_preferences:\n  max_build_lanes: 2\n")
         got = mk_at(omc_data, env_store, "acquire", "--run", "r1", "--task", "omcs", "--base", "main")
         assert got["ok"] and got["slot"] == 1, got
         omc_slot = got["path"]
@@ -2763,9 +2793,12 @@ def self_test():
             else:
                 shutil.rmtree(link_s)
         os.symlink(outside_s, link_s)
-        st("task", "add", "--id", "syms", "--title", "symlink store", "--run", "r1")
-        _sh.rmtree(os.path.join(omc_data, "runs"))
-        _sh.copytree(os.path.join(data, "runs"), os.path.join(omc_data, "runs"))
+        # L4: the run lives in the store, so the new task must be written there (a runs/ copy would
+        # leave 'syms' unknown); the existing lane pool and its slot 1 registration are kept
+        r = subprocess.run([sys.executable, os.path.join(HERE, "mk-state.py"), "--data", omc_data,
+                            "task", "add", "--id", "syms", "--title", "symlink store", "--run", "r1"],
+                           capture_output=True, text=True, env=env, cwd=repo)
+        assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
         got = mk_at(omc_data, env_store, "acquire", "--run", "r1", "--task", "syms", "--base", "main")
         assert got["ok"] and got["slot"] == 1, got
         assert not os.path.islink(link_s) and os.path.isdir(link_s)
@@ -2907,9 +2940,11 @@ def self_test():
         want = {"ids": ["rs1"], "exact": "rs1", "upper": "rs1", "mixed": "rs1", "unknown": None,
                 "task_exact": "Rt1", "task_upper": "Rt1", "task_lower": "Rt1", "task_other": "Rt2",
                 "task_unknown": "nope", "task_no_run": "rt1"}
-        # (b) the file views are present — today's world, and the store is already the source
-        assert os.path.isfile(mkpaths.run_doc(rsd, "rs1")), "store enable published no run.json"
-        assert os.path.isfile(mkpaths.runs_index(rsd))
+        assert os.path.isfile(os.path.join(rsd, "mk.db")), "store enable wrote no mk.db"
+        # (b) L4 (C4): store enable writes NO run.json / index.json — the store is the only
+        # record. The resolutions below are read straight off it.
+        assert not os.path.exists(mkpaths.run_doc(rsd, "rs1"))
+        assert not os.path.exists(mkpaths.runs_index(rsd))
         assert resolutions(rsd) == want, resolutions(rsd)
         # (d) an unknown run still resolves to None, and acquire refuses naming the store's runs
         assert resolve_run(rsd, "nope") is None
@@ -2931,15 +2966,12 @@ def self_test():
         assert row["id"] == "Rt1" and row["lane"] and row["slot"] == "1", row
         assert mk_at(rsd, env, "release", "--slot", "1",
                      "--integration", "mk/r1/integration")["ok"]
-        # (a) the two files the readers used to read are gone: runs/index.json and the run
-        # documents. That is the whole post-L4 world for a reader — mk-state writes neither, and
-        # only the store is left to answer. The directory itself stays: mk-state's own store
-        # writer still wants <data>/runs/<rid>/ to exist (L4's business, not this reader's).
-        os.unlink(mkpaths.runs_index(rsd))
-        for _t in os.listdir(os.path.join(rsd, "runs", "rs1", "tasks")):
-            _p = os.path.join(rsd, "runs", "rs1", "tasks", _t)
-            _sh.rmtree(_p) if os.path.isdir(_p) else os.unlink(_p)
-        os.unlink(mkpaths.run_doc(rsd, "rs1"))
+        # (a) L4 (C4): mk-state writes no run.json / index.json, so there is nothing for a reader
+        # to fall back to — the store is the only record, and the resolutions hold anyway. (If a
+        # legacy file view ever exists, delete it: the store must answer without it.)
+        for _p in (mkpaths.runs_index(rsd), mkpaths.run_doc(rsd, "rs1")):
+            if os.path.exists(_p):
+                os.unlink(_p)
         assert not os.path.exists(mkpaths.run_doc(rsd, "rs1"))
         assert not os.path.exists(mkpaths.runs_index(rsd))
         assert resolutions(rsd) == want, resolutions(rsd)
@@ -2973,12 +3005,15 @@ def self_test():
                            env=bare, cwd=repo)
         assert r.returncode == 0 and json.loads(r.stdout)["ok"], (r.returncode, r.stdout, r.stderr)
 
-        # (e) a pre-migration project: no store at all, so the run files are still the source
+        # (e) a pre-migration project: no store at all, so the run files are still the source.
+        # L4 (C4) made mk-state store-always, so this fixture writes the legacy file views by hand
+        # — that is the one shape a storeless project can have now.
         nsd = os.path.join(tmp, "data-resolve-file")
-        os.makedirs(nsd)
-        st_at(nsd, "run", "init", "--id", "Fs1", "--feature", "F", "--branch", "b")
-        st_at(nsd, "task", "add", "--id", "Ft1", "--title", "one")
-        assert not os.path.exists(os.path.join(nsd, "mk.db")), "a file-mode run created mk.db"
+        os.makedirs(os.path.join(nsd, "runs", "Fs1"))
+        write(os.path.join(nsd, "runs", "index.json"), json.dumps([{"id": "Fs1"}]))
+        write(os.path.join(nsd, "runs", "Fs1", "run.json"),
+              json.dumps({"schema": 1, "id": "Fs1", "tasks": [{"id": "Ft1"}]}))
+        assert not os.path.exists(os.path.join(nsd, "mk.db"))
         assert store_snapshot(nsd) is None
         assert run_ids(nsd) == ["Fs1"], run_ids(nsd)
         assert resolve_run(nsd, "fS1") == "Fs1" and resolve_run(nsd, "nope") is None
