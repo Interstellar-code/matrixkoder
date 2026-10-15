@@ -245,18 +245,29 @@ function gitBan(ws: readonly string[]): Ban | undefined {
 }
 
 const MKDB = /(^|\/)mk\.db(\?|$)/
-// ponytail: keyword scan, so a SELECT that quotes "update" is denied too; add -readonly. Upgrade if it bites.
-const SQL_WRITE = /\b(insert|update|delete|drop|alter|create|reindex|replace\s+into)\b|\bvacuum\s+into\s+\S*mk\.db|^\s*\.(import|restore)\b/i
+const SQL_WRITE = /\b(insert|update|delete|drop|alter|create|reindex|replace\s+into)\b|^\s*\.(import|restore)\b/i
+const VACUUM_MK = /\bvacuum\s+(\S+\s+)?into\s+['"]?\S*mk\.db/i
+const noLiterals = (sql: string) => sql.replace(/'(?:[^']|'')*'|"[^"]*"/g, "''") // a keyword inside a literal is data
 
-/** Raw `sqlite3` that may write an mk.db. Read-only (`-readonly`, `mode=ro`) and `VACUUM INTO <tmp>` pass; SQL fed by
- * stdin cannot be seen, so a bare `sqlite3 mk.db` is denied. */
-function sqliteBan(ws: readonly string[]): Ban | undefined {
+/** Raw `sqlite3` that may write an mk.db, as the db argument or as a path inside the SQL (ATTACH, VACUUM INTO).
+ * Read-only (`-readonly`, `mode=ro`) and `VACUUM INTO <tmp>` pass. SQL fed by stdin (`<`, heredoc, `piped`) cannot be
+ * seen, so it counts as a write on an mk.db. */
+function sqliteBan(ws: readonly string[], piped: boolean): Ban | undefined {
   if (base(ws[0] ?? '') !== 'sqlite3') return undefined
   const args = ws.slice(1)
-  if (!args.some(w => MKDB.test(w.replace(/^file:/, ''))) || args.some(w => /^--?readonly$/.test(w) || /mode=ro\b/.test(w))) return undefined
-  const sql = args.filter(w => !w.startsWith('-') && !MKDB.test(w.replace(/^file:/, '')))
-  if (sql.length && !args.some(w => w.startsWith('<')) && !sql.some(w => SQL_WRITE.test(w))) return undefined
-  return { cmd: 'sqlite3 write to mk.db', why: 'use mk-state / mkdb.py, or sqlite3 -readonly' }
+  if (args.some(w => /^--?readonly$/.test(w) || /mode=ro\b/.test(w))) return undefined
+  const isDb = (w: string) => MKDB.test(w.replace(/^file:/, ''))
+  const sql = args.filter(w => !w.startsWith('-') && !isDb(w))
+  const dbArg = args.some(isDb)
+  const inSql = sql.some(w => /mk\.db/.test(w))
+  if (!dbArg && !inSql) return undefined
+  const stdin = piped || args.some(w => w.startsWith('<'))
+  const writes = sql.some(w => SQL_WRITE.test(noLiterals(w)) || VACUUM_MK.test(w))
+  // ponytail: with a plain db arg, SQL-less or stdin SQL is denied; a quoted-literal scan only, not a SQL parser
+  if (dbArg ? stdin || !sql.length || writes : writes) {
+    return { cmd: 'sqlite3 write to mk.db', why: 'use mk-state / mkdb.py, or sqlite3 -readonly' }
+  }
+  return undefined
 }
 
 /** A command's short flag letters, other flags and positional words; rm's -R/--recursive/--force fold to r/f. */
@@ -300,7 +311,7 @@ function check(command: string, banned: readonly string[], depth = 0): Ban | und
   const subs: string[] = []
   for (const raw of tokenize(command, subs)) {
     const ws = stripPrefixes(raw)
-    const ban = gitBan(ws) ?? sqliteBan(ws) ?? bannedHit(ws, banned)
+    const ban = gitBan(ws) ?? sqliteBan(ws, /\|[^|]*\bsqlite3\b/.test(command)) ?? bannedHit(ws, banned)
     if (ban) return ban
     const inner = depth < MAX_DEPTH ? innerScript(ws) : undefined
     const nested = inner === undefined ? undefined : check(inner, banned, depth + 1)
