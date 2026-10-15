@@ -164,6 +164,22 @@ test('a task row shows id, cut title and the dim lane·agent tag (V1.5)', () => 
   expect(text).toContain('L3 · opencode glm-5.3')
 })
 
+test('a merged or done task with a slot and route shows no lane tag; a building one does (Z26)', () => {
+  const withStatus = (status: string): typeof PLAN_REAL_FIXTURE => {
+    const f = routedFixture()
+    return { ...f, phases: (f.phases ?? []).map(phase => ({
+      ...phase, rows: phase.rows.map(row => row.id === 'V1.3' ? { ...row, status } : row),
+    })) }
+  }
+  const ui = new Map([['plan:phase:V1', '1']])
+  expect(allText(PlanTab(stubEls, withStatus('building'), 80, ui))).toContain('L3 · opencode glm-5.3')
+  for (const status of ['merged', 'done']) {
+    const text = allText(PlanTab(stubEls, withStatus(status), 80, ui))
+    expect(text).toContain('V1.3')
+    expect(text).not.toContain('L3 · opencode glm-5.3')
+  }
+})
+
 test('at a narrow width the lane·agent tag drops before the title shrinks below 10', () => {
   const drawn = PlanTab(stubEls, routedFixture(), 36, new Map([['plan:phase:V1', '1']]))
   const text = allText(drawn)
@@ -271,21 +287,21 @@ test('report render: the Detail sub-tab with phase D1 open at 80 cols, exactly a
 PHASES                                               ▾ Expand all ▸ Collapse all
 
 ╭──────────────────────────────────────────────────────────────────────────────╮
-│ ▸ ◈ › R1 · Self-tests never write a real DB: one MK home var…  L3  with T1   │
+│ ▸ ◈ › R1 · Self-tests never write a real DB: one MK home variab…   with T1   │
 │ ◈◈◈                                                                          │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 
 ╭──────────────────────────────────────────────────────────────────────────────╮
-│ ▸ ✓ › T1 · Plan template is the contract: every header key nam…  L4  with R1 │
+│ ▸ ✓ › T1 · Plan template is the contract: every header key names …   with R1 │
 │ ✓✓                                                                           │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 
 ╭──────────────────────────────────────────────────────────────────────────────╮
 │ ▾ ◈ › D1 · Plans in the project DB: the four new columns, impor…   merged    │
 │ ◈◈◈◈                                                                         │
-│ ├  ◈ D1.1 mkdb.py: plans gains status, created, design, integration…  L3     │
-│ ├  ◈ D1.2 mk-plan.py: write the new columns; \`impor…  L4 · opencode auto     │
-│ ├  ◈ D1.3 docs/state-schema.md: drop the 'added by D1' marks; docum…  L5     │
+│ ├  ◈ D1.1 mkdb.py: plans gains status, created, design, integration (…       │
+│ ├  ◈ D1.2 mk-plan.py: write the new columns; \`import <file>\`; \`delete…       │
+│ ├  ◈ D1.3 docs/state-schema.md: drop the 'added by D1' marks; documen…       │
 │ ├  ◈ D1.4 First real import: settings-plans-db.md into .matrixkoder/m…       │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 
@@ -300,7 +316,7 @@ PHASES                                               ▾ Expand all ▸ Collapse
 ╰──────────────────────────────────────────────────────────────────────────────╯
 
 ╭──────────────────────────────────────────────────────────────────────────────╮
-│ ▸ ◈ › V1.4 · Kanban sub-tab to PlanKanban.dc.h…  opencode glm-5.3  merged    │
+│ ▸ ◈ › V1.4 · Kanban sub-tab to PlanKanban.dc.html: 4 side-by-si…   merged    │
 │ ◈◈◈◈◈◈◈                                                                      │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 
@@ -357,9 +373,9 @@ PHASES   ▾ Expand all ▸ Collapse all
 ╭──────────────────────────────────╮
 │ ▾ ◈ › D1 · Plans in…   merged    │
 │ ◈◈◈◈                             │
-│ ├  ◈ D1.1 mkdb.py: plan…  L3     │
+│ ├  ◈ D1.1 mkdb.py: plans …       │
 │ ├  ◈ D1.2 mk-plan.py: wri…       │
-│ ├  ◈ D1.3 docs/state-sc…  L5     │
+│ ├  ◈ D1.3 docs/state-sche…       │
 │ ├  ◈ D1.4 First real impo…       │
 ╰──────────────────────────────────╯
 

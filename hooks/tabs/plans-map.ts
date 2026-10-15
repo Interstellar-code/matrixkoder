@@ -136,6 +136,14 @@ const STATUS_BUCKET: Record<string, 'done' | 'live' | 'planned'> = {
   planned: 'planned', routed: 'planned', ready: 'planned', parked: 'planned',
 }
 
+/** True for a finished task (merged/done): its slot and route are history, the
+ *  slot may already hold another task, so the plan tree shows no lane tag. */
+export const isDoneStatus = (status: string): boolean => STATUS_BUCKET[status] === 'done'
+
+/** Natural order by task id within one parent: F.2 < F.4 < F.10 < F.S. */
+const byTaskId = (a: { id: string }, b: { id: string }): number =>
+  a.id.localeCompare(b.id, 'en', { numeric: true })
+
 /** Sum the per-status counts into the run-card bucket totals. A status not in
  *  STATUS_BUCKET lands in planned: every task counts. */
 function bucketCounts(counts: unknown): { done: number; live: number; planned: number } {
@@ -191,6 +199,7 @@ function taskOf(raw: unknown): PlanTask | null {
   const type = strOrNull(raw.type)
   const round = typeof raw.round === 'number' && Number.isFinite(raw.round) ? raw.round : undefined
   const verdict = strOrNull(raw.verdict)
+  subs.sort(byTaskId)
   return {
     id: raw.id, title: str(raw.title), status, right: status, subs,
     ...routeFields(raw),
@@ -358,6 +367,7 @@ export function planFromReply(reply: unknown): PlanView {
         tasksInPhases += 1
       }
     }
+    rows.sort(byTaskId)
     const wave = typeof raw.wave === 'number' ? raw.wave : undefined
     phases.push({
       id: raw.id,
