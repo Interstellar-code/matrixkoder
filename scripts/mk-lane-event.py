@@ -628,7 +628,7 @@ def store_rows(data, sql, params=()):
     uri = "file:" + mkpaths.project_db(data=data) + "?mode=ro"
     con = None
     try:
-        con = sqlite3.connect(uri, uri=True, timeout=5)
+        con = sqlite3.connect(uri, uri=True, timeout=5)  # uri ends in mode=ro: read-only
         con.row_factory = sqlite3.Row
         return [dict(r) for r in con.execute(sql, params)]
     except sqlite3.Error:
