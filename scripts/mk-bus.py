@@ -3273,15 +3273,55 @@ def _archive_digest(rows_by_group):
     return h.hexdigest()
 
 
-def _own_project_store(data_dir):
-    """(store, folder) of the project this data dir names, resolved the way the bus
-    resolves its own store (L6.1, todo 108): a switched project's rows live in the
-    C2 project folder, and mkpaths.project_db(slug) is the one rule that follows
-    the switch. Pre-migration the answer is exactly <data>/mk.db."""
+def _switched_slug_of(data_dir):
+    """The root slug whose projects row has SWITCHED this data dir (db_path set), or None.
+
+    One data dir can be named by several root rows: the bus's own project_slug_for
+    REGISTERS a derived `p<hash>` row for a dir it has no row for, and that row stays
+    after the project is switched under its real slug (L9's audit tree holds exactly
+    that pair, both naming <repo>/.matrixkoder). mkpaths resolves a data dir two ways
+    and BOTH can land on the unswitched row: project_slug_of returns the FIRST root
+    match (the derived row is inserted first), and migrated_slug's map is last-write-wins
+    (the derived row is inserted last), so it then finds no db_path and answers None.
+
+    The row that carries db_path — C3's migrated marker — is the one whose store every
+    reader of this project must use; a db_path-less row never wins over it. Read-only:
+    this is the read half of project_slug_for and registers nothing.
+    """
     try:
-        slug = project_slug_for(data_dir)
-    except Fail:
-        slug = None
+        mod = _load_mkdb()
+        home = _paths("root_home")
+        con = mod.open_root(home)
+    except Exception:
+        return None
+    real = os.path.realpath(data_dir)
+    try:
+        for row in con.execute("SELECT slug, data_dir, db_path FROM projects"):
+            slug, recorded, db_path = row[0], row[1], row[2]
+            if not isinstance(slug, str) or not slug or not isinstance(db_path, str) or not db_path.strip():
+                continue
+            if recorded and os.path.realpath(os.path.expanduser(str(recorded))) == real:
+                return slug
+    except Exception:
+        return None
+    finally:
+        con.close()
+    return None
+
+
+def _own_project_store(data_dir):
+    """(store, folder, slug) of the project this data dir names: a switched project's
+    rows live in the C2 project folder (L6.1, todo 108), and mkpaths.project_db(slug)
+    is the one rule that follows the switch. Pre-migration the answer is exactly
+    <data>/mk.db, with a None slug.
+
+    The slug comes from _switched_slug_of — the row that has actually switched this
+    dir. The plain resolutions can hand back the unswitched row when a derived row
+    names the same dir, which made archive-run read the LEGACY store of a migrated
+    project: a closed run answered `not closed (status active)` and a live run's rows
+    would have been deleted from the wrong store. See _switched_slug_of for why.
+    """
+    slug = _switched_slug_of(data_dir)
     if slug:
         try:
             db = _paths("project_db", slug=slug)
@@ -3290,8 +3330,8 @@ def _own_project_store(data_dir):
         if db and os.path.isfile(db):
             folder = os.path.dirname(db)
             if os.path.realpath(folder) != os.path.realpath(data_dir):
-                return StoreAdapter(folder), folder
-    return StoreAdapter(data_dir), data_dir
+                return StoreAdapter(folder), folder, slug
+    return StoreAdapter(data_dir), data_dir, None
 
 
 def _archive_rows(store, run):
@@ -3516,12 +3556,19 @@ def archive_run(data_dir, run):
         raise Fail("invalid run id")
     if not store_mode(data_dir):
         raise Fail("archive-run needs the project store: file mode holds no bus rows")
-    store, folder = _own_project_store(data_dir)
+    store, folder, slug = _own_project_store(data_dir)
     plan, _status = _archive_refuse_unless_closed(store, run)
     msgs, acks, arts = _archive_rows(store, run)
     groups = _archive_groups(msgs, acks, arts)
     counts, seq_range, digest = _archive_state(groups)
-    path = os.path.join(_paths("run_dir", data_dir, run), "bus.jsonl")
+    # The archive belongs beside the run it holds. A switched run lives in the C2 plan
+    # folder, and `run_dir`'s data-dir form answers today's path as soon as a derived
+    # root row shadows the switched one, so the migrated case names the slug and takes
+    # mkpaths' target rule (the same folder mk-state writes the round files to).
+    if slug:
+        path = os.path.join(_paths("target_run_dir", slug, plan, run), "bus.jsonl")
+    else:
+        path = os.path.join(_paths("run_dir", data_dir, run), "bus.jsonl")
     if not any(counts.values()):
         # Idempotent: the rows are already gone. An archive file that already
         # exists with matching content is left alone; no empty second file.
@@ -7403,6 +7450,99 @@ def _archive_run_self_test():
         assert rows_of(f, "rA") == {"msg": [], "ack": [], "artifact": []}, rows_of(f, "rA")
         f.stop_bus(pid)
         case("(g) failed delete clears the file; the retry archives the run whole")
+        f.cleanup()
+
+        # ---- (h) archive-run on a MIGRATED project named by its LEGACY data dir ---------------
+        # Z4 add-on: the switch copies the store to the C2 tree and sets projects.db_path,
+        # and a post-switch write closes the run there — so the legacy <data>/mk.db still
+        # says `active` while the C2 store says `archived`. archive-run must read the C2
+        # store and write the archive into the C2 PLAN FOLDER, not the legacy runs dir, and
+        # must never refuse with the legacy store's status.
+        f = _archive_fixture(tmp, "projh")
+        f.add_run("rA", status="active", tasks=("T1",))
+        pid, port = f.start_bus("rA")
+        orch = f.mint_orch()
+        tok = f.lane_token("rA", "T1")
+        askmsg = ask(f, port, tok, "rA", "T1", "which fixture?")
+        code, ans = f.post(port, orch, {"run": "rA", "task": "T1", "kind": "answer",
+                                        "text": "the schema one", "from": "orch", "to": "T1",
+                                        "reply_to": askmsg["id"]})
+        assert code == 200 and ans["ok"] is True, (code, ans)
+        code, acked = f.post(port, tok, {"run": "rA", "task": "T1", "kind": "ack", "text": "",
+                                         "from": "T1", "to": "orch",
+                                         "reply_to": ans["message"]["id"], "ack_level": 3})
+        assert code == 200 and acked.get("ack_recorded") is True, (code, acked)
+        code, rep = f.post(port, tok, {"run": "rA", "task": "T1", "kind": "report",
+                                       "text": "round:1\nthe report body", "from": "T1",
+                                       "to": "orch"})
+        assert code == 200 and rep.get("artifact", {}).get("rev") == 1, (code, rep)
+        # the task is terminal before the switch (a copied task row); the RUN status stays
+        # active in the legacy store and is closed only in the C2 one after the switch
+        set_statuses(f, "rA", run_status="active", tasks=(("T1", "done"),))
+        # the inbox is drained, so the switch can quiesce
+        f.stop_bus(pid)
+        f.migrate()  # the real mk-migrate --switch: db_path set, the store copied to C2
+        # a write that lands ONLY in the new store: the run is closed there, while the legacy
+        # copy the switch left behind still says active
+        set_statuses(f, "rA", run_status="archived")
+        # the C2 store the archive must read, addressed by shape: the fixture's own reader
+        # (`folder()`/`store_path()`) follows mkpaths' data-dir form, which the shadow row
+        # below breaks — that is the bug this case pins, so it is never used as the oracle.
+        c2_dir = os.path.join(f.paths()["home"], "projects", f.slug)
+        c2_store = StoreAdapter(c2_dir)
+
+        def rows_of_c2(run_id):
+            msgs = c2_store.store_select(
+                "SELECT id, run, task, t, chan, kind, from_id, to_id, reply_to, text,"
+                " artifact_id, meta_json FROM events WHERE chan=? AND run=? ORDER BY id",
+                ("bus", run_id))
+            acks = c2_store.store_select(
+                "SELECT run, msg, lane, level, t FROM acks WHERE run=? ORDER BY msg, lane",
+                (run_id,))
+            arts = c2_store.store_select(
+                "SELECT id, run, task, round, kind, rev, text, created, src FROM artifacts"
+                " WHERE run=? AND id IN (SELECT artifact_id FROM events"
+                " WHERE chan=? AND run=? AND artifact_id IS NOT NULL) ORDER BY id",
+                (run_id, "bus", run_id))
+            return {"msg": msgs, "ack": acks, "artifact": arts}
+
+        want_h = rows_of_c2("rA")
+        assert want_h["msg"] and want_h["ack"] and want_h["artifact"], \
+            {k: len(v) for k, v in want_h.items()}
+        # the L9 shadow row: the bus's project_slug_for registered a derived slug for this
+        # data dir when it found no row (db_path NULL), and it still names <data>. A reader
+        # that takes the first root match archives the LEGACY store.
+        con_root = f.mod.open_root(f.paths()["home"])
+        try:
+            con_root.execute(
+                "INSERT OR IGNORE INTO projects(slug, name, repo, data_dir, mode, created,"
+                " last_activity) VALUES (?,?,?,?,?,?,?)",
+                ("p" + __import__("hashlib").sha256(
+                    os.path.realpath(f.data).encode("utf-8")).hexdigest()[:16],
+                 "shadow", "", os.path.realpath(f.data), "managed",
+                 "2026-10-12T09:00:00+00:00", "2026-10-12T09:00:00+00:00"))
+            con_root.commit()
+            shadowed = [r[0] for r in con_root.execute(
+                "SELECT slug FROM projects WHERE data_dir=? ORDER BY rowid",
+                (os.path.realpath(f.data),))]
+        finally:
+            con_root.close()
+        assert len(shadowed) >= 2 and shadowed[0].startswith("p"), shadowed
+        # the legacy store still says active — the trap this case pins
+        legacy_rows = StoreAdapter(f.data).store_select(
+            "SELECT status FROM runs WHERE id=?", ("rA",))
+        assert legacy_rows and legacy_rows[0]["status"] == "active", legacy_rows
+        want_path_h = os.path.join(c2_dir, "plans", f.plan, "runs", "rA", "bus.jsonl")
+        rc, res, blob = cli(["archive-run", "--data", f.data, "--run", "rA"], env=f.env())
+        assert rc == 0 and res.get("ok") is True and res["written"] is True, (rc, res, blob)
+        assert res["path"] == want_path_h, (res["path"], want_path_h)
+        assert os.path.isfile(want_path_h), want_path_h
+        assert res["messages"] == len(want_h["msg"]) and res["artifacts"] == len(want_h["artifact"]), res
+        assert res["acks"] == len(want_h["ack"]), res
+        assert rows_of_c2("rA") == {"msg": [], "ack": [], "artifact": []}, rows_of_c2("rA")
+        assert not os.path.exists(os.path.join(f.data, "runs", "rA", "bus.jsonl")), \
+            "the archive must not land in the legacy runs dir"
+        case("(h) archive-run reads the migrated store, not the shadowed legacy one")
         f.cleanup()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
