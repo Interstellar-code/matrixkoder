@@ -8678,7 +8678,7 @@ def self_test():
         mk_state = os.path.join(HERE, "mk-state.py")
 
         subprocess.run([sys.executable, mk_state, "--data", data_state, "run", "init", "--id", "r2", "--feature", "f", "--branch", "b", "--force"], check=True, capture_output=True)
-        subprocess.run([sys.executable, mk_state, "--data", data_state, "--run", "r2", "task", "add", "--id", "T2", "--title", "task two"], check=True, capture_output=True)
+        subprocess.run([sys.executable, mk_state, "--data", data_state, "--run", "r2", "task", "add", "--root", "--id", "T2", "--title", "task two"], check=True, capture_output=True)
         subprocess.run([sys.executable, mk_state, "--data", data_state, "--run", "r2", "task", "set", "T2", "status=blocked"], check=True, capture_output=True)
 
         rc, res_ens_st, _ = cli(["ensure", "--data", data_state, "--run", "r2"])
@@ -8738,7 +8738,7 @@ def self_test():
         data_ask = os.path.join(tmp, "data_ask")
         os.makedirs(data_ask, exist_ok=True)
         subprocess.run([sys.executable, mk_state, "--data", data_ask, "run", "init", "--id", "r4", "--feature", "f", "--branch", "b", "--force"], check=True, capture_output=True)
-        subprocess.run([sys.executable, mk_state, "--data", data_ask, "--run", "r4", "task", "add", "--id", "T4", "--title", "ask lane"], check=True, capture_output=True)
+        subprocess.run([sys.executable, mk_state, "--data", data_ask, "--run", "r4", "task", "add", "--root", "--id", "T4", "--title", "ask lane"], check=True, capture_output=True)
         subprocess.run([sys.executable, mk_state, "--data", data_ask, "--run", "r4", "task", "set", "T4", "status=building"], check=True, capture_output=True)
 
         rc, res_ens_ask, _ = cli(["ensure", "--data", data_ask, "--run", "r4"])
@@ -8820,7 +8820,7 @@ def self_test():
         data_askf = os.path.join(tmp, "data_askfail")
         os.makedirs(data_askf, exist_ok=True)
         subprocess.run([sys.executable, mk_state, "--data", data_askf, "run", "init", "--id", "r5", "--feature", "f", "--branch", "b", "--force"], check=True, capture_output=True)
-        subprocess.run([sys.executable, mk_state, "--data", data_askf, "--run", "r5", "task", "add", "--id", "T5", "--title", "ask fail lane"], check=True, capture_output=True)
+        subprocess.run([sys.executable, mk_state, "--data", data_askf, "--run", "r5", "task", "add", "--root", "--id", "T5", "--title", "ask fail lane"], check=True, capture_output=True)
         subprocess.run([sys.executable, mk_state, "--data", data_askf, "--run", "r5", "task", "set", "T5", "status=building"], check=True, capture_output=True)
 
         r5_store = StoreAdapter(data_askf)
@@ -8892,7 +8892,7 @@ def self_test():
         os.makedirs(data_2r, exist_ok=True)
         for rid, tid in (("r6", "T6"), ("r7", "T7")):
             subprocess.run([sys.executable, mk_state, "--data", data_2r, "run", "init", "--id", rid, "--feature", "f", "--branch", "b", "--force"], check=True, capture_output=True)
-            subprocess.run([sys.executable, mk_state, "--data", data_2r, "--run", rid, "task", "add", "--id", tid, "--title", f"ask lane {rid}"], check=True, capture_output=True)
+            subprocess.run([sys.executable, mk_state, "--data", data_2r, "--run", rid, "task", "add", "--root", "--id", tid, "--title", f"ask lane {rid}"], check=True, capture_output=True)
             subprocess.run([sys.executable, mk_state, "--data", data_2r, "--run", rid, "task", "set", tid, "status=building"], check=True, capture_output=True)
 
         rc, res_ens_2r, _ = cli(["ensure", "--data", data_2r, "--run", "r6"])

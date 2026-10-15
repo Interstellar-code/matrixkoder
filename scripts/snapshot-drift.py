@@ -65,14 +65,14 @@ def build_run(env) -> str:
     the second, an attention status on the third, an unrouted fourth, and a wait."""
     data = env["MATRIXKODER_DATA"]
     mk(env, "run", "init", "--id", RUN_ID, "--feature", "L5 fixtures", "--branch", "mk/l5")
-    mk(env, "task", "add", "--id", "P1", "--title", "Phase one", "--wave", "1",
+    mk(env, "task", "add", "--root", "--id", "P1", "--title", "Phase one", "--wave", "1",
         "--owned", "scripts/p1.py")
     mk(env, "task", "add", "--id", "T1", "--title", "First", "--parent", "P1", "--wave", "1",
         "--owned", "scripts/a.py")
     mk(env, "task", "add", "--id", "T2", "--title", "Second", "--parent", "P1", "--wave", "2",
         "--deps", "T1", "--owned", "scripts/b.py,scripts/c.py")
-    mk(env, "task", "add", "--id", "T3", "--title", "Third", "--wave", "1")
-    mk(env, "task", "add", "--id", "T4", "--title", "Fourth", "--wave", "2")
+    mk(env, "task", "add", "--root", "--id", "T3", "--title", "Third", "--wave", "1")
+    mk(env, "task", "add", "--root", "--id", "T4", "--title", "Fourth", "--wave", "2")
     for status in ("routed", "dispatched", "building"):
         mk(env, "task", "set", "T1", f"status={status}",
             "--note", "lane-watch", "--by", "lane-watch")
