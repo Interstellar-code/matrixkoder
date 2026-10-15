@@ -187,6 +187,7 @@ def load_run(data, run_id):
         "next": doc.get("next") if isinstance(doc.get("next"), str) else None,
         "started": doc.get("started"),
         "ended": doc.get("ended"),
+        "extra_json": _extras_json(_run_extras(doc)),
     }
     task_rows = []
     for t in tasks:
@@ -208,6 +209,7 @@ def load_run(data, run_id):
             "round": t.get("round") or 0,
             "verdict": t.get("verdict"),
             "updated": t.get("updated") or doc.get("updated"),
+            "extra_json": _extras_json(_task_extras(t)),
         })
     events, skipped, skip_reasons = [], 0, []
     ev_path = mkpaths.events_doc(data, run_id)
@@ -388,6 +390,33 @@ def _import_order(loaded):
         order.extend(ready)
         pending -= set(ready)
     return order
+
+
+# L4: the run/task fields the tables have no column for ride runs.extra_json / tasks.extra_json
+# (mk-state writes them too). The importer populates them from the legacy run.json so an imported
+# store reads the same extras a live one does, in the same single transaction (never a second write).
+RUN_FILE_KEYS = ("feature", "waiting", "recent", "plan_sha", "plan_status", "updated", "plan", "plan_id")
+TASK_FILE_KEYS = ("wave", "ready", "workspace", "last_commit", "gates", "rounds", "created",
+                  "plan_phase", "plan_task", "route", "lane_group", "reviewer", "refs", "deps")
+
+
+def _extras_json(obj):
+    """The extra_json column value: compact JSON, or None when empty (a stored NULL keeps the
+    same shape as a pre-L4 row and lets import_history's COALESCE-keep fire)."""
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True) if obj else None
+
+
+def _run_extras(doc):
+    """The run-level fields with no column, from a legacy run.json, plus the task order."""
+    out = {k: doc[k] for k in RUN_FILE_KEYS if k in doc}
+    out["task_order"] = [t.get("id") for t in doc.get("tasks") or []
+                         if isinstance(t, dict) and t.get("id")]
+    return out
+
+
+def _task_extras(t):
+    """The task-level fields with no column, from one legacy run.json task object."""
+    return {k: t[k] for k in TASK_FILE_KEYS if k in t}
 
 
 def import_one(home, project, data, run_id):
@@ -575,6 +604,10 @@ def self_test():
             _check(report == "report \u2014 no newline" and not report.endswith("\n"), "no-newline file")
             row = con.execute("SELECT parent, deps FROM tasks WHERE id='P.1'").fetchone()
             _check(row["parent"] == "P" and row["deps"] == "P.2", dict(row))
+            # R2 fix 4: the importer's TASK_FILE_KEYS carries deps, so the raw dep list also
+            # rides tasks.extra_json (mk-state reads it back there), matching mk-state.
+            xrow = con.execute("SELECT extra_json FROM tasks WHERE id='P.1'").fetchone()
+            _check(json.loads(xrow["extra_json"]).get("deps") == ["P.2"], xrow["extra_json"])
         finally:
             con.close()
 
