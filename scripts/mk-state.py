@@ -1096,6 +1096,20 @@ class Store:
                 con.commit()
             finally:
                 con.close()
+        if run.get("fidelity") and os.environ.get(ROOT_CRASH) != "1":
+            # F.3: mkdb.transition() rolls a parent up in the store on its own. A parent that
+            # rollup() held un-closed (own gate without fresh evidence) is put back here.
+            con = self.store_open()
+            try:
+                stored = {r["id"]: (r["status"] or "").lower() for r in
+                          con.execute("SELECT id, status FROM tasks WHERE run=?", (rid,))}
+            finally:
+                con.close()
+            for t, _ in reversed(tree(run.get("tasks") or [])):  # children first
+                if t.get("id") and stored.get(t["id"]) in CLOSED_STATUSES and t.get("status") not in CLOSED_STATUSES:
+                    self.root_write(self.db().transition, self.home_dir(), self.project_slug(), rid,
+                                    t["id"], t["status"], note="held: own gate has no fresh green evidence",
+                                    round=t.get("round") or 0, sync_root=True, data_dir=self.project_folder())
         if os.environ.get(ROOT_CRASH) != "1":
             # catch_up repairs a card whose status disagrees with the task row, including one
             # whose change_log sits below the watermark the transition above just advanced.
@@ -1301,6 +1315,10 @@ def rollup(st, run, by):
             new = min(kids, key=lambda s: order.get(s, 0))  # unknown status: least advanced
             if any(order.get(k, 0) > order["routed"] for k in kids) and order.get(new, 0) < order["building"]:
                 new = "building"
+        if (new in CLOSED_STATUSES and new != t.get("status") and run.get("fidelity")
+                and (t.get("gate") or t.get("manual")) and fidelity_missing(st, run, [t["id"]])):
+            # F.3: a parent with its own gate/manual line never rolls up to a closed status unchecked
+            new = t["status"] if t.get("status") not in CLOSED_STATUSES else "review"
         if new != t.get("status"):
             st.event(run, "transition", f"roll-up from children: {t.get('status')} → {new}", task=t["id"],
                      frm=t.get("status"), to=new, by=by)
@@ -1959,8 +1977,17 @@ def fidelity_gate(st, run, task_ids, final=False):
     checkout's current tree (older evidence is STALE and does not count); a `manual` line needs a
     recorded green sign-off (gate 'manual', any tree). `final=True` adds every final gate.
     Legacy (non-fidelity) runs are exempt. Raises Fail naming each missing gate; writes nothing."""
+    missing = fidelity_missing(st, run, task_ids, final)
+    if missing:
+        raise Fail("fidelity run " + run["id"] + " needs fresh green evidence (gate run / gate signoff): "
+                   + "; ".join(missing), missing=missing)
+
+
+def fidelity_missing(st, run, task_ids, final=False):
+    """The list behind fidelity_gate: one text per gate lacking fresh green evidence ([] when the
+    run is legacy or nothing is missing). rollup() calls it directly, since it must not raise."""
     if not run.get("fidelity"):
-        return
+        return []
     byid = {t["id"]: t for t in run.get("tasks") or [] if t.get("id")}
     need = []  # (task or None, gate name)
     for tid in task_ids:
@@ -1972,7 +1999,7 @@ def fidelity_gate(st, run, task_ids, final=False):
     if final:
         need += [(None, g.get("id") or f"final#{i}") for i, g in enumerate(run.get("final_gates") or [], 1)]
     if not need:
-        return
+        return []
     where, _ = integration_checkout(st)
     tree = current_tree_sha(where)
     con = _evidence_con(st)
@@ -1992,9 +2019,7 @@ def fidelity_gate(st, run, task_ids, final=False):
     finally:
         if con:
             con.close()
-    if missing:
-        raise Fail("fidelity run " + run["id"] + " needs fresh green evidence (gate run / gate signoff): "
-                   + "; ".join(missing), missing=missing)
+    return missing
 
 
 def cmd_gate_signoff(a, st):
@@ -2471,7 +2496,7 @@ def cmd_task(a, st):
                           for lid in leaf_ids]
                 leaves = [x for x in leaves if x is not None]
                 if s in CLOSED_STATUSES:  # F.3: no leaf closes without fresh green evidence
-                    fidelity_gate(st, run, [c["id"] for c in leaves if c["status"] != s])
+                    fidelity_gate(st, run, [t["id"]] + descendant_ids(t["id"], run["tasks"]))
                 for c in leaves:
                     if s in DEP_GATED and c["status"] not in DEP_GATED:
                         waiting = st.unmet_tree(run, c)
@@ -2710,6 +2735,18 @@ def latest_baseline(st, run):
                     out["tsc"] = int(m.group(1))
             return out
     return {}
+
+
+def descendant_ids(task_id, tasks):
+    """Every task id below task_id (children, grandchildren, ...), parents and leaves alike."""
+    out, stack = [], [task_id.lower()]
+    while stack:
+        cur = stack.pop()
+        for x in tasks:
+            if (x.get("parent") or "").lower() == cur and x.get("id"):
+                out.append(x["id"])
+                stack.append(x["id"].lower())
+    return out
 
 
 def leaf_descendants(task_id, tasks):
@@ -6491,11 +6528,35 @@ def fidelity_self_test(tmp, env):
     mkrun("f1b", tasks=[("N", None)], final=False)
     fi("task", "set", "N", "status=building", "--run", "f1b")
 
-    # 2. parent fan-out
+    # 2. parent fan-out: the parent's OWN gate counts too (R1 only checked the leaves)
     mkrun("f2", tasks=[("P", None), ("K1", "P"), ("K2", "P")], final=False)
-    refused(fi("task", "set", "P", "status=done", "--run", "f2", code=2), "K1:K1#1", "K2:K2#1")
+    refused(fi("task", "set", "P", "status=done", "--run", "f2", code=2), "K1:K1#1", "K2:K2#1", "P:P#1")
     fi("gate", "run", "K1", "--run", "f2"), fi("gate", "run", "K2", "--run", "f2")
+    refused(fi("task", "set", "P", "status=done", "--run", "f2", code=2), "P:P#1 no evidence")
+    fi("gate", "run", "P", "--run", "f2")
     assert fi("task", "set", "P", "status=done", "--run", "f2")["ok"] is True
+    # an intermediate gated task of a 3-level tree is checked too
+    mkrun("f2b", tasks=[("GP", None), ("M", "GP"), ("L", "M")], final=False)
+    fi("gate", "run", "L", "--run", "f2b"), fi("gate", "run", "GP", "--run", "f2b")
+    refused(fi("task", "set", "GP", "status=done", "--run", "f2b", code=2), "M:M#1 no evidence")
+    fi("gate", "run", "M", "--run", "f2b")
+    assert fi("task", "set", "GP", "status=done", "--run", "f2b")["ok"] is True
+
+    # 2c. automatic roll-up: a gated parent never rolls up to a closed status without its evidence
+    def status_of(rid, tid):
+        return fi("task", "get", tid, "--run", rid)["task"]["status"]
+
+    mkrun("f2r", tasks=[("RP", None), ("RK", "RP")], final=False)
+    fi("gate", "run", "RK", "--run", "f2r")
+    fi("task", "set", "RK", "status=done", "--run", "f2r")
+    assert status_of("f2r", "RK") == "done" and status_of("f2r", "RP") not in CLOSED_STATUSES, status_of("f2r", "RP")
+    fi("gate", "run", "RP", "--run", "f2r")
+    fi("task", "set", "RK", "status=done", "--run", "f2r", "--note", "resave")  # any save rolls up again
+    assert status_of("f2r", "RP") == "done", status_of("f2r", "RP")
+    # a legacy run still rolls up exactly as before
+    mkrun("f2l", fidelity=False, tasks=[("LP", None), ("LK", "LP")], final=False)
+    fi("task", "set", "LK", "status=done", "--run", "f2l")
+    assert status_of("f2l", "LP") == "done", status_of("f2l", "LP")
 
     # 3. run set --status done (open work first, then final gates, then stale tasks)
     mkrun("f3", tasks=[("X", None)])

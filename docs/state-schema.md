@@ -184,6 +184,34 @@ writer auto-migrates, so the first v6 write upgrades an existing store in place.
 - `critical` (bool, default false)
 - `base_risk` (int 1–5, default 1)
 - `gates` (any JSON, stored and returned; F.2 defines the format)
+- `gate` (list of `{cmd, expect, timeout, lines}`), `manual` (string, never run),
+  `acceptance_lines` (list of `{id, text}`): copied from the plan by `run init` / `plan sync --apply`
+  for a plan with the F.2 contract. `base_risk` is the plan's task `risk`. All of these are
+  read-only through `task set` (refused with a "read-only" error); the plan text is their only home.
+
+### Per-run fields in `runs.extra_json` (F.3)
+
+- `fidelity` (bool): set by `run init` / `plan sync --apply` when the plan carries the F.2
+  contract. A legacy run has none and is exempt from every evidence check below.
+- `final_gates` (list of `{id, cmd, expect, every, timeout, needs, covers}`): the plan's `[[final_gate]]`s.
+
+### Gate evidence and the fidelity gate (F.3)
+
+- `gate run <T> | --final | --due [--ref R]`: runs the gates in the integration checkout through
+  the one gate runner (timeout kills the whole process group; load above 40 records `deferred`) and
+  writes one `evidence` row per gate. `result` is one of `green|red|timeout|deferred|error`;
+  `tree_sha` is `git rev-parse HEAD^{tree}` of the checked tree. Gate names: `<T>#<n>` (or the
+  gate's `id`), final gates by `id`.
+- `gate signoff <T> --ref R`: records a green `manual` evidence row; a `manual` line is never run.
+- `risk add <T> --kind K --points N [--source S]` | `risk list [<T>]` | `risk clear <id>
+  --evidence <evidence id>`: writes/reads `risk_reasons`. A clear needs a green, non-manual
+  evidence row of that task on the current tree.
+- `fidelity_gate` guards every closing path in a fidelity run: `task set` to merged/qa/done,
+  parent fan-out (the parent and every descendant with its own gate/manual are checked, not just
+  the leaves), automatic roll-up (a parent with its own gate/manual never rolls up to a closed
+  status without fresh green evidence), `promote_closed`, `run set --status done` (tasks plus final
+  gates) and `run archive`. The latest evidence row per gate must be green AND on the current tree;
+  older evidence is stale and does not count. A `manual` line needs a sign-off (any tree).
 
 ### Derived risk rule
 
