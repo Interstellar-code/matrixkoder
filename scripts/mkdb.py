@@ -1508,7 +1508,7 @@ def events(home, project, run, data_dir=None, task=None, chan="state", since=Non
     list, no file and no directory is created. meta_json carries `by` and the source key; a
     direct mkdb.transition() leaves it NULL, which the reader maps to "orchestrator".
     """
-    path = os.path.join(project_dir(home, project, data_dir), "mk.db")
+    path = _store_path(home, project, data_dir)
     con = _open_read(path, SCHEMA)
     if con is None:
         return []
@@ -1923,6 +1923,18 @@ def _run_obj(con, row, doc):
     return obj
 
 
+def _store_path(home, project=None, data_dir=None):
+    """The store a READER opens for this project (L5). mkpaths.project_folder's rule: a migrated
+    project's store is the C2 `<home>/projects/<slug>/mk.db` its root row points at, a
+    pre-migration project's is `<data>/mk.db`. The other readers here keep project_dir's
+    --data-literal rule on purpose (mk-migrate's rollback addresses the legacy store through
+    exactly that form); a pane holding a data dir must follow the switch instead, or it would
+    read the pre-switch copy that is still sitting in the data dir. Never creates anything."""
+    folder = (_mkpaths().project_folder(data_dir, home_arg=home) if data_dir
+              else project_dir(home, project))
+    return os.path.join(folder, "mk.db")
+
+
 def run_snapshot(home, project=None, run=None, data_dir=None):
     """The runs list plus one run's document — what run.json and runs/index.json held (L5).
 
@@ -1932,7 +1944,7 @@ def run_snapshot(home, project=None, run=None, data_dir=None):
     (runs.status='active', newest `started` first — the pane's own active-run order), or null
     when no run is active.
     """
-    path = os.path.join(project_dir(home, project, data_dir), "mk.db")
+    path = _store_path(home, project, data_dir)
     con = _open_read(path, SCHEMA)
     if con is None:
         if run:
@@ -2226,6 +2238,7 @@ def self_test():
         _projects_read(home)
         _run_snapshot(home)
         _run_events(home)
+        _run_snapshot_migrated(home)
         _root_v2_migration(home, tmp)
         _plan_summary_transitions(home)
         _plan_summary_atomic(home)
@@ -4594,6 +4607,68 @@ def _run_events(home):
     events(home, "demo", "r", data_dir=data)
     after = {n: _file_hash(os.path.join(data, n)) for n in names}
     _check(after == before, f"events wrote the store: {before} -> {after}")
+
+
+def _run_snapshot_migrated(home):
+    """A reader holding a data dir follows the switch to the C2 store (L5).
+
+    mk-migrate's rollback deliberately addresses the pre-switch store by the data dir's literal
+    path, and that copy stays behind in the data dir. A pane holding the data dir must NOT read
+    it: the root row's db_path is the live store. mkpaths.project_folder is the rule; this proves
+    run_snapshot and events use it and that the stale copy is ignored.
+    """
+    data = os.path.join(home, "mig", "data")          # the legacy location, post-switch
+    slug = "demo"
+    c2 = os.path.join(home, "projects", slug)          # the C2 project folder
+    os.makedirs(data, exist_ok=True)
+    os.makedirs(c2, exist_ok=True)
+    live = open_project(home, data_dir=c2)             # write the live store through the C2 folder
+    stale = open_project(home, data_dir=data)          # and a DIFFERENT store in the legacy dir
+    try:
+        live.execute("INSERT INTO runs(id, branch, status, stage, started)"
+                     " VALUES ('live','main','active','3','2026-02-02T00:00:00+00:00')")
+        live.commit()
+        add_task(live, "live", "A1", "task", title="live task")
+        stale.execute("INSERT INTO runs(id, branch, status, stage, started)"
+                      " VALUES ('stale','main','active','9','2026-02-03T00:00:00+00:00')")
+        stale.commit()
+        add_task(stale, "stale", "B1", "task", title="stale task")
+        # the root row: this project's live store is db_path (L2's switch marker)
+        root = open_root(home)
+        try:
+            root.execute("INSERT INTO projects(slug, name, repo, data_dir, mode, db_path)"
+                         " VALUES (?,'demo','',?,'home',?)", (slug, data, os.path.join(c2, "mk.db")))
+            root.commit()
+        finally:
+            root.close()
+    finally:
+        live.close()
+        stale.close()
+
+    got = run_snapshot(home, data_dir=data)
+    _check([r["id"] for r in got["runs"]] == ["live"],
+           f"the reader followed the stale pre-switch store: {[r['id'] for r in got['runs']]}")
+    _check(got["active"] == "live" and got["run"]["stage"] == 3, f"live run {got['active']}")
+    _check([t["id"] for t in got["run"]["tasks"]] == ["A1"], f"live tasks {got['run']['tasks']}")
+    _check(events(home, "demo", "live", data_dir=data) == [],
+           "events read a store with no rows for the live run")
+    # --data wins over --project (the existing mkdb rule), and the slug form reaches the same store
+    _check(run_snapshot(home, project=slug, data_dir=data) == got,
+           "--project and --data disagree about the store")
+    _check(_store_path(home, data_dir=data) == os.path.join(c2, "mk.db"),
+           f"the store path is {_store_path(home, data_dir=data)}")
+    # a pre-migration project (no root row) keeps today's literal <data>/mk.db
+    plain = os.path.join(home, "plain")
+    plain_db = open_project(home, data_dir=plain)
+    try:
+        plain_db.execute("INSERT INTO runs(id, branch, status, stage, started)"
+                         " VALUES ('p','main','active','1','2026-02-04T00:00:00+00:00')")
+        plain_db.commit()
+    finally:
+        plain_db.close()
+    _check(_store_path(home, data_dir=plain) == os.path.join(plain, "mk.db"),
+           "a pre-migration project lost its own store path")
+    _check(run_snapshot(home, data_dir=plain)["active"] == "p", "the pre-migration read failed")
 
 
 def _ready(home):
