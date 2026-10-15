@@ -1613,11 +1613,28 @@ def cmd_run(a, st):
     out = {"ok": True, "run": run, **({"warning": warn} if warn else {})}
     if a.action == "set" and a.status == "done":
         out.update(checks)
+        out.update(final_report(st, run))  # F.6: the closed run prints its final report
         out["promoted"] = promoted
         if perr:
             out["promote_error"] = perr
     return out
 
+
+
+def final_report(st, run):
+    """F.6: `mk-report.py final` for a run that just closed -> {"report": text} (or report_error).
+    The checkout and tree are the ones the close gates used, so the report agrees with them.
+    Best-effort: the close already happened, so a report failure is a field, never an error."""
+    where, _ = integration_checkout(st)
+    try:
+        r = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "mk-report.py"),
+                            "final", "--run", run["id"], "--data", st.data, "--where", where],
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return {"report_error": f"{type(e).__name__}: {e}"}
+    if r.returncode in (0, 1) and r.stdout.strip():
+        return {"report": r.stdout.rstrip("\n")}
+    return {"report_error": (r.stdout or r.stderr).strip()[-300:] or f"exit {r.returncode}"}
 
 
 def archive_backup(st, run):
@@ -5196,6 +5213,9 @@ def self_test():
         # already-done keeps promoting: it repairs a crash between the two writes
         rest = pm("run", "set", "--id", "half", "--status", "done")
         assert rest["ok"] and rest["promoted"] == ["H2"], rest
+        # F.6: the closed run prints its final report (a legacy run renders: NONE / MANUAL rows)
+        assert rest["report"].startswith("FINAL REPORT run half"), rest.get("report") or rest
+        assert "## Corrective actions" in rest["report"] and "Evidence (SELECT" in rest["report"], rest["report"]
         assert "promote_error" not in rest
 
         # F0-BLOCK-BEGIN — F.0: `run set --status done` is refused while work is open or a gate fails
