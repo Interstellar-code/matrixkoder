@@ -232,6 +232,21 @@ def project_data_dir(slug, root=None):
     return os.path.realpath(os.path.expanduser(row["data_dir"].strip()))
 
 
+def _row_rank(slug, db_path, root_dir):
+    """How canonical a root row is for its data dir: 2, 1 or 0 (Z22: the one rule, shared).
+
+    2 = db_path folder is `<root>/projects/<this row's slug>` (the C2 rule's own shape);
+    1 = db_path set (C3's migrated marker); 0 = neither. Callers keep the FIRST row of the
+    highest rank, so row order never picks the answer. `root_dir` is the realpath'd root home.
+    """
+    if not (isinstance(db_path, str) and db_path.strip()):
+        return 0
+    folder = os.path.dirname(os.path.expanduser(db_path.strip()))
+    if os.path.realpath(os.path.abspath(folder)) == os.path.join(root_dir, TARGET_PROJECTS_DIR, slug):
+        return 2
+    return 1
+
+
 def project_slug_of(data_dir, root=None):
     """The root projects.slug whose data_dir OR migrated db_path folder is this path, or None.
 
@@ -255,7 +270,7 @@ def project_slug_of(data_dir, root=None):
     if con is None:
         return None
     try:
-        canonical = with_db = first = None
+        best, best_rank = None, -1
         for row in con.execute("SELECT slug, data_dir, db_path FROM projects"):
             slug, recorded, db_path = row["slug"], row["data_dir"], row["db_path"]
             if not isinstance(slug, str) or not SLUG_RE.match(slug):
@@ -266,21 +281,14 @@ def project_slug_of(data_dir, root=None):
                          and os.path.realpath(os.path.dirname(os.path.expanduser(db_path.strip()))) == real))
             if not match:
                 continue
-            if first is None:
-                first = slug
-            if db_path and isinstance(db_path, str) and db_path.strip():
-                if with_db is None:
-                    with_db = slug
-                folder = os.path.dirname(os.path.expanduser(db_path.strip()))
-                if os.path.realpath(os.path.abspath(os.path.expanduser(folder))) == \
-                        os.path.join(root_dir, TARGET_PROJECTS_DIR, slug):
-                    canonical = slug
-                    break  # the canonical row wins outright; the sweep is over
+            rank = _row_rank(slug, db_path, root_dir)
+            if rank > best_rank:  # strict: the first row of the best rank wins
+                best, best_rank = slug, rank
     except sqlite3.Error:
         return None
     finally:
         con.close()
-    return canonical or with_db or first
+    return best
 
 
 # ---- migration: today's layout vs the C2 target (L3) ----------------------------------------
@@ -313,7 +321,8 @@ def _migrated_maps(root=None):
     sig = _root_signature(root)
     if _MIGRATED_MEMO is not None and _MIGRATED_MEMO[0] == sig:
         return _MIGRATED_MEMO[1], _MIGRATED_MEMO[2]
-    by_slug, by_data = {}, {}
+    by_slug, by_data, rank = {}, {}, {}
+    root_dir = os.path.realpath(os.path.abspath(os.path.expanduser(root or root_home())))
     con = _open_root_ro(sig[0])
     if con is not None:
         try:
@@ -324,7 +333,10 @@ def _migrated_maps(root=None):
                 if isinstance(db_path, str) and db_path.strip():
                     by_slug[slug] = db_path.strip()
                 if isinstance(data_dir, str) and data_dir.strip():
-                    by_data[os.path.realpath(os.path.expanduser(data_dir.strip()))] = slug
+                    key = os.path.realpath(os.path.expanduser(data_dir.strip()))
+                    r = _row_rank(slug, db_path, root_dir)
+                    if r > rank.get(key, -1):  # Z22: canonical row wins, whatever the row order
+                        by_data[key], rank[key] = slug, r
         except sqlite3.Error:
             by_slug, by_data = {}, {}
         finally:
@@ -1200,6 +1212,52 @@ def self_test():
             con.close()
         _check(project_slug_of(data) == "pdceb35c892fc86bb", project_slug_of(data))
 
+    def t_canonical_folder(tmp_home, repo):
+        """Z22: two root rows share a data dir (alias, no db_path; canonical, db_path under
+        projects/matrixkoder). project_folder/project_yaml must follow the canonical row in
+        EITHER row order; with no db_path anywhere the data dir itself is the folder."""
+        global _MIGRATED_MEMO
+        os.environ["HOME"] = tmp_home
+        _clear_home_env()
+        os.environ["MK_HOME"] = os.environ["MATRIXKODER_HOME"] = tmp_home
+        os.chdir(repo)
+        data = os.path.realpath(os.path.join(repo, ".matrixkoder"))
+        canon = os.path.join(tmp_home, "projects", "matrixkoder")
+        spec = importlib.util.spec_from_file_location(
+            "mkdb", os.path.join(os.path.dirname(os.path.abspath(__file__)), "mkdb.py"))
+        mkdb = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mkdb)
+
+        def add(slug, db_path):
+            con = mkdb.open_root(tmp_home)
+            try:
+                con.execute("INSERT INTO projects(slug, name, repo, data_dir, mode, db_path)"
+                            " VALUES (?,?,?,?,?,?)",
+                            (slug, slug, repo, ".matrixkoder", "home", db_path))
+                con.commit()
+            finally:
+                con.close()
+            _MIGRATED_MEMO = None  # same-process reseed may keep the root stamp; drop the memo
+
+        def answers():
+            return (project_folder(data), project_yaml(data), project_yaml_lock(data))
+
+        want = (canon, os.path.join(canon, "project.yaml"),
+                os.path.join(canon, "project.yaml") + ".lock")
+        # (a) canonical row FIRST, alias row last — the old last-row-wins by_data picked the alias
+        _seed_root(tmp_home, "matrixkoder", repo, ".matrixkoder", os.path.join(canon, "mk.db"))
+        add("pdceb35c892fc86bb", None)
+        _check(answers() == want, "canonical first: %r" % (answers(),))
+        # (b) alias row FIRST, canonical last — identical answers
+        _seed_root(tmp_home, "pdceb35c892fc86bb", repo, ".matrixkoder")
+        add("matrixkoder", os.path.join(canon, "mk.db"))
+        _check(answers() == want, "alias first: %r" % (answers(),))
+        # (c) unmigrated: two rows, no db_path — the data dir stays the folder
+        _seed_root(tmp_home, "pdceb35c892fc86bb", repo, ".matrixkoder")
+        add("matrixkoder", None)
+        _check(project_folder(data) == data, project_folder(data))
+        _check(project_yaml(data) == os.path.join(data, "matrixkoder.yaml"), project_yaml(data))
+
     def t_bus(tmp_home, repo):
         os.environ["HOME"] = tmp_home
         _clear_home_env()
@@ -1438,6 +1496,8 @@ def self_test():
         t_data_dir(tmp_home, repo, worktree)
         t_folders(tmp_home, repo)
         t_project_db(tmp_home, repo)
+        t_canonical(tmp_home, repo)
+        t_canonical_folder(tmp_home, repo)
         t_bus(tmp_home, repo)
         t_take_over_race()
         t_target(tmp_home)
