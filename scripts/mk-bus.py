@@ -219,6 +219,15 @@ class StoreAdapter:
         fn = getattr(self._mod(), "transition", None)
         if fn is None:
             raise Fail("store writer transition is not available")
+        # Test-only, the twin of the append-fail flag above: a one-shot marker in the data
+        # dir makes the NEXT transition raise after the caller has already appended the
+        # message, so the "the POST succeeded, the side-write did not, its error rides in
+        # the reply" path is reachable without a real mk-state failure (L4 moved this write
+        # off mk-state and into mkdb, so $MK_STATE_CMD can no longer fail it).
+        flag_path = os.path.join(self.data_dir, "transition-fail")
+        if os.path.isfile(flag_path):
+            os.remove(flag_path)
+            raise RuntimeError("injected transition failure")
         return fn(
             self.data_dir, None, run, task, to, note=note, round=round_n,
             sync_root=False, data_dir=self.data_dir,
@@ -327,6 +336,33 @@ def bus_location(data_dir):
     $MK_BUS_DIR overrides (tests pin a temp home without touching ~/.matrixkoder).
     The rule itself lives in mkpaths (L0)."""
     return _paths("bus_dir", data_dir)
+
+
+def live_bus_dir(data_dir):
+    """The directory whose bus.json describes the bus actually serving this data dir.
+
+    mkpaths resolves the L6.1 bus/ folder under the MK home the moment a project
+    store exists. A data dir that gains its store while a file-mode bus is still
+    running — mk-state, driven by an `answer`, creates that store — would move every
+    bus file to a bus/ folder that holds none of this bus's tokens, so a client
+    answered "bus down" (or reached the ROOT bus, which carries its own token set and
+    refuses this project's) and a freshly minted lane token was written where no bus
+    reads it (HTTP 401 on the lane's next request).
+
+    A bus.json in the data dir is a file-mode bus started for exactly this data dir,
+    so while its pid is alive that bus is the one serving it and wins — including when
+    a root bus is running, whose bus/ folder also holds a bus.json. A dead pid is a
+    leftover from before a switch and the resolution stands.
+    """
+    new_dir = bus_location(data_dir)
+    if new_dir == data_dir:
+        return new_dir
+    file_json = os.path.join(data_dir, "bus.json")
+    if not os.path.isfile(file_json):
+        return new_dir
+    if is_pid_alive((read_json(file_json, {}) or {}).get("pid")):
+        return data_dir
+    return new_dir
 
 
 def project_slug_for(data_dir):
@@ -590,6 +626,11 @@ class BusState:
         self.any_cond = threading.Condition(self.lock)
         self.tokens = {}
         self.tokens_mtime = 0
+        # Bus-file paths, pinned on first use (see _bus_file). mkpaths re-decides
+        # bus_dir per call and a project store appearing mid-process would move a
+        # live server's files under it, so this cache is the file-side twin of
+        # use_store below.
+        self._bus_files = {}
         # Decided once at process start. A store that appears mid-process is ignored
         # so a file-mode server never starts writing the store halfway through.
         self.use_store = store_mode(self.project_dir)
@@ -624,13 +665,99 @@ class BusState:
             self.ring_interval = max(0.05, float(os.environ.get("MK_BUS_RING_INTERVAL_SEC", "5")))
         except (TypeError, ValueError):
             self.ring_interval = 5.0
+        # A project that gained its store while a bus was running keeps its tokens in
+        # the data dir; this bus now resolves them elsewhere. One copy, before the first
+        # read, so a restart after the flip does not 401 the tokens the old bus minted.
+        self._adopt_file_mode_tokens()
 
     def _bus_file(self, name):
         """One bus-file path from mkpaths (bus_json / bus_tokens / bus_tokens_lock /
-        ring_queue ...), resolved against this bus's project dir. A BusState assembled
-        with __new__ — a self-test stub — carries only `data_dir`, the bus dir itself,
-        so that is the fallback base; every real instance sets project_dir."""
-        return _paths(name, getattr(self, "project_dir", None) or self.data_dir)
+        ring_queue ...), resolved against this bus's project dir and then PINNED for
+        this server's lifetime.
+
+        mkpaths resolves bus_dir per call, and its rule flips the moment a project
+        store exists: file mode keeps the data dir, store mode moves the files to the
+        MK home's bus/ folder. A live server must not have its token file, ring queue
+        or lock move under it, because the files it reads and writes were placed at the
+        serve-time location by the very process it serves: mk-state, driven by an
+        `answer`, creates <data>/mk.db while the bus runs, which moved a file-mode
+        bus's tokens to a bus/ folder that holds none of its tokens, so every lane
+        token answered 401 on a bus that was alive and delivering (Z4). First use is
+        serve time (retire_orch_tokens + add_token in cmd_serve), so the pinned path is
+        the one the bus registered its own tokens in.
+
+        A BusState assembled with __new__ — a self-test stub — carries neither
+        project_dir nor _bus_files, so both are read defensively and such a state
+        resolves per call as before."""
+        base = getattr(self, "project_dir", None) or self.data_dir
+        pinned = getattr(self, "_bus_files", None)
+        if pinned is None:
+            return _paths(name, base)
+        path = pinned.get(name)
+        if path is None:
+            path = _paths(name, base)
+            pinned[name] = path
+        return path
+
+    def _adopt_file_mode_tokens(self):
+        """C6 read-once for a project that gained its store while a bus was running.
+
+        A bus started in file mode keeps its tokens in the data dir. When the project
+        then gains a store (mk-state, driven by an `answer`), this bus resolves its
+        token file to the MK home's bus/ folder — where the pre-L6.1 file sits at the
+        home root, so the file-mode data-dir file is not one mkpaths' take-over sees
+        and every lane token minted before the switch answers 401. Copy that file over
+        once (atomic, 0600), never delete it: the rule L6.1 states for a moved path,
+        applied to the move a file-mode bus makes.
+        """
+        new_path = self._bus_file("bus_tokens")
+        old_path = os.path.join(self.project_dir, "bus-tokens.json")
+        if old_path == new_path or os.path.exists(new_path) or not os.path.isfile(old_path):
+            return
+        try:
+            with open(old_path, "rb") as f:
+                blob = f.read()
+        except OSError:
+            return
+        if not blob:
+            return
+        try:
+            tokens = json.loads(blob.decode("utf-8"))
+        except Exception:
+            return
+        if not isinstance(tokens, dict):
+            return
+        # A store-mode bus resolves every token's project (resolve_ctx refuses a token
+        # with none) and a file-mode token had no project because there was no store.
+        # This bus serves exactly this project, so the adopted rows name it.
+        try:
+            slug = project_slug_for(self.project_dir)
+        except Exception:
+            slug = None
+        if slug:
+            for entry in tokens.values():
+                if isinstance(entry, dict) and not entry.get("project"):
+                    entry["project"] = slug
+        payload = json.dumps(tokens).encode("utf-8")
+        dst_dir = os.path.dirname(new_path)
+        fd = tmp = None
+        try:
+            os.makedirs(dst_dir, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=dst_dir, prefix=".tokens-adopt-")
+            with os.fdopen(fd, "wb") as f:
+                fd = None  # closed by fdopen on every path out
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, new_path)
+            tmp = None  # installed
+        except OSError:
+            if fd is not None:
+                os.close(fd)
+            if tmp is not None:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
 
     def mark_ask_once(self, run, ask_id):
         """True exactly once per (run, ask id): the caller may run its one blocked-marking write."""
@@ -2287,6 +2414,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                             # Todo 68d: the store is the state here; only a building task blocks.
                             ask_reply["state_updated"], ask_reply["mk_state_error"] = _store_move(
                                 store, run, task, "blocked", note, allowed_from=("building",))
+                        elif not store_mode(bus.project_dir):
+                            # File mode has no state to move (L4 removed the file views), and
+                            # mk-state's store-always-on behaviour would CREATE the project
+                            # store the bus resolves its own files through — moving a live
+                            # bus's token file so every lane token answers 401 (Z4). A
+                            # project that gains a store moves through the branch above.
+                            pass
                         else:
                             ask_reply["state_updated"], ask_reply["mk_state_error"] = _mk_state_task_set(
                                 self.server.bus_state.data_dir, run, task, "blocked", note, by="bus")
@@ -2793,7 +2927,11 @@ def cmd_token(args):
     if not isinstance(round_val, int) or isinstance(round_val, bool) or round_val < 0:
         raise Fail("invalid round")
 
-    bus_json_path = _paths("bus_json", data_dir)
+    # The url this lane is told must be the LIVE bus's: the same resolution
+    # _get_client_conn and _orch_token use, so a store appearing mid-flight cannot
+    # hand a lane the root bus's port (or port 0) while the token lands in the
+    # file-mode bus still serving this data dir (Z4, review HIGH).
+    bus_json_path = os.path.join(live_bus_dir(data_dir), "bus.json")
     port = None
     if os.path.exists(bus_json_path):
         d = read_json(bus_json_path)
@@ -2829,9 +2967,11 @@ def cmd_token(args):
 
     write_json(lane_file, payload, mode=0o600)
 
-    bus_dir = bus_location(data_dir)
-    lock_path = _paths("bus_tokens_lock", data_dir)
-    tokens_path = _paths("bus_tokens", data_dir)
+    # The token must land in the file the bus actually reads: the live bus's dir,
+    # not the resolution a store appearing mid-flight would name (Z4).
+    bus_dir = live_bus_dir(data_dir)
+    lock_path = os.path.join(bus_dir, "bus-tokens.lock")
+    tokens_path = os.path.join(bus_dir, "bus-tokens.json")
     entry = {
         "project": project_slug_for(data_dir) if store_mode(data_dir) else None,
         "token": tok,
@@ -2878,9 +3018,9 @@ def cmd_revoke(args):
         except OSError:
             pass
 
-    bus_dir = bus_location(data_dir)
-    lock_path = _paths("bus_tokens_lock", data_dir)
-    tokens_path = _paths("bus_tokens", data_dir)
+    bus_dir = live_bus_dir(data_dir)
+    lock_path = os.path.join(bus_dir, "bus-tokens.lock")
+    tokens_path = os.path.join(bus_dir, "bus-tokens.json")
     lfd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     os.fchmod(lfd, 0o600)
     fcntl.flock(lfd, fcntl.LOCK_EX)
@@ -2904,7 +3044,7 @@ def cmd_revoke(args):
 
 
 def _get_client_conn(data_dir):
-    bus_json_path = _paths("bus_json", data_dir)
+    bus_json_path = os.path.join(live_bus_dir(data_dir), "bus.json")
     if not os.path.exists(bus_json_path):
         raise Fail("bus down")
     bdata = read_json(bus_json_path)
@@ -3133,15 +3273,55 @@ def _archive_digest(rows_by_group):
     return h.hexdigest()
 
 
-def _own_project_store(data_dir):
-    """(store, folder) of the project this data dir names, resolved the way the bus
-    resolves its own store (L6.1, todo 108): a switched project's rows live in the
-    C2 project folder, and mkpaths.project_db(slug) is the one rule that follows
-    the switch. Pre-migration the answer is exactly <data>/mk.db."""
+def _switched_slug_of(data_dir):
+    """The root slug whose projects row has SWITCHED this data dir (db_path set), or None.
+
+    One data dir can be named by several root rows: the bus's own project_slug_for
+    REGISTERS a derived `p<hash>` row for a dir it has no row for, and that row stays
+    after the project is switched under its real slug (L9's audit tree holds exactly
+    that pair, both naming <repo>/.matrixkoder). mkpaths resolves a data dir two ways
+    and BOTH can land on the unswitched row: project_slug_of returns the FIRST root
+    match (the derived row is inserted first), and migrated_slug's map is last-write-wins
+    (the derived row is inserted last), so it then finds no db_path and answers None.
+
+    The row that carries db_path — C3's migrated marker — is the one whose store every
+    reader of this project must use; a db_path-less row never wins over it. Read-only:
+    this is the read half of project_slug_for and registers nothing.
+    """
     try:
-        slug = project_slug_for(data_dir)
-    except Fail:
-        slug = None
+        mod = _load_mkdb()
+        home = _paths("root_home")
+        con = mod.open_root(home)
+    except Exception:
+        return None
+    real = os.path.realpath(data_dir)
+    try:
+        for row in con.execute("SELECT slug, data_dir, db_path FROM projects"):
+            slug, recorded, db_path = row[0], row[1], row[2]
+            if not isinstance(slug, str) or not slug or not isinstance(db_path, str) or not db_path.strip():
+                continue
+            if recorded and os.path.realpath(os.path.expanduser(str(recorded))) == real:
+                return slug
+    except Exception:
+        return None
+    finally:
+        con.close()
+    return None
+
+
+def _own_project_store(data_dir):
+    """(store, folder, slug) of the project this data dir names: a switched project's
+    rows live in the C2 project folder (L6.1, todo 108), and mkpaths.project_db(slug)
+    is the one rule that follows the switch. Pre-migration the answer is exactly
+    <data>/mk.db, with a None slug.
+
+    The slug comes from _switched_slug_of — the row that has actually switched this
+    dir. The plain resolutions can hand back the unswitched row when a derived row
+    names the same dir, which made archive-run read the LEGACY store of a migrated
+    project: a closed run answered `not closed (status active)` and a live run's rows
+    would have been deleted from the wrong store. See _switched_slug_of for why.
+    """
+    slug = _switched_slug_of(data_dir)
     if slug:
         try:
             db = _paths("project_db", slug=slug)
@@ -3150,8 +3330,8 @@ def _own_project_store(data_dir):
         if db and os.path.isfile(db):
             folder = os.path.dirname(db)
             if os.path.realpath(folder) != os.path.realpath(data_dir):
-                return StoreAdapter(folder), folder
-    return StoreAdapter(data_dir), data_dir
+                return StoreAdapter(folder), folder, slug
+    return StoreAdapter(data_dir), data_dir, None
 
 
 def _archive_rows(store, run):
@@ -3376,12 +3556,19 @@ def archive_run(data_dir, run):
         raise Fail("invalid run id")
     if not store_mode(data_dir):
         raise Fail("archive-run needs the project store: file mode holds no bus rows")
-    store, folder = _own_project_store(data_dir)
+    store, folder, slug = _own_project_store(data_dir)
     plan, _status = _archive_refuse_unless_closed(store, run)
     msgs, acks, arts = _archive_rows(store, run)
     groups = _archive_groups(msgs, acks, arts)
     counts, seq_range, digest = _archive_state(groups)
-    path = os.path.join(_paths("run_dir", data_dir, run), "bus.jsonl")
+    # The archive belongs beside the run it holds. A switched run lives in the C2 plan
+    # folder, and `run_dir`'s data-dir form answers today's path as soon as a derived
+    # root row shadows the switched one, so the migrated case names the slug and takes
+    # mkpaths' target rule (the same folder mk-state writes the round files to).
+    if slug:
+        path = os.path.join(_paths("target_run_dir", slug, plan, run), "bus.jsonl")
+    else:
+        path = os.path.join(_paths("run_dir", data_dir, run), "bus.jsonl")
     if not any(counts.values()):
         # Idempotent: the rows are already gone. An archive file that already
         # exists with matching content is left alone; no empty second file.
@@ -3492,8 +3679,12 @@ def cmd_answer(args):
         # Store mode: the bus already moved the task through the store.
         state_updated, mk_state_error = send_res["state_updated"], send_res.get("mk_state_error")
     elif task:
-        state_updated, mk_state_error = _mk_state_task_set(data_dir, target_run, task,
-                                                           "building", "bus answer")
+        # File mode has no state to move (L4 removed the file views). Calling mk-state here
+        # would CREATE the project store this bus resolves its files through, which moves a
+        # live bus's token file and answers every lane token 401 (Z4).
+        if store_mode(data_dir):
+            state_updated, mk_state_error = _mk_state_task_set(data_dir, target_run, task,
+                                                               "building", "bus answer")
 
     res = {
         "ok": True,
@@ -3582,11 +3773,15 @@ def _orch_token(data_dir):
     repo on the machine and bus.json's token belongs to the project that started it; an
     orchestrator of another project uses (or mints) its own project-scoped orch token in
     bus-tokens.json, so its messages land in its own store and run, never the host's."""
-    bus_json = read_json(_paths("bus_json", data_dir)) or {}
+    # The live bus's dir, not the resolution a store appearing mid-flight names: the
+    # token must be one the bus that is actually running accepts (Z4).
+    base = live_bus_dir(data_dir)
+    bus_json = read_json(os.path.join(base, "bus.json")) or {}
     slug = project_slug_for(data_dir)
     if bus_json.get("token") and (slug is None or bus_json.get("project") in (None, slug)):
         return bus_json["token"]
-    tp, tl = _paths("bus_tokens", data_dir), _paths("bus_tokens_lock", data_dir)
+    tp = os.path.join(base, "bus-tokens.json")
+    tl = os.path.join(base, "bus-tokens.lock")
     lfd = os.open(tl, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(lfd, fcntl.LOCK_EX)
@@ -3637,9 +3832,15 @@ def cmd_watch(args):
     # never a lost message). Store mode seqs never reset, so no stamp is kept or checked there.
     file_mode = not store_mode(data_dir)
 
+    def bus_json_path():
+        # The live bus's bus.json, not the resolution a store appearing mid-flight
+        # names: the token comes from _orch_token (live_bus_dir), so the port and the
+        # started stamp must come from the same bus or watch 401s / reports BUS DOWN.
+        return os.path.join(live_bus_dir(data_dir), "bus.json")
+
     def bus_started():
         try:
-            return (read_json(_paths("bus_json", data_dir)) or {}).get("started")
+            return (read_json(bus_json_path()) or {}).get("started")
         except Exception:
             return None
     cur_started = bus_started() if file_mode else None
@@ -3661,7 +3862,7 @@ def cmd_watch(args):
     while True:
         port = None
         try:
-            bdata = read_json(_paths("bus_json", data_dir))
+            bdata = read_json(bus_json_path())
             if bdata and bdata.get("port"):
                 port = int(bdata["port"])
                 if file_mode:
@@ -7250,6 +7451,99 @@ def _archive_run_self_test():
         f.stop_bus(pid)
         case("(g) failed delete clears the file; the retry archives the run whole")
         f.cleanup()
+
+        # ---- (h) archive-run on a MIGRATED project named by its LEGACY data dir ---------------
+        # Z4 add-on: the switch copies the store to the C2 tree and sets projects.db_path,
+        # and a post-switch write closes the run there — so the legacy <data>/mk.db still
+        # says `active` while the C2 store says `archived`. archive-run must read the C2
+        # store and write the archive into the C2 PLAN FOLDER, not the legacy runs dir, and
+        # must never refuse with the legacy store's status.
+        f = _archive_fixture(tmp, "projh")
+        f.add_run("rA", status="active", tasks=("T1",))
+        pid, port = f.start_bus("rA")
+        orch = f.mint_orch()
+        tok = f.lane_token("rA", "T1")
+        askmsg = ask(f, port, tok, "rA", "T1", "which fixture?")
+        code, ans = f.post(port, orch, {"run": "rA", "task": "T1", "kind": "answer",
+                                        "text": "the schema one", "from": "orch", "to": "T1",
+                                        "reply_to": askmsg["id"]})
+        assert code == 200 and ans["ok"] is True, (code, ans)
+        code, acked = f.post(port, tok, {"run": "rA", "task": "T1", "kind": "ack", "text": "",
+                                         "from": "T1", "to": "orch",
+                                         "reply_to": ans["message"]["id"], "ack_level": 3})
+        assert code == 200 and acked.get("ack_recorded") is True, (code, acked)
+        code, rep = f.post(port, tok, {"run": "rA", "task": "T1", "kind": "report",
+                                       "text": "round:1\nthe report body", "from": "T1",
+                                       "to": "orch"})
+        assert code == 200 and rep.get("artifact", {}).get("rev") == 1, (code, rep)
+        # the task is terminal before the switch (a copied task row); the RUN status stays
+        # active in the legacy store and is closed only in the C2 one after the switch
+        set_statuses(f, "rA", run_status="active", tasks=(("T1", "done"),))
+        # the inbox is drained, so the switch can quiesce
+        f.stop_bus(pid)
+        f.migrate()  # the real mk-migrate --switch: db_path set, the store copied to C2
+        # a write that lands ONLY in the new store: the run is closed there, while the legacy
+        # copy the switch left behind still says active
+        set_statuses(f, "rA", run_status="archived")
+        # the C2 store the archive must read, addressed by shape: the fixture's own reader
+        # (`folder()`/`store_path()`) follows mkpaths' data-dir form, which the shadow row
+        # below breaks — that is the bug this case pins, so it is never used as the oracle.
+        c2_dir = os.path.join(f.paths()["home"], "projects", f.slug)
+        c2_store = StoreAdapter(c2_dir)
+
+        def rows_of_c2(run_id):
+            msgs = c2_store.store_select(
+                "SELECT id, run, task, t, chan, kind, from_id, to_id, reply_to, text,"
+                " artifact_id, meta_json FROM events WHERE chan=? AND run=? ORDER BY id",
+                ("bus", run_id))
+            acks = c2_store.store_select(
+                "SELECT run, msg, lane, level, t FROM acks WHERE run=? ORDER BY msg, lane",
+                (run_id,))
+            arts = c2_store.store_select(
+                "SELECT id, run, task, round, kind, rev, text, created, src FROM artifacts"
+                " WHERE run=? AND id IN (SELECT artifact_id FROM events"
+                " WHERE chan=? AND run=? AND artifact_id IS NOT NULL) ORDER BY id",
+                (run_id, "bus", run_id))
+            return {"msg": msgs, "ack": acks, "artifact": arts}
+
+        want_h = rows_of_c2("rA")
+        assert want_h["msg"] and want_h["ack"] and want_h["artifact"], \
+            {k: len(v) for k, v in want_h.items()}
+        # the L9 shadow row: the bus's project_slug_for registered a derived slug for this
+        # data dir when it found no row (db_path NULL), and it still names <data>. A reader
+        # that takes the first root match archives the LEGACY store.
+        con_root = f.mod.open_root(f.paths()["home"])
+        try:
+            con_root.execute(
+                "INSERT OR IGNORE INTO projects(slug, name, repo, data_dir, mode, created,"
+                " last_activity) VALUES (?,?,?,?,?,?,?)",
+                ("p" + __import__("hashlib").sha256(
+                    os.path.realpath(f.data).encode("utf-8")).hexdigest()[:16],
+                 "shadow", "", os.path.realpath(f.data), "managed",
+                 "2026-10-12T09:00:00+00:00", "2026-10-12T09:00:00+00:00"))
+            con_root.commit()
+            shadowed = [r[0] for r in con_root.execute(
+                "SELECT slug FROM projects WHERE data_dir=? ORDER BY rowid",
+                (os.path.realpath(f.data),))]
+        finally:
+            con_root.close()
+        assert len(shadowed) >= 2 and shadowed[0].startswith("p"), shadowed
+        # the legacy store still says active — the trap this case pins
+        legacy_rows = StoreAdapter(f.data).store_select(
+            "SELECT status FROM runs WHERE id=?", ("rA",))
+        assert legacy_rows and legacy_rows[0]["status"] == "active", legacy_rows
+        want_path_h = os.path.join(c2_dir, "plans", f.plan, "runs", "rA", "bus.jsonl")
+        rc, res, blob = cli(["archive-run", "--data", f.data, "--run", "rA"], env=f.env())
+        assert rc == 0 and res.get("ok") is True and res["written"] is True, (rc, res, blob)
+        assert res["path"] == want_path_h, (res["path"], want_path_h)
+        assert os.path.isfile(want_path_h), want_path_h
+        assert res["messages"] == len(want_h["msg"]) and res["artifacts"] == len(want_h["artifact"]), res
+        assert res["acks"] == len(want_h["ack"]), res
+        assert rows_of_c2("rA") == {"msg": [], "ack": [], "artifact": []}, rows_of_c2("rA")
+        assert not os.path.exists(os.path.join(f.data, "runs", "rA", "bus.jsonl")), \
+            "the archive must not land in the legacy runs dir"
+        case("(h) archive-run reads the migrated store, not the shadowed legacy one")
+        f.cleanup()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -7731,6 +8025,97 @@ def self_test():
             assert e.code == 400, f"Expected 400 for ack with unknown reply_to, got {e.code}"
         done("ask->answer round trip + honest acks")
 
+        # 7c. Z4: a store appearing mid-flight must not move a live bus's files.
+        # `answer` runs mk-state, which creates <data>/mk.db while the server above
+        # is still running; mkpaths then resolves this bus's token file into the MK
+        # home's bus/ folder, which holds none of the tokens registered here. The bus
+        # pins its file paths at serve time (the file-side twin of use_store), so the
+        # lane token above keeps answering instead of 401 on a live, delivering bus.
+        data_flip = os.path.join(tmp, "data_flip")
+        os.makedirs(data_flip, exist_ok=True)
+        rc, res_flip, _ = cli(["ensure", "--data", data_flip, "--run", "rf"])
+        assert rc == 0 and res_flip["ok"] is True, res_flip
+        pids.append(res_flip["pid"])
+        port_flip = res_flip["port"]
+        lane_flip = os.path.join(tmp, "lane_flip")
+        os.makedirs(lane_flip, exist_ok=True)
+        rc, res_flip_tok, _ = cli(["token", "--lane", lane_flip, "--task", "T1", "--run", "rf",
+                                   "--data", data_flip])
+        assert rc == 0 and res_flip_tok["ok"] is True, res_flip_tok
+        token_flip = res_flip_tok["token"]
+        with urllib.request.urlopen(urllib.request.Request(
+                f"http://127.0.0.1:{port_flip}/wait?lane=T1&after=0&timeout=1",
+                headers={"Authorization": f"Bearer {token_flip}",
+                         "Host": f"127.0.0.1:{port_flip}"}), timeout=5.0) as resp:
+            assert json.loads(resp.read().decode("utf-8"))["ok"] is True, "flip bus: token before"
+        # The flip: a project store appears under the data dir mid-flight, exactly
+        # what mk-state does for this bus when a lane's ask is answered.
+        with open(os.path.join(data_flip, "mk.db"), "wb") as f:
+            f.write(b"")
+        with urllib.request.urlopen(urllib.request.Request(
+                f"http://127.0.0.1:{port_flip}/wait?lane=T1&after=0&timeout=1",
+                headers={"Authorization": f"Bearer {token_flip}",
+                         "Host": f"127.0.0.1:{port_flip}"}), timeout=5.0) as resp:
+            flip_ok = json.loads(resp.read().decode("utf-8"))["ok"]
+        assert flip_ok is True, "a mid-flight store must not move the bus's token file (401)"
+        # a lane ask + its ack, straight over HTTP (the CLI resolves the bus through
+        # bus.json, which the flip legitimately moves): both must still answer 200
+        req_flip_ask = urllib.request.Request(
+            f"http://127.0.0.1:{port_flip}/send",
+            data=json.dumps({"run": "rf", "task": "T1", "kind": "ask", "text": "still mine?",
+                             "from": "T1", "to": "orch"}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token_flip}",
+                     "Host": f"127.0.0.1:{port_flip}"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req_flip_ask, timeout=5.0) as resp:
+            flip_ask = json.loads(resp.read().decode("utf-8"))
+        assert flip_ask["ok"] is True, flip_ask
+        req_flip_ack = urllib.request.Request(
+            f"http://127.0.0.1:{port_flip}/ack",
+            data=json.dumps({"id": flip_ask["message"]["id"], "ack_level": 3, "run": "rf"}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token_flip}",
+                     "Host": f"127.0.0.1:{port_flip}"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req_flip_ack, timeout=5.0) as resp:
+            flip_ack = json.loads(resp.read().decode("utf-8"))
+        assert flip_ack["ok"] is True, flip_ack
+        # The freshly minted half of the same review (HIGH): a token minted AFTER the
+        # flip must name the LIVE bus's port. Before the fix, bus.json had already moved,
+        # so this url was http://127.0.0.1:0 (no root bus alive) or the ROOT bus's port
+        # — and the token itself was written where the live file-mode bus does not look,
+        # so every request with it answered 401. Read by path, because that is the file a
+        # lane would dial.
+        rc, res_flip_tok2, _ = cli(["token", "--lane", lane_flip, "--task", "T2", "--run", "rf",
+                                    "--data", data_flip])
+        assert rc == 0 and res_flip_tok2["ok"] is True, res_flip_tok2
+        flip_cfg2 = read_json(os.path.join(lane_flip, ".matrixkoder-bus.json"))
+        assert flip_cfg2 and flip_cfg2["url"] == f"http://127.0.0.1:{port_flip}", flip_cfg2
+        assert flip_cfg2["token"] == res_flip_tok2["token"], flip_cfg2
+        req_flip_fresh = urllib.request.Request(
+            f"http://127.0.0.1:{port_flip}/send",
+            data=json.dumps({"run": "rf", "task": "T2", "kind": "ask", "text": "minted after the flip",
+                             "from": "T2", "to": "orch"}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {flip_cfg2['token']}",
+                     "Host": f"127.0.0.1:{port_flip}"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req_flip_fresh, timeout=10.0) as resp:
+            flip_fresh = json.loads(resp.read().decode("utf-8"))
+        assert flip_fresh["ok"] is True, flip_fresh
+        req_flip_fresh_ack = urllib.request.Request(
+            f"http://127.0.0.1:{port_flip}/ack",
+            data=json.dumps({"id": flip_fresh["message"]["id"], "ack_level": 3, "run": "rf"}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {flip_cfg2['token']}",
+                     "Host": f"127.0.0.1:{port_flip}"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req_flip_fresh_ack, timeout=10.0) as resp:
+            flip_fresh_ack = json.loads(resp.read().decode("utf-8"))
+        assert flip_fresh_ack["ok"] is True, flip_fresh_ack
+        done("a store appearing mid-flight never moves the bus's token file (old or freshly minted)")
+
         # 7b. Cross-lane ack forgery refused on EVERY ack path (MEDIUM 1):
         # T1 must not ack T2's messages, via /send kind=ack AND via /ack.
         lane2 = os.path.join(tmp, "lane2")
@@ -8115,27 +8500,39 @@ def self_test():
         assert json.loads(p_get2.stdout)["task"]["status"] == "building"
         done("mk-state integration (answer -> building)")
 
-        # 11b. Ambiguous message id refused (MEDIUM 2): ids are per run, so
-        # "m-1" exists in both r2 and r3; without --run the CLI must fail
-        # instead of answering whichever run os.listdir returned first.
-        subprocess.run([sys.executable, mk_state, "--data", data_state, "run", "init", "--id", "r3", "--feature", "f", "--branch", "b", "--force"], check=True, capture_output=True)
-        subprocess.run([sys.executable, mk_state, "--data", data_state, "--run", "r3", "task", "add", "--id", "T3", "--title", "task three"], check=True, capture_output=True)
+        # 11b. Ambiguous message id refused (MEDIUM 2): ids are per run in file mode,
+        # so "m-1" exists in both runs and without --run the CLI must fail instead of
+        # answering whichever run os.listdir returned first. Store mode is not a
+        # counter-example: ids are project-wide there, so no id can collide, which is
+        # why this case runs its own file-mode project with two hand-seeded runs.
+        data_amb = os.path.join(tmp, "data_amb")
+        os.makedirs(data_amb, exist_ok=True)
+        for run_id, task_id in (("ar1", "A1"), ("ar2", "A2")):
+            amb_run_dir = _paths("run_dir", data_amb, run_id)
+            os.makedirs(amb_run_dir, exist_ok=True)
+            with open(os.path.join(amb_run_dir, "bus.jsonl"), "w") as f:
+                f.write(json.dumps({"seq": 1, "id": "m-1", "ts": "2026-10-15T00:00:00Z",
+                                    "run": run_id, "task": task_id, "from": task_id, "to": "orch",
+                                    "kind": "ask", "reply_to": None, "text": "ask " + run_id,
+                                    "ack_level": 1}) + "\n")
+        rc, res_ens_amb, _ = cli(["ensure", "--data", data_amb, "--run", "ar1"])
+        assert rc == 0 and res_ens_amb["ok"] is True, res_ens_amb
+        pids.append(res_ens_amb["pid"])
 
-        rc, res_ask3, _ = cli(["send", "--run", "r3", "--task", "T3", "--kind", "ask", "--text", "second run ask", "--from", "T3", "--to", "orch", "--data", data_state])
-        assert rc == 0 and res_ask3["ok"] is True, res_ask3
-        assert res_ask3["message"]["id"] == "m-1", res_ask3
-
-        rc, res_amb, _ = cli(["answer", "m-1", "which one?", "--data", data_state], check=False)
+        rc, res_amb, _ = cli(["answer", "m-1", "which one?", "--data", data_amb], check=False)
         assert rc != 0, "ambiguous answer without --run must fail"
         assert res_amb == {"ok": False, "error": "ambiguous message id, pass --run"}, res_amb
 
-        # --run disambiguates: r3's ask is unanswered (r2's already answered)
-        rc, res_dis, _ = cli(["answer", "m-1", "answered via run", "--run", "r3", "--data", data_state])
+        # --run disambiguates: ar2's ask is answered, ar1's stays open
+        rc, res_dis, _ = cli(["answer", "m-1", "answered via run", "--run", "ar2", "--data", data_amb])
         assert rc == 0 and res_dis["ok"] is True, res_dis
-        assert res_dis["message"]["reply_to"] == "m-1" and res_dis["message"]["run"] == "r3", res_dis
+        assert res_dis["message"]["reply_to"] == "m-1" and res_dis["message"]["run"] == "ar2", res_dis
 
-        rc, res_r2, _ = cli(["answer", "m-1", "nope", "--run", "r2", "--data", data_state], check=False)
-        assert rc != 0 and "already answered" in res_r2.get("error", ""), res_r2
+        rc, res_r1, _ = cli(["answer", "m-1", "nope", "--run", "ar1", "--data", data_amb], check=False)
+        assert rc == 0 and res_r1.get("ok") is True and res_r1["message"]["run"] == "ar1", res_r1
+
+        rc, res_again, _ = cli(["answer", "m-1", "nope", "--run", "ar1", "--data", data_amb], check=False)
+        assert rc != 0 and "already answered" in res_again.get("error", ""), res_again
         done("ambiguous answer refused, --run disambiguates")
 
         # 11c. A lane ask over real HTTP marks its task blocked (once per ask id, --by bus) via
@@ -8168,15 +8565,33 @@ def self_test():
             with urllib.request.urlopen(req_ask, timeout=5.0) as resp:
                 return json.loads(resp.read().decode("utf-8"))
 
+        def r4_task():
+            """T4's store row: the status now, plus prev_status — the status the last move
+            came from. A move into an attention status keeps the one it replaced (C4), so
+            `building` here IS that transition's `from`."""
+            rows = StoreAdapter(data_ask).store_select(
+                "SELECT status, prev_status FROM tasks WHERE run=? AND id=?", ("r4", "T4"))
+            return rows[0] if rows else {}
+
         def r4_status():
-            run_ = read_json(os.path.join(data_ask, "runs", "r4", "run.json"))
-            return next(t["status"] for t in run_["tasks"] if t["id"] == "T4")
+            """T4's status from the store's tasks table (C4). mkdb.transition is the only
+            writer of it (C10); L4 stopped writing runs/<run>/run.json, so the file read this
+            case used to do now returns None."""
+            return r4_task().get("status")
 
         def r4_bus_transitions():
-            ev_path = os.path.join(data_ask, "runs", "r4", "events.jsonl")
-            return [json.loads(l) for l in open(ev_path).readlines() if l.strip()
-                    and json.loads(l).get("type") == "transition"
-                    and json.loads(l).get("by") == "bus"]
+            """The moves the BUS made on this task, from the store's own events rows.
+
+            A store-mode task move is mkdb.transition: it writes one
+            events(chan='state', kind='transition', to_id=<to>, text=<note>) row and leaves
+            the status it came from in tasks.prev_status. The note of a lane ask is
+            `bus ask <id>: <text>`, so these rows are the store-mode twin of the old
+            events.jsonl `transition` + `by == 'bus'` view — the same moves, the same note,
+            the same order, read from the only source of truth."""
+            return [r for r in StoreAdapter(data_ask).store_select(
+                "SELECT task, to_id, text, t FROM events"
+                " WHERE chan=? AND kind=? AND run=? AND text LIKE ? ORDER BY id",
+                ("state", "transition", "r4", "bus ask %"))]
 
         ask1 = post_lane_ask("which fixture should I load?")
         assert ask1["ok"] is True and ask1["state_updated"] is True and ask1["mk_state_error"] is None, ask1
@@ -8184,7 +8599,7 @@ def self_test():
         assert r4_status() == "blocked"
         tr1 = r4_bus_transitions()
         assert len(tr1) == 1 and tr1[0]["text"].startswith(f"bus ask {ask1_id}: which fixture"), tr1
-        assert tr1[0]["from"] == "building" and tr1[0]["to"] == "blocked", tr1
+        assert tr1[0]["to_id"] == "blocked" and r4_task()["prev_status"] == "building", tr1
 
         rc, res_ans_ask, _ = cli(["answer", ask1_id, "load the schema one", "--run", "r4", "--data", data_ask])
         assert rc == 0 and res_ans_ask["ok"] is True, res_ans_ask
@@ -8197,23 +8612,36 @@ def self_test():
         assert r4_status() == "blocked"
         tr2 = r4_bus_transitions()
         assert len(tr2) == 2 and tr2[1]["text"].startswith(f"bus ask {ask2_id}: and where is the report"), tr2
-        assert tr2[1]["from"] == "building" and tr2[1]["to"] == "blocked", tr2
+        assert tr2[1]["to_id"] == "blocked" and r4_task()["prev_status"] == "building", tr2
         done("lane ask marks blocked (--by bus), answer restores building")
 
-        # 11d. mk-state failing on the ask path: the POST still succeeds, the failure rides in
-        # the reply, and run state is untouched.
+        # 11d. The task side-write failing on the ask path: the POST still succeeds, the
+        # failure rides in the reply, and the run's state is untouched. Since L4 the store
+        # is the only state (C4), so this write is mkdb.transition and $MK_STATE_CMD can no
+        # longer fail it: the one-shot transition-fail marker is the failure seam, the twin
+        # of the append-fail flag the store writers already carry.
         data_askf = os.path.join(tmp, "data_askfail")
         os.makedirs(data_askf, exist_ok=True)
         subprocess.run([sys.executable, mk_state, "--data", data_askf, "run", "init", "--id", "r5", "--feature", "f", "--branch", "b", "--force"], check=True, capture_output=True)
         subprocess.run([sys.executable, mk_state, "--data", data_askf, "--run", "r5", "task", "add", "--id", "T5", "--title", "ask fail lane"], check=True, capture_output=True)
         subprocess.run([sys.executable, mk_state, "--data", data_askf, "--run", "r5", "task", "set", "T5", "status=building"], check=True, capture_output=True)
-        r5_json = os.path.join(data_askf, "runs", "r5", "run.json")
-        before = open(r5_json, "rb").read()
-        fake_ms = os.path.join(tmp, "fake-mk-state.py")
-        with open(fake_ms, "w") as f:
-            f.write("#!/usr/bin/env python3\nimport sys\nsys.stderr.write('mk-state: run state locked\\n')\nsys.exit(1)\n")
-        os.chmod(fake_ms, 0o755)
-        os.environ["MK_STATE_CMD"] = fake_ms  # inherited by the serve this ensure starts
+
+        r5_store = StoreAdapter(data_askf)
+
+        def r5_state():
+            """T5's store row plus r5's transition rows, the state the failed side-write must
+            leave exactly as it was. runs/r5/run.json is gone since L4, so a byte read of it
+            is no longer a proof of anything — the store's own rows are."""
+            row = r5_store.store_select(
+                "SELECT status, prev_status FROM tasks WHERE run=? AND id=?", ("r5", "T5"))
+            moves = r5_store.store_select(
+                "SELECT task, to_id, text, t FROM events WHERE chan=? AND kind=? AND run=?",
+                ("state", "transition", "r5"))
+            return (row[0] if row else None, moves)
+
+        before = r5_state()
+        # The seam, armed before the serve starts: this bus's first transition raises.
+        open(os.path.join(data_askf, "transition-fail"), "w").close()
         try:
             rc, res_ens_f, _ = cli(["ensure", "--data", data_askf, "--run", "r5"])
             assert rc == 0 and res_ens_f["ok"] is True, res_ens_f
@@ -8232,11 +8660,12 @@ def self_test():
                 assert resp.status == 200
                 askf = json.loads(resp.read().decode("utf-8"))
             assert askf["ok"] is True and askf["state_updated"] is False, askf
-            assert askf["mk_state_error"] and "run state locked" in askf["mk_state_error"], askf
-            assert open(r5_json, "rb").read() == before, "run.json must be untouched when mk-state fails"
+            assert askf["mk_state_error"] and "injected transition failure" in askf["mk_state_error"], askf
+            assert r5_state() == before, "the task row and its transitions must be untouched when the side-write fails"
         finally:
-            os.environ.pop("MK_STATE_CMD", None)
-        done("lane ask survives mk-state failure (200 + error carried)")
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(os.path.join(data_askf, "transition-fail"))
+        done("lane ask survives a failed side-write (200 + error carried, state untouched)")
 
         # 11e. owner_timeout_s: env hook > yaml bus.owner_timeout_min (clamped to the schema's
         # [5, 120]) > 1800.0 s default. Asserted directly on the helper: fast, no waiting.
@@ -8256,9 +8685,10 @@ def self_test():
         assert owner_timeout_s(data_ot) == 120 * 60.0  # clamped up to the schema max
         done("owner_timeout_s: env > yaml (clamped) > 1800 s default")
 
-        # 11f. Ask ids are per run ("m-1" exists in every run), so the once-per-ask guard
-        # must key (run, id), not id alone (review MEDIUM 2): two runs on ONE bus, each
-        # lane's first ask is m-1 — both tasks must go blocked. Also pins the argparse
+        # 11f. Store mode makes ids project-wide (one counter per project store), but the
+        # once-per-ask guard must still key (run, id), not id alone (review MEDIUM 2): two
+        # runs on ONE bus, each lane's ask blocks its own task, and a second ask in the
+        # same run is a new (run, id) pair that blocks again. Also pins the argparse
         # side of the "--" terminator (review MEDIUM 1): option-shaped answer texts reach
         # mk-bus.py only after "--" and are stored verbatim, flags not hijacked.
         data_2r = os.path.join(tmp, "data_2runs")
@@ -8284,8 +8714,13 @@ def self_test():
                 return json.loads(resp.read().decode("utf-8"))
 
         def status_2r(rid, tid):
-            run_ = read_json(os.path.join(data_2r, "runs", rid, "run.json"))
-            return next(t["status"] for t in run_["tasks"] if t["id"] == tid)
+            """One (run, task) status from the store's tasks table (C4). L4 stopped writing
+            runs/<run>/run.json, and a file view could never hold two runs' tasks in one
+            project anyway: the store's ids are project-wide, so the two runs of this case
+            share one message counter (m-1 in r6, m-2 in r7) and one tasks table."""
+            rows = StoreAdapter(data_2r).store_select(
+                "SELECT status FROM tasks WHERE run=? AND id=?", (rid, tid))
+            return rows[0]["status"] if rows else None
 
         toks_2r = {}
         for rid, tid in (("r6", "T6"), ("r7", "T7")):
@@ -8297,25 +8732,34 @@ def self_test():
 
         ask_2r_a = post_ask_2r(toks_2r["r6"], "first run question")
         ask_2r_b = post_ask_2r(toks_2r["r7"], "second run question")
-        assert ask_2r_a["message"]["id"] == "m-1", ask_2r_a
-        assert ask_2r_b["message"]["id"] == "m-1", ask_2r_b  # per-run ids: both m-1
+        # Store mode: one counter per project store. Both ids are therefore whatever
+        # this project store's next two ids are — the case does not pin a number (the
+        # data dir is fresh but a shared project store can already hold rows), it pins
+        # that each lane's ask blocks ITS task: the (run, id) guard, not an id-only one.
+        assert ask_2r_a["message"]["id"] != ask_2r_b["message"]["id"], (ask_2r_a, ask_2r_b)
         assert ask_2r_a["state_updated"] is True and ask_2r_a["mk_state_error"] is None, ask_2r_a
-        # the id-only guard returned state_updated=False here (run A's m-1 had already marked)
+        # an id-only guard answered state_updated=False here (r6's ask had already marked)
         assert ask_2r_b["state_updated"] is True and ask_2r_b["mk_state_error"] is None, ask_2r_b
         assert status_2r("r6", "T6") == "blocked"
         assert status_2r("r7", "T7") == "blocked"  # and T7 stayed building on the id-only guard
 
-        rc, res_2r_ev, _ = cli(["answer", "--data", data_2r, "--run", "r6", "--", "m-1", "--run=evil"])
+        rc, res_2r_ev, _ = cli(["answer", "--data", data_2r, "--run", "r6", "--", ask_2r_a["message"]["id"], "--run=evil"])
         assert rc == 0 and res_2r_ev["ok"] is True, res_2r_ev
         assert res_2r_ev["message"]["text"] == "--run=evil", res_2r_ev  # verbatim, not swallowed
         assert res_2r_ev["message"]["run"] == "r6", res_2r_ev  # --run not hijacked by the text
 
+        # A third ask in the SAME run is another (run, id) pair, so the once-per-ask guard
+        # marks r6's task again: its id is a fresh one, not either ask's or that answer's.
         ask_2r_c = post_ask_2r(toks_2r["r6"], "third question")
-        ask_2r_c_id = ask_2r_c["message"]["id"]  # m-3: the --run=evil answer took m-2
+        ask_2r_c_id = ask_2r_c["message"]["id"]
+        assert ask_2r_c_id not in ("m-1", ask_2r_b["message"]["id"], res_2r_ev["message"]["id"]), \
+            ask_2r_c_id
+        assert ask_2r_c_id != ask_2r_a["message"]["id"], ask_2r_c_id
+        assert status_2r("r6", "T6") == "blocked"  # once per ask, not once per run
         rc, res_2r_x, _ = cli(["answer", "--data", data_2r, "--run", "r6", "--", ask_2r_c_id, "-x"])
         assert rc == 0 and res_2r_x["ok"] is True, res_2r_x
         assert res_2r_x["message"]["text"] == "-x" and res_2r_x["message"]["run"] == "r6", res_2r_x
-        done("ask-once keyed (run, id): two runs' m-1 asks both block; answer -- stores text verbatim")
+        done("ask-once keyed (run, id): each run's ask blocks its own task; answer -- stores text verbatim")
 
         # 12. Unsupported methods answer JSON 405, never the stdlib 501 HTML
         # page (LOW 5); HEAD sends the JSON headers with no body.
