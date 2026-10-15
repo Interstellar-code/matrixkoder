@@ -59,7 +59,13 @@ LOCKFILES = ("pnpm-lock.yaml", "package-lock.json", "yarn.lock", "bun.lock", "bu
 # `.omc/` here would also swallow an ignored file inside a TRACKED `.omc/` (the 11g case).
 DISPOSABLE = (".matrixkoder-*", ".env", ".env.*", "node_modules/", ".omo/", ".serena/",
               ".venv/", "__pycache__/", ".claude/", ".claude/skills/mk-builder/",
-              ".omp/", ".omp/skills/mk-builder/")
+              ".omp/", ".omp/skills/mk-builder/", ".claude-plugin/types/", ".ruff_cache/")
+# The ignored scratch release REMOVES from the slot before parking it (the lane cleanup the skill
+# docs describe: `reference/lane-rules.md`, the release step of `skills/matrixkoder/SKILL.md` and
+# `reference/loop.md`). Literal root-level names only — no globs — and each must also be on
+# DISPOSABLE, so a slot whose only leftover is one of these reads clean and is freed. Everything
+# else stays a pause item: any other ignored leftover still refuses.
+SCRATCH = (".ruff_cache", ".claude-plugin/types")
 # The build-cache dirs every package/venv path ends with: allowed as a path component at any depth,
 # so a monorepo's packages/a/node_modules/ does not read as dirty. Everything else stays root-only.
 ANY_DEPTH = ("node_modules/", "__pycache__/", ".venv/")
@@ -665,9 +671,15 @@ def clean_state(path, cfg):
 
     `--no-optional-locks`: this is a read-only poll that runs on every status and acquire, and
     without the flag git may take the index lock for it. A poll must never block a real
-    `git add` in the same worktree."""
-    r = run_cmd(["git", "--no-optional-locks", "-C", path, "status", "--porcelain=v1", "-z", "--ignored",
-                 "--untracked-files=normal", "--ignore-submodules=none"], 60)
+    `git add` in the same worktree.
+
+    `--ignored=matching` (not the default `traditional`): traditional COLLAPSES a directory whose
+    every entry is ignored into one `!! .claude-plugin/` record, so the allowlist entry that names
+    the real leftover (`.claude-plugin/types/`) never matched and the slot read dirty forever —
+    the exact refusal the Z21 brief saw on slots 1 and 4. matching reports the entry the ignore
+    rule actually names, which is what the allowlist is spelled in."""
+    r = run_cmd(["git", "--no-optional-locks", "-C", path, "status", "--porcelain=v1", "-z",
+                 "--ignored=matching", "--untracked-files=normal", "--ignore-submodules=none"], 60)
     if r.returncode != 0:
         raise Fail(f"git status in {path} failed", stderr=(r.stderr or r.stdout).strip()[:400])
     allow = tuple(DISPOSABLE) + tuple(cfg["disposable"]) + tuple(cfg["copy"])
@@ -688,6 +700,48 @@ def clean_state(path, cfg):
         if not (rec.startswith("!! ") and disposable_ok(rec[3:], allow, has_tracked)):
             dirty.append(rec)
     return not dirty, dirty
+
+
+def scratch_names(path):
+    """-> the SCRATCH entries that EXIST in this slot and that git reports as ignored. Literal
+    root-level names only, and `git check-ignore` (not a parsed `git status`) is what decides:
+    status COLLAPSES a directory whose every entry is ignored to `!! .claude-plugin/`, so the
+    entry the brief saw is only visible per name. check-ignore consults the index the same way
+    status does — a TRACKED `.ruff_cache/` or `.claude-plugin/types/` is not reported ignored and
+    is therefore never removed."""
+    out = []
+    for name in SCRATCH:
+        if not os.path.lexists(os.path.join(path, name)):
+            continue
+        # no --literal-pathspecs here: check-ignore refuses it ("pathspec magic not supported").
+        # The name comes from the SCRATCH tuple, never from user input, so there is nothing to
+        # escape; a `:` in a SCRATCH entry would be a code change, not data.
+        r = run_cmd(["git", "-C", path, "check-ignore", "-q", "--", name], 30)
+        if r.returncode == 0:
+            out.append(name)
+    return out
+
+
+def clear_scratch(path):
+    """Remove the slot's ignored scratch — the SDK types `claude plugin test` writes into
+    `.claude-plugin/types/` and the linter's `.ruff_cache` — and return the removed names. Called
+    only by release, and only AFTER the clean check passed, so a slot that refuses loses nothing.
+    One path per name: a file or a link goes by the link, a directory goes whole, and anything
+    resolving outside the slot is left alone."""
+    slot_real = os.path.realpath(path)
+    gone = []
+    for name in scratch_names(path):
+        target = os.path.join(path, name)
+        if os.path.commonpath([os.path.realpath(target), slot_real]) != slot_real:
+            continue        # a name that resolves outside the slot is not ours to remove
+        if os.path.islink(target) or os.path.isfile(target):
+            os.unlink(target)
+        elif os.path.isdir(target):
+            shutil.rmtree(target)
+        else:
+            continue
+        gone.append(name)
+    return gone
 
 
 def stray_commits(path):
@@ -1185,7 +1239,7 @@ def cmd_release(a, cfg, data, main):
             raise Fail(f"--integration {a.integration!r} is the task branch of slot {a.slot}; "
                        "pass the integration branch")
         verify_slot_path(a.slot, rec["path"], main)
-        require_clean(a.slot, rec, cfg)
+        require_clean(a.slot, rec, cfg)  # BEFORE any cleanup: a slot that refuses keeps its bytes
         require_no_stray(a.slot, rec["path"])
         git(["-C", rec["path"], "switch", "--detach", integration])
         branch, warning, deleted = task_branch, None, None
@@ -1208,9 +1262,15 @@ def cmd_release(a, cfg, data, main):
             else:
                 deleted = False
                 warning = f"branch {branch} not merged into {iname}, kept"  # never -D
+        # the documented lane cleanup (lane-rules §6): the ignored scratch a slot ACCUMULATES —
+        # `.ruff_cache`, the SDK types `claude plugin test` writes into `.claude-plugin/types/` —
+        # goes before the slot is parked. Only after the clean check passed, so a dirty slot the
+        # user must look at loses nothing.
+        scratch = clear_scratch(rec["path"])
         touch(rec, state="free", run=None, task=None, branch=None)
         out = {"ok": True, "slot": a.slot, "path": rec["path"], "state": "free",
-               "integration": a.integration, "branch": branch, "branch_deleted": deleted}
+               "integration": a.integration, "branch": branch, "branch_deleted": deleted,
+               "scratch_removed": scratch}
         if not cfg["reuse"]:  # one-shot slots: the worktree goes with the release
             try:
                 why = remove_slot(a.slot, rec, main)
@@ -1732,7 +1792,7 @@ def self_test():
         rel = mk("release", "--slot", "1", "--integration", "mk/r1/integration")
         assert rel == {"ok": True, "slot": 1, "path": slot1, "state": "free",
                        "integration": "mk/r1/integration", "branch": "mk/r1/t1",
-                       "branch_deleted": True}, rel
+                       "branch_deleted": True, "scratch_removed": []}, rel
         assert main_head() == "main"  # merged-ness judged against integration, not this HEAD
         assert g("rev-parse", "--verify", "--quiet", "refs/heads/mk/r1/t1",
                  check=False).returncode != 0  # the task branch is gone
@@ -1939,6 +1999,47 @@ def self_test():
         assert d["error"] == "slot 1 dirty" and "?? scratch-omc.txt" in d["dirty"], d
         os.unlink(os.path.join(slot1, "scratch-omc.txt"))
         assert mk("release", "--slot", "1", "--integration", "mk/r1/integration")["ok"]
+
+        # 8c (Z21) release removes the slot's ignored scratch: the SDK types `claude plugin test`
+        # writes into `.claude-plugin/types/` and the linter's `.ruff_cache`. Both used to read
+        # `slot N dirty` (`!! .claude-plugin/types/`), so such a slot was never releasable — the
+        # exact refusal seen on slots 1 and 4 on 2026-10-15.
+        write(os.path.join(integ, ".gitignore"),
+              "node_modules/\n__pycache__/\n/.venv/\n.omc/\nprod.sqlite\n"
+              ".claude-plugin/types/\n.ruff_cache/\n")
+        g("-C", integ, "add", ".gitignore"), g("-C", integ, "commit", "-qm", "ignore the scratch dirs")
+        assert mk("acquire", "--run", "r1", "--task", "t8c", "--base", "mk/r1/integration")["slot"] == 1
+        write(os.path.join(slot1, ".claude-plugin", "types", "x.d.ts"), "export type X = number\n")
+        write(os.path.join(slot1, ".ruff_cache", "cache.db"), "x\n")
+        assert mk("list")["slots"][0]["clean"] is True, mk("list")   # both are disposable
+        rel = mk("release", "--slot", "1", "--integration", "mk/r1/integration")
+        assert rel["ok"] and sorted(rel["scratch_removed"]) == [".claude-plugin/types", ".ruff_cache"], rel
+        assert not os.path.exists(os.path.join(slot1, ".claude-plugin", "types"))
+        assert not os.path.exists(os.path.join(slot1, ".ruff_cache"))
+        assert os.path.isdir(os.path.join(slot1, ".claude-plugin"))  # only the scratch leaf went
+
+        # 8d any OTHER ignored leftover still refuses, and the release that refuses deletes nothing
+        write(os.path.join(integ, ".gitignore"),
+              "node_modules/\n__pycache__/\n/.venv/\n.omc/\nprod.sqlite\n"
+              ".claude-plugin/types/\n.ruff_cache/\nbuild-out/\n")
+        g("-C", integ, "add", ".gitignore"), g("-C", integ, "commit", "-qm", "ignore build-out")
+        # re-acquire so the slot sits on the tip that ignores build-out/ (the release above parked
+        # it on the older tip, where the folder would read `??` — a different rule than this case's)
+        st("task", "add", "--id", "t8d", "--title", "other ignored leftover", "--run", "r1")
+        assert mk("acquire", "--run", "r1", "--task", "t8d", "--base", "mk/r1/integration")["slot"] == 1
+        write(os.path.join(slot1, "build-out", "b.js"), "x\n")
+        write(os.path.join(slot1, ".ruff_cache", "cache.db"), "x\n")
+        assert mk("list")["slots"][0]["clean"] is False  # build-out/ is not on the cleanup list
+        d = mk("release", "--slot", "1", "--integration", "mk/r1/integration", code=3)
+        assert d["error"] == "slot 1 dirty" and d["dirty"] == ["!! build-out/"], d
+        assert os.path.isfile(os.path.join(slot1, ".ruff_cache", "cache.db"))  # left alone while dirty
+        shutil.rmtree(os.path.join(slot1, "build-out"))
+        assert mk("release", "--slot", "1", "--integration", "mk/r1/integration")["ok"]
+        assert not os.path.exists(os.path.join(slot1, ".ruff_cache"))
+        # back to the 8b world for the cases below
+        write(os.path.join(integ, ".gitignore"),
+              "node_modules/\n__pycache__/\n/.venv/\n.omc/\nprod.sqlite\n")
+        g("-C", integ, "add", ".gitignore"), g("-C", integ, "commit", "-qm", "restore the ignores")
 
         # 9 a commit on the free detached slot is not orphaned by the next switch
         write(os.path.join(slot1, "stray.md"), "late builder commit\n")
