@@ -591,6 +591,101 @@ test('Settings · every scope fits 36 and 46 cols; hotkeys are only 1-8 and s/x/
   expect(drawnText(draw(busy, 46)).includes('● 2 unsaved'), 'the busy state is dirty').toBe(true)
 })
 
+// ---------- L10.4: Global / Project sub-tabs over the layered yaml rows ----------
+
+const POLICY = 'routing_preferences.policy'
+const FLOOR = 'routing_preferences.reserve_floor.claude.five_hour_left_pct'
+
+/** the fixture view with its routing rows layered: policy overridden in the project, the floor set
+ *  globally, the rest at their default (the shape L10.3's `list --json` source gives). */
+const layeredView = () => {
+  const base = settingsView()
+  return {
+    ...base,
+    groups: base.groups.map(g => g.scope !== 'routing'
+      ? g
+      : { ...g, rows: g.rows.map(r => ({ ...r, layered: true as const, source: r.key === POLICY ? 'project' as const : r.key === FLOOR ? 'global' as const : 'default' as const })) }),
+  }
+}
+const drawLayered = (ui: FakeUi | ReturnType<typeof liveUiOf>, cols = 46): unknown => SettingsTab(stubEls, layeredView(), cols, ui)
+const hasButton = (drawn: unknown, key: string): boolean => buttonsOf(drawn).some(b => b.props.key === key)
+
+test('Settings · L10.4 sub-tabs: Project is the default and marks overridden vs inherited rows', () => {
+  const ui: FakeUi = new Map([['settings:scope', 'routing']])
+  const drawn = drawLayered(ui)
+  // the active sub-tab is drawn as plain text (a static Segment), the other one is the press
+  const text = drawnText(drawn)
+  expect(text.includes('Project') && hasButton(drawn, 'set-sub-global'), 'both sub-tabs drawn, Project active').toBe(true)
+  expect(text.includes('● overridden in this project')).toBe(true) // policy
+  expect(text.includes('↳ inherited from global')).toBe(true) // the floor
+  expect(text.includes('↳ default')).toBe(true)
+  // reset-to-inherit is offered on the project-overridden row only
+  expect(hasButton(drawn, `set-unset-${POLICY}`)).toBe(true)
+  expect(hasButton(drawn, `set-unset-${FLOOR}`)).toBe(false)
+})
+
+test('Settings · L10.4 sub-tabs: pressing Global redraws the same rows with the global marks', () => {
+  const ui: FakeUi = new Map([['settings:scope', 'routing']])
+  press(drawLayered(ui), 'set-sub-global')
+  expect(ui.get('settings:sub')).toBe('global')
+  const drawn = drawLayered(ui)
+  expect(drawnText(drawn).includes('Global') && hasButton(drawn, 'set-sub-project'), 'Global active').toBe(true)
+  const text = drawnText(drawn)
+  expect(text.includes('● a project value overrides')).toBe(true)
+  expect(text.includes('● set globally')).toBe(true)
+  expect(hasButton(drawn, `set-unset-${FLOOR}`)).toBe(true) // the global layer holds this one
+  expect(hasButton(drawn, `set-unset-${POLICY}`)).toBe(false)
+  press(drawn, 'set-sub-project')
+  expect(ui.get('settings:sub')).toBe('project')
+})
+
+test('Settings · L10.4 sub-tabs: scopes with no layered rows draw no sub-tab bar', () => {
+  for (const scope of ['mode', 'about']) {
+    const drawn = SettingsTab(stubEls, layeredView(), 46, new Map([['settings:scope', scope]]))
+    expect(hasButton(drawn, 'set-sub-project') || hasButton(drawn, 'set-sub-global'), `${scope} has no sub-tabs`).toBe(false)
+  }
+  // an unlayered fixture (an older mk-config) keeps today's tab: no bar, no markers
+  const plain = SettingsTab(stubEls, settingsView(), 46, new Map([['settings:scope', 'routing']]))
+  expect(hasButton(plain, 'set-sub-project') || hasButton(plain, 'set-sub-global')).toBe(false)
+  expect(drawnText(plain).includes('overridden')).toBe(false)
+})
+
+test('Settings · L10.4 save: an edit is saved into the active sub-tab layer (set vs set --global)', () => {
+  for (const [sub, want] of [['', 'project'], ['global', 'global']] as const) {
+    const ui: FakeUi = new Map([['settings:scope', 'routing']])
+    if (sub !== '') ui.set('settings:sub', sub)
+    const seen = { saves: [] as unknown[], rechecks: 0 }
+    const live = liveUiOf(ui, seen)
+    press(drawLayered(live), 'set-routing_preferences.policy-seg-qual')
+    press(drawLayered(live), 'set-save')
+    expect(seen.saves, sub).toEqual([{
+      sets: [{ key: POLICY, value: 'quality', list: false, scope: want }],
+      globals: [],
+      visibility: [],
+    }])
+  }
+})
+
+test('Settings · L10.4 sub-tabs: switching drops unsaved layered edits, so a save never lands in the other layer', () => {
+  const ui: FakeUi = new Map([['settings:scope', 'routing']])
+  press(drawLayered(ui), 'set-routing_preferences.policy-seg-qual')
+  expect(ui.get(`settings:edit:${POLICY}`)).toBe('"quality"')
+  press(drawLayered(ui), 'set-sub-global')
+  expect(ui.get(`settings:edit:${POLICY}`)).toBe('')
+})
+
+test('Settings · L10.4 reset: inherit hands an unset (project row, or --global) to the live wire', () => {
+  const ui: FakeUi = new Map([['settings:scope', 'routing']])
+  const seen = { saves: [] as unknown[], rechecks: 0 }
+  const live = liveUiOf(ui, seen)
+  press(drawLayered(live), `set-unset-${POLICY}`)
+  ui.set('settings:sub', 'global')
+  press(drawLayered(live), `set-unset-${FLOOR}`)
+  const resets = seen.saves.map(p => (p as { sets: { key: string; scope: string; reset: boolean }[] }).sets)
+  expect(resets[0]).toMatchObject([{ key: POLICY, scope: 'project', reset: true }])
+  expect(resets[1]).toMatchObject([{ key: FLOOR, scope: 'global', reset: true }])
+})
+
 // ---------- S3: the save press hands the ordered payload to the live wire ----------
 
 /** a fake ui with the S3 live wires: save/recheck record their calls (kept
