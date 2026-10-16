@@ -1272,7 +1272,10 @@ AUDIT_ROOT_STORES = (mkpaths.ROOT_DB_NAME, mkpaths.LEGACY_DB_NAME)      # a ROOT
 AUDIT_PROJECT_STORES = (mkpaths.PROJECT_DB_NAME, mkpaths.LEGACY_DB_NAME)  # a PROJECT store: new name or kept legacy
 AUDIT_HOME_FILES = {n + suf for n in AUDIT_ROOT_STORES for suf in ("", "-wal", "-shm")} | {
                     mkpaths.MK_SETTINGS_NAME, "usage.json", "usage.json.lock", "config.json",
-                    "bus-tokens.json", mkpaths.PROJECTS_JSON}
+                    "bus-tokens.json", mkpaths.PROJECTS_JSON,
+                    # mk-migrate's --v2 / --v2-retire markers (kept until the matching --rollback) and the flock
+                    # mk-config's settings writes take beside the home-level mk-settings.yaml
+                    ".migrate-v2.json", ".retire-v2.json", mkpaths.LEGACY_YAML_NAME + ".lock"}
 AUDIT_HOME_DIRS = {mkpaths.TARGET_BUS_DIR, "locks", mkpaths.TARGET_PROJECTS_DIR, "inbox", "backups",
                    mkpaths.BUS_LANES_DIR}
 AUDIT_BAK_PREFIXES = tuple(n + ".bak-" for n in AUDIT_ROOT_STORES)
@@ -1280,7 +1283,7 @@ AUDIT_BAK_PREFIXES = tuple(n + ".bak-" for n in AUDIT_ROOT_STORES)
 AUDIT_PROJECT_FILES = {n + suf for n in AUDIT_PROJECT_STORES for suf in ("", "-wal", "-shm")} | {
                        mkpaths.PROJECT_YAML_NAME, mkpaths.PROJECT_YAML_NAME + ".lock", mkpaths.PROJECT_YAML_NAME + ".bak",
                        ".migrate.json"}
-AUDIT_PROJECT_DIRS = {mkpaths.TARGET_PLANS_DIR, "archive", "runs"}
+AUDIT_PROJECT_DIRS = {mkpaths.TARGET_PLANS_DIR, "archive", "runs", "legacy"}   # legacy/ = the user-confirmed `--archive` tarball of the old data dir
 AUDIT_PLAN_ENTRIES = {"plan.md", "assets", "archive", "runs"}
 # the root store also carries mk-catalog's C8 tables (agents, catalog_user, models): the catalog owns them
 AUDIT_ROOT_CATALOG_TABLES = {"agents", "catalog_user", "models"}   # optional: allowed when present, never required
@@ -1389,7 +1392,7 @@ def _audit_copy(db, tmp, n):
     checkpoint can touch it. A copy is a point-in-time view; a live writer mid-commit can tear it."""
     dst = os.path.join(tmp, f"{n}.db")
     shutil.copy2(db, dst)
-    if os.path.isfile(db + "-wal"):
+    with contextlib.suppress(FileNotFoundError):   # a live writer may checkpoint and remove the WAL between the check and the copy
         shutil.copy2(db + "-wal", dst + "-wal")
     con = sqlite3.connect(dst)  # RO_AUDIT: a private copy in tmp, never the original store
     con.row_factory = sqlite3.Row
@@ -1479,9 +1482,16 @@ def do_audit(home=None):
                 if os.path.isfile(mkpaths.project_db_in(full)):
                     bad_link.append(f"{mkpaths.TARGET_PROJECTS_DIR}/{d} has no projects row (holds a stray mk.db)")
                 else:
-                    # no row and no store: the root-cleanup alias folder, kept while bus tokens carry its slug
-                    info_link.append(f"{mkpaths.TARGET_PROJECTS_DIR}/{d} has no projects row and no store "
-                                     "(alias folder kept for bus tokens): WARN, not a failure")
+                    # no store of its own: the alias folder of a row whose db_path is another project's store
+                    # (same data dir), kept while bus tokens carry its slug. A folder with no row at all is only a WARN.
+                    row_here = next((r for r in rows if r["slug"] == d), None)
+                    alias_of = row_here and next((o["slug"] for o in rows if o["slug"] != d and o["db_path"]
+                                                  and o["data_dir"] == row_here["data_dir"]), None)
+                    if alias_of:
+                        info_link.append(f"{mkpaths.TARGET_PROJECTS_DIR}/{d} is the alias folder of {alias_of} (same data dir): fine")
+                    else:
+                        info_link.append(f"{mkpaths.TARGET_PROJECTS_DIR}/{d} has no projects row and no store "
+                                         "(alias folder kept for bus tokens): WARN, not a failure")
         proj_cons = {}
         for i, db in enumerate(sorted(stores)):
             if not os.path.isfile(db):
@@ -1895,6 +1905,58 @@ def audit_self_test():
         _check(len(by["A07"]["info"]) == 2, f"history tokens are not counted as info: {by['A07']['info']}")
         # a live writer touching a -wal/-shm during the audit is not a change the audit made
         _check(do_audit(home)["home_changed_during_audit"] == [], "home_changed_during_audit is not empty on a quiet home")
+    finally:
+        shutil.rmtree(f["root"], ignore_errors=True)
+    # L10.Y: shapes of a real migrated home that are NOT drift
+    f = _audit_fixture()
+    try:
+        home = f["home"]
+        # (a) an unmigrated project: root row db_path NULL, its data dir a repo folder holding the store, no projects/<slug> folder
+        data_c = os.path.join(f["root"], "repo-c", ".matrixkoder")
+        os.makedirs(data_c)
+        mkdb.open_project(home, "fixc", data_dir=data_c).close()
+        con = mkdb.open_root(home)
+        try:
+            con.execute("INSERT INTO projects(slug, name, repo, data_dir, mode, db_path, created) VALUES (?,?,?,?,?,?,?)",
+                        ("fixc", "fixc", os.path.dirname(data_c), data_c, "home", None, "e2e"))
+            con.commit()
+        finally:
+            con.close()
+        rep = do_audit(home)
+        _check(rep["ok"] and not os.path.exists(os.path.join(home, "projects", "fixc")),
+               f"an unmigrated project fails the audit: {[r for r in rep['rules'] if not r['pass']]}")
+        # (b) the alias folder (project.yaml + .bak only) of a row that shares a migrated row's data dir
+        alias = "p0123456789abcdef"
+        con = mkdb.open_root(home)
+        try:
+            con.execute("INSERT INTO projects(slug, name, repo, data_dir, mode, db_path, created) VALUES (?,?,?,?,?,?,?)",
+                        (alias, alias, os.path.realpath(f["repo"]), f["data"], "managed",
+                         mkpaths.project_db_in(f["data"]), "e2e"))
+            con.commit()
+        finally:
+            con.close()
+        adir = os.path.join(home, "projects", alias)
+        os.makedirs(adir)
+        for n in (mkpaths.PROJECT_YAML_NAME, mkpaths.PROJECT_YAML_NAME + ".bak"):
+            with open(os.path.join(adir, n), "w", encoding="utf-8") as fh:
+                fh.write("x: 1\n")
+        rep = do_audit(home)
+        by = {r["id"]: r for r in rep["rules"]}
+        _check(rep["ok"], f"an alias folder of a migrated row fails the audit: {[r for r in rep['rules'] if not r['pass']]}")
+        _check(any(alias in i and f"alias folder of {f['slug']}" in i for i in by["A04"]["info"]), f"A04 info lacks the alias: {by['A04']['info']}")
+        # (c) the user-confirmed `--archive` tarball folder in a project folder
+        legacy = os.path.join(mkpaths.target_project_dir(f["slug"], home), "legacy")
+        os.makedirs(legacy)
+        with open(os.path.join(legacy, f["slug"] + "-20261016-000000.tar.gz"), "wb") as fh:
+            fh.write(b"tar")
+        rep = do_audit(home)
+        _check(rep["ok"], f"a legacy/ folder fails the audit: {[r for r in rep['rules'] if not r['pass']]}")
+        # (d) the old root store left beside mk-overview.db is tolerated (as before)
+        with open(mkpaths.legacy_db_in(home), "wb") as fh:
+            fh.write(b"old root store")
+        rep = do_audit(home)
+        _check(rep["ok"], f"the old root store beside the new one fails the audit: {[r for r in rep['rules'] if not r['pass']]}")
+        _check(_audit_exit(home) == 0, "audit exit code is not 0 with the L10.Y shapes")
     finally:
         shutil.rmtree(f["root"], ignore_errors=True)
     for rid, name, token, mutate in _audit_mutations():

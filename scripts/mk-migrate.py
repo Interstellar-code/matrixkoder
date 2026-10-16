@@ -12,6 +12,10 @@ stays NULL, so every reader keeps the old path.
               old DB changed), else carries the new DB back new->old with the same verify.
 --archive   : AFTER the user confirms, tar the old <repo>/.matrixkoder into
               <MK home>/projects/<slug>/legacy/. Never deletes the old folder or the old DB.
+--v2-retire : (L10.Y) AFTER a verified --v2 switch of --slug S: MOVE (never delete) the old stores and the
+              leftovers the v2 layout no longer holds into <home>/backups/retire-<stamp>/ with a manifest
+              (path, size, sha256), drop the junk `projects` rows, and let `--v2-retire --rollback` put every
+              byte back. See cmd_v2_retire.
 --v2        : (L10.8) the whole-home move onto the v2 names, from BOTH source shapes: a v1 C2 home
               (`projects.db_path` set, store `projects/<slug>/mk.db`) and a pre-migration project
               (store `<repo>/.matrixkoder/mk.db`, no db_path). `--v2 --slug A[,B] [--dry-run]` copies each
@@ -1343,6 +1347,8 @@ def cmd_v2_rollback(home, args):
     marker = _read_json(mpath) if os.path.isfile(mpath) else None
     if not marker:
         raise Fail(f"no v2 record at {mpath}: nothing to roll back", 3)
+    if os.path.exists(_retire_marker_path(home)):
+        raise Fail(f"a v2-retire is recorded ({_retire_marker_path(home)}); run --v2-retire --rollback first", 3)
     lines = [f"remove {p}" for p in marker.get("created", [])]
     lines += [f"restore {dst} -> {src}" for dst, src in marker.get("moved", [])]
     lines += [f"restore {copy} -> {orig} (rewritten by the settings carry)" for copy, orig in marker.get("restore", [])]
@@ -1380,6 +1386,320 @@ def cmd_v2_rollback(home, args):
         os.remove(mpath)
     return {"ok": True, "command": "v2-rollback", "home": home, "removed": marker.get("created", []),
             "restored": len(marker.get("moved", [])), "old_files_changed": old_changed}
+
+
+# ---------- v2-retire: move the old stores and leftovers into a named backup (L10.Y) ----------
+#
+# After `--v2` has switched a project, the OLD root/project stores, the stale view files and a few home-level
+# leftovers still sit in the live tree and make the layout audit fail. Retire MOVES them (shutil.move on one
+# filesystem is a rename; nothing is ever deleted) into <home>/backups/retire-<stamp>/, keeping their relative
+# paths, writes a manifest (path, size, sha256) and a marker, and `--v2-retire --rollback` puts every byte back.
+
+RETIRE_MARKER = ".retire-v2.json"
+RETIRE_VIEW_NAMES = set(mkpaths.VIEW_DOC_NAMES) | {"index.json"}
+TEMP_PREFIXES = ("/private/tmp/", "/tmp/", "/private/var/folders/", "/var/folders/")
+
+
+def _retire_marker_path(home):
+    return os.path.join(home, RETIRE_MARKER)
+
+
+def _sizes(path):
+    """[(rel-to-path, size, sha256)] for a file (rel '') or every file under a folder, symlinks as symlinks."""
+    if os.path.isfile(path) or os.path.islink(path):
+        return [("", os.lstat(path).st_size, _hash_path(path))]
+    out = []
+    for d, dirs, files in os.walk(path):
+        dirs.sort()
+        for n in sorted(files):
+            full = os.path.join(d, n)
+            out.append((os.path.relpath(full, path), os.lstat(full).st_size, _hash_path(full)))
+    return out
+
+
+def _config_json_carried(home):
+    """True when <home>/config.json can go: it holds ONLY keys migrate-settings carries and mk-settings.yaml has
+    every one of them with the same value. -> (carried?, reason)."""
+    cj = os.path.join(home, "config.json")
+    doc = _read_json(cj)
+    if not isinstance(doc, dict):
+        return False, "config.json is unreadable"
+    flat = {}
+
+    def walk(prefix, node):
+        for k, v in node.items():
+            key = f"{prefix}.{k}" if prefix else str(k)
+            if isinstance(v, dict):
+                walk(key, v)
+            else:
+                flat[key] = v
+
+    walk("", doc)
+    carried_keys = {"dashboard.auto_open", "dashboard.chip", "dashboard.toasts", "usage.poll_min"}
+    extra = sorted(k for k in flat if k not in carried_keys)
+    if extra:
+        return False, f"config.json holds keys migrate-settings does not carry: {extra}"
+    have = {}
+    try:
+        with open(mkpaths.mk_settings(home)) as f:
+            for line in f:
+                m = re.match(r"^([A-Za-z_][A-Za-z0-9_.-]*):[ \t]*(.*)$", line.rstrip("\n"))
+                if m:
+                    try:
+                        have[m.group(1)] = json.loads(m.group(2))
+                    except ValueError:
+                        have[m.group(1)] = m.group(2).strip().strip("\"'")
+    except OSError:
+        return False, "mk-settings.yaml is missing"
+    missing = sorted(k for k, v in flat.items() if have.get(k) != v)
+    if missing:
+        return False, f"mk-settings.yaml lacks or differs on {missing}"
+    return True, "carried"
+
+
+def _lock_held(path):
+    """True when another process holds this flock (or it cannot be opened): a held lock is never retired."""
+    try:
+        f = open(path, "a")
+    except OSError:
+        return True
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(f, fcntl.LOCK_UN)
+        f.close()
+    return False
+
+
+def _tokens_name(home, slug):
+    """True when any bus token file under the home names this slug (a row with tokens is never junk)."""
+    for p in (os.path.join(home, "bus-tokens.json"), os.path.join(home, "bus", "bus-tokens.json")):
+        try:
+            with open(p) as f:
+                if slug in f.read():
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def _junk_rows(home, root_path, keep):
+    """Root `projects` rows that are test debris: no db_path, a temp-dir data_dir that no longer exists, and no bus
+    token naming the slug. Rows in `keep` (the alias, hermes, anything with db_path) are never junk."""
+    con = open_ro(root_path)
+    if con is None:
+        return []
+    try:
+        rows = [dict(r) for r in con.execute("SELECT * FROM projects")]
+    finally:
+        con.close()
+    out = []
+    for r in rows:
+        d = r.get("data_dir") or ""
+        if r["slug"] in keep or r.get("db_path") or not d.startswith(TEMP_PREFIXES) or os.path.exists(d):
+            continue
+        if _tokens_name(home, r["slug"]):
+            continue
+        out.append(r)
+    return out
+
+
+def _retire_plan(home, slug):
+    """What retire would move for this project, and the junk rows it would drop. Refuses unless the switch is
+    verified: the v2 marker names the slug, the root row points at the new store, both new stores open."""
+    marker = _read_json(_v2_marker_path(home)) if os.path.isfile(_v2_marker_path(home)) else None
+    entry = next((p for p in (marker or {}).get("projects", []) if p.get("slug") == slug), None)
+    if not entry:
+        raise Fail(f"no verified v2 switch recorded for {slug!r} ({_v2_marker_path(home)}); run --v2 first", 3)
+    new_proj, new_root = entry["new"], mkpaths.new_db_in(home, "root")
+    for label, path in (("root", new_root), ("project", new_proj)):
+        if state_of(path) is None:
+            raise Fail(f"the new {label} store does not open: {path}", 3)
+    row = root_row(home, slug)
+    if not row or os.path.realpath(row.get("db_path") or "") != os.path.realpath(new_proj):
+        raise Fail(f"projects.db_path of {slug!r} is not the new store; refusing to retire", 3)
+    if os.path.exists(_retire_marker_path(home)):
+        raise Fail(f"a retire is already recorded ({_retire_marker_path(home)}); --v2-retire --rollback first", 3)
+    tdir = os.path.dirname(new_proj)
+    items = []      # {"rel": path relative to home, "why": rule}
+
+    def add(path, why):
+        if os.path.lexists(path):
+            rel = os.path.relpath(path, home)
+            if not any(i["rel"] == rel for i in items):
+                items.append({"rel": rel, "why": why})
+
+    legacy_root = mkpaths.legacy_db_in(home)
+    if os.path.realpath(legacy_root) != os.path.realpath(new_root):
+        for suf in ("", "-wal", "-shm"):
+            add(legacy_root + suf, "old root store beside the new one")
+    legacy_proj = mkpaths.legacy_db_in(tdir)
+    if os.path.realpath(legacy_proj) != os.path.realpath(new_proj):
+        for suf in ("", "-wal", "-shm"):
+            add(legacy_proj + suf, "old project store beside the new one")
+    for n in sorted(os.listdir(home)):
+        if n.startswith(mkpaths.LEGACY_DB_NAME + ".bak-"):
+            add(os.path.join(home, n), "old root store backup")
+    # stale run view files under the project's plans/**/runs/ and the pre-C2 projects/<slug>/runs folder
+    for d, dirs, files in os.walk(os.path.join(tdir, mkpaths.TARGET_PLANS_DIR)):
+        dirs.sort()
+        if "runs" in d.split(os.sep):
+            for n in sorted(files):
+                if n in RETIRE_VIEW_NAMES:
+                    add(os.path.join(d, n), "stale run view file")
+    add(os.path.join(tdir, "runs"), "old runs folder (pre-C2)")
+    # a stray store with no projects row
+    rows_all = mkdb.projects(home)
+    slugs_all = {r.get("slug") for r in rows_all}
+    pdir = os.path.join(home, mkpaths.TARGET_PROJECTS_DIR)
+    for n in sorted(os.listdir(pdir)) if os.path.isdir(pdir) else []:
+        folder = os.path.join(pdir, n)
+        owned = n in slugs_all or any((r.get("db_path") or "").startswith(folder + os.sep) for r in rows_all)
+        if not owned and os.path.isdir(folder) and any(
+                os.path.isfile(os.path.join(folder, x)) for x in (mkpaths.LEGACY_DB_NAME, mkpaths.PROJECT_DB_NAME)):
+            add(folder, "project folder with a store and no projects row")
+        # stray lock files in a project folder (lanes.lock now lives under <home>/locks)
+        if os.path.isdir(folder) and os.path.relpath(folder, home) not in [i["rel"] for i in items]:
+            for x in sorted(os.listdir(folder)):
+                if re.match(r"^(.+\.yaml\.lock|lanes\.lock)$", x) and os.path.isfile(os.path.join(folder, x)):
+                    add(os.path.join(folder, x), "stray lock file in a project folder")
+    # home-level leftovers
+    notes = []
+    if os.path.isfile(os.path.join(home, "config.json")):
+        ok_, why_ = _config_json_carried(home)
+        if ok_:
+            add(os.path.join(home, "config.json"), "retired UI toggles, carried into mk-settings.yaml")
+        else:
+            notes.append(f"config.json stays: {why_}")
+    add(os.path.join(home, mkpaths.PROJECTS_JSON), "retired home-mode registry (the root rows hold it)")
+    ldir = os.path.join(home, "locks")
+    for n in sorted(os.listdir(ldir)) if os.path.isdir(ldir) else []:
+        full = os.path.join(ldir, n)
+        if n.endswith(".lock") and os.path.isfile(full) and n != os.path.basename(mkpaths.lock_path("migrate")):
+            if _lock_held(full):
+                notes.append(f"locks/{n} stays: held by a process")
+            else:
+                add(full, "lock file no process holds")
+    keep = {slug} | set(entry.get("slugs") or []) | {r["slug"] for r in rows_all if r.get("db_path")}
+    junk = _junk_rows(home, new_root, keep)
+    return {"items": items, "junk": junk, "notes": notes, "tdir": tdir, "new_root": new_root, "entry": entry}
+
+
+def cmd_v2_retire(args):
+    home = mkpaths.home(args.home)
+    if args.rollback:
+        return cmd_v2_retire_rollback(home, args)
+    if not args.slug or "," in args.slug:
+        raise Fail("--v2-retire needs exactly one --slug S", 2)
+    plan = _retire_plan(home, args.slug)
+    lines = [f"move {i['rel']}  ({i['why']})" for i in plan["items"]]
+    lines += [f"drop projects row {r['slug']} ({r.get('data_dir')}): temp path gone, no db_path, no token" for r in plan["junk"]]
+    if args.dry_run:
+        for line in lines + [f"note: {n}" for n in plan["notes"]]:
+            print(line)
+        return {"ok": True, "command": "v2-retire", "dry_run": True, "home": home, "slug": args.slug,
+                "moves": [i["rel"] for i in plan["items"]], "junk_rows": [r["slug"] for r in plan["junk"]],
+                "notes": plan["notes"]}
+    stamp = now_stamp()
+    backup = os.path.join(home, "backups", f"retire-{stamp}")
+    manifest = {"slug": args.slug, "stamp": stamp, "backup": backup, "items": [], "rows": plan["junk"]}
+    done = []
+    with switch_lock(home):
+        plan = _retire_plan(home, args.slug)       # re-read under the lock: what is there NOW is what moves
+        try:
+            for i in plan["items"]:
+                src, dst = os.path.join(home, i["rel"]), os.path.join(backup, i["rel"])
+                files = _sizes(src)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.move(src, dst)
+                done.append((dst, src))
+                manifest["items"].append({"rel": i["rel"], "why": i["why"], "files": files,
+                                          "is_dir": os.path.isdir(dst) and not os.path.islink(dst)})
+            if plan["junk"]:
+                con = mkdb.open_root(home)
+                try:
+                    for r in plan["junk"]:
+                        con.execute("DELETE FROM projects WHERE slug=? AND db_path IS NULL", (r["slug"],))
+                    con.commit()
+                finally:
+                    con.close()
+            manifest["rows"] = plan["junk"]
+            os.makedirs(backup, exist_ok=True)
+            with open(os.path.join(backup, "manifest.json"), "w") as f:
+                json.dump(manifest, f, indent=2, sort_keys=True, default=str)
+            with open(_retire_marker_path(home), "w") as f:
+                json.dump({"slug": args.slug, "stamp": stamp, "backup": backup,
+                           "manifest": os.path.join(backup, "manifest.json")}, f, indent=2)
+        except BaseException as e:
+            for dst, src in reversed(done):
+                with contextlib.suppress(OSError):
+                    os.makedirs(os.path.dirname(src), exist_ok=True)
+                    shutil.move(dst, src)
+            if plan["junk"]:
+                _reinsert_rows(home, plan["junk"])
+            with contextlib.suppress(OSError):
+                os.remove(_retire_marker_path(home))
+            _prune_backup(backup)
+            if isinstance(e, (Fail, KeyboardInterrupt, SystemExit)):
+                raise
+            raise Fail(f"v2-retire failed: {type(e).__name__}: {e} — everything was put back", 3)
+    return {"ok": True, "command": "v2-retire", "home": home, "slug": args.slug, "backup": backup,
+            "moved": len(manifest["items"]), "junk_rows": [r["slug"] for r in plan["junk"]], "notes": plan["notes"]}
+
+
+def _reinsert_rows(home, rows):
+    con = mkdb.open_root(home)
+    try:
+        for r in rows:
+            cols = [c for c in r if c in {x[1] for x in con.execute("PRAGMA table_info(projects)")}]
+            con.execute(f"INSERT OR IGNORE INTO projects({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})",
+                        [r[c] for c in cols])
+        con.commit()
+    finally:
+        con.close()
+
+
+def cmd_v2_retire_rollback(home, args):
+    """Put every retired byte back. Refuses when a moved file changed in the backup (sha mismatch), when a target
+    path is occupied again, or when the manifest is missing; nothing is half-restored on a refusal."""
+    mpath = _retire_marker_path(home)
+    marker = _read_json(mpath) if os.path.isfile(mpath) else None
+    if not marker:
+        raise Fail(f"no retire record at {mpath}: nothing to roll back", 3)
+    manifest = _read_json(marker["manifest"])
+    if not manifest:
+        raise Fail(f"the retire manifest is unreadable: {marker['manifest']}", 3)
+    backup = manifest["backup"]
+    lines = [f"restore {i['rel']}" for i in manifest["items"]] + [f"re-insert projects row {r['slug']}" for r in manifest.get("rows", [])]
+    if args.dry_run:
+        for line in lines:
+            print(line)
+        return {"ok": True, "command": "v2-retire-rollback", "dry_run": True, "steps": lines}
+    with switch_lock(home):
+        for i in manifest["items"]:
+            dst, src = os.path.join(backup, i["rel"]), os.path.join(home, i["rel"])
+            if not os.path.lexists(dst):
+                raise Fail(f"the backup copy is gone: {dst}", 3)
+            if os.path.lexists(src):
+                raise Fail(f"cannot restore {i['rel']}: the path exists again (inspect it, then retry)", 3)
+            now = {(a, b, c) for a, b, c in _sizes(dst)}
+            if now != {tuple(f) for f in i["files"]}:
+                raise Fail(f"the backup copy of {i['rel']} differs from the manifest; refusing to restore", 3)
+        for i in manifest["items"]:
+            src = os.path.join(home, i["rel"])
+            os.makedirs(os.path.dirname(src), exist_ok=True)
+            shutil.move(os.path.join(backup, i["rel"]), src)
+        if manifest.get("rows"):
+            _reinsert_rows(home, manifest["rows"])
+        os.remove(mpath)
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(backup, "manifest.json"))
+        _prune_backup(backup)
+    return {"ok": True, "command": "v2-retire-rollback", "home": home, "restored": len(manifest["items"]),
+            "rows": len(manifest.get("rows", []))}
 
 
 def cmd_archive(args):
@@ -1463,6 +1783,8 @@ def build_parser():
     p.add_argument("--switch", action="store_true", help="copy+verify under the lock, then set projects.db_path")
     p.add_argument("--rollback", action="store_true", help="undo a switch (refuses on new writes)")
     p.add_argument("--archive", action="store_true", help="tar the old <repo>/.matrixkoder under the MK home")
+    p.add_argument("--v2-retire", dest="v2_retire", action="store_true",
+                   help="after --v2: move the old stores and leftovers into backups/retire-<stamp>/ (--slug S; --rollback undoes)")
     p.add_argument("--v2", action="store_true", help="move onto the v2 names (mk-overview.db, mk-project.db); --slug A[,B]")
     p.add_argument("--slug", help="project slug (registered in the root when absent)")
     p.add_argument("--data", help="the project data dir (default: the data-dir order)")
@@ -1476,7 +1798,9 @@ def main(argv):
         return self_test()
     args = build_parser().parse_args(argv)
     try:
-        if args.v2:
+        if args.v2_retire:
+            out = cmd_v2_retire(args)
+        elif args.v2:
             out = cmd_v2(args)
         elif args.archive:
             out = cmd_archive(args)
@@ -1995,6 +2319,267 @@ def _v2_rehearse(fx):
     _check(os.path.isfile(new_proj) and os.path.isfile(new_root) and os.path.isfile(_v2_marker_path(home)),
            f"{tag}: the refused rollback removed something")
     return tag
+
+
+RETIRE_SLUG = "matrixkoder"
+RETIRE_JUNK = ("zz-junk-1", "zz-junk-2", "zz-junk-3")
+
+
+def _retire_fixture(tmp, config=None):
+    """ONE home mirroring the real layout: `matrixkoder` (shape c2, v1 names, plus its alias row and alias folder) and
+    `hermes` (shape legacy, db_path NULL, store + yaml in its repo), root debris and a frozen repo copy."""
+    home, repo, repo2 = os.path.join(tmp, "home"), os.path.join(tmp, "repo"), os.path.join(tmp, "repo2")
+    data, data2, slug = os.path.join(repo, ".matrixkoder"), os.path.join(repo2, ".matrixkoder"), RETIRE_SLUG
+    tdir, keepdir = os.path.join(home, "projects", slug), os.path.join(tmp, "keepdir")
+    alias = alias_slug(data)
+    for d in (data, data2, tdir, keepdir):
+        os.makedirs(d)
+    with _as_home(home):
+        root = mkdb.open_root(home)
+        ins = ("INSERT INTO projects(slug, name, repo, data_dir, mode, created, last_activity, db_path)"
+               " VALUES (?,?,?,?,?,?,?,?)")
+        proj_db = mkpaths.legacy_db_in(tdir)
+        root.execute(ins, (slug, slug, repo, os.path.realpath(data), "home", "c", "c", proj_db))
+        root.execute(ins, (alias, alias, repo, os.path.realpath(data), "managed", "c", "c", proj_db))
+        root.execute(ins, ("hermes", "hermes", repo2, os.path.realpath(data2), "home", "c", "c", None))
+        for n, d in [(j, f"/private/tmp/{j}-gone") for j in RETIRE_JUNK] + [("zz-keep", keepdir)]:
+            root.execute(ins, (n, n, d, d, "home", "c", "c", None))
+        root.commit()
+        con = mkdb.open_project(home, slug)
+        _v2_fill(con)
+        for pid, title, status, counts_json, live_run in mkdb._plan_summary_values(con):
+            root.execute("INSERT INTO plan_summary(project, plan, title, status, counts_json, live_run, updated)"
+                         " VALUES (?,?,?,?,?,?,?)", (slug, pid, title, status, counts_json, live_run, "u"))
+        root.commit()
+        root.close()
+        con.close()
+        _v2_rename_to_legacy(mkpaths.new_db_in(tdir, "project"), tdir)
+        h = mkdb.open_project(home, "hermes", data_dir=data2, version=4)
+        _v2_fill(h)
+        h.close()
+        _v2_rename_to_legacy(mkpaths.new_db_in(data2, "project"), data2)
+        _v2_rename_to_legacy(mkpaths.new_db_in(home, "root"), home)
+    shutil.copyfile(mkpaths.legacy_db_in(tdir), mkpaths.legacy_db_in(data))      # the frozen pre-switch copy
+    _v2_write(mkpaths.legacy_yaml(data), V2_YAML)
+    _v2_write(mkpaths.legacy_yaml(data2), V2_YAML)
+    for n, body in ((mkpaths.legacy_lanes(tdir), json.dumps({"slots": {"1": {"path": "/x/lane1", "state": "free"}}})),
+                    (mkpaths.legacy_cursors(tdir), json.dumps({"ra|*": {"seq": 3}})),
+                    (os.path.join(tdir, "lanes.lock"), ""), (mkpaths.project_yaml_in(tdir), V2_YAML),
+                    (mkpaths.project_yaml_in(tdir) + ".bak", "# older\n"), (mkpaths.project_yaml_in(tdir) + ".lock", ""),
+                    (mkpaths.legacy_yaml(tdir) + ".lock", "")):
+        _v2_write(n, body)
+    # stale run view files, and the pre-C2 runs folder with its flock and one brief
+    for n in (mkpaths.TASK_DOC_NAME, mkpaths.BOARD_DOC_NAME, mkpaths.EVENTS_DOC_NAME, mkpaths.RUN_DOC_NAME):
+        _v2_write(os.path.join(tdir, "plans", "pa", "runs", "ra", n), f"stale {n}\n")
+    _v2_write(os.path.join(tdir, "runs", ".lock"), "")
+    _v2_write(os.path.join(tdir, "runs", "ra", "T1", "brief-r1.md"), "# old brief\n")
+    # the alias folder: only config
+    _v2_write(mkpaths.project_yaml_in(os.path.join(home, "projects", alias)), V2_YAML)
+    _v2_write(mkpaths.project_yaml_in(os.path.join(home, "projects", alias)) + ".bak", "# alias older\n")
+    _v2_write(mkpaths.legacy_yaml(os.path.join(home, "projects", alias)) + ".lock", "")
+    # a stray store with no projects row, home leftovers, locks
+    _v2_write(mkpaths.legacy_db_in(os.path.join(home, "projects", "e2e")), "stray store")
+    _v2_write(os.path.join(home, mkpaths.LEGACY_DB_NAME + ".bak-20261013"), "bak")
+    _v2_write(os.path.join(home, "config.json"), json.dumps(config or V2_CONFIG_JSON))
+    _v2_write(os.path.join(home, mkpaths.PROJECTS_JSON), "{}")
+    _v2_write(os.path.join(home, "locks", "x.lock"), "")
+    # the old root bus files carry-root moves: one token naming the project, one lane token file
+    _v2_write(os.path.join(home, "bus-tokens.json"), json.dumps({"tk1": {"project": slug, "token": "x", "role": "orch"}}))
+    _v2_write(os.path.join(home, "bus-lanes", hashlib.sha256(b"lane1").hexdigest() + ".json"),
+              json.dumps({"v": 1, "token": "x", "data": data}))
+    return {"home": home, "repo": repo, "repo2": repo2, "data": data, "data2": data2, "slug": slug, "alias": alias,
+            "tdir": tdir, "keepdir": keepdir, "shape": "retire"}
+
+
+def _row_of(root_path, slug):
+    con = open_ro(root_path)
+    try:
+        r = con.execute("SELECT * FROM projects WHERE slug=?", (slug,)).fetchone()
+        return dict(r) if r else None
+    finally:
+        con.close()
+
+
+def _slugs_of(root_path):
+    con = open_ro(root_path)
+    try:
+        return {r["slug"]: dict(r) for r in con.execute("SELECT * FROM projects")}
+    finally:
+        con.close()
+
+
+def _hash_skip(home, repo, repo2, skip):
+    """_v2_hash-clean trees of home/repo/repo2, hashed again minus every home-relative path starting with a `skip` entry."""
+    _v2_hash(home, repo, repo2)
+    out = []
+    for root in (home, repo, repo2):
+        h = hashlib.sha256()
+        for d, dirs, files in os.walk(root):
+            dirs.sort()
+            for n in sorted(files):
+                p = os.path.join(d, n)
+                rel = os.path.relpath(p, root)
+                if root == home and any(rel.startswith(s) for s in skip):
+                    continue
+                h.update(rel.encode() + _hash_path(p).encode())
+        out.append(h.hexdigest())
+    return out
+
+
+def _retire_rehearse(fx):
+    home, repo, repo2, slug, alias, tdir, data = (fx[k] for k in ("home", "repo", "repo2", "slug", "alias", "tdir", "data"))
+    tag = "v2-retire"
+    new_root, new_proj = mkpaths.new_db_in(home, "root"), mkpaths.new_db_in(tdir, "project")
+    old_root, old_proj = mkpaths.legacy_db_in(home), mkpaths.legacy_db_in(tdir)
+
+    def retire(*a):
+        return _cli(home, ["--v2-retire", "--home", home, *a])
+
+    def doc(out):
+        return _last_json(out) or {}
+
+    start = _v2_hash(home, repo, repo2)
+    # carry-root's moves and the archive tarball are not undone by --v2 --rollback: compare the rest
+    v2_skip = ("backups", "bus", "mk-settings.yaml", os.path.join("projects", slug, "legacy"))
+    start_skip = _hash_skip(home, repo, repo2, v2_skip)
+    old_sha = {p: _hash_file(p) for p in (old_proj, old_root)}
+    # (0) retire before --v2 refuses, nothing moves
+    rc, out, _ = retire("--slug", slug)
+    _check(rc == 3 and "no verified v2 switch" in out and _v2_hash(home, repo, repo2) == start, f"{tag}: retire before v2 rc={rc} {out[-200:]}")
+    hermes_hash, hermes_row = _v2_hash(repo2)[0], _row_of(old_root, "hermes")
+    _check(hermes_row and hermes_row["db_path"] is None, f"{tag}: hermes fixture row {hermes_row}")
+    # (1) --v2 --slug matrixkoder (the alias row moves with it); hermes untouched
+    rc, out, err = _cli(home, ["--v2", "--home", home, "--slug", slug])
+    _check(rc == 0, f"{tag}: v2 rc={rc} {out[-500:]} {err[-300:]}")
+    rows = _slugs_of(new_root)
+    _check(rows[slug]["db_path"] == new_proj and rows[alias]["db_path"] == new_proj, f"{tag}: db_path after v2 {rows[slug]['db_path']} {rows[alias]['db_path']}")
+    _check({k: rows["hermes"][k] for k in hermes_row} == hermes_row, f"{tag}: the hermes row changed by v2")
+    # (2) carry-root as the real subprocess, on the temp home
+    env = dict(os.environ, MK_HOME=home, MATRIXKODER_HOME=home, MK_SELFTEST="1")
+    env.pop("MK_BUS_DIR", None)
+    p = subprocess.run([sys.executable, os.path.join(HERE, "mk-bus.py"), "carry-root"], capture_output=True, text=True, env=env)
+    cdoc = _last_json(p.stdout) or {}
+    _check(p.returncode == 0 and cdoc.get("tokens", {}).get("carried") == 1 and cdoc.get("lanes", {}).get("carried") == 1,
+           f"{tag}: carry-root rc={p.returncode} {p.stdout[-300:]} {p.stderr[-200:]}")
+    _check(not os.path.exists(os.path.join(home, "bus-tokens.json")) and not os.path.exists(os.path.join(home, mkpaths.BUS_LANES_DIR)),
+           f"{tag}: carry-root left the root bus files")
+    # what the migrated tree gets back later: a tool recreates a stray yaml lock in the project folder
+    _v2_write(os.path.join(tdir, "other.yaml.lock"), "")
+    want = [os.path.relpath(old_root, home), os.path.relpath(old_proj, home), mkpaths.LEGACY_DB_NAME + ".bak-20261013",
+            "config.json", mkpaths.PROJECTS_JSON, os.path.join("locks", "x.lock"), os.path.join("projects", "e2e"),
+            os.path.join("projects", slug, "runs"), os.path.join("projects", slug, "other.yaml.lock"),
+            os.path.join("projects", alias, mkpaths.LEGACY_YAML_NAME + ".lock")]
+    want += [os.path.join("projects", slug, "plans", "pa", "runs", "ra", n)
+             for n in (mkpaths.TASK_DOC_NAME, mkpaths.BOARD_DOC_NAME, mkpaths.EVENTS_DOC_NAME, mkpaths.RUN_DOC_NAME)]
+    pre = {rel: _sizes(os.path.join(home, rel)) for rel in want}
+    live_stay = [os.path.join("projects", slug, mkpaths.PROJECT_YAML_NAME), os.path.join("projects", slug, mkpaths.PROJECT_YAML_NAME + ".bak"),
+                 os.path.join("projects", alias, mkpaths.PROJECT_YAML_NAME), os.path.join("projects", alias, mkpaths.PROJECT_YAML_NAME + ".bak")]
+    stay_pre = {rel: _hash_file(os.path.join(home, rel)) for rel in live_stay}
+    before = _v2_hash(home, repo, repo2)
+    skip = (os.path.relpath(new_root, home), os.path.join("projects", slug, "legacy"))
+    before_skip, rows_pre = _hash_skip(home, repo, repo2, skip), _slugs_of(new_root)
+    # (3) dry run: changes nothing, lists the items
+    rc, out, err = retire("--slug", slug, "--dry-run")
+    d = doc(out)
+    _check(rc == 0 and d.get("dry_run") and sorted(d["moves"]) == sorted(want), f"{tag}: dry-run rc={rc} {sorted(set(d.get('moves', [])) ^ set(want))} {err[-200:]}")
+    _check(sorted(d["junk_rows"]) == sorted(RETIRE_JUNK), f"{tag}: dry-run junk rows {d['junk_rows']}")
+    _check(_v2_hash(home, repo, repo2) == before, f"{tag}: the dry run changed the tree")
+    _check(not os.path.exists(os.path.join(home, RETIRE_MARKER)), f"{tag}: the dry run wrote a marker")
+    # (4) apply
+    rc, out, err = retire("--slug", slug)
+    d = doc(out)
+    _check(rc == 0 and d.get("moved") == len(want), f"{tag}: retire rc={rc} {out[-400:]} {err[-300:]}")
+    backup = d["backup"]
+    _check(os.path.dirname(backup) == os.path.join(home, "backups") and os.path.basename(backup).startswith("retire-"), f"{tag}: backup {backup}")
+    with open(os.path.join(backup, "manifest.json")) as f:
+        man = json.load(f)
+    mani = {i["rel"]: [tuple(x) for x in i["files"]] for i in man["items"]}
+    for rel in want:
+        _check(not os.path.lexists(os.path.join(home, rel)), f"{tag}: {rel} is still in the live tree")
+        _check(_sizes(os.path.join(backup, rel)) == pre[rel] and mani.get(rel) == pre[rel], f"{tag}: backup/manifest of {rel} differ from the original")
+    _check(_hash_file(os.path.join(backup, os.path.relpath(old_root, home))) == old_sha[old_root]
+           and _hash_file(os.path.join(backup, os.path.relpath(old_proj, home))) == old_sha[old_proj], f"{tag}: old stores' sha256")
+    _check(os.path.isfile(new_root) and os.path.isfile(new_proj) and os.path.isfile(os.path.join(home, RETIRE_MARKER)), f"{tag}: new stores or marker missing")
+    for rel, sha in stay_pre.items():
+        _check(os.path.isfile(os.path.join(home, rel)) and _hash_file(os.path.join(home, rel)) == sha, f"{tag}: {rel} did not stay")
+    rows = _slugs_of(new_root)
+    _check(not set(RETIRE_JUNK) & set(rows) and {"zz-keep", "hermes", slug, alias} <= set(rows), f"{tag}: rows after retire {sorted(rows)}")
+    _check(sorted(r["slug"] for r in man["rows"]) == sorted(RETIRE_JUNK), f"{tag}: manifest rows")
+    _check(rows[alias]["db_path"] == new_proj and rows[alias]["mode"] == "managed", f"{tag}: alias row {rows[alias]}")
+    # (5) refusals while retired
+    mid = _v2_hash(home, repo, repo2)
+    rc, out, _ = retire("--slug", slug)
+    _check(rc == 3 and "already recorded" in out and _v2_hash(home, repo, repo2) == mid, f"{tag}: second retire rc={rc} {out[-200:]}")
+    rc, out, _ = _cli(home, ["--v2", "--home", home, "--rollback"])
+    _check(rc == 3 and "v2-retire is recorded" in out and _v2_hash(home, repo, repo2) == mid, f"{tag}: v2 rollback while retired rc={rc} {out[-200:]}")
+    # (6) the project archive tarball, then the layout audit
+    rc, out, err = _cli(home, ["--archive", "--home", home, "--slug", slug, "--data", data])
+    _check(rc == 0, f"{tag}: archive rc={rc} {out[-300:]} {err[-200:]}")
+    _check(any(n.endswith(".tar.gz") for n in os.listdir(os.path.join(tdir, "legacy"))), f"{tag}: no tarball")
+    audited = _v2_hash(home, repo, repo2)
+    ap = subprocess.run([sys.executable, os.path.join(HERE, "mk-e2e-layout.py"), "audit", "--home", home], capture_output=True, text=True, env=env)
+    bad = [r for r in (_last_json(ap.stdout) or {}).get("rules", []) if not r.get("pass")]
+    _check(ap.returncode == 0 and not bad, f"{tag}: audit rc={ap.returncode} failed={bad} {ap.stderr[-300:]}")
+    _check(_v2_hash(home, repo, repo2) == audited, f"{tag}: the audit changed the tree")
+    # (7) lanes: a migrated project's registry lock lives under <home>/locks, never in the project folder
+    lane = _load("mklane", os.path.join(HERE, "mk-lane.py"))
+    with _as_home(home):
+        lock = mkpaths.lanes_lock(data)
+        _check(os.path.dirname(lock) == os.path.join(home, "locks"), f"{tag}: lanes_lock {lock}")
+        for _ in range(2):         # an acquire and a release each take it
+            with lane.locked(data, 2):
+                pass
+    _check(os.path.isfile(lock) and not os.path.exists(os.path.join(tdir, "lanes.lock")), f"{tag}: lanes.lock location")
+    os.remove(lock)
+    # (8) a changed backup copy blocks the rollback, nothing moves; fixing the copy unblocks it
+    victim = os.path.join(backup, "config.json")
+    with open(victim, "rb") as f:
+        good = f.read()
+    with open(victim, "wb") as f:
+        f.write(good + b" ")
+    held = _v2_hash(home, repo, repo2)
+    rc, out, _ = retire("--rollback")
+    _check(rc == 3 and "differs from the manifest" in out and _v2_hash(home, repo, repo2) == held
+           and os.path.isfile(os.path.join(home, RETIRE_MARKER)), f"{tag}: altered backup rc={rc} {out[-200:]}")
+    with open(victim, "wb") as f:
+        f.write(good)
+    held = _v2_hash(home, repo, repo2)
+    # (9) retire rollback: the tree equals the state just before retire. The new root is compared by its rows (the
+    # rollback re-inserts the dropped ones, which rewrites the file), the archive tarball is not part of the retire.
+    rc, out, err = retire("--rollback", "--dry-run")
+    _check(rc == 0 and "restore config.json" in out and _v2_hash(home, repo, repo2) == held, f"{tag}: rollback dry run rc={rc}")
+    rc, out, err = retire("--rollback")
+    _check(rc == 0 and doc(out).get("rows") == len(RETIRE_JUNK), f"{tag}: rollback rc={rc} {out[-300:]} {err[-200:]}")
+    _check(_hash_skip(home, repo, repo2, skip) == before_skip, f"{tag}: the retire rollback did not restore the tree")
+    _check(_slugs_of(new_root) == rows_pre, f"{tag}: root rows after the retire rollback differ")
+    _check(not os.path.exists(os.path.join(home, RETIRE_MARKER)) and not [n for n in os.listdir(os.path.join(home, "backups")) if n.startswith("retire-")],
+           f"{tag}: marker or backup left after the rollback")
+    # (10) --v2 --rollback works again; carry-root's moves, the tarball and the retired-then-restored stray lock are
+    # outside what it undoes, so the stray lock is removed and the rest is compared with those paths skipped
+    os.remove(os.path.join(tdir, "other.yaml.lock"))
+    rc, out, err = _cli(home, ["--v2", "--home", home, "--rollback"])
+    _check(rc == 0, f"{tag}: v2 rollback rc={rc} {out[-400:]} {err[-300:]}")
+    _check(not os.path.exists(new_root) and not os.path.exists(new_proj) and not os.path.exists(mkpaths.mk_settings(home)), f"{tag}: new files survive the v2 rollback")
+    _check(_hash_skip(home, repo, repo2, v2_skip) == start_skip, f"{tag}: the v2 rollback did not restore the start (carry-root's moves and the tarball excluded)")
+    # (11) hermes: the whole sequence never touched its store, yaml or root row
+    _check(_v2_hash(repo2)[0] == hermes_hash, f"{tag}: the hermes folder changed")
+    _check(_row_of(old_root, "hermes") == hermes_row, f"{tag}: the hermes root row changed")
+    return tag
+
+
+def _retire_config_case(tmp):
+    """config.json holds a key mk-settings.yaml cannot carry: retire leaves it, and says why."""
+    fx = _retire_fixture(tmp, config={**V2_CONFIG_JSON, "other_toggle": 1})
+    home, slug = fx["home"], fx["slug"]
+    rc, out, err = _cli(home, ["--v2", "--home", home, "--slug", slug])
+    _check(rc == 0, f"retire-config: v2 rc={rc} {out[-300:]} {err[-200:]}")
+    rc, out, _ = _cli(home, ["--v2-retire", "--home", home, "--slug", slug, "--dry-run"])
+    d = _last_json(out) or {}
+    _check(rc == 0 and "config.json" not in d.get("moves", []) and any("other_toggle" in n for n in d.get("notes", [])), f"retire-config: dry run {out[-300:]}")
+    rc, out, _ = _cli(home, ["--v2-retire", "--home", home, "--slug", slug])
+    _check(rc == 0 and os.path.isfile(os.path.join(home, "config.json")), f"retire-config: retire rc={rc} {out[-200:]}")
+    _check(not os.path.exists(os.path.join(_last_json(out)["backup"], "config.json")), "retire-config: config.json was moved")
+    return "v2-retire-config-kept"
 
 
 def self_test():
@@ -2805,6 +3390,14 @@ def self_test():
         _check(rc2 == 2, f"v2 without --slug rc={rc2}")
         _check(_v2_hash(fx["home"], fx["repo"]) == start, "v2 refusals: the tree changed")
         ok("v2-refusals")
+        shutil.rmtree(v2tmp, ignore_errors=True)
+
+        # L10.Y: the whole sequence on a home that mirrors the real layout, then the config.json refusal case
+        v2tmp = tempfile.mkdtemp(prefix="mk-v2-", dir=tmp)
+        ok(_retire_rehearse(_retire_fixture(v2tmp)))
+        shutil.rmtree(v2tmp, ignore_errors=True)
+        v2tmp = tempfile.mkdtemp(prefix="mk-v2-", dir=tmp)
+        ok(_retire_config_case(v2tmp))
         shutil.rmtree(v2tmp, ignore_errors=True)
 
     finally:
