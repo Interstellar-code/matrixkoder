@@ -783,7 +783,7 @@ def _remove_new_copy(home, slug):
     """Remove ONLY what the C2 copy owns: its DB and the files a copy writes. `legacy/` (a user
     archive) and the switch marker are never removed. The old folder and old DB are untouched."""
     tdir = target_dir(home, slug)
-    dbname = mkpaths.ROOT_DB_NAME
+    dbname = os.path.basename(mkpaths.target_project_db(slug, home))  # the file the copy wrote (new or legacy name)
     for name in (dbname, dbname + "-wal", dbname + "-shm", mkpaths.PROJECT_YAML_NAME, mkpaths.CURSORS_NAME,
                  mkpaths.LANES_NAME, "plans"):
         p = os.path.join(tdir, name)
@@ -1192,6 +1192,24 @@ def _seed(home, data, repo, *, busy=False, ask=False):
     return plan_bytes
 
 
+class _as_home:
+    """Point this process's MK home at `home` for a block: mkpaths picks mk-overview.db for a fresh
+    ROOT only when the folder IS the process's home, so a second temp home read in-process needs it."""
+    def __init__(self, home):
+        self.home = home
+
+    def __enter__(self):
+        self.saved = {k: os.environ.get(k) for k in ("MK_HOME", "MATRIXKODER_HOME")}
+        os.environ.update({"MK_HOME": self.home, "MATRIXKODER_HOME": self.home})
+
+    def __exit__(self, *exc):
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 def _cli(home, args, env=None):
     e = dict(os.environ)
     e.update({"MK_HOME": home, "MATRIXKODER_HOME": home, "MK_SELFTEST": "1"})
@@ -1393,7 +1411,7 @@ def self_test():
         carried_counts = state_of(dest_db)[0]
         # L10.1: while switched the data form follows to the C2 store, and rollback still reads the old one
         _check(mkpaths.project_db(data=data) == dest_db, "the data form did not follow the switch")
-        _check(src_db(data) == os.path.join(data, mkpaths.ROOT_DB_NAME), "rollback source is not the legacy store")
+        _check(src_db(data) == mkpaths.db_in(data), "rollback source is not the legacy store")
         rc, out, err = _cli(home, ["--rollback", "--slug", "fixture", "--data", data])
         _check(rc == 0, f"clean rollback rc={rc} {err[-400:]}")
         _check(root_row(home, "fixture")["db_path"] is None, "rollback left db_path set")
@@ -1898,6 +1916,8 @@ def self_test():
         z7_repo = os.path.join(tmp, "z7-repo")
         z7_data = os.path.join(z7_repo, ".matrixkoder")
         z7_home = os.path.join(tmp, "z7-home")
+        _z7_env = _as_home(z7_home)
+        _z7_env.__enter__()
         _seed(z7_home, z7_data, z7_repo)
         z7_alias = "p" + hashlib.sha256(os.path.realpath(z7_data).encode()).hexdigest()[:16]
         _root_rows_set(z7_home, [(z7_alias, z7_data)])
@@ -1914,6 +1934,7 @@ def self_test():
                "the 12e dry-run rollback cleared the alias row")
         shutil.rmtree(mkpaths.target_project_dir("fixture", z7_home), ignore_errors=True)
         clear_db_path(z7_home, [z7_alias, "fixture"])
+        _z7_env.__exit__()
         ok("dry-run-names-only-what-it-would-change")
 
         # 13. Z15 (todo: R02): a plan approved BEFORE the switch must still land in its plan

@@ -51,6 +51,7 @@ def _load(name, path):
 
 
 mkpaths = _load("mkpaths", os.path.join(HERE, "mkpaths.py"))  # C1: the one path module
+STORE_NAMES = (mkpaths.ROOT_DB_NAME, mkpaths.PROJECT_DB_NAME, mkpaths.LEGACY_DB_NAME)  # a store file under any of its names (L10.13)
 mkdb = _load("mkdb", os.path.join(HERE, "mkdb.py"))           # the only SQLite writer
 mkstate = _load("mk_state", os.path.join(HERE, "mk-state.py"))
 livetest = _load("mk_livetest", os.path.join(HERE, "mk-livetest.py"))
@@ -240,7 +241,7 @@ def _real_projects_rows():
     """The real home's temp-pointing projects rows, read-only, as 'slug -> data'
     strings. Snapshot for R15: only rows the run ADDED are a leak."""
     real = _default_home()
-    db = mkpaths.db_in(real)
+    db = mkpaths.root_db_in(real)
     if not os.path.isfile(db):
         return []
     con = sqlite3.connect("file:" + db + "?mode=ro", uri=True)
@@ -635,7 +636,7 @@ def do_run(slug="e2e", keep=False):
         # (f) migrate while the run is still ACTIVE: C5 moves the files of live plans, so
         # switching here is what puts the run tree under the C2 plan folder at all — and it
         # is the state the bus archive (C6) then writes into.
-        legacy_db = mkpaths.db_in(data)
+        legacy_db = mkpaths.project_db_in(data)
         legacy_before = _store_digest(legacy_db)
         # the dry-run's own move list is kept: it is the evidence for what C5 did and did not
         # carry into the C2 plan folder
@@ -700,7 +701,7 @@ def do_run(slug="e2e", keep=False):
         "slug": slug, "slug_pre_migration": slug_b, "pre_migration_data": data_b,
         "plan": plan_id, "plan_file": plan_path, "run": run,
         "data": data, "new_project_db": new_db, "legacy_project_db": legacy_db,
-        "root_db": mkpaths.db_in(home),
+        "root_db": mkpaths.root_db_in(home),
         "messages": sum(len(v["ids"]) for v in lane_msgs.values()),
         "bus_archive": bool(archive and archive.get("ok")),
         "legacy_unchanged": legacy_before == legacy_after,
@@ -795,7 +796,7 @@ def build_rules():
         # C5: the legacy <data>/mk.db of a migrated project is the frozen pre-switch copy
         # until --archive runs, so it is expected too.
         found = sorted(_rel(ctx, os.path.join(ctx["root"], p)) for p in _all_mkdb(ctx["root"]))
-        want = {_rel(ctx, mkpaths.db_in(ctx["home"]))}
+        want = {_rel(ctx, mkpaths.root_db_in(ctx["home"]))}
         by_data = {}
         for slug in ctx["known"]:
             data = ctx["data_of"].get(slug)
@@ -810,9 +811,9 @@ def build_rules():
                 continue
             if len(paths) == 1:
                 want.add(_rel(ctx, paths.pop()))
-                want.add(_rel(ctx, mkpaths.db_in(data)))  # legacy frozen copy
+                want.add(_rel(ctx, mkpaths.project_db_in(data)))  # legacy frozen copy
             else:
-                want.add(_rel(ctx, mkpaths.db_in(data)))
+                want.add(_rel(ctx, mkpaths.project_db_in(data)))
         stray = sorted(p for p in found if p not in want)
         missing = sorted(p for p in want if p not in found)
         ok = not stray and not missing and not bad
@@ -886,7 +887,7 @@ def build_rules():
         bad, plans = [], 0
         for slug, data in sorted(ctx["data_of"].items()):
             live = ctx["live_dir"].get(slug, data)
-            if not live or not os.path.isfile(mkpaths.db_in(live)):
+            if not live or not os.path.isfile(mkpaths.project_db_in(live)):
                 continue
             mine = run_tool("mkdb.py", "plans", "--json", "--data", live,
                             home=ctx["home"], timeout=60)
@@ -989,7 +990,7 @@ def build_rules():
         for data, slugs in sorted(by_data.items()):
             new_db = ctx["db_paths"].get(slugs[0])
             if not new_db or not os.path.isfile(new_db):
-                bad.append(f"no NEW store at {_rel(ctx, new_db or mkpaths.db_in(data))}")
+                bad.append(f"no NEW store at {_rel(ctx, new_db or mkpaths.project_db_in(data))}")
                 continue
             if _store_digest(new_db) == ctx["new_store_before"].get(slugs[0]):
                 bad.append(f"{_rel(ctx, new_db)} did not change after the switch")
@@ -1001,7 +1002,7 @@ def build_rules():
             (f"; wrong {bad}" if bad else ""), bad
 
     def r12(ctx):
-        root_db = mkpaths.db_in(ctx["home"])
+        root_db = mkpaths.root_db_in(ctx["home"])
         bad = []
         tables = _tables(root_db)
         for name in ("tasks", "events"):
@@ -1024,7 +1025,7 @@ def build_rules():
         bad = []
         for rel in _walk(ctx["home"]):
             base = os.path.basename(rel)
-            if base in (mkpaths.ROOT_DB_NAME,) or base.endswith(("-wal", "-shm")):
+            if base in STORE_NAMES or base.endswith(("-wal", "-shm")):
                 continue
             if os.path.splitext(base)[1] in (".db", ".sqlite", ".sqlite3"):
                 # the one whitelist: `mk-state run archive`'s VACUUM INTO backup
@@ -1119,7 +1120,7 @@ def build_rules():
 def _all_mkdb(home):
     out = []
     for rel in _walk(home):
-        if os.path.basename(rel) == mkpaths.ROOT_DB_NAME:
+        if os.path.basename(rel) in STORE_NAMES:
             out.append(os.path.join(home, rel))
     return sorted(out)
 
@@ -1257,14 +1258,16 @@ def teardown(home, quiet=False):
 # Legitimate on a real home today (L10.14 R2): config.json (kept until migrate-settings), bus-tokens.json and
 # bus-lanes/ (kept by root-cleanup for the old token place), projects.json (still READ as the last fallback),
 # backups/ (named backups by design, never scanned inside) and mk.db.bak-* (handled by prefix below).
-AUDIT_HOME_FILES = {mkpaths.ROOT_DB_NAME, mkpaths.ROOT_DB_NAME + "-wal", mkpaths.ROOT_DB_NAME + "-shm",
+AUDIT_ROOT_STORES = (mkpaths.ROOT_DB_NAME, mkpaths.LEGACY_DB_NAME)      # a ROOT store: new name or kept legacy
+AUDIT_PROJECT_STORES = (mkpaths.PROJECT_DB_NAME, mkpaths.LEGACY_DB_NAME)  # a PROJECT store: new name or kept legacy
+AUDIT_HOME_FILES = {n + suf for n in AUDIT_ROOT_STORES for suf in ("", "-wal", "-shm")} | {
                     mkpaths.MK_SETTINGS_NAME, "usage.json", "usage.json.lock", "config.json",
                     "bus-tokens.json", mkpaths.PROJECTS_JSON}
 AUDIT_HOME_DIRS = {mkpaths.TARGET_BUS_DIR, "locks", mkpaths.TARGET_PROJECTS_DIR, "inbox", "backups",
                    mkpaths.BUS_LANES_DIR}
-AUDIT_BAK_PREFIX = mkpaths.ROOT_DB_NAME + ".bak-"
+AUDIT_BAK_PREFIXES = tuple(n + ".bak-" for n in AUDIT_ROOT_STORES)
 # `.migrate.json` is mk-migrate's marker; `runs/` holds mk-state's per-project flock (runs/.lock)
-AUDIT_PROJECT_FILES = {mkpaths.ROOT_DB_NAME, mkpaths.ROOT_DB_NAME + "-wal", mkpaths.ROOT_DB_NAME + "-shm",
+AUDIT_PROJECT_FILES = {n + suf for n in AUDIT_PROJECT_STORES for suf in ("", "-wal", "-shm")} | {
                        mkpaths.PROJECT_YAML_NAME, mkpaths.PROJECT_YAML_NAME + ".lock", mkpaths.PROJECT_YAML_NAME + ".bak",
                        ".migrate.json"}
 AUDIT_PROJECT_DIRS = {mkpaths.TARGET_PLANS_DIR, "archive", "runs"}
@@ -1307,7 +1310,7 @@ def _audit_tree_rules(home):
     names, forbidden = [], []
     top_files, top_scan_dirs = _audit_scan(home)
     lane_dirs = {n for n in top_scan_dirs if n.startswith("lane-")} if harness else set()  # `run`'s lane fixtures
-    baks = {n for n in top_files if n.startswith(AUDIT_BAK_PREFIX)}
+    baks = {n for n in top_files if n.startswith(AUDIT_BAK_PREFIXES)}
     _, top_dirs = _audit_names(home, "", AUDIT_HOME_FILES | extra | baks, AUDIT_HOME_DIRS | lane_dirs, names)
     proj_root = mkpaths.TARGET_PROJECTS_DIR
     if proj_root in top_dirs:
@@ -1350,9 +1353,10 @@ def _audit_tree_rules(home):
                 tree.append(rel + ("/" if n in dirnames else ""))
             low = n.lower()
             is_db = low.endswith((".db", ".sqlite", ".sqlite3"))
-            ok_db = (n == mkpaths.ROOT_DB_NAME and (rel_dir == "." or os.path.dirname(rel_dir) == proj_root)
+            ok_db = (((n in AUDIT_ROOT_STORES and rel_dir == ".")
+                      or (n in AUDIT_PROJECT_STORES and os.path.dirname(rel_dir) == proj_root))
                      and rel_dir.count(os.sep) <= 1) or os.path.basename(rel_dir) == "archive"
-            allowed_root = rel_dir == "." and (n == mkpaths.PROJECTS_JSON or n.startswith(AUDIT_BAK_PREFIX))
+            allowed_root = rel_dir == "." and (n == mkpaths.PROJECTS_JSON or n.startswith(AUDIT_BAK_PREFIXES))
             if (n in AUDIT_FORBIDDEN and n not in dirnames and not allowed_root) or (is_db and not ok_db and not allowed_root):
                 forbidden.append(rel)
     return tree, names, sorted(set(forbidden))
@@ -1377,7 +1381,7 @@ def _audit_copy(db, tmp, n):
     shutil.copy2(db, dst)
     if os.path.isfile(db + "-wal"):
         shutil.copy2(db + "-wal", dst + "-wal")
-    con = sqlite3.connect(dst)
+    con = sqlite3.connect(dst)  # RO_AUDIT: a private copy in tmp, never the original store
     con.row_factory = sqlite3.Row
     return con
 
@@ -1428,19 +1432,20 @@ def do_audit(home=None):
         fresh_proj = mkdb.open_project(fresh, "audit-fresh")
         want_proj = _audit_tables(fresh_proj)
         fresh_proj.close()
-        root_db = mkpaths.db_in(home)
+        root_db = mkpaths.root_db_in(home)
+        root_key = os.path.basename(root_db)
         bad_t, bad_v, bad_link, bad_over, bad_cnt, bad_tok = [], [], [], [], [], []
         info_link, info_tok = [], []
         root = None
         if os.path.isfile(root_db):
             root = _audit_copy(root_db, tmp, "root")
         else:
-            bad_link.append("mk.db (no root store at the home root)")
+            bad_link.append(f"{os.path.basename(root_db)} (no root store at the home root)")
         slugs, rows = set(), []
         if root is not None:
-            tables_out["mk.db"] = sorted(_audit_tables(root))
-            schema_out["mk.db"] = _audit_version(root)
-            if "projects" in tables_out["mk.db"]:
+            tables_out[root_key] = sorted(_audit_tables(root))
+            schema_out[root_key] = _audit_version(root)
+            if "projects" in tables_out[root_key]:
                 rows = [dict(r) for r in root.execute("SELECT slug, data_dir, db_path FROM projects")]
             slugs = {r["slug"] for r in rows}
         # every project store: those the root rows name, plus any projects/<x>/mk.db on disk
@@ -1451,7 +1456,7 @@ def do_audit(home=None):
         proj_dir = os.path.join(home, mkpaths.TARGET_PROJECTS_DIR)
         folders = sorted(os.listdir(proj_dir)) if os.path.isdir(proj_dir) else []
         for d in folders:
-            db = mkpaths.db_in(os.path.join(proj_dir, d))
+            db = mkpaths.project_db_in(os.path.join(proj_dir, d))
             if os.path.isfile(db):
                 stores.setdefault(os.path.realpath(db), [])
         for r in rows:
@@ -1460,8 +1465,8 @@ def do_audit(home=None):
         row_dbs = {os.path.realpath(r["db_path"]) for r in rows if r["db_path"]}
         for d in folders:
             full = os.path.realpath(os.path.join(proj_dir, d))
-            if os.path.isdir(full) and os.path.realpath(mkpaths.db_in(full)) not in row_dbs:
-                if os.path.isfile(mkpaths.db_in(full)):
+            if os.path.isdir(full) and os.path.realpath(mkpaths.project_db_in(full)) not in row_dbs:
+                if os.path.isfile(mkpaths.project_db_in(full)):
                     bad_link.append(f"{mkpaths.TARGET_PROJECTS_DIR}/{d} has no projects row (holds a stray mk.db)")
                 else:
                     # no row and no store: the root-cleanup alias folder, kept while bus tokens carry its slug
@@ -1487,13 +1492,13 @@ def do_audit(home=None):
             if schema_out[name] != mkdb.SCHEMA:
                 bad_v.append(f"{name} schema_version {schema_out[name]} != {mkdb.SCHEMA}")
         if root is not None:
-            have = set(tables_out["mk.db"])
+            have = set(tables_out[root_key])
             for t in sorted(want_root - have):
-                bad_t.append(f"mk.db is missing table {t}")
+                bad_t.append(f"{root_key} is missing table {t}")
             for t in sorted(have - want_root - AUDIT_ROOT_CATALOG_TABLES):
-                bad_t.append(f"mk.db has extra table {t}")
-            if schema_out["mk.db"] != mkdb.ROOT_SCHEMA:
-                bad_v.append(f"mk.db schema_version {schema_out['mk.db']} != {mkdb.ROOT_SCHEMA}")
+                bad_t.append(f"{root_key} has extra table {t}")
+            if schema_out[root_key] != mkdb.ROOT_SCHEMA:
+                bad_v.append(f"{root_key} schema_version {schema_out[root_key]} != {mkdb.ROOT_SCHEMA}")
         add("A02", "each DB has exactly the table set of a fresh store", bad_t,
             f"{len(tables_out)} DBs")
         add("A03", "each DB carries the current schema_version", bad_v,
@@ -1509,7 +1514,7 @@ def do_audit(home=None):
                         plans_of.setdefault(db, set()).add(pid)
                         counts_of[(db, pid)] = json.loads(counts_json or "{}")
         summary = []
-        if root is not None and "plan_summary" in tables_out["mk.db"]:
+        if root is not None and "plan_summary" in tables_out[root_key]:
             summary = [dict(r) for r in root.execute("SELECT project, plan, counts_json FROM plan_summary")]
         db_of_slug = {r["slug"]: os.path.realpath(r["db_path"]) for r in rows if r["db_path"]}
         seen = set()
@@ -1636,7 +1641,7 @@ def _fixture(ctx_skel):
         con.execute("INSERT INTO projects(slug, name, repo, data_dir, mode, db_path, created)"
                     " VALUES (?,?,?,?,?,?,?)",
                     (slug, slug, os.path.realpath(repo), data, "home",
-                     mkpaths.db_in(data), "e2e"))
+                     mkpaths.project_db_in(data), "e2e"))
         con.execute("INSERT INTO projects(slug, name, repo, data_dir, mode, db_path, created)"
                     " VALUES (?,?,?,?,?,?,?)",
                     (slug_b, slug_b, os.path.realpath(scratch), data_b, "home", None, "e2e"))
@@ -1837,7 +1842,7 @@ def audit_self_test():
         _check(rep["home_changed_during_audit"] == [], f"home changed: {rep['home_changed_during_audit']}")
         _check(_audit_exit(f["home"]) == 0, "audit exit code on a clean home is not 0")
         _check({r["id"] for r in rep["rules"]} == {f"A0{i}" for i in range(1, 9)}, "rule ids drifted")
-        _check("mk.db" in rep["tables"] and "projects/fix/mk.db" in rep["tables"], f"tables: {list(rep['tables'])}")
+        _check(mkpaths.ROOT_DB_NAME in rep["tables"] and f"projects/fix/{mkpaths.PROJECT_DB_NAME}" in rep["tables"], f"tables: {list(rep['tables'])}")
         _check(any(t.startswith("projects/fix/") for t in rep["tree"]), "tree lacks the project folder")
     finally:
         shutil.rmtree(f["root"], ignore_errors=True)
@@ -1913,7 +1918,7 @@ def _mutations(_unused):
 
     @m("R01", "a stray mk.db under the temp root", "fix-stray/mk.db")
     def _(f):
-        stray = mkpaths.db_in(os.path.join(f["home"], "projects", f["slug"] + "-stray"))
+        stray = mkpaths.legacy_db_in(os.path.join(f["home"], "projects", f["slug"] + "-stray"))
         os.makedirs(os.path.dirname(stray))
         with open(stray, "w", encoding="utf-8") as fh:
             fh.write("not a store")
@@ -2082,7 +2087,7 @@ def _mutations(_unused):
             con.execute("INSERT INTO projects(slug, name, repo, data_dir, mode, db_path, created)"
                         " VALUES (?,?,?,?,?,?,?)",
                         (f["slug"] + "-alias", f["slug"] + "-alias", os.path.realpath(f["repo"]),
-                         f["data"], "home", mkpaths.db_in(os.path.join(f["home"], "projects", f["slug"] + "-alias")),
+                         f["data"], "home", mkpaths.project_db_in(os.path.join(f["home"], "projects", f["slug"] + "-alias")),
                          "e2e"))
             con.commit()
         finally:
@@ -2090,7 +2095,7 @@ def _mutations(_unused):
 
     @m("R01", "a missing second project store", "fixb")
     def _(f):
-        os.unlink(mkpaths.db_in(f["data_b"]))
+        os.unlink(mkpaths.project_db_in(f["data_b"]))
     return out
 
 
@@ -2151,7 +2156,7 @@ def self_test():
                 ("pf3", "/tmp/x", None),                 # the literal /tmp spelling
                 ("pf4", tmp_lit + "/x", None),           # gettempdir() spelled out
                 ("pf5", "/tmpfoo/x", None),              # NOT a temp root
-                ("pf6", None, mkpaths.db_in("/private/tmp/y"))]   # db_path counts, not only data_dir
+                ("pf6", None, mkpaths.project_db_in("/private/tmp/y"))]   # db_path counts, not only data_dir
         con = mkdb.open_root(f["home"])    # the one SQLite writer (single-writer rule)
         try:
             for slug, data, dbp in rows:

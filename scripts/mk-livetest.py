@@ -146,7 +146,7 @@ def setup(slug="lt"):
     proj.close()
     _write_marker(parent, home, repo)
     return {"ok": True, "home": home, "repo": repo, "data": data, "slug": slug,
-            "root_db": mkpaths.db_in(home), "project_db": mkpaths.db_in(data),
+            "root_db": mkpaths.root_db_in(home), "project_db": mkpaths.project_db_in(data),
             "marker": _marker_path(home)}
 
 
@@ -272,7 +272,7 @@ def _pragmas(con):
 
 
 def row_c1_create(ctx):
-    db = mkpaths.db_in(_need(ctx)["home"])
+    db = mkpaths.root_db_in(_need(ctx)["home"])
     if not os.path.isfile(db):
         raise Fail("root store missing")
     con = mkdb.open_root(ctx["home"])
@@ -283,7 +283,7 @@ def row_c1_create(ctx):
 
 
 def row_c2_create(ctx):
-    db = mkpaths.db_in(_need(ctx)["data"])
+    db = mkpaths.project_db_in(_need(ctx)["data"])
     if not os.path.isfile(db):
         raise Fail("project store missing")
     con = mkdb.open_project(ctx["home"], data_dir=ctx["data"])
@@ -571,7 +571,7 @@ def _plan_project(ctx):
     """
     slug = "ltplan"
     data = os.path.join(ctx["home"], "projects", slug)
-    if not os.path.isfile(mkpaths.db_in(data)):
+    if not os.path.isfile(mkpaths.project_db_in(data)):
         mkdb.open_project(ctx["home"], slug).close()
         root = mkdb.open_root(ctx["home"])
         try:
@@ -947,7 +947,7 @@ def _second_project(ctx):
     """A second scratch project under the same temp home, registered in the root store."""
     slug = "ltb"
     data = os.path.join(ctx["home"], "projects", slug)
-    if not os.path.isfile(mkpaths.db_in(data)):
+    if not os.path.isfile(mkpaths.project_db_in(data)):
         con = mkdb.open_project(ctx["home"], slug)
         con.close()
         root = mkdb.open_root(ctx["home"])
@@ -967,7 +967,7 @@ def _bus_project(ctx):
     one (`p` + hash) and registers it, so the `lt` row setup wrote is not it."""
     import sqlite3
     from urllib.parse import quote
-    db = mkpaths.db_in(ctx["home"])
+    db = mkpaths.root_db_in(ctx["home"])
     con = sqlite3.connect("file:" + quote(db) + "?mode=ro", uri=True)
     try:
         row = con.execute("SELECT slug FROM projects WHERE data_dir=?",

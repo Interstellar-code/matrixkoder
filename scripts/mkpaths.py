@@ -47,12 +47,20 @@ def _name(env, default):
     return v
 
 
-ROOT_DB_NAME = _name("MK_NAME_ROOT_DB", "mk.db")
+# L10.13: new homes name their stores mk-overview.db (root) and mk-project.db (project). A store that already
+# exists under the legacy name `mk.db` keeps being used under that name until migrate v2 renames it (L10.8):
+# the live home must not move under running processes. Rule, one place (`_resolve_db`): the new-name file if it
+# exists, else an existing legacy `mk.db`, else (nothing on disk) the new name. Never rename, never create a
+# new-name file beside an old one. LEGACY_DB_NAME is deliberately not overridable: it is the name on disk.
+ROOT_DB_NAME = _name("MK_NAME_ROOT_DB", "mk-overview.db")
+PROJECT_DB_NAME = _name("MK_NAME_PROJECT_DB", "mk-project.db")
+LEGACY_DB_NAME = "mk.db"
 PROJECTS_JSON = "projects.json"
 USAGE_LEDGER = "usage.json"
 MK_SETTINGS_NAME = _name("MK_NAME_SETTINGS", "mk-settings.yaml")
 # L10.12a: the file names a caller joins onto a folder it already holds (no migrated lookup, no home rule)
-DB_FILE_NAMES = (ROOT_DB_NAME, ROOT_DB_NAME + "-wal", ROOT_DB_NAME + "-shm")
+DB_FILE_NAMES = tuple(n + suf for n in (ROOT_DB_NAME, PROJECT_DB_NAME, LEGACY_DB_NAME) for suf in ("", "-wal", "-shm"))
+# ^ every store file a folder can hold (new root, new project, legacy), each with its WAL sidecars
 LEGACY_YAML_NAME = _name("MK_NAME_LEGACY_YAML", "matrixkoder.yaml")
 PROJECT_YAML_NAME = _name("MK_NAME_PROJECT_YAML", "project.yaml")
 RUN_DOC_NAME = _name("MK_NAME_RUN_DOC", "run.json")
@@ -189,9 +197,32 @@ def _query(path, sql, args=()):
         con.close()
 
 
+def _resolve_db(folder, kind):
+    """The store file inside `folder` for kind 'root' | 'project' (L10.13): the new-name file when it exists,
+    else an existing legacy `mk.db`, else (a fresh folder) the new name. When BOTH exist the new name wins:
+    only a deliberate step (migrate v2, a fresh home) creates it, and the legacy file is then the frozen
+    pre-migration copy. Read-only: nothing is created, renamed or moved."""
+    new = os.path.join(folder, ROOT_DB_NAME if kind == "root" else PROJECT_DB_NAME)
+    if os.path.isfile(new):
+        return new
+    old = os.path.join(folder, LEGACY_DB_NAME)
+    return old if os.path.isfile(old) else new
+
+
+def _kind_of(folder):
+    """'root' when `folder` is the MK home (or the pinned bus home), else 'project'. Only a fresh folder needs
+    this: an existing store is found by its own name."""
+    try:
+        real = os.path.realpath(os.path.abspath(folder))
+        return "root" if real in {os.path.realpath(home()), os.path.realpath(root_home())} else "project"
+    except (Fail, OSError):
+        return "project"
+
+
 def root_db(arg=None):
-    """The root overview store: <home>/mk.db (C3). A read never creates it."""
-    return os.path.join(home(arg), ROOT_DB_NAME)
+    """The root overview store: <home>/mk-overview.db on a new home, the existing <home>/mk.db on a home that
+    has one (C3, L10.13). A read never creates it."""
+    return _resolve_db(home(arg), "root")
 
 
 def bus_env_dir():
@@ -208,14 +239,39 @@ def root_home():
 
 
 def db_in(folder):
-    """<folder>/mk.db: the store file of a folder the caller already resolved. A plain join: no home
-    rule, no migrated lookup (`project_db` and `root_db` are the resolving forms)."""
-    return os.path.join(folder, ROOT_DB_NAME)
+    """The store file of a folder the caller already resolved (no home rule, no migrated lookup:
+    `project_db` and `root_db` are the resolving forms). An existing file keeps its name (see `_resolve_db`);
+    a fresh folder gets mk-overview.db when it is the MK home, else mk-project.db."""
+    return _resolve_db(folder, _kind_of(folder))
+
+
+def root_db_in(folder):
+    """The root store file of `folder` (kind explicit: no guess from the MK home). Existing files keep their name."""
+    return _resolve_db(folder, "root")
+
+
+def project_db_in(folder):
+    """The project store file of `folder` (kind explicit). Existing files keep their name."""
+    return _resolve_db(folder, "project")
 
 
 def db_files_in(folder):
-    """The store file and its two WAL sidecars inside `folder`, in DB_FILE_NAMES order."""
-    return [os.path.join(folder, n) for n in DB_FILE_NAMES]
+    """The store file of `folder` and its two WAL sidecars."""
+    db = db_in(folder)
+    return [db, db + "-wal", db + "-shm"]
+
+
+def legacy_db_in(folder):
+    """<folder>/mk.db, literally: the OLD name, for mk-migrate to name the file it migrates away from."""
+    return os.path.join(folder, LEGACY_DB_NAME)
+
+
+def new_db_in(folder, kind):
+    """The NEW-name store path of `folder` for kind 'root' | 'project', whether or not it exists: the
+    target a migration writes to."""
+    if kind not in ("root", "project"):
+        raise Fail(f"new_db_in: kind is root or project, not {kind!r}")
+    return os.path.join(folder, ROOT_DB_NAME if kind == "root" else PROJECT_DB_NAME)
 
 
 def legacy_yaml(folder):
@@ -320,7 +376,7 @@ def project_data_dir(slug, root=None):
     `root` names the root store's home (default: `root_home()`), so a caller with an explicit
     --home reads that store rather than the ambient one.
     """
-    row = _query(os.path.join(root or root_home(), ROOT_DB_NAME),
+    row = _query(_resolve_db(root or root_home(), "root"),
                  "SELECT data_dir FROM projects WHERE slug=?", (slug,))
     if not row or not isinstance(row["data_dir"], str) or not row["data_dir"].strip():
         return None
@@ -361,7 +417,7 @@ def project_slug_of(data_dir, root=None):
     """
     real = os.path.realpath(data_dir)
     root_dir = os.path.realpath(os.path.abspath(os.path.expanduser(root or root_home())))
-    con = _open_root_ro(os.path.join(root_dir, ROOT_DB_NAME))
+    con = _open_root_ro(_resolve_db(root_dir, "root"))
     if con is None:
         return None
     try:
@@ -395,7 +451,7 @@ def _root_signature(root=None):
     is memoised against this stamp instead of hitting SQLite each call. A switch rewrites the root
     mk.db (mk-migrate's UPDATE), which moves mtime/size and drops the memo.
     """
-    path = os.path.join(root or root_home(), ROOT_DB_NAME)
+    path = _resolve_db(root or root_home(), "root")
     try:
         st = os.stat(path)
     except OSError:
@@ -500,7 +556,7 @@ def project_db(slug=None, data=None, legacy=False):
     if data:
         data = os.path.abspath(os.path.expanduser(data))
         migrated = None if legacy else migrated_slug(data=data)
-        return db_path_of(slug=migrated) if migrated else os.path.join(data, ROOT_DB_NAME)
+        return db_path_of(slug=migrated) if migrated else _resolve_db(data, "project")
     if not slug:
         raise Fail("project_db needs a slug or a data dir")
     target = db_path_of(slug=slug)
@@ -509,7 +565,7 @@ def project_db(slug=None, data=None, legacy=False):
     data_dir_of_slug = project_data_dir(slug)
     if not data_dir_of_slug:
         return None
-    return os.path.join(data_dir_of_slug, ROOT_DB_NAME)
+    return _resolve_db(data_dir_of_slug, "project")
 
 
 def project_dir(home_arg=None, slug=None, data_dir=None, legacy=False):
@@ -881,7 +937,8 @@ def target_project_dir(slug, arg=None):
 
 
 def target_project_db(slug, arg=None):
-    return os.path.join(target_project_dir(slug, arg), ROOT_DB_NAME)
+    """The C2 project store: an existing file keeps its name, a fresh project gets mk-project.db."""
+    return _resolve_db(target_project_dir(slug, arg), "project")
 
 
 def target_project_yaml(slug, arg=None):
@@ -1166,11 +1223,94 @@ def self_test():
             raise Fail(f"self-test: inbox_dir accepted plan id {bad!r}")
         _clear_home_env()
 
+    def t_db_names(tmp_home):
+        """L10.13: the four states of a home / project folder, the kind rule, the legacy and NEW forms, and the
+        rule that a read never creates, renames or moves a file."""
+        _clear_home_env()
+        os.environ["MK_HOME"] = os.environ["MATRIXKODER_HOME"] = tmp_home
+        base = os.path.join(root, "dbnames")
+
+        def touch(path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            open(path, "w").close()
+
+        def listing(d):
+            return sorted(os.listdir(d)) if os.path.isdir(d) else []
+
+        # the names themselves
+        _check((ROOT_DB_NAME, PROJECT_DB_NAME, LEGACY_DB_NAME) == ("mk-overview.db", "mk-project.db", "mk.db"), "names")
+        _check(set(DB_FILE_NAMES) == {n + x for n in ("mk-overview.db", "mk-project.db", "mk.db") for x in ("", "-wal", "-shm")}, DB_FILE_NAMES)
+        for kind, fn, new in (("root", lambda d: _resolve_db(d, "root"), "mk-overview.db"),
+                              ("project", lambda d: _resolve_db(d, "project"), "mk-project.db")):
+            d = os.path.join(base, kind + "-fresh")  # fresh (no folder, no file): the NEW name
+            _check(fn(d) == os.path.join(d, new), fn(d))
+            d = os.path.join(base, kind + "-old")  # old only: the existing mk.db keeps resolving
+            touch(os.path.join(d, "mk.db"))
+            _check(fn(d) == os.path.join(d, "mk.db"), fn(d))
+            _check(listing(d) == ["mk.db"], listing(d))  # nothing created beside it
+            d = os.path.join(base, kind + "-new")  # new only
+            touch(os.path.join(d, new))
+            _check(fn(d) == os.path.join(d, new), fn(d))
+            d = os.path.join(base, kind + "-both")  # both: the new name wins (only a deliberate step makes it)
+            touch(os.path.join(d, "mk.db"))
+            touch(os.path.join(d, new))
+            _check(fn(d) == os.path.join(d, new), fn(d))
+            _check(listing(d) == sorted(["mk.db", new]), listing(d))
+        # the project file must not be mistaken for the root one, and the other way round
+        d = os.path.join(base, "cross")
+        touch(os.path.join(d, "mk-project.db"))
+        _check(_resolve_db(d, "root") == os.path.join(d, "mk-overview.db"), _resolve_db(d, "root"))
+        # the explicit-kind forms never guess: a root dir that is NOT the process home is still a root store
+        other = os.path.join(base, "other-home")
+        _check(root_db_in(other) == os.path.join(other, "mk-overview.db") and project_db_in(other) == os.path.join(other, "mk-project.db"), "explicit kinds")
+        _check(db_in(other) == os.path.join(other, "mk-project.db"), "db_in guesses project for a non-home folder")
+        touch(os.path.join(other, "mk.db"))
+        _check(root_db_in(other) == project_db_in(other) == os.path.join(other, "mk.db"), "existing legacy store found by either kind")
+        # kind rule for db_in: the MK home is root, any other folder is project
+        _check(db_in(tmp_home) == os.path.join(tmp_home, "mk-overview.db"), db_in(tmp_home))
+        _check(root_db() == db_in(tmp_home) == root_db(tmp_home), root_db())
+        _check(db_in(os.path.join(base, "elsewhere")) == os.path.join(base, "elsewhere", "mk-project.db"), "project kind")
+        touch(os.path.join(tmp_home, "mk.db"))  # an existing legacy root store keeps being the root store
+        _check(root_db() == db_in(tmp_home) == os.path.join(tmp_home, "mk.db"), root_db())
+        _check(db_files_in(tmp_home) == [os.path.join(tmp_home, n) for n in ("mk.db", "mk.db-wal", "mk.db-shm")], db_files_in(tmp_home))
+        os.remove(os.path.join(tmp_home, "mk.db"))
+        # project_db / target_project_db follow the same rule
+        pd = os.path.join(base, "projdata")
+        _check(project_db(data=pd) == os.path.join(pd, "mk-project.db") == project_db(data=pd, legacy=True), project_db(data=pd))
+        touch(os.path.join(pd, "mk.db"))
+        _check(project_db(data=pd) == os.path.join(pd, "mk.db") == project_db(data=pd, legacy=True), project_db(data=pd))
+        _check(target_project_db("slug1") == os.path.join(tmp_home, "projects", "slug1", "mk-project.db"), target_project_db("slug1"))
+        touch(os.path.join(tmp_home, "projects", "slug2", "mk.db"))
+        _check(target_project_db("slug2") == os.path.join(tmp_home, "projects", "slug2", "mk.db"), target_project_db("slug2"))
+        # mk-migrate's forms: the OLD name literally, the NEW name whether or not it exists
+        _check(legacy_db_in(pd) == os.path.join(pd, "mk.db"), legacy_db_in(pd))
+        _check(new_db_in(pd, "project") == os.path.join(pd, "mk-project.db"), new_db_in(pd, "project"))
+        _check(new_db_in(tmp_home, "root") == os.path.join(tmp_home, "mk-overview.db"), new_db_in(tmp_home, "root"))
+        try:
+            new_db_in(pd, "bogus")
+        except Fail:
+            pass
+        else:
+            raise Fail("self-test: new_db_in accepted a bogus kind")
+        # the overrides still rename the new names (the canary), and a bad override is refused
+        _check(_name("MK_NAME_SELFTEST_ONLY", "x.db") == "x.db", "unset env = default")  # an env name the canary never sets
+        os.environ["MK_NAME_SELFTEST_ONLY"] = "y.db"
+        _check(_name("MK_NAME_SELFTEST_ONLY", "x.db") == "y.db", "override")
+        os.environ["MK_NAME_SELFTEST_ONLY"] = "../evil.db"
+        try:
+            _name("MK_NAME_SELFTEST_ONLY", "x.db")
+        except RuntimeError:
+            pass
+        else:
+            raise Fail("self-test: a path-like name override was accepted")
+        os.environ.pop("MK_NAME_SELFTEST_ONLY")
+        _clear_home_env()
+
     def t_names():
         """L10.12a: the folder-literal helpers join exactly what the call sites used to spell."""
         d = os.path.join(root, "names")
-        _check(db_in(d) == os.path.join(d, ROOT_DB_NAME), db_in(d))
-        _check(db_files_in(d) == [os.path.join(d, n) for n in (ROOT_DB_NAME, ROOT_DB_NAME + "-wal", ROOT_DB_NAME + "-shm")], db_files_in(d))
+        _check(db_in(d) == os.path.join(d, PROJECT_DB_NAME), db_in(d))  # a fresh non-home folder: the project name
+        _check(db_files_in(d) == [os.path.join(d, n) for n in (PROJECT_DB_NAME, PROJECT_DB_NAME + "-wal", PROJECT_DB_NAME + "-shm")], db_files_in(d))
         _check(legacy_yaml(d) == os.path.join(d, LEGACY_YAML_NAME), legacy_yaml(d))
         _check(project_yaml_in(d) == os.path.join(d, PROJECT_YAML_NAME), project_yaml_in(d))
         _check(legacy_lanes(d) == os.path.join(d, LANES_NAME) == lanes_file(d), legacy_lanes(d))
@@ -1273,9 +1413,9 @@ def self_test():
         os.chdir(repo)
         _seed_root(tmp_home, "matrixkoder", repo, ".matrixkoder")
         data = os.path.realpath(os.path.join(repo, ".matrixkoder"))
-        _check(project_db(slug="matrixkoder") == os.path.join(data, ROOT_DB_NAME),
+        _check(project_db(slug="matrixkoder") == os.path.join(data, PROJECT_DB_NAME),
                project_db(slug="matrixkoder"))
-        _check(project_db(data=data) == os.path.join(data, ROOT_DB_NAME), project_db(data=data))
+        _check(project_db(data=data) == os.path.join(data, PROJECT_DB_NAME), project_db(data=data))
         _check(project_db(slug="nope") is None, project_db(slug="nope"))
         _check(project_slug_of(data) == "matrixkoder", project_slug_of(data))
         _check(project_slug_of(os.path.join(root, "nowhere")) is None, project_slug_of("x"))
@@ -1412,7 +1552,7 @@ def self_test():
         _check(bus_json(data) == os.path.join(data, "bus.json"), bus_json(data))
         # store mode: the MK home's bus/ folder (C6, L6.1), one bus for every project
         os.makedirs(data, exist_ok=True)
-        open(os.path.join(data, ROOT_DB_NAME), "w").close()
+        open(os.path.join(data, PROJECT_DB_NAME), "w").close()
         _check(bus_dir(data) == os.path.join(tmp_home, "bus"), bus_dir(data))
         _check(bus_json(data) == os.path.join(tmp_home, "bus", "bus.json"), bus_json(data))
         _check(bus_tokens(data) == os.path.join(tmp_home, "bus", "bus-tokens.json"), bus_tokens(data))
@@ -1546,7 +1686,7 @@ def self_test():
         proj = os.path.join(tmp_home, "projects", "migs")
         # slug form: every path follows the switch
         _check(project_dir(home_arg=tmp_home, slug="migs") == proj, project_dir(home_arg=tmp_home, slug="migs"))
-        _check(project_db(slug="migs") == os.path.join(proj, ROOT_DB_NAME), project_db(slug="migs"))
+        _check(project_db(slug="migs") == os.path.join(proj, PROJECT_DB_NAME), project_db(slug="migs"))
         _check(project_yaml(data) == os.path.join(proj, PROJECT_YAML_NAME), project_yaml(data))
         _check(plan_dir(data, "p1") == os.path.join(proj, "plans", "p1"), plan_dir(data, "p1"))
         _check(plan_file(data, "p1") == os.path.join(proj, "plans", "p1", "plan.md"), plan_file(data, "p1"))
@@ -1591,12 +1731,12 @@ def self_test():
                    task_dir(plain, "r1", "T1"))
         # L10.1: the data form of project_db follows the switch to the C2 store; legacy=True is the
         # literal <data>/mk.db that mk-migrate's rollback reads (its copy-back must not follow)
-        _check(project_db(data=data) == os.path.join(proj, ROOT_DB_NAME), project_db(data=data))
+        _check(project_db(data=data) == os.path.join(proj, PROJECT_DB_NAME), project_db(data=data))
         _check(project_db(data=data) == project_db(slug="migs"), "data form equals slug form")
-        _check(project_db(data=data, legacy=True) == os.path.join(data, ROOT_DB_NAME), project_db(data=data, legacy=True))
+        _check(project_db(data=data, legacy=True) == os.path.join(data, PROJECT_DB_NAME), project_db(data=data, legacy=True))
         # an unmigrated project is byte-for-byte unchanged, legacy flag or not
         for plain in (os.path.join(root, "elsewhere"), os.path.join(tmp_home, "projects", "unmigrated")):
-            _check(project_db(data=plain) == os.path.join(plain, ROOT_DB_NAME) == project_db(data=plain, legacy=True),
+            _check(project_db(data=plain) == os.path.join(plain, PROJECT_DB_NAME) == project_db(data=plain, legacy=True),
                    project_db(data=plain))
             _check(project_dir(home_arg=tmp_home, data_dir=plain) == plain, project_dir(home_arg=tmp_home, data_dir=plain))
         # C6 (L6.1): the watch cursors move into the project folder with the project; the
@@ -1644,7 +1784,7 @@ def self_test():
         proj = os.path.join(tmp_home, "projects", "matrixkoder")
         _check(target_projects_dir() == os.path.join(tmp_home, "projects"), target_projects_dir())
         _check(target_project_dir("matrixkoder") == proj, target_project_dir("matrixkoder"))
-        _check(target_project_db("matrixkoder") == os.path.join(proj, ROOT_DB_NAME), "target db")
+        _check(target_project_db("matrixkoder") == os.path.join(proj, PROJECT_DB_NAME), "target db")
         _check(target_project_yaml("matrixkoder") == os.path.join(proj, PROJECT_YAML_NAME), "yaml")
         _check(target_watch_cursors("matrixkoder")
                == os.path.join(proj, CURSORS_NAME), "cursors")
@@ -1672,6 +1812,7 @@ def self_test():
         t_home(tmp_home)
         t_l10(tmp_home)
         t_names()
+        t_db_names(tmp_home)
         t_data_dir(tmp_home, repo, worktree)
         t_folders(tmp_home, repo)
         t_project_db(tmp_home, repo)

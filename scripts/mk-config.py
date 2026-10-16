@@ -393,7 +393,7 @@ def catalog_routes():
     cached for the process, so one `list` starts at most one subprocess."""
     if "routes" in _ROUTES_CACHE:
         return _ROUTES_CACHE["routes"]
-    if not os.path.isfile(mkpaths.db_in(catalog_home())):
+    if not os.path.isfile(mkpaths.root_db_in(catalog_home())):
         _ROUTES_CACHE["routes"] = None  # no store: do not call the catalog, it would create one
         return None
     try:

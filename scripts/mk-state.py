@@ -4007,7 +4007,7 @@ def self_test():
         import sqlite3 as _z8sq
 
         def _root_counts(home_dir):
-            dbp = mkpaths.db_in(home_dir)
+            dbp = mkpaths.root_db(home_dir)
             if not os.path.exists(dbp):
                 return 0, 0
             con = _z8sq.connect(dbp)
@@ -6109,7 +6109,7 @@ def store_self_test(tmp, env):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
-    assert os.path.exists(mkpaths.db_in(reg_home))
+    assert os.path.exists(mkpaths.root_db(reg_home))
     # the CLI form the wizard calls: root row yes, projects.json no
     cli_home = os.path.join(tmp, "cli-reg-home")
     r = subprocess.run([sys.executable, os.path.abspath(__file__), "project", "register", "--slug", "clireg",

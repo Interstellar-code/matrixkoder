@@ -203,11 +203,26 @@ export async function resolveDataDir($: EngineInterface, opts: { cwd?: string; h
 /** Every path a hook builds under the data dir and the global dir (C1). A new file
  *  name is added here once, not joined in three hooks — `projectDb`, `projectYaml`
  *  and friends are the lockstep spots. */
+/** The store file names (mkpaths ROOT_DB_NAME / PROJECT_DB_NAME / LEGACY_DB_NAME). */
+const DB_NAME = { root: 'mk-overview.db', project: 'mk-project.db', legacy: 'mk.db' } as const
+
 export const paths = {
   projectsJson: (globalDir: string): string => join(globalDir, 'projects.json'),
   usage: (globalDir: string): string => join(globalDir, 'usage.json'),
-  /** The root overview store: <home>/mk.db (mkpaths.root_db). The root probe reads this one. */
-  rootDb: (home: string): string => join(home, 'mk.db'),
+  /** The LEGACY root store name, <home>/mk.db: what an existing home still holds. Not the resolved path — a new
+   *  home names it mk-overview.db; use `pickDb` for the file that is really there (mkpaths.root_db). */
+  rootDb: (home: string): string => join(home, DB_NAME.legacy),
+  /** L10.13, mkpaths._resolve_db: the store names a folder may hold for `kind`, new name first. */
+  dbCandidates: (dir: string, kind: 'root' | 'project'): readonly [string, string] =>
+    [join(dir, kind === 'root' ? DB_NAME.root : DB_NAME.project), join(dir, DB_NAME.legacy)],
+  /** The store file of `dir`, mkpaths' rule: the new-name file if it exists, else an existing legacy mk.db,
+   *  else (nothing there) the new name. Both present: the new name wins. `exists` is the caller's probe
+   *  (`$.fs.exists`); this never touches a file itself. */
+  pickDb: async (dir: string, kind: 'root' | 'project', exists: (path: string) => boolean | Promise<boolean>): Promise<string> => {
+    const [fresh, legacy] = paths.dbCandidates(dir, kind)
+    if (await exists(fresh)) return fresh
+    return (await exists(legacy)) ? legacy : fresh
+  },
   /** The global settings file: <home>/mk-settings.yaml (mkpaths.mk_settings). */
   mkSettings: (home: string): string => join(home, 'mk-settings.yaml'),
   /** <home>/inbox, or <home>/inbox/<planId> (mkpaths.inbox_dir); a plan id with a separator or `..` is refused. */
@@ -223,8 +238,8 @@ export const paths = {
   /** Where a deleted plan's file moves: <globalDir>/projects/<slug>/plans/<plan>/archive/. `globalDir` stays
    *  the display `~/.matrixkoder` when the caller has no real one. */
   planArchiveDir: (slug: string, planId: string, globalDir = '~/.matrixkoder'): string => `${globalDir}/projects/${slug}/plans/${planId}/archive/`,
-  /** The project store: <data>/mk.db. Its presence is the store-mode probe. */
-  projectDb: (dataDir: string): string => join(dataDir, 'mk.db'),
+  /** The LEGACY project store name, <data>/mk.db (see `rootDb`); `pickDb(dir, 'project', ...)` is the resolved file. */
+  projectDb: (dataDir: string): string => join(dataDir, DB_NAME.legacy),
   /** The repo settings file: `<dataDir>/matrixkoder.yaml` today; the C2
    *  `<project>/project.yaml` for a migrated project (a root `projects.db_path`
    *  set — `projectYamlPath` supplies the flag, `isMigratedFolder` the rule). */
