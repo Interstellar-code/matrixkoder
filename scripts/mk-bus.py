@@ -52,7 +52,7 @@ Subcommands:
 
 Every command prints ONE JSON line. Errors: {"ok": false, "error": ...} exit 2.
 """
-import argparse, contextlib, datetime, fcntl, hashlib, hmac, importlib.util, io, json, math, os, re, secrets, shutil, signal, socket, subprocess, sys, tempfile, threading, time
+import argparse, contextlib, datetime, fcntl, hashlib, hmac, importlib.util, io, json, math, os, re, secrets, shutil, signal, socket, stat, subprocess, sys, tempfile, threading, time
 import urllib.error, urllib.parse, urllib.request
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
@@ -3648,6 +3648,127 @@ def cmd_archive_run(args):
     """C6: the run-end archive CLI. See archive_run for the contract."""
     data_dir = resolve_data(getattr(args, "data", None))
     res = archive_run(data_dir, getattr(args, "run", "") or "")
+    out(res)
+    return res
+
+
+def _copy_private(src, dst):
+    """Copy one file byte for byte to dst, 0600, atomically (temp file, fsync, replace)."""
+    d = os.path.dirname(dst)
+    os.makedirs(d, exist_ok=True)
+    with open(src, "rb") as f:
+        blob = f.read()
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".carry-")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(blob)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, dst)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def carry_root(home, dry_run=False):
+    """L10.G: move the pre-L6.1 root bus files into bus/ and the old copies into a named backup.
+
+    Every token of <home>/bus-tokens.json that bus/bus-tokens.json lacks is merged in (an entry
+    in both places keeps the bus/ value, never overwritten); every <home>/bus-lanes/<sha>.json
+    that bus/lanes/ lacks is copied byte for byte, 0600 (a name in both keeps the bus/ file).
+    Only after both are verified are the root bus-tokens.json, bus-tokens.lock and bus-lanes/
+    MOVED to <home>/backups/bus-root-<stamp>/ — never deleted. A bus whose pid sits in the root
+    bus.json is still running against the root files: refused. --dry-run lists, writes nothing.
+    Tokens are never printed; the reply counts them and names the projects of the carried ones."""
+    home = os.path.abspath(home)
+    bus = _paths("target_bus_dir", home)
+    root_tokens = os.path.join(home, "bus-tokens.json")
+    root_lock = os.path.join(home, "bus-tokens.lock")
+    root_lanes = os.path.join(home, "bus-lanes")
+    running = is_pid_alive((read_json(os.path.join(home, "bus.json")) or {}).get("pid"))
+    if running and not dry_run:
+        raise Fail("a bus is still running against the root bus files (pid in <home>/bus.json); stop it first")
+    res = {"ok": True, "op": "carry-root", "dry_run": bool(dry_run), "home": home, "bus_dir": bus,
+           "bus_running_on_root": running,
+           "tokens": {"root": 0, "carried": 0, "same": 0, "bus_wins": 0, "carried_projects": {}},
+           "lanes": {"root": 0, "carried": 0, "same": 0, "bus_wins": 0}, "moves": []}
+    tokens_path = os.path.join(bus, "bus-tokens.json")
+    root = {}
+    if os.path.isfile(root_tokens):
+        root = read_json(root_tokens)
+        if not isinstance(root, dict):
+            raise Fail("root bus-tokens.json is unreadable; nothing moved")
+    t = res["tokens"]
+    t["root"] = len(root)
+    cur = read_json(tokens_path, default={}) or {}
+    for tok, entry in root.items():
+        if tok not in cur:
+            t["carried"] += 1
+            proj = str((entry or {}).get("project") or "?") if isinstance(entry, dict) else "?"
+            t["carried_projects"][proj] = t["carried_projects"].get(proj, 0) + 1
+        elif cur[tok] == entry:
+            t["same"] += 1
+        else:
+            t["bus_wins"] += 1
+    lane_ops = []
+    names = sorted(n for n in os.listdir(root_lanes) if os.path.isfile(os.path.join(root_lanes, n))) \
+        if os.path.isdir(root_lanes) else []
+    res["lanes"]["root"] = len(names)
+    for n in names:
+        src, dst = os.path.join(root_lanes, n), os.path.join(bus, "lanes", n)
+        if not os.path.exists(dst):
+            res["lanes"]["carried"] += 1
+            lane_ops.append((src, dst))
+        elif open(src, "rb").read() == open(dst, "rb").read():
+            res["lanes"]["same"] += 1
+        else:
+            res["lanes"]["bus_wins"] += 1
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup = os.path.join(home, "backups", "bus-root-" + stamp)
+    n = 1
+    while os.path.exists(backup):
+        n += 1
+        backup = os.path.join(home, "backups", f"bus-root-{stamp}-{n}")
+    movers = [p for p in (root_tokens, root_lock, root_lanes) if os.path.lexists(p)]
+    res["moves"] = [{"from": p, "to": os.path.join(backup, os.path.basename(p))} for p in movers]
+    res["backup"] = backup if movers else None
+    if dry_run:
+        return res
+    if t["carried"]:
+        os.makedirs(bus, exist_ok=True)
+        lfd = os.open(os.path.join(bus, "bus-tokens.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+        os.fchmod(lfd, 0o600)
+        fcntl.flock(lfd, fcntl.LOCK_EX)
+        try:
+            cur = read_json(tokens_path, default={}) or {}
+            for tok, entry in root.items():
+                cur.setdefault(tok, entry)
+            write_json(tokens_path, cur, mode=0o600)
+        finally:
+            fcntl.flock(lfd, fcntl.LOCK_UN)
+            os.close(lfd)
+    for src, dst in lane_ops:
+        _copy_private(src, dst)
+    # verify before anything moves: every root token and lane file is now answered from bus/
+    after = read_json(tokens_path, default={}) or {}
+    lost = [k for k in root if k not in after]
+    if lost:
+        raise Fail(f"{len(lost)} root tokens missing from bus/bus-tokens.json after the merge; nothing moved")
+    for src, dst in lane_ops:
+        if not os.path.isfile(dst) or open(src, "rb").read() != open(dst, "rb").read():
+            raise Fail(f"lane file {os.path.basename(dst)} did not copy intact; nothing moved")
+    if movers:
+        os.makedirs(backup, exist_ok=True)
+        for p in movers:
+            os.rename(p, os.path.join(backup, os.path.basename(p)))
+    return res
+
+
+def cmd_carry_root(args):
+    """L10.G: the carry-root CLI. See carry_root for the contract."""
+    res = carry_root(mk_home(), dry_run=getattr(args, "dry_run", False))
     out(res)
     return res
 
@@ -7823,6 +7944,85 @@ def _archive_run_self_test():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _carry_root_self_test():
+    """L10.G: carry-root on a temp home. A root-only token and lane file land under bus/ and
+    resolve through the production readers; an entry in both places keeps the bus/ value;
+    --dry-run changes nothing; a running root bus refuses; the root files end in the named
+    backup, moved not deleted; a second run is a no-op."""
+    tmp = tempfile.mkdtemp(prefix="mk-bus-carry-")
+    try:
+        home = os.path.join(tmp, "home")
+        bus = os.path.join(home, "bus")
+        lane = os.path.join(tmp, "lane")
+        os.makedirs(lane)
+        digest = hashlib.sha256(os.path.realpath(lane).encode("utf-8")).hexdigest()
+        both = hashlib.sha256(b"both").hexdigest()
+        write_json(os.path.join(home, "bus-tokens.json"), {
+            "root-only": {"project": "pa", "role": "lane", "lane": lane},
+            "both": {"project": "old"}}, mode=0o600)
+        open(os.path.join(home, "bus-tokens.lock"), "w").close()
+        write_json(os.path.join(home, "bus-lanes", digest + ".json"), {"token": "root-only"}, mode=0o600)
+        write_json(os.path.join(home, "bus-lanes", both + ".json"), {"token": "old"}, mode=0o600)
+        write_json(os.path.join(bus, "bus-tokens.json"), {"both": {"project": "new"}, "live": {"project": "pb"}})
+        write_json(os.path.join(bus, "lanes", both + ".json"), {"token": "new"}, mode=0o600)
+
+        def snap():
+            return sorted((os.path.join(d, f), open(os.path.join(d, f), "rb").read())
+                          for d, _, fs in os.walk(home) for f in fs)
+
+        def carry(*extra, check=True):
+            env = dict(os.environ, MK_HOME=home, MATRIXKODER_HOME=home)
+            env.pop("MK_BUS_DIR", None)
+            p = subprocess.run([sys.executable, os.path.abspath(__file__), "carry-root", *extra],
+                               capture_output=True, text=True, env=env)
+            doc = json.loads(p.stdout.strip().splitlines()[-1])
+            assert (p.returncode == 0) == check, f"carry-root {extra}: rc {p.returncode} {doc}"
+            return doc
+
+        before = snap()
+        dry = carry("--dry-run")
+        assert dry["dry_run"] and snap() == before, "carry-root --dry-run wrote something"
+        assert dry["tokens"]["carried"] == 1 and dry["tokens"]["bus_wins"] == 1, dry["tokens"]
+        assert dry["lanes"]["carried"] == 1 and dry["lanes"]["bus_wins"] == 1, dry["lanes"]
+        assert len(dry["moves"]) == 3 and dry["tokens"]["carried_projects"] == {"pa": 1}, dry
+        # a bus still running against the root files: refused, nothing written
+        write_json(os.path.join(home, "bus.json"), {"pid": os.getpid()})
+        busy = snap()
+        refused = carry(check=False)
+        assert "still running" in refused["error"] and snap() == busy, refused
+        os.unlink(os.path.join(home, "bus.json"))
+        real = carry()
+        assert real["tokens"]["carried"] == 1 and real["lanes"]["carried"] == 1, real
+        merged = read_json(os.path.join(bus, "bus-tokens.json"))
+        assert merged["root-only"]["project"] == "pa" and merged["live"] == {"project": "pb"}, "merge lost a token"
+        assert merged["both"] == {"project": "new"}, "an entry in both places must keep the bus/ value"
+        assert read_json(os.path.join(bus, "lanes", both + ".json")) == {"token": "new"}, "bus/ lane file overwritten"
+        # the production readers answer from bus/ now, with the root files gone
+        env_keys = ("MK_HOME", "MATRIXKODER_HOME", "MK_BUS_DIR", "MK_BUS_TOKEN_FILE")
+        saved = {k: os.environ.pop(k, None) for k in env_keys}
+        os.environ["MK_HOME"] = os.environ["MATRIXKODER_HOME"] = home
+        try:
+            tok_file = lane_token_path(lane)
+            assert tok_file == os.path.join(bus, "lanes", digest + ".json"), tok_file
+            assert read_json(tok_file) == {"token": "root-only"}, "carried lane token does not resolve"
+            assert stat.S_IMODE(os.stat(tok_file).st_mode) == 0o600, "carried lane file is not 0600"
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+        names = sorted(os.listdir(home))
+        assert "bus-tokens.json" not in names and "bus-lanes" not in names and "bus-tokens.lock" not in names, names
+        kept = os.path.join(real["backup"])
+        assert os.path.basename(kept).startswith("bus-root-") and os.path.dirname(kept) == os.path.join(home, "backups")
+        assert read_json(os.path.join(kept, "bus-tokens.json"))["both"] == {"project": "old"}, "backup lost the old file"
+        assert os.path.isfile(os.path.join(kept, "bus-lanes", digest + ".json")) and os.path.isfile(os.path.join(kept, "bus-tokens.lock"))
+        again = carry()
+        assert again["moves"] == [] and again["tokens"]["root"] == 0 and again["backup"] is None, again
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def self_test():
     tmp = tempfile.mkdtemp(prefix="mk-bus-test-")
     pids = []
@@ -9200,6 +9400,7 @@ def self_test():
     _legacy_bus_token_self_test()
     _archive_run_self_test()
     _z14_path_self_test()
+    _carry_root_self_test()
     print("pass mk-bus.py: mk-bus self-test ok")
     print(json.dumps({"ok": True, "tests": len(checks), "passed": len(checks)}))
     return 0
@@ -9291,6 +9492,9 @@ def main():
     p_arch.add_argument("--run", required=True, help="Run identifier (must be closed)")
     p_arch.add_argument("--data", help="MatrixKoder data dir")
 
+    p_carry = subparsers.add_parser("carry-root")
+    p_carry.add_argument("--dry-run", action="store_true", help="List every move, write nothing")
+
     try:
         args = parser.parse_args()
         if not args.cmd:
@@ -9310,6 +9514,7 @@ def main():
             "watch": cmd_watch,
             "metrics": cmd_metrics,
             "archive-run": cmd_archive_run,
+            "carry-root": cmd_carry_root,
         }
         fn = dispatch.get(args.cmd)
         if fn:
