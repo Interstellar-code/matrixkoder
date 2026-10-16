@@ -7,14 +7,15 @@
 import { mock } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import type { Plugin } from 'claude-code/testing'
+import { paths } from './paths'
 
 export type Files = Record<string, string>
 
 export const PROJECT_DIR = '/tmp/mk-proj'
 export const DATA_DIR = `${PROJECT_DIR}/.matrixkoder`
-export const RUNS_INDEX = `${DATA_DIR}/runs/index.json`
-export const RUN_PATH = `${DATA_DIR}/runs/wfv2/run.json`
-export const USAGE_PATH = '/home/mk/.matrixkoder/usage.json'
+export const RUNS_INDEX = paths.runsIndex(DATA_DIR)
+export const RUN_PATH = paths.runDoc(DATA_DIR, 'wfv2')
+export const USAGE_PATH = paths.usage('/home/mk/.matrixkoder')
 export const NOW = Date.parse('2026-10-07T18:00:00Z')
 
 const RUN_INDEX = JSON.stringify([
@@ -105,6 +106,7 @@ export const worldFixtures: Plugin = {
   name: 'mk-fixtures',
   tier: 'prepend',
   register(on, _options) {
+    // literals only: the engine's module scan drops closures over module consts (RUNS_INDEX etc.)
     return on('session.start', async ($, e, next) => {
       const copies: readonly [string, string][] = [
         ['/fixtures/index.json', '/tmp/mk-proj/.matrixkoder/runs/index.json'],
@@ -176,6 +178,7 @@ export function mockFs(
   dirs: readonly string[] = [DATA_DIR, `${PROJECT_DIR}/.git`],
   statFiles: readonly string[] = [],
 ): { reads: string[] } {
+  servedFiles = files
   const reads: string[] = []
   on('fs.write', (_$, e) => {
     files[e.path] = e.text
@@ -200,6 +203,34 @@ export function mockFs(
  * the chip and toast texts, `process` taps poll argv, `env` adds variables
  * (e.g. MATRIXKODER_DATA). Returns the mock clock (for advance()).
  */
+/** The files dict of the latest mockFs call: the process.run handler may not call $.fs (host scan),
+ *  so the default run-snapshot reply reads the same in-memory dict the fs mock serves. */
+let servedFiles: Files = {}
+
+/** The default `mkdb.py run-snapshot --json` reply: built from the in-memory index/run fixture
+ *  files (what tests mutate via setRun) in the real RUN_SNAPSHOT shape. An unreadable index is
+ *  "no store" (`store: false`); a missing or unparseable run doc is `run: null`. */
+let snapshotSpawns = 0
+/** How many default run-snapshot reads the pane made since mockWorld was set up (the old RUN_PATH read count). */
+export const snapshotCount = (): number => snapshotSpawns
+
+function storeReply(argv: readonly string[]) {
+  snapshotSpawns++
+  const dataDir = argv[argv.indexOf('--data') + 1] ?? DATA_DIR
+  const read = (path: string): unknown => {
+    try { return JSON.parse(servedFiles[path] ?? '') } catch { return undefined }
+  }
+  /** a run doc that is present but not JSON: the store named it, the pane cannot read it (⚠ note) */
+  const readDoc = (path: string): unknown => (path in servedFiles ? read(path) ?? '<unreadable>' : null)
+  const out = (stdout: string) => ({ exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false })
+  const index = read(paths.runsIndex(dataDir))
+  if (!Array.isArray(index)) return out(JSON.stringify({ ok: true, store: false, runs: [] }))
+  const entries = index.filter((r): r is { id: string; status?: string; started?: string } => typeof r === 'object' && r !== null && typeof r.id === 'string')
+  const head = entries.filter(r => r.status === 'active').sort((a, b) => Date.parse(b.started ?? '') - Date.parse(a.started ?? ''))[0]
+  const run = head ? readDoc(paths.runDoc(dataDir, head.id)) : null
+  return out(JSON.stringify({ ok: true, runs: entries, active: head?.id ?? null, run, waits: [], store: true }))
+}
+
 /** what mockWorld hands back: the mock clock (for advance()) */
 export type MockWorld = ReturnType<typeof mock.clock>
 
@@ -214,6 +245,7 @@ export function mockWorld(
     env?: Record<string, string>
   } = {},
 ): MockWorld {
+  snapshotSpawns = 0
   const clock = mock.clock(on, { now: NOW })
   mock.env(on, { HOME: '/home/mk', ...opts.env })
   // engine events (session.start, prompt.compose) are answered bare; noun
@@ -222,6 +254,7 @@ export function mockWorld(
   on('prompt.compose', (_$, _e) => ({ sections: [] }))
   on('process.run', async (_$, e) => {
     const override = await opts.process?.(e.argv)
+    if (override == null && e.argv.includes('run-snapshot')) return { value: storeReply(e.argv) }
     return override ?? { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('ui.open', (_$, e) => {

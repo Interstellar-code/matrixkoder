@@ -2,6 +2,7 @@
 // project-banned commands. Wired in by hooks/register.tsx in a later phase.
 // A tripwire against plausible model-written commands, not a sandbox.
 import type { On, PluginOptions, ToolCallResult } from 'claude-code'
+import { paths } from './paths'
 
 type Ban = { cmd: string; why: string }
 
@@ -378,9 +379,9 @@ export function registerGuards(on: On, options: PluginOptions): void {
     let yamlPath: string | undefined
     try {
       for (let dir = await $.session.cwd(); dir; dir = dir.slice(0, dir.lastIndexOf('/'))) {
-        const st = await $.fs.stat(`${dir}/.matrixkoder`).catch(() => undefined)
+        const st = await $.fs.stat(paths.legacyDataDir(dir)).catch(() => undefined)
         if (st?.kind === 'dir') {
-          yamlPath = `${dir}/.matrixkoder/matrixkoder.yaml`
+          yamlPath = paths.projectYaml(paths.legacyDataDir(dir))
           break
         }
       }

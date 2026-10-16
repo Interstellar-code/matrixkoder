@@ -10,7 +10,7 @@ import type { Elements, EngineInterface, On, PluginOptions, RenderElement } from
 type Els = Elements[keyof Elements]
 import type { MkDashTab, MkEvent, MkRun, MkRunIndexEntry, MkSnapshot, MkStatusMemory, MkTask } from '../types'
 import {
-  AGENT_ORDER, PANE_ID, EMPTY_SNAPSHOT, activeEntries, basename, coerceIndex, coerceRun, coerceUsage, join,
+  AGENT_ORDER, PANE_ID, EMPTY_SNAPSHOT, basename, coerceIndex, coerceRun, coerceUsage, join,
   mkSnapshot, normalizePath, orderAgents, parentOf, parseJson, parseYamlAgents, parseYamlProviders,
   sanitizeText, timerRegistry,
 } from './data'
@@ -590,19 +590,14 @@ async function readText($: EngineInterface, path: string): Promise<string | null
 /** The runs list + the active run's document, from the project store (C4/L5).
  *
  *  `mkdb.py run-snapshot --data <dir> --json` is the ONE read-only reader the pane uses for
- *  what run.json and runs/index.json used to hold (L5's addition to scripts/mkdb.py). It opens
- *  the store `mode=ro`, never migrates and never creates it; `--data` resolves through
- *  mkpaths.project_folder, so a migrated project is read from its C2 store and not from the
- *  pre-switch copy still sitting in the data dir.
+ *  the runs list and the active run. It opens the store `mode=ro`, never migrates and never
+ *  creates it; `--data` resolves through mkpaths.project_folder, so a migrated project is
+ *  read from its C2 store.
  *
- *  null means "the store could not answer" — a pre-migration project with no store, a store
- *  this code is too new/old for, a refused or slow spawn. The caller then falls back to the
- *  file views. An empty but successful answer ({runs: [], run: null}) is NOT null: it means
- *  the store is there and holds no active run, which is the NoRun panel, not a fallback.
- *
- *  `store: false` is how the reader says the store is MISSING. Without it a no-store reply
- *  (`{ok: true, store: false, runs: []}`) is indistinguishable from a store that holds no run,
- *  and the file fallback would never run on a pre-migration project. */
+ *  null means "the store could not answer" — no store (`store: false`), a store this code is
+ *  too new/old for, a refused or slow spawn. The caller shows the NoRun panel. An empty but
+ *  successful answer ({runs: [], run: null}) is NOT null: the store is there and holds no
+ *  active run. A run the store named but we cannot coerce answers with `error` set. */
 async function readStoreSnapshot($: EngineInterface, dataDir: string): Promise<{
   runs: MkRunIndexEntry[]
   run: MkRun | null
@@ -620,58 +615,20 @@ async function readStoreSnapshot($: EngineInterface, dataDir: string): Promise<{
   if (ran.exitCode !== 0) return null
   const doc = parseJson(ran.stdout) as { runs?: unknown; run?: unknown; store?: unknown } | null
   if (doc === null || typeof doc !== 'object' || !Array.isArray(doc.runs)) return null
-  if (doc.store === false) return null // no store: the file views answer, not this reader
+  if (doc.store === false) return null // no store: nothing to show
   const run = coerceRun(doc.run)
-  if (doc.run != null && run == null) return null // a run the store named that we cannot read
-  return { runs: coerceIndex(doc.runs), run, error: null }
+  const error = doc.run != null && run == null ? 'cannot read run.json' : null // a run the store named that we cannot read
+  return { runs: coerceIndex(doc.runs), run, error }
 }
 
-/** Loads every active run, newest first. The NEWEST keeps the single-run
- *  semantics it always had — its run/error drive the ⚠ note, the NoRun panel
- *  and the chip/toasts/wake inputs (snap.run); an OLDER run that cannot be read
- *  is skipped, never blanking the pane.
- *
- *  C4/L5: the project store is the only source of truth. The store answers the whole
- *  question in one read (the runs list and the newest active run's document), so the
- *  file views below are a FALLBACK ONLY: a pre-migration project with no store, or a
- *  store this code cannot read. mk-state stops writing run.json/index.json in L4, so
- *  the fallback stops firing the moment the store exists. */
+/** Loads the active run. The project store is the only source of truth (C4/L5): one read
+ *  answers the runs list and the newest active run's document. No store or an unreadable
+ *  one is the NoRun panel. */
 async function loadRuns($: EngineInterface, dataDir: string): Promise<{ run: MkRun | null; activeRuns: MkRun[]; runs: ReturnType<typeof coerceIndex>; error: string | null }> {
   const store = await readStoreSnapshot($, dataDir)
-  if (store != null) {
-    const activeRuns = store.run == null ? [] : [store.run]
-    return { run: store.run, activeRuns, runs: store.runs, error: null }
-  }
-  return loadRunsFromFiles($, dataDir)
-}
-
-/** FALLBACK (C4/L5): the retired file views — `<data>/runs/index.json` and each
- *  `runs/<id>/run.json`. Only reached when the project store cannot answer: a
- *  pre-migration project, or a store this code is too new/old for. Everything here
- *  goes away with the views in L4. */
-async function loadRunsFromFiles($: EngineInterface, dataDir: string): Promise<{ run: MkRun | null; activeRuns: MkRun[]; runs: ReturnType<typeof coerceIndex>; error: string | null }> {
-  const runs = coerceIndex(await readJson($, join(dataDir, 'runs/index.json')))
-  const active = activeEntries(runs)
-  const head = active[0]
-  if (!head) return { run: null, activeRuns: [], runs, error: null }
-  const first = await readRun($, dataDir, head)
-  if (first.run == null) return { run: null, activeRuns: [], runs, error: first.error }
-  const activeRuns = [first.run]
-  for (const entry of active.slice(1)) {
-    const more = await readRun($, dataDir, entry)
-    if (more.run != null) activeRuns.push(more.run)
-  }
-  return { run: first.run, activeRuns, runs, error: null }
-}
-
-/** FALLBACK (C4/L5): one `run.json` → a coerced run, or the error the loader reports for it. */
-async function readRun($: EngineInterface, dataDir: string, entry: MkRunIndexEntry): Promise<{ run: MkRun | null; error: string | null }> {
-  const runPath = join(dataDir, 'runs', entry.id, 'run.json')
-  const text = await readText($, runPath)
-  if (text == null) return { run: null, error: `cannot read ${entry.id}/run.json` }
-  const run = coerceRun(parseJson(text))
-  if (run == null) return { run: null, error: 'cannot read run.json' }
-  return { run, error: null }
+  if (store == null) return { run: null, activeRuns: [], runs: [], error: null }
+  const activeRuns = store.run == null ? [] : [store.run]
+  return { run: store.run, activeRuns, runs: store.runs, error: store.error }
 }
 
 async function loadSnapshot($: EngineInterface, cwd: string): Promise<MkSnapshot> {

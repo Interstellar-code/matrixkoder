@@ -9,6 +9,7 @@ import { ActionButton, ActionButtons, Card, Chip, Section, Segment } from './kit
 import type { ActionSpec, ActionTone } from './kit'
 import { laneStrip, pickBar } from './raster'
 import { ROLE } from './palette'
+import { paths } from '../paths'
 import type { PaletteRole } from './palette'
 
 type Els = Elements[keyof Elements]
@@ -115,7 +116,7 @@ function clip(text: string, w: number): string {
  *  the source named none (the live project). Never the old `<repo>/.matrixkoder/plans/archive`. */
 export function planArchiveDir(plan: Pick<PlanRow, 'id' | 'project'>): string {
   const slug = plan.project != null && plan.project !== '' ? plan.project : 'matrixkoder'
-  return `~/.matrixkoder/projects/${slug}/plans/${plan.id}/archive/`
+  return paths.planArchiveDir(slug, plan.id)
 }
 
 /** Pure render: elements only, no $, no state (C1); `ui` is the C12 view state. */
