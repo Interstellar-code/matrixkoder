@@ -384,7 +384,7 @@ def copy_db(src_path, dst_path):
     """The WHOLE project DB, through SQLite's backup API (never a file copy while open)."""
     src = mkdb._connect_ro(src_path)
     try:
-        dst = mkdb._connect(dst_path)
+        dst = mkdb._connect(dst_path, create_beside_legacy=True)  # the deliberate create (L10.X)
         try:
             src.backup(dst)
         finally:

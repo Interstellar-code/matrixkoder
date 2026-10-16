@@ -216,11 +216,14 @@ export const paths = {
   dbCandidates: (dir: string, kind: 'root' | 'project'): readonly [string, string] =>
     [join(dir, kind === 'root' ? DB_NAME.root : DB_NAME.project), join(dir, DB_NAME.legacy)],
   /** The store file of `dir`, mkpaths' rule: the new-name file if it exists, else an existing legacy mk.db,
-   *  else (nothing there) the new name. Both present: the new name wins. `exists` is the caller's probe
-   *  (`$.fs.exists`); this never touches a file itself. */
-  pickDb: async (dir: string, kind: 'root' | 'project', exists: (path: string) => boolean | Promise<boolean>): Promise<string> => {
+   *  else (nothing there) the new name. Both present: the new name wins — unless it is empty (L10.X): a 0-byte
+   *  new-name file is no store and never hides mk.db. `exists` is the caller's probe (`$.fs.exists`); `size`
+   *  (optional, `$.fs.stat(...).size`) says how big the new-name file is; without it the new name counts as a
+   *  store when it exists, as before. Python's `is_store_file` also checks the 16-byte SQLite header; the TS side
+   *  only sees the size. This never touches a file itself. */
+  pickDb: async (dir: string, kind: 'root' | 'project', exists: (path: string) => boolean | Promise<boolean>, size?: (path: string) => number | Promise<number>): Promise<string> => {
     const [fresh, legacy] = paths.dbCandidates(dir, kind)
-    if (await exists(fresh)) return fresh
+    if (await exists(fresh) && (size === undefined || (await size(fresh)) > 0)) return fresh
     return (await exists(legacy)) ? legacy : fresh
   },
   /** The global settings file: <home>/mk-settings.yaml (mkpaths.mk_settings). */
