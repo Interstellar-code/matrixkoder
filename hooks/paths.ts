@@ -216,6 +216,11 @@ export const paths = {
     if (planId === '' || planId === '.' || planId === '..' || /[/\\\0]/.test(planId)) throw new Error(`bad plan id ${JSON.stringify(planId)}`)
     return join(home, 'inbox', planId)
   },
+  /** The pre-migration data dir of a repo folder: <repo>/.matrixkoder. */
+  legacyDataDir: (repo: string): string => join(repo, '.matrixkoder'),
+  /** Where a deleted plan's file moves: <globalDir>/projects/<slug>/plans/<plan>/archive/. `globalDir` stays
+   *  the display `~/.matrixkoder` when the caller has no real one. */
+  planArchiveDir: (slug: string, planId: string, globalDir = '~/.matrixkoder'): string => `${globalDir}/projects/${slug}/plans/${planId}/archive/`,
   /** The project store: <data>/mk.db. Its presence is the store-mode probe. */
   projectDb: (dataDir: string): string => join(dataDir, 'mk.db'),
   /** The repo settings file: `<dataDir>/matrixkoder.yaml` today; the C2

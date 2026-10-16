@@ -3,7 +3,7 @@
 // via $.fs.write (inline fixtures plugin); fs is served in memory.
 import { test, expect } from 'claude-code/testing'
 import type { On, ConfigRow } from 'claude-code'
-import { DATA_DIR, NOW, PROJECT_DIR, RUN_PATH, RUNS_INDEX, USAGE_PATH, agentOf, agentsOf, mockFs, mockWorld, paneProps, sessionStart, sessionStartIn, setRun, setUsage, tasksOf, worldFiles, worldFixtures } from './testkit'
+import { snapshotCount, DATA_DIR, NOW, PROJECT_DIR, RUN_PATH, RUNS_INDEX, USAGE_PATH, agentOf, agentsOf, mockFs, mockWorld, paneProps, sessionStart, sessionStartIn, setRun, setUsage, tasksOf, worldFiles, worldFixtures } from './testkit'
 import type { Files, MockWorld } from './testkit'
 import { parseYamlAgents } from './data'
 import { DONE_STATUSES_FOR_TEST, waitingPane, waitingPaneView } from './dashboard'
@@ -74,14 +74,6 @@ const PROJECT_YAML = [
 
 // --- C4/L5: the pane reads the project store; the file views are a fallback ---------------
 
-/** The captured reply's run as the file-view fixture the pane used to read: the same
- *  document, so the two paths can be compared by what they DRAW, not by what they hold.
- *  Only the run document feeds the pane (the chip, the run header, ▶ Next, the waiting
- *  block, the task rows); the index list feeds the NoRun panel. */
-function storeRun(): Record<string, unknown> {
-  return JSON.parse(JSON.stringify(RUN_SNAPSHOT.run)) as Record<string, unknown>
-}
-
 test('C4/L5: the store reply renders the pane with the file views deleted', async ($, on) => {
   const files: Files = {} // post-L4: no runs/index.json, no run.json, nothing
   mockFs(on, files, [DATA_DIR, `${PROJECT_DIR}/.git`])
@@ -98,40 +90,19 @@ test('C4/L5: the store reply renders the pane with the file views deleted', asyn
   expect(snap?.slice(2)).toEqual(['--data', DATA_DIR, 'run-snapshot', '--json'])
 })
 
-test('C4/L5: the store reply and the retired file views draw the same text', async ($, on) => {
-  // The same run, read twice: once off the store with no file view anywhere, and once off a
-  // run.json carrying the very document the store answered with. An identical draw is the
-  // acceptance: the reader is a drop-in for the view it replaces. One world, switched
-  // between the two reads — a test cannot register a second handler after the first `$.` call.
-  const files: Files = {}
-  mockFs(on, files, [DATA_DIR, `${PROJECT_DIR}/.git`])
-  const store: StoreState = { reply: JSON.stringify(RUN_SNAPSHOT), argv: [] }
-  const clock = mockWorld(on, { process: storeSnapshot(store) })
-  await $.session.start(sessionStart())
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  const fromStore = rowTexts(await ui.drawn()).join('\n')
-  expect(fromStore.length, 'the store drew something').toBeGreaterThan(0)
-
-  files[`${DATA_DIR}/runs/l5fix/run.json`] = JSON.stringify(storeRun())
-  files[RUNS_INDEX] = JSON.stringify([{ id: 'l5fix', feature: 'L5 fixtures', status: 'active', started: '2026-10-07T16:00:00+02:00' }])
-  store.reply = NO_STORE_SNAPSHOT // mk.db is gone: the real exit-0 `store:false` reply, so the file views answer
-  await clock.advance(5000)
-  const fromFiles = rowTexts(await ui.drawn()).join('\n')
-  expect(fromStore, 'the store and the file view must draw the same text').toEqual(fromFiles)
-})
-
-test('C4/L5: no store falls back to the file views', async ($, on) => {
+test('C4/L5: no store (store:false) draws the NoRun panel, never a file view', async ($, on) => {
   // The REAL mkdb.py answer for a project with no mk.db, captured verbatim (exit 0, `store:false`).
-  // This is the pre-migration project the fallback exists for: mkdb.py exits 0, not 2, so the pane
-  // can only see "no store" through the `store:false` key. The run drawn is the fixture's, not
-  // the store's (the reply names no runs at all), and run.json is really read off the fs mock.
+  // The store is the only truth: a run.json/index.json still on disk is not read, so the pane
+  // shows NoRun instead of resurrecting the old file views.
   const files = worldFiles()
   const fs = mockFs(on, files)
   mockWorld(on, { process: storeSnapshot({ reply: NO_STORE_SNAPSHOT, argv: [] }) })
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  expect(await ui.find({ text: 'workflows-v2' }), 'the fallback drew the run').toBeTruthy()
-  expect(fs.reads, 'the fallback really read run.json').toContain(RUN_PATH)
+  expect(await ui.find({ text: 'No active orchestration run.' }), 'no store is the NoRun panel').toBeTruthy()
+  expect(await ui.find({ text: 'workflows-v2' }), 'the stale run.json is not drawn').toBeUndefined()
+  expect(fs.reads, 'the file views are never consulted').not.toContain(RUN_PATH)
+  expect(fs.reads).not.toContain(RUNS_INDEX)
 })
 
 test('C4/L5: a store that EXISTS with no run is not a missing store — no file fallback', async ($, on) => {
@@ -234,7 +205,7 @@ test('tasks:[null] run.json still renders and recovers once fixed', { plugins: [
     const tasks = tasksOf(run)
     run.tasks = [null, tasks[4] ?? {}]
   })
-  const fs = mockFs(on, files)
+  mockFs(on, files)
   const clock = mockWorld(on)
   await $.session.start(sessionStart())
   let ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
@@ -243,7 +214,7 @@ test('tasks:[null] run.json still renders and recovers once fixed', { plugins: [
   files['/fixtures/run.json'] = files[RUN_PATH] = good
   await clock.advance(5000)
   expect(await ui.find({ text: /F6/ })).toBeTruthy() // recovered
-  expect(fs.reads.filter(p => p === RUN_PATH).length).toBeGreaterThan(1) // the timer survived the bad load
+  expect(snapshotCount()).toBeGreaterThan(1) // the timer survived the bad load
 })
 
 test('corrupt run.json shows the ⚠ note, then recovers', { plugins: [worldFixtures] }, async ($, on) => {
@@ -686,30 +657,30 @@ test('U3: a plan pool that reports usage shows bars, not its setup hint', { plug
 
 test('two session.start arm exactly one refresh timer', { plugins: [worldFixtures] }, async ($, on) => {
   const files = worldFiles()
-  const fs = mockFs(on, files)
+  mockFs(on, files)
   const clock = mockWorld(on)
   await $.session.start(sessionStart())
   await $.session.start(sessionStart())
   await clock.advance(5000)
   await clock.advance(5000)
   await clock.advance(5000)
-  expect(fs.reads.filter(p => p === RUN_PATH).length).toBe(5) // 2 initial loads + 3 single ticks
+  expect(snapshotCount()).toBe(5) // 2 initial loads + 3 single ticks
 })
 
 test('/mk re-arms the refresh loop after /clear (session.end, no session.start)', { plugins: [worldFixtures] }, async ($, on) => {
   const files = worldFiles()
-  const fs = mockFs(on, files)
+  mockFs(on, files)
   const clock = mockWorld(on)
   on('session.cwd', () => ({ value: '/tmp/mk-proj' }))
   on('session.end', () => ({ sessionId: 's1' }))
   await $.session.start(sessionStart())
   await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: undefined } } as never)
   await clock.advance(5000)
-  expect(fs.reads.filter(p => p === RUN_PATH).length).toBe(1) // loop dead: only the start load
+  expect(snapshotCount()).toBe(1) // loop dead: only the start load
   await $.command.run({ command: 'mk', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 165 } })
-  expect(fs.reads.filter(p => p === RUN_PATH).length).toBe(2) // /mk reloads at once
+  expect(snapshotCount()).toBe(2) // /mk reloads at once
   await clock.advance(5000)
-  expect(fs.reads.filter(p => p === RUN_PATH).length).toBe(3) // and ticks again
+  expect(snapshotCount()).toBe(3) // and ticks again
 })
 
 test('/mk args: open, close, setup, init and unknown', { plugins: [worldFixtures] }, async ($, on) => {
@@ -1066,6 +1037,7 @@ test('bus.enabled=false skips ensure, any other mk-config answer proceeds', { pl
   const ok = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
   const clock = mockWorld(on, {
     process: argv => {
+      if (argv.includes('run-snapshot')) return // the default store reply
       if (isBusEnabledGet(argv)) { gets.push(argv); return ok('{"ok": true, "value": false}') } // the row BC adds
       if (isBus(argv)) bus.push(argv)
       return ok('{"ok": false, "error": "unknown key: bus.enabled"}') // every checkout without BC
@@ -1083,6 +1055,7 @@ test('an unknown bus.enabled key does not stop ensure', { plugins: [worldFixture
   const bus: (readonly string[])[] = []
   const clock = mockWorld(on, {
     process: argv => {
+      if (argv.includes('run-snapshot')) return // the default store reply
       if (isBus(argv)) bus.push(argv)
       // mk-config.py prints ok:false and exits 2 for a key no row declares
       return { value: { exitCode: 2, stdout: '{"ok": false, "error": "unknown key: bus.enabled"}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
@@ -1149,21 +1122,14 @@ test('the /mk re-arm path calls ensure once, without a 15 s wait', { plugins: [w
   expect(bus.length, '/mk re-arms and calls ensure at once').toBe(2)
 })
 
-// ---------- every active run renders, not only the newest ----------
+// ---------- the store names ONE run document: the newest active run ----------
 
-test('two active runs render both Run headers and both Plan lists, newest first', { plugins: [worldFixtures] }, async ($, on) => {
+test('two active runs: the store reply draws only the newest run, the older stays in the index', { plugins: [worldFixtures] }, async ($, on) => {
   const files = worldFiles()
-  // a second, OLDER active run: the fixture body under its own id and feature,
-  // with W0's title replaced so each Plan list has a row only it shows
-  const second = JSON.parse(files['/fixtures/run.json'] ?? '{}') as { id?: string; feature?: string; tasks?: unknown[] }
-  second.id = 'mk-ui'
-  second.feature = 'ui-polish'
-  const w0 = second.tasks?.[0]
-  if (typeof w0 === 'object' && w0 !== null) (w0 as { title?: string }).title = 'mk-ui header pass'
-  files[`${DATA_DIR}/runs/mk-ui/run.json`] = JSON.stringify(second)
+  // a second, OLDER active run in the index; run-snapshot carries only the newest run's document
   const index = JSON.stringify([
-    { id: 'wfv2', feature: 'workflows-v2', status: 'active', started: '2026-10-07T16:00:00+02:00', ended: null },
     { id: 'mk-ui', feature: 'ui-polish', status: 'active', started: '2026-10-07T14:30:00+02:00', ended: null },
+    { id: 'wfv2', feature: 'workflows-v2', status: 'active', started: '2026-10-07T16:00:00+02:00', ended: null },
     { id: 'mk-p0', feature: 'mod spikes', status: 'done', started: '2026-10-01T10:00:00+02:00', ended: '2026-10-02T10:00:00+02:00' },
   ])
   files['/fixtures/index.json'] = index // worldFixtures re-copies this on session.start
@@ -1173,24 +1139,8 @@ test('two active runs render both Run headers and both Plan lists, newest first'
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   expect(await ui.find({ text: /workflows-v2/ }), 'newest run header').toBeTruthy()
-  expect(await ui.find({ text: /ui-polish/ }), 'second run header').toBeTruthy()
-  expect(await ui.find({ text: /wizard split/ }), 'newest plan list').toBeTruthy() // W0's fixture title
-  expect(await ui.find({ text: /mk-ui header pass/ }), 'second plan list').toBeTruthy() // W0 retitled in the second run
-  // walk the drawn tree: the newest run's header and plan row come first
-  const texts: string[] = []
-  const walk = (n: unknown): void => {
-    if (typeof n !== 'object' || n === null) return
-    const node = n as { type?: string; children?: unknown[] }
-    if (node.type === 'Text' && Array.isArray(node.children)) {
-      const own = node.children.map(c => (typeof c === 'string' ? c : '')).join('')
-      if (own) texts.push(own)
-    }
-    if (Array.isArray(node.children)) node.children.forEach(walk)
-  }
-  walk(await ui.drawn())
-  const flat = texts.join('\n')
-  expect(flat.indexOf('workflows-v2'), 'newest header first').toBeLessThan(flat.indexOf('ui-polish'))
-  expect(flat.indexOf('wizard split'), 'newest plan row first').toBeLessThan(flat.indexOf('mk-ui header pass'))
+  expect(await ui.find({ text: /wizard split/ }), 'newest plan list').toBeTruthy()
+  expect(await ui.find({ text: /ui-polish/ }), 'the older active run has no document in the reply, so no block').toBeUndefined()
 })
 
 // ---------- S0: the tab bar, the Old tab and the six stub tabs ----------

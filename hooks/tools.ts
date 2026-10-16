@@ -1,6 +1,6 @@
 // MatrixKoder model tools: mk_state, mk_usage and mk_bus (strict types)
 import type { EngineInterface, On, PluginOptions, ToolCallResult } from 'claude-code'
-import { join, parseJson } from './data'
+import { parseJson } from './data'
 import { paths, resolveDataDir } from './paths'
 
 const ALLOWED_SUBCOMMANDS = new Set([
@@ -308,7 +308,7 @@ export function registerTools(on: On, _options: PluginOptions): void {
       } catch {
         // no HOME: the walk only stops at /
       }
-      const dataDir = (await resolveDataDir($, { cwd, home, store: true })) ?? join(cwd, '.matrixkoder')
+      const dataDir = (await resolveDataDir($, { cwd, home, store: true })) ?? paths.legacyDataDir(cwd)
 
       // Single-quote a shell word. A newline or NUL cannot be quoted safely.
       const shellWord = (word: string): string | null => {
