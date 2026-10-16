@@ -135,5 +135,16 @@ for f in "${files[@]}"; do
     echo "FAIL $f"; sed 's/^/  /' <<<"$out"; fail=$((fail + 1))
   fi
 done
+# C1: no MK file name is spelled outside mkpaths.py / hooks/paths.ts. The kept hits (message text, labels,
+# fixtures) are listed in c1-gate.py, so the baseline is 0. Skipped when the gate is not beside this script.
+c1_py=./c1-gate.py  # the script cd'd into its own dir above
+if [ -f "$c1_py" ]; then
+  ran=$((ran + 1))
+  if out=$(python3 "$c1_py" check --baseline 0 2>&1); then
+    echo "pass c1-gate check: $(tail -n 1 <<<"$out")"
+  else
+    echo "FAIL c1-gate check"; sed 's/^/  /' <<<"$out"; fail=$((fail + 1))
+  fi
+fi
 echo "selftest: $ran run, $fail failed"
 [ "$fail" -eq 0 ]
