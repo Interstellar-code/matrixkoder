@@ -28,16 +28,6 @@ export const RUN_SNAPSHOT = {
       },
       {
         "by": "lane-watch",
-        "from": "dispatched",
-        "run": "l5fix",
-        "t": "<t>",
-        "task": "T1",
-        "text": "lane-watch",
-        "to": "building",
-        "type": "transition"
-      },
-      {
-        "by": "lane-watch",
         "from": "building",
         "run": "l5fix",
         "t": "<t>",
@@ -55,6 +45,16 @@ export const RUN_SNAPSHOT = {
         "text": "deps met (T1): ready to dispatch",
         "to": null,
         "type": "note"
+      },
+      {
+        "by": "lead",
+        "from": "planned",
+        "run": "l5fix",
+        "t": "<t>",
+        "task": "P1",
+        "text": "roll-up from children: planned → building",
+        "to": "building",
+        "type": "transition"
       },
       {
         "by": "lead",
@@ -117,7 +117,6 @@ export const RUN_SNAPSHOT = {
         "type": "note"
       }
     ],
-    "schema": 1,
     "stage": 3,
     "started": "<started>",
     "status": "active",
