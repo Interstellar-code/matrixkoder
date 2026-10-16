@@ -36,6 +36,10 @@ type TabUi = {
 }
 
 /** The eight scopes, in hotkey order; `file`/`note` draw the scope-note line. */
+/** L10.3/L10.4: which layer a yaml row's value comes from. `inherited` is the state right after a
+ *  reset, before the list is re-read. */
+export type SettingSource = 'project' | 'global' | 'legacy' | 'default' | 'inherited'
+
 export type SettingsScopeId = 'mode' | 'project' | 'routing' | 'agents' | 'models' | 'child' | 'tabs' | 'about'
 
 export type SettingsScope = {
@@ -72,6 +76,10 @@ export type SettingsField = {
   /** S3: a live global row (its value came from $.config, keyed by suffix) —
    *  the save payload routes it to $.config.set, not to mk-config set. */
   readonly global?: true
+  /** L10.3: the layer that answered (absent on an older mk-config). */
+  readonly source?: SettingSource
+  /** L10.4: a yaml row mk-config layers, so the Global/Project sub-tabs apply to it. */
+  readonly layered?: true
 }
 
 /** One card of rows under a scope (the artboard's groups). */
@@ -194,6 +202,39 @@ function setEdit(ui: TabUi | undefined, key: string, value: string | number | bo
   ui?.set(`settings:edit:${key}`, JSON.stringify(value))
 }
 
+/** L10.4: the active sub-tab for the layered yaml rows. Project (the default) edits the project
+ *  override; Global edits mk-settings.yaml. */
+type SubTab = 'global' | 'project'
+const subOf = (ui: TabUi | undefined): SubTab => (ui?.get('settings:sub') === 'global' ? 'global' : 'project')
+
+/** L10.4: the dim marker under a layered row. Project sub-tab: overridden here, or where the value is
+ *  inherited from. Global sub-tab: the project override that hides the global value, else the global
+ *  state. `inherited` is the moment after a reset, before the list is re-read. */
+function sourceNote(f: SettingsField, sub: SubTab): string {
+  const src = f.source
+  if (src == null) return ''
+  if (sub === 'project') {
+    if (src === 'project') return '● overridden in this project'
+    if (src === 'global') return '↳ inherited from global'
+    if (src === 'legacy') return '↳ from project.yaml'
+    if (src === 'inherited') return '↳ inherited · reopen for value'
+    return '↳ default'
+  }
+  if (src === 'project') return '● a project value overrides'
+  if (src === 'global') return '● set globally'
+  if (src === 'inherited') return '↳ reset · reopen for value'
+  return src === 'legacy' ? '↳ not global · project.yaml' : '↳ not global · default'
+}
+
+/** Whether the row has something to reset in the active sub-tab (its own layer holds a value). */
+const canReset = (f: SettingsField, sub: SubTab): boolean =>
+  f.layered === true && f.editable && f.source === (sub === 'project' ? 'project' : 'global')
+
+/** switching sub-tabs drops unsaved layered edits, so a save never lands in the other layer. */
+function clearLayeredEdits(view: SettingsView, ui: TabUi | undefined): void {
+  for (const f of flatFields(view)) if (f.layered === true) ui?.set(`settings:edit:${f.key}`, '')
+}
+
 /** every row the view holds, flat (the C1 list). */
 const flatFields = (view: SettingsView): readonly SettingsField[] => view.groups.flatMap(g => g.rows)
 
@@ -254,7 +295,7 @@ function savePayloadOf(view: SettingsView, ui: TabUi | undefined): SavePayload {
     } else if (f.scope === 'tabs' && f.key.startsWith('tabs.') && typeof e === 'boolean') {
       visibility.push({ tab: f.key.slice('tabs.'.length), on: e })
     } else {
-      sets.push({ key: f.key, value: e, list: f.type === 'list' })
+      sets.push({ key: f.key, value: e, list: f.type === 'list', ...(f.layered === true ? { scope: subOf(ui) } : {}) })
     }
   }
   for (const p of view.picks) {
@@ -476,6 +517,7 @@ export function SettingsTab(els: Els, view: SettingsView, cols: number, ui?: Tab
     <Box flexDirection="column">
       {view.mock && <Text bold={true} color="warning">MOCK · fixture data · not this run</Text>}
       {ScopeBar(els, view, cols, scopeId, ui, noHk)}
+      {view.groups.some(g => g.scope === scopeId && g.rows.some(r => r.layered === true)) && SubBar(els, view, subOf(ui), ui)}
       <Box flexDirection="row" gap={1} backgroundColor={PALETTE.field} paddingX={1} marginTop={1} marginBottom={1}>
         <Text dimColor={true}>/</Text>
         {findField}
@@ -570,6 +612,32 @@ function ScopeBar(els: Els, view: SettingsView, cols: number, activeId: Settings
   )
 }
 
+/** L10.4: the Global | Project sub-tabs over the layered yaml rows. Press-only (no hotkeys: the
+ *  letters belong to the pane and the tab). */
+function SubBar(els: Els, view: SettingsView, active: SubTab, ui: TabUi | undefined): RenderElement {
+  const { Box } = els
+  return (
+    <Box flexDirection="row">
+      {(['project', 'global'] as const).map(id => Segment(els, {
+        key: `set-sub-${id}`,
+        label: id === 'project' ? 'Project' : 'Global',
+        on: id === active,
+        flat: true,
+        static: true,
+        boxed: true,
+        onPress: () => {
+          if (id === active) return
+          clearLayeredEdits(view, ui)
+          ui?.set('settings:sub', id)
+          ui?.set('settings:sel', '')
+          ui?.set('settings:open', '')
+          ui?.set('settings:focus', '')
+        },
+      }))}
+    </Box>
+  )
+}
+
 /** The row scopes' cards: one kit Card per group (the artboard's LANES /
  * RESERVE FLOOR / … headers), the group's rows filtered by the find query. */
 function GroupCards(els: Els, view: SettingsView, scopeId: SettingsScopeId, W: number, ui: TabUi | undefined, q: string, noHk: true | undefined): RenderElement {
@@ -583,9 +651,35 @@ function GroupCards(els: Els, view: SettingsView, scopeId: SettingsScopeId, W: n
       {groups.map(({ g, rows }) => Card(els, { edge: EDGE }, (
         <Box key={`set-group-${g.title}`} flexDirection="column" width={W}>
           {SecHead(els, { label: g.title, right: g.right })}
-          {rows.map(r => SettingRow(els, kitField(r, currentValue(r, ui), W), rowCtx(r, W, ui, noHk)))}
+          {rows.map(r => LayeredRow(els, view, r, W, ui, noHk))}
         </Box>
       )))}
+    </Box>
+  )
+}
+
+/** One row; a layered yaml row gets its source marker and, when its own layer holds a value, a
+ *  reset-to-inherit press (`unset`, or `unset --global`) under it. */
+function LayeredRow(els: Els, view: SettingsView, r: SettingsField, W: number, ui: TabUi | undefined, noHk: true | undefined): RenderElement {
+  const { Box, Text } = els
+  const row = SettingRow(els, kitField(r, currentValue(r, ui), W), rowCtx(r, W, ui, noHk))
+  if (r.layered !== true) return row
+  const sub = subOf(ui)
+  const note = sourceNote(r, sub)
+  if (note === '') return row
+  return (
+    <Box key={`set-layer-${r.key}`} flexDirection="column">
+      {row}
+      <Box flexDirection="row" gap={1}>
+        <Text dimColor={true}>{clip(note, Math.max(1, W - 12))}</Text>
+        {canReset(r, sub) && ActionButton(els, {
+          key: `set-unset-${r.key}`, glyph: 'inherit', word: '', tone: 'quiet', plain: true,
+          onPress: () => {
+            ui?.set(`settings:edit:${r.key}`, '')
+            ui?.save?.({ sets: [{ key: r.key, value: r.value, list: r.type === 'list', scope: sub, reset: true }], globals: [], visibility: [] })
+          },
+        })}
+      </Box>
     </Box>
   )
 }

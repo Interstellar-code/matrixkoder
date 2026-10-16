@@ -4,7 +4,7 @@
 // rows. The module itself is never stubbed.
 import { test, expect } from 'claude-code/testing'
 import {
-  applySavedView, buildSettingsView, encodeSetValue, firstTagLine, loadYaml, matchGlobalKey, mkConfigArgv,
+  applySavedView, buildSettingsView, encodeSetValue, firstTagLine, loadYaml, matchGlobalKey, mkConfigArgv, mkConfigProjectArgv,
   parsePluginManifest, saveGlobals, saveYaml, savedEditKeys, settingsInputKeys,
   tabsVisibilityToHidden, topChangelogEntry,
 } from './settings-io'
@@ -469,6 +469,86 @@ test('S3 save: the stored view folds the saved values back, so saved rows read c
   })
   expect(kept.groups.flatMap(g => g.rows).find(r => r.key === 'session.stall_min')?.value).toBe(25)
   expect(kept.groups.flatMap(g => g.rows).find(r => r.key === 'session.max_wait_min')?.value).toBe(120)
+})
+
+// ---------- L10.4: layers — argv for set / set --global / unset / --project, and the source ----------
+
+test('L10.4 argv: set writes the project row, set --global the mk-settings.yaml, unset (--global) resets', async () => {
+  const { run, calls } = stubRun(() => line({ ok: true }))
+  const out = await saveYaml(run, '/plug', '/data', [
+    { key: 'session.stall_min', value: 20, list: false, scope: 'project' },
+    { key: 'session.stall_min', value: 25, list: false, scope: 'global' },
+    { key: 'session.stall_min', value: 0, list: false, scope: 'project', reset: true },
+    { key: 'session.stall_min', value: 0, list: false, scope: 'global', reset: true },
+    { key: 'session.max_wait_min', value: 60, list: false },
+  ])
+  expect(out).toEqual({ saved: 5 })
+  expect(calls.map(c => c.slice(4))).toEqual([
+    ['set', 'session.stall_min', '20'],
+    ['set', 'session.stall_min', '25', '--global'],
+    ['unset', 'session.stall_min'],
+    ['unset', 'session.stall_min', '--global'],
+    ['set', 'session.max_wait_min', '60'],
+  ])
+})
+
+test('L10.4 argv: another project goes through --project and never carries --data', async () => {
+  expect(mkConfigProjectArgv('/plug', 'other', 'unset', 'session.stall_min')).toEqual(
+    ['python3', '/plug/scripts/mk-config.py', '--project', 'other', 'unset', 'session.stall_min'])
+  const { run, calls } = stubRun(() => line({ ok: true }))
+  await saveYaml(run, '/plug', '/data', [{ key: 'session.stall_min', value: 20, list: false, scope: 'global' }], 'other')
+  expect(calls[0]).toEqual(['python3', '/plug/scripts/mk-config.py', '--project', 'other', 'set', 'session.stall_min', '20', '--global'])
+  expect(calls[0]?.includes('--data')).toBe(false)
+  const refused = stubRun(() => line({ ok: false, error: 'unknown project: nope' }, 2))
+  expect(await saveYaml(refused.run, '/plug', '/data', [{ key: 'a', value: 1, list: false, reset: true }], 'nope'))
+    .toEqual({ saved: 0, error: 'a: unknown project: nope' })
+})
+
+test('L10.4 source: list rows carry the layer that answered; agents/picks rows are not layered', () => {
+  const fields: YamlFieldIn[] = [
+    { ...FIELDS[0]!, source: 'project' },
+    { ...FIELDS[1]!, source: 'global' },
+    { ...FIELDS[2]!, source: 'legacy' },
+    { ...FIELDS[0]!, key: 'agents.claude.available', scope: 'agents', type: 'bool', value: true, default: true, source: 'default' },
+    { ...FIELDS[1]!, key: 'repo.lanes.reuse', source: 'bogus' },
+  ]
+  const view = buildSettingsView({ fields, file: '', configRows: CONFIG_ROWS, globalDefaults: {}, about: ABOUT })
+  const rows = new Map(view.groups.flatMap(g => g.rows).map(r => [r.key, r]))
+  expect(rows.get('session.stall_min')).toMatchObject({ source: 'project', layered: true })
+  expect(rows.get('session.max_wait_min')).toMatchObject({ source: 'global', layered: true })
+  expect(rows.get('repo.lanes.slots')).toMatchObject({ source: 'legacy', layered: true })
+  expect(rows.get('agents.claude.available')?.layered).toBeUndefined()
+  expect(rows.get('repo.lanes.reuse')?.source).toBeUndefined() // an unknown word is no marker
+})
+
+test('L10.4 source: a saved set or reset moves the row to its new layer in the stored view', () => {
+  const fields: YamlFieldIn[] = FIELDS.map((f, i) => ({ ...f, source: ['project', 'global', 'default'][i] }))
+  const view = buildSettingsView({ fields, file: '', configRows: CONFIG_ROWS, globalDefaults: {}, about: ABOUT })
+  const src = (v: typeof view, key: string) => v.groups.flatMap(g => g.rows).find(r => r.key === key)?.source
+  const next = applySavedView(view, {
+    sets: [
+      { key: 'session.stall_min', value: 30, list: false, scope: 'global' }, // a project override stands over it
+      { key: 'session.max_wait_min', value: 90, list: false, scope: 'project' },
+      { key: 'repo.lanes.slots', value: 4, list: false, scope: 'global' },
+    ],
+    globals: [],
+    visibility: [],
+  })
+  expect(src(next, 'session.stall_min')).toBe('project')
+  expect(src(next, 'session.max_wait_min')).toBe('project')
+  expect(src(next, 'repo.lanes.slots')).toBe('global')
+  const reset = applySavedView(view, {
+    sets: [
+      { key: 'session.stall_min', value: 0, list: false, scope: 'project', reset: true },
+      { key: 'session.max_wait_min', value: 0, list: false, scope: 'project', reset: true }, // not project-set: unchanged
+    ],
+    globals: [],
+    visibility: [],
+  })
+  expect(src(reset, 'session.stall_min')).toBe('inherited')
+  expect(src(reset, 'session.max_wait_min')).toBe('global')
+  // a reset never rewrites the value it cannot know
+  expect(reset.groups.flatMap(g => g.rows).find(r => r.key === 'session.stall_min')?.value).toBe(20)
 })
 
 // ---------- drift tests: schema and plugin.json userConfig ----------

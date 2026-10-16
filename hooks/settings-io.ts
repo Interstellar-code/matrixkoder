@@ -18,6 +18,7 @@
 // MEDIUM focus rule). The reverse import (this file reads SettingsView from
 // settings.tsx) is type-only, so there is no runtime cycle.
 import type {
+  SettingSource,
   SettingsAbout,
   SettingsField,
   SettingsGroup,
@@ -57,6 +58,12 @@ export function mkConfigArgv(pluginRoot: string, dataDir: string, ...cmd: string
   return ['python3', `${pluginRoot}/${MK_CONFIG_SCRIPT}`, '--data', dataDir, ...cmd]
 }
 
+/** L10.3/L10.4: the same CLI aimed at ANOTHER project by slug. mk-config refuses --project together
+ *  with --data, so this argv carries --project alone (the script resolves the data dir itself). */
+export function mkConfigProjectArgv(pluginRoot: string, slug: string, ...cmd: string[]): string[] {
+  return ['python3', `${pluginRoot}/${MK_CONFIG_SCRIPT}`, '--project', slug, ...cmd]
+}
+
 /** Run argv and take the one JSON line on stdout. The real CLI reports a
  *  refusal as exit 2 WITH the reason on stdout
  *  (`{"ok":false,"error":"repo.lanes.slots must be between 1 and 6: 99"}`, empty
@@ -66,7 +73,7 @@ export function mkConfigArgv(pluginRoot: string, dataDir: string, ...cmd: string
  *  <stderr>`); exit 0 with no JSON is `printed no JSON`. */
 async function runJson(run: RunFn, argv: readonly string[]): Promise<unknown> {
   const r = await run(argv, { timeoutMs: MK_CONFIG_TIMEOUT_MS })
-  const cmd = argv.find(a => a === 'migrate' || a === 'list' || a === 'get' || a === 'set') ?? argv[argv.length - 1] ?? '?'
+  const cmd = argv.find(a => a === 'migrate' || a === 'list' || a === 'get' || a === 'set' || a === 'unset') ?? argv[argv.length - 1] ?? '?'
   const parsed = tryJson(r.stdout)
   if (parsed !== undefined) {
     const ok = okOf(parsed)
@@ -111,6 +118,8 @@ export type YamlFieldIn = {
   home?: unknown
   /** C8: global (one value for the user) | project (per project). */
   level?: unknown
+  /** L10.3: which layer answered (project|global|legacy|default); absent on an older mk-config. */
+  source?: unknown
   label: unknown
   type: unknown
   value: unknown
@@ -172,7 +181,22 @@ export async function runListFields(
 
 /** One dirty yaml row for the save: a list-typed row (or picks.*) whose edit
  *  is a comma string is encoded as a JSON array; an array edit as-is. */
-export type DirtySet = { key: string; value: SettingsValue; list: boolean }
+export type DirtySet = {
+  key: string
+  value: SettingsValue
+  list: boolean
+  /** L10.4: which layer the write lands in (`set` = the project row, `set --global` = mk-settings.yaml);
+   *  absent keeps the plain `set`. */
+  scope?: 'global' | 'project'
+  /** L10.4: reset-to-inherit — `unset` (project row, or `--global`) instead of `set`. */
+  reset?: boolean
+}
+
+/** The mk-config command words for one dirty row: `set KEY VALUE [--global]` or `unset KEY [--global]`. */
+export function dirtyCmd(d: DirtySet): string[] {
+  const flag = d.scope === 'global' ? ['--global'] : []
+  return d.reset === true ? ['unset', d.key, ...flag] : ['set', d.key, encodeSetValue(d.value, d.list), ...flag]
+}
 
 /** A comma-string edit as the JSON array C1's set takes for a list value. */
 export function encodeSetValue(value: SettingsValue, list: boolean): string {
@@ -193,13 +217,18 @@ export async function saveYaml(
   pluginRoot: string,
   dataDir: string,
   dirty: readonly DirtySet[],
+  project?: string,
 ): Promise<{ saved: number; error?: string }> {
   let saved = 0
   for (const d of dirty) {
     let ans: unknown
     const formatErr = (err: string): string => (err.startsWith(d.key) ? err : `${d.key}: ${err}`)
     try {
-      ans = await runJson(run, mkConfigArgv(pluginRoot, dataDir, 'set', d.key, encodeSetValue(d.value, d.list)))
+      const cmd = dirtyCmd(d)
+      // a project other than the session's goes through --project, never together with --data
+      ans = await runJson(run, project != null && project !== ''
+        ? mkConfigProjectArgv(pluginRoot, project, ...cmd)
+        : mkConfigArgv(pluginRoot, dataDir, ...cmd))
     } catch (e) {
       return { saved, error: formatErr(e instanceof Error ? e.message : String(e)) }
     }
@@ -561,7 +590,22 @@ function toRow(f: YamlFieldIn, scope: SettingsScopeId): SettingsField | null {
     help: f.help,
     editable: f.editable !== false,
     why: typeof f.why === 'string' ? f.why : undefined,
+    source: toSource(f.source),
+    layered: isLayered(f) ? true : undefined,
   }
+}
+
+const SOURCES: readonly string[] = ['project', 'global', 'legacy', 'default']
+
+/** L10.3's `source` as the tab's marker; anything else (an older mk-config) is no marker. */
+function toSource(v: unknown): SettingSource | undefined {
+  return typeof v === 'string' && SOURCES.includes(v) ? (v as SettingSource) : undefined
+}
+
+/** A yaml-home row mk-config layers (project row > global > project.yaml > default). The agent,
+ *  pick and helper rows stay in the project yaml: `set --global` and `unset` refuse them. */
+function isLayered(f: YamlFieldIn): boolean {
+  return f.home !== 'userConfig' && typeof f.key === 'string' && !/^(agents|picks|helpers)\./.test(f.key)
 }
 
 /** Build the live view: yaml fields grouped into the artboard's groups,
@@ -745,6 +789,19 @@ export function buildSettingsView(args: {
 
 // ---------- view-state keys the dashboard clears on a successful save ----------
 
+/** L10.4: where a saved row's value now comes from. A project `set` makes it `project`; a `--global`
+ *  set leaves a project override standing and otherwise makes it `global`. A reset leaves the row
+ *  `inherited`: the CLI does not say which layer answers next, and the stored view keeps the old
+ *  value until the tab is reopened (the list is re-read then). */
+function savedSource(r: SettingsField, d: DirtySet | undefined): { source?: SettingSource } {
+  if (d == null || r.layered !== true) return {}
+  if (d.reset === true) {
+    return d.scope === 'global' ? (r.source === 'global' ? { source: 'inherited' } : {}) : (r.source === 'project' ? { source: 'inherited' } : {})
+  }
+  if (d.scope === 'global') return r.source === 'project' ? {} : { source: 'global' }
+  return { source: 'project' }
+}
+
 /** A successful save folded back into the stored view, so the rows keep
  *  showing what was just written (the edits clear, and dirty-tracking
  *  compares against the loaded value). Yaml sets land on their rows (a
@@ -752,7 +809,8 @@ export function buildSettingsView(args: {
  *  theirs, visibility edits recompute the tabs.* bools, picks.* sets the
  *  pick order. */
 export function applySavedView(view: SettingsView, payload: SavePayload): SettingsView {
-  const sets = new Map(payload.sets.map(s => [s.key, s.value]))
+  const sets = new Map(payload.sets.filter(s => s.reset !== true).map(s => [s.key, s.value]))
+  const scopes = new Map(payload.sets.map(s => [s.key, s] as const))
   const globals = new Map(payload.globals.map(g => [g.suffix, g.value]))
   const hiddenRow = view.groups.flatMap(g => g.rows).find(r => r.key === 'hiddenTabs')
   const hiddenNext = payload.visibility.length > 0
@@ -777,7 +835,7 @@ export function applySavedView(view: SettingsView, payload: SavePayload): Settin
   }
   return {
     ...view,
-    groups: view.groups.map(g => ({ ...g, rows: g.rows.map(r => ({ ...r, value: rowValue(r) })) })),
+    groups: view.groups.map(g => ({ ...g, rows: g.rows.map(r => ({ ...r, value: rowValue(r), ...savedSource(r, scopes.get(r.key)) })) })),
     picks: view.picks.map(p => {
       const s = sets.get(`picks.${p.agent}`)
       return Array.isArray(s) ? { agent: p.agent, models: [...s] } : p
