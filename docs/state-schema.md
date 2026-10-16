@@ -16,13 +16,13 @@ gone, and `mk-migrate.py` is the ONE migration tool.
 |---|---|
 | Project data dir | `--data DIR` → `$MATRIXKODER_DATA` → the repo's `projects.data_dir` row in the root store (keyed by the **main checkout** path; `mkpaths.data_dir`) → the repo folder. toplevel = the nearest `.git` above cwd, never `$HOME` itself (a dotfiles repo is not a project); a linked worktree (`.git` file with `commondir`) resolves to its **main checkout**, a nested repo to itself (pass `--data` to reach the outer repo). Once the project is migrated (its root `projects.db_path` is set) the data dir is the project's **legacy** location; the store and every live folder come from `mkpaths.project_db(slug)` / `mkpaths.project_folder` |
 | Global dir | `$MK_HOME` / `$MATRIXKODER_HOME` → `~/.matrixkoder` (`mkpaths.home` — **one** rule: both env names are the MK home and must agree; TS: `mkHomeEnv`/`globalDirOf` in `hooks/paths.ts`). Plugin prefs live in the plugin's userConfig, not in this dir |
-| Root store | `<home>/mk.db` — the overview only: the `projects` row per project and one `plan_summary` row per plan (C3). No task row, no event |
-| Project store | `<home>/projects/<slug>/mk.db` — the project DB, the only per-project DB and the ONE source of truth (C4). A migrated project's root `projects.db_path` names this file; `mkpaths.project_db(slug)` resolves it (the bus follows every switch through it) |
-| Project folder | `<home>/projects/<slug>/` — holds `mk.db`, `project.yaml` (today's `matrixkoder.yaml`), `legacy/` and `plans/` (the C2 tree below). `watch-cursors.json` is no longer written: the bus watch cursors are `watch_cursors` rows in the project DB, and the file is read once as an import source |
+| Root store | `<home>/mk-overview.db` on a new home, `<home>/mk.db` on an existing one (`mkpaths.root_db`) — the overview only: the `projects` row per project and one `plan_summary` row per plan (C3). No task row, no event |
+| Project store | `<home>/projects/<slug>/mk-project.db` on a new home, `.../mk.db` on an existing one (`mkpaths.project_db`) — the project DB, the only per-project DB and the ONE source of truth (C4). A migrated project's root `projects.db_path` names this file; `mkpaths.project_db(slug)` resolves it (the bus follows every switch through it) |
+| Project folder | `<home>/projects/<slug>/` — holds the project DB (`mk-project.db`, or `mk.db` on an existing home), `project.yaml` (today's `matrixkoder.yaml`), `legacy/` and `plans/` (the C2 tree below). `watch-cursors.json` is no longer written: the bus watch cursors are `watch_cursors` rows in the project DB, and the file is read once as an import source |
 | Plan folder | `<home>/projects/<slug>/plans/<plan-id>/` — `plan.md`, `assets/`, `archive/` (`plan-v1.md`, `plan-v2.md` …) and `runs/` |
 | Run folder | `plans/<plan-id>/runs/<run-id>/` — `bus.jsonl` (C6) and one folder per task |
 | Task round files | `plans/<plan-id>/runs/<run-id>/<task-id>/`: `brief-rN.md`, `report-rN.md`, `review-rN.md` (paths returned by `task round`; written by the orchestrator / agents, not by mk-state; `task round --undo` refuses while any of them exists for the latest round) |
-| Lane registry | With a project `mk.db`: the `lane_slots` rows of the project DB, written **only** by `mk-lane.py`; `lanes.json` is neither read nor written. File mode (no `mk.db`) only: `<data>/lanes.json`, written only by `mk-lane.py` (see below). `mk-lane.py carry-legacy` carries a pre-switch registry into the rows once. `mk-state.py` never touches either |
+| Lane registry | With a project DB: the `lane_slots` rows of the project DB, written **only** by `mk-lane.py`; `lanes.json` is neither read nor written. File mode (no project DB) only: `<data>/lanes.json`, written only by `mk-lane.py` (see below). `mk-lane.py carry-legacy` carries a pre-switch registry into the rows once. `mk-state.py` never touches either |
 | Bus files | `<home>/bus/` — `bus.json`, `bus-tokens.json`, `bus-tokens.lock`, `bus.lock`, `bus-ensure.lock`, `ring-queue.json`, `lanes/<sha256(lane)>.json` (C6) |
 | Watch cursors | The `watch_cursors` rows of the project DB (C6), keyed `<run or *>\|<task or *>`, written by `mk-bus.py`. `<home>/projects/<slug>/watch-cursors.json` (0600) is no longer written; `mk-bus.py` reads it once as the import source when a key has no row yet |
 | Locks | `<home>/locks/<resource lower-cased>.lock` |
@@ -35,15 +35,33 @@ other file implements the MK home rule, the data-dir order, the project DB path,
 folder, the lane-token path or the watch-cursor path (`hooks/data.ts` keeps only the pure string
 math they build on).
 
+Store file names (L10.13): a fresh home names its stores `mk-overview.db` (root) and `mk-project.db`
+(project). A store that already exists as `mk.db` keeps that name and keeps resolving: the lookup
+(`mkpaths._resolve_db`) takes the new-name file when it exists, else an existing `mk.db`, else the new
+name, and it never renames a file or creates a new-name file beside an old one (migrate v2, L10.8,
+is not shipped). Store-creating calls name their kind (`mkpaths.root_db_in` / `project_db_in`; `db_in`
+guesses it from the MK home). The names are overridable per file through `MK_NAME_ROOT_DB` /
+`MK_NAME_PROJECT_DB` (and one `MK_NAME_*` for each other file-name constant) for the rename canary
+(`c1-gate.py canary`, below). Where this document writes `mk.db` below it means whichever of the two
+names the store has.
+
+C1 is a standing check: `scripts/c1-gate.py check --baseline 0` fails on any literal store or run
+file name outside `mkpaths.py` / `hooks/paths.ts` (kept hits are listed in the script), and the
+self-test runs it. `c1-gate.py canary` runs `mkpaths.py --self-test` and the `mk-e2e-layout.py`
+cycle with every `MK_NAME_*` overridden on a temp home, and fails on a default-named file in the
+tree. `mk-e2e-layout.py audit [--home DIR]` is the read-only audit of a real home (default
+`~/.matrixkoder`): it reads each store from a private copy, prints one JSON line
+`{tree, tables, schema, rules}` and exits 1 on drift.
+
 ### The folder tree (C2)
 
 ```
 ~/.matrixkoder/
-├── mk.db                         root: overview only (C3)
+├── mk-overview.db                root: overview only (C3); `mk.db` on an existing home
 ├── usage.json
 ├── bus/                          bus.json, bus-tokens.json, lanes/<sha256(lane)>.json, ring-queue.json (C6)
 └── projects/<slug>/
-    ├── mk.db                     the project DB (C4) — the only per-project DB
+    ├── mk-project.db             the project DB (C4) — the only per-project DB; `mk.db` on an existing home
     ├── project.yaml              today's matrixkoder.yaml
     ├── legacy/                   read-only tarball of the project's old data dir (C5, after user confirm)
     └── plans/<plan-id>/
@@ -65,7 +83,7 @@ files (`.matrixkoder-*` in a lane) are not data and stay.
 |---|---|---|
 | `mk-state.py` | the project DB (runs, tasks, events, artifacts, waits, and its `ack`/`artifact` helpers); the board text it prints; the lane locks under `<home>/locks/` (the root store only through `mkdb`'s `plan_summary` refresh / `catch_up`) | `lanes.json`, `lane_slots` |
 | `mk-plan.py` | the project DB (`plans`, the task rows) and the plan folder (`plan.md`, `archive/<id>-v<n>.md`) | the root store |
-| `mk-lane.py` | the `lane_slots` rows of the project DB (the lane registry; best-effort mirror onto the task), and `lanes.json` in file mode only (no `mk.db`) | the run/task state tables |
+| `mk-lane.py` | the `lane_slots` rows of the project DB (the lane registry; best-effort mirror onto the task), and `lanes.json` in file mode only (no project DB) | the run/task state tables |
 | `mk-migrate.py` | the root `projects.db_path` column (the ONLY root column it moves), the C2 project folder and the `legacy/` tarball | anything else |
 | `mkdb.py` | the root's `plan_summary` rows; every project-table write; `root-cleanup` / `restore` on the root home | — |
 | `mk-bus.py` | `<home>/bus/` files and the live bus rows of the project DB (`events` chan='bus', `acks`, bus `artifacts`) | the state tables |
@@ -73,7 +91,7 @@ files (`.matrixkoder-*` in a lane) are not data and stay.
 
 ## The project DB
 
-`<home>/projects/<slug>/mk.db` is the only source of truth (C4). The tables `plans`, `runs`, `tasks`,
+`<home>/projects/<slug>/mk-project.db` (`mk.db` on an existing home) is the only source of truth (C4). The tables `plans`, `runs`, `tasks`,
 `events`, `artifacts`, `acks`, `lane_slots`, `waits` and `change_log` are described under
 [SQLite stores](#sqlite-stores-scriptsmkdbpy) below. No file view of the run state is written (L4) or
 read (L5, L6.2); the board is **printed to stdout** from the DB by
@@ -276,11 +294,11 @@ run's messages, acks and bus artifacts are archived (count-checked) to
 
 ## `lanes.json` (slot registry, `scripts/mk-lane.py`)
 
-**File mode only.** With a project `mk.db` the `lane_slots` rows are the lane registry and
+**File mode only.** With a project DB the `lane_slots` rows are the lane registry and
 `lanes.json` is neither read nor written; `mk-lane.py carry-legacy [--dry-run]` carries a pre-switch
 registry (the legacy store's `lane_slots` and the legacy `lanes.json`) into the rows once: it inserts
 only slots absent from the target, never overwrites a newer target row, and refuses while any slot is
-busy. The rest of this section describes the file as file mode (no `mk.db`) still uses it.
+busy. The rest of this section describes the file as file mode (no project DB) still uses it.
 
 It describes the reusable **worktree slots** of this project, not a run (a project-level file beside
 the data dir, not inside a run folder).
@@ -474,6 +492,11 @@ lane-watch exit → task status (with `--task --data`, both required together): 
 `dispatched|building|stalled|quota|provider|blocked`; otherwise the status is kept and a `note` event is
 logged. `DEV_SERVER`, `ERROR`, `WATCH_EXPIRED` only append a `note` event.
 
+A verdict read from the store (`source=store`) carries the row it read (`seen`: task, status,
+`updated`). `record()` re-reads the task before writing: when the status or `updated` changed since
+(an `answer` set a `blocked` task back to `building`), the newer status is kept and only a `note`
+event is logged (`status <s> kept: row changed since read`).
+
 ### `task verify` (stage 7)
 
 `task verify T --tests '<pass>/<fail>' [--tsc N] [--lint N] [--selftest '<run>/<failed>'] [--fail 'why']`
@@ -553,8 +576,8 @@ Data-dir resolution (`resolve_data_arg`), the same order as `mk-state` and copie
 imported: `--data`, then `$MATRIXKODER_DATA`, then the data dir this repo registered (the root
 `projects.data_dir` row), else the repo folder. A
 linked worktree uses the main checkout. None of these commands creates a store: a store exists
-only when the project DB (`<home>/projects/<slug>/mk.db` for a migrated project, else
-`<data>/mk.db`) is already a file. Once the project is migrated, the store and the plan folder
+only when the project DB (`<home>/projects/<slug>/mk-project.db` for a migrated project, else
+`<data>/mk-project.db`; an existing `mk.db` keeps its name) is already a file. Once the project is migrated, the store and the plan folder
 come from `mkpaths.project_folder` / `mkpaths.plan_dir`, so nothing is written under the legacy
 data dir.
 
@@ -663,7 +686,7 @@ and the reply gains `version`, the stored version number.
 `<data>` resolves in this order: `--data` > `$MATRIXKODER_DATA` > the root `projects.data_dir` row
 (by repo path) > the repo folder. The repo is the nearest
 `.git` above the cwd, never `$HOME` itself, and a linked worktree maps to its main checkout.
-Reading the root table checks that `<home>/mk.db` exists first, so resolving never creates it.
+Reading the root table checks that the root store (`mk-overview.db`, or `mk.db` on an existing home) exists first, so resolving never creates it.
 Registering a project writes the root `projects` row (the single registry); the slug is checked
 against `^[a-z0-9][a-z0-9-]{0,40}$` before either is touched, and a bad slug writes nothing. The
 `db_path` column is the migrated marker: once set, `mkpaths.project_db(slug)` /
@@ -705,8 +728,8 @@ passes a temp home; the real `~/.matrixkoder` is never created by a test.
 
 | Store | Path | Holds |
 |---|---|---|
-| Root (C3) | `<home>/mk.db` | `projects` (with `db_path`) and `plan_summary` only. `cards`, `project_summary` and `sync` are dropped by root v3 when they hold no row |
-| Project (C4) | `<home>/projects/<slug>/mk.db` for a migrated project; a slug resolves it through `projects.db_path` (`mkpaths.project_db`). A `--data` (or pre-migration slug) opens `<data>/mk.db`, the legacy location | `plans`, `runs`, `tasks`, `events`, `artifacts`, `acks`, `lane_slots`, `waits`, `change_log`, `evidence`, `risk_reasons`, `reconcile_due`, `settings`, `watch_cursors` |
+| Root (C3) | `<home>/mk-overview.db` (`mk.db` on an existing home) | `projects` (with `db_path`) and `plan_summary` only. `cards`, `project_summary` and `sync` are dropped by root v3 when they hold no row |
+| Project (C4) | `<home>/projects/<slug>/mk-project.db` (`mk.db` on an existing home) for a migrated project; a slug resolves it through `projects.db_path` (`mkpaths.project_db`). A `--data` (or pre-migration slug) opens the store in `<data>`, the legacy location | `plans`, `runs`, `tasks`, `events`, `artifacts`, `acks`, `lane_slots`, `waits`, `change_log`, `evidence`, `risk_reasons`, `reconcile_due`, `settings`, `watch_cursors` |
 
 `<home>` is `--home` → `$MK_HOME` → `~/.matrixkoder`. `<data>` is `--data` / `data_dir`: it names
 either the project folder or (pre-migration, and for `mk-migrate`'s rollback) the project's legacy
@@ -803,7 +826,7 @@ artifact_id, meta_json)` with index `ev_task(run, task, id)`. `chan` is `state`,
 `kind` is the event type. Status changes go only through `transition()` (`chan='state'`,
 `kind='transition'`); `append_event` refuses that pair.
 `change_log(change_no INTEGER PRIMARY KEY, run, task, t)` — `change_no` is the rowid, gap-free.
-`lane_slots(slot TEXT PRIMARY KEY, lane_path, state, run, task, workspace, workspace_id, branch, lock_hash, updated)` — the five trailing columns are v3, each `TEXT`, and are the slot record (with a project `mk.db` these rows ARE the lane registry and `lanes.json` is not written; file mode keeps the same record in `lanes.json`; `workspace` and `workspace_id` are null for a plain git worktree; `branch`, `lock_hash` and `updated` are null until the slot is acquired).
+`lane_slots(slot TEXT PRIMARY KEY, lane_path, state, run, task, workspace, workspace_id, branch, lock_hash, updated)` — the five trailing columns are v3, each `TEXT`, and are the slot record (with a project DB these rows ARE the lane registry and `lanes.json` is not written; file mode keeps the same record in `lanes.json`; `workspace` and `workspace_id` are null for a plain git worktree; `branch`, `lock_hash` and `updated` are null until the slot is acquired).
 `waits(id INTEGER PRIMARY KEY, run, question, opened, cleared)` — the run's one live `waiting`
 question. `acks(run, msg, lane, level, t, PRIMARY KEY(run, msg, lane))` — the bus's ack levels (C6).
 `artifacts(id INTEGER PRIMARY KEY, run, task, round, kind, rev, text, created, src)` — `text` is
@@ -864,8 +887,8 @@ The root home can carry tables and files that later layouts replaced (`cards`, `
 
 - Default (or `--dry-run`): a read-only dry run. It opens the root DB read-only, creates and changes
   nothing, and prints the `remove`, `merge` and `keep` lists. A table that holds rows is `keep`.
-- `--apply --backup-dir D`: first makes a backup under `D/root-cleanup-<stamp>/` — a copy of `mk.db`
-  through the SQLite backup API plus every removable file, with a sha256 manifest — and verifies it
+- `--apply --backup-dir D`: first makes a backup under `D/root-cleanup-<stamp>/` — a copy of the root DB
+  (kept under its source name, `mk-overview.db` or `mk.db`) through the SQLite backup API plus every removable file, with a sha256 manifest — and verifies it
   before anything is removed. Then it removes exactly the listed items. `--apply` without
   `--backup-dir` is refused, and `--dry-run` with `--apply` is refused.
 - `mkdb.py restore --from <backup>` puts the root DB and every removed file back from a
@@ -918,7 +941,7 @@ run a writer command"): any writer, such as `mk-plan.py import`, migrates it fir
 
 
 `timeline` is `SELECT … FROM events WHERE run=? AND task=? ORDER BY id`. `overview` reads the root's `projects` + `plan_summary` (C3).
-`mk-catalog.py` follows the same rule for the root store: its read commands (`list`, `show`, `routes`, `model`) go through `read_catalog`, which returns an empty result when `<home>/mk.db` is absent (`list` and `routes` answer `{"ok": true, …: []}`) and never creates it, while the writers `seed` and `set` call `open_catalog` and do create it (`set` creates it even when the agent is unknown and the command then refuses). One JSON line per call; errors exit 2, a newer store exits 3.
+`mk-catalog.py` follows the same rule for the root store: its read commands (`list`, `show`, `routes`, `model`) go through `read_catalog`, which returns an empty result when the root store is absent (`list` and `routes` answer `{"ok": true, …: []}`) and never creates it, while the writers `seed` and `set` call `open_catalog` and do create it (`set` creates it even when the agent is unknown and the command then refuses). One JSON line per call; errors exit 2, a newer store exits 3.
 
 ### `import_history(home, project, run, *, run_row=None, tasks=(), events=(), artifacts=(), data_dir=None)`
 
