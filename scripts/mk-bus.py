@@ -246,7 +246,7 @@ class StoreAdapter:
         No store file yet means no rows. A locked, newer or unmigrated store raises Fail.
         """
         mod = self._mod()
-        path = os.path.join(mod.project_dir(self.data_dir, None, self.data_dir), "mk.db")
+        path = os.path.join(mod.project_dir(self.data_dir, None, self.data_dir, True), "mk.db")
         try:
             con = mod._open_read(path, mod.SCHEMA)
         except Exception as e:

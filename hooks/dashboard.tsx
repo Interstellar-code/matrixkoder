@@ -1233,7 +1233,7 @@ export type RootOverview = {
 
 async function readRootOverview($: EngineInterface): Promise<RootOverview> {
   const home = await globalDirOf($, await homeDir($))
-  const dbPath = home == null ? '' : paths.projectDb(home)
+  const dbPath = home == null ? '' : paths.rootDb(home)
   let exists = false
   if (dbPath !== '') {
     try { exists = await $.fs.exists(dbPath) } catch { exists = false }
