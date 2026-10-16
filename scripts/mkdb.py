@@ -19,16 +19,16 @@ The project store <data>/mk.db (or <home>/projects/<slug>/mk.db when only --proj
 holds that project's plans, runs, tasks, events and change_log (C2). The project store is the
 truth: transition() is the only status writer, and the root plan_summary is a projection written
 afterwards. L7.3 dropped the old root copies (`cards`, `project_summary`, `sync`) from every read
-and write; their CREATE TABLE lines stay for one more migration.
+and write; root schema 3 (L10.9) drops the empty ones and a fresh root never creates them.
 
 Schema: docs/state-schema.md (store section).
 """
-import argparse, contextlib, datetime, hashlib, importlib.util, json, multiprocessing, os, re, sqlite3, subprocess, sys, tempfile
+import argparse, contextlib, datetime, hashlib, importlib.util, json, multiprocessing, os, re, shutil, sqlite3, subprocess, sys, tempfile
 
 sys.dont_write_bytecode = True
 
 SCHEMA = 7
-ROOT_SCHEMA = 2  # the root store migrates additively; project stores go to SCHEMA
+ROOT_SCHEMA = 3  # the root store migrates additively; project stores go to SCHEMA
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
 
 # C1 (L3): mkpaths.py is the ONE path authority (home rule, data dir, project folder, store
@@ -68,14 +68,6 @@ ROOT_DDL = """
 CREATE TABLE IF NOT EXISTS projects(
   slug TEXT PRIMARY KEY, name TEXT, repo TEXT, data_dir TEXT, mode TEXT, created TEXT, last_activity TEXT,
   db_path TEXT);
-CREATE TABLE IF NOT EXISTS cards(
-  project TEXT, run TEXT, task TEXT, parent TEXT, type TEXT, title TEXT, status TEXT, col TEXT,
-  attention INTEGER, question TEXT, route_json TEXT, lane TEXT, round INTEGER, verdict TEXT,
-  gates TEXT, updated TEXT, change_no INTEGER, PRIMARY KEY(project, run, task));
-CREATE TABLE IF NOT EXISTS project_summary(
-  project TEXT PRIMARY KEY, active_runs INTEGER, by_status_json TEXT, attention INTEGER,
-  last_event TEXT, change_no INTEGER);
-CREATE TABLE IF NOT EXISTS sync(project TEXT PRIMARY KEY, last_change_no INTEGER);
 -- C3: one row per plan of a project — the numbers and the linkage, never the rows themselves.
 -- Column list is frozen: L2 codes against it. No task row, no event.
 CREATE TABLE IF NOT EXISTS plan_summary(
@@ -364,7 +356,7 @@ def open_root(home, version=ROOT_SCHEMA, migrations=()):
     check_home(home)
     _selftest_write_guard(os.path.join(home, "mk.db"))
     return _migrate(_connect(os.path.join(home, "mk.db")), version,
-                    ((1, ROOT_DDL), (2, _root_v2)) + tuple(migrations))
+                    ((1, ROOT_DDL), (2, _root_v2), (3, _root_v3)) + tuple(migrations))
 
 
 def _root_v2(con):
@@ -382,6 +374,17 @@ def _root_v2(con):
       project TEXT, plan TEXT, title TEXT, status TEXT, counts_json TEXT, live_run TEXT, updated TEXT,
       PRIMARY KEY(project, plan))""")
 
+
+
+def _root_v3(con):
+    """The shipped root v3 step (L10.9): drop cards, project_summary and sync, the pre-linkage
+    copies of the project store. Additive in reverse: a table is dropped only when it holds no
+    row, so a root that still has data in one keeps it (root-cleanup lists it as `keep`).
+    Safe to run twice: DROP TABLE IF EXISTS."""
+    for table in ROOT_DROPPED_TABLES:
+        exists = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+        if exists and con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0:
+            con.execute(f"DROP TABLE {table}")
 
 
 def _ensure_prev_status(con):
@@ -1883,6 +1886,434 @@ def run_snapshot(home, project=None, run=None, data_dir=None):
         con.close()
 
 
+# --- L10.9 root cleanup: dry-run list, backup, apply, restore -----------------------------------
+# The root home carries tables and files that later layouts replaced. `root-cleanup` lists them
+# (the default, writes nothing); `--apply --backup-dir D` copies every item into
+# D/root-cleanup-<stamp>/ with a sha256 manifest, verifies the copy, then removes exactly the
+# listed items. `restore --from <backup>` puts the root DB and every removed file back.
+ROOT_DROPPED_TABLES = ("cards", "project_summary", "sync")  # emptied by _root_v3, never created
+ROOT_CLEANUP_TABLES = ROOT_DROPPED_TABLES + ("event_src",)  # event_src leaked into one real root
+CLEANUP_BUS_FILES = ("bus-ensure.lock", "bus.lock", "bus-tokens.json", "bus-tokens.lock",
+                     "ring-queue.json")  # pre-L6.1 home-root names; the bus/ folder replaced them
+CLEANUP_MANIFEST = "manifest.json"
+_DERIVED_SLUG_RE = re.compile(r"^p[0-9a-f]{16}$")  # a slug derived from a path, not a name
+
+
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _tree_files(path):
+    """Every file under path (sorted, relative), plus every dir (relative, '' = path itself)."""
+    files, dirs = [], [""]
+    for cur, dnames, fnames in os.walk(path):
+        rel = os.path.relpath(cur, path)
+        rel = "" if rel == "." else rel
+        for d in dnames:
+            dirs.append(os.path.join(rel, d))
+        for f in fnames:
+            files.append(os.path.join(rel, f))
+    return sorted(files), sorted(dirs)
+
+
+def _token_slugs(home):
+    """The project slugs that bus tokens carry (slugs only, never a token), from bus/ and the
+    pre-L6.1 home-root store."""
+    slugs = {}
+    for path in (os.path.join(home, "bus", "bus-tokens.json"), os.path.join(home, "bus-tokens.json")):
+        try:
+            with open(path) as fh:
+                doc = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        entries = doc.items() if isinstance(doc, dict) else enumerate(doc) if isinstance(doc, list) else ()
+        for key, e in entries:
+            if isinstance(e, dict) and isinstance(e.get("project"), str):
+                slugs.setdefault(e["project"], set()).add(e.get("token") or key)  # a token once, not per file
+    return {slug: len(toks) for slug, toks in slugs.items()}
+
+
+def _old_bus_alive(home):
+    """True when a pre-L6.1 bus.json at the home root names a live pid: that bus still reads the
+    old token and lane files, so none of them may go."""
+    try:
+        with open(os.path.join(home, "bus.json")) as fh:
+            pid = (json.load(fh) or {}).get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            return False
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def _flock_free(path):
+    """True when nobody holds the flock on path (it is then an unused lock file)."""
+    import fcntl
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def _cleanup_projects(con, home, remove, merge, keep):
+    """List the junk and alias rows of `projects`. Alias rows (same data dir or repo as another
+    row) with a bus token are `merge`: kept, the token slug stays. Without a token and without a
+    plan_summary row they are `remove`."""
+    rows = [dict(r) for r in con.execute("SELECT * FROM projects ORDER BY slug")]
+    if not rows:
+        return
+    named = {r[0] for r in con.execute("SELECT DISTINCT project FROM plan_summary")} \
+        if con.execute("SELECT 1 FROM sqlite_master WHERE name='plan_summary'").fetchone() else set()
+    tokens = _token_slugs(home)
+    groups = {}
+    for r in rows:
+        for key in (("data_dir", r.get("data_dir")), ("repo", r.get("repo"))):
+            if key[1]:
+                groups.setdefault(key, []).append(r["slug"])
+    alias_of = {}
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        by_slug = {r["slug"]: r for r in rows}
+        canon = next((s for s in members if by_slug[s].get("repo") and not _DERIVED_SLUG_RE.match(s)),
+                     members[0])
+        for s in members:
+            if s != canon:
+                alias_of.setdefault(s, canon)
+    for r in rows:
+        slug = r["slug"]
+        repo, data_dir = r.get("repo"), r.get("data_dir")
+        if slug in alias_of:
+            n = tokens.get(slug, 0)
+            if n:
+                merge.append({"kind": "projects-row", "target": slug, "canonical": alias_of[slug],
+                              "reason": f"alias row: {n} bus token(s) carry this slug; keep it or "
+                                        "drain and re-mint, never drop", "rows": 1})
+            elif slug in named:
+                keep.append({"kind": "projects-row", "target": slug, "rows": 1,
+                             "reason": "alias row but a plan_summary row names it"})
+            else:
+                remove.append({"kind": "projects-row", "target": slug, "rows": 1,
+                               "reason": f"alias of {alias_of[slug]}, no bus token carries it"})
+            continue
+        gone = not (repo and os.path.isdir(repo)) and not (data_dir and os.path.isdir(data_dir))
+        if gone and r.get("db_path") is None and slug not in named and slug not in tokens:
+            remove.append({"kind": "projects-row", "target": slug, "rows": 1,
+                           "reason": "junk row: repo and data dir are gone, no db_path, "
+                                     "no plan_summary row, no bus token"})
+
+
+def _cleanup_files(home, remove, keep):
+    bus_dir = os.path.join(home, "bus")
+    old_alive = _old_bus_alive(home)
+
+    def item(kind, rel, reason):
+        full = os.path.join(home, rel)
+        if os.path.isdir(full):
+            files, _ = _tree_files(full)
+            return {"kind": kind, "target": rel, "reason": reason, "rows": len(files)}
+        return {"kind": kind, "target": rel, "reason": reason, "rows": 1,
+                "bytes": os.path.getsize(full)}
+
+    # old per-lane token files
+    old_lanes = os.path.join(home, "bus-lanes")
+    if os.path.isdir(old_lanes):
+        files, _ = _tree_files(old_lanes)
+        new_lanes = os.path.join(bus_dir, "lanes")
+        missing = [f for f in files if not os.path.isfile(os.path.join(new_lanes, f))
+                   or _sha256_file(os.path.join(new_lanes, f)) != _sha256_file(os.path.join(old_lanes, f))]
+        if old_alive:
+            keep.append({"kind": "dir", "target": "bus-lanes", "rows": len(files),
+                         "reason": "keep: the pre-L6.1 bus is still running"})
+        elif missing:
+            keep.append({"kind": "dir", "target": "bus-lanes", "rows": len(files),
+                         "reason": f"keep: bus/lanes holds {len(files) - len(missing)} of "
+                                   f"{len(files)} lane files"})
+        else:
+            remove.append(item("dir", "bus-lanes", "bus/lanes holds the same lane files"))
+    # .mk-home dirs: the home's own and one level into projects/<slug>/
+    cands = [".mk-home"]
+    pdir = os.path.join(home, "projects")
+    if os.path.isdir(pdir):
+        cands += [os.path.join("projects", d, ".mk-home") for d in sorted(os.listdir(pdir))]
+    for rel in cands:
+        full = os.path.join(home, rel)
+        if os.path.isdir(full) and not os.path.islink(full):
+            files, _ = _tree_files(full)
+            if files:
+                keep.append({"kind": "dir", "target": rel, "rows": len(files),
+                             "reason": "keep: .mk-home holds files"})
+            else:
+                remove.append(item("dir", rel, "empty .mk-home dir"))
+    # runs/.lock and an empty runs/
+    runs = os.path.join(home, "runs")
+    lock = os.path.join(runs, ".lock")
+    if os.path.isdir(runs):
+        left = [n for n in os.listdir(runs) if n != ".lock"]
+        if os.path.isfile(lock) and os.path.getsize(lock) == 0 and _flock_free(lock):
+            remove.append(item("file", os.path.join("runs", ".lock"), "unused empty flock file"))
+            if not left:
+                remove.append({"kind": "dir", "target": "runs", "rows": 0,
+                               "reason": "empty after runs/.lock goes"})
+        elif os.path.isfile(lock):
+            keep.append({"kind": "file", "target": os.path.join("runs", ".lock"), "rows": 1,
+                         "reason": "keep: not empty or a process holds the lock"})
+        if not os.path.isfile(lock) and not left:
+            remove.append({"kind": "dir", "target": "runs", "rows": 0, "reason": "empty runs dir"})
+    # pre-L6.1 bus files at the home root
+    new_tokens = None
+    for name in CLEANUP_BUS_FILES:
+        old = os.path.join(home, name)
+        if not os.path.isfile(old):
+            continue
+        new = os.path.join(bus_dir, name)
+        if old_alive:
+            keep.append({"kind": "file", "target": name, "rows": 1,
+                         "reason": "keep: the pre-L6.1 bus is still running"})
+        elif not os.path.isfile(new):
+            keep.append({"kind": "file", "target": name, "rows": 1,
+                         "reason": f"keep: bus/{name} does not exist"})
+        elif name == "bus-tokens.json":
+            try:
+                with open(old) as fh:
+                    o = json.load(fh)
+                with open(new) as fh:
+                    new_tokens = json.load(fh)
+                lost = [t for t in o if t not in new_tokens] if isinstance(o, dict) else ["?"]
+            except (OSError, ValueError):
+                lost = ["?"]
+            if lost:
+                keep.append({"kind": "file", "target": name, "rows": 1,
+                             "reason": f"keep: {len(lost)} token(s) are only in the old file"})
+            else:
+                remove.append(item("file", name, "every token is in bus/bus-tokens.json"))
+        else:
+            remove.append(item("file", name, f"replaced by bus/{name}"))
+    if os.path.isfile(os.path.join(home, "config.json")):
+        keep.append({"kind": "file", "target": "config.json", "rows": 1,
+                     "reason": "keep: waiting for L10.3 migrate-settings"})
+
+
+def root_cleanup_plan(home):
+    """The dry-run list: {remove, merge, keep, counts}. Read-only: the root DB opens mode=ro and
+    no file is created or changed."""
+    check_home(home)
+    remove, merge, keep = [], [], []
+    db = os.path.join(home, "mk.db")
+    if os.path.isfile(db):
+        con = _connect_ro(db)
+        try:
+            for t in ROOT_CLEANUP_TABLES:
+                if not con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                                   (t,)).fetchone():
+                    continue
+                n = con.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"]
+                if n:
+                    keep.append({"kind": "table", "target": t, "rows": n, "reason": "keep: has rows"})
+                else:
+                    remove.append({"kind": "table", "target": t, "rows": 0,
+                                   "reason": "empty table nothing reads or writes"})
+            if con.execute("SELECT 1 FROM sqlite_master WHERE name='projects'").fetchone():
+                _cleanup_projects(con, home, remove, merge, keep)
+        finally:
+            con.close()
+    _cleanup_files(home, remove, keep)
+    counts = {}
+    for it in remove:
+        counts[it["reason"]] = counts.get(it["reason"], 0) + 1
+    return {"ok": True, "home": home, "remove": remove, "merge": merge, "keep": keep, "counts": counts}
+
+
+def _backup_db(src, dst):
+    """Copy a SQLite file with the backup API (consistent even with a WAL), read-only source."""
+    ro = _connect_ro(src)
+    try:
+        out = sqlite3.connect(dst)
+        try:
+            ro.backup(out)
+        finally:
+            out.close()
+    finally:
+        ro.close()
+
+
+def _copy_into(home, rel, bdir, manifest):
+    """Copy one removal target (file or dir tree) into bdir/files/<rel>; record each file."""
+    full = os.path.join(home, rel)
+    if os.path.isdir(full):
+        files, dirs = _tree_files(full)
+        for d in dirs:
+            os.makedirs(os.path.join(bdir, "files", rel, d), exist_ok=True)
+            nd = os.path.normpath(os.path.join(rel, d))
+            if nd not in manifest["dirs"]:
+                manifest["dirs"].append(nd)
+        names = [os.path.join(rel, f) for f in files]
+    else:
+        names = [rel]
+    seen = {f["path"] for f in manifest["files"]}
+    for name in names:
+        if name in seen:
+            continue
+        dst = os.path.join(bdir, "files", name)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(os.path.join(home, name), dst)
+        manifest["files"].append({"path": name, "size": os.path.getsize(dst), "sha256": _sha256_file(dst),
+                                  "mode": os.stat(dst).st_mode & 0o7777})
+
+
+def root_cleanup_apply(home, backup_dir):
+    """Back up, verify, then remove exactly the dry-run list. -> the reply."""
+    if not backup_dir:
+        raise Fail("--apply needs --backup-dir")
+    check_home(home)
+    plan = root_cleanup_plan(home)
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    bdir = os.path.join(os.path.abspath(os.path.expanduser(backup_dir)), f"root-cleanup-{stamp}")
+    _selftest_write_guard(os.path.join(bdir, "mk.db"))
+    for it in plan["remove"]:
+        _selftest_write_guard(os.path.join(home, it["target"]))
+    if os.path.exists(bdir):
+        raise Fail(f"backup folder {bdir} exists; wait a second and retry")
+    os.makedirs(bdir, mode=0o700)  # it holds copies of token files
+    manifest = {"home": home, "stamp": stamp, "db": None, "files": [], "dirs": [], "plan": plan}
+    db = os.path.join(home, "mk.db")
+    if os.path.isfile(db):
+        _backup_db(db, os.path.join(bdir, "mk.db"))
+        manifest["db"] = {"path": "mk.db", "size": os.path.getsize(os.path.join(bdir, "mk.db")),
+                          "sha256": _sha256_file(os.path.join(bdir, "mk.db"))}
+    for it in plan["remove"]:
+        if it["kind"] in ("file", "dir"):
+            _copy_into(home, it["target"], bdir, manifest)
+    with open(os.path.join(bdir, CLEANUP_MANIFEST), "w") as fh:
+        json.dump(manifest, fh, indent=1)
+    bad = _verify_backup(bdir)
+    if bad:
+        raise Fail(f"backup verification failed, nothing was removed: {bad}")
+    removed = {"tables": [], "projects": [], "files": []}
+    drops = [it["target"] for it in plan["remove"] if it["kind"] == "table"]
+    junk = [it["target"] for it in plan["remove"] if it["kind"] == "projects-row"]
+    if os.path.isfile(db):
+        root = open_root(home)  # a v2 root migrates here; _root_v3 drops the empty orphans itself
+        try:
+            for t in drops:
+                n = root.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()[0] if root.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (t,)).fetchone() else 0
+                if n:
+                    raise Fail(f"table {t} gained {n} row(s) since the list; not dropped")
+                root.execute(f"DROP TABLE IF EXISTS {t}")
+                removed["tables"].append(t)
+            _begin(root)
+            try:
+                for slug in junk:
+                    root.execute("DELETE FROM projects WHERE slug=? AND db_path IS NULL", (slug,))
+                    removed["projects"].append(slug)
+                root.execute("COMMIT")
+            except Exception:
+                root.execute("ROLLBACK")
+                raise
+        finally:
+            root.close()
+    for it in plan["remove"]:
+        if it["kind"] == "file":
+            os.remove(os.path.join(home, it["target"]))
+            removed["files"].append(it["target"])
+    # dirs deepest first: their files are listed in the manifest, remove them, then the dirs
+    for it in plan["remove"]:
+        if it["kind"] == "dir":
+            base = os.path.join(home, it["target"])
+            if os.path.isdir(base):
+                files, dirs = _tree_files(base)
+                for f in files:
+                    os.remove(os.path.join(base, f))
+                for d in sorted(dirs, key=len, reverse=True):
+                    os.rmdir(os.path.join(base, d) if d else base)
+            removed["files"].append(it["target"] + "/")
+    return {"ok": True, "applied": True, "backup": bdir, "removed": removed}
+
+
+def _verify_backup(bdir):
+    """-> list of problems (empty when every manifest entry matches its sha256 and size)."""
+    try:
+        with open(os.path.join(bdir, CLEANUP_MANIFEST)) as fh:
+            manifest = json.load(fh)
+    except (OSError, ValueError) as e:
+        return [f"manifest unreadable: {e}"]
+    bad = []
+    db = manifest.get("db")
+    if db:
+        p = os.path.join(bdir, db["path"])
+        if not os.path.isfile(p) or _sha256_file(p) != db["sha256"]:
+            bad.append("mk.db copy does not match its sha256")
+        else:
+            con = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+            try:
+                if con.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                    bad.append("mk.db copy fails integrity_check")
+            finally:
+                con.close()
+    for f in manifest.get("files", ()):
+        p = os.path.join(bdir, "files", f["path"])
+        if not os.path.isfile(p) or os.path.getsize(p) != f["size"] or _sha256_file(p) != f["sha256"]:
+            bad.append(f"{f['path']} does not match its sha256")
+    return bad
+
+
+def root_restore(home, bdir):
+    """Put the root DB and every removed file back from a root-cleanup-<stamp> folder, verified
+    against its manifest first. The DB being replaced is saved beside the backup first."""
+    check_home(home)
+    bdir = os.path.abspath(os.path.expanduser(bdir))
+    bad = _verify_backup(bdir)
+    if bad:
+        raise Fail(f"backup does not verify, nothing restored: {bad}")
+    with open(os.path.join(bdir, CLEANUP_MANIFEST)) as fh:
+        manifest = json.load(fh)
+    for f in manifest["files"]:
+        dst = os.path.join(home, f["path"])
+        _selftest_write_guard(dst)
+        if os.path.exists(dst) and _sha256_file(dst) != f["sha256"]:
+            raise Fail(f"refusing to overwrite {dst}: it exists and differs from the backup")
+    restored = []
+    db = manifest.get("db")
+    if db:
+        target = os.path.join(home, "mk.db")
+        _selftest_write_guard(target)
+        if os.path.isfile(target):
+            _backup_db(target, os.path.join(bdir, "pre-restore-mk.db"))
+        tmp = target + ".restore"
+        shutil.copy2(os.path.join(bdir, db["path"]), tmp)
+        for side in ("-wal", "-shm"):
+            if os.path.exists(target + side):
+                os.remove(target + side)
+        os.replace(tmp, target)
+        restored.append("mk.db")
+    for d in manifest.get("dirs", ()):
+        os.makedirs(os.path.join(home, d), exist_ok=True)
+    for f in manifest["files"]:
+        dst = os.path.join(home, f["path"])
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if not os.path.exists(dst):
+            shutil.copy2(os.path.join(bdir, "files", f["path"]), dst)
+        restored.append(f["path"])
+    return {"ok": True, "restored": restored, "from": bdir}
+# --- end L10.9 root cleanup ---
+
+
 def _cli(argv):
     # The common options are accepted before or after the subcommand. They are pulled out first,
     # so a subcommand never sees them and the two positions cannot disagree.
@@ -1913,6 +2344,12 @@ def _cli(argv):
     ev.add_argument("--chan", default="state", help="channel; '' reads every channel")
     ev.add_argument("--since", type=int, help="only rows past this events.id (the wake cursor)")
     ev.add_argument("--json", action="store_true")
+    rc = sub.add_parser("root-cleanup")
+    rc.add_argument("--dry-run", action="store_true")
+    rc.add_argument("--apply", action="store_true")
+    rc.add_argument("--backup-dir")
+    rs2 = sub.add_parser("restore")
+    rs2.add_argument("--from", dest="src", required=True)
     im = sub.add_parser("import-history")
     im.add_argument("--run", required=True)
     im.add_argument("--json-file", required=True)
@@ -1945,6 +2382,14 @@ def _cli(argv):
                 "store": _store_present(home, args.project, args.data),
                 "events": events(home, args.project, args.run, args.data, args.task,
                                  args.chan, args.since)}
+    if args.cmd == "root-cleanup":
+        if args.apply and args.dry_run:
+            raise Fail("root-cleanup takes --dry-run or --apply, not both")
+        if args.apply:
+            return root_cleanup_apply(home, args.backup_dir)
+        return {**root_cleanup_plan(home), "dry_run": True}
+    if args.cmd == "restore":
+        return root_restore(home, args.src)
     if args.cmd == "import-history":
         if not args.project:
             raise Fail("import-history needs --project")
@@ -1959,8 +2404,8 @@ def _cli(argv):
                                 tasks=doc.get("tasks") or (), events=doc.get("events") or (),
                                 artifacts=doc.get("artifacts") or (), data_dir=args.data)
         return {"ok": True, **counts}
-    raise Fail("usage: mkdb.py timeline|projects|overview|plans|run-snapshot|events"
-               "|import-history --json  (or --self-test)")
+    raise Fail("usage: mkdb.py timeline|projects|overview|plans|run-snapshot|events|root-cleanup"
+               "|restore|import-history --json  (or --self-test)")
 
 
 def main(argv):
@@ -2520,6 +2965,7 @@ def self_test():
         _orphan_root_untouched(home)
         _orphan_root_absent(home)
         _cards_subcommand_gone(home)
+        _root_cleanup(home)
         _reads_create_nothing(home)
         _projects_read(home)
         _run_snapshot(home)
@@ -2558,8 +3004,11 @@ def _stores(home):
     try:
         _check(_pragmas(root) == ("wal", 5000, 1), f"root pragmas {_pragmas(root)}")
         _check(_pragmas(proj) == ("wal", 5000, 1), f"project pragmas {_pragmas(proj)}")
-        for table in ("projects", "cards", "project_summary", "sync", "schema_version"):
+        for table in ("projects", "plan_summary", "schema_version"):
             _check(root.execute("SELECT 1 FROM sqlite_master WHERE name=?", (table,)).fetchone(), table)
+        for table in ROOT_DROPPED_TABLES:  # root schema 3: a fresh root never creates them
+            _check(not root.execute("SELECT 1 FROM sqlite_master WHERE name=?", (table,)).fetchone(),
+                   f"a fresh root created {table}")
         for table in ("plans", "runs", "tasks", "events", "artifacts", "acks", "lane_slots",
                       "waits", "change_log", "schema_version"):
             _check(proj.execute("SELECT 1 FROM sqlite_master WHERE name=?", (table,)).fetchone(), table)
@@ -2915,9 +3364,9 @@ def _reads(home):
     transition(home, "reads", "r", "t", "done", note="synced", sync_root=True, data_dir=data)
     root = open_root(home)
     try:
-        for table in ("cards", "project_summary", "sync"):
-            n = root.execute(f"SELECT COUNT(*) c FROM {table}").fetchone()["c"]
-            _check(n == 0, f"{table} gained a row: {n}")
+        for table in ROOT_DROPPED_TABLES:  # not there at all, so nothing can have gained a row
+            _check(not root.execute("SELECT 1 FROM sqlite_master WHERE name=?", (table,)).fetchone(),
+                   f"{table} came back on a synced write")
     finally:
         root.close()
 
@@ -4027,7 +4476,18 @@ def _summary_two_projects(home):
 # C3 (L7.3): cards, project_summary and sync are the pre-linkage copies of the project store.
 # After the drop nothing in mkdb reads or writes them; a status write leaves them exactly as
 # they were, and a root that never had them still serves every path that stays.
-ROOT_ORPHAN_TABLES = ("cards", "project_summary", "sync")
+# The pre-L10.9 shape of the three tables, for fixtures that need a root which still holds rows in
+# them (a fresh root no longer creates them).
+OLD_ROOT_ORPHAN_DDL = """
+CREATE TABLE IF NOT EXISTS cards(
+  project TEXT, run TEXT, task TEXT, parent TEXT, type TEXT, title TEXT, status TEXT, col TEXT,
+  attention INTEGER, question TEXT, route_json TEXT, lane TEXT, round INTEGER, verdict TEXT,
+  gates TEXT, updated TEXT, change_no INTEGER, PRIMARY KEY(project, run, task));
+CREATE TABLE IF NOT EXISTS project_summary(
+  project TEXT PRIMARY KEY, active_runs INTEGER, by_status_json TEXT, attention INTEGER,
+  last_event TEXT, change_no INTEGER);
+CREATE TABLE IF NOT EXISTS sync(project TEXT PRIMARY KEY, last_change_no INTEGER);
+"""
 
 
 def _root_orphan_dump(home):
@@ -4040,7 +4500,7 @@ def _root_orphan_dump(home):
     root = open_root(home)
     try:
         out = []
-        for table in ROOT_ORPHAN_TABLES:
+        for table in ROOT_DROPPED_TABLES:
             rows = [list(r) for r in root.execute(f"SELECT * FROM {table} ORDER BY rowid")]
             out.append(table + "=" + json.dumps(rows, sort_keys=True))
         return "\n".join(out)
@@ -4075,6 +4535,7 @@ def _seed_orphan_root(home, name):
     live = os.path.join(home, name)
     root = open_root(live)
     try:
+        root.executescript(OLD_ROOT_ORPHAN_DDL)  # a fresh root has no such tables any more
         root.execute("INSERT INTO projects(slug, name, repo, data_dir, mode, created,"
                      " last_activity, db_path) VALUES (?,?,?,?,?,?,?,?)",
                      ("legacy", "Legacy", "/r/legacy", "/d/legacy", "local", "t1", "t2", None))
@@ -4095,8 +4556,9 @@ def _seed_orphan_root(home, name):
 def _orphan_root_untouched(home):
     """L7.3 (C3): a status write leaves cards/project_summary/sync alone.
 
-    Fresh root: the three tables keep 0 rows through transition(sync_root=True) — their only
-    writer is gone, and plan_summary, the rollup that stays, moves instead. A root that already
+    Fresh root: the three tables are not there at all (root schema 3 never creates them) and a
+    transition(sync_root=True) does not bring them back — their only writer is gone, and
+    plan_summary, the rollup that stays, moves instead. A root that already
     holds rows, copied into a temp home exactly as a live root would be, keeps them
     byte-identical. Both halves FAIL on the pre-L7.3 code, which writes a card, a summary and a
     watermark on every sync_root move.
@@ -4109,10 +4571,9 @@ def _orphan_root_untouched(home):
     transition(fresh, "oruntu", "r-alpha", "ALPHA1", "building", sync_root=True, data_dir=data)
     root = open_root(fresh)
     try:
-        counts = {t: root.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"]
-                  for t in ROOT_ORPHAN_TABLES}
-        _check(all(n == 0 for n in counts.values()),
-               f"_orphan_root_untouched: a fresh root gained rows in the dropped tables: {counts}")
+        made = [t for t in ROOT_DROPPED_TABLES if root.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (t,)).fetchone()]
+        _check(made == [], f"_orphan_root_untouched: a fresh root has the dropped tables: {made}")
         _check(root.execute("SELECT COUNT(*) c FROM plan_summary").fetchone()["c"] >= 1,
                "_orphan_root_untouched: the transition did not update plan_summary")
     finally:
@@ -4143,8 +4604,8 @@ def _orphan_root_absent(home):
     _add_plan_summary_tasks(data)
     root = open_root(sub)
     try:
-        for table in ROOT_ORPHAN_TABLES:
-            root.execute(f"DROP TABLE {table}")
+        for table in ROOT_DROPPED_TABLES:
+            root.execute(f"DROP TABLE IF EXISTS {table}")
         root.commit()
     finally:
         root.close()
@@ -4157,7 +4618,7 @@ def _orphan_root_absent(home):
            f"_orphan_root_absent: plans without the dropped tables: {listed}")
     root = open_root(sub)
     try:
-        back = [t for t in ROOT_ORPHAN_TABLES if root.execute(
+        back = [t for t in ROOT_DROPPED_TABLES if root.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (t,)).fetchone()]
         _check(back == [], f"_orphan_root_absent: a dropped table came back: {back}")
     finally:
@@ -4181,6 +4642,249 @@ def _cards_subcommand_gone(home):
            f"_cards_subcommand_gone: overview exited {kept.returncode}"
            f": {kept.stderr.strip()[-200:]}")
 # --- end L7.3 orphan-root self-tests ---
+
+
+# --- L10.9 root-cleanup self-tests ---
+def _rc_write(path, text="", mode=None):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as fh:
+        fh.write(text)
+    if mode:
+        os.chmod(path, mode)
+
+
+def _rc_home(base, name, old_bus_tokens=None, lanes_match=True):
+    """A temp root home shaped like a live one, at root schema 2: an empty cards/project_summary/
+    event_src, a sync table WITH a row, the projects rows of every cleanup kind, and the old bus
+    files beside their bus/ replacements. -> (home, repo, tokens dict)."""
+    home = os.path.join(base, name)
+    repo = os.path.join(base, name + "-repo")
+    os.makedirs(os.path.join(repo, ".matrixkoder"), exist_ok=True)
+    con = open_root(home, version=2)  # a v2 root: apply migrates it to v3
+    try:
+        con.executescript(OLD_ROOT_ORPHAN_DDL + "CREATE TABLE IF NOT EXISTS event_src(run TEXT, src TEXT,"
+                          " PRIMARY KEY(run, src));")
+        con.execute("INSERT INTO sync(project, last_change_no) VALUES ('keepme', 3)")
+        gone = os.path.join(base, "gone-" + name)  # a path that does not exist
+        db_path = os.path.join(home, "projects", "main", "mk.db")
+        data_main = os.path.join(repo, ".matrixkoder")
+        rows = [("main", "Main", repo, data_main, "local", "t", "t", db_path),
+                ("pa11a5a11a5a11a5a", "alias with token", "", data_main, "local", "t", "t", db_path),
+                ("pb22b5b22b5b22b5b", "alias no token", "", data_main, "local", "t", "t", None),
+                ("junk", "gone", gone, gone + "/.matrixkoder", "local", "t", "t", None),
+                ("planned", "has a plan row", gone + "-2", gone + "-2/.matrixkoder", "local", "t", "t", None)]
+        con.executemany("INSERT INTO projects(slug,name,repo,data_dir,mode,created,last_activity,db_path)"
+                        " VALUES (?,?,?,?,?,?,?,?)", rows)
+        con.execute("INSERT INTO plan_summary(project,plan,title,status,counts_json,live_run,updated)"
+                    " VALUES ('main','pl','T','approved','{\"done\":1}',NULL,'t')")
+        con.execute("INSERT INTO plan_summary(project,plan,title,status,counts_json,live_run,updated)"
+                    " VALUES ('planned','pl2','T2','draft','{}',NULL,'t')")
+        con.commit()
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        con.close()
+    tokens = {"tok-main-1": {"project": "main", "token": "tok-main-1"},
+              "tok-alias-1": {"project": "pa11a5a11a5a11a5a", "token": "tok-alias-1"}}
+    new_tokens = dict(tokens)
+    _rc_write(os.path.join(home, "bus", "bus-tokens.json"), json.dumps(new_tokens), 0o600)
+    old = dict(tokens) if old_bus_tokens is None else old_bus_tokens
+    _rc_write(os.path.join(home, "bus-tokens.json"), json.dumps(old), 0o600)
+    for name_ in ("bus-ensure.lock", "bus.lock", "bus-tokens.lock"):
+        _rc_write(os.path.join(home, name_))
+        _rc_write(os.path.join(home, "bus", name_))
+    _rc_write(os.path.join(home, "ring-queue.json"), "[]", 0o600)
+    _rc_write(os.path.join(home, "bus", "ring-queue.json"), "[]", 0o600)
+    _rc_write(os.path.join(home, "bus-lanes", "l1.json"), '{"token": "tok-main-1"}', 0o600)
+    _rc_write(os.path.join(home, "bus-lanes", "l2.json"), '{"token": "tok-alias-1"}', 0o600)
+    _rc_write(os.path.join(home, "bus", "lanes", "l1.json"), '{"token": "tok-main-1"}', 0o600)
+    if lanes_match:
+        _rc_write(os.path.join(home, "bus", "lanes", "l2.json"), '{"token": "tok-alias-1"}', 0o600)
+    os.makedirs(os.path.join(home, ".mk-home"))
+    _rc_write(os.path.join(home, "runs", ".lock"))
+    _rc_write(os.path.join(home, "config.json"), '{"a": 1}')
+    return home, repo, tokens
+
+
+def _rc_listing(home):
+    """Every path under home with size, mode and sha256 (dirs by name): the 'nothing changed'
+    proof for a dry run and the 'back byte for byte' proof for a restore. mk.db sidecars count."""
+    out = {}
+    for cur, dnames, fnames in os.walk(home):
+        for d in dnames:
+            out[os.path.relpath(os.path.join(cur, d), home)] = "dir"
+        for f in fnames:
+            p = os.path.join(cur, f)
+            out[os.path.relpath(p, home)] = (os.path.getsize(p), os.stat(p).st_mode & 0o7777, _sha256_file(p))
+    return out
+
+
+def _rc_dump(home):
+    """Every row of every table of the root DB, read-only, as one comparable dict."""
+    con = _connect_ro(os.path.join(home, "mk.db"))
+    try:
+        out = {}
+        for r in con.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"):
+            out[r[0]] = [list(x) for x in con.execute(f"SELECT * FROM {r[0]} ORDER BY rowid")]
+        return out
+    finally:
+        con.close()
+
+
+def _rc_reads(home):
+    """The overview read paths, straight from the root DB: projects that carry a db_path, and every
+    plan_summary row. Apply must leave both exactly as they were."""
+    con = _connect_ro(os.path.join(home, "mk.db"))
+    try:
+        return ([list(r) for r in con.execute("SELECT * FROM projects WHERE db_path IS NOT NULL ORDER BY slug")],
+                [list(r) for r in con.execute("SELECT * FROM plan_summary ORDER BY project, plan")])
+    finally:
+        con.close()
+
+
+def _root_cleanup(home):
+    """L10.9: the dry-run list, apply with a backup, and restore, all on temp homes."""
+    base = os.path.join(home, "rc")
+    os.makedirs(base, exist_ok=True)
+    h, repo, tokens = _rc_home(base, "h1")
+    want_remove = {("table", "cards"), ("table", "project_summary"), ("table", "event_src"),
+                   ("projects-row", "pb22b5b22b5b22b5b"), ("projects-row", "junk"),
+                   ("dir", "bus-lanes"), ("dir", ".mk-home"), ("file", "runs/.lock"), ("dir", "runs"),
+                   ("file", "bus-ensure.lock"), ("file", "bus.lock"), ("file", "bus-tokens.json"),
+                   ("file", "bus-tokens.lock"), ("file", "ring-queue.json")}
+
+    # 1. the dry run writes nothing and lists exactly the removable items
+    before_tree, before_dump = _rc_listing(h), _rc_dump(h)
+    plan = root_cleanup_plan(h)
+    cli = subprocess.run([sys.executable, __file__, "--home", h, "root-cleanup", "--dry-run"],
+                         capture_output=True, text=True)
+    _check(cli.returncode == 0, f"_root_cleanup: dry-run CLI exited {cli.returncode}: {cli.stderr[-300:]}")
+    _check(_rc_listing(h) == before_tree and _rc_dump(h) == before_dump,
+           "_root_cleanup: the dry run changed the home")
+    got = {(i["kind"], i["target"]) for i in plan["remove"]}
+    _check(got == want_remove, f"_root_cleanup: remove list {sorted(got ^ want_remove)}")
+    cli_plan = json.loads(cli.stdout)
+    _check(cli_plan["dry_run"] is True and {(i["kind"], i["target"]) for i in cli_plan["remove"]} == want_remove,
+           "_root_cleanup: the CLI dry run lists something else")
+    _check([m["target"] for m in plan["merge"]] == ["pa11a5a11a5a11a5a"] and plan["merge"][0]["canonical"] == "main",
+           f"_root_cleanup: alias row with a token is not a merge: {plan['merge']}")
+    keeps = {(i["kind"], i["target"]): i["reason"] for i in plan["keep"]}
+    _check(keeps.get(("table", "sync"), "").startswith("keep: has rows"), f"_root_cleanup: sync {keeps}")
+    _check(("projects-row", "planned") not in keeps and ("projects-row", "planned") not in got,
+           "_root_cleanup: the row a plan_summary row names was touched")
+    _check(keeps.get(("file", "config.json"), "").endswith("L10.3 migrate-settings"), f"_root_cleanup: {keeps}")
+    _check(all(i["reason"] and "rows" in i for i in plan["remove"]) and sum(plan["counts"].values()) == len(plan["remove"]),
+           "_root_cleanup: items lack a reason/rows, or counts do not add up")
+    _check("tok-main-1" not in cli.stdout and "tok-alias-1" not in cli.stdout, "_root_cleanup: a token was printed")
+    # a missing root DB lists files only and creates nothing
+    empty = os.path.join(base, "empty")
+    os.makedirs(empty)
+    _check(root_cleanup_plan(empty)["remove"] == [] and not os.path.exists(os.path.join(empty, "mk.db")),
+           "_root_cleanup: a home with no root DB")
+
+    # 2. apply is refused without --backup-dir, and --dry-run with --apply is a usage error
+    for args in (["--apply"], ["--apply", "--dry-run", "--backup-dir", os.path.join(base, "bk")]):
+        r = subprocess.run([sys.executable, __file__, "--home", h, "root-cleanup", *args],
+                           capture_output=True, text=True)
+        _check(r.returncode == 2 and _rc_listing(h) == before_tree, f"_root_cleanup: {args} -> {r.returncode}")
+
+    # 3. apply: backup, verify, then exactly the listed items go
+    reads_before = _rc_reads(h)
+    bk = os.path.join(base, "bk")
+    res = root_cleanup_apply(h, bk)
+    bdir = res["backup"]
+    _check(os.path.basename(bdir).startswith("root-cleanup-") and _verify_backup(bdir) == [],
+           f"_root_cleanup: backup {_verify_backup(bdir)}")
+    manifest = json.load(open(os.path.join(bdir, CLEANUP_MANIFEST)))
+    _check(manifest["db"]["sha256"] == _sha256_file(os.path.join(bdir, "mk.db")) and manifest["files"],
+           "_root_cleanup: manifest")
+    for kind, target in want_remove:
+        if kind in ("file", "dir"):
+            _check(not os.path.exists(os.path.join(h, target)), f"_root_cleanup: {target} is still there")
+    kept = ["config.json", "bus/bus-tokens.json", "bus/lanes/l1.json", "bus/ring-queue.json"]
+    _check(all(os.path.exists(os.path.join(h, k)) for k in kept), "_root_cleanup: a kept file went")
+    after = _rc_dump(h)
+    _check(all(t not in after for t in ("cards", "project_summary", "event_src")) and after["sync"] == [["keepme", 3]],
+           f"_root_cleanup: tables after apply {sorted(after)}")
+    slugs = {r[0] for r in after["projects"]}
+    _check(slugs == {"main", "pa11a5a11a5a11a5a", "planned"}, f"_root_cleanup: projects after apply {slugs}")
+    _check(_rc_reads(h) == reads_before, "_root_cleanup: apply changed the overview read paths")
+    ov = overview(h)  # the real reader, now that the root is at schema 3
+    _check(ov["ok"] and {p["plan"] for p in ov["plans"]} == {"pl", "pl2"}, f"_root_cleanup: overview {ov}")
+    _check(_schema_version(_connect_ro(os.path.join(h, "mk.db"))) == 3, "_root_cleanup: root not at schema 3")
+    # the live tokens still resolve: the bus/ store is untouched and holds every token slug
+    _check(set(json.load(open(os.path.join(h, "bus", "bus-tokens.json")))) == set(tokens),
+           "_root_cleanup: a live token is gone from bus/bus-tokens.json")
+    again = root_cleanup_plan(h)
+    _check(again["remove"] == [], f"_root_cleanup: a second dry run still lists {again['remove']}")
+
+    # 4. restore puts every item back byte for byte (the DB logically and by the backup's sha)
+    rr = root_restore(h, bdir)
+    _check("mk.db" in rr["restored"], "_root_cleanup: restore did not restore the DB")
+    _check(_sha256_file(os.path.join(h, "mk.db")) == manifest["db"]["sha256"], "_root_cleanup: restored DB sha")
+    _check(_rc_dump(h) == before_dump, "_root_cleanup: restored DB rows differ")
+    now_tree = _rc_listing(h)
+    for rel, v in before_tree.items():
+        if rel.startswith("mk.db"):
+            continue
+        _check(now_tree.get(rel) == v, f"_root_cleanup: restore differs at {rel}: {now_tree.get(rel)} != {v}")
+    _check(os.path.isfile(os.path.join(bdir, "pre-restore-mk.db")), "_root_cleanup: pre-restore copy missing")
+    # restoring over a changed file is refused, nothing half-restored
+    root_cleanup_apply(h, bk + "2")
+    _rc_write(os.path.join(h, "ring-queue.json"), "[1]")
+    r2 = [d for d in os.listdir(bk + "2")][0]
+    try:
+        root_restore(h, os.path.join(bk + "2", r2))
+    except Fail as e:
+        _check("refusing to overwrite" in str(e), f"_root_cleanup: {e}")
+    else:
+        raise SystemExit("SELF-TEST FAIL: restore overwrote a changed file")
+    # a corrupted backup is caught before anything is removed or restored
+    victim = os.path.join(bdir, "files", "bus.lock")
+    _rc_write(victim, "tampered")
+    _check(_verify_backup(bdir) != [], "_root_cleanup: a tampered backup verified")
+    try:
+        root_restore(h, bdir)
+    except Fail as e:
+        _check("does not verify" in str(e), f"_root_cleanup: {e}")
+    else:
+        raise SystemExit("SELF-TEST FAIL: restore used a tampered backup")
+
+    # 5. keep rules: a token only in the old file, a lane file missing from bus/lanes, a running
+    #    old bus, an .mk-home with a file, and a table with rows are all kept
+    h2, _repo, _t = _rc_home(base, "h2", old_bus_tokens={"tok-old-only": {"project": "main"}}, lanes_match=False)
+    _rc_write(os.path.join(h2, ".mk-home", "x"), "data")
+    p2 = root_cleanup_plan(h2)
+    k2 = {(i["kind"], i["target"]): i["reason"] for i in p2["keep"]}
+    r2 = {(i["kind"], i["target"]) for i in p2["remove"]}
+    _check("only in the old file" in k2.get(("file", "bus-tokens.json"), ""), f"_root_cleanup: {k2}")
+    _check("holds 1 of 2" in k2.get(("dir", "bus-lanes"), ""), f"_root_cleanup: {k2}")
+    _check("holds files" in k2.get(("dir", ".mk-home"), ""), f"_root_cleanup: {k2}")
+    _check(("file", "bus-tokens.json") not in r2 and ("dir", "bus-lanes") not in r2 and (".mk-home" not in {t for _, t in r2}),
+           "_root_cleanup: a kept item is also listed for removal")
+    _rc_write(os.path.join(h2, "bus.json"), json.dumps({"pid": os.getpid()}))  # an old bus that is alive
+    p3 = root_cleanup_plan(h2)
+    _check(not [i for i in p3["remove"] if i["kind"] in ("file", "dir") and i["target"] in CLEANUP_BUS_FILES + ("bus-lanes",)]
+           and "still running" in {(i["target"]): i["reason"] for i in p3["keep"]}.get("bus.lock", ""),
+           f"_root_cleanup: a running old bus does not keep its files: {p3['remove']}")
+    # a table that gains a row between the list and the apply is not dropped
+    h3, _r, _t = _rc_home(base, "h3")
+    con = open_root(h3, version=2)
+    try:
+        con.execute("INSERT INTO cards(project, run, task) VALUES ('p','r','t')")
+        con.commit()
+    finally:
+        con.close()
+    _check(("table", "cards") not in {(i["kind"], i["target"]) for i in root_cleanup_plan(h3)["remove"]},
+           "_root_cleanup: a table with a row is listed for removal")
+    res3 = root_cleanup_apply(h3, os.path.join(base, "bk3"))
+    _check("cards" not in res3["removed"]["tables"] and "cards" in _rc_dump(h3), "_root_cleanup: a table with rows was dropped")
+    # root schema 3 on its own: a v2 root migrates and loses only the EMPTY dropped tables
+    h4, _r, _t = _rc_home(base, "h4")
+    open_root(h4).close()
+    d4 = _rc_dump(h4)
+    _check("cards" not in d4 and "project_summary" not in d4 and d4["sync"] == [["keepme", 3]],
+           f"_root_cleanup: _root_v3 dropped/kept the wrong tables: {sorted(d4)}")
+# --- end L10.9 root-cleanup self-tests ---
 
 
 # --- L1 plan_summary self-tests: extract this whole region for the old-code probe ---
