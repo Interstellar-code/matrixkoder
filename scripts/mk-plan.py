@@ -2847,7 +2847,7 @@ def self_test():
                            env={k: v for k, v in os.environ.items() if k != "MATRIXKODER_DATA"})
         assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
         got = json.loads(r.stdout.strip().splitlines()[-1])
-        assert got["store"] is False and any("mk.db" in w for w in got.get("warnings") or []), got
+        assert got["store"] is False and any(os.path.basename(mkpaths.db_in(side)) in w for w in got.get("warnings") or []), got
 
         # C2 (L3.2): on a MIGRATED project (root db_path set by L2's mk-migrate --switch) import,
         # approve and delete write plans and archives under projects/<slug>/plans/<id>/ and leave

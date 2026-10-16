@@ -29,7 +29,7 @@ _spec = importlib.util.spec_from_file_location("mk_livetest", os.path.join(HERE,
 lt = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(lt)
 
-REAL_FILES = ("bus.json", "bus-tokens.json", mkpaths.ROOT_DB_NAME)
+REAL_FILES = ("bus.json", "bus-tokens.json", mkpaths.ROOT_DB_NAME, mkpaths.LEGACY_DB_NAME)  # the real home still holds the legacy mk.db
 RUN = "soak1"
 TASK = "SOAK"
 LANE_NAME = "soak-lane"

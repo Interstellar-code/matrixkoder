@@ -146,7 +146,7 @@ def setup(slug="lt"):
     proj.close()
     _write_marker(parent, home, repo)
     return {"ok": True, "home": home, "repo": repo, "data": data, "slug": slug,
-            "root_db": mkpaths.db_in(home), "project_db": mkpaths.db_in(data),
+            "root_db": mkpaths.root_db_in(home), "project_db": mkpaths.project_db_in(data),
             "marker": _marker_path(home)}
 
 

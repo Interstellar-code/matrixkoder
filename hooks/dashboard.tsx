@@ -1002,7 +1002,7 @@ async function refreshPlans($: EngineInterface, cwd: string, overview: RootOverv
   const dataDir = await resolveDataDir($, { cwd, home: storeHome, requireExisting: true, store: true }).catch(() => null)
   let exists = false
   if (dataDir != null) {
-    const projectPath = paths.projectDb(dataDir)
+    const projectPath = await paths.pickDb(dataDir, 'project', p => $.fs.exists(p).catch(() => false))
     try { exists = await $.fs.exists(projectPath) } catch { exists = false }
   }
   const view = await read($, viewStateAtom)
@@ -1190,7 +1190,7 @@ export type RootOverview = {
 
 async function readRootOverview($: EngineInterface): Promise<RootOverview> {
   const home = await globalDirOf($, await homeDir($))
-  const dbPath = home == null ? '' : paths.rootDb(home)
+  const dbPath = home == null ? '' : await paths.pickDb(home, 'root', p => $.fs.exists(p).catch(() => false))
   let exists = false
   if (dbPath !== '') {
     try { exists = await $.fs.exists(dbPath) } catch { exists = false }
@@ -1314,7 +1314,7 @@ async function ensureBus($: EngineInterface, options: PluginOptions, cwd: string
     // ~/.matrixkoder). File mode (no mk.db) keeps the per-project bus.json —
     // paths.busDirOf is mkpaths.bus_dir's rule.
     const globalDir = await globalDirOf($, await homeDir($))
-    const busDir = paths.busDirOf(dataDir, await readText($, paths.projectDb(dataDir)) != null, globalDir)
+    const busDir = paths.busDirOf(dataDir, await readText($, await paths.pickDb(dataDir, 'project', p => $.fs.exists(p).catch(() => false))) != null, globalDir)
     const busFile = paths.busFile(busDir)
     if ((await readText($, busFile)) != null) {
       await $.process.run(['python3', script, 'heartbeat', '--data', dataDir, '--run', snap.run.id], { timeoutMs: BUS_TIMEOUT_MS })

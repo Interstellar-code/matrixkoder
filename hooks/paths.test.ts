@@ -217,7 +217,7 @@ test('$MK_HOME and $MATRIXKODER_HOME are ONE setting, MK_HOME first', async () =
 test('the data-dir and global-dir file names come from one place', async () => {
   expect(paths.runsIndex('/d')).toBe('/d/runs/index.json')
   expect(paths.runDoc('/d', 'r1')).toBe('/d/runs/r1/run.json')
-  expect(paths.projectDb('/d')).toBe('/d/mk.db')
+  expect(paths.projectDb('/d')).toBe('/d/mk.db') // the legacy name: pickDb is the resolving form
   expect(paths.legacyDataDir('/r')).toBe('/r/.matrixkoder')
   expect(paths.homeProjectDir('/g', 'p')).toBe('/g/projects/p')
   expect(paths.planArchiveDir('p', 'a1')).toBe('~/.matrixkoder/projects/p/plans/a1/archive/')
@@ -226,6 +226,8 @@ test('the data-dir and global-dir file names come from one place', async () => {
   expect(paths.watchCursors('/d')).toBe('/d/watch-cursors.json')
   // L10.1: the same strings scripts/mkpaths.py --self-test asserts for the same home (this suite spawns no process)
   expect(paths.rootDb('/g')).toBe('/g/mk.db')
+  expect(paths.dbCandidates('/g', 'root')).toEqual(['/g/mk-overview.db', '/g/mk.db'])
+  expect(paths.dbCandidates('/d', 'project')).toEqual(['/d/mk-project.db', '/d/mk.db'])
   expect(paths.mkSettings('/g')).toBe('/g/mk-settings.yaml')
   expect(paths.inbox('/g')).toBe('/g/inbox')
   expect(paths.inbox('/g', 'p1')).toBe('/g/inbox/p1')
@@ -235,4 +237,19 @@ test('the data-dir and global-dir file names come from one place', async () => {
   expect(paths.busFile(paths.busDirOf('/d', true, '/g'))).toBe('/g/bus.json') // store mode: the one bus per home
   expect(paths.busFile(paths.busDirOf('/d', false, '/g'))).toBe('/d/bus.json') // file mode: per-project
   expect(paths.busDirOf('/d', true, null)).toBe('/d') // no global dir: the per-project bus
+})
+
+// L10.13: mkpaths._resolve_db's four states, for both kinds (scripts/mkpaths.py --self-test asserts the same table)
+test('pickDb: new name if it exists, else an existing mk.db, else the new name; both present = new wins', async () => {
+  const has = (files: readonly string[]) => (p: string): boolean => files.includes(p)
+  for (const [kind, fresh] of [['root', 'mk-overview.db'], ['project', 'mk-project.db']] as const) {
+    expect(await paths.pickDb('/h', kind, has([])), `${kind} fresh`).toBe(`/h/${fresh}`)
+    expect(await paths.pickDb('/h', kind, has(['/h/mk.db'])), `${kind} old only`).toBe('/h/mk.db')
+    expect(await paths.pickDb('/h', kind, has([`/h/${fresh}`])), `${kind} new only`).toBe(`/h/${fresh}`)
+    expect(await paths.pickDb('/h', kind, has(['/h/mk.db', `/h/${fresh}`])), `${kind} both`).toBe(`/h/${fresh}`)
+  }
+  // the other kind's new name is not this kind's store
+  expect(await paths.pickDb('/h', 'root', has(['/h/mk-project.db']))).toBe('/h/mk-overview.db')
+  // an async probe, as $.fs.exists is
+  expect(await paths.pickDb('/h', 'root', async p => p === '/h/mk.db')).toBe('/h/mk.db')
 })

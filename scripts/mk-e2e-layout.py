@@ -47,6 +47,7 @@ def _load(name, path):
 
 
 mkpaths = _load("mkpaths", os.path.join(HERE, "mkpaths.py"))  # C1: the one path module
+STORE_NAMES = (mkpaths.ROOT_DB_NAME, mkpaths.PROJECT_DB_NAME, mkpaths.LEGACY_DB_NAME)  # a store file under any of its names (L10.13)
 mkdb = _load("mkdb", os.path.join(HERE, "mkdb.py"))           # the only SQLite writer
 mkstate = _load("mk_state", os.path.join(HERE, "mk-state.py"))
 livetest = _load("mk_livetest", os.path.join(HERE, "mk-livetest.py"))
@@ -1020,7 +1021,7 @@ def build_rules():
         bad = []
         for rel in _walk(ctx["home"]):
             base = os.path.basename(rel)
-            if base in (mkpaths.ROOT_DB_NAME,) or base.endswith(("-wal", "-shm")):
+            if base in STORE_NAMES or base.endswith(("-wal", "-shm")):
                 continue
             if os.path.splitext(base)[1] in (".db", ".sqlite", ".sqlite3"):
                 # the one whitelist: `mk-state run archive`'s VACUUM INTO backup
@@ -1115,7 +1116,7 @@ def build_rules():
 def _all_mkdb(home):
     out = []
     for rel in _walk(home):
-        if os.path.basename(rel) == mkpaths.ROOT_DB_NAME:
+        if os.path.basename(rel) in STORE_NAMES:
             out.append(os.path.join(home, rel))
     return sorted(out)
 
