@@ -12,6 +12,15 @@ stays NULL, so every reader keeps the old path.
               old DB changed), else carries the new DB back new->old with the same verify.
 --archive   : AFTER the user confirms, tar the old <repo>/.matrixkoder into
               <MK home>/projects/<slug>/legacy/. Never deletes the old folder or the old DB.
+--v2        : (L10.8) the whole-home move onto the v2 names, from BOTH source shapes: a v1 C2 home
+              (`projects.db_path` set, store `projects/<slug>/mk.db`) and a pre-migration project
+              (store `<repo>/.matrixkoder/mk.db`, no db_path). `--v2 --slug A[,B] [--dry-run]` copies each
+              store with SQLite's backup API into the NEW-name file (mk-overview.db, mk-project.db) beside
+              the old one, migrates the copy to the current schema, verifies it table by table, points
+              `projects.db_path` at it, carries settings (mk-config migrate-settings), lane slots and watch
+              cursors into the copy, and moves the leftover files into <home>/backups/migrate-<stamp>/.
+              Never a bare rename and never a write to an old store. `--v2 --rollback` removes the new
+              files and puts the leftovers back; the old files were never touched.
 
 Contracts (read-only here, they are the plan's):
   C2 — the target tree. Every target path comes from mkpaths.target_*.
@@ -196,6 +205,24 @@ def _read_json(path):
         return None
 
 
+def _open_ro_any_schema(path):
+    """An existing store read-only whatever its schema (None when absent). A pre-migration store (hermes-switchui
+    is schema 4) is exactly what a migration reads, and `mkdb._open_read` refuses an OLDER store ("run a writer
+    command"), which made the quiesce check impossible. Only a store NEWER than this code is refused."""
+    if not os.path.isfile(path):
+        return None
+    con = mkdb._connect_ro(path)
+    try:
+        have = mkdb._schema_version(con)
+    except Exception:
+        con.close()
+        raise
+    if have > mkdb.SCHEMA:
+        con.close()
+        raise Fail(f"store schema v{have} is newer than this code (v{mkdb.SCHEMA}); upgrade mkdb.py", 3)
+    return con
+
+
 def _registry_rows(data):
     """The lane registry as rows (slot, lane_path, state, run, task), or None when the registry is
     genuinely absent (no store, no `lane_slots` table, no lanes.json).
@@ -206,10 +233,10 @@ def _registry_rows(data):
     db = src_db(data)
     if db and os.path.isfile(db):
         try:
-            con = mkdb._open_read(db, mkdb.SCHEMA)
+            con = _open_ro_any_schema(db)
         except sqlite3.Error as e:
             raise Fail(f"lane registry unreadable (C5 refusal): {db}: {e}", 3)
-        except Exception as e:  # mkdb.Fail: newer or unmigrated schema
+        except Exception as e:  # mkdb.Fail: a store NEWER than this code
             raise Fail(f"lane registry unreadable (C5 refusal): {db}: {e}", 3)
         if con is None:
             raise Fail(f"lane registry unreadable (C5 refusal): cannot open {db}", 3)
@@ -272,12 +299,20 @@ def pending_asks(data):
     This is the `/pending` rule: an ask with no answer naming it. An unreadable inbox is a C5
     refusal (review R1 HIGH 2), never a traceback and never "no asks"."""
     try:
-        store = mkbus.StoreAdapter(data)
-        asks = store.store_select(
-            "SELECT id, run, t FROM events WHERE chan='bus' AND kind='ask' ORDER BY id")
-        answers = store.store_select(
-            "SELECT reply_to FROM events WHERE chan='bus' AND kind='answer'"
-            " AND reply_to IS NOT NULL")
+        # the same two SELECTs mk-bus's StoreAdapter runs, on a read-only open that accepts a pre-migration
+        # (older-schema) store: StoreAdapter refuses one, and v2 must be able to quiesce a schema-4 project
+        con = _open_ro_any_schema(src_db(data))
+        if con is None:
+            asks, answers = [], []
+        else:
+            try:
+                asks = [dict(r) for r in con.execute(
+                    "SELECT id, run, t FROM events WHERE chan='bus' AND kind='ask' ORDER BY id")]
+                answers = [dict(r) for r in con.execute(
+                    "SELECT reply_to FROM events WHERE chan='bus' AND kind='answer'"
+                    " AND reply_to IS NOT NULL")]
+            finally:
+                con.close()
     except Exception as e:
         raise Fail(f"bus inbox unreadable: {e}", 3)
     answered = {a["reply_to"] for a in answers if a.get("reply_to")}
@@ -922,6 +957,373 @@ def cmd_rollback(args):
             "counts": new_state[0]}
 
 
+# ---------- v2: the whole-home move onto the v2 names (L10.8) ----------
+#
+# Both source shapes end in the same place: root `mk-overview.db`, project `mk-project.db`, settings as
+# project DB rows, lane slots and watch cursors as rows, no leftover files in the project folder.
+# The OLD files are never written: every new file is a SQLite-backup copy, so a rollback is "delete the
+# new files, put the moved leftovers back" and the old tree is byte-identical to where it started.
+
+V2_MARKER = ".migrate-v2.json"          # home-level bookkeeping (what v2 created / moved)
+LEFTOVER_RE = re.compile(
+    r"^(lanes\.json|lanes\.lock|watch-cursors\.json|(project|matrixkoder)\.yaml(\..+)?|.+\.yaml\.lock)$")
+SKIP_SUMS = {"schema_version"}          # a migration adds stamps: not user data
+# the root tables a running process rewrites by itself (derived overview rows): they never block a rollback
+ROOT_DERIVED = {"plan_summary", "project_summary", "sync", "models", "agents", "catalog_user", "schema_version"}
+
+
+def _v2_marker_path(home):
+    return os.path.join(home, V2_MARKER)
+
+
+def _table_sums(path, ref=None):
+    """{table: (rows, sha256)} read-only. With `ref` (another {table: [columns]}) the checksum covers only
+    the columns the SOURCE had, so a migration that ADDS columns or tables does not read as a change."""
+    con = open_ro(path)
+    if con is None:
+        return None
+    try:
+        out = {}
+        for t in _tables(con):
+            if t in SKIP_SUMS:
+                continue
+            cols = [r["name"] for r in con.execute(f"PRAGMA table_info({t})")]
+            use = [c for c in (ref.get(t, cols) if ref else cols) if c in cols]
+            h, n = hashlib.sha256(), 0
+            for row in con.execute(f"SELECT {', '.join(use)} FROM {t} ORDER BY rowid"):
+                n += 1
+                h.update(repr(tuple(row)).encode())
+            out[t] = (n, h.hexdigest(), cols)
+        return out
+    finally:
+        con.close()
+
+
+def _v2_compare(src, dst):
+    """Problems between a source store and its migrated copy: every source table present, equal row count and
+    equal checksum over the source's own columns. Tables the copy ADDED are fine."""
+    a = _table_sums(src)
+    if a is None:
+        return [f"source store missing: {src}"]
+    b = _table_sums(dst, ref={t: v[2] for t, v in a.items()})
+    if b is None:
+        return [f"copy missing: {dst}"]
+    bad = []
+    for t, (n, digest, _cols) in a.items():
+        if t not in b:
+            bad.append(f"{t}: table missing in the copy")
+        elif b[t][0] != n:
+            bad.append(f"{t}: {n} rows in the source, {b[t][0]} in the copy")
+        elif b[t][1] != digest:
+            bad.append(f"{t}: row checksum differs")
+    return bad
+
+
+def _file_sha(path):
+    return _hash_file(path) if os.path.isfile(path) else None
+
+
+def _v2_project(home, slug):
+    """Plan one project: its shape, old and new store, folder and every root row that names it."""
+    row = root_row(home, slug)
+    if not row:
+        raise Fail(f"no projects row for slug {slug!r}", 3)
+    data = row.get("data_dir")
+    if row.get("db_path"):
+        shape, old = "c2", row["db_path"]
+        tdir = os.path.dirname(old)
+        data_for_registry = tdir
+    else:
+        if not data or not os.path.isdir(data):
+            raise Fail(f"{slug}: no data dir at {data!r} to migrate from", 3)
+        shape, old = "legacy", src_db(data)
+        tdir = target_dir(home, slug)
+        data_for_registry = data
+    if not os.path.isfile(old):
+        raise Fail(f"{slug}: no project store at {old}", 3)
+    new = mkpaths.new_db_in(tdir, "project")
+    if os.path.realpath(old) == os.path.realpath(new):
+        raise Fail(f"{slug}: already on the v2 names ({new})", 3)
+    if os.path.realpath(tdir) != os.path.realpath(target_dir(home, slug)):
+        raise Fail(f"{slug}: its store folder {tdir} is not the C2 folder {target_dir(home, slug)}; refusing to guess", 3)
+    return {"slug": slug, "shape": shape, "data": data, "old": old, "tdir": tdir, "new": new,
+            "slugs": switch_slugs(home, slug, data) if data else [slug], "registry": data_for_registry,
+            "leftovers": sorted(n for n in (os.listdir(tdir) if os.path.isdir(tdir) else ())
+                                if os.path.isfile(os.path.join(tdir, n)) and LEFTOVER_RE.match(n)),
+            "new_exists": os.path.exists(new)}
+
+
+def _v2_plan(home, slugs):
+    root_old = mkpaths.root_db_in(home)
+    root_new = mkpaths.new_db_in(home, "root")
+    if not os.path.isfile(root_old):
+        raise Fail(f"no root store at {root_old}", 3)
+    projects = [_v2_project(home, s) for s in slugs]
+    return {"root_old": root_old, "root_new": root_new,
+            "root_copy": os.path.realpath(root_old) != os.path.realpath(root_new),
+            "root_new_exists": os.path.exists(root_new), "projects": projects}
+
+
+def _carry_lanes(con, lanes_json):
+    """Insert the slots of a leftover lanes.json that the store does not hold yet (a store row is newer and
+    never overwritten). -> the slots carried."""
+    doc = _read_json(lanes_json) if os.path.isfile(lanes_json) else None
+    slots = doc.get("slots") if isinstance(doc, dict) else None
+    if not isinstance(slots, dict):
+        return []
+    have = {r[0] for r in con.execute("SELECT slot FROM lane_slots")}
+    carried = []
+    for k, rec in sorted(slots.items(), key=lambda kv: str(kv[0])):
+        if str(k) in have or not isinstance(rec, dict):
+            continue
+        con.execute(
+            "INSERT INTO lane_slots(slot, lane_path, state, run, task, workspace, workspace_id, branch,"
+            " lock_hash, updated) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (str(k), rec.get("path"), rec.get("state"), rec.get("run"), rec.get("task"), rec.get("workspace"),
+             rec.get("workspace_id"), rec.get("branch"), rec.get("lock_hash"), rec.get("updated")))
+        carried.append(str(k))
+    return carried
+
+
+def _carry_cursors(con, cursors_json):
+    """Insert the watch cursors of a leftover watch-cursors.json that the store does not hold yet.
+    The file maps `<run or *>|<task or *>` -> {seq, started?, updated?}. -> the keys carried."""
+    doc = _read_json(cursors_json) if os.path.isfile(cursors_json) else None
+    if not isinstance(doc, dict):
+        return []
+    have = {r[0] for r in con.execute("SELECT key FROM watch_cursors")}
+    carried = []
+    for key, rec in sorted(doc.items()):
+        seq = rec.get("seq") if isinstance(rec, dict) else rec
+        if key in have or not isinstance(seq, int) or isinstance(seq, bool):
+            continue
+        con.execute("INSERT INTO watch_cursors(key, seq, started, updated) VALUES (?,?,?,?)",
+                    (key, seq, rec.get("started") if isinstance(rec, dict) else None,
+                     rec.get("updated") if isinstance(rec, dict) else None))
+        carried.append(key)
+    return carried
+
+
+def _carry_settings(home, tdir):
+    """mk-config migrate-settings against the new store: yaml keys -> project rows, config.json -> mk-settings.yaml.
+    The yaml is never edited. -> the reply."""
+    env = dict(os.environ, MK_HOME=home, MATRIXKODER_HOME=home)
+    r = subprocess.run([sys.executable, os.path.join(HERE, "mk-config.py"), "--data", tdir, "migrate-settings"],
+                       capture_output=True, text=True, env=env)
+    try:
+        doc = json.loads((r.stdout or "").strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        doc = {}
+    if r.returncode != 0 or not doc.get("ok"):
+        raise Fail(f"settings carry failed: {doc.get('error') or (r.stdout + r.stderr).strip()[-300:]}", 3)
+    return doc
+
+
+def _remove_files(paths):
+    for p in paths:
+        with contextlib.suppress(OSError):
+            os.remove(p)
+
+
+def _v2_undo_new(created):
+    """Remove only files this run created (new stores + sidecars). Old files are never in this list."""
+    for p in created:
+        _remove_files([p, p + "-wal", p + "-shm"])
+
+
+def cmd_v2(args):
+    home = mkpaths.home(args.home)
+    if args.rollback:
+        return cmd_v2_rollback(home, args)
+    slugs = [x for x in (args.slug or "").split(",") if x]
+    if not slugs:
+        raise Fail("--v2 needs --slug A[,B]: the projects to move onto the v2 names", 2)
+    plan = _v2_plan(home, slugs)
+    if os.path.exists(_v2_marker_path(home)):
+        raise Fail(f"a v2 move is already recorded ({_v2_marker_path(home)}); --v2 --rollback first", 3)
+    clash = [p["new"] for p in plan["projects"] if p["new_exists"]] + ([plan["root_new"]] if plan["root_new_exists"] and plan["root_copy"] else [])
+    if clash:
+        raise Fail("v2 target file(s) already exist, inspect or remove them: " + ", ".join(clash), 3)
+    blocked = []
+    for p in plan["projects"]:
+        try:
+            quiesce(p["registry"])
+        except Fail as e:
+            if not args.dry_run:
+                raise
+            blocked.append(f"{p['slug']}: {e}")  # a dry run still prints the plan and names what would refuse
+    steps = []
+    steps.append(f"copy root {plan['root_old']} -> {plan['root_new']} (SQLite backup API)" if plan["root_copy"]
+                 else f"root already {plan['root_new']}")
+    for p in plan["projects"]:
+        steps.append(f"{p['slug']} [{p['shape']}]: copy {p['old']} -> {p['new']}, migrate the copy to schema {mkdb.SCHEMA}, verify table by table")
+        steps.append(f"{p['slug']}: switch projects.db_path of {', '.join(p['slugs'])} to {p['new']}")
+        steps.append(f"{p['slug']}: carry settings (mk-config migrate-settings), lane slots, watch cursors into the copy")
+        extra = " (a pre-migration project: its yaml, lanes and cursors are first copied into the C2 folder, then moved too)" if p["shape"] == "legacy" else ""
+        steps.append(f"{p['slug']}: move {len(p['leftovers'])} leftover file(s) {p['leftovers']}{extra} to <home>/backups/migrate-<stamp>/{p['slug']}/")
+    if args.dry_run:
+        for line in steps:
+            print(line)
+        for line in blocked:
+            print(f"would refuse: {line}")
+        return {"ok": True, "command": "v2", "dry_run": True, "home": home, "steps": steps, "would_refuse": blocked,
+                "projects": [{k: p[k] for k in ("slug", "shape", "old", "new", "tdir", "slugs", "leftovers")}
+                             for p in plan["projects"]],
+                "root": {"old": plan["root_old"], "new": plan["root_new"]}}
+    return _v2_apply(home, plan)
+
+
+def _v2_apply(home, plan):
+    stamp = now_stamp()
+    backup = os.path.join(home, "backups", f"migrate-{stamp}")
+    created, moved = [], []          # created: new store files; moved: (backup path, original path)
+    marker = {"home": home, "stamp": stamp, "backup": backup, "created_root": False, "projects": [],
+              "old_sha": {}, "switched_at": None}
+    with switch_lock(home):
+        for p in plan["projects"]:
+            quiesce(p["registry"])
+        try:
+            # 1. the project copies (the old stores are only read)
+            for p in plan["projects"]:
+                if p["shape"] == "legacy":
+                    do_copy_verify(home, p["data"], p["slug"])  # backup-API copy + plan files + verify (root row exists: _v2_project)
+                else:
+                    copy_db(p["old"], p["new"])
+                created.append(p["new"])
+                marker["old_sha"][p["old"]] = _file_sha(p["old"])
+            # 2. the root copy (becomes the root every resolver reads: the new name wins)
+            if plan["root_copy"]:
+                marker["old_sha"][plan["root_old"]] = _file_sha(plan["root_old"])
+                copy_db(plan["root_old"], plan["root_new"])
+                created.append(plan["root_new"])
+                marker["created_root"] = True
+            # 3. migrate the copies to the current schema, through mkdb (the only writer)
+            mkdb.open_root(home).close()
+            for p in plan["projects"]:
+                mkdb.open_project(home, p["slug"]).close()
+            # 4. verify: every source table, row count and checksum equal in the copy
+            bad = []
+            for p in plan["projects"]:
+                bad += [f"{p['slug']} {x}" for x in _v2_compare(p["old"], p["new"])]
+            if plan["root_copy"]:
+                bad += [f"root {x}" for x in _v2_compare(plan["root_old"], plan["root_new"])]
+            if bad:
+                raise Fail("v2 verify failed: " + "; ".join(bad) + " — the new files were removed, the old ones are untouched", 3)
+            # 5. switch: the NEW root's rows point at the new stores
+            for p in plan["projects"]:
+                set_db_path(home, p["slugs"], p["new"])
+            # 6. carry settings, lane slots and watch cursors into the copies
+            carried = {}
+            for p in plan["projects"]:
+                settings = _carry_settings(home, p["tdir"])
+                con = mkdb.open_project(home, p["slug"])
+                try:
+                    lanes = _carry_lanes(con, mkpaths.legacy_lanes(p["tdir"]))
+                    cursors = _carry_cursors(con, mkpaths.legacy_cursors(p["tdir"]))
+                    con.commit()
+                finally:
+                    con.close()
+                carried[p["slug"]] = {"settings": len(settings.get("carried") or []),
+                                      "unknown_keys": settings.get("unknown_keys") or [],
+                                      "comments": len(settings.get("comments") or []),
+                                      "lanes": lanes, "cursors": cursors}
+            # 7. the leftovers move into a named backup (never deleted)
+            for p in plan["projects"]:
+                # listed NOW, not at plan time: a pre-migration project's C2 folder only gets its copied
+                # project.yaml / lanes.json / watch-cursors.json during step 1
+                for name in sorted(n for n in os.listdir(p["tdir"]) if LEFTOVER_RE.match(n)):
+                    src = os.path.join(p["tdir"], name)
+                    if not os.path.isfile(src):
+                        continue
+                    dst = os.path.join(backup, p["slug"], name)
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    shutil.move(src, dst)
+                    moved.append((dst, src))
+        except BaseException as e:
+            # roll the partial v2 back: put moved files back, remove only what this run created. The old
+            # stores and the old root were never written, so they are exactly as they started.
+            for dst, src in reversed(moved):
+                with contextlib.suppress(OSError):
+                    shutil.move(dst, src)
+            _v2_undo_new(created)
+            for p in plan["projects"]:
+                if p["shape"] == "legacy":
+                    _remove_new_copy(home, p["slug"])  # the plan files do_copy_verify wrote into the C2 folder
+            if isinstance(e, (Fail, KeyboardInterrupt, SystemExit)):
+                raise
+            raise Fail(f"v2 failed: {type(e).__name__}: {e} — the new files were removed, the old ones are untouched", 3)
+        # 8. the record a rollback needs: what was created, moved, and the state of the new files now
+        marker["switched_at"] = now_iso()
+        marker["moved"] = [[a, b] for a, b in moved]
+        marker["created"] = created
+        for p in plan["projects"]:
+            st = state_of(p["new"])
+            marker["projects"].append({"slug": p["slug"], "slugs": p["slugs"], "old": p["old"], "new": p["new"],
+                                       "shape": p["shape"], "tdir": p["tdir"], "counts": st[0], "digest": st[1]})
+        marker["root_projects_digest"] = _root_projects_digest(plan["root_new"])
+        with open(_v2_marker_path(home), "w") as f:
+            json.dump(marker, f, indent=2, sort_keys=True)
+    return {"ok": True, "command": "v2", "home": home, "backup": backup, "carried": carried,
+            "projects": [{"slug": x["slug"], "shape": x["shape"], "new": x["new"], "counts": x["counts"]}
+                         for x in marker["projects"]],
+            "root": plan["root_new"], "moved": len(moved)}
+
+
+def _root_projects_digest(root_path):
+    con = open_ro(root_path)
+    if con is None:
+        return None
+    try:
+        h = hashlib.sha256()
+        for row in con.execute("SELECT slug, data_dir, db_path FROM projects ORDER BY slug"):
+            h.update(repr(tuple(row)).encode())
+        return h.hexdigest()
+    finally:
+        con.close()
+
+
+def cmd_v2_rollback(home, args):
+    """Undo --v2: refuse when a NEW project store (or the root's project rows) changed since the switch;
+    else put the leftovers back and remove the new files. The old files are not written."""
+    mpath = _v2_marker_path(home)
+    marker = _read_json(mpath) if os.path.isfile(mpath) else None
+    if not marker:
+        raise Fail(f"no v2 record at {mpath}: nothing to roll back", 3)
+    lines = [f"remove {p}" for p in marker.get("created", [])]
+    lines += [f"restore {dst} -> {src}" for dst, src in marker.get("moved", [])]
+    if args.dry_run:
+        for line in lines:
+            print(line)
+        return {"ok": True, "command": "v2-rollback", "dry_run": True, "steps": lines}
+    with switch_lock(home):
+        for p in marker.get("projects", []):
+            st = state_of(p["new"])
+            if st is None:
+                raise Fail(f"the new store is gone: {p['new']}", 3)
+            if st[1] != p["digest"]:
+                raise Fail(f"the new store {p['new']} changed after the v2 switch; refusing to roll back (its writes"
+                           " would be lost)", 3)
+        root_new = mkpaths.new_db_in(home, "root")
+        if marker.get("created_root") and os.path.isfile(root_new):
+            if _root_projects_digest(root_new) != marker.get("root_projects_digest"):
+                raise Fail("the new root's project rows changed after the v2 switch; refusing to roll back", 3)
+        for dst, src in marker.get("moved", []):
+            if os.path.exists(src):
+                raise Fail(f"cannot restore {src}: it exists again (inspect it, then retry)", 3)
+        for dst, src in marker.get("moved", []):
+            if os.path.isfile(dst):
+                os.makedirs(os.path.dirname(src), exist_ok=True)
+                shutil.move(dst, src)
+        _v2_undo_new(marker.get("created", []))
+        for p in marker.get("projects", []):
+            if p.get("shape") == "legacy":
+                _remove_new_copy(home, p["slug"])  # the C2 folder a pre-migration project did not have before
+        old_changed = [p for p, sha in (marker.get("old_sha") or {}).items() if _file_sha(p) != sha]
+        os.remove(mpath)
+    return {"ok": True, "command": "v2-rollback", "home": home, "removed": marker.get("created", []),
+            "restored": len(marker.get("moved", [])), "old_files_changed": old_changed}
+
+
 def cmd_archive(args):
     home, data, slug, repo = _prepare(args)
     row = root_row(home, slug)
@@ -1003,6 +1405,7 @@ def build_parser():
     p.add_argument("--switch", action="store_true", help="copy+verify under the lock, then set projects.db_path")
     p.add_argument("--rollback", action="store_true", help="undo a switch (refuses on new writes)")
     p.add_argument("--archive", action="store_true", help="tar the old <repo>/.matrixkoder under the MK home")
+    p.add_argument("--v2", action="store_true", help="move onto the v2 names (mk-overview.db, mk-project.db); --slug A[,B]")
     p.add_argument("--slug", help="project slug (registered in the root when absent)")
     p.add_argument("--data", help="the project data dir (default: the data-dir order)")
     p.add_argument("--home", help="the MK home (default $MK_HOME / ~/.matrixkoder)")
@@ -1015,7 +1418,9 @@ def main(argv):
         return self_test()
     args = build_parser().parse_args(argv)
     try:
-        if args.archive:
+        if args.v2:
+            out = cmd_v2(args)
+        elif args.archive:
             out = cmd_archive(args)
         elif args.rollback:
             out = cmd_rollback(args)
@@ -1271,6 +1676,227 @@ def _alias_root_row(home, data, repo):
 def _other_root_row(home, data, repo):
     """A root row for a DIFFERENT data dir: the set the switch must never touch."""
     _root_rows_set(home, [("otherproj", data)])
+
+
+V2_YAML = ("# my own note\nsession:\n  stall_min: 17\nmystery_key: keep-me\n")
+V2_NO_FILL = ("settings", "schema_version")      # tables the source fixture leaves empty on purpose
+
+
+def _v2_fill(con):
+    """One row in every project-store table a source holds (direct INSERTs through an open mkdb connection)."""
+    con.execute("INSERT INTO plans(id, version, title, status, header_json) VALUES ('pa', 1, 'A', 'running', '{}')")
+    con.execute("INSERT INTO runs(id, plan, status, started) VALUES ('ra', 'pa', 'active', 't0')")
+    con.execute("INSERT INTO tasks(run, id, type, title, status) VALUES ('ra', 'T1', 'task', 'one', 'todo')")
+    con.execute("INSERT INTO events(run, task, t, chan, kind, from_id, to_id, text)"
+                " VALUES ('ra', 'T1', 't1', 'bus', 'info', 'orch', 'T1', 'hello')")
+    con.execute("INSERT INTO artifacts(run, task, round, kind, rev, text, created)"
+                " VALUES ('ra', 'T1', 1, 'brief', 1, '# brief', 't2')")
+    con.execute("INSERT INTO acks(run, msg, lane, level, t) VALUES ('ra', 'm-1', 'L1', 1, 't3')")
+    con.execute("INSERT OR REPLACE INTO change_log(change_no, run, task, t) VALUES (900, 'ra', 'T1', 't4')")
+    con.execute("INSERT INTO waits(run, question, opened) VALUES ('ra', 'why?', 't5')")
+    con.execute("INSERT OR REPLACE INTO lane_slots(slot, lane_path, state, run, task) VALUES ('1', '/x/lane1', 'free', 'ra', 'T1')")
+    con.execute("INSERT OR REPLACE INTO event_src(run, src) VALUES ('ra', 'src-1')")
+    for t in ("evidence", "risk_reasons", "reconcile_due", "watch_cursors"):
+        if con.execute("SELECT 1 FROM sqlite_master WHERE name=?", (t,)).fetchone():
+            if t == "evidence":
+                con.execute("INSERT INTO evidence(run, task, line, gate, result) VALUES ('ra', 'T1', 'l', 'g', 'pass')")
+            elif t == "risk_reasons":
+                con.execute("INSERT INTO risk_reasons(run, task, kind, points, opened) VALUES ('ra', 'T1', 'k', 1, 't6')")
+            elif t == "reconcile_due":
+                con.execute("INSERT INTO reconcile_due(run, scope, created) VALUES ('ra', 's', 't7')")
+            else:
+                con.execute("INSERT INTO watch_cursors(key, seq, started, updated) VALUES ('ra|*', 3, NULL, NULL)")
+    con.commit()
+
+
+def _v2_rename_to_legacy(path_new, folder):
+    """Give a closed store the OLD file name (a closed WAL store leaves no sidecar; drop strays)."""
+    os.replace(path_new, mkpaths.legacy_db_in(folder))
+    for suffix in ("-wal", "-shm"):
+        with contextlib.suppress(OSError):
+            os.remove(path_new + suffix)
+
+
+def _v2_write(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(text)
+
+
+def _v2_fixture_c2(tmp):
+    """Shape 1: a v1 C2 home. Root and project stores under the LEGACY name, root row has db_path set,
+    leftovers in the project folder, a frozen copy in <repo>/.matrixkoder."""
+    home, repo = os.path.join(tmp, "home"), os.path.join(tmp, "repo")
+    data, slug = os.path.join(repo, ".matrixkoder"), "v2c2"
+    tdir = os.path.join(home, "projects", slug)
+    os.makedirs(data)
+    os.makedirs(tdir)
+    with _as_home(home):
+        root = mkdb.open_root(home)
+        root.execute("INSERT INTO projects(slug, name, repo, data_dir, mode, created, last_activity, db_path)"
+                     " VALUES (?,?,?,?,?,?,?,?)", (slug, slug, repo, os.path.realpath(data), "home", "c", "c",
+                                                  mkpaths.legacy_db_in(tdir)))
+        root.execute("INSERT INTO plan_summary(project, plan, title, status, counts_json, live_run, updated)"
+                     " VALUES (?, 'pa', 'A', 'running', '{}', 'ra', 'u')", (slug,))
+        root.commit()
+        root.close()
+        con = mkdb.open_project(home, slug)
+        _v2_fill(con)
+        con.close()
+        newp = mkpaths.new_db_in(tdir, "project")
+        _v2_rename_to_legacy(newp, tdir)
+        _v2_rename_to_legacy(mkpaths.new_db_in(home, "root"), home)
+    shutil.copyfile(mkpaths.legacy_db_in(tdir), mkpaths.legacy_db_in(data))      # the frozen pre-switch copy
+    _v2_write(mkpaths.legacy_yaml(data), V2_YAML)
+    _v2_write(mkpaths.legacy_lanes(tdir), json.dumps({"slots": {"1": {"path": "/x/lane1", "state": "free"},
+                                                              "2": {"path": "/x/lane2", "state": "free", "branch": "b2"}}}))
+    _v2_write(mkpaths.legacy_cursors(tdir), json.dumps({"ra|*": {"seq": 3}, "rb|T9": {"seq": 8}}))
+    _v2_write(mkpaths.project_yaml_in(tdir), V2_YAML)
+    _v2_write(mkpaths.project_yaml_in(tdir) + ".bak", "# older\n")
+    _v2_write(mkpaths.project_yaml_in(tdir) + ".lock", "")
+    _v2_write(mkpaths.legacy_yaml(tdir) + ".lock", "")
+    _v2_write(os.path.join(tdir, "lanes.lock"), "")
+    return {"home": home, "repo": repo, "data": data, "slug": slug, "tdir": tdir, "shape": "c2",
+            "old_proj": mkpaths.legacy_db_in(tdir), "old_root": mkpaths.legacy_db_in(home),
+            "leftovers": [mkpaths.LANES_NAME, "lanes.lock", mkpaths.CURSORS_NAME, mkpaths.PROJECT_YAML_NAME,
+                          mkpaths.PROJECT_YAML_NAME + ".bak", mkpaths.PROJECT_YAML_NAME + ".lock",
+                          mkpaths.LEGACY_YAML_NAME + ".lock"], "lane": "2", "cursor": "rb|T9"}
+
+
+def _v2_fixture_legacy(tmp):
+    """Shape 2: a pre-migration project. Schema-4 store `<repo>/.matrixkoder/<legacy name>`, matrixkoder.yaml,
+    lanes.json and watch-cursors.json beside it, root row with db_path NULL, root store under the LEGACY name."""
+    home, repo = os.path.join(tmp, "home"), os.path.join(tmp, "repo")
+    data, slug = os.path.join(repo, ".matrixkoder"), "v2leg"
+    os.makedirs(data)
+    with _as_home(home):
+        root = mkdb.open_root(home)
+        root.execute("INSERT INTO projects(slug, name, repo, data_dir, mode, created, last_activity)"
+                     " VALUES (?,?,?,?,?,?,?)", (slug, slug, repo, os.path.realpath(data), "home", "c", "c"))
+        root.commit()
+        root.close()
+        con = mkdb.open_project(home, slug, data_dir=data, version=4)
+        _v2_fill(con)
+        con.close()
+        _v2_rename_to_legacy(mkpaths.new_db_in(data, "project"), data)
+        _v2_rename_to_legacy(mkpaths.new_db_in(home, "root"), home)
+    _v2_write(mkpaths.legacy_yaml(data), V2_YAML)
+    _v2_write(mkpaths.legacy_lanes(data), json.dumps({"slots": {"1": {"path": "/x/lane1", "state": "free"},
+                                                              "2": {"path": "/x/lane2", "state": "free", "branch": "b2"}}}))
+    _v2_write(mkpaths.legacy_cursors(data), json.dumps({"ra|*": {"seq": 3}, "rb|T9": {"seq": 8}}))
+    return {"home": home, "repo": repo, "data": data, "slug": slug, "tdir": os.path.join(home, "projects", slug),
+            "shape": "legacy", "old_proj": mkpaths.legacy_db_in(data), "old_root": mkpaths.legacy_db_in(home),
+            "leftovers": [mkpaths.CURSORS_NAME, mkpaths.PROJECT_YAML_NAME], "lane": None, "cursor": "rb|T9"}
+
+
+def _v2_hash(*roots):
+    """_tree_hash over folders, minus the migrator's own lock file (created by any locked run, never removed) and the empty WAL sidecars a read leaves."""
+    for r in roots:
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(r, "locks", "migrate.lock"))
+        # a read-only open of a WAL store leaves an EMPTY -wal and a -shm beside it (SQLite, not a write): drop those
+        for d, _dirs, files in os.walk(r):
+            for n in files:
+                if n.endswith("-wal") and os.path.getsize(os.path.join(d, n)) == 0:
+                    for suffix in ("-wal", "-shm"):
+                        with contextlib.suppress(OSError):
+                            os.remove(os.path.join(d, n[:-4] + suffix))
+    return [_tree_hash(r) for r in roots]
+
+
+def _v2_args(fx, *extra):
+    return ["--v2", "--home", fx["home"], *extra]
+
+
+def _v2_rehearse(fx):
+    home, repo, slug, tdir = fx["home"], fx["repo"], fx["slug"], fx["tdir"]
+    tag = f"v2-{fx['shape']}"
+    start = _v2_hash(home, repo)
+    # (1) dry run: prints the steps, changes nothing
+    rc, out, err = _cli(home, _v2_args(fx, "--slug", slug, "--dry-run"))
+    _check(rc == 0 and "copy" in out and "carry settings" in out, f"{tag} dry-run rc={rc} {out[-300:]} {err[-300:]}")
+    _check(_v2_hash(home, repo) == start, f"{tag}: the dry run changed the tree")
+    old_sha = {p: _hash_file(p) for p in (fx["old_proj"], fx["old_root"])}
+    # the leftovers' bytes: the c2 ones in the project folder, the legacy ones in the data dir (the copy puts them in tdir)
+    src_folder = tdir if fx["shape"] == "c2" else fx["data"]
+    orig = {}
+    for n in fx["leftovers"]:
+        base = mkpaths.LEGACY_YAML_NAME if (fx["shape"] == "legacy" and n == mkpaths.PROJECT_YAML_NAME) else n
+        with open(os.path.join(src_folder, base), "rb") as f:
+            orig[n] = f.read()
+    # (2) apply
+    rc, out, err = _cli(home, _v2_args(fx, "--slug", slug))
+    _check(rc == 0, f"{tag} apply rc={rc} {out[-500:]} {err[-300:]}")
+    new_proj, new_root = mkpaths.new_db_in(tdir, "project"), mkpaths.new_db_in(home, "root")
+    _check(os.path.isfile(new_proj) and os.path.isfile(new_root), f"{tag}: new stores missing")
+    for p, sha in old_sha.items():
+        _check(_hash_file(p) == sha, f"{tag}: old store {p} changed")
+    with _as_home(home):
+        _check(mkpaths.root_db(home) == new_root, f"{tag}: root_db is {mkpaths.root_db(home)}")
+        _check(mkpaths.project_db(slug=slug) == new_proj, f"{tag}: project_db is {mkpaths.project_db(slug=slug)}")
+    bad = _v2_compare(fx["old_proj"], new_proj)
+    # lane_slots, watch_cursors and settings legitimately gain the carried rows; every other table is equal
+    # a legacy store that already holds lane rows wins over lanes.json (do_copy_verify's rule): no slot is carried
+    carried_tables = ["lane_slots", "settings", "watch_cursors"] if fx["lane"] else ["settings", "watch_cursors"]
+    _check(sorted(x.split(":")[0] for x in bad) == carried_tables and all("rows in the source" in x for x in bad),
+           f"{tag}: compare problems {bad}")
+    old_n = _table_sums(fx["old_proj"])
+    new_n = _table_sums(new_proj)
+    for t, (n, _d, _c) in old_n.items():
+        _check(new_n[t][0] == n + (1 if t in carried_tables else 0), f"{tag}: {t} rows {n} -> {new_n[t][0]}")
+    for t in ("runs", "tasks", "events", "artifacts", "acks", "change_log", "plans", "waits", "event_src"):
+        _check(new_n[t][0] >= 1, f"{tag}: {t} empty in the copy")
+    rbad = [x for x in _v2_compare(fx["old_root"], new_root) if not x.startswith("projects:")]
+    _check(rbad == [], f"{tag}: root compare {rbad}")
+    con = open_ro(new_proj)
+    try:
+        _check(con.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == mkdb.SCHEMA, f"{tag}: schema")
+        got = {r["key"]: r["value"] for r in con.execute("SELECT key, value FROM settings")}
+        _check(any(k.endswith("stall_min") and json.loads(v) == 17 for k, v in got.items()), f"{tag}: settings {got}")
+        _check(fx["lane"] is None or con.execute("SELECT 1 FROM lane_slots WHERE slot=?", (fx["lane"],)).fetchone(),
+               f"{tag}: lane not carried")
+        _check(con.execute("SELECT 1 FROM watch_cursors WHERE key=?", (fx["cursor"],)).fetchone(), f"{tag}: cursor not carried")
+    finally:
+        con.close()
+    rcon = open_ro(new_root)
+    try:
+        paths = {r["db_path"] for r in rcon.execute("SELECT db_path FROM projects WHERE data_dir=?",
+                                                    (os.path.realpath(fx["data"]),))}
+    finally:
+        rcon.close()
+    _check(paths == {new_proj}, f"{tag}: root db_path {paths}")
+    bdirs = [os.path.join(home, "backups", d, slug) for d in sorted(os.listdir(os.path.join(home, "backups")))
+             if d.startswith("migrate-") and os.path.isdir(os.path.join(home, "backups", d, slug))]
+    _check(len(bdirs) == 1, f"{tag}: backup dirs {bdirs}")
+    for n, body in orig.items():
+        _check(not os.path.exists(os.path.join(tdir, n)), f"{tag}: leftover {n} still in the project folder")
+        with open(os.path.join(bdirs[0], n), "rb") as f:
+            _check(f.read() == body, f"{tag}: backup {n} differs")
+    # (3) a second --v2 refuses
+    rc, out, _ = _cli(home, _v2_args(fx, "--slug", slug))
+    _check(rc == 3 and os.path.isfile(_v2_marker_path(home)), f"{tag}: second v2 rc={rc} {out[-200:]}")
+    # (4) rollback dry run changes nothing
+    mid = _v2_hash(home, repo)
+    rc, out, _ = _cli(home, _v2_args(fx, "--rollback", "--dry-run"))
+    _check(rc == 0 and "remove" in out and _v2_hash(home, repo) == mid, f"{tag}: rollback dry-run rc={rc}")
+    # (5) rollback: byte-identical to the start
+    rc, out, err = _cli(home, _v2_args(fx, "--rollback"))
+    _check(rc == 0, f"{tag}: rollback rc={rc} {out[-400:]} {err[-300:]}")
+    _check(not os.path.exists(new_proj) and not os.path.exists(new_root), f"{tag}: new files survive rollback")
+    _check(_v2_hash(home, repo) == start, f"{tag}: the rollback did not restore the tree")
+    # (6) re-apply, write to the NEW store, rollback refuses and removes nothing
+    rc, out, err = _cli(home, _v2_args(fx, "--slug", slug))
+    _check(rc == 0, f"{tag}: re-apply rc={rc} {out[-300:]}")
+    with _as_home(home):
+        con = mkdb.open_project(home, slug)
+        con.execute("INSERT INTO acks(run, msg, lane, level, t) VALUES ('ra', 'm-late', 'L1', 1, 'late')")
+        con.commit()
+        con.close()
+    rc, out, _ = _cli(home, _v2_args(fx, "--rollback"))
+    _check(rc == 3 and "changed after" in out, f"{tag}: rollback after a write rc={rc} {out[-200:]}")
+    _check(os.path.isfile(new_proj) and os.path.isfile(new_root) and os.path.isfile(_v2_marker_path(home)),
+           f"{tag}: the refused rollback removed something")
+    return tag
 
 
 def self_test():
@@ -2041,6 +2667,47 @@ def self_test():
         _check(os.path.isfile(os.path.join(z15b_pdir, "plan.md")),
                "Z15c: the plan folder has no plan.md")
         ok("z15-empty-assets-folder")
+
+        # L10.8 v2 rehearsal: a whole home onto mk-overview.db / mk-project.db, from both source shapes
+        for make in (_v2_fixture_c2, _v2_fixture_legacy):
+            v2tmp = tempfile.mkdtemp(prefix="mk-v2-", dir=tmp)
+            ok(_v2_rehearse(make(v2tmp)))
+            shutil.rmtree(v2tmp, ignore_errors=True)
+
+        # failure injection (real inputs): a pre-existing target; a lanes.json the carry cannot insert
+        v2tmp = tempfile.mkdtemp(prefix="mk-v2-", dir=tmp)
+        fx = _v2_fixture_c2(v2tmp)
+        _v2_write(mkpaths.new_db_in(fx["tdir"], "project"), "not a store")
+        start = _v2_hash(fx["home"], fx["repo"])
+        rc, out, _ = _cli(fx["home"], _v2_args(fx, "--slug", fx["slug"]))
+        _check(rc == 3 and "already exist" in out, f"v2 pre-existing target rc={rc} {out[-200:]}")
+        _check(_v2_hash(fx["home"], fx["repo"]) == start, "v2 pre-existing target: the tree changed")
+        _check(not os.path.exists(mkpaths.new_db_in(fx["home"], "root")), "v2 pre-existing target: a root was written")
+        os.remove(mkpaths.new_db_in(fx["tdir"], "project"))
+        _v2_write(mkpaths.legacy_lanes(fx["tdir"]), json.dumps({"slots": {"3": {"path": ["not", "a", "scalar"]}}}))
+        start = _v2_hash(fx["home"], fx["repo"])
+        rc, out, _ = _cli(fx["home"], _v2_args(fx, "--slug", fx["slug"]))
+        _check(rc == 3 and "v2 failed" in out, f"v2 carry failure rc={rc} {out[-300:]}")
+        _check(_v2_hash(fx["home"], fx["repo"]) == start, "v2 carry failure: the tree changed")
+        _check(not os.path.exists(mkpaths.new_db_in(fx["home"], "root"))
+               and not os.path.exists(mkpaths.new_db_in(fx["tdir"], "project"))
+               and not os.path.exists(_v2_marker_path(fx["home"])), "v2 carry failure: a new file is left")
+        ok("v2-failure-injection")
+
+        # refusals: a busy lane, and no --slug
+        with _as_home(fx["home"]):
+            con = mkdb.open_project(fx["home"], fx["slug"])
+            con.execute("UPDATE lane_slots SET state='busy' WHERE slot='1'")
+            con.commit()
+            con.close()
+        start = _v2_hash(fx["home"], fx["repo"])
+        rc, out, err = _cli(fx["home"], _v2_args(fx, "--slug", fx["slug"]))
+        _check(rc == 3 and "not quiesced" in out + err, f"v2 busy lane rc={rc} {out[-200:]}")
+        rc2, _, _ = _cli(fx["home"], _v2_args(fx))
+        _check(rc2 == 2, f"v2 without --slug rc={rc2}")
+        _check(_v2_hash(fx["home"], fx["repo"]) == start, "v2 refusals: the tree changed")
+        ok("v2-refusals")
+        shutil.rmtree(v2tmp, ignore_errors=True)
 
     finally:
         for k, v in saved.items():
