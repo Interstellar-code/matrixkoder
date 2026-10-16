@@ -521,7 +521,7 @@ def _synthetic(root):
             {"id": "P.2", "title": "later", "status": "blocked", "parent": "P", "deps": [], "round": 0},
         ],
     }
-    _write(os.path.join(run_dir, "run.json"), json.dumps(doc))
+    _write(mkpaths.run_doc_in(run_dir), json.dumps(doc))
     lines = [
         {"t": "2020-01-01T00:00:01+00:00", "run": run, "task": "P.1", "type": "transition",
          "text": "started", "from": "planned", "to": "building", "by": "orchestrator"},
@@ -537,15 +537,15 @@ def _synthetic(root):
          "text": "run level", "by": "orchestrator"},
     ]
     body = "".join(json.dumps(ln) + "\n" for ln in lines) + "not json at all\n"
-    _write(os.path.join(run_dir, "events.jsonl"), body)
+    _write(mkpaths.events_doc_in(run_dir), body)
     _write(os.path.join(run_dir, "tasks", "P.1", "brief-r2.md"), "brief caf\u00e9\n")
     _write(os.path.join(run_dir, "tasks", "P.1", "report-r2.md"), "report \u2014 no newline")
     _write(os.path.join(run_dir, "tasks", "P.1", "review-r2.md"), "review\n")
-    _write(os.path.join(run_dir, "tasks", "P", "task.json"), "{}")  # not an artifact
+    _write(mkpaths.task_doc_in(os.path.join(run_dir, "tasks", "P")), "{}")  # not an artifact
     other = {"id": "synth-r2", "status": "done", "branch": "b", "started": "2020-02-01T00:00:00+00:00",
              "tasks": [{"id": "Q", "title": "only", "status": "done", "parent": None, "deps": []}]}
-    _write(os.path.join(root, "runs", "synth-r2", "run.json"), json.dumps(other))
-    _write(os.path.join(root, "runs", "synth-r2", "events.jsonl"),
+    _write(mkpaths.run_doc_in(mkpaths.legacy_run_dir(root, "synth-r2")), json.dumps(other))
+    _write(mkpaths.events_doc_in(mkpaths.legacy_run_dir(root, "synth-r2")),
            json.dumps({"t": "2020-02-01T00:00:01+00:00", "run": "synth-r2", "task": "Q",
                        "type": "note", "text": "hi", "by": "orchestrator"}) + "\n")
     return run
@@ -655,11 +655,11 @@ def _blank_events(tmp):
     data = os.path.join(tmp, "blank")
     home = os.path.join(tmp, "blank-home")
     os.makedirs(home)
-    _write(os.path.join(data, "runs", "b1", "run.json"), json.dumps(
+    _write(mkpaths.run_doc_in(mkpaths.legacy_run_dir(data, "b1")), json.dumps(
         {"id": "b1", "status": "done", "tasks": [
             {"id": "T", "title": "t", "status": "done", "parent": None, "deps": [], "verdict": "APPROVE"}]}))
     note = json.dumps({"t": "2020-01-01T00:00:01+00:00", "task": "T", "type": "note", "text": "kept"})
-    _write(os.path.join(data, "runs", "b1", "events.jsonl"), "\n" + note + "\n   \nnot-json\n")
+    _write(mkpaths.events_doc_in(mkpaths.legacy_run_dir(data, "b1")), "\n" + note + "\n   \nnot-json\n")
     code, out, err = _run_cli(["run", "--project", "matrixkoder", "--data", data, "--run", "b1", "--home", home])
     _check(code == 0, f"blank: {code} {out} {err}")
     doc = json.loads(out)
@@ -688,9 +688,9 @@ def _guards_r2(tmp):
     r2 = {"id": "r2", "status": "done", "tasks": [
         {"id": "T2", "title": "two", "status": "done", "parent": None,
          "deps": ["r1:T1", "r2:T2", "missing-run:Z"]}]}
-    _write(os.path.join(data, "runs", "r1", "run.json"), json.dumps(r1))
-    _write(os.path.join(data, "runs", "r2", "run.json"), json.dumps(r2))
-    _write(os.path.join(data, "runs", "r2", "events.jsonl"), "this is not json\n")
+    _write(mkpaths.run_doc_in(mkpaths.legacy_run_dir(data, "r1")), json.dumps(r1))
+    _write(mkpaths.run_doc_in(mkpaths.legacy_run_dir(data, "r2")), json.dumps(r2))
+    _write(mkpaths.events_doc_in(mkpaths.legacy_run_dir(data, "r2")), "this is not json\n")
     _write(os.path.join(data, "runs", "r2", "tasks", "T2", "brief-review-r1.md"), "review brief\n")
     blob = bytes([0xff, 0xfe, 0x00])
     with open(os.path.join(data, "runs", "r2", "tasks", "T2", "report-r1.md"), "wb") as fh:
@@ -720,7 +720,7 @@ def _guards_r2(tmp):
 
     # case A: the target task is already in the store (r1 imported above), a new run depends on it
     later = os.path.join(tmp, "later")
-    _write(os.path.join(later, "runs", "r3", "run.json"), json.dumps(
+    _write(mkpaths.run_doc_in(mkpaths.legacy_run_dir(later, "r3")), json.dumps(
         {"id": "r3", "status": "done", "tasks": [
             {"id": "T3", "title": "three", "status": "done", "parent": None, "deps": ["r1:T1"]}]}))
     code, out, err = _run_cli(["run", "--project", "matrixkoder", "--data", later, "--run", "r3", "--home", home])
@@ -735,10 +735,10 @@ def _guards_r2(tmp):
     fresh = os.path.join(tmp, "order")
     fresh_home = os.path.join(tmp, "order-home")
     os.makedirs(fresh_home)
-    _write(os.path.join(fresh, "runs", "b2", "run.json"), json.dumps(
+    _write(mkpaths.run_doc_in(mkpaths.legacy_run_dir(fresh, "b2")), json.dumps(
         {"id": "b2", "status": "done", "tasks": [
             {"id": "T", "title": "needs b1", "status": "done", "parent": None, "deps": ["b1:T"]}]}))
-    _write(os.path.join(fresh, "runs", "b1", "run.json"), json.dumps(
+    _write(mkpaths.run_doc_in(mkpaths.legacy_run_dir(fresh, "b1")), json.dumps(
         {"id": "b1", "status": "done", "tasks": [
             {"id": "T", "title": "base", "status": "done", "parent": None, "deps": []}]}))
     code, out, err = _run_cli(["run", "--project", "matrixkoder", "--data", fresh, "--all", "--home", fresh_home])
@@ -753,7 +753,7 @@ def _guards_r2(tmp):
     lone = os.path.join(tmp, "lone")
     lone_home = os.path.join(tmp, "lone-home")
     os.makedirs(lone_home)
-    _write(os.path.join(lone, "runs", "lone", "run.json"), json.dumps(
+    _write(mkpaths.run_doc_in(mkpaths.legacy_run_dir(lone, "lone")), json.dumps(
         {"id": "lone", "status": "done", "tasks": [
             {"id": "T", "title": "alone", "status": "done", "parent": None, "deps": ["nowhere:Z"]}]}))
     code, out, err = _run_cli(["run", "--project", "matrixkoder", "--data", lone, "--run", "lone", "--home", lone_home])
@@ -777,7 +777,7 @@ def _guards_r2(tmp):
         _check(not os.path.exists(marker), f"{bad!r} read outside")
     outside = os.path.join(tmp, "outside")
     os.makedirs(os.path.join(outside, "secret"), exist_ok=True)
-    _write(os.path.join(outside, "run.json"), json.dumps({"id": "nope", "tasks": []}))
+    _write(mkpaths.run_doc_in(outside), json.dumps({"id": "nope", "tasks": []}))
     link = os.path.join(data, "runs", "linked")
     os.symlink(outside, link)
     code, out, err = _run_cli(["run", "--project", "matrixkoder", "--data", data, "--run", "linked", "--home", home])
@@ -788,10 +788,10 @@ def _guards_r2(tmp):
     good_home = os.path.join(tmp, "mixed-home")
     os.makedirs(good_home)
     for name in ("good1", "good2"):
-        _write(os.path.join(bad_dir, "runs", name, "run.json"),
+        _write(mkpaths.run_doc_in(mkpaths.legacy_run_dir(bad_dir, name)),
                json.dumps({"id": name, "status": "done", "tasks": [
                    {"id": "T", "title": name, "status": "done", "parent": None, "deps": []}]}))
-    _write(os.path.join(bad_dir, "runs", "bad", "run.json"), "{not json")
+    _write(mkpaths.run_doc_in(mkpaths.legacy_run_dir(bad_dir, "bad")), "{not json")
     code, out, err = _run_cli(["run", "--project", "matrixkoder", "--data", bad_dir, "--all", "--home", good_home])
     _check(code == 4, f"mixed exit {code} {out} {err}")
     doc = json.loads(out)
@@ -800,7 +800,7 @@ def _guards_r2(tmp):
 
     # a non-object run.json is a JSON error, never a traceback
     obj = os.path.join(tmp, "obj")
-    _write(os.path.join(obj, "runs", "arr", "run.json"), "[1, 2, 3]")
+    _write(mkpaths.run_doc_in(mkpaths.legacy_run_dir(obj, "arr")), "[1, 2, 3]")
     code, out, err = _run_cli(["run", "--project", "matrixkoder", "--data", obj, "--run", "arr",
                                "--home", os.path.join(tmp, "obj-home")])
     _check(code == 2 and out.startswith('{"ok": false') and "Traceback" not in err, f"non-object: {code} {out} {err}")
@@ -816,10 +816,10 @@ def _symlinks(tmp):
     _write(secret, json.dumps({"t": "1999-01-01T00:00:00+00:00", "run": "lnk", "task": "T",
                                "type": "note", "text": "SECRET-OUTSIDE", "by": "x"}) + "\n")
     run_dir = os.path.join(data, "runs", "lnk")
-    _write(os.path.join(run_dir, "run.json"), json.dumps(
+    _write(mkpaths.run_doc_in(run_dir), json.dumps(
         {"id": "lnk", "status": "done", "tasks": [
             {"id": "T", "title": "t", "status": "done", "parent": None, "deps": []}]}))
-    os.symlink(secret, os.path.join(run_dir, "events.jsonl"))
+    os.symlink(secret, mkpaths.events_doc_in(run_dir))
     code, out, err = _run_cli(["run", "--project", "matrixkoder", "--data", data, "--run", "lnk", "--home", home])
     _check(code == 2 and "escapes" in out, f"events link: {code} {out} {err}")
     _check("SECRET-OUTSIDE" not in out, "secret leaked into the result")
@@ -832,8 +832,8 @@ def _symlinks(tmp):
             con.close()
 
     # the events file is legitimate; the artifact link escapes and is skipped by name
-    os.remove(os.path.join(run_dir, "events.jsonl"))
-    _write(os.path.join(run_dir, "events.jsonl"), json.dumps(
+    os.remove(mkpaths.events_doc_in(run_dir))
+    _write(mkpaths.events_doc_in(run_dir), json.dumps(
         {"t": "2020-01-01T00:00:00+00:00", "run": "lnk", "task": "T", "type": "note",
          "text": "inside", "by": "x"}) + "\n")
     outside_art = os.path.join(tmp, "secret-brief.md")
@@ -858,8 +858,8 @@ def _symlinks(tmp):
 
     # a sibling directory whose name only shares the run id's prefix is not inside the run dir
     evil = os.path.join(data, "runs", "lnk-evil")
-    _write(os.path.join(evil, "run.json"), json.dumps({"id": "lnk-evil", "status": "done", "tasks": []}))
-    _check(not inside(run_dir, os.path.join(evil, "run.json")), "sibling prefix passed inside()")
+    _write(mkpaths.run_doc_in(evil), json.dumps({"id": "lnk-evil", "status": "done", "tasks": []}))
+    _check(not inside(run_dir, mkpaths.run_doc_in(evil)), "sibling prefix passed inside()")
 
 
 def _real_bus(tmp):
@@ -877,7 +877,7 @@ def _real_bus(tmp):
     _check(code == 0, f"mk-bus-r1 import: {code} {out} {err}")
     _check(tree_checksums(run_dir) == before, "mk-bus-r1 source changed")
     want = []
-    with open(os.path.join(run_dir, "events.jsonl"), encoding="utf-8") as fh:
+    with open(mkpaths.events_doc_in(run_dir), encoding="utf-8") as fh:
         for line in fh:
             raw = line.strip()
             if not raw:

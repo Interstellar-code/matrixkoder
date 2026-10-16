@@ -59,7 +59,7 @@ FAIL = getattr(livetest, "Fail", RuntimeError)
 # The C4 file views (plan storage-layout L410). L4 (mk-state store-only) removes the
 # writers; until it merges these are still produced, so `check` reports them, never hides
 # them (see the report's "rules that fail on today's main").
-FILE_VIEWS = ("run.json", "task.json", "events.jsonl", "board.md")
+FILE_VIEWS = mkpaths.VIEW_DOC_NAMES
 BUS_ARCHIVE_SUBCOMMANDS = ("archive-run",)   # L6.3; absent on main until it merges
 
 POLL_STEP = 0.02
@@ -219,7 +219,7 @@ def _real_projects_rows():
     """The real home's temp-pointing projects rows, read-only, as 'slug -> data'
     strings. Snapshot for R15: only rows the run ADDED are a leak."""
     real = _default_home()
-    db = os.path.join(real, "mk.db")
+    db = mkpaths.db_in(real)
     if not os.path.isfile(db):
         return []
     con = sqlite3.connect("file:" + db + "?mode=ro", uri=True)
@@ -614,7 +614,7 @@ def do_run(slug="e2e", keep=False):
         # (f) migrate while the run is still ACTIVE: C5 moves the files of live plans, so
         # switching here is what puts the run tree under the C2 plan folder at all — and it
         # is the state the bus archive (C6) then writes into.
-        legacy_db = os.path.join(data, "mk.db")
+        legacy_db = mkpaths.db_in(data)
         legacy_before = _store_digest(legacy_db)
         # the dry-run's own move list is kept: it is the evidence for what C5 did and did not
         # carry into the C2 plan folder
@@ -679,7 +679,7 @@ def do_run(slug="e2e", keep=False):
         "slug": slug, "slug_pre_migration": slug_b, "pre_migration_data": data_b,
         "plan": plan_id, "plan_file": plan_path, "run": run,
         "data": data, "new_project_db": new_db, "legacy_project_db": legacy_db,
-        "root_db": os.path.join(home, "mk.db"),
+        "root_db": mkpaths.db_in(home),
         "messages": sum(len(v["ids"]) for v in lane_msgs.values()),
         "bus_archive": bool(archive and archive.get("ok")),
         "legacy_unchanged": legacy_before == legacy_after,
@@ -774,7 +774,7 @@ def build_rules():
         # C5: the legacy <data>/mk.db of a migrated project is the frozen pre-switch copy
         # until --archive runs, so it is expected too.
         found = sorted(_rel(ctx, os.path.join(ctx["root"], p)) for p in _all_mkdb(ctx["root"]))
-        want = {_rel(ctx, os.path.join(ctx["home"], "mk.db"))}
+        want = {_rel(ctx, mkpaths.db_in(ctx["home"]))}
         by_data = {}
         for slug in ctx["known"]:
             data = ctx["data_of"].get(slug)
@@ -789,9 +789,9 @@ def build_rules():
                 continue
             if len(paths) == 1:
                 want.add(_rel(ctx, paths.pop()))
-                want.add(_rel(ctx, os.path.join(data, "mk.db")))  # legacy frozen copy
+                want.add(_rel(ctx, mkpaths.db_in(data)))  # legacy frozen copy
             else:
-                want.add(_rel(ctx, os.path.join(data, "mk.db")))
+                want.add(_rel(ctx, mkpaths.db_in(data)))
         stray = sorted(p for p in found if p not in want)
         missing = sorted(p for p in want if p not in found)
         ok = not stray and not missing and not bad
@@ -865,7 +865,7 @@ def build_rules():
         bad, plans = [], 0
         for slug, data in sorted(ctx["data_of"].items()):
             live = ctx["live_dir"].get(slug, data)
-            if not live or not os.path.isfile(os.path.join(live, "mk.db")):
+            if not live or not os.path.isfile(mkpaths.db_in(live)):
                 continue
             mine = run_tool("mkdb.py", "plans", "--json", "--data", live,
                             home=ctx["home"], timeout=60)
@@ -944,7 +944,7 @@ def build_rules():
                 bad.append(f"{_rel(ctx, want)} mode != 0600")
             # the C2 answer is the ONLY watch-cursors.json anywhere under the temp root
             for rel in _walk(ctx["root"]):
-                if os.path.basename(rel) == "watch-cursors.json" and rel != _rel(ctx, want):
+                if os.path.basename(rel) == mkpaths.CURSORS_NAME and rel != _rel(ctx, want):
                     bad.append(f"watch cursors also at {rel} (not projects/{slug}/)")
         return not bad, "watch cursors at projects/<slug>/" + \
             (f"; wrong {bad}" if bad else ""), bad
@@ -961,7 +961,7 @@ def build_rules():
         for data, slugs in sorted(by_data.items()):
             new_db = ctx["db_paths"].get(slugs[0])
             if not new_db or not os.path.isfile(new_db):
-                bad.append(f"no NEW store at {_rel(ctx, new_db or os.path.join(data, 'mk.db'))}")
+                bad.append(f"no NEW store at {_rel(ctx, new_db or mkpaths.db_in(data))}")
                 continue
             if _store_digest(new_db) == ctx["new_store_before"].get(slugs[0]):
                 bad.append(f"{_rel(ctx, new_db)} did not change after the switch")
@@ -973,7 +973,7 @@ def build_rules():
             (f"; wrong {bad}" if bad else ""), bad
 
     def r12(ctx):
-        root_db = os.path.join(ctx["home"], "mk.db")
+        root_db = mkpaths.db_in(ctx["home"])
         bad = []
         tables = _tables(root_db)
         for name in ("tasks", "events"):
@@ -989,7 +989,7 @@ def build_rules():
         bad = []
         for rel in _walk(ctx["home"]):
             base = os.path.basename(rel)
-            if base in ("mk.db",) or base.endswith(("-wal", "-shm")):
+            if base in (mkpaths.ROOT_DB_NAME,) or base.endswith(("-wal", "-shm")):
                 continue
             if os.path.splitext(base)[1] in (".db", ".sqlite", ".sqlite3"):
                 # the one whitelist: `mk-state run archive`'s VACUUM INTO backup
@@ -1048,7 +1048,7 @@ def build_rules():
 def _all_mkdb(home):
     out = []
     for rel in _walk(home):
-        if os.path.basename(rel) == "mk.db":
+        if os.path.basename(rel) == mkpaths.ROOT_DB_NAME:
             out.append(os.path.join(home, rel))
     return sorted(out)
 
@@ -1207,7 +1207,7 @@ def _fixture(ctx_skel):
         con.execute("INSERT INTO projects(slug, name, repo, data_dir, mode, db_path, created)"
                     " VALUES (?,?,?,?,?,?,?)",
                     (slug, slug, os.path.realpath(repo), data, "home",
-                     os.path.join(data, "mk.db"), "e2e"))
+                     mkpaths.db_in(data), "e2e"))
         con.execute("INSERT INTO projects(slug, name, repo, data_dir, mode, db_path, created)"
                     " VALUES (?,?,?,?,?,?,?)",
                     (slug_b, slug_b, os.path.realpath(scratch), data_b, "home", None, "e2e"))
@@ -1286,7 +1286,7 @@ def _mutations(_unused):
 
     @m("R01", "a stray mk.db under the temp root", "fix-stray/mk.db")
     def _(f):
-        stray = os.path.join(f["home"], "projects", f["slug"] + "-stray", "mk.db")
+        stray = mkpaths.db_in(os.path.join(f["home"], "projects", f["slug"] + "-stray"))
         os.makedirs(os.path.dirname(stray))
         with open(stray, "w", encoding="utf-8") as fh:
             fh.write("not a store")
@@ -1309,7 +1309,7 @@ def _mutations(_unused):
     def _(f):
         d = os.path.join(f["home"], "projects", f["slug"], "runs", f["run"])
         os.makedirs(d, exist_ok=True)
-        with open(os.path.join(d, "run.json"), "w", encoding="utf-8") as fh:
+        with open(mkpaths.run_doc_in(d), "w", encoding="utf-8") as fh:
             fh.write("{}")
 
     @m("R06", "a wrong plan_summary count", "plan_summary")
@@ -1346,7 +1346,7 @@ def _mutations(_unused):
     def _(f):
         # a pre-migration project's cursors must stay in its data dir, never appear as a
         # second file anywhere under the tree
-        legacy = os.path.join(f["data_b"], "watch-cursors.json")
+        legacy = mkpaths.legacy_cursors(f["data_b"])
         with open(legacy, "w", encoding="utf-8") as fh:
             json.dump({"fix-run|*": {"seq": 9}}, fh)
         os.chmod(legacy, 0o600)
@@ -1398,7 +1398,7 @@ def _mutations(_unused):
             con.execute("INSERT INTO projects(slug, name, repo, data_dir, mode, db_path, created)"
                         " VALUES (?,?,?,?,?,?,?)",
                         (f["slug"] + "-alias", f["slug"] + "-alias", os.path.realpath(f["repo"]),
-                         f["data"], "home", os.path.join(f["home"], "projects", f["slug"] + "-alias", "mk.db"),
+                         f["data"], "home", mkpaths.db_in(os.path.join(f["home"], "projects", f["slug"] + "-alias")),
                          "e2e"))
             con.commit()
         finally:
@@ -1406,7 +1406,7 @@ def _mutations(_unused):
 
     @m("R01", "a missing second project store", "fixb")
     def _(f):
-        os.unlink(os.path.join(f["data_b"], "mk.db"))
+        os.unlink(mkpaths.db_in(f["data_b"]))
     return out
 
 
@@ -1467,7 +1467,7 @@ def self_test():
                 ("pf3", "/tmp/x", None),                 # the literal /tmp spelling
                 ("pf4", tmp_lit + "/x", None),           # gettempdir() spelled out
                 ("pf5", "/tmpfoo/x", None),              # NOT a temp root
-                ("pf6", None, "/private/tmp/y/mk.db")]   # db_path counts, not only data_dir
+                ("pf6", None, mkpaths.db_in("/private/tmp/y"))]   # db_path counts, not only data_dir
         con = mkdb.open_root(f["home"])    # the one SQLite writer (single-writer rule)
         try:
             for slug, data, dbp in rows:

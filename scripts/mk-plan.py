@@ -856,7 +856,7 @@ def store_present(data):
     if not data:
         return False
     try:
-        return os.path.isfile(os.path.join(mkpaths.project_folder(data), "mk.db"))
+        return os.path.isfile(mkpaths.db_in(mkpaths.project_folder(data)))
     except mkpaths.Fail:
         return False
 
@@ -898,7 +898,7 @@ def resolve_data_arg(arg):
 def side_store_warning(path):
     """A file-only answer next to an existing mk.db is the hermes-switchui trap: approve silently
     skipped the store that was on. Named in the reply instead of staying quiet."""
-    side = os.path.join(os.path.dirname(os.path.abspath(path)), "mk.db")
+    side = mkpaths.db_in(os.path.dirname(os.path.abspath(path)))
     if not os.path.isfile(side):
         return None
     return (f"file-only: no store resolved, but {side} exists — pass "
@@ -2046,7 +2046,7 @@ def self_test():
                  'review = "light"\nqa = []\ncommit = ""\n\n')
         dsub, dempty = os.path.join(tmp, "data-sub"), os.path.join(tmp, "data-empty")
         os.makedirs(dsub), os.makedirs(dempty)
-        with open(os.path.join(dsub, "matrixkoder.yaml"), "w") as f:
+        with open(mkpaths.legacy_yaml(dsub), "w") as f:
             f.write("session:\n  subagents: false\n")
         p = write("inherit-nokey.md", plan_text(phases=nokey))
         assert parse_env(p, dsub)["phases"][0]["subagents"] is False  # inherited from the yaml
@@ -2345,8 +2345,8 @@ def self_test():
         empty_home = os.path.join(tmp, "empty-home")
         out = mk("approve", p, "--data", empty_data, "--home", empty_home)
         assert out["ok"] and out["store"] is False and out["status"] == "approved"
-        assert not os.path.exists(os.path.join(empty_data, "mk.db"))
-        assert not os.path.exists(os.path.join(empty_home, "mk.db"))
+        assert not os.path.exists(mkpaths.db_in(empty_data))
+        assert not os.path.exists(mkpaths.db_in(empty_home))
         assert mk("parse", p)["status"] == "approved"
         assert mk("approve", p, "--data", empty_data, "--home", empty_home).get("noop") is True
         # a failing check refuses the write and still creates no store
@@ -2355,7 +2355,7 @@ def self_test():
         refused = mk("approve", badp, "--data", empty_data, "--home", empty_home, code=2)
         assert any("bad route" in e for e in refused["errors"])
         assert open(badp, "rb").read() == before
-        assert not os.path.exists(os.path.join(empty_data, "mk.db"))
+        assert not os.path.exists(mkpaths.db_in(empty_data))
 
         # with a store: import, archive, export; a failed approve leaves file and data
         data = os.path.join(tmp, "store")
@@ -2839,7 +2839,7 @@ def self_test():
         # file-only next to an existing mk.db names that store in a warning
         side = os.path.join(tmp, "side")
         os.makedirs(side)
-        open(os.path.join(side, "mk.db"), "wb").close()
+        open(mkpaths.db_in(side), "wb").close()
         sp = os.path.join(side, "side.md")
         open(sp, "w").write(plan_text(plan='plan = "sideplan"', phases=phase("P1") + "\n"))
         r = subprocess.run([sys.executable, os.path.abspath(__file__), "approve", sp],
@@ -2869,7 +2869,7 @@ def self_test():
         subprocess.run(["git", "init", "-q", mig_repo], check=True)
         pre = os.path.join(mig_data, "plans", "old.md")
         open(pre, "w").write(plan_text(plan='plan = "old"', phases=phase("P1") + "\n"))
-        open(os.path.join(mig_data, "matrixkoder.yaml"), "w").write("data_dir: .matrixkoder/\n")
+        open(mkpaths.legacy_yaml(mig_data), "w").write("data_dir: .matrixkoder/\n")
         home = os.environ["MK_HOME"]
         db.open_project(home, "migs", data_dir=mig_data).close()
         con = db.open_root(home)

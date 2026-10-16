@@ -246,7 +246,7 @@ class StoreAdapter:
         No store file yet means no rows. A locked, newer or unmigrated store raises Fail.
         """
         mod = self._mod()
-        path = os.path.join(mod.project_dir(self.data_dir, None, self.data_dir, True), "mk.db")
+        path = _load_mkpaths().db_in(mod.project_dir(self.data_dir, None, self.data_dir, True))
         try:
             con = mod._open_read(path, mod.SCHEMA)
         except Exception as e:
@@ -1159,7 +1159,7 @@ class BusState:
         except Fail:
             db = None
         if not db or os.path.realpath(db) == os.path.realpath(
-                os.path.join(self.project_dir, "mk.db")):
+                _load_mkpaths().db_in(self.project_dir)):
             return self.store, self.project_dir  # no root row, or still today's store
         folder = os.path.dirname(db)
         with self.lock:
@@ -4335,7 +4335,7 @@ def _layout_self_test():
         migs_data = project("migs", "migs-repo")
         switch("migs", migs_data, "migs-repo")
         migs_folder = os.path.join(mkh, "projects", "migs")
-        assert os.path.isfile(os.path.join(migs_folder, "mk.db")), \
+        assert os.path.isfile(_load_mkpaths().db_in(migs_folder)), \
             "the switched store is not in the C2 project folder"
         plain_data = project("plain", "plain-repo")
         own_data = project("own", "own-repo")
@@ -4395,13 +4395,13 @@ def _layout_self_test():
                                 "--kind", "info", "--from", "orch", "--to", "T1", "--text", text])
             assert rc == 0 and res.get("ok"), (res, err)
             assert res["message"]["project"] == slug, res
-        migs_texts = texts(os.path.join(migs_folder, "mk.db"))
-        plain_texts = texts(os.path.join(plain_data, "mk.db"))
+        migs_texts = texts(_load_mkpaths().db_in(migs_folder))
+        plain_texts = texts(_load_mkpaths().db_in(plain_data))
         assert "for migs" in migs_texts and "for plain" not in migs_texts, migs_texts
         assert "for plain" in plain_texts and "for migs" not in plain_texts, plain_texts
 
         # ---- 3. the bus's OWN project switches while the bus runs (todo 108) ---------------
-        assert "before switch" in texts(os.path.join(own_data, "mk.db")), \
+        assert "before switch" in texts(_load_mkpaths().db_in(own_data)), \
             "the pre-switch message must be in the legacy store"
         switch("own", own_data, "own-repo")   # the bus keeps running through the switch
         own_folder = os.path.join(mkh, "projects", "own")
@@ -4409,8 +4409,8 @@ def _layout_self_test():
                             "--kind", "info", "--from", "orch", "--to", "T1",
                             "--text", "after switch"])
         assert rc == 0 and res.get("ok"), (res, err)
-        new_texts = texts(os.path.join(own_folder, "mk.db"))
-        old_texts = texts(os.path.join(own_data, "mk.db"))
+        new_texts = texts(_load_mkpaths().db_in(own_folder))
+        old_texts = texts(_load_mkpaths().db_in(own_data))
         assert "before switch" in new_texts, "the switch did not carry the pre-switch message"
         assert "after switch" in new_texts, f"the new project DB missed the message: {new_texts}"
         assert "after switch" not in old_texts, \
@@ -4424,7 +4424,7 @@ def _layout_self_test():
         # ---- 4. the watch cursor lives in the project folder; the old one is carried over --
         # L10.5: the cursor is a watch_cursors row; the first watch imports the MAX of the legacy file
         # (seq 1) and the C2-folder file (seq 0) once, and neither file is written again.
-        legacy_cursor = os.path.join(own_data, "watch-cursors.json")
+        legacy_cursor = _load_mkpaths().legacy_cursors(own_data)
         write_json(legacy_cursor, {"r1|*": {"seq": 1}}, mode=0o600)
         folder_cursor = os.path.join(own_folder, os.path.basename(_paths("target_watch_cursors", "x")))
         write_json(folder_cursor, {"r1|*": {"seq": 0}}, mode=0o600)
@@ -4477,8 +4477,8 @@ def _layout_self_test():
         st, out = post({"run": "r1", "task": "T1", "kind": "info", "text": "adopted token"},
                        token=cfg["token"])
         assert st == 200, (st, out)
-        assert "adopted token" in texts(os.path.join(migs_folder, "mk.db")), texts(
-            os.path.join(migs_folder, "mk.db"))
+        assert "adopted token" in texts(_load_mkpaths().db_in(migs_folder)), texts(
+            _load_mkpaths().db_in(migs_folder))
     finally:
         stop_bus()
         for p in pids:
@@ -4776,7 +4776,7 @@ def _store_self_test_body(mod):
             mod.add_task(con, "r1", "T9", "task", title="real herdr lane")
         finally:
             con.close()
-        assert os.path.isfile(os.path.join(data, "mk.db")), "open_project did not create mk.db"
+        assert os.path.isfile(_load_mkpaths().db_in(data)), "open_project did not create mk.db"
 
         lane = os.path.join(tmp, "lane")
         os.makedirs(lane, exist_ok=True)
@@ -5554,7 +5554,7 @@ def _store_self_test_body(mod):
 
         def patched_project_db(slug=None, data=None):
             if slug == "proj" or (data and os.path.realpath(data) == real):
-                return os.path.join(else_dir, "mk.db")
+                return _load_mkpaths().db_in(else_dir)
             return real_project_db(slug=slug, data=data)
 
         mkpaths = _load_mkpaths()
@@ -6211,10 +6211,10 @@ def _store_self_test_body(mod):
         empty_dir = os.path.join(tmp, "no-store")
         os.makedirs(empty_dir)
         assert StoreAdapter(empty_dir).store_select("SELECT 1") == []
-        assert not os.path.exists(os.path.join(empty_dir, "mk.db"))
+        assert not os.path.exists(_load_mkpaths().db_in(empty_dir))
         broken_dir = os.path.join(tmp, "broken-store")
         os.makedirs(broken_dir)
-        with open(os.path.join(broken_dir, "mk.db"), "w") as fh:
+        with open(_load_mkpaths().db_in(broken_dir), "w") as fh:
             fh.write("this is not a database")
         try:
             StoreAdapter(broken_dir).store_select("SELECT 1")
@@ -6378,7 +6378,7 @@ def _store_self_test_body(mod):
             assert " r1 T1 info orch->T1: file mode" in out_fm, out_fm
             # File-mode cursor: valid only for the bus start stamp it was written under. A new run in
             # the same data dir restarts seq from 1 and restarts the bus, so a stale cursor must replay.
-            fm_cur = os.path.join(fm_data, "watch-cursors.json")
+            fm_cur = _load_mkpaths().legacy_cursors(fm_data)
             fm_started = read_json(os.path.join(fm_home, "bus.json"))["started"]
             assert read_json(fm_cur)["*|*"] == {"seq": 1, "started": fm_started}, read_json(fm_cur)
             fm_watch = [sys.executable, os.path.abspath(__file__), "watch", "--data", fm_data, "--max-messages", "1"]
@@ -6593,7 +6593,7 @@ def _lane_state_self_test(mod):
         code, res = call(port, tok_s1, "/send", {"kind": "task", "text": "round: 1\ntodo done S1b\ntodo done S2x\ntodo done S2"})
         assert code == 200 and res.get("todo_updated") == ["S1b"] and res.get("todo_ignored") == ["S2x", "S2"], res
         assert status_of("S1b") == "verifying" and status_of("S2x") == "planned" and status_of("S2") == "verifying", (status_of("S1b"), status_of("S2x"))
-        with open(os.path.join(data, "matrixkoder.yaml"), "w") as yf:
+        with open(_load_mkpaths().legacy_yaml(data), "w") as yf:
             yf.write("todo_done_status: done\n")  # a lane still stops at verifying
         assert status_of("S1a") == "verifying", status_of("S1a")  # rolled up from its only child
         code, res = call(port, tok_s1, "/send", {"kind": "task", "text": "todo done S1c"})  # never started: no move
@@ -6695,7 +6695,7 @@ def _z14_seed_project(home, slug, data, run_id, migrated, plan="alpha", task="T1
     if migrated:
         # an EMPTY legacy store at <data>/mk.db: store_mode only checks the file
         mod.open_project(home, None, data).close()
-        if not os.path.isfile(os.path.join(store_dir, "mk.db")):
+        if not os.path.isfile(_load_mkpaths().db_in(store_dir)):
             mod.open_project(home, slug, None).close()
     con = mod.open_project(home, slug if migrated else None, store_dir)
     try:
@@ -6769,7 +6769,7 @@ def _z14_path_self_test():
                 os.environ.pop(_k, None)
             os.environ["MK_HOME"] = os.environ["MATRIXKODER_HOME"] = os.environ["MK_BUS_DIR"] = home
             os.environ["MK_SELFTEST"] = "1"
-            db_path = os.path.join(home, "projects", slug, "mk.db") if migrated else None
+            db_path = _load_mkpaths().db_in(os.path.join(home, "projects", slug)) if migrated else None
             con = _load_mkdb().open_root(home)
             try:
                 # the derived alias row FIRST: project_slug_for registers it before
@@ -6881,7 +6881,7 @@ class _ArchiveFixture:
         return _paths("project_folder", self.data)
 
     def store_path(self):
-        return os.path.join(self.folder(), "mk.db")
+        return _load_mkpaths().db_in(self.folder())
 
     def paths(self):
         """The paths the cases assert against, every one resolved through mkpaths."""
@@ -8325,7 +8325,7 @@ def self_test():
             assert json.loads(resp.read().decode("utf-8"))["ok"] is True, "flip bus: token before"
         # The flip: a project store appears under the data dir mid-flight, exactly
         # what mk-state does for this bus when a lane's ask is answered.
-        with open(os.path.join(data_flip, "mk.db"), "wb") as f:
+        with open(_load_mkpaths().db_in(data_flip), "wb") as f:
             f.write(b"")
         with urllib.request.urlopen(urllib.request.Request(
                 f"http://127.0.0.1:{port_flip}/wait?lane=T1&after=0&timeout=1",
@@ -8946,7 +8946,7 @@ def self_test():
         # [5, 120]) > 1800.0 s default. Asserted directly on the helper: fast, no waiting.
         data_ot = os.path.join(tmp, "data_ot")
         os.makedirs(data_ot, exist_ok=True)
-        with open(os.path.join(data_ot, "matrixkoder.yaml"), "w") as f:
+        with open(_load_mkpaths().legacy_yaml(data_ot), "w") as f:
             f.write("bus:\n  owner_timeout_min: 5\n")
         assert owner_timeout_s(data_ot) == 300.0
         assert owner_timeout_s(data_ask) == 1800.0  # no yaml there
@@ -8955,7 +8955,7 @@ def self_test():
             assert owner_timeout_s(data_ot) == 7.0 and owner_timeout_s(data_ask) == 7.0
         finally:
             os.environ.pop("MK_BUS_HEARTBEAT_TIMEOUT_SEC", None)
-        with open(os.path.join(data_ot, "matrixkoder.yaml"), "w") as f:
+        with open(_load_mkpaths().legacy_yaml(data_ot), "w") as f:
             f.write("bus:\n  owner_timeout_min: 999\n")
         assert owner_timeout_s(data_ot) == 120 * 60.0  # clamped up to the schema max
         done("owner_timeout_s: env > yaml (clamped) > 1800 s default")

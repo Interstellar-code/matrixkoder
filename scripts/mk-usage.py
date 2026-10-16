@@ -1154,7 +1154,7 @@ def self_test_body():
 
         c3_data = os.path.join(c3_dir, "data")
         os.makedirs(c3_data, exist_ok=True)
-        yaml_path = os.path.join(c3_data, "matrixkoder.yaml")
+        yaml_path = mkpaths.legacy_yaml(c3_data)
         c3_ledger = os.path.join(c3_dir, "usage.json")
         c3_env = dict(os.environ, PATH=c3_bin + ":" + os.environ.get("PATH", ""),
                       MATRIXKODER_DATA=c3_data)

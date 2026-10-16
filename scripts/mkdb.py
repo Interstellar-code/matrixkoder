@@ -186,7 +186,7 @@ def _selftest_write_guard(path):
         return
     rp = os.path.realpath(os.path.abspath(path))
     real = _real_home()
-    if rp == os.path.join(real, "mk.db") or rp.startswith(real + os.sep):
+    if rp == _mkpaths().db_in(real) or rp.startswith(real + os.sep):
         raise Fail(f"refusing to write the real MK home {rp} under MK_SELFTEST=1 (C16)")
     roots = set()
     for key in ("TMPDIR", "TEMP", "TMP"):
@@ -354,8 +354,8 @@ def open_root(home, version=ROOT_SCHEMA, migrations=()):
     """Open or create the root store <home>/mk.db (C1). Migrates additively: an existing v1
     root keeps every row and gains projects.db_path plus plan_summary (C3)."""
     check_home(home)
-    _selftest_write_guard(os.path.join(home, "mk.db"))
-    return _migrate(_connect(os.path.join(home, "mk.db")), version,
+    _selftest_write_guard(_mkpaths().db_in(home))
+    return _migrate(_connect(_mkpaths().db_in(home)), version,
                     ((1, ROOT_DDL), (2, _root_v2), (3, _root_v3)) + tuple(migrations))
 
 
@@ -488,7 +488,7 @@ def _v7(con):
 def open_project(home, slug=None, data_dir=None, version=SCHEMA, migrations=(), legacy=False):
     """Open or create the project store (C2). check_home runs before any directory is created.
     `legacy=True` opens the literal --data store of a migrated project (rollback fixtures only)."""
-    path = os.path.join(project_dir(home, slug, data_dir, legacy), "mk.db")
+    path = _mkpaths().db_in(project_dir(home, slug, data_dir, legacy))
     _selftest_write_guard(path)
     con = _migrate(_connect(path), version, ((1, PROJECT_DDL), (2, _v2), (3, _v3), (4, _v4), (5, _v5), (6, _v6), (7, _v7)) + tuple(migrations))
     _ensure_prev_status(con)
@@ -1387,7 +1387,7 @@ def projects(home):
     A missing root store is an empty list: <home>/mk.db is not created.
     """
     check_home(home)
-    root = _open_read(os.path.join(home, "mk.db"), ROOT_SCHEMA)
+    root = _open_read(_mkpaths().db_in(home), ROOT_SCHEMA)
     if root is None:
         return []
     try:
@@ -1409,7 +1409,7 @@ def overview(home):
     arrives as a parsed object ({} when NULL or unparsable), never as a JSON string.
     """
     check_home(home)
-    root = _open_read(os.path.join(home, "mk.db"), ROOT_SCHEMA)
+    root = _open_read(_mkpaths().db_in(home), ROOT_SCHEMA)
     if root is None:
         return {"ok": True, "projects": [], "plans": []}
     try:
@@ -1830,7 +1830,7 @@ def _store_path(home, project=None, data_dir=None):
     anything."""
     folder = (_mkpaths().project_folder(data_dir, home_arg=home) if data_dir
               else project_dir(home, project))
-    return os.path.join(folder, "mk.db")
+    return _mkpaths().db_in(folder)
 
 
 def _store_open(home, project, data_dir):
@@ -2114,7 +2114,7 @@ def root_cleanup_plan(home):
     no file is created or changed."""
     check_home(home)
     remove, merge, keep = [], [], []
-    db = os.path.join(home, "mk.db")
+    db = _mkpaths().db_in(home)
     if os.path.isfile(db):
         con = _connect_ro(db)
         try:
@@ -2184,18 +2184,18 @@ def root_cleanup_apply(home, backup_dir):
     plan = root_cleanup_plan(home)
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     bdir = os.path.join(os.path.abspath(os.path.expanduser(backup_dir)), f"root-cleanup-{stamp}")
-    _selftest_write_guard(os.path.join(bdir, "mk.db"))
+    _selftest_write_guard(_mkpaths().db_in(bdir))
     for it in plan["remove"]:
         _selftest_write_guard(os.path.join(home, it["target"]))
     if os.path.exists(bdir):
         raise Fail(f"backup folder {bdir} exists; wait a second and retry")
     os.makedirs(bdir, mode=0o700)  # it holds copies of token files
     manifest = {"home": home, "stamp": stamp, "db": None, "files": [], "dirs": [], "plan": plan}
-    db = os.path.join(home, "mk.db")
+    db = _mkpaths().db_in(home)
     if os.path.isfile(db):
-        _backup_db(db, os.path.join(bdir, "mk.db"))
-        manifest["db"] = {"path": "mk.db", "size": os.path.getsize(os.path.join(bdir, "mk.db")),
-                          "sha256": _sha256_file(os.path.join(bdir, "mk.db"))}
+        _backup_db(db, _mkpaths().db_in(bdir))
+        manifest["db"] = {"path": "mk.db", "size": os.path.getsize(_mkpaths().db_in(bdir)),
+                          "sha256": _sha256_file(_mkpaths().db_in(bdir))}
     for it in plan["remove"]:
         if it["kind"] in ("file", "dir"):
             _copy_into(home, it["target"], bdir, manifest)
@@ -2291,7 +2291,7 @@ def root_restore(home, bdir):
     restored = []
     db = manifest.get("db")
     if db:
-        target = os.path.join(home, "mk.db")
+        target = _mkpaths().db_in(home)
         _selftest_write_guard(target)
         if os.path.isfile(target):
             _backup_db(target, os.path.join(bdir, "pre-restore-mk.db"))
@@ -2471,7 +2471,7 @@ def _selftest_guard(home):
     """C16: under MK_SELFTEST=1 a write open outside the temp dir raises; ro reads work."""
     _check(os.environ.get("MK_SELFTEST") == "1", "guard case ran without MK_SELFTEST=1")
     real = _real_home()
-    real_db = os.path.join(real, "mk.db")
+    real_db = _mkpaths().db_in(real)
     # the real resolved home path, not a made-up one: with both vars unset the
     # resolver must land on ~/.matrixkoder
     kept = {k: os.environ.get(k) for k in ("MK_HOME", "MATRIXKODER_HOME")}
@@ -2632,7 +2632,7 @@ def _schema6_v6(home):
 
     # An old reader (version=5) refuses the v6 store
     try:
-        _open_read(os.path.join(data, "mk.db"), 5)
+        _open_read(_mkpaths().db_in(data), 5)
     except Fail as e:
         _check(e.code == 3, f"old reader exit code {e.code} != 3")
         _check("newer than this code" in str(e), f"old reader message: {e}")
@@ -2718,7 +2718,7 @@ def _schema7_v7(home):
     finally:
         con.close()
     try:
-        _open_read(os.path.join(home, "schema7-fresh", "mk.db"), 6)
+        _open_read(_mkpaths().db_in(os.path.join(home, "schema7-fresh")), 6)
     except Fail as e:
         _check(e.code == 3 and "newer than this code" in str(e), f"old reader message: {e}")
     else:
@@ -3025,7 +3025,7 @@ def _stores(home):
         again.close()
     via_data = open_project(home, data_dir=os.path.join(home, "explicit"))
     via_data.close()
-    _check(os.path.exists(os.path.join(home, "explicit", "mk.db")), "--data store")
+    _check(os.path.exists(_mkpaths().db_in(os.path.join(home, "explicit"))), "--data store")
 
 
 def _guards(tmp, home):
@@ -3239,7 +3239,7 @@ def _migrations(home):
         add_task(con, "r", "kept", "task", title="keep me")
     finally:
         con.close()
-    bare = sqlite3.connect(os.path.join(v1, "mk.db"))
+    bare = sqlite3.connect(_mkpaths().db_in(v1))
     bare.row_factory = sqlite3.Row
     _v2(bare)  # the crash: the step landed, the schema_version stamp did not
     bare.commit()
@@ -3271,7 +3271,7 @@ def _migrations(home):
     _check(second.execute("SELECT COUNT(*) c FROM schema_version").fetchone()["c"] == SCHEMA + 1, "idempotent")
     second.close()
     # Finding 8: a crash between executescript and the version stamp re-runs safely.
-    con = sqlite3.connect(os.path.join(data, "mk.db"))
+    con = sqlite3.connect(_mkpaths().db_in(data))
     con.execute(f"DELETE FROM schema_version WHERE version={SCHEMA + 1}")
     con.commit()
     con.close()
@@ -3795,7 +3795,7 @@ def _lane_slots_v3(home):
     os.makedirs(data, exist_ok=True)
     # The base CREATE TABLE already has the v3 columns, so a real v2 file is built here:
     # the pre-v3 lane_slots shape, stamped at version 2, with one busy row.
-    bare = sqlite3.connect(os.path.join(data, "mk.db"))
+    bare = sqlite3.connect(_mkpaths().db_in(data))
     bare.executescript("""
         CREATE TABLE lane_slots(slot TEXT PRIMARY KEY, lane_path TEXT, state TEXT, run TEXT, task TEXT);
         CREATE TABLE schema_version(version INTEGER PRIMARY KEY);
@@ -3807,7 +3807,7 @@ def _lane_slots_v3(home):
     names = [r[1] for r in bare.execute("PRAGMA table_info(lane_slots)")]
     bare.close()
     _check("workspace" not in names, "v2 fixture already had workspace")
-    bare = sqlite3.connect(os.path.join(data, "mk.db"))
+    bare = sqlite3.connect(_mkpaths().db_in(data))
     bare.row_factory = sqlite3.Row
     _v3(bare)  # the crash: the step landed, the schema_version stamp did not
     bare.commit()
@@ -3912,7 +3912,7 @@ def _plans_cols_v4(home):
     os.makedirs(data, exist_ok=True)
     # a real v3 file, built like _lane_slots_v3's fixture: the pre-v4 7-column plans
     # shape, stamped 1..3, with one row
-    bare = sqlite3.connect(os.path.join(data, "mk.db"))
+    bare = sqlite3.connect(_mkpaths().db_in(data))
     bare.executescript("""
         CREATE TABLE plans(id TEXT PRIMARY KEY, version INTEGER, title TEXT, header_json TEXT,
           body_md TEXT, approved_at TEXT, archived_path TEXT);
@@ -3964,7 +3964,7 @@ def _extra_json_v5(home):
     data = os.path.join(home, "extras-v4")
     os.makedirs(data, exist_ok=True)
     # a real v4 file: the pre-v5 runs/tasks shapes (no extra_json), stamped 1..4, with rows
-    bare = sqlite3.connect(os.path.join(data, "mk.db"))
+    bare = sqlite3.connect(_mkpaths().db_in(data))
     bare.executescript("""
         CREATE TABLE runs(id TEXT PRIMARY KEY, plan TEXT, plan_version INTEGER, branch TEXT,
           status TEXT, stage TEXT, next TEXT, started TEXT, ended TEXT);
@@ -4666,7 +4666,7 @@ def _rc_home(base, name, old_bus_tokens=None, lanes_match=True):
                           " PRIMARY KEY(run, src));")
         con.execute("INSERT INTO sync(project, last_change_no) VALUES ('keepme', 3)")
         gone = os.path.join(base, "gone-" + name)  # a path that does not exist
-        db_path = os.path.join(home, "projects", "main", "mk.db")
+        db_path = _mkpaths().db_in(os.path.join(home, "projects", "main"))
         data_main = os.path.join(repo, ".matrixkoder")
         rows = [("main", "Main", repo, data_main, "local", "t", "t", db_path),
                 ("pa11a5a11a5a11a5a", "alias with token", "", data_main, "local", "t", "t", db_path),
@@ -4720,7 +4720,7 @@ def _rc_listing(home):
 
 def _rc_dump(home):
     """Every row of every table of the root DB, read-only, as one comparable dict."""
-    con = _connect_ro(os.path.join(home, "mk.db"))
+    con = _connect_ro(_mkpaths().db_in(home))
     try:
         out = {}
         for r in con.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"):
@@ -4733,7 +4733,7 @@ def _rc_dump(home):
 def _rc_reads(home):
     """The overview read paths, straight from the root DB: projects that carry a db_path, and every
     plan_summary row. Apply must leave both exactly as they were."""
-    con = _connect_ro(os.path.join(home, "mk.db"))
+    con = _connect_ro(_mkpaths().db_in(home))
     try:
         return ([list(r) for r in con.execute("SELECT * FROM projects WHERE db_path IS NOT NULL ORDER BY slug")],
                 [list(r) for r in con.execute("SELECT * FROM plan_summary ORDER BY project, plan")])
@@ -4778,7 +4778,7 @@ def _root_cleanup(home):
     # a missing root DB lists files only and creates nothing
     empty = os.path.join(base, "empty")
     os.makedirs(empty)
-    _check(root_cleanup_plan(empty)["remove"] == [] and not os.path.exists(os.path.join(empty, "mk.db")),
+    _check(root_cleanup_plan(empty)["remove"] == [] and not os.path.exists(_mkpaths().db_in(empty)),
            "_root_cleanup: a home with no root DB")
 
     # 2. apply is refused without --backup-dir, and --dry-run with --apply is a usage error
@@ -4795,7 +4795,7 @@ def _root_cleanup(home):
     _check(os.path.basename(bdir).startswith("root-cleanup-") and _verify_backup(bdir) == [],
            f"_root_cleanup: backup {_verify_backup(bdir)}")
     manifest = json.load(open(os.path.join(bdir, CLEANUP_MANIFEST)))
-    _check(manifest["db"]["sha256"] == _sha256_file(os.path.join(bdir, "mk.db")) and manifest["files"],
+    _check(manifest["db"]["sha256"] == _sha256_file(_mkpaths().db_in(bdir)) and manifest["files"],
            "_root_cleanup: manifest")
     for kind, target in want_remove:
         if kind in ("file", "dir"):
@@ -4810,7 +4810,7 @@ def _root_cleanup(home):
     _check(_rc_reads(h) == reads_before, "_root_cleanup: apply changed the overview read paths")
     ov = overview(h)  # the real reader, now that the root is at schema 3
     _check(ov["ok"] and {p["plan"] for p in ov["plans"]} == {"pl", "pl2"}, f"_root_cleanup: overview {ov}")
-    _check(_schema_version(_connect_ro(os.path.join(h, "mk.db"))) == 3, "_root_cleanup: root not at schema 3")
+    _check(_schema_version(_connect_ro(_mkpaths().db_in(h))) == 3, "_root_cleanup: root not at schema 3")
     # the live tokens still resolve: the bus/ store is untouched and holds every token slug
     _check(set(json.load(open(os.path.join(h, "bus", "bus-tokens.json")))) == set(tokens),
            "_root_cleanup: a live token is gone from bus/bus-tokens.json")
@@ -4820,7 +4820,7 @@ def _root_cleanup(home):
     # 4. restore puts every item back byte for byte (the DB logically and by the backup's sha)
     rr = root_restore(h, bdir)
     _check("mk.db" in rr["restored"], "_root_cleanup: restore did not restore the DB")
-    _check(_sha256_file(os.path.join(h, "mk.db")) == manifest["db"]["sha256"], "_root_cleanup: restored DB sha")
+    _check(_sha256_file(_mkpaths().db_in(h)) == manifest["db"]["sha256"], "_root_cleanup: restored DB sha")
     _check(_rc_dump(h) == before_dump, "_root_cleanup: restored DB rows differ")
     now_tree = _rc_listing(h)
     for rel, v in before_tree.items():
@@ -5025,7 +5025,7 @@ def _root_v2_migration(home, tmp):
             "print(json.dumps({'projects': m.projects(home)}))\n")
     ran = subprocess.run([sys.executable, driver, old_path, old_home], capture_output=True, text=True)
     _check(ran.returncode == 0, f"the old mkdb.py did not build a root: {ran.stderr.strip()[-400:]}")
-    db = os.path.join(old_home, "mk.db")
+    db = _mkpaths().db_in(old_home)
     _check(os.path.isfile(db), "the old mkdb.py created no root store")
 
     migrated = open_root(old_home)
@@ -5050,7 +5050,7 @@ def _root_v2_migration(home, tmp):
 
     fresh_home = os.path.join(home, "fresh-root")
     fresh = open_root(fresh_home)
-    ref = _open_read(os.path.join(old_home, "mk.db"), ROOT_SCHEMA)  # already migrated; read-only
+    ref = _open_read(_mkpaths().db_in(old_home), ROOT_SCHEMA)  # already migrated; read-only
     try:
         _check(ref is not None, "the migrated root vanished after the writer closed it")
         for table in ("projects", "plan_summary"):
@@ -5231,13 +5231,13 @@ def _overview_read(home):
     _check(ran.returncode == 0, f"overview on an empty home exited {ran.returncode}: {ran.stderr[-300:]}")
     _check(json.loads(ran.stdout) == {"ok": True, "projects": [], "plans": []},
            f"overview stdout {ran.stdout.strip()}")
-    _check(not os.path.exists(os.path.join(bare, "mk.db")), "overview created mk.db")
+    _check(not os.path.exists(_mkpaths().db_in(bare)), "overview created mk.db")
 
     # a read must not write or migrate: hash the store, read, hash again
-    db = os.path.join(seeded, "mk.db")
-    before = {n: _file_hash(os.path.join(seeded, n)) for n in ("mk.db", "mk.db-wal", "mk.db-shm")}
+    db = _mkpaths().db_in(seeded)
+    before = {n: _file_hash(os.path.join(seeded, n)) for n in _mkpaths().DB_FILE_NAMES}
     overview(seeded)
-    after = {n: _file_hash(os.path.join(seeded, n)) for n in ("mk.db", "mk.db-wal", "mk.db-shm")}
+    after = {n: _file_hash(os.path.join(seeded, n)) for n in _mkpaths().DB_FILE_NAMES}
     _check(after == before, f"overview wrote the root store: {before} -> {after}")
 
 
@@ -5286,7 +5286,7 @@ def _overview_production_home(home, tmp):
                           env=env, capture_output=True, text=True)
     _check(made.returncode == 0 and made.stdout.strip().endswith("ok"),
            f"the production open path failed: {made.stderr.strip()[-400:]}")
-    _check(os.path.isfile(os.path.join(mkh, "mk.db")), "the production path created no root store")
+    _check(os.path.isfile(_mkpaths().db_in(mkh)), "the production path created no root store")
     ran = subprocess.run(base + ["overview", "--json"], env=env, capture_output=True, text=True)
     _check(ran.returncode == 0, f"overview exited {ran.returncode}: {ran.stderr.strip()[-300:]}")
     got = json.loads(ran.stdout)
@@ -5295,8 +5295,8 @@ def _overview_production_home(home, tmp):
     _check(len(got["plans"]) == 1 and got["plans"][0]["plan"] == "p", f"overview plans {got['plans']}")
     _check(got["plans"][0]["counts"] == {"done": 1}, f"overview counts {got['plans'][0]['counts']}")
     _check(got["plans"][0]["live_run"] == "r", f"overview live_run {got['plans'][0]['live_run']!r}")
-    _check(os.path.realpath(os.path.join(mkh, "mk.db")).startswith(os.path.realpath(fake_home) + os.sep),
-           f"the store landed outside the temp $HOME: {os.path.join(mkh, 'mk.db')}")
+    _check(os.path.realpath(_mkpaths().db_in(mkh)).startswith(os.path.realpath(fake_home) + os.sep),
+           f"the store landed outside the temp $HOME: {_mkpaths().db_in(mkh)}")
 
 
 # --- end L1 plan_summary self-tests ---
@@ -5343,11 +5343,11 @@ def _reads_create_nothing(home):
     finally:
         con.close()
     transition(home, "ignored", "r", "t", "building", note="hello", data_dir=data)
-    db = os.path.join(data, "mk.db")
-    hashes = {name: _file_hash(os.path.join(data, name)) for name in ("mk.db", "mk.db-wal", "mk.db-shm")}
+    db = _mkpaths().db_in(data)
+    hashes = {name: _file_hash(os.path.join(data, name)) for name in _mkpaths().DB_FILE_NAMES}
     got = timeline(home, "ignored", "r", "t", data)
     _check(any(e["text"] == "hello" for e in got), f"ro timeline {got}")
-    after = {name: _file_hash(os.path.join(data, name)) for name in ("mk.db", "mk.db-wal", "mk.db-shm")}
+    after = {name: _file_hash(os.path.join(data, name)) for name in _mkpaths().DB_FILE_NAMES}
     _check(after == hashes, f"read wrote the store: {hashes} -> {after}")
 
     old = os.path.join(home, "ro-old")
@@ -5356,7 +5356,7 @@ def _reads_create_nothing(home):
         add_task(con, "r", "t", "task", title="old")
     finally:
         con.close()
-    old_db = os.path.join(old, "mk.db")
+    old_db = _mkpaths().db_in(old)
     old_hash = _file_hash(old_db)
     try:
         timeline(home, "ignored", "r", "t", old)
@@ -5369,18 +5369,18 @@ def _reads_create_nothing(home):
 
     root_old = os.path.join(home, "ro-root-old")
     os.makedirs(root_old)
-    bare = sqlite3.connect(os.path.join(root_old, "mk.db"))
+    bare = sqlite3.connect(_mkpaths().db_in(root_old))
     bare.execute("CREATE TABLE schema_version(version INTEGER PRIMARY KEY)")
     bare.commit()
     bare.close()
-    root_hash = _file_hash(os.path.join(root_old, "mk.db"))
+    root_hash = _file_hash(_mkpaths().db_in(root_old))
     try:
         overview(root_old)
     except Fail as e:
         _check(e.code == 2 and "needs migration" in str(e), f"old root error: {e}")
     else:
         raise SystemExit("SELF-TEST FAIL: an unstamped root store was read without a migration error")
-    _check(_file_hash(os.path.join(root_old, "mk.db")) == root_hash, "reading an old root wrote it")
+    _check(_file_hash(_mkpaths().db_in(root_old)) == root_hash, "reading an old root wrote it")
     _check(not os.path.exists(os.path.join(root_old, "mk.db-wal")), "reading an old root created a wal")
 
     # Y1 R2: a commit sitting in the WAL, not yet checkpointed, must be visible to a read.
@@ -5391,7 +5391,7 @@ def _reads_create_nothing(home):
         add_task(con, "r", "t", "task", title="initial")
     finally:
         con.close()
-    wal_db = os.path.join(wal, "mk.db")
+    wal_db = _mkpaths().db_in(wal)
     wcon = sqlite3.connect(wal_db)
     wcon.execute("PRAGMA wal_autocheckpoint=0")
     wcon.execute("INSERT INTO events(run, task, t, chan, kind, text) VALUES(?,?,?,?,?,?)",
@@ -5418,7 +5418,7 @@ def _reads_create_nothing(home):
         add_task(con, "r", "t", "task", title="held")
     finally:
         con.close()
-    held_db = os.path.join(held, "mk.db")
+    held_db = _mkpaths().db_in(held)
     holder = sqlite3.connect(held_db, timeout=5.0)
     holder.execute("PRAGMA busy_timeout=5000")
     holder.execute("BEGIN IMMEDIATE")
@@ -5465,7 +5465,7 @@ def _projects_read(home):
     _check(projects(bare) == [], "projects() created mk.db")
     cli = _cli(["projects", "--json", "--home", bare])
     _check(cli == {"ok": True, "projects": []}, f"bare cli {cli}")
-    _check(not os.path.exists(os.path.join(bare, "mk.db")), "projects created mk.db")
+    _check(not os.path.exists(_mkpaths().db_in(bare)), "projects created mk.db")
 
 
 def _run_snapshot(home):
@@ -5610,7 +5610,7 @@ def _run_snapshot(home):
     _check(not os.path.exists(missing), "the refused read created a data dir")
 
     # a read must not write or migrate: hash the store, read, hash again
-    names = ("mk.db", "mk.db-wal", "mk.db-shm")
+    names = _mkpaths().DB_FILE_NAMES
     before = {n: _file_hash(os.path.join(data, n)) for n in names}
     run_snapshot(home, data_dir=data, run="r-a")
     after = {n: _file_hash(os.path.join(data, n)) for n in names}
@@ -5677,7 +5677,7 @@ def _run_events(home):
     _check(events(home, "demo", "r", data_dir=missing) == [], "a missing store is not an empty feed")
     _check(not os.path.exists(missing), "events created a missing data dir")
 
-    names = ("mk.db", "mk.db-wal", "mk.db-shm")
+    names = _mkpaths().DB_FILE_NAMES
     before = {n: _file_hash(os.path.join(data, n)) for n in names}
     events(home, "demo", "r", data_dir=data)
     after = {n: _file_hash(os.path.join(data, n)) for n in names}
@@ -5712,7 +5712,7 @@ def _run_snapshot_migrated(home):
         root = open_root(home)
         try:
             root.execute("INSERT INTO projects(slug, name, repo, data_dir, mode, db_path)"
-                         " VALUES (?,'demo','',?,'home',?)", (slug, data, os.path.join(c2, "mk.db")))
+                         " VALUES (?,'demo','',?,'home',?)", (slug, data, _mkpaths().db_in(c2)))
             root.commit()
         finally:
             root.close()
@@ -5730,7 +5730,7 @@ def _run_snapshot_migrated(home):
     # --data wins over --project (the existing mkdb rule), and the slug form reaches the same store
     _check(run_snapshot(home, project=slug, data_dir=data) == got,
            "--project and --data disagree about the store")
-    _check(_store_path(home, data_dir=data) == os.path.join(c2, "mk.db"),
+    _check(_store_path(home, data_dir=data) == _mkpaths().db_in(c2),
            f"the store path is {_store_path(home, data_dir=data)}")
     # a pre-migration project (no root row) keeps today's literal <data>/mk.db
     plain = os.path.join(home, "plain")
@@ -5741,7 +5741,7 @@ def _run_snapshot_migrated(home):
         plain_db.commit()
     finally:
         plain_db.close()
-    _check(_store_path(home, data_dir=plain) == os.path.join(plain, "mk.db"),
+    _check(_store_path(home, data_dir=plain) == _mkpaths().db_in(plain),
            "a pre-migration project lost its own store path")
     _check(run_snapshot(home, data_dir=plain)["active"] == "p", "the pre-migration read failed")
 
@@ -5759,7 +5759,7 @@ def _run_snapshot_no_store(home):
     os.makedirs(missing)                       # a real, empty data dir: no mk.db in it
     before = sorted(os.listdir(missing))
     _check(before == [], f"the fresh data dir is not empty: {before}")
-    _check(not os.path.exists(os.path.join(missing, "mk.db")), "fixture has a store")
+    _check(not os.path.exists(_mkpaths().db_in(missing)), "fixture has a store")
 
     got = run_snapshot(home, data_dir=missing)
     _check(got == {"ok": True, "store": False, "runs": [], "active": None, "run": None, "waits": []},
@@ -5772,7 +5772,7 @@ def _run_snapshot_no_store(home):
     _check(feed.get("store") is False and feed["events"] == [], f"no-store events reply {feed}")
     # and the read stays read-only: no file, no directory, under the path it was pointed at
     _check(sorted(os.listdir(missing)) == before, f"the no-store read created a file: {before}")
-    _check(not os.path.exists(os.path.join(missing, "mk.db")), "the no-store read created a store")
+    _check(not os.path.exists(_mkpaths().db_in(missing)), "the no-store read created a store")
 
 
 def _plans_timeline_migrated(home):
@@ -5815,7 +5815,7 @@ def _plans_timeline_migrated(home):
         root = open_root(home)
         try:
             root.execute("INSERT INTO projects(slug, name, repo, data_dir, mode, db_path)"
-                         " VALUES (?,'demo','',?,'home',?)", (slug, data, os.path.join(c2, "mk.db")))
+                         " VALUES (?,'demo','',?,'home',?)", (slug, data, _mkpaths().db_in(c2)))
             root.commit()
         finally:
             root.close()
@@ -5849,7 +5849,7 @@ def _plans_timeline_migrated(home):
                  "--run", "r-live", "--task", "t1"]) == {"ok": True, "events": feed},
            "cli timeline differs from the api")
     # and a read still leaves the pre-switch copy untouched: no write, no migration
-    names = ("mk.db", "mk.db-wal", "mk.db-shm")
+    names = _mkpaths().DB_FILE_NAMES
     before = {n: _file_hash(os.path.join(data, n)) for n in names}
     plans(home, data_dir=data)
     timeline(home, slug, "r-live", "t1", data_dir=data)
@@ -5888,7 +5888,7 @@ def _plans_timeline_premigration(home):
     finally:
         root.close()
 
-    _check(_store_path(home, data_dir=data) == os.path.join(data, "mk.db"),
+    _check(_store_path(home, data_dir=data) == _mkpaths().db_in(data),
            f"a pre-migration project lost its own store: {_store_path(home, data_dir=data)}")
     got = plans(home, data_dir=data, plan_id="p1")
     _check(got["title"] == "Plain plan", f"pre-migration plans {got}")
@@ -5953,7 +5953,7 @@ def _run_snapshot_zero_runs(home):
     data = os.path.join(home, "zero-runs")
     con = open_project(home, data_dir=data)    # a real store, no rows
     con.close()
-    _check(os.path.exists(os.path.join(data, "mk.db")), "the empty store was not created")
+    _check(os.path.exists(_mkpaths().db_in(data)), "the empty store was not created")
 
     got = run_snapshot(home, data_dir=data)
     _check(got["store"] is True, f"an existing store is not marked store=true: {got}")

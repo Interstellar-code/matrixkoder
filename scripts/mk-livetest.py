@@ -27,6 +27,7 @@ import argparse, json, os, secrets, shutil, subprocess, sys, tempfile
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import mkpaths  # noqa: E402  C1: every MK path
 import mkdb  # the only store opener; this file opens no database itself
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -145,7 +146,7 @@ def setup(slug="lt"):
     proj.close()
     _write_marker(parent, home, repo)
     return {"ok": True, "home": home, "repo": repo, "data": data, "slug": slug,
-            "root_db": os.path.join(home, "mk.db"), "project_db": os.path.join(data, "mk.db"),
+            "root_db": mkpaths.db_in(home), "project_db": mkpaths.db_in(data),
             "marker": _marker_path(home)}
 
 
@@ -271,7 +272,7 @@ def _pragmas(con):
 
 
 def row_c1_create(ctx):
-    db = os.path.join(_need(ctx)["home"], "mk.db")
+    db = mkpaths.db_in(_need(ctx)["home"])
     if not os.path.isfile(db):
         raise Fail("root store missing")
     con = mkdb.open_root(ctx["home"])
@@ -282,7 +283,7 @@ def row_c1_create(ctx):
 
 
 def row_c2_create(ctx):
-    db = os.path.join(_need(ctx)["data"], "mk.db")
+    db = mkpaths.db_in(_need(ctx)["data"])
     if not os.path.isfile(db):
         raise Fail("project store missing")
     con = mkdb.open_project(ctx["home"], data_dir=ctx["data"])
@@ -570,7 +571,7 @@ def _plan_project(ctx):
     """
     slug = "ltplan"
     data = os.path.join(ctx["home"], "projects", slug)
-    if not os.path.isfile(os.path.join(data, "mk.db")):
+    if not os.path.isfile(mkpaths.db_in(data)):
         mkdb.open_project(ctx["home"], slug).close()
         root = mkdb.open_root(ctx["home"])
         try:
@@ -946,7 +947,7 @@ def _second_project(ctx):
     """A second scratch project under the same temp home, registered in the root store."""
     slug = "ltb"
     data = os.path.join(ctx["home"], "projects", slug)
-    if not os.path.isfile(os.path.join(data, "mk.db")):
+    if not os.path.isfile(mkpaths.db_in(data)):
         con = mkdb.open_project(ctx["home"], slug)
         con.close()
         root = mkdb.open_root(ctx["home"])
@@ -966,7 +967,7 @@ def _bus_project(ctx):
     one (`p` + hash) and registers it, so the `lt` row setup wrote is not it."""
     import sqlite3
     from urllib.parse import quote
-    db = os.path.join(ctx["home"], "mk.db")
+    db = mkpaths.db_in(ctx["home"])
     con = sqlite3.connect("file:" + quote(db) + "?mode=ro", uri=True)
     try:
         row = con.execute("SELECT slug FROM projects WHERE data_dir=?",
@@ -1312,7 +1313,7 @@ def row_c9_setting(ctx):
     if first.get("mapped") != "verify" or first.get("sent") is not True:
         raise Fail(f"default is not a sent verify: {first}")
     # Then `done`. A new round is a new dedupe key, so the second report is sent.
-    with open(os.path.join(ctx["data"], "matrixkoder.yaml"), "w") as fh:
+    with open(mkpaths.legacy_yaml(ctx["data"]), "w") as fh:
         fh.write("todo_done_status: done\n")
     code, lines, err = _builder(lane, "start", "--run", ctx["run"], "--task", "C9S",
                                 "--round", "2", "--report", "r.md", env=env)

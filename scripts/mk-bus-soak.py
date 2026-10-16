@@ -24,11 +24,12 @@ sys.path.insert(0, HERE)
 
 import importlib.util  # noqa: E402
 import mkdb  # noqa: E402
+import mkpaths  # noqa: E402
 _spec = importlib.util.spec_from_file_location("mk_livetest", os.path.join(HERE, "mk-livetest.py"))
 lt = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(lt)
 
-REAL_FILES = ("bus.json", "bus-tokens.json", "mk.db")
+REAL_FILES = ("bus.json", "bus-tokens.json", mkpaths.ROOT_DB_NAME)
 RUN = "soak1"
 TASK = "SOAK"
 LANE_NAME = "soak-lane"
@@ -324,7 +325,7 @@ def check_metrics(ctx):
     missing = [k for k in wanted if k not in res]
     if not res.get("ok") or missing:
         raise SoakFail("metrics", f"not a counter line: {res}")
-    con = sqlite3.connect("file:" + quote(os.path.join(ctx["data"], "mk.db")) + "?mode=ro", uri=True)
+    con = sqlite3.connect("file:" + quote(mkpaths.db_in(ctx["data"])) + "?mode=ro", uri=True)
     try:
         total = con.execute(
             "SELECT COUNT(*) FROM events WHERE chan='bus' AND run=? AND kind IN ('ask','info','nudge','answer')",
@@ -338,7 +339,7 @@ def check_metrics(ctx):
 
 
 def _answers_for(data, ask_id):
-    con = sqlite3.connect("file:" + quote(os.path.join(data, "mk.db")) + "?mode=ro", uri=True)
+    con = sqlite3.connect("file:" + quote(mkpaths.db_in(data)) + "?mode=ro", uri=True)
     try:
         return con.execute(
             "SELECT COUNT(*) FROM events WHERE chan='bus' AND kind='answer' AND reply_to=?",
@@ -348,7 +349,7 @@ def _answers_for(data, ask_id):
 
 
 def count_events(data, chan="bus"):
-    con = sqlite3.connect("file:" + quote(os.path.join(data, "mk.db")) + "?mode=ro", uri=True)
+    con = sqlite3.connect("file:" + quote(mkpaths.db_in(data)) + "?mode=ro", uri=True)
     try:
         return con.execute("SELECT COUNT(*) FROM events WHERE chan=?", (chan,)).fetchone()[0]
     finally:
@@ -363,7 +364,7 @@ def check_counts(ctx, data_a, data_b, sent_a, sent_b, acks_only=None):
         check_acks(acks_only)
         return
     def expect(data, sent):
-        con = sqlite3.connect("file:" + quote(os.path.join(data, "mk.db")) + "?mode=ro", uri=True)
+        con = sqlite3.connect("file:" + quote(mkpaths.db_in(data)) + "?mode=ro", uri=True)
         try:
             rings = con.execute(
                 "SELECT COUNT(*) FROM events WHERE chan='bus' AND kind IN ('ring','ring-typed')").fetchone()[0]
@@ -380,7 +381,7 @@ def check_counts(ctx, data_a, data_b, sent_a, sent_b, acks_only=None):
 
 def check_acks(data):
     """Exactly one acks row per (run, msg, lane, level). `data` may be a COPY."""
-    con = sqlite3.connect("file:" + quote(os.path.join(data, "mk.db") if os.path.isdir(data) else data) + "?mode=ro", uri=True)
+    con = sqlite3.connect("file:" + quote(mkpaths.db_in(data) if os.path.isdir(data) else data) + "?mode=ro", uri=True)
     try:
         rows = list(con.execute("SELECT run, msg, lane, level, COUNT(*) c FROM acks "
                                 "GROUP BY run, msg, lane, level"))
@@ -821,7 +822,7 @@ def _case_mutation_ack():
     made = lt.setup()
     home = made["home"]
     try:
-        src = os.path.join(made["data"], "mk.db")
+        src = mkpaths.db_in(made["data"])
         copy = os.path.join(home, "acks-copy.db")
         shutil.copy(src, copy)
         # The write goes through mkdb's own connection. The live primary key is

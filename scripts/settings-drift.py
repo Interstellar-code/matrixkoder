@@ -40,6 +40,9 @@ import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+import mkpaths  # noqa: E402  C1: every MK path
+
 MK_CONFIG = REPO_ROOT / "scripts" / "mk-config.py"
 PLUGIN_JSON = REPO_ROOT / ".claude-plugin" / "plugin.json"
 OUT_FILE = REPO_ROOT / "hooks" / "tabs" / "settings.schema.ts"
@@ -73,7 +76,7 @@ def list_schema() -> list[dict]:
     """The schema `mk-config.py list --json` prints against an empty data dir
     + a minimal agents block, reduced to the columns the tests check."""
     with tempfile.TemporaryDirectory() as data_dir:
-        yaml = Path(data_dir) / "matrixkoder.yaml"
+        yaml = Path(mkpaths.legacy_yaml(data_dir))
         yaml.write_text(MIN_YAML)
         out = subprocess.check_output(
             ["python3", str(MK_CONFIG), "--data", data_dir, "list", "--json"],

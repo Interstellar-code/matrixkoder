@@ -38,6 +38,13 @@ ROOT_DB_NAME = "mk.db"
 PROJECTS_JSON = "projects.json"
 USAGE_LEDGER = "usage.json"
 MK_SETTINGS_NAME = "mk-settings.yaml"
+# L10.12a: the file names a caller joins onto a folder it already holds (no migrated lookup, no home rule)
+DB_FILE_NAMES = (ROOT_DB_NAME, ROOT_DB_NAME + "-wal", ROOT_DB_NAME + "-shm")
+LEGACY_YAML_NAME = "matrixkoder.yaml"
+PROJECT_YAML_NAME = "project.yaml"
+RUN_DOC_NAME, TASK_DOC_NAME, EVENTS_DOC_NAME, BOARD_DOC_NAME = "run.json", "task.json", "events.jsonl", "board.md"
+VIEW_DOC_NAMES = (RUN_DOC_NAME, TASK_DOC_NAME, EVENTS_DOC_NAME, BOARD_DOC_NAME)  # the pre-C4 file views
+LANES_NAME, CURSORS_NAME = "lanes.json", "watch-cursors.json"
 INBOX_DIR = "inbox"
 LANE_BUS_FILE = ".matrixkoder-bus.json"
 BUS_LANES_DIR = "bus-lanes"
@@ -181,6 +188,58 @@ def root_home():
     bus pins it with $MK_BUS_DIR (tests), everything else uses the MK home. No other caller
     ever sets $MK_BUS_DIR, so the two agree wherever it matters."""
     return bus_env_dir() or home()
+
+
+def db_in(folder):
+    """<folder>/mk.db: the store file of a folder the caller already resolved. A plain join: no home
+    rule, no migrated lookup (`project_db` and `root_db` are the resolving forms)."""
+    return os.path.join(folder, ROOT_DB_NAME)
+
+
+def db_files_in(folder):
+    """The store file and its two WAL sidecars inside `folder`, in DB_FILE_NAMES order."""
+    return [os.path.join(folder, n) for n in DB_FILE_NAMES]
+
+
+def legacy_yaml(folder):
+    """<folder>/matrixkoder.yaml: the pre-C2 settings file name, literal (`project_yaml` resolves)."""
+    return os.path.join(folder, LEGACY_YAML_NAME)
+
+
+def project_yaml_in(folder):
+    """<folder>/project.yaml: the C2 settings file of a project folder the caller already resolved."""
+    return os.path.join(folder, PROJECT_YAML_NAME)
+
+
+def legacy_lanes(folder):
+    """<folder>/lanes.json, literal (`lanes_file` is the data-dir form; same bytes)."""
+    return lanes_file(folder)
+
+
+def legacy_run_dir(data, run):
+    """<data>/runs/<run>, literal: where the pre-C4 file views live (`run_dir` follows a switch)."""
+    return os.path.join(runs_dir(data), run)
+
+
+def run_doc_in(run_folder):
+    return os.path.join(run_folder, RUN_DOC_NAME)
+
+
+def task_doc_in(task_folder):
+    return os.path.join(task_folder, TASK_DOC_NAME)
+
+
+def events_doc_in(run_folder):
+    return os.path.join(run_folder, EVENTS_DOC_NAME)
+
+
+def board_doc_in(run_folder):
+    return os.path.join(run_folder, BOARD_DOC_NAME)
+
+
+def legacy_cursors(folder):
+    """<folder>/watch-cursors.json, literal: the pre-L6.1 cursor file, never the take-over form."""
+    return os.path.join(folder, CURSORS_NAME)
 
 
 def mk_settings(arg=None):
@@ -1090,6 +1149,23 @@ def self_test():
             raise Fail(f"self-test: inbox_dir accepted plan id {bad!r}")
         _clear_home_env()
 
+    def t_names():
+        """L10.12a: the folder-literal helpers join exactly what the call sites used to spell."""
+        d = os.path.join(root, "names")
+        _check(db_in(d) == os.path.join(d, "mk.db"), db_in(d))
+        _check(db_files_in(d) == [os.path.join(d, n) for n in ("mk.db", "mk.db-wal", "mk.db-shm")], db_files_in(d))
+        _check(legacy_yaml(d) == os.path.join(d, "matrixkoder.yaml"), legacy_yaml(d))
+        _check(project_yaml_in(d) == os.path.join(d, "project.yaml"), project_yaml_in(d))
+        _check(legacy_lanes(d) == os.path.join(d, "lanes.json") == lanes_file(d), legacy_lanes(d))
+        _check(legacy_cursors(d) == os.path.join(d, "watch-cursors.json"), legacy_cursors(d))
+        r, t = os.path.join(d, "runs", "r1"), os.path.join(d, "runs", "r1", "tasks", "T")
+        _check(legacy_run_dir(d, "r1") == r, legacy_run_dir(d, "r1"))
+        _check(run_doc_in(r) == os.path.join(r, "run.json") and events_doc_in(r) == os.path.join(r, "events.jsonl")
+               and board_doc_in(r) == os.path.join(r, "board.md") and task_doc_in(t) == os.path.join(t, "task.json"), "docs")
+        _check(VIEW_DOC_NAMES == ("run.json", "task.json", "events.jsonl", "board.md"), VIEW_DOC_NAMES)
+        _check((LANES_NAME, CURSORS_NAME) == ("lanes.json", "watch-cursors.json"), "names")
+        _check(not os.path.exists(d), "a path helper created a folder")
+
     def t_home(tmp_home):
         os.environ["HOME"] = tmp_home
         _clear_home_env()
@@ -1578,6 +1654,7 @@ def self_test():
             f.write("gitdir: " + wt_git + "\n")
         t_home(tmp_home)
         t_l10(tmp_home)
+        t_names()
         t_data_dir(tmp_home, repo, worktree)
         t_folders(tmp_home, repo)
         t_project_db(tmp_home, repo)

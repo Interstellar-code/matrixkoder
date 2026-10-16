@@ -155,7 +155,7 @@ def settings_file(data):
     exist, so a migrated project whose project.yaml is gone falls back to its old config instead
     of silently reading DEFAULTS."""
     path = mkpaths.project_yaml(data)
-    return path if os.path.exists(path) else os.path.join(data, "matrixkoder.yaml")
+    return path if os.path.exists(path) else mkpaths.legacy_yaml(data)
 
 
 def load_config(data):
@@ -873,8 +873,7 @@ def store_snapshot(data, run=None):
     The gate is mkpaths.project_folder's — the same store run_snapshot opens — so a migrated
     project is gated on its C2 store, never on the pre-switch copy left in the data dir."""
     try:
-        if not data or not os.path.isfile(os.path.join(
-                mkpaths.project_folder(data, home_arg=mkpaths.home()), "mk.db")):
+        if not data or not os.path.isfile(mkpaths.db_in(mkpaths.project_folder(data, home_arg=mkpaths.home()))):
             return None
         return mkdb.run_snapshot(mkpaths.home(), None, run, data_dir=data)
     except Exception:  # a store we cannot read must not fail an acquire: the file view answers
@@ -1685,7 +1684,7 @@ def self_test():
         return {k: v for k, v in obj.items() if k not in ("warning", "warnings")}
 
     def yaml_cap(slots, cap, pattern="../{repo}-mk-{n}", disposable=None):
-        with open(os.path.join(data, "matrixkoder.yaml"), "w") as f:
+        with open(mkpaths.legacy_yaml(data), "w") as f:
             f.write(f'repo:\n  lanes: {{ slots: {slots}, pattern: "{pattern}", reuse: true }}\n'
                     f"routing_preferences:\n  max_build_lanes: {cap}\n")
             if disposable:
@@ -1722,7 +1721,7 @@ def self_test():
 
         # config: L3's shape (with its trailing comment), defaults, cap math, disposable validation
         assert load_config(data) == {**DEFAULTS, "warnings": []}, load_config(data)  # no yaml at all
-        write(os.path.join(data, "matrixkoder.yaml"),
+        write(mkpaths.legacy_yaml(data),
               'repo:\n  lanes: { slots: 2, pattern: "../{repo}-lanes-{n}", reuse: true }   '
               "# reusable worktree slots; the cap is max_build_lanes\n")
         assert load_config(data) == {**DEFAULTS, "slots": 2, "pattern": "../{repo}-lanes-{n}",
@@ -1734,24 +1733,24 @@ def self_test():
         assert load_config(data)["cap"] == 3, load_config(data)  # the cap is max_build_lanes
         yaml_cap(4, 2)  # a bigger pool ask never raises the cap: mk-config's value wins (Z24)
         assert load_config(data)["cap"] == 2, load_config(data)
-        write(os.path.join(data, "matrixkoder.yaml"),
+        write(mkpaths.legacy_yaml(data),
               "repo:\n  lanes: { slots: 1, pattern: ../{repo}-mk-{n}, reuse: false }\n")
         assert load_config(data) == {**DEFAULTS, "slots": 1, "reuse": False,
                                      "warnings": []}, load_config(data)
         # a wildcard disposable entry is refused, so it can never widen the allowlist to "everything"
-        write(os.path.join(data, "matrixkoder.yaml"),
+        write(mkpaths.legacy_yaml(data),
               'repo:\n  lanes: { slots: 1, pattern: "../{repo}-mk-{n}", reuse: true }\n'
               'lanes_disposable: ["*", "../secrets", "*.db", "build", "dist/"]\n')
         cfg = load_config(data)
         assert cfg["disposable"] == ["build", "dist/"], cfg
         assert len(cfg["warnings"]) == 3, cfg
         # lanes.copy: a flow list inside the lanes map; only literal relative paths are accepted
-        write(os.path.join(data, "matrixkoder.yaml"),
+        write(mkpaths.legacy_yaml(data),
               'repo:\n  lanes: { slots: 2, pattern: "../{repo}-mk-{n}", reuse: true, '
               'copy: [".claude-plugin/types", ".env"] }\n')
         cfg = load_config(data)
         assert cfg["copy"] == [".claude-plugin/types", ".env"] and cfg["warnings"] == [], cfg
-        write(os.path.join(data, "matrixkoder.yaml"),
+        write(mkpaths.legacy_yaml(data),
               'repo:\n  lanes: { slots: 1, pattern: "../{repo}-mk-{n}", reuse: true, '
               'copy: ["*", "../secrets", "/abs", ".", "ok-dir/"] }\n')
         cfg = load_config(data)
@@ -1764,10 +1763,10 @@ def self_test():
         # value mk-config reports for routing_preferences.max_build_lanes.
         slug, legacy = "cap-proj", os.path.join(tmp, "cap-legacy")
         c2 = os.path.join(lane_home, "projects", slug)
-        write(os.path.join(c2, "project.yaml"),
+        write(mkpaths.project_yaml_in(c2),
               "repo:\n  lanes: { slots: 5, pattern: ../{repo}-mk-{n}, reuse: true }\n"
               "routing_preferences:\n  max_build_lanes: 4\n")
-        write(os.path.join(legacy, "matrixkoder.yaml"),
+        write(mkpaths.legacy_yaml(legacy),
               "repo:\n  lanes: { slots: 1, pattern: ../{repo}-mk-{n}, reuse: true }\n"
               "routing_preferences:\n  max_build_lanes: 5\n")
         root = mkdb.open_root(lane_home)  # C3's migrated marker is this row's db_path
@@ -1779,7 +1778,7 @@ def self_test():
                          " VALUES (?,?,?,?,?,?)",
                          # repo: a path of its own, so data_dir(None)'s repo lookup never finds this row
                          (slug, slug, os.path.join(tmp, "cap-repo"), legacy, "home",
-                          os.path.join(c2, "mk.db")))
+                          mkpaths.db_in(c2)))
             root.commit()
         finally:
             root.close()
@@ -1793,12 +1792,12 @@ def self_test():
             assert json.loads(r.stdout)["value"] == cap, (d, cap, r.stdout)
         # unmigrated: no root row, so the legacy file in the data dir is still the config
         plain = os.path.join(tmp, "cap-plain")
-        write(os.path.join(plain, "matrixkoder.yaml"),
+        write(mkpaths.legacy_yaml(plain),
               "repo:\n  lanes: { slots: 1, pattern: ../{repo}-mk-{n}, reuse: true }\n"
               "routing_preferences:\n  max_build_lanes: 6\n")
         assert load_config(plain)["cap"] == 6, load_config(plain)
         # a migrated project whose project.yaml is gone falls back to its legacy file, not DEFAULTS
-        os.unlink(os.path.join(c2, "project.yaml"))
+        os.unlink(mkpaths.project_yaml_in(c2))
         assert load_config(legacy)["cap"] == 5, load_config(legacy)
 
         # 1 names: lowercased, digit-prefixed agent, the 32-char limit, integration branch
@@ -1813,7 +1812,7 @@ def self_test():
         assert big["agent"].endswith("-build-r1"), big
         assert mk("names", "--run", "r1", "--task", "x", "--slot", "2")["workspace"] == "mk:repo:2"
         # a pattern without {n} would put every slot on one path: refused before anything is computed
-        write(os.path.join(data, "matrixkoder.yaml"),
+        write(mkpaths.legacy_yaml(data),
               'repo:\n  lanes: { slots: 1, pattern: "../{repo}", reuse: true }\n')
         assert "{n}" in mk("names", "--run", "r1", "--task", "t1", code=2)["error"]
         yaml_cap(1, 1)
@@ -2244,7 +2243,7 @@ def self_test():
         # 11f a lanes: line we cannot read is reported, never silently the defaults
         for bad in ('  lanes: { slots: 1, pattern: "../{repo}-mk-{n}", reuse: true }#c\n',
                     "  lanes: { slots: 1, pattern: ../bob's-mk-{n}, reuse: true }   # slots\n"):
-            write(os.path.join(data, "matrixkoder.yaml"), bad)
+            write(mkpaths.legacy_yaml(data), bad)
             w = mk("list")
             assert any("lanes line unparsed" in x for x in w.get("warnings", [])), (bad, w)
             assert any("lanes line unparsed" in x for x in mk("names", "--run", "r1",
@@ -2328,17 +2327,17 @@ def self_test():
         g("worktree", "add", "-q", other, "-b", "userwork", "main")
         write(os.path.join(other, "mine.txt"), "the user's own work\n")
         g("-C", other, "add", "-A"), g("-C", other, "commit", "-qm", "user work")
-        write(os.path.join(data, "matrixkoder.yaml"),
+        write(mkpaths.legacy_yaml(data),
               'repo:\n  lanes: { slots: 2, pattern: "{repo}-lanes/{n}", reuse: true }\n')
         bad = mk("acquire", "--run", "r1", "--task", "tb", "--base", "main", code=2)
         assert bad["ok"] is False and "inside it" in bad["error"], bad
         assert main_head() == "main", main_head()  # the main checkout was never switched
-        write(os.path.join(data, "matrixkoder.yaml"),
+        write(mkpaths.legacy_yaml(data),
               'repo:\n  lanes: { slots: 2, pattern: "../{repo}", reuse: true }\n')
         bad = mk("acquire", "--run", "r1", "--task", "tb", "--base", "main", code=2)
         assert bad["ok"] is False and "{n}" in bad["error"], bad
         assert main_head() == "main", main_head()
-        write(os.path.join(data, "matrixkoder.yaml"),
+        write(mkpaths.legacy_yaml(data),
               'repo:\n  lanes: { slots: 2, pattern: "../other-{n}", reuse: true }\n')
         bad = mk("acquire", "--run", "r1", "--task", "tb", "--base", "main", code=2)
         assert bad["ok"] is False and "pattern now gives" in bad["error"], bad
@@ -2391,7 +2390,7 @@ def self_test():
         assert mk("release", "--slot", "1", "--integration", "mk/r1/integration")["ok"]
 
         # 13 a rejected lanes_disposable entry narrows the allowlist and is reported
-        write(os.path.join(data, "matrixkoder.yaml"),
+        write(mkpaths.legacy_yaml(data),
               'repo:\n  lanes: { slots: 2, pattern: "../{repo}-mk-{n}", reuse: true }\n'
               'lanes_disposable: ["*"]\n')
         assert mk("release", "--slot", "2", "--integration", "mk/r1/integration")["ok"]
@@ -2492,7 +2491,7 @@ def self_test():
               "node_modules/\n__pycache__/\n/.venv/\n.omc/\nprod.sqlite\n.env\n")
         g("add", "src", ".gitignore"), g("commit", "-qm", "tracked src; .env ignored")
         write(os.path.join(repo, ".env"), "TOKEN=copy\n")
-        write(os.path.join(data, "matrixkoder.yaml"),
+        write(mkpaths.legacy_yaml(data),
               'repo:\n  lanes: { slots: 5, pattern: "../{repo}-mk-{n}", reuse: true, '
               'copy: ["README.md", "src", ".env"] }\n'
               'routing_preferences:\n  max_build_lanes: 5\n')
@@ -2555,7 +2554,7 @@ def self_test():
 
         # ...and through acquire: slot 5 is reused (its path exists), loses its .env, and gets
         # main's current one back; the second reuse keeps the slot's own newer .env untouched
-        write(os.path.join(data, "matrixkoder.yaml"),
+        write(mkpaths.legacy_yaml(data),
               'repo:\n  lanes: { slots: 5, pattern: "../{repo}-mk-{n}", reuse: true, '
               'copy: ["README.md", "src", ".env"] }\n'
               'routing_preferences:\n  max_build_lanes: 5\n')
@@ -2653,7 +2652,7 @@ def self_test():
         # 12 acquire without --base uses repo.integration_branch from the yaml; an explicit --base
         # still wins; a bad yaml value still fails check_ref
         assert mk("release", "--slot", "5", "--integration", "mk/r1/integration")["ok"]
-        write(os.path.join(data, "matrixkoder.yaml"),
+        write(mkpaths.legacy_yaml(data),
               'repo:\n  integration_branch: mk/r1/integration\n  lanes: { slots: 5, reuse: true }\n')
         st("task", "add", "--root", "--id", "t20", "--title", "twenty", "--run", "r1")
         acq_nobase = mk("acquire", "--run", "r1", "--task", "t20")
@@ -2672,7 +2671,7 @@ def self_test():
 
         # a bad yaml value still fails check_ref
         assert mk("release", "--slot", "5", "--integration", "mk/r1/integration")["ok"]
-        write(os.path.join(data, "matrixkoder.yaml"),
+        write(mkpaths.legacy_yaml(data),
               'repo:\n  integration_branch: nosuchbranch\n  lanes: { slots: 5, reuse: true }\n')
         st("task", "add", "--root", "--id", "t22", "--title", "twenty-two", "--run", "r1")
         bad_yaml = mk("acquire", "--run", "r1", "--task", "t22", code=2)
@@ -2680,7 +2679,7 @@ def self_test():
         assert bad_yaml["ok"] is False
 
         # absent from yaml falls back to schema default "main"
-        write(os.path.join(data, "matrixkoder.yaml"),
+        write(mkpaths.legacy_yaml(data),
               'repo:\n  lanes: { slots: 5, reuse: true }\n')
         st("task", "add", "--root", "--id", "t23", "--title", "twenty-three", "--run", "r1")
         acq_dflt = mk("acquire", "--run", "r1", "--task", "t23")
@@ -2726,14 +2725,14 @@ def self_test():
         def seed(ddir, tag):
             os.makedirs(ddir)
             for name in os.listdir(data):
-                if name == "lanes.json":
+                if name == mkpaths.LANES_NAME:
                     continue
                 src, dst = os.path.join(data, name), os.path.join(ddir, name)
                 if os.path.isdir(src):
                     _sh.copytree(src, dst)
                 else:
                     _sh.copy2(src, dst)
-            write(os.path.join(ddir, "matrixkoder.yaml"), parity_yaml(tag))
+            write(mkpaths.legacy_yaml(ddir), parity_yaml(tag))
             # the copied store carries the source run's slot rows: empty the pool so each side
             # builds its own, exactly as the old file-mode side started with no lanes.json
             con = mkdb.open_project(mkpaths.home(), data_dir=ddir)
@@ -2752,7 +2751,7 @@ def self_test():
         env_store = dict(env, MK_HOME=home, MATRIXKODER_HOME=home)
         con = mkdb.open_project(home, data_dir=store_data)
         con.close()
-        assert os.path.isfile(os.path.join(store_data, "mk.db"))
+        assert os.path.isfile(mkpaths.db_in(store_data))
 
         def mk_at(ddir, eenv, *args, code=0):
             r = subprocess.run([sys.executable, self_path, *args, "--data", ddir], capture_output=True,
@@ -2785,7 +2784,7 @@ def self_test():
                     return {k: norm(obj[k]) for k in keep if k in obj}
                 return norm(obj)
             assert core(fa) == core(sa), (args, fa, sa)
-        assert os.path.isfile(os.path.join(file_data, "mk.db"))  # both sides are stores now
+        assert os.path.isfile(mkpaths.db_in(file_data))  # both sides are stores now
 
         # exit 4 when every slot is busy — its own data dir, so no slot path from the parity pattern
         # cap 1: one acquire succeeds, the next is exit 4. Need a known task.
@@ -2800,14 +2799,14 @@ def self_test():
             _sh.rmtree(ddir, ignore_errors=True)
             os.makedirs(ddir)
             for name in os.listdir(data):
-                if name == "lanes.json":
+                if name == mkpaths.LANES_NAME:
                     continue
                 src, dst = os.path.join(data, name), os.path.join(ddir, name)
                 if os.path.isdir(src):
                     _sh.copytree(src, dst)
                 else:
                     _sh.copy2(src, dst)
-            write(os.path.join(ddir, "matrixkoder.yaml"), yaml_text)
+            write(mkpaths.legacy_yaml(ddir), yaml_text)
             con = mkdb.open_project(mkpaths.home(), data_dir=ddir)
             try:
                 con.execute("BEGIN IMMEDIATE")
@@ -2957,7 +2956,7 @@ def self_test():
         mkpaths._MIGRATED_MEMO = None
         # L4 (C4): there is no file-mode data dir left — every dir mk-state is asked about gets a
         # store, so `data` above carries mk.db like any other, and that is the expected state
-        assert os.path.isfile(os.path.join(data, "mk.db"))
+        assert os.path.isfile(mkpaths.db_in(data))
 
         # L1 in store mode: ignored `.omc` state alone leaves the slot releasable, a modified
         # tracked plan still refuses, and the outside skill symlink is not followed.
@@ -3123,7 +3122,7 @@ def self_test():
         # world, where mk-state writes none of them.
         rsd = os.path.join(tmp, "data-resolve-store")
         os.makedirs(rsd)
-        write(os.path.join(rsd, "matrixkoder.yaml"),
+        write(mkpaths.legacy_yaml(rsd),
               'repo:\n  lanes: { slots: 1, pattern: "../{repo}-res-{n}", reuse: true }\n')
 
         def st_at(ddir, *args, code=0):
@@ -3138,7 +3137,7 @@ def self_test():
         st_at(rsd, "task", "add", "--root", "--id", "Rt2", "--title", "two")
         st_at(rsd, "task", "add", "--root", "--id", "Rt3", "--title", "three")
         st_at(rsd, "store", "enable")
-        assert os.path.isfile(os.path.join(rsd, "mk.db")), "store enable wrote no mk.db"
+        assert os.path.isfile(mkpaths.db_in(rsd)), "store enable wrote no mk.db"
 
         def resolutions(ddir):
             """Every answer run_ids/resolve_run/resolve_task give for the store fixture, as one dict."""
@@ -3155,7 +3154,7 @@ def self_test():
         want = {"ids": ["rs1"], "exact": "rs1", "upper": "rs1", "mixed": "rs1", "unknown": None,
                 "task_exact": "Rt1", "task_upper": "Rt1", "task_lower": "Rt1", "task_other": "Rt2",
                 "task_unknown": "nope", "task_no_run": "rt1"}
-        assert os.path.isfile(os.path.join(rsd, "mk.db")), "store enable wrote no mk.db"
+        assert os.path.isfile(mkpaths.db_in(rsd)), "store enable wrote no mk.db"
         # (b) L4 (C4): store enable writes NO run.json / index.json — the store is the only
         # record. The resolutions below are read straight off it.
         assert not os.path.exists(mkpaths.run_doc(rsd, "rs1"))
@@ -3166,7 +3165,7 @@ def self_test():
         bad = mk_at(rsd, env, "acquire", "--run", "nope", "--task", "Rt1", "--base", "main", code=2)
         assert bad["ok"] is False and "unknown run 'nope'" in bad["error"], bad
         assert bad["known_runs"] == ["rs1"], bad
-        assert not os.path.exists(os.path.join(rsd, "lanes.json")), "a refused acquire wrote lanes.json"
+        assert not os.path.exists(mkpaths.legacy_lanes(rsd)), "a refused acquire wrote lanes.json"
         # (c) the whole acquire off the store, with both ids typed in the wrong case: the writes
         # must carry the stored spelling, which only a store-backed resolve can produce
         acq = mk_at(rsd, env, "acquire", "--run", "RS1", "--task", "rt1", "--base", "main")
@@ -3226,9 +3225,9 @@ def self_test():
         nsd = os.path.join(tmp, "data-resolve-file")
         os.makedirs(os.path.join(nsd, "runs", "Fs1"))
         write(os.path.join(nsd, "runs", "index.json"), json.dumps([{"id": "Fs1"}]))
-        write(os.path.join(nsd, "runs", "Fs1", "run.json"),
+        write(mkpaths.run_doc_in(mkpaths.legacy_run_dir(nsd, "Fs1")),
               json.dumps({"schema": 1, "id": "Fs1", "tasks": [{"id": "Ft1"}]}))
-        assert not os.path.exists(os.path.join(nsd, "mk.db"))
+        assert not os.path.exists(mkpaths.db_in(nsd))
         assert store_snapshot(nsd) is None
         assert run_ids(nsd) == ["Fs1"], run_ids(nsd)
         assert resolve_run(nsd, "fS1") == "Fs1" and resolve_run(nsd, "nope") is None
