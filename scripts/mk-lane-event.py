@@ -314,6 +314,8 @@ def verdict_for(w):
     state, ev = lw.decide(h, subj, rx, report_ok, h.get("text", ""), w.get("phase"), stall, st, armed)
     if st and st.get("source") == "store" and ev and ev[-1] == "source=status":
         ev = ev[:-1] + ["source=store"]  # decided from the tasks row, not the status file
+    # the row this verdict was read from: apply_verdict hands it to record()'s compare-and-set
+    SEEN[w["lane"]] = st.get("seen") if st and st.get("source") == "store" else None
     return h, subj, state, ev
 
 
@@ -366,6 +368,9 @@ def toast_pane(task, state, status):
         return False
 
 
+SEEN = {}   # lane -> the store row its latest verdict was read from (set by the check, taken by apply_verdict)
+
+
 def apply_verdict(w, state, subj, evidence, h):
     """Record via lane-watch's record() (verdict → mk-state status, WATCHED guard), label + toast,
     stamp the watch file. A failed mk-state write stamps nothing, so the next event retries. A
@@ -378,9 +383,11 @@ def apply_verdict(w, state, subj, evidence, h):
     if not any(str(e).startswith("source=") for e in evidence):   # R41: pane detections (R35)
         evidence = evidence + ["source=pane"]
     # source is one of store|status|pane|grace (D5A.2); decide() already ends with one of them
-    rec = lw.record({"state": state, "commit": subj, "evidence": evidence,
-                     "agent_status": (h or {}).get("agent_status")}, watch_tasks(w), w["data"],
-                    w.get("run"))
+    verdict = {"state": state, "commit": subj, "evidence": evidence, "agent_status": (h or {}).get("agent_status")}
+    seen = SEEN.pop(w["lane"], None)
+    if seen:
+        verdict["seen"] = seen
+    rec = lw.record(verdict, watch_tasks(w), w["data"], w.get("run"))
     if not rec.get("ok"):
         return rec, False, False, None
     if state == "DONE":
@@ -3476,6 +3483,25 @@ def self_test():
         v = {x["task"]: x for x in r["verdicts"]}
         assert v.get("S4", {}).get("verdict") == "DONE", r
         assert "source=store" in [e for e in events() if e.get("task") == "S4" and "lane-watch" in (e.get("text") or "")][-1]["text"]
+        # a store BLOCKED verdict is recorded only while its row is unchanged: the orchestrator's answer
+        # (building) that lands between the read and the write must win, and apply_verdict only notes it
+        mks("task", "add", "--root", "--id", "S5", "--title", "stale blocked")
+        mks("task", "set", "S5", "status=building")
+        lanes["S5"] = os.path.join(tmp, "lane-s5")
+        g(repo, "worktree", "add", "-q", "--detach", lanes["S5"])
+        mks("task", "round", "S5", "--kind", "build")
+        mks("task", "set", "S5", "status=blocked")
+        arm("S5", phase="S5 R1")
+        st5 = lw.read_status(lanes["S5"], {"run": "r1", "task": "S5", "phase": "S5 R1", "data": data})
+        assert st5 and st5["state"] == "blocked" and st5["seen"]["status"] == "blocked", st5
+        mks("task", "set", "S5", "status=building")   # the answer, after the read
+        w5 = watch_of("S5")
+        SEEN[w5["lane"]] = st5["seen"]
+        rec5, _, _, _ = apply_verdict(w5, "BLOCKED", "", ["store row blocked: q", "source=store"], {})
+        assert rec5.get("ok"), rec5
+        assert store_read("SELECT status FROM tasks WHERE run='r1' AND id='S5'")[0]["status"] == "building", "the answer was undone"
+        notes5 = [e for e in events() if e.get("task") == "S5" and "lane-watch BLOCKED" in (e.get("text") or "")]
+        assert notes5 and "kept: row changed" in notes5[-1]["text"], notes5
 
         # (D7B) the job hint calls the real function. The lookup uses the HERE path,
         # so the cwd does not matter, and the arithmetic goes through selftest_jobs_hint.
