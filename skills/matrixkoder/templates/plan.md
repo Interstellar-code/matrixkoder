@@ -50,6 +50,12 @@ timeout = 600                             # int seconds, default 600 — plans.h
 needs = []                                # optional: things the gate needs in place before it runs, e.g. ["bus"]; list, default [] — plans.header_json
 covers = ["P1.1", "P1.2"]                 # required, non-empty: the task ids of THIS plan the gate proves; mk-plan check refuses a final gate without covers and errors on an id that is not a task here — plans.header_json
 
+[[final_gate]]                            # L10.14 example: the read-only layout + DB audit of the MK home as a standing gate; delete it for a plan that does not touch the storage layout — plans.header_json
+id = "LAYOUT"                             # the audit's own name in errors and in the change report — plans.header_json
+cmd = "python3 scripts/mk-e2e-layout.py audit"  # never writes the home: reads every store from a private copy; exit 0 = clean v2 home, 1 = drift (the failing rule names the path or table) — plans.header_json
+every = "merge"                           # rerun after every lane merge, so a merge that leaves a stray file or table fails at once — plans.header_json
+covers = ["P1.1", "P1.2"]                 # the tasks whose merge can change the home layout; same rule as above: non-empty and real task ids — plans.header_json
+
 [[phase]]                                 # one block per phase; phases in one wave must own disjoint files — plans.header_json
 id = "P1"                                 # [A-Z][A-Z0-9]{0,7}, unique; tasks are <phase id>.<n> — tasks.id
 title = "what this phase delivers, one line"   # becomes the phase task title — tasks.title
