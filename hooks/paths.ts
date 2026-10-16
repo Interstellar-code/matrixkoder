@@ -206,6 +206,16 @@ export async function resolveDataDir($: EngineInterface, opts: { cwd?: string; h
 export const paths = {
   projectsJson: (globalDir: string): string => join(globalDir, 'projects.json'),
   usage: (globalDir: string): string => join(globalDir, 'usage.json'),
+  /** The root overview store: <home>/mk.db (mkpaths.root_db). The root probe reads this one. */
+  rootDb: (home: string): string => join(home, 'mk.db'),
+  /** The global settings file: <home>/mk-settings.yaml (mkpaths.mk_settings). */
+  mkSettings: (home: string): string => join(home, 'mk-settings.yaml'),
+  /** <home>/inbox, or <home>/inbox/<planId> (mkpaths.inbox_dir); a plan id with a separator or `..` is refused. */
+  inbox: (home: string, planId?: string): string => {
+    if (planId === undefined) return join(home, 'inbox')
+    if (planId === '' || planId === '.' || planId === '..' || /[/\\\0]/.test(planId)) throw new Error(`bad plan id ${JSON.stringify(planId)}`)
+    return join(home, 'inbox', planId)
+  },
   /** The project store: <data>/mk.db. Its presence is the store-mode probe. */
   projectDb: (dataDir: string): string => join(dataDir, 'mk.db'),
   /** The repo settings file: `<dataDir>/matrixkoder.yaml` today; the C2

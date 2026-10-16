@@ -222,7 +222,7 @@ def resolve_home(arg):
     return home
 
 
-def project_dir(home, slug=None, data_dir=None):
+def project_dir(home, slug=None, data_dir=None, legacy=False):
     """--data wins; else <home>/projects/<slug> — the C2 folder for a migrated project (C1, L3).
 
     The slug is checked before the path exists. Both routes pass check_home before
@@ -231,7 +231,7 @@ def project_dir(home, slug=None, data_dir=None):
     today's answer) is mkpaths.project_dir's; mkdb keeps the refusals.
     """
     if data_dir:
-        path = _mkpaths().project_dir(home_arg=home, data_dir=data_dir)
+        path = _mkpaths().project_dir(home_arg=home, data_dir=data_dir, legacy=legacy)
         check_home(path)
         return path
     if not slug:
@@ -467,9 +467,10 @@ def _v6(con):
     con.execute("CREATE INDEX IF NOT EXISTS risk_reasons_run_task ON risk_reasons(run, task)")
 
 
-def open_project(home, slug=None, data_dir=None, version=SCHEMA, migrations=()):
-    """Open or create the project store (C2). check_home runs before any directory is created."""
-    path = os.path.join(project_dir(home, slug, data_dir), "mk.db")
+def open_project(home, slug=None, data_dir=None, version=SCHEMA, migrations=(), legacy=False):
+    """Open or create the project store (C2). check_home runs before any directory is created.
+    `legacy=True` opens the literal --data store of a migrated project (rollback fixtures only)."""
+    path = os.path.join(project_dir(home, slug, data_dir, legacy), "mk.db")
     _selftest_write_guard(path)
     con = _migrate(_connect(path), version, ((1, PROJECT_DDL), (2, _v2), (3, _v3), (4, _v4), (5, _v5), (6, _v6)) + tuple(migrations))
     _ensure_prev_status(con)

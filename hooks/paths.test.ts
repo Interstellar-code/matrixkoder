@@ -221,6 +221,12 @@ test('the data-dir and global-dir file names come from one place', async () => {
   expect(paths.projectDb('/d')).toBe('/d/mk.db')
   expect(paths.projectYaml('/d')).toBe('/d/matrixkoder.yaml')
   expect(paths.watchCursors('/d')).toBe('/d/watch-cursors.json')
+  // L10.1: the same strings scripts/mkpaths.py --self-test asserts for the same home (this suite spawns no process)
+  expect(paths.rootDb('/g')).toBe('/g/mk.db')
+  expect(paths.mkSettings('/g')).toBe('/g/mk-settings.yaml')
+  expect(paths.inbox('/g')).toBe('/g/inbox')
+  expect(paths.inbox('/g', 'p1')).toBe('/g/inbox/p1')
+  for (const bad of ['..', '.', '', 'a/b', '../x', 'a\\b', 'a\0b']) expect(() => paths.inbox('/g', bad)).toThrow()
   expect(paths.projectsJson('/g')).toBe('/g/projects.json')
   expect(paths.usage('/g')).toBe('/g/usage.json')
   expect(paths.busFile(paths.busDirOf('/d', true, '/g'))).toBe('/g/bus.json') // store mode: the one bus per home

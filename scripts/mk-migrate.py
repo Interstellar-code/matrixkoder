@@ -81,7 +81,7 @@ def now_stamp():
 
 def src_db(data):
     """<data>/mk.db — the project store, today's place."""
-    return mkpaths.project_db(data=data)
+    return mkpaths.project_db(data=data, legacy=True)  # the old store, even after the switch (rollback)
 
 
 def target_dir(home, slug):
@@ -1391,6 +1391,9 @@ def self_test():
                                         "new_digest": state_of(dest_db)[1],
                                         "new_counts": state_of(dest_db)[0]})
         carried_counts = state_of(dest_db)[0]
+        # L10.1: while switched the data form follows to the C2 store, and rollback still reads the old one
+        _check(mkpaths.project_db(data=data) == dest_db, "the data form did not follow the switch")
+        _check(src_db(data) == os.path.join(data, mkpaths.ROOT_DB_NAME), "rollback source is not the legacy store")
         rc, out, err = _cli(home, ["--rollback", "--slug", "fixture", "--data", data])
         _check(rc == 0, f"clean rollback rc={rc} {err[-400:]}")
         _check(root_row(home, "fixture")["db_path"] is None, "rollback left db_path set")
@@ -2143,7 +2146,7 @@ def _mutation_quiesce(home, data, tmp):
     ], sandbox)
     shutil.rmtree(mkpaths.target_project_dir("fixture", home), ignore_errors=True)
     clear_db_path(home, "fixture")
-    con = mkdb.open_project(home, "fixture", data_dir=data)
+    con = mkdb.open_project(home, "fixture", data_dir=data, legacy=True)
     con.execute("UPDATE lane_slots SET state='busy' WHERE slot='1'")
     con.commit()
     con.close()
@@ -2155,7 +2158,7 @@ def _mutation_quiesce(home, data, tmp):
         _check(os.path.exists(mkpaths.target_project_db("fixture", home)),
                "mutation-quiesce: the broken version copied nothing")
     finally:
-        con = mkdb.open_project(home, "fixture", data_dir=data)
+        con = mkdb.open_project(home, "fixture", data_dir=data, legacy=True)
         con.execute("UPDATE lane_slots SET state='free' WHERE slot='1'")
         con.commit()
         con.close()

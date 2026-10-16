@@ -37,6 +37,8 @@ DEFAULT_HOME = "~/.matrixkoder"
 ROOT_DB_NAME = "mk.db"
 PROJECTS_JSON = "projects.json"
 USAGE_LEDGER = "usage.json"
+MK_SETTINGS_NAME = "mk-settings.yaml"
+INBOX_DIR = "inbox"
 LANE_BUS_FILE = ".matrixkoder-bus.json"
 BUS_LANES_DIR = "bus-lanes"
 # L6.1: the lane token files move with the bus into <bus dir>/lanes/ (C6). BUS_LANES_DIR
@@ -179,6 +181,23 @@ def root_home():
     bus pins it with $MK_BUS_DIR (tests), everything else uses the MK home. No other caller
     ever sets $MK_BUS_DIR, so the two agree wherever it matters."""
     return bus_env_dir() or home()
+
+
+def mk_settings(arg=None):
+    """The global settings file: <home>/mk-settings.yaml (L10.3 reads and writes it). A pure path."""
+    return os.path.join(home(arg), MK_SETTINGS_NAME)
+
+
+def inbox_dir(arg=None, plan_id=None):
+    """<home>/inbox/, or <home>/inbox/<plan-id>/ — unassigned plans and input docs (L10.6 imports
+    from it). A pure path: nothing is created. A plan id with a separator or `..` is refused."""
+    base = os.path.join(home(arg), INBOX_DIR)
+    if plan_id is None:
+        return base
+    if (not isinstance(plan_id, str) or not plan_id or plan_id in (".", "..") or "/" in plan_id
+            or "\\" in plan_id or "\0" in plan_id):
+        raise Fail(f"bad plan id {plan_id!r}")
+    return os.path.join(base, plan_id)
 
 
 def projects_json(arg=None):
@@ -392,18 +411,20 @@ def project_folder(data, home_arg=None):
 
 # ---- stores ----------------------------------------------------------------------------------
 
-def project_db(slug=None, data=None):
+def project_db(slug=None, data=None, legacy=False):
     """The project store (C2/C3). A migrated project's store is its root `db_path`; else <data>/mk.db.
 
-    The slug form follows a switch: a root `projects.db_path` set is L2's marker, so the bus's
-    `project_db(slug=…)` (L0.3) resolves the NEW store. The data form keeps today's `<data>/mk.db`:
-    a data dir is the project's *legacy* location after a switch, and mk-migrate's rollback reads
-    the source store through exactly this form (its copy-back must not follow the switch). Absent
-    file means file mode; this never creates it. Returns None when a slug has no root projects row
-    carrying a data_dir (the caller owns that error).
+    Both forms follow a switch (L10.1): a root `projects.db_path` set is L2's marker, so the slug
+    form AND the data form (the project's old `<repo>/.matrixkoder`, or its C2 folder) resolve the
+    NEW store. `legacy=True` asks for the literal `<data>/mk.db` — mk-migrate's rollback reads the
+    source store through it (its copy-back must not follow the switch). An unmigrated project is
+    `<data>/mk.db` either way. Absent file means file mode; this never creates it. Returns None
+    when a slug has no root projects row carrying a data_dir (the caller owns that error).
     """
     if data:
-        return os.path.join(os.path.abspath(os.path.expanduser(data)), ROOT_DB_NAME)
+        data = os.path.abspath(os.path.expanduser(data))
+        migrated = None if legacy else migrated_slug(data=data)
+        return db_path_of(slug=migrated) if migrated else os.path.join(data, ROOT_DB_NAME)
     if not slug:
         raise Fail("project_db needs a slug or a data dir")
     target = db_path_of(slug=slug)
@@ -415,18 +436,18 @@ def project_db(slug=None, data=None):
     return os.path.join(data_dir_of_slug, ROOT_DB_NAME)
 
 
-def project_dir(home_arg=None, slug=None, data_dir=None):
+def project_dir(home_arg=None, slug=None, data_dir=None, legacy=False):
     """The project's folder (C2): <home>/projects/<slug> once migrated, else today's answer.
 
-    The slug form follows a switch — a root `projects.db_path` set (L2's marker) resolves to the
-    C2 folder, so a slug-named reader (the bus, a DB reader) lands in the new tree. The `--data`
-    form keeps mkdb's original rule verbatim: it names a folder, and that folder is the answer
-    (mk-migrate's rollback and its fixtures address the LEGACY <data>/mk.db by exactly this form,
-    so it must not follow the switch). A pre-migration project is byte-for-byte today's path.
-    Never creates anything.
+    Both forms follow a switch (L10.1) — a root `projects.db_path` set (L2's marker) resolves to
+    the C2 folder, whether the caller names the slug or the project's old `--data` dir. `legacy=True`
+    keeps the literal `--data` folder (mk-migrate's rollback addresses the LEGACY <data>/mk.db
+    through it). A pre-migration project is byte-for-byte today's path. Never creates anything.
     """
     if data_dir:
-        return os.path.abspath(os.path.expanduser(data_dir))
+        data_dir = os.path.abspath(os.path.expanduser(data_dir))
+        migrated = None if legacy else migrated_slug(data=data_dir, root=home_arg)
+        return target_project_dir(migrated, home_arg) if migrated else data_dir
     if not slug:
         raise Fail("pass --project or --data")
     if db_path_of(slug=slug, root=home_arg):
@@ -1051,6 +1072,24 @@ def self_test():
     saved_cwd = os.getcwd()
     failures = []
 
+    def t_l10(tmp_home):
+        """L10.1: the two new pure paths (no mkdir, no write) and their id check."""
+        _clear_home_env()
+        os.environ["MK_HOME"] = tmp_home
+        _check(mk_settings() == os.path.join(tmp_home, "mk-settings.yaml"), mk_settings())
+        _check(mk_settings(tmp_home) == mk_settings(), mk_settings(tmp_home))
+        _check(inbox_dir() == os.path.join(tmp_home, "inbox"), inbox_dir())
+        _check(inbox_dir(plan_id="p1") == os.path.join(tmp_home, "inbox", "p1"), inbox_dir(plan_id="p1"))
+        _check(inbox_dir(tmp_home, "p1") == inbox_dir(plan_id="p1"), "explicit home")
+        _check(not os.path.exists(os.path.join(tmp_home, "inbox")), "inbox_dir must not create the folder")
+        for bad in ("..", ".", "", "a/b", "../x", "a\\b", "a\0b"):
+            try:
+                inbox_dir(plan_id=bad)
+            except Fail:
+                continue
+            raise Fail(f"self-test: inbox_dir accepted plan id {bad!r}")
+        _clear_home_env()
+
     def t_home(tmp_home):
         os.environ["HOME"] = tmp_home
         _clear_home_env()
@@ -1421,9 +1460,12 @@ def self_test():
         _check(plan_archives_dir(data, "p1") == os.path.join(proj, "plans", "p1", "archive"),
                plan_archives_dir(data, "p1"))
         _check(project_folder(data) == proj, project_folder(data))
-        # the --data form of project_dir stays literal: mk-migrate's rollback and its fixtures
-        # address the LEGACY store by exactly this form, so it must not follow the switch
-        _check(project_dir(home_arg=tmp_home, data_dir=data) == data, project_dir(home_arg=tmp_home, data_dir=data))
+        # L10.1: the --data form of a MIGRATED project resolves to its C2 folder (fails on the old
+        # literal rule); the old folder only on request, which is what mk-migrate's rollback asks for
+        _check(project_dir(home_arg=tmp_home, data_dir=data) == proj, project_dir(home_arg=tmp_home, data_dir=data))
+        _check(project_dir(home_arg=tmp_home, data_dir=data, legacy=True) == data,
+               project_dir(home_arg=tmp_home, data_dir=data, legacy=True))
+        _check(project_dir(home_arg=tmp_home, data_dir=proj) == proj, "C2 folder maps to itself")
         # the run/task family resolves under the plan the store records for the run
         _check(run_dir(data, "r1") == os.path.join(proj, "plans", "p1", "runs", "r1"),
                run_dir(data, "r1"))
@@ -1454,9 +1496,16 @@ def self_test():
             _check(migrated_slug(data=plain) is None, migrated_slug(data=plain))
             _check(task_dir(plain, "r1", "T1") == os.path.join(plain, "runs", "r1", "tasks", "T1"),
                    task_dir(plain, "r1", "T1"))
-        # the data form of project_db stays today's <data>/mk.db: mk-migrate's rollback reads the
-        # source store through exactly this form (its copy-back must not follow the switch)
-        _check(project_db(data=data) == os.path.join(data, "mk.db"), project_db(data=data))
+        # L10.1: the data form of project_db follows the switch to the C2 store; legacy=True is the
+        # literal <data>/mk.db that mk-migrate's rollback reads (its copy-back must not follow)
+        _check(project_db(data=data) == os.path.join(proj, "mk.db"), project_db(data=data))
+        _check(project_db(data=data) == project_db(slug="migs"), "data form equals slug form")
+        _check(project_db(data=data, legacy=True) == os.path.join(data, "mk.db"), project_db(data=data, legacy=True))
+        # an unmigrated project is byte-for-byte unchanged, legacy flag or not
+        for plain in (os.path.join(root, "elsewhere"), os.path.join(tmp_home, "projects", "unmigrated")):
+            _check(project_db(data=plain) == os.path.join(plain, "mk.db") == project_db(data=plain, legacy=True),
+                   project_db(data=plain))
+            _check(project_dir(home_arg=tmp_home, data_dir=plain) == plain, project_dir(home_arg=tmp_home, data_dir=plain))
         # C6 (L6.1): the watch cursors move into the project folder with the project; the
         # pre-migration file is read once and copied over, never deleted
         _check(watch_cursors(data) == os.path.join(proj, "watch-cursors.json"), watch_cursors(data))
@@ -1528,6 +1577,7 @@ def self_test():
         with open(os.path.join(worktree, ".git"), "w") as f:
             f.write("gitdir: " + wt_git + "\n")
         t_home(tmp_home)
+        t_l10(tmp_home)
         t_data_dir(tmp_home, repo, worktree)
         t_folders(tmp_home, repo)
         t_project_db(tmp_home, repo)
