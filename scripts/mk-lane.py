@@ -308,9 +308,11 @@ def locked(data, timeout):
     IMMEDIATE transaction covers only the final write, while acquire/release read the rows, run git
     and write later, so the transaction alone would not serialize two acquires. A holder that outlasts the timeout is
     an error, never a second writer racing the first."""
+    lock = mkpaths.lanes_lock(data)
     with contextlib.suppress(OSError):
         os.makedirs(data, exist_ok=True)
-    f = open(mkpaths.lanes_lock(data), "a")
+        os.makedirs(os.path.dirname(lock), exist_ok=True)   # <home>/locks: the lock never lives in a project folder
+    f = open(lock, "a")
     try:
         deadline = time.monotonic() + timeout
         while True:
@@ -2421,7 +2423,7 @@ def self_test():
         assert mk("acquire", "--run", "r1", "--task", "t9", "--base", "main")["slot"] == 1
         assert mk("acquire", "--run", "r1", "--task", "tc", "--base", "main")["slot"] == 2
         before = json.dumps(mk("list")["slots"])
-        hold = open(os.path.join(data, "lanes.lock"), "a")
+        hold = open(mkpaths.lanes_lock(data), "a")
         fcntl.flock(hold, fcntl.LOCK_EX)
         try:
             assert mk("acquire", "--run", "r1", "--task", "td", "--base", "main", "--lock-timeout", "1",

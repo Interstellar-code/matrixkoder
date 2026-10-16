@@ -743,7 +743,14 @@ def lanes_file(data):
 
 
 def lanes_lock(data):
-    """The flock beside lanes.json: <data>/lanes.lock."""
+    """The lane-registry flock. A MIGRATED project (its data dir, or its C2 folder, is named by a root row with
+    db_path set) takes `<home>/locks/lanes-<slug>.lock` (L10.Y): the old `<project folder>/lanes.lock` was
+    re-created by every acquire/release in a folder the v2 layout keeps free of lock files. A data dir outside an
+    MK home (file mode, a legacy project) keeps `<data>/lanes.lock`: a lock must never create an MK home. A pure
+    path: no mkdir."""
+    slug = migrated_slug(data=data)
+    if slug:
+        return os.path.join(home(), "locks", f"lanes-{slug}.lock")
     return os.path.join(data, "lanes.lock")
 
 
@@ -1336,6 +1343,10 @@ def self_test():
         else:
             raise Fail("self-test: a path-like name override was accepted")
         os.environ.pop("MK_NAME_SELFTEST_ONLY")
+        # L10.Y: an unmigrated data dir keeps <data>/lanes.lock; a MIGRATED project's lock is <home>/locks/lanes-<slug>.lock
+        la = os.path.join(base, "lock-a")
+        _check(lanes_lock(la) == os.path.join(la, "lanes.lock"), lanes_lock(la))
+        _check(not os.path.exists(os.path.join(tmp_home, "locks")), "lanes_lock created a folder")
         _clear_home_env()
 
     def t_names():
@@ -1764,6 +1775,9 @@ def self_test():
         # L10.1: the data form of project_db follows the switch to the C2 store; legacy=True is the
         # literal <data>/mk.db that mk-migrate's rollback reads (its copy-back must not follow)
         _check(project_db(data=data) == os.path.join(proj, PROJECT_DB_NAME), project_db(data=data))
+        # L10.Y: a migrated project's lane lock is under <home>/locks, whichever form of its dir the caller holds
+        _check(lanes_lock(data) == lanes_lock(proj) == os.path.join(tmp_home, "locks", "lanes-migs.lock"), lanes_lock(data))
+        _check(lanes_lock(os.path.join(root, "elsewhere")) == os.path.join(root, "elsewhere", "lanes.lock"), "unmigrated lock")
         _check(project_db(data=data) == project_db(slug="migs"), "data form equals slug form")
         _check(project_db(data=data, legacy=True) == os.path.join(data, PROJECT_DB_NAME), project_db(data=data, legacy=True))
         # an unmigrated project is byte-for-byte unchanged, legacy flag or not
