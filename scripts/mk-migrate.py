@@ -965,8 +965,10 @@ def cmd_rollback(args):
 # new files, put the moved leftovers back" and the old tree is byte-identical to where it started.
 
 V2_MARKER = ".migrate-v2.json"          # home-level bookkeeping (what v2 created / moved)
-LEFTOVER_RE = re.compile(
-    r"^(lanes\.json|lanes\.lock|watch-cursors\.json|(project|matrixkoder)\.yaml(\..+)?|.+\.yaml\.lock)$")
+# Only state that now lives in the DB (lane slots, watch cursors) and lock files move away. project.yaml (and its
+# .bak) is LIVE configuration: it is the lowest settings layer and holds keys migrate-settings does not carry
+# (banned_commands, gates, baselines, agents, picks, helpers, qa, lanes_disposable), read by seven scripts.
+LEFTOVER_RE = re.compile(r"^(lanes\.json|lanes\.lock|watch-cursors\.json|.+\.yaml\.lock)$")
 SKIP_SUMS = {"schema_version"}          # a migration adds stamps: not user data
 # the root tables a running process rewrites by itself (derived overview rows): they never block a rollback
 ROOT_DERIVED = {"plan_summary", "project_summary", "sync", "models", "agents", "catalog_user", "schema_version"}
@@ -1131,6 +1133,41 @@ def _v2_undo_new(created):
         _remove_files([p, p + "-wal", p + "-shm"])
 
 
+def _home_files(home):
+    """The regular files directly in the MK home (not recursive): the snapshot that finds a file a carry step
+    created there (mk-settings.yaml from config.json, and the lock file mk-config takes to write it)."""
+    return {n for n in os.listdir(home) if os.path.isfile(os.path.join(home, n))}
+
+
+def _note_home_created(home, before, created):
+    """Add every home-level file that appeared since `before` to `created` (once), so an undo or a rollback
+    removes it."""
+    for n in sorted(_home_files(home) - before):
+        path = os.path.join(home, n)
+        if path not in created:
+            created.append(path)
+
+
+def _restore_home_files(restore):
+    """Put back the exact bytes of a home-level file the carry step rewrote (copies kept in the backup), then drop
+    the copy: after an undo nothing of this run stays in the home."""
+    for copy, original in restore:
+        if os.path.isfile(copy):
+            shutil.copy2(copy, original)
+            with contextlib.suppress(OSError):
+                os.remove(copy)
+
+
+def _prune_backup(backup):
+    """Remove the (now empty) folders of this run's backup, and `backups/` itself when nothing else is in it.
+    Never removes a file: a backup that still holds something is left as it is."""
+    for d, _dirs, _files in sorted(os.walk(backup), key=lambda t: -len(t[0])):
+        with contextlib.suppress(OSError):
+            os.rmdir(d)
+    with contextlib.suppress(OSError):
+        os.rmdir(os.path.dirname(backup))
+
+
 def cmd_v2(args):
     home = mkpaths.home(args.home)
     if args.rollback:
@@ -1159,8 +1196,9 @@ def cmd_v2(args):
         steps.append(f"{p['slug']} [{p['shape']}]: copy {p['old']} -> {p['new']}, migrate the copy to schema {mkdb.SCHEMA}, verify table by table")
         steps.append(f"{p['slug']}: switch projects.db_path of {', '.join(p['slugs'])} to {p['new']}")
         steps.append(f"{p['slug']}: carry settings (mk-config migrate-settings), lane slots, watch cursors into the copy")
-        extra = " (a pre-migration project: its yaml, lanes and cursors are first copied into the C2 folder, then moved too)" if p["shape"] == "legacy" else ""
-        steps.append(f"{p['slug']}: move {len(p['leftovers'])} leftover file(s) {p['leftovers']}{extra} to <home>/backups/migrate-<stamp>/{p['slug']}/")
+        extra = (" (a pre-migration project: its lanes and cursors are first copied into the C2 folder; its yaml becomes"
+                 " the C2 settings file and STAYS there as live config)") if p["shape"] == "legacy" else ""
+        steps.append(f"{p['slug']}: move {len(p['leftovers'])} leftover file(s) {p['leftovers']}{extra} to <home>/backups/migrate-<stamp>/{p['slug']}/ (the project settings file and its backup stay: live config)")
     if args.dry_run:
         for line in steps:
             print(line)
@@ -1177,6 +1215,8 @@ def _v2_apply(home, plan):
     stamp = now_stamp()
     backup = os.path.join(home, "backups", f"migrate-{stamp}")
     created, moved = [], []          # created: new store files; moved: (backup path, original path)
+    restore = []                     # (backup copy, original) of a home-level file the carry step may rewrite
+    home_before = _home_files(home)
     marker = {"home": home, "stamp": stamp, "backup": backup, "created_root": False, "projects": [],
               "old_sha": {}, "switched_at": None}
     with switch_lock(home):
@@ -1212,10 +1252,20 @@ def _v2_apply(home, plan):
             # 5. switch: the NEW root's rows point at the new stores
             for p in plan["projects"]:
                 set_db_path(home, p["slugs"], p["new"])
-            # 6. carry settings, lane slots and watch cursors into the copies
+            # 6. carry settings, lane slots and watch cursors into the copies. migrate-settings may CREATE
+            # <home>/mk-settings.yaml (from config.json) or rewrite an existing one: keep the exact old bytes
+            # in the backup first, and note every home-level file it creates, so an undo / a rollback restores
+            # the home byte for byte.
+            ms = mkpaths.mk_settings(home)
+            if os.path.isfile(ms):
+                keep = os.path.join(backup, "_home", os.path.basename(ms))
+                os.makedirs(os.path.dirname(keep), exist_ok=True)
+                shutil.copy2(ms, keep)
+                restore.append((keep, ms))
             carried = {}
             for p in plan["projects"]:
                 settings = _carry_settings(home, p["tdir"])
+                _note_home_created(home, home_before, created)
                 con = mkdb.open_project(home, p["slug"])
                 try:
                     lanes = _carry_lanes(con, mkpaths.legacy_lanes(p["tdir"]))
@@ -1245,7 +1295,10 @@ def _v2_apply(home, plan):
             for dst, src in reversed(moved):
                 with contextlib.suppress(OSError):
                     shutil.move(dst, src)
+            _note_home_created(home, home_before, created)
             _v2_undo_new(created)
+            _restore_home_files(restore)
+            _prune_backup(backup)
             for p in plan["projects"]:
                 if p["shape"] == "legacy":
                     _remove_new_copy(home, p["slug"])  # the plan files do_copy_verify wrote into the C2 folder
@@ -1256,6 +1309,7 @@ def _v2_apply(home, plan):
         marker["switched_at"] = now_iso()
         marker["moved"] = [[a, b] for a, b in moved]
         marker["created"] = created
+        marker["restore"] = [[a, b] for a, b in restore]
         for p in plan["projects"]:
             st = state_of(p["new"])
             marker["projects"].append({"slug": p["slug"], "slugs": p["slugs"], "old": p["old"], "new": p["new"],
@@ -1291,6 +1345,7 @@ def cmd_v2_rollback(home, args):
         raise Fail(f"no v2 record at {mpath}: nothing to roll back", 3)
     lines = [f"remove {p}" for p in marker.get("created", [])]
     lines += [f"restore {dst} -> {src}" for dst, src in marker.get("moved", [])]
+    lines += [f"restore {copy} -> {orig} (rewritten by the settings carry)" for copy, orig in marker.get("restore", [])]
     if args.dry_run:
         for line in lines:
             print(line)
@@ -1315,6 +1370,9 @@ def cmd_v2_rollback(home, args):
                 os.makedirs(os.path.dirname(src), exist_ok=True)
                 shutil.move(dst, src)
         _v2_undo_new(marker.get("created", []))
+        _restore_home_files(marker.get("restore", []))
+        if marker.get("backup"):
+            _prune_backup(marker["backup"])
         for p in marker.get("projects", []):
             if p.get("shape") == "legacy":
                 _remove_new_copy(home, p["slug"])  # the C2 folder a pre-migration project did not have before
@@ -1678,7 +1736,10 @@ def _other_root_row(home, data, repo):
     _root_rows_set(home, [("otherproj", data)])
 
 
-V2_YAML = ("# my own note\nsession:\n  stall_min: 17\nmystery_key: keep-me\n")
+V2_YAML = ("# my own note\nsession:\n  stall_min: 17\nmystery_key: keep-me\nbanned_commands: [\"git push --force\", \"rm -rf\"]\n"
+           "lanes_disposable: [\".omo/\"]\n")     # keys migrate-settings does NOT carry: the yaml must stay live
+V2_CONFIG_JSON = {"dashboard": {"chip": True}, "usage": {"poll_min": 7}}   # the retired UI toggles -> mk-settings.yaml
+V2_PRE_SETTINGS = "lanes.default_agent: claude\n"                         # a mk-settings.yaml that already exists
 V2_NO_FILL = ("settings", "schema_version")      # tables the source fixture leaves empty on purpose
 
 
@@ -1751,6 +1812,7 @@ def _v2_fixture_c2(tmp):
     _v2_write(mkpaths.legacy_lanes(tdir), json.dumps({"slots": {"1": {"path": "/x/lane1", "state": "free"},
                                                               "2": {"path": "/x/lane2", "state": "free", "branch": "b2"}}}))
     _v2_write(mkpaths.legacy_cursors(tdir), json.dumps({"ra|*": {"seq": 3}, "rb|T9": {"seq": 8}}))
+    _v2_write(os.path.join(home, "config.json"), json.dumps(V2_CONFIG_JSON))     # the carry CREATES mk-settings.yaml
     _v2_write(mkpaths.project_yaml_in(tdir), V2_YAML)
     _v2_write(mkpaths.project_yaml_in(tdir) + ".bak", "# older\n")
     _v2_write(mkpaths.project_yaml_in(tdir) + ".lock", "")
@@ -1758,9 +1820,10 @@ def _v2_fixture_c2(tmp):
     _v2_write(os.path.join(tdir, "lanes.lock"), "")
     return {"home": home, "repo": repo, "data": data, "slug": slug, "tdir": tdir, "shape": "c2",
             "old_proj": mkpaths.legacy_db_in(tdir), "old_root": mkpaths.legacy_db_in(home),
-            "leftovers": [mkpaths.LANES_NAME, "lanes.lock", mkpaths.CURSORS_NAME, mkpaths.PROJECT_YAML_NAME,
-                          mkpaths.PROJECT_YAML_NAME + ".bak", mkpaths.PROJECT_YAML_NAME + ".lock",
-                          mkpaths.LEGACY_YAML_NAME + ".lock"], "lane": "2", "cursor": "rb|T9"}
+            "leftovers": [mkpaths.LANES_NAME, "lanes.lock", mkpaths.CURSORS_NAME,
+                          mkpaths.PROJECT_YAML_NAME + ".lock", mkpaths.LEGACY_YAML_NAME + ".lock"],
+            "stay": [mkpaths.PROJECT_YAML_NAME, mkpaths.PROJECT_YAML_NAME + ".bak"], "settings_before": None,
+            "lane": "2", "cursor": "rb|T9"}
 
 
 def _v2_fixture_legacy(tmp):
@@ -1784,9 +1847,12 @@ def _v2_fixture_legacy(tmp):
     _v2_write(mkpaths.legacy_lanes(data), json.dumps({"slots": {"1": {"path": "/x/lane1", "state": "free"},
                                                               "2": {"path": "/x/lane2", "state": "free", "branch": "b2"}}}))
     _v2_write(mkpaths.legacy_cursors(data), json.dumps({"ra|*": {"seq": 3}, "rb|T9": {"seq": 8}}))
+    _v2_write(os.path.join(home, "config.json"), json.dumps(V2_CONFIG_JSON))
+    _v2_write(mkpaths.mk_settings(home), V2_PRE_SETTINGS)    # the carry REWRITES an existing mk-settings.yaml
     return {"home": home, "repo": repo, "data": data, "slug": slug, "tdir": os.path.join(home, "projects", slug),
             "shape": "legacy", "old_proj": mkpaths.legacy_db_in(data), "old_root": mkpaths.legacy_db_in(home),
-            "leftovers": [mkpaths.CURSORS_NAME, mkpaths.PROJECT_YAML_NAME], "lane": None, "cursor": "rb|T9"}
+            "leftovers": [mkpaths.CURSORS_NAME], "stay": [mkpaths.PROJECT_YAML_NAME],
+            "settings_before": V2_PRE_SETTINGS, "lane": None, "cursor": "rb|T9"}
 
 
 def _v2_hash(*roots):
@@ -1821,9 +1887,18 @@ def _v2_rehearse(fx):
     src_folder = tdir if fx["shape"] == "c2" else fx["data"]
     orig = {}
     for n in fx["leftovers"]:
-        base = mkpaths.LEGACY_YAML_NAME if (fx["shape"] == "legacy" and n == mkpaths.PROJECT_YAML_NAME) else n
-        with open(os.path.join(src_folder, base), "rb") as f:
+        with open(os.path.join(src_folder, n), "rb") as f:
             orig[n] = f.read()
+    # the live config: project.yaml (c2: in the C2 folder; legacy: the repo's matrixkoder.yaml becomes it) must
+    # survive with its bytes, and a key migrate-settings does not carry must read the same value before and after
+    stay_src = {n: os.path.join(src_folder, mkpaths.LEGACY_YAML_NAME if (fx["shape"] == "legacy" and n == mkpaths.PROJECT_YAML_NAME) else n)
+                for n in fx["stay"]}
+    stay_body = {}
+    for n, path in stay_src.items():
+        with open(path, "rb") as f:
+            stay_body[n] = f.read()
+    banned_before = [ln for ln in stay_body[mkpaths.PROJECT_YAML_NAME].decode().splitlines() if ln.startswith("banned_commands")]
+    _check(len(banned_before) == 1, f"{tag}: fixture has no banned_commands line")
     # (2) apply
     rc, out, err = _cli(home, _v2_args(fx, "--slug", slug))
     _check(rc == 0, f"{tag} apply rc={rc} {out[-500:]} {err[-300:]}")
@@ -1865,6 +1940,24 @@ def _v2_rehearse(fx):
     finally:
         rcon.close()
     _check(paths == {new_proj}, f"{tag}: root db_path {paths}")
+    # project.yaml and its .bak STAY in the C2 folder (live config); banned_commands reads the same through mk-config
+    for n, body in stay_body.items():
+        with open(os.path.join(tdir, n), "rb") as f:
+            _check(f.read() == body, f"{tag}: {n} in the project folder differs from the source")
+    with _as_home(home):
+        yaml_now = mkpaths.project_yaml(fx["data"])
+    _check(yaml_now == os.path.join(tdir, mkpaths.PROJECT_YAML_NAME), f"{tag}: project_yaml resolves to {yaml_now}")
+    listed = subprocess.run([sys.executable, os.path.join(HERE, "mk-config.py"), "--data", fx["data"], "list", "--json"],
+                            capture_output=True, text=True, env=dict(os.environ, MK_HOME=home, MATRIXKODER_HOME=home, MK_SELFTEST="1"))
+    _check(listed.returncode == 0 and json.loads(listed.stdout.strip().splitlines()[-1])["file"] == yaml_now,
+           f"{tag}: mk-config reads {listed.stdout[-200:]} {listed.stderr[-200:]}")
+    with open(yaml_now) as f:
+        banned_after = [ln for ln in f.read().splitlines() if ln.startswith("banned_commands")]
+    _check(banned_after == banned_before, f"{tag}: banned_commands {banned_before} -> {banned_after}")
+    # <home>/mk-settings.yaml: created by the carry (c2) or rewritten (legacy); config.json is left in place
+    ms = mkpaths.mk_settings(home)
+    _check(os.path.isfile(ms) and "dashboard.chip" in open(ms).read(), f"{tag}: mk-settings.yaml not written by the carry")
+    _check(os.path.isfile(os.path.join(home, "config.json")), f"{tag}: config.json removed")
     bdirs = [os.path.join(home, "backups", d, slug) for d in sorted(os.listdir(os.path.join(home, "backups")))
              if d.startswith("migrate-") and os.path.isdir(os.path.join(home, "backups", d, slug))]
     _check(len(bdirs) == 1, f"{tag}: backup dirs {bdirs}")
@@ -1884,6 +1977,11 @@ def _v2_rehearse(fx):
     _check(rc == 0, f"{tag}: rollback rc={rc} {out[-400:]} {err[-300:]}")
     _check(not os.path.exists(new_proj) and not os.path.exists(new_root), f"{tag}: new files survive rollback")
     _check(_v2_hash(home, repo) == start, f"{tag}: the rollback did not restore the tree")
+    if fx["settings_before"] is None:
+        _check(not os.path.exists(mkpaths.mk_settings(home)), f"{tag}: rollback left a created mk-settings.yaml")
+    else:
+        with open(mkpaths.mk_settings(home)) as f:
+            _check(f.read() == fx["settings_before"], f"{tag}: rollback did not restore the old mk-settings.yaml")
     # (6) re-apply, write to the NEW store, rollback refuses and removes nothing
     rc, out, err = _cli(home, _v2_args(fx, "--slug", slug))
     _check(rc == 0, f"{tag}: re-apply rc={rc} {out[-300:]}")
