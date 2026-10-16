@@ -163,16 +163,33 @@ def _store_digest(db_path):
     return {p: _digest(db_path + p) for p in ("", "-wal", "-shm")}
 
 
+# an audit read of a quiescent tree: immutable=1 never creates a -shm/-wal, so a rule's read cannot
+# change the bytes R11 compares
+RO_AUDIT = "?mode=ro&immutable=1"
+
+
 def _tables(db_path):
-    con = sqlite3.connect("file:" + db_path + "?mode=ro", uri=True)
+    con = sqlite3.connect("file:" + db_path + RO_AUDIT, uri=True)
     try:
         return {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     finally:
         con.close()
 
 
+def _rows(db_path, sql):
+    con = sqlite3.connect("file:" + db_path + RO_AUDIT, uri=True)
+    try:
+        return [tuple(r) for r in con.execute(sql)]
+    finally:
+        con.close()
+
+
+# the root tables root schema 3 dropped (L10.9): none may come back
+ROOT_DROPPED = ("cards", "project_summary", "sync", "event_src")
+
+
 def _columns(db_path, table):
-    con = sqlite3.connect("file:" + db_path + "?mode=ro", uri=True)
+    con = sqlite3.connect("file:" + db_path + RO_AUDIT, uri=True)
     try:
         return [r[1] for r in con.execute(f"PRAGMA table_info({table})")]
     finally:
@@ -702,7 +719,7 @@ def _bus_row_counts(db_path, run=None):
     Read-only; the count is exactly what leaves the store when the run is archived."""
     if not os.path.isfile(db_path):
         return 0
-    con = sqlite3.connect("file:" + db_path + "?mode=ro", uri=True)
+    con = sqlite3.connect("file:" + db_path + RO_AUDIT, uri=True)
     try:
         tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         # the run filter goes last on every query, so each WHERE is written in full here
@@ -935,18 +952,25 @@ def build_rules():
             (f"; wrong {bad}" if bad else ""), bad
 
     def r10(ctx):
+        # L10.5: the bus watch cursors are rows of the project DB's `watch_cursors` table; no
+        # watch-cursors.json exists anywhere under the temp root, in the C2 folder or a data dir.
         bad = []
+        for rel in _walk(ctx["root"]):
+            if os.path.basename(rel) == mkpaths.CURSORS_NAME:
+                bad.append(f"{rel} (cursors are watch_cursors rows, never a file)")
+        rows = 0
         for slug in ctx["slugs"]:
-            want = mkpaths.target_watch_cursors(slug, ctx["home"])
-            if not os.path.isfile(want):
-                continue                                  # no watch ran: nothing to assert
-            if (os.stat(want).st_mode & 0o777) != 0o600:
-                bad.append(f"{_rel(ctx, want)} mode != 0600")
-            # the C2 answer is the ONLY watch-cursors.json anywhere under the temp root
-            for rel in _walk(ctx["root"]):
-                if os.path.basename(rel) == mkpaths.CURSORS_NAME and rel != _rel(ctx, want):
-                    bad.append(f"watch cursors also at {rel} (not projects/{slug}/)")
-        return not bad, "watch cursors at projects/<slug>/" + \
+            db = ctx["db_paths"].get(slug)
+            if not db or not os.path.isfile(db):
+                continue
+            if "watch_cursors" not in _tables(db):
+                bad.append(f"{_rel(ctx, db)} has no watch_cursors table")
+                continue
+            for key, seq in _rows(db, "SELECT key, seq FROM watch_cursors"):
+                rows += 1
+                if "|" not in str(key) or not isinstance(seq, int) or seq < 0:
+                    bad.append(f"{_rel(ctx, db)} watch_cursors row {key!r}={seq!r} is malformed")
+        return not bad, f"watch cursors in the project DB ({rows} rows)" + \
             (f"; wrong {bad}" if bad else ""), bad
 
     def r11(ctx):
@@ -979,6 +1003,13 @@ def build_rules():
         for name in ("tasks", "events"):
             if name in tables:
                 bad.append(f"root mk.db has a {name} table (C3: root is numbers only)")
+        # L10.9: root schema 3 dropped the sync-era tables
+        for name in ROOT_DROPPED:
+            if name in tables:
+                bad.append(f"root mk.db still has the dropped {name} table (schema 3)")
+        have = _rows(root_db, "SELECT MAX(version) FROM schema_version") if "schema_version" in tables else [(None,)]
+        if have[0][0] != mkdb.ROOT_SCHEMA:
+            bad.append(f"root schema_version {have[0][0]} != {mkdb.ROOT_SCHEMA}")
         want = ["project", "plan", "title", "status", "counts_json", "live_run", "updated"]
         got = _columns(root_db, "plan_summary")
         if got != want:
@@ -1025,6 +1056,40 @@ def build_rules():
             + (f"; new junk {bad}" if bad else ""), bad
 
 
+    def r16(ctx):
+        # L10.5: the lane registry is the `lane_slots` table of the project DB. No lanes.json (or its
+        # flock file) exists after a run cycle, in the C2 folder, a data dir or anywhere else.
+        bad = [f"{rel} (the registry is lane_slots rows, never a file)" for rel in _walk(ctx["root"])
+               if os.path.basename(rel) in (mkpaths.LANES_NAME, "lanes.lock")]
+        for slug in ctx["slugs"]:
+            db = ctx["db_paths"].get(slug)
+            if db and os.path.isfile(db) and "lane_slots" not in _tables(db):
+                bad.append(f"{_rel(ctx, db)} has no lane_slots table")
+        return not bad, "the lane registry is lane_slots only" + (f"; wrong {bad}" if bad else ""), bad
+
+    def r17(ctx):
+        # L10.3: settings live in the project DB's `settings` table and the global
+        # <home>/mk-settings.yaml. The ONE yaml a migrated project folder may hold is the
+        # `project.yaml` onboarding creates (mk-config reads it as the lowest layer); the legacy
+        # matrixkoder.yaml name, a project.yaml anywhere else and a mk-settings.yaml outside the
+        # home root are all violations.
+        bad = []
+        folders = {os.path.realpath(mkpaths.target_project_dir(s, ctx["home"])) for s in ctx["slugs"]}
+        for rel in _walk(ctx["root"]):
+            base, full = os.path.basename(rel), os.path.realpath(os.path.join(ctx["root"], rel))
+            here = os.path.dirname(full)
+            if base == mkpaths.PROJECT_YAML_NAME and here not in folders:
+                bad.append(f"{rel} (project.yaml belongs only in a migrated project folder)")
+            elif base == "matrixkoder.yaml" and here in folders:
+                bad.append(f"{rel} (the legacy settings name inside a migrated project folder)")
+            elif base == "mk-settings.yaml" and here != os.path.realpath(ctx["home"]):
+                bad.append(f"{rel} (the global settings file lives at the home root)")
+        for slug in ctx["slugs"]:
+            db = ctx["db_paths"].get(slug)
+            if db and os.path.isfile(db) and "settings" not in _tables(db):
+                bad.append(f"{_rel(ctx, db)} has no settings table")
+        return not bad, "settings in the project DB + mk-settings.yaml" + (f"; wrong {bad}" if bad else ""), bad
+
     return [
         Rule("R01", "C2", "exactly the root mk.db and one mk.db per project", r01),
         Rule("R02", "C2", "the plan folder holds plan.md, assets/ and archive/", r02),
@@ -1035,13 +1100,15 @@ def build_rules():
         Rule("R07", "C6", "bus.jsonl line count equals the archived messages", r07),
         Rule("R08", "C6", "lane tokens live at bus/lanes/<sha256(lane)>.json, 0600", r08),
         Rule("R09", "C6", "the bus files live in bus/ and nowhere else", r09),
-        Rule("R10", "C6", "watch cursors live at projects/<slug>/watch-cursors.json", r10),
+        Rule("R10", "C6", "watch cursors are watch_cursors rows in the project DB, no watch-cursors.json", r10),
         Rule("R11", "C3,C5", "post-switch writes land in the NEW store, the legacy one is frozen",
              r11),
         Rule("R12", "C3", "the root store carries numbers and linkage only", r12),
         Rule("R13", "C2", "no per-plan DB and no bus DB", r13),
         Rule("R14", "C3", "the root overview alone carries every plan row the Plan tab needs", r14),
         Rule("R15", "C16", "the caller's REAL home never gains an e2e row", r15),
+        Rule("R16", "C6", "the lane registry is lane_slots rows, no lanes.json anywhere", r16),
+        Rule("R17", "C8", "settings live in the project DB and mk-settings.yaml; at most project.yaml", r17),
     ]
 
 
@@ -1251,10 +1318,23 @@ def _fixture(ctx_skel):
     with open(mkpaths.target_lane_token(lane, home), "w", encoding="utf-8") as fh:
         fh.write("{}\n")
     os.chmod(mkpaths.target_lane_token(lane, home), 0o600)
-    cursors = mkpaths.target_watch_cursors(slug, home)
-    with open(cursors, "w", encoding="utf-8") as fh:
-        json.dump({f"{run}|*": {"seq": 2}}, fh)
-    os.chmod(cursors, 0o600)
+    # L10.5: the cursor is a watch_cursors row of the project DB, and the registry holds one lane
+    # slot row; no watch-cursors.json / lanes.json is ever written
+    store = mkdb.open_project(home, slug, data_dir=data)
+    try:
+        store.execute("BEGIN IMMEDIATE")
+        store.execute("INSERT INTO watch_cursors(key, seq, started, updated) VALUES (?,?,?,?)",
+                      (f"{run}|*", 2, "2026-10-16T00:00:00Z", "2026-10-16T00:00:01Z"))
+        store.execute("INSERT INTO lane_slots(slot, lane_path, state) VALUES (?,?,?)", ("1", lane, "free"))
+        store.execute("INSERT INTO settings(key, value, updated) VALUES (?,?,?)",
+                      ("lanes.default_agent", '"claude"', "2026-10-16T00:00:00Z"))
+        store.execute("COMMIT")
+    finally:
+        store.close()
+    with open(mkpaths.project_yaml_in(data), "w", encoding="utf-8") as fh:
+        fh.write("# onboarding's project.yaml: the one yaml a migrated project folder may hold\n")
+    with open(mkpaths.mk_settings(home), "w", encoding="utf-8") as fh:
+        fh.write("{}\n")
     manifest = {
         "repo": repo, "scratch_repo": scratch,
         "plans": [[slug, plan]], "runs": [[slug, plan, run]],
@@ -1270,6 +1350,20 @@ def _fixture(ctx_skel):
     return {"root": root, "home": home, "repo": repo, "scratch": scratch,
             "slug": slug, "slug_b": slug_b, "plan": plan, "run": run,
             "data": data, "data_b": data_b, "lane": lane}
+
+
+def _sql(f, sql):
+    """One write on the fixture's project store, through the one SQLite writer."""
+    con = mkdb.open_project(f["home"], f["slug"], data_dir=f["data"])
+    try:
+        con.execute(sql)
+        con.commit()
+    finally:
+        con.close()
+
+
+def _drop_table(f, table):
+    _sql(f, f"DROP TABLE {table}")
 
 
 def _mutations(_unused):
@@ -1350,6 +1444,63 @@ def _mutations(_unused):
         with open(legacy, "w", encoding="utf-8") as fh:
             json.dump({"fix-run|*": {"seq": 9}}, fh)
         os.chmod(legacy, 0o600)
+
+    @m("R10", "a watch-cursors.json in the C2 project folder", "watch-cursors.json")
+    def _(f):
+        path = os.path.join(mkpaths.target_project_dir(f["slug"], f["home"]), mkpaths.CURSORS_NAME)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"fix-run|*": {"seq": 9}}, fh)
+
+    @m("R10", "a watch_cursors table missing from the project DB", "no watch_cursors table")
+    def _(f):
+        _drop_table(f, "watch_cursors")
+
+    @m("R10", "a malformed watch_cursors row", "malformed")
+    def _(f):
+        _sql(f, "INSERT INTO watch_cursors(key, seq) VALUES ('nokey', -3)")
+
+    @m("R16", "a lanes.json in the C2 project folder", "lanes.json")
+    def _(f):
+        path = os.path.join(mkpaths.target_project_dir(f["slug"], f["home"]), mkpaths.LANES_NAME)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"schema": 1, "slots": {}}, fh)
+
+    @m("R16", "a lanes.json in a legacy data dir", "lanes.json")
+    def _(f):
+        with open(os.path.join(f["data_b"], mkpaths.LANES_NAME), "w", encoding="utf-8") as fh:
+            fh.write("{}")
+
+    @m("R16", "a lane_slots table missing from the project DB", "no lane_slots table")
+    def _(f):
+        _drop_table(f, "lane_slots")
+
+    @m("R17", "a legacy matrixkoder.yaml inside a migrated project folder", "matrixkoder.yaml")
+    def _(f):
+        with open(os.path.join(mkpaths.target_project_dir(f["slug"], f["home"]), "matrixkoder.yaml"), "w") as fh:
+            fh.write("data_dir: x\n")
+
+    @m("R17", "a project.yaml in the scratch repo", "project.yaml")
+    def _(f):
+        with open(os.path.join(f["scratch"], mkpaths.PROJECT_YAML_NAME), "w") as fh:
+            fh.write("x: 1\n")
+
+    @m("R17", "a mk-settings.yaml outside the home root", "mk-settings.yaml")
+    def _(f):
+        with open(os.path.join(f["repo"], "mk-settings.yaml"), "w") as fh:
+            fh.write("{}\n")
+
+    @m("R17", "a settings table missing from the project DB", "no settings table")
+    def _(f):
+        _drop_table(f, "settings")
+
+    @m("R12", "a dropped sync-era table back in the root store", "project_summary")
+    def _(f):
+        con = mkdb.open_root(f["home"])
+        try:
+            con.execute("CREATE TABLE project_summary(project TEXT)")
+            con.commit()
+        finally:
+            con.close()
 
     @m("R11", "a post-switch write that never reached the NEW store", "did not change")
     def _(f):
