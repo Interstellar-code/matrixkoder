@@ -76,6 +76,10 @@ function world(
       }
       return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     }
+    // L10.7: `mk-state.py project register` (the root-table registration) succeeds unless a test overrides it
+    if (e.argv[1]?.endsWith('/scripts/mk-state.py') && e.argv[2] === 'project' && e.argv[3] === 'register') {
+      return { value: { exitCode: 0, stdout: '{"ok": true}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     const key = e.argv[0] === 'mkdir' ? 'mkdir -p' : e.argv.join(' ')
     const out = table[key]
     return { value: out == null ? { exitCode: 1, stdout: '', stderr: 'not found', isStdoutTruncated: false, isStderrTruncated: false } : { exitCode: 0, stdout: out, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
@@ -404,7 +408,7 @@ async function toReview(ui: Walker): Promise<void> {
   while (await ui.find({ key: 'wz-next' })) await ui.press({ key: 'wz-next' })
 }
 
-test('review writes yaml, projects.json, .gitignore and the dirs; edits land in the yaml', async ($, on) => {
+test('review writes yaml, registers the project (no projects.json), .gitignore and the dirs; edits land in the yaml', async ($, on) => {
   const files = repoFiles()
   const w = world(on, files)
   await $.session.start(sessionStart())
@@ -465,8 +469,9 @@ test('review writes yaml, projects.json, .gitignore and the dirs; edits land in 
     expect(yaml, 'the dead dashboard copy is gone').not.toContain('dashboard:')
     expect(yaml, 'the dead poll_min copy is gone').not.toContain('poll_min:')
 
-    const projects = JSON.parse(files[PROJECTS] ?? 'null')
-    expect(projects).toEqual({ [PROJECT_DIR]: { data_dir: DATA_DIR, onboarded_at: ISO_NOW } })
+    expect(files[PROJECTS], 'projects.json is no longer written').toBeUndefined()
+    const reg = w.argv.filter(a => a[2] === 'project' && a[3] === 'register').pop()
+    expect(reg?.slice(4), surface).toEqual(['--slug', 'mk-proj', '--repo', PROJECT_DIR, '--data', DATA_DIR])
     expect(Object.keys(files).some(p => p.endsWith('/config.json')), 'no config.json anywhere in the fake home').toBe(false)
     expect(files[`${PROJECT_DIR}/.gitignore`]).toBe('node_modules/\n/.matrixkoder/\n')
     expect(w.argv.some(a => a[0] === 'mkdir' && a.includes(`${DATA_DIR}/plans`) && a.includes(`${DATA_DIR}/runs`))).toBe(true)
@@ -530,33 +535,38 @@ test('a carried string key keeps its text: subagent_model "007" is not the numbe
   await ui.unmount()
 })
 
-test('projects.json is merged, not replaced; a corrupt one aborts the write', async ($, on) => {
+test('an existing projects.json is left alone (never read, never written); a failed registration aborts with the reason', async ($, on) => {
   const files = repoFiles()
-  files[PROJECTS] = JSON.stringify({ '/other/repo': { data_dir: '/other/repo/.matrixkoder', onboarded_at: 'x' } })
-  world(on, files)
+  const old = JSON.stringify({ '/other/repo': { data_dir: '/other/repo/.matrixkoder', onboarded_at: 'x' } })
+  files[PROJECTS] = old
+  let fail = false
+  const w = world(on, files, {}, {}, [], argv => {
+    if (fail && argv[2] === 'project') return { value: { exitCode: 2, stdout: '{"ok": false, "error": "slug taken"}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
   await $.session.start(sessionStart())
   await mk($, 'setup')
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(64) })
   await toReview(ui)
   await ui.press({ key: 'wz-write' })
-  expect(Object.keys(JSON.parse(files[PROJECTS] ?? '{}')).sort()).toEqual(['/other/repo', PROJECT_DIR])
+  expect(files[PROJECTS]).toBe(old)
+  expect(w.argv.some(a => a[2] === 'project' && a[3] === 'register')).toBe(true)
   expect(files[CONFIG], 'no config.json copy is written').toBeUndefined()
 
-  // corrupt projects.json: error shown, projects.json left alone, no "set up" claim
-  files[PROJECTS] = '{not json'
+  // the registration fails: error shown with its reason, no "set up" claim
+  fail = true
   await mk($, 'setup')
   await toReview(ui)
   await ui.select({ key: 'wz-replace', value: 'replace' })
   await ui.press({ key: 'wz-write' })
-  expect(files[PROJECTS]).toBe('{not json')
-  expect(await ui.find({ text: /projects\.json is not valid JSON/ })).toBeTruthy()
+  expect(files[PROJECTS]).toBe(old)
+  expect(await ui.find({ text: /could not register the project: .*slug taken/ })).toBeTruthy()
   expect(await ui.find({ text: /MatrixKoder is set up/ })).toBeUndefined()
 })
 
 test('an existing matrixkoder.yaml is kept by default and replaced only after the confirm', async ($, on) => {
   const files = repoFiles()
   files[YAML] = '# mine\ndata_dir: .matrixkoder/\n'
-  world(on, files)
+  const w = world(on, files)
   await $.session.start(sessionStart())
   for (const surface of SURFACES) {
     files[YAML] = '# mine\ndata_dir: .matrixkoder/\n'
@@ -568,7 +578,7 @@ test('an existing matrixkoder.yaml is kept by default and replaced only after th
     expect(await ui.find({ text: /keep +.*matrixkoder\.yaml/ }), `${surface} default is keep`).toBeTruthy()
     await ui.press({ key: 'wz-write' })
     expect(files[YAML], `${surface} kept`).toBe('# mine\ndata_dir: .matrixkoder/\n')
-    expect(files[PROJECTS], 'the global files are still written').toBeDefined()
+    expect(w.argv.some(a => a[2] === 'project' && a[3] === 'register'), 'the project is still registered').toBe(true)
     expect(await ui.find({ text: /kept existing matrixkoder\.yaml/ })).toBeTruthy()
     await ui.unmount()
 
@@ -586,7 +596,7 @@ test('an existing matrixkoder.yaml is kept by default and replaced only after th
 
 test('data location home: yaml goes under ~/.matrixkoder/projects/<slug>/ and no .gitignore edit', async ($, on) => {
   const files = repoFiles()
-  world(on, files)
+  const w = world(on, files)
   await $.session.start(sessionStart())
   await mk($, 'setup')
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(64) })
@@ -598,7 +608,8 @@ test('data location home: yaml goes under ~/.matrixkoder/projects/<slug>/ and no
   const dir = `${HOME}/.matrixkoder/projects/mk-proj`
   expect(files[`${dir}/matrixkoder.yaml`]).toContain(`data_dir: ${dir}/`)
   expect(files[`${PROJECT_DIR}/.gitignore`]).toBe('node_modules/\n')
-  expect(JSON.parse(files[PROJECTS] ?? '{}')[PROJECT_DIR]).toEqual({ data_dir: dir, onboarded_at: ISO_NOW })
+  const reg = w.argv.filter(a => a[2] === 'project' && a[3] === 'register').pop()
+  expect(reg?.slice(4)).toEqual(['--slug', 'mk-proj', '--repo', PROJECT_DIR, '--data', dir])
 })
 
 test('no API key is read, asked for, run or written', async ($, on) => {
@@ -735,21 +746,6 @@ test('an existing but unreadable .gitignore aborts the write and is never overwr
   expect(w.argv.some(a => a[0] === 'mv' || a[0] === 'mkdir')).toBe(false)
 })
 
-for (const victim of ['projects.json'] as const) {
-  test(`an unreadable existing ${victim} aborts before any write`, async ($, on) => {
-    const files = repoFiles()
-    world(on, files, {}, {}, [`${HOME}/.matrixkoder/${victim}`])
-    await $.session.start(sessionStart())
-    await mk($, 'setup')
-    const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(64) })
-    await toReview(ui)
-    await ui.press({ key: 'wz-write' })
-    expect(await ui.find({ text: new RegExp(`cannot read .*${victim.replace('.', '\\.')}`) })).toBeTruthy()
-    expect(Object.keys(files).filter(p => p.includes('.matrixkoder') || p.endsWith('.tmp'))).toEqual([])
-    expect(files[GITIGNORE]).toBe('node_modules/\n')
-  })
-}
-
 test('a non-object config.json ([]) is left alone: it is no longer written or read', async ($, on) => {
   const files = repoFiles()
   files[CONFIG] = '[]'
@@ -781,7 +777,7 @@ test('a matrixkoder.yaml that appeared after detection goes back to the replace 
   // keep (default) then write again: the yaml stays, the rest is written
   await ui.press({ key: 'wz-write' })
   expect(files[YAML]).toBe('# created by someone else after detection\n')
-  expect(files[PROJECTS]).toBeDefined()
+  expect(w.argv.some(a => a[2] === 'project' && a[3] === 'register')).toBe(true)
   expect(await ui.find({ text: /MatrixKoder is set up/ })).toBeTruthy()
 })
 
@@ -796,7 +792,7 @@ test('writes go through a .tmp file and mv; replacing a yaml keeps a .bak', asyn
   await ui.select({ key: 'wz-replace', value: 'replace' })
   await ui.press({ key: 'wz-write' })
   const moves = w.argv.filter(a => a[0] === 'mv').map(a => a[a.length - 1])
-  expect(moves).toEqual([YAML, GITIGNORE, PROJECTS])
+  expect(moves).toEqual([YAML, GITIGNORE])
   for (const a of w.argv.filter(x => x[0] === 'mv')) expect(a[a.length - 2]).toBe(`${a[a.length - 1]}.tmp`)
   expect(Object.keys(files).filter(p => p.endsWith('.tmp')), 'no temp file is left').toEqual([])
   expect(files[`${YAML}.bak`]).toBe('# old\n')
@@ -805,7 +801,7 @@ test('writes go through a .tmp file and mv; replacing a yaml keeps a .bak', asyn
 
 test('$MATRIXKODER_DATA and $MATRIXKODER_HOME are honoured by the wizard', async ($, on) => {
   const files = repoFiles()
-  world(on, files, {}, { MATRIXKODER_DATA: '/srv/mk-data', MATRIXKODER_HOME: '/srv/mk-home' })
+  const w = world(on, files, {}, { MATRIXKODER_DATA: '/srv/mk-data', MATRIXKODER_HOME: '/srv/mk-home' })
   await $.session.start(sessionStart())
   await mk($, 'setup')
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(64) })
@@ -815,7 +811,8 @@ test('$MATRIXKODER_DATA and $MATRIXKODER_HOME are honoured by the wizard', async
   await toReview(ui)
   await ui.press({ key: 'wz-write' })
   expect(files['/srv/mk-data/matrixkoder.yaml']).toContain('data_dir: /srv/mk-data/')
-  expect(JSON.parse(files['/srv/mk-home/projects.json'] ?? 'null')).toEqual({ [PROJECT_DIR]: { data_dir: '/srv/mk-data', onboarded_at: ISO_NOW } })
+  expect(files['/srv/mk-home/projects.json'], 'registered through mk-state, not a file').toBeUndefined()
+  expect(w.argv.some(a => a[2] === 'project' && a[3] === 'register' && a.includes('/srv/mk-data'))).toBe(true)
   expect(files['/srv/mk-home/config.json'], 'no config.json anywhere, env home included').toBeUndefined()
   expect(files[`${HOME}/.matrixkoder/projects.json`]).toBeUndefined()
   expect(files[GITIGNORE], 'env data dir lives outside the repo: no .gitignore edit').toBe('node_modules/\n')
@@ -1015,7 +1012,7 @@ test('a successful write runs the mk-config migration once', async ($, on) => {
 test('a failing migration warns but never fails the wizard', async ($, on) => {
   const files = repoFiles()
   world(on, files, {}, {}, [], argv => {
-    if (argv[0] === 'python3') return { value: { exitCode: 1, stdout: '', stderr: 'python3: not available', isStdoutTruncated: false, isStderrTruncated: false } }
+    if (argv[0] === 'python3' && argv.includes('migrate')) return { value: { exitCode: 1, stdout: '', stderr: 'python3: not available', isStdoutTruncated: false, isStderrTruncated: false } }
     return undefined
   })
   await $.session.start(sessionStart())
