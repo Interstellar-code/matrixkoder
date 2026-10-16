@@ -1,5 +1,5 @@
 // MatrixKoder wake on lane events: polls the project store's events and submits prompt on
-// transition events (the retired events.jsonl is a labelled fallback, C4/L5) (strict types)
+// transition events; the project DB is the only source (strict types)
 import type { EngineInterface, On, PluginOptions, Timer } from 'claude-code'
 import type { MkWakePending } from '../types'
 import { join, parseJson, sanitizeText } from './data'
@@ -14,11 +14,11 @@ const COOLDOWN_MS = 5 * 60 * 1000 // 5 minutes
 const HOLD_MS = 10 * 60 * 1000 // 10 minutes: a submit that threw may still have been queued
 const CLAIM_DEAD_MS = 2 * 60 * 1000 // 2 minutes: a claim without a completed send is dead
 const HOLD_GONE = -1 // a hold that already gave up: never blocks a later identical text
-const STORE_READ_MS = 5000 // one-shot mkdb read; a timeout skips the tick (file mode is not a fallback)
+const STORE_READ_MS = 5000 // one-shot mkdb read; a timeout skips the tick (there is no file fallback)
 const POLL_MS = 30000 // the poll tick
 const OWNER_LEASE_MS = 3 * POLL_MS // a wake owner that has not refreshed for this long is gone
 
-/** One events.jsonl object (fallback mode), or the same shape mapped from a store row.
+/** One event: a store row mapped onto the events.jsonl shape mk-state's event_line renders.
  *  `id` is set only in store mode. */
 type WakeEvent = {
   type?: unknown
@@ -61,13 +61,13 @@ const EMPTY_PENDING: Pending = { run: '', upTo: 0, items: [] }
 const askBodies = new Map<string, string>()
 const askKey = (run: string, task: string, askId: string) => `${run}\0${task}\0${askId}`
 
-/** The key is typed `byId: number`, so the form rides in the sign. A line count (file mode,
+/** The key is typed `byId: number`, so the form rides in the sign. A line count (the retired file mode,
  *  and every cursor saved before store mode) is >= 0. An events.id cursor is stored negative,
  *  -(id+1), which is never 0 and never collides with a line count. */
 const idCursorOf = (id: number): number => -(id + 1)
 const idFromCursor = (stored: number): number => -stored - 1
 
-/** A store cursor is negative. Writes from the flush keep that sign; file mode stays >= 0. */
+/** A store cursor is negative. Writes from the flush keep that sign; a value saved by the retired file mode stays >= 0. */
 async function keepCursorForm($: EngineInterface, run: string, n: number): Promise<number> {
   const res = await $.state.get({ plugin: 'matrixkoder', key: 'wakeEventLines', id: run } as const).catch(() => ({ value: undefined }))
   return typeof res.value === 'number' && res.value < 0 ? idCursorOf(n) : n
@@ -85,7 +85,7 @@ async function keepCursorForm($: EngineInterface, run: string, n: number): Promi
 async function wakeDataDir($: EngineInterface): Promise<string> {
   const cwd = await sessionCwd($)
   const resolved = await resolveDataDir($, { cwd, home: await homeDir($), store: true })
-  return resolved ?? join(cwd, '.matrixkoder')
+  return resolved ?? paths.legacyDataDir(cwd)
 }
 
 async function readPending($: EngineInterface): Promise<Pending> {
@@ -104,7 +104,7 @@ function armDebounce($: EngineInterface): void {
 /** The task's CURRENT status at flush time, from the project store (C4/L5): one
  *  `mkdb.py run-snapshot --run <R>` read for the whole batch, since every pending item belongs
  *  to the same run. null means the store could not answer (a pre-migration project with no
- *  store, or a refused spawn) and the caller falls back to the file views.
+ *  store, or a refused spawn) and the caller keeps every item.
  *
  *  The file reads below are the FALLBACK ONLY: run.json, else the task's own task.json copy
  *  (state-schema v1). mk-state stops writing both in L4. Note the store's `ready` is a kanban
@@ -140,30 +140,6 @@ async function storeTaskStatuses(
     }
   }
   return out
-}
-
-/** FALLBACK (C4/L5): the retired file views — run.json first, then the task's own task.json
- *  copy. Only reached when the store could not answer. undefined = neither is readable — the
- *  caller keeps the item, a read error must not silently eat a wake. */
-async function currentTaskStatus($: EngineInterface, dataDir: string, run: string, task: string): Promise<string | undefined> {
-  const runObj = parseJson(await $.fs.read(paths.runDoc(dataDir, run)).catch(() => ''))
-  const tasks = runObj != null && typeof runObj === 'object' && Array.isArray((runObj as { tasks?: unknown }).tasks)
-    ? (runObj as { tasks: unknown[] }).tasks
-    : null
-  if (tasks != null) {
-    for (const t of tasks) {
-      if (t != null && typeof t === 'object') {
-        const o = t as { id?: unknown; status?: unknown }
-        if (o.id === task && typeof o.status === 'string') return o.status
-      }
-    }
-  }
-  const taskObj = parseJson(await $.fs.read(`${dataDir}/runs/${run}/tasks/${task}/task.json`).catch(() => ''))
-  if (taskObj != null && typeof taskObj === 'object') {
-    const status = (taskObj as { status?: unknown }).status
-    if (typeof status === 'string') return status
-  }
-  return undefined
 }
 
 /** The identical-text hold sits in the wakeSentAt family under the id `hold:<text>` (a family
@@ -216,11 +192,11 @@ async function flushBatch($: EngineInterface): Promise<void> {
   // A later status change may already have reversed a transition while the batch waited:
   // re-read each task's current status and drop items that no longer hold it.
   const dataDir = await wakeDataDir($)
-  // one store read answers every item's current status; null falls back to the file views
+  // one store read answers every item's current status; null (the reader could not answer) keeps every item
   const store = await storeTaskStatuses($, dataDir, pend.run)
   const items: PendingItem[] = []
   for (const p of pend.items) {
-    const status = store?.get(p.task) ?? await currentTaskStatus($, dataDir, pend.run, p.task)
+    const status = store?.get(p.task)
     if (status === undefined || status === p.to) items.push(p)
   }
   if (items.length === 0) {
@@ -277,7 +253,9 @@ async function flushBatch($: EngineInterface): Promise<void> {
     // max with heldUpTo.
     const cursorRef = { plugin: 'matrixkoder', key: 'wakeEventLines', id: pend.run } as const
     const cursorRes = await $.state.get(cursorRef).catch(() => ({ value: undefined }))
-    const currentCursor = typeof cursorRes.value === 'number' ? cursorRes.value : 0
+    // a stored id cursor is negative (idCursorOf): decode it, or the max below compares two units and rewinds
+    const storedCursor = typeof cursorRes.value === 'number' ? cursorRes.value : 0
+    const currentCursor = storedCursor < 0 ? idFromCursor(storedCursor) : storedCursor
     const nextCursor = Math.max(currentCursor, heldUpTo)
     await $.state.set(cursorRef, await keepCursorForm($, pend.run, nextCursor)).catch(() => {})
     askBodies.clear()
@@ -325,36 +303,10 @@ async function flushBatch($: EngineInterface): Promise<void> {
   await $.state.set(pendingRef, EMPTY_PENDING).catch(() => {})
 }
 
-/** `mkdb.py run-snapshot` already says whether the store is there (`store`, L5 R2), and it is the
- *  store that decides the cursor unit: store mode counts events.id, file mode a line. Wake
- *  already spawns this reader every tick to pick the active run, so the mode comes off that SAME
- *  reply — no extra process, and no dependence on the literal `<dataDir>/mk.db`, which on a
- *  migrated project is the frozen pre-switch copy that `mk--archive` removes (todo 123).
- *
- *  undefined when the reader could not answer (a refused spawn, a non-zero exit, a payload with
- *  no runs). The caller then keeps today's file probe, so a pre-migration project with no python
- *  still falls back to events.jsonl exactly as before. */
+/** `mkdb.py run-snapshot` says whether the store is there (`store`, L5 R2) and names the active run.
+ *  Wake spawns it every tick; undefined means the reader could not answer (a refused spawn, a
+ *  non-zero exit, a payload with no runs) and the tick is skipped, like `store: false`. */
 type StoreProbe = { store: boolean; activeId: string | null | undefined }
-
-/** Store vs file mode for a tick. `probe` is the tick's one run-snapshot read: its `store` key
- *  answers directly (`true` → store mode, `false` → file mode, including a migrated project
- *  whose legacy `<dataDir>/mk.db` is gone). Only when the reader could not answer does the
- *  legacy `<dataDir>/mk.db` probe decide: a present regular file → store mode; a present path
- *  that is not a file → 'skip' (unreadable: the caller must not guess the cursor unit); absent →
- *  file mode. */
-async function storeMode(
-  $: EngineInterface,
-  dataDir: string,
-  probe: StoreProbe | undefined,
-): Promise<'store' | 'file' | 'skip'> {
-  if (probe !== undefined) return probe.store ? 'store' : 'file'
-  try {
-    const st = await $.fs.stat(paths.projectDb(dataDir))
-    return st.kind === 'file' ? 'store' : 'skip'
-  } catch {
-    return 'file'
-  }
-}
 
 /** Read-only events for one run, through `mkdb.py events` (C4/L5) — the ONE store reader.
  * It replaces the inline `python3 -c` probe that imported mkdb and opened `<data>/mk.db`
@@ -386,9 +338,7 @@ function storeRowToEvent(row: Record<string, unknown>): WakeEvent {
   return { type: row.kind, task: row.task, to: row.to_id, text: row.text, by, id }
 }
 
-/** One `mkdb.py events` spawn, or undefined when it could not answer. Undefined skips the
- *  tick: store mode never falls through to the file view, because the two use different
- *  cursor units (events.id vs a line count). */
+/** One `mkdb.py events` spawn, or undefined when it could not answer. Undefined skips the tick. */
 async function readStoreEvents($: EngineInterface, dataDir: string, runId: string): Promise<WakeEvent[] | undefined> {
   let ran: { exitCode: number; stdout: string }
   try {
@@ -414,33 +364,12 @@ async function readStoreEvents($: EngineInterface, dataDir: string, runId: strin
   return out
 }
 
-async function readFileEvents($: EngineInterface, eventsPath: string): Promise<WakeEvent[] | undefined> {
-  const eventsRaw = await $.fs.read(eventsPath).catch(() => '')
-  if (!eventsRaw) return []
-  const out: WakeEvent[] = []
-  for (const line of eventsRaw.split('\n')) {
-    if (line.trim().length === 0) continue
-    try {
-      out.push(JSON.parse(line) as WakeEvent)
-    } catch {
-      out.push({}) // a torn line still occupies a cursor slot, same as the old line scan
-    }
-  }
-  return out
-}
-
-/** The store's one run-snapshot read for a tick: its `store` key (store mode vs file mode) and
- *  the active run it names (or null: end of the poll). undefined when the reader could not answer
- *  — a pre-migration project with no store, a refused spawn, a non-zero exit, or a payload with
- *  no `runs` array. The caller then reads the retired `<data>/runs/index.json` for the run and
- *  keeps today's `<data>/mk.db` stat for the mode.
- *
- *  `store: false` is how the reader says the store is MISSING: without it, its no-store reply
- *  (`{ok: true, store: false, runs: []}`) is indistinguishable from a store with no active run.
- *
- *  The pick stays the index file's: the FIRST active entry in a list ordered by `started`
- *  ascending, i.e. the OLDEST active run. The reader's own `active` field is the NEWEST one
- *  (the dashboard's pick), which would move wake onto a different run of a busy project. */
+/** The store's one run-snapshot read for a tick: its `store` key and the active run it names (or
+ *  null: the end of the poll). undefined when the reader could not answer. `store: false` is how
+ *  the reader says the store is MISSING; without it its no-store reply would read as a store with
+ *  no active run. The pick is the FIRST active entry of the list ordered by `started` ascending,
+ *  i.e. the OLDEST active run; the reader's own `active` field is the newest one (the dashboard's
+ *  pick), which would move wake onto a different run of a busy project. */
 async function storeProbe($: EngineInterface, dataDir: string): Promise<StoreProbe | undefined> {
   let ran: { exitCode: number; stdout: string }
   try {
@@ -457,26 +386,16 @@ async function storeProbe($: EngineInterface, dataDir: string): Promise<StorePro
     return undefined
   }
   // The reader always marks the reply (store true/false). Anything else is not an answer this
-  // reader can use, so the caller keeps the file probe rather than reading the marker as false.
+  // reader can use, and the caller skips the tick rather than reading the marker as false.
   if (doc.store !== true && doc.store !== false) return undefined
   const list = (doc as { runs: unknown[] }).runs
   const first = list.find(r =>
     r !== null && typeof r === 'object' && (r as { status?: unknown }).status === 'active'
     && typeof (r as { id?: unknown }).id === 'string')
-  // store: false → no store file at all: the index file names the run (activeId undefined).
+  // store: false → no store file at all: nothing to read (activeId undefined).
   // store: true  → the reader answered; an empty list is the end of the poll (activeId null).
   if (doc.store === false) return { store: false, activeId: undefined }
   return { store: true, activeId: first === undefined ? null : (first as { id: string }).id }
-}
-
-/** FALLBACK (C4/L5): the retired `<data>/runs/index.json`, first active entry. */
-async function activeRunIdFromFiles($: EngineInterface, dataDir: string): Promise<string | null> {
-  const runs = parseJson(await $.fs.read(paths.runsIndex(dataDir)).catch(() => ''))
-  if (!Array.isArray(runs)) return null
-  const entry = runs.find((r): r is { id: string } =>
-    r !== null && typeof r === 'object' && (r as { status?: unknown }).status === 'active'
-    && typeof (r as { id?: unknown }).id === 'string')
-  return entry?.id ?? null
 }
 
 /** Only the orchestrator session wakes (todo 155). Every Claude session that loads the plugin
@@ -515,12 +434,10 @@ async function pollEvents($: EngineInterface): Promise<void> {
   try {
     const dataDir = await wakeDataDir($)
     const probe = await storeProbe($, dataDir)
-    // Store mode: the store named the run (null = no active run, the end of the poll). File mode
-    // (store:false, or a reader that could not answer): the retired index file names it.
-    const activeId = probe !== undefined && probe.store
-      ? probe.activeId
-      : await activeRunIdFromFiles($, dataDir)
-    const active = activeId == null ? undefined : { id: activeId }
+    // The project DB is the only source: no store (store:false) or a reader that could not answer
+    // skips the tick. A store with no active run (activeId null) is the end of the poll.
+    if (probe === undefined || !probe.store) return
+    const active = probe.activeId == null ? undefined : { id: probe.activeId }
     // a batch found before a reload (or a held/failed submit) is still owed, but only to the run that is still active
     const owed = await readPending($)
     if (owed.items.length > 0 && (!active?.id || owed.run !== active.id)) {
@@ -532,41 +449,28 @@ async function pollEvents($: EngineInterface): Promise<void> {
     }
     if (!active?.id) return
 
-    const mode = await storeMode($, dataDir, probe)
-    if (mode === 'skip') return // mk.db is there but not a readable file: do not guess the cursor unit
-    const eventsPath = paths.eventsDoc(dataDir, active.id)
-    // Store mode never falls through to the file view: a failed read skips the tick so a
-    // transient error cannot double-fire from events.jsonl (a different cursor unit).
-    const events = mode === 'store'
-      ? await readStoreEvents($, dataDir, active.id)
-      : await readFileEvents($, eventsPath)
+    // A failed read skips the tick (a store read is the only source; nothing double-fires).
+    const events = await readStoreEvents($, dataDir, active.id)
     if (events === undefined) return
     if (events.length === 0) return
 
     const stateRef = { plugin: 'matrixkoder', key: 'wakeEventLines', id: active.id } as const
     const stateRes = await $.state.get(stateRef).catch(() => ({ value: undefined }))
-    // File mode: the cursor is a line count, >= 0. Store mode: it is the last consumed
-    // events.id, stored negative (idCursorOf) because the key is typed byId:number and a
-    // second key cannot record the form. A non-negative number saved before store mode
-    // existed is a line count; reading it as an id would re-wake every event with id > N.
-    const cursorOf = (ev: WakeEvent, index: number): number => (mode === 'store' ? (ev.id ?? 0) : index + 1)
-    const maxCursor = events.reduce((m, ev, i) => Math.max(m, cursorOf(ev, i)), 0)
+    // The cursor is the last consumed events.id, stored negative (idCursorOf) because the key is
+    // typed byId:number and a second key cannot record the form. A non-negative number saved by
+    // the retired file mode is a line count; reading it as an id would re-wake every event with id > N.
+    const cursorOf = (ev: WakeEvent): number => ev.id ?? 0
+    const maxCursor = events.reduce((m, ev) => Math.max(m, cursorOf(ev)), 0)
     const saved = typeof stateRes.value === 'number' ? stateRes.value : undefined
 
-    if (mode === 'store' && !(typeof saved === 'number' && saved < 0)) {
-      // First store-mode tick for this run, whether or not a line-count cursor was saved:
+    if (!(typeof saved === 'number' && saved < 0)) {
+      // First tick for this run, whether or not a line-count cursor was saved:
       // baseline to the current max id and do not wake for events already in the store.
       await $.state.set(stateRef, idCursorOf(maxCursor)).catch(() => {})
       return
     }
 
-    if (typeof saved !== 'number') {
-      // First enable or first time seeing this active run: baseline to current max, do not wake for history
-      await $.state.set(stateRef, maxCursor).catch(() => {})
-      return
-    }
-
-    const lastSeen = mode === 'store' ? idFromCursor(saved) : saved
+    const lastSeen = idFromCursor(saved)
     if (maxCursor <= lastSeen) return
 
     let now = Date.now()
@@ -579,7 +483,7 @@ async function pollEvents($: EngineInterface): Promise<void> {
 
     for (let i = 0; i < events.length; i++) {
       const ev = events[i]
-      if (!ev || cursorOf(ev, i) <= lastSeen) continue
+      if (!ev || cursorOf(ev) <= lastSeen) continue
       try {
         // Validate every value placed in prompt.submit:
         // task must be a string matching mk-state ID_RE; status must be in WAKE_STATUSES enum;
@@ -673,7 +577,7 @@ async function pollEvents($: EngineInterface): Promise<void> {
       if (!items.some(p => p.task === item.task && p.to === item.to && p.askId === item.askId)) items.push(item)
     }
     if (items.length === 0) {
-      await $.state.set(stateRef, mode === 'store' ? idCursorOf(maxCursor) : maxCursor).catch(() => {}) // nothing to wake for: safe to move on
+      await $.state.set(stateRef, idCursorOf(maxCursor)).catch(() => {}) // nothing to wake for: safe to move on
       return
     }
     // lines are NOT marked seen yet: that happens after the submit (flushBatch)

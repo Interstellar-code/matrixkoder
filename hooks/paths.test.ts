@@ -217,9 +217,9 @@ test('$MK_HOME and $MATRIXKODER_HOME are ONE setting, MK_HOME first', async () =
 test('the data-dir and global-dir file names come from one place', async () => {
   expect(paths.runsIndex('/d')).toBe('/d/runs/index.json')
   expect(paths.runDoc('/d', 'r1')).toBe('/d/runs/r1/run.json')
-  expect(paths.eventsDoc('/d', 'r1')).toBe('/d/runs/r1/events.jsonl')
   expect(paths.projectDb('/d')).toBe('/d/mk.db')
   expect(paths.legacyDataDir('/r')).toBe('/r/.matrixkoder')
+  expect(paths.homeProjectDir('/g', 'p')).toBe('/g/projects/p')
   expect(paths.planArchiveDir('p', 'a1')).toBe('~/.matrixkoder/projects/p/plans/a1/archive/')
   expect(paths.planArchiveDir('p', 'a1', '/g')).toBe('/g/projects/p/plans/a1/archive/')
   expect(paths.projectYaml('/d')).toBe('/d/matrixkoder.yaml')

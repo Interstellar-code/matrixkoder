@@ -8,6 +8,7 @@ import { atom, read, update } from 'claude-code'
 import type { Elements as ElementTables, EngineInterface, On, PluginOptions } from 'claude-code'
 import type { MkWizardDraft } from '../types'
 import { globalDirPath, join, parseJson } from './data'
+import { paths as mkPaths } from './paths'
 import {
   AGENT_NAMES, WIZARD_STEPS, ZAI_KEY_CMD, addToGitignore, buildYaml,
   builderOrderOf, dataDirOf, EMPTY_DRAFT, emptyDraft, fallbackText, installModeOf, mergeModels, parseModels, parseProviders, parseVersion,
@@ -52,7 +53,7 @@ export function registerWizard(on: On, options: PluginOptions): void {
     const title = WIZARD_STEPS[step - 1] ?? ''
     // the review preview is exactly what a replace writes: read the yaml the carry-over needs (readOpt: null on any failure)
     const data = dataDirOf(d)
-    const oldYaml = step === LAST_STEP && d.existingYaml && d.replace && data != null ? await readOpt($, join(data, 'matrixkoder.yaml')) : null
+    const oldYaml = step === LAST_STEP && d.existingYaml && d.replace && data != null ? await readOpt($, mkPaths.projectYaml(data)) : null
     return (
       <Box flexDirection="column" width={cols} gap={1}>
         {e.props.placement === 'inline' && (
@@ -232,14 +233,14 @@ async function detect($: EngineInterface, options: PluginOptions): Promise<MkWiz
   // `<repo>/.matrixkoder`. The write step registers the project in the root store through
   // `mk-state.py project register` (L10.7); <home>/projects.json is no longer written.
   if (d.dataEnv == null && d.repo != null && d.globalDir != null) {
-    const repoData = await $.fs.exists(join(d.repo, '.matrixkoder')).catch(() => false)
+    const repoData = await $.fs.exists(mkPaths.legacyDataDir(d.repo)).catch(() => false)
     const established = await $.fs.exists(join(d.repo, 'package.json')).catch(() => false)
       || await $.fs.exists(join(d.repo, 'pyproject.toml')).catch(() => false)
       || await $.fs.exists(join(d.repo, 'Makefile')).catch(() => false)
     if (!repoData && !established) d.dataMode = 'home'
   }
   const data = dataDirOf(d)
-  d.existingYaml = data != null && (await $.fs.exists(join(data, 'matrixkoder.yaml')).catch(() => false))
+  d.existingYaml = data != null && (await $.fs.exists(mkPaths.projectYaml(data)).catch(() => false))
   d.loaded = true
   return d
 }
@@ -267,7 +268,7 @@ const goto = ($: EngineInterface, step: number): Promise<unknown> =>
 async function refreshExisting($: EngineInterface, p: Partial<MkWizardDraft>): Promise<void> {
   const next = { ...(await read($, draftAtom)), ...p }
   const data = dataDirOf(next)
-  const existing = data != null && (await $.fs.exists(join(data, 'matrixkoder.yaml')).catch(() => false))
+  const existing = data != null && (await $.fs.exists(mkPaths.projectYaml(data)).catch(() => false))
   await patch($, { ...p, existingYaml: existing, replace: false })
 }
 
@@ -298,7 +299,7 @@ async function writeAll($: EngineInterface): Promise<void> {
   try {
     const data = dataDirOf(d)
     if (d.repo == null || data == null || d.home == null || d.globalDir == null) throw new Error('no git repository (or HOME) detected — run /mk setup from inside the project')
-    const yamlPath = join(data, 'matrixkoder.yaml')
+    const yamlPath = mkPaths.projectYaml(data)
     // detection is a snapshot: a yaml that appeared since goes back to the replace confirm, nothing is written
     const yamlExists = await $.fs.exists(yamlPath)
     if (yamlExists && !d.existingYaml) {
@@ -627,7 +628,7 @@ function Review(els: Elements, $: EngineInterface, d: MkWizardDraft, oldYaml: st
         <Text>{`${d.existingYaml && !d.replace ? 'keep   ' : d.existingYaml ? 'replace' : 'create '} ${data ?? '?'}/matrixkoder.yaml`}</Text>
         <Text>{`create  ${data ?? '?'}/plans/ and runs/`}</Text>
         {d.dataEnv == null && d.dataMode === 'repo' && d.gitignore && !d.gitignoreHas && <Text>add     /.matrixkoder/ to .gitignore</Text>}
-        <Text>{`${d.globalDir ?? '~/.matrixkoder'}root projects table (register this repo)`}</Text>
+        <Text>{`${d.globalDir ?? '~/.matrixkoder'} root projects table (register this repo)`}</Text>
         {d.agents.herdr?.found && d.herdrPlugin === 'link' && <Text>{`link    ${d.pluginRoot}/herdr in herdr`}</Text>}
         {d.agents.herdr?.found && d.herdrPlugin === 'linked' && <Text dimColor={true}>herdr plugin already linked</Text>}
         {d.installMode === 'marketplace' && <Text dimColor={true}>Re-run /mk setup after each MatrixKoder update: the herdr link points at this plugin version's folder.</Text>}
