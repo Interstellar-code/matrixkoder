@@ -22,7 +22,8 @@ and exit 0 with an empty lanes list — never a crash, never a non-zero exit.
 
 Tests never touch the real ~/.matrixkoder. When MK_NUDGE_LANES_JSON is set it
 is a path to a JSON file used INSTEAD of `mk-lane.py list` (read only when
-set). Tests put a fake `herdr`, a fake `ps` and a fake `mk-lane-event.py`
+set). The slots come from `mk-lane.py list`, i.e. the project DB's lane_slots rows
+(L10.5): this script never reads lanes.json. Tests put a fake `herdr`, a fake `ps` and a fake `mk-lane-event.py`
 first on PATH.
 """
 import fcntl, json, os, re, shutil, subprocess, sys, tempfile, time
@@ -684,7 +685,7 @@ def self_test():
         os.makedirs(bin_dir)
         data = os.path.join(root, "data")
         os.makedirs(data)
-        lanes_file = os.path.join(root, "lanes.json")
+        lanes_file = os.path.join(root, "lane-list.json")  # a `mk-lane.py list` fixture, not the registry
         herdr_file = os.path.join(root, "herdr.json")
         ps_file = os.path.join(root, "ps.txt")
         sent_log = os.path.join(root, "sent.log")
