@@ -32,8 +32,9 @@ Legacy projects whose runs live only in files migrate through mk-store-import.py
       repo; never a hard-coded path): a plain string gate is `manual` — never run, never blocks;
       a `[gates.<name>]` table {cmd, expect = 0, timeout = 600} must exit `expect`, inside its
       timeout, with the 1-minute load average at or below 40 (above that every gate is
-      `deferred` and blocks; the load reader is `load_avg()`). A failure names the gate, its
-      result (`fail exit=N` | `timeout` | `deferred load=X`) and the last 20 lines of its output,
+      `deferred` and blocks; the load reader is `load_avg()`). A gate whose cmd matches a project.yaml
+      `banned_commands` entry is `banned`: blocks, never run. A failure names the gate, its
+      result (`fail exit=N` | `timeout` | `banned` | `deferred load=X`) and the last 20 lines of its output,
       and writes nothing. The accepted reply lists every gate with its result (`gates`).
       `run set` takes no --force, and none is added: F.0 has no bypass. Reading the gates is
       best-effort like the plan update below (no plan link, a missing plan file or a plan-tool
@@ -1795,8 +1796,48 @@ def _read_tail(pipe, box):
     box["sha"], box["tail"] = h.hexdigest(), bytes(tail)
 
 
-def _gate_exec(g, cwd):
+def banned_commands(data):
+    """The project's top-level `banned_commands:` from its project yaml (block or one-line flow list).
+    A missing file or key is an empty list. ponytail: scalars only, no anchors or multi-line flows."""
+    try:
+        with open(mkpaths.project_yaml(data), encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    out = []
+    for i, line in enumerate(lines):
+        m = re.match(r"banned_commands:\s*(.*?)\s*(#.*)?$", line)
+        if not m:
+            continue
+        flow = m.group(1)
+        if flow.startswith("["):
+            items = re.findall(r"\"([^\"]*)\"|'([^']*)'|([^,\[\]\s][^,\]]*)", flow)
+            return [a or b or c.strip() for a, b, c in items if a or b or c.strip()]
+        for nxt in lines[i + 1:]:
+            m2 = re.match(r"\s+-\s+(.*?)\s*(\s#.*)?$", nxt)
+            if not m2:
+                if nxt.strip() and not nxt.lstrip().startswith("#"):
+                    break
+                continue
+            out.append(m2.group(1).strip("\"'"))
+        return out
+    return out
+
+
+def _banned_hit(cmd, banned):
+    """The first banned entry whose words occur as a contiguous word run in cmd (`npm run dev`
+    hits `cd x && npm run dev`, not `npm run devtools`); shell separators count as spaces."""
+    words = re.sub(r"[;&|()<>]", " ", cmd).split()
+    for entry in banned:
+        ew = entry.split()
+        if ew and any(words[i:i + len(ew)] == ew for i in range(len(words) - len(ew) + 1)):
+            return entry
+    return None
+
+
+def _gate_exec(g, cwd, banned=()):
     """Run ONE table gate in cwd -> (result, output tail text, sha256 of the full output).
+    A cmd matching a `banned` entry (project.yaml banned_commands) is never run: result `banned`.
     The gate gets its own process group (start_new_session); on timeout the WHOLE group is
     SIGKILLed, so no child outlives the gate (todo 140; subprocess.run only killed the shell).
     stdout+stderr are merged into one stream. The tail is bounded to GATE_TAIL_BYTES."""
@@ -1808,6 +1849,9 @@ def _gate_exec(g, cwd):
         return "invalid", f"expect {expect!r} is not an int", empty
     if type(timeout) is not int:
         return "invalid", f"timeout {timeout!r} is not an int", empty
+    hit = _banned_hit(cmd, banned)
+    if hit:
+        return "banned", f"banned command {hit!r} (project.yaml banned_commands); gate not run", empty
     try:
         proc = subprocess.Popen(cmd, shell=True, cwd=cwd, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -1843,12 +1887,12 @@ def _gate_exec(g, cwd):
     return f"fail exit={proc.returncode}", out, box["sha"]
 
 
-def _gate_run(g, cwd):
+def _gate_run(g, cwd, banned=()):
     """F.0: run ONE table gate in cwd -> (result, output tail). Result vocabulary: `pass`,
-    `fail exit=N`, `timeout`, or `invalid` for a gate the plan tool would have refused (this
+    `fail exit=N`, `timeout`, `banned` (cmd matches banned_commands, never run), or `invalid` for a gate the plan tool would have refused (this
     reads `parse`, which does not check shape). A wrong exit code, a timeout and a malformed
     gate all block; only exit == expect passes. The tail is the last GATE_OUTPUT_LINES lines."""
-    result, out, _sha = _gate_exec(g, cwd)
+    result, out, _sha = _gate_exec(g, cwd, banned)
     return result, "" if result == "pass" else _gate_tail(out)
 
 
@@ -1856,18 +1900,19 @@ def run_gates(st, gates):
     """F.0: run every runnable gate of the run's plan in its integration checkout.
     -> (results, failures, where, note). `results` names every gate as the reply lists it: a
     plain string gate is `manual` (never run, never blocks); a table gate is `pass`,
-    `fail exit=N`, `timeout` or `deferred load=X`. Deferral blocks: a 1-minute load average
+    `fail exit=N`, `timeout`, `banned` or `deferred load=X`. Deferral blocks: a 1-minute load average
     above GATE_LOAD_MAX means the machine is busy, so NO gate passes and none is run."""
     where, note = integration_checkout(st)
     load = load_avg()
     deferred = load > GATE_LOAD_MAX
+    banned = banned_commands(st.data)
     results, failures = {}, []
     for name, g in gates.items():
         if not isinstance(g, dict):
             results[name] = "manual"
             continue
         result, out = (f"deferred load={load:g}", "deferred: load average above "
-                       f"{GATE_LOAD_MAX:g}") if deferred else _gate_run(g, where)
+                       f"{GATE_LOAD_MAX:g}") if deferred else _gate_run(g, where, banned)
         results[name] = result
         if result != "pass":
             failures.append({"gate": name, "result": result, "output": out})
@@ -1915,7 +1960,7 @@ def gate_record(st, rid, tid, name, g, where, tree, load, by, ref):
     if load > GATE_LOAD_MAX:
         result, tail, sha = (f"deferred load={load:g}", f"deferred: load average above {GATE_LOAD_MAX:g}", None)
     else:
-        result, tail, sha = _gate_exec(g, where)
+        result, tail, sha = _gate_exec(g, where, banned_commands(st.data))
     enum = _evidence_result(result)
     with st.locked():
         con = st.store_open()
@@ -6773,6 +6818,26 @@ def gate_run_self_test(tmp, env):
         raise AssertionError("_gate_run left the child alive")
     assert _gate_run({"cmd": "echo hi; exit 2"}, repo) == ("fail exit=2", "hi")
 
+    # F.3b: banned_commands (project.yaml) — a matching gate is `banned`, never run, and blocks
+    bmark = os.path.join(tmp, "gr-banned-ran")
+    assert banned_commands(os.path.join(tmp, "no-such-data")) == []  # no yaml: no ban
+    assert _gate_run({"cmd": f"touch {bmark}"}, repo, ["touch"]) [0] == "banned" and not os.path.exists(bmark)
+    assert _gate_run({"cmd": f"cd {repo} && touch {bmark}"}, repo, ["cd"])[0] == "banned"
+    assert _gate_run({"cmd": "npm run devtools"}, repo, ["npm run dev"])[0] != "banned"  # word match
+    assert _banned_hit("cd x && npm run dev", ["npm run dev"]) == "npm run dev"
+    assert _gate_run({"cmd": "echo ok"}, repo, ["touch"]) == ("pass", "")  # unbanned unchanged
+    bdata = os.path.join(tmp, "bdata")
+    os.makedirs(bdata)
+    with open(os.path.join(bdata, "matrixkoder.yaml"), "w") as f:
+        f.write("banned_commands:\n  - npm run dev   # servers\n  - \"touch\"\nqa:\n  start: x\n")
+    assert banned_commands(bdata) == ["npm run dev", "touch"], banned_commands(bdata)
+    with open(os.path.join(bdata, "matrixkoder.yaml"), "w") as f:
+        f.write("banned_commands: [\"npm run dev\", 'touch']\n")
+    assert banned_commands(bdata) == ["npm run dev", "touch"]
+    with open(os.path.join(bdata, "matrixkoder.yaml"), "w") as f:
+        f.write("banned_commands: []\n")
+    assert banned_commands(bdata) == []
+
     # deferred under load: a deferred row, nothing run
     before = len(evidence())
     marker = os.path.join(tmp, "gr-ran")
@@ -6788,6 +6853,22 @@ def gate_run_self_test(tmp, env):
     rows = evidence()
     assert len(rows) == before + 1 and rows[-1]["result"] == "deferred" and not os.path.exists(marker), rows[-1]
     assert out["all_green"] is False, out
+
+    # F.3b through the CLI: a banned task gate records an error row (detail banned) and never runs;
+    # lifting the ban lets the same gate run; no project yaml means no ban
+    ypath = mkpaths.project_yaml(data)
+    assert not os.path.exists(ypath), ypath
+    out = gr("gate", "run", "G1", "--run", "gr")
+    assert os.path.exists(marker) and out["all_green"] is True, out  # no yaml: unbanned
+    os.remove(marker)
+    with open(ypath, "w") as f:
+        f.write("banned_commands:\n  - touch\n")
+    before = len(evidence())
+    out = gr("gate", "run", "G1", "--run", "gr")
+    assert out["evidence"][0]["detail"] == "banned" and out["all_green"] is False, out
+    assert not os.path.exists(marker) and len(evidence()) == before + 1, "banned gate ran"
+    assert "banned command 'touch'" in evidence()[-1]["output_tail"], evidence()[-1]
+    os.remove(ypath)
 
     # --final runs every final gate; --due runs the merge gates only once a task is merged
     out = gr("gate", "run", "--final", "--run", "gr")
