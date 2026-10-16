@@ -237,8 +237,17 @@ def project_dir(home, slug=None, data_dir=None, legacy=False):
     return _mkpaths().project_dir(home_arg=home, slug=slug)
 
 
-def _connect(path):
+def _connect(path, create_beside_legacy=False):
+    """The one writer open. A new-name store (mk-overview.db / mk-project.db) is never CREATED beside an
+    existing legacy mk.db (L10.X): the resolver would hide the live store behind it. Only mk-migrate's copy
+    step passes create_beside_legacy=True. An empty or foreign new-name file counts as absent."""
     _selftest_write_guard(path)
+    mp = _mkpaths()
+    folder = os.path.dirname(path)
+    if not create_beside_legacy and os.path.basename(path) in (mp.ROOT_DB_NAME, mp.PROJECT_DB_NAME) \
+            and not mp.is_store_file(path) and os.path.isfile(os.path.join(folder, mp.LEGACY_DB_NAME)):
+        raise Fail(f"legacy {mp.LEGACY_DB_NAME} present; refusing to create {os.path.basename(path)} "
+                   f"beside it in {folder}; run mk-migrate --v2")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     con = sqlite3.connect(path, timeout=5.0)
     con.row_factory = sqlite3.Row
@@ -2979,6 +2988,7 @@ def self_test():
         os.environ["MATRIXKODER_HOME"] = home
         os.environ["MK_SELFTEST"] = "1"
         _stores(home)
+        _empty_new_name(tmp)
         _guards(tmp, home)
         _migrations(home)
         _writers(home)
@@ -3074,6 +3084,78 @@ def _stores(home):
     via_data = open_project(home, data_dir=os.path.join(home, "explicit"))
     via_data.close()
     _check(os.path.exists(_mkpaths().db_in(os.path.join(home, "explicit"))), "--data store")
+
+
+def _empty_new_name(tmp):
+    """L10.X: on an old-layout home a 0-byte mk-overview.db / mk-project.db never changes what a reader or
+    writer opens, no writer creates a new-name store beside mk.db, and only the explicit flag may."""
+    mp = _mkpaths()
+    old_home = os.path.join(tmp, "oldlayout")
+    saved = {k: os.environ.get(k) for k in ("MK_HOME", "MATRIXKODER_HOME")}
+    os.environ["MK_HOME"] = os.environ["MATRIXKODER_HOME"] = old_home
+    try:
+        open_root(old_home).close()
+        open_project(old_home, "demo").close()
+        proj_dir_ = os.path.join(old_home, "projects", "demo")
+        for folder, new in ((old_home, mp.ROOT_DB_NAME), (proj_dir_, mp.PROJECT_DB_NAME)):  # make it an OLD layout
+            for suf in ("", "-wal", "-shm"):
+                if os.path.exists(os.path.join(folder, new + suf)):
+                    os.rename(os.path.join(folder, new + suf), os.path.join(folder, mp.LEGACY_DB_NAME + suf))
+        legacy_root, legacy_proj = os.path.join(old_home, mp.LEGACY_DB_NAME), os.path.join(proj_dir_, mp.LEGACY_DB_NAME)
+        _check(os.path.isfile(legacy_root) and os.path.isfile(legacy_proj), "old-layout fixture")
+        empties = (os.path.join(old_home, mp.ROOT_DB_NAME), os.path.join(proj_dir_, mp.PROJECT_DB_NAME))
+        for e in empties:
+            open(e, "w").close()
+        # (a) every resolver answers the legacy file
+        _check(mp.root_db() == mp.root_db_in(old_home) == legacy_root, f"root_db: {mp.root_db()}")
+        _check(mp.project_db(data=proj_dir_) == mp.project_db_in(proj_dir_) == legacy_proj, mp.project_db(data=proj_dir_))
+        # (b) the writers write mk.db and leave the empty files exactly as they were
+        root, proj = open_root(old_home), open_project(old_home, "demo")
+        try:
+            proj.execute("INSERT INTO runs(id, plan, status, started) VALUES ('r1','p1','active','2026-01-01')")
+            proj.commit()
+            append_event(old_home, "demo", "r1", chan="note", kind="note", text="hello")
+        finally:
+            root.close()
+            proj.close()
+        _check(all(os.path.getsize(e) == 0 for e in empties), "a writer wrote into the empty new-name file")
+        _check(not any(f.startswith((mp.ROOT_DB_NAME + "-", mp.PROJECT_DB_NAME + "-")) for f in os.listdir(old_home) + os.listdir(proj_dir_)),
+               "a writer left a new-name sidecar")
+        con = sqlite3.connect(legacy_proj)
+        _check(con.execute("SELECT COUNT(*) FROM events WHERE text='hello'").fetchone()[0] == 1, "the event did not land in the legacy store")
+        con.close()
+        # (c) a forced new-name path beside mk.db raises, whether the file is absent or empty
+        for e in empties:
+            os.unlink(e)
+            for _ in range(2):
+                try:
+                    _connect(e)
+                except Fail as err:
+                    _check("mk-migrate --v2" in str(err) and f"legacy {mp.LEGACY_DB_NAME}" in str(err), str(err))
+                else:
+                    raise AssertionError(f"_connect created {e} beside {mp.LEGACY_DB_NAME}")
+                _check(not os.path.exists(e) or os.path.getsize(e) == 0, f"{e} was written")
+                open(e, "w").close()      # second pass: an empty file in the way is refused too
+            os.unlink(e)
+        # the explicit create path (mk-migrate's copy step) is the only way
+        _connect(empties[1], create_beside_legacy=True).close()
+        _check(os.path.getsize(empties[1]) > 0 and mp.is_store_file(empties[1]), "explicit create did not make a store")
+        os.unlink(empties[1])
+        for sfx in ("-wal", "-shm"):
+            if os.path.exists(empties[1] + sfx):
+                os.unlink(empties[1] + sfx)
+        # (d) a fresh home still gets the new names
+        fresh = os.path.join(tmp, "freshhome")
+        os.environ["MK_HOME"] = os.environ["MATRIXKODER_HOME"] = fresh
+        open_root(fresh).close()
+        open_project(fresh, "demo").close()
+        _check(os.path.isfile(os.path.join(fresh, mp.ROOT_DB_NAME)) and os.path.isfile(os.path.join(fresh, "projects", "demo", mp.PROJECT_DB_NAME)), "fresh home new names")
+        _check(not os.path.exists(os.path.join(fresh, mp.LEGACY_DB_NAME)), "fresh home made a legacy store")
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
 
 
 def _guards(tmp, home):

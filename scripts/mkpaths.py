@@ -197,13 +197,27 @@ def _query(path, sql, args=()):
         con.close()
 
 
+SQLITE_MAGIC = b"SQLite format 3\x00"
+
+
+def is_store_file(path):
+    """True when `path` is a real SQLite store: a file that starts with the 16-byte header. A 0-byte or
+    foreign file is not one — an empty new-name file must never win over the live store (L10.X)."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(16) == SQLITE_MAGIC
+    except OSError:
+        return False
+
+
 def _resolve_db(folder, kind):
-    """The store file inside `folder` for kind 'root' | 'project' (L10.13): the new-name file when it exists,
-    else an existing legacy `mk.db`, else (a fresh folder) the new name. When BOTH exist the new name wins:
-    only a deliberate step (migrate v2, a fresh home) creates it, and the legacy file is then the frozen
-    pre-migration copy. Read-only: nothing is created, renamed or moved."""
+    """The store file inside `folder` for kind 'root' | 'project' (L10.13): the new-name file when it is a real
+    store, else an existing legacy `mk.db`, else (a fresh folder) the new name. When BOTH are real the new name
+    wins: only a deliberate step (migrate v2, a fresh home) creates it, and the legacy file is then the frozen
+    pre-migration copy. An empty or foreign new-name file is not a store (L10.X) and never hides `mk.db`.
+    Read-only: nothing is created, renamed or moved."""
     new = os.path.join(folder, ROOT_DB_NAME if kind == "root" else PROJECT_DB_NAME)
-    if os.path.isfile(new):
+    if is_store_file(new):
         return new
     old = os.path.join(folder, LEGACY_DB_NAME)
     return old if os.path.isfile(old) else new
@@ -1234,6 +1248,12 @@ def self_test():
             os.makedirs(os.path.dirname(path), exist_ok=True)
             open(path, "w").close()
 
+        def store(path):
+            """A file that IS a store as far as the resolver can tell: the 16-byte SQLite header (L10.X)."""
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(SQLITE_MAGIC + b"\0" * 84)
+
         def listing(d):
             return sorted(os.listdir(d)) if os.path.isdir(d) else []
 
@@ -1249,16 +1269,28 @@ def self_test():
             _check(fn(d) == os.path.join(d, "mk.db"), fn(d))
             _check(listing(d) == ["mk.db"], listing(d))  # nothing created beside it
             d = os.path.join(base, kind + "-new")  # new only
-            touch(os.path.join(d, new))
+            store(os.path.join(d, new))
             _check(fn(d) == os.path.join(d, new), fn(d))
-            d = os.path.join(base, kind + "-both")  # both: the new name wins (only a deliberate step makes it)
-            touch(os.path.join(d, "mk.db"))
-            touch(os.path.join(d, new))
+            d = os.path.join(base, kind + "-both")  # both real: the new name wins (only a deliberate step makes it)
+            store(os.path.join(d, "mk.db"))
+            store(os.path.join(d, new))
             _check(fn(d) == os.path.join(d, new), fn(d))
             _check(listing(d) == sorted(["mk.db", new]), listing(d))
+            # L10.X: an EMPTY or foreign new-name file beside mk.db is no store and never hides it
+            d = os.path.join(base, kind + "-empty-new")
+            touch(os.path.join(d, "mk.db"))
+            touch(os.path.join(d, new))
+            _check(fn(d) == os.path.join(d, "mk.db"), f"{kind}: a 0-byte {new} hijacked the store: {fn(d)}")
+            with open(os.path.join(d, new), "wb") as f:
+                f.write(b"not a sqlite file at all")
+            _check(fn(d) == os.path.join(d, "mk.db"), f"{kind}: a foreign {new} hijacked the store: {fn(d)}")
+            _check(listing(d) == sorted(["mk.db", new]), listing(d))  # the resolver deleted nothing
+            d = os.path.join(base, kind + "-empty-new-alone")  # no mk.db: the (empty) new name stays the answer
+            touch(os.path.join(d, new))
+            _check(fn(d) == os.path.join(d, new), fn(d))
         # the project file must not be mistaken for the root one, and the other way round
         d = os.path.join(base, "cross")
-        touch(os.path.join(d, "mk-project.db"))
+        store(os.path.join(d, "mk-project.db"))
         _check(_resolve_db(d, "root") == os.path.join(d, "mk-overview.db"), _resolve_db(d, "root"))
         # the explicit-kind forms never guess: a root dir that is NOT the process home is still a root store
         other = os.path.join(base, "other-home")

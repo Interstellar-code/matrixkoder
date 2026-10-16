@@ -250,6 +250,14 @@ test('pickDb: new name if it exists, else an existing mk.db, else the new name; 
   }
   // the other kind's new name is not this kind's store
   expect(await paths.pickDb('/h', 'root', has(['/h/mk-project.db']))).toBe('/h/mk-overview.db')
+  // L10.X: an EMPTY new-name file is no store: with a size probe it never hides mk.db
+  const sized = (sizes: Record<string, number>) => (p: string): number => sizes[p] ?? 0
+  for (const [kind, fresh] of [['root', 'mk-overview.db'], ['project', 'mk-project.db']] as const) {
+    const files = has(['/h/mk.db', `/h/${fresh}`])
+    expect(await paths.pickDb('/h', kind, files, sized({ '/h/mk.db': 44, [`/h/${fresh}`]: 0 })), `${kind} empty new + mk.db`).toBe('/h/mk.db')
+    expect(await paths.pickDb('/h', kind, files, sized({ '/h/mk.db': 44, [`/h/${fresh}`]: 4096 })), `${kind} real new + mk.db`).toBe(`/h/${fresh}`)
+    expect(await paths.pickDb('/h', kind, has([`/h/${fresh}`]), sized({})), `${kind} empty new alone`).toBe(`/h/${fresh}`)
+  }
   // an async probe, as $.fs.exists is
   expect(await paths.pickDb('/h', 'root', async p => p === '/h/mk.db')).toBe('/h/mk.db')
 })
