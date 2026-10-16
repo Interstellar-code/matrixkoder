@@ -359,7 +359,9 @@ def read_status(lane, armed):
             upd = _row_epoch(row["updated"]) if fresh else 0.0
             return {"v": 1, "seq": None, "run": armed.get("run"), "task": armed.get("task"),
                     "round": row["round"], "role": "builder", "state": state, "question": question,
-                    "updated_at": upd, "source": "store"}
+                    "updated_at": upd, "source": "store",
+                    # what this verdict was read from: record() writes only while the row still says so
+                    "seen": {"task": armed.get("task"), "status": status, "updated": row["updated"]}}
     try:
         with open(os.path.join(lane, STATUS_FILE)) as f:   # R27.1: <lane>/.matrixkoder-status.json
             st = json.load(f)
@@ -619,8 +621,16 @@ def record(out, task, data, run=None):
                 cur = json.loads(r.stdout.strip().splitlines()[-1])
             except (json.JSONDecodeError, IndexError):
                 cur = {"ok": False}
+            seen = out.get("seen") or {}
             if cur.get("ok") and cur["task"]["status"] not in WATCHED:  # late watcher: never overwrite review/merged/...
                 t_note += f" (status {cur['task']['status']} kept)"
+                t_status = None
+            elif (cur.get("ok") and seen.get("task") == t
+                  and (cur["task"]["status"] != seen.get("status")
+                       or (seen.get("updated") and cur["task"].get("updated") != seen["updated"]))):
+                # the verdict came from a store row that has since changed (an answer set the task
+                # building after we read it blocked): the newer row wins, we only log
+                t_note += f" (status {cur['task']['status']} kept: row changed since read)"
                 t_status = None
         if t_status:
             pairs = [f"status={t_status}"]
@@ -761,12 +771,74 @@ def watch(a):
             return {"state": "DONE_SENT" if r.returncode == 0 else "ERROR", "commit": subj, "evidence": ev,
                     "sent": then_send, "ask_rc": r.returncode, "ask_out": (r.stdout + r.stderr).strip()[-200:]}
         if state:
-            return {"state": state, "commit": subj, "evidence": ev, "agent_status": h.get("agent_status")}
+            res = {"state": state, "commit": subj, "evidence": ev, "agent_status": h.get("agent_status")}
+            if (st or {}).get("source") == "store" and st.get("seen"):
+                res["seen"] = st["seen"]   # the store row this verdict came from (record()'s compare-and-set)
+            return res
         if time.time() - start > max_wait:
             return {"state": "WATCH_EXPIRED", "commit": subj, "agent_status": h.get("agent_status"),
                     "last_change_min": h.get("last_change_min"),
                     "evidence": ["watch window ended", "source=pane"]}   # R41: a pane detection
         time.sleep(poll)
+
+
+def stale_blocked_race_test():
+    """record() must not undo the orchestrator's answer: a verdict derived from a store row carries
+    "seen" (task, status, updated as read); if the row moved on (blocked -> building) the verdict is
+    only noted. Temp home + data dir, never the real ones."""
+    import shutil
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="lane-watch-race-")
+    home = os.path.join(tmp, "home")
+    saved = {k: os.environ.get(k) for k in ("MK_HOME", "MATRIXKODER_HOME", "MK_SELFTEST", "MK_STATE_LOADAVG")}
+    os.environ.update(MK_HOME=home, MATRIXKODER_HOME=home, MK_SELFTEST="1", MK_STATE_LOADAVG="0")
+    data = os.path.join(tmp, "data")
+    restore_data = mk_config.pin_tmp_data(tmp)
+    try:
+        def mks(*args):
+            r = subprocess.run([sys.executable, MK_STATE, *args, "--data", data], capture_output=True, text=True)
+            assert r.returncode == 0, r.stdout + r.stderr
+            return r.stdout
+        def row(t):  # the task row as lane-watch reads it (status, updated)
+            return json.loads(mks("task", "get", t, "--run", "r1").strip().splitlines()[-1])["task"]
+        def lw_events(t):  # (type, to, text) of lane-watch's events on <t>
+            c = store_con(data)
+            try:
+                return [(r["kind"], r["to_id"], r["text"]) for r in c.execute(
+                    "SELECT * FROM events WHERE run='r1' AND chan='state' AND task=? ORDER BY id", (t,))
+                    if (json.loads(r["meta_json"]) if r["meta_json"] else {}).get("by") == "lane-watch"]
+            finally:
+                c.close()
+        mks("run", "init", "--id", "r1", "--feature", "F", "--branch", "b")
+        mks("task", "add", "--root", "--id", "P", "--title", "phase")
+        mks("task", "add", "--id", "T", "--title", "leaf", "--parent", "P")
+        mks("task", "set", "T", "status=building")
+        mks("task", "set", "T", "status=blocked")
+        seen = {"task": "T", "status": "blocked", "updated": row("T")["updated"]}  # what lane-watch read
+        verdict = {"state": "BLOCKED", "commit": "", "evidence": ["store row blocked: q", "source=store"], "seen": seen}
+        # the race: the orchestrator answered (blocked -> building) after the read, before record()
+        mks("task", "set", "T", "status=building")
+        r = record(verdict, "T", data)
+        assert r["ok"], r
+        assert row("T")["status"] == "building", ("lane-watch undid the answer", row("T"))
+        assert row("P")["status"] == "building", ("parent rolled up to blocked", row("P"))
+        evs = lw_events("T")
+        assert not any(k == "transition" and to == "blocked" for k, to, _ in evs), evs
+        assert any("lane-watch BLOCKED" in tx and "kept" in tx for _, _, tx in evs), evs
+        # not a race: the row is still the blocked row that was read -> status written as before
+        mks("task", "set", "T", "status=blocked")
+        seen["updated"] = row("T")["updated"]
+        r = record(verdict, "T", data)
+        assert r["ok"] and row("T")["status"] == "blocked", (r, row("T"))
+        # first-time case: no "seen" key (pane/status-file verdict) still writes
+        mks("task", "set", "T", "status=building")
+        r = record({"state": "STALL", "commit": "", "evidence": ["agent idle 11 min"]}, "T", data)
+        assert r["ok"] and row("T")["status"] == "stalled", (r, row("T"))
+    finally:
+        restore_data()
+        for k, v in saved.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def self_test():
@@ -1126,6 +1198,7 @@ def self_test():
         r = record({"state": "STALL", "commit": other, "evidence": ["late"]}, "P1", data)
         assert r["ok"] and "event" in r and "status review kept" in r["event"]["text"]
         assert _run_doc(data)["tasks"][0]["status"] == "review"
+        stale_blocked_race_test()  # a verdict read from a store row never undoes the answer that followed
 
         # a parent task: mk-state refuses status= on it ("status rolls up from children"), so the
         # verdict goes to every child, never the parent (which only rolls up)
