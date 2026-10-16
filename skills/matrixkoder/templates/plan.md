@@ -36,6 +36,11 @@ typecheck = "<typecheck cmd>"             # e.g. pnpm exec tsc --noEmit — plan
 selftest = "<self-test cmd of the changed scripts>"  # e.g. python3 scripts/<name>.py --self-test; the full bash scripts/selftest.sh runs once on the integration tip, not per task — plans.header_json
 validate = "<validate cmd>"               # e.g. claude plugin validate . — plans.header_json
 
+[gates.c1]                                # F.10: the literal store-path-name count may only go down; baseline measured 377 at ecfa56f, lower it with `python3 scripts/c1-gate.py ratchet --baseline 377`, never raise it — plans.header_json
+cmd = "python3 scripts/c1-gate.py check --baseline 377 --base main"  # exits 1 and lists the new hits when the count rises — plans.header_json
+expect = 0                                # int, default 0 — plans.header_json
+timeout = 60                              # seconds — plans.header_json
+
 [[final_gate]]                            # F.2: the plan-level gate; F.2 wants one with covers, and mk-plan check warns when the header has none — plans.header_json
 id = "F1"                                 # optional: names the gate in errors and in the change report (`final_gate[F1]` vs `final_gate[1]`) — plans.header_json
 cmd = "<the command that proves the whole plan>"  # the command the run executes at every `every`; keep it the one end-to-end proof of the plan — plans.header_json
