@@ -27,7 +27,7 @@ import argparse, contextlib, datetime, hashlib, importlib.util, json, multiproce
 
 sys.dont_write_bytecode = True
 
-SCHEMA = 6
+SCHEMA = 7
 ROOT_SCHEMA = 2  # the root store migrates additively; project stores go to SCHEMA
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
 
@@ -118,6 +118,10 @@ CREATE TABLE IF NOT EXISTS reconcile_due(
   id INTEGER PRIMARY KEY, run TEXT, scope TEXT, created TEXT, done TEXT);
 CREATE INDEX IF NOT EXISTS evidence_run_task ON evidence(run, task);
 CREATE INDEX IF NOT EXISTS risk_reasons_run_task ON risk_reasons(run, task);
+CREATE TABLE IF NOT EXISTS settings(
+  key TEXT PRIMARY KEY, value TEXT, updated TEXT);
+CREATE TABLE IF NOT EXISTS watch_cursors(
+  key TEXT PRIMARY KEY, seq INTEGER NOT NULL, started TEXT, updated TEXT);
 """
 # v2: artifacts.src is the importer's stable source key. NULL on rows written by the live path.
 # event_src mirrors meta_json.src so a repeat import is one indexed lookup, not a table scan.
@@ -467,12 +471,23 @@ def _v6(con):
     con.execute("CREATE INDEX IF NOT EXISTS risk_reasons_run_task ON risk_reasons(run, task)")
 
 
+def _v7(con):
+    """The v7 step (L10.2): the project `settings` table (key -> JSON value, a reset is a DELETE) and
+    the `watch_cursors` table (the bus watch cursors, keyed `<run or *>|<task or *>`). Additive only
+    and safe to run twice: two CREATE TABLE IF NOT EXISTS, no existing table, column or row changes.
+    Nothing reads or writes them yet (L10.3 and L10.5 do); `lane_slots` stays the lane registry.
+    """
+    con.execute("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT, updated TEXT)")
+    con.execute("CREATE TABLE IF NOT EXISTS watch_cursors("
+                "key TEXT PRIMARY KEY, seq INTEGER NOT NULL, started TEXT, updated TEXT)")
+
+
 def open_project(home, slug=None, data_dir=None, version=SCHEMA, migrations=(), legacy=False):
     """Open or create the project store (C2). check_home runs before any directory is created.
     `legacy=True` opens the literal --data store of a migrated project (rollback fixtures only)."""
     path = os.path.join(project_dir(home, slug, data_dir, legacy), "mk.db")
     _selftest_write_guard(path)
-    con = _migrate(_connect(path), version, ((1, PROJECT_DDL), (2, _v2), (3, _v3), (4, _v4), (5, _v5), (6, _v6)) + tuple(migrations))
+    con = _migrate(_connect(path), version, ((1, PROJECT_DDL), (2, _v2), (3, _v3), (4, _v4), (5, _v5), (6, _v6), (7, _v7)) + tuple(migrations))
     _ensure_prev_status(con)
     _ensure_file_status(con)
     return con
@@ -2114,8 +2129,8 @@ def _schema6_v6(home):
     bare.commit()
     bare.close()
 
-    # Open with new code — migrates v5 to v6
-    con = open_project(home, data_dir=data)
+    # Open with the v6 chain — migrates v5 to v6 (v7 has its own test)
+    con = open_project(home, data_dir=data, version=6)
     try:
         # Schema is 6
         v = con.execute("SELECT MAX(version) v FROM schema_version").fetchone()["v"]
@@ -2148,7 +2163,7 @@ def _schema6_v6(home):
         con.close()
 
     # Idempotent: open again, nothing changes
-    con = open_project(home, data_dir=data)
+    con = open_project(home, data_dir=data, version=6)
     try:
         v2 = con.execute("SELECT MAX(version) v FROM schema_version").fetchone()["v"]
         _check(v2 == 6, f"second open schema {v2} != 6")
@@ -2159,7 +2174,7 @@ def _schema6_v6(home):
 
     # A fresh store also has the tables at schema 6
     fresh_data = os.path.join(home, "schema6-fresh")
-    con = open_project(home, data_dir=fresh_data)
+    con = open_project(home, data_dir=fresh_data, version=6)
     try:
         v3 = con.execute("SELECT MAX(version) v FROM schema_version").fetchone()["v"]
         _check(v3 == 6, f"fresh store schema {v3} != 6")
@@ -2178,6 +2193,91 @@ def _schema6_v6(home):
         _check("newer than this code" in str(e), f"old reader message: {e}")
     else:
         raise SystemExit("SELF-TEST FAIL: old reader did not refuse v6 store")
+
+
+def _store_sums(con):
+    """(row count, sha256 of every row) per pre-existing table: the 'nothing lost' proof."""
+    out = {}
+    for tbl in ("runs", "tasks", "events", "artifacts", "change_log", "lane_slots", "evidence"):
+        if not con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (tbl,)).fetchone():
+            continue
+        rows = sorted(repr(tuple(r)) for r in con.execute(f"SELECT * FROM {tbl}"))
+        out[tbl] = (len(rows), hashlib.sha256("\n".join(rows).encode()).hexdigest())
+    return out
+
+
+def _schema7_v7(home):
+    """L10.2: a fresh store has settings + watch_cursors at schema 7; a v5 and a v6 store upgrade in
+    place with every row of every old table unchanged (count + checksum); a second open changes
+    nothing; the tables take the rows L10.3 / L10.5 will write; an old reader refuses the v7 store."""
+    want = {"settings": ["key", "value", "updated"], "watch_cursors": ["key", "seq", "started", "updated"]}
+
+    def shape(con):
+        for tbl, cols in want.items():
+            _check([c[1] for c in con.execute(f"PRAGMA table_info({tbl})")] == cols, f"{tbl} columns")
+
+    fresh = open_project(home, data_dir=os.path.join(home, "schema7-fresh"))
+    try:
+        _check(fresh.execute("SELECT MAX(version) v FROM schema_version").fetchone()["v"] == 7, "fresh store not at 7")
+        shape(fresh)
+    finally:
+        fresh.close()
+    for old in (5, 6):
+        data = os.path.join(home, f"schema7-v{old}")
+        con = open_project(home, data_dir=data, version=old)
+        _check(con.execute("SELECT MAX(version) v FROM schema_version").fetchone()["v"] == old, f"not at {old}")
+        # PROJECT_DDL (a fresh build) already carries the v7 tables; drop them so this store has the
+        # shape real v{old} code left behind, and the upgrade has to create them
+        con.execute("DROP TABLE settings")
+        con.execute("DROP TABLE watch_cursors")
+        _check(not con.execute("SELECT 1 FROM sqlite_master WHERE name IN ('settings','watch_cursors')").fetchone(),
+               f"a v{old} store still has the v7 tables")
+        con.execute("INSERT INTO runs(id, plan, status, started) VALUES ('r1','p1','active','2026-01-01')")
+        con.execute("INSERT INTO tasks(run, id, parent, type, title, status, updated)"
+                    " VALUES ('r1','T1',NULL,'phase','Phase 1','planned','2026-01-01')")
+        con.execute("INSERT INTO events(run, task, t, chan, kind, text) VALUES ('r1','T1','2026-01-01','state','transition','added')")
+        con.execute("INSERT INTO artifacts(run, task, round, kind, rev, text, created)"
+                    " VALUES ('r1','T1',0,'brief',1,'hello','2026-01-01')")
+        con.execute("INSERT INTO change_log(run, task, t) VALUES ('r1','T1','2026-01-01')")
+        con.execute("INSERT INTO lane_slots(slot, lane_path, state) VALUES ('1','/x/lane1','free')")
+        if old == 6:
+            con.execute("INSERT INTO evidence(run, task, line, gate, result, created)"
+                        " VALUES ('r1','T1','a1','g','GREEN','2026-01-01')")
+        con.commit()
+        before = _store_sums(con)
+        con.close()
+        con = open_project(home, data_dir=data)
+        try:
+            _check(con.execute("SELECT MAX(version) v FROM schema_version").fetchone()["v"] == 7, f"v{old} not upgraded to 7")
+            shape(con)
+            _check(_store_sums(con) == before, f"v{old} upgrade changed a row: {_store_sums(con)} vs {before}")
+        finally:
+            con.close()
+        con = open_project(home, data_dir=data)  # second open: nothing changes
+        try:
+            _check(con.execute("SELECT COUNT(*) c FROM schema_version WHERE version=7").fetchone()["c"] == 1, "v7 stamped twice")
+            _check(_store_sums(con) == before, f"v{old} second open changed a row")
+            con.execute("INSERT INTO settings(key, value, updated) VALUES ('lanes.default_agent','\"claude\"','2026-01-02')")
+            con.execute("INSERT INTO watch_cursors(key, seq, started, updated) VALUES ('r1|*', 3, '2026-01-02', '2026-01-02')")
+            con.commit()
+            _check(con.execute("SELECT value FROM settings").fetchone()["value"] == '"claude"', "settings row")
+            _check(con.execute("SELECT seq FROM watch_cursors").fetchone()["seq"] == 3, "watch_cursors row")
+        finally:
+            con.close()
+    # the migration step alone is idempotent on a store that already has the tables
+    con = open_project(home, data_dir=os.path.join(home, "schema7-fresh"))
+    try:
+        _v7(con)
+        _v7(con)
+        shape(con)
+    finally:
+        con.close()
+    try:
+        _open_read(os.path.join(home, "schema7-fresh", "mk.db"), 6)
+    except Fail as e:
+        _check(e.code == 3 and "newer than this code" in str(e), f"old reader message: {e}")
+    else:
+        raise SystemExit("SELF-TEST FAIL: a v6 reader did not refuse the v7 store")
 
 
 def _derived_risk(home):
@@ -2439,6 +2539,7 @@ def self_test():
         _single_writer()
         _ready(home)
         _schema6_v6(home)
+        _schema7_v7(home)
         _derived_risk(home)
         _rework_rollup(home)
         _selftest_guard(home)
