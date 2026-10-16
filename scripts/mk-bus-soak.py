@@ -295,6 +295,30 @@ def queued(ctx, msg_id):
         return False
 
 
+def settle_rings(ctx, quiet=1.0, timeout=15):
+    """Wait until every ring the sends so far owe has gone out: the queue file holds no row and the
+    fake herdr's ring count has not moved for `quiet` seconds. The answer and the info of a cycle are
+    unsolicited and ring ASYNCHRONOUSLY (one drain per ring interval), so a count snapshot taken
+    right after the sends can land before those rings and then absorb them into the nudge's ring."""
+    open(ctx["fake"] + ".status", "w").write("idle")
+    deadline, last, since = time.time() + timeout, -1, time.time()
+    while time.time() < deadline:
+        rows = []
+        path = os.path.join(ctx["home"], "ring-queue.json")
+        if os.path.isfile(path):
+            try:
+                rows = json.load(open(path))
+            except (OSError, ValueError):
+                rows = [None]
+        now = ring_count(ctx)
+        if now != last or rows:
+            last, since = now, time.time()
+        elif time.time() - since >= quiet:
+            return
+        time.sleep(0.1)
+    raise SoakFail("settle", "the rings owed by the sends never went quiet")
+
+
 # ---------------------------------------------------------------- checks
 
 
@@ -363,16 +387,17 @@ def check_counts(ctx, data_a, data_b, sent_a, sent_b, acks_only=None):
     if acks_only is not None:
         check_acks(acks_only)
         return
-    def expect(data, sent):
+    def read(data):
+        """events and the ring rows among them, from ONE read: a ring row written between two reads
+        (rings are async) would count in the second only."""
         con = sqlite3.connect("file:" + quote(mkpaths.project_db_in(data)) + "?mode=ro", uri=True)
         try:
-            rings = con.execute(
-                "SELECT COUNT(*) FROM events WHERE chan='bus' AND kind IN ('ring','ring-typed')").fetchone()[0]
+            return con.execute("SELECT COUNT(*), COALESCE(SUM(kind IN ('ring','ring-typed')), 0) "
+                               "FROM events WHERE chan='bus'").fetchone()
         finally:
             con.close()
-        return sent + rings
-    got_a, got_b = count_events(data_a), count_events(data_b)
-    want_a, want_b = expect(data_a, sent_a), expect(data_b, sent_b)
+    (got_a, rings_a), (got_b, rings_b) = read(data_a), read(data_b)
+    want_a, want_b = sent_a + rings_a, sent_b + rings_b
     if got_a != want_a or got_b != want_b:
         raise SoakFail("counts", f"events A={got_a} sent+rings={want_a}; B={got_b} sent+rings={want_b}")
     check_acks(data_a)
@@ -485,9 +510,8 @@ def cycle(ctx, port, do_doorbell=True):
     if not do_doorbell:
         return
     # The answer and the info are unsolicited too, so they ring. Snapshot first.
-    open(ctx["fake"] + ".status", "w").write("working")
+    settle_rings(ctx)
     before = ring_count(ctx)
-    open(ctx["fake"] + ".status", "w").write("idle")
     send(ctx, port, ctx["tok_a"], ctx["slug_a"], "nudge", "idle")
     ctx["sent_a"] += 1
     lt._wait_until(lambda: ring_count(ctx) >= before + 1, 5, "the idle agent to be rung")
@@ -504,7 +528,14 @@ def cycle(ctx, port, do_doorbell=True):
     lt._wait_until(lambda: queued(ctx, nid), 5, "the working agent's nudge to be queued")
     if not queued(ctx, nid):
         raise SoakFail("doorbell-working", "the working agent's nudge is not in ring-queue.json")
+    # queued() is true as soon as a drain CLAIMS the row (the queue file is saved with the claimed batch),
+    # before that drain has read the agent's status. Flipping to idle right then can ring it before the
+    # snapshot below. Hold the agent working for several ring intervals (0.2 s): the row must stay
+    # queued and no ring may go out while it works.
     held = ring_count(ctx)
+    time.sleep(1.0)
+    if ring_count(ctx) != held or not queued(ctx, nid):
+        raise SoakFail("doorbell-working", "the nudge rang or left the queue while the agent was working")
     open(ctx["fake"] + ".status", "w").write("idle")
     lt._wait_until(lambda: ring_count(ctx) >= held + 1, 5, "the queued nudge to ring once")
     if ring_count(ctx) - held != 1:
