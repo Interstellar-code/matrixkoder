@@ -206,7 +206,7 @@ def render(rep):
 def status(rep):
     """The small stable shape hooks read (F.7 banner, Stop hook)."""
     n = {s.lower(): sum(1 for x in rep["rows"] if x["state"] == s) for s in STATES}
-    return {"ok": True, "run": rep["run"], "green": rep["green"], "red": n["red"], "stale": n["stale"],
+    return {"ok": True, "run": rep["run"], "fidelity": rep["fidelity"], "green": rep["green"], "red": n["red"], "stale": n["stale"],
             "deferred": n["deferred"], "manual": n["manual"], "rework": len(rep["rework"]),
             "due": len(rep["reconcile_due"]), "open_reasons": sum(len(r["reasons"]) for r in rep["risk"]),
             "rows": [{"id": x["id"], "evidence": x["evidence"], "state": x["state"]} for x in rep["rows"]]}
@@ -307,7 +307,8 @@ def self_test():
     assert [a["open"] for a in rep["actions"]] == sorted((a["open"] for a in rep["actions"]), reverse=True)
     # status --json is small and stable
     s = status(rep)
-    assert set(s) == {"ok", "run", "green", "red", "stale", "deferred", "manual", "rework", "due",
+    assert s["fidelity"] is True, s
+    assert set(s) == {"ok", "run", "fidelity", "green", "red", "stale", "deferred", "manual", "rework", "due",
                       "open_reasons", "rows"}, set(s)
     assert (s["red"], s["stale"], s["deferred"], s["manual"], s["due"], s["open_reasons"]) == (1, 2, 1, 1, 1, 1), s
     # a green run: all rows green/signed-off, nothing open, nothing due
@@ -328,6 +329,7 @@ def self_test():
     con.commit()
     leg = build(con, "old", None)
     assert [(x["id"], x["evidence"], x["state"]) for x in leg["rows"]] == [("L1", [], "MANUAL")], leg["rows"]
+    assert status(leg)["fidelity"] is False, "a legacy run says so in status"
     assert leg["green"] is True and "| NONE | MANUAL" in render(leg) and "legacy run" in render(leg)
     con.close()
     # read-only: the store file is byte-identical after a report

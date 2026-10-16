@@ -78,3 +78,55 @@ test('a missing mode (orchestrator) names the mode and still carries the run lin
   expect(section?.text).toContain('tasks:')
   expect(section?.text.length).toBeLessThanOrEqual(600)
 })
+
+// ---------- F.7 R2: the RED/REWORK/DUE banner ----------
+
+const bannerStatus = (over: Record<string, unknown> = {}): string =>
+  JSON.stringify({
+    ok: true, run: 'wfv2', fidelity: true, green: false, red: 1, stale: 0, deferred: 0, manual: 0, rework: 1, due: 2, open_reasons: 0,
+    rows: [{ id: 'F6.a1', evidence: [7], state: 'RED' }], ...over,
+  })
+
+const reportProc = (stdout: string, exitCode = 0) => (argv: readonly string[]) =>
+  argv.some(a => a.endsWith('mk-report.py'))
+    ? { value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    : undefined
+
+test('a fidelity run with open rows gets one banner line with counts and the first ids', { plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on, { process: reportProc(bannerStatus()) })
+  await $.session.start(sessionStart())
+  const { sections } = await $.prompt.compose(composeArgs())
+  const banner = sections.filter(s => s.id === 'matrixkoder:red')
+  expect(banner).toHaveLength(1)
+  expect(banner[0]?.text).toContain('red 1')
+  expect(banner[0]?.text).toContain('rework 1')
+  expect(banner[0]?.text).toContain('due 2')
+  expect(banner[0]?.text).toContain('F6.a1(RED)')
+  expect(sections.filter(s => s.id === 'matrixkoder:run')).toHaveLength(1) // the run section is untouched
+})
+
+test('no banner for a green run, a legacy run, a failed status read, or solo mode', { plugins: [worldFixtures] }, async ($, on) => {
+  let out = bannerStatus({ green: true, red: 0, rework: 0, due: 0, rows: [] })
+  let code = 0
+  mockFs(on, worldFiles())
+  mockWorld(on, { process: (argv) => reportProc(out, code)(argv) })
+  await $.session.start(sessionStart())
+  const banner = async () => (await $.prompt.compose(composeArgs())).sections.filter(s => s.id === 'matrixkoder:red')
+  expect(await banner()).toHaveLength(0) // green
+  out = bannerStatus({ fidelity: false })
+  expect(await banner()).toHaveLength(0) // legacy
+  out = 'garbage'
+  expect(await banner()).toHaveLength(0)
+  out = bannerStatus()
+  code = 2
+  expect(await banner()).toHaveLength(0) // reader failed
+})
+
+test('solo mode shows no banner', { plugins: [worldFixtures], options: { mode: 'solo' } }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on, { process: reportProc(bannerStatus()) })
+  await $.session.start(sessionStart())
+  const { sections } = await $.prompt.compose(composeArgs())
+  expect(sections.filter(s => s.id === 'matrixkoder:red')).toHaveLength(0)
+})

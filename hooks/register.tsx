@@ -4,6 +4,7 @@ import { registerGuards } from './guards'
 import { registerDashboard } from './dashboard'
 import { registerStatus } from './status'
 import { registerResume } from './resume'
+import { registerStopGuard } from './stop-guard'
 import { registerTools } from './tools'
 import { registerWake } from './wake'
 import { registerWizard } from './wizard'
@@ -13,6 +14,7 @@ export const register: Register = (on, options) => {
   registerDashboard(on, options)
   registerStatus(on, options)
   registerResume(on, options)
+  registerStopGuard(on, options)
   registerTools(on, options)
   registerWake(on, options)
   registerWizard(on, options)
