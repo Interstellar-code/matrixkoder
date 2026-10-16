@@ -1254,14 +1254,23 @@ def teardown(home, quiet=False):
 # --------------------------------------------------------------------------- audit (L10.14)
 
 # The names a v2 MK home may hold at each level. Anything else is drift and is NAMED, never ignored.
+# Legitimate on a real home today (L10.14 R2): config.json (kept until migrate-settings), bus-tokens.json and
+# bus-lanes/ (kept by root-cleanup for the old token place), projects.json (still READ as the last fallback),
+# backups/ (named backups by design, never scanned inside) and mk.db.bak-* (handled by prefix below).
 AUDIT_HOME_FILES = {mkpaths.ROOT_DB_NAME, mkpaths.ROOT_DB_NAME + "-wal", mkpaths.ROOT_DB_NAME + "-shm",
-                    mkpaths.MK_SETTINGS_NAME, "usage.json", "usage.json.lock"}
-AUDIT_HOME_DIRS = {mkpaths.TARGET_BUS_DIR, "locks", mkpaths.TARGET_PROJECTS_DIR, "inbox"}
+                    mkpaths.MK_SETTINGS_NAME, "usage.json", "usage.json.lock", "config.json",
+                    "bus-tokens.json", mkpaths.PROJECTS_JSON}
+AUDIT_HOME_DIRS = {mkpaths.TARGET_BUS_DIR, "locks", mkpaths.TARGET_PROJECTS_DIR, "inbox", "backups",
+                   mkpaths.BUS_LANES_DIR}
+AUDIT_BAK_PREFIX = mkpaths.ROOT_DB_NAME + ".bak-"
 # `.migrate.json` is mk-migrate's marker; `runs/` holds mk-state's per-project flock (runs/.lock)
 AUDIT_PROJECT_FILES = {mkpaths.ROOT_DB_NAME, mkpaths.ROOT_DB_NAME + "-wal", mkpaths.ROOT_DB_NAME + "-shm",
-                       mkpaths.PROJECT_YAML_NAME, mkpaths.PROJECT_YAML_NAME + ".lock", ".migrate.json"}
+                       mkpaths.PROJECT_YAML_NAME, mkpaths.PROJECT_YAML_NAME + ".lock", mkpaths.PROJECT_YAML_NAME + ".bak",
+                       ".migrate.json"}
 AUDIT_PROJECT_DIRS = {mkpaths.TARGET_PLANS_DIR, "archive", "runs"}
 AUDIT_PLAN_ENTRIES = {"plan.md", "assets", "archive", "runs"}
+# the root store also carries mk-catalog's C8 tables (agents, catalog_user, models): the catalog owns them
+AUDIT_ROOT_CATALOG_TABLES = {"agents", "catalog_user", "models"}   # optional: allowed when present, never required
 AUDIT_BUS_FILES = {"bus.json", "bus-tokens.json", "ring-queue.json", "bus.lock", "bus-ensure.lock",
                    "bus-tokens.lock"}
 LANE_TOKEN_RE = re.compile(r"^[0-9a-f]{64}\.json$")
@@ -1296,8 +1305,10 @@ def _audit_tree_rules(home):
     harness = os.path.isfile(_marker_path(home))     # a `run`-built tree also holds its marker + manifest
     extra = {MARKER, "manifest.json"} if harness else set()
     names, forbidden = [], []
-    lane_dirs = {n for n in _audit_scan(home)[1] if n.startswith("lane-")} if harness else set()  # `run`'s lane fixtures
-    _, top_dirs = _audit_names(home, "", AUDIT_HOME_FILES | extra, AUDIT_HOME_DIRS | lane_dirs, names)
+    top_files, top_scan_dirs = _audit_scan(home)
+    lane_dirs = {n for n in top_scan_dirs if n.startswith("lane-")} if harness else set()  # `run`'s lane fixtures
+    baks = {n for n in top_files if n.startswith(AUDIT_BAK_PREFIX)}
+    _, top_dirs = _audit_names(home, "", AUDIT_HOME_FILES | extra | baks, AUDIT_HOME_DIRS | lane_dirs, names)
     proj_root = mkpaths.TARGET_PROJECTS_DIR
     if proj_root in top_dirs:
         files, dirs = _audit_scan(os.path.join(home, proj_root))
@@ -1311,7 +1322,10 @@ def _audit_tree_rules(home):
                 for n in sorted(pl_files):
                     names.append(f"{rel}/plans/{n} (a file where only plan folders belong)")
                 for plan in sorted(pl_dirs):
-                    _audit_names(home, f"{rel}/plans/{plan}", {"plan.md"}, AUDIT_PLAN_ENTRIES - {"plan.md"}, names)
+                    # a plan folder also holds the plan's own design / input documents (any file); only a
+                    # stray FOLDER name is drift
+                    plan_files = _audit_scan(os.path.join(home, rel, "plans", plan))[0]
+                    _audit_names(home, f"{rel}/plans/{plan}", plan_files, AUDIT_PLAN_ENTRIES - {"plan.md"}, names)
     if mkpaths.TARGET_BUS_DIR in top_dirs:
         bus = mkpaths.TARGET_BUS_DIR
         _, bdirs = _audit_names(home, bus, AUDIT_BUS_FILES, {mkpaths.TARGET_LANES_DIR}, names)
@@ -1327,7 +1341,10 @@ def _audit_tree_rules(home):
         dirnames.sort()
         rel_dir = os.path.relpath(dirpath, home)
         depth = 0 if rel_dir == "." else rel_dir.count(os.sep) + 1
-        for n in sorted(dirnames) + sorted(filenames):
+        walked = sorted(dirnames) + sorted(filenames)
+        if rel_dir == ".":
+            dirnames[:] = [d for d in dirnames if d != "backups"]   # named backups: anything goes, never scanned inside
+        for n in walked:
             rel = n if rel_dir == "." else os.path.join(rel_dir, n)
             if depth < AUDIT_TREE_DEPTH:
                 tree.append(rel + ("/" if n in dirnames else ""))
@@ -1335,7 +1352,8 @@ def _audit_tree_rules(home):
             is_db = low.endswith((".db", ".sqlite", ".sqlite3"))
             ok_db = (n == mkpaths.ROOT_DB_NAME and (rel_dir == "." or os.path.dirname(rel_dir) == proj_root)
                      and rel_dir.count(os.sep) <= 1) or os.path.basename(rel_dir) == "archive"
-            if (n in AUDIT_FORBIDDEN and n not in dirnames) or (is_db and not ok_db):
+            allowed_root = rel_dir == "." and (n == mkpaths.PROJECTS_JSON or n.startswith(AUDIT_BAK_PREFIX))
+            if (n in AUDIT_FORBIDDEN and n not in dirnames and not allowed_root) or (is_db and not ok_db and not allowed_root):
                 forbidden.append(rel)
     return tree, names, sorted(set(forbidden))
 
@@ -1389,11 +1407,13 @@ def do_audit(home=None):
             r = os.path.relpath(p, home)
             return p if r.startswith("..") else r
 
-        def add(rid, what, bad, summary):
-            # `paths` keeps every offender; the one-line detail names the first ten
+        def add(rid, what, bad, summary, info=()):
+            # `paths` keeps every offender; the one-line detail names the first ten. `info` items are
+            # facts that do NOT fail the rule (history, alias folders), listed in `info` and the detail.
             more = f" (+{len(bad) - 10} more)" if len(bad) > 10 else ""
-            rules.append({"id": rid, "what": what, "pass": not bad, "paths": bad,
-                          "detail": summary + (f"; wrong {bad[:10]}{more}" if bad else "")})
+            rules.append({"id": rid, "what": what, "pass": not bad, "paths": bad, "info": list(info),
+                          "detail": summary + (f"; wrong {bad[:10]}{more}" if bad else "")
+                          + (f"; info: {'; '.join(info)}" if info else "")})
 
         tree, names, forbidden = _audit_tree_rules(home)
         add("A01", "only known files and folders at each level of the tree", names,
@@ -1410,6 +1430,7 @@ def do_audit(home=None):
         fresh_proj.close()
         root_db = mkpaths.db_in(home)
         bad_t, bad_v, bad_link, bad_over, bad_cnt, bad_tok = [], [], [], [], [], []
+        info_link, info_tok = [], []
         root = None
         if os.path.isfile(root_db):
             root = _audit_copy(root_db, tmp, "root")
@@ -1440,18 +1461,25 @@ def do_audit(home=None):
         for d in folders:
             full = os.path.realpath(os.path.join(proj_dir, d))
             if os.path.isdir(full) and os.path.realpath(mkpaths.db_in(full)) not in row_dbs:
-                bad_link.append(f"{mkpaths.TARGET_PROJECTS_DIR}/{d} has no projects row"
-                                + (" (holds a stray mk.db)" if os.path.isfile(mkpaths.db_in(full)) else ""))
+                if os.path.isfile(mkpaths.db_in(full)):
+                    bad_link.append(f"{mkpaths.TARGET_PROJECTS_DIR}/{d} has no projects row (holds a stray mk.db)")
+                else:
+                    # no row and no store: the root-cleanup alias folder, kept while bus tokens carry its slug
+                    info_link.append(f"{mkpaths.TARGET_PROJECTS_DIR}/{d} has no projects row and no store "
+                                     "(alias folder kept for bus tokens): WARN, not a failure")
         proj_cons = {}
         for i, db in enumerate(sorted(stores)):
             if not os.path.isfile(db):
                 continue
             name = rel(db)
             con = _audit_copy(db, tmp, f"p{i}")
-            proj_cons[db] = con
             have = _audit_tables(con)
             tables_out[name] = sorted(have)
             schema_out[name] = _audit_version(con)
+            if db not in row_dbs:
+                con.close()          # a store no projects row owns is A04's finding alone: A02/A03 audit owned stores
+                continue
+            proj_cons[db] = con
             for t in sorted(want_proj - have):
                 bad_t.append(f"{name} is missing table {t}")
             for t in sorted(have - want_proj):
@@ -1462,7 +1490,7 @@ def do_audit(home=None):
             have = set(tables_out["mk.db"])
             for t in sorted(want_root - have):
                 bad_t.append(f"mk.db is missing table {t}")
-            for t in sorted(have - want_root):
+            for t in sorted(have - want_root - AUDIT_ROOT_CATALOG_TABLES):
                 bad_t.append(f"mk.db has extra table {t}")
             if schema_out["mk.db"] != mkdb.ROOT_SCHEMA:
                 bad_v.append(f"mk.db schema_version {schema_out['mk.db']} != {mkdb.ROOT_SCHEMA}")
@@ -1471,7 +1499,7 @@ def do_audit(home=None):
         add("A03", "each DB carries the current schema_version", bad_v,
             ", ".join(f"{k}=v{v}" for k, v in sorted(schema_out.items())))
         add("A04", "every projects.db_path exists and every project folder has a row", bad_link,
-            f"{len(rows)} projects rows, {len(folders)} project folders")
+            f"{len(rows)} projects rows, {len(folders)} project folders", info_link)
         # overview rows <-> project plans, and the counts in them
         plans_of, counts_of = {}, {}
         for db, con in proj_cons.items():
@@ -1515,7 +1543,7 @@ def do_audit(home=None):
         data_dirs = {os.path.realpath(r["data_dir"]) for r in rows if r["data_dir"]}
         data_dirs |= {os.path.dirname(os.path.realpath(r["db_path"])) for r in rows if r["db_path"]}
         tok = os.path.join(home, mkpaths.TARGET_BUS_DIR, "bus-tokens.json")
-        n_tok, stale_lane = 0, 0
+        n_tok, stale_lane, gone_lane = 0, 0, 0
         if os.path.isfile(tok):
             try:
                 with open(tok, encoding="utf-8") as fh:
@@ -1529,10 +1557,16 @@ def do_audit(home=None):
                 proj = rec.get("project") if isinstance(rec, dict) else None
                 if proj not in slugs:
                     unknown[proj] = unknown.get(proj, 0) + 1
-            if unknown:
-                sample = sorted(str(k) for k in unknown)[:3]
-                bad_tok.append(f"bus/bus-tokens.json: {sum(unknown.values())} token(s) name {len(unknown)} "
-                               f"project slug(s) with no projects row, e.g. {sample}")
+            # tokens of slugs with no row are HISTORY (temp test projects) unless the slug names a live
+            # project folder: that folder has no row, which is real drift
+            live = {d for d in folders if os.path.isdir(os.path.join(proj_dir, d))}
+            for proj, n in sorted(unknown.items(), key=lambda kv: str(kv[0])):
+                if proj in live:
+                    bad_tok.append(f"bus/bus-tokens.json: {n} token(s) name slug {proj!r}, a live project folder with no projects row")
+            hist = sum(n for k, n in unknown.items() if k not in live)
+            if hist:
+                info_tok.append(f"{hist} historical bus token(s) name {sum(1 for k in unknown if k not in live)} slug(s) "
+                                "with no projects row and no folder (temp test projects)")
         lanes_dir = os.path.join(home, mkpaths.TARGET_BUS_DIR, mkpaths.TARGET_LANES_DIR)
         for n in sorted(os.listdir(lanes_dir)) if os.path.isdir(lanes_dir) else []:
             if not LANE_TOKEN_RE.match(n):
@@ -1543,19 +1577,27 @@ def do_audit(home=None):
                     data = (json.load(fh) or {}).get("data")
             except (ValueError, AttributeError):
                 data = None
-            if not data or os.path.realpath(data) not in data_dirs:
-                stale_lane = stale_lane + 1
+            if not data or os.path.realpath(data) in data_dirs:
+                continue
+            if os.path.isdir(data):
+                stale_lane = stale_lane + 1            # a data dir that exists on disk and no row owns
+            else:
+                gone_lane = gone_lane + 1              # its data dir is gone: history
         if stale_lane:
-            bad_tok.append(f"bus/lanes/: {stale_lane} lane token(s) name a data dir no projects row owns")
+            bad_tok.append(f"bus/lanes/: {stale_lane} lane token(s) point at an existing data dir no projects row owns")
+        if gone_lane:
+            info_tok.append(f"{gone_lane} lane token(s) point at a data dir that no longer exists (history)")
         add("A07", "every bus token's project resolves to a projects row", bad_tok,
-            f"{n_tok} tokens checked")
+            f"{n_tok} tokens checked", info_tok)
         for con in [root, *proj_cons.values()]:
             if con is not None:
                 con.close()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     after = _audit_snapshot(home)
-    changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+    # a live writer touches the -wal/-shm of its store: those are not the audit's doing, every other file is watched
+    changed = sorted(k for k in set(before) | set(after)
+                     if before.get(k) != after.get(k) and not k.endswith(("-wal", "-shm")))
     rules.sort(key=lambda r: r["id"])
     return {"ok": all(r["pass"] for r in rules), "home": home, "tree": tree, "tables": tables_out,
             "schema": schema_out, "rules": rules, "home_changed_during_audit": changed}
@@ -1747,10 +1789,19 @@ def _audit_mutations():
         finally:
             con.close()
 
-    @m("A07", "a bus token with an unknown project slug", "ghostslug")
+    @m("A07", "a bus token naming the slug of a live project folder with no row", "ghostslug")
     def _(f):
+        os.makedirs(os.path.join(f["home"], "projects", "ghostslug"))      # no store: A04 only warns
         with open(os.path.join(mkpaths.target_bus_dir(f["home"]), "bus-tokens.json"), "w", encoding="utf-8") as fh:
             json.dump({"tk9": {"project": "ghostslug", "token": "x"}}, fh)
+
+    @m("A07", "a lane token pointing at an existing data dir no row owns", "lane token(s)")
+    def _(f):
+        orphan = os.path.join(f["root"], "orphan-data")
+        os.makedirs(orphan)
+        token = mkpaths.target_lane_token(os.path.join(f["home"], "lane-orphan"), f["home"])
+        with open(token, "w", encoding="utf-8") as fh:
+            json.dump({"v": 1, "url": "http://127.0.0.1:1", "token": "x", "run": "r", "task": "T", "data": orphan}, fh)
 
     @m("A06", "a plan_summary count that disagrees with the project DB", "plan_summary[")
     def _(f):
@@ -1788,6 +1839,47 @@ def audit_self_test():
         _check({r["id"] for r in rep["rules"]} == {f"A0{i}" for i in range(1, 9)}, "rule ids drifted")
         _check("mk.db" in rep["tables"] and "projects/fix/mk.db" in rep["tables"], f"tables: {list(rep['tables'])}")
         _check(any(t.startswith("projects/fix/") for t in rep["tree"]), "tree lacks the project folder")
+    finally:
+        shutil.rmtree(f["root"], ignore_errors=True)
+    # L10.14 R2: a HEALTHY real home carries entries a fresh v2 home does not, and none of them is drift
+    f = _audit_fixture()
+    try:
+        home = f["home"]
+        for name in ("config.json", "projects.json"):
+            with open(os.path.join(home, name), "w") as fh:
+                fh.write("{}")
+        with open(os.path.join(home, "mk.db.bak-20261013"), "wb") as fh:
+            fh.write(b"bak")
+        os.makedirs(os.path.join(home, "bus-lanes"))
+        os.makedirs(os.path.join(home, "backups", "root-pre-x"))
+        for rel in ("root-pre-x/mk.db", "old.db", "root-pre-x/projects.json", "root-pre-x/lanes.json"):
+            with open(os.path.join(home, "backups", rel), "w") as fh:
+                fh.write("x")
+        with open(os.path.join(home, "bus-tokens.json"), "w") as fh:
+            fh.write("{}")
+        with open(os.path.join(mkpaths.target_project_dir(f["slug"], home), "project.yaml.bak"), "w") as fh:
+            fh.write("x")
+        alias = os.path.join(home, "projects", "pdeadbeef")            # no row, no store: an alias folder
+        os.makedirs(alias)
+        with open(os.path.join(alias, "project.yaml"), "w") as fh:
+            fh.write("x: 1\n")
+        tok = os.path.join(mkpaths.target_bus_dir(home), "bus-tokens.json")
+        with open(tok, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        doc["old1"] = {"project": "p0123456789abcdef", "token": "x"}   # history of a temp test project
+        with open(tok, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh)
+        gone = mkpaths.target_lane_token(os.path.join(home, "lane-gone"), home)
+        with open(gone, "w", encoding="utf-8") as fh:
+            json.dump({"v": 1, "url": "http://127.0.0.1:1", "token": "x", "run": "r", "task": "T",
+                       "data": os.path.join(f["root"], "deleted-data")}, fh)
+        rep = do_audit(home)
+        _check(rep["ok"], f"a healthy home with the legitimate extras fails: {[r for r in rep['rules'] if not r['pass']]}")
+        by = {r["id"]: r for r in rep["rules"]}
+        _check(by["A04"]["info"] and "alias" in by["A04"]["detail"], f"the alias folder is not reported as a warning: {by['A04']}")
+        _check(len(by["A07"]["info"]) == 2, f"history tokens are not counted as info: {by['A07']['info']}")
+        # a live writer touching a -wal/-shm during the audit is not a change the audit made
+        _check(do_audit(home)["home_changed_during_audit"] == [], "home_changed_during_audit is not empty on a quiet home")
     finally:
         shutil.rmtree(f["root"], ignore_errors=True)
     for rid, name, token, mutate in _audit_mutations():
