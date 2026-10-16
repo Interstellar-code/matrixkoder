@@ -205,7 +205,7 @@ loopback message bus connecting the orchestrator with isolated lane sessions.
 
 ## 3. Message Schema and Truth Model (Contract C2)
 
-- **B15.** Live location: the project DB `<home>/projects/<slug>/mk.db` — an `events` row with
+- **B15.** Live location: the project DB `<home>/projects/<slug>/mk-project.db` (`mk.db` on an existing home) — an `events` row with
   `chan='bus'` per message (C6, §9). At run end the run's messages and acks are archived,
   count-checked, to `<home>/projects/<slug>/plans/<plan>/runs/<run>/bus.jsonl` and leave the DB.
   (`<data>/runs/<run>/bus.jsonl` as the live file was the pre-`projects/` layout, until 2026-10-15.)
@@ -576,7 +576,7 @@ The following capabilities are explicitly omitted from protocol `v: 1` (`mk-bus/
 
 ## 9. The project store (C6)
 
-Messages live in the project DB, `<home>/projects/<slug>/mk.db` — the only source of truth.
+Messages live in the project DB, `<home>/projects/<slug>/mk-project.db` (`mk.db` on an existing home) — the only source of truth.
 `mkpaths.project_db(slug)` resolves it, so the bus follows every switch. Bus files live under
 `<home>/bus/` (C6, §10); no bus DB exists and no per-run `bus.jsonl` is written live.
 
@@ -611,7 +611,7 @@ Messages live in the project DB, `<home>/projects/<slug>/mk.db` — the only sou
 - **Connections.** One store connection per operation. No read transaction is held across an SSE
   write, so a slow SSE client cannot lock the store.
 - **Tokens.** A lane token is bound to one run and one task. It cannot write another run. Project
-  isolation is the project DB: a token minted for project A's `mk.db` is not in project B's token
+  isolation is the project DB: a token minted for project A's project DB is not in project B's token
   file, so it cannot open B's store. `/mk setup` creates the project DB.
 
 

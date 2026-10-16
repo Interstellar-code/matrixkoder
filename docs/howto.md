@@ -39,8 +39,8 @@ Steps 5 to 9 have text inputs, so they have no single-key hotkeys.
 On confirm the wizard writes:
 
 - `~/.matrixkoder/projects/<slug>/project.yaml` (today's `matrixkoder.yaml`) — your repo settings, the legacy layer under the project DB and `~/.matrixkoder/mk-settings.yaml`. If one exists you choose keep (default) or replace; replace backs the old file up to `.bak`.
-- `~/.matrixkoder/projects/<slug>/mk.db` — the project DB, the ONLY source of truth (`/mk setup` always creates it; file mode is dropped).
-- `~/.matrixkoder/mk.db` — the root DB, updated with this project's `slug, repo, data_dir, mode, db_path` row.
+- `~/.matrixkoder/projects/<slug>/mk-project.db` (existing projects keep `mk.db`) — the project DB, the ONLY source of truth (`/mk setup` always creates it; file mode is dropped).
+- `~/.matrixkoder/mk-overview.db` (an existing home keeps `mk.db`) — the root DB, updated with this project's `slug, repo, data_dir, mode, db_path` row.
 - The `projects/<slug>/plans/` and `projects/<slug>/plans/<plan>/runs/` folders under `~/.matrixkoder/`, as runs are created. The repo keeps no MK data, so no gitignore entry is written.
 
 Dashboard preferences (auto-open, chip, toasts, poll interval) are plugin settings — `claude plugin configure matrixkoder` — not files the wizard writes.
@@ -81,14 +81,16 @@ What lands on disk:
 
 | Path | Content |
 |---|---|
-| `~/.matrixkoder/mk.db` | Root DB, schema 3 — overview numbers and linkage only (`projects` with `slug, repo, data_dir, mode, db_path`; `plan_summary` with `project, plan, title, status, counts_json, live_run, updated`). No task rows, no events; `mkdb.py root-cleanup` removes older leftovers. |
-| `~/.matrixkoder/projects/<slug>/mk.db` | The project DB, schema 7 — the ONLY source of truth. Run/task/event, live bus rows, `settings`, `watch_cursors` and `lane_slots` live here. |
+| `~/.matrixkoder/mk-overview.db` (existing homes: `mk.db`) | Root DB, schema 3 — overview numbers and linkage only (`projects` with `slug, repo, data_dir, mode, db_path`; `plan_summary` with `project, plan, title, status, counts_json, live_run, updated`). No task rows, no events; `mkdb.py root-cleanup` removes older leftovers. |
+| `~/.matrixkoder/projects/<slug>/mk-project.db` (existing projects: `mk.db`) | The project DB, schema 7 — the ONLY source of truth. Run/task/event, live bus rows, `settings`, `watch_cursors` and `lane_slots` live here. |
 | `~/.matrixkoder/projects/<slug>/project.yaml` | Legacy settings layer from the wizard (today's `matrixkoder.yaml`); `agents.*`, `picks.*` and `helpers.*` stay here. |
 | `~/.matrixkoder/mk-settings.yaml` | Global settings layer (`mk-config.py set --global`). |
 | `~/.matrixkoder/inbox/<plan-id>/` | A plan and its docs dropped for `mk-plan.py import`, which moves `plan.md` to the plan file and the rest into the project's `assets/`. |
 | `~/.matrixkoder/projects/<slug>/plans/<plan>/plan.md`, `assets/`, `archive/` | The plan, its mockups/design files, and `plan-v1.md, plan-v2.md …`. |
 | `~/.matrixkoder/projects/<slug>/plans/<plan>/runs/<run>/` | `bus.jsonl` (bus messages, acks and bus artifacts, archived at run end). Briefs, reports and reviews are bus artifacts in the project DB; there are no run-folder copies. |
 | `~/.matrixkoder/bus/` | `bus.json`, `bus-tokens.json`, `lanes/<sha256(lane)>.json`, `ring-queue.json`. |
+
+A new home gets `mk-overview.db` and `mk-project.db`; a home that already has `mk.db` files keeps resolving them (the new name is used only when that file exists, and is never created beside an old one). To check a real home, run `python3 scripts/mk-e2e-layout.py audit`: it only reads (each store from a private copy) and exits 0 for a clean layout, 1 on drift. The repo's self-test also runs the C1 gate (`scripts/c1-gate.py check --baseline 0`, no MK file name spelled outside `mkpaths.py`), and `scripts/c1-gate.py canary` reruns the layout cycle with every `MK_NAME_*` file-name override set.
 
 `mk-state` writes no file run state: no `run.json`, `task.json`, `events.jsonl`, `board.md` or run-doc artifact. The board text is printed to stdout from the project DB. Read-only commands you can run yourself:
 
