@@ -4007,7 +4007,7 @@ def self_test():
         import sqlite3 as _z8sq
 
         def _root_counts(home_dir):
-            dbp = os.path.join(home_dir, "mk.db")
+            dbp = mkpaths.db_in(home_dir)
             if not os.path.exists(dbp):
                 return 0, 0
             con = _z8sq.connect(dbp)
@@ -4057,7 +4057,7 @@ def self_test():
         _status_write(a_data, _bare_env(a_home))
         a_root = os.path.join(a_home, ".matrixkoder")
         assert _root_counts(a_root) == (0, 0), _root_counts(a_root)
-        assert os.path.exists(os.path.join(a_data, "mk.db")), "the project write itself must land"
+        assert os.path.exists(mkpaths.db_in(a_data)), "the project write itself must land"
 
         # Z9: the SAME store WITH a plans row. Z8 only proved the status write leaves no projects
         # row; the root projection mkdb rebuilds on that path is the C3 plan_summary of import_history
@@ -4067,7 +4067,7 @@ def self_test():
         # caller's behaviour byte for byte.
         def _plan_dir(data_dir):
             """The project store mkpaths picks for a data dir (its own folder until migrated)."""
-            return os.path.join(data_dir, "mk.db")
+            return mkpaths.db_in(data_dir)
 
         def _z9(which):
             h = os.path.join(tmp, "z9-default-home-" + which)
@@ -4175,7 +4175,7 @@ def self_test():
         # L4: the DB is the record; no run.json / events.jsonl / board.md is written
         assert q1(data, "SELECT 1 x FROM runs WHERE id='r1'"), "no runs row for r1"
         assert n_events(data, "r1") >= 1, "no events rows for r1"
-        for f in ("run.json", "events.jsonl", "board.md", "index.json"):
+        for f in (mkpaths.RUN_DOC_NAME, mkpaths.EVENTS_DOC_NAME, mkpaths.BOARD_DOC_NAME, "index.json"):
             assert not os.path.exists(os.path.join(rdir, f)), f
         assert not os.path.exists(os.path.join(data, "runs", "index.json"))
         assert mk("run", "init", "--id", "r1", "--feature", "F", "--branch", "b", code=2)["ok"] is False
@@ -4204,7 +4204,7 @@ def self_test():
         assert r1["round"] == 1 and r1["brief"].endswith(os.path.join("tasks", "T1", "brief-r1.md"))
         after = mk("task", "get", "T1")["task"]
         assert after["status"] == before["status"] == "routed" and after["verdict"] == before["verdict"], after
-        assert os.path.exists(os.path.join(data, "mk.db")), "the store is always on"
+        assert os.path.exists(mkpaths.db_in(data)), "the store is always on"
         assert q1(data, "SELECT round FROM tasks WHERE run='r1' AND id='T1'")["round"] == 1
         r2 = mk("task", "round", "T1", "--kind", "fix", "--cause", "brief gap")
         assert r2["round"] == 2 and r2["review"].endswith("review-r2.md") and r2["report"].endswith("report-r2.md")
@@ -4382,7 +4382,7 @@ def self_test():
         assert mk("run", "stage", "-1", code=2)["ok"] is False
         for ttl in ("nan", "inf", "-5"):
             assert mk("lock", "take", "x", "--reason", "r", "--ttl-min", ttl, code=2)["ok"] is False
-        for f in ("run.json", "events.jsonl", "board.md", os.path.join("tasks", "T1", "task.json")):
+        for f in (mkpaths.RUN_DOC_NAME, mkpaths.EVENTS_DOC_NAME, mkpaths.BOARD_DOC_NAME, os.path.join("tasks", "T1", mkpaths.TASK_DOC_NAME)):
             assert not os.path.exists(os.path.join(rdir, f)), f  # L4 writes no view file
         # a torn event row in the store never crashes render (was a torn events.jsonl line)
         con = DB.open_project(H, STORE_PROJECT_FALLBACK, data_dir=data)
@@ -5649,9 +5649,9 @@ def store_self_test(tmp, env):
     mk("task", "add", "--root", "--id", "T1", "--title", "One")
     mk("task", "set", "T1", "status=routed")
     mk("event", "--task", "T1", "--type", "note", "--text", "hello")
-    assert os.path.exists(os.path.join(data, "mk.db")), "the store is always on: mk.db must exist"
+    assert os.path.exists(mkpaths.db_in(data)), "the store is always on: mk.db must exist"
     assert not os.path.exists(os.path.join(data, "runs-legacy"))
-    for rel in ("runs/s1/run.json", "runs/s1/events.jsonl", "runs/s1/board.md", "runs/index.json"):
+    for rel in (f"runs/s1/{mkpaths.RUN_DOC_NAME}", f"runs/s1/{mkpaths.EVENTS_DOC_NAME}", f"runs/s1/{mkpaths.BOARD_DOC_NAME}", "runs/index.json"):
         assert not os.path.exists(os.path.join(data, rel)), rel  # no view file is written
 
     # `store enable` is a no-op now: it reports on and imports nothing.
@@ -5715,7 +5715,7 @@ def store_self_test(tmp, env):
            [(e["task"], e["kind"], e["text"]) for e in be], (ae, be)
     assert (ar["status"], ar["feature"] if "feature" in ar else None) == \
            (br["status"], br["feature"] if "feature" in br else None), (ar, br)
-    for rel in ("runs/s2/run.json", "runs/s2/events.jsonl", "runs/s2/board.md", "runs/index.json"):
+    for rel in (f"runs/s2/{mkpaths.RUN_DOC_NAME}", f"runs/s2/{mkpaths.EVENTS_DOC_NAME}", f"runs/s2/{mkpaths.BOARD_DOC_NAME}", "runs/index.json"):
         assert not os.path.exists(os.path.join(data, rel)), rel
         assert not os.path.exists(os.path.join(twin, rel)), rel
 
@@ -5828,7 +5828,7 @@ def store_self_test(tmp, env):
     saved_rows = rows_of(data, "s2")
     mk("export-legacy", "--run", "s2")
     assert rows_of(data, "s2") == saved_rows  # nothing changed
-    for rel in ("runs/s2/run.json", "runs/s2/events.jsonl", "runs/s2/board.md", "runs/index.json"):
+    for rel in (f"runs/s2/{mkpaths.RUN_DOC_NAME}", f"runs/s2/{mkpaths.EVENTS_DOC_NAME}", f"runs/s2/{mkpaths.BOARD_DOC_NAME}", "runs/index.json"):
         assert not os.path.exists(os.path.join(data, rel)), rel  # still no view file
 
     # plan-path fallback: a missing plan file resolves through plans.archived_path
@@ -6011,7 +6011,7 @@ def store_self_test(tmp, env):
         cc.close()
     # a missing view never existed to repair: the store is the read source
     assert once(["run", "get", "--id", "c1"], corrupt)["run"]["id"] == "c1"
-    for rel in ("runs/c1/run.json", "runs/c1/board.md", "runs/c1/events.jsonl"):
+    for rel in (f"runs/c1/{mkpaths.RUN_DOC_NAME}", f"runs/c1/{mkpaths.BOARD_DOC_NAME}", f"runs/c1/{mkpaths.EVENTS_DOC_NAME}"):
         assert not os.path.exists(os.path.join(corrupt, rel)), rel
 
     # L7.3: the root card and sync watermark are gone, so this checks the surviving facts —
@@ -6060,8 +6060,8 @@ def store_self_test(tmp, env):
     r = subprocess.run([sys.executable, os.path.abspath(__file__), "sync", "--data", off],
                        capture_output=True, text=True, env=d3env)
     assert r.returncode == 0 and json.loads(r.stdout)["store"] == "on", r.stdout
-    assert os.path.exists(os.path.join(off, "mk.db"))  # the store is always on
-    for rel in ("runs/o1/run.json", "runs/index.json"):
+    assert os.path.exists(mkpaths.db_in(off))  # the store is always on
+    for rel in (f"runs/o1/{mkpaths.RUN_DOC_NAME}", "runs/index.json"):
         assert not os.path.exists(os.path.join(off, rel)), rel
     # a resolve with no root store must not create one
     bare = os.path.join(tmp, "bare-home")
@@ -6071,7 +6071,7 @@ def store_self_test(tmp, env):
                        cwd=repo, capture_output=True, text=True,
                        env=dict(env, MATRIXKODER_HOME=bare, MK_HOME=bare, HOME=os.path.join(tmp, "nowhere")))
     assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
-    assert not os.path.exists(os.path.join(bare, "mk.db")), "resolve created a root store"
+    assert not os.path.exists(mkpaths.db_in(bare)), "resolve created a root store"
 
     # resolve order: root projects table beats projects.json; --data and the env beat both
     reg_home = os.path.join(tmp, "reg-home")
@@ -6109,7 +6109,7 @@ def store_self_test(tmp, env):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
-    assert os.path.exists(os.path.join(reg_home, "mk.db"))
+    assert os.path.exists(mkpaths.db_in(reg_home))
     # the CLI form the wizard calls: root row yes, projects.json no
     cli_home = os.path.join(tmp, "cli-reg-home")
     r = subprocess.run([sys.executable, os.path.abspath(__file__), "project", "register", "--slug", "clireg",
@@ -6131,7 +6131,7 @@ def store_self_test(tmp, env):
                 assert type(e).__name__ == "Fail", (bad, type(e), e)
                 assert "slug" in str(e), (bad, e)
         assert not os.path.exists(os.path.join(slug_home, "projects.json"))
-        assert not os.path.exists(os.path.join(slug_home, "mk.db"))
+        assert not os.path.exists(mkpaths.db_in(slug_home))
         assert os.listdir(slug_home) == []
     finally:
         os.environ["MK_HOME"] = reg_home
@@ -6290,7 +6290,7 @@ def store_self_test(tmp, env):
     for i in range(20):
         once(["task", "add", "--root", "--id", f"P{i}", "--title", f"p{i}", "--run", "pr"], par, parenv)
     once(["store", "enable"], par, parenv)
-    assert os.path.exists(os.path.join(par, "mk.db"))
+    assert os.path.exists(mkpaths.db_in(par))
     script = os.path.abspath(__file__)
     procs = []
     for side in (0, 1):
@@ -6362,7 +6362,7 @@ def store_self_test(tmp, env):
     once(["task", "set", "BB", "status=building", "--run", "o1"], order)  # an ordinary write
     post_ids = [t["id"] for t in once(["run", "get", "--id", "o1"], order)["run"]["tasks"]]
     assert post_ids == ["BA", "BA.1", "BA.2", "BB"], post_ids
-    for rel in ("runs/o1/run.json", "runs/o1/board.md", "runs/index.json"):
+    for rel in (f"runs/o1/{mkpaths.RUN_DOC_NAME}", f"runs/o1/{mkpaths.BOARD_DOC_NAME}", "runs/index.json"):
         assert not os.path.exists(os.path.join(order, rel)), rel
 
     # L4: `store enable` no longer sweeps mk-enable-* dirs (the enable path is gone; the store is
@@ -6518,7 +6518,7 @@ def no_file_views_self_test(tmp, env):
         assert r.returncode == code, (args, r.returncode, r.stdout, r.stderr)
         return json.loads(lines[0])
 
-    VIEWS = ("run.json", "task.json", "events.jsonl", "board.md", "index.json")
+    VIEWS = (mkpaths.RUN_DOC_NAME, mkpaths.TASK_DOC_NAME, mkpaths.EVENTS_DOC_NAME, mkpaths.BOARD_DOC_NAME, "index.json")
 
     def view_roots():
         roots = [os.path.join(data, "runs")]              # today: <data>/runs/**
@@ -6614,11 +6614,11 @@ def cross_run_dep_from_db_self_test(tmp, env):
     mk("task", "add", "--root", "--id", "A2", "--title", "Waits", "--deps", "ra:R", "--run", "rb")
     assert mk("task", "get", "A2", "--run", "rb")["task"]["ready"] is False
     # remove any file view the other run might still have: the DB is the only source now
-    for name in ("run.json", "task.json"):
+    for name in (mkpaths.RUN_DOC_NAME, mkpaths.TASK_DOC_NAME):
         p = os.path.join(data, "runs", "ra", name)
         if os.path.exists(p):
             os.remove(p)
-    taskjson = os.path.join(data, "runs", "ra", "tasks", "R", "task.json")
+    taskjson = os.path.join(data, "runs", "ra", "tasks", "R", mkpaths.TASK_DOC_NAME)
     if os.path.exists(taskjson):
         os.remove(taskjson)
     mk("task", "set", "R", "status=merged", "--run", "ra")   # writes ra only
@@ -6943,13 +6943,13 @@ def gate_run_self_test(tmp, env):
     assert _gate_run({"cmd": "echo ok"}, repo, ["touch"]) == ("pass", "")  # unbanned unchanged
     bdata = os.path.join(tmp, "bdata")
     os.makedirs(bdata)
-    with open(os.path.join(bdata, "matrixkoder.yaml"), "w") as f:
+    with open(mkpaths.legacy_yaml(bdata), "w") as f:
         f.write("banned_commands:\n  - npm run dev   # servers\n  - \"touch\"\nqa:\n  start: x\n")
     assert banned_commands(bdata) == ["npm run dev", "touch"], banned_commands(bdata)
-    with open(os.path.join(bdata, "matrixkoder.yaml"), "w") as f:
+    with open(mkpaths.legacy_yaml(bdata), "w") as f:
         f.write("banned_commands: [\"npm run dev\", 'touch']\n")
     assert banned_commands(bdata) == ["npm run dev", "touch"]
-    with open(os.path.join(bdata, "matrixkoder.yaml"), "w") as f:
+    with open(mkpaths.legacy_yaml(bdata), "w") as f:
         f.write("banned_commands: []\n")
     assert banned_commands(bdata) == []
 
@@ -7466,7 +7466,7 @@ def migrated_store_self_test(tmp, env):
     run(["run", "init", "--id", "r1", "--feature", "F", "--branch", "b1", *d], m, cwd=repo)
     run(["task", "add", "--root", "--id", "P1.1", "--title", "one", "--run", "r1", *d], m, cwd=repo)
     run(["store", "enable", *d], m, cwd=repo)
-    old_db = os.path.join(data, "mk.db")
+    old_db = mkpaths.db_in(data)
     new_db = mkpaths.target_project_db("fixture", home)
     assert os.path.exists(old_db), "mk-state store enable wrote no <data>/mk.db"
     rc = subprocess.run([sys.executable, os.path.join(here, "mk-migrate.py"),
@@ -7511,7 +7511,7 @@ def migrated_store_self_test(tmp, env):
     run(["store", "enable", "--data", bdata], bm, cwd=brepo)
     out = run(["task", "set", "BT", "status=building", "--run", "b1", "--data", bdata], bm, cwd=brepo)
     assert out["task"]["status"] == "building", out
-    assert os.path.exists(os.path.join(bdata, "mk.db")), "pre-migration write left the legacy store"
+    assert os.path.exists(mkpaths.db_in(bdata)), "pre-migration write left the legacy store"
     assert not os.path.exists(os.path.join(bhome, "projects")), "pre-migration created a projects/ folder"
     bcon = db.open_project(H, STORE_PROJECT_FALLBACK, data_dir=bdata)
     try:
@@ -7534,14 +7534,14 @@ def migrated_store_self_test(tmp, env):
     run(["store", "enable", "--data", cdata], ce, cwd=crepo)
     assert run(["task", "set", "CT", "status=building", "--run", "c1", "--data", cdata],
                ce, cwd=crepo)["task"]["status"] == "building"
-    assert os.path.exists(os.path.join(cdata, "mk.db")), "a missing root lost the fallback store"
+    assert os.path.exists(mkpaths.db_in(cdata)), "a missing root lost the fallback store"
 
     # case (c2): a corrupt root store must not raise — fall back to <d>/mk.db.
     korrupt = os.path.join(base, "korrupt-home")
     kdata = os.path.join(base, "krepo", ".matrixkoder")
     os.makedirs(os.path.dirname(kdata), exist_ok=True)
     os.makedirs(korrupt, exist_ok=True)
-    with open(os.path.join(korrupt, "mk.db"), "wb") as f:
+    with open(mkpaths.db_in(korrupt), "wb") as f:
         f.write(b"this is not a sqlite database")
     km = migrated_env(korrupt)
     run(["run", "init", "--id", "k1", "--feature", "K", "--branch", "kk", "--data", kdata], km)
@@ -7549,14 +7549,14 @@ def migrated_store_self_test(tmp, env):
     run(["store", "enable", "--data", kdata], km)
     assert run(["task", "set", "KT", "status=building", "--run", "k1", "--data", kdata],
                km)["task"]["status"] == "building"
-    assert os.path.exists(os.path.join(kdata, "mk.db")), "a corrupt root lost the fallback store"
+    assert os.path.exists(mkpaths.db_in(kdata)), "a corrupt root lost the fallback store"
 
     # case (c3): a root store at an OLDER schema (no projects.db_path) — same safe fallback.
     ohome = os.path.join(base, "old-home")
     odata = os.path.join(base, "orepo", ".matrixkoder")
     os.makedirs(os.path.dirname(odata), exist_ok=True)
     os.makedirs(ohome, exist_ok=True)
-    old_root = _sq.connect(os.path.join(ohome, "mk.db"))
+    old_root = _sq.connect(mkpaths.db_in(ohome))
     try:
         old_root.execute("CREATE TABLE projects(slug TEXT, name TEXT, repo TEXT, data_dir TEXT)")
         old_root.execute("INSERT INTO projects(slug, name, repo, data_dir) VALUES (?,?,?,?)",
@@ -7570,7 +7570,7 @@ def migrated_store_self_test(tmp, env):
     run(["store", "enable", "--data", odata], om)
     assert run(["task", "set", "OT", "status=building", "--run", "o1", "--data", odata],
                om)["task"]["status"] == "building"
-    assert os.path.exists(os.path.join(odata, "mk.db")), "an old-schema root lost the fallback store"
+    assert os.path.exists(mkpaths.db_in(odata)), "an old-schema root lost the fallback store"
     assert not os.path.exists(os.path.join(ohome, "projects")), "an old-schema root created a projects/ folder"
 
 

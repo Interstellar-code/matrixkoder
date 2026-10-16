@@ -2380,7 +2380,7 @@ def self_test():
         # L4 (C4): there is no runs/<run>/run.json or events.jsonl any more — the store's
         # tasks/events rows are the record. These harness readers open it read-only.
         def store_read(sql, params=()):
-            path = os.path.join(data, "mk.db")
+            path = mkpaths.db_in(data)
             if not os.path.isfile(path):
                 return []
             con = sqlite3.connect("file:%s?mode=ro" % path, uri=True)
@@ -3133,11 +3133,11 @@ def self_test():
         # fresh_session: new.
         datanew = os.path.join(tmp, "data-new")
         os.makedirs(datanew)
-        shutil.copy(os.path.join(HERE, "fixtures", "matrixkoder.yaml"),
-                    os.path.join(datanew, "matrixkoder.yaml"))
+        shutil.copy(os.path.join(HERE, "fixtures", mkpaths.LEGACY_YAML_NAME),
+                    mkpaths.legacy_yaml(datanew))
         datasame = os.path.join(tmp, "data-same")
         os.makedirs(datasame)
-        with open(os.path.join(datasame, "matrixkoder.yaml"), "w") as f:
+        with open(mkpaths.legacy_yaml(datasame), "w") as f:
             f.write("session:\n  fresh_session: same\n")
         dataempty = os.path.join(tmp, "data-empty")
         os.makedirs(dataempty)
@@ -3336,7 +3336,7 @@ def self_test():
         # (c) a data dir whose yaml says bus.enabled false: no bus command at all, arm or disarm
         databus = os.path.join(tmp, "data-busoff")
         os.makedirs(databus)
-        with open(os.path.join(databus, "matrixkoder.yaml"), "w") as f:
+        with open(mkpaths.legacy_yaml(databus), "w") as f:
             f.write("bus:\n  enabled: false\n")
 
         def mks_in(dir_, *args):
@@ -3405,7 +3405,7 @@ def self_test():
         # --- the project store (D5A.2): verdict_for reads the store inside the per-lane lock ---
         # L4 (C4): the store is always on — every mk-state write above created and used mk.db
         # (no file views, no `store enable` gate any more).
-        assert os.path.getsize(os.path.join(data, "mk.db")) > 0
+        assert os.path.getsize(mkpaths.db_in(data)) > 0
         # store-first: no lane status file, the tasks row + report artifact decide -> DONE, source=store
         mks("task", "add", "--root", "--id", "S1", "--title", "store")
         mks("task", "set", "S1", "status=building")
@@ -3663,7 +3663,7 @@ def self_test():
             # E3 R2: lane and data are quoted, so a space or metacharacters stay one argument
             odd = os.path.join(tmp, "data dir;$(touch x)")
             os.makedirs(odd, exist_ok=True)
-            open(os.path.join(odd, "mk.db"), "w").write("")
+            open(mkpaths.db_in(odd), "w").write("")
             open(os.path.join(tmp, "pane_list_out.txt"), "w").write(json.dumps(
                 {"result": {"panes": [{"pane_id": pane_of("NB"), "agent_status": "idle"}]}}) + "\n")
             n0 = len(prompt_calls())
@@ -3719,7 +3719,7 @@ def self_test():
             import sqlite3
             # read-only (mode=ro): the single-writer rule lets only mkdb.py open SQLite for
             # writing (mkdb.py _single_writer), and this helper only reads a column
-            con = sqlite3.connect("file:%s?mode=ro" % os.path.join(data, "mk.db"), uri=True)
+            con = sqlite3.connect("file:%s?mode=ro" % mkpaths.db_in(data), uri=True)
             try:
                 row = con.execute("SELECT route_json FROM tasks WHERE run=? AND id=?",
                                   ("r1", tid)).fetchone()
@@ -3902,7 +3902,7 @@ def self_test():
         os.environ["MATRIXKODER_HOME"] = _home
         os.environ.pop("MK_BUS_DIR", None)
         try:
-            assert os.path.isfile(os.path.join(data, "mk.db")), "the store must exist here"
+            assert os.path.isfile(mkpaths.db_in(data)), "the store must exist here"
             assert bus_dir_for(data) == mkpaths.target_bus_dir(), bus_dir_for(data)
             assert bus_is_up(data) is False
             os.makedirs(mkpaths.target_bus_dir(), exist_ok=True)
