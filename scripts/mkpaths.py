@@ -34,17 +34,34 @@ import sys
 import tempfile
 
 DEFAULT_HOME = "~/.matrixkoder"
-ROOT_DB_NAME = "mk.db"
+
+
+def _name(env, default):
+    """A file-name constant: `default`, or $<env> when set. The override exists for the rename canary
+    (c1-gate.py canary): proof that no caller spells a store/run file name outside this module."""
+    v = os.environ.get(env)
+    if v is None or v == "":
+        return default
+    if "/" in v or "\\" in v or v in (".", "..") or v.startswith("."):
+        raise RuntimeError(f"{env}={v!r} is not a plain file name")
+    return v
+
+
+ROOT_DB_NAME = _name("MK_NAME_ROOT_DB", "mk.db")
 PROJECTS_JSON = "projects.json"
 USAGE_LEDGER = "usage.json"
-MK_SETTINGS_NAME = "mk-settings.yaml"
+MK_SETTINGS_NAME = _name("MK_NAME_SETTINGS", "mk-settings.yaml")
 # L10.12a: the file names a caller joins onto a folder it already holds (no migrated lookup, no home rule)
 DB_FILE_NAMES = (ROOT_DB_NAME, ROOT_DB_NAME + "-wal", ROOT_DB_NAME + "-shm")
-LEGACY_YAML_NAME = "matrixkoder.yaml"
-PROJECT_YAML_NAME = "project.yaml"
-RUN_DOC_NAME, TASK_DOC_NAME, EVENTS_DOC_NAME, BOARD_DOC_NAME = "run.json", "task.json", "events.jsonl", "board.md"
+LEGACY_YAML_NAME = _name("MK_NAME_LEGACY_YAML", "matrixkoder.yaml")
+PROJECT_YAML_NAME = _name("MK_NAME_PROJECT_YAML", "project.yaml")
+RUN_DOC_NAME = _name("MK_NAME_RUN_DOC", "run.json")
+TASK_DOC_NAME = _name("MK_NAME_TASK_DOC", "task.json")
+EVENTS_DOC_NAME = _name("MK_NAME_EVENTS_DOC", "events.jsonl")
+BOARD_DOC_NAME = _name("MK_NAME_BOARD_DOC", "board.md")
 VIEW_DOC_NAMES = (RUN_DOC_NAME, TASK_DOC_NAME, EVENTS_DOC_NAME, BOARD_DOC_NAME)  # the pre-C4 file views
-LANES_NAME, CURSORS_NAME = "lanes.json", "watch-cursors.json"
+LANES_NAME = _name("MK_NAME_LANES", "lanes.json")
+CURSORS_NAME = _name("MK_NAME_CURSORS", "watch-cursors.json")
 INBOX_DIR = "inbox"
 LANE_BUS_FILE = ".matrixkoder-bus.json"
 BUS_LANES_DIR = "bus-lanes"
@@ -588,19 +605,19 @@ def task_dir(data, run, task):
 
 
 def run_doc(data, run):
-    return os.path.join(run_dir(data, run), "run.json")
+    return os.path.join(run_dir(data, run), RUN_DOC_NAME)
 
 
 def task_doc(data, run, task):
-    return os.path.join(task_dir(data, run, task), "task.json")
+    return os.path.join(task_dir(data, run, task), TASK_DOC_NAME)
 
 
 def events_doc(data, run):
-    return os.path.join(run_dir(data, run), "events.jsonl")
+    return os.path.join(run_dir(data, run), EVENTS_DOC_NAME)
 
 
 def board_doc(data, run):
-    return os.path.join(run_dir(data, run), "board.md")
+    return os.path.join(run_dir(data, run), BOARD_DOC_NAME)
 
 
 def runs_index(data):
@@ -642,7 +659,7 @@ def project_yaml(data):
     slug = migrated_slug(data=data)
     if slug:
         return target_project_yaml(slug)
-    return os.path.join(data, "matrixkoder.yaml")
+    return os.path.join(data, LEGACY_YAML_NAME)
 
 
 def project_yaml_lock(data):
@@ -652,7 +669,7 @@ def project_yaml_lock(data):
 
 def lanes_file(data):
     """<data>/lanes.json — the lane-slot registry (a project-level file, not lane data)."""
-    return os.path.join(data, "lanes.json")
+    return os.path.join(data, LANES_NAME)
 
 
 def lanes_lock(data):
@@ -839,8 +856,8 @@ def watch_cursors(data):
     """The orchestrator bus watch cursors (0600): projects/<slug>/watch-cursors.json for a
     migrated project (C6, mkpaths.project_folder), else today's <data>/watch-cursors.json.
     The pre-migration file is read once and copied over, never deleted."""
-    return _take_over(os.path.join(project_folder(data), "watch-cursors.json"),
-                      os.path.join(data, "watch-cursors.json"))
+    return _take_over(os.path.join(project_folder(data), CURSORS_NAME),
+                      os.path.join(data, CURSORS_NAME))
 
 
 def nudge_state(data):
@@ -869,11 +886,11 @@ def target_project_db(slug, arg=None):
 
 def target_project_yaml(slug, arg=None):
     """Today's matrixkoder.yaml, under the project folder."""
-    return os.path.join(target_project_dir(slug, arg), "project.yaml")
+    return os.path.join(target_project_dir(slug, arg), PROJECT_YAML_NAME)
 
 
 def target_watch_cursors(slug, arg=None):
-    return os.path.join(target_project_dir(slug, arg), "watch-cursors.json")
+    return os.path.join(target_project_dir(slug, arg), CURSORS_NAME)
 
 
 def target_bus_dir(arg=None):
@@ -1135,7 +1152,7 @@ def self_test():
         """L10.1: the two new pure paths (no mkdir, no write) and their id check."""
         _clear_home_env()
         os.environ["MK_HOME"] = tmp_home
-        _check(mk_settings() == os.path.join(tmp_home, "mk-settings.yaml"), mk_settings())
+        _check(mk_settings() == os.path.join(tmp_home, MK_SETTINGS_NAME), mk_settings())
         _check(mk_settings(tmp_home) == mk_settings(), mk_settings(tmp_home))
         _check(inbox_dir() == os.path.join(tmp_home, "inbox"), inbox_dir())
         _check(inbox_dir(plan_id="p1") == os.path.join(tmp_home, "inbox", "p1"), inbox_dir(plan_id="p1"))
@@ -1152,18 +1169,18 @@ def self_test():
     def t_names():
         """L10.12a: the folder-literal helpers join exactly what the call sites used to spell."""
         d = os.path.join(root, "names")
-        _check(db_in(d) == os.path.join(d, "mk.db"), db_in(d))
-        _check(db_files_in(d) == [os.path.join(d, n) for n in ("mk.db", "mk.db-wal", "mk.db-shm")], db_files_in(d))
-        _check(legacy_yaml(d) == os.path.join(d, "matrixkoder.yaml"), legacy_yaml(d))
-        _check(project_yaml_in(d) == os.path.join(d, "project.yaml"), project_yaml_in(d))
-        _check(legacy_lanes(d) == os.path.join(d, "lanes.json") == lanes_file(d), legacy_lanes(d))
-        _check(legacy_cursors(d) == os.path.join(d, "watch-cursors.json"), legacy_cursors(d))
+        _check(db_in(d) == os.path.join(d, ROOT_DB_NAME), db_in(d))
+        _check(db_files_in(d) == [os.path.join(d, n) for n in (ROOT_DB_NAME, ROOT_DB_NAME + "-wal", ROOT_DB_NAME + "-shm")], db_files_in(d))
+        _check(legacy_yaml(d) == os.path.join(d, LEGACY_YAML_NAME), legacy_yaml(d))
+        _check(project_yaml_in(d) == os.path.join(d, PROJECT_YAML_NAME), project_yaml_in(d))
+        _check(legacy_lanes(d) == os.path.join(d, LANES_NAME) == lanes_file(d), legacy_lanes(d))
+        _check(legacy_cursors(d) == os.path.join(d, CURSORS_NAME), legacy_cursors(d))
         r, t = os.path.join(d, "runs", "r1"), os.path.join(d, "runs", "r1", "tasks", "T")
         _check(legacy_run_dir(d, "r1") == r, legacy_run_dir(d, "r1"))
-        _check(run_doc_in(r) == os.path.join(r, "run.json") and events_doc_in(r) == os.path.join(r, "events.jsonl")
-               and board_doc_in(r) == os.path.join(r, "board.md") and task_doc_in(t) == os.path.join(t, "task.json"), "docs")
-        _check(VIEW_DOC_NAMES == ("run.json", "task.json", "events.jsonl", "board.md"), VIEW_DOC_NAMES)
-        _check((LANES_NAME, CURSORS_NAME) == ("lanes.json", "watch-cursors.json"), "names")
+        _check(run_doc_in(r) == os.path.join(r, RUN_DOC_NAME) and events_doc_in(r) == os.path.join(r, EVENTS_DOC_NAME)
+               and board_doc_in(r) == os.path.join(r, BOARD_DOC_NAME) and task_doc_in(t) == os.path.join(t, TASK_DOC_NAME), "docs")
+        _check(VIEW_DOC_NAMES == (RUN_DOC_NAME, TASK_DOC_NAME, EVENTS_DOC_NAME, BOARD_DOC_NAME), VIEW_DOC_NAMES)
+        _check((LANES_NAME, CURSORS_NAME) == (LANES_NAME, CURSORS_NAME), "names")
         _check(not os.path.exists(d), "a path helper created a folder")
 
     def t_home(tmp_home):
@@ -1241,7 +1258,7 @@ def self_test():
         _check(plan_dir(data, "p1") == os.path.join(data, "plans", "p1"), plan_dir(data, "p1"))
         _check(plan_archives_dir(data) == os.path.join(data, "plans", "archive"),
                plan_archives_dir(data))
-        _check(watch_cursors(data) == os.path.join(data, "watch-cursors.json"), watch_cursors(data))
+        _check(watch_cursors(data) == os.path.join(data, CURSORS_NAME), watch_cursors(data))
         _check(usage_ledger() == os.path.join(tmp_home, "usage.json"), usage_ledger())
         _check(nudge_state(data) == os.path.join(data, "nudge-state.json"), nudge_state(data))
         os.environ["MK_HOME"] = tmp_home
@@ -1256,9 +1273,9 @@ def self_test():
         os.chdir(repo)
         _seed_root(tmp_home, "matrixkoder", repo, ".matrixkoder")
         data = os.path.realpath(os.path.join(repo, ".matrixkoder"))
-        _check(project_db(slug="matrixkoder") == os.path.join(data, "mk.db"),
+        _check(project_db(slug="matrixkoder") == os.path.join(data, ROOT_DB_NAME),
                project_db(slug="matrixkoder"))
-        _check(project_db(data=data) == os.path.join(data, "mk.db"), project_db(data=data))
+        _check(project_db(data=data) == os.path.join(data, ROOT_DB_NAME), project_db(data=data))
         _check(project_db(slug="nope") is None, project_db(slug="nope"))
         _check(project_slug_of(data) == "matrixkoder", project_slug_of(data))
         _check(project_slug_of(os.path.join(root, "nowhere")) is None, project_slug_of("x"))
@@ -1285,14 +1302,14 @@ def self_test():
             con.execute("INSERT INTO projects(slug, name, repo, data_dir, mode, db_path)"
                         " VALUES (?,?,?,?,?,?)",
                         ("matrixkoder", "matrixkoder", repo, ".matrixkoder", "home",
-                         os.path.join(canon, "mk.db")))
+                         os.path.join(canon, ROOT_DB_NAME)))
             con.commit()
         finally:
             con.close()
         _check(project_slug_of(data) == "matrixkoder", project_slug_of(data))
         _check(project_folder(data) == canon, project_folder(data))
         # case 2: the same two rows in reverse order — row order must not decide the answer.
-        _seed_root(tmp_home, "matrixkoder", repo, ".matrixkoder", os.path.join(canon, "mk.db"))
+        _seed_root(tmp_home, "matrixkoder", repo, ".matrixkoder", os.path.join(canon, ROOT_DB_NAME))
         con = mkdb.open_root(tmp_home)
         try:
             con.execute("INSERT INTO projects(slug, name, repo, data_dir, mode, db_path)"
@@ -1302,7 +1319,7 @@ def self_test():
         finally:
             con.close()
         _check(project_slug_of(data) == "matrixkoder", project_slug_of(data))
-        _check(target_project_yaml("matrixkoder") == os.path.join(canon, "project.yaml"),
+        _check(target_project_yaml("matrixkoder") == os.path.join(canon, PROJECT_YAML_NAME),
                target_project_yaml("matrixkoder"))
         _check(target_run_dir("matrixkoder", "p1", "r1")
                == os.path.join(canon, "plans", "p1", "runs", "r1"),
@@ -1315,11 +1332,11 @@ def self_test():
             con.execute("INSERT INTO projects(slug, name, repo, data_dir, mode, db_path)"
                         " VALUES (?,?,?,?,?,?)",
                         ("matrixkoder", "matrixkoder", repo, ".matrixkoder", "home",
-                         os.path.join(canon, "mk.db")))
+                         os.path.join(canon, ROOT_DB_NAME)))
             con.commit()
         finally:
             con.close()
-        _check(target_project_yaml("matrixkoder") == os.path.join(canon, "project.yaml"),
+        _check(target_project_yaml("matrixkoder") == os.path.join(canon, PROJECT_YAML_NAME),
                target_project_yaml("matrixkoder"))
         _check(target_run_dir("matrixkoder", "p1", "r1")
                == os.path.join(canon, "plans", "p1", "runs", "r1"),
@@ -1367,21 +1384,21 @@ def self_test():
         def answers():
             return (project_folder(data), project_yaml(data), project_yaml_lock(data))
 
-        want = (canon, os.path.join(canon, "project.yaml"),
-                os.path.join(canon, "project.yaml") + ".lock")
+        want = (canon, os.path.join(canon, PROJECT_YAML_NAME),
+                os.path.join(canon, PROJECT_YAML_NAME) + ".lock")
         # (a) canonical row FIRST, alias row last — the old last-row-wins by_data picked the alias
-        _seed_root(tmp_home, "matrixkoder", repo, ".matrixkoder", os.path.join(canon, "mk.db"))
+        _seed_root(tmp_home, "matrixkoder", repo, ".matrixkoder", os.path.join(canon, ROOT_DB_NAME))
         add("pdceb35c892fc86bb", None)
         _check(answers() == want, "canonical first: %r" % (answers(),))
         # (b) alias row FIRST, canonical last — identical answers
         _seed_root(tmp_home, "pdceb35c892fc86bb", repo, ".matrixkoder")
-        add("matrixkoder", os.path.join(canon, "mk.db"))
+        add("matrixkoder", os.path.join(canon, ROOT_DB_NAME))
         _check(answers() == want, "alias first: %r" % (answers(),))
         # (c) unmigrated: two rows, no db_path — the data dir stays the folder
         _seed_root(tmp_home, "pdceb35c892fc86bb", repo, ".matrixkoder")
         add("matrixkoder", None)
         _check(project_folder(data) == data, project_folder(data))
-        _check(project_yaml(data) == os.path.join(data, "matrixkoder.yaml"), project_yaml(data))
+        _check(project_yaml(data) == os.path.join(data, LEGACY_YAML_NAME), project_yaml(data))
 
     def t_bus(tmp_home, repo):
         os.environ["HOME"] = tmp_home
@@ -1395,7 +1412,7 @@ def self_test():
         _check(bus_json(data) == os.path.join(data, "bus.json"), bus_json(data))
         # store mode: the MK home's bus/ folder (C6, L6.1), one bus for every project
         os.makedirs(data, exist_ok=True)
-        open(os.path.join(data, "mk.db"), "w").close()
+        open(os.path.join(data, ROOT_DB_NAME), "w").close()
         _check(bus_dir(data) == os.path.join(tmp_home, "bus"), bus_dir(data))
         _check(bus_json(data) == os.path.join(tmp_home, "bus", "bus.json"), bus_json(data))
         _check(bus_tokens(data) == os.path.join(tmp_home, "bus", "bus-tokens.json"), bus_tokens(data))
@@ -1529,8 +1546,8 @@ def self_test():
         proj = os.path.join(tmp_home, "projects", "migs")
         # slug form: every path follows the switch
         _check(project_dir(home_arg=tmp_home, slug="migs") == proj, project_dir(home_arg=tmp_home, slug="migs"))
-        _check(project_db(slug="migs") == os.path.join(proj, "mk.db"), project_db(slug="migs"))
-        _check(project_yaml(data) == os.path.join(proj, "project.yaml"), project_yaml(data))
+        _check(project_db(slug="migs") == os.path.join(proj, ROOT_DB_NAME), project_db(slug="migs"))
+        _check(project_yaml(data) == os.path.join(proj, PROJECT_YAML_NAME), project_yaml(data))
         _check(plan_dir(data, "p1") == os.path.join(proj, "plans", "p1"), plan_dir(data, "p1"))
         _check(plan_file(data, "p1") == os.path.join(proj, "plans", "p1", "plan.md"), plan_file(data, "p1"))
         _check(plan_archives_dir(data, "p1") == os.path.join(proj, "plans", "p1", "archive"),
@@ -1574,22 +1591,22 @@ def self_test():
                    task_dir(plain, "r1", "T1"))
         # L10.1: the data form of project_db follows the switch to the C2 store; legacy=True is the
         # literal <data>/mk.db that mk-migrate's rollback reads (its copy-back must not follow)
-        _check(project_db(data=data) == os.path.join(proj, "mk.db"), project_db(data=data))
+        _check(project_db(data=data) == os.path.join(proj, ROOT_DB_NAME), project_db(data=data))
         _check(project_db(data=data) == project_db(slug="migs"), "data form equals slug form")
-        _check(project_db(data=data, legacy=True) == os.path.join(data, "mk.db"), project_db(data=data, legacy=True))
+        _check(project_db(data=data, legacy=True) == os.path.join(data, ROOT_DB_NAME), project_db(data=data, legacy=True))
         # an unmigrated project is byte-for-byte unchanged, legacy flag or not
         for plain in (os.path.join(root, "elsewhere"), os.path.join(tmp_home, "projects", "unmigrated")):
-            _check(project_db(data=plain) == os.path.join(plain, "mk.db") == project_db(data=plain, legacy=True),
+            _check(project_db(data=plain) == os.path.join(plain, ROOT_DB_NAME) == project_db(data=plain, legacy=True),
                    project_db(data=plain))
             _check(project_dir(home_arg=tmp_home, data_dir=plain) == plain, project_dir(home_arg=tmp_home, data_dir=plain))
         # C6 (L6.1): the watch cursors move into the project folder with the project; the
         # pre-migration file is read once and copied over, never deleted
-        _check(watch_cursors(data) == os.path.join(proj, "watch-cursors.json"), watch_cursors(data))
-        _write_json(os.path.join(proj, "watch-cursors.json"), {"r1|*": {"seq": 3}})
-        _write_json(os.path.join(data, "watch-cursors.json"), {"r1|*": {"seq": 9}})
-        os.remove(os.path.join(proj, "watch-cursors.json"))
+        _check(watch_cursors(data) == os.path.join(proj, CURSORS_NAME), watch_cursors(data))
+        _write_json(os.path.join(proj, CURSORS_NAME), {"r1|*": {"seq": 3}})
+        _write_json(os.path.join(data, CURSORS_NAME), {"r1|*": {"seq": 9}})
+        os.remove(os.path.join(proj, CURSORS_NAME))
         _check(_read_json(watch_cursors(data)) == {"r1|*": {"seq": 9}}, watch_cursors(data))
-        _check(os.path.isfile(os.path.join(data, "watch-cursors.json")),
+        _check(os.path.isfile(os.path.join(data, CURSORS_NAME)),
                "the legacy cursor file must survive a take-over")
 
         # a pre-migration project side by side keeps every path today's
@@ -1603,7 +1620,7 @@ def self_test():
         gate = _bus_gate(tmp_home, other_repo, data, other_data)
         if gate:
             _check(gate == "mixed-layout bus gate ok", gate)
-        _check(project_yaml(other_data) == os.path.join(other_data, "matrixkoder.yaml"),
+        _check(project_yaml(other_data) == os.path.join(other_data, LEGACY_YAML_NAME),
                project_yaml(other_data))
         _check(plan_file(other_data, "p1") == os.path.join(other_data, "plans", "p1.md"),
                plan_file(other_data, "p1"))
@@ -1617,7 +1634,7 @@ def self_test():
         missing = os.path.join(root, "no-such-home")
         os.environ["MK_HOME"] = os.environ["MATRIXKODER_HOME"] = missing
         _MIGRATED_MEMO = None
-        _check(project_yaml(other_data) == os.path.join(other_data, "matrixkoder.yaml"), "no root")
+        _check(project_yaml(other_data) == os.path.join(other_data, LEGACY_YAML_NAME), "no root")
         os.environ["MK_HOME"] = os.environ["MATRIXKODER_HOME"] = tmp_home
         _MIGRATED_MEMO = None
 
@@ -1627,10 +1644,10 @@ def self_test():
         proj = os.path.join(tmp_home, "projects", "matrixkoder")
         _check(target_projects_dir() == os.path.join(tmp_home, "projects"), target_projects_dir())
         _check(target_project_dir("matrixkoder") == proj, target_project_dir("matrixkoder"))
-        _check(target_project_db("matrixkoder") == os.path.join(proj, "mk.db"), "target db")
-        _check(target_project_yaml("matrixkoder") == os.path.join(proj, "project.yaml"), "yaml")
+        _check(target_project_db("matrixkoder") == os.path.join(proj, ROOT_DB_NAME), "target db")
+        _check(target_project_yaml("matrixkoder") == os.path.join(proj, PROJECT_YAML_NAME), "yaml")
         _check(target_watch_cursors("matrixkoder")
-               == os.path.join(proj, "watch-cursors.json"), "cursors")
+               == os.path.join(proj, CURSORS_NAME), "cursors")
         _check(target_bus_dir() == os.path.join(tmp_home, "bus"), target_bus_dir())
         _check(target_plan_dir("matrixkoder", "p1") == os.path.join(proj, "plans", "p1"), "plan")
         _check(target_run_dir("matrixkoder", "p1", "r1")
