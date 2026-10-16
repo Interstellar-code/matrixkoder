@@ -4,10 +4,18 @@
   list --json
   get KEY [--set KEY=VALUE]   (--set: the caller's own value, so a draft can be read back)
   set KEY VALUE               VALUE is JSON: 12, true, "main", ["a","b"]
+  set KEY VALUE --global      the same, into <home>/mk-settings.yaml (L10.3)
+  unset KEY [--global]        delete the override: the key inherits again
   migrate
+  migrate-settings [--dry-run]  project.yaml -> project DB rows, config.json -> mk-settings.yaml
   context [--usage PATH]
   probe
   --self-test
+
+L10.3 layers every SCHEMA yaml key: project DB override > global mk-settings.yaml > project.yaml
+(legacy) > default, and get/list/context say which one answered (`source`). `set` writes the
+project override when the project has a store, else the yaml as before; `--project SLUG` picks
+another project than the session's.
 
 Common: --data DIR, resolved exactly as mk-state.py does (--data > $MATRIXKODER_DATA >
 <home>/projects.json > <main checkout>/.matrixkoder). Every command prints ONE JSON line, like
@@ -35,7 +43,7 @@ session.selftest_jobs_total: integer 1..16, the whole-machine self-test job budg
 has no value the default is derived as max(1, round(cpu_count/3)); list/get/context show that
 number and say it is derived.
 """
-import contextlib, datetime, difflib, fcntl, importlib.util, json, os, re, shutil, subprocess, sys, tempfile, time
+import contextlib, datetime, difflib, fcntl, hashlib, importlib.util, json, os, re, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True  # no stray __pycache__ next to the scripts
@@ -121,6 +129,7 @@ def _load(name, path):
 
 mk_state = _load("mk_state", os.path.join(HERE, "mk-state.py"))  # data dir resolution, Fail
 mkpaths = _load("mkpaths", os.path.join(HERE, "mkpaths.py"))  # C1: home, data-dir order, paths
+mkdb = _load("mkdb", os.path.join(HERE, "mkdb.py"))  # the only SQLite writer: project overrides live in its settings table
 
 
 class Fail(Exception):
@@ -934,13 +943,190 @@ def parse_value(raw, r, lines=None):
     return v
 
 
+# ---------- L10.3: layered settings ----------
+#
+# project DB `settings` row > global <home>/mk-settings.yaml > project.yaml (legacy, read-only
+# fallback) > SCHEMA default. Only SCHEMA rows with home == yaml take part; agents.*, picks.* and
+# helpers.* stay in the project yaml. LAYERS is filled by main() for one command; an importer that
+# calls value_of() directly (mk-lane, lane-health, ...) still reads the yaml alone, as before.
+
+LAYERED = frozenset(r["key"] for r in SCHEMA if r["home"] == YAML_HOME)
+LAYERS = {"project": {}, "global": {}}
+GLOBAL_LINE_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_.-]*):[ \t]*(.*)$")
+CONFIG_JSON = "config.json"  # the retired UI-toggle file: <home>/config.json, read once by migrate-settings
+CONFIG_JSON_KEYS = ("dashboard.auto_open", "dashboard.chip", "dashboard.toasts", "usage.poll_min")
+
+
+def global_path(home_arg=None):
+    return mkpaths.mk_settings(home_arg)
+
+
+def _global_value(raw):
+    """One mk-settings.yaml value: the JSON subset we write, else a plain yaml scalar."""
+    text = strip_comment(raw).strip()
+    try:
+        return json.loads(text)
+    except ValueError:
+        return scalar(text)
+
+
+def read_global(path=None):
+    """-> {dotted key: value} from mk-settings.yaml; {} when the file is absent or unreadable."""
+    try:
+        with open(path or global_path()) as f:
+            raw = f.read().splitlines()
+    except OSError:
+        return {}
+    got = {}
+    for line in raw:
+        m = GLOBAL_LINE_RE.match(line)
+        if m:
+            got[m.group(1)] = _global_value(m.group(2))
+    return got
+
+
+def _store_file(data):
+    return mkpaths.project_db(data=data)
+
+
+def has_store(data):
+    return bool(data) and os.path.isfile(_store_file(data))
+
+
+def read_project_overrides(data):
+    """-> {key: value} from the project DB `settings` table, read-only. {} when there is no store, it
+    is older than schema 7, or anything about it cannot be read: a read never fails a command."""
+    if not data:
+        return {}
+    try:
+        con = mkdb._open_read(_store_file(data), mkdb.SCHEMA)
+    except Exception:
+        return {}
+    if con is None:
+        return {}
+    try:
+        got = {}
+        for row in con.execute("SELECT key, value FROM settings"):
+            try:
+                got[row["key"]] = json.loads(row["value"])
+            except (TypeError, ValueError):
+                continue
+        return got
+    except Exception:
+        return {}
+    finally:
+        con.close()
+
+
+def load_layers(data):
+    LAYERS["project"] = read_project_overrides(data)
+    LAYERS["global"] = read_global()
+
+
+def _layer_ok(r, v, lines):
+    """A layered value that no longer passes the schema's own check is ignored, not trusted."""
+    try:
+        parse_value(json.dumps(v), r, lines)
+        return True
+    except Fail:
+        return False
+
+
+def resolve(lines, r):
+    """-> (source, found, value) for a row: project | global | legacy | default."""
+    key = r["key"]
+    if key in LAYERED:
+        for source in ("project", "global"):
+            if key in LAYERS[source] and _layer_ok(r, LAYERS[source][key], lines):
+                return source, True, LAYERS[source][key]
+    found, value = value_of(lines, r)
+    return ("legacy" if found else "default"), found, value
+
+
+def _write_atomic(path, text):
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".mk-settings-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def write_global(updates, removes=(), path=None):
+    """Set and remove dotted keys in mk-settings.yaml, atomically, under the lock. Every other line
+    (comments, keys we do not own) is kept byte for byte. -> the keys that actually changed."""
+    path = path or global_path()
+    changed = []
+    with yaml_lock(path):
+        try:
+            with open(path, newline="") as f:
+                old = f.read()
+        except OSError:
+            old = ""
+        out_lines, seen = [], set()
+        for line in old.splitlines(keepends=True):
+            m = GLOBAL_LINE_RE.match(line.rstrip("\r\n"))
+            if m and m.group(1) in removes:
+                changed.append(m.group(1))
+                continue
+            if m and m.group(1) in updates:
+                k = m.group(1)
+                seen.add(k)
+                if _global_value(m.group(2)) == updates[k]:
+                    out_lines.append(line)
+                else:
+                    out_lines.append(f"{k}: {json.dumps(updates[k])}\n")
+                    changed.append(k)
+                continue
+            out_lines.append(line)
+        if out_lines and not out_lines[-1].endswith("\n"):
+            out_lines[-1] += "\n"
+        for k, v in updates.items():
+            if k not in seen:
+                out_lines.append(f"{k}: {json.dumps(v)}\n")
+                changed.append(k)
+        if changed:
+            _write_atomic(path, "".join(out_lines))
+    return changed
+
+
+def write_project_overrides(data, updates, removes=()):
+    """Upsert/delete project DB `settings` rows through mkdb.open_project. -> keys that changed."""
+    changed = []
+    con = mkdb.open_project(mkpaths.home(), data_dir=data)
+    try:
+        for k, v in updates.items():
+            enc = json.dumps(v)
+            row = con.execute("SELECT value FROM settings WHERE key=?", (k,)).fetchone()
+            if row is None or row["value"] != enc:
+                con.execute("INSERT OR REPLACE INTO settings(key, value, updated) VALUES (?,?,?)",
+                            (k, enc, mkdb.now()))
+                changed.append(k)
+        for k in removes:
+            if con.execute("DELETE FROM settings WHERE key=?", (k,)).rowcount:
+                changed.append(k)
+        con.commit()
+    finally:
+        con.close()
+    return changed
+
+
 def cmd_list(path, lines):
     fields = []
     for r in rows(lines):
-        found, value = value_of(lines, r)
+        source, found, value = resolve(lines, r)
         shown_default = effective_default(r)
         f = {"key": r["key"], "scope": r["scope"], "label": r["label"], "type": r["type"],
-             "value": value, "default": shown_default, "help": r["help"],
+             "value": value, "default": shown_default, "help": r["help"], "source": source,
              "editable": r.get("editable", True),
              # C8: where the value lives, beside the UI-tab `scope` (a different vocabulary).
              "level": r["level"], "home": r["home"]}
@@ -984,12 +1170,12 @@ def cmd_get(path, lines, args):
             if not sep or k != key:
                 raise Fail(f"--set needs KEY=VALUE for {key}")
             return out({"ok": True, "key": key, "value": parse_value(raw, r, lines)})  # the caller's value wins
-    found, value = value_of(lines, r)
-    ans = {"ok": True, "key": key, "value": value}
+    source, found, value = resolve(lines, r)
+    ans = {"ok": True, "key": key, "value": value, "source": source}
     if r.get("derived") and not found:
         ans["derived"] = True  # no yaml value: this number is max(1, round(cores/3))
         ans["default"] = value
-    if r.get("integer"):
+    if r.get("integer") and source in ("legacy", "default"):
         # the scalar as written. A hand edit of "abc" or 99 still resolves to a value, and a
         # reader that must not trust it (selftest.sh) warns from this text.
         kl = key_lines(lines)
@@ -1002,7 +1188,19 @@ def cmd_get(path, lines, args):
     return out(ans)
 
 
-def cmd_set(path, lines, args):
+def _layered_row(lines, key, verb):
+    r = row_for(lines, key)
+    if not r:
+        raise Fail(f"unknown key: {key}")
+    if key not in LAYERED:
+        raise Fail(f"{key}: {verb} only applies to SCHEMA yaml keys (userConfig, agent and pick rows "
+                   "are not layered)")
+    return r
+
+
+def cmd_set(path, lines, args, data=None):
+    glob = "--global" in args
+    args = [a for a in args if a != "--global"]
     if len(args) < 2:
         raise Fail("set needs KEY and VALUE (JSON)")
     key, raw = args[0], args[1]
@@ -1013,6 +1211,17 @@ def cmd_set(path, lines, args):
     if not r.get("editable", True) and not r["key"].startswith("agents."):
         raise Fail(f"{key} is read-only: {r.get('why', 'not editable')}")
     value = parse_value(raw, r, lines)
+    # L10.3: a SCHEMA key is the PROJECT override (project DB row) when the project has a store,
+    # the global value with --global; with no store, and for rows that are not layered, the yaml.
+    if glob:
+        _layered_row(lines, key, "--global")
+        changed = write_global({key: value})
+        return out({"ok": True, "key": key, "value": value, "file": global_path(),
+                    "target": "global", "changed": bool(changed)})
+    if key in LAYERED and has_store(data):
+        changed = write_project_overrides(data, {key: value})
+        return out({"ok": True, "key": key, "value": value, "file": _store_file(data),
+                    "target": "project", "changed": bool(changed)})
     with yaml_lock(path):
         lines = read_lines(path)  # the copy main() read is stale once another writer held the lock
         r = row_for(lines, key) or r
@@ -1030,6 +1239,123 @@ def cmd_set(path, lines, args):
         write_yaml(path, lines, new, count, [(key, value, r)])
     return out({"ok": True, "key": key, "value": value, "file": path, "changed": True,
                 "backup": path + ".bak", "backup_of": "previous"})
+
+
+def cmd_unset(path, lines, args, data=None):
+    """Delete the override so the key inherits again (project row by default, global with --global)."""
+    glob = "--global" in args
+    args = [a for a in args if a != "--global"]
+    if len(args) != 1:
+        raise Fail("unset needs one KEY")
+    key = args[0]
+    _layered_row(lines, key, "unset")
+    if glob:
+        changed = write_global({}, removes=(key,))
+        return out({"ok": True, "key": key, "file": global_path(), "target": "global", "changed": bool(changed)})
+    if not has_store(data):
+        return out({"ok": True, "key": key, "target": "project", "changed": False,
+                    "note": "no project store: nothing to unset"})
+    changed = write_project_overrides(data, {}, removes=(key,))
+    return out({"ok": True, "key": key, "file": _store_file(data), "target": "project",
+                "changed": bool(changed)})
+
+
+def yaml_inventory(lines):
+    """-> (unknown dotted keys, comments) of a project yaml: what a settings migration cannot carry.
+
+    A key line is known when its section path matches a schema/agent/pick/helper row (or a member of
+    a known flow map); a whole unknown section is reported once, by its top key. Comments are every
+    full-line `#` and every trailing `# ...`, with their 1-based line numbers."""
+    known, members = set(), {}
+    for r in rows(lines):
+        p = ("helpers", r["member"]) if r["key"].startswith("helpers.") else tuple(r["sec"]) + (r["line"],)
+        for n in range(1, len(p) + 1):
+            known.add(p[:n])
+        if r.get("member") and not r["key"].startswith("helpers."):
+            members.setdefault(p, set()).add(r["member"])
+    unknown, stack, bad = [], [], None
+    for (i, indent, k, rest) in key_lines(lines):
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        path = tuple(x[1] for x in stack) + (k,)
+        stack.append((indent, k))
+        if bad is not None and path[:len(bad)] == bad:
+            continue
+        if path not in known:
+            bad = path
+            unknown.append(".".join(path))
+            continue
+        for m in flow_map(rest):
+            if path in members and m not in members[path]:
+                unknown.append(".".join(path + (m,)))
+    comments = []
+    for n, raw in enumerate(lines, 1):
+        body = raw.rstrip("\r\n")
+        if body.strip().startswith("#"):
+            comments.append({"line": n, "text": body.strip()})
+        elif "#" in body and strip_comment(body) != body:
+            comments.append({"line": n, "text": body[len(strip_comment(body)):].strip()})
+    return unknown, comments
+
+
+def read_config_json():
+    """-> (path, status, {dotted key: value}, unknown keys). The retired UI-toggle file, read only."""
+    path = os.path.join(mkpaths.home(), CONFIG_JSON)
+    try:
+        with open(path) as f:
+            doc = json.load(f)
+    except OSError:
+        return path, "absent", {}, []
+    except ValueError:
+        return path, "unreadable", {}, []
+    flat = {}
+
+    def walk(prefix, node):
+        for k, v in node.items():
+            dotted = f"{prefix}.{k}" if prefix else str(k)
+            if isinstance(v, dict):
+                walk(dotted, v)
+            else:
+                flat[dotted] = v
+
+    if isinstance(doc, dict):
+        walk("", doc)
+    return path, "retired", {k: v for k, v in flat.items() if k in CONFIG_JSON_KEYS}, \
+        sorted(k for k in flat if k not in CONFIG_JSON_KEYS)
+
+
+def cmd_migrate_settings(path, lines, data, dry_run=False):
+    """project.yaml -> project DB rows (SCHEMA keys that differ from the default; an existing row
+    wins), config.json -> mk-settings.yaml (keys not already there). Reports the yaml keys and
+    comments it did not carry. Never edits or deletes either source file."""
+    if not dry_run and not has_store(data):
+        raise Fail(f"no project store at {_store_file(data)}: nothing to write the overrides into")
+    existing = read_project_overrides(data)
+    carried, kept = [], []
+    for r in SCHEMA:
+        if r["key"] not in LAYERED or r.get("derived"):
+            continue
+        found, value = value_of(lines, r)
+        if not found or value == r["default"]:
+            continue
+        (kept if r["key"] in existing else carried).append((r["key"], value))
+    unknown, comments = yaml_inventory(lines)
+    cj_path, cj_status, cj_vals, cj_unknown = read_config_json()
+    glob = read_global()
+    cj_carry = {k: v for k, v in cj_vals.items() if k not in glob}
+    if not dry_run:
+        write_project_overrides(data, dict(carried))
+        if cj_carry:
+            write_global(cj_carry)
+    return out({"ok": True, "dry_run": dry_run, "file": path, "store": _store_file(data),
+                "carried": [{"key": k, "value": v} for k, v in carried],
+                "kept_existing": [k for k, _v in kept],
+                "unknown_keys": unknown, "comments": comments, "yaml_untouched": True,
+                "global_file": global_path(),
+                "config_json": {"file": cj_path, "status": cj_status,
+                                "carried": [{"key": k, "value": v} for k, v in cj_carry.items()],
+                                "already_global": sorted(k for k in cj_vals if k in glob),
+                                "unknown_keys": cj_unknown}})
 
 
 def cmd_migrate(path, lines, dry_run=False):
@@ -1232,12 +1558,14 @@ def is_future_iso(ts):
 
 def cmd_context(path, lines, usage_arg=None):
     schema_rows = {r["key"]: r for r in rows(lines)}  # row_for scans the schema per call; resolve once
+    sources = {}  # key -> project|global|legacy|default, for every value this reply reads
 
     def val(key):
         r = schema_rows.get(key)
         if not r:
             raise Fail(f"unknown schema row: {key}")
-        return value_of(lines, r)[1]
+        sources[key], _found, value = resolve(lines, r)
+        return value
 
     builder_skip_permissions = val("autonomy_contract.builder_skip_permissions")
     if builder_skip_permissions:
@@ -1318,8 +1646,8 @@ def cmd_context(path, lines, usage_arg=None):
         "reviewer_split": val("session.reviewer_split"),
         "todo_done_status": val("session.todo_done_status"),
         "selftest_jobs_total": val("session.selftest_jobs_total"),
-        "selftest_jobs_total_derived": not value_of(
-            lines, schema_rows["session.selftest_jobs_total"])[0],
+        "selftest_jobs_total_derived": resolve(
+            lines, schema_rows["session.selftest_jobs_total"])[0] == "default",
         "reuse_reviewer": val("session.reuse_reviewer"),
         "bus_ask_timeout_s": val("bus.ask_timeout_s"),
         "integration_branch": val("repo.integration_branch"),
@@ -1330,6 +1658,7 @@ def cmd_context(path, lines, usage_arg=None):
         "launch_flags": launch_flags,
         "default_agent": val("lanes.default_agent"),
         "agents": agents_map,
+        "sources": sources,
     })
 
 
@@ -1554,6 +1883,14 @@ def main(argv=None):
         if i + 1 >= len(argv):
             return out({"ok": False, "error": "--data needs a directory"}, 2)
         data_arg, argv = argv[i + 1], argv[:i] + argv[i + 2:]
+    project_arg = None
+    if "--project" in argv:
+        i = argv.index("--project")
+        if i + 1 >= len(argv):
+            return out({"ok": False, "error": "--project needs a slug"}, 2)
+        project_arg, argv = argv[i + 1], argv[:i] + argv[i + 2:]
+        if data_arg:
+            return out({"ok": False, "error": "--project and --data name the project twice; pass one"}, 2)
     usage_arg = None
     if "--usage" in argv:
         i = argv.index("--usage")
@@ -1561,9 +1898,15 @@ def main(argv=None):
             return out({"ok": False, "error": "--usage needs a path"}, 2)
         usage_arg, argv = argv[i + 1], argv[:i] + argv[i + 2:]
     try:
-        data = mk_state.resolve_data(data_arg)
+        if project_arg:
+            data = mkpaths.project_data_dir(project_arg)
+            if not data:
+                raise Fail(f"unknown project: {project_arg}")
+        else:
+            data = mk_state.resolve_data(data_arg)
         path = project_yaml_path(data)
         lines = read_lines(path)
+        load_layers(data)
         cmd, args = (argv[0], argv[1:]) if argv else (None, [])
         if cmd == "list":
             if "--json" not in args:
@@ -1572,7 +1915,11 @@ def main(argv=None):
         if cmd == "get":
             return cmd_get(path, lines, args)
         if cmd == "set":
-            return cmd_set(path, lines, args)
+            return cmd_set(path, lines, args, data)
+        if cmd == "unset":
+            return cmd_unset(path, lines, args, data)
+        if cmd == "migrate-settings":
+            return cmd_migrate_settings(path, lines, data, dry_run="--dry-run" in args)
         if cmd == "migrate":
             return cmd_migrate(path, lines, dry_run="--dry-run" in args)
         if cmd == "context":
@@ -1580,7 +1927,8 @@ def main(argv=None):
         if cmd == "probe":
             return cmd_probe(path, lines)
         raise Fail("usage: mk-config.py [--data DIR] list --json | get KEY [--set KEY=VALUE] | "
-                   "set KEY VALUE | migrate | context [--usage PATH] | probe | --self-test")
+                   "set KEY VALUE [--global] | unset KEY [--global] | migrate | migrate-settings [--dry-run] | "
+                   "context [--usage PATH] | probe | [--project SLUG] | --self-test")
     except mk_state.Fail as e:  # data dir resolution failed
         return out({"ok": False, "error": str(e)}, e.code)
     except Fail as e:
@@ -2277,7 +2625,7 @@ def self_test():
         raw_sh = raw_sh.replace(needle_data, repl_data, 1)
         needle = '  [ -e "$f" ] || continue\n  files+=("$f")\n'
         repl = ('  [ -e "$f" ] || continue\n'
-                '  case "$(basename "$f")" in mk-config.py|mk-state.py|mkpaths.py) continue ;; esac\n'
+                '  case "$(basename "$f")" in mk-config.py|mk-state.py|mkpaths.py|mkdb.py) continue ;; esac\n'
                 '  files+=("$f")\n')
         if raw_sh.count(needle) != 1:
             raise AssertionError("selftest.sh file loop changed; the harness skip no longer matches")
@@ -2288,6 +2636,8 @@ def self_test():
         shutil.copy(os.path.join(HERE, "mk-state.py"), os.path.join(harness, "mk-state.py"))
         # mk-config loads mkpaths beside itself (C1); the harness must carry it too
         shutil.copy(os.path.join(HERE, "mkpaths.py"), os.path.join(harness, "mkpaths.py"))
+        # and mkdb (L10.3: the project overrides are read through it)
+        shutil.copy(os.path.join(HERE, "mkdb.py"), os.path.join(harness, "mkdb.py"))
         for name in ("w1.py", "w2.py", "w3.py"):
             with open(os.path.join(harness, name), "w") as f:
                 f.write(
@@ -2699,10 +3049,117 @@ def self_test():
             f"migrate created a phantom beside project.yaml: {os.listdir(c2)}"
         # and a set through the C2 folder lands in the real project.yaml, not a phantom
         before_set = open(real_yaml).read()
-        run_mig("--data", c2, "set", "session.stall_min", "21")
-        after_set = open(real_yaml).read()
-        assert "stall_min: 21" in after_set and after_set != before_set, after_set
+        # L10.3: the project has a store, so `set` writes the project override (DB row), not the yaml
+        sr = run_mig("--data", c2, "set", "session.stall_min", "21")
+        assert sr["target"] == "project" and sr["changed"] is True, sr
+        assert open(real_yaml).read() == before_set, "set rewrote the yaml of a project with a store"
+        got = run_mig("--data", c2, "get", "session.stall_min")
+        assert got["value"] == 21 and got["source"] == "project", got
         assert not os.path.exists(os.path.join(c2, "matrixkoder.yaml")), "set wrote a phantom yaml"
+
+        # ---- L10.3: layered settings (project DB > global mk-settings.yaml > project yaml > default) ----
+        def sha(path):
+            with open(path, "rb") as f:
+                return hashlib.sha256(f.read()).hexdigest()
+
+        def mkproj(name, yaml_text):
+            d = os.path.join(tmp, name)
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "matrixkoder.yaml"), "w") as f:
+                f.write(yaml_text)
+            mkdb.open_project(home, data_dir=d).close()  # a store: `set` now targets the project DB
+            return d
+
+        l_yaml = ("# keep me\nsession:\n  stall_min: 17   # legacy note\nbus:\n  ask_timeout_s: 90\n"
+                  "bogus_section:\n  a: 1\nrepo:\n  lanes: { slots: 3, bogus: 9 }\n")
+        da = mkproj("l10a", l_yaml)
+        gfile = os.path.join(home, "mk-settings.yaml")
+        yaml_hash = sha(os.path.join(da, "matrixkoder.yaml"))
+        g = run("--data", da, "get", "session.stall_min")
+        assert (g["value"], g["source"]) == (17, "legacy"), g
+        sg = run("--data", da, "set", "session.stall_min", "18", "--global")
+        assert sg["target"] == "global" and sg["changed"] is True, sg
+        assert "session.stall_min: 18" in open(gfile).read(), open(gfile).read()
+        g = run("--data", da, "get", "session.stall_min")
+        assert (g["value"], g["source"]) == (18, "global"), g
+        sp = run("--data", da, "set", "session.stall_min", "19")
+        assert sp["target"] == "project" and sp["changed"] is True, sp
+        assert run("--data", da, "set", "session.stall_min", "19")["changed"] is False
+        g = run("--data", da, "get", "session.stall_min")
+        assert (g["value"], g["source"]) == (19, "project"), g  # the project value wins over global
+        lst = {f["key"]: f for f in run("--data", da, "list", "--json")["fields"]}
+        assert lst["session.stall_min"]["value"] == 19 and lst["session.stall_min"]["source"] == "project", lst["session.stall_min"]
+        assert lst["session.fresh_session"]["source"] == "default", lst["session.fresh_session"]
+        ctx = run("--data", da, "context")
+        assert ctx["sources"]["bus.ask_timeout_s"] == "legacy" and ctx["bus_ask_timeout_s"] == 90, ctx["sources"]
+        run("--data", da, "set", "bus.ask_timeout_s", "120")
+        ctx = run("--data", da, "context")
+        assert ctx["sources"]["bus.ask_timeout_s"] == "project" and ctx["bus_ask_timeout_s"] == 120, ctx["sources"]
+        # unset: the key inherits again, one layer at a time
+        assert run("--data", da, "unset", "session.stall_min")["changed"] is True
+        g = run("--data", da, "get", "session.stall_min")
+        assert (g["value"], g["source"]) == (18, "global"), g
+        assert run("--data", da, "unset", "session.stall_min", "--global")["changed"] is True
+        g = run("--data", da, "get", "session.stall_min")
+        assert (g["value"], g["source"]) == (17, "legacy"), g
+        assert run("--data", da, "unset", "session.stall_min")["changed"] is False
+        run("--data", da, "unset", "session.stall_min", "--global")
+        assert "session.stall_min" not in open(gfile).read()
+        run("--data", da, "unset", "bus.ask_timeout_s")
+        run("unset", "no.such.key", "--data", da, ok=False)
+        run("--data", da, "set", "agents.claude.available", "true", "--global", ok=False)  # not a layered key
+        assert sha(os.path.join(da, "matrixkoder.yaml")) == yaml_hash, "layered set/unset touched the yaml"
+        # no yaml value anywhere: the default
+        db_ = mkproj("l10b", "session:\n  fresh_session: true\n")
+        g = run("--data", db_, "get", "bus.ask_timeout_s")
+        assert g["source"] == "default", g
+        # --project <slug> reads and writes the OTHER project only; an unknown slug writes nothing
+        rcon = mkdb.open_root(home)
+        try:
+            rcon.execute("INSERT OR REPLACE INTO projects(slug, name, repo, data_dir, mode) VALUES (?,?,?,?,?)",
+                         ("other", "other", db_, db_, "home"))
+            rcon.commit()
+        finally:
+            rcon.close()
+        sp = run("--project", "other", "set", "session.stall_min", "25")
+        assert sp["target"] == "project", sp
+        assert run("--project", "other", "get", "session.stall_min")["value"] == 25
+        assert run("--data", db_, "get", "session.stall_min")["source"] == "project"
+        assert run("--data", da, "get", "session.stall_min")["source"] == "legacy", "--project wrote the wrong project"
+        bad = run("--project", "nope", "set", "session.stall_min", "26", ok=False)
+        assert "unknown project" in bad["error"], bad
+        run("--project", "other", "--data", da, "get", "session.stall_min", ok=False)
+        assert run("--data", db_, "get", "session.stall_min")["value"] == 25, "an unknown slug wrote something"
+        # migrate-settings: carries SCHEMA keys, reports what it cannot carry, never touches the sources
+        dc = mkproj("l10c", l_yaml)
+        run("--data", dc, "set", "bus.ask_timeout_s", "120")  # an existing row is never overwritten
+        cj = os.path.join(home, "config.json")
+        with open(cj, "w") as f:
+            json.dump({"dashboard": {"auto_open": False, "chip": "on", "toasts": True},
+                       "usage": {"poll_min": 7}, "other_toggle": 1}, f)
+        cj_hash, yaml_hash = sha(cj), sha(os.path.join(dc, "matrixkoder.yaml"))
+        g_before = open(gfile).read() if os.path.exists(gfile) else ""
+        dry = run("--data", dc, "migrate-settings", "--dry-run")
+        assert dry["dry_run"] is True and [c["key"] for c in dry["carried"]] == ["session.stall_min"], dry
+        assert dry["kept_existing"] == ["bus.ask_timeout_s"], dry
+        assert run("--data", dc, "get", "session.stall_min")["source"] == "legacy", "--dry-run wrote a row"
+        assert (open(gfile).read() if os.path.exists(gfile) else "") == g_before, "--dry-run wrote mk-settings.yaml"
+        mig = run("--data", dc, "migrate-settings")
+        assert mig["yaml_untouched"] is True and mig["carried"] == dry["carried"], mig
+        assert sorted(mig["unknown_keys"]) == ["bogus_section", "repo.lanes.bogus"], mig["unknown_keys"]
+        assert {"line": 1, "text": "# keep me"} in mig["comments"], mig["comments"]
+        assert any(c["line"] == 3 and c["text"] == "# legacy note" for c in mig["comments"]), mig["comments"]
+        g = run("--data", dc, "get", "session.stall_min")
+        assert (g["value"], g["source"]) == (17, "project"), g
+        assert run("--data", dc, "get", "bus.ask_timeout_s")["value"] == 120, "migrate overwrote an existing row"
+        assert sha(os.path.join(dc, "matrixkoder.yaml")) == yaml_hash, "migrate-settings changed the yaml"
+        assert mig["config_json"]["status"] == "retired" and mig["config_json"]["unknown_keys"] == ["other_toggle"], mig["config_json"]
+        assert sha(cj) == cj_hash, "migrate-settings changed config.json"
+        gtext = open(gfile).read()
+        for want_line in ("dashboard.auto_open: false", 'dashboard.chip: "on"', "dashboard.toasts: true", "usage.poll_min: 7"):
+            assert want_line in gtext, (want_line, gtext)
+        again = run("--data", dc, "migrate-settings")
+        assert again["carried"] == [] and again["config_json"]["carried"] == [], again
 
         # R1.2: the mkdb write guard refuses the real home from this suite too.
         import importlib.util as _iu
