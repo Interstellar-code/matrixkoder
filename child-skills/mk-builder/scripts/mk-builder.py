@@ -5408,10 +5408,10 @@ def t_l62_migrated_project_connect_round_trip(root):
                         "--home", home, "--repo", repo],
                        capture_output=True, text=True, env=env, timeout=180)
     assert r.returncode == 0, (r.returncode, r.stdout[-2000:], r.stderr[-2000:])
-    new_db = os.path.join(home, "projects", slug, "mk.db")
+    new_db = _paths("project_db_in", os.path.join(home, "projects", slug))  # the name is mkpaths' (L10.13), not a literal
     assert os.path.isfile(new_db), new_db
     # the root store the switch wrote, next to the C2 project folder
-    assert os.path.getsize(os.path.join(home, "mk.db")) > 0, "no root store"
+    assert os.path.getsize(_paths("root_db_in", home)) > 0, "no root store"
     saved = {k: os.environ.pop(k, None) for k in
              ("MK_HOME", "MATRIXKODER_HOME", "MATRIXKODER_DATA", "MK_BUS_DIR")}
     real_home = os.environ.get("HOME")
@@ -5501,7 +5501,7 @@ def t_z10_migrated_connect_reads_the_store(root):
                         "--home", home, "--repo", repo],
                        capture_output=True, text=True, env=env, timeout=180)
     assert r.returncode == 0, (r.returncode, r.stdout[-2000:], r.stderr[-2000:])
-    new_db = os.path.join(home, "projects", slug, "mk.db")
+    new_db = _paths("project_db_in", os.path.join(home, "projects", slug))  # the name is mkpaths' (L10.13), not a literal
     assert os.path.isfile(new_db), new_db
     # the NEW task's brief lands in the C2 store and its C2 task folder (what mk-state's
     # `task round` does), NOT in the frozen legacy store
@@ -5591,13 +5591,13 @@ def t_z10_migrated_connect_reads_the_store(root):
                                    "text": "# PRE-MIGRATION brief\nthe legacy store answers\n",
                                    "created": "2026-10-15T09:00:00+00:00"}],
                        data_dir=data2)
-    assert os.path.isfile(os.path.join(data2, "mk.db")), "the legacy store must exist"
+    assert os.path.isfile(_paths("project_db_in", data2)), "the legacy store must exist"  # mkpaths names it (L10.13)
     os.environ["HOME"] = home2
     os.environ["MK_HOME"] = home2
     os.environ["MATRIXKODER_HOME"] = home2
     try:
         assert _paths("migrated_slug", data=data2) is None, "a pre-migration project has no slug"
-        assert project_store(data2) == os.path.join(data2, "mk.db"), project_store(data2)
+        assert project_store(data2) == _paths("project_db_in", data2), project_store(data2)
         lane_d = mklane(root, "z10_lane_d")
         os.makedirs(lane_d, exist_ok=True)
         path = os.path.join(lane_d, BUS_LANE_FILE)
