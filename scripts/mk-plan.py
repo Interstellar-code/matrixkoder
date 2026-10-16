@@ -1383,11 +1383,80 @@ def cmd_export(a):
 
 # ---------- import / delete (D1.2) ----------
 
+def _file_sha(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _inbox_plan(path, home):
+    """L10.6: (inbox folder, plan id) when `path` is an inbox plan folder or its plan.md, else None."""
+    real, box = os.path.realpath(path), os.path.realpath(mkpaths.inbox_dir(home))
+    if os.path.isfile(real) and os.path.basename(real) == "plan.md":
+        real = os.path.dirname(real)
+    rel = os.path.relpath(real, box).split(os.sep)
+    if len(rel) != 1 or rel[0] in ("", ".", "..") or not os.path.isdir(real):
+        return None
+    return real, rel[0]
+
+
+def _inbox_moves(folder, data, plan_id):
+    """The (src, dst) pairs that move an inbox plan into its project: plan.md -> the plan file, every
+    other file -> <plan dir>/assets/ keeping its relative path. A target holding the same bytes is
+    skipped (nothing moves twice); one holding other bytes, or a symlink in the inbox, refuses."""
+    pairs = [(os.path.join(folder, "plan.md"), mkpaths.plan_file(data, plan_id))]
+    assets = os.path.join(mkpaths.plan_dir(data, plan_id), "assets")
+    for dirpath, _dirs, files in os.walk(folder):
+        for name in files:
+            src = os.path.join(dirpath, name)
+            rel = os.path.relpath(src, folder)
+            if rel != "plan.md":
+                pairs.append((src, os.path.join(assets, rel)))
+    moves = []
+    for src, dst in pairs:
+        if os.path.islink(src):
+            raise Fail([f"inbox file {src} is a symlink; nothing moved"], code=0, reason="symlink in the inbox")
+        if os.path.lexists(dst):
+            if os.path.islink(dst) or not os.path.isfile(dst) or _file_sha(dst) != _file_sha(src):
+                raise Fail([f"target {dst} already exists with other content; nothing moved"],
+                           code=0, reason="target exists")
+        moves.append((src, dst))
+    return moves
+
+
+def _inbox_move(moves, folder):
+    """Copy each file (size + sha256 checked), then unlink its source; then rmdir the now-empty
+    inbox folder (os.rmdir only, never rmtree). A failure leaves the source in place."""
+    done = []
+    try:
+        for src, dst in moves:
+            if not os.path.exists(dst):
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(src, dst)
+            if os.path.getsize(src) != os.path.getsize(dst) or _file_sha(src) != _file_sha(dst):
+                raise OSError(f"copy of {src} to {dst} did not verify")
+            os.unlink(src)
+            done.append({"from": src, "to": dst})
+    except OSError as e:
+        raise Fail([f"inbox move stopped: {e}; moved so far: {len(done)}; sources kept"], moved=done)
+    for dirpath, _dirs, _files in os.walk(folder, topdown=False):
+        with contextlib.suppress(OSError):
+            os.rmdir(dirpath)
+    return done
+
+
 def import_file(path, data, home, dry_run=False):
     """Load one +++ plan into the store without approving it (C4): a plans row and nothing else.
     No task rows, no file change, no status flip — approve is the command that does those.
-    Idempotent: the same bytes upsert onto the same row and change nothing."""
+    Idempotent: the same bytes upsert onto the same row and change nothing.
+    L10.6: a plan in <home>/inbox/<plan-id>/ (the folder or its plan.md) is then MOVED into the
+    project: plan.md to the plan file, other files to <plan dir>/assets/; reply `moved` lists them."""
     data = resolve_data_arg(data)
+    inbox = _inbox_plan(path, home)
+    if inbox:
+        path = os.path.join(inbox[0], "plan.md")
     text, sha = load(path)
     # a file that is not a plan, or a header that does not parse, is refused with the reason in
     # the reply and exit 0 — it is a "this file is not importable" answer, not a failed command.
@@ -1401,12 +1470,16 @@ def import_file(path, data, home, dry_run=False):
     if not plan_id:
         raise Fail(["the header has no plan id (C4: only a +++ file with plan = \"<id>\" imports)"],
                    code=0, reason="no plan id in the header")
+    if inbox and inbox[1] != plan_id:
+        raise Fail([f"inbox folder {inbox[1]!r} must equal the header plan id {plan_id!r}"],
+                   code=0, reason="inbox folder name differs from the plan id")
     body_md = body_md_of(text, close)
     title = plan_title(body_md, plan_id)
     if not store_present(data):
         raise Fail([f"no store: import needs <data>/mk.db ({data})"])
     db = _mkdb()
     home = db.resolve_home(home)
+    moves = _inbox_moves(inbox[0], data, plan_id) if inbox else []
     header_json = header_json_of(out, sha, body_md, str(out["status"] or "draft"))
     if not dry_run and mkpaths.migrated_slug(data):
         _ensure_plan_assets(data, plan_id)
@@ -1445,10 +1518,15 @@ def import_file(path, data, home, dry_run=False):
             except Exception:
                 con.execute("ROLLBACK")
                 raise
-        return {"ok": True, "store": True, "plan": plan_id, "version": version,
-                "title": title, "noop": bool(row), "dry_run": bool(dry_run)}
+        reply = {"ok": True, "store": True, "plan": plan_id, "version": version,
+                 "title": title, "noop": bool(row), "dry_run": bool(dry_run)}
     finally:
         con.close()
+    if dry_run:
+        reply["moved"] = [{"from": a, "to": b} for a, b in moves]
+    else:
+        reply["moved"] = _inbox_move(moves, inbox[0]) if inbox else []
+    return reply
 
 
 def delete_plan(plan_id, data, home):
@@ -2592,6 +2670,57 @@ def self_test():
         assert out["plan"] == "imp5" and out["title"] == "Dry Title", out
         assert plans_rows("imp5")[0] == 0
         assert open(imp5, "rb").read() == blob5
+
+        # L10.6: inbox plans move into the project. The home is the one the import above used.
+        def inbox_plan(pid, header_id=None, docs=("notes.md", "mock/a.png")):
+            d = os.path.join(mkpaths.inbox_dir(home), pid)
+            for rel in docs:
+                os.makedirs(os.path.dirname(os.path.join(d, rel)), exist_ok=True)
+                with open(os.path.join(d, rel), "w") as f:
+                    f.write(f"doc {rel}\n")
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "plan.md"), "w") as f:
+                f.write(plan_text(plan=f'plan = "{header_id or pid}"',
+                                  phases=phase("P1", tasks=task("P1.1")) + "\n"))
+            return d
+        ib = inbox_plan("ibx1")
+        plan_md_bytes = open(os.path.join(ib, "plan.md"), "rb").read()
+        tgt_plan, tgt_assets = mkpaths.plan_file(data, "ibx1"), os.path.join(mkpaths.plan_dir(data, "ibx1"), "assets")
+        # dry-run: lists every move, changes nothing
+        out = mk("import", ib, "--dry-run", "--data", data, "--home", home)
+        assert out["ok"] and len(out["moved"]) == 3 and out["moved"][0]["to"] == tgt_plan, out
+        assert os.path.isdir(ib) and not os.path.exists(tgt_plan) and plans_rows("ibx1")[0] == 0
+        # a target plan.md with other bytes: refused, nothing moved, no row
+        os.makedirs(os.path.dirname(tgt_plan), exist_ok=True)
+        with open(tgt_plan, "w") as f:
+            f.write("someone else's plan\n")
+        out = mk("import", ib, "--data", data, "--home", home)
+        assert out["ok"] is False and out["reason"] == "target exists", out
+        assert os.path.isfile(os.path.join(ib, "notes.md")) and plans_rows("ibx1")[0] == 0
+        os.unlink(tgt_plan)
+        # a taken asset name refuses too
+        os.makedirs(tgt_assets, exist_ok=True)
+        with open(os.path.join(tgt_assets, "notes.md"), "w") as f:
+            f.write("other\n")
+        out = mk("import", os.path.join(ib, "plan.md"), "--data", data, "--home", home)
+        assert out["ok"] is False and out["reason"] == "target exists", out
+        assert not os.path.exists(tgt_plan)
+        os.unlink(os.path.join(tgt_assets, "notes.md"))
+        # the real move: row recorded, files at targets, source bytes kept, inbox folder gone
+        out = mk("import", ib, "--data", data, "--home", home)
+        assert out["ok"] and len(out["moved"]) == 3 and plans_rows("ibx1")[0] == 1, out
+        assert open(tgt_plan, "rb").read() == plan_md_bytes
+        assert open(os.path.join(tgt_assets, "notes.md")).read() == "doc notes.md\n"
+        assert open(os.path.join(tgt_assets, "mock", "a.png")).read() == "doc mock/a.png\n"
+        assert not os.path.exists(ib), "the emptied inbox folder was not removed"
+        # header id differs from the folder name: refused, nothing moved
+        bad = inbox_plan("ibx2", header_id="other-id")
+        out = mk("import", bad, "--data", data, "--home", home)
+        assert out["ok"] is False and "plan id" in out["reason"], out
+        assert os.path.isfile(os.path.join(bad, "notes.md")) and plans_rows("other-id")[0] == 0
+        # outside the inbox: unchanged behaviour, moved is empty, the file stays
+        out = mk("import", imp1, "--data", data, "--home", home)
+        assert out["ok"] and out["moved"] == [] and os.path.isfile(imp1), out
 
         # 6. delete moves the plan file into plans/archive and never unlinks it; a clash with an
         # existing archive name gets a timestamp suffix
