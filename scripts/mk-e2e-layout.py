@@ -814,6 +814,16 @@ def build_rules():
                 want.add(_rel(ctx, mkpaths.project_db_in(data)))  # legacy frozen copy
             else:
                 want.add(_rel(ctx, mkpaths.project_db_in(data)))
+        # L10.10a R2: one folder never holds a new-name store and a legacy mk.db (the legacy
+        # file is drift). A fresh home's stores carry the new names because `want` names them
+        # (root_db_in/project_db_in); a pre-migration data dir may keep either name, never both.
+        names = {}
+        for p in found:
+            names.setdefault(os.path.dirname(p), set()).add(os.path.basename(p))
+        for folder, have in sorted(names.items()):
+            if mkpaths.LEGACY_DB_NAME in have and have & {mkpaths.ROOT_DB_NAME, mkpaths.PROJECT_DB_NAME}:
+                new = sorted(have - {mkpaths.LEGACY_DB_NAME})[0]
+                bad.append(f"legacy {mkpaths.LEGACY_DB_NAME} beside {new} in {folder or '.'}")
         stray = sorted(p for p in found if p not in want)
         missing = sorted(p for p in want if p not in found)
         ok = not stray and not missing and not bad
@@ -2079,6 +2089,24 @@ def _mutations(_unused):
         finally:
             con.close()
 
+
+    @m("R01", "a legacy-named store beside the new root store", f"{mkpaths.LEGACY_DB_NAME} beside {mkpaths.ROOT_DB_NAME}")
+    def _(f):
+        with open(os.path.join(f["home"], mkpaths.LEGACY_DB_NAME), "w", encoding="utf-8") as fh:
+            fh.write("not a store")
+
+    @m("R01", "a legacy-named store beside the new project store", f"{mkpaths.LEGACY_DB_NAME} beside {mkpaths.PROJECT_DB_NAME}")
+    def _(f):
+        with open(os.path.join(f["home"], "projects", f["slug"], mkpaths.LEGACY_DB_NAME),
+                  "w", encoding="utf-8") as fh:
+            fh.write("not a store")
+
+    @m("R03", "bus.jsonl left at the pre-L10.7 run folder, not the plan's runs/", "plans/")
+    def _(f):
+        want = os.path.join(mkpaths.target_run_dir(f["slug"], f["plan"], f["run"], f["home"]), "bus.jsonl")
+        old = os.path.join(f["home"], "projects", f["slug"], "runs", f["run"])
+        os.makedirs(old)
+        os.replace(want, os.path.join(old, "bus.jsonl"))
 
     @m("R01", "disagreeing db_paths for one data dir", "disagreeing")
     def _(f):
