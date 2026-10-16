@@ -676,7 +676,7 @@ def self_test():
         os.environ["MK_HOME"] = home
         os.environ["MATRIXKODER_HOME"] = home
         os.environ["MK_SELFTEST"] = "1"
-        yaml = os.path.join(tmp, "matrixkoder.yaml")
+        yaml = mkpaths.legacy_yaml(tmp)
         open(yaml, "w").write(
             "agents:\n"
             "  opencode: { available: true, models: [opencode/alpha, opencode/beta] }\n"
@@ -805,7 +805,7 @@ def self_test():
         _check(os.listdir(empty) == [], f"model created {os.listdir(empty)}")
         # writers still create the store; fixtures live beside the home, not inside it
         side = tempfile.mkdtemp(dir=os.path.dirname(empty))
-        yaml = os.path.join(side, "matrixkoder.yaml")
+        yaml = mkpaths.legacy_yaml(side)
         open(yaml, "w").write("agents:\n  opencode: { available: true, models: [opencode/alpha] }\n")
         jev = os.path.join(side, "models.md")
         open(jev, "w").write("## Codex (official)\n\n| Model | Jev note |\n|---|---|\n| `gpt-6-luna` | fast |\n")

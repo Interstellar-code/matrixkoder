@@ -165,7 +165,7 @@ def store_on(data):
     if not data:
         return False
     try:
-        return os.path.exists(os.path.join(mkpaths.project_dir(data_dir=data), "mk.db"))
+        return os.path.exists(mkpaths.db_in(mkpaths.project_dir(data_dir=data)))
     except mkpaths.Fail:
         return False
 
@@ -1100,7 +1100,7 @@ def self_test():
         assert r["task"]["status"] == "verifying" and r["task"]["last_commit"] == "abc123"
         r = record({"state": "WATCH_EXPIRED", "commit": good}, "P1", data)
         assert r["ok"] and r["event"]["type"] == "note"
-        evs = [json.loads(x) for x in open(os.path.join(data, "runs", "r1", "events.jsonl"))]
+        evs = [json.loads(x) for x in open(mkpaths.events_doc_in(mkpaths.legacy_run_dir(data, "r1")))]
         tr = [(e["from"], e["to"], e["by"]) for e in evs if e["type"] == "transition" and e["from"]]
         assert ("building", "stalled", "lane-watch") in tr and ("stalled", "verifying", "lane-watch") in tr
         assert "lane-watch STALL: agent idle 11 min" in [e["text"] for e in evs]
@@ -1109,7 +1109,7 @@ def self_test():
         mks("task", "set", "P1", "status=review")
         r = record({"state": "STALL", "commit": other, "evidence": ["late"]}, "P1", data)
         assert r["ok"] and "event" in r and "status review kept" in r["event"]["text"]
-        assert json.load(open(os.path.join(data, "runs", "r1", "run.json")))["tasks"][0]["status"] == "review"
+        assert json.load(open(mkpaths.run_doc_in(mkpaths.legacy_run_dir(data, "r1"))))["tasks"][0]["status"] == "review"
 
         # a parent task: mk-state refuses status= on it ("status rolls up from children"), so the
         # verdict goes to every child, never the parent (which only rolls up)
@@ -1119,7 +1119,7 @@ def self_test():
             mks("task", "set", c, "status=building")
 
         def statuses():
-            run_ = json.load(open(os.path.join(data, "runs", "r1", "run.json")))
+            run_ = json.load(open(mkpaths.run_doc_in(mkpaths.legacy_run_dir(data, "r1"))))
             return {t["id"]: t for t in run_["tasks"]}
 
         r = record({"state": "DONE", "commit": good, "evidence": ["commit x"]}, "P2", data)
@@ -1141,7 +1141,7 @@ def self_test():
         st = statuses()
         assert (st["C1"]["status"], st["C2"]["status"], st["C3"]["status"]) == \
             ("stalled", "review", "stalled"), st
-        evs2 = [json.loads(x) for x in open(os.path.join(data, "runs", "r1", "events.jsonl"))]
+        evs2 = [json.loads(x) for x in open(mkpaths.events_doc_in(mkpaths.legacy_run_dir(data, "r1")))]
         assert any(e.get("task") == "C2" and "status review kept" in e.get("text", "") for e in evs2)
         # nested groups: a child that is itself a parent never gets the write either — the verdict
         # lands on the subtree's leaves, intermediate parents roll up
@@ -1195,7 +1195,7 @@ def self_test():
         mks("task", "add", "--id", "E2", "--title", "e2", "--parent", "P6")
         mks("task", "set", "E1", "status=building")
         mks("task", "set", "E2", "status=building")
-        e2json = os.path.join(data, "runs", "r1", "tasks", "E2", "task.json")
+        e2json = mkpaths.task_doc_in(os.path.join(mkpaths.legacy_run_dir(data, "r1"), "tasks", "E2"))
         os.unlink(e2json)
         os.makedirs(e2json)  # unwritable: the write fails, the error is reported
         r = record({"state": "DONE", "commit": good, "evidence": ["commit x"]}, "P6", data)
@@ -1234,7 +1234,7 @@ def self_test():
         out = cli("--commit-grep", r"feat\(p1\)", "--phase", "P1", "--kind", "codex", "--prompt-marker",
                   "Read and follow brief-r1.md", "--poll", "0.1", "--task", "P3", "--data", data)
         assert out["state"] == "DONE" and out["state_written"] is True, out
-        assert json.load(open(os.path.join(data, "runs", "r1", "run.json")))["tasks"][-1]["status"] == "verifying"
+        assert json.load(open(mkpaths.run_doc_in(mkpaths.legacy_run_dir(data, "r1"))))["tasks"][-1]["status"] == "verifying"
         # CLI end to end on a parent: the verdict reaches its children through the same record()
         mks("task", "add", "--root", "--id", "P4", "--title", "cli group")
         for c in ("D1", "D2", "D3"):
@@ -1415,18 +1415,18 @@ def self_test():
 
         # --- the project store (D5A.1): reads go through mkdb; files are the fallback --------
         # self-hosting guard: every run above was the file path; none of them created a store
-        assert not os.path.exists(os.path.join(data, "mk.db")), "a watch created mk.db"
+        assert not os.path.exists(mkpaths.db_in(data)), "a watch created mk.db"
         out = cli("--commit-grep", "nomatch", "--poll", "0.1", "--stall-min", win(0.02, 0.06)[0],
                   "--max-wait-min", win(0.02, 0.06)[1], "--task", "P3", "--data", data)
         assert out["state"] == "STALL" and out["state_written"], out  # file path, still works
-        assert not os.path.exists(os.path.join(data, "mk.db")), "file-path run created mk.db"
+        assert not os.path.exists(mkpaths.db_in(data)), "file-path run created mk.db"
         # undo the E2 fixture (task.json is a directory) BEFORE enabling: store enable republishes
         # every view, and a directory there fails the publish
         shutil.rmtree(os.path.join(data, "runs", "r1", "tasks", "E2"), ignore_errors=True)
         os.makedirs(os.path.join(data, "runs", "r1", "tasks", "E2"))
         r = subprocess.run([sys.executable, MK_STATE, "store", "enable", "--data", data],
                            capture_output=True, text=True)
-        assert r.returncode == 0 and os.path.getsize(os.path.join(data, "mk.db")) > 0, (r.stdout, r.stderr, os.listdir(data))
+        assert r.returncode == 0 and os.path.getsize(mkpaths.db_in(data)) > 0, (r.stdout, r.stderr, os.listdir(data))
 
         # store-first: no status file in the lane, the tasks row IS the channel -> DONE, source=store
         mks("task", "add", "--root", "--id", "S4", "--title", "store")
@@ -1580,7 +1580,7 @@ def self_test():
         assert fresh and fresh["status"] == "done", dict(fresh) if fresh else fresh
 
         # W1: a store read failure is a named reason, never a silent None, and decide keeps watching
-        dbp = os.path.join(data, "mk.db")
+        dbp = mkpaths.db_in(data)
         os.rename(dbp, dbp + ".w1bak")
         os.mkdir(dbp)
         try:
@@ -1616,7 +1616,7 @@ def self_test():
             cwks("task", "add", "--id", _c, "--title", _c, "--parent", "CW")
         cwks("task", "add", "--root", "--id", "CLeaf", "--title", "leaf")
         # (e) pre-migration: no store, so the run documents answer
-        assert not store_on(cw) and not os.path.exists(os.path.join(cw, "mk.db"))
+        assert not store_on(cw) and not os.path.exists(mkpaths.db_in(cw))
         assert child_tasks("CW", cw) == ["Ca", "Cb", "Cc"], child_tasks("CW", cw)
         assert child_tasks("CW", cw, "cr1") == ["Ca", "Cb", "Cc"]
         assert child_tasks("CLeaf", cw) == [], "a leaf has no children"

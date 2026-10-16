@@ -37,6 +37,9 @@ import sys
 import tempfile
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
+import mkpaths  # noqa: E402  C1: every MK path
+
 MK_STATE = os.path.join(REPO_ROOT, "scripts", "mk-state.py")
 MKDB = os.path.join(REPO_ROOT, "scripts", "mkdb.py")
 OUT_JSON = os.path.join(REPO_ROOT, "hooks", "fixtures", "run-snapshot.json")
@@ -97,7 +100,7 @@ def file_views(data) -> dict:
     """The retired views, captured before the store exists — the ground truth the reader must match."""
     runs = os.path.join(data, "runs")
     view = {}
-    for rel, key in (("index.json", "runs"), (os.path.join(RUN_ID, "run.json"), "run")):
+    for rel, key in (("index.json", "runs"), (mkpaths.run_doc_in(RUN_ID), "run")):
         path = os.path.join(runs, rel)
         with contextlib.suppress(OSError, ValueError):
             with open(path) as fh:

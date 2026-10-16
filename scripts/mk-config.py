@@ -393,7 +393,7 @@ def catalog_routes():
     cached for the process, so one `list` starts at most one subprocess."""
     if "routes" in _ROUTES_CACHE:
         return _ROUTES_CACHE["routes"]
-    if not os.path.isfile(os.path.join(catalog_home(), "mk.db")):
+    if not os.path.isfile(mkpaths.db_in(catalog_home())):
         _ROUTES_CACHE["routes"] = None  # no store: do not call the catalog, it would create one
         return None
     try:
@@ -645,7 +645,7 @@ def patch(lines, r, value):
 
 
 LOCK_WAIT_S = 5  # a Settings save waits this long for another writer, then refuses; never hangs
-LOCK_NAME = "matrixkoder.yaml.lock"
+LOCK_NAME = mkpaths.LEGACY_YAML_NAME + ".lock"
 
 
 @contextlib.contextmanager
@@ -1970,7 +1970,7 @@ def self_test():
         restore = pin_tmp_data(tmp)  # the in-process calls below must resolve here, not in a real repo
         data, home, yaml_path = os.path.join(tmp, "data"), os.path.join(tmp, "home"), None
         os.makedirs(data, exist_ok=True)
-        yaml_path = os.path.join(data, "matrixkoder.yaml")
+        yaml_path = mkpaths.legacy_yaml(data)
         with open(FIXTURE) as f:
             fixture = f.read()
         env = dict(os.environ, MATRIXKODER_DATA=data, MATRIXKODER_HOME=home,
@@ -2611,7 +2611,7 @@ def self_test():
         real_yaml = "/Users/rohits/Development/matrixkoder/.matrixkoder/matrixkoder.yaml"
         prod = os.path.join(tmp, "prod")
         os.makedirs(prod)
-        shutil.copy(real_yaml, os.path.join(prod, "matrixkoder.yaml"))
+        shutil.copy(real_yaml, mkpaths.legacy_yaml(prod))
         subprocess.run([sys.executable, script, "--data", prod, "set",
                         "session.selftest_jobs_total", "2"], check=True,
                        capture_output=True, text=True)
@@ -2652,7 +2652,7 @@ def self_test():
 
         def trace(data, env_jobs, text=None):
             if text is not None:
-                with open(os.path.join(data, "matrixkoder.yaml"), "w") as f:
+                with open(mkpaths.legacy_yaml(data), "w") as f:
                     f.write(text)
             stamp = os.path.join(tmp, "trace-%s" % time.time())
             slots = stamp + ".slots"
@@ -2679,7 +2679,7 @@ def self_test():
                 peak = sum(1 for t in times if t < t0 + 0.35)
             return p, got, peak
 
-        base = open(os.path.join(prod, "matrixkoder.yaml")).read()
+        base = open(mkpaths.legacy_yaml(prod)).read()
         p_env, j_env, peak_env = trace(prod, "1")
         assert p_env.returncode == 0 and j_env == "1" and peak_env == 1, (j_env, peak_env, p_env.stdout, p_env.stderr)
         assert p_env.stderr == "", p_env.stderr
@@ -2920,7 +2920,7 @@ def self_test():
             proc.wait(timeout=max(30, LOCK_WAIT_S + spawn_s * 20))
         after = rd()
         assert "stall_min: 22" in after and "max_wait_min: 40" in after, after
-        hold = os.path.join(data, "matrixkoder.yaml.lock")
+        hold = mkpaths.legacy_yaml(data) + ".lock"
         hf = open(hold, "a")
         fcntl.flock(hf, fcntl.LOCK_EX)
         try:
@@ -3017,7 +3017,7 @@ def self_test():
             con.execute("COMMIT")
         finally:
             con.close()
-        with open(os.path.join(mig_data, "matrixkoder.yaml"), "w") as f:
+        with open(mkpaths.legacy_yaml(mig_data), "w") as f:
             f.write(fixture)
         _mkdb.open_project(mig_home, "mig", data_dir=mig_data).close()
         switched = subprocess.run(
@@ -3026,7 +3026,7 @@ def self_test():
             capture_output=True, text=True, env=dict(os.environ, MK_SELFTEST="1"))
         assert switched.returncode == 0, f"mk-migrate --switch: {switched.stdout}{switched.stderr}"
         c2 = os.path.join(mig_home, "projects", "mig")
-        real_yaml = os.path.join(c2, "project.yaml")
+        real_yaml = mkpaths.project_yaml_in(c2)
         assert os.path.isfile(real_yaml), f"the switch did not place project.yaml: {os.listdir(c2)}"
 
         def run_mig(*args, ok=True, home_dir=mig_home):
@@ -3045,7 +3045,7 @@ def self_test():
         assert legacy_file == c2_file == real_yaml, (legacy_file, c2_file, real_yaml)
         # migrate through the C2-folder form writes nothing new: no phantom matrixkoder.yaml
         run_mig("--data", c2, "migrate")
-        assert not os.path.exists(os.path.join(c2, "matrixkoder.yaml")), \
+        assert not os.path.exists(mkpaths.legacy_yaml(c2)), \
             f"migrate created a phantom beside project.yaml: {os.listdir(c2)}"
         # and a set through the C2 folder lands in the real project.yaml, not a phantom
         before_set = open(real_yaml).read()
@@ -3055,7 +3055,7 @@ def self_test():
         assert open(real_yaml).read() == before_set, "set rewrote the yaml of a project with a store"
         got = run_mig("--data", c2, "get", "session.stall_min")
         assert got["value"] == 21 and got["source"] == "project", got
-        assert not os.path.exists(os.path.join(c2, "matrixkoder.yaml")), "set wrote a phantom yaml"
+        assert not os.path.exists(mkpaths.legacy_yaml(c2)), "set wrote a phantom yaml"
 
         # ---- L10.3: layered settings (project DB > global mk-settings.yaml > project yaml > default) ----
         def sha(path):
@@ -3065,7 +3065,7 @@ def self_test():
         def mkproj(name, yaml_text):
             d = os.path.join(tmp, name)
             os.makedirs(d, exist_ok=True)
-            with open(os.path.join(d, "matrixkoder.yaml"), "w") as f:
+            with open(mkpaths.legacy_yaml(d), "w") as f:
                 f.write(yaml_text)
             mkdb.open_project(home, data_dir=d).close()  # a store: `set` now targets the project DB
             return d
@@ -3074,7 +3074,7 @@ def self_test():
                   "bogus_section:\n  a: 1\nrepo:\n  lanes: { slots: 3, bogus: 9 }\n")
         da = mkproj("l10a", l_yaml)
         gfile = os.path.join(home, "mk-settings.yaml")
-        yaml_hash = sha(os.path.join(da, "matrixkoder.yaml"))
+        yaml_hash = sha(mkpaths.legacy_yaml(da))
         g = run("--data", da, "get", "session.stall_min")
         assert (g["value"], g["source"]) == (17, "legacy"), g
         sg = run("--data", da, "set", "session.stall_min", "18", "--global")
@@ -3108,7 +3108,7 @@ def self_test():
         run("--data", da, "unset", "bus.ask_timeout_s")
         run("unset", "no.such.key", "--data", da, ok=False)
         run("--data", da, "set", "agents.claude.available", "true", "--global", ok=False)  # not a layered key
-        assert sha(os.path.join(da, "matrixkoder.yaml")) == yaml_hash, "layered set/unset touched the yaml"
+        assert sha(mkpaths.legacy_yaml(da)) == yaml_hash, "layered set/unset touched the yaml"
         # no yaml value anywhere: the default
         db_ = mkproj("l10b", "session:\n  fresh_session: true\n")
         g = run("--data", db_, "get", "bus.ask_timeout_s")
@@ -3137,7 +3137,7 @@ def self_test():
         with open(cj, "w") as f:
             json.dump({"dashboard": {"auto_open": False, "chip": "on", "toasts": True},
                        "usage": {"poll_min": 7}, "other_toggle": 1}, f)
-        cj_hash, yaml_hash = sha(cj), sha(os.path.join(dc, "matrixkoder.yaml"))
+        cj_hash, yaml_hash = sha(cj), sha(mkpaths.legacy_yaml(dc))
         g_before = open(gfile).read() if os.path.exists(gfile) else ""
         dry = run("--data", dc, "migrate-settings", "--dry-run")
         assert dry["dry_run"] is True and [c["key"] for c in dry["carried"]] == ["session.stall_min"], dry
@@ -3152,7 +3152,7 @@ def self_test():
         g = run("--data", dc, "get", "session.stall_min")
         assert (g["value"], g["source"]) == (17, "project"), g
         assert run("--data", dc, "get", "bus.ask_timeout_s")["value"] == 120, "migrate overwrote an existing row"
-        assert sha(os.path.join(dc, "matrixkoder.yaml")) == yaml_hash, "migrate-settings changed the yaml"
+        assert sha(mkpaths.legacy_yaml(dc)) == yaml_hash, "migrate-settings changed the yaml"
         assert mig["config_json"]["status"] == "retired" and mig["config_json"]["unknown_keys"] == ["other_toggle"], mig["config_json"]
         assert sha(cj) == cj_hash, "migrate-settings changed config.json"
         gtext = open(gfile).read()

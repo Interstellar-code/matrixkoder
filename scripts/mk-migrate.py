@@ -584,7 +584,7 @@ def build_moves(data, home, slug, con, skips=None):
     lanes_json = mkpaths.lanes_file(data)
     if not lanes_rows and os.path.isfile(lanes_json):
         moves.append({"label": "lanes.json", "kind": "file", "src": lanes_json,
-                      "dst": os.path.join(target_dir(home, slug), "lanes.json")})
+                      "dst": os.path.join(target_dir(home, slug), mkpaths.LANES_NAME)})
     for pid in live_plans(con):
         moves += plan_moves(data, home, slug, con, pid, skips=skips)
     return moves
@@ -784,8 +784,8 @@ def _remove_new_copy(home, slug):
     archive) and the switch marker are never removed. The old folder and old DB are untouched."""
     tdir = target_dir(home, slug)
     dbname = mkpaths.ROOT_DB_NAME
-    for name in (dbname, dbname + "-wal", dbname + "-shm", "project.yaml", "watch-cursors.json",
-                 "lanes.json", "plans"):
+    for name in (dbname, dbname + "-wal", dbname + "-shm", mkpaths.PROJECT_YAML_NAME, mkpaths.CURSORS_NAME,
+                 mkpaths.LANES_NAME, "plans"):
         p = os.path.join(tdir, name)
         if os.path.isdir(p):
             shutil.rmtree(p, ignore_errors=True)
@@ -1182,12 +1182,12 @@ def _seed(home, data, repo, *, busy=False, ask=False):
     td = os.path.join(data, "runs", "r1", "tasks", "P1.1")
     os.makedirs(td, exist_ok=True)
     for name, body in (("brief-r1.md", b"# brief\n"), ("report-r1.md", b"# report\n"),
-                       ("review-r1.md", b"# review\n"), ("task.json", b'{"id":"P1.1"}')):
+                       ("review-r1.md", b"# review\n"), (mkpaths.TASK_DOC_NAME, b'{"id":"P1.1"}')):
         with open(os.path.join(td, name), "wb") as f:
             f.write(body)
-    with open(os.path.join(data, "watch-cursors.json"), "w") as f:
+    with open(mkpaths.legacy_cursors(data), "w") as f:
         json.dump({"r1|*": {"seq": 1, "started": None}}, f)
-    with open(os.path.join(data, "matrixkoder.yaml"), "w") as f:
+    with open(mkpaths.legacy_yaml(data), "w") as f:
         f.write("data_dir: .matrixkoder/\n")
     return plan_bytes
 
@@ -1358,7 +1358,7 @@ def self_test():
                "a non-live plan's files moved (C5: live plans only)")
         rt = mkpaths.target_task_dir("fixture", "live", "r1", "P1.1", home)
         _check(os.path.isfile(os.path.join(rt, "brief-r1.md")), "brief-r1.md not copied")
-        _check(not os.path.exists(os.path.join(rt, "task.json")), "task.json should not move (C2)")
+        _check(not os.path.exists(mkpaths.task_doc_in(rt)), "task.json should not move (C2)")
         _check(_hash_file(src_db(data)) == old_db, "the copy changed the old DB")
         _check(_tree_hash(data) == old_files, "the copy changed the old data dir")
         _check(os.path.isfile(mkpaths.target_plan_dir("fixture", "live", home) + "/archive/live-v1.md"),
@@ -1980,7 +1980,7 @@ def self_test():
         _check(rc == 0, f"Z15 rollback rc={rc} {out[-400:]}")
         _check(not os.path.exists(z15_pdir),
                f"Z15: rollback left the plan folder behind ({z15_pdir})")
-        _check(os.path.isfile(os.path.join(z15_data, "mk.db")),
+        _check(os.path.isfile(mkpaths.db_in(z15_data)),
                "Z15: rollback removed the OLD store")
         ok("z15-rollback-removes-the-plan-folder")
 
