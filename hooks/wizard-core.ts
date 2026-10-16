@@ -422,12 +422,6 @@ function portOf(url: string): number | null {
   return m?.[1] ? Number(m[1]) : null
 }
 
-/** Upserts one repo into projects.json without touching the others. */
-export function buildProjectsJson(existing: unknown, repo: string, dataDir: string, at: string): string {
-  const out = { ...rec(existing), [repo]: { data_dir: dataDir, onboarded_at: at } }
-  return `${JSON.stringify(out, null, 2)}\n`
-}
-
 /** The .gitignore text with `/.matrixkoder/` appended, or null when already ignored. */
 export function addToGitignore(text: string | null): string | null {
   const lines = (text ?? '').split('\n').map(l => l.trim())

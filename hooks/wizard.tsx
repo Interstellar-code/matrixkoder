@@ -9,7 +9,7 @@ import type { Elements as ElementTables, EngineInterface, On, PluginOptions } fr
 import type { MkWizardDraft } from '../types'
 import { globalDirPath, join, parseJson } from './data'
 import {
-  AGENT_NAMES, WIZARD_STEPS, ZAI_KEY_CMD, addToGitignore, buildProjectsJson, buildYaml,
+  AGENT_NAMES, WIZARD_STEPS, ZAI_KEY_CMD, addToGitignore, buildYaml,
   builderOrderOf, dataDirOf, EMPTY_DRAFT, emptyDraft, fallbackText, installModeOf, mergeModels, parseModels, parseProviders, parseVersion,
   parseWhich, proposeGates, providerChoices, providerLabel, slugOf,
 } from './wizard-core'
@@ -229,9 +229,8 @@ async function detect($: EngineInterface, options: PluginOptions): Promise<MkWiz
   // Default to home mode (`<globalDir>/projects/<slug>/`) for a repo that has neither a
   // data dir nor a project layout yet. A repo that already builds (a package.json, a
   // pyproject, a Makefile) keeps repo mode, and so does one that already has
-  // `<repo>/.matrixkoder`. Registering the project in the root store needs a CLI that does
-  // not exist (`register_project` is a function in mk-state.py, not a command), so the
-  // wizard still only writes projects.json.
+  // `<repo>/.matrixkoder`. The write step registers the project in the root store through
+  // `mk-state.py project register` (L10.7); <home>/projects.json is no longer written.
   if (d.dataEnv == null && d.repo != null && d.globalDir != null) {
     const repoData = await $.fs.exists(join(d.repo, '.matrixkoder')).catch(() => false)
     const established = await $.fs.exists(join(d.repo, 'package.json')).catch(() => false)
@@ -284,18 +283,9 @@ async function readExisting($: EngineInterface, path: string): Promise<string | 
   }
 }
 
-async function readJsonStrict($: EngineInterface, path: string): Promise<unknown> {
-  const text = await readExisting($, path)
-  if (text == null || text.trim() === '') return null
-  const parsed = parseJson(text)
-  if (parsed === null) throw new Error(`${path} is not valid JSON — fix or remove it, then run /mk setup again`)
-  if (typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error(`${path} is not a JSON object — fix or remove it, then run /mk setup again`)
-  return parsed
-}
-
 /** Temp file in the same dir, then `mv -f` (a rename): a crash never leaves a truncated file. $.fs has no rename.
  *  ponytail: read-merge-write of the two global files is not locked; two wizards finishing in the same
- *  few milliseconds can lose one repo's projects.json entry. Add a lock via mk-state if that ever happens. */
+ *  few milliseconds can lose one of them. Add a lock via mk-state if that ever happens. */
 async function writeAtomic($: EngineInterface, path: string, text: string): Promise<void> {
   const tmp = `${path}.tmp`
   await $.fs.write(tmp, text)
@@ -320,8 +310,6 @@ async function writeAll($: EngineInterface): Promise<void> {
     const wantGitignore = d.dataMode === 'repo' && d.dataEnv == null && d.gitignore
     const gitignoreNext = wantGitignore ? addToGitignore(await readExisting($, gitignorePath)) : null
     const globalDir = d.globalDir
-    const projectsPath = join(globalDir, 'projects.json')
-    const projects = await readJsonStrict($, projectsPath)
     const at = new Date(await $.clock.now()).toISOString()
     const written: string[] = []
     const mk = await $.process.run(['mkdir', '-p', join(data, 'plans'), join(data, 'runs'), globalDir], { timeoutMs: PROBE_MS })
@@ -339,8 +327,12 @@ async function writeAll($: EngineInterface): Promise<void> {
       await writeAtomic($, gitignorePath, gitignoreNext)
       written.push(gitignorePath)
     }
-    await writeAtomic($, projectsPath, buildProjectsJson(projects, d.repo, data, at))
-    written.push(projectsPath)
+    // L10.7: the root projects table is the registry; MK_HOME points the script at the wizard's home
+    const reg = await $.process.run(
+      ['python3', join(d.pluginRoot, 'scripts', 'mk-state.py'), 'project', 'register', '--slug', d.slug, '--repo', d.repo, '--data', data],
+      { cwd: d.repo, env: { MK_HOME: globalDir, MATRIXKODER_HOME: globalDir }, timeoutMs: PROBE_MS })
+    if (reg.exitCode !== 0) throw new Error(`could not register the project: ${(reg.stdout || reg.stderr).trim().slice(0, 120)}`)
+    written.push(`${globalDir} root projects table`)
     let herdrLinkResult = d.herdrLinkResult
     if (d.herdrPlugin === 'link') {
       try {
@@ -635,7 +627,7 @@ function Review(els: Elements, $: EngineInterface, d: MkWizardDraft, oldYaml: st
         <Text>{`${d.existingYaml && !d.replace ? 'keep   ' : d.existingYaml ? 'replace' : 'create '} ${data ?? '?'}/matrixkoder.yaml`}</Text>
         <Text>{`create  ${data ?? '?'}/plans/ and runs/`}</Text>
         {d.dataEnv == null && d.dataMode === 'repo' && d.gitignore && !d.gitignoreHas && <Text>add     /.matrixkoder/ to .gitignore</Text>}
-        <Text>{`${d.globalDir ?? '~/.matrixkoder'}/projects.json (upsert this repo)`}</Text>
+        <Text>{`${d.globalDir ?? '~/.matrixkoder'}root projects table (register this repo)`}</Text>
         {d.agents.herdr?.found && d.herdrPlugin === 'link' && <Text>{`link    ${d.pluginRoot}/herdr in herdr`}</Text>}
         {d.agents.herdr?.found && d.herdrPlugin === 'linked' && <Text dimColor={true}>herdr plugin already linked</Text>}
         {d.installMode === 'marketplace' && <Text dimColor={true}>Re-run /mk setup after each MatrixKoder update: the herdr link points at this plugin version's folder.</Text>}

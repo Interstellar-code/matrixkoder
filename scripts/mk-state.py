@@ -106,6 +106,7 @@ Legacy projects whose runs live only in files migrate through mk-store-import.py
   wait set --question TEXT --options a,b [--rec TEXT] | wait clear
   lock take RES --reason TEXT [--ttl-min 30] [--scope a,b] [--force-stale]
   lock release RES [--force] (refuses a lock taken by another --by) | lock check RES
+  project register --slug S --repo R [--name N] — upsert the project in the root projects table
   render — print the board text from the project DB (stdout, never board.md)
   store enable [--data D] — L4 no-op kept for callers: the store is always on. It reports store on
       and imports nothing; the project store (mkpaths.project_folder: <home>/projects/<slug>/mk.db
@@ -283,8 +284,9 @@ def resolve_data(arg):
 
 
 def register_project(slug, repo, data_dir, name=None):
-    """Write the project to BOTH the root projects table and <home>/projects.json (until D9).
-    The slug is checked (C11) before the root store is opened or projects.json is touched."""
+    """Write the project to the root projects table. L10.7: <home>/projects.json is no longer written
+    (the resolver still READS it as the last-resort fallback for an old home). The slug is checked
+    (C11) before the root store is opened."""
     _mkdb().check_slug(slug)
     repo = os.path.realpath(repo)
     data_dir = os.path.abspath(data_dir)
@@ -304,16 +306,6 @@ def register_project(slug, repo, data_dir, name=None):
         raise
     finally:
         con.close()
-    path = mkpaths.projects_json()
-    try:
-        with open(path) as f:
-            projects = json.load(f)
-        if not isinstance(projects, dict):
-            projects = {}
-    except (OSError, ValueError):
-        projects = {}
-    projects[repo] = {"data_dir": data_dir, "slug": slug, "onboarded_at": now()}
-    write_json(path, projects)
 
 
 def main_worktree(top):
@@ -404,8 +396,10 @@ class Store:
     @contextlib.contextmanager
     def locked(self):
         # ponytail: one flock for the whole data dir; per-run locks only if writers ever contend
-        os.makedirs(self.runs, exist_ok=True)
-        with open(mkpaths.runs_lock(self.data), "a") as f:
+        # L10.7: a migrated project's lock lives in its C2 folder, never in the legacy data dir
+        lock_dir = mkpaths.project_folder(self.data)
+        os.makedirs(mkpaths.runs_dir(lock_dir), exist_ok=True)
+        with open(mkpaths.runs_lock(lock_dir), "a") as f:
             fcntl.flock(f, fcntl.LOCK_EX)
             yield
 
@@ -1613,6 +1607,8 @@ def cmd_run(a, st):
         st.flush()
     out = {"ok": True, "run": run, **({"warning": warn} if warn else {})}
     if a.action == "set" and a.status == "done":
+        if run["status"] == "done":
+            out["bus_archive"] = archive_bus(st, run)
         out.update(checks)
         out.update(final_report(st, run))  # F.6: the closed run prints its final report
         out["promoted"] = promoted
@@ -1620,6 +1616,27 @@ def cmd_run(a, st):
             out["promote_error"] = perr
     return out
 
+
+
+def archive_bus(st, run):
+    """L10.7: a run that just closed archives its bus rows to <plan folder>/runs/<run>/bus.jsonl
+    (`mk-bus.py archive-run`: count-checked, rows deleted only after the file verifies). The status is
+    already committed here, so a failure is LOUD (exit 2, naming the retry) and never swallowed.
+    A run with no plan has no folder to hold the file: skipped, and the reply says so."""
+    if not (run.get("plan_id") or run.get("plan")):
+        return {"skipped": "run has no plan: no folder for bus.jsonl"}
+    try:
+        r = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "mk-bus.py"),
+                            "archive-run", "--run", run["id"], "--data", st.data],
+                           capture_output=True, text=True, timeout=120)
+        doc = json.loads(r.stdout.strip().splitlines()[-1]) if r.stdout.strip() else {}
+    except (OSError, subprocess.TimeoutExpired, ValueError) as e:
+        doc, r = {"error": f"{type(e).__name__}: {e}"}, None
+    if r is None or r.returncode != 0 or not doc.get("ok"):
+        why = doc.get("error") or (r.stderr if r else "").strip()[-300:] or "no output"
+        raise Fail(f"run {run['id']} is done but its bus archive failed: {why} — retry: "
+                   f"mk-bus.py archive-run --run {run['id']} --data {st.data}")
+    return {k: doc.get(k) for k in ("path", "messages", "acks", "artifacts", "written")}
 
 
 def final_report(st, run):
@@ -1642,7 +1659,7 @@ def archive_backup(st, run):
     """VACUUM INTO a new file, check it holds the run, then rename it into place.
     An existing <run>.db is kept: the new backup is <run>-<UTC timestamp>.db. A failure removes
     the temp file and raises, before the run is marked archived."""
-    dest_dir = os.path.join(st.data, "archive")
+    dest_dir = os.path.join(mkpaths.project_folder(st.data), "archive")  # L10.7: never the legacy dir of a migrated project
     os.makedirs(dest_dir, exist_ok=True)
     final = os.path.join(dest_dir, run["id"] + ".db")
     if os.path.exists(final):
@@ -3428,6 +3445,13 @@ def cmd_render(a, st):
         return {"ok": True, "board": st.render(st.load(a.run))}
 
 
+def cmd_project(a, st):
+    """`project register --slug S --repo R [--name N] [--data D]` (L10.7): the wizard's way into the
+    root projects table (it used to write <home>/projects.json itself). One upsert, nothing else."""
+    register_project(a.slug, a.repo, st.data, name=a.name)
+    return {"ok": True, "slug": a.slug, "repo": os.path.realpath(a.repo), "data_dir": os.path.abspath(st.data)}
+
+
 def cmd_store(a, st):
     with st.locked():
         if a.action == "status":
@@ -3589,6 +3613,10 @@ def build_parser():
     stc = sub.add_parser("store").add_subparsers(dest="action", required=True)
     for name in ("enable", "status"):
         stc.add_parser(name, parents=[data_p]).set_defaults(func=cmd_store)
+    pc = sub.add_parser("project").add_subparsers(dest="action", required=True)
+    pr = pc.add_parser("register", parents=[data_p])
+    pr.add_argument("--slug", required=True), pr.add_argument("--repo", required=True), pr.add_argument("--name")
+    pr.set_defaults(func=cmd_project)
     sy = sub.add_parser("sync", parents=[data_p])
     sy.add_argument("--project")
     sy.set_defaults(func=cmd_sync)
@@ -5409,6 +5437,8 @@ def self_test():
         x31_r2_fixes_self_test(tmp, env)
         print("mk-state x31-r2-fixes self-test ok")
         gate_run_self_test(tmp, env)
+        stray_writers_self_test(tmp, env)
+        print("mk-state stray-writers self-test ok")
         fidelity_self_test(tmp, env)
         rework_round_self_test(tmp, env)
         lessons_lint_self_test()
@@ -6066,7 +6096,9 @@ def store_self_test(tmp, env):
     # plan there is no plan_summary row to write, so the root file is only created by a registration
     # or a plan. What must still hold: no fake home inside the data dir.
     assert not os.path.exists(os.path.join(from_json, ".mk-home")), "a fake home must not be created"
-    # register writes BOTH, and the root table then wins over a stale projects.json
+    # L10.7: register writes the root table ONLY; the stale projects.json is read, never written
+    pj_path = os.path.join(reg_home, "projects.json")
+    pj_stat = (os.stat(pj_path).st_mtime_ns, os.stat(pj_path).st_size, open(pj_path, "rb").read())
     saved = {k: os.environ.get(k) for k in ("MK_HOME", "MATRIXKODER_HOME")}
     os.environ["MK_HOME"] = reg_home
     os.environ["MATRIXKODER_HOME"] = reg_home
@@ -6079,6 +6111,13 @@ def store_self_test(tmp, env):
             else:
                 os.environ[k] = v
     assert os.path.exists(os.path.join(reg_home, "mk.db"))
+    # the CLI form the wizard calls: root row yes, projects.json no
+    cli_home = os.path.join(tmp, "cli-reg-home")
+    r = subprocess.run([sys.executable, os.path.abspath(__file__), "project", "register", "--slug", "clireg",
+                        "--repo", reg_repo, "--data", from_root], capture_output=True, text=True,
+                       env=dict(env, MATRIXKODER_HOME=cli_home, MK_HOME=cli_home))
+    assert r.returncode == 0 and json.loads(r.stdout)["slug"] == "clireg", (r.stdout, r.stderr)
+    assert os.path.isfile(mkpaths.root_db(cli_home)) and not os.path.exists(os.path.join(cli_home, "projects.json"))
     # an invalid slug is refused before any file is written
     slug_home = os.path.join(tmp, "slug-home")
     os.makedirs(slug_home)
@@ -6098,8 +6137,9 @@ def store_self_test(tmp, env):
     finally:
         os.environ["MK_HOME"] = reg_home
         os.environ["MATRIXKODER_HOME"] = reg_home
-    listed = json.load(open(os.path.join(reg_home, "projects.json")))
-    assert listed[os.path.realpath(reg_repo)]["data_dir"] == os.path.abspath(from_root)
+    assert (os.stat(pj_path).st_mtime_ns, os.stat(pj_path).st_size, open(pj_path, "rb").read()) == pj_stat, \
+        "register_project wrote projects.json"
+    assert mkpaths.root_data_dir(os.path.realpath(reg_repo)) == os.path.abspath(from_root)
     r = subprocess.run([sys.executable, os.path.abspath(__file__), "run", "init", "--id", "rt1",
                         "--feature", "R", "--branch", "br"], cwd=reg_repo,
                        capture_output=True, text=True, env=dict(env, MATRIXKODER_HOME=reg_home, MK_HOME=reg_home))
@@ -6715,6 +6755,82 @@ def r2_fixes_self_test(tmp, env):
             "an upper-case run id in a dep did not resolve"
     finally:
         con.close()
+
+
+def stray_writers_self_test(tmp, env):
+    """L10.7: a full run cycle on a MIGRATED project (root `projects.db_path` set) writes only the
+    project DB. The legacy store, projects.json and the legacy data dir keep their mtime/size, no
+    run-folder copy (run.json / events.jsonl / board.md / task.json) appears anywhere, and
+    `run set --status done` archives the run's bus rows to <plan folder>/runs/<run>/bus.jsonl.
+    FAILS on e506cd6: register_project rewrote projects.json, and nothing archived the bus."""
+    home, repo = os.path.join(tmp, "sw-home"), os.path.join(tmp, "sw-repo")
+    legacy, slug = os.path.join(repo, ".matrixkoder"), "sw-proj"
+    os.makedirs(os.path.join(repo, ".git"))
+    os.makedirs(legacy)
+    e = {k: v for k, v in env.items() if k != "MK_SELFTEST_FALLBACK_SLUG"}
+    e.update(MK_HOME=home, MATRIXKODER_HOME=home, MK_SELFTEST="1", MK_STATE_LOADAVG="0")
+    db, paths = _mkdb(), mkpaths
+    c2 = os.path.join(home, "projects", slug)
+    lc = db.open_project(home, data_dir=legacy, legacy=True)  # the pre-switch store
+    lc.close()
+    write_json(os.path.join(home, "projects.json"), {os.path.realpath(repo): {"data_dir": legacy, "slug": slug}})
+    root = db.open_root(home)
+    try:
+        root.execute("INSERT OR REPLACE INTO projects(slug, name, repo, data_dir, mode, db_path) VALUES (?,?,?,?,?,?)",
+                     (slug, slug, os.path.realpath(repo), os.path.realpath(legacy), "home",
+                      os.path.join(c2, os.path.basename(paths.project_db(data=legacy, legacy=True)))))
+        root.commit()
+    finally:
+        root.close()
+    db.open_project(home, data_dir=legacy).close()  # the C2 store the switch made
+
+    def snap():
+        out = {}
+        for base in (legacy, os.path.join(home, "projects.json")):
+            for dirpath, _d, files in (os.walk(base) if os.path.isdir(base) else [(os.path.dirname(base), [], [os.path.basename(base)])]):
+                for f in files:
+                    st = os.stat(os.path.join(dirpath, f))
+                    out[os.path.join(dirpath, f)] = (st.st_mtime_ns, st.st_size)
+        return out
+    before = snap()
+    assert any(k.endswith("projects.json") for k in before) and any(k.endswith(".db") for k in before), before
+
+    def run(*args, code=0):
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), *args, "--data", legacy],
+                           capture_output=True, text=True, env=e, cwd=repo)
+        lines = r.stdout.strip().splitlines()
+        assert lines and r.returncode == code, (args, r.returncode, r.stdout, r.stderr)
+        return json.loads(lines[-1])
+
+    run("run", "init", "--id", "swr", "--feature", "F", "--branch", "b")
+    run("run", "set", "--run", "swr", "--plan-id", "swplan")
+    run("task", "add", "--root", "--id", "T1", "--title", "one", "--run", "swr")
+    for st_ in ("routed", "building", "verifying", "review", "merged"):
+        run("task", "set", "T1", f"status={st_}", "--run", "swr")
+    ev = db.append_event(home, None, "swr", task="T1", chan="bus", kind="info", from_id="orch", to_id="T1",
+                         text="hello bus", data_dir=legacy)
+    assert ev, ev
+    out = run("run", "set", "--run", "swr", "--status", "done")
+    arch = out.get("bus_archive") or {}
+    want = os.path.join(c2, "plans", "swplan", "runs", "swr", "bus.jsonl")
+    assert arch.get("path") == want and arch.get("messages") == 1 and os.path.isfile(want), out
+    assert "hello bus" in open(want).read(), open(want).read()
+    # the legacy store, projects.json and the legacy dir are untouched
+    assert snap() == before, {k: (before.get(k), v) for k, v in snap().items() if before.get(k) != v}
+    # no run-folder copy anywhere under the home or the repo
+    copies = {os.path.basename(x) for x in (mkpaths.run_doc("d", "r"), mkpaths.board_doc("d", "r"), mkpaths.task_doc("d", "r", "t"),
+                                            mkpaths.events_doc("d", "r"))}
+    bad = [os.path.join(d, f) for base in (home, repo) for d, _x, fs in os.walk(base) for f in fs
+           if f in copies or (f == "bus.jsonl" and os.path.join(d, f) != want)]
+    assert not bad, bad
+    # a failing archive is loud: the retry hint, a non-zero exit, never a silent done
+    run("run", "init", "--id", "swr2", "--feature", "F", "--branch", "b2")
+    run("run", "set", "--run", "swr2", "--plan-id", "swplan")
+    os.makedirs(os.path.join(c2, "plans", "swplan", "runs", "swr2"))
+    write_json(os.path.join(c2, "plans", "swplan", "runs", "swr2", "bus.jsonl"), {"x": 1})
+    db.append_event(home, None, "swr2", chan="bus", kind="info", from_id="orch", to_id="x", text="m", data_dir=legacy)
+    bad_out = run("run", "set", "--run", "swr2", "--status", "done", code=2)
+    assert "bus archive failed" in bad_out.get("error", "") and "mk-bus.py archive-run" in bad_out["error"], bad_out
 
 
 def gate_run_self_test(tmp, env):
