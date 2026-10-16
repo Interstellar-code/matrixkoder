@@ -1927,7 +1927,7 @@ def self_test():
         with open(template, "rb") as f:
             assert out["ok"] and out["sha"] == hashlib.sha256(f.read()).hexdigest()
         assert out["plan"] == "feature-id" and out["status"] == "draft" and out["runs"] == []
-        assert set(out["gates"]) == {"test", "typecheck", "selftest", "validate"}
+        assert set(out["gates"]) == {"test", "typecheck", "selftest", "validate", "c1"}
         p0 = out["phases"][0]
         assert p0["id"] == "P1" and p0["wave"] == 1 and p0["lane_group"] == "" and p0["subagents"] is True  # template default (user 2026-10-09)
         assert p0["reviewer"] == "opencode opencode-go/kimi-k3"  # template's reviewer example passes through

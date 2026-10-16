@@ -6,7 +6,7 @@
   c1-gate.py ratchet --baseline N              prints the lower baseline when count went down
   c1-gate.py --self-test
 
-Plan gate for F.3's runner:
+Plan gate for F.3's runner (the same stanza ships in skills/matrixkoder/templates/plan.md):
   [gates.c1]
   cmd = "python3 scripts/c1-gate.py check --baseline <n> --base main"
   expect = 0
@@ -196,6 +196,14 @@ def self_test():
         _git(d, "commit", "-qm", "base")
         (t / "scripts" / "a.py").write_text('n = 1\np = os.path.join(root, "mk.db")\nq = f"{r}/run.json"\nz = "lanes.json"\n')
         assert [fmt(h) for h in new_hits(scan_dir(t), scan_ref(t, "HEAD"))] == ["scripts/a.py:4: lanes.json"]
+        # check against the base: a rise exits 1 and names only the new hit; equal or lower exits 0
+        (t / "scripts" / "a.py").write_text('n = 1\np = os.path.join(root, "mk.db")\nq = f"{r}/run.json"\nz = "lanes.json"\n')
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            assert cmd_check(t, 3, "HEAD") == 1
+        assert "scripts/a.py:4: lanes.json" in buf.getvalue() and "mk.db" not in buf.getvalue(), buf.getvalue()
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert cmd_check(t, 4, "HEAD") == 0 and cmd_check(t, 5, "HEAD") == 0
         # removing a hit lowers the baseline
         (t / "scripts" / "a.py").write_text('q = f"{r}/run.json"\n')
         buf = io.StringIO()
