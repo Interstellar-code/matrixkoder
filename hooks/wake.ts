@@ -4,6 +4,7 @@ import type { EngineInterface, On, PluginOptions, Timer } from 'claude-code'
 import type { MkWakePending } from '../types'
 import { join, parseJson, sanitizeText } from './data'
 import { homeDir, paths, resolveDataDir, sessionCwd } from './paths'
+import { isLaneCwd } from './stop-guard'
 
 // $.state contract for wakeEventLines and wakeSentAt lives in types/index.d.ts
 
@@ -14,6 +15,8 @@ const HOLD_MS = 10 * 60 * 1000 // 10 minutes: a submit that threw may still have
 const CLAIM_DEAD_MS = 2 * 60 * 1000 // 2 minutes: a claim without a completed send is dead
 const HOLD_GONE = -1 // a hold that already gave up: never blocks a later identical text
 const STORE_READ_MS = 5000 // one-shot mkdb read; a timeout skips the tick (file mode is not a fallback)
+const POLL_MS = 30000 // the poll tick
+const OWNER_LEASE_MS = 3 * POLL_MS // a wake owner that has not refreshed for this long is gone
 
 /** One events.jsonl object (fallback mode), or the same shape mapped from a store row.
  *  `id` is set only in store mode. */
@@ -170,6 +173,7 @@ async function currentTaskStatus($: EngineInterface, dataDir: string, run: strin
  *  never resent within HOLD_MS; a negative value is a hold that already gave up and blocks nothing. */
 async function flushBatch($: EngineInterface): Promise<void> {
   debounceTimer = null
+  if (!(await ownsWake($))) return // the batch stays owed; the owner's own poller sends it
   const pend = await readPending($)
   if (pend.items.length === 0) return
   // Claim the batch before submitting: swap it for the sending sentinel (the
@@ -475,6 +479,38 @@ async function activeRunIdFromFiles($: EngineInterface, dataDir: string): Promis
   return entry?.id ?? null
 }
 
+/** Only the orchestrator session wakes (todo 155). Every Claude session that loads the plugin
+ *  and resolves to this project would otherwise submit the same prompt: the lane worktrees
+ *  (`isLaneCwd`, stop-guard's rule) and any second Claude pane in the main checkout.
+ *
+ *  `$.state` is the session's own, so the claim cannot live there. The lease is one
+ *  `$.store` key per data dir (the plugin's JSON file, shared by every session): `{ id, at }` with
+ *  this session's `$.session.id()`. The first session to ask takes it; the owner refreshes it on
+ *  every call; another session gets false until the owner's `at` is older than OWNER_LEASE_MS.
+ *  shortcut: the store has no compare-and-set, so the write is read back and the id compared;
+ *  two sessions racing inside one read-write gap can both see themselves win for one tick. Upgrade
+ *  to a real lock when a duplicate wake is seen in practice. */
+async function ownsWake($: EngineInterface): Promise<boolean> {
+  try {
+    if (await isLaneCwd($, await sessionCwd($))) return false
+    const me = await $.session.id()
+    const key = `wakeOwner:${await wakeDataDir($)}`
+    let now = Date.now()
+    try {
+      now = await $.clock.now()
+    } catch {
+      // clock error
+    }
+    const held = (await $.store.get(key)) as { id?: unknown; at?: unknown } | undefined
+    if (held && typeof held.id === 'string' && held.id !== me && typeof held.at === 'number' && now - held.at < OWNER_LEASE_MS) return false
+    await $.store.set(key, { id: me, at: now })
+    const back = (await $.store.get(key)) as { id?: unknown } | undefined
+    return back?.id === me
+  } catch {
+    return false // an unreadable lease or session must not make every session wake
+  }
+}
+
 async function pollEvents($: EngineInterface): Promise<void> {
   try {
     const dataDir = await wakeDataDir($)
@@ -661,6 +697,7 @@ export function registerWake(on: On, options: PluginOptions): void {
   on('session.start', { cwd: /.*/ }, async ($, e, next) => {
     const timers = wakeTimers()
     timers.pollCancel?.() // the previous evaluation's poller (a reload) or this one's re-arm
+    if (await isLaneCwd($, e.cwd || await sessionCwd($))) return next(e) // a lane never arms the poller (todo 155)
     // The epoch is the reload guard the registry cannot give alone: $.state
     // survives a hot reload even where the reload lands in a fresh module
     // realm whose globalThis differs. Every registration bumps it; a poller
@@ -669,7 +706,7 @@ export function registerWake(on: On, options: PluginOptions): void {
     const res = await $.state.get(epochRef).catch(() => ({ value: undefined }))
     const epoch = (typeof res.value === 'number' ? res.value : 0) + 1
     await $.state.set(epochRef, epoch).catch(() => {})
-    const timer = $.clock.every(30000, () => {
+    const timer = $.clock.every(POLL_MS, () => {
       void (async () => {
         const cur = await $.state.get(epochRef).catch(() => ({ value: undefined }))
         // an unreadable epoch never cancels (a read error must not eat the
@@ -678,6 +715,7 @@ export function registerWake(on: On, options: PluginOptions): void {
           timer.cancel() // a newer registration owns the poller now
           return
         }
+        if (!(await ownsWake($))) return // a lane, or another session owns the wake
         await pollEvents($)
       })()
     })

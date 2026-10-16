@@ -21,6 +21,7 @@ test('wake fires once for a new verifying event', { options: { wake: true } }, a
   }
 
   mock.env(on, { MATRIXKODER_DATA: '/data' })
+  orchestrator(on, '/tmp')
 
   on('fs.read', (_$, e) => {
     if (e.path in files) return { value: files[e.path] ?? '' }
@@ -80,6 +81,7 @@ test('first enable baselines to current lines and does not wake for history', { 
   }
 
   mock.env(on, { MATRIXKODER_DATA: '/data' })
+  orchestrator(on, '/tmp')
 
   on('fs.read', (_$, e) => (e.path in files ? { value: files[e.path] ?? '' } : { value: '' }))
   on('prompt.submit', (_$, e) => {
@@ -130,6 +132,7 @@ test('drops hostile task id injection and preserves prompt integrity', { options
   }
 
   mock.env(on, { MATRIXKODER_DATA: '/data' })
+  orchestrator(on, '/tmp')
 
   on('fs.read', (_$, e) => (e.path in files ? { value: files[e.path] ?? '' } : { value: '' }))
   on('prompt.submit', (_$, e) => {
@@ -177,6 +180,7 @@ test('5-minute per task+status cap suppresses at 2 min, allows at 6 min', { opti
   }
 
   mock.env(on, { MATRIXKODER_DATA: '/data' })
+  orchestrator(on, '/tmp')
 
   on('fs.read', (_$, e) => {
     if (e.path === '/data/runs/index.json') return { value: files[e.path] ?? '' }
@@ -297,6 +301,7 @@ test('M4: identical-text re-transition after the 10-min hold goes out as that ta
   }
 
   mock.env(on, { MATRIXKODER_DATA: '/data' })
+  orchestrator(on, '/tmp')
 
   on('fs.read', (_$, e) => {
     if (e.path === '/data/runs/index.json') return { value: files[e.path] ?? '' }
@@ -387,6 +392,7 @@ test('M4-new: a new task+to past the 10-min hold goes out (two submits, F8 case)
   }
 
   mock.env(on, { MATRIXKODER_DATA: '/data' })
+  orchestrator(on, '/tmp')
 
   on('fs.read', (_$, e) => {
     if (e.path === '/data/runs/index.json') return { value: files[e.path] ?? '' }
@@ -531,6 +537,7 @@ test('not for review event', { options: { wake: true } }, async ($, on) => {
   }
 
   mock.env(on, { MATRIXKODER_DATA: '/data' })
+  orchestrator(on, '/tmp')
 
   on('fs.read', (_$, e) => (e.path in files ? { value: files[e.path] ?? '' } : { value: '' }))
   on('prompt.submit', (_$, e) => {
@@ -573,6 +580,7 @@ test('not twice after reload', { options: { wake: true } }, async ($, on) => {
   }
 
   mock.env(on, { MATRIXKODER_DATA: '/data' })
+  orchestrator(on, '/tmp')
 
   on('fs.read', (_$, e) => (e.path in files ? { value: files[e.path] ?? '' } : { value: '' }))
   on('prompt.submit', (_$, e) => {
@@ -619,6 +627,7 @@ test('debounce with mock clock batches events into one submit', { options: { wak
   ]
 
   mock.env(on, { MATRIXKODER_DATA: '/data' })
+  orchestrator(on, '/tmp')
 
   on('fs.read', (_$, e) => {
     if (e.path === '/data/runs/index.json') {
@@ -702,18 +711,36 @@ test('wake: false registers nothing', { options: { wake: false } }, async ($, on
 const EV = (task: string, to: string, run = 'r1') =>
   JSON.stringify({ t: '2026-10-07T20:00:00+02:00', run, task, type: 'transition', from: 'building', to }) + '\n'
 
-type WakeWorld = { submitted: string[]; store: Map<string, unknown>; failSubmits: { n: number }; seenAtSubmit: unknown[] }
+type WakeWorld = { submitted: string[]; store: Map<string, unknown>; failSubmits: { n: number }; seenAtSubmit: unknown[]; lease: Map<string, unknown>; sid: { current: string } }
+
+/** An orchestrator-like session (todo 155): cwd is a checkout root (a `.git` dir, so `isLaneCwd` is
+ *  false), `$.session.id()` answers `id.current`, and `$.store` is the shared `lease` map, the way the
+ *  plugin's JSON file is shared by every session. Hand a second session the same `lease`. */
+function orchestrator(on: On, cwd: string, id: { current: string } = { current: 'sess-A' }, lease: Map<string, unknown> = new Map(), withStat = true): void {
+  if (withStat) {
+    on('fs.stat', (_$, e, next) => (e.path === `${cwd}/.git` ? { value: { kind: 'dir', size: 0, mtimeMs: 0, isLink: false } } : next(e)))
+    on('session.cwd', (_$, _e) => ({ value: cwd })) // wakeWorld answers both itself
+  }
+  on('session.id', (_$, _e) => ({ value: id.current }))
+  on('store.get', (_$, e) => ({ value: lease.get(e.key) }))
+  on('store.set', (_$, e) => {
+    lease.set(e.key, e.value)
+    return { value: undefined }
+  })
+}
 
 /** fs from a dict (stat: dirs/files given), submit recorder, and a memory $.state for every wake key.
  *  `reads`, when given, collects the paths the fs.read handler was asked for. */
 function wakeWorld(on: On, files: Record<string, string>, dirs: string[], env: Record<string, string>, cwd: string, reads?: string[]): WakeWorld {
-  const w: WakeWorld = { submitted: [], store: new Map(), failSubmits: { n: 0 }, seenAtSubmit: [] }
+  const w: WakeWorld = { submitted: [], store: new Map(), failSubmits: { n: 0 }, seenAtSubmit: [], lease: new Map(), sid: { current: 'sess-A' } }
   mock.env(on, env)
+  orchestrator(on, cwd, w.sid, w.lease, false) // wakeWorld's own fs.stat answers the checkout root (an event registers once)
   on('fs.read', (_$, e) => {
     reads?.push(e.path)
     return { value: files[e.path] ?? '' }
   })
   on('fs.stat', (_$, e, next) => {
+    if (e.path === `${cwd}/.git` && !(e.path in files)) return { value: { kind: 'dir', size: 0, mtimeMs: 0, isLink: false } } // a checkout root: isLaneCwd is false
     if (dirs.includes(e.path)) return { value: { kind: 'dir', size: 0, mtimeMs: 0, isLink: false } }
     if (e.path in files) return { value: { kind: 'file', size: 0, mtimeMs: 0, isLink: false } }
     return next(e)
@@ -739,23 +766,6 @@ function wakeWorld(on: On, files: Record<string, string>, dirs: string[], env: R
 }
 
 const START = (cwd: string) => ({ cwd, surface: 'terminal' as const, isInteractive: true as const })
-
-test('a linked worktree (commondir ../..) polls the main checkout data dir', { options: { wake: true } }, async ($, on) => {
-  const clock = mock.clock(on)
-  const files: Record<string, string> = {
-    '/tmp/wt-lane/.git': 'gitdir: /tmp/main/.git/worktrees/lane\n',
-    '/tmp/main/.git/worktrees/lane/commondir': '../..\n',
-    '/tmp/main/.matrixkoder/runs/index.json': JSON.stringify([{ id: 'r1', status: 'active' }]),
-    '/tmp/main/.matrixkoder/runs/r1/events.jsonl': '',
-  }
-  const w = wakeWorld(on, files, [], { HOME: '/home/mk' }, '/tmp/wt-lane')
-  w.store.set('wakeEventLines:r1', 0)
-  await $.session.start(START('/tmp/wt-lane'))
-  files['/tmp/main/.matrixkoder/runs/r1/events.jsonl'] = EV('F6', 'verifying')
-  await clock.advance(30000)
-  await clock.advance(60000)
-  expect(w.submitted).toEqual(['MatrixKoder: F6 → verifying. Continue the run from its Next action.'])
-})
 
 test('the data-dir walk stops before $HOME (a dotfiles repo never makes ~/.matrixkoder project data)', { options: { wake: true } }, async ($, on) => {
   const clock = mock.clock(on)
@@ -881,9 +891,9 @@ test('home mode: the repo\'s data dir comes from $MATRIXKODER_HOME/projects.json
     '/srv/elsewhere/proj-data/runs/index.json': JSON.stringify([{ id: 'r1', status: 'active' }]),
     '/srv/elsewhere/proj-data/runs/r1/events.jsonl': '',
   }
-  const w = wakeWorld(on, files, ['/tmp/proj/.git'], { HOME: '/home/mk', MATRIXKODER_HOME: '/srv/mkhome' }, '/tmp/proj/sub')
+  const w = wakeWorld(on, files, ['/tmp/proj/.git'], { HOME: '/home/mk', MATRIXKODER_HOME: '/srv/mkhome' }, '/tmp/proj')
   w.store.set('wakeEventLines:r1', 0)
-  await $.session.start(START('/tmp/proj/sub'))
+  await $.session.start(START('/tmp/proj'))
   files['/srv/elsewhere/proj-data/runs/r1/events.jsonl'] = EV('F6', 'verifying')
   await clock.advance(30000)
   await clock.advance(60000)
@@ -1011,6 +1021,7 @@ test('F1.1: registering wake twice (a hot reload) leaves one poller — one subm
   const store = new Map<string, unknown>([['wakeEventLines:r1', 0]])
 
   mock.env(on, { MATRIXKODER_DATA: '/data' })
+  orchestrator(on, '/tmp')
   on('fs.read', (_$, e) => ({ value: files[e.path] ?? '' }))
   on('prompt.submit', (_$, e) => {
     submitted.push(e.text)
@@ -1068,6 +1079,7 @@ test('F1.2: two concurrent flushes of one batch → exactly one submit', { optio
   const store = new Map<string, unknown>([['wakeEventLines:r1', 0]])
 
   mock.env(on, { MATRIXKODER_DATA: '/data' })
+  orchestrator(on, '/tmp')
   on('fs.read', (_$, e) => {
     if (e.path === '/data/runs/r1/events.jsonl') return { value: eventLines }
     if (e.path === '/data/runs/r1/run.json' && pendingAtStatusRead === undefined && store.get('wakeSentAt:claimAt:r1:1') !== undefined) {
@@ -1199,6 +1211,7 @@ test('two bus asks 1 min apart wake twice', { options: { wake: true } }, async (
   }
 
   mock.env(on, { MATRIXKODER_DATA: '/data' })
+  orchestrator(on, '/tmp')
 
   on('fs.read', (_$, e) => {
     if (e.path === '/data/runs/index.json') return { value: files[e.path] ?? '' }
@@ -1264,6 +1277,7 @@ test('two plain blocked transitions 1 min apart wake once (old behaviour kept)',
   }
 
   mock.env(on, { MATRIXKODER_DATA: '/data' })
+  orchestrator(on, '/tmp')
 
   on('fs.read', (_$, e) => {
     if (e.path === '/data/runs/index.json') return { value: files[e.path] ?? '' }
@@ -1337,6 +1351,7 @@ test('same task and ask id in a new run wakes again inside 5 min', { options: { 
   let index = JSON.stringify([{ id: 'askA-run', status: 'active' }])
 
   mock.env(on, { MATRIXKODER_DATA: '/data' })
+  orchestrator(on, '/tmp')
 
   on('fs.read', (_$, e) => {
     if (e.path === '/data/runs/index.json') return { value: index }
@@ -1833,14 +1848,14 @@ test('the root store alone names the data dir when projects.json is absent', { o
     '/srv/store-data/runs/index.json': JSON.stringify([{ id: 'r1', status: 'active' }]),
     '/srv/store-data/runs/r1/events.jsonl': '',
   }
-  const w = wakeWorld(on, files, ['/tmp/proj/.git'], { HOME: '/home/mk', MATRIXKODER_HOME: '/srv/mkhome' }, '/tmp/proj/sub')
+  const w = wakeWorld(on, files, ['/tmp/proj/.git'], { HOME: '/home/mk', MATRIXKODER_HOME: '/srv/mkhome' }, '/tmp/proj')
   on('process.run', (_$, e) => ({
     value: e.argv.includes('projects')
       ? { exitCode: 0, stdout: files['mkdb-projects'] ?? '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
       : { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
   }))
   w.store.set('wakeEventLines:r1', 0)
-  await $.session.start(START('/tmp/proj/sub'))
+  await $.session.start(START('/tmp/proj'))
   files['/srv/store-data/runs/r1/events.jsonl'] = EV('F6', 'verifying')
   await clock.advance(30000)
   await clock.advance(60000)
@@ -1864,6 +1879,7 @@ test('F.8: a rework transition DOES wake — one submit, "F6 → rework"', { opt
   }
 
   mock.env(on, { MATRIXKODER_DATA: '/data' })
+  orchestrator(on, '/tmp')
 
   on('fs.read', (_$, e) => (e.path in files ? { value: files[e.path] ?? '' } : { value: '' }))
   on('prompt.submit', (_$, e) => {
@@ -1889,4 +1905,163 @@ test('F.8: a rework transition DOES wake — one submit, "F6 → rework"', { opt
   expect(submitted[0], 'the prompt names the rework transition').toBe(
     'MatrixKoder: F6 → rework. Continue the run from its Next action.'
   )
+})
+
+
+// ---------- L10.W: wake runs only in the orchestrator session; one lease owner per data dir ----------
+//
+// ASSUMES (production code not written yet):
+//  - a poll tick and a flush skip when isLaneCwd($, cwd) (hooks/stop-guard.ts) is true;
+//  - the owner lease lives in the plugin's $.store (shared by every session, unlike $.state) under
+//    `wakeOwner:<data dir>` = { id, at } (`id` from $.session.id(), `at` from $.clock.now()); a poll tick whose session is not the
+//    owner, while the lease is not older than 3 poll intervals (90 000 ms), neither arms the debounce
+//    nor submits; a stale or missing lease is taken over by the ticking session.
+//  - the harness has ONE engine, so "two sessions" are two ids answered by the `session.id` hook
+//    over ONE shared state store; the second session.start replaces the first poller (epoch guard),
+//    so the sessions take turns, they never tick concurrently. The test stands in for the live
+//    owner's poller by refreshing its lease by hand.
+
+const LEASE = 'wakeOwner:/data'
+const BATCH = 'MatrixKoder: F6 → verifying. Continue the run from its Next action.'
+
+/** wakeWorld over MATRIXKODER_DATA=/data in a non-lane repo-root cwd, plus a switchable session id. */
+function leaseWorld(on: On, files: Record<string, string>, id: string, env: Record<string, string> = {}, cwd = '/tmp/proj', dirs: string[] = [`${cwd}/.git`]) {
+  const w = wakeWorld(on, files, dirs, { MATRIXKODER_DATA: '/data', ...env }, cwd)
+  w.sid.current = id
+  return { w, sid: w.sid }
+}
+
+const WAKE_FILES = (): Record<string, string> => ({
+  '/data/runs/index.json': JSON.stringify([{ id: 'r1', status: 'active' }]),
+  '/data/runs/r1/events.jsonl': EV('F6', 'verifying'),
+})
+
+const noWakeKeys = (w: WakeWorld): string[] =>
+  [...w.store.keys()].filter(k => /^(wakeEventLines|wakeSentAt|wakePending|wakeOwner)/.test(k))
+
+test('control: a repo-root orchestrator cwd still wakes (the lane fixtures below are not vacuous)', { options: { wake: true } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const { w } = leaseWorld(on, WAKE_FILES(), 'sess-A')
+  w.store.set('wakeEventLines:r1', 0)
+  await $.session.start(START('/tmp/proj'))
+  await clock.advance(30000)
+  await clock.advance(60000)
+  expect(w.submitted).toEqual([BATCH])
+})
+
+const LANES: Array<[string, string, Record<string, string>, string[], Record<string, string>]> = [
+  ['a -mk-<n> slot worktree', '/tmp/proj-mk-2', {}, ['/tmp/proj-mk-2/.git'], {}],
+  ['a linked worktree (.git is a file)', '/tmp/wt', { '/tmp/wt/.git': 'gitdir: /tmp/proj/.git/worktrees/wt\n' }, [], {}],
+  ['a lane status file', '/tmp/status-lane', { '/tmp/status-lane/.matrixkoder-status.json': '{}' }, ['/tmp/status-lane/.git'], {}],
+  ['the lane PATH shim', '/tmp/proj', {}, ['/tmp/proj/.git'], { PATH: '/usr/bin:/lane/.matrixkoder-bin' }],
+]
+for (const [name, cwd, extraFiles, dirs, env] of LANES) {
+  test(`lane session (${name}) arms nothing and never submits, even with a ready wake event`, { options: { wake: true } }, async ($, on) => {
+    const clock = mock.clock(on)
+    const { w } = leaseWorld(on, { ...WAKE_FILES(), ...extraFiles }, 'sess-L', env, cwd, dirs)
+    w.store.set('wakeEventLines:r1', 0)
+    w.store.set('wakePending:', { run: 'r1', upTo: 1, items: [{ task: 'F6', to: 'verifying' }] }) // an owed batch too
+    await $.session.start(START(cwd))
+    await clock.advance(30000)
+    await clock.advance(60000)
+    await clock.advance(300000)
+    expect(w.seenAtSubmit, 'prompt.submit never called').toEqual([])
+    expect(w.submitted).toEqual([])
+    expect(w.store.get('wakeSentAt:pollEpoch'), 'no poller armed: no epoch bump').toBeUndefined()
+    expect(w.lease.get(LEASE), 'a lane never takes the lease').toBeUndefined()
+    expect(w.store.get('wakeEventLines:r1'), 'cursor untouched').toBe(0)
+    expect(noWakeKeys(w).sort()).toEqual(['wakeEventLines:r1', 'wakePending:'])
+  })
+}
+
+test('two sessions, one data dir, one store: a session that is not the lease owner never submits while the owner keeps its lease fresh', { options: { wake: true } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const { w } = leaseWorld(on, WAKE_FILES(), 'sess-B')
+  w.store.set('wakeEventLines:r1', 0)
+  const heartbeat = (): void => { w.lease.set(LEASE, { id: 'sess-A', at: clock.now() }) } // sess-A's live poller
+  heartbeat()
+  await $.session.start(START('/tmp/proj'))
+  for (let i = 0; i < 6; i++) { // 180 s: past one debounce, past the 90 s staleness bound had it not been refreshed
+    await clock.advance(30000)
+    heartbeat()
+  }
+  expect(w.seenAtSubmit, 'sess-B never called prompt.submit').toEqual([])
+  expect(w.lease.get(LEASE)).toMatchObject({ id: 'sess-A' })
+  expect(w.store.get('wakeEventLines:r1'), 'the owner still owes the lines: B did not consume them').toBe(0)
+})
+
+test('two sessions in turn on one store and one pending batch: the first claims the lease and submits, the second stays silent', { options: { wake: true } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const { w, sid } = leaseWorld(on, WAKE_FILES(), 'sess-A')
+  w.store.set('wakeEventLines:r1', 0)
+  await $.session.start(START('/tmp/proj'))
+  await clock.advance(30000) // poll: sess-A finds F6 and takes the lease
+  expect(w.lease.get(LEASE)).toMatchObject({ id: 'sess-A', at: 30000 })
+  await clock.advance(60000) // 90 s: the debounce fires, the one submit
+  expect(w.submitted).toEqual([BATCH])
+
+  // sess-B starts on the same data dir while sess-A's lease is fresh; a different owed batch is waiting
+  sid.current = 'sess-B'
+  w.store.set('wakePending:', { run: 'r1', upTo: 2, items: [{ task: 'F9', to: 'stalled' }] })
+  await $.session.start(START('/tmp/proj'))
+  for (let i = 0; i < 3; i++) { // 90 s of B ticks; sess-A's poller (stood in for by hand) keeps refreshing
+    w.lease.set(LEASE, { id: 'sess-A', at: clock.now() })
+    await clock.advance(30000)
+  }
+  expect(w.submitted, 'exactly one prompt.submit across both sessions').toEqual([BATCH])
+  expect(w.store.get('wakePending:'), 'the owed batch stays owed').toMatchObject({ items: [{ task: 'F9', to: 'stalled' }] })
+})
+
+test('a stale lease (older than 3 poll intervals) is taken over: the other session submits, once, and becomes the owner', { options: { wake: true } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const { w } = leaseWorld(on, WAKE_FILES(), 'sess-B')
+  w.store.set('wakeEventLines:r1', 0)
+  w.lease.set(LEASE, { id: 'sess-A', at: -200000 }) // sess-A died 200 s before this clock started
+  await $.session.start(START('/tmp/proj'))
+  await clock.advance(30000) // poll: the lease is 230 s old: sess-B takes it and finds F6
+  expect(w.lease.get(LEASE)).toMatchObject({ id: 'sess-B' })
+  await clock.advance(60000) // 90 s: the debounce fires
+  expect(w.submitted).toEqual([BATCH])
+  await clock.advance(300000)
+  expect(w.submitted.length, 'no second submit').toBe(1)
+  expect(w.lease.get(LEASE), 'the owner refreshes its own lease while it polls').toMatchObject({ id: 'sess-B' })
+  expect((w.lease.get(LEASE) as { at: number }).at).toBeGreaterThan(30000)
+})
+
+test('the owner dies mid-handoff: the second session stays silent while the lease is fresh, then submits once the lease goes stale', { options: { wake: true } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const { w } = leaseWorld(on, WAKE_FILES(), 'sess-B')
+  w.store.set('wakeEventLines:r1', 0)
+  w.lease.set(LEASE, { id: 'sess-A', at: 0 }) // refreshed once, at t=0, then sess-A is gone
+  await $.session.start(START('/tmp/proj'))
+  await clock.advance(30000)
+  await clock.advance(60000) // 90 s: the lease is exactly 3 intervals old, not OLDER: still sess-A's
+  expect(w.submitted, 'not yet').toEqual([])
+  await clock.advance(30000) // 120 s: stale; B takes over on this poll
+  await clock.advance(60000) // 180 s: the debounce fires
+  expect(w.submitted).toEqual([BATCH])
+  expect(w.lease.get(LEASE)).toMatchObject({ id: 'sess-B' })
+})
+
+test('solo mode and wake off: no lease is ever written (existing tests: "solo mode registers no wake hooks at all", "wake: false registers nothing")', { options: { wake: true, mode: 'solo' } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const { w } = leaseWorld(on, WAKE_FILES(), 'sess-A')
+  await $.session.start(START('/tmp/proj'))
+  await clock.advance(30000)
+  await clock.advance(60000)
+  await clock.advance(300000)
+  expect(w.submitted).toEqual([])
+  expect(noWakeKeys(w), 'solo writes no wake state, the lease included').toEqual([])
+  expect(w.lease.size, 'no lease').toBe(0)
+})
+
+test('wake off: no lease is ever written', { options: { wake: false } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const { w } = leaseWorld(on, WAKE_FILES(), 'sess-A')
+  await $.session.start(START('/tmp/proj'))
+  await clock.advance(30000)
+  await clock.advance(60000)
+  expect(w.submitted).toEqual([])
+  expect(noWakeKeys(w)).toEqual([])
+  expect(w.lease.size, 'no lease').toBe(0)
 })
