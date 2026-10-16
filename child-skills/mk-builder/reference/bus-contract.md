@@ -586,8 +586,8 @@ Messages live in the project DB, `<home>/projects/<slug>/mk.db` — the only sou
   `report`/`review` message stores a bus `artifacts` row.
 - **Run-end archive.** When a run closes, its bus messages, acks and bus artifacts are written to
   `<home>/projects/<slug>/plans/<plan>/runs/<run>/bus.jsonl` (count-checked against the rows) and
-  leave the DB. Cursors tolerate the gap: the orchestrator's watch cursors in
-  `<home>/projects/<slug>/watch-cursors.json` skip over archived seqs without replaying or
+  leave the DB. Cursors tolerate the gap: the orchestrator's watch cursors (`watch_cursors` rows in
+  the project DB) skip over archived seqs without replaying or
   stalling. A token's `project` slug finds the project DB through `mkpaths.project_db(slug)`.
 - **Id semantics.** The event row id returned by `append_event` is the SSE `Last-Event-ID` and the
   message `seq`. The wire `id` is derived as `m-<row id>` and is not stored in `meta`. A client
@@ -612,8 +612,7 @@ Messages live in the project DB, `<home>/projects/<slug>/mk.db` — the only sou
   write, so a slow SSE client cannot lock the store.
 - **Tokens.** A lane token is bound to one run and one task. It cannot write another run. Project
   isolation is the project DB: a token minted for project A's `mk.db` is not in project B's token
-  file, so it cannot open B's store. `/mk setup` always creates the project DB (file mode is
-  dropped).
+  file, so it cannot open B's store. `/mk setup` creates the project DB.
 
 
 ## 10. Root bus (C6)
@@ -621,7 +620,7 @@ Messages live in the project DB, `<home>/projects/<slug>/mk.db` — the only sou
 One bus per home: `<home>/bus/bus.json`, `<home>/bus/bus-tokens.json`, `<home>/bus/lanes/<sha256(lane)>.json`
 and `<home>/bus/ring-queue.json` (`bus/bus.lock` guards the single instance; before the projects/
 layout, until 2026-10-15, §4's `<data>/...` names were the live paths). The orchestrator's bus watch
-cursors live in `<home>/projects/<slug>/watch-cursors.json`. The process exits only when no
+cursors live in the project DB `watch_cursors` table. The process exits only when no
 project has heartbeated within the owner timeout.
 
 - **Tokens.** A lane token is scoped to one project + run + task. An orchestrator token is scoped to one project. A root token is read-only: every POST, PUT, and DELETE returns 403 before the body is parsed. Every request resolves one project from the token; a query or body project that disagrees is 403 and changes nothing. An empty project slug is refused. Run state is cached by `(project, run)`.

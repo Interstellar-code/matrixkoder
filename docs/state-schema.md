@@ -18,13 +18,13 @@ gone, and `mk-migrate.py` is the ONE migration tool.
 | Global dir | `$MK_HOME` / `$MATRIXKODER_HOME` → `~/.matrixkoder` (`mkpaths.home` — **one** rule: both env names are the MK home and must agree; TS: `mkHomeEnv`/`globalDirOf` in `hooks/paths.ts`). Plugin prefs live in the plugin's userConfig, not in this dir |
 | Root store | `<home>/mk.db` — the overview only: the `projects` row per project and one `plan_summary` row per plan (C3). No task row, no event |
 | Project store | `<home>/projects/<slug>/mk.db` — the project DB, the only per-project DB and the ONE source of truth (C4). A migrated project's root `projects.db_path` names this file; `mkpaths.project_db(slug)` resolves it (the bus follows every switch through it) |
-| Project folder | `<home>/projects/<slug>/` — holds `mk.db`, `project.yaml` (today's `matrixkoder.yaml`), `watch-cursors.json`, `legacy/` and `plans/` (the C2 tree below) |
+| Project folder | `<home>/projects/<slug>/` — holds `mk.db`, `project.yaml` (today's `matrixkoder.yaml`), `legacy/` and `plans/` (the C2 tree below). `watch-cursors.json` is no longer written: the bus watch cursors are `watch_cursors` rows in the project DB, and the file is read once as an import source |
 | Plan folder | `<home>/projects/<slug>/plans/<plan-id>/` — `plan.md`, `assets/`, `archive/` (`plan-v1.md`, `plan-v2.md` …) and `runs/` |
 | Run folder | `plans/<plan-id>/runs/<run-id>/` — `bus.jsonl` (C6) and one folder per task |
 | Task round files | `plans/<plan-id>/runs/<run-id>/<task-id>/`: `brief-rN.md`, `report-rN.md`, `review-rN.md` (paths returned by `task round`; written by the orchestrator / agents, not by mk-state; `task round --undo` refuses while any of them exists for the latest round) |
-| Lane registry | `<data>/lanes.json` — written **only** by `mk-lane.py` (see below); `mk-state.py` never touches it. It is a project-level file (the reusable worktree slots), not lane data |
+| Lane registry | With a project `mk.db`: the `lane_slots` rows of the project DB, written **only** by `mk-lane.py`; `lanes.json` is neither read nor written. File mode (no `mk.db`) only: `<data>/lanes.json`, written only by `mk-lane.py` (see below). `mk-lane.py carry-legacy` carries a pre-switch registry into the rows once. `mk-state.py` never touches either |
 | Bus files | `<home>/bus/` — `bus.json`, `bus-tokens.json`, `bus-tokens.lock`, `bus.lock`, `bus-ensure.lock`, `ring-queue.json`, `lanes/<sha256(lane)>.json` (C6) |
-| Watch cursors | `<home>/projects/<slug>/watch-cursors.json` (0600) — the orchestrator's bus watch cursors (C6) |
+| Watch cursors | The `watch_cursors` rows of the project DB (C6), keyed `<run or *>\|<task or *>`, written by `mk-bus.py`. `<home>/projects/<slug>/watch-cursors.json` (0600) is no longer written; `mk-bus.py` reads it once as the import source when a key has no row yet |
 | Locks | `<home>/locks/<resource lower-cased>.lock` |
 | Usage ledger | `<home>/usage.json` (owned by `mk-usage.py`; lane-health only adds `exhausted_*` fields, on the agent or on one pool, see below) |
 | Usage ledger lock | `<home>/usage.json.lock` — an empty sidecar every read-modify-write of `usage.json` takes as an exclusive `fcntl.flock` (`mk-usage.py`'s poll and lane-health's quota mark; the two would otherwise lose each other's fields). It holds no data, and it is derived from `<home>` rather than from the ledger path, so writers pointed at different `--out`/`--ledger` paths still serialise |
@@ -45,7 +45,6 @@ math they build on).
 └── projects/<slug>/
     ├── mk.db                     the project DB (C4) — the only per-project DB
     ├── project.yaml              today's matrixkoder.yaml
-    ├── watch-cursors.json        orchestrator bus watch cursors
     ├── legacy/                   read-only tarball of the project's old data dir (C5, after user confirm)
     └── plans/<plan-id>/
         ├── plan.md               the plan (reference after import)
@@ -64,13 +63,13 @@ files (`.matrixkoder-*` in a lane) are not data and stay.
 
 | Writer | Writes | Never touches |
 |---|---|---|
-| `mk-state.py` | the project DB (runs, tasks, events, artifacts, waits, and its `ack`/`artifact` helpers); the board text it prints; the lane locks under `<home>/locks/` (the root store only through `mkdb`'s `plan_summary` refresh / `catch_up`) | `lanes.json` |
+| `mk-state.py` | the project DB (runs, tasks, events, artifacts, waits, and its `ack`/`artifact` helpers); the board text it prints; the lane locks under `<home>/locks/` (the root store only through `mkdb`'s `plan_summary` refresh / `catch_up`) | `lanes.json`, `lane_slots` |
 | `mk-plan.py` | the project DB (`plans`, the task rows) and the plan folder (`plan.md`, `archive/<id>-v<n>.md`) | the root store |
-| `mk-lane.py` | `lanes.json` (its **only** writer) and the `lane_slots` rows of the project DB (best-effort mirror onto the task) | the run/task state tables |
+| `mk-lane.py` | the `lane_slots` rows of the project DB (the lane registry; best-effort mirror onto the task), and `lanes.json` in file mode only (no `mk.db`) | the run/task state tables |
 | `mk-migrate.py` | the root `projects.db_path` column (the ONLY root column it moves), the C2 project folder and the `legacy/` tarball | anything else |
-| `mkdb.py` | the root's `plan_summary` rows and (until L7.3 drops them) the `cards`; every project-table write | — |
+| `mkdb.py` | the root's `plan_summary` rows; every project-table write; `root-cleanup` / `restore` on the root home | — |
 | `mk-bus.py` | `<home>/bus/` files and the live bus rows of the project DB (`events` chan='bus', `acks`, bus `artifacts`) | the state tables |
-| `lane-watch.py` / `lane-health.py` | events and the quota mark in `<home>/usage.json` (see below) | `lanes.json` |
+| `lane-watch.py` / `lane-health.py` | events and the quota mark in `<home>/usage.json` (see below) | `lanes.json`, `lane_slots` |
 
 ## The project DB
 
@@ -277,9 +276,15 @@ run's messages, acks and bus artifacts are archived (count-checked) to
 
 ## `lanes.json` (slot registry, `scripts/mk-lane.py`)
 
+**File mode only.** With a project `mk.db` the `lane_slots` rows are the lane registry and
+`lanes.json` is neither read nor written; `mk-lane.py carry-legacy [--dry-run]` carries a pre-switch
+registry (the legacy store's `lane_slots` and the legacy `lanes.json`) into the rows once: it inserts
+only slots absent from the target, never overwrites a newer target row, and refuses while any slot is
+busy. The rest of this section describes the file as file mode (no `mk.db`) still uses it.
+
 It describes the reusable **worktree slots** of this project, not a run (a project-level file beside
 the data dir, not inside a run folder).
-`mk-lane.py` is its only writer and mirrors the lane it hands out onto the task (`lane`, `branch`,
+In file mode `mk-lane.py` is its only writer and mirrors the lane it hands out onto the task (`lane`, `branch`,
 `workspace`, `slot` task keys, best-effort: a failed write there is a warning on the acquire, never a
 failed one). `mk-state.py` never reads or writes it.
 
@@ -348,10 +353,10 @@ Every read-modify-write holds an exclusive `fcntl.flock` on `<data>/lanes.lock` 
 
 Notes worth knowing before you rely on it: a `switch` can overwrite an allowlisted ignored file if the
 target commit happens to track that name (git's own behaviour — keep secrets out of the base branch);
-a crash between creating the worktree and writing `lanes.json` leaves a worktree the registry does not
+a crash between creating the worktree and writing the registry (`lanes.json` in file mode) leaves a worktree the registry does not
 know (delete the directory and `git worktree prune`, then acquire again — the create path refuses an
 existing directory); `run`/`task` are stored as typed while the branch is lowercased, so `T1` and `t1`
-map to one branch; and a **hand-edited** `lanes.json` pointing a slot at another worktree of the same
+map to one branch; and a **hand-edited** registry (`lanes.json`, file mode) pointing a slot at another worktree of the same
 repo is outside what the tool can detect — it trusts its own registry, so do not edit it by hand.
 
 ## Lock file `<home>/locks/<resource>.lock`
@@ -443,7 +448,7 @@ everything else `default`.
 | `lock take` / `release` / `check` | `RES --reason TEXT [--ttl-min 30] [--scope a,b] [--force-stale]`; `release RES [--force]` |
 | `render` | print the board to **stdout** from the project DB (`{"ok": true, "board": "…"}`) |
 | `store status` / `store enable` | the project DB's presence (`on`) or the legacy one-way import (see Store mode) |
-| `sync` | `[--project SLUG]` — root-card catch-up (see Store mode) |
+| `sync` | `[--project SLUG]` — heal the root `plan_summary` rows against the project store (see Store mode) |
 
 Common flags: `--data DIR`, `--by WHO` (default `orchestrator`; written to events and locks), `--run ID`
 for task/event/wait/render (`run *` commands take `--id`, alias `--run`).
@@ -633,11 +638,13 @@ into the DB and none of these file views is written again.
 `export-legacy --run R` is removed with file mode: nothing rebuilds the old file views from the
 tables any more.
 
-`sync [--project SLUG]` catches the root `cards` up from `sync.last_change_no`: it copies the
-`change_log` rows the root is behind on and answers `{"store": "on", "project": "<slug>", "copied": N}`.
-Run again it copies nothing (`"copied": 0`) — it is idempotent, and `last_change_no` only moves
-forward. The project defaults to `matrixkoder`. `cards`/`project_summary`/`sync` stay in the root as
-a read-only view until L7.3 drops them; the root's numbers now come from `plan_summary` (C3).
+`sync [--project SLUG]` calls `catch_up()`, which recomputes the root `plan_summary` rows from the
+project store and writes only the rows that are missing or differ (a kill between the project commit
+and the root write leaves them stale). It answers `{"store": "on", "project": "<slug>", "copied": N}`,
+where `N` is the number of plan rows written; run again it writes nothing (`"copied": 0`). The
+project defaults to `matrixkoder`. There is no root `cards` copy to catch up any more: `cards`,
+`project_summary` and `sync` were dropped from the root (root v3, below) and the root's numbers come
+from `plan_summary` (C3).
 
 `run archive` first backs the project store up: `VACUUM INTO` a temp file
 (`<data>/archive/<run>.db.tmp`), checked to hold the run and its task count, then renamed to
@@ -698,8 +705,8 @@ passes a temp home; the real `~/.matrixkoder` is never created by a test.
 
 | Store | Path | Holds |
 |---|---|---|
-| Root (C3) | `<home>/mk.db` | `projects` (with `db_path`), `plan_summary`; `cards`, `project_summary`, `sync` until L7.3 drops them |
-| Project (C4) | `<home>/projects/<slug>/mk.db` for a migrated project; a slug resolves it through `projects.db_path` (`mkpaths.project_db`). A `--data` (or pre-migration slug) opens `<data>/mk.db`, the legacy location | `plans`, `runs`, `tasks`, `events`, `artifacts`, `acks`, `lane_slots`, `waits`, `change_log` |
+| Root (C3) | `<home>/mk.db` | `projects` (with `db_path`) and `plan_summary` only. `cards`, `project_summary` and `sync` are dropped by root v3 when they hold no row |
+| Project (C4) | `<home>/projects/<slug>/mk.db` for a migrated project; a slug resolves it through `projects.db_path` (`mkpaths.project_db`). A `--data` (or pre-migration slug) opens `<data>/mk.db`, the legacy location | `plans`, `runs`, `tasks`, `events`, `artifacts`, `acks`, `lane_slots`, `waits`, `change_log`, `evidence`, `risk_reasons`, `reconcile_due`, `settings`, `watch_cursors` |
 
 `<home>` is `--home` → `$MK_HOME` → `~/.matrixkoder`. `<data>` is `--data` / `data_dir`: it names
 either the project folder or (pre-migration, and for `mk-migrate`'s rollback) the project's legacy
@@ -716,8 +723,8 @@ Every open sets `journal_mode=WAL`, `busy_timeout=5000`, `foreign_keys=ON`. Ever
 
 ### `schema_version` and migrations
 
-Both stores carry `schema_version(version INTEGER PRIMARY KEY)`. The project store is `SCHEMA = 4`;
-the root store is `ROOT_SCHEMA = 2` (it migrates additively and independently). Migrations are an
+Both stores carry `schema_version(version INTEGER PRIMARY KEY)`. The project store is `SCHEMA = 7`;
+the root store is `ROOT_SCHEMA = 3` (it migrates additively and independently). Migrations are an
 ordered `(version, step)` list applied once. A step is either SQL or a Python callable. SQL steps
 are idempotent by construction (`CREATE TABLE IF NOT EXISTS`, `INSERT OR IGNORE`); an
 `ALTER TABLE ADD COLUMN` is not safe to run twice, so it goes through a guarded Python step that
@@ -728,7 +735,7 @@ newer than the code is refused:
 
 Root v2 (shipped, a guarded Python step) adds `projects.db_path` — last, matching the base
 `CREATE TABLE`'s column order — and creates the `plan_summary` table empty. Additive only: a v1
-root keeps every row it had (including its `cards`) and reaches the same shape a fresh root gets,
+root keeps every row it had (including its old `cards`) and reaches the same shape a fresh root gets,
 and re-running the step changes nothing (the column is added only when `table_info` lacks it).
 
 v2 (shipped, a Python step) adds `artifacts.src TEXT` — the importer's stable source key, NULL
@@ -751,6 +758,22 @@ rows written before the migration. `design` and `integration` hold JSON array te
 is created with those columns already on `plans`, then the v2, v3 and v4 steps run and stamp
 version 4. A v1, v2 or v3 store is upgraded in place on the next open and keeps every `plans`
 row; opening it again changes nothing.
+
+v5 (shipped, a guarded Python step, the same `PRAGMA table_info` pattern as v4) adds
+`runs.extra_json` and `tasks.extra_json`, each `TEXT` and NULL on rows written before the migration.
+Additive only: an older store keeps every row and re-running the step changes nothing.
+
+v6 (shipped) creates the empty tables `evidence`, `risk_reasons` and `reconcile_due` and their two
+indexes (described under "Schema 6" above). No existing row changes.
+
+v7 (shipped) creates the empty tables `settings(key TEXT PRIMARY KEY, value TEXT, updated TEXT)` and
+`watch_cursors(key TEXT PRIMARY KEY, seq INTEGER NOT NULL, started TEXT, updated TEXT)`. No existing
+row changes. A store older than v7 is upgraded in place on the next open.
+
+Root v3 (shipped, L10.9, `_root_v3`) drops `cards`, `project_summary` and `sync` (the pre-linkage
+copies of the project store; `ROOT_DROPPED_TABLES`) **only when the table holds no row**. A root that
+still has data in one of them keeps it, and `root-cleanup` lists it as `keep`. A fresh root never
+creates them. Re-running the step changes nothing.
 
 ### Project tables (C4)
 
@@ -780,13 +803,18 @@ artifact_id, meta_json)` with index `ev_task(run, task, id)`. `chan` is `state`,
 `kind` is the event type. Status changes go only through `transition()` (`chan='state'`,
 `kind='transition'`); `append_event` refuses that pair.
 `change_log(change_no INTEGER PRIMARY KEY, run, task, t)` — `change_no` is the rowid, gap-free.
-`lane_slots(slot TEXT PRIMARY KEY, lane_path, state, run, task, workspace, workspace_id, branch, lock_hash, updated)` — the five trailing columns are v3, each `TEXT`, and match the slot record in `lanes.json` (a published view of these rows; `workspace` and `workspace_id` are null for a plain git worktree; `branch`, `lock_hash` and `updated` are null until the slot is acquired).
+`lane_slots(slot TEXT PRIMARY KEY, lane_path, state, run, task, workspace, workspace_id, branch, lock_hash, updated)` — the five trailing columns are v3, each `TEXT`, and are the slot record (with a project `mk.db` these rows ARE the lane registry and `lanes.json` is not written; file mode keeps the same record in `lanes.json`; `workspace` and `workspace_id` are null for a plain git worktree; `branch`, `lock_hash` and `updated` are null until the slot is acquired).
 `waits(id INTEGER PRIMARY KEY, run, question, opened, cleared)` — the run's one live `waiting`
 question. `acks(run, msg, lane, level, t, PRIMARY KEY(run, msg, lane))` — the bus's ack levels (C6).
 `artifacts(id INTEGER PRIMARY KEY, run, task, round, kind, rev, text, created, src)` — `text` is
 stored byte-for-byte; `src` is the v2 source key. A round's `brief`/`report`/`review` content is
 stored here (and written to the task's folder as the round files) — no per-task file copy.
 `event_src(run, src, PRIMARY KEY(run, src))` — the importer's stable source keys.
+`settings(key TEXT PRIMARY KEY, value TEXT, updated TEXT)` (v7) — `key` maps to a JSON `value`; a
+reset is a `DELETE` of the row. Written by `mk-config`.
+`watch_cursors(key TEXT PRIMARY KEY, seq INTEGER NOT NULL, started TEXT, updated TEXT)` (v7) — the bus
+watch cursors, keyed `<run or *>|<task or *>`. Written by `mk-bus.py`; `watch-cursors.json` is no
+longer written (read once as the import source).
 
 
 ### Root tables (C3)
@@ -797,32 +825,27 @@ counts_json, live_run, updated, PRIMARY KEY(project, plan))` — new; one row pe
 numbers (`counts_json`: the task counts by status) and the linkage (`live_run`), refreshed by every
 writer. The root holds **no task row and no event**.
 
-`cards(project, run, task, parent, type, title, status, col, attention, question, route_json, lane,
-round, verdict, gates, updated, change_no, PRIMARY KEY(project, run, task))`. The root card carries
-`verdict`: the value `transition()` stored on the task (the imported verdict when a later
-status-only transition did not replace it). `col` (C4) is derived
-from `status`: Backlog (`planned`, `routed`) · Ready · Building (`dispatched`, `building`,
-`takeover`) · Verify (`verifying`) · Review · Fix · Done (`merged`, `qa`, `done`); an attention
-status (`blocked`, `stalled`, `quota`, `provider`) keeps the column of the task's previous
+The root has no card table: `cards`, `project_summary` and `sync(project PRIMARY KEY,
+last_change_no)` were the pre-linkage copies of the project store and root v3 drops them when empty
+(see the migrations above). The Kanban column rules still apply to the project store's task status.
+`col` is derived from `status`: Backlog (`planned`, `routed`) · Ready · Building (`dispatched`,
+`building`, `takeover`) · Verify (`verifying`) · Review · Fix · Done (`merged`, `qa`, `done`); an
+attention status (`blocked`, `stalled`, `quota`, `provider`) keeps the column of the task's previous
 non-attention status — `tasks.prev_status`, written by `transition()` — and sets `attention=1`.
 A task with no previous non-attention status uses Backlog. `column_of(status, prev_status=None)`
-is pure; `transition()` and the rollup do the lookup.
-`cards`, `project_summary` and `sync(project PRIMARY KEY, last_change_no)` — how far the root copy
-got, only ever moving forward (`MAX` of the stored value and the new `change_no`) — are a read-only
-view kept **until L7.3 drops them**; only `plan_summary` and `projects.db_path` are the root's real
-content.
+is pure; `transition()` and the rollup do the lookup. Only `plan_summary` and `projects.db_path`
+are the root's content.
 
 ### `transition(home, project, run, task, to, note="", round=0, sync_root=False, data_dir=None, verdict=<unchanged>)`
 
 The only status writer (C10). `verdict` is optional: omitted, the task's stored verdict is left
-unchanged; a string or `None` replaces it, and the root card (when `sync_root=True`) and a later
-`catch_up()` both copy that value. One project-store transaction updates the task row, appends an
+unchanged; a string or `None` replaces it. One project-store transaction updates the task row, appends an
 `events` row (`chan='state'`, `kind='transition'`) and a `change_log` row, and returns `change_no`.
-A failure inside it leaves nothing. The root upserts (the C5 card, `plan_summary`) are a **second**
+A failure inside it leaves nothing. The root `plan_summary` upsert is a **second**
 transaction and run only when `sync_root=True`; with `sync_root=False` the `plan_summary` refresh
 lands in its own root transaction right after the project commit, so the two can never interleave.
-A crash between them leaves the project change durable and the root behind; `catch_up()` replays
-`change_log` from `sync.last_change_no`.
+A crash between them leaves the project change durable and the root behind; `catch_up()` recomputes
+the `plan_summary` rows and writes the ones that differ.
 
 ### API and CLI
 
@@ -830,9 +853,23 @@ API: `open_root(home)`, `open_project(home, slug=None, data_dir=None)`,
 `add_task(con, run, task, type, title="", parent=None, deps="", route_json=None, status="planned")`,
 `transition(home, project, run, task, to, note="", round=0, sync_root=False, data_dir=None)`,
 `catch_up(home, project, data_dir=None)`, `timeline(home, project, run, task, data_dir=None)`,
-`cards(home, project=None)`, `overview(home)` (the root's projects + plans: numbers and `db_path`,
+`overview(home)` (the root's projects + plans: numbers and `db_path`,
 read-only, never creates the root), `check_slug`, `check_home`, `column_of(status, prev_status=None)`,
 `import_history(home, project, run, *, run_row=None, tasks=(), events=(), artifacts=(), data_dir=None)`.
+
+### `root-cleanup` and `restore`
+
+The root home can carry tables and files that later layouts replaced (`cards`, `project_summary`,
+`sync`, and `event_src`, which leaked into one real root). `mkdb.py root-cleanup` lists them:
+
+- Default (or `--dry-run`): a read-only dry run. It opens the root DB read-only, creates and changes
+  nothing, and prints the `remove`, `merge` and `keep` lists. A table that holds rows is `keep`.
+- `--apply --backup-dir D`: first makes a backup under `D/root-cleanup-<stamp>/` — a copy of `mk.db`
+  through the SQLite backup API plus every removable file, with a sha256 manifest — and verifies it
+  before anything is removed. Then it removes exactly the listed items. `--apply` without
+  `--backup-dir` is refused, and `--dry-run` with `--apply` is refused.
+- `mkdb.py restore --from <backup>` puts the root DB and every removed file back from a
+  `root-cleanup-<stamp>` folder. It saves the current DB first.
 
 ### Live writers (`append_event`, `append_ack`, `put_artifact`)
 
@@ -861,7 +898,6 @@ is accepted; a larger body is refused.
 
 ```
 mkdb.py timeline --project P --run R --task T --json [--data DIR] [--home DIR]
-mkdb.py cards [--project P] --json [--home DIR]
 mkdb.py overview --json [--home DIR]
 mkdb.py import-history --project P --run R --json-file F [--data DIR] [--home DIR]
 mkdb.py plans --json [--data DIR] [--home DIR]
@@ -881,8 +917,7 @@ answers `ok: false` and exits 2. Both reads refuse a store still at v3 ("needs m
 run a writer command"): any writer, such as `mk-plan.py import`, migrates it first.
 
 
-`timeline` is `SELECT … FROM events WHERE run=? AND task=? ORDER BY id`. `cards` reads the root
-store's read-only card view; `overview` reads the root's `projects` + `plan_summary` (C3).
+`timeline` is `SELECT … FROM events WHERE run=? AND task=? ORDER BY id`. `overview` reads the root's `projects` + `plan_summary` (C3).
 `mk-catalog.py` follows the same rule for the root store: its read commands (`list`, `show`, `routes`, `model`) go through `read_catalog`, which returns an empty result when `<home>/mk.db` is absent (`list` and `routes` answer `{"ok": true, …: []}`) and never creates it, while the writers `seed` and `set` call `open_catalog` and do create it (`set` creates it even when the agent is unknown and the command then refuses). One JSON line per call; errors exit 2, a newer store exits 3.
 
 ### `import_history(home, project, run, *, run_row=None, tasks=(), events=(), artifacts=(), data_dir=None)`
@@ -912,7 +947,7 @@ is one `BEGIN IMMEDIATE` transaction; any error rolls it back and the store is u
 
 Idempotent: an event or artifact whose `src` is already stored is skipped, and tasks and the run
 row upsert, so the same call twice adds nothing. Each task actually added gets one `change_log`
-row, so `catch_up()` can build its root card later, and the `plan_summary` rows are refreshed after
+row, and the `plan_summary` rows are refreshed after
 the commit (in their own root transaction). It returns `{runs, tasks, events, artifacts}`, the
 counts of rows actually added.
 

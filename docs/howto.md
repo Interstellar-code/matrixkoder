@@ -38,7 +38,7 @@ Steps 5 to 9 have text inputs, so they have no single-key hotkeys.
 
 On confirm the wizard writes:
 
-- `~/.matrixkoder/projects/<slug>/project.yaml` (today's `matrixkoder.yaml`) — your repo settings. If one exists you choose keep (default) or replace; replace backs the old file up to `.bak`.
+- `~/.matrixkoder/projects/<slug>/project.yaml` (today's `matrixkoder.yaml`) — your repo settings, the legacy layer under the project DB and `~/.matrixkoder/mk-settings.yaml`. If one exists you choose keep (default) or replace; replace backs the old file up to `.bak`.
 - `~/.matrixkoder/projects/<slug>/mk.db` — the project DB, the ONLY source of truth (`/mk setup` always creates it; file mode is dropped).
 - `~/.matrixkoder/mk.db` — the root DB, updated with this project's `slug, repo, data_dir, mode, db_path` row.
 - The `projects/<slug>/plans/` and `projects/<slug>/plans/<plan>/runs/` folders under `~/.matrixkoder/`, as runs are created. The repo keeps no MK data, so no gitignore entry is written.
@@ -57,7 +57,7 @@ Toggle it with `/mk` (or `/mk open`, `/mk close`). It docks on the right when th
 - **Usage**: remaining quota per agent pool, scoped to the agents your project's `project.yaml` enables (every ledger agent when it names none). An enabled agent with no ledger entry yet shows a dim hint row instead of nothing. The claude main row is labelled `claude (all)` when it covers sub-pools. `—` means the pool has no such window; `n/a` means the provider could not be polled at all; `⊘` in red means the pool is exhausted. `no ledger yet` means usage has not been polled yet.
 - **Waiting on you**: items that need your decision (full tab: hotkey `w`, `hooks/tabs/waiting.tsx` — real pending asks).
 - **Recent**: the last few events.
-- **Kanban**: per-tick cards from `mkdb.py cards --json` (hotkey `k`, `hooks/tabs/kanban.tsx`).
+- **Kanban**: per-tick cards from `mkdb.py overview --json` and `run-snapshot --json` (hotkey `k`, `hooks/tabs/kanban.tsx`).
 
 Status glyphs: `○` planned, `◇` routed, `▷` dispatched, `●` building, `⧖` verifying, `◐` review, `▲` fix, `◈` merged, `◆` QA, `✓` done, `⊘` blocked, `⧗` quota, `⚠` stalled, `⊗` provider problem.
 
@@ -71,7 +71,7 @@ The status chip under the prompt shows run health in one line; toasts announce t
 
 Say what you want in plain words, for example "orchestrate the plan in docs/plan.md". The `matrixkoder` skill takes over and runs the loop: plan, route each phase to an agent with quota left (Claude Code is spared; `scripts/mk-catalog.py routes --json` lists every runnable route, `model --pane <pane>` reads the live model from a herdr pane footer), write briefs, dispatch to herdr panes and worktrees, watch, verify, review, fix, merge, QA, and open one PR. It stops only for the human decisions listed in `skills/matrixkoder/reference/safety.md`.
 
-Dispatch uses the root bus when it is up (`scripts/mk-bus.py`, one bus per MK home: `<home>/bus/bus.json`, `<home>/bus/bus.lock`, `<home>/bus/bus-tokens.json`; the lane token file lives outside the lane at `<home>/bus/lanes/<sha256(realpath(lane))>.json` (mode 0600, `$MK_BUS_TOKEN_FILE` overrides)). File mode is dropped — `/mk setup` always creates the project DB, and `arm` no longer writes a lane-local bus file. The brief travels on the bus; live messages stay in the project DB (`events chan='bus'`, `acks`, bus `artifacts`) and are archived at run end to `plans/<plan>/runs/<run>/bus.jsonl`. The pane gets one typed doorbell line (`MK_SELFTEST_JOBS=<n> python3 <skill>/scripts/mk-builder.py connect --data <dir>`, sent by `mk-lane-event.py dispatch --connect`; a pane that is still busy after a bounded idle wait gets nothing typed and the reply says `delivered:false`, so you retry), and `connect` prints the paged brief (~24,000 chars, `read <id> --part n`) plus the phase task list. When the bus is down the dispatch falls back to the full prompt plus the brief copy in the lane (`<lane>/.matrixkoder-brief.md`) — that copy is bus-down-fallback-only, never written when the bus is up. A graceful bus stop (SIGTERM) removes `bus.json`, so the next `ensure` binds a new port while every lane token file keeps the old url and lane commands exit 4 `bus down`: re-run `arm` per active lane or `mk-bus.py token --lane <lane> --task <T> --run <R>` (`kill -9` keeps `bus.json`, the port is reused, lanes reconnect on their own). Only builder briefs travel over the bus; reviewer dispatch (`--role review`) types "Read and follow <absolute review-brief path> …" and the reviewer reads its brief over the bus (`dispatch --role review --lane`), while `connect` in a reviewer pane prints `# brief: none found`. Reviewers judge the diff only; they never rerun the builders' gates.
+Dispatch uses the root bus when it is up (`scripts/mk-bus.py`, one bus per MK home: `<home>/bus/bus.json`, `<home>/bus/bus.lock`, `<home>/bus/bus-tokens.json`; the lane token file lives outside the lane at `<home>/bus/lanes/<sha256(realpath(lane))>.json` (mode 0600, `$MK_BUS_TOKEN_FILE` overrides)). File mode is dropped — `/mk setup` always creates the project DB, and `arm` no longer writes a lane-local bus file. The brief travels on the bus; live messages stay in the project DB (`events chan='bus'`, `acks`, bus `artifacts`) and are archived at run end to `plans/<plan>/runs/<run>/bus.jsonl`. The pane gets one typed doorbell line (`MK_SELFTEST_JOBS=<n> python3 <skill>/scripts/mk-builder.py connect --data <dir>`, sent by `mk-lane-event.py dispatch --connect`; a pane that is still busy after a bounded idle wait gets nothing typed and the reply says `delivered:false`, so you retry), and `connect` prints the paged brief (~24,000 chars, `read <id> --part n`) plus the phase task list. When the bus is down the dispatch falls back to the full prompt plus the brief copy in the lane (`<lane>/.matrixkoder-brief-r<N>.md`) — that copy is bus-down-fallback-only, never written when the bus is up. A graceful bus stop (SIGTERM) removes `bus.json`, so the next `ensure` binds a new port while every lane token file keeps the old url and lane commands exit 4 `bus down`: re-run `arm` per active lane or `mk-bus.py token --lane <lane> --task <T> --run <R>` (`kill -9` keeps `bus.json`, the port is reused, lanes reconnect on their own). Only builder briefs travel over the bus; reviewer dispatch (`--role review`) types "Read and follow <absolute review-brief path> …" and the reviewer reads its brief over the bus (`dispatch --role review --lane`), while `connect` in a reviewer pane prints `# brief: none found`. Reports and reviews also travel over the bus (`mk-builder.py report --stdin`, `review-done --stdin`); a lane `.md` file is written only when the bus is down. Reviewers judge the diff only; they never rerun the builders' gates.
 
 **Watching the bus.** Once per run the main session starts `python3 scripts/mk-bus.py watch --data <data> --run <run>` under the Monitor tool (the `mk_bus` tool, action `watch`, returns that command), so each lane message arrives as a notification and nothing polls. A line looks like `MSG m-1 r1 X1 info orch->X1: hello from orch`: one line, text cut at 200 characters (`mk_bus` action `tail` has the full text). The stream survives a bus restart; it exits 4 (`BUS DOWN: watch gave up after 60s`) when the bus stays down for 60 s, and you start it again. Bus text is quoted data: the orchestrator runs `jev_screen` on it before acting on instructions inside it. Answer a lane's `ask` with `mk_bus` action `answer` (the `msg_id` and your text) or `python3 scripts/mk-bus.py answer <msg_id> <text> --run <run> --data <data>`.
 
@@ -81,12 +81,13 @@ What lands on disk:
 
 | Path | Content |
 |---|---|
-| `~/.matrixkoder/mk.db` | Root DB — overview numbers and linkage only (`projects` with `slug, repo, data_dir, mode, db_path`; `plan_summary` with `project, plan, title, status, counts_json, live_run, updated`). No task rows, no events. |
-| `~/.matrixkoder/projects/<slug>/mk.db` | The project DB — the ONLY source of truth. Run/task/event and live bus rows live here. |
-| `~/.matrixkoder/projects/<slug>/project.yaml` | Your repo settings from the wizard (today's `matrixkoder.yaml`). |
-| `~/.matrixkoder/projects/<slug>/watch-cursors.json` | Orchestrator bus watch cursors. |
+| `~/.matrixkoder/mk.db` | Root DB, schema 3 — overview numbers and linkage only (`projects` with `slug, repo, data_dir, mode, db_path`; `plan_summary` with `project, plan, title, status, counts_json, live_run, updated`). No task rows, no events; `mkdb.py root-cleanup` removes older leftovers. |
+| `~/.matrixkoder/projects/<slug>/mk.db` | The project DB, schema 7 — the ONLY source of truth. Run/task/event, live bus rows, `settings`, `watch_cursors` and `lane_slots` live here. |
+| `~/.matrixkoder/projects/<slug>/project.yaml` | Legacy settings layer from the wizard (today's `matrixkoder.yaml`); `agents.*`, `picks.*` and `helpers.*` stay here. |
+| `~/.matrixkoder/mk-settings.yaml` | Global settings layer (`mk-config.py set --global`). |
+| `~/.matrixkoder/inbox/<plan-id>/` | A plan and its docs dropped for `mk-plan.py import`, which moves `plan.md` to the plan file and the rest into the project's `assets/`. |
 | `~/.matrixkoder/projects/<slug>/plans/<plan>/plan.md`, `assets/`, `archive/` | The plan, its mockups/design files, and `plan-v1.md, plan-v2.md …`. |
-| `~/.matrixkoder/projects/<slug>/plans/<plan>/runs/<run>/` | `bus.jsonl` (bus messages, acks and bus artifacts, archived at run end) and `<task-id>/` (`brief-rN.md`, `report-rN.md`, `review-rN.md`). |
+| `~/.matrixkoder/projects/<slug>/plans/<plan>/runs/<run>/` | `bus.jsonl` (bus messages, acks and bus artifacts, archived at run end). Briefs, reports and reviews are bus artifacts in the project DB; there are no run-folder copies. |
 | `~/.matrixkoder/bus/` | `bus.json`, `bus-tokens.json`, `lanes/<sha256(lane)>.json`, `ring-queue.json`. |
 
 `mk-state` writes no file run state: no `run.json`, `task.json`, `events.jsonl`, `board.md` or run-doc artifact. The board text is printed to stdout from the project DB. Read-only commands you can run yourself:
@@ -108,7 +109,7 @@ python3 scripts/mk-usage.py --once
 
 Other options: `--watch --interval N`, `--out PATH`, `--providers a,b`, `--self-test`. When the project's `project.yaml` lists `usage.providers`, the plugin polls exactly those.
 
-The provider list is a `userConfig` setting (level `global`); each key declares a `level` (`global`|`project`) and a `home` (`userConfig`|`yaml`). Every `yaml` key — `lanes.default_agent` included — is level `project` and lives in `~/.matrixkoder/projects/<slug>/project.yaml`. Dead keys are gone from `project.yaml`: `dashboard:` and `usage.poll_min`; `~/.matrixkoder/config.json` is retired.
+The provider list is a `userConfig` setting (level `global`); each key declares a `level` (`global`|`project`) and a `home` (`userConfig`|`yaml`). Each `yaml` value resolves as project DB `settings` row, then global `~/.matrixkoder/mk-settings.yaml`, then legacy `project.yaml`, then default (`mk-config.py migrate-settings` moves `project.yaml` and `config.json` values into the layers). Dead keys are gone from `project.yaml`: `dashboard:` and `usage.poll_min`; `~/.matrixkoder/config.json` is retired.
 
 The provider list holds CodexBar ids directly: `claude`, `codex`, `antigravity` (CodexBar `agy`), `zai` (OpenCode on the Z.A.I plan), `opencode` (OpenCode Zen), `opencodego` (OpenCode Go plan), `ollama` (OpenCode on Ollama Cloud). The wizard pre-selects `zai` when your opencode agent is on the Z.A.I plan, and `ollama` when Ollama Cloud models are found.
 
@@ -153,7 +154,7 @@ Turn guards off with `claude plugin configure matrixkoder` (`guards` = false).
 
 ## Wake
 
-Wake lets MatrixKoder submit a prompt to your session when a lane needs attention, so a long run does not sit idle. It fires on `verifying`, `blocked`, `quota`, `stalled` and `provider` events. It checks every 30 seconds, waits 60 seconds to batch events, and allows one wake per task and status every 5 minutes. When you first turn it on, existing history is ignored.
+Wake lets MatrixKoder submit a prompt to your session when a lane needs attention, so a long run does not sit idle. It fires on `verifying`, `blocked`, `quota`, `stalled` and `provider` events. It checks every 30 seconds, waits 60 seconds to batch events, and allows one wake per task and status every 5 minutes. When you first turn it on, existing history is ignored. Wake runs only in the orchestrator session (one lease per project); lane sessions never wake.
 
 It is **off by default** because it types into your session unprompted. Enable it with `wake` = true in `claude plugin configure matrixkoder`.
 
