@@ -201,8 +201,8 @@ export async function resolveDataDir($: EngineInterface, opts: { cwd?: string; h
 }
 
 /** Every path a hook builds under the data dir and the global dir (C1). A new file
- *  name is added here once, not joined in three hooks — `runsIndex`,
- *  `runDoc`, `projectDb` and friends are the lockstep spots. */
+ *  name is added here once, not joined in three hooks — `projectDb`, `projectYaml`
+ *  and friends are the lockstep spots. */
 export const paths = {
   projectsJson: (globalDir: string): string => join(globalDir, 'projects.json'),
   usage: (globalDir: string): string => join(globalDir, 'usage.json'),
@@ -218,6 +218,8 @@ export const paths = {
   },
   /** The pre-migration data dir of a repo folder: <repo>/.matrixkoder. */
   legacyDataDir: (repo: string): string => join(repo, '.matrixkoder'),
+  /** A project's home-mode data dir: <globalDir>/projects/<slug> (mkpaths.project_dir for an unmigrated home project). */
+  homeProjectDir: (globalDir: string, slug: string): string => `${globalDir}/projects/${slug}`,
   /** Where a deleted plan's file moves: <globalDir>/projects/<slug>/plans/<plan>/archive/. `globalDir` stays
    *  the display `~/.matrixkoder` when the caller has no real one. */
   planArchiveDir: (slug: string, planId: string, globalDir = '~/.matrixkoder'): string => `${globalDir}/projects/${slug}/plans/${planId}/archive/`,
@@ -231,8 +233,6 @@ export const paths = {
   runsIndex: (dataDir: string): string => join(dataDir, 'runs/index.json'),
   /** One run's document: <data>/runs/<run>/run.json. */
   runDoc: (dataDir: string, runId: string): string => join(dataDir, 'runs', runId, 'run.json'),
-  /** One run's event log: <data>/runs/<run>/events.jsonl. */
-  eventsDoc: (dataDir: string, runId: string): string => join(dataDir, 'runs', runId, 'events.jsonl'),
   /** The orchestrator's bus watch cursors: <data>/watch-cursors.json. */
   watchCursors: (dataDir: string): string => join(dataDir, 'watch-cursors.json'),
   /** C6 (mkpaths.bus_dir): store mode heartbeats the ONE bus under the MK home; file

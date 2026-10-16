@@ -4,6 +4,7 @@
 // handles an API key: the z.ai key is entered by the user into CodexBar.
 import type { MkWizardAgent, MkWizardDraft, MkWizardGates } from '../types'
 import { basename } from './data'
+import { paths } from './paths'
 
 export const AGENT_NAMES = ['claude', 'codex', 'opencode', 'agy', 'herdr'] as const
 export const DEFAULT_BUILDER_ORDER = ['codex', 'opencode', 'agy', 'claude'] as const
@@ -251,8 +252,8 @@ export function builderOrderOf(d: MkWizardDraft): string[] {
 
 export function dataDirOf(d: MkWizardDraft): string | null {
   if (d.dataEnv != null) return d.dataEnv // readers check $MATRIXKODER_DATA first
-  if (d.dataMode === 'home') return d.globalDir == null ? null : `${d.globalDir}/projects/${d.slug}`
-  return d.repo == null ? null : `${d.repo}/.matrixkoder`
+  if (d.dataMode === 'home') return d.globalDir == null ? null : paths.homeProjectDir(d.globalDir, d.slug)
+  return d.repo == null ? null : paths.legacyDataDir(d.repo)
 }
 
 /** The session: keys a replace carries over — the Settings tab owns them between wizard runs. */
