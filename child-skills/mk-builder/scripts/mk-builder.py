@@ -7556,13 +7556,52 @@ def t_skill_frontmatter(root):
     assert "R9" in body, "the body must cite lane-rules R9 for the todo-list rule"
 
 
-def stat_of(path):
-    """(size, mtime_ns) of a file, None when absent. os.stat only: never opens the file."""
-    try:
-        st = os.stat(path)
-    except OSError:
+def home_db_mentions(db, needle):
+    """Todo L10.T: `table.column` names in the sqlite file `db` that hold `needle` in some row, opened
+    read-only; [] for a clean file, None when it is absent or unreadable. The self-test uses it to
+    show that nothing it ran wrote into the REAL home: every write a case makes carries the run's
+    unique temp-root name (data dirs, repo paths, task rows), while the bus and the orchestrator
+    write the same file without it. A size/mtime comparison cannot tell them apart."""
+    if not os.path.isfile(db):
         return None
-    return (st.st_size, st.st_mtime_ns)
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error:
+        return None
+    hits = []
+    try:
+        for (table,) in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall():
+            for col in [r[1] for r in con.execute(f'PRAGMA table_info("{table}")').fetchall()]:
+                try:
+                    n = con.execute(f'SELECT count(*) FROM "{table}" WHERE CAST("{col}" AS TEXT) LIKE ?',
+                                    (f"%{needle}%",)).fetchone()[0]
+                except sqlite3.Error:
+                    continue  # a virtual table or a column that cannot be cast: not a row of ours
+                if n:
+                    hits.append(f"{table}.{col}")
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+    return hits
+
+
+def t_real_home_scan_flags_a_temp_path(root):
+    """L10.T: the real-home check must fail when a run writes its temp root into the home DB, and pass
+    for a file other processes wrote: a clean DB scans [], a DB with a row naming the temp root is
+    flagged by table.column, a missing file is None."""
+    needle = os.path.basename(root)
+    clean = os.path.join(root, "scan-clean.db")
+    dirty = os.path.join(root, "scan-dirty.db")
+    for path, value in ((clean, "/Users/someone/repo"), (dirty, f"/private/var/folders/x/{needle}/data")):
+        con = sqlite3.connect(path)
+        con.execute("CREATE TABLE projects (slug TEXT, data_dir TEXT, n INTEGER)")
+        con.execute("INSERT INTO projects VALUES ('p', ?, 3)", (value,))
+        con.commit()
+        con.close()
+    assert home_db_mentions(clean, needle) == [], home_db_mentions(clean, needle)
+    assert home_db_mentions(dirty, needle) == ["projects.data_dir"], home_db_mentions(dirty, needle)
+    assert home_db_mentions(os.path.join(root, "no-such.db"), needle) is None
 
 
 def run_self_test():
@@ -7571,9 +7610,11 @@ def run_self_test():
     root = tempfile.mkdtemp(prefix="mk-builder-selftest-")
     cases = sorted((n, f) for n, f in globals().items() if n.startswith("t_") and callable(f))
     failed, leftover = [], []
-    # Todo 69: the real home's root store, read with os.stat only, before anything runs.
+    # Todo 69, reworked in L10.T: the real home's root store is scanned (read-only) after the run for
+    # this run's own temp-root name. A size/mtime comparison failed whenever the live bus or the
+    # orchestrator wrote the file meanwhile, which has nothing to do with the test.
     real_db = os.path.join(os.path.expanduser("~"), ".matrixkoder", "mk.db")
-    real_before = stat_of(real_db)
+    root_name = os.path.basename(root)
     pinned = {k: os.environ.get(k) for k in ("MK_HOME", "MATRIXKODER_HOME", "MK_BUS_DIR", "MK_BUS_DATA", "MK_SELFTEST")}
     try:
         for name, fn in cases:
@@ -7598,9 +7639,10 @@ def run_self_test():
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
-    if stat_of(real_db) != real_before:
+    mentions = home_db_mentions(real_db, root_name)
+    if mentions:
         failed.append("real_home_untouched")
-        print(f"not ok real_home_untouched: {real_db} was {real_before}, now {stat_of(real_db)}")
+        print(f"not ok real_home_untouched: {real_db} holds this run's temp root {root_name} in {', '.join(mentions)}")
     # R1.2: the mkdb write guard refuses the real home; ro reads work. A temp
     # home keeps the probe's write off the real store.
     try:

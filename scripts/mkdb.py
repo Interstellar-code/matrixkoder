@@ -1722,23 +1722,41 @@ def plans(home, project=None, data_dir=None, plan_id=None):
 RUN_DOC = "run-doc"
 
 
-def _run_doc(con, run):
-    """The newest run-doc artifact of run as a dict, or {} when there is none (or it is not JSON).
+def _extra_dict(text):
+    """A parsed extra_json column as a dict; NULL, bad JSON or a non-object is {}."""
+    try:
+        got = json.loads(text or "")
+    except (TypeError, ValueError):
+        return {}
+    return got if isinstance(got, dict) else {}
 
-    The artifact is a whole run.json written by mk-state on every store commit; mk-state's own
-    load_store overlays the columns on top of it, and so does run_snapshot. A run with no
-    artifact (a plain mkdb writer, an imported row set) still reads: the columns carry it.
+
+def _run_doc(con, run):
+    """The run document of run as a dict: the newest run-doc artifact (pre-migration stores)
+    overlaid with runs.extra_json and each tasks.extra_json (what mk-state writes now).
+
+    mk-state stopped writing the artifact (bf55ee0): the file-only keys live in the extra_json
+    columns, run keys on the run row and task keys on the task rows, task order in `task_order`.
+    mk-state's own load_store reads them the same way; the columns are overlaid later, by
+    _run_obj and _task_obj. A run with neither (a plain mkdb writer, an imported row set) is {}.
     """
     row = con.execute(
         "SELECT text FROM artifacts WHERE run=? AND kind=? AND task IS NULL ORDER BY id DESC LIMIT 1",
         (run, RUN_DOC)).fetchone()
-    if row is None:
-        return {}
-    try:
-        got = json.loads(row["text"] or "")
-    except (TypeError, ValueError):
-        return {}
-    return got if isinstance(got, dict) else {}
+    doc = _extra_dict(row["text"]) if row is not None else {}
+    rrow = con.execute("SELECT extra_json FROM runs WHERE id=?", (run,)).fetchone()
+    run_x = _extra_dict(rrow["extra_json"]) if rrow else {}
+    task_x = {r["id"]: x for r in con.execute("SELECT id, extra_json FROM tasks WHERE run=?", (run,))
+              if (x := _extra_dict(r["extra_json"]))}
+    if not run_x and not task_x:
+        return doc
+    doc.update(run_x)
+    tasks = {t["id"]: t for t in doc.get("tasks") or [] if isinstance(t, dict) and t.get("id")}
+    order = [i for i in doc.pop("task_order", None) or [] if isinstance(i, str)]
+    order += [i for i in tasks if i not in order]  # the artifact's own order, when task_order is absent
+    order += [i for i in task_x if i not in order]
+    doc["tasks"] = [{**tasks.get(i, {}), **task_x.get(i, {}), "id": i} for i in order]
+    return doc
 
 
 def _stage_of(row):
@@ -2969,6 +2987,7 @@ def self_test():
         _reads_create_nothing(home)
         _projects_read(home)
         _run_snapshot(home)
+        _run_snapshot_extra_json(home)
         _run_events(home)
         _run_snapshot_migrated(home)
         _run_snapshot_no_store(home)
@@ -5744,6 +5763,68 @@ def _run_snapshot_migrated(home):
     _check(_store_path(home, data_dir=plain) == _mkpaths().db_in(plain),
            "a pre-migration project lost its own store path")
     _check(run_snapshot(home, data_dir=plain)["active"] == "p", "the pre-migration read failed")
+
+
+def _run_snapshot_extra_json(home):
+    """run-snapshot() reads the file-only keys off runs.extra_json and tasks.extra_json (L10.T).
+
+    mk-state stopped writing the run-doc artifact (bf55ee0): feature, waiting, recent and the plan
+    link live on the run row's extra_json, wave/gates/rounds/last_commit/reviewer on each task
+    row's. A run with an artifact-less store and extras still reads them; a run with neither reads
+    its defaults (feature null, no waiting, empty recent) and never errors.
+    """
+    data = os.path.join(home, "snap-extra")
+    con = open_project(home, data_dir=data)
+    try:
+        run_x = {"feature": "Extra lane", "plan_id": "p-x", "plan_sha": "f00d", "plan_status": "running",
+                 "waiting": {"question": "Ship it?", "options": ["yes", "no"], "rec": "yes"},
+                 "recent": [{"t": "2026-02-01T01:00:00+00:00", "run": "r-x", "task": "X1",
+                             "type": "note", "text": "from extras", "by": "lane-watch"}],
+                 "task_order": ["X2", "X1"]}
+        con.execute("INSERT INTO runs(id, plan, branch, status, stage, next, started, extra_json)"
+                    " VALUES ('r-x','p-x','mk/x','active','3','merge X','2026-02-01T00:00:00+00:00',?)",
+                    (json.dumps(run_x),))
+        con.execute("INSERT INTO runs(id, plan, branch, status, stage, next, started)"
+                    " VALUES ('r-n','p-n','mk/n','done','1','none','2026-01-01T00:00:00+00:00')")
+        con.commit()  # add_task opens its own transaction
+        add_task(con, "r-x", "X1", "task", title="One")
+        add_task(con, "r-x", "X2", "task", title="Two", deps="X1")
+        con.execute("UPDATE tasks SET extra_json=? WHERE run='r-x' AND id='X1'", (json.dumps(
+            {"wave": 2, "gates": {"tests": "green"}, "last_commit": "1de932a", "reviewer": "agy",
+             "rounds": [{"n": 1, "kind": "build", "sha": "1de932a"}]}),))
+        con.execute("UPDATE tasks SET extra_json=? WHERE run='r-x' AND id='X2'", (json.dumps(
+            {"wave": 3, "gates": {}, "last_commit": None, "reviewer": "opencode", "rounds": []}),))
+        con.commit()
+        add_task(con, "r-n", "N1", "task", title="Bare")
+        con.commit()
+        _check(con.execute("SELECT COUNT(*) FROM artifacts WHERE kind='run-doc'").fetchone()[0] == 0,
+               "the fixture holds a run-doc artifact")
+    finally:
+        con.close()
+
+    got = run_snapshot(home, data_dir=data, run="r-x")
+    run = got["run"]
+    _check(got["runs"][1]["feature"] == "Extra lane", f"index feature from extra_json: {got['runs']}")
+    _check(run["feature"] == "Extra lane", f"feature {run['feature']!r}")
+    _check(run["waiting"]["question"] == "Ship it?" and run["waiting"]["options"] == ["yes", "no"],
+           f"waiting {run['waiting']}")
+    _check(len(run["recent"]) == 1 and run["recent"][0]["text"] == "from extras", f"recent {run['recent']}")
+    _check(run["plan_id"] == "p-x" and run["plan_sha"] == "f00d" and run["plan_status"] == "running",
+           f"plan link {run}")
+    _check("task_order" not in run, f"task_order leaked into the run: {run}")
+    _check([t["id"] for t in run["tasks"]] == ["X2", "X1"], f"task order {[t['id'] for t in run['tasks']]}")
+    x1, x2 = run["tasks"][1], run["tasks"][0]
+    _check(x1["wave"] == 2 and x1["gates"] == {"tests": "green"} and x1["last_commit"] == "1de932a"
+           and x1["reviewer"] == "agy" and x1["rounds"][0]["sha"] == "1de932a", f"X1 extras {x1}")
+    _check(x2["wave"] == 3 and x2["reviewer"] == "opencode" and x2["rounds"] == []
+           and x2["last_commit"] is None and x2["deps"] == ["X1"], f"X2 extras {x2}")
+
+    # no artifact and no extras: the defaults, no error
+    bare = run_snapshot(home, data_dir=data, run="r-n")["run"]
+    _check(bare["feature"] is None and bare["waiting"] is None and bare["recent"] == []
+           and bare["plan_id"] is None, f"bare run defaults {bare}")
+    _check([t["id"] for t in bare["tasks"]] == ["N1"] and bare["tasks"][0]["title"] == "Bare"
+           and "wave" not in bare["tasks"][0], f"bare tasks {bare['tasks']}")
 
 
 def _run_snapshot_no_store(home):

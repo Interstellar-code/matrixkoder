@@ -417,6 +417,7 @@ export const SETTINGS_SCHEMA = {
     "hiddenTabs": "",
     "mode": "orchestrator",
     "raster": true,
+    "stopGuard": false,
     "toasts": true,
     "usagePollMin": 5,
     "wake": false
