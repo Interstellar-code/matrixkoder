@@ -6019,9 +6019,8 @@ def store_self_test(tmp, env):
     assert json.loads(r.stdout)["copied"] == 0, r.stdout  # plan_summary already current
     rootdb = db.open_root(root)
     try:
-        for table in ("cards", "project_summary", "sync"):
-            n = rootdb.execute(f"SELECT COUNT(*) c FROM {table}").fetchone()["c"]
-            assert n == 0, f"{table} gained a row: {n}"
+        for table in ("cards", "project_summary", "sync"):  # root schema 3: not created at all
+            assert not rootdb.execute("SELECT 1 FROM sqlite_master WHERE name=?", (table,)).fetchone(), table
     finally:
         rootdb.close()
 

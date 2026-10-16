@@ -658,8 +658,8 @@ def row_c5_sync(ctx):
     root = mkdb.open_root(ctx["home"])
     try:
         cols = {r[1] for r in root.execute("PRAGMA table_info(plan_summary)")}
-        counts = {t: root.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"]
-                  for t in ("cards", "project_summary", "sync")}
+        counts = {t: root.execute("SELECT COUNT(*) c FROM sqlite_master WHERE name=?", (t,)).fetchone()["c"]
+                  for t in ("cards", "project_summary", "sync")}  # root schema 3: absent, so 0
     finally:
         root.close()
     # C3: the projection is one row per plan. A task-shaped column crossing means the old card
@@ -1072,8 +1072,8 @@ def row_c1_summary(ctx):
         raise Fail(f"overview --json {row} != store by_status={by_status}")
     root = mkdb.open_root(ctx["home"])
     try:
-        leftovers = {t: root.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"]
-                     for t in ("cards", "project_summary", "sync")}
+        leftovers = {t: root.execute("SELECT COUNT(*) c FROM sqlite_master WHERE name=?", (t,)).fetchone()["c"]
+                     for t in ("cards", "project_summary", "sync")}  # root schema 3: absent, so 0
     finally:
         root.close()
     if any(leftovers.values()):
