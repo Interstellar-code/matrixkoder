@@ -3846,6 +3846,66 @@ def _orch_token(data_dir):
         os.close(lfd)
 
 
+def _cursor_seq(saved):
+    """The seq of one saved cursor value: an old plain int, or {"seq": n, ...}; else 0."""
+    if isinstance(saved, dict):
+        saved = saved.get("seq")
+    return saved if isinstance(saved, int) and not isinstance(saved, bool) and saved > 0 else 0
+
+
+def cursor_get(data_dir, key):
+    """L10.5: the watch cursor for `key` from the project DB's watch_cursors table. No row yet: the
+    ONE-TIME import takes the max seq of the C2-folder watch-cursors.json and the legacy one (read
+    only, neither is ever written again) and stores it. A store that cannot be read or written
+    (a pre-schema-7 store, a locked one) answers 0: a replay, never a lost message."""
+    try:
+        mod = StoreAdapter(data_dir)._mod()
+        con = mod._open_read(project_store_path(data_dir), mod.SCHEMA)
+        row = con.execute("SELECT seq FROM watch_cursors WHERE key=?", (key,)).fetchone() if con else None
+        if con:
+            con.close()
+        if row:
+            return int(row["seq"])
+        folder = _paths("project_folder", data_dir)
+        seqs = [_cursor_seq((read_json(os.path.join(d, os.path.basename(_paths("target_watch_cursors", "x"))), default={}) or {}).get(key))
+                for d in {folder, data_dir}]
+        seq = max(seqs)
+        if seq:
+            cursor_put(data_dir, key, seq)
+        return seq
+    except Exception:
+        return 0
+
+
+def cursor_row(data_dir, key):
+    """The stored seq of one watch_cursors row, or None (no row, no store): a read, nothing imported."""
+    mod = StoreAdapter(data_dir)._mod()
+    con = mod._open_read(project_store_path(data_dir), mod.SCHEMA)
+    try:
+        row = con.execute("SELECT seq FROM watch_cursors WHERE key=?", (key,)).fetchone() if con else None
+    finally:
+        if con:
+            con.close()
+    return row["seq"] if row else None
+
+
+def cursor_put(data_dir, key, seq):
+    """Upsert one watch cursor into watch_cursors (the store's own write path; mk-bus owns this one)."""
+    mod = StoreAdapter(data_dir)._mod()
+    con = mod.open_project(mod.resolve_home(None), data_dir=data_dir)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute("INSERT INTO watch_cursors(key, seq, started, updated) VALUES (?,?,?,?)"
+                    " ON CONFLICT(key) DO UPDATE SET seq=excluded.seq, updated=excluded.updated",
+                    (key, int(seq), now_iso(), now_iso()))
+        con.execute("COMMIT")
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+    finally:
+        con.close()
+
+
 def cmd_watch(args):
     """E2 (4): the orchestrator's stream. One flushed line per bus message.
 
@@ -3857,8 +3917,8 @@ def cmd_watch(args):
     the bus's own run, since `run=*` needs the project store). A 4xx from
     the bus prints the error on one line and exits 5, as ask/wait/inbox do.
 
-    The last printed seq is kept in <data>/watch-cursors.json under
-    "<run or *>|<task or *>", so a new watch does not replay what the last one
+    The last printed seq is kept in the project DB's watch_cursors table (file mode:
+    <data>/watch-cursors.json) under "<run or *>|<task or *>", so a new watch does not replay what the last one
     printed. Start point: explicit --after, else the cursor, else 0 (first arm);
     --replay skips the cursor. Seq is the number in the message id (m-12 -> 12).
     """
@@ -3870,8 +3930,11 @@ def cmd_watch(args):
     if task and not is_valid_id(task):
         raise Fail("invalid task id")
     after = getattr(args, "after", None)
-    cursor_path = _paths("watch_cursors", data_dir)
     cursor_key = "%s|%s" % (run or "*", task or "*")
+    # L10.5: with the project store the cursor is a watch_cursors row, and no watch-cursors.json is
+    # read or written (the first watch imports the old files once, inside cursor_get). File mode
+    # (no mk.db) keeps the file.
+    cursor_path = None if store_mode(data_dir) else _paths("watch_cursors", data_dir)
     # File mode: a new run in the same data dir restarts seq from 1 and restarts the bus, so a cursor
     # is trusted only for the bus start stamp it was written under (a mismatch replays: a duplicate,
     # never a lost message). Store mode seqs never reset, so no stamp is kept or checked there.
@@ -3892,8 +3955,10 @@ def cmd_watch(args):
     if after is None or after == "":
         after = 0
         if not getattr(args, "replay", False):
-            cur = read_json(cursor_path, default={})
+            cur = read_json(cursor_path, default={}) if cursor_path else {}
             saved = cur.get(cursor_key) if isinstance(cur, dict) else None
+            if cursor_path is None:
+                saved = cursor_get(data_dir, cursor_key)
             if isinstance(saved, int):  # an old plain-integer value: no stamp
                 saved = {"seq": saved, "started": None}
             if (isinstance(saved, dict) and isinstance(saved.get("seq"), int) and saved["seq"] > 0
@@ -3965,10 +4030,16 @@ def cmd_watch(args):
                         print(_watch_line(m), flush=True)
                         # shortcut: unlocked read-modify-write, two watches of one data dir can
                         # lose a cursor update (replays a few lines); lock if that ever bites.
-                        cursors = read_json(cursor_path, default={})
-                        cursors = cursors if isinstance(cursors, dict) else {}
-                        cursors[cursor_key] = {"seq": last_seq, "started": cur_started}
-                        write_json(cursor_path, cursors)
+                        if cursor_path is None:
+                            try:
+                                cursor_put(data_dir, cursor_key, last_seq)
+                            except Exception as e:  # a cursor that cannot be saved replays, never loses
+                                sys.stderr.write("watch cursor not saved: %s\n" % (e,))
+                        else:
+                            cursors = read_json(cursor_path, default={})
+                            cursors = cursors if isinstance(cursors, dict) else {}
+                            cursors[cursor_key] = {"seq": last_seq, "started": cur_started}
+                            write_json(cursor_path, cursors)
                         printed += 1
                         if max_messages and printed >= max_messages:
                             return 0
@@ -4351,18 +4422,26 @@ def _layout_self_test():
         assert one_bus("after the own-project switch") == 1
 
         # ---- 4. the watch cursor lives in the project folder; the old one is carried over --
+        # L10.5: the cursor is a watch_cursors row; the first watch imports the MAX of the legacy file
+        # (seq 1) and the C2-folder file (seq 0) once, and neither file is written again.
         legacy_cursor = os.path.join(own_data, "watch-cursors.json")
         write_json(legacy_cursor, {"r1|*": {"seq": 1}}, mode=0o600)
-        os.remove(_paths("watch_cursors", own_data))
+        folder_cursor = os.path.join(own_folder, os.path.basename(_paths("target_watch_cursors", "x")))
+        write_json(folder_cursor, {"r1|*": {"seq": 0}}, mode=0o600)
+        folder_bytes = open(folder_cursor, "rb").read()
+        assert cursor_row(own_data, "r1|*") is None
         w = subprocess.run([sys.executable, os.path.abspath(__file__), "watch", "--data",
                             own_data, "--run", "r1", "--max-messages", "1"],
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
         seen = [x for x in w.stdout.strip().splitlines() if x.strip()]
         assert len(seen) == 1 and "after switch" in seen[0], (w.stdout, w.stderr)
-        cursor_path = _paths("watch_cursors", own_data)
-        assert cursor_path == os.path.join(own_folder, "watch-cursors.json"), cursor_path
-        assert (read_json(cursor_path) or {}).get("r1|*", {}).get("seq") == 2, read_json(cursor_path)
-        assert os.path.isfile(legacy_cursor), "the legacy cursor file must survive a take-over"
+        assert cursor_row(own_data, "r1|*") == 2, cursor_row(own_data, "r1|*")
+        assert open(folder_cursor, "rb").read() == folder_bytes, "watch wrote the C2 cursor file"
+        assert os.path.isfile(legacy_cursor), "the legacy cursor file must survive the import"
+        assert read_json(legacy_cursor) == {"r1|*": {"seq": 1}}, "watch wrote the legacy cursor file"
+        # a restarted watch resumes from the table alone, with both files gone
+        os.remove(legacy_cursor), os.remove(folder_cursor)
+        assert cursor_get(own_data, "r1|*") == 2
 
         # ---- 5. a pre-L6.1 bus is adopted, never duplicated ---------------------------------
         # SIGKILL, not a stop: a killed server leaves its bus.json behind, which is exactly
@@ -6058,11 +6137,12 @@ def _store_self_test_body(mod):
                 stop_process(watch.pid)
                 watch.wait(timeout=10)
 
-        # Decision 1: watch keeps a per-(run, task) cursor in <data>/watch-cursors.json. The
-        # watch above (--after, run r1, no task) printed 6 lines, so the cursor holds "r1|*".
-        cur_path = os.path.join(data, "watch-cursors.json")
-        assert (os.stat(cur_path).st_mode & 0o777) == 0o600, oct(os.stat(cur_path).st_mode)
-        cur_seq = read_json(cur_path)["r1|*"]["seq"]
+        # Decision 1 (L10.5): watch keeps a per-(run, task) cursor in the project DB's watch_cursors
+        # table, never in a file. The watch above (--after, run r1, no task) printed 6 lines, so the
+        # cursor holds "r1|*".
+        cur_path = os.path.join(data, os.path.basename(_paths("target_watch_cursors", "x")))
+        assert not os.path.exists(cur_path), "a store-mode watch wrote watch-cursors.json"
+        cur_seq = cursor_row(data, "r1|*")
         assert cur_seq == int(ids[-1][2:]), (cur_seq, ids[-1])
         cur_new = []
         for i in range(2):
@@ -6076,14 +6156,14 @@ def _store_self_test_body(mod):
                                  stderr=subprocess.PIPE, text=True, timeout=20)
         assert res_cur.returncode == 0, (res_cur.returncode, res_cur.stderr)
         assert [ln.split()[1] for ln in res_cur.stdout.splitlines()] == cur_new, res_cur.stdout
-        assert read_json(cur_path)["r1|*"]["seq"] == int(cur_new[-1][2:]), read_json(cur_path)
-        assert (os.stat(cur_path).st_mode & 0o777) == 0o600
+        assert cursor_row(data, "r1|*") == int(cur_new[-1][2:]), cursor_row(data, "r1|*")
+        assert not os.path.exists(cur_path)
         # A different filter has its own key: a task watch with no cursor replays from the start.
         res_tk = subprocess.run(watch_cmd + ["--task", "T9", "--max-messages", "1"], stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, timeout=20)
         assert res_tk.returncode == 0, (res_tk.returncode, res_tk.stderr)
         assert res_tk.stdout.split()[1] not in cur_new, res_tk.stdout
-        assert "r1|T9" in read_json(cur_path), read_json(cur_path)
+        assert cursor_row(data, "r1|T9") is not None
         # --replay ignores the cursor and starts from 0: the oldest message, not a new one.
         res_rp = subprocess.run(watch_cmd + ["--replay", "--max-messages", "1"], stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, timeout=20)
@@ -6093,10 +6173,9 @@ def _store_self_test_body(mod):
         res_af = subprocess.run(watch_cmd + ["--after", cur_new[0], "--max-messages", "1"], stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, timeout=20)
         assert res_af.stdout.split()[1] == cur_new[1], res_af.stdout
-        # A cursor file that is valid JSON but not an object is no cursor: replay, never a crash.
-        for junk in ("[]", "3", '"x"'):
-            with open(cur_path, "w") as f:
-                f.write(junk)
+        # A cursor row at seq 0 is no cursor: replay, never a crash.
+        for junk in (0,):
+            cursor_put(data, "r1|*", junk)
             res_junk = subprocess.run(watch_cmd + ["--max-messages", "1"], stdout=subprocess.PIPE,
                                       stderr=subprocess.PIPE, text=True, timeout=20)
             assert res_junk.returncode == 0, (junk, res_junk.returncode, res_junk.stderr)
@@ -7486,8 +7565,7 @@ def _archive_run_self_test():
 
         # 1. the watch cursor sits on a deleted seq: the next watch prints the NEXT existing
         #    message and nothing it had already passed (a reset to 0 would replay both)
-        write_json(_paths("watch_cursors", f.data), {"*|*": {"seq": cursor, "started": None}},
-                   mode=0o600)
+        cursor_put(f.data, "*|*", cursor)
         w = subprocess.run([sys.executable, bus_py, "watch", "--data", f.data, "--max-messages", "2"],
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                            env=f.env(), timeout=30)

@@ -300,11 +300,13 @@ def names(run, task, cfg=None, role="build", rnd=1, slot=1, main=None):
             "agent": agent_name(tid, role, rnd)}
 
 
-# ---------- <data>/lanes.json, one exclusive lock ----------
+# ---------- lane_slots in the project DB (lanes.json only in file mode), one exclusive lock ----------
 
 @contextlib.contextmanager
 def locked(data, timeout):
-    """Every read-modify-write of lanes.json holds this flock; a holder that outlasts the timeout is
+    """Every read-modify-write of the registry holds this flock. Kept with the DB (L10.5): a BEGIN
+    IMMEDIATE transaction covers only the final write, while acquire/release read the rows, run git
+    and write later, so the transaction alone would not serialize two acquires. A holder that outlasts the timeout is
     an error, never a second writer racing the first."""
     with contextlib.suppress(OSError):
         os.makedirs(data, exist_ok=True)
@@ -379,22 +381,6 @@ def read_rows(con):
     return con.execute("SELECT " + ", ".join(SLOT_COLS) + " FROM lane_slots ORDER BY slot").fetchall()
 
 
-def import_file(con, lanes):
-    """First store-on command: copy lanes.json into lane_slots. Idempotent — an existing row wins,
-    so a second import changes nothing and a busy slot stays busy."""
-    for key, rec in lanes["slots"].items():
-        if not str(key).lstrip("-").isdigit() or not isinstance(rec, dict):
-            continue
-        check_slot_keys(rec, key)
-        if con.execute("SELECT 1 FROM lane_slots WHERE slot=?", (str(key),)).fetchone():
-            continue
-        con.execute(
-            "INSERT INTO lane_slots(" + ", ".join(SLOT_COLS) + ") VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (str(key), rec.get("path"), _cell(rec.get("state")), _cell(rec.get("run")),
-             _cell(rec.get("task")), _cell(rec.get("workspace")), _cell(rec.get("workspace_id")),
-             _cell(rec.get("branch")), _cell(rec.get("lock_hash")), _cell(rec.get("updated"))))
-
-
 def write_rows(con, lanes):
     """Replace lane_slots with the in-memory pool. Caller holds the lanes lock and a transaction."""
     con.execute("DELETE FROM lane_slots")
@@ -407,45 +393,21 @@ def write_rows(con, lanes):
              _cell(rec.get("branch")), _cell(rec.get("lock_hash")), _cell(rec.get("updated"))))
 
 
-def publish_view(data, lanes):
-    """lanes.json is a published view of the rows, same shape as today, rewritten after each change."""
-    write_lanes_file(data, lanes)
-
-
 def read_lanes(data):
-    """File mode when mk.db is absent. With the store: rows are truth; a store that has never held
-    a slot imports lanes.json once (and republishes the view). A crash after the row commit and
-    before the view rewrite is repaired here: the view is rewritten from the rows."""
+    """The registry. With the project store the `lane_slots` rows are the only registry (L10.5):
+    lanes.json is neither read nor written. A project with no mk.db is file mode: the file is its
+    only store, and none is created."""
     con = store_db(data)
     if con is None:
         return read_lanes_file(data)
     try:
-        rows = read_rows(con)
-        if not rows and os.path.isfile(mkpaths.lanes_file(data)):
-            file_lanes = read_lanes_file(data)
-            if file_lanes["slots"]:
-                con.execute("BEGIN IMMEDIATE")
-                try:
-                    import_file(con, file_lanes)
-                    con.execute("COMMIT")
-                except Exception:
-                    con.execute("ROLLBACK")
-                    raise
-                rows = read_rows(con)
-                publish_view(data, lanes_from_rows(rows))
-                return lanes_from_rows(rows)
-        lanes = lanes_from_rows(rows)
-        # repair a view that drifted from the rows (crash between commit and rewrite)
-        on_disk = read_lanes_file(data) if os.path.isfile(mkpaths.lanes_file(data)) else None
-        if on_disk != lanes:
-            publish_view(data, lanes)
-        return lanes
+        return lanes_from_rows(read_rows(con))
     finally:
         con.close()
 
 
 def write_lanes(data, lanes):
-    """Commit the rows, then rewrite the view. No mk.db: the file is the only store, and none is created."""
+    """Commit the rows in one transaction (store), or write lanes.json (no mk.db: file mode)."""
     con = store_db(data)
     if con is None:
         write_lanes_file(data, lanes)
@@ -453,16 +415,64 @@ def write_lanes(data, lanes):
     try:
         con.execute("BEGIN IMMEDIATE")
         try:
-            if not read_rows(con) and os.path.isfile(mkpaths.lanes_file(data)):
-                import_file(con, read_lanes_file(data))
             write_rows(con, lanes)
             con.execute("COMMIT")
         except Exception:
             con.execute("ROLLBACK")
             raise
-        publish_view(data, lanes)
     finally:
         con.close()
+
+
+def cmd_carry_legacy(a, cfg, data, main):
+    """`carry-legacy [--dry-run]` (L10.5): the ONE-TIME carry of the pre-switch registry into the C2
+    project DB. Sources: the legacy store's lane_slots (`project_db(legacy=True)`, opened read-only)
+    and the legacy lanes.json. Only slots ABSENT from the target are inserted; a target row is newer
+    and never overwritten (`skipped_newer`). Refused, nothing written, when any slot is busy in the
+    sources or the target (quiesce). Idempotent; --dry-run writes nothing."""
+    src_db, dst_db = mkpaths.project_db(data=data, legacy=True), mkpaths.project_db(data=data)
+    if not dst_db or not os.path.isfile(dst_db):
+        raise Fail("carry-legacy needs the project store (the project DB file is absent)")
+    if os.path.realpath(src_db) == os.path.realpath(dst_db):
+        return {"ok": True, "carried": [], "skipped_newer": [], "refused": [], "dry_run": bool(a.dry_run),
+                "note": "legacy and project store are the same file: nothing to carry"}
+    src = {}
+    if os.path.isfile(src_db):
+        ro = mkdb._connect_ro(src_db)
+        try:
+            if ro.execute("SELECT 1 FROM sqlite_master WHERE name='lane_slots'").fetchone():
+                src = {r["slot"]: row_to_rec(r) for r in read_rows(ro)}
+        finally:
+            ro.close()
+    for key, rec in read_lanes_file(data)["slots"].items():
+        src.setdefault(str(key), rec)  # the store row wins over the file's, like the old import
+    con = store_db(data)
+    try:
+        have = {r["slot"]: row_to_rec(r) for r in read_rows(con)}
+        busy = sorted([f"source:{k}" for k, r in src.items() if r.get("state") == "busy"]
+                      + [f"target:{k}" for k, r in have.items() if r.get("state") == "busy"])
+        if busy:
+            raise Fail("carry-legacy refused: busy slot(s) " + ", ".join(busy) + " (quiesce first)",
+                       refused=busy, carried=[], skipped_newer=[])
+        skipped = sorted(k for k in src if k in have)
+        todo = sorted((k for k in src if k not in have), key=lambda k: (not k.lstrip("-").isdigit(), k))
+        if todo and not a.dry_run:
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                for k in todo:
+                    rec = src[k]
+                    check_slot_keys(rec, k)
+                    con.execute("INSERT INTO lane_slots(" + ", ".join(SLOT_COLS) + ") VALUES (?,?,?,?,?,?,?,?,?,?)",
+                                (str(k), rec.get("path"), _cell(rec.get("state")), _cell(rec.get("run")),
+                                 _cell(rec.get("task")), _cell(rec.get("workspace")), _cell(rec.get("workspace_id")),
+                                 _cell(rec.get("branch")), _cell(rec.get("lock_hash")), _cell(rec.get("updated"))))
+                con.execute("COMMIT")
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
+    finally:
+        con.close()
+    return {"ok": True, "carried": todo, "skipped_newer": skipped, "refused": [], "dry_run": bool(a.dry_run)}
 
 
 def slot_numbers(lanes):
@@ -1594,6 +1604,9 @@ def build_parser():
     x.add_argument("--keep", type=int, default=1)
     x.set_defaults(func=cmd_gc)
     sub.add_parser("list", parents=[dp]).set_defaults(func=cmd_list)
+    x = sub.add_parser("carry-legacy", parents=[dp])
+    x.add_argument("--dry-run", action="store_true")
+    x.set_defaults(func=cmd_carry_legacy)
     x = sub.add_parser("status", parents=[dp])
     x.add_argument("--slot", type=int), x.add_argument("--task"), x.add_argument("--run")
     x.add_argument("--lines", type=int, default=12), x.add_argument("--json", action="store_true")
@@ -1879,7 +1892,7 @@ def self_test():
         assert g("-C", slot1, "symbolic-ref", "-q", "HEAD", check=False).returncode != 0  # still detached
         assert g("rev-parse", "--verify", "--quiet", "refs/heads/mk/r1/t5",
                  check=False).returncode != 0  # no branch was created
-        rec = mk_state.read_json(os.path.join(data, "lanes.json"))["slots"]["1"]
+        rec = mk("list")["slots"][0]  # L10.5: the rows are the registry; no lanes.json exists
         assert (rec["state"], rec["branch"], rec["task"]) == ("free", None, None), rec
         # `status.showUntrackedFiles=no` in the user's config must not hide it: the flags win
         g("config", "status.showUntrackedFiles", "no")
@@ -2008,7 +2021,8 @@ def self_test():
         assert rel["branch_deleted"] is False and rel["state"] == "free", rel
         assert mk("list")["slots"][0]["state"] == "free"
         assert g("rev-parse", "--verify", "--quiet", "refs/heads/mk/r1/t5").returncode == 0
-        assert "mk/r1/t5" not in open(os.path.join(data, "lanes.json")).read()  # only in the branch ref
+        assert "mk/r1/t5" not in json.dumps(mk("list"))  # only in the branch ref
+        assert not os.path.exists(mkpaths.lanes_file(data)), "a store-backed lane command wrote the lanes file"
 
         # 8b (L1.1) git-ignored `.omc` state alone is not dirt, at the root and nested, and the
         # check never deletes it. A modified TRACKED `.omc/plans/x.md` still refuses, and so does
@@ -2407,13 +2421,13 @@ def self_test():
         # 14 lanes.lock: a holder outlasts a short timeout, and nothing changes
         assert mk("acquire", "--run", "r1", "--task", "t9", "--base", "main")["slot"] == 1
         assert mk("acquire", "--run", "r1", "--task", "tc", "--base", "main")["slot"] == 2
-        before = open(os.path.join(data, "lanes.json")).read()
+        before = json.dumps(mk("list")["slots"])
         hold = open(os.path.join(data, "lanes.lock"), "a")
         fcntl.flock(hold, fcntl.LOCK_EX)
         try:
             assert mk("acquire", "--run", "r1", "--task", "td", "--base", "main", "--lock-timeout", "1",
                       code=2)["error"] == "lanes.lock busy"
-            assert open(os.path.join(data, "lanes.json")).read() == before  # no state change
+            assert json.dumps(mk("list")["slots"]) == before  # no state change
             assert mk("list")["slots"][1]["task"] == "tc"  # the registry stays readable while locked
         finally:
             fcntl.flock(hold, fcntl.LOCK_UN)
@@ -2426,11 +2440,11 @@ def self_test():
         # slot copies, and the real herdr workspace id
 
         # an unknown run id is refused before anything is created: no slot, no branch, no lanes entry
-        before = open(os.path.join(data, "lanes.json")).read()
+        before = json.dumps(mk("list")["slots"])
         bad = mk("acquire", "--run", "plan-link", "--task", "t10", "--base", "main", code=2)
         assert bad["ok"] is False and "plan-link" in bad["error"] and "r1" in bad["error"], bad
         assert bad["known_runs"] == ["r1"], bad
-        assert open(os.path.join(data, "lanes.json")).read() == before  # nothing created
+        assert json.dumps(mk("list")["slots"]) == before  # nothing created
         assert g("rev-parse", "--verify", "--quiet", "refs/heads/mk/r1/plan-link",
                  check=False).returncode != 0
 
@@ -2840,69 +2854,110 @@ def self_test():
             mk_at(par_data, env_store, "release", "--slot", str(o["slot"]),
                   "--integration", "mk/r1/integration")
 
-        # migration: a populated lanes.json loses nothing and is idempotent
-        mig = os.path.join(tmp, "data-mig")
-        os.makedirs(mig)
-        _sh.copytree(os.path.join(data, "runs"), os.path.join(mig, "runs"))
-        populated = {"schema": 1, "slots": {
-            "1": {"path": slot1, "workspace": "mk:repo:1", "workspace_id": None, "state": "busy",
-                  "run": "r1", "task": "storeA", "branch": "mk/r1/storeA", "lock_hash": "abc",
-                  "updated": "2026-10-11T00:00:00Z"},
-            "2": {"path": slot2, "workspace": "mk:repo:2", "workspace_id": "ws-2", "state": "free",
-                  "run": None, "task": None, "branch": None, "lock_hash": "def",
-                  "updated": "2026-10-11T00:00:01Z"}}}
-        mk_state.write_json(os.path.join(mig, "lanes.json"), populated)
-        before = open(os.path.join(mig, "lanes.json"), "rb").read()
-        con = mkdb.open_project(home, data_dir=mig)
-        con.close()
-        listed = mk_at(mig, env_store, "list")
-        by = {s["slot"]: s for s in listed["slots"]}
-        assert by[1]["state"] == "busy" and by[1]["run"] == "r1" and by[1]["task"] == "storeA"
-        assert by[1]["branch"] == "mk/r1/storeA" and by[1]["lock_hash"] == "abc" if False else True
-        # lock_hash is not in list output; read the row
-        con = mkdb.open_project(home, data_dir=mig)
-        rows = {r["slot"]: dict(r) for r in con.execute("SELECT * FROM lane_slots")}
-        assert rows["1"]["state"] == "busy" and rows["1"]["branch"] == "mk/r1/storeA"
-        assert rows["1"]["lock_hash"] == "abc" and rows["1"]["lane_path"] == slot1
-        assert rows["1"]["workspace"] == "mk:repo:1" and rows["1"]["updated"] == "2026-10-11T00:00:00Z"
-        assert rows["2"]["state"] == "free" and rows["2"]["workspace_id"] == "ws-2"
-        assert rows["2"]["lock_hash"] == "def"
-        n1 = con.execute("SELECT COUNT(*) AS c FROM lane_slots").fetchone()["c"]
-        con.close()
-        again = mk_at(mig, env_store, "list")
-        con = mkdb.open_project(home, data_dir=mig)
-        n2 = con.execute("SELECT COUNT(*) AS c FROM lane_slots").fetchone()["c"]
-        rows2 = {r["slot"]: dict(r) for r in con.execute("SELECT * FROM lane_slots")}
-        con.close()
-        assert n1 == n2 == 2 and rows2["1"]["branch"] == "mk/r1/storeA" and rows2["2"]["lock_hash"] == "def"
-        assert again["slots"][0]["state"] == "busy"
+        # L10.5: the registry is the project DB only. A store-backed dir never gets a lanes.json, and
+        # carry-legacy copies a pre-switch registry once: it fills only ABSENT slots, never overwrites a
+        # newer C2 row, refuses while any slot is busy, and --dry-run writes nothing.
+        cl_slug, cl_legacy = "carry-proj", os.path.join(tmp, "carry-legacy")
+        cl_c2 = os.path.join(home, "projects", cl_slug)
+        os.makedirs(cl_legacy)
 
-        # the published view equals the rows after a change
-        mk_at(mig, env_store, "release", "--slot", "1", "--integration", "mk/r1/integration")
-        view = mk_state.read_json(os.path.join(mig, "lanes.json"))
-        con = mkdb.open_project(home, data_dir=mig)
-        for key, rec in view["slots"].items():
-            row = con.execute("SELECT * FROM lane_slots WHERE slot=?", (key,)).fetchone()
-            assert row["lane_path"] == rec["path"] and row["state"] == rec["state"]
-            assert row["branch"] == rec["branch"] and row["run"] == rec["run"]
-            assert row["task"] == rec["task"] and row["workspace"] == rec["workspace"]
-            assert row["workspace_id"] == rec["workspace_id"] and row["lock_hash"] == rec["lock_hash"]
-            assert row["updated"] == rec["updated"]
-        # crash between the row commit and the view rewrite: next command repairs the view
-        con.execute("BEGIN IMMEDIATE")
-        con.execute("UPDATE lane_slots SET state='busy', run='r1', task='storeA' WHERE slot='1'")
-        con.execute("COMMIT")
-        con.close()
-        stale = mk_state.read_json(os.path.join(mig, "lanes.json"))
-        assert stale["slots"]["1"]["state"] == "free"  # view still says free; row says busy
-        repaired = mk_at(mig, env_store, "list")
-        view2 = mk_state.read_json(os.path.join(mig, "lanes.json"))
-        assert view2["slots"]["1"]["state"] == "busy" and view2["slots"]["1"]["task"] == "storeA"
-        assert repaired["slots"][0]["state"] == "busy"
+        def slot_row(slot, state, path, updated, run=None, task=None):
+            return (slot, path, state, run, task, "mk:repo:" + slot, None, None, None, updated)
+        ins = "INSERT INTO lane_slots(" + ", ".join(SLOT_COLS) + ") VALUES (?,?,?,?,?,?,?,?,?,?)"
+        lc = mkdb.open_project(home, data_dir=cl_legacy, legacy=True)  # the unmigrated, literal store
+        try:
+            lc.execute("BEGIN IMMEDIATE")
+            lc.execute(ins, slot_row("1", "free", slot1, "2026-10-01T00:00:00Z"))
+            lc.execute(ins, slot_row("2", "busy", slot2, "2026-10-01T00:00:01Z", "r1", "oldtask"))
+            lc.execute("COMMIT")
+        finally:
+            lc.close()
+        mk_state.write_json(mkpaths.lanes_file(cl_legacy), {"schema": 1, "slots": {
+            "3": {"path": slot1 + "-3", "workspace": "mk:repo:3", "workspace_id": None, "state": "free",
+                  "run": None, "task": None, "branch": None, "lock_hash": None, "updated": "2026-10-01T00:00:02Z"}}})
+        legacy_json = open(mkpaths.lanes_file(cl_legacy), "rb").read()
+        root = mkdb.open_root(home)
+        try:
+            root.execute("CREATE TABLE IF NOT EXISTS projects("
+                         "slug TEXT PRIMARY KEY, name TEXT, repo TEXT, data_dir TEXT, mode TEXT,"
+                         " created TEXT, last_activity TEXT, db_path TEXT)")
+            root.execute("INSERT OR REPLACE INTO projects(slug, name, repo, data_dir, mode, db_path)"
+                         " VALUES (?,?,?,?,?,?)",
+                         (cl_slug, cl_slug, os.path.join(tmp, "carry-repo"), cl_legacy, "home",
+                          os.path.join(cl_c2, os.path.basename(mkpaths.project_db(data=cl_legacy, legacy=True)))))
+            root.commit()
+        finally:
+            root.close()
+        mkpaths._MIGRATED_MEMO = None
+        cc = mkdb.open_project(home, data_dir=cl_legacy)  # now the C2 store
+        try:
+            cc.execute("BEGIN IMMEDIATE")
+            cc.execute(ins, slot_row("1", "free", slot1 + "-new", "2026-10-16T10:00:00Z"))  # the NEWER registry
+            cc.execute("COMMIT")
+        finally:
+            cc.close()
+
+        def c2_rows():
+            con = mkdb.open_project(home, data_dir=cl_legacy)
+            try:
+                return {r["slot"]: dict(r) for r in con.execute("SELECT * FROM lane_slots")}
+            finally:
+                con.close()
+        before_rows = c2_rows()
+        # refused while a slot is busy in the legacy store: nothing written, even with the rest absent
+        ref = mk_at(cl_legacy, env_store, "carry-legacy", code=2)
+        assert ref["ok"] is False and ref["refused"] == ["source:2"] and c2_rows() == before_rows, ref
+        lc = mkdb.open_project(home, data_dir=cl_legacy, legacy=True)
+        try:
+            lc.execute("BEGIN IMMEDIATE")
+            lc.execute("UPDATE lane_slots SET state='free', run=NULL, task=NULL WHERE slot='2'")
+            lc.execute("COMMIT")
+        finally:
+            lc.close()
+        # a busy slot in the target refuses too
+        cc = mkdb.open_project(home, data_dir=cl_legacy)
+        try:
+            cc.execute("BEGIN IMMEDIATE")
+            cc.execute("UPDATE lane_slots SET state='busy' WHERE slot='1'")
+            cc.execute("COMMIT")
+        finally:
+            cc.close()
+        ref = mk_at(cl_legacy, env_store, "carry-legacy", code=2)
+        assert ref["refused"] == ["target:1"], ref
+        cc = mkdb.open_project(home, data_dir=cl_legacy)
+        try:
+            cc.execute("BEGIN IMMEDIATE")
+            cc.execute("UPDATE lane_slots SET state='free' WHERE slot='1'")
+            cc.execute("COMMIT")
+        finally:
+            cc.close()
+        before_rows = c2_rows()
+        # --dry-run: reports, writes nothing
+        dry = mk_at(cl_legacy, env_store, "carry-legacy", "--dry-run")
+        assert dry["dry_run"] is True and dry["carried"] == ["2", "3"] and dry["skipped_newer"] == ["1"], dry
+        assert c2_rows() == before_rows
+        # the real carry: slots 2 (legacy store) and 3 (legacy lanes.json) arrive, newer slot 1 is untouched
+        got = mk_at(cl_legacy, env_store, "carry-legacy")
+        assert got["carried"] == ["2", "3"] and got["skipped_newer"] == ["1"] and got["refused"] == [], got
+        rows = c2_rows()
+        assert sorted(rows) == ["1", "2", "3"] and rows["1"] == before_rows["1"], rows
+        assert rows["1"]["lane_path"] == slot1 + "-new" and rows["2"]["lane_path"] == slot2, rows
+        assert rows["3"]["lane_path"] == slot1 + "-3", rows
+        # idempotent: a second carry changes nothing
+        again = mk_at(cl_legacy, env_store, "carry-legacy")
+        assert again["carried"] == [] and again["skipped_newer"] == ["1", "2", "3"], again
+        assert c2_rows() == rows
+        # the legacy file is read, never written; no lanes.json appeared in the C2 folder
+        assert open(mkpaths.lanes_file(cl_legacy), "rb").read() == legacy_json
+        assert not os.path.exists(mkpaths.lanes_file(cl_c2))
+        # acquire/release/status work off the table alone
+        listed = mk_at(cl_legacy, env_store, "list")
+        assert [s["slot"] for s in listed["slots"]] == [1, 2, 3], listed
+        assert open(mkpaths.lanes_file(cl_legacy), "rb").read() == legacy_json
+        mkpaths._MIGRATED_MEMO = None
         # L4 (C4): there is no file-mode data dir left — every dir mk-state is asked about gets a
         # store, so `data` above carries mk.db like any other, and that is the expected state
         assert os.path.isfile(os.path.join(data, "mk.db"))
-        assert before  # the pre-import bytes were captured; import did not need them afterwards
 
         # L1 in store mode: ignored `.omc` state alone leaves the slot releasable, a modified
         # tracked plan still refuses, and the outside skill symlink is not followed.
@@ -3018,13 +3073,17 @@ def self_test():
             {"state": "working", "round": 1, "role": "builder", "step": "S1.2 did it", "ctx_pct": None,
              "updated_at": time.time() - 180}))
         write(os.path.join(sl, ".matrixkoder-report-r1.md"), "r\n")
-        write(os.path.join(sdata, "lanes.json"), json.dumps({"schema": 1, "slots": {
-            "1": {"path": sl, "workspace": "w", "workspace_id": "wS", "state": "busy", "run": "s1", "task": "t1",
-                  "branch": "mk/s1/t1", "lock_hash": None, "updated": "x"},
-            "2": {"path": os.path.join(tmp, "gone"), "workspace": "w", "workspace_id": None, "state": "busy",
-                  "run": "s1", "task": "t2", "branch": None, "lock_hash": None, "updated": "x"},
-            "3": {"path": sl, "workspace": "w", "workspace_id": None, "state": "free", "run": None, "task": None,
-                  "branch": None, "lock_hash": None, "updated": "x"}}}))
+        # L10.5: the registry rows are the fixture (a store created later no longer imports lanes.json)
+        sc = mkdb.open_project(lane_home, data_dir=sdata)
+        try:
+            sc.execute("BEGIN IMMEDIATE")
+            for rec in (("1", sl, "busy", "s1", "t1", "w", "wS", "mk/s1/t1", None, "x"),
+                        ("2", os.path.join(tmp, "gone"), "busy", "s1", "t2", "w", None, None, None, "x"),
+                        ("3", sl, "free", None, None, "w", None, None, None, "x")):
+                sc.execute(ins, rec)
+            sc.execute("COMMIT")
+        finally:
+            sc.close()
         sfake = os.path.join(tmp, "fake-status-herdr")
         write(sfake, "#!/usr/bin/env python3\nimport json, sys\n"
               "if sys.argv[2] == 'list':\n"
