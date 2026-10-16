@@ -7,10 +7,13 @@ import { atom, read } from 'claude-code'
 import type { On, PluginOptions } from 'claude-code'
 import type { MkRun } from '../types'
 import { EMPTY_SNAPSHOT, PANE_ID, sanitizeText } from './data'
+import { resolveDataDir, sessionCwd } from './paths'
+import { bannerText, readStatus } from './stop-guard'
 
 const MAX_CHARS = 600
 const FIELD_CAP = 200
 const SECTION_ID = 'matrixkoder:run'
+const BANNER_ID = 'matrixkoder:red'
 const SOLO_TEXT = 'MK solo: no orchestration, build in this session'
 
 // same plugin+key address as dashboard.tsx's atom — file-local for the scan
@@ -41,6 +44,18 @@ export function registerResume(on: On, options: PluginOptions): void {
     const snap = await read($, snapshotAtom)
     const run = snap.run
     if (!run || run.status === 'done' || run.status === 'archived') return { sections }
-    return { sections: [...sections, { id: SECTION_ID, text: resumeText(run), scope: 'session' as const }] }
+    const out = [...sections, { id: SECTION_ID, text: resumeText(run), scope: 'session' as const }]
+    // F.7: the always-on piece. One banner line while a fidelity run has red, stale, deferred,
+    // rework, due or open-reason rows; nothing for a green or legacy run, nothing when the
+    // status read fails (a banner must never throw into prompt composition).
+    try {
+      const cwd = await sessionCwd($)
+      const dataDir = snap.dataDir ?? await resolveDataDir($, { cwd })
+      const text = dataDir ? bannerText(await readStatus($, dataDir, cwd, run.id)) : null
+      if (text) out.push({ id: BANNER_ID, text, scope: 'session' as const })
+    } catch {
+      // no banner
+    }
+    return { sections: out }
   })
 }
