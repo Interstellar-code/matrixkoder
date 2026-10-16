@@ -220,6 +220,7 @@ export const SETTINGS_FIXTURE: SettingsView = {
         { key: 'autoOpen', scope: 'about', label: 'Auto-open pane', type: 'bool', value: true, default: true, help: 'Open the pane when a session starts.', editable: false, why: 'Read-only: claude plugin configure' },
         { key: 'chip', scope: 'about', label: 'Status chip', type: 'bool', value: true, default: true, help: 'Run health chip under the prompt.', editable: false, why: 'Read-only: claude plugin configure' },
         { key: 'toasts', scope: 'about', label: 'Toasts', type: 'bool', value: true, default: true, help: 'Toast on task status transitions.', editable: false, why: 'Read-only: claude plugin configure' },
+        { key: 'stopGuard', scope: 'about', label: 'Stop guard', type: 'bool', value: false, default: false, help: 'Block a stop once per set of RED/REWORK/DUE rows in an orchestrator checkout of a fidelity run.', editable: false, why: 'Read-only: claude plugin configure' },
       ],
     },
     {
