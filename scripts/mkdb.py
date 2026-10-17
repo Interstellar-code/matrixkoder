@@ -1582,6 +1582,15 @@ def _task_history(con, run, task_id, extra, rnd):
             "findings": _findings_count(con, run, task_id, rnd) if rnd else None}
 
 
+def _desc_into(obj, src):
+    """C1: copy the optional plain-English `description` from src onto obj; omitted when it is
+    not a non-empty string."""
+    desc = src.get("description") if isinstance(src, dict) else None
+    if isinstance(desc, str) and desc.strip():
+        obj["description"] = desc
+    return obj
+
+
 def _phases_from_run(rows, header, run, con):
     """Phases with their tasks from one run's task rows, in row order (C5).
 
@@ -1600,6 +1609,8 @@ def _phases_from_run(rows, header, run, con):
     """
     hwave = {str(p.get("id")): p.get("wave") for p in header.get("phases") or []
              if isinstance(p, dict) and p.get("id")}
+    hphase = {str(p.get("id")): p for p in header.get("phases") or []
+              if isinstance(p, dict) and p.get("id")}
     ids = {r["id"] for r in rows}
     roots = {r["id"] for r in rows if not r["parent"] or r["parent"] not in ids}
     phases, nodes = {}, {}
@@ -1609,6 +1620,7 @@ def _phases_from_run(rows, header, run, con):
                   "deps": _deps_of(r["deps"]), "status": r["status"]}
             ph.update(_routing_of(r))
             ph.update(_task_history(con, run, r["id"], _task_extra(con, run, r["id"]), r["round"]))
+            _desc_into(ph, hphase.get(r["id"]))
             ph["tasks"] = []
             phases[r["id"]] = ph
         else:
@@ -1621,6 +1633,7 @@ def _phases_from_run(rows, header, run, con):
             nodes[r["id"]].update(_task_history(con, run, r["id"], extra, r["round"]))
             nodes[r["id"]]["risk"] = _risk_of(extra, reasons)
             nodes[r["id"]]["critical"] = extra.get("critical") is True
+            _desc_into(nodes[r["id"]], extra)
             nodes[r["id"]]["open_reasons"] = reasons
     for r in rows:  # pass 2: attach in rowid order — the parent node already exists, any depth
         node = nodes.get(r["id"])
@@ -1662,8 +1675,8 @@ def _phases_from_header(header):
             if not isinstance(t, dict):
                 continue
             tid = str(t.get("id", ""))
-            task = _node(tid, t, pid, "task")
-            task["subtasks"] = [_node(str(s.get("id", "")), s, tid, "subtask")
+            task = _desc_into(_node(tid, t, pid, "task"), t)
+            task["subtasks"] = [_desc_into(_node(str(s.get("id", "")), s, tid, "subtask"), s)
                                 for s in t.get("subtasks") or [] if isinstance(s, dict)]
             tasks.append(task)
         out.append({"id": pid, "title": ph.get("title", ""), "wave": ph.get("wave"),
@@ -1671,6 +1684,7 @@ def _phases_from_header(header):
                     "pane": None, "branch": None, "updated": None, "acceptance": None,
                     "owned": [], "route": None, "last_commit": None, "rounds": None,
                     "gates": None, "findings": None, "tasks": tasks})
+        _desc_into(out[-1], ph)
     return out
 
 
@@ -1701,6 +1715,7 @@ def _plan_obj(con, row, detail=False):
         "version": row["version"],
         "approved_at": row["approved_at"],
     }
+    _desc_into(obj, header)
     runs = _runs_of(con, row["id"])
     obj["runs"] = [r["id"] for r in runs]
     obj["live_run"] = next((r["id"] for r in runs if r["status"] == "active"), None)
@@ -3042,6 +3057,7 @@ def self_test():
         _plans_query(home)
         _plans_detail(home)
         _plans_reparent(home)
+        _plans_description(home)
         _card_verdict(home)
         _summary_idempotent(home)
         _summary_two_projects(home)
@@ -4335,6 +4351,66 @@ def _plans_detail(home):
     _check(proc.returncode == 2 and "Traceback" not in proc.stderr,
            f"unknown id rc={proc.returncode} err={proc.stderr[-300:]}")
     _check(json.loads(proc.stdout)["ok"] is False, f"unknown id out {proc.stdout!r}")
+
+
+def _plans_description(home):
+    """C1: the optional `description` reaches the three plan views at plan, phase, task and
+    subtask level (run view: tasks from extra_json, phases and plan from header_json; planned
+    view: all four from header_json) and is omitted when empty or whitespace-only."""
+    data = os.path.join(home, "plans-desc")
+    hdr = json.dumps({"description": "Plan why", "phases": [
+        {"id": "ph1", "title": "P1", "description": "Phase why", "tasks": [
+            {"id": "a1", "title": "A1", "description": "Task why",
+             "subtasks": [{"id": "s1", "title": "S1", "description": "Sub why"}]},
+            {"id": "a2", "title": "A2", "description": "  ", "subtasks": []}]}]})
+    bare = json.dumps({"phases": [{"id": "ph1", "title": "P1", "description": "",
+                                   "tasks": [{"id": "a1", "title": "A1"}]}]})
+    con = open_project(home, data_dir=data)
+    try:
+        _begin(con)
+        con.execute("INSERT INTO plans(id, version, title, header_json) VALUES (?,?,?,?)",
+                    ("dplan", 1, "D", hdr))
+        con.execute("INSERT INTO plans(id, version, title, header_json) VALUES (?,?,?,?)",
+                    ("bplan", 1, "B", bare))
+        con.execute("INSERT INTO runs(id, plan, status, started) VALUES (?,?,?,?)",
+                    ("dr", "plans/dplan.md", "active", "2026-01-04T00:00:00Z"))
+        con.execute("COMMIT")
+        add_task(con, "dr", "ph1", "phase", title="P1")
+        add_task(con, "dr", "a1", "task", title="A1", parent="ph1")
+        add_task(con, "dr", "s1", "subtask", title="S1", parent="a1")
+        add_task(con, "dr", "a2", "task", title="A2", parent="ph1")
+        for tid, extra in (("a1", {"description": "Task why"}), ("s1", {"description": "Sub why"}),
+                           ("a2", {"description": " "})):
+            con.execute("UPDATE tasks SET extra_json=? WHERE run='dr' AND id=?",
+                        (json.dumps(extra), tid))
+        con.commit()
+    finally:
+        con.close()
+    got = plans(home, data_dir=data, plan_id="dplan")  # the run view
+    ph = got["phases"][0]
+    t1, t2 = ph["tasks"]
+    _check(got["description"] == "Plan why" and ph["description"] == "Phase why"
+           and t1["description"] == "Task why" and t1["subtasks"][0]["description"] == "Sub why"
+           and "description" not in t2, f"description run view {got}")
+    con = open_project(home, data_dir=data)
+    try:  # no run: the planned view reads every level from header_json
+        con.execute("DELETE FROM tasks WHERE run='dr'")
+        con.execute("DELETE FROM runs WHERE id='dr'")
+        con.commit()
+    finally:
+        con.close()
+    got = plans(home, data_dir=data, plan_id="dplan")
+    ph = got["phases"][0]
+    t1, t2 = ph["tasks"]
+    _check(got["description"] == "Plan why" and ph["description"] == "Phase why"
+           and t1["description"] == "Task why" and t1["subtasks"][0]["description"] == "Sub why"
+           and "description" not in t2, f"description planned view {got}")
+    got = plans(home, data_dir=data, plan_id="bplan")  # nothing set anywhere: no key anywhere
+    _check("description" not in got and "description" not in got["phases"][0]
+           and "description" not in got["phases"][0]["tasks"][0], f"empty description kept {got}")
+    listed = {p["id"]: p for p in plans(home, data_dir=data)["plans"]}
+    _check(listed["dplan"]["description"] == "Plan why" and "description" not in listed["bplan"],
+           f"description plan list {listed}")
 
 
 def _plans_reparent(home):

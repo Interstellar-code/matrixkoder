@@ -992,11 +992,15 @@ def plan_title(body_md, plan_id):
 
 def header_json_of(out, sha, body_md, status):
     """The header_json approve and import both write: the sha of the file, the status, runs,
-    gates, the F.2 final gates, phases and the body. Unknown header keys (created, design,
-    integration, …) live here on a store without the D1.1 columns."""
-    return json.dumps({"sha": sha, "status": status, "runs": out["runs"], "gates": out["gates"],
-                       "final_gates": out["final_gates"], "phases": out["phases"],
-                       "body": body_md}, sort_keys=True)
+    gates, the F.2 final gates, phases and the body, plus the plan-level `description` when it
+    is a non-empty string. Other unknown header keys (created, design, integration, …) live
+    here on a store without the D1.1 columns."""
+    hdr = {"sha": sha, "status": status, "runs": out["runs"], "gates": out["gates"],
+           "final_gates": out["final_gates"], "phases": out["phases"], "body": body_md}
+    desc = out.get("description")
+    if isinstance(desc, str) and desc.strip():
+        hdr["description"] = desc
+    return json.dumps(hdr, sort_keys=True)
 
 
 def write_plan_row(con, plan_id, values, update=None):
@@ -3385,6 +3389,14 @@ def self_test():
         # F.2 approve — counts, the frozen gate fields (a change is a new version naming the field)
         # and the --user-ack refusal. db and mkpaths are already in scope here.
         f2_approve_self_test(tmp, mk, write, plan_text, phase, task, db, mkpaths)
+
+        # C1: the plan-level `description` rides header_json when it is a non-empty string, else
+        # the key is absent (a plan without one is unchanged)
+        base = {"runs": [], "gates": {}, "final_gates": [], "phases": []}
+        assert json.loads(header_json_of(dict(base, description="Why this plan"), "s", "b", "draft")
+                          )["description"] == "Why this plan"
+        for none in ({}, {"description": ""}, {"description": "  "}, {"description": 5}):
+            assert "description" not in json.loads(header_json_of(dict(base, **none), "s", "b", "draft"))
 
         print("mk-plan self-test ok")
     finally:

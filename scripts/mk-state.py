@@ -191,7 +191,9 @@ TASK_FILE_KEYS = ("wave", "ready", "workspace", "last_commit", "gates", "rounds"
                   # refuses them). `gate` is a list of {cmd, expect, timeout, lines} tables, the shape
                   # _gate_run already runs; `manual` is a line nobody runs. `base_risk` is the plan's
                   # `risk` under the name mkdb._task_risk reads (derived risk = base + open reasons).
-                  "gate", "manual", "critical", "base_risk", "acceptance_lines")
+                  "gate", "manual", "critical", "base_risk", "acceptance_lines",
+                  # C1: the plan's optional plain-English description (task and subtask only)
+                  "description")
 # run-level fields the runs table has no column for; they live in the runs.extra_json column.
 # `plan` (the file path) and `plan_id` ride here, not the runs.plan column: that column holds
 # the plan id for a plan-tool run and the bare path for a legacy one, so it cannot carry both. `task_order` is the task-add order (the rows store parent-before-child, which is not that order).
@@ -2636,6 +2638,12 @@ def plan_fidelity(cur):
     return False
 
 
+def plan_description(src):
+    """C1: a plan entry's optional description when it is a non-empty string, else None."""
+    d = src.get("description")
+    return d if isinstance(d, str) and d.strip() else None
+
+
 def plan_field_extra(extra, src, kind, fid=False):
     """D1.5.1: the plan fields (acceptance/refs/type) a `run init --plan` / `plan sync --apply`
     add copies onto the new run.json task. The plan tool (C3, a subprocess) is the only reader
@@ -2647,6 +2655,8 @@ def plan_field_extra(extra, src, kind, fid=False):
         out["acceptance"] = (src.get("acceptance") or "") or None
         refs = src.get("refs") or []
         out["refs"] = list(refs) if isinstance(refs, list) else ([refs] if refs else [])
+        if plan_description(src):  # C1: the optional plain-English description
+            out["description"] = plan_description(src)
         if fid:  # F.2: the gate contract rides tasks.extra_json; a pre-F plan adds no key
             out.update({"gate": list(src.get("gate") or []), "manual": src.get("manual") or "",
                         "critical": bool(src.get("critical")), "base_risk": src.get("risk", 1),
@@ -3266,6 +3276,25 @@ def cmd_plan(a, st):
                     t["owned"] = list(src.get("owned") or [])
                 t["updated"] = now()
                 st.save(run, t, a.by)
+            # C1: description is display-only (not a gate/work field), so it follows the plan at any
+            # status and is not part of plan_field_diffs (no drift warning, no change-list line).
+            # It does not bump `updated`: that stamp feeds the stalled chip and lane-watch freshness.
+            # Existing subtasks have no plan link; they are found by parent. New rows already carry it.
+            for ph in cur.get("phases") or []:
+                for c in ph.get("tasks") or []:
+                    ct = ck_by.get(str(c.get("id") or "").lower())
+                    if ct is None:
+                        continue
+                    kids = {str(x["id"]).lower(): x for x in run["tasks"] if x.get("parent") == ct["id"]}
+                    for t, src in [(ct, c)] + [(kids.get(str(s.get("id") or "").lower()), s)
+                                               for s in c.get("subtasks") or []]:
+                        new = plan_description(src)
+                        if t is None or new == t.get("description"):
+                            continue
+                        if new is None:
+                            del t["description"]
+                        else:
+                            t["description"] = new
             run["plan_sha"] = cur.get("sha")
             run["plan_status"] = cur.get("status")
             st.save(run)
@@ -3282,7 +3311,8 @@ def cmd_plan(a, st):
             plan_store_write(st, run["plan_id"], prev + 1, str(cur.get("plan") or ""),
                              {"sha": cur.get("sha"), "status": cur.get("status"),
                               "final_gates": cur.get("final_gates") or [],
-                              "phases": cur.get("phases") or []},
+                              "phases": cur.get("phases") or [],
+                              **({"description": cur["description"]} if plan_description(cur) else {})},
                              body, st.plan_file(run))
     return {"ok": True, "run": run["id"], "plan": run["plan_id"], "apply": True, "sha": cur.get("sha"),
             "changes": changes, "warnings": warnings,
@@ -3735,6 +3765,25 @@ def d15_self_test(tmp, env, pd, penv):
     # task check reads the same fields: the subtask has everything; a phase needs no acceptance
     assert pk("task", "check", "DP.1.1", "--run", "d1")["ok"] is True
     assert pk("task", "check", "DP", "--run", "d1")["ok"] is True
+
+    # --- C1: plan sync --apply writes an edited description into an EXISTING task and subtask row
+    # (present -> changed -> cleared by empty text, then absent from the plan), and drops the key
+    def sync_desc(task_text, sub_text):
+        for src, text in ((plan["phases"][0]["tasks"][0], task_text),
+                          (plan["phases"][0]["tasks"][0]["subtasks"][0], sub_text)):
+            if text is None:
+                src.pop("description", None)
+            else:
+                src["description"] = text
+        json.dump(plan, open(pfile, "w"))
+        assert pk("plan", "sync", "--run", "d1", "--apply", "--from-file")["ok"] is True
+        return [pk("task", "get", i, "--run", "d1")["task"].get("description") for i in ("DP.1", "DP.1.1")]
+    assert sync_desc("why t", "why s") == ["why t", "why s"]
+    assert sync_desc("why t2", "why s2") == ["why t2", "why s2"]
+    assert sync_desc("", " \n") == [None, None]
+    assert sync_desc("why t", "why s") == ["why t", "why s"]
+    assert sync_desc(None, None) == [None, None]
+    assert "description" not in pk("task", "get", "DP.1", "--run", "d1")["task"]  # the key is gone, not blank
 
     # --- D1.5.4: task check lists the missing mandatory fields
     pk("task", "add", "--root", "--id", "DBAD", "--title", "", "--run", "d1", code=2)  # title is mandatory at add
@@ -5419,6 +5468,14 @@ def self_test():
         assert out["task"]["status"] == "merged", f"phase status {out['task']['status']} != merged"
         out = rw("run", "set", "--id", "rw", "--status", "done")
         assert out["ok"] is True and out["run"]["status"] == "done", out
+
+        # C1: plan_field_extra copies a non-empty string `description` for task and subtask only
+        for kind in ("task", "subtask"):
+            assert plan_field_extra({}, {"description": "why"}, kind)["description"] == "why", kind
+            for none in ({}, {"description": ""}, {"description": " \n"}, {"description": None}):
+                assert "description" not in plan_field_extra({}, none, kind), (kind, none)
+        assert "description" not in plan_field_extra({}, {"description": "why"}, "phase")
+        assert "description" in TASK_FILE_KEYS  # else extra_json never keeps it
 
         d15_self_test(tmp, env, pd, penv)
         print("mk-state self-test ok")
