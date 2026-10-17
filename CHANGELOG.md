@@ -2,6 +2,12 @@
 
 All notable changes to this project. Format: Keep a Changelog; versions: SemVer.
 
+## [0.6.1] - 2026-10-17
+
+### Added
+- **dashboard:** Plan tab redesign, live Overview/Lanes/Usage/Events, Old tab removed (2341d2c)
+- **mkdb:** plans reply carries last_commit, rounds, gates and findings per task (0c680ca)
+
 ## [0.6.0] - 2026-10-16
 
 ### Added
