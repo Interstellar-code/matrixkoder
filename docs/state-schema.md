@@ -205,6 +205,7 @@ writer auto-migrates, so the first v6 write upgrades an existing store in place.
   `acceptance_lines` (list of `{id, text}`): copied from the plan by `run init` / `plan sync --apply`
   for a plan with the F.2 contract. `base_risk` is the plan's task `risk`. All of these are
   read-only through `task set` (refused with a "read-only" error); the plan text is their only home.
+- `description` (string, optional; task and subtask only): the plan's plain-English description. `run init` and `plan sync --apply` copy it when non-empty. `plan sync --apply` (with `--from-file` on a live run) updates or clears it on existing rows with no change line and no `updated` bump. `task set` does not accept it.
 
 ### Per-run fields in `runs.extra_json` (F.3)
 
@@ -527,8 +528,8 @@ no key is renamed or removed, so every plan written against an older template st
 
 `plans(id, version, title, status, created, design, integration, header_json, body_md,
 approved_at, archived_path)`. `status`, `created`, `design` and `integration` are real columns
-(C1). `design` and `integration` are JSON array text. `runs`, the `[gates]` block and the
-`[[phase]]` blocks stay in `header_json`.
+(C1). `design` and `integration` are JSON array text. `runs`, the `[gates]` block, the
+`[[phase]]` blocks (their `description` included) and the plan-level `description` stay in `header_json`.
 
 `archived` is a DB-only `plans.status` (plan files keep draft/approved/running/done/parked).
 `mk-plan.py archive` sets it, keeps the prior status in `header_json.archived_from` and moves the
@@ -556,6 +557,8 @@ files stay.
 | `[[phase]]` blocks | `plans.header_json` |
 | `[[phase]] id` / `[[phase.task]] id` / `[[phase.task.subtask]] id` | `tasks.id` |
 | `title` (phase, task, subtask) | `tasks.title` |
+| `description` (header) | `plans.header_json` |
+| `description` (phase, task, subtask) | `plans.header_json`; task and subtask also `tasks.extra_json` (copied at run init and plan sync) |
 | `acceptance` (task, subtask) | `tasks.acceptance` |
 | `owned` (phase, task, subtask) | `tasks.owned` |
 | `deps` (phase, task, subtask) | `tasks.deps` |
@@ -949,7 +952,7 @@ the plan's live run, or null. `counts` is the task counts by status. `plans <id>
 same object plus `phases`: each phase with its `tasks`, taken from the latest run (`tasks` joined
 to `runs` on `runs.plan = plans.id`), or from the `[[phase]]` / `[[phase.task]]` rows in
 `header_json` when the plan has no run (status `planned`). Each phase is `{id, title, wave, deps,
-status, tasks}`, each task `{id, title, status, parent, type, round, verdict}`. An unknown id
+status, tasks}`, each task `{id, title, status, parent, type, round, verdict}`. The plan, each phase and each task carry an optional `description`, omitted when empty. An unknown id
 answers `ok: false` and exits 2. Both reads refuse a store still at v3 ("needs migration to v4;
 run a writer command"): any writer, such as `mk-plan.py import`, migrates it first.
 
