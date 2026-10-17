@@ -138,9 +138,10 @@ export function planKanbanSideBySide(cols: number): boolean {
 const COLUMN_GLYPH: Readonly<Record<PlanKanbanColumn, string>> = {
   PLANNED: '○', BUILDING: '●', 'NEEDS YOU': '▲', 'ON MAIN': '✓',
 }
-const COLUMN_FG: Readonly<Record<PlanKanbanColumn, string>> = {
+// at draw time, for the theme
+const COLUMN_FG = (): Readonly<Record<PlanKanbanColumn, string>> => ({
   PLANNED: PALETTE.dim, BUILDING: ROLE.live.fg, 'NEEDS YOU': ROLE.warn.fg, 'ON MAIN': ROLE.ok.fg,
-}
+})
 
 const cut = (text: string, w: number): string => {
   if (w <= 0) return ''
@@ -197,7 +198,7 @@ function planCard(els: Els, card: PlanKanbanCard, col: PlanKanbanColumn, inner: 
   return Card(els, edge, (
     <Box key={card.id} flexDirection="column">
       <Box flexDirection="row" gap={1}>
-        <Text color={COLUMN_FG[col]}>{COLUMN_GLYPH[col]}</Text>
+        <Text color={COLUMN_FG()[col]}>{COLUMN_GLYPH[col]}</Text>
         {ActionButton(els, {
           key: `plankanban-card-${card.id}`,
           glyph: card.id,
@@ -229,9 +230,9 @@ function planColumn(els: Els, col: PlanKanbanColumn, cards: readonly PlanKanbanC
   const inner = Math.max(1, width - 8) // lane border 2 + paddingX 2, card border 2 + paddingX 2
   const ruleW = Math.max(1, width - 4)
   return (
-    <Box key={col} flexDirection="column" borderStyle="round" borderColor={cards.length > 0 && col !== 'ON MAIN' && col !== 'PLANNED' ? COLUMN_FG[col] : PALETTE.line} paddingX={1} {...(fixedWidth ? { width } : {})}>
+    <Box key={col} flexDirection="column" borderStyle="round" borderColor={cards.length > 0 && col !== 'ON MAIN' && col !== 'PLANNED' ? COLUMN_FG()[col] : PALETTE.line} paddingX={1} {...(fixedWidth ? { width } : {})}>
       <Box flexDirection="row" justifyContent="space-between" gap={1}>
-        <Text bold={true} color={COLUMN_FG[col]}>{`${COLUMN_GLYPH[col]} ${col}`}</Text>
+        <Text bold={true} color={COLUMN_FG()[col]}>{`${COLUMN_GLYPH[col]} ${col}`}</Text>
         <Text color={PALETTE.mut}>{String(cards.length)}</Text>
       </Box>
       <Text color={PALETTE.line}>{'─'.repeat(ruleW)}</Text>

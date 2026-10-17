@@ -464,7 +464,7 @@ function rowCtx(f: SettingsField, W: number, ui: TabUi | undefined, noHk: true |
 // ---------- the render
 
 /** a plain section's border: lighter than the line token so every card reads as a box on a terminal */
-const EDGE = PALETTE.edge
+const EDGE = (): string => PALETTE.edge // read at draw time so the theme recolours it
 
 /** a card header (Settings.dc.html `.h`): bold upper-case in the muted ink, the
  *  note dim on the right. */
@@ -648,7 +648,7 @@ function GroupCards(els: Els, view: SettingsView, scopeId: SettingsScopeId, W: n
     .filter(({ rows }) => rows.length > 0)
   return (
     <Box flexDirection="column">
-      {groups.map(({ g, rows }) => Card(els, { edge: EDGE }, (
+      {groups.map(({ g, rows }) => Card(els, { edge: EDGE() }, (
         <Box key={`set-group-${g.title}`} flexDirection="column" width={W}>
           {SecHead(els, { label: g.title, right: g.right })}
           {rows.map(r => LayeredRow(els, view, r, W, ui, noHk))}
@@ -691,7 +691,7 @@ function ModeCards(els: Els, view: SettingsView, W: number, ui: TabUi | undefine
   const mode = currentMode(view, ui)
   return (
     <Box flexDirection="column">
-      {Card(els, { edge: EDGE }, (
+      {Card(els, { edge: EDGE() }, (
         <Box flexDirection="column" width={W}>
           {SecHead(els, { label: 'operating mode', right: 'radio' })}
           {view.modes.map(m => {
@@ -762,7 +762,7 @@ function ModelsCards(els: Els, view: SettingsView, W: number, ui: TabUi | undefi
         const chip = Chip(els, { label: `${picks.length}/4`, role: full ? 'warn' : picks.length > 0 ? 'live' : 'idle' })
         const provBudget = Math.max(1, W - cat.name.length - `${picks.length}/4`.length - 2 - 4)
         const orderText = picks.length > 0 ? picks.map(shortModel).join(' → ') : 'none picked'
-        return Card(els, { role: off ? undefined : picks.length > 0 ? 'live' : 'warn', edge: EDGE }, (
+        return Card(els, { role: off ? undefined : picks.length > 0 ? 'live' : 'warn', edge: EDGE() }, (
           <Box key={`set-agent-${cat.id}`} flexDirection="column" width={W}>
             <Box flexDirection="row" justifyContent="space-between" gap={1}>
               <Box flexDirection="row" gap={1}>
@@ -844,7 +844,7 @@ function AboutBody(els: Els, view: SettingsView, W: number, ui: TabUi | undefine
           </Box>
         </Box>
       ))}
-      {Card(els, { edge: EDGE }, (
+      {Card(els, { edge: EDGE() }, (
         <Box flexDirection="column" width={W}>
           {SecHead(els, { label: `what's new · v${a.latest}`, right: `${String(a.commits)} commits` })}
           {a.whatsNew.map(w => (

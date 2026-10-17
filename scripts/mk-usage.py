@@ -429,6 +429,7 @@ def normalize_provider_entry(provider, raw_result_or_json, existing_entry=None, 
         observed_at = now.isoformat(timespec="seconds")
 
     windows = []
+    paces = item.get("pace") or {}
 
     def add_window(win_id, win_dict, custom_title=None, label_key=None):
         if not win_dict or not isinstance(win_dict, dict):
@@ -444,6 +445,8 @@ def normalize_provider_entry(provider, raw_result_or_json, existing_entry=None, 
                 title = "5h"
             elif lbl.lower() == "weekly":
                 title = "week"
+            elif lbl.lower() == "monthly":
+                title = "month"
             else:
                 title = lbl
         else:
@@ -471,12 +474,23 @@ def normalize_provider_entry(provider, raw_result_or_json, existing_entry=None, 
         }
         if is_past:
             w_entry["reset_passed"] = True
+        if usage_data.get("dataConfidence") == "estimated":
+            w_entry["estimated"] = True  # CodexBar's local counter, not the provider's own number
+        # CodexBar's burn-rate forecast, keyed like the window ("primary"/"secondary"); a past reset voids it
+        pace = paces.get(label_key or win_id) if not is_past else None
+        if isinstance(pace, dict) and pace.get("summary"):
+            w_entry["pace"] = {
+                "summary": str(pace["summary"]).replace(" | ", " · "),
+                "will_last": pace.get("willLastToReset") is not False,
+            }
         windows.append(w_entry)
 
     if usage_data.get("primary"):
         add_window("primary", usage_data["primary"], label_key="primary")
     if usage_data.get("secondary"):
         add_window("secondary", usage_data["secondary"], label_key="secondary")
+    if usage_data.get("tertiary"):
+        add_window("tertiary", usage_data["tertiary"], label_key="tertiary")
     for ew in usage_data.get("extraRateWindows") or []:
         if isinstance(ew, dict):
             add_window(ew.get("id"), ew.get("window") or {}, custom_title=ew.get("title"))

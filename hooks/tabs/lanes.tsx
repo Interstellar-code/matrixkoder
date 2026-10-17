@@ -13,7 +13,7 @@
 import type { Elements, RenderElement } from 'claude-code'
 import { LANES_FIXTURE } from './lanes.fixture'
 import { NARROW } from './ui'
-import { ActionRow, Card, Chip, ControlRow } from './kit'
+import { ActionRow, Card, Chip, ControlRow, Section } from './kit'
 import type { ControlState } from './kit'
 import { ROLE } from './palette'
 import type { PaletteRole } from './palette'
@@ -72,6 +72,8 @@ export type LanesView = {
   lanes: LaneData[]
   footerLeft: string
   footerRight: string
+  /** the project's worktree lane slots (mk-lane.py list): drawn as cards when no task holds a lane */
+  slots?: readonly { slot: number; path: string; state: string; clean: boolean; task: string | null; branch: string | null }[]
 }
 
 /** the fixture with the mock flag (C1/C3). */
@@ -299,6 +301,22 @@ export function LanesTab(els: Els, view: LanesView, cols: number, ui?: TabUi): R
           {laneCard(els, lane, cols, ui)}
         </Box>
       ))}
+      {(view.slots ?? []).length > 0 && (
+        <Box flexDirection="column">
+          {Section(els, { label: 'Lane slots', right: `${(view.slots ?? []).filter(x => x.state === 'free').length} free / ${(view.slots ?? []).length}` })}
+          {(view.slots ?? []).map(x => Card(els, x.state === 'free' ? {} : { role: 'live' }, (
+            <Box key={`slot-${String(x.slot)}`} flexDirection="column">
+              <Box flexDirection="row" gap={1}>
+                <Text bold={true}>{`L${String(x.slot)}`}</Text>
+                <Text dimColor={true} wrap="truncate-end">{x.path.split('/').pop() ?? x.path}</Text>
+                <Box flexGrow={1} />
+                {Chip(els, { label: x.state, role: x.state === 'free' ? 'ok' : 'live' })}
+              </Box>
+              <Text dimColor={true} wrap="truncate-end">{x.task != null ? `${x.task}${x.branch != null ? ` · ${x.branch}` : ''}` : x.clean ? 'idle · clean worktree' : 'idle · worktree has changes'}</Text>
+            </Box>
+          )))}
+        </Box>
+      )}
       <Text dimColor={true}>{hintRow(view.footerLeft, view.footerRight, cols)}</Text>
     </Box>
   )

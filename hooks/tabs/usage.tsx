@@ -11,15 +11,21 @@
 import type { Elements, RenderElement } from 'claude-code'
 import { USAGE_FIXTURE } from './usage.fixture'
 import { leftCol } from './ui'
-import { ActionRow, Card, Chip, Section, SmoothBar } from './kit'
+import { ActionRow, BoxButton, Card, Chip, Section, SmoothBar } from './kit'
 import { ROLE } from './palette'
 import type { PaletteRole } from './palette'
 import { gradientBar, pickBar } from './raster'
+import type { SavePayload } from '../settings-io'
 
 type Els = Elements[keyof Elements]
 
 /** The local view state V1 hands every mock tab (C12), declared structurally. */
-export type TabUi = { get(key: string): string | undefined; set(key: string, value: string): void }
+export type TabUi = { get(key: string): string | undefined; set(key: string, value: string): void; save?: (payload: SavePayload) => void }
+
+/** one reserve-floor setting (% left) the quota card edits in place */
+export type FloorSetting = { key: string; left: number; min: number; max: number }
+/** the floors one routing group shares: Claude, or every other agent */
+export type FloorCtl = { who: 'claude' | 'others'; label: string; five: FloorSetting; week: FloorSetting }
 
 /** the row vocabulary: `tone` is a ThemeKey ('dim' draws as dimColor) so body
  *  text follows the theme, and `paint` is a palette colour for chrome-like words
@@ -29,7 +35,16 @@ export type Seg = { text: string; tone?: Tone; paint?: string; bold?: boolean }
 
 /** one quota bar: the share used, the text beside it and the reserve floor
  *  (80 = 20% left), which the gradient bar marks under itself. */
-export type Quota = { pct: number; used: string; floor?: number }
+export type Quota = {
+  pct: number
+  used: string
+  floor?: number
+  /** CodexBar's burn-rate line (`7% in deficit · Runs out in 2d 4h`); paceBad when it runs out before the reset */
+  pace?: string
+  paceBad?: boolean
+  /** the reserve-floor setting this bar's mark shows; drawn as −/+ beside the bar */
+  floorSet?: FloorSetting
+}
 
 /** one agent or pool row (the Main board's Usage tab); a note row carries no bars. */
 export type QuotaRow = {
@@ -40,6 +55,12 @@ export type QuotaRow = {
   reset?: string
   note?: string
   noteTone?: Tone
+  /** a pool row under its agent: drawn without the blank line that separates agents */
+  pool?: boolean
+  /** a monthly window (OpenCode Go), drawn as a third `mo` bar */
+  month?: Quota
+  /** the numbers are CodexBar's local estimate, not the provider's: an `est.` tag by the name */
+  est?: boolean
 }
 
 /** one Jev routing decision, as its one line draws it. */
@@ -60,6 +81,8 @@ export type UsageView = {
   headerLeft: string
   headerRight: string
   rows: QuotaRow[]
+  /** the reserve floors, editable here (live only; the fixture has none) */
+  floors?: FloorCtl[]
   /** the legend chips, each in its real role colour */
   legend: { label: string; role: PaletteRole }[]
   /** the dim source line under the quota rows */
@@ -79,7 +102,7 @@ export function usageView(): UsageView {
 }
 
 /** the heat gradient's stops: the mockup's grad() runs green → amber → red. */
-const HEAT: readonly string[] = [ROLE.ok.fg, ROLE.warn.fg, ROLE.err.fg]
+const HEAT = (): readonly string[] => [ROLE.ok.fg, ROLE.warn.fg, ROLE.err.fg] // at draw time, for the theme
 
 /** the bar role at `pct`: the mockup's tone() — spent and nearly spent are red. */
 export function barRole(pct: number): PaletteRole {
@@ -163,63 +186,112 @@ function sectionRow(els: Els, label: string, right: string, w: number): RenderEl
 }
 
 /** one quota bar row: the `5h`/`wk` label, the bar, the share right-aligned. */
-function barRow(els: Els, key: string, label: string, quota: Quota, w: number): RenderElement {
+function barRow(els: Els, key: string, label: string, quota: Quota, w: number, ui?: TabUi): RenderElement {
   const { Box, Text } = els
   const LW = 3 // `5h ` / `wk `
   const PW = 4 // the share, right-aligned
-  const bw = Math.max(1, w - LW - PW - 2) // two gap columns
+  // the floor stepper `◖−◗ 40% ◖+◗` (11 cells + its gap) takes the bar's right end
+  // every bar keeps the column, stepper or not, so bars line up across rows and cards
+  const CW = ui?.save != null ? FLOOR_W + 1 : 0
+  // with a stepper the bar keeps ~60% of what is left, so the floor column breathes
+  const free = Math.max(1, w - LW - PW - 2 - CW) // two gap columns
+  const bw = CW > 0 ? Math.max(1, Math.floor(free * 0.6)) : free
   const role = barRole(quota.pct)
   const bar = pickBar(
     els,
     key,
-    gradientBar(quota.pct, bw, HEAT, quota.floor),
+    gradientBar(quota.pct, bw, HEAT(), quota.floor),
     SmoothBar(els, { pct: quota.pct, width: bw, role }),
   )
   const share = cut(quota.used, PW)
-  return (
-    <Box flexDirection="row" gap={1}>
+  const line = (
+    <Box key="bar" flexDirection="row" gap={1} width={w}>
       <Text dimColor={true}>{leftCol(label, LW)}</Text>
       {bar}
       <Text color={share === '⊘' ? ROLE.err.fg : role === 'warn' ? ROLE.warn.fg : undefined}>{share.padStart(PW)}</Text>
+      {/* the slack the shortened bar leaves: pushes the floor column to the card's right edge */}
+      {CW > 0 && <Box key="slack" flexGrow={1} />}
+      {CW > 0 && (quota.floorSet != null ? floorStepper(els, key, quota.floorSet, ui) : <Box key={`${key}-floor`} width={FLOOR_W} flexShrink={0} />)}
+    </Box>
+  )
+  if (quota.pace == null) return line
+  // the pace sits under the bar, aligned with its left edge
+  return (
+    <Box key={key} flexDirection="column">
+      {line}
+      <Box key="pace" paddingLeft={LW + 1}>
+        <Text color={quota.paceBad ? ROLE.err.fg : undefined} dimColor={!quota.paceBad}>{cut(quota.pace, w - LW - 1)}</Text>
+      </Box>
     </Box>
   )
 }
 
 /** one agent row: its name (err when its 5h window is spent) and its reset,
  *  then a 5h and a week bar, or its note where it has no window. */
-function quotaRows(els: Els, row: QuotaRow, w: number, keyPrefix: string): RenderElement[] {
+function quotaRows(els: Els, row: QuotaRow, w: number, keyPrefix: string, ui?: TabUi): RenderElement[] {
   const { Box, Text } = els
   if (row.note != null) {
     return [<Text key="note">{segEls(els, fitSegs([sg(row.name, row.nameTone), sg(' · '), sg(row.note, row.noteTone)], w))}</Text>]
   }
-  const reset = cut(row.reset ?? '', Math.max(0, Math.floor(w / 3)))
+  const reset = cut(row.reset && row.reset !== '—' ? `resets ${row.reset}` : '', Math.max(0, Math.floor(w / 3)))
   const dead = isExhausted(row)
   const name: Seg = {
-    text: cut(row.name, Math.max(1, w - reset.length - 1)),
+    text: cut(row.name, Math.max(1, w - reset.length - 1 - (row.est === true ? 6 : 0))),
     bold: true,
     tone: dead ? undefined : row.nameTone,
     paint: dead ? ROLE.err.fg : undefined,
   }
   const out: RenderElement[] = [
     (
-      <Box key="name" flexDirection="row" justifyContent="space-between" gap={1}>
-        <Text>{segEls(els, [name])}</Text>
+      <Box key="name" flexDirection="row" justifyContent="space-between" gap={1} width={w}>
+        <Text>{segEls(els, row.est === true ? [name, sg(' est.', 'dim')] : [name])}</Text>
         <Text color={dead ? ROLE.warn.fg : undefined} dimColor={!dead}>{reset}</Text>
       </Box>
     ),
   ]
-  if (row.five != null) out.push(barRow(els, `${keyPrefix}-5h`, '5h', row.five, w))
-  if (row.week != null) out.push(barRow(els, `${keyPrefix}-wk`, 'wk', row.week, w))
+  if (row.five != null) out.push(barRow(els, `${keyPrefix}-5h`, '5h', row.five, w, ui))
+  if (row.week != null) out.push(barRow(els, `${keyPrefix}-wk`, 'wk', row.week, w, ui))
+  if (row.month != null) out.push(barRow(els, `${keyPrefix}-mo`, 'mo', row.month, w, ui))
   return out
 }
 
-/** the Quota card (C11): the rows, the legend chips and the dim source line. */
-function quotaCard(els: Els, view: UsageView, w: number): RenderElement {
+const FLOOR_W = 17 // `◖ − ◗ 40% ◖ + ◗`: two 6-cell buttons, the value and its gaps
+
+/** the reserve-floor stepper beside a bar: % left before routing skips the agent; a press saves at once */
+function floorStepper(els: Els, key: string, f: FloorSetting, ui?: TabUi): RenderElement {
+  const { Box, Text } = els
+  const step = (by: number): void => {
+    const value = Math.min(f.max, Math.max(f.min, f.left + by))
+    if (value !== f.left) ui?.save?.({ sets: [{ key: f.key, value, list: false }], globals: [], visibility: [] })
+  }
+  return (
+    <Box key={`${key}-floor`} flexDirection="row" width={FLOOR_W} flexShrink={0} gap={1} justifyContent="flex-end">
+      {BoxButton(els, { key: `${key}-floor-dec`, label: '−', onPress: () => step(-5) })}
+      <Text bold={true}>{`${String(f.left)}%`.padStart(3)}</Text>
+      {BoxButton(els, { key: `${key}-floor-inc`, label: '+', onPress: () => step(5) })}
+    </Box>
+  )
+}
+
+/** the Quota card (C11): one bordered card per agent (its pools inside),
+ *  the legend chips and the dim source line. */
+function quotaCard(els: Els, view: UsageView, w: number, ui?: TabUi): RenderElement {
   const { Box, Text } = els
   const rows: RenderElement[] = [sectionRow(els, view.headerLeft, view.headerRight, w)]
-  view.rows.forEach((row, i) => {
-    if (i > 0) rows.push(<Text key={`gap-${String(i)}`}>{' '}</Text>)
-    rows.push(...quotaRows(els, row, w, `quota-${String(i)}`))
+  const msg = ui?.get('settings:save:msg') ?? ''
+  if (msg !== '') rows.push(<Text key="floor-msg" dimColor={true}>{cut(msg, w)}</Text>)
+  // an agent row opens a group; its `└` pool rows join it
+  const groups: QuotaRow[][] = []
+  for (const row of view.rows) {
+    if (row.pool === true && groups.length > 0) groups[groups.length - 1]!.push(row)
+    else groups.push([row])
+  }
+  const iw = Math.max(8, w - 4) // the inner card's border + padding
+  groups.forEach((g, gi) => {
+    const body: RenderElement[] = []
+    g.forEach((row, i) => body.push(<Box key={`r-${String(i)}`} flexDirection="column">{quotaRows(els, row, iw, `quota-${String(gi)}-${String(i)}`, ui)}</Box>))
+    // a fixed-width column so every agent card spans the same width
+    rows.push(<Box key={`g-${String(gi)}`} width={w} flexDirection="column">{Card(els, {}, <Box flexDirection="column">{body}</Box>)}</Box>)
   })
   const legend = chipRow(els, view.legend, w)
   if (legend != null) rows.push(legend)
@@ -265,11 +337,10 @@ function routingCard(els: Els, view: UsageView, w: number): RenderElement {
 export function UsageTab(els: Els, view: UsageView, cols: number, ui?: TabUi): RenderElement {
   const { Box, Text } = els
   const w = Math.max(8, cols - 4) // the Card's border + padding each side (C11)
-  void ui // the Usage board has no control; see the header note (C12)
   return (
     <Box flexDirection="column">
       {view.mock && <Text bold={true} color={ROLE.warn.fg}>MOCK · fixture data · not this run</Text>}
-      {quotaCard(els, view, w)}
+      {quotaCard(els, view, w, ui)}
       {routingCard(els, view, w)}
       <Text dimColor={true}>{hintRow(view.footerLeft, view.footerRight, cols)}</Text>
     </Box>

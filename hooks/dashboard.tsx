@@ -19,16 +19,16 @@ import { globalDirOf, homeDir, paths, projectYamlPath, resolveDataDir } from './
 import { NARROW, STATUS_GLYPH } from './tabs/ui'
 import { stageWord, STAGE_TOTAL } from './tabs/header'
 import type { RunHeaderData } from './tabs/header'
-import { Chip, Segment } from './tabs/kit'
-import { PALETTE, ROLE, withTheme } from './tabs/palette'
+import { Card, Chip, Section, Segment } from './tabs/kit'
+import { PALETTE, ROLE, themeText, withTheme } from './tabs/palette'
 import { withRaster } from './tabs/raster'
 import { EventsTab, EVENTS_MAX } from './tabs/events'
 import type { EventsView } from './tabs/events'
 import { LanesTab } from './tabs/lanes'
 import type { LaneData, LanesView } from './tabs/lanes'
-import { OverviewTab } from './tabs/overview'
+import { OverviewTab, UsageCard } from './tabs/overview'
 import type { OverviewView } from './tabs/overview'
-import { PlanTab, planView } from './tabs/plan'
+import { PlanTab } from './tabs/plan'
 import type { PlanView } from './tabs/plan'
 import { PlansTab, planActionLine } from './tabs/plans'
 import type { PlansView } from './tabs/plans'
@@ -43,7 +43,7 @@ import {
 } from './settings-io'
 import type { RunFn, SavePayload, YamlFieldIn } from './settings-io'
 import { UsageTab } from './tabs/usage'
-import type { QuotaRow, UsageView } from './tabs/usage'
+import type { FloorCtl, FloorSetting, Quota, QuotaRow, UsageView } from './tabs/usage'
 import { USAGE_FIXTURE } from './tabs/usage.fixture'
 import { WaitingTab, waitingAsks, waitingView, readPending, askView, runWaitView, emptyWaitingView } from './tabs/waiting'
 import type { PendingAsk, RunWait } from './tabs/waiting'
@@ -242,8 +242,7 @@ export function registerDashboard(on: On, options: PluginOptions): void {
 
   on('ui.render', { component: 'Pane', requestId: PANE_ID }, async ($, e) => {
     void rearmLoop($, options) // an open pane after /clear restarts its own loop, no /mk needed
-    const els = $.ui.resolve(e)
-    const { Box, Text } = els
+    const rawEls = $.ui.resolve(e)
     const snap = await read($, snapshotAtom) as MkPaneSnapshot
     const dashTab = await read($, dashTabAtom)
     const viewState = await read($, viewStateAtom)
@@ -252,7 +251,7 @@ export function registerDashboard(on: On, options: PluginOptions): void {
     const compact = cols < NARROW
     // S2.3: `raster: false` hands the tabs a table without Raster, so every
     // pickBar falls back to its eighth-block bar.
-    const tabEls = withRaster(els, options.raster)
+    const rawTabEls = withRaster(rawEls, options.raster)
     const tabs = visibleTabs(options.hiddenTabs)
     // the run header comes from the live snapshot on every tab
     const header = realRunHeader(snap)
@@ -274,16 +273,27 @@ export function registerDashboard(on: On, options: PluginOptions): void {
     // straight onto settings (defaultTab) loads here while nothing is stored;
     // every other open reloads from the tab switch (LOW 5) — a render must
     // never start a refresh on its own, or the refresh tick would re-list.
+    if (dashTab === 'lanes' && Date.now() - Number(viewState['lanes:slots-at'] ?? '0') > 30_000) void loadLaneSlots($)
     const settingsState = readSettingsState(viewState)
     const settingsLive = settingsState.live
-    if (dashTab === 'settings' && settingsLive == null && !settingsInflight && (viewState['settings:load:error'] ?? '') === '') {
+    // Usage reads the reserve floors from the same live settings, so it loads them too
+    if ((dashTab === 'settings' || dashTab === 'usage') && settingsLive == null && !settingsInflight && (viewState['settings:load:error'] ?? '') === '') {
       void ensureSettingsLoaded($)
     }
 
-    return (
-      <Box flexDirection="column" width={cols} gap={1}>
+    // Matrix theme across the whole pane: palette.ts swaps PALETTE/ROLE for this synchronous build
+    return withTheme('matrix', () => {
+      // every Text in the pane gets the Matrix greens (a plain or dim Text would draw terminal grey)
+      const els = themeText(rawEls)
+      const tabEls = themeText(rawTabEls)
+      const { Box, Text } = els
+      return (
+      // minHeight: paint the Matrix ground down the whole dock, not just under the content
+      <Box flexDirection="column" width={cols} minHeight={e.props.placement === 'dock' ? e.props.scroll?.bodyRows : undefined} gap={1} backgroundColor={PALETTE.bg}>
+        {/* Matrix code rain behind every tab — first child, so everything after paints over it */}
+        {e.props.placement === 'dock' && codeRain(els, cols, e.props.scroll?.bodyRows ?? 40, Date.now())}
         {e.props.placement === 'inline' && (
-          <Box borderStyle="round" borderColor="yellow" paddingX={1}>
+          <Box borderStyle="round" borderColor={ROLE.warn.fg} paddingX={1}>
             <Text color={ROLE.warn.fg}>Run /tui fullscreen to dock this panel on the right.</Text>
           </Box>
         )}
@@ -305,9 +315,9 @@ export function registerDashboard(on: On, options: PluginOptions): void {
         {needsSetup && dashTab !== 'settings'
           ? null
           : dashTab === 'overview'
-            ? withTheme('matrix', () => snap.run == null ? NoRun(tabEls, snap) : OverviewTab(tabEls, liveOverviewView(snap), cols - 2, ui)) // Matrix theme trial: this tab only
+            ? (snap.run == null ? NoRun(tabEls, snap, cols - 2) : OverviewTab(tabEls, liveOverviewView(snap), cols - 2, ui))
             : dashTab === 'lanes'
-              ? withViewState(LanesTab, tabEls, liveLanesView(snap), cols, ui)
+              ? withViewState(LanesTab, tabEls, { ...liveLanesView(snap), slots: laneSlotsOf(viewState) }, cols, ui)
               : dashTab === 'plan'
                 ? PlanPane(tabEls, viewState, cols, ui)
             : dashTab === 'settings'
@@ -315,7 +325,7 @@ export function registerDashboard(on: On, options: PluginOptions): void {
                 ? SettingsTab(tabEls, settingsLive, cols, ui)
                 : SettingsLoading(els, cols, viewState['settings:load:error'] ?? '')
                   : dashTab === 'usage'
-                    ? withViewState(UsageTab, tabEls, liveUsageView(snap, typeof options.usagePollMin === 'number' && options.usagePollMin > 0 ? Math.max(USAGE_POLL_MIN_MIN, options.usagePollMin) : USAGE_POLL_DEFAULT_MIN), cols, ui)
+                    ? withViewState(UsageTab, tabEls, liveUsageView(snap, typeof options.usagePollMin === 'number' && options.usagePollMin > 0 ? Math.max(USAGE_POLL_MIN_MIN, options.usagePollMin) : USAGE_POLL_DEFAULT_MIN, settingsLive), cols, ui)
                     : dashTab === 'events'
                       ? withViewState(EventsTab, tabEls, liveEventsView(snap), cols, ui)
                       : dashTab === 'kanban'
@@ -324,7 +334,8 @@ export function registerDashboard(on: On, options: PluginOptions): void {
                           ? waitingAsks(tabEls, pane.asks, cols, new Date().toISOString(), ui)
                           : withViewState(WaitingTab, tabEls, waitingPaneView(pane, snap.run?.waiting ?? null), cols, ui)}
       </Box>
-    )
+      )
+    })
   })
 }
 
@@ -544,6 +555,11 @@ async function startLoop($: EngineInterface, options: PluginOptions, cwd: string
   timerRegistry.cancelSweep = arm($.clock.every(SWEEP_INTERVAL_MS, () => sweepLanes($, options, cwd)))
   busTimers.cancelBus?.()
   busTimers.cancelBus = arm($.clock.every(BUS_INTERVAL_MS, () => ensureBus($, options, cwd)))
+  // the code rain's own frame: a view-state bump redraws the pane, skipped once no pane drew it lately
+  timerRegistry.cancelRain?.()
+  timerRegistry.cancelRain = arm($.clock.every(RAIN_MS, () => {
+    if (Date.now() - lastRainDraw < 10_000) void setViewKey($, 'rain:tick', String(Math.floor(Date.now() / RAIN_MS)))
+  }))
   lastChipText = undefined
   await refreshSafe($, options, cwd) // first load populates pane + chip and never toasts
   const gdir = await globalDirOf($, await homeDir($))
@@ -837,7 +853,8 @@ function planDetailViewOf(view: Record<string, string>, id: string): PlanView | 
 export function PlanPane(els: Els, view: Record<string, string>, paneCols: number, ui: TabUi): RenderElement {
   const cols = paneCols - 2 // the paddingX of the navy ground below
   const { Box, Text } = els
-  if (view[PLANS_STORE_KEY] !== '1') return PlanTab(els, planView(), cols, ui)
+  // no project store yet: say so, never the Checkout v2 fixture
+  if (view[PLANS_STORE_KEY] !== '1') return <Text dimColor={true}>no plans yet · approve a plan to see it here</Text>
   const sub = planSubOf(view)
   const onAction = (kind: string, id: string): void => {
     if (kind === 'open') {
@@ -1372,6 +1389,26 @@ async function projectProviders($: EngineInterface, cwd: string): Promise<readon
 // ---------- S3: the Settings tab's live layer (settings-io does the pure
 // work; these closures hand it this module's $ — $ never crosses an import) ----------
 
+let slotsInflight = false
+
+/** The project's lane slots (`mk-lane.py list`) into view state `lanes:slots`, at most every
+ *  30 s and only while the Lanes tab draws — a render never waits on it. */
+async function loadLaneSlots($: EngineInterface): Promise<void> {
+  if (slotsInflight) return
+  slotsInflight = true
+  try {
+    const r = await $.process.run(['python3', `${$.plugin.root}/scripts/mk-lane.py`, 'list'], { timeoutMs: 5_000 })
+    const parsed = JSON.parse(r.stdout ?? '') as { ok?: boolean; slots?: unknown }
+    if (parsed.ok === true && Array.isArray(parsed.slots)) {
+      await update($, viewStateAtom, prev => ({ ...prev, 'lanes:slots': JSON.stringify(parsed.slots), 'lanes:slots-at': String(Date.now()) }))
+    }
+  } catch {
+    // no lane slots readable — the tab keeps what it had
+  } finally {
+    slotsInflight = false
+  }
+}
+
 let settingsInflight = false
 
 /** One view-state key write that never throws (a refused write keeps the
@@ -1659,27 +1696,38 @@ function FirstRun(els: Els) {
   )
 }
 
-function NoRun(els: Els, snap: MkSnapshot) {
+/** No active run: the Overview's card layout with what there is — a RUN card saying so,
+ *  the recent runs, and the live usage — not the old plain-text panel. */
+function NoRun(els: Els, snap: MkSnapshot, cols: number) {
   const { Box, Text } = els
-  const past = snap.runs.filter(r => r.status !== 'active').slice(-3).reverse()
+  const W = Math.max(1, cols - 4)
+  const past = snap.runs.filter(r => r.status !== 'active').slice(-5).reverse()
+  const usage = liveOverviewView(snap).usage
   return (
-    <Box flexDirection="column">
-      <Text bold={true}>Run</Text>
-      <Text>No active orchestration run.</Text>
-      <Text dimColor={true}>To start a multi-lane feature run, ask Claude to orchestrate it.</Text>
-      <Text color={PALETTE.blue} bold={true}>▶ New project? Run /mk setup</Text>
-      {past.length > 0 && (
-        <Box flexDirection="column" marginTop={1}>
-          <Text bold={true}>Recent Runs</Text>
+    <Box flexDirection="column" gap={1} backgroundColor={PALETTE.bg} paddingX={1} paddingY={1}>
+      {Card(els, {}, (
+        <Box flexDirection="column">
+          {Section(els, { label: 'Run', right: 'idle' })}
+          <Text>No active orchestration run.</Text>
+          <Text dimColor={true}>To start a multi-lane feature run, ask Claude to orchestrate it.</Text>
+          <Text color={ROLE.live.fg} bold={true}>▶ New project? Run /mk setup</Text>
+        </Box>
+      ))}
+      {past.length > 0 && Card(els, {}, (
+        <Box flexDirection="column">
+          {Section(els, { label: 'Recent runs', right: String(past.length) })}
           {past.map(r => (
             <Box key={r.id} flexDirection="row" gap={1}>
-              <Text color={ROLE.ok.fg}>✓</Text>
+              <Text color={r.status === 'done' ? ROLE.ok.fg : ROLE.warn.fg}>{r.status === 'done' ? '✓' : '‖'}</Text>
               <Text bold={true}>{r.id}</Text>
-              <Text dimColor={true}>{r.feature ?? ''} {r.status ?? ''}</Text>
+              <Text dimColor={true} wrap="truncate-end">{(r.feature ?? '').slice(0, Math.max(1, W - r.id.length - 14))}</Text>
+              <Box flexGrow={1} />
+              {Chip(els, { label: r.status ?? '', role: r.status === 'done' ? 'ok' : 'idle' })}
             </Box>
           ))}
         </Box>
-      )}
+      ))}
+      {usage.length > 0 && UsageCard(els, usage, W, cols < NARROW)}
     </Box>
   )
 }
@@ -1705,6 +1753,7 @@ function resetStr(iso: string | null | undefined, now: number, compact: boolean)
     return compact ? `${h}h${String(m).padStart(2, '0')}` : `${h}h${String(m).padStart(2, '0')}m`
   }
   const d = new Date(t)
+  if (!compact) return `${d.toLocaleString('en', { month: 'short' })} ${d.getDate()}` // `Oct 20`, not the ambiguous `10-20`
   return `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
 
@@ -1830,34 +1879,139 @@ function usageRows(snap: MkSnapshot, compact: boolean): UsageRow[] {
   })
 }
 
+const RAIN_MS = 1500
+/** when the rain last drew: the tick only redraws while a pane is actually showing it */
+let lastRainDraw = 0
+
+const RAIN_GLYPHS = 'ｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓﾔﾕﾖﾗﾘﾙﾚﾛﾜﾝ0123456789'
+// three dim greens, head to tail: kept far under the text greens so the rain stays background
+const RAIN_SHADES = ['#1c6b32', '#124a22', '#0b2e16'] as const
+
+/** a cheap deterministic hash, so a column's drop is stable between redraws of the same tick */
+const rainHash = (n: number): number => {
+  let x = (n ^ 0x9e3779b9) >>> 0
+  x = Math.imul(x ^ (x >>> 16), 0x85ebca6b) >>> 0
+  x = Math.imul(x ^ (x >>> 13), 0xc2b2ae35) >>> 0
+  return (x ^ (x >>> 16)) >>> 0
+}
+
+/** Matrix code rain as an absolute layer behind the pane: one drop on every other column,
+ *  falling one or two rows per rain tick, its head brightest and its tail fading. It moves only when
+ *  the pane redraws: the RAIN_MS tick below, or any other redraw. */
+function codeRain(els: Elements[keyof Elements], cols: number, rows: number, now: number): RenderElement {
+  const { Box, Text } = els
+  lastRainDraw = now
+  const tick = Math.floor(now / RAIN_MS) // one step per rain redraw
+  // shade per cell (-1 = empty), then each row is drawn as runs of one shade
+  const grid: number[][] = Array.from({ length: rows }, () => new Array<number>(cols).fill(-1))
+  const glyph: string[][] = Array.from({ length: rows }, () => new Array<string>(cols).fill(' '))
+  for (let c = 0; c < cols; c += 2) {
+    const h = rainHash(c * 7919)
+    if (h % 3 === 0) continue // a third of the columns stay dark
+    const len = 4 + (h % 9)
+    const period = rows + len + (h % 17)
+    const head = (tick * (1 + (h % 2)) + (h % period)) % period
+    for (let k = 0; k < len; k++) {
+      const r = head - k
+      if (r < 0 || r >= rows) continue
+      grid[r]![c] = k === 0 ? 0 : k < len / 2 ? 1 : 2
+      glyph[r]![c] = RAIN_GLYPHS[rainHash(c * 31 + r * 131 + tick) % RAIN_GLYPHS.length]!
+    }
+  }
+  return (
+    <Box key="rain" position="absolute" top={0} left={0} flexDirection="column">
+      {grid.map((row, r) => {
+        const runs: RenderElement[] = []
+        let start = 0
+        for (let c = 1; c <= cols; c++) {
+          if (c < cols && row[c] === row[start]) continue
+          const shade = row[start]!
+          const text = glyph[r]!.slice(start, c).join('')
+          runs.push(shade < 0
+            ? <Text key={String(start)}>{text}</Text>
+            : <Text key={String(start)} color={RAIN_SHADES[shade]}>{text}</Text>)
+          start = c
+        }
+        return <Text key={`r${String(r)}`}>{runs}</Text>
+      })}
+    </Box>
+  )
+}
+
 /** The Usage tab's live view: the snapshot's ledger rows (usageRows:
  *  `claude (all)`, `└` pool rows, ⊘ exhausted, n/a, hints) in the tab's QuotaRow shape.
  *  Jev routing has no recorded source yet, so that card is empty, never invented. */
-export function liveUsageView(snap: MkSnapshot, pollMin: number): UsageView {
-  const q = (pct: number | null, na: boolean, exhausted: boolean): QuotaRow['five'] =>
-    exhausted ? { pct: 100, used: '⊘' } : pct == null ? (na ? { pct: 0, used: 'n/a' } : undefined) : { pct, used: `${Math.round(pct)}%`, floor: 80 }
+const FLOOR_KEY = 'routing_preferences.reserve_floor'
+/** the four reserve floors (% left) from the live Settings view; the schema defaults until it loads */
+function reserveFloors(settings: SettingsView | null): FloorCtl[] {
+  const rows = new Map((settings?.groups ?? []).flatMap(g => g.rows).map(f => [f.key, f]))
+  const one = (who: 'claude' | 'others', win: 'five_hour' | 'weekly', dflt: number): FloorCtl['five'] => {
+    const key = `${FLOOR_KEY}.${who}.${win}_left_pct`
+    const f = rows.get(key)
+    const v = Number(f?.value ?? dflt)
+    return { key, left: Number.isFinite(v) ? v : dflt, min: f?.min ?? 0, max: f?.max ?? 90 }
+  }
+  return [
+    { who: 'claude', label: 'claude', five: one('claude', 'five_hour', 40), week: one('claude', 'weekly', 30) },
+    { who: 'others', label: 'others', five: one('others', 'five_hour', 10), week: one('others', 'weekly', 15) },
+  ]
+}
+
+export function liveUsageView(snap: MkSnapshot, pollMin: number, settings: SettingsView | null = null): UsageView {
+  const floors = reserveFloors(settings)
+  // the bar's floor mark sits at the share used where the reserve starts: 100 − % left
+  const floorFor = (agent: string, kind: '5h' | 'week'): FloorSetting => {
+    const f = floors[agent === 'claude' ? 0 : 1]!
+    return kind === '5h' ? f.five : f.week
+  }
+  type Win = { pool?: string; kind?: string; used_pct?: number; estimated?: boolean; pace?: { summary: string; will_last: boolean } }
+  const winsOf = (agent: string, pool: string | null): Win[] =>
+    ((snap.usage?.agents?.[agent] as { windows?: Win[] } | undefined)?.windows ?? []).filter(x => pool == null || x.pool === pool)
+  // a monthly window (OpenCode Go) as a third bar; `est.` when CodexBar only estimates locally
+  const monthOf = (agent: string, pool: string | null): QuotaRow['month'] => {
+    const m = winsOf(agent, pool).find(x => x.kind === 'month' && typeof x.used_pct === 'number')
+    return m == null ? undefined : { pct: m.used_pct!, used: `${Math.round(m.used_pct!)}%` }
+  }
+  const estOf = (agent: string, pool: string | null): boolean => winsOf(agent, pool).some(x => x.estimated === true)
+  // CodexBar's pace forecast for one agent pool window (only Claude's session/weekly carry one today)
+  const paceOf = (agent: string, pool: string | null, kind: '5h' | 'week'): Pick<Quota, 'pace' | 'paceBad'> => {
+    const w = ((snap.usage?.agents?.[agent] as { windows?: Win[] } | undefined)?.windows ?? [])
+      .find(x => x.kind === kind && x.pace != null && (pool == null || x.pool === pool))
+    return w?.pace ? { pace: w.pace.summary, paceBad: !w.pace.will_last } : {}
+  }
+  const q = (pct: number | null, na: boolean, exhausted: boolean, pace: Pick<Quota, 'pace' | 'paceBad'> = {}, fs?: FloorSetting): QuotaRow['five'] =>
+    exhausted ? { pct: 100, used: '⊘' } : pct == null ? (na ? { pct: 0, used: 'n/a' } : undefined) : { pct, used: `${Math.round(pct)}%`, floor: fs == null ? 80 : 100 - fs.left, floorSet: fs, ...pace }
   const rows: QuotaRow[] = []
   for (const r of usageRows(snap, false)) {
     if (r.hint != null) { rows.push({ name: r.label, nameTone: 'dim', note: r.hint, noteTone: 'dim' }); continue }
-    if (r.header) { rows.push({ name: r.label, note: 'provider pools below', noteTone: 'dim' }); continue }
+    if (r.header) { rows.push({ name: r.label }); continue }
+    if (r.na && r.weekPct == null && r.sub.length === 0) { rows.push({ name: r.label.trim(), note: `n/a · sign in to ${r.name} in CodexBar`, noteTone: 'warning' }); continue }
+    if (r.pct == null && r.weekPct == null && !r.na && r.sub.length === 0) { rows.push({ name: r.label.trim(), note: 'no quota source', noteTone: 'dim' }); continue }
+    const [agent, pool] = r.name.includes(':') ? r.name.split(':') as [string, string] : [r.name, r.name === 'claude' ? 'default' : null]
     rows.push({
       name: r.label.trim(),
-      ...(r.label.startsWith('  ') ? { nameTone: 'dim' as const } : {}),
-      five: q(r.pct, r.na, r.exhausted),
-      week: q(r.weekPct, false, false),
+      ...(r.label.startsWith('  ') ? { nameTone: 'dim' as const, pool: true } : {}),
+      five: q(r.pct, r.na, r.exhausted, paceOf(agent, pool, '5h'), floorFor(agent, '5h')),
+      week: q(r.weekPct, false, false, paceOf(agent, pool, 'week'), floorFor(agent, 'week')),
       reset: resetStr(r.exhausted && r.exhaustedUntil ? r.exhaustedUntil : r.reset, snap.now, false).trim(),
+      month: monthOf(agent, pool),
+      ...(estOf(agent, pool) ? { est: true } : {}),
     })
     for (const p of r.sub) {
       rows.push(p.hint != null
-        ? { name: `└ ${p.name}`, nameTone: 'dim', note: p.hint, noteTone: 'dim' }
-        : { name: `└ ${p.name}`, nameTone: 'dim', five: q(p.pct, false, p.exhausted), week: q(p.weekPct, false, false), reset: resetStr(p.exhausted && p.exhaustedUntil ? p.exhaustedUntil : p.reset, snap.now, false).trim() })
+        ? { name: `└ ${p.name}`, nameTone: 'dim', pool: true, note: p.hint, noteTone: 'dim' }
+        : { name: `└ ${p.name}`, nameTone: 'dim', pool: true, five: q(p.pct, false, p.exhausted, paceOf(r.name, p.name, '5h'), floorFor(r.name, '5h')), week: q(p.weekPct, false, false, paceOf(r.name, p.name, 'week'), floorFor(r.name, 'week')), month: monthOf(r.name, p.name), ...(estOf(r.name, p.name) ? { est: true } : {}), reset: resetStr(p.exhausted && p.exhaustedUntil ? p.exhaustedUntil : p.reset, snap.now, false).trim() })
     }
   }
   return {
     ...USAGE_FIXTURE,
     mock: false,
+    headerRight: '▮ reserve floor',
     rows,
+    floors,
     actions: `usage.json · CodexBar · poll ${pollMin}m`,
+    footerLeft: '',
+    footerRight: '',
     decisionsRight: '',
     decisions: [],
     routingHint: 'Jev decisions show here once routing is recorded',
@@ -1973,6 +2127,22 @@ export function liveOverviewView(snap: MkSnapshot): OverviewView {
 /** The Lanes tab's live view: one card per lane from run.tasks. No live source for the
  *  stage strip, gate table, review counts, activity line, commit subject or pane id, so
  *  those stay empty. */
+/** The lane slots last read by loadLaneSlots, typed for the Lanes tab. */
+function laneSlotsOf(view: Record<string, string>): NonNullable<LanesView['slots']> {
+  try {
+    const raw = JSON.parse(view['lanes:slots'] ?? '[]') as unknown
+    if (!Array.isArray(raw)) return []
+    return raw.flatMap(x => {
+      if (x == null || typeof x !== 'object') return []
+      const o = x as Record<string, unknown>
+      if (typeof o.slot !== 'number' || typeof o.path !== 'string') return []
+      return [{ slot: o.slot, path: o.path, state: typeof o.state === 'string' ? o.state : '?', clean: o.clean === true, task: typeof o.task === 'string' ? o.task : null, branch: typeof o.branch === 'string' ? o.branch : null }]
+    })
+  } catch {
+    return []
+  }
+}
+
 export function liveLanesView(snap: MkSnapshot): LanesView {
   const groups = snap.run ? laneGroups(snap.run) : []
   const held = groups.filter(g => SIDE_STATE.has(g.status)).length

@@ -109,3 +109,18 @@ export function withTheme<T>(theme: ThemeName, render: () => T): T {
     THEME.name = 'default'
   }
 }
+
+/** Matrix lettering for every Text: no colour → the theme's body green, `dimColor` → the
+ *  theme's dim green (a terminal's dim is grey). Colours are read now, inside withTheme, so
+ *  the wrapper keeps them whenever the engine calls it. Other element kinds pass through. */
+export function themeText<T extends { Text: (props: never) => unknown }>(els: T): T {
+  if (THEME.name !== 'matrix') return els
+  const fg = PALETTE.fg
+  const dim = PALETTE.dim
+  const Text = els.Text as unknown as (props: Record<string, unknown>) => unknown
+  const wrapped = (props: Record<string, unknown>): unknown => {
+    if (props.color != null) return Text(props)
+    return Text({ ...props, color: props.dimColor === true ? dim : fg, dimColor: false })
+  }
+  return { ...els, Text: wrapped } as unknown as T
+}

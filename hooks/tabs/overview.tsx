@@ -205,7 +205,7 @@ function LanesCard(els: Els, lanes: OverviewData['lanes'], W: number, compact: b
 }
 
 /** USAGE — gradient bars (Raster) with the SmoothBar fallback, then the numbers. */
-function UsageCard(els: Els, usage: OverviewData['usage'], W: number, compact: boolean) {
+export function UsageCard(els: Els, usage: OverviewData['usage'], W: number, compact: boolean) {
   const { Box, Text } = els
   const numW = compact ? NUM_W.compact : NUM_W.wide
   const barW = Math.max(3, W - NAME_W - numW - 2)
