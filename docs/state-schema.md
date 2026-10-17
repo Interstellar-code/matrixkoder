@@ -530,6 +530,14 @@ approved_at, archived_path)`. `status`, `created`, `design` and `integration` ar
 (C1). `design` and `integration` are JSON array text. `runs`, the `[gates]` block and the
 `[[phase]]` blocks stay in `header_json`.
 
+`archived` is a DB-only `plans.status` (plan files keep draft/approved/running/done/parked).
+`mk-plan.py archive` sets it, keeps the prior status in `header_json.archived_from` (the folder's
+new path in `archived_to`) and moves the whole plan folder to `<project>/archive/plans/<plan-id>/`;
+`unarchive` reverses both. `mk-plan.py delete` takes an archived plan only: after a verified
+`<project>/archive/<plan-id>-pre-delete-<UTC ts>.db` backup, one transaction deletes the rows of
+the plan's runs (`tasks`, `events`, `artifacts`, `acks`, `waits`, `change_log`, `evidence`,
+`risk_reasons`, `reconcile_due`), the `runs` rows and the `plans` row. The archived folder stays.
+
 | Header key | DB home |
 |---|---|
 | `plan` | `plans.id` |

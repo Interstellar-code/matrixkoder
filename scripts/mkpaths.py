@@ -706,6 +706,13 @@ def plan_dir(data, plan):
     return os.path.join(plans_dir(data), plan)
 
 
+def archive_dir(data, plan=None, home_arg=None):
+    """<project>/archive (run and pre-delete backups); with a plan id, <project>/archive/plans/<id>
+    (the whole archived plan folder). The C2 project folder for a migrated project (L10.7)."""
+    base = os.path.join(project_folder(data, home_arg), "archive")
+    return os.path.join(base, "plans", plan) if plan else base
+
+
 def plan_archives_dir(data, plan=None):
     """The plan-version folder. Migrated and named: <project>/plans/<plan>/archive (C2).
     Otherwise today's <data>/plans/archive — a migrated project with no plan id cannot be

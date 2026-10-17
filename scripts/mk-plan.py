@@ -13,9 +13,18 @@ Python 3 stdlib only.
   import <path> [--dry-run] [--data DIR] [--home DIR]
                                    load one +++ plan into the store WITHOUT approving it (C4):
                                    one plans row, no tasks, no file change
+  archive <id> [--data DIR] [--home DIR]
+                                   refused on a live run; sets plans.status=archived (prior status
+                                   in header_json.archived_from) and moves the whole plan folder to
+                                   <project>/archive/plans/<id>/ (a taken name gets a stamp)
+  unarchive <id> [--data DIR] [--home DIR]
+                                   archived plans only; moves the folder back (refused when the
+                                   original exists) and restores the prior status
   delete <id> [--data DIR] [--home DIR]
-                                   refused on a live run; else drops the plans row and moves the
-                                   file into plans/archive/ (never unlinks, C10)
+                                   archived plans only; refused on a live run or a held lane slot.
+                                   Verified VACUUM INTO backup <project>/archive/<id>-pre-delete-
+                                   <ts>.db, then one transaction purges the plan's run rows and the
+                                   plans row. The archived folder is never unlinked (C10)
   export <path> [--data DIR] [--home DIR]
                                    rebuild the markdown from the store; body kept verbatim
 
@@ -1529,45 +1538,171 @@ def import_file(path, data, home, dry_run=False):
     return reply
 
 
-def delete_plan(plan_id, data, home):
-    """C10: drop the plans row and archive the file — never unlink it (C13). Refused while any
-    run of this plan is still active; tasks of finished runs stay."""
+def _open_plan_store(plan_id, data, home, verb):
+    """Shared by archive/unarchive/delete: id check, store check, the open connection, the plans
+    row and the plan's run ids. Raises Fail (connection closed) when the plan is not in the store."""
     if not PLAN_ID_RE.fullmatch(plan_id):
         raise Fail([f"bad plan id {plan_id!r} ({PLAN_ID_RE.pattern})"])
     data = resolve_data_arg(data)
     if not store_present(data):
-        raise Fail([f"no store: delete needs <data>/mk.db ({data})"])
+        raise Fail([f"no store: {verb} needs the project store ({data})"])
     db = _mkdb()
     home = db.resolve_home(home)
     con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
+    row = con.execute("SELECT status, header_json FROM plans WHERE id=?", (plan_id,)).fetchone()
+    if not row:
+        con.close()
+        raise Fail([f"no plan {plan_id} in the store"])
+    runs = [r["id"] for r in con.execute("SELECT id FROM runs WHERE plan=? ORDER BY id", (plan_id,))]
+    return data, home, con, row, runs
+
+
+def _refuse_live(con, plan_id, runs, verb):
+    live = [r["id"] for r in con.execute(
+        "SELECT id FROM runs WHERE plan=? AND status='active' ORDER BY id", (plan_id,))]
+    if live:
+        raise Fail([f"refusing to {verb} {plan_id}: live run(s) {', '.join(live)} — "
+                    f"close the run first (C10)"])
+
+
+def _free_name(path):
+    """A name nothing uses yet: path itself, else path-<UTC stamp>[-n]. Never overwrites."""
+    out, n = path, 0
+    while os.path.exists(out):
+        n += 1
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        out = f"{path}-{stamp}" + (f"-{n}" if n > 1 else "")
+    return out
+
+
+def _set_header(con, plan_id, row, status, **keys):
+    """Write plans.status and merge keys into header_json (a None value drops the key)."""
+    header = json.loads(row["header_json"] or "{}")
+    for k, v in keys.items():
+        if v is None:
+            header.pop(k, None)
+        else:
+            header[k] = v
+    con.execute("UPDATE plans SET status=?, header_json=? WHERE id=?",
+                (status, json.dumps(header), plan_id))
+    con.commit()
+    return header
+
+
+def archive_plan(plan_id, data, home):
+    """Mark the plan archived (prior status kept in header_json.archived_from), then move the whole
+    plan folder to <project>/archive/plans/<id>. The row is written first: a failed move leaves
+    status archived with the folder at the source, and a re-run finishes the move."""
+    data, home, con, row, runs = _open_plan_store(plan_id, data, home, "archive")
     try:
-        row = con.execute("SELECT archived_path FROM plans WHERE id=?", (plan_id,)).fetchone()
-        if not row:
-            raise Fail([f"no plan {plan_id} in the store"])
-        live = [r["id"] for r in con.execute(
-            "SELECT id FROM runs WHERE plan=? AND status='active' ORDER BY id", (plan_id,))]
-        if live:
-            raise Fail([f"refusing to delete {plan_id}: live run(s) {', '.join(live)} — "
-                        f"close the run first (C10)"])
-        con.execute("DELETE FROM plans WHERE id=?", (plan_id,))
-        con.commit()
+        _refuse_live(con, plan_id, runs, "archive")
+        src = mkpaths.plan_dir(data, plan_id)
+        if row["status"] == "archived" and not os.path.isdir(src):
+            raise Fail([f"plan {plan_id} is already archived"])
+        if row["status"] != "archived":
+            _set_header(con, plan_id, row, "archived", archived_from=row["status"] or "done")
+        moved = None
+        if os.path.isdir(src):
+            dst = _free_name(mkpaths.archive_dir(data, plan_id, home))
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.move(src, dst)
+            moved = dst
+            row = con.execute("SELECT status, header_json FROM plans WHERE id=?", (plan_id,)).fetchone()
+            _set_header(con, plan_id, row, "archived", archived_to=dst)
     finally:
         con.close()
-    # the file moves to the archive only after the row is gone; a name already taken gets a
-    # timestamp suffix so an earlier archived version is never overwritten
-    src = mkpaths.plan_file(data, plan_id)
-    moved = None
-    if os.path.isfile(src):
-        dst = os.path.join(mkpaths.plan_archives_dir(data, plan_id), os.path.basename(src))
-        n = 0
-        while os.path.exists(dst):
-            stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-            n += 1
-            dst = os.path.join(mkpaths.plan_archives_dir(data, plan_id), f"{plan_id}-{stamp}" + (f"-{n}" if n > 1 else "") + ".md")
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        shutil.move(src, dst)
-        moved = dst
     return {"ok": True, "plan": plan_id, "moved": moved}
+
+
+def unarchive_plan(plan_id, data, home):
+    """Move the archived folder back and restore the prior status (default done)."""
+    data, home, con, row, runs = _open_plan_store(plan_id, data, home, "unarchive")
+    try:
+        if row["status"] != "archived":
+            raise Fail([f"plan {plan_id} is not archived (status {row['status']!r})"])
+        header = json.loads(row["header_json"] or "{}")
+        src = header.get("archived_to") or mkpaths.archive_dir(data, plan_id, home)
+        dst = mkpaths.plan_dir(data, plan_id)
+        moved = None
+        if os.path.isdir(src):
+            if os.path.exists(dst):
+                raise Fail([f"refusing to unarchive {plan_id}: {dst} already exists"])
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.move(src, dst)
+            moved = dst
+        _set_header(con, plan_id, row, header.get("archived_from") or "done",
+                    archived_from=None, archived_to=None)
+    finally:
+        con.close()
+    return {"ok": True, "plan": plan_id, "moved": moved}
+
+
+# tables keyed by run id, children first; a store older than a table skips it
+PURGE_BY_RUN = ("tasks", "events", "artifacts", "acks", "waits", "change_log", "evidence",
+                "risk_reasons", "reconcile_due")
+
+
+def delete_plan(plan_id, data, home):
+    """C10: delete an ARCHIVED plan. After a verified VACUUM INTO backup, one transaction drops the
+    rows of its runs, the runs and the plans row. The archived folder is never unlinked (C13).
+    Refused on a live run or while a lane slot still holds one of its runs."""
+    data, home, con, row, runs = _open_plan_store(plan_id, data, home, "delete")
+    try:
+        if row["status"] != "archived":
+            raise Fail([f"refusing to delete {plan_id}: status is {row['status']!r}, "
+                        f"archive it first"])
+        _refuse_live(con, plan_id, runs, "delete")
+        marks = ",".join("?" * len(runs))
+        held = [r["slot"] for r in con.execute(
+            f"SELECT slot FROM lane_slots WHERE run IN ({marks})", runs)] if runs else []
+        if held:
+            raise Fail([f"refusing to delete {plan_id}: lane slot(s) {', '.join(held)} still "
+                        f"hold its runs"])
+        backup = _predelete_backup(con, plan_id, mkpaths.archive_dir(data, None, home))
+        have = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        purged = {}
+        try:
+            for t in PURGE_BY_RUN:
+                if t in have and runs:
+                    purged[t] = con.execute(f"DELETE FROM {t} WHERE run IN ({marks})", runs).rowcount
+            purged["runs"] = con.execute("DELETE FROM runs WHERE plan=?", (plan_id,)).rowcount
+            purged["plans"] = con.execute("DELETE FROM plans WHERE id=?", (plan_id,)).rowcount
+            con.commit()
+        except BaseException:
+            con.rollback()
+            raise
+    finally:
+        con.close()
+    return {"ok": True, "plan": plan_id, "backup": backup, "purged": purged}
+
+
+def _predelete_backup(con, plan_id, dest_dir):
+    """VACUUM INTO a temp file, open it and check it holds the plan, then rename into place. Any
+    failure removes the temp file and raises before a row is touched (shape of mk-state archive_backup)."""
+    import sqlite3
+    os.makedirs(dest_dir, exist_ok=True)
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    final = _free_name(os.path.join(dest_dir, f"{plan_id}-pre-delete-{stamp}.db"))
+    tmp = final + ".tmp"
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    try:
+        if os.environ.get("MK_ARCHIVE_FAIL") == "1":  # test seam: the backup fails before any rename
+            raise RuntimeError("injected archive backup failure")
+        con.execute("VACUUM INTO ?", (tmp,))
+        chk = sqlite3.connect(tmp)
+        try:
+            ok = chk.execute("SELECT 1 FROM plans WHERE id=?", (plan_id,)).fetchone()
+        finally:
+            chk.close()
+        if not ok:
+            raise RuntimeError(f"backup has no plan {plan_id}")
+        os.replace(tmp, final)
+    except Exception as e:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise Fail([f"pre-delete backup failed: {type(e).__name__}: {e}"])
+    return final
 
 
 def cmd_import(a):
@@ -1576,6 +1711,14 @@ def cmd_import(a):
 
 def cmd_delete(a):
     return delete_plan(a.plan, a.data, a.home)
+
+
+def cmd_archive(a):
+    return archive_plan(a.plan, a.data, a.home)
+
+
+def cmd_unarchive(a):
+    return unarchive_plan(a.plan, a.data, a.home)
 
 
 def build_parser():
@@ -1603,11 +1746,12 @@ def build_parser():
         if name == "import":
             c.add_argument("--dry-run", action="store_true")
         c.set_defaults(func=func)
-    d = sub.add_parser("delete")
-    d.add_argument("plan")
-    d.add_argument("--data", default=None)
-    d.add_argument("--home", default=None)
-    d.set_defaults(func=cmd_delete)
+    for name, func in (("delete", cmd_delete), ("archive", cmd_archive), ("unarchive", cmd_unarchive)):
+        d = sub.add_parser(name)
+        d.add_argument("plan")
+        d.add_argument("--data", default=None)
+        d.add_argument("--home", default=None)
+        d.set_defaults(func=func)
     return p
 
 
@@ -1946,7 +2090,7 @@ def f2_approve_self_test(tmp, mk, write, plan_text, phase, task, db, mkpaths):
 
 
 def self_test():
-    import shutil, subprocess
+    import shutil, sqlite3, subprocess
     tmp = tempfile.mkdtemp(prefix="mk-plan-test-")
     # every parse reads session.subagents, which resolves the data dir: pin it here so the run can
     # never read the main checkout's .matrixkoder/ (and fail if it would)
@@ -2722,56 +2866,128 @@ def self_test():
         out = mk("import", imp1, "--data", data, "--home", home)
         assert out["ok"] and out["moved"] == [] and os.path.isfile(imp1), out
 
-        # 6. delete moves the plan file into plans/archive and never unlinks it; a clash with an
-        # existing archive name gets a timestamp suffix
+        # 6. delete takes an ARCHIVED plan only; an unmigrated plan has no folder, so archive just
+        # flips the status. Backup first, then the rows go; an unarchived plan is refused.
         plans_dir = os.path.join(data, "plans")
-        arch_dir = os.path.join(plans_dir, "archive")
-        os.makedirs(arch_dir, exist_ok=True)
+        os.makedirs(plans_dir, exist_ok=True)
         live = os.path.join(plans_dir, "imp6.md")
         open(live, "w").write(plan_text(plan='plan = "imp6"', phases=phase("P1") + "\n"))
-        live_bytes = open(live, "rb").read()
-        clash = os.path.join(arch_dir, "imp6.md")
-        open(clash, "w").write("older archived copy\n")
-        clash_bytes = open(clash, "rb").read()
         assert mk("import", live, "--data", data, "--home", home)["ok"]
+        out = mk("delete", "imp6", "--data", data, "--home", home, code=2)
+        assert "archive it first" in " ".join(out["errors"]) and plans_rows("imp6")[0] == 1, out
+        out = mk("archive", "imp6", "--data", data, "--home", home)
+        assert out["ok"] and out["moved"] is None, out
         out = mk("delete", "imp6", "--data", data, "--home", home)
-        assert out["ok"] is True and out["plan"] == "imp6", out
-        moved = out["moved"]
-        assert moved and os.path.dirname(os.path.abspath(moved)) == os.path.abspath(arch_dir), moved
-        assert os.path.abspath(moved) != os.path.abspath(clash)
-        assert os.path.isfile(moved) and open(moved, "rb").read() == live_bytes
-        assert not os.path.exists(live)
-        assert open(clash, "rb").read() == clash_bytes
-        assert plans_rows("imp6")[0] == 0
+        assert out["ok"] and out["plan"] == "imp6" and out["purged"]["plans"] == 1, out
+        assert os.path.isfile(out["backup"]) and "imp6-pre-delete-" in out["backup"], out
+        assert os.path.isfile(live) and plans_rows("imp6")[0] == 0
 
-        # 7. a plan an active run still points at is refused: the row and the file both stay
-        live7 = os.path.join(plans_dir, "imp7.md")
-        open(live7, "w").write(plan_text(plan='plan = "imp7"', phases=phase("P1") + "\n"))
-        assert mk("import", live7, "--data", data, "--home", home)["ok"]
-        con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
-        con.execute("INSERT OR REPLACE INTO runs(id, plan, plan_version, branch, status, stage)"
-                    " VALUES ('imp7run','imp7',0,'br','active','build')")
+        # 7. live run refused (archive and delete); a held lane slot refuses delete; MK_ARCHIVE_FAIL
+        # leaves every row; a full purge leaves no row naming the plan and another plan's rows stay.
+        def project_con():
+            return db.open_project(home, data_dir=mkpaths.project_folder(data, home))
+
+        def named(con, plan_id, run_ids):
+            n = con.execute("SELECT COUNT(*) FROM plans WHERE id=?", (plan_id,)).fetchone()[0]
+            n += con.execute("SELECT COUNT(*) FROM runs WHERE plan=?", (plan_id,)).fetchone()[0]
+            for t in PURGE_BY_RUN:
+                n += con.execute(f"SELECT COUNT(*) FROM {t} WHERE run IN ({','.join('?' * len(run_ids))})",
+                                 run_ids).fetchone()[0]
+            return n
+
+        for pid in ("imp7", "imp8"):
+            f = os.path.join(plans_dir, pid + ".md")
+            open(f, "w").write(plan_text(plan=f'plan = "{pid}"', phases=phase("P1") + "\n"))
+            assert mk("import", f, "--data", data, "--home", home)["ok"]
+        con = project_con()
+        for pid, run in (("imp7", "imp7run"), ("imp8", "imp8run")):
+            con.execute("INSERT OR REPLACE INTO runs(id, plan, plan_version, branch, status, stage)"
+                        " VALUES (?,?,0,'br','active','build')", (run, pid))
         con.commit()
         con.close()
+        out = mk("archive", "imp7", "--data", data, "--home", home, code=2)
+        said = " ".join(out["errors"])
+        assert "imp7run" in said and "live run" in said and plans_rows("imp7")[0] == 1, out
+        con = project_con()
+        con.execute("UPDATE runs SET status='done'")
+        con.commit()
+        for run in ("imp7run", "imp8run"):
+            db.add_task(con, run, "P1", "phase", title="kept")
+        for pid, run in (("imp7", "imp7run"), ("imp8", "imp8run")):
+            con.execute("INSERT INTO events(run, task, t, chan, kind, text) VALUES (?,'P1','t','c','k','x')", (run,))
+            con.execute("INSERT INTO artifacts(run, task, kind, text) VALUES (?,'P1','k','x')", (run,))
+            con.execute("INSERT INTO acks(run, msg, lane) VALUES (?,'m','l')", (run,))
+            con.execute("INSERT INTO waits(run, question) VALUES (?,'q')", (run,))
+        con.execute("INSERT INTO lane_slots(slot, run, state) VALUES ('s1','imp7run','busy')")
+        con.commit()
+        con.close()
+        assert mk("archive", "imp7", "--data", data, "--home", home)["ok"]
+        assert mk("archive", "imp8", "--data", data, "--home", home)["ok"]
         out = mk("delete", "imp7", "--data", data, "--home", home, code=2)
-        assert out["ok"] is False, out
-        said = " ".join(out.get("errors") or [])
-        assert "imp7run" in said and "live run" in said, out
-        assert plans_rows("imp7")[0] == 1
-        assert os.path.isfile(live7)
-
-        # a finished run does not block delete, and its tasks stay
-        con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
-        con.execute("UPDATE runs SET status='done' WHERE id='imp7run'")
+        assert "lane slot" in " ".join(out["errors"]) and plans_rows("imp7")[0] == 1, out
+        con = project_con()
+        con.execute("DELETE FROM lane_slots")
         con.commit()
-        db.add_task(con, "imp7run", "P1", "phase", title="kept")
         con.close()
+        env_old = os.environ.get("MK_ARCHIVE_FAIL")
+        os.environ["MK_ARCHIVE_FAIL"] = "1"
+        try:
+            out = mk("delete", "imp7", "--data", data, "--home", home, code=2)
+        finally:
+            os.environ.pop("MK_ARCHIVE_FAIL", None)
+            if env_old is not None:
+                os.environ["MK_ARCHIVE_FAIL"] = env_old
+        assert "backup failed" in " ".join(out["errors"]), out
+        con = project_con()
+        assert named(con, "imp7", ["imp7run"]) == 7, named(con, "imp7", ["imp7run"])
+        con.close()
+        arch = mkpaths.archive_dir(data, None, home)
+        assert not [n for n in os.listdir(arch) if n.endswith(".tmp")], os.listdir(arch)
         out = mk("delete", "imp7", "--data", data, "--home", home)
-        assert out["ok"] is True and plans_rows("imp7")[0] == 0, out
-        con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
-        kept = con.execute("SELECT id FROM tasks WHERE run='imp7run'").fetchall()
+        assert out["ok"] and out["purged"]["tasks"] == 1 and out["purged"]["runs"] == 1, out
+        con = project_con()
+        assert named(con, "imp7", ["imp7run"]) == 0
+        assert named(con, "imp8", ["imp8run"]) == 7, "another plan's rows were touched"
         con.close()
-        assert [r["id"] for r in kept] == ["P1"]
+        chk = sqlite3.connect(out["backup"])
+        assert chk.execute("SELECT COUNT(*) FROM runs WHERE plan='imp7'").fetchone()[0] == 1
+        chk.close()
+
+        # 8. archive -> unarchive round trip on a plan with a folder (the data dir here is not
+        # migrated, so build the folder by hand): status, folder and archived_from come back.
+        f9 = os.path.join(plans_dir, "imp9.md")
+        open(f9, "w").write(plan_text(plan='plan = "imp9"', phases=phase("P1") + "\n"))
+        assert mk("import", f9, "--data", data, "--home", home)["ok"]
+        con = project_con()
+        con.execute("UPDATE plans SET status='parked' WHERE id='imp9'")
+        con.commit()
+        con.close()
+        pdir = mkpaths.plan_dir(data, "imp9")
+        os.makedirs(os.path.join(pdir, "assets"))
+        open(os.path.join(pdir, "plan.md"), "w").write("x\n")
+        out = mk("archive", "imp9", "--data", data, "--home", home)
+        dst = mkpaths.archive_dir(data, "imp9", home)
+        assert out["moved"] == dst and os.path.isfile(os.path.join(dst, "plan.md")), out
+        assert not os.path.exists(pdir)
+        con = project_con()
+        r9 = con.execute("SELECT status, header_json FROM plans WHERE id='imp9'").fetchone()
+        con.close()
+        assert r9["status"] == "archived" and json.loads(r9["header_json"])["archived_from"] == "parked"
+        out = mk("archive", "imp9", "--data", data, "--home", home, code=2)  # already archived
+        assert "already archived" in " ".join(out["errors"]), out
+        os.makedirs(pdir)
+        out = mk("unarchive", "imp9", "--data", data, "--home", home, code=2)  # original exists
+        assert "already exists" in " ".join(out["errors"]), out
+        os.rmdir(pdir)
+        out = mk("unarchive", "imp9", "--data", data, "--home", home)
+        assert out["moved"] == pdir and os.path.isdir(os.path.join(pdir, "assets")), out
+        assert not os.path.exists(dst)
+        con = project_con()
+        r9 = con.execute("SELECT status, header_json FROM plans WHERE id='imp9'").fetchone()
+        con.close()
+        assert r9["status"] == "parked" and "archived_from" not in json.loads(r9["header_json"])
+        out = mk("unarchive", "imp9", "--data", data, "--home", home, code=2)  # not archived now
+        assert "not archived" in " ".join(out["errors"]), out
 
         # D1.1 columns: filled when present, harmless when absent
         cols_data = os.path.join(tmp, "store-cols")
@@ -2907,8 +3123,13 @@ def self_test():
         assert out["ok"] and out.get("noop") is True, out
         assert os.path.isdir(os.path.join(proj, "plans", "migplan", "assets")), \
             "the no-op approve dropped the plan folder's assets/"
+        out = mk("archive", "migplan", "--data", mig_data, "--home", home)
+        assert out["ok"] and out["moved"] == os.path.join(proj, "archive", "plans", "migplan"), out
+        assert os.path.isfile(os.path.join(out["moved"], "plan.md")) and os.path.isdir(os.path.join(out["moved"], "assets"))
+        assert not os.path.exists(os.path.join(proj, "plans", "migplan"))
         out = mk("delete", "migplan", "--data", mig_data, "--home", home)
-        assert out["ok"] and out["moved"] == os.path.join(proj, "plans", "migplan", "archive", "plan.md"), out
+        assert out["ok"] and os.path.dirname(out["backup"]) == os.path.join(proj, "archive"), out
+        assert os.path.isfile(os.path.join(proj, "archive", "plans", "migplan", "plan.md")), "delete unlinked the archived folder"
         # nothing was written under the repo's .matrixkoder
         assert tree_hash(mig_data) == before, "a migrated mk-plan wrote under the repo .matrixkoder"
 
