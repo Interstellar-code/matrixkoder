@@ -23,17 +23,17 @@ export const OVERVIEW_FIXTURE: Omit<OverviewView, 'mock'> = {
   // the Overview's short task list: `note` is the wide right column, `short`
   // the compact word (the board's narrow artboard)
   tasks: [
-    { id: 'P4', title: 'Payment provider adapter', status: 'building', note: 'building 14m', short: 'build 14m' },
+    { id: 'P4', title: 'Payment provider adapter', status: 'building', note: 'build 14m', short: 'build 14m' },
     { id: 'P5', title: 'Checkout UI', status: 'review', note: 'review r2', short: 'review' },
-    { id: 'P6', title: 'Tax rules', status: 'blocked', note: 'blocked · needs P4', short: 'blocked' },
-    { id: 'P7', title: 'Confirmation emails', status: 'quota', note: 'quota · agy reset 19:05', short: 'quota' },
-    { id: 'P8', title: 'E2E checkout QA', status: 'planned', note: 'planned W3', short: 'plan' },
+    { id: 'P6', title: 'Tax rules', status: 'blocked', note: 'blocked P4', short: 'blocked' },
+    { id: 'P7', title: 'Confirmation emails', status: 'quota', note: 'quota 19:05', short: 'quota' },
+    { id: 'P8', title: 'E2E checkout QA', status: 'planned', note: 'W3', short: 'plan' },
   ],
   lanes: [
-    { slot: 'p4', agent: 'codex', model: 'gpt-6.1-sol', modelShort: 'sol', effort: 'high', status: 'building', note: 'building', short: 'build' },
-    { slot: 'p5', agent: 'claude', model: 'sonnet', modelShort: 'sonnet', effort: 'medium', status: 'review', note: 'review r2', short: 'review' },
-    { slot: 'p6', agent: 'opencode', model: 'glm-5', modelShort: 'glm-5', effort: 'high', status: 'blocked', note: 'blocked', short: 'blocked' },
-    { slot: 'p7', agent: 'agy', model: 'gemini-3.8-flash', modelShort: 'flash', effort: 'medium', status: 'quota', note: 'quota', short: 'quota' },
+    { slot: 'p4', agent: 'codex', modelShort: 'sol', effort: 'high', status: 'building', short: 'build' },
+    { slot: 'p5', agent: 'claude', modelShort: 'sonnet', effort: 'medium', status: 'review', short: 'review' },
+    { slot: 'p6', agent: 'opencode', modelShort: 'glm-5', effort: 'high', status: 'blocked', short: 'blocked' },
+    { slot: 'p7', agent: 'agy', modelShort: 'flash', effort: 'medium', status: 'quota', short: 'quota' },
   ],
   usage: [
     { label: 'claude (all)', short: 'claude', pct: 38, weekPct: 61, reset: '2h10m', exhausted: false, until: null },
@@ -43,16 +43,16 @@ export const OVERVIEW_FIXTURE: Omit<OverviewView, 'mock'> = {
   ],
   waiting: {
     since: '17:41',
-    question: "P6 Tax rules depends on P4's schema change, not yet merged. Hold P6 until P4 merges?",
-    options: ['Hold P6 (recommended)', 'Start on main, rebase later', 'Fold into P4 lane'],
+    question: "P6 needs P4's schema change, not merged. Hold P6 until P4 merges?",
+    options: ['Hold P6', 'Rebase later', 'Fold'],
     rec: 0,
     // the Narrow board's waiting card: the short question and its three buttons
     shortQuestion: 'Hold P6 until P4 merges?',
     shortOptions: ['Hold', 'Start now', 'Fold in P4'],
   },
   recent: [
-    { t: '17:44', text: 'P5 review r2 sent to opencode glm-5 (3 findings r1)' },
-    { t: '17:41', text: 'P6 blocked: depends on P4 · waiting on you' },
-    { t: '17:38', text: 'dispatched P4 R1, pane wQ:p4 · commit 2b8e41d' },
+    { t: '17:44', text: 'P5 review r2 → glm-5' },
+    { t: '17:41', text: 'P6 blocked · waiting on you' },
+    { t: '17:38', text: 'P4 R1 dispatched · wQ:p4' },
   ],
 }

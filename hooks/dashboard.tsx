@@ -334,6 +334,8 @@ export function registerDashboard(on: On, options: PluginOptions): void {
                         : pane.src === 'live'
                           ? waitingAsks(tabEls, pane.asks, cols, new Date().toISOString(), ui)
                           : withViewState(WaitingTab, tabEls, waitingPaneView(pane, snap.run?.waiting ?? null), cols, ui)}
+        {dashTab !== 'settings' && !needsSetup && snap.run != null && <Box flexGrow={1} />}
+        {dashTab !== 'settings' && !needsSetup && snap.run != null && PaneFooter(els, snap, openWaiting(pane.asks, snap.run), cols)}
       </Box>
       )
     })
@@ -2104,8 +2106,73 @@ function laneGroups(run: MkRun): { slot: string; ids: string; status: string; re
   return out
 }
 
-/** The Overview's live view. No source for: the model's short name (= the model), lane
- *  slot of an un-laned run ('·'). Waiting/usage/recent are empty when the snapshot has none. */
+/** The usage rows' short names: a pool row `agy:gemini` drops its `agy:` prefix when the
+ *  suffix is unique among the rows, else keeps the whole name (so two pools never clip alike). */
+export function usageShorts<T extends { name: string }>(rows: readonly T[]): [T, string][] {
+  const tail = (n: string): string => n.split(':').pop() ?? n
+  return rows.map(r => [r, rows.filter(x => tail(x.name) === tail(r.name)).length === 1 ? tail(r.name) : r.name])
+}
+
+/** The Plan row's wide chip text (the glyph is the chip's): `build 14m`, `review r2`,
+ *  `blocked P4` (the first dep not done), `quota 19:05` (the agent's reset), `W3` for a planned row. */
+export function taskNote(t: MkTask, all: readonly MkTask[], snap: MkSnapshot, suffix: string): string {
+  if (t.status === 'planned') return t.wave == null ? 'planned' : `W${t.wave}`
+  if (t.status === 'blocked') {
+    const dep = (t.deps ?? []).find(d => !DONE.has(all.find(x => x.id === d)?.status ?? '')) ?? (t.deps ?? [])[0]
+    return dep == null ? 'blocked' : `blocked ${dep}`
+  }
+  if (t.status === 'quota') {
+    const a = t.agent == null ? undefined : snap.usage?.agents?.[t.agent]
+    const until = a?.exhausted_until ?? Object.values(a?.pools ?? {}).map(p => p.exhausted_until).find(u => u != null)
+    return until == null ? 'quota' : `quota ${clockOf(until)}`
+  }
+  return `${t.status === 'building' ? 'build' : t.status}${suffix}`
+}
+
+/** The pane's last row on every tab but Settings: `2 live · 2 held · 1 waiting` left (waiting
+ *  omitted at 0), the refresh interval right. Under a tight `w` the right drops `tick`, then
+ *  goes, then the left shortens to `2l 2h 1w`, so the row never passes `w` cells. */
+export function footerParts(live: number, held: number, waiting: number, w: number): { left: string; right: string } {
+  const left = [`${live} live`, `${held} held`, ...(waiting > 0 ? [`${waiting} waiting`] : [])].join(' · ')
+  const tick = REFRESH_MS / 1000
+  for (const right of [`tick ${tick}s`, `${tick}s`, '']) {
+    if (left.length + right.length + (right === '' ? 0 : 1) <= w) return { left, right }
+  }
+  return { left: [`${live}l`, `${held}h`, ...(waiting > 0 ? [`${waiting}w`] : [])].join(' ').slice(0, Math.max(1, w)), right: '' }
+}
+
+/** how many asks the pane owes an answer: the bus's pending asks, else the run's own waiting
+ *  entry — what the Overview Waiting card draws */
+export function openWaiting(asks: readonly unknown[], run: MkRun | null): number {
+  return asks.length > 0 ? asks.length : run?.waiting ? 1 : 0
+}
+
+/** a dashed rule (not the tab bar's solid one), then the counts row; the pane's flexGrow spacer above it pins both to the bottom. */
+function PaneFooter(els: Els, snap: MkSnapshot, waiting: number, cols: number) {
+  const { Box, Text } = els
+  const groups = snap.run ? laneGroups(snap.run) : []
+  const held = groups.filter(g => SIDE_STATE.has(g.status)).length
+  const { left, right } = footerParts(groups.length - held, held, waiting, cols - 2) // paddingX 1 each side
+  return (
+    <Box flexDirection="column">
+      <Text color={PALETTE.line}>{'╌'.repeat(Math.max(0, cols))}</Text>
+      <Box flexDirection="row" justifyContent="space-between" gap={1} paddingX={1}>
+        <Text dimColor={true}>{left}</Text>
+        <Text dimColor={true}>{right}</Text>
+      </Box>
+    </Box>
+  )
+}
+
+/** A model id in the Overview's lane rows: the family word, `-lite` kept (`gpt-6.1-sol` → `sol`,
+ *  `gemini-3.8-flash-lite` → `flash-lite`, `claude-sonnet-4-5` → `sonnet`); unknown ids pass through. */
+export function modelShort(model: string): string {
+  const id = model.split('/').filter(Boolean).pop() ?? model
+  return /(?:^|-)(sol|flash(?:-lite)?|sonnet|opus|haiku)(?:-|$)/i.exec(id)?.[1]?.toLowerCase() ?? id
+}
+
+/** The Overview's live view. No source for the lane slot of an un-laned run ('·').
+ *  Waiting/usage/recent are empty when the snapshot has none. */
 export function liveOverviewView(snap: MkSnapshot): OverviewView {
   const run = snap.run
   const tasks = run?.tasks ?? []
@@ -2136,25 +2203,22 @@ export function liveOverviewView(snap: MkSnapshot): OverviewView {
     waves,
     tasks: tasks.filter(t => !DONE.has(t.status)).map(t => {
       const suffix = taskSuffix(t, snap.now)
-      return { id: t.id, title: t.title, status: t.status, note: `${t.status}${suffix}`, short: `${statusWord(t.status, true)}${suffix}` }
+      return { id: t.id, title: t.title, status: t.status, note: taskNote(t, tasks, snap, suffix), short: `${statusWord(t.status, true)}${suffix}` }
     }),
     lanes: (run ? laneGroups(run) : []).map(g => ({
       slot: g.slot,
       agent: g.rep.agent ?? 'agent',
-      model: g.rep.model ?? '',
-      modelShort: g.rep.model ?? '',
+      modelShort: modelShort(g.rep.model ?? ''),
       effort: g.rep.effort ?? '',
       status: g.status,
-      note: g.status,
       short: statusWord(g.status, true),
     })),
-    usage: usageRows(snap, false)
-      .filter(r => r.hint == null && !r.header && (r.pct != null || r.exhausted))
-      .map(r => ({
+    usage: usageShorts(usageRows(snap, false).filter(r => r.hint == null && !r.header && (r.pct != null || r.exhausted)))
+      .map(([r, short]) => ({
         label: r.label.trim(),
-        short: r.name,
+        short,
         pct: Math.round(r.pct ?? 0),
-        weekPct: Math.round(r.weekPct ?? 0),
+        weekPct: r.weekPct == null ? null : Math.round(r.weekPct),
         reset: r.reset == null || r.exhausted ? null : resetStr(r.reset, snap.now, false),
         exhausted: r.exhausted,
         until: r.exhausted ? clockOf(r.exhaustedUntil) : null,

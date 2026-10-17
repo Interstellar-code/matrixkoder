@@ -94,11 +94,12 @@ export function gradientBar(pct: number, cols: number, stops: readonly string[],
 
 /** Evenly pick `count` of `colors` (both ends kept) when the width cannot hold
  *  every segment: the strip keeps its shape, not its exact item count. */
-function sample(colors: readonly string[], count: number): string[] {
+export function sample<T>(colors: readonly T[], count: number): T[] {
   if (colors.length <= count || count <= 1) return colors.slice(0, Math.max(1, count))
-  const out: string[] = []
+  const out: T[] = []
   for (let k = 0; k < count; k++) {
-    out.push(colors[Math.round((k * (colors.length - 1)) / (count - 1))] ?? PALETTE.track)
+    const v = colors[Math.round((k * (colors.length - 1)) / (count - 1))]
+    if (v !== undefined) out.push(v)
   }
   return out
 }

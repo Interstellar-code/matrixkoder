@@ -6,7 +6,8 @@ import type { On, ConfigRow } from 'claude-code'
 import { snapshotCount, DATA_DIR, NOW, PROJECT_DIR, RUN_PATH, RUNS_INDEX, USAGE_PATH, agentOf, agentsOf, mockFs, mockWorld, paneProps, sessionStart, sessionStartIn, setRun, setUsage, tasksOf, worldFiles, worldFixtures } from './testkit'
 import type { Files, MockWorld } from './testkit'
 import { parseYamlAgents } from './data'
-import { planActionPatch, runPlanAction, waitingPane, waitingPaneView } from './dashboard'
+import { footerParts, liveOverviewView, modelShort, openWaiting, planActionPatch, runPlanAction, taskNote, usageShorts, waitingPane, waitingPaneView } from './dashboard'
+import type { MkSnapshot } from '../types'
 import { mockTabCounts, waitingCount } from './tabs/header'
 import { RUN_SNAPSHOT } from './fixtures/run-snapshot'
 
@@ -999,12 +1000,12 @@ test('D1.2: a 120-char title at 100 cols truncates with … and keeps the status
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(100) })
   expect(await ui.find({ text: /…/ }), 'the truncated title marks the cut').toBeTruthy()
-  expect(await ui.find({ text: /building 12m/ }), 'status word and age still found').toBeTruthy()
+  expect(await ui.find({ text: /build 12m/ }), 'status word and age still found').toBeTruthy()
   const row = await ui.find({ key: 'F6' })
   expect(row, 'the plan row').toBeDefined()
   const flat = rowTexts(row).join('')
   expect(flat).toContain('…')
-  expect(flat).toContain('building 12m') // same row as the (truncated) title
+  expect(flat).toContain('build 12m') // same row as the (truncated) title
   expect(flat).toContain(longTitle.slice(0, 40)) // the title's head is still drawn
   expect(flat).not.toContain(longTitle.slice(-20)) // and its tail yielded to the status column
 })
@@ -2174,6 +2175,86 @@ test('L7.2: the top-level k reads open tasks of every linked project — migrate
   })
   expect(dirs, 'the migrated row read the C2 project folder').toContain(MIGRATED_DIR)
   expect(dirs, 'the db_path-NULL row fell back to its legacy data_dir').toContain(LEGACY_DIR)
+})
+
+// a real-shaped snapshot for the Overview's pure functions (types cast: only the read fields are set)
+const NOW_MS = Date.parse('2026-10-07T18:00:00Z')
+const ago = (ms: number): string => new Date(NOW_MS - ms).toISOString()
+const task = (o: Record<string, unknown>) => ({ title: 't', deps: [], wave: 1, agent: 'codex', model: 'gpt-6.1-sol', effort: 'high', lane: null, round: 0, ...o })
+const OVERVIEW_SNAP = {
+  now: NOW_MS,
+  dataDir: '/d',
+  runs: [],
+  projectAgents: ['agy', 'codex'],
+  usage: {
+    agents: {
+      agy: {
+        exhausted_until: ago(-3600_000),
+        pools: {
+          gemini: { five_hour: { used_pct: 54, resets_at: ago(-3600_000) }, weekly: null, exhausted_until: null },
+          'claude-gpt': { five_hour: { used_pct: 100, resets_at: ago(-3600_000) }, weekly: { used_pct: 80, resets_at: ago(-3600_000) }, exhausted_until: ago(-3600_000) },
+        },
+      },
+      codex: { five_hour: { used_pct: 10, resets_at: ago(-3600_000) }, weekly: null, exhausted_until: null, pools: { default: { five_hour: { used_pct: 10, resets_at: ago(-3600_000) }, weekly: null, exhausted_until: null } } },
+    },
+  },
+  run: {
+    id: 'r1', feature: 'f', branch: 'b', stage: 6, next: '', head_sha: 'abc1234', recent: [],
+    waiting: { question: 'Hold P6?', options: ['Hold', 'Fold'], rec: 'Hold', since: ago(0) },
+    tasks: [
+      task({ id: 'P3', status: 'merged', updated: ago(0) }),
+      task({ id: 'P4', status: 'building', updated: ago(14 * 60_000), lane: '../wt-p4' }),
+      task({ id: 'P5', status: 'review', round: 2, updated: ago(0), lane: '../wt-p5' }),
+      task({ id: 'P6', status: 'blocked', deps: ['P3', 'P4'], updated: ago(0), lane: '../wt-p6' }),
+      task({ id: 'P7', status: 'quota', agent: 'agy', model: 'gemini-3.8-flash-lite', updated: ago(0) }),
+      task({ id: 'P8', status: 'planned', wave: 3, updated: ago(0) }),
+    ],
+  },
+} as unknown as MkSnapshot
+
+test('the live Overview task chips carry the board copy: build 14m, review r2, blocked P4, quota HH:MM, W3', () => {
+  const v = liveOverviewView(OVERVIEW_SNAP)
+  const notes = Object.fromEntries(v.tasks.map(t => [t.id, t.note]))
+  const hhmm = new Date(NOW_MS + 3600_000)
+  expect(notes.P4).toBe('build 14m')
+  expect(notes.P5).toBe('review r2')
+  expect(notes.P6, 'the first dep that is not done').toBe('blocked P4')
+  expect(notes.P7).toBe(`quota ${String(hhmm.getHours()).padStart(2, '0')}:${String(hhmm.getMinutes()).padStart(2, '0')}`)
+  expect(notes.P8).toBe('W3')
+  expect(v.plan, 'done tasks count in the plan, not in the rows').toEqual({ done: 1, total: 6 })
+  expect(taskNote(task({ id: 'Q', status: 'blocked' }) as never, [], OVERVIEW_SNAP, ''), 'no dep, no id').toBe('blocked')
+  expect(v.lanes.map(l => l.modelShort)).toEqual(['sol', 'sol', 'sol'])
+})
+
+test('the live usage rows: pool names stay unique, an unknown week is null, not 0', () => {
+  const v = liveOverviewView(OVERVIEW_SNAP)
+  const gem = v.usage.find(u => u.label.includes('gemini'))
+  const gpt = v.usage.find(u => u.label.includes('claude-gpt'))
+  expect([gem?.short, gpt?.short]).toEqual(['gemini', 'claude-gpt'])
+  expect(gem?.weekPct, 'no weekly data').toBeNull()
+  expect(gpt?.weekPct).toBe(80)
+  // two pools sharing a suffix keep the agent prefix so they never clip alike
+  const rows = [{ name: 'agy:default' }, { name: 'codex:default' }, { name: 'agy:gemini' }]
+  expect(usageShorts(rows).map(([, short]) => short)).toEqual(['agy:default', 'codex:default', 'gemini'])
+})
+
+test('modelShort: family word, case-insensitive, -lite kept, provider prefix dropped', () => {
+  expect(['gpt-6.1-sol', 'gemini-3.8-flash', 'Gemini-3.8-FLASH-Lite', 'claude-sonnet-4-5', 'sonnet', 'openai/gpt-6.1-sol', 'openai/', 'glm-5'].map(modelShort))
+    .toEqual(['sol', 'flash', 'flash-lite', 'sonnet', 'sonnet', 'sol', 'openai', 'glm-5'])
+})
+
+test('the pane footer: counts, waiting omitted at 0, never wider than the row; waiting agrees with the card', () => {
+  expect(footerParts(2, 2, 1, 44)).toEqual({ left: '2 live · 2 held · 1 waiting', right: 'tick 5s' })
+  expect(footerParts(2, 2, 0, 44).left).toBe('2 live · 2 held')
+  for (const w of [10, 20, 30, 34, 44]) {
+    const p = footerParts(2, 2, 1, w)
+    expect(p.left.length + p.right.length + (p.right === '' ? 0 : 1), `fits ${w}`).toBeLessThanOrEqual(w)
+  }
+  expect(footerParts(2, 2, 1, 34).right, 'tight: the word tick goes first').toBe('5s')
+  const run = OVERVIEW_SNAP.run
+  expect(openWaiting([], run), 'no bus asks: the run waiting entry').toBe(1)
+  expect(openWaiting([{}, {}], run)).toBe(2)
+  expect(openWaiting([], null)).toBe(0)
 })
 
 test('runPlanAction runs mk-plan.py <kind> <id> --data and reports ok as null', async () => {

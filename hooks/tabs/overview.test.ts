@@ -1,13 +1,14 @@
 // Overview tab tests (plan dashboard-v2-p0b, V1.1): the REAL pane mounted the
-// way dashboard.test.ts mounts it — the tab must render the Checkout v2
-// fixture (a stub fails every assertion below), hide the Old pane, sit every
+// way dashboard.test.ts mounts it — the tab must render the testkit's live run
+// (workflows-v2, the world the pane really reads; the Checkout v2 fixture is
+// only driven through OverviewTab directly), hide the Old pane, sit every
 // section in its own kit Card, and keep every drawn row within the pane's
 // width at 36 cols.
 import { test, expect } from 'claude-code/testing'
 import type { BoxProps, ElementChildren, Elements, RenderChildren, RenderElement, RenderNode, TextProps } from 'claude-code'
 import { mockFs, mockWorld, paneProps, sessionStart, worldFiles, worldFixtures } from './../testkit'
 import { DONE_STATUSES_FOR_TEST, OverviewTab, overviewView } from './overview'
-import { PALETTE, ROLE } from './palette'
+import { PALETTE, ROLE, withTheme } from './palette'
 
 // ---------- row widths (review r1 HIGH): a row is a horizontal Box (or a
 // Text); its width is the text of every Text descendant — nested Texts
@@ -55,18 +56,23 @@ function rowWidths(root: unknown): { width: number; inCard: boolean }[] {
   return out
 }
 
-test('the Overview tab renders the Checkout v2 fixture and hides the Old pane', { plugins: [worldFixtures] }, async ($, on) => {
+test('the Overview tab renders the live run (live copy, no MOCK line) and hides the Old pane', { plugins: [worldFixtures] }, async ($, on) => {
   mockFs(on, worldFiles())
   mockWorld(on)
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   await ui.press({ key: 'dash-tab-overview' })
-  expect(await ui.find({ text: /MOCK · fixture data · not this run/ }), 'the MOCK row stays (C3)').toBeTruthy()
-  expect(await ui.find({ text: 'Checkout v2' }), 'run header').toBeTruthy()
-  expect(await ui.find({ text: /Payment provider adapter/ }), 'live task row').toBeTruthy()
-  expect(await ui.find({ text: /watching P4 R1/ }), 'next line').toBeTruthy()
-  expect(await ui.find({ text: /Hold P6 \(recommended\)/ }), 'waiting options').toBeTruthy()
-  expect(await ui.find({ text: /workflows-v2/ }), 'the Old pane is gone').toBeUndefined()
+  expect(await ui.find({ text: /MOCK · fixture data/ }), 'the extra MOCK line is gone (the header chip says it)').toBeUndefined()
+  expect(await ui.find({ text: /workflows-v2/ }), 'run header').toBeTruthy()
+  expect(await ui.find({ text: /PLAN 1\/5/ }), 'plan header: the merged W0 counts, no DONE').toBeTruthy()
+  expect(await ui.find({ text: /design\+configure/ }), 'live task row').toBeTruthy()
+  expect(await ui.find({ text: /review r2/ }), 'live chip copy').toBeTruthy()
+  expect(await ui.find({ text: /build 2m/ }), 'live chip copy: build + age').toBeTruthy()
+  expect(await ui.find({ text: /W2/ }), 'the planned row names its wave').toBeTruthy()
+  expect(await ui.find({ text: /verify F6 gates/ }), 'next line').toBeTruthy()
+  expect(await ui.find({ text: /F8 deletes rows/ }), 'waiting question').toBeTruthy()
+  expect(await ui.find({ text: /approve ★/ }), 'the recommended option carries the star').toBeTruthy()
+  expect(await ui.find({ text: /Hold P6/ }), 'no fixture copy in the live pane').toBeUndefined()
 })
 
 test('the Overview keeps every drawn ROW within the pane width at 36, 39, 40 and 46 cols', { plugins: [worldFixtures] }, async ($, on) => {
@@ -77,10 +83,9 @@ test('the Overview keeps every drawn ROW within the pane width at 36, 39, 40 and
   await ui.press({ key: 'dash-tab-overview' })
   for (const cols of [36, 39, 40, 46] as const) {
     await ui.redraw(paneProps(cols))
-    expect(await ui.find({ text: /MOCK · fixture data · not this run/ }), `the MOCK row at ${cols}`).toBeTruthy()
-    expect(await ui.find({ text: /watching P4 R1/ }), `the fixture renders at ${cols}`).toBeTruthy()
+    expect(await ui.find({ text: /design/ }), `the live run renders at ${cols}`).toBeTruthy()
     // a row inside a Card is budgeted for the Card's content (cols - 4: the
-    // border and one padding cell per side); the MOCK row and the header rows
+    // border and one padding cell per side); the header rows
     // outside any Card still owe only the pane's own width
     const rows = rowWidths(await ui.drawn())
     const wide = rows.filter(r => (r.inCard ? r.width > cols - 4 : r.width > cols))
@@ -89,18 +94,18 @@ test('the Overview keeps every drawn ROW within the pane width at 36, 39, 40 and
 })
 
 test('the clipped Plan and Lanes rows fill the Card content width exactly', () => {
-  // the agy lane's model clips at both widths; the Plan row gets a long title
-  // so it clips at both too
+  // a lane with a long model clips at both widths; the Plan row gets a long
+  // title so it clips at both too
   const view: ReturnType<typeof overviewView> = {
     ...overviewView(),
-    tasks: [{ id: 'P4', title: 'Payment provider adapter for the whole checkout flow', status: 'building', note: 'building 14m', short: 'build 14m' }],
+    tasks: [{ id: 'P4', title: 'Payment provider adapter for the whole checkout flow', status: 'building', note: 'build 14m', short: 'build 14m' }],
+    lanes: [{ slot: 'p7', agent: 'agy', modelShort: 'gemini-3.8-flash-preview-long-name', effort: 'medium', status: 'quota', short: 'quota' }],
   }
   for (const cols of [36, 46] as const) {
     const tree = OverviewTab(stubEls(true), view, cols)
     const rows = new Map(nodesOf(tree, 'Box').map(b => [String(b.props.key), b]))
     const planRow = rows.get('P4')
-    // the sonnet lane's model clips at 36 (compact words), the agy lane's at 46
-    const laneRow = rows.get(cols < 40 ? 'p5' : 'p7')
+    const laneRow = rows.get('p7')
     expect(planRow, `the P4 row at ${cols}`).toBeDefined()
     expect(laneRow, `the clipping lane row at ${cols}`).toBeDefined()
     // the row lands on the Card's content width, never one cell into the padding
@@ -120,8 +125,8 @@ test('the Overview usage rows draw real bars and the exhausted marker', { plugin
   await ui.press({ key: 'dash-tab-overview' })
   // the terminal table has a Raster: the 5h bars are Raster cells, not text
   expect(await ui.findAll({ type: 'Raster' }), 'Raster bars').not.toHaveLength(0)
-  expect(await ui.find({ text: /38%/ }), 'the 5h percentage').toBeTruthy()
-  expect(await ui.find({ text: /exhausted · 19:05/ }), 'the ⊘ exhausted row').toBeTruthy()
+  expect(await ui.find({ text: /54%/ }), 'the 5h percentage').toBeTruthy()
+  expect(await ui.find({ text: /⊘/ }), 'the ⊘ exhausted row').toBeTruthy()
 })
 
 test('every Overview section sits in its own kit Card at 36 and 46 cols', { plugins: [worldFixtures] }, async ($, on) => {
@@ -132,20 +137,23 @@ test('every Overview section sits in its own kit Card at 36 and 46 cols', { plug
   await ui.press({ key: 'dash-tab-overview' })
   for (const cols of [36, 46] as const) {
     await ui.redraw(paneProps(cols))
-    expect(await ui.find({ text: /MOCK · fixture data · not this run/ }), `the MOCK row at ${cols}`).toBeTruthy()
     // the inline hint is the only other bordered Box and this pane is docked:
-    // exactly the five section Cards
+    // exactly the four section Cards (Recent is drawn without one, as on the board)
     const cards = cardsOf(await ui.drawn())
-    expect(cards, `five Cards at ${cols}`).toHaveLength(5)
-    for (const card of cards) {
-      expect(card.props.backgroundColor, `card fill at ${cols}`).toBe(PALETTE.panel)
-      expect([PALETTE.line, ROLE.warn.fg], `card border at ${cols}`).toContain(card.props.borderColor)
-    }
-    // the Waiting Card is the warn one: solid chip header + the a/b/c options
+    expect(cards, `four Cards at ${cols}`).toHaveLength(4)
+    // the pane paints under the Matrix theme, so the Card colours are the themed ones
+    withTheme('matrix', () => {
+      for (const card of cards) {
+        expect(card.props.backgroundColor, `card fill at ${cols}`).toBe(PALETTE.panel)
+        expect([PALETTE.line, ROLE.warn.fg], `card border at ${cols}`).toContain(card.props.borderColor)
+      }
+    })
+    // the Waiting Card is the warn one: solid chip header + the a/b options
     expect(await ui.find({ text: /WAITING/ }), `the waiting header at ${cols}`).toBeTruthy()
-    expect(await ui.find({ text: /Hold P6/ }), `the recommended option at ${cols}`).toBeTruthy()
+    expect(await ui.find({ text: /approve/ }), `the recommended option at ${cols}`).toBeTruthy()
   }
-  const warnCards = cardsOf(await ui.drawn()).filter(c => c.props.borderColor === ROLE.warn.fg)
+  const warnFg = withTheme('matrix', () => ROLE.warn.fg)
+  const warnCards = cardsOf(await ui.drawn()).filter(c => c.props.borderColor === warnFg)
   expect(warnCards, 'the Waiting Card carries the warn border').toHaveLength(1)
 })
 
@@ -247,7 +255,7 @@ test('the Waiting options are a/b/c Buttons; the pick and the ⋯ reveal are vie
   const wide = OverviewTab(stubEls(true), overviewView(), 46, map)
   const buttons = nodesOf(wide, 'Button')
   // at 46 the row folds: the primary stays, the rest collapse into ⋯ More
-  expect(buttons.map(b => String(b.props.label)), 'the folded row').toEqual(['a Hold P6 (recommended)', '⋯ More'])
+  expect(buttons.map(b => String(b.props.label)), 'the folded row').toEqual(['a Hold P6 ★', '⋯ More'])
   expect(buttons[0]?.props.hotkey, 'the primary hotkey').toBe('a')
   expect(buttons[1]?.props.plain, 'the fold button is plain').toBe(true)
 
@@ -265,8 +273,8 @@ test('the Waiting options are a/b/c Buttons; the pick and the ⋯ reveal are vie
   expect(map.get('overview:waiting:more'), 'the reveal lands in view state').toBe('1')
   expect(map.get('waiting:more'), 'still not the Waiting tab key').toBeUndefined()
   const revealed = allText(OverviewTab(stubEls(true), overviewView(), 46, map))
-  expect(revealed.includes('b Start on main, rebase later'), 'the folded option is revealed').toBe(true)
-  expect(revealed.includes('c Fold into P4 lane'), 'the other folded option is revealed').toBe(true)
+  expect(revealed.includes('b Rebase later'), 'the folded option is revealed').toBe(true)
+  expect(revealed.includes('c Fold'), 'the other folded option is revealed').toBe(true)
 
   // the Overview shows the pick: that option's button takes the primary variant
   const afterPick = buttonsOf(OverviewTab(stubEls(true), overviewView(), 46, map)).find(b => String(b.props.key) === 'waiting-opt-a')
@@ -284,4 +292,24 @@ test('F.8: rework is not a DONE status — the DONE set keeps done and merged on
   expect(DONE_STATUSES_FOR_TEST.has('rework'), 'rework is back on the board, not counted done').toBe(false)
   expect(DONE_STATUSES_FOR_TEST.has('done')).toBe(true)
   expect(DONE_STATUSES_FOR_TEST.has('merged')).toBe(true)
+})
+
+test('the Usage bar reaches 14 cells at the 46-col pane; an unknown week reads —; an all-done plan says so', () => {
+  const view = overviewView()
+  const bars = nodesOf(OverviewTab(stubEls(true), view, 46), 'Raster').filter(r => String(r.props.key).startsWith('overview-usage-'))
+  expect(bars.map(b => b.props.columns), 'every bar 14 wide at 46 cols').toEqual([14, 14, 14, 14])
+  const noWeek = { ...view, usage: view.usage.map(u => ({ ...u, weekPct: null })) }
+  const text = allText(OverviewTab(stubEls(true), noWeek, 46))
+  expect(text.includes('61%'), 'the old week % is gone').toBe(false)
+  expect(text.includes('—'), 'the unknown week prints a dash').toBe(true)
+  const allDone = allText(OverviewTab(stubEls(true), { ...view, plan: { done: 3, total: 3 }, tasks: [] }, 46))
+  expect(allDone.includes('all done') && !allDone.includes('no tasks yet')).toBe(true)
+})
+
+test('a revealed fold row keeps the star of the recommended option', () => {
+  const map = new Map<string, string>([['overview:waiting:more', '1']])
+  const view = { ...overviewView(), waiting: { ...overviewView().waiting, rec: 1 } }
+  const text = allText(OverviewTab(stubEls(true), view, 46, map))
+  expect(text.includes('b Rebase later ★'), 'the starred option on its fold row').toBe(true)
+  expect(text.includes('c Fold ★')).toBe(false)
 })
