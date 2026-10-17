@@ -1697,8 +1697,10 @@ def unarchive_plan(plan_id, data, home):
         pairs = [tuple(p) for p in header.get("archived_files") or []]
         if not pairs:
             src = header.get("archived_to") or mkpaths.archive_dir(data, plan_id, home)
-            if os.path.isdir(src) or header.get("archived_to") or mkpaths.migrated_slug(data=data, root=home):
-                pairs = [(mkpaths.plan_dir(data, plan_id), src)]
+            here = os.path.isdir(mkpaths.plan_dir(data, plan_id)) or mkpaths.plan_legacy_files(data, plan_id, runs)
+            if os.path.isdir(src) or (not here and (header.get("archived_to")
+                                                    or mkpaths.migrated_slug(data=data, root=home))):
+                pairs = [(mkpaths.plan_dir(data, plan_id), src)]  # else: archive died before the move
         todo, bad = [], []
         for orig, arch in pairs:
             if os.path.exists(arch):
@@ -1750,10 +1752,18 @@ def _delete_checks(con, plan_id, verb="delete"):
     return [r["id"] for r in con.execute("SELECT id FROM runs WHERE plan=? ORDER BY id", (plan_id,))]
 
 
+def _child_counts(con, plan_id):
+    """{table: rows} for the plan's runs, over every PURGE_BY_RUN table the store has."""
+    have = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    return {t: con.execute(f"SELECT COUNT(*) FROM {t} WHERE run IN (SELECT id FROM runs WHERE plan=?)",
+                           (plan_id,)).fetchone()[0] for t in PURGE_BY_RUN if t in have}
+
+
 def delete_plan(plan_id, data, home):
     """C10: delete an ARCHIVED plan. Checks under the write lock, a verified VACUUM INTO backup
     (which cannot run inside a transaction), then the lock again: the checks and the run set are
-    re-verified before one transaction drops the rows of the plan's runs, the runs and the plans
+    re-verified (run set AND per-table child row counts: a write between the backup and the purge
+    aborts, the backup stays) before one transaction drops the rows of the plan's runs, the runs and the plans
     row. The archived folder is never unlinked (C13)."""
     data, home, con, row, _ = _open_plan_store(plan_id, data, home, "delete")
     db = _mkdb()
@@ -1761,14 +1771,24 @@ def delete_plan(plan_id, data, home):
         con.execute("BEGIN IMMEDIATE")
         try:
             runs = _delete_checks(con, plan_id)
+            counts = _child_counts(con, plan_id)
         finally:
             con.rollback()
-        backup = _predelete_backup(con, plan_id, mkpaths.archive_dir(data, None, home))
+        backup = _predelete_backup(con, plan_id, mkpaths.archive_dir(data, None, home), counts)
+        race = os.environ.get("MK_DELETE_RACE_SQL")
+        if race:  # test seam: a write lands between the backup and the second lock
+            con.execute(race)
+            con.commit()
         con.execute("BEGIN IMMEDIATE")
         try:
             if _delete_checks(con, plan_id) != runs:
                 raise Fail([f"refusing to delete {plan_id}: its runs changed during the backup; "
                             f"retry (backup kept at {backup})"])
+            now = _child_counts(con, plan_id)
+            for t, n in counts.items():
+                if now.get(t) != n:
+                    raise Fail([f"refusing to delete {plan_id}: {t} went from {n} to {now.get(t)} rows "
+                                f"during the backup; retry (backup kept at {backup})"])
             have = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             purged = {}
             for t in PURGE_BY_RUN:
@@ -1793,9 +1813,9 @@ def delete_plan(plan_id, data, home):
     return out
 
 
-def _predelete_backup(con, plan_id, dest_dir):
+def _predelete_backup(con, plan_id, dest_dir, counts):
     """VACUUM INTO a temp file, open it, check integrity, the plan row and the plan's run count
-    against the live store, then rename into place. Any failure removes the temp file and raises
+    and every child table's row count against `counts` (taken under the lock), then rename into place. Any failure removes the temp file and raises
     before a row is touched (shape of mk-state archive_backup)."""
     import sqlite3
     os.makedirs(dest_dir, exist_ok=True)
@@ -1806,7 +1826,7 @@ def _predelete_backup(con, plan_id, dest_dir):
     final = _free_name(os.path.join(dest_dir, f"{plan_id}-pre-delete-{stamp}.db"))
     tmp = final + ".tmp"
     try:
-        if os.environ.get("MK_ARCHIVE_FAIL") == "1":  # test seam: the backup fails before any rename
+        if "1" in (os.environ.get("MK_DELETE_BACKUP_FAIL"), os.environ.get("MK_ARCHIVE_FAIL")):  # test seam: fails before any rename
             raise RuntimeError("injected archive backup failure")
         con.execute("VACUUM INTO ?", (tmp,))
         chk = sqlite3.connect(tmp)
@@ -1815,12 +1835,11 @@ def _predelete_backup(con, plan_id, dest_dir):
                 raise RuntimeError("backup failed quick_check")
             if not chk.execute("SELECT 1 FROM plans WHERE id=?", (plan_id,)).fetchone():
                 raise RuntimeError(f"backup has no plan {plan_id}")
-            n = chk.execute("SELECT COUNT(*) FROM runs WHERE plan=?", (plan_id,)).fetchone()[0]
+            held = _child_counts(chk, plan_id)
         finally:
             chk.close()
-        live = con.execute("SELECT COUNT(*) FROM runs WHERE plan=?", (plan_id,)).fetchone()[0]
-        if n != live:
-            raise RuntimeError(f"backup holds {n} run(s), the store {live}")
+        if held != counts:
+            raise RuntimeError(f"backup rows {held} differ from the store {counts}")
         os.replace(tmp, final)
     except Exception as e:
         if os.path.exists(tmp):
@@ -3055,20 +3074,31 @@ def self_test():
         con.execute("DELETE FROM lane_slots")
         con.commit()
         con.close()
-        env_old = os.environ.get("MK_ARCHIVE_FAIL")
-        os.environ["MK_ARCHIVE_FAIL"] = "1"
+        os.environ["MK_DELETE_BACKUP_FAIL"] = "1"
         try:
             out = mk("delete", "imp7", "--data", data, "--home", home, code=2)
         finally:
-            os.environ.pop("MK_ARCHIVE_FAIL", None)
-            if env_old is not None:
-                os.environ["MK_ARCHIVE_FAIL"] = env_old
+            os.environ.pop("MK_DELETE_BACKUP_FAIL", None)
         assert "backup failed" in " ".join(out["errors"]), out
         con = project_con()
         assert named(con, "imp7", ["imp7run"]) == 8, named(con, "imp7", ["imp7run"])
         con.close()
         arch = mkpaths.archive_dir(data, None, home)
         assert not [n for n in os.listdir(arch) if n.endswith(".tmp")], os.listdir(arch)
+        # a child row written between the backup and the purge aborts delete; nothing is deleted
+        os.environ["MK_DELETE_RACE_SQL"] = ("INSERT INTO events(run, task, t, chan, kind, text)"
+                                            " VALUES ('imp7run','P1','t','c','k','late')")
+        try:
+            out = mk("delete", "imp7", "--data", data, "--home", home, code=2)
+        finally:
+            os.environ.pop("MK_DELETE_RACE_SQL", None)
+        said = " ".join(out["errors"])
+        assert "events went from 1 to 2" in said and "backup kept at" in said, out
+        con = project_con()
+        assert named(con, "imp7", ["imp7run"]) == 9, "the aborted delete changed rows"
+        con.execute("DELETE FROM events WHERE text='late'")
+        con.commit()
+        con.close()
         # a failure mid-purge rolls the whole transaction back
         os.environ["MK_PURGE_FAIL"] = "1"
         try:
@@ -3171,6 +3201,20 @@ def self_test():
         assert r9["archived_path"] == v2
         out = mk("unarchive", "imp9", "--data", data, "--home", home, code=2)  # not archived now
         assert "not archived" in " ".join(out["errors"]), out
+
+        # crash recovery: status written, archived_to recorded, folder never moved -> unarchive
+        # just restores the status
+        seed("impc", "done")
+        con = project_con()
+        con.execute("UPDATE plans SET status='archived', header_json=? WHERE id='impc'",
+                    (json.dumps({"archived_from": "done", "archived_to": os.path.join(data, "nowhere")}),))
+        con.commit()
+        con.close()
+        out = mk("unarchive", "imp" + "c", "--data", data, "--home", home)
+        assert out["ok"] and os.path.isfile(os.path.join(plans_dir, "impc.md")), out
+        con = project_con()
+        assert con.execute("SELECT status FROM plans WHERE id='impc'").fetchone()[0] == "done"
+        con.close()
 
         # repair: already 'archived' with no record and the legacy files still in place -> the move
         # happens; a second archive then refuses; a taken archive name gets a stamp, never overwritten
