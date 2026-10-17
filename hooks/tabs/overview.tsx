@@ -4,11 +4,11 @@
 // (a Card eats a border and a padding cell per side). Fixture data unchanged
 // (C6); the fixture names (OverviewData, OverviewView, overviewView,
 // OverviewTab) stay the contract the pane and the tests build against.
-import type { Elements } from 'claude-code'
+import type { Elements, RenderChildren, RenderElement } from 'claude-code'
 import { AGENT_COLOR, AGENT_GLYPH, NARROW } from './ui'
-import { ActionButtons, Card, Chip, Section, SmoothBar } from './kit'
+import { ActionButtons, Card, SmoothBar } from './kit'
 import type { ActionSpec } from './kit'
-import { gradientBar, laneStrip, pickBar } from './raster'
+import { gradientBar, pickBar } from './raster'
 import { PALETTE, ROLE, THEME } from './palette'
 import type { PaletteRole } from './palette'
 import { OVERVIEW_FIXTURE } from './overview.fixture'
@@ -113,10 +113,8 @@ export function OverviewTab(els: Els, view: OverviewData & { mock?: boolean }, c
   const { Box, Text } = els
   const compact = cols < NARROW
   const W = Math.max(1, cols - 4) // the Card's content width (border + padding per side)
-  const matrix = THEME.name === 'matrix'
   return (
-    <Box flexDirection="column" gap={1} {...(matrix ? { backgroundColor: PALETTE.bg, paddingX: 1, paddingY: 1 } : {})}>
-      {matrix && <Text bold={true} color={ROLE.live.fg}>{'> MATRIXKODER :: OVERVIEW ▌'}</Text>}
+    <Box flexDirection="column" gap={1}>
       {view.mock !== false && <Text bold={true} color={ROLE.warn.fg}>MOCK · fixture data · not this run</Text>}
       {PlanCard(els, view, W, compact)}
       {LanesCard(els, view.lanes, W, compact)}
@@ -127,48 +125,48 @@ export function OverviewTab(els: Els, view: OverviewData & { mock?: boolean }, c
   )
 }
 
-/** PLAN 3/8 — the wave chips, the segment strip and the task rows. */
+/** a card's header row: the `> LABEL` on the left, any coloured parts on the right (the board's
+ *  `PLAN 3/8 DONE ……… W1 ✓✓✓ W2 ●◐!⊘ W3 ○`). */
+function HeadRow(els: Els, label: string, right: RenderChildren): RenderElement {
+  const { Box, Text } = els
+  return (
+    <Box flexDirection="row" justifyContent="space-between" gap={1}>
+      <Text bold={true} color={PALETTE.mut}>{`${THEME.name === 'matrix' ? '> ' : ''}${label.toUpperCase()}`}</Text>
+      <Text>{right}</Text>
+    </Box>
+  )
+}
+
+/** the task's checkbox, as the board draws it: `[•]` live, `[!]` needs you, `[✓]` done, `[ ]` planned */
+function boxOf(status: string): string {
+  if (DONE.has(status)) return '[✓]'
+  const role = roleOf(status)
+  return role === 'live' ? '[•]' : role === 'warn' ? '[!]' : '[ ]'
+}
+
+/** PLAN 3/8 DONE — wave glyphs on the right, one `[•] P4 title …… building 14m` row per task. */
 function PlanCard(els: Els, view: OverviewData, W: number, compact: boolean) {
   const { Box, Text } = els
-  const live = view.tasks.filter(t => !DONE.has(t.status) && t.status !== 'planned').length
-  // the strip: one segment per task, coloured by that task's role (Main's
-  // planStrip); without a Raster the wave glyphs draw as one dim row
-  const strip = pickBar(
-    els,
-    'overview-plan-strip',
-    laneStrip(view.tasks.map(t => roleOf(t.status)), W),
-    <Text dimColor={true}>{view.waves.map(w => w.glyphs).join('')}</Text>,
-  )
+  const waves = view.waves.map((w, i) => (
+    <Text key={w.label} color={ROLE[WAVE_ROLE[w.tone]].fg} dimColor={w.tone === 'planned'}>{`${i > 0 ? ' ' : ''}${w.label} ${w.glyphs}`}</Text>
+  ))
   return Card(els, {}, (
     <Box flexDirection="column">
-      {Section(els, { label: 'Plan', right: `${view.plan.done}/${view.plan.total}` })}
-      <Box flexDirection="row" gap={1}>
-        {view.waves.map(w => {
-          const label = compact
-            ? `${w.label} ${w.tone === 'done' ? '✓' : w.tone === 'active' ? `${live}/${view.tasks.length}` : '○'}`
-            : `${w.label} ${w.glyphs}`
-          return Chip(els, { label, role: WAVE_ROLE[w.tone] })
-        })}
-      </Box>
-      {strip}
+      {HeadRow(els, `Plan ${view.plan.done}/${view.plan.total} done`, compact ? null : waves)}
+      {view.tasks.length === 0 && <Text dimColor={true}>no tasks yet</Text>}
       {view.tasks.map(task => {
-        // the canvas chip is a short status label ('● build 14m'), so it
-        // carries the fixture's short word at every width and the title keeps
-        // its cells (the wide `note` spelling stays in the fixture)
-        const word = task.short
-        const right = task.status === 'planned'
-          ? <Text dimColor={true}>{`${glyphOf(task.status)} ${word}`}</Text>
-          : Chip(els, { label: `${glyphOf(task.status)} ${word}`, role: roleOf(task.status) })
-        const rightW = task.status === 'planned' ? word.length + 2 : word.length + glyphOf(task.status).length + 3
-        // the row is id · title · filler · right with a gap column between each
-        // pair, so the title's budget gives back all three gap columns
-        const budget = Math.max(1, W - task.id.length - rightW - 3)
+        const planned = task.status === 'planned'
+        const right = compact ? task.short : task.note
+        const role = roleOf(task.status)
+        // box · id · title · filler · right, with a gap column between each pair
+        const budget = Math.max(1, W - 3 - task.id.length - right.length - 4)
         return (
           <Box key={task.id} flexDirection="row" gap={1}>
-            <Text bold={true}>{task.id}</Text>
-            <Text wrap="truncate-end">{clip(task.title, budget)}</Text>
+            <Text color={planned ? undefined : ROLE[role].fg} dimColor={planned}>{boxOf(task.status)}</Text>
+            <Text bold={!planned} dimColor={planned}>{task.id}</Text>
+            <Text dimColor={planned} wrap="truncate-end">{clip(task.title, budget)}</Text>
             <Box flexGrow={1} />
-            {right}
+            <Text color={planned ? undefined : ROLE[role].fg} dimColor={planned}>{right}</Text>
           </Box>
         )
       })}
@@ -176,27 +174,32 @@ function PlanCard(els: Els, view: OverviewData, W: number, compact: boolean) {
   ))
 }
 
-/** LANES 4 — one row per lane: slot, agent, model · effort, status chip. */
+/** LANES — `p4 ⌂ CODEX gpt-6.1-sol high …… ● building`. */
 function LanesCard(els: Els, lanes: OverviewData['lanes'], W: number, compact: boolean) {
   const { Box, Text } = els
   return Card(els, {}, (
     <Box flexDirection="column">
-      {Section(els, { label: 'Lanes', right: String(lanes.length) })}
+      {HeadRow(els, 'Lanes', <Text dimColor={true}>{String(lanes.length)}</Text>)}
       {lanes.length === 0 && <Text dimColor={true}>none live</Text>}
       {lanes.map(lane => {
         const name = `${AGENT_GLYPH[lane.agent] ?? '⌂'} ${lane.agent.toUpperCase()}`
-        const word = compact ? lane.short : lane.note
-        const label = `${glyphOf(lane.status)} ${word}`
-        const modelEffort = compact ? `${lane.modelShort} ${lane.effort.slice(0, 3)}` : `${lane.model} ${lane.effort}`
-        // slot · agent · model · filler · chip: four gap columns to give back
-        const budget = Math.max(1, W - lane.slot.length - name.length - (label.length + 2) - 4)
+        const label = `${glyphOf(lane.status)} ${compact ? lane.short : lane.note}`
+        const model = compact ? lane.modelShort : lane.model
+        const effort = compact ? lane.effort.slice(0, 3) : lane.effort
+        // slot · agent · model effort · filler · status: four gap columns to give back
+        const budget = Math.max(1, W - lane.slot.length - name.length - label.length - 4)
+        // one cut over `model effort`, then the model part bold and the rest dim
+        const cut = clip(`${model} ${effort}`, budget)
         return (
           <Box key={lane.slot} flexDirection="row" gap={1}>
             <Text dimColor={true}>{lane.slot}</Text>
-            <Text color={AGENT_COLOR[lane.agent] ?? 'cyan'} bold={true}>{name}</Text>
-            <Text dimColor={true} wrap="truncate-end">{clip(modelEffort, budget)}</Text>
+            <Text color={AGENT_COLOR[lane.agent] ?? ROLE.live.fg} bold={true}>{name}</Text>
+            <Text wrap="truncate-end">
+              <Text bold={true}>{cut.slice(0, model.length)}</Text>
+              {cut.length > model.length && <Text dimColor={true}>{cut.slice(model.length)}</Text>}
+            </Text>
             <Box flexGrow={1} />
-            {Chip(els, { label, role: roleOf(lane.status) })}
+            <Text color={ROLE[roleOf(lane.status)].fg}>{label}</Text>
           </Box>
         )
       })}
@@ -204,11 +207,12 @@ function LanesCard(els: Els, lanes: OverviewData['lanes'], W: number, compact: b
   ))
 }
 
-/** USAGE — gradient bars (Raster) with the SmoothBar fallback, then the numbers. */
+/** USAGE — `claude (all) …… [bar] 38% · 61% · 2h10m`: the name left, a short bar and the numbers right. */
 export function UsageCard(els: Els, usage: OverviewData['usage'], W: number, compact: boolean) {
   const { Box, Text } = els
   const numW = compact ? NUM_W.compact : NUM_W.wide
-  const barW = Math.max(3, W - NAME_W - numW - 2)
+  const barW = Math.max(3, Math.min(12, W - NAME_W - numW - 3))
+  const nameW = Math.max(1, W - barW - numW - 3)
   const role = (u: OverviewData['usage'][number]): PaletteRole => {
     if (u.exhausted || u.pct > 80) return 'err'
     if (u.pct >= 50) return 'warn'
@@ -216,21 +220,23 @@ export function UsageCard(els: Els, usage: OverviewData['usage'], W: number, com
   }
   return Card(els, {}, (
     <Box flexDirection="column">
-      {Section(els, { label: 'Usage', right: compact ? '5h · reset' : '5h · wk · reset' })}
+      {HeadRow(els, 'Usage', <Text dimColor={true}>{compact ? '5h · reset' : '5h · week · reset'}</Text>)}
+      {usage.length === 0 && <Text dimColor={true}>no usage data yet</Text>}
       {usage.map(u => {
         const nums = u.exhausted
-          ? (compact ? `⊘ ${u.until ?? '—'}` : `exhausted · ${u.until ?? '—'}`)
+          ? (compact ? `⊘ ${u.until ?? '—'}` : `⊘ exhausted · ${u.until ?? '—'}`)
           : (compact ? `${u.pct}% ${u.reset ?? '—'}` : `${u.pct}% · ${u.weekPct}% · ${u.reset ?? '—'}`)
         return (
           <Box key={u.label} flexDirection="row" gap={1}>
-            <Text>{u.short.padEnd(NAME_W).slice(0, NAME_W)}</Text>
+            <Text wrap="truncate-end">{clip(compact ? u.short : u.label, nameW)}</Text>
+            <Box flexGrow={1} />
             {pickBar(
               els,
               `overview-usage-${u.short}`,
-              gradientBar(u.pct, barW, u.exhausted ? [PALETTE.red] : USAGE_STOPS()),
-              SmoothBar(els, { pct: u.pct, width: barW, role: role(u) }),
+              gradientBar(u.exhausted ? 100 : u.pct, barW, u.exhausted ? [PALETTE.red] : USAGE_STOPS()),
+              SmoothBar(els, { pct: u.exhausted ? 100 : u.pct, width: barW, role: role(u) }),
             )}
-            <Text color={u.exhausted ? ROLE.err.fg : undefined} bold={u.exhausted}>{clip(nums, numW)}</Text>
+            <Text color={u.exhausted ? ROLE.err.fg : ROLE[role(u)].fg}>{clip(nums, numW).padStart(numW)}</Text>
           </Box>
         )
       })}
@@ -238,7 +244,7 @@ export function UsageCard(els: Els, usage: OverviewData['usage'], W: number, com
   ))
 }
 
-/** WAITING — the warn Card: solid chip header, the wrapped question and the
+/** WAITING ON YOU — the warn Card: amber header and its time, the wrapped question and the
  *  a/b/c option buttons (folded into ⋯ More, the reveal in view state, C10). */
 function WaitingCard(els: Els, waiting: OverviewData['waiting'], W: number, compact: boolean, ui?: TabUi) {
   const { Box, Text } = els
@@ -264,7 +270,7 @@ function WaitingCard(els: Els, waiting: OverviewData['waiting'], W: number, comp
   return Card(els, { role: 'warn' }, (
     <Box flexDirection="column">
       <Box flexDirection="row" justifyContent="space-between" gap={1}>
-        {Chip(els, { label: compact ? '! WAITING' : '! WAITING ON YOU', role: 'warn', solid: true })}
+        <Text bold={true} color={ROLE.warn.fg}>{compact ? 'WAITING' : 'WAITING ON YOU'}</Text>
         <Text dimColor={true}>{waiting.since}</Text>
       </Box>
       {wrap(question, W).map((line, i) => (
@@ -278,12 +284,12 @@ function WaitingCard(els: Els, waiting: OverviewData['waiting'], W: number, comp
   ))
 }
 
-/** RECENT — dim time + text rows. */
+/** RECENT — no card, as on the board: the header, then dim time + text rows. */
 function RecentCard(els: Els, recent: OverviewData['recent'], W: number) {
   const { Box, Text } = els
-  return Card(els, {}, (
-    <Box flexDirection="column">
-      {Section(els, { label: 'Recent' })}
+  return (
+    <Box flexDirection="column" paddingX={1}>
+      {HeadRow(els, 'Recent', null)}
       {recent.length === 0 && <Text dimColor={true}>nothing yet</Text>}
       {recent.map(ev => (
         <Box key={`${ev.t}${ev.text}`} flexDirection="row" gap={1}>
@@ -292,5 +298,5 @@ function RecentCard(els: Els, recent: OverviewData['recent'], W: number) {
         </Box>
       ))}
     </Box>
-  ))
+  )
 }

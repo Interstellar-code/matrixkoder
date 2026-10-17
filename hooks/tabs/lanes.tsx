@@ -12,10 +12,10 @@
 // `cols - 4` and nothing draws wider than the pane.
 import type { Elements, RenderElement } from 'claude-code'
 import { LANES_FIXTURE } from './lanes.fixture'
-import { NARROW } from './ui'
+import { AGENT_COLOR, AGENT_GLYPH, NARROW } from './ui'
 import { ActionRow, Card, Chip, ControlRow, Section } from './kit'
 import type { ControlState } from './kit'
-import { ROLE } from './palette'
+import { PALETTE, ROLE, THEME } from './palette'
 import type { PaletteRole } from './palette'
 import { pickBar, stageBar } from './raster'
 
@@ -49,8 +49,12 @@ export type LaneData = {
   right: string
   /** the stage strip: `done` of `total` stages done, the next one current */
   stage?: { done: number; total: number }
-  /** the agent/model line */
+  /** the agent/model line (the fixture's form; a live lane sets agentId/model/effort instead) */
   agent: Seg[]
+  /** the live lane's agent id, model and effort: drawn as `⌂ CODEX model effort` */
+  agentId?: string
+  model?: string
+  effort?: string
   /** the agent line's short form under NARROW (the Narrow board) */
   agentShort?: string
   /** the last commit; the sha yields to the subject when the row is narrow */
@@ -82,7 +86,7 @@ export function lanesView(): LanesView {
 }
 
 /** the header glyphs the boards draw per status. */
-const STATUS_GLYPH: Record<string, string> = { building: '●', review: '◐', blocked: '!', quota: '⊘' }
+const STATUS_GLYPH: Record<string, string> = { building: '●', verifying: '●', dispatched: '●', review: '◐', fix: '▲', blocked: '!', quota: '⊘', stalled: '!' }
 
 /** the statuses a lane is HELD in — nothing to control, a warn border (C11). */
 const HELD: readonly string[] = ['blocked', 'quota']
@@ -172,15 +176,37 @@ function chipRow(els: Els, chips: readonly { label: string; role: PaletteRole }[
 function laneHeader(els: Els, lane: LaneData, w: number): RenderElement {
   const { Box, Text } = els
   const role = laneRole(lane.status)
-  const label = `${STATUS_GLYPH[lane.status] ?? ''} ${lane.status}`.trim()
-  const right = cut(lane.right, Math.max(0, Math.floor(w / 2)))
-  const room = w - (label.length + 2) - right.length - 2 // chip + two gap columns
-  // the Narrow board's bare task id when the title would leave nothing readable
-  const title = room - (lane.task.length + 1) < 6 ? lane.task : cut(`${lane.task} ${lane.title}`, room)
+  const label = `${STATUS_GLYPH[lane.status] ?? '·'} ${lane.status}`
+  // task · title · filler · status, with a gap column between each pair
+  const room = Math.max(1, w - lane.task.length - label.length - 3)
   return (
-    <Box flexDirection="row" gap={1} justifyContent="space-between">
-      {Chip(els, { label, role })}
-      <Text bold={true}>{cut(title, Math.max(1, room))}</Text>
+    <Box flexDirection="row" gap={1}>
+      <Text bold={true} color={ROLE[role].fg}>{lane.task}</Text>
+      <Text bold={true} wrap="truncate-end">{cut(lane.title, room)}</Text>
+      <Box flexGrow={1} />
+      <Text color={ROLE[role].fg}>{label}</Text>
+    </Box>
+  )
+}
+
+/** the agent line, as the Overview draws it: `⌂ CODEX gpt-6.1-sol high`, then the round/age right. */
+function laneAgent(els: Els, lane: LaneData, w: number, wide: boolean): RenderElement {
+  const { Box, Text } = els
+  const who = lane.agentId ?? ''
+  const name = who === '' ? '' : `${AGENT_GLYPH[who] ?? '⌂'} ${who.toUpperCase()}`
+  const right = cut(lane.right, Math.max(0, Math.floor(w / 3)))
+  const model = !wide && lane.agentShort != null ? lane.agentShort : (lane.model ?? '')
+  const effort = wide ? (lane.effort ?? '') : ''
+  const room = Math.max(1, w - name.length - right.length - 3)
+  const both = cut([model, effort].filter(Boolean).join(' '), room)
+  return (
+    <Box key="agent" flexDirection="row" gap={1}>
+      {name !== '' && <Text bold={true} color={AGENT_COLOR[who] ?? ROLE.live.fg}>{name}</Text>}
+      <Text wrap="truncate-end">
+        <Text bold={true}>{both.slice(0, model.length)}</Text>
+        {both.length > model.length && <Text dimColor={true}>{both.slice(model.length)}</Text>}
+      </Text>
+      <Box flexGrow={1} />
       <Text dimColor={true}>{right}</Text>
     </Box>
   )
@@ -264,9 +290,12 @@ function laneCard(els: Els, lane: LaneData, cols: number, ui: TabUi | undefined)
   const rows: RenderElement[] = [laneHeader(els, lane, w)]
   const stage = laneStage(els, lane, w)
   if (stage != null) rows.push(stage)
-  // the Narrow board's short agent line under NARROW (the long one truncates)
-  const agent = !wide && lane.agentShort != null ? [sg(lane.agentShort)] : lane.agent
-  rows.push(<Text key="agent">{segEls(els, fitSegs(agent, w))}</Text>)
+  if (lane.agentId != null) rows.push(laneAgent(els, lane, w, wide))
+  else {
+    // the Narrow board's short agent line under NARROW (the long one truncates)
+    const agent = !wide && lane.agentShort != null ? [sg(lane.agentShort)] : lane.agent
+    rows.push(<Text key="agent">{segEls(els, fitSegs(agent, w))}</Text>)
+  }
   if (lane.commit != null) {
     // the sha yields to the subject when both do not fit (the Narrow board)
     const full = `${lane.commit.sha} ${lane.commit.subject}`
@@ -285,7 +314,7 @@ function laneCard(els: Els, lane: LaneData, cols: number, ui: TabUi | undefined)
   if (!HELD.includes(lane.status)) {
     rows.push(ControlRow(els, laneControlState(ui, lane.task), w, next => { ui?.set(laneStateKey(lane.task), next) }, lane.task.toLowerCase()))
   }
-  rows.push(ActionRow(els, { actions: cut(lane.actions, w) }))
+  if (lane.actions !== '') rows.push(ActionRow(els, { actions: cut(lane.actions, w) }))
   return Card(els, { role: laneRole(lane.status) }, <Box flexDirection="column">{rows}</Box>)
 }
 
@@ -293,9 +322,13 @@ function laneCard(els: Els, lane: LaneData, cols: number, ui: TabUi | undefined)
 export function LanesTab(els: Els, view: LanesView, cols: number, ui?: TabUi): RenderElement {
   const { Box, Text } = els
   return (
-    <Box flexDirection="column">
+    <Box flexDirection="column" gap={1}>
       {view.mock && <Text bold={true} color={ROLE.warn.fg}>MOCK · fixture data · not this run</Text>}
-      <Text dimColor={true}>{hintRow(view.summary, view.summaryRight, cols)}</Text>
+      <Box flexDirection="row" justifyContent="space-between" gap={1} paddingX={1}>
+        <Text bold={true} color={PALETTE.mut}>{`${THEME.name === 'matrix' ? '> ' : ''}LANES`}</Text>
+        <Text dimColor={true}>{cut(view.summary, Math.max(0, cols - 10))}</Text>
+      </Box>
+      {view.lanes.length === 0 && (view.slots ?? []).length === 0 && Card(els, {}, <Text dimColor={true}>no live lanes · a run's builders show here</Text>)}
       {view.lanes.map(lane => (
         <Box key={lane.task} flexDirection="column">
           {laneCard(els, lane, cols, ui)}
@@ -307,10 +340,10 @@ export function LanesTab(els: Els, view: LanesView, cols: number, ui?: TabUi): R
           {(view.slots ?? []).map(x => Card(els, x.state === 'free' ? {} : { role: 'live' }, (
             <Box key={`slot-${String(x.slot)}`} flexDirection="column">
               <Box flexDirection="row" gap={1}>
-                <Text bold={true}>{`L${String(x.slot)}`}</Text>
-                <Text dimColor={true} wrap="truncate-end">{x.path.split('/').pop() ?? x.path}</Text>
+                <Text bold={true} color={x.state === 'free' ? ROLE.ok.fg : ROLE.live.fg}>{`L${String(x.slot)}`}</Text>
+                <Text wrap="truncate-end">{x.path.split('/').pop() ?? x.path}</Text>
                 <Box flexGrow={1} />
-                {Chip(els, { label: x.state, role: x.state === 'free' ? 'ok' : 'live' })}
+                <Text color={x.state === 'free' ? ROLE.ok.fg : ROLE.live.fg}>{`${x.state === 'free' ? '○' : '●'} ${x.state}`}</Text>
               </Box>
               <Text dimColor={true} wrap="truncate-end">{x.task != null ? `${x.task}${x.branch != null ? ` · ${x.branch}` : ''}` : x.clean ? 'idle · clean worktree' : 'idle · worktree has changes'}</Text>
             </Box>

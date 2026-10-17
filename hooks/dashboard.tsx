@@ -1704,7 +1704,8 @@ function NoRun(els: Els, snap: MkSnapshot, cols: number) {
   const past = snap.runs.filter(r => r.status !== 'active').slice(-5).reverse()
   const usage = liveOverviewView(snap).usage
   return (
-    <Box flexDirection="column" gap={1} backgroundColor={PALETTE.bg} paddingX={1} paddingY={1}>
+    // no ground of its own: the pane's Matrix ground and code rain show between the cards
+    <Box flexDirection="column" gap={1}>
       {Card(els, {}, (
         <Box flexDirection="column">
           {Section(els, { label: 'Run', right: 'idle' })}
@@ -2125,8 +2126,8 @@ export function liveOverviewView(snap: MkSnapshot): OverviewView {
 }
 
 /** The Lanes tab's live view: one card per lane from run.tasks. No live source for the
- *  stage strip, gate table, review counts, activity line, commit subject or pane id, so
- *  those stay empty. */
+ *  gate table, review counts, activity line, commit subject or pane id, so those stay
+ *  empty; the stage strip is the task's place on LANE_PIPE. */
 /** The lane slots last read by loadLaneSlots, typed for the Lanes tab. */
 function laneSlotsOf(view: Record<string, string>): NonNullable<LanesView['slots']> {
   try {
@@ -2143,19 +2144,32 @@ function laneSlotsOf(view: Record<string, string>): NonNullable<LanesView['slots
   }
 }
 
+/** the lane pipeline the stage strip walks, dispatch to merge */
+const LANE_PIPE = ['dispatched', 'building', 'verifying', 'review', 'qa', 'merged'] as const as readonly string[]
+
 export function liveLanesView(snap: MkSnapshot): LanesView {
   const groups = snap.run ? laneGroups(snap.run) : []
   const held = groups.filter(g => SIDE_STATE.has(g.status)).length
-  const lanes: LaneData[] = groups.map(g => ({
-    status: g.status,
-    task: g.ids,
-    title: g.rep.title,
-    right: taskSuffix(g.rep, snap.now).trim(),
-    agent: [{ text: [g.rep.agent ?? 'agent', g.rep.model, g.rep.effort ? `effort ${g.rep.effort}` : ''].filter(Boolean).join(' · ') }],
-    ...(g.rep.last_commit ? { commit: { sha: g.rep.last_commit.slice(0, 7), subject: '' } } : {}),
-    gate: [],
-    actions: '',
-  }))
+  const lanes: LaneData[] = groups.map(g => {
+    // the stage strip: where the task sits on the lane pipeline (a fix round sits at review)
+    const at = LANE_PIPE.indexOf(g.status === 'fix' ? 'review' : g.status)
+    const reasons = (g.rep.open_reasons ?? []).map(r => r.kind).filter(Boolean)
+    return {
+      status: g.status,
+      task: g.ids,
+      title: g.rep.title,
+      right: [g.rep.round != null && g.rep.round > 0 ? `r${String(g.rep.round)}` : '', taskSuffix(g.rep, snap.now).trim()].filter(Boolean).join(' · '),
+      ...(at >= 0 ? { stage: { done: at, total: LANE_PIPE.length } } : {}),
+      agent: [{ text: g.rep.agent ?? 'agent' }],
+      agentId: g.rep.agent ?? 'agent',
+      ...(g.rep.model ? { model: g.rep.model } : {}),
+      ...(g.rep.effort ? { effort: g.rep.effort } : {}),
+      ...(g.rep.last_commit ? { commit: { sha: g.rep.last_commit.slice(0, 7), subject: '' } } : {}),
+      ...(reasons.length > 0 ? { note: [{ text: `waiting on ${reasons.join(', ')}`, tone: 'warning' as const }] } : {}),
+      gate: [],
+      actions: '',
+    }
+  })
   return {
     mock: false,
     summary: groups.length === 0 ? 'no live lanes' : `${groups.length} lanes · ${groups.length - held} live · ${held} held`,
