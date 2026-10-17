@@ -2,6 +2,11 @@
 
 All notable changes to this project. Format: Keep a Changelog; versions: SemVer.
 
+## [0.6.3] - 2026-10-17
+
+### Added
+- **dashboard:** Overview and Lanes redesign in the Matrix theme (6bd6d42)
+
 ## [0.6.2] - 2026-10-17
 
 ### Added
