@@ -359,3 +359,39 @@ test('natural task id order without ICU: Z9 < Z10 < Z20, digits before text (Z27
   expect((view.phases?.[0]?.rows ?? []).map(r => r.id)).toEqual(['Z', 'Z2a', 'Z9', 'Z10', 'Z20'])
   expect(naturalCompare('F.10', 'F.S')).toBeLessThan(0)
 })
+
+test('description maps at plan, phase, task and subtask level; blank and non-string are absent', () => {
+  const view = planFromReply({
+    ok: true, id: 'p', title: 'T', status: 'running', description: '  Why this plan exists.  ',
+    phases: [
+      { id: 'P1', title: 'Phase', status: 'building', description: ' A phase.\n',
+        tasks: [{ id: 'P1.1', title: 'Task', status: 'building', description: 'A task.',
+          subtasks: [{ id: 'P1.1a', title: 'Sub', status: 'building', description: 'A subtask.' }] }] },
+      { id: 'P2', title: 'Blank', status: 'planned', description: '   ',
+        tasks: [{ id: 'P2.1', title: 'Empty', status: 'planned', description: '',
+          subtasks: [{ id: 'P2.1a', title: 'Sub', status: 'planned', description: '\t' }] }] },
+      { id: 'P3', title: 'Typed', status: 'planned', description: 7,
+        tasks: [{ id: 'P3.1', title: 'Typed', status: 'planned', description: ['x'],
+          subtasks: [{ id: 'P3.1a', title: 'Sub', status: 'planned', description: null }] }] },
+    ],
+  })
+  expect(view.plan?.description).toBe('Why this plan exists.')
+  expect(view.phases?.[0]?.description).toBe('A phase.')
+  expect(view.phases?.[0]?.rows[0]?.description).toBe('A task.')
+  expect(view.phases?.[0]?.rows[0]?.subs?.[0]?.description).toBe('A subtask.')
+  for (const p of [view.phases?.[1], view.phases?.[2]]) {
+    expect(p).not.toHaveProperty('description')
+    expect(p?.rows[0]).not.toHaveProperty('description')
+    expect(p?.rows[0]?.subs?.[0]).not.toHaveProperty('description')
+  }
+  for (const bad of ['', '  ', 5, null, {}]) {
+    expect(planFromReply({ ok: true, id: 'p', description: bad }).plan).not.toHaveProperty('description')
+  }
+})
+
+test('the captured detail carries the fixture descriptions', () => {
+  const view = planFromReply(detail)
+  expect(view.phases?.[0]?.description).toContain('throwaway home folder')
+  expect(view.phases?.[0]?.rows[0]?.description).toContain('same folder')
+  expect(view.phases?.[1]).not.toHaveProperty('description')
+})

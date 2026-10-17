@@ -35,6 +35,7 @@ export function findPlanTask(phases: readonly PlanPhase[] | undefined, id: strin
         title: phase.title,
         status: phase.status ?? 'planned',
         right: phase.status ?? '',
+        ...(phase.description != null ? { description: phase.description } : {}),
         slot: phase.slot ?? null,
         pane: phase.pane ?? null,
         branch: phase.branch ?? null,
@@ -91,6 +92,7 @@ export function PlanTaskPanel(els: Els, row: PlanTask, cols: number, onClose?: (
         {BoxButton(els, { key: `plan-task-close-top-${row.id}`, label: '✕ close', onPress: () => { onClose?.() } })}
       </Box>
       <Text color={PALETTE.mut} wrap="wrap">{row.title}</Text>
+      {row.description != null && <Text color={PALETTE.mut} wrap="wrap">{row.description}</Text>}
       {row.last_commit != null && fieldRow(els, 'commit', row.last_commit.slice(0, 7))}
       {row.findings != null && row.findings > 0 && fieldRow(els, 'findings', String(row.findings))}
       {row.type != null && fieldRow(els, 'type', row.type)}

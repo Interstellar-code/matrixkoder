@@ -418,3 +418,99 @@ test('a routed phase row shows its lane·agent tag and selects itself as a task 
   press(PlanTab(stubEls, planFromReply(detailFixture), 80, ui), 'plan-fold-D1.5')
   expect(ui.get('plan:task')).toBe('')
 })
+
+/** ── description: header (4 lines), expanded phase (3 lines), folded phase none ── */
+
+const LONG = 'The first sentence sets the scene for a reviewer who has never seen this work. The second one says what changes. The third one says why it matters now. The fourth names the risk. The fifth explains how it was checked. The sixth is cut.'
+
+const withDescriptions = (): typeof PLAN_REAL_FIXTURE => ({
+  ...PLAN_REAL_FIXTURE,
+  plan: PLAN_REAL_FIXTURE.plan == null ? undefined : { ...PLAN_REAL_FIXTURE.plan, description: LONG },
+  phases: (PLAN_REAL_FIXTURE.phases ?? []).map(phase => phase.id === 'S1' ? { ...phase, description: LONG } : phase),
+})
+
+const descLines = (drawn: unknown, prefix: string): string[] =>
+  nodesOf(drawn, 'Text').filter(t => String(t.props?.key ?? '').startsWith(prefix)).map(t => String((t.children ?? [])[0] ?? ''))
+
+test('the header shows the plan description, wrapped and capped at 4 lines', () => {
+  const lines = descLines(PlanTab(stubEls, withDescriptions(), 60, new Map()), 'plan-head-desc-')
+  expect(lines.length).toBe(4)
+  expect(lines[0]).toContain('The first sentence')
+  for (const l of lines) expect(l.length).toBeLessThanOrEqual(56)
+  expect(lines[3]?.endsWith('…')).toBe(true)
+  expect(lines.join(' ')).not.toContain('sixth')
+  // the shipped fixture text shows whole, and the word wave never appears
+  const text = allText(PlanTab(stubEls, PLAN_REAL_FIXTURE, 80, new Map()))
+  expect(text).toContain('This plan makes the settings screen')
+  expect(text.toLowerCase()).not.toContain('wave')
+})
+
+test('an expanded phase shows its description capped at 3 lines; a folded one shows nothing', () => {
+  const view = withDescriptions()
+  const open = descLines(PlanTab(stubEls, view, 60, new Map([['plan:phase:S1', '1']])), 'plan-desc-S1-')
+  expect(open.length).toBe(3)
+  expect(open[2]?.endsWith('…')).toBe(true)
+  expect(descLines(PlanTab(stubEls, view, 60, new Map()), 'plan-desc-')).toEqual([])
+  const short = allText(PlanTab(stubEls, PLAN_REAL_FIXTURE, 80, new Map([['plan:phase:S1', '1']])))
+  expect(short).toContain('Each setting is matched to the folder')
+  expect(allText(PlanTab(stubEls, PLAN_REAL_FIXTURE, 80, new Map()))).not.toContain('Each setting is matched')
+})
+
+test('a phase without a description draws no description rows', () => {
+  expect(descLines(PlanTab(stubEls, PLAN_REAL_FIXTURE, 80, new Map([['plan:phase:R1', '1']])), 'plan-desc-')).toEqual([])
+})
+
+/** ── wrapCap: a long word breaks; exact N lines has no ellipsis, N+1 cuts ── */
+
+const LONG_WORD = 'matrixkoder/plans/settings-plans-db/integration/review/round-one/notes.md'
+const HEAD_FILL = 'The settings screen and the saved plans now share one database. Tests stop touching the real one. Plans move into the project store. The Plan tab gets list, detail and board views.'
+const HEAD_OVER = `${HEAD_FILL} Old keys go and nothing else changes. Sample data follows the real reply.`
+// an expanded phase at 60 cols wraps to 50 cols (PhaseCard W-4, then Describe W-2)
+const PHASE_FILL = 'Each setting is matched to the folder it belongs in. Keys nobody reads any more are removed. The sample data is brought back in line.'
+const PHASE_OVER = `${PHASE_FILL} Done and checked.`
+
+const withPlanDesc = (description: string): typeof PLAN_REAL_FIXTURE => ({
+  ...PLAN_REAL_FIXTURE,
+  plan: PLAN_REAL_FIXTURE.plan == null ? undefined : { ...PLAN_REAL_FIXTURE.plan, description },
+})
+const withPhaseDesc = (description: string): typeof PLAN_REAL_FIXTURE => ({
+  ...PLAN_REAL_FIXTURE,
+  phases: (PLAN_REAL_FIXTURE.phases ?? []).map(phase => phase.id === 'S1' ? { ...phase, description } : phase),
+})
+
+test('wrapCap: a word wider than the line is broken into chunks inside the width', () => {
+  // header width at 60 cols is 56: the 73-col path is cut to a 56-col chunk, nothing dropped
+  const lines = descLines(PlanTab(stubEls, withPlanDesc(`Read the plan at ${LONG_WORD} before touching anything.`), 60, new Map()), 'plan-head-desc-')
+  expect(lines.every(l => l.length <= 56)).toBe(true)
+  expect(lines[1]).toBe(LONG_WORD.slice(0, 56))
+  expect(lines.join('')).toContain(LONG_WORD)
+})
+
+test('wrapCap: text that fills exactly 4 header lines has no ellipsis; a 5th line cuts the last one', () => {
+  const exact = descLines(PlanTab(stubEls, withPlanDesc(HEAD_FILL), 60, new Map()), 'plan-head-desc-')
+  expect(exact.length).toBe(4)
+  expect(exact.some(l => l.includes('…'))).toBe(false)
+  expect(exact[3]).toBe('and board views.')
+  const over = descLines(PlanTab(stubEls, withPlanDesc(HEAD_OVER), 60, new Map()), 'plan-head-desc-')
+  expect(over.length).toBe(4)
+  expect(over[2]).toBe(exact[2])
+  expect(over[3]?.endsWith('…')).toBe(true)
+})
+
+test('wrapCap: text that fills exactly 3 phase lines has no ellipsis; a 4th line cuts the last one', () => {
+  const open = new Map([['plan:phase:S1', '1']])
+  const exact = descLines(PlanTab(stubEls, withPhaseDesc(PHASE_FILL), 60, open), 'plan-desc-S1-')
+  expect(exact.length).toBe(3)
+  expect(exact.some(l => l.includes('…'))).toBe(false)
+  const over = descLines(PlanTab(stubEls, withPhaseDesc(PHASE_OVER), 60, open), 'plan-desc-S1-')
+  expect(over.length).toBe(3)
+  expect(over[1]).toBe(exact[1])
+  expect(over[2]?.endsWith('…')).toBe(true)
+})
+
+test('wrapCap: an 8-col plan does not crash and still draws the header description, capped at 4 lines', () => {
+  const lines = descLines(PlanTab(stubEls, withDescriptions(), 8, new Map()), 'plan-head-desc-')
+  expect(lines.length).toBe(4)
+  expect(lines.every(l => l.length <= 4)).toBe(true)
+  expect(lines[3]?.endsWith('…')).toBe(true)
+})

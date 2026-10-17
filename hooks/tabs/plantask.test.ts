@@ -308,3 +308,27 @@ test('F.8: a panel without the risk keys shows no R badge, no !! and no reasons 
   // the bare panel never invents a made-up reasons block either
   expect(t).not.toContain('open reasons')
 })
+
+/** ── description: a plain wrapped line under the title, absent draws nothing ── */
+
+test('the panel shows the description right under the title, uncapped; absent draws nothing', () => {
+  const desc = 'This task makes every dispatched card carry its lane. It reads the old rows once, fills the gap, and leaves finished rows alone. Reviewers can check it by opening any card. A fourth sentence. A fifth sentence follows here.'
+  const lines = picture({ ...FULL, description: desc }, 36).split('\n')
+  const first = lines.findIndex(l => l.includes('Backfill'))
+  const at = lines.findIndex(l => l.includes('This task makes'))
+  expect(at).toBeGreaterThan(first)
+  const t = allText(PlanTaskPanel(stubEls(), { ...FULL, description: desc }, 80))
+  expect(t).toContain('A fifth sentence follows here.')
+  expect(t).not.toContain('…')
+  // hidden when absent or empty: the row has no extra text and no label
+  const bare: PlanTask = { id: 'T9', title: 'Bare', status: 'planned', right: 'planned' }
+  expect(allText(PlanTaskPanel(stubEls(), bare, 80))).not.toContain('description')
+  expect(picture({ ...bare, description: undefined }, 80)).toBe(picture(bare, 80))
+})
+
+test('findPlanTask keeps a phase description when the phase opens as a task', () => {
+  const phases = planFromReply({ ok: true, id: 'p', phases: [{ id: 'D1.5', title: 'Phase', status: 'review', description: 'A phase opened in the panel.', tasks: [] }] }).phases
+  expect(findPlanTask(phases, 'D1.5')?.description).toBe('A phase opened in the panel.')
+  const none = planFromReply({ ok: true, id: 'p', phases: [{ id: 'D1.5', title: 'Phase', status: 'review', tasks: [] }] }).phases
+  expect(findPlanTask(none, 'D1.5')).not.toHaveProperty('description')
+})

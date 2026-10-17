@@ -30,6 +30,7 @@ const data = {
     {
       "id": "R1",
       "title": "Self-tests never write a real DB: one MK home variable, temp homes in every self-test, a write guard; matrixkoder registered by name",
+      "description": "Every self-test now runs in a throwaway home folder. A test run can no longer open or change the real database, so a failing run cannot damage saved plans.",
       "wave": 1,
       "deps": [],
       "status": "merged",
@@ -48,6 +49,7 @@ const data = {
         {
           "id": "R1.1",
           "title": "One home rule: mkdb.py ($MK_HOME) and mk-state.py ($MATRIXKODER_HOME) resolve the MK home the same way; selftest.sh and every --self-test set it to a temp dir",
+          "description": "Both home variables now point to the same folder. The helper accepts either name, so older scripts keep working without any change.",
           "status": "merged",
           "parent": "R1",
           "type": "task",

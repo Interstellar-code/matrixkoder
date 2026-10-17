@@ -21,6 +21,10 @@ const strList = (value: unknown): string[] =>
 const strOrNull = (value: unknown): string | null =>
   typeof value === 'string' && value !== '' ? value : null
 
+/** A description: trimmed, and null when it is not a string or only blanks. */
+const descOf = (value: unknown): string | null =>
+  typeof value === 'string' && value.trim() !== '' ? value.trim() : null
+
 /** The slot as an int: the store's column is TEXT ('3'), the reply says int. */
 const slotOf = (value: unknown): number | null => {
   if (typeof value === 'number' && Number.isFinite(value)) return Math.trunc(value)
@@ -48,6 +52,7 @@ export function routeFields(raw: Record<string, unknown>): {
   branch?: string | null
   updated?: string | null
   acceptance?: string | null
+  description?: string
   owned?: readonly string[]
   deps?: readonly string[]
   route?: PlanRoute | null
@@ -63,6 +68,7 @@ export function routeFields(raw: Record<string, unknown>): {
     branch?: string | null
     updated?: string | null
     acceptance?: string | null
+    description?: string
     owned?: readonly string[]
     deps?: readonly string[]
     route?: PlanRoute | null
@@ -80,6 +86,8 @@ export function routeFields(raw: Record<string, unknown>): {
   if (updated != null) out.updated = updated
   const acceptance = strOrNull(raw.acceptance)
   if (acceptance != null) out.acceptance = acceptance
+  const description = descOf(raw.description)
+  if (description != null) out.description = description
   const owned = strList(raw.owned)
   if (owned.length > 0) out.owned = owned
   const deps = strList(raw.deps)
@@ -406,6 +414,7 @@ export function planFromReply(reply: unknown): PlanView {
   const summed = sumCounts(reply.counts)
   const taskCount = summed > 0 ? summed : tasksInPhases
   const status = str(reply.status)
+  const description = descOf(reply.description)
   return {
     mock: false,
     plan: {
@@ -423,6 +432,7 @@ export function planFromReply(reply: unknown): PlanView {
       // plan renders exactly as before), so no row is added.
       ...(status === 'done' ? { roundFiles: 'archived · legacy tarball' } : {}),
       counts: `${taskCount} tasks · ${phases.length} phases`,
+      ...(description != null ? { description } : {}),
     },
     phases,
     footer: [`${phases.length} phases · all folded by default`, 'source project'],

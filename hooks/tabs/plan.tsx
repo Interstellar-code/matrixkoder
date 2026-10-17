@@ -34,6 +34,8 @@ export type PlanSub = {
   readonly status: string
   readonly right: string
   readonly rightRole?: PaletteRole
+  /** optional plain-English description (2-5 sentences), trimmed; absent when empty */
+  readonly description?: string
   /** V1.5: the routing fields the plans reply carries, when it has them */
   readonly slot?: number | null
   readonly pane?: string | null
@@ -62,6 +64,8 @@ export type PlanTask = {
   readonly right: string
   readonly short?: { readonly title: string; readonly right: string }
   readonly subs?: readonly PlanSub[]
+  /** optional plain-English description (2-5 sentences), trimmed; absent when empty */
+  readonly description?: string
   /** legacy: a wave row that itself folds (the Checkout fixture) */
   readonly rows?: readonly PlanTask[]
   /** V1.5: the routing fields the plans reply carries, when it has them */
@@ -107,6 +111,8 @@ export type PlanPhase = {
   readonly wave?: number
   readonly rows: readonly PlanTask[]
   readonly note?: string
+  /** optional plain-English description (2-5 sentences), trimmed; absent when empty */
+  readonly description?: string
   /** V1.5: routing fields a phase-level task row carries, when it has them */
   readonly slot?: number | null
   readonly pane?: string | null
@@ -131,6 +137,8 @@ export type PlanView = {
     readonly mergesTo: string
     readonly design: string
     readonly counts: string
+    /** optional plain-English description (2-5 sentences), trimmed; absent when empty */
+    readonly description?: string
     /** L7.2: where this plan's round files (briefs/reports/reviews) are — a DONE
      *  plan's were archived (the legacy tarball), `archived · legacy tarball
      *  <path>`; anything else reads `missing` (they are not in the project
@@ -171,6 +179,38 @@ export const planStatusGlyph = glyphOf
 export function clip(text: string, w: number): string {
   if (text.length <= w) return text
   return `${text.slice(0, Math.max(1, w) - 1)}…`
+}
+
+// shortcut: counts string length, not cell width, so wide CJK or emoji text overflows; upgrade if non-English text is needed
+/** `text` wrapped on spaces to `w` cols and cut to `max` lines; a cut ends its last line with `…`. */
+function wrapCap(text: string, w: number, max: number): string[] {
+  const width = Math.max(1, w)
+  const lines: string[] = []
+  let cur = ''
+  for (let word of text.split(/\s+/).filter(x => x !== '')) {
+    while (word.length > width) { // a word wider than the line is broken
+      if (cur !== '') lines.push(cur)
+      cur = ''
+      lines.push(word.slice(0, width))
+      word = word.slice(width)
+    }
+    if (cur === '') cur = word
+    else if (cur.length + 1 + word.length <= width) cur += ` ${word}`
+    else { lines.push(cur); cur = word }
+  }
+  if (cur !== '') lines.push(cur)
+  if (lines.length <= max) return lines
+  return [...lines.slice(0, max - 1), clip(`${lines[max - 1] ?? ''}…`, width)]
+}
+
+/** A description as plain muted lines (no label), at most `max` of them. */
+function Describe(els: Els, key: string, text: string, w: number, max: number): RenderElement {
+  const { Box, Text } = els
+  return (
+    <Box key={key} flexDirection="column">
+      {wrapCap(text, w, max).map((line, i) => <Text key={`${key}-${i}`} color={PALETTE.mut}>{line}</Text>)}
+    </Box>
+  )
 }
 
 const phaseKey = (id: string): string => `plan:phase:${id}`
@@ -302,6 +342,7 @@ function HeaderCard(els: Els, view: PlanView, W: number, compact: boolean): Rend
         {Chip(els, { label: compact ? clip(head.statusChip, 12) : head.statusChip, role: chipRole })}
       </Box>
       <Text color={ROLE.idle.fg} wrap="truncate-end">{clip(head.title, W)}</Text>
+      {head.description != null && Describe(els, 'plan-head-desc', head.description, W, 4)}
       {kv('created', head.created)}
       {kv('runs', head.runs)}
       {kv('merges to', head.mergesTo)}
@@ -373,6 +414,7 @@ function PhaseCard(els: Els, phase: PlanPhase, waveMates: readonly string[], W: 
         {Chip(els, { label: chipLabel, role: chipRole })}
         {!legacy && pauseButton(els, `plan-phase-pause-${phase.id}`, phase.status ?? '', state === 'building', act, 'phase', phase.id)}
       </Box>
+      {expanded && phase.description != null && Describe(els, `plan-desc-${phase.id}`, phase.description, W - 2, 3)}
       {strip}
       {expanded && !legacy && phase.rows.map((row, i) => TaskBlock(els, row, i === phase.rows.length - 1, W - 4, compact, ui, act))}
       {legacy && phase.rows.map(row => LegacyRow(els, row, W, compact, ui))}

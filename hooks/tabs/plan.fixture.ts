@@ -93,6 +93,7 @@ export const PLAN_REAL_FIXTURE: PlanView = {
     mergesTo: 'main',
     design: 'settings-tab · settings-wire · dashboard-v2 · mk-store',
     counts: '14 tasks · 5 phases',
+    description: 'This plan makes the settings screen and the saved plans use one database. Tests stop touching the real one, plans move into the project store, and the Plan tab gets list, detail and board views.',
   },
   phases: [
     { id: 'R1', title: 'Self-tests never write a real DB', status: 'merged', header: '✓ merged', headerRole: 'ok', wave: 1,
@@ -114,9 +115,11 @@ export const PLAN_REAL_FIXTURE: PlanView = {
         { id: 'D1.4', title: 'First real import', status: 'done', right: 'done' },
       ], note: 'lane mk-3 · merged to main' },
     { id: 'S1', title: 'Settings mapping and cleanup', status: 'building', header: '● building 22m', headerRole: 'live', wave: 3,
+      description: 'Each setting is matched to the folder it belongs in. Keys nobody reads any more are removed, and the sample data is brought back in line.',
       rows: [
         { id: 'S1.1', title: 'scope-home map', status: 'merged', right: 'r1' },
-        { id: 'S1.2', title: 'dead keys, fixture drift', status: 'building', right: 'building', round: 1 },
+        { id: 'S1.2', title: 'dead keys, fixture drift', status: 'building', right: 'building', round: 1,
+          description: 'Finds settings keys that no screen reads and deletes them. Also refreshes the sample data so it matches the real reply.' },
       ], note: 'lane mk-4 · opencode · 2 subagents' },
     { id: 'V1', title: 'Plan tab sub-tabs', status: 'building', header: '2 findings', headerRole: 'warn', wave: 3,
       rows: [
