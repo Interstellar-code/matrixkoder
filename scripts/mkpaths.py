@@ -713,6 +713,29 @@ def archive_dir(data, plan=None, home_arg=None):
     return os.path.join(base, "plans", plan) if plan else base
 
 
+RUNS_LEGACY_NAME = "runs-legacy"  # the read-only snapshot of runs/ that `store enable` leaves
+
+
+def plan_legacy_files(data, plan, run_ids):
+    """Existing legacy-layout files of a plan under its data dir: plans/<id>.md, the version files
+    plans/archive/<id>-v<digits>.md (exact id: never another plan whose id starts with this one)
+    and runs-legacy/<run> and runs/<run> for each run id."""
+    out = []
+    one = os.path.join(plans_dir(data), plan + ".md")
+    if os.path.isfile(one):
+        out.append(one)
+    vers = os.path.join(plans_dir(data), "archive")
+    if os.path.isdir(vers):
+        rx = re.compile(re.escape(plan) + r"-v\d+\.md")
+        out += [os.path.join(vers, n) for n in sorted(os.listdir(vers))
+                if rx.fullmatch(n) and os.path.isfile(os.path.join(vers, n))]
+    for run in run_ids:
+        for p in (os.path.join(data, RUNS_LEGACY_NAME, run), legacy_run_dir(data, run)):
+            if os.path.isdir(p):
+                out.append(p)
+    return out
+
+
 def plan_archives_dir(data, plan=None):
     """The plan-version folder. Migrated and named: <project>/plans/<plan>/archive (C2).
     Otherwise today's <data>/plans/archive — a migrated project with no plan id cannot be

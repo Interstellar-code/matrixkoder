@@ -531,12 +531,18 @@ approved_at, archived_path)`. `status`, `created`, `design` and `integration` ar
 `[[phase]]` blocks stay in `header_json`.
 
 `archived` is a DB-only `plans.status` (plan files keep draft/approved/running/done/parked).
-`mk-plan.py archive` sets it, keeps the prior status in `header_json.archived_from` (the folder's
-new path in `archived_to`) and moves the whole plan folder to `<project>/archive/plans/<plan-id>/`;
-`unarchive` reverses both. `mk-plan.py delete` takes an archived plan only: after a verified
+`mk-plan.py archive` sets it, keeps the prior status in `header_json.archived_from` and moves the
+plan's asset set under `<project>/archive/plans/<plan-id>/`, layout kept: the C2 plan folder as
+`folder/`, and from the data dir `plans/<id>.md`, `plans/archive/<id>-v<n>.md` (exact id) and
+`runs-legacy/<run>` / `runs/<run>` for each run of the plan. The moved (from, to) pairs are written
+to `header_json.archived_files` (with `archived_to`) before the move and `plans.archived_path` is
+rewritten to follow; `unarchive` restores each pair, refusing when an original is occupied or an
+archived item is missing. `archive` on an archived plan with no record and assets still in place
+finishes the move. `mk-plan.py delete` takes an archived plan only: after a verified
 `<project>/archive/<plan-id>-pre-delete-<UTC ts>.db` backup, one transaction deletes the rows of
 the plan's runs (`tasks`, `events`, `artifacts`, `acks`, `waits`, `change_log`, `evidence`,
-`risk_reasons`, `reconcile_due`), the `runs` rows and the `plans` row. The archived folder stays.
+`risk_reasons`, `reconcile_due`, `event_src`), the `runs` rows and the `plans` row. The archived
+files stay.
 
 | Header key | DB home |
 |---|---|

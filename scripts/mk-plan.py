@@ -15,11 +15,13 @@ Python 3 stdlib only.
                                    one plans row, no tasks, no file change
   archive <id> [--data DIR] [--home DIR]
                                    refused on a live run; sets plans.status=archived (prior status
-                                   in header_json.archived_from) and moves the whole plan folder to
+                                   in header_json.archived_from) and moves the plan's asset set (C2
+                                   folder, legacy plan/version files, run folders) under
                                    <project>/archive/plans/<id>/ (a taken name gets a stamp)
   unarchive <id> [--data DIR] [--home DIR]
-                                   archived plans only; moves the folder back (refused when the
-                                   original exists) and restores the prior status
+                                   archived plans only; puts every moved item back (refused when an
+                                   original is occupied or an archived item is missing) and
+                                   restores the prior status
   delete <id> [--data DIR] [--home DIR]
                                    archived plans only; refused on a live run or a held lane slot.
                                    Verified VACUUM INTO backup <project>/archive/<id>-pre-delete-
@@ -1579,9 +1581,10 @@ def _free_name(path):
     return out
 
 
-def _set_header(con, plan_id, status, move=None, **keys):
-    """Write plans.status and merge keys into header_json (a None value drops the key). move=(src,
-    dst) rewrites a plans.archived_path under src, so mk-state's plan fallback follows the folder."""
+def _set_header(con, plan_id, status, moves=(), **keys):
+    """Write plans.status and merge keys into header_json (a None value drops the key). moves is
+    [(src, dst)]: a plans.archived_path under a src is rewritten, so mk-state's plan fallback
+    follows the files."""
     row = con.execute("SELECT header_json, archived_path FROM plans WHERE id=?", (plan_id,)).fetchone()
     header = json.loads(row["header_json"] or "{}")
     for k, v in keys.items():
@@ -1590,8 +1593,10 @@ def _set_header(con, plan_id, status, move=None, **keys):
         else:
             header[k] = v
     path = row["archived_path"]
-    if move and path and (path == move[0] or path.startswith(move[0] + os.sep)):
-        path = move[1] + path[len(move[0]):]
+    for a, b in moves:
+        if path and (path == a or path.startswith(a + os.sep)):
+            path = b + path[len(a):]
+            break
     con.execute("UPDATE plans SET status=?, header_json=?, archived_path=? WHERE id=?",
                 (status, json.dumps(header), path, plan_id))
     con.commit()
@@ -1619,37 +1624,59 @@ def _sync_summary(db, data, home, plan_id, gone=False):
     return None
 
 
+def _asset_pairs(data, plan_id, runs, base):
+    """[(src, dst)] for every existing asset of the plan: the C2 folder (folder/), then the legacy
+    plan file, version files and run folders (their layout under <data> kept) — all under base."""
+    out = []
+    folder = mkpaths.plan_dir(data, plan_id)
+    if os.path.isdir(folder):
+        out.append((folder, os.path.join(base, "folder")))
+    for f in mkpaths.plan_legacy_files(data, plan_id, runs):
+        out.append((f, os.path.join(base, os.path.relpath(f, data))))
+    return out
+
+
+def _move_all(pairs):
+    for src, dst in pairs:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.move(src, dst)
+
+
 def archive_plan(plan_id, data, home):
-    """Mark the plan archived (prior status in header_json.archived_from, the destination in
-    archived_to), then move the whole plan folder to <project>/archive/plans/<id>. The row is
-    written BEFORE the move: a crash leaves archived_to pointing where the folder is going, and a
-    re-run finishes an interrupted move. A completed archive is refused, never moved again."""
+    """Mark the plan archived (prior status in header_json.archived_from), then move its asset set
+    — the C2 folder and the legacy plan files and run folders — into <project>/archive/plans/<id>.
+    The pairs go into header_json (archived_to, archived_files) BEFORE the move, so a crash leaves
+    unarchive a correct pointer and a re-run finishes the move. An archive whose recorded
+    destination exists and has nothing left to move is refused; one with no record whose assets
+    still sit in place is repaired."""
     data, home, con, row, runs = _open_plan_store(plan_id, data, home, "archive")
     db = _mkdb()
     try:
         _refuse_live(con, plan_id, "archive")
-        src = mkpaths.plan_dir(data, plan_id)
         header = json.loads(row["header_json"] or "{}")
         done_at = header.get("archived_to")
-        if row["status"] == "archived":
-            if done_at and os.path.isdir(done_at):
-                raise Fail([f"plan {plan_id} is already archived at {done_at}"])
-            if not os.path.isdir(src):
+        if row["status"] == "archived" and done_at:
+            pairs = [(a, b) for a, b in header.get("archived_files") or [] if os.path.exists(a)]
+            if not pairs:
+                if os.path.isdir(done_at):
+                    raise Fail([f"plan {plan_id} is already archived at {done_at}"])
+                pairs = _asset_pairs(data, plan_id, runs, done_at)  # recorded dir lost: nothing moved yet
+            keep = {}
+        else:
+            base = _free_name(mkpaths.archive_dir(data, plan_id, home))
+            pairs = _asset_pairs(data, plan_id, runs, base)
+            if row["status"] == "archived" and not pairs:
                 raise Fail([f"plan {plan_id} is already archived"])
-        moved = None
-        if os.path.isdir(src):
-            dst = done_at if row["status"] == "archived" and done_at else \
-                _free_name(mkpaths.archive_dir(data, plan_id, home))
-            keep = {} if row["status"] == "archived" else {"archived_from": row["status"] or "done"}
-            _set_header(con, plan_id, "archived", move=(src, dst), archived_to=dst, **keep)
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.move(src, dst)
-            moved = dst
-        elif row["status"] != "archived":
-            _set_header(con, plan_id, "archived", archived_from=row["status"] or "done")
+            keep = {"archived_from": header.get("archived_from") or row["status"] or "done"} \
+                if row["status"] != "archived" else {}
+            keep.update(archived_to=base if pairs else None,
+                        archived_files=[list(p) for p in pairs] if pairs else None)
+        if pairs or row["status"] != "archived":
+            _set_header(con, plan_id, "archived", moves=pairs, **keep)
+        _move_all(pairs)
     finally:
         con.close()
-    out = {"ok": True, "plan": plan_id, "moved": moved}
+    out = {"ok": True, "plan": plan_id, "moved": [dst for _, dst in pairs] or None}
     err = _sync_summary(db, data, home, plan_id)
     if err:
         out["warnings"] = [err]
@@ -1657,30 +1684,46 @@ def archive_plan(plan_id, data, home):
 
 
 def unarchive_plan(plan_id, data, home):
-    """Move the archived folder back and restore the prior status (default done). The archived
-    folder must exist, except for an unmigrated project, which never had one."""
+    """Put every recorded asset back where it came from (header_json.archived_files; a plan archived
+    before that record keeps the single archived folder -> C2 folder pair) and restore the prior
+    status. Refused, naming them, when an original path is occupied or an archived item is missing.
+    An unmigrated plan with no folder and no record just changes status."""
     data, home, con, row, runs = _open_plan_store(plan_id, data, home, "unarchive")
     db = _mkdb()
     try:
         if row["status"] != "archived":
             raise Fail([f"plan {plan_id} is not archived (status {row['status']!r})"])
         header = json.loads(row["header_json"] or "{}")
-        src = header.get("archived_to") or mkpaths.archive_dir(data, plan_id, home)
-        dst = mkpaths.plan_dir(data, plan_id)
-        moved = None
-        if os.path.isdir(src):
-            if os.path.exists(dst):
-                raise Fail([f"refusing to unarchive {plan_id}: {dst} already exists"])
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.move(src, dst)
-            moved = dst
-        elif header.get("archived_to") or mkpaths.migrated_slug(data=data, root=home):
-            raise Fail([f"refusing to unarchive {plan_id}: archived folder {src} is missing"])
-        _set_header(con, plan_id, header.get("archived_from") or "done", move=(src, dst),
-                    archived_from=None, archived_to=None)
+        pairs = [tuple(p) for p in header.get("archived_files") or []]
+        if not pairs:
+            src = header.get("archived_to") or mkpaths.archive_dir(data, plan_id, home)
+            if os.path.isdir(src) or header.get("archived_to") or mkpaths.migrated_slug(data=data, root=home):
+                pairs = [(mkpaths.plan_dir(data, plan_id), src)]
+        todo, bad = [], []
+        for orig, arch in pairs:
+            if os.path.exists(arch):
+                if os.path.exists(orig):
+                    bad.append(f"original {orig} already exists")
+                else:
+                    todo.append((arch, orig))
+            elif not os.path.exists(orig):  # neither side: lost; orig present alone = restored already
+                bad.append(f"archived item {arch} is missing")
+        if bad:
+            raise Fail([f"refusing to unarchive {plan_id}: " + "; ".join(bad)])
+        _move_all(todo)
+        top = header.get("archived_to")
+        for arch, _ in todo:  # drop the folders the move left empty, up to the archive root
+            d = os.path.dirname(arch)
+            while top and (d + os.sep).startswith(top + os.sep) \
+                    and os.path.isdir(d) and not os.listdir(d):
+                os.rmdir(d)
+                d = os.path.dirname(d)
+        _set_header(con, plan_id, header.get("archived_from") or "done",
+                    moves=[(b, a) for a, b in pairs],
+                    archived_from=None, archived_to=None, archived_files=None)
     finally:
         con.close()
-    out = {"ok": True, "plan": plan_id, "moved": moved}
+    out = {"ok": True, "plan": plan_id, "moved": [dst for _, dst in todo] or None}
     err = _sync_summary(db, data, home, plan_id)
     if err:
         out["warnings"] = [err]
@@ -2957,11 +3000,12 @@ def self_test():
         out = mk("delete", "imp6", "--data", data, "--home", home, code=2)
         assert "archive it first" in " ".join(out["errors"]) and plans_rows("imp6")[0] == 1, out
         out = mk("archive", "imp6", "--data", data, "--home", home)
-        assert out["ok"] and out["moved"] is None, out
+        assert out["ok"] and len(out["moved"]) == 1 and not os.path.exists(live), out  # legacy plan file moved
         out = mk("delete", "imp6", "--data", data, "--home", home)
         assert out["ok"] and out["plan"] == "imp6" and out["purged"]["plans"] == 1, out
         assert os.path.isfile(out["backup"]) and "imp6-pre-delete-" in out["backup"], out
-        assert os.path.isfile(live) and plans_rows("imp6")[0] == 0
+        assert os.path.isfile(mkpaths.archive_dir(data, "imp6", home) + "/plans/imp6.md")  # never unlinked
+        assert plans_rows("imp6")[0] == 0
 
         # 7. live run refused (archive and delete); a held lane slot refuses delete; MK_ARCHIVE_FAIL
         # leaves every row; a full purge leaves no row naming the plan and another plan's rows stay.
@@ -3047,61 +3091,102 @@ def self_test():
         assert chk.execute("SELECT COUNT(*) FROM runs WHERE plan='imp7'").fetchone()[0] == 1
         chk.close()
 
-        # 8. archive -> unarchive round trip on a plan with a folder (the data dir here is not
-        # migrated, so build the folder by hand): status, folder and archived_from come back.
-        f9 = os.path.join(plans_dir, "imp9.md")
-        open(f9, "w").write(plan_text(plan='plan = "imp9"', phases=phase("P1") + "\n"))
-        assert mk("import", f9, "--data", data, "--home", home)["ok"]
+        # 8. asset set: archive moves the C2 folder, plans/<id>.md, plans/archive/<id>-v<n>.md and the
+        # run folders (layout kept) and nothing of an id-prefix plan; unarchive restores them
+        # byte-identical; a completed archive is refused; a taken archive name gets a stamp.
+        def put(path, text):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            open(path, "w").write(text)
+
+        def snap(paths):
+            out = {}
+            for q in paths:
+                for dp, _, fs in os.walk(q) if os.path.isdir(q) else [(os.path.dirname(q), 0, [os.path.basename(q)])]:
+                    for f in fs:
+                        out[os.path.join(dp, f)] = open(os.path.join(dp, f), "rb").read()
+            return out
+
+        def seed(pid, status=None):
+            f = os.path.join(plans_dir, pid + ".md")
+            put(f, plan_text(plan=f'plan = "{pid}"', phases=phase("P1") + "\n"))
+            assert mk("import", f, "--data", data, "--home", home)["ok"]
+            con = project_con()
+            con.execute("UPDATE plans SET status=? WHERE id=?", (status, pid))
+            con.execute("INSERT INTO runs(id, plan, plan_version, branch, status, stage) VALUES (?,?,0,'b','done','x')",
+                        (pid + "run", pid))
+            con.commit()
+            con.close()
+
+        seed("imp9", "parked")
+        seed("imp9-extra", "done")  # shares the id prefix: must stay untouched
+        pdir = mkpaths.plan_dir(data, "imp9")
+        put(os.path.join(pdir, "assets", "a.txt"), "asset\n")
+        put(os.path.join(pdir, "plan.md"), "x\n")
+        v1, v2 = (os.path.join(plans_dir, "archive", f"imp9-v{n}.md") for n in (1, 2))
+        put(v1, "v1\n"), put(v2, "v2\n")
+        put(os.path.join(plans_dir, "archive", "imp9-extra-v1.md"), "decoy\n")
+        put(os.path.join(data, mkpaths.RUNS_LEGACY_NAME, "imp9run", "r.txt"), "legacy run\n")
+        put(os.path.join(data, "runs", "imp9run", "y.txt"), "run\n")
         con = project_con()
-        con.execute("UPDATE plans SET status='parked' WHERE id='imp9'")
+        con.execute("UPDATE plans SET archived_path=? WHERE id='imp9'", (v2,))
         con.commit()
         con.close()
-        pdir = mkpaths.plan_dir(data, "imp9")
-        os.makedirs(os.path.join(pdir, "assets"))
-        open(os.path.join(pdir, "plan.md"), "w").write("x\n")
+        decoys = [os.path.join(plans_dir, "imp9-extra.md"), os.path.join(plans_dir, "archive", "imp9-extra-v1.md")]
+        assets = [pdir, os.path.join(plans_dir, "imp9.md"), v1, v2,
+                  os.path.join(data, mkpaths.RUNS_LEGACY_NAME, "imp9run"), os.path.join(data, "runs", "imp9run")]
+        before_assets, before_decoys = snap(assets), snap(decoys)
         out = mk("archive", "imp9", "--data", data, "--home", home)
-        dst = mkpaths.archive_dir(data, "imp9", home)
-        assert out["moved"] == dst and os.path.isfile(os.path.join(dst, "plan.md")), out
-        assert not os.path.exists(pdir)
+        base = mkpaths.archive_dir(data, "imp9", home)
+        assert len(out["moved"]) == 6 and all(m.startswith(base + os.sep) for m in out["moved"]), out
+        assert not any(os.path.exists(q) for q in assets), "an asset stayed behind"
+        assert snap(decoys) == before_decoys, "an id-prefix plan's files were touched"
+        assert os.path.isfile(os.path.join(base, "folder", "assets", "a.txt"))
+        assert os.path.isfile(os.path.join(base, "plans", "archive", "imp9-v2.md"))
+        assert os.path.isfile(os.path.join(base, mkpaths.RUNS_LEGACY_NAME, "imp9run", "r.txt"))
         con = project_con()
-        r9 = con.execute("SELECT status, header_json FROM plans WHERE id='imp9'").fetchone()
+        r9 = con.execute("SELECT status, header_json, archived_path FROM plans WHERE id='imp9'").fetchone()
         con.close()
-        assert r9["status"] == "archived" and json.loads(r9["header_json"])["archived_from"] == "parked"
-        out = mk("archive", "imp9", "--data", data, "--home", home, code=2)  # already archived
-        assert "already archived" in " ".join(out["errors"]), out
-        os.makedirs(pdir)
-        out = mk("archive", "imp9", "--data", data, "--home", home, code=2)  # both folders present
-        assert "already archived at" in " ".join(out["errors"]) and os.path.isdir(dst), out
-        os.rename(dst, dst + ".away")
-        out = mk("unarchive", "imp9", "--data", data, "--home", home, code=2)  # archived folder gone
-        assert "missing" in " ".join(out["errors"]), out
-        os.rename(dst + ".away", dst)
-        out = mk("unarchive", "imp9", "--data", data, "--home", home, code=2)  # original exists
-        assert "already exists" in " ".join(out["errors"]), out
-        os.rmdir(pdir)
+        h9 = json.loads(r9["header_json"])
+        assert r9["status"] == "archived" and h9["archived_from"] == "parked" and h9["archived_to"] == base
+        assert len(h9["archived_files"]) == 6 and r9["archived_path"] == os.path.join(base, "plans", "archive", "imp9-v2.md")
+        out = mk("archive", "imp9", "--data", data, "--home", home, code=2)  # completed: refused
+        assert "already archived at" in " ".join(out["errors"]), out
+        put(os.path.join(plans_dir, "imp9.md"), "squatter\n")
+        out = mk("unarchive", "imp9", "--data", data, "--home", home, code=2)  # original occupied
+        assert "already exists" in " ".join(out["errors"]) and "imp9.md" in " ".join(out["errors"]), out
+        os.remove(os.path.join(plans_dir, "imp9.md"))
+        os.rename(os.path.join(base, "plans", "archive", "imp9-v1.md"), os.path.join(base, "away"))
+        out = mk("unarchive", "imp9", "--data", data, "--home", home, code=2)  # archived item gone
+        assert "missing" in " ".join(out["errors"]) and "imp9-v1.md" in " ".join(out["errors"]), out
+        os.rename(os.path.join(base, "away"), os.path.join(base, "plans", "archive", "imp9-v1.md"))
         out = mk("unarchive", "imp9", "--data", data, "--home", home)
-        assert out["moved"] == pdir and os.path.isdir(os.path.join(pdir, "assets")), out
-        assert not os.path.exists(dst)
+        assert len(out["moved"]) == 6 and not os.path.exists(base), out
+        assert snap(assets) == before_assets, "unarchive did not restore the files byte-identical"
+        assert snap(decoys) == before_decoys
         con = project_con()
-        r9 = con.execute("SELECT status, header_json FROM plans WHERE id='imp9'").fetchone()
+        r9 = con.execute("SELECT status, header_json, archived_path FROM plans WHERE id='imp9'").fetchone()
         con.close()
-        assert r9["status"] == "parked" and "archived_from" not in json.loads(r9["header_json"])
+        h9 = json.loads(r9["header_json"])
+        assert r9["status"] == "parked" and not {"archived_from", "archived_to", "archived_files"} & set(h9)
+        assert r9["archived_path"] == v2
         out = mk("unarchive", "imp9", "--data", data, "--home", home, code=2)  # not archived now
         assert "not archived" in " ".join(out["errors"]), out
 
-        # a taken archive name is never overwritten: the new folder gets a stamped name
-        fa = os.path.join(plans_dir, "impa.md")
-        open(fa, "w").write(plan_text(plan='plan = "impa"', phases=phase("P1") + "\n"))
-        assert mk("import", fa, "--data", data, "--home", home)["ok"]
-        taken = mkpaths.archive_dir(data, "impa", home)
-        os.makedirs(taken)
-        open(os.path.join(taken, "old.md"), "w").write("older\n")
-        os.makedirs(mkpaths.plan_dir(data, "impa"))
-        open(os.path.join(mkpaths.plan_dir(data, "impa"), "plan.md"), "w").write("new\n")
-        out = mk("archive", "impa", "--data", data, "--home", home)
-        assert out["moved"] != taken and out["moved"].startswith(taken + "-"), out
+        # repair: already 'archived' with no record and the legacy files still in place -> the move
+        # happens; a second archive then refuses; a taken archive name gets a stamp, never overwritten
+        seed("impb", "archived")
+        taken = mkpaths.archive_dir(data, "impb", home)
+        put(os.path.join(taken, "old.md"), "older\n")
+        out = mk("archive", "impb", "--data", data, "--home", home)
+        assert len(out["moved"]) == 1 and out["moved"][0].startswith(taken + "-"), out  # plan file only
         assert open(os.path.join(taken, "old.md")).read() == "older\n"
-        assert os.path.isfile(os.path.join(out["moved"], "plan.md"))
+        assert not os.path.exists(os.path.join(plans_dir, "impb.md"))
+        con = project_con()
+        hb = json.loads(con.execute("SELECT header_json FROM plans WHERE id='impb'").fetchone()[0])
+        con.close()
+        assert out["moved"][0].startswith(hb["archived_to"] + os.sep) and hb["archived_to"].startswith(taken + "-")
+        out = mk("archive", "impb", "--data", data, "--home", home, code=2)
+        assert "already archived at" in " ".join(out["errors"]), out
 
         # D1.1 columns: filled when present, harmless when absent
         cols_data = os.path.join(tmp, "store-cols")
@@ -3238,12 +3323,13 @@ def self_test():
         assert os.path.isdir(os.path.join(proj, "plans", "migplan", "assets")), \
             "the no-op approve dropped the plan folder's assets/"
         out = mk("archive", "migplan", "--data", mig_data, "--home", home)
-        assert out["ok"] and out["moved"] == os.path.join(proj, "archive", "plans", "migplan"), out
-        assert os.path.isfile(os.path.join(out["moved"], "plan.md")) and os.path.isdir(os.path.join(out["moved"], "assets"))
+        arch = os.path.join(proj, "archive", "plans", "migplan")
+        assert out["ok"] and out["moved"] == [os.path.join(arch, "folder")], out
+        assert os.path.isfile(os.path.join(arch, "folder", "plan.md")) and os.path.isdir(os.path.join(arch, "folder", "assets"))
         assert not os.path.exists(os.path.join(proj, "plans", "migplan"))
         out = mk("delete", "migplan", "--data", mig_data, "--home", home)
         assert out["ok"] and os.path.dirname(out["backup"]) == os.path.join(proj, "archive"), out
-        assert os.path.isfile(os.path.join(proj, "archive", "plans", "migplan", "plan.md")), "delete unlinked the archived folder"
+        assert os.path.isfile(os.path.join(arch, "folder", "plan.md")), "delete unlinked the archived folder"
         # nothing was written under the repo's .matrixkoder
         assert tree_hash(mig_data) == before, "a migrated mk-plan wrote under the repo .matrixkoder"
 
