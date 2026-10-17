@@ -2,6 +2,23 @@
 
 All notable changes to this project. Format: Keep a Changelog; versions: SemVer.
 
+## [0.6.4] - 2026-10-17
+
+### Added
+- **dashboard:** confirm before plan archive (b589827)
+- **dashboard:** wire plan archive and delete to mk-plan.py (f2d8eb2)
+- **plan:** archive, unarchive and delete-after-archive (8e64269)
+
+### Fixed
+- **plan:** delete also purges rows keyed by the plan id (064f675)
+- **plan:** detect child-row writes between delete backup and purge (86d55cf)
+- **plan:** archive moves legacy-layout plan files (6b61c41)
+- **plan:** harden archive and delete after review (391142d)
+
+### Other
+- **dashboard:** WIP overview and dashboard changes (unfinished) (b1f24e5)
+- **dashboard:** cover plan action state and routing (7dd7068)
+
 ## [0.6.3] - 2026-10-17
 
 ### Added
