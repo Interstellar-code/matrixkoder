@@ -15,7 +15,7 @@
     "wake": { "title": "Wake on events", "type": "boolean", "default": false, "description": "Submit prompt when lanes encounter verifying, blocked, quota, stalled or provider" },
     "stopGuard": { "title": "Stop guard", "type": "boolean", "default": false, "description": "Block a stop once per set of RED/REWORK/DUE rows in an orchestrator checkout of a fidelity run (never in a lane or solo)" },
     "mode": { "title": "Mode", "type": "string", "options": ["orchestrator", "solo"], "default": "orchestrator", "description": "Solo runs no orchestration: no lane sweep, build in this session" },
-    "defaultTab": { "title": "Default tab", "type": "string", "options": ["overview", "lanes", "plan", "usage", "events", "waiting", "old", "settings"], "default": "old", "description": "The dashboard tab the pane opens on" },
+    "defaultTab": { "title": "Default tab", "type": "string", "options": ["overview", "lanes", "plan", "usage", "events", "waiting", "settings"], "default": "overview", "description": "The dashboard tab the pane opens on" },
     "hiddenTabs": { "title": "Hidden tabs", "type": "string", "default": "", "description": "Comma-separated dashboard tabs to hide (Settings is never hidden)" },
     "raster": { "title": "Raster bars", "type": "boolean", "default": true, "description": "Draw Raster bars; off uses the eighth-block fallback" }
   }

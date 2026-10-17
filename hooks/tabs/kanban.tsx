@@ -13,6 +13,7 @@ import { NARROW, STATUS_COLOR } from './ui'
 import { Chip } from './kit'
 import { KANBAN_COLUMNS, KANBAN_FIXTURE } from './kanban.fixture'
 import type { KanbanCard } from './kanban.fixture'
+import { ROLE } from './palette'
 
 type Els = Elements[keyof Elements]
 
@@ -274,7 +275,7 @@ function cardRow(els: Els, card: KanbanCard, nowIso: string, width: number): Ren
   const color = badge ? 'text' : (STATUS_COLOR[card.status] ?? 'text')
   return (
     <Box key={`${card.project}/${card.run}/${card.task}`} flexDirection="row">
-      {badge ? <Text color="red" bold={true} dimColor={false}>{BADGE}</Text> : null}
+      {badge ? <Text color={ROLE.err.fg} bold={true} dimColor={false}>{BADGE}</Text> : null}
       <Text color={color} wrap="truncate">{line}</Text>
     </Box>
   )
@@ -298,8 +299,8 @@ export function KanbanTab(els: Els, view: KanbanView, cols: number, nowIso: stri
   const inner = Math.max(8, width - (compact ? 0 : 2))
   return (
     <Box flexDirection="column" width={cols}>
-      {view.mock ? <Text bold={true} color="warning">MOCK · fixture data · not this run</Text> : null}
-      {errorLine != null ? <Text color="yellow" bold={true}>{errorLine}</Text> : null}
+      {view.mock ? <Text bold={true} color={ROLE.warn.fg}>MOCK · fixture data · not this run</Text> : null}
+      {errorLine != null ? <Text color={ROLE.warn.fg} bold={true}>{errorLine}</Text> : null}
       <Text dimColor={true}>{cut(
         `Needs you ${view.filters.needsYou ? 'on' : 'off'} · project ${view.filters.project ?? 'all'}${view.slow ? ' · slow' : ''}`,
         width,

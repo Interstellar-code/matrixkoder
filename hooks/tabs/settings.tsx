@@ -464,7 +464,7 @@ function rowCtx(f: SettingsField, W: number, ui: TabUi | undefined, noHk: true |
 // ---------- the render
 
 /** a plain section's border: lighter than the line token so every card reads as a box on a terminal */
-const EDGE = '#5b6776'
+const EDGE = PALETTE.edge
 
 /** a card header (Settings.dc.html `.h`): bold upper-case in the muted ink, the
  *  note dim on the right. */
@@ -515,7 +515,7 @@ export function SettingsTab(els: Els, view: SettingsView, cols: number, ui?: Tab
 
   return (
     <Box flexDirection="column">
-      {view.mock && <Text bold={true} color="warning">MOCK · fixture data · not this run</Text>}
+      {view.mock && <Text bold={true} color={ROLE.warn.fg}>MOCK · fixture data · not this run</Text>}
       {ScopeBar(els, view, cols, scopeId, ui, noHk)}
       {view.groups.some(g => g.scope === scopeId && g.rows.some(r => r.layered === true)) && SubBar(els, view, subOf(ui), ui)}
       <Box flexDirection="row" gap={1} backgroundColor={PALETTE.field} paddingX={1} marginTop={1} marginBottom={1}>
@@ -766,7 +766,7 @@ function ModelsCards(els: Els, view: SettingsView, W: number, ui: TabUi | undefi
           <Box key={`set-agent-${cat.id}`} flexDirection="column" width={W}>
             <Box flexDirection="row" justifyContent="space-between" gap={1}>
               <Box flexDirection="row" gap={1}>
-                <Text bold={true} color="subtle">{cat.name}</Text>
+                <Text bold={true} color={PALETTE.mut}>{cat.name}</Text>
                 <Text dimColor={true}>{clip(cat.provider, provBudget)}</Text>
               </Box>
               {chip}

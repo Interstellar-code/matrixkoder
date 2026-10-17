@@ -219,6 +219,8 @@ function taskOf(raw: unknown): PlanTask | null {
   const type = strOrNull(raw.type)
   const round = typeof raw.round === 'number' && Number.isFinite(raw.round) ? raw.round : undefined
   const verdict = strOrNull(raw.verdict)
+  const lastCommit = strOrNull(raw.last_commit)
+  const findings = typeof raw.findings === 'number' && Number.isFinite(raw.findings) ? raw.findings : undefined
   subs.sort(byTaskId)
   return {
     id: raw.id, title: str(raw.title), status, right: status, subs,
@@ -226,6 +228,8 @@ function taskOf(raw: unknown): PlanTask | null {
     ...(type != null ? { type } : {}),
     ...(round !== undefined ? { round } : {}),
     ...(verdict != null ? { verdict } : {}),
+    ...(lastCommit != null ? { last_commit: lastCommit } : {}),
+    ...(findings !== undefined ? { findings } : {}),
   }
 }
 
@@ -421,7 +425,7 @@ export function planFromReply(reply: unknown): PlanView {
       counts: `${taskCount} tasks · ${phases.length} phases`,
     },
     phases,
-    footer: [`phases ${phases.length}`],
+    footer: [`${phases.length} phases · all folded by default`, 'source project'],
   }
 }
 

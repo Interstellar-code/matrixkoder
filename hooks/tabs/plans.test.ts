@@ -59,8 +59,20 @@ function nodesOf(n: unknown, type: string): Node[] {
   return out
 }
 
-const allText = (n: unknown): string =>
-  nodesOf(n, 'Text').map(t => (t.children ?? []).map(c => (typeof c === 'string' ? c : '')).join('')).join('\n')
+// visible text in draw order: Text children plus the name Buttons (plan rows `plans-detail-*`, run cards `plans-run-<id>`)
+const isName = (key: string): boolean => key.startsWith('plans-detail-') || (key.startsWith('plans-run-') && !/^plans-run-(open|pause)-/.test(key))
+const allText = (n: unknown): string => {
+  const out: string[] = []
+  const walk = (node: unknown): void => {
+    if (typeof node !== 'object' || node === null) return
+    const cur = node as Node
+    if (cur.type === 'Text') out.push((cur.children ?? []).map(c => (typeof c === 'string' ? c : '')).join(''))
+    if (cur.type === 'Button' && isName(String(cur.props?.key))) out.push(String(cur.props?.label))
+    for (const c of cur.children ?? []) walk(c)
+  }
+  walk(n)
+  return out.join('\n')
+}
 
 function press(drawn: unknown, key: string): void {
   const b = nodesOf(drawn, 'Button').find(x => String(x.props?.key) === key)
@@ -162,7 +174,11 @@ test('Plans list: the filter Segments narrow the list', () => {
 
 test('Plans list: pressing a row sets plans:sel and plan:sub', () => {
   const ui = new Map<string, string>()
-  press(PlansTab(stubEls, PLANS_FIXTURE, 80, ui), 'plans-detail-settings-plans-db')
+  const drawn = PlansTab(stubEls, PLANS_FIXTURE, 80, ui)
+  // the plan name is part of the press target, not only the one-cell ›
+  const btn = nodesOf(drawn, 'Button').find(x => String(x.props?.key) === 'plans-detail-settings-plans-db')
+  expect(String(btn?.props?.label)).toBe('settings-plans-db ›')
+  press(drawn, 'plans-detail-settings-plans-db')
   expect(ui.get('plans:sel')).toBe('settings-plans-db')
   expect(ui.get('plan:sub')).toBe('detail')
 })

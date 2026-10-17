@@ -9,8 +9,8 @@
 // arm a raw Esc without a kit change, so the press is the close that works.
 // Pure render — no $, no state, no scripts (C1).
 import type { Elements, RenderElement } from 'claude-code'
-import { ActionButton, Card, Chip } from './kit'
-import { ROLE } from './palette'
+import { ActionButton, Card, Chip, BoxButton } from './kit'
+import { PALETTE, ROLE } from './palette'
 import { clip, planStatusGlyph, planStatusRole } from './plan'
 import type { PlanPhase, PlanSub, PlanTask } from './plan'
 
@@ -84,10 +84,15 @@ export function PlanTaskPanel(els: Els, row: PlanTask, cols: number, onClose?: (
   const owned = row.owned ?? []
   const shown = owned.slice(0, 8)
   const route = row.route
-  return Card(els, {}, (
+  return Card(els, { role: 'live' }, (
     <Box key={`plan-task-panel-${row.id}`} flexDirection="column">
-      <Text bold={true}>{`${row.id} · ${row.status}`}</Text>
-      <Text color="subtle" wrap="wrap">{row.title}</Text>
+      <Box flexDirection="row" justifyContent="space-between" gap={1}>
+        <Text bold={true}>{`${row.id} · ${row.status}`}</Text>
+        {BoxButton(els, { key: `plan-task-close-top-${row.id}`, label: '✕ close', onPress: () => { onClose?.() } })}
+      </Box>
+      <Text color={PALETTE.mut} wrap="wrap">{row.title}</Text>
+      {row.last_commit != null && fieldRow(els, 'commit', row.last_commit.slice(0, 7))}
+      {row.findings != null && row.findings > 0 && fieldRow(els, 'findings', String(row.findings))}
       {row.type != null && fieldRow(els, 'type', row.type)}
       {row.round != null && fieldRow(els, 'round', String(row.round))}
       {row.verdict != null && fieldRow(els, 'verdict', row.verdict)}

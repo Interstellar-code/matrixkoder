@@ -8,7 +8,7 @@
 // voice: Text/Box with palette fills and round borders for cards, chips and
 // headers; native Button for everything pressable.
 import type { Elements, RenderChildren, RenderElement } from 'claude-code'
-import { PALETTE, ROLE } from './palette'
+import { PALETTE, ROLE, THEME } from './palette'
 import type { PaletteRole } from './palette'
 
 type Els = Elements[keyof Elements]
@@ -62,7 +62,7 @@ export function Section(els: Els, opts: { label: string; right?: string }): Rend
   const { Box, Text } = els
   return (
     <Box flexDirection="row" justifyContent="space-between">
-      <Text bold={true} color="subtle">{opts.label.toUpperCase()}</Text>
+      <Text bold={true} color={PALETTE.mut}>{`${THEME.name === 'matrix' ? '> ' : ''}${opts.label.toUpperCase()}`}</Text>
       {opts.right != null && <Text dimColor={true}>{opts.right}</Text>}
     </Box>
   )
@@ -137,6 +137,29 @@ export function ActionButton(els: Els, spec: ActionSpec): RenderElement {
   )
 }
 
+/** The one button look: a filled one-row block around a plain press (a border would cost a
+ *  row above and below). Fill carries the tone: primary/on blue, danger red, warn amber,
+ *  default the resting button fill. The label colour stays the engine's. */
+export function BoxButton(els: Els, opts: { key: string; label: string; tone?: ActionTone; on?: boolean; hotkey?: string; onPress: () => void }): RenderElement {
+  const { Box } = els
+  const tone = opts.tone ?? 'default'
+  const bg = opts.on === true || tone === 'primary' ? ROLE.live.tint
+    : tone === 'danger' ? PALETTE.redTint
+      : tone === 'warn' ? PALETTE.ambTint
+        : PALETTE.btn
+  // rounded ends: half-disc caps (◖ ◗) in the fill colour either side of the filled label
+  const { Text } = els
+  return (
+    <Box key={`${opts.key}-edge`} flexDirection="row">
+      <Text color={bg}>◖</Text>
+      <Box backgroundColor={bg} paddingX={1}>
+        {ActionButton(els, { key: opts.key, glyph: opts.label, word: '', plain: true, ...(opts.hotkey == null ? { noHotkey: true as const } : { hotkey: opts.hotkey }), tone: tone === 'danger' || tone === 'warn' ? 'default' : tone, onPress: opts.onPress })}
+      </Box>
+      <Text color={bg}>◗</Text>
+    </Box>
+  )
+}
+
 /** A boxed strip segment (Settings.dc.html's `.seg button` / `.sub`): a plain
  *  press on a filled cell — the blue tint when `on`, the resting button fill
  *  otherwise (`flat`: no fill, for the scope strip's inactive scopes). Drawn
@@ -144,7 +167,7 @@ export function ActionButton(els: Els, spec: ActionSpec): RenderElement {
 export function Segment(els: Els, opts: { key: string; label: string; on: boolean; flat?: boolean; hotkey?: string; static?: true; boxed?: true; onPress: () => void }): RenderElement {
   const { Box, Text } = els
   const edge = (inner: RenderElement): RenderElement => opts.boxed === true
-    ? <Box key={`${opts.key}-edge`} borderStyle="round" borderColor={opts.on ? ROLE.live.fg : '#5b6776'}>{inner}</Box>
+    ? <Box key={`${opts.key}-edge`} borderStyle="round" borderColor={opts.on ? ROLE.live.fg : PALETTE.edge}>{inner}</Box>
     : inner
   // the picked segment of a strip needs no press: plain bold blue text on the tint (a Button's label colour is the engine's)
   if (opts.on && opts.static === true) {

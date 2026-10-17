@@ -179,4 +179,4 @@ The plugin runs `scripts/mk-lane-event.py event` for every pane status change an
 - **No pane at all**: `/mk open`, and check `autoOpen` in settings.
 - **Plugin changes not showing**: restart the session, or start Claude Code with `--plugin-dir`.
 - **A command is denied**: it matched a guard. Use a safe alternative, or turn `guards` off.
-- **Dashboard says "Run /mk init <feature-name>"**: that text is real — the dashboard NoRun view still prints it (`hooks/dashboard.tsx`). There is no `/mk init` command; use `/mk setup` for the wizard and ask the model to "orchestrate …" to start a run.
+- **Dashboard says "No active orchestration run."**: the Overview tab (the default) shows this when the project has no live run. Start one by asking the model to "orchestrate …"; `/mk setup` opens the wizard for a new project.

@@ -292,7 +292,7 @@ export function LanesTab(els: Els, view: LanesView, cols: number, ui?: TabUi): R
   const { Box, Text } = els
   return (
     <Box flexDirection="column">
-      <Text bold={true} color="warning">MOCK · fixture data · not this run</Text>
+      {view.mock && <Text bold={true} color={ROLE.warn.fg}>MOCK · fixture data · not this run</Text>}
       <Text dimColor={true}>{hintRow(view.summary, view.summaryRight, cols)}</Text>
       {view.lanes.map(lane => (
         <Box key={lane.task} flexDirection="column">

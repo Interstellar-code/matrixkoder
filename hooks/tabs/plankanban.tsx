@@ -7,7 +7,7 @@
 // sub-tab changes.
 import type { Elements, RenderElement } from 'claude-code'
 import { NARROW } from './ui'
-import { ActionButton, Card, Chip, Section, Segment } from './kit'
+import { ActionButton, Card, Chip, Segment } from './kit'
 import { PALETTE, ROLE } from './palette'
 import type { PaletteRole } from './palette'
 import { timeInStatus } from './kanban'
@@ -52,6 +52,8 @@ export type PlanKanbanCard = {
   readonly phase: string
   readonly verdict: string | null
   readonly age: string
+  /** raw task `findings` count (backend adds it); absent shows no chip */
+  readonly findings?: number
   readonly slot?: number | null
   readonly route?: PlanRoute | null
   /** F.1 contract: derived risk (int 1-5) and its critical flag. Absent/unknown
@@ -107,6 +109,7 @@ export function planKanbanView(detail: unknown, nowIso = ''): PlanKanbanView {
         phase: raw.id,
         verdict: verdictRaw === '' ? null : verdictRaw,
         age: ageOf(str(task.updated), nowIso),
+        ...(typeof task.findings === 'number' && Number.isInteger(task.findings) && task.findings > 0 ? { findings: task.findings } : {}),
         // routeFields already maps risk (1-5), critical and open_reasons —
         // an old row out of the range or without them maps to absent.
         ...routeFields(task),
@@ -185,7 +188,8 @@ function planCard(els: Els, card: PlanKanbanCard, col: PlanKanbanColumn, inner: 
   const riskTag = typeof card.risk === 'number' && card.risk >= 1 && card.risk <= 5 ? `R${card.risk}` : ''
   const riskRole: PaletteRole = riskTag === '' ? 'idle' : card.risk! <= 2 ? 'ok' : card.risk! >= 4 ? 'warn' : 'idle'
   const criticalTag = card.critical === true ? '!!' : ''
-  const tagRoom = inner - (card.phase.length + 2) - 1 - (card.age !== '' ? 1 + card.age.length : 0)
+  const findTag = col === 'NEEDS YOU' && card.findings != null ? `${card.findings} ${card.findings === 1 ? 'finding' : 'findings'}` : ''
+  const tagRoom = inner - (card.phase.length + 2) - 1 - (findTag !== '' ? findTag.length + 3 : 0) - (card.age !== '' ? 1 + card.age.length : 0)
     - (riskTag !== '' ? 1 + riskTag.length : 0) - (criticalTag !== '' ? 1 + criticalTag.length : 0)
   const fits = (tag: string): boolean => tag !== '' && tag.length <= tagRoom
   const rowTag = fits(full) ? full : fits(short) ? short : ''
@@ -202,15 +206,16 @@ function planCard(els: Els, card: PlanKanbanCard, col: PlanKanbanColumn, inner: 
           onPress: () => { if (ui != null) ui.set('plan:task', ui.get('plan:task') === card.id ? '' : card.id) },
         })}
       </Box>
-      <Text color="subtle" wrap="truncate-end">{cut(card.title, inner)}</Text>
-      <Box flexDirection="row" gap={1}>
+      <Text {...(col === 'ON MAIN' ? { dimColor: true } : { color: 'subtle' })} wrap="truncate-end">{cut(card.title, inner)}</Text>
+      {col !== 'ON MAIN' && <Box flexDirection="row" gap={1}>
         {Chip(els, { label: card.phase, role: 'idle' })}
+        {col === 'NEEDS YOU' && card.findings != null && Chip(els, { label: findTag, role: 'warn' })}
         {criticalTag !== '' && <Text color={ROLE.err.fg}>{criticalTag}</Text>}
         {riskTag !== '' && Chip(els, { label: riskTag, role: riskRole, solid: card.critical === true })}
         {rowTag !== '' && <Text dimColor={true}>{rowTag}</Text>}
         {card.age !== '' && <Text dimColor={true}>{card.age}</Text>}
-      </Box>
-      {ownTag !== '' && <Text dimColor={true}>{ownTag}</Text>}
+      </Box>}
+      {col !== 'ON MAIN' && ownTag !== '' && <Text dimColor={true}>{ownTag}</Text>}
     </Box>
   ))
 }
@@ -219,12 +224,19 @@ function planCard(els: Els, card: PlanKanbanCard, col: PlanKanbanColumn, inner: 
  *  mockup's dim `none` when empty. `width` is the column's cell budget. */
 function planColumn(els: Els, col: PlanKanbanColumn, cards: readonly PlanKanbanCard[], width: number, fixedWidth: boolean, ui?: TabUi): RenderElement {
   const { Box, Text } = els
-  const inner = Math.max(1, width - 4) // Card: border 2 + paddingX 1 each side
+  // a lane: its own bordered box, header (glyph + name in the column colour, count right),
+  // a rule, then the cards stacked tight; an empty lane says so dimly
+  const inner = Math.max(1, width - 8) // lane border 2 + paddingX 2, card border 2 + paddingX 2
+  const ruleW = Math.max(1, width - 4)
   return (
-    <Box key={col} flexDirection="column" gap={1} {...(fixedWidth ? { width } : {})}>
-      {Section(els, { label: col, right: String(cards.length) })}
+    <Box key={col} flexDirection="column" borderStyle="round" borderColor={cards.length > 0 && col !== 'ON MAIN' && col !== 'PLANNED' ? COLUMN_FG[col] : PALETTE.line} paddingX={1} {...(fixedWidth ? { width } : {})}>
+      <Box flexDirection="row" justifyContent="space-between" gap={1}>
+        <Text bold={true} color={COLUMN_FG[col]}>{`${COLUMN_GLYPH[col]} ${col}`}</Text>
+        <Text color={PALETTE.mut}>{String(cards.length)}</Text>
+      </Box>
+      <Text color={PALETTE.line}>{'─'.repeat(ruleW)}</Text>
       {cards.length === 0
-        ? <Text dimColor={true}>none</Text>
+        ? <Text dimColor={true}>— nothing here</Text>
         : cards.map(card => planCard(els, card, col, inner, ui))}
     </Box>
   )
@@ -262,7 +274,7 @@ export function PlanKanbanTab(els: Els, view: PlanKanbanView, cols: number, ui?:
   const phase = ui?.get('plankanban:phase') ?? ''
   const shown = phase === '' ? view.cards : view.cards.filter(card => card.phase === phase)
   const side = planKanbanSideBySide(cols)
-  const colW = side ? Math.floor((cols - 3) / 4) : cols
+  const colW = side ? Math.floor((cols - 3) / 4) : cols - 1
   const byColumn = (col: PlanKanbanColumn): readonly PlanKanbanCard[] => shown.filter(card => columnOfTask(card) === col)
   return (
     <Box flexDirection="column" gap={1}>
@@ -276,7 +288,10 @@ export function PlanKanbanTab(els: Els, view: PlanKanbanView, cols: number, ui?:
           {PLAN_KANBAN_COLUMNS.map(col => planColumn(els, col, byColumn(col), colW, false, ui))}
         </Box>
       )}
-      <Text dimColor={true}>{`${shown.length} tasks · this plan only · source mk.db`}</Text>
+      <Box flexDirection="row" justifyContent="space-between" gap={1}>
+        <Text dimColor={true}>{`${shown.length} tasks · same cards as k, this plan only`}</Text>
+        <Text dimColor={true}>source project</Text>
+      </Box>
     </Box>
   )
 }

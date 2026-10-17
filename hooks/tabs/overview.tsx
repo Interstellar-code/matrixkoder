@@ -2,14 +2,14 @@
 // the Main.dc.html / Narrow.dc.html Overview boards redrawn from the V0 kit —
 // five Cards (Plan, Lanes, Usage, Waiting, Recent), each budgeted for `cols - 4`
 // (a Card eats a border and a padding cell per side). Fixture data unchanged
-// (C6); the Old tab's fixture names (OverviewData, OverviewView, overviewView,
+// (C6); the fixture names (OverviewData, OverviewView, overviewView,
 // OverviewTab) stay the contract the pane and the tests build against.
 import type { Elements } from 'claude-code'
 import { AGENT_COLOR, AGENT_GLYPH, NARROW } from './ui'
 import { ActionButtons, Card, Chip, Section, SmoothBar } from './kit'
 import type { ActionSpec } from './kit'
 import { gradientBar, laneStrip, pickBar } from './raster'
-import { PALETTE, ROLE } from './palette'
+import { PALETTE, ROLE, THEME } from './palette'
 import type { PaletteRole } from './palette'
 import { OVERVIEW_FIXTURE } from './overview.fixture'
 
@@ -72,7 +72,7 @@ const DONE = new Set(['done', 'merged'])
 /** test-visible alias: the F.8 not-done-count tests read the set directly */
 export const DONE_STATUSES_FOR_TEST = DONE
 /** the usage bar's heat stops (Main.dc.html's heat(): green → amber → red). */
-const USAGE_STOPS: readonly string[] = [PALETTE.grn, PALETTE.amb, PALETTE.red]
+const USAGE_STOPS = (): readonly string[] => [PALETTE.grn, PALETTE.amb, PALETTE.red] // at draw time, for the theme
 /** the usage row's fixed columns: the 8-cell name, then the numbers' width. */
 const NAME_W = 8
 const NUM_W = { wide: 17, compact: 10 } as const
@@ -109,17 +109,19 @@ function wrap(text: string, w: number): string[] {
 }
 
 /** Pure render: elements only, no $, no state (C1); `ui` is the C12 view state. */
-export function OverviewTab(els: Els, view: OverviewData, cols: number, ui?: TabUi) {
+export function OverviewTab(els: Els, view: OverviewData & { mock?: boolean }, cols: number, ui?: TabUi) {
   const { Box, Text } = els
   const compact = cols < NARROW
   const W = Math.max(1, cols - 4) // the Card's content width (border + padding per side)
+  const matrix = THEME.name === 'matrix'
   return (
-    <Box flexDirection="column" gap={1}>
-      <Text bold={true} color="warning">MOCK · fixture data · not this run</Text>
+    <Box flexDirection="column" gap={1} {...(matrix ? { backgroundColor: PALETTE.bg, paddingX: 1, paddingY: 1 } : {})}>
+      {matrix && <Text bold={true} color={ROLE.live.fg}>{'> MATRIXKODER :: OVERVIEW ▌'}</Text>}
+      {view.mock !== false && <Text bold={true} color={ROLE.warn.fg}>MOCK · fixture data · not this run</Text>}
       {PlanCard(els, view, W, compact)}
       {LanesCard(els, view.lanes, W, compact)}
       {UsageCard(els, view.usage, W, compact)}
-      {WaitingCard(els, view.waiting, W, compact, ui)}
+      {view.waiting.question !== '' && WaitingCard(els, view.waiting, W, compact, ui)}
       {RecentCard(els, view.recent, W)}
     </Box>
   )
@@ -180,6 +182,7 @@ function LanesCard(els: Els, lanes: OverviewData['lanes'], W: number, compact: b
   return Card(els, {}, (
     <Box flexDirection="column">
       {Section(els, { label: 'Lanes', right: String(lanes.length) })}
+      {lanes.length === 0 && <Text dimColor={true}>none live</Text>}
       {lanes.map(lane => {
         const name = `${AGENT_GLYPH[lane.agent] ?? '⌂'} ${lane.agent.toUpperCase()}`
         const word = compact ? lane.short : lane.note
@@ -224,7 +227,7 @@ function UsageCard(els: Els, usage: OverviewData['usage'], W: number, compact: b
             {pickBar(
               els,
               `overview-usage-${u.short}`,
-              gradientBar(u.pct, barW, u.exhausted ? [PALETTE.red] : USAGE_STOPS),
+              gradientBar(u.pct, barW, u.exhausted ? [PALETTE.red] : USAGE_STOPS()),
               SmoothBar(els, { pct: u.pct, width: barW, role: role(u) }),
             )}
             <Text color={u.exhausted ? ROLE.err.fg : undefined} bold={u.exhausted}>{clip(nums, numW)}</Text>
@@ -281,6 +284,7 @@ function RecentCard(els: Els, recent: OverviewData['recent'], W: number) {
   return Card(els, {}, (
     <Box flexDirection="column">
       {Section(els, { label: 'Recent' })}
+      {recent.length === 0 && <Text dimColor={true}>nothing yet</Text>}
       {recent.map(ev => (
         <Box key={`${ev.t}${ev.text}`} flexDirection="row" gap={1}>
           <Text dimColor={true}>{ev.t}</Text>

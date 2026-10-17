@@ -9,6 +9,7 @@ import { NARROW } from './ui'
 import { Card, Chip, Section } from './kit'
 import { EVENTS_FIXTURE } from './events.fixture'
 import type { PaletteRole } from './palette'
+import { ROLE } from './palette'
 
 type Els = Elements[keyof Elements]
 
@@ -62,10 +63,11 @@ export function EventsTab(els: Els, view: EventsView, cols: number) {
   const headerSide = `last ${String(rows.length)}`
   return (
     <Box flexDirection="column">
-      <Text bold={true} color="warning">MOCK · fixture data · not this run</Text>
+      {view.mock && <Text bold={true} color={ROLE.warn.fg}>MOCK · fixture data · not this run</Text>}
       {Card(els, {}, (
         <Box flexDirection="column">
           {Section(els, { label: 'Events', right: headerSide })}
+          {rows.length === 0 && <Text dimColor={true}>nothing yet</Text>}
           {rows.map((ev, i) => {
             // compact uses the Narrow artboard's own short pair for the row
             const typeWord = compact ? ev.short?.type ?? ev.type : ev.type

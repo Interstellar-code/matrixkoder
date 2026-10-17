@@ -6,7 +6,7 @@ import type { On, ConfigRow } from 'claude-code'
 import { snapshotCount, DATA_DIR, NOW, PROJECT_DIR, RUN_PATH, RUNS_INDEX, USAGE_PATH, agentOf, agentsOf, mockFs, mockWorld, paneProps, sessionStart, sessionStartIn, setRun, setUsage, tasksOf, worldFiles, worldFixtures } from './testkit'
 import type { Files, MockWorld } from './testkit'
 import { parseYamlAgents } from './data'
-import { DONE_STATUSES_FOR_TEST, waitingPane, waitingPaneView } from './dashboard'
+import { waitingPane, waitingPaneView } from './dashboard'
 import { mockTabCounts, waitingCount } from './tabs/header'
 import { RUN_SNAPSHOT } from './fixtures/run-snapshot'
 
@@ -82,9 +82,7 @@ test('C4/L5: the store reply renders the pane with the file views deleted', asyn
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   expect(await ui.find({ text: 'L5 fixtures' }), 'the run name comes from the store').toBeTruthy()
-  expect(await ui.find({ text: /▶ Next: verify T1 gates/ }), 'the next-action line').toBeTruthy()
-  expect(await ui.find({ text: /Merge T1 now\?/ }), 'the wait block').toBeTruthy()
-  expect(await ui.find({ text: /T1/ }), 'a task row').toBeTruthy()
+  expect(await ui.find({ text: /verify T1 gates/ }), 'the next-action line').toBeTruthy()
   const snap = store.argv.find(a => a.includes('run-snapshot'))
   expect(snap?.[0]).toBe('python3')
   expect(snap?.slice(2)).toEqual(['--data', DATA_DIR, 'run-snapshot', '--json'])
@@ -132,35 +130,6 @@ test('C4/L5: the store wins over the file views when both are present', async ($
   expect(await ui.find({ text: 'from-the-file-view' }), 'the file view is not consulted').toBeUndefined()
 })
 
-test('renders section titles, a task row and the agy pool sub-row', { plugins: [worldFixtures] }, async ($, on) => {
-  const files = worldFiles()
-  mockFs(on, files)
-  mockWorld(on)
-  await $.session.start(sessionStart())
-  for (const surface of ['terminal', 'desktop'] as const) {
-    const ui = await $.ui.mount({ plugin: 'matrixkoder', surface, component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-    for (const title of ['Run', 'Plan', 'Lanes', 'Usage', 'Waiting on you', 'Recent']) {
-      expect(await ui.find({ type: 'Text', text: title }), `${surface} ${title}`).toBeTruthy()
-    }
-    expect(await ui.find({ text: /F6/ }), `${surface} task row`).toBeTruthy()
-    expect(await ui.find({ text: /claude-gpt/ }), `${surface} agy pool sub-row`).toBeTruthy()
-    expect(await ui.find({ text: /review/ }), `${surface} status column`).toBeTruthy()
-    expect(await ui.find({ text: /workflows-v2/ }), `${surface} feature`).toBeTruthy()
-    expect(await ui.find({ text: /main@82252eb/ }), `${surface} branch@head`).toBeTruthy()
-  }
-})
-
-test('compact variant at 36 cols drops the week column and shortens the stage', { plugins: [worldFixtures] }, async ($, on) => {
-  mockFs(on, worldFiles())
-  mockWorld(on)
-  await $.session.start(sessionStart())
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  await ui.redraw(paneProps(36))
-  expect(await ui.find({ text: 'stg 7/12' })).toBeTruthy()
-  expect(await ui.find({ text: 'week' })).toBeUndefined()
-  expect(await ui.find({ text: /design\+configure/ })).toBeTruthy() // title still drawn, truncated by wrap
-})
-
 test('inline placement shows the /tui fullscreen hint', { plugins: [worldFixtures] }, async ($, on) => {
   mockFs(on, worldFiles())
   mockWorld(on)
@@ -183,7 +152,7 @@ test('first-run state when no .matrixkoder dir exists', async ($, on) => {
   expect(await ui.find({ type: 'Text', text: 'Plan' })).toBeUndefined()
 })
 
-test('no active run state lists recent runs and keeps usage', { plugins: [worldFixtures] }, async ($, on) => {
+test('no active run state lists recent runs', { plugins: [worldFixtures] }, async ($, on) => {
   const files = worldFiles()
   mockFs(on, files)
   const clock = mockWorld(on)
@@ -193,8 +162,6 @@ test('no active run state lists recent runs and keeps usage', { plugins: [worldF
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   expect(await ui.find({ text: 'No active orchestration run.' })).toBeTruthy()
   expect(await ui.find({ text: /mk-p0/ })).toBeTruthy()
-  expect(await ui.find({ type: 'Text', text: 'Usage' })).toBeTruthy()
-  expect(await ui.find({ type: 'Text', text: 'Lanes' })).toBeUndefined() // run sections hidden without a run
 })
 
 // ---------- fix1: resilience, data-dir rule, /mk args, timers, usage rows ----------
@@ -295,17 +262,6 @@ test('the root store alone names the data dir when projects.json is absent', asy
   expect(await ui.find({ text: /Welcome to MatrixKoder/ })).toBeUndefined()
 })
 
-test('MATRIXKODER_HOME moves the global dir: usage.json is read from it', { plugins: [worldFixtures] }, async ($, on) => {
-  const files = worldFiles()
-  files['/srv/mkhome/usage.json'] = (files[USAGE_PATH] ?? '').replace('claude-gpt', 'srv-pool') // distinguishable from the fixture copy under HOME
-  mockFs(on, files)
-  mockWorld(on, { env: { MATRIXKODER_HOME: '/srv/mkhome' } })
-  await $.session.start(sessionStart())
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  expect(await ui.find({ text: /srv-pool/ })).toBeTruthy()
-  expect(await ui.find({ text: /claude-gpt/ })).toBeUndefined()
-})
-
 test('MATRIXKODER_DATA overrides the walk', async ($, on) => {
   const files: Record<string, string> = {
     '/tmp/alt-data/runs/index.json': JSON.stringify([{ id: 'alt', feature: 'alt-feature', status: 'active', started: '2026-10-07T16:00:00+02:00' }]),
@@ -317,98 +273,6 @@ test('MATRIXKODER_DATA overrides the walk', async ($, on) => {
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   expect(await ui.find({ text: /workflows-v2/ })).toBeTruthy() // run from the env dir, not the walk
   expect(await ui.find({ text: /Welcome to MatrixKoder/ })).toBeUndefined()
-})
-
-test('missing feature/branch does not break compact rendering', { plugins: [worldFixtures] }, async ($, on) => {
-  const files = worldFiles()
-  setRun(files, run => {
-    delete run.feature
-    delete run.branch
-  })
-  mockFs(on, files)
-  mockWorld(on)
-  await $.session.start(sessionStart())
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  await ui.redraw(paneProps(36))
-  expect(await ui.find({ text: 'stg 7/12' })).toBeTruthy()
-})
-
-test('compact cuts the title to 14 chars and shows round/elapsed', { plugins: [worldFixtures] }, async ($, on) => {
-  const files = worldFiles()
-  setRun(files, run => {
-    const tasks = tasksOf(run)
-    if (tasks[1]) tasks[1].title = 'design and configuration pass'
-    if (tasks[2]) tasks[2].updated = new Date(NOW - 12 * 60_000).toISOString()
-  })
-  mockFs(on, files)
-  mockWorld(on)
-  await $.session.start(sessionStart())
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  await ui.redraw(paneProps(36))
-  expect(await ui.find({ text: 'design and con' })).toBeTruthy()
-  expect(await ui.find({ text: /configuration pass/ })).toBeUndefined()
-  expect(await ui.find({ text: /review r2/ })).toBeTruthy()
-  expect(await ui.find({ text: /build 12m|building 12m/ })).toBeTruthy()
-})
-
-test('red only when the agent-level exhaustion says so; exhausted rows show the clearing date', { plugins: [worldFixtures] }, async ($, on) => {
-  const files = worldFiles()
-  setUsage(files, usage => {
-    const agents = agentsOf(usage)
-    delete agents.claude
-    delete agents.codex
-    delete agents.opencode
-    // agy carries ONLY the exhausted claude-gpt pool: no gemini, agent-level exhausted_until null
-    const agy = agentOf(usage, 'agy')
-    if (!agy) return
-    agy.exhausted_until = null
-    agy.five_hour = { used_pct: 100, resets_at: new Date(NOW + 10 * 24 * 3600_000).toISOString() }
-    const pools = agy.pools
-    agy.pools = typeof pools === 'object' && pools !== null ? { 'claude-gpt': (pools as Record<string, unknown>)['claude-gpt'] } : {}
-  })
-  mockFs(on, files)
-  mockWorld(on)
-  await $.session.start(sessionStart())
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  expect(await ui.find({ text: '⊘' })).toBeUndefined() // agent row not marked exhausted
-})
-
-test('exhausted agent row shows exhausted_until (10-…), not the 5h reset', { plugins: [worldFixtures] }, async ($, on) => {
-  const files = worldFiles()
-  setUsage(files, usage => {
-    const oc = agentOf(usage, 'opencode')
-    if (!oc) return
-    oc.exhausted_until = new Date(NOW + 10 * 24 * 3600_000).toISOString()
-    oc.five_hour = { used_pct: 100, resets_at: new Date(NOW + 3600_000).toISOString() }
-    if (typeof oc.pools === 'object' && oc.pools !== null) {
-      const def = (oc.pools as Record<string, Record<string, unknown>>).default
-      if (def) def.exhausted_until = oc.exhausted_until
-    }
-  })
-  mockFs(on, files)
-  mockWorld(on)
-  await $.session.start(sessionStart())
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  expect(await ui.find({ text: /10-1[0-9]/ })).toBeTruthy()
-  expect(await ui.find({ text: /1h00m/ })).toBeUndefined()
-})
-
-test('null primary 5h with sub-pools labels n/a, not 0%', { plugins: [worldFixtures] }, async ($, on) => {
-  const files = worldFiles()
-  setUsage(files, usage => {
-    const claude = agentOf(usage, 'claude')
-    if (!claude) return
-    claude.five_hour = null
-    if (typeof claude.pools === 'object' && claude.pools !== null) {
-      const def = (claude.pools as Record<string, Record<string, unknown>>).default
-      if (def) def.five_hour = null
-    }
-  })
-  mockFs(on, files)
-  mockWorld(on)
-  await $.session.start(sessionStart())
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  expect(await ui.find({ text: '  0%' })).toBeUndefined()
 })
 
 test('missing usage triggers the initial poll with the right argv', { plugins: [worldFixtures] }, async ($, on) => {
@@ -427,8 +291,6 @@ test('missing usage triggers the initial poll with the right argv', { plugins: [
   expect(first[0]).toBe('python3')
   expect(first[1]?.endsWith('scripts/mk-usage.py')).toBe(true)
   expect(first[2]).toBe('--once')
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  expect(await ui.find({ text: 'no ledger yet' })).toBeTruthy()
 })
 
 test('a project yaml scopes the usage poll: --providers from usage.providers', { plugins: [worldFixtures] }, async ($, on) => {
@@ -450,209 +312,6 @@ test('a project yaml scopes the usage poll: --providers from usage.providers', {
   expect(first[2]).toBe('--once')
   expect(first[3]).toBe('--providers')
   expect(first[4]).toBe('claude,codex,antigravity')
-})
-
-test('the usage section shows only the yaml agents; an enabled agent without a ledger entry gets a hint row', { plugins: [worldFixtures] }, async ($, on) => {
-  const files = worldFiles()
-  files[`${DATA_DIR}/matrixkoder.yaml`] = PROJECT_YAML
-  setUsage(files, usage => {
-    delete agentsOf(usage).opencode // enabled in the yaml, absent from the ledger
-  })
-  mockFs(on, files)
-  mockWorld(on)
-  await $.session.start(sessionStart())
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  expect(await ui.find({ text: 'claude (all)' }), 'claude row shown').toBeTruthy()
-  expect(await ui.find({ text: 'codex         ' }), 'codex disabled in the yaml: no row').toBeUndefined()
-  expect(await ui.find({ text: 'agy            ' }), 'agy disabled in the yaml: no row').toBeUndefined()
-  expect(await ui.find({ text: 'opencode      no usage — enable zai in CodexBar' }), 'opencode hint row').toBeTruthy()
-})
-
-test('fable with no 5h window renders — in the 5h column; claude main row reads claude (all); n/a only for a status n/a entry', { plugins: [worldFixtures] }, async ($, on) => {
-  const files = worldFiles()
-  setUsage(files, usage => {
-    const claude = agentOf(usage, 'claude')
-    const pools = claude?.pools
-    if (typeof pools === 'object' && pools !== null) {
-      const fable = (pools as Record<string, Record<string, unknown>>).fable
-      if (fable) fable.five_hour = null
-    }
-    const codex = agentOf(usage, 'codex')
-    if (codex) codex.status = 'n/a'
-  })
-  mockFs(on, files)
-  mockWorld(on)
-  await $.session.start(sessionStart())
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  expect(await ui.find({ text: 'claude (all)' }), 'main claude row covers all models').toBeTruthy()
-  expect(await ui.find({ text: '  n/a' }), 'a whole-entry n/a keeps n/a in the 5h column').toBeTruthy()
-  // walk the drawn tree: the fable sub-row's 5h column is '—', not n/a
-  const cols: string[] = []
-  let inRow = false
-  const walk = (n: unknown): void => {
-    if (typeof n !== 'object' || n === null) return
-    const node = n as { type?: string; children?: unknown[] }
-    if (node.type === 'Text' && Array.isArray(node.children)) {
-      const own = node.children.map(c => (typeof c === 'string' ? c : '')).join('')
-      if (own.startsWith('  └ fable')) inRow = true
-      else if (inRow) {
-        cols.push(own)
-        if (cols.length === 4) inRow = false // name, bar, 5h, week(+reset on the row's last Texts)
-      }
-    }
-    if (Array.isArray(node.children)) node.children.forEach(walk)
-  }
-  walk(await ui.drawn())
-  expect(cols[0]).toBe('░░░░░░░') // empty bar: no 5h value
-  expect(cols[1], 'fable 5h column').toBe('    —')
-  expect(cols.some(c => c === '  n/a'), 'no n/a on a pool row').toBe(false)
-  // compact keeps the plain agent name
-  await ui.redraw(paneProps(36))
-  expect(await ui.find({ text: 'claude (all)' })).toBeUndefined()
-})
-
-const U3_PROJECT_YAML = [
-  'data_dir: .matrixkoder/',
-  'agents:',
-  '  codex: { available: false, models: [] }',
-  '  opencode: { available: true, models: [zai-coding-plan/glm-4.7] }',
-  '  agy: { available: false, models: [] }',
-  '  claude: { available: true }',
-  '  herdr: { available: true }',
-  `  checked_at: "${new Date(NOW).toISOString()}"`,
-  'usage:',
-  '  source: codexbar',
-  '  poll_min: 5',
-  '  providers: [zai, opencodego, ollama]',
-].join('\n')
-
-function makeU3Usage(): string {
-  return JSON.stringify({
-    agents: {
-      claude: {
-        source: 'codexbar',
-        five_hour: { used_pct: 4, resets_at: new Date(NOW + 4 * 3600_000).toISOString() },
-        weekly: { used_pct: 52, resets_at: new Date(NOW + 90 * 3600_000).toISOString() },
-        exhausted_until: null,
-        available_pools: ['default', 'fable'],
-        pools: {
-          default: {
-            five_hour: { used_pct: 4, resets_at: new Date(NOW + 4 * 3600_000).toISOString() },
-            weekly: { used_pct: 52, resets_at: new Date(NOW + 90 * 3600_000).toISOString() },
-            exhausted_until: null,
-          },
-          fable: {
-            five_hour: { used_pct: 17, resets_at: new Date(NOW + 4 * 3600_000).toISOString() },
-            weekly: { used_pct: 17, resets_at: new Date(NOW + 90 * 3600_000).toISOString() },
-            exhausted_until: null,
-          },
-        },
-      },
-      agy: {
-        source: 'codexbar',
-        five_hour: { used_pct: 54, resets_at: new Date(NOW + 3600_000).toISOString() },
-        weekly: { used_pct: 52, resets_at: new Date(NOW + 6 * 24 * 3600_000).toISOString() },
-        exhausted_until: null,
-        available_pools: ['gemini'],
-        pools: {
-          gemini: {
-            five_hour: { used_pct: 54, resets_at: new Date(NOW + 3600_000).toISOString() },
-            weekly: { used_pct: 52, resets_at: new Date(NOW + 6 * 24 * 3600_000).toISOString() },
-            exhausted_until: null,
-          },
-          'claude-gpt': {
-            five_hour: { used_pct: 100, resets_at: new Date(NOW + 3600_000).toISOString() },
-            weekly: { used_pct: 100, resets_at: new Date(NOW + 6 * 24 * 3600_000).toISOString() },
-            exhausted_until: new Date(NOW + 6 * 24 * 3600_000).toISOString(),
-          },
-        },
-      },
-      codex: { source: 'codexbar', exhausted_until: null, available_pools: ['default'], pools: { default: { five_hour: null, weekly: null, exhausted_until: null } } },
-      opencode: {
-        source: 'codexbar',
-        five_hour: { used_pct: 0, resets_at: new Date(NOW + 4 * 3600_000).toISOString() },
-        weekly: { used_pct: 0, resets_at: new Date(NOW + 7 * 24 * 3600_000).toISOString() },
-        exhausted_until: null,
-        available_pools: ['go'],
-        pools: {
-          zai: {
-            five_hour: null,
-            weekly: null,
-            exhausted_until: null,
-            status: 'n/a',
-            error: 'No available fetch strategy for zai.',
-          },
-          go: {
-            five_hour: { used_pct: 0, resets_at: new Date(NOW + 4 * 3600_000).toISOString() },
-            weekly: { used_pct: 0, resets_at: new Date(NOW + 7 * 3600_000).toISOString() },
-            exhausted_until: null,
-          },
-          ollama: {
-            five_hour: null,
-            weekly: null,
-            exhausted_until: null,
-            status: 'n/a',
-            error: 'No Ollama session cookie found; sign in at ollama.com',
-          },
-        },
-      },
-    },
-  })
-}
-
-test('U3: opencode agent shows per-plan pools with n/a hints and project agents filter out agy/codex', { plugins: [worldFixtures] }, async ($, on) => {
-  const files = worldFiles()
-  files[`${DATA_DIR}/matrixkoder.yaml`] = U3_PROJECT_YAML
-  files['/fixtures/usage.json'] = files[USAGE_PATH] = makeU3Usage()
-  mockFs(on, files)
-  mockWorld(on)
-  await $.session.start(sessionStart())
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  const textOf = (n: unknown): string => {
-    if (typeof n === 'string') return n
-    if (typeof n !== 'object' || n === null) return ''
-    const node = n as { type?: string; children?: unknown[] }
-    if (node.type !== 'Text' || !Array.isArray(node.children)) return ''
-    return node.children.map(textOf).join('')
-  }
-  const texts: string[] = []
-  const walk = (n: unknown): void => {
-    if (typeof n !== 'object' || n === null) return
-    const node = n as { type?: string; children?: unknown[] }
-    if (node.type === 'Text') {
-      const own = textOf(n)
-      if (own) texts.push(own)
-    }
-    if (Array.isArray(node.children)) node.children.forEach(walk)
-  }
-  walk(await ui.drawn())
-  const usageText = texts.filter(t => /claude|opencode|zai|go|ollama|fable/.test(t)).join('\n')
-  expect(usageText).toContain('claude')
-  expect(usageText).toContain('  └ fable')
-  expect(usageText).toContain('opencode')
-  expect(usageText).toContain('  └ zai')
-  expect(usageText).toContain('set the z.ai key in CodexBar')
-  expect(usageText).toContain('  └ go')
-  expect(usageText).toContain('  └ ollama')
-  expect(usageText).toContain('sign in at ollama.com')
-  expect(usageText).not.toContain('agy')
-  expect(usageText).not.toContain('codex')
-})
-
-test('U3: a plan pool that reports usage shows bars, not its setup hint', { plugins: [worldFixtures] }, async ($, on) => {
-  const files = worldFiles()
-  files[`${DATA_DIR}/matrixkoder.yaml`] = U3_PROJECT_YAML
-  const usage = JSON.parse(makeU3Usage()) as { agents: { opencode: { pools: Record<string, unknown> } } }
-  usage.agents.opencode.pools.zai = { five_hour: { used_pct: 42, resets_at: new Date(NOW + 2 * 3600_000).toISOString() }, weekly: null, exhausted_until: null }
-  files['/fixtures/usage.json'] = files[USAGE_PATH] = JSON.stringify(usage)
-  mockFs(on, files)
-  mockWorld(on)
-  await $.session.start(sessionStart())
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  const drawn = JSON.stringify(await ui.drawn())
-  expect(drawn).not.toContain('set the z.ai key in CodexBar')
-  expect(drawn).toContain('42%')
-  expect(drawn).toContain('sign in at ollama.com') // ollama still has no numbers
 })
 
 test('two session.start arm exactly one refresh timer', { plugins: [worldFixtures] }, async ($, on) => {
@@ -681,6 +340,23 @@ test('/mk re-arms the refresh loop after /clear (session.end, no session.start)'
   expect(snapshotCount()).toBe(2) // /mk reloads at once
   await clock.advance(5000)
   expect(snapshotCount()).toBe(3) // and ticks again
+})
+
+test('an open pane re-arms the refresh loop after /clear without /mk (render self-heal)', { plugins: [worldFixtures] }, async ($, on) => {
+  const files = worldFiles()
+  mockFs(on, files)
+  const clock = mockWorld(on)
+  on('session.cwd', () => ({ value: '/tmp/mk-proj' }))
+  on('session.end', () => ({ sessionId: 's1' }))
+  await $.session.start(sessionStart())
+  await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: undefined } } as never)
+  await clock.advance(5000)
+  expect(snapshotCount()).toBe(1) // loop dead: only the start load
+  await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await clock.advance(0)
+  expect(snapshotCount()).toBe(2) // the render restarted the loop and reloaded
+  await clock.advance(5000)
+  expect(snapshotCount()).toBe(3) // and it ticks again
 })
 
 test('/mk args: open, close, setup, init and unknown', { plugins: [worldFixtures] }, async ($, on) => {
@@ -728,87 +404,6 @@ test('chip:false leaves the status line untouched', { plugins: [worldFixtures], 
 
 // ---------- fix2: live-pane bugs ----------
 
-test('▶ Next renders as one row: label and text in a single truncating Text', { plugins: [worldFixtures] }, async ($, on) => {
-  const files = worldFiles()
-  setRun(files, run => {
-    run.next = 'Re-review P4+P6 fixes, merge mk-int to main and tag the dashboard milestone'
-  })
-  mockFs(on, files)
-  mockWorld(on)
-  await $.session.start(sessionStart())
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  expect(await ui.find({ text: /▶ Next: Re-review P4\+P6/ })).toBeTruthy() // one row, label + text together
-  // find matches substrings of the whole tree, so walk it: no Text node may be
-  // the bare label — the label and the text share ONE truncating Text
-  const textOf = (n: unknown): string => {
-    if (typeof n === 'string') return n
-    if (typeof n !== 'object' || n === null) return ''
-    const node = n as { type?: string; children?: unknown[] }
-    if (node.type !== 'Text' || !Array.isArray(node.children)) return ''
-    return node.children.map(textOf).join('')
-  }
-  const texts: string[] = []
-  const walk = (n: unknown): void => {
-    if (typeof n !== 'object' || n === null) return
-    const node = n as { type?: string; children?: unknown[] }
-    if (node.type === 'Text') {
-      const own = textOf(n)
-      if (own) texts.push(own)
-    }
-    if (Array.isArray(node.children)) node.children.forEach(walk)
-  }
-  walk(await ui.drawn())
-  expect(texts.includes('▶ Next:')).toBe(false)
-  expect(texts.some(t => t.startsWith('▶ Next: Re-review'))).toBe(true)
-})
-
-test('todo boxes: in-progress [•] (review, merged), side states [!], done [✓]', { plugins: [worldFixtures] }, async ($, on) => {
-  mockFs(on, worldFiles())
-  mockWorld(on)
-  await $.session.start(sessionStart())
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  expect(await ui.find({ text: /\[•\]F6/ })).toBeTruthy() // review is in progress
-  expect(await ui.find({ text: /\[•\]W0/ })).toBeTruthy() // merged is still in progress
-  expect(await ui.find({ text: /\[!\]FIX6/ })).toBeTruthy() // stalled is a side state
-  expect(await ui.find({ text: /\[ \]X1/ })).toBeTruthy() // planned stays empty
-})
-
-test('todo boxes: done checks green', { plugins: [worldFixtures] }, async ($, on) => {
-  const files = worldFiles()
-  setRun(files, run => {
-    for (const t of tasksOf(run)) t.status = 'done'
-  })
-  mockFs(on, files)
-  mockWorld(on)
-  await $.session.start(sessionStart())
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  expect(await ui.find({ text: /\[✓\]W0/ })).toBeTruthy()
-})
-
-test('usage columns align: padded header, exact-width name column', { plugins: [worldFixtures] }, async ($, on) => {
-  mockFs(on, worldFiles())
-  mockWorld(on)
-  await $.session.start(sessionStart())
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  expect(await ui.find({ text: '   5h' })).toBeTruthy() // right-aligned 5-wide header
-  expect(await ui.find({ text: ' week' })).toBeTruthy()
-  expect(await ui.find({ text: '  └ claude-gpt' })).toBeTruthy() // sub-row label fills the 14-wide name column exactly
-  expect(await ui.find({ text: 'codex         ' })).toBeTruthy() // agent names pad to the same width
-})
-
-test('lanes fall back to live tasks when no lane is set', { plugins: [worldFixtures] }, async ($, on) => {
-  const files = worldFiles()
-  setRun(files, run => {
-    for (const t of tasksOf(run)) t.lane = null
-  })
-  mockFs(on, files)
-  mockWorld(on)
-  await $.session.start(sessionStart())
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  expect(await ui.find({ text: /∇ AGY/ })).toBeTruthy() // F8 building stands in with its agent glyph
-  expect(await ui.find({ text: 'none live' })).toBeUndefined()
-})
-
 test('/mk setup then closing the wizard shows the run again (no sticky first-run panel)', { plugins: [worldFixtures] }, async ($, on) => {
   mockFs(on, worldFiles())
   const clock = mockWorld(on)
@@ -820,9 +415,6 @@ test('/mk setup then closing the wizard shows the run again (no sticky first-run
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   expect(await ui.find({ text: /Welcome to MatrixKoder/ })).toBeUndefined()
   expect(await ui.find({ text: /workflows-v2/ })).toBeTruthy()
-  expect(await ui.find({ type: 'Text', text: 'Plan' })).toBeTruthy()
-  expect(await ui.find({ type: 'Text', text: 'Lanes' })).toBeTruthy()
-  expect(await ui.find({ text: 'Waiting on you' })).toBeTruthy()
 })
 
 test('parseYamlAgents accepts any indent >= 2 spaces, block style, and unparseable is null never []', () => {
@@ -867,30 +459,6 @@ test('parseYamlAgents accepts any indent >= 2 spaces, block style, and unparseab
   expect(parseYamlAgents('agents: []')).toBeNull()
   expect(parseYamlAgents('agents:\n')).toBeNull()
   expect(parseYamlAgents('no agents block here')).toBeNull()
-})
-
-test('U3 add-on: an agents block with all agents disabled shows no usage rows', { plugins: [worldFixtures] }, async ($, on) => {
-  const files = worldFiles()
-  files[`${DATA_DIR}/matrixkoder.yaml`] = [
-    'data_dir: .matrixkoder/',
-    'agents:',
-    '  codex: { available: false, models: [] }',
-    '  opencode: { available: false, models: [] }',
-    '  agy: { available: false, models: [] }',
-    '  claude: { available: false }',
-    '  herdr: { available: true }',
-    `  checked_at: "${new Date(NOW).toISOString()}"`,
-  ].join('\n')
-  mockFs(on, files)
-  mockWorld(on)
-  await $.session.start(sessionStart())
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  // the section still renders but no agent rows appear; herdr is never shown
-  expect(await ui.find({ type: 'Text', text: 'Usage' })).toBeTruthy()
-  expect(await ui.find({ text: 'claude' })).toBeUndefined()
-  expect(await ui.find({ text: /agy/ })).toBeUndefined()
-  expect(await ui.find({ text: /opencode/ })).toBeUndefined()
-  expect(await ui.find({ text: /codex/ })).toBeUndefined()
 })
 
 // ---------- H2B: lane sweep from the dashboard tick ----------
@@ -1139,11 +707,10 @@ test('two active runs: the store reply draws only the newest run, the older stay
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   expect(await ui.find({ text: /workflows-v2/ }), 'newest run header').toBeTruthy()
-  expect(await ui.find({ text: /wizard split/ }), 'newest plan list').toBeTruthy()
   expect(await ui.find({ text: /ui-polish/ }), 'the older active run has no document in the reply, so no block').toBeUndefined()
 })
 
-// ---------- S0: the tab bar, the Old tab and the six stub tabs ----------
+// ---------- S0: the tab bar and the tabs ----------
 
 const MOCK_ROW = /MOCK · fixture data · not this run/
 const mockRow = () => ({ text: MOCK_ROW })
@@ -1158,17 +725,16 @@ const TAB_BUTTONS = [
   { key: 'dash-tab-settings', name: 'Settings' },
 ] as const
 
-test('a fresh mount shows the Old tab: real run data and no MOCK row', { plugins: [worldFixtures] }, async ($, on) => {
+test('a fresh mount opens on Overview: real run data and no MOCK row', { plugins: [worldFixtures] }, async ($, on) => {
   mockFs(on, worldFiles())
   mockWorld(on)
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  expect(await ui.find({ text: /workflows-v2/ })).toBeTruthy() // today's pane under the bar
-  expect(await ui.find({ text: 'Old' })).toBeTruthy() // the Old tab button is drawn
+  expect(await ui.find({ text: /workflows-v2/ })).toBeTruthy() // the real run header
   expect(await ui.find(mockRow())).toBeUndefined()
 })
 
-test('every tab hotkey switches to that tab’s MOCK row and hides Old; 0 restores Old', { plugins: [worldFixtures] }, async ($, on) => {
+test('every tab hotkey switches to that tab’s MOCK row', { plugins: [worldFixtures] }, async ($, on) => {
   mockFs(on, worldFiles())
   mockWorld(on)
   await $.session.start(sessionStart())
@@ -1177,10 +743,6 @@ test('every tab hotkey switches to that tab’s MOCK row and hides Old; 0 restor
   for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban')) {
     await ui.press({ key })
     expect(await ui.find(mockRow()), `${name} MOCK row`).toBeTruthy()
-    expect(await ui.find({ text: /workflows-v2/ }), `${name} hides Old`).toBeUndefined()
-    await ui.press({ key: 'dash-tab-old' })
-    expect(await ui.find({ text: /workflows-v2/ }), 'Old is back').toBeTruthy()
-    expect(await ui.find(mockRow())).toBeUndefined()
   }
 })
 
@@ -1199,8 +761,6 @@ test('at 36 cols the tab bar drops to short labels and every tab still renders',
     await ui.press({ key })
     expect(await ui.find(mockRow()), `${key} renders narrow`).toBeTruthy()
   }
-  await ui.press({ key: 'dash-tab-old' })
-  expect(await ui.find({ text: 'stg 7/12' })).toBeTruthy() // Old renders narrow
 })
 
 test('the chosen tab survives a refresh tick', { plugins: [worldFixtures] }, async ($, on) => {
@@ -1212,7 +772,6 @@ test('the chosen tab survives a refresh tick', { plugins: [worldFixtures] }, asy
   expect(await ui.find(mockRow())).toBeTruthy()
   await clock.advance(5000) // the refresh tick reloads the snapshot atom
   expect(await ui.find(mockRow())).toBeTruthy() // the tab choice stands
-  expect(await ui.find({ text: /workflows-v2/ })).toBeUndefined()
 })
 
 // ---------- V0.4: the run header on every tab and the counted tab bar ----------
@@ -1226,12 +785,12 @@ const tabLabels = async (ui: { findAll: (q: { type: string }) => Promise<{ props
     .map(b => String(b.props.label))
 
 test('the mock tab counts read the fixtures: lanes, plan done/total, waiting only when open', async () => {
-  expect(mockTabCounts()).toEqual({ overview: '', lanes: '4', plan: '3/8', usage: '', events: '', waiting: '!1', kanban: '', old: '', settings: '' })
+  expect(mockTabCounts()).toEqual({ overview: '', lanes: '4', plan: '3/8', usage: '', events: '', waiting: '!1', kanban: '', settings: '' })
   expect(waitingCount(0)).toBe('') // LOW: a fixture with no open decision shows no count, never `!0`
   expect(waitingCount(2)).toBe('!2')
 })
 
-test('the run header sits above the tab bar on Old: name, stage chip and ▶ Next', { plugins: [worldFixtures] }, async ($, on) => {
+test('the run header sits above the tab bar: name, stage chip and ▶ Next', { plugins: [worldFixtures] }, async ($, on) => {
   mockFs(on, worldFiles())
   mockWorld(on)
   await $.session.start(sessionStart())
@@ -1239,9 +798,7 @@ test('the run header sits above the tab bar on Old: name, stage chip and ▶ Nex
   expect(await ui.find({ text: 'workflows-v2' }), 'run name').toBeTruthy()
   expect(await ui.find({ text: /7\/12 Verify/ }), 'stage chip').toBeTruthy()
   expect(await ui.find({ text: /▶ verify F6 gates/ }), 'the ▶ Next line').toBeTruthy()
-  expect(await ui.find({ text: ' MOCK ' }), 'Old is not marked MOCK').toBeUndefined()
-  expect(await ui.find({ text: /main@82252eb/ }), 'the Old pane under the header is unchanged').toBeTruthy()
-  expect(await ui.find({ text: '▶ Next: ' }), 'the Run section still prints its own Next label').toBeTruthy()
+  expect(await ui.find({ text: ' MOCK ' }), 'the real header is not marked MOCK').toBeUndefined()
 })
 
 test('every mock tab shows the fixture run header: name, stage chip, MOCK marker and ▶ Next', { plugins: [worldFixtures] }, async ($, on) => {
@@ -1251,7 +808,6 @@ test('every mock tab shows the fixture run header: name, stage chip, MOCK marker
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
   for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban')) {
-    await ui.press({ key: 'dash-tab-old' })
     await ui.press({ key })
     expect(await ui.find({ text: 'MATRIXKODER' }), `${name} shared brand header`).toBeTruthy()
     expect(await ui.find({ text: /ORCHESTRATOR/ }), `${name} mode chip`).toBeTruthy()
@@ -1259,7 +815,6 @@ test('every mock tab shows the fixture run header: name, stage chip, MOCK marker
     expect(await ui.find({ text: /6\/12 Watch/ }), `${name} stage chip`).toBeTruthy()
     expect(await ui.find({ text: ' MOCK ' }), `${name} MOCK marker`).toBeTruthy()
     expect(await ui.find({ text: /▶ watching P4 R1/ }), `${name} ▶ Next`).toBeTruthy()
-    expect(await ui.find({ text: /workflows-v2/ }), `${name} hides Old`).toBeUndefined()
   }
 })
 
@@ -1283,16 +838,15 @@ test('the shared brand header shows plugin.json\'s version chip on a run tab and
   expect(await ui.find({ text: 'Checkout v2' }), 'no run block on Settings').toBeUndefined()
 })
 
-test('F0: every tab Button carries its keyboard hotkey — o l p u e w k 0, at 36 and 46 cols', { plugins: [worldFixtures] }, async ($, on) => {
+test('F0: every tab Button carries its keyboard hotkey — o l p u e w k 9, at 36 and 46 cols', { plugins: [worldFixtures] }, async ($, on) => {
   mockFs(on, worldFiles())
   mockWorld(on)
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   for (const cols of [46, 36] as const) {
-    await ui.press({ key: 'dash-tab-old' })
     await ui.redraw(paneProps(cols))
     const buttons = await ui.findAll({ type: 'Button' })
-    expect(buttons.map(b => b.props.hotkey), `hotkeys at ${cols}`).toEqual(['o', 'l', 'p', 'u', 'e', 'w', 'k', '0', '9'])
+    expect(buttons.map(b => b.props.hotkey), `hotkeys at ${cols}`).toEqual(['o', 'l', 'p', 'u', 'e', 'w', 'k', '9'])
     for (const b of buttons) {
       // an inactive tab's label is its count alone (or the `·` placeholder), so
       // a plain Button's `h: label` drawing never repeats the tab's own letter
@@ -1309,8 +863,6 @@ test('F0: every tab Button carries its keyboard hotkey — o l p u e w k 0, at 3
     await ui.redraw(paneProps(46))
     await ui.press({ key })
     expect(await ui.find(mockRow()), `${name} MOCK row`).toBeTruthy()
-    await ui.press({ key: 'dash-tab-old' })
-    expect(await ui.find({ text: /workflows-v2/ }), 'Old is back').toBeTruthy()
   }
 })
 
@@ -1337,17 +889,15 @@ test('the tab bar shows the active word and count, the rest hotkey + count, at 4
   mockWorld(on)
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  // Old active: the counts come from the snapshot — 3 live lanes, 1/5 done, 1 open decision
-  expect(await tabLabels(ui)).toEqual(['Overview', 'Lanes 3', 'Plan 1/5', 'Usage', 'Events', 'Waiting !1', 'Kanban', 'Old', 'Settings'])
+  expect(await tabLabels(ui)).toEqual(['Overview', 'Lanes 3', 'Plan 1/5', 'Usage', 'Events', 'Waiting !1', 'Kanban', 'Settings'])
   for (const cols of [36, 46] as const) {
-    await ui.press({ key: 'dash-tab-old' })
     await ui.press({ key: 'dash-tab-lanes' })
     await ui.redraw(paneProps(cols))
     const labels = await tabLabels(ui)
-    expect(labels, `at ${cols}`).toEqual(cols === 46 ? ['Overview', 'Lanes 4', 'Plan 3/8', 'Usage', 'Events', 'Waiting !1', 'Kanban', 'Old', 'Settings'] : ['·', 'Lanes 4', '3/8', '·', '·', '!1', '·', '·', '·'])
+    expect(labels, `at ${cols}`).toEqual(cols === 46 ? ['Overview', 'Lanes 4', 'Plan 3/8', 'Usage', 'Events', 'Waiting !1', 'Kanban', 'Settings'] : ['·', 'Lanes 4', '3/8', '·', '·', '!1', '·', '·'])
     expect(labels.join(' ')).not.toContain('o: o') // the S0 short labels are gone
     expect(labels.some(l => /^[a-z0-9]$/.test(l)), 'no tab shows its own letter twice').toBe(false)
-    expect(labels.filter(l => l === '·').length, 'count-less tabs carry the placeholder').toBe(cols === 46 ? 0 : 6)
+    expect(labels.filter(l => l === '·').length, 'count-less tabs carry the placeholder').toBe(cols === 46 ? 0 : 5)
   }
 })
 
@@ -1504,10 +1054,8 @@ test('V1.4: a full-width rule of the palette line colour sits directly under the
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   for (const cols of [36, 46] as const) {
-    await ui.press({ key: 'dash-tab-old' })
     await ui.redraw(paneProps(cols))
-    // Old carries the rule too: the frame is the header + bar, not the tab body
-    expect(await ui.find({ text: new RegExp(`^─{${String(cols)}}$`) }), `the rule on Old at ${cols}`).toBeTruthy()
+    expect(await ui.find({ text: new RegExp(`^─{${String(cols)}}$`) }), `the rule at ${cols}`).toBeTruthy()
     expect((await allTexts(ui)).filter(t => /^─+$/.test(t)), `exactly one rule at ${cols}`).toHaveLength(1)
     // flush: the rule's parent is a column Box with no gap that holds the tab
     // bar and the rule, and nothing else
@@ -1518,10 +1066,9 @@ test('V1.4: a full-width rule of the palette line colour sits directly under the
     expect(wrap?.kids, `bar then rule at ${cols}`).toHaveLength(2)
     const bar = nodesOf(wrap?.kids[0], 'Button')
     expect(bar.map(b => String(b.props.key)), `the bar is the first child at ${cols}`)
-      .toEqual(['dash-tab-overview', 'dash-tab-lanes', 'dash-tab-plan', 'dash-tab-usage', 'dash-tab-events', 'dash-tab-waiting', 'dash-tab-kanban', 'dash-tab-old', 'dash-tab-settings'])
+      .toEqual(['dash-tab-overview', 'dash-tab-lanes', 'dash-tab-plan', 'dash-tab-usage', 'dash-tab-events', 'dash-tab-waiting', 'dash-tab-kanban', 'dash-tab-settings'])
     // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
     for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings')) {
-      await ui.press({ key: 'dash-tab-old' })
       await ui.press({ key })
       expect(await ui.find({ text: new RegExp(`^─{${String(cols)}}$`) }), `${name} rule at ${cols}`).toBeTruthy()
     }
@@ -1550,7 +1097,6 @@ test('C12: every tab call receives the ui handle — all six tabs act on it, not
   // argument through the pane's widened call and still render their fixture
   // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
   for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban')) {
-    await ui.press({ key: 'dash-tab-old' })
     await ui.press({ key })
     expect(await ui.find(mockRow()), `${name} renders with the ui argument`).toBeTruthy()
   }
@@ -1572,7 +1118,7 @@ test('C12: every tab call receives the ui handle — all six tabs act on it, not
   // Waiting: ⋯ reveals the folded actions; a pick marks the option it picked
   await ui.press({ key: 'dash-tab-waiting' })
   const labels = await tabLabels(ui)
-  expect(labels, 'the tab bar keeps its own labels while a body draws buttons').toHaveLength(9)
+  expect(labels, 'the tab bar keeps its own labels while a body draws buttons').toHaveLength(8)
   await ui.press({ key: 'waiting-a-more-3' })
   expect(await ui.find({ type: 'Button', text: /Rebase later/ }), 'the revealed option button').toBeTruthy()
   await ui.press({ key: 'waiting-b' })
@@ -1609,7 +1155,7 @@ test('S2.0 spike: $.ui.resolve(e) exposes Input and Select on terminal + desktop
 
 // ---------- S2.3: settings wiring — hotkey 9, hiddenTabs, defaultTab, raster=false, solo ----------
 
-test('S2.3: hotkey 9 switches to the Settings tab and hides Old', { plugins: [worldFixtures] }, async ($, on) => {
+test('S2.3: hotkey 9 switches to the Settings tab', { plugins: [worldFixtures] }, async ($, on) => {
   const files = worldFiles()
   const calls: (readonly string[])[] = []
   const clock = mockSettingsBackend(on, files, calls, R3_FIELDS)
@@ -1623,8 +1169,6 @@ test('S2.3: hotkey 9 switches to the Settings tab and hides Old', { plugins: [wo
   expect(await ui.find({ text: /MOCK · fixture data/ }), 'never mock rows').toBeUndefined()
   expect((await ui.findAll({ type: 'Button' })).find(b => b.props.key === 'set-scope-project'), 'the settings scope bar').toBeTruthy()
   expect(await ui.find({ text: /Checkout v2/ }), 'the real run header, never the mock world').toBeUndefined()
-  await ui.press({ key: 'dash-tab-old' })
-  expect(await ui.find({ text: /workflows-v2/ }), 'Old is back').toBeTruthy()
 })
 
 test('S2.3: hiddenTabs hides named tabs but never Settings', { plugins: [worldFixtures], options: { hiddenTabs: 'lanes,plan' } }, async ($, on) => {
@@ -1636,7 +1180,7 @@ test('S2.3: hiddenTabs hides named tabs but never Settings', { plugins: [worldFi
   expect(keys).not.toContain('dash-tab-lanes')
   expect(keys).not.toContain('dash-tab-plan')
   expect(keys).toContain('dash-tab-settings')
-  expect(keys).toContain('dash-tab-old')
+  expect(keys).toContain('dash-tab-overview')
 })
 
 test('S2.3: hiddenTabs naming Settings still draws it', { plugins: [worldFixtures], options: { hiddenTabs: 'settings,lanes' } }, async ($, on) => {
@@ -1666,21 +1210,21 @@ test('S2.3: defaultTab opens the pane on that tab', { plugins: [worldFixtures], 
   expect(await ui.find({ text: /Checkout v2/ }), 'the real run header, never the mock world').toBeUndefined()
 })
 
-test('S2.3: an unknown or hidden defaultTab keeps the Old default', { plugins: [worldFixtures], options: { defaultTab: 'nope' } }, async ($, on) => {
+// at 36 cols only the open tab keeps its word, so 'Overview' in the bar means Overview is open
+test('S2.3: an unknown or retired (old) defaultTab keeps the Overview default', { plugins: [worldFixtures], options: { defaultTab: 'old' } }, async ($, on) => {
   mockFs(on, worldFiles())
   mockWorld(on)
   await $.session.start(sessionStart())
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  expect(await ui.find({ text: /workflows-v2/ }), 'Old stays the default').toBeTruthy()
-  expect(await ui.find(mockRow())).toBeUndefined()
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(36) })
+  expect(await tabLabels(ui), 'Overview stays the default').toContain('Overview')
 })
 
-test('S2.3: a hidden defaultTab falls back to Old', { plugins: [worldFixtures], options: { defaultTab: 'lanes', hiddenTabs: 'lanes' } }, async ($, on) => {
+test('S2.3: a hidden defaultTab falls back to Overview', { plugins: [worldFixtures], options: { defaultTab: 'lanes', hiddenTabs: 'lanes' } }, async ($, on) => {
   mockFs(on, worldFiles())
   mockWorld(on)
   await $.session.start(sessionStart())
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  expect(await ui.find({ text: /workflows-v2/ }), 'Old stays the default').toBeTruthy()
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(36) })
+  expect(await tabLabels(ui), 'Overview stays the default').toContain('Overview')
 })
 
 test('S2.3: raster:false draws the eighth-block fallback (no Raster); default draws Raster', { plugins: [worldFixtures] }, async ($, on) => {
@@ -1701,8 +1245,7 @@ test('S2.3: raster:false draws the eighth-block fallback (no Raster)', { plugins
   expect(await ui.findAll({ type: 'Raster' }), 'no Raster anywhere under raster:false').toHaveLength(0)
   expect(await ui.find({ text: /Payment provider adapter/ }), 'the live wave still renders').toBeTruthy()
   // R3 LOW 2: a second bar-drawing mock tab (Usage draws pickBar strips) falls
-  // back too. Old intentionally keeps `els`: OldTab never calls pickBar today
-  // (text bars only), so there is nothing to fall back — out of scope.
+  // back too.
   await ui.press({ key: 'dash-tab-usage' })
   expect(await ui.findAll({ type: 'Raster' }), 'no Raster on Usage either').toHaveLength(0)
   expect(await ui.find(mockRow()), 'the Usage mock world still renders').toBeTruthy()
@@ -1999,7 +1542,7 @@ test('LOW 5: every open re-lists and shows the fresh reply; migrate still runs o
   expect(await ui.find({ text: '20m' }), 'the first list reply').toBeTruthy()
   // the yaml changes under the pane; the next open re-reads it
   stall = 25
-  await ui.press({ key: 'dash-tab-old' })
+  await ui.press({ key: 'dash-tab-overview' })
   await ui.press({ key: 'dash-tab-settings' })
   await loadLiveSettings(clock, ui, calls, 3)
   const mk = mkConfigCalls(calls)
@@ -2080,7 +1623,7 @@ test('MEDIUM 2: the ui.focus hook records the ring; leaving the Input re-arms s'
   await $.ui.focus({ component: 'Pane', requestId: 'matrixkoder', element: 'set-find-input', origin: { kind: 'person' } })
   await ui.redraw(paneProps(46))
   expect(await hotkeyOf('set-save'), 's inert again').toBeUndefined()
-  await ui.press({ key: 'dash-tab-old' })
+  await ui.press({ key: 'dash-tab-overview' })
   await ui.press({ key: 'dash-tab-settings' })
   await ui.redraw(paneProps(46))
   expect(await hotkeyOf('set-save'), 's back after the tab switch').toBe('s')
@@ -2214,7 +1757,7 @@ test('LOW 2: a failing list records settings:migrated so migrate is not rerun on
   expect(mkConfigCalls(calls).filter(a => a.includes('migrate'))).toHaveLength(1)
   expect(mkConfigCalls(calls).filter(a => a.includes('list'))).toHaveLength(1)
   // second open: list retried, but migrate NOT rerun
-  await ui.press({ key: 'dash-tab-old' })
+  await ui.press({ key: 'dash-tab-overview' })
   await ui.press({ key: 'dash-tab-settings' })
   await loadLiveSettings(clock, ui, calls, 3)
   expect(mkConfigCalls(calls).filter(a => a.includes('migrate'))).toHaveLength(1)
@@ -2251,7 +1794,7 @@ test('LOW 4: a second save press while saving does nothing', { plugins: [worldFi
   expect(await ui.find({ text: /✓ saved 1/ }), 'the save lands once').toBeTruthy()
 })
 
-test('D8A: hotkey k opens the Kanban tab between Waiting and Old', { plugins: [worldFixtures] }, async ($, on) => {
+test('D8A: hotkey k opens the Kanban tab between Waiting and Settings', { plugins: [worldFixtures] }, async ($, on) => {
   mockFs(on, worldFiles())
   const clock = mockWorld(on, { env: { MK_HOME: '/tmp/mk-d8a-missing' } })
   on('fs.exists', () => ({ value: false }))
@@ -2262,9 +1805,9 @@ test('D8A: hotkey k opens the Kanban tab between Waiting and Old', { plugins: [w
   const keys = buttons.map(b => String(b.props.key))
   const w = keys.indexOf('dash-tab-waiting')
   const k = keys.indexOf('dash-tab-kanban')
-  const o = keys.indexOf('dash-tab-old')
+  const o = keys.indexOf('dash-tab-settings')
   expect(k, 'kanban sits after waiting').toBe(w + 1)
-  expect(o, 'old sits after kanban').toBe(k + 1)
+  expect(o, 'settings sits after kanban').toBe(k + 1)
   const kanban = buttons.find(b => b.props.key === 'dash-tab-kanban')
   expect(kanban?.props.hotkey).toBe('k')
   expect(String(kanban?.props.label)).toContain('Kanban')
@@ -2631,9 +2174,4 @@ test('L7.2: the top-level k reads open tasks of every linked project — migrate
   })
   expect(dirs, 'the migrated row read the C2 project folder').toContain(MIGRATED_DIR)
   expect(dirs, 'the db_path-NULL row fell back to its legacy data_dir').toContain(LEGACY_DIR)
-})
-test('F.8: rework is not a DONE status — the dashboard DONE set keeps done and merged only', () => {
-  expect(DONE_STATUSES_FOR_TEST.has('rework'), 'a reworked task is not silently counted done').toBe(false)
-  expect(DONE_STATUSES_FOR_TEST.has('done')).toBe(true)
-  expect(DONE_STATUSES_FOR_TEST.has('merged')).toBe(true)
 })

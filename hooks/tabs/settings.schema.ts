@@ -412,7 +412,7 @@ export const SETTINGS_SCHEMA = {
   "userConfig": {
     "autoOpen": true,
     "chip": true,
-    "defaultTab": "old",
+    "defaultTab": "overview",
     "guards": true,
     "hiddenTabs": "",
     "mode": "orchestrator",

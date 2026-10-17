@@ -46,9 +46,10 @@ function word(hex: string): number {
   return rgbWord(hex)
 }
 
-const PANEL = word(PALETTE.panel)
-const TRACK = word(PALETTE.track)
-const MUT = word(PALETTE.mut)
+// read at draw time, not load time, so a theme (palette.ts withTheme) recolours the bars too
+const PANEL = (): number => word(PALETTE.panel)
+const TRACK = (): number => word(PALETTE.track)
+const MUT = (): number => word(PALETTE.mut)
 
 /** Clamp to 0..100, non-finite and NaN read as 0. */
 function clampPct(value: number): number {
@@ -85,8 +86,8 @@ export function gradientBar(pct: number, cols: number, stops: readonly string[],
     : Math.min(width - 1, Math.max(0, Math.floor((clampPct(floorPct) / 100) * width)))
   const words: number[] = []
   for (let i = 0; i < width; i++) {
-    const fg = i < filled ? colorAt(stops, width <= 1 ? 0 : i / (width - 1)) : TRACK
-    words.push(UPPER_HALF, fg, i === floor ? MUT : PANEL)
+    const fg = i < filled ? colorAt(stops, width <= 1 ? 0 : i / (width - 1)) : TRACK()
+    words.push(UPPER_HALF, fg, i === floor ? MUT() : PANEL())
   }
   return { columns: width, rows: 1, cells: encodeCells(words) }
 }
@@ -126,10 +127,10 @@ function strip(colors: readonly string[], cols: number): RasterSpec {
   const words: number[] = []
   for (let i = 0; i < n; i++) {
     const c = word(list[i] ?? PALETTE.track)
-    for (let k = 0; k < seg; k++) words.push(UPPER_HALF, c, PANEL)
+    for (let k = 0; k < seg; k++) words.push(UPPER_HALF, c, PANEL())
     if (i < n - 1) {
       const gap = gaps[i] ?? 1
-      for (let k = 0; k < gap; k++) words.push(UPPER_HALF, PANEL, PANEL)
+      for (let k = 0; k < gap; k++) words.push(UPPER_HALF, PANEL(), PANEL())
     }
   }
   return { columns: width, rows: 1, cells: encodeCells(words) }

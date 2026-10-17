@@ -252,6 +252,7 @@ function decisionRows(els: Els, d: Decision, w: number): RenderElement[] {
 function routingCard(els: Els, view: UsageView, w: number): RenderElement {
   const { Box, Text } = els
   const rows: RenderElement[] = [sectionRow(els, view.decisionsHeader, view.decisionsRight, w)]
+  if (view.decisions.length === 0) rows.push(<Text key="none" dimColor={true}>no routing data yet</Text>)
   view.decisions.forEach((d, i) => {
     rows.push(<Text key={`gap-${String(i)}`}>{' '}</Text>)
     rows.push(...decisionRows(els, d, w))
@@ -267,7 +268,7 @@ export function UsageTab(els: Els, view: UsageView, cols: number, ui?: TabUi): R
   void ui // the Usage board has no control; see the header note (C12)
   return (
     <Box flexDirection="column">
-      <Text bold={true} color="warning">MOCK · fixture data · not this run</Text>
+      {view.mock && <Text bold={true} color={ROLE.warn.fg}>MOCK · fixture data · not this run</Text>}
       {quotaCard(els, view, w)}
       {routingCard(els, view, w)}
       <Text dimColor={true}>{hintRow(view.footerLeft, view.footerRight, cols)}</Text>

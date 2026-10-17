@@ -14,6 +14,7 @@ import {
   builderOrderOf, dataDirOf, EMPTY_DRAFT, emptyDraft, fallbackText, installModeOf, mergeModels, parseModels, parseProviders, parseVersion,
   parseWhich, proposeGates, providerChoices, providerLabel, slugOf,
 } from './wizard-core'
+import { PALETTE, ROLE } from './tabs/palette'
 
 /** Surfaces that draw Input and Select (mobile does not). */
 type Elements = ElementTables['terminal'] | ElementTables['desktop'] | ElementTables['vscode']
@@ -58,11 +59,11 @@ export function registerWizard(on: On, options: PluginOptions): void {
       <Box flexDirection="column" width={cols} gap={1}>
         {e.props.placement === 'inline' && (
           <Box borderStyle="round" borderColor="yellow" paddingX={1}>
-            <Text color="yellow">Run /tui fullscreen to dock this panel on the right.</Text>
+            <Text color={ROLE.warn.fg}>Run /tui fullscreen to dock this panel on the right.</Text>
           </Box>
         )}
         <Box flexDirection="column">
-          <Text color="cyan" bold={true}>⬡ MatrixKoder setup</Text>
+          <Text color={PALETTE.blue} bold={true}>⬡ MatrixKoder setup</Text>
           <Text dimColor={true}>{`Step ${step}/${LAST_STEP} · ${title}   ${WIZARD_STEPS.map((_, i) => (i + 1 < step ? '●' : i + 1 === step ? '◉' : '○')).join('')}`}</Text>
         </Box>
         {!d.loaded ? <Text dimColor={true}>Detecting agents, usage and gates…</Text> : Body(els, $, d, step, options, oldYaml)}
@@ -427,7 +428,7 @@ function HerdrLinkChoice(els: Elements, $: EngineInterface, d: MkWizardDraft) {
   const label = 'Link the MatrixKoder herdr plugin (herdr pushes lane events instead of polling)'
   const options = YES_NO.map(o => ({ value: o.value === 'yes' ? 'link' : 'skip', label: o.label }))
   if (!a?.found) return <Text dimColor={true}>herdr not found on PATH</Text>
-  if (d.herdrPlugin === 'linked') return <Text color="green">✓ MatrixKoder herdr plugin is linked</Text>
+  if (d.herdrPlugin === 'linked') return <Text color={ROLE.ok.fg}>✓ MatrixKoder herdr plugin is linked</Text>
   return (
     <Box flexDirection="column">
       <Select
@@ -457,7 +458,7 @@ function Body(els: Elements, $: EngineInterface, d: MkWizardDraft, step: number,
         <Box flexDirection="column" gap={1}>
           <Text>Repo: <Text bold={true}>{d.repo ?? 'not a git repository'}</Text></Text>
           {d.dataEnv != null
-            ? <Text color="yellow">{`$MATRIXKODER_DATA is set: data goes to ${d.dataEnv}`}</Text>
+            ? <Text color={ROLE.warn.fg}>{`$MATRIXKODER_DATA is set: data goes to ${d.dataEnv}`}</Text>
             : (
               <Select
                 key="wz-datamode" label="Data location" value={d.dataMode}
@@ -500,11 +501,11 @@ function Body(els: Elements, $: EngineInterface, d: MkWizardDraft, step: number,
           {d.codexbarVersion == null
             ? (
               <Box flexDirection="column">
-                <Text color="yellow">⚠ codexbar not found on PATH</Text>
+                <Text color={ROLE.warn.fg}>⚠ codexbar not found on PATH</Text>
                 <Text dimColor={true}>Install CodexBar (github.com/steipete/CodexBar) and put its CLI on PATH; usage stays n/a until then. You can continue.</Text>
               </Box>
             )
-            : <Text color="green">{`✓ codexbar ${d.codexbarVersion}`}</Text>}
+            : <Text color={ROLE.ok.fg}>{`✓ codexbar ${d.codexbarVersion}`}</Text>}
           {d.codexbarVersion != null && (
             <Box flexDirection="column">
               <Text bold={true}>Providers (tick to track)</Text>
@@ -574,7 +575,7 @@ function Body(els: Elements, $: EngineInterface, d: MkWizardDraft, step: number,
           {TextField(els, $, d, 'pollMin', 'Usage poll (minutes)')}
           <Text dimColor={true}>{`Plugin settings today: autoOpen ${options.autoOpen !== false ? 'on' : 'off'}, chip ${options.chip !== false ? 'on' : 'off'}, toasts ${options.toasts !== false ? 'on' : 'off'}.`}</Text>
           <Text dimColor={true}>These live in the plugin's own settings (claude plugin configure matrixkoder), not in the yaml.</Text>
-          {d.error != null && <Text color="red">{`✗ ${d.error}`}</Text>}
+          {d.error != null && <Text color={ROLE.err.fg}>{`✗ ${d.error}`}</Text>}
           <Button key="wz-dash-apply" variant="primary" label="Apply these settings" onPress={() => void applyPrefs($)} />
         </Box>
       )
@@ -603,7 +604,7 @@ function Review(els: Elements, $: EngineInterface, d: MkWizardDraft, oldYaml: st
   if (d.phase === 'written') {
     return (
       <Box flexDirection="column">
-        <Text color="green" bold={true}>✓ MatrixKoder is set up</Text>
+        <Text color={ROLE.ok.fg} bold={true}>✓ MatrixKoder is set up</Text>
         {d.written.map(p => <Text key={p} dimColor={true}>{`wrote ${p}`}</Text>)}
         {d.existingYaml && !d.replace && <Text dimColor={true}>kept existing matrixkoder.yaml</Text>}
         {d.herdrLinkResult && (
@@ -614,7 +615,7 @@ function Review(els: Elements, $: EngineInterface, d: MkWizardDraft, oldYaml: st
         {d.installMode === 'marketplace' && (
           <Text dimColor={true}>Re-run /mk setup after each MatrixKoder update: the herdr link points at this plugin version's folder.</Text>
         )}
-        {d.error != null && <Text color="yellow">{`⚠ ${d.error}`}</Text>}
+        {d.error != null && <Text color={ROLE.warn.fg}>{`⚠ ${d.error}`}</Text>}
         <Text>Next: /mk to open the dashboard.</Text>
       </Box>
     )
@@ -622,7 +623,7 @@ function Review(els: Elements, $: EngineInterface, d: MkWizardDraft, oldYaml: st
   const yaml = buildYaml(d, 'pending', d.existingYaml && d.replace ? oldYaml : null).split('\n')
   return (
     <Box flexDirection="column" gap={1}>
-      {d.phase === 'error' && <Text color="red" bold={true}>{`✗ ${d.error ?? 'write failed'}`}</Text>}
+      {d.phase === 'error' && <Text color={ROLE.err.fg} bold={true}>{`✗ ${d.error ?? 'write failed'}`}</Text>}
       <Box flexDirection="column">
         <Text bold={true}>Will write</Text>
         <Text>{`${d.existingYaml && !d.replace ? 'keep   ' : d.existingYaml ? 'replace' : 'create '} ${data ?? '?'}/matrixkoder.yaml`}</Text>

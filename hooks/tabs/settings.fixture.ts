@@ -199,13 +199,12 @@ export const SETTINGS_FIXTURE: SettingsView = {
         { key: 'tabs.usage', scope: 'tabs', label: 'u Usage', type: 'bool', value: true, default: true, help: 'Quota bars per agent.', editable: true },
         { key: 'tabs.events', scope: 'tabs', label: 'e Events', type: 'bool', value: true, default: true, help: 'The run’s event log.', editable: true },
         { key: 'tabs.waiting', scope: 'tabs', label: 'w Waiting', type: 'bool', value: true, default: true, help: 'Decisions open on you.', editable: true },
-        { key: 'tabs.old', scope: 'tabs', label: '0 Old', type: 'bool', value: true, default: true, help: 'Retired later.', editable: true },
       ],
     },
     {
       scope: 'tabs', title: 'pane', right: 'dashboard',
       rows: [
-        { key: 'defaultTab', scope: 'tabs', label: 'Open on', type: 'select', value: 'old', default: 'old', opts: [['overview', ''], ['lanes', ''], ['plan', ''], ['usage', ''], ['events', ''], ['waiting', ''], ['old', ''], ['settings', 'this tab']], help: 'The tab the pane opens on.', editable: true },
+        { key: 'defaultTab', scope: 'tabs', label: 'Open on', type: 'select', value: 'overview', default: 'overview', opts: [['overview', ''], ['lanes', ''], ['plan', ''], ['usage', ''], ['events', ''], ['waiting', ''], ['settings', 'this tab']], help: 'The tab the pane opens on.', editable: true },
         { key: 'hiddenTabs', scope: 'tabs', label: 'Hidden tabs', type: 'text', value: '', default: '', help: 'Comma list of tabs to hide (Settings never hidden).', editable: true },
         { key: 'raster', scope: 'tabs', label: 'Raster bars', type: 'bool', value: true, default: true, help: 'Off = eighth-block fallback.', editable: true },
       ],

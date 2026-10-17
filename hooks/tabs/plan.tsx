@@ -6,9 +6,10 @@
 import type { Elements, RenderElement } from 'claude-code'
 import { PLAN_FIXTURE } from './plan.fixture'
 import { NARROW, STATUS_GLYPH, fitLegend } from './ui'
-import { ActionButton, Card, Chip, TreeRow } from './kit'
+import { ActionButton, BoxButton, Card, Chip, Segment, TreeRow } from './kit'
+import type { ActionSpec } from './kit'
 import { laneStrip, pickBar } from './raster'
-import { ROLE } from './palette'
+import { PALETTE, ROLE } from './palette'
 import type { PaletteRole } from './palette'
 import { isDoneStatus, laneAgent } from './plans-map'
 
@@ -75,6 +76,10 @@ export type PlanTask = {
   readonly type?: string
   readonly round?: number
   readonly verdict?: string
+  /** Detail row right side, when the backend sends them: the task's last merge
+   *  commit (drawn as 7 chars on a done task) and its open review findings. */
+  readonly last_commit?: string
+  readonly findings?: number
   /** F.1 contract: the derived risk (int 1-5), its critical flag, and the open
    *  reasons. All optional — an old row carries none of them. */
   readonly risk?: number
@@ -137,6 +142,10 @@ export type PlanView = {
   readonly waves?: readonly { readonly name: string; readonly header: string; readonly tone: 'green' | 'blue' | 'gray'; readonly shortHeader?: string; readonly rows: readonly PlanTask[] }[]
   /** ' · '-joined footer parts; the tail drops until the line fits (fitLegend). */
   readonly footer: readonly string[]
+  /** header-card buttons (`pause`, `open-file`) call this with the plan id; absent, they do nothing */
+  readonly onAction?: (kind: string, planId: string) => void
+  /** a task's detail panel drawn in place of the phases box (the pop-up); header and footer stay */
+  readonly taskPanel?: RenderElement
 }
 
 /** T1.2: the fixture, mock flag on (C1/C6). */
@@ -166,6 +175,35 @@ export function clip(text: string, w: number): string {
 
 const phaseKey = (id: string): string => `plan:phase:${id}`
 
+/** The title only: store titles carry the description after the first `: `, `; ` or ` — `. */
+function headline(text: string): string {
+  const m = /: |; | — /.exec(text)
+  return m == null ? text : text.slice(0, m.index)
+}
+
+/** A phase's state for the border colour and the PHASES filter: done, building (a live or
+ *  flagged task), else pending. */
+function phaseState(phase: PlanPhase): 'done' | 'building' | 'pending' {
+  if (isDoneStatus(phase.status ?? '') || (phase.rows.length > 0 && phase.rows.every(r => isDoneStatus(r.status)))) return 'done'
+  if (phase.rows.some(r => roleOf(r.status) === 'live' || roleOf(r.status) === 'warn')) return 'building'
+  return 'pending'
+}
+
+const PHASE_FILTERS = ['all', 'building', 'pending', 'done'] as const
+
+const PAUSED = new Set(['paused', 'parked', 'held', 'on_hold'])
+
+/** Design only (no backend yet): `‖` pauses a live phase/task, `▶` resumes a paused one; the
+ *  press submits `mk: <pause|resume> <phase|task> <id> plan <plan>` like the plan buttons. */
+function pauseButton(els: Els, key: string, status: string, live: boolean, act: ((kind: string) => void) | undefined, what: string, id: string): RenderElement | null {
+  const paused = PAUSED.has(status)
+  if (!paused && !live) return null
+  return BoxButton(els, {
+    key, label: paused ? '▶' : '‖', tone: paused ? 'primary' : 'default',
+    onPress: () => { act?.(`${paused ? 'resume' : 'pause'} ${what} ${id}`) },
+  })
+}
+
 /** Pure render: elements only, no $, no state (C1); `ui` is the C12 view state. */
 export function PlanTab(els: Els, view: PlanView, cols: number, ui?: TabUi): RenderElement {
   const { Box, Text } = els
@@ -179,26 +217,58 @@ export function PlanTab(els: Els, view: PlanView, cols: number, ui?: TabUi): Ren
     list.push(phase.id)
     shared.set(phase.wave, list)
   }
+  const act = (kind: string): void => { view.onAction?.(kind, view.plan?.id ?? '') }
+  const phaseFilter = ui?.get('plan:phase-filter') ?? 'all'
+  const shownPhases = phaseFilter === 'all' ? phases : phases.filter(p => phaseState(p) === phaseFilter)
   return (
     <Box flexDirection="column" gap={1}>
-      {view.mock && <Text bold={true} color="warning">MOCK · fixture data · not this run</Text>}
+      {view.mock && <Text bold={true} color={ROLE.warn.fg}>MOCK · fixture data · not this run</Text>}
       {view.plan != null && HeaderCard(els, view, W, compact)}
       <Box flexDirection="row" justifyContent="space-between" gap={1}>
-        <Text bold={true} color="subtle">PHASES</Text>
         <Box flexDirection="row" gap={1}>
-          {ActionButton(els, {
-            key: 'plan-expand-all', glyph: '▾', word: 'Expand all', tone: 'quiet',
+          <Text bold={true} color={PALETTE.mut}>PHASES</Text>
+          {!compact && PHASE_FILTERS.map(f => Segment(els, {
+            key: `plan-phase-filter-${f}`,
+            label: f === 'all' ? `all ${phases.length}` : `${f} ${phases.filter(p => phaseState(p) === f).length}`,
+            on: phaseFilter === f,
+            onPress: () => { ui?.set('plan:phase-filter', f) },
+          }))}
+        </Box>
+        <Box flexDirection="row" gap={1}>
+          {BoxButton(els, {
+            key: 'plan-expand-all', label: '▾ Expand all',
             onPress: () => { for (const p of phases) ui?.set(phaseKey(p.id), '1') },
           })}
-          {ActionButton(els, {
-            key: 'plan-collapse-all', glyph: '▸', word: 'Collapse all', tone: 'quiet',
+          {BoxButton(els, {
+            key: 'plan-collapse-all', label: '▸ Collapse all',
             onPress: () => { for (const p of phases) ui?.set(phaseKey(p.id), '') },
           })}
         </Box>
       </Box>
-      {phases.map(phase => PhaseCard(els, phase, shared.get(phase.wave ?? -1) ?? [], W, compact, ui))}
+      <Box key="plan-phases" flexDirection="column" position="relative">
+        {shownPhases.length === 0 && <Text dimColor={true}>{`no ${phaseFilter} phases`}</Text>}
+        {shownPhases.length > 0 && Card(els, { edge: PALETTE.mut }, (
+          <Box flexDirection="column">
+            {shownPhases.map((phase, i) => (
+              <Box key={`plan-phase-wrap-${phase.id}`} flexDirection="column">
+                {i > 0 && <Text color={PALETTE.line}>{'─'.repeat(Math.max(1, W - 4))}</Text>}
+                {PhaseCard(els, phase, shared.get(phase.wave ?? -1) ?? [], W - 4, compact, ui, act)}
+              </Box>
+            ))}
+          </Box>
+        ))}
+        {/* the task pop-up floats over the phases, inset so the rows around it stay visible and pressable */}
+        {view.taskPanel != null && (
+          <Box key="plan-task-popup" position="absolute" top={2} left={compact ? 1 : 4} right={compact ? 1 : 4} flexDirection="column">
+            {view.taskPanel}
+          </Box>
+        )}
+      </Box>
       {!compact && (
-        <Text dimColor={true} wrap="truncate-end">{clip(fitLegend([...view.footer], cols), cols)}</Text>
+        <Box flexDirection="row" justifyContent="space-between" gap={1}>
+          <Text dimColor={true} wrap="truncate-end">{clip(view.footer[0] ?? '', Math.max(1, cols - 20))}</Text>
+          <Text dimColor={true} wrap="truncate-end">{clip(fitLegend(view.footer.slice(1), 18), 18)}</Text>
+        </Box>
       )}
     </Box>
   )
@@ -208,25 +278,39 @@ function HeaderCard(els: Els, view: PlanView, W: number, compact: boolean): Rend
   const { Box, Text } = els
   const head = view.plan
   if (head == null) return Card(els, {}, <Text></Text>)
-  const kv = (k: string, v: string): RenderElement => (
-    <Box flexDirection="row" gap={1}>
-      <Text dimColor={true}>{k}</Text>
-      <Text wrap="truncate-end">{clip(v, Math.max(1, W - k.length - 2))}</Text>
+  const KEY_W = 11 // the design's two-column kv: keys padded to one width
+  const kv = (k: string, v: string): RenderElement | null => v === '' ? null : (
+    <Box flexDirection="row">
+      <Text dimColor={true}>{k.padEnd(KEY_W)}</Text>
+      <Text wrap="truncate-end">{clip(v, Math.max(1, W - KEY_W))}</Text>
     </Box>
   )
-  return Card(els, { role: 'live' }, (
+  // design docs as short names (`settings-tab · dashboard-v2`), not full paths
+  const design = head.design.split(/\s+/).filter(d => d !== '').map(d => (d.split('/').pop() ?? d).replace(/\.md$/, '')).join(' · ')
+  const running = head.status === 'running'
+  const chipRole: PaletteRole = running ? 'live' : isDoneStatus(head.status) ? 'ok' : head.status === 'parked' ? 'warn' : 'idle'
+  const fire = (kind: string): void => { view.onAction?.(kind, head.id) }
+  const buttons: ActionSpec[] = [
+    ...(head.status === 'running' ? [{ key: 'plan-head-pause', glyph: '‖ Pause', word: '', tone: 'quiet', plain: true, onPress: () => { fire('pause') } } satisfies ActionSpec] : []),
+    ...(PAUSED.has(head.status) ? [{ key: 'plan-head-resume', glyph: '▶ Resume', word: '', tone: 'primary', plain: true, onPress: () => { fire('resume') } } satisfies ActionSpec] : []),
+    { key: 'plan-head-open-file', glyph: 'Open file', word: '', tone: 'default', plain: true, onPress: () => { fire('open-file') } },
+  ]
+  return Card(els, running ? { role: 'live' } : { edge: PALETTE.mut }, (
     <Box flexDirection="column">
       <Box flexDirection="row" justifyContent="space-between" gap={1}>
         <Text bold={true}>{clip(head.id, Math.max(1, W - head.statusChip.length - 6))}</Text>
-        {Chip(els, { label: compact ? clip(head.statusChip, 12) : head.statusChip, role: 'live' })}
+        {Chip(els, { label: compact ? clip(head.statusChip, 12) : head.statusChip, role: chipRole })}
       </Box>
       <Text color={ROLE.idle.fg} wrap="truncate-end">{clip(head.title, W)}</Text>
       {kv('created', head.created)}
       {kv('runs', head.runs)}
       {kv('merges to', head.mergesTo)}
-      {kv('design', head.design)}
+      {kv('design', design)}
       {head.roundFiles != null && head.roundFiles !== '' && kv('round files', head.roundFiles)}
-      <Text dimColor={true}>{head.counts}</Text>
+      <Box flexDirection="row" justifyContent="space-between" gap={1}>
+        <Text dimColor={true} wrap="truncate-end">{clip(head.counts, Math.max(1, W - 24))}</Text>
+        <Box flexDirection="row" gap={1}>{buttons.map(b => BoxButton(els, { key: b.key, label: b.glyph, tone: b.tone, onPress: () => { b.onPress?.() } }))}</Box>
+      </Box>
     </Box>
   ))
 }
@@ -241,7 +325,7 @@ export function phaseRouted(phase: PlanPhase): boolean {
 /** One phase Card. Folded (the default) is one row: fold glyph, status glyph,
  *  `<id> · <title>`, the header chip and the laneStrip. A routed phase adds
  *  its dim lane·agent tag right-aligned, and the fold press selects it too. */
-function PhaseCard(els: Els, phase: PlanPhase, waveMates: readonly string[], W: number, compact: boolean, ui?: TabUi): RenderElement {
+function PhaseCard(els: Els, phase: PlanPhase, waveMates: readonly string[], W: number, compact: boolean, ui?: TabUi, act?: (kind: string) => void): RenderElement {
   const { Box, Text } = els
   const legacy = phase.tone != null
   const expanded = legacy ? true : ui?.get(phaseKey(phase.id)) === '1'
@@ -250,6 +334,9 @@ function PhaseCard(els: Els, phase: PlanPhase, waveMates: readonly string[], W: 
   const toneRole: PaletteRole = phase.tone === 'green' ? 'ok' : phase.tone === 'blue' ? 'live' : 'idle'
   const headRole = phase.headerRole ?? toneRole
   const live = (phase.tone === 'blue') || phase.rows.some(r => roleOf(r.status) === 'live' || roleOf(r.status) === 'warn')
+  const findings = phase.rows.reduce((n, r) => n + (r.findings ?? 0), 0)
+  const chipLabel = findings > 0 ? `${findings} findings` : compact && phase.shortHeader != null ? phase.shortHeader : phase.header
+  const chipRole: PaletteRole = findings > 0 ? 'warn' : headRole
   const others = waveMates.filter(id => id !== phase.id)
   const strip = pickBar(
     els,
@@ -257,15 +344,21 @@ function PhaseCard(els: Els, phase: PlanPhase, waveMates: readonly string[], W: 
     laneStrip(phase.rows.map(r => roleOf(r.status)), W),
     <Text dimColor={true}>{phase.rows.map(r => glyphOf(r.status)).join('')}</Text>,
   )
-  return Card(els, live ? { role: 'live' } : {}, (
-    <Box key={phase.id} flexDirection="column">
+  // state as a one-column bar down the left edge: building blue, pending yellow, done the plain line
+  // (phases share one Card, so one divider row between them, not two borders)
+  const state = legacy ? (live ? 'building' : 'done') : phaseState(phase)
+  const bar = state === 'building' ? ROLE.live.fg : state === 'pending' ? ROLE.warn.fg : PALETTE.line
+  return (
+    <Box key={phase.id} flexDirection="row" gap={1}>
+    <Box width={1} backgroundColor={bar} />
+    <Box flexDirection="column" flexGrow={1}>
       <Box flexDirection="row" gap={1}>
-        {!legacy && <Text dimColor={true}>{expanded ? '▾' : '▸'}</Text>}
+        {!legacy && <Text dimColor={!live} color={live ? ROLE.live.fg : undefined}>{expanded ? '▾' : '▸'}</Text>}
         {!legacy && <Text color={ROLE[headRole].fg}>{glyphOf(phase.status ?? 'planned')}</Text>}
         {!legacy && ActionButton(els, {
           key: `plan-fold-${phase.id}`,
           glyph: '›',
-          word: clip(`${phase.id} · ${phase.title}`, Math.max(1, W - phase.header.length - 12 - (!compact && lane !== '' ? lane.length + 1 : 0))),
+          word: clip(`${phase.id} · ${headline(phase.title)}`, Math.max(1, W - chipLabel.length - 12 - (!compact && lane !== '' ? lane.length + 1 : 0))),
           plain: true,
           noHotkey: true,
           onPress: () => {
@@ -273,18 +366,20 @@ function PhaseCard(els: Els, phase: PlanPhase, waveMates: readonly string[], W: 
             if (routed) ui?.set('plan:task', ui?.get('plan:task') === phase.id ? '' : phase.id)
           },
         })}
-        {legacy && <Text bold={true} color="subtle">{phase.name ?? phase.id}</Text>}
+        {legacy && <Text bold={true} color={PALETTE.mut}>{phase.name ?? phase.id}</Text>}
         <Box flexGrow={1} />
         {!compact && routed && lane !== '' && <Text dimColor={true} wrap="truncate-end">{lane}</Text>}
         {others.length > 0 && Chip(els, { label: `with ${others[0]}`, role: 'idle' })}
-        {Chip(els, { label: compact && phase.shortHeader != null ? phase.shortHeader : phase.header, role: headRole })}
+        {Chip(els, { label: chipLabel, role: chipRole })}
+        {!legacy && pauseButton(els, `plan-phase-pause-${phase.id}`, phase.status ?? '', state === 'building', act, 'phase', phase.id)}
       </Box>
       {strip}
-      {expanded && !legacy && phase.rows.map(row => TaskBlock(els, row, W, compact, ui))}
+      {expanded && !legacy && phase.rows.map((row, i) => TaskBlock(els, row, i === phase.rows.length - 1, W - 4, compact, ui, act))}
       {legacy && phase.rows.map(row => LegacyRow(els, row, W, compact, ui))}
       {expanded && phase.note != null && <Text dimColor={true}>{clip(phase.note, W)}</Text>}
     </Box>
-  ))
+    </Box>
+  )
 }
 
 /** One task: the V1.5 row — status glyph, task id, the title cut to the space
@@ -292,12 +387,16 @@ function PhaseCard(els: Els, phase: PlanPhase, waveMates: readonly string[], W: 
  *  selects the task (`plan:task`); pressing the selected task again clears it.
  *  When the width cannot fit id + ≥10 title cols + the tag, the tag drops
  *  first — the title never shrinks below 10 to keep it. */
-function TaskBlock(els: Els, row: PlanTask, W: number, compact: boolean, ui?: TabUi): RenderElement {
+function TaskBlock(els: Els, row: PlanTask, last: boolean, W: number, compact: boolean, ui?: TabUi, act?: (kind: string) => void): RenderElement {
   const { Box, Text } = els
   const role = roleOf(row.status)
-  const title = compact ? row.short?.title ?? row.title : row.title
+  const title = headline(compact ? row.short?.title ?? row.title : row.title)
   const lane = isDoneStatus(row.status) ? '' : laneAgent(row)
-  const chrome = 6 // '├ ' + gap + glyph + gap + the gap before the tag
+  const find = row.findings ?? 0
+  const sha = isDoneStatus(row.status) && row.last_commit != null ? row.last_commit.slice(0, 7) : ''
+  const rnd = row.round != null ? `r${row.round}` : ''
+  const rightLen = find > 0 ? `${find} findings`.length + 2 : sha !== '' ? sha.length : rnd.length
+  const chrome = 6 + (rightLen > 0 ? rightLen + 1 : 0) // '├ ' + gap + glyph + gap + the gap before the tag + the right text
   const showLane = lane !== '' && chrome + row.id.length + 1 + 10 + lane.length <= W
   const titleBudget = Math.max(1, showLane
     ? W - chrome - row.id.length - 1 - lane.length
@@ -306,7 +405,7 @@ function TaskBlock(els: Els, row: PlanTask, W: number, compact: boolean, ui?: Ta
   return (
     <Box key={row.id} flexDirection="column">
       <Box flexDirection="row" gap={1}>
-        <Text dimColor={true}>{'├ '}</Text>
+        <Text dimColor={true}>{last ? '└ ' : '├ '}</Text>
         <Text color={ROLE[role].fg}>{glyphOf(row.status)}</Text>
         {ActionButton(els, {
           key: `plan-task-${row.id}`,
@@ -317,13 +416,15 @@ function TaskBlock(els: Els, row: PlanTask, W: number, compact: boolean, ui?: Ta
         })}
         <Box flexGrow={1} />
         {showLane && <Text dimColor={true} wrap="truncate-end">{lane}</Text>}
+        {find > 0 ? Chip(els, { label: `${find} findings`, role: 'warn' }) : sha !== '' ? <Text dimColor={true}>{sha}</Text> : rnd !== '' ? <Text dimColor={true}>{rnd}</Text> : null}
+        {pauseButton(els, `plan-task-pause-${row.id}`, row.status, role === 'live', act, 'task', row.id)}
       </Box>
       {subs.map((sub, i) => TreeRow(els, {
         depth: 1,
         last: i === subs.length - 1,
         glyph: glyphOf(sub.status),
         role: roleOf(sub.status),
-        title: `${sub.id} ${sub.title}`,
+        title: `${sub.id} ${headline(sub.title)}`,
         right: sub.right,
         rightRole: sub.rightRole ?? roleOf(sub.status),
       }, W))}

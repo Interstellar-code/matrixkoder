@@ -312,7 +312,7 @@ test('Settings · Tabs: visibility bools, the C2 rows (defaultTab, hiddenTabs, r
   const drawn = draw(ui, 46, 'tabs')
   const flat = drawnText(drawn)
   expect(flat.includes('userConfig · dashboard'), 'the tabs scope-note').toBe(true)
-  for (const sig of ['o Overview', '0 Old', 'Open on', 'old ▾', 'Hidden tabs', 'Raster bars']) {
+  for (const sig of ['o Overview', 'Open on', 'overview ▾', 'Hidden tabs', 'Raster bars']) {
     expect(flat.includes(sig), `the ${sig} row`).toBe(true)
   }
   expect(flat.includes('reset Tabs to defaults'), 'the danger row').toBe(true)

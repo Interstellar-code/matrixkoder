@@ -395,7 +395,7 @@ export function WaitingTab(els: Els, view: WaitingView, cols: number, ui?: TabUi
   }
   return (
     <Box flexDirection="column">
-      {view.mock && <Text bold={true} color="warning">MOCK · fixture data · not this run</Text>}
+      {view.mock && <Text bold={true} color={ROLE.warn.fg}>MOCK · fixture data · not this run</Text>}
       {askCard(els, view, cols, ui, 'ask')}
       <Text dimColor={true}>{hintRow(view.footerLeft, view.footerRight, cols)}</Text>
     </Box>

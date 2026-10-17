@@ -152,14 +152,9 @@ test('a card shows glyph, id, cut title, phase chip and the dim lane·agent tag 
   expect(text(onMain)).toContain('✓R1.1')
   expect(text(onMain)).toContain('One home rule')
   expect(text(onMain)).not.toContain('$MK_HOME') // R1.1's long title is cut, not wrapped
-  expect(text(onMain)).toContain(' R1 ')
-  // the live task-level routes draw their tag: D1.2 slot 4 · opencode/manifest/auto;
-  // V1.1/V1.2 slot 5 · route with an agent only. At 80 cols each card is 19 wide
-  // (inner 15), so the chip row cannot hold even `L4 opencode` (11 > the 10 cells
-  // left after the phase chip): todo 94 drops the model and the tag sits alone.
-  expect(text(onMain)).toContain('L4 opencode')
-  expect(text(onMain)).toContain('L5 opencode')
-  expect(text(onMain)).not.toContain('L4 · openc')
+  // ON MAIN cards are the glyph and the dim title only: no phase chip, no lane tag
+  expect(text(onMain)).not.toContain(' R1 ')
+  expect(text(onMain)).not.toContain('L4 opencode')
   // no nowIso passed → no age text
   expect(text(tree)).not.toMatch(/\b\d+[mhd]\b/)
 })
@@ -226,12 +221,13 @@ test('narrow (36 cols) stacks the columns; wide keeps them side by side', () => 
   expect(wideParent?.props.flexDirection).toBe('row')
 })
 
-test('footer: <n> tasks · this plan only · source mk.db, following the filter', () => {
+test('footer: <n> tasks · same cards as k, this plan only · source project, following the filter', () => {
   const tree = PlanKanbanTab(stubEls(), view, W80, uiOf().handle)
-  expect(text(tree)).toContain('32 tasks · this plan only · source mk.db')
+  expect(text(tree)).toContain('32 tasks · same cards as k, this plan only')
+  expect(text(tree)).toContain('source project')
   const { handle } = uiOf(new Map([['plankanban:phase', 'S1']]))
   const narrowed = PlanKanbanTab(stubEls(), view, W80, handle)
-  expect(text(narrowed)).toContain('2 tasks · this plan only · source mk.db')
+  expect(text(narrowed)).toContain('2 tasks · same cards as k, this plan only')
 })
 
 test('no KanbanTab chrome: no Needs you off line, no Backlog/Ready/Verify headings', () => {
@@ -357,7 +353,7 @@ const picture = (cols: number): string =>
 const narrowFixture = (): ReturnType<typeof planKanbanView> => planKanbanView({
   ok: true, id: 'narrow', phases: [{ id: 'D1', tasks: [
     {
-      id: 'D1.2', title: 'mk-plan.py: write the new columns, import, delete and pause', status: 'merged',
+      id: 'D1.2', title: 'mk-plan.py: write the new columns, import, delete and pause', status: 'building',
       updated: '2026-10-14T11:38:00+02:00', slot: 4,
       route: { agent: 'opencode', model: 'zai-coding-plan/glm-5.3', effort: 'high' },
     },

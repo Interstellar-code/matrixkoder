@@ -8,7 +8,7 @@ import type { Elements, EngineInterface, On, PluginOptions, RenderElement } from
 
 // the per-surface element table $.ui.resolve(e) answers (every surface's has Box/Text)
 type Els = Elements[keyof Elements]
-import type { MkDashTab, MkEvent, MkRun, MkRunIndexEntry, MkSnapshot, MkStatusMemory, MkTask } from '../types'
+import type { MkDashTab, MkRun, MkRunIndexEntry, MkSnapshot, MkStatusMemory, MkTask } from '../types'
 import {
   AGENT_ORDER, PANE_ID, EMPTY_SNAPSHOT, basename, coerceIndex, coerceRun, coerceUsage, join,
   mkSnapshot, normalizePath, orderAgents, parentOf, parseJson, parseYamlAgents, parseYamlProviders,
@@ -16,15 +16,18 @@ import {
 } from './data'
 import type { MkPaneSnapshot } from './data'
 import { globalDirOf, homeDir, paths, projectYamlPath, resolveDataDir } from './paths'
-import { AGENT_COLOR, AGENT_GLYPH, NARROW, STATUS_COLOR, STATUS_GLYPH, bar, leftCol, rightCol } from './tabs/ui'
-import { mockRunHeader, mockTabCounts, stageWord, STAGE_TOTAL } from './tabs/header'
+import { NARROW, STATUS_GLYPH } from './tabs/ui'
+import { stageWord, STAGE_TOTAL } from './tabs/header'
 import type { RunHeaderData } from './tabs/header'
 import { Chip, Segment } from './tabs/kit'
-import { PALETTE, ROLE } from './tabs/palette'
+import { PALETTE, ROLE, withTheme } from './tabs/palette'
 import { withRaster } from './tabs/raster'
-import { EventsTab, eventsView } from './tabs/events'
-import { LanesTab, lanesView } from './tabs/lanes'
-import { OverviewTab, overviewView } from './tabs/overview'
+import { EventsTab, EVENTS_MAX } from './tabs/events'
+import type { EventsView } from './tabs/events'
+import { LanesTab } from './tabs/lanes'
+import type { LaneData, LanesView } from './tabs/lanes'
+import { OverviewTab } from './tabs/overview'
+import type { OverviewView } from './tabs/overview'
 import { PlanTab, planView } from './tabs/plan'
 import type { PlanView } from './tabs/plan'
 import { PlansTab, planActionLine } from './tabs/plans'
@@ -39,7 +42,9 @@ import {
   savedEditKeys, topChangelogEntry,
 } from './settings-io'
 import type { RunFn, SavePayload, YamlFieldIn } from './settings-io'
-import { UsageTab, usageView } from './tabs/usage'
+import { UsageTab } from './tabs/usage'
+import type { QuotaRow, UsageView } from './tabs/usage'
+import { USAGE_FIXTURE } from './tabs/usage.fixture'
 import { WaitingTab, waitingAsks, waitingView, readPending, askView, runWaitView, emptyWaitingView } from './tabs/waiting'
 import type { PendingAsk, RunWait } from './tabs/waiting'
 import { KanbanTab, kanbanView, readCards, emptyKanbanView, kanbanFixtureView, cardsErrorLine } from './tabs/kanban'
@@ -55,8 +60,7 @@ const statusMemoryAtom = atom({ plugin: 'matrixkoder', key: 'taskStatuses' } as 
   loaded: false,
 } satisfies MkStatusMemory)
 const paneOpenAtom = atom({ plugin: 'matrixkoder', key: 'paneOpen' } as const, false)
-// S0.2: 'old' (the pre-tab pane) is the default tab
-const dashTabAtom = atom({ plugin: 'matrixkoder', key: 'dashTab' } as const, 'old')
+const dashTabAtom = atom({ plugin: 'matrixkoder', key: 'dashTab' } as const, 'overview')
 // C12: the tabs' local view state (folded phases, revealed options). The tabs
 // reach it through the `ui` handle the Pane render hands them; only an onPress
 // writes it, never a render.
@@ -81,9 +85,9 @@ const PRIMARY_POOL: Record<string, string> = { agy: 'gemini', claude: 'default' 
 // the pane's glyph/colour vocabularies moved to tabs/ui.ts: one copy for the
 // pane and the tab modules (T1/T2)
 /** the tab bar (S0.2): order and hotkeys are the plan's — o Overview, l Lanes,
- * p Plan, u Usage, e Events, w Waiting, 0 Old. V0.4 dropped `short`: the bar
+ * p Plan, u Usage, e Events, w Waiting. V0.4 dropped `short`: the bar
  * carries one scheme at every width — the active tab shows its full word, the
- * others the hotkey letter plus their count (`l 4`, `p 3/8`, `w !1`, `0`). */
+ * others the hotkey letter plus their count (`l 4`, `p 3/8`, `w !1`). */
 const TABS: readonly { key: MkDashTab; hotkey: string; label: string }[] = [
   { key: 'overview', hotkey: 'o', label: 'Overview' },
   { key: 'lanes', hotkey: 'l', label: 'Lanes' },
@@ -92,7 +96,6 @@ const TABS: readonly { key: MkDashTab; hotkey: string; label: string }[] = [
   { key: 'events', hotkey: 'e', label: 'Events' },
   { key: 'waiting', hotkey: 'w', label: 'Waiting' },
   { key: 'kanban', hotkey: 'k', label: 'Kanban' },
-  { key: 'old', hotkey: '0', label: 'Old' },
   { key: 'settings', hotkey: '9', label: 'Settings' },
 ]
 
@@ -121,9 +124,6 @@ const STATUS_SHORT: Record<string, string> = {
   building: 'build', verifying: 'verify', dispatched: 'disp', stalled: 'stall', planned: 'plan',
 }
 const DONE = new Set(['done', 'merged'])
-/** test-visible alias: the F.8 not-done-count tests read the set directly */
-export const DONE_STATUSES_FOR_TEST = DONE
-const IN_PROGRESS = new Set(['dispatched', 'building', 'verifying', 'review', 'fix', 'qa', 'merged'])
 const SIDE_STATE = new Set(['blocked', 'quota', 'stalled', 'provider'])
 const LANE_LIVE = new Set(['dispatched', 'building', 'verifying', 'review', 'fix', 'stalled', 'blocked'])
 const LANE_FALLBACK = new Set(['dispatched', 'building', 'verifying', 'fix'])
@@ -169,11 +169,7 @@ let lastChipText: string | null | undefined // undefined = never set; skip ui.st
 
 export function registerDashboard(on: On, options: PluginOptions): void {
   on('session.start', async ($, e, next) => {
-    try {
-      await $.command.register({ name: 'mk', description: 'Toggle the MatrixKoder dashboard pane', argumentHint: '[open|close|setup|init]' })
-    } catch {
-      // command registration refused — /mk stays inert, the pane still renders
-    }
+    await registerMk($)
     if (options.autoOpen !== false) {
       try {
         const opened = await $.ui.open({ id: PANE_ID, title: 'MatrixKoder', columns: COLUMNS })
@@ -186,7 +182,7 @@ export function registerDashboard(on: On, options: PluginOptions): void {
     void ensureBus($, options, e.cwd) // the 15 s tick is too late for a session that needs the bus now
     await loadBrandVersion($)
     // S2.3: `defaultTab` picks the opening tab — a known visible tab stands,
-    // anything else keeps the Old default.
+    // anything else keeps the Overview default.
     const opening = typeof options.defaultTab === 'string'
       ? visibleTabs(options.hiddenTabs).find(t => t.key === options.defaultTab)
       : undefined
@@ -194,24 +190,22 @@ export function registerDashboard(on: On, options: PluginOptions): void {
       try {
         await update($, dashTabAtom, () => opening.key)
       } catch {
-        // the atom write failed — the pane keeps the Old default
+        // the atom write failed — the pane keeps the Overview default
       }
     }
     return next(e)
   })
 
+  // /mk is a per-session declaration. session.start does not fire on /clear or on a
+  // reload of unchanged modules, so the first turn of any session declares it too.
+  on('turn.start', async ($, e, next) => {
+    if (timerRegistry.mkRegistered !== true) await registerMk($)
+    void rearmLoop($, options)
+    return next(e)
+  })
+
   on('command.run', { command: 'mk' }, async ($, e, next) => {
-    // /clear fires session.end (timers cancelled) but never session.start: /mk re-arms the loop
-    if (timerRegistry.cancelRefresh == null) {
-      try {
-        const cwd = await $.session.cwd()
-        await startLoop($, options, cwd)
-        await loadBrandVersion($)
-        void ensureBus($, options, cwd) // /mk is how /clear comes back — the bus needs no /clear
-      } catch {
-        // no cwd — the pane keeps its last snapshot
-      }
-    }
+    await rearmLoop($, options)
     const args = e.args.trim().split(/\s+/)[0]?.toLowerCase() ?? ''
     if (args === 'setup' || args === 'init') {
       // wizard.tsx's command.run hook (registered after this one) answers: $ cannot cross an import
@@ -240,12 +234,14 @@ export function registerDashboard(on: On, options: PluginOptions): void {
     // Carried MEDIUM: keep the focused element's key where the Settings tab
     // reads it (`settings:focus`); the tab drops s/x/r/f/c + 1-8 while the
     // key names one of its Inputs. The ring move itself always goes through.
+    void rearmLoop($, options)
     const out = await next(e)
     await setViewKey($, 'settings:focus', e.element ?? '')
     return out
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE_ID }, async ($, e) => {
+    void rearmLoop($, options) // an open pane after /clear restarts its own loop, no /mk needed
     const els = $.ui.resolve(e)
     const { Box, Text } = els
     const snap = await read($, snapshotAtom) as MkPaneSnapshot
@@ -258,10 +254,10 @@ export function registerDashboard(on: On, options: PluginOptions): void {
     // pickBar falls back to its eighth-block bar.
     const tabEls = withRaster(els, options.raster)
     const tabs = visibleTabs(options.hiddenTabs)
-    // V0.4: the header is the snapshot's run on Old, the mock world on the six mock tabs
-    const realTab = dashTab === 'old' || dashTab === 'settings'
-    const header = realTab ? realRunHeader(snap) : mockRunHeader()
-    const counts = { ...(realTab ? realTabCounts(snap.run) : mockTabCounts()), kanban: '' }
+    // the run header comes from the live snapshot on every tab
+    const header = realRunHeader(snap)
+    // first run (no data dir): the setup gate shows on every tab; only Settings keeps its body
+    const needsSetup = snap.dataDir === null
     // C12: the tabs' view-state handle. `get` reads the atom's snapshot; `set`
     // writes it and is only ever called from an onPress (C10). `save`/`recheck`
     // are the Settings tab's live wires (S3): the ordered write and the About
@@ -288,11 +284,11 @@ export function registerDashboard(on: On, options: PluginOptions): void {
       <Box flexDirection="column" width={cols} gap={1}>
         {e.props.placement === 'inline' && (
           <Box borderStyle="round" borderColor="yellow" paddingX={1}>
-            <Text color="yellow">Run /tui fullscreen to dock this panel on the right.</Text>
+            <Text color={ROLE.warn.fg}>Run /tui fullscreen to dock this panel on the right.</Text>
           </Box>
         )}
         {snap.error && (
-          <Text color="yellow" bold={true}>⚠ {snap.error}</Text>
+          <Text color={ROLE.warn.fg} bold={true}>⚠ {snap.error}</Text>
         )}
         {/* one header for every tab: the brand block, then the run block on every tab but Settings */}
         {BrandHeader(els, cols, settingsLive?.about.installed ?? viewState['brand:version'] ?? '', settingsLive?.about.latest ?? '', String(options.mode ?? 'orchestrator'))}
@@ -302,15 +298,16 @@ export function registerDashboard(on: On, options: PluginOptions): void {
             The bar and the rule share a gap-less column so the rule sits
             directly under the bar; the pane's own gap keeps the space after it. */}
         <Box flexDirection="column">
-          {TabBar(els, $, dashTab, counts, tabs, compact)}
+          {TabBar(els, $, dashTab, tabs, compact)}
           <Text color={PALETTE.line}>{'─'.repeat(Math.max(0, cols))}</Text>
         </Box>
-        {dashTab === 'old'
-          ? OldTab(els, snap, cols, compact)
+        {needsSetup && FirstRun(els)}
+        {needsSetup && dashTab !== 'settings'
+          ? null
           : dashTab === 'overview'
-            ? OverviewTab(tabEls, overviewView(), cols, ui)
+            ? withTheme('matrix', () => snap.run == null ? NoRun(tabEls, snap) : OverviewTab(tabEls, liveOverviewView(snap), cols - 2, ui)) // Matrix theme trial: this tab only
             : dashTab === 'lanes'
-              ? withViewState(LanesTab, tabEls, lanesView(), cols, ui)
+              ? withViewState(LanesTab, tabEls, liveLanesView(snap), cols, ui)
               : dashTab === 'plan'
                 ? PlanPane(tabEls, viewState, cols, ui)
             : dashTab === 'settings'
@@ -318,9 +315,9 @@ export function registerDashboard(on: On, options: PluginOptions): void {
                 ? SettingsTab(tabEls, settingsLive, cols, ui)
                 : SettingsLoading(els, cols, viewState['settings:load:error'] ?? '')
                   : dashTab === 'usage'
-                    ? withViewState(UsageTab, tabEls, usageView(), cols, ui)
+                    ? withViewState(UsageTab, tabEls, liveUsageView(snap, typeof options.usagePollMin === 'number' && options.usagePollMin > 0 ? Math.max(USAGE_POLL_MIN_MIN, options.usagePollMin) : USAGE_POLL_DEFAULT_MIN), cols, ui)
                     : dashTab === 'events'
-                      ? withViewState(EventsTab, tabEls, eventsView(), cols, ui)
+                      ? withViewState(EventsTab, tabEls, liveEventsView(snap), cols, ui)
                       : dashTab === 'kanban'
                         ? KanbanTab(tabEls, kanbanPaneView(viewState), cols)
                         : pane.src === 'live'
@@ -427,7 +424,7 @@ function RunHeader(els: Els, head: RunHeaderData, cols: number) {
         <Text dimColor={true}>{truncateTitle(head.sub, cols)}</Text>
       )}
       {wrapToCols(`▶ ${head.next}`, cols).map((line, i) => (
-        <Text key={`next-${String(i)}`} color="subtle">{line}</Text>
+        <Text key={`next-${String(i)}`} color={PALETTE.mut}>{line}</Text>
       ))}
     </Box>
   )
@@ -461,31 +458,31 @@ function wrapToCols(text: string, cols: number): string[] {
  *  `w: !1`) — or the `·` placeholder when it has none (`o: ·`), never its own
  *  letter. At 36 cols the wrapped bar runs to two rows; no row is wider than
  *  the pane. */
-function TabBar(els: Els, $: EngineInterface, dashTab: MkDashTab, counts: Record<MkDashTab, string>, tabs: readonly { key: MkDashTab; hotkey: string; label: string }[], compact: boolean) {
+function TabBar(els: Els, $: EngineInterface, dashTab: MkDashTab, tabs: readonly { key: MkDashTab; hotkey: string; label: string }[], compact: boolean) {
   const { Box, Button } = els
   return (
     <Box flexDirection="row" flexWrap="wrap">
       {tabs.map(t => {
         const active = dashTab === t.key
-        const count = counts[t.key]
         // the open tab sits on the tint like the Settings sub-strip's picked scope; it stays a press (its key and hotkey)
         const btn = (
           <Button
             key={`dash-tab-${t.key}`}
             hotkey={t.hotkey}
-            label={active || !compact ? `${t.label}${count === '' ? '' : ` ${count}`}` : count === '' ? '·' : count}
+            // no counts on the tab buttons (3/8, 4, !1 read as noise); the hotkey prefix stays
+            label={active || !compact ? t.label : t.hotkey}
             plain={true}
             dimColor={active ? undefined : true}
             onPress={() => { void switchTab($, t.key) }}
           />
         )
-        return <Box key={`dash-tab-${t.key}-box`} borderStyle="round" borderColor={active ? ROLE.live.fg : '#5b6776'} backgroundColor={active ? ROLE.live.tint : undefined}>{btn}</Box>
+        return <Box key={`dash-tab-${t.key}-box`} backgroundColor={active ? ROLE.live.tint : PALETTE.btn} paddingX={1} marginRight={1}>{btn}</Box>
       })}
     </Box>
   )
 }
 
-/** The Old tab's header from the real snapshot (the newest run); no run, no
+/** The run header from the real snapshot (the newest run); no run, no
  *  header — first-run and no-run keep their own panels. */
 function realRunHeader(snap: MkPaneSnapshot): RunHeaderData | null {
   const run = snap.run
@@ -500,26 +497,34 @@ function realRunHeader(snap: MkPaneSnapshot): RunHeaderData | null {
   }
 }
 
-/** The Old tab's tab-bar counts from the same snapshot (the mockup's count
- *  vocabulary): live lanes, done/total, one open decision. */
-function realTabCounts(run: MkRun | null): Record<MkDashTab, string> {
-  const none: Record<MkDashTab, string> = { overview: '', lanes: '', plan: '', usage: '', events: '', waiting: '', kanban: '', old: '', settings: '' }
-  if (run == null) return none
-  const done = run.tasks.filter(t => DONE.has(t.status)).length
-  return {
-    ...none,
-    lanes: String(liveLaneRows(run)),
-    plan: `${done}/${run.tasks.length}`,
-    waiting: run.waiting ? '!1' : '',
+/** Declares /mk for this session; safe to call again (a re-declare replaces it). */
+async function registerMk($: EngineInterface): Promise<void> {
+  try {
+    await $.command.register({ name: 'mk', description: 'Toggle the MatrixKoder dashboard pane', argumentHint: '[open|close|setup|init]' })
+    timerRegistry.mkRegistered = true
+  } catch {
+    // command registration refused — /mk stays inert, the pane still renders
   }
 }
 
-/** The rows LanesSection lists (one per lane path, else the live tasks standing
- *  in) — the tab-bar count must agree with the rows below it. */
-function liveLaneRows(run: MkRun): number {
-  const lanes = run.tasks.filter(t => t.lane && LANE_LIVE.has(t.status))
-  if (lanes.length > 0) return new Set(lanes.map(t => t.lane)).size
-  return run.tasks.filter(t => LANE_FALLBACK.has(t.status)).length
+let rearmInFlight = false
+
+/** /clear fires session.end (timers cancelled) but never session.start, so the pane kept
+ *  drawing frozen data until /mk. /mk, a pane render and a pane focus all call this; it
+ *  restarts the loop only when it is dead, once at a time. */
+export async function rearmLoop($: EngineInterface, options: PluginOptions): Promise<void> {
+  if (timerRegistry.cancelRefresh != null || rearmInFlight) return
+  rearmInFlight = true
+  try {
+    const cwd = await $.session.cwd()
+    await startLoop($, options, cwd)
+    await loadBrandVersion($)
+    void ensureBus($, options, cwd) // the bus needs no /clear either
+  } catch {
+    // no cwd — the pane keeps its last snapshot
+  } finally {
+    rearmInFlight = false
+  }
 }
 
 /** Arms the refresh, usage-poll and lane-sweep timers for `cwd`, then loads the first snapshot. */
@@ -816,7 +821,9 @@ function plansViewOf(view: Record<string, string>, onAction: (kind: string, id: 
   // L7.2 R2: the root overview holds every project's plan_summary; keep only the
   // active project's plans (the alias row sharing its store dir counts).
   const mapped = plansFromOverview(parsed ?? {}, view[PLANS_DIR_KEY] ?? '')
-  return { mock: false, runs: mapped.runs, plans: mapped.plans, onAction }
+  const at = Number(view[PLANS_AT_KEY] ?? '0')
+  const cachedAt = at > 0 ? new Date(at).toTimeString().slice(0, 5) : ''
+  return { mock: false, runs: mapped.runs, plans: mapped.plans, onAction, cachedAt }
 }
 
 function planDetailViewOf(view: Record<string, string>, id: string): PlanView | null {
@@ -827,7 +834,8 @@ function planDetailViewOf(view: Record<string, string>, id: string): PlanView | 
   return planFromReply(parsed)
 }
 
-export function PlanPane(els: Els, view: Record<string, string>, cols: number, ui: TabUi): RenderElement {
+export function PlanPane(els: Els, view: Record<string, string>, paneCols: number, ui: TabUi): RenderElement {
+  const cols = paneCols - 2 // the paddingX of the navy ground below
   const { Box, Text } = els
   if (view[PLANS_STORE_KEY] !== '1') return PlanTab(els, planView(), cols, ui)
   const sub = planSubOf(view)
@@ -855,7 +863,7 @@ export function PlanPane(els: Els, view: Record<string, string>, cols: number, u
   } else if (sub === 'detail') {
     const detail = planDetailViewOf(view, sel)
     detailView = detail
-    body = detail == null ? <Text>loading {sel}</Text> : PlanTab(els, detail, cols, ui)
+    body = detail == null ? <Text>loading {sel}</Text> : PlanTab(els, { ...detail, onAction }, cols, ui)
   } else {
     // V1.4: PlanKanbanTab from the raw `plans <id>` reply — kept raw because
     // the mapped PlanView drops `verdict`, which the NEEDS YOU column reads.
@@ -875,12 +883,15 @@ export function PlanPane(els: Els, view: Record<string, string>, cols: number, u
   const selRow = selTask !== '' ? findPlanTask(detailView?.phases, selTask) : null
   if (selRow != null) {
     const panel = PlanTaskPanel(els, selRow, cols, () => { ui.set('plan:task', '') })
-    body = cols >= 59
-      ? <Box flexDirection="column" gap={1}>{body}{panel}</Box>
+    // the pop-up: Detail draws it in place of the phases box (header, PHASES row and footer stay);
+    // Kanban has no such slot, so the panel takes the body
+    body = sub === 'detail' && detailView != null
+      ? PlanTab(els, { ...detailView, onAction, taskPanel: panel }, cols, ui)
       : panel
   }
   return (
-    <Box flexDirection="column" gap={1}>
+    // the design's navy ground under the whole Plan tab, not the terminal grey around navy cards
+    <Box flexDirection="column" gap={1} flexGrow={1} backgroundColor={PALETTE.bg} paddingX={1} paddingY={1}>
       <Box flexDirection="row" gap={1}>
         {PLAN_SUBS.map(name => Segment(els, {
           key: `plan-sub-${name}`,
@@ -889,7 +900,7 @@ export function PlanPane(els: Els, view: Record<string, string>, cols: number, u
           onPress: () => { ui.set('plan:sub', name) },
         }))}
       </Box>
-      {errorLine != null ? <Text color="yellow" bold={true}>{errorLine}</Text> : null}
+      {errorLine != null ? <Text color={ROLE.warn.fg} bold={true}>{errorLine}</Text> : null}
       {body}
     </Box>
   )
@@ -1635,42 +1646,15 @@ async function recheckAbout($: EngineInterface): Promise<void> {
 
 // ---------- sections (plain functions: JSX tags resolve to locals by name) ----------
 
-/** The pane as it was before the tab bar (S0.2): first-run, no-run and the
- * per-run sections with Usage/Waiting/Recent below, moved here unchanged. */
-function OldTab(els: Els, snap: MkPaneSnapshot, cols: number, compact: boolean) {
-  const { Box } = els
-  const active = snap.activeRuns
-  return (
-    <Box flexDirection="column" gap={1}>
-      {snap.dataDir === null
-        ? FirstRun(els)
-        : active.length === 0
-          ? NoRun(els, snap)
-          : active.map(run => (
-            // one Run/Plan/Lanes block per active run, newest first; Usage /
-            // Waiting / Recent below are global and render once
-            <Box key={run.id} flexDirection="column" gap={1}>
-              {RunSection(els, run, compact)}
-              {PlanSection(els, run, cols, compact, snap.now)}
-              {LanesSection(els, run, cols)}
-            </Box>
-          ))}
-      {UsageSection(els, snap, compact)}
-      {snap.run?.waiting && WaitingSection(els, snap.run.waiting)}
-      {snap.run && RecentSection(els, (snap.run.recent ?? []).slice(-3).reverse(), compact)}
-    </Box>
-  )
-}
-
 function FirstRun(els: Els) {
   const { Box, Text } = els
   return (
     <Box flexDirection="column">
       <Text bold={true}>Setup</Text>
-      <Text color="cyan" bold={true}>⬡ Welcome to MatrixKoder!</Text>
+      <Text color={PALETTE.blue} bold={true}>⬡ Welcome to MatrixKoder!</Text>
       <Text>Configuration required for this project:</Text>
-      <Text color="yellow" bold={true}>[!] Missing .matrixkoder/matrixkoder.yaml</Text>
-      <Text color="cyan" bold={true}>▶ Run /mk setup to launch the wizard</Text>
+      <Text color={ROLE.warn.fg} bold={true}>[!] No project config yet (projects/&lt;slug&gt;/project.yaml)</Text>
+      <Text color={PALETTE.blue} bold={true}>▶ Run /mk setup to launch the wizard</Text>
     </Box>
   )
 }
@@ -1682,14 +1666,14 @@ function NoRun(els: Els, snap: MkSnapshot) {
     <Box flexDirection="column">
       <Text bold={true}>Run</Text>
       <Text>No active orchestration run.</Text>
-      <Text dimColor={true}>To start a new multi-lane feature run:</Text>
-      <Text color="cyan" bold={true}>▶ Run /mk init &lt;feature-name&gt;</Text>
+      <Text dimColor={true}>To start a multi-lane feature run, ask Claude to orchestrate it.</Text>
+      <Text color={PALETTE.blue} bold={true}>▶ New project? Run /mk setup</Text>
       {past.length > 0 && (
         <Box flexDirection="column" marginTop={1}>
           <Text bold={true}>Recent Runs</Text>
           {past.map(r => (
             <Box key={r.id} flexDirection="row" gap={1}>
-              <Text color="green">✓</Text>
+              <Text color={ROLE.ok.fg}>✓</Text>
               <Text bold={true}>{r.id}</Text>
               <Text dimColor={true}>{r.feature ?? ''} {r.status ?? ''}</Text>
             </Box>
@@ -1700,42 +1684,6 @@ function NoRun(els: Els, snap: MkSnapshot) {
   )
 }
 
-function RunSection(els: Els, run: MkRun, compact: boolean) {
-  const { Box, Text } = els
-  const head = run.head_sha ? `@${run.head_sha.slice(0, 7)}` : ''
-  const feature = compact ? run.feature.split('-')[0] : run.feature
-  return (
-    <Box flexDirection="column">
-      <Text bold={true}>Run</Text>
-      <Box flexDirection="row" gap={1}>
-        <Text bold={true}>{feature}</Text>
-        {run.branch && <Text dimColor={true}>· {run.branch}{head}</Text>}
-        <Text dimColor={true}>·</Text>
-        <Text color="cyan" bold={true}>{compact ? 'stg' : 'stage'} {run.stage}/12</Text>
-      </Box>
-      {run.next && (
-        <Text wrap="truncate-end"><Text color="cyan" bold={true}>▶ Next: </Text>{sanitizeText(run.next, 120)}</Text>
-      )}
-    </Box>
-  )
-}
-
-function wavePills(tasks: readonly MkTask[], compact: boolean): { label: string; glyphs: string; color: string }[] {
-  const waves = new Map<string, MkTask[]>()
-  for (const t of tasks) {
-    const key = t.wave == null ? 'W·' : `W${t.wave}`
-    waves.set(key, [...(waves.get(key) ?? []), t])
-  }
-  return [...waves.entries()].sort((a, b) => a[0].localeCompare(b[0], undefined, { numeric: true })).map(([label, list]) => {
-    if (list.every(t => DONE.has(t.status))) return { label, glyphs: '✓', color: 'green' }
-    if (list.every(t => t.status === 'planned')) return { label, glyphs: '○', color: 'gray' }
-    const active = list.filter(t => !DONE.has(t.status) && t.status !== 'planned').length
-    if (compact) return { label, glyphs: `${active}/${list.length}`, color: 'yellow' }
-    const glyphs = list.map(t => STATUS_GLYPH[t.status] ?? '○').join('')
-    return { label, glyphs, color: 'yellow' }
-  })
-}
-
 function elapsedMin(task: MkTask, nowMs: number): number | null {
   const t = Date.parse(task.updated ?? '')
   if (!Number.isFinite(t) || !nowMs) return null
@@ -1744,120 +1692,6 @@ function elapsedMin(task: MkTask, nowMs: number): number | null {
 
 function statusWord(status: string, compact: boolean): string {
   return compact ? STATUS_SHORT[status] ?? status : status
-}
-
-function PlanSection(els: Els, run: MkRun, cols: number, compact: boolean, nowMs: number) {
-  const { Box, Text } = els
-  const done = run.tasks.filter(t => DONE.has(t.status)).length
-  const total = run.tasks.length
-  return (
-    <Box flexDirection="column">
-      <Box flexDirection="row" justifyContent="space-between">
-        <Box flexDirection="row" gap={1}>
-          <Text bold={true}>Plan</Text>
-          <Text color="green">{done}/{total} done</Text>
-        </Box>
-        <Box flexDirection="row" gap={1}>
-          {wavePills(run.tasks, compact).map(w => (
-            <Box key={w.label} flexDirection="row">
-              <Text dimColor={true}>{w.label} </Text>
-              <Text color={w.color}>{w.glyphs}</Text>
-            </Box>
-          ))}
-        </Box>
-      </Box>
-      {run.tasks.map(task => {
-        const isDone = task.status === 'done'
-        const isActive = IN_PROGRESS.has(task.status)
-        const isAttention = SIDE_STATE.has(task.status)
-        const checkbox = isDone ? '[✓]' : isActive ? '[•]' : isAttention ? '[!]' : '[ ]'
-        const checkColor = isDone ? 'green' : isActive ? 'cyan' : isAttention ? 'yellow' : 'gray'
-        const word = statusWord(task.status, compact)
-        const round = task.round && (task.status === 'review' || task.status === 'fix') ? ` r${task.round}` : ''
-        const mins = task.status === 'building' || task.status === 'verifying' || task.status === 'stalled' ? elapsedMin(task, nowMs) : null
-        const suffix = `${round}${mins != null ? ` ${mins}m` : ''}`
-        const sha = cols >= 44 && task.last_commit ? task.last_commit.slice(0, 7) : ''
-        // the title yields to the status column and the age (D1.2): truncate
-        // with … to the columns left after checkbox + id and status + age + sha
-        const budget = cols - (checkbox.length + 1 + task.id.length + 1) - 1 - (word.length + suffix.length + (sha ? 1 + sha.length : 0))
-        const title = compact
-          ? task.title.slice(0, Math.min(14, Math.max(1, budget))) // §3.7: 14-char title budget
-          : truncateTitle(task.title, budget)
-        return (
-          <Box key={task.id} flexDirection="row" justifyContent="space-between" gap={1}>
-            <Box flexDirection="row" gap={1} flexShrink={1}>
-              <Text color={checkColor} bold={isActive || isAttention}>{checkbox}</Text>
-              <Text bold={true}>{task.id}</Text>
-              <Text dimColor={task.status === 'planned'} wrap="truncate-end">{title}</Text>
-            </Box>
-            <Box flexDirection="row" gap={1} flexShrink={0}>
-              <Text color={STATUS_COLOR[task.status] ?? 'text'}>{word}{suffix}</Text>
-              {sha && <Text dimColor={true}>{sha}</Text>}
-            </Box>
-          </Box>
-        )
-      })}
-    </Box>
-  )
-}
-
-function LanesSection(els: Els, run: MkRun, cols: number) {
-  const { Box, Text } = els
-  const lanes = run.tasks.filter(t => t.lane && LANE_LIVE.has(t.status))
-  // one row per LANE PATH (D1.1): phases sharing a worktree share one lane row
-  // listing their phase ids — parents only, child tasks are never listed. No
-  // task carries a lane (early run, lanes not dispatched yet): the live
-  // dispatched|building|verifying|fix tasks stand in with agent glyph + model.
-  const rows: { key: string; slot: string; head: MkTask; tasks: MkTask[] }[] = []
-  if (lanes.length > 0) {
-    const byLane = new Map<string, { head: MkTask; tasks: MkTask[] }>()
-    for (const t of lanes) {
-      const key = t.lane ?? ''
-      const group = byLane.get(key) ?? { head: t, tasks: [] }
-      group.tasks.push(t)
-      byLane.set(key, group)
-    }
-    for (const [lane, group] of byLane) {
-      rows.push({ key: lane, slot: lane.split('/').filter(Boolean).at(-1) ?? lane, ...group })
-    }
-  } else {
-    for (const t of run.tasks.filter(t => LANE_FALLBACK.has(t.status))) {
-      rows.push({ key: t.id, slot: '·', head: t, tasks: [t] })
-    }
-  }
-  return (
-    <Box flexDirection="column">
-      <Text bold={true}>Lanes</Text>
-      {rows.length === 0 && <Text dimColor={true}>none live</Text>}
-      {rows.map(({ key, slot, head, tasks }) => {
-        const status = rollupLaneStatus(tasks)
-        const rep = tasks.find(t => t.status === status) ?? head
-        const parents = tasks.filter(t => !t.parent)
-        const ids = (parents.length > 0 ? parents : tasks).map(t => t.id).join(' ')
-        const agent = rep.agent ?? 'agent'
-        return (
-          <Box key={key} flexDirection="row" justifyContent="space-between" gap={1}>
-            <Box flexDirection="row" gap={1} flexShrink={1}>
-              <Text dimColor={true}>{slot}</Text>
-              <Text color={AGENT_COLOR[agent] ?? 'cyan'} bold={true}>{AGENT_GLYPH[agent] ?? '⌂'} {agent.toUpperCase()}</Text>
-              <Text dimColor={true} wrap="truncate-end">{[rep.model, rep.effort].filter(Boolean).join('-')}</Text>
-              <Text wrap="truncate-end">{ids}</Text>
-            </Box>
-            <Box flexDirection="row" gap={1} flexShrink={0}>
-              <Text color={SIDE_STATE.has(status) ? 'yellow' : 'cyan'}>{status}</Text>
-              {cols >= 44 && rep.last_commit && <Text dimColor={true}>{rep.last_commit.slice(0, 7)}</Text>}
-            </Box>
-          </Box>
-        )
-      })}
-    </Box>
-  )
-}
-
-function pctColor(pct: number | null | undefined, exhausted: boolean): string {
-  if (exhausted || (pct ?? 0) > 85) return 'red'
-  if ((pct ?? 0) > 60) return 'yellow'
-  return 'green'
 }
 
 function resetStr(iso: string | null | undefined, now: number, compact: boolean): string {
@@ -1996,97 +1830,179 @@ function usageRows(snap: MkSnapshot, compact: boolean): UsageRow[] {
   })
 }
 
-function UsageSection(els: Els, snap: MkSnapshot, compact: boolean) {
-  const { Box, Text } = els
-  const rows = usageRows(snap, compact)
-  const barW = compact ? 5 : 7 // design §4.2: 7 standard, 5 compact
-  const NAME_W = 14 // fits '  └ claude-gpt': sub-row labels and agent names share one column
-  const NUM_W = 5
-  const RESET_W = 6
-  // a missing 5h window is '—' like the week column; 'n/a' only for a whole entry the provider could not answer
-  const pctCol = (pct: number | null, na: boolean): string => (pct == null ? rightCol(na ? 'n/a' : '—', NUM_W) : rightCol(`${Math.round(pct)}%`, NUM_W))
-  const weekCol = (pct: number | null): string => (pct == null ? rightCol('—', NUM_W) : rightCol(`${Math.round(pct)}%`, NUM_W))
-  const resetCol = (iso: string | null): string => rightCol(resetStr(iso, snap.now, compact), RESET_W)
-
-  const row = (keyId: string, name: string, nameColor: string | undefined, boldName: boolean, pct: number | null, weekPct: number | null, resetIso: string | null, exhausted: boolean, exhaustedUntil: string | null, na: boolean, isHeader: boolean) => {
-    const color = pctColor(pct, exhausted)
-    const resetIsoShown = exhausted && exhaustedUntil ? exhaustedUntil : resetIso
-    return (
-      <Box key={keyId} flexDirection="row" gap={0}>
-        <Text color={nameColor} bold={boldName}>{leftCol(name, NAME_W)}</Text>
-        {isHeader ? (
-          <Text dimColor={true}>{' '.repeat(barW + NUM_W + (compact ? 0 : NUM_W) + RESET_W)}</Text>
-        ) : (
-          [
-            <Text key="bar" color={color} bold={exhausted}>{bar(pct, barW)}</Text>,
-            <Text key="pct" color={pct == null ? 'gray' : color} bold={exhausted}>{pctCol(pct, na)}</Text>,
-            ...(compact ? [] : [<Text key="week" dimColor={true}>{weekCol(weekPct)}</Text>]),
-            <Text key="reset" dimColor={!exhausted} color={exhausted ? 'red' : undefined} bold={exhausted}>{resetCol(resetIsoShown)}</Text>,
-            ...(exhausted ? [<Text key="ex" color="red" bold={true}>⊘</Text>] : []),
-          ]
-        )}
-      </Box>
-    )
+/** The Usage tab's live view: the snapshot's ledger rows (usageRows:
+ *  `claude (all)`, `└` pool rows, ⊘ exhausted, n/a, hints) in the tab's QuotaRow shape.
+ *  Jev routing has no recorded source yet, so that card is empty, never invented. */
+export function liveUsageView(snap: MkSnapshot, pollMin: number): UsageView {
+  const q = (pct: number | null, na: boolean, exhausted: boolean): QuotaRow['five'] =>
+    exhausted ? { pct: 100, used: '⊘' } : pct == null ? (na ? { pct: 0, used: 'n/a' } : undefined) : { pct, used: `${Math.round(pct)}%`, floor: 80 }
+  const rows: QuotaRow[] = []
+  for (const r of usageRows(snap, false)) {
+    if (r.hint != null) { rows.push({ name: r.label, nameTone: 'dim', note: r.hint, noteTone: 'dim' }); continue }
+    if (r.header) { rows.push({ name: r.label, note: 'provider pools below', noteTone: 'dim' }); continue }
+    rows.push({
+      name: r.label.trim(),
+      ...(r.label.startsWith('  ') ? { nameTone: 'dim' as const } : {}),
+      five: q(r.pct, r.na, r.exhausted),
+      week: q(r.weekPct, false, false),
+      reset: resetStr(r.exhausted && r.exhaustedUntil ? r.exhaustedUntil : r.reset, snap.now, false).trim(),
+    })
+    for (const p of r.sub) {
+      rows.push(p.hint != null
+        ? { name: `└ ${p.name}`, nameTone: 'dim', note: p.hint, noteTone: 'dim' }
+        : { name: `└ ${p.name}`, nameTone: 'dim', five: q(p.pct, false, p.exhausted), week: q(p.weekPct, false, false), reset: resetStr(p.exhausted && p.exhaustedUntil ? p.exhaustedUntil : p.reset, snap.now, false).trim() })
+    }
   }
-
-  return (
-    <Box flexDirection="column">
-      <Box flexDirection="row" gap={0}>
-        <Text bold={true}>Usage</Text>
-        <Text>{' '.repeat(Math.max(1, NAME_W + barW - 6))}</Text>
-        <Text dimColor={true}>{rightCol('5h', NUM_W)}</Text>
-        {!compact && <Text dimColor={true}>{rightCol('week', NUM_W)}</Text>}
-        <Text dimColor={true}>{rightCol('reset', RESET_W)}</Text>
-      </Box>
-      {rows.length === 0 && <Text dimColor={true}>no ledger yet</Text>}
-      {rows.map(r => (
-        <Box key={r.name} flexDirection="column">
-          {r.hint != null
-            ? <Text dimColor={true}>{leftCol(r.label, NAME_W)}{r.hint}</Text>
-            : row(r.name, leftCol(r.label, NAME_W), AGENT_COLOR[r.name] ?? 'cyan', r.exhausted, r.pct, r.weekPct, r.reset, r.exhausted, r.exhaustedUntil, r.na, r.header)}
-          {r.sub.map(p => (
-            p.hint != null
-              ? <Text key={`${r.name}:${p.name}`} dimColor={true}>{leftCol(`  └ ${compact ? p.name.slice(0, 6) : p.name}`, NAME_W)}{p.hint}</Text>
-              : row(`${r.name}:${p.name}`, `  └ ${compact ? p.name.slice(0, 6) : p.name}`, undefined, false, p.pct, p.weekPct, p.reset, p.exhausted, p.exhaustedUntil, false, false)
-          ))}
-        </Box>
-      ))}
-    </Box>
-  )
+  return {
+    ...USAGE_FIXTURE,
+    mock: false,
+    rows,
+    actions: `usage.json · CodexBar · poll ${pollMin}m`,
+    decisionsRight: '',
+    decisions: [],
+    routingHint: 'Jev decisions show here once routing is recorded',
+  }
 }
 
-function WaitingSection(els: Els, waiting: NonNullable<MkRun['waiting']>) {
-  const { Box, Text } = els
-  return (
-    <Box flexDirection="column">
-      <Text color="red" bold={true}>Waiting on you</Text>
-      <Text bold={true} wrap="wrap">{sanitizeText(waiting.question, 160)}</Text>
-      {waiting.options && waiting.options.length > 0 && (
-        <Box flexDirection="column" marginTop={1}>
-          {waiting.options.map((opt, i) => (
-            <Text key={opt} dimColor={opt !== waiting.rec} color={opt === waiting.rec ? 'cyan' : undefined}>
-              [{i + 1}] {sanitizeText(opt, 60)}{opt === waiting.rec ? ' (Rec)' : ''}
-            </Text>
-          ))}
-        </Box>
-      )}
-    </Box>
-  )
+// ---------- live views for Overview / Lanes / Events (same snapshot as liveUsageView) ----------
+
+const hhmm = (iso: string | null | undefined): string => (iso ?? '').slice(11, 16)
+
+/** local HH:MM of an ISO instant; '—' when it does not parse. */
+function clockOf(iso: string | null | undefined): string {
+  const d = new Date(iso ?? '')
+  return Number.isNaN(d.getTime()) ? '—' : `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
 
-function RecentSection(els: Els, events: readonly MkEvent[], compact: boolean) {
-  const { Box, Text } = els
-  return (
-    <Box flexDirection="column">
-      <Text bold={true}>Recent</Text>
-      {events.length === 0 && <Text dimColor={true}>nothing yet</Text>}
-      {events.map((ev, i) => (
-        <Box key={`ev${String(i)}`} flexDirection="row" gap={1}>
-          {!compact && <Text dimColor={true}>{(ev.t ?? '').slice(11, 16)}</Text>}
-          {/* event text is lane-watch pane evidence — sanitised before display */}
-          <Text wrap="truncate-end" color={ev.type === 'verdict' ? 'green' : undefined}>{sanitizeText(ev.text ?? '', compact ? 40 : 80)}</Text>
-        </Box>
-      ))}
-    </Box>
-  )
+/** ` r2 14m`: the review/fix round and the age of a running task, '' when neither applies. */
+function taskSuffix(t: MkTask, now: number): string {
+  const round = t.round && (t.status === 'review' || t.status === 'fix') ? ` r${t.round}` : ''
+  const mins = t.status === 'building' || t.status === 'verifying' || t.status === 'stalled' ? elapsedMin(t, now) : null
+  return `${round}${mins != null ? ` ${mins}m` : ''}`
 }
+
+/** One entry per lane path (phases sharing a worktree share a row); no task carries a
+ *  lane yet → the live tasks stand in. */
+function laneGroups(run: MkRun): { slot: string; ids: string; status: string; rep: MkTask }[] {
+  const out: { slot: string; ids: string; status: string; rep: MkTask }[] = []
+  const add = (slot: string, tasks: MkTask[]): void => {
+    const status = rollupLaneStatus(tasks)
+    const rep = tasks.find(t => t.status === status) ?? tasks[0]
+    if (rep == null) return
+    const parents = tasks.filter(t => !t.parent)
+    out.push({ slot, ids: (parents.length > 0 ? parents : tasks).map(t => t.id).join(' '), status, rep })
+  }
+  const lanes = run.tasks.filter(t => t.lane && LANE_LIVE.has(t.status))
+  if (lanes.length > 0) {
+    const by = new Map<string, MkTask[]>()
+    for (const t of lanes) by.set(t.lane ?? '', [...(by.get(t.lane ?? '') ?? []), t])
+    for (const [lane, tasks] of by) add(lane.split('/').filter(Boolean).at(-1) ?? lane, tasks)
+  } else {
+    for (const t of run.tasks.filter(t => LANE_FALLBACK.has(t.status))) add('·', [t])
+  }
+  return out
+}
+
+/** The Overview's live view. No source for: the model's short name (= the model), lane
+ *  slot of an un-laned run ('·'). Waiting/usage/recent are empty when the snapshot has none. */
+export function liveOverviewView(snap: MkSnapshot): OverviewView {
+  const run = snap.run
+  const tasks = run?.tasks ?? []
+  const byWave = new Map<string, MkTask[]>()
+  for (const t of tasks) {
+    const key = t.wave == null ? 'W·' : `W${t.wave}`
+    byWave.set(key, [...(byWave.get(key) ?? []), t])
+  }
+  const waves = [...byWave.entries()].sort((a, b) => a[0].localeCompare(b[0], undefined, { numeric: true })).map(([label, list]) => ({
+    label,
+    glyphs: list.map(t => (DONE.has(t.status) ? '✓' : STATUS_GLYPH[t.status] ?? '○')).join(''),
+    tone: list.every(t => DONE.has(t.status)) ? 'done' as const : list.every(t => t.status === 'planned') ? 'planned' as const : 'active' as const,
+  }))
+  const w = run?.waiting
+  const options = (w?.options ?? []).map(o => sanitizeText(o, 60))
+  return {
+    mock: false,
+    run: {
+      name: run?.feature ?? '',
+      id: run?.id ?? '',
+      short: run?.head_sha?.slice(0, 7) ?? '',
+      stage: run?.stage ?? 0,
+      stages: STAGE_TOTAL,
+      stageWord: run ? stageWord(run.stage) : '',
+      next: sanitizeText(run?.next, 120),
+    },
+    plan: { done: tasks.filter(t => DONE.has(t.status)).length, total: tasks.length },
+    waves,
+    tasks: tasks.filter(t => !DONE.has(t.status)).map(t => {
+      const suffix = taskSuffix(t, snap.now)
+      return { id: t.id, title: t.title, status: t.status, note: `${t.status}${suffix}`, short: `${statusWord(t.status, true)}${suffix}` }
+    }),
+    lanes: (run ? laneGroups(run) : []).map(g => ({
+      slot: g.slot,
+      agent: g.rep.agent ?? 'agent',
+      model: g.rep.model ?? '',
+      modelShort: g.rep.model ?? '',
+      effort: g.rep.effort ?? '',
+      status: g.status,
+      note: g.status,
+      short: statusWord(g.status, true),
+    })),
+    usage: usageRows(snap, false)
+      .filter(r => r.hint == null && !r.header && (r.pct != null || r.exhausted))
+      .map(r => ({
+        label: r.label.trim(),
+        short: r.name,
+        pct: Math.round(r.pct ?? 0),
+        weekPct: Math.round(r.weekPct ?? 0),
+        reset: r.reset == null || r.exhausted ? null : resetStr(r.reset, snap.now, false),
+        exhausted: r.exhausted,
+        until: r.exhausted ? clockOf(r.exhaustedUntil) : null,
+      })),
+    waiting: {
+      since: hhmm(w?.since),
+      question: sanitizeText(w?.question, 160),
+      options,
+      rec: w?.rec == null ? -1 : (w.options ?? []).indexOf(w.rec),
+      shortQuestion: sanitizeText(w?.question, 160),
+      shortOptions: options,
+    },
+    recent: (run?.recent ?? []).slice(-3).reverse().map(ev => ({ t: hhmm(ev.t), text: sanitizeText(ev.text ?? '', 80) })),
+  }
+}
+
+/** The Lanes tab's live view: one card per lane from run.tasks. No live source for the
+ *  stage strip, gate table, review counts, activity line, commit subject or pane id, so
+ *  those stay empty. */
+export function liveLanesView(snap: MkSnapshot): LanesView {
+  const groups = snap.run ? laneGroups(snap.run) : []
+  const held = groups.filter(g => SIDE_STATE.has(g.status)).length
+  const lanes: LaneData[] = groups.map(g => ({
+    status: g.status,
+    task: g.ids,
+    title: g.rep.title,
+    right: taskSuffix(g.rep, snap.now).trim(),
+    agent: [{ text: [g.rep.agent ?? 'agent', g.rep.model, g.rep.effort ? `effort ${g.rep.effort}` : ''].filter(Boolean).join(' · ') }],
+    ...(g.rep.last_commit ? { commit: { sha: g.rep.last_commit.slice(0, 7), subject: '' } } : {}),
+    gate: [],
+    actions: '',
+  }))
+  return {
+    mock: false,
+    summary: groups.length === 0 ? 'no live lanes' : `${groups.length} lanes · ${groups.length - held} live · ${held} held`,
+    summaryRight: '',
+    lanes,
+    footerLeft: '',
+    footerRight: '',
+  }
+}
+
+/** The Events tab's live view: run.recent, newest first (type/text as lane-watch wrote them). */
+export function liveEventsView(snap: MkSnapshot): EventsView {
+  const all = [...(snap.run?.recent ?? [])].reverse()
+  return {
+    mock: false,
+    events: all.slice(0, EVENTS_MAX).map(ev => ({ t: hhmm(ev.t), type: ev.type ?? '', text: sanitizeText(ev.text ?? '', 120) })),
+    earlierCount: Math.max(0, all.length - EVENTS_MAX),
+  }
+}
+

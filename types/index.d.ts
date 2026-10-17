@@ -115,8 +115,8 @@ export type MkStatusMemory = {
   runId?: string | null
 }
 
-/** dashboard.tsx (S0.2): the /mk pane's tabs — 'old' is the pre-tab pane, the rest are the six mock tabs */
-export type MkDashTab = 'old' | 'overview' | 'lanes' | 'plan' | 'usage' | 'events' | 'waiting' | 'kanban' | 'settings'
+/** dashboard.tsx (S0.2): the /mk pane's tabs */
+export type MkDashTab = 'overview' | 'lanes' | 'plan' | 'usage' | 'events' | 'waiting' | 'kanban' | 'settings'
 
 declare module 'claude-code' {
   interface PluginState {
@@ -124,7 +124,7 @@ declare module 'claude-code' {
       snapshot: MkSnapshot
       taskStatuses: MkStatusMemory
       paneOpen: boolean
-      /** dashboard.tsx: the /mk pane's selected tab ('old' = the pre-tab pane) */
+      /** dashboard.tsx: the /mk pane's selected tab */
       dashTab: MkDashTab
       /** dashboard.tsx: the tabs' local view state (folded phases, revealed
        *  options) — C12: only an onPress ever writes it, never a render */

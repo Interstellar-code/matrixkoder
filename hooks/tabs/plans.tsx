@@ -5,10 +5,10 @@
 // prompt-submit path. No $ import (C10).
 import type { Elements, RenderChildren, RenderElement } from 'claude-code'
 import { NARROW, STATUS_GLYPH } from './ui'
-import { ActionButton, ActionButtons, Card, Chip, Section, Segment } from './kit'
+import { ActionButton, BoxButton, Card, Chip, Segment } from './kit'
 import type { ActionSpec, ActionTone } from './kit'
 import { laneStrip, pickBar } from './raster'
-import { ROLE } from './palette'
+import { PALETTE, ROLE } from './palette'
 import { paths } from '../paths'
 import type { PaletteRole } from './palette'
 
@@ -62,6 +62,8 @@ export type PlansView = {
   readonly runs: readonly RunRow[]
   readonly plans: readonly PlanRow[]
   readonly onAction?: (kind: string, planId: string) => void
+  /** footer right side: when the list was last read, `HH:MM`; absent, no time shown */
+  readonly cachedAt?: string
 }
 
 /** The structured line V1.3 submits (waiting.tsx's `mk:` voice). */
@@ -106,6 +108,11 @@ function actionsFor(status: string): readonly PlanAction[] {
   }
 }
 
+/** The design's filled button, now the kit's one button look (BoxButton). */
+function Pill(els: Els, key: string, label: string, tone: ActionTone, onPress: () => void): RenderElement {
+  return BoxButton(els, { key, label, tone, onPress })
+}
+
 function clip(text: string, w: number): string {
   if (text.length <= w) return text
   return `${text.slice(0, Math.max(1, w) - 1)}…`
@@ -126,32 +133,59 @@ export function PlansTab(els: Els, view: PlansView, cols: number, ui?: TabUi): R
   const W = Math.max(1, cols - 4)
   const filter = ui?.get('plans:filter') ?? 'all'
   const shown = filter === 'all' ? view.plans : view.plans.filter(p => p.status === filter)
+  const filters = (
+    <Box flexDirection="row" gap={1}>
+      {FILTERS.map(f => Segment(els, {
+        key: `plans-filter-${f}`,
+        label: f === 'all' ? `all ${view.plans.length}` : f,
+        on: filter === f,
+        onPress: () => { ui?.set('plans:filter', f) },
+      }))}
+    </Box>
+  )
   return (
-    <Box flexDirection="column" gap={1}>
-      {view.mock && <Text bold={true} color="warning">MOCK · fixture data · not this run</Text>}
-      {Section(els, { label: 'ONGOING RUNS', right: String(view.runs.length) })}
-      {view.runs.map(run => RunCard(els, run, W))}
-      {Section(els, { label: 'PLANS' })}
-      <Box flexDirection="row" gap={1}>
-        {FILTERS.map(f => Segment(els, {
-          key: `plans-filter-${f}`,
-          label: f === 'all' ? `all ${view.plans.length}` : f,
-          on: filter === f,
-          onPress: () => { ui?.set('plans:filter', f) },
-        }))}
+    // paddingRight: the right-aligned counts and the last filter sat on the pane edge, cut off
+    <Box flexDirection="column" gap={1} paddingRight={1}>
+      {view.mock && <Text bold={true} color={ROLE.warn.fg}>MOCK · fixture data · not this run</Text>}
+      {Head(els, 'ONGOING RUNS', String(view.runs.length))}
+      {view.runs.length === 0 && <Text dimColor={true}>no live runs · start a plan below</Text>}
+      {view.runs.map(run => RunCard(els, run, view, W, ui))}
+      {compact
+        ? <Box flexDirection="column" gap={1}>{Head(els, 'PLANS')}{filters}</Box>
+        : (
+          <Box flexDirection="row" justifyContent="space-between" gap={1}>
+            {Head(els, 'PLANS')}
+            {filters}
+          </Box>
+        )}
+      <Box flexDirection="column">
+        {shown.length === 0 && <Text dimColor={true}>{`no ${filter} plans`}</Text>}
+        {shown.map(plan => PlanLine(els, plan, view, W, compact, ui))}
       </Box>
-      {Card(els, {}, (
-        <Box flexDirection="column">
-          {shown.map(plan => PlanLine(els, plan, view, W, compact, ui))}
-        </Box>
-      ))}
       <Text dimColor={true}>Press a row for Detail · only imported plans are listed</Text>
+      <Text color={PALETTE.line}>{'─'.repeat(Math.max(1, W + 2))}</Text>
+      <Box flexDirection="row" justifyContent="space-between" gap={1}>
+        <Text dimColor={true}>{`source overview · ${view.plans.length} plan${view.plans.length === 1 ? '' : 's'}`}</Text>
+        {view.cachedAt != null && view.cachedAt !== '' && <Text dimColor={true}>{`list cached ${view.cachedAt}`}</Text>}
+      </Box>
     </Box>
   )
 }
 
-/** One run Card: live border, stage chip, title, the laneStrip and the counts. */
-function RunCard(els: Els, run: RunRow, W: number): RenderElement {
+/** A section heading in the design's bright muted bold (kit Section draws it dim). */
+function Head(els: Els, label: string, right?: string): RenderElement {
+  const { Box, Text } = els
+  return (
+    <Box flexDirection="row" justifyContent="space-between" gap={1}>
+      <Text bold={true} color={PALETTE.mut}>{label}</Text>
+      {right != null && <Text color={PALETTE.mut}>{right}</Text>}
+    </Box>
+  )
+}
+
+/** One run Card: live border, stage chip, title, the laneStrip, the counts and
+ *  Open/Pause. Pressing the run id opens the plan's Detail, like Open. */
+function RunCard(els: Els, run: RunRow, view: PlansView, W: number, ui?: TabUi): RenderElement {
   const { Box, Text } = els
   const { done, live, planned } = run.counts
   const states: PaletteRole[] = [
@@ -165,15 +199,33 @@ function RunCard(els: Els, run: RunRow, W: number): RenderElement {
     laneStrip(states, W),
     <Text dimColor={true}>{`${'◈'.repeat(done)}${'●'.repeat(live)}${'○'.repeat(planned)}`}</Text>,
   )
+  const open = (): void => { ui?.set('plans:sel', run.plan); ui?.set('plan:sub', 'detail') }
+  const buttons: ActionSpec[] = [
+    { key: `plans-run-open-${run.id}`, glyph: 'Open', word: '', tone: 'default', primary: true, plain: true, onPress: open },
+    { key: `plans-run-pause-${run.id}`, glyph: 'Pause', word: '', tone: 'quiet', plain: true, onPress: () => { view.onAction?.('pause', run.plan) } },
+  ]
   return Card(els, { role: 'live' }, (
     <Box key={run.id} flexDirection="column">
       <Box flexDirection="row" justifyContent="space-between" gap={1}>
-        <Text color={ROLE.live.fg}>{`● ${clip(run.id, Math.max(1, W - run.stage.length - 6))}`}</Text>
-        {Chip(els, { label: run.stage, role: 'live' })}
+        <Box flexDirection="row" gap={1}>
+          <Text color={ROLE.live.fg}>●</Text>
+          {ActionButton(els, {
+            key: `plans-run-${run.id}`,
+            glyph: clip(run.id, Math.max(1, W - run.stage.length - 8)),
+            word: '',
+            plain: true,
+            noHotkey: true,
+            onPress: open,
+          })}
+        </Box>
+        {run.stage !== '' && Chip(els, { label: run.stage, role: 'live' })}
       </Box>
       <Text color={ROLE.idle.fg} wrap="truncate-end">{clip(run.title, W)}</Text>
       {strip}
-      <Text dimColor={true} wrap="truncate-end">{clip(run.countsLine, W)}</Text>
+      <Box flexDirection="row" justifyContent="space-between" gap={1}>
+        <Text dimColor={true} wrap="truncate-end">{clip(run.countsLine, Math.max(1, W - 14))}</Text>
+        <Box flexDirection="row" gap={1}>{buttons.map(b => Pill(els, b.key, b.glyph, b.tone ?? 'default', () => { b.onPress?.() }))}</Box>
+      </Box>
     </Box>
   ))
 }
@@ -194,29 +246,26 @@ function PlanLine(els: Els, plan: PlanRow, view: PlansView, W: number, compact: 
       ? `running · ${liveTag}`
       : plan.status
   const fire = (kind: string): void => { view.onAction?.(kind, plan.id) }
-  const specs: ActionSpec[] = actionsFor(plan.status).map(a => ({
-    key: `plans-${a.kind}-${plan.id}`,
-    // a danger button draws its glyph as separate text and its word as the Button label
-    // (kit.tsx ActionButton split), so Delete carries the word, not the glyph
-    glyph: a.tone === 'danger' ? '✕' : a.word,
-    word: a.tone === 'danger' ? a.word : '',
-    tone: a.tone,
-    primary: a.primary,
-    plain: true,
-    onPress: () => {
-      if (a.kind === 'delete') { ui?.set('plans:confirm', plan.id); return }
-      fire(a.kind)
-    },
-  }))
+
   const idBudget = Math.max(1, compact ? 22 : 32)
-  return (
+  const by = plan.counts.byStatus ?? {}
+  const countsLine = Object.entries(by).map(([k, n]) => `${n} ${k}`).join(' · ')
+  // the strip: settled green, live blue, the rest the track, one segment per task bucket
+  const settled = Object.entries(by).filter(([k]) => /done|merged|qa/.test(k)).reduce((n, [, v]) => n + v, 0)
+  const total = Object.values(by).reduce((n, v) => n + v, 0)
+  const liveN = Object.entries(by).filter(([k]) => /build|review|verify|fix|run/.test(k)).reduce((n, [, v]) => n + v, 0)
+  const barW = Math.max(4, W - 6)
+  const okW = total > 0 ? Math.round(settled / total * barW) : 0
+  const liveW = total > 0 ? Math.round(liveN / total * barW) : 0
+  const edge = plan.status === 'running' ? { role: 'live' as const } : plan.status === 'parked' ? { role: 'warn' as const } : {}
+  return Card(els, edge, (
     <Box key={`plans-row-${plan.id}`} flexDirection="column">
       <Box flexDirection="row" gap={1}>
         <Text color={ROLE[role].fg}>{glyph}</Text>
-        <Text>{clip(plan.id, idBudget)}</Text>
         {ActionButton(els, {
           key: `plans-detail-${plan.id}`,
-          glyph: '›',
+          // the name itself is the press target, not only the one-cell ›
+          glyph: clip(plan.id, idBudget),
           word: '',
           plain: true,
           noHotkey: true,
@@ -224,13 +273,20 @@ function PlanLine(els: Els, plan: PlanRow, view: PlansView, W: number, compact: 
         })}
         <Box flexGrow={1} />
         {Chip(els, { label: clip(chip, compact ? 18 : 28), role })}
-        {ActionButtons(els, specs, W, () => { ui?.set(`plans:more:${plan.id}`, '1') })}
       </Box>
-      {plan.counts.byStatus && Object.keys(plan.counts.byStatus).length > 0 && (
-        <Text dimColor={true} wrap="truncate-end">
-          {clip(Object.entries(plan.counts.byStatus).map(([s, n]) => `${n} ${s}`).join(' · '), Math.max(1, W - 4))}
+      {plan.title !== '' && plan.title !== plan.id && <Text color={ROLE.idle.fg} wrap="truncate-end">{clip(plan.title, W - 4)}</Text>}
+      {total > 0 && (
+        <Text>
+          <Text color={ROLE.ok.fg}>{'━'.repeat(okW)}</Text>
+          <Text color={ROLE.live.fg}>{'━'.repeat(Math.min(liveW, barW - okW))}</Text>
+          <Text color={PALETTE.line}>{'━'.repeat(Math.max(0, barW - okW - liveW))}</Text>
         </Text>
       )}
+      <Box flexDirection="row" gap={1}>
+        <Text dimColor={true} wrap="truncate-end">{clip(countsLine, Math.max(1, W - 24))}</Text>
+        <Box flexGrow={1} />
+        <Box flexDirection="row" gap={1}>{actionsFor(plan.status).map(x => Pill(els, `plans-${x.kind}-${plan.id}`, x.word, x.tone, () => { if (x.kind === 'delete') { ui?.set('plans:confirm', plan.id); return } fire(x.kind) }))}</Box>
+      </Box>
       {confirming && (
         <Box flexDirection="row" gap={1}>
           <Text color={ROLE.err.fg}>{clip(`Delete ${plan.id}? File moves to ${planArchiveDir(plan)}.`, Math.max(1, W - 20))}</Text>
@@ -245,5 +301,5 @@ function PlanLine(els: Els, plan: PlanRow, view: PlansView, W: number, compact: 
         </Box>
       )}
     </Box>
-  )
+  ))
 }

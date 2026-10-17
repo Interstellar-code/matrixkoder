@@ -228,19 +228,15 @@ Shown when no run is live in the project DB (`~/.matrixkoder/projects/<slug>/mk.
 Run
 No active orchestration run.
 
-To start a new multi-lane feature run:
-▶ Run  /mk init <feature-name>
-▶ Or   /mk resume
+To start a multi-lane feature run, ask Claude to orchestrate it.
+▶ New project? Run /mk setup
 
 Recent Runs
 ✓ wfv2-f678  workflows-v2      archived
 ✓ mk-p0      mod spikes        done
-
-Usage                        5h   week
-claude    █░░░░░░░           7%    36%
-agy       ████░░░░          48%    52%
-codex     ░░░░░░░░          n/a    n/a
 ```
+
+This is the Overview tab's empty state; the Usage tab shows the ledger on its own.
 
 ---
 
@@ -255,7 +251,7 @@ Setup
 Configuration required for this project:
 [!] Missing projects/<slug>/project.yaml
 
-▶ Type /mk setup to launch the wizard
+▶ Run /mk setup to launch the wizard
 
 System Detection
 ✓ Git Repository       main worktree
