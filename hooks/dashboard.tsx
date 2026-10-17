@@ -838,35 +838,42 @@ const PLAN_SCRIPT_KINDS = ['archive', 'unarchive', 'delete']
 
 /** `mk-plan.py <kind> <id> --data <dataDir>` through the RunFn seam. Resolves the first error
  *  of the one-JSON-line reply (`{"ok":false,"errors":[...]}`), or the exit text when stdout
- *  holds no JSON; null on `{"ok":true}`. */
+ *  holds no JSON; null only on `{"ok":true}` WITH exit 0 (the exit code wins). An id mk-plan.py
+ *  would not accept (it also reads a leading '-' as a flag) is refused before any spawn. */
 export async function runPlanAction(run: RunFn, root: string, dataDir: string, kind: string, id: string): Promise<string | null> {
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(id)) return `bad plan id ${id}`
   const r = await run(['python3', `${root}/scripts/mk-plan.py`, kind, id, '--data', dataDir], { timeoutMs: 60_000 })
   let reply: unknown = null
   try { reply = JSON.parse(r.stdout.trim()) } catch { reply = null }
-  if (typeof reply === 'object' && reply !== null) {
+  const err = r.stderr.trim()
+  const exitText = `${kind} ${id} exit ${r.exitCode}${err !== '' ? `: ${err}` : ''}`
+  if (typeof reply === 'object' && reply !== null && !Array.isArray(reply)) {
     const { ok, errors } = reply as { ok?: unknown; errors?: unknown }
-    if (ok === true) return null
+    if (ok === true) return r.exitCode === 0 ? null : exitText
     const first = Array.isArray(errors) ? errors.find((e): e is string => typeof e === 'string' && e !== '') : undefined
     return first ?? `${kind} ${id} refused`
   }
-  const err = r.stderr.trim()
-  return `${kind} ${id} exit ${r.exitCode}${err !== '' ? `: ${err}` : ''}`
+  return exitText
 }
 
-/** A press on Archive/Unarchive/Delete: run it, then reload the list; a failure becomes the
- *  plans error line (no reload on failure: the refresh would clear that line). */
-async function planAction($: EngineInterface, kind: string, id: string): Promise<void> {
-  const view = await read($, viewStateAtom)
+/** The view-state patch for one press: a reload bump on success; on failure the plans error
+ *  line (no reload: the refresh would clear it). An empty data dir spawns nothing. */
+export async function planActionPatch(run: RunFn, root: string, view: Record<string, string>, kind: string, id: string, now: number): Promise<Record<string, string>> {
   const dataDir = view[PLANS_DIR_KEY] ?? ''
   let error: string | null
   try {
-    error = dataDir === '' ? 'no project data dir' : await runPlanAction((argv, init) => $.process.run([...argv], init), $.plugin.root, dataDir, kind, id)
+    error = dataDir === '' ? 'no project data dir' : await runPlanAction(run, root, dataDir, kind, id)
   } catch (e) {
     error = `${kind} ${id}: ${e instanceof Error ? e.message : String(e)}`
   }
-  await update($, viewStateAtom, prev => error == null
-    ? { ...prev, 'plans:reload': String(Date.now()) }
-    : { ...prev, [PLANS_ERROR_KEY]: error, [PLANS_STALE_KEY]: '0' })
+  return error == null ? { 'plans:reload': String(now) } : { [PLANS_ERROR_KEY]: error, [PLANS_STALE_KEY]: '0' }
+}
+
+/** A press on Archive/Unarchive/Delete: run it, then apply the patch. */
+async function planAction($: EngineInterface, kind: string, id: string): Promise<void> {
+  const view = await read($, viewStateAtom)
+  const patch = await planActionPatch((argv, init) => $.process.run([...argv], init), $.plugin.root, view, kind, id, Date.now())
+  await update($, viewStateAtom, prev => ({ ...prev, ...patch }))
 }
 
 function plansViewOf(view: Record<string, string>, onAction: (kind: string, id: string) => void): PlansView {

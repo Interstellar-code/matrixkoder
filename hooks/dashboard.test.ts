@@ -6,7 +6,7 @@ import type { On, ConfigRow } from 'claude-code'
 import { snapshotCount, DATA_DIR, NOW, PROJECT_DIR, RUN_PATH, RUNS_INDEX, USAGE_PATH, agentOf, agentsOf, mockFs, mockWorld, paneProps, sessionStart, sessionStartIn, setRun, setUsage, tasksOf, worldFiles, worldFixtures } from './testkit'
 import type { Files, MockWorld } from './testkit'
 import { parseYamlAgents } from './data'
-import { runPlanAction, waitingPane, waitingPaneView } from './dashboard'
+import { planActionPatch, runPlanAction, waitingPane, waitingPaneView } from './dashboard'
 import { mockTabCounts, waitingCount } from './tabs/header'
 import { RUN_SNAPSHOT } from './fixtures/run-snapshot'
 
@@ -2188,4 +2188,46 @@ test('runPlanAction surfaces the first error of an ok:false reply, else the exit
   expect(await runPlanAction(bad, '/root', '/data', 'delete', 'p1')).toBe('run r1 is active')
   const crash = async () => ({ exitCode: 2, stdout: '', stderr: 'boom\n' })
   expect(await runPlanAction(crash, '/root', '/data', 'delete', 'p1')).toBe('delete p1 exit 2: boom')
+})
+
+const okRun = (stdout: string, exitCode = 0) => async () => ({ exitCode, stdout, stderr: '' })
+
+test('runPlanAction edge cases: non-object reply, no errors array, errors with no strings', async () => {
+  expect(await runPlanAction(okRun('[1]'), '/r', '/d', 'archive', 'p1')).toBe('archive p1 exit 0')
+  expect(await runPlanAction(okRun('{"ok":false}', 1), '/r', '/d', 'archive', 'p1')).toBe('archive p1 refused')
+  expect(await runPlanAction(okRun('{"ok":false,"errors":[1,""]}', 1), '/r', '/d', 'archive', 'p1')).toBe('archive p1 refused')
+})
+
+test('runPlanAction: ok:true with a non-zero exit is a failure', async () => {
+  expect(await runPlanAction(okRun('{"ok":true}', 3), '/r', '/d', 'archive', 'p1')).toBe('archive p1 exit 3')
+})
+
+test('runPlanAction refuses an id mk-plan.py would read as a flag, without spawning', async () => {
+  let spawned = 0
+  const run = async () => { spawned += 1; return { exitCode: 0, stdout: '{"ok":true}', stderr: '' } }
+  expect(await runPlanAction(run, '/r', '/d', 'delete', '--home')).toBe('bad plan id --home')
+  expect(spawned).toBe(0)
+})
+
+test('planActionPatch: failure sets the error and stale 0 and does not bump reload', async () => {
+  const run = okRun('{"ok":false,"errors":["run r1 is active","x"]}', 1)
+  const patch = await planActionPatch(run, '/r', { 'plans:dir': '/d' }, 'delete', 'p1', 5)
+  expect(patch).toEqual({ 'plans:error': 'run r1 is active', 'plans:stale': '0' })
+})
+
+test('planActionPatch: success bumps plans:reload only', async () => {
+  expect(await planActionPatch(okRun('{"ok":true}'), '/r', { 'plans:dir': '/d' }, 'archive', 'p1', 7)).toEqual({ 'plans:reload': '7' })
+})
+
+test('planActionPatch: a missing plans:dir spawns nothing and shows an error', async () => {
+  let spawned = 0
+  const run = async () => { spawned += 1; return { exitCode: 0, stdout: '{"ok":true}', stderr: '' } }
+  const patch = await planActionPatch(run, '/r', {}, 'archive', 'p1', 7)
+  expect(spawned).toBe(0)
+  expect(patch).toEqual({ 'plans:error': 'no project data dir', 'plans:stale': '0' })
+})
+
+test('planActionPatch: a thrown spawn becomes the error line', async () => {
+  const run = async (): Promise<{ exitCode: number; stdout: string; stderr: string }> => { throw new Error('spawn failed') }
+  expect((await planActionPatch(run, '/r', { 'plans:dir': '/d' }, 'archive', 'p1', 7))['plans:error']).toBe('archive p1: spawn failed')
 })

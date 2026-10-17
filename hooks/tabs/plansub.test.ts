@@ -304,3 +304,37 @@ test('the List accepts a legacy alias row sharing the active store', () => {
   expect(text).toContain('alpha-plan')
   expect(text).not.toContain('beta-plan')
 })
+
+const ACTION_VIEW: Record<string, string> = {
+  'plans:store': '1',
+  'plans:list': JSON.stringify({ ok: true, projects: [], plans: [
+    { project: 'matrixkoder', plan: 'dn', title: 'D', status: 'done', created: 'c', live_run: null, counts: {} },
+    { project: 'matrixkoder', plan: 'ar', title: 'A', status: 'archived', created: 'c', live_run: null, counts: {} },
+    { project: 'matrixkoder', plan: 'dr', title: 'R', status: 'draft', created: 'c', live_run: null, counts: {} },
+    { project: 'matrixkoder', plan: 'pk', title: 'P', status: 'parked', created: 'c', live_run: null, counts: {} },
+  ] }),
+}
+
+test('plan actions: archive, unarchive and delete go to ui.planAct; start and resume do not', () => {
+  const ui = new Map<string, string>([['plans:filter', 'archived']])
+  const acts: string[] = []
+  const subs: string[] = []
+  const handle = { get: (k: string) => ui.get(k), set: (k: string, v: string) => { ui.set(k, v) }, submit: (t: string) => { subs.push(t) }, planAct: (k: string, id: string) => { acts.push(`${k}:${id}`) } }
+  press(PlanPane(stubEls, ACTION_VIEW, 120, handle), 'plans-unarchive-ar')
+  press(PlanPane(stubEls, ACTION_VIEW, 120, handle), 'plans-delete-ar')
+  press(PlanPane(stubEls, ACTION_VIEW, 120, handle), 'plans-confirm-delete-ar')
+  ui.set('plans:filter', 'all')
+  press(PlanPane(stubEls, ACTION_VIEW, 120, handle), 'plans-archive-dn')
+  press(PlanPane(stubEls, ACTION_VIEW, 120, handle), 'plans-start-dr')
+  press(PlanPane(stubEls, ACTION_VIEW, 120, handle), 'plans-resume-pk')
+  expect(acts).toEqual(['unarchive:ar', 'delete:ar', 'archive:dn'])
+  expect(subs).toEqual([planActionLine('start', 'dr'), planActionLine('resume', 'pk')])
+})
+
+test('plan actions: without ui.planAct archive still submits the mk: line', () => {
+  const ui = new Map<string, string>()
+  const subs: string[] = []
+  const handle = { get: (k: string) => ui.get(k), set: (k: string, v: string) => { ui.set(k, v) }, submit: (t: string) => { subs.push(t) } }
+  press(PlanPane(stubEls, ACTION_VIEW, 120, handle), 'plans-archive-dn')
+  expect(subs).toEqual(['mk: archive plan dn'])
+})

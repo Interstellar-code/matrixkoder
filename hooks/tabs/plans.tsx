@@ -243,6 +243,7 @@ function PlanLine(els: Els, plan: PlanRow, view: PlansView, W: number, compact: 
   const role = STATUS_ROLE[plan.status] ?? 'idle'
   const glyph = STATUS_GLYPH_PLAN[plan.status] ?? STATUS_GLYPH[plan.status] ?? '○'
   const confirming = ui?.get('plans:confirm') === plan.id
+  const del = planDeleteInfo(plan)
   const liveTag = plan.live_run != null && plan.live_run.startsWith(`${plan.id}-`)
     ? plan.live_run.slice(plan.id.length + 1)
     : plan.live_run
@@ -295,7 +296,7 @@ function PlanLine(els: Els, plan: PlanRow, view: PlansView, W: number, compact: 
       </Box>
       {confirming && (
         <Box flexDirection="row" gap={1}>
-          <Text color={ROLE.err.fg}>{clip(`Delete ${plan.id}? Backup ${planDeleteInfo(plan).backup}; folder stays in ${planDeleteInfo(plan).folder}`, Math.max(1, W - 20))}</Text>
+          <Text color={ROLE.err.fg}>{clip(`Delete ${plan.id}? Backup ${del.backup}; folder stays in ${del.folder}`, Math.max(1, W - 20))}</Text>
           {ActionButton(els, {
             key: `plans-confirm-delete-${plan.id}`, glyph: '✕', word: 'Delete', tone: 'danger', plain: true,
             onPress: () => { ui?.set('plans:confirm', ''); fire('delete') },
