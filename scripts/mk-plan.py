@@ -1752,11 +1752,15 @@ def _delete_checks(con, plan_id, verb="delete"):
     return [r["id"] for r in con.execute("SELECT id FROM runs WHERE plan=? ORDER BY id", (plan_id,))]
 
 
+# rows of the plan: its runs' own, plus import-time rows keyed run=<plan id> (no run exists yet)
+RUN_KEYED = "(run IN (SELECT id FROM runs WHERE plan=?) OR run=?)"
+
+
 def _child_counts(con, plan_id):
     """{table: rows} for the plan's runs, over every PURGE_BY_RUN table the store has."""
     have = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    return {t: con.execute(f"SELECT COUNT(*) FROM {t} WHERE run IN (SELECT id FROM runs WHERE plan=?)",
-                           (plan_id,)).fetchone()[0] for t in PURGE_BY_RUN if t in have}
+    return {t: con.execute(f"SELECT COUNT(*) FROM {t} WHERE {RUN_KEYED}", (plan_id, plan_id)).fetchone()[0]
+            for t in PURGE_BY_RUN if t in have}
 
 
 def delete_plan(plan_id, data, home):
@@ -1794,8 +1798,7 @@ def delete_plan(plan_id, data, home):
             for t in PURGE_BY_RUN:
                 if t in have:
                     purged[t] = con.execute(
-                        f"DELETE FROM {t} WHERE run IN (SELECT id FROM runs WHERE plan=?)",
-                        (plan_id,)).rowcount
+                        f"DELETE FROM {t} WHERE {RUN_KEYED}", (plan_id, plan_id)).rowcount
                 if t == "tasks" and os.environ.get("MK_PURGE_FAIL") == "1":  # test seam: dies mid-purge
                     raise RuntimeError("injected purge failure")
             purged["runs"] = con.execute("DELETE FROM runs WHERE plan=?", (plan_id,)).rowcount
@@ -3055,7 +3058,7 @@ def self_test():
         con = project_con()
         con.execute("UPDATE runs SET status='done'")
         con.commit()
-        for run in ("imp7run", "imp8run"):
+        for run in ("imp7run", "imp8run", "imp7", "imp7-b"):  # imp7: import-time rows keyed by the plan id
             db.add_task(con, run, "P1", "phase", title="kept")
         for pid, run in (("imp7", "imp7run"), ("imp8", "imp8run")):
             con.execute("INSERT INTO events(run, task, t, chan, kind, text) VALUES (?,'P1','t','c','k','x')", (run,))
@@ -3112,10 +3115,12 @@ def self_test():
         con.close()
         out = mk("delete", "imp7", "--data", data, "--home", home)
         assert out["purged"]["event_src"] == 1, out
-        assert out["ok"] and out["purged"]["tasks"] == 1 and out["purged"]["runs"] == 1, out
+        assert out["ok"] and out["purged"]["tasks"] == 2 and out["purged"]["runs"] == 1, out
         con = project_con()
         assert named(con, "imp7", ["imp7run"]) == 0
         assert named(con, "imp8", ["imp8run"]) == 8, "another plan's rows were touched"
+        left = con.execute("SELECT run FROM tasks WHERE run IN ('imp7','imp7-b','imp7run','imp8run') ORDER BY run").fetchall()
+        assert [r[0] for r in left] == ["imp7-b", "imp8run"], [r[0] for r in left]  # plan-id rows gone, prefix plan kept
         con.close()
         chk = sqlite3.connect(out["backup"])
         assert chk.execute("SELECT COUNT(*) FROM runs WHERE plan='imp7'").fetchone()[0] == 1
