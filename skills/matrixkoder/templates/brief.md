@@ -2,6 +2,8 @@
 
 Repo: this folder (worktree `<path>`, branch `<branch>`, at `<sha>`: <what is already in>). Stack: <stack>. Plan `<plan id>`: `<project>/plans/<plan id>/plan.md` (read-only) — phase `<PHASE id>`, its tasks `<P.n>`, `<P.n>` (acceptance lines in the plan header); history for this task: `<project>/plans/<plan>/runs/<run>/<T>/` (read-only). Do ONLY <PHASE>. Other agents work on: <lanes + their areas> — do not touch them.
 
+What it is (plain English): <the task's description from the plan file; delete this line when the task has none>
+
 ## Risk and gates
 - Risk: <derived risk 1-5 from `mk-state risk list <T>`: base + open reasons (kind, points, source); "1, no open reasons" when none>. Critical: <yes | no>.
 - Gates: <the task's plan gates, one per line as `name: cmd` (expect, timeout); "none" when it has none>. You run the ones in Commands.

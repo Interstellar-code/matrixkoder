@@ -29,6 +29,7 @@ created = 2026-10-08                      # date the plan was drafted — plans.
 runs = []                                 # run ids; mk-plan.py add-run appends, never by hand — plans.header_json
 design = []                               # optional: research/spike docs behind the decisions (paths) — plans.design (column added by D1; header_json until then)
 integration = "mk/<feature>/integration"  # optional: branch the lanes merge into; default from the project.yaml `repo.integration_branch` — plans.integration (column added by D1; header_json until then)
+description = "A short plain-English summary of what this plan builds and why it matters. Two to five sentences, no test steps and no lists of names."  # optional: plain English, 2-5 sentences, what it is and why — plans.header_json only
 
 [gates]                                   # full-suite gates the orchestrator reruns at merge and QA; scoped forms go in briefs — plans.header_json
 test = "<test cmd>"                       # e.g. pnpm vitest run — plans.header_json
@@ -59,6 +60,7 @@ covers = ["P1.1", "P1.2"]                 # the tasks whose merge can change the
 [[phase]]                                 # one block per phase; phases in one wave must own disjoint files — plans.header_json
 id = "P1"                                 # [A-Z][A-Z0-9]{0,7}, unique; tasks are <phase id>.<n> — tasks.id
 title = "what this phase delivers, one line"   # becomes the phase task title — tasks.title
+description = "A short plain-English summary of what this phase is and why it exists. Two to five sentences."  # optional: plain English, 2-5 sentences — header_json only
 wave = 1                                  # int >= 1; same-wave phases run in parallel — header_json only (the wave is not a tasks column)
 deps = []                                 # phase ids, or <run>:<task> to wait on another run's task — tasks.deps
 owned = ["src/area/", "src/file.ts"]      # the only files this phase touches; overlap within a wave is a check error — tasks.owned
@@ -76,6 +78,7 @@ lane_group = ""                           # same value = same wave, one shared w
   [[phase.task]]                          # optional: splits a phase into separately accepted tasks — plans.header_json; the rows below are what the importer writes
   id = "P1.1"                             # <phase id>.<n> — tasks.id
   title = "what this task delivers, one line"  # tasks.title
+  description = "A short plain-English summary of what this task is and why it is needed. Two to five sentences."  # optional: plain English, 2-5 sentences — header_json; copied to tasks.extra_json at run init / plan sync
   acceptance = ["the outcome that decides done, checkable by the reviewer", "the second outcome the same task must also meet"]  # tasks.acceptance; a list = two acceptance lines, and every line gets an id by position: <task id>.a1, <task id>.a2 (a plain string is the single line <task id>.a1)
   refs = []                               # optional: path:line pointers the brief quotes — header_json only
   subagent = false                        # true only inside a subagents=true phase; then owned is required — header_json only
@@ -87,6 +90,7 @@ lane_group = ""                           # same value = same wave, one shared w
   [[phase.task.subtask]]                  # optional: splits a task into subtasks; id is <phase>.<n>.<m> — plans.header_json
   id = "P1.1.1"                           # <phase id>.<n>.<m>; the importer derives tasks.type="subtask" and tasks.parent from the nesting
   title = "what this subtask delivers, one line"  # tasks.title
+  description = "A short plain-English summary of what this subtask is and why it is needed. Two to five sentences."  # optional: plain English, 2-5 sentences — header_json; copied to tasks.extra_json at run init / plan sync
   acceptance = "the outcome that decides this subtask done"  # tasks.acceptance
   deps = []                               # comma-separated ids in the same plan, or <run>:<id> to wait on another run — tasks.deps
   parallel = false                        # true: parallel-flagged siblings with no dep between them may run at once — tasks.parallel
