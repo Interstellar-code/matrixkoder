@@ -6,7 +6,7 @@ import type { On, ConfigRow } from 'claude-code'
 import { snapshotCount, DATA_DIR, NOW, PROJECT_DIR, RUN_PATH, RUNS_INDEX, USAGE_PATH, agentOf, agentsOf, mockFs, mockWorld, paneProps, sessionStart, sessionStartIn, setRun, setUsage, tasksOf, worldFiles, worldFixtures } from './testkit'
 import type { Files, MockWorld } from './testkit'
 import { parseYamlAgents } from './data'
-import { waitingPane, waitingPaneView } from './dashboard'
+import { runPlanAction, waitingPane, waitingPaneView } from './dashboard'
 import { mockTabCounts, waitingCount } from './tabs/header'
 import { RUN_SNAPSHOT } from './fixtures/run-snapshot'
 
@@ -2174,4 +2174,18 @@ test('L7.2: the top-level k reads open tasks of every linked project — migrate
   })
   expect(dirs, 'the migrated row read the C2 project folder').toContain(MIGRATED_DIR)
   expect(dirs, 'the db_path-NULL row fell back to its legacy data_dir').toContain(LEGACY_DIR)
+})
+
+test('runPlanAction runs mk-plan.py <kind> <id> --data and reports ok as null', async () => {
+  const calls: string[][] = []
+  const run = async (argv: readonly string[]) => { calls.push([...argv]); return { exitCode: 0, stdout: '{"ok":true,"id":"p1"}\n', stderr: '' } }
+  expect(await runPlanAction(run, '/root', '/data', 'archive', 'p1')).toBeNull()
+  expect(calls).toEqual([['python3', '/root/scripts/mk-plan.py', 'archive', 'p1', '--data', '/data']])
+})
+
+test('runPlanAction surfaces the first error of an ok:false reply, else the exit text', async () => {
+  const bad = async () => ({ exitCode: 1, stdout: '{"ok":false,"errors":["run r1 is active","second"]}', stderr: '' })
+  expect(await runPlanAction(bad, '/root', '/data', 'delete', 'p1')).toBe('run r1 is active')
+  const crash = async () => ({ exitCode: 2, stdout: '', stderr: 'boom\n' })
+  expect(await runPlanAction(crash, '/root', '/data', 'delete', 'p1')).toBe('delete p1 exit 2: boom')
 })

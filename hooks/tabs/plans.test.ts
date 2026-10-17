@@ -80,6 +80,11 @@ function press(drawn: unknown, key: string): void {
   ;(b?.props?.onPress as () => void)()
 }
 
+const ARCHIVED_VIEW: PlansView = {
+  ...PLANS_FIXTURE,
+  plans: [...PLANS_FIXTURE.plans, { id: 'old-plan', title: 'old', status: 'archived', created: '2026-10-01', runs: [], live_run: null, counts: { tasks: 1, phases: 0 } }],
+}
+
 const viewWith = (onAction: (kind: string, id: string) => void): PlansView =>
   ({ ...PLANS_FIXTURE, onAction })
 
@@ -108,30 +113,34 @@ test('Plans list: each status shows exactly its buttons', () => {
         return k.startsWith('plans-') && k.endsWith(`-${id}`) && !k.startsWith('plans-detail-') && !k.includes('confirm')
       })
       .map(b => String(b.props?.key ?? '').split('-')[1] ?? '')
-  expect(of('lane-nudge').sort()).toEqual(['delete', 'start'])
-  expect(of('checkout-v2').sort()).toEqual(['delete', 'start'])
+  expect(of('lane-nudge')).toEqual(['start'])
+  expect(of('checkout-v2')).toEqual(['start'])
   expect(of('settings-plans-db').sort()).toEqual(['open', 'pause'])
-  expect(of('hive-cards').sort()).toEqual(['delete', 'resume'])
-  expect(of('workflows-v2')).toEqual(['delete'])
+  expect(of('hive-cards')).toEqual(['resume'])
+  expect(of('workflows-v2')).toEqual(['archive'])
+  const archived = PlansTab(stubEls, ARCHIVED_VIEW, 80, new Map([['plans:filter', 'archived']]))
+  const keys = nodesOf(archived, 'Button').map(b => String(b.props?.key ?? '')).filter(k => k.endsWith('-old-plan') && !k.startsWith('plans-detail-'))
+  expect(keys.sort()).toEqual(['plans-delete-old-plan', 'plans-unarchive-old-plan'])
 })
 
 test('Plans list: Delete needs two presses; Cancel clears; the second calls onAction once', () => {
   const ui = new Map<string, string>()
   const calls: string[] = []
-  const view = viewWith((kind, id) => { calls.push(`${kind}:${id}`) })
+  const view: PlansView = { ...ARCHIVED_VIEW, onAction: (kind, id) => { calls.push(`${kind}:${id}`) } }
+  ui.set('plans:filter', 'archived')
   const first = PlansTab(stubEls, view, 80, ui)
-  expect(allText(first)).not.toContain('Delete checkout-v2?')
-  press(first, 'plans-delete-checkout-v2')
-  expect(ui.get('plans:confirm')).toBe('checkout-v2')
+  expect(allText(first)).not.toContain('Delete old-plan?')
+  press(first, 'plans-delete-old-plan')
+  expect(ui.get('plans:confirm')).toBe('old-plan')
   expect(calls, 'the first press does not act').toEqual([])
   const confirm = PlansTab(stubEls, view, 80, ui)
-  expect(allText(confirm)).toContain('Delete checkout-v2?')
-  press(confirm, 'plans-confirm-cancel-checkout-v2')
+  expect(allText(confirm)).toContain('Delete old-plan?')
+  press(confirm, 'plans-confirm-cancel-old-plan')
   expect(ui.get('plans:confirm')).toBe('')
-  expect(allText(PlansTab(stubEls, view, 80, ui))).not.toContain('Delete checkout-v2?')
-  press(PlansTab(stubEls, view, 80, ui), 'plans-delete-checkout-v2')
-  press(PlansTab(stubEls, view, 80, ui), 'plans-confirm-delete-checkout-v2')
-  expect(calls).toEqual(['delete:checkout-v2'])
+  expect(allText(PlansTab(stubEls, view, 80, ui))).not.toContain('Delete old-plan?')
+  press(PlansTab(stubEls, view, 80, ui), 'plans-delete-old-plan')
+  press(PlansTab(stubEls, view, 80, ui), 'plans-confirm-delete-old-plan')
+  expect(calls).toEqual(['delete:old-plan'])
 })
 
 test('Plans list: Start, Pause and Resume call onAction with the right kind', () => {
@@ -189,13 +198,32 @@ test('Plans list: a running plan with no live run says so', () => {
   expect(text).toContain('running · r1')
 })
 
-test('Plans list: Delete names the C2 archive path, not the old relative one (L7.2)', () => {
+test('Plans list: Delete confirm names the pre-delete backup and the kept folder', () => {
+  const ui = new Map<string, string>([['plans:filter', 'archived']])
+  const view: PlansView = { ...viewWith(() => undefined), plans: ARCHIVED_VIEW.plans.map(p => (p.id === 'old-plan' ? { ...p, project: 'matrixkoder' } : p)) }
+  press(PlansTab(stubEls, view, 300, ui), 'plans-delete-old-plan')
+  const confirm = allText(PlansTab(stubEls, view, 300, ui))
+  expect(confirm).toContain('~/.matrixkoder/projects/matrixkoder/archive/old-plan-pre-delete-<ts>.db')
+  expect(confirm).toContain('~/.matrixkoder/projects/matrixkoder/archive/plans/old-plan/')
+})
+
+test('Plans list: Archive and Unarchive call onAction; the archived filter lists them, all and the count do not', () => {
+  const calls: string[] = []
+  const view: PlansView = { ...ARCHIVED_VIEW, onAction: (k, id) => { calls.push(`${k}:${id}`) } }
   const ui = new Map<string, string>()
-  const view = viewWith(() => undefined)
-  press(PlansTab(stubEls, view, 200, ui), 'plans-delete-checkout-v2')
-  const confirm = allText(PlansTab(stubEls, view, 200, ui))
-  expect(confirm).toContain('~/.matrixkoder/projects/matrixkoder/plans/checkout-v2/archive/')
-  expect(confirm).not.toContain('plans/archive/.')
+  const all = PlansTab(stubEls, view, 80, ui)
+  press(all, 'plans-archive-workflows-v2')
+  expect(allText(all)).not.toContain('old-plan')
+  const seg = nodesOf(all, 'Button').find(x => String(x.props?.key) === 'plans-filter-all')
+  expect(String(seg?.props?.label)).toBe(`all ${PLANS_FIXTURE.plans.length}`)
+  expect(allText(all)).toContain(`source overview · ${PLANS_FIXTURE.plans.length} plans`)
+  press(all, 'plans-filter-archived')
+  expect(ui.get('plans:filter')).toBe('archived')
+  const arch = PlansTab(stubEls, view, 80, ui)
+  expect(allText(arch)).toContain('old-plan')
+  expect(allText(arch)).not.toContain('checkout-v2')
+  press(arch, 'plans-unarchive-old-plan')
+  expect(calls).toEqual(['archive:workflows-v2', 'unarchive:old-plan'])
 })
 
 test('Plans list: the narrow layout at 36 cols still renders', () => {

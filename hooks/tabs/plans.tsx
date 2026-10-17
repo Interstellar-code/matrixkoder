@@ -71,25 +71,24 @@ export function planActionLine(kind: string, id: string): string {
   return `mk: ${kind} plan ${id}`
 }
 
-const FILTERS = ['all', 'draft', 'running', 'parked', 'done'] as const
+const FILTERS = ['all', 'draft', 'running', 'parked', 'done', 'archived'] as const
 
 const STATUS_ROLE: Record<string, PaletteRole> = {
-  draft: 'idle', approved: 'idle', running: 'live', parked: 'warn', done: 'ok',
+  draft: 'idle', approved: 'idle', running: 'live', parked: 'warn', done: 'ok', archived: 'idle',
 }
 const STATUS_GLYPH_PLAN: Record<string, string> = {
-  draft: '◇', approved: '◇', running: '◐', parked: '‖', done: '✓',
+  draft: '◇', approved: '◇', running: '◐', parked: '‖', done: '✓', archived: '▣',
 }
 
 type PlanAction = { kind: string; word: string; tone: ActionTone; primary?: boolean }
 
-/** C10: the buttons a status shows. `approved` shares draft's pair. */
+/** C10: the buttons a status shows. `approved` shares draft's. Delete only on `archived` (mk-plan.py refuses it elsewhere). */
 function actionsFor(status: string): readonly PlanAction[] {
   switch (status) {
     case 'draft':
     case 'approved':
       return [
         { kind: 'start', word: 'Start', tone: 'primary', primary: true },
-        { kind: 'delete', word: 'Delete', tone: 'danger' },
       ]
     case 'running':
       return [
@@ -99,10 +98,14 @@ function actionsFor(status: string): readonly PlanAction[] {
     case 'parked':
       return [
         { kind: 'resume', word: 'Resume', tone: 'primary', primary: true },
-        { kind: 'delete', word: 'Delete', tone: 'danger' },
       ]
     case 'done':
-      return [{ kind: 'delete', word: 'Delete', tone: 'danger', primary: true }]
+      return [{ kind: 'archive', word: 'Archive', tone: 'primary', primary: true }]
+    case 'archived':
+      return [
+        { kind: 'unarchive', word: 'Unarchive', tone: 'default' },
+        { kind: 'delete', word: 'Delete', tone: 'danger', primary: true },
+      ]
     default:
       return []
   }
@@ -118,12 +121,13 @@ function clip(text: string, w: number): string {
   return `${text.slice(0, Math.max(1, w) - 1)}…`
 }
 
-/** C2: the folder a deleted plan's file moves to — `~/.matrixkoder/projects/<slug>/plans/<plan>/archive/`.
- *  A slug is needed; the row's `project` carries it, and `matrixkoder` is the C16 default when
- *  the source named none (the live project). Never the old `<repo>/.matrixkoder/plans/archive`. */
-export function planArchiveDir(plan: Pick<PlanRow, 'id' | 'project'>): string {
+/** Where Delete's pre-delete backup and the kept plan folder live, per mk-plan.py:
+ *  `<project>/archive/<id>-pre-delete-<ts>.db` and `<project>/archive/plans/<id>/`, with
+ *  `<project>` = `~/.matrixkoder/projects/<slug>` (`matrixkoder` is the C16 default slug). */
+export function planDeleteInfo(plan: Pick<PlanRow, 'id' | 'project'>): { backup: string; folder: string } {
   const slug = plan.project != null && plan.project !== '' ? plan.project : 'matrixkoder'
-  return paths.planArchiveDir(slug, plan.id)
+  const archive = `~/.matrixkoder/projects/${slug}/archive`
+  return { backup: `${archive}/${plan.id}-pre-delete-<ts>.db`, folder: `${archive}/plans/${plan.id}/` }
 }
 
 /** Pure render: elements only, no $, no state (C1); `ui` is the C12 view state. */
@@ -132,12 +136,14 @@ export function PlansTab(els: Els, view: PlansView, cols: number, ui?: TabUi): R
   const compact = cols < NARROW
   const W = Math.max(1, cols - 4)
   const filter = ui?.get('plans:filter') ?? 'all'
-  const shown = filter === 'all' ? view.plans : view.plans.filter(p => p.status === filter)
+  // archived plans leave the all filter and every count; only the archived filter lists them
+  const live = view.plans.filter(p => p.status !== 'archived')
+  const shown = filter === 'all' ? live : view.plans.filter(p => p.status === filter)
   const filters = (
     <Box flexDirection="row" gap={1}>
       {FILTERS.map(f => Segment(els, {
         key: `plans-filter-${f}`,
-        label: f === 'all' ? `all ${view.plans.length}` : f,
+        label: f === 'all' ? `all ${live.length}` : f,
         on: filter === f,
         onPress: () => { ui?.set('plans:filter', f) },
       }))}
@@ -165,7 +171,7 @@ export function PlansTab(els: Els, view: PlansView, cols: number, ui?: TabUi): R
       <Text dimColor={true}>Press a row for Detail · only imported plans are listed</Text>
       <Text color={PALETTE.line}>{'─'.repeat(Math.max(1, W + 2))}</Text>
       <Box flexDirection="row" justifyContent="space-between" gap={1}>
-        <Text dimColor={true}>{`source overview · ${view.plans.length} plan${view.plans.length === 1 ? '' : 's'}`}</Text>
+        <Text dimColor={true}>{`source overview · ${live.length} plan${live.length === 1 ? '' : 's'}`}</Text>
         {view.cachedAt != null && view.cachedAt !== '' && <Text dimColor={true}>{`list cached ${view.cachedAt}`}</Text>}
       </Box>
     </Box>
@@ -289,7 +295,7 @@ function PlanLine(els: Els, plan: PlanRow, view: PlansView, W: number, compact: 
       </Box>
       {confirming && (
         <Box flexDirection="row" gap={1}>
-          <Text color={ROLE.err.fg}>{clip(`Delete ${plan.id}? File moves to ${planArchiveDir(plan)}.`, Math.max(1, W - 20))}</Text>
+          <Text color={ROLE.err.fg}>{clip(`Delete ${plan.id}? Backup ${planDeleteInfo(plan).backup}; folder stays in ${planDeleteInfo(plan).folder}`, Math.max(1, W - 20))}</Text>
           {ActionButton(els, {
             key: `plans-confirm-delete-${plan.id}`, glyph: '✕', word: 'Delete', tone: 'danger', plain: true,
             onPress: () => { ui?.set('plans:confirm', ''); fire('delete') },

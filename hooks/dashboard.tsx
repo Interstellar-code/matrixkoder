@@ -267,6 +267,7 @@ export function registerDashboard(on: On, options: PluginOptions): void {
       save: payload => { void saveSettings($, payload) },
       recheck: () => { void recheckAbout($) },
       submit: text => { void $.prompt.submit({ text }) },
+      planAct: (kind, id) => { void planAction($, kind, id) },
     }
     // S3: the live Settings view once loaded. Before that a one-line
     // skeleton draws — never the fixture's mock rows (LOW 1). A tab opened
@@ -349,6 +350,8 @@ type TabUi = {
   recheck?: () => void
   /** Plan actions: the Waiting tab's prompt-submit path. The pane never writes state. */
   submit?: (text: string) => void
+  /** archive | unarchive | delete: runs mk-plan.py directly (see planAction). */
+  planAct?: (kind: string, id: string) => void
 }
 
 /** C12 hands `ui` to all six tabs; V2's three still take three arguments, so
@@ -831,6 +834,41 @@ export function selectedPlanId(view: Record<string, string>, plans: readonly { i
   return (live ?? plans[0])?.id ?? ''
 }
 
+const PLAN_SCRIPT_KINDS = ['archive', 'unarchive', 'delete']
+
+/** `mk-plan.py <kind> <id> --data <dataDir>` through the RunFn seam. Resolves the first error
+ *  of the one-JSON-line reply (`{"ok":false,"errors":[...]}`), or the exit text when stdout
+ *  holds no JSON; null on `{"ok":true}`. */
+export async function runPlanAction(run: RunFn, root: string, dataDir: string, kind: string, id: string): Promise<string | null> {
+  const r = await run(['python3', `${root}/scripts/mk-plan.py`, kind, id, '--data', dataDir], { timeoutMs: 60_000 })
+  let reply: unknown = null
+  try { reply = JSON.parse(r.stdout.trim()) } catch { reply = null }
+  if (typeof reply === 'object' && reply !== null) {
+    const { ok, errors } = reply as { ok?: unknown; errors?: unknown }
+    if (ok === true) return null
+    const first = Array.isArray(errors) ? errors.find((e): e is string => typeof e === 'string' && e !== '') : undefined
+    return first ?? `${kind} ${id} refused`
+  }
+  const err = r.stderr.trim()
+  return `${kind} ${id} exit ${r.exitCode}${err !== '' ? `: ${err}` : ''}`
+}
+
+/** A press on Archive/Unarchive/Delete: run it, then reload the list; a failure becomes the
+ *  plans error line (no reload on failure: the refresh would clear that line). */
+async function planAction($: EngineInterface, kind: string, id: string): Promise<void> {
+  const view = await read($, viewStateAtom)
+  const dataDir = view[PLANS_DIR_KEY] ?? ''
+  let error: string | null
+  try {
+    error = dataDir === '' ? 'no project data dir' : await runPlanAction((argv, init) => $.process.run([...argv], init), $.plugin.root, dataDir, kind, id)
+  } catch (e) {
+    error = `${kind} ${id}: ${e instanceof Error ? e.message : String(e)}`
+  }
+  await update($, viewStateAtom, prev => error == null
+    ? { ...prev, 'plans:reload': String(Date.now()) }
+    : { ...prev, [PLANS_ERROR_KEY]: error, [PLANS_STALE_KEY]: '0' })
+}
+
 function plansViewOf(view: Record<string, string>, onAction: (kind: string, id: string) => void): PlansView {
   let parsed: unknown = null
   try { parsed = JSON.parse(view[PLANS_KEY] ?? '') } catch { parsed = null }
@@ -862,6 +900,7 @@ export function PlanPane(els: Els, view: Record<string, string>, paneCols: numbe
       ui.set('plan:sub', 'detail')
       return
     }
+    if (PLAN_SCRIPT_KINDS.includes(kind) && ui.planAct != null) { ui.planAct(kind, id); return }
     ui.set('plans:reload', String(Date.now()))
     void ui.submit?.(planActionLine(kind, id))
   }
