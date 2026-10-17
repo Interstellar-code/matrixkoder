@@ -2,6 +2,14 @@
 
 All notable changes to this project. Format: Keep a Changelog; versions: SemVer.
 
+## [0.6.2] - 2026-10-17
+
+### Added
+- **dashboard:** Matrix theme everywhere, code rain, live usage floors and pace (c462b83)
+
+### Docs
+- **changelog:** note v0.6.1 known test failures (fcb3e8a)
+
 ## [0.6.1] - 2026-10-17
 
 ### Added
