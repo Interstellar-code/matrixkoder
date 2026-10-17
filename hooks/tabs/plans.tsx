@@ -124,10 +124,10 @@ function clip(text: string, w: number): string {
 /** Where Delete's pre-delete backup and the kept plan folder live, per mk-plan.py:
  *  `<project>/archive/<id>-pre-delete-<ts>.db` and `<project>/archive/plans/<id>/`, with
  *  `<project>` = `~/.matrixkoder/projects/<slug>` (`matrixkoder` is the C16 default slug). */
-export function planDeleteInfo(plan: Pick<PlanRow, 'id' | 'project'>): { backup: string; folder: string } {
+export function planDeleteInfo(plan: Pick<PlanRow, 'id' | 'project'>): { backup: string; folder: string; from: string } {
   const slug = plan.project != null && plan.project !== '' ? plan.project : 'matrixkoder'
   const archive = `~/.matrixkoder/projects/${slug}/archive`
-  return { backup: `${archive}/${plan.id}-pre-delete-<ts>.db`, folder: `${archive}/plans/${plan.id}/` }
+  return { backup: `${archive}/${plan.id}-pre-delete-<ts>.db`, folder: `${archive}/plans/${plan.id}/`, from: `~/.matrixkoder/projects/${slug}/plans/${plan.id}/` }
 }
 
 /** Pure render: elements only, no $, no state (C1); `ui` is the C12 view state. */
@@ -145,7 +145,7 @@ export function PlansTab(els: Els, view: PlansView, cols: number, ui?: TabUi): R
         key: `plans-filter-${f}`,
         label: f === 'all' ? `all ${live.length}` : f,
         on: filter === f,
-        onPress: () => { ui?.set('plans:filter', f) },
+        onPress: () => { ui?.set('plans:filter', f); ui?.set('plans:confirm', '') },
       }))}
     </Box>
   )
@@ -237,12 +237,14 @@ function RunCard(els: Els, run: RunRow, view: PlansView, W: number, ui?: TabUi):
 }
 
 /** One plan row: status glyph, id (press opens Detail), status chip, actions.
- *  Delete's first press sets `plans:confirm` and draws the confirm row. */
+ *  Archive's and Delete's first press set `plans:confirm` and draw the confirm row. */
 function PlanLine(els: Els, plan: PlanRow, view: PlansView, W: number, compact: boolean, ui?: TabUi): RenderChildren {
   const { Box, Text } = els
   const role = STATUS_ROLE[plan.status] ?? 'idle'
   const glyph = STATUS_GLYPH_PLAN[plan.status] ?? STATUS_GLYPH[plan.status] ?? '○'
-  const confirming = ui?.get('plans:confirm') === plan.id
+  // `plans:confirm` holds `<kind>:<id>` (archive or delete), one at a time; the spawn is only behind Confirm
+  const pending = ui?.get('plans:confirm') ?? ''
+  const confirmKind = pending === `archive:${plan.id}` ? 'archive' : pending === `delete:${plan.id}` ? 'delete' : ''
   const del = planDeleteInfo(plan)
   const liveTag = plan.live_run != null && plan.live_run.startsWith(`${plan.id}-`)
     ? plan.live_run.slice(plan.id.length + 1)
@@ -276,7 +278,7 @@ function PlanLine(els: Els, plan: PlanRow, view: PlansView, W: number, compact: 
           word: '',
           plain: true,
           noHotkey: true,
-          onPress: () => { ui?.set('plans:sel', plan.id); ui?.set('plan:sub', 'detail') },
+          onPress: () => { ui?.set('plans:confirm', ''); ui?.set('plans:sel', plan.id); ui?.set('plan:sub', 'detail') },
         })}
         <Box flexGrow={1} />
         {Chip(els, { label: clip(chip, compact ? 18 : 28), role })}
@@ -292,14 +294,16 @@ function PlanLine(els: Els, plan: PlanRow, view: PlansView, W: number, compact: 
       <Box flexDirection="row" gap={1}>
         <Text dimColor={true} wrap="truncate-end">{clip(countsLine, Math.max(1, W - 24))}</Text>
         <Box flexGrow={1} />
-        <Box flexDirection="row" gap={1}>{actionsFor(plan.status).map(x => Pill(els, `plans-${x.kind}-${plan.id}`, x.word, x.tone, () => { if (x.kind === 'delete') { ui?.set('plans:confirm', plan.id); return } fire(x.kind) }))}</Box>
+        <Box flexDirection="row" gap={1}>{actionsFor(plan.status).map(x => Pill(els, `plans-${x.kind}-${plan.id}`, x.word, x.tone, () => { if (x.kind === 'delete' || x.kind === 'archive') { ui?.set('plans:confirm', `${x.kind}:${plan.id}`); return } ui?.set('plans:confirm', ''); fire(x.kind) }))}</Box>
       </Box>
-      {confirming && (
+      {confirmKind !== '' && (
         <Box flexDirection="row" gap={1}>
-          <Text color={ROLE.err.fg}>{clip(`Delete ${plan.id}? Backup ${del.backup}; folder stays in ${del.folder}`, Math.max(1, W - 20))}</Text>
+          <Text color={confirmKind === 'delete' ? ROLE.err.fg : ROLE.warn.fg}>{clip(confirmKind === 'delete' ? `Delete ${plan.id}? Backup ${del.backup}; folder stays in ${del.folder}` : `Archive ${plan.id}? ${del.from} -> ${del.folder} · undo with Unarchive · refused while a run is live`, Math.max(1, W - 20))}</Text>
           {ActionButton(els, {
-            key: `plans-confirm-delete-${plan.id}`, glyph: '✕', word: 'Delete', tone: 'danger', plain: true,
-            onPress: () => { ui?.set('plans:confirm', ''); fire('delete') },
+            key: `plans-confirm-${confirmKind}-${plan.id}`,
+            glyph: confirmKind === 'delete' ? '✕' : '✓', word: confirmKind === 'delete' ? 'Delete' : 'Confirm',
+            tone: confirmKind === 'delete' ? 'danger' : 'primary', plain: true,
+            onPress: () => { ui?.set('plans:confirm', ''); fire(confirmKind) },
           })}
           {ActionButton(els, {
             key: `plans-confirm-cancel-${plan.id}`, glyph: 'Cancel', word: '', tone: 'quiet', plain: true,

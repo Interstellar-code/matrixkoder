@@ -322,9 +322,12 @@ test('plan actions: archive, unarchive and delete go to ui.planAct; start and re
   const handle = { get: (k: string) => ui.get(k), set: (k: string, v: string) => { ui.set(k, v) }, submit: (t: string) => { subs.push(t) }, planAct: (k: string, id: string) => { acts.push(`${k}:${id}`) } }
   press(PlanPane(stubEls, ACTION_VIEW, 120, handle), 'plans-unarchive-ar')
   press(PlanPane(stubEls, ACTION_VIEW, 120, handle), 'plans-delete-ar')
+  expect(acts).toEqual(['unarchive:ar'])
   press(PlanPane(stubEls, ACTION_VIEW, 120, handle), 'plans-confirm-delete-ar')
   ui.set('plans:filter', 'all')
   press(PlanPane(stubEls, ACTION_VIEW, 120, handle), 'plans-archive-dn')
+  expect(acts, 'first press of archive or delete never reaches planAct').toEqual(['unarchive:ar', 'delete:ar'])
+  press(PlanPane(stubEls, ACTION_VIEW, 120, handle), 'plans-confirm-archive-dn')
   press(PlanPane(stubEls, ACTION_VIEW, 120, handle), 'plans-start-dr')
   press(PlanPane(stubEls, ACTION_VIEW, 120, handle), 'plans-resume-pk')
   expect(acts).toEqual(['unarchive:ar', 'delete:ar', 'archive:dn'])
@@ -336,5 +339,7 @@ test('plan actions: without ui.planAct archive still submits the mk: line', () =
   const subs: string[] = []
   const handle = { get: (k: string) => ui.get(k), set: (k: string, v: string) => { ui.set(k, v) }, submit: (t: string) => { subs.push(t) } }
   press(PlanPane(stubEls, ACTION_VIEW, 120, handle), 'plans-archive-dn')
+  expect(subs).toEqual([])
+  press(PlanPane(stubEls, ACTION_VIEW, 120, handle), 'plans-confirm-archive-dn')
   expect(subs).toEqual(['mk: archive plan dn'])
 })
