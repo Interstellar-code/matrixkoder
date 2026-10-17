@@ -1559,6 +1559,29 @@ def _risk_of(extra, reasons):
     return max(1, min(5, base + sum(r["points"] for r in reasons)))
 
 
+def _findings_count(con, run, task_id, rnd):
+    """Bullets under the `## Findings` section of the task's review artifact for round rnd;
+    null when there is no such artifact or section. shortcut: heuristic on free-text reviews
+    (the store holds no structured count), upgrade when mk-state records one."""
+    row = con.execute("SELECT text FROM artifacts WHERE run=? AND task=? AND kind='review' AND round=?"
+                      " ORDER BY id DESC LIMIT 1", (run, task_id, rnd)).fetchone()
+    m = re.search(r"^## Findings.*?$(.*?)(?=^## |\Z)", row["text"] or "", re.M | re.S) if row else None
+    return len(re.findall(r"^\s*- (?!none\b)", m.group(1), re.M | re.I)) if m else None
+
+
+def _task_history(con, run, task_id, extra, rnd):
+    """last_commit, rounds, gates, findings for one task node: extra_json values, null when absent."""
+    rounds = extra.get("rounds")
+    if isinstance(rounds, list):
+        rounds = [{"n": r.get("n"), "kind": r.get("kind"), "sha": r.get("sha"),
+                   "verdict": r.get("verdict"), "at": r.get("started")}
+                  for r in rounds if isinstance(r, dict)]
+    else:
+        rounds = None
+    return {"last_commit": extra.get("last_commit"), "rounds": rounds, "gates": extra.get("gates"),
+            "findings": _findings_count(con, run, task_id, rnd) if rnd else None}
+
+
 def _phases_from_run(rows, header, run, con):
     """Phases with their tasks from one run's task rows, in row order (C5).
 
@@ -1585,6 +1608,7 @@ def _phases_from_run(rows, header, run, con):
             ph = {"id": r["id"], "title": r["title"], "wave": hwave.get(r["id"]),
                   "deps": _deps_of(r["deps"]), "status": r["status"]}
             ph.update(_routing_of(r))
+            ph.update(_task_history(con, run, r["id"], _task_extra(con, run, r["id"]), r["round"]))
             ph["tasks"] = []
             phases[r["id"]] = ph
         else:
@@ -1594,6 +1618,7 @@ def _phases_from_run(rows, header, run, con):
             # F.1: risk fields from extra_json + risk_reasons
             extra = _task_extra(con, run, r["id"])
             reasons = _open_reasons(con, run, r["id"])
+            nodes[r["id"]].update(_task_history(con, run, r["id"], extra, r["round"]))
             nodes[r["id"]]["risk"] = _risk_of(extra, reasons)
             nodes[r["id"]]["critical"] = extra.get("critical") is True
             nodes[r["id"]]["open_reasons"] = reasons
@@ -1629,6 +1654,7 @@ def _phases_from_header(header):
                     "type": type_, "round": None, "verdict": None, "slot": None, "pane": None,
                     "branch": None, "updated": None, "acceptance": None, "owned": [],
                     "deps": list(d.get("deps") or []), "route": None, "subtasks": [],
+                    "last_commit": None, "rounds": None, "gates": None, "findings": None,
                     "risk": 1, "critical": False, "open_reasons": []}
 
         tasks = []
@@ -1643,7 +1669,8 @@ def _phases_from_header(header):
         out.append({"id": pid, "title": ph.get("title", ""), "wave": ph.get("wave"),
                     "deps": list(ph.get("deps") or []), "status": "planned", "slot": None,
                     "pane": None, "branch": None, "updated": None, "acceptance": None,
-                    "owned": [], "route": None, "tasks": tasks})
+                    "owned": [], "route": None, "last_commit": None, "rounds": None,
+                    "gates": None, "findings": None, "tasks": tasks})
     return out
 
 
@@ -4235,14 +4262,15 @@ def _plans_detail(home):
     _check(ids == ["ph1", "loner"], f"detail phases {ids}")  # row order; header ph2 never ran
     ph1, loner = got["phases"]
     phase_keys = {"id", "title", "wave", "deps", "status", "tasks", "slot", "pane", "branch",
-                  "updated", "acceptance", "owned", "route"}
+                  "updated", "acceptance", "owned", "route", "last_commit", "rounds", "gates",
+                  "findings"}
     _check(ph1["wave"] == 1 and ph1["title"] == "Phase one" and ph1["status"] == "planned"
            and ph1["deps"] == [] and set(ph1) == phase_keys and ph1["slot"] is None
            and ph1["route"] is None, f"ph1 {ph1}")  # wave from header_json; routing null-defaulted
     _check([t["id"] for t in ph1["tasks"]] == ["a1", "a2", "a3", "a4"], f"ph1 tasks {ph1['tasks']}")
     task_keys = {"id", "title", "status", "parent", "type", "round", "verdict", "slot", "pane",
                  "branch", "updated", "acceptance", "owned", "deps", "route", "subtasks",
-                 "risk", "critical", "open_reasons"}
+                 "risk", "critical", "open_reasons", "last_commit", "rounds", "gates", "findings"}
     a1, a2, a3, a4 = ph1["tasks"]
     _check(a1["parent"] == "ph1" and a1["type"] == "task" and a1["status"] == "planned"
            and set(a1) == task_keys, f"a1 {a1}")
