@@ -8,6 +8,9 @@ All notable changes to this project. Format: Keep a Changelog; versions: SemVer.
 - **dashboard:** Plan tab redesign, live Overview/Lanes/Usage/Events, Old tab removed (2341d2c)
 - **mkdb:** plans reply carries last_commit, rounds, gates and findings per task (0c680ca)
 
+### Known issues
+- 51 plugin tests still assert the pre-redesign screens and `scripts/selftest.sh` reports 16 failures; fixed in the next patch.
+
 ## [0.6.0] - 2026-10-16
 
 ### Added
