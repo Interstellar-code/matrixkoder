@@ -3,6 +3,8 @@
 Source: https://www.claudemod.com/mods/karpathy-claude-rules (from forrestchang/andrej-karpathy-skills).
 Simplicity First is left out: the `ponytail` plugin already enforces it.
 
+These rules favour caution over speed. For trivial tasks (typo fixes, obvious one-liners) use judgment: not every change needs the full rigor.
+
 ## 1. Think before coding
 
 Don't assume. Don't hide confusion. Surface tradeoffs.
