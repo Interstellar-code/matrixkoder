@@ -116,7 +116,7 @@ export type MkStatusMemory = {
 }
 
 /** dashboard.tsx (S0.2): the /mk pane's tabs */
-export type MkDashTab = 'overview' | 'lanes' | 'plan' | 'usage' | 'files' | 'events' | 'waiting' | 'kanban' | 'settings'
+export type MkDashTab = 'overview' | 'lanes' | 'plan' | 'usage' | 'files' | 'events' | 'waiting' | 'kanban' | 'todo' | 'settings'
 
 export type MkFileAct = {
   path: string

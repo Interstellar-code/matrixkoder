@@ -52,7 +52,9 @@ import type { FloorCtl, FloorSetting, Quota, QuotaRow, UsageView } from './tabs/
 import { USAGE_FIXTURE } from './tabs/usage.fixture'
 import { WaitingTab, waitingAsks, waitingView, readPending, askView, runWaitView, emptyWaitingView } from './tabs/waiting'
 import type { PendingAsk, RunWait } from './tabs/waiting'
-import { KanbanTab, kanbanView, readCards, emptyKanbanView, kanbanFixtureView, cardsErrorLine } from './tabs/kanban'
+import { KanbanTab, kanbanView, readCards, emptyKanbanView, kanbanFixtureView, cardsErrorLine, projectStoreDir, storeGroups } from './tabs/kanban'
+import { TodoTab } from './tabs/todo'
+import type { TodoFilter, TodoItem, TodoView } from './tabs/todo'
 import type { KanbanCard, KanbanFilters, CardsRead } from './tabs/kanban'
 import { chipText, toastsFor } from './status'
 
@@ -107,6 +109,7 @@ const TABS: readonly { key: MkDashTab; hotkey: string; label: string }[] = [
   { key: 'events', hotkey: 'e', label: 'Events' },
   { key: 'waiting', hotkey: 'w', label: 'Waiting' },
   { key: 'kanban', hotkey: 'k', label: 'Kanban' },
+  { key: 'todo', hotkey: 't', label: 'Todo' },
   { key: 'settings', hotkey: '9', label: 'Settings' },
 ]
 
@@ -314,6 +317,7 @@ export function registerDashboard(on: On, options: PluginOptions): void {
       recheck: () => { void recheckAbout($) },
       submit: text => { void $.prompt.submit({ text }) },
       planAct: (kind, id) => { void planAction($, kind, id) },
+      todoAct: (kind, arg) => { void todoAction($, kind, arg) },
     }
     // S3: the live Settings view once loaded. Before that a one-line
     // skeleton draws — never the fixture's mock rows (LOW 1). A tab opened
@@ -392,6 +396,8 @@ export function registerDashboard(on: On, options: PluginOptions): void {
                       ? withViewState(EventsTab, tabEls, liveEventsView(snap), cols, ui)
                       : dashTab === 'kanban'
                         ? KanbanTab(tabEls, kanbanPaneView(viewState), cols)
+                        : dashTab === 'todo'
+                          ? TodoPane($, tabEls, viewState, cols, ui)
                         : pane.src === 'live'
                           ? waitingAsks(tabEls, pane.asks, cols, new Date().toISOString(), ui)
                           : withViewState(WaitingTab, tabEls, waitingPaneView(pane, snap.run?.waiting ?? null), cols, ui)}
@@ -415,6 +421,8 @@ type TabUi = {
   submit?: (text: string) => void
   /** archive | unarchive | delete: runs mk-plan.py directly (see planAction). */
   planAct?: (kind: string, id: string) => void
+  /** Todo tab presses: runs `mkdb.py todo <verb>` (see todoAction). */
+  todoAct?: (kind: 'add' | 'toggle' | 'delete' | 'undo' | 'clear-done', arg?: string | number) => void
 }
 
 /** C12 hands `ui` to all six tabs; V2's three still take three arguments, so
@@ -437,6 +445,7 @@ async function switchTab($: EngineInterface, tab: MkDashTab): Promise<void> {
   await update($, dashTabAtom, () => tab)
   await setViewKey($, 'settings:focus', '')
   if (tab === 'settings') void ensureSettingsLoaded($)
+  if (tab === 'todo') void kickTodos($) // the first list should not wait for the 5 s tick
   if (tab !== 'files') {
     filesSlotsStamp = null
     filesNow = 0
@@ -1488,6 +1497,136 @@ async function refreshPlans($: EngineInterface, cwd: string, overview: RootOverv
   }).finally(() => { plansInFlight = false })
 }
 
+// ── Todo tab: the list is read on the tick (only while the tab is open), writes run from presses ──
+
+const TODO_ITEMS_KEY = 'todo:items'
+const TODO_ERROR_KEY = 'todo:error'
+const TODO_SLUG_KEY = 'todo:slug'
+const TODO_HOME_KEY = 'todo:home'
+const TODO_UNDO_KEY = 'todo:undo'
+
+/** The active project's slug in the root overview: the row(s) whose store dir is the pane's data
+ *  dir (the same match the Plan list uses), named the way the Kanban tab names a store. */
+function activeSlug(doc: unknown, dataDir: string | null): string {
+  const rows = doc != null && typeof doc === 'object' ? (doc as { projects?: unknown }).projects : undefined
+  if (dataDir == null || dataDir === '' || !Array.isArray(rows)) return ''
+  const mine = rows.filter((r): r is Record<string, unknown> =>
+    r != null && typeof r === 'object' && (projectStoreDir(r) === dataDir || (typeof r.data_dir === 'string' && r.data_dir.trim() === dataDir)))
+  return storeGroups(mine)[0]?.slug ?? ''
+}
+
+function todoPaneView(view: Record<string, string>): TodoView {
+  const parse = (key: string): unknown => { try { return JSON.parse(view[key] ?? '') } catch { return null } }
+  const items = parse(TODO_ITEMS_KEY)
+  const undo = parse(TODO_UNDO_KEY)
+  const f = view['todo:filter']
+  return {
+    mock: false,
+    project: view[TODO_SLUG_KEY] || 'no project',
+    todos: Array.isArray(items) ? items as TodoItem[] : [],
+    filter: (f === 'open' || f === 'done' ? f : 'all') as TodoFilter,
+    draft: view['todo:draft'] ?? '',
+    undo: undo != null && typeof undo === 'object' ? undo as TodoItem : null,
+  }
+}
+
+/** The Todo body: an error line (a failed verb), the tab, then the a / z hotkeys. The hotkeys
+ *  stand down while the add field has the focus (it swallows letters), like Settings' noHotkey. */
+function TodoPane($: EngineInterface, els: Els, view: Record<string, string>, cols: number, ui: TabUi): RenderElement {
+  const { Box, Text, Button } = els
+  const err = view[TODO_ERROR_KEY] ?? ''
+  const typing = (view['settings:focus'] ?? '') === 'todo-q'
+  return (
+    <Box flexDirection="column" gap={1}>
+      {err !== '' && <Text color={ROLE.err.fg}>{`⚠ ${sanitizeText(err, Math.max(8, cols - 4))}`}</Text>}
+      {TodoTab(els, todoPaneView(view), cols, ui)}
+      <Box flexDirection="row" gap={1} paddingX={1}>
+        <Button key="todo-key-a" hotkey={typing ? undefined : 'a'} label="add" plain={true} onPress={() => filesFocus($, 'todo-q')} />
+        <Button key="todo-key-z" hotkey={typing ? undefined : 'z'} label="undo" plain={true} onPress={() => ui.todoAct?.('undo')} />
+      </Box>
+    </Box>
+  )
+}
+
+let todosInFlight = false
+let todosAgain = false
+
+/** `mkdb.py todo list` for one project; one read in flight. A write that lands while a read is
+ *  out asks for one more read after it (`again`), so the list never keeps pre-write rows. */
+async function loadTodos($: EngineInterface, home: string, slug: string, again = false): Promise<void> {
+  if (todosInFlight) { if (again) todosAgain = true; return }
+  todosInFlight = true
+  try {
+    const r = await $.process.run(['python3', `${$.plugin.root}/scripts/mkdb.py`, '--home', home, 'todo', 'list', '--project', slug], { timeoutMs: 5_000 })
+    const reply = JSON.parse(r.stdout) as { ok?: boolean; todos?: TodoItem[]; error?: string }
+    if (r.exitCode !== 0 || reply.ok !== true || !Array.isArray(reply.todos)) throw new Error(reply.error ?? `todo list exit ${r.exitCode}`)
+    const items = JSON.stringify([...reply.todos].sort((a, b) => b.id - a.id))
+    await update($, viewStateAtom, prev => (prev[TODO_SLUG_KEY] !== slug ? prev : prev[TODO_ITEMS_KEY] === items && (prev[TODO_ERROR_KEY] ?? '') === '' ? prev : { ...prev, [TODO_ITEMS_KEY]: items, [TODO_ERROR_KEY]: '' }))
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    await update($, viewStateAtom, prev => ({ ...prev, [TODO_ERROR_KEY]: `todo list: ${msg}` })).catch(() => {})
+  } finally {
+    todosInFlight = false
+    if (todosAgain) { todosAgain = false; void loadTodos($, home, slug) }
+  }
+}
+
+/** The tick (and the switch to the tab): resolve the project from the shared root overview, then
+ *  list. Only while the Todo tab is open; a missing overview database spawns nothing. */
+async function refreshTodos($: EngineInterface, cwd: string, overview: RootOverview): Promise<void> {
+  if ((await read($, dashTabAtom)) !== 'todo') return
+  const home = overview.exists ? overview.home ?? '' : ''
+  const dataDir = home === '' ? null : await resolveDataDir($, { cwd, home, requireExisting: true, store: true }).catch(() => null)
+  const slug = home === '' ? '' : activeSlug(overview.doc, dataDir)
+  await update($, viewStateAtom, prev => (prev[TODO_HOME_KEY] === home && prev[TODO_SLUG_KEY] === slug ? prev
+    // a new project: the old rows, the undo row and the error belong to the old one, so a press cannot send their ids here
+    : { ...prev, [TODO_HOME_KEY]: home, [TODO_SLUG_KEY]: slug, [TODO_ITEMS_KEY]: '', [TODO_UNDO_KEY]: '', [TODO_ERROR_KEY]: '' }))
+  if (home !== '' && slug !== '') await loadTodos($, home, slug)
+}
+
+async function kickTodos($: EngineInterface): Promise<void> {
+  const cwd = await filesCwd($)
+  await refreshTodos($, cwd, await readRootOverview($)).catch(() => {})
+}
+
+/** A press: run `mkdb.py todo <verb>` with the user text as ONE argv element (`--text=<text>`,
+ *  so a leading dash is not read as a flag), then reload the list. A failure keeps the list and
+ *  shows an error line. */
+async function todoAction($: EngineInterface, kind: string, arg?: string | number): Promise<void> {
+  const view = await read($, viewStateAtom)
+  const home = view[TODO_HOME_KEY] ?? ''
+  const slug = view[TODO_SLUG_KEY] ?? ''
+  let undo: TodoItem | null = null
+  try { undo = JSON.parse(view[TODO_UNDO_KEY] ?? '') as TodoItem } catch { undo = null }
+  const tail =
+    kind === 'add' ? ['add', `--text=${String(arg ?? '')}`]
+    : kind === 'toggle' || kind === 'delete' ? [kind, '--id', String(arg)]
+    : kind === 'clear-done' ? ['clear-done']
+    : kind === 'undo' && undo != null
+      ? ['restore', '--id', String(undo.id), `--text=${undo.text}`, '--done', undo.done ? '1' : '0', ...(undo.created ? [`--created=${undo.created}`] : [])]
+      : null
+  if (tail == null) return
+  const fail = (msg: string) => update($, viewStateAtom, prev => ({ ...prev, [TODO_ERROR_KEY]: `todo ${kind}: ${msg}` }))
+  if (home === '' || slug === '') { await fail('no project'); return }
+  try {
+    const r = await $.process.run(['python3', `${$.plugin.root}/scripts/mkdb.py`, '--home', home, 'todo', tail[0]!, '--project', slug, ...tail.slice(1)], { timeoutMs: 10_000 })
+    let reply: { ok?: boolean; todo?: TodoItem; error?: string } = {}
+    try { reply = JSON.parse(r.stdout) as typeof reply } catch { reply = {} }
+    if (r.exitCode !== 0 || reply.ok !== true) { await fail(reply.error ?? (r.stderr.trim() || `exit ${r.exitCode}`)); return }
+    await update($, viewStateAtom, prev => ({
+      ...prev,
+      [TODO_ERROR_KEY]: '',
+      ...(kind === 'delete' ? { [TODO_UNDO_KEY]: JSON.stringify(reply.todo ?? null) } : {}),
+      ...(kind === 'undo' ? { [TODO_UNDO_KEY]: '' } : {}),
+      ...(kind === 'add' ? { 'todo:draft': '' } : {}),
+    }))
+  } catch (e) {
+    await fail(e instanceof Error ? e.message : String(e))
+    return
+  }
+  await loadTodos($, home, slug, true)
+}
+
 /** Cards JSON kept on the view-state atom so a tick is one read, not a render. */
 const CARDS_KEY = 'kanban:cards'
 const CARDS_MS_KEY = 'kanban:ms'
@@ -1663,6 +1802,7 @@ async function refreshSafe($: EngineInterface, options: PluginOptions, cwd: stri
     await refreshCards($, overview)
     await refreshPending($, cwd)
     await refreshPlans($, cwd, overview)
+    await refreshTodos($, cwd, overview)
   } catch (err) {
     try {
       await update($, snapshotAtom, () => ({ ...prev, error: `cannot read the run state (${String(err).slice(0, 40)})` }))

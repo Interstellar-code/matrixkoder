@@ -263,6 +263,7 @@ const TAB_OPTS: readonly (readonly [string, string])[] = [
   ['events', ''],
   ['waiting', ''],
   ['kanban', ''],
+  ['todo', ''],
   ['settings', 'this tab'],
 ]
 

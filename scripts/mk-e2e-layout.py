@@ -1285,8 +1285,8 @@ AUDIT_PROJECT_FILES = {n + suf for n in AUDIT_PROJECT_STORES for suf in ("", "-w
                        ".migrate.json"}
 AUDIT_PROJECT_DIRS = {mkpaths.TARGET_PLANS_DIR, "archive", "runs", "legacy"}   # legacy/ = the user-confirmed `--archive` tarball of the old data dir
 AUDIT_PLAN_ENTRIES = {"plan.md", "assets", "archive", "runs"}
-# the root store also carries mk-catalog's C8 tables (agents, catalog_user, models): the catalog owns them
-AUDIT_ROOT_CATALOG_TABLES = {"agents", "catalog_user", "models"}   # optional: allowed when present, never required
+# the root store also carries mk-catalog's C8 tables (agents, catalog_user, models) and the user's todos table
+AUDIT_ROOT_CATALOG_TABLES = {"agents", "catalog_user", "models", "todos"}   # optional: allowed when present, never required
 AUDIT_BUS_FILES = {"bus.json", "bus-tokens.json", "ring-queue.json", "bus.lock", "bus-ensure.lock",
                    "bus-tokens.lock"}
 LANE_TOKEN_RE = re.compile(r"^[0-9a-f]{64}\.json$")

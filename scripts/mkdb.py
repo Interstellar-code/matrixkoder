@@ -14,7 +14,7 @@ Common: --data DIR (the project data dir; until DM a project lives at <repo>/.ma
 Every command prints ONE JSON line. Errors: {"ok": false, "error": ...} exit 2;
 a store newer than this code: exit 3.
 
-Two stores. The root store <home>/mk.db holds the projects linkage and plan_summary (C1, C3).
+Two stores. The root store <home>/mk.db holds the projects linkage, plan_summary, the agent catalog tables and the user's todos (C1, C3).
 The project store <data>/mk.db (or <home>/projects/<slug>/mk.db when only --project is given)
 holds that project's plans, runs, tasks, events and change_log (C2). The project store is the
 truth: transition() is the only status writer, and the root plan_summary is a projection written
@@ -1983,6 +1983,127 @@ def run_snapshot(home, project=None, run=None, data_dir=None):
         con.close()
 
 
+# --- todo: the user's to-do list, one root table (T3, T4) -----------------------------------------
+# The table is created by the first write verb (CREATE TABLE IF NOT EXISTS), exactly like the agent
+# catalog tables; ROOT_SCHEMA stays 3. `todo list` never creates the file or the table.
+TODO_DDL = """CREATE TABLE IF NOT EXISTS todos(
+  project TEXT NOT NULL, id INTEGER NOT NULL, text TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0,
+  created TEXT, PRIMARY KEY(project, id))"""
+TODO_MAX = 500
+_TODO_CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")  # tab and newline included
+
+
+def _todo_text(text):
+    out = _TODO_CTRL_RE.sub("", text or "").strip()
+    if not out:
+        raise Fail("todo text is empty")
+    if len(out) > TODO_MAX:
+        raise Fail(f"todo text is {len(out)} chars; the cap is {TODO_MAX}")
+    return out
+
+
+def _todo_row(r):
+    return {"id": r["id"], "text": r["text"], "done": bool(r["done"]), "created": r["created"]}
+
+
+def _todo_write(home, project, fn):
+    """Run fn(con) in one short BEGIN IMMEDIATE on the root store; create the table first."""
+    check_home(home)
+    check_slug(project)
+    con = open_root(home)
+    try:
+        _begin(con)
+        try:
+            con.execute(TODO_DDL)
+            out = fn(con)
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+        return out
+    finally:
+        con.close()
+
+
+def _todo_get(con, project, tid):
+    r = con.execute("SELECT id, text, done, created FROM todos WHERE project=? AND id=?",
+                    (project, tid)).fetchone()
+    if r is None:
+        raise Fail(f"no todo {tid} in project {project}")
+    return r
+
+
+def todo_list(home, project, which="all"):
+    """Read-only: mode=ro, never creates the root file or the table. Newest first (id DESC)."""
+    check_home(home)
+    check_slug(project)
+    if which not in ("all", "open", "done"):
+        raise Fail(f"bad filter {which!r}: all, open or done")
+    empty = {"ok": True, "todos": [], "open": 0, "done": 0}
+    con = _open_read(_mkpaths().root_db_in(home), ROOT_SCHEMA)
+    if con is None:
+        return empty
+    try:
+        if not con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='todos'").fetchone():
+            return empty
+        rows = [_todo_row(r) for r in con.execute(
+            "SELECT id, text, done, created FROM todos WHERE project=? ORDER BY id DESC", (project,))]
+    finally:
+        con.close()
+    n_done = sum(1 for r in rows if r["done"])
+    keep = [r for r in rows if which == "all" or r["done"] == (which == "done")]
+    return {"ok": True, "todos": keep, "open": len(rows) - n_done, "done": n_done}
+
+
+def todo_add(home, project, text):
+    text = _todo_text(text)
+
+    def go(con):
+        tid = con.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM todos WHERE project=?",
+                          (project,)).fetchone()[0]
+        con.execute("INSERT INTO todos(project, id, text, done, created) VALUES (?,?,?,0,?)",
+                    (project, tid, text, now()))
+        return {"ok": True, "todo": _todo_row(_todo_get(con, project, tid))}
+    return _todo_write(home, project, go)
+
+
+def todo_toggle(home, project, tid):
+    def go(con):
+        _todo_get(con, project, tid)
+        con.execute("UPDATE todos SET done = 1 - done WHERE project=? AND id=?", (project, tid))
+        return {"ok": True, "todo": _todo_row(_todo_get(con, project, tid))}
+    return _todo_write(home, project, go)
+
+
+def todo_delete(home, project, tid):
+    def go(con):
+        row = _todo_row(_todo_get(con, project, tid))
+        con.execute("DELETE FROM todos WHERE project=? AND id=?", (project, tid))
+        return {"ok": True, "todo": row}
+    return _todo_write(home, project, go)
+
+
+def todo_restore(home, project, tid, text, done, created):
+    text = _todo_text(text)
+    if done not in (0, 1):
+        raise Fail("todo restore --done must be 0 or 1")
+
+    def go(con):
+        if con.execute("SELECT 1 FROM todos WHERE project=? AND id=?", (project, tid)).fetchone():
+            raise Fail(f"todo {tid} already exists in project {project}")
+        con.execute("INSERT INTO todos(project, id, text, done, created) VALUES (?,?,?,?,?)",
+                    (project, tid, text, done, created))
+        return {"ok": True, "todo": _todo_row(_todo_get(con, project, tid))}
+    return _todo_write(home, project, go)
+
+
+def todo_clear_done(home, project):
+    def go(con):
+        return {"ok": True, "cleared": con.execute(
+            "DELETE FROM todos WHERE project=? AND done=1", (project,)).rowcount}
+    return _todo_write(home, project, go)
+
+
 # --- L10.9 root cleanup: dry-run list, backup, apply, restore -----------------------------------
 # The root home carries tables and files that later layouts replaced. `root-cleanup` lists them
 # (the default, writes nothing); `--apply --backup-dir D` copies every item into
@@ -2444,6 +2565,13 @@ def _cli(argv):
     ev.add_argument("--chan", default="state", help="channel; '' reads every channel")
     ev.add_argument("--since", type=int, help="only rows past this events.id (the wake cursor)")
     ev.add_argument("--json", action="store_true")
+    td = sub.add_parser("todo")
+    td.add_argument("verb", choices=("list", "add", "toggle", "delete", "restore", "clear-done"))
+    td.add_argument("--filter", default="all", choices=("all", "open", "done"))
+    td.add_argument("--text")
+    td.add_argument("--id", type=int)
+    td.add_argument("--done", type=int)
+    td.add_argument("--created")
     rc = sub.add_parser("root-cleanup")
     rc.add_argument("--dry-run", action="store_true")
     rc.add_argument("--apply", action="store_true")
@@ -2482,6 +2610,25 @@ def _cli(argv):
                 "store": _store_present(home, args.project, args.data),
                 "events": events(home, args.project, args.run, args.data, args.task,
                                  args.chan, args.since)}
+    if args.cmd == "todo":
+        if not args.project:
+            raise Fail("todo needs --project")
+        v = args.verb
+        if v in ("toggle", "delete", "restore") and args.id is None:
+            raise Fail(f"todo {v} needs --id")
+        if v in ("add", "restore") and args.text is None:
+            raise Fail(f"todo {v} needs --text")
+        if v == "list":
+            return todo_list(home, args.project, args.filter)
+        if v == "add":
+            return todo_add(home, args.project, args.text)
+        if v == "toggle":
+            return todo_toggle(home, args.project, args.id)
+        if v == "delete":
+            return todo_delete(home, args.project, args.id)
+        if v == "restore":
+            return todo_restore(home, args.project, args.id, args.text, args.done, args.created)
+        return todo_clear_done(home, args.project)
     if args.cmd == "root-cleanup":
         if args.apply and args.dry_run:
             raise Fail("root-cleanup takes --dry-run or --apply, not both")
@@ -2504,7 +2651,7 @@ def _cli(argv):
                                 tasks=doc.get("tasks") or (), events=doc.get("events") or (),
                                 artifacts=doc.get("artifacts") or (), data_dir=args.data)
         return {"ok": True, **counts}
-    raise Fail("usage: mkdb.py timeline|projects|overview|plans|run-snapshot|events|root-cleanup"
+    raise Fail("usage: mkdb.py timeline|projects|overview|plans|run-snapshot|events|todo|root-cleanup"
                "|restore|import-history --json  (or --self-test)")
 
 
@@ -3058,6 +3205,7 @@ def self_test():
         os.environ["MATRIXKODER_HOME"] = home
         os.environ["MK_SELFTEST"] = "1"
         _stores(home)
+        _todos(tmp)
         _empty_new_name(tmp)
         _guards(tmp, home)
         _migrations(home)
@@ -3126,6 +3274,86 @@ def self_test():
                 os.environ[k] = v
     print(json.dumps({"ok": True, "self_test": "pass"}))
     return 0
+
+
+def _todos(tmp):
+    """T3/T4: the todos table and the todo verbs, on throwaway homes inside the temp tree."""
+    def fails(fn, *a):
+        try:
+            fn(*a)
+        except Fail as e:
+            return str(e)
+        return None
+
+    def sha(path):
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+
+    fresh = os.path.join(tmp, "todohome-fresh")  # (2) a missing root: list creates nothing
+    _check(todo_list(fresh, "demo") == {"ok": True, "todos": [], "open": 0, "done": 0}, "todo list, no root")
+    _check(not os.path.exists(fresh), "todo list created the home")
+    bare = os.path.join(tmp, "todohome-bare")  # (2) a root without the table: not a byte changes
+    open_root(bare).close()
+    db = _mkpaths().root_db_in(bare)
+    before, files = sha(db), sorted(os.listdir(bare))
+    _check(todo_list(bare, "demo")["todos"] == [], "todo list, no table")
+    _check(sha(db) == before, "todo list changed the root db")
+    _check(not any(n.endswith("-wal") and os.path.getsize(os.path.join(bare, n)) for n in os.listdir(bare)),
+           "todo list left a wal")
+    _check(sorted(os.listdir(bare)) == files or set(os.listdir(bare)) - set(files) <= {os.path.basename(db) + "-shm"},
+           "todo list created a file")
+    con = open_root(bare)  # (3) the existing tables are byte-identical after the first add
+    try:
+        snap = {t: con.execute(f"SELECT * FROM {t} ORDER BY 1").fetchall() and
+                [tuple(r) for r in con.execute(f"SELECT * FROM {t} ORDER BY 1")]
+                for t in ("projects", "plan_summary", "schema_version")}
+    finally:
+        con.close()
+    a1 = todo_add(bare, "demo", "first")["todo"]  # (1)
+    a2 = todo_add(bare, "demo", "second")["todo"]
+    _check((a1["id"], a2["id"], a1["done"]) == (1, 2, False) and a1["created"], f"todo ids {a1} {a2}")
+    got = todo_list(bare, "demo")
+    _check([t["id"] for t in got["todos"]] == [2, 1] and (got["open"], got["done"]) == (2, 0)
+           and all(t["created"] and t["done"] is False for t in got["todos"]), f"todo list {got}")
+    con = open_root(bare)
+    try:
+        for t, rows in snap.items():
+            _check([tuple(r) for r in con.execute(f"SELECT * FROM {t} ORDER BY 1")] == rows, f"{t} changed")
+        _check(con.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 3, "root schema moved")
+    finally:
+        con.close()
+    _check(todo_toggle(bare, "demo", 1)["todo"]["done"] is True, "toggle on")  # (4)
+    _check(todo_list(bare, "demo", "done")["todos"][0]["id"] == 1, "done filter")
+    _check([t["id"] for t in todo_list(bare, "demo", "open")["todos"]] == [2], "open filter")
+    gone = todo_delete(bare, "demo", 1)["todo"]
+    _check(gone["text"] == "first" and gone["done"] is True, f"delete row {gone}")
+    _check(todo_list(bare, "demo")["done"] == 0, "delete left the row")
+    back = todo_restore(bare, "demo", 1, gone["text"], 1, gone["created"])["todo"]
+    _check(back == gone, f"restore {back} != {gone}")
+    _check(todo_clear_done(bare, "demo") == {"ok": True, "cleared": 1}, "clear-done count")
+    _check([t["id"] for t in todo_list(bare, "demo")["todos"]] == [2], "clear-done kept open rows")
+    _check("no todo 99" in (fails(todo_toggle, bare, "demo", 99) or ""), "toggle unknown id")
+    _check(fails(todo_delete, bare, "demo", 99), "delete unknown id")
+    cli = subprocess.run([sys.executable, __file__, "--home", bare, "todo", "toggle", "--project", "demo",
+                          "--id", "99"], capture_output=True, text=True)
+    _check(cli.returncode != 0 and "no todo 99" in cli.stdout, f"cli unknown id {cli.returncode} {cli.stdout}")
+    _check(fails(todo_add, bare, "demo", " \t\n ") and fails(todo_add, bare, "demo", "x" * 501),  # (5)
+           "empty or long text accepted")
+    _check(todo_add(bare, "demo", "a" * 500)["todo"]["text"] == "a" * 500, "500 chars refused")
+    _check(todo_add(bare, "demo", "a\x00b\tc\x1b[0m\x7fd")["todo"]["text"] == "abc[0md", "control chars kept")
+    evil = "'); DROP TABLE todos;--"
+    tid = todo_add(bare, "demo", evil)["todo"]["id"]
+    _check(todo_list(bare, "demo")["todos"][0]["text"] == evil and tid, "metacharacters not verbatim")
+    _check(fails(todo_add, bare, "Bad Slug", "x"), "bad project accepted")
+    todo_add(bare, "other", "first")  # (6) the same id and text in two projects stay apart
+    todo_toggle(bare, "other", 1)
+    _check([t["done"] for t in todo_list(bare, "other")["todos"]] == [True], "other project")
+    _check(todo_list(bare, "demo")["todos"][-1]["done"] is False and
+           todo_list(bare, "demo")["todos"][-1]["id"] == 2, "projects bled")
+    _check(todo_clear_done(bare, "other")["cleared"] == 1 and todo_list(bare, "demo")["open"] >= 4,
+           "clear-done crossed projects")
+    ids = {r["id"] for r in todo_list(bare, "demo")["todos"]}
+    _check(len(ids) == len(todo_list(bare, "demo")["todos"]), "duplicate ids")
 
 
 def _stores(home):

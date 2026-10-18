@@ -16,7 +16,7 @@ gone, and `mk-migrate.py` is the ONE migration tool.
 |---|---|
 | Project data dir | `--data DIR` → `$MATRIXKODER_DATA` → the repo's `projects.data_dir` row in the root store (keyed by the **main checkout** path; `mkpaths.data_dir`) → the repo folder. toplevel = the nearest `.git` above cwd, never `$HOME` itself (a dotfiles repo is not a project); a linked worktree (`.git` file with `commondir`) resolves to its **main checkout**, a nested repo to itself (pass `--data` to reach the outer repo). Once the project is migrated (its root `projects.db_path` is set) the data dir is the project's **legacy** location; the store and every live folder come from `mkpaths.project_db(slug)` / `mkpaths.project_folder` |
 | Global dir | `$MK_HOME` / `$MATRIXKODER_HOME` → `~/.matrixkoder` (`mkpaths.home` — **one** rule: both env names are the MK home and must agree; TS: `mkHomeEnv`/`globalDirOf` in `hooks/paths.ts`). Plugin prefs live in the plugin's userConfig, not in this dir |
-| Root store | `<home>/mk-overview.db` on a new home, `<home>/mk.db` on an existing one (`mkpaths.root_db`) — the overview only: the `projects` row per project and one `plan_summary` row per plan (C3). No task row, no event |
+| Root store | `<home>/mk-overview.db` on a new home, `<home>/mk.db` on an existing one (`mkpaths.root_db`) — the overview numbers and linkage (the `projects` row per project and one `plan_summary` row per plan, C3), the agent catalog tables and the user's `todos`. No task row, no event |
 | Project store | `<home>/projects/<slug>/mk-project.db` on a new home, `.../mk.db` on an existing one (`mkpaths.project_db`) — the project DB, the only per-project DB and the ONE source of truth (C4). A migrated project's root `projects.db_path` names this file; `mkpaths.project_db(slug)` resolves it (the bus follows every switch through it) |
 | Project folder | `<home>/projects/<slug>/` — holds the project DB (`mk-project.db`, or `mk.db` on an existing home), `project.yaml` (today's `matrixkoder.yaml`), `legacy/` and `plans/` (the C2 tree below). `watch-cursors.json` is no longer written: the bus watch cursors are `watch_cursors` rows in the project DB, and the file is read once as an import source |
 | Plan folder | `<home>/projects/<slug>/plans/<plan-id>/` — `plan.md`, `assets/`, `archive/` (`plan-v1.md`, `plan-v2.md` …) and `runs/` |
@@ -57,7 +57,7 @@ tree. `mk-e2e-layout.py audit [--home DIR]` is the read-only audit of a real hom
 
 ```
 ~/.matrixkoder/
-├── mk-overview.db                root: overview only (C3); `mk.db` on an existing home
+├── mk-overview.db                root: overview, catalog and todos (C3); `mk.db` on an existing home
 ├── usage.json
 ├── bus/                          bus.json, bus-tokens.json, lanes/<sha256(lane)>.json, ring-queue.json (C6)
 └── projects/<slug>/
@@ -745,7 +745,7 @@ passes a temp home; the real `~/.matrixkoder` is never created by a test.
 
 | Store | Path | Holds |
 |---|---|---|
-| Root (C3) | `<home>/mk-overview.db` (`mk.db` on an existing home) | `projects` (with `db_path`) and `plan_summary` only. `cards`, `project_summary` and `sync` are dropped by root v3 when they hold no row |
+| Root (C3) | `<home>/mk-overview.db` (`mk.db` on an existing home) | `projects` (with `db_path`) and `plan_summary`, the agent catalog tables (`agents`, `catalog_user`, `models`) and the user's `todos`. `cards`, `project_summary` and `sync` are dropped by root v3 when they hold no row |
 | Project (C4) | `<home>/projects/<slug>/mk-project.db` (`mk.db` on an existing home) for a migrated project; a slug resolves it through `projects.db_path` (`mkpaths.project_db`). A `--data` (or pre-migration slug) opens the store in `<data>`, the legacy location | `plans`, `runs`, `tasks`, `events`, `artifacts`, `acks`, `lane_slots`, `waits`, `change_log`, `evidence`, `risk_reasons`, `reconcile_due`, `settings`, `watch_cursors` |
 
 `<home>` is `--home` → `$MK_HOME` → `~/.matrixkoder`. `<data>` is `--data` / `data_dir`: it names
@@ -863,7 +863,14 @@ longer written (read once as the import source).
 db_path)` — `db_path` is new; **set = migrated**. `plan_summary(project, plan, title, status,
 counts_json, live_run, updated, PRIMARY KEY(project, plan))` — new; one row per plan with the
 numbers (`counts_json`: the task counts by status) and the linkage (`live_run`), refreshed by every
-writer. The root holds **no task row and no event**.
+writer. The root holds **no task row and no event**: it carries the overview numbers, the linkage,
+the agent catalog tables and the user's to-dos.
+
+`todos(project TEXT NOT NULL, id INTEGER NOT NULL, text TEXT NOT NULL, done INTEGER NOT NULL
+DEFAULT 0, created TEXT, PRIMARY KEY(project, id))` — one row per to-do. The write verbs create it
+with `CREATE TABLE IF NOT EXISTS` (the way `mk-catalog.py` creates its tables); the root schema
+number stays 3, so nothing that exists is altered. `id` is the project's `MAX(id)+1`, taken inside
+one short `BEGIN IMMEDIATE`. `root-cleanup` neither lists nor removes it.
 
 The root has no card table: `cards`, `project_summary` and `sync(project PRIMARY KEY,
 last_change_no)` were the pre-linkage copies of the project store and root v3 drops them when empty
@@ -873,7 +880,7 @@ last_change_no)` were the pre-linkage copies of the project store and root v3 dr
 attention status (`blocked`, `stalled`, `quota`, `provider`) keeps the column of the task's previous
 non-attention status — `tasks.prev_status`, written by `transition()` — and sets `attention=1`.
 A task with no previous non-attention status uses Backlog. `column_of(status, prev_status=None)`
-is pure; `transition()` and the rollup do the lookup. Only `plan_summary` and `projects.db_path`
+is pure; `transition()` and the rollup do the lookup. Only `plan_summary`, `projects.db_path`, the catalog tables and `todos`
 are the root's content.
 
 ### `transition(home, project, run, task, to, note="", round=0, sync_root=False, data_dir=None, verdict=<unchanged>)`
@@ -894,7 +901,7 @@ API: `open_root(home)`, `open_project(home, slug=None, data_dir=None)`,
 `transition(home, project, run, task, to, note="", round=0, sync_root=False, data_dir=None)`,
 `catch_up(home, project, data_dir=None)`, `timeline(home, project, run, task, data_dir=None)`,
 `overview(home)` (the root's projects + plans: numbers and `db_path`,
-read-only, never creates the root), `check_slug`, `check_home`, `column_of(status, prev_status=None)`,
+read-only, never creates the root), `todo_list/add/toggle/delete/restore/clear_done(home, project, …)`, `check_slug`, `check_home`, `column_of(status, prev_status=None)`,
 `import_history(home, project, run, *, run_row=None, tasks=(), events=(), artifacts=(), data_dir=None)`.
 
 ### `root-cleanup` and `restore`
@@ -942,6 +949,12 @@ mkdb.py overview --json [--home DIR]
 mkdb.py import-history --project P --run R --json-file F [--data DIR] [--home DIR]
 mkdb.py plans --json [--data DIR] [--home DIR]
 mkdb.py plans <id> --json [--data DIR] [--home DIR]
+mkdb.py todo list --project P [--filter all|open|done] [--home DIR]
+mkdb.py todo add --project P --text T [--home DIR]
+mkdb.py todo toggle --project P --id N [--home DIR]
+mkdb.py todo delete --project P --id N [--home DIR]
+mkdb.py todo restore --project P --id N --text T --done 0|1 --created C [--home DIR]
+mkdb.py todo clear-done --project P [--home DIR]
 mkdb.py --self-test
 ```
 
@@ -956,6 +969,17 @@ status, tasks}`, each task `{id, title, status, parent, type, round, verdict}`. 
 answers `ok: false` and exits 2. Both reads refuse a store still at v3 ("needs migration to v4;
 run a writer command"): any writer, such as `mk-plan.py import`, migrates it first.
 
+
+`todo` verbs (the `todos` table above), one JSON line each. `list` is read-only: an absent root file or
+table answers `{"ok": true, "todos": [], "open": 0, "done": 0}` and creates nothing; otherwise it returns
+`{"ok": true, "todos": [{"id", "text", "done" (bool), "created"}, …], "open": N, "done": N}`, newest
+first (`id` DESC), narrowed by `--filter` (the counts always cover every row of the project). `add`,
+`toggle` and `restore` return `{"ok": true, "todo": {…}}`; `delete` returns the removed row the same
+way; `clear-done` returns `{"ok": true, "cleared": N}`. `restore` puts a row back with its old id,
+text, done flag and created time (an id that already exists is refused). Text is stripped of control
+characters (tab and newline too), must not be empty and is capped at 500 characters (longer is
+refused); an unknown id, a bad project slug or a bad filter is `ok: false`, exit 2. Every statement is
+parameterised, so SQL metacharacters in the text are stored verbatim.
 
 `timeline` is `SELECT … FROM events WHERE run=? AND task=? ORDER BY id`. `overview` reads the root's `projects` + `plan_summary` (C3).
 `mk-catalog.py` follows the same rule for the root store: its read commands (`list`, `show`, `routes`, `model`) go through `read_catalog`, which returns an empty result when the root store is absent (`list` and `routes` answer `{"ok": true, …: []}`) and never creates it, while the writers `seed` and `set` call `open_catalog` and do create it (`set` creates it even when the agent is unknown and the command then refuses). One JSON line per call; errors exit 2, a newer store exits 3.
