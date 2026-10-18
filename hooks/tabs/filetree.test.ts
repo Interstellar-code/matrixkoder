@@ -398,15 +398,30 @@ test('Files F3.1: at 46 and 36 columns no line is wider than column count and lo
   for (const cols of [46, 36]) {
     const tree = FilesTab(stubEls, longView, cols, ui)
 
-    // 1. Card: border and padding plus line content
+    const rootNode = tree as Node
+    const rootChildren = (rootNode.children ?? []) as Node[]
+
+    // 1. Chip row: chips plus gaps
+    const chipRow = rootChildren[0] as Node
+    expect(chipRow).toBeDefined()
+    const chips = nodesOf(chipRow, 'Button')
+    const chipRowGap = Number(chipRow.props?.gap ?? 0)
+    const chipRowWidth = chips.reduce((sum, c) => sum + textOf(c).length, 0) + Math.max(0, chips.length - 1) * chipRowGap + boxOverhead(chipRow)
+    expect(chipRowWidth, `chip row at ${cols} cols: ${chipRowWidth}`).toBeLessThanOrEqual(cols)
+
+    // 2. Card: border and padding plus line contents
     const cardBox = nodesOf(tree, 'Box').find(b => b.props?.borderColor === FT.cardBorder && b.props?.paddingX !== undefined)!
     expect(cardBox).toBeDefined()
     const cardOverhead = boxOverhead(cardBox) // borderStyle (2) + paddingX (2) = 4
 
-    // Top line in card (root label + counts)
-    const topRow = (cardBox.children ?? [])[0] as Node
-    const topTexts = nodesOf(topRow, 'Text')
-    const topLineWidth = topTexts.reduce((sum, t) => sum + textOf(t).length, 0) + cardOverhead
+    // Top line in card (root label + live activity counts + space + gaps)
+    const topRow = ((cardBox.children ?? []) as Node[])[0] as Node
+    const topLabelText = nodesOf((topRow.children as Node[] | undefined)?.[0], 'Text')[0]!
+    const countsBox = (topRow.children as Node[] | undefined)?.[1] as Node
+    const countTexts = nodesOf(countsBox, 'Text')
+    const countGaps = Math.max(0, countTexts.length - 1) * Number(countsBox.props?.gap ?? 1)
+    const countsWidth = countTexts.reduce((sum, t) => sum + textOf(t).length, 0) + countGaps
+    const topLineWidth = textOf(topLabelText).length + 1 + countsWidth + cardOverhead
     expect(topLineWidth, `card top line at ${cols} cols: ${topLineWidth}`).toBeLessThanOrEqual(cols)
 
     // Path line in card
@@ -415,7 +430,27 @@ test('Files F3.1: at 46 and 36 columns no line is wider than column count and lo
     const cardPathLineWidth = textOf(cardPathText).length + cardOverhead
     expect(cardPathLineWidth, `card path line at ${cols} cols: ${cardPathLineWidth}`).toBeLessThanOrEqual(cols)
 
-    // 2. Tree Box: border plus each row line
+    // Search row in card (Input/Text + Button 's' + gap)
+    const searchRow = ((cardBox.children ?? []) as Node[])[2] as Node
+    const searchRowGap = Number(searchRow.props?.gap ?? 1)
+    const searchTexts = nodesOf(searchRow, 'Text')
+    const searchButtons = nodesOf(searchRow, 'Button')
+    const searchRowContentWidth = searchTexts.reduce((sum, t) => sum + textOf(t).length, 0)
+      + searchButtons.reduce((sum, b) => sum + textOf(b).length, 0)
+      + searchRowGap
+    const searchRowLineWidth = searchRowContentWidth + cardOverhead
+    expect(searchRowLineWidth, `search row at ${cols} cols: ${searchRowLineWidth}`).toBeLessThanOrEqual(cols)
+
+    // Expand/Collapse row in card
+    const expRow = ((cardBox.children ?? []) as Node[])[3] as Node
+    const expRowGap = Number(expRow.props?.gap ?? 1)
+    const expButtons = nodesOf(expRow, 'Button')
+    const expRowContentWidth = expButtons.reduce((sum, b) => sum + textOf(b).length, 0)
+      + Math.max(0, expButtons.length - 1) * expRowGap
+    const expRowLineWidth = expRowContentWidth + cardOverhead
+    expect(expRowLineWidth, `expand/collapse row at ${cols} cols: ${expRowLineWidth}`).toBeLessThanOrEqual(cols)
+
+    // 3. Tree Box: border plus each row line
     const treeBox = nodesOf(tree, 'Box').find(b => b.props?.borderColor === FT.cardBorder && b.props?.paddingX === undefined)!
     expect(treeBox).toBeDefined()
     const treeOverhead = boxOverhead(treeBox) // borderStyle (2) = 2
@@ -440,6 +475,31 @@ test('Files F3.1: at 46 and 36 columns no line is wider than column count and lo
       const noteLineWidth = textOf(note).length + treeOverhead
       expect(noteLineWidth, `note row at ${cols} cols: ${noteLineWidth}`).toBeLessThanOrEqual(cols)
     }
+
+    // 4. Line under the tree (counts + path)
+    const underTreeBox = rootChildren.find(b => {
+      return b.type === 'Box' && nodesOf(b, 'Text').some(t => textOf(t).includes('folders'))
+    }) as Node
+    expect(underTreeBox).toBeDefined()
+    const underTexts = nodesOf(underTreeBox, 'Text')
+    const underTreeLineWidth = underTexts.reduce((sum, t) => sum + textOf(t).length, 0) + 1 + boxOverhead(underTreeBox)
+    expect(underTreeLineWidth, `under-tree line at ${cols} cols: ${underTreeLineWidth}`).toBeLessThanOrEqual(cols)
+
+    // 5. Footer line (legend with gaps + space + keys with gaps)
+    const footerBox = rootChildren.find(b => {
+      return b.type === 'Box' && nodesOf(b, 'Button').some(btn => btn.props?.key === 'files-key-j')
+    }) as Node
+    expect(footerBox).toBeDefined()
+    const legendBox = (footerBox.children as Node[] | undefined)?.[0] as Node
+    const legendTexts = nodesOf(legendBox, 'Text')
+    const legendGaps = Math.max(0, legendTexts.length - 1) * Number(legendBox.props?.gap ?? 1)
+    const legendWidth = legendTexts.reduce((sum, t) => sum + textOf(t).length, 0) + legendGaps
+    const keysBox = (footerBox.children as Node[] | undefined)?.[1] as Node
+    const keyButtons = nodesOf(keysBox, 'Button')
+    const keysGaps = Math.max(0, keyButtons.length - 1) * Number(keysBox.props?.gap ?? 1)
+    const keysWidth = keyButtons.reduce((sum, b) => sum + textOf(b).length, 0) + keysGaps
+    const footerLineWidth = legendWidth + 1 + keysWidth + boxOverhead(footerBox)
+    expect(footerLineWidth, `footer line at ${cols} cols: ${footerLineWidth}`).toBeLessThanOrEqual(cols)
 
     // Long file name ends in ellipsis
     const longRowText = nodesOf(tree, 'Text').find(t => textOf(t).includes('an-extremely-long'))

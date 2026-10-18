@@ -388,13 +388,17 @@ export function FilesTab(
     )
 
     // 6. Footer line with legend and hotkeys j, k, h, l
+    const isNarrow = W < 42
+    const writeLegend = isNarrow ? 'write ·' : 'writing ·'
+    const readLegend = isNarrow ? 'read' : 'reading · fades 3s'
+
     const footer = (
       <Box flexDirection="row" justifyContent="space-between" marginTop={1}>
         <Box flexDirection="row" gap={1}>
           <Text color={FT.write}>●</Text>
-          <Text dimColor={true} color={FT.dim}>writing ·</Text>
+          <Text dimColor={true} color={FT.dim}>{writeLegend}</Text>
           <Text color={FT.read}>◉</Text>
-          <Text dimColor={true} color={FT.dim}>reading · fades 3s</Text>
+          <Text dimColor={true} color={FT.dim}>{readLegend}</Text>
         </Box>
         <Box flexDirection="row" gap={1}>
           {Button({ key: 'files-key-j', hotkey: 'j', plain: true, label: 'j', onPress: () => moveSel(1) })}
