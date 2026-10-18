@@ -441,7 +441,7 @@ async function switchTab($: EngineInterface, tab: MkDashTab): Promise<void> {
     filesSlotsStamp = filesNow
     void loadLaneSlots($)
     filesRenderWalk = false // from here the walks start from presses and ticks, where state writes are allowed
-    void startFilesWalk($) // a press may write state, a render may not: the first paint does not wait for the tick
+    void startFilesWalk($).catch(() => {}) // a press may write state, a render may not: the first paint does not wait for the tick
   }
   try {
     await $.ui.scroll({ in: PANE_ID, to: 'start' })
@@ -662,7 +662,7 @@ async function startLoop($: EngineInterface, options: PluginOptions, cwd: string
       if (filesSkipOnce) {
         filesSkipOnce = false
       } else if (!filesWalkInFlight) {
-        void filesTick($)
+        void filesTick($).catch(() => {})
       }
     }
   }))
@@ -1038,11 +1038,15 @@ function cachedMainCheckout($: EngineInterface, cwd: string): Promise<string> {
 
 /** starts the first walk of the root on screen from a press or a tick, where state writes are allowed */
 async function startFilesWalk($: EngineInterface): Promise<void> {
-  const cwd = await filesCwd($)
-  if (!cwd) return
-  const view = await read($, viewStateAtom)
-  const root = pickRoot(rootsOf(await cachedMainCheckout($, cwd), laneSlotsOf(view)), view['files:root'])
-  if (!filesWalkCache.has(root.path)) await runFilesWalk($, root.path)
+  try {
+    const cwd = await filesCwd($)
+    if (!cwd) return
+    const view = await read($, viewStateAtom)
+    const root = pickRoot(rootsOf(await cachedMainCheckout($, cwd), laneSlotsOf(view)), view['files:root'])
+    if (!filesWalkCache.has(root.path)) await runFilesWalk($, root.path)
+  } catch {
+    // fire and forget: a state read refused after the plugin unloaded must not surface; the next tick starts again
+  }
 }
 
 async function runFilesWalk($: EngineInterface, rootPath: string): Promise<void> {
@@ -1132,7 +1136,7 @@ function FilesPane(
 
     let walk = filesWalkCache.get(chosenRoot.path)
     if (!walk && !filesWalkInFlight && filesRenderWalk) {
-      void runFilesWalk($, chosenRoot.path)
+      void runFilesWalk($, chosenRoot.path).catch(() => {})
     }
 
     const mainRoot = roots[0] ?? { id: 'main', label: 'repo', path: mainCheckoutPath || cwd }
@@ -1141,7 +1145,7 @@ function FilesPane(
       note = 'missing root, fallback to repo'
       walk = filesWalkCache.get(mainRoot.path)
       if (!walk && !filesWalkInFlight && filesRenderWalk) {
-        void runFilesWalk($, mainRoot.path)
+        void runFilesWalk($, mainRoot.path).catch(() => {})
       }
     } else if (walk?.missing) {
       note = 'missing root'
@@ -1204,7 +1208,7 @@ function FilesPane(
     const filesTabUi: FilesTabUi = {
       get: key => viewState[key],
       set: (key, value) => {
-        void update($, viewStateAtom, prev => ({ ...prev, [key]: value })).then(() => { if (key === 'files:root') return startFilesWalk($) })
+        void update($, viewStateAtom, prev => ({ ...prev, [key]: value })).then(() => { if (key === 'files:root') return startFilesWalk($) }).catch(() => {})
       },
       reveal: key => { void $.ui.scroll({ in: PANE_ID, to: { key } }).catch(() => {}) },
       focus: key => filesFocus($, key),
