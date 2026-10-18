@@ -318,16 +318,17 @@ export function registerDashboard(on: On, options: PluginOptions): void {
     // never start a refresh on its own, or the refresh tick would re-list.
     if (dashTab === 'lanes' && Date.now() - Number(viewState['lanes:slots-at'] ?? '0') > 30_000) void loadLaneSlots($)
     filesShown = dashTab === 'files'
+    // the Files reads below may find the plugin unloaded when a render lands during teardown: they settle to empty, never reject
     if (dashTab === 'files') {
-      if (!filesNow) filesNow = await $.clock.now()
+      if (!filesNow) filesNow = await Promise.resolve($.clock.now()).catch(() => 0)
       lastFilesDraw = filesNow
     }
-    const fileAct = dashTab === 'files' ? await read($, fileActivityAtom) : undefined
+    const fileAct = dashTab === 'files' ? await read($, fileActivityAtom).catch(() => undefined) : undefined
     let cwd = ''
     let mainCheckoutPath = ''
     if (dashTab === 'files') {
-      cwd = await filesCwd($)
-      mainCheckoutPath = cwd ? await cachedMainCheckout($, cwd) : ''
+      cwd = await filesCwd($).catch(() => '')
+      mainCheckoutPath = cwd ? await cachedMainCheckout($, cwd).catch(() => '') : ''
     }
     const settingsState = readSettingsState(viewState)
     const settingsLive = settingsState.live
@@ -439,7 +440,7 @@ async function switchTab($: EngineInterface, tab: MkDashTab): Promise<void> {
     // a render may not write state, so the lane slots load from here and from the rain tick
     filesNow = await $.clock.now()
     filesSlotsStamp = filesNow
-    void loadLaneSlots($)
+    void loadLaneSlots($).catch(() => {})
     filesRenderWalk = false // from here the walks start from presses and ticks, where state writes are allowed
     void startFilesWalk($).catch(() => {}) // a press may write state, a render may not: the first paint does not wait for the tick
   }
@@ -652,12 +653,12 @@ async function startLoop($: EngineInterface, options: PluginOptions, cwd: string
     const files = clockOk && filesShown && filesNow - lastFilesDraw < 10_000
     const rain = Date.now() - lastRainDraw < 10_000
     if (rain || files) {
-      void setViewKey($, 'rain:tick', String(Math.floor((rain ? Date.now() : filesNow) / RAIN_MS)))
+      void setViewKey($, 'rain:tick', String(Math.floor((rain ? Date.now() : filesNow) / RAIN_MS))).catch(() => {})
     }
     if (files) {
       if (filesSlotsStamp === null || filesNow - filesSlotsStamp >= 30_000) {
         filesSlotsStamp = filesNow
-        void loadLaneSlots($)
+        void loadLaneSlots($).catch(() => {})
       }
       if (filesSkipOnce) {
         filesSkipOnce = false
@@ -1042,7 +1043,7 @@ async function startFilesWalk($: EngineInterface): Promise<void> {
     const cwd = await filesCwd($)
     if (!cwd) return
     const view = await read($, viewStateAtom)
-    const root = pickRoot(rootsOf(await cachedMainCheckout($, cwd), laneSlotsOf(view)), view['files:root'])
+    const root = pickRoot(rootsOf(await cachedMainCheckout($, cwd), busySlotsOf(view)), view['files:root'])
     if (!filesWalkCache.has(root.path)) await runFilesWalk($, root.path)
   } catch {
     // fire and forget: a state read refused after the plugin unloaded must not surface; the next tick starts again
@@ -1126,7 +1127,7 @@ function FilesPane(
 ): RenderElement {
   const { Text } = els
   try {
-    const slots = laneSlotsOf(viewState)
+    const slots = busySlotsOf(viewState)
     const roots = rootsOf(mainCheckoutPath || cwd, slots)
     const chosenId = viewState['files:root']
     const chosenRoot = pickRoot(roots, chosenId)
@@ -2564,6 +2565,11 @@ export function liveOverviewView(snap: MkSnapshot): OverviewView {
  *  gate table, review counts, activity line, commit subject or pane id, so those stay
  *  empty; the stage strip is the task's place on LANE_PIPE. */
 /** The lane slots last read by loadLaneSlots, typed for the Lanes tab. */
+/** The Files root chips: only lane slots that hold a task (an idle slot has nothing being written). */
+function busySlotsOf(view: Record<string, string>): NonNullable<LanesView['slots']> {
+  return laneSlotsOf(view).filter(s => s.task != null && s.state !== 'free')
+}
+
 function laneSlotsOf(view: Record<string, string>): NonNullable<LanesView['slots']> {
   try {
     const raw = JSON.parse(view['lanes:slots'] ?? '[]') as unknown

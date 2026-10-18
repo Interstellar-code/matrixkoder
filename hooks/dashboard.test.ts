@@ -2511,6 +2511,33 @@ test('Files F4.2: render reads fileActivity only when dashTab is files', { timeo
   expect(actReadCount).toBeGreaterThan(0)
 })
 
+test('Files F4.2: only lane slots that hold a task get a root chip, idle slots do not', { timeoutMs: 15000, plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  const clock = mockWorld(on, {
+    process: argv => {
+      if (argv.some(a => a.includes('mk-lane.py')) && argv.includes('list')) {
+        return { value: { exitCode: 0, stdout: JSON.stringify({ ok: true, slots: [{ slot: 1, path: '/lane/1', task: 'P4', state: 'busy' }, { slot: 3, path: '/lane/3', task: null, state: 'free' }, { slot: 4, path: '/lane/4', state: 'free' }] }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      }
+      return undefined
+    },
+  })
+  on('fs.list', () => ({ value: [{ name: 'a.ts', kind: 'file', size: 1, mtimeMs: 1000, isLink: false }] }))
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-files' })
+  let keys: string[] = []
+  for (let i = 0; i < 60; i++) {
+    await clock.advance(0)
+    await ui.redraw(paneProps(46))
+    keys = (await ui.findAll({ type: 'Button' })).map(b => String(b.props.key)).filter(k => k.startsWith('files-root:'))
+    if (keys.includes('files-root:slot-1')) break
+  }
+  expect(keys).toContain('files-root:main')
+  expect(keys).toContain('files-root:slot-1')
+  expect(keys).not.toContain('files-root:slot-3')
+  expect(keys).not.toContain('files-root:slot-4')
+})
+
 test('Files F4.2: missing lane root falls back to main checkout with note', { timeoutMs: 15000, plugins: [worldFixtures] }, async ($, on) => {
   mockFs(on, worldFiles())
   let processCalls = 0
