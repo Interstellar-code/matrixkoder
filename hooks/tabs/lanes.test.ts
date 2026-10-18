@@ -117,15 +117,25 @@ function rowWidths(root: unknown): number[] {
 
 // ---------- the mounted pane ----------
 
+/** every Text's shown string in the tab drawn directly over the fixture, in document order. */
+const fixtureTexts = (cols: number, withRaster = true): string[] =>
+  allOf(LanesTab(stubEls(withRaster), lanesView(), cols), 'Text').map(t => text(t))
+
 test('the Lanes tab draws the MOCK row and its fixture lanes at 46 cols', { plugins: [worldFixtures] }, async ($, on) => {
   mockFs(on, worldFiles())
   mockWorld(on)
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   await ui.press({ key: 'dash-tab-lanes' })
-  expect(await ui.find({ text: MOCK }), 'MOCK row').toBeTruthy()
-  expect(await ui.find({ text: /stripe adapter/ }), 'fixture commit message').toBeTruthy()
-  expect(await ui.find({ text: /\[Reroute\]/ }), 'fixture actions').toBeTruthy()
+  // the mounted pane draws the live run: no MOCK row, the live summary and lanes
+  expect(await ui.find({ text: MOCK }), 'no MOCK row in the live pane').toBeUndefined()
+  expect(await ui.find({ text: /3 lanes · 2 live · 1 held/ }), 'live summary').toBeTruthy()
+  expect(await ui.find({ text: /bulk delete/ }), 'a live lane').toBeTruthy()
+  // the tab itself still draws the fixture view with its MOCK row
+  const texts = fixtureTexts(46)
+  expect(texts.some(t => MOCK.test(t)), 'MOCK row').toBe(true)
+  expect(texts.some(t => /stripe adapter/.test(t)), 'fixture commit message').toBe(true)
+  expect(texts.some(t => /\[Reroute\]/.test(t)), 'fixture actions').toBe(true)
 })
 
 test('the Lanes tab fits 36, 40, 46 and 56 cols: MOCK row, fixture string, no row over cols', { plugins: [worldFixtures] }, async ($, on) => {
@@ -136,13 +146,16 @@ test('the Lanes tab fits 36, 40, 46 and 56 cols: MOCK row, fixture string, no ro
   await ui.press({ key: 'dash-tab-lanes' })
   for (const w of [36, 40, 46, 56]) {
     await ui.redraw(paneProps(w))
-    expect(await ui.find({ text: MOCK }), `MOCK row at ${w}`).toBeTruthy()
+    expect(await ui.find({ text: MOCK }), `no MOCK row in the live pane at ${w}`).toBeUndefined()
     for (const width of textWidths(await ui.drawn())) {
       expect(width, `row wider than ${w} cells at ${w}: ${width}`).toBeLessThanOrEqual(w)
     }
+    expect(fixtureTexts(w).some(t => MOCK.test(t)), `MOCK row at ${w}`).toBe(true)
+    for (const width of textWidths(LanesTab(stubEls(true), lanesView(), w))) {
+      expect(width, `fixture row wider than ${w} cells at ${w}: ${width}`).toBeLessThanOrEqual(w)
+    }
   }
-  await ui.redraw(paneProps(36))
-  expect(await ui.find({ text: /stripe adapter/ }), 'fixture string at 36').toBeTruthy()
+  expect(fixtureTexts(36).some(t => /stripe adapter/.test(t)), 'fixture string at 36').toBe(true)
 })
 
 test('the gate table is three columns at 46 and 56 cols; under 40 it is the Narrow board\'s chips', { plugins: [worldFixtures] }, async ($, on) => {
@@ -153,17 +166,17 @@ test('the gate table is three columns at 46 and 56 cols; under 40 it is the Narr
   await ui.press({ key: 'dash-tab-lanes' })
   // V2.1 moved the breakpoint: the lane-vs-baseline table is the DEFAULT view now
   // (plan acceptance: "the 3-column gate table shows at the default 46 cols"),
-  // so it is at 46 as well as 56 — p0's one-liner is gone from both.
+  // so it is at 46 as well as 56 — p0's one-liner is gone from both. The live
+  // pane's lanes carry no gates (gate: []), so the table is read off the fixture view.
   await ui.redraw(paneProps(56))
-  expect(await ui.find({ text: /baseline/ }), 'gate header at 56').toBeTruthy()
-  expect(await ui.find({ text: /410 \/ 2/ }), 'baseline column at 56').toBeTruthy()
-  expect(await ui.find({ text: /tests 412\/2/ }), 'no one-liner at wide').toBeUndefined()
-  await ui.redraw(paneProps(46))
-  expect(await ui.find({ text: /baseline/ }), 'gate header at 46').toBeTruthy()
-  expect(await ui.find({ text: /410 \/ 2/ }), 'baseline column at 46').toBeTruthy()
-  await ui.redraw(paneProps(36))
-  expect(await ui.find({ text: /baseline/ }), 'no gate table under 40').toBeUndefined()
-  expect(await ui.find({ text: /t 412\/2/ }), 'gate chip under 40').toBeTruthy()
+  expect(await ui.find({ text: /baseline/ }), 'the live pane has no gate table').toBeUndefined()
+  expect(fixtureTexts(56).some(t => /baseline/.test(t)), 'gate header at 56').toBe(true)
+  expect(fixtureTexts(56).some(t => /410 \/ 2/.test(t)), 'baseline column at 56').toBe(true)
+  expect(fixtureTexts(56).some(t => /tests 412\/2/.test(t)), 'no one-liner at wide').toBe(false)
+  expect(fixtureTexts(46).some(t => /baseline/.test(t)), 'gate header at 46').toBe(true)
+  expect(fixtureTexts(46).some(t => /410 \/ 2/.test(t)), 'baseline column at 46').toBe(true)
+  expect(fixtureTexts(36).some(t => /baseline/.test(t)), 'no gate table under 40').toBe(false)
+  expect(fixtureTexts(36).some(t => /t 412\/2/.test(t)), 'gate chip under 40').toBe(true)
 })
 
 // ---------- the render, called directly with a stub table ----------
@@ -188,13 +201,14 @@ test('C11: nothing is drawn outside a Card but the MOCK row and the two hint lin
   const view = lanesView()
   const root = node(LanesTab(stubEls(true), view, 46))
   expect(root.type).toBe('Box')
-  // the root column: the three one-line hints plus one Box per lane
+  // the root column: the MOCK row, the LANES header row (title + summary), one
+  // Box per lane, then the footer hint line
   const outside = kids(root).filter(c => c.type !== 'Box')
   const hintTexts = outside.map(t => text(t))
   expect(hintTexts[0]).toBe('MOCK · fixture data · not this run')
-  expect(hintTexts[1], 'the summary hint').toContain('4 lanes')
-  expect(hintTexts[2], 'the footer hint').toContain('lane-watch')
-  const laneBoxes = kids(root).filter(c => c.type === 'Box')
+  expect(hintTexts[1], 'the footer hint').toContain('lane-watch')
+  const [header, ...laneBoxes] = kids(root).filter(c => c.type === 'Box')
+  expect(text(header), 'the summary hint').toContain('4 lanes')
   expect(laneBoxes, 'one wrapper per lane').toHaveLength(view.lanes.length)
 
   // every Text inside a lane's wrapper is inside a bordered Card (C11)

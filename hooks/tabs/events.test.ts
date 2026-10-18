@@ -9,8 +9,8 @@ import type {
   BoxProps, ElementChildren, Elements, RenderChildren, RenderElement, RenderNode, TextProps,
 } from 'claude-code'
 import { mockFs, mockWorld, paneProps, sessionStart, worldFiles, worldFixtures } from './../testkit'
-import { EVENTS_MAX, EventsTab, eventsViewOf } from './events'
-import { PALETTE, ROLE } from './palette'
+import { EVENTS_MAX, EventsTab, eventsView, eventsViewOf } from './events'
+import { MATRIX, PALETTE, ROLE } from './palette'
 
 /** every node of `type` under `n`, in document order. */
 function nodesOf(n: unknown, type: string): { type: string; props: Record<string, unknown>; children: unknown[] }[] {
@@ -149,14 +149,22 @@ test('the Events tab draws the Checkout v2 timeline over its fixture', { plugins
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   await ui.press({ key: 'dash-tab-events' })
-  expect(await ui.find({ text: /MOCK · fixture data · not this run/ })).toBeTruthy() // first row, always
+  // the mounted pane draws the live run: no MOCK row, one live event, no footer
+  expect(await ui.find({ text: /MOCK · fixture data · not this run/ })).toBeUndefined()
   expect(await ui.find({ text: /EVENTS/ })).toBeTruthy() // the Card's Section header
-  expect(await ui.find({ text: /last 12/ })).toBeTruthy() // the Section's right side
-  expect(await ui.find({ text: /P5 r2 sent to opencode glm/ })).toBeTruthy() // 17:44 row (clipped to the card's width)
-  expect(await ui.find({ text: /worktrees p4 p5 p6 p7/ })).toBeTruthy() // 17:35 row (its head: the row is clipped with … at 46)
-  expect(await ui.find({ text: /24 earlier events/ })).toBeTruthy() // the footer row
-  expect(await ui.find({ text: /workflows-v2/ })).toBeUndefined() // Old is gone
-  const flat = textOwn(await ui.drawn()).join('\n')
+  expect(await ui.find({ text: /last 1$/ })).toBeTruthy() // the Section's right side
+  expect(await ui.find({ text: /F6 r2 gates 6196/ })).toBeTruthy() // the live 17:40 row
+  expect(await ui.find({ text: /earlier events/ })).toBeUndefined()
+  // the tab itself still draws the Checkout v2 fixture view
+  const texts = textOwn(EventsTab(els, eventsView(), 46))
+  expect(texts.some(t => /MOCK · fixture data · not this run/.test(t)), 'first row, always').toBe(true)
+  expect(texts.some(t => /EVENTS/i.test(t))).toBe(true) // the Card's Section header
+  expect(texts.some(t => /last 12/.test(t))).toBe(true) // the Section's right side
+  expect(texts.some(t => /P5 r2 sent to opencode glm/.test(t))).toBe(true) // 17:44 row (clipped to the card's width)
+  expect(texts.some(t => /worktrees p4 p5 p6 p7/.test(t))).toBe(true) // 17:35 row (its head: the row is clipped with … at 46)
+  expect(texts.some(t => /24 earlier events/.test(t))).toBe(true) // the footer row
+  expect(texts.some(t => /workflows-v2/.test(t))).toBe(false)
+  const flat = texts.join('\n')
   expect(flat.indexOf('P5 r2 sent to opencode glm-5'), 'newest row first').toBeLessThan(flat.indexOf('P3 r1 approved'))
 })
 
@@ -170,12 +178,13 @@ test('the event list sits in one kit Card with coloured type chips', { plugins: 
     await ui.redraw(paneProps(cols))
     const cards = cardsOf(await ui.drawn())
     expect(cards, `the one Events Card at ${cols}`).toHaveLength(1)
-    expect(cards[0]?.props.backgroundColor, `card fill at ${cols}`).toBe(PALETTE.panel)
+    expect(cards[0]?.props.backgroundColor, `card fill at ${cols}`).toBe(MATRIX.panel) // the pane wears the Matrix palette
     expect(cards[0]?.props.borderStyle, `round border at ${cols}`).toBe('round')
-    expect(cards[0]?.props.borderColor, `line border at ${cols}`).toBe(PALETTE.line)
+    expect(cards[0]?.props.borderColor, `line border at ${cols}`).toBe(MATRIX.line)
   }
   // the type Chips paint by role: review is the live tint, blocked/quota the warn tint
-  const chips = typeChipsOf(await ui.drawn())
+  // (the live run has one 'verdict' event; the fixture view carries all four roles)
+  const chips = typeChipsOf(EventsTab(els, eventsView(), 46))
   expect(chips.some(c => c.backgroundColor === ROLE.live.tint), 'a review chip').toBe(true)
   expect(chips.some(c => c.backgroundColor === ROLE.warn.tint), 'a blocked chip').toBe(true)
   expect(chips.some(c => c.backgroundColor === ROLE.ok.tint), 'a merged chip').toBe(true)
@@ -198,9 +207,10 @@ test('the Events tab keeps every drawn ROW within the pane width at 36, 39, 40 a
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   await ui.press({ key: 'dash-tab-events' })
   await ui.redraw(paneProps(36))
-  expect(await ui.find({ text: /MOCK · fixture data · not this run/ })).toBeTruthy()
-  expect(await ui.find({ text: /agy ⊘ 19:05/ })).toBeTruthy() // the Narrow board's short row
-  expect(await ui.find({ text: /P5 r2 → glm-5/ })).toBeTruthy() // the Narrow board's short text
+  expect(await ui.find({ text: /MOCK · fixture data · not this run/ })).toBeUndefined() // the live pane has no MOCK row
+  const narrow = textOwn(EventsTab(els, eventsView(), 36))
+  expect(narrow.some(t => /agy ⊘ 19:05/.test(t))).toBe(true) // the Narrow board's short row
+  expect(narrow.some(t => /P5 r2 → glm-5/.test(t))).toBe(true) // the Narrow board's short text
   for (const cols of [36, 39, 40, 46] as const) {
     await ui.redraw(paneProps(cols))
     // a row inside the Card is budgeted for its content (cols - 4); the MOCK
@@ -209,5 +219,7 @@ test('the Events tab keeps every drawn ROW within the pane width at 36, 39, 40 a
     expect(widths.length, `the tab drew rows at ${cols}`).toBeGreaterThan(0)
     const wide = widths.filter(w => (w.inCard ? w.width > cols - 4 : w.width > cols))
     expect(wide, `over-wide rows at ${cols} cols: ${JSON.stringify(wide)}`).toEqual([])
+    const fixtureWide = rowWidths(EventsTab(els, eventsView(), cols)).filter(w => (w.inCard ? w.width > cols - 4 : w.width > cols))
+    expect(fixtureWide, `over-wide fixture rows at ${cols} cols: ${JSON.stringify(fixtureWide)}`).toEqual([])
   }
 })

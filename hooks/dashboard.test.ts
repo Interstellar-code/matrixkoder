@@ -11,6 +11,7 @@ import { filesFocus, footerParts, liveOverviewView, modelShort, openWaiting, pla
 import type { MkSnapshot } from '../types'
 import { mockTabCounts, waitingCount } from './tabs/header'
 import { RUN_SNAPSHOT } from './fixtures/run-snapshot'
+import planDetail from './tabs/fixtures/plan-detail'
 
 /* ---------------------------------------------------------------------------
  * The REAL `mkdb.py run-snapshot --data <dir> --json` replies, captured by
@@ -969,17 +970,18 @@ test('D1.1: four phase tasks on one lane path render ONE lanes row listing their
   mockWorld(on)
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  // 2341d2c: the Lanes tab draws live lane cards; a shared lane is ONE card keyed by its phase ids
+  await ui.press({ key: 'dash-tab-lanes' })
   expect(await ui.find({ text: /E1 E2 E3 E4/ }), 'the phase ids on one row').toBeTruthy()
-  expect(await ui.find({ text: /⌂ OPENCODE/ }), 'the shared lane agent').toBeTruthy()
-  expect(await ui.find({ text: 'building' }), 'the rolled-up status').toBeTruthy()
-  const row = await ui.find({ key: '../wt-shared' })
-  expect(row, 'one row keyed by the lane path').toBeDefined()
+  expect(await ui.find({ text: /OPENCODE/ }), 'the shared lane agent').toBeTruthy()
+  expect(await ui.find({ text: /● building/ }), 'the rolled-up status').toBeTruthy()
+  const row = await ui.find({ key: 'E1 E2 E3 E4' })
+  expect(row, 'one card keyed by the phase ids').toBeDefined()
   const flat = rowTexts(row).join('')
-  expect(flat).toContain('wt-shared')
   expect(flat).toContain('E1 E2 E3 E4')
   expect(flat).toContain('building')
   expect(flat).not.toContain('E1.1') // child tasks are never listed
-  expect(rowTexts(await ui.drawn()).filter(t => t === 'wt-shared'), 'the slot drawn exactly once').toHaveLength(1)
+  expect(rowTexts(await ui.drawn()).filter(t => t === 'E1 E2 E3 E4'), 'the shared lane drawn exactly once').toHaveLength(1)
 })
 
 test('D1.1: the shared row shows the most urgent status; two lane paths stay two rows', { plugins: [worldFixtures] }, async ($, on) => {
@@ -996,8 +998,9 @@ test('D1.1: the shared row shows the most urgent status; two lane paths stay two
   mockWorld(on)
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  const rowA = await ui.find({ key: '../wt-a' })
-  const rowB = await ui.find({ key: '../wt-b' })
+  await ui.press({ key: 'dash-tab-lanes' })
+  const rowA = await ui.find({ key: 'E1 E2 E3' })
+  const rowB = await ui.find({ key: 'E5' })
   expect(rowA, 'lane A row').toBeDefined()
   expect(rowB, 'lane B row stays its own row').toBeDefined()
   const flatA = rowTexts(rowA).join('')
@@ -1102,50 +1105,83 @@ test('V1.4: a full-width rule of the palette line colour sits directly under the
   }
 })
 
-test('C12: the view state starts empty — every phase folded — and only a press opens one', { plugins: [worldFixtures] }, async ($, on) => {
-  mockFs(on, worldFiles())
-  mockWorld(on)
-  await $.session.start(sessionStart())
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+/** A world whose root overview lists the plan `settings-plans-db` and whose `plans <id>` read answers the
+ *  captured detail reply: the Plan tab is store-driven (2341d2c), so its phase rows and `plan-fold-*`
+ *  buttons exist only once a plan is listed and opened. Every other spawn gets the default answer. */
+function planStoreWorld(on: On, files: Files): ReturnType<typeof mockWorld> {
+  const HOME = '/tmp/mk-c12'
+  const reply = (body: unknown) => ({ value: { exitCode: 0, stdout: JSON.stringify(body), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+  const clock = mockWorld(on, {
+    env: { MK_HOME: HOME },
+    process: argv => {
+      if (argv.includes('overview')) {
+        return reply({ ok: true, projects: [], plans: [{ project: 'matrixkoder', plan: planDetail.id, title: planDetail.title, status: 'running', created: 'c', live_run: null, counts: { building: 2 } }] })
+      }
+      if (argv.includes('plans') && argv.includes(planDetail.id)) return reply(planDetail)
+      return undefined
+    },
+  })
+  on('fs.exists', (_$, e) => ({ value: [`${HOME}/mk.db`, `${DATA_DIR}/mk.db`].includes(String(e.path)) }))
+  mockFs(on, files)
+  return clock
+}
+
+/** list -> open the plan -> let the detail read land; the phase fold buttons are then drawn. */
+async function openPlanDetail(ui: { press: (q: { key: string }) => Promise<unknown> }, clock: ReturnType<typeof mockWorld>): Promise<void> {
   await ui.press({ key: 'dash-tab-plan' })
-  // the empty default: no subtask tree is drawn before any press
-  expect(await ui.find({ text: /R1 stripe adapter/ }), 'nothing folded at the default').toBeUndefined()
-  expect(await ui.find({ text: /│ ├/ }), 'no tree rows at the default').toBeUndefined()
-  await ui.press({ key: 'plan-fold-P4' })
-  expect(await ui.find({ text: /R1 stripe adapter/ }), 'the press opened the phase').toBeTruthy()
+  for (let i = 0; i < 5; i++) await clock.advance(0)
+  await ui.press({ key: `plans-detail-${planDetail.id}` })
+  await clock.advance(5000)
+  for (let i = 0; i < 10; i++) await clock.advance(0)
+}
+
+test('C12: the view state starts empty — every phase folded — and only a press opens one', { plugins: [worldFixtures] }, async ($, on) => {
+  const clock = planStoreWorld(on, worldFiles())
+  await $.session.start(sessionStart())
+  for (let i = 0; i < 5; i++) await clock.advance(0)
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await openPlanDetail(ui, clock)
+  // the empty default: no task row is drawn before any press
+  expect(await ui.find({ type: 'Button', key: 'plan-fold-R1' }), 'the phase fold button is drawn').toBeTruthy()
+  expect(await ui.find({ type: 'Button', key: 'plan-task-R1.1' }), 'nothing unfolded at the default').toBeUndefined()
+  await ui.press({ key: 'plan-fold-R1' })
+  expect(await ui.find({ type: 'Button', key: 'plan-task-R1.1' }), 'the press opened the phase').toBeTruthy()
 })
 
 test('C12: every tab call receives the ui handle — all six tabs act on it, not just Overview and Plan', { plugins: [worldFixtures] }, async ($, on) => {
-  mockFs(on, worldFiles())
-  mockWorld(on)
+  const files = worldFiles()
+  // three options, so the Overview waiting card folds b and c behind ⋯ (waiting-opt-a-more-2)
+  setRun(files, run => { run.waiting = { question: "P6 needs P4's schema change. Hold P6?", options: ['Hold P6', 'Rebase later', 'Fold'], rec: 'Hold P6', since: new Date(NOW).toISOString() } })
+  const clock = planStoreWorld(on, files)
   await $.session.start(sessionStart())
+  for (let i = 0; i < 5; i++) await clock.advance(0)
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  // the three-argument tabs (lanes, usage, waiting, events) take the extra
-  // argument through the pane's widened call and still render their fixture
+  // the four-argument tabs (lanes, usage, waiting, events) take the extra argument through the
+  // pane's widened call and still render their body; Plan is store-driven and acts on ui below
   // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
-  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban' && t.key !== 'dash-tab-files' && t.key !== 'dash-tab-todo')) {
+  for (const { key, name } of TAB_BUTTONS.filter(t => !['dash-tab-settings', 'dash-tab-kanban', 'dash-tab-files', 'dash-tab-todo', 'dash-tab-plan'].includes(t.key))) {
     await ui.press({ key })
-    expect(await ui.find(mockRow()), `${name} renders with the ui argument`).toBeTruthy()
+    await expectTabBody(ui, key, `${name} renders with the ui argument`)
   }
   // Overview: the ⋯ reveal reads its flag back from ui and draws the rest
   await ui.press({ key: 'dash-tab-overview' })
-  expect(await ui.find({ text: /b Start on main, rebase later/ }), 'hidden before the press').toBeUndefined()
+  expect(await ui.find({ text: /b Rebase later/ }), 'hidden before the press').toBeUndefined()
   await ui.press({ key: 'waiting-opt-a-more-2' })
-  expect(await ui.find({ text: /b Start on main, rebase later/ }), 'the Overview reveal after the press').toBeTruthy()
+  expect(await ui.find({ text: /b Rebase later/ }), 'the Overview reveal after the press').toBeTruthy()
   // Plan: the phase rows fold through ui
-  await ui.press({ key: 'dash-tab-plan' })
-  expect(await ui.find({ text: /R1 stripe adapter/ }), 'folded to start').toBeUndefined()
-  await ui.press({ key: 'plan-fold-P4' })
-  expect(await ui.find({ text: /R1 stripe adapter/ }), 'the fold reaches the Plan tab through ui').toBeTruthy()
+  await openPlanDetail(ui, clock)
+  expect(await ui.find({ type: 'Button', key: 'plan-task-R1.1' }), 'folded to start').toBeUndefined()
+  await ui.press({ key: 'plan-fold-R1' })
+  expect(await ui.find({ type: 'Button', key: 'plan-task-R1.1' }), 'the fold reaches the Plan tab through ui').toBeTruthy()
   // Lanes: a lane's pause control re-renders that lane with its resume button
   await ui.press({ key: 'dash-tab-lanes' })
-  expect(await ui.find({ type: 'Button', key: 'p4-resume' }), 'a building lane offers pause, not resume').toBeUndefined()
-  await ui.press({ key: 'p4-pause' })
-  expect(await ui.find({ type: 'Button', key: 'p4-resume' }), 'the paused lane offers resume').toBeTruthy()
+  expect(await ui.find({ type: 'Button', key: 'f8-resume' }), 'a building lane offers pause, not resume').toBeUndefined()
+  await ui.press({ key: 'f8-pause' })
+  expect(await ui.find({ type: 'Button', key: 'f8-resume' }), 'the paused lane offers resume').toBeTruthy()
   // Waiting: ⋯ reveals the folded actions; a pick marks the option it picked
   await ui.press({ key: 'dash-tab-waiting' })
   const labels = await tabLabels(ui)
-  expect(labels, 'the tab bar keeps its own labels while a body draws buttons').toHaveLength(9)
+  expect(labels, 'the tab bar keeps its own labels while a body draws buttons').toHaveLength(10)
   await ui.press({ key: 'waiting-a-more-3' })
   expect(await ui.find({ type: 'Button', text: /Rebase later/ }), 'the revealed option button').toBeTruthy()
   await ui.press({ key: 'waiting-b' })
@@ -1259,8 +1295,8 @@ test('S2.3: raster:false draws the eighth-block fallback (no Raster); default dr
   mockWorld(on)
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  await ui.press({ key: 'dash-tab-plan' })
-  expect(await ui.findAll({ type: 'Raster' }), 'the live wave strip is a Raster by default').not.toHaveLength(0)
+  await ui.press({ key: 'dash-tab-lanes' })
+  expect(await ui.findAll({ type: 'Raster' }), 'the live lane stage strip is a Raster by default').not.toHaveLength(0)
 })
 
 test('S2.3: raster:false draws the eighth-block fallback (no Raster)', { plugins: [worldFixtures], options: { raster: false } }, async ($, on) => {
@@ -1268,14 +1304,13 @@ test('S2.3: raster:false draws the eighth-block fallback (no Raster)', { plugins
   mockWorld(on)
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  await ui.press({ key: 'dash-tab-plan' })
+  await ui.press({ key: 'dash-tab-lanes' })
   expect(await ui.findAll({ type: 'Raster' }), 'no Raster anywhere under raster:false').toHaveLength(0)
-  expect(await ui.find({ text: /Payment provider adapter/ }), 'the live wave still renders').toBeTruthy()
-  // R3 LOW 2: a second bar-drawing mock tab (Usage draws pickBar strips) falls
-  // back too.
+  expect(await ui.find({ text: /3 lanes · 2 live/ }), 'the live lanes still render').toBeTruthy()
+  // R3 LOW 2: a second bar-drawing tab (Usage draws pickBar strips) falls back too.
   await ui.press({ key: 'dash-tab-usage' })
   expect(await ui.findAll({ type: 'Raster' }), 'no Raster on Usage either').toHaveLength(0)
-  expect(await ui.find(mockRow()), 'the Usage mock world still renders').toBeTruthy()
+  expect(await ui.find({ text: /> QUOTA/ }), 'the live Usage still renders').toBeTruthy()
 })
 
 test('S2.3: mode solo skips the lane sweep', { plugins: [worldFixtures], options: { mode: 'solo' } }, async ($, on) => {

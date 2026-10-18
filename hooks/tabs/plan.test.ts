@@ -181,10 +181,12 @@ test('a merged or done task with a slot and route shows no lane tag; a building 
 })
 
 test('at a narrow width the lane·agent tag drops before the title shrinks below 10', () => {
-  const drawn = PlanTab(stubEls, routedFixture(), 36, new Map([['plan:phase:V1', '1']]))
+  const drawn = PlanTab(stubEls, routedFixture(), 41, new Map([['plan:phase:V1', '1']]))
   const text = allText(drawn)
-  // 36 cols → the row cannot fit id + 10 title cols + the 20-col tag: the
-  // tag is gone, and the title keeps at least 10 cols after the id
+  // 2341d2c: the phases sit in one Card and each task row is indented 4 more cells, so a
+  // task row has cols − 12 cells (36 cols leave the title 5, below the 10 floor). 41 cols
+  // (the narrowest non-compact pane) → the row cannot fit id + 10 title cols + the 20-col tag:
+  // the tag is gone, and the title keeps at least 10 cols after the id
   expect(text).not.toContain('L3 · opencode glm-5.3')
   expect(text).toContain('V1.3 Kanban f')
   const row = nodesOf(drawn, 'Button').find(b => String(b.props?.key) === 'plan-task-V1.3')

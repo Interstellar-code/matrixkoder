@@ -112,20 +112,20 @@ function rowWidths(root: unknown): number[] {
 
 // ---------- the mounted pane ----------
 
-test('the Usage tab draws the MOCK row and its fixture quota/Jev rows at 46 cols', { plugins: [worldFixtures] }, async ($, on) => {
+test('the Usage tab draws its live Quota and Jev routing cards, no MOCK row, at 46 cols', { plugins: [worldFixtures] }, async ($, on) => {
   mockFs(on, worldFiles())
   mockWorld(on)
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   await ui.press({ key: 'dash-tab-usage' })
-  expect(await ui.find({ text: MOCK }), 'MOCK row').toBeTruthy()
-  expect(await ui.find({ text: /sign in at ollama.com/ }), 'fixture ollama note').toBeTruthy()
-  // V2.2 draws routing in the board's one-line form, `task → pick conf · rule`
-  // (p0 drew a `pick <route> · conf <n> · <rule>` line, three columns instead)
-  expect(await ui.find({ text: /→ opencode glm-5/ }), 'fixture Jev pick row').toBeTruthy()
+  // 2341d2c: the tab draws the live snapshot, no MOCK row; Matrix section headers are `> LABEL`
+  expect(await ui.find({ text: MOCK }), 'no MOCK row').toBeFalsy()
+  expect(await ui.find({ text: /> QUOTA/ }), 'quota header').toBeTruthy()
+  expect(await ui.find({ text: /> JEV ROUTING/ }), 'routing header').toBeTruthy()
+  expect(await ui.find({ text: /no routing data yet/ }), 'empty routing line').toBeTruthy()
 })
 
-test('the Usage tab fits 36, 40, 46 and 56 cols: MOCK row, fixture string, no row over cols', { plugins: [worldFixtures] }, async ($, on) => {
+test('the Usage tab fits 36, 40, 46 and 56 cols: both headers, no MOCK row, no row over cols', { plugins: [worldFixtures] }, async ($, on) => {
   mockFs(on, worldFiles())
   mockWorld(on)
   await $.session.start(sessionStart())
@@ -133,13 +133,15 @@ test('the Usage tab fits 36, 40, 46 and 56 cols: MOCK row, fixture string, no ro
   await ui.press({ key: 'dash-tab-usage' })
   for (const w of [36, 40, 46, 56]) {
     await ui.redraw(paneProps(w))
-    expect(await ui.find({ text: MOCK }), `MOCK row at ${w}`).toBeTruthy()
+    expect(await ui.find({ text: MOCK }), `no MOCK row at ${w}`).toBeFalsy()
+    expect(await ui.find({ text: /> QUOTA/ }), `quota header at ${w}`).toBeTruthy()
+    expect(await ui.find({ text: /> JEV ROUTING/ }), `routing header at ${w}`).toBeTruthy()
     for (const width of textWidths(await ui.drawn())) {
       expect(width, `row wider than ${w} cells at ${w}: ${width}`).toBeLessThanOrEqual(w)
     }
   }
   await ui.redraw(paneProps(36))
-  expect(await ui.find({ text: /sign in at ollama.com/ }), 'fixture string at 36').toBeTruthy()
+  expect(await ui.find({ text: /no routing data yet/ }), 'empty routing line at 36').toBeTruthy()
 })
 
 test('the terminal surface draws each quota window as a Raster bar', { plugins: [worldFixtures] }, async ($, on) => {
@@ -149,11 +151,12 @@ test('the terminal surface draws each quota window as a Raster bar', { plugins: 
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   await ui.press({ key: 'dash-tab-usage' })
   const rasters = await ui.findAll({ type: 'Raster' })
-  // 10 windows with bars (claude, fable, codex, agy and go, 5h and wk each); the
-  // three note rows (opencode, glm-5, ollama) have no window, so no bar
-  expect(rasters.length).toBe(10)
+  // 9 windows with bars in the world fixture (claude, fable, gemini, claude-gpt: 5h and wk;
+  // opencode: 5h); codex has no quota source, so no bar
+  expect(rasters.length).toBe(9)
   for (const r of rasters) {
-    expect(r.props.columns, 'the bar takes the card content width').toBe(33)
+    // c462b83: the live pane's floor stepper takes the bar's right end; 38 - 3 - 4 - 2 - 18 = 11, 60% of it
+    expect(r.props.columns, 'the bar keeps 60% of what the floor stepper leaves').toBe(6)
     expect(r.props.rows).toBe(1)
   }
 })
@@ -164,7 +167,8 @@ test('C11: the Quota block and the routing block each sit in their own Card', ()
   const view = usageView()
   for (const cols of [36, 46] as const) {
     const cards = cardsIn(UsageTab(stubEls(true), view, cols))
-    expect(cards, `two Cards at ${cols}`).toHaveLength(2)
+    // c462b83: the Quota card holds one Card per row (8 fixture rows), and the routing card is the tenth
+    expect(cards, `ten Cards at ${cols}`).toHaveLength(10)
     for (const card of cards) {
       expect(card.props.backgroundColor).toBe('#151a21')
       expect(card.props.paddingX).toBe(1)
@@ -197,13 +201,13 @@ test('each window draws gradientBar with the reserve floor, at the card content 
   const view = usageView()
   const rasters = allOf(UsageTab(stubEls(true), view, 46), 'Raster')
   expect(rasters, 'one bar per window').toHaveLength(10)
-  const bw = 42 - 9 // the card content width less the label, the share and two gaps
-  const claude5h = rasters.find(r => r.props.key === 'quota-0-5h')
+  const bw = 38 - 9 // the row Card's content width (c462b83) less the label, the share and two gaps
+  const claude5h = rasters.find(r => r.props.key === 'quota-0-0-5h')
   expect(claude5h?.props.columns).toBe(bw)
   expect(claude5h?.props.cells, 'the 5h gradient with its floor mark').toBe(gradientBar(38, bw, HEAT, 80).cells)
-  const claudeWk = rasters.find(r => r.props.key === 'quota-0-wk')
+  const claudeWk = rasters.find(r => r.props.key === 'quota-0-0-wk')
   expect(claudeWk?.props.cells, 'the week gradient with its floor mark').toBe(gradientBar(61, bw, HEAT, 80).cells)
-  const agy5h = rasters.find(r => r.props.key === 'quota-3-5h')
+  const agy5h = rasters.find(r => r.props.key === 'quota-3-0-5h')
   expect(agy5h?.props.cells, 'the spent window has no floor to mark').toBe(gradientBar(100, bw, HEAT, undefined).cells)
   // a bar without a floor really differs from one with it
   expect(gradientBar(38, bw, HEAT, undefined).cells === claude5h?.props.cells).toBe(false)
