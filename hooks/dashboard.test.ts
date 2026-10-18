@@ -2638,8 +2638,8 @@ function f43Rig(on: On, opts: {
   listing: (path: string) => FsEntry[] | Promise<FsEntry[]>
   activity?: unknown[]
   startOnFiles?: boolean
-  /** the first files:v write is refused the way the engine refuses a write made during a render */
-  refuseFilesV?: boolean
+  /** the first files:v write is refused with this reason (the engine's own wording for a write made during a render) */
+  refuseFilesV?: string
   /** the project's .git is a worktree FILE pointing at /main */
   gitFile?: boolean
   process?: Parameters<typeof mockWorld>[1] extends infer O ? O extends { process?: infer P } ? P : never : never
@@ -2660,9 +2660,9 @@ function f43Rig(on: On, opts: {
     return next(e)
   })
   on('state.set', (_$, e, next) => {
-    if (opts.refuseFilesV && refused === 0 && e.key === 'viewState' && (e.value as Record<string, string> | undefined)?.['files:v'] !== undefined) {
+    if (typeof opts.refuseFilesV === 'string' && refused === 0 && e.key === 'viewState' && (e.value as Record<string, string> | undefined)?.['files:v'] !== undefined) {
       refused++
-      return { deny: 'it was made while ui.render is being dispatched, and drawing is pure' }
+      return { deny: opts.refuseFilesV }
     }
     sets.push({ key: e.key, value: e.value })
     if (e.key === 'viewState' && e.value) viewState = e.value as Record<string, string>
@@ -2943,7 +2943,7 @@ test('Files F4.3: review fix 1, with a missing lane root chosen the tick walks t
 })
 
 test('Files F4.2: review fix 2, a files:v write refused during a render is retried by the next tick, not dropped', F43_OPTS, async ($, on) => {
-  const rig = f43Rig(on, { startOnFiles: true, refuseFilesV: true, listing: p => (p === PROJECT_DIR ? [f43Entry('a.ts')] : []) })
+  const rig = f43Rig(on, { startOnFiles: true, refuseFilesV: 'it was made while ui.render is being dispatched, and drawing is pure', listing: p => (p === PROJECT_DIR ? [f43Entry('a.ts')] : []) })
   await $.session.start(sessionStart())
   await $.ui.mount({ ...F43_MOUNT, props: paneProps(46) })
   await rig.settle()
@@ -3027,4 +3027,52 @@ test('Files F4.3: review fix 4, a rejecting $.clock.now still bumps rain:tick fo
   await clock.advance(1500)
   for (let i = 0; i < 10; i++) await clock.advance(0)
   expect(Number(viewState['rain:tick'])).toBeGreaterThanOrEqual(Math.floor(Date.now() / 1500) - 1)
+})
+
+/* ---------------------------------------------------------------------------
+ * Files F4 re-review fixes (1 MEDIUM, 2 LOW)
+ * ------------------------------------------------------------------------- */
+test('Files F4.2: review fix 5, a files:v write that fails for any other reason is retried by the next tick too', F43_OPTS, async ($, on) => {
+  const rig = f43Rig(on, { startOnFiles: true, refuseFilesV: 'storage unavailable', listing: p => (p === PROJECT_DIR ? [f43Entry('a.ts')] : []) })
+  await $.session.start(sessionStart())
+  await $.ui.mount({ ...F43_MOUNT, props: paneProps(46) })
+  await rig.settle()
+  expect(rig.refusals()).toBe(1)
+  expect(rig.vs()['files:v']).toBeUndefined()
+  await rig.clock.advance(1500)
+  await rig.settle()
+  expect(rig.vs()['files:v']).toBe('1')
+})
+
+test('Files F4.3: review fix 6, a missing lane root that comes back replaces the fallback tree and the note goes away after one tick', F43_OPTS, async ($, on) => {
+  let laneBack = false
+  const rig = f43Rig(on, {
+    process: argv => (argv.some(a => a.includes('mk-lane.py')) && argv.includes('list') ? f43Lane('/lane/one') : undefined),
+    listing: p => {
+      if (p === '/lane/one') {
+        if (!laneBack) throw new Error('ENOENT')
+        return [f43Entry('lane-file.ts')]
+      }
+      return p === PROJECT_DIR ? [f43Entry('main-file.ts')] : []
+    },
+  })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ ...F43_MOUNT, props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-files' })
+  for (let i = 0; i < 60 && !(await ui.find({ type: 'Button', key: 'files-root:slot-1' })); i++) {
+    await rig.clock.advance(0)
+    await ui.redraw(paneProps(46))
+  }
+  await ui.press({ key: 'files-root:slot-1' })
+  for (let i = 0; i < 60 && !(await ui.find({ text: /missing root, fallback to repo/ })); i++) {
+    await rig.clock.advance(0)
+    await ui.redraw(paneProps(46))
+  }
+  expect(await ui.find({ text: /main-file\.ts/ })).toBeTruthy()
+  laneBack = true
+  await rig.clock.advance(1500)
+  await rig.settle()
+  await ui.redraw(paneProps(46))
+  expect(await ui.find({ text: /lane-file\.ts/ })).toBeTruthy()
+  expect(await ui.find({ text: /missing root/ })).toBeUndefined()
 })
