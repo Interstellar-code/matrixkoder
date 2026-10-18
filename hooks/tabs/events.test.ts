@@ -168,7 +168,7 @@ test('the Events tab draws the Checkout v2 timeline over its fixture', { plugins
   expect(flat.indexOf('P5 r2 sent to opencode glm-5'), 'newest row first').toBeLessThan(flat.indexOf('P3 r1 approved'))
 })
 
-test('the event list sits in one kit Card with coloured type chips', { plugins: [worldFixtures] }, async ($, on) => {
+test('the event list sits in kit Cards with coloured type chips', { plugins: [worldFixtures] }, async ($, on) => {
   mockFs(on, worldFiles())
   mockWorld(on)
   await $.session.start(sessionStart())
@@ -177,10 +177,12 @@ test('the event list sits in one kit Card with coloured type chips', { plugins: 
   for (const cols of [36, 46] as const) {
     await ui.redraw(paneProps(cols))
     const cards = cardsOf(await ui.drawn())
-    expect(cards, `the one Events Card at ${cols}`).toHaveLength(1)
-    expect(cards[0]?.props.backgroundColor, `card fill at ${cols}`).toBe(MATRIX.panel) // the pane wears the Matrix palette
-    expect(cards[0]?.props.borderStyle, `round border at ${cols}`).toBe('round')
-    expect(cards[0]?.props.borderColor, `line border at ${cols}`).toBe(MATRIX.line)
+    expect(cards, `the Events Cards at ${cols}`).toHaveLength(4)
+    for (const card of cards) {
+      expect(card.props.backgroundColor, `card fill at ${cols}`).toBe(MATRIX.panel) // the pane wears the Matrix palette
+      expect(card.props.borderStyle, `round border at ${cols}`).toBe('round')
+      expect(card.props.borderColor, `line border at ${cols}`).toBe(MATRIX.line)
+    }
   }
   // the type Chips paint by role: review is the live tint, blocked/quota the warn tint
   // (the live run has one 'verdict' event; the fixture view carries all four roles)
