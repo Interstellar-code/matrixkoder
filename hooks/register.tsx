@@ -8,6 +8,7 @@ import { registerStopGuard } from './stop-guard'
 import { registerTools } from './tools'
 import { registerWake } from './wake'
 import { registerWizard } from './wizard'
+import { registerFileActivity } from './filetree-activity'
 
 export const register: Register = (on, options) => {
   registerGuards(on, options)
@@ -18,4 +19,5 @@ export const register: Register = (on, options) => {
   registerTools(on, options)
   registerWake(on, options)
   registerWizard(on, options)
+  registerFileActivity(on, options)
 }
