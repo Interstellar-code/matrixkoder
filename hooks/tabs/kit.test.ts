@@ -79,7 +79,7 @@ test('Section upper-cases its bold label beside an optional dim right text', () 
   expect(sec.type).toBe('Box')
   const [head, right] = kids(sec)
   expect(head?.props.bold).toBe(true)
-  expect(head?.props.color).toBe('subtle') // a ThemeKey: body text follows the theme
+  expect(head?.props.color).toBe('#a3adb8') // PALETTE.mut: the muted label colour
   expect(text(head)).toBe('PLAN')
   expect(right?.props.dimColor).toBe(true)
   expect(text(right)).toBe('3/8')

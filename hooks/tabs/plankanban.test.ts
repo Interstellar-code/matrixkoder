@@ -3,7 +3,7 @@
 // the elements PlanKanbanTab actually built — four columns with counts from the
 // captured plan-detail fixture, the status→column map, the phase filter row,
 // card lines (glyph, id, cut title, phase chip, age), the empty column's
-// `none`, the narrow stack, the footer, and none of the old KanbanTab chrome.
+// `— nothing here`, the narrow stack, the footer, and none of the old KanbanTab chrome.
 import { test, expect } from 'claude-code/testing'
 import type { Elements } from 'claude-code'
 import {
@@ -61,18 +61,24 @@ const uiOf = (init?: Map<string, string>) => {
   return { ui, handle: { get: (k: string) => ui.get(k), set: (k: string, v: string) => { ui.set(k, v) } } }
 }
 
+/** the four headings as drawn: the column's glyph, a space, its name
+ *  (plankanban.tsx COLUMN_GLYPH, changed in 2341d2c). */
+const HEADING: Record<string, string> = {
+  PLANNED: '○ PLANNED', BUILDING: '● BUILDING', 'NEEDS YOU': '▲ NEEDS YOU', 'ON MAIN': '✓ ON MAIN',
+}
+
 /** the four column blocks: a Box column whose direct child is the Section Box
  *  (a row holding the bold heading Text). */
 function columnBlock(root: unknown, name: string): N | undefined {
   return allOf(root, 'Box').find(box => kids(box).some(
-    k => k.type === 'Box' && kids(k).some(g => g.type === 'Text' && g.props.bold === true && text(g) === name),
+    k => k.type === 'Box' && kids(k).some(g => g.type === 'Text' && g.props.bold === true && text(g) === HEADING[name]),
   ))
 }
 
-/** a column block's count: the bare-number dim Text under its heading. */
+/** a column block's count: the bare-number Text under its heading (muted, not dim, since the palette change). */
 const countOf = (block: N | undefined): string => {
-  const dim = allOf(block, 'Text').find(t => t.props.dimColor === true && /^\d+$/.test(text(t)))
-  return dim == null ? '' : text(dim)
+  const count = allOf(block, 'Text').find(t => /^\d+$/.test(text(t)))
+  return count == null ? '' : text(count)
 }
 
 /** one card's outer Box, by the task id it carries as its element key. */
@@ -132,7 +138,7 @@ test('the status→column map: every status named by C15, unknown falls to PLANN
 test('four headings with the right counts: PLANNED 4 · BUILDING 9 · NEEDS YOU 0 · ON MAIN 19', () => {
   const tree = PlanKanbanTab(stubEls(), view, W80, uiOf().handle)
   const heads = allOf(tree, 'Text').filter(t => t.props.bold === true).map(t => text(t))
-  expect(heads).toEqual([...PLAN_KANBAN_COLUMNS])
+  expect(heads).toEqual(PLAN_KANBAN_COLUMNS.map(col => HEADING[col]))
   const counts = PLAN_KANBAN_COLUMNS.map(col => countOf(columnBlock(tree, col)))
   expect(counts).toEqual(['4', '9', '0', '19'])
   // every fixture task id is drawn exactly once across the four columns
@@ -144,13 +150,13 @@ test('a card shows glyph, id, cut title, phase chip and the dim lane·agent tag 
   const tree = PlanKanbanTab(stubEls(), view, W80, uiOf().handle)
   const building = columnBlock(tree, 'BUILDING')
   expect(text(building)).toContain('●V1.5.1') // glyph and id are sibling Texts; the row's gap is layout, not text
-  // 80 cols → each column 19 wide → card inner 15: the long title is cut, not wrapped
-  expect(text(building)).toContain('mkdb plans <id…')
+  // 80 cols → each column 19 wide → card inner 11 (lane and card boxes take 4 each): the long title is cut, not wrapped
+  expect(text(building)).toContain('mkdb plans…')
   expect(text(building)).not.toContain('node carries lane slot')
   expect(text(building)).toContain(' V1.5 ')
   const onMain = columnBlock(tree, 'ON MAIN')
   expect(text(onMain)).toContain('✓R1.1')
-  expect(text(onMain)).toContain('One home rule')
+  expect(text(onMain)).toContain('One home r…')
   expect(text(onMain)).not.toContain('$MK_HOME') // R1.1's long title is cut, not wrapped
   // ON MAIN cards are the glyph and the dim title only: no phase chip, no lane tag
   expect(text(onMain)).not.toContain(' R1 ')
@@ -159,11 +165,11 @@ test('a card shows glyph, id, cut title, phase chip and the dim lane·agent tag 
   expect(text(tree)).not.toMatch(/\b\d+[mhd]\b/)
 })
 
-test('empty column shows a dim none', () => {
+test('empty column shows a dim "— nothing here"', () => {
   const tree = PlanKanbanTab(stubEls(), view, W80, uiOf().handle)
   const needsYou = columnBlock(tree, 'NEEDS YOU')
-  const none = kids(needsYou).find(k => k.type === 'Text' && text(k) === 'none')
-  expect(none, 'dim none line').toBeDefined()
+  const none = kids(needsYou).find(k => k.type === 'Text' && text(k) === '— nothing here')
+  expect(none, 'dim nothing-here line').toBeDefined()
   expect((none as N | undefined)?.props.dimColor).toBe(true)
 })
 
@@ -235,7 +241,7 @@ test('no KanbanTab chrome: no Needs you off line, no Backlog/Ready/Verify headin
   const all = text(tree)
   expect(all).not.toContain('Needs you off')
   const heads = allOf(tree, 'Text').filter(t => t.props.bold === true).map(t => text(t))
-  expect(heads).toEqual([...PLAN_KANBAN_COLUMNS])
+  expect(heads).toEqual(PLAN_KANBAN_COLUMNS.map(col => HEADING[col]))
   expect(all).not.toContain('Backlog')
   expect(all).not.toContain('Ready')
   expect(all).not.toContain('Verify')
@@ -361,8 +367,8 @@ const narrowFixture = (): ReturnType<typeof planKanbanView> => planKanbanView({
 }, '2026-10-14T12:00:00+02:00')
 
 test('todo 94: a narrow card drops the model instead of cutting the tag mid-word, and keeps title, phase and age', () => {
-  // 21 cols stacked → column 21 → card inner 17 (Card border 2 + paddingX 1 each side)
-  const inner = 21 - 4
+  // 21 cols stacked → column 20 (cols - 1) → card inner 12: lane box and card each take border 2 + paddingX 2
+  const inner = 21 - 1 - 8
   const tree = PlanKanbanTab(stubEls(), narrowFixture(), 21, uiOf().handle)
   const card = cardBox(tree, 'D1.2')
   expect(card, 'the D1.2 card').toBeDefined()
@@ -375,10 +381,10 @@ test('todo 94: a narrow card drops the model instead of cutting the tag mid-word
   // title, phase chip and age still render on the narrow card
   const body = text(card as N)
   expect(body).toContain('D1.2')
-  expect(body).toContain('mk-plan.py: writ…') // cut to the inner width, not wrapped
+  expect(body).toContain('mk-plan.py:…') // cut to the inner width, not wrapped
   expect(body).toContain(' D1 ')
   expect(body).toContain('22m')
-  expect(inner).toBe(17)
+  expect(inner).toBe(12)
 })
 
 test('todo 94: a wide card keeps the three-part lane · agent · model tag', () => {
@@ -434,336 +440,259 @@ test('a card keeps its age beside the lane·agent tag (V1.5)', () => {
 test('report render: the captured fixture at 80 cols, exactly as pasted', () => {
   expect(picture(80)).toBe(`all phases R1 T1 D1 S1 V1 V1.4 D1.5 V1.5                            k = all runs
 
-PLANNED           4 BUILDING          9 NEEDS YOU         0 ON MAIN          19
-
-╭─────────────────╮ ╭─────────────────╮ none                ╭─────────────────╮
-│ ○ S1.1          │ │ ● D1.5.1        │                     │ ✓ R1.1          │
-│ Scope-home map… │ │ run init --pla… │                     │ One home rule:… │
-│  S1             │ │  D1.5           │                     │  R1             │
-╰─────────────────╯ ╰─────────────────╯                     ╰─────────────────╯
-
-╭─────────────────╮ ╭─────────────────╮                     ╭─────────────────╮
-│ ○ S1.2          │ │ ● D1.5.2        │                     │ ✓ R1.2          │
-│ Dead keys and … │ │ store mirror n… │                     │ Write guard: a… │
-│  S1             │ │  D1.5           │                     │  R1             │
-╰─────────────────╯ ╰─────────────────╯                     ╰─────────────────╯
-
-╭─────────────────╮ ╭─────────────────╮                     ╭─────────────────╮
-│ ○ V1.5.4        │ │ ● D1.5.3        │                     │ ✓ R1.3          │
-│ Detail panel: … │ │ dispatch recor… │                     │ Register matri… │
-│  V1.5           │ │  D1.5           │                     │  R1             │
-╰─────────────────╯ ╰─────────────────╯                     ╰─────────────────╯
-
-╭─────────────────╮ ╭─────────────────╮                     ╭─────────────────╮
-│ ○ V1.5.5        │ │ ● D1.5.4        │                     │ ✓ T1.1          │
-│ Fixture recapt… │ │ mk-state task … │                     │ templates/plan… │
-│  V1.5           │ │  D1.5           │                     │  T1             │
-╰─────────────────╯ ╰─────────────────╯                     ╰─────────────────╯
-
-                    ╭─────────────────╮                     ╭─────────────────╮
-                    │ ● D1.5.5        │                     │ ✓ T1.2          │
-                    │ backfill setti… │                     │ SKILL.md stage… │
-                    │  D1.5           │                     │  T1             │
-                    ╰─────────────────╯                     ╰─────────────────╯
-
-                    ╭─────────────────╮                     ╭─────────────────╮
-                    │ ● D1.5.6        │                     │ ✓ D1.1          │
-                    │ SKILL.md: task… │                     │ mkdb.py: plans… │
-                    │  D1.5           │                     │  D1  L3         │
-                    ╰─────────────────╯                     ╰─────────────────╯
-
-                    ╭─────────────────╮                     ╭─────────────────╮
-                    │ ● V1.5.1        │                     │ ✓ D1.2          │
-                    │ mkdb plans <id… │                     │ mk-plan.py: wr… │
-                    │  V1.5           │                     │  D1             │
-                    ╰─────────────────╯                     │ L4 opencode     │
-                                                            ╰─────────────────╯
-                    ╭─────────────────╮
-                    │ ● V1.5.2        │                     ╭─────────────────╮
-                    │ Detail sub-tab… │                     │ ✓ D1.3          │
-                    │  V1.5           │                     │ docs/state-sch… │
-                    ╰─────────────────╯                     │  D1  L5         │
-                                                            ╰─────────────────╯
-                    ╭─────────────────╮
-                    │ ● V1.5.3        │                     ╭─────────────────╮
-                    │ Kanban card: i… │                     │ ✓ D1.4          │
-                    │  V1.5           │                     │ First real imp… │
-                    ╰─────────────────╯                     │  D1             │
-                                                            ╰─────────────────╯
-
-                                                            ╭─────────────────╮
-                                                            │ ✓ V1.1          │
-                                                            │ List sub-tab: … │
-                                                            │  V1             │
-                                                            │ L5 opencode     │
-                                                            ╰─────────────────╯
-
-                                                            ╭─────────────────╮
-                                                            │ ✓ V1.2          │
-                                                            │ Detail sub-tab… │
-                                                            │  V1             │
-                                                            │ L5 opencode     │
-                                                            ╰─────────────────╯
-
-                                                            ╭─────────────────╮
-                                                            │ ✓ V1.3          │
-                                                            │ Kanban sub-tab… │
-                                                            │  V1  L4         │
-                                                            ╰─────────────────╯
-
-                                                            ╭─────────────────╮
-                                                            │ ✓ V1.4.1        │
-                                                            │ New hooks/tabs… │
-                                                            │  V1.4           │
+╭─────────────────╮ ╭─────────────────╮ ╭─────────────────╮ ╭─────────────────╮
+│ ○ PLANNED     4 │ │ ● BUILDING    9 │ │ ▲ NEEDS YOU   0 │ │ ✓ ON MAIN    19 │
+│ ─────────────── │ │ ─────────────── │ │ ─────────────── │ │ ─────────────── │
+│ ╭─────────────╮ │ │ ╭─────────────╮ │ │ — nothing here  │ │ ╭─────────────╮ │
+│ │ ○ S1.1      │ │ │ │ ● D1.5.1    │ │ ╰─────────────────╯ │ │ ✓ R1.1      │ │
+│ │ Scope-home… │ │ │ │ run init -… │ │                     │ │ One home r… │ │
+│ │  S1         │ │ │ │  D1.5       │ │                     │ ╰─────────────╯ │
+│ ╰─────────────╯ │ │ ╰─────────────╯ │                     │ ╭─────────────╮ │
+│ ╭─────────────╮ │ │ ╭─────────────╮ │                     │ │ ✓ R1.2      │ │
+│ │ ○ S1.2      │ │ │ │ ● D1.5.2    │ │                     │ │ Write guar… │ │
+│ │ Dead keys … │ │ │ │ store mirr… │ │                     │ ╰─────────────╯ │
+│ │  S1         │ │ │ │  D1.5       │ │                     │ ╭─────────────╮ │
+│ ╰─────────────╯ │ │ ╰─────────────╯ │                     │ │ ✓ R1.3      │ │
+│ ╭─────────────╮ │ │ ╭─────────────╮ │                     │ │ Register m… │ │
+│ │ ○ V1.5.4    │ │ │ │ ● D1.5.3    │ │                     │ ╰─────────────╯ │
+│ │ Detail pan… │ │ │ │ dispatch r… │ │                     │ ╭─────────────╮ │
+│ │  V1.5       │ │ │ │  D1.5       │ │                     │ │ ✓ T1.1      │ │
+│ ╰─────────────╯ │ │ ╰─────────────╯ │                     │ │ templates/… │ │
+│ ╭─────────────╮ │ │ ╭─────────────╮ │                     │ ╰─────────────╯ │
+│ │ ○ V1.5.5    │ │ │ │ ● D1.5.4    │ │                     │ ╭─────────────╮ │
+│ │ Fixture re… │ │ │ │ mk-state t… │ │                     │ │ ✓ T1.2      │ │
+│ │  V1.5       │ │ │ │  D1.5       │ │                     │ │ SKILL.md s… │ │
+│ ╰─────────────╯ │ │ ╰─────────────╯ │                     │ ╰─────────────╯ │
+╰─────────────────╯ │ ╭─────────────╮ │                     │ ╭─────────────╮ │
+                    │ │ ● D1.5.5    │ │                     │ │ ✓ D1.1      │ │
+                    │ │ backfill s… │ │                     │ │ mkdb.py: p… │ │
+                    │ │  D1.5       │ │                     │ ╰─────────────╯ │
+                    │ ╰─────────────╯ │                     │ ╭─────────────╮ │
+                    │ ╭─────────────╮ │                     │ │ ✓ D1.2      │ │
+                    │ │ ● D1.5.6    │ │                     │ │ mk-plan.py… │ │
+                    │ │ SKILL.md: … │ │                     │ ╰─────────────╯ │
+                    │ │  D1.5       │ │                     │ ╭─────────────╮ │
+                    │ ╰─────────────╯ │                     │ │ ✓ D1.3      │ │
+                    │ ╭─────────────╮ │                     │ │ docs/state… │ │
+                    │ │ ● V1.5.1    │ │                     │ ╰─────────────╯ │
+                    │ │ mkdb plans… │ │                     │ ╭─────────────╮ │
+                    │ │  V1.5       │ │                     │ │ ✓ D1.4      │ │
+                    │ ╰─────────────╯ │                     │ │ First real… │ │
+                    │ ╭─────────────╮ │                     │ ╰─────────────╯ │
+                    │ │ ● V1.5.2    │ │                     │ ╭─────────────╮ │
+                    │ │ Detail sub… │ │                     │ │ ✓ V1.1      │ │
+                    │ │  V1.5       │ │                     │ │ List sub-t… │ │
+                    │ ╰─────────────╯ │                     │ ╰─────────────╯ │
+                    │ ╭─────────────╮ │                     │ ╭─────────────╮ │
+                    │ │ ● V1.5.3    │ │                     │ │ ✓ V1.2      │ │
+                    │ │ Kanban car… │ │                     │ │ Detail sub… │ │
+                    │ │  V1.5       │ │                     │ ╰─────────────╯ │
+                    │ ╰─────────────╯ │                     │ ╭─────────────╮ │
+                    ╰─────────────────╯                     │ │ ✓ V1.3      │ │
+                                                            │ │ Kanban sub… │ │
+                                                            │ ╰─────────────╯ │
+                                                            │ ╭─────────────╮ │
+                                                            │ │ ✓ V1.4.1    │ │
+                                                            │ │ New hooks/… │ │
+                                                            │ ╰─────────────╯ │
+                                                            │ ╭─────────────╮ │
+                                                            │ │ ✓ V1.4.2    │ │
+                                                            │ │ Phase filt… │ │
+                                                            │ ╰─────────────╯ │
+                                                            │ ╭─────────────╮ │
+                                                            │ │ ✓ V1.4.3    │ │
+                                                            │ │ Four colum… │ │
+                                                            │ ╰─────────────╯ │
+                                                            │ ╭─────────────╮ │
+                                                            │ │ ✓ V1.4.4    │ │
+                                                            │ │ Cards: sta… │ │
+                                                            │ ╰─────────────╯ │
+                                                            │ ╭─────────────╮ │
+                                                            │ │ ✓ V1.4.5    │ │
+                                                            │ │ Empty colu… │ │
+                                                            │ ╰─────────────╯ │
+                                                            │ ╭─────────────╮ │
+                                                            │ │ ✓ V1.4.6    │ │
+                                                            │ │ Narrow pan… │ │
+                                                            │ ╰─────────────╯ │
+                                                            │ ╭─────────────╮ │
+                                                            │ │ ✓ V1.4.7    │ │
+                                                            │ │ Footer: <n… │ │
+                                                            │ ╰─────────────╯ │
                                                             ╰─────────────────╯
 
-                                                            ╭─────────────────╮
-                                                            │ ✓ V1.4.2        │
-                                                            │ Phase filter r… │
-                                                            │  V1.4           │
-                                                            ╰─────────────────╯
-
-                                                            ╭─────────────────╮
-                                                            │ ✓ V1.4.3        │
-                                                            │ Four columns s… │
-                                                            │  V1.4           │
-                                                            ╰─────────────────╯
-
-                                                            ╭─────────────────╮
-                                                            │ ✓ V1.4.4        │
-                                                            │ Cards: status … │
-                                                            │  V1.4           │
-                                                            ╰─────────────────╯
-
-                                                            ╭─────────────────╮
-                                                            │ ✓ V1.4.5        │
-                                                            │ Empty column s… │
-                                                            │  V1.4           │
-                                                            ╰─────────────────╯
-
-                                                            ╭─────────────────╮
-                                                            │ ✓ V1.4.6        │
-                                                            │ Narrow panes: … │
-                                                            │  V1.4           │
-                                                            ╰─────────────────╯
-
-                                                            ╭─────────────────╮
-                                                            │ ✓ V1.4.7        │
-                                                            │ Footer: <n> ta… │
-                                                            │  V1.4           │
-                                                            ╰─────────────────╯
-
-32 tasks · this plan only · source mk.db`)
+32 tasks · same cards as k, this plan only                        source project`)
 })
 
 test('report render: the captured fixture at 36 cols, exactly as pasted', () => {
   expect(picture(36)).toBe(`all phases R1 T1 D1 S1 V1 V1.4 D1.5
                         k = all runs
 
-PLANNED                            4
-
 ╭──────────────────────────────────╮
-│ ○ S1.1                           │
-│ Scope-home map: every SCHEMA ke… │
-│  S1                              │
+│ ○ PLANNED                      4 │
+│ ───────────────────────────────  │
+│ ╭──────────────────────────────╮ │
+│ │ ○ S1.1                       │ │
+│ │ Scope-home map: every SCHE…  │ │
+│ │  S1                          │ │
+│ ╰──────────────────────────────╯ │
+│ ╭──────────────────────────────╮ │
+│ │ ○ S1.2                       │ │
+│ │ Dead keys and fixture drif…  │ │
+│ │  S1                          │ │
+│ ╰──────────────────────────────╯ │
+│ ╭──────────────────────────────╮ │
+│ │ ○ V1.5.4                     │ │
+│ │ Detail panel: select a tas…  │ │
+│ │  V1.5                        │ │
+│ ╰──────────────────────────────╯ │
+│ ╭──────────────────────────────╮ │
+│ │ ○ V1.5.5                     │ │
+│ │ Fixture recaptured from th…  │ │
+│ │  V1.5                        │ │
+│ ╰──────────────────────────────╯ │
 ╰──────────────────────────────────╯
 
 ╭──────────────────────────────────╮
-│ ○ S1.2                           │
-│ Dead keys and fixture drift: dr… │
-│  S1                              │
+│ ● BUILDING                     9 │
+│ ───────────────────────────────  │
+│ ╭──────────────────────────────╮ │
+│ │ ● D1.5.1                     │ │
+│ │ run init --plan copies acc…  │ │
+│ │  D1.5                        │ │
+│ ╰──────────────────────────────╯ │
+│ ╭──────────────────────────────╮ │
+│ │ ● D1.5.2                     │ │
+│ │ store mirror never blanks …  │ │
+│ │  D1.5                        │ │
+│ ╰──────────────────────────────╯ │
+│ ╭──────────────────────────────╮ │
+│ │ ● D1.5.3                     │ │
+│ │ dispatch records agent, mo…  │ │
+│ │  D1.5                        │ │
+│ ╰──────────────────────────────╯ │
+│ ╭──────────────────────────────╮ │
+│ │ ● D1.5.4                     │ │
+│ │ mk-state task check: manda…  │ │
+│ │  D1.5                        │ │
+│ ╰──────────────────────────────╯ │
+│ ╭──────────────────────────────╮ │
+│ │ ● D1.5.5                     │ │
+│ │ backfill settings-plans-db…  │ │
+│ │  D1.5                        │ │
+│ ╰──────────────────────────────╯ │
+│ ╭──────────────────────────────╮ │
+│ │ ● D1.5.6                     │ │
+│ │ SKILL.md: task round and r…  │ │
+│ │  D1.5                        │ │
+│ ╰──────────────────────────────╯ │
+│ ╭──────────────────────────────╮ │
+│ │ ● V1.5.1                     │ │
+│ │ mkdb plans <id> --json: ea…  │ │
+│ │  V1.5                        │ │
+│ ╰──────────────────────────────╯ │
+│ ╭──────────────────────────────╮ │
+│ │ ● V1.5.2                     │ │
+│ │ Detail sub-tab task row: i…  │ │
+│ │  V1.5                        │ │
+│ ╰──────────────────────────────╯ │
+│ ╭──────────────────────────────╮ │
+│ │ ● V1.5.3                     │ │
+│ │ Kanban card: id, cut title…  │ │
+│ │  V1.5                        │ │
+│ ╰──────────────────────────────╯ │
 ╰──────────────────────────────────╯
 
 ╭──────────────────────────────────╮
-│ ○ V1.5.4                         │
-│ Detail panel: select a task row… │
-│  V1.5                            │
+│ ▲ NEEDS YOU                    0 │
+│ ───────────────────────────────  │
+│ — nothing here                   │
 ╰──────────────────────────────────╯
 
 ╭──────────────────────────────────╮
-│ ○ V1.5.5                         │
-│ Fixture recaptured from the liv… │
-│  V1.5                            │
+│ ✓ ON MAIN                     19 │
+│ ───────────────────────────────  │
+│ ╭──────────────────────────────╮ │
+│ │ ✓ R1.1                       │ │
+│ │ One home rule: mkdb.py ($M…  │ │
+│ ╰──────────────────────────────╯ │
+│ ╭──────────────────────────────╮ │
+│ │ ✓ R1.2                       │ │
+│ │ Write guard: a process sta…  │ │
+│ ╰──────────────────────────────╯ │
+│ ╭──────────────────────────────╮ │
+│ │ ✓ R1.3                       │ │
+│ │ Register matrixkoder in th…  │ │
+│ ╰──────────────────────────────╯ │
+│ ╭──────────────────────────────╮ │
+│ │ ✓ T1.1                       │ │
+│ │ templates/plan.md: each he…  │ │
+│ ╰──────────────────────────────╯ │
+│ ╭──────────────────────────────╮ │
+│ │ ✓ T1.2                       │ │
+│ │ SKILL.md stage 1 and docs/…  │ │
+│ ╰──────────────────────────────╯ │
+│ ╭──────────────────────────────╮ │
+│ │ ✓ D1.1                       │ │
+│ │ mkdb.py: plans gains statu…  │ │
+│ ╰──────────────────────────────╯ │
+│ ╭──────────────────────────────╮ │
+│ │ ✓ D1.2                       │ │
+│ │ mk-plan.py: write the new …  │ │
+│ ╰──────────────────────────────╯ │
+│ ╭──────────────────────────────╮ │
+│ │ ✓ D1.3                       │ │
+│ │ docs/state-schema.md: drop…  │ │
+│ ╰──────────────────────────────╯ │
+│ ╭──────────────────────────────╮ │
+│ │ ✓ D1.4                       │ │
+│ │ First real import: setting…  │ │
+│ ╰──────────────────────────────╯ │
+│ ╭──────────────────────────────╮ │
+│ │ ✓ V1.1                       │ │
+│ │ List sub-tab: ongoing runs…  │ │
+│ ╰──────────────────────────────╯ │
+│ ╭──────────────────────────────╮ │
+│ │ ✓ V1.2                       │ │
+│ │ Detail sub-tab: the existi…  │ │
+│ ╰──────────────────────────────╯ │
+│ ╭──────────────────────────────╮ │
+│ │ ✓ V1.3                       │ │
+│ │ Kanban sub-tab: the existi…  │ │
+│ ╰──────────────────────────────╯ │
+│ ╭──────────────────────────────╮ │
+│ │ ✓ V1.4.1                     │ │
+│ │ New hooks/tabs/plankanban.…  │ │
+│ ╰──────────────────────────────╯ │
+│ ╭──────────────────────────────╮ │
+│ │ ✓ V1.4.2                     │ │
+│ │ Phase filter row: all phas…  │ │
+│ ╰──────────────────────────────╯ │
+│ ╭──────────────────────────────╮ │
+│ │ ✓ V1.4.3                     │ │
+│ │ Four columns side by side …  │ │
+│ ╰──────────────────────────────╯ │
+│ ╭──────────────────────────────╮ │
+│ │ ✓ V1.4.4                     │ │
+│ │ Cards: status glyph, task …  │ │
+│ ╰──────────────────────────────╯ │
+│ ╭──────────────────────────────╮ │
+│ │ ✓ V1.4.5                     │ │
+│ │ Empty column shows none (d…  │ │
+│ ╰──────────────────────────────╯ │
+│ ╭──────────────────────────────╮ │
+│ │ ✓ V1.4.6                     │ │
+│ │ Narrow panes: columns stac…  │ │
+│ ╰──────────────────────────────╯ │
+│ ╭──────────────────────────────╮ │
+│ │ ✓ V1.4.7                     │ │
+│ │ Footer: <n> tasks · this p…  │ │
+│ ╰──────────────────────────────╯ │
 ╰──────────────────────────────────╯
 
-BUILDING                           9
-
-╭──────────────────────────────────╮
-│ ● D1.5.1                         │
-│ run init --plan copies acceptan… │
-│  D1.5                            │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ● D1.5.2                         │
-│ store mirror never blanks accep… │
-│  D1.5                            │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ● D1.5.3                         │
-│ dispatch records agent, model, … │
-│  D1.5                            │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ● D1.5.4                         │
-│ mk-state task check: mandatory … │
-│  D1.5                            │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ● D1.5.5                         │
-│ backfill settings-plans-db-r1 t… │
-│  D1.5                            │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ● D1.5.6                         │
-│ SKILL.md: task round and route … │
-│  D1.5                            │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ● V1.5.1                         │
-│ mkdb plans <id> --json: each ta… │
-│  V1.5                            │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ● V1.5.2                         │
-│ Detail sub-tab task row: id, ti… │
-│  V1.5                            │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ● V1.5.3                         │
-│ Kanban card: id, cut title, lan… │
-│  V1.5                            │
-╰──────────────────────────────────╯
-
-NEEDS YOU                          0
-
-none
-
-ON MAIN                           19
-
-╭──────────────────────────────────╮
-│ ✓ R1.1                           │
-│ One home rule: mkdb.py ($MK_HOM… │
-│  R1                              │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ✓ R1.2                           │
-│ Write guard: a process started … │
-│  R1                              │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ✓ R1.3                           │
-│ Register matrixkoder in the roo… │
-│  R1                              │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ✓ T1.1                           │
-│ templates/plan.md: each header … │
-│  T1                              │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ✓ T1.2                           │
-│ SKILL.md stage 1 and docs/state… │
-│  T1                              │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ✓ D1.1                           │
-│ mkdb.py: plans gains status, cr… │
-│  D1  L3                          │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ✓ D1.2                           │
-│ mk-plan.py: write the new colum… │
-│  D1  L4 · opencode auto          │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ✓ D1.3                           │
-│ docs/state-schema.md: drop the … │
-│  D1  L5                          │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ✓ D1.4                           │
-│ First real import: settings-pla… │
-│  D1                              │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ✓ V1.1                           │
-│ List sub-tab: ongoing runs on t… │
-│  V1  L5 · opencode               │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ✓ V1.2                           │
-│ Detail sub-tab: the existing Pl… │
-│  V1  L5 · opencode               │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ✓ V1.3                           │
-│ Kanban sub-tab: the existing Ka… │
-│  V1  L4                          │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ✓ V1.4.1                         │
-│ New hooks/tabs/plankanban.tsx b… │
-│  V1.4                            │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ✓ V1.4.2                         │
-│ Phase filter row: all phases + … │
-│  V1.4                            │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ✓ V1.4.3                         │
-│ Four columns side by side with … │
-│  V1.4                            │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ✓ V1.4.4                         │
-│ Cards: status glyph, task id, c… │
-│  V1.4                            │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ✓ V1.4.5                         │
-│ Empty column shows none (dim)    │
-│  V1.4                            │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ✓ V1.4.6                         │
-│ Narrow panes: columns stack ver… │
-│  V1.4                            │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ✓ V1.4.7                         │
-│ Footer: <n> tasks · this plan o… │
-│  V1.4                            │
-╰──────────────────────────────────╯
-
-32 tasks · this plan only · source
-mk.db`)
+32 tasks · same cards as k, this
+plan only
+                      source project`)
 })
 test('F.8: a rework status maps to NEEDS YOU via the map, and its card lands in the NEEDS YOU column', () => {
   // independent map assertion, extending (not editing) the map-equality test's spec:
@@ -785,7 +714,7 @@ test('F.8: a rework status maps to NEEDS YOU via the map, and its card lands in 
   const card = cardBox(tree, 'P1.9')
   expect(card, 'the P1.9 card is drawn').toBeDefined()
   const needsText = text(needs)
-  expect(needsText, 'the P1.9 card text sits in the NEEDS YOU column block').toContain('proved wrong')
+  expect(needsText, 'the P1.9 card text sits in the NEEDS YOU column block').toContain('proved wro…')
   expect(needsText, 'the P1.9 card id sits in the NEEDS YOU column block').toContain('P1.9')
 })
 // F.8: risk, critical and open reasons on the cards (F.1 contract).

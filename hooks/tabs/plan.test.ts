@@ -277,60 +277,46 @@ test('report render: the Detail sub-tab with phase D1 open at 80 cols, exactly a
   expect(liveDetailPic(80)).toBe(`╭──────────────────────────────────────────────────────────────────────────────╮
 │ settings-plans-db                                                   running  │
 │ Settings field mapping, plans in the DB, and Plan tab sub-tabs               │
-│ created 2026-10-13                                                           │
-│ runs settings-plans-db-r1                                                    │
-│ merges to main                                                               │
-│ design .matrixkoder/plans/settings-tab.md .matrixkoder/plans/settings-wire…  │
-│ 32 tasks · 8 phases                                                          │
+│ created    2026-10-13                                                        │
+│ runs       settings-plans-db-r1                                              │
+│ merges to  main                                                              │
+│ design     settings-tab · settings-wire · dashboard-v2 · mk-store            │
+│ 32 tasks · 8 phases                                    ◖‖ Pause◗ ◖Open file◗ │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 
-PHASES                                               ▾ Expand all ▸ Collapse all
+PHASES all 8                                     ◖▾ Expand all◗ ◖▸ Collapse all◗
 
 ╭──────────────────────────────────────────────────────────────────────────────╮
-│ ▸ ◈ › R1 · Self-tests never write a real DB: one MK home variab…   with T1   │
-│ ◈◈◈                                                                          │
+│  ▸ ◆ › R1 · Self-tests never write a real DB   with T1   merged              │
+│  ◆◆◆                                                                         │
+│ ────────────────────────────────────────────────────────────────────────     │
+│  ▸ ◆ › T1 · Plan template is the contract   with R1   done                   │
+│  ◆◆                                                                          │
+│ ────────────────────────────────────────────────────────────────────────     │
+│  ▾ ◆ › D1 · Plans in the project DB   merged                                 │
+│  ◆◆◆◆                                                                        │
+│  ├  ◆ D1.1 mkdb.py  r1                                                       │
+│  ├  ◆ D1.2 mk-plan.py  r1                                                    │
+│  ├  ◆ D1.3 docs/state-schema.md  r1                                          │
+│  └  ◆ D1.4 First real import  r0                                             │
+│ ────────────────────────────────────────────────────────────────────────     │
+│  ▸ ○ › S1 · Settings mapping   ready                                         │
+│  ○○                                                                          │
+│ ────────────────────────────────────────────────────────────────────────     │
+│  ▸ ◆ › V1 · Plan tab sub-tabs from the existing kit   merged                 │
+│  ◆◆◆                                                                         │
+│ ────────────────────────────────────────────────────────────────────────     │
+│  ▸ ◆ › V1.4 · Kanban sub-tab to PlanKanban.dc.html   merged                  │
+│  ◆◆◆◆◆◆◆                                                                     │
+│ ────────────────────────────────────────────────────────────────────────     │
+│  ▸ ◐ › D1.5 · Task fields sur…  L5 · opencode space-bunny-free  review       │
+│  ◐◐◐◐◐◐                                                                      │
+│ ────────────────────────────────────────────────────────────────────────     │
+│  ▸ ● › V1.5 · Plan tab task cards  L3 · opencode glm-5.3  planned  ◖‖◗       │
+│  ●●●○○                                                                       │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 
-╭──────────────────────────────────────────────────────────────────────────────╮
-│ ▸ ✓ › T1 · Plan template is the contract: every header key names …   with R1 │
-│ ✓✓                                                                           │
-╰──────────────────────────────────────────────────────────────────────────────╯
-
-╭──────────────────────────────────────────────────────────────────────────────╮
-│ ▾ ◈ › D1 · Plans in the project DB: the four new columns, impor…   merged    │
-│ ◈◈◈◈                                                                         │
-│ ├  ◈ D1.1 mkdb.py: plans gains status, created, design, integration (…       │
-│ ├  ◈ D1.2 mk-plan.py: write the new columns; \`import <file>\`; \`delete…       │
-│ ├  ◈ D1.3 docs/state-schema.md: drop the 'added by D1' marks; documen…       │
-│ ├  ◈ D1.4 First real import: settings-plans-db.md into .matrixkoder/m…       │
-╰──────────────────────────────────────────────────────────────────────────────╯
-
-╭──────────────────────────────────────────────────────────────────────────────╮
-│ ▸ ○ › S1 · Settings mapping: every key carries scope and home, d…   ready    │
-│ ○○                                                                           │
-╰──────────────────────────────────────────────────────────────────────────────╯
-
-╭──────────────────────────────────────────────────────────────────────────────╮
-│ ▸ ◈ › V1 · Plan tab sub-tabs from the existing kit: List with p…   merged    │
-│ ◈◈◈                                                                          │
-╰──────────────────────────────────────────────────────────────────────────────╯
-
-╭──────────────────────────────────────────────────────────────────────────────╮
-│ ▸ ◈ › V1.4 · Kanban sub-tab to PlanKanban.dc.html: 4 side-by-si…   merged    │
-│ ◈◈◈◈◈◈◈                                                                      │
-╰──────────────────────────────────────────────────────────────────────────────╯
-
-╭──────────────────────────────────────────────────────────────────────────────╮
-│ ▸ ◐ › D1.5 · Task fields survive…  L5 · opencode space-bunny-free  review    │
-│ ◐◐◐◐◐◐                                                                       │
-╰──────────────────────────────────────────────────────────────────────────────╯
-
-╭──────────────────────────────────────────────────────────────────────────────╮
-│ ▸ ○ › V1.5 · Plan tab task cards: id, cu…  L3 · opencode glm-5.3  planned    │
-│ ●⧖●○○                                                                        │
-╰──────────────────────────────────────────────────────────────────────────────╯
-
-phases 8`)
+8 phases · all folded by default                                  source project`)
 })
 
 test('a DONE plan\u2019s absent round files read archived \u00b7 legacy tarball (L7.2); a running plan adds no such row', () => {
@@ -351,57 +337,44 @@ test('the report render: the Detail sub-tab with phase D1 open at 36 cols, exact
   expect(liveDetailPic(36)).toBe(`╭──────────────────────────────────╮
 │ settings-plans-db       running  │
 │ Settings field mapping, plans i… │
-│ created 2026-10-13               │
-│ runs settings-plans-db-r1        │
-│ merges to main                   │
-│ design .matrixkoder/plans/sett…  │
-│ 32 tasks · 8 phases              │
+│ created    2026-10-13            │
+│ runs       settings-plans-db-r1  │
+│ merges to  main                  │
+│ design     settings-tab · setti… │
+│ 32 task…   ◖‖ Pause◗ ◖Open file◗ │
 ╰──────────────────────────────────╯
 
-PHASES   ▾ Expand all ▸ Collapse all
+PHASES
+     ◖▾ Expand all◗ ◖▸ Collapse all◗
 
 ╭──────────────────────────────────╮
-│ ▸ ◈ › R1 · Self-tes…   with T1   │
-│ ◈◈◈                              │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ▸ ✓ › T1 · Plan templ…   with R1 │
-│ ✓✓                               │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ▾ ◈ › D1 · Plans in…   merged    │
-│ ◈◈◈◈                             │
-│ ├  ◈ D1.1 mkdb.py: plans …       │
-│ ├  ◈ D1.2 mk-plan.py: wri…       │
-│ ├  ◈ D1.3 docs/state-sche…       │
-│ ├  ◈ D1.4 First real impo…       │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ▸ ○ › S1 · Settings …   ready    │
-│ ○○                               │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ▸ ◈ › V1 · Plan tab…   merged    │
-│ ◈◈◈                              │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ▸ ◈ › V1.4 · Kanban…   merged    │
-│ ◈◈◈◈◈◈◈                          │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ▸ ◐ › D1.5 · Task f…   review    │
-│ ◐◐◐◐◐◐                           │
-╰──────────────────────────────────╯
-
-╭──────────────────────────────────╮
-│ ▸ ○ › V1.5 · Plan …   planned    │
-│ ●⧖●○○                            │
+│  ▸ ◆ › R1 · Self…   with T1   me │
+│  ◆◆◆                             │
+│ ────────────────────────────     │
+│  ▸ ◆ › T1 · Plan t…   with R1    │
+│  ◆◆                              │
+│ ────────────────────────────     │
+│  ▾ ◆ › D1 · Plan…   merged       │
+│  ◆◆◆◆                            │
+│  ├  ◆ D1.1 mkdb…  r1             │
+│  ├  ◆ D1.2 mk-p…  r1             │
+│  ├  ◆ D1.3 docs…  r1             │
+│  └  ◆ D1.4 Firs…  r0             │
+│ ────────────────────────────     │
+│  ▸ ○ › S1 · Setti…   ready       │
+│  ○○                              │
+│ ────────────────────────────     │
+│  ▸ ◆ › V1 · Plan…   merged       │
+│  ◆◆◆                             │
+│ ────────────────────────────     │
+│  ▸ ◆ › V1.4 · Ka…   merged       │
+│  ◆◆◆◆◆◆◆                         │
+│ ────────────────────────────     │
+│  ▸ ◐ › D1.5 · Ta…   review       │
+│  ◐◐◐◐◐◐                          │
+│ ────────────────────────────     │
+│  ▸ ● › V1.5 · P…   planned  ◖‖◗  │
+│  ●●●○○                           │
 ╰──────────────────────────────────╯`)
 })
 

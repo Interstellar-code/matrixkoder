@@ -2571,7 +2571,7 @@ def _selftest_guard(home):
     """C16: under MK_SELFTEST=1 a write open outside the temp dir raises; ro reads work."""
     _check(os.environ.get("MK_SELFTEST") == "1", "guard case ran without MK_SELFTEST=1")
     real = _real_home()
-    real_db = _mkpaths().db_in(real)
+    real_db = _mkpaths().root_db_in(real)
     # the real resolved home path, not a made-up one: with both vars unset the
     # resolver must land on ~/.matrixkoder
     kept = {k: os.environ.get(k) for k in ("MK_HOME", "MATRIXKODER_HOME")}
