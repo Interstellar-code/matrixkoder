@@ -6,7 +6,7 @@ import type { On, ConfigRow } from 'claude-code'
 import { snapshotCount, DATA_DIR, NOW, PROJECT_DIR, RUN_PATH, RUNS_INDEX, USAGE_PATH, agentOf, agentsOf, mockFs, mockWorld, paneProps, sessionStart, sessionStartIn, setRun, setUsage, tasksOf, worldFiles, worldFixtures } from './testkit'
 import type { Files, MockWorld } from './testkit'
 import { PANE_ID, parseYamlAgents } from './data'
-import { footerParts, liveOverviewView, modelShort, openWaiting, planActionPatch, resolveMainCheckout, runPlanAction, taskNote, usageShorts, waitingPane, waitingPaneView } from './dashboard'
+import { filesFocus, footerParts, liveOverviewView, modelShort, openWaiting, planActionPatch, resolveMainCheckout, runPlanAction, taskNote, usageShorts, waitingPane, waitingPaneView } from './dashboard'
 import type { MkSnapshot } from '../types'
 import { mockTabCounts, waitingCount } from './tabs/header'
 import { RUN_SNAPSHOT } from './fixtures/run-snapshot'
@@ -2564,13 +2564,13 @@ test('Files F4.2: fs.list rejecting everywhere still draws tab bar with note', {
   expect(await ui.find({ text: /missing root/ })).toBeTruthy()
 })
 
-test('Files F4.2: ui.reveal and ui.focus wired to engine, pressing s calls focus files-q', { timeoutMs: 15000, plugins: [worldFixtures] }, async ($, on) => {
+test('Files F4.2: helper-level only, the engine focus call is not proven: filesFocus calls $.ui.focus with the pane id and key, ignores a rejection and a deny; pressing s draws no error', { timeoutMs: 15000, plugins: [worldFixtures] }, async ($, on) => {
+  const calls: unknown[] = []
+  await filesFocus({ ui: { focus: async args => { calls.push(args); return {} } } }, 'files-q')
+  expect(calls).toEqual([{ requestId: PANE_ID, key: 'files-q' }])
+  await filesFocus({ ui: { focus: async () => { throw new Error('focus refused') } } }, 'files-q')
+  await filesFocus({ ui: { focus: async () => ({ deny: 'site does not hold the keys' }) } }, 'files-q')
   mockFs(on, worldFiles())
-  let focusCalledWith: unknown = null
-  on('ui.focus', (_$, e) => {
-    focusCalledWith = e
-    return {}
-  })
   const clock = mockWorld(on)
   on('fs.list', () => ({ value: [{ name: 'test.ts', kind: 'file', size: 10, mtimeMs: 1000, isLink: false }] }))
   await $.session.start(sessionStart())
@@ -2580,7 +2580,8 @@ test('Files F4.2: ui.reveal and ui.focus wired to engine, pressing s calls focus
   await ui.redraw({ ...paneProps(46), isFocused: true })
   await ui.press({ key: 'files-s' })
   for (let i = 0; i < 10; i++) await clock.advance(0)
-  expect(focusCalledWith).toEqual({ requestId: PANE_ID, key: 'files-q' })
+  expect(await ui.find({ text: /Files could not draw/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', key: 'files-s' })).toBeDefined()
 })
 
 test('Files F4.2: Files wiring never writes settings:focus', { timeoutMs: 15000, plugins: [worldFixtures] }, async ($, on) => {
