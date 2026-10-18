@@ -118,6 +118,12 @@ export type MkStatusMemory = {
 /** dashboard.tsx (S0.2): the /mk pane's tabs */
 export type MkDashTab = 'overview' | 'lanes' | 'plan' | 'usage' | 'events' | 'waiting' | 'kanban' | 'settings'
 
+export type MkFileAct = {
+  path: string
+  kind: 'read' | 'write'
+  at: number
+}
+
 declare module 'claude-code' {
   interface PluginState {
     matrixkoder: {
@@ -139,6 +145,7 @@ declare module 'claude-code' {
       wizardStep: number
       /** wizard.tsx: detection + answers until the review step writes them */
       wizardDraft: MkWizardDraft
+      fileActivity: readonly MkFileAct[]
     }
   }
 }
