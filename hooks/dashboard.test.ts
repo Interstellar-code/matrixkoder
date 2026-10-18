@@ -732,7 +732,7 @@ async function expectTabBody(ui: { find: (q: { text: RegExp }) => Promise<unknow
     expect(await ui.find(mockRow()), `${label} MOCK row`).toBeTruthy()
     return
   }
-  expect(await ui.find(mark), `${label} live body`).toBeTruthy()
+  expect(await ui.find({ text: mark }), `${label} live body`).toBeTruthy()
   expect(await ui.find(mockRow()), `${label} has no MOCK row`).toBeUndefined()
 }
 const TAB_BUTTONS = [
