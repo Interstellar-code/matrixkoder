@@ -187,6 +187,8 @@ let filesWalkInFlight = false
 let filesSkipOnce = false
 let filesCurrentRoot: string | null = null
 let lastRootWalked: string | null = null
+let filesBumpPending = false
+const filesMainCache = new Map<string, Promise<string>>()
 
 let filesSessionCwd = ''
 
@@ -203,6 +205,8 @@ export function registerDashboard(on: On, options: PluginOptions): void {
     filesSkipOnce = false
     filesCurrentRoot = null
     lastRootWalked = null
+    filesBumpPending = false
+    filesMainCache.clear()
     await registerMk($)
     if (options.autoOpen !== false) {
       try {
@@ -315,13 +319,11 @@ export function registerDashboard(on: On, options: PluginOptions): void {
       lastFilesDraw = filesNow
     }
     const fileAct = dashTab === 'files' ? await read($, fileActivityAtom) : undefined
-    let cwd = filesSessionCwd
-    if (!cwd) {
-      try { cwd = await $.session.cwd() } catch {}
-    }
-    let mainCheckoutPath = cwd
-    if (cwd && dashTab === 'files') {
-      mainCheckoutPath = await resolveMainCheckout($, cwd)
+    let cwd = ''
+    let mainCheckoutPath = ''
+    if (dashTab === 'files') {
+      cwd = await filesCwd($)
+      mainCheckoutPath = cwd ? await cachedMainCheckout($, cwd) : ''
     }
     const settingsState = readSettingsState(viewState)
     const settingsLive = settingsState.live
@@ -434,6 +436,7 @@ async function switchTab($: EngineInterface, tab: MkDashTab): Promise<void> {
     filesNow = await $.clock.now()
     filesSlotsStamp = filesNow
     void loadLaneSlots($)
+    void startFilesWalk($) // a press may write state, a render may not: the first paint does not wait for the tick
   }
   try {
     await $.ui.scroll({ in: PANE_ID, to: 'start' })
@@ -613,6 +616,8 @@ async function startLoop($: EngineInterface, options: PluginOptions, cwd: string
   filesSkipOnce = false
   filesCurrentRoot = null
   lastRootWalked = null
+  filesBumpPending = false
+  filesMainCache.clear()
   const min = typeof options.usagePollMin === 'number' && options.usagePollMin > 0
     ? Math.max(USAGE_POLL_MIN_MIN, options.usagePollMin)
     : USAGE_POLL_DEFAULT_MIN
@@ -631,9 +636,13 @@ async function startLoop($: EngineInterface, options: PluginOptions, cwd: string
   // the code rain's own frame: a view-state bump redraws the pane, skipped once no pane drew it lately
   timerRegistry.cancelRain?.()
   timerRegistry.cancelRain = arm($.clock.every(RAIN_MS, async () => {
-    filesNow = await $.clock.now()
-    const t = filesNow
-    const files = filesShown && t - lastFilesDraw < 10_000
+    let clockOk = true
+    try {
+      filesNow = await $.clock.now()
+    } catch {
+      clockOk = false // only the Files work skips this beat; the rain still beats
+    }
+    const files = clockOk && filesShown && filesNow - lastFilesDraw < 10_000
     const rain = Date.now() - lastRainDraw < 10_000
     if (rain || files) {
       void setViewKey($, 'rain:tick', String(Math.floor((rain ? Date.now() : filesNow) / RAIN_MS)))
@@ -1006,6 +1015,32 @@ export async function resolveMainCheckout(
   return cwd
 }
 
+/** the engine refuses a state write made while a render is dispatched ("drawing is pure") */
+const isRenderWriteRefusal = (e: unknown): boolean => /drawing is pure|while ui\.render is being dispatched/.test(String(e))
+
+async function filesCwd($: EngineInterface): Promise<string> {
+  if (filesSessionCwd) return filesSessionCwd
+  try { return await $.session.cwd() } catch { return '' }
+}
+
+function cachedMainCheckout($: EngineInterface, cwd: string): Promise<string> {
+  let hit = filesMainCache.get(cwd)
+  if (!hit) {
+    hit = resolveMainCheckout($, cwd)
+    filesMainCache.set(cwd, hit)
+  }
+  return hit
+}
+
+/** starts the first walk of the root on screen from a press or a tick, where state writes are allowed */
+async function startFilesWalk($: EngineInterface): Promise<void> {
+  const cwd = await filesCwd($)
+  if (!cwd) return
+  const view = await read($, viewStateAtom)
+  const root = pickRoot(rootsOf(await cachedMainCheckout($, cwd), laneSlotsOf(view)), view['files:root'])
+  if (!filesWalkCache.has(root.path)) await runFilesWalk($, root.path)
+}
+
 async function runFilesWalk($: EngineInterface, rootPath: string): Promise<void> {
   if (filesWalkInFlight || !rootPath) return
   filesWalkInFlight = true
@@ -1022,7 +1057,7 @@ async function runFilesWalk($: EngineInterface, rootPath: string): Promise<void>
     const isFirstWalk = !prevWalk
     const isRootSwitch = rootPath !== lastRootWalked
     lastRootWalked = rootPath
-    let changed = isFirstWalk
+    let changed = isFirstWalk || filesBumpPending
     if (prevWalk && !isRootSwitch) {
       const diff = diffWalk(prevWalk, nextWalk)
       if (diff.length > 0) {
@@ -1038,22 +1073,28 @@ async function runFilesWalk($: EngineInterface, rootPath: string): Promise<void>
     }
     filesWalkCache.set(rootPath, nextWalk)
     if (changed) {
-      await update($, viewStateAtom, prev => ({
-        ...prev,
-        'files:v': String(Number(prev['files:v'] ?? '0') + 1),
-      }))
+      filesBumpPending = false
+      try {
+        await update($, viewStateAtom, prev => ({
+          ...prev,
+          'files:v': String(Number(prev['files:v'] ?? '0') + 1),
+        }))
+      } catch (e) {
+        if (!isRenderWriteRefusal(e)) throw e
+        filesBumpPending = true // refused during a render: the next tick's walk bumps it again
+      }
     }
   } catch {
-    // ignore
+    // a failed clock read or list: the next tick walks again
   } finally {
     filesWalkInFlight = false
   }
 }
 
 async function filesTick($: EngineInterface): Promise<void> {
-  if (filesCurrentRoot && !filesWalkInFlight) {
-    await runFilesWalk($, filesCurrentRoot)
-  }
+  if (filesWalkInFlight) return
+  if (filesCurrentRoot) await runFilesWalk($, filesCurrentRoot)
+  else await startFilesWalk($) // nothing drawn yet to name a root
 }
 
 /** the Files tab's focus wiring: fire and forget, a rejection or a { deny } is ignored; never writes settings:focus */
@@ -1076,7 +1117,6 @@ function FilesPane(
     const roots = rootsOf(mainCheckoutPath || cwd, slots)
     const chosenId = viewState['files:root']
     const chosenRoot = pickRoot(roots, chosenId)
-    filesCurrentRoot = chosenRoot.path
 
     let rootToRender = chosenRoot
     let note: string | null = null
@@ -1097,6 +1137,8 @@ function FilesPane(
     } else if (walk?.missing) {
       note = 'missing root'
     }
+
+    filesCurrentRoot = rootToRender.path // the tick walks the root on screen, not a missing lane root
 
     const effectiveWalk: Walk = walk ?? { dirs: new Map(), capped: false, missing: false }
 

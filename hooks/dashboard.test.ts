@@ -2,6 +2,7 @@
 // compact 36-col, inline hint, first-run and no-run states. Fixtures arrive
 // via $.fs.write (inline fixtures plugin); fs is served in memory.
 import { test, expect } from 'claude-code/testing'
+import type { Plugin } from 'claude-code/testing'
 import type { On, ConfigRow, FsEntry } from 'claude-code'
 import { snapshotCount, DATA_DIR, NOW, PROJECT_DIR, RUN_PATH, RUNS_INDEX, USAGE_PATH, agentOf, agentsOf, mockFs, mockWorld, paneProps, sessionStart, sessionStartIn, setRun, setUsage, tasksOf, worldFiles, worldFixtures } from './testkit'
 import type { Files, MockWorld } from './testkit'
@@ -2637,18 +2638,32 @@ function f43Rig(on: On, opts: {
   listing: (path: string) => FsEntry[] | Promise<FsEntry[]>
   activity?: unknown[]
   startOnFiles?: boolean
+  /** the first files:v write is refused the way the engine refuses a write made during a render */
+  refuseFilesV?: boolean
+  /** the project's .git is a worktree FILE pointing at /main */
+  gitFile?: boolean
   process?: Parameters<typeof mockWorld>[1] extends infer O ? O extends { process?: infer P } ? P : never : never
 }) {
   const sets: { key: string; value: unknown }[] = []
   let viewState: Record<string, string> = {}
-  mockFs(on, worldFiles())
+  const files = worldFiles()
+  if (opts.gitFile) {
+    files[`${PROJECT_DIR}/.git`] = 'gitdir: /main/.git/worktrees/x\n'
+    files['/main/.git/worktrees/x/commondir'] = '../..\n'
+  }
+  const { reads } = mockFs(on, files, opts.gitFile ? [DATA_DIR] : undefined, opts.gitFile ? [`${PROJECT_DIR}/.git`] : undefined)
   const clock = mockWorld(on, { process: opts.process })
+  let refused = 0
   on('state.get', (_$, e, next) => {
     if (e.key === 'dashTab' && opts.startOnFiles) return { value: { value: 'files', version: 1 } }
     if (e.key === 'fileActivity' && opts.activity) return { value: { value: opts.activity, version: 1 } }
     return next(e)
   })
   on('state.set', (_$, e, next) => {
+    if (opts.refuseFilesV && refused === 0 && e.key === 'viewState' && (e.value as Record<string, string> | undefined)?.['files:v'] !== undefined) {
+      refused++
+      return { deny: 'it was made while ui.render is being dispatched, and drawing is pure' }
+    }
     sets.push({ key: e.key, value: e.value })
     if (e.key === 'viewState' && e.value) viewState = e.value as Record<string, string>
     return next(e)
@@ -2656,7 +2671,7 @@ function f43Rig(on: On, opts: {
   on('fs.list', async (_$, e) => ({ value: await opts.listing(e.path) }))
   const settle = async (): Promise<void> => { for (let i = 0; i < 10; i++) await clock.advance(0) }
   const writes = (): number => sets.filter(s => s.key === 'fileActivity').length
-  return { clock, sets, settle, writes, vs: () => viewState }
+  return { clock, sets, settle, writes, reads, refusals: () => refused, vs: () => viewState }
 }
 
 /** the text of every Text on the pane, joined by spaces */
@@ -2890,4 +2905,126 @@ test('Files F4.3: a10 on a fixture shaped like this repo one tick lists at most 
   expect(listed.filter(p => /\/(\.omc|\.matrixkoder|\.matrixkoder-old-1)(\/|$)/.test(p))).toEqual([])
   expect(await ui.find({ text: /tree stopped at its limit/ })).toBeUndefined()
   expect(rig.writes()).toBe(0)
+})
+
+/* ---------------------------------------------------------------------------
+ * Files F4 review r1 fixes (3 MEDIUM, 1 LOW)
+ * ------------------------------------------------------------------------- */
+test('Files F4.3: review fix 1, with a missing lane root chosen the tick walks the main checkout on screen and a new file there shows as a write', F43_OPTS, async ($, on) => {
+  let newFile = false
+  const rig = f43Rig(on, {
+    process: argv => (argv.some(a => a.includes('mk-lane.py')) && argv.includes('list') ? f43Lane('/missing/lane-1') : undefined),
+    listing: p => {
+      if (p.startsWith('/missing')) throw new Error('ENOENT')
+      return p === PROJECT_DIR ? [f43Entry('a.ts'), ...(newFile ? [f43Entry('new.ts', NOW)] : [])] : []
+    },
+  })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ ...F43_MOUNT, props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-files' })
+  for (let i = 0; i < 60 && !(await ui.find({ type: 'Button', key: 'files-root:slot-1' })); i++) {
+    await rig.clock.advance(0)
+    await ui.redraw(paneProps(46))
+  }
+  await ui.press({ key: 'files-root:slot-1' })
+  for (let i = 0; i < 60 && !(await ui.find({ text: /missing root, fallback to repo/ })); i++) {
+    await rig.clock.advance(0)
+    await ui.redraw(paneProps(46))
+  }
+  expect(await ui.find({ text: /missing root, fallback to repo/ })).toBeTruthy()
+  await rig.clock.advance(1500) // the first walk after the root change records nothing
+  await rig.settle()
+  expect(rig.writes()).toBe(0)
+  newFile = true
+  await rig.clock.advance(1500)
+  await rig.settle()
+  const last = rig.sets.filter(s => s.key === 'fileActivity').pop()?.value as { path: string; kind: string }[] | undefined
+  expect(last?.map(a => a.path)).toEqual([`${PROJECT_DIR}/new.ts`])
+})
+
+test('Files F4.2: review fix 2, a files:v write refused during a render is retried by the next tick, not dropped', F43_OPTS, async ($, on) => {
+  const rig = f43Rig(on, { startOnFiles: true, refuseFilesV: true, listing: p => (p === PROJECT_DIR ? [f43Entry('a.ts')] : []) })
+  await $.session.start(sessionStart())
+  await $.ui.mount({ ...F43_MOUNT, props: paneProps(46) })
+  await rig.settle()
+  expect(rig.refusals()).toBe(1)
+  expect(rig.vs()['files:v']).toBeUndefined()
+  await rig.clock.advance(1500)
+  await rig.settle()
+  expect(rig.vs()['files:v']).toBe('1')
+})
+
+test('Files F4.2: review fix 2, pressing f from another tab starts the walk of the root on screen', F43_OPTS, async ($, on) => {
+  let rootCalls = 0
+  const rig = f43Rig(on, { listing: p => { if (p === PROJECT_DIR) rootCalls++; return p === PROJECT_DIR ? [f43Entry('a.ts')] : [] } })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ ...F43_MOUNT, props: paneProps(46) })
+  await rig.settle()
+  expect(rootCalls).toBe(0)
+  await ui.press({ key: 'dash-tab-files' })
+  await rig.clock.advance(0)
+  expect(rootCalls).toBeGreaterThan(0)
+  expect(rig.vs()['files:v']).toBe('1')
+})
+
+test('Files F4.2: review fix 3, an Overview render never asks $.session.cwd', F43_OPTS, async ($, on) => {
+  let cwdCalls = 0
+  const rig = f43Rig(on, { listing: () => [] })
+  on('session.cwd', (_$, e, next) => { cwdCalls++; return next(e) })
+  await $.session.start(sessionStartIn(''))
+  const ui = await $.ui.mount({ ...F43_MOUNT, props: paneProps(46) })
+  await rig.settle()
+  await ui.redraw(paneProps(46))
+  await ui.redraw(paneProps(46))
+  expect(cwdCalls).toBe(0)
+})
+
+test('Files F4.2: review fix 3, on Files several renders resolve the main checkout once', F43_OPTS, async ($, on) => {
+  let mainListed = 0
+  const rig = f43Rig(on, { startOnFiles: true, gitFile: true, listing: p => { if (p === '/main') mainListed++; return p === '/main' ? [f43Entry('a.ts')] : [] } })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ ...F43_MOUNT, props: paneProps(46) })
+  await rig.settle()
+  // other code (the data-dir lookup) reads commondir too: count only what the renders add
+  const commondirReads = (): number => rig.reads.filter(r => r === '/main/.git/worktrees/x/commondir').length
+  const before = commondirReads()
+  for (let i = 0; i < 3; i++) {
+    await rig.clock.advance(1500)
+    await ui.redraw(paneProps(46))
+  }
+  expect(commondirReads() - before).toBe(0)
+  expect(mainListed).toBeGreaterThan(0) // the Files renders ran and walked the resolved main checkout
+})
+
+// literals only (the module scan drops closures): the clock is refused once the test writes this file
+const clockBreaker: Plugin = {
+  name: 'mk-clock-breaker',
+  tier: 'prepend',
+  register(on, _options) {
+    return on('clock.now', async ($, e, next) => {
+      let broken = false
+      try { broken = (await $.fs.read('/mk-clock-broken')) === '1' } catch { broken = false }
+      if (broken) return { deny: 'clock gone' }
+      return next(e)
+    })
+  },
+}
+
+test('Files F4.3: review fix 4, a rejecting $.clock.now still bumps rain:tick for the code rain on a non-Files tab', { timeoutMs: 15000, plugins: [worldFixtures, clockBreaker] }, async ($, on) => {
+  const files = worldFiles()
+  mockFs(on, files)
+  const clock = mockWorld(on)
+  let viewState: Record<string, string> = {}
+  on('state.set', (_$, e, next) => {
+    if (e.key === 'viewState' && e.value) viewState = e.value as Record<string, string>
+    return next(e)
+  })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ ...F43_MOUNT, props: paneProps(46) })
+  for (let i = 0; i < 10; i++) await clock.advance(0)
+  await ui.redraw(paneProps(46)) // Overview draws the rain
+  files['/mk-clock-broken'] = '1'
+  await clock.advance(1500)
+  for (let i = 0; i < 10; i++) await clock.advance(0)
+  expect(Number(viewState['rain:tick'])).toBeGreaterThanOrEqual(Math.floor(Date.now() / 1500) - 1)
 })
