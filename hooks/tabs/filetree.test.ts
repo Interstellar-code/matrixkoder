@@ -1,0 +1,650 @@
+// Tests for FilesTab (plan filetree-tab-ralplan, phase F3, task F3.1).
+// Covers all 16 acceptance criteria F3.1.a1 through F3.1.a16.
+import { test, expect } from 'claude-code/testing'
+import type { BoxProps, ElementChildren, Elements, RenderChildren, RenderElement, RenderNode, TextProps } from 'claude-code'
+import { FilesTab, FT } from './filetree'
+import type { FilesTabUi, FilesView } from './filetree'
+import {
+  filetreeFixtureView,
+  noGitFixtureView,
+  longNamesFixtureView,
+  FIXTURE_ROOTS,
+} from './filetree.fixture'
+import type { Row } from './filetree-data'
+
+type Node = { type?: string; props?: Record<string, unknown>; children?: unknown[] }
+
+const isNode = (k: RenderChildren): k is RenderNode =>
+  typeof k === 'string' || (typeof k === 'object' && k !== null && !Array.isArray(k))
+
+const kids = (c: RenderChildren | undefined): RenderNode[] | undefined => {
+  if (c == null) return undefined
+  const arr: readonly RenderChildren[] = Array.isArray(c) ? c : [c]
+  return arr.filter(isNode)
+}
+
+const scalarProps = (props: object): Record<string, string | boolean | number> => {
+  const out: Record<string, string | boolean | number> = {}
+  for (const [k, v] of Object.entries(props)) {
+    if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') out[k] = v
+  }
+  return out
+}
+
+const stubEls = {
+  Box: (props: any): RenderElement => ({
+    type: 'Box',
+    props: scalarProps(props),
+    children: kids(props.children),
+  }),
+  Text: (props: any): RenderElement => ({
+    type: 'Text',
+    props: scalarProps(props),
+    children: kids(props.children),
+  }),
+  Button: (props: any): RenderElement => ({
+    type: 'Button',
+    props,
+    children: Array.isArray(props.children) ? (props.children as unknown[]).flatMap(c => Array.isArray(c) ? c : [c]) : [],
+  }) as unknown as RenderElement,
+  Input: (props: any): RenderElement => ({
+    type: 'Input',
+    props,
+  }) as unknown as RenderElement,
+} as unknown as Elements[keyof Elements]
+
+function nodesOf(n: unknown, type?: string): Node[] {
+  const out: Node[] = []
+  const walk = (node: unknown): void => {
+    if (typeof node !== 'object' || node === null) return
+    const cur = node as Node
+    if (!type || cur.type === type) out.push(cur)
+    for (const c of cur.children ?? []) walk(c)
+  }
+  walk(n)
+  return out
+}
+
+function textOf(n: unknown): string {
+  if (typeof n === 'string') return n
+  if (typeof n !== 'object' || n === null) return ''
+  const cur = n as Node
+  if (cur.type === 'Button' && typeof cur.props?.label === 'string') {
+    return cur.props.label
+  }
+  return (cur.children ?? []).map(textOf).join('')
+}
+
+function allText(n: unknown): string {
+  const texts = nodesOf(n, 'Text').map(t => (t.children ?? []).map(c => (typeof c === 'string' ? c : textOf(c))).join(''))
+  const buttons = nodesOf(n, 'Button').map(b => (b.props?.label ? String(b.props.label) : textOf(b)))
+  return [...texts, ...buttons].join('\n')
+}
+
+function pressButton(tree: unknown, key: string): void {
+  const b = nodesOf(tree, 'Button').find(x => String(x.props?.key) === key)
+  if (!b) throw new Error(`button ${key} not found`)
+  ;(b.props?.onPress as (() => void) | undefined)?.()
+}
+
+function createMockUi(initialState: Record<string, string> = {}): {
+  ui: FilesTabUi
+  state: Record<string, string>
+  revealed: string[]
+  focused: string[]
+  gets: string[]
+} {
+  const state: Record<string, string> = { ...initialState }
+  const revealed: string[] = []
+  const focused: string[] = []
+  const gets: string[] = []
+  const ui: FilesTabUi = {
+    get: (key: string) => {
+      gets.push(key)
+      return state[key]
+    },
+    set: (key: string, val: string) => {
+      state[key] = val
+    },
+    reveal: (key: string) => {
+      revealed.push(key)
+    },
+    focus: (key: string) => {
+      focused.push(key)
+    },
+  }
+  return { ui, state, revealed, focused, gets }
+}
+
+// ────────────────────── Acceptance Tests F3.1.a1 – F3.1.a16 ──────────────────────
+
+test('Files F3.1: root chips show repo and each lane with active chip colours on chosen one, pressing calls ui.set and all keys are unique', () => {
+  const view = filetreeFixtureView()
+  const { ui, state } = createMockUi()
+  const tree = FilesTab(stubEls, view, 46, ui)
+
+  // Root chips have keys files-root:<id>
+  const chipButtons = nodesOf(tree, 'Button').filter(b => String(b.props?.key).startsWith('files-root:'))
+  expect(chipButtons.length).toBe(3)
+  expect(chipButtons.map(b => b.props?.key)).toEqual([
+    'files-root:main',
+    'files-root:slot-1',
+    'files-root:slot-2',
+  ])
+
+  // Active chip (main) has activeChip colour and white bold text
+  const mainChip = chipButtons[0]!
+  const mainText = nodesOf(mainChip, 'Text')[0]!
+  expect(mainText.props?.backgroundColor).toBe(FT.activeChip)
+  expect(mainText.props?.color).toBe(FT.white)
+  expect(mainText.props?.bold).toBe(true)
+  expect(textOf(mainChip)).toContain('repo')
+
+  // Inactive chip (slot-1) has chipFill and fileText
+  const slot1Chip = chipButtons[1]!
+  const slot1Text = nodesOf(slot1Chip, 'Text')[0]!
+  expect(slot1Text.props?.backgroundColor).toBe(FT.chipFill)
+  expect(slot1Text.props?.color).toBe(FT.fileText)
+  expect(textOf(slot1Chip)).toContain('P4')
+
+  // Pressing calls ui.set('files:root', id)
+  pressButton(tree, 'files-root:slot-1')
+  expect(state['files:root']).toBe('slot-1')
+
+  // Every element key is unique and none starts with dash-tab-
+  const allElements = nodesOf(tree)
+  const keys: string[] = []
+  for (const el of allElements) {
+    if (el.props?.key) {
+      keys.push(String(el.props.key))
+    }
+  }
+  const uniqueKeys = new Set(keys)
+  expect(uniqueKeys.size).toBe(keys.length)
+  for (const k of keys) {
+    expect(k.startsWith('files-')).toBe(true)
+    expect(k.startsWith('dash-tab-')).toBe(false)
+  }
+})
+
+test('Files F3.1: card shows root label in bold neon, write count after amber dot, read count after teal ring, and dim clipped path', () => {
+  const view = filetreeFixtureView({ nWrite: 7, nRead: 11 })
+  const { ui } = createMockUi()
+  const tree = FilesTab(stubEls, view, 46, ui)
+
+  const textNodes = nodesOf(tree, 'Text')
+
+  // Root label in bold neon
+  const neonLabel = textNodes.find(t => t.props?.color === FT.neon && t.props?.bold === true)
+  expect(neonLabel).toBeDefined()
+  expect(textOf(neonLabel)).toBe('repo')
+
+  // Amber dot and write count
+  const amberDot = textNodes.find(t => t.props?.color === FT.write && textOf(t).includes('●'))
+  expect(amberDot).toBeDefined()
+  const writeCount = textNodes.find(t => textOf(t) === '7')
+  expect(writeCount).toBeDefined()
+
+  // Teal ring and read count
+  const tealRing = textNodes.find(t => t.props?.color === FT.read && textOf(t).includes('◉'))
+  expect(tealRing).toBeDefined()
+  const readCount = textNodes.find(t => textOf(t) === '11')
+  expect(readCount).toBeDefined()
+
+  // Root path is dim
+  const dimPath = textNodes.find(t => t.props?.color === FT.dim && textOf(t).includes('/repo'))
+  expect(dimPath).toBeDefined()
+  expect(dimPath?.props?.dimColor).toBe(true)
+})
+
+test('Files F3.1: folders are bold neon with caret, files in file text, hidden in hidden text, links dim with arrow, indent 2 cols per depth', () => {
+  const view = filetreeFixtureView()
+  const { ui } = createMockUi()
+  const tree = FilesTab(stubEls, view, 46, ui)
+
+  const textNodes = nodesOf(tree, 'Text')
+
+  // Folders are bold neon with caret (open or folded)
+  const docsFolderText = textNodes.find(t => textOf(t) === 'docs')
+  expect(docsFolderText?.props?.color).toBe(FT.neon)
+  expect(docsFolderText?.props?.bold).toBe(true)
+
+  // Files in file text
+  const readmeText = textNodes.find(t => textOf(t) === 'package.json')
+  expect(readmeText?.props?.color).toBe(FT.fileText)
+
+  // Hidden names in hidden text
+  const hiddenText = textNodes.find(t => textOf(t) === '.github')
+  expect(hiddenText?.props?.color).toBe(FT.hidden)
+
+  // Links dim with trailing arrow
+  const linkText = textNodes.find(t => textOf(t) === 'link-to-readme →')
+  expect(linkText?.props?.color).toBe(FT.dim)
+
+  // Indent: depth 0 has empty indent, depth 1 has 2 spaces, depth 2 has 4 spaces
+  const depth2Row = view.rows.find(r => r.depth === 2)!
+  const rowBtn = nodesOf(tree, 'Button').find(b => b.props?.key === depth2Row.key)!
+  const rowTexts = nodesOf(rowBtn, 'Text')
+  expect(textOf(rowTexts[1])).toBe('    ')
+})
+
+test('Files F3.1: written row has write tint and pulsing amber dot, read row has read tint and teal ring, folded folder shows icon and count', () => {
+  // 1. Written row has write tint and amber dot, bright when pulse: true, dim when pulse: false
+  const viewPulse = filetreeFixtureView({ pulse: true, sel: '' })
+  const { ui } = createMockUi()
+  const treePulse = FilesTab(stubEls, viewPulse, 46, ui)
+
+  const mkdbRow = viewPulse.rows.find(r => r.path === '/repo/scripts/mkdb.py')!
+  expect(mkdbRow.icon).toBe('write')
+  const mkdbBtn = nodesOf(treePulse, 'Button').find(b => b.props?.key === mkdbRow.key)!
+  const mkdbBox = nodesOf(mkdbBtn, 'Box')[0]!
+  expect(mkdbBox.props?.backgroundColor).toBe(FT.writeRowTint)
+
+  const mkdbIconText = nodesOf(mkdbBtn, 'Text').find(t => textOf(t).includes('●'))!
+  expect(mkdbIconText.props?.color).toBe(FT.write)
+  expect(mkdbIconText.props?.dimColor).toBe(false) // bright
+
+  // With pulse false: amber dot is dim
+  const viewDim = filetreeFixtureView({ pulse: false, sel: '' })
+  const treeDim = FilesTab(stubEls, viewDim, 46, createMockUi().ui)
+  const mkdbBtnDim = nodesOf(treeDim, 'Button').find(b => b.props?.key === mkdbRow.key)!
+  const mkdbIconDim = nodesOf(mkdbBtnDim, 'Text').find(t => textOf(t).includes('●'))!
+  expect(mkdbIconDim.props?.dimColor).toBe(true)
+
+  // 2. Read row has read tint and teal ring
+  const guideRow = viewPulse.rows.find(r => r.path === '/repo/docs/guide.md')!
+  expect(guideRow.icon).toBe('read')
+  const guideBtn = nodesOf(treePulse, 'Button').find(b => b.props?.key === guideRow.key)!
+  const guideBox = nodesOf(guideBtn, 'Box')[0]!
+  expect(guideBox.props?.backgroundColor).toBe(FT.readRowTint)
+  const guideIconText = nodesOf(guideBtn, 'Text').find(t => textOf(t).includes('◉'))!
+  expect(guideIconText.props?.color).toBe(FT.read)
+  expect(textOf(guideIconText)).toContain('◉')
+
+  // 3. Folded folder shows strongest icon plus count when > 1
+  const customRows: Row[] = [
+    {
+      key: 'files-row:/repo/folded-folder',
+      path: '/repo/folded-folder',
+      name: 'folded-folder',
+      depth: 0,
+      dir: true,
+      open: false,
+      hidden: false,
+      link: false,
+      icon: 'write',
+      count: 3,
+    },
+  ]
+  const viewFolded = filetreeFixtureView({ rows: customRows, sel: '' })
+  const treeFolded = FilesTab(stubEls, viewFolded, 46, createMockUi().ui)
+  const foldedBtn = nodesOf(treeFolded, 'Button').find(b => b.props?.key === 'files-row:/repo/folded-folder')!
+  const foldedIcon = nodesOf(foldedBtn, 'Text').find(t => textOf(t).includes('●'))!
+  expect(textOf(foldedIcon)).toContain('● 3')
+})
+
+test('Files F3.1: typing in search input calls ui.set, and empty match shows dim no file matches line', () => {
+  const view = filetreeFixtureView({ q: 'initial' })
+  const { ui, state } = createMockUi()
+  const tree = FilesTab(stubEls, view, 46, ui)
+
+  // Input key files-q
+  const inputEl = nodesOf(tree, 'Input').find(i => i.props?.key === 'files-q')!
+  expect(inputEl).toBeDefined()
+  expect(inputEl.props?.placeholder).toBe('s : search')
+  expect(inputEl.props?.value).toBe('initial')
+
+  // Typing calls ui.set('files:q', text)
+  ;(inputEl.props?.onInput as (val: string) => void)('searchterm')
+  expect(state['files:q']).toBe('searchterm')
+
+  // Empty match: view.rows = [] shows dim "no file matches"
+  const emptyView = filetreeFixtureView({ rows: [], q: 'nonexistent' })
+  const treeEmpty = FilesTab(stubEls, emptyView, 46, ui)
+  const noMatchText = nodesOf(treeEmpty, 'Text').find(t => textOf(t).includes('no file matches'))
+  expect(noMatchText).toBeDefined()
+  expect(noMatchText?.props?.dimColor).toBe(true)
+  expect(noMatchText?.props?.color).toBe(FT.dim)
+})
+
+test('Files F3.1: Expand all sets files:open to JSON of view.dirs and Collapse all sets it to empty array', () => {
+  const view = filetreeFixtureView()
+  const { ui, state } = createMockUi()
+  const tree = FilesTab(stubEls, view, 46, ui)
+
+  pressButton(tree, 'files-expand')
+  expect(state['files:open']).toBe(JSON.stringify(view.dirs))
+
+  pressButton(tree, 'files-collapse')
+  expect(state['files:open']).toBe(JSON.stringify([]))
+})
+
+test('Files F3.1: empty folder shows dim empty row, unlisted folder shows dim not listed row, note shows as line, capped shows limit line', () => {
+  const customRows: Row[] = [
+    {
+      key: 'files-empty:/repo/empty-dir',
+      path: '/repo/empty-dir',
+      name: '(empty)',
+      depth: 1,
+      dir: false,
+      open: false,
+      hidden: false,
+      link: false,
+      icon: null,
+      count: 0,
+      note: 'empty',
+    },
+    {
+      key: 'files-unlisted:/repo/unlisted-dir',
+      path: '/repo/unlisted-dir',
+      name: '(not listed)',
+      depth: 1,
+      dir: false,
+      open: false,
+      hidden: false,
+      link: false,
+      icon: null,
+      count: 0,
+      note: 'unlisted',
+    },
+  ]
+  const view = filetreeFixtureView({
+    rows: customRows,
+    note: 'missing root, fallback to repo',
+    capped: true,
+  })
+  const { ui } = createMockUi()
+  const tree = FilesTab(stubEls, view, 46, ui)
+
+  const textNodes = nodesOf(tree, 'Text')
+
+  // empty folder shows dim (empty) row
+  const emptyText = textNodes.find(t => textOf(t).includes('(empty)'))!
+  expect(emptyText).toBeDefined()
+  expect(emptyText.props?.color).toBe(FT.dim)
+  expect(emptyText.props?.dimColor).toBe(true)
+
+  // unlisted folder shows dim (not listed) row
+  const unlistedText = textNodes.find(t => textOf(t).includes('(not listed)'))!
+  expect(unlistedText).toBeDefined()
+  expect(unlistedText.props?.color).toBe(FT.dim)
+  expect(unlistedText.props?.dimColor).toBe(true)
+
+  // view.note shows as one line
+  const noteText = textNodes.find(t => textOf(t).includes('missing root, fallback to repo'))!
+  expect(noteText).toBeDefined()
+  expect(noteText.props?.color).toBe(FT.dim)
+
+  // view.capped shows dim line that tree stopped at its limit
+  const cappedText = textNodes.find(t => textOf(t).includes('tree stopped at its limit'))!
+  expect(cappedText).toBeDefined()
+  expect(cappedText.props?.color).toBe(FT.dim)
+  expect(cappedText.props?.dimColor).toBe(true)
+})
+
+test('Files F3.1: at 46 and 36 columns no line is wider than column count and long names end in ellipsis', () => {
+  const longView = longNamesFixtureView()
+  const { ui } = createMockUi()
+
+  for (const cols of [46, 36]) {
+    const tree = FilesTab(stubEls, longView, cols, ui)
+    for (const t of nodesOf(tree, 'Text')) {
+      const shown = textOf(t)
+      expect(shown.length, `text length at ${cols} cols: ${shown}`).toBeLessThanOrEqual(cols)
+    }
+
+    // Long file name ends in ellipsis
+    const longRowText = nodesOf(tree, 'Text').find(t => textOf(t).includes('an-extremely-long'))
+    expect(longRowText).toBeDefined()
+    expect(textOf(longRowText).endsWith('…')).toBe(true)
+
+    // Long path ends in ellipsis
+    const pathText = nodesOf(tree, 'Text').find(t => textOf(t).includes('/a/very/long'))
+    expect(pathText).toBeDefined()
+    expect(textOf(pathText).endsWith('…')).toBe(true)
+  }
+})
+
+test('Files F3.1: drawn text with no dot-git fixture matches none of the whole words git, branch, commit', () => {
+  const view = noGitFixtureView()
+  const { ui } = createMockUi()
+  const tree = FilesTab(stubEls, view, 46, ui)
+
+  const textDump = allText(tree)
+  expect(textDump).not.toMatch(/\bgit\b/i)
+  expect(textDump).not.toMatch(/\bbranch\b/i)
+  expect(textDump).not.toMatch(/\bcommit\b/i)
+})
+
+test('Files F3.1: when view throws while drawing FilesTab returns one line starting Files could not draw', () => {
+  const throwingView = {
+    ...filetreeFixtureView(),
+    get rows(): Row[] {
+      throw new Error('corrupted tree state')
+    },
+  }
+  const { ui } = createMockUi()
+  const tree = FilesTab(stubEls, throwingView, 46, ui)
+
+  const textDump = allText(tree).trim()
+  expect(textDump.startsWith('Files could not draw')).toBe(true)
+})
+
+test('Files F3.1: pressing j and k calls ui.set for next and previous visible path row stopping at ends, note rows are Text and never selected', () => {
+  const view = filetreeFixtureView()
+  const pathRows = view.rows.filter(r => !r.note)
+  const { ui, state, revealed } = createMockUi({ 'files:sel': pathRows[0]!.key })
+  const tree = FilesTab(stubEls, view, 46, ui)
+
+  // Pressing j selects next visible path row
+  pressButton(tree, 'files-key-j')
+  expect(state['files:sel']).toBe(pathRows[1]!.key)
+  expect(revealed).toContain(pathRows[1]!.key)
+
+  // At the end, pressing j stops at the end
+  const { ui: uiEnd, state: stateEnd } = createMockUi({ 'files:sel': pathRows[pathRows.length - 1]!.key })
+  const treeEnd = FilesTab(stubEls, view, 46, uiEnd)
+  pressButton(treeEnd, 'files-key-j')
+  expect(stateEnd['files:sel']).toBe(pathRows[pathRows.length - 1]!.key)
+
+  // Pressing k moves to previous visible path row
+  const { ui: uiMid, state: stateMid } = createMockUi({ 'files:sel': pathRows[2]!.key })
+  const treeMid = FilesTab(stubEls, view, 46, uiMid)
+  pressButton(treeMid, 'files-key-k')
+  expect(stateMid['files:sel']).toBe(pathRows[1]!.key)
+
+  // At the start, pressing k stops at index 0
+  const { ui: uiStart, state: stateStart } = createMockUi({ 'files:sel': pathRows[0]!.key })
+  const treeStart = FilesTab(stubEls, view, 46, uiStart)
+  pressButton(treeStart, 'files-key-k')
+  expect(stateStart['files:sel']).toBe(pathRows[0]!.key)
+
+  // Note rows (empty, unlisted, more) are Text, never Button
+  const customRows: Row[] = [
+    {
+      key: 'files-empty:/repo/e',
+      path: '/repo/e',
+      name: '(empty)',
+      depth: 1,
+      dir: false,
+      open: false,
+      hidden: false,
+      link: false,
+      icon: null,
+      count: 0,
+      note: 'empty',
+    },
+    {
+      key: 'files-unlisted:/repo/u',
+      path: '/repo/u',
+      name: '(not listed)',
+      depth: 1,
+      dir: false,
+      open: false,
+      hidden: false,
+      link: false,
+      icon: null,
+      count: 0,
+      note: 'unlisted',
+    },
+    {
+      key: 'files-more:/repo/m',
+      path: '/repo/m',
+      name: 'more',
+      depth: 1,
+      dir: false,
+      open: false,
+      hidden: false,
+      link: false,
+      icon: null,
+      count: 50,
+      note: 'more',
+    },
+  ]
+  const viewNotes = filetreeFixtureView({ rows: customRows })
+  const treeNotes = FilesTab(stubEls, viewNotes, 46, ui)
+  const buttons = nodesOf(treeNotes, 'Button')
+  expect(buttons.some(b => String(b.props?.key).startsWith('files-empty:'))).toBe(false)
+  expect(buttons.some(b => String(b.props?.key).startsWith('files-unlisted:'))).toBe(false)
+  expect(buttons.some(b => String(b.props?.key).startsWith('files-more:'))).toBe(false)
+})
+
+test('Files F3.1: pressing l opens selected folder, h folds it, or on a file h moves selection to parent folder', () => {
+  // Case 1: pressing l opens selected folded folder
+  const view = filetreeFixtureView()
+  const foldedFolder = view.rows.find(r => r.dir && !r.open)!
+  const { ui: uiFolded, state: stateFolded } = createMockUi({ 'files:sel': foldedFolder.key })
+  const treeFolded = FilesTab(stubEls, view, 46, uiFolded)
+  pressButton(treeFolded, 'files-key-l')
+  const openListAfterL = JSON.parse(stateFolded['files:open'] ?? '[]') as string[]
+  expect(openListAfterL).toContain(foldedFolder.path)
+
+  // Case 2: pressing h folds selected open folder
+  const openFolder = view.rows.find(r => r.dir && r.open)!
+  const { ui: uiOpen, state: stateOpen } = createMockUi({
+    'files:sel': openFolder.key,
+    'files:open': JSON.stringify([openFolder.path]),
+  })
+  const treeOpen = FilesTab(stubEls, view, 46, uiOpen)
+  pressButton(treeOpen, 'files-key-h')
+  const openListAfterH = JSON.parse(stateOpen['files:open'] ?? '[]') as string[]
+  expect(openListAfterH).not.toContain(openFolder.path)
+
+  // Case 3: on a file, pressing h moves selection to parent folder
+  const childFile = view.rows.find(r => !r.dir && r.path === '/repo/docs/guide.md')!
+  const parentFolder = view.rows.find(r => r.dir && r.path === '/repo/docs')!
+  const { ui: uiFile, state: stateFile, revealed } = createMockUi({ 'files:sel': childFile.key })
+  const treeFile = FilesTab(stubEls, view, 46, uiFile)
+  pressButton(treeFile, 'files-key-h')
+  expect(stateFile['files:sel']).toBe(parentFolder.key)
+  expect(revealed).toContain(parentFolder.key)
+})
+
+test('Files F3.1: pressing a row or Enter on a focused row toggles folder and selects file', () => {
+  const view = filetreeFixtureView()
+  const { ui, state, revealed } = createMockUi()
+  const tree = FilesTab(stubEls, view, 46, ui)
+
+  // Pressing a folder row toggles it and sets selection
+  const folderRow = view.rows.find(r => r.dir && r.open)!
+  pressButton(tree, folderRow.key)
+  expect(state['files:sel']).toBe(folderRow.key)
+  const openList = JSON.parse(state['files:open'] ?? '[]') as string[]
+  expect(openList).not.toContain(folderRow.path) // toggled closed
+
+  // Pressing a file row selects it and calls reveal
+  const fileRow = view.rows.find(r => !r.dir && r.path === '/repo/README.md')!
+  pressButton(tree, fileRow.key)
+  expect(state['files:sel']).toBe(fileRow.key)
+  expect(revealed).toContain(fileRow.key)
+})
+
+test('Files F3.1: pressing search button calls ui.focus for files-q, never reads settings:focus, and hotkeys j k h l s are always armed', () => {
+  const view = filetreeFixtureView()
+  const { ui, focused, gets } = createMockUi({ 'settings:focus': 'files-q' })
+  const tree = FilesTab(stubEls, view, 46, ui)
+
+  // Pressing search button files-s calls ui.focus('files-q')
+  pressButton(tree, 'files-s')
+  expect(focused).toContain('files-q')
+
+  // The tab never reads settings:focus
+  expect(gets).not.toContain('settings:focus')
+
+  // Buttons j, k, h, l, s are armed with their hotkeys
+  const buttons = nodesOf(tree, 'Button')
+  const sBtn = buttons.find(b => b.props?.key === 'files-s')!
+  expect(sBtn.props?.hotkey).toBe('s')
+  const jBtn = buttons.find(b => b.props?.key === 'files-key-j')!
+  expect(jBtn.props?.hotkey).toBe('j')
+  const kBtn = buttons.find(b => b.props?.key === 'files-key-k')!
+  expect(kBtn.props?.hotkey).toBe('k')
+  const hBtn = buttons.find(b => b.props?.key === 'files-key-h')!
+  expect(hBtn.props?.hotkey).toBe('h')
+  const lBtn = buttons.find(b => b.props?.key === 'files-key-l')!
+  expect(lBtn.props?.hotkey).toBe('l')
+})
+
+test('Files F3.1: submitting search input keeps files:q and focuses selected row if visible, else first path row, else files-s', () => {
+  const view = filetreeFixtureView()
+  const pathRows = view.rows.filter(r => !r.note)
+
+  // 1. Selected row is still visible: focuses selected row
+  const { ui: ui1, state: state1, focused: focused1 } = createMockUi({ 'files:sel': pathRows[2]!.key })
+  const tree1 = FilesTab(stubEls, view, 46, ui1)
+  const input1 = nodesOf(tree1, 'Input').find(i => i.props?.key === 'files-q')!
+  ;(input1.props?.onSubmit as (v: string) => void)('newquery')
+  expect(state1['files:q']).toBe('newquery')
+  expect(focused1).toEqual([pathRows[2]!.key])
+
+  // 2. Selected row filtered out (e.g. was some path not in view.rows): focuses first visible path row
+  const { ui: ui2, state: state2, focused: focused2 } = createMockUi({ 'files:sel': 'files-row:/vanished/path' })
+  const tree2 = FilesTab(stubEls, view, 46, ui2)
+  const input2 = nodesOf(tree2, 'Input').find(i => i.props?.key === 'files-q')!
+  ;(input2.props?.onSubmit as (v: string) => void)('filtered')
+  expect(state2['files:q']).toBe('filtered')
+  expect(focused2).toEqual([pathRows[0]!.key])
+
+  // 3. First visible row is a note row (no path rows at all): focuses files-s
+  const noteOnlyView = filetreeFixtureView({
+    rows: [
+      {
+        key: 'files-empty:/repo/empty',
+        path: '/repo/empty',
+        name: '(empty)',
+        depth: 0,
+        dir: false,
+        open: false,
+        hidden: false,
+        link: false,
+        icon: null,
+        count: 0,
+        note: 'empty',
+      },
+    ],
+  })
+  const { ui: ui3, focused: focused3 } = createMockUi()
+  const tree3 = FilesTab(stubEls, noteOnlyView, 46, ui3)
+  const input3 = nodesOf(tree3, 'Input').find(i => i.props?.key === 'files-q')!
+  ;(input3.props?.onSubmit as (v: string) => void)('emptysearch')
+  expect(focused3).toEqual(['files-s'])
+})
+
+test('Files F3.1: selected row draws lime left bar on selected fill and selection move calls ui.reveal with row key', () => {
+  const view = filetreeFixtureView()
+  const selectedRow = view.rows.find(r => r.key === view.sel)!
+  const { ui, revealed } = createMockUi({ 'files:sel': selectedRow.key })
+  const tree = FilesTab(stubEls, view, 46, ui)
+
+  // Selected row draws lime bar on selected fill
+  const selBtn = nodesOf(tree, 'Button').find(b => b.props?.key === selectedRow.key)!
+  const selBox = nodesOf(selBtn, 'Box')[0]!
+  expect(selBox.props?.backgroundColor).toBe(FT.selectedRow)
+  const barText = nodesOf(selBtn, 'Text').find(t => textOf(t).includes('▌'))!
+  expect(textOf(barText)).toBe('▌')
+  expect(barText.props?.color).toBe(FT.limeBar)
+
+  // Selection move calls ui.reveal with that row's key
+  pressButton(tree, 'files-key-j')
+  expect(revealed.length).toBeGreaterThan(0)
+})
