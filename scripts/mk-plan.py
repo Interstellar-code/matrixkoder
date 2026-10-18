@@ -1541,6 +1541,9 @@ def import_file(path, data, home, dry_run=False):
         reply["moved"] = [{"from": a, "to": b} for a, b in moves]
     else:
         reply["moved"] = _inbox_move(moves, inbox[0]) if inbox else []
+        err = _sync_summary(db, data, home, plan_id)  # the dashboard List reads the root summary
+        if err:
+            reply["warnings"] = [err]
     return reply
 
 
@@ -3360,6 +3363,11 @@ def self_test():
         # Z15 (R02): import on a migrated project ensures the plan folder's assets/ too
         assert os.path.isdir(os.path.join(proj, "plans", "migplan", "assets")), \
             "a migrated import did not create the plan folder's assets/"
+        # the dashboard List reads the root plan_summary: an imported draft must be in it
+        con = db.open_root(home)
+        n_sum = con.execute("SELECT COUNT(*) c FROM plan_summary WHERE project='migs' AND plan='migplan'").fetchone()["c"]
+        con.close()
+        assert n_sum == 1 and "warnings" not in out, (n_sum, out)
         out = mk("approve", mp, "--data", mig_data, "--home", home, "--run", "migrun")
         assert out["ok"] and out["version"] == 1, out
         assert out["archived"] == os.path.join(proj, "plans", "migplan", "archive", "migplan-v1.md"), out
