@@ -2,7 +2,7 @@
 // compact 36-col, inline hint, first-run and no-run states. Fixtures arrive
 // via $.fs.write (inline fixtures plugin); fs is served in memory.
 import { test, expect } from 'claude-code/testing'
-import type { On, ConfigRow } from 'claude-code'
+import type { On, ConfigRow, FsEntry } from 'claude-code'
 import { snapshotCount, DATA_DIR, NOW, PROJECT_DIR, RUN_PATH, RUNS_INDEX, USAGE_PATH, agentOf, agentsOf, mockFs, mockWorld, paneProps, sessionStart, sessionStartIn, setRun, setUsage, tasksOf, worldFiles, worldFixtures } from './testkit'
 import type { Files, MockWorld } from './testkit'
 import { PANE_ID, parseYamlAgents } from './data'
@@ -2623,4 +2623,271 @@ test('Files F4.2: Files wiring never writes settings:focus', { timeoutMs: 15000,
   await ui.press({ key: 'files-key-j' })
   for (let i = 0; i < 10; i++) await clock.advance(0)
   expect(latestViewState['files:sel']).toBeDefined()
+})
+
+/* ---------------------------------------------------------------------------
+ * Files F4.3: the Files tab rides the rain tick (RAIN_MS = 1500). Time moves only
+ * with mock.clock `advance`; fs.list is answered in the test; nothing sleeps.
+ * ------------------------------------------------------------------------- */
+const f43Entry = (name: string, mtimeMs = 1000, kind: 'file' | 'dir' = 'file'): FsEntry => ({ name, kind, size: 10, mtimeMs, isLink: false })
+const f43Lane = (path: string) => ({ value: { exitCode: 0, stdout: JSON.stringify({ ok: true, slots: [{ slot: 1, path, task: 'P4' }] }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+
+/** every state write recorded; `startOnFiles` opens the pane straight onto Files (saved dashTab) */
+function f43Rig(on: On, opts: {
+  listing: (path: string) => FsEntry[] | Promise<FsEntry[]>
+  activity?: unknown[]
+  startOnFiles?: boolean
+  process?: Parameters<typeof mockWorld>[1] extends infer O ? O extends { process?: infer P } ? P : never : never
+}) {
+  const sets: { key: string; value: unknown }[] = []
+  let viewState: Record<string, string> = {}
+  mockFs(on, worldFiles())
+  const clock = mockWorld(on, { process: opts.process })
+  on('state.get', (_$, e, next) => {
+    if (e.key === 'dashTab' && opts.startOnFiles) return { value: { value: 'files', version: 1 } }
+    if (e.key === 'fileActivity' && opts.activity) return { value: { value: opts.activity, version: 1 } }
+    return next(e)
+  })
+  on('state.set', (_$, e, next) => {
+    sets.push({ key: e.key, value: e.value })
+    if (e.key === 'viewState' && e.value) viewState = e.value as Record<string, string>
+    return next(e)
+  })
+  on('fs.list', async (_$, e) => ({ value: await opts.listing(e.path) }))
+  const settle = async (): Promise<void> => { for (let i = 0; i < 10; i++) await clock.advance(0) }
+  const writes = (): number => sets.filter(s => s.key === 'fileActivity').length
+  return { clock, sets, settle, writes, vs: () => viewState }
+}
+
+/** the text of every Text on the pane, joined by spaces */
+async function f43Screen(ui: { findAll: (q: { type: 'Text' }) => Promise<readonly { text: string }[]> }): Promise<string> {
+  return (await ui.findAll({ type: 'Text' })).map(t => t.text).join(' ')
+}
+
+const F43_OPTS = { timeoutMs: 15000, plugins: [worldFixtures] }
+const F43_MOUNT = { plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder' } as const
+
+test('Files F4.3: a2 rain:tick follows the mock clock (filesNow), not Date.now, with Files the only tab drawn', F43_OPTS, async ($, on) => {
+  const rig = f43Rig(on, { startOnFiles: true, listing: () => [f43Entry('a.ts')] })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ ...F43_MOUNT, props: paneProps(46, 'inline') })
+  await rig.settle()
+  await rig.clock.advance(1500)
+  await rig.settle()
+  expect(rig.vs()['rain:tick']).toBe(String(Math.floor((NOW + 1500) / 1500)))
+  await rig.clock.advance(3000)
+  await rig.settle()
+  await ui.redraw(paneProps(46, 'inline'))
+  expect(rig.vs()['rain:tick']).toBe(String(Math.floor((NOW + 4500) / 1500)))
+})
+
+test('Files F4.3: a3 the tick walks and writes nothing when the last render was not Files, (the over-10 s half is not reachable here: a mounted pane redraws on every tick bump)', F43_OPTS, async ($, on) => {
+  let rootCalls = 0
+  const rig = f43Rig(on, { listing: p => { if (p === PROJECT_DIR) rootCalls++; return p === PROJECT_DIR ? [f43Entry('a.ts')] : [] } })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ ...F43_MOUNT, props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-files' })
+  await rig.settle()
+  await ui.redraw(paneProps(46))
+  const walkedBefore = rootCalls
+  await rig.clock.advance(1500)
+  await rig.settle()
+  expect(rootCalls).toBeGreaterThan(walkedBefore) // Files drawn: the tick walks
+  // the last render was Overview
+  await ui.press({ key: 'dash-tab-overview' })
+  await rig.settle()
+  await ui.redraw(paneProps(46))
+  const before = { calls: rootCalls, writes: rig.writes(), v: rig.vs()['files:v'] }
+  await rig.clock.advance(4500)
+  await rig.settle()
+  expect({ calls: rootCalls, writes: rig.writes(), v: rig.vs()['files:v'] }).toEqual(before)
+})
+
+test('Files F4.3: a4 an entry recorded by a tool call is gone from the tab after advance(4500)', F43_OPTS, async ($, on) => {
+  const rig = f43Rig(on, { startOnFiles: true, activity: [{ path: `${PROJECT_DIR}/a.ts`, kind: 'write', at: NOW }], listing: () => [f43Entry('a.ts')] })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ ...F43_MOUNT, props: paneProps(46, 'inline') })
+  await rig.settle()
+  await ui.redraw(paneProps(46, 'inline'))
+  expect(await f43Screen(ui)).toMatch(/●\s*1\b/)
+  await rig.clock.advance(4500)
+  await rig.settle()
+  expect(await f43Screen(ui)).toMatch(/●\s*0\b/) // no redraw by the test: the tick's rain:tick bump redraws
+})
+
+test('Files F4.3: a5 a file created or changed in a listed folder shows as a write on the next tick, also inside a folded folder, and fades', F43_OPTS, async ($, on) => {
+  let rootMtime = 1000
+  let subMtime = 1000
+  let extra = false
+  const rig = f43Rig(on, {
+    startOnFiles: true,
+    listing: p => {
+      if (p === PROJECT_DIR) return [f43Entry('a.ts', rootMtime), f43Entry('sub', 0, 'dir'), ...(extra ? [f43Entry('c.ts', NOW)] : [])]
+      if (p === `${PROJECT_DIR}/sub`) return [f43Entry('b.ts', subMtime)]
+      return []
+    },
+  })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ ...F43_MOUNT, props: paneProps(46) })
+  await rig.settle()
+  await ui.redraw(paneProps(46))
+  expect(rig.writes()).toBe(0)
+  extra = true
+  subMtime = 5000
+  await rig.clock.advance(1500)
+  await rig.settle()
+  await ui.redraw(paneProps(46))
+  const last = rig.sets.filter(s => s.key === 'fileActivity').pop()?.value as { path: string; kind: string }[]
+  expect(last.map(a => a.path).sort()).toEqual([`${PROJECT_DIR}/c.ts`, `${PROJECT_DIR}/sub/b.ts`])
+  expect(last.every(a => a.kind === 'write')).toBe(true)
+  expect(await f43Screen(ui)).toMatch(/●\s*2\b/)
+  await rig.clock.advance(4500)
+  await rig.settle()
+  await ui.redraw(paneProps(46))
+  expect(await f43Screen(ui)).toMatch(/●\s*0\b/)
+})
+
+test('Files F4.3: a6 the first walk of a root, and the first walk after switching roots, records nothing', F43_OPTS, async ($, on) => {
+  let mainExtra = false
+  const rig = f43Rig(on, {
+    process: argv => (argv.some(a => a.includes('mk-lane.py')) && argv.includes('list') ? f43Lane('/tmp/lane-1') : undefined),
+    listing: p => {
+      if (p === PROJECT_DIR) return [f43Entry('a.ts'), ...(mainExtra ? [f43Entry('a2.ts', NOW)] : [])]
+      if (p === '/tmp/lane-1') return [f43Entry('l.ts', NOW)]
+      return []
+    },
+  })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ ...F43_MOUNT, props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-files' })
+  for (let i = 0; i < 60 && !(await ui.find({ type: 'Button', key: 'files-root:slot-1' })); i++) {
+    await rig.clock.advance(0)
+    await ui.redraw(paneProps(46))
+  }
+  expect(rig.writes()).toBe(0)
+  await ui.press({ key: 'files-root:slot-1' })
+  await rig.settle()
+  await rig.clock.advance(1500)
+  await rig.settle()
+  await ui.redraw(paneProps(46))
+  expect(await ui.find({ text: /l\.ts/ })).toBeTruthy()
+  expect(rig.writes()).toBe(0)
+  mainExtra = true // main changes while the lane is shown
+  await ui.press({ key: 'files-root:main' })
+  await rig.settle()
+  await rig.clock.advance(1500)
+  await rig.settle()
+  await ui.redraw(paneProps(46))
+  expect(await ui.find({ text: /a2\.ts/ })).toBeTruthy()
+  expect(rig.writes()).toBe(0)
+})
+
+test('Files F4.3: a7 the pulse flag is Math.floor(filesNow / RAIN_MS) % 2 === 0 and flips after advance(1500)', F43_OPTS, async ($, on) => {
+  const rig = f43Rig(on, { startOnFiles: true, activity: [{ path: `${PROJECT_DIR}/a.ts`, kind: 'write', at: NOW }], listing: () => [f43Entry('a.ts')] })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ ...F43_MOUNT, props: paneProps(46) })
+  await rig.settle()
+  await ui.redraw(paneProps(46))
+  // the write icon on the row is dim when the pulse is off
+  const dimOf = async (): Promise<unknown> => (await ui.findAll({ type: 'Text' })).find(t => typeof t.props.dimColor === 'boolean' && t.text.trim() === '●')?.props.dimColor
+  expect(await dimOf()).toBe(!(Math.floor(NOW / 1500) % 2 === 0))
+  await rig.clock.advance(1500)
+  await rig.settle()
+  await ui.redraw(paneProps(46))
+  expect(await dimOf()).toBe(!(Math.floor((NOW + 1500) / 1500) % 2 === 0))
+})
+
+test('Files F4.3: a8 walk budget: a walk over 1000 ms of clock time makes the next tick start no walk, the tick after walks again, and no walk starts while one runs', F43_OPTS, async ($, on) => {
+  let rootCalls = 0
+  let walkMs = 0
+  let rig!: ReturnType<typeof f43Rig>
+  rig = f43Rig(on, {
+    startOnFiles: true,
+    listing: async p => {
+      if (p === PROJECT_DIR) rootCalls++
+      if (walkMs > 0) await rig.clock.sleep(walkMs) // fs.list runs for walkMs of clock time
+      return p === PROJECT_DIR ? [f43Entry('a.ts')] : []
+    },
+  })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ ...F43_MOUNT, props: paneProps(46) })
+  await rig.settle()
+  const base = rootCalls
+  const step = async (ms: number): Promise<void> => {
+    await rig.clock.advance(ms)
+    await rig.settle()
+    await ui.redraw(paneProps(46)) // keeps Files inside the 10 s hot window
+  }
+  // a walk that takes 1100 ms: tick 1500 starts it, the walk ends at 2600, tick 3000 skips, tick 4500 walks
+  walkMs = 1100
+  await step(1500)
+  expect(rootCalls).toBe(base + 1)
+  walkMs = 0
+  await step(1500)
+  expect(rootCalls).toBe(base + 1)
+  await step(1500)
+  expect(rootCalls).toBe(base + 2)
+  // a walk that takes 3200 ms: ticks 7500 and 9000 find it running; it ends at 9200, tick 10500 skips, tick 12000 walks
+  walkMs = 3200
+  await step(1500)
+  expect(rootCalls).toBe(base + 3)
+  walkMs = 0
+  await step(1500)
+  await step(1500)
+  expect(rootCalls).toBe(base + 3)
+  await step(1500)
+  expect(rootCalls).toBe(base + 3)
+  await step(1500)
+  expect(rootCalls).toBe(base + 4)
+})
+
+test('Files F4.3: a9 a tick whose walk finds no change writes only rain:tick: no files:v bump and no fileActivity write', F43_OPTS, async ($, on) => {
+  const rig = f43Rig(on, { startOnFiles: true, listing: p => (p === PROJECT_DIR ? [f43Entry('a.ts')] : []) })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ ...F43_MOUNT, props: paneProps(46, 'inline') })
+  await rig.settle()
+  await ui.redraw(paneProps(46, 'inline'))
+  const before = rig.vs()
+  const mark = rig.sets.length
+  await rig.clock.advance(1500)
+  await rig.settle()
+  const after = rig.sets.slice(mark)
+  expect(after.length).toBeGreaterThan(0)
+  expect(after.every(s => s.key === 'viewState')).toBe(true)
+  const changed = Object.keys(rig.vs()).filter(k => rig.vs()[k] !== before[k])
+  expect(changed).toEqual(['rain:tick'])
+})
+
+test('Files F4.3: a10 on a fixture shaped like this repo one tick lists at most 60 folders, none inside .omc, .matrixkoder or .matrixkoder-old-1, is not capped, and a newer .matrixkoder-status.json records no write', F43_OPTS, async ($, on) => {
+  const listed: string[] = []
+  let statusMtime = 1000
+  const others = Array.from({ length: 40 }, (_, i) => `d${i}`)
+  const rig = f43Rig(on, {
+    startOnFiles: true,
+    listing: p => {
+      listed.push(p)
+      if (p === PROJECT_DIR) {
+        return [
+          f43Entry('.matrixkoder', 0, 'dir'), f43Entry('.omc', 0, 'dir'), f43Entry('.matrixkoder-old-1', 0, 'dir'),
+          f43Entry('.matrixkoder-status.json', statusMtime), f43Entry('.matrixkoder-bus-cursor'),
+          ...others.map(n => f43Entry(n, 0, 'dir')),
+        ]
+      }
+      return Array.from({ length: 6 }, (_, i) => f43Entry(`f${i}.ts`))
+    },
+  })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ ...F43_MOUNT, props: paneProps(46) })
+  await rig.settle()
+  await ui.redraw(paneProps(46))
+  listed.length = 0
+  statusMtime = NOW
+  await rig.clock.advance(1500)
+  await rig.settle()
+  await ui.redraw(paneProps(46))
+  expect(listed.length).toBeGreaterThan(0)
+  expect(listed.length).toBeLessThanOrEqual(60)
+  expect(listed.filter(p => /\/(\.omc|\.matrixkoder|\.matrixkoder-old-1)(\/|$)/.test(p))).toEqual([])
+  expect(await ui.find({ text: /tree stopped at its limit/ })).toBeUndefined()
+  expect(rig.writes()).toBe(0)
 })
