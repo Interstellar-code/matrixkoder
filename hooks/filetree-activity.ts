@@ -63,12 +63,17 @@ export function liveActivity(
   return map
 }
 
-function onToolCall($: EngineInterface, e: any, next: (event: any) => any) {
+function onToolCall<E extends { tool: string; file_path?: string; notebook_path?: string }, R>(
+  $: EngineInterface,
+  e: E,
+  next: (event: E) => R,
+): R {
   try {
     const rawPath = e.tool === 'NotebookEdit' ? e.notebook_path : e.file_path
-    const path = typeof rawPath === 'string' ? rawPath : ''
-    const kind = e.tool === 'Read' ? 'read' : 'write'
-    void update($, fileActivityAtom, s => recordActivity(s, path, kind, Date.now())).catch(() => {})
+    if (typeof rawPath === 'string' && rawPath.startsWith('/')) {
+      const kind = e.tool === 'Read' ? 'read' : 'write'
+      void update($, fileActivityAtom, s => recordActivity(s, rawPath, kind, Date.now())).catch(() => {})
+    }
   } catch {}
   return next(e)
 }

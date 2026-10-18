@@ -137,7 +137,7 @@ test('Files F1.2: registerFileActivity registers Read as read, Edit and Write as
 })
 
 test('Files F1.2: every call reaches next with same input and unchanged result even with missing, relative or non-string path', async ($, on) => {
-  setupStateStore(on)
+  const { store } = setupStateStore(on)
   registerFileActivity(on)
 
   const receivedInputs: any[] = []
@@ -162,28 +162,61 @@ test('Files F1.2: every call reaches next with same input and unchanged result e
   expect(receivedInputs[0].tool).toBe('Read')
   expect(receivedInputs[1].file_path).toBe('relative/file.ts')
   expect(receivedInputs[2].file_path).toBe(12345)
+
+  // Verify the store remains empty (no activity recorded for missing, relative, or non-string paths)
+  expect(store.has('fileActivity')).toBe(false)
 })
 
 test('Files F1.2: state write is update without await and rejection swallowed so throwing update lets tool run', async ($, on) => {
+  let stateMode: 'pending' | 'reject' | 'throw' = 'pending'
+  let updateStarted = false
+  let nextCalled = false
+
   on('state.get', (_$, e, next) => {
     if (e.key === 'fileActivity') {
-      throw new Error('state.get exploded')
+      updateStarted = true
+      if (stateMode === 'pending') {
+        return new Promise(() => {}) // pending forever: never resolves
+      }
+      if (stateMode === 'reject') {
+        return Promise.reject(new Error('async update rejection'))
+      }
+      throw new Error('sync state.get throw')
     }
     return next(e)
   })
-  on('state.set', (_$, e, next) => {
-    if (e.key === 'fileActivity') {
-      throw new Error('state.set exploded')
-    }
-    return next(e)
+
+  on('tool.call', {}, () => {
+    nextCalled = true
+    return { result: { success: true } }
   })
   registerFileActivity(on)
 
-  on('tool.call', {}, () => ({ result: { success: true } }))
+  const timeout = (ms: number) =>
+    new Promise((_, rej) => (globalThis as any).setTimeout(() => rej(new Error('timed out: hook awaited update before calling next')), ms))
 
-  // A throwing update still lets the tool run without error
-  const res = await $.tool.call({ tool: 'Read', file_path: '/src/file.ts' } as any)
-  expect(res).toEqual({ result: { success: true } })
+  // 1. Pending update: hook must call next and settle without waiting for update
+  const resPending = await Promise.race([
+    $.tool.call({ tool: 'Read', file_path: '/src/pending.ts' } as any),
+    timeout(4000),
+  ])
+  expect(updateStarted).toBe(true)
+  expect(nextCalled).toBe(true)
+  expect(resPending).toEqual({ result: { success: true } })
+
+  // 2. Rejecting update: hook must swallow rejection, not throw or return a rejected promise
+  stateMode = 'reject'
+  nextCalled = false
+  const resReject = await $.tool.call({ tool: 'Write', file_path: '/src/reject.ts' } as any)
+  expect(nextCalled).toBe(true)
+  expect(resReject).toEqual({ result: { success: true } })
+
+  // 3. Synchronously throwing update: hook must swallow throw and let tool run
+  stateMode = 'throw'
+  nextCalled = false
+  const resThrow = await $.tool.call({ tool: 'Edit', file_path: '/src/throw.ts' } as any)
+  expect(nextCalled).toBe(true)
+  expect(resThrow).toEqual({ result: { success: true } })
 })
 
 test('Files F1.2: two calls recorded at once both end up in the store', async ($, on) => {

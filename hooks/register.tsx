@@ -19,5 +19,5 @@ export const register: Register = (on, options) => {
   registerTools(on, options)
   registerWake(on, options)
   registerWizard(on, options)
-  registerFileActivity(on)
+  registerFileActivity(on, options)
 }
