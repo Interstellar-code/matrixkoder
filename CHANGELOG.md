@@ -2,6 +2,18 @@
 
 All notable changes to this project. Format: Keep a Changelog; versions: SemVer.
 
+## [0.6.6] - 2026-10-19
+
+### Added
+- **todo:** Todo tab in the /mk pane, saved in the overview db (d3db94e)
+- **agents:** add neo, smith, trinity, switch and seraph agents (fe17609)
+
+### Fixed
+- **tests:** query the live tab marker as text in the dashboard helper (35fd030)
+- **tests:** update the usage, events, lanes, plan and dashboard tests to the live screens (f9d94db)
+- **tests:** update the dashboard tab, header and hotkey tests to the live tabs (dcdcc3c)
+- **tests:** update stale pane tests and make the db self-test pass (be96910)
+
 ## [0.6.5] - 2026-10-18
 
 ### Added
