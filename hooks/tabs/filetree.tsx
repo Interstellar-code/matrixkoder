@@ -334,31 +334,32 @@ export function FilesTab(
           }
         }
 
+        // a Button holds only strings and Text: the icon column and the row background sit outside it
         drawnRows.push(
-          Button({
-            key: row.key,
-            plain: true,
-            onPress: onRowPress,
-            children: [
-              <Box flexDirection="row" backgroundColor={rowBg}>
-                <Text color={isSelected ? FT.limeBar : undefined}>{leftBar}</Text>
-                <Text>{indentStr}</Text>
-                <Text color={FT.dim}>{caret}</Text>
-                <Text> </Text>
-                <Text color={nameColor} bold={isBold}>{clippedName}</Text>
-                {rightIconWidth > 0 && (
-                  <Box flexDirection="row" justifyContent="flex-end" flexGrow={1}>
-                    <Text
-                      color={row.icon === 'write' ? FT.write : FT.read}
-                      dimColor={row.icon === 'write' ? !view.pulse : false}
-                    >
-                      {`${iconSymbol}${iconCountStr}`.padStart(4)}
-                    </Text>
-                  </Box>
-                )}
-              </Box>,
-            ],
-          }),
+          <Box key={`files-line:${row.path}`} flexDirection="row" backgroundColor={rowBg}>
+            {Button({
+              key: row.key,
+              plain: true,
+              onPress: onRowPress,
+              children: [
+                <Text color={isSelected ? FT.limeBar : undefined}>{leftBar}</Text>,
+                <Text>{indentStr}</Text>,
+                <Text color={FT.dim}>{caret}</Text>,
+                <Text> </Text>,
+                <Text color={nameColor} bold={isBold}>{clippedName}</Text>,
+              ],
+            })}
+            {rightIconWidth > 0 && (
+              <Box flexDirection="row" justifyContent="flex-end" flexGrow={1}>
+                <Text
+                  color={row.icon === 'write' ? FT.write : FT.read}
+                  dimColor={row.icon === 'write' ? !view.pulse : false}
+                >
+                  {`${iconSymbol}${iconCountStr}`.padStart(4)}
+                </Text>
+              </Box>
+            )}
+          </Box>,
         )
       }
     }

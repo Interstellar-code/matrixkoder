@@ -42,11 +42,19 @@ const stubEls = {
     props: scalarProps(props),
     children: kids(props.children),
   }),
-  Button: (props: any): RenderElement => ({
-    type: 'Button',
-    props,
-    children: Array.isArray(props.children) ? (props.children as unknown[]).flatMap(c => Array.isArray(c) ? c : [c]) : [],
-  }) as unknown as RenderElement,
+  Button: (props: any): RenderElement => {
+    // the real engine lets a Button hold only strings and Text
+    for (const c of ([] as unknown[]).concat(props.children ?? []).flat()) {
+      if (typeof c !== 'string' && (c as { type?: string } | null)?.type !== 'Text') {
+        throw new Error(`JSX element <Button key="${props.key}"> holds strings and Text, not <${(c as { type?: string } | null)?.type ?? typeof c}>`)
+      }
+    }
+    return {
+      type: 'Button',
+      props,
+      children: Array.isArray(props.children) ? (props.children as unknown[]).flatMap(c => Array.isArray(c) ? c : [c]) : [],
+    } as unknown as RenderElement
+  },
   Input: (props: any): RenderElement => ({
     type: 'Input',
     props,
@@ -63,6 +71,11 @@ function nodesOf(n: unknown, type?: string): Node[] {
   }
   walk(n)
   return out
+}
+
+/** the row's line Box: it holds the row Button and the icon column beside it */
+function lineOf(tree: unknown, rowKey: string): Node {
+  return nodesOf(tree, 'Box').find(b => b.props?.key === `files-line:${rowKey.slice('files-row:'.length)}`)!
 }
 
 function textOf(n: unknown): string {
@@ -223,7 +236,7 @@ test('Files F3.1: folders are bold neon with caret, files in file text, hidden i
 
   // Indent: depth 0 has empty indent, depth 1 has 2 spaces, depth 2 has 4 spaces
   const depth2Row = view.rows.find(r => r.depth === 2)!
-  const rowBtn = nodesOf(tree, 'Button').find(b => b.props?.key === depth2Row.key)!
+  const rowBtn = lineOf(tree, depth2Row.key)
   const rowTexts = nodesOf(rowBtn, 'Text')
   expect(textOf(rowTexts[1])).toBe('    ')
 })
@@ -236,7 +249,7 @@ test('Files F3.1: written row has write tint and pulsing amber dot, read row has
 
   const mkdbRow = viewPulse.rows.find(r => r.path === '/repo/scripts/mkdb.py')!
   expect(mkdbRow.icon).toBe('write')
-  const mkdbBtn = nodesOf(treePulse, 'Button').find(b => b.props?.key === mkdbRow.key)!
+  const mkdbBtn = lineOf(treePulse, mkdbRow.key)
   const mkdbBox = nodesOf(mkdbBtn, 'Box')[0]!
   expect(mkdbBox.props?.backgroundColor).toBe(FT.writeRowTint)
 
@@ -247,14 +260,14 @@ test('Files F3.1: written row has write tint and pulsing amber dot, read row has
   // With pulse false: amber dot is dim
   const viewDim = filetreeFixtureView({ pulse: false, sel: '' })
   const treeDim = FilesTab(stubEls, viewDim, 46, createMockUi().ui)
-  const mkdbBtnDim = nodesOf(treeDim, 'Button').find(b => b.props?.key === mkdbRow.key)!
+  const mkdbBtnDim = lineOf(treeDim, mkdbRow.key)
   const mkdbIconDim = nodesOf(mkdbBtnDim, 'Text').find(t => textOf(t).includes('●'))!
   expect(mkdbIconDim.props?.dimColor).toBe(true)
 
   // 2. Read row has read tint and teal ring
   const guideRow = viewPulse.rows.find(r => r.path === '/repo/docs/guide.md')!
   expect(guideRow.icon).toBe('read')
-  const guideBtn = nodesOf(treePulse, 'Button').find(b => b.props?.key === guideRow.key)!
+  const guideBtn = lineOf(treePulse, guideRow.key)
   const guideBox = nodesOf(guideBtn, 'Box')[0]!
   expect(guideBox.props?.backgroundColor).toBe(FT.readRowTint)
   const guideIconText = nodesOf(guideBtn, 'Text').find(t => textOf(t).includes('◉'))!
@@ -278,7 +291,7 @@ test('Files F3.1: written row has write tint and pulsing amber dot, read row has
   ]
   const viewFolded = filetreeFixtureView({ rows: customRows, sel: '' })
   const treeFolded = FilesTab(stubEls, viewFolded, 46, createMockUi().ui)
-  const foldedBtn = nodesOf(treeFolded, 'Button').find(b => b.props?.key === 'files-row:/repo/folded-folder')!
+  const foldedBtn = lineOf(treeFolded, 'files-row:/repo/folded-folder')
   const foldedIcon = nodesOf(foldedBtn, 'Text').find(t => textOf(t).includes('●'))!
   expect(textOf(foldedIcon)).toContain('● 3')
 })
@@ -743,7 +756,7 @@ test('Files F3.1: selected row draws lime left bar on selected fill and selectio
   const tree = FilesTab(stubEls, view, 46, ui)
 
   // Selected row draws lime bar on selected fill
-  const selBtn = nodesOf(tree, 'Button').find(b => b.props?.key === selectedRow.key)!
+  const selBtn = lineOf(tree, selectedRow.key)
   const selBox = nodesOf(selBtn, 'Box')[0]!
   expect(selBox.props?.backgroundColor).toBe(FT.selectedRow)
   const barText = nodesOf(selBtn, 'Text').find(t => textOf(t).includes('▌'))!
