@@ -155,10 +155,11 @@ export function FilesTab(
     )
 
     // 2. Card header with counts, root path, search box and expand/collapse buttons
+    const innerCardW = Math.max(4, W - 4)
     const countText = `● ${view.nWrite} ◉ ${view.nRead}`
-    const leftLabelBudget = Math.max(4, W - countText.length - 4)
+    const leftLabelBudget = Math.max(4, innerCardW - countText.length - 1)
     const clippedRootLabel = clip(activeRoot.label, leftLabelBudget)
-    const clippedRootPath = clip(activeRoot.path, Math.max(4, W - 2))
+    const clippedRootPath = clip(activeRoot.path, innerCardW)
 
     let searchInputEl: RenderElement
     if ('Input' in els) {
@@ -181,7 +182,7 @@ export function FilesTab(
         },
       })
     } else {
-      searchInputEl = <Text dimColor={true}>{clip(view.q ? view.q : 's : search', W - 4)}</Text>
+      searchInputEl = <Text dimColor={true}>{clip(view.q ? view.q : 's : search', Math.max(4, innerCardW - 3))}</Text>
     }
 
     const card = (
@@ -230,10 +231,11 @@ export function FilesTab(
     )
 
     // 3. Tree rows
+    const innerTreeW = Math.max(4, W - 2)
     const drawnRows: RenderElement[] = []
     if (view.rows.length === 0) {
       drawnRows.push(
-        <Text key="files-no-matches" dimColor={true} color={FT.dim}>no file matches</Text>,
+        <Text key="files-no-matches" dimColor={true} color={FT.dim}>{clip('no file matches', innerTreeW)}</Text>,
       )
     } else {
       for (const row of view.rows) {
@@ -244,7 +246,7 @@ export function FilesTab(
         if (row.note === 'empty') {
           drawnRows.push(
             <Text key={row.key} dimColor={true} color={FT.dim}>
-              {clip(`${indentStr}  (empty)`, W)}
+              {clip(`${indentStr}  (empty)`, innerTreeW)}
             </Text>,
           )
           continue
@@ -252,7 +254,7 @@ export function FilesTab(
         if (row.note === 'unlisted') {
           drawnRows.push(
             <Text key={row.key} dimColor={true} color={FT.dim}>
-              {clip(`${indentStr}  (not listed)`, W)}
+              {clip(`${indentStr}  (not listed)`, innerTreeW)}
             </Text>,
           )
           continue
@@ -260,7 +262,7 @@ export function FilesTab(
         if (row.note === 'more') {
           drawnRows.push(
             <Text key={row.key} dimColor={true} color={FT.dim}>
-              {clip(`${indentStr}  ${row.count} more`, W)}
+              {clip(`${indentStr}  ${row.count} more`, innerTreeW)}
             </Text>,
           )
           continue
@@ -283,9 +285,9 @@ export function FilesTab(
         }
         const rightIconWidth = (iconSymbol + iconCountStr).length > 0 ? 4 : 0
 
-        // Calculate name budget so entire line fits inside W
+        // Calculate name budget so entire line fits inside innerTreeW (W - 2)
         const prefixWidth = 1 + row.depth * 2 + 1 + 1 // bar (1) + indent + caret (1) + space (1)
-        const nameBudget = Math.max(3, W - prefixWidth - rightIconWidth - 1)
+        const nameBudget = Math.max(3, innerTreeW - prefixWidth - rightIconWidth - (rightIconWidth > 0 ? 1 : 0))
         const clippedName = clip(displayName, nameBudget)
 
         // Text colour

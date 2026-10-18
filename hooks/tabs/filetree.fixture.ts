@@ -114,19 +114,24 @@ export function noGitFixtureView(): FilesView {
 
 /** Fixture with long names to test clipping at 46 and 36 columns */
 export function longNamesFixtureView(): FilesView {
+  const longRoot = '/a/very/long/path/that/exceeds/the/normal/column/width/for/testing/purposes'
+  const emptyFolder = `${longRoot}/an-empty-folder-with-a-very-long-name-indeed`
   const dirs = new Map<string, FsEntry[]>()
-  dirs.set('/a/very/long/path/that/exceeds/the/normal/column/width/for/testing/purposes', [
+  dirs.set(longRoot, [
     makeEntry('an-extremely-long-file-name-that-definitely-exceeds-thirty-six-columns-in-length.typescript', 'file'),
     makeEntry('a-long-folder-name-that-is-very-long-indeed', 'dir'),
+    makeEntry('an-empty-folder-with-a-very-long-name-indeed', 'dir'),
+    makeEntry('node_modules', 'dir'),
   ])
-  const longRoot = '/a/very/long/path/that/exceeds/the/normal/column/width/for/testing/purposes'
+  dirs.set(emptyFolder, [])
+  const openSet = new Set([emptyFolder, `${longRoot}/node_modules`])
   const walk: Walk = { dirs, capped: true, missing: false }
-  const rows = treeRows(walk, longRoot, new Set(), '', new Map())
+  const rows = treeRows(walk, longRoot, openSet, '', new Map())
   return {
     roots: [{ id: 'main', label: 'repo', path: longRoot }],
     root: 'main',
     rows,
-    dirs: [longRoot],
+    dirs: [longRoot, emptyFolder],
     nWrite: 14,
     nRead: 25,
     nFolders: 10,

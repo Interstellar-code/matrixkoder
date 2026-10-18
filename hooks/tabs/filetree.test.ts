@@ -382,15 +382,63 @@ test('Files F3.1: empty folder shows dim empty row, unlisted folder shows dim no
   expect(cappedText.props?.dimColor).toBe(true)
 })
 
+function boxOverhead(b: Node | undefined): number {
+  if (!b || !b.props) return 0
+  const border = b.props.borderStyle ? 2 : 0
+  const padX = Number(b.props.paddingX ?? 0) * 2
+  const padL = Number(b.props.paddingLeft ?? 0)
+  const padR = Number(b.props.paddingRight ?? 0)
+  return border + padX + padL + padR
+}
+
 test('Files F3.1: at 46 and 36 columns no line is wider than column count and long names end in ellipsis', () => {
   const longView = longNamesFixtureView()
   const { ui } = createMockUi()
 
   for (const cols of [46, 36]) {
     const tree = FilesTab(stubEls, longView, cols, ui)
-    for (const t of nodesOf(tree, 'Text')) {
-      const shown = textOf(t)
-      expect(shown.length, `text length at ${cols} cols: ${shown}`).toBeLessThanOrEqual(cols)
+
+    // 1. Card: border and padding plus line content
+    const cardBox = nodesOf(tree, 'Box').find(b => b.props?.borderColor === FT.cardBorder && b.props?.paddingX !== undefined)!
+    expect(cardBox).toBeDefined()
+    const cardOverhead = boxOverhead(cardBox) // borderStyle (2) + paddingX (2) = 4
+
+    // Top line in card (root label + counts)
+    const topRow = (cardBox.children ?? [])[0] as Node
+    const topTexts = nodesOf(topRow, 'Text')
+    const topLineWidth = topTexts.reduce((sum, t) => sum + textOf(t).length, 0) + cardOverhead
+    expect(topLineWidth, `card top line at ${cols} cols: ${topLineWidth}`).toBeLessThanOrEqual(cols)
+
+    // Path line in card
+    const cardPathText = nodesOf(cardBox, 'Text').find(t => textOf(t).includes('/a/very/long'))!
+    expect(cardPathText).toBeDefined()
+    const cardPathLineWidth = textOf(cardPathText).length + cardOverhead
+    expect(cardPathLineWidth, `card path line at ${cols} cols: ${cardPathLineWidth}`).toBeLessThanOrEqual(cols)
+
+    // 2. Tree Box: border plus each row line
+    const treeBox = nodesOf(tree, 'Box').find(b => b.props?.borderColor === FT.cardBorder && b.props?.paddingX === undefined)!
+    expect(treeBox).toBeDefined()
+    const treeOverhead = boxOverhead(treeBox) // borderStyle (2) = 2
+
+    // Path rows
+    const pathRowBtns = nodesOf(treeBox, 'Button')
+    expect(pathRowBtns.length).toBeGreaterThan(0)
+    for (const btn of pathRowBtns) {
+      const rowTexts = nodesOf(btn, 'Text')
+      const rowElementsWidth = rowTexts.reduce((sum, t) => sum + textOf(t).length, 0)
+      const totalRowLineWidth = rowElementsWidth + treeOverhead
+      expect(totalRowLineWidth, `path row at ${cols} cols: ${totalRowLineWidth}`).toBeLessThanOrEqual(cols)
+    }
+
+    // Note rows (empty, unlisted, etc.)
+    const noteTexts = nodesOf(treeBox, 'Text').filter(t => {
+      const k = String(t.props?.key ?? '')
+      return k.startsWith('files-empty:') || k.startsWith('files-unlisted:') || k.startsWith('files-more:') || k === 'files-no-matches'
+    })
+    expect(noteTexts.length).toBeGreaterThan(0)
+    for (const note of noteTexts) {
+      const noteLineWidth = textOf(note).length + treeOverhead
+      expect(noteLineWidth, `note row at ${cols} cols: ${noteLineWidth}`).toBeLessThanOrEqual(cols)
     }
 
     // Long file name ends in ellipsis
@@ -399,9 +447,7 @@ test('Files F3.1: at 46 and 36 columns no line is wider than column count and lo
     expect(textOf(longRowText).endsWith('…')).toBe(true)
 
     // Long path ends in ellipsis
-    const pathText = nodesOf(tree, 'Text').find(t => textOf(t).includes('/a/very/long'))
-    expect(pathText).toBeDefined()
-    expect(textOf(pathText).endsWith('…')).toBe(true)
+    expect(textOf(cardPathText).endsWith('…')).toBe(true)
   }
 })
 
