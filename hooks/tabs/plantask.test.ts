@@ -218,7 +218,7 @@ test('report render: the D1.5 panel at 80 cols, exactly as pasted (V1.5)', () =>
   const row = findPlanTask(planFromReply(detailFixture).phases, 'D1.5')
   expect(row, 'the D1.5 phase-rooted task').not.toBeNull()
   expect(picture(row!, 80)).toBe(`╭──────────────────────────────────────────────────────────────────────────────╮
-│ D1.5 · review                                                                │
+│ D1.5 · review ◖✕ close◗                                                      │
 │ Task fields survive the store mirror; dispatch records the route;            │
 │ mandatory-field check                                                        │
 │ lane L5                                                                      │
@@ -248,7 +248,7 @@ test('report render: the D1.5 panel at 36 cols, exactly as pasted (V1.5)', () =>
   const row = findPlanTask(planFromReply(detailFixture).phases, 'D1.5')
   expect(row, 'the D1.5 phase-rooted task').not.toBeNull()
   expect(picture(row!, 36)).toBe(`╭──────────────────────────────────╮
-│ D1.5 · review                    │
+│ D1.5 · review ◖✕ close◗          │
 │ Task fields survive the store    │
 │ mirror; dispatch records the     │
 │ route; mandatory-field check     │

@@ -186,7 +186,7 @@ test('Plans list: pressing a row sets plans:sel and plan:sub', () => {
   const drawn = PlansTab(stubEls, PLANS_FIXTURE, 80, ui)
   // the plan name is part of the press target, not only the one-cell ›
   const btn = nodesOf(drawn, 'Button').find(x => String(x.props?.key) === 'plans-detail-settings-plans-db')
-  expect(String(btn?.props?.label)).toBe('settings-plans-db ›')
+  expect(String(btn?.props?.label)).toBe('settings-plans-db')
   press(drawn, 'plans-detail-settings-plans-db')
   expect(ui.get('plans:sel')).toBe('settings-plans-db')
   expect(ui.get('plan:sub')).toBe('detail')

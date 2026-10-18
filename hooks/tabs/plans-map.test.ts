@@ -40,7 +40,7 @@ test('planFromReply maps the captured detail', () => {
   expect(view.phases?.length).toBe(detailReply.phases.length)
   expect(view.plan?.id).toBe(detailReply.id)
   expect(view.plan?.counts).toBe('32 tasks · 8 phases')
-  expect(view.footer).toEqual(['phases 8'])
+  expect(view.footer).toEqual(['8 phases · all folded by default', 'source project'])
   expect(view.phases?.[0]?.rows.length).toBe(3)
 })
 

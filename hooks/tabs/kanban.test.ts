@@ -22,6 +22,7 @@ import {
 } from './kanban'
 import type { RunFn } from './kanban'
 import { KANBAN_AFTER, KANBAN_COLUMNS, KANBAN_FIXTURE } from './kanban.fixture'
+import { ROLE } from './palette'
 
 const ATTENTION_STATUSES = ['blocked', 'stalled', 'quota', 'provider'] as const
 const ATTENTION_TASKS = ['P4', 'D5A', 'P6', 'F2'] as const
@@ -94,7 +95,7 @@ function columnSection(root: unknown, name: string): N | undefined {
 }
 
 const redBadges = (root: unknown): N[] =>
-  allOf(root, 'Text').filter(t => t.props.color === 'red' && text(t) === '! ')
+  allOf(root, 'Text').filter(t => t.props.color === ROLE.err.fg && text(t) === '! ')
 
 test('every C4 column is drawn from the fixture in order and columnOf is the col field', () => {
   const view = kanbanFixtureView()
@@ -130,13 +131,13 @@ test('attention cards carry a separate red "! " badge and isAttention is only th
     const task = key.split('/')[2] ?? ''
     const card = KANBAN_FIXTURE.find(c => c.task === task)
     expect(card, key).toBeTruthy()
-    const badges = kids(row).filter(k => k.type === 'Text' && k.props.color === 'red')
+    const badges = kids(row).filter(k => k.type === 'Text' && k.props.color === ROLE.err.fg)
     const attention = ATTENTION_TASKS.includes(task as (typeof ATTENTION_TASKS)[number])
     if (attention) {
       expect(badges.length, task).toBe(1)
       expect(text(badges[0]!)).toBe('! ')
       expect(text(badges[0]!)).not.toContain('\n')
-      const line = kids(row).filter(k => k.type === 'Text' && k.props.color !== 'red').map(text).join('')
+      const line = kids(row).filter(k => k.type === 'Text' && k.props.color !== ROLE.err.fg).map(text).join('')
       expect(line.startsWith('! '), `${task} badge folded into line`).toBe(false)
     } else {
       expect(badges.length, task).toBe(0)

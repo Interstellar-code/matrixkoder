@@ -49,7 +49,7 @@ archive file is written and fsynced and before the original is brought up to the
 approved bytes. The next approve converges: it finishes a missing archive, or is
 a no-op when the archive bytes already match. The original file is never removed.
 """
-import argparse, contextlib, datetime, fnmatch, glob, hashlib, importlib.util, json, os, re, shutil, stat, sys, tempfile, tomllib
+import argparse, contextlib, datetime, fnmatch, glob, hashlib, importlib.util, json, os, re, shutil, stat, sys, tempfile, tomllib, urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 _cspec = importlib.util.spec_from_file_location("mk_config", os.path.join(HERE, "mk-config.py"))
@@ -1839,7 +1839,7 @@ def _predelete_backup(con, plan_id, dest_dir, counts):
         if "1" in (os.environ.get("MK_DELETE_BACKUP_FAIL"), os.environ.get("MK_ARCHIVE_FAIL")):  # test seam: fails before any rename
             raise RuntimeError("injected archive backup failure")
         con.execute("VACUUM INTO ?", (tmp,))
-        chk = sqlite3.connect(tmp)
+        chk = sqlite3.connect("file:" + urllib.parse.quote(tmp) + "?mode=ro", uri=True)
         try:
             if chk.execute("PRAGMA quick_check").fetchone()[0] != "ok":
                 raise RuntimeError("backup failed quick_check")
@@ -3129,7 +3129,7 @@ def self_test():
         left = con.execute("SELECT run FROM tasks WHERE run IN ('imp7','imp7-b','imp7run','imp8run') ORDER BY run").fetchall()
         assert [r[0] for r in left] == ["imp7-b", "imp8run"], [r[0] for r in left]  # plan-id rows gone, prefix plan kept
         con.close()
-        chk = sqlite3.connect(out["backup"])
+        chk = sqlite3.connect("file:" + urllib.parse.quote(out["backup"]) + "?mode=ro", uri=True)
         assert chk.execute("SELECT COUNT(*) FROM runs WHERE plan='imp7'").fetchone()[0] == 1
         chk.close()
 

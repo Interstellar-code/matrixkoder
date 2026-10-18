@@ -77,7 +77,7 @@ test('file mode: no store draws today\'s Plan tab and no Segment row', () => {
   const ui = new Map<string, string>()
   const drawn = PlanPane(stubEls, {}, 80, { get: k => ui.get(k), set: (k, v) => { ui.set(k, v) } })
   const text = allText(drawn)
-  expect(text).toContain('MOCK · fixture data · not this run')
+  expect(text).toContain('no plans yet · approve a plan to see it here')
   expect(text).not.toContain('List')
   expect(nodesOf(drawn, 'Button').some(b => String(b.props?.key) === 'plan-sub-list')).toBe(false)
   // the fixture planView is what file mode mounts
@@ -137,7 +137,8 @@ test('store mode: the Kanban sub-tab renders PlanKanbanTab (four columns, no Kan
   expect(text).toContain('ON MAIN')
   expect(text).toContain('T1')
   expect(text).not.toContain('Needs you off')
-  expect(text).toContain('1 tasks · this plan only · source mk.db')
+  expect(text).toContain('1 tasks · same cards as k, this plan only')
+  expect(text).toContain('source project')
   // the active Segment carries the plan id (V1.4 spec 2)
   const labels = nodesOf(drawn, 'Button').map(b => String(b.props?.label ?? ''))
   expect(labels).toContain('Kanban · alpha')
@@ -171,14 +172,14 @@ test('under 59 cols the panel replaces the body', () => {
   const drawn = PlanPane(stubEls, panelView({ 'plan:task': 'T1' }), 36, { get: k => ui.get(k), set: (k, v) => { ui.set(k, v) } })
   const text = allText(drawn)
   expect(text).toContain('T1 · building')
-  expect(text).not.toContain('PHASES') // the body gave way to the panel
+  expect(text).toContain('PHASES') // the pop-up floats over the phases; the PHASES row stays
 })
 
 test('the panel also draws on the Kanban sub-tab (from the same detail reply)', () => {
   const ui = new Map<string, string>()
   const drawn = PlanPane(stubEls, panelView({ 'plan:sub': 'kanban', 'plan:task': 'T1' }), 80, { get: k => ui.get(k), set: (k, v) => { ui.set(k, v) } })
   const text = allText(drawn)
-  expect(text).toContain('BUILDING')
+  expect(text).not.toContain('BUILDING') // the panel takes the Kanban body
   expect(text).toContain('T1 · building')
 })
 
