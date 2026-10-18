@@ -1591,6 +1591,33 @@ def _desc_into(obj, src):
     return obj
 
 
+def _route_obj(v):
+    """A plan-file route as {agent, model, effort}: the file's "<agent> <model> [<effort>]" string
+    or an inline table; None when empty or not usable."""
+    if isinstance(v, str):
+        parts = v.split()
+        if len(parts) < 2:
+            return None
+        return dict(zip(("agent", "model", "effort"), parts[:3]))
+    if isinstance(v, dict):
+        got = {k: v[k] for k in ("agent", "model", "effort") if isinstance(v.get(k), str) and v[k].strip()}
+        return got or None
+    return None
+
+
+def _planned_into(obj, phase, item):
+    """The plan file's own builder route and reviewer, for a plan with no run yet: `planned_route`
+    is the item's route, else its phase's; `reviewer` is the phase's. Kept apart from `route`
+    (the route a run really took), so a draft never looks routed."""
+    route = _route_obj(item.get("route")) or _route_obj(phase.get("route"))
+    if route:
+        obj["planned_route"] = route
+    rev = phase.get("reviewer")
+    if isinstance(rev, str) and rev.strip():
+        obj["reviewer"] = rev.strip()
+    return obj
+
+
 def _phases_from_run(rows, header, run, con):
     """Phases with their tasks from one run's task rows, in row order (C5).
 
@@ -1675,8 +1702,8 @@ def _phases_from_header(header):
             if not isinstance(t, dict):
                 continue
             tid = str(t.get("id", ""))
-            task = _desc_into(_node(tid, t, pid, "task"), t)
-            task["subtasks"] = [_desc_into(_node(str(s.get("id", "")), s, tid, "subtask"), s)
+            task = _planned_into(_desc_into(_node(tid, t, pid, "task"), t), ph, t)
+            task["subtasks"] = [_planned_into(_desc_into(_node(str(s.get("id", "")), s, tid, "subtask"), s), ph, s)
                                 for s in t.get("subtasks") or [] if isinstance(s, dict)]
             tasks.append(task)
         out.append({"id": pid, "title": ph.get("title", ""), "wave": ph.get("wave"),
@@ -1685,6 +1712,7 @@ def _phases_from_header(header):
                     "owned": [], "route": None, "last_commit": None, "rounds": None,
                     "gates": None, "findings": None, "tasks": tasks})
         _desc_into(out[-1], ph)
+        _planned_into(out[-1], ph, ph)
     return out
 
 
@@ -4359,10 +4387,12 @@ def _plans_description(home):
     view: all four from header_json) and is omitted when empty or whitespace-only."""
     data = os.path.join(home, "plans-desc")
     hdr = json.dumps({"description": "Plan why", "phases": [
-        {"id": "ph1", "title": "P1", "description": "Phase why", "tasks": [
+        {"id": "ph1", "title": "P1", "description": "Phase why",
+         "route": "agy gemini-3.8-flash-high", "reviewer": "claude sonnet", "tasks": [
             {"id": "a1", "title": "A1", "description": "Task why",
              "subtasks": [{"id": "s1", "title": "S1", "description": "Sub why"}]},
-            {"id": "a2", "title": "A2", "description": "  ", "subtasks": []}]}]})
+            {"id": "a2", "title": "A2", "description": "  ", "route": "codex gpt-6.1-sol high",
+             "subtasks": []}]}]})
     bare = json.dumps({"phases": [{"id": "ph1", "title": "P1", "description": "",
                                    "tasks": [{"id": "a1", "title": "A1"}]}]})
     con = open_project(home, data_dir=data)
@@ -4405,9 +4435,19 @@ def _plans_description(home):
     _check(got["description"] == "Plan why" and ph["description"] == "Phase why"
            and t1["description"] == "Task why" and t1["subtasks"][0]["description"] == "Sub why"
            and "description" not in t2, f"description planned view {got}")
+    # the plan file's own route and reviewer: a task takes its phase's unless it names its own,
+    # and `route` (what a run really took) stays null so a draft never looks routed
+    want = {"agent": "agy", "model": "gemini-3.8-flash-high"}
+    _check(ph["planned_route"] == want and ph["reviewer"] == "claude sonnet"
+           and t1["planned_route"] == want and t1["subtasks"][0]["planned_route"] == want
+           and t2["planned_route"] == {"agent": "codex", "model": "gpt-6.1-sol", "effort": "high"}
+           and t2["reviewer"] == "claude sonnet" and ph["route"] is None and t1["route"] is None,
+           f"planned route view {got}")
     got = plans(home, data_dir=data, plan_id="bplan")  # nothing set anywhere: no key anywhere
     _check("description" not in got and "description" not in got["phases"][0]
            and "description" not in got["phases"][0]["tasks"][0], f"empty description kept {got}")
+    _check("planned_route" not in got["phases"][0] and "reviewer" not in got["phases"][0]
+           and "planned_route" not in got["phases"][0]["tasks"][0], f"empty route kept {got}")
     listed = {p["id"]: p for p in plans(home, data_dir=data)["plans"]}
     _check(listed["dplan"]["description"] == "Plan why" and "description" not in listed["bplan"],
            f"description plan list {listed}")

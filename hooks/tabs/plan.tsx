@@ -11,7 +11,7 @@ import type { ActionSpec } from './kit'
 import { laneStrip, pickBar } from './raster'
 import { PALETTE, ROLE } from './palette'
 import type { PaletteRole } from './palette'
-import { isDoneStatus, laneAgent } from './plans-map'
+import { isDoneStatus, laneAgent, routeText } from './plans-map'
 
 type Els = Elements[keyof Elements]
 
@@ -77,6 +77,9 @@ export type PlanTask = {
   readonly owned?: readonly string[]
   readonly deps?: readonly string[]
   readonly route?: PlanRoute | null
+  /** a draft plan's own builder route and reviewer, from the plan file (not a run's route) */
+  readonly plannedRoute?: PlanRoute | null
+  readonly reviewer?: string
   readonly type?: string
   readonly round?: number
   readonly verdict?: string
@@ -122,6 +125,9 @@ export type PlanPhase = {
   readonly owned?: readonly string[]
   readonly deps?: readonly string[]
   readonly route?: PlanRoute | null
+  /** a draft plan's own builder route and reviewer, from the plan file (not a run's route) */
+  readonly plannedRoute?: PlanRoute | null
+  readonly reviewer?: string
 }
 
 /** The tab's whole view: the header card plus the phases. */
@@ -415,6 +421,9 @@ function PhaseCard(els: Els, phase: PlanPhase, waveMates: readonly string[], W: 
         {!legacy && pauseButton(els, `plan-phase-pause-${phase.id}`, phase.status ?? '', state === 'building', act, 'phase', phase.id)}
       </Box>
       {expanded && phase.description != null && Describe(els, `plan-desc-${phase.id}`, phase.description, W - 2, 3)}
+      {expanded && !routed && (phase.plannedRoute != null || phase.reviewer != null) && (
+        <Text key={`plan-who-${phase.id}`} color={PALETTE.mut} wrap="truncate-end">{clip([phase.plannedRoute != null ? `builder ${routeText(phase.plannedRoute)}` : '', phase.reviewer != null ? `reviewer ${phase.reviewer}` : ''].filter(p => p !== '').join(' · '), W - 2)}</Text>
+      )}
       {strip}
       {expanded && !legacy && phase.rows.map((row, i) => TaskBlock(els, row, i === phase.rows.length - 1, W - 4, compact, ui, act))}
       {legacy && phase.rows.map(row => LegacyRow(els, row, W, compact, ui))}

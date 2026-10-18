@@ -514,3 +514,12 @@ test('wrapCap: an 8-col plan does not crash and still draws the header descripti
   expect(lines.every(l => l.length <= 4)).toBe(true)
   expect(lines[3]?.endsWith('…')).toBe(true)
 })
+
+test('an expanded draft phase names its builder and reviewer; a folded one does not', () => {
+  const view = { ...PLAN_REAL_FIXTURE, phases: (PLAN_REAL_FIXTURE.phases ?? []).map(phase => phase.id === 'S1'
+    ? { ...phase, plannedRoute: { agent: 'agy', model: 'gemini-3.8-flash-high' }, reviewer: 'claude sonnet' } : phase) }
+  const open = allText(PlanTab(stubEls, view, 80, new Map([['plan:phase:S1', '1']])))
+  expect(open).toContain('builder agy gemini-3.8-flash-high · reviewer claude sonnet')
+  expect(allText(PlanTab(stubEls, view, 80, new Map()))).not.toContain('builder agy')
+  expect(allText(PlanTab(stubEls, PLAN_REAL_FIXTURE, 80, new Map([['plan:phase:S1', '1']])))).not.toContain('builder')
+})

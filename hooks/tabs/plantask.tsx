@@ -12,6 +12,7 @@ import type { Elements, RenderElement } from 'claude-code'
 import { ActionButton, Card, Chip, BoxButton } from './kit'
 import { PALETTE, ROLE } from './palette'
 import { clip, planStatusGlyph, planStatusRole } from './plan'
+import { routeText } from './plans-map'
 import type { PlanPhase, PlanSub, PlanTask } from './plan'
 
 type Els = Elements[keyof Elements]
@@ -44,6 +45,8 @@ export function findPlanTask(phases: readonly PlanPhase[] | undefined, id: strin
         owned: phase.owned,
         deps: phase.deps,
         route: phase.route ?? null,
+        ...(phase.plannedRoute != null ? { plannedRoute: phase.plannedRoute } : {}),
+        ...(phase.reviewer != null ? { reviewer: phase.reviewer } : {}),
         subs: phase.rows,
       }
     }
@@ -122,6 +125,8 @@ export function PlanTaskPanel(els: Els, row: PlanTask, cols: number, onClose?: (
       {route?.agent != null && fieldRow(els, 'agent', route.agent)}
       {route?.model != null && fieldRow(els, 'model', route.model)}
       {route?.effort != null && fieldRow(els, 'effort', route.effort)}
+      {route == null && row.plannedRoute != null && fieldRow(els, 'planned agent', routeText(row.plannedRoute))}
+      {row.reviewer != null && fieldRow(els, 'reviewer', row.reviewer)}
       {row.updated != null && fieldRow(els, 'updated', row.updated)}
       {row.deps != null && row.deps.length > 0 && fieldRow(els, 'deps', row.deps.join(' '))}
       {owned.length > 0 && (

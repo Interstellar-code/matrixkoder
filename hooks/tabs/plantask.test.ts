@@ -332,3 +332,16 @@ test('findPlanTask keeps a phase description when the phase opens as a task', ()
   const none = planFromReply({ ok: true, id: 'p', phases: [{ id: 'D1.5', title: 'Phase', status: 'review', tasks: [] }] }).phases
   expect(findPlanTask(none, 'D1.5')).not.toHaveProperty('description')
 })
+
+test('a draft task shows its planned agent and reviewer; a routed one shows its real route instead', () => {
+  const draft: PlanTask = { id: 'F1.1', title: 'The store', status: 'planned', right: 'planned', subs: [],
+    plannedRoute: { agent: 'agy', model: 'gemini-3.8-flash-high' }, reviewer: 'claude sonnet' }
+  const text = allText(PlanTaskPanel(stubEls(), draft, 80))
+  expect(text).toContain('planned agent')
+  expect(text).toContain('agy gemini-3.8-flash-high')
+  expect(text).toContain('claude sonnet')
+  const routed = allText(PlanTaskPanel(stubEls(), { ...draft, route: { agent: 'opencode', model: 'glm' } }, 80))
+  expect(routed).not.toContain('planned agent')
+  expect(routed).toContain('opencode')
+  expect(allText(PlanTaskPanel(stubEls(), { ...draft, plannedRoute: undefined, reviewer: undefined }, 80))).not.toContain('reviewer')
+})

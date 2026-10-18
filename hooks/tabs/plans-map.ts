@@ -56,6 +56,8 @@ export function routeFields(raw: Record<string, unknown>): {
   owned?: readonly string[]
   deps?: readonly string[]
   route?: PlanRoute | null
+  plannedRoute?: PlanRoute | null
+  reviewer?: string
   /** F.1 contract: the derived risk (int 1-5), its critical flag, and the open
    *  reasons. All optional — an old row carries none of them. */
   risk?: number
@@ -72,6 +74,8 @@ export function routeFields(raw: Record<string, unknown>): {
     owned?: readonly string[]
     deps?: readonly string[]
     route?: PlanRoute | null
+    plannedRoute?: PlanRoute | null
+    reviewer?: string
     risk?: number
     critical?: boolean
     openReasons?: readonly { readonly kind: string; readonly points: number; readonly source: string; readonly opened: string }[]
@@ -94,6 +98,10 @@ export function routeFields(raw: Record<string, unknown>): {
   if (deps.length > 0) out.deps = deps
   const route = routeOf(raw.route)
   if (route != null) out.route = route
+  const plannedRoute = routeOf(raw.planned_route)
+  if (plannedRoute != null) out.plannedRoute = plannedRoute
+  const reviewer = descOf(raw.reviewer)
+  if (reviewer != null) out.reviewer = reviewer
   if (typeof raw.risk === 'number' && Number.isInteger(raw.risk) && raw.risk >= 1 && raw.risk <= 5) out.risk = raw.risk
   if (raw.critical === true) out.critical = true
   if (Array.isArray(raw.open_reasons)) {
@@ -104,6 +112,10 @@ export function routeFields(raw: Record<string, unknown>): {
   }
   return out
 }
+
+/** A route as the words a person reads: `agy gemini-3.8-flash-high`. */
+export const routeText = (route: PlanRoute): string =>
+  [route.agent, route.model, route.effort].filter((p): p is string => p != null && p !== '').join(' ')
 
 /** V1.5: the lane·agent tag a task row and a Kanban card show — `L<slot> ·
  *  <agent> <model's last path segment>` (e.g. `L3 · opencode glm-5.3`). The

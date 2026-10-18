@@ -389,6 +389,22 @@ test('description maps at plan, phase, task and subtask level; blank and non-str
   }
 })
 
+test('planned_route and reviewer map onto phase and task; route stays unset', () => {
+  const view = planFromReply({
+    ok: true, id: 'p', title: 'T', status: 'draft',
+    phases: [{ id: 'P1', title: 'Phase', status: 'planned', planned_route: { agent: 'agy', model: 'gemini-3.8-flash-high' }, reviewer: 'claude sonnet',
+      route: null, tasks: [{ id: 'P1.1', title: 'Task', status: 'planned', planned_route: { agent: 'agy', model: 'gemini-3.8-flash-high' }, reviewer: 'claude sonnet', route: null, subtasks: [] }] },
+    { id: 'P2', title: 'Bare', status: 'planned', planned_route: {}, reviewer: '  ', tasks: [] }],
+  })
+  expect(view.phases?.[0]?.plannedRoute).toEqual({ agent: 'agy', model: 'gemini-3.8-flash-high' })
+  expect(view.phases?.[0]?.reviewer).toBe('claude sonnet')
+  expect(view.phases?.[0]?.rows[0]?.plannedRoute?.agent).toBe('agy')
+  expect(view.phases?.[0]?.rows[0]?.reviewer).toBe('claude sonnet')
+  expect(view.phases?.[0]?.rows[0]).not.toHaveProperty('route')
+  expect(view.phases?.[1]).not.toHaveProperty('plannedRoute')
+  expect(view.phases?.[1]).not.toHaveProperty('reviewer')
+})
+
 test('the captured detail carries the fixture descriptions', () => {
   const view = planFromReply(detail)
   expect(view.phases?.[0]?.description).toContain('throwaway home folder')
