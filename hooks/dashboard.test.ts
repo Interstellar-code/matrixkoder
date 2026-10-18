@@ -5,8 +5,8 @@ import { test, expect } from 'claude-code/testing'
 import type { On, ConfigRow } from 'claude-code'
 import { snapshotCount, DATA_DIR, NOW, PROJECT_DIR, RUN_PATH, RUNS_INDEX, USAGE_PATH, agentOf, agentsOf, mockFs, mockWorld, paneProps, sessionStart, sessionStartIn, setRun, setUsage, tasksOf, worldFiles, worldFixtures } from './testkit'
 import type { Files, MockWorld } from './testkit'
-import { parseYamlAgents } from './data'
-import { footerParts, liveOverviewView, modelShort, openWaiting, planActionPatch, runPlanAction, taskNote, usageShorts, waitingPane, waitingPaneView } from './dashboard'
+import { PANE_ID, parseYamlAgents } from './data'
+import { footerParts, liveOverviewView, modelShort, openWaiting, planActionPatch, resolveMainCheckout, runPlanAction, taskNote, usageShorts, waitingPane, waitingPaneView, debugLastFocus, debugFocusErr, debugLastPressed } from './dashboard'
 import type { MkSnapshot } from '../types'
 import { mockTabCounts, waitingCount } from './tabs/header'
 import { RUN_SNAPSHOT } from './fixtures/run-snapshot'
@@ -720,6 +720,7 @@ const TAB_BUTTONS = [
   { key: 'dash-tab-lanes', name: 'Lanes' },
   { key: 'dash-tab-plan', name: 'Plan' },
   { key: 'dash-tab-usage', name: 'Usage' },
+  { key: 'dash-tab-files', name: 'Files' },
   { key: 'dash-tab-events', name: 'Events' },
   { key: 'dash-tab-waiting', name: 'Waiting' },
   { key: 'dash-tab-kanban', name: 'Kanban' },
@@ -741,7 +742,7 @@ test('every tab hotkey switches to that tab’s MOCK row', { plugins: [worldFixt
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
-  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban')) {
+  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban' && t.key !== 'dash-tab-files')) {
     await ui.press({ key })
     expect(await ui.find(mockRow()), `${name} MOCK row`).toBeTruthy()
   }
@@ -758,7 +759,7 @@ test('at 36 cols the tab bar drops to short labels and every tab still renders',
     expect(await ui.find({ type: 'Button', text: name }), `${name} wide label dropped`).toBeUndefined()
   }
   expect(await ui.findAll({ type: 'Button' })).toHaveLength(TAB_BUTTONS.length + 1) // the bar still draws every tab
-  for (const { key } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban')) {
+  for (const { key } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban' && t.key !== 'dash-tab-files')) {
     await ui.press({ key })
     expect(await ui.find(mockRow()), `${key} renders narrow`).toBeTruthy()
   }
@@ -786,7 +787,7 @@ const tabLabels = async (ui: { findAll: (q: { type: string }) => Promise<{ props
     .map(b => String(b.props.label))
 
 test('the mock tab counts read the fixtures: lanes, plan done/total, waiting only when open', async () => {
-  expect(mockTabCounts()).toEqual({ overview: '', lanes: '4', plan: '3/8', usage: '', events: '', waiting: '!1', kanban: '', settings: '' })
+  expect(mockTabCounts()).toEqual({ overview: '', lanes: '4', plan: '3/8', usage: '', files: '', events: '', waiting: '!1', kanban: '', settings: '' })
   expect(waitingCount(0)).toBe('') // LOW: a fixture with no open decision shows no count, never `!0`
   expect(waitingCount(2)).toBe('!2')
 })
@@ -808,7 +809,7 @@ test('every mock tab shows the fixture run header: name, stage chip, MOCK marker
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
-  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban')) {
+  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban' && t.key !== 'dash-tab-files')) {
     await ui.press({ key })
     expect(await ui.find({ text: 'MATRIXKODER' }), `${name} shared brand header`).toBeTruthy()
     expect(await ui.find({ text: /ORCHESTRATOR/ }), `${name} mode chip`).toBeTruthy()
@@ -847,7 +848,7 @@ test('F0: every tab Button carries its keyboard hotkey — o l p u e w k 9, at 3
   for (const cols of [46, 36] as const) {
     await ui.redraw(paneProps(cols))
     const buttons = await ui.findAll({ type: 'Button' })
-    expect(buttons.map(b => b.props.hotkey), `hotkeys at ${cols}`).toEqual(['o', 'l', 'p', 'u', 'e', 'w', 'k', '9'])
+    expect(buttons.map(b => b.props.hotkey), `hotkeys at ${cols}`).toEqual(['o', 'l', 'p', 'u', 'f', 'e', 'w', 'k', '9'])
     for (const b of buttons) {
       // an inactive tab's label is its count alone (or the `·` placeholder), so
       // a plain Button's `h: label` drawing never repeats the tab's own letter
@@ -860,7 +861,7 @@ test('F0: every tab Button carries its keyboard hotkey — o l p u e w k 9, at 3
   }
   // the press-by-key switch loop stands
   // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
-  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban')) {
+  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban' && t.key !== 'dash-tab-files')) {
     await ui.redraw(paneProps(46))
     await ui.press({ key })
     expect(await ui.find(mockRow()), `${name} MOCK row`).toBeTruthy()
@@ -1067,7 +1068,7 @@ test('V1.4: a full-width rule of the palette line colour sits directly under the
     expect(wrap?.kids, `bar then rule at ${cols}`).toHaveLength(2)
     const bar = nodesOf(wrap?.kids[0], 'Button')
     expect(bar.map(b => String(b.props.key)), `the bar is the first child at ${cols}`)
-      .toEqual(['dash-tab-overview', 'dash-tab-lanes', 'dash-tab-plan', 'dash-tab-usage', 'dash-tab-events', 'dash-tab-waiting', 'dash-tab-kanban', 'dash-tab-settings'])
+      .toEqual(['dash-tab-overview', 'dash-tab-lanes', 'dash-tab-plan', 'dash-tab-usage', 'dash-tab-files', 'dash-tab-events', 'dash-tab-waiting', 'dash-tab-kanban', 'dash-tab-settings'])
     // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
     for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings')) {
       await ui.press({ key })
@@ -1097,7 +1098,7 @@ test('C12: every tab call receives the ui handle — all six tabs act on it, not
   // the three-argument tabs (lanes, usage, waiting, events) take the extra
   // argument through the pane's widened call and still render their fixture
   // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
-  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban')) {
+  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban' && t.key !== 'dash-tab-files')) {
     await ui.press({ key })
     expect(await ui.find(mockRow()), `${name} renders with the ui argument`).toBeTruthy()
   }
@@ -2311,4 +2312,316 @@ test('planActionPatch: a missing plans:dir spawns nothing and shows an error', a
 test('planActionPatch: a thrown spawn becomes the error line', async () => {
   const run = async (): Promise<{ exitCode: number; stdout: string; stderr: string }> => { throw new Error('spawn failed') }
   expect((await planActionPatch(run, '/r', { 'plans:dir': '/d' }, 'archive', 'p1', 7))['plans:error']).toBe('archive p1: spawn failed')
+})
+
+test('Files F4.1: the tab bar order is o l p u f e w k 9 and pressing f opens Files from Overview, Lanes, Plan, Usage, Events and Kanban', { timeoutMs: 15000, plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  const buttons = (await ui.findAll({ type: 'Button' })).filter(b => String(b.props.key).startsWith('dash-tab-'))
+  expect(buttons.map(b => b.props.hotkey)).toEqual(['o', 'l', 'p', 'u', 'f', 'e', 'w', 'k', '9'])
+  const fromTabs = ['dash-tab-overview', 'dash-tab-lanes', 'dash-tab-plan', 'dash-tab-usage', 'dash-tab-events', 'dash-tab-kanban'] as const
+  for (const tabKey of fromTabs) {
+    await ui.press({ key: tabKey })
+    await ui.press({ key: 'dash-tab-files' })
+    const filesBtn = await ui.find({ type: 'Button', key: 'dash-tab-files' })
+    expect(filesBtn).toBeDefined()
+    expect(filesBtn?.props.label).toBe('Files')
+  }
+})
+
+test('Files F4.1: hiddenTabs set to files hides the tab', { timeoutMs: 15000, plugins: [worldFixtures], options: { hiddenTabs: 'files' } }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  const keys = (await ui.findAll({ type: 'Button' })).map(b => String(b.props.key))
+  expect(keys).not.toContain('dash-tab-files')
+})
+
+test('Files F4.1: hiddenTabs set to Files hides the tab (capitalized)', { timeoutMs: 15000, plugins: [worldFixtures], options: { hiddenTabs: 'Files' } }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  const keys = (await ui.findAll({ type: 'Button' })).map(b => String(b.props.key))
+  expect(keys).not.toContain('dash-tab-files')
+})
+
+test('Files F4.2: main checkout: if <cwd>/.git is a file, parseGitdir, commondir, mainCheckout give the path, else cwd', async () => {
+  const cwd1 = '/worktree/lane-1'
+  const files1: Record<string, string> = {
+    '/worktree/lane-1/.git': 'gitdir: /main/repo/.git/worktrees/lane-1\n',
+    '/main/repo/.git/worktrees/lane-1/commondir': '../..\n',
+  }
+  const mockEngine1 = {
+    fs: {
+      stat: async (p: string) => ({ kind: p in files1 ? 'file' : 'dir' }),
+      read: async (p: string) => files1[p] ?? '',
+    },
+  }
+  const res1 = await resolveMainCheckout(mockEngine1, cwd1)
+  expect(res1).toBe('/main/repo')
+
+  const cwd2 = '/plain/repo'
+  const mockEngine2 = {
+    fs: {
+      stat: async (_p: string) => ({ kind: 'dir' }),
+      read: async (_p: string) => '',
+    },
+  }
+  const res2 = await resolveMainCheckout(mockEngine2, cwd2)
+  expect(res2).toBe(cwd2)
+
+  const cwd3 = '/no/git'
+  const mockEngine3 = {
+    fs: {
+      stat: async (_p: string) => { throw new Error('ENOENT') },
+      read: async (_p: string) => '',
+    },
+  }
+  const res3 = await resolveMainCheckout(mockEngine3, cwd3)
+  expect(res3).toBe(cwd3)
+})
+
+test('Files F4.2: a render on Files with no cache for the chosen root starts walkRoot, including opening straight from saved dashTab', { timeoutMs: 15000, plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  const clock = mockWorld(on)
+  on('state.get', (_$, e, next) => {
+    if (e.key === 'dashTab') {
+      return { value: { value: 'files', version: 1 } }
+    }
+    return next(e)
+  })
+  const walked: string[] = []
+  on('fs.list', (_$, e) => {
+    walked.push(e.path)
+    return { value: [{ name: 'file1.txt', kind: 'file', size: 10, mtimeMs: 1000, isLink: false }] }
+  })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  for (let i = 0; i < 10; i++) await clock.advance(0)
+  await ui.redraw(paneProps(46))
+  expect(walked.length).toBeGreaterThan(0)
+  expect(await ui.find({ text: /file1\.txt/ })).toBeTruthy()
+})
+
+test('Files F4.2: walk result lives in module Map, files:v bumped after change or first walk', { timeoutMs: 15000, plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  const clock = mockWorld(on)
+  let latestViewState: Record<string, string> = {}
+  on('state.set', (_$, e, next) => {
+    if (e.key === 'viewState' && e.value) {
+      latestViewState = e.value as Record<string, string>
+    }
+    return next(e)
+  })
+  on('fs.list', (_$, e) => {
+    return { value: [{ name: 'hello.ts', kind: 'file', size: 10, mtimeMs: 1000, isLink: false }] }
+  })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-files' })
+  for (let i = 0; i < 10; i++) await clock.advance(0)
+  await ui.redraw(paneProps(46))
+  expect(await ui.find({ text: /hello\.ts/ })).toBeTruthy()
+  expect(Number(latestViewState['files:v'] ?? '0')).toBeGreaterThan(0)
+  expect(latestViewState['files:walk']).toBeUndefined()
+  expect(latestViewState['files:tree']).toBeUndefined()
+})
+
+test('Files F4.2: walk uses SCAN_SKIP and .matrixkoder- prefix only, expand and search need no load', { timeoutMs: 15000, plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  const clock = mockWorld(on)
+  let listCalls = 0
+  on('fs.list', (_$, e) => {
+    listCalls++
+    if (e.path.endsWith('/src')) {
+      return { value: [{ name: 'main.ts', kind: 'file', size: 100, mtimeMs: 1000, isLink: false }] }
+    }
+    return {
+      value: [
+        { name: 'src', kind: 'dir', size: 0, mtimeMs: 0, isLink: false },
+        { name: '.git', kind: 'dir', size: 0, mtimeMs: 0, isLink: false },
+        { name: '.omc', kind: 'dir', size: 0, mtimeMs: 0, isLink: false },
+        { name: '.matrixkoder-status.json', kind: 'file', size: 0, mtimeMs: 1000, isLink: false },
+      ],
+    }
+  })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-files' })
+  for (let i = 0; i < 10; i++) await clock.advance(0)
+  await ui.redraw(paneProps(46))
+  const initialCalls = listCalls
+  await ui.press({ key: 'files-expand' })
+  expect(listCalls).toBe(initialCalls)
+  await ui.input({ key: 'files-q', text: 'main' })
+  expect(listCalls).toBe(initialCalls)
+})
+
+test('Files F4.2: lane slots reload every 30s of filesNow without touching Date.now', { timeoutMs: 15000, plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  let laneSlotCalls = 0
+  const clock = mockWorld(on, {
+    process: argv => {
+      if (argv.some(a => a.includes('mk-lane.py')) && argv.includes('list')) {
+        laneSlotCalls++
+        return { value: { exitCode: 0, stdout: JSON.stringify({ ok: true, slots: [] }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      }
+      return undefined
+    },
+  })
+  on('fs.list', (_$, e) => ({ value: [] }))
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-files' })
+  for (let i = 0; i < 10; i++) await clock.advance(0)
+  expect(laneSlotCalls).toBe(1)
+
+  await clock.advance(29_000)
+  await ui.redraw(paneProps(46))
+  expect(laneSlotCalls).toBe(1)
+
+  await clock.advance(2_000)
+  await ui.redraw(paneProps(46))
+  for (let i = 0; i < 10; i++) await clock.advance(0)
+  expect(laneSlotCalls).toBe(2)
+})
+
+test('Files F4.2: render reads fileActivity only when dashTab is files', { timeoutMs: 15000, plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  let actReadCount = 0
+  on('state.get', (_$, e, next) => {
+    if (e.key === 'fileActivity') {
+      actReadCount++
+      return { value: { value: [{ path: `${PROJECT_DIR}/test.ts`, kind: 'write', at: NOW }], version: 1 } }
+    }
+    return next(e)
+  })
+  on('fs.list', (_$, e) => ({ value: [{ name: 'test.ts', kind: 'file', size: 10, mtimeMs: 1000, isLink: false }] }))
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  expect(actReadCount).toBe(0)
+
+  await ui.press({ key: 'dash-tab-files' })
+  expect(actReadCount).toBeGreaterThan(0)
+})
+
+test('Files F4.2: missing lane root falls back to main checkout with note', { timeoutMs: 15000, plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  let processCalls = 0
+  const clock = mockWorld(on, {
+    process: argv => {
+      if (argv.some(a => a.includes('mk-lane.py')) && argv.includes('list')) {
+        processCalls++
+        return { value: { exitCode: 0, stdout: JSON.stringify({ ok: true, slots: [{ slot: 1, path: '/missing/lane-1', task: 'P4' }] }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      }
+      return undefined
+    },
+  })
+  on('fs.list', (_$, e) => {
+    if (e.path.startsWith('/missing')) {
+      throw new Error('ENOENT')
+    }
+    return { value: [{ name: 'main-repo-file.ts', kind: 'file', size: 10, mtimeMs: 1000, isLink: false }] }
+  })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-files' })
+  for (let i = 0; i < 60; i++) {
+    await clock.advance(0)
+    await ui.redraw(paneProps(46))
+    const btn = (await ui.findAll({ type: 'Button' })).find(b => b.props.key === 'files-root:slot-1')
+    if (btn) break
+  }
+  const noteNode = await ui.find({ key: 'files-view-note' })
+  expect(noteNode?.props?.children).toBe('something')
+  await ui.press({ key: 'files-root:slot-1' })
+  for (let i = 0; i < 60 && !(await ui.find({ text: /missing root, fallback to repo/ })); i++) {
+    await clock.advance(0)
+    await ui.redraw(paneProps(46))
+  }
+  expect(await ui.find({ text: /missing root, fallback to repo/ })).toBeTruthy()
+  expect(await ui.find({ text: /main-repo-file\.ts/ })).toBeTruthy()
+})
+
+test('Files F4.2: fs.list rejecting everywhere still draws tab bar with note', { timeoutMs: 15000, plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  const clock = mockWorld(on)
+  on('fs.list', () => {
+    throw new Error('EPERM')
+  })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-files' })
+  for (let i = 0; i < 10; i++) await clock.advance(0)
+  await ui.redraw(paneProps(46))
+  const tabButtons = await ui.findAll({ type: 'Button' })
+  const keys = tabButtons.map(b => String(b.props.key))
+  expect(keys).toContain('dash-tab-overview')
+  expect(keys).toContain('dash-tab-files')
+  expect(await ui.find({ text: /missing root/ })).toBeTruthy()
+})
+
+test('Files F4.2: ui.reveal and ui.focus wired to engine, pressing s calls focus files-q', { timeoutMs: 15000, plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  let focusCalledWith: unknown = null
+  on('ui.focus', (_$, e) => {
+    focusCalledWith = e
+    return {}
+  })
+  const clock = mockWorld(on)
+  on('fs.list', () => ({ value: [{ name: 'test.ts', kind: 'file', size: 10, mtimeMs: 1000, isLink: false }] }))
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: { ...paneProps(46), isFocused: true } })
+  await ui.press({ key: 'dash-tab-files' })
+  for (let i = 0; i < 10; i++) await clock.advance(0)
+  await ui.redraw({ ...paneProps(46), isFocused: true })
+  await ui.press({ key: 'files-s' })
+  for (let i = 0; i < 10; i++) await clock.advance(0)
+  expect({ focusCalledWith, debugLastFocus, debugFocusErr, debugLastPressed }).toEqual({ focusCalledWith: { requestId: PANE_ID, key: 'files-q' }, debugLastFocus: 'files-q', debugFocusErr: null, debugLastPressed: 'files-s' })
+})
+
+test('Files F4.2: Files wiring never writes settings:focus', { timeoutMs: 15000, plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  let shouldReject = false
+  on('ui.focus', () => {
+    if (shouldReject) throw new Error('focus refused')
+    return { deny: 'denied' }
+  })
+  on('fs.list', () => ({
+    value: [
+      { name: 'a.ts', kind: 'file', size: 10, mtimeMs: 1000, isLink: false },
+      { name: 'b.ts', kind: 'file', size: 10, mtimeMs: 1000, isLink: false },
+    ],
+  }))
+  let latestViewState: Record<string, string> = {}
+  on('state.set', (_$, e, next) => {
+    if (e.key === 'viewState' && e.value) {
+      latestViewState = e.value as Record<string, string>
+    }
+    return next(e)
+  })
+  const clock = mockWorld(on)
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: { ...paneProps(46), isFocused: true } })
+  await ui.press({ key: 'dash-tab-files' })
+  for (let i = 0; i < 10; i++) await clock.advance(0)
+  await ui.redraw({ ...paneProps(46), isFocused: true })
+
+  await ui.press({ key: 'files-s' })
+  for (let i = 0; i < 10; i++) await clock.advance(0)
+  expect(latestViewState['settings:focus'] ?? '').toBe('')
+
+  shouldReject = true
+  await ui.press({ key: 'files-s' })
+  for (let i = 0; i < 10; i++) await clock.advance(0)
+  expect(latestViewState['settings:focus'] ?? '').toBe('')
+
+  await ui.press({ key: 'files-key-j' })
+  for (let i = 0; i < 10; i++) await clock.advance(0)
+  expect(latestViewState['files:sel']).toBeDefined()
 })
