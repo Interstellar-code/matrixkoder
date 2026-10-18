@@ -2092,6 +2092,9 @@ test('a slow pending read stays one in flight across four ticks', { plugins: [wo
   await clock.advance(5000)
   for (let j = 0; j < 5; j++) await clock.advance(0)
   expect(started, 'the next tick starts exactly one new read').toBe(2)
+  // settle the second read too, so no promise outlives the test
+  held[1]?.({ value: { exitCode: 0, stdout: '{"ok":true,"run":"*","pending":[]}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+  for (let j = 0; j < 10; j++) await clock.advance(0)
 })
 
 // ── L7.2: the Plan list from the root overview, and k across linked projects ──
