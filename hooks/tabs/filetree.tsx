@@ -109,17 +109,18 @@ export function FilesTab(
 
     const handleH = () => {
       if (!selectedRow) return
-      if (selectedRow.dir) {
+      if (selectedRow.dir && selectedRow.open) {
         const currentOpen = parseOpenList(view, ui)
         const next = currentOpen.filter(p => p !== selectedRow.path)
         ui.set('files:open', JSON.stringify(next))
-      } else {
-        const parentPath = getParent(selectedRow.path)
-        const parentRow = pathRows.find(r => r.dir && r.path === parentPath)
-        if (parentRow) {
-          ui.set('files:sel', parentRow.key)
-          ui.reveal?.(parentRow.key)
-        }
+        return
+      }
+      // a file or an already folded folder: step up to the parent folder (a depth-0 row has none)
+      const parentPath = getParent(selectedRow.path)
+      const parentRow = pathRows.find(r => r.dir && r.path === parentPath)
+      if (parentRow) {
+        ui.set('files:sel', parentRow.key)
+        ui.reveal?.(parentRow.key)
       }
     }
 
@@ -166,7 +167,7 @@ export function FilesTab(
       const { Input } = els as unknown as { Input: (props: Record<string, unknown>) => RenderElement }
       searchInputEl = Input({
         key: 'files-q',
-        placeholder: 's : search',
+        placeholder: 'filter files',
         value: view.q ?? '',
         onInput: (v: string) => ui.set('files:q', v),
         onSubmit: (v: string) => {
@@ -182,7 +183,7 @@ export function FilesTab(
         },
       })
     } else {
-      searchInputEl = <Text dimColor={true}>{clip(view.q ? view.q : 's : search', Math.max(4, innerCardW - 3))}</Text>
+      searchInputEl = <Text dimColor={true}>{clip(view.q ? view.q : 'filter files', Math.max(4, innerCardW - 3))}</Text>
     }
 
     const card = (
@@ -209,7 +210,7 @@ export function FilesTab(
             key: 'files-s',
             hotkey: 's',
             plain: true,
-            label: 's',
+            label: 'search',
             onPress: () => ui.focus?.('files-q'),
           })}
         </Box>
@@ -235,7 +236,7 @@ export function FilesTab(
     const drawnRows: RenderElement[] = []
     if (view.rows.length === 0) {
       drawnRows.push(
-        <Text key="files-no-matches" dimColor={true} color={FT.dim}>{clip('no file matches', innerTreeW)}</Text>,
+        <Text key="files-no-matches" dimColor={true} color={FT.dim}>{clip(view.q ? `no file matches “${view.q}”` : 'no file matches', innerTreeW)}</Text>,
       )
     } else {
       for (const row of view.rows) {
@@ -246,7 +247,7 @@ export function FilesTab(
         if (row.note === 'empty') {
           drawnRows.push(
             <Text key={row.key} dimColor={true} color={FT.dim}>
-              {clip(`${indentStr}  (empty)`, innerTreeW)}
+              {clip(` ${indentStr}  (empty)`, innerTreeW)}
             </Text>,
           )
           continue
@@ -254,7 +255,7 @@ export function FilesTab(
         if (row.note === 'unlisted') {
           drawnRows.push(
             <Text key={row.key} dimColor={true} color={FT.dim}>
-              {clip(`${indentStr}  (not listed)`, innerTreeW)}
+              {clip(` ${indentStr}  (not listed)`, innerTreeW)}
             </Text>,
           )
           continue
@@ -262,7 +263,7 @@ export function FilesTab(
         if (row.note === 'more') {
           drawnRows.push(
             <Text key={row.key} dimColor={true} color={FT.dim}>
-              {clip(`${indentStr}  ${row.count} more`, innerTreeW)}
+              {clip(` ${indentStr}  ${row.count} more`, innerTreeW)}
             </Text>,
           )
           continue
@@ -283,7 +284,8 @@ export function FilesTab(
           iconSymbol = '◉'
           if (row.dir && !row.open && row.count > 1) iconCountStr = ` ${row.count}`
         }
-        const rightIconWidth = (iconSymbol + iconCountStr).length > 0 ? 4 : 0
+        // 4 columns for the icon plus 1 of right padding, as in the artboard
+        const rightIconWidth = (iconSymbol + iconCountStr).length > 0 ? 5 : 0
 
         // Calculate name budget so entire line fits inside innerTreeW (W - 2)
         const prefixWidth = 1 + row.depth * 2 + 1 + 1 // bar (1) + indent + caret (1) + space (1)
@@ -334,7 +336,9 @@ export function FilesTab(
           }
         }
 
-        // a Button holds only strings and Text: the icon column and the row background sit outside it
+        // a Button holds only strings and Text, so the row background is the Box and the
+        // icon column is Text inside the Button, pushed right by padding the name with spaces
+        const nameCell = rightIconWidth > 0 ? clippedName.padEnd(nameBudget + 1) : clippedName.padEnd(innerTreeW - prefixWidth)
         drawnRows.push(
           <Box key={`files-line:${row.path}`} flexDirection="row" backgroundColor={rowBg}>
             {Button({
@@ -346,19 +350,19 @@ export function FilesTab(
                 <Text>{indentStr}</Text>,
                 <Text color={FT.dim}>{caret}</Text>,
                 <Text> </Text>,
-                <Text color={nameColor} bold={isBold}>{clippedName}</Text>,
+                <Text color={nameColor} bold={isBold}>{nameCell}</Text>,
+                ...(rightIconWidth > 0
+                  ? [
+                      <Text
+                        color={row.icon === 'write' ? FT.write : FT.read}
+                        dimColor={row.icon === 'write' ? !view.pulse : false}
+                      >
+                        {`${iconSymbol}${iconCountStr}`.padStart(4) + ' '}
+                      </Text>,
+                    ]
+                  : []),
               ],
             })}
-            {rightIconWidth > 0 && (
-              <Box flexDirection="row" justifyContent="flex-end" flexGrow={1}>
-                <Text
-                  color={row.icon === 'write' ? FT.write : FT.read}
-                  dimColor={row.icon === 'write' ? !view.pulse : false}
-                >
-                  {`${iconSymbol}${iconCountStr}`.padStart(4)}
-                </Text>
-              </Box>
-            )}
           </Box>,
         )
       }
@@ -388,24 +392,21 @@ export function FilesTab(
       </Box>
     )
 
-    // 6. Footer line with legend and hotkeys j, k, h, l
-    const isNarrow = W < 42
-    const writeLegend = isNarrow ? 'write ·' : 'writing ·'
-    const readLegend = isNarrow ? 'read' : 'reading · fades 3s'
-
+    // 6. Footer: legend and hotkeys j, k, h, l; one line when wide, two lines (legend, then keys) otherwise
+    const footerRow = W >= 64
     const footer = (
-      <Box flexDirection="row" justifyContent="space-between" marginTop={1}>
+      <Box flexDirection={footerRow ? 'row' : 'column'} justifyContent="space-between">
         <Box flexDirection="row" gap={1}>
           <Text color={FT.write}>●</Text>
-          <Text dimColor={true} color={FT.dim}>{writeLegend}</Text>
+          <Text dimColor={true} color={FT.dim}>writing ·</Text>
           <Text color={FT.read}>◉</Text>
-          <Text dimColor={true} color={FT.dim}>{readLegend}</Text>
+          <Text dimColor={true} color={FT.dim}>reading · fades 3s</Text>
         </Box>
-        <Box flexDirection="row" gap={1}>
-          {Button({ key: 'files-key-j', hotkey: 'j', plain: true, label: 'j', onPress: () => moveSel(1) })}
-          {Button({ key: 'files-key-k', hotkey: 'k', plain: true, label: 'k', onPress: () => moveSel(-1) })}
-          {Button({ key: 'files-key-h', hotkey: 'h', plain: true, label: 'h', onPress: handleH })}
-          {Button({ key: 'files-key-l', hotkey: 'l', plain: true, label: 'l', onPress: handleL })}
+        <Box flexDirection="row" gap={1} justifyContent="flex-end">
+          {Button({ key: 'files-key-j', hotkey: 'j', plain: true, label: 'down', onPress: () => moveSel(1) })}
+          {Button({ key: 'files-key-k', hotkey: 'k', plain: true, label: 'up', onPress: () => moveSel(-1) })}
+          {Button({ key: 'files-key-h', hotkey: 'h', plain: true, label: 'fold', onPress: handleH })}
+          {Button({ key: 'files-key-l', hotkey: 'l', plain: true, label: 'open', onPress: handleL })}
         </Box>
       </Box>
     )
@@ -417,7 +418,7 @@ export function FilesTab(
         <Box flexDirection="column" borderColor={FT.cardBorder} borderStyle="round" backgroundColor={FT.cardFill}>
           {drawnRows}
         </Box>
-        {banners}
+        {banners.length > 0 ? <Box flexDirection="column">{banners}</Box> : []}
         {underTree}
         {footer}
       </Box>

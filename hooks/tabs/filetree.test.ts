@@ -218,20 +218,20 @@ test('Files F3.1: folders are bold neon with caret, files in file text, hidden i
   const textNodes = nodesOf(tree, 'Text')
 
   // Folders are bold neon with caret (open or folded)
-  const docsFolderText = textNodes.find(t => textOf(t) === 'docs')
+  const docsFolderText = textNodes.find(t => textOf(t).trim() === 'docs')
   expect(docsFolderText?.props?.color).toBe(FT.neon)
   expect(docsFolderText?.props?.bold).toBe(true)
 
   // Files in file text
-  const readmeText = textNodes.find(t => textOf(t) === 'package.json')
+  const readmeText = textNodes.find(t => textOf(t).trim() === 'package.json')
   expect(readmeText?.props?.color).toBe(FT.fileText)
 
   // Hidden names in hidden text
-  const hiddenText = textNodes.find(t => textOf(t) === '.github')
+  const hiddenText = textNodes.find(t => textOf(t).trim() === '.github')
   expect(hiddenText?.props?.color).toBe(FT.hidden)
 
   // Links dim with trailing arrow
-  const linkText = textNodes.find(t => textOf(t) === 'link-to-readme →')
+  const linkText = textNodes.find(t => textOf(t).trim() === 'link-to-readme →')
   expect(linkText?.props?.color).toBe(FT.dim)
 
   // Indent: depth 0 has empty indent, depth 1 has 2 spaces, depth 2 has 4 spaces
@@ -304,7 +304,7 @@ test('Files F3.1: typing in search input calls ui.set, and empty match shows dim
   // Input key files-q
   const inputEl = nodesOf(tree, 'Input').find(i => i.props?.key === 'files-q')!
   expect(inputEl).toBeDefined()
-  expect(inputEl.props?.placeholder).toBe('s : search')
+  expect(inputEl.props?.placeholder).toBe('filter files')
   expect(inputEl.props?.value).toBe('initial')
 
   // Typing calls ui.set('files:q', text)
@@ -404,6 +404,12 @@ function boxOverhead(b: Node | undefined): number {
   return border + padX + padL + padR
 }
 
+/** columns a Button draws: a plain Button with a hotkey prints `<hotkey>: <label>` */
+function buttonWidth(b: Node): number {
+  const label = textOf(b).length
+  return typeof b.props?.hotkey === 'string' ? b.props.hotkey.length + 2 + label : label
+}
+
 test('Files F3.1: at 46 and 36 columns no line is wider than column count and long names end in ellipsis', () => {
   const longView = longNamesFixtureView()
   const { ui } = createMockUi()
@@ -419,7 +425,7 @@ test('Files F3.1: at 46 and 36 columns no line is wider than column count and lo
     expect(chipRow).toBeDefined()
     const chips = nodesOf(chipRow, 'Button')
     const chipRowGap = Number(chipRow.props?.gap ?? 0)
-    const chipRowWidth = chips.reduce((sum, c) => sum + textOf(c).length, 0) + Math.max(0, chips.length - 1) * chipRowGap + boxOverhead(chipRow)
+    const chipRowWidth = chips.reduce((sum, c) => sum + buttonWidth(c), 0) + Math.max(0, chips.length - 1) * chipRowGap + boxOverhead(chipRow)
     expect(chipRowWidth, `chip row at ${cols} cols: ${chipRowWidth}`).toBeLessThanOrEqual(cols)
 
     // 2. Card: border and padding plus line contents
@@ -449,7 +455,7 @@ test('Files F3.1: at 46 and 36 columns no line is wider than column count and lo
     const searchTexts = nodesOf(searchRow, 'Text')
     const searchButtons = nodesOf(searchRow, 'Button')
     const searchRowContentWidth = searchTexts.reduce((sum, t) => sum + textOf(t).length, 0)
-      + searchButtons.reduce((sum, b) => sum + textOf(b).length, 0)
+      + searchButtons.reduce((sum, b) => sum + buttonWidth(b), 0)
       + searchRowGap
     const searchRowLineWidth = searchRowContentWidth + cardOverhead
     expect(searchRowLineWidth, `search row at ${cols} cols: ${searchRowLineWidth}`).toBeLessThanOrEqual(cols)
@@ -458,7 +464,7 @@ test('Files F3.1: at 46 and 36 columns no line is wider than column count and lo
     const expRow = ((cardBox.children ?? []) as Node[])[3] as Node
     const expRowGap = Number(expRow.props?.gap ?? 1)
     const expButtons = nodesOf(expRow, 'Button')
-    const expRowContentWidth = expButtons.reduce((sum, b) => sum + textOf(b).length, 0)
+    const expRowContentWidth = expButtons.reduce((sum, b) => sum + buttonWidth(b), 0)
       + Math.max(0, expButtons.length - 1) * expRowGap
     const expRowLineWidth = expRowContentWidth + cardOverhead
     expect(expRowLineWidth, `expand/collapse row at ${cols} cols: ${expRowLineWidth}`).toBeLessThanOrEqual(cols)
@@ -468,7 +474,7 @@ test('Files F3.1: at 46 and 36 columns no line is wider than column count and lo
     expect(treeBox).toBeDefined()
     const treeOverhead = boxOverhead(treeBox) // borderStyle (2) = 2
 
-    // Path rows
+    // Path rows: the Button holds the whole line, icon column included
     const pathRowBtns = nodesOf(treeBox, 'Button')
     expect(pathRowBtns.length).toBeGreaterThan(0)
     for (const btn of pathRowBtns) {
@@ -510,8 +516,9 @@ test('Files F3.1: at 46 and 36 columns no line is wider than column count and lo
     const keysBox = (footerBox.children as Node[] | undefined)?.[1] as Node
     const keyButtons = nodesOf(keysBox, 'Button')
     const keysGaps = Math.max(0, keyButtons.length - 1) * Number(keysBox.props?.gap ?? 1)
-    const keysWidth = keyButtons.reduce((sum, b) => sum + textOf(b).length, 0) + keysGaps
-    const footerLineWidth = legendWidth + 1 + keysWidth + boxOverhead(footerBox)
+    const keysWidth = keyButtons.reduce((sum, b) => sum + buttonWidth(b), 0) + keysGaps
+    // side by side with one space between when wide, stacked in two lines when not
+    const footerLineWidth = (footerBox.props?.flexDirection === 'row' ? legendWidth + 1 + keysWidth : Math.max(legendWidth, keysWidth)) + boxOverhead(footerBox)
     expect(footerLineWidth, `footer line at ${cols} cols: ${footerLineWidth}`).toBeLessThanOrEqual(cols)
 
     // Long file name ends in ellipsis
@@ -766,4 +773,191 @@ test('Files F3.1: selected row draws lime left bar on selected fill and selectio
   // Selection move calls ui.reveal with that row's key
   pressButton(tree, 'files-key-j')
   expect(revealed.length).toBeGreaterThan(0)
+})
+
+// ────────────────────── Polish round: labels, whole-row Button, h on folded folder, render dump ──────────────────────
+
+type Seg = { t: string; fg?: string; bg?: string; flags?: string }
+type Block = Seg[][]
+
+const COLOUR_NAMES = new Map<string, string>(Object.entries(FT).map(([k, v]) => [v, k]))
+const cname = (c: unknown): string | undefined => (typeof c === 'string' ? COLOUR_NAMES.get(c) ?? c : undefined)
+const segW = (line: Seg[]): number => line.reduce((n, s) => n + s.t.length, 0)
+
+/**
+ * A tiny text layout of the stub tree: Box column or row (gap, margin, border, paddingX, space-between,
+ * flex-end, wrap), Text, Button (hotkey prints `<hotkey>: <label>`) and Input. Enough to read the tab as lines.
+ */
+function layoutNode(n: unknown, avail: number, bg?: string, stretch = true): Block {
+  if (typeof n === 'string') return [[{ t: n, bg }]]
+  const node = n as Node
+  const p = node.props ?? {}
+  const kidsOf = (b?: string): Block[] => (node.children ?? []).map(c => layoutNode(c, avail, b, false))
+  if (node.type === 'Text') {
+    const flags = `${p.bold ? 'b' : ''}${p.dimColor ? 'd' : ''}`
+    const text = (node.children ?? []).map(c => (typeof c === 'string' ? c : textOf(c))).join('')
+    return [[{ t: text, fg: cname(p.color), bg: cname(p.backgroundColor) ?? bg, flags }]]
+  }
+  if (node.type === 'Button') {
+    const parts: Seg[] = []
+    if (typeof p.hotkey === 'string') parts.push({ t: `${p.hotkey}: `, flags: 'hk', bg })
+    if (typeof p.label === 'string') parts.push({ t: p.label, bg })
+    for (const k of kidsOf(bg)) parts.push(...(k[0] ?? []))
+    return [parts]
+  }
+  if (node.type === 'Input') return [[{ t: `[${String(p.value || p.placeholder)}]`, flags: 'input', bg }]]
+  // Box
+  const ownBg = cname(p.backgroundColor) ?? bg
+  const bordered = Boolean(p.borderStyle)
+  const padX = Number(p.paddingX ?? 0)
+  const inner = (typeof p.width === 'number' ? p.width : avail) - (bordered ? 2 : 0) - padX * 2
+  const gap = Number(p.gap ?? 0)
+  const blocks = (node.children ?? []).flat().filter(Boolean).map(c => layoutNode(c, inner, ownBg, p.flexDirection !== 'row'))
+  let lines: Seg[][] = []
+  if (p.flexDirection === 'row') {
+    const widths = blocks.map(b => Math.max(0, ...b.map(segW)))
+    const rows: Block[][] = [[]]
+    let used = 0
+    blocks.forEach((b, i) => {
+      if (p.flexWrap === 'wrap' && used > 0 && used + gap + widths[i]! > inner) { rows.push([]); used = 0 }
+      rows[rows.length - 1]!.push(b)
+      used += (used > 0 ? gap : 0) + widths[i]!
+    })
+    for (const r of rows) {
+      const rw = r.map(b => Math.max(0, ...b.map(segW)))
+      const free = Math.max(0, inner - rw.reduce((a, b) => a + b, 0) - gap * Math.max(0, r.length - 1))
+      const height = Math.max(1, ...r.map(b => b.length))
+      for (let y = 0; y < height; y++) {
+        const line: Seg[] = []
+        r.forEach((b, i) => {
+          if (i > 0) {
+            const sp = stretch && p.justifyContent === 'space-between' && r.length === 2 ? free + gap : gap
+            line.push({ t: ' '.repeat(sp), bg: ownBg })
+          } else if (stretch && p.justifyContent === 'flex-end' && free > 0) line.push({ t: ' '.repeat(free), bg: ownBg })
+          line.push(...(b[y] ?? [{ t: ' '.repeat(rw[i]!), bg: ownBg }]))
+        })
+        lines.push(line)
+      }
+    }
+  } else {
+    blocks.forEach((b, i) => {
+      if (i > 0) for (let g = 0; g < gap; g++) lines.push([])
+      lines.push(...b)
+    })
+  }
+  if (p.marginTop) lines = [...Array.from({ length: Number(p.marginTop) }, () => [] as Seg[]), ...lines]
+  if (bordered || padX) {
+    const w = typeof p.width === 'number' ? p.width - (bordered ? 2 : 0) - padX * 2 : Math.max(0, ...lines.map(segW))
+    lines = lines.map(l => [
+      ...(bordered ? [{ t: '│', fg: cname(p.borderColor) }] : []), { t: ' '.repeat(padX), bg: ownBg }, ...l,
+      { t: ' '.repeat(Math.max(0, w - segW(l)) + padX), bg: ownBg }, ...(bordered ? [{ t: '│', fg: cname(p.borderColor) }] : []),
+    ])
+    if (bordered) {
+      const bw = w + padX * 2
+      lines = [[{ t: `╭${'─'.repeat(bw)}╮`, fg: cname(p.borderColor) }], ...lines, [{ t: `╰${'─'.repeat(bw)}╯`, fg: cname(p.borderColor) }]]
+    }
+  }
+  return lines
+}
+
+/** plain lines (what the terminal draws) and the same lines with [fg/bg flags:text] notes per Text */
+function renderLines(tree: unknown, cols: number): { plain: string[]; noted: string[] } {
+  const block = layoutNode(tree, cols)
+  return {
+    plain: block.map(l => l.map(s => s.t).join('')),
+    noted: block.map(l => l.map(s => (s.fg || s.bg || s.flags ? `⟦${[s.fg, s.bg && `bg:${s.bg}`, s.flags].filter(Boolean).join(' ')}|${s.t}⟧` : s.t)).join('')),
+  }
+}
+
+test('Files polish: no hotkey letter is printed twice, every keyed Button reads `<hotkey>: <word>` and fits at 80, 46 and 36 columns', () => {
+  const view = filetreeFixtureView()
+  for (const cols of [80, 46, 36]) {
+    const { plain } = renderLines(FilesTab(stubEls, view, cols, createMockUi().ui), cols)
+    const dump = plain.join('\n')
+    expect(dump).toContain('s: search')
+    for (const want of ['j: down', 'k: up', 'h: fold', 'l: open']) expect(dump).toContain(want)
+    expect(dump).not.toMatch(/\b([jklhs]): \1\b/)
+    expect(dump).not.toContain('s : search')
+  }
+  const tree = FilesTab(stubEls, view, 46, createMockUi().ui)
+  const labels = Object.fromEntries(['files-s', 'files-key-j', 'files-key-k', 'files-key-h', 'files-key-l'].map(k => {
+    const b = nodesOf(tree, 'Button').find(x => x.props?.key === k)!
+    return [k, b.props?.label]
+  }))
+  expect(labels).toEqual({ 'files-s': 'search', 'files-key-j': 'down', 'files-key-k': 'up', 'files-key-h': 'fold', 'files-key-l': 'open' })
+})
+
+test('Files polish: the icon and count are Text inside the row Button, keep their colours, and every row line is exactly the box width at 80, 46 and 36 columns', () => {
+  for (const pulse of [true, false]) {
+    const view = filetreeFixtureView({ pulse, sel: '' })
+    for (const cols of [80, 46, 36]) {
+      const tree = FilesTab(stubEls, view, cols, createMockUi().ui)
+      const mkdb = view.rows.find(r => r.path === '/repo/scripts/mkdb.py')!
+      const btn = nodesOf(tree, 'Button').find(b => b.props?.key === mkdb.key)!
+      const icon = nodesOf(btn, 'Text').find(t => textOf(t).includes('●'))
+      expect(icon, 'write icon sits inside the row Button').toBeDefined()
+      expect(icon!.props?.color).toBe(FT.write)
+      expect(icon!.props?.dimColor).toBe(!pulse)
+      const read = view.rows.find(r => r.path === '/repo/docs/guide.md')!
+      const readBtn = nodesOf(tree, 'Button').find(b => b.props?.key === read.key)!
+      expect(nodesOf(readBtn, 'Text').find(t => textOf(t).includes('◉'))?.props?.color).toBe(FT.read)
+      // outside the Button the line Box holds nothing else
+      expect(nodesOf(lineOf(tree, mkdb.key), 'Text').length).toBe(nodesOf(btn, 'Text').length)
+      // every path row is exactly the tree box's inner width, so the whole line is the click target
+      for (const b of nodesOf(tree, 'Button').filter(x => String(x.props?.key).startsWith('files-row:'))) {
+        const w = nodesOf(b, 'Text').reduce((n, t) => n + textOf(t).length, 0)
+        expect(w, `${String(b.props?.key)} at ${cols}`).toBe(Math.max(12, cols) - 2)
+      }
+    }
+  }
+  // a folded folder keeps its count inside the Button
+  const folded: Row = { key: 'files-row:/repo/f', path: '/repo/f', name: 'f', depth: 0, dir: true, open: false, hidden: false, link: false, icon: 'read', count: 4 }
+  const tree = FilesTab(stubEls, filetreeFixtureView({ rows: [folded], sel: '' }), 36, createMockUi().ui)
+  const btn = nodesOf(tree, 'Button').find(b => b.props?.key === folded.key)!
+  expect(textOf(btn)).toMatch(/◉ 4 $/)
+})
+
+test('Files polish: h on a folded folder moves to its parent folder, on a depth-0 folder it does nothing', () => {
+  const view = filetreeFixtureView()
+  const tabs = view.rows.find(r => r.path === '/repo/hooks/tabs')!
+  const hooks = view.rows.find(r => r.path === '/repo/hooks')!
+  // /repo/hooks/tabs shown folded (its parent is open): h goes up to hooks
+  const foldedTabs = { ...view, rows: view.rows.map(r => (r.path === tabs.path ? { ...r, open: false } : r)) }
+  const { ui, state, revealed } = createMockUi({ 'files:sel': tabs.key })
+  pressButton(FilesTab(stubEls, foldedTabs, 46, ui), 'files-key-h')
+  expect(state['files:sel']).toBe(hooks.key)
+  expect(revealed).toContain(hooks.key)
+  expect(state['files:open']).toBeUndefined()
+  // depth-0 folded folder: no parent row, nothing changes
+  const docs = view.rows.find(r => r.path === '/repo/docs')!
+  const foldedDocs = { ...view, rows: view.rows.map(r => (r.path === docs.path ? { ...r, open: false } : r)) }
+  const { ui: ui0, state: state0, revealed: revealed0 } = createMockUi({ 'files:sel': docs.key })
+  pressButton(FilesTab(stubEls, foldedDocs, 46, ui0), 'files-key-h')
+  expect(state0['files:sel']).toBe(docs.key)
+  expect(state0['files:open']).toBeUndefined()
+  expect(revealed0).toEqual([])
+})
+
+test('Files polish: the tab drawn as text lines at 80, 46 and 36 columns, with every note, never wider than the columns', () => {
+  const extra: Row[] = [
+    { key: 'files-more:/repo/hooks', path: '/repo/hooks', name: 'more', depth: 1, dir: false, open: false, hidden: false, link: false, icon: null, count: 12, note: 'more' },
+  ]
+  const base = filetreeFixtureView()
+  const view = filetreeFixtureView({ rows: [...base.rows, ...extra], note: 'missing root, fallback to repo', capped: true })
+  for (const cols of [80, 46, 36]) {
+    const r = renderLines(FilesTab(stubEls, view, cols, createMockUi().ui), cols)
+    for (const l of r.plain) expect(l.length, `${cols}: ${l}`).toBeLessThanOrEqual(cols)
+  }
+})
+
+test('Files polish: note rows start in the name column, the no-match line shows the query, the footer sits one blank line under the tree line', () => {
+  const view = filetreeFixtureView()
+  const { plain } = renderLines(FilesTab(stubEls, view, 46, createMockUi().ui), 46)
+  const col = (needle: string): number => plain.find(l => l.includes(needle))!.indexOf(needle)
+  expect(col('(empty)')).toBe(col('guide.md'))
+  const none = renderLines(FilesTab(stubEls, filetreeFixtureView({ rows: [], q: 'zzz' }), 46, createMockUi().ui), 46).plain
+  expect(none.some(l => l.includes('no file matches “zzz”'))).toBe(true)
+  const under = plain.findIndex(l => l.includes('folders ·'))
+  expect(plain[under + 1]).toBe('')
+  expect(plain[under + 2]).toContain('writing')
 })
