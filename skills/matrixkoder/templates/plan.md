@@ -128,6 +128,9 @@ lane_group = ""                           # same value = same wave, one shared w
 
 ## Open questions
 <None left, or the question plus who answers it. Anything here blocks approval.>
+<Write every unresolved question, deferred decision or item needing clarification here, as `- [ ] <question> — <why it matters>`; never scatter them through the phase notes.>
+<Questions raised by an analysis or review of the plan are copied here too; ask the user only for preferences, never for codebase facts you can read.>
+<A question is closed by ticking it `- [x]` and adding a Log line with the answer and who gave it; never by deleting it.>
 
 ## Log
 - <date> — drafted.

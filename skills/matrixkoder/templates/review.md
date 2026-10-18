@@ -8,6 +8,12 @@ When the bus is up, this brief reaches you over it: `dispatch --role review --la
 
 Review the commit (or the uncommitted diff) and report. Do NOT rerun the self-tests, typecheck or suite the builder and orchestrator already ran (user rule 2026-10-14) — read their output instead. Run a probe ONLY when a new proof is needed: an old-vs-new comparison, hostile input, or a temp-store trial.
 
+## Reject weak work
+- A false approval costs far more than a false rejection: when the work is not proven, say REQUEST CHANGES.
+- Before reading the diff in detail, write down the 3-5 places this work is most likely to fail, then check each one on purpose.
+- Every CRITICAL or HIGH finding carries a `path:line` or quoted excerpt. A finding without evidence is an opinion: move it to "Not verified".
+- Reject on a missing or vague acceptance proof, not on typos. Report "no issues found" when that is true; do not invent problems.
+
 ## CRITICAL / HIGH / MEDIUM / LOW
 - `path:line` — problem — fix
 
