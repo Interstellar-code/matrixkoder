@@ -188,10 +188,6 @@ let filesSkipOnce = false
 let filesCurrentRoot: string | null = null
 let lastRootWalked: string | null = null
 
-export let debugLastFocus: string | null = null
-export let debugFocusErr: string | null = null
-export let debugLastPressed: unknown = null
-
 let filesSessionCwd = ''
 
 export function registerDashboard(on: On, options: PluginOptions): void {
@@ -1059,28 +1055,6 @@ async function filesTick($: EngineInterface): Promise<void> {
   }
 }
 
-function sanitizeButtonKids(kids: unknown): unknown[] {
-  if (kids == null) return []
-  if (!Array.isArray(kids)) {
-    if (typeof kids === 'object' && kids !== null && 'type' in kids && (kids as { type: unknown }).type === 'Box') {
-      const box = kids as { props?: { children?: unknown }; children?: unknown }
-      return sanitizeButtonKids(box.children ?? box.props?.children)
-    }
-    return [kids]
-  }
-  const out: unknown[] = []
-  for (const k of kids) {
-    if (k == null) continue
-    if (typeof k === 'object' && k !== null && 'type' in k && (k as { type: unknown }).type === 'Box') {
-      const box = k as { props?: { children?: unknown }; children?: unknown }
-      out.push(...sanitizeButtonKids(box.children ?? box.props?.children))
-    } else {
-      out.push(k)
-    }
-  }
-  return out
-}
-
 function FilesPane(
   $: EngineInterface,
   els: Els,
@@ -1099,7 +1073,7 @@ function FilesPane(
     filesCurrentRoot = chosenRoot.path
 
     let rootToRender = chosenRoot
-    let note: string | null = (viewState['debug:slots:err'] ? 'ERR: ' + viewState['debug:slots:err'] : null) || (viewState['debug:slots:bad_parse'] ? 'BAD: ' + viewState['debug:slots:bad_parse'] : null) || (viewState['lanes:slots'] ? 'SLOTS: ' + viewState['lanes:slots'] : 'NO_SLOTS')
+    let note: string | null = null
 
     let walk = filesWalkCache.get(chosenRoot.path)
     if (!walk && !filesWalkInFlight) {
@@ -1173,33 +1147,10 @@ function FilesPane(
       get: key => viewState[key],
       set: (key, value) => { void update($, viewStateAtom, prev => ({ ...prev, [key]: value })) },
       reveal: key => { void $.ui.scroll({ in: PANE_ID, to: { key } }).catch(() => {}) },
-      focus: key => {
-        debugLastFocus = key
-        void $.ui.focus({ requestId: PANE_ID, key }).catch(e => { debugFocusErr = String(e) })
-      },
+      focus: key => { void $.ui.focus({ requestId: PANE_ID, key }).catch(() => {}) },
     }
 
-    const rawButton = els.Button as unknown as (props: Record<string, unknown>) => RenderElement
-    const wrappedButton = (props: Record<string, unknown>): RenderElement => {
-      const origOnPress = props.onPress as (() => void) | undefined
-      const newProps = {
-        ...props,
-        onPress: () => {
-          debugLastPressed = props.key
-          origOnPress?.()
-        },
-      }
-      if (newProps && newProps.children) {
-        return rawButton({
-          ...newProps,
-          children: sanitizeButtonKids(newProps.children),
-        })
-      }
-      return rawButton(newProps)
-    }
-    const filesEls = { ...els, Button: wrappedButton } as unknown as Els
-
-    return FilesTab(filesEls, view, cols, filesTabUi)
+    return FilesTab(els, view, cols, filesTabUi)
   } catch (err) {
     return <Text>Files could not draw</Text>
   }
@@ -1756,16 +1707,12 @@ async function loadLaneSlots($: EngineInterface): Promise<void> {
   slotsInflight = true
   try {
     const r = await $.process.run(['python3', `${$.plugin.root}/scripts/mk-lane.py`, 'list'], { timeoutMs: 5_000 })
-    const rawOut = typeof r.stdout === 'string' ? r.stdout : (r as unknown as { value?: { stdout?: string } })?.value?.stdout ?? ''
-    const parsed = JSON.parse(rawOut) as { ok?: boolean; slots?: unknown }
+    const parsed = JSON.parse(r.stdout ?? '') as { ok?: boolean; slots?: unknown }
     if (parsed.ok === true && Array.isArray(parsed.slots)) {
-      await update($, viewStateAtom, prev => ({ ...prev, 'lanes:slots': JSON.stringify(parsed.slots), 'lanes:slots-at': String(Date.now()), 'debug:slots:updated': 'true' }))
-    } else {
-      await update($, viewStateAtom, prev => ({ ...prev, 'debug:slots:bad_parse': JSON.stringify(parsed) }))
+      await update($, viewStateAtom, prev => ({ ...prev, 'lanes:slots': JSON.stringify(parsed.slots), 'lanes:slots-at': String(Date.now()) }))
     }
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err)
-    await update($, viewStateAtom, prev => ({ ...prev, 'debug:slots:err': msg }))
+  } catch {
+    // no lane slots readable — the tab keeps what it had
   } finally {
     slotsInflight = false
   }

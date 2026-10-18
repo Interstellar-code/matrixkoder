@@ -6,7 +6,7 @@ import type { On, ConfigRow } from 'claude-code'
 import { snapshotCount, DATA_DIR, NOW, PROJECT_DIR, RUN_PATH, RUNS_INDEX, USAGE_PATH, agentOf, agentsOf, mockFs, mockWorld, paneProps, sessionStart, sessionStartIn, setRun, setUsage, tasksOf, worldFiles, worldFixtures } from './testkit'
 import type { Files, MockWorld } from './testkit'
 import { PANE_ID, parseYamlAgents } from './data'
-import { footerParts, liveOverviewView, modelShort, openWaiting, planActionPatch, resolveMainCheckout, runPlanAction, taskNote, usageShorts, waitingPane, waitingPaneView, debugLastFocus, debugFocusErr, debugLastPressed } from './dashboard'
+import { footerParts, liveOverviewView, modelShort, openWaiting, planActionPatch, resolveMainCheckout, runPlanAction, taskNote, usageShorts, waitingPane, waitingPaneView } from './dashboard'
 import type { MkSnapshot } from '../types'
 import { mockTabCounts, waitingCount } from './tabs/header'
 import { RUN_SNAPSHOT } from './fixtures/run-snapshot'
@@ -2537,8 +2537,6 @@ test('Files F4.2: missing lane root falls back to main checkout with note', { ti
     const btn = (await ui.findAll({ type: 'Button' })).find(b => b.props.key === 'files-root:slot-1')
     if (btn) break
   }
-  const noteNode = await ui.find({ key: 'files-view-note' })
-  expect(noteNode?.props?.children).toBe('something')
   await ui.press({ key: 'files-root:slot-1' })
   for (let i = 0; i < 60 && !(await ui.find({ text: /missing root, fallback to repo/ })); i++) {
     await clock.advance(0)
@@ -2582,7 +2580,7 @@ test('Files F4.2: ui.reveal and ui.focus wired to engine, pressing s calls focus
   await ui.redraw({ ...paneProps(46), isFocused: true })
   await ui.press({ key: 'files-s' })
   for (let i = 0; i < 10; i++) await clock.advance(0)
-  expect({ focusCalledWith, debugLastFocus, debugFocusErr, debugLastPressed }).toEqual({ focusCalledWith: { requestId: PANE_ID, key: 'files-q' }, debugLastFocus: 'files-q', debugFocusErr: null, debugLastPressed: 'files-s' })
+  expect(focusCalledWith).toEqual({ requestId: PANE_ID, key: 'files-q' })
 })
 
 test('Files F4.2: Files wiring never writes settings:focus', { timeoutMs: 15000, plugins: [worldFixtures] }, async ($, on) => {
