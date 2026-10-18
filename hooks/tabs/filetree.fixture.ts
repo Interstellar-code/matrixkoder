@@ -11,7 +11,7 @@ function makeEntry(name: string, kind: 'file' | 'dir' | 'other' = 'file', size =
 export const FIXTURE_ROOT = '/repo'
 
 export const FIXTURE_ROOTS: readonly RootItem[] = [
-  { id: 'main', label: 'repo', path: '/repo' },
+  { id: 'main', label: 'main', path: '/repo' },
   { id: 'slot-1', label: 'P4', path: '/repo-wt/p4' },
   { id: 'slot-2', label: 'slot 2', path: '/repo-wt/slot-2' },
 ]
@@ -96,7 +96,7 @@ export function noGitFixtureView(): FilesView {
   const walk: Walk = { dirs, capped: false, missing: false }
   const rows = treeRows(walk, '/project', new Set(['/project/src']), '', new Map())
   return {
-    roots: [{ id: 'main', label: 'repo', path: '/project' }],
+    roots: [{ id: 'main', label: 'main', path: '/project' }],
     root: 'main',
     rows,
     dirs: ['/project', '/project/src'],
@@ -128,7 +128,7 @@ export function longNamesFixtureView(): FilesView {
   const walk: Walk = { dirs, capped: true, missing: false }
   const rows = treeRows(walk, longRoot, openSet, '', new Map())
   return {
-    roots: [{ id: 'main', label: 'repo', path: longRoot }],
+    roots: [{ id: 'main', label: 'main', path: longRoot }],
     root: 'main',
     rows,
     dirs: [longRoot, emptyFolder],

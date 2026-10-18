@@ -52,12 +52,20 @@ export type Row = {
   icon: 'read' | 'write' | null
   count: number
   note?: 'more' | 'empty' | 'unlisted'
+  /** bytes (files) and last change; absent on note rows */
+  size?: number
+  mtimeMs?: number
 }
+
+/** The column the tree is sorted by and its direction; folders always list first. */
+export type SortSpec = { by: 'name' | 'size' | 'date'; desc: boolean }
 
 export type RootItem = {
   id: string
   label: string
   path: string
+  /** a lane slot with no task: its chip is drawn dim */
+  idle?: boolean
 }
 
 function joinPath(dir: string, name: string): string {
@@ -69,12 +77,49 @@ function getParent(p: string): string {
   return idx <= 0 ? '/' : p.slice(0, idx)
 }
 
-function compareEntries(a: FsEntry, b: FsEntry): number {
-  const aDir = a.kind === 'dir'
-  const bDir = b.kind === 'dir'
-  if (aDir !== bDir) return aDir ? -1 : 1
-  const cmp = a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
-  return cmp !== 0 ? cmp : a.name.localeCompare(b.name)
+/** Absolute paths of the git-ignored folders in `git ls-files --others --ignored --exclude-standard --directory` output. */
+export function ignoredDirs(stdout: string, root: string): Set<string> {
+  const out = new Set<string>()
+  for (const line of stdout.split('\n')) {
+    if (line.endsWith('/')) out.add(joinPath(root, line.slice(0, -1)))
+  }
+  return out
+}
+
+/** The host reports a folder's change time in seconds and a file's in milliseconds; anything below 1e11 is seconds. */
+export function normMs(ms: number): number {
+  return ms < 1e11 ? ms * 1000 : ms
+}
+
+/** `git status --porcelain` as { path relative to the root: one-letter mark }; an untracked folder keeps its trailing slash. */
+export function gitStatusMap(stdout: string): Map<string, string> {
+  const out = new Map<string, string>()
+  for (const line of stdout.split('\n')) {
+    if (line.length < 4) continue
+    const xy = line.slice(0, 2)
+    let path = line.slice(3)
+    const arrow = path.indexOf(' -> ')
+    if (arrow >= 0) path = path.slice(arrow + 4)
+    path = path.replace(/^"|"$/g, '')
+    const mark = xy === '??' ? '?' : xy.includes('D') ? 'D' : xy.includes('A') ? 'A' : xy.includes('R') ? 'R' : 'M'
+    out.set(path, mark)
+  }
+  return out
+}
+
+function compareEntries(sort: SortSpec): (a: FsEntry, b: FsEntry) => number {
+  const byName = (a: FsEntry, b: FsEntry): number => {
+    const cmp = a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
+    return cmp !== 0 ? cmp : a.name.localeCompare(b.name)
+  }
+  return (a, b) => {
+    const aDir = a.kind === 'dir'
+    const bDir = b.kind === 'dir'
+    if (aDir !== bDir) return aDir ? -1 : 1
+    // ascending is A to Z, smallest first, oldest first; a folder has no size, so it falls back to its name
+    const key = sort.by === 'date' ? normMs(a.mtimeMs) - normMs(b.mtimeMs) : sort.by === 'size' && !aDir ? a.size - b.size : 0
+    return (key !== 0 ? key : byName(a, b)) * (sort.desc ? -1 : 1)
+  }
 }
 
 function folderActivity(
@@ -104,6 +149,7 @@ function folderActivity(
 export async function walkRoot(
   root: string,
   list: (dir: string) => Promise<FsEntry[]>,
+  skip: ReadonlySet<string> = new Set(),
 ): Promise<Walk> {
   const dirs = new Map<string, FsEntry[]>()
   let listCalls = 0
@@ -144,7 +190,7 @@ export async function walkRoot(
 
     for (const entry of entries) {
       if (entry.kind === 'dir') {
-        if (!SCAN_SKIP_SET.has(entry.name) && !entry.name.startsWith(SCAN_SKIP_PREFIX)) {
+        if (!SCAN_SKIP_SET.has(entry.name) && !entry.name.startsWith(SCAN_SKIP_PREFIX) && !skip.has(joinPath(current, entry.name))) {
           queue.push(joinPath(current, entry.name))
         }
       }
@@ -199,7 +245,9 @@ export function treeRows(
   open: ReadonlySet<string>,
   q: string,
   act: Map<string, 'read' | 'write'>,
+  sort: SortSpec = { by: 'name', desc: false },
 ): Row[] {
+  const cmp = compareEntries(sort)
   if (!walk.dirs.has(root)) {
     return []
   }
@@ -225,7 +273,7 @@ export function treeRows(
       rows.push({
         key: `files-unlisted:${dirPath}`,
         path: dirPath,
-        name: '(not listed)',
+        name: '(not scanned)',
         depth,
         dir: false,
         open: false,
@@ -260,7 +308,7 @@ export function treeRows(
       return
     }
 
-    entries.sort(compareEntries)
+    entries.sort(cmp)
     const total = entries.length
     const slice = entries.slice(0, 500)
 
@@ -277,6 +325,8 @@ export function treeRows(
           dir: true,
           open: isOpen,
           hidden: entry.name.startsWith('.'),
+          size: entry.size,
+          mtimeMs: normMs(entry.mtimeMs),
           link: false,
           icon,
           count,
@@ -295,6 +345,8 @@ export function treeRows(
           dir: false,
           open: false,
           hidden: entry.name.startsWith('.'),
+          size: entry.size,
+          mtimeMs: normMs(entry.mtimeMs),
           link: isLink,
           icon,
           count: 0,
@@ -342,7 +394,7 @@ export function treeRows(
       })
     }
   } else {
-    rootEntries.sort(compareEntries)
+    rootEntries.sort(cmp)
     const total = rootEntries.length
     const slice = rootEntries.slice(0, 500)
 
@@ -359,6 +411,8 @@ export function treeRows(
           dir: true,
           open: isOpen,
           hidden: entry.name.startsWith('.'),
+          size: entry.size,
+          mtimeMs: normMs(entry.mtimeMs),
           link: false,
           icon,
           count,
@@ -377,6 +431,8 @@ export function treeRows(
           dir: false,
           open: false,
           hidden: entry.name.startsWith('.'),
+          size: entry.size,
+          mtimeMs: normMs(entry.mtimeMs),
           link: isLink,
           icon,
           count: 0,
@@ -453,13 +509,13 @@ export function diffWalk(prev: Walk | undefined, next: Walk): string[] {
 }
 
 /**
- * Lists the main checkout first (id: 'main', label: 'repo') and one root per lane slot in slot order.
+ * Lists the main checkout first (id: 'main', label: 'main') and one root per lane slot in slot order.
  */
 export function rootsOf(
   main: string,
   slots: readonly { slot: number; path: string; task: string | null }[],
 ): RootItem[] {
-  const mainRoot: RootItem = { id: 'main', label: 'repo', path: main }
+  const mainRoot: RootItem = { id: 'main', label: 'main', path: main }
   const seenSlots = new Set<number>()
   const sorted = [...slots].sort((a, b) => a.slot - b.slot)
   const slotRoots: RootItem[] = []
@@ -472,6 +528,7 @@ export function rootsOf(
       id: `slot-${s.slot}`,
       label,
       path: s.path,
+      ...(s.task && s.task.trim() ? {} : { idle: true }),
     })
   }
 
@@ -492,5 +549,5 @@ export function pickRoot(
   const main = roots.find(r => r.id === 'main')
   if (main) return main
   if (roots.length > 0 && roots[0]) return roots[0]
-  return { id: 'main', label: 'repo', path: '' }
+  return { id: 'main', label: 'main', path: '' }
 }

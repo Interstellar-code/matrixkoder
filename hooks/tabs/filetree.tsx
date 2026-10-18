@@ -32,6 +32,8 @@ export type FilesTabUi = {
   set(key: string, value: string): void
   reveal?(key: string): void
   focus?(key: string): void
+  /** list one folder the walk skipped, and keep it listed */
+  scan?(path: string): void
 }
 
 export type FilesView = {
@@ -46,6 +48,8 @@ export type FilesView = {
   pulse: boolean
   capped: boolean
   note: string | null
+  /** git status marks by path relative to the root; absent when git is not read */
+  git?: ReadonlyMap<string, string>
   q?: string
   sel?: string
 }
@@ -53,6 +57,62 @@ export type FilesView = {
 function clip(str: string, maxLen: number): string {
   if (str.length <= maxLen) return str
   return maxLen <= 1 ? '…' : `${str.slice(0, maxLen - 1)}…`
+}
+
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+const SIZE_W = 7
+const DATE_W = 9
+const ICON_W = 2 // the file or folder glyph (1 cell) and a space
+const GIT_W = 4 // the git mark column, between the name and the size
+const ACT_W = 5 // the writing / reading dot, always reserved when the columns show
+const COLS_MIN_W = 56 // narrower than this the Size and Modified columns are left out
+
+/** bytes as `812 B`, `3.4 K`, `12 M`; empty for a folder */
+function fmtSize(bytes: number | undefined): string {
+  if (bytes == null) return ''
+  if (bytes < 1024) return `${bytes} B`
+  const units = ['K', 'M', 'G', 'T']
+  let n = bytes / 1024
+  let u = 0
+  while (n >= 1024 && u < units.length - 1) { n /= 1024; u++ }
+  return `${n < 10 ? n.toFixed(1) : Math.round(n)} ${units[u]}`
+}
+
+/** `Oct 18` for this year, `Oct 2025` for an older one */
+function fmtDate(ms: number | undefined): string {
+  if (ms == null) return ''
+  const d = new Date(ms)
+  const mon = MONTHS[d.getMonth()] ?? ''
+  return d.getFullYear() === new Date().getFullYear() ? `${mon} ${String(d.getDate()).padStart(2, '0')}` : `${mon} ${d.getFullYear()}`
+}
+
+/** one coloured glyph per kind, so a folder or a file type reads at a glance without emoji */
+const EXT_COLOR: Record<string, string> = {
+  ts: '#5b9bd5', tsx: '#5b9bd5', js: '#e5c07b', jsx: '#e5c07b', mjs: '#e5c07b', py: '#e8d44d',
+  md: '#7ec699', txt: '#7ec699', json: '#e8b04a', yaml: '#e8b04a', yml: '#e8b04a', toml: '#e8b04a',
+  sh: '#c678dd', zsh: '#c678dd', bash: '#c678dd', png: '#e06c9f', jpg: '#e06c9f', jpeg: '#e06c9f',
+  gif: '#e06c9f', svg: '#e06c9f', webp: '#e06c9f', lock: '#8a8a8a',
+}
+
+/** the glyph and its colour in front of a name: folder (open or shut), link, or a file by its extension */
+function glyphOf(row: Row): { glyph: string; color: string } {
+  if (row.dir) return { glyph: row.open ? '▾' : '■', color: row.hidden ? FT.hidden : FT.neon }
+  if (row.link) return { glyph: '↪', color: FT.dim }
+  const dot = row.name.lastIndexOf('.')
+  const color = (dot > 0 ? EXT_COLOR[row.name.slice(dot + 1).toLowerCase()] : undefined) ?? FT.dim
+  return { glyph: '◆', color }
+}
+
+/** the git mark of a row: its own, or a dot for a folder that holds a changed file */
+function gitMarkOf(row: Row, rootPath: string, git: ReadonlyMap<string, string> | undefined): { mark: string; color: string } {
+  if (!git || git.size === 0) return { mark: '', color: FT.dim }
+  const rel = row.path.startsWith(`${rootPath}/`) ? row.path.slice(rootPath.length + 1) : row.path
+  let mark = git.get(rel) ?? git.get(`${rel}/`) ?? ''
+  if (mark === '' && row.dir) {
+    for (const k of git.keys()) if (k.startsWith(`${rel}/`)) { mark = '•'; break }
+  }
+  const color = mark === 'D' ? '#e06c6c' : mark === '?' || mark === 'A' ? FT.read : FT.write
+  return { mark, color }
 }
 
 function getParent(p: string): string {
@@ -134,33 +194,37 @@ export function FilesTab(
 
     // 1. Root chips row
     const chipRow = (
-      <Box flexDirection="row" gap={1} flexWrap="wrap">
+      <Box flexDirection="row" gap={1} flexWrap="wrap" marginBottom={1}>
         {view.roots.map(r => {
           const isChosen = r.id === rootId
-          return Button({
-            key: `files-root:${r.id}`,
-            plain: true,
-            onPress: () => ui.set('files:root', r.id),
-            children: [
-              <Text
-                backgroundColor={isChosen ? FT.activeChip : FT.chipFill}
-                color={isChosen ? FT.white : FT.fileText}
-                bold={isChosen}
-              >
-                {` ${clip(r.label, Math.max(4, W - 4))} `}
-              </Text>,
-            ],
-          })
+          return (
+            <Box key={`files-root-box:${r.id}`} borderStyle="round" borderColor={isChosen ? FT.neon : FT.hidden} backgroundColor={isChosen ? FT.activeChip : FT.chipFill} paddingX={1}>
+              {Button({
+                key: `files-root:${r.id}`,
+                plain: true,
+                onPress: () => ui.set('files:root', r.id),
+                children: [
+                  <Text color={isChosen ? FT.white : r.idle ? FT.hidden : FT.fileText} bold={true}>
+                    {clip(r.label, Math.max(4, W - 8))}
+                  </Text>,
+                ],
+              })}
+            </Box>
+          )
         })}
       </Box>
     )
 
     // 2. Card header with counts, root path, search box and expand/collapse buttons
     const innerCardW = Math.max(4, W - 4)
-    const countText = `● ${view.nWrite} ◉ ${view.nRead}`
+    const dirty = view.git?.size ?? 0
+    const countText = `${view.nFolders} folders · ${view.nFiles} files${view.git ? (dirty > 0 ? ` · ● ${dirty} dirty` : ' · ✓ clean') : ''}`
     const leftLabelBudget = Math.max(4, innerCardW - countText.length - 1)
-    const clippedRootLabel = clip(activeRoot.label, leftLabelBudget)
-    const clippedRootPath = clip(activeRoot.path, innerCardW)
+    const clippedRootLabel = clip(activeRoot.id === 'main' ? activeRoot.label : `${activeRoot.label} · worktree`, leftLabelBudget)
+    const home = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env?.HOME
+    const tilde = (p: string): string => (home && p.startsWith(`${home}/`) ? `~${p.slice(home.length)}` : p)
+    // the line under the label names the selected row, else the root
+    const clippedRootPath = clip(tilde(selectedRow && !selectedRow.note ? selectedRow.path : activeRoot.path), innerCardW)
 
     let searchInputEl: RenderElement
     if ('Input' in els) {
@@ -196,16 +260,17 @@ export function FilesTab(
       >
         <Box flexDirection="row" justifyContent="space-between">
           <Text bold={true} color={FT.neon}>{clippedRootLabel}</Text>
-          <Box flexDirection="row" gap={1}>
-            <Text color={FT.write} dimColor={!view.pulse}>●</Text>
-            <Text color={FT.fileText}>{String(view.nWrite)}</Text>
-            <Text color={FT.read}>◉</Text>
-            <Text color={FT.fileText}>{String(view.nRead)}</Text>
+          <Box flexDirection="row">
+            <Text dimColor={true} color={FT.dim}>{`${view.nFolders} folders · ${view.nFiles} files`}</Text>
+            {view.git
+              ? (dirty > 0
+                ? <Text color={FT.write}>{` · ● ${dirty} dirty`}</Text>
+                : <Text color={FT.neon}>{' · ✓ clean'}</Text>)
+              : []}
           </Box>
         </Box>
         <Text dimColor={true} color={FT.dim} wrap="truncate">{clippedRootPath}</Text>
-        <Box flexDirection="row" gap={1} marginTop={1}>
-          {searchInputEl}
+        <Box flexDirection="row" gap={1} borderColor={FT.cardBorder} borderStyle="round" paddingX={1}>
           {Button({
             key: 'files-s',
             hotkey: 's',
@@ -213,18 +278,19 @@ export function FilesTab(
             label: 'search',
             onPress: () => ui.focus?.('files-q'),
           })}
+          {searchInputEl}
         </Box>
-        <Box flexDirection="row" gap={1} justifyContent="flex-end" marginTop={1}>
+        <Box flexDirection="row" gap={1} justifyContent="flex-end">
           {Button({
             key: 'files-expand',
             plain: true,
-            label: '▾ Expand all',
+            children: [<Text backgroundColor={FT.chipFill} color={FT.fileText}>{' ▾ Expand all '}</Text>],
             onPress: () => ui.set('files:open', JSON.stringify(view.dirs ?? [])),
           })}
           {Button({
             key: 'files-collapse',
             plain: true,
-            label: '▸ Collapse all',
+            children: [<Text backgroundColor={FT.chipFill} color={FT.fileText}>{' ▸ Collapse all '}</Text>],
             onPress: () => ui.set('files:open', JSON.stringify([])),
           })}
         </Box>
@@ -233,6 +299,36 @@ export function FilesTab(
 
     // 3. Tree rows
     const innerTreeW = Math.max(4, W - 2)
+    const showCols = W >= COLS_MIN_W
+    const sortBy = ui.get('files:sort') === 'size' || ui.get('files:sort') === 'date' ? ui.get('files:sort') : 'name'
+    const sortDesc = ui.get('files:dir') === 'desc'
+    const pressSort = (by: string) => {
+      if (by === sortBy) {
+        ui.set('files:dir', sortDesc ? 'asc' : 'desc')
+      } else {
+        ui.set('files:sort', by)
+        ui.set('files:dir', by === 'name' ? 'asc' : 'desc')
+      }
+    }
+    const headCell = (by: 'name' | 'size' | 'date', label: string, width: number, right: boolean) => {
+      const text = `${label}${sortBy === by ? (sortDesc ? ' ▼' : ' ▲') : ''}`
+      return Button({
+        key: `files-sort-${by}`,
+        plain: true,
+        onPress: () => pressSort(by),
+        children: [<Text bold={sortBy === by} color={sortBy === by ? FT.neon : FT.dim}>{right ? text.padStart(width) : text.padEnd(width)}</Text>],
+      })
+    }
+    const headRow = (
+      <Box key="files-head" flexDirection="row">
+        <Text>{' '.repeat(3)}</Text>
+        {headCell('name', 'Name', showCols ? innerTreeW - 3 - GIT_W - SIZE_W - DATE_W - ACT_W : innerTreeW - 3, false)}
+        {showCols ? <Text color={FT.dim}>{'Git'.padStart(GIT_W - 1).padEnd(GIT_W)}</Text> : []}
+        {showCols ? headCell('size', 'Size', SIZE_W, true) : []}
+        {showCols ? headCell('date', 'Modified', DATE_W, true) : []}
+        {showCols ? <Text>{' '.repeat(ACT_W)}</Text> : []}
+      </Box>
+    )
     const drawnRows: RenderElement[] = []
     if (view.rows.length === 0) {
       drawnRows.push(
@@ -247,23 +343,31 @@ export function FilesTab(
         if (row.note === 'empty') {
           drawnRows.push(
             <Text key={row.key} dimColor={true} color={FT.dim}>
-              {clip(` ${indentStr}  (empty)`, innerTreeW)}
+              {clip(` ${indentStr}    (empty)`, innerTreeW)}
             </Text>,
           )
           continue
         }
         if (row.note === 'unlisted') {
           drawnRows.push(
-            <Text key={row.key} dimColor={true} color={FT.dim}>
-              {clip(` ${indentStr}  (not listed)`, innerTreeW)}
-            </Text>,
+            <Box key={row.key} flexDirection="row" gap={1}>
+              <Text dimColor={true} color={FT.dim}>{clip(` ${indentStr}    (not scanned)`, Math.max(4, innerTreeW - 10))}</Text>
+              {ui.scan
+                ? Button({
+                    key: `files-scan:${row.path}`,
+                    plain: true,
+                    onPress: () => ui.scan?.(row.path),
+                    children: [<Text backgroundColor={FT.chipFill} color={FT.fileText}>{' ⟳ scan '}</Text>],
+                  })
+                : []}
+            </Box>,
           )
           continue
         }
         if (row.note === 'more') {
           drawnRows.push(
             <Text key={row.key} dimColor={true} color={FT.dim}>
-              {clip(` ${indentStr}  ${row.count} more`, innerTreeW)}
+              {clip(` ${indentStr}    ${row.count} more`, innerTreeW)}
             </Text>,
           )
           continue
@@ -272,9 +376,9 @@ export function FilesTab(
         // Regular path row
         const leftBar = isSelected ? '▌' : ' '
         const caret = row.dir ? (row.open ? '▾' : '▸') : ' '
-        const displayName = row.link ? `${row.name} →` : row.name
+        const displayName = row.link ? `${row.name} →` : row.dir ? `${row.name}/` : row.name
 
-        // Icon column (4 characters wide, right-aligned)
+        // Right icon column (4 characters wide, right-aligned)
         let iconSymbol = ''
         let iconCountStr = ''
         if (row.icon === 'write') {
@@ -288,8 +392,10 @@ export function FilesTab(
         const rightIconWidth = (iconSymbol + iconCountStr).length > 0 ? 5 : 0
 
         // Calculate name budget so entire line fits inside innerTreeW (W - 2)
-        const prefixWidth = 1 + row.depth * 2 + 1 + 1 // bar (1) + indent + caret (1) + space (1)
-        const nameBudget = Math.max(3, innerTreeW - prefixWidth - rightIconWidth - (rightIconWidth > 0 ? 1 : 0))
+        const prefixWidth = 1 + row.depth * 2 + 1 + 1 + ICON_W // bar (1) + indent + caret (1) + space (1) + file glyph
+        const nameBudget = showCols
+          ? Math.max(3, innerTreeW - prefixWidth - GIT_W - SIZE_W - DATE_W - ACT_W)
+          : Math.max(3, innerTreeW - prefixWidth - rightIconWidth - (rightIconWidth > 0 ? 1 : 0))
         const clippedName = clip(displayName, nameBudget)
 
         // Text colour
@@ -338,7 +444,7 @@ export function FilesTab(
 
         // a Button holds only strings and Text, so the row background is the Box and the
         // icon column is Text inside the Button, pushed right by padding the name with spaces
-        const nameCell = rightIconWidth > 0 ? clippedName.padEnd(nameBudget + 1) : clippedName.padEnd(innerTreeW - prefixWidth)
+        const nameCell = showCols ? clippedName.padEnd(nameBudget) : rightIconWidth > 0 ? clippedName.padEnd(nameBudget + 1) : clippedName.padEnd(innerTreeW - prefixWidth)
         drawnRows.push(
           <Box key={`files-line:${row.path}`} flexDirection="row" backgroundColor={rowBg}>
             {Button({
@@ -350,8 +456,23 @@ export function FilesTab(
                 <Text>{indentStr}</Text>,
                 <Text color={FT.dim}>{caret}</Text>,
                 <Text> </Text>,
+                <Text color={glyphOf(row).color}>{`${glyphOf(row).glyph} `}</Text>,
                 <Text color={nameColor} bold={isBold}>{nameCell}</Text>,
-                ...(rightIconWidth > 0
+                ...(showCols
+                  ? [
+                      <Text color={gitMarkOf(row, activeRoot.path, view.git).color}>{gitMarkOf(row, activeRoot.path, view.git).mark.padStart(GIT_W - 1).padEnd(GIT_W)}</Text>,
+                      <Text color={FT.dim}>{fmtSize(row.dir ? undefined : row.size).padStart(SIZE_W)}</Text>,
+                      <Text color={FT.dim}>{fmtDate(row.mtimeMs).padStart(DATE_W)}</Text>,
+                      <Text
+                        color={row.icon === 'write' ? FT.write : FT.read}
+                        dimColor={row.icon === 'write' ? !view.pulse : false}
+                      >
+                        {(rightIconWidth > 0 ? `${iconSymbol}${iconCountStr}`.padStart(4) + ' ' : '').padEnd(ACT_W)}
+                      </Text>,
+                    ]
+                  : [])
+                ,
+                ...(!showCols && rightIconWidth > 0
                   ? [
                       <Text
                         color={row.icon === 'write' ? FT.write : FT.read}
@@ -381,21 +502,10 @@ export function FilesTab(
       )
     }
 
-    // 5. Under the tree line
-    const countsStr = `${view.nFolders} folders · ${view.nFiles} files`
-    const selPathStr = selectedRow ? selectedRow.path : ''
-    const underBudget = Math.max(4, W - countsStr.length - 2)
-    const underTree = (
-      <Box flexDirection="row" justifyContent="space-between">
-        <Text dimColor={true} color={FT.dim}>{countsStr}</Text>
-        <Text dimColor={true} color={FT.dim}>{clip(selPathStr, underBudget)}</Text>
-      </Box>
-    )
-
     // 6. Footer: legend and hotkeys j, k, h, l; one line when wide, two lines (legend, then keys) otherwise
     const footerRow = W >= 64
     const footer = (
-      <Box flexDirection={footerRow ? 'row' : 'column'} justifyContent="space-between">
+      <Box flexDirection={footerRow ? 'row' : 'column'} justifyContent="space-between" marginTop={1}>
         <Box flexDirection="row" gap={1}>
           <Text color={FT.write}>●</Text>
           <Text dimColor={true} color={FT.dim}>writing ·</Text>
@@ -412,14 +522,14 @@ export function FilesTab(
     )
 
     return (
-      <Box flexDirection="column" gap={1} width={W} backgroundColor={FT.paneBg}>
+      <Box flexDirection="column" width={W} backgroundColor={FT.paneBg}>
         {chipRow}
         {card}
         <Box flexDirection="column" borderColor={FT.cardBorder} borderStyle="round" backgroundColor={FT.cardFill}>
+          {headRow}
           {drawnRows}
         </Box>
-        {banners.length > 0 ? <Box flexDirection="column">{banners}</Box> : []}
-        {underTree}
+        {banners.length > 0 ? <Box flexDirection="column" marginTop={1}>{banners}</Box> : []}
         {footer}
       </Box>
     )

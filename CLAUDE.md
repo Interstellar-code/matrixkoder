@@ -42,3 +42,7 @@ Only for complex code (several files, risky or cross-cutting changes), state a b
 ```
 
 Weak criteria ("make it work") need constant clarification. Strong criteria let you loop alone.
+
+# CodeGraph
+
+This repo has a `.codegraph/` index. To find or trace code, call `codegraph_explore` before grep or reading files, and name exact symbols or files (e.g. "walkRoot treeRows rootsOf"), not a sentence. Use it for "where is X", "who calls X" and "what breaks if I change X". Don't grep to re-check its results.

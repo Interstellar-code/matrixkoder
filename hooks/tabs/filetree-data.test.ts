@@ -7,6 +7,8 @@ import {
   treeRows,
   diffWalk,
   rootsOf,
+  gitStatusMap,
+  ignoredDirs,
   pickRoot,
   type Walk,
   type Row,
@@ -498,7 +500,7 @@ test('Files F2.1: row shape and unique key contract on fixture with empty, unlis
 test('Files F2.1: rootsOf lists main checkout first with id main and label repo', () => {
   const roots = rootsOf('/path/to/main', [])
   expect(roots).toEqual([
-    { id: 'main', label: 'repo', path: '/path/to/main' },
+    { id: 'main', label: 'main', path: '/path/to/main' },
   ])
 })
 
@@ -512,8 +514,8 @@ test('Files F2.1: rootsOf lists each slot in slot order with id slot-N and task 
   const roots = rootsOf('/main', slots)
 
   expect(roots).toEqual([
-    { id: 'main', label: 'repo', path: '/main' },
-    { id: 'slot-1', label: 'slot 1', path: '/worktrees/slot-1' },
+    { id: 'main', label: 'main', path: '/main' },
+    { id: 'slot-1', label: 'slot 1', path: '/worktrees/slot-1', idle: true },
     { id: 'slot-2', label: 'F1.1', path: '/worktrees/slot-2' },
     { id: 'slot-3', label: 'F2.1', path: '/worktrees/slot-3' },
   ])
@@ -521,14 +523,57 @@ test('Files F2.1: rootsOf lists each slot in slot order with id slot-N and task 
 
 test('Files F2.1: pickRoot returns chosen root or falls back to main checkout', () => {
   const roots = [
-    { id: 'main', label: 'repo', path: '/main' },
+    { id: 'main', label: 'main', path: '/main' },
     { id: 'slot-1', label: 'slot 1', path: '/slot-1' },
     { id: 'slot-2', label: 'F2', path: '/slot-2' },
   ]
 
   expect(pickRoot(roots, 'slot-2')).toEqual({ id: 'slot-2', label: 'F2', path: '/slot-2' })
-  expect(pickRoot(roots, 'slot-999')).toEqual({ id: 'main', label: 'repo', path: '/main' })
-  expect(pickRoot(roots, undefined)).toEqual({ id: 'main', label: 'repo', path: '/main' })
-  expect(pickRoot(roots, null)).toEqual({ id: 'main', label: 'repo', path: '/main' })
-  expect(pickRoot(roots, '')).toEqual({ id: 'main', label: 'repo', path: '/main' })
+  expect(pickRoot(roots, 'slot-999')).toEqual({ id: 'main', label: 'main', path: '/main' })
+  expect(pickRoot(roots, undefined)).toEqual({ id: 'main', label: 'main', path: '/main' })
+  expect(pickRoot(roots, null)).toEqual({ id: 'main', label: 'main', path: '/main' })
+  expect(pickRoot(roots, '')).toEqual({ id: 'main', label: 'main', path: '/main' })
+})
+
+test('Files columns: treeRows sorts by size and date, folders stay first, desc flips, size and date ride on the rows', () => {
+  const walk: Walk = {
+    dirs: new Map([['/r', [
+      makeEntry('b.txt', 'file', 50, 3000),
+      makeEntry('a.txt', 'file', 900, 1000),
+      makeEntry('c.txt', 'file', 5, 2000),
+      makeEntry('zdir', 'dir', 0, 500),
+    ]]]),
+    capped: false,
+    missing: false,
+  }
+  const names = (by: 'name' | 'size' | 'date', desc: boolean): string[] =>
+    treeRows(walk, '/r', new Set<string>(), '', new Map(), { by, desc }).map(r => r.name)
+  expect(names('name', false)).toEqual(['zdir', 'a.txt', 'b.txt', 'c.txt'])
+  expect(names('size', false)).toEqual(['zdir', 'c.txt', 'b.txt', 'a.txt'])
+  expect(names('size', true)).toEqual(['zdir', 'a.txt', 'b.txt', 'c.txt'])
+  expect(names('date', true)).toEqual(['zdir', 'b.txt', 'c.txt', 'a.txt'])
+  const first = treeRows(walk, '/r', new Set<string>(), '', new Map()).find(r => r.name === 'a.txt')!
+  expect(first.size).toBe(900)
+  expect(first.mtimeMs).toBe(1_000_000) // 1000 is seconds, so it reads as 1e6 ms
+})
+
+test('Files git: gitStatusMap reads porcelain lines into one-letter marks, renames to the new path', () => {
+  const m = gitStatusMap(' M hooks/a.ts\n?? notes/\nD  gone.txt\nA  new.ts\nR  old.ts -> moved.ts\n')
+  expect(m.get('hooks/a.ts')).toBe('M')
+  expect(m.get('notes/')).toBe('?')
+  expect(m.get('gone.txt')).toBe('D')
+  expect(m.get('new.ts')).toBe('A')
+  expect(m.get('moved.ts')).toBe('R')
+})
+
+test('Files ignored: ignoredDirs reads git-ignored folders, walkRoot leaves them unlisted', async () => {
+  const ign = ignoredDirs('out/\nsrc/gen/\nnotes.log\n', '/r')
+  expect([...ign].sort()).toEqual(['/r/out', '/r/src/gen'])
+  const listed: string[] = []
+  const walk = await walkRoot('/r', async dir => {
+    listed.push(dir)
+    return dir === '/r' ? [makeEntry('out', 'dir'), makeEntry('src', 'dir')] : []
+  }, ign)
+  expect(listed.sort()).toEqual(['/r', '/r/src'])
+  expect(walk.dirs.has('/r/out')).toBe(false)
 })

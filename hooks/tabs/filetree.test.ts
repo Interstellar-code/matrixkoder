@@ -148,15 +148,17 @@ test('Files F3.1: root chips show repo and each lane with active chip colours on
   // Active chip (main) has activeChip colour and white bold text
   const mainChip = chipButtons[0]!
   const mainText = nodesOf(mainChip, 'Text')[0]!
-  expect(mainText.props?.backgroundColor).toBe(FT.activeChip)
+  // the chip colour sits on the rounded Box that wraps the button
+  const chipBox = (id: string) => nodesOf(tree, 'Box').find(x => x.props?.key === `files-root-box:${id}`)!
+  expect(chipBox('main').props?.backgroundColor).toBe(FT.activeChip)
   expect(mainText.props?.color).toBe(FT.white)
   expect(mainText.props?.bold).toBe(true)
-  expect(textOf(mainChip)).toContain('repo')
+  expect(textOf(mainChip)).toContain('main')
 
   // Inactive chip (slot-1) has chipFill and fileText
   const slot1Chip = chipButtons[1]!
   const slot1Text = nodesOf(slot1Chip, 'Text')[0]!
-  expect(slot1Text.props?.backgroundColor).toBe(FT.chipFill)
+  expect(chipBox('slot-1').props?.backgroundColor).toBe(FT.chipFill)
   expect(slot1Text.props?.color).toBe(FT.fileText)
   expect(textOf(slot1Chip)).toContain('P4')
 
@@ -180,31 +182,23 @@ test('Files F3.1: root chips show repo and each lane with active chip colours on
   }
 })
 
-test('Files F3.1: card shows root label in bold neon, write count after amber dot, read count after teal ring, and dim clipped path', () => {
-  const view = filetreeFixtureView({ nWrite: 7, nRead: 11 })
+test('Files F3.1: card shows root label in bold neon, folder and file counts, git dirty count or clean, and the dim clipped path', () => {
+  const view = filetreeFixtureView({ nFolders: 7, nFiles: 11 })
   const { ui } = createMockUi()
-  const tree = FilesTab(stubEls, view, 46, ui)
+  const textNodes = nodesOf(FilesTab(stubEls, view, 46, ui), 'Text')
 
-  const textNodes = nodesOf(tree, 'Text')
-
-  // Root label in bold neon
   const neonLabel = textNodes.find(t => t.props?.color === FT.neon && t.props?.bold === true)
   expect(neonLabel).toBeDefined()
-  expect(textOf(neonLabel)).toBe('repo')
+  expect(textOf(neonLabel)).toBe('main')
+  expect(textNodes.some(t => textOf(t) === '7 folders · 11 files')).toBe(true)
 
-  // Amber dot and write count
-  const amberDot = textNodes.find(t => t.props?.color === FT.write && textOf(t).includes('●'))
-  expect(amberDot).toBeDefined()
-  const writeCount = textNodes.find(t => textOf(t) === '7')
-  expect(writeCount).toBeDefined()
+  // git read: dirty count in amber; nothing dirty reads clean; git not read shows neither
+  const dirty = nodesOf(FilesTab(stubEls, { ...view, git: new Map([['a.ts', 'M'], ['b.ts', '?']]) }, 46, ui), 'Text')
+  expect(dirty.some(t => t.props?.color === FT.write && textOf(t).includes('2 dirty'))).toBe(true)
+  const clean = nodesOf(FilesTab(stubEls, { ...view, git: new Map() }, 46, ui), 'Text')
+  expect(clean.some(t => textOf(t).includes('clean'))).toBe(true)
+  expect(textNodes.some(t => textOf(t).includes('dirty') || textOf(t).includes('clean'))).toBe(false)
 
-  // Teal ring and read count
-  const tealRing = textNodes.find(t => t.props?.color === FT.read && textOf(t).includes('◉'))
-  expect(tealRing).toBeDefined()
-  const readCount = textNodes.find(t => textOf(t) === '11')
-  expect(readCount).toBeDefined()
-
-  // Root path is dim
   const dimPath = textNodes.find(t => t.props?.color === FT.dim && textOf(t).includes('/repo'))
   expect(dimPath).toBeDefined()
   expect(dimPath?.props?.dimColor).toBe(true)
@@ -218,7 +212,7 @@ test('Files F3.1: folders are bold neon with caret, files in file text, hidden i
   const textNodes = nodesOf(tree, 'Text')
 
   // Folders are bold neon with caret (open or folded)
-  const docsFolderText = textNodes.find(t => textOf(t).trim() === 'docs')
+  const docsFolderText = textNodes.find(t => textOf(t).trim() === 'docs/')
   expect(docsFolderText?.props?.color).toBe(FT.neon)
   expect(docsFolderText?.props?.bold).toBe(true)
 
@@ -227,7 +221,7 @@ test('Files F3.1: folders are bold neon with caret, files in file text, hidden i
   expect(readmeText?.props?.color).toBe(FT.fileText)
 
   // Hidden names in hidden text
-  const hiddenText = textNodes.find(t => textOf(t).trim() === '.github')
+  const hiddenText = textNodes.find(t => textOf(t).trim() === '.github/')
   expect(hiddenText?.props?.color).toBe(FT.hidden)
 
   // Links dim with trailing arrow
@@ -350,7 +344,7 @@ test('Files F3.1: empty folder shows dim empty row, unlisted folder shows dim no
     {
       key: 'files-unlisted:/repo/unlisted-dir',
       path: '/repo/unlisted-dir',
-      name: '(not listed)',
+      name: '(not scanned)',
       depth: 1,
       dir: false,
       open: false,
@@ -377,8 +371,8 @@ test('Files F3.1: empty folder shows dim empty row, unlisted folder shows dim no
   expect(emptyText.props?.color).toBe(FT.dim)
   expect(emptyText.props?.dimColor).toBe(true)
 
-  // unlisted folder shows dim (not listed) row
-  const unlistedText = textNodes.find(t => textOf(t).includes('(not listed)'))!
+  // unlisted folder shows dim (not scanned) row
+  const unlistedText = textNodes.find(t => textOf(t).includes('(not scanned)'))!
   expect(unlistedText).toBeDefined()
   expect(unlistedText.props?.color).toBe(FT.dim)
   expect(unlistedText.props?.dimColor).toBe(true)
@@ -495,15 +489,6 @@ test('Files F3.1: at 46 and 36 columns no line is wider than column count and lo
       expect(noteLineWidth, `note row at ${cols} cols: ${noteLineWidth}`).toBeLessThanOrEqual(cols)
     }
 
-    // 4. Line under the tree (counts + path)
-    const underTreeBox = rootChildren.find(b => {
-      return b.type === 'Box' && nodesOf(b, 'Text').some(t => textOf(t).includes('folders'))
-    }) as Node
-    expect(underTreeBox).toBeDefined()
-    const underTexts = nodesOf(underTreeBox, 'Text')
-    const underTreeLineWidth = underTexts.reduce((sum, t) => sum + textOf(t).length, 0) + 1 + boxOverhead(underTreeBox)
-    expect(underTreeLineWidth, `under-tree line at ${cols} cols: ${underTreeLineWidth}`).toBeLessThanOrEqual(cols)
-
     // 5. Footer line (legend with gaps + space + keys with gaps)
     const footerBox = rootChildren.find(b => {
       return b.type === 'Box' && nodesOf(b, 'Button').some(btn => btn.props?.key === 'files-key-j')
@@ -603,7 +588,7 @@ test('Files F3.1: pressing j and k calls ui.set for next and previous visible pa
     {
       key: 'files-unlisted:/repo/u',
       path: '/repo/u',
-      name: '(not listed)',
+      name: '(not scanned)',
       depth: 1,
       dir: false,
       open: false,
@@ -950,14 +935,32 @@ test('Files polish: the tab drawn as text lines at 80, 46 and 36 columns, with e
   }
 })
 
-test('Files polish: note rows start in the name column, the no-match line shows the query, the footer sits one blank line under the tree line', () => {
+test('Files polish: note rows start in the name column, the no-match line shows the query, the footer legend sits one blank line under the tree', () => {
   const view = filetreeFixtureView()
   const { plain } = renderLines(FilesTab(stubEls, view, 46, createMockUi().ui), 46)
   const col = (needle: string): number => plain.find(l => l.includes(needle))!.indexOf(needle)
   expect(col('(empty)')).toBe(col('guide.md'))
   const none = renderLines(FilesTab(stubEls, filetreeFixtureView({ rows: [], q: 'zzz' }), 46, createMockUi().ui), 46).plain
   expect(none.some(l => l.includes('no file matches “zzz”'))).toBe(true)
-  const under = plain.findIndex(l => l.includes('folders ·'))
-  expect(plain[under + 1]).toBe('')
-  expect(plain[under + 2]).toContain('writing')
+  const legend = plain.findIndex(l => l.includes('writing'))
+  expect(plain[legend - 1]).toBe('')
+  expect(plain.some(l => l.includes('folders ·'))).toBe(true)
+})
+
+test('Files columns: a header row sorts by Name, Size and Modified; wide rows carry size and date and a glyph, narrow rows no columns', () => {
+  const view = filetreeFixtureView()
+  const { ui, state } = createMockUi()
+  const wide = FilesTab(stubEls, view, 80, ui)
+  const wideTexts = nodesOf(wide, 'Text').map(t => textOf(t))
+  expect(wideTexts.some(t => t.includes('Size'))).toBe(true)
+  expect(wideTexts.some(t => t.includes('Modified'))).toBe(true)
+  expect(wideTexts.some(t => t.startsWith('■') || t.startsWith('▾'))).toBe(true)
+  expect(wideTexts.some(t => t.includes('Git'))).toBe(true)
+  const sizeBtn = nodesOf(wide, 'Button').find(b => b.props?.key === 'files-sort-size')!
+  ;(sizeBtn.props as { onPress: () => void }).onPress()
+  expect(state['files:sort']).toBe('size')
+  expect(state['files:dir']).toBe('desc')
+  const narrow = FilesTab(stubEls, view, 46, ui)
+  expect(nodesOf(narrow, 'Button').some(b => b.props?.key === 'files-sort-size')).toBe(false)
+  expect(nodesOf(narrow, 'Button').some(b => b.props?.key === 'files-sort-name')).toBe(true)
 })

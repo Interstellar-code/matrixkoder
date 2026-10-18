@@ -39,8 +39,8 @@ import { SettingsTab } from './tabs/settings'
 import type { SettingsValue, SettingsView } from './tabs/settings'
 import { FilesTab } from './tabs/filetree'
 import type { FilesTabUi, FilesView } from './tabs/filetree'
-import { diffWalk, pickRoot, rootsOf, treeRows, walkRoot } from './tabs/filetree-data'
-import type { RootItem, Walk } from './tabs/filetree-data'
+import { diffWalk, gitStatusMap, ignoredDirs, pickRoot, rootsOf, treeRows, walkRoot } from './tabs/filetree-data'
+import type { RootItem, SortSpec, Walk } from './tabs/filetree-data'
 import { liveActivity, recordActivity } from './filetree-activity'
 import {
   applySavedView, buildSettingsView, firstTagLine, runListFields, parsePluginManifest, runMigrate, saveGlobals, saveYaml,
@@ -183,6 +183,10 @@ let lastFilesDraw = 0
 let filesShown = false
 let filesSlotsStamp: number | null = null
 const filesWalkCache = new Map<string, Walk>()
+/** git status marks per walked root, refreshed with each walk */
+const filesGitCache = new Map<string, Map<string, string>>()
+/** folders the user pressed scan on: each is listed one level deep on every walk */
+const filesScanned = new Set<string>()
 let filesWalkInFlight = false
 let filesSkipOnce = false
 let filesCurrentRoot: string | null = null
@@ -316,7 +320,7 @@ export function registerDashboard(on: On, options: PluginOptions): void {
     // straight onto settings (defaultTab) loads here while nothing is stored;
     // every other open reloads from the tab switch (LOW 5) — a render must
     // never start a refresh on its own, or the refresh tick would re-list.
-    if (dashTab === 'lanes' && Date.now() - Number(viewState['lanes:slots-at'] ?? '0') > 30_000) void loadLaneSlots($)
+    if ((dashTab === 'lanes' || dashTab === 'files') && Date.now() - Number(viewState['lanes:slots-at'] ?? '0') > 30_000) void loadLaneSlots($)
     filesShown = dashTab === 'files'
     // the Files reads below may find the plugin unloaded when a render lands during teardown: they settle to empty, never reject
     if (dashTab === 'files') {
@@ -1043,7 +1047,7 @@ async function startFilesWalk($: EngineInterface): Promise<void> {
     const cwd = await filesCwd($)
     if (!cwd) return
     const view = await read($, viewStateAtom)
-    const root = pickRoot(rootsOf(await cachedMainCheckout($, cwd), busySlotsOf(view)), view['files:root'])
+    const root = pickRoot(rootsOf(await cachedMainCheckout($, cwd), laneSlotsOf(view)), view['files:root'])
     if (!filesWalkCache.has(root.path)) await runFilesWalk($, root.path)
   } catch {
     // fire and forget: a state read refused after the plugin unloaded must not surface; the next tick starts again
@@ -1057,7 +1061,14 @@ async function runFilesWalk($: EngineInterface, rootPath: string): Promise<void>
     filesNow = await $.clock.now()
     const walkStart = filesNow
     const prevWalk = filesWalkCache.get(rootPath)
-    const nextWalk = await walkRoot(rootPath, dir => $.fs.list(dir))
+    // git-ignored folders are not scanned; only a press on their scan button lists one
+    const ignOut = await $.process.run(['git', '-C', rootPath, 'ls-files', '--others', '--ignored', '--exclude-standard', '--directory'], { timeoutMs: 2000 }).catch(() => null)
+    const skip = ignOut != null && ignOut.exitCode === 0 ? ignoredDirs(ignOut.stdout, rootPath) : new Set<string>()
+    const nextWalk = await walkRoot(rootPath, dir => $.fs.list(dir), skip)
+    for (const dir of filesScanned) {
+      if (!dir.startsWith(`${rootPath}/`)) continue
+      try { nextWalk.dirs.set(dir, await $.fs.list(dir)) } catch { /* gone: the next walk drops it */ }
+    }
     const walkEnd = await $.clock.now()
     const duration = walkEnd - walkStart
     if (duration > 1000) {
@@ -1082,6 +1093,11 @@ async function runFilesWalk($: EngineInterface, rootPath: string): Promise<void>
       }
     }
     filesWalkCache.set(rootPath, nextWalk)
+    const gitOut = await $.process.run(['git', '-C', rootPath, 'status', '--porcelain'], { timeoutMs: 2000 }).catch(() => null)
+    const nextGit = gitOut != null && gitOut.exitCode === 0 ? gitStatusMap(gitOut.stdout) : new Map<string, string>()
+    const prevGit = filesGitCache.get(rootPath)
+    if (JSON.stringify([...nextGit]) !== JSON.stringify([...(prevGit ?? [])])) changed = true
+    filesGitCache.set(rootPath, nextGit)
     if (changed) {
       // cleared only once the write landed; any failure (a render-time refusal too) retries on the next tick
       filesBumpPending = true
@@ -1127,7 +1143,7 @@ function FilesPane(
 ): RenderElement {
   const { Text } = els
   try {
-    const slots = busySlotsOf(viewState)
+    const slots = laneSlotsOf(viewState)
     const roots = rootsOf(mainCheckoutPath || cwd, slots)
     const chosenId = viewState['files:root']
     const chosenRoot = pickRoot(roots, chosenId)
@@ -1140,7 +1156,7 @@ function FilesPane(
       void runFilesWalk($, chosenRoot.path).catch(() => {})
     }
 
-    const mainRoot = roots[0] ?? { id: 'main', label: 'repo', path: mainCheckoutPath || cwd }
+    const mainRoot = roots[0] ?? { id: 'main', label: 'main', path: mainCheckoutPath || cwd }
     if (chosenRoot.id !== 'main' && walk?.missing) {
       rootToRender = mainRoot
       note = 'missing root, fallback to repo'
@@ -1168,7 +1184,9 @@ function FilesPane(
 
     const q = viewState['files:q'] ?? ''
     const actMap = liveActivity(activity, filesNow)
-    const rows = treeRows(effectiveWalk, rootToRender.path, openSet, q, actMap)
+    const sortBy = viewState['files:sort']
+    const sort: SortSpec = { by: sortBy === 'size' || sortBy === 'date' ? sortBy : 'name', desc: viewState['files:dir'] === 'desc' }
+    const rows = treeRows(effectiveWalk, rootToRender.path, openSet, q, actMap, sort)
 
     let nFolders = 0
     let nFiles = 0
@@ -1202,6 +1220,7 @@ function FilesPane(
       pulse,
       capped: effectiveWalk.capped,
       note,
+      git: filesGitCache.get(rootToRender.path),
       q,
       sel: viewState['files:sel'],
     }
@@ -1213,6 +1232,15 @@ function FilesPane(
       },
       reveal: key => { void $.ui.scroll({ in: PANE_ID, to: { key } }).catch(() => {}) },
       focus: key => filesFocus($, key),
+      scan: path => {
+        filesScanned.add(path)
+        void $.fs.list(path)
+          .then(entries => {
+            filesWalkCache.get(rootToRender.path)?.dirs.set(path, entries)
+            return update($, viewStateAtom, prev => ({ ...prev, 'files:v': String(Number(prev['files:v'] ?? '0') + 1) }))
+          })
+          .catch(() => {})
+      },
     }
 
     return FilesTab(els, view, cols, filesTabUi)
@@ -2565,11 +2593,6 @@ export function liveOverviewView(snap: MkSnapshot): OverviewView {
  *  gate table, review counts, activity line, commit subject or pane id, so those stay
  *  empty; the stage strip is the task's place on LANE_PIPE. */
 /** The lane slots last read by loadLaneSlots, typed for the Lanes tab. */
-/** The Files root chips: only lane slots that hold a task (an idle slot has nothing being written). */
-function busySlotsOf(view: Record<string, string>): NonNullable<LanesView['slots']> {
-  return laneSlotsOf(view).filter(s => s.task != null && s.state !== 'free')
-}
-
 function laneSlotsOf(view: Record<string, string>): NonNullable<LanesView['slots']> {
   try {
     const raw = JSON.parse(view['lanes:slots'] ?? '[]') as unknown

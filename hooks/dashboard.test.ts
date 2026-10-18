@@ -2514,7 +2514,7 @@ test('Files F4.2: render reads fileActivity only when dashTab is files', { timeo
   expect(actReadCount).toBeGreaterThan(0)
 })
 
-test('Files F4.2: only lane slots that hold a task get a root chip, idle slots do not', { timeoutMs: 15000, plugins: [worldFixtures] }, async ($, on) => {
+test('Files F4.2: every lane slot gets a root chip, idle ones too', { timeoutMs: 15000, plugins: [worldFixtures] }, async ($, on) => {
   mockFs(on, worldFiles())
   const clock = mockWorld(on, {
     process: argv => {
@@ -2537,8 +2537,8 @@ test('Files F4.2: only lane slots that hold a task get a root chip, idle slots d
   }
   expect(keys).toContain('files-root:main')
   expect(keys).toContain('files-root:slot-1')
-  expect(keys).not.toContain('files-root:slot-3')
-  expect(keys).not.toContain('files-root:slot-4')
+  expect(keys).toContain('files-root:slot-3')
+  expect(keys).toContain('files-root:slot-4')
 })
 
 test('Files F4.2: missing lane root falls back to main checkout with note', { timeoutMs: 15000, plugins: [worldFixtures] }, async ($, on) => {
@@ -2748,16 +2748,19 @@ test('Files F4.3: a3 the tick walks and writes nothing when the last render was 
   expect({ calls: rootCalls, writes: rig.writes(), v: rig.vs()['files:v'] }).toEqual(before)
 })
 
+/** the amber write dots on screen: one per lit row, plus the legend's */
+const dots = (screen: string): number => (screen.match(/●/g) ?? []).length
+
 test('Files F4.3: a4 an entry recorded by a tool call is gone from the tab after advance(4500)', F43_OPTS, async ($, on) => {
   const rig = f43Rig(on, { startOnFiles: true, activity: [{ path: `${PROJECT_DIR}/a.ts`, kind: 'write', at: NOW }], listing: () => [f43Entry('a.ts')] })
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ ...F43_MOUNT, props: paneProps(46, 'inline') })
   await rig.settle()
   await ui.redraw(paneProps(46, 'inline'))
-  expect(await f43Screen(ui)).toMatch(/●\s*1\b/)
+  expect(dots(await f43Screen(ui))).toBe(2) // the lit row and the legend
   await rig.clock.advance(4500)
   await rig.settle()
-  expect(await f43Screen(ui)).toMatch(/●\s*0\b/) // no redraw by the test: the tick's rain:tick bump redraws
+  expect(dots(await f43Screen(ui))).toBe(1) // the legend only; // no redraw by the test: the tick's rain:tick bump redraws
 })
 
 test('Files F4.3: a5 a file created or changed in a listed folder shows as a write on the next tick, also inside a folded folder, and fades', F43_OPTS, async ($, on) => {
@@ -2785,11 +2788,11 @@ test('Files F4.3: a5 a file created or changed in a listed folder shows as a wri
   const last = rig.sets.filter(s => s.key === 'fileActivity').pop()?.value as { path: string; kind: string }[]
   expect(last.map(a => a.path).sort()).toEqual([`${PROJECT_DIR}/c.ts`, `${PROJECT_DIR}/sub/b.ts`])
   expect(last.every(a => a.kind === 'write')).toBe(true)
-  expect(await f43Screen(ui)).toMatch(/●\s*2\b/)
+  expect(dots(await f43Screen(ui))).toBeGreaterThanOrEqual(2)
   await rig.clock.advance(4500)
   await rig.settle()
   await ui.redraw(paneProps(46))
-  expect(await f43Screen(ui)).toMatch(/●\s*0\b/)
+  expect(dots(await f43Screen(ui))).toBe(1)
 })
 
 test('Files F4.3: a6 the first walk of a root, and the first walk after switching roots, records nothing', F43_OPTS, async ($, on) => {
