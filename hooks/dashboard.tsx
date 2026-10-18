@@ -964,6 +964,8 @@ export function PlanPane(els: Els, view: Record<string, string>, paneCols: numbe
           on: sub === name,
           onPress: () => { ui.set('plan:sub', name) },
         }))}
+        <Box flexGrow={1} />
+        {Segment(els, { key: 'plan-refresh', label: '↻ Refresh', on: false, hotkey: 'r', onPress: () => { ui.set('plans:reload', String(Date.now())) } })}
       </Box>
       {errorLine != null ? <Text color={ROLE.warn.fg} bold={true}>{errorLine}</Text> : null}
       {body}

@@ -343,3 +343,12 @@ test('plan actions: without ui.planAct archive still submits the mk: line', () =
   press(PlanPane(stubEls, ACTION_VIEW, 120, handle), 'plans-confirm-archive-dn')
   expect(subs).toEqual(['mk: archive plan dn'])
 })
+
+test('Refresh button bumps plans:reload so the list rereads', () => {
+  const ui = new Map<string, string>()
+  const view: Record<string, string> = { 'plans:store': '1', 'plans:list': LIST }
+  const drawn = PlanPane(stubEls, view, 80, { get: k => ui.get(k), set: (k, v) => { ui.set(k, v) } })
+  expect(nodesOf(drawn, 'Button').find(b => String(b.props?.key) === 'plan-refresh')?.props?.hotkey).toBe('r')
+  press(drawn, 'plan-refresh')
+  expect(Number(ui.get('plans:reload'))).toBeGreaterThan(0)
+})
