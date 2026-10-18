@@ -50,6 +50,7 @@ export function mockTabCounts(): Record<MkDashTab, string> {
     lanes: String(LANES_FIXTURE.lanes.length),
     plan: `${plan.done}/${plan.total}`,
     usage: '',
+    files: '',
     events: '',
     waiting: waitingCount(WAITING_FIXTURE.options.length > 0 ? 1 : 0),
     kanban: '',

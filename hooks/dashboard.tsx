@@ -8,10 +8,10 @@ import type { Elements, EngineInterface, On, PluginOptions, RenderElement } from
 
 // the per-surface element table $.ui.resolve(e) answers (every surface's has Box/Text)
 type Els = Elements[keyof Elements]
-import type { MkDashTab, MkRun, MkRunIndexEntry, MkSnapshot, MkStatusMemory, MkTask } from '../types'
+import type { MkDashTab, MkFileAct, MkRun, MkRunIndexEntry, MkSnapshot, MkStatusMemory, MkTask } from '../types'
 import {
   AGENT_ORDER, PANE_ID, EMPTY_SNAPSHOT, basename, coerceIndex, coerceRun, coerceUsage, join,
-  mkSnapshot, normalizePath, orderAgents, parentOf, parseJson, parseYamlAgents, parseYamlProviders,
+  mainCheckout, mkSnapshot, normalizePath, orderAgents, parentOf, parseGitdir, parseJson, parseYamlAgents, parseYamlProviders,
   sanitizeText, timerRegistry,
 } from './data'
 import type { MkPaneSnapshot } from './data'
@@ -37,6 +37,11 @@ import { PlanKanbanTab, planKanbanView } from './tabs/plankanban'
 import { PlanTaskPanel, findPlanTask } from './tabs/plantask'
 import { SettingsTab } from './tabs/settings'
 import type { SettingsValue, SettingsView } from './tabs/settings'
+import { FilesTab } from './tabs/filetree'
+import type { FilesTabUi, FilesView } from './tabs/filetree'
+import { diffWalk, pickRoot, rootsOf, treeRows, walkRoot } from './tabs/filetree-data'
+import type { RootItem, Walk } from './tabs/filetree-data'
+import { liveActivity, recordActivity } from './filetree-activity'
 import {
   applySavedView, buildSettingsView, firstTagLine, runListFields, parsePluginManifest, runMigrate, saveGlobals, saveYaml,
   savedEditKeys, topChangelogEntry,
@@ -50,6 +55,11 @@ import type { PendingAsk, RunWait } from './tabs/waiting'
 import { KanbanTab, kanbanView, readCards, emptyKanbanView, kanbanFixtureView, cardsErrorLine } from './tabs/kanban'
 import type { KanbanCard, KanbanFilters, CardsRead } from './tabs/kanban'
 import { chipText, toastsFor } from './status'
+
+const fileActivityAtom = atom(
+  { plugin: 'matrixkoder', key: 'fileActivity' } as const,
+  [] as readonly MkFileAct[],
+)
 
 // atoms are file-local consts (the scan reads this file's own consts); the
 // plugin+key address is what makes them one value across files
@@ -93,6 +103,7 @@ const TABS: readonly { key: MkDashTab; hotkey: string; label: string }[] = [
   { key: 'lanes', hotkey: 'l', label: 'Lanes' },
   { key: 'plan', hotkey: 'p', label: 'Plan' },
   { key: 'usage', hotkey: 'u', label: 'Usage' },
+  { key: 'files', hotkey: 'f', label: 'Files' },
   { key: 'events', hotkey: 'e', label: 'Events' },
   { key: 'waiting', hotkey: 'w', label: 'Waiting' },
   { key: 'kanban', hotkey: 'k', label: 'Kanban' },
@@ -167,8 +178,31 @@ let busInFlight = false
 const busTimers = timerRegistry
 let lastChipText: string | null | undefined // undefined = never set; skip ui.status when unchanged
 
+let filesNow = 0
+let lastFilesDraw = 0
+let filesShown = false
+let filesSlotsStamp: number | null = null
+const filesWalkCache = new Map<string, Walk>()
+let filesWalkInFlight = false
+let filesSkipOnce = false
+let filesCurrentRoot: string | null = null
+let lastRootWalked: string | null = null
+
+let filesSessionCwd = ''
+
 export function registerDashboard(on: On, options: PluginOptions): void {
   on('session.start', async ($, e, next) => {
+    filesSessionCwd = e.cwd ?? ''
+    filesNow = 0
+    lastFilesDraw = 0
+    filesShown = false
+    filesSlotsStamp = null
+    slotsInflight = false
+    filesWalkCache.clear()
+    filesWalkInFlight = false
+    filesSkipOnce = false
+    filesCurrentRoot = null
+    lastRootWalked = null
     await registerMk($)
     if (options.autoOpen !== false) {
       try {
@@ -275,6 +309,28 @@ export function registerDashboard(on: On, options: PluginOptions): void {
     // every other open reloads from the tab switch (LOW 5) — a render must
     // never start a refresh on its own, or the refresh tick would re-list.
     if (dashTab === 'lanes' && Date.now() - Number(viewState['lanes:slots-at'] ?? '0') > 30_000) void loadLaneSlots($)
+    filesShown = dashTab === 'files'
+    if (dashTab === 'files') {
+      const curNow = await $.clock.now()
+      if (curNow < filesNow) {
+        filesSlotsStamp = null
+      }
+      filesNow = curNow
+      lastFilesDraw = filesNow
+      if (filesSlotsStamp === null || filesNow - filesSlotsStamp >= 30_000) {
+        filesSlotsStamp = filesNow
+        void loadLaneSlots($)
+      }
+    }
+    const fileAct = dashTab === 'files' ? await read($, fileActivityAtom) : undefined
+    let cwd = filesSessionCwd
+    if (!cwd) {
+      try { cwd = await $.session.cwd() } catch {}
+    }
+    let mainCheckoutPath = cwd
+    if (cwd && dashTab === 'files') {
+      mainCheckoutPath = await resolveMainCheckout($, cwd)
+    }
     const settingsState = readSettingsState(viewState)
     const settingsLive = settingsState.live
     // Usage reads the reserve floors from the same live settings, so it loads them too
@@ -327,6 +383,8 @@ export function registerDashboard(on: On, options: PluginOptions): void {
                 : SettingsLoading(els, cols, viewState['settings:load:error'] ?? '')
                   : dashTab === 'usage'
                     ? withViewState(UsageTab, tabEls, liveUsageView(snap, typeof options.usagePollMin === 'number' && options.usagePollMin > 0 ? Math.max(USAGE_POLL_MIN_MIN, options.usagePollMin) : USAGE_POLL_DEFAULT_MIN, settingsLive), cols, ui)
+                    : dashTab === 'files'
+                      ? FilesPane($, tabEls, cols, viewState, fileAct, cwd, mainCheckoutPath)
                     : dashTab === 'events'
                       ? withViewState(EventsTab, tabEls, liveEventsView(snap), cols, ui)
                       : dashTab === 'kanban'
@@ -376,6 +434,10 @@ async function switchTab($: EngineInterface, tab: MkDashTab): Promise<void> {
   await update($, dashTabAtom, () => tab)
   await setViewKey($, 'settings:focus', '')
   if (tab === 'settings') void ensureSettingsLoaded($)
+  if (tab !== 'files') {
+    filesSlotsStamp = null
+    filesNow = 0
+  }
   try {
     await $.ui.scroll({ in: PANE_ID, to: 'start' })
   } catch {
@@ -545,6 +607,15 @@ export async function rearmLoop($: EngineInterface, options: PluginOptions): Pro
 
 /** Arms the refresh, usage-poll and lane-sweep timers for `cwd`, then loads the first snapshot. */
 async function startLoop($: EngineInterface, options: PluginOptions, cwd: string): Promise<void> {
+  filesNow = 0
+  lastFilesDraw = 0
+  filesShown = false
+  filesSlotsStamp = 0
+  filesWalkCache.clear()
+  filesWalkInFlight = false
+  filesSkipOnce = false
+  filesCurrentRoot = null
+  lastRootWalked = null
   const min = typeof options.usagePollMin === 'number' && options.usagePollMin > 0
     ? Math.max(USAGE_POLL_MIN_MIN, options.usagePollMin)
     : USAGE_POLL_DEFAULT_MIN
@@ -562,8 +633,21 @@ async function startLoop($: EngineInterface, options: PluginOptions, cwd: string
   busTimers.cancelBus = arm($.clock.every(BUS_INTERVAL_MS, () => ensureBus($, options, cwd)))
   // the code rain's own frame: a view-state bump redraws the pane, skipped once no pane drew it lately
   timerRegistry.cancelRain?.()
-  timerRegistry.cancelRain = arm($.clock.every(RAIN_MS, () => {
-    if (Date.now() - lastRainDraw < 10_000) void setViewKey($, 'rain:tick', String(Math.floor(Date.now() / RAIN_MS)))
+  timerRegistry.cancelRain = arm($.clock.every(RAIN_MS, async () => {
+    filesNow = await $.clock.now()
+    const t = filesNow
+    const files = filesShown && t - lastFilesDraw < 10_000
+    const rain = Date.now() - lastRainDraw < 10_000
+    if (rain || files) {
+      void setViewKey($, 'rain:tick', String(Math.floor((rain ? Date.now() : filesNow) / RAIN_MS)))
+    }
+    if (files) {
+      if (filesSkipOnce) {
+        filesSkipOnce = false
+      } else if (!filesWalkInFlight) {
+        void filesTick($)
+      }
+    }
   }))
   lastChipText = undefined
   await refreshSafe($, options, cwd) // first load populates pane + chip and never toasts
@@ -895,6 +979,181 @@ function planDetailViewOf(view: Record<string, string>, id: string): PlanView | 
   try { parsed = JSON.parse(view[PLAN_DETAIL_KEY] ?? '') } catch { parsed = null }
   if (parsed == null) return null
   return planFromReply(parsed)
+}
+
+export async function resolveMainCheckout(
+  $: { fs: { stat: (p: string) => Promise<{ kind: string }>; read: (p: string) => Promise<string> } },
+  cwd: string,
+): Promise<string> {
+  if (!cwd) return ''
+  const gitPath = join(cwd, '.git')
+  try {
+    const stat = await $.fs.stat(gitPath)
+    if (stat.kind === 'file') {
+      const content = await $.fs.read(gitPath)
+      const gitdir = parseGitdir(content)
+      if (gitdir) {
+        const gd = gitdir.startsWith('/') ? gitdir : join(cwd, gitdir)
+        const commondir = await $.fs.read(join(gd, 'commondir'))
+        const main = mainCheckout(gd, commondir)
+        if (main) return main
+      }
+    }
+  } catch {
+    // missing or unreadable
+  }
+  return cwd
+}
+
+async function runFilesWalk($: EngineInterface, rootPath: string): Promise<void> {
+  if (filesWalkInFlight || !rootPath) return
+  filesWalkInFlight = true
+  try {
+    filesNow = await $.clock.now()
+    const walkStart = filesNow
+    const prevWalk = filesWalkCache.get(rootPath)
+    const nextWalk = await walkRoot(rootPath, dir => $.fs.list(dir))
+    const walkEnd = await $.clock.now()
+    const duration = walkEnd - walkStart
+    if (duration > 1000) {
+      filesSkipOnce = true
+    }
+    const isFirstWalk = !prevWalk
+    const isRootSwitch = rootPath !== lastRootWalked
+    lastRootWalked = rootPath
+    let changed = isFirstWalk
+    if (prevWalk && !isRootSwitch) {
+      const diff = diffWalk(prevWalk, nextWalk)
+      if (diff.length > 0) {
+        changed = true
+        void update($, fileActivityAtom, s => {
+          let cur = s
+          for (const file of diff) {
+            cur = recordActivity(cur, file, 'write', filesNow)
+          }
+          return cur
+        }).catch(() => {})
+      }
+    }
+    filesWalkCache.set(rootPath, nextWalk)
+    if (changed) {
+      await update($, viewStateAtom, prev => ({
+        ...prev,
+        'files:v': String(Number(prev['files:v'] ?? '0') + 1),
+      }))
+    }
+  } catch {
+    // ignore
+  } finally {
+    filesWalkInFlight = false
+  }
+}
+
+async function filesTick($: EngineInterface): Promise<void> {
+  if (filesCurrentRoot && !filesWalkInFlight) {
+    await runFilesWalk($, filesCurrentRoot)
+  }
+}
+
+function FilesPane(
+  $: EngineInterface,
+  els: Els,
+  cols: number,
+  viewState: Record<string, string>,
+  activity: readonly MkFileAct[] | undefined,
+  cwd: string,
+  mainCheckoutPath: string,
+): RenderElement {
+  const { Text } = els
+  try {
+    const slots = laneSlotsOf(viewState)
+    const roots = rootsOf(mainCheckoutPath || cwd, slots)
+    const chosenId = viewState['files:root']
+    const chosenRoot = pickRoot(roots, chosenId)
+    filesCurrentRoot = chosenRoot.path
+
+    let rootToRender = chosenRoot
+    let note: string | null = null
+
+    let walk = filesWalkCache.get(chosenRoot.path)
+    if (!walk && !filesWalkInFlight) {
+      void runFilesWalk($, chosenRoot.path)
+    }
+
+    const mainRoot = roots[0] ?? { id: 'main', label: 'repo', path: mainCheckoutPath || cwd }
+    if (chosenRoot.id !== 'main' && walk?.missing) {
+      rootToRender = mainRoot
+      note = 'missing root, fallback to repo'
+      walk = filesWalkCache.get(mainRoot.path)
+      if (!walk && !filesWalkInFlight) {
+        void runFilesWalk($, mainRoot.path)
+      }
+    } else if (walk?.missing) {
+      note = 'missing root'
+    }
+
+    const effectiveWalk: Walk = walk ?? { dirs: new Map(), capped: false, missing: false }
+
+    let openSet = new Set<string>()
+    try {
+      const rawOpen = viewState['files:open']
+      if (rawOpen) {
+        const parsed = JSON.parse(rawOpen)
+        if (Array.isArray(parsed)) openSet = new Set(parsed as string[])
+      }
+    } catch {}
+
+    const q = viewState['files:q'] ?? ''
+    const actMap = liveActivity(activity, filesNow)
+    const rows = treeRows(effectiveWalk, rootToRender.path, openSet, q, actMap)
+
+    let nFolders = 0
+    let nFiles = 0
+    for (const [_, entries] of effectiveWalk.dirs) {
+      for (const e of entries) {
+        if (e.name === '.git') continue
+        if (e.kind === 'dir') nFolders++
+        else if (e.kind === 'file' || e.kind === 'other') nFiles++
+      }
+    }
+
+    let nWrite = 0
+    let nRead = 0
+    for (const [p, kind] of actMap) {
+      if (p === rootToRender.path || p.startsWith(rootToRender.path.endsWith('/') ? rootToRender.path : `${rootToRender.path}/`)) {
+        if (kind === 'write') nWrite++
+        else if (kind === 'read') nRead++
+      }
+    }
+
+    const pulse = Math.floor(filesNow / RAIN_MS) % 2 === 0
+    const view: FilesView = {
+      roots,
+      root: rootToRender,
+      rows,
+      dirs: Array.from(effectiveWalk.dirs.keys()),
+      nWrite,
+      nRead,
+      nFolders,
+      nFiles,
+      pulse,
+      capped: effectiveWalk.capped,
+      note,
+      q,
+      sel: viewState['files:sel'],
+    }
+
+    const filesTabUi: FilesTabUi = {
+      get: key => viewState[key],
+      set: (key, value) => { void update($, viewStateAtom, prev => ({ ...prev, [key]: value })) },
+      reveal: key => { void $.ui.scroll({ in: PANE_ID, to: { key } }).catch(() => {}) },
+      focus: key => { void $.ui.focus({ requestId: PANE_ID, key }).catch(() => {}) },
+    }
+
+    return FilesTab(els, view, cols, filesTabUi)
+  } catch (err) {
+    return <Text>Files could not draw</Text>
+  }
 }
 
 export function PlanPane(els: Els, view: Record<string, string>, paneCols: number, ui: TabUi): RenderElement {
