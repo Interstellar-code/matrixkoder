@@ -8,7 +8,7 @@ import { PLAN_FIXTURE } from './plan.fixture'
 import { NARROW, STATUS_GLYPH, fitLegend } from './ui'
 import { ActionButton, BoxButton, Card, Chip, Segment, TreeRow } from './kit'
 import type { ActionSpec } from './kit'
-import { laneStrip, pickBar } from './raster'
+import { colorStrip, laneStrip, pickBar } from './raster'
 import { PALETTE, ROLE } from './palette'
 import type { PaletteRole } from './palette'
 import { isDoneStatus, laneAgent, routeText } from './plans-map'
@@ -227,15 +227,62 @@ function headline(text: string): string {
   return m == null ? text : text.slice(0, m.index)
 }
 
-/** A phase's state for the border colour and the PHASES filter: done, building (a live or
- *  flagged task), else pending. */
-function phaseState(phase: PlanPhase): 'done' | 'building' | 'pending' {
+/** The five states every status is shown as, one hue and one shape each, so the phase bar, the
+ *  PHASES filter chip, the task dot and the right-hand chip cannot drift apart. Plan-tab colours:
+ *  the shared ROLE palette stays as it is for the other tabs. */
+export type PlanState = 'done' | 'building' | 'review' | 'pending' | 'attention'
+export const PLAN_STATE: Record<PlanState, { readonly glyph: string; readonly color: string; readonly tint: string }> = {
+  done: { glyph: '◆', color: '#34d063', tint: '#0f3a1c' }, // green
+  building: { glyph: '●', color: '#4da3ff', tint: '#10294a' }, // blue
+  review: { glyph: '◐', color: '#b57bff', tint: '#2a1a4a' }, // purple
+  pending: { glyph: '○', color: '#ffd84a', tint: '#3a3210' }, // yellow
+  attention: { glyph: '▲', color: '#ff5555', tint: '#4a1414' }, // red
+}
+const STATE_OF: Record<string, PlanState> = {
+  merged: 'done', qa: 'done', done: 'done',
+  dispatched: 'building', building: 'building', verifying: 'building',
+  review: 'review',
+  fix: 'attention', blocked: 'attention', quota: 'attention', stalled: 'attention', provider: 'attention',
+}
+/** A task or phase status as one of the five states; planned, routed and anything unknown are pending. */
+export const statusState = (status: string): PlanState => STATE_OF[status] ?? 'pending'
+
+/** A phase's state for the bar colour and the PHASES filter: done when every task is done, else
+ *  the most urgent task (attention, then building, then review), else pending. A phase with no
+ *  task rows takes its own status. */
+function phaseState(phase: PlanPhase): PlanState {
   if (isDoneStatus(phase.status ?? '') || (phase.rows.length > 0 && phase.rows.every(r => isDoneStatus(r.status)))) return 'done'
-  if (phase.rows.some(r => roleOf(r.status) === 'live' || roleOf(r.status) === 'warn')) return 'building'
-  return 'pending'
+  const states = phase.rows.length > 0 ? phase.rows.map(r => statusState(r.status)) : [statusState(phase.status ?? 'planned')]
+  for (const s of ['attention', 'building', 'review'] as const) if (states.includes(s)) return s
+  return states.includes('done') ? 'done' : 'pending'
 }
 
-const PHASE_FILTERS = ['all', 'building', 'pending', 'done'] as const
+// the building chip also counts phases in review; attention has its own chip, drawn only when it has any
+const PHASE_FILTERS = ['all', 'building', 'attention', 'pending', 'done'] as const
+type PhaseFilter = typeof PHASE_FILTERS[number]
+const inFilter = (f: PhaseFilter, state: PlanState): boolean =>
+  f === 'all' || (f === 'building' ? state === 'building' || state === 'review' : state === f)
+
+/** A coloured filter chip: the state's tint with its colour, filled solid when it is the picked one. */
+function FilterChip(els: Els, opts: { key: string; label: string; state: PlanState; on: boolean; onPress: () => void }): RenderElement {
+  const { Button, Text } = els
+  const c = PLAN_STATE[opts.state]
+  return Button({
+    key: opts.key,
+    plain: true,
+    onPress: opts.onPress,
+    children: [
+      <Text backgroundColor={opts.on ? c.color : c.tint} color={opts.on ? PALETTE.bg : c.color} bold={opts.on}>{` ${c.glyph} ${opts.label} `}</Text>,
+    ],
+  })
+}
+
+/** The right-hand state chip of a phase: the state's tint and colour. */
+function StateChip(els: Els, label: string, state: PlanState): RenderElement {
+  const { Text } = els
+  const c = PLAN_STATE[state]
+  return <Text backgroundColor={c.tint} color={c.color}>{` ${label} `}</Text>
+}
 
 const PAUSED = new Set(['paused', 'parked', 'held', 'on_hold'])
 
@@ -265,7 +312,10 @@ export function PlanTab(els: Els, view: PlanView, cols: number, ui?: TabUi): Ren
   }
   const act = (kind: string): void => { view.onAction?.(kind, view.plan?.id ?? '') }
   const phaseFilter = ui?.get('plan:phase-filter') ?? 'all'
-  const shownPhases = phaseFilter === 'all' ? phases : phases.filter(p => phaseState(p) === phaseFilter)
+  const attentionCount = phases.filter(p => phaseState(p) === 'attention').length
+  // a picked attention chip with nothing left to show falls back to all
+  const activeFilter: PhaseFilter = phaseFilter === 'attention' && attentionCount === 0 ? 'all' : (PHASE_FILTERS as readonly string[]).includes(phaseFilter) ? phaseFilter as PhaseFilter : 'all'
+  const shownPhases = activeFilter === 'all' ? phases : phases.filter(p => inFilter(activeFilter, phaseState(p)))
   return (
     <Box flexDirection="column" gap={1}>
       {view.mock && <Text bold={true} color={ROLE.warn.fg}>MOCK · fixture data · not this run</Text>}
@@ -273,12 +323,20 @@ export function PlanTab(els: Els, view: PlanView, cols: number, ui?: TabUi): Ren
       <Box flexDirection="row" justifyContent="space-between" gap={1}>
         <Box flexDirection="row" gap={1}>
           <Text bold={true} color={PALETTE.mut}>PHASES</Text>
-          {!compact && PHASE_FILTERS.map(f => Segment(els, {
-            key: `plan-phase-filter-${f}`,
-            label: f === 'all' ? `all ${phases.length}` : `${f} ${phases.filter(p => phaseState(p) === f).length}`,
-            on: phaseFilter === f,
-            onPress: () => { ui?.set('plan:phase-filter', f) },
-          }))}
+          {!compact && PHASE_FILTERS.filter(f => f !== 'attention' || attentionCount > 0).map(f => f === 'all'
+            ? Segment(els, {
+              key: 'plan-phase-filter-all',
+              label: `all ${phases.length}`,
+              on: activeFilter === 'all',
+              onPress: () => { ui?.set('plan:phase-filter', 'all') },
+            })
+            : FilterChip(els, {
+              key: `plan-phase-filter-${f}`,
+              label: `${f} ${phases.filter(p => inFilter(f, phaseState(p))).length}`,
+              state: f,
+              on: activeFilter === f,
+              onPress: () => { ui?.set('plan:phase-filter', f) },
+            }))}
         </Box>
         <Box flexDirection="row" gap={1}>
           {BoxButton(els, {
@@ -292,7 +350,7 @@ export function PlanTab(els: Els, view: PlanView, cols: number, ui?: TabUi): Ren
         </Box>
       </Box>
       <Box key="plan-phases" flexDirection="column" position="relative">
-        {shownPhases.length === 0 && <Text dimColor={true}>{`no ${phaseFilter} phases`}</Text>}
+        {shownPhases.length === 0 && <Text dimColor={true}>{`no ${activeFilter} phases`}</Text>}
         {shownPhases.length > 0 && Card(els, { edge: PALETTE.mut }, (
           <Box flexDirection="column">
             {shownPhases.map((phase, i) => (
@@ -388,20 +446,20 @@ function PhaseCard(els: Els, phase: PlanPhase, waveMates: readonly string[], W: 
   const strip = pickBar(
     els,
     `plan-strip-${phase.id}`,
-    laneStrip(phase.rows.map(r => roleOf(r.status)), W),
-    <Text dimColor={true}>{phase.rows.map(r => glyphOf(r.status)).join('')}</Text>,
+    legacy ? laneStrip(phase.rows.map(r => roleOf(r.status)), W) : colorStrip(phase.rows.map(r => PLAN_STATE[statusState(r.status)].color), W),
+    <Text dimColor={true}>{phase.rows.map(r => legacy ? glyphOf(r.status) : PLAN_STATE[statusState(r.status)].glyph).join('')}</Text>,
   )
   // state as a one-column bar down the left edge: building blue, pending yellow, done the plain line
   // (phases share one Card, so one divider row between them, not two borders)
-  const state = legacy ? (live ? 'building' : 'done') : phaseState(phase)
-  const bar = state === 'building' ? ROLE.live.fg : state === 'pending' ? ROLE.warn.fg : PALETTE.line
+  const state: PlanState = legacy ? (live ? 'building' : 'done') : phaseState(phase)
+  const bar = PLAN_STATE[state].color
   return (
     <Box key={phase.id} flexDirection="row" gap={1}>
     <Box width={1} backgroundColor={bar} />
     <Box flexDirection="column" flexGrow={1}>
       <Box flexDirection="row" gap={1}>
         {!legacy && <Text dimColor={!live} color={live ? ROLE.live.fg : undefined}>{expanded ? '▾' : '▸'}</Text>}
-        {!legacy && <Text color={ROLE[headRole].fg}>{glyphOf(phase.status ?? 'planned')}</Text>}
+        {!legacy && <Text color={PLAN_STATE[state].color}>{PLAN_STATE[state].glyph}</Text>}
         {!legacy && ActionButton(els, {
           key: `plan-fold-${phase.id}`,
           glyph: '›',
@@ -417,7 +475,7 @@ function PhaseCard(els: Els, phase: PlanPhase, waveMates: readonly string[], W: 
         <Box flexGrow={1} />
         {!compact && routed && lane !== '' && <Text dimColor={true} wrap="truncate-end">{lane}</Text>}
         {others.length > 0 && Chip(els, { label: `with ${others[0]}`, role: 'idle' })}
-        {Chip(els, { label: chipLabel, role: chipRole })}
+        {legacy || findings > 0 ? Chip(els, { label: chipLabel, role: chipRole }) : StateChip(els, chipLabel, state)}
         {!legacy && pauseButton(els, `plan-phase-pause-${phase.id}`, phase.status ?? '', state === 'building', act, 'phase', phase.id)}
       </Box>
       {expanded && phase.description != null && Describe(els, `plan-desc-${phase.id}`, phase.description, W - 2, 3)}
@@ -457,7 +515,7 @@ function TaskBlock(els: Els, row: PlanTask, last: boolean, W: number, compact: b
     <Box key={row.id} flexDirection="column">
       <Box flexDirection="row" gap={1}>
         <Text dimColor={true}>{last ? '└ ' : '├ '}</Text>
-        <Text color={ROLE[role].fg}>{glyphOf(row.status)}</Text>
+        <Text color={PLAN_STATE[statusState(row.status)].color}>{PLAN_STATE[statusState(row.status)].glyph}</Text>
         {ActionButton(els, {
           key: `plan-task-${row.id}`,
           glyph: clip(`${row.id} ${title}`, titleBudget),
@@ -473,7 +531,8 @@ function TaskBlock(els: Els, row: PlanTask, last: boolean, W: number, compact: b
       {subs.map((sub, i) => TreeRow(els, {
         depth: 1,
         last: i === subs.length - 1,
-        glyph: glyphOf(sub.status),
+        glyph: PLAN_STATE[statusState(sub.status)].glyph,
+        glyphColor: PLAN_STATE[statusState(sub.status)].color,
         role: roleOf(sub.status),
         title: `${sub.id} ${headline(sub.title)}`,
         right: sub.right,

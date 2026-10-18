@@ -4,7 +4,7 @@
 // fields, and 36 cols still renders.
 import { test, expect } from 'claude-code/testing'
 import type { BoxProps, ElementChildren, Elements, RenderChildren, RenderElement, RenderNode, TextProps } from 'claude-code'
-import { PlanTab } from './plan'
+import { PLAN_STATE, PlanTab, statusState } from './plan'
 import { planFromReply } from './plans-map'
 import detailFixture from './fixtures/plan-detail'
 import { PLAN_REAL_FIXTURE } from './plan.fixture'
@@ -522,4 +522,88 @@ test('an expanded draft phase names its builder and reviewer; a folded one does 
   expect(open).toContain('builder agy gemini-3.8-flash-high · reviewer claude sonnet')
   expect(allText(PlanTab(stubEls, view, 80, new Map()))).not.toContain('builder agy')
   expect(allText(PlanTab(stubEls, PLAN_REAL_FIXTURE, 80, new Map([['plan:phase:S1', '1']])))).not.toContain('builder')
+})
+
+/** ── five states: one hue and one shape each (bar, filter chip, state chip, task dot) ── */
+
+const task = (id: string, status: string) => ({ id, title: `${id} task`, status, subtasks: [] })
+const statesView = () => planFromReply({
+  ok: true, id: 'p', title: 'T', status: 'running',
+  phases: [
+    { id: 'D', title: 'Done phase', status: 'merged', tasks: [task('D.1', 'merged')] },
+    { id: 'B', title: 'Building phase', status: 'building', tasks: [task('B.1', 'building')] },
+    { id: 'R', title: 'Review phase', status: 'review', tasks: [task('R.1', 'review')] },
+    { id: 'P', title: 'Pending phase', status: 'planned', tasks: [task('P.1', 'planned')] },
+    { id: 'X', title: 'Attention phase', status: 'fix', tasks: [task('X.1', 'fix')] },
+  ],
+})
+const chipOf = (drawn: unknown, state: keyof typeof PLAN_STATE): Node | undefined =>
+  nodesOf(nodesOf(drawn, 'Button').find(b => String(b.props?.key) === `plan-phase-filter-${state}`), 'Text')[0]
+  ?? ((nodesOf(drawn, 'Button').find(b => String(b.props?.key) === `plan-phase-filter-${state}`)?.props?.children as Node[] | undefined) ?? [])[0]
+
+test('statusState: every status is one of the five states, unknown is pending', () => {
+  const want: Record<string, string> = {
+    merged: 'done', qa: 'done', done: 'done',
+    dispatched: 'building', building: 'building', verifying: 'building',
+    review: 'review',
+    fix: 'attention', blocked: 'attention', quota: 'attention', stalled: 'attention', provider: 'attention',
+    planned: 'pending', routed: 'pending', nonsense: 'pending',
+  }
+  for (const [status, state] of Object.entries(want)) expect(statusState(status), status).toBe(state)
+  const hues = Object.values(PLAN_STATE).map(c => c.color)
+  expect(new Set(hues).size).toBe(5)
+  expect(new Set(Object.values(PLAN_STATE).map(c => c.glyph)).size).toBe(5)
+})
+
+test('each phase bar and state chip takes its state colour', () => {
+  const drawn = PlanTab(stubEls, statesView(), 80, new Map())
+  const bars = nodesOf(drawn, 'Box').filter(b => b.props?.width === 1 && typeof b.props?.backgroundColor === 'string').map(b => b.props?.backgroundColor)
+  expect(bars).toEqual([PLAN_STATE.done.color, PLAN_STATE.building.color, PLAN_STATE.review.color, PLAN_STATE.pending.color, PLAN_STATE.attention.color])
+  for (const state of Object.keys(PLAN_STATE) as (keyof typeof PLAN_STATE)[]) {
+    const c = PLAN_STATE[state]
+    expect(nodesOf(drawn, 'Text').some(t => t.props?.backgroundColor === c.tint && t.props?.color === c.color), `${state} chip`).toBe(true)
+  }
+})
+
+test('the PHASES chips match the bars: coloured, building counts review, attention only when needed', () => {
+  const drawn = PlanTab(stubEls, statesView(), 80, new Map())
+  const text = (state: keyof typeof PLAN_STATE): string => String(((chipOf(drawn, state)?.children ?? []) as unknown[]).join(''))
+  expect(chipOf(drawn, 'building')?.props?.backgroundColor).toBe(PLAN_STATE.building.tint)
+  expect(chipOf(drawn, 'building')?.props?.color).toBe(PLAN_STATE.building.color)
+  expect(text('building')).toContain('building 2')
+  expect(text('pending')).toContain('pending 1')
+  expect(text('done')).toContain('done 1')
+  expect(text('attention')).toContain('attention 1')
+  expect(text('done')).toContain(PLAN_STATE.done.glyph)
+  // nothing needs attention: the chip is not drawn
+  const calm = planFromReply({ ok: true, id: 'p', title: 'T', status: 'running', phases: [{ id: 'B', title: 'b', status: 'building', tasks: [task('B.1', 'building')] }] })
+  expect(nodesOf(PlanTab(stubEls, calm, 80, new Map()), 'Button').some(b => String(b.props?.key) === 'plan-phase-filter-attention')).toBe(false)
+})
+
+test('the picked chip is filled solid, and building also shows the review phase', () => {
+  const ui = new Map<string, string>([['plan:phase-filter', 'building']])
+  const drawn = PlanTab(stubEls, statesView(), 80, ui)
+  expect(chipOf(drawn, 'building')?.props?.backgroundColor).toBe(PLAN_STATE.building.color)
+  const shown = allText(drawn)
+  expect(shown).toContain('Building phase')
+  expect(shown).toContain('Review phase')
+  expect(shown).not.toContain('Done phase')
+  press(drawn, 'plan-phase-filter-pending')
+  expect(ui.get('plan:phase-filter')).toBe('pending')
+})
+
+test('a picked attention filter with nothing to show falls back to all', () => {
+  const calm = planFromReply({ ok: true, id: 'p', title: 'T', status: 'running', phases: [{ id: 'B', title: 'Building phase', status: 'building', tasks: [task('B.1', 'building')] }] })
+  const drawn = PlanTab(stubEls, calm, 80, new Map([['plan:phase-filter', 'attention']]))
+  expect(allText(drawn)).toContain('Building phase')
+  expect(allText(drawn)).not.toContain('no attention phases')
+})
+
+test('task dots take the state colour and shape', () => {
+  const ui = new Map<string, string>([['plan:phase:X', '1'], ['plan:phase:R', '1'], ['plan:phase:D', '1']])
+  const drawn = PlanTab(stubEls, statesView(), 80, ui)
+  for (const state of ['attention', 'review', 'done'] as const) {
+    const c = PLAN_STATE[state]
+    expect(nodesOf(drawn, 'Text').some(t => t.props?.color === c.color && (t.children ?? []).join('') === c.glyph), `${state} dot`).toBe(true)
+  }
 })

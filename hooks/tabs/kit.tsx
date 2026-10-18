@@ -255,6 +255,8 @@ export function TreeRow(els: Els, opts: {
   depth: number
   last: boolean
   glyph: string
+  /** a plain `#rrggbb` for the glyph, instead of the role's (the Plan tab's status colours) */
+  glyphColor?: string
   role: PaletteRole
   title: string
   right?: string
@@ -269,7 +271,7 @@ export function TreeRow(els: Els, opts: {
   return (
     <Box flexDirection="row" gap={1}>
       <Text dimColor={true}>{prefix}</Text>
-      <Text color={ROLE[opts.role].fg}>{opts.glyph}</Text>
+      <Text color={opts.glyphColor ?? ROLE[opts.role].fg}>{opts.glyph}</Text>
       <Text>{title}</Text>
       {opts.right != null && Chip(els, { label: opts.right, role: opts.rightRole ?? opts.role })}
     </Box>

@@ -147,6 +147,11 @@ export function stageBar(done: number, current: number, total: number, cols: num
 }
 
 /** One segment per lane, coloured by that lane's role (Lanes tab). */
+/** A strip from plain `#rrggbb` colours, one segment per entry (the Plan tab's five status colours). */
+export function colorStrip(colors: readonly string[], cols: number): RasterSpec {
+  return strip(colors.length > 0 ? colors : [PALETTE.track], cols)
+}
+
 export function laneStrip(states: readonly PaletteRole[], cols: number): RasterSpec {
   return strip(states.map(s => ROLE[s]?.fg ?? PALETTE.track), cols)
 }
