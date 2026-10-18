@@ -311,16 +311,8 @@ export function registerDashboard(on: On, options: PluginOptions): void {
     if (dashTab === 'lanes' && Date.now() - Number(viewState['lanes:slots-at'] ?? '0') > 30_000) void loadLaneSlots($)
     filesShown = dashTab === 'files'
     if (dashTab === 'files') {
-      const curNow = await $.clock.now()
-      if (curNow < filesNow) {
-        filesSlotsStamp = null
-      }
-      filesNow = curNow
+      if (!filesNow) filesNow = await $.clock.now()
       lastFilesDraw = filesNow
-      if (filesSlotsStamp === null || filesNow - filesSlotsStamp >= 30_000) {
-        filesSlotsStamp = filesNow
-        void loadLaneSlots($)
-      }
     }
     const fileAct = dashTab === 'files' ? await read($, fileActivityAtom) : undefined
     let cwd = filesSessionCwd
@@ -437,6 +429,11 @@ async function switchTab($: EngineInterface, tab: MkDashTab): Promise<void> {
   if (tab !== 'files') {
     filesSlotsStamp = null
     filesNow = 0
+  } else {
+    // a render may not write state, so the lane slots load from here and from the rain tick
+    filesNow = await $.clock.now()
+    filesSlotsStamp = filesNow
+    void loadLaneSlots($)
   }
   try {
     await $.ui.scroll({ in: PANE_ID, to: 'start' })
@@ -642,6 +639,10 @@ async function startLoop($: EngineInterface, options: PluginOptions, cwd: string
       void setViewKey($, 'rain:tick', String(Math.floor((rain ? Date.now() : filesNow) / RAIN_MS)))
     }
     if (files) {
+      if (filesSlotsStamp === null || filesNow - filesSlotsStamp >= 30_000) {
+        filesSlotsStamp = filesNow
+        void loadLaneSlots($)
+      }
       if (filesSkipOnce) {
         filesSkipOnce = false
       } else if (!filesWalkInFlight) {
@@ -1055,6 +1056,11 @@ async function filesTick($: EngineInterface): Promise<void> {
   }
 }
 
+/** the Files tab's focus wiring: fire and forget, a rejection or a { deny } is ignored; never writes settings:focus */
+export function filesFocus($: { ui: { focus: (args: { requestId: string; key: string }) => Promise<unknown> } }, key: string): void {
+  void $.ui.focus({ requestId: PANE_ID, key }).catch(() => {})
+}
+
 function FilesPane(
   $: EngineInterface,
   els: Els,
@@ -1147,7 +1153,7 @@ function FilesPane(
       get: key => viewState[key],
       set: (key, value) => { void update($, viewStateAtom, prev => ({ ...prev, [key]: value })) },
       reveal: key => { void $.ui.scroll({ in: PANE_ID, to: { key } }).catch(() => {}) },
-      focus: key => { void $.ui.focus({ requestId: PANE_ID, key }).catch(() => {}) },
+      focus: key => filesFocus($, key),
     }
 
     return FilesTab(els, view, cols, filesTabUi)
