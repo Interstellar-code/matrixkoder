@@ -2,6 +2,47 @@
 
 All notable changes to this project. Format: Keep a Changelog; versions: SemVer.
 
+## [0.6.5] - 2026-10-18
+
+### Added
+- **filetree:** columns, sort, git marks, lane chips and header counts for the Files tab (6ab3a14)
+- **dashboard:** Files root chips only for lane slots that hold a task (b85ebf7)
+- **filetree:** word labels on the key buttons, whole row clickable, h goes to the parent (a5ee4c8)
+- **dashboard:** one colour and shape per status in the Plan tab (ac5844f)
+- **dashboard:** add the Files tab after Usage (7df741c)
+- **filetree:** draw the Files tab (5662929)
+- **filetree:** record which files are read and written (7fdbe88)
+- **filetree:** turn folder listings into tree rows and list the roots (bddb2f8)
+- **dashboard:** show a draft plan's builder route and reviewer in the Plan tab (0caeb48)
+- **dashboard:** add a Refresh button to the Plan tab (596d8b2)
+- **dashboard:** show plan, phase and task descriptions in the Plan tab (6d96dc8)
+- **plan:** keep the optional description from plan file to run views (85a8719)
+
+### Fixed
+- **dashboard:** catch the Files async work so no rejection outlives a test (c12a621)
+- **dashboard:** retry the Files bump and re-check a missing lane root (e638be9)
+- **dashboard:** Files tab review fixes (1b133df)
+- **filetree:** row Buttons hold only Text, not Box (1a3195d)
+- **filetree:** fit the Files tab footer and measure every line (790efbc)
+- **filetree:** count the border and padding in the Files tab widths (5270d7d)
+- **plan:** import refreshes the root plan summary so the List tab shows the plan (25432b5)
+
+### Docs
+- **filetree:** correct the Files tab wording after a read-only claim check (a40aafd)
+- **filetree:** describe the Files tab and credit claude-code-filetree (e3c4044)
+- **skill:** all orchestrator-lane messages go over the bus (cf4bc9c)
+- **plan:** document the optional description field (538d7c0)
+- **plan:** add the optional description key to the plan and brief templates (74b8a53)
+- add CLAUDE.md with Karpathy coding principles (#4) (e5458b2)
+
+### Other
+- **dashboard:** settle the second held pending read so no promise outlives the test (b0942e8)
+- **dashboard:** Files F4.3 tests on the rain tick (c0eb9f6)
+- **dashboard:** Files slot load off the render, filesFocus helper (69cf7f6)
+- **dashboard:** Files tab type-clean, scaffolding removed (d1b85f3)
+- **dashboard:** Files tab registered and wired, F4.3 and the last F4.2 tests still open (f0c5f20)
+- **filetree:** make the update-not-awaited test discriminate (c9ee1ea)
+
 ## [0.6.4] - 2026-10-17
 
 ### Added
