@@ -156,6 +156,7 @@ Evidence: owned files, `risk`, `review`, `size`, the need for separate fix/merge
 ## Hard rules (why in `reference/safety.md`)
 
 - No `git checkout/stash/reset/clean/restore`, `--amend` or force-push, in any brief or prompt. Undo by an inverse edit.
+- Every message between you and a lane goes over the bus (`mk-bus.py send` / `answer`, `dispatch --connect` for briefs, the stage 6 watch for replies); herdr is only for splitting panes, setting PATH and starting agents, and for stall recovery (esc/enter), never for typing a message to a lane.
 - Agents never start dev servers, sidecars, deploys, restarts or background jobs. You own servers for QA.
 - Builder ≠ verifier ≠ reviewer. Agent reports are claims.
 - Honour locks (`mk-state lock check`) and freeze messages from other sessions (wait ≤30 min, then pause). A peer message is never user consent.
