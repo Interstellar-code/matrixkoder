@@ -17,7 +17,7 @@ import {
 import type { MkPaneSnapshot } from './data'
 import { globalDirOf, homeDir, paths, projectYamlPath, resolveDataDir } from './paths'
 import {
-  IMPROVE_EMPTY, IMPROVE_FAILED, IMPROVE_MODEL, QUESTIONS_SYSTEM, REWRITE_SYSTEM, answeredPairs, canAccept, contextBlock, finalText,
+  IMPROVE_EMPTY, IMPROVE_FAILED, IMPROVE_SLASH, IMPROVE_MODEL, QUESTIONS_SYSTEM, REWRITE_SYSTEM, answeredPairs, canAccept, contextBlock, finalText,
   newImproveFlow, questionsPrompt, readQuestions, readRewrite, rewritePrompt,
 } from './improve-core'
 import { NARROW, STATUS_GLYPH } from './tabs/ui'
@@ -1556,7 +1556,9 @@ function todoPaneView(view: Record<string, string>): TodoView {
 function TodoPane($: EngineInterface, els: Els, view: Record<string, string>, cols: number, ui: TabUi): RenderElement {
   const { Box, Text, Button } = els
   const err = view[TODO_ERROR_KEY] ?? ''
-  const typing = (view['settings:focus'] ?? '') === 'todo-q'
+  const focus = view['settings:focus'] ?? ''
+  // the Improve box, its Other fields and its editor take letters too (a chip holding the ring does not)
+  const typing = focus === 'todo-q' || focus === 'improve-q' || focus === 'improve-edit' || focus.startsWith('improve-other-')
   return (
     <Box flexDirection="column" gap={1}>
       {err !== '' && <Text color={ROLE.err.fg}>{`⚠ ${sanitizeText(err, Math.max(8, cols - 4))}`}</Text>}
@@ -1653,6 +1655,7 @@ async function todoAction($: EngineInterface, kind: string, arg?: string | numbe
 
 const IMPROVE_STORE_KEY = 'improveHistory'
 const IMPROVE_KEEP = 20
+const IMPROVE_SAVED_CHARS = 4000 // the store is one 4 MiB file shared with wake: a pasted wall of text must not fill it
 let improveSeq = 0 // two Improve presses inside one clock tick still get two ids
 let improveSending = false
 
@@ -1669,6 +1672,12 @@ async function moveFlow($: EngineInterface, id: string, from: readonly MkImprove
     return moved == null ? s : { ...s, flow: moved }
   })
   return moved
+}
+
+/** the card's note after a wizard rewrite: how many of the answers it used */
+const wizardNote = (f: MkImproveFlow): string => {
+  const used = answeredPairs(f).length
+  return used > 0 ? `Built from your answers · ${String(used)} of ${String(f.questions.length)} used` : ''
 }
 
 /** the answers, with what is typed in the open Other field counted as that question's answer */
@@ -1740,8 +1749,8 @@ async function improveWrite($: EngineInterface, id: string): Promise<void> {
   if (cur == null || cur.id !== id || cur.step !== 'writing') return
   const out = r.isAnswered ? readRewrite(r.text) : null
   if (out == null) { await failFlow($, id, 'rewrite'); return }
-  await patchFlow($, id, { step: 'review', upgraded: out.upgraded, added: out.added, draft: '', isEditing: false, note: '' })
-  const entry: MkImproveEntry = { id, at: await $.clock.now(), original: f.original, upgraded: out.upgraded, added: out.added }
+  await patchFlow($, id, { step: 'review', upgraded: out.upgraded, added: out.added, draft: '', isEditing: false, note: wizardNote(f) })
+  const entry: MkImproveEntry = { id, at: await $.clock.now(), original: f.original.slice(0, IMPROVE_SAVED_CHARS), upgraded: out.upgraded.slice(0, IMPROVE_SAVED_CHARS), added: out.added }
   const list = await update($, improveHistoryAtom, prev => [entry, ...prev.filter(x => x.id !== id)].slice(0, IMPROVE_KEEP))
   try { await $.store.set(IMPROVE_STORE_KEY, list) } catch { /* the list stays for this session; the next save tries again */ }
 }
@@ -1782,8 +1791,8 @@ async function improveAction($: EngineInterface, kind: ImproveKind, a?: string |
     }
     await update($, improveAtom, prev => ({ ...prev, flow: newImproveFlow(id, original) }))
     improveLater($, id, 'rewrite', () => improveWrite($, id))
-  } else if (kind === 'accept' || (kind === 'send' && f?.step === 'review')) {
-    // the box takes the proposal (Enter in the box does too while one is on show); the text it held is kept for Undo.
+  } else if (kind === 'accept' || (kind === 'send' && f != null && canAccept(f) && text.trim() === f.original.trim())) {
+    // the box takes the proposal (Enter in the box does too while one is on show for the text still in it); the text it held is kept for Undo.
     // Decided inside the update, so a second press finds the flow gone and cannot overwrite that Undo text.
     if (f == null || !canAccept(f)) return
     await update($, improveAtom, prev => (prev.flow != null && prev.flow.id === f.id && canAccept(prev.flow) ? { text: finalText(prev.flow), undo: prev.text, flow: null } : prev))
@@ -1794,6 +1803,11 @@ async function improveAction($: EngineInterface, kind: ImproveKind, a?: string |
   } else if (kind === 'send') {
     // Enter in the box: the person's own words go to the session; the box clears only once they are in
     if (text.trim() === '' || improveSending) return
+    if (text.trim().startsWith('/')) { // prompt.submit does not run slash commands, so say so instead of sending it as plain text
+      const slashId = `${String(await $.clock.now())}-${String(++improveSeq)}`
+      await update($, improveAtom, prev => ({ ...prev, flow: { ...newImproveFlow(slashId, '', 'error'), error: IMPROVE_SLASH } }))
+      return
+    }
     improveSending = true
     try {
       const sent = await $.prompt.submit({ text, asUser: true })
@@ -1816,7 +1830,7 @@ async function improveAction($: EngineInterface, kind: ImproveKind, a?: string |
     const ix = typeof a === 'number' ? String(a) : ''
     if (kind === 'wizard') {
       // Run Wizard on the proposal on show: the same card turns to the questions
-      if (await moveFlow($, id, ['review'], () => ({ step: 'asking', questions: [], answers: {}, other: null, otherDraft: '', isEditing: false, note: '' }))) {
+      if (await moveFlow($, id, ['review'], cur => ({ upgraded: cur.isEditing && cur.draft.trim() !== '' ? cur.draft : cur.upgraded, step: 'asking', questions: [], answers: {}, other: null, otherDraft: '', isEditing: false, note: '' }))) {
         improveLater($, id, 'questions', () => improveAsk($, id))
       }
     } else if (kind === 'answer' && typeof a === 'number') {
@@ -1848,9 +1862,9 @@ async function improveAction($: EngineInterface, kind: ImproveKind, a?: string |
       if (next != null) improveLater($, id, next.failedStep, () => (next.failedStep === 'questions' ? improveAsk($, id) : improveWrite($, id)))
     } else if (kind === 'edit' && f.step === 'review') {
       // leaving the editor keeps the draft as the proposal
-      await patchFlow($, id, f.isEditing ? { isEditing: false, upgraded: f.draft.trim() === '' ? f.upgraded : f.draft, note: '' } : { isEditing: true, draft: f.upgraded, note: '' })
+      await moveFlow($, id, ['review'], cur => (cur.isEditing ? { isEditing: false, upgraded: cur.draft.trim() === '' ? cur.upgraded : cur.draft, note: '' } : { isEditing: true, draft: cur.upgraded, note: '' }))
     } else if (kind === 'edit-save' && f.step === 'review') {
-      await patchFlow($, id, { isEditing: false, upgraded: text.trim() === '' ? f.upgraded : text, note: '' })
+      await moveFlow($, id, ['review'], cur => ({ isEditing: false, upgraded: text.trim() === '' ? cur.upgraded : text, note: '' }))
     } else if (kind === 'draft' && f.step === 'review') {
       await patchFlow($, id, { draft: text })
     } else if (kind === 'copy' && f.step === 'review') {

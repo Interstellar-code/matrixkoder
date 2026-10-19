@@ -206,7 +206,7 @@ test('wizard questions: options, Other, Skip, the answered count and the go butt
   const flow = flowOf({ step: 'questions', questions: QUESTIONS, answers: { '0': { kind: 'option', text: 'My team' } } })
   const { tree, calls } = footer(viewOf({ flow }))
   const f = flat(tree)
-  expect(f).toContain('✦ QUICK QUESTIONS')
+  expect(f).toContain('✦ WIZARD')
   expect(f).toContain('✓ Who is it for?') // answered
   expect(f).toContain('2 How long should it be?')
   expect(f).toContain('✓ My team')

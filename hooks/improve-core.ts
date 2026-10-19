@@ -9,6 +9,7 @@ export const IMPROVE_MODEL = 'haiku'
 /** the calm line a failed rewrite shows in the card; the box text is never touched */
 export const IMPROVE_FAILED = 'Could not improve that one. Your prompt is untouched.'
 export const IMPROVE_EMPTY = 'Type a prompt first, then press Improve.'
+export const IMPROVE_SLASH = 'This box sends plain text. Type slash commands in the main prompt.'
 
 /** a fresh improvement for `original`, in `step` (writing = the default one-call rewrite) */
 export const newImproveFlow = (id: string, original: string, step: MkImproveStep = 'writing'): MkImproveFlow => ({

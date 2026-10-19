@@ -183,7 +183,7 @@ function footerCard(els: Els, f: MkImproveFlow, cols: number, act: (kind: Improv
       </Box>
     )
   } else if (f.step === 'questions') {
-    body = <Box flexDirection="column">{head('✦ QUICK QUESTIONS')}{questions(els, f, w, act, 'improve-f')}</Box>
+    body = <Box flexDirection="column">{head('✦ WIZARD')}{questions(els, f, w, act, 'improve-f')}</Box>
   } else if (f.step === 'error') {
     body = (
       <Box flexDirection="column">
@@ -271,7 +271,7 @@ export function ImproveTab(els: Els, view: ImproveView, cols: number, ui: Improv
       <Box flexDirection="column" gap={1}>
         {Card(els, {}, (
           <Box flexDirection="column">
-            <Text bold={true} color={ROLE.ok.fg}>No proposal yet</Text>
+            <Text bold={true} color={ROLE.ok.fg}>✦ IMPROVE</Text>
             {lines(els, 'improve-t-empty', 'Type a prompt in the footer and press Improve.', w, 3, {})}
           </Box>
         ))}

@@ -4,7 +4,7 @@
 import { test, expect } from 'claude-code/testing'
 import type { Engine, Mounted } from 'claude-code/testing'
 import { mockFs, mockWorld, paneProps, sessionStart, worldFiles, worldFixtures } from './testkit'
-import { IMPROVE_FAILED, wordCount } from './improve-core'
+import { IMPROVE_FAILED, IMPROVE_SLASH, wordCount } from './improve-core'
 
 const usage = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
 const ROUGH = 'Check all the files with type errors.'
@@ -234,7 +234,7 @@ test('Run Wizard switches the same card to the questions; answers and Skip shape
   await w.settle()
   expect(w.log.calls, 'the questions call').toBe(2)
   expect(w.log.prompts[1]).toContain('Ask up to 3 multiple-choice questions')
-  expect(await has(ui, { text: '✦ QUICK QUESTIONS' }), 'the same card now asks').toBe(true)
+  expect(await has(ui, { text: '✦ WIZARD' }), 'the same card now asks').toBe(true)
   expect(await has(ui, { text: /1 Who is it for\?/ })).toBe(true)
   for (const b of ['improve-f-q0o0', 'improve-f-q0o1', 'improve-f-q0other', 'improve-f-q0skip', 'improve-f-q1o0']) expect(await has(ui, { type: 'Button', key: b }), b).toBe(true)
   await ui.press({ key: 'improve-f-q0o1' }) // My team
@@ -319,7 +319,7 @@ test('a failing question call shows the calm line; Try again asks again', { plug
   expect(await says(ui, IMPROVE_FAILED)).toBe(true)
   await ui.press({ key: 'improve-f-retry' })
   await w.settle()
-  expect(await has(ui, { text: '✦ QUICK QUESTIONS' })).toBe(true)
+  expect(await has(ui, { text: '✦ WIZARD' })).toBe(true)
   expect(await boxValue(ui)).toBe(ROUGH)
 })
 
@@ -487,6 +487,71 @@ test('F4: Enter in the box accepts the proposal while one is on show; with none 
   await ui.input({ key: 'improve-q', text: ROUGH })
   expect(w.log.submitted).toEqual([{ text: ROUGH, asUser: true }])
   expect(await boxValue(ui)).toBe('')
+})
+
+test('review 2: Enter with different text than the proposal was made for sends that text and drops the old card', { plugins: [worldFixtures] }, async ($, on) => {
+  const w = world(on, { answer: () => REWRITE })
+  await $.session.start(sessionStart())
+  const ui = await mount($)
+  await improve(ui, w)
+  await type(ui, 'something else entirely')
+  await ui.input({ key: 'improve-q', text: 'something else entirely' })
+  expect(w.log.submitted).toEqual([{ text: 'something else entirely', asUser: true }])
+  expect(await has(ui, { text: '✦ IMPROVED PROMPT' }), 'the old card is gone').toBe(false)
+})
+
+test('review 2: a leading slash is not sent as plain text; the card says so and the box keeps it', { plugins: [worldFixtures] }, async ($, on) => {
+  const w = world(on, { answer: () => REWRITE })
+  await $.session.start(sessionStart())
+  const ui = await mount($)
+  await type(ui, '/compact now')
+  await ui.input({ key: 'improve-q', text: '/compact now' })
+  expect(w.log.submitted).toEqual([])
+  expect(await boxValue(ui)).toBe('/compact now')
+  expect(await says(ui, IMPROVE_SLASH)).toBe(true)
+})
+
+test('review 3: a saved improvement is cut to 4000 characters each side, so one pasted wall cannot fill the store', { plugins: [worldFixtures] }, async ($, on) => {
+  const big = 'x'.repeat(9000)
+  const w = world(on, { answer: () => JSON.stringify({ prompt: big, added: ['a'] }) })
+  await $.session.start(sessionStart())
+  const ui = await mount($)
+  await improve(ui, w, big)
+  const saved = w.stored.get('improveHistory') as { original: string; upgraded: string }[]
+  expect(saved[0]?.original).toHaveLength(4000)
+  expect(saved[0]?.upgraded).toHaveLength(4000)
+})
+
+test('review 6: Run Wizard keeps an edit in progress as the proposal, even when the question call then fails', { plugins: [worldFixtures] }, async ($, on) => {
+  const w = world(on, { answer: (_n, isQuestions) => (isQuestions ? null : REWRITE) })
+  await $.session.start(sessionStart())
+  const ui = await mount($, 80)
+  await improve(ui, w)
+  await ui.press({ key: 'dash-tab-improve' })
+  await ui.press({ key: 'improve-t-edit' })
+  await ui.input({ key: 'improve-edit', text: 'my own edit', kind: 'change' })
+  await ui.press({ key: 'improve-t-wizard' })
+  await w.settle()
+  expect(await has(ui, { text: IMPROVE_FAILED }), 'the question call failed').toBe(true)
+  await ui.press({ key: 'improve-t-accept' })
+  expect(await boxValue(ui), 'the edit, not the older rewrite, is what Accept takes').toBe('my own edit')
+})
+
+test('review 12: while an Improve input has the focus the Todo a / z hotkeys stand down, like todo-q', { plugins: [worldFixtures] }, async ($, on) => {
+  on('ui.focus', () => ({}))
+  world(on, { answer: () => REWRITE })
+  await $.session.start(sessionStart())
+  const ui = await mount($)
+  await ui.press({ key: 'dash-tab-todo' })
+  const hotkeyOf = async (key: string): Promise<unknown> =>
+    (await ui.find({ type: 'Button', key }) as { props: { hotkey?: string } } | undefined)?.props.hotkey
+  expect(await hotkeyOf('todo-key-a'), 'armed before the box has the ring').toBe('a')
+  await $.ui.focus({ component: 'Pane', requestId: 'matrixkoder', element: 'improve-q', origin: { kind: 'person' } })
+  await ui.redraw(paneProps(46))
+  expect(await hotkeyOf('todo-key-a'), 'inert while the box holds the ring').toBeUndefined()
+  await $.ui.focus({ component: 'Pane', requestId: 'matrixkoder', element: 'improve-f-go', origin: { kind: 'person' } })
+  await ui.redraw(paneProps(46))
+  expect(await hotkeyOf('todo-key-a'), 'back once the ring leaves the box').toBe('a')
 })
 
 test('F4: Enter while the proposal shows in the Improve tab accepts it too', { plugins: [worldFixtures] }, async ($, on) => {
@@ -670,7 +735,7 @@ test('F5: a wizard question flow (no worker) is left alone at session start', { 
   await ui.press({ key: 'improve-f-wizard' })
   await w.settle()
   await $.session.start(sessionStart())
-  expect(await has(ui, { text: '✦ QUICK QUESTIONS' })).toBe(true)
+  expect(await has(ui, { text: '✦ WIZARD' })).toBe(true)
 })
 
 test('F3: wizard option chips of 40 characters fit inside the padded box at 36, 46 and 80 columns', { plugins: [worldFixtures], timeoutMs: 30000 }, async ($, on) => {
