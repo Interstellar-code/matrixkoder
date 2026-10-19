@@ -205,6 +205,11 @@ const filesGitCache = new Map<string, Map<string, string>>()
 const filesScanned = new Set<string>()
 let filesWalkInFlight = false
 let filesSkipOnce = false
+/** when the last walk+git of the Files tick started (the engine clock): one per FILES_WALK_MS window */
+let lastFilesWalk = 0
+/** whether the last Files render drew any activity icon: its fade must be drawn, so the beat keeps
+ *  redrawing until a render shows the faded row. An icon-free pane leaves this false. */
+let filesIconsDrawn = false
 let filesCurrentRoot: string | null = null
 let filesChosenRoot: string | null = null
 let filesRenderWalk = true // a render may start the first walk only when the pane opened straight onto Files
@@ -347,6 +352,7 @@ export function registerDashboard(on: On, options: PluginOptions): void {
     // never start a refresh on its own, or the refresh tick would re-list.
     if ((dashTab === 'lanes' || dashTab === 'files') && Date.now() - Number(viewState['lanes:slots-at'] ?? '0') > 30_000) void loadLaneSlots($)
     filesShown = dashTab === 'files'
+    if (dashTab !== 'files') filesIconsDrawn = false // the pulse is a Files-tab animation only
     // the Files reads below may find the plugin unloaded when a render lands during teardown: they settle to empty, never reject
     if (dashTab === 'files') {
       if (!filesNow) filesNow = await Promise.resolve($.clock.now()).catch(() => 0)
@@ -655,6 +661,8 @@ async function startLoop($: EngineInterface, options: PluginOptions, cwd: string
   lastFilesDraw = 0
   filesShown = false
   filesSlotsStamp = 0
+  lastFilesWalk = 0
+  filesIconsDrawn = false
   filesWalkCache.clear()
   filesWalkInFlight = false
   filesSkipOnce = false
@@ -685,7 +693,8 @@ async function startLoop($: EngineInterface, options: PluginOptions, cwd: string
   timerRegistry.cancelSweep = arm($.clock.every(SWEEP_INTERVAL_MS, () => sweepLanes($, options, cwd)))
   busTimers.cancelBus?.()
   busTimers.cancelBus = arm($.clock.every(BUS_INTERVAL_MS, () => ensureBus($, options, cwd)))
-  // the code rain's own frame: a view-state bump redraws the pane, skipped once no pane drew it lately
+  // the code rain's own frame: a view-state bump redraws the pane. It runs only while the dock is
+  // OPEN (a closed pane must not render), and while something on screen is still animating.
   timerRegistry.cancelRain?.()
   timerRegistry.cancelRain = arm($.clock.every(RAIN_MS, async () => {
     let clockOk = true
@@ -694,19 +703,32 @@ async function startLoop($: EngineInterface, options: PluginOptions, cwd: string
     } catch {
       clockOk = false // only the Files work skips this beat; the rain still beats
     }
+    if (!(await read($, paneOpenAtom).catch(() => false))) return // a closed dock draws nothing
+    // one clock for the whole beat: the engine clock when it answers, else wall time so a
+    // refused clock.now still lets the rain move (C1: the review fix 4 test pins that)
+    const now = clockOk ? filesNow : Date.now()
     const files = clockOk && filesShown && filesNow - lastFilesDraw < 10_000
-    const rain = Date.now() - lastRainDraw < 10_000
-    if (rain || files) {
-      void setViewKey($, 'rain:tick', String(Math.floor((rain ? Date.now() : filesNow) / RAIN_MS))).catch(() => {})
+    const rain = now - lastRainDraw < 10_000
+    // The pulse only changes rows that carry an activity icon, and an icon exists only while a
+    // tool-call entry is live (3 s): with none, a flip changes nothing on screen, so no redraw.
+    const act = files && clockOk ? await read($, fileActivityAtom).catch(() => undefined) : undefined
+    const icons = act != null && act.some(e => filesNow - e.at <= 3000)
+    // a pane whose last render carried an icon keeps redrawing until a render draws its fade
+    if (rain || icons || filesIconsDrawn) {
+      void setViewKey($, 'rain:tick', String(Math.floor(now / RAIN_MS))).catch(() => {})
     }
     if (files) {
       if (filesSlotsStamp === null || filesNow - filesSlotsStamp >= 30_000) {
         filesSlotsStamp = filesNow
         void loadLaneSlots($).catch(() => {})
       }
+      // the walk and its two git runs cost a tree listing each on a quiet repo: once per
+      // FILES_WALK_MS window is enough for a create, delete, rename OR an edit to show.
+      // A files:v write that was refused is retried at once: that is a lost redraw, not a quiet repo.
       if (filesSkipOnce) {
         filesSkipOnce = false
-      } else if (!filesWalkInFlight) {
+      } else if (!filesWalkInFlight && (filesBumpPending || filesNow - lastFilesWalk >= FILES_WALK_MS)) {
+        lastFilesWalk = filesNow
         void filesTick($).catch(() => {})
       }
     }
@@ -756,6 +778,12 @@ async function closePane($: EngineInterface): Promise<void> {
   } catch {
     // already closed — fine
   }
+  // a closed pane draws nothing: drop the stamps that would keep the beat and the Files walk hot
+  // for up to 10 s after the dock goes; the next tick after a reopen starts them again
+  filesShown = false
+  filesIconsDrawn = false
+  lastRainDraw = 0
+  lastFilesDraw = 0
   await update($, paneOpenAtom, () => false)
 }
 
@@ -1281,6 +1309,8 @@ function FilesPane(
     }
 
     const pulse = Math.floor(filesNow / RAIN_MS) % 2 === 0
+    // an icon on screen means the next pulse step changes something visible there
+    filesIconsDrawn = rows.some(r => r.icon != null)
     const view: FilesView = {
       roots,
       root: rootToRender,
@@ -2533,6 +2563,9 @@ function usageRows(snap: MkSnapshot, compact: boolean): UsageRow[] {
 }
 
 const RAIN_MS = 1500
+/** The Files walk + its two git runs: one per window on a quiet repo (a create, delete, rename or
+ *  edit still shows within one window, so change detection is kept). */
+const FILES_WALK_MS = 5000
 /** when the rain last drew: the tick only redraws while a pane is actually showing it */
 let lastRainDraw = 0
 
@@ -2548,13 +2581,11 @@ const rainHash = (n: number): number => {
   return (x ^ (x >>> 16)) >>> 0
 }
 
-/** Matrix code rain as an absolute layer behind the pane: one drop on every other column,
- *  falling one or two rows per rain tick, its head brightest and its tail fading. It moves only when
- *  the pane redraws: the RAIN_MS tick below, or any other redraw. */
-function codeRain(els: Elements[keyof Elements], cols: number, rows: number, now: number): RenderElement {
-  const { Box, Text } = els
-  lastRainDraw = now
-  const tick = Math.floor(now / RAIN_MS) // one step per rain redraw
+/** The rain's cells for one tick: shade per cell (-1 = empty) and the glyph grid. Pure. */
+export type RainGrid = { grid: number[][]; glyph: string[][] }
+
+/** Builds the rain grid for (cols, rows, tick). Pure: same inputs, same output. */
+export function buildRainGrid(cols: number, rows: number, tick: number): RainGrid {
   // shade per cell (-1 = empty), then each row is drawn as runs of one shade
   const grid: number[][] = Array.from({ length: rows }, () => new Array<number>(cols).fill(-1))
   const glyph: string[][] = Array.from({ length: rows }, () => new Array<string>(cols).fill(' '))
@@ -2571,6 +2602,30 @@ function codeRain(els: Elements[keyof Elements], cols: number, rows: number, now
       glyph[r]![c] = RAIN_GLYPHS[rainHash(c * 31 + r * 131 + tick) % RAIN_GLYPHS.length]!
     }
   }
+  return { grid, glyph }
+}
+
+/** The latest grid only: two renders in one tick and size reuse it, a new tick or size builds a new
+ *  one, and the cache never grows past this one entry. */
+let rainGridCache: { cols: number; rows: number; tick: number; value: RainGrid } | null = null
+
+/** buildRainGrid, once per (cols, rows, tick): a render is otherwise ~1,840 fresh cells. */
+export function rainGridFor(cols: number, rows: number, tick: number): RainGrid {
+  const hit = rainGridCache
+  if (hit != null && hit.cols === cols && hit.rows === rows && hit.tick === tick) return hit.value
+  const value = buildRainGrid(cols, rows, tick)
+  rainGridCache = { cols, rows, tick, value }
+  return value
+}
+
+/** Matrix code rain as an absolute layer behind the pane: one drop on every other column,
+ *  falling one or two rows per rain tick, its head brightest and its tail fading. It moves only when
+ *  the pane redraws: the RAIN_MS tick below, or any other redraw. */
+function codeRain(els: Elements[keyof Elements], cols: number, rows: number, now: number): RenderElement {
+  const { Box, Text } = els
+  lastRainDraw = now
+  const tick = Math.floor(now / RAIN_MS) // one step per rain redraw
+  const { grid, glyph } = rainGridFor(cols, rows, tick)
   return (
     <Box key="rain" position="absolute" top={0} left={0} flexDirection="column">
       {grid.map((row, r) => {

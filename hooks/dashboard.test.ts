@@ -9,7 +9,7 @@ import type { Files, MockWorld } from './testkit'
 
 
 import { PANE_ID, parseYamlAgents } from './data'
-import { filesFocus, footerParts, liveOverviewView, modelShort, openWaiting, planActionPatch, resolveMainCheckout, runPlanAction, taskNote, usageShorts, waitingPane, waitingPaneView } from './dashboard'
+import { buildRainGrid, filesFocus, footerParts, liveOverviewView, modelShort, openWaiting, planActionPatch, rainGridFor, resolveMainCheckout, runPlanAction, taskNote, usageShorts, waitingPane, waitingPaneView } from './dashboard'
 import type { MkSnapshot } from '../types'
 import { mockTabCounts, waitingCount } from './tabs/header'
 import { RUN_SNAPSHOT } from './fixtures/run-snapshot'
@@ -2800,17 +2800,23 @@ const F43_OPTS = { timeoutMs: 15000, plugins: [worldFixtures] }
 const F43_MOUNT = { plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder' } as const
 
 test('Files F4.3: a2 rain:tick follows the mock clock (filesNow), not Date.now, with Files the only tab drawn', F43_OPTS, async ($, on) => {
-  const rig = f43Rig(on, { startOnFiles: true, listing: () => [f43Entry('a.ts')] })
+  const rig = f43Rig(on, {
+    startOnFiles: true,
+    // P4.4: the pulse only redraws rows that carry an icon, so this fixture carries one and the
+    // second advance stays inside its 3 s activity TTL (NOW + 2900)
+    activity: [{ path: `${PROJECT_DIR}/a.ts`, kind: 'write', at: NOW }],
+    listing: () => [f43Entry('a.ts')],
+  })
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ ...F43_MOUNT, props: paneProps(46, 'inline') })
   await rig.settle()
   await rig.clock.advance(1500)
   await rig.settle()
   expect(rig.vs()['rain:tick']).toBe(String(Math.floor((NOW + 1500) / 1500)))
-  await rig.clock.advance(3000)
+  await rig.clock.advance(1400)
   await rig.settle()
   await ui.redraw(paneProps(46, 'inline'))
-  expect(rig.vs()['rain:tick']).toBe(String(Math.floor((NOW + 4500) / 1500)))
+  expect(rig.vs()['rain:tick']).toBe(String(Math.floor((NOW + 2900) / 1500)))
 })
 
 test('Files F4.3: a3 the tick walks and writes nothing when the last render was not Files, (the over-10 s half is not reachable here: a mounted pane redraws on every tick bump)', F43_OPTS, async ($, on) => {
@@ -2910,7 +2916,7 @@ test('Files F4.3: a6 the first walk of a root, and the first walk after switchin
   mainExtra = true // main changes while the lane is shown
   await ui.press({ key: 'files-root:main' })
   await rig.settle()
-  await rig.clock.advance(1500)
+  await rig.clock.advance(6000) // P4.2: one walk per 5 s window — the next window after the walk above
   await rig.settle()
   await ui.redraw(paneProps(46))
   expect(await ui.find({ text: /a2\.ts/ })).toBeTruthy()
@@ -2953,7 +2959,8 @@ test('Files F4.3: a8 walk budget: a walk over 1000 ms of clock time makes the ne
     await rig.settle()
     await ui.redraw(paneProps(46)) // keeps Files inside the 10 s hot window
   }
-  // a walk that takes 1100 ms: tick 1500 starts it, the walk ends at 2600, tick 3000 skips, tick 4500 walks
+  // a walk that takes 1100 ms (over the 1000 ms budget): beat 1500 starts it, and the 5 s window
+  // holds the beats at 3000, 4500 and 6000 back, so the next walk is at 7500
   walkMs = 1100
   await step(1500)
   expect(rootCalls).toBe(base + 1)
@@ -2961,13 +2968,17 @@ test('Files F4.3: a8 walk budget: a walk over 1000 ms of clock time makes the ne
   await step(1500)
   expect(rootCalls).toBe(base + 1)
   await step(1500)
+  expect(rootCalls).toBe(base + 1)
+  await step(4500)
   expect(rootCalls).toBe(base + 2)
-  // a walk that takes 3200 ms: ticks 7500 and 9000 find it running; it ends at 9200, tick 10500 skips, tick 12000 walks
+  // a walk that takes 3200 ms: it starts at beat 14000 and ends at 17200, so the beats at 15500 and
+  // 17000 find it running; beat 18500 is still inside the window, beat 20000 walks
   walkMs = 3200
-  await step(1500)
+  await step(5000)
   expect(rootCalls).toBe(base + 3)
   walkMs = 0
   await step(1500)
+  expect(rootCalls).toBe(base + 3)
   await step(1500)
   expect(rootCalls).toBe(base + 3)
   await step(1500)
@@ -2987,10 +2998,9 @@ test('Files F4.3: a9 a tick whose walk finds no change writes only rain:tick: no
   await rig.clock.advance(1500)
   await rig.settle()
   const after = rig.sets.slice(mark)
-  expect(after.length).toBeGreaterThan(0)
   expect(after.every(s => s.key === 'viewState')).toBe(true)
   const changed = Object.keys(rig.vs()).filter(k => rig.vs()[k] !== before[k])
-  expect(changed).toEqual(['rain:tick'])
+  expect(changed).toEqual([])
 })
 
 test('Files F4.3: a10 on a fixture shaped like this repo one tick lists at most 60 folders, none inside .omc, .matrixkoder or .matrixkoder-old-1, is not capped, and a newer .matrixkoder-status.json records no write', F43_OPTS, async ($, on) => {
@@ -3056,7 +3066,7 @@ test('Files F4.3: review fix 1, with a missing lane root chosen the tick walks t
   await rig.settle()
   expect(rig.writes()).toBe(0)
   newFile = true
-  await rig.clock.advance(1500)
+  await rig.clock.advance(6000) // P4.2: the next 5 s walk window after the walk above
   await rig.settle()
   const last = rig.sets.filter(s => s.key === 'fileActivity').pop()?.value as { path: string; kind: string }[] | undefined
   expect(last?.map(a => a.path)).toEqual([`${PROJECT_DIR}/new.ts`])
@@ -3588,4 +3598,153 @@ test('P1.3.a4 (R3): a first load that rejects before its usage check still polls
   await clock.advance(1)
   await settle(clock, 20)
   expect(polls, 'the failed first load still leaves exactly one cold-start poll').toHaveLength(1)
+})
+
+/* ---------------------------------------------------------------------------
+ * P4 — rain and Files render economy (dashboard-perf-r1)
+ * ------------------------------------------------------------------------- */
+
+test('P4.1.a1: a closed dock writes no rain:tick and redraws nothing, and a reopen restarts the beat', F43_OPTS, async ($, on) => {
+  // FAILS ON THE OLD CODE: closePane reset neither filesShown nor lastRainDraw, so the beat kept
+  // bumping rain:tick for up to 10 s after the dock closed and the pane re-rendered unseen.
+  const rig = f43Rig(on, { startOnFiles: true, listing: p => (p === PROJECT_DIR ? [f43Entry('a.ts')] : []) })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ ...F43_MOUNT, props: paneProps(46) })
+  await rig.settle()
+  await ui.redraw(paneProps(46))
+  await rig.clock.advance(1500)
+  await rig.settle()
+  expect(rig.vs()['rain:tick'], 'the open dock beats').toBeDefined()
+
+  await $.command.run({ command: 'mk', args: 'close', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 165 } })
+  await rig.settle()
+  const mark = rig.sets.length
+  const tickAtClose = rig.vs()['rain:tick']
+  await rig.clock.advance(4500) // three beats, all inside the refresh tick's 5 s
+  await rig.settle()
+  const after = rig.sets.slice(mark)
+  expect(after.filter(s => s.key === 'viewState' && (s.value as Record<string, string>)['rain:tick'] !== tickAtClose)).toEqual([])
+
+  await $.command.run({ command: 'mk', args: 'open', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 165 } })
+  await rig.settle()
+  await ui.redraw(paneProps(46)) // the engine paints the reopened pane: codeRain stamps lastRainDraw
+  const mark2 = rig.sets.length
+  await rig.clock.advance(1500)
+  await rig.settle()
+  expect(rig.sets.slice(mark2).some(s => s.key === 'viewState' && (s.value as Record<string, string>)['rain:tick'] !== tickAtClose), 'the beat is back').toBe(true)
+})
+
+test('P4.2.a1: on an unchanged repo with Files shown, 30 s of beats walk at most once per 5 s and run git at most once per 5 s', F43_OPTS, async ($, on) => {
+  // FAILS ON THE OLD CODE, which walked the tree and ran `git ls-files` + `git status` on every
+  // 1.5 s beat (20 walks and 40 git runs in 30 s).
+  let walks = 0
+  const gits: string[][] = []
+  const rig = f43Rig(on, {
+    startOnFiles: true,
+    process: argv => {
+      if (argv[0] === 'git') gits.push([...argv])
+      return undefined
+    },
+    listing: p => {
+      if (p === PROJECT_DIR) walks++
+      return p === PROJECT_DIR ? [f43Entry('a.ts'), f43Entry('sub', 0, 'dir')] : [f43Entry('b.ts')]
+    },
+  })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ ...F43_MOUNT, props: paneProps(46) })
+  await rig.settle()
+  await ui.redraw(paneProps(46))
+  const baseWalks = walks
+  const baseGits = gits.length
+  for (let i = 0; i < 20; i++) { // 20 beats = 30 s
+    await rig.clock.advance(1500)
+    await rig.settle()
+    await ui.redraw(paneProps(46))
+  }
+  const walked = walks - baseWalks
+  const gitRuns = gits.length - baseGits
+  expect(walked, 'at most one walk per 5 s window').toBeLessThanOrEqual(6)
+  expect(gitRuns, 'at most one git run pair per 5 s window').toBeLessThanOrEqual(12)
+  expect(walked, 'and the beat does keep walking').toBeGreaterThan(0)
+  expect(gits.some(a => a.includes('ls-files')), 'the walk still asks git for the ignored dirs').toBe(true)
+  expect(gits.some(a => a.includes('status')), 'the walk still asks git for the status').toBe(true)
+})
+
+test('P4.2.a2: a file edited in place (same listing, changed git status) shows its status within one 5 s window', F43_OPTS, async ($, on) => {
+  // C2: skipping git whenever the LISTING is unchanged would miss this edit entirely.
+  let status = ''
+  const rig = f43Rig(on, {
+    startOnFiles: true,
+    process: argv => {
+      if (argv[0] === 'git' && argv.includes('status')) {
+        return { value: { exitCode: 0, stdout: status, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      }
+      return undefined
+    },
+    listing: () => [f43Entry('a.ts', 1000)],
+  })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ ...F43_MOUNT, props: paneProps(46) })
+  await rig.settle()
+  await ui.redraw(paneProps(46))
+  expect(await ui.find({ text: /✓ clean/ }), 'the quiet repo reads clean').toBeTruthy()
+  status = ' M a.ts\n' // the real `git status --porcelain` line for an edited, still-listed file
+  await rig.clock.advance(4500) // the next beat inside the window after the boot walk
+  await rig.settle()
+  await ui.redraw(paneProps(46))
+  expect(await ui.find({ text: /● 1 dirty/ }), 'the edit is seen within one window').toBeTruthy()
+})
+
+test('P4.3.a1/a2: the rain grid is built once per (cols, rows, tick) and equals the uncached build', () => {
+  // FAILS ON THE OLD CODE, which had no cache at all: every render rebuilt the 46x40 grid.
+  const tick = Math.floor(NOW / 1500)
+  const a = rainGridFor(46, 40, tick)
+  const b = rainGridFor(46, 40, tick)
+  expect(b).toBe(a) // same object: built once for two renders in one tick and size
+  expect(a).toEqual(buildRainGrid(46, 40, tick)) // identical to the uncached output
+  const nextTick = rainGridFor(46, 40, tick + 1)
+  expect(nextTick).not.toBe(a)
+  const resized = rainGridFor(30, 40, tick + 1)
+  expect(resized).not.toBe(nextTick)
+  // single entry: the earlier ones are gone, the latest is held
+  expect(rainGridFor(30, 40, tick + 1)).toBe(resized)
+  expect(rainGridFor(46, 40, tick)).not.toBe(a)
+})
+
+test('P4.4.a2: an inline Files pane with no activity icons writes no rain:tick across several beats', F43_OPTS, async ($, on) => {
+  // FAILS ON THE OLD CODE, which bumped rain:tick on every 1.5 s beat while Files was shown even
+  // though the pulse changed no visible prop on any row.
+  const rig = f43Rig(on, { startOnFiles: true, listing: () => [f43Entry('a.ts')] })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ ...F43_MOUNT, props: paneProps(46, 'inline') })
+  await rig.settle()
+  await ui.redraw(paneProps(46, 'inline'))
+  const mark = rig.sets.length
+  for (let i = 0; i < 4; i++) {
+    await rig.clock.advance(1500)
+    await rig.settle()
+  }
+  const ticks = rig.sets.slice(mark)
+    .filter(s => s.key === 'viewState')
+    .map(s => (s.value as Record<string, string>)['rain:tick'])
+    .filter(v => v !== undefined)
+  expect(ticks, 'no rain:tick write at all').toEqual([])
+})
+
+test('P4.4.a2: an inline Files pane that draws an icon still pulses it, and the fade is drawn', F43_OPTS, async ($, on) => {
+  const rig = f43Rig(on, { startOnFiles: true, activity: [{ path: `${PROJECT_DIR}/a.ts`, kind: 'write', at: NOW }], listing: () => [f43Entry('a.ts')] })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ ...F43_MOUNT, props: paneProps(46, 'inline') })
+  await rig.settle()
+  await ui.redraw(paneProps(46, 'inline'))
+  expect(dots(await f43Screen(ui))).toBe(2) // the lit row and the legend
+  const mark = rig.sets.length
+  await rig.clock.advance(1500)
+  await rig.settle()
+  expect(rig.sets.slice(mark).some(s => s.key === 'viewState' && (s.value as Record<string, string>)['rain:tick'] != null), 'the icon pulses').toBe(true)
+  await ui.redraw(paneProps(46, 'inline'))
+  // the activity entry expires at 3 s: the beat keeps redrawing until a render shows the faded row
+  await rig.clock.advance(3000)
+  await rig.settle()
+  expect(dots(await f43Screen(ui))).toBe(1) // the legend only
 })

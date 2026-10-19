@@ -120,6 +120,15 @@ function getParent(p: string): string {
   return cut <= 0 ? '/' : p.slice(0, cut)
 }
 
+/** The latest press handler: a row element is cached across renders, so its `onPress` may not close
+ *  over one render's view. Every render repoints this before rows are drawn. */
+let rowPress: (row: Row) => void = () => {}
+
+/** One drawn row per `row.key`, reused while its signature is unchanged: a pulse that changes no
+ *  visible prop on a row (it has no icon) hands back the same element object instead of rebuilding
+ *  up to 600 of them. Pruned to the rows of the latest render, so it never grows. */
+const rowCache = new Map<string, { sig: string; el: RenderElement }>()
+
 function parseOpenList(view: FilesView, ui: FilesTabUi): string[] {
   try {
     const raw = ui.get('files:open')
@@ -150,6 +159,25 @@ export function FilesTab(
     const pathRows = view.rows.filter(r => !r.note)
     const selIndex = pathRows.findIndex(r => r.key === selKey)
     const selectedRow = view.rows.find(r => r.key === selKey)
+
+    // the cached row elements call through this, so it must be this render's view and ui
+    rowPress = (row: Row): void => {
+      if (row.dir) {
+        const currentOpen = parseOpenList(view, ui)
+        let next: string[]
+        if (row.open) {
+          next = currentOpen.filter(p => p !== row.path)
+        } else {
+          next = Array.from(new Set([...currentOpen, row.path]))
+        }
+        ui.set('files:open', JSON.stringify(next))
+        ui.set('files:sel', row.key)
+        ui.reveal?.(row.key)
+      } else {
+        ui.set('files:sel', row.key)
+        ui.reveal?.(row.key)
+      }
+    }
 
     // Action handlers for j, k, h, l keys
     const moveSel = (delta: number) => {
@@ -424,43 +452,39 @@ export function FilesTab(
           rowBg = FT.readRowTint
         }
 
-        const onRowPress = () => {
-          if (row.dir) {
-            const currentOpen = parseOpenList(view, ui)
-            let next: string[]
-            if (row.open) {
-              next = currentOpen.filter(p => p !== row.path)
-            } else {
-              next = Array.from(new Set([...currentOpen, row.path]))
-            }
-            ui.set('files:open', JSON.stringify(next))
-            ui.set('files:sel', row.key)
-            ui.reveal?.(row.key)
-          } else {
-            ui.set('files:sel', row.key)
-            ui.reveal?.(row.key)
-          }
-        }
-
         // a Button holds only strings and Text, so the row background is the Box and the
         // icon column is Text inside the Button, pushed right by padding the name with spaces
         const nameCell = showCols ? clippedName.padEnd(nameBudget) : rightIconWidth > 0 ? clippedName.padEnd(nameBudget + 1) : clippedName.padEnd(innerTreeW - prefixWidth)
-        drawnRows.push(
+        const git = gitMarkOf(row, activeRoot.path, view.git)
+        const glyph = glyphOf(row)
+        // everything the drawn row depends on. A pulse that changes nothing visible on this row
+        // (no icon) leaves the signature alone, so the element object is reused.
+        const sig = [
+          row.key, row.path, row.depth, row.dir, row.open, row.hidden, row.link, row.icon, row.count,
+          row.size ?? '', row.mtimeMs ?? '', innerTreeW, showCols, isSelected, git.mark, git.color,
+          row.icon === 'write' ? view.pulse : '',
+        ].join('\u0000')
+        const cached = rowCache.get(row.key)
+        if (cached != null && cached.sig === sig) {
+          drawnRows.push(cached.el)
+          continue
+        }
+        const el = (
           <Box key={`files-line:${row.path}`} flexDirection="row" backgroundColor={rowBg}>
             {Button({
               key: row.key,
               plain: true,
-              onPress: onRowPress,
+              onPress: () => rowPress(row),
               children: [
                 <Text color={isSelected ? FT.limeBar : undefined}>{leftBar}</Text>,
                 <Text>{indentStr}</Text>,
                 <Text color={FT.dim}>{caret}</Text>,
                 <Text> </Text>,
-                <Text color={glyphOf(row).color}>{`${glyphOf(row).glyph} `}</Text>,
+                <Text color={glyph.color}>{`${glyph.glyph} `}</Text>,
                 <Text color={nameColor} bold={isBold}>{nameCell}</Text>,
                 ...(showCols
                   ? [
-                      <Text color={gitMarkOf(row, activeRoot.path, view.git).color}>{gitMarkOf(row, activeRoot.path, view.git).mark.padStart(GIT_W - 1).padEnd(GIT_W)}</Text>,
+                      <Text color={git.color}>{git.mark.padStart(GIT_W - 1).padEnd(GIT_W)}</Text>,
                       <Text color={FT.dim}>{fmtSize(row.dir ? undefined : row.size).padStart(SIZE_W)}</Text>,
                       <Text color={FT.dim}>{fmtDate(row.mtimeMs).padStart(DATE_W)}</Text>,
                       <Text
@@ -484,8 +508,14 @@ export function FilesTab(
                   : []),
               ],
             })}
-          </Box>,
+          </Box>
         )
+        rowCache.set(row.key, { sig, el })
+        drawnRows.push(el)
+      }
+      if (rowCache.size > view.rows.length) {
+        const live = new Set(view.rows.map(r => r.key))
+        for (const key of Array.from(rowCache.keys())) if (!live.has(key)) rowCache.delete(key)
       }
     }
 
