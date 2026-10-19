@@ -253,10 +253,12 @@ export const paths = {
   runDoc: (dataDir: string, runId: string): string => join(dataDir, 'runs', runId, 'run.json'),
   /** The orchestrator's bus watch cursors: <data>/watch-cursors.json. */
   watchCursors: (dataDir: string): string => join(dataDir, 'watch-cursors.json'),
-  /** C6 (mkpaths.bus_dir): store mode heartbeats the ONE bus under the MK home; file
-   *  mode keeps the per-project bus.json in the data dir. `store` = <data>/mk.db
-   *  exists; with no global dir to name, the per-project bus is the only answer. */
-  busDirOf: (dataDir: string, store: boolean, globalDir: string | null): string => (store && globalDir != null ? globalDir : dataDir),
+  /** C6 (mkpaths.bus_dir): $MK_BUS_DIR (`busEnv`) wins; store mode heartbeats the ONE
+   *  bus in the MK home's `bus/` folder; file mode keeps the per-project bus.json in the
+   *  data dir. `store` = <data>/mk.db exists; with no global dir to name, the
+   *  per-project bus is the only answer. */
+  busDirOf: (dataDir: string, store: boolean, globalDir: string | null, busEnv: string | null = null): string =>
+    busEnv || (store && globalDir != null ? join(globalDir, 'bus') : dataDir),
   /** <bus dir>/bus.json — pid, port, started, token (0600). */
   busFile: (busDir: string): string => join(busDir, 'bus.json'),
 }

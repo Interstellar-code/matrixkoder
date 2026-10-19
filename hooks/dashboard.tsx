@@ -22,7 +22,7 @@ import type { RunHeaderData } from './tabs/header'
 import { Card, Chip, Section, Segment } from './tabs/kit'
 import { PALETTE, ROLE, themeText, withTheme } from './tabs/palette'
 import { withRaster } from './tabs/raster'
-import { EventsTab, EVENTS_MAX, eventsView } from './tabs/events'
+import { BUS_UNKNOWN, EventsTab, EVENTS_MAX, eventsView } from './tabs/events'
 import type { BusViewData, EventItem, EventsView, LaneActivityItem } from './tabs/events'
 import { EVENTS_FIXTURE } from './tabs/events.fixture'
 import { LanesTab } from './tabs/lanes'
@@ -1804,7 +1804,7 @@ async function refreshSafe($: EngineInterface, options: PluginOptions, cwd: stri
     await refreshPending($, cwd)
     await refreshPlans($, cwd, overview)
     await refreshTodos($, cwd, overview)
-    await refreshEvents($, cwd, snap)
+    if (await read($, dashTabAtom) === 'events') await refreshEvents($, cwd, snap) // the store read costs a spawn: only for an open Events tab
   } catch (err) {
     try {
       await update($, snapshotAtom, () => ({ ...prev, error: `cannot read the run state (${String(err).slice(0, 40)})` }))
@@ -1885,9 +1885,7 @@ async function ensureBus($: EngineInterface, options: PluginOptions, cwd: string
     // global dir (paths.globalDirOf: $MK_HOME, else $MATRIXKODER_HOME, else
     // ~/.matrixkoder). File mode (no mk.db) keeps the per-project bus.json —
     // paths.busDirOf is mkpaths.bus_dir's rule.
-    const globalDir = await globalDirOf($, await homeDir($))
-    const busDir = paths.busDirOf(dataDir, await readText($, await paths.pickDb(dataDir, 'project', p => $.fs.exists(p).catch(() => false), p => $.fs.stat(p).then(st => st.size).catch(() => 0))) != null, globalDir)
-    const busFile = paths.busFile(busDir)
+    const busFile = paths.busFile(await busDirFor($, dataDir, await globalDirOf($, await homeDir($))))
     if ((await readText($, busFile)) != null) {
       await $.process.run(['python3', script, 'heartbeat', '--data', dataDir, '--run', snap.run.id], { timeoutMs: BUS_TIMEOUT_MS })
       return
@@ -1899,6 +1897,20 @@ async function ensureBus($: EngineInterface, options: PluginOptions, cwd: string
   } finally {
     busInFlight = false
   }
+}
+
+/** mkpaths.bus_dir for the pane: $MK_BUS_DIR, else store mode (the project DB
+ *  exists: an exists check, never a read of the DB) or file mode. */
+async function busDirFor($: EngineInterface, dataDir: string, globalDir: string | null): Promise<string> {
+  const db = await paths.pickDb(dataDir, 'project', p => $.fs.exists(p).catch(() => false), p => $.fs.stat(p).then(st => st.size).catch(() => 0))
+  const store = await $.fs.exists(db).catch(() => false)
+  let busEnv: string | null = null
+  try {
+    busEnv = (await $.env.get('MK_BUS_DIR')) || null
+  } catch {
+    // env noun refused: the store/file rule
+  }
+  return paths.busDirOf(dataDir, store, globalDir, busEnv)
 }
 
 /** True only for an explicit `{"ok":true,"value":false}` from mk-config.py. Every
@@ -2790,148 +2802,167 @@ let eventsInFlight = false
 const EVENTS_LIST_KEY = 'events:list'
 const EVENTS_BUS_KEY = 'events:bus'
 const EVENTS_LANES_KEY = 'events:lanes'
+/** raw store rows kept per run (acks included); the --since cursor reads only newer ones. */
+const EVENTS_KEEP = EVENTS_MAX * 4
+let eventsCache: { run: string; since: number; total: number; rows: Record<string, unknown>[] } | null = null
+const LANE_BUCKETS = 24
+const LANE_BUCKET_MS = 5 * 60_000 // 24 × 5 min: the card's "last 2h"
+const LANE_SILENT_MS = 5 * 60_000
+const LANE_EMPTY = '#0f4d22'
+
+const ageOf = (ms: number): string =>
+  ms < 60_000 ? `${Math.floor(ms / 1000)}s` : ms < 3_600_000 ? `${Math.floor(ms / 60_000)}m` : `${Math.floor(ms / 3_600_000)}h`
+
+const metaOf = (row: Record<string, unknown>): Record<string, unknown> => {
+  try {
+    const meta = JSON.parse(typeof row.meta_json === 'string' ? row.meta_json : '') as unknown
+    return meta != null && typeof meta === 'object' ? meta as Record<string, unknown> : {}
+  } catch {
+    return {}
+  }
+}
 
 async function refreshEvents($: EngineInterface, cwd: string, snap: MkSnapshot): Promise<void> {
   if (eventsInFlight) return
   eventsInFlight = true
+  // only a changed serialised value is written, so a quiet tick draws nothing
+  const write = async (next: Record<string, string>): Promise<void> => {
+    const prev = await read($, viewStateAtom)
+    if (Object.keys(next).every(k => (prev[k] ?? '') === next[k])) return
+    await update($, viewStateAtom, p => ({ ...p, ...next }))
+  }
   try {
     const home = await homeDir($)
     const dataDir = await resolveDataDir($, { cwd, home, requireExisting: true, store: true }).catch(() => null)
-    if (dataDir == null) return
-    const globalDir = await globalDirOf($, home)
-    const isStore = await readText($, await paths.pickDb(dataDir, 'project', p => $.fs.exists(p).catch(() => false), p => $.fs.stat(p).then(st => st.size).catch(() => 0))) != null
-    const busDir = paths.busDirOf(dataDir, isStore, globalDir)
+    if (dataDir == null || snap.run == null) {
+      eventsCache = null
+      await write({ [EVENTS_LIST_KEY]: '', [EVENTS_BUS_KEY]: '', [EVENTS_LANES_KEY]: '' })
+      return
+    }
+    const busDir = await busDirFor($, dataDir, await globalDirOf($, home))
+    const now = Date.now()
 
-    // 1. Bus status
-    let busView: BusViewData = EVENTS_FIXTURE.bus!
+    // 1. Bus status: up only while bus.json names a server whose heartbeat is fresh
+    const busText = await readText($, paths.busFile(busDir)).catch(() => null)
+    let parsedBus: { port?: number; pid?: number; started?: number; owner_heartbeat?: number; projects?: Record<string, unknown> } | null = null
     try {
-      const busFile = paths.busFile(busDir)
-      const busContent = await readText($, busFile)
-      if (busContent != null) {
-        const parsedBus = JSON.parse(busContent) as { port?: number; pid?: number; started?: number; owner_heartbeat?: number }
-        const port = parsedBus.port ? `127.0.0.1:${parsedBus.port}` : '—'
-        const pid = parsedBus.pid ?? null
-        const startedMs = (parsedBus.started ?? 0) * 1000
-        const uptimeMins = startedMs > 0 ? Math.max(0, Math.floor((Date.now() - startedMs) / 60000)) : 0
-        const uptimeH = Math.floor(uptimeMins / 60)
-        const uptimeM = uptimeMins % 60
-        const startDate = startedMs > 0 ? new Date(startedMs) : null
-        const startHHMM = startDate ? `${String(startDate.getHours()).padStart(2, '0')}:${String(startDate.getMinutes()).padStart(2, '0')}` : '09:12'
-        const runningSince = `${startHHMM} today · ${uptimeH}h ${uptimeM}m`
+      const parsed = JSON.parse(busText ?? '') as unknown
+      if (parsed != null && typeof parsed === 'object') parsedBus = parsed as typeof parsedBus
+    } catch {
+      // missing, empty or corrupt bus.json: the bus reads down
+    }
+    const tokens = await $.fs.exists(join(busDir, 'bus-tokens.json')).catch(() => false)
+    let ringQueue = 0
+    try {
+      const rq = JSON.parse((await readText($, join(busDir, 'ring-queue.json'))) ?? '[]') as unknown
+      if (Array.isArray(rq)) ringQueue = rq.length
+    } catch {
+      // no readable ring queue: nothing pending
+    }
+    // a root bus heartbeats per project (projects map); file mode has owner_heartbeat only
+    const beatMs = Math.max(Number(parsedBus?.owner_heartbeat) || 0, ...Object.values(parsedBus?.projects ?? {}).map(v => Number(v) || 0)) * 1000
+    const startedMs = (Number(parsedBus?.started) || 0) * 1000
+    const startHHMM = startedMs > 0 ? clockOf(new Date(startedMs).toISOString()) : '—'
+    const upMins = Math.max(0, Math.floor((now - startedMs) / 60_000))
+    const busView: BusViewData = parsedBus == null
+      ? { ...BUS_UNKNOWN, files: { busJson: busText != null, tokens, ringQueue } }
+      : {
+        up: beatMs > 0 && now - beatMs <= 2 * BUS_INTERVAL_MS,
+        lastAge: beatMs > 0 ? ageOf(Math.max(0, now - beatMs)) : '—',
+        port: parsedBus.port ? `127.0.0.1:${parsedBus.port}` : '—',
+        pid: typeof parsedBus.pid === 'number' ? parsedBus.pid : null,
+        runningSince: startedMs > 0 ? `${startHHMM} · ${Math.floor(upMins / 60)}h ${upMins % 60}m` : '—',
+        queue: { pending: ringQueue, rate: null, total: null },
+        files: { busJson: true, tokens, ringQueue },
+        rateStart: startHHMM,
+        rateHistory: [],
+      }
 
-        const lastHeartbeatMs = (parsedBus.owner_heartbeat ?? 0) * 1000
-        const lastAgeSec = lastHeartbeatMs > 0 ? Math.max(0, Math.floor((Date.now() - lastHeartbeatMs) / 1000)) : 37
-        const lastAge = `${lastAgeSec}s`
-
-        // Check tokens & ring queue files
-        const tokensExist = await $.fs.exists(join(busDir, 'bus-tokens.json')).catch(() => false)
-        let ringQueueLen = 0
-        try {
-          const rqPath = join(busDir, 'ring-queue.json')
-          const rqText = await readText($, rqPath)
-          if (rqText) {
-            const rqParsed = JSON.parse(rqText) as unknown
-            if (Array.isArray(rqParsed)) ringQueueLen = rqParsed.length
+    // 2. Events: the --since cursor reads only rows past the last tick's newest id
+    const runId = snap.run.id
+    if (eventsCache?.run !== runId) eventsCache = { run: runId, since: 0, total: 0, rows: [] }
+    const cache = eventsCache
+    try {
+      const ran = await $.process.run(
+        ['python3', `${$.plugin.root}/scripts/mkdb.py`, '--data', dataDir, 'events', '--run', runId, '--chan', '', '--json',
+          ...(cache.since > 0 ? ['--since', String(cache.since)] : [])],
+        { timeoutMs: STORE_READ_MS },
+      )
+      if (ran.exitCode === 0) {
+        const parsed = JSON.parse(ran.stdout) as { ok?: boolean; events?: Record<string, unknown>[] }
+        if (parsed.ok && Array.isArray(parsed.events)) {
+          for (const row of parsed.events) {
+            if (typeof row.id === 'number' && row.id > cache.since) cache.since = row.id
+            if (row.kind !== 'ack') cache.total += 1
           }
-        } catch {}
-
-        busView = {
-          up: true,
-          lastAge,
-          port,
-          pid,
-          runningSince,
-          queue: { pending: 0, rate: 14, total: 1842 },
-          files: { busJson: true, tokens: tokensExist, ringQueue: ringQueueLen },
-          rateStart: startHHMM,
-          rateHistory: EVENTS_FIXTURE.bus?.rateHistory ?? [],
+          cache.rows = [...cache.rows, ...parsed.events].slice(-EVENTS_KEEP)
         }
       }
     } catch {
-      // bus read safe catch
+      // subprocess safe catch: the cached rows stand
     }
 
-    // 2. Events list
-    let eventItems: EventItem[] = []
-    if (snap.run != null) {
-      try {
-        const ran = await $.process.run(
-          ['python3', `${$.plugin.root}/scripts/mkdb.py`, '--data', dataDir, 'events', '--run', snap.run.id, '--chan', '', '--json'],
-          { timeoutMs: STORE_READ_MS },
-        )
-        if (ran.exitCode === 0) {
-          const parsed = JSON.parse(ran.stdout) as { ok?: boolean; store?: boolean; events?: Record<string, unknown>[] }
-          if (parsed.ok && Array.isArray(parsed.events)) {
-            eventItems = parsed.events.slice().reverse().map((row: Record<string, unknown>, idx: number) => {
-              let meta: Record<string, unknown> = {}
-              if (typeof row.meta_json === 'string' && row.meta_json.length > 0) {
-                try { meta = JSON.parse(row.meta_json) as Record<string, unknown> } catch {}
-              }
-              const isBus = row.chan === 'bus'
-              const kind = typeof row.kind === 'string' ? row.kind : 'info'
-              const fromId = typeof row.from_id === 'string' ? row.from_id : ''
-              const toId = typeof row.to_id === 'string' ? row.to_id : ''
-              const task = typeof row.task === 'string' ? row.task : ''
-              const who = fromId && toId ? `${fromId}→${toId}` : (isBus ? fromId || 'orch' : 'run')
-              const lane = task || (fromId.startsWith('p') ? fromId : toId.startsWith('p') ? toId : 'all')
-              const text = typeof row.text === 'string' ? row.text : ''
-              const ack = typeof meta.ack === 'number' ? meta.ack : meta.delivered === true ? 1 : 0
-              const bad = meta.bad === true || kind.startsWith('ring-failed') || meta.delivered === false
-              const answered = !!row.reply_to || kind === 'answer'
-              const id = typeof row.id === 'number' ? (isBus ? `m-${row.id}` : `r-${row.id}`) : `ev-${idx}`
-
-              return {
-                id,
-                src: isBus ? 'bus' : 'run',
-                t: hhmm(typeof row.t === 'string' ? row.t : ''),
-                kind,
-                type: kind,
-                who,
-                lane,
-                text: sanitizeText(text, 120),
-                ack,
-                bad,
-                answered,
-              }
-            })
-          }
-        }
-      } catch {
-        // subprocess safe catch
-      }
+    // mk-bus records an ack as its own kind:'ack' row (reply_to -> message, meta.ack_level):
+    // fold it into its target, as mk-bus.py's read does, and keep it out of the list
+    const ackOf = new Map<string, number>()
+    for (const row of cache.rows) {
+      if (row.kind !== 'ack' || typeof row.reply_to !== 'string') continue
+      const level = metaOf(row).ack_level
+      ackOf.set(row.reply_to, Math.max(ackOf.get(row.reply_to) ?? 0, typeof level === 'number' ? level : 1))
     }
-
-    // 3. Lane activity
-    const laneMap = new Map<string, string[]>()
-    for (const ev of eventItems) {
-      if (ev.lane && ev.lane !== 'all') {
-        const list = laneMap.get(ev.lane) ?? []
-        if (list.length < 12) {
-          const kind = ev.kind ?? ''
-          const col = ev.bad || kind.startsWith('ring-') ? '#ff7a66'
-            : kind === 'ask' || kind === 'nudge' ? '#e8b04a'
-            : kind === 'answer' || kind === 'commit' ? '#19e35a'
-            : kind === 'run' ? '#8bbf9a' : '#4fd1c5'
-          list.push(col)
-          laneMap.set(ev.lane, list)
-        }
+    const items: EventItem[] = cache.rows.filter(row => row.kind !== 'ack').reverse().map((row, idx) => {
+      const meta = metaOf(row)
+      const isBus = row.chan === 'bus'
+      const kind = typeof row.kind === 'string' ? row.kind : 'info'
+      const fromId = typeof row.from_id === 'string' ? row.from_id : ''
+      const toId = typeof row.to_id === 'string' ? row.to_id : ''
+      const task = typeof row.task === 'string' ? row.task : ''
+      const who = fromId && toId ? `${fromId}→${toId}` : (isBus ? fromId || 'orch' : 'run')
+      const lane = task || (fromId.startsWith('p') ? fromId : toId.startsWith('p') ? toId : 'all')
+      const text = typeof row.text === 'string' ? row.text : ''
+      const id = typeof row.id === 'number' ? (isBus ? `m-${row.id}` : `r-${row.id}`) : `ev-${idx}`
+      const t = typeof row.t === 'string' ? row.t : ''
+      return {
+        id,
+        src: isBus ? 'bus' : 'run',
+        t: hhmm(t),
+        ts: Date.parse(t) || undefined,
+        kind,
+        type: kind,
+        who,
+        lane,
+        text: sanitizeText(text, 120),
+        ack: ackOf.get(id) ?? (meta.delivered === true ? 1 : 0),
+        bad: meta.bad === true || kind.startsWith('ring-failed') || meta.delivered === false,
+        reply_to: typeof row.reply_to === 'string' ? row.reply_to : undefined,
       }
-    }
-
-    const lanesActivity: LaneActivityItem[] = Array.from(laneMap.entries()).map(([lane, colors]) => {
-      const cells: string[] = []
-      for (let i = 0; i < 24; i++) {
-        cells.push(colors[Math.floor(i / 2)] ?? '#0f4d22')
-      }
-      return { lane, cells, age: '1m', silent: false }
     })
 
-    await update($, viewStateAtom, prev => ({
-      ...prev,
+    // 3. Lane activity: 24 time buckets (oldest left), each the colour of its newest event
+    const laneMap = new Map<string, { cells: string[]; newest: number }>()
+    for (const ev of items) { // newest first
+      if (!ev.lane || ev.lane === 'all' || ev.ts == null) continue
+      const entry = laneMap.get(ev.lane) ?? { cells: Array<string>(LANE_BUCKETS).fill(LANE_EMPTY), newest: ev.ts }
+      laneMap.set(ev.lane, entry)
+      const slot = LANE_BUCKETS - 1 - Math.floor(Math.max(0, now - ev.ts) / LANE_BUCKET_MS)
+      if (slot < 0 || entry.cells[slot] !== LANE_EMPTY) continue
+      const kind = ev.kind ?? ''
+      entry.cells[slot] = ev.bad || kind.startsWith('ring-') ? '#ff7a66'
+        : kind === 'ask' || kind === 'nudge' ? '#e8b04a'
+        : kind === 'answer' || kind === 'commit' ? '#19e35a'
+        : kind === 'run' ? '#8bbf9a' : '#4fd1c5'
+    }
+    const lanesActivity: LaneActivityItem[] = Array.from(laneMap.entries()).map(([lane, { cells, newest }]) => {
+      const age = Math.max(0, now - newest)
+      const silent = age > LANE_SILENT_MS
+      return { lane, cells, age: silent ? `${ageOf(age)} silent` : ageOf(age), silent }
+    })
+
+    await write({
       [EVENTS_BUS_KEY]: JSON.stringify(busView),
-      ...(eventItems.length > 0 ? { [EVENTS_LIST_KEY]: JSON.stringify(eventItems) } : {}),
-      ...(lanesActivity.length > 0 ? { [EVENTS_LANES_KEY]: JSON.stringify(lanesActivity) } : {}),
-    }))
+      [EVENTS_LIST_KEY]: JSON.stringify({ run: runId, total: cache.total, events: items.slice(0, EVENTS_MAX) }),
+      [EVENTS_LANES_KEY]: JSON.stringify(lanesActivity),
+    })
   } catch {
     // safe catch
   } finally {
@@ -2939,46 +2970,47 @@ async function refreshEvents($: EngineInterface, cwd: string, snap: MkSnapshot):
   }
 }
 
-/** The Events tab's live view: run.recent or store events, newest first. */
-export function liveEventsView(snap: MkSnapshot, viewState?: Record<string, string>): EventsView {
-  if (viewState && viewState[EVENTS_LIST_KEY]) {
-    try {
-      const events = JSON.parse(viewState[EVENTS_LIST_KEY]) as EventItem[]
-      let bus: BusViewData | undefined
-      if (viewState[EVENTS_BUS_KEY]) {
-        try { bus = JSON.parse(viewState[EVENTS_BUS_KEY]) as BusViewData } catch {}
-      }
-      let lanes: LaneActivityItem[] | undefined
-      if (viewState[EVENTS_LANES_KEY]) {
-        try { lanes = JSON.parse(viewState[EVENTS_LANES_KEY]) as LaneActivityItem[] } catch {}
-      }
-      return {
-        mock: false,
-        bus: bus ?? EVENTS_FIXTURE.bus,
-        events,
-        lanes: lanes ?? EVENTS_FIXTURE.lanes,
-        earlierCount: Math.max(0, events.length - EVENTS_MAX),
-      }
-    } catch {}
+const parseOr = <T,>(text: string | undefined): T | undefined => {
+  try {
+    return text ? JSON.parse(text) as T : undefined
+  } catch {
+    return undefined
   }
+}
+
+/** The Events tab's live view: the store's events for this run, else run.recent, newest
+ *  first. The fixture is only the no-run (offline) view, labelled mock. */
+export function liveEventsView(snap: MkSnapshot, viewState?: Record<string, string>): EventsView {
   if (snap.run == null) {
     return { ...EVENTS_FIXTURE, mock: true }
+  }
+  const bus = parseOr<BusViewData>(viewState?.[EVENTS_BUS_KEY]) ?? BUS_UNKNOWN
+  const stored = parseOr<{ run?: string; total?: number; events?: EventItem[] }>(viewState?.[EVENTS_LIST_KEY])
+  if (stored?.run === snap.run.id && Array.isArray(stored.events)) {
+    return {
+      mock: false,
+      bus,
+      events: stored.events,
+      lanes: parseOr<LaneActivityItem[]>(viewState?.[EVENTS_LANES_KEY]) ?? [],
+      earlierCount: Math.max(0, (stored.total ?? 0) - stored.events.length),
+    }
   }
   const all = [...(snap.run?.recent ?? [])].reverse()
   return {
     mock: false,
-    bus: EVENTS_FIXTURE.bus,
+    bus,
     events: all.slice(0, EVENTS_MAX).map(ev => ({
       id: `ev-${ev.t ?? ''}`,
       src: 'run' as const,
       t: hhmm(ev.t),
+      ts: Date.parse(ev.t ?? '') || undefined,
       kind: ev.type ?? 'info',
       type: ev.type ?? 'info',
       who: 'run',
       lane: ev.task ?? 'all',
       text: sanitizeText(ev.text ?? '', 120),
     })),
-    lanes: EVENTS_FIXTURE.lanes,
+    lanes: [],
     earlierCount: Math.max(0, all.length - EVENTS_MAX),
   }
 }

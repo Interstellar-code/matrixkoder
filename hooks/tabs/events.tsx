@@ -26,6 +26,10 @@ export type EventItem = {
   readonly ack?: number // 0: none, 1: delivered (✓), 2: read (✓✓)
   readonly bad?: boolean
   readonly answered?: boolean
+  /** the message id this row replies to (an answer names its ask) */
+  readonly reply_to?: string
+  /** epoch ms of the row, when known: the Last hour view and Pause read it */
+  readonly ts?: number
   /** Backwards compatibility for earlier tests */
   readonly type?: string
   readonly short?: { readonly type: string; readonly text: string }
@@ -37,7 +41,7 @@ export type BusViewData = {
   readonly port: string
   readonly pid: number | null
   readonly runningSince: string
-  readonly queue: { readonly pending: number; readonly rate: number; readonly total: number }
+  readonly queue: { readonly pending: number | null; readonly rate: number | null; readonly total: number | null }
   readonly files: { readonly busJson: boolean; readonly tokens: boolean; readonly ringQueue: number }
   readonly rateHistory: readonly { readonly pct: number; readonly color?: string }[]
   readonly rateStart?: string
@@ -70,11 +74,23 @@ export const EVENTS_MAX = 50
 export const BUSK = ['ask', 'answer', 'info', 'ack', 'task', 'status', 'commit', 'report', 'review', 'nudge', 'ring'] as const
 
 export const VIEWS = [
-  ['none', 'Any', ''],
-  ['needs', 'Unanswered', '1'],
-  ['problems', 'Problems', '2'],
-  ['hour', 'Last hour', '15'],
+  ['none', 'Any'],
+  ['needs', 'Unanswered'],
+  ['problems', 'Problems'],
+  ['hour', 'Last hour'],
 ] as const
+
+/** The bus card when bus.json cannot be read: down, every value unknown. */
+export const BUS_UNKNOWN: BusViewData = {
+  up: false,
+  lastAge: '—',
+  port: '—',
+  pid: null,
+  runningSince: '—',
+  queue: { pending: null, rate: null, total: null },
+  files: { busJson: false, tokens: false, ringQueue: 0 },
+  rateHistory: [],
+}
 
 export const SHORT: Record<string, string> = {
   answer: 'ans',
@@ -139,7 +155,10 @@ const TIME_W = 5
 const TYPE_W = 6
 
 /** `…`-truncate to `w` cells */
-const clip = (text: string, w: number): string => (text.length <= w ? text : `${text.slice(0, Math.max(1, w) - 1)}…`)
+const clip = (text: string, w: number): string => (w <= 0 ? '' : text.length <= w ? text : `${text.slice(0, w - 1)}…`)
+
+/** a Button's drawn width: `[ label ]` (kit's actionWidth rule for a non-plain button) */
+const buttonW = (label: string): number => label.length + 4
 
 /** Check if kind is ring-related */
 const isRing = (k: string): boolean => k === 'ring' || k.startsWith('ring-')
@@ -155,6 +174,8 @@ type NormalizedEvent = {
   ack?: number
   bad?: boolean
   answered?: boolean
+  reply_to?: string
+  ts?: number
   short?: { readonly type: string; readonly text: string }
 }
 
@@ -173,6 +194,7 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
   const laneFilter = ui?.get('events:lane') ?? 'all'
   const q = (ui?.get('events:q') ?? '').trim().toLowerCase()
   const paused = ui?.get('events:paused') === '1'
+  const pausedAt = Number(ui?.get('events:pausedAt') ?? '') || Infinity
   const openMenu = ui?.get('events:open') ?? ''
   const selId = ui?.get('events:sel') ?? (view.events[0]?.id ?? '')
 
@@ -188,21 +210,32 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
     ack: e.ack,
     bad: e.bad ?? (e.kind === 'ring-failed' || e.type === 'ring-failed'),
     answered: e.answered,
+    reply_to: e.reply_to,
+    ts: e.ts,
     short: e.short,
   }))
 
-  const answeredSet = new Set(allEvents.filter(e => e.answered || e.kind === 'answer').map(e => e.id))
+  // asks some answer row replies to
+  const answeredSet = new Set(allEvents.filter(e => e.kind === 'answer' && e.reply_to).map(e => e.reply_to))
+  const hourAgo = Date.now() - 3_600_000
+  const inView: Record<string, (e: NormalizedEvent) => boolean> = {
+    needs: e => e.kind === 'ask' && !e.answered && !answeredSet.has(e.id),
+    problems: e => !!e.bad || isRing(e.kind) && e.kind !== 'ring' || e.kind === 'blocked',
+    hour: e => e.ts != null && e.ts >= hourAgo,
+  }
+  // events that arrived after Pause: held back from the list until Live
+  const isNew = (e: NormalizedEvent): boolean => paused && e.ts != null && e.ts > pausedAt
+  const newCount = allEvents.filter(isNew).length
 
   // Filter list
   const filtered = allEvents.filter(e => {
+    if (isNew(e)) return false
     if (source !== 'all' && e.src !== source) return false
     if (source !== 'run' && anyKind && e.src === 'bus') {
       const k = isRing(e.kind) ? 'ring' : e.kind
       if (!selectedKinds.has(k)) return false
     }
-    if (viewFilter === 'needs' && !(e.kind === 'ask' && !answeredSet.has(e.id))) return false
-    if (viewFilter === 'problems' && !(e.bad || isRing(e.kind) && e.kind !== 'ring' || e.kind === 'blocked')) return false
-    if (viewFilter === 'hour' && e.t < '16:46') return false
+    if (inView[viewFilter] && !inView[viewFilter]!(e)) return false
     if (laneFilter !== 'all' && e.lane !== laneFilter) return false
     if (q) {
       const haystack = `${e.text} ${e.id} ${e.who} ${e.kind}`.toLowerCase()
@@ -237,9 +270,17 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
   const viewOption = VIEWS.find(([k]) => k === viewFilter)
   const viewLabel = viewOption ? viewOption[1] : 'Any'
 
-  const bus = view.bus ?? EVENTS_FIXTURE.bus!
+  const bus = view.bus ?? BUS_UNKNOWN
   const busUp = bus.up
   const labelW = compact ? 4 : 7
+  const num = (n: number | null): string => (n == null ? '—' : String(n))
+  const mark = (ok: boolean): string => (ok ? '✓' : '✗')
+  const filesOk = bus.files.busJson && bus.files.tokens
+  const filesLong = `bus.json ${mark(bus.files.busJson)} · tokens ${mark(bus.files.tokens)} · ring-queue ${bus.files.ringQueue}`
+  const filesText = 'files'.length + 1 + filesLong.length <= W
+    ? filesLong
+    : `bus ${mark(bus.files.busJson)} tok ${mark(bus.files.tokens)} rq ${bus.files.ringQueue}`
+  const pauseLabel = paused ? '▶ Live' : '‖ Pause'
 
   return (
     <Box flexDirection="column" gap={1}>
@@ -251,7 +292,7 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
           <Box flexDirection="row" justifyContent="space-between">
             <Text bold={true} color={PALETTE.mut}>{`${THEME.name === 'matrix' ? '> ' : ''}BUS`}</Text>
             <Text color={busUp ? ROLE.live.fg : ROLE.err.fg}>
-              {`${busUp ? '● up' : '○ down'} · ${compact ? bus.lastAge : `last msg ${bus.lastAge}`}`}
+              {`${busUp ? '● up' : '○ down'} · ${compact ? bus.lastAge : `heartbeat ${bus.lastAge}`}`}
             </Text>
           </Box>
           <Box flexDirection="row" justifyContent="space-between">
@@ -264,28 +305,28 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
           </Box>
           <Box flexDirection="row" justifyContent="space-between">
             <Text dimColor={true}>queue</Text>
-            <Text>{compact ? `${bus.queue.pending} · ${bus.queue.rate}/m · ${bus.queue.total}` : `${bus.queue.pending} · ${bus.queue.rate} msg/min · ${bus.queue.total} total`}</Text>
+            <Text>{compact ? `${num(bus.queue.pending)} · ${num(bus.queue.rate)}/m · ${num(bus.queue.total)}` : `${num(bus.queue.pending)} · ${num(bus.queue.rate)} msg/min · ${num(bus.queue.total)} total`}</Text>
           </Box>
           <Box flexDirection="row" justifyContent="space-between">
             <Text dimColor={true}>files</Text>
-            <Text color={ROLE.live.fg}>
-              {cols < 46
-                ? `bus ✓ tok ✓ rq ${bus.files.ringQueue}`
-                : `bus.json ✓ · tokens ✓ · ring-queue ${bus.files.ringQueue}`}
-            </Text>
+            <Text color={filesOk ? ROLE.live.fg : ROLE.warn.fg}>{filesText}</Text>
           </Box>
 
-          {/* Rate Sparkline */}
-          <Box flexDirection="row" gap={0}>
-            {bus.rateHistory.slice(0, Math.min(bus.rateHistory.length, W)).map((c, i) => (
-              <Text key={`rate-cell-${i}`} color={c.color ?? ROLE.live.fg}>■</Text>
-            ))}
-          </Box>
-          <Box flexDirection="row" justifyContent="space-between">
-            <Text dimColor={true}>{compact ? 'up' : `up since ${bus.rateStart ?? '09:12'}`}</Text>
-            {!compact && <Text dimColor={true}>msgs per minute</Text>}
-            <Text dimColor={true}>now</Text>
-          </Box>
+          {/* Rate Sparkline: only when the bus reports a history */}
+          {bus.rateHistory.length > 0 && (
+            <Box flexDirection="row" gap={0}>
+              {bus.rateHistory.slice(0, Math.min(bus.rateHistory.length, W)).map((c, i) => (
+                <Text key={`rate-cell-${i}`} color={c.color ?? ROLE.live.fg}>■</Text>
+              ))}
+            </Box>
+          )}
+          {bus.rateHistory.length > 0 && (
+            <Box flexDirection="row" justifyContent="space-between">
+              <Text dimColor={true}>{compact ? 'up' : `up since ${bus.rateStart ?? '—'}`}</Text>
+              {!compact && <Text dimColor={true}>msgs per minute</Text>}
+              <Text dimColor={true}>now</Text>
+            </Box>
+          )}
         </Box>
       ))}
 
@@ -357,7 +398,8 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
                       label="c clear"
                       onPress={() => ui?.set('events:kinds', '')}
                     />
-                    <Text dimColor={true}>space toggle · esc close</Text>
+                    {/* the menu's width (W less paddingX) less the plain `c clear` button and a gap */}
+                    <Text dimColor={true}>{clip('space toggle · esc close', W - 2 - 'c clear'.length - 1)}</Text>
                   </Box>
                 </Box>
               )}
@@ -378,7 +420,10 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
             </Box>
             {openMenu === 'view' && (
               <Box flexDirection="column" paddingX={1} backgroundColor={PALETTE.field}>
-                {VIEWS.map(([k, name, count]) => (
+                {VIEWS.map(([k, name]) => {
+                  const test = inView[k]
+                  const count = test ? String(allEvents.filter(test).length) : ''
+                  return (
                   <Box key={`view-opt-${k}`} flexDirection="row" justifyContent="space-between">
                     <Button
                       key={`view-btn-${k}`}
@@ -391,7 +436,8 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
                     />
                     {count !== '' && <Text dimColor={true}>{count}</Text>}
                   </Box>
-                ))}
+                  )
+                })}
               </Box>
             )}
           </Box>
@@ -412,13 +458,16 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
           {/* Search Input & Pause Button */}
           <Box flexDirection="row" gap={1} alignItems="center" justifyContent="space-between">
             <Text dimColor={true}>
-              {clip(q ? `/ ${q}` : '/ : search text, id, task', compact ? 20 : 28)}
+              {clip(q ? `/ ${q}` : '/ : search text, id, task', Math.min(compact ? 20 : 28, W - buttonW(pauseLabel) - 1))}
             </Text>
             <Button
               key="ev-pause-btn"
               variant={paused ? 'primary' : undefined}
-              label={paused ? '▶ Live' : '‖ Pause'}
-              onPress={() => ui?.set('events:paused', paused ? '0' : '1')}
+              label={pauseLabel}
+              onPress={() => {
+                if (!paused) ui?.set('events:pausedAt', String(Date.now()))
+                ui?.set('events:paused', paused ? '0' : '1')
+              }}
             />
           </Box>
         </Box>
@@ -428,7 +477,7 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
       {Card(els, {}, (
         <Box flexDirection="column">
           {/* Header */}
-          {Section(els, { label: 'Events', right: paused ? 'paused · 3 new' : `last ${String(rows.length)}` })}
+          {Section(els, { label: 'Events', right: paused ? `paused · ${newCount} new` : `last ${String(rows.length)}` })}
 
           <Box flexDirection="row" justifyContent="space-between">
             <Text dimColor={true}>
@@ -463,7 +512,7 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
             const ackStr = isBus ? (ev.ack === 2 ? '✓✓' : ev.ack === 1 ? '✓' : '·') : ''
             const ackColor = ev.ack === 2 ? ROLE.live.fg : PALETTE.dim
             const showWho = isBus && ev.who !== 'run' && ev.who !== ''
-            const whoStr = showWho ? ev.who : ''
+            const whoStr = showWho ? clip(ev.who, Math.floor(W / 3)) : ''
             const hasMarker = isSel || ev.bad
             const leftMarker = isSel ? '▌' : ev.bad ? '!' : ''
             const leftColor = isSel ? '#c6f135' : ROLE.err.fg
@@ -503,14 +552,16 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
           <Box flexDirection="column">
             <Box flexDirection="row" justifyContent="space-between">
               <Text bold={true} color={PALETTE.mut}>{`${THEME.name === 'matrix' ? '> ' : ''}LANE ACTIVITY`}</Text>
-              <Text dimColor={true}>last 12 msgs</Text>
+              <Text dimColor={true}>last 2h</Text>
             </Box>
 
             {view.lanes.map(l => {
-              const laneLabel = l.lane.padEnd(4)
+              const laneW = compact ? 4 : 8
+              const ageW = compact ? 8 : 12
+              const laneLabel = clip(l.lane, laneW).padEnd(laneW)
               const ageColor = l.silent ? ROLE.warn.fg : PALETTE.dim
-              const sparkW = Math.max(8, W - 4 - 1 - (compact ? 8 : 12))
-              const activeCells = l.cells.slice(0, sparkW)
+              const sparkW = Math.max(0, W - laneW - ageW - 2)
+              const activeCells = sparkW > 0 ? l.cells.slice(-sparkW) : [] // oldest left, newest right: a narrow card keeps the newest
 
               return (
                 <Box key={`lane-act-${l.lane}`} flexDirection="row" justifyContent="space-between" alignItems="center">
@@ -520,7 +571,7 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
                       <Text key={`c-${idx}`} color={col}>■</Text>
                     ))}
                   </Box>
-                  <Text color={ageColor}>{l.age.padStart(compact ? 8 : 12)}</Text>
+                  <Text color={ageColor}>{clip(l.age, ageW).padStart(ageW)}</Text>
                 </Box>
               )
             })}
