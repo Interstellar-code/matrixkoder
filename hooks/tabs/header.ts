@@ -55,6 +55,7 @@ export function mockTabCounts(): Record<MkDashTab, string> {
     waiting: waitingCount(WAITING_FIXTURE.options.length > 0 ? 1 : 0),
     kanban: '',
     todo: '',
+    improve: '',
     settings: '',
   }
 }
