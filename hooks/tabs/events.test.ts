@@ -10,7 +10,7 @@ import type {
 } from 'claude-code'
 import { mockFs, mockWorld, paneProps, sessionStart, worldFiles, worldFixtures } from './../testkit'
 import { EVENTS_MAX, EventsTab, eventsView, eventsViewOf } from './events'
-import { MATRIX, PALETTE, ROLE } from './palette'
+import { MATRIX, PALETTE, ROLE, withTheme } from './palette'
 
 /** every node of `type` under `n`, in document order. */
 function nodesOf(n: unknown, type: string): { type: string; props: Record<string, unknown>; children: unknown[] }[] {
@@ -176,9 +176,13 @@ test('the event list sits in kit Cards with coloured type chips', { plugins: [wo
   await ui.press({ key: 'dash-tab-events' })
   for (const cols of [36, 46] as const) {
     await ui.redraw(paneProps(cols))
-    const cards = cardsOf(await ui.drawn())
-    expect(cards, `the Events Cards at ${cols}`).toHaveLength(4)
-    for (const card of cards) {
+    // the live run has no lane-attributed events, so no LANE ACTIVITY card (it no longer borrows the fixture's lanes)
+    const live = cardsOf(await ui.drawn())
+    expect(live, `the live Events Cards at ${cols}`).toHaveLength(3)
+    // the fixture view carries lane activity: BUS, FILTERS, EVENTS and LANE ACTIVITY (drawn in the Matrix theme, as the pane wears it)
+    const fixture = withTheme('matrix', () => cardsOf(EventsTab(els, eventsView(), cols)))
+    expect(fixture, `the fixture Events Cards at ${cols}`).toHaveLength(4)
+    for (const card of [...live, ...fixture]) {
       expect(card.props.backgroundColor, `card fill at ${cols}`).toBe(MATRIX.panel) // the pane wears the Matrix palette
       expect(card.props.borderStyle, `round border at ${cols}`).toBe('round')
       expect(card.props.borderColor, `line border at ${cols}`).toBe(MATRIX.line)
