@@ -545,6 +545,36 @@ test('Undo pressed right after typing, before any tick, never overwrites the new
   expect(await has(ui, { type: 'Button', key: 'improve-f-undo' }), 'Undo was dropped').toBe(false)
 })
 
+/** the pinned strip: the absolute Box that holds the Improve chip, and the spacer that keeps content from hiding under it */
+async function pinned(ui: Ui) {
+  const boxes = await ui.findAll({ type: 'Box' })
+  const strip = boxes.find(b => b.props.position === 'absolute' && JSON.stringify(b.children).includes('improve-f-go'))
+  const spacer = boxes.find(b => typeof b.props.height === 'number' && b.props.flexShrink === 0)
+  return { strip, rows: Number(spacer?.props.height) }
+}
+
+test('I1.2: docked, the footer rows sit at the window\'s last rows and follow the scroll offset', { plugins: [worldFixtures] }, async ($, on) => {
+  world(on, { answer: () => REWRITE })
+  await $.session.start(sessionStart())
+  const ui = await mount($)
+  const at0 = await pinned(ui)
+  expect(at0.strip, 'the chip row is in an absolutely placed strip, not in the scrolled content').toBeDefined()
+  expect(at0.rows).toBeGreaterThanOrEqual(2)
+  expect(at0.strip?.props.top, 'short content: the strip sits at the bottom of the window').toBe(40 - at0.rows)
+  await ui.redraw({ ...paneProps(46), scroll: { offset: 25, bodyRows: 40 } })
+  const scrolled = await pinned(ui)
+  expect(scrolled.strip?.props.top, 'scrolled: the strip moves with the window').toBe(25 + 40 - scrolled.rows)
+})
+
+test('I1.2: inline there is no scrolled window, so the footer stays in the flow', { plugins: [worldFixtures] }, async ($, on) => {
+  world(on, { answer: () => REWRITE })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46, 'inline') })
+  const { strip } = await pinned(ui)
+  expect(strip).toBeUndefined()
+  expect(await has(ui, { type: 'Button', key: 'improve-f-go' })).toBe(true)
+})
+
 test('review 3: a saved improvement is cut to 4000 characters each side, so one pasted wall cannot fill the store', { plugins: [worldFixtures] }, async ($, on) => {
   const big = 'x'.repeat(9000)
   const w = world(on, { answer: () => JSON.stringify({ prompt: big, added: ['a'] }) })
@@ -815,6 +845,8 @@ function improveRows(root: unknown): { w: number; inCard: boolean; text: string 
   const textOf = (n: unknown): string => (typeof n === 'string' ? n : typeof n === 'object' && n !== null ? ((n as Drawn).children ?? []).map(textOf).join('') : '')
   const ownText = (n: unknown): string => (typeof n === 'object' && n !== null && (n as Drawn).type === 'Text' ? textOf(n) : '')
   const isFooter = (c: Drawn): boolean => c.type === 'Box' && /^╌+$/.test(ownText((c.children ?? [])[0]))
+  // docked, the proposal card is its own sibling of the pinned strip
+  const isCardWrap = (c: Drawn): boolean => c.type === 'Box' && (c.children ?? []).some(k => typeof k === 'object' && k !== null && (k as Drawn).props?.borderStyle === 'round') && JSON.stringify(c).includes('improve-f-')
   const isTab = (c: Drawn): boolean => c.type === 'Box' && (c.children ?? []).some(k => typeof k === 'object' && k !== null && (k as Drawn).type === 'Box' && ((k as Drawn).children ?? []).some(t => ownText(t) === '✦ Improve'))
   // a row's width plus the padding of the Boxes around it (a Card's own padding is counted by its content limit)
   const measure = (n: unknown, inCard: boolean, inset: number): void => {
@@ -829,7 +861,7 @@ function improveRows(root: unknown): { w: number; inCard: boolean; text: string 
   const find = (n: unknown): void => {
     if (typeof n !== 'object' || n === null) return
     const c = n as Drawn
-    if (isFooter(c) || isTab(c)) { measure(c, false, 0); return }
+    if (isFooter(c) || isTab(c) || isCardWrap(c)) { measure(c, false, 0); return }
     c.children?.forEach(find)
   }
   find(root)

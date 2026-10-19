@@ -217,7 +217,7 @@ const SLOT = '┊ + tool ┊'
  * which draws the same proposal in full) and the chip row. Improve reads and writes Claude Code's
  * own prompt line, so the footer draws no field of its own; the chip row never wraps.
  */
-export function ImproveFooter(els: Els, view: ImproveView, cols: number, ui: ImproveUi, card = true): RenderElement {
+export function ImproveFooter(els: Els, view: ImproveView, cols: number, ui: ImproveUi, card = true, chips = true): RenderElement {
   const { Box, Text } = els
   const act = (kind: ImproveKind, a?: string | number, b?: string): void => ui.improveAct?.(kind, a, b)
   const w = Math.max(1, cols - 2) // paddingX 1 each side
@@ -234,11 +234,13 @@ export function ImproveFooter(els: Els, view: ImproveView, cols: number, ui: Imp
   return (
     <Box flexDirection="column">
       {card && view.flow != null && footerCard(els, view.flow, cols, act)}
-      <Box flexDirection="row" gap={1} paddingX={1}>
-        {chipBtn(els, go)}
-        {undo != null && chipBtn(els, undo)}
-        {slots.map((s, i) => <Text key={`improve-slot${String(i)}`} color={PALETTE.edge}>{s}</Text>)}
-      </Box>
+      {chips && (
+        <Box flexDirection="row" gap={1} paddingX={1}>
+          {chipBtn(els, go)}
+          {undo != null && chipBtn(els, undo)}
+          {slots.map((s, i) => <Text key={`improve-slot${String(i)}`} color={PALETTE.edge}>{s}</Text>)}
+        </Box>
+      )}
     </Box>
   )
 }

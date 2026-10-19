@@ -389,6 +389,9 @@ export function registerDashboard(on: On, options: PluginOptions): void {
     }
 
     // Matrix theme across the whole pane: palette.ts swaps PALETTE/ROLE for this synchronous build
+    // docked, the body is a window the engine scrolls over the tree: the footer is drawn at the window's last rows instead of the tree's
+    const docked = e.props.placement === 'dock' && e.props.scroll != null
+    const pinnedRows = pinnedFooterRows(snap)
     return withTheme('matrix', () => {
       // every Text in the pane gets the Matrix greens (a plain or dim Text would draw terminal grey)
       const els = themeText(rawEls)
@@ -447,7 +450,15 @@ export function registerDashboard(on: On, options: PluginOptions): void {
                           ? waitingAsks(tabEls, pane.asks, cols, new Date().toISOString(), ui)
                           : withViewState(WaitingTab, tabEls, waitingPaneView(pane, snap.run?.waiting ?? null), cols, ui)}
         {dashTab !== 'settings' && !needsSetup && <Box flexGrow={1} />}
-        {dashTab !== 'settings' && !needsSetup && PaneFooter(els, snap, openWaiting(pane.asks, snap.run), cols, improveView, ui, dashTab !== 'improve')}
+        {/* docked: the proposal card ends the content; the rule, chips and counts are pinned to the window's last rows */}
+        {dashTab !== 'settings' && !needsSetup && !docked && PaneFooter(els, snap, openWaiting(pane.asks, snap.run), cols, improveView, ui, dashTab !== 'improve')}
+        {dashTab !== 'settings' && !needsSetup && docked && dashTab !== 'improve' && improveView.flow != null && ImproveFooter(els, improveView, cols, ui, true, false)}
+        {dashTab !== 'settings' && !needsSetup && docked && <Box height={pinnedRows} flexShrink={0} />}
+        {dashTab !== 'settings' && !needsSetup && docked && (
+          <Box position="absolute" flexDirection="column" top={Math.max(0, (e.props.scroll?.offset ?? 0) + (e.props.scroll?.bodyRows ?? 0) - pinnedRows)} left={0} width={cols} backgroundColor={PALETTE.bg}>
+            {PaneFooter(els, snap, openWaiting(pane.asks, snap.run), cols, improveView, ui, false)}
+          </Box>
+        )}
       </Box>
       )
     })
@@ -1393,7 +1404,7 @@ function FilesPane(
       set: (key, value) => {
         void update($, viewStateAtom, prev => ({ ...prev, [key]: value })).then(() => { if (key === 'files:root') return startFilesWalk($) }).catch(() => {})
       },
-      reveal: key => { void $.ui.scroll({ in: PANE_ID, to: { key } }).catch(() => {}) },
+      reveal: key => { void $.ui.scroll({ in: PANE_ID, to: { key }, block: 'center' }).catch(() => {}) },
       focus: key => filesFocus($, key),
       scan: path => {
         filesScanned.add(path)
@@ -1893,6 +1904,7 @@ async function improveWrite($: EngineInterface, id: string): Promise<void> {
   const out = r.isAnswered ? readRewrite(r.text) : null
   if (out == null) { await failFlow($, id, 'rewrite'); return }
   await patchFlow($, id, { step: 'review', upgraded: out.upgraded, added: out.added, draft: '', isEditing: false, note: wizardNote(f) })
+  void $.ui.scroll({ in: PANE_ID, to: 'end' }).catch(() => {}) // the card ends the content; docked, the pinned strip sits under it
   const entry: MkImproveEntry = { id, at: await $.clock.now(), original: f.original.slice(0, IMPROVE_SAVED_CHARS), upgraded: out.upgraded.slice(0, IMPROVE_SAVED_CHARS), added: out.added }
   const list = await update($, improveHistoryAtom, prev => [entry, ...prev.filter(x => x.id !== id)].slice(0, IMPROVE_KEEP))
   try { await $.store.set(IMPROVE_STORE_KEY, list) } catch { /* the list stays for this session; the next save tries again */ }
@@ -3144,6 +3156,11 @@ export function footerParts(live: number, held: number, waiting: number, w: numb
  *  entry — what the Overview Waiting card draws */
 export function openWaiting(asks: readonly unknown[], run: MkRun | null): number {
   return asks.length > 0 ? asks.length : run?.waiting ? 1 : 0
+}
+
+/** rows the pinned footer takes: the rule, the Improve chips, and the counts row while a run is on show */
+export function pinnedFooterRows(snap: MkSnapshot): number {
+  return 2 + (snap.run != null ? 1 : 0)
 }
 
 function PaneFooter(els: Els, snap: MkSnapshot, waiting: number, cols: number, improve: ImproveView, ui: TabUi, card: boolean) {
