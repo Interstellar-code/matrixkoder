@@ -745,6 +745,7 @@ const TAB_BUTTONS = [
   { key: 'dash-tab-waiting', name: 'Waiting' },
   { key: 'dash-tab-kanban', name: 'Kanban' },
   { key: 'dash-tab-todo', name: 'Todo' },
+  { key: 'dash-tab-improve', name: 'Improve' },
   { key: 'dash-tab-settings', name: 'Settings' },
 ] as const
 
@@ -763,7 +764,7 @@ test('every tab hotkey switches to that tab’s body: live data, MOCK only on Wa
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
-  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban' && t.key !== 'dash-tab-files' && t.key !== 'dash-tab-todo')) {
+  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban' && t.key !== 'dash-tab-files' && t.key !== 'dash-tab-todo' && t.key !== 'dash-tab-improve')) {
     await ui.press({ key })
     await expectTabBody(ui, key, name)
   }
@@ -778,12 +779,12 @@ test('at 36 cols the tab bar drops to short labels and every tab still renders',
   // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
   // the active tab (Overview) keeps its word; the others show their hotkey letter (V0.4: one scheme at every width)
   for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings')) {
-    const wide = await ui.find({ type: 'Button', text: name })
+    const wide = await ui.find({ type: 'Button', key, text: name }) // by key: the footer's Improve chip also says Improve
     if (key === 'dash-tab-overview') expect(wide, `${name} is active and keeps its word`).toBeDefined()
     else expect(wide, `${name} wide label dropped`).toBeUndefined()
   }
   expect((await ui.findAll({ type: 'Button' })).filter(b => String(b.props.key).startsWith('dash-tab-')), 'the bar still draws every tab').toHaveLength(TAB_BUTTONS.length)
-  for (const { key } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban' && t.key !== 'dash-tab-files' && t.key !== 'dash-tab-todo')) {
+  for (const { key } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban' && t.key !== 'dash-tab-files' && t.key !== 'dash-tab-todo' && t.key !== 'dash-tab-improve')) {
     await ui.press({ key })
     await expectTabBody(ui, key, `${key} renders narrow`)
   }
@@ -811,7 +812,7 @@ const tabLabels = async (ui: { findAll: (q: { type: string }) => Promise<{ props
     .map(b => String(b.props.label))
 
 test('the mock tab counts read the fixtures: lanes, plan done/total, waiting only when open', async () => {
-  expect(mockTabCounts()).toEqual({ overview: '', lanes: '4', plan: '3/8', usage: '', files: '', events: '', waiting: '!1', kanban: '', todo: '', settings: '' })
+  expect(mockTabCounts()).toEqual({ overview: '', lanes: '4', plan: '3/8', usage: '', files: '', events: '', waiting: '!1', kanban: '', todo: '', improve: '', settings: '' })
   expect(waitingCount(0)).toBe('') // LOW: a fixture with no open decision shows no count, never `!0`
   expect(waitingCount(2)).toBe('!2')
 })
@@ -833,7 +834,7 @@ test('every tab shows the real run header: name, stage chip and ▶ Next, never 
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
-  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban' && t.key !== 'dash-tab-files' && t.key !== 'dash-tab-todo')) {
+  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban' && t.key !== 'dash-tab-files' && t.key !== 'dash-tab-todo' && t.key !== 'dash-tab-improve')) {
     await ui.press({ key })
     expect(await ui.find({ text: 'MATRIXKODER' }), `${name} shared brand header`).toBeTruthy()
     expect(await ui.find({ text: /ORCHESTRATOR/ }), `${name} mode chip`).toBeTruthy()
@@ -864,7 +865,7 @@ test('the shared brand header shows plugin.json\'s version chip on a run tab and
   expect(await ui.find({ text: 'workflows-v2' }), 'no run block on Settings').toBeUndefined()
 })
 
-test('F0: every tab Button carries its keyboard hotkey — o l p u e w k t 9, at 36 and 46 cols', { plugins: [worldFixtures] }, async ($, on) => {
+test('F0: every tab Button carries its keyboard hotkey — o l p u e w k t i 9, at 36 and 46 cols', { plugins: [worldFixtures] }, async ($, on) => {
   mockFs(on, worldFiles())
   mockWorld(on)
   await $.session.start(sessionStart())
@@ -873,7 +874,7 @@ test('F0: every tab Button carries its keyboard hotkey — o l p u e w k t 9, at
     await ui.redraw(paneProps(cols))
     // only the bar's own `dash-tab-*` keys name tabs: a body (Waiting's options) draws Buttons too
     const buttons = (await ui.findAll({ type: 'Button' })).filter(b => String(b.props.key).startsWith('dash-tab-'))
-    expect(buttons.map(b => b.props.hotkey), `hotkeys at ${cols}`).toEqual(['o', 'l', 'p', 'u', 'f', 'e', 'w', 'k', 't', '9'])
+    expect(buttons.map(b => b.props.hotkey), `hotkeys at ${cols}`).toEqual(['o', 'l', 'p', 'u', 'f', 'e', 'w', 'k', 't', 'i', '9'])
     for (const b of buttons) {
       // an inactive tab's label is its count alone (or the `·` placeholder), so
       // a plain Button's `h: label` drawing never repeats the tab's own letter
@@ -887,7 +888,7 @@ test('F0: every tab Button carries its keyboard hotkey — o l p u e w k t 9, at
   }
   // the press-by-key switch loop stands
   // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
-  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban' && t.key !== 'dash-tab-files' && t.key !== 'dash-tab-todo')) {
+  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban' && t.key !== 'dash-tab-files' && t.key !== 'dash-tab-todo' && t.key !== 'dash-tab-improve')) {
     await ui.redraw(paneProps(46))
     await ui.press({ key })
     await expectTabBody(ui, key, name)
@@ -917,14 +918,14 @@ test('the tab bar shows every word at 46 and the active word plus hotkey letters
   mockWorld(on)
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  expect(await tabLabels(ui)).toEqual(['Overview', 'Lanes', 'Plan', 'Usage', 'Files', 'Events', 'Waiting', 'Kanban', 'Todo', 'Settings'])
+  expect(await tabLabels(ui)).toEqual(['Overview', 'Lanes', 'Plan', 'Usage', 'Files', 'Events', 'Waiting', 'Kanban', 'Todo', 'Improve', 'Settings'])
   for (const cols of [36, 46] as const) {
     await ui.press({ key: 'dash-tab-lanes' })
     await ui.redraw(paneProps(cols))
     const labels = await tabLabels(ui)
-    expect(labels, `at ${cols}`).toEqual(cols === 46 ? ['Overview', 'Lanes', 'Plan', 'Usage', 'Files', 'Events', 'Waiting', 'Kanban', 'Todo', 'Settings'] : ['o', 'Lanes', 'p', 'u', 'f', 'e', 'w', 'k', 't', '9'])
+    expect(labels, `at ${cols}`).toEqual(cols === 46 ? ['Overview', 'Lanes', 'Plan', 'Usage', 'Files', 'Events', 'Waiting', 'Kanban', 'Todo', 'Improve', 'Settings'] : ['o', 'Lanes', 'p', 'u', 'f', 'e', 'w', 'k', 't', 'i', '9'])
     expect(labels.join(' ')).not.toContain('o: o') // the S0 short labels are gone
-    expect(labels.filter(l => /^[a-z0-9]$/.test(l)).length, 'narrow: every inactive tab shows its hotkey letter, wide: none').toBe(cols === 46 ? 0 : 9)
+    expect(labels.filter(l => /^[a-z0-9]$/.test(l)).length, 'narrow: every inactive tab shows its hotkey letter, wide: none').toBe(cols === 46 ? 0 : 10)
     expect(labels.filter(l => l === '·').length, 'the count placeholder is gone').toBe(0)
   }
 })
@@ -1096,7 +1097,7 @@ test('V1.4: a full-width rule of the palette line colour sits directly under the
     expect(wrap?.kids, `bar then rule at ${cols}`).toHaveLength(2)
     const bar = nodesOf(wrap?.kids[0], 'Button')
     expect(bar.map(b => String(b.props.key)), `the bar is the first child at ${cols}`)
-      .toEqual(['dash-tab-overview', 'dash-tab-lanes', 'dash-tab-plan', 'dash-tab-usage', 'dash-tab-files', 'dash-tab-events', 'dash-tab-waiting', 'dash-tab-kanban', 'dash-tab-todo', 'dash-tab-settings'])
+      .toEqual(['dash-tab-overview', 'dash-tab-lanes', 'dash-tab-plan', 'dash-tab-usage', 'dash-tab-files', 'dash-tab-events', 'dash-tab-waiting', 'dash-tab-kanban', 'dash-tab-todo', 'dash-tab-improve', 'dash-tab-settings'])
     // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
     for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings')) {
       await ui.press({ key })
@@ -1159,7 +1160,7 @@ test('C12: every tab call receives the ui handle — all six tabs act on it, not
   // the four-argument tabs (lanes, usage, waiting, events) take the extra argument through the
   // pane's widened call and still render their body; Plan is store-driven and acts on ui below
   // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
-  for (const { key, name } of TAB_BUTTONS.filter(t => !['dash-tab-settings', 'dash-tab-kanban', 'dash-tab-files', 'dash-tab-todo', 'dash-tab-plan'].includes(t.key))) {
+  for (const { key, name } of TAB_BUTTONS.filter(t => !['dash-tab-settings', 'dash-tab-kanban', 'dash-tab-files', 'dash-tab-todo', 'dash-tab-improve', 'dash-tab-plan'].includes(t.key))) {
     await ui.press({ key })
     await expectTabBody(ui, key, `${name} renders with the ui argument`)
   }
@@ -1181,7 +1182,7 @@ test('C12: every tab call receives the ui handle — all six tabs act on it, not
   // Waiting: ⋯ reveals the folded actions; a pick marks the option it picked
   await ui.press({ key: 'dash-tab-waiting' })
   const labels = await tabLabels(ui)
-  expect(labels, 'the tab bar keeps its own labels while a body draws buttons').toHaveLength(10)
+  expect(labels, 'the tab bar keeps its own labels while a body draws buttons').toHaveLength(11)
   await ui.press({ key: 'waiting-a-more-3' })
   expect(await ui.find({ type: 'Button', text: /Rebase later/ }), 'the revealed option button').toBeTruthy()
   await ui.press({ key: 'waiting-b' })
@@ -1868,10 +1869,12 @@ test('D8A: hotkey k opens the Kanban tab between Waiting and Settings', { plugin
   const w = keys.indexOf('dash-tab-waiting')
   const k = keys.indexOf('dash-tab-kanban')
   const t = keys.indexOf('dash-tab-todo')
+  const i = keys.indexOf('dash-tab-improve')
   const o = keys.indexOf('dash-tab-settings')
   expect(k, 'kanban sits after waiting').toBe(w + 1)
   expect(t, 'todo sits after kanban').toBe(k + 1)
-  expect(o, 'settings sits after todo').toBe(t + 1)
+  expect(i, 'improve sits after todo').toBe(t + 1)
+  expect(o, 'settings sits after improve').toBe(i + 1)
   const kanban = buttons.find(b => b.props.key === 'dash-tab-kanban')
   expect(kanban?.props.hotkey).toBe('k')
   expect(String(kanban?.props.label)).toContain('Kanban')
@@ -2379,13 +2382,13 @@ test('planActionPatch: a thrown spawn becomes the error line', async () => {
   expect((await planActionPatch(run, '/r', { 'plans:dir': '/d' }, 'archive', 'p1', 7))['plans:error']).toBe('archive p1: spawn failed')
 })
 
-test('Files F4.1: the tab bar order is o l p u f e w k t 9 and pressing f opens Files from Overview, Lanes, Plan, Usage, Events and Kanban', { timeoutMs: 15000, plugins: [worldFixtures] }, async ($, on) => {
+test('Files F4.1: the tab bar order is o l p u f e w k t i 9 and pressing f opens Files from Overview, Lanes, Plan, Usage, Events and Kanban', { timeoutMs: 15000, plugins: [worldFixtures] }, async ($, on) => {
   mockFs(on, worldFiles())
   mockWorld(on)
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   const buttons = (await ui.findAll({ type: 'Button' })).filter(b => String(b.props.key).startsWith('dash-tab-'))
-  expect(buttons.map(b => b.props.hotkey)).toEqual(['o', 'l', 'p', 'u', 'f', 'e', 'w', 'k', 't', '9'])
+  expect(buttons.map(b => b.props.hotkey)).toEqual(['o', 'l', 'p', 'u', 'f', 'e', 'w', 'k', 't', 'i', '9'])
   const fromTabs = ['dash-tab-overview', 'dash-tab-lanes', 'dash-tab-plan', 'dash-tab-usage', 'dash-tab-events', 'dash-tab-kanban'] as const
   for (const tabKey of fromTabs) {
     await ui.press({ key: tabKey })

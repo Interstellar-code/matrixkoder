@@ -116,12 +116,66 @@ export type MkStatusMemory = {
 }
 
 /** dashboard.tsx (S0.2): the /mk pane's tabs */
-export type MkDashTab = 'overview' | 'lanes' | 'plan' | 'usage' | 'files' | 'events' | 'waiting' | 'kanban' | 'todo' | 'settings'
+export type MkDashTab = 'overview' | 'lanes' | 'plan' | 'usage' | 'files' | 'events' | 'waiting' | 'kanban' | 'todo' | 'improve' | 'settings'
 
 export type MkFileAct = {
   path: string
   kind: 'read' | 'write'
   at: number
+}
+
+// ---- Improve (hooks/improve-core.ts, hooks/tabs/improve.tsx): the footer prompt box and the Improve tab share one proposal ----
+
+/** one multiple-choice question of the wizard: 2-4 short options */
+export type MkImproveQuestion = { question: string; options: string[] }
+
+/** the person's answer to one question; a skipped one is left out of the rewrite */
+export type MkImproveAnswer =
+  | { kind: 'option'; text: string }
+  | { kind: 'other'; text: string }
+  | { kind: 'skip' }
+
+/** asking = the wizard's questions are being written, writing = the rewrite is, review = a proposal is on show */
+export type MkImproveStep = 'asking' | 'questions' | 'writing' | 'review' | 'error'
+
+/** one improvement from the press of Improve to its review */
+export type MkImproveFlow = {
+  id: string
+  original: string
+  step: MkImproveStep
+  questions: MkImproveQuestion[]
+  /** keyed by the question's index as a string */
+  answers: Record<string, MkImproveAnswer>
+  /** index of the question whose "Other" field is open, or null */
+  other: number | null
+  /** what is typed in the open "Other" field, kept here so a redraw never erases it */
+  otherDraft: string
+  upgraded: string
+  /** one short note per detail the rewrite added */
+  added: string[]
+  isEditing: boolean
+  draft: string
+  /** which model call failed, when step is 'error' */
+  failedStep: 'questions' | 'rewrite'
+  error: string
+  note: string
+}
+
+export type MkImprove = {
+  /** the footer prompt box: the single source of what it holds */
+  text: string
+  /** the box text before the last Accept, for the Undo chip */
+  undo: string | null
+  flow: MkImproveFlow | null
+}
+
+/** one saved improvement (the last 20, also kept in $.store) */
+export type MkImproveEntry = {
+  id: string
+  at: number
+  original: string
+  upgraded: string
+  added: string[]
 }
 
 declare module 'claude-code' {
@@ -146,6 +200,10 @@ declare module 'claude-code' {
       /** wizard.tsx: detection + answers until the review step writes them */
       wizardDraft: MkWizardDraft
       fileActivity: readonly MkFileAct[]
+      /** dashboard.tsx: the footer prompt box and the open improvement (shared by the footer card and the Improve tab) */
+      improve: MkImprove
+      /** dashboard.tsx: the last 20 improvements, newest first */
+      improveHistory: readonly MkImproveEntry[]
     }
   }
 }

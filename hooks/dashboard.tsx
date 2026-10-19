@@ -8,7 +8,7 @@ import type { Elements, EngineInterface, On, PluginOptions, RenderElement } from
 
 // the per-surface element table $.ui.resolve(e) answers (every surface's has Box/Text)
 type Els = Elements[keyof Elements]
-import type { MkDashTab, MkFileAct, MkRun, MkRunIndexEntry, MkSnapshot, MkStatusMemory, MkTask } from '../types'
+import type { MkDashTab, MkFileAct, MkImprove, MkImproveEntry, MkImproveFlow, MkImproveStep, MkRun, MkRunIndexEntry, MkSnapshot, MkStatusMemory, MkTask } from '../types'
 import {
   AGENT_ORDER, PANE_ID, EMPTY_SNAPSHOT, basename, coerceIndex, coerceRun, coerceUsage, join,
   mainCheckout, mkSnapshot, normalizePath, orderAgents, parentOf, parseGitdir, parseJson, parseYamlAgents, parseYamlProviders,
@@ -16,6 +16,10 @@ import {
 } from './data'
 import type { MkPaneSnapshot } from './data'
 import { globalDirOf, homeDir, paths, projectYamlPath, resolveDataDir } from './paths'
+import {
+  IMPROVE_EMPTY, IMPROVE_FAILED, IMPROVE_MODEL, QUESTIONS_SYSTEM, REWRITE_SYSTEM, answeredPairs, canAccept, contextBlock, finalText,
+  newImproveFlow, questionsPrompt, readQuestions, readRewrite, rewritePrompt,
+} from './improve-core'
 import { NARROW, STATUS_GLYPH } from './tabs/ui'
 import { stageWord, STAGE_TOTAL } from './tabs/header'
 import type { RunHeaderData } from './tabs/header'
@@ -55,6 +59,8 @@ import { WaitingTab, waitingAsks, waitingView, readPending, askView, runWaitView
 import type { PendingAsk, RunWait } from './tabs/waiting'
 import { KanbanTab, kanbanView, readCards, emptyKanbanView, kanbanFixtureView, cardsErrorLine, projectStoreDir, storeGroups } from './tabs/kanban'
 import { TodoTab } from './tabs/todo'
+import { ImproveFooter, ImproveTab } from './tabs/improve'
+import type { ImproveKind, ImproveView } from './tabs/improve'
 import type { TodoFilter, TodoItem, TodoView } from './tabs/todo'
 import type { KanbanCard, KanbanFilters, CardsRead } from './tabs/kanban'
 import { chipText, toastsFor } from './status'
@@ -78,6 +84,9 @@ const dashTabAtom = atom({ plugin: 'matrixkoder', key: 'dashTab' } as const, 'ov
 // reach it through the `ui` handle the Pane render hands them; only an onPress
 // writes it, never a render.
 const viewStateAtom = atom({ plugin: 'matrixkoder', key: 'viewState' } as const, {} as Record<string, string>)
+// the footer prompt box and the open improvement: ONE value the footer card and the Improve tab both draw
+const improveAtom = atom({ plugin: 'matrixkoder', key: 'improve' } as const, { text: '', undo: null, flow: null } as MkImprove)
+const improveHistoryAtom = atom({ plugin: 'matrixkoder', key: 'improveHistory' } as const, [] as readonly MkImproveEntry[])
 
 const COLUMNS = 46
 const REFRESH_MS = 5000
@@ -111,6 +120,7 @@ const TABS: readonly { key: MkDashTab; hotkey: string; label: string }[] = [
   { key: 'waiting', hotkey: 'w', label: 'Waiting' },
   { key: 'kanban', hotkey: 'k', label: 'Kanban' },
   { key: 'todo', hotkey: 't', label: 'Todo' },
+  { key: 'improve', hotkey: 'i', label: 'Improve' },
   { key: 'settings', hotkey: '9', label: 'Settings' },
 ]
 
@@ -231,6 +241,8 @@ export function registerDashboard(on: On, options: PluginOptions): void {
     await startLoop($, options, e.cwd) // the session's own words for where it runs; timers capture it
     void ensureBus($, options, e.cwd) // the 15 s tick is too late for a session that needs the bus now
     await loadBrandVersion($)
+    void loadImproveHistory($) // the saved list should not hold the start up
+    await resetImproveWork($)
     // S2.3: `defaultTab` picks the opening tab — a known visible tab stands,
     // anything else keeps the Overview default.
     const opening = typeof options.defaultTab === 'string'
@@ -296,6 +308,8 @@ export function registerDashboard(on: On, options: PluginOptions): void {
     const snap = await read($, snapshotAtom) as MkPaneSnapshot
     const dashTab = await read($, dashTabAtom)
     const viewState = await read($, viewStateAtom)
+    const improve = await read($, improveAtom)
+    const improveHistory = await read($, improveHistoryAtom)
     const pane = waitingPane(viewState)
     const cols = e.props.bodyColumns || COLUMNS
     const compact = cols < NARROW
@@ -319,7 +333,9 @@ export function registerDashboard(on: On, options: PluginOptions): void {
       submit: text => { void $.prompt.submit({ text }) },
       planAct: (kind, id) => { void planAction($, kind, id) },
       todoAct: (kind, arg) => { void todoAction($, kind, arg) },
+      improveAct: (kind, a, b) => { void improveAction($, kind, a, b) },
     }
+    const improveView: ImproveView = { mock: false, text: improve.text, undo: improve.undo, flow: improve.flow, history: improveHistory }
     // S3: the live Settings view once loaded. Before that a one-line
     // skeleton draws — never the fixture's mock rows (LOW 1). A tab opened
     // straight onto settings (defaultTab) loads here while nothing is stored;
@@ -399,11 +415,13 @@ export function registerDashboard(on: On, options: PluginOptions): void {
                         ? KanbanTab(tabEls, kanbanPaneView(viewState), cols)
                         : dashTab === 'todo'
                           ? TodoPane($, tabEls, viewState, cols, ui)
+                        : dashTab === 'improve'
+                          ? ImproveTab(tabEls, improveView, cols, ui)
                         : pane.src === 'live'
                           ? waitingAsks(tabEls, pane.asks, cols, new Date().toISOString(), ui)
                           : withViewState(WaitingTab, tabEls, waitingPaneView(pane, snap.run?.waiting ?? null), cols, ui)}
-        {dashTab !== 'settings' && !needsSetup && snap.run != null && <Box flexGrow={1} />}
-        {dashTab !== 'settings' && !needsSetup && snap.run != null && PaneFooter(els, snap, openWaiting(pane.asks, snap.run), cols)}
+        {dashTab !== 'settings' && !needsSetup && <Box flexGrow={1} />}
+        {dashTab !== 'settings' && !needsSetup && PaneFooter(els, snap, openWaiting(pane.asks, snap.run), cols, improveView, ui, dashTab !== 'improve')}
       </Box>
       )
     })
@@ -424,6 +442,8 @@ type TabUi = {
   planAct?: (kind: string, id: string) => void
   /** Todo tab presses: runs `mkdb.py todo <verb>` (see todoAction). */
   todoAct?: (kind: 'add' | 'toggle' | 'delete' | 'undo' | 'clear-done', arg?: string | number) => void
+  /** Improve presses (footer card and tab): see improveAction. */
+  improveAct?: (kind: ImproveKind, a?: string | number, b?: string) => void
 }
 
 /** C12 hands `ui` to all six tabs; V2's three still take three arguments, so
@@ -1628,6 +1648,219 @@ async function todoAction($: EngineInterface, kind: string, arg?: string | numbe
   await loadTodos($, home, slug, true)
 }
 
+// ── Improve: the footer prompt box and the Improve tab share one proposal (improveAtom). Presses write it and
+// ask the model; a draw only reads it. The box text is never touched by a failure or a Discard. ──
+
+const IMPROVE_STORE_KEY = 'improveHistory'
+const IMPROVE_KEEP = 20
+let improveSeq = 0 // two Improve presses inside one clock tick still get two ids
+let improveSending = false
+
+/** the open improvement, changed only while it is still the one that asked */
+const patchFlow = ($: EngineInterface, id: string, change: Partial<MkImproveFlow>): Promise<unknown> =>
+  update($, improveAtom, s => (s.flow != null && s.flow.id === id ? { ...s, flow: { ...s.flow, ...change } } : s))
+
+/** A step change decided on the CURRENT flow inside the update, so two quick presses cannot both pass: resolves
+ *  the changed flow, or null when the flow is gone, is another one, or is not in a step of `from`. */
+async function moveFlow($: EngineInterface, id: string, from: readonly MkImproveStep[], change: (f: MkImproveFlow) => Partial<MkImproveFlow>): Promise<MkImproveFlow | null> {
+  let moved: MkImproveFlow | null = null
+  await update($, improveAtom, s => {
+    moved = s.flow != null && s.flow.id === id && from.includes(s.flow.step) ? { ...s.flow, ...change(s.flow) } : null
+    return moved == null ? s : { ...s, flow: moved }
+  })
+  return moved
+}
+
+/** the answers, with what is typed in the open Other field counted as that question's answer */
+const answersWithDraft = (f: MkImproveFlow): MkImproveFlow['answers'] =>
+  f.other != null && f.otherDraft.trim() !== '' ? { ...f.answers, [String(f.other)]: { kind: 'other' as const, text: f.otherDraft.trim() } } : f.answers
+
+/** A reload (or a new session) drops the timer a working flow waits on, but the atom lives on: clear such a flow so
+ *  Improve can be pressed again. The box text is not touched. */
+async function resetImproveWork($: EngineInterface): Promise<void> {
+  try {
+    await update($, improveAtom, prev => (prev.flow != null && (prev.flow.step === 'asking' || prev.flow.step === 'writing') ? { ...prev, flow: null } : prev))
+  } catch {
+    // the atom could not be written: the Discard chip still clears it
+  }
+}
+
+/** the model call failed or its answer was unreadable: one calm line and a Try again; nothing is changed or sent */
+const failFlow = ($: EngineInterface, id: string, failedStep: 'questions' | 'rewrite'): Promise<unknown> =>
+  update($, improveAtom, s => (s.flow != null && s.flow.id === id && (s.flow.step === 'asking' || s.flow.step === 'writing')
+    ? { ...s, flow: { ...s.flow, step: 'error' as const, failedStep, error: IMPROVE_FAILED } }
+    : s))
+
+/** Model work outlives a press, so it starts on a timer (as the standalone Prompt Upgrade mod does), never as a dangling promise. */
+function improveLater($: EngineInterface, id: string, failedStep: 'questions' | 'rewrite', fn: () => Promise<void>): void {
+  $.clock.after(1, () => { void fn().catch(() => failFlow($, id, failedStep).catch(() => {})) })
+}
+
+/** the last 150 messages as one block of text; never throws: no context is better than no rewrite */
+async function improveContext($: EngineInterface): Promise<string> {
+  try {
+    return contextBlock(await $.session.messages())
+  } catch {
+    return ''
+  }
+}
+
+/** Run Wizard: ask the model for up to three questions; none that help leaves the rewrite on show standing */
+async function improveAsk($: EngineInterface, id: string): Promise<void> {
+  const f = (await read($, improveAtom)).flow
+  if (f == null || f.id !== id || f.step !== 'asking') return
+  let r
+  try {
+    r = await $.model.complete({ model: IMPROVE_MODEL, system: QUESTIONS_SYSTEM, prompt: questionsPrompt(f.original, await improveContext($)), maxTokens: 900, timeoutMs: 45_000 })
+  } catch {
+    await failFlow($, id, 'questions')
+    return
+  }
+  const cur = (await read($, improveAtom)).flow
+  if (cur == null || cur.id !== id || cur.step !== 'asking') return
+  if (!r.isAnswered) { await failFlow($, id, 'questions'); return }
+  const questions = readQuestions(r.text)
+  await patchFlow($, id, questions.length === 0
+    ? { step: 'review', note: 'No question would help. This rewrite stands.' }
+    : { step: 'questions', questions, answers: {}, other: null, note: '' })
+}
+
+/** The rewrite: one model call with the recent conversation and any wizard answers; the result is saved in the list */
+async function improveWrite($: EngineInterface, id: string): Promise<void> {
+  const f = (await read($, improveAtom)).flow
+  if (f == null || f.id !== id || f.step !== 'writing') return
+  let r
+  try {
+    r = await $.model.complete({ model: IMPROVE_MODEL, system: REWRITE_SYSTEM, prompt: rewritePrompt(f.original, answeredPairs(f), await improveContext($)), maxTokens: 2000, timeoutMs: 60_000 })
+  } catch {
+    await failFlow($, id, 'rewrite')
+    return
+  }
+  const cur = (await read($, improveAtom)).flow
+  if (cur == null || cur.id !== id || cur.step !== 'writing') return
+  const out = r.isAnswered ? readRewrite(r.text) : null
+  if (out == null) { await failFlow($, id, 'rewrite'); return }
+  await patchFlow($, id, { step: 'review', upgraded: out.upgraded, added: out.added, draft: '', isEditing: false, note: '' })
+  const entry: MkImproveEntry = { id, at: await $.clock.now(), original: f.original, upgraded: out.upgraded, added: out.added }
+  const list = await update($, improveHistoryAtom, prev => [entry, ...prev.filter(x => x.id !== id)].slice(0, IMPROVE_KEEP))
+  try { await $.store.set(IMPROVE_STORE_KEY, list) } catch { /* the list stays for this session; the next save tries again */ }
+}
+
+/** The saved list, once at session start (an unreadable or foreign value counts as none). */
+async function loadImproveHistory($: EngineInterface): Promise<void> {
+  try {
+    const saved = await $.store.get(IMPROVE_STORE_KEY)
+    if (!Array.isArray(saved)) return
+    const ok: MkImproveEntry[] = []
+    for (const x of saved as Record<string, unknown>[]) {
+      if (x != null && typeof x === 'object' && typeof x.id === 'string' && typeof x.at === 'number' && typeof x.original === 'string' && typeof x.upgraded === 'string' && Array.isArray(x.added)) {
+        ok.push({ id: x.id, at: x.at, original: x.original, upgraded: x.upgraded, added: x.added.filter((a): a is string => typeof a === 'string') })
+      }
+    }
+    if (ok.length > 0) await update($, improveHistoryAtom, prev => (prev.length > 0 ? prev : ok.slice(0, IMPROVE_KEEP)))
+  } catch {
+    // no store here: the list lives for this session only
+  }
+}
+
+/** One Improve press (footer or tab). `a` / `b` carry the question index, the option or the text. */
+async function improveAction($: EngineInterface, kind: ImproveKind, a?: string | number, b?: string): Promise<void> {
+  const text = typeof a === 'string' ? a : b ?? ''
+  if (kind === 'text') { // every keystroke: no read first; a change after an Accept drops Undo, so it never wipes later edits
+    await update($, improveAtom, prev => (prev.text === text ? prev : { ...prev, text, undo: null }))
+    return
+  }
+  const s = await read($, improveAtom)
+  const f = s.flow
+  if (kind === 'improve' || (kind === 'retry' && f != null && f.step === 'error' && f.original.trim() === '')) {
+    if (f != null && (f.step === 'asking' || f.step === 'writing')) return
+    const original = s.text.trim()
+    const id = `${String(await $.clock.now())}-${String(++improveSeq)}`
+    if (original === '') {
+      await update($, improveAtom, prev => ({ ...prev, flow: { ...newImproveFlow(id, '', 'error'), error: IMPROVE_EMPTY } }))
+      return
+    }
+    await update($, improveAtom, prev => ({ ...prev, flow: newImproveFlow(id, original) }))
+    improveLater($, id, 'rewrite', () => improveWrite($, id))
+  } else if (kind === 'accept' || (kind === 'send' && f?.step === 'review')) {
+    // the box takes the proposal (Enter in the box does too while one is on show); the text it held is kept for Undo.
+    // Decided inside the update, so a second press finds the flow gone and cannot overwrite that Undo text.
+    if (f == null || !canAccept(f)) return
+    await update($, improveAtom, prev => (prev.flow != null && prev.flow.id === f.id && canAccept(prev.flow) ? { text: finalText(prev.flow), undo: prev.text, flow: null } : prev))
+  } else if (kind === 'discard') {
+    await update($, improveAtom, prev => ({ ...prev, flow: null }))
+  } else if (kind === 'undo') {
+    await update($, improveAtom, prev => (prev.undo == null ? prev : { ...prev, text: prev.undo, undo: null }))
+  } else if (kind === 'send') {
+    // Enter in the box: the person's own words go to the session; the box clears only once they are in
+    if (text.trim() === '' || improveSending) return
+    improveSending = true
+    try {
+      const sent = await $.prompt.submit({ text, asUser: true })
+      if (sent.drop != null) return
+      await update($, improveAtom, prev => (prev.text.trim() === text.trim() ? { text: '', undo: null, flow: null } : prev))
+    } catch {
+      // the prompt was not taken: the box keeps the text
+    } finally {
+      improveSending = false
+    }
+  } else if (kind === 'open') {
+    const saved = (await read($, improveHistoryAtom)).find(x => x.id === a)
+    if (saved == null) return
+    await update($, improveAtom, prev => (prev.flow != null ? prev : {
+      ...prev,
+      flow: { ...newImproveFlow(saved.id, saved.original, 'review'), upgraded: saved.upgraded, added: saved.added },
+    }))
+  } else if (f != null) {
+    const id = f.id
+    const ix = typeof a === 'number' ? String(a) : ''
+    if (kind === 'wizard') {
+      // Run Wizard on the proposal on show: the same card turns to the questions
+      if (await moveFlow($, id, ['review'], () => ({ step: 'asking', questions: [], answers: {}, other: null, otherDraft: '', isEditing: false, note: '' }))) {
+        improveLater($, id, 'questions', () => improveAsk($, id))
+      }
+    } else if (kind === 'answer' && typeof a === 'number') {
+      // merged into the CURRENT answers, so two quick picks both land; an Other field open on another question stays
+      await moveFlow($, id, ['questions'], cur => ({ other: cur.other === a ? null : cur.other, otherDraft: cur.other === a ? '' : cur.otherDraft, answers: { ...cur.answers, [ix]: { kind: 'option', text: b ?? '' } } }))
+    } else if (kind === 'other' && typeof a === 'number') {
+      // opening one Other field keeps what was typed in the last as that question's answer
+      await moveFlow($, id, ['questions'], cur => {
+        const typed = cur.answers[ix]
+        return { answers: answersWithDraft(cur), other: a, otherDraft: typed?.kind === 'other' ? typed.text : '' }
+      })
+    } else if (kind === 'other-draft' && typeof a === 'number') {
+      await moveFlow($, id, ['questions'], cur => (cur.other === a ? { otherDraft: text } : {}))
+    } else if (kind === 'other-save' && typeof a === 'number') {
+      const t = (b ?? '').trim()
+      await moveFlow($, id, ['questions'], cur => ({ other: null, otherDraft: '', answers: t === '' ? cur.answers : { ...cur.answers, [ix]: { kind: 'other', text: t } } }))
+    } else if (kind === 'skip' && typeof a === 'number') {
+      await moveFlow($, id, ['questions'], cur => ({ other: cur.other === a ? null : cur.other, otherDraft: cur.other === a ? '' : cur.otherDraft, answers: { ...cur.answers, [ix]: { kind: 'skip' } } }))
+    } else if (kind === 'go') {
+      // what is typed in an open Other field counts; the rest count as skipped; the rewrite runs with what was answered
+      const next = await moveFlow($, id, ['questions'], cur => {
+        const answers = { ...answersWithDraft(cur) }
+        cur.questions.forEach((_, i) => { if (answers[String(i)] === undefined) answers[String(i)] = { kind: 'skip' } })
+        return { answers, other: null, otherDraft: '', step: 'writing' }
+      })
+      if (next != null) improveLater($, id, 'rewrite', () => improveWrite($, id))
+    } else if (kind === 'retry') {
+      const next = await moveFlow($, id, ['error'], cur => ({ step: cur.failedStep === 'questions' ? 'asking' : 'writing', error: '' }))
+      if (next != null) improveLater($, id, next.failedStep, () => (next.failedStep === 'questions' ? improveAsk($, id) : improveWrite($, id)))
+    } else if (kind === 'edit' && f.step === 'review') {
+      // leaving the editor keeps the draft as the proposal
+      await patchFlow($, id, f.isEditing ? { isEditing: false, upgraded: f.draft.trim() === '' ? f.upgraded : f.draft, note: '' } : { isEditing: true, draft: f.upgraded, note: '' })
+    } else if (kind === 'edit-save' && f.step === 'review') {
+      await patchFlow($, id, { isEditing: false, upgraded: text.trim() === '' ? f.upgraded : text, note: '' })
+    } else if (kind === 'draft' && f.step === 'review') {
+      await patchFlow($, id, { draft: text })
+    } else if (kind === 'copy' && f.step === 'review') {
+      let copied = false
+      try { copied = (await $.ui.copy({ text: finalText(f) })).isCopied } catch { copied = false }
+      await patchFlow($, id, { note: copied ? 'Copied.' : 'Could not copy. Select the text instead.' })
+    }
+  }
+}
+
 /** Cards JSON kept on the view-state atom so a tick is one read, not a render. */
 const CARDS_KEY = 'kanban:cards'
 const CARDS_MS_KEY = 'kanban:ms'
@@ -2655,8 +2888,9 @@ export function openWaiting(asks: readonly unknown[], run: MkRun | null): number
   return asks.length > 0 ? asks.length : run?.waiting ? 1 : 0
 }
 
-/** a dashed rule (not the tab bar's solid one), then the counts row; the pane's flexGrow spacer above it pins both to the bottom. */
-function PaneFooter(els: Els, snap: MkSnapshot, waiting: number, cols: number) {
+/** a dashed rule (not the tab bar's solid one), the Improve rows (card, prompt box, chips), then the counts row; the
+ *  pane's flexGrow spacer above it pins them to the bottom. The Improve tab draws the proposal in full, so it passes `card` false. */
+function PaneFooter(els: Els, snap: MkSnapshot, waiting: number, cols: number, improve: ImproveView, ui: TabUi, card: boolean) {
   const { Box, Text } = els
   const groups = snap.run ? laneGroups(snap.run) : []
   const held = groups.filter(g => SIDE_STATE.has(g.status)).length
@@ -2664,10 +2898,13 @@ function PaneFooter(els: Els, snap: MkSnapshot, waiting: number, cols: number) {
   return (
     <Box flexDirection="column">
       <Text color={PALETTE.line}>{'╌'.repeat(Math.max(0, cols))}</Text>
-      <Box flexDirection="row" justifyContent="space-between" gap={1} paddingX={1}>
-        <Text dimColor={true}>{left}</Text>
-        <Text dimColor={true}>{right}</Text>
-      </Box>
+      {ImproveFooter(els, improve, cols, ui, card)}
+      {snap.run != null && (
+        <Box flexDirection="row" justifyContent="space-between" gap={1} paddingX={1}>
+          <Text dimColor={true}>{left}</Text>
+          <Text dimColor={true}>{right}</Text>
+        </Box>
+      )}
     </Box>
   )
 }
