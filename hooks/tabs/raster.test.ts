@@ -173,3 +173,12 @@ test('S2.3 withRaster: only an explicit false drops Raster, so pickBar falls bac
   }
   expect(withRaster(bareEls, false)).toBe(bareEls) // nothing to drop
 })
+
+
+import { withTheme } from './palette'
+
+test('cache: equal args return identical spec (cache hit)', () => {
+  const a = gradientBar(50, 40, [PALETTE.grn, PALETTE.red])
+  const b = gradientBar(50, 40, [PALETTE.grn, PALETTE.red])
+  expect(a).toBe(b)
+})
