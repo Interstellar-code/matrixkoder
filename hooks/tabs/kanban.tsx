@@ -355,6 +355,11 @@ export function cardsErrorLine(kind: 'exit' | 'json' | 'ok' | 'spawn' | 'timeout
  * A per-project read that fails is skipped — one broken project must not blank
  * the whole board; the error is reported only when NO project read succeeded.
  * When the previous read took longer than 100 ms, every other tick is skipped.
+ *
+ * `first` is the tick's already-parsed `run-snapshot` reply for one store directory
+ * (the pane's own load reads the active project's store every tick): that group is
+ * answered from it, so the store is not spawned twice in one tick. Any other group,
+ * and every call without it, is read exactly as before.
  */
 export async function readCards(
   run: RunFn,
@@ -364,6 +369,7 @@ export async function readCards(
   tick: number,
   lastMs: number,
   overview?: { doc: unknown; failure: { kind: 'exit' | 'json' | 'ok' | 'spawn' | 'timeout'; detail: string } | null },
+  first?: { dir: string; doc: unknown },
 ): Promise<CardsRead> {
   const fail = (error: string, ms: number): CardsRead => ({ cards: [], ms, skipped: false, empty: false, error })
   if (home == null || !homeHasStore) return { cards: [], ms: 0, skipped: true, empty: true, error: null }
@@ -415,6 +421,10 @@ export async function readCards(
   const groups = storeGroups(rows)
   for (const group of groups) {
     attempted += 1
+    if (first != null && group.dir === first.dir) {
+      cards.push(...cardsOfSnapshot(group.slug, first.doc))
+      continue
+    }
     const got = await call(['python3', mkdb, '--data', group.dir, 'run-snapshot', '--json'])
     if (got.error != null) {
       failures += 1

@@ -467,6 +467,9 @@ async function switchTab($: EngineInterface, tab: MkDashTab): Promise<void> {
   await setViewKey($, 'settings:focus', '')
   if (tab === 'settings') void ensureSettingsLoaded($)
   if (tab === 'todo') void kickTodos($) // the first list should not wait for the 5 s tick
+  if (tab === 'plan') void kickPlans($) // the gated tab loads on open, not 5 s later
+  if (tab === 'kanban') void kickCards($)
+  if (tab === 'waiting') void kickPending($) // a retry now, whatever the sticky-down backoff says
   if (tab !== 'files') {
     filesSlotsStamp = null
     filesNow = 0
@@ -667,6 +670,9 @@ async function startLoop($: EngineInterface, options: PluginOptions, cwd: string
   const min = typeof options.usagePollMin === 'number' && options.usagePollMin > 0
     ? Math.max(USAGE_POLL_MIN_MIN, options.usagePollMin)
     : USAGE_POLL_DEFAULT_MIN
+  pendingDownSkips = 0 // a new loop (start or /mk) retries the bus at once (P3.3)
+  cardsTick = 0 // a new loop paces readCards from the first tick again
+  cardsFirstPass = true // and its first pass loads the board whatever tab is open
   // timers first: a throwing first load must never leave the loop dead
   // a cancel may come back as a plain function or a { cancel } handle (mock clock)
   const arm = (cancel: unknown): (() => void) =>
@@ -782,6 +788,12 @@ async function readText($: EngineInterface, path: string): Promise<string | null
  *  globalDirOf, listedDataDir, resolveDataDir and homeDir. The dashboard asks them with
  *  `requireExisting`, so a repo whose data dir is not there yet answers null (first-run). */
 
+/** The tick's own parsed `run-snapshot` reply (P3.2), keyed by the store directory it
+ *  came from. `loadSnapshot` reads the active project's store every tick; `readCards`
+ *  takes this as its pre-resolved first group, so that store is not spawned twice.
+ *  Reset at the start of every tick, so a failed load never hands on the previous one. */
+let tickSnapshotMemo: { dir: string; doc: unknown } | null = null
+
 /** The runs list + the active run's document, from the project store (C4/L5).
  *
  *  `mkdb.py run-snapshot --data <dir> --json` is the ONE read-only reader the pane uses for
@@ -810,6 +822,9 @@ async function readStoreSnapshot($: EngineInterface, dataDir: string): Promise<{
   if (ran.exitCode !== 0) return null
   const doc = parseJson(ran.stdout) as { runs?: unknown; run?: unknown; store?: unknown } | null
   if (doc === null || typeof doc !== 'object' || !Array.isArray(doc.runs)) return null
+  // P3.2: the tick's own parsed reply, for `readCards`' pre-resolved first group. It is
+  // only the answer this store already gave; a group naming another directory is read.
+  tickSnapshotMemo = { dir: dataDir, doc }
   if (doc.store === false) return null // no store: nothing to show
   const run = coerceRun(doc.run)
   const error = doc.run != null && run == null ? 'cannot read run.json' : null // a run the store named that we cannot read
@@ -961,27 +976,52 @@ export function waitingPaneView(pane: { src: string; asks: PendingAsk[] }, runWa
  *  and cleared in `finally`, so a tick that finds the previous read still
  *  running skips instead of stacking another process. */
 let pendingInFlight = false
+/** Sticky-down (P3.3): after the bus answered `down`, it is not asked again for
+ *  `PENDING_RETRY_TICKS - 1` ticks, and nothing is written while the stored state
+ *  still says down. A live answer — the next retry, or the Waiting tab's kick —
+ *  clears it and shows the asks. */
+const PENDING_RETRY_TICKS = 6
+let pendingDownSkips = 0
 
 async function refreshPending($: EngineInterface, cwd: string): Promise<void> {
   if (pendingInFlight) return
+  // sticky-down: the ticks after a `down` answer ask nothing
+  if (pendingDownSkips > 0) {
+    pendingDownSkips -= 1
+    return
+  }
   pendingInFlight = true
   const dataDir = await resolveDataDir($, { cwd, home: await homeDir($), requireExisting: true, store: true }).catch(() => null)
   const run = (argv: readonly string[], init?: { timeoutMs?: number }) =>
     $.process.run([...argv], init).then(r => ({ stdout: r.stdout, code: r.exitCode }))
+  const markDown = (): Promise<unknown> => {
+    pendingDownSkips = PENDING_RETRY_TICKS - 1
+    return update($, viewStateAtom, prev => (prev[PENDING_SRC_KEY] === 'down' ? prev : { ...prev, [PENDING_SRC_KEY]: 'down' })).catch(() => {})
+  }
   void readPending(run, $.plugin.root, dataDir).then(async got => {
     if (!got.live && !got.down) return
-    await update($, viewStateAtom, prev => ({
-      ...prev,
-      [PENDING_SRC_KEY]: got.down ? 'down' : 'live',
-      ...(got.live ? { [PENDING_KEY]: JSON.stringify(got.asks) } : {}),
-    }))
+    if (got.down) {
+      await markDown()
+      return
+    }
+    pendingDownSkips = 0
+    const pending = JSON.stringify(got.asks)
+    await update($, viewStateAtom, prev => (prev[PENDING_SRC_KEY] === 'live' && prev[PENDING_KEY] === pending
+      ? prev
+      : { ...prev, [PENDING_SRC_KEY]: 'live', [PENDING_KEY]: pending }))
   }).catch(() => {
-    // This chain outlives the tick it started in, so a refused write here would surface as an
+    // this chain outlives the tick it started in, so a refused write here would surface as an
     // unhandled rejection long after the session's hooks module is gone. Swallow it.
-    return update($, viewStateAtom, prev => ({ ...prev, [PENDING_SRC_KEY]: 'down' })).catch(() => {})
+    return markDown()
   }).finally(() => {
     pendingInFlight = false
   })
+}
+
+/** The Waiting tab's kick: whatever the backoff says, ask now. */
+async function kickPending($: EngineInterface): Promise<void> {
+  pendingDownSkips = 0
+  await refreshPending($, await filesCwd($)).catch(() => {})
 }
 
 /** Plan sub-tabs (V1.3). File mode (no project mk.db) is today's Plan tab:
@@ -1494,7 +1534,17 @@ function plansDue(view: Record<string, string>, now: number): boolean {
   return now - at >= PLANS_RELOAD_MS
 }
 
+/** The Plan tab's open: load now, not on the next tick. `plans:reload` is already bumped by
+ *  the presses that need one; this is the plain switch. */
+async function kickPlans($: EngineInterface): Promise<void> {
+  const cwd = await filesCwd($)
+  await refreshPlans($, cwd, await readRootOverview($)).catch(() => {})
+}
+
 async function refreshPlans($: EngineInterface, cwd: string, overview: RootOverview): Promise<void> {
+  // P3.4: nothing outside the Plan tab reads the plans keys (P3.0). A gate ahead of
+  // every write keeps a closed tab from redrawing the pane.
+  if ((await read($, dashTabAtom)) !== 'plan') return
   const storeHome = overview.home
   // The LIST reads the ROOT store (its plan_summary, read once per tick in readRootOverview),
   // the DETAIL the project DB (L7.2).
@@ -1695,7 +1745,6 @@ async function todoAction($: EngineInterface, kind: string, arg?: string | numbe
 /** Cards JSON kept on the view-state atom so a tick is one read, not a render. */
 const CARDS_KEY = 'kanban:cards'
 const CARDS_MS_KEY = 'kanban:ms'
-const CARDS_TICK_KEY = 'kanban:tick'
 const CARDS_EMPTY_KEY = 'kanban:empty'
 const CARDS_ERROR_KEY = 'kanban:error'
 const CARDS_STALE_KEY = 'kanban:stale'
@@ -1734,59 +1783,76 @@ function kanbanPaneView(view: Record<string, string>) {
  * awaited, so a slow cards call cannot hold the tick; one read is in flight
  * at most (the 5 s timeout lives in readCards). A read slower than 100 ms
  * still skips every other tick.
+ *
+ * P3.1: an answer that leaves the board as it was returns `prev`, so the atom is
+ * not written and the pane does not redraw — the `refreshTodos` pattern. The tick
+ * counter is module state, not a view key: it only paces `readCards`, and a key
+ * that moved every tick would defeat the skip.
+ * P3.4: only while the Kanban tab is open (nothing outside it reads these keys), with
+ * `kickCards` loading it at the switch. The session's FIRST pass still reads: the start
+ * load has always left the board in place, and `dashboard.test.ts`'s FC cases assert it.
  */
 let cardsInFlight = false
+let cardsTick = 0
+let cardsFirstPass = true
 
-function applyCardsRead(
+/** The view-state patch for one cards answer, or null when nothing the pane draws moved
+ *  (then no write, so no redraw — P3.1). */
+function cardsPatch(
   prev: Record<string, string>,
-  tick: number,
   lastMs: number,
   got: CardsRead,
-): Record<string, string> {
+): Record<string, string> | null {
   const had = (prev[CARDS_KEY] ?? '') !== ''
-  if (got.error != null) {
-    return {
-      ...prev,
-      [CARDS_TICK_KEY]: String(tick),
-      [CARDS_MS_KEY]: String(got.ms),
-      [CARDS_ERROR_KEY]: got.error,
-      [CARDS_STALE_KEY]: had ? '1' : '0',
-      [CARDS_EMPTY_KEY]: '0',
-    }
-  }
-  return {
-    ...prev,
-    [CARDS_TICK_KEY]: String(tick),
-    [CARDS_MS_KEY]: String(got.skipped ? lastMs : got.ms),
-    [CARDS_EMPTY_KEY]: got.empty ? '1' : '0',
-    [CARDS_ERROR_KEY]: '',
-    [CARDS_STALE_KEY]: '0',
-    ...(got.skipped ? {} : { [CARDS_KEY]: JSON.stringify(got.cards) }),
-  }
+  const next: Record<string, string> = got.error != null
+    ? {
+        [CARDS_MS_KEY]: String(got.ms),
+        [CARDS_ERROR_KEY]: got.error,
+        [CARDS_STALE_KEY]: had ? '1' : '0',
+        [CARDS_EMPTY_KEY]: '0',
+      }
+    : {
+        [CARDS_MS_KEY]: String(got.skipped ? lastMs : got.ms),
+        [CARDS_EMPTY_KEY]: got.empty ? '1' : '0',
+        [CARDS_ERROR_KEY]: '',
+        [CARDS_STALE_KEY]: '0',
+        ...(got.skipped ? {} : { [CARDS_KEY]: JSON.stringify(got.cards) }),
+      }
+  // No change, no write: `ms` only matters through the 100 ms threshold it is read for
+  // (the slow flag and the every-other-tick cadence), and an absent key reads as ''.
+  const changed = Object.entries(next).some(([key, value]) =>
+    key === CARDS_MS_KEY
+      ? (Number(value) > 100) !== (Number(prev[key] ?? '0') > 100)
+      : value !== (prev[key] ?? ''))
+  return changed ? { ...prev, ...next } : null
 }
 
 async function refreshCards($: EngineInterface, overview: RootOverview): Promise<void> {
+  if (cardsFirstPass) cardsFirstPass = false
+  else if ((await read($, dashTabAtom)) !== 'kanban') return
   // storeHome is the global dir (paths.globalDirOf: $MK_HOME, else
   // $MATRIXKODER_HOME, else ~/.matrixkoder). The exists-check ran in readRootOverview:
   // a missing root store never spawns mkdb, which would create it.
   const storeHome = overview.home
   const exists = overview.exists
   const view = await read($, viewStateAtom)
-  const tick = Number(view[CARDS_TICK_KEY] ?? '0') + 1
+  const tick = ++cardsTick
   const lastMs = Number(view[CARDS_MS_KEY] ?? '0')
   const run = (argv: readonly string[], init?: { timeoutMs?: number }) => $.process.run([...argv], init)
+  const applyGot = async (got: CardsRead): Promise<void> => {
+    // unchanged answer: not even a write, so the pane is not drawn again (P3.1)
+    if (cardsPatch(await read($, viewStateAtom), lastMs, got) === null) return
+    await update($, viewStateAtom, prev => cardsPatch(prev, lastMs, got) ?? prev)
+  }
   // A missing store is synchronous inside readCards (no spawn). Record it
   // before returning so the pane can show "no store yet" on this tick.
   if (storeHome == null || !exists) {
     const got = await readCards(async () => ({ stdout: '', code: 0 }), $.plugin.root, storeHome, exists, tick, lastMs)
-    await update($, viewStateAtom, prev => applyCardsRead(prev, tick, lastMs, got))
+    await applyGot(got)
     return
   }
   // A slow or failed read must not hold this tick. One read in flight.
-  if (cardsInFlight) {
-    await update($, viewStateAtom, prev => ({ ...prev, [CARDS_TICK_KEY]: String(tick) }))
-    return
-  }
+  if (cardsInFlight) return
   cardsInFlight = true
   const started = Date.now()
   void readCards(
@@ -1795,17 +1861,22 @@ async function refreshCards($: EngineInterface, overview: RootOverview): Promise
       return { stdout: r.stdout, code: r.exitCode }
     },
     $.plugin.root, storeHome, exists, tick, lastMs, { doc: overview.doc, failure: overview.failure },
+    tickSnapshotMemo ?? undefined,
   ).then(async got => {
     const ms = Math.max(got.ms, Date.now() - started)
-    await update($, viewStateAtom, prev => applyCardsRead(prev, tick, lastMs, { ...got, ms }))
+    await applyGot({ ...got, ms })
   }).catch(() => {
     // see refreshPending: a detached chain's failure handler must not reject on its own
-    return update($, viewStateAtom, prev => applyCardsRead(prev, tick, lastMs, {
-      cards: [], ms: Date.now() - started, skipped: false, empty: false, error: cardsErrorLine('spawn'),
-    })).catch(() => {})
+    return applyGot({ cards: [], ms: Date.now() - started, skipped: false, empty: false, error: cardsErrorLine('spawn') }).catch(() => {})
   }).finally(() => {
     cardsInFlight = false
   })
+}
+
+/** The Kanban tab's open: load now, not on the next tick. */
+async function kickCards($: EngineInterface): Promise<void> {
+  tickSnapshotMemo = null // a kick is outside the tick: no stale reply may answer it
+  await refreshCards($, await readRootOverview($)).catch(() => {})
 }
 
 /** One root-store read per tick (L7.2): the Plan list and the top-level `k` both need
@@ -1856,6 +1927,7 @@ async function readRootOverview($: EngineInterface): Promise<RootOverview> {
 async function refreshSafe($: EngineInterface, options: PluginOptions, cwd: string): Promise<void> {
   beginStoreTick() // one `mkdb.py projects --json` for the whole tick
   resetYamlPathMemo() // one store read for the yaml path per tick, not one per caller
+  tickSnapshotMemo = null // P3.2: only THIS tick's own run-snapshot may answer a cards read
   // The previous snapshot is read INSIDE the try: a refused read must not escape the tick,
   // and `endStoreTick()` in the finally must run whatever happens here.
   let prev: MkSnapshot = EMPTY_SNAPSHOT
@@ -1889,12 +1961,26 @@ async function refreshSafe($: EngineInterface, options: PluginOptions, cwd: stri
     }
     // One root `overview --json` for the whole tick (C1): the Plan list and the
     // top-level `k` read the same document, so it is spawned once here and handed on.
-    await refreshCards($, overview)
-    await refreshPending($, cwd)
-    await refreshPlans($, cwd, overview)
-    await refreshTodos($, cwd, overview)
-    // the store read costs a spawn: only for an open Events tab, and only with a run to read
-    if (snap.value != null && await read($, dashTabAtom) === 'events') await refreshEvents($, cwd, snap.value)
+    // The refreshers now start together, so paths.ts's per-tick `projects --json` memo is
+    // filled first: otherwise two concurrent resolvers would each spawn the table (P1.1).
+    await resolveDataDir($, { cwd, home: await homeDir($), requireExisting: true, store: true }).catch(() => null)
+    // The tab refreshers share nothing but that document (P3.4): they run together, so a
+    // slow one neither delays the others nor the tick, and `allSettled` keeps one
+    // rejection from stopping the rest. Each already handles its own failure; the
+    // settled list is awaited so `endStoreTick()` still closes after them.
+    const eventsTick = snap.value == null
+      ? undefined
+      // the store read costs a spawn: only for an open Events tab, and only with a run to read
+      : (async () => {
+          if ((await read($, dashTabAtom)) === 'events') await refreshEvents($, cwd, snap.value as MkSnapshot)
+        })()
+    await Promise.allSettled([
+      refreshCards($, overview),
+      refreshPending($, cwd),
+      refreshPlans($, cwd, overview),
+      refreshTodos($, cwd, overview),
+      eventsTick,
+    ])
   } catch (err) {
     // A tick whose previous snapshot could not even be read flags nothing: writing the
     // EMPTY_SNAPSHOT fallback over a good atom would lose data to a transport failure.
