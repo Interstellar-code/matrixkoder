@@ -10,6 +10,8 @@ import {
   longNamesFixtureView,
   FIXTURE_ROOTS,
 } from './filetree.fixture'
+import { treeRows } from './filetree-data'
+import type { FsEntry } from './filetree-data'
 import type { Row } from './filetree-data'
 
 type Node = { type?: string; props?: Record<string, unknown>; children?: unknown[] }
@@ -963,4 +965,53 @@ test('Files columns: a header row sorts by Name, Size and Modified; wide rows ca
   const narrow = FilesTab(stubEls, view, 46, ui)
   expect(nodesOf(narrow, 'Button').some(b => b.props?.key === 'files-sort-size')).toBe(false)
   expect(nodesOf(narrow, 'Button').some(b => b.props?.key === 'files-sort-name')).toBe(true)
+})
+
+test('P4.4.a1: a pulse on a 600-row tree reuses every icon-free row object and rebuilds only the icon rows', () => {
+  // FAILS ON THE OLD CODE: every pulse rebuilt all 600 row elements, icon or not.
+  const dirs = new Map<string, FsEntry[]>()
+  // 299 files plus the subfolder at the root, and 300 inside it: 600 drawn rows under the 500/600 caps
+  dirs.set('/big', [
+    ...Array.from({ length: 299 }, (_, i) => ({ name: `f${String(i).padStart(3, '0')}.ts`, kind: 'file' as const, size: 10, mtimeMs: 1000, isLink: false })),
+    { name: 'sub', kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false },
+  ])
+  dirs.set('/big/sub', Array.from({ length: 300 }, (_, i) => ({ name: `g${String(i).padStart(3, '0')}.ts`, kind: 'file' as const, size: 10, mtimeMs: 1000, isLink: false })))
+  const act = new Map<string, 'read' | 'write'>([
+    ['/big/f000.ts', 'write'], ['/big/f001.ts', 'write'], ['/big/f002.ts', 'write'],
+  ])
+  const rows = treeRows({ dirs, capped: false, missing: false }, '/big', new Set(['/big/sub']), '', act)
+  expect(rows).toHaveLength(600)
+  expect(rows.filter(r => r.icon != null)).toHaveLength(3)
+
+  const view = (pulse: boolean): FilesView => ({
+    roots: [{ id: 'main', label: 'main', path: '/big' }],
+    root: 'main',
+    rows,
+    dirs: ['/big', '/big/sub'],
+    nWrite: 3,
+    nRead: 0,
+    nFolders: 0,
+    nFiles: 600,
+    pulse,
+    capped: false,
+    note: null,
+    q: '',
+    sel: '',
+  })
+  const ui = createMockUi().ui
+  const lit = FilesTab(stubEls, view(true), 46, ui)
+  const dim = FilesTab(stubEls, view(false), 46, ui)
+  const litRows = nodesOf(lit, 'Button').filter(b => String(b.props?.key).startsWith('files-row:'))
+  const dimRows = nodesOf(dim, 'Button').filter(b => String(b.props?.key).startsWith('files-row:'))
+  expect(litRows).toHaveLength(600)
+  expect(dimRows).toHaveLength(600)
+  const changed: string[] = []
+  for (let i = 0; i < 600; i++) if (litRows[i] !== dimRows[i]) changed.push(String(litRows[i]!.props?.key))
+  expect(changed.sort()).toEqual(['files-row:/big/f000.ts', 'files-row:/big/f001.ts', 'files-row:/big/f002.ts'])
+  // the icon fade still reads as the tests above expect: bright on pulse, dim off it
+  const iconOf = (tree: unknown): unknown =>
+    nodesOf(nodesOf(tree, 'Button').find(b => b.props?.key === 'files-row:/big/f000.ts')!, 'Text')
+      .find(t => textOf(t).includes('●'))?.props?.dimColor
+  expect(iconOf(lit)).toBe(false)
+  expect(iconOf(dim)).toBe(true)
 })
