@@ -15,7 +15,7 @@ import {
   sanitizeText, timerRegistry,
 } from './data'
 import type { MkPaneSnapshot } from './data'
-import { globalDirOf, homeDir, paths, projectYamlPath, resolveDataDir } from './paths'
+import { beginStoreTick, endStoreTick, globalDirOf, homeDir, paths, projectYamlPath, resolveDataDir, resetStoreMemo } from './paths'
 import { NARROW, STATUS_GLYPH } from './tabs/ui'
 import { stageWord, STAGE_TOTAL } from './tabs/header'
 import type { RunHeaderData } from './tabs/header'
@@ -84,6 +84,8 @@ const REFRESH_MS = 5000
 const USAGE_POLL_DEFAULT_MIN = 5
 const USAGE_POLL_MIN_MIN = 1 // a faster poll with the 120 s timeout would stack runs
 const POLL_MIN_INTERVAL_MS = 60_000
+/** The cold-start usage poll waits this long, so it does not stack onto the first load. */
+const FIRST_POLL_MS = 5000
 const SWEEP_INTERVAL_MS = 120_000
 // The bus host (mk-bus.py): one idempotent `ensure` (or `heartbeat`) every 15 s.
 // Its own start window is a few seconds of flock + probe, so the spawn timeout
@@ -176,6 +178,16 @@ function truncateTitle(text: string, budget: number): string {
 }
 let pollInFlight = false
 let lastPollAt = -Infinity
+/** The first load of a start, in the background: the 5 s timer is its backstop. */
+let firstLoad: Promise<void> = Promise.resolve()
+/** The cold-start usage one-shot (`$.clock.after`); cancelled with the other timers. */
+let cancelFirstPoll: (() => void) | null = null
+/** The poll canceller this loop armed: the interval plus the cold-start one-shot. */
+let cancelPoll: (() => void) | null = null
+/** loadSnapshot's answer for the start: true when usage.json was missing at the load. */
+let usageMissingAtLoad = false
+/** true once the start's own load has recorded that answer (later ticks leave it alone). */
+let firstLoadDone = false
 let sweepInFlight = false
 let lastSweepAt = -Infinity
 let busInFlight = false
@@ -204,6 +216,7 @@ let filesSessionCwd = ''
 
 export function registerDashboard(on: On, options: PluginOptions): void {
   on('session.start', async ($, e, next) => {
+    resetStoreMemo() // a new session must not answer from the previous one's tick
     filesSessionCwd = e.cwd ?? ''
     filesNow = 0
     lastFilesDraw = 0
@@ -228,8 +241,9 @@ export function registerDashboard(on: On, options: PluginOptions): void {
         // the engine seats the pane itself; a refusal is not fatal
       }
     }
-    await startLoop($, options, e.cwd) // the session's own words for where it runs; timers capture it
-    void ensureBus($, options, e.cwd) // the 15 s tick is too late for a session that needs the bus now
+    startLoop($, options, e.cwd) // arms the timers now; the first load runs in the background
+    const out = next(e) // the engine continues at once: the pane is usable before any data has loaded
+    // Neither the brand version nor the opening tab waits on, or is produced by, the first load.
     await loadBrandVersion($)
     // S2.3: `defaultTab` picks the opening tab — a known visible tab stands,
     // anything else keeps the Overview default.
@@ -243,7 +257,11 @@ export function registerDashboard(on: On, options: PluginOptions): void {
         // the atom write failed — the pane keeps the Overview default
       }
     }
-    return next(e)
+    // The hook still finishes with a populated pane: the load's backstop is the 5 s tick,
+    // and every caller that follows `next` sees the same state it always did.
+    await firstLoad
+    void ensureBus($, options, e.cwd) // the 15 s tick is too late for a session that needs the bus now
+    return out
   })
 
   // /mk is a per-session declaration. session.start does not fire on /clear or on a
@@ -615,7 +633,9 @@ export async function rearmLoop($: EngineInterface, options: PluginOptions): Pro
   rearmInFlight = true
   try {
     const cwd = await $.session.cwd()
-    await startLoop($, options, cwd)
+    // Same hand-over as session.start: the timers are armed at once and the first load
+    // runs in the background; the 5 s tick is its backstop. Nothing here waits for data.
+    startLoop($, options, cwd)
     await loadBrandVersion($)
     void ensureBus($, options, cwd) // the bus needs no /clear either
   } catch {
@@ -649,8 +669,14 @@ async function startLoop($: EngineInterface, options: PluginOptions, cwd: string
     typeof cancel === 'function' ? (cancel as () => void) : () => { (cancel as { cancel?: () => void }).cancel?.() }
   timerRegistry.cancelRefresh?.()
   timerRegistry.cancelRefresh = arm($.clock.every(REFRESH_MS, () => refreshSafe($, options, cwd)))
-  timerRegistry.cancelPoll?.()
-  timerRegistry.cancelPoll = arm($.clock.every(Math.round(min * 60_000), () => pollUsage($, cwd)))
+  cancelPoll?.() // the previous loop's interval AND its cold-start one-shot
+  const pollInterval = arm($.clock.every(Math.round(min * 60_000), () => pollUsage($, cwd)))
+  cancelPoll = () => {
+    pollInterval()
+    cancelFirstPoll?.()
+    cancelFirstPoll = null
+  }
+  timerRegistry.cancelPoll = cancelPoll
   timerRegistry.cancelSweep?.()
   timerRegistry.cancelSweep = arm($.clock.every(SWEEP_INTERVAL_MS, () => sweepLanes($, options, cwd)))
   busTimers.cancelBus?.()
@@ -682,10 +708,21 @@ async function startLoop($: EngineInterface, options: PluginOptions, cwd: string
     }
   }))
   lastChipText = undefined
-  await refreshSafe($, options, cwd) // first load populates pane + chip and never toasts
-  const gdir = await globalDirOf($, await homeDir($))
-  const usageMissing = gdir == null || (await readJson($, paths.usage(gdir))) == null
-  if (usageMissing) void pollUsage($, cwd) // cold start: do not show "no ledger yet" for N minutes
+  firstLoadDone = false
+  usageMissingAtLoad = false
+  // The first load runs in the background: the pane draws from stored values and the
+  // 5 s tick is the backstop, so a session does not wait two Python starts to hand over.
+  // refreshSafe never throws; the catch is for a rejected promise only.
+  firstLoad = refreshSafe($, options, cwd).catch(() => {})
+  // Cold start: no usage.json yet means "no ledger yet" for the whole first poll interval.
+  // The check lives in loadSnapshot (it reads usage.json already); this one-shot fires
+  // after 5 s — once the first load has answered — and polls at most once.
+  cancelFirstPoll?.()
+  cancelFirstPoll = arm($.clock.after(FIRST_POLL_MS, () => {
+    void firstLoad
+      .then(() => (usageMissingAtLoad ? pollUsage($, cwd) : undefined))
+      .catch(() => {})
+  }))
 }
 
 async function openPane($: EngineInterface): Promise<void> {
@@ -790,7 +827,15 @@ async function loadSnapshot($: EngineInterface, cwd: string): Promise<MkSnapshot
     ;({ run, activeRuns, runs, error } = await loadRuns($, dataDir))
   }
   const gdir = await globalDirOf($, home)
-  const usage = gdir ? coerceUsage(await readJson($, paths.usage(gdir))) : null
+  const usageJson = gdir ? await readJson($, paths.usage(gdir)) : null
+  // The cold start's usage check rides this read: usage.json is already in hand, so
+  // startLoop needs no second read and no extra spawn to know the ledger is missing.
+  // Only the start's own load decides, so a later tick cannot overwrite the answer.
+  if (!firstLoadDone) {
+    usageMissingAtLoad = usageJson == null
+    firstLoadDone = true
+  }
+  const usage = gdir ? coerceUsage(usageJson) : null
   // the project yaml scopes the usage section (and its poll) to this project's agents and
   // providers. yamlPathFor, not paths.projectYaml: on a MIGRATED project the file is the C2
   // `<project>/project.yaml`, and the pre-migration `<data>/matrixkoder.yaml` is gone.
@@ -1789,28 +1834,50 @@ async function readRootOverview($: EngineInterface): Promise<RootOverview> {
 
 /** Never throws: a failing load keeps the last good snapshot and flags the error. */
 async function refreshSafe($: EngineInterface, options: PluginOptions, cwd: string): Promise<void> {
+  beginStoreTick() // one `mkdb.py projects --json` for the whole tick
   resetYamlPathMemo() // one store read for the yaml path per tick, not one per caller
   const prev = await read($, snapshotAtom)
   try {
-    const snap = await loadSnapshot($, cwd)
-    await applyStatus($, options, snap)
-    if (contentSig(prev) !== contentSig(snap)) {
-      await update($, snapshotAtom, () => snap)
+    // The two first reads do not depend on each other: the run state and the root
+    // overview start together, so the tick waits for the slower one, not both. Each
+    // keeps its own failure: a rejected snapshot leaves the last good one flagged,
+    // and the overview is still handed to the tab refreshers.
+    const [snap, overview] = await Promise.all([
+      loadSnapshot($, cwd).then(
+        value => ({ value, error: null as string | null }),
+        (err: unknown) => ({ value: null, error: String(err) }),
+      ),
+      readRootOverview($),
+    ])
+    if (snap.value == null) {
+      try {
+        await update($, snapshotAtom, () => ({ ...prev, error: `cannot read the run state (${String(snap.error).slice(0, 40)})` }))
+      } catch {
+        // even the atom write failed — nothing more to do
+      }
+    } else {
+      const good = snap.value
+      await applyStatus($, options, good)
+      if (contentSig(prev) !== contentSig(good)) {
+        await update($, snapshotAtom, () => good)
+      }
     }
     // One root `overview --json` for the whole tick (C1): the Plan list and the
     // top-level `k` read the same document, so it is spawned once here and handed on.
-    const overview = await readRootOverview($)
     await refreshCards($, overview)
     await refreshPending($, cwd)
     await refreshPlans($, cwd, overview)
     await refreshTodos($, cwd, overview)
-    if (await read($, dashTabAtom) === 'events') await refreshEvents($, cwd, snap) // the store read costs a spawn: only for an open Events tab
+    // the store read costs a spawn: only for an open Events tab, and only with a run to read
+    if (snap.value != null && await read($, dashTabAtom) === 'events') await refreshEvents($, cwd, snap.value)
   } catch (err) {
     try {
       await update($, snapshotAtom, () => ({ ...prev, error: `cannot read the run state (${String(err).slice(0, 40)})` }))
     } catch {
       // even the atom write failed — nothing more to do
     }
+  } finally {
+    endStoreTick() // the answer stays for an outside-tick caller while it is fresh
   }
 }
 
