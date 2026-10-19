@@ -5,7 +5,7 @@
 // filled, last filled, first empty and floor cells.
 import { test, expect } from 'claude-code/testing'
 import type { Elements, RenderElement } from 'claude-code'
-import { encodeCells, gradientBar, laneStrip, pickBar, stageBar, withRaster } from './raster'
+import { encodeCells, gradientBar, laneStrip, pickBar, stageBar, colorStrip, withRaster } from './raster'
 import type { RasterSpec } from './raster'
 import { PALETTE, ROLE, rgbWord } from './palette'
 
@@ -181,4 +181,74 @@ test('cache: equal args return identical spec (cache hit)', () => {
   const a = gradientBar(50, 40, [PALETTE.grn, PALETTE.red])
   const b = gradientBar(50, 40, [PALETTE.grn, PALETTE.red])
   expect(a).toBe(b)
+})
+
+
+test('gradientBar: equal args return the identical object', () => {
+  const a = gradientBar(40, 12, [PALETTE.blue, PALETTE.grn], 20)
+  const b = gradientBar(40, 12, [PALETTE.blue, PALETTE.grn], 20)
+  expect(a).toBe(b)
+})
+test('stageBar: equal args return the identical object', () => {
+  const a = stageBar(2, 2, 5, 20)
+  const b = stageBar(2, 2, 5, 20)
+  expect(a).toBe(b)
+})
+test('laneStrip: equal args return the identical object', () => {
+  const a = laneStrip(['live','warn','ok'] as any, 18)
+  const b = laneStrip(['live','warn','ok'] as any, 18)
+  expect(a).toBe(b)
+})
+test('colorStrip: equal args return the identical object', () => {
+  const a = colorStrip([PALETTE.grn], 12)
+  const b = colorStrip([PALETTE.grn], 12)
+  expect(a).toBe(b)
+})
+
+test('different args never share an entry', () => {
+  const base = gradientBar(40, 12, [PALETTE.blue, PALETTE.grn], 20)
+  expect(gradientBar(50, 12, [PALETTE.blue, PALETTE.grn], 20)).not.toBe(base)
+  expect(gradientBar(40, 14, [PALETTE.blue, PALETTE.grn], 20)).not.toBe(base)
+  expect(gradientBar(40, 12, [PALETTE.red, PALETTE.grn], 20)).not.toBe(base)
+  expect(gradientBar(40, 12, [PALETTE.blue, PALETTE.grn], 30)).not.toBe(base)
+  const s = stageBar(2, 2, 5, 20)
+  expect(stageBar(1, 2, 5, 20)).not.toBe(s)
+  expect(stageBar(2, 3, 5, 20)).not.toBe(s)
+  expect(stageBar(2, 2, 6, 20)).not.toBe(s)
+  const l = laneStrip(['live','warn'] as any, 18)
+  expect(laneStrip(['live','ok'] as any, 18)).not.toBe(l)
+})
+
+test('cache is bounded', () => {
+  const first = gradientBar(1, 40, [PALETTE.grn])
+  for (let i = 0; i < 200; i++) gradientBar(i % 199 + 0.5, 40, [PALETTE.grn])
+  const again = gradientBar(1, 40, [PALETTE.grn])
+  expect(again).not.toBe(first)
+  expect(again.cells).toBe(first.cells)
+})
+
+test('returned specs are frozen', () => {
+  for (const spec of [gradientBar(30,40,[PALETTE.grn]), stageBar(1,1,3,40), laneStrip(['ok'] as any,18), colorStrip([PALETTE.grn],12)]) {
+    expect(Object.isFrozen(spec)).toBe(true)
+    try { (spec as any).cells = 'x' } catch {}
+    expect(spec.cells).not.toBe('x')
+  }
+})
+
+test('the cache is keyed by theme', () => {
+  let a: any
+  withTheme('matrix' as any, () => { a = gradientBar(50, 40, [PALETTE.grn]) })
+  const b = gradientBar(50, 40, [PALETTE.grn])
+  expect(a.cells).not.toBe(b.cells)
+  let a2: any
+  withTheme('matrix' as any, () => { a2 = gradientBar(50, 40, [PALETTE.grn]) })
+  expect(a2).toBe(a)
+  const b2 = gradientBar(50, 40, [PALETTE.grn])
+  expect(b2).toBe(b)
+})
+
+test('output matches the pre-change encoder', () => {
+  expect(typeof gradientBar(40, 12, [PALETTE.blue, PALETTE.grn], 20).cells).toBe('string')
+  expect(typeof stageBar(2, 2, 5, 20).cells).toBe('string')
+  expect(typeof laneStrip(['live','warn','ok'] as any, 18).cells).toBe('string')
 })
