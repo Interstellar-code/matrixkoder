@@ -75,21 +75,47 @@ function colorAt(stops: readonly string[], t: number): number {
   return (mix(16) << 16) | (mix(8) << 8) | mix(0)
 }
 
+// ---- memoization ----
+const CACHE_CAP = 64
+const cache = new Map<string, RasterSpec>()
+
+function cacheKey(parts: unknown[]): string {
+  return JSON.stringify(parts)
+}
+
+function frozen(spec: RasterSpec): RasterSpec {
+  return Object.freeze({ columns: spec.columns, rows: spec.rows, cells: spec.cells })
+}
+
+function memoize(key: string, build: () => RasterSpec): RasterSpec {
+  const hit = cache.get(key)
+  if (hit) return hit
+  if (cache.size >= CACHE_CAP) {
+    const first = cache.keys().next().value
+    if (first !== undefined) cache.delete(first)
+  }
+  const spec = frozen(build())
+  cache.set(key, spec)
+  return spec
+}
+
 /** One row of `▀` cells: `pct` of `cols` in the gradient colour of its own
  *  position, the rest on the track; the cell at `floorPct` carries a mut
  *  background — the floor tick under the bar (Kit.dc.html's grad()). */
 export function gradientBar(pct: number, cols: number, stops: readonly string[], floorPct?: number): RasterSpec {
-  const width = Math.max(1, Math.floor(cols))
-  const filled = Math.round((clampPct(pct) / 100) * width)
-  const floor = floorPct == null
-    ? -1
-    : Math.min(width - 1, Math.max(0, Math.floor((clampPct(floorPct) / 100) * width)))
-  const words: number[] = []
-  for (let i = 0; i < width; i++) {
-    const fg = i < filled ? colorAt(stops, width <= 1 ? 0 : i / (width - 1)) : TRACK()
-    words.push(UPPER_HALF, fg, i === floor ? MUT() : PANEL())
-  }
-  return { columns: width, rows: 1, cells: encodeCells(words) }
+  return memoize(cacheKey([pct, cols, [...stops], floorPct]), () => {
+    const width = Math.max(1, Math.floor(cols))
+    const filled = Math.round((clampPct(pct) / 100) * width)
+    const floor = floorPct == null
+      ? -1
+      : Math.min(width - 1, Math.max(0, Math.floor((clampPct(floorPct) / 100) * width)))
+    const words: number[] = []
+    for (let i = 0; i < width; i++) {
+      const fg = i < filled ? colorAt(stops, width <= 1 ? 0 : i / (width - 1)) : TRACK()
+      words.push(UPPER_HALF, fg, i === floor ? MUT() : PANEL())
+    }
+    return { columns: width, rows: 1, cells: encodeCells(words) }
+  })
 }
 
 /** Evenly pick `count` of `colors` (both ends kept) when the width cannot hold
@@ -143,17 +169,19 @@ export function stageBar(done: number, current: number, total: number, cols: num
   const n = Math.max(1, Math.floor(total))
   const colors: string[] = []
   for (let i = 0; i < n; i++) colors.push(i < done ? PALETTE.grn : i === current ? PALETTE.blue : PALETTE.track)
-  return strip(colors, cols)
+  return memoize(cacheKey(['stage', done, current, total, cols, colors]), () => strip(colors, cols))
 }
 
 /** One segment per lane, coloured by that lane's role (Lanes tab). */
 /** A strip from plain `#rrggbb` colours, one segment per entry (the Plan tab's five status colours). */
 export function colorStrip(colors: readonly string[], cols: number): RasterSpec {
-  return strip(colors.length > 0 ? colors : [PALETTE.track], cols)
+  const list = colors.length > 0 ? colors : [PALETTE.track]
+  return memoize(cacheKey(['colorStrip', [...colors], cols]), () => strip(list, cols))
 }
 
 export function laneStrip(states: readonly PaletteRole[], cols: number): RasterSpec {
-  return strip(states.map(s => ROLE[s]?.fg ?? PALETTE.track), cols)
+  const mapped = states.map(s => ROLE[s]?.fg ?? PALETTE.track)
+  return memoize(cacheKey(['laneStrip', [...states], cols]), () => strip(mapped, cols))
 }
 
 /** The Raster when the element table has one (the terminal), the fallback
@@ -168,8 +196,6 @@ export function pickBar(els: Els, key: string, spec: RasterSpec, fallback: Rende
  *  true) keeps the table whole — so `pickBar` above falls back to its
  *  eighth-block bar exactly as on a surface with no Raster. */
 export function withRaster(els: Els, raster: unknown): Els {
-  if (raster !== false) return els
-  if (!('Raster' in els)) return els
-  const { Raster: _drop, ...rest } = els
-  return rest as Els
+  if (raster === false) return { ...els, Raster: undefined } as unknown as Els
+  return els
 }
