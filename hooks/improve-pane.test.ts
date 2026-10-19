@@ -1,10 +1,10 @@
-// Improve wiring in the pane: the footer prompt box and Improve chip on every tab but Settings, the
+// Improve wiring in the pane: the footer Improve chip on every tab but Settings, the
 // Improve tab between Todo and Settings, and the shared proposal. The model, the session, the
-// prompt box and the store are mocked beneath the plugin; a real terminal draw is not covered here.
+// prompt line and the store are mocked beneath the plugin; a real terminal draw is not covered here.
 import { test, expect } from 'claude-code/testing'
 import type { Engine, Mounted } from 'claude-code/testing'
 import { mockFs, mockWorld, paneProps, sessionStart, worldFiles, worldFixtures } from './testkit'
-import { IMPROVE_FAILED, IMPROVE_SLASH, wordCount } from './improve-core'
+import { IMPROVE_FAILED, IMPROVE_FILL_FAILED, wordCount } from './improve-core'
 
 const usage = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
 const ROUGH = 'Check all the files with type errors.'
@@ -29,6 +29,8 @@ type World = {
   answer: (n: number, isQuestions: boolean) => Answer | Promise<Answer>
   submit?: 'drop' | 'throw'
   copy?: boolean
+  /** the draft Claude Code's prompt line holds when the test mounts */
+  draft?: string
 }
 
 /** the world beneath the pane: model, conversation, prompt box, clipboard, store */
@@ -36,6 +38,18 @@ function world(on: Parameters<typeof mockWorld>[0], w: World) {
   const log = { prompts: [] as string[], models: [] as string[], systems: [] as string[], calls: 0, submitted: [] as { text: string; asUser?: boolean }[], copied: [] as string[] }
   const clock = mockWorld(on)
   mockFs(on, w.files ?? worldFiles())
+  // Claude Code's own prompt line, in memory: read resolves what it holds, fill writes it
+  // (the real shapes: PromptBox `{ text, cursor }`, PromptFilled `{ isFilled, text, cursor }`)
+  const box = { text: w.draft ?? '', refuses: false }
+  const fills: { text: string; mode: string }[] = []
+  on('prompt.read', () => ({ value: { text: box.text, cursor: box.text.length } }))
+  // prompt.fill is an event: its handler answers the result itself, not a value wrapper
+  on('prompt.fill', (_$, e) => {
+    fills.push({ text: e.text, mode: e.mode })
+    if (box.refuses) return { isFilled: false as const, refusal: 'dialog' as const }
+    box.text = e.mode === 'append' ? box.text + e.text : e.text
+    return { isFilled: true as const }
+  })
   // the plugin's own store, in memory and readable by the test
   const stored = new Map<string, unknown>(Object.entries(w.stored ?? {}))
   on('store.get', (_$, e) => ({ value: stored.get(e.key) }))
@@ -69,50 +83,52 @@ function world(on: Parameters<typeof mockWorld>[0], w: World) {
     return { value: w.copy !== false ? { isCopied: true as const } : { isCopied: false as const, reason: 'no-clipboard' as const } }
   })
   const settle = async (n = 10) => { for (let i = 0; i < n; i++) await clock.advance(5) }
-  return { log, clock, settle, stored }
+  return { log, clock, settle, stored, box, fills }
 }
 
 type Ui = Mounted<'terminal', 'Pane'>
 const mount = ($: Engine, cols = 46): Promise<Ui> =>
   $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(cols) })
 
-const boxValue = async (ui: Ui): Promise<string> => String((await ui.find({ type: 'Input', key: 'improve-q' }))?.props.value ?? '')
-const type = (ui: Ui, text: string) => ui.input({ key: 'improve-q', text, kind: 'change' })
+/** what Claude Code's prompt line holds: the world's box, as the person would see it */
+const boxValue = (w: ReturnType<typeof world>): string => w.box.text
+const type = (w: ReturnType<typeof world>, text: string): void => { w.box.text = text }
 const has = async (ui: Ui, q: Parameters<Ui['find']>[0]): Promise<boolean> => (await ui.find(q)) !== undefined
 /** a sentence the card wrapped over several rows, read whole */
 const says = async (ui: Ui, sentence: string): Promise<boolean> =>
   (await ui.findAll({ type: 'Text' })).map(t => String(t.text)).join(' ').includes(sentence)
 
-/** type a prompt, press Improve, let the timer-started model call finish */
+/** type a prompt in the prompt line, press Improve, let the timer-started model call finish */
 async function improve(ui: Ui, w: ReturnType<typeof world>, text = ROUGH) {
-  await type(ui, text)
+  type(w, text)
   await ui.press({ key: 'improve-f-go' })
   await w.settle()
 }
 
-test('the footer: ❯ prompt box, the solid Improve chip and two + tool slots sit between the dashed rule and the counts, on every tab but Settings', { plugins: [worldFixtures] }, async ($, on) => {
+test('the footer: the solid Improve chip and two + tool slots sit between the dashed rule and the counts, on every tab but Settings, and no prompt field', { plugins: [worldFixtures] }, async ($, on) => {
   world(on, { answer: () => REWRITE })
   await $.session.start(sessionStart())
   const ui = await mount($)
   for (const tab of ['overview', 'lanes', 'plan', 'usage', 'events', 'waiting', 'kanban', 'todo', 'improve']) {
     await ui.press({ key: `dash-tab-${tab}` })
-    expect(await has(ui, { type: 'Input', key: 'improve-q' }), `the box on ${tab}`).toBe(true)
+    expect(await has(ui, { type: 'Input', key: 'improve-q' }), `no box of its own on ${tab}`).toBe(false)
     expect(await has(ui, { type: 'Button', key: 'improve-f-go' }), `the chip on ${tab}`).toBe(true)
   }
   await ui.press({ key: 'dash-tab-overview' })
   const order = (await ui.findAll({ type: 'Text' })).map(t => t.text)
   const at = (s: RegExp): number => order.findIndex(t => s.test(String(t)))
   expect(at(/^╌+$/)).toBeGreaterThan(-1)
-  expect(at(/^╌+$/)).toBeLessThan(at(/^❯$/))
-  expect(at(/^❯$/)).toBeLessThan(at(/ live · /))
+  // the chips row is the footer's own: it sits between the dashed rule and the counts row, with no prompt row
+  expect(at(/^╌+$/)).toBeLessThan(order.findIndex(t => String(t).includes('✦ Improve')))
+  expect(order.findIndex(t => String(t).includes('✦ Improve'))).toBeLessThan(at(/ live · /))
   expect(order.filter(t => t === '┊ + tool ┊')).toHaveLength(2)
   expect((await ui.find({ type: 'Button', key: 'improve-f-go' }))?.text).toBe(' ✦ Improve ')
   expect(await has(ui, { text: '↶ Undo' }), 'no Undo before an accept').toBe(false)
   await ui.press({ key: 'dash-tab-settings' })
-  expect(await has(ui, { type: 'Input', key: 'improve-q' }), 'Settings keeps its own body').toBe(false)
+  expect(await has(ui, { type: 'Button', key: 'improve-f-go' }), 'Settings draws no footer').toBe(false)
 })
 
-test('with no active run the footer keeps the prompt box and Improve, without the counts row', { plugins: [worldFixtures] }, async ($, on) => {
+test('with no active run the footer keeps Improve, without the counts row', { plugins: [worldFixtures] }, async ($, on) => {
   const files = worldFiles()
   const w = world(on, { answer: () => REWRITE, files })
   await $.session.start(sessionStart())
@@ -120,7 +136,6 @@ test('with no active run the footer keeps the prompt box and Improve, without th
   await w.clock.advance(5000)
   const ui = await mount($)
   expect(await says(ui, 'No active orchestration run.')).toBe(true)
-  expect(await has(ui, { type: 'Input', key: 'improve-q' })).toBe(true)
   expect(await has(ui, { type: 'Button', key: 'improve-f-go' })).toBe(true)
   expect(await has(ui, { text: / live · / }), 'no counts without a run').toBe(false)
   await improve(ui, w)
@@ -138,7 +153,7 @@ test('the Improve tab sits between Todo and Settings with hotkey i; hiddenTabs h
   expect(bar.find(b => b.props.key === 'dash-tab-improve')?.props.hotkey).toBe('i')
   expect(new Set(bar.map(b => b.props.hotkey)).size, 'every hotkey distinct').toBe(bar.length)
   await ui.press({ key: 'dash-tab-improve' })
-  expect(await says(ui, 'Type a prompt in the footer and press Improve.')).toBe(true)
+  expect(await says(ui, 'Type a prompt in Claude Code’s prompt line and press ✦ Improve.')).toBe(true)
 })
 
 test('hiddenTabs improve hides the tab (key or label); defaultTab improve opens on it', { plugins: [worldFixtures], options: { hiddenTabs: 'Improve' } }, async ($, on) => {
@@ -147,21 +162,21 @@ test('hiddenTabs improve hides the tab (key or label); defaultTab improve opens 
   const ui = await mount($)
   expect(await has(ui, { type: 'Button', key: 'dash-tab-improve' })).toBe(false)
   expect(await has(ui, { type: 'Button', key: 'dash-tab-settings' })).toBe(true)
-  expect(await has(ui, { type: 'Input', key: 'improve-q' }), 'the footer stays').toBe(true)
+  expect(await has(ui, { type: 'Button', key: 'improve-f-go' }), 'the footer stays').toBe(true)
 })
 
 test('defaultTab improve opens the pane on the Improve tab', { plugins: [worldFixtures], options: { defaultTab: 'improve' } }, async ($, on) => {
   world(on, { answer: () => REWRITE })
   await $.session.start(sessionStart())
   const ui = await mount($)
-  expect(await says(ui, 'Type a prompt in the footer and press Improve.')).toBe(true)
+  expect(await says(ui, 'Type a prompt in Claude Code’s prompt line and press ✦ Improve.')).toBe(true)
 })
 
 test('Improve: one model call (haiku), the card shows the proposal and the word counts, the box is not touched', { plugins: [worldFixtures] }, async ($, on) => {
   const w = world(on, { answer: () => REWRITE })
   await $.session.start(sessionStart())
   const ui = await mount($)
-  await type(ui, `  ${ROUGH}  `)
+  type(w, `  ${ROUGH}  `)
   await ui.press({ key: 'improve-f-go' })
   expect(await says(ui, 'Writing the new prompt…'), 'working shows a calm line').toBe(true)
   await w.settle()
@@ -177,7 +192,7 @@ test('Improve: one model call (haiku), the card shows the proposal and the word 
   expect(await has(ui, { type: 'Button', key: 'improve-f-accept' })).toBe(true)
   expect(await has(ui, { type: 'Button', key: 'improve-f-wizard' })).toBe(true)
   expect(await has(ui, { type: 'Button', key: 'improve-f-discard' })).toBe(true)
-  expect(await boxValue(ui), 'the box keeps the person’s text').toBe(`  ${ROUGH}  `)
+  expect(boxValue(w), 'the box keeps the person’s text').toBe(`  ${ROUGH}  `)
   expect(w.log.submitted, 'nothing is sent').toEqual([])
 })
 
@@ -201,11 +216,11 @@ test('Accept fills the box with the rewrite and shows Undo; Undo restores the or
   const original = `  ${ROUGH}\nsecond line  `
   await improve(ui, w, original)
   await ui.press({ key: 'improve-f-accept' })
-  expect(await boxValue(ui)).toBe(BETTER)
+  expect(boxValue(w)).toBe(BETTER)
   expect(await has(ui, { text: '✦ IMPROVED PROMPT' }), 'the card is gone').toBe(false)
   expect((await ui.find({ type: 'Button', key: 'improve-f-undo' }))?.text).toBe(' ↶ Undo ')
   await ui.press({ key: 'improve-f-undo' })
-  expect(await boxValue(ui)).toBe(original)
+  expect(boxValue(w)).toBe(original)
   expect(await has(ui, { type: 'Button', key: 'improve-f-undo' }), 'Undo is spent').toBe(false)
   expect(w.log.submitted, 'accepting never sends').toEqual([])
 })
@@ -217,7 +232,7 @@ test('Discard closes the card and leaves the box as it was', { plugins: [worldFi
   await improve(ui, w)
   await ui.press({ key: 'improve-f-discard' })
   expect(await has(ui, { text: '✦ IMPROVED PROMPT' })).toBe(false)
-  expect(await boxValue(ui)).toBe(ROUGH)
+  expect(boxValue(w)).toBe(ROUGH)
   expect(await has(ui, { type: 'Button', key: 'improve-f-undo' })).toBe(false)
 })
 
@@ -251,7 +266,7 @@ test('Run Wizard switches the same card to the questions; answers and Skip shape
   expect(await has(ui, { text: /for my team/ }), 'the new rewrite shows in the same card').toBe(true)
   expect(await has(ui, { text: '✦ IMPROVED PROMPT' })).toBe(true)
   await ui.press({ key: 'improve-f-accept' })
-  expect(await boxValue(ui)).toBe('Run tsc --noEmit for my team and list every file. [the folder]')
+  expect(boxValue(w)).toBe('Run tsc --noEmit for my team and list every file. [the folder]')
 })
 
 test('Run Wizard: Other (type it) takes the typed answer; Skip the rest, upgrade now skips what is left', { plugins: [worldFixtures] }, async ($, on) => {
@@ -290,7 +305,7 @@ test('a failing model call shows one calm line and Try again; the box is untouch
   const ui = await mount($)
   await improve(ui, w) // 0: the API failed
   expect(await says(ui, IMPROVE_FAILED), 'api failure').toBe(true)
-  expect(await boxValue(ui)).toBe(ROUGH)
+  expect(boxValue(w)).toBe(ROUGH)
   expect(await has(ui, { text: '✦ IMPROVED PROMPT' })).toBe(false)
   await ui.press({ key: 'improve-f-retry' }) // 1: the request was refused (it rejects)
   await w.settle()
@@ -299,7 +314,7 @@ test('a failing model call shows one calm line and Try again; the box is untouch
   await ui.press({ key: 'improve-f-retry' }) // 2: an unreadable answer
   await w.settle()
   expect(await says(ui, IMPROVE_FAILED), 'unreadable answer').toBe(true)
-  expect(await boxValue(ui)).toBe(ROUGH)
+  expect(boxValue(w)).toBe(ROUGH)
   await ui.press({ key: 'improve-f-retry' }) // 3: the rewrite
   await w.settle()
   expect(w.log.calls).toBe(4)
@@ -320,49 +335,36 @@ test('a failing question call shows the calm line; Try again asks again', { plug
   await ui.press({ key: 'improve-f-retry' })
   await w.settle()
   expect(await has(ui, { text: '✦ WIZARD' })).toBe(true)
-  expect(await boxValue(ui)).toBe(ROUGH)
+  expect(boxValue(w)).toBe(ROUGH)
 })
 
-test('Improve on an empty box says so and asks nothing', { plugins: [worldFixtures] }, async ($, on) => {
+test('Improve on an empty prompt line says so and asks nothing', { plugins: [worldFixtures] }, async ($, on) => {
   const w = world(on, { answer: () => REWRITE })
   await $.session.start(sessionStart())
   const ui = await mount($)
   await ui.press({ key: 'improve-f-go' })
   await w.settle()
-  expect(await says(ui, 'Type a prompt first, then press Improve.')).toBe(true)
+  expect(await says(ui, 'Type a prompt in Claude Code’s prompt line, then press Improve.')).toBe(true)
   expect(w.log.calls).toBe(0)
-  // Try again with the box filled now improves it
-  await type(ui, ROUGH)
+  // Try again with the prompt line filled now improves it
+  type(w, ROUGH)
   await ui.press({ key: 'improve-f-retry' })
   await w.settle()
   expect(w.log.calls).toBe(1)
   expect(await has(ui, { text: '✦ IMPROVED PROMPT' })).toBe(true)
 })
 
-test('Enter in the box sends it as the person’s own words and clears the box', { plugins: [worldFixtures] }, async ($, on) => {
+test('no footer or tab field is drawn, so nothing of the Improve UI sends a prompt any more', { plugins: [worldFixtures] }, async ($, on) => {
   const w = world(on, { answer: () => REWRITE })
   await $.session.start(sessionStart())
-  const ui = await mount($)
-  await type(ui, 'run the tests')
-  await ui.input({ key: 'improve-q', text: 'run the tests' }) // submit
-  expect(w.log.submitted).toEqual([{ text: 'run the tests', asUser: true }])
-  expect(await boxValue(ui)).toBe('')
-  // an empty or blank box sends nothing
-  await ui.input({ key: 'improve-q', text: '   ' })
-  expect(w.log.submitted).toHaveLength(1)
+  const ui = await mount($, 80)
+  await improve(ui, w)
+  await ui.press({ key: 'dash-tab-improve' })
+  expect(await has(ui, { type: 'Input', key: 'improve-q' }), 'no prompt field in the footer or the tab').toBe(false)
+  await ui.press({ key: 'improve-t-accept' })
+  expect(w.log.submitted, 'accepting never sends').toEqual([])
+  expect(boxValue(w)).toBe(BETTER)
 })
-
-for (const submit of ['drop', 'throw'] as const) {
-  test(`a send the session ${submit === 'drop' ? 'refuses' : 'fails'} leaves the box exactly as it was`, { plugins: [worldFixtures] }, async ($, on) => {
-    const w = world(on, { answer: () => REWRITE, submit })
-    await $.session.start(sessionStart())
-    const ui = await mount($)
-    await type(ui, 'keep me')
-    await ui.input({ key: 'improve-q', text: 'keep me' })
-    expect(w.log.submitted).toHaveLength(1)
-    expect(await boxValue(ui)).toBe('keep me')
-  })
-}
 
 test('the Improve tab and the footer share one proposal: Accept in the tab does what Accept in the footer does', { plugins: [worldFixtures] }, async ($, on) => {
   const w = world(on, { answer: () => REWRITE })
@@ -376,9 +378,8 @@ test('the Improve tab and the footer share one proposal: Accept in the tab does 
   expect(await has(ui, { text: '+' })).toBe(true)
   expect(await has(ui, { text: 'details added' })).toBe(true)
   expect(await has(ui, { type: 'Button', key: 'improve-f-accept' }), 'the footer card gives way to the tab').toBe(false)
-  expect(await has(ui, { type: 'Input', key: 'improve-q' }), 'the box stays').toBe(true)
   await ui.press({ key: 'improve-t-accept' })
-  expect(await boxValue(ui)).toBe(BETTER)
+  expect(boxValue(w)).toBe(BETTER)
   expect(await has(ui, { type: 'Button', key: 'improve-f-undo' })).toBe(true)
   // back on Overview the proposal is gone too: one state
   await ui.press({ key: 'dash-tab-overview' })
@@ -392,7 +393,7 @@ test('the Improve tab and the footer share one proposal: Accept in the tab does 
   await ui.press({ key: 'improve-t-discard' })
   await ui.press({ key: 'dash-tab-overview' })
   expect(await has(ui, { text: '✦ IMPROVED PROMPT' })).toBe(false)
-  expect(await boxValue(ui)).toBe(ROUGH)
+  expect(boxValue(w)).toBe(ROUGH)
 })
 
 test('the tab: Edit shows the field, the draft is what Accept takes; Copy puts it on the clipboard', { plugins: [worldFixtures] }, async ($, on) => {
@@ -405,11 +406,11 @@ test('the tab: Edit shows the field, the draft is what Accept takes; Copy puts i
   expect(w.log.copied).toEqual([BETTER])
   expect(await has(ui, { text: 'Copied.' })).toBe(true)
   await ui.press({ key: 'improve-t-edit' })
-  expect(await boxValue(ui), 'editing never touches the footer box').toBe(ROUGH)
+  expect(boxValue(w), 'editing never touches the footer box').toBe(ROUGH)
   expect((await ui.find({ type: 'Input', key: 'improve-edit' }))?.props.value).toBe(BETTER)
   await ui.input({ key: 'improve-edit', text: 'Run tsc and list the files.', kind: 'change' })
   await ui.press({ key: 'improve-t-accept' })
-  expect(await boxValue(ui)).toBe('Run tsc and list the files.')
+  expect(boxValue(w)).toBe('Run tsc and list the files.')
 })
 
 test('Copy that cannot reach the clipboard says so', { plugins: [worldFixtures] }, async ($, on) => {
@@ -441,9 +442,9 @@ test('the last improvements are kept in the store and listed in the tab; a click
   expect(w.log.calls, 'reopening asks the model nothing').toBe(1)
   // accepting a reopened one fills the box; the text it held is kept for Undo
   await ui.press({ key: 'improve-t-accept' })
-  expect(await boxValue(ui)).toBe('old better prompt')
+  expect(boxValue(w)).toBe('old better prompt')
   await ui.press({ key: 'improve-f-undo' })
-  expect(await boxValue(ui)).toBe(ROUGH)
+  expect(boxValue(w)).toBe(ROUGH)
 })
 
 test('the list keeps twenty at most', { plugins: [worldFixtures], timeoutMs: 30000 }, async ($, on) => {
@@ -466,49 +467,82 @@ test('F1: two Accept presses in a row leave Undo holding the typed original, and
   await improve(ui, w)
   // the second press may find the card gone; either way it must not change what Undo holds
   await Promise.allSettled([ui.press({ key: 'improve-f-accept' }), ui.press({ key: 'improve-f-accept' })])
-  expect(await boxValue(ui)).toBe(BETTER)
+  expect(boxValue(w)).toBe(BETTER)
   await ui.press({ key: 'improve-f-undo' })
-  expect(await boxValue(ui), 'Undo gives back the typed original, not the rewrite').toBe(ROUGH)
+  expect(boxValue(w), 'Undo gives back the typed original, not the rewrite').toBe(ROUGH)
 })
 
-test('F4: Enter in the box accepts the proposal while one is on show; with none it sends', { plugins: [worldFixtures] }, async ($, on) => {
+test('F4: Improve reads Claude Code\u2019s prompt line at the press, and Accept writes the proposal back with replace', { plugins: [worldFixtures] }, async ($, on) => {
+  const w = world(on, { answer: () => REWRITE, draft: 'the person\u2019s own draft' })
+  await $.session.start(sessionStart())
+  const ui = await mount($)
+  // the draft typed in the prompt line is what gets rewritten, with no field of ours involved
+  await ui.press({ key: 'improve-f-go' })
+  await w.settle()
+  expect(w.log.prompts[0]).toContain('<prompt>\nthe person\u2019s own draft\n</prompt>')
+  await ui.press({ key: 'improve-f-accept' })
+  expect(w.fills, 'one replace over the draft').toEqual([{ text: BETTER, mode: 'replace' }])
+  expect(boxValue(w)).toBe(BETTER)
+})
+
+test('review 2: what the person typed after the press is never sent, and Accept\u2019s Undo holds the text it replaced', { plugins: [worldFixtures] }, async ($, on) => {
   const w = world(on, { answer: () => REWRITE })
   await $.session.start(sessionStart())
   const ui = await mount($)
   await improve(ui, w)
-  await ui.input({ key: 'improve-q', text: ROUGH }) // Enter
-  expect(w.log.submitted, 'nothing is sent while a proposal is on show').toEqual([])
-  expect(await boxValue(ui)).toBe(BETTER)
-  expect(await has(ui, { text: '✦ IMPROVED PROMPT' }), 'the card is gone').toBe(false)
+  type(w, 'a different draft now')
+  await ui.press({ key: 'improve-f-accept' })
+  expect(w.log.submitted, 'the Improve UI never sends').toEqual([])
+  expect(boxValue(w)).toBe(BETTER)
+  expect(w.fills, 'the proposal replaced what the line held').toEqual([{ text: BETTER, mode: 'replace' }])
+  await ui.press({ key: 'improve-f-undo' })
+  expect(boxValue(w), 'Undo gives back the text Accept replaced').toBe('a different draft now')
+})
+
+test('a fill the engine refuses (a dialog holds the box) keeps the proposal on show and says so', { plugins: [worldFixtures] }, async ($, on) => {
+  const w = world(on, { answer: () => REWRITE })
+  w.box.refuses = true
+  await $.session.start(sessionStart())
+  const ui = await mount($)
+  await improve(ui, w)
+  await ui.press({ key: 'improve-f-accept' })
+  expect(boxValue(w), 'the prompt line is untouched').toBe(ROUGH)
+  expect(await says(ui, IMPROVE_FILL_FAILED), 'the card says why').toBe(true)
+  expect(await has(ui, { text: /Run tsc --noEmit and list every file/ }), 'the proposal stays').toBe(true)
+  expect(await has(ui, { type: 'Button', key: 'improve-f-accept' }), 'Accept can be tried again').toBe(true)
+  expect(await has(ui, { type: 'Button', key: 'improve-f-undo' }), 'no Undo without a write').toBe(false)
+  // the dialog closes: the same Accept now lands
+  w.box.refuses = false
+  await ui.press({ key: 'improve-f-accept' })
+  expect(boxValue(w)).toBe(BETTER)
+  expect(await has(ui, { text: /IMPROVED PROMPT/ }), 'the card clears').toBe(false)
+})
+
+test('Undo is dropped once the person types over what Accept wrote, and never overwrites it', { plugins: [worldFixtures] }, async ($, on) => {
+  const w = world(on, { answer: () => REWRITE })
+  await $.session.start(sessionStart())
+  const ui = await mount($)
+  await improve(ui, w)
+  await ui.press({ key: 'improve-f-accept' })
   expect(await has(ui, { type: 'Button', key: 'improve-f-undo' })).toBe(true)
-  await ui.press({ key: 'improve-f-undo' })
-  expect(await boxValue(ui)).toBe(ROUGH)
-  // no proposal now: Enter sends the box text as the person's own words
-  await ui.input({ key: 'improve-q', text: ROUGH })
-  expect(w.log.submitted).toEqual([{ text: ROUGH, asUser: true }])
-  expect(await boxValue(ui)).toBe('')
+  type(w, `${BETTER} And keep it short.`)
+  // the 5 s tick sees the line changed and drops Undo; the chip is gone and the text stays
+  await w.clock.advance(5000)
+  await ui.redraw(paneProps(46))
+  expect(await has(ui, { type: 'Button', key: 'improve-f-undo' }), 'Undo was dropped').toBe(false)
+  expect(boxValue(w)).toBe(`${BETTER} And keep it short.`)
 })
 
-test('review 2: Enter with different text than the proposal was made for sends that text and drops the old card', { plugins: [worldFixtures] }, async ($, on) => {
+test('Undo pressed right after typing, before any tick, never overwrites the new text', { plugins: [worldFixtures] }, async ($, on) => {
   const w = world(on, { answer: () => REWRITE })
   await $.session.start(sessionStart())
   const ui = await mount($)
   await improve(ui, w)
-  await type(ui, 'something else entirely')
-  await ui.input({ key: 'improve-q', text: 'something else entirely' })
-  expect(w.log.submitted).toEqual([{ text: 'something else entirely', asUser: true }])
-  expect(await has(ui, { text: '✦ IMPROVED PROMPT' }), 'the old card is gone').toBe(false)
-})
-
-test('review 2: a leading slash is not sent as plain text; the card says so and the box keeps it', { plugins: [worldFixtures] }, async ($, on) => {
-  const w = world(on, { answer: () => REWRITE })
-  await $.session.start(sessionStart())
-  const ui = await mount($)
-  await type(ui, '/compact now')
-  await ui.input({ key: 'improve-q', text: '/compact now' })
-  expect(w.log.submitted).toEqual([])
-  expect(await boxValue(ui)).toBe('/compact now')
-  expect(await says(ui, IMPROVE_SLASH)).toBe(true)
+  await ui.press({ key: 'improve-f-accept' })
+  type(w, `${BETTER} And keep it short.`)
+  await ui.press({ key: 'improve-f-undo' })
+  expect(boxValue(w)).toBe(`${BETTER} And keep it short.`)
+  expect(await has(ui, { type: 'Button', key: 'improve-f-undo' }), 'Undo was dropped').toBe(false)
 })
 
 test('review 3: a saved improvement is cut to 4000 characters each side, so one pasted wall cannot fill the store', { plugins: [worldFixtures] }, async ($, on) => {
@@ -534,7 +568,7 @@ test('review 6: Run Wizard keeps an edit in progress as the proposal, even when 
   await w.settle()
   expect(await has(ui, { text: IMPROVE_FAILED }), 'the question call failed').toBe(true)
   await ui.press({ key: 'improve-t-accept' })
-  expect(await boxValue(ui), 'the edit, not the older rewrite, is what Accept takes').toBe('my own edit')
+  expect(boxValue(w), 'the edit, not the older rewrite, is what Accept takes').toBe('my own edit')
 })
 
 test('review 12: while an Improve input has the focus the Todo a / z hotkeys stand down, like todo-q', { plugins: [worldFixtures] }, async ($, on) => {
@@ -546,35 +580,23 @@ test('review 12: while an Improve input has the focus the Todo a / z hotkeys sta
   const hotkeyOf = async (key: string): Promise<unknown> =>
     (await ui.find({ type: 'Button', key }) as { props: { hotkey?: string } } | undefined)?.props.hotkey
   expect(await hotkeyOf('todo-key-a'), 'armed before the box has the ring').toBe('a')
-  await $.ui.focus({ component: 'Pane', requestId: 'matrixkoder', element: 'improve-q', origin: { kind: 'person' } })
+  await $.ui.focus({ component: 'Pane', requestId: 'matrixkoder', element: 'improve-edit', origin: { kind: 'person' } })
   await ui.redraw(paneProps(46))
-  expect(await hotkeyOf('todo-key-a'), 'inert while the box holds the ring').toBeUndefined()
+  expect(await hotkeyOf('todo-key-a'), 'inert while an Improve input holds the ring').toBeUndefined()
   await $.ui.focus({ component: 'Pane', requestId: 'matrixkoder', element: 'improve-f-go', origin: { kind: 'person' } })
   await ui.redraw(paneProps(46))
   expect(await hotkeyOf('todo-key-a'), 'back once the ring leaves the box').toBe('a')
 })
 
-test('F4: Enter while the proposal shows in the Improve tab accepts it too', { plugins: [worldFixtures] }, async ($, on) => {
+test('F4: Accept in the Improve tab writes the proposal into the prompt line too', { plugins: [worldFixtures] }, async ($, on) => {
   const w = world(on, { answer: () => REWRITE })
   await $.session.start(sessionStart())
   const ui = await mount($, 80)
   await improve(ui, w)
   await ui.press({ key: 'dash-tab-improve' })
-  await ui.input({ key: 'improve-q', text: ROUGH })
-  expect(w.log.submitted).toEqual([])
-  expect(await boxValue(ui)).toBe(BETTER)
-})
-
-test('F8c: typing in the box after an Accept drops Undo, so Undo never wipes the later edit', { plugins: [worldFixtures] }, async ($, on) => {
-  const w = world(on, { answer: () => REWRITE })
-  await $.session.start(sessionStart())
-  const ui = await mount($)
-  await improve(ui, w)
-  await ui.press({ key: 'improve-f-accept' })
-  expect(await has(ui, { type: 'Button', key: 'improve-f-undo' })).toBe(true)
-  await type(ui, `${BETTER} And keep it short.`)
-  expect(await has(ui, { type: 'Button', key: 'improve-f-undo' }), 'the edit spent Undo').toBe(false)
-  expect(await boxValue(ui)).toBe(`${BETTER} And keep it short.`)
+  await ui.press({ key: 'improve-t-accept' })
+  expect(w.fills).toEqual([{ text: BETTER, mode: 'replace' }])
+  expect(boxValue(w)).toBe(BETTER)
 })
 
 test('F2: what is typed in the wizard’s Other field survives a redraw, a refresh tick, a tab switch and a pick on another question; Enter commits it', { plugins: [worldFixtures] }, async ($, on) => {
@@ -672,7 +694,7 @@ test('F8: a failed wizard call keeps the shown rewrite visible with the calm lin
   expect(await has(ui, { text: /Run tsc --noEmit and list every file/ }), 'and on the tab').toBe(true)
   expect(await has(ui, { type: 'Button', key: 'improve-t-accept' })).toBe(true)
   await ui.press({ key: 'improve-t-accept' })
-  expect(await boxValue(ui)).toBe(BETTER)
+  expect(boxValue(w)).toBe(BETTER)
 })
 
 test('F8: an error before any rewrite has no Accept', { plugins: [worldFixtures] }, async ($, on) => {
@@ -692,12 +714,12 @@ test('F13: a stale model answer that lands after Discard and a new Improve never
   const w = world(on, { answer: n => (n === 0 ? first : NEW) })
   await $.session.start(sessionStart())
   const ui = await mount($)
-  await type(ui, 'first rough prompt')
+  type(w, 'first rough prompt')
   await ui.press({ key: 'improve-f-go' })
   await w.settle() // the first call is out and waiting
   expect(w.log.calls).toBe(1)
   await ui.press({ key: 'improve-f-discard' })
-  await type(ui, 'second rough prompt')
+  type(w, 'second rough prompt')
   await ui.press({ key: 'improve-f-go' })
   release(OLD)
   await w.settle()
@@ -713,12 +735,12 @@ test('F5: a flow left working by a lost timer is cleared at session start; the b
   const w = world(on, { answer: () => REWRITE })
   await $.session.start(sessionStart())
   const ui = await mount($)
-  await type(ui, ROUGH)
+  type(w, ROUGH)
   await ui.press({ key: 'improve-f-go' }) // the model call waits on a timer that is never advanced: the worker is "lost"
   expect(await says(ui, 'Writing the new prompt…')).toBe(true)
   await $.session.start(sessionStart()) // the reloaded module starts a session
   expect(await says(ui, 'Writing the new prompt…'), 'no stuck flow').toBe(false)
-  expect(await boxValue(ui), 'the box text is intact').toBe(ROUGH)
+  expect(boxValue(w), 'the box text is intact').toBe(ROUGH)
   await w.settle()
   expect(w.log.calls, 'the dropped worker asks nothing').toBe(0)
   await ui.press({ key: 'improve-f-go' })
@@ -828,7 +850,7 @@ test('every Improve row stays within the pane width at 36, 46 and 80 columns: fo
       expect(over.map(r => `${String(r.w)}: ${r.text}`), `${what} at ${cols}`).toEqual([])
     }
   }
-  await type(ui, long)
+  type(w, long)
   await ui.press({ key: 'improve-f-go' })
   await check('working')
   await w.settle()
@@ -848,7 +870,7 @@ test('every Improve row stays within the pane width at 36, 46 and 80 columns: fo
   await check('footer answered')
   await ui.press({ key: 'improve-f-discard' })
   await check('footer idle')
-  await type(ui, '')
+  type(w, '')
   await ui.press({ key: 'improve-f-go' })
   await check('footer empty error')
   const rows = improveRows(await ui.drawn())

@@ -17,7 +17,7 @@ import {
 import type { MkPaneSnapshot } from './data'
 import { beginStoreTick, endStoreTick, globalDirOf, homeDir, paths, projectYamlPath, resolveDataDir, resetStoreMemo } from './paths'
 import {
-  IMPROVE_EMPTY, IMPROVE_FAILED, IMPROVE_SLASH, IMPROVE_MODEL, QUESTIONS_SYSTEM, REWRITE_SYSTEM, answeredPairs, canAccept, contextBlock, finalText,
+  IMPROVE_EMPTY, IMPROVE_FAILED, IMPROVE_FILL_FAILED, IMPROVE_MODEL, QUESTIONS_SYSTEM, REWRITE_SYSTEM, answeredPairs, canAccept, contextBlock, finalText,
   newImproveFlow, questionsPrompt, readQuestions, readRewrite, rewritePrompt,
 } from './improve-core'
 import { NARROW, STATUS_GLYPH } from './tabs/ui'
@@ -84,8 +84,8 @@ const dashTabAtom = atom({ plugin: 'matrixkoder', key: 'dashTab' } as const, 'ov
 // reach it through the `ui` handle the Pane render hands them; only an onPress
 // writes it, never a render.
 const viewStateAtom = atom({ plugin: 'matrixkoder', key: 'viewState' } as const, {} as Record<string, string>)
-// the footer prompt box and the open improvement: ONE value the footer card and the Improve tab both draw
-const improveAtom = atom({ plugin: 'matrixkoder', key: 'improve' } as const, { text: '', undo: null, flow: null } as MkImprove)
+// the open improvement and the prompt text Accept replaced: ONE value the footer card and the Improve tab both draw
+const improveAtom = atom({ plugin: 'matrixkoder', key: 'improve' } as const, { undo: null, written: null, flow: null } as MkImprove)
 const improveHistoryAtom = atom({ plugin: 'matrixkoder', key: 'improveHistory' } as const, [] as readonly MkImproveEntry[])
 
 const COLUMNS = 46
@@ -360,7 +360,7 @@ export function registerDashboard(on: On, options: PluginOptions): void {
       todoAct: (kind, arg) => { void todoAction($, kind, arg) },
       improveAct: (kind, a, b) => { void improveAction($, kind, a, b) },
     }
-    const improveView: ImproveView = { mock: false, text: improve.text, undo: improve.undo, flow: improve.flow, history: improveHistory }
+    const improveView: ImproveView = { mock: false, undo: improve.undo, flow: improve.flow, history: improveHistory }
     // S3: the live Settings view once loaded. Before that a one-line
     // skeleton draws — never the fixture's mock rows (LOW 1). A tab opened
     // straight onto settings (defaultTab) loads here while nothing is stored;
@@ -1701,8 +1701,8 @@ function TodoPane($: EngineInterface, els: Els, view: Record<string, string>, co
   const { Box, Text, Button } = els
   const err = view[TODO_ERROR_KEY] ?? ''
   const focus = view['settings:focus'] ?? ''
-  // the Improve box, its Other fields and its editor take letters too (a chip holding the ring does not)
-  const typing = focus === 'todo-q' || focus === 'improve-q' || focus === 'improve-edit' || focus.startsWith('improve-other-')
+  // the Improve Other fields and the editor take letters too (the footer has no field of its own)
+  const typing = focus === 'todo-q' || focus === 'improve-edit' || focus.startsWith('improve-other-')
   return (
     <Box flexDirection="column" gap={1}>
       {err !== '' && <Text color={ROLE.err.fg}>{`⚠ ${sanitizeText(err, Math.max(8, cols - 4))}`}</Text>}
@@ -1794,14 +1794,13 @@ async function todoAction($: EngineInterface, kind: string, arg?: string | numbe
   await loadTodos($, home, slug, true)
 }
 
-// ── Improve: the footer prompt box and the Improve tab share one proposal (improveAtom). Presses write it and
-// ask the model; a draw only reads it. The box text is never touched by a failure or a Discard. ──
+// ── Improve: Claude Code's prompt line and the Improve tab share one proposal (improveAtom). Presses write it and
+// ask the model; a draw only reads it. The prompt line is never touched by a failure or a Discard. ──
 
 const IMPROVE_STORE_KEY = 'improveHistory'
 const IMPROVE_KEEP = 20
 const IMPROVE_SAVED_CHARS = 4000 // the store is one 4 MiB file shared with wake: a pasted wall of text must not fill it
 let improveSeq = 0 // two Improve presses inside one clock tick still get two ids
-let improveSending = false
 
 /** the open improvement, changed only while it is still the one that asked */
 const patchFlow = ($: EngineInterface, id: string, change: Partial<MkImproveFlow>): Promise<unknown> =>
@@ -1919,15 +1918,12 @@ async function loadImproveHistory($: EngineInterface): Promise<void> {
 /** One Improve press (footer or tab). `a` / `b` carry the question index, the option or the text. */
 async function improveAction($: EngineInterface, kind: ImproveKind, a?: string | number, b?: string): Promise<void> {
   const text = typeof a === 'string' ? a : b ?? ''
-  if (kind === 'text') { // every keystroke: no read first; a change after an Accept drops Undo, so it never wipes later edits
-    await update($, improveAtom, prev => (prev.text === text ? prev : { ...prev, text, undo: null }))
-    return
-  }
   const s = await read($, improveAtom)
   const f = s.flow
   if (kind === 'improve' || (kind === 'retry' && f != null && f.step === 'error' && f.original.trim() === '')) {
     if (f != null && (f.step === 'asking' || f.step === 'writing')) return
-    const original = s.text.trim()
+    // the draft in Claude Code's own prompt line, read at the press (never rejects; '' with no box)
+    const original = (await $.prompt.read()).text.trim()
     const id = `${String(await $.clock.now())}-${String(++improveSeq)}`
     if (original === '') {
       await update($, improveAtom, prev => ({ ...prev, flow: { ...newImproveFlow(id, '', 'error'), error: IMPROVE_EMPTY } }))
@@ -1935,33 +1931,33 @@ async function improveAction($: EngineInterface, kind: ImproveKind, a?: string |
     }
     await update($, improveAtom, prev => ({ ...prev, flow: newImproveFlow(id, original) }))
     improveLater($, id, 'rewrite', () => improveWrite($, id))
-  } else if (kind === 'accept' || (kind === 'send' && f != null && canAccept(f) && text.trim() === f.original.trim())) {
-    // the box takes the proposal (Enter in the box does too while one is on show for the text still in it); the text it held is kept for Undo.
-    // Decided inside the update, so a second press finds the flow gone and cannot overwrite that Undo text.
+  } else if (kind === 'accept') {
+    // the proposal goes into the prompt line over the draft; the text it replaced is kept for Undo
     if (f == null || !canAccept(f)) return
-    await update($, improveAtom, prev => (prev.flow != null && prev.flow.id === f.id && canAccept(prev.flow) ? { text: finalText(prev.flow), undo: prev.text, flow: null } : prev))
+    const proposal = finalText(f)
+    const before = await $.prompt.read()
+    const filled = await $.prompt.fill({ text: proposal, mode: 'replace' })
+    if (!filled.isFilled) {
+      // a dialog holds the box: the proposal stays on show, so Accept can be tried again
+      await patchFlow($, f.id, { note: IMPROVE_FILL_FAILED })
+      return
+    }
+    await update($, improveAtom, prev => (prev.flow != null && prev.flow.id === f.id && canAccept(prev.flow)
+      ? { ...prev, undo: before.text, written: filled.text, flow: null }
+      : prev))
   } else if (kind === 'discard') {
     await update($, improveAtom, prev => ({ ...prev, flow: null }))
   } else if (kind === 'undo') {
-    await update($, improveAtom, prev => (prev.undo == null ? prev : { ...prev, text: prev.undo, undo: null }))
-  } else if (kind === 'send') {
-    // Enter in the box: the person's own words go to the session; the box clears only once they are in
-    if (text.trim() === '' || improveSending) return
-    if (text.trim().startsWith('/')) { // prompt.submit does not run slash commands, so say so instead of sending it as plain text
-      const slashId = `${String(await $.clock.now())}-${String(++improveSeq)}`
-      await update($, improveAtom, prev => ({ ...prev, flow: { ...newImproveFlow(slashId, '', 'error'), error: IMPROVE_SLASH } }))
+    // only while the line still holds what Accept wrote: newer typing is never overwritten
+    if (s.undo == null) return
+    const box = await $.prompt.read()
+    if (s.written != null && box.text !== s.written) {
+      await update($, improveAtom, prev => ({ ...prev, undo: null, written: null }))
       return
     }
-    improveSending = true
-    try {
-      const sent = await $.prompt.submit({ text, asUser: true })
-      if (sent.drop != null) return
-      await update($, improveAtom, prev => (prev.text.trim() === text.trim() ? { text: '', undo: null, flow: null } : prev))
-    } catch {
-      // the prompt was not taken: the box keeps the text
-    } finally {
-      improveSending = false
-    }
+    const filled = await $.prompt.fill({ text: s.undo, mode: 'replace' })
+    if (!filled.isFilled) return // the Undo chip stays for a retry
+    await update($, improveAtom, prev => (prev.undo === s.undo ? { ...prev, undo: null, written: null } : prev))
   } else if (kind === 'open') {
     const saved = (await read($, improveHistoryAtom)).find(x => x.id === a)
     if (saved == null) return
@@ -2269,8 +2265,19 @@ async function refreshSafe($: EngineInterface, options: PluginOptions, cwd: stri
       }
     }
   } finally {
+    await dropStaleUndo($).catch(() => {})
     endStoreTick() // the answer stays for an outside-tick caller while it is fresh
   }
+}
+
+/** Undo stands only while the prompt line still holds what Accept wrote: one cheap read per tick, and only while
+ *  an Undo is held. Typing since then drops it, so the chip never offers to overwrite newer text. */
+async function dropStaleUndo($: EngineInterface): Promise<void> {
+  const s = await read($, improveAtom)
+  if (s.undo == null || s.written == null) return
+  const box = await $.prompt.read()
+  if (box.text === s.written) return
+  await update($, improveAtom, prev => (prev.undo === s.undo ? { ...prev, undo: null, written: null } : prev))
 }
 
 /** Polls mk-usage.py for this project: `--providers` from the project yaml when it lists any, else whatever CodexBar has enabled. */
@@ -3139,8 +3146,6 @@ export function openWaiting(asks: readonly unknown[], run: MkRun | null): number
   return asks.length > 0 ? asks.length : run?.waiting ? 1 : 0
 }
 
-/** a dashed rule (not the tab bar's solid one), the Improve rows (card, prompt box, chips), then the counts row; the
- *  pane's flexGrow spacer above it pins them to the bottom. The Improve tab draws the proposal in full, so it passes `card` false. */
 function PaneFooter(els: Els, snap: MkSnapshot, waiting: number, cols: number, improve: ImproveView, ui: TabUi, card: boolean) {
   const { Box, Text } = els
   const groups = snap.run ? laneGroups(snap.run) : []

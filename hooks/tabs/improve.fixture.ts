@@ -4,7 +4,6 @@ import type { ImproveView } from './improve'
 
 export const IMPROVE_FIXTURE: ImproveView = {
   mock: true,
-  text: 'Check all the files with type errors.',
   undo: null,
   history: [
     {

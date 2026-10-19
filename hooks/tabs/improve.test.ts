@@ -132,20 +132,17 @@ test('the fixture view is the design sample, marked MOCK on the tab only', () =>
   expect(flat(tab(viewOf()).tree)).not.toContain('MOCK')
 })
 
-test('footer: the prompt row, the solid Improve chip with black bold text, two dashed + tool slots', () => {
-  const { tree, calls } = footer(viewOf({ flow: null, text: 'fix the build', history: [] }))
+test('footer: the solid Improve chip with black bold text and two dashed + tool slots sit above the counts, and no prompt field', () => {
+  const { tree, calls } = footer(viewOf({ flow: null, history: [] }))
   const f = flat(tree)
-  expect(f).toContain('❯')
   const chip = textOf(tree, '✦ Improve')
   expect(chip?.props).toMatchObject({ backgroundColor: ROLE.live.fg, color: PALETTE.bg, bold: true })
   expect(texts(tree).filter(s => s === '┊ + tool ┊')).toHaveLength(2)
-  expect(inputs.get('improve-q')?.props.value).toBe('fix the build')
-  expect(inputs.get('improve-q')?.props.rows).toBe(1)
-  // a press and the box's own callbacks each fire exactly their kind
+  // the prompt is Claude Code's own line now: the footer draws no field and no `❯` row for it
+  expect(f).not.toContain('❯')
+  expect(inputs.get('improve-q')).toBeUndefined()
   presses.get('improve-f-go')?.()
-  inputs.get('improve-q')?.onInput?.('fix the build now')
-  inputs.get('improve-q')?.onSubmit('fix the build now')
-  expect(calls).toEqual([['improve', undefined, undefined], ['text', 'fix the build now', undefined], ['send', 'fix the build now', undefined]])
+  expect(calls).toEqual([['improve', undefined, undefined]])
 })
 
 test('footer: the Undo chip shows only after an accept, beside Improve', () => {
@@ -154,14 +151,6 @@ test('footer: the Undo chip shows only after an accept, beside Improve', () => {
   expect(flat(tree)).toContain('↶ Undo')
   presses.get('improve-f-undo')?.()
   expect(calls).toEqual([['undo', undefined, undefined]])
-})
-
-test('footer: the box grows to four rows for a long prompt and the chip row drops slots that do not fit', () => {
-  footer(viewOf({ flow: null, text: 'word '.repeat(80) }))
-  expect(inputs.get('improve-q')?.props.rows).toBe(4)
-  // 36 cols with Undo: Improve + Undo + one slot fit (11 + 8 + 10 + gaps), the second slot is dropped
-  expect(texts(footer(viewOf({ flow: null, undo: 'x' }), 36).tree).filter(s => s.includes('+ tool'))).toHaveLength(1)
-  expect(texts(footer(viewOf({ flow: null, undo: null }), 36).tree).filter(s => s.includes('+ tool'))).toHaveLength(2)
 })
 
 test('footer card: IMPROVED PROMPT with the counts, the struck original, the bright new text, Accept / Run Wizard / Discard', () => {
@@ -279,7 +268,7 @@ test('tab review: counts follow the proposal; editing shows the field and the li
 test('tab empty state: the hint, then the saved improvements; a click reopens one', () => {
   const { tree, calls } = tab(viewOf({ flow: null }))
   const f = flat(tree)
-  expect(said(tree)).toContain('Type a prompt in the footer and press Improve.')
+  expect(said(tree)).toContain('Type a prompt in Claude Code’s prompt line and press ✦ Improve.')
   expect(f).toContain('RECENT')
   expect(f).toContain('Check all the files with type')
   presses.get('improve-t-h1')?.()
@@ -316,7 +305,7 @@ test('nothing drawn is wider than the pane at 36, 46 and 80 columns; long text a
   for (const cols of [36, 46, 80]) {
     for (const flow of flows) {
       for (const undo of [null, 'old'] as const) {
-        const v = viewOf({ flow, undo, text: messy, history })
+        const v = viewOf({ flow, undo, history })
         for (const [name, tree] of [['footer', footer(v, cols, true, elsNoInput).tree], ['tab', tab(v, cols).tree]] as const) {
           // a Card's content is 4 cells narrower than the pane (border + padding); everything else is pane wide
           const over = rows(tree).filter(r => (r.inCard ? r.w > cols - 4 : r.w > cols))
@@ -393,16 +382,20 @@ test('F9: no Box shares a key with the Button inside it, and every key is drawn 
   }
 })
 
-test('F10: the footer box is as many rows tall as the prompt has lines (up to four)', () => {
-  footer(viewOf({ flow: null, text: 'a\nb\nc' }))
-  expect(inputs.get('improve-q')?.props.rows).toBe(3)
-  footer(viewOf({ flow: null, text: 'a\n\n\n\n\nb' }))
-  expect(inputs.get('improve-q')?.props.rows).toBe(4)
-  footer(viewOf({ flow: null, text: '' }))
-  expect(inputs.get('improve-q')?.props.rows).toBe(1)
+test('F10: the footer chip row drops the slots that do not fit, and the Improve chip always shows', () => {
+  for (const cols of [36, 39, 40, 46]) {
+    const { tree } = footer(viewOf({ flow: null, undo: 'x' }), cols)
+    expect(textOf(tree, '✦ Improve'), `Improve at ${cols}`).toBeTruthy()
+    expect(textOf(tree, '↶ Undo'), `Undo at ${cols}`).toBeTruthy()
+  }
+  // 36 cols with Undo: Improve + Undo + one slot fit (11 + 8 + 10 + gaps), the second slot is dropped
+  expect(texts(footer(viewOf({ flow: null, undo: 'x' }), 36).tree).filter(s => s.includes('+ tool'))).toHaveLength(1)
+  expect(texts(footer(viewOf({ flow: null, undo: null }), 36).tree).filter(s => s.includes('+ tool'))).toHaveLength(2)
 })
 
-test('without an Input element the footer draws the typed text dim instead of failing', () => {
-  const { tree } = footer(viewOf({ flow: null, text: 'half typed' }), 46, true, elsNoInput)
-  expect(textNodes(tree).find(n => own(n) === 'half typed')?.props?.dimColor).toBe(true)
+test('without an Input element the footer and the tab still draw every non-field row', () => {
+  const { tree } = footer(viewOf({ flow: null, undo: 'x' }), 46, true, elsNoInput)
+  expect(textOf(tree, '✦ Improve')).toBeTruthy()
+  expect(textOf(tree, '↶ Undo')).toBeTruthy()
+  expect(flat(tab(viewOf()).tree)).toContain('BEFORE AND AFTER')
 })
