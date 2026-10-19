@@ -454,6 +454,13 @@ def check_plan(header, out, body=None):
         errors.append(f"duplicate subtask id {sid}")
 
     by_id = {p["id"]: p for p in phases if p["id"]}
+
+    def wave_of(p):
+        # a bad wave is already a warning below; order it as wave 1 so the wave checks
+        # never compare a str with an int
+        w = p["wave"]
+        return w if isinstance(w, int) and not isinstance(w, bool) else 1
+
     for n, p in enumerate(phases):
         pid = p["id"] or f"phase {n + 1}"
         if not p["id"]:
@@ -471,8 +478,8 @@ def check_plan(header, out, body=None):
                 else:
                     warnings.append(f"{pid}: dep {d!r} is not a phase id or <run>:<task>")
             elif d in by_id:
-                if by_id[d] is not p and by_id[d]["wave"] > p["wave"]:
-                    errors.append(f"{pid}: dep {d} is in a later wave ({by_id[d]['wave']} > {p['wave']})")
+                if by_id[d] is not p and wave_of(by_id[d]) > wave_of(p):
+                    errors.append(f"{pid}: dep {d} is in a later wave ({wave_of(by_id[d])} > {wave_of(p)})")
             else:
                 errors.append(f"{pid}: unknown dep {d}")
         if p["size"] not in SIZES:
@@ -516,7 +523,7 @@ def check_plan(header, out, body=None):
 
     waves = {}
     for p in phases:
-        waves.setdefault(p["wave"], []).append(p)
+        waves.setdefault(wave_of(p), []).append(p)
     for wave in sorted(waves):
         group = waves[wave]
         for i in range(len(group)):
@@ -530,7 +537,7 @@ def check_plan(header, out, body=None):
         if p["lane_group"]:
             lanes.setdefault(p["lane_group"], []).append(p)
     for g, group in sorted(lanes.items()):
-        ws = sorted({p["wave"] for p in group})
+        ws = sorted({wave_of(p) for p in group})
         if len(ws) > 1:
             errors.append(f"lane_group {g}: phases in different waves ({', '.join(str(w) for w in ws)})")
 
@@ -2411,6 +2418,10 @@ def self_test():
         bad("self-dep", phase("P1", deps='"P1"'), "dep cycle: P1 -> P1")
         bad("later-wave", phase("P1", deps='"P2"') + "\n" + phase("P2", wave=2),
             "dep P2 is in a later wave")
+        # a str wave is a warning; it must not make the wave checks compare str with int
+        q = write("str-wave.md", plan_text(phases=phase("P1", wave='"2"') + "\n" + phase("P2") + "\n"))
+        out = mk("check", q)
+        assert any("wave '2' is not an int" in w for w in out["warnings"]), out
         bad("size", phase("P1", size="huge"), "bad size 'huge'")
         bad("risk", phase("P1", risk="wild"), "bad risk 'wild'")
         bad("review", phase("P1", review="deep"), "bad review 'deep'")
