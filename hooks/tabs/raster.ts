@@ -9,7 +9,7 @@
 // and its fallback (a SmoothBar or a glyph Text) when it does not — the
 // desktop and mobile surfaces have no Raster.
 import type { Elements, RenderElement } from 'claude-code'
-import { PALETTE, ROLE, rgbWord } from './palette'
+import { PALETTE, ROLE, rgbWord, THEME } from './palette'
 import type { PaletteRole } from './palette'
 
 type Els = Elements[keyof Elements]
@@ -103,7 +103,7 @@ function memoize(key: string, build: () => RasterSpec): RasterSpec {
  *  position, the rest on the track; the cell at `floorPct` carries a mut
  *  background — the floor tick under the bar (Kit.dc.html's grad()). */
 export function gradientBar(pct: number, cols: number, stops: readonly string[], floorPct?: number): RasterSpec {
-  return memoize(cacheKey([pct, cols, [...stops], floorPct]), () => {
+  return memoize(cacheKey([THEME.name, pct, cols, [...stops], floorPct]), () => {
     const width = Math.max(1, Math.floor(cols))
     const filled = Math.round((clampPct(pct) / 100) * width)
     const floor = floorPct == null
@@ -169,19 +169,19 @@ export function stageBar(done: number, current: number, total: number, cols: num
   const n = Math.max(1, Math.floor(total))
   const colors: string[] = []
   for (let i = 0; i < n; i++) colors.push(i < done ? PALETTE.grn : i === current ? PALETTE.blue : PALETTE.track)
-  return memoize(cacheKey(['stage', done, current, total, cols, colors]), () => strip(colors, cols))
+  return memoize(cacheKey([THEME.name, 'stage', done, current, total, cols, colors]), () => strip(colors, cols))
 }
 
 /** One segment per lane, coloured by that lane's role (Lanes tab). */
 /** A strip from plain `#rrggbb` colours, one segment per entry (the Plan tab's five status colours). */
 export function colorStrip(colors: readonly string[], cols: number): RasterSpec {
   const list = colors.length > 0 ? colors : [PALETTE.track]
-  return memoize(cacheKey(['colorStrip', [...colors], cols]), () => strip(list, cols))
+  return memoize(cacheKey([THEME.name, 'colorStrip', [...colors], cols]), () => strip(list, cols))
 }
 
 export function laneStrip(states: readonly PaletteRole[], cols: number): RasterSpec {
   const mapped = states.map(s => ROLE[s]?.fg ?? PALETTE.track)
-  return memoize(cacheKey(['laneStrip', [...states], cols]), () => strip(mapped, cols))
+  return memoize(cacheKey([THEME.name, 'laneStrip', [...states], cols]), () => strip(mapped, cols))
 }
 
 /** The Raster when the element table has one (the terminal), the fallback
@@ -196,6 +196,8 @@ export function pickBar(els: Els, key: string, spec: RasterSpec, fallback: Rende
  *  true) keeps the table whole — so `pickBar` above falls back to its
  *  eighth-block bar exactly as on a surface with no Raster. */
 export function withRaster(els: Els, raster: unknown): Els {
-  if (raster === false) return { ...els, Raster: undefined } as unknown as Els
-  return els
+  if (raster !== false) return els
+  if (!('Raster' in els)) return els
+  const { Raster: _drop, ...rest } = els
+  return rest as Els
 }
