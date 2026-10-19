@@ -5,8 +5,9 @@ import { composeArgs, mockFs, mockWorld, sessionStart, setRun, worldFiles, world
 
 test('compose adds a session-scoped section while a run is active', { plugins: [worldFixtures] }, async ($, on) => {
   mockFs(on, worldFiles())
-  mockWorld(on)
+  const clock = mockWorld(on)
   await $.session.start(sessionStart())
+  await clock.advance(0) // R3: session.start no longer blocks on the first load
   const { sections } = await $.prompt.compose(composeArgs())
   const mk = sections.filter(s => s.id === 'matrixkoder:run')
   expect(mk).toHaveLength(1)
@@ -24,8 +25,9 @@ test('compose adds a session-scoped section while a run is active', { plugins: [
 
 test('compose is unchanged without a run', async ($, on) => {
   mockFs(on, {}, [])
-  mockWorld(on)
+  const clock = mockWorld(on)
   await $.session.start(sessionStart())
+  await clock.advance(0) // R3: session.start no longer blocks on the first load
   const { sections } = await $.prompt.compose(composeArgs())
   expect(sections.filter(s => s.id === 'matrixkoder:run')).toHaveLength(0)
 })
@@ -39,8 +41,9 @@ test('long next/question are capped and control-stripped, counts survive', { plu
     run.waiting = { question: `approve\n${'y'.repeat(300)}\ttab`, options: ['a', 'b'], rec: 'a' }
   })
   mockFs(on, files)
-  mockWorld(on)
+  const clock = mockWorld(on)
   await $.session.start(sessionStart())
+  await clock.advance(0) // R3: session.start no longer blocks on the first load
   const { sections } = await $.prompt.compose(composeArgs())
   const mk = sections.filter(s => s.id === 'matrixkoder:run')
   expect(mk).toHaveLength(1)
@@ -58,8 +61,9 @@ test('long next/question are capped and control-stripped, counts survive', { plu
 
 test('solo mode: the section is exactly the solo line, no run lines', { plugins: [worldFixtures], options: { mode: 'solo' } }, async ($, on) => {
   mockFs(on, worldFiles())
-  mockWorld(on)
+  const clock = mockWorld(on)
   await $.session.start(sessionStart())
+  await clock.advance(0) // R3: session.start no longer blocks on the first load
   const { sections } = await $.prompt.compose(composeArgs())
   const mk = sections.filter(s => s.id === 'matrixkoder:run')
   expect(mk).toHaveLength(1)
@@ -68,8 +72,9 @@ test('solo mode: the section is exactly the solo line, no run lines', { plugins:
 
 test('a missing mode (orchestrator) names the mode and still carries the run lines', { plugins: [worldFixtures] }, async ($, on) => {
   mockFs(on, worldFiles())
-  mockWorld(on)
+  const clock = mockWorld(on)
   await $.session.start(sessionStart())
+  await clock.advance(0) // R3: session.start no longer blocks on the first load
   const { sections } = await $.prompt.compose(composeArgs())
   const section = sections.find(s => s.id === 'matrixkoder:run')
   expect(section?.text).toContain('mode orchestrator')
@@ -94,8 +99,9 @@ const reportProc = (stdout: string, exitCode = 0) => (argv: readonly string[]) =
 
 test('a fidelity run with open rows gets one banner line with counts and the first ids', { plugins: [worldFixtures] }, async ($, on) => {
   mockFs(on, worldFiles())
-  mockWorld(on, { process: reportProc(bannerStatus()) })
+  const clock = mockWorld(on, { process: reportProc(bannerStatus()) })
   await $.session.start(sessionStart())
+  await clock.advance(0) // R3: session.start no longer blocks on the first load
   const { sections } = await $.prompt.compose(composeArgs())
   const banner = sections.filter(s => s.id === 'matrixkoder:red')
   expect(banner).toHaveLength(1)
@@ -110,8 +116,9 @@ test('no banner for a green run, a legacy run, a failed status read, or solo mod
   let out = bannerStatus({ green: true, red: 0, rework: 0, due: 0, rows: [] })
   let code = 0
   mockFs(on, worldFiles())
-  mockWorld(on, { process: (argv) => reportProc(out, code)(argv) })
+  const clock = mockWorld(on, { process: (argv) => reportProc(out, code)(argv) })
   await $.session.start(sessionStart())
+  await clock.advance(0) // R3: session.start no longer blocks on the first load
   const banner = async () => (await $.prompt.compose(composeArgs())).sections.filter(s => s.id === 'matrixkoder:red')
   expect(await banner()).toHaveLength(0) // green
   out = bannerStatus({ fidelity: false })
@@ -125,8 +132,9 @@ test('no banner for a green run, a legacy run, a failed status read, or solo mod
 
 test('solo mode shows no banner', { plugins: [worldFixtures], options: { mode: 'solo' } }, async ($, on) => {
   mockFs(on, worldFiles())
-  mockWorld(on, { process: reportProc(bannerStatus()) })
+  const clock = mockWorld(on, { process: reportProc(bannerStatus()) })
   await $.session.start(sessionStart())
+  await clock.advance(0) // R3: session.start no longer blocks on the first load
   const { sections } = await $.prompt.compose(composeArgs())
   expect(sections.filter(s => s.id === 'matrixkoder:red')).toHaveLength(0)
 })

@@ -2,10 +2,12 @@
 // compact 36-col, inline hint, first-run and no-run states. Fixtures arrive
 // via $.fs.write (inline fixtures plugin); fs is served in memory.
 import { test, expect } from 'claude-code/testing'
-import type { Plugin } from 'claude-code/testing'
+import type { Engine, Plugin } from 'claude-code/testing'
 import type { On, ConfigRow, FsEntry } from 'claude-code'
 import { snapshotCount, DATA_DIR, NOW, PROJECT_DIR, RUN_PATH, RUNS_INDEX, USAGE_PATH, agentOf, agentsOf, mockFs, mockWorld, paneProps, sessionStart, sessionStartIn, setRun, setUsage, tasksOf, worldFiles, worldFixtures } from './testkit'
 import type { Files, MockWorld } from './testkit'
+
+
 import { PANE_ID, parseYamlAgents } from './data'
 import { filesFocus, footerParts, liveOverviewView, modelShort, openWaiting, planActionPatch, resolveMainCheckout, runPlanAction, taskNote, usageShorts, waitingPane, waitingPaneView } from './dashboard'
 import type { MkSnapshot } from '../types'
@@ -286,8 +288,9 @@ test('missing usage triggers the initial poll with the right argv', { plugins: [
   const polls: (readonly string[])[] = []
   const clock = mockWorld(on, { process: argv => { if (argv.some(a => a.endsWith('scripts/mk-usage.py'))) polls.push(argv) } })
   await $.session.start(sessionStart())
-  // the cold-start poll is fire-and-forget: advance(0) settles the event loop so its dispatch chain reaches process.run
-  await clock.advance(0)
+  // P1.3: the cold-start poll is scheduled 5 s out (it must not stack onto the first load),
+  // so the first tick of the mock clock is what starts it.
+  await clock.advance(5000)
   expect(polls.length).toBe(1)
   const first = polls[0]
   if (!first) throw new Error('no poll ran')
@@ -305,8 +308,8 @@ test('a project yaml scopes the usage poll: --providers from usage.providers', {
   const polls: (readonly string[])[] = []
   const clock = mockWorld(on, { process: argv => { if (argv.some(a => a.endsWith('scripts/mk-usage.py'))) polls.push(argv) } })
   await $.session.start(sessionStart())
-  // the cold-start poll is fire-and-forget: advance(0) settles the event loop so its dispatch chain reaches process.run
-  await clock.advance(0)
+  // P1.3: the cold-start poll is scheduled 5 s out, not fired with the first load.
+  await clock.advance(5000)
   expect(polls.length).toBe(1)
   const first = polls[0]
   if (!first) throw new Error('no poll ran')
@@ -315,6 +318,26 @@ test('a project yaml scopes the usage poll: --providers from usage.providers', {
   expect(first[2]).toBe('--once')
   expect(first[3]).toBe('--providers')
   expect(first[4]).toBe('claude,codex,antigravity')
+})
+
+test('P1.3.a4: no usage poll happens in the first 5 s after start on the mock clock', { plugins: [worldFixtures] }, async ($, on) => {
+  // The cold-start poll is scheduled with $.clock.after(5000, ...), so a start that is
+  // missing usage.json still polls nothing for the first tick. FAILS ON THE OLD CODE, which
+  // polled straight from startLoop (no timer involved).
+  const files = worldFiles()
+  delete files['/fixtures/usage.json']
+  delete files[USAGE_PATH]
+  mockFs(on, files)
+  const polls: (readonly string[])[] = []
+  const clock = mockWorld(on, { process: argv => { if (argv.some(a => a.endsWith('scripts/mk-usage.py'))) polls.push(argv) } })
+  await $.session.start(sessionStart())
+  await clock.advance(4999)
+  expect(polls, 'nothing polls inside the 5 s window').toHaveLength(0)
+  await clock.advance(1)
+  expect(polls, 'the one-shot fires at 5 s').toHaveLength(1)
+  // and it is a one-shot, not an interval: the next 5 s adds no second call
+  await clock.advance(5000)
+  expect(polls, 'started at most once for a cold start').toHaveLength(1)
 })
 
 test('two session.start arm exactly one refresh timer', { plugins: [worldFixtures] }, async ($, on) => {
@@ -340,6 +363,9 @@ test('/mk re-arms the refresh loop after /clear (session.end, no session.start)'
   await clock.advance(5000)
   expect(snapshotCount()).toBe(1) // loop dead: only the start load
   await $.command.run({ command: 'mk', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 165 } })
+  // P1.3: /mk arms the loop and starts the first load in the background, so settle one step
+  // before counting it (the number itself is unchanged).
+  await clock.advance(0)
   expect(snapshotCount()).toBe(2) // /mk reloads at once
   await clock.advance(5000)
   expect(snapshotCount()).toBe(3) // and ticks again
@@ -3171,3 +3197,395 @@ test('Files F4.3: review fix 6, a missing lane root that comes back replaces the
   expect(await ui.find({ text: /missing root/ })).toBeUndefined()
 })
 
+
+/* ---------------------------------------------------------------------------
+ * P1 — dedupe and parallelize the tick and the start (dashboard-perf-r1)
+ *
+ * ONE counting fake runner for the whole tick: every `python3 <script>` argv the
+ * pane spawns is recorded and answered with the fixture shapes the tests above
+ * already use (`mkdb.py projects|overview|todo|run-snapshot`, `mk-bus.py pending`,
+ * `mk-config.py get`). Only the process runner and the clock are faked — refreshSafe,
+ * loadSnapshot and every refresher under test are the production ones.
+ * ------------------------------------------------------------------------- */
+
+/** One `python3 …` spawn of the pane, as the counting runner saw it. */
+type Spawn = { script: string; argv: string[] }
+
+const P1_HOME = '/tmp/mk-p1-home'
+const P1_SLUG = 'matrixkoder'
+const P1_C2 = `${P1_HOME}/projects/${P1_SLUG}`
+/** the project yaml in the wizard's emitter shape: agents + usage providers */
+const P1_PROJECT_YAML = [
+  'agents:',
+  '  claude: { available: true }',
+  'usage:',
+  '  source: codexbar',
+  '  poll_min: 5',
+  '  providers: [claude]',
+].join('\n')
+
+const okReply = (body: unknown) => ({
+  value: { exitCode: 0, stdout: JSON.stringify(body), stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
+})
+
+/** A promise plus its resolver: this tsconfig's lib has no `Promise.withResolvers`, so the
+ *  executor form is the only one available for a deferred the test releases later. */
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>(res => { resolve = res })
+  return { promise, resolve }
+}
+
+/** Every `mkdb.py projects --json` spawn in the recorded list. */
+const projectReads = (spawns: readonly Spawn[]): Spawn[] =>
+  spawns.filter(s => s.script === 'mkdb.py' && s.argv.includes('projects'))
+
+/** Settle every fire-and-forget chain a tick left, without moving time. */
+async function settle(clock: MockWorld, steps = 40): Promise<void> {
+  for (let i = 0; i < steps; i++) await clock.advance(0)
+}
+
+/**
+ * The worst-case P1 world and its counting runner. `state.projects` and `state.run`
+ * are live: a test rewrites them between two ticks to prove the cache is dropped.
+ * Every reader is answered, so nothing short-circuits before its own spawn:
+ *   - `mkdb.py projects --json`  → one row naming this project (C2 db_path)
+ *   - `mkdb.py overview --json`  → that row + one plan (Cards and the Plan list)
+ *   - `mkdb.py run-snapshot --json` → the run fixture (the pane's own read)
+ *   - `mkdb.py todo list`        → one open item (only while the Todo tab is open)
+ *   - `mk-bus.py pending`        → a live empty ask list
+ *   - `mk-config.py get`         → true (bus enabled)
+ */
+function p1Runner(spawns: Spawn[]) {
+  const state = {
+    projects: [
+      { slug: P1_SLUG, name: P1_SLUG, repo: PROJECT_DIR, data_dir: DATA_DIR, mode: 'home', db_path: `${P1_C2}/mk.db` },
+    ] as Record<string, unknown>[],
+    run: null as unknown,
+  }
+  const process = (argv: readonly string[]) => {
+    const script = (argv[1] ?? '').split('/').pop() ?? ''
+    spawns.push({ script, argv: [...argv] })
+    switch (script) {
+      case 'mkdb.py':
+        if (argv.includes('projects')) return okReply({ ok: true, projects: state.projects })
+        if (argv.includes('overview')) {
+          return okReply({
+            ok: true,
+            projects: state.projects.map(r => ({ slug: r.slug, repo: r.repo, data_dir: r.data_dir, db_path: r.db_path })),
+            plans: [{ project: P1_SLUG, plan: 'alpha', title: 'Alpha', status: 'running', created: 'c', live_run: null, counts: { building: 1 } }],
+          })
+        }
+        if (argv.includes('todo')) return okReply({ ok: true, todos: [{ id: 1, text: 'one', status: 'open', created: 'c' }] })
+        return okReply({ ok: true, runs: [], active: 'wfv2', waits: [], store: true, run: state.run })
+      case 'mk-bus.py':
+        return okReply({ ok: true, run: 'wfv2', pending: [] })
+      case 'mk-config.py':
+        return okReply({ ok: true, value: true })
+      default:
+        return undefined
+    }
+  }
+  return { process, state }
+}
+
+/** The world one worst-case tick reads: fixtures, both stores on disk, every tab's data due. */
+function p1World(on: On, spawns: Spawn[], opts: { storeFails?: boolean } = {}) {
+  const files = worldFiles()
+  files[`${P1_C2}/project.yaml`] = P1_PROJECT_YAML
+  const fs = mockFs(on, files, [DATA_DIR, `${PROJECT_DIR}/.git`, P1_C2])
+  const world = p1Runner(spawns)
+  world.state.run = JSON.parse(files[RUN_PATH] ?? '{}') as unknown
+  const runner = world.process
+  on('fs.exists', (_$, e) => ({ value: [`${P1_HOME}/mk.db`, `${P1_C2}/mk.db`, `${DATA_DIR}/mk.db`].includes(String(e.path)) }))
+  const clock = mockWorld(on, {
+    env: { HOME: '/home/mk', MK_HOME: P1_HOME },
+    process: argv => {
+      // the refused-resolve case: every root-store read fails at the spawn
+      if (opts.storeFails === true && argv.some(a => a.endsWith('mkdb.py')) && argv.includes('projects')) {
+        spawns.push({ script: 'mkdb.py', argv: [...argv] })
+        throw new Error('spawn python3 ENOENT')
+      }
+      return runner(argv)
+    },
+  })
+  return { clock, world, files, fs }
+}
+
+/** The production refreshSafe, driven through a real session.start and a real tick. */
+async function p1Start($: Engine, on: On, opts: { storeFails?: boolean } = {}) {
+  const spawns: Spawn[] = []
+  const { clock, world, files, fs } = p1World(on, spawns, opts)
+  await $.session.start(sessionStart())
+  await settle(clock)
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  return { spawns, clock, world, files, fs, ui }
+}
+
+// ── P1.1: one project/dataDir read per tick ──────────────────────────────────
+
+test('P1.1.a1: a worst-case tick runs `mkdb.py projects --json` at most once', { plugins: [worldFixtures] }, async ($, on) => {
+  // FAILS ON THE OLD CODE: loadSnapshot, refreshPending, refreshPlans, refreshTodos and
+  // yamlPathFor each resolved the data dir on their own, so one due tick started the
+  // command once per caller (about 5).
+  const { spawns, clock } = await p1Start($, on)
+  expect(projectReads(spawns).length, 'the start load reads the projects table once').toBeLessThanOrEqual(1)
+  // ONE refresh tick: every refresher that resolves the data dir runs off the same answer
+  spawns.length = 0
+  await clock.advance(5000)
+  await settle(clock)
+  expect(projectReads(spawns).length, `reads: ${projectReads(spawns).map(r => r.argv.slice(2).join(' ')).join(' | ')}`).toBeLessThanOrEqual(1)
+})
+
+test('P1.1.a3: the tick answer is dropped, so a store change between two ticks is seen', { plugins: [worldFixtures] }, async ($, on) => {
+  // FAILS ON THE OLD CODE (the second tick reads a memoised row forever if a cache is not dropped).
+  const { spawns, clock, world, ui } = await p1Start($, on)
+  // a SECOND project appears in the root store between two ticks
+  world.state.projects = [
+    ...world.state.projects,
+    { slug: 'added', name: 'added', repo: '/srv/added', data_dir: '/srv/added/.matrixkoder', mode: 'home', db_path: null },
+  ]
+  spawns.length = 0
+  await clock.advance(30_000)
+  await settle(clock)
+  // the Plan list renders from the root overview, which now names two plans' worth of rows
+  await ui.press({ key: 'dash-tab-plan' })
+  await settle(clock)
+  const overview = spawns.filter(s => s.script === 'mkdb.py' && s.argv.includes('overview'))
+  expect(overview.length, 'the next tick re-read the root store').toBeGreaterThan(0)
+  expect(projectReads(spawns).length, 'and the projects table with it').toBeGreaterThan(0)
+})
+
+test('P1.1.a4: a refused projects resolve keeps today’s result in every refresher', { plugins: [worldFixtures] }, async ($, on) => {
+  // A refused/empty resolve must not throw out of the tick and must keep today's answer
+  // in each refresher: the pane still draws, the Plan list still renders from the root
+  // overview, and the Kanban tab still counts its open task from the project store.
+  const { spawns, clock, ui } = await p1Start($, on, { storeFails: true })
+  expect(projectReads(spawns).length, 'the refused read was attempted').toBeGreaterThan(0)
+  expect(await ui.find({ text: /workflows-v2|Alpha|No active orchestration/ }), 'the pane still drew').toBeTruthy()
+  await ui.press({ key: 'dash-tab-plan' })
+  await settle(clock)
+  expect(await ui.find({ text: /Alpha plan|Alpha|no plans yet/ }), 'no throw out of the tick').toBeTruthy()
+  await ui.press({ key: 'dash-tab-kanban' })
+  await settle(clock)
+  expect(await ui.find({ text: /Backlog|cards read failed|no store yet/ }), 'the Kanban tab still answers').toBeTruthy()
+})
+
+// ── P1.2: the two first reads run side by side ───────────────────────────────
+
+test('P1.2.a1: both first reads are pending at the same moment', { plugins: [worldFixtures] }, async ($, on) => {
+  // FAILS ON THE OLD CODE: loadSnapshot was awaited to completion before readRootOverview
+  // was even started, so the overview spawn could not exist while the snapshot was held.
+  // Both reads are held open here: on the old order only ONE of the two can ever be pending.
+  const heldSnapshot: Array<() => void> = []
+  const heldOverview: Array<() => void> = []
+  const clock = mockWorld(on, {
+    env: { HOME: '/home/mk', MK_HOME: P1_HOME },
+    process: argv => {
+      if (argv.some(a => a.endsWith('mkdb.py')) && argv.includes('run-snapshot')) {
+        const { promise, resolve } = deferred<ReturnType<typeof okReply>>()
+        heldSnapshot.push(() => resolve(okReply({ ok: true, runs: [], active: 'wfv2', waits: [], store: true, run: null })))
+        return promise
+      }
+      if (argv.some(a => a.endsWith('mkdb.py')) && argv.includes('overview')) {
+        const { promise, resolve } = deferred<ReturnType<typeof okReply>>()
+        heldOverview.push(() => resolve(okReply({ ok: true, projects: [], plans: [] })))
+        return promise
+      }
+      if (argv.includes('projects')) return okReply({ ok: true, projects: [] })
+      return okReply({ ok: true, pending: [], value: true, todos: [] })
+    },
+  })
+  on('fs.exists', (_$, e) => ({ value: [`${P1_HOME}/mk.db`, `${DATA_DIR}/mk.db`].includes(String(e.path)) }))
+  mockFs(on, worldFiles(), [DATA_DIR, `${PROJECT_DIR}/.git`])
+  // not awaited: the hook finishes with the held load, which is the whole point
+  const started = $.session.start(sessionStart())
+  for (let i = 0; i < 10; i++) await clock.advance(0)
+  expect(heldSnapshot.length, 'the snapshot read is pending').toBe(1)
+  expect(heldOverview.length, 'the overview read is pending at the same time').toBe(1)
+  for (const go of [...heldSnapshot, ...heldOverview]) go()
+  await started
+  await settle(clock)
+})
+
+test('P1.2.a2: a failing first read does not lose the other', { plugins: [worldFixtures] }, async ($, on) => {
+  // FAILS ON THE OLD CODE only in the sense that the old order made the overview
+  // unreachable after a snapshot throw; here the overview's own result still lands.
+  // The production refreshSafe runs: the snapshot spawn throws, the overview does not.
+  const clock = mockWorld(on, {
+    env: { HOME: '/home/mk', MK_HOME: P1_HOME },
+    process: argv => {
+      if (argv.some(a => a.endsWith('mkdb.py')) && argv.includes('run-snapshot')) throw new Error('spawn python3 ENOENT')
+      if (argv.some(a => a.endsWith('mkdb.py')) && argv.includes('overview')) {
+        return okReply({
+          ok: true,
+          projects: [],
+          plans: [{ project: P1_SLUG, plan: 'beta', title: 'Beta plan', status: 'running', created: 'c', live_run: null, counts: {} }],
+        })
+      }
+      if (argv.includes('projects')) return okReply({ ok: true, projects: [] })
+      return okReply({ ok: true, pending: [], value: true, todos: [] })
+    },
+  })
+  on('fs.exists', (_$, e) => ({ value: [`${P1_HOME}/mk.db`, `${DATA_DIR}/mk.db`].includes(String(e.path)) }))
+  mockFs(on, worldFiles(), [DATA_DIR, `${PROJECT_DIR}/.git`])
+  await $.session.start(sessionStart())
+  await settle(clock)
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  // The failed snapshot keeps today's answer on the Overview tab (readStoreSnapshot swallows
+  // the refusal into "null store"), while the overview read still lands on the Plan list.
+  expect(await ui.find({ text: 'No active orchestration run.' }), 'the failed snapshot is today’s NoRun panel').toBeTruthy()
+  await ui.press({ key: 'dash-tab-plan' })
+  await settle(clock)
+  expect(await ui.find({ text: /Beta plan|beta/ }), 'the overview result still reached the Plan list').toBeTruthy()
+})
+
+// ── P1.3: the session hands over before the first load finishes ──────────────
+
+/** A process answer that holds the pane's own store read open until `release()`. */
+function p1HeldRun(held: Array<() => void>, spawns: Spawn[]) {
+  return (argv: readonly string[]) => {
+    const script = (argv[1] ?? '').split('/').pop() ?? ''
+    spawns.push({ script, argv: [...argv] })
+    if (script === 'mkdb.py' && argv.includes('run-snapshot') && !argv.includes('--home')) {
+      const { promise, resolve } = deferred<ReturnType<typeof okReply>>()
+      held.push(() => resolve(okReply({ ok: true, runs: [], active: 'wfv2', waits: [], store: true, run: null })))
+      return promise
+    }
+    if (script === 'mkdb.py' && argv.includes('projects')) {
+      return okReply({ ok: true, projects: [{ slug: P1_SLUG, repo: PROJECT_DIR, data_dir: DATA_DIR, db_path: null }] })
+    }
+    if (script === 'mkdb.py' && argv.includes('overview')) return okReply({ ok: true, projects: [], plans: [] })
+    if (script === 'mkdb.py') return okReply({ ok: true, todos: [] })
+    return okReply({ ok: true, pending: [], value: true })
+  }
+}
+
+test('P1.3.a1 (session.start): the handler’s promise resolves while the first load is held open', { plugins: [worldFixtures] }, async ($, on) => {
+  // FAILS ON 9fa3f19, where the handler ended with `await firstLoad`, so the promise the engine
+  // waits on stayed pending until the load finished. (It also fails on 270da7b, where
+  // `await startLoop(...)` put the whole load in front of `return next(e)`.)
+  const held: Array<() => void> = []
+  const spawns: Spawn[] = []
+  const clock = mockWorld(on, { env: { HOME: '/home/mk', MK_HOME: P1_HOME }, process: p1HeldRun(held, spawns) })
+  on('fs.exists', (_$, e) => ({ value: [`${P1_HOME}/mk.db`, `${DATA_DIR}/mk.db`].includes(String(e.path)) }))
+  mockFs(on, worldFiles(), [DATA_DIR, `${PROJECT_DIR}/.git`])
+  // the promise the engine awaits: `$.session.start` resolves it when the hook returns
+  let handlerSettled = false
+  const started = $.session.start(sessionStart())
+  void started.then(() => { handlerSettled = true })
+  for (let i = 0; i < 12 && held.length === 0; i++) await clock.advance(0)
+  expect(held.length, 'the first load is held').toBe(1)
+  await settle(clock, 4)
+  expect(handlerSettled, 'the hook’s promise resolved with the load still pending').toBe(true)
+  // the pane drew from stored atoms meanwhile, and the load runs ONCE
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  expect(await ui.find({ text: /MatrixKoder|Overview/ }), 'the pane drew while the load was still pending').toBeTruthy()
+  expect(spawns.filter(s => s.script === 'mkdb.py' && s.argv.includes('run-snapshot') && !s.argv.includes('--home')).length, 'one first load').toBe(1)
+  for (const go of held) go()
+  await started
+  await settle(clock)
+})
+
+test('P1.3.a1 (reopen path): the re-arm returns while the first load is still held open', { plugins: [worldFixtures] }, async ($, on) => {
+  // The second startLoop caller: rearmLoop, reached by /mk, turn.start, a render and a focus.
+  // FAILS ON THE OLD CODE, where rearmLoop awaited startLoop -> refreshSafe before returning,
+  // so /mk could not return while that load was outstanding.
+  const held: Array<() => void> = []
+  const spawns: Spawn[] = []
+  const clock = mockWorld(on, { env: { HOME: '/home/mk', MK_HOME: P1_HOME }, process: p1HeldRun(held, spawns) })
+  on('fs.exists', (_$, e) => ({ value: [`${P1_HOME}/mk.db`, `${DATA_DIR}/mk.db`].includes(String(e.path)) }))
+  on('session.cwd', () => ({ value: PROJECT_DIR }))
+  on('session.end', () => ({ sessionId: 's1' }))
+  mockFs(on, worldFiles(), [DATA_DIR, `${PROJECT_DIR}/.git`])
+  const started = $.session.start(sessionStart())
+  for (let i = 0; i < 12 && held.length === 0; i++) await clock.advance(0)
+  expect(held.length, 'the start load is pending').toBe(1)
+  for (const go of held.splice(0)) go()
+  await started
+  await settle(clock)
+  await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: undefined } } as never)
+  spawns.length = 0
+  // /mk re-arms: its handler must return while the first load it started is outstanding.
+  // The command is NOT awaited yet — the assertion below is exactly that it settled anyway.
+  let returned = false
+  const cmd = $.command.run({ command: 'mk', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 165 } })
+  void cmd.then(() => { returned = true })
+  for (let i = 0; i < 12 && held.length === 0; i++) await clock.advance(0)
+  expect(held.length, 'the re-armed load is pending').toBe(1)
+  expect(returned, '/mk returned while that load was still pending').toBe(true)
+  expect(spawns.filter(s => s.script === 'mkdb.py' && s.argv.includes('run-snapshot') && !s.argv.includes('--home')).length, 'exactly one re-armed load').toBe(1)
+  for (const go of held) go()
+  await cmd
+  await settle(clock)
+})
+
+test('P1.3.a1 (brand + default tab): both arrive after next(), with the load still held', { plugins: [worldFixtures], options: { defaultTab: 'settings' } }, async ($, on) => {
+  // FAILS ON THE OLD CODE: `loadBrandVersion` and the default-tab write both sat behind
+  // `await startLoop`, which awaited the first load.
+  const held: Array<() => void> = []
+  const spawns: Spawn[] = []
+  const clock = mockWorld(on, { env: { HOME: '/home/mk', MK_HOME: P1_HOME }, process: p1HeldRun(held, spawns) })
+  on('fs.exists', (_$, e) => ({ value: [`${P1_HOME}/mk.db`, `${DATA_DIR}/mk.db`].includes(String(e.path)) }))
+  mockFs(on, worldFiles(), [DATA_DIR, `${PROJECT_DIR}/.git`])
+  const started = $.session.start(sessionStart())
+  await settle(clock, 12)
+  expect(held.length, 'the first load is held').toBe(1)
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  // defaultTab settings: the Settings tab is the open one, so its word is in the bar
+  expect(await ui.find({ text: /Settings/ }), 'the default tab landed before the load finished').toBeTruthy()
+  for (const go of held) go()
+  await started
+  await settle(clock)
+  await ui.redraw(paneProps(46))
+  expect(await ui.find({ text: 'MATRIXKODER' }), 'the brand header still drew').toBeTruthy()
+})
+
+// ── P1.4: the spawn bound ────────────────────────────────────────────────────
+
+test('P1.4.a1: one worst-case tick starts at most 6 Python processes', { plugins: [worldFixtures] }, async ($, on) => {
+  // FAILS ON THE OLD CODE: measured at 270da7b, one such tick started 8 processes, 4 of them
+  // the same `mkdb.py projects --json` (see the report's before/after numbers).
+  const { spawns, clock } = await p1Start($, on)
+  // the worst case: a refresh tick with every refresher due (Cards and Pending every tick)
+  spawns.length = 0
+  await clock.advance(5000)
+  await settle(clock)
+  const tick = spawns.filter(s => s.script === 'mkdb.py' || s.script === 'mk-bus.py' || s.script === 'mk-usage.py')
+  expect(projectReads(spawns).length, 'one projects read').toBeLessThanOrEqual(1)
+  expect(tick.length, `one tick's Python starts: ${tick.map(t => `${t.script} ${t.argv.slice(2).join(' ')}`).join(' | ')}`).toBeLessThanOrEqual(6)
+})
+
+// ── R3 FIX 3: a cold start whose first load failed still polls usage once ────
+
+test('P1.3.a4 (R3): a first load that rejects before its usage check still polls once, at 5 s', { plugins: [worldFixtures] }, async ($, on) => {
+  // FAILS ON 9fa3f19: there `const prev = await read($, snapshotAtom)` sat OUTSIDE the try, so a
+  // refused snapshot read rejected the whole first load — and `startLoop`'s 5 s one-shot only
+  // polls on a RESOLVED first load. `firstLoadDone` stayed false, `usageMissingAtLoad` false,
+  // and a cold start whose ledger is missing never polled: the pane kept "no ledger yet" for
+  // the whole poll interval. With the read moved inside the try the tick completes, the
+  // fallback (`usageMissingNow`) runs, and exactly one poll happens.
+  const files = worldFiles()
+  delete files['/fixtures/usage.json']
+  delete files[USAGE_PATH]
+  mockFs(on, files, [DATA_DIR, `${PROJECT_DIR}/.git`])
+  // the engine refuses the snapshot atom read: the first load cannot get its previous value
+  on('state.get', (_$, e, next) => (e.key === 'snapshot' ? { deny: 'state store unavailable' } : next(e)))
+  const polls: (readonly string[])[] = []
+  const clock = mockWorld(on, {
+    env: { HOME: '/home/mk', MK_HOME: P1_HOME },
+    process: argv => {
+      if (argv.some(a => a.endsWith('scripts/mk-usage.py'))) { polls.push([...argv]); return undefined }
+      if (argv.some(a => a.endsWith('mkdb.py')) && argv.includes('projects')) return okReply({ ok: true, projects: [] })
+      if (argv.some(a => a.endsWith('mkdb.py')) && argv.includes('overview')) return okReply({ ok: true, projects: [], plans: [] })
+      if (argv.some(a => a.endsWith('mkdb.py'))) return okReply({ ok: true, todos: [] })
+      return okReply({ ok: true, pending: [], value: true })
+    },
+  })
+  await $.session.start(sessionStart())
+  await clock.advance(4999)
+  expect(polls, 'nothing polls inside the 5 s window').toHaveLength(0)
+  await clock.advance(1)
+  await settle(clock, 20)
+  expect(polls, 'the failed first load still leaves exactly one cold-start poll').toHaveLength(1)
+})

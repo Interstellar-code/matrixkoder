@@ -82,25 +82,75 @@ export async function sessionCwd($: EngineInterface): Promise<string> {
   }
 }
 
+/** The one `mkdb.py projects --json` answer of the current tick, keyed by the global dir it
+ *  came from: two homes are two tables. Filled ONLY inside a tick (beginStoreTick), so a call
+ *  made outside one always resolves on its own — the three outside-tick callers (ensureBus,
+ *  ensureSettingsLoaded, projectProviders) reuse the tick's answer while it is still fresh. */
+let tickRows: { gdir: string; rows: MkProjectRow[] | null; at: number } | null = null
+/** true between beginStoreTick and endStoreTick. */
+let insideTick = false
+
+/** How long an answer outlives its tick for an outside-tick caller. A tick restarts the window
+ *  every 5 s, so this only bounds a tick that stopped (a dead loop). */
+const STORE_ROWS_FRESH_MS = 30_000
+
+/** Starts a new read window: the next store read runs `mkdb.py projects --json` again, so a
+ *  project added (or a store removed) between two ticks is seen on the next tick. */
+export function beginStoreTick(): void {
+  tickRows = null
+  insideTick = true
+}
+
+/** Closes the window. The answer stays for the outside-tick callers while it is fresh. */
+export function endStoreTick(): void {
+  insideTick = false
+}
+
+/** Forgets any answer — a new session must not read the previous one's table. */
+export function resetStoreMemo(): void {
+  tickRows = null
+  insideTick = false
+}
+
 /** The root store's projects table: the ONE `mkdb.py projects --json` spawn
  * `listedDataDir` and `projectYamlPath` share (C1 — no second reader of the same
  * table). null when the command fails or answers nothing; a caller then keeps
- * today's pre-migration paths. */
+ * today's pre-migration paths. Inside a tick the failure is memoised too: a refused resolve
+ * answers every caller in the tick the same null, without a retry storm. */
 async function storeRows($: EngineInterface, home: string | null): Promise<MkProjectRow[] | null> {
   const gdir = await globalDirOf($, home)
   if (gdir == null) return null
+  if (tickRows != null && tickRows.gdir === gdir && (insideTick || await isFresh($, tickRows.at))) return tickRows.rows
   try {
     const ran = await $.process.run(
       ['python3', join($.plugin.root, 'scripts/mkdb.py'), 'projects', '--json', '--home', gdir],
       { timeoutMs: 5000 },
     )
-    if (ran.exitCode !== 0) return null
+    if (ran.exitCode !== 0) return remember(gdir, null, await nowMs($))
     const parsed = parseJson(ran.stdout)
     const rows = isProjectsReply(parsed) ? parsed.projects : null
-    return Array.isArray(rows) ? rows as MkProjectRow[] : null
+    return remember(gdir, Array.isArray(rows) ? rows as MkProjectRow[] : null, await nowMs($))
   } catch {
-    return null // no python, or the command failed
+    return remember(gdir, null, await nowMs($)) // no python, or the command failed
   }
+}
+
+/** The answer, kept for the rest of the tick — and for an outside caller while it is fresh. */
+function remember(gdir: string, rows: MkProjectRow[] | null, at: number): MkProjectRow[] | null {
+  if (insideTick) tickRows = { gdir, rows, at }
+  return rows
+}
+
+async function nowMs($: EngineInterface): Promise<number> {
+  try {
+    return await $.clock.now()
+  } catch {
+    return Date.now()
+  }
+}
+
+async function isFresh($: EngineInterface, at: number): Promise<boolean> {
+  return (await nowMs($)) - at < STORE_ROWS_FRESH_MS
 }
 
 /** C3's migrated marker for a data dir: a root row whose `db_path` names THIS
