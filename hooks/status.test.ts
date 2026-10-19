@@ -6,8 +6,9 @@ import { DATA_DIR, NOW, RUNS_INDEX, RUN_PATH, agentOf, mockFs, mockWorld, sessio
 test('chip shows waiting-on-you over everything else', { plugins: [worldFixtures] }, async ($, on) => {
   const status: (string | undefined)[] = []
   mockFs(on, worldFiles())
-  mockWorld(on, { status: text => status.push(text) })
+  const clock = mockWorld(on, { status: text => status.push(text) })
   await $.session.start(sessionStart())
+  await clock.advance(0) // R3: session.start no longer blocks on the first load
   expect(status.at(-1)).toBe('⬡ mk · ⚠ 1 waiting on you · 1 building')
 })
 
@@ -19,8 +20,9 @@ test('chip falls back to the stalled template without a waiting item', { plugins
   files[RUN_PATH] = JSON.stringify(run)
   const status: (string | undefined)[] = []
   mockFs(on, files)
-  mockWorld(on, { status: text => status.push(text) })
+  const clock = mockWorld(on, { status: text => status.push(text) })
   await $.session.start(sessionStart())
+  await clock.advance(0) // R3: session.start no longer blocks on the first load
   expect(status.at(-1)).toBe('⬡ mk · ⚠ FIX6 stalled (11m) · 1 building') // stalled outranks plain progress
 })
 
@@ -30,6 +32,7 @@ test('toast fires once on a status change, never on first load', { plugins: [wor
   const toasts: string[] = []
   const clock = mockWorld(on, { toast: text => toasts.push(text) })
   await $.session.start(sessionStart())
+  await clock.advance(0) // R3: session.start no longer blocks on the first load
   expect(toasts).toEqual([]) // first load never toasts
   const run = JSON.parse(files[RUN_PATH] ?? '{}') as { tasks?: Record<string, unknown>[] }
   const tasks: Record<string, unknown>[] = run.tasks ?? []
@@ -60,8 +63,9 @@ test('quota chip uses the real window kind (5h)', { plugins: [worldFixtures] }, 
   })
   const chips: (string | undefined)[] = []
   mockFs(on, files)
-  mockWorld(on, { status: t => chips.push(t) })
+  const clock = mockWorld(on, { status: t => chips.push(t) })
   await $.session.start(sessionStart())
+  await clock.advance(0) // R3: session.start no longer blocks on the first load
   expect(chips.at(-1) ?? '').toBe('⬡ mk · agy ⊘ 5h resets 10-07 · 2 building')
 })
 
@@ -81,8 +85,9 @@ test('only agents the run routes to can raise the quota chip', { plugins: [world
   })
   const chips: (string | undefined)[] = []
   mockFs(on, files)
-  mockWorld(on, { status: t => chips.push(t) })
+  const clock = mockWorld(on, { status: t => chips.push(t) })
   await $.session.start(sessionStart())
+  await clock.advance(0) // R3: session.start no longer blocks on the first load
   expect(chips.at(-1) ?? '').not.toContain('⊘ wk')
   expect(chips.at(-1) ?? '').toBe('⬡ mk · 2 building · 1 review · 1/5 done')
 })
@@ -111,8 +116,9 @@ test('a project yaml scopes the quota chip: an exhausted agent the yaml disables
   })
   const chips: (string | undefined)[] = []
   mockFs(on, files)
-  mockWorld(on, { status: t => chips.push(t) })
+  const clock = mockWorld(on, { status: t => chips.push(t) })
   await $.session.start(sessionStart())
+  await clock.advance(0) // R3: session.start no longer blocks on the first load
   expect(chips.at(-1) ?? '').not.toContain('agy ⊘')
   expect(chips.at(-1) ?? '').toBe('⬡ mk · 2 building · 1 review · 1/5 done')
 })
@@ -129,8 +135,9 @@ test('all-done outranks quota', { plugins: [worldFixtures] }, async ($, on) => {
   })
   const chips: (string | undefined)[] = []
   mockFs(on, files)
-  mockWorld(on, { status: t => chips.push(t) })
+  const clock = mockWorld(on, { status: t => chips.push(t) })
   await $.session.start(sessionStart())
+  await clock.advance(0) // R3: session.start no longer blocks on the first load
   expect(chips.at(-1) ?? '').toBe('⬡ mk · ✓ all 5 tasks merged · stage 7/12')
 })
 
@@ -144,8 +151,9 @@ test('blocked chip names the dependencies', { plugins: [worldFixtures] }, async 
   })
   const chips: (string | undefined)[] = []
   mockFs(on, files)
-  mockWorld(on, { status: t => chips.push(t) })
+  const clock = mockWorld(on, { status: t => chips.push(t) })
   await $.session.start(sessionStart())
+  await clock.advance(0) // R3: session.start no longer blocks on the first load
   expect(chips.at(-1) ?? '').toBe('⬡ mk · ⊘ X1 blocked by F6, F8 · 2 building')
 })
 
@@ -160,6 +168,7 @@ test('stalled toast uses the lane basename', { plugins: [worldFixtures] }, async
   const toasts: string[] = []
   const clock = mockWorld(on, { toast: t => toasts.push(t) })
   await $.session.start(sessionStart())
+  await clock.advance(0) // R3: session.start no longer blocks on the first load
   setRun(files, run => {
     const tasks = tasksOf(run)
     if (tasks[3]) {
@@ -180,6 +189,7 @@ test('a task whose deps are met toasts ready once', { plugins: [worldFixtures] }
   const toasts: string[] = []
   const clock = mockWorld(on, { toast: t => toasts.push(t) })
   await $.session.start(sessionStart())
+  await clock.advance(0) // R3: session.start no longer blocks on the first load
   setRun(files, run => {
     const tasks = tasksOf(run)
     if (tasks[3]) {
@@ -203,6 +213,7 @@ test('quota toast carries the exhausted pool', { plugins: [worldFixtures] }, asy
   const toasts: string[] = []
   const clock = mockWorld(on, { toast: t => toasts.push(t) })
   await $.session.start(sessionStart())
+  await clock.advance(0) // R3: session.start no longer blocks on the first load
   setRun(files, run => {
     const tasks = tasksOf(run)
     if (tasks[2]) tasks[2].status = 'quota'
@@ -220,6 +231,7 @@ test('a run switch never toasts old-vs-new diffs', { plugins: [worldFixtures] },
   const toasts: string[] = []
   const clock = mockWorld(on, { toast: t => toasts.push(t) })
   await $.session.start(sessionStart())
+  await clock.advance(0) // R3: session.start no longer blocks on the first load
   files['/fixtures/index.json'] = files[RUNS_INDEX] = JSON.stringify([
     { id: 'other', feature: 'other-feature', status: 'active', started: '2026-10-07T17:00:00+02:00' },
   ])
@@ -240,6 +252,7 @@ test('provider toast sanitises the event text', { plugins: [worldFixtures] }, as
   const toasts: string[] = []
   const clock = mockWorld(on, { toast: t => toasts.push(t) })
   await $.session.start(sessionStart())
+  await clock.advance(0) // R3: session.start no longer blocks on the first load
   setRun(files, run => {
     const tasks = tasksOf(run)
     if (tasks[3]) tasks[3].status = 'provider'

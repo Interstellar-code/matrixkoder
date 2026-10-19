@@ -3461,23 +3461,26 @@ function p1HeldRun(held: Array<() => void>, spawns: Spawn[]) {
   }
 }
 
-test('P1.3.a1 (session.start): next() has returned while the first load is held open', { plugins: [worldFixtures] }, async ($, on) => {
-  // FAILS ON THE OLD CODE: `await startLoop(...)` inside the session.start handler awaited
-  // refreshSafe before `return next(e)`, so the engine could not continue while the load ran.
+test('P1.3.a1 (session.start): the handler’s promise resolves while the first load is held open', { plugins: [worldFixtures] }, async ($, on) => {
+  // FAILS ON 9fa3f19, where the handler ended with `await firstLoad`, so the promise the engine
+  // waits on stayed pending until the load finished. (It also fails on 270da7b, where
+  // `await startLoop(...)` put the whole load in front of `return next(e)`.)
   const held: Array<() => void> = []
   const spawns: Spawn[] = []
   const clock = mockWorld(on, { env: { HOME: '/home/mk', MK_HOME: P1_HOME }, process: p1HeldRun(held, spawns) })
   on('fs.exists', (_$, e) => ({ value: [`${P1_HOME}/mk.db`, `${DATA_DIR}/mk.db`].includes(String(e.path)) }))
   mockFs(on, worldFiles(), [DATA_DIR, `${PROJECT_DIR}/.git`])
-  // session.start resolves only after the hook finishes; the hook itself must return next(e)
-  // first. The engine's own answer to the start is what tells us next ran: ask for it and
-  // check that the start resolved with the pane mounted while the load is still held.
+  // the promise the engine awaits: `$.session.start` resolves it when the hook returns
+  let handlerSettled = false
   const started = $.session.start(sessionStart())
-  await settle(clock, 12)
+  void started.then(() => { handlerSettled = true })
+  for (let i = 0; i < 12 && held.length === 0; i++) await clock.advance(0)
   expect(held.length, 'the first load is held').toBe(1)
+  await settle(clock, 4)
+  expect(handlerSettled, 'the hook’s promise resolved with the load still pending').toBe(true)
+  // the pane drew from stored atoms meanwhile, and the load runs ONCE
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   expect(await ui.find({ text: /MatrixKoder|Overview/ }), 'the pane drew while the load was still pending').toBeTruthy()
-  // the load runs ONCE, not once per caller
   expect(spawns.filter(s => s.script === 'mkdb.py' && s.argv.includes('run-snapshot') && !s.argv.includes('--home')).length, 'one first load').toBe(1)
   for (const go of held) go()
   await started
@@ -3551,4 +3554,38 @@ test('P1.4.a1: one worst-case tick starts at most 6 Python processes', { plugins
   const tick = spawns.filter(s => s.script === 'mkdb.py' || s.script === 'mk-bus.py' || s.script === 'mk-usage.py')
   expect(projectReads(spawns).length, 'one projects read').toBeLessThanOrEqual(1)
   expect(tick.length, `one tick's Python starts: ${tick.map(t => `${t.script} ${t.argv.slice(2).join(' ')}`).join(' | ')}`).toBeLessThanOrEqual(6)
+})
+
+// ── R3 FIX 3: a cold start whose first load failed still polls usage once ────
+
+test('P1.3.a4 (R3): a first load that rejects before its usage check still polls once, at 5 s', { plugins: [worldFixtures] }, async ($, on) => {
+  // FAILS ON 9fa3f19: there `const prev = await read($, snapshotAtom)` sat OUTSIDE the try, so a
+  // refused snapshot read rejected the whole first load — and `startLoop`'s 5 s one-shot only
+  // polls on a RESOLVED first load. `firstLoadDone` stayed false, `usageMissingAtLoad` false,
+  // and a cold start whose ledger is missing never polled: the pane kept "no ledger yet" for
+  // the whole poll interval. With the read moved inside the try the tick completes, the
+  // fallback (`usageMissingNow`) runs, and exactly one poll happens.
+  const files = worldFiles()
+  delete files['/fixtures/usage.json']
+  delete files[USAGE_PATH]
+  mockFs(on, files, [DATA_DIR, `${PROJECT_DIR}/.git`])
+  // the engine refuses the snapshot atom read: the first load cannot get its previous value
+  on('state.get', (_$, e, next) => (e.key === 'snapshot' ? { deny: 'state store unavailable' } : next(e)))
+  const polls: (readonly string[])[] = []
+  const clock = mockWorld(on, {
+    env: { HOME: '/home/mk', MK_HOME: P1_HOME },
+    process: argv => {
+      if (argv.some(a => a.endsWith('scripts/mk-usage.py'))) { polls.push([...argv]); return undefined }
+      if (argv.some(a => a.endsWith('mkdb.py')) && argv.includes('projects')) return okReply({ ok: true, projects: [] })
+      if (argv.some(a => a.endsWith('mkdb.py')) && argv.includes('overview')) return okReply({ ok: true, projects: [], plans: [] })
+      if (argv.some(a => a.endsWith('mkdb.py'))) return okReply({ ok: true, todos: [] })
+      return okReply({ ok: true, pending: [], value: true })
+    },
+  })
+  await $.session.start(sessionStart())
+  await clock.advance(4999)
+  expect(polls, 'nothing polls inside the 5 s window').toHaveLength(0)
+  await clock.advance(1)
+  await settle(clock, 20)
+  expect(polls, 'the failed first load still leaves exactly one cold-start poll').toHaveLength(1)
 })

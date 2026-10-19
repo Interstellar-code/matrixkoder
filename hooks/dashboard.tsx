@@ -241,7 +241,7 @@ export function registerDashboard(on: On, options: PluginOptions): void {
         // the engine seats the pane itself; a refusal is not fatal
       }
     }
-    startLoop($, options, e.cwd) // arms the timers now; the first load runs in the background
+    void startLoop($, options, e.cwd).catch(() => {}) // arms the timers now; the first load runs in the background
     const out = next(e) // the engine continues at once: the pane is usable before any data has loaded
     // Neither the brand version nor the opening tab waits on, or is produced by, the first load.
     await loadBrandVersion($)
@@ -257,10 +257,12 @@ export function registerDashboard(on: On, options: PluginOptions): void {
         // the atom write failed — the pane keeps the Overview default
       }
     }
-    // The hook still finishes with a populated pane: the load's backstop is the 5 s tick,
-    // and every caller that follows `next` sees the same state it always did.
-    await firstLoad
-    void ensureBus($, options, e.cwd) // the 15 s tick is too late for a session that needs the bus now
+    // The hook's returned promise must NOT wait for data: the engine awaits it, and the pane
+    // draws from stored atoms meanwhile. The load is `.catch`ed in startLoop and the 5 s tick
+    // is its backstop, so nothing here awaits `firstLoad`.
+    // ensureBus reads the snapshot atom and needs a run to find one, so it runs once the first
+    // load has landed — as a side task, never as something the hook waits on.
+    void firstLoad.then(() => ensureBus($, options, e.cwd)).catch(() => {})
     return out
   })
 
@@ -635,7 +637,9 @@ export async function rearmLoop($: EngineInterface, options: PluginOptions): Pro
     const cwd = await $.session.cwd()
     // Same hand-over as session.start: the timers are armed at once and the first load
     // runs in the background; the 5 s tick is its backstop. Nothing here waits for data.
-    startLoop($, options, cwd)
+    // The promise is left un-awaited by design, so it is caught here: a refused clock or
+    // atom during teardown must not surface as an unhandled rejection.
+    void startLoop($, options, cwd).catch(() => {})
     await loadBrandVersion($)
     void ensureBus($, options, cwd) // the bus needs no /clear either
   } catch {
@@ -715,14 +719,26 @@ async function startLoop($: EngineInterface, options: PluginOptions, cwd: string
   // refreshSafe never throws; the catch is for a rejected promise only.
   firstLoad = refreshSafe($, options, cwd).catch(() => {})
   // Cold start: no usage.json yet means "no ledger yet" for the whole first poll interval.
-  // The check lives in loadSnapshot (it reads usage.json already); this one-shot fires
-  // after 5 s — once the first load has answered — and polls at most once.
+  // The check usually rides loadSnapshot (it reads usage.json already); this one-shot fires
+  // after 5 s and polls at most once. A first load that REJECTED before its usage check left
+  // `firstLoadDone` false — the check runs here instead, so a cold start with a missing
+  // ledger still polls once rather than never.
   cancelFirstPoll?.()
   cancelFirstPoll = arm($.clock.after(FIRST_POLL_MS, () => {
     void firstLoad
-      .then(() => (usageMissingAtLoad ? pollUsage($, cwd) : undefined))
+      .then(async () => {
+        const missing = firstLoadDone ? usageMissingAtLoad : await usageMissingNow($)
+        if (missing) await pollUsage($, cwd)
+      })
       .catch(() => {})
   }))
+}
+
+/** The cold start's usage check when the first load never got that far: usage.json present?
+ *  One `$.fs.read` (no spawn), the same file loadSnapshot reads. */
+async function usageMissingNow($: EngineInterface): Promise<boolean> {
+  const gdir = await globalDirOf($, await homeDir($))
+  return gdir == null || (await readJson($, paths.usage(gdir))) == null
 }
 
 async function openPane($: EngineInterface): Promise<void> {
@@ -959,8 +975,10 @@ async function refreshPending($: EngineInterface, cwd: string): Promise<void> {
       [PENDING_SRC_KEY]: got.down ? 'down' : 'live',
       ...(got.live ? { [PENDING_KEY]: JSON.stringify(got.asks) } : {}),
     }))
-  }).catch(async () => {
-    await update($, viewStateAtom, prev => ({ ...prev, [PENDING_SRC_KEY]: 'down' }))
+  }).catch(() => {
+    // This chain outlives the tick it started in, so a refused write here would surface as an
+    // unhandled rejection long after the session's hooks module is gone. Swallow it.
+    return update($, viewStateAtom, prev => ({ ...prev, [PENDING_SRC_KEY]: 'down' })).catch(() => {})
   }).finally(() => {
     pendingInFlight = false
   })
@@ -1533,13 +1551,14 @@ async function refreshPlans($: EngineInterface, cwd: string, overview: RootOverv
         ...(got.detail != null && sel !== '' ? { [PLAN_DETAIL_KEY]: JSON.stringify(got.detail), [PLAN_DETAIL_FOR_KEY]: sel } : {}),
       }
     })
-  }).catch(async () => {
-    await update($, viewStateAtom, prev => ({
+  }).catch(() => {
+    // see refreshPending: a detached chain's failure handler must not reject on its own
+    return update($, viewStateAtom, prev => ({
       ...prev,
       [PLANS_STORE_KEY]: '1',
       [PLANS_ERROR_KEY]: plansErrorLine('spawn'),
       [PLANS_STALE_KEY]: (prev[PLANS_KEY] ?? '') !== '' ? '1' : '0',
-    }))
+    })).catch(() => {})
   }).finally(() => { plansInFlight = false })
 }
 
@@ -1779,10 +1798,11 @@ async function refreshCards($: EngineInterface, overview: RootOverview): Promise
   ).then(async got => {
     const ms = Math.max(got.ms, Date.now() - started)
     await update($, viewStateAtom, prev => applyCardsRead(prev, tick, lastMs, { ...got, ms }))
-  }).catch(async () => {
-    await update($, viewStateAtom, prev => applyCardsRead(prev, tick, lastMs, {
+  }).catch(() => {
+    // see refreshPending: a detached chain's failure handler must not reject on its own
+    return update($, viewStateAtom, prev => applyCardsRead(prev, tick, lastMs, {
       cards: [], ms: Date.now() - started, skipped: false, empty: false, error: cardsErrorLine('spawn'),
-    }))
+    })).catch(() => {})
   }).finally(() => {
     cardsInFlight = false
   })
@@ -1836,8 +1856,13 @@ async function readRootOverview($: EngineInterface): Promise<RootOverview> {
 async function refreshSafe($: EngineInterface, options: PluginOptions, cwd: string): Promise<void> {
   beginStoreTick() // one `mkdb.py projects --json` for the whole tick
   resetYamlPathMemo() // one store read for the yaml path per tick, not one per caller
-  const prev = await read($, snapshotAtom)
+  // The previous snapshot is read INSIDE the try: a refused read must not escape the tick,
+  // and `endStoreTick()` in the finally must run whatever happens here.
+  let prev: MkSnapshot = EMPTY_SNAPSHOT
+  let readPrev = false // did the previous snapshot actually load? (a refused read keeps the atom untouched)
   try {
+    prev = await read($, snapshotAtom)
+    readPrev = true
     // The two first reads do not depend on each other: the run state and the root
     // overview start together, so the tick waits for the slower one, not both. Each
     // keeps its own failure: a rejected snapshot leaves the last good one flagged,
@@ -1871,10 +1896,14 @@ async function refreshSafe($: EngineInterface, options: PluginOptions, cwd: stri
     // the store read costs a spawn: only for an open Events tab, and only with a run to read
     if (snap.value != null && await read($, dashTabAtom) === 'events') await refreshEvents($, cwd, snap.value)
   } catch (err) {
-    try {
-      await update($, snapshotAtom, () => ({ ...prev, error: `cannot read the run state (${String(err).slice(0, 40)})` }))
-    } catch {
-      // even the atom write failed — nothing more to do
+    // A tick whose previous snapshot could not even be read flags nothing: writing the
+    // EMPTY_SNAPSHOT fallback over a good atom would lose data to a transport failure.
+    if (readPrev) {
+      try {
+        await update($, snapshotAtom, () => ({ ...prev, error: `cannot read the run state (${String(err).slice(0, 40)})` }))
+      } catch {
+        // even the atom write failed — nothing more to do
+      }
     }
   } finally {
     endStoreTick() // the answer stays for an outside-tick caller while it is fresh
