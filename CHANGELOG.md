@@ -2,6 +2,15 @@
 
 All notable changes to this project. Format: Keep a Changelog; versions: SemVer.
 
+## [0.6.7] - 2026-10-19
+
+### Added
+- **events:** redesign Events tab visual pass and wire backend bus/events data (408a541)
+
+### Fixed
+- **events:** type the parsed bus.json and expect the store-mode bus dir (36f2e02)
+- **events:** show real bus data, correct bus dir, real filters, pause and lane buckets (ca7c504)
+
 ## [0.6.6] - 2026-10-19
 
 ### Added
