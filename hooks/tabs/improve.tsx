@@ -1,8 +1,10 @@
 // The /mk pane's Improve parts, drawn from the Prompt Upgrade design in the matrix theme: the
-// FOOTER (the proposal card, the prompt box, the Improve / Undo chips) that sits on every tab,
-// and the Improve TAB (the full review screen). Both draw ONE shared proposal (view.flow), so a
-// press does the same thing in either place. A pure render (C10): no $, no state reads; a press
-// only calls `ui.improveAct`, which the pane turns into the state writes and model calls.
+// FOOTER (the proposal card and the Improve / Undo chips) that sits on every tab, and the
+// Improve TAB (the full review screen). Both draw ONE shared proposal (view.flow), so a
+// press does the same thing in either place. The prompt itself lives in Claude Code's own prompt
+// line: Improve reads it and Accept writes it, so neither place draws a field for it.
+// A pure render (C10): no $, no state reads; a press only calls `ui.improveAct`, which the pane
+// turns into the state writes and model calls.
 import type { Elements, RenderElement } from 'claude-code'
 import type { MkImproveEntry, MkImproveFlow } from '../../types'
 import { IMPROVE_FAILED, bigDigits, bigNumber, canAccept, clip, finalText, wordCount, wrap } from '../improve-core'
@@ -14,7 +16,7 @@ type Els = Elements[keyof Elements]
 
 /** What a press asks of the pane. `a` / `b` carry the question index, the option or the text. */
 export type ImproveKind =
-  | 'text' | 'send' | 'improve' | 'accept' | 'discard' | 'undo' | 'wizard' | 'retry' | 'copy' | 'open'
+  | 'improve' | 'accept' | 'discard' | 'undo' | 'wizard' | 'retry' | 'copy' | 'open'
   | 'answer' | 'other' | 'other-draft' | 'other-save' | 'skip' | 'go' | 'edit' | 'edit-save' | 'draft'
 
 export type ImproveUi = {
@@ -24,9 +26,7 @@ export type ImproveUi = {
 /** everything the footer and the tab draw */
 export type ImproveView = {
   mock: boolean
-  /** the footer prompt box */
-  text: string
-  /** the box text before the last Accept; the Undo chip shows while it is set */
+  /** the prompt text before the last Accept; the Undo chip shows while it is set */
   undo: string | null
   flow: MkImproveFlow | null
   /** saved improvements, newest first */
@@ -213,22 +213,13 @@ function footerCard(els: Els, f: MkImproveFlow, cols: number, act: (kind: Improv
 const SLOT = '┊ + tool ┊'
 
 /**
- * The pane footer's new rows, above the counts: the proposal card (`card` false on the Improve tab,
- * which draws the same proposal in full), the prompt row `❯ <Input>` and the chip row. Enter in the
- * box asks the pane to send it (the pane takes it as Accept while a proposal is on show); the chip row never wraps.
+ * The pane footer's rows, above the counts: the proposal card (`card` false on the Improve tab,
+ * which draws the same proposal in full) and the chip row. Improve reads and writes Claude Code's
+ * own prompt line, so the footer draws no field of its own; the chip row never wraps.
  */
 export function ImproveFooter(els: Els, view: ImproveView, cols: number, ui: ImproveUi, card = true): RenderElement {
   const { Box, Text } = els
   const act = (kind: ImproveKind, a?: string | number, b?: string): void => ui.improveAct?.(kind, a, b)
-  const room = Math.max(8, cols - 6) // the box beside the `❯` and the padding
-  const box = field(els, {
-    key: 'improve-q',
-    placeholder: 'Ask the orchestrator…',
-    value: view.text,
-    rows: Math.min(4, view.text.split('\n').reduce((n, ln) => n + Math.max(1, Math.ceil(clean(ln).length / room)), 0)),
-    onInput: v => act('text', v),
-    onSubmit: v => act('send', v),
-  })
   const w = Math.max(1, cols - 2) // paddingX 1 each side
   const go: ChipSpec = { key: 'improve-f-go', label: '✦ Improve', tone: 'solid', onPress: () => act('improve') }
   const undo: ChipSpec | null = view.undo == null ? null : { key: 'improve-f-undo', label: '↶ Undo', tone: 'soft', onPress: () => act('undo') }
@@ -243,10 +234,6 @@ export function ImproveFooter(els: Els, view: ImproveView, cols: number, ui: Imp
   return (
     <Box flexDirection="column">
       {card && view.flow != null && footerCard(els, view.flow, cols, act)}
-      <Box flexDirection="row" gap={1} paddingX={1}>
-        <Text bold={true} color={ROLE.live.fg}>❯</Text>
-        {box != null ? <Box flexGrow={1} backgroundColor={PALETTE.field}>{box}</Box> : <Text dimColor={true}>{clip(clean(view.text), room)}</Text>}
-      </Box>
       <Box flexDirection="row" gap={1} paddingX={1}>
         {chipBtn(els, go)}
         {undo != null && chipBtn(els, undo)}
@@ -272,7 +259,7 @@ export function ImproveTab(els: Els, view: ImproveView, cols: number, ui: Improv
         {Card(els, {}, (
           <Box flexDirection="column">
             <Text bold={true} color={ROLE.ok.fg}>✦ IMPROVE</Text>
-            {lines(els, 'improve-t-empty', 'Type a prompt in the footer and press Improve.', w, 3, {})}
+            {lines(els, 'improve-t-empty', 'Type a prompt in Claude Code’s prompt line and press ✦ Improve.', w, 3, {})}
           </Box>
         ))}
         {view.history.length > 0 && (

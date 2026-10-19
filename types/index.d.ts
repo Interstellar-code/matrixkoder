@@ -124,7 +124,7 @@ export type MkFileAct = {
   at: number
 }
 
-// ---- Improve (hooks/improve-core.ts, hooks/tabs/improve.tsx): the footer prompt box and the Improve tab share one proposal ----
+// ---- Improve (hooks/improve-core.ts, hooks/tabs/improve.tsx): Claude Code's prompt line and the Improve tab share one proposal ----
 
 /** one multiple-choice question of the wizard: 2-4 short options */
 export type MkImproveQuestion = { question: string; options: string[] }
@@ -162,10 +162,10 @@ export type MkImproveFlow = {
 }
 
 export type MkImprove = {
-  /** the footer prompt box: the single source of what it holds */
-  text: string
-  /** the box text before the last Accept, for the Undo chip */
+  /** the text the prompt line held before the last Accept, for the Undo chip */
   undo: string | null
+  /** what Accept wrote into the prompt line: Undo stands only while the line still holds it */
+  written: string | null
   flow: MkImproveFlow | null
 }
 
@@ -200,7 +200,7 @@ declare module 'claude-code' {
       /** wizard.tsx: detection + answers until the review step writes them */
       wizardDraft: MkWizardDraft
       fileActivity: readonly MkFileAct[]
-      /** dashboard.tsx: the footer prompt box and the open improvement (shared by the footer card and the Improve tab) */
+      /** dashboard.tsx: the open improvement (shared by the footer card and the Improve tab) */
       improve: MkImprove
       /** dashboard.tsx: the last 20 improvements, newest first */
       improveHistory: readonly MkImproveEntry[]

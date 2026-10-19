@@ -6,10 +6,11 @@ import type { MkImproveAnswer, MkImproveFlow, MkImproveQuestion, MkImproveStep }
 
 export const IMPROVE_MODEL = 'haiku'
 
-/** the calm line a failed rewrite shows in the card; the box text is never touched */
+/** the calm line a failed rewrite shows in the card; the prompt line is never touched */
 export const IMPROVE_FAILED = 'Could not improve that one. Your prompt is untouched.'
-export const IMPROVE_EMPTY = 'Type a prompt first, then press Improve.'
-export const IMPROVE_SLASH = 'This box sends plain text. Type slash commands in the main prompt.'
+export const IMPROVE_EMPTY = 'Type a prompt in Claude Code’s prompt line, then press Improve.'
+/** the prompt line refused the write (a dialog, or no composer): nothing is lost, Accept can be tried again */
+export const IMPROVE_FILL_FAILED = 'Prompt line busy. Close dialogs, Accept again.'
 
 /** a fresh improvement for `original`, in `step` (writing = the default one-call rewrite) */
 export const newImproveFlow = (id: string, original: string, step: MkImproveStep = 'writing'): MkImproveFlow => ({
