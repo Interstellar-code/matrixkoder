@@ -234,7 +234,7 @@ test('the data-dir and global-dir file names come from one place', async () => {
   for (const bad of ['..', '.', '', 'a/b', '../x', 'a\\b', 'a\0b']) expect(() => paths.inbox('/g', bad)).toThrow()
   expect(paths.projectsJson('/g')).toBe('/g/projects.json')
   expect(paths.usage('/g')).toBe('/g/usage.json')
-  expect(paths.busFile(paths.busDirOf('/d', true, '/g'))).toBe('/g/bus.json') // store mode: the one bus per home
+  expect(paths.busFile(paths.busDirOf('/d', true, '/g'))).toBe('/g/bus/bus.json') // store mode: the one bus per home
   expect(paths.busFile(paths.busDirOf('/d', false, '/g'))).toBe('/d/bus.json') // file mode: per-project
   expect(paths.busDirOf('/d', true, null)).toBe('/d') // no global dir: the per-project bus
 })

@@ -2844,10 +2844,11 @@ async function refreshEvents($: EngineInterface, cwd: string, snap: MkSnapshot):
 
     // 1. Bus status: up only while bus.json names a server whose heartbeat is fresh
     const busText = await readText($, paths.busFile(busDir)).catch(() => null)
-    let parsedBus: { port?: number; pid?: number; started?: number; owner_heartbeat?: number; projects?: Record<string, unknown> } | null = null
+    type RawBus = { port?: number; pid?: number; started?: number; owner_heartbeat?: number; projects?: Record<string, unknown> }
+    let parsedBus = null as RawBus | null
     try {
       const parsed = JSON.parse(busText ?? '') as unknown
-      if (parsed != null && typeof parsed === 'object') parsedBus = parsed as typeof parsedBus
+      if (parsed != null && typeof parsed === 'object') parsedBus = parsed as RawBus
     } catch {
       // missing, empty or corrupt bus.json: the bus reads down
     }
