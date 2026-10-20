@@ -304,7 +304,8 @@ function pauseButton(els: Els, key: string, status: string, live: boolean, runni
  *  (its own deps and, for a task, its phase's deps are all merged or done). The press
  *  drafts its prompt on the Improve card. */
 function playButton(els: Els, key: string, status: string, depsMet: boolean, running: boolean, act: ((kind: string) => void) | undefined, what: string, id: string): RenderElement | null {
-  if (!running || act == null || !canPlay(status, depsMet)) return null
+  // a held row already carries the Resume ▶ (pauseButton), so Play is not drawn twice
+  if (!running || act == null || PAUSED.has(status) || !canPlay(status, depsMet)) return null
   return IconButton(els, { key, icon: 'play', onPress: () => { act(`play ${what} ${id}`) } })
 }
 
