@@ -354,7 +354,7 @@ export function registerDashboard(on: On, options: PluginOptions): void {
       set: (key, value) => { void update($, viewStateAtom, prev => ({ ...prev, [key]: value })) },
       save: payload => { void saveSettings($, payload) },
       recheck: () => { void recheckAbout($) },
-      submit: text => { void $.prompt.submit({ text }) },
+      submit: text => { void $.prompt.submit({ text, asUser: true }) },
       planAct: (kind, id) => { void planAction($, kind, id) },
       todoAct: (kind, arg) => { void todoAction($, kind, arg) },
       improveAct: (kind, a, b) => { void improveAction($, kind, a, b) },
