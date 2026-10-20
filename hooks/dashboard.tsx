@@ -1946,6 +1946,25 @@ async function improveAction($: EngineInterface, kind: ImproveKind, a?: string |
   const f = s.flow
   if (kind === 'menu') {
     await update($, improveAtom, prev => ({ ...prev, menu: prev.menu !== true }))
+  } else if (kind === 'seed') {
+    // a ready-made prompt from the Plan tab's Play/Pause buttons: `a` is the text,
+    // `b` = 'pause' shows it as the finished proposal (no model call, exact words)
+    if (f != null && (f.step === 'asking' || f.step === 'writing')) {
+      await update($, improveAtom, prev => ({ ...prev, menu: false }))
+      return
+    }
+    const seed = (typeof a === 'string' ? a : '').trim()
+    const id = `${String(await $.clock.now())}-${String(++improveSeq)}`
+    if (seed === '') {
+      await update($, improveAtom, prev => ({ ...prev, menu: false, flow: { ...newImproveFlow(id, '', 'error'), error: IMPROVE_EMPTY } }))
+      return
+    }
+    if (b === 'pause') {
+      await update($, improveAtom, prev => ({ ...prev, menu: false, flow: { ...newImproveFlow(id, seed, 'review'), upgraded: seed } }))
+      return
+    }
+    await update($, improveAtom, prev => ({ ...prev, menu: false, flow: newImproveFlow(id, seed) }))
+    improveLater($, id, 'rewrite', () => improveWrite($, id))
   } else if (kind === 'improve' || (kind === 'retry' && f != null && f.step === 'error' && f.original.trim() === '' && modeOf(f) === 'improve')) {
     if (f != null && (f.step === 'asking' || f.step === 'writing')) {
       await update($, improveAtom, prev => ({ ...prev, menu: false }))

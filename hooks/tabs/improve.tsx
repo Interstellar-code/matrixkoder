@@ -21,6 +21,9 @@ export type ImproveKind =
   // the footer drop-up: 'menu' opens or closes it, 'compose' drafts a message ('answer' | 'question' in `a`),
   // 'send' submits the drafted message as the person's own
   | 'menu' | 'compose' | 'send'
+  // a ready-made prompt from the Plan tab's Play/Pause buttons: `a` is the text, `b` = 'pause'
+  // shows it as the finished proposal (no model call)
+  | 'seed'
 
 export type ImproveUi = {
   improveAct?(kind: ImproveKind, a?: string | number, b?: string): void
