@@ -229,3 +229,28 @@ test('the Events tab keeps every drawn ROW within the pane width at 36, 39, 40 a
     expect(fixtureWide, `over-wide fixture rows at ${cols} cols: ${JSON.stringify(fixtureWide)}`).toEqual([])
   }
 })
+
+test('the lane filter is a dropdown like Kind and View, and no row carries a selection notch', () => {
+  const events = [
+    { t: '06:01', type: 'note', text: 'one', lane: 'K1' },
+    { t: '06:00', type: 'info', text: 'two', lane: 'K1.1' },
+  ]
+  const state = new Map<string, string>()
+  const ui = { get: (k: string) => state.get(k), set: (k: string, v: string) => { state.set(k, v) } }
+  const buttonEls = { ...els, Button: (props: Parameters<Elements['terminal']['Button']>[0]): RenderElement => ({ type: 'Button', props: { key: props.key ?? '', label: props.label ?? '' }, children: [] }) as unknown as RenderElement }
+  const buttons = (tree: unknown) => nodesOf(tree, 'Button').map(b => String(b.props.label))
+  const closed = EventsTab(buttonEls, eventsViewOf(events), 46, ui)
+  expect(buttons(closed), 'a closed dropdown shows its one button').toContain('all lanes ▾')
+  expect(buttons(closed).some(l => /\( \)|\(●\)/.test(l) && /K1/.test(l)), 'no lane options until it opens').toBe(false)
+  state.set('events:open', 'lane')
+  const open = buttons(EventsTab(buttonEls, eventsViewOf(events), 46, ui))
+  expect(open).toContain('(●) all lanes')
+  expect(open).toContain('( ) K1')
+  expect(open).toContain('( ) K1.1')
+  // picking a lane filters the list; the notch '▌' is gone from every row
+  state.set('events:lane', 'K1.1')
+  const picked = textOwn(EventsTab(buttonEls, eventsViewOf(events), 46, ui))
+  expect(picked.some(t => t === 'two')).toBe(true)
+  expect(picked.some(t => t === 'one')).toBe(false)
+  expect(textOwn(EventsTab(buttonEls, eventsViewOf(events), 46)).includes('▌'), 'no selection notch').toBe(false)
+})

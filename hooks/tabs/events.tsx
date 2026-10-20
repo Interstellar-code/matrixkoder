@@ -1,8 +1,8 @@
 // The /mk pane's Events tab (plan dashboard-v2-p0b, Events tab redesign):
 // Full visual pass layout matching the HTML design ("Events tab · bus + run, kind filters, pinned asks, lane activity"):
 // 1. BUS Card (bus heartbeat, port, uptime, queue stats, files, rate sparkline)
-// 2. Filter Card (source, kind multi-select dropdown, view preset dropdown, lane chips, search, pause)
-// 3. Events Card (time, colored kind chip, who, text, ack level, selection & problem indicators)
+// 2. Filter Card (source, kind multi-select dropdown, view preset dropdown, lane dropdown, search, pause)
+// 3. Events Card (time, colored kind chip, who, text, ack level, problem indicator)
 // 4. LANE ACTIVITY Card (per-lane 24-cell sparkline & silence age)
 // Pure render: elements only, no $, no direct state mutation. Filter and selection state flows through TabUi.
 import type { Elements, RenderElement } from 'claude-code'
@@ -196,7 +196,6 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
   const paused = ui?.get('events:paused') === '1'
   const pausedAt = Number(ui?.get('events:pausedAt') ?? '') || Infinity
   const openMenu = ui?.get('events:open') ?? ''
-  const selId = ui?.get('events:sel') ?? (view.events[0]?.id ?? '')
 
   // Normalize events: ensure kind, id, who, lane are populated
   const allEvents: NormalizedEvent[] = view.events.map((e, idx) => ({
@@ -442,16 +441,35 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
             )}
           </Box>
 
-          {/* Lane Filter Chips */}
-          <Box flexDirection="row" gap={1} alignItems="center" flexWrap="wrap">
-            <Text dimColor={true}>{'lane'.padEnd(labelW)}</Text>
-            {laneNames.map(n =>
-              Segment(els, {
-                key: `lane-chip-${n}`,
-                label: n,
-                on: laneFilter === n,
-                onPress: () => ui?.set('events:lane', n),
-              })
+          {/* Lane Dropdown */}
+          <Box flexDirection="column">
+            <Box flexDirection="row" gap={1} alignItems="center">
+              <Text dimColor={true}>{'lane'.padEnd(labelW)}</Text>
+              <Box flexGrow={1}>
+                <Button
+                  key="ev-lane-dd"
+                  label={`${clip(laneFilter === 'all' ? 'all lanes' : laneFilter, compact ? 18 : 26)} ▾`}
+                  onPress={() => ui?.set('events:open', openMenu === 'lane' ? '' : 'lane')}
+                />
+              </Box>
+            </Box>
+            {openMenu === 'lane' && (
+              <Box flexDirection="column" paddingX={1} backgroundColor={PALETTE.field}>
+                {laneNames.map(n => (
+                  <Box key={`lane-opt-${n}`} flexDirection="row" justifyContent="space-between">
+                    <Button
+                      key={`lane-btn-${n}`}
+                      plain={true}
+                      label={`${laneFilter === n ? '(●)' : '( )'} ${n === 'all' ? 'all lanes' : n}`}
+                      onPress={() => {
+                        ui?.set('events:lane', n)
+                        ui?.set('events:open', '')
+                      }}
+                    />
+                    <Text dimColor={true}>{String(n === 'all' ? allEvents.length : allEvents.filter(e => e.lane === n).length)}</Text>
+                  </Box>
+                ))}
+              </Box>
             )}
           </Box>
 
@@ -491,7 +509,6 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
           {/* Event Rows */}
           {rows.length === 0 && <Text dimColor={true}>no event matches the filters</Text>}
           {rows.map((ev, i) => {
-            const isSel = selId === ev.id
             const typeWord = compact ? ev.short?.type ?? ev.kind : ev.kind
             const role = TYPE_ROLE[typeWord] ?? (ev.bad ? 'err' : 'idle')
             const text = compact ? ev.short?.text ?? ev.text : ev.text
@@ -513,9 +530,7 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
             const ackColor = ev.ack === 2 ? ROLE.live.fg : PALETTE.dim
             const showWho = isBus && ev.who !== 'run' && ev.who !== ''
             const whoStr = showWho ? clip(ev.who, Math.floor(W / 3)) : ''
-            const hasMarker = isSel || ev.bad
-            const leftMarker = isSel ? '▌' : ev.bad ? '!' : ''
-            const leftColor = isSel ? '#c6f135' : ROLE.err.fg
+            const hasMarker = ev.bad
 
             // Layout: [marker 1 gap 1] + time 5 + gap 1 + chip (TYPE_W + 2) + [who + gap 1] + text + [gap 1 + ack]
             const chipW = Math.max(typeWord.length, TYPE_W) + 2
@@ -529,7 +544,7 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
 
             return (
               <Box key={`ev-row-${ev.id || i}`} flexDirection="row" gap={1} alignItems="center">
-                {hasMarker && <Text color={leftColor}>{leftMarker}</Text>}
+                {hasMarker && <Text color={ROLE.err.fg}>!</Text>}
                 <Text dimColor={true}>{ev.t.slice(0, TIME_W).padStart(TIME_W)}</Text>
                 {Chip(els, { label: typeWord.padEnd(TYPE_W), role })}
                 {showWho && <Text dimColor={true}>{whoStr}</Text>}
