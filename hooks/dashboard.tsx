@@ -34,6 +34,7 @@ import type { LaneData, LanesView } from './tabs/lanes'
 import { OverviewTab, UsageCard } from './tabs/overview'
 import type { OverviewView } from './tabs/overview'
 import { PlanTab } from './tabs/plan'
+import { pausePrompt, phasePrompt, taskPrompt } from './tabs/planrun'
 import type { PlanView } from './tabs/plan'
 import { PlansTab, planActionLine } from './tabs/plans'
 import type { PlansView } from './tabs/plans'
@@ -1414,6 +1415,34 @@ export function PlanPane(els: Els, view: Record<string, string>, paneCols: numbe
   // no project store yet: say so, never the Checkout v2 fixture
   if (view[PLANS_STORE_KEY] !== '1') return <Text dimColor={true}>no plans yet · approve a plan to see it here</Text>
   const sub = planSubOf(view)
+  // the shown plan's mapped view, filled by the Detail branch below; a Play/Pause press
+  // reads it for the row and its phases (the press is drawn before the body is built)
+  let shown: PlanView | null = null
+  /** Play/Pause on a phase or task: draft the prompt from the row's own data on the
+   *  Improve card. Any miss (no match, no loaded detail, no Improve) keeps today's
+   *  `mk: <kind> plan <id>` submit as the fallback. */
+  const seedPress = (kind: string, id: string): boolean => {
+    const m = /^(play|pause) (phase|task) (\S+)$/.exec(kind)
+    if (m == null || ui.improveAct == null) return false
+    const what = m[1] === 'play' ? 'play' : 'pause'
+    const level = m[2] === 'phase' ? 'phase' : 'task'
+    const rowId = m[3] ?? ''
+    const phases = shown?.phases
+    if (phases == null || phases.length === 0) return false
+    const phasesOf = phases
+    let text = ''
+    if (level === 'phase') {
+      const phase = phasesOf.find(p => p.id === rowId)
+      if (phase == null) return false
+      text = what === 'play' ? phasePrompt(id, phase, phasesOf) : pausePrompt(id, 'phase', phase, phasesOf)
+    } else {
+      const task = findPlanTask(phasesOf, rowId)
+      if (task == null) return false
+      text = what === 'play' ? taskPrompt(id, task, phasesOf) : pausePrompt(id, 'task', task, phasesOf)
+    }
+    ui.improveAct('seed', text, what === 'pause' ? 'pause' : undefined)
+    return true
+  }
   const onAction = (kind: string, id: string): void => {
     if (kind === 'open') {
       ui.set('plans:sel', id)
@@ -1421,6 +1450,7 @@ export function PlanPane(els: Els, view: Record<string, string>, paneCols: numbe
       return
     }
     if (PLAN_SCRIPT_KINDS.includes(kind) && ui.planAct != null) { ui.planAct(kind, id); return }
+    if (seedPress(kind, id)) return
     ui.set('plans:reload', String(Date.now()))
     void ui.submit?.(planActionLine(kind, id))
   }
@@ -1439,6 +1469,7 @@ export function PlanPane(els: Els, view: Record<string, string>, paneCols: numbe
   } else if (sub === 'detail') {
     const detail = planDetailViewOf(view, sel)
     detailView = detail
+    shown = detail
     body = detail == null ? <Text>loading {sel}</Text> : PlanTab(els, { ...detail, onAction }, cols, ui)
   } else {
     // V1.4: PlanKanbanTab from the raw `plans <id>` reply — kept raw because
@@ -1448,6 +1479,7 @@ export function PlanPane(els: Els, view: Record<string, string>, paneCols: numbe
       try { raw = JSON.parse(view[PLAN_DETAIL_KEY] ?? '') } catch { raw = null }
     }
     detailView = raw == null ? null : planFromReply(raw)
+    shown = detailView
     body = raw == null ? <Text>loading {sel}</Text> : PlanKanbanTab(els, planKanbanView(raw, new Date().toISOString()), cols, ui)
   }
   // V1.5: when `plan:task` names a task of the shown plan, the task detail
@@ -1458,7 +1490,7 @@ export function PlanPane(els: Els, view: Record<string, string>, paneCols: numbe
   const selTask = view['plan:task'] ?? ''
   const selRow = selTask !== '' ? findPlanTask(detailView?.phases, selTask) : null
   if (selRow != null) {
-    const panel = PlanTaskPanel(els, selRow, cols, () => { ui.set('plan:task', '') })
+    const panel = PlanTaskPanel(els, selRow, cols, () => { ui.set('plan:task', '') }, k => { onAction(k, sel) }, detailView?.plan?.status === 'running')
     // the pop-up: Detail draws it in place of the phases box (header, PHASES row and footer stay);
     // Kanban has no such slot, so the panel takes the body
     body = sub === 'detail' && detailView != null

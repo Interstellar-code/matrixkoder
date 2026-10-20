@@ -353,3 +353,90 @@ test('Refresh button bumps plans:reload so the list rereads', () => {
   press(drawn, 'plan-refresh')
   expect(Number(ui.get('plans:reload'))).toBeGreaterThan(0)
 })
+
+/** ── P1.3: Play and Pause press routing (the production path) ────────────── */
+
+/** The 80-col open detail: phase S1 expanded, so its task rows' Play buttons exist. */
+const PLAY_VIEW = (ui: Map<string, string> = new Map([['plan:phase:S1', '1']])): [Record<string, string>, typeof ui] => [{
+  'plans:store': '1', 'plans:list': LIST, 'plan:sub': 'detail', 'plans:sel': 'alpha',
+  'plans:detail': PLAY_DETAIL, 'plans:detail-for': 'alpha',
+}, ui]
+const PLAY_DETAIL = JSON.stringify({
+  ok: true, id: 'alpha', title: 'Alpha', status: 'running', created: 'c', runs: ['alpha-r1'], live_run: 'alpha-r1',
+  integration: 'main', design: [], counts: { planned: 1, review: 1 },
+  phases: [
+    { id: 'V1', title: 'Foundations', status: 'merged', wave: 1, deps: [], tasks: [] },
+    { id: 'S1', title: 'Settings mapping', status: 'ready', deps: ['V1'], tasks: [
+      { id: 'S1.1', title: 'Scope-home map', status: 'planned', deps: [], owned: ['a.ts'], acceptance: 'it works', subtasks: [] },
+      { id: 'S1.2', title: 'Dead keys', status: 'review', deps: [], subtasks: [] },
+    ] },
+  ],
+})
+
+test('P1.3: a task Play press calls improveAct once with the seed text and never submit', () => {
+  const [view, ui] = PLAY_VIEW()
+  const seeds: { kind: string; text: string; b?: string }[] = []
+  const subs: string[] = []
+  const handle = {
+    get: (k: string) => ui.get(k),
+    set: (k: string, v: string) => { ui.set(k, v) },
+    submit: (t: string) => { subs.push(t) },
+    improveAct: (kind: string, a?: string | number, b?: string) => { seeds.push({ kind, text: String(a ?? ''), b }) },
+  }
+  press(PlanPane(stubEls, view, 120, handle), 'plan-task-play-S1.1')
+  expect(seeds.length, 'one improveAct').toBe(1)
+  expect(seeds[0]?.kind).toBe('seed')
+  expect(seeds[0]?.text.startsWith('Start task S1.1 of plan alpha (phase S1): "Scope-home map".')).toBe(true)
+  expect(seeds[0]?.b, 'Play goes through the model').toBeUndefined()
+  expect(subs, 'nothing is submitted').toEqual([])
+  expect(ui.get('plans:reload'), 'no reload on a seed press').toBeUndefined()
+})
+
+test('P1.3: a task Pause press seeds the pause text with the pause marker', () => {
+  const [view, ui] = PLAY_VIEW()
+  const seeds: { kind: string; text: string; b?: string }[] = []
+  const handle = {
+    get: (k: string) => ui.get(k),
+    set: (k: string, v: string) => { ui.set(k, v) },
+    improveAct: (kind: string, a?: string | number, b?: string) => { seeds.push({ kind, text: String(a ?? ''), b }) },
+  }
+  press(PlanPane(stubEls, view, 120, handle), 'plan-task-pause-S1.2')
+  expect(seeds.length).toBe(1)
+  expect(seeds[0]?.b).toBe('pause')
+  expect(seeds[0]?.text.startsWith('Pause task S1.2 of plan alpha: "Dead keys".')).toBe(true)
+})
+
+test('P1.3: with no improveAct, no loaded detail, or an unknown row the mk: submit still runs', () => {
+  const [view, ui] = PLAY_VIEW()
+  const subs: string[] = []
+  const noImprove = { get: (k: string) => ui.get(k), set: (k: string, v: string) => { ui.set(k, v) }, submit: (t: string) => { subs.push(t) } }
+  press(PlanPane(stubEls, view, 120, noImprove), 'plan-task-play-S1.1')
+  expect(subs).toEqual([planActionLine('play task S1.1', 'alpha')])
+  subs.length = 0
+  const seeds: string[] = []
+  const withImprove = { ...noImprove, improveAct: (kind: string) => { seeds.push(kind) } }
+  // a plan-level Pause (the List's running row) is no play/pause phase|task press: it still submits
+  const listView: Record<string, string> = {
+    'plans:store': '1',
+    'plans:list': JSON.stringify({ ok: true, projects: [], plans: [{ project: 'matrixkoder', plan: 'rn', title: 'R', status: 'running', created: 'c', live_run: 'rn-r1', counts: {} }] }),
+  }
+  press(PlanPane(stubEls, listView, 120, withImprove), 'plans-pause-rn')
+  expect(seeds).toEqual([])
+  expect(subs).toEqual([planActionLine('pause', 'rn')])
+  const unknown = nodesOf(PlanPane(stubEls, view, 120, withImprove), 'Button').find(b => String(b.props?.key) === 'plan-task-play-ZZ.9')
+  expect(unknown, 'an unknown row draws no button').toBeUndefined()
+})
+
+test('P1.3: a plan-level start or resume still submits and never becomes a seed', () => {
+  const ui = new Map<string, string>()
+  const subs: string[] = []
+  const seeds: string[] = []
+  const handle = {
+    get: (k: string) => ui.get(k), set: (k: string, v: string) => { ui.set(k, v) },
+    submit: (t: string) => { subs.push(t) }, improveAct: (kind: string) => { seeds.push(kind) },
+    planAct: () => { throw new Error('start/resume must not reach planAct') },
+  }
+  press(PlanPane(stubEls, ACTION_VIEW, 120, handle), 'plans-start-dr')
+  expect(seeds).toEqual([])
+  expect(subs).toEqual([planActionLine('start', 'dr')])
+})

@@ -9,6 +9,7 @@ import { PlanTaskPanel, findPlanTask } from './plantask'
 import { planFromReply } from './plans-map'
 import detailFixture from './fixtures/plan-detail'
 import type { PlanTask } from './plan'
+import { ICONS } from './kit'
 
 type N = { type: string; props: Record<string, unknown>; children: unknown[] }
 
@@ -344,4 +345,35 @@ test('a draft task shows its planned agent and reviewer; a routed one shows its 
   expect(routed).not.toContain('planned agent')
   expect(routed).toContain('opencode')
   expect(allText(PlanTaskPanel(stubEls(), { ...draft, plannedRoute: undefined, reviewer: undefined }, 80))).not.toContain('reviewer')
+})
+
+/** ── P1.3: Play and Pause in the task panel header (the labelled form) ──── */
+
+test('P1.3: a running plan\'s panel offers labelled Play on a planned task and Pause on a review task', () => {
+  const planned = findPlanTask(planFromReply(detailFixture).phases, 'S1.1')!
+  const drawn = PlanTaskPanel(stubEls(), planned, 80, undefined, () => {}, true)
+  const play = allOf(drawn, 'Button').find(b => String(b.props.key) === 'plan-task-play-panel-S1.1')
+  expect(play, 'the Play button').toBeDefined()
+  expect(play?.props.label).toBe(`${ICONS.play.glyph} ${ICONS.play.word}`)
+  const review = findPlanTask(planFromReply(detailFixture).phases, 'D1.5')!
+  const paused = allOf(PlanTaskPanel(stubEls(), review, 80, undefined, () => {}, true), 'Button').find(b => String(b.props.key) === 'plan-task-pause-panel-D1.5')
+  expect(paused?.props.label).toBe(`${ICONS.pause.glyph} ${ICONS.pause.word}`)
+})
+
+test('P1.3: the panel press reaches the pane\'s onAction with `play task <id>`, and a non-running plan draws neither', () => {
+  const row = findPlanTask(planFromReply(detailFixture).phases, 'S1.1')!
+  const calls: string[] = []
+  press(PlanTaskPanel(stubEls(), row, 80, undefined, kind => { calls.push(kind) }, true), 'plan-task-play-panel-S1.1')
+  expect(calls).toEqual(['play task S1.1'])
+  const keys = allOf(PlanTaskPanel(stubEls(), row, 80, undefined, () => {}, false), 'Button').map(b => String(b.props.key))
+  expect(keys).not.toContain('plan-task-play-panel-S1.1')
+  expect(keys).not.toContain('plan-task-pause-panel-S1.1')
+  // the close is still there, unchanged
+  expect(keys).toContain('plan-task-close-top-S1.1')
+})
+
+test('P1.3: without an act callback the panel draws no Play or Pause, so the pinned picture stands', () => {
+  const row = findPlanTask(planFromReply(detailFixture).phases, 'D1.5')!
+  const keys = allOf(PlanTaskPanel(stubEls(), row, 80, () => {}), 'Button').map(b => String(b.props.key))
+  expect(keys.filter(k => k.includes('-panel-'))).toEqual([])
 })

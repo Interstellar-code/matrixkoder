@@ -13,6 +13,7 @@ import { ActionButton, Card, Chip, IconButton } from './kit'
 import { PALETTE, ROLE } from './palette'
 import { clip, planStatusGlyph, planStatusRole } from './plan'
 import { routeText } from './plans-map'
+import { canPause, canPlay } from './planrun'
 import type { PlanPhase, PlanSub, PlanTask } from './plan'
 
 type Els = Elements[keyof Elements]
@@ -83,7 +84,9 @@ function subRow(els: Els, sub: PlanSub, W: number): RenderElement {
 /** The V1.5 task detail panel. Pure render from one mapped task row; every
  *  missing field is left out. `onClose` is the caller's callback for the
  *  pressable `esc close` footer line. */
-export function PlanTaskPanel(els: Els, row: PlanTask, cols: number, onClose?: () => void): RenderElement {
+/** `onAct` drafts the row's Play/Pause prompt (the pane's Improve seed); `running` is the
+ *  shown plan's own status, the one condition every Play/Pause button obeys. */
+export function PlanTaskPanel(els: Els, row: PlanTask, cols: number, onClose?: () => void, onAct?: (kind: string) => void, running = false): RenderElement {
   const { Box, Text } = els
   const owned = row.owned ?? []
   const shown = owned.slice(0, 8)
@@ -92,7 +95,11 @@ export function PlanTaskPanel(els: Els, row: PlanTask, cols: number, onClose?: (
     <Box key={`plan-task-panel-${row.id}`} flexDirection="column">
       <Box flexDirection="row" justifyContent="space-between" gap={1}>
         <Text bold={true}>{`${row.id} · ${row.status}`}</Text>
-        {IconButton(els, { key: `plan-task-close-top-${row.id}`, icon: 'close', labelled: true, onPress: () => { onClose?.() } })}
+        <Box flexDirection="row" gap={1}>
+          {running && onAct != null && canPlay(row.status, true) && IconButton(els, { key: `plan-task-play-panel-${row.id}`, icon: 'play', labelled: true, onPress: () => { onAct(`play task ${row.id}`) } })}
+          {running && onAct != null && canPause(row.status, true) && IconButton(els, { key: `plan-task-pause-panel-${row.id}`, icon: 'pause', labelled: true, onPress: () => { onAct(`pause task ${row.id}`) } })}
+          {IconButton(els, { key: `plan-task-close-top-${row.id}`, icon: 'close', labelled: true, onPress: () => { onClose?.() } })}
+        </Box>
       </Box>
       <Text color={PALETTE.mut} wrap="wrap">{row.title}</Text>
       {row.description != null && <Text color={PALETTE.mut} wrap="wrap">{row.description}</Text>}

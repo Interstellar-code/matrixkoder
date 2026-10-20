@@ -3,9 +3,13 @@
 // prompt line and the store are mocked beneath the plugin; a real terminal draw is not covered here.
 import { test, expect } from 'claude-code/testing'
 import type { Engine, Mounted } from 'claude-code/testing'
-import { mockFs, mockWorld, paneProps, sessionStart, worldFiles, worldFixtures } from './testkit'
+import { DATA_DIR, mockFs, mockWorld, paneProps, sessionStart, worldFiles, worldFixtures } from './testkit'
+import detailFixture from './tabs/fixtures/plan-detail'
 import { DRAFT_EMPTY, DRAFT_SEND_FAILED, IMPROVE_FAILED, IMPROVE_PASTE, IMPROVE_FILL_FAILED, wordCount } from './improve-core'
 
+const PLAN_HOME = '/tmp/mk-improve-plan'
+const SEED_TASK = 'Start task S1.1 of plan settings-plans-db (phase S1): "Scope-home map".\n1. Done means (acceptance S1.1.a1 onwards): C6 holds. The drift test passes. No storage moves: every reader keeps reading where it reads today.\n2. Depends on: phase S1 needs V1 merged.\n3. Files this task owns: scripts/mk-config.py, scripts/settings-drift.py, hooks/tabs/settings.schema.ts.\n4. Run this one task, not the rest of S1.\n5. Run it through the MatrixKoder loop (round, brief, lane, dispatch, watch, verify, separate review). Do not edit plan statuses by hand.'
+const SEED_REWRITE = JSON.stringify({ prompt: SEED_TASK, added: [] })
 const usage = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
 const ROUGH = 'Check all the files with type errors.'
 const BETTER = "Run tsc --noEmit and list every file with type errors. Give each error's file, line and cause. Don't edit anything yet."
@@ -35,22 +39,40 @@ type World = {
   clipboard?: string | 'fail'
   /** the conversation `session.messages` answers (the world's three rows by default) */
   messages?: { role: 'user' | 'assistant'; text: string; toolUses: never[] }[]
+  /** the root store lists this plan and `plans <id>` answers the captured detail reply */
+  plan?: boolean
 }
 
 /** the world beneath the pane: model, conversation, prompt box, clipboard, store */
 function world(on: Parameters<typeof mockWorld>[0], w: World) {
-  const log = { prompts: [] as string[], models: [] as string[], systems: [] as string[], calls: 0, submitted: [] as { text: string; asUser?: boolean }[], copied: [] as string[] }
+  const log = { prompts: [] as string[], models: [] as string[], systems: [] as string[], calls: 0, reads: 0, submitted: [] as { text: string; asUser?: boolean }[], copied: [] as string[] }
+  const mkdb = (body: unknown) => ({ value: { exitCode: 0, stdout: JSON.stringify(body), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
   const clock = mockWorld(on, {
-    process: argv => (argv[0] === 'pbpaste'
-      ? { value: { exitCode: w.clipboard === 'fail' ? 1 : 0, stdout: w.clipboard === 'fail' ? '' : w.clipboard ?? '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
-      : undefined),
+    env: w.plan === true ? { MK_HOME: PLAN_HOME } : {},
+    process: argv => {
+      if (argv[0] === 'pbpaste') {
+        return { value: { exitCode: w.clipboard === 'fail' ? 1 : 0, stdout: w.clipboard === 'fail' ? '' : w.clipboard ?? '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      }
+      if (w.plan !== true) return undefined
+      if (argv.includes('overview')) {
+        return mkdb({ ok: true, projects: [], plans: [{ project: 'matrixkoder', plan: detailFixture.id, title: detailFixture.title, status: 'running', created: 'c', live_run: null, counts: { building: 2 } }] })
+      }
+      if (argv.includes('plans') && argv.includes(detailFixture.id)) return mkdb(detailFixture)
+      return undefined
+    },
   })
+  if (w.plan === true) {
+    on('fs.exists', (_$, e) => ({ value: [`${PLAN_HOME}/mk.db`, `${DATA_DIR}/mk.db`].includes(String(e.path)) }))
+  }
   mockFs(on, w.files ?? worldFiles())
   // Claude Code's own prompt line, in memory: read resolves what it holds, fill writes it
   // (the real shapes: PromptBox `{ text, cursor }`, PromptFilled `{ isFilled, text, cursor }`)
   const box = { text: w.draft ?? '', refuses: false }
   const fills: { text: string; mode: string }[] = []
-  on('prompt.read', () => ({ value: { text: box.text, cursor: box.text.length } }))
+  on('prompt.read', () => {
+    log.reads += 1
+    return { value: { text: box.text, cursor: box.text.length } }
+  })
   // prompt.fill is an event: its handler answers the result itself, not a value wrapper
   on('prompt.fill', (_$, e) => {
     fills.push({ text: e.text, mode: e.mode })
@@ -237,6 +259,67 @@ test('Accept fills the box with the rewrite and shows Undo; Undo restores the or
   expect(boxValue(w)).toBe(original)
   expect(await has(ui, { type: 'Button', key: 'improve-f-undo' }), 'Undo is spent').toBe(false)
   expect(w.log.submitted, 'accepting never sends').toEqual([])
+})
+
+/** ── P1.2: the Plan tab's Play/Pause seeds ─────────────────────────────── */
+
+/** list -> open the plan -> expand phase S1: its task row's Play and the phase's Play draw. */
+async function openPlan(ui: Ui, w: ReturnType<typeof world>): Promise<void> {
+  await ui.press({ key: 'dash-tab-plan' })
+  for (let i = 0; i < 5; i++) await w.clock.advance(0)
+  await ui.press({ key: `plans-detail-${detailFixture.id}` })
+  await w.clock.advance(5000)
+  for (let i = 0; i < 10; i++) await w.clock.advance(0)
+  await ui.press({ key: 'plan-fold-S1' })
+  await ui.press({ key: 'plan-fold-V1.5' })
+}
+
+test('a Play seed drafts the task prompt on the card without reading the prompt line, and Accept fills it', { timeoutMs: 20000, plugins: [worldFixtures] }, async ($, on) => {
+  const w = world(on, { plan: true, answer: () => SEED_REWRITE })
+  await $.session.start(sessionStart())
+  const ui = await mount($, 80)
+  type(w, 'my own draft')
+  await openPlan(ui, w)
+  await ui.press({ key: 'plan-task-play-S1.1' })
+  await w.settle()
+  expect(w.log.calls, 'one model call').toBe(1)
+  expect(w.log.reads, 'the seed never reads the prompt line').toBe(0)
+  expect(w.log.prompts[0]).toContain('Start task S1.1 of plan settings-plans-db')
+  expect(w.log.prompts[0]).toContain('Do not edit plan statuses by hand')
+  expect(boxValue(w), 'the line is untouched until Accept').toBe('my own draft')
+  expect(await has(ui, { type: 'Button', key: 'improve-f-accept' }), 'the proposal is on the card').toBe(true)
+  await ui.press({ key: 'improve-f-accept' })
+  expect(boxValue(w)).toBe(SEED_TASK)
+  expect(w.log.submitted, 'nothing is sent unseen').toEqual([])
+})
+
+test('a Pause seed is shown as the finished proposal with no model call', { timeoutMs: 20000, plugins: [worldFixtures] }, async ($, on) => {
+  const w = world(on, { plan: true, answer: () => SEED_REWRITE })
+  await $.session.start(sessionStart())
+  const ui = await mount($, 80)
+  await openPlan(ui, w)
+  await ui.press({ key: 'plan-task-pause-V1.5.2' }) // a review task of V1.5: its row draws the Pause
+  await w.settle()
+  expect(w.log.calls, 'no model call').toBe(0)
+  expect(w.log.reads, 'the seed never reads the prompt line').toBe(0)
+  expect(await says(ui, 'Pause task V1.5.2 of plan settings-plans-db')).toBe(true)
+  expect(await has(ui, { type: 'Button', key: 'improve-f-accept' }), 'Accept is offered').toBe(true)
+  await ui.press({ key: 'improve-f-accept' })
+  expect(boxValue(w)).toContain('Pause task V1.5.2 of plan settings-plans-db')
+  expect(boxValue(w)).toContain('pause only asks, it stops no running builder')
+})
+
+test('a seed press while another flow is writing is ignored', { timeoutMs: 20000, plugins: [worldFixtures] }, async ($, on) => {
+  const w = world(on, { plan: true, answer: () => SEED_REWRITE })
+  await $.session.start(sessionStart())
+  const ui = await mount($, 80)
+  await openPlan(ui, w)
+  await ui.press({ key: 'plan-task-play-S1.1' })
+  await ui.press({ key: 'plan-task-play-S1.2' }) // still writing: dropped
+  await w.settle()
+  expect(w.log.calls, 'the second seed never runs').toBe(1)
+  expect(w.log.prompts[0]).toContain('Start task S1.1 of plan settings-plans-db')
+  expect(w.log.prompts.join(' '), 'the second seed replaced nothing').not.toContain('Start task S1.2')
 })
 
 test('Discard closes the card and leaves the box as it was', { plugins: [worldFixtures] }, async ($, on) => {

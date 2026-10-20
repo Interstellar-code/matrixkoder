@@ -5,6 +5,7 @@
 import { test, expect } from 'claude-code/testing'
 import type { BoxProps, ElementChildren, Elements, RenderChildren, RenderElement, RenderNode, TextProps } from 'claude-code'
 import { PLAN_STATE, PlanTab, statusState } from './plan'
+import { ICONS } from './kit'
 import { planFromReply } from './plans-map'
 import detailFixture from './fixtures/plan-detail'
 import { PLAN_REAL_FIXTURE } from './plan.fixture'
@@ -581,4 +582,59 @@ test('task dots take the state colour and shape', () => {
     const c = PLAN_STATE[state]
     expect(nodesOf(drawn, 'Text').some(t => t.props?.color === c.color && (t.children ?? []).join('') === c.glyph), `${state} dot`).toBe(true)
   }
+})
+
+/** ── P1.3: Play and Pause icons on the phase and task rows ──────────────── */
+
+const runningView = () => planFromReply(detailFixture)
+
+test('P1.3: a planned task with deps met draws Play; a building task draws Pause; a merged one draws neither', () => {
+  const ui = new Map<string, string>([['plan:phase:S1', '1'], ['plan:phase:V1.5', '1']])
+  const drawn = PlanTab(stubEls, runningView(), 80, ui)
+  const keys = nodesOf(drawn, 'Button').map(b => String(b.props?.key))
+  // S1.1 is planned and its phase's dep V1 is merged: Play
+  expect(keys).toContain('plan-task-play-S1.1')
+  // V1.5.4 is planned but the phase needs D1.5 (review): no Play
+  expect(keys).not.toContain('plan-task-play-V1.5.4')
+  // V1.5.2 is verifying: Pause
+  expect(keys).toContain('plan-task-pause-V1.5.2')
+  // V1.5.1 is building inside a planned phase: Pause
+  expect(keys).toContain('plan-task-pause-V1.5.1')
+  // R1.1 is merged: neither button
+  ui.set('plan:phase:R1', '1')
+  const merged = nodesOf(PlanTab(stubEls, runningView(), 80, ui), 'Button').map(b => String(b.props?.key))
+  expect(merged).not.toContain('plan-task-play-R1.1')
+  expect(merged).not.toContain('plan-task-pause-R1.1')
+})
+
+test('P1.3: Play and Pause draw through the kit glyphs, not typed ones', () => {
+  const ui = new Map<string, string>([['plan:phase:S1', '1'], ['plan:phase:V1.5', '1']])
+  const drawn = PlanTab(stubEls, runningView(), 80, ui)
+  const byKey = (key: string) => nodesOf(drawn, 'Button').find(b => String(b.props?.key) === key)
+  expect(byKey('plan-task-play-S1.1')?.props?.label).toBe(ICONS.play.glyph)
+  expect(byKey('plan-task-play-S1.1')?.props?.plain).toBe(true)
+  expect(byKey('plan-task-pause-V1.5.2')?.props?.label).toBe(ICONS.pause.glyph)
+})
+
+test('P1.3: a non-running plan draws no Play or Pause at all', () => {
+  const ui = new Map<string, string>([['plan:phase:S1', '1'], ['plan:phase:V1.5', '1']])
+  const parked = { ...runningView(), plan: { ...runningView().plan!, status: 'parked' } }
+  const keys = nodesOf(PlanTab(stubEls, parked, 80, ui), 'Button').map(b => String(b.props?.key))
+  expect(keys.filter(k => k.startsWith('plan-task-play-') || k.startsWith('plan-task-pause-'))).toEqual([])
+  expect(keys.filter(k => k.startsWith('plan-phase-play-') || k.startsWith('plan-phase-pause-'))).toEqual([])
+})
+
+test('P1.3: pressing a task Play calls onAction once with `play task <id>`, never a plan kind', () => {
+  const ui = new Map<string, string>([['plan:phase:S1', '1']])
+  const calls: string[] = []
+  const view = { ...runningView(), onAction: (kind: string) => { calls.push(kind) } }
+  press(PlanTab(stubEls, view, 80, ui), 'plan-task-play-S1.1')
+  expect(calls).toEqual(['play task S1.1'])
+})
+
+test('P1.3: a folded phase row draws no Play; an expanded one does', () => {
+  const keys = nodesOf(PlanTab(stubEls, runningView(), 80, new Map()), 'Button').map(b => String(b.props?.key))
+  expect(keys).not.toContain('plan-phase-play-S1')
+  const open = nodesOf(PlanTab(stubEls, runningView(), 80, new Map([['plan:phase:S1', '1']])), 'Button').map(b => String(b.props?.key))
+  expect(open).toContain('plan-phase-play-S1')
 })

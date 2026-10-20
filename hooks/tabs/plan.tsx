@@ -6,12 +6,13 @@
 import type { Elements, RenderElement } from 'claude-code'
 import { PLAN_FIXTURE } from './plan.fixture'
 import { NARROW, STATUS_GLYPH, fitLegend } from './ui'
-import { ActionButton, BoxButton, Card, Chip, Segment, TreeRow } from './kit'
+import { ActionButton, BoxButton, Card, Chip, ICONS, IconButton, Segment, TreeRow } from './kit'
 import type { ActionSpec } from './kit'
 import { colorStrip, laneStrip, pickBar } from './raster'
 import { PALETTE, ROLE } from './palette'
 import type { PaletteRole } from './palette'
 import { isDoneStatus, laneAgent, routeText } from './plans-map'
+import { canPause, canPlay, depsMet } from './planrun'
 
 type Els = Elements[keyof Elements]
 
@@ -286,15 +287,25 @@ function StateChip(els: Els, label: string, state: PlanState): RenderElement {
 
 const PAUSED = new Set(['paused', 'parked', 'held', 'on_hold'])
 
-/** Design only (no backend yet): `‖` pauses a live phase/task, `▶` resumes a paused one; the
- *  press submits `mk: <pause|resume> <phase|task> <id> plan <plan>` like the plan buttons. */
-function pauseButton(els: Els, key: string, status: string, live: boolean, act: ((kind: string) => void) | undefined, what: string, id: string): RenderElement | null {
+/** `‖` pauses a running phase/task, `▶` resumes a paused one; the glyphs come from the
+ *  kit's ICONS so Play and Pause cannot drift. `canPause` decides a running row;
+ *  a phase whose tasks are building is running even when its own status says planned. */
+function pauseButton(els: Els, key: string, status: string, live: boolean, running: boolean, act: ((kind: string) => void) | undefined, what: string, id: string): RenderElement | null {
   const paused = PAUSED.has(status)
-  if (!paused && !live) return null
+  // only a running plan draws it: a task follows canPause, a phase its building state
+  if (!running || (!paused && !(what === 'task' ? canPause(status, true) : live))) return null
   return BoxButton(els, {
-    key, label: paused ? '▶' : '‖', tone: paused ? 'primary' : 'default',
+    key, label: paused ? ICONS.play.glyph : ICONS.pause.glyph, tone: paused ? 'primary' : 'default',
     onPress: () => { act?.(`${paused ? 'resume' : 'pause'} ${what} ${id}`) },
   })
+}
+
+/** The Play icon of a phase or task: drawn when the plan is running and the row can start
+ *  (its own deps and, for a task, its phase's deps are all merged or done). The press
+ *  drafts its prompt on the Improve card. */
+function playButton(els: Els, key: string, status: string, depsMet: boolean, running: boolean, act: ((kind: string) => void) | undefined, what: string, id: string): RenderElement | null {
+  if (!running || act == null || !canPlay(status, depsMet)) return null
+  return IconButton(els, { key, icon: 'play', onPress: () => { act(`play ${what} ${id}`) } })
 }
 
 /** Pure render: elements only, no $, no state (C1); `ui` is the C12 view state. */
@@ -311,6 +322,8 @@ export function PlanTab(els: Els, view: PlanView, cols: number, ui?: TabUi): Ren
     shared.set(phase.wave, list)
   }
   const act = (kind: string): void => { view.onAction?.(kind, view.plan?.id ?? '') }
+  // Play and Pause exist only while the plan runs (its tasks exist only then)
+  const running = view.plan?.status === 'running'
   const phaseFilter = ui?.get('plan:phase-filter') ?? 'all'
   const attentionCount = phases.filter(p => phaseState(p) === 'attention').length
   // a picked attention chip with nothing left to show falls back to all
@@ -356,7 +369,7 @@ export function PlanTab(els: Els, view: PlanView, cols: number, ui?: TabUi): Ren
             {shownPhases.map((phase, i) => (
               <Box key={`plan-phase-wrap-${phase.id}`} flexDirection="column">
                 {i > 0 && <Text color={PALETTE.line}>{'─'.repeat(Math.max(1, W - 4))}</Text>}
-                {PhaseCard(els, phase, shared.get(phase.wave ?? -1) ?? [], W - 4, compact, ui, act)}
+                {PhaseCard(els, phase, shared.get(phase.wave ?? -1) ?? [], W - 4, compact, ui, act, running, phases)}
               </Box>
             ))}
           </Box>
@@ -430,7 +443,7 @@ export function phaseRouted(phase: PlanPhase): boolean {
 /** One phase Card. Folded (the default) is one row: fold glyph, status glyph,
  *  `<id> · <title>`, the header chip and the laneStrip. A routed phase adds
  *  its dim lane·agent tag right-aligned, and the fold press selects it too. */
-function PhaseCard(els: Els, phase: PlanPhase, waveMates: readonly string[], W: number, compact: boolean, ui?: TabUi, act?: (kind: string) => void): RenderElement {
+function PhaseCard(els: Els, phase: PlanPhase, waveMates: readonly string[], W: number, compact: boolean, ui?: TabUi, act?: (kind: string) => void, running = false, phases: readonly PlanPhase[] = []): RenderElement {
   const { Box, Text } = els
   const legacy = phase.tone != null
   const expanded = legacy ? true : ui?.get(phaseKey(phase.id)) === '1'
@@ -476,14 +489,15 @@ function PhaseCard(els: Els, phase: PlanPhase, waveMates: readonly string[], W: 
         {!compact && routed && lane !== '' && <Text dimColor={true} wrap="truncate-end">{lane}</Text>}
         {others.length > 0 && Chip(els, { label: `with ${others[0]}`, role: 'idle' })}
         {legacy || findings > 0 ? Chip(els, { label: chipLabel, role: chipRole }) : StateChip(els, chipLabel, state)}
-        {!legacy && pauseButton(els, `plan-phase-pause-${phase.id}`, phase.status ?? '', state === 'building', act, 'phase', phase.id)}
+        {!legacy && pauseButton(els, `plan-phase-pause-${phase.id}`, phase.status ?? '', state === 'building', running, act, 'phase', phase.id)}
+        {expanded && !legacy && playButton(els, `plan-phase-play-${phase.id}`, phase.status ?? '', depsMet(phase.deps, phases), running, act, 'phase', phase.id)}
       </Box>
       {expanded && phase.description != null && Describe(els, `plan-desc-${phase.id}`, phase.description, W - 2, 3)}
       {expanded && !routed && (phase.plannedRoute != null || phase.reviewer != null) && (
         <Text key={`plan-who-${phase.id}`} color={PALETTE.mut} wrap="truncate-end">{clip([phase.plannedRoute != null ? `builder ${routeText(phase.plannedRoute)}` : '', phase.reviewer != null ? `reviewer ${phase.reviewer}` : ''].filter(p => p !== '').join(' · '), W - 2)}</Text>
       )}
       {strip}
-      {expanded && !legacy && phase.rows.map((row, i) => TaskBlock(els, row, i === phase.rows.length - 1, W - 4, compact, ui, act))}
+      {expanded && !legacy && phase.rows.map((row, i) => TaskBlock(els, row, i === phase.rows.length - 1, W - 4, compact, ui, act, running, phases))}
       {legacy && phase.rows.map(row => LegacyRow(els, row, W, compact, ui))}
       {expanded && phase.note != null && <Text dimColor={true}>{clip(phase.note, W)}</Text>}
     </Box>
@@ -496,7 +510,7 @@ function PhaseCard(els: Els, phase: PlanPhase, waveMates: readonly string[], W: 
  *  selects the task (`plan:task`); pressing the selected task again clears it.
  *  When the width cannot fit id + ≥10 title cols + the tag, the tag drops
  *  first — the title never shrinks below 10 to keep it. */
-function TaskBlock(els: Els, row: PlanTask, last: boolean, W: number, compact: boolean, ui?: TabUi, act?: (kind: string) => void): RenderElement {
+function TaskBlock(els: Els, row: PlanTask, last: boolean, W: number, compact: boolean, ui?: TabUi, act?: (kind: string) => void, running = false, phases: readonly PlanPhase[] = []): RenderElement {
   const { Box, Text } = els
   const role = roleOf(row.status)
   const title = headline(compact ? row.short?.title ?? row.title : row.title)
@@ -526,7 +540,8 @@ function TaskBlock(els: Els, row: PlanTask, last: boolean, W: number, compact: b
         <Box flexGrow={1} />
         {showLane && <Text dimColor={true} wrap="truncate-end">{lane}</Text>}
         {find > 0 ? Chip(els, { label: `${find} findings`, role: 'warn' }) : sha !== '' ? <Text dimColor={true}>{sha}</Text> : rnd !== '' ? <Text dimColor={true}>{rnd}</Text> : null}
-        {pauseButton(els, `plan-task-pause-${row.id}`, row.status, role === 'live', act, 'task', row.id)}
+        {pauseButton(els, `plan-task-pause-${row.id}`, row.status, role === 'live', running, act, 'task', row.id)}
+        {playButton(els, `plan-task-play-${row.id}`, row.status, depsMet([...(row.deps ?? []), ...(phases.find(p => p.rows.some(r => r.id === row.id))?.deps ?? [])], phases), running, act, 'task', row.id)}
       </Box>
       {subs.map((sub, i) => TreeRow(els, {
         depth: 1,
