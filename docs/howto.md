@@ -19,33 +19,36 @@ Change settings with `claude plugin configure matrixkoder`. The keys are `guards
 
 ## First run and the wizard
 
-Run `/mk setup` (alias `/mk init`). The wizard opens as a pane, one step at a time. Every step is pre-filled from detection; edit only what is wrong. **Nothing is written until the final confirm.** The wizard never asks for API keys.
+Run `/mk setup` (alias `/mk init`). The wizard opens as a pane at 46 columns, one step at a time. Every step is pre-filled from detection; edit only what is wrong. **Nothing is written until the final confirm** — the dashboard preferences included. The wizard never asks for API keys. `/mk init <name>` makes `<name>` the project slug (lowercased, with `_` and `.` folded to `-`); `/mk setup` takes no name.
 
 | # | Step | What it asks |
 |---|---|---|
 | 1 | Install | Shows whether you run from a dev folder or a marketplace install. Info only. |
-| 2 | Data | Where project data lives: always `~/.matrixkoder/projects/<slug>/` (`<slug>` derived from the repo), and the repo keeps no MK data. Info only; the project DB is created on confirm. |
-| 3 | Agents | Which of Claude Code, Codex, OpenCode, AGY you use. Hotkeys 1 to 4 toggle them. If `herdr` is found, choose whether to link the MatrixKoder herdr plugin so pane events push lane verdicts instead of polling. |
-| 4 | Usage | Which CodexBar providers to track. Hotkeys 1 to 9. `zai (OpenCode Z.AI plan)` and `opencode (OpenCode Zen)` are labelled so you pick the right one; zai is pre-selected when your opencode agent is on the Z.AI plan. Shows the z.ai key command (see [Usage tracking](#usage-tracking)). |
-| 5 | Gates | Your test, typecheck, lint and format commands, as text inputs. Detection reads package.json, pyproject.toml, Makefile, `.claude-plugin/plugin.json`, `scripts/selftest.sh`, tsconfig.json, `Cargo.toml` and `go.mod`; when nothing is detected the first field takes the focus so you can just type. |
-| 6 | Routing | Builder order, reserve floors, max lanes, effort by size, reviewers. |
-| 7 | Autonomy | What the orchestrator may do without asking, and what pauses it. |
-| 8 | QA | Whether there is a frontend, its start command, dev URL, and where QA runs. |
-| 9 | Dashboard | Auto-open, status chip, toasts, poll intervals. |
-| 10 | Review | Shows what will be written. `w` writes; `x` closes afterwards. |
+| 2 | Data | Where project data lives. The default is `<repo>/.matrixkoder/`, and the step offers `~/.matrixkoder/projects/<slug>/` instead; `$MATRIXKODER_DATA`, when set, decides it and the step says so. In repo mode it asks whether to add `/.matrixkoder/` to the repo `.gitignore` (a file that already ignores it is only confirmed). A bare repo with no build file starts in home mode; the project DB is created on confirm, not here. |
+| 3 | Agents | Which builders you use, one row per agent on PATH with its state chip, path and model count; hotkeys 1 to 4 toggle Codex, OpenCode, AGY and the herdr agent (Claude Code is always on). Codex and AGY models come from `agy models` and `opencode models` (plus the Z.AI and Ollama Cloud plan lists). If `herdr` is found, choose whether to link the MatrixKoder herdr plugin so pane events push lane verdicts instead of polling. |
+| 4 | Usage | Which CodexBar providers to track. Hotkeys 1 to 9. The short names (`Claude`, `OpenCode Zen`, `Z.AI`, `Ollama`, …) tell the similar ones apart; every provider CodexBar has enabled is pre-selected, and zai joins when your opencode agent is on the Z.AI plan (ollama when Ollama Cloud models are found). Shows the z.ai key command (see [Usage tracking](#usage-tracking)). |
+| 5 | Gates | Five commands, as text inputs: install, test, typecheck, lint_changed, format_changed. They are whole-repo runs — detection proposes `pnpm exec vitest run`, `pnpm exec eslint .`, `ruff check .`, never a `{paths}` token, because nothing expands one. Detection reads package.json, pyproject.toml, Makefile, `.claude-plugin/plugin.json`, `scripts/selftest.sh`, tsconfig.json, `Cargo.toml` and `go.mod`; when nothing is detected the first field takes the focus so you can just type, and an empty command is named as `""` rather than refused. |
+| 6 | Routing | Builder order, max build lanes (1 to 5), the two Claude reserve floors (5h left % and weekly left %), and the integration branch. A builder name that is not an enabled agent, and a branch that is empty or holds spaces, are each named in one dim line and still written as typed. |
+| 7 | Autonomy | Whether builders skip permission prompts (they run in their own worktree only), and what is pre-authorised. |
+| 8 | QA | Whether there is a frontend, the dev URL, the start command (orchestrator only), the themes and the mockups dir, and where QA runs: `local-main` = QA on the running dev server. |
+| 9 | Dashboard | Auto-open, status chip, toasts, and the usage poll in minutes. These are plugin settings, and they are saved with everything else when you confirm: there is no Apply button here. A poll that is not a whole number of minutes ≥ 1 is named as written 5. |
+| 10 | Review | Shows exactly what will be written: the whole file, scrollable, with the timestamp the write will stamp. If a settings file already exists you choose keep (the default, which shows that file untouched) or replace, which shows a real `-`/`+` diff against it and a `N lines changed · M unchanged` count. `w` writes; `x` closes afterwards. |
 
-Steps 5 to 9 have text inputs, so they have no single-key hotkeys.
+Steps 5 to 9 have text inputs, so they have no single-key hotkeys: Tab moves between the fields and `↵` goes on to the next step.
 
 On confirm the wizard writes:
 
-- `~/.matrixkoder/projects/<slug>/project.yaml` (today's `matrixkoder.yaml`) — your repo settings, the legacy layer under the project DB and `~/.matrixkoder/mk-settings.yaml`. If one exists you choose keep (default) or replace; replace backs the old file up to `.bak`.
-- `~/.matrixkoder/projects/<slug>/mk-project.db` (existing projects keep `mk.db`) — the project DB, the ONLY source of truth (`/mk setup` always creates it; file mode is dropped).
-- `~/.matrixkoder/mk-overview.db` (an existing home keeps `mk.db`) — the root DB, updated with this project's `slug, repo, data_dir, mode, db_path` row.
-- The `projects/<slug>/plans/` and `projects/<slug>/plans/<plan>/runs/` folders under `~/.matrixkoder/`, as runs are created. The repo keeps no MK data, so no gitignore entry is written.
+- The settings file under the data dir: `<repo>/.matrixkoder/matrixkoder.yaml` in repo mode, `~/.matrixkoder/projects/<slug>/matrixkoder.yaml` in home mode, and `project.yaml` in the same place once the project is migrated — your repo settings, the legacy layer under the project DB and `~/.matrixkoder/mk-settings.yaml`. If one exists you choose keep (default) or replace; replace backs the old file up to `.bak`, writes a temp file and moves it into place, and a kept file is left byte-identical.
+- `/.matrixkoder/` in the repo `.gitignore`, when you chose repo mode and said yes.
+- `<data>/mk-project.db` (existing projects keep `mk.db`) — the project DB, the ONLY source of truth. It is created at the write by `mk-state.py sync`, the script that owns it; once the project is migrated that folder is `~/.matrixkoder/projects/<slug>/`.
+- `~/.matrixkoder/mk-overview.db` (an existing home keeps `mk.db`) — the root DB, with this project's `slug, repo, data_dir` row. `db_path` is set only by `mk-migrate.py --switch`, and it is what marks a project migrated.
+- `<data>/plans/` and `<data>/runs/`, made at once; plan and run folders fill in as runs are created. In home mode the repo keeps no MK data; in repo mode `/.matrixkoder/` is the gitignore entry above.
 
-Dashboard preferences (auto-open, chip, toasts, poll interval) are plugin settings — `claude plugin configure matrixkoder` — not files the wizard writes.
+Dashboard preferences (auto-open, chip, toasts, poll interval) are plugin settings — `claude plugin configure matrixkoder` — not files the wizard writes; they are set at the same confirm as everything else.
 
-If the pane cannot open (not fullscreen, or too narrow), the same questions are asked in chat.
+When the write made the file (a create or a replace), the wizard then runs `mk-config.py migrate` on the data dir: it adds the `session:`, `picks:`, `lanes.default_agent` and reviewer keys an old file lacks and drops the dead yaml copies of plugin settings. A kept file is not migrated — keep means keep. A failure warns on the post-write line and never fails the wizard.
+
+If the pane cannot open (not fullscreen), `/mk setup` answers with a read-only summary of what detection found, ending `Nothing was written.` There are no chat questions and no width check: a docked or inline pane draws the steps, and the mobile app (which draws no text fields) gets a notice saying to run it on desktop.
 
 ## Reading the dashboard
 
@@ -88,7 +91,7 @@ What lands on disk:
 |---|---|
 | `~/.matrixkoder/mk-overview.db` (existing homes: `mk.db`) | Root DB, schema 3 — overview numbers and linkage only (`projects` with `slug, repo, data_dir, mode, db_path`; `plan_summary` with `project, plan, title, status, counts_json, live_run, updated`). No task rows, no events; `mkdb.py root-cleanup` removes older leftovers. |
 | `~/.matrixkoder/projects/<slug>/mk-project.db` (existing projects: `mk.db`) | The project DB, schema 7 — the ONLY source of truth. Run/task/event, live bus rows, `settings`, `watch_cursors` and `lane_slots` live here. |
-| `~/.matrixkoder/projects/<slug>/project.yaml` | Legacy settings layer from the wizard (today's `matrixkoder.yaml`); `agents.*`, `picks.*` and `helpers.*` stay here. |
+| `~/.matrixkoder/projects/<slug>/project.yaml` | Legacy settings layer for a migrated project (a project not yet migrated keeps the wizard's `<data>/matrixkoder.yaml`); `agents.*` and `picks.*` stay here. The wizard writes no `helpers.*` block. |
 | `~/.matrixkoder/mk-settings.yaml` | Global settings layer (`mk-config.py set --global`). |
 | `~/.matrixkoder/inbox/<plan-id>/` | A plan and its docs dropped for `mk-plan.py import`, which moves `plan.md` to the plan file and the rest into the project's `assets/`. |
 | `~/.matrixkoder/projects/<slug>/plans/<plan>/plan.md`, `assets/`, `archive/` | The plan, its mockups/design files, and `plan-v1.md, plan-v2.md …`. |
