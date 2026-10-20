@@ -2,7 +2,7 @@
 import { test, expect } from 'claude-code/testing'
 import list from './fixtures/plans-list'
 import detail from './fixtures/plan-detail'
-import { laneAgent, naturalCompare, planFromReply, plansErrorLine, plansFromOverview, plansFromReply } from './plans-map'
+import { laneAgent, naturalCompare, planFromReply, plansErrorLine, plansFromOverview, plansFromReply, storeGroups } from './plans-map'
 import liveOverview from './fixtures/overview-live'
 import type { PlansView } from './plans'
 
@@ -410,4 +410,19 @@ test('the captured detail carries the fixture descriptions', () => {
   expect(view.phases?.[0]?.description).toContain('throwaway home folder')
   expect(view.phases?.[0]?.rows[0]?.description).toContain('same folder')
   expect(view.phases?.[1]).not.toHaveProperty('description')
+})
+
+// Regression guard for the K1.1 move out of the old Kanban tab: passes on the old
+// code too. Plans and the Todo tab name a store through this one grouping.
+test('storeGroups folds shared stores, keeps first-seen order and drops storeless rows', () => {
+  const groups = storeGroups([
+    { slug: 'mk-alias', repo: '/Users/me/dev/matrixkoder', db_path: '/data/matrixkoder/mk.db' },
+    { slug: 'other', repo: '/Users/me/dev/other', data_dir: '/data/other' },
+    { slug: 'matrixkoder', repo: '/Users/me/dev/matrixkoder', db_path: '/data/matrixkoder/mk.db' },
+    { slug: 'nowhere', repo: '/Users/me/dev/nowhere' },
+  ])
+  expect(groups).toEqual([
+    { dir: '/data/matrixkoder', slug: 'matrixkoder' },
+    { dir: '/data/other', slug: 'other' },
+  ])
 })

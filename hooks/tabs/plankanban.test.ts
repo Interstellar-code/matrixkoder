@@ -13,6 +13,7 @@ import {
   columnOfTask,
   planKanbanView,
   planKanbanSideBySide,
+  timeInStatus,
   verdictNeedsChanges,
 } from './plankanban'
 import type { PlanKanbanView } from './plankanban'
@@ -227,13 +228,13 @@ test('narrow (36 cols) stacks the columns; wide keeps them side by side', () => 
   expect(wideParent?.props.flexDirection).toBe('row')
 })
 
-test('footer: <n> tasks · same cards as k, this plan only · source project, following the filter', () => {
+test('footer: <n> tasks · this plan only · source project, following the filter', () => {
   const tree = PlanKanbanTab(stubEls(), view, W80, uiOf().handle)
-  expect(text(tree)).toContain('32 tasks · same cards as k, this plan only')
+  expect(text(tree)).toContain('32 tasks · this plan only')
   expect(text(tree)).toContain('source project')
   const { handle } = uiOf(new Map([['plankanban:phase', 'S1']]))
   const narrowed = PlanKanbanTab(stubEls(), view, W80, handle)
-  expect(text(narrowed)).toContain('2 tasks · same cards as k, this plan only')
+  expect(text(narrowed)).toContain('2 tasks · this plan only')
 })
 
 test('no KanbanTab chrome: no Needs you off line, no Backlog/Ready/Verify headings', () => {
@@ -521,7 +522,7 @@ test('report render: the captured fixture at 80 cols, exactly as pasted', () => 
                                                             │ ╰─────────────╯ │
                                                             ╰─────────────────╯
 
-32 tasks · same cards as k, this plan only                        source project`)
+32 tasks · this plan only                                         source project`)
 })
 
 test('report render: the captured fixture at 36 cols, exactly as pasted', () => {
@@ -690,8 +691,7 @@ test('report render: the captured fixture at 36 cols, exactly as pasted', () => 
 │ ╰──────────────────────────────╯ │
 ╰──────────────────────────────────╯
 
-32 tasks · same cards as k, this
-plan only
+32 tasks · this plan only
                       source project`)
 })
 test('F.8: a rework status maps to NEEDS YOU via the map, and its card lands in the NEEDS YOU column', () => {
@@ -817,4 +817,9 @@ test('F.8: a row without the risk keys renders byte-identically even when a sibl
   expect(allOf(plainCard, 'Text').map(t => text(t)),
     'the absent row renders exactly as on main: byte-identical with a risky sibling beside it')
     .toEqual(allOf(riskyCard, 'Text').map(t => text(t)))
+})
+
+// Regression guard for the K1.1 move out of the old Kanban tab: passes on the old code too.
+test('timeInStatus of one hour before is 1h', () => {
+  expect(timeInStatus('2026-10-12T09:00:00+02:00', '2026-10-12T10:00:00+02:00')).toBe('1h')
 })

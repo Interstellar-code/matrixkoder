@@ -3,18 +3,28 @@
 // NEEDS YOU · ON MAIN) of THIS plan's tasks, a phase filter row, and a dim
 // footer. Pure render from the raw `plans <id>` reply — kept raw because the
 // mapped PlanView (plans-map.ts) drops `verdict`, which the NEEDS YOU rule
-// reads. The top-level `k` tab (KanbanTab) is untouched: only the Plan
-// sub-tab changes.
+// reads.
 import type { Elements, RenderElement } from 'claude-code'
 import { NARROW } from './ui'
 import { ActionButton, Card, Chip, Segment } from './kit'
 import { PALETTE, ROLE } from './palette'
 import type { PaletteRole } from './palette'
-import { timeInStatus } from './kanban'
 import { laneAgent, routeFields } from './plans-map'
 import type { PlanRoute } from './plan'
 
 type Els = Elements[keyof Elements]
+
+/** Minutes between `updated` and `nowIso`. Unparseable clocks yield an em dash. */
+export function timeInStatus(updated: string, nowIso: string): string {
+  const a = Date.parse(updated)
+  const b = Date.parse(nowIso)
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return '—'
+  const mins = Math.max(0, Math.round((b - a) / 60000))
+  if (mins < 60) return `${String(mins)}m`
+  const hours = Math.floor(mins / 60)
+  if (hours < 48) return `${String(hours)}h`
+  return `${String(Math.floor(hours / 24))}d`
+}
 
 /** C12: this tab's view-state handle — declared locally (structural typing; no
  *  import crosses lanes). */
@@ -78,7 +88,7 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 const str = (value: unknown): string => (typeof value === 'string' ? value : '')
 
 /** `22m` / `8h` / `2d` from `updated` against `nowIso`; '' when either side is
- *  missing or unparseable (KanbanTab's timeInStatus, dimmed to nothing). */
+ *  missing or unparseable (timeInStatus, dimmed to nothing). */
 const ageOf = (updated: string, nowIso: string): string => {
   if (updated === '' || nowIso === '') return ''
   const got = timeInStatus(updated, nowIso)
@@ -290,7 +300,7 @@ export function PlanKanbanTab(els: Els, view: PlanKanbanView, cols: number, ui?:
         </Box>
       )}
       <Box flexDirection="row" justifyContent="space-between" gap={1}>
-        <Text dimColor={true}>{`${shown.length} tasks · same cards as k, this plan only`}</Text>
+        <Text dimColor={true}>{`${shown.length} tasks · this plan only`}</Text>
         <Text dimColor={true}>source project</Text>
       </Box>
     </Box>
