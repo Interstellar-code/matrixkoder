@@ -81,6 +81,10 @@ export function readRewrite(text: string): { upgraded: string; added: string[] }
   return { upgraded: raw.prompt.trim(), added }
 }
 
+/** the layout every written text follows, so a long one reads as points, not one block */
+export const FORMAT_RULE =
+  '- Layout: one or two sentences fit on one line. Anything longer opens with one short sentence, then a numbered list (1. 2. 3.), one point per line, separated by "\\n". No headings, no bold, no emoji.'
+
 export const QUESTIONS_SYSTEM =
   'You help people turn a rough prompt into a great one. You never answer the prompt itself. You reply with JSON only.'
 
@@ -158,6 +162,7 @@ export const rewritePrompt = (original: string, pairs: readonly { question: stri
     '- Use what they answered. Leave out anything they skipped.',
     '- Never invent facts, names, numbers or prices. Where something is unknown, leave a [placeholder] in square brackets.',
     '- Write it as one request the person could have typed themselves, in plain language.',
+    FORMAT_RULE,
     '- If the prompt is already clear and complete, return it unchanged.',
     '',
     'Reply with JSON only, in this shape:',
@@ -227,7 +232,8 @@ export const draftPrompt = (mode: 'answer' | 'question', hint: string, ctx: { ea
         ]),
     ...(hint.trim() !== '' ? ['', 'The person started typing this; follow its intent:', '<hint>', hint.trim(), '</hint>'] : []),
     '',
-    'Rules: 1 to 3 sentences, plain words, the way a busy person types. Never invent facts, names or numbers; use a [placeholder] for anything unknown.',
+    'Rules: short, plain words, the way a busy person types. Never invent facts, names or numbers; use a [placeholder] for anything unknown.',
+    FORMAT_RULE,
     '',
     'Reply with JSON only, in this shape:',
     '{"prompt":"<the message>","added":["<one short note per choice you made>"]}',
@@ -241,6 +247,14 @@ export function wrap(text: string, width: number): string[] {
   for (const para of text.replace(/\r/g, '').split('\n')) {
     if (para.trim() === '') {
       out.push('')
+      continue
+    }
+    // a list point ("1. ", "- ") wraps under its own text, not under the marker
+    const marker = /^\s*(\d+[.)]|[-*•])\s+/.exec(para)
+    if (marker != null && marker[1] != null && marker[1].length + 1 <= w / 2) {
+      const lead = `${marker[1]} `
+      const inner = wrap(para.slice(marker[0].length), w - lead.length)
+      inner.forEach((l, i) => out.push((i === 0 ? lead : ' '.repeat(lead.length)) + l))
       continue
     }
     let line = ''

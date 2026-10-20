@@ -2,7 +2,7 @@
 // ported from the standalone Prompt Upgrade mod.
 import { test, expect } from 'claude-code/testing'
 import {
-  answeredPairs, bigDigits, bigNumber, clip, contextBlock, draftContext, extractJson, finalText, newImproveFlow, questionsPrompt,
+  FORMAT_RULE, answeredPairs, bigDigits, bigNumber, clip, contextBlock, draftContext, draftPrompt, extractJson, finalText, newImproveFlow, questionsPrompt,
   readQuestions, readRewrite, rewritePrompt, wordCount, wrap,
 } from './improve-core'
 
@@ -176,4 +176,22 @@ test('draftContext: the latest exchange is whole and apart; the oldest rows are 
   const long = draftContext([{ role: 'user', text: 'go' }, { role: 'assistant', text: 'y'.repeat(9000) }])
   expect(long.latest.split('\n')[1]?.length).toBe('Assistant: '.length + 4000)
   expect(draftContext([]).latest).toBe('')
+})
+
+test('wrap: a numbered or dashed point wraps under its own text; lines never pass the width', () => {
+  const out = wrap('Do three things:\n1. Run the full test suite and report the counts\n- check the docs', 20)
+  expect(out[0]).toBe('Do three things:')
+  expect(out[1]).toBe('1. Run the full test')
+  expect(out[2]).toBe('   suite and report')
+  expect(out[3]).toBe('   the counts')
+  expect(out[4]).toBe('- check the docs')
+  expect(out.every(l => l.length <= 20)).toBe(true)
+})
+
+test('every written text is asked for the list layout: Improve rewrite, Answer and Question', () => {
+  const ctx = { earlier: '', latest: 'Person: go\nAssistant: done' }
+  for (const p of [rewritePrompt('rough', []), draftPrompt('answer', '', ctx), draftPrompt('question', '', ctx)]) {
+    expect(p).toContain(FORMAT_RULE)
+  }
+  expect(FORMAT_RULE).toContain('numbered list')
 })

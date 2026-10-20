@@ -195,7 +195,7 @@ function footerCard(els: Els, f: MkImproveFlow, cols: number, act: (kind: Improv
       <Box flexDirection="column">
         {head(DRAFT_WORDS[mode].head, `${String(wordCount(finalText(f)))} words`)}
         {f.original !== '' && lines(els, 'improve-f-hint', `from what you typed: ${f.original}`, w, 1, { dimColor: true })}
-        {lines(els, 'improve-f-new', finalText(f), w, 6, { color: PALETTE.fg })}
+        {lines(els, 'improve-f-new', finalText(f), w, 10, { color: PALETTE.fg })}
         {f.note !== '' ? <Text dimColor={true} wrap="truncate-end">{f.note}</Text> : lines(els, 'improve-f-help', DRAFT_HELP, w, 2, { dimColor: true })}
         {chipRows(els, [
           { key: 'improve-f-send', label: '↵ Send', tone: 'solid', onPress: () => act('send') },
@@ -217,7 +217,7 @@ function footerCard(els: Els, f: MkImproveFlow, cols: number, act: (kind: Improv
       <Box flexDirection="column">
         {head('✦ IMPROVED PROMPT', countsLabel(wordCount(f.original), wordCount(finalText(f)), w - 18))}
         {lines(els, 'improve-f-was', f.original, w, 2, { dimColor: true, strikethrough: true })}
-        {lines(els, 'improve-f-new', finalText(f), w, 6, { color: PALETTE.fg })}
+        {lines(els, 'improve-f-new', finalText(f), w, 10, { color: PALETTE.fg })}
         {f.note !== '' && <Text dimColor={true} wrap="truncate-end">{f.note}</Text>}
         {chipRows(els, [
           { key: 'improve-f-accept', label: '↵ Accept', tone: 'solid', onPress: () => act('accept') },
