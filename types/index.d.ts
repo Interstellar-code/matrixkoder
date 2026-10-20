@@ -138,9 +138,15 @@ export type MkImproveAnswer =
 /** asking = the wizard's questions are being written, writing = the rewrite is, review = a proposal is on show */
 export type MkImproveStep = 'asking' | 'questions' | 'writing' | 'review' | 'error'
 
+/** improve = rewrite the prompt line; answer / question = draft the person's next message from the conversation */
+export type MkImproveMode = 'improve' | 'answer' | 'question'
+
 /** one improvement from the press of Improve to its review */
 export type MkImproveFlow = {
   id: string
+  /** absent = improve (flows saved before the drop-up) */
+  mode?: MkImproveMode
+  /** improve: the prompt line's text; answer / question: what the line held as a hint, or '' */
   original: string
   step: MkImproveStep
   questions: MkImproveQuestion[]
@@ -167,6 +173,8 @@ export type MkImprove = {
   /** what Accept wrote into the prompt line: Undo stands only while the line still holds it */
   written: string | null
   flow: MkImproveFlow | null
+  /** the footer's Improve drop-up (Improve / Answer / Question) is open */
+  menu?: boolean
 }
 
 /** one saved improvement (the last 20, also kept in $.store) */

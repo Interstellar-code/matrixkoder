@@ -142,7 +142,34 @@ test('footer: the solid Improve chip with black bold text and two dashed + tool 
   expect(f).not.toContain('❯')
   expect(inputs.get('improve-q')).toBeUndefined()
   presses.get('improve-f-go')?.()
-  expect(calls).toEqual([['improve', undefined, undefined]])
+  expect(calls).toEqual([['menu', undefined, undefined]])
+})
+
+test('footer drop-up: open, it lists Improve, Answer and Question with what each does; each row asks its own action', () => {
+  expect(flat(footer(viewOf({ flow: null, history: [] })).tree)).not.toContain('reply to the last message')
+  const { tree, calls } = footer(viewOf({ flow: null, history: [], menu: true }))
+  const f = flat(tree)
+  expect(f).toContain('✦ Improve ▾')
+  expect(f).toContain('rewrite my prompt')
+  expect(f).toContain('reply to the last message')
+  expect(f).toContain('ask about it')
+  presses.get('improve-f-m-improve')?.()
+  presses.get('improve-f-m-answer')?.()
+  presses.get('improve-f-m-question')?.()
+  expect(calls).toEqual([['improve', undefined, undefined], ['compose', 'answer', undefined], ['compose', 'question', undefined]])
+})
+
+test('footer card: a drafted answer shows its head, the hint, the draft and Send / Edit / Discard; no Run Wizard', () => {
+  const { tree, calls } = footer(viewOf({ flow: flowOf({ mode: 'answer', original: 'ok go', upgraded: 'Looks good, ship it.' }) }))
+  const f = flat(tree)
+  expect(f).toContain('✦ DRAFTED ANSWER')
+  expect(f).toContain('hint: ok go')
+  expect(f).toContain('Looks good, ship it.')
+  expect(f).not.toContain('Run Wizard')
+  presses.get('improve-f-send')?.()
+  presses.get('improve-f-accept')?.()
+  expect(calls.map(c => c[0])).toEqual(['send', 'accept'])
+  expect(flat(footer(viewOf({ flow: flowOf({ mode: 'question', step: 'writing', original: '' }) })).tree).replace(/\n/g, ' ')).toContain('drafting a question')
 })
 
 test('footer: the Undo chip shows only after an accept, beside Improve', () => {
@@ -388,9 +415,10 @@ test('F10: the footer chip row drops the slots that do not fit, and the Improve 
     expect(textOf(tree, '✦ Improve'), `Improve at ${cols}`).toBeTruthy()
     expect(textOf(tree, '↶ Undo'), `Undo at ${cols}`).toBeTruthy()
   }
-  // 36 cols with Undo: Improve + Undo + one slot fit (11 + 8 + 10 + gaps), the second slot is dropped
+  // 36 cols (34 inside): Improve ▴ + one slot fit (13 + 10 + gap), with or without Undo; the second slot is dropped
   expect(texts(footer(viewOf({ flow: null, undo: 'x' }), 36).tree).filter(s => s.includes('+ tool'))).toHaveLength(1)
-  expect(texts(footer(viewOf({ flow: null, undo: null }), 36).tree).filter(s => s.includes('+ tool'))).toHaveLength(2)
+  expect(texts(footer(viewOf({ flow: null, undo: null }), 36).tree).filter(s => s.includes('+ tool'))).toHaveLength(1)
+  expect(texts(footer(viewOf({ flow: null, undo: null }), 46).tree).filter(s => s.includes('+ tool'))).toHaveLength(2)
 })
 
 test('without an Input element the footer and the tab still draw every non-field row', () => {

@@ -17,8 +17,8 @@ import {
 import type { MkPaneSnapshot } from './data'
 import { beginStoreTick, endStoreTick, globalDirOf, homeDir, paths, projectYamlPath, resolveDataDir, resetStoreMemo } from './paths'
 import {
-  IMPROVE_EMPTY, IMPROVE_FAILED, IMPROVE_FILL_FAILED, IMPROVE_MODEL, QUESTIONS_SYSTEM, REWRITE_SYSTEM, answeredPairs, canAccept, contextBlock, finalText,
-  newImproveFlow, questionsPrompt, readQuestions, readRewrite, rewritePrompt,
+  DRAFT_EMPTY, DRAFT_MESSAGES, DRAFT_SEND_FAILED, DRAFT_SYSTEM, IMPROVE_EMPTY, IMPROVE_FAILED, IMPROVE_FILL_FAILED, IMPROVE_MODEL, QUESTIONS_SYSTEM, REWRITE_SYSTEM,
+  answeredPairs, canAccept, contextBlock, draftPrompt, finalText, modeOf, newImproveFlow, questionsPrompt, readQuestions, readRewrite, rewritePrompt,
 } from './improve-core'
 import { NARROW, STATUS_GLYPH } from './tabs/ui'
 import { stageWord, STAGE_TOTAL } from './tabs/header'
@@ -358,7 +358,7 @@ export function registerDashboard(on: On, options: PluginOptions): void {
       todoAct: (kind, arg) => { void todoAction($, kind, arg) },
       improveAct: (kind, a, b) => { void improveAction($, kind, a, b) },
     }
-    const improveView: ImproveView = { mock: false, undo: improve.undo, flow: improve.flow, history: improveHistory }
+    const improveView: ImproveView = { mock: false, undo: improve.undo, flow: improve.flow, history: improveHistory, menu: improve.menu === true }
     // S3: the live Settings view once loaded. Before that a one-line
     // skeleton draws — never the fixture's mock rows (LOW 1). A tab opened
     // straight onto settings (defaultTab) loads here while nothing is stored;
@@ -389,7 +389,7 @@ export function registerDashboard(on: On, options: PluginOptions): void {
     // Matrix theme across the whole pane: palette.ts swaps PALETTE/ROLE for this synchronous build
     // docked, the body is a window the engine scrolls over the tree: the footer is drawn at the window's last rows instead of the tree's
     const docked = e.props.placement === 'dock' && e.props.scroll != null
-    const pinnedRows = pinnedFooterRows(snap)
+    const pinnedRows = pinnedFooterRows(snap, improve.menu === true)
     return withTheme('matrix', () => {
       // every Text in the pane gets the Matrix greens (a plain or dim Text would draw terminal grey)
       const els = themeText(rawEls)
@@ -498,6 +498,7 @@ function withViewState<V>(
 async function switchTab($: EngineInterface, tab: MkDashTab): Promise<void> {
   await update($, dashTabAtom, () => tab)
   await setViewKey($, 'settings:focus', '')
+  await update($, improveAtom, prev => (prev.menu === true ? { ...prev, menu: false } : prev)) // the drop-up closes on a tab switch
   if (tab === 'settings') void ensureSettingsLoaded($)
   if (tab === 'todo') void kickTodos($) // the first list should not wait for the 5 s tick
   if (tab === 'plan') void kickPlans($) // the gated tab loads on open, not 5 s later
@@ -1796,6 +1797,7 @@ const IMPROVE_STORE_KEY = 'improveHistory'
 const IMPROVE_KEEP = 20
 const IMPROVE_SAVED_CHARS = 4000 // the store is one 4 MiB file shared with wake: a pasted wall of text must not fill it
 let improveSeq = 0 // two Improve presses inside one clock tick still get two ids
+const draftSending = new Set<string>() // drafted-message flows whose Send is in flight
 
 /** the open improvement, changed only while it is still the one that asked */
 const patchFlow = ($: EngineInterface, id: string, change: Partial<MkImproveFlow>): Promise<unknown> =>
@@ -1876,9 +1878,24 @@ async function improveAsk($: EngineInterface, id: string): Promise<void> {
 async function improveWrite($: EngineInterface, id: string): Promise<void> {
   const f = (await read($, improveAtom)).flow
   if (f == null || f.id !== id || f.step !== 'writing') return
+  const mode = modeOf(f)
+  let call
+  if (mode === 'improve') {
+    call = { system: REWRITE_SYSTEM, prompt: rewritePrompt(f.original, answeredPairs(f), await improveContext($)) }
+  } else {
+    // Answer / Question read the last DRAFT_MESSAGES messages; with none there is nothing to reply to
+    let ctx = ''
+    // 4000 chars a message: the assistant's latest report or question is the text the draft answers
+    try { ctx = contextBlock(await $.session.messages(), DRAFT_MESSAGES, 4000) } catch { ctx = '' }
+    if (ctx === '') {
+      await update($, improveAtom, s => (s.flow != null && s.flow.id === id && s.flow.step === 'writing' ? { ...s, flow: { ...s.flow, step: 'error' as const, failedStep: 'rewrite' as const, error: DRAFT_EMPTY } } : s))
+      return
+    }
+    call = { system: DRAFT_SYSTEM, prompt: draftPrompt(mode, f.original, ctx) }
+  }
   let r
   try {
-    r = await $.model.complete({ model: IMPROVE_MODEL, system: REWRITE_SYSTEM, prompt: rewritePrompt(f.original, answeredPairs(f), await improveContext($)), maxTokens: 2000, timeoutMs: 60_000 })
+    r = await $.model.complete({ model: IMPROVE_MODEL, ...call, maxTokens: 2000, timeoutMs: 60_000 })
   } catch {
     await failFlow($, id, 'rewrite')
     return
@@ -1887,8 +1904,9 @@ async function improveWrite($: EngineInterface, id: string): Promise<void> {
   if (cur == null || cur.id !== id || cur.step !== 'writing') return
   const out = r.isAnswered ? readRewrite(r.text) : null
   if (out == null) { await failFlow($, id, 'rewrite'); return }
-  await patchFlow($, id, { step: 'review', upgraded: out.upgraded, added: out.added, draft: '', isEditing: false, note: wizardNote(f) })
+  await patchFlow($, id, { step: 'review', upgraded: out.upgraded, added: out.added, draft: '', isEditing: false, note: mode === 'improve' ? wizardNote(f) : '' })
   void $.ui.scroll({ in: PANE_ID, to: 'end' }).catch(() => {}) // the card ends the content; docked, the pinned strip sits under it
+  if (mode !== 'improve') return // a drafted message is not a saved improvement
   const entry: MkImproveEntry = { id, at: await $.clock.now(), original: f.original.slice(0, IMPROVE_SAVED_CHARS), upgraded: out.upgraded.slice(0, IMPROVE_SAVED_CHARS), added: out.added }
   const list = await update($, improveHistoryAtom, prev => [entry, ...prev.filter(x => x.id !== id)].slice(0, IMPROVE_KEEP))
   try { await $.store.set(IMPROVE_STORE_KEY, list) } catch { /* the list stays for this session; the next save tries again */ }
@@ -1916,17 +1934,46 @@ async function improveAction($: EngineInterface, kind: ImproveKind, a?: string |
   const text = typeof a === 'string' ? a : b ?? ''
   const s = await read($, improveAtom)
   const f = s.flow
-  if (kind === 'improve' || (kind === 'retry' && f != null && f.step === 'error' && f.original.trim() === '')) {
-    if (f != null && (f.step === 'asking' || f.step === 'writing')) return
+  if (kind === 'menu') {
+    await update($, improveAtom, prev => ({ ...prev, menu: prev.menu !== true }))
+  } else if (kind === 'improve' || (kind === 'retry' && f != null && f.step === 'error' && f.original.trim() === '' && modeOf(f) === 'improve')) {
+    if (f != null && (f.step === 'asking' || f.step === 'writing')) {
+      await update($, improveAtom, prev => ({ ...prev, menu: false }))
+      return
+    }
     // the draft in Claude Code's own prompt line, read at the press (never rejects; '' with no box)
     const original = (await $.prompt.read()).text.trim()
     const id = `${String(await $.clock.now())}-${String(++improveSeq)}`
     if (original === '') {
-      await update($, improveAtom, prev => ({ ...prev, flow: { ...newImproveFlow(id, '', 'error'), error: IMPROVE_EMPTY } }))
+      await update($, improveAtom, prev => ({ ...prev, menu: false, flow: { ...newImproveFlow(id, '', 'error'), error: IMPROVE_EMPTY } }))
       return
     }
-    await update($, improveAtom, prev => ({ ...prev, flow: newImproveFlow(id, original) }))
+    await update($, improveAtom, prev => ({ ...prev, menu: false, flow: newImproveFlow(id, original) }))
     improveLater($, id, 'rewrite', () => improveWrite($, id))
+  } else if (kind === 'compose' && (a === 'answer' || a === 'question')) {
+    // draft the person's next message from the conversation; what the prompt line holds is a hint, never required
+    if (f != null && (f.step === 'asking' || f.step === 'writing')) {
+      await update($, improveAtom, prev => ({ ...prev, menu: false }))
+      return
+    }
+    const hint = (await $.prompt.read()).text.trim()
+    const id = `${String(await $.clock.now())}-${String(++improveSeq)}`
+    await update($, improveAtom, prev => ({ ...prev, menu: false, flow: newImproveFlow(id, hint, 'writing', a) }))
+    improveLater($, id, 'rewrite', () => improveWrite($, id))
+  } else if (kind === 'send') {
+    // a drafted message goes in as the person's own words; a hint left in the prompt line is cleared with it
+    if (f == null || modeOf(f) === 'improve' || !canAccept(f) || draftSending.has(f.id)) return
+    draftSending.add(f.id) // a second press while the first submit is out must not send it twice
+    let sent = false
+    try { sent = (await $.prompt.submit({ text: finalText(f), asUser: true })).drop == null } catch { sent = false } finally { draftSending.delete(f.id) }
+    if (!sent) {
+      await patchFlow($, f.id, { note: DRAFT_SEND_FAILED })
+      return
+    }
+    await update($, improveAtom, prev => (prev.flow != null && prev.flow.id === f.id ? { ...prev, flow: null } : prev))
+    if (f.original !== '' && (await $.prompt.read()).text.trim() === f.original) {
+      await $.prompt.fill({ text: '', mode: 'replace' }).catch(() => undefined)
+    }
   } else if (kind === 'accept') {
     // the proposal goes into the prompt line over the draft; the text it replaced is kept for Undo
     if (f == null || !canAccept(f)) return
@@ -1965,8 +2012,8 @@ async function improveAction($: EngineInterface, kind: ImproveKind, a?: string |
     const id = f.id
     const ix = typeof a === 'number' ? String(a) : ''
     if (kind === 'wizard') {
-      // Run Wizard on the proposal on show: the same card turns to the questions
-      if (await moveFlow($, id, ['review'], cur => ({ upgraded: cur.isEditing && cur.draft.trim() !== '' ? cur.draft : cur.upgraded, step: 'asking', questions: [], answers: {}, other: null, otherDraft: '', isEditing: false, note: '' }))) {
+      // Run Wizard on the proposal on show: the same card turns to the questions (improvements only)
+      if (modeOf(f) === 'improve' && await moveFlow($, id, ['review'], cur => ({ upgraded: cur.isEditing && cur.draft.trim() !== '' ? cur.draft : cur.upgraded, step: 'asking', questions: [], answers: {}, other: null, otherDraft: '', isEditing: false, note: '' }))) {
         improveLater($, id, 'questions', () => improveAsk($, id))
       }
     } else if (kind === 'answer' && typeof a === 'number') {
@@ -3006,8 +3053,8 @@ export function openWaiting(asks: readonly unknown[], run: MkRun | null): number
 }
 
 /** rows the pinned footer takes: the rule, the Improve chips, and the counts row while a run is on show */
-export function pinnedFooterRows(snap: MkSnapshot): number {
-  return 2 + (snap.run != null ? 1 : 0)
+export function pinnedFooterRows(snap: MkSnapshot, menu = false): number {
+  return 2 + (snap.run != null ? 1 : 0) + (menu ? 3 : 0) // the open drop-up adds its three rows above the chips
 }
 
 function PaneFooter(els: Els, snap: MkSnapshot, waiting: number, cols: number, improve: ImproveView, ui: TabUi, card: boolean) {

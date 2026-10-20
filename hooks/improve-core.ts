@@ -2,7 +2,7 @@
 // what comes back, the conversation context and the text sizing. Ported from the standalone
 // Prompt Upgrade mod (my-mods/better/hooks/logic.ts); the $-bound flow lives in dashboard.tsx and
 // the drawing in tabs/improve.tsx.
-import type { MkImproveAnswer, MkImproveFlow, MkImproveQuestion, MkImproveStep } from '../types'
+import type { MkImproveAnswer, MkImproveFlow, MkImproveMode, MkImproveQuestion, MkImproveStep } from '../types'
 
 export const IMPROVE_MODEL = 'haiku'
 
@@ -12,11 +12,19 @@ export const IMPROVE_EMPTY = 'Type a prompt in Claude Code’s prompt line, then
 /** the prompt line refused the write (a dialog, or no composer): nothing is lost, Accept can be tried again */
 export const IMPROVE_FILL_FAILED = 'Prompt line busy. Close dialogs, Accept again.'
 
+/** an Answer or Question press with no conversation to read */
+export const DRAFT_EMPTY = 'Nothing to reply to yet: the conversation is empty.'
+/** the prompt queue refused the message: it stays on show, Edit puts it in the prompt line */
+export const DRAFT_SEND_FAILED = 'Could not send it. Press Edit to put it in the prompt line.'
+
 /** a fresh improvement for `original`, in `step` (writing = the default one-call rewrite) */
-export const newImproveFlow = (id: string, original: string, step: MkImproveStep = 'writing'): MkImproveFlow => ({
-  id, original, step, questions: [], answers: {}, other: null, otherDraft: '', upgraded: '', added: [],
+export const newImproveFlow = (id: string, original: string, step: MkImproveStep = 'writing', mode: MkImproveMode = 'improve'): MkImproveFlow => ({
+  id, mode, original, step, questions: [], answers: {}, other: null, otherDraft: '', upgraded: '', added: [],
   isEditing: false, draft: '', failedStep: 'rewrite', error: '', note: '',
 })
+
+/** the flow's mode; flows saved before the drop-up have none and are improvements */
+export const modeOf = (f: Pick<MkImproveFlow, 'mode'>): MkImproveMode => f.mode ?? 'improve'
 
 /** the proposal as it stands: the edit draft while the person edits it */
 export const finalText = (f: Pick<MkImproveFlow, 'isEditing' | 'draft' | 'upgraded'>): string => (f.isEditing ? f.draft : f.upgraded)
@@ -155,6 +163,41 @@ export const rewritePrompt = (original: string, pairs: readonly { question: stri
     'Reply with JSON only, in this shape:',
     '{"prompt":"<the upgraded prompt>","added":["<one short note per detail you added>"]}',
     'List at most 8 notes, each under 90 characters.',
+  ].join('\n')
+
+export const DRAFT_SYSTEM =
+  'You draft the next message a person sends to their AI coding assistant, in their voice. You reply with JSON only.'
+
+/** how many recent messages an Answer or Question draft reads */
+export const DRAFT_MESSAGES = 100
+
+/** Answer: reply to the assistant's latest message. Question: ask about it. `hint` is what the prompt line held. */
+export const draftPrompt = (mode: 'answer' | 'question', hint: string, ctx: string): string =>
+  [
+    'Recent conversation between the person and their AI coding assistant, newest last:',
+    '<conversation>',
+    ctx,
+    '</conversation>',
+    '',
+    ...(mode === 'answer'
+      ? [
+          "Draft the person's reply to the assistant's latest message.",
+          '- If it asks a question or offers options, answer it: pick the option the conversation supports best and say why in a few words.',
+          '- If it reports progress or a result, acknowledge it in a word and give the obvious next instruction.',
+          '- If it is blocked or asks for approval, give the decision the conversation supports; when it truly cannot tell, ask for the missing fact instead.',
+        ]
+      : [
+          "Draft one short question the person asks the assistant about its latest message.",
+          '- If work is still running, ask for the status: what is done, what is left, any blocker.',
+          '- If it just reported a result or a plan, question the weakest point: missing evidence, a risk, a skipped step, or what is still unverified.',
+        ]),
+    ...(hint.trim() !== '' ? ['', 'The person started typing this; follow its intent:', '<hint>', hint.trim(), '</hint>'] : []),
+    '',
+    'Rules: 1 to 3 sentences, plain words, the way a busy person types. Never invent facts, names or numbers; use a [placeholder] for anything unknown.',
+    '',
+    'Reply with JSON only, in this shape:',
+    '{"prompt":"<the message>","added":["<one short note per choice you made>"]}',
+    'List at most 3 notes, each under 90 characters.',
   ].join('\n')
 
 /** word-wrap to `width` cells (at least 4); a word longer than a line is cut; blank lines are kept */

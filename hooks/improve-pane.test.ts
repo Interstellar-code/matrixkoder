@@ -4,7 +4,7 @@
 import { test, expect } from 'claude-code/testing'
 import type { Engine, Mounted } from 'claude-code/testing'
 import { mockFs, mockWorld, paneProps, sessionStart, worldFiles, worldFixtures } from './testkit'
-import { IMPROVE_FAILED, IMPROVE_FILL_FAILED, wordCount } from './improve-core'
+import { DRAFT_EMPTY, DRAFT_SEND_FAILED, IMPROVE_FAILED, IMPROVE_FILL_FAILED, wordCount } from './improve-core'
 
 const usage = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
 const ROUGH = 'Check all the files with type errors.'
@@ -31,6 +31,8 @@ type World = {
   copy?: boolean
   /** the draft Claude Code's prompt line holds when the test mounts */
   draft?: string
+  /** the conversation `session.messages` answers (the world's three rows by default) */
+  messages?: { role: 'user' | 'assistant'; text: string; toolUses: never[] }[]
 }
 
 /** the world beneath the pane: model, conversation, prompt box, clipboard, store */
@@ -67,7 +69,7 @@ function world(on: Parameters<typeof mockWorld>[0], w: World) {
     return { value: out === null ? { isAnswered: false, reason: 'api-error', status: 529, error: 'overloaded', usage } : { isAnswered: true, text: out, usage } }
   })
   on('session.messages', () => ({
-    value: [
+    value: w.messages ?? [
       { role: 'user', text: 'build the weekly report', toolUses: [] },
       { role: 'assistant', text: 'Done: the report is in out/report.md', toolUses: [] },
       { role: 'user', text: '', toolUses: [] },
@@ -98,10 +100,16 @@ const has = async (ui: Ui, q: Parameters<Ui['find']>[0]): Promise<boolean> => (a
 const says = async (ui: Ui, sentence: string): Promise<boolean> =>
   (await ui.findAll({ type: 'Text' })).map(t => String(t.text)).join(' ').includes(sentence)
 
+/** open the Improve drop-up and press one of its rows */
+async function pick(ui: Ui, row: 'improve' | 'answer' | 'question') {
+  await ui.press({ key: 'improve-f-go' })
+  await ui.press({ key: `improve-f-m-${row}` })
+}
+
 /** type a prompt in the prompt line, press Improve, let the timer-started model call finish */
 async function improve(ui: Ui, w: ReturnType<typeof world>, text = ROUGH) {
   type(w, text)
-  await ui.press({ key: 'improve-f-go' })
+  await pick(ui, 'improve')
   await w.settle()
 }
 
@@ -122,7 +130,7 @@ test('the footer: the solid Improve chip and two + tool slots sit between the da
   expect(at(/^╌+$/)).toBeLessThan(order.findIndex(t => String(t).includes('✦ Improve')))
   expect(order.findIndex(t => String(t).includes('✦ Improve'))).toBeLessThan(at(/ live · /))
   expect(order.filter(t => t === '┊ + tool ┊')).toHaveLength(2)
-  expect((await ui.find({ type: 'Button', key: 'improve-f-go' }))?.text).toBe(' ✦ Improve ')
+  expect((await ui.find({ type: 'Button', key: 'improve-f-go' }))?.text).toBe(' ✦ Improve ▴ ')
   expect(await has(ui, { text: '↶ Undo' }), 'no Undo before an accept').toBe(false)
   await ui.press({ key: 'dash-tab-settings' })
   expect(await has(ui, { type: 'Button', key: 'improve-f-go' }), 'Settings draws no footer').toBe(false)
@@ -177,7 +185,7 @@ test('Improve: one model call (haiku), the card shows the proposal and the word 
   await $.session.start(sessionStart())
   const ui = await mount($)
   type(w, `  ${ROUGH}  `)
-  await ui.press({ key: 'improve-f-go' })
+  await pick(ui, 'improve')
   expect(await says(ui, 'Writing the new prompt…'), 'working shows a calm line').toBe(true)
   await w.settle()
   expect(w.log.calls, 'rewrite only, no questions').toBe(1)
@@ -342,7 +350,7 @@ test('Improve on an empty prompt line says so and asks nothing', { plugins: [wor
   const w = world(on, { answer: () => REWRITE })
   await $.session.start(sessionStart())
   const ui = await mount($)
-  await ui.press({ key: 'improve-f-go' })
+  await pick(ui, 'improve')
   await w.settle()
   expect(await says(ui, 'Type a prompt in Claude Code’s prompt line, then press Improve.')).toBe(true)
   expect(w.log.calls).toBe(0)
@@ -386,7 +394,7 @@ test('the Improve tab and the footer share one proposal: Accept in the tab does 
   expect(await has(ui, { text: '✦ IMPROVED PROMPT' })).toBe(false)
   // the other way round: Improve in the footer on another tab, Discard in the tab
   await ui.press({ key: 'improve-f-undo' })
-  await ui.press({ key: 'improve-f-go' })
+  await pick(ui, 'improve')
   await w.settle()
   expect(await has(ui, { text: '✦ IMPROVED PROMPT' })).toBe(true)
   await ui.press({ key: 'dash-tab-improve' })
@@ -477,7 +485,7 @@ test('F4: Improve reads Claude Code\u2019s prompt line at the press, and Accept 
   await $.session.start(sessionStart())
   const ui = await mount($)
   // the draft typed in the prompt line is what gets rewritten, with no field of ours involved
-  await ui.press({ key: 'improve-f-go' })
+  await pick(ui, 'improve')
   await w.settle()
   expect(w.log.prompts[0]).toContain('<prompt>\nthe person\u2019s own draft\n</prompt>')
   await ui.press({ key: 'improve-f-accept' })
@@ -745,12 +753,12 @@ test('F13: a stale model answer that lands after Discard and a new Improve never
   await $.session.start(sessionStart())
   const ui = await mount($)
   type(w, 'first rough prompt')
-  await ui.press({ key: 'improve-f-go' })
+  await pick(ui, 'improve')
   await w.settle() // the first call is out and waiting
   expect(w.log.calls).toBe(1)
   await ui.press({ key: 'improve-f-discard' })
   type(w, 'second rough prompt')
-  await ui.press({ key: 'improve-f-go' })
+  await pick(ui, 'improve')
   release(OLD)
   await w.settle()
   expect(w.log.calls).toBe(2)
@@ -766,14 +774,14 @@ test('F5: a flow left working by a lost timer is cleared at session start; the b
   await $.session.start(sessionStart())
   const ui = await mount($)
   type(w, ROUGH)
-  await ui.press({ key: 'improve-f-go' }) // the model call waits on a timer that is never advanced: the worker is "lost"
+  await pick(ui, 'improve') // the model call waits on a timer that is never advanced: the worker is "lost"
   expect(await says(ui, 'Writing the new prompt…')).toBe(true)
   await $.session.start(sessionStart()) // the reloaded module starts a session
   expect(await says(ui, 'Writing the new prompt…'), 'no stuck flow').toBe(false)
   expect(boxValue(w), 'the box text is intact').toBe(ROUGH)
   await w.settle()
   expect(w.log.calls, 'the dropped worker asks nothing').toBe(0)
-  await ui.press({ key: 'improve-f-go' })
+  await pick(ui, 'improve')
   await w.settle()
   expect(w.log.calls).toBe(1)
   expect(await has(ui, { text: '✦ IMPROVED PROMPT' })).toBe(true)
@@ -883,7 +891,7 @@ test('every Improve row stays within the pane width at 36, 46 and 80 columns: fo
     }
   }
   type(w, long)
-  await ui.press({ key: 'improve-f-go' })
+  await pick(ui, 'improve')
   await check('working')
   await w.settle()
   await check('card')
@@ -903,8 +911,157 @@ test('every Improve row stays within the pane width at 36, 46 and 80 columns: fo
   await ui.press({ key: 'improve-f-discard' })
   await check('footer idle')
   type(w, '')
-  await ui.press({ key: 'improve-f-go' })
+  await pick(ui, 'improve')
   await check('footer empty error')
   const rows = improveRows(await ui.drawn())
   expect(rows.length, 'the walk found the Improve rows').toBeGreaterThan(3)
+})
+
+// ── the drop-up: Improve / Answer / Question ──────────────────────────────────
+
+const REPLY = JSON.stringify({ prompt: 'Looks good. Ship the report to the team channel.', added: ['Next step: share it'] })
+
+test('the Improve chip is a drop-up: it opens Improve, Answer and Question above it and closes again', { plugins: [worldFixtures] }, async ($, on) => {
+  world(on, { answer: () => REWRITE })
+  await $.session.start(sessionStart())
+  const ui = await mount($)
+  expect(await has(ui, { type: 'Button', key: 'improve-f-m-answer' }), 'closed at first').toBe(false)
+  await ui.press({ key: 'improve-f-go' })
+  for (const row of ['improve', 'answer', 'question']) expect(await has(ui, { type: 'Button', key: `improve-f-m-${row}` }), row).toBe(true)
+  expect((await ui.find({ type: 'Button', key: 'improve-f-go' }))?.text).toBe(' ✦ Improve ▾ ')
+  const order = (await ui.findAll({ type: 'Button' })).map(b => String(b.props.key))
+  expect(order.indexOf('improve-f-m-question'), 'the rows sit above the chip').toBeLessThan(order.indexOf('improve-f-go'))
+  await ui.press({ key: 'improve-f-go' })
+  expect(await has(ui, { type: 'Button', key: 'improve-f-m-answer' }), 'a second press closes it').toBe(false)
+})
+
+test('Answer drafts a reply from the conversation (no prompt needed), Send submits it as the person and closes the card', { plugins: [worldFixtures] }, async ($, on) => {
+  const w = world(on, { answer: () => REPLY })
+  await $.session.start(sessionStart())
+  const ui = await mount($)
+  await pick(ui, 'answer')
+  expect(await has(ui, { type: 'Button', key: 'improve-f-m-answer' }), 'the drop-up closed').toBe(false)
+  await w.settle()
+  expect(w.log.calls).toBe(1)
+  expect(w.log.models).toEqual(['haiku'])
+  expect(w.log.prompts[0]).toContain('Person: build the weekly report')
+  expect(w.log.prompts[0]).toContain("Draft the person's reply to the assistant's latest message.")
+  expect(w.log.prompts[0]).not.toContain('<hint>')
+  expect(await has(ui, { text: '✦ DRAFTED ANSWER' })).toBe(true)
+  expect(await says(ui, 'Looks good. Ship the report to the team channel.')).toBe(true)
+  await ui.press({ key: 'improve-f-send' })
+  expect(w.log.submitted).toEqual([{ text: 'Looks good. Ship the report to the team channel.', asUser: true }])
+  expect(await has(ui, { text: '✦ DRAFTED ANSWER' }), 'the card is gone').toBe(false)
+  expect(w.stored.get('improveHistory'), 'a draft is not a saved improvement').toBeUndefined()
+})
+
+test('Question uses what the prompt line holds as a hint; Edit puts the draft in the prompt line instead of sending', { plugins: [worldFixtures] }, async ($, on) => {
+  const w = world(on, { answer: () => JSON.stringify({ prompt: 'What is left before the report is final?', added: [] }) })
+  await $.session.start(sessionStart())
+  const ui = await mount($)
+  type(w, 'is it done')
+  await pick(ui, 'question')
+  await w.settle()
+  expect(w.log.prompts[0]).toContain('Draft one short question')
+  expect(w.log.prompts[0]).toContain('<hint>\nis it done\n</hint>')
+  expect(await has(ui, { text: '✦ DRAFTED QUESTION' })).toBe(true)
+  await ui.press({ key: 'improve-f-accept' })
+  expect(boxValue(w)).toBe('What is left before the report is final?')
+  expect(w.log.submitted, 'Edit never sends').toEqual([])
+})
+
+test('Send clears a hint left in the prompt line; a refused send keeps the draft with a note', { plugins: [worldFixtures] }, async ($, on) => {
+  const w = world(on, { answer: () => REPLY, submit: 'drop' })
+  await $.session.start(sessionStart())
+  const ui = await mount($)
+  type(w, 'ok go')
+  await pick(ui, 'answer')
+  await w.settle()
+  await ui.press({ key: 'improve-f-send' })
+  expect(await has(ui, { text: '✦ DRAFTED ANSWER' }), 'the draft stays').toBe(true)
+  expect(await says(ui, DRAFT_SEND_FAILED)).toBe(true)
+  expect(boxValue(w), 'nothing cleared on a refusal').toBe('ok go')
+})
+
+test('Send that enters clears the hint from the prompt line', { plugins: [worldFixtures] }, async ($, on) => {
+  const w = world(on, { answer: () => REPLY })
+  await $.session.start(sessionStart())
+  const ui = await mount($)
+  type(w, 'ok go')
+  await pick(ui, 'answer')
+  await w.settle()
+  await ui.press({ key: 'improve-f-send' })
+  expect(w.log.submitted).toHaveLength(1)
+  expect(boxValue(w)).toBe('')
+})
+
+test('Answer with no conversation shows a calm line and asks the model nothing', { plugins: [worldFixtures] }, async ($, on) => {
+  const w = world(on, { answer: () => REPLY, messages: [] })
+  await $.session.start(sessionStart())
+  const ui = await mount($)
+  await pick(ui, 'answer')
+  await w.settle()
+  expect(w.log.calls).toBe(0)
+  expect(await says(ui, DRAFT_EMPTY)).toBe(true)
+  expect(await has(ui, { type: 'Button', key: 'improve-f-send' })).toBe(false)
+})
+
+test('two quick Send presses submit the draft once', { plugins: [worldFixtures] }, async ($, on) => {
+  const w = world(on, { answer: () => REPLY })
+  await $.session.start(sessionStart())
+  const ui = await mount($)
+  await pick(ui, 'answer')
+  await w.settle()
+  await Promise.all([ui.press({ key: 'improve-f-send' }), ui.press({ key: 'improve-f-send' })])
+  expect(w.log.submitted).toHaveLength(1)
+})
+
+test('a failed Answer draft with no hint retries as an Answer, never as an Improve', { plugins: [worldFixtures] }, async ($, on) => {
+  const w = world(on, { answer: n => (n === 0 ? null : REPLY) })
+  await $.session.start(sessionStart())
+  const ui = await mount($)
+  await pick(ui, 'answer')
+  await w.settle()
+  expect(await says(ui, IMPROVE_FAILED)).toBe(true)
+  await ui.press({ key: 'improve-f-retry' })
+  await w.settle()
+  expect(w.log.calls).toBe(2)
+  expect(w.log.prompts[1]).toContain("Draft the person's reply")
+  expect(await has(ui, { text: '✦ DRAFTED ANSWER' })).toBe(true)
+})
+
+test('a thrown send keeps the draft with a note; text typed after the press is never cleared by Send', { plugins: [worldFixtures] }, async ($, on) => {
+  const thrown = world(on, { answer: () => REPLY, submit: 'throw' })
+  await $.session.start(sessionStart())
+  const ui = await mount($)
+  type(thrown, 'ok go')
+  await pick(ui, 'answer')
+  await thrown.settle()
+  type(thrown, 'something new I typed')
+  await ui.press({ key: 'improve-f-send' })
+  expect(await says(ui, DRAFT_SEND_FAILED)).toBe(true)
+  expect(boxValue(thrown)).toBe('something new I typed')
+})
+
+test('Send leaves text typed after the press in the prompt line', { plugins: [worldFixtures] }, async ($, on) => {
+  const w = world(on, { answer: () => REPLY })
+  await $.session.start(sessionStart())
+  const ui = await mount($)
+  type(w, 'ok go')
+  await pick(ui, 'answer')
+  await w.settle()
+  type(w, 'something new I typed')
+  await ui.press({ key: 'improve-f-send' })
+  expect(w.log.submitted).toHaveLength(1)
+  expect(boxValue(w)).toBe('something new I typed')
+})
+
+test('the drop-up closes on a tab switch', { plugins: [worldFixtures] }, async ($, on) => {
+  world(on, { answer: () => REPLY })
+  await $.session.start(sessionStart())
+  const ui = await mount($)
+  await ui.press({ key: 'improve-f-go' })
+  expect(await has(ui, { type: 'Button', key: 'improve-f-m-answer' })).toBe(true)
+  await ui.press({ key: 'dash-tab-lanes' })
+  expect(await has(ui, { type: 'Button', key: 'improve-f-m-answer' })).toBe(false)
 })

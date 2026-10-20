@@ -7,7 +7,7 @@
 // turns into the state writes and model calls.
 import type { Elements, RenderElement } from 'claude-code'
 import type { MkImproveEntry, MkImproveFlow } from '../../types'
-import { IMPROVE_FAILED, bigDigits, bigNumber, canAccept, clip, finalText, wordCount, wrap } from '../improve-core'
+import { IMPROVE_FAILED, bigDigits, bigNumber, canAccept, clip, finalText, modeOf, wordCount, wrap } from '../improve-core'
 import { IMPROVE_FIXTURE } from './improve.fixture'
 import { ActionButton, Card, Chip, Section } from './kit'
 import { PALETTE, ROLE } from './palette'
@@ -18,6 +18,9 @@ type Els = Elements[keyof Elements]
 export type ImproveKind =
   | 'improve' | 'accept' | 'discard' | 'undo' | 'wizard' | 'retry' | 'copy' | 'open'
   | 'answer' | 'other' | 'other-draft' | 'other-save' | 'skip' | 'go' | 'edit' | 'edit-save' | 'draft'
+  // the footer drop-up: 'menu' opens or closes it, 'compose' drafts a message ('answer' | 'question' in `a`),
+  // 'send' submits the drafted message as the person's own
+  | 'menu' | 'compose' | 'send'
 
 export type ImproveUi = {
   improveAct?(kind: ImproveKind, a?: string | number, b?: string): void
@@ -31,7 +34,22 @@ export type ImproveView = {
   flow: MkImproveFlow | null
   /** saved improvements, newest first */
   history: readonly MkImproveEntry[]
+  /** the footer's drop-up is open */
+  menu?: boolean
 }
+
+/** the drop-up's rows: key, chip label, what it does */
+const MENU: readonly (readonly [string, string, string])[] = [
+  ['improve-f-m-improve', '✦ Improve ', 'rewrite my prompt'],
+  ['improve-f-m-answer', '✦ Answer  ', 'reply to the last message'],
+  ['improve-f-m-question', '✦ Question', 'ask about it'],
+]
+
+/** the card head and working line for each mode's draft */
+const DRAFT_WORDS = {
+  answer: { head: '✦ DRAFTED ANSWER', short: '✦ ANSWER', doing: 'Reading the conversation and drafting a reply…' },
+  question: { head: '✦ DRAFTED QUESTION', short: '✦ QUESTION', doing: 'Reading the conversation and drafting a question…' },
+} as const
 
 /** the fixture view (the design's sample prompt, a proposal on show) */
 export function improveView(): ImproveView {
@@ -167,8 +185,32 @@ function footerCard(els: Els, f: MkImproveFlow, cols: number, act: (kind: Improv
     </Box>
   )
   const discard: ChipSpec = { key: 'improve-f-discard', label: 'Discard', tone: 'dim', onPress: () => act('discard') }
+  const mode = modeOf(f)
   let body: RenderElement
-  if (f.step === 'review') {
+  if (mode !== 'improve' && f.step === 'review') {
+    // a drafted message: Send submits it as is, Edit puts it in the prompt line to change first
+    body = (
+      <Box flexDirection="column">
+        {head(DRAFT_WORDS[mode].head, `${String(wordCount(finalText(f)))} words`)}
+        {f.original !== '' && lines(els, 'improve-f-hint', `hint: ${f.original}`, w, 1, { dimColor: true })}
+        {lines(els, 'improve-f-new', finalText(f), w, 6, { color: PALETTE.fg })}
+        {f.note !== '' && <Text dimColor={true} wrap="truncate-end">{f.note}</Text>}
+        {chipRows(els, [
+          { key: 'improve-f-send', label: '↵ Send', tone: 'solid', onPress: () => act('send') },
+          { key: 'improve-f-accept', label: 'Edit', tone: 'soft', onPress: () => act('accept') },
+          discard,
+        ], w, 'improve-f-review')}
+      </Box>
+    )
+  } else if (mode !== 'improve' && f.step !== 'error') {
+    body = (
+      <Box flexDirection="column">
+        {head(DRAFT_WORDS[mode].short)}
+        {lines(els, 'improve-f-doing', DRAFT_WORDS[mode].doing, w, 2, { dimColor: true })}
+        {chipRows(els, [discard], w, 'improve-f-doing')}
+      </Box>
+    )
+  } else if (f.step === 'review') {
     body = (
       <Box flexDirection="column">
         {head('✦ IMPROVED PROMPT', countsLabel(wordCount(f.original), wordCount(finalText(f)), w - 18))}
@@ -187,7 +229,7 @@ function footerCard(els: Els, f: MkImproveFlow, cols: number, act: (kind: Improv
   } else if (f.step === 'error') {
     body = (
       <Box flexDirection="column">
-        {head('✦ IMPROVE')}
+        {head(mode === 'improve' ? '✦ IMPROVE' : DRAFT_WORDS[mode].short)}
         {canAccept(f) && lines(els, 'improve-f-prev', finalText(f), w, 4, { color: PALETTE.fg })}
         {lines(els, 'improve-f-err', f.error || IMPROVE_FAILED, w, 3, { color: ROLE.warn.fg })}
         {chipRows(els, [
@@ -221,7 +263,9 @@ export function ImproveFooter(els: Els, view: ImproveView, cols: number, ui: Imp
   const { Box, Text } = els
   const act = (kind: ImproveKind, a?: string | number, b?: string): void => ui.improveAct?.(kind, a, b)
   const w = Math.max(1, cols - 2) // paddingX 1 each side
-  const go: ChipSpec = { key: 'improve-f-go', label: '✦ Improve', tone: 'solid', onPress: () => act('improve') }
+  const open = view.menu === true
+  // a drop-up: the chip opens Improve / Answer / Question above the chip row
+  const go: ChipSpec = { key: 'improve-f-go', label: open ? '✦ Improve ▾' : '✦ Improve ▴', tone: 'solid', onPress: () => act('menu') }
   const undo: ChipSpec | null = view.undo == null ? null : { key: 'improve-f-undo', label: '↶ Undo', tone: 'soft', onPress: () => act('undo') }
   // the slots join only while they fit
   let used = chipW(go) + (undo == null ? 0 : 1 + chipW(undo))
@@ -234,6 +278,12 @@ export function ImproveFooter(els: Els, view: ImproveView, cols: number, ui: Imp
   return (
     <Box flexDirection="column">
       {card && view.flow != null && footerCard(els, view.flow, cols, act)}
+      {chips && open && MENU.map(([key, label, what]) => (
+        <Box key={`${key}-row`} flexDirection="row" gap={1} paddingX={1}>
+          {chipBtn(els, { key, label, tone: 'soft', onPress: () => (key === 'improve-f-m-improve' ? act('improve') : act('compose', key === 'improve-f-m-answer' ? 'answer' : 'question')) })}
+          <Text dimColor={true} wrap="truncate-end">{what}</Text>
+        </Box>
+      ))}
       {chips && (
         <Box flexDirection="row" gap={1} paddingX={1}>
           {chipBtn(els, go)}
@@ -319,8 +369,15 @@ export function ImproveTab(els: Els, view: ImproveView, cols: number, ui: Improv
         </Box>
         <Box flexDirection="column">
           {chipRows(els, [
-            { key: 'improve-t-accept', label: '↵ Accept', tone: 'solid', onPress: () => act('accept') },
-            { key: 'improve-t-wizard', label: 'Run Wizard', tone: 'soft', onPress: () => act('wizard') },
+            ...(modeOf(f) === 'improve'
+              ? [
+                  { key: 'improve-t-accept', label: '↵ Accept', tone: 'solid' as const, onPress: () => act('accept') },
+                  { key: 'improve-t-wizard', label: 'Run Wizard', tone: 'soft' as const, onPress: () => act('wizard') },
+                ]
+              : [
+                  { key: 'improve-t-send', label: '↵ Send', tone: 'solid' as const, onPress: () => act('send') },
+                  { key: 'improve-t-accept', label: 'To prompt line', tone: 'soft' as const, onPress: () => act('accept') },
+                ]),
             { key: 'improve-t-edit', label: f.isEditing ? 'Stop editing' : 'Edit', tone: 'soft', onPress: () => act('edit') },
             { key: 'improve-t-copy', label: 'Copy', tone: 'soft', onPress: () => act('copy') },
             discard,
@@ -346,8 +403,8 @@ export function ImproveTab(els: Els, view: ImproveView, cols: number, ui: Improv
           <Box flexDirection="column">
             {Section(els, { label: 'Before and after' })}
             <Box flexDirection={side ? 'row' : 'column'} gap={1}>
-              {cardOf('improve-t-was', 'BEFORE', f.original, cw - 4, undefined, { dimColor: true })}
-              {cardOf('improve-t-new', 'AFTER', f.upgraded, (side ? cols - 1 - cw : cols) - 4, 'live', { color: PALETTE.fg })}
+              {cardOf('improve-t-was', modeOf(f) === 'improve' ? 'BEFORE' : 'HINT', f.original, cw - 4, undefined, { dimColor: true })}
+              {cardOf('improve-t-new', modeOf(f) === 'improve' ? 'AFTER' : 'DRAFT', f.upgraded, (side ? cols - 1 - cw : cols) - 4, 'live', { color: PALETTE.fg })}
             </Box>
           </Box>
         )}
@@ -370,7 +427,7 @@ export function ImproveTab(els: Els, view: ImproveView, cols: number, ui: Improv
   } else {
     body = Card(els, {}, (
       <Box flexDirection="column">
-        {lines(els, 'improve-t-doing', f.step === 'asking' ? 'Reading your prompt and working out what to ask…' : 'Writing the new prompt…', w, 2, { dimColor: true })}
+        {lines(els, 'improve-t-doing', modeOf(f) !== 'improve' ? DRAFT_WORDS[modeOf(f) as 'answer' | 'question'].doing : f.step === 'asking' ? 'Reading your prompt and working out what to ask…' : 'Writing the new prompt…', w, 2, { dimColor: true })}
         {lines(els, 'improve-t-mine', f.original, w, 4, { dimColor: true, strikethrough: true })}
         {chipRows(els, [discard], w, 'improve-t-doing')}
       </Box>
