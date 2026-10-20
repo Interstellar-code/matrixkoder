@@ -9,7 +9,7 @@
 // arm a raw Esc without a kit change, so the press is the close that works.
 // Pure render — no $, no state, no scripts (C1).
 import type { Elements, RenderElement } from 'claude-code'
-import { ActionButton, Card, Chip, BoxButton } from './kit'
+import { ActionButton, Card, Chip, IconButton } from './kit'
 import { PALETTE, ROLE } from './palette'
 import { clip, planStatusGlyph, planStatusRole } from './plan'
 import { routeText } from './plans-map'
@@ -92,7 +92,7 @@ export function PlanTaskPanel(els: Els, row: PlanTask, cols: number, onClose?: (
     <Box key={`plan-task-panel-${row.id}`} flexDirection="column">
       <Box flexDirection="row" justifyContent="space-between" gap={1}>
         <Text bold={true}>{`${row.id} · ${row.status}`}</Text>
-        {BoxButton(els, { key: `plan-task-close-top-${row.id}`, label: '✕ close', onPress: () => { onClose?.() } })}
+        {IconButton(els, { key: `plan-task-close-top-${row.id}`, icon: 'close', onPress: () => { onClose?.() } })}
       </Box>
       <Text color={PALETTE.mut} wrap="wrap">{row.title}</Text>
       {row.description != null && <Text color={PALETTE.mut} wrap="wrap">{row.description}</Text>}

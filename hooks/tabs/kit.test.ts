@@ -5,7 +5,8 @@
 // calling the closure the Button carries — C10: no press ever leaves the test.
 import { test, expect } from 'claude-code/testing'
 import type { Elements } from 'claude-code'
-import { ActionButton, ActionButtons, ActionRow, Card, Chip, ControlRow, Section, SettingRow, SmoothBar, TreeRow, actionLabel } from './kit'
+import { ICONS, ActionButton, ActionButtons, ActionRow, Card, Chip, ControlRow, IconButton, Section, SettingRow, SmoothBar, TreeRow, actionLabel, iconHint, iconWidth } from './kit'
+import type { IconName } from './kit'
 import type { SettingCtx, SettingField } from './kit'
 import { PALETTE, ROLE } from './palette'
 
@@ -592,4 +593,67 @@ test('LOW: a text row caps its label so label + Input fit 36 cols', () => {
   }
   expect(glyph(46)).toBe('Integration branch name lane')
   expect(glyph(36)).toBe('Integration branch n…')
+})
+
+// ---------- IconButton · ICONS · iconWidth · iconHint ----------
+
+const iconNames = Object.keys(ICONS) as IconName[]
+
+test('IconButton draws just the icon glyph, plain, under the caller key, and a press calls onPress', () => {
+  for (const name of iconNames) {
+    let pressed = 0
+    const b = node(IconButton(stubEls(), { key: `ik-${name}`, icon: name, onPress: () => { pressed += 1 } }))
+    expect(b.type).toBe('Button')
+    expect(b.props.key).toBe(`ik-${name}`)
+    expect(b.props.label, `${name} label is the glyph alone`).toBe(ICONS[name].glyph)
+    expect([...String(b.props.label)].length, `${name} is one cell wide`).toBe(1)
+    expect(b.props.plain).toBe(true)
+    expect(b.props.hotkey, 'no engine hotkey').toBeUndefined()
+    expect(b.props.title, 'no tooltip').toBeUndefined()
+    ;(b.props.onPress as () => void)()
+    expect(pressed).toBe(1)
+  }
+})
+
+test('IconButton tone: primary and default draw at full strength, quiet dims, the icon tone is the default', () => {
+  const draw = (icon: IconName, tone?: 'primary' | 'default' | 'quiet'): Node =>
+    node(IconButton(stubEls(), { key: 'k', icon, onPress: () => {}, ...(tone != null ? { tone } : {}) }))
+  expect(draw('play').props.dimColor).toBeUndefined() // primary
+  expect(draw('pause').props.dimColor).toBeUndefined() // default
+  expect(draw('close').props.dimColor).toBe(true) // quiet
+  expect(draw('close', 'default').props.dimColor).toBeUndefined() // an override wins
+  expect(draw('pause', 'quiet').props.dimColor).toBe(true)
+  expect(draw('pause', 'primary').props.dimColor).toBeUndefined()
+  // every tone is one Button (no split Text beside it): the glyph is the whole label
+  for (const tone of ['primary', 'default', 'quiet'] as const) expect(draw('play', tone).type).toBe('Button')
+  expect(ICONS.play.tone).toBe('primary')
+  expect(ICONS.pause.tone).toBe('default')
+  expect(ICONS.close.tone).toBe('quiet')
+  expect(ICONS.delete.tone).toBe('quiet')
+})
+
+test('iconWidth is the width a plain Button draws for the glyph (its label alone, no hotkey)', () => {
+  for (const name of iconNames) {
+    const b = node(IconButton(stubEls(), { key: 'k', icon: name, onPress: () => {} }))
+    expect(iconWidth(name), name).toBe(String(b.props.label).length)
+    expect(iconWidth(name), name).toBe(1)
+  }
+})
+
+test('iconHint joins glyph and word with a dot', () => {
+  expect(iconHint('pause', 'close')).toBe('‖ pause · ✕ close')
+  expect(iconHint('play')).toBe('▶ play')
+  expect(iconHint('close', 'delete')).toBe('✕ close · ✕ delete')
+  expect(iconHint()).toBe('')
+})
+
+test('every ICONS glyph is exactly one column: one code point, not an emoji or a wide character', () => {
+  for (const name of iconNames) {
+    const { glyph } = ICONS[name]
+    expect([...glyph].length, `${name} is one code point`).toBe(1)
+    expect(glyph, `${name} is not emoji-presentation`).not.toMatch(/\p{Emoji_Presentation}/u)
+    const cp = glyph.codePointAt(0)!
+    const wide = (cp >= 0x1100 && cp <= 0x115f) || (cp >= 0x2e80 && cp <= 0xa4cf) || (cp >= 0xac00 && cp <= 0xd7a3) || (cp >= 0xf900 && cp <= 0xfaff) || (cp >= 0xfe30 && cp <= 0xfe6f) || (cp >= 0xff00 && cp <= 0xff60) || cp >= 0x1f000
+    expect(wide, `${name} is not in a double-width block`).toBe(false)
+  }
 })

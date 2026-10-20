@@ -456,3 +456,59 @@ test('fullOf folds CRLF, turns a tab or a lone CR into a space and drops other c
   expect(fullOf('a\nb')).toBe('a\nb')
   expect(fullOf('a\u0007b\u0000c\u001bd\u007fe')).toBe('abcde')
 })
+
+// ---------- the pause icon (`ev-pause-btn`) and the footer legend ----------
+
+/** the row Box holding the pause icon, and its drawn width: a Text is its string, a Button its label, plus the gap columns */
+function pauseRow(tree: unknown): { width: number; label: string } {
+  const row = nodesOf(tree, 'Box').find(b => (b.children as { type?: string; props?: Record<string, unknown> }[]).some(c => c.type === 'Button' && c.props?.key === 'ev-pause-btn'))
+  expect(row, 'the search row').toBeDefined()
+  const parts = (row?.children ?? []) as { type?: string; props?: Record<string, unknown>; children?: unknown[] }[]
+  const w = parts.reduce((sum, c) => sum + (c.type === 'Button' ? String(c.props?.label).length : textWidth(c)), 0)
+  const gap = typeof row?.props.gap === 'number' ? row.props.gap : 0
+  const btn = parts.find(c => c.type === 'Button')
+  return { width: w + gap * Math.max(0, parts.length - 1), label: String(btn?.props?.label) }
+}
+
+test('the pause icon toggles events:paused and events:pausedAt, shows ‖ while live and ▶ while paused', () => {
+  for (const cols of [46, 36] as const) {
+    const live = pressable()
+    const liveTree = EventsTab(live.pressEls, eventsViewOf(DETAIL_EVENTS), cols, live.ui)
+    expect(pauseRow(liveTree).label, `live shows the pause glyph at ${cols}`).toBe('‖')
+    live.press(liveTree, 'ev-pause-btn')
+    expect(live.sets.map(s => s[0]), `pausing stamps the time then flips the flag at ${cols}`).toEqual(['events:pausedAt', 'events:paused'])
+    expect(live.sets[1], `paused at ${cols}`).toEqual(['events:paused', '1'])
+    expect(Number(live.sets[0]?.[1])).toBeGreaterThan(0)
+
+    const held = pressable({ 'events:paused': '1', 'events:pausedAt': '1' })
+    const heldTree = EventsTab(held.pressEls, eventsViewOf(DETAIL_EVENTS), cols, held.ui)
+    expect(pauseRow(heldTree).label, `paused shows the play glyph at ${cols}`).toBe('▶')
+    held.press(heldTree, 'ev-pause-btn')
+    expect(held.sets, `resuming only clears the flag at ${cols}`).toEqual([['events:paused', '0']])
+  }
+})
+
+test('the search row and the footer stay within the pane at 46 and 36 cols, live and paused', () => {
+  for (const cols of [46, 36] as const) {
+    const states: Record<string, string>[] = [{}, { 'events:paused': '1' }, { 'events:q': 'a very long search text that cannot fit', 'events:paused': '1' }]
+    for (const initial of states) {
+      const { pressEls, ui } = pressable(initial)
+      const tree = EventsTab(pressEls, eventsViewOf(DETAIL_EVENTS), cols, ui)
+      expect(pauseRow(tree).width, `the search row at ${cols} ${JSON.stringify(initial)}`).toBeLessThanOrEqual(cols - 4)
+      const foot = nodesOf(tree, 'Box').filter(b => (b.children as { type?: string }[]).length === 2 && textOwn(b).some(t => /^j k/.test(t)) && textOwn(b).some(t => /✓ deliv/.test(t))).at(-1)
+      expect(foot, 'the footer row').toBeDefined()
+      expect(textOwn(foot).reduce((n, t) => n + t.length, 0), `the footer at ${cols}`).toBeLessThanOrEqual(cols)
+    }
+  }
+})
+
+test('the footer legend names the pause icon while live and the play icon while paused', () => {
+  const footer = (initial: Record<string, string>, cols: number): string => {
+    const { pressEls, ui } = pressable(initial)
+    return textOwn(EventsTab(pressEls, eventsViewOf(DETAIL_EVENTS), cols, ui)).find(t => /✓ deliv/.test(t)) ?? ''
+  }
+  expect(footer({}, 60)).toBe('✓ delivered · ✓✓ read · ↵ open · ‖ pause')
+  expect(footer({ 'events:paused': '1' }, 60)).toBe('✓ delivered · ✓✓ read · ↵ open · ▶ play')
+  expect(footer({}, 46)).toBe('✓ deliv · ✓✓ read · ‖ pause')
+  expect(footer({ 'events:paused': '1' }, 46)).toBe('✓ deliv · ✓✓ read · ▶ play')
+})

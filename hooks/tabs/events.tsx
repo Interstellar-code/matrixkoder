@@ -8,7 +8,8 @@
 // Pure render: elements only, no $, no direct state mutation. Filter and selection state flows through TabUi.
 import type { Elements, RenderElement } from 'claude-code'
 import { NARROW } from './ui'
-import { ActionButton, Card, Chip, Section, Segment } from './kit'
+import { ActionButton, Card, Chip, IconButton, Section, Segment, iconHint, iconWidth } from './kit'
+import type { IconName } from './kit'
 import { EventDetailPanel } from './eventdetail'
 import { EVENTS_FIXTURE } from './events.fixture'
 import type { PaletteRole } from './palette'
@@ -173,9 +174,6 @@ const TYPE_W = 6
 /** `…`-truncate to `w` cells */
 const clip = (text: string, w: number): string => (w <= 0 ? '' : text.length <= w ? text : `${text.slice(0, w - 1)}…`)
 
-/** a Button's drawn width: `[ label ]` (kit's actionWidth rule for a non-plain button) */
-const buttonW = (label: string): number => label.length + 4
-
 /** Check if kind is ring-related */
 const isRing = (k: string): boolean => k === 'ring' || k.startsWith('ring-')
 
@@ -327,7 +325,7 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
   const filesText = 'files'.length + 1 + filesLong.length <= W
     ? filesLong
     : `bus ${mark(bus.files.busJson)} tok ${mark(bus.files.tokens)} rq ${bus.files.ringQueue}`
-  const pauseLabel = paused ? '▶ Live' : '‖ Pause'
+  const pauseIcon: IconName = paused ? 'play' : 'pause'
 
   return (
     <Box flexDirection="column" gap={1}>
@@ -524,17 +522,16 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
           {/* Search Input & Pause Button */}
           <Box flexDirection="row" gap={1} alignItems="center" justifyContent="space-between">
             <Text dimColor={true}>
-              {clip(q ? `/ ${q}` : '/ : search text, id, task', Math.min(compact ? 20 : 28, W - buttonW(pauseLabel) - 1))}
+              {clip(q ? `/ ${q}` : '/ : search text, id, task', Math.min(compact ? 20 : 28, W - iconWidth(pauseIcon) - 1))}
             </Text>
-            <Button
-              key="ev-pause-btn"
-              variant={paused ? 'primary' : undefined}
-              label={pauseLabel}
-              onPress={() => {
+            {IconButton(els, {
+              key: 'ev-pause-btn',
+              icon: pauseIcon,
+              onPress: () => {
                 if (!paused) ui?.set('events:pausedAt', String(Date.now()))
                 ui?.set('events:paused', paused ? '0' : '1')
-              }}
-            />
+              },
+            })}
           </Box>
         </Box>
       ))}
@@ -645,7 +642,7 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
 
       {/* Footer shortcut hints */}
       <Box flexDirection="row" justifyContent="space-between">
-        <Text dimColor={true}>{cols < 56 ? '✓ deliv · ✓✓ read · ↵ open' : '✓ delivered · ✓✓ read · ↵ open · space pause'}</Text>
+        <Text dimColor={true}>{clip(cols < 56 ? `✓ deliv · ✓✓ read · ${iconHint(pauseIcon)}` : `✓ delivered · ✓✓ read · ↵ open · ${iconHint(pauseIcon)}`, cols - (cols < 56 ? 'j k' : 'j k /').length - 1)}</Text>
         <Text dimColor={true}>{cols < 56 ? 'j k' : 'j k /'}</Text>
       </Box>
     </Box>

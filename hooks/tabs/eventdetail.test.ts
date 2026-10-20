@@ -6,6 +6,7 @@
 import { test, expect } from 'claude-code/testing'
 import type { Elements } from 'claude-code'
 import { EventDetailPanel } from './eventdetail'
+import { iconWidth } from './kit'
 import type { EventItem } from './events'
 
 type N = { type: string; props: Record<string, unknown>; children: unknown[] }
@@ -82,7 +83,9 @@ test('the card draws every present field', () => {
   expect(flat).toContain('! yes')
   expect(flat).toContain('orchestrator')
   expect(bodyLines(drawn)).toEqual(['use the cache', 'and drop the recompute']) // the full text, not the cut one
-  expect(flat).toContain('✕ close')
+  const top = allOf(drawn, 'Button').find(b => String(b.props.key) === 'ev-detail-close-top-m-7')
+  expect(top?.props.label, 'the top-right close is the icon alone').toBe('✕')
+  expect(flat).not.toContain('✕ close')
   expect(flat).toContain('esc close')
 })
 
@@ -164,6 +167,6 @@ test('the header yields to the close button at a narrow width', () => {
     return text(allOf(drawn, 'Text').find(t => t.props.bold === true))
   }
   expect(header(80)).toBe('m-1234567 · ring-failed')
-  expect(header(24).length).toBeLessThanOrEqual(24 - 4 - 12)
+  expect(header(24).length).toBeLessThanOrEqual(24 - 4 - 1 - iconWidth('close'))
   expect(header(24).endsWith('…')).toBe(true)
 })

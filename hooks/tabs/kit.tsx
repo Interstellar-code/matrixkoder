@@ -137,6 +137,36 @@ export function ActionButton(els: Els, spec: ActionSpec): RenderElement {
   )
 }
 
+/** The tones an IconButton draws: a lone glyph has no word for warn/danger to split off. `primary` draws like `default` (the engine draws a plain Button the same either way); only `quiet` shows. */
+export type IconTone = 'primary' | 'default' | 'quiet'
+
+/** The kit's icons, by name: the glyph, the tone it draws in and the word its footer legend uses. One-column glyphs only (no emoji, they are two columns and break the width maths). `delete` shares `close`'s glyph and cannot draw `danger`: put it behind a confirm press and do not list both in one legend. */
+export const ICONS = {
+  play: { glyph: '▶', tone: 'primary', word: 'play' },
+  pause: { glyph: '‖', tone: 'default', word: 'pause' },
+  close: { glyph: '✕', tone: 'quiet', word: 'close' },
+  delete: { glyph: '✕', tone: 'quiet', word: 'delete' },
+} as const satisfies Record<string, { glyph: string; tone: IconTone; word: string }>
+
+/** The name of one of the kit's icons. */
+export type IconName = keyof typeof ICONS
+
+/** An icon-only press: a plain, chrome-less single glyph (no tooltip, the engine's Button has none). The tone is the icon's own unless the caller overrides it. */
+export function IconButton(els: Els, opts: { key: string; icon: IconName; onPress: () => void; tone?: IconTone }): RenderElement {
+  const { glyph, tone } = ICONS[opts.icon]
+  return ActionButton(els, { key: opts.key, glyph, word: '', plain: true, tone: opts.tone ?? tone, onPress: opts.onPress })
+}
+
+/** An IconButton's drawn width in columns: a plain Button without a hotkey draws its label alone, so the glyph. */
+export function iconWidth(icon: IconName): number {
+  return [...ICONS[icon].glyph].length
+}
+
+/** The footer legend of icons: `‖ pause · ✕ close` (glyph, space, word, joined by ` · `). */
+export function iconHint(...names: IconName[]): string {
+  return names.map(n => `${ICONS[n].glyph} ${ICONS[n].word}`).join(' · ')
+}
+
 /** The one button look: a filled one-row block around a plain press (a border would cost a
  *  row above and below). Fill carries the tone: primary/on blue, danger red, warn amber,
  *  default the resting button fill. The label colour stays the engine's. */
