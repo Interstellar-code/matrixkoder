@@ -9,6 +9,7 @@ import type { On } from 'claude-code'
 import type { MkWizardDraft } from '../types'
 import { NOW, PROJECT_DIR, DATA_DIR, mockFs, paneProps, sessionStart, type Files } from './testkit'
 import { addToGitignore, buildYaml, emptyDraft, inline, mergeModels, parseModels, parseProviders, parseWhich, proposeGates } from './wizard-core'
+import { resetStoreMemo } from './paths'
 
 const HOME = '/home/mk'
 const WIZARD = 'matrixkoder-setup'
@@ -1021,27 +1022,33 @@ const projectsReply = (dataDir: string): string => JSON.stringify({
   }],
 })
 
-test('B-1: on a migrated project the review names and writes <project>/project.yaml, never matrixkoder.yaml', async ($, on) => {
+test('B-1: on a migrated project the review names and writes the C2 project.yaml, never matrixkoder.yaml', async ($, on) => {
   const files = repoFiles()
-  // the root row says this data dir holds a C2 store: paths.isMigratedFolder is what the wizard asks
+  // A REAL migrated row, captured from `mkdb.py projects --json`: db_path sits in the C2 project folder
+  // `<home>/projects/<slug>`, NOT in the repo's data dir — so that folder is the data dir too.
+  const c2 = `${HOME}/.matrixkoder/projects/mk-proj`
   const w = world(on, files, {}, {}, [], argv => {
     if (argv[1]?.endsWith('/scripts/mkdb.py') && argv[2] === 'projects') {
-      return { value: { exitCode: 0, stdout: projectsReply(DATA_DIR), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      return { value: { exitCode: 0, stdout: projectsReply(c2), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     }
     return undefined
   })
   await $.session.start(sessionStart())
+  // paths.ts memoises the root-store read for the rest of the process (a session-start reset does it in the
+  // real pane); this test is the one that changes the answer, so it starts from a clean memo
+  resetStoreMemo()
   await mk($, 'setup')
   expect(draftOf().migrated, 'the store row marks the project migrated').toBe(true)
+  expect(draftOf().dataMode, 'a migrated project writes in its C2 folder').toBe('repo')
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(46) })
   await toReview(ui)
-  expect(await ui.find({ text: /project\.yaml/ })).toBeTruthy()
+  expect(await ui.find({ text: new RegExp(`${c2}/project\\.yaml`) }), 'the review names the C2 file').toBeTruthy()
   expect(await ui.find({ text: /matrixkoder\.yaml/ }), 'the pre-migration name is not offered').toBeUndefined()
   await ui.press({ key: 'wz-write' })
-  expect(files[`${DATA_DIR}/project.yaml`], 'the C2 file is the one written').toContain('integration_branch')
+  expect(files[`${c2}/project.yaml`], 'the C2 file is the one written').toContain('integration_branch')
   expect(files[YAML], 'no second matrixkoder.yaml beside it').toBeUndefined()
   const reg = w.argv.filter(a => a[2] === 'project' && a[3] === 'register').pop()
-  expect(reg?.slice(4)).toEqual(['--slug', 'mk-proj', '--repo', PROJECT_DIR, '--data', DATA_DIR])
+  expect(reg?.slice(4)).toEqual(['--slug', 'mk-proj', '--repo', PROJECT_DIR, '--data', c2])
   await ui.unmount()
 })
 

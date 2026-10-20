@@ -28,7 +28,7 @@ export function emptyDraft(): MkWizardDraft {
     skipPermissions: true,
     qaFrontend: false, qaStart: '', qaDevUrl: '', qaThemes: '', qaMockups: '', qaTarget: 'local-main',
     autoOpen: true, chip: true, toasts: true, pollMin: '5',
-    existingYaml: false, migrated: false, replace: false, phase: 'editing', written: [], error: null,
+    existingYaml: false, storeDir: null, migrated: false, replace: false, phase: 'editing', written: [], error: null,
     herdrPlugin: 'skip', herdrLinkResult: null, prefsSaved: false,
   }
 }
@@ -265,6 +265,10 @@ export function builderOrderOf(d: MkWizardDraft): string[] {
 
 export function dataDirOf(d: MkWizardDraft): string | null {
   if (d.dataEnv != null) return d.dataEnv // readers check $MATRIXKODER_DATA first
+  // The root store's row for this repo wins: it names the folder the pane itself reads (mkpaths.data_dir,
+  // data.ts projectDirFromStore), and for a MIGRATED project that is its C2 folder
+  // `<globalDir>/projects/<slug>`. Writing anywhere else put the yaml beside a store nothing reads (B-1).
+  if (d.storeDir != null) return d.storeDir
   if (d.dataMode === 'home') return d.globalDir == null ? null : paths.homeProjectDir(d.globalDir, d.slug)
   return d.repo == null ? null : paths.legacyDataDir(d.repo)
 }

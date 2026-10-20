@@ -8,7 +8,7 @@ import { atom, read, update } from 'claude-code'
 import type { Elements as ElementTables, EngineInterface, On, PluginOptions, RenderChildren, RenderElement } from 'claude-code'
 import type { MkWizardDraft } from '../types'
 import { globalDirPath, join, parseJson } from './data'
-import { paths as mkPaths, projectYamlPath } from './paths'
+import { listedDataDir, paths as mkPaths, projectYamlPath } from './paths'
 import { parsePluginManifest } from './settings-io'
 import {
   AGENT_NAMES, WIZARD_STEPS, addToGitignore, buildYaml, dataDirOf, EMPTY_DRAFT, emptyDraft, fallbackText, installModeOf, mergeModels, parseModels, parseProviders, parseVersion,
@@ -356,11 +356,17 @@ async function detect($: EngineInterface, options: PluginOptions): Promise<MkWiz
       || await $.fs.exists(join(d.repo, 'Makefile')).catch(() => false)
     if (!repoData && !established) d.dataMode = 'home'
   }
+  // B-1: which folder and which file name this project's settings live in. The root store's own row for
+  // this repo is the pane's rule (C1, `listedDataDir` + `projectDirFromStore`): it names the data dir, and a
+  // MIGRATED row (a `db_path` set) names the C2 folder `<globalDir>/projects/<slug>`. With no row the mode
+  // above decides. `projectYamlPath` then owns the file name for that folder, so the wizard reads and writes
+  // the same paths `mk-config.py`, the dashboard and the Settings tab do.
+  if (d.dataEnv == null && d.repo != null && d.globalDir != null) {
+    d.storeDir = await listedDataDir($, [d.repo], d.home, { store: true }).catch(() => null)
+  }
   const data = dataDirOf(d)
-  // B-1: a migrated project's yaml is `<data>/project.yaml`, everything older keeps `matrixkoder.yaml`.
-  // One read of the root table (`projectYamlPath`) decides it for every later read and for the write.
   const yamlPath = data == null ? null : await projectYamlPath($, data, { home: d.home, store: true })
-  d.migrated = yamlPath != null && yamlPath.endsWith('/project.yaml')
+  d.migrated = data != null && yamlPath === mkPaths.projectYaml(data, true)
   d.existingYaml = yamlPath != null && (await $.fs.exists(yamlPath).catch(() => false))
   d.loaded = true
   return d

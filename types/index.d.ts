@@ -291,6 +291,10 @@ export type MkWizardDraft = {
   toasts: boolean
   pollMin: string
   existingYaml: boolean
+  /** the data dir the root store names for this repo (`listedDataDir`, store mode) — the pane's own
+   *  rule (C1): a migrated project's is its C2 folder `<globalDir>/projects/<slug>`. null = the store
+   *  named nothing, and the mode below decides. */
+  storeDir: string | null
   /** the project is MIGRATED (paths.isMigratedFolder): the yaml is `<data>/project.yaml`, not
    *  `<data>/matrixkoder.yaml` — every read, the preview and the write follow this one flag (B-1) */
   migrated: boolean
