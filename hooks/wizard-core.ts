@@ -19,7 +19,7 @@ export function emptyDraft(): MkWizardDraft {
   const agents: Record<string, MkWizardAgent> = {}
   for (const n of AGENT_NAMES) agents[n] = { found: false, path: null, enabled: false, models: [] }
   return {
-    loaded: false, repo: null, slug: 'project', home: null, globalDir: null, dataEnv: null, installMode: 'dev', pluginRoot: '', branch: 'main',
+    loaded: false, repo: null, slug: 'project', home: null, globalDir: null, dataEnv: null, installMode: 'dev', pluginRoot: '', version: '', branch: 'main',
     dataMode: 'repo', gitignore: true, gitignoreHas: false,
     agents, codexbarVersion: null, providersAll: [...DEFAULT_PROVIDERS], providersOn: [...DEFAULT_PROVIDERS],
     gates: { install: '', test: '', typecheck: '', lint_changed: '', format_changed: '' }, gatesFrom: '', banned: [],
@@ -28,8 +28,8 @@ export function emptyDraft(): MkWizardDraft {
     skipPermissions: true,
     qaFrontend: false, qaStart: '', qaDevUrl: '', qaThemes: '', qaMockups: '', qaTarget: 'local-main',
     autoOpen: true, chip: true, toasts: true, pollMin: '5',
-    existingYaml: false, replace: false, phase: 'editing', written: [], error: null,
-    herdrPlugin: 'skip', herdrLinkResult: null,
+    existingYaml: false, migrated: false, replace: false, phase: 'editing', written: [], error: null,
+    herdrPlugin: 'skip', herdrLinkResult: null, prefsSaved: false,
   }
 }
 
@@ -38,7 +38,13 @@ export const EMPTY_DRAFT: MkWizardDraft = emptyDraft()
 // ---------- detection parsers ----------
 
 export function slugOf(path: string): string {
-  const s = basename(path).toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '')
+  // mkdb.py's SLUG_RE (^[a-z0-9][a-z0-9-]{0,40}$): letters, digits and '-' only, 41 at most.
+  // '_' and '.' used to survive, and `mk-state.py project register` refuses those AFTER the yaml is written (B-2).
+  const s = basename(path).toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+/, '')
+    .slice(0, 41)
+    .replace(/-+$/, '')
   return s === '' ? 'project' : s
 }
 
@@ -83,13 +89,15 @@ export function mergeModels(...lists: readonly (readonly string[])[]): string[] 
   return [...plan, ...ollama, ...rest].slice(0, cap)
 }
 
-/** The Usage step's provider label: OpenCode plans are disambiguated; the stored value stays the CodexBar id. */
+/** The Usage step's provider label (the slides' short names): the stored value always stays the
+ *  CodexBar id, and a provider this file has never heard of still gets a word back — the old
+ *  fallback printed the bare id, so `openai` drew as `openai` and read as a second-class row (B-9). */
+const PROVIDER_LABEL: Record<string, string> = {
+  claude: 'Claude', codex: 'Codex', antigravity: 'Antigravity', openai: 'OpenAI',
+  zai: 'Z.AI', opencode: 'OpenCode Zen', opencodego: 'OpenCode Go', ollama: 'Ollama',
+}
 export function providerLabel(p: string): string {
-  if (p === 'zai') return 'zai (OpenCode Z.AI plan)'
-  if (p === 'opencode') return 'opencode (OpenCode Zen)'
-  if (p === 'ollama') return 'ollama (OpenCode on Ollama Cloud)'
-  if (p === 'opencodego') return 'opencodego (OpenCode Go)'
-  return p
+  return PROVIDER_LABEL[p] ?? p.charAt(0).toUpperCase() + p.slice(1)
 }
 
 export function parseVersion(stdout: string): string | null {
@@ -100,7 +108,9 @@ export function parseVersion(stdout: string): string | null {
 export function providerChoices(listed: readonly { name: string; enabled: boolean }[]): { all: string[]; on: string[] } {
   const relevant = new Set<string>(RELEVANT_PROVIDERS)
   const shown = listed.filter(p => relevant.has(p.name) || p.enabled)
-  return { all: shown.map(p => p.name), on: shown.filter(p => p.enabled && relevant.has(p.name)).map(p => p.name) }
+  // every listed provider that CodexBar has ON is pre-selected, relevant or not: a listed-but-unticked
+  // row with no reason was B-9 (`openai: enabled` drew as `[ ] openai`).
+  return { all: shown.map(p => p.name), on: shown.filter(p => p.enabled).map(p => p.name) }
 }
 
 /** Plugin root → install mode: a marketplace install lives in the plugins cache. */
@@ -133,7 +143,10 @@ function pmOf(locks: readonly string[]): Pm {
   return { run: 'npm run', exec: 'npx', install: 'npm ci' }
 }
 
-/** Proposes the five gate commands from what the repo declares. Never runs anything. */
+/** Proposes the five gate commands from what the repo declares. Never runs anything.
+ *  The proposed commands are whole-repo runs: the old `{paths}`/`{files}` scope tokens were written
+ *  literally by this emitter and expanded by nobody (B-18), so a proposed gate would have run a
+ *  shell that met the braces and, if it ever ran, a command named `{files}`. */
 export function proposeGates(inp: GateInputs): { gates: MkWizardGates; banned: string[]; from: string } {
   const gates: MkWizardGates = { install: '', test: '', typecheck: '', lint_changed: '', format_changed: '' }
   const banned: string[] = []
@@ -147,25 +160,25 @@ export function proposeGates(inp: GateInputs): { gates: MkWizardGates; banned: s
     const script = (n: string): string => (typeof scripts[n] === 'string' ? (scripts[n] as string) : '')
     gates.install = pm.install
     if (script('test') !== '' || 'vitest' in deps || 'jest' in deps) {
-      gates.test = 'vitest' in deps || /vitest/.test(script('test')) ? `${pm.exec} vitest run {paths}`
-        : 'jest' in deps || /jest/.test(script('test')) ? `${pm.exec} jest {paths}`
+      gates.test = 'vitest' in deps || /vitest/.test(script('test')) ? `${pm.exec} vitest run`
+        : 'jest' in deps || /jest/.test(script('test')) ? `${pm.exec} jest`
         : `${pm.run} test`
     }
     const tc = ['typecheck', 'type-check', 'check:types', 'tsc'].find(n => script(n) !== '')
     gates.typecheck = tc ? `${pm.run} ${tc}` : inp.hasTsconfig || 'typescript' in deps ? `${pm.exec} tsc --noEmit` : ''
-    if ('eslint' in deps) gates.lint_changed = `${pm.exec} eslint {files}`
-    else if ('@biomejs/biome' in deps) gates.lint_changed = `${pm.exec} biome check {files}`
-    if ('prettier' in deps) gates.format_changed = `${pm.exec} prettier --write {files}`
+    if ('eslint' in deps) gates.lint_changed = `${pm.exec} eslint .`
+    else if ('@biomejs/biome' in deps) gates.lint_changed = `${pm.exec} biome check .`
+    if ('prettier' in deps) gates.format_changed = `${pm.exec} prettier --write .`
     for (const n of ['dev', 'start']) if (script(n) !== '') banned.push(`${pm.run} ${n}`)
   }
   if (inp.pyproject != null) {
     from.push('pyproject.toml')
     const py = inp.pyproject
     if (gates.install === '') gates.install = inp.locks.includes('uv.lock') ? 'uv sync' : inp.locks.includes('poetry.lock') ? 'poetry install' : ''
-    if (gates.test === '' && /pytest/.test(py)) gates.test = 'pytest {paths}'
+    if (gates.test === '' && /pytest/.test(py)) gates.test = 'pytest'
     if (gates.typecheck === '') gates.typecheck = /mypy/.test(py) ? 'mypy .' : /pyright/.test(py) ? 'pyright' : ''
-    if (gates.lint_changed === '' && /ruff/.test(py)) gates.lint_changed = 'ruff check {files}'
-    if (gates.format_changed === '') gates.format_changed = /ruff/.test(py) ? 'ruff format {files}' : /black/.test(py) ? 'black {files}' : ''
+    if (gates.lint_changed === '' && /ruff/.test(py)) gates.lint_changed = 'ruff check .'
+    if (gates.format_changed === '') gates.format_changed = /ruff/.test(py) ? 'ruff format .' : /black/.test(py) ? 'black .' : ''
   }
   if (inp.makefile != null) {
     from.push('Makefile')
@@ -182,7 +195,7 @@ export function proposeGates(inp: GateInputs): { gates: MkWizardGates; banned: s
   if (marker('.claude-plugin/plugin.json')) {
     from.push('.claude-plugin/plugin.json')
     if (gates.test === '') gates.test = 'claude plugin test .'
-    // the plugin schema has no whole-repo validate slot; make lint already ignores {files} the same way
+    // the plugin schema has no whole-repo validate slot; every proposed gate is a whole-repo run
     if (gates.lint_changed === '') gates.lint_changed = 'claude plugin validate .'
   }
   if (marker('Cargo.toml')) {
@@ -348,9 +361,13 @@ export function buildYaml(d: MkWizardDraft, checkedAt: string, existingYaml?: st
   }
   const g = d.gates
   const proposed = (v: string): string | undefined => (v !== '' ? 'proposed' : undefined)
-  L.push('# <data>/matrixkoder.yaml — written by the MatrixKoder onboarding wizard after the user confirmed.')
+  // the header names the file it is: a migrated project's is <data>/project.yaml (B-1)
+  L.push(`# <data>/${d.migrated ? 'project.yaml' : 'matrixkoder.yaml'} — written by the MatrixKoder onboarding wizard after the user confirmed.`)
   L.push('# Re-checked for drift on every run; the user\'s explicit statements override any value.')
-  kv(0, 'data_dir', d.dataEnv != null || d.dataMode === 'home' ? `${dataDirOf(d) ?? ''}/` : '.matrixkoder/', 'project data dir')
+  // B-8: with no global dir to name in home mode, dataDirOf is null and the old `${dir ?? ''}/`
+  // wrote the value `/` — a data dir of the filesystem root. The locks line below already spells
+  // an unknown home as `~/.matrixkoder`; data_dir does the same instead of inventing a root.
+  kv(0, 'data_dir', d.dataEnv != null || d.dataMode === 'home' ? `${dataDirOf(d) ?? paths.homeProjectDir('~/.matrixkoder', d.slug)}/` : '.matrixkoder/', 'project data dir')
   L.push('repo:')
   kv(2, 'integration_branch', d.branch, 'lanes merge here; one PR to main at the end')
   kv(2, 'lanes', { slots: 1, pattern: '../{repo}-mk-{n}', reuse: true }, 'reusable worktree slots; the cap is max_build_lanes')
@@ -429,6 +446,35 @@ export function addToGitignore(text: string | null): string | null {
   if (lines.some(l => l === '/.matrixkoder/' || l === '.matrixkoder/' || l === '/.matrixkoder' || l === '.matrixkoder')) return null
   const body = text ?? ''
   return `${body}${body === '' || body.endsWith('\n') ? '' : '\n'}/.matrixkoder/\n`
+}
+
+/** One row of the review's `-`/`+` diff (B-6, SetupReviewReplace). */
+export type YamlDiffRow = { sign: '-' | '+' | ' '; text: string }
+
+/** The review's replace form: line-wise `-`/`+` rows against the file on disk, plus how many lines the
+ *  two share. Line-wise, not LCS: the wizard's emitter is one key per line and a replace rewrites whole
+ *  blocks, so a positional compare reads exactly as the slides do (`- test: pnpm test`, `+ test: …`) and
+ *  costs O(n). Unchanged lines keep their text and draw with a leading space. */
+export function yamlDiff(oldText: string | null, newText: string): { rows: YamlDiffRow[]; changed: number; unchanged: number } {
+  const before = (oldText ?? '').replace(/\n$/, '').split('\n')
+  const after = newText.replace(/\n$/, '').split('\n')
+  const rows: YamlDiffRow[] = []
+  let changed = 0
+  let unchanged = 0
+  const n = Math.max(before.length, after.length)
+  for (let i = 0; i < n; i++) {
+    const a = before[i]
+    const b = after[i]
+    if (a === b && a != null) {
+      rows.push({ sign: ' ', text: a })
+      unchanged++
+    } else {
+      if (a != null) rows.push({ sign: '-', text: a })
+      if (b != null) rows.push({ sign: '+', text: b })
+      changed++
+    }
+  }
+  return { rows, changed, unchanged }
 }
 
 /** Text answer for `/mk setup` outside fullscreen: the detected defaults, one command to continue. */
