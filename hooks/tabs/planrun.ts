@@ -69,16 +69,8 @@ const quote = (text: string): string => `"${titleOnly(text)}"`
 const needsFirst = (deps: readonly DepStatus[]): string =>
   deps.length === 0 ? '' : deps.map(d => `${d.id} ${d.status === '' ? 'not in this plan' : d.status}`).join(' and ')
 
-/** The lane and route words the row carries (`L3 · opencode glm-5.3`), '' when none. */
-const laneWords = (row: { readonly slot?: number | null; readonly route?: PlanPhase['route'] }): string => {
-  const lane = typeof row.slot === 'number' && Number.isFinite(row.slot) ? `L${row.slot}` : ''
-  const route = row.route
-  const agent = route == null ? '' : [route.agent ?? '', route.model ?? '', route.effort ?? ''].filter(p => p !== '').join(' ')
-  return [lane, agent].filter(p => p !== '').join(' · ')
-}
-
-/** The line every prompt ends on. */
-const LOOP = 'Run it through the MatrixKoder loop (round, brief, lane, dispatch, watch, verify, separate review). Do not edit plan statuses by hand.'
+/** The heading line of every prompt a Play or Pause press drafts. */
+const HEADING = 'Message from MatrixKoder'
 
 /** A numbered block: the parts present, numbered in order from 1. */
 const numbered = (parts: readonly string[]): string[] => parts.map((part, i) => `${String(i + 1)}. ${part}`)
@@ -106,14 +98,9 @@ export function phasePrompt(planId: string, phase: PlanPhase, phases: readonly P
   }
   const owned = phase.owned ?? []
   if (owned.length > 0) parts.push(`Files this phase owns: ${owned.join(', ')}.`)
-  const lane = laneWords(phase)
-  const route = lane === '' ? 'none planned' : lane
-  const reviewer = phase.reviewer != null && phase.reviewer !== '' ? phase.reviewer : 'none'
-  parts.push(`Route: ${route}; reviewer: ${reviewer}.`)
-  parts.push(LOOP)
   const wave = phase.wave != null ? ` (wave ${String(phase.wave)})` : ''
   const verb = HELD[phase.status ?? ''] === true ? 'Resume' : started ? 'Continue' : 'Start'
-  return [`${verb} phase ${phase.id} of plan ${planId}: ${quote(phase.title)}${wave}.`, ...numbered(parts)].join('\n')
+  return [HEADING, `${verb} phase ${phase.id} of plan ${planId}: ${quote(phase.title)}${wave}.`, ...numbered(parts)].join('\n')
 }
 
 /** The phase a task id belongs to (`B1.1` → `B1`), or the phase that holds it. */
@@ -137,24 +124,18 @@ export function taskPrompt(planId: string, task: PlanTask, phases: readonly Plan
   const phaseNeeds = phase == null ? '' : needsFirst(depStatuses(phase.deps, phases))
   const depParts = [needs !== '' ? `this task needs ${needs}` : '', phaseNeeds !== '' ? `phase ${phase?.id ?? ''} needs ${phaseNeeds}` : ''].filter(p => p !== '')
   if (depParts.length > 0) parts.push(`Depends on: ${depParts.join('; ')}.`)
-  const lane = laneWords(task)
-  if (lane !== '') parts.push(`Lane: ${lane}.`)
-  const reviewer = task.reviewer != null && task.reviewer !== '' ? task.reviewer : ''
-  if (reviewer !== '') parts.push(`Reviewer: ${reviewer}.`)
   const owned = task.owned ?? []
   if (owned.length > 0) parts.push(`Files this task owns: ${owned.join(', ')}.`)
   parts.push(`Run this one task, not the rest of ${phase?.id ?? 'the phase'}.`)
   const verb = status === 'rework' ? 'Rework' : STOPPED[status] === true ? 'Retry' : HELD[status] === true ? 'Resume' : 'Start'
-  parts.push(LOOP)
   const inPhase = phase != null && phase.id !== task.id ? ` (phase ${phase.id})` : ''
-  return [`${verb} task ${task.id} of plan ${planId}${inPhase}: ${quote(task.title)}.`, ...numbered(parts)].join('\n')
+  return [HEADING, `${verb} task ${task.id} of plan ${planId}${inPhase}: ${quote(task.title)}.`, ...numbered(parts)].join('\n')
 }
 
 /** The prompt for Pause on a phase or task: what to stop, what is left, and the
  *  loop. Pause asks; it stops nothing by itself. */
 export function pausePrompt(planId: string, what: 'phase' | 'task', row: PlanPhase | PlanTask, phases: readonly PlanPhase[]): string {
   const status = row.status ?? ''
-  const lane = laneWords(row) || 'no lane'
   const parts: string[] = []
   parts.push(`Stop handing out new work in ${row.id}; let nothing new start.`)
   parts.push(`Tell its builder to stop at the next safe point and report what is done.`)
@@ -169,10 +150,11 @@ export function pausePrompt(planId: string, what: 'phase' | 'task', row: PlanPha
       : 'Record the phase state on the run; do not set a status the store lacks.')
   }
   parts.push(`Tell me when it is quiet, and what "play" must restore.`)
-  parts.push(`Run it through the MatrixKoder loop where work is needed. Do not edit plan statuses by hand; pause only asks, it stops no running builder.`)
+  parts.push(`Pause only asks; it stops no running builder.`)
   const needLine = needsFirst(depStatuses(row.deps, phases))
   return [
-    `Pause ${what} ${row.id} of plan ${planId}: ${quote(row.title)}. Status ${status === '' ? 'unknown' : status}; lane ${lane}.${needLine === '' ? '' : ` Deps: ${needLine}.`}`,
+    HEADING,
+    `Pause ${what} ${row.id} of plan ${planId}: ${quote(row.title)}. Status ${status === '' ? 'unknown' : status}.${needLine === '' ? '' : ` Deps: ${needLine}.`}`,
     ...numbered(parts),
   ].join('\n')
 }
