@@ -109,7 +109,7 @@ test('the footer: the solid Improve chip and two + tool slots sit between the da
   world(on, { answer: () => REWRITE })
   await $.session.start(sessionStart())
   const ui = await mount($)
-  for (const tab of ['overview', 'lanes', 'plan', 'usage', 'events', 'waiting', 'kanban', 'todo', 'improve']) {
+  for (const tab of ['overview', 'lanes', 'plan', 'usage', 'events', 'waiting', 'todo', 'improve']) {
     await ui.press({ key: `dash-tab-${tab}` })
     expect(await has(ui, { type: 'Input', key: 'improve-q' }), `no box of its own on ${tab}`).toBe(false)
     expect(await has(ui, { type: 'Button', key: 'improve-f-go' }), `the chip on ${tab}`).toBe(true)

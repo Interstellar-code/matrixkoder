@@ -137,7 +137,7 @@ test('store mode: the Kanban sub-tab renders PlanKanbanTab (four columns, no Kan
   expect(text).toContain('ON MAIN')
   expect(text).toContain('T1')
   expect(text).not.toContain('Needs you off')
-  expect(text).toContain('1 tasks · same cards as k, this plan only')
+  expect(text).toContain('1 tasks · this plan only')
   expect(text).toContain('source project')
   // the active Segment carries the plan id (V1.4 spec 2)
   const labels = nodesOf(drawn, 'Button').map(b => String(b.props?.label ?? ''))

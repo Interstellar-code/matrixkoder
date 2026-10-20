@@ -12,8 +12,6 @@ import { PANE_ID, parseYamlAgents } from './data'
 import { buildRainGrid, filesFocus, footerParts, liveOverviewView, modelShort, openWaiting, planActionPatch, rainGridFor, resolveMainCheckout, runPlanAction, taskNote, usageShorts, waitingPane, waitingPaneView } from './dashboard'
 import type { MkSnapshot } from '../types'
 import { mockTabCounts, waitingCount } from './tabs/header'
-import { readCards } from './tabs/kanban'
-import type { RunFn } from './tabs/kanban'
 import { RUN_SNAPSHOT } from './fixtures/run-snapshot'
 import planDetail from './tabs/fixtures/plan-detail'
 
@@ -771,7 +769,6 @@ const TAB_BUTTONS = [
   { key: 'dash-tab-files', name: 'Files' },
   { key: 'dash-tab-events', name: 'Events' },
   { key: 'dash-tab-waiting', name: 'Waiting' },
-  { key: 'dash-tab-kanban', name: 'Kanban' },
   { key: 'dash-tab-todo', name: 'Todo' },
   { key: 'dash-tab-improve', name: 'Improve' },
   { key: 'dash-tab-settings', name: 'Settings' },
@@ -792,7 +789,7 @@ test('every tab hotkey switches to that tab’s body: live data, MOCK only on Wa
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
-  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban' && t.key !== 'dash-tab-files' && t.key !== 'dash-tab-todo' && t.key !== 'dash-tab-improve')) {
+  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-files' && t.key !== 'dash-tab-todo' && t.key !== 'dash-tab-improve')) {
     await ui.press({ key })
     await expectTabBody(ui, key, name)
   }
@@ -812,7 +809,7 @@ test('at 36 cols the tab bar drops to short labels and every tab still renders',
     else expect(wide, `${name} wide label dropped`).toBeUndefined()
   }
   expect((await ui.findAll({ type: 'Button' })).filter(b => String(b.props.key).startsWith('dash-tab-')), 'the bar still draws every tab').toHaveLength(TAB_BUTTONS.length)
-  for (const { key } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban' && t.key !== 'dash-tab-files' && t.key !== 'dash-tab-todo' && t.key !== 'dash-tab-improve')) {
+  for (const { key } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-files' && t.key !== 'dash-tab-todo' && t.key !== 'dash-tab-improve')) {
     await ui.press({ key })
     await expectTabBody(ui, key, `${key} renders narrow`)
   }
@@ -839,8 +836,19 @@ const tabLabels = async (ui: { findAll: (q: { type: string }) => Promise<{ props
     .filter(b => String(b.props.key).startsWith('dash-tab-'))
     .map(b => String(b.props.label))
 
+test('K1.2 (C2): a stored tab that is no longer a tab (the removed kanban) opens on Overview', { plugins: [worldFixtures] }, async ($, on) => {
+  mockFs(on, worldFiles())
+  mockWorld(on)
+  on('state.get', (_$, e, next) => (e.key === 'dashTab' ? { value: { value: 'kanban', version: 1 } } : next(e)))
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  expect(await ui.find({ text: LIVE_MARK['dash-tab-overview']! }), 'the Overview body draws').toBeTruthy()
+  const buttons = (await ui.findAll({ type: 'Button' })).filter(b => String(b.props.key).startsWith('dash-tab-'))
+  expect(buttons.filter(b => b.props.dimColor !== true).map(b => String(b.props.key)), 'the Overview tab is the active one').toEqual(['dash-tab-overview'])
+})
+
 test('the mock tab counts read the fixtures: lanes, plan done/total, waiting only when open', async () => {
-  expect(mockTabCounts()).toEqual({ overview: '', lanes: '4', plan: '3/8', usage: '', files: '', events: '', waiting: '!1', kanban: '', todo: '', improve: '', settings: '' })
+  expect(mockTabCounts()).toEqual({ overview: '', lanes: '4', plan: '3/8', usage: '', files: '', events: '', waiting: '!1', todo: '', improve: '', settings: '' })
   expect(waitingCount(0)).toBe('') // LOW: a fixture with no open decision shows no count, never `!0`
   expect(waitingCount(2)).toBe('!2')
 })
@@ -862,7 +870,7 @@ test('every tab shows the real run header: name, stage chip and ▶ Next, never 
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
-  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban' && t.key !== 'dash-tab-files' && t.key !== 'dash-tab-todo' && t.key !== 'dash-tab-improve')) {
+  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-files' && t.key !== 'dash-tab-todo' && t.key !== 'dash-tab-improve')) {
     await ui.press({ key })
     expect(await ui.find({ text: 'MATRIXKODER' }), `${name} shared brand header`).toBeTruthy()
     expect(await ui.find({ text: /ORCHESTRATOR/ }), `${name} mode chip`).toBeTruthy()
@@ -893,7 +901,7 @@ test('the shared brand header shows plugin.json\'s version chip on a run tab and
   expect(await ui.find({ text: 'workflows-v2' }), 'no run block on Settings').toBeUndefined()
 })
 
-test('F0: every tab Button carries its keyboard hotkey — o l p u e w k t i 9, at 36 and 46 cols', { plugins: [worldFixtures] }, async ($, on) => {
+test('F0: every tab Button carries its keyboard hotkey — o l p u e w t i 9, at 36 and 46 cols', { plugins: [worldFixtures] }, async ($, on) => {
   mockFs(on, worldFiles())
   mockWorld(on)
   await $.session.start(sessionStart())
@@ -902,7 +910,7 @@ test('F0: every tab Button carries its keyboard hotkey — o l p u e w k t i 9, 
     await ui.redraw(paneProps(cols))
     // only the bar's own `dash-tab-*` keys name tabs: a body (Waiting's options) draws Buttons too
     const buttons = (await ui.findAll({ type: 'Button' })).filter(b => String(b.props.key).startsWith('dash-tab-'))
-    expect(buttons.map(b => b.props.hotkey), `hotkeys at ${cols}`).toEqual(['o', 'l', 'p', 'u', 'f', 'e', 'w', 'k', 't', 'i', '9'])
+    expect(buttons.map(b => b.props.hotkey), `hotkeys at ${cols}`).toEqual(['o', 'l', 'p', 'u', 'f', 'e', 'w', 't', 'i', '9'])
     for (const b of buttons) {
       // an inactive tab's label is its count alone (or the `·` placeholder), so
       // a plain Button's `h: label` drawing never repeats the tab's own letter
@@ -916,7 +924,7 @@ test('F0: every tab Button carries its keyboard hotkey — o l p u e w k t i 9, 
   }
   // the press-by-key switch loop stands
   // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
-  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-kanban' && t.key !== 'dash-tab-files' && t.key !== 'dash-tab-todo' && t.key !== 'dash-tab-improve')) {
+  for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings' && t.key !== 'dash-tab-files' && t.key !== 'dash-tab-todo' && t.key !== 'dash-tab-improve')) {
     await ui.redraw(paneProps(46))
     await ui.press({ key })
     await expectTabBody(ui, key, name)
@@ -946,14 +954,14 @@ test('the tab bar shows every word at 46 and the active word plus hotkey letters
   mockWorld(on)
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  expect(await tabLabels(ui)).toEqual(['Overview', 'Lanes', 'Plan', 'Usage', 'Files', 'Events', 'Waiting', 'Kanban', 'Todo', 'Improve', 'Settings'])
+  expect(await tabLabels(ui)).toEqual(['Overview', 'Lanes', 'Plan', 'Usage', 'Files', 'Events', 'Waiting', 'Todo', 'Improve', 'Settings'])
   for (const cols of [36, 46] as const) {
     await ui.press({ key: 'dash-tab-lanes' })
     await ui.redraw(paneProps(cols))
     const labels = await tabLabels(ui)
-    expect(labels, `at ${cols}`).toEqual(cols === 46 ? ['Overview', 'Lanes', 'Plan', 'Usage', 'Files', 'Events', 'Waiting', 'Kanban', 'Todo', 'Improve', 'Settings'] : ['o', 'Lanes', 'p', 'u', 'f', 'e', 'w', 'k', 't', 'i', '9'])
+    expect(labels, `at ${cols}`).toEqual(cols === 46 ? ['Overview', 'Lanes', 'Plan', 'Usage', 'Files', 'Events', 'Waiting', 'Todo', 'Improve', 'Settings'] : ['o', 'Lanes', 'p', 'u', 'f', 'e', 'w', 't', 'i', '9'])
     expect(labels.join(' ')).not.toContain('o: o') // the S0 short labels are gone
-    expect(labels.filter(l => /^[a-z0-9]$/.test(l)).length, 'narrow: every inactive tab shows its hotkey letter, wide: none').toBe(cols === 46 ? 0 : 10)
+    expect(labels.filter(l => /^[a-z0-9]$/.test(l)).length, 'narrow: every inactive tab shows its hotkey letter, wide: none').toBe(cols === 46 ? 0 : 9)
     expect(labels.filter(l => l === '·').length, 'the count placeholder is gone').toBe(0)
   }
 })
@@ -1125,7 +1133,7 @@ test('V1.4: a full-width rule of the palette line colour sits directly under the
     expect(wrap?.kids, `bar then rule at ${cols}`).toHaveLength(2)
     const bar = nodesOf(wrap?.kids[0], 'Button')
     expect(bar.map(b => String(b.props.key)), `the bar is the first child at ${cols}`)
-      .toEqual(['dash-tab-overview', 'dash-tab-lanes', 'dash-tab-plan', 'dash-tab-usage', 'dash-tab-files', 'dash-tab-events', 'dash-tab-waiting', 'dash-tab-kanban', 'dash-tab-todo', 'dash-tab-improve', 'dash-tab-settings'])
+      .toEqual(['dash-tab-overview', 'dash-tab-lanes', 'dash-tab-plan', 'dash-tab-usage', 'dash-tab-files', 'dash-tab-events', 'dash-tab-waiting', 'dash-tab-todo', 'dash-tab-improve', 'dash-tab-settings'])
     // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
     for (const { key, name } of TAB_BUTTONS.filter(t => t.key !== 'dash-tab-settings')) {
       await ui.press({ key })
@@ -1188,7 +1196,7 @@ test('C12: every tab call receives the ui handle — all six tabs act on it, not
   // the four-argument tabs (lanes, usage, waiting, events) take the extra argument through the
   // pane's widened call and still render their body; Plan is store-driven and acts on ui below
   // Settings is live since S3 (loading line, then live rows) — the S3 tests cover it.
-  for (const { key, name } of TAB_BUTTONS.filter(t => !['dash-tab-settings', 'dash-tab-kanban', 'dash-tab-files', 'dash-tab-todo', 'dash-tab-improve', 'dash-tab-plan'].includes(t.key))) {
+  for (const { key, name } of TAB_BUTTONS.filter(t => !['dash-tab-settings', 'dash-tab-files', 'dash-tab-todo', 'dash-tab-improve', 'dash-tab-plan'].includes(t.key))) {
     await ui.press({ key })
     await expectTabBody(ui, key, `${name} renders with the ui argument`)
   }
@@ -1210,7 +1218,7 @@ test('C12: every tab call receives the ui handle — all six tabs act on it, not
   // Waiting: ⋯ reveals the folded actions; a pick marks the option it picked
   await ui.press({ key: 'dash-tab-waiting' })
   const labels = await tabLabels(ui)
-  expect(labels, 'the tab bar keeps its own labels while a body draws buttons').toHaveLength(11)
+  expect(labels, 'the tab bar keeps its own labels while a body draws buttons').toHaveLength(10)
   await ui.press({ key: 'waiting-a-more-3' })
   expect(await ui.find({ type: 'Button', text: /Rebase later/ }), 'the revealed option button').toBeTruthy()
   await ui.press({ key: 'waiting-b' })
@@ -1885,31 +1893,6 @@ test('LOW 4: a second save press while saving does nothing', { plugins: [worldFi
   expect(await ui.find({ text: /✓ saved 1/ }), 'the save lands once').toBeTruthy()
 })
 
-test('D8A: hotkey k opens the Kanban tab between Waiting and Settings', { plugins: [worldFixtures] }, async ($, on) => {
-  mockFs(on, worldFiles())
-  const clock = mockWorld(on, { env: { MK_HOME: '/tmp/mk-d8a-missing' } })
-  on('fs.exists', () => ({ value: false }))
-  await $.session.start(sessionStart())
-  await clock.advance(0)
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  const buttons = await ui.findAll({ type: 'Button' })
-  const keys = buttons.map(b => String(b.props.key))
-  const w = keys.indexOf('dash-tab-waiting')
-  const k = keys.indexOf('dash-tab-kanban')
-  const t = keys.indexOf('dash-tab-todo')
-  const i = keys.indexOf('dash-tab-improve')
-  const o = keys.indexOf('dash-tab-settings')
-  expect(k, 'kanban sits after waiting').toBe(w + 1)
-  expect(t, 'todo sits after kanban').toBe(k + 1)
-  expect(i, 'improve sits after todo').toBe(t + 1)
-  expect(o, 'settings sits after improve').toBe(i + 1)
-  const kanban = buttons.find(b => b.props.key === 'dash-tab-kanban')
-  expect(kanban?.props.hotkey).toBe('k')
-  expect(String(kanban?.props.label)).toContain('Kanban')
-  await ui.press({ key: 'dash-tab-kanban' })
-  expect(await ui.find({ text: 'no store yet' }), 'missing root store draws the empty state').toBeTruthy()
-})
-
 test('D8A: a dashboard tick reads the root overview once when the root store exists, and never when it does not', { plugins: [worldFixtures] }, async ($, on) => {
   const calls: string[][] = []
   const clock = mockWorld(on, {
@@ -1936,200 +1919,6 @@ test('D8A: a dashboard tick reads the root overview once when the root store exi
 })
 
 
-test('D8A R2: MK_HOME unset reads ~/.matrixkoder/mk.db and shows no store yet', { plugins: [worldFixtures] }, async ($, on) => {
-  const calls: string[][] = []
-  const exists: string[] = []
-  const clock = mockWorld(on, {
-    process: argv => {
-      calls.push([...argv])
-      return undefined
-    },
-  })
-  on('fs.exists', (_$, e) => {
-    exists.push(String(e.path))
-    return { value: false }
-  })
-  mockFs(on, worldFiles())
-  await $.session.start(sessionStart())
-  await clock.advance(0)
-  const homeIdx = calls.flat().indexOf('--home')
-  const cardCalls = calls.filter(a => a.includes('cards'))
-  expect(cardCalls, 'a missing store never spawns mkdb').toHaveLength(0)
-  expect(exists.some(p => p === '/home/mk/.matrixkoder/mk.db'), `exists looked at ${exists.join(',')}`).toBe(true)
-  expect(exists.some(p => p === '/home/mk/mk.db'), 'must not probe $HOME/mk.db').toBe(false)
-  void homeIdx
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  await ui.press({ key: 'dash-tab-kanban' })
-  expect(await ui.find({ text: 'no store yet' })).toBeTruthy()
-  expect(await ui.find({ text: /alpha/ })).toBeUndefined()
-  expect(await ui.find({ text: /beta/ })).toBeUndefined()
-  expect(await ui.find({ text: /gamma/ })).toBeUndefined()
-})
-
-test('D8A R2: a present store with zero linked projects draws an empty board, not the fixture', { plugins: [worldFixtures] }, async ($, on) => {
-  const calls: string[][] = []
-  const clock = mockWorld(on, {
-    process: argv => {
-      calls.push([...argv])
-      if (argv.includes('overview')) {
-        return { value: { exitCode: 0, stdout: '{"ok":true,"projects":[],"plans":[]}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
-      }
-      return undefined
-    },
-  })
-  on('fs.exists', (_$, e) => ({ value: String(e.path) === '/home/mk/.matrixkoder/mk.db' }))
-  mockFs(on, worldFiles())
-  await $.session.start(sessionStart())
-  await clock.advance(0)
-  const cardCalls = calls.filter(a => a.includes('overview'))
-  expect(cardCalls, 'one overview read').toHaveLength(1)
-  const homeAt = cardCalls[0]!.indexOf('--home')
-  expect(cardCalls[0]![homeAt + 1]).toBe('/home/mk/.matrixkoder')
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  await ui.press({ key: 'dash-tab-kanban' })
-  expect(await ui.find({ text: 'no store yet' }), 'a present store is not the empty-store line').toBeUndefined()
-  expect(await ui.find({ text: 'Backlog 0' })).toBeTruthy()
-  expect(await ui.find({ text: /alpha/ })).toBeUndefined()
-})
-
-
-test('FC: a corrupt per-project read shows an error and keeps the last good cards', { plugins: [worldFixtures] }, async ($, on) => {
-  let mode: 'good' | 'corrupt' = 'good'
-  const calls: string[][] = []
-  const clock = mockWorld(on, {
-    env: { MK_HOME: '/tmp/mk-fc-home' },
-    process: argv => {
-      calls.push([...argv])
-      if (argv.includes('overview')) {
-        return { value: { exitCode: 0, stdout: JSON.stringify({ ok: true, projects: [{ slug: 'alpha', repo: '/r/alpha', data_dir: '/srv/alpha/.matrixkoder', db_path: null }], plans: [] }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
-      }
-      if (!argv.includes('run-snapshot')) return undefined
-      if (mode === 'corrupt') {
-        // real mkdb.py against a corrupt mk.db: empty stdout, exit 1
-        return { value: { exitCode: 1, stdout: '', stderr: 'sqlite3.DatabaseError: file is not a database', isStdoutTruncated: false, isStderrTruncated: false } }
-      }
-      const snap = { ok: true, runs: [], active: 'r', waits: [], run: { id: 'r', plan: null, status: 'active', tasks: [{ id: 'D3A', title: 'Writer', status: 'building', parent: 'D3', updated: '2026-10-12T09:00:00+02:00' }] } }
-      return { value: { exitCode: 0, stdout: JSON.stringify(snap), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
-    },
-  })
-  on('fs.exists', (_$, e) => ({ value: String(e.path) === '/tmp/mk-fc-home/mk.db' }))
-  mockFs(on, worldFiles())
-  await $.session.start(sessionStart())
-  for (let i = 0; i < 20; i++) await clock.advance(0)
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  await ui.press({ key: 'dash-tab-kanban' })
-  expect(await ui.find({ text: /D3A/ }), 'the good read draws the card').toBeTruthy()
-  mode = 'corrupt'
-  await clock.advance(5000)
-  for (let i = 0; i < 30; i++) await clock.advance(0)
-  expect(await ui.find({ text: /cards read failed/ }), 'the failed read is a visible error').toBeTruthy()
-  expect(await ui.find({ text: /stale/ }), 'last good cards are flagged stale').toBeTruthy()
-  expect(await ui.find({ text: /D3A/ }), 'last good card stays').toBeTruthy()
-  expect(await ui.find({ text: 'no store yet' }), 'an error is not the empty-store line').toBeUndefined()
-})
-
-test('FC: {ok:false} shows an error, not empty columns', { plugins: [worldFixtures] }, async ($, on) => {
-  const clock = mockWorld(on, {
-    env: { MK_HOME: '/tmp/mk-fc-okfalse' },
-    process: argv => {
-      if (argv.includes('overview')) {
-        return { value: { exitCode: 0, stdout: JSON.stringify({ ok: true, projects: [{ slug: 'alpha', repo: '/r/alpha', data_dir: '/d/alpha', db_path: null }], plans: [] }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
-      }
-      if (!argv.includes('run-snapshot')) return undefined
-      return { value: { exitCode: 0, stdout: '{"ok":false,"error":"locked"}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
-    },
-  })
-  on('fs.exists', (_$, e) => ({ value: String(e.path) === '/tmp/mk-fc-okfalse/mk.db' }))
-  mockFs(on, worldFiles())
-  await $.session.start(sessionStart())
-  for (let i = 0; i < 20; i++) await clock.advance(0)
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  await ui.press({ key: 'dash-tab-kanban' })
-  expect(await ui.find({ text: /cards read failed: locked/ })).toBeTruthy()
-  expect(await ui.find({ text: 'no store yet' })).toBeUndefined()
-  expect(await ui.find({ text: 'Backlog 0' })).toBeUndefined()
-})
-
-test('FC: non-JSON stdout shows an error, not empty columns', { plugins: [worldFixtures] }, async ($, on) => {
-  const clock = mockWorld(on, {
-    env: { MK_HOME: '/tmp/mk-fc-nonjson' },
-    process: argv => {
-      if (!argv.includes('cards')) return undefined
-      return { value: { exitCode: 0, stdout: 'not-json', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
-    },
-  })
-  on('fs.exists', (_$, e) => ({ value: String(e.path) === '/tmp/mk-fc-nonjson/mk.db' }))
-  mockFs(on, worldFiles())
-  await $.session.start(sessionStart())
-  for (let i = 0; i < 20; i++) await clock.advance(0)
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  await ui.press({ key: 'dash-tab-kanban' })
-  expect(await ui.find({ text: /cards read failed: not JSON/ })).toBeTruthy()
-  expect(await ui.find({ text: 'no store yet' })).toBeUndefined()
-  expect(await ui.find({ text: 'Backlog 0' })).toBeUndefined()
-})
-
-test('FC: a thrown spawn shows an error, not the empty-store line', { plugins: [worldFixtures] }, async ($, on) => {
-  const clock = mockWorld(on, {
-    env: { MK_HOME: '/tmp/mk-fc-throw' },
-    process: argv => {
-      if (argv.includes('overview')) {
-        return { value: { exitCode: 0, stdout: JSON.stringify({ ok: true, projects: [{ slug: 'alpha', repo: '/r/alpha', data_dir: '/d/alpha', db_path: null }], plans: [] }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
-      }
-      if (!argv.includes('run-snapshot')) return undefined
-      throw new Error('spawn python3 ENOENT')
-    },
-  })
-  on('fs.exists', (_$, e) => ({ value: String(e.path) === '/tmp/mk-fc-throw/mk.db' }))
-  mockFs(on, worldFiles())
-  await $.session.start(sessionStart())
-  for (let i = 0; i < 20; i++) await clock.advance(0)
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  await ui.press({ key: 'dash-tab-kanban' })
-  expect(await ui.find({ text: /cards read failed: cannot run mkdb/ })).toBeTruthy()
-  expect(await ui.find({ text: 'no store yet' })).toBeUndefined()
-  expect(await ui.find({ text: 'Backlog 0' })).toBeUndefined()
-})
-
-test('FC: a slow per-project read does not hold the tick, and only one read is in flight', { plugins: [worldFixtures] }, async ($, on) => {
-  const held: Array<(v: { value: { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean; isStderrTruncated: boolean } }) => void> = []
-  let started = 0
-  const clock = mockWorld(on, {
-    env: { MK_HOME: '/tmp/mk-fc-slow' },
-    process: argv => {
-      if (argv.includes('overview')) {
-        return { value: { exitCode: 0, stdout: JSON.stringify({ ok: true, projects: [{ slug: 'alpha', repo: '/r/alpha', data_dir: '/d/alpha', db_path: null }], plans: [] }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
-      }
-      if (!argv.includes('run-snapshot')) return undefined
-      // Hold ONLY the Kanban cards read — the overview row's store (/d/alpha). The
-      // pane's OWN per-project read (L5: `--data <session data dir>`) is awaited by the
-      // refresh tick by design, so holding it would hold the tick and prove nothing about
-      // the fire-and-forget read this test is about. Answer it "no store" so the tick
-      // proceeds to the file fallback.
-      if (argv[argv.indexOf('--data') + 1] !== '/d/alpha') {
-        return { value: { exitCode: 0, stdout: JSON.stringify({ ok: true, store: false, runs: [] }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
-      }
-      started += 1
-      return new Promise<{ value: { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean; isStderrTruncated: boolean } }>(resolve => {
-        held.push(resolve)
-      })
-    },
-  })
-  on('fs.exists', (_$, e) => ({ value: String(e.path) === '/tmp/mk-fc-slow/mk.db' }))
-  mockFs(on, worldFiles())
-  await $.session.start(sessionStart())
-  for (let i = 0; i < 10; i++) await clock.advance(0)
-  expect(started, 'the read was started').toBe(1)
-  await clock.advance(5000)
-  for (let i = 0; i < 10; i++) await clock.advance(0)
-  expect(started, 'a second read does not start while one is in flight').toBe(1)
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  expect(await ui.find({ text: 'Overview' }), 'the pane still rendered').toBeTruthy()
-  held[0]?.({ value: { exitCode: 0, stdout: JSON.stringify({ ok: true, runs: [], active: null, waits: [], run: null }), isStdoutTruncated: false, isStderrTruncated: false, stderr: '' } })
-  for (let i = 0; i < 20; i++) await clock.advance(0)
-  await ui.press({ key: 'dash-tab-kanban' })
-  expect(await ui.find({ text: 'Backlog 0' }), 'the landed read draws the empty board').toBeTruthy()
-})
 
 // D8B: the tick's view state feeds the Waiting tab. `waitingPane` parses the
 // stored asks once; `waitingPaneView` picks the fixture, the empty state or the
@@ -2189,7 +1978,7 @@ test('a slow pending read stays one in flight across four ticks', { plugins: [wo
   for (let j = 0; j < 10; j++) await clock.advance(0)
 })
 
-// ── L7.2: the Plan list from the root overview, and k across linked projects ──
+// ── L7.2: the Plan list from the root overview ───────────────────────────────
 
 test('L7.2: the Plan List renders from the root overview with the project DB unavailable', { plugins: [worldFixtures] }, async ($, on) => {
   const calls: string[][] = []
@@ -2223,55 +2012,6 @@ test('L7.2: the Plan List renders from the root overview with the project DB una
   // DB). It must not appear: the list is the root overview alone (acceptance).
   expect(calls.some(a => a.includes('plans') && a.includes('--data')), 'the list never opened a project DB').toBe(false)
   expect(await ui.find({ text: /⚠/ }), 'no error line: the list is not the failing read').toBeUndefined()
-})
-
-test('L7.2: the top-level k reads open tasks of every linked project — migrated via db_path, pre-migration via its data_dir', { plugins: [worldFixtures] }, async ($, on) => {
-  const HOME = '/tmp/mk-l72-k'
-  const MIGRATED_DIR = `${HOME}/projects/alpha`
-  const MIGRATED_DB = `${MIGRATED_DIR}/mk.db`
-  const LEGACY_DIR = '/srv/legacy/.matrixkoder'
-  const calls: string[][] = []
-  const clock = mockWorld(on, {
-    env: { MK_HOME: HOME },
-    process: argv => {
-      calls.push([...argv])
-      const reply = (body: unknown) => ({ value: { exitCode: 0, stdout: JSON.stringify(body), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
-      if (argv.includes('overview')) {
-        return reply({
-          ok: true,
-          projects: [
-            { slug: 'alpha', name: 'alpha', repo: '/srv/alpha', data_dir: '/srv/alpha/.matrixkoder', mode: 'home', db_path: MIGRATED_DB },
-            { slug: 'legacy', name: 'legacy', repo: '/srv/legacy', data_dir: LEGACY_DIR, mode: 'home', db_path: null },
-          ],
-          plans: [],
-        })
-      }
-      const taskSnap = (id: string, title: string) => ({
-        ok: true, runs: [], active: 'r1', waits: [],
-        run: { id: 'r1', plan: null, status: 'active', tasks: [{ id, title, status: 'building', parent: null, updated: '2026-10-12T09:00:00+02:00' }] },
-      })
-      const dataAt = argv.indexOf('--data')
-      const dir = dataAt >= 0 ? argv[dataAt + 1] ?? '' : ''
-      if (dir === MIGRATED_DIR) return reply(taskSnap('A-OPEN', 'alpha open task'))
-      if (dir === LEGACY_DIR) return reply(taskSnap('L-OPEN', 'legacy open task'))
-      return undefined
-    },
-  })
-  on('fs.exists', (_$, e) => ({ value: [`${HOME}/mk.db`, MIGRATED_DB, `${LEGACY_DIR}/mk.db`].includes(String(e.path)) }))
-  mockFs(on, worldFiles())
-  await $.session.start(sessionStart())
-  for (let i = 0; i < 5; i++) await clock.advance(0)
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  await ui.press({ key: 'dash-tab-kanban' })
-  for (let i = 0; i < 5; i++) await clock.advance(0)
-  expect(await ui.find({ text: /A-OPEN/ }), 'the migrated project’s open task').toBeTruthy()
-  expect(await ui.find({ text: /L-OPEN/ }), 'the pre-migration project’s open task').toBeTruthy()
-  const dirs = calls.map(a => {
-    const i = a.indexOf('--data')
-    return i >= 0 ? a[i + 1] ?? '' : ''
-  })
-  expect(dirs, 'the migrated row read the C2 project folder').toContain(MIGRATED_DIR)
-  expect(dirs, 'the db_path-NULL row fell back to its legacy data_dir').toContain(LEGACY_DIR)
 })
 
 // a real-shaped snapshot for the Overview's pure functions (types cast: only the read fields are set)
@@ -2410,14 +2150,14 @@ test('planActionPatch: a thrown spawn becomes the error line', async () => {
   expect((await planActionPatch(run, '/r', { 'plans:dir': '/d' }, 'archive', 'p1', 7))['plans:error']).toBe('archive p1: spawn failed')
 })
 
-test('Files F4.1: the tab bar order is o l p u f e w k t i 9 and pressing f opens Files from Overview, Lanes, Plan, Usage, Events and Kanban', { timeoutMs: 15000, plugins: [worldFixtures] }, async ($, on) => {
+test('Files F4.1: the tab bar order is o l p u f e w t i 9 and pressing f opens Files from Overview, Lanes, Plan, Usage and Events', { timeoutMs: 15000, plugins: [worldFixtures] }, async ($, on) => {
   mockFs(on, worldFiles())
   mockWorld(on)
   await $.session.start(sessionStart())
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   const buttons = (await ui.findAll({ type: 'Button' })).filter(b => String(b.props.key).startsWith('dash-tab-'))
-  expect(buttons.map(b => b.props.hotkey)).toEqual(['o', 'l', 'p', 'u', 'f', 'e', 'w', 'k', 't', 'i', '9'])
-  const fromTabs = ['dash-tab-overview', 'dash-tab-lanes', 'dash-tab-plan', 'dash-tab-usage', 'dash-tab-events', 'dash-tab-kanban'] as const
+  expect(buttons.map(b => b.props.hotkey)).toEqual(['o', 'l', 'p', 'u', 'f', 'e', 'w', 't', 'i', '9'])
+  const fromTabs = ['dash-tab-overview', 'dash-tab-lanes', 'dash-tab-plan', 'dash-tab-usage', 'dash-tab-events'] as const
   for (const tabKey of fromTabs) {
     await ui.press({ key: tabKey })
     await ui.press({ key: 'dash-tab-files' })
@@ -3268,7 +3008,7 @@ async function settle(clock: MockWorld, steps = 40): Promise<void> {
  * are live: a test rewrites them between two ticks to prove the cache is dropped.
  * Every reader is answered, so nothing short-circuits before its own spawn:
  *   - `mkdb.py projects --json`  → one row naming this project (C2 db_path)
- *   - `mkdb.py overview --json`  → that row + one plan (Cards and the Plan list)
+ *   - `mkdb.py overview --json`  → that row + one plan (the Plan list and Todo)
  *   - `mkdb.py run-snapshot --json` → the run fixture (the pane's own read)
  *   - `mkdb.py todo list`        → one open item (only while the Todo tab is open)
  *   - `mk-bus.py pending`        → a live empty ask list
@@ -3376,17 +3116,14 @@ test('P1.1.a3: the tick answer is dropped, so a store change between two ticks i
 
 test('P1.1.a4: a refused projects resolve keeps today’s result in every refresher', { plugins: [worldFixtures] }, async ($, on) => {
   // A refused/empty resolve must not throw out of the tick and must keep today's answer
-  // in each refresher: the pane still draws, the Plan list still renders from the root
-  // overview, and the Kanban tab still counts its open task from the project store.
+  // in each refresher: the pane still draws and the Plan list still renders from the root
+  // overview.
   const { spawns, clock, ui } = await p1Start($, on, { storeFails: true })
   expect(projectReads(spawns).length, 'the refused read was attempted').toBeGreaterThan(0)
   expect(await ui.find({ text: /workflows-v2|Alpha|No active orchestration/ }), 'the pane still drew').toBeTruthy()
   await ui.press({ key: 'dash-tab-plan' })
   await settle(clock)
   expect(await ui.find({ text: /Alpha plan|Alpha|no plans yet/ }), 'no throw out of the tick').toBeTruthy()
-  await ui.press({ key: 'dash-tab-kanban' })
-  await settle(clock)
-  expect(await ui.find({ text: /Backlog|cards read failed|no store yet/ }), 'the Kanban tab still answers').toBeTruthy()
 })
 
 // ── P1.2: the two first reads run side by side ───────────────────────────────
@@ -3565,7 +3302,7 @@ test('P1.4.a1: one worst-case tick starts at most 6 Python processes', { plugins
   // FAILS ON THE OLD CODE: measured at 270da7b, one such tick started 8 processes, 4 of them
   // the same `mkdb.py projects --json` (see the report's before/after numbers).
   const { spawns, clock } = await p1Start($, on)
-  // the worst case: a refresh tick with every refresher due (Cards and Pending every tick)
+  // the worst case: a refresh tick with every refresher due (Pending every tick)
   spawns.length = 0
   await clock.advance(5000)
   await settle(clock)
@@ -3761,15 +3498,12 @@ test('P4.4.a2: an inline Files pane that draws an icon still pulses it, and the 
  * P3 — refresh economy: no redraw without new data, no read for a closed tab
  *
  * The P1 counting runner and `settle` are reused: only the process runner and the
- * clock are faked, so refreshSafe, refreshCards, refreshPending, refreshPlans and
- * readCards are the production ones.
+ * clock are faked, so refreshSafe, refreshPending, refreshPlans and refreshTodos are
+ * the production ones.
  * ------------------------------------------------------------------------- */
 
 /** every `mk-bus.py pending` spawn */
 const pendingReads = (spawns: readonly Spawn[]): Spawn[] => spawns.filter(s => s.script === 'mk-bus.py' && s.argv.includes('pending'))
-/** every `mkdb.py run-snapshot --data <dir> --json` spawn */
-const snapshotReads = (spawns: readonly Spawn[]): Spawn[] =>
-  spawns.filter(s => s.script === 'mkdb.py' && s.argv.includes('run-snapshot'))
 
 /** the view-state writes recorded so far */
 function viewWrites(on: On): { key: string; value: unknown }[] {
@@ -3780,9 +3514,6 @@ function viewWrites(on: On): { key: string; value: unknown }[] {
   })
   return sets
 }
-
-const cardsOf = (sets: readonly { key: string; value: unknown }[]): string[] =>
-  sets.filter(s => s.key === 'viewState').map(s => String((s.value as Record<string, string>)['kanban:cards'] ?? ''))
 
 /** The `waiting:src` / `waiting:pending` pair of a view-state write. */
 function pendingState(value: unknown): string {
@@ -3803,181 +3534,6 @@ function pendingStates(sets: readonly { key: string; value: unknown }[], from = 
   }
   return out
 }
-
-/** The writes in `[from, …)` whose `kanban:cards` differs from the value written before them.
- *  A pending/rain write re-sends the whole view state, so only a changed board counts. */
-function cardsChanges(sets: readonly { key: string; value: unknown }[], from = 0): string[] {
-  const out: string[] = []
-  let prev = from === 0 ? '' : cardsOf(sets.slice(0, from)).pop() ?? ''
-  for (const s of sets.slice(from)) {
-    if (s.key !== 'viewState') continue
-    const cards = String((s.value as Record<string, string>)['kanban:cards'] ?? '')
-    if (cards !== prev) out.push(cards)
-    prev = cards
-  }
-  return out
-}
-
-// ── P3.1: an unchanged cards payload writes nothing ──────────────────────────
-
-test('P3.1.a1: two identical cards payloads write the view state once, not twice', { plugins: [worldFixtures] }, async ($, on) => {
-  // FAILS ON 375f9ef: refreshCards wrote `kanban:tick` on EVERY tick and re-wrote the whole
-  // cards payload, so the view state moved twice and the pane redrew twice. The pending read
-  // is held open here, so the cards refresher is the only thing that can write on tick 2.
-  const sets = viewWrites(on) // registered before the test's first $ call
-  const { clock, ui } = await p1Start($, on, { pending: () => new Promise<RunAnswer>(() => { /* held: writes nothing */ }) })
-  await ui.press({ key: 'dash-tab-kanban' })
-  await settle(clock)
-  await clock.advance(5000) // the first cards answer is written
-  await settle(clock)
-  expect(cardsOf(sets).pop(), 'the first cards answer is written').toBeTruthy()
-  const mark = sets.length
-  await clock.advance(5000) // the same payload again
-  await settle(clock)
-  // the board data itself must not be re-written: no write may move `kanban:cards` (or the
-  // empty/error/stale flags) — and the old code's `kanban:tick` key must not exist at all
-  for (const w of sets.slice(mark).filter(w => w.key === 'viewState')) {
-    const view = w.value as Record<string, string>
-    expect(view['kanban:cards'], 'the board is re-sent unchanged').toBe(cardsOf(sets).pop())
-    expect(Object.keys(view).filter(k => k === 'kanban:tick'), 'the old per-tick key is gone').toEqual([])
-  }
-  const boards = new Set(sets.filter(w => w.key === 'viewState').map(w => String((w.value as Record<string, string>)['kanban:cards'] ?? '')))
-  expect(boards.size, 'one board, written once').toBe(1)
-})
-
-test('P3.1.a2: a changed payload writes once and the new cards are shown', { plugins: [worldFixtures] }, async ($, on) => {
-  const sets = viewWrites(on)
-  const { clock, world, ui } = await p1Start($, on)
-  await ui.press({ key: 'dash-tab-kanban' })
-  await settle(clock)
-  await clock.advance(5000)
-  await settle(clock)
-  expect(await ui.find({ text: /Backlog/ }), 'the board drew').toBeTruthy()
-  // the store's run gains one open task
-  world.state.run = {
-    id: 'wfv2', plan: null, status: 'active', waiting: null, recent: [],
-    tasks: [{ id: 'P9', title: 'new card', status: 'building', parent: null, updated: new Date(NOW).toISOString() }],
-  }
-  const mark = sets.length
-  await clock.advance(5000)
-  await settle(clock)
-  const changes = cardsChanges(sets, mark)
-  expect(changes, 'exactly one write carried the new cards').toHaveLength(1)
-  expect(changes[0]).toContain('P9')
-  await ui.redraw(paneProps(46))
-  expect(await ui.find({ text: /P9/ }), 'the new card is drawn').toBeTruthy()
-})
-
-test('P3.1.a3: a tick whose read is skipped (cadence gate) keeps the previous cards and writes nothing', { plugins: [worldFixtures] }, async ($, on) => {
-  // readCards skips the odd tick once the last read took over 100 ms (`kanban:ms`). A skip
-  // must not touch the board — and starts no per-store read. The second store is what makes
-  // the skip observable: the tick's own load answers the ACTIVE store from the memo, the
-  // other store is only spawned by a cards read that actually runs.
-  // FAILS ON 375f9ef: that branch still wrote `kanban:tick`, so the view state moved and the
-  // whole pane redrew for a read that never happened.
-  const spawns: Spawn[] = []
-  const world = p1Runner(spawns)
-  world.state.run = { id: 'wfv2', plan: null, status: 'active', tasks: [{ id: 'D3A', title: 'Writer', status: 'building', parent: null, updated: new Date(NOW).toISOString() }] }
-  const OTHER = `${P1_HOME}/projects/beta`
-  world.state.projects = [
-    ...world.state.projects,
-    { slug: 'beta', name: 'beta', repo: '/r/beta', data_dir: OTHER, mode: 'home', db_path: `${OTHER}/mk.db` },
-  ]
-  const sets = viewWrites(on)
-  // the board already holds the previous cards, and the last read took 150 ms
-  const held = JSON.stringify([{ project: P1_SLUG, run: 'wfv2', task: 'P0', parent: null, type: 'task', title: 'held', status: 'building', col: 'Building', attention: 0, question: null, route_json: null, lane: null, round: null, verdict: null, gates: null, updated: new Date(NOW).toISOString(), change_no: 0 }])
-  on('state.get', (_$, e, next) =>
-    e.key === 'viewState'
-      ? { value: { value: { 'kanban:ms': '150', 'kanban:cards': held, 'kanban:empty': '0', 'kanban:error': '', 'kanban:stale': '0' }, version: 1 } }
-      : next(e))
-  const clock = mockWorld(on, { env: { HOME: '/home/mk', MK_HOME: P1_HOME }, process: world.process })
-  on('fs.exists', (_$, e) => ({ value: [`${P1_HOME}/mk.db`, `${P1_C2}/mk.db`, `${DATA_DIR}/mk.db`].includes(String(e.path)) }))
-  mockFs(on, worldFiles(), [DATA_DIR, `${PROJECT_DIR}/.git`, P1_C2])
-  await $.session.start(sessionStart())
-  await settle(clock)
-  // the start load is cards tick 1: odd, and `kanban:ms` says the last read was slow
-  expect(snapshotReads(spawns).filter(s => s.argv[s.argv.indexOf('--data') + 1] === OTHER), 'the skipped tick read no store').toHaveLength(0)
-  // a skipping tick may still carry the board it already has (a pending write spreads the
-  // whole view); what it must not do is write a DIFFERENT board
-  const boards = sets.filter(w => w.key === 'viewState').map(w => String((w.value as Record<string, string>)['kanban:cards'] ?? ''))
-  expect(boards.filter(b => b !== held), 'and carried no cards change').toEqual([])
-  // the gate is a cadence, not a stall: the next cards read (even) reads the other store
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
-  spawns.length = 0
-  await ui.press({ key: 'dash-tab-kanban' })
-  await settle(clock)
-  expect(snapshotReads(spawns).filter(s => s.argv[s.argv.indexOf('--data') + 1] === OTHER), 'the even read reaches the other store').toHaveLength(1)
-})
-
-// ── P3.2: the tick's run-snapshot feeds the cards read ───────────────────────
-
-test('P3.2.a1: one project spawns run-snapshot once per tick; two stores spawn it twice, not three times', { plugins: [worldFixtures] }, async ($, on) => {
-  // FAILS ON 375f9ef: loadSnapshot read the active project's store and readCards read it
-  // again in the same tick, so one project cost 2 spawns and two stores cost 3.
-  const { spawns, clock, world, ui } = await p1Start($, on)
-  await ui.press({ key: 'dash-tab-kanban' })
-  await settle(clock)
-  spawns.length = 0
-  await clock.advance(5000)
-  await settle(clock)
-  const one = snapshotReads(spawns).map(s => s.argv[s.argv.indexOf('--data') + 1] ?? '')
-  expect(one.filter(d => d === P1_C2), `reads: ${one.join(', ')}`).toHaveLength(1)
-  expect(one, 'one project, one store read this tick').toHaveLength(1)
-  // a second project with its own store: the tick's own reply answers the active store,
-  // the other is read once — two in total, not three
-  const OTHER = `${P1_HOME}/projects/beta`
-  world.state.projects = [
-    ...world.state.projects,
-    { slug: 'beta', name: 'beta', repo: '/r/beta', data_dir: OTHER, mode: 'home', db_path: `${OTHER}/mk.db` },
-  ]
-  spawns.length = 0
-  await clock.advance(5000)
-  await settle(clock)
-  const two = snapshotReads(spawns).map(s => s.argv[s.argv.indexOf('--data') + 1] ?? '')
-  expect(two, `reads: ${two.join(', ')}`).toHaveLength(2)
-  expect(two.filter(d => d === OTHER), 'the second store once').toHaveLength(1)
-})
-
-test('P3.2.a2: the cards from a pre-resolved group are identical to the ones the old path reads', { plugins: [worldFixtures] }, async ($, on) => {
-  // the same reply, handed in as the first group, produces the same cards as reading it:
-  // compared on the captured run-snapshot fixture on BOTH paths.
-  const snap = JSON.stringify({ ok: true, runs: [], active: 'r', waits: [], store: true, run: {
-    id: 'r', plan: null, status: 'active', tasks: [
-      { id: 'D3A', title: 'Writer', status: 'building', parent: 'D3', updated: '2026-10-12T09:00:00+02:00' },
-      { id: 'D4A', title: 'Reader', status: 'merged', parent: 'D4', updated: '2026-10-12T09:00:00+02:00' },
-    ] } })
-  const overview = { ok: true, projects: [{ slug: 'alpha', repo: '/r/alpha', data_dir: '/d/alpha', db_path: null }], plans: [] }
-  let reads = 0
-  const run: RunFn = async argv => {
-    if (argv.includes('--home')) return { stdout: JSON.stringify(overview), code: 0 }
-    reads += 1
-    return { stdout: snap, code: 0 }
-  }
-  const oldPath = await readCards(run, '/plugin', '/tmp/mk-home', true, 0, 0)
-  expect(reads, 'the old path spawns the store').toBe(1)
-  reads = 0
-  const newPath = await readCards(run, '/plugin', '/tmp/mk-home', true, 0, 0, undefined, { dir: '/d/alpha', doc: JSON.parse(snap) })
-  expect(reads, 'the handed-in group spawns nothing').toBe(0)
-  expect(newPath.cards, 'same cards').toEqual(oldPath.cards)
-  expect(newPath.cards.map(c => c.task)).toEqual(['D3A'])
-  expect(newPath.error).toBe(oldPath.error)
-  expect(newPath.empty).toBe(oldPath.empty)
-})
-
-test('P3.2.a3: readCards without the new argument behaves exactly as before', { plugins: [worldFixtures] }, async ($, on) => {
-  // a regression guard (PASSES ON 375f9ef too): the seventh argument stays optional, so a
-  // caller that never passes it still spawns the store and gets the cards.
-  let reads = 0
-  const run: RunFn = async argv => {
-    if (argv.includes('--home')) return { stdout: JSON.stringify({ ok: true, projects: [{ slug: 'alpha', repo: '/r/alpha', data_dir: '/d/alpha', db_path: null }], plans: [] }), code: 0 }
-    reads += 1
-    return { stdout: JSON.stringify({ ok: true, runs: [], active: 'r', waits: [], run: { id: 'r', plan: null, status: 'active', tasks: [{ id: 'D3A', title: 'x', status: 'building', parent: null, updated: '2026-10-12T09:00:00+02:00' }] } }), code: 0 }
-  }
-  const got = await readCards(run, '/plugin', '/tmp/mk-home', true, 0, 0)
-  expect(reads).toBe(1)
-  expect(got.cards.map(c => c.task)).toEqual(['D3A'])
-  expect(got.error).toBeNull()
-})
 
 // ── P3.3: a bus that answered `down` is not asked every tick ─────────────────
 
@@ -4049,14 +3605,13 @@ test('P3.3.a3: opening the Waiting tab retries at once, inside the backoff', { p
 
 // ── P3.4: gated tabs, always-on footer, refreshers together ──────────────────
 
-test('P3.4.a1: with only Overview open a tick starts no cards read and no plan read', { plugins: [worldFixtures] }, async ($, on) => {
-  // FAILS ON 375f9ef: every tick read the cards store and the plans from the root overview
-  // whatever tab was open, although nothing outside Plan/Kanban reads either.
+test('P3.4.a1: with only Overview open a tick starts no plan read', { plugins: [worldFixtures] }, async ($, on) => {
+  // FAILS ON 375f9ef: every tick read the plans from the root overview whatever tab was
+  // open, although nothing outside Plan reads them.
   const { spawns, clock } = await p1Start($, on)
   spawns.length = 0
   await clock.advance(5000)
   await settle(clock)
-  expect(snapshotReads(spawns).length, `run-snapshot starts: ${snapshotReads(spawns).map(s => s.argv.join(' ')).join(' | ')}`).toBe(1) // only the tick's own load
   expect(spawns.some(s => s.script === 'mkdb.py' && s.argv.includes('plans')), 'no plan-detail read').toBe(false)
 })
 
@@ -4073,31 +3628,28 @@ test('P3.4.a2: the footer still follows the bus asks with the Waiting tab closed
   expect(await ui.find({ type: 'Button', key: 'dash-tab-waiting' }), 'and the Waiting tab is not the open one').toBeTruthy()
 })
 
-test('P3.4.a3: switching to Plan and Kanban loads their data at once, not on the next tick', { plugins: [worldFixtures] }, async ($, on) => {
+test('P3.4.a3: switching to Plan loads its data at once, not on the next tick', { plugins: [worldFixtures] }, async ($, on) => {
   const { spawns, clock, ui } = await p1Start($, on)
   spawns.length = 0
   await ui.press({ key: 'dash-tab-plan' })
   await settle(clock)
   expect(spawns.some(s => s.script === 'mkdb.py' && s.argv.includes('overview')), 'the Plan list read on the press').toBe(true)
   expect(await ui.find({ text: /Alpha/ }), 'the Plan list drew without a 5 s wait').toBeTruthy()
-  spawns.length = 0
-  await ui.press({ key: 'dash-tab-kanban' })
-  await settle(clock)
-  expect(snapshotReads(spawns).some(s => s.argv[s.argv.indexOf('--data') + 1] === P1_C2), 'the cards read started on the press').toBe(true)
-  expect(await ui.find({ text: /Backlog/ }), 'the board drew at once').toBeTruthy()
 })
 
 test('P3.4.a4: a rejection in one refresher stops neither the others nor the tick', { plugins: [worldFixtures] }, async ($, on) => {
-  // the cards refresher's first read (the view state) is refused, so refreshCards rejects.
+  // With the Plan tab open, refreshPlans' view-state read is refused, so it rejects.
   // FAILS ON 375f9ef: the refreshers were awaited in turn inside the tick's try, so the
   // rejection skipped every one after it — the bus was never asked in that tick.
   const refuse = { on: false } // refused only after the start load, so the pane still mounts
   on('state.get', (_$, e, next) => (refuse.on && e.key === 'viewState' ? { deny: 'state store unavailable' } : next(e)))
-  const { spawns, clock } = await p1Start($, on)
+  const { spawns, clock, ui } = await p1Start($, on)
+  await ui.press({ key: 'dash-tab-plan' })
+  await settle(clock)
   refuse.on = true
   spawns.length = 0
   await clock.advance(5000)
   await settle(clock)
-  expect(pendingReads(spawns), 'the pending read ran after the cards rejection').toHaveLength(1)
+  expect(pendingReads(spawns), 'the pending read ran after the plans rejection').toHaveLength(1)
   expect(spawns.some(s => s.script === 'mkdb.py' && s.argv.includes('overview')), 'and the tick still read the root overview').toBe(true)
 })
