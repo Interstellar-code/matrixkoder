@@ -17,7 +17,7 @@ import {
 import type { MkPaneSnapshot } from './data'
 import { beginStoreTick, endStoreTick, globalDirOf, homeDir, paths, projectYamlPath, resolveDataDir, resetStoreMemo } from './paths'
 import {
-  DRAFT_EMPTY, DRAFT_SEND_FAILED, DRAFT_SYSTEM, IMPROVE_EMPTY, IMPROVE_FAILED, IMPROVE_FILL_FAILED, IMPROVE_MODEL, QUESTIONS_SYSTEM, REWRITE_SYSTEM,
+  DRAFT_EMPTY, DRAFT_SEND_FAILED, DRAFT_SYSTEM, IMPROVE_EMPTY, IMPROVE_PASTE, expandPaste, IMPROVE_FAILED, IMPROVE_FILL_FAILED, IMPROVE_MODEL, QUESTIONS_SYSTEM, REWRITE_SYSTEM,
   answeredPairs, canAccept, contextBlock, draftContext, draftPrompt, finalText, modeOf, newImproveFlow, questionsPrompt, readQuestions, readRewrite, rewritePrompt,
 } from './improve-core'
 import { NARROW, STATUS_GLYPH } from './tabs/ui'
@@ -1845,6 +1845,16 @@ function improveLater($: EngineInterface, id: string, failedStep: 'questions' | 
   $.clock.after(1, () => { void fn().catch(() => failFlow($, id, failedStep).catch(() => {})) })
 }
 
+/** the system clipboard's text (macOS `pbpaste`); null where it cannot be read. Never throws. */
+async function readClipboard($: EngineInterface): Promise<string | null> {
+  try {
+    const r = await $.process.run(['pbpaste'], { timeoutMs: 2_000 })
+    return r.exitCode === 0 ? r.stdout : null
+  } catch {
+    return null
+  }
+}
+
 /** the last 150 messages as one block of text; never throws: no context is better than no rewrite */
 async function improveContext($: EngineInterface): Promise<string> {
   try {
@@ -1942,12 +1952,19 @@ async function improveAction($: EngineInterface, kind: ImproveKind, a?: string |
       return
     }
     // the draft in Claude Code's own prompt line, read at the press (never rejects; '' with no box)
-    const original = (await $.prompt.read()).text.trim()
+    const line = (await $.prompt.read()).text.trim()
     const id = `${String(await $.clock.now())}-${String(++improveSeq)}`
-    if (original === '') {
+    if (line === '') {
       await update($, improveAtom, prev => ({ ...prev, menu: false, flow: { ...newImproveFlow(id, '', 'error'), error: IMPROVE_EMPTY } }))
       return
     }
+    // a collapsed paste is only a placeholder in the line: fill it from the clipboard, or ask for it expanded
+    const expanded = expandPaste(line, /\[Pasted text #\d+/.test(line) ? await readClipboard($) : null)
+    if (!expanded.ok) {
+      await update($, improveAtom, prev => ({ ...prev, menu: false, flow: { ...newImproveFlow(id, '', 'error'), error: IMPROVE_PASTE } }))
+      return
+    }
+    const original = expanded.text.trim()
     await update($, improveAtom, prev => ({ ...prev, menu: false, flow: newImproveFlow(id, original) }))
     improveLater($, id, 'rewrite', () => improveWrite($, id))
   } else if (kind === 'compose' && (a === 'answer' || a === 'question')) {
@@ -1986,7 +2003,8 @@ async function improveAction($: EngineInterface, kind: ImproveKind, a?: string |
       return
     }
     await update($, improveAtom, prev => (prev.flow != null && prev.flow.id === f.id && canAccept(prev.flow)
-      ? { ...prev, undo: before.text, written: filled.text, flow: null }
+      // a line that held a collapsed paste: Undo puts back the expanded text, not a placeholder string with no paste behind it
+      ? { ...prev, undo: /\[Pasted text #\d+/.test(before.text) ? f.original : before.text, written: filled.text, flow: null }
       : prev))
   } else if (kind === 'discard') {
     await update($, improveAtom, prev => ({ ...prev, flow: null }))

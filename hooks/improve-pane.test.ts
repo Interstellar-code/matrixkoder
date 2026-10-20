@@ -4,7 +4,7 @@
 import { test, expect } from 'claude-code/testing'
 import type { Engine, Mounted } from 'claude-code/testing'
 import { mockFs, mockWorld, paneProps, sessionStart, worldFiles, worldFixtures } from './testkit'
-import { DRAFT_EMPTY, DRAFT_SEND_FAILED, IMPROVE_FAILED, IMPROVE_FILL_FAILED, wordCount } from './improve-core'
+import { DRAFT_EMPTY, DRAFT_SEND_FAILED, IMPROVE_FAILED, IMPROVE_PASTE, IMPROVE_FILL_FAILED, wordCount } from './improve-core'
 
 const usage = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
 const ROUGH = 'Check all the files with type errors.'
@@ -31,6 +31,8 @@ type World = {
   copy?: boolean
   /** the draft Claude Code's prompt line holds when the test mounts */
   draft?: string
+  /** what `pbpaste` prints; 'fail' = the command fails (no clipboard tool) */
+  clipboard?: string | 'fail'
   /** the conversation `session.messages` answers (the world's three rows by default) */
   messages?: { role: 'user' | 'assistant'; text: string; toolUses: never[] }[]
 }
@@ -38,7 +40,11 @@ type World = {
 /** the world beneath the pane: model, conversation, prompt box, clipboard, store */
 function world(on: Parameters<typeof mockWorld>[0], w: World) {
   const log = { prompts: [] as string[], models: [] as string[], systems: [] as string[], calls: 0, submitted: [] as { text: string; asUser?: boolean }[], copied: [] as string[] }
-  const clock = mockWorld(on)
+  const clock = mockWorld(on, {
+    process: argv => (argv[0] === 'pbpaste'
+      ? { value: { exitCode: w.clipboard === 'fail' ? 1 : 0, stdout: w.clipboard === 'fail' ? '' : w.clipboard ?? '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      : undefined),
+  })
   mockFs(on, w.files ?? worldFiles())
   // Claude Code's own prompt line, in memory: read resolves what it holds, fill writes it
   // (the real shapes: PromptBox `{ text, cursor }`, PromptFilled `{ isFilled, text, cursor }`)
@@ -1090,4 +1096,47 @@ test('Answer drafts from the latest exchange: the newest assistant message is in
   expect(prompt.indexOf('<earlier>'), 'earlier comes first').toBeLessThan(prompt.indexOf('<latest>'))
   expect(prompt).not.toContain('OLD TOPIC 0:') // the budget drops the oldest rows first
   expect(prompt).toContain('OLD TOPIC 29:')
+})
+
+// ── a collapsed paste in the prompt line ───────────────────────────────────────
+
+const PASTED = Array.from({ length: 15 }, (_, i) => `line ${String(i + 1)} of the pasted spec`).join('\n')
+
+test('Improve fills a collapsed paste from the clipboard when its line count matches, and rewrites the whole text', { plugins: [worldFixtures] }, async ($, on) => {
+  const w = world(on, { answer: () => REWRITE, clipboard: `${PASTED}\n` })
+  await $.session.start(sessionStart())
+  const ui = await mount($)
+  await improve(ui, w, 'Review this: [Pasted text #1 +14 lines] and list the risks')
+  expect(w.log.calls).toBe(1)
+  expect(w.log.prompts[0]).toContain(`<prompt>\nReview this: ${PASTED} and list the risks\n</prompt>`)
+  expect(w.log.prompts[0]).not.toContain('[Pasted text')
+  expect(await has(ui, { text: '✦ IMPROVED PROMPT' })).toBe(true)
+  // Accept, then Undo: the line gets the expanded text back, never a bare placeholder string
+  await ui.press({ key: 'improve-f-accept' })
+  await ui.press({ key: 'improve-f-undo' })
+  expect(boxValue(w)).toBe(`Review this: ${PASTED} and list the risks`)
+})
+
+test('a clipboard copied over since the paste, a second paste or no clipboard asks for the paste to be expanded; nothing is sent to the model', { plugins: [worldFixtures] }, async ($, on) => {
+  const w = world(on, { answer: () => REWRITE, clipboard: 'something copied later' })
+  await $.session.start(sessionStart())
+  const ui = await mount($)
+  await improve(ui, w, 'Review [Pasted text #1 +14 lines]')
+  expect(await says(ui, IMPROVE_PASTE)).toBe(true)
+  await ui.press({ key: 'improve-f-discard' })
+  await improve(ui, w, '[Pasted text #1 +14 lines] and [Pasted text #2 +3 lines]')
+  expect(await says(ui, IMPROVE_PASTE)).toBe(true)
+  expect(w.log.calls).toBe(0)
+})
+
+test('with no readable clipboard a collapsed paste asks for expanding; a prompt with no placeholder never reads the clipboard', { plugins: [worldFixtures] }, async ($, on) => {
+  const w = world(on, { answer: () => REWRITE, clipboard: 'fail' })
+  await $.session.start(sessionStart())
+  const ui = await mount($)
+  await improve(ui, w, 'Fix [Pasted text #1 +14 lines]')
+  expect(await says(ui, IMPROVE_PASTE)).toBe(true)
+  expect(w.log.calls).toBe(0)
+  await ui.press({ key: 'improve-f-discard' })
+  await improve(ui, w, ROUGH)
+  expect(w.log.calls, 'a plain prompt is improved as before').toBe(1)
 })

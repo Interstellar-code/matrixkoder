@@ -2,7 +2,7 @@
 // ported from the standalone Prompt Upgrade mod.
 import { test, expect } from 'claude-code/testing'
 import {
-  FORMAT_RULE, answeredPairs, bigDigits, bigNumber, clip, contextBlock, draftContext, draftPrompt, extractJson, finalText, newImproveFlow, questionsPrompt,
+  FORMAT_RULE, answeredPairs, expandPaste, bigDigits, bigNumber, clip, contextBlock, draftContext, draftPrompt, extractJson, finalText, newImproveFlow, questionsPrompt,
   readQuestions, readRewrite, rewritePrompt, wordCount, wrap,
 } from './improve-core'
 
@@ -194,4 +194,15 @@ test('every written text is asked for the list layout: Improve rewrite, Answer a
     expect(p).toContain(FORMAT_RULE)
   }
   expect(FORMAT_RULE).toContain('numbered list')
+})
+
+test('expandPaste: one placeholder with a matching line count is filled; anything else is not guessed', () => {
+  const clip = 'a\nb\nc\n'
+  expect(expandPaste('see [Pasted text #3 +2 lines] now', clip)).toEqual({ text: 'see a\nb\nc now', ok: true })
+  expect(expandPaste('no paste here', null)).toEqual({ text: 'no paste here', ok: true })
+  expect(expandPaste('see [Pasted text #3 +5 lines]', clip).ok, 'count mismatch').toBe(false)
+  expect(expandPaste('[Pasted text #1 +2 lines] [Pasted text #2 +2 lines]', clip).ok, 'two pastes').toBe(false)
+  expect(expandPaste('[Pasted text #1 +2 lines]', null).ok, 'no clipboard').toBe(false)
+  expect(expandPaste('[Pasted text #1 +2 lines]', '   ').ok, 'empty clipboard').toBe(false)
+  expect(expandPaste('x [Pasted text #1] y', 'one line').text, 'no line count: filled').toBe('x one line y')
 })

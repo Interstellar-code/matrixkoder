@@ -26,6 +26,29 @@ export const newImproveFlow = (id: string, original: string, step: MkImproveStep
 /** the flow's mode; flows saved before the drop-up have none and are improvements */
 export const modeOf = (f: Pick<MkImproveFlow, 'mode'>): MkImproveMode => f.mode ?? 'improve'
 
+/** the prompt line holds a collapsed paste Improve could not fill in from the clipboard */
+export const IMPROVE_PASTE = 'Your prompt has a collapsed paste Improve cannot read. Paste it again to expand it, then press Improve.'
+
+/** Claude Code's collapsed-paste placeholder in the prompt line: `[Pasted text #1 +14 lines]`
+ *  (`+K` = the pasted text's line breaks, so 15 lines show +14). */
+const PASTE_RE = /\[Pasted text #\d+(?: \+(\d+) lines?)?\]/g
+
+/** The prompt line with its collapsed paste put back from the clipboard. Claude Code keeps a pasted text out of
+ *  the prompt line (the plugin sees only the placeholder, and `prompt.edit` does not fire on a paste), so the
+ *  clipboard is the one copy a plugin can read. It fills ONE placeholder, and only when the clipboard's line
+ *  breaks match its `+K`: a clipboard copied over since the paste, or a second paste, is `ok: false`, never guessed.
+ *  shortcut: the clipboard holds only the last paste, upgrade if Claude Code exposes pasted contents to plugins. */
+export function expandPaste(text: string, clipboard: string | null): { text: string; ok: boolean } {
+  const found = [...text.matchAll(PASTE_RE)]
+  if (found.length === 0) return { text, ok: true }
+  const m = found[0]
+  if (found.length > 1 || m == null || clipboard == null) return { text, ok: false }
+  const pasted = clipboard.replace(/\r/g, '').replace(/\n$/, '')
+  const breaks = (pasted.match(/\n/g) ?? []).length
+  if (pasted.trim() === '' || (m[1] != null && Number(m[1]) !== breaks)) return { text, ok: false }
+  return { text: text.slice(0, m.index) + pasted + text.slice((m.index ?? 0) + m[0].length), ok: true }
+}
+
 /** the proposal as it stands: the edit draft while the person edits it */
 export const finalText = (f: Pick<MkImproveFlow, 'isEditing' | 'draft' | 'upgraded'>): string => (f.isEditing ? f.draft : f.upgraded)
 
