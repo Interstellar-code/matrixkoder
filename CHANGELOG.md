@@ -2,6 +2,31 @@
 
 All notable changes to this project. Format: Keep a Changelog; versions: SemVer.
 
+## [0.7.1] - 2026-10-20
+
+### Added
+- **plan:** a paused task status; Resume on the Play button; rework shows as attention; dashboard prompts say where they came from (32d0fee)
+- **plan:** Play and Pause prompts open with a MatrixKoder heading; drop lane, reviewer and loop lines (ddb2e33)
+- **plan:** Play and Pause prompts follow the row's status; dashboard prompts sent bare (928e100)
+- **plan:** Play and Pause icon buttons on phase and task rows and the task panel (297415d)
+- **plan:** a seed entry in the Improve flow for Plan Play and Pause (b74e6fd)
+- **plan:** pure Play/Pause prompt drafters for phases and tasks (00313e6)
+- **events:** word next to each icon; tick legend in the count row (8afacef)
+- **popups:** name the close icon in the Events and Plan task popup footers (8827a01)
+- **kit:** central IconButton; icon-only Events pause and popup close (ee1add9)
+- **events:** press an Events row to open its detail card (4718f12)
+
+### Fixed
+- **plan:** a paused row draws one Resume play button, not two (83425ca)
+- **plan:** the task panel Play checks dependencies like the row (87ca39d)
+- **events:** lane filter is a dropdown; drop the selection notch on the top row (c1f976c)
+
+### Docs
+- **plan:** say what the Plan Play and Pause buttons do (f827dac)
+
+### Other
+- **plan:** pin the new Play and Pause prompt wording (c2e99ea)
+
 ## [0.7.0] - 2026-10-20
 
 ### Added
