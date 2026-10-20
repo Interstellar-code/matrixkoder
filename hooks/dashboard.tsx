@@ -3244,6 +3244,17 @@ const metaOf = (row: Record<string, unknown>): Record<string, unknown> => {
   }
 }
 
+/** the detail card's text cap: a longer event text is cut here */
+export const EVENT_FULL_MAX = 1500
+/** an event's text kept whole for the detail card: newlines stay (\r\n folded), a tab or lone \r is a space, other control chars go, cut at the cap (never inside a surrogate pair) with a `… n more` tail */
+export const fullOf = (text: string): string => {
+  const clean = text.replace(/\r\n/g, '\n').replace(/[\t\r]/g, ' ').replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, '')
+  if (clean.length <= EVENT_FULL_MAX) return clean
+  const last = clean.charCodeAt(EVENT_FULL_MAX - 1)
+  const cut = last >= 0xd800 && last <= 0xdbff ? EVENT_FULL_MAX - 1 : EVENT_FULL_MAX
+  return `${clean.slice(0, cut)}\n… ${clean.length - cut} more`
+}
+
 async function refreshEvents($: EngineInterface, cwd: string, snap: MkSnapshot): Promise<void> {
   if (eventsInFlight) return
   eventsInFlight = true
@@ -3358,6 +3369,13 @@ async function refreshEvents($: EngineInterface, cwd: string, snap: MkSnapshot):
         ack: ackOf.get(id) ?? (meta.delivered === true ? 1 : 0),
         bad: meta.bad === true || kind.startsWith('ring-failed') || meta.delivered === false,
         reply_to: typeof row.reply_to === 'string' ? row.reply_to : undefined,
+        date: t || undefined,
+        from: fromId || undefined,
+        to: toId || undefined,
+        task: task || undefined,
+        chan: typeof row.chan === 'string' && row.chan !== '' ? row.chan : undefined,
+        by: typeof meta.by === 'string' && meta.by !== '' ? meta.by : undefined,
+        full: fullOf(text),
       }
     })
 
@@ -3422,8 +3440,8 @@ export function liveEventsView(snap: MkSnapshot, viewState?: Record<string, stri
   return {
     mock: false,
     bus,
-    events: all.slice(0, EVENTS_MAX).map(ev => ({
-      id: `ev-${ev.t ?? ''}`,
+    events: all.slice(0, EVENTS_MAX).map((ev, i) => ({
+      id: `ev-${ev.t ?? ''}-${i}`,
       src: 'run' as const,
       t: hhmm(ev.t),
       ts: Date.parse(ev.t ?? '') || undefined,
@@ -3432,6 +3450,9 @@ export function liveEventsView(snap: MkSnapshot, viewState?: Record<string, stri
       who: 'run',
       lane: ev.task ?? 'all',
       text: sanitizeText(ev.text ?? '', 120),
+      date: ev.t || undefined,
+      task: ev.task || undefined,
+      full: fullOf(ev.text ?? ''),
     })),
     lanes: [],
     earlierCount: Math.max(0, all.length - EVENTS_MAX),

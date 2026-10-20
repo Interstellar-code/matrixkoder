@@ -10,7 +10,9 @@ import type {
 } from 'claude-code'
 import { mockFs, mockWorld, paneProps, sessionStart, worldFiles, worldFixtures } from './../testkit'
 import { EVENTS_MAX, EventsTab, eventsView, eventsViewOf } from './events'
+import type { EventItem } from './events'
 import { MATRIX, PALETTE, ROLE, withTheme } from './palette'
+import { EVENT_FULL_MAX, fullOf } from './../dashboard'
 
 /** every node of `type` under `n`, in document order. */
 function nodesOf(n: unknown, type: string): { type: string; props: Record<string, unknown>; children: unknown[] }[] {
@@ -63,12 +65,15 @@ const boxTag = (props: BoxProps & ElementChildren): RenderElement =>
 const textTag = (props: TextProps & ElementChildren): RenderElement =>
   ({ type: 'Text', props: scalarProps(props), children: kids(props.children) })
 const stub = (): RenderElement => ({ type: 'Text', props: {}, children: [] })
+/** a Button draws its label as a Text: a plain row press is the row's text, and the width probes read it */
+const buttonTag = (props: Parameters<Elements['terminal']['Button']>[0]): RenderElement =>
+  ({ type: 'Text', props: {}, children: [props.label ?? ''] })
 
-/** enough of the terminal table for EventsTab's destructure — Box and Text real. */
+/** enough of the terminal table for EventsTab's destructure — Box and Text real, Button its label as a Text. */
 const els: Elements['terminal'] = {
   Box: boxTag,
   Text: textTag,
-  Button: stub,
+  Button: buttonTag,
   Input: stub,
   Select: stub,
   Link: stub,
@@ -249,8 +254,205 @@ test('the lane filter is a dropdown like Kind and View, and no row carries a sel
   expect(open).toContain('( ) K1.1')
   // picking a lane filters the list; the notch '▌' is gone from every row
   state.set('events:lane', 'K1.1')
-  const picked = textOwn(EventsTab(buttonEls, eventsViewOf(events), 46, ui))
+  const pickedTree = EventsTab(buttonEls, eventsViewOf(events), 46, ui)
+  const picked = [...textOwn(pickedTree), ...buttons(pickedTree)] // a row's text is its press: a Button label
   expect(picked.some(t => t === 'two')).toBe(true)
   expect(picked.some(t => t === 'one')).toBe(false)
-  expect(textOwn(EventsTab(buttonEls, eventsViewOf(events), 46)).includes('▌'), 'no selection notch').toBe(false)
+  const noNotch = EventsTab(buttonEls, eventsViewOf(events), 46)
+  expect(textOwn(noNotch).includes('▌'), 'no selection notch').toBe(false)
+  expect(buttons(noNotch).some(l => l.includes('▌')), 'no selection notch on a row button either').toBe(false)
+})
+
+// ---------- the row detail card (`events:detail`) ----------
+
+const DETAIL_EVENTS: readonly EventItem[] = [
+  { id: 'm-2', src: 'bus', t: '06:02', kind: 'answer', who: 'p2→orch', lane: 'p2', text: 'use the cache', reply_to: 'm-1', ack: 1, short: { type: 'ans', text: 'cache' } },
+  { id: 'm-1', src: 'bus', t: '06:01', kind: 'ask', who: 'orch→p2', lane: 'p2', text: 'cache or recompute?' },
+  { id: 'r-9', src: 'run', t: '06:00', kind: 'run', text: 'run started' },
+]
+
+/** a fake view-state handle (every set recorded) and an element table whose Buttons keep key, label and onPress */
+function pressable(initial: Record<string, string> = {}) {
+  const state = new Map(Object.entries(initial))
+  const sets: [string, string][] = []
+  const ui = { get: (k: string) => state.get(k), set: (k: string, v: string) => { sets.push([k, v]); state.set(k, v) } }
+  const pressEls = {
+    ...els,
+    Button: (props: Parameters<Elements['terminal']['Button']>[0]): RenderElement =>
+      ({ type: 'Button', props: { key: props.key ?? '', label: props.label ?? '', onPress: props.onPress }, children: [] }) as unknown as RenderElement,
+  }
+  const press = (tree: unknown, key: string): void => {
+    const b = nodesOf(tree, 'Button').find(x => x.props.key === key)
+    expect(b, `button ${key}`).toBeDefined()
+    ;(b?.props.onPress as () => void)()
+  }
+  return { state, sets, ui, pressEls, press }
+}
+
+const rowKeys = (tree: unknown): string[] => nodesOf(tree, 'Button').map(b => String(b.props.key)).filter(k => k.startsWith('ev-open-'))
+
+test('pressing an Events row opens its detail card, pressing it again closes it', () => {
+  for (const cols of [46, 36] as const) {
+    const { state, sets, ui, pressEls, press } = pressable()
+    const list = EventsTab(pressEls, eventsViewOf(DETAIL_EVENTS), cols, ui)
+    expect(rowKeys(list), `every row is pressable at ${cols}`).toEqual(['ev-open-m-2', 'ev-open-m-1', 'ev-open-r-9'])
+    press(list, 'ev-open-m-1')
+    expect(sets, `a press opens the row at ${cols}`).toEqual([['events:detail', 'm-1']])
+    // the row is open now (ui.get names it): the same press, from the list drawn before, closes it
+    state.set('events:detail', 'm-1')
+    press(list, 'ev-open-m-1')
+    expect(sets.at(-1), `a second press closes at ${cols}`).toEqual(['events:detail', ''])
+    // another row while one is open switches to it
+    press(list, 'ev-open-r-9')
+    expect(sets.at(-1), `another row switches at ${cols}`).toEqual(['events:detail', 'r-9'])
+  }
+})
+
+test('with a row open the detail card replaces the list; BUS, filters and lane activity stay', () => {
+  for (const cols of [46, 36] as const) {
+    const { sets, ui, pressEls, press } = pressable({ 'events:detail': 'm-1' })
+    const tree = EventsTab(pressEls, eventsViewOf(DETAIL_EVENTS), cols, ui)
+    const texts = [...textOwn(tree), ...nodesOf(tree, 'Button').map(b => String(b.props.label))]
+    expect(rowKeys(tree), `no list row at ${cols}`).toEqual([])
+    expect(texts.some(t => /^EVENTS$/i.test(t)), `no list header at ${cols}`).toBe(false)
+    expect(texts.some(t => /shown$/.test(t)), `no list count line at ${cols}`).toBe(false)
+    expect(texts.some(t => t === 'm-1 · ask'), `the detail header at ${cols}`).toBe(true)
+    expect(texts.some(t => t === 'cache or recompute?'), `the detail text at ${cols}`).toBe(true)
+    expect(texts.some(t => /BUS/.test(t)), `the BUS card stays at ${cols}`).toBe(true)
+    expect(texts.some(t => /LANE ACTIVITY/.test(t)), `the lane activity card stays at ${cols}`).toBe(true)
+    const keys = nodesOf(tree, 'Button').map(b => String(b.props.key))
+    expect(keys, `the filters stay at ${cols}`).toEqual(expect.arrayContaining(['ev-src-all', 'ev-kind-dd', 'ev-view-dd', 'ev-lane-dd', 'ev-pause-btn']))
+    // both close buttons clear the key
+    press(tree, 'ev-detail-close-top-m-1')
+    press(tree, 'ev-detail-close-m-1')
+    expect(sets, `both closes clear at ${cols}`).toEqual([['events:detail', ''], ['events:detail', '']])
+  }
+})
+
+test('an open id the view does not carry draws the list', () => {
+  const unknown = pressable({ 'events:detail': 'nope' })
+  const list = EventsTab(unknown.pressEls, eventsViewOf(DETAIL_EVENTS), 46, unknown.ui)
+  expect(rowKeys(list)).toHaveLength(3)
+  expect(nodesOf(list, 'Button').some(b => String(b.props.key).startsWith('ev-detail-close')), 'no detail card').toBe(false)
+})
+
+test('a filter or search that hides the open row does not close its card', () => {
+  // m-2 is a bus answer on lane p2 saying `use the cache`: each of these filters leaves it out of the list
+  const hides: Record<string, string>[] = [{ 'events:source': 'run' }, { 'events:kinds': 'ask' }, { 'events:q': 'recompute' }, { 'events:lane': 'p9' }, { 'events:view': 'needs' }]
+  for (const hide of hides) {
+    const label = JSON.stringify(hide)
+    const hidden = pressable(hide)
+    expect(rowKeys(EventsTab(hidden.pressEls, eventsViewOf(DETAIL_EVENTS), 46, hidden.ui)), `${label} hides m-2 from the list`).not.toContain('ev-open-m-2')
+    const open = pressable({ 'events:detail': 'm-2', ...hide })
+    const tree = EventsTab(open.pressEls, eventsViewOf(DETAIL_EVENTS), 46, open.ui)
+    expect(rowKeys(tree), `no list row under ${label}`).toEqual([])
+    expect(textOwn(tree).some(t => t === 'm-2 · answer'), `the card stays under ${label}`).toBe(true)
+  }
+})
+
+test('a row keeps its time, chip, who, text, ack and problem marker once pressable', () => {
+  const events: EventItem[] = [{ id: 'm-3', src: 'bus', t: '06:03', kind: 'info', who: 'p1→orch', text: 'heads up', ack: 2, bad: true }]
+  const { pressEls, ui } = pressable()
+  const tree = EventsTab(pressEls, eventsViewOf(events), 80, ui)
+  const row = nodesOf(tree, 'Box').find(b => String(b.props.key) === 'ev-row-m-3')
+  expect(row, 'the row Box').toBeDefined()
+  const cells = textOwn(row)
+  expect(cells).toEqual(expect.arrayContaining(['!', '06:03', 'p1→orch', '✓✓']))
+  expect(nodesOf(row, 'Button').map(b => b.props.label)).toEqual(['heads up'])
+})
+
+// ---------- the store rows -> EventItem conversion (hooks/dashboard.tsx refreshEvents) ----------
+
+test('a stored row reaches the view with its date, from, to, task, chan, author and capped full text, and opens in the detail card', { plugins: [worldFixtures], timeoutMs: 15000 }, async ($, on) => {
+  const long = 'abcdefghij'.repeat(300) // 3000 chars: past the list cap (120) and the detail cap (1500)
+  const rows = [
+    { id: 11, t: '2026-10-07T17:50:00+02:00', chan: 'bus', kind: 'ask', from_id: 'p3', to_id: 'orch', reply_to: null, task: 'F6', text: 'cache or recompute?\r\nsecond\tline\u0007', meta_json: JSON.stringify({ by: 'builder-3', delivered: true }) },
+    { id: 12, t: '2026-10-07T17:51:00+02:00', chan: 'bus', kind: 'answer', from_id: 'orch', to_id: 'p3', reply_to: 'm-11', task: 'F6', text: long, meta_json: JSON.stringify({ delivered: true }) },
+    { id: 13, t: '2026-10-07T17:52:00+02:00', chan: 'run', kind: 'run', text: 'run note', meta_json: '' },
+  ]
+  mockFs(on, worldFiles())
+  const clock = mockWorld(on, {
+    process: argv => argv.some(a => a.endsWith('mkdb.py')) && argv.includes('events')
+      ? { value: { exitCode: 0, stdout: JSON.stringify({ ok: true, events: rows }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      : undefined,
+  })
+  let stored: Record<string, string> = {}
+  on('state.set', (_$, e, next) => {
+    if (e.key === 'viewState' && e.value) stored = e.value as Record<string, string>
+    return next(e)
+  })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(80) })
+  await ui.press({ key: 'dash-tab-events' })
+  for (let i = 0; i < 10; i++) await clock.advance(0)
+  await clock.advance(5000)
+  for (let i = 0; i < 10; i++) await clock.advance(0)
+
+  // 1. the stored view: the new fields travel, the list text stays flattened and capped at 120
+  const items = (JSON.parse(stored['events:list'] ?? '{}') as { events?: EventItem[] }).events ?? []
+  const byId = new Map(items.map(e => [e.id, e]))
+  const ask = byId.get('m-11')
+  const answer = byId.get('m-12')
+  const note = byId.get('r-13')
+  expect(items.map(e => e.id), 'newest first').toEqual(['r-13', 'm-12', 'm-11'])
+  expect(ask).toMatchObject({ date: '2026-10-07T17:50:00+02:00', from: 'p3', to: 'orch', task: 'F6', chan: 'bus', by: 'builder-3', src: 'bus' })
+  expect(ask?.full, '\\r\\n folded to \\n, a tab is a space, other control chars dropped').toBe('cache or recompute?\nsecond line')
+  expect(ask?.text, 'the list text is flattened').toBe('cache or recompute? second line')
+  expect(answer?.chan).toBe('bus')
+  expect(answer?.text.length, 'the list text keeps its 120 cap').toBe(120)
+  expect(answer?.full).toBe(`${long.slice(0, 1500)}\n… 1500 more`)
+  expect(note?.chan).toBe('run')
+  for (const k of ['from', 'to', 'task', 'by'] as const) expect(note?.[k], `a run row without ${k} leaves it out`).toBeUndefined()
+
+  // 2. the row opens its detail card in place of the list, the card reads those fields, and ✕ close brings the list back
+  await ui.redraw(paneProps(80))
+  expect(await ui.find({ type: 'Button', key: 'ev-open-m-12' }), 'the answer row is pressable').toBeDefined()
+  await ui.press({ key: 'ev-open-m-12' })
+  for (let i = 0; i < 10; i++) await clock.advance(0)
+  const drawn = await ui.drawn()
+  const texts = textOwn(drawn)
+  expect(texts.some(t => t === 'm-12 · answer'), 'the detail header').toBe(true)
+  expect(texts.some(t => t === '2026-10-07 17:51:00+02:00'), 'when').toBe(true)
+  expect(texts.some(t => t === 'orch → p3'), 'from → to').toBe(true)
+  expect(texts.some(t => t === 'answers m-11'), 'the related ask').toBe(true)
+  expect(texts.filter(t => t.startsWith('abcdefghij')), 'the kept 1500').toEqual([long.slice(0, 1500)])
+  expect(texts.filter(t => /^… \d+ more$/.test(t)), 'the tail, on its own line').toEqual(['… 1500 more'])
+  expect(await ui.find({ type: 'Button', key: 'ev-open-m-11' }), 'the list is not drawn').toBeUndefined()
+  await ui.press({ key: 'ev-detail-close-top-m-12' })
+  for (let i = 0; i < 10; i++) await clock.advance(0)
+  expect(await ui.find({ type: 'Button', key: 'ev-open-m-11' }), 'closed: the list is back').toBeDefined()
+})
+
+// ---------- fullOf: the detail card's text cap ----------
+
+test('fullOf keeps a text of exactly 1500 characters whole and cuts a longer one with a `… n more` tail', () => {
+  expect(EVENT_FULL_MAX).toBe(1500)
+  expect(fullOf('')).toBe('')
+  expect(fullOf('a'.repeat(1499))).toBe('a'.repeat(1499))
+  expect(fullOf('a'.repeat(1500)), 'exactly the cap: whole, no tail').toBe('a'.repeat(1500))
+  expect(fullOf('a'.repeat(1501)), 'one over: the cap, then the tail').toBe(`${'a'.repeat(1500)}\n… 1 more`)
+  expect(fullOf('a'.repeat(3000))).toBe(`${'a'.repeat(1500)}\n… 1500 more`)
+})
+
+test('fullOf never cuts inside a surrogate pair', () => {
+  const pair = '😀' // two UTF-16 units
+  const lone = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/
+  // the pair straddles the cut (high at 1499, low at 1500): the cut moves back one unit and `n` counts the dropped units
+  const straddle = `${'a'.repeat(1499)}${pair}tail`
+  expect(fullOf(straddle)).toBe(`${'a'.repeat(1499)}\n… ${straddle.length - 1499} more`)
+  expect(lone.test(fullOf(straddle)), 'no lone surrogate').toBe(false)
+  // the pair ends the text at 1501 units: still moved back, 2 dropped
+  expect(fullOf(`${'a'.repeat(1499)}${pair}`)).toBe(`${'a'.repeat(1499)}\n… 2 more`)
+  // a pair wholly inside the cap is kept
+  const inside = `${'a'.repeat(1498)}${pair}tail`
+  expect(fullOf(inside)).toBe(`${inside.slice(0, 1500)}\n… ${inside.length - 1500} more`)
+  expect(lone.test(fullOf(inside)), 'no lone surrogate').toBe(false)
+})
+
+test('fullOf folds CRLF, turns a tab or a lone CR into a space and drops other control characters', () => {
+  expect(fullOf('one\r\ntwo\r\n\r\nfour')).toBe('one\ntwo\n\nfour')
+  expect(fullOf('second\tline')).toBe('second line')
+  expect(fullOf('a\rb')).toBe('a b')
+  expect(fullOf('a\nb')).toBe('a\nb')
+  expect(fullOf('a\u0007b\u0000c\u001bd\u007fe')).toBe('abcde')
 })

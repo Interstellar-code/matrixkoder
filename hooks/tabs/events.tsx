@@ -2,12 +2,14 @@
 // Full visual pass layout matching the HTML design ("Events tab · bus + run, kind filters, pinned asks, lane activity"):
 // 1. BUS Card (bus heartbeat, port, uptime, queue stats, files, rate sparkline)
 // 2. Filter Card (source, kind multi-select dropdown, view preset dropdown, lane dropdown, search, pause)
-// 3. Events Card (time, colored kind chip, who, text, ack level, problem indicator)
+// 3. Events Card (time, colored kind chip, who, text, ack level, problem indicator); a pressed row's
+//    detail card (`events:detail` names its id) takes the Card's place until it is closed
 // 4. LANE ACTIVITY Card (per-lane 24-cell sparkline & silence age)
 // Pure render: elements only, no $, no direct state mutation. Filter and selection state flows through TabUi.
 import type { Elements, RenderElement } from 'claude-code'
 import { NARROW } from './ui'
-import { Card, Chip, Section, Segment } from './kit'
+import { ActionButton, Card, Chip, Section, Segment } from './kit'
+import { EventDetailPanel } from './eventdetail'
 import { EVENTS_FIXTURE } from './events.fixture'
 import type { PaletteRole } from './palette'
 import { PALETTE, ROLE, THEME } from './palette'
@@ -30,6 +32,20 @@ export type EventItem = {
   readonly reply_to?: string
   /** epoch ms of the row, when known: the Last hour view and Pause read it */
   readonly ts?: number
+  /** the row's time as an ISO string: the detail card's full date and time */
+  readonly date?: string
+  /** the sender id of a bus message */
+  readonly from?: string
+  /** the receiver id of a bus message */
+  readonly to?: string
+  /** the plan task the row belongs to */
+  readonly task?: string
+  /** the store channel the row was written on */
+  readonly chan?: string
+  /** the author the row's meta names */
+  readonly by?: string
+  /** the whole text, newlines kept (capped by the store reader): the detail card reads it */
+  readonly full?: string
   /** Backwards compatibility for earlier tests */
   readonly type?: string
   readonly short?: { readonly type: string; readonly text: string }
@@ -176,6 +192,13 @@ type NormalizedEvent = {
   answered?: boolean
   reply_to?: string
   ts?: number
+  date?: string
+  from?: string
+  to?: string
+  task?: string
+  chan?: string
+  by?: string
+  full?: string
   short?: { readonly type: string; readonly text: string }
 }
 
@@ -211,6 +234,13 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
     answered: e.answered,
     reply_to: e.reply_to,
     ts: e.ts,
+    date: e.date,
+    from: e.from,
+    to: e.to,
+    task: e.task,
+    chan: e.chan,
+    by: e.by,
+    full: e.full,
     short: e.short,
   }))
 
@@ -245,6 +275,24 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
 
   const rows = filtered.slice(0, EVENTS_MAX)
   const earlierCount = view.earlierCount
+
+  // the open row's detail card: `events:detail` holds its id; a row the view does not carry draws the list.
+  // The view's events, not the filtered rows: a filter or new traffic does not close an open card.
+  const detailId = ui?.get('events:detail') ?? ''
+  const detail = detailId !== '' ? allEvents.find(e => e.id === detailId) : undefined
+  // an answer's ask, or an ask's answer, when the view carries it
+  const related = detail == null ? undefined
+    : detail.kind === 'answer' && detail.reply_to ? allEvents.find(e => e.id === detail.reply_to)
+      : detail.kind === 'ask' ? allEvents.find(e => e.kind === 'answer' && e.reply_to === detail.id)
+        : undefined
+  /** a row's text as the press that opens (or, pressed again, closes) its detail card */
+  const rowButton = (ev: NormalizedEvent, i: number, label: string): RenderElement => ActionButton(els, {
+    key: `ev-open-${ev.id || i}`,
+    glyph: label === '' ? '·' : label,
+    word: '',
+    plain: true,
+    onPress: () => { if (ui != null) ui.set('events:detail', ui.get('events:detail') === ev.id ? '' : ev.id) },
+  })
 
   // Lanes list for filter
   const laneNames: string[] = ['all', ...Array.from(new Set(allEvents.map(e => e.lane).filter((l): l is string => typeof l === 'string' && l !== '' && l !== 'all')))]
@@ -491,8 +539,9 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
         </Box>
       ))}
 
-      {/* ── CARD 3: EVENTS LIST ── */}
-      {Card(els, {}, (
+      {/* ── CARD 3: EVENTS LIST (a pressed row's detail card takes its place) ── */}
+      {detail != null && EventDetailPanel(els, detail, related, cols, () => { ui?.set('events:detail', '') })}
+      {detail == null && Card(els, {}, (
         <Box flexDirection="column">
           {/* Header */}
           {Section(els, { label: 'Events', right: paused ? `paused · ${newCount} new` : `last ${String(rows.length)}` })}
@@ -520,7 +569,7 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
                 <Box key={`ev-row-${ev.id || i}`} flexDirection="row" gap={1}>
                   <Text dimColor={true}>{ev.t.slice(0, TIME_W).padStart(TIME_W)}</Text>
                   {Chip(els, { label: typeWord.padEnd(TYPE_W), role })}
-                  <Text wrap="truncate-end">{clip(text, budget)}</Text>
+                  {rowButton(ev, i, clip(text, budget))}
                 </Box>
               )
             }
@@ -548,7 +597,7 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
                 <Text dimColor={true}>{ev.t.slice(0, TIME_W).padStart(TIME_W)}</Text>
                 {Chip(els, { label: typeWord.padEnd(TYPE_W), role })}
                 {showWho && <Text dimColor={true}>{whoStr}</Text>}
-                <Text wrap="truncate-end">{displayText}</Text>
+                {rowButton(ev, i, displayText)}
                 {ackStr !== '' && <Text color={ackColor}>{ackStr}</Text>}
               </Box>
             )
