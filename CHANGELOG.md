@@ -2,6 +2,35 @@
 
 All notable changes to this project. Format: Keep a Changelog; versions: SemVer.
 
+## [0.7.0] - 2026-10-20
+
+### Added
+- **improve:** fill a collapsed paste from the clipboard before the rewrite (051383b)
+- **improve:** written texts use a numbered list when longer than two sentences (dcce4bd)
+- **improve:** the Improve chip opens a drop-up with Improve, Answer and Question (5ebce0b)
+- **dashboard:** pin the footer rows to the docked pane window (ace3016)
+- **improve:** Improve reads and writes Claude Code's prompt line (8e9f8e3)
+- **improve:** footer Improve box, Run Wizard and a new Improve tab (6d3bd36)
+
+### Fixed
+- **improve:** Answer and Question draft from the latest exchange; plain card labels (20cd539)
+- **improve:** review fixes for Enter, slash, saved size, edits and hotkeys (e2c9716)
+
+### Performance
+- **dashboard:** skip unchanged card writes, reuse run-snapshot, gate refreshers (c29c9ee)
+- **dashboard:** gate the rain beat on the open pane, cheaper Files walk and pulse (aa09f11)
+- **dashboard:** do not hold the session.start hook on the first load (a7b2205)
+- **dashboard:** one project read per tick, parallel first load, non-blocking start (9fa3f19)
+- **raster:** key the bar cache by theme, add cache tests (51dd7a0)
+- **raster:** memoize gradient, stage and lane bars per input (1812715)
+
+### Other
+- **dashboard:** remove the standalone Kanban tab (94cb809)
+- **dashboard:** move the helpers the Plan Kanban borrows out of the Kanban tab (c703972)
+- **events:** the live Events pane draws 3 Cards, the fixture view 4 (09db0c2)
+- **raster:** cover the bar cache, theme key, bound and freeze (checklist) (5e5b079)
+- **raster:** cover the bar cache, theme key, bound and freeze (193dc10)
+
 ## [0.6.7] - 2026-10-19
 
 ### Added
