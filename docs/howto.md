@@ -52,7 +52,7 @@ If the pane cannot open (not fullscreen, or too narrow), the same questions are 
 Toggle it with `/mk` (or `/mk open`, `/mk close`). It docks on the right when the window is wide enough and Claude Code is in fullscreen (`/tui fullscreen`). Sections, top to bottom:
 
 - **Run**: the active run, its stage and the next action.
-- **Plan**: the waves, each as a row of status glyphs.
+- **Plan**: the waves, each as a row of status glyphs. On a running plan, an expanded phase and every task row carry Play (`▶`) and Pause (`‖`); a press drafts that item's prompt (its title, description, acceptance, deps, files and route) on the Improve card, where the Play draft is refined by the model and the Pause draft is shown as written, and Play and Pause only ask the orchestrator to start or pause — Pause stops no running builder, and nothing is sent until you accept the draft and send it.
 - **Lanes**: one line per task with its agent and status.
 - **Usage**: remaining quota per agent pool, scoped to the agents your project's `project.yaml` enables (every ledger agent when it names none). An enabled agent with no ledger entry yet shows a dim hint row instead of nothing. The claude main row is labelled `claude (all)` when it covers sub-pools. `—` means the pool has no such window; `n/a` means the provider could not be polled at all; `⊘` in red means the pool is exhausted. `no ledger yet` means usage has not been polled yet.
 - **Waiting on you**: items that need your decision (full tab: hotkey `w`, `hooks/tabs/waiting.tsx` — real pending asks).
