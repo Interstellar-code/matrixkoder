@@ -14,6 +14,9 @@ import { Chip } from './kit'
 import { KANBAN_COLUMNS, KANBAN_FIXTURE } from './kanban.fixture'
 import type { KanbanCard } from './kanban.fixture'
 import { ROLE } from './palette'
+import { timeInStatus } from './plankanban'
+import { projectStoreDir, storeGroups } from './plans-map'
+import type { ProjectRow } from './plans-map'
 
 type Els = Elements[keyof Elements]
 
@@ -62,57 +65,8 @@ export function columnOf(card: KanbanCard): string {
   return card.col
 }
 
-/** The root store's `projects` row (`mkdb.py overview --json`): the linkage k follows.
- *  A set `db_path` marks a migrated project (its store is `<dirname(db_path)>/mk.db`);
- *  a NULL one is pre-migration and is read at its `data_dir` (C3). */
-export type ProjectRow = { slug?: unknown; repo?: unknown; data_dir?: unknown; db_path?: unknown }
-
 /** The root store's `plan_summary` row, as `overview --json` returns it. */
 export type OverviewReply = { ok?: boolean; projects?: readonly ProjectRow[]; plans?: readonly unknown[] }
-
-/** Where a root row's project store lives (C3): the migrated C2 folder, else the recorded
- *  data dir. '' when the row names neither, so the caller cannot read a store that is not
- *  there. Pure string math — the row is the test's. */
-export const projectStoreDir = (row: ProjectRow): string => {
-  const dbPath = typeof row.db_path === 'string' ? row.db_path.trim() : ''
-  if (dbPath !== '') {
-    const cut = dbPath.lastIndexOf('/')
-    return cut > 0 ? dbPath.slice(0, cut) : ''
-  }
-  return typeof row.data_dir === 'string' ? row.data_dir.trim() : ''
-}
-
-/** One distinct store directory and the slug its cards carry. */
-export type StoreGroup = { dir: string; slug: string }
-
-/** The slug a store's cards are labelled with: the row whose slug is the project
- *  NAME (basename of a non-empty `repo`), else the first row's slug, else ''. The
- *  live root carries both `matrixkoder` and a legacy alias for one store; the
- *  named row is the one a user recognises. */
-const labelSlug = (group: readonly ProjectRow[]): string => {
-  for (const row of group) {
-    const repo = typeof row.repo === 'string' ? row.repo.trim() : ''
-    const name = repo === '' ? '' : repo.replace(/\/+$/, '').split('/').pop() ?? ''
-    if (name !== '' && typeof row.slug === 'string' && row.slug === name) return row.slug
-  }
-  const first = group[0]
-  return typeof first?.slug === 'string' ? first.slug : ''
-}
-
-/** Group rows by their store directory (L7.2 R2): ONE read per distinct store, in
- *  first-seen order, so two rows sharing a `db_path` (the live alias) spawn one
- *  `run-snapshot`. Rows that name no store are dropped. Pure — the rows are the test's. */
-export function storeGroups(rows: readonly ProjectRow[]): StoreGroup[] {
-  const byDir = new Map<string, ProjectRow[]>()
-  for (const row of rows) {
-    const dir = projectStoreDir(row)
-    if (dir === '') continue
-    const group = byDir.get(dir)
-    if (group == null) byDir.set(dir, [row])
-    else group.push(row)
-  }
-  return [...byDir.entries()].map(([dir, group]) => ({ dir, slug: labelSlug(group) }))
-}
 
 /** The pane's status → column map, for cards built from a per-project task read
  *  (`run-snapshot`) rather than the retired root `cards` table. Attention statuses keep
@@ -197,18 +151,6 @@ function routeOf(card: KanbanCard): { agent: string; model: string } | null {
   } catch {
     return null
   }
-}
-
-/** Minutes between `updated` and `nowIso`. Unparseable clocks yield an em dash. */
-export function timeInStatus(updated: string, nowIso: string): string {
-  const a = Date.parse(updated)
-  const b = Date.parse(nowIso)
-  if (!Number.isFinite(a) || !Number.isFinite(b)) return '—'
-  const mins = Math.max(0, Math.round((b - a) / 60000))
-  if (mins < 60) return `${String(mins)}m`
-  const hours = Math.floor(mins / 60)
-  if (hours < 48) return `${String(hours)}h`
-  return `${String(Math.floor(hours / 24))}d`
 }
 
 export function kanbanView(cards: readonly KanbanCard[], filters: KanbanFilters, nowIso: string, slow = false): KanbanView {

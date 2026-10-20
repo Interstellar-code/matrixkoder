@@ -13,6 +13,7 @@ import {
   columnOfTask,
   planKanbanView,
   planKanbanSideBySide,
+  timeInStatus,
   verdictNeedsChanges,
 } from './plankanban'
 import type { PlanKanbanView } from './plankanban'
@@ -817,4 +818,9 @@ test('F.8: a row without the risk keys renders byte-identically even when a sibl
   expect(allOf(plainCard, 'Text').map(t => text(t)),
     'the absent row renders exactly as on main: byte-identical with a risky sibling beside it')
     .toEqual(allOf(riskyCard, 'Text').map(t => text(t)))
+})
+
+// Regression guard for the K1.1 move out of the old Kanban tab: passes on the old code too.
+test('timeInStatus of one hour before is 1h', () => {
+  expect(timeInStatus('2026-10-12T09:00:00+02:00', '2026-10-12T10:00:00+02:00')).toBe('1h')
 })

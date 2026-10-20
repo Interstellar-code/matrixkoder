@@ -18,7 +18,6 @@ import {
   kanbanFixtureView,
   kanbanView,
   readCards,
-  timeInStatus,
 } from './kanban'
 import type { RunFn } from './kanban'
 import { KANBAN_AFTER, KANBAN_COLUMNS, KANBAN_FIXTURE } from './kanban.fixture'
@@ -283,10 +282,6 @@ test('D3A is under Building before the fixture transition and under Verify after
   expect(moved!.status).toBe('verifying')
   expect(moved!.col).toBe('Verify')
   expect(columnOf(moved!)).toBe('Verify')
-})
-
-test('timeInStatus of one hour before KANBAN_NOW is 1h', () => {
-  expect(timeInStatus('2026-10-12T09:00:00+02:00', KANBAN_NOW)).toBe('1h')
 })
 
 

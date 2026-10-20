@@ -10,11 +10,22 @@ import { NARROW } from './ui'
 import { ActionButton, Card, Chip, Segment } from './kit'
 import { PALETTE, ROLE } from './palette'
 import type { PaletteRole } from './palette'
-import { timeInStatus } from './kanban'
 import { laneAgent, routeFields } from './plans-map'
 import type { PlanRoute } from './plan'
 
 type Els = Elements[keyof Elements]
+
+/** Minutes between `updated` and `nowIso`. Unparseable clocks yield an em dash. */
+export function timeInStatus(updated: string, nowIso: string): string {
+  const a = Date.parse(updated)
+  const b = Date.parse(nowIso)
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return '—'
+  const mins = Math.max(0, Math.round((b - a) / 60000))
+  if (mins < 60) return `${String(mins)}m`
+  const hours = Math.floor(mins / 60)
+  if (hours < 48) return `${String(hours)}h`
+  return `${String(Math.floor(hours / 24))}d`
+}
 
 /** C12: this tab's view-state handle — declared locally (structural typing; no
  *  import crosses lanes). */
