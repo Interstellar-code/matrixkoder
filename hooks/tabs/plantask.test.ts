@@ -10,6 +10,7 @@ import { planFromReply } from './plans-map'
 import detailFixture from './fixtures/plan-detail'
 import type { PlanTask } from './plan'
 import { ICONS } from './kit'
+import { taskDepsMet } from './planrun'
 
 type N = { type: string; props: Record<string, unknown>; children: unknown[] }
 
@@ -376,4 +377,49 @@ test('P1.3: without an act callback the panel draws no Play or Pause, so the pin
   const row = findPlanTask(planFromReply(detailFixture).phases, 'D1.5')!
   const keys = allOf(PlanTaskPanel(stubEls(), row, 80, () => {}), 'Button').map(b => String(b.props.key))
   expect(keys.filter(k => k.includes('-panel-'))).toEqual([])
+})
+
+/** ── R2 HIGH 1: the panel Play obeys the same dependency gate as the row ── */
+
+const S1 = () => {
+  const phase = planFromReply(detailFixture).phases?.find(p => p.id === 'S1')
+  if (phase == null) throw new Error('fixture has no phase S1')
+  return phase
+}
+
+test('R2 HIGH 1: a planned task with an unmet phase dependency draws no Play in the panel', () => {
+  const phases = planFromReply(detailFixture).phases ?? []
+  const task = S1().rows.find(r => r.id === 'S1.1')
+  expect(task, 'the planned task').toBeDefined()
+  // S1 needs V1; with V1 not merged the gate is false
+  const unmet = { ...S1(), rows: S1().rows, deps: ['V1'] }
+  const withUnmet = [unmet, ...phases.filter(p => p.id !== 'S1').map(p => (p.id === 'V1' ? { ...p, status: 'building' } : p))]
+  expect(taskDepsMet(task!, withUnmet), 'the shared gate').toBe(false)
+  const keys = allOf(PlanTaskPanel(stubEls(), task!, 80, undefined, () => {}, true, taskDepsMet(task!, withUnmet)), 'Button').map(b => String(b.props.key))
+  expect(keys, 'no Play with unmet deps').not.toContain('plan-task-play-panel-S1.1')
+  expect(keys, 'the close stays').toContain('plan-task-close-top-S1.1')
+})
+
+test('R2 HIGH 1: the same planned task with its dependencies merged draws Play in the panel', () => {
+  const phases = planFromReply(detailFixture).phases ?? []
+  const task = S1().rows.find(r => r.id === 'S1.1')
+  expect(taskDepsMet(task!, phases), 'V1 is merged in the captured reply').toBe(true)
+  const keys = allOf(PlanTaskPanel(stubEls(), task!, 80, undefined, () => {}, true, taskDepsMet(task!, phases)), 'Button').map(b => String(b.props.key))
+  expect(keys).toContain('plan-task-play-panel-S1.1')
+})
+
+test('R2 HIGH 1: Pause in the panel ignores dependencies, as the brief says', () => {
+  const phases = planFromReply(detailFixture).phases ?? []
+  const review = findPlanTask(planFromReply(detailFixture).phases, 'V1.5.2')
+  expect(review?.status).toBe('verifying')
+  // the V1.5 phase needs D1.5 (review, not finished): the gate is false, Pause still draws
+  expect(taskDepsMet(review!, phases), 'the dependency gate is unmet').toBe(false)
+  const keys = allOf(PlanTaskPanel(stubEls(), review!, 80, undefined, () => {}, true, taskDepsMet(review!, phases)), 'Button').map(b => String(b.props.key))
+  expect(keys).toContain('plan-task-pause-panel-V1.5.2')
+})
+
+test('R2 HIGH 1: with no dependency result passed the panel keeps today\'s behaviour', () => {
+  const task = S1().rows.find(r => r.id === 'S1.1')
+  const keys = allOf(PlanTaskPanel(stubEls(), task!, 80, undefined, () => {}, true), 'Button').map(b => String(b.props.key))
+  expect(keys).toContain('plan-task-play-panel-S1.1')
 })

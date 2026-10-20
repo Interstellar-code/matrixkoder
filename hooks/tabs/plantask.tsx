@@ -85,8 +85,10 @@ function subRow(els: Els, sub: PlanSub, W: number): RenderElement {
  *  missing field is left out. `onClose` is the caller's callback for the
  *  pressable `esc close` footer line. */
 /** `onAct` drafts the row's Play/Pause prompt (the pane's Improve seed); `running` is the
- *  shown plan's own status, the one condition every Play/Pause button obeys. */
-export function PlanTaskPanel(els: Els, row: PlanTask, cols: number, onClose?: () => void, onAct?: (kind: string) => void, running = false): RenderElement {
+ *  shown plan's own status, the one condition every Play/Pause button obeys; `depsMet`
+ *  is the same dependency result the task row uses (absent: treated as met, today's
+ *  behaviour). Pause never consults dependencies. */
+export function PlanTaskPanel(els: Els, row: PlanTask, cols: number, onClose?: () => void, onAct?: (kind: string) => void, running = false, depsMet = true): RenderElement {
   const { Box, Text } = els
   const owned = row.owned ?? []
   const shown = owned.slice(0, 8)
@@ -96,7 +98,7 @@ export function PlanTaskPanel(els: Els, row: PlanTask, cols: number, onClose?: (
       <Box flexDirection="row" justifyContent="space-between" gap={1}>
         <Text bold={true}>{`${row.id} · ${row.status}`}</Text>
         <Box flexDirection="row" gap={1}>
-          {running && onAct != null && canPlay(row.status, true) && IconButton(els, { key: `plan-task-play-panel-${row.id}`, icon: 'play', labelled: true, onPress: () => { onAct(`play task ${row.id}`) } })}
+          {running && onAct != null && canPlay(row.status, depsMet) && IconButton(els, { key: `plan-task-play-panel-${row.id}`, icon: 'play', labelled: true, onPress: () => { onAct(`play task ${row.id}`) } })}
           {running && onAct != null && canPause(row.status, true) && IconButton(els, { key: `plan-task-pause-panel-${row.id}`, icon: 'pause', labelled: true, onPress: () => { onAct(`pause task ${row.id}`) } })}
           {IconButton(els, { key: `plan-task-close-top-${row.id}`, icon: 'close', labelled: true, onPress: () => { onClose?.() } })}
         </Box>

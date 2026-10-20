@@ -322,6 +322,27 @@ test('a seed press while another flow is writing is ignored', { timeoutMs: 20000
   expect(w.log.prompts.join(' '), 'the second seed replaced nothing').not.toContain('Start task S1.2')
 })
 
+test('R2 MEDIUM 2: a seed press while a draft is in review replaces it; while asking or writing it is ignored', { timeoutMs: 20000, plugins: [worldFixtures] }, async ($, on) => {
+  const w = world(on, { plan: true, answer: () => SEED_REWRITE })
+  await $.session.start(sessionStart())
+  const ui = await mount($, 80)
+  await openPlan(ui, w)
+  // a finished draft on show (review)
+  await ui.press({ key: 'plan-task-play-S1.1' })
+  await w.settle()
+  expect(w.log.calls, 'the first seed rewrote').toBe(1)
+  // a second seed at review replaces it: one more model call, the new text on show
+  await ui.press({ key: 'plan-task-play-S1.2' })
+  await w.settle()
+  expect(w.log.calls, 'the replacement seed ran').toBe(2)
+  expect(w.log.prompts[1]).toContain('Start task S1.2 of plan settings-plans-db')
+  expect(await says(ui, 'Start task S1.2 of plan settings-plans-db'), 'the new draft is on show').toBe(true)
+  // a Pause seed at review replaces it with no model call
+  await ui.press({ key: 'plan-task-pause-V1.5.2' })
+  expect(w.log.calls, 'pause never calls the model').toBe(2)
+  expect(await says(ui, 'Pause task V1.5.2'), 'the pause text replaced the draft').toBe(true)
+})
+
 test('Discard closes the card and leaves the box as it was', { plugins: [worldFixtures] }, async ($, on) => {
   const w = world(on, { answer: () => REWRITE })
   await $.session.start(sessionStart())

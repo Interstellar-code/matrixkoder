@@ -6,6 +6,7 @@ import type { BoxProps, ElementChildren, Elements, RenderChildren, RenderElement
 import { PlanPane, planSubOf, readPlans, selectedPlanId } from '../dashboard'
 import { planActionLine } from './plans'
 import { planView } from './plan'
+import detailFixture from './fixtures/plan-detail'
 
 const scalarProps = (props: object): Record<string, string | boolean | number> => {
   const out: Record<string, string | boolean | number> = {}
@@ -439,4 +440,47 @@ test('P1.3: a plan-level start or resume still submits and never becomes a seed'
   press(PlanPane(stubEls, ACTION_VIEW, 120, handle), 'plans-start-dr')
   expect(seeds).toEqual([])
   expect(subs).toEqual([planActionLine('start', 'dr')])
+})
+
+/** ── R2 HIGH 1: the panel and the row agree on the dependency gate ─────── */
+
+/** The captured `plans <id>` reply, verbatim: its V1.5 phase needs D1.5 (still in review). */
+const REAL_DETAIL = JSON.stringify(detailFixture)
+const REAL_LIST = JSON.stringify({ ok: true, projects: [], plans: [{ project: 'matrixkoder', plan: detailFixture.id, title: detailFixture.title, status: 'running', created: 'c', live_run: 'settings-plans-db-r1', counts: { building: 2 } }] })
+const realView = (task: string): [Record<string, string>, Map<string, string>] => {
+  const ui = new Map<string, string>([['plan:phase:V1.5', '1'], ['plan:phase:S1', '1']])
+  return [{
+    'plans:store': '1', 'plans:list': REAL_LIST, 'plan:sub': 'detail', 'plans:sel': detailFixture.id,
+    'plans:detail': REAL_DETAIL, 'plans:detail-for': detailFixture.id, 'plan:task': task,
+  }, ui]
+}
+
+test('R2 HIGH 1: the panel shows no Play for a planned task whose phase dependency is not merged, and its row shows none', () => {
+  const [view, ui] = realView('V1.5.4')
+  const drawn = PlanPane(stubEls, view, 120, { get: k => ui.get(k), set: (k, v) => { ui.set(k, v) } })
+  const keys = nodesOf(drawn, 'Button').map(b => String(b.props?.key))
+  expect(keys, 'the panel draws').toContain('plan-task-close-top-V1.5.4')
+  expect(keys, 'the panel offers no Play').not.toContain('plan-task-play-panel-V1.5.4')
+  expect(keys, 'the row offers none either').not.toContain('plan-task-play-V1.5.4')
+})
+
+test('R2 HIGH 1: the panel and the row both offer Play for a planned task whose dependencies are merged', () => {
+  const [view, ui] = realView('S1.1')
+  const drawn = PlanPane(stubEls, view, 120, { get: k => ui.get(k), set: (k, v) => { ui.set(k, v) } })
+  const keys = nodesOf(drawn, 'Button').map(b => String(b.props?.key))
+  expect(keys, 'the panel draws').toContain('plan-task-close-top-S1.1')
+  expect(keys, 'the panel offers Play').toContain('plan-task-play-panel-S1.1')
+  expect(keys, 'the row offers Play too').toContain('plan-task-play-S1.1')
+})
+
+test('R2 HIGH 1: pressing the panel Play of that task seeds the prompt once', () => {
+  const [view, ui] = realView('S1.1')
+  const seeds: string[] = []
+  const handle = {
+    get: (k: string) => ui.get(k), set: (k: string, v: string) => { ui.set(k, v) },
+    improveAct: (kind: string, a?: string | number) => { seeds.push(`${kind}:${String(a ?? '')}`) },
+  }
+  press(PlanPane(stubEls, view, 120, handle), 'plan-task-play-panel-S1.1')
+  expect(seeds.length).toBe(1)
+  expect(seeds[0]?.startsWith(`seed:Start task S1.1 of plan ${detailFixture.id}`)).toBe(true)
 })

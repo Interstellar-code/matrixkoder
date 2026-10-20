@@ -12,7 +12,7 @@ import { colorStrip, laneStrip, pickBar } from './raster'
 import { PALETTE, ROLE } from './palette'
 import type { PaletteRole } from './palette'
 import { isDoneStatus, laneAgent, routeText } from './plans-map'
-import { canPause, canPlay, depsMet } from './planrun'
+import { canPause, canPlay, depsMet, taskDepsMet } from './planrun'
 
 type Els = Elements[keyof Elements]
 
@@ -541,7 +541,7 @@ function TaskBlock(els: Els, row: PlanTask, last: boolean, W: number, compact: b
         {showLane && <Text dimColor={true} wrap="truncate-end">{lane}</Text>}
         {find > 0 ? Chip(els, { label: `${find} findings`, role: 'warn' }) : sha !== '' ? <Text dimColor={true}>{sha}</Text> : rnd !== '' ? <Text dimColor={true}>{rnd}</Text> : null}
         {pauseButton(els, `plan-task-pause-${row.id}`, row.status, role === 'live', running, act, 'task', row.id)}
-        {playButton(els, `plan-task-play-${row.id}`, row.status, depsMet([...(row.deps ?? []), ...(phases.find(p => p.rows.some(r => r.id === row.id))?.deps ?? [])], phases), running, act, 'task', row.id)}
+        {playButton(els, `plan-task-play-${row.id}`, row.status, taskDepsMet(row, phases), running, act, 'task', row.id)}
       </Box>
       {subs.map((sub, i) => TreeRow(els, {
         depth: 1,

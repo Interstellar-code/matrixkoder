@@ -34,7 +34,7 @@ import type { LaneData, LanesView } from './tabs/lanes'
 import { OverviewTab, UsageCard } from './tabs/overview'
 import type { OverviewView } from './tabs/overview'
 import { PlanTab } from './tabs/plan'
-import { pausePrompt, phasePrompt, taskPrompt } from './tabs/planrun'
+import { pausePrompt, phasePrompt, taskDepsMet, taskPrompt } from './tabs/planrun'
 import type { PlanView } from './tabs/plan'
 import { PlansTab, planActionLine } from './tabs/plans'
 import type { PlansView } from './tabs/plans'
@@ -1490,7 +1490,9 @@ export function PlanPane(els: Els, view: Record<string, string>, paneCols: numbe
   const selTask = view['plan:task'] ?? ''
   const selRow = selTask !== '' ? findPlanTask(detailView?.phases, selTask) : null
   if (selRow != null) {
-    const panel = PlanTaskPanel(els, selRow, cols, () => { ui.set('plan:task', '') }, k => { onAction(k, sel) }, detailView?.plan?.status === 'running')
+    // the panel's Play obeys the row's own dependency gate (task deps + its phase's deps)
+    const panelDeps = taskDepsMet(selRow, detailView?.phases ?? [])
+    const panel = PlanTaskPanel(els, selRow, cols, () => { ui.set('plan:task', '') }, k => { onAction(k, sel) }, detailView?.plan?.status === 'running', panelDeps)
     // the pop-up: Detail draws it in place of the phases box (header, PHASES row and footer stay);
     // Kanban has no such slot, so the panel takes the body
     body = sub === 'detail' && detailView != null

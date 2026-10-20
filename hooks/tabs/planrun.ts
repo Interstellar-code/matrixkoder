@@ -43,6 +43,14 @@ export function depStatuses(ids: readonly string[] | undefined, phases: readonly
 export const depsMet = (ids: readonly string[] | undefined, phases: readonly PlanPhase[]): boolean =>
   depStatuses(ids, phases).every(d => DEP_MET[d.status] === true)
 
+/** A task's Play dependency gate: its own deps plus its phase's deps (a phase id or a
+ *  task id both resolve through the loaded phases). Shared by the task row and the task
+ *  detail panel so the two can never disagree. */
+export const taskDepsMet = (task: PlanTask, phases: readonly PlanPhase[]): boolean => {
+  const phase = phases.find(p => p.rows.some(r => r.id === task.id)) ?? phases.find(p => p.id === task.id.split('.')[0])
+  return depsMet([...(task.deps ?? []), ...(phase?.deps ?? [])], phases)
+}
+
 /** The title only: store titles carry the description after the first `: `, `; ` or ` — `. */
 const titleOnly = (text: string): string => {
   const m = /: |; | — /.exec(text)
