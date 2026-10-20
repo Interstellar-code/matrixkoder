@@ -387,7 +387,7 @@ test('P1.3: a task Play press calls improveAct once with the seed text and never
   press(PlanPane(stubEls, view, 120, handle), 'plan-task-play-S1.1')
   expect(seeds.length, 'one improveAct').toBe(1)
   expect(seeds[0]?.kind).toBe('seed')
-  expect(seeds[0]?.text.startsWith('Start task S1.1 of plan alpha (phase S1): "Scope-home map".')).toBe(true)
+  expect(seeds[0]?.text.startsWith('Sent from the MK dashboard (button press)\nStart task S1.1 of plan alpha (phase S1): "Scope-home map".')).toBe(true)
   expect(seeds[0]?.b, 'Play goes through the model').toBeUndefined()
   expect(subs, 'nothing is submitted').toEqual([])
   expect(ui.get('plans:reload'), 'no reload on a seed press').toBeUndefined()
@@ -404,7 +404,7 @@ test('P1.3: a task Pause press seeds the pause text with the pause marker', () =
   press(PlanPane(stubEls, view, 120, handle), 'plan-task-pause-S1.2')
   expect(seeds.length).toBe(1)
   expect(seeds[0]?.b).toBe('pause')
-  expect(seeds[0]?.text.startsWith('Pause task S1.2 of plan alpha: "Dead keys".')).toBe(true)
+  expect(seeds[0]?.text.startsWith('Sent from the MK dashboard (button press)\nPause task S1.2 of plan alpha: "Dead keys".')).toBe(true)
 })
 
 test('P1.3: with no improveAct, no loaded detail, or an unknown row the mk: submit still runs', () => {
@@ -482,5 +482,5 @@ test('R2 HIGH 1: pressing the panel Play of that task seeds the prompt once', ()
   }
   press(PlanPane(stubEls, view, 120, handle), 'plan-task-play-panel-S1.1')
   expect(seeds.length).toBe(1)
-  expect(seeds[0]?.startsWith(`seed:Start task S1.1 of plan ${detailFixture.id}`)).toBe(true)
+  expect(seeds[0]?.startsWith(`seed:Sent from the MK dashboard (button press)\nStart task S1.1 of plan ${detailFixture.id}`)).toBe(true)
 })

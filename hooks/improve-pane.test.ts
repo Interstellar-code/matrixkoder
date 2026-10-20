@@ -8,7 +8,7 @@ import detailFixture from './tabs/fixtures/plan-detail'
 import { DRAFT_EMPTY, DRAFT_SEND_FAILED, IMPROVE_FAILED, IMPROVE_PASTE, IMPROVE_FILL_FAILED, wordCount } from './improve-core'
 
 const PLAN_HOME = '/tmp/mk-improve-plan'
-const SEED_TASK = 'Start task S1.1 of plan settings-plans-db (phase S1): "Scope-home map".\n1. Done means (acceptance S1.1.a1 onwards): C6 holds. The drift test passes. No storage moves: every reader keeps reading where it reads today.\n2. Depends on: phase S1 needs V1 merged.\n3. Files this task owns: scripts/mk-config.py, scripts/settings-drift.py, hooks/tabs/settings.schema.ts.\n4. Run this one task, not the rest of S1.\n5. Run it through the MatrixKoder loop (round, brief, lane, dispatch, watch, verify, separate review). Do not edit plan statuses by hand.'
+const SEED_TASK = 'Sent from the MK dashboard (button press)\nStart task S1.1 of plan settings-plans-db (phase S1): "Scope-home map".\n1. Done means (acceptance S1.1.a1 onwards): C6 holds. The drift test passes. No storage moves: every reader keeps reading where it reads today.\n2. Depends on: phase S1 needs V1 merged.\n3. Files this task owns: scripts/mk-config.py, scripts/settings-drift.py, hooks/tabs/settings.schema.ts.\n4. Run this one task, not the rest of S1.'
 const SEED_REWRITE = JSON.stringify({ prompt: SEED_TASK, added: [] })
 const usage = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
 const ROUGH = 'Check all the files with type errors.'
@@ -285,7 +285,7 @@ test('a Play seed drafts the task prompt on the card without reading the prompt 
   expect(w.log.calls, 'one model call').toBe(1)
   expect(w.log.reads, 'the seed never reads the prompt line').toBe(0)
   expect(w.log.prompts[0]).toContain('Start task S1.1 of plan settings-plans-db')
-  expect(w.log.prompts[0]).toContain('Do not edit plan statuses by hand')
+  expect(w.log.prompts[0]).toContain('Sent from the MK dashboard (button press)')
   expect(boxValue(w), 'the line is untouched until Accept').toBe('my own draft')
   expect(await has(ui, { type: 'Button', key: 'improve-f-accept' }), 'the proposal is on the card').toBe(true)
   await ui.press({ key: 'improve-f-accept' })
@@ -306,7 +306,7 @@ test('a Pause seed is shown as the finished proposal with no model call', { time
   expect(await has(ui, { type: 'Button', key: 'improve-f-accept' }), 'Accept is offered').toBe(true)
   await ui.press({ key: 'improve-f-accept' })
   expect(boxValue(w)).toContain('Pause task V1.5.2 of plan settings-plans-db')
-  expect(boxValue(w)).toContain('pause only asks, it stops no running builder')
+  expect(boxValue(w)).toContain('Pause only asks; it stops no running builder')
 })
 
 test('a seed press while another flow is writing is ignored', { timeoutMs: 20000, plugins: [worldFixtures] }, async ($, on) => {
