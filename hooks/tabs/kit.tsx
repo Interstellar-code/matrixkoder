@@ -151,15 +151,16 @@ export const ICONS = {
 /** The name of one of the kit's icons. */
 export type IconName = keyof typeof ICONS
 
-/** An icon-only press: a plain, chrome-less single glyph (no tooltip, the engine's Button has none). The tone is the icon's own unless the caller overrides it. */
-export function IconButton(els: Els, opts: { key: string; icon: IconName; onPress: () => void; tone?: IconTone }): RenderElement {
-  const { glyph, tone } = ICONS[opts.icon]
-  return ActionButton(els, { key: opts.key, glyph, word: '', plain: true, tone: opts.tone ?? tone, onPress: opts.onPress })
+/** A plain, chrome-less icon press (no tooltip, the engine's Button has none): the glyph alone, or with `labelled` the glyph and its word (`✕ close`). The tone is the icon's own unless the caller overrides it. */
+export function IconButton(els: Els, opts: { key: string; icon: IconName; onPress: () => void; tone?: IconTone; labelled?: true }): RenderElement {
+  const { glyph, tone, word } = ICONS[opts.icon]
+  return ActionButton(els, { key: opts.key, glyph: opts.labelled === true ? `${glyph} ${word}` : glyph, word: '', plain: true, tone: opts.tone ?? tone, onPress: opts.onPress })
 }
 
-/** An IconButton's drawn width in columns: a plain Button without a hotkey draws its label alone, so the glyph. */
-export function iconWidth(icon: IconName): number {
-  return [...ICONS[icon].glyph].length
+/** An IconButton's drawn width in columns: a plain Button without a hotkey draws its label alone, so the glyph, or with `labelled` the glyph, a space and the word. */
+export function iconWidth(icon: IconName, labelled?: true): number {
+  const { glyph, word } = ICONS[icon]
+  return [...(labelled === true ? `${glyph} ${word}` : glyph)].length
 }
 
 /** The footer legend of icons: `‖ pause · ✕ close` (glyph, space, word, joined by ` · `). */

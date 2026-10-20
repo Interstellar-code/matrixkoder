@@ -218,7 +218,7 @@ test('report render: the D1.5 panel at 80 cols, exactly as pasted (V1.5)', () =>
   const row = findPlanTask(planFromReply(detailFixture).phases, 'D1.5')
   expect(row, 'the D1.5 phase-rooted task').not.toBeNull()
   expect(picture(row!, 80)).toBe(`╭──────────────────────────────────────────────────────────────────────────────╮
-│ D1.5 · review ✕                                                              │
+│ D1.5 · review ✕ close                                                        │
 │ Task fields survive the store mirror; dispatch records the route;            │
 │ mandatory-field check                                                        │
 │ lane L5                                                                      │
@@ -240,7 +240,7 @@ test('report render: the D1.5 panel at 80 cols, exactly as pasted (V1.5)', () =>
 │ ◐ D1.5.4 mk-state task check: mandatory fields; dispatch refuses a …  review │
 │ ◐ D1.5.5 backfill settings-plans-db-r1 task fields from the plan  review     │
 │ ◐ D1.5.6 SKILL.md: task round and route recorded at dispatch  review         │
-│ ✕ close · esc close                                                          │
+│ esc close                                                                    │
 ╰──────────────────────────────────────────────────────────────────────────────╯`)
 })
 
@@ -248,7 +248,7 @@ test('report render: the D1.5 panel at 36 cols, exactly as pasted (V1.5)', () =>
   const row = findPlanTask(planFromReply(detailFixture).phases, 'D1.5')
   expect(row, 'the D1.5 phase-rooted task').not.toBeNull()
   expect(picture(row!, 36)).toBe(`╭──────────────────────────────────╮
-│ D1.5 · review ✕                  │
+│ D1.5 · review ✕ close            │
 │ Task fields survive the store    │
 │ mirror; dispatch records the     │
 │ route; mandatory-field check     │
@@ -271,7 +271,7 @@ test('report render: the D1.5 panel at 36 cols, exactly as pasted (V1.5)', () =>
 │ ◐ D1.5.4 mk-state task …  review │
 │ ◐ D1.5.5 backfill setti…  review │
 │ ◐ D1.5.6 SKILL.md: task…  review │
-│ ✕ close · esc close              │
+│ esc close                        │
 ╰──────────────────────────────────╯`)
 })
 /** ── F.8: risk / critical / open_reasons on the task-detail panel (F.1) ──

@@ -51,7 +51,6 @@ const keysOf = (drawn: unknown): string[] =>
     .map(b => kids(b)[0])
     .filter((t): t is N => t != null && t.type === 'Text' && t.props.dimColor === true)
     .map(t => text(t))
-    .filter(k => !k.endsWith('·')) // the footer's icon legend is a row of the same shape, not a field
 
 /** the card's text lines (the full text, one Text per line) */
 const bodyLines = (drawn: unknown): string[] =>
@@ -85,9 +84,9 @@ test('the card draws every present field', () => {
   expect(flat).toContain('orchestrator')
   expect(bodyLines(drawn)).toEqual(['use the cache', 'and drop the recompute']) // the full text, not the cut one
   const top = allOf(drawn, 'Button').find(b => String(b.props.key) === 'ev-detail-close-top-m-7')
-  expect(top?.props.label, 'the top-right close is the icon alone').toBe('✕')
-  expect(flat).toContain('✕ close ·') // the footer: the icon's legend,
-  expect(flat).toContain('esc close') // then the pressable line
+  expect(top?.props.label, 'the top-right close names its word').toBe('✕ close')
+  expect(flat).toContain('esc close') // the footer's pressable line
+  expect(flat).not.toContain('✕ close ·') // no icon legend there
 })
 
 test('a row with only id, kind, text and time shows no empty field line', () => {
@@ -168,6 +167,6 @@ test('the header yields to the close button at a narrow width', () => {
     return text(allOf(drawn, 'Text').find(t => t.props.bold === true))
   }
   expect(header(80)).toBe('m-1234567 · ring-failed')
-  expect(header(24).length).toBeLessThanOrEqual(24 - 4 - 1 - iconWidth('close'))
+  expect(header(24).length).toBeLessThanOrEqual(24 - 4 - 1 - iconWidth('close', true))
   expect(header(24).endsWith('…')).toBe(true)
 })

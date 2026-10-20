@@ -8,7 +8,7 @@
 // Pure render: elements only, no $, no direct state mutation. Filter and selection state flows through TabUi.
 import type { Elements, RenderElement } from 'claude-code'
 import { NARROW } from './ui'
-import { ActionButton, Card, Chip, IconButton, Section, Segment, iconHint, iconWidth } from './kit'
+import { ActionButton, Card, Chip, IconButton, Section, Segment, iconWidth } from './kit'
 import type { IconName } from './kit'
 import { EventDetailPanel } from './eventdetail'
 import { EVENTS_FIXTURE } from './events.fixture'
@@ -326,6 +326,11 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
     ? filesLong
     : `bus ${mark(bus.files.busJson)} tok ${mark(bus.files.tokens)} rq ${bus.files.ringQueue}`
   const pauseIcon: IconName = paused ? 'play' : 'pause'
+  // the count line; the ticks legend joins it only when the whole of it fits beside the state word (never cut mid-word)
+  const countBudget = W - (paused ? 'paused' : 'live').length - 1
+  const countBare = compact ? `${rows.length}/${allEvents.length} shown` : `${rows.length} of ${allEvents.length} shown`
+  const countFull = `${countBare} · ✓ delivered · ✓✓ read`
+  const countText = !compact && countFull.length <= countBudget ? countFull : clip(countBare, countBudget)
 
   return (
     <Box flexDirection="column" gap={1}>
@@ -522,11 +527,12 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
           {/* Search Input & Pause Button */}
           <Box flexDirection="row" gap={1} alignItems="center" justifyContent="space-between">
             <Text dimColor={true}>
-              {clip(q ? `/ ${q}` : '/ : search text, id, task', Math.min(compact ? 20 : 28, W - iconWidth(pauseIcon) - 1))}
+              {clip(q ? `/ ${q}` : '/ : search text, id, task', Math.min(compact ? 20 : 28, W - iconWidth(pauseIcon, true) - 1))}
             </Text>
             {IconButton(els, {
               key: 'ev-pause-btn',
               icon: pauseIcon,
+              labelled: true,
               onPress: () => {
                 if (!paused) ui?.set('events:pausedAt', String(Date.now()))
                 ui?.set('events:paused', paused ? '0' : '1')
@@ -545,7 +551,7 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
 
           <Box flexDirection="row" justifyContent="space-between">
             <Text dimColor={true}>
-              {compact ? `${rows.length}/${allEvents.length} shown` : `${rows.length} of ${allEvents.length} shown`}
+              {countText}
             </Text>
             <Text color={paused ? ROLE.warn.fg : ROLE.live.fg}>
               {paused ? 'paused' : 'live'}
@@ -642,7 +648,7 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
 
       {/* Footer shortcut hints */}
       <Box flexDirection="row" justifyContent="space-between">
-        <Text dimColor={true}>{clip(cols < 56 ? `✓ deliv · ✓✓ read · ${iconHint(pauseIcon)}` : `✓ delivered · ✓✓ read · ↵ open · ${iconHint(pauseIcon)}`, cols - (cols < 56 ? 'j k' : 'j k /').length - 1)}</Text>
+        <Text dimColor={true}>↵ open</Text>
         <Text dimColor={true}>{cols < 56 ? 'j k' : 'j k /'}</Text>
       </Box>
     </Box>

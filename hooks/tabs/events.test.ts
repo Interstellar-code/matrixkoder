@@ -457,9 +457,9 @@ test('fullOf folds CRLF, turns a tab or a lone CR into a space and drops other c
   expect(fullOf('a\u0007b\u0000c\u001bd\u007fe')).toBe('abcde')
 })
 
-// ---------- the pause icon (`ev-pause-btn`) and the footer legend ----------
+// ---------- the pause button (`ev-pause-btn`), the count row and the footer ----------
 
-/** the row Box holding the pause icon, and its drawn width: a Text is its string, a Button its label, plus the gap columns */
+/** the row Box holding the pause button, and its drawn width: a Text is its string, a Button its label, plus the gap columns */
 function pauseRow(tree: unknown): { width: number; label: string } {
   const row = nodesOf(tree, 'Box').find(b => (b.children as { type?: string; props?: Record<string, unknown> }[]).some(c => c.type === 'Button' && c.props?.key === 'ev-pause-btn'))
   expect(row, 'the search row').toBeDefined()
@@ -470,11 +470,29 @@ function pauseRow(tree: unknown): { width: number; label: string } {
   return { width: w + gap * Math.max(0, parts.length - 1), label: String(btn?.props?.label) }
 }
 
-test('the pause icon toggles events:paused and events:pausedAt, shows ‖ while live and ▶ while paused', () => {
+/** the Events card's count row: the Box whose right Text is `live` or `paused` */
+function countRow(tree: unknown): { left: string; right: string; width: number } {
+  const row = nodesOf(tree, 'Box').find(b => {
+    const t = textOwn(b)
+    return b.props.flexDirection === 'row' && t.length === 2 && /shown/.test(t[0] ?? '') && /^(live|paused)$/.test(t[1] ?? '')
+  })
+  expect(row, 'the count row').toBeDefined()
+  const [left = '', right = ''] = textOwn(row)
+  return { left, right, width: left.length + right.length + 1 } // space-between keeps at least one column apart
+}
+
+/** the footer row: `↵ open` on the left, the `j k` keys on the right */
+function footerRow(tree: unknown): string[] {
+  const row = nodesOf(tree, 'Box').filter(b => b.props.flexDirection === 'row' && textOwn(b).some(t => /^j k/.test(t))).at(-1)
+  expect(row, 'the footer row').toBeDefined()
+  return textOwn(row)
+}
+
+test('the pause button toggles events:paused and events:pausedAt, reads `‖ pause` while live and `▶ play` while paused', () => {
   for (const cols of [46, 36] as const) {
     const live = pressable()
     const liveTree = EventsTab(live.pressEls, eventsViewOf(DETAIL_EVENTS), cols, live.ui)
-    expect(pauseRow(liveTree).label, `live shows the pause glyph at ${cols}`).toBe('‖')
+    expect(pauseRow(liveTree).label, `live shows the pause word at ${cols}`).toBe('‖ pause')
     live.press(liveTree, 'ev-pause-btn')
     expect(live.sets.map(s => s[0]), `pausing stamps the time then flips the flag at ${cols}`).toEqual(['events:pausedAt', 'events:paused'])
     expect(live.sets[1], `paused at ${cols}`).toEqual(['events:paused', '1'])
@@ -482,33 +500,71 @@ test('the pause icon toggles events:paused and events:pausedAt, shows ‖ while 
 
     const held = pressable({ 'events:paused': '1', 'events:pausedAt': '1' })
     const heldTree = EventsTab(held.pressEls, eventsViewOf(DETAIL_EVENTS), cols, held.ui)
-    expect(pauseRow(heldTree).label, `paused shows the play glyph at ${cols}`).toBe('▶')
+    expect(pauseRow(heldTree).label, `paused shows the play word at ${cols}`).toBe('▶ play')
     held.press(heldTree, 'ev-pause-btn')
     expect(held.sets, `resuming only clears the flag at ${cols}`).toEqual([['events:paused', '0']])
   }
 })
 
-test('the search row and the footer stay within the pane at 46 and 36 cols, live and paused', () => {
-  for (const cols of [46, 36] as const) {
+test('the search row, the count row and the footer stay within the pane at 46, 36 and 56 cols, live and paused', () => {
+  for (const cols of [46, 36, 56] as const) {
     const states: Record<string, string>[] = [{}, { 'events:paused': '1' }, { 'events:q': 'a very long search text that cannot fit', 'events:paused': '1' }]
     for (const initial of states) {
       const { pressEls, ui } = pressable(initial)
       const tree = EventsTab(pressEls, eventsViewOf(DETAIL_EVENTS), cols, ui)
-      expect(pauseRow(tree).width, `the search row at ${cols} ${JSON.stringify(initial)}`).toBeLessThanOrEqual(cols - 4)
-      const foot = nodesOf(tree, 'Box').filter(b => (b.children as { type?: string }[]).length === 2 && textOwn(b).some(t => /^j k/.test(t)) && textOwn(b).some(t => /✓ deliv/.test(t))).at(-1)
-      expect(foot, 'the footer row').toBeDefined()
-      expect(textOwn(foot).reduce((n, t) => n + t.length, 0), `the footer at ${cols}`).toBeLessThanOrEqual(cols)
+      const where = `at ${cols} ${JSON.stringify(initial)}`
+      expect(pauseRow(tree).width, `the search row ${where}`).toBeLessThanOrEqual(cols - 4)
+      const count = countRow(tree)
+      expect(count.width, `the count row ${where}`).toBeLessThanOrEqual(cols - 4)
+      expect(count.right, `the state word survives ${where}`).toBe(initial['events:paused'] === '1' ? 'paused' : 'live')
+      const foot = footerRow(tree)
+      expect(foot.reduce((n, t) => n + t.length, 0) + 1, `the footer ${where}`).toBeLessThanOrEqual(cols)
     }
   }
 })
 
-test('the footer legend names the pause icon while live and the play icon while paused', () => {
-  const footer = (initial: Record<string, string>, cols: number): string => {
+test('the ticks legend joins the count row only when the whole of it fits beside the state word', () => {
+  const LEGEND = ' · ✓ delivered · ✓✓ read'
+  const rowAt = (cols: number, initial: Record<string, string>, events: readonly EventItem[] = DETAIL_EVENTS) => {
     const { pressEls, ui } = pressable(initial)
-    return textOwn(EventsTab(pressEls, eventsViewOf(DETAIL_EVENTS), cols, ui)).find(t => /✓ deliv/.test(t)) ?? ''
+    return countRow(EventsTab(pressEls, eventsViewOf(events), cols, ui))
   }
-  expect(footer({}, 60)).toBe('✓ delivered · ✓✓ read · ↵ open · ‖ pause')
-  expect(footer({ 'events:paused': '1' }, 60)).toBe('✓ delivered · ✓✓ read · ↵ open · ▶ play')
-  expect(footer({}, 46)).toBe('✓ deliv · ✓✓ read · ‖ pause')
-  expect(footer({ 'events:paused': '1' }, 46)).toBe('✓ deliv · ✓✓ read · ▶ play')
+  // fits: the full legend, live and paused (3 of 3 shown + legend = 36 columns; the budget is cols - 4 - state word - 1)
+  const both: Record<string, string>[] = [{}, { 'events:paused': '1' }]
+  for (const initial of both) {
+    const row = rowAt(56, initial)
+    expect(row.left, `full legend at 56 ${JSON.stringify(initial)}`).toBe(`3 of 3 shown${LEGEND}`)
+    expect(row.right).toBe(initial['events:paused'] === '1' ? 'paused' : 'live')
+  }
+  // the exact boundary: paused needs cols - 4 - 6 - 1 >= 36 (cols 47), live needs cols - 4 - 4 - 1 >= 36 (cols 45)
+  expect(rowAt(47, { 'events:paused': '1' }).left).toBe(`3 of 3 shown${LEGEND}`)
+  expect(rowAt(46, { 'events:paused': '1' }).left).toBe('3 of 3 shown')
+  expect(rowAt(45, {}).left).toBe(`3 of 3 shown${LEGEND}`)
+  expect(rowAt(44, {}).left).toBe('3 of 3 shown')
+  // does not fit: the bare count, no tick, no ellipsis, and the state word still there
+  for (const [cols, initial] of [[44, { 'events:paused': '1' }], [46, { 'events:paused': '1' }], [44, {}], [40, {}]] as const) {
+    const row = rowAt(cols, initial)
+    expect(row.left, `bare count at ${cols} ${JSON.stringify(initial)}`).toBe('3 of 3 shown')
+    expect(row.left).not.toMatch(/✓|…/)
+    expect(row.right).toBe('paused' in initial || 'events:paused' in initial ? 'paused' : 'live')
+    expect(row.width).toBeLessThanOrEqual(cols - 4)
+  }
+  // a large count: 50 of 1234 shown + legend = 40 columns
+  const many: EventItem[] = Array.from({ length: 1234 }, (_, i) => ({ id: `b-${i}`, src: 'run', t: '06:00', kind: 'run', text: `row ${i}` }))
+  expect(rowAt(56, { 'events:paused': '1' }, many).left).toBe(`50 of 1234 shown${LEGEND}`)
+  for (const [cols, initial] of [[48, {}], [50, { 'events:paused': '1' }], [46, {}]] as const) {
+    const row = rowAt(cols, initial, many)
+    expect(row.left, `bare large count at ${cols}`).toBe('50 of 1234 shown')
+    expect(row.left).not.toMatch(/✓|…/)
+    expect(row.right).toBe('events:paused' in initial ? 'paused' : 'live')
+    expect(row.width).toBeLessThanOrEqual(cols - 4)
+  }
+  // compact never carries the legend
+  expect(rowAt(36, {}).left).toBe('3/3 shown')
+  // and the footer holds no legend at any width
+  for (const cols of [60, 46, 36] as const) {
+    const { pressEls, ui } = pressable()
+    const tree = EventsTab(pressEls, eventsViewOf(DETAIL_EVENTS), cols, ui)
+    expect(footerRow(tree), `the footer at ${cols}`).toEqual(['↵ open', cols < 56 ? 'j k' : 'j k /'])
+  }
 })

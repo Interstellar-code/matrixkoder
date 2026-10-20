@@ -632,12 +632,35 @@ test('IconButton tone: primary and default draw at full strength, quiet dims, th
   expect(ICONS.delete.tone).toBe('quiet')
 })
 
-test('iconWidth is the width a plain Button draws for the glyph (its label alone, no hotkey)', () => {
+test('a labelled IconButton draws the glyph, a space and the word as its one plain label', () => {
   for (const name of iconNames) {
-    const b = node(IconButton(stubEls(), { key: 'k', icon: name, onPress: () => {} }))
-    expect(iconWidth(name), name).toBe(String(b.props.label).length)
-    expect(iconWidth(name), name).toBe(1)
+    let pressed = 0
+    const b = node(IconButton(stubEls(), { key: `lk-${name}`, icon: name, labelled: true, onPress: () => { pressed += 1 } }))
+    expect(b.type).toBe('Button')
+    expect(b.props.key).toBe(`lk-${name}`)
+    expect(b.props.label).toBe(`${ICONS[name].glyph} ${ICONS[name].word}`)
+    expect(b.props.plain).toBe(true)
+    expect(b.props.hotkey, 'no engine hotkey').toBeUndefined()
+    expect(b.props.title, 'no tooltip').toBeUndefined()
+    expect(b.props.dimColor === true, 'same tone as the glyph-only form').toBe(ICONS[name].tone === 'quiet')
+    ;(b.props.onPress as () => void)()
+    expect(pressed).toBe(1)
   }
+  expect(node(IconButton(stubEls(), { key: 'k', icon: 'pause', labelled: true, onPress: () => {} })).props.label).toBe('‖ pause')
+  expect(node(IconButton(stubEls(), { key: 'k', icon: 'play', labelled: true, onPress: () => {} })).props.label).toBe('▶ play')
+  expect(node(IconButton(stubEls(), { key: 'k', icon: 'close', labelled: true, onPress: () => {} })).props.label).toBe('✕ close')
+})
+
+test('iconWidth is the width a plain Button draws for the label (no hotkey), glyph-only and labelled', () => {
+  for (const name of iconNames) {
+    const bare = node(IconButton(stubEls(), { key: 'k', icon: name, onPress: () => {} }))
+    expect(iconWidth(name), name).toBe(String(bare.props.label).length)
+    expect(iconWidth(name), name).toBe(1)
+    const full = node(IconButton(stubEls(), { key: 'k', icon: name, labelled: true, onPress: () => {} }))
+    expect(iconWidth(name, true), name).toBe(String(full.props.label).length)
+    expect(iconWidth(name, true), name).toBe(1 + 1 + ICONS[name].word.length)
+  }
+  expect([iconWidth('pause', true), iconWidth('play', true), iconWidth('close', true)]).toEqual([7, 6, 7])
 })
 
 test('iconHint joins glyph and word with a dot', () => {

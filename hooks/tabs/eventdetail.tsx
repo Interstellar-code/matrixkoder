@@ -8,7 +8,7 @@
 // text. The footer dim line `esc close` is pressable (`onClose` clears
 // `events:detail`), as the Plan tab's task panel. Pure render — no $, no state.
 import type { Elements, RenderElement } from 'claude-code'
-import { ActionButton, Card, IconButton, iconHint, iconWidth } from './kit'
+import { ActionButton, Card, IconButton, iconWidth } from './kit'
 import { ROLE } from './palette'
 import type { EventItem } from './events'
 
@@ -45,8 +45,8 @@ export function EventDetailPanel(els: Els, ev: EventItem, related: EventItem | n
   const { Box, Text } = els
   const id = ev.id ?? ''
   const kind = ev.kind ?? ev.type ?? 'info'
-  // the header row's text yields to the close icon (`✕`: 1 cell and a gap) inside the Card (border and padding: 4)
-  const title = clip(id === '' ? kind : `${id} · ${kind}`, Math.max(1, cols - 4 - 1 - iconWidth('close')))
+  // the header row's text yields to the `✕ close` button (iconWidth cells and a gap) inside the Card (border and padding: 4)
+  const title = clip(id === '' ? kind : `${id} · ${kind}`, Math.max(1, cols - 4 - 1 - iconWidth('close', true)))
   const when = has(ev.date) ? ev.date.replace('T', ' ').replace(/\.\d+/, '') : ev.t
   const route = has(ev.from) && has(ev.to) ? `${ev.from} → ${ev.to}` : null
   const lane = has(ev.lane) && ev.lane !== 'all' ? ev.lane : null
@@ -58,7 +58,7 @@ export function EventDetailPanel(els: Els, ev: EventItem, related: EventItem | n
     <Box key={`ev-detail-panel-${id}`} flexDirection="column">
       <Box flexDirection="row" justifyContent="space-between" gap={1}>
         <Text bold={true}>{title}</Text>
-        {IconButton(els, { key: `ev-detail-close-top-${id}`, icon: 'close', onPress: () => { onClose?.() } })}
+        {IconButton(els, { key: `ev-detail-close-top-${id}`, icon: 'close', labelled: true, onPress: () => { onClose?.() } })}
       </Box>
       {when !== '' && fieldRow(els, 'when', when)}
       {has(ev.src) && fieldRow(els, 'source', ev.src)}
@@ -87,17 +87,14 @@ export function EventDetailPanel(els: Els, ev: EventItem, related: EventItem | n
           <Text dimColor={true} wrap="wrap">{relatedText}</Text>
         </Box>
       )}
-      <Box flexDirection="row" gap={1}>
-        <Text dimColor={true}>{`${iconHint('close')} ·`}</Text>
-        {ActionButton(els, {
-          key: `ev-detail-close-${id}`,
-          glyph: 'esc close',
-          word: '',
-          plain: true,
-          tone: 'quiet',
-          onPress: () => { onClose?.() },
-        })}
-      </Box>
+      {ActionButton(els, {
+        key: `ev-detail-close-${id}`,
+        glyph: 'esc close',
+        word: '',
+        plain: true,
+        tone: 'quiet',
+        onPress: () => { onClose?.() },
+      })}
     </Box>
   ))
 }
