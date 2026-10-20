@@ -240,7 +240,7 @@ test('report render: the D1.5 panel at 80 cols, exactly as pasted (V1.5)', () =>
 │ ◐ D1.5.4 mk-state task check: mandatory fields; dispatch refuses a …  review │
 │ ◐ D1.5.5 backfill settings-plans-db-r1 task fields from the plan  review     │
 │ ◐ D1.5.6 SKILL.md: task round and route recorded at dispatch  review         │
-│ esc close                                                                    │
+│ ✕ close · esc close                                                          │
 ╰──────────────────────────────────────────────────────────────────────────────╯`)
 })
 
@@ -271,7 +271,7 @@ test('report render: the D1.5 panel at 36 cols, exactly as pasted (V1.5)', () =>
 │ ◐ D1.5.4 mk-state task …  review │
 │ ◐ D1.5.5 backfill setti…  review │
 │ ◐ D1.5.6 SKILL.md: task…  review │
-│ esc close                        │
+│ ✕ close · esc close              │
 ╰──────────────────────────────────╯`)
 })
 /** ── F.8: risk / critical / open_reasons on the task-detail panel (F.1) ──

@@ -8,7 +8,7 @@
 // text. The footer dim line `esc close` is pressable (`onClose` clears
 // `events:detail`), as the Plan tab's task panel. Pure render — no $, no state.
 import type { Elements, RenderElement } from 'claude-code'
-import { ActionButton, Card, IconButton, iconWidth } from './kit'
+import { ActionButton, Card, IconButton, iconHint, iconWidth } from './kit'
 import { ROLE } from './palette'
 import type { EventItem } from './events'
 
@@ -87,14 +87,17 @@ export function EventDetailPanel(els: Els, ev: EventItem, related: EventItem | n
           <Text dimColor={true} wrap="wrap">{relatedText}</Text>
         </Box>
       )}
-      {ActionButton(els, {
-        key: `ev-detail-close-${id}`,
-        glyph: 'esc close',
-        word: '',
-        plain: true,
-        tone: 'quiet',
-        onPress: () => { onClose?.() },
-      })}
+      <Box flexDirection="row" gap={1}>
+        <Text dimColor={true}>{`${iconHint('close')} ·`}</Text>
+        {ActionButton(els, {
+          key: `ev-detail-close-${id}`,
+          glyph: 'esc close',
+          word: '',
+          plain: true,
+          tone: 'quiet',
+          onPress: () => { onClose?.() },
+        })}
+      </Box>
     </Box>
   ))
 }

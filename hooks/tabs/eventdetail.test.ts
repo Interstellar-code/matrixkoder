@@ -51,6 +51,7 @@ const keysOf = (drawn: unknown): string[] =>
     .map(b => kids(b)[0])
     .filter((t): t is N => t != null && t.type === 'Text' && t.props.dimColor === true)
     .map(t => text(t))
+    .filter(k => !k.endsWith('·')) // the footer's icon legend is a row of the same shape, not a field
 
 /** the card's text lines (the full text, one Text per line) */
 const bodyLines = (drawn: unknown): string[] =>
@@ -85,8 +86,8 @@ test('the card draws every present field', () => {
   expect(bodyLines(drawn)).toEqual(['use the cache', 'and drop the recompute']) // the full text, not the cut one
   const top = allOf(drawn, 'Button').find(b => String(b.props.key) === 'ev-detail-close-top-m-7')
   expect(top?.props.label, 'the top-right close is the icon alone').toBe('✕')
-  expect(flat).not.toContain('✕ close')
-  expect(flat).toContain('esc close')
+  expect(flat).toContain('✕ close ·') // the footer: the icon's legend,
+  expect(flat).toContain('esc close') // then the pressable line
 })
 
 test('a row with only id, kind, text and time shows no empty field line', () => {
