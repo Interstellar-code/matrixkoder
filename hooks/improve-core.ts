@@ -171,23 +171,57 @@ export const DRAFT_SYSTEM =
 /** how many recent messages an Answer or Question draft reads */
 export const DRAFT_MESSAGES = 100
 
+/** Text the harness wraps into user rows (reminders, task and command notices): not the person's words. */
+const INJECTED = /<(system-reminder|task-notification|local-command-caveat|local-command-stdout|command-name|command-message|command-args)>[\s\S]*?<\/\1>/g
+
+/** What an Answer or Question draft reads, split so the latest exchange cannot be lost or outweighed:
+ *  `latest` = the person's last message before the assistant's latest one, through the end, always whole
+ *  (each message capped at `perMessage`); `earlier` = the rows before it, filled newest first into what
+ *  is left of `total`. Rows are the last `keep` non-empty user / assistant texts, injected notices removed. */
+export function draftContext(messages: readonly Turn[], keep = DRAFT_MESSAGES, perMessage = 4000, total = 24000): { earlier: string; latest: string } {
+  const rows = messages
+    .filter(m => m.role === 'user' || m.role === 'assistant')
+    .map(m => ({ role: m.role, text: typeof m.text === 'string' ? m.text.replace(INJECTED, ' ').trim() : '' }))
+    .filter(m => m.text !== '')
+    .slice(-keep)
+  const line = (m: { role: string; text: string }): string => `${m.role === 'user' ? 'Person' : 'Assistant'}: ${clip(m.text.replace(/\s+/g, ' '), perMessage)}`
+  let lastAssistant = -1
+  for (let i = rows.length - 1; i >= 0; i--) if (rows[i]?.role === 'assistant') { lastAssistant = i; break }
+  let start = lastAssistant < 0 ? Math.max(0, rows.length - 1) : lastAssistant
+  while (start > 0 && rows[start - 1]?.role === 'assistant') start--
+  if (start > 0 && rows[start - 1]?.role === 'user') start--
+  const latest = rows.slice(start).map(line)
+  let used = latest.reduce((n, r) => n + r.length + 1, 0)
+  const earlier: string[] = []
+  for (let i = start - 1; i >= 0; i--) {
+    const row = line(rows[i] ?? { role: 'user', text: '' })
+    used += row.length + 1
+    if (used > total) break
+    earlier.unshift(row)
+  }
+  return { earlier: earlier.join('\n'), latest: latest.join('\n') }
+}
+
 /** Answer: reply to the assistant's latest message. Question: ask about it. `hint` is what the prompt line held. */
-export const draftPrompt = (mode: 'answer' | 'question', hint: string, ctx: string): string =>
+export const draftPrompt = (mode: 'answer' | 'question', hint: string, ctx: { earlier: string; latest: string }): string =>
   [
-    'Recent conversation between the person and their AI coding assistant, newest last:',
-    '<conversation>',
-    ctx,
-    '</conversation>',
+    ...(ctx.earlier !== ''
+      ? ['Earlier in the conversation, oldest first. Background only; it may be out of date:', '<earlier>', ctx.earlier, '</earlier>', '']
+      : []),
+    'The LATEST exchange between the person and their AI coding assistant. Your draft responds to this, and where it disagrees with earlier messages, this wins:',
+    '<latest>',
+    ctx.latest,
+    '</latest>',
     '',
     ...(mode === 'answer'
       ? [
-          "Draft the person's reply to the assistant's latest message.",
+          "Draft the person's reply to the assistant's last message in <latest>.",
           '- If it asks a question or offers options, answer it: pick the option the conversation supports best and say why in a few words.',
           '- If it reports progress or a result, acknowledge it in a word and give the obvious next instruction.',
           '- If it is blocked or asks for approval, give the decision the conversation supports; when it truly cannot tell, ask for the missing fact instead.',
         ]
       : [
-          "Draft one short question the person asks the assistant about its latest message.",
+          "Draft one short question the person asks the assistant about its last message in <latest>.",
           '- If work is still running, ask for the status: what is done, what is left, any blocker.',
           '- If it just reported a result or a plan, question the weakest point: missing evidence, a risk, a skipped step, or what is still unverified.',
         ]),

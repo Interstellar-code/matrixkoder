@@ -17,8 +17,8 @@ import {
 import type { MkPaneSnapshot } from './data'
 import { beginStoreTick, endStoreTick, globalDirOf, homeDir, paths, projectYamlPath, resolveDataDir, resetStoreMemo } from './paths'
 import {
-  DRAFT_EMPTY, DRAFT_MESSAGES, DRAFT_SEND_FAILED, DRAFT_SYSTEM, IMPROVE_EMPTY, IMPROVE_FAILED, IMPROVE_FILL_FAILED, IMPROVE_MODEL, QUESTIONS_SYSTEM, REWRITE_SYSTEM,
-  answeredPairs, canAccept, contextBlock, draftPrompt, finalText, modeOf, newImproveFlow, questionsPrompt, readQuestions, readRewrite, rewritePrompt,
+  DRAFT_EMPTY, DRAFT_SEND_FAILED, DRAFT_SYSTEM, IMPROVE_EMPTY, IMPROVE_FAILED, IMPROVE_FILL_FAILED, IMPROVE_MODEL, QUESTIONS_SYSTEM, REWRITE_SYSTEM,
+  answeredPairs, canAccept, contextBlock, draftContext, draftPrompt, finalText, modeOf, newImproveFlow, questionsPrompt, readQuestions, readRewrite, rewritePrompt,
 } from './improve-core'
 import { NARROW, STATUS_GLYPH } from './tabs/ui'
 import { stageWord, STAGE_TOTAL } from './tabs/header'
@@ -1884,10 +1884,10 @@ async function improveWrite($: EngineInterface, id: string): Promise<void> {
     call = { system: REWRITE_SYSTEM, prompt: rewritePrompt(f.original, answeredPairs(f), await improveContext($)) }
   } else {
     // Answer / Question read the last DRAFT_MESSAGES messages; with none there is nothing to reply to
-    let ctx = ''
-    // 4000 chars a message: the assistant's latest report or question is the text the draft answers
-    try { ctx = contextBlock(await $.session.messages(), DRAFT_MESSAGES, 4000) } catch { ctx = '' }
-    if (ctx === '') {
+    // the latest exchange is sent whole and apart from the earlier rows, so the draft answers it, not an old message
+    let ctx = { earlier: '', latest: '' }
+    try { ctx = draftContext(await $.session.messages()) } catch { ctx = { earlier: '', latest: '' } }
+    if (ctx.latest === '') {
       await update($, improveAtom, s => (s.flow != null && s.flow.id === id && s.flow.step === 'writing' ? { ...s, flow: { ...s.flow, step: 'error' as const, failedStep: 'rewrite' as const, error: DRAFT_EMPTY } } : s))
       return
     }

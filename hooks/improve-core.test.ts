@@ -2,7 +2,7 @@
 // ported from the standalone Prompt Upgrade mod.
 import { test, expect } from 'claude-code/testing'
 import {
-  answeredPairs, bigDigits, bigNumber, clip, contextBlock, extractJson, finalText, newImproveFlow, questionsPrompt,
+  answeredPairs, bigDigits, bigNumber, clip, contextBlock, draftContext, extractJson, finalText, newImproveFlow, questionsPrompt,
   readQuestions, readRewrite, rewritePrompt, wordCount, wrap,
 } from './improve-core'
 
@@ -158,4 +158,22 @@ test('clip cuts with an ellipsis; newImproveFlow starts on the one-call rewrite;
   expect(newImproveFlow('2', 'x', 'review').step).toBe('review')
   expect(finalText({ isEditing: false, draft: 'd', upgraded: 'u' })).toBe('u')
   expect(finalText({ isEditing: true, draft: 'd', upgraded: 'u' })).toBe('d')
+})
+
+test('draftContext: the latest exchange is whole and apart; the oldest rows are dropped first; notices are stripped', () => {
+  const rows = Array.from({ length: 120 }, (_, i) => ({ role: i % 2 === 0 ? 'user' : 'assistant', text: `row ${String(i)} ${'x'.repeat(3000)}` }))
+  rows.push({ role: 'user', text: 'which file?' }, { role: 'assistant', text: 'The NEWEST answer: hooks/a.ts' }, { role: 'user', text: '<task-notification>done</task-notification>' })
+  const { earlier, latest } = draftContext(rows)
+  expect(latest).toBe('Person: which file?\nAssistant: The NEWEST answer: hooks/a.ts')
+  expect(earlier).toContain('row 119 ')
+  expect(earlier).not.toContain('row 0 ') // over the 24000 budget: the oldest go first
+  expect(earlier.split('\n').every(r => r.length <= 'Assistant: '.length + 4000)).toBe(true)
+  // only the newest 100 rows are read at all
+  const window = draftContext(Array.from({ length: 150 }, (_, i) => ({ role: i % 2 === 0 ? 'user' : 'assistant', text: `r${String(i)}` })))
+  expect(window.earlier).not.toContain('r49\n')
+  expect(window.earlier.startsWith('Person: r50')).toBe(true)
+  // a long latest assistant message keeps 4000 chars
+  const long = draftContext([{ role: 'user', text: 'go' }, { role: 'assistant', text: 'y'.repeat(9000) }])
+  expect(long.latest.split('\n')[1]?.length).toBe('Assistant: '.length + 4000)
+  expect(draftContext([]).latest).toBe('')
 })

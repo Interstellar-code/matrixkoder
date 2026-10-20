@@ -47,9 +47,11 @@ const MENU: readonly (readonly [string, string, string])[] = [
 
 /** the card head and working line for each mode's draft */
 const DRAFT_WORDS = {
-  answer: { head: '✦ DRAFTED ANSWER', short: '✦ ANSWER', doing: 'Reading the conversation and drafting a reply…' },
-  question: { head: '✦ DRAFTED QUESTION', short: '✦ QUESTION', doing: 'Reading the conversation and drafting a question…' },
+  answer: { head: '✦ REPLY WRITTEN FOR YOU', short: '✦ ANSWER', doing: 'Reading the latest messages and writing a reply for you…' },
+  question: { head: '✦ QUESTION WRITTEN FOR YOU', short: '✦ QUESTION', doing: 'Reading the latest messages and writing a question for you…' },
 } as const
+/** under the written text: what the two buttons do, so the card needs no explanation */
+const DRAFT_HELP = 'Send posts it as you. Edit puts it in your prompt line first.'
 
 /** the fixture view (the design's sample prompt, a proposal on show) */
 export function improveView(): ImproveView {
@@ -192,9 +194,9 @@ function footerCard(els: Els, f: MkImproveFlow, cols: number, act: (kind: Improv
     body = (
       <Box flexDirection="column">
         {head(DRAFT_WORDS[mode].head, `${String(wordCount(finalText(f)))} words`)}
-        {f.original !== '' && lines(els, 'improve-f-hint', `hint: ${f.original}`, w, 1, { dimColor: true })}
+        {f.original !== '' && lines(els, 'improve-f-hint', `from what you typed: ${f.original}`, w, 1, { dimColor: true })}
         {lines(els, 'improve-f-new', finalText(f), w, 6, { color: PALETTE.fg })}
-        {f.note !== '' && <Text dimColor={true} wrap="truncate-end">{f.note}</Text>}
+        {f.note !== '' ? <Text dimColor={true} wrap="truncate-end">{f.note}</Text> : lines(els, 'improve-f-help', DRAFT_HELP, w, 2, { dimColor: true })}
         {chipRows(els, [
           { key: 'improve-f-send', label: '↵ Send', tone: 'solid', onPress: () => act('send') },
           { key: 'improve-f-accept', label: 'Edit', tone: 'soft', onPress: () => act('accept') },
@@ -403,8 +405,8 @@ export function ImproveTab(els: Els, view: ImproveView, cols: number, ui: Improv
           <Box flexDirection="column">
             {Section(els, { label: 'Before and after' })}
             <Box flexDirection={side ? 'row' : 'column'} gap={1}>
-              {cardOf('improve-t-was', modeOf(f) === 'improve' ? 'BEFORE' : 'HINT', f.original, cw - 4, undefined, { dimColor: true })}
-              {cardOf('improve-t-new', modeOf(f) === 'improve' ? 'AFTER' : 'DRAFT', f.upgraded, (side ? cols - 1 - cw : cols) - 4, 'live', { color: PALETTE.fg })}
+              {cardOf('improve-t-was', modeOf(f) === 'improve' ? 'BEFORE' : 'WHAT YOU TYPED', f.original === '' && modeOf(f) !== 'improve' ? '(nothing)' : f.original, cw - 4, undefined, { dimColor: true })}
+              {cardOf('improve-t-new', modeOf(f) === 'improve' ? 'AFTER' : 'WRITTEN FOR YOU', f.upgraded, (side ? cols - 1 - cw : cols) - 4, 'live', { color: PALETTE.fg })}
             </Box>
           </Box>
         )}

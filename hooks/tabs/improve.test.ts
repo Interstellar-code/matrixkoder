@@ -162,14 +162,15 @@ test('footer drop-up: open, it lists Improve, Answer and Question with what each
 test('footer card: a drafted answer shows its head, the hint, the draft and Send / Edit / Discard; no Run Wizard', () => {
   const { tree, calls } = footer(viewOf({ flow: flowOf({ mode: 'answer', original: 'ok go', upgraded: 'Looks good, ship it.' }) }))
   const f = flat(tree)
-  expect(f).toContain('✦ DRAFTED ANSWER')
-  expect(f).toContain('hint: ok go')
+  expect(f).toContain('✦ REPLY WRITTEN FOR YOU')
+  expect(f).toContain('from what you typed: ok go')
+  expect(f.replace(/\n/g, ' ')).toContain('Send posts it as you. Edit puts it in your prompt line first.')
   expect(f).toContain('Looks good, ship it.')
   expect(f).not.toContain('Run Wizard')
   presses.get('improve-f-send')?.()
   presses.get('improve-f-accept')?.()
   expect(calls.map(c => c[0])).toEqual(['send', 'accept'])
-  expect(flat(footer(viewOf({ flow: flowOf({ mode: 'question', step: 'writing', original: '' }) })).tree).replace(/\n/g, ' ')).toContain('drafting a question')
+  expect(flat(footer(viewOf({ flow: flowOf({ mode: 'question', step: 'writing', original: '' }) })).tree).replace(/\n/g, ' ')).toContain('writing a question for you')
 })
 
 test('footer: the Undo chip shows only after an accept, beside Improve', () => {

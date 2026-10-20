@@ -945,13 +945,13 @@ test('Answer drafts a reply from the conversation (no prompt needed), Send submi
   expect(w.log.calls).toBe(1)
   expect(w.log.models).toEqual(['haiku'])
   expect(w.log.prompts[0]).toContain('Person: build the weekly report')
-  expect(w.log.prompts[0]).toContain("Draft the person's reply to the assistant's latest message.")
+  expect(w.log.prompts[0]).toContain("Draft the person's reply to the assistant's last message in <latest>.")
   expect(w.log.prompts[0]).not.toContain('<hint>')
-  expect(await has(ui, { text: '✦ DRAFTED ANSWER' })).toBe(true)
+  expect(await has(ui, { text: '✦ REPLY WRITTEN FOR YOU' })).toBe(true)
   expect(await says(ui, 'Looks good. Ship the report to the team channel.')).toBe(true)
   await ui.press({ key: 'improve-f-send' })
   expect(w.log.submitted).toEqual([{ text: 'Looks good. Ship the report to the team channel.', asUser: true }])
-  expect(await has(ui, { text: '✦ DRAFTED ANSWER' }), 'the card is gone').toBe(false)
+  expect(await has(ui, { text: '✦ REPLY WRITTEN FOR YOU' }), 'the card is gone').toBe(false)
   expect(w.stored.get('improveHistory'), 'a draft is not a saved improvement').toBeUndefined()
 })
 
@@ -964,7 +964,7 @@ test('Question uses what the prompt line holds as a hint; Edit puts the draft in
   await w.settle()
   expect(w.log.prompts[0]).toContain('Draft one short question')
   expect(w.log.prompts[0]).toContain('<hint>\nis it done\n</hint>')
-  expect(await has(ui, { text: '✦ DRAFTED QUESTION' })).toBe(true)
+  expect(await has(ui, { text: '✦ QUESTION WRITTEN FOR YOU' })).toBe(true)
   await ui.press({ key: 'improve-f-accept' })
   expect(boxValue(w)).toBe('What is left before the report is final?')
   expect(w.log.submitted, 'Edit never sends').toEqual([])
@@ -978,7 +978,7 @@ test('Send clears a hint left in the prompt line; a refused send keeps the draft
   await pick(ui, 'answer')
   await w.settle()
   await ui.press({ key: 'improve-f-send' })
-  expect(await has(ui, { text: '✦ DRAFTED ANSWER' }), 'the draft stays').toBe(true)
+  expect(await has(ui, { text: '✦ REPLY WRITTEN FOR YOU' }), 'the draft stays').toBe(true)
   expect(await says(ui, DRAFT_SEND_FAILED)).toBe(true)
   expect(boxValue(w), 'nothing cleared on a refusal').toBe('ok go')
 })
@@ -1027,7 +1027,7 @@ test('a failed Answer draft with no hint retries as an Answer, never as an Impro
   await w.settle()
   expect(w.log.calls).toBe(2)
   expect(w.log.prompts[1]).toContain("Draft the person's reply")
-  expect(await has(ui, { text: '✦ DRAFTED ANSWER' })).toBe(true)
+  expect(await has(ui, { text: '✦ REPLY WRITTEN FOR YOU' })).toBe(true)
 })
 
 test('a thrown send keeps the draft with a note; text typed after the press is never cleared by Send', { plugins: [worldFixtures] }, async ($, on) => {
@@ -1064,4 +1064,30 @@ test('the drop-up closes on a tab switch', { plugins: [worldFixtures] }, async (
   expect(await has(ui, { type: 'Button', key: 'improve-f-m-answer' })).toBe(true)
   await ui.press({ key: 'dash-tab-lanes' })
   expect(await has(ui, { type: 'Button', key: 'improve-f-m-answer' })).toBe(false)
+})
+
+test('Answer drafts from the latest exchange: the newest assistant message is in <latest>, an older topic only in <earlier>', { plugins: [worldFixtures] }, async ($, on) => {
+  const old = Array.from({ length: 30 }, (_, i) => ({ role: (i % 2 === 0 ? 'user' : 'assistant') as 'user' | 'assistant', text: `OLD TOPIC ${String(i)}: ${'filler '.repeat(400)}`, toolUses: [] as never[] }))
+  const w = world(on, {
+    answer: () => REPLY,
+    messages: [
+      ...old,
+      { role: 'user', text: 'now fix the login bug', toolUses: [] },
+      { role: 'assistant', text: 'Fixed the login bug. Should I also add a test for it, yes or no?', toolUses: [] },
+      { role: 'user', text: '<system-reminder>a reminder the harness added</system-reminder>', toolUses: [] },
+    ],
+  })
+  await $.session.start(sessionStart())
+  const ui = await mount($)
+  await pick(ui, 'answer')
+  await w.settle()
+  const prompt = w.log.prompts[0] ?? ''
+  const latest = prompt.slice(prompt.indexOf('<latest>'), prompt.indexOf('</latest>'))
+  expect(latest).toContain('Assistant: Fixed the login bug. Should I also add a test for it, yes or no?')
+  expect(latest).toContain('Person: now fix the login bug')
+  expect(latest, 'no old topic in the latest block').not.toContain('OLD TOPIC')
+  expect(latest, 'harness notices are not the person').not.toContain('system-reminder')
+  expect(prompt.indexOf('<earlier>'), 'earlier comes first').toBeLessThan(prompt.indexOf('<latest>'))
+  expect(prompt).not.toContain('OLD TOPIC 0:') // the budget drops the oldest rows first
+  expect(prompt).toContain('OLD TOPIC 29:')
 })
