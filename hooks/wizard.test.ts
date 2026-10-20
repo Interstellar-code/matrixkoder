@@ -9,6 +9,7 @@ import type { On } from 'claude-code'
 import type { MkWizardDraft } from '../types'
 import { NOW, PROJECT_DIR, DATA_DIR, mockFs, paneProps, sessionStart, type Files } from './testkit'
 import { addToGitignore, buildYaml, emptyDraft, inline, mergeModels, parseModels, parseProviders, parseWhich, proposeGates } from './wizard-core'
+import { resetStoreMemo } from './paths'
 
 const HOME = '/home/mk'
 const WIZARD = 'matrixkoder-setup'
@@ -40,6 +41,14 @@ const PROCS: Record<string, string | null> = {
   'codexbar --version': 'CodexBar 0.73.0\n',
   'codexbar config providers': 'codex: enabled default (Codex)\nopenai: disabled (OpenAI)\nclaude: enabled (Claude)\nzai: disabled (z.ai / GLM)\nantigravity: enabled (Antigravity)\n',
   'mkdir -p': '',
+}
+
+/** The same canned probes as PROCS, but with the repo at `repo` (a slug test drives a foreign folder). */
+function ProcsFor(repo: string): Record<string, string | null> {
+  return {
+    ...PROCS,
+    'git rev-parse --path-format=absolute --git-common-dir': `${repo}/.git\n`,
+  }
 }
 
 type World = { argv: string[][]; opened: string[]; closed: string[]; state: Map<string, { value: unknown; version: number }> }
@@ -79,6 +88,11 @@ function world(
     // L10.7: `mk-state.py project register` (the root-table registration) succeeds unless a test overrides it
     if (e.argv[1]?.endsWith('/scripts/mk-state.py') && e.argv[2] === 'project' && e.argv[3] === 'register') {
       return { value: { exitCode: 0, stdout: '{"ok": true}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
+    // B-3: the project store is created by `mk-state.py sync` (real reply, captured from the script);
+    // it writes <data>/mk-project.db, which the fake fs cannot show, so the reply is the witness
+    if (e.argv[1]?.endsWith('/scripts/mk-state.py') && e.argv[2] === 'sync') {
+      return { value: { exitCode: 0, stdout: '{"ok": true, "store": "on", "project": "mk-proj", "copied": 0}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     }
     const key = e.argv[0] === 'mkdir' ? 'mkdir -p' : e.argv.join(' ')
     const out = table[key]
@@ -151,14 +165,14 @@ test('gate proposals: pnpm+vitest, python, Makefile; never invents', () => {
   const js = proposeGates({ pkg: JSON.parse(PKG), pyproject: null, makefile: null, locks: ['pnpm-lock.yaml'], hasTsconfig: true, markers: [] })
   expect(js.gates).toEqual({
     install: 'pnpm install --frozen-lockfile --prefer-offline',
-    test: 'pnpm exec vitest run {paths}',
+    test: 'pnpm exec vitest run',
     typecheck: 'pnpm run typecheck',
-    lint_changed: 'pnpm exec eslint {files}',
-    format_changed: 'pnpm exec prettier --write {files}',
+    lint_changed: 'pnpm exec eslint .',
+    format_changed: 'pnpm exec prettier --write .',
   })
   expect(js.banned).toEqual(['pnpm run dev'])
   const py = proposeGates({ pkg: null, pyproject: '[tool.pytest]\n[tool.ruff]\n[tool.mypy]', makefile: null, locks: ['uv.lock'], hasTsconfig: false, markers: [] })
-  expect(py.gates).toEqual({ install: 'uv sync', test: 'pytest {paths}', typecheck: 'mypy .', lint_changed: 'ruff check {files}', format_changed: 'ruff format {files}' })
+  expect(py.gates).toEqual({ install: 'uv sync', test: 'pytest', typecheck: 'mypy .', lint_changed: 'ruff check .', format_changed: 'ruff format .' })
   const mk = proposeGates({ pkg: null, pyproject: null, makefile: 'test:\n\tgo test\nlint:\n\tvet\n', locks: [], hasTsconfig: false, markers: [] })
   expect(mk.gates.test).toBe('make test')
   expect(mk.gates.typecheck).toBe('')
@@ -195,7 +209,7 @@ test('gate proposals: marker files (plugin, selftest, tsconfig-only, Cargo, go.m
   expect(mkCargo.from).toBe('Makefile + Cargo.toml')
   // package.json keeps its own typecheck; markers add nothing (a consulted marker still lands in from, like a Makefile)
   const pkgCargo = proposeGates({ pkg: JSON.parse(PKG), pyproject: null, makefile: null, locks: [], hasTsconfig: true, markers: ['Cargo.toml'] })
-  expect(pkgCargo.gates.test).toBe('npx vitest run {paths}')
+  expect(pkgCargo.gates.test).toBe('npx vitest run')
   expect(pkgCargo.gates.typecheck).toBe('npm run typecheck')
   expect(pkgCargo.from).toBe('package.json + Cargo.toml')
   // finding 3: selftest + Cargo gives cargo test && bash scripts/selftest.sh
@@ -206,7 +220,7 @@ test('gate proposals: marker files (plugin, selftest, tsconfig-only, Cargo, go.m
   expect(cargoSelftest.from).toBe('Cargo.toml + scripts/selftest.sh')
   // finding 4: package.json and Makefile test stay unchanged when selftest is present
   const pkgSelftest = proposeGates({ pkg: JSON.parse(PKG), pyproject: null, makefile: null, locks: [], hasTsconfig: true, markers: ['scripts/selftest.sh'] })
-  expect(pkgSelftest.gates.test).toBe('npx vitest run {paths}')
+  expect(pkgSelftest.gates.test).toBe('npx vitest run')
   expect(pkgSelftest.from).toBe('package.json')
   const mkSelftest = proposeGates({ pkg: null, pyproject: null, makefile: 'test:\n\tgo test\nlint:\n\tvet\n', locks: [], hasTsconfig: false, markers: ['scripts/selftest.sh'] })
   expect(mkSelftest.gates.test).toBe('make test')
@@ -261,7 +275,7 @@ test('/mk setup opens the wizard pane and detection pre-fills the draft', async 
   expect(d.codexbarVersion).toBe('0.73.0')
   expect(d.providersOn).toEqual(['codex', 'claude', 'antigravity'])
   expect(d.providersAll).toEqual(['codex', 'claude', 'zai', 'antigravity'])
-  expect(d.gates.test).toBe('pnpm exec vitest run {paths}')
+  expect(d.gates.test).toBe('pnpm exec vitest run')
   expect(d.gates.install).toBe('pnpm install --frozen-lockfile --prefer-offline')
   expect(d.gitignore).toBe(true)
   expect(d.qaFrontend).toBe(true)
@@ -317,7 +331,7 @@ test('the pane walks 10 steps forward and back on both surfaces', async ($, on) 
     const ui = await $.ui.mount({ plugin: 'matrixkoder', surface, component: 'Pane', requestId: WIZARD, props: paneProps(64) })
     expect(await ui.find({ key: 'wz-back' }), `${surface} no back on step 1`).toBeUndefined()
     for (const [n, query] of expectBody) {
-      expect(await ui.find({ text: new RegExp(`Step ${n}/10`) }), `${surface} step ${n} header`).toBeTruthy()
+      expect(await ui.find({ text: new RegExp(`STEP ${n}/10`) }), `${surface} step ${n} header`).toBeTruthy()
       expect(await ui.find(query), `${surface} step ${n} body`).toBeTruthy()
       if (n < 10) await ui.press({ key: 'wz-next' })
     }
@@ -378,8 +392,8 @@ test('opencode on the Z.AI plan: plan models merge in, zai is labelled and pre-s
   expect(d.providersOn).toContain('zai') // pre-selected even though CodexBar lists zai disabled
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(72) })
   for (let i = 0; i < 3; i++) await ui.press({ key: 'wz-next' })
-  expect(await ui.find({ text: /\[x\] zai \(OpenCode Z\.AI plan\)/ })).toBeTruthy()
-  expect(await ui.find({ text: /\[ \] opencode \(OpenCode Zen\)/ })).toBeTruthy()
+  expect(await ui.find({ text: /\[x\] Z\.AI/ })).toBeTruthy()
+  expect(await ui.find({ text: /\[ \] OpenCode Zen/ })).toBeTruthy()
   // the stored value stays the CodexBar id
   await ui.press({ key: 'wz-prov-zai' })
   expect((draftOf()).providersOn).not.toContain('zai')
@@ -427,7 +441,7 @@ test('review writes yaml, registers the project (no projects.json), .gitignore a
     await ui.press({ key: 'wz-next' })
     expect(await ui.find({ text: /Will write/ })).toBeTruthy()
     expect(files[YAML], 'nothing is written before the confirm').toBeUndefined()
-    expect(await ui.find({ text: /matrixkoder\.yaml preview/ })).toBeTruthy()
+    expect(await ui.find({ text: /matrixkoder\.yaml · new file/ })).toBeTruthy()
     await ui.press({ key: 'wz-write' })
 
     const yaml = files[YAML] ?? ''
@@ -435,7 +449,7 @@ test('review writes yaml, registers the project (no projects.json), .gitignore a
     expect(yaml).toContain('  integration_branch: main')
     expect(yaml).toContain('  install: pnpm install --frozen-lockfile --prefer-offline   # proposed')
     expect(yaml).toContain('  test: "pnpm exec vitest run {paths} --bail"   # proposed')
-    expect(yaml).toContain('  lint_changed: "pnpm exec eslint {files}"   # proposed')
+    expect(yaml).toContain('  lint_changed: pnpm exec eslint .   # proposed')
     expect(yaml).toContain('  type_errors: null')
     expect(yaml).toContain('banned_commands: [pnpm run dev]')
     expect(yaml).toContain('  codex: { available: true, models: [] }')
@@ -579,7 +593,7 @@ test('an existing matrixkoder.yaml is kept by default and replaced only after th
     await ui.press({ key: 'wz-write' })
     expect(files[YAML], `${surface} kept`).toBe('# mine\ndata_dir: .matrixkoder/\n')
     expect(w.argv.some(a => a[2] === 'project' && a[3] === 'register'), 'the project is still registered').toBe(true)
-    expect(await ui.find({ text: /kept existing matrixkoder\.yaml/ })).toBeTruthy()
+    expect(await ui.find({ text: /kept existing yaml \(unchanged\)/ })).toBeTruthy()
     await ui.unmount()
 
     await mk($, 'setup')
@@ -640,7 +654,7 @@ test('outside fullscreen /mk setup answers with text and tells the user to run /
   expect(ran.text).toContain('/mk setup')
   expect(ran.text).toContain('agents: claude, codex, agy, herdr (missing: opencode)')
   expect(ran.text).toContain('codexbar 0.73.0')
-  expect(ran.text).toContain('test: pnpm exec vitest run {paths}')
+  expect(ran.text).toContain('test: pnpm exec vitest run')
   expect(ran.text).toContain('Nothing was written.')
   expect(w.opened).not.toContain(WIZARD)
   expect(Object.keys(files).some(p => p.includes('.matrixkoder'))).toBe(false)
@@ -911,8 +925,8 @@ test('opencode on Ollama Cloud: models merge in, ollama is labelled and pre-sele
   expect(d.providersOn).toContain('ollama')
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(72) })
   for (let i = 0; i < 3; i++) await ui.press({ key: 'wz-next' })
-  expect(await ui.find({ text: /\[x\] ollama \(OpenCode on Ollama Cloud\)/ })).toBeTruthy()
-  expect(await ui.find({ text: /\[ \] opencodego \(OpenCode Go\)/ })).toBeTruthy()
+  expect(await ui.find({ text: /\[x\] Ollama/ })).toBeTruthy()
+  expect(await ui.find({ text: /\[ \] OpenCode Go/ })).toBeTruthy()
 })
 
 // ---------- H2B R2: linked-state Select, marketplace re-link note ----------
@@ -950,7 +964,7 @@ test('wizard adds a marketplace re-link note to Review and the post-write view',
 
 // ---------- S1.3: dashboard prefs via $.config.set, config migration ----------
 
-test('dashboard prefs step writes the four userConfig keys via $.config.set only on its confirm', async ($, on) => {
+test('B-5: step 9 draws no Apply button; the four userConfig keys land with the step-10 write', async ($, on) => {
   const files = repoFiles()
   world(on, files)
   const sets: Array<{ key: string; value: unknown }> = []
@@ -960,13 +974,16 @@ test('dashboard prefs step writes the four userConfig keys via $.config.set only
   })
   await $.session.start(sessionStart())
   await mk($, 'setup')
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(64) })
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(46) })
   for (let i = 0; i < 8; i++) await ui.press({ key: 'wz-next' }) // step 9
+  expect(await ui.find({ key: 'wz-dash-apply' }), 'no Apply button on step 9').toBeUndefined()
   await ui.select({ key: 'wz-toasts', value: 'no' })
   await ui.input({ key: 'wz-pollMin', text: '7' })
   expect(sets, 'rendering and editing never write').toEqual([])
   expect(files[YAML]).toBeUndefined()
-  await ui.press({ key: 'wz-dash-apply' })
+  await toReview(ui)
+  expect(sets, 'the review alone still writes nothing').toEqual([])
+  await ui.press({ key: 'wz-write' })
   expect(sets).toEqual([
     { key: 'autoOpen', value: true },
     { key: 'chip', value: true },
@@ -977,17 +994,105 @@ test('dashboard prefs step writes the four userConfig keys via $.config.set only
   await ui.unmount()
 })
 
-test('a deny from $.config.set surfaces as the dashboard prefs step error', async ($, on) => {
+test('B-5: a deny from $.config.set surfaces as the write error, and the files still land', async ($, on) => {
   const files = repoFiles()
   world(on, files)
   on('config.set', (_$, e) => (e.key === 'toasts' ? { deny: 'locked by policy' } : { value: e.value }))
   await $.session.start(sessionStart())
   await mk($, 'setup')
-  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(64) })
-  for (let i = 0; i < 8; i++) await ui.press({ key: 'wz-next' })
-  await ui.press({ key: 'wz-dash-apply' })
-  expect(await ui.find({ text: /✗ could not set toasts: locked by policy/ })).toBeTruthy()
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(46) })
+  await toReview(ui)
+  await ui.press({ key: 'wz-write' })
+  expect(files[YAML], 'the yaml is written even when a pref is refused').toContain('integration_branch')
+  // applyPrefs runs inside writeAll, so its refusal is the draft's error: the review keeps the write list up
+  // and the post-write view's ⚠ line carries it — either way the text is on screen, never silent.
+  expect(await ui.find({ text: /could not set toasts: locked by policy/ })).toBeTruthy()
   await ui.unmount()
+})
+
+// ---------- B-1/B-2/B-4: the migrated path, the slug, keep-versus-migrate ----------
+
+/** `mkdb.py projects --json` as the real script answers it (captured), naming `dataDir`'s store. */
+const projectsReply = (dataDir: string): string => JSON.stringify({
+  ok: true,
+  projects: [{
+    slug: 'mk-proj', name: 'mk-proj', repo: PROJECT_DIR, data_dir: dataDir,
+    mode: 'home', created: '2026-10-20T22:43:25+02:00', last_activity: '2026-10-20T22:43:25+02:00',
+    db_path: `${dataDir}/mk-project.db`,
+  }],
+})
+
+test('B-1: on a migrated project the review names and writes the C2 project.yaml, never matrixkoder.yaml', async ($, on) => {
+  const files = repoFiles()
+  // A REAL migrated row, captured from `mkdb.py projects --json`: db_path sits in the C2 project folder
+  // `<home>/projects/<slug>`, NOT in the repo's data dir — so that folder is the data dir too.
+  const c2 = `${HOME}/.matrixkoder/projects/mk-proj`
+  const w = world(on, files, {}, {}, [], argv => {
+    if (argv[1]?.endsWith('/scripts/mkdb.py') && argv[2] === 'projects') {
+      return { value: { exitCode: 0, stdout: projectsReply(c2), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
+    return undefined
+  })
+  await $.session.start(sessionStart())
+  // paths.ts memoises the root-store read for the rest of the process (a session-start reset does it in the
+  // real pane); this test is the one that changes the answer, so it starts from a clean memo
+  resetStoreMemo()
+  await mk($, 'setup')
+  expect(draftOf().migrated, 'the store row marks the project migrated').toBe(true)
+  expect(draftOf().dataMode, 'a migrated project writes in its C2 folder').toBe('repo')
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(46) })
+  await toReview(ui)
+  expect(await ui.find({ text: new RegExp(`${c2}/project\\.yaml`) }), 'the review names the C2 file').toBeTruthy()
+  expect(await ui.find({ text: /matrixkoder\.yaml/ }), 'the pre-migration name is not offered').toBeUndefined()
+  await ui.press({ key: 'wz-write' })
+  expect(files[`${c2}/project.yaml`], 'the C2 file is the one written').toContain('integration_branch')
+  expect(files[YAML], 'no second matrixkoder.yaml beside it').toBeUndefined()
+  const reg = w.argv.filter(a => a[2] === 'project' && a[3] === 'register').pop()
+  expect(reg?.slice(4)).toEqual(['--slug', 'mk-proj', '--repo', PROJECT_DIR, '--data', c2])
+  await ui.unmount()
+})
+
+test('B-2: a repo folder name mk-state would refuse is normalised into a slug it accepts', async ($, on) => {
+  // /tmp/my_project: the old slugOf kept `_`, and `project register` refused it AFTER the yaml was on disk
+  const files: Files = Object.fromEntries(Object.entries(repoFiles()).map(([k, v]) => [k.replace(PROJECT_DIR, '/tmp/my_project'), v]))
+  const w = world(on, files, ProcsFor('/tmp/my_project'))
+  await $.session.start(sessionStart())
+  await mk($, 'setup')
+  expect(draftOf().slug).toBe('my-project')
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(46) })
+  await toReview(ui)
+  await ui.press({ key: 'wz-write' })
+  const reg = w.argv.filter(a => a[2] === 'project' && a[3] === 'register').pop()
+  expect(reg?.[5], 'the slug handed to mk-state satisfies ^[a-z0-9][a-z0-9-]{0,40}$').toMatch(/^[a-z0-9][a-z0-9-]{0,40}$/)
+  expect(await ui.find({ text: /MatrixKoder is set up/ })).toBeTruthy()
+  await ui.unmount()
+})
+
+test('B-4: keep means keep — a kept yaml is never rewritten by mk-config migrate', async ($, on) => {
+  const files = repoFiles()
+  const kept = '# mine\ndata_dir: .matrixkoder/\n'
+  files[YAML] = kept
+  const w = world(on, files, {}, {}, [], argv => {
+    if (argv[0] === 'python3' && argv.includes('migrate')) return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    return undefined
+  })
+  await $.session.start(sessionStart())
+  await mk($, 'setup')
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(46) })
+  await toReview(ui)
+  await ui.press({ key: 'wz-write' })
+  expect(files[YAML], 'the kept file is byte-identical').toBe(kept)
+  expect(w.argv.some(a => a[0] === 'python3' && a.includes('migrate')), 'no migration ran against the kept yaml').toBe(false)
+  await ui.unmount()
+
+  // a replace DID write the file, so the migration still runs there
+  await mk($, 'setup')
+  const ui2 = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(46) })
+  await toReview(ui2)
+  await ui2.select({ key: 'wz-replace', value: 'replace' })
+  await ui2.press({ key: 'wz-write' })
+  expect(w.argv.some(a => a[0] === 'python3' && a.includes('migrate')), 'a replaced yaml is migrated').toBe(true)
+  await ui2.unmount()
 })
 
 test('a successful write runs the mk-config migration once', async ($, on) => {
@@ -1021,6 +1126,6 @@ test('a failing migration warns but never fails the wizard', async ($, on) => {
   await toReview(ui)
   await ui.press({ key: 'wz-write' })
   expect(await ui.find({ text: /✓ MatrixKoder is set up/ })).toBeTruthy()
-  expect(await ui.find({ text: /⚠ config migration skipped: python3: not available/ })).toBeTruthy()
+  expect(await ui.find({ text: /config migration skipped: python3: not available/ })).toBeTruthy()
   await ui.unmount()
 })
