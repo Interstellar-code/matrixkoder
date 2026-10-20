@@ -200,7 +200,7 @@ function sumCounts(counts: unknown): number {
 const STATUS_BUCKET: Record<string, 'done' | 'live' | 'planned'> = {
   merged: 'done', done: 'done',
   dispatched: 'live', building: 'live', verifying: 'live', review: 'live', fix: 'live', qa: 'live',
-  blocked: 'live', stalled: 'live', quota: 'live', provider: 'live', rework: 'live', takeover: 'live',
+  blocked: 'live', stalled: 'live', quota: 'live', provider: 'live', paused: 'live', rework: 'live', takeover: 'live',
   planned: 'planned', routed: 'planned', ready: 'planned', parked: 'planned',
 }
 

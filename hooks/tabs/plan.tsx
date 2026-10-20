@@ -171,7 +171,7 @@ export function planView(): PlanView {
 const STATUS_ROLE: Record<string, PaletteRole> = {
   dispatched: 'live', building: 'live', verifying: 'live', review: 'live', fix: 'warn', qa: 'live',
   merged: 'ok', done: 'ok',
-  blocked: 'warn', quota: 'warn', stalled: 'warn', provider: 'warn',
+  blocked: 'warn', quota: 'warn', stalled: 'warn', provider: 'warn', paused: 'warn',
   planned: 'idle', routed: 'idle',
 }
 const SETTLED = new Set(['merged', 'done', 'routed', 'planned'])
@@ -243,7 +243,7 @@ const STATE_OF: Record<string, PlanState> = {
   merged: 'done', qa: 'done', done: 'done',
   dispatched: 'building', building: 'building', verifying: 'building',
   review: 'review',
-  fix: 'attention', blocked: 'attention', quota: 'attention', stalled: 'attention', provider: 'attention',
+  fix: 'attention', rework: 'attention', blocked: 'attention', quota: 'attention', stalled: 'attention', provider: 'attention', paused: 'attention',
 }
 /** A task or phase status as one of the five states; planned, routed and anything unknown are pending. */
 export const statusState = (status: string): PlanState => STATE_OF[status] ?? 'pending'

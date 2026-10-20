@@ -87,7 +87,7 @@ NONEMPTY_KINDS = ("ask", "answer", "info", "task", "status", "commit", "report",
 STATUS_VALUES = (
     "planned", "routed", "ready", "dispatched", "building", "takeover",
     "verifying", "review", "fix", "merged", "qa", "done",
-    "blocked", "stalled", "quota", "provider",
+    "blocked", "stalled", "quota", "provider", "paused",
 )
 
 

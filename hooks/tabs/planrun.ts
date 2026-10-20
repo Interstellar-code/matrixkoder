@@ -8,7 +8,7 @@ import type { PlanPhase, PlanTask } from './plan'
 const DEP_MET: Record<string, true> = { merged: true, done: true }
 
 /** Play: work that has not started, and the states that need a retry or a continue. */
-const PLAYABLE: Record<string, true> = { planned: true, routed: true, ready: true, blocked: true, stalled: true, quota: true, provider: true, rework: true }
+const PLAYABLE: Record<string, true> = { planned: true, routed: true, ready: true, blocked: true, stalled: true, quota: true, provider: true, rework: true, paused: true }
 
 /** Pause: work that is running right now (or waiting on the person). */
 const PAUSABLE: Record<string, true> = { dispatched: true, building: true, verifying: true, review: true, fix: true, qa: true }
@@ -70,7 +70,7 @@ const needsFirst = (deps: readonly DepStatus[]): string =>
   deps.length === 0 ? '' : deps.map(d => `${d.id} ${d.status === '' ? 'not in this plan' : d.status}`).join(' and ')
 
 /** The heading line of every prompt a Play or Pause press drafts. */
-const HEADING = 'Message from MatrixKoder'
+const HEADING = 'Sent from the MK dashboard (button press)'
 
 /** A numbered block: the parts present, numbered in order from 1. */
 const numbered = (parts: readonly string[]): string[] => parts.map((part, i) => `${String(i + 1)}. ${part}`)
@@ -141,15 +141,15 @@ export function pausePrompt(planId: string, what: 'phase' | 'task', row: PlanPha
   parts.push(`Tell its builder to stop at the next safe point and report what is done.`)
   if (what === 'task') {
     const acceptance = row.acceptance != null && row.acceptance.trim() !== '' ? ` Not yet done: ${row.acceptance.trim()}` : ''
-    parts.push(`Record the task's state on the run; do not set a status the store lacks.${acceptance}`)
+    parts.push(`Set the task to paused (mk-state task set ${row.id} status=paused) and note what it was doing: ${status === '' ? 'unknown' : status}.${acceptance}`)
   } else {
     const tasks = (row as PlanPhase).rows
     const left = tasks.filter(t => DEP_MET[t.status] !== true).map(t => `${t.id} ${titleOnly(t.title)}${t.status === '' ? '' : ` (${t.status})`}`)
     parts.push(left.length > 0
-      ? `Record which tasks are still open (${left.join('; ')}); do not set a status the store lacks.`
-      : 'Record the phase state on the run; do not set a status the store lacks.')
+      ? `Set each task that is still open to paused and note what it was doing (${left.join('; ')}).`
+      : 'Note the phase state on the run.')
   }
-  parts.push(`Tell me when it is quiet, and what "play" must restore.`)
+  parts.push(`Tell me when it is quiet. Play on a paused item puts it back to what it was doing.`)
   parts.push(`Pause only asks; it stops no running builder.`)
   const needLine = needsFirst(depStatuses(row.deps, phases))
   return [

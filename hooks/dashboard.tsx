@@ -1422,9 +1422,9 @@ export function PlanPane(els: Els, view: Record<string, string>, paneCols: numbe
    *  Improve card. Any miss (no match, no loaded detail, no Improve) keeps today's
    *  `mk: <kind> plan <id>` submit as the fallback. */
   const seedPress = (kind: string, id: string): boolean => {
-    const m = /^(play|pause) (phase|task) (\S+)$/.exec(kind)
+    const m = /^(play|resume|pause) (phase|task) (\S+)$/.exec(kind)
     if (m == null || ui.improveAct == null) return false
-    const what = m[1] === 'play' ? 'play' : 'pause'
+    const what = m[1] === 'pause' ? 'pause' : 'play'
     const level = m[2] === 'phase' ? 'phase' : 'task'
     const rowId = m[3] ?? ''
     const phases = shown?.phases

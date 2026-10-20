@@ -132,7 +132,7 @@ import argparse, contextlib, datetime, fcntl, fnmatch, hashlib, importlib.util, 
 
 SCHEMA = 1
 STATUSES = ("planned routed dispatched building verifying review fix rework merged qa done "
-            "blocked quota stalled provider").split()
+            "blocked quota stalled provider paused").split()
 STATUS_ALIASES = {"reviewing": "review", "merging": "merged", "fixing": "fix"}  # input aliases (F2.2)
 EVENT_TYPES = ("transition", "decision", "verdict", "quota", "note")
 TASK_KEYS = ("status", "agent", "model", "effort", "lane", "pane", "branch", "workspace", "slot",
@@ -159,7 +159,7 @@ ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 RECENT, BOARD_EVENTS = 10, 15
 DEP_MET = ("merged", "qa", "done")
 DEP_GATED = ("dispatched", "building")
-SIDE = ("rework", "blocked", "provider", "quota", "stalled")  # roll-up precedence: the first present wins
+SIDE = ("rework", "blocked", "provider", "quota", "stalled", "paused")  # roll-up precedence: the first present wins
 # F.0: a run closes (`run set --status done`) only when nothing is open and every runnable plan
 # gate passes. Closed = merged/qa/done (a task that reached the integration branch or was waived);
 # every other status is open. A plan gate is a plain string (manual: never run, never blocks) or a

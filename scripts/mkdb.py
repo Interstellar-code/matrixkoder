@@ -53,7 +53,7 @@ COLUMNS = {"planned": "Backlog", "routed": "Backlog", "ready": "Ready",
            "dispatched": "Building", "building": "Building", "takeover": "Building",
            "verifying": "Verify", "review": "Review", "fix": "Fix", "rework": "Fix",
            "merged": "Done", "qa": "Done", "done": "Done"}
-ATTENTION = ("rework", "blocked", "stalled", "quota", "provider")
+ATTENTION = ("rework", "blocked", "stalled", "quota", "provider", "paused")
 ROUTE_KEYS = ("agent", "model", "effort")
 # shortcut: the synced-folder check is a path-string heuristic, not a mount probe. It catches the
 # macOS iCloud container ("Mobile Documents"), the CloudStorage symlink tree, Dropbox, and anything
