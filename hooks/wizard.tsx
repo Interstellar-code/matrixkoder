@@ -17,7 +17,7 @@ import {
 import { StepsA, type WizardAct } from './wizard-steps-a'
 import { StepsB } from './wizard-steps-b'
 import { Card, Chip } from './tabs/kit'
-import { PALETTE, ROLE } from './tabs/palette'
+import { PALETTE, ROLE, themeText, withTheme } from './tabs/palette'
 
 /** Surfaces that draw Input and Select (mobile does not): the wizard's steps need both. */
 type Elements = ElementTables['terminal'] | ElementTables['desktop'] | ElementTables['vscode']
@@ -47,8 +47,7 @@ export function registerWizard(on: On, options: PluginOptions): void {
   })
 
   on('ui.render', { component: 'Pane', requestId: WIZARD_ID }, async ($, e, next) => {
-    const chrome = $.ui.resolve(e)
-    const { Box, Text } = chrome
+    const rawChrome = $.ui.resolve(e)
     const step = await read($, stepAtom)
     const d = await read($, draftAtom)
     const cols = e.props.bodyColumns || COLUMNS
@@ -56,13 +55,17 @@ export function registerWizard(on: On, options: PluginOptions): void {
     // this, mobile fell through to `next(e)` and drew an EMPTY pane: the command had already claimed
     // the wizard was open. The notice below is the whole surface it gets, and it says where to go.
     if (e.surface === 'mobile') {
-      return (
-        <Box flexDirection="column" width={cols} gap={1}>
+      return withTheme('matrix', () => {
+        const chrome = themeText(rawChrome)
+        const { Box, Text } = chrome
+        return (
+        <Box flexDirection="column" width={cols} gap={1} backgroundColor={PALETTE.bg}>
           {Header(chrome, d, cols, 'mobile')}
           {Card(chrome, { role: 'warn' }, <Text color={ROLE.warn.fg}>Open /mk setup on desktop to run the setup wizard: this app draws no text fields yet.</Text>)}
           <Text dimColor={true}>The wizard writes project.yaml, so it needs the docked pane.</Text>
         </Box>
-      )
+        )
+      })
     }
     // the review preview is exactly what a replace writes: read the yaml the carry-over needs (readOpt: null on any failure)
     const data = dataDirOf(d)
@@ -72,10 +75,16 @@ export function registerWizard(on: On, options: PluginOptions): void {
     // the preview must be byte-identical to the write (B-6): one clock read for both
     const checkedAt = step === LAST_STEP ? new Date(await $.clock.now()).toISOString() : ''
     // the mobile surface already returned: this table is the terminal's, the desktop's or vscode's
-    const els = $.ui.resolve(e) as Elements
+    const rawEls = $.ui.resolve(e) as Elements
     const inline = e.props.placement === 'inline'
-    return (
-      <Box flexDirection="column" width={cols} gap={1}>
+    // the dashboard's Matrix theme (palette.ts): PALETTE/ROLE swap for this synchronous build, and
+    // themeText turns plain and dim Text into the theme's greens instead of terminal grey
+    return withTheme('matrix', () => {
+      const els = themeText(rawEls)
+      const { Box, Text } = els
+      return (
+      // minHeight: paint the Matrix ground down the whole dock, not just under the content
+      <Box flexDirection="column" width={cols} gap={1} backgroundColor={PALETTE.bg} minHeight={e.props.placement === 'dock' ? e.props.scroll?.bodyRows : undefined}>
         {/* SetupLoading is the brand block and the step card alone, with the detecting line inside it */}
         {Header(els, d, cols, statusOf(d, step, inline))}
         {inline && Card(els, { role: 'warn' }, <Text color={ROLE.warn.fg}>Run /tui fullscreen to dock this panel on the right.</Text>)}
@@ -94,7 +103,8 @@ export function registerWizard(on: On, options: PluginOptions): void {
             </>
           )}
       </Box>
-    )
+      )
+    })
   })
 }
 
