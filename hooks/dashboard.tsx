@@ -1989,10 +1989,20 @@ async function setInboxCard($: EngineInterface, id: string, state: InboxCardStat
   })
 }
 
-/** One `mk-inbox.py` action; the reply's last JSON line, with the progress steps before it. */
-async function runInbox($: EngineInterface, home: string, dataDir: string, argv: readonly string[]): Promise<{ exitCode: number; stderr: string; reply: Record<string, unknown>; step: number }> {
+/** One `mk-inbox.py` action: `<action> [options] -- <id>`, so an id that starts with `-` is read
+ *  as the positional it is (argparse ends option parsing at `--`). Every option must precede the
+ *  `--`; the reply is the last JSON line, with the progress steps before it. */
+async function runInbox(
+  $: EngineInterface,
+  home: string,
+  dataDir: string,
+  action: string,
+  id: string,
+  extra: readonly string[] = [],
+): Promise<{ exitCode: number; stderr: string; reply: Record<string, unknown>; step: number }> {
   const r = await $.process.run(
-    ['python3', `${$.plugin.root}/scripts/mk-inbox.py`, ...argv, '--home', home, ...(dataDir === '' ? [] : ['--data', dataDir])],
+    ['python3', `${$.plugin.root}/scripts/mk-inbox.py`, action, '--home', home,
+      ...(dataDir === '' ? [] : ['--data', dataDir]), ...extra, '--', id],
     { timeoutMs: 300_000 },
   )
   let reply: Record<string, unknown> = {}
@@ -2028,7 +2038,7 @@ function inboxStepOf(reply: Record<string, unknown>, seen: number): 1 | 2 | 3 {
 async function inboxImportCounts($: EngineInterface, dataDir: string, planId: string, items: number): Promise<{ phases: number; tasks: number }> {
   try {
     const r = await $.process.run(
-      ['python3', `${$.plugin.root}/scripts/mkdb.py`, '--data', dataDir, 'plans', planId, '--json'],
+      ['python3', `${$.plugin.root}/scripts/mkdb.py`, '--data', dataDir, 'plans', '--json', '--', planId],
       { timeoutMs: STORE_READ_MS },
     )
     const parsed = JSON.parse(r.stdout) as { ok?: boolean; phases?: unknown[] }
@@ -2072,13 +2082,39 @@ async function inboxAct($: EngineInterface, kind: InboxActKind, id: string): Pro
   }
   if (kind === 'open') {
     // `path` is the entry's name inside the inbox (a folder form reads `<folder>/plan.md`); an
-    // archived entry lives under inbox/archive/, and C3's `path` carries no such prefix
+    // archived entry lives under inbox/archive/, and C3's `path` carries no such prefix.
+    // The name comes from a file on disk, so it is treated as hostile: the resolved target must
+    // stay inside the inbox folder (or its archive/), and a link that lands elsewhere is refused
+    // before any opener runs.
     const box = paths.inbox(home)
-    const target = file.archived ? join(join(box, 'archive'), file.path) : join(box, file.path)
+    const folder = file.archived ? join(box, 'archive') : box
+    const target = join(folder, file.path)
+    // Both sides are compared as RESOLVED paths: a resolved target may have a symlinked ancestor
+    // folded (macOS /var -> /private/var), so comparing it with the plain folder would refuse a
+    // legitimate file. `folderReal` is the folder itself resolved, or the plain folder when the
+    // host cannot resolve it (the entry then has to match it literally).
+    const folderReal = await $.fs.stat(folder, { resolve: true }).then(s => s.realPath).catch(() => undefined)
+    const root = normalizePath(folderReal ?? folder)
+    let real: string | undefined
+    try {
+      const stat = await $.fs.stat(target, { resolve: true })
+      real = stat.realPath
+    } catch {
+      real = undefined
+    }
+    if (real === undefined) {
+      await fail(1, `${file.path} cannot be resolved inside the inbox; refused`, 'open')
+      return
+    }
+    if (normalizePath(real) !== root && !normalizePath(real).startsWith(`${root}/`)) {
+      await fail(1, `${file.path} is outside the inbox folder; refused`, 'open')
+      return
+    }
     let opened = false
     for (const opener of ['open', 'xdg-open']) {
       try {
-        const r = await $.process.run([opener, target], { timeoutMs: 5000 })
+        // the resolved path, one argument after `--`: an opener reads it as a path, never a flag
+        const r = await $.process.run([opener, '--', real], { timeoutMs: 5000 })
         if (r.exitCode === 0) { opened = true; break }
       } catch {
         // the opener is not on this host; the next one is tried
@@ -2094,7 +2130,7 @@ async function inboxAct($: EngineInterface, kind: InboxActKind, id: string): Pro
     let planId = id
     let items = 0
     try {
-      const ran = await runInbox($, home, dataDir, ['import', id])
+      const ran = await runInbox($, home, dataDir, 'import', id)
       step = inboxStepOf(ran.reply, ran.step)
       if (ran.exitCode === 0 && ran.reply.ok === true) {
         planId = typeof ran.reply.plan === 'string' && ran.reply.plan !== '' ? ran.reply.plan : id
@@ -2116,14 +2152,14 @@ async function inboxAct($: EngineInterface, kind: InboxActKind, id: string): Pro
     await loadInbox($, home, dataDir, true)
     return
   }
-  const tail = kind === 'confirm-delete' ? ['delete', id, ...(file.archived ? ['--archived'] : [])]
-    : kind === 'archive' || kind === 'restore' ? [kind, id]
-    : null
-  if (tail == null) return
+  const action = kind === 'confirm-delete' ? 'delete' : kind === 'archive' || kind === 'restore' ? kind : null
+  if (action == null) return
+  // the archive flag is an OPTION: it goes before the `--` that ends option parsing, never after
+  const extra = action === 'delete' && file.archived ? ['--archived'] : []
   try {
-    const ran = await runInbox($, home, dataDir, tail)
+    const ran = await runInbox($, home, dataDir, action, id, extra)
     if (ran.exitCode !== 0 || ran.reply.ok !== true) {
-      await fail(inboxStepOf(ran.reply, ran.step), inboxFailure(ran.reply, ran.stderr, ran.exitCode), tail[0]!)
+      await fail(inboxStepOf(ran.reply, ran.step), inboxFailure(ran.reply, ran.stderr, ran.exitCode), action)
       return
     }
     await update($, viewStateAtom, prev => ({
@@ -2132,7 +2168,7 @@ async function inboxAct($: EngineInterface, kind: InboxActKind, id: string): Pro
       [INBOX_STATE_KEY]: JSON.stringify({ ...inboxStatesOf(prev), [id]: { kind: 'idle' } }),
     }))
   } catch (e) {
-    await fail(1, e instanceof Error ? e.message : String(e), tail[0]!)
+    await fail(1, e instanceof Error ? e.message : String(e), action)
   }
   await loadInbox($, home, dataDir, true)
 }
