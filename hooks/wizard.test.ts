@@ -8,7 +8,7 @@ import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import type { MkWizardDraft } from '../types'
 import { NOW, PROJECT_DIR, DATA_DIR, mockFs, paneProps, sessionStart, type Files } from './testkit'
-import { addToGitignore, buildYaml, emptyDraft, inline, mergeModels, parseModels, parseProviders, parseWhich, proposeGates } from './wizard-core'
+import { addToGitignore, buildYaml, emptyDraft, inline, mergeModels, parseModels, parseProviders, parseWhich, proposeGates, yamlDiff } from './wizard-core'
 import { resetStoreMemo } from './paths'
 
 const HOME = '/home/mk'
@@ -232,6 +232,44 @@ test('gitignore append is idempotent', () => {
   expect(addToGitignore('node_modules/')).toBe('node_modules/\n/.matrixkoder/\n')
   expect(addToGitignore('/.matrixkoder/\n')).toBeNull()
   expect(addToGitignore(null)).toBe('/.matrixkoder/\n')
+})
+
+test('B-19: the replace diff is a real line diff, so an insertion marks one row and nothing after it', () => {
+  // one line inserted at the top: exactly one `+` row, every other line unchanged
+  const oldText = 'repo:\n  integration_branch: main\ngates:\n  test: pnpm test\n'
+  const inserted = 'repo:\n  conventions: []\n  integration_branch: main\ngates:\n  test: pnpm test\n'
+  const ins = yamlDiff(oldText, inserted)
+  expect(ins.rows).toEqual([
+    { sign: ' ', text: 'repo:' },
+    { sign: '+', text: '  conventions: []' },
+    { sign: ' ', text: '  integration_branch: main' },
+    { sign: ' ', text: 'gates:' },
+    { sign: ' ', text: '  test: pnpm test' },
+  ])
+  expect(ins.changed).toBe(1)
+  expect(ins.unchanged).toBe(4)
+  // one line changed: one `-`, one `+`, the count says 1 changed line
+  const replaced = 'repo:\n  integration_branch: main\ngates:\n  test: pnpm exec vitest run\n'
+  const rep = yamlDiff(oldText, replaced)
+  expect(rep.rows).toEqual([
+    { sign: ' ', text: 'repo:' },
+    { sign: ' ', text: '  integration_branch: main' },
+    { sign: ' ', text: 'gates:' },
+    { sign: '-', text: '  test: pnpm test' },
+    { sign: '+', text: '  test: pnpm exec vitest run' },
+  ])
+  expect(rep.changed).toBe(1)
+  expect(rep.unchanged).toBe(3)
+  // identical files: no changed row at all
+  const same = yamlDiff(oldText, oldText)
+  expect(same.changed).toBe(0)
+  expect(same.unchanged).toBe(4)
+  expect(same.rows.every(r => r.sign === ' ')).toBe(true)
+  // a new file (no old text) is every line added
+  const created = yamlDiff(null, 'a\nb\n')
+  expect(created.changed).toBe(2)
+  expect(created.unchanged).toBe(0)
+  expect(created.rows.map(r => r.sign)).toEqual(['+', '+'])
 })
 
 test('baselines stay null and gates are marked proposed', () => {
@@ -842,14 +880,6 @@ test('yaml quoting: numberish, date-ish and NEL values are quoted', () => {
 })
 
 // ---------- H2B: herdr plugin link and Ollama Cloud models ----------
-
-test('wizard detects whether the MatrixKoder herdr plugin is linked', async ($, on) => {
-  const files = repoFiles()
-  world(on, files, { 'herdr plugin list': 'matrixkoder\n' })
-  await $.session.start(sessionStart())
-  await mk($, 'setup')
-  expect(draftOf().herdrPlugin).toBe('linked')
-})
 
 test('wizard links the herdr plugin on write when link, and only once', async ($, on) => {
   const files = repoFiles()

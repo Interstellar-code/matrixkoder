@@ -463,28 +463,61 @@ export function addToGitignore(text: string | null): string | null {
 export type YamlDiffRow = { sign: '-' | '+' | ' '; text: string }
 
 /** The review's replace form: line-wise `-`/`+` rows against the file on disk, plus how many lines the
- *  two share. Line-wise, not LCS: the wizard's emitter is one key per line and a replace rewrites whole
- *  blocks, so a positional compare reads exactly as the slides do (`- test: pnpm test`, `+ test: …`) and
- *  costs O(n). Unchanged lines keep their text and draw with a leading space. */
+ *  two share. A real line diff (LCS over lines, O(n·m) — the files are under ~200 lines), not a positional
+ *  compare: one line inserted at the top used to mark every later line changed, which reads as a rewrite
+ *  the write is not (B-19). A changed hunk draws its `-` rows before its `+` rows; unchanged lines keep
+ *  their text and draw with a leading space. `changed` counts changed lines the way the count text reads
+ *  (`N lines changed`): the larger of removed and added per hunk, so one replaced line is 1, not 2. */
 export function yamlDiff(oldText: string | null, newText: string): { rows: YamlDiffRow[]; changed: number; unchanged: number } {
-  const before = (oldText ?? '').replace(/\n$/, '').split('\n')
-  const after = newText.replace(/\n$/, '').split('\n')
+  const before = oldText == null || oldText === '' ? [] : oldText.replace(/\n$/, '').split('\n')
+  const after = newText === '' ? [] : newText.replace(/\n$/, '').split('\n')
   const rows: YamlDiffRow[] = []
   let changed = 0
   let unchanged = 0
-  const n = Math.max(before.length, after.length)
-  for (let i = 0; i < n; i++) {
-    const a = before[i]
-    const b = after[i]
-    if (a === b && a != null) {
-      rows.push({ sign: ' ', text: a })
-      unchanged++
-    } else {
-      if (a != null) rows.push({ sign: '-', text: a })
-      if (b != null) rows.push({ sign: '+', text: b })
-      changed++
+  const n = before.length
+  const m = after.length
+  // lcs[i][j] = the longest common subsequence of before[i..] and after[j..]
+  const width = m + 1
+  const lcs = new Uint32Array((n + 1) * width)
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      lcs[i * width + j] = before[i] === after[j]
+        ? (lcs[(i + 1) * width + j + 1] ?? 0) + 1
+        : Math.max(lcs[(i + 1) * width + j] ?? 0, lcs[i * width + j + 1] ?? 0)
     }
   }
+  const at = (i: number, j: number): number => lcs[i * width + j] ?? 0
+  let removed: string[] = []
+  let added: string[] = []
+  const flush = (): void => {
+    if (removed.length === 0 && added.length === 0) return
+    for (const text of removed) rows.push({ sign: '-', text })
+    for (const text of added) rows.push({ sign: '+', text })
+    changed += Math.max(removed.length, added.length)
+    removed = []
+    added = []
+  }
+  let i = 0
+  let j = 0
+  while (i < n && j < m) {
+    if (before[i] === after[j]) {
+      flush()
+      rows.push({ sign: ' ', text: before[i] ?? '' })
+      unchanged++
+      i++
+      j++
+    } else if (at(i, j + 1) >= at(i + 1, j)) {
+      // a tie takes the insertion first, so an inserted line draws as one `+` row and nothing else moves
+      added.push(after[j] ?? '')
+      j++
+    } else {
+      removed.push(before[i] ?? '')
+      i++
+    }
+  }
+  while (i < n) removed.push(before[i++] ?? '')
+  while (j < m) added.push(after[j++] ?? '')
+  flush()
   return { rows, changed, unchanged }
 }
 
