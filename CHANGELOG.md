@@ -2,7 +2,7 @@
 
 All notable changes to this project. Format: Keep a Changelog; versions: SemVer.
 
-## [0.7.2] - 2026-10-21
+## [0.7.3] - 2026-10-21
 
 ### Added
 - **improve:** the Improve tab follows the slides, with fixes (5ae6205)
