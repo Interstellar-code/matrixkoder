@@ -185,18 +185,18 @@ Mockup: see conversation 2026-10-07 (46-col right pane); becomes `matrixkoder/do
 
 ## 7. Onboarding wizard (first `/mk` in a repo)
 
-Runs as pane steps; falls back to chat questions when not fullscreen. Every step pre-filled, one confirm at the end.
+Runs as 46-column pane steps; every step pre-filled, one confirm at the end. There is no chat-question fallback: outside fullscreen it prints a read-only summary ending `Nothing was written.`, and a mobile surface gets a short notice to run it on desktop.
 
 1. Install mode detected (dev `--plugin-dir` / marketplace) — info only
-2. Data: project folder detected (`~/.matrixkoder/projects/<slug>/`), the project DB created on confirm
-3. Agents: detect claude / codex / opencode / agy / herdr + model lists; tick to enable
-4. Usage: codexbar present? (show install cmd if not) → enable providers → live probe per agent; z.ai key entry
-5. Gates: detect test / typecheck / lint / format; measure baselines
-6. Routing: builder order, reserve floors, max lanes, effort by size
-7. Autonomy: pre-authorised list, builder permission-skip flags
-8. QA: dev URL, themes, mockups dir
-9. Dashboard prefs: auto-open, chip, toasts, poll intervals
-10. Review → write `projects/<slug>/project.yaml`; update the root `mk.db` `projects` row (dashboard prefs are plugin settings, not a written file)
+2. Data: default repo mode (`<repo>/.matrixkoder/`, added to `.gitignore`); home mode (`<globalDir>/projects/<slug>/`) is offered and is the default only for a bare repo. The data dir follows the root store's row for the repo (a migrated project writes `<project>/project.yaml`); the write creates the project store
+3. Agents: detect claude / codex / opencode / agy / herdr + model lists; tick to enable an agent, and choose whether to link the herdr plugin
+4. Usage: codexbar present? (show install cmd if not) → every enabled provider pre-selected; the z.ai key is printed as a `codexbar config set-api-key` command to run yourself, never entered here
+5. Gates: detect `install` / test / typecheck / lint / format; proposed commands are whole-repo runs (no `{paths}`/`{files}` scope — nothing expands them); baselines written null and measured at first run
+6. Routing: builder order, max lanes, the two Claude reserve floors, integration branch; `effort_by_size` and the reviewers are written as fixed defaults, never asked
+7. Autonomy: pre-authorised list, builder permission-skip flags; `pause_only_for` is a fixed eight-item default, not asked
+8. QA: frontend?, dev URL, start command (orchestrator only), themes, mockups dir, QA integration target; the port is derived from the dev URL, never asked
+9. Dashboard prefs: auto-open, chip, toasts, poll intervals chosen here but written at the step-10 confirm with everything else — there is no Apply button
+10. Review and confirm → whole file, `exactly what is written` (no truncation, no `pending`); a replace draws a real `-`/`+` diff with a changed/unchanged count; keep is the default and a kept file is never rewritten (`mk-config migrate` skipped for it); the write saves `<data>/matrixkoder.yaml` (or `project.yaml` when migrated), registers the project, creates its store, and puts the four prefs in the plugin's userConfig; Cancel/Close discard the answers
 
 Bootstrap of the old skill (read-only checks) becomes steps 3–8's detection.
 

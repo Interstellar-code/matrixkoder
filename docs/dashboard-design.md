@@ -242,14 +242,14 @@ This is the Overview tab's empty state; the Usage tab shows the ledger on its ow
 
 ### 3.4 State Variation: First-Run Setup (Wizard Incomplete)
 
-Shown when the project's configuration (`~/.matrixkoder/projects/<slug>/project.yaml`) is missing (global plugin prefs live in the plugin's userConfig, not a file).
+Shown when the project's configuration is missing. The wizard writes `<data>/matrixkoder.yaml`, or the C2 `<data>/project.yaml` for a project whose root row has a `db_path` set (migrated); in home mode `<data>` is `~/.matrixkoder/projects/<slug>`. Global plugin prefs live in the plugin's userConfig, not a file. `/mk setup` opens a 46-column pane, `/mk init <name>` sets the project slug, and nothing is written until the final confirm — the dashboard preferences included.
 
 ```
 Setup
 ⬡ Welcome to MatrixKoder!
 
 Configuration required for this project:
-[!] Missing projects/<slug>/project.yaml
+[!] No project config yet (projects/<slug>/project.yaml)
 
 ▶ Run /mk setup to launch the wizard
 
