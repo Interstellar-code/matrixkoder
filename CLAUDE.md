@@ -45,4 +45,4 @@ Weak criteria ("make it work") need constant clarification. Strong criteria let 
 
 # CodeGraph
 
-This repo has a `.codegraph/` index. To find or trace code, call `codegraph_explore` before grep or reading files, and name exact symbols or files (e.g. "walkRoot treeRows rootsOf"), not a sentence. Use it for "where is X", "who calls X" and "what breaks if I change X". Don't grep to re-check its results.
+This repo has a `.codegraph/` index. To find or trace code, call `mcp__codegraph__codegraph_explore` (the full name; the short `codegraph_explore` does not exist in a session, and a deferred tool must be loaded first with ToolSearch `select:mcp__codegraph__codegraph_explore`) before grep or reading files, and name exact symbols or files (e.g. "walkRoot treeRows rootsOf"), not a sentence. Use it for "where is X", "who calls X" and "what breaks if I change X". Don't grep to re-check its results.
