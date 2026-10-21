@@ -32,6 +32,12 @@ export const pendingPlanPrompt = (f: { note: string }): { kind: 'pause' | 'play'
   return { kind, text: rest.slice(sep + 2) }
 }
 
+/** The note a Plan prompt waits in, behind the proposal on show (R-23). */
+export const planPromptNote = (kind: 'pause' | 'play', text: string): string => `${PLAN_PROMPT_NOTE}${kind}: ${text}`
+
+/** The note a flow keeps: a Plan prompt that waits stays put, whatever else the note said (R-23). */
+export const keepPlanPrompt = (note: string, next: string): string => (pendingPlanPrompt({ note }) == null ? next : note)
+
 // ── the Run Wizard card's shared words ───────────────────────────────────────────
 // The footer card and the Improve tab draw the same card, so its heads, its counted answers and
 // its waiting Plan prompt live here and both surfaces read them from one place.

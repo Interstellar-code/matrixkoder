@@ -7,9 +7,13 @@
 // turns into the state writes and model calls.
 import type { Elements, RenderElement } from 'claude-code'
 import type { MkImproveEntry, MkImproveFlow } from '../../types'
-import { IMPROVE_FAILED, bigDigits, bigNumber, canAccept, clip, finalText, modeOf, wordCount, wrap } from '../improve-core'
+import {
+  CARD_HEAD, IMPROVE_FILL_FAILED, NO_QUESTION_NOTE, PLAN_PROMPT_CHIP, PLAN_PROMPT_HEADING, WIZARD_ANSWERS_UNUSED, WIZARD_NOTE,
+  answeredCount, answeredLabel, canAccept, clip, finalText, improveError,
+  isPlanProposal, modeOf, pendingPlanPrompt, planPromptLine, wordCount, wrap, workingText,
+} from '../improve-core'
 import { IMPROVE_FIXTURE } from './improve.fixture'
-import { ActionButton, Card, Chip, Section } from './kit'
+import { ActionButton, Card, Chip } from './kit'
 import { PALETTE, ROLE } from './palette'
 
 type Els = Elements[keyof Elements]
@@ -24,6 +28,8 @@ export type ImproveKind =
   // a ready-made prompt from the Plan tab's Play/Pause buttons: `a` is the text, `b` = 'pause'
   // shows it as the finished proposal (no model call)
   | 'seed'
+  // a Plan prompt parked behind the proposal: open it as the proposal (R-23)
+  | 'plan-prompt'
 
 export type ImproveUi = {
   improveAct?(kind: ImproveKind, a?: string | number, b?: string): void
@@ -128,48 +134,72 @@ export function field(els: Els, props: { key: string; value: string; placeholder
   return <Input {...props} />
 }
 
-/** The wizard's questions (up to three, 2-4 options each, plus Other and Skip), the answered count
- *  and the go button. One drawing for the footer card and the tab. */
+/** The wizard's questions (up to three, 2-4 options each, plus Other and Skip) and the go
+ *  button. One drawing for the footer card and the tab: the marker is a chip, the options sit
+ *  four cells in, and a Skip is not an answer (the count lives in the head, `answeredLabel`). */
 export function questions(els: Els, f: MkImproveFlow, w: number, act: (kind: ImproveKind, a?: string | number, b?: string) => void, p: string): RenderElement {
   const { Box, Text } = els
   const total = f.questions.length
-  const done = Object.keys(f.answers).length
-  const all = done === total
+  const all = answeredCount(f) === total
+  const inner = Math.max(4, w - 4) // the options sit four cells in from the card's edge
   return (
     <Box flexDirection="column" gap={1}>
       {f.questions.map((q, i) => {
         const a = f.answers[String(i)]
+        const open = f.other === i
         const opts: ChipSpec[] = q.options.map((o, j) => {
           const picked = a?.kind === 'option' && a.text === o
-          return { key: `${p}-q${String(i)}o${String(j)}`, label: picked ? `✓ ${clip(o, w - 6)}` : clip(o, w - 4), tone: picked ? 'on' : 'soft', onPress: () => act('answer', i, o) }
+          return { key: `${p}-q${String(i)}o${String(j)}`, label: picked ? `✓ ${clip(o, inner - 6)}` : clip(o, inner - 4), tone: picked ? 'on' : 'soft', onPress: () => act('answer', i, o) }
         })
         opts.push({
-          key: `${p}-q${String(i)}other`, tone: a?.kind === 'other' ? 'on' : 'soft', onPress: () => act('other', i),
-          label: a?.kind === 'other' ? `✓ Other: ${clip(a.text, Math.max(4, Math.min(24, w - 14)))}` : 'Other (type it)',
+          // the Other chip is picked while its field is open, and once it carries an answer (R-9)
+          key: `${p}-q${String(i)}other`, tone: a?.kind === 'other' || open ? 'on' : 'soft', onPress: () => act('other', i),
+          label: a?.kind === 'other' ? `✓ Other: ${clip(a.text, Math.max(4, Math.min(24, inner - 14)))}` : 'Other (type it)',
         })
         opts.push({ key: `${p}-q${String(i)}skip`, label: a?.kind === 'skip' ? 'skipped' : 'Skip', tone: 'dim', onPress: () => act('skip', i) })
-        const box = f.other === i
+        const box = open
           ? field(els, { key: `improve-other-${String(i)}`, autoFocus: true, placeholder: 'Type your answer', submitLabel: 'save', value: f.otherDraft, onInput: v => act('other-draft', i, v), onSubmit: v => act('other-save', i, v) })
           : null
+        const qlines = wrap(q.question, Math.max(4, w - 4))
         return (
           <Box key={`${p}-q${String(i)}`} flexDirection="column">
-            {wrap(q.question, w - 2).map((ln, j) => (
-              <Text key={`${p}-q${String(i)}l${String(j)}`} bold={true} wrap="truncate-end">{`${j === 0 ? (a ? '✓' : String(i + 1)) : ' '} ${clean(ln)}`}</Text>
+            <Box flexDirection="row" gap={1}>
+              {Chip(els, { label: a != null ? '✓' : String(i + 1), role: a != null ? 'live' : 'idle', solid: a != null })}
+              <Text wrap="truncate-end">{clean(qlines[0] ?? '')}</Text>
+            </Box>
+            {qlines.slice(1).map((ln, j) => (
+              <Box key={`${p}-q${String(i)}l${String(j)}`} paddingLeft={4}>
+                <Text wrap="truncate-end">{clean(ln)}</Text>
+              </Box>
             ))}
-            <Box flexDirection="column" paddingLeft={2}>
-              {chipRows(els, opts, w - 2, `${p}-q${String(i)}`)}
+            <Box flexDirection="column" paddingLeft={4}>
+              {chipRows(els, opts, inner, `${p}-q${String(i)}`)}
               {box}
+              {box != null && <Text dimColor={true}>{'↵ save'}</Text>}
             </Box>
           </Box>
         )
       })}
-      <Text dimColor={true}>{`${String(done)} of ${String(total)} answered`}</Text>
       {chipRows(els, [
         { key: `${p}-upgrade`, label: all ? 'Upgrade now' : 'Skip the rest, upgrade now', tone: all ? 'solid' : 'soft', onPress: () => act('go') },
         { key: `${p}-discard`, label: 'Discard', tone: 'dim', onPress: () => act('discard') },
       ], w, `${p}-ask`)}
     </Box>
   )
+}
+
+/** A Plan prompt (the Plan tab's Play or Pause press) on show: where it came from, and the text
+ *  without the heading line it carries (R-6, R-24). A ready-made prompt is the proposal itself;
+ *  a rewritten one shows what came before it too. */
+function planProposal(f: MkImproveFlow): { label: string; text: string; ready: boolean } {
+  const full = finalText(f)
+  const ready = f.upgraded === f.original // the ready-made prompt, not a rewrite of it
+  const text = ready && full.startsWith(PLAN_PROMPT_HEADING) ? full.slice(PLAN_PROMPT_HEADING.length).replace(/^\n/, '') : full
+  const body = f.original.split('\n').slice(1).join('\n')
+  const label = /^Pause (phase|task)/.test(body) ? 'from Plan · Pause'
+    : /^(Start|Continue|Resume) (phase|task)/.test(body) ? 'from Plan · Play'
+    : 'from Plan'
+  return { label, text, ready }
 }
 
 /** The proposal's card in the footer, by step. */
@@ -208,28 +238,48 @@ function footerCard(els: Els, f: MkImproveFlow, cols: number, act: (kind: Improv
         {chipRows(els, [discard], w, 'improve-f-doing')}
       </Box>
     )
-  } else if (f.step === 'review') {
+  } else if (f.step === 'review' && isPlanProposal(f)) {
+    // a Plan prompt: its text once, no word count, no wizard (R-6, R-24)
+    const plan = planProposal(f)
     body = (
       <Box flexDirection="column">
-        {head('✦ IMPROVED PROMPT', countsLabel(wordCount(f.original), wordCount(finalText(f)), w - 18))}
-        {lines(els, 'improve-f-was', f.original, w, 2, { dimColor: true, strikethrough: true })}
-        {lines(els, 'improve-f-new', finalText(f), w, 10, { color: PALETTE.fg })}
-        {f.note !== '' && <Text dimColor={true} wrap="truncate-end">{f.note}</Text>}
+        {head(CARD_HEAD.plan, plan.label)}
+        {!plan.ready && lines(els, 'improve-f-was', f.original, w, 2, { dimColor: true, strikethrough: true })}
+        {lines(els, 'improve-f-new', plan.text, w, 10, { color: PALETTE.fg })}
+        {plan.ready && <Text dimColor={true} wrap="truncate-end">{PLAN_PROMPT_HEADING}</Text>}
         {chipRows(els, [
           { key: 'improve-f-accept', label: '↵ Accept', tone: 'solid', onPress: () => act('accept') },
-          { key: 'improve-f-wizard', label: 'Run Wizard', tone: 'soft', onPress: () => act('wizard') },
+          discard,
+        ], w, 'improve-f-review')}
+      </Box>
+    )
+  } else if (f.step === 'review') {
+    // the wizard already said no question would help: the card offers no wizard again
+    const wizard = f.note !== NO_QUESTION_NOTE
+    // a Plan prompt waiting behind the proposal is drawn under the card, not inside it
+    const planNote = pendingPlanPrompt(f) != null
+    body = (
+      <Box flexDirection="column">
+        {head(CARD_HEAD.proposal, countsLabel(wordCount(f.original), wordCount(finalText(f)), w - 18))}
+        {lines(els, 'improve-f-was', f.original, w, 2, { dimColor: true, strikethrough: true })}
+        {lines(els, 'improve-f-new', finalText(f), w, 10, { color: PALETTE.fg })}
+        {f.note !== '' && !planNote && <Text dimColor={true} wrap="truncate-end">{f.note}</Text>}
+        {chipRows(els, [
+          { key: 'improve-f-accept', label: '↵ Accept', tone: 'solid', onPress: () => act('accept') },
+          ...(wizard ? [{ key: 'improve-f-wizard', label: 'Run Wizard', tone: 'soft' as const, onPress: () => act('wizard') }] : []),
           discard,
         ], w, 'improve-f-review')}
       </Box>
     )
   } else if (f.step === 'questions') {
-    body = <Box flexDirection="column">{head('✦ WIZARD')}{questions(els, f, w, act, 'improve-f')}</Box>
+    body = <Box flexDirection="column">{head(CARD_HEAD.wizard, answeredLabel(f))}{questions(els, f, w, act, 'improve-f')}</Box>
   } else if (f.step === 'error') {
     body = (
       <Box flexDirection="column">
-        {head(mode === 'improve' ? '✦ IMPROVE' : DRAFT_WORDS[mode].short)}
+        {head(mode === 'improve' ? CARD_HEAD.improve : DRAFT_WORDS[mode].short)}
         {canAccept(f) && lines(els, 'improve-f-prev', finalText(f), w, 4, { color: PALETTE.fg })}
-        {lines(els, 'improve-f-err', f.error || IMPROVE_FAILED, w, 3, { color: ROLE.warn.fg })}
+        {lines(els, 'improve-f-err', improveError(f), w, 3, { color: ROLE.warn.fg })}
+        {wizardUnusedNote(f) !== '' && lines(els, 'improve-f-note', wizardUnusedNote(f), w, 2, { dimColor: true })}
         {chipRows(els, [
           { key: 'improve-f-retry', label: 'Try again', tone: 'solid', onPress: () => act('retry') },
           ...(canAccept(f) ? [{ key: 'improve-f-accept', label: '↵ Accept', tone: 'soft' as const, onPress: () => act('accept') }] : []),
@@ -238,10 +288,12 @@ function footerCard(els: Els, f: MkImproveFlow, cols: number, act: (kind: Improv
       </Box>
     )
   } else {
+    // the working card: the head and the lines the shared words name (R-13)
+    const wt = workingText(f)
     body = (
       <Box flexDirection="column">
-        {head('✦ IMPROVING')}
-        {lines(els, 'improve-f-doing', f.step === 'asking' ? 'Reading your prompt and working out what to ask…' : 'Writing the new prompt…', w, 2, { dimColor: true })}
+        {head(wt.head)}
+        {wt.lines.map((ln, i) => <Text key={`improve-f-doing${String(i)}`} dimColor={true} wrap="truncate-end">{ln}</Text>)}
         {chipRows(els, [discard], w, 'improve-f-doing')}
       </Box>
     )
@@ -252,10 +304,71 @@ function footerCard(els: Els, f: MkImproveFlow, cols: number, act: (kind: Improv
 /** A dashed, empty tool slot (the design's two `+ tool` placeholders); not a press. */
 const SLOT = '┊ + tool ┊'
 
+/** One piece of the hint row: the words, and the press that carries them. */
+export type HintSeg = { text: string; press?: () => void }
+
+/** The note a failed wizard rewrite carries under its calm line: the answers the person gave were
+ *  not used, and the earlier rewrite is still on show (R-5). The flow says so by itself — the
+ *  rewrite failed while the wizard's questions were still on it — so no extra state is kept. */
+export const wizardUnusedNote = (f: MkImproveFlow): string =>
+  f.step === 'error' && f.failedStep === 'rewrite' && f.questions.length > 0 ? WIZARD_ANSWERS_UNUSED : ''
+
+/** The hint row under the chips: what the keys do, per state. The esc part is pressable — the
+ *  pane's pressable line, the way plantask.tsx draws `esc close` (R-10); no global key handler.
+ *  Null when the state has no hint (the draft states have no slide). */
+export function improveHint(f: MkImproveFlow, act: (kind: ImproveKind, a?: string | number, b?: string) => void): HintSeg[] | null {
+  if (modeOf(f) !== 'improve') return null
+  if (f.step === 'review') {
+    if (isPlanProposal(f) || f.note === NO_QUESTION_NOTE || f.note === IMPROVE_FILL_FAILED) {
+      return [{ text: '↵ accept', press: () => act('accept') }, { text: 'esc discard', press: () => act('discard') }]
+    }
+    if (f.note.startsWith(WIZARD_NOTE)) {
+      return [{ text: '↵ accept', press: () => act('accept') }, { text: 'w wizard again', press: () => act('wizard') }]
+    }
+    return [
+      { text: '↵ accept', press: () => act('accept') },
+      { text: 'w wizard', press: () => act('wizard') },
+      { text: 'esc discard', press: () => act('discard') },
+    ]
+  }
+  if (f.step === 'questions') {
+    if (f.other != null) {
+      const i = f.other
+      return [
+        { text: '↵ save', press: () => act('other-save', i, f.otherDraft) },
+        { text: 'esc close the box', press: () => act('other-save', i, '') },
+      ]
+    }
+    if (answeredCount(f) === f.questions.length) return [{ text: '↵ upgrade now', press: () => act('go') }]
+    return [{ text: 'answer or Skip each question' }]
+  }
+  if (f.step === 'error') {
+    return [{ text: '↵ try again', press: () => act('retry') }, { text: 'esc discard', press: () => act('discard') }]
+  }
+  return [{ text: 'esc discard', press: () => act('discard') }]
+}
+
+/** The hint row as it is drawn: the words, the esc part pressable, the pieces joined by `·`. */
+function hintRow(els: Els, segs: readonly HintSeg[], key: string): RenderElement {
+  const { Box, Text } = els
+  return (
+    <Box flexDirection="row" gap={1} paddingX={1}>
+      {segs.map((s, i) => (
+        <Box key={`${key}-seg${String(i)}`} flexDirection="row" gap={1}>
+          {i > 0 && <Text dimColor={true}>{'·'}</Text>}
+          {s.press == null
+            ? <Text dimColor={true} wrap="truncate-end">{s.text}</Text>
+            : ActionButton(els, { key: `${key}-${String(i)}`, glyph: s.text, word: '', plain: true, tone: 'quiet', onPress: s.press })}
+        </Box>
+      ))}
+    </Box>
+  )
+}
+
 /**
  * The pane footer's rows, above the counts: the proposal card (`card` false on the Improve tab,
- * which draws the same proposal in full) and the chip row. Improve reads and writes Claude Code's
- * own prompt line, so the footer draws no field of its own; the chip row never wraps.
+ * which draws the same proposal in full), the chip row and the hint row. Improve reads and writes
+ * Claude Code's own prompt line, so the footer draws no field of its own; the chip row never wraps.
  */
 export function ImproveFooter(els: Els, view: ImproveView, cols: number, ui: ImproveUi, card = true, chips = true): RenderElement {
   const { Box, Text } = els
@@ -273,9 +386,27 @@ export function ImproveFooter(els: Els, view: ImproveView, cols: number, ui: Imp
     used += 1 + SLOT.length
     slots.push(SLOT)
   }
+  // The hint row belongs to the footer block that draws the card: the pinned strip (card false)
+  // and the Improve tab draw none, so their row counts do not move.
+  const hint = !card
+    ? null
+    : view.flow != null
+      ? improveHint(view.flow, act)
+      : open
+        ? [{ text: '↑↓ pick' }, { text: '↵ run', press: () => act('improve') }, { text: 'esc close', press: () => act('menu') }]
+        : null
+  const plan = view.flow != null ? planPromptLine(view.flow) : ''
+  // a Plan prompt parked behind the proposal: the chip opens it (R-23)
+  const planChip: ChipSpec = { key: 'improve-f-plan', label: PLAN_PROMPT_CHIP, tone: 'soft', onPress: () => act('plan-prompt') }
   return (
     <Box flexDirection="column">
       {card && view.flow != null && footerCard(els, view.flow, cols, act)}
+      {card && plan !== '' && (
+        <Box flexDirection="row" gap={1} paddingX={1}>
+          {chipBtn(els, planChip)}
+          <Text dimColor={true} wrap="truncate-end">{clip(plan, Math.max(4, w - chipW(planChip) - 1))}</Text>
+        </Box>
+      )}
       {chips && open && MENU.map(([key, label, what]) => (
         <Box key={`${key}-row`} flexDirection="row" gap={1} paddingX={1}>
           {chipBtn(els, { key, label, tone: 'soft', onPress: () => (key === 'improve-f-m-improve' ? act('improve') : act('compose', key === 'improve-f-m-answer' ? 'answer' : 'question')) })}
@@ -289,6 +420,7 @@ export function ImproveFooter(els: Els, view: ImproveView, cols: number, ui: Imp
           {slots.map((s, i) => <Text key={`improve-slot${String(i)}`} color={PALETTE.edge}>{s}</Text>)}
         </Box>
       )}
+      {card && hint != null && hintRow(els, hint, 'improve-f-hint')}
     </Box>
   )
 }
