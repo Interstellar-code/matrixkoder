@@ -2,14 +2,14 @@
 // Checkout v2 timeline (MOCK row, header, rows, footer) and hides Old; at 36
 // cols nothing drawn is wider than the pane. The cap probe calls the real
 // EventsTab directly with a minimal element table — the pane only ever hands
-// the tab the 12-row fixture, so a longer view reaches the render only this
+// the tab the 22-row fixture, so a longer view reaches the render only this
 // way ($.ui.resolve is not available to a plain test).
 import { test, expect } from 'claude-code/testing'
 import type {
   BoxProps, ElementChildren, Elements, RenderChildren, RenderElement, RenderNode, TextProps,
 } from 'claude-code'
 import { mockFs, mockWorld, paneProps, sessionStart, worldFiles, worldFixtures } from './../testkit'
-import { EVENTS_MAX, EventsTab, eventsView, eventsViewOf } from './events'
+import { EVENTS_MAX, EventsTab, INBOXK, SHORT, TYPE_ROLE, eventsView, eventsViewOf } from './events'
 import type { EventItem } from './events'
 import { MATRIX, PALETTE, ROLE, withTheme } from './palette'
 import { EVENT_FULL_MAX, fullOf } from './../dashboard'
@@ -164,7 +164,7 @@ test('the Events tab draws the Checkout v2 timeline over its fixture', { plugins
   const texts = textOwn(EventsTab(els, eventsView(), 46))
   expect(texts.some(t => /MOCK · fixture data · not this run/.test(t)), 'first row, always').toBe(true)
   expect(texts.some(t => /EVENTS/i.test(t))).toBe(true) // the Card's Section header
-  expect(texts.some(t => /last 12/.test(t))).toBe(true) // the Section's right side
+  expect(texts.some(t => /last 22/.test(t))).toBe(true) // the Section's right side: 12 bus and run rows and the 10 inbox rows
   expect(texts.some(t => /P5 r2 sent to opencode glm/.test(t))).toBe(true) // 17:44 row (clipped to the card's width)
   expect(texts.some(t => /worktrees p4 p5 p6 p7/.test(t))).toBe(true) // 17:35 row (its head: the row is clipped with … at 46)
   expect(texts.some(t => /24 earlier events/.test(t))).toBe(true) // the footer row
@@ -566,5 +566,161 @@ test('the ticks legend joins the count row only when the whole of it fits beside
     const { pressEls, ui } = pressable()
     const tree = EventsTab(pressEls, eventsViewOf(DETAIL_EVENTS), cols, ui)
     expect(footerRow(tree), `the footer at ${cols}`).toEqual(['↵ open', cols < 56 ? 'j k' : 'j k /'])
+  }
+})
+
+// ---------- EVT.2: the inbox source (plan inbox-and-parsing, C5) ----------
+
+const pressed = new Map<string, () => void>()
+/** the table with a Button that records its press by key and draws its label as a Text */
+const pressEls: Elements['terminal'] = {
+  ...els,
+  Button: (props: Parameters<Elements['terminal']['Button']>[0]): RenderElement => {
+    if (props.key != null && props.onPress != null) pressed.set(props.key, props.onPress as () => void)
+    return { type: 'Text', props: {}, children: [props.label ?? ''] }
+  },
+}
+/** EventsTab over the view with the given view-state, on the recording table; the state map is returned for press checks */
+function drawEvents(state: Record<string, string>, cols = 46, view = eventsView()) {
+  pressed.clear()
+  const map = new Map(Object.entries(state))
+  const ui = { get: (k: string) => map.get(k), set: (k: string, v: string) => { map.set(k, v) } }
+  return { tree: EventsTab(pressEls, view, cols, ui), map }
+}
+const INBOX_IDS = ['i-15', 'i-14', 'i-13', 'i-12', 'i-11', 'i-10', 'i-8', 'i-6', 'i-5', 'i-1']
+const shownIds = (tree: unknown): string[] => [...pressed.keys()].filter(k => k.startsWith('ev-open-')).map(k => k.slice('ev-open-'.length))
+
+test('an inbox row gets the inbox source, never the run source, whatever its type word says', () => {
+  const rows: EventItem[] = [
+    { id: 'a', chan: 'inbox', kind: 'found', t: '10:00', text: 'found a.md' },
+    { id: 'b', chan: 'inbox', type: 'review', kind: 'checked', t: '10:01', text: 'checked a.md' }, // `review` would make a bus row a run row
+    { id: 'c', type: 'review', t: '10:02', text: 'a run row' },
+    { id: 'd', kind: 'ask', t: '10:03', text: 'a bus row' },
+  ]
+  const ids = (source: string): string[] => { const { tree } = drawEvents({ 'events:source': source }, 46, eventsViewOf(rows)); return shownIds(tree) }
+  expect(ids('inbox')).toEqual(['a', 'b'])
+  expect(ids('run')).toEqual(['c'])
+  expect(ids('bus')).toEqual(['d'])
+  expect(ids('all')).toEqual(['a', 'b', 'c', 'd'])
+})
+
+test('the source filter has an Inbox segment next to All, Bus and Run; picking it shows only inbox rows', () => {
+  for (const cols of [36, 40, 46] as const) {
+    const { map } = drawEvents({}, cols)
+    for (const k of ['all', 'bus', 'run', 'inbox']) expect(pressed.has(`ev-src-${k}`), `${k} segment at ${cols}`).toBe(true)
+    pressed.get('ev-src-inbox')?.()
+    expect(map.get('events:source')).toBe('inbox')
+    const all = drawEvents({ 'events:source': 'all' }, cols)
+    expect(shownIds(all.tree)).toEqual(expect.arrayContaining([...INBOX_IDS, 'm-141', 'r-88']))
+    const inbox = drawEvents({ 'events:source': 'inbox' }, cols)
+    expect(shownIds(inbox.tree), `inbox only at ${cols}`).toEqual(INBOX_IDS)
+    expect(shownIds(drawEvents({ 'events:source': 'bus' }, cols).tree).some(id => INBOX_IDS.includes(id))).toBe(false)
+    expect(shownIds(drawEvents({ 'events:source': 'run' }, cols).tree).some(id => INBOX_IDS.includes(id))).toBe(false)
+  }
+  // the segment is drawn "on" when picked
+  const segOn = (source: string): string[] => nodesOf(drawEvents({ 'events:source': source }).tree, 'Text').filter(t => t.props.backgroundColor === ROLE.live.tint).map(textOf)
+  expect(segOn('inbox').length + segOn('all').length).toBeGreaterThan(0)
+})
+
+test('every inbox kind has a chip word in SHORT (or is short itself) and a role in TYPE_ROLE, wide and narrow', () => {
+  expect(INBOXK).toEqual(['found', 'checked', 'import-step', 'imported', 'import-failed', 'archived', 'restored', 'deleted'])
+  for (const k of INBOXK) {
+    const word = SHORT[k] ?? k
+    expect(word.length, `${k} chip word ${word}`).toBeLessThanOrEqual(6)
+    expect(TYPE_ROLE[k], `${k} role`).toBeDefined()
+    expect(TYPE_ROLE[word], `${word} role`).toBeDefined()
+    expect(TYPE_ROLE[word]).toBe(TYPE_ROLE[k])
+  }
+  // drawn: each inbox row's chip carries the role of its kind, in the wide row (kind) and the narrow row (short word)
+  for (const cols of [46, 36] as const) {
+    const { tree } = drawEvents({ 'events:source': 'inbox' }, cols)
+    const rows = nodesOf(tree, 'Box').filter(b => String(b.props.key ?? '').startsWith('ev-row-i-'))
+    expect(rows, `inbox rows at ${cols}`).toHaveLength(INBOX_IDS.length)
+    for (const row of rows) {
+      const kind = eventsView().events.find(e => `ev-row-${String(e.id)}` === row.props.key)?.kind ?? ''
+      const chip = nodesOf(row, 'Text').find(t => Object.values(ROLE).some(r => r.tint === t.props.backgroundColor))
+      const word = cols === 46 ? kind : SHORT[kind] ?? kind
+      expect(textOf(chip).trim(), `${kind} chip at ${cols}`).toBe(word)
+      expect(chip?.props.backgroundColor, `${kind} tint at ${cols}`).toBe(ROLE[TYPE_ROLE[word] ?? 'idle'].tint)
+    }
+  }
+  // a failed import is a problem row: marker and the Problems view
+  const problems = shownIds(drawEvents({ 'events:view': 'problems' }).tree)
+  expect(problems).toContain('i-12')
+  expect(problems.filter(id => id.startsWith('i-'))).toEqual(['i-12'])
+})
+
+test('the kind list applies to inbox rows: the menu lists the inbox kinds and a picked kind filters them', () => {
+  const labels = (state: Record<string, string>): string[] => { const { tree } = drawEvents(state); return nodesOf(tree, 'Text').map(textOf) }
+  const open = labels({ 'events:source': 'inbox', 'events:open': 'kind' })
+  for (const k of INBOXK) expect(open.some(l => l === `[ ] ${k}`), `${k} in the inbox kind menu`).toBe(true)
+  expect(open.some(l => l === '[ ] ask'), 'no bus kinds under the Inbox source').toBe(false)
+  const bus = labels({ 'events:source': 'bus', 'events:open': 'kind' })
+  expect(bus.some(l => l === '[ ] ask') && !bus.some(l => l === '[ ] found')).toBe(true)
+  // the count beside a kind is the inbox rows of it
+  const { tree } = drawEvents({ 'events:source': 'inbox', 'events:open': 'kind' })
+  const rowOf = (k: string) => nodesOf(tree, 'Box').find(b => nodesOf(b, 'Text').some(t => textOf(t) === `[ ] ${k}`) && nodesOf(b, 'Text').length === 2)
+  expect(nodesOf(rowOf('import-step'), 'Text').map(textOf)).toEqual(['[ ] import-step', '2'])
+  // a picked inbox kind keeps only the rows of that kind; with the Inbox source and with All
+  expect(shownIds(drawEvents({ 'events:source': 'inbox', 'events:kinds': 'deleted' }).tree)).toEqual(['i-15'])
+  expect(shownIds(drawEvents({ 'events:source': 'inbox', 'events:kinds': 'found,imported' }).tree)).toEqual(['i-10', 'i-5', 'i-1'])
+  const mixed = shownIds(drawEvents({ 'events:source': 'all', 'events:kinds': 'deleted' }).tree)
+  expect(mixed.filter(id => id.startsWith('i-'))).toEqual(['i-15'])
+  // a bus kind picked on the way in does not hide the inbox rows
+  expect(shownIds(drawEvents({ 'events:source': 'inbox', 'events:kinds': 'ask' }).tree)).toEqual(INBOX_IDS)
+  // and an inbox kind picked does not hide the bus rows
+  expect(shownIds(drawEvents({ 'events:source': 'bus', 'events:kinds': 'deleted' }).tree)).toEqual(expect.arrayContaining(['m-141', 'm-140']))
+})
+
+test('the detail card of an inbox row shows the file name and the plan id', () => {
+  for (const cols of [46, 36] as const) {
+    const { tree } = drawEvents({ 'events:detail': 'i-10' }, cols)
+    const flat = textOwn(tree).join('\n')
+    expect(flat).toContain('plan-inbox-and-parsing.md')
+    expect(flat).toContain('plan-inbox-and-parsing')
+    expect(textOwn(tree)).toEqual(expect.arrayContaining(['file', 'plan', 'fit', 'source', 'inbox', 'template']))
+    expect(flat).not.toContain('ack') // an inbox row has no ack line
+    expect(flat).not.toContain('undefined')
+  }
+})
+
+/** rowWidths without the rows that hold a wrapping Text (the detail card's body and values): the engine wraps those inside the card */
+function fixedRowWidths(root: unknown): { width: number; inCard: boolean }[] {
+  const out: { width: number; inCard: boolean }[] = []
+  const wraps = (n: unknown): boolean => {
+    if (typeof n !== 'object' || n === null) return false
+    const c = n as { type?: string; props?: Record<string, unknown>; children?: unknown[] }
+    return (c.type === 'Text' && c.props?.wrap === 'wrap') || (c.children ?? []).some(wraps)
+  }
+  const walk = (node: unknown, inCard: boolean): void => {
+    if (typeof node !== 'object' || node === null) return
+    const n = node as DrawnNode
+    const card = inCard || (n.type === 'Box' && n.props?.borderStyle === 'round')
+    if ((n.type === 'Text' || (n.type === 'Box' && n.props?.flexDirection === 'row')) && !wraps(node)) out.push({ width: widthOf(node), inCard: card })
+    for (const c of n.children ?? []) walk(c, card)
+  }
+  walk(root, false)
+  return out
+}
+
+test('the Inbox filter keeps every drawn row within the pane at 36, 40 and 46 columns', () => {
+  const states: Record<string, string>[] = [
+    { 'events:source': 'inbox' },
+    { 'events:source': 'all' },
+    { 'events:source': 'inbox', 'events:open': 'kind' },
+    { 'events:source': 'inbox', 'events:kinds': 'import-failed,archived,deleted' },
+    { 'events:source': 'inbox', 'events:detail': 'i-12' },
+    { 'events:source': 'inbox', 'events:detail': 'i-15' },
+  ]
+  for (const cols of [36, 40, 46] as const) {
+    for (const state of states) {
+      const { tree } = drawEvents(state, cols)
+      const wide = fixedRowWidths(tree).filter(w => (w.inCard ? w.width > cols - 4 : w.width > cols))
+      expect(wide, `over-wide rows at ${cols} cols with ${JSON.stringify(state)}: ${JSON.stringify(wide)}`).toEqual([])
+      expect(fixedRowWidths(tree).length).toBeGreaterThan(0)
+    }
+    // all four source segments are drawn, one row or two
+    const srcTexts = textOwn(drawEvents({ 'events:source': 'inbox' }, cols).tree)
+    for (const l of ['All', 'Bus', 'Run', 'Inbox']) expect(srcTexts, `${l} at ${cols}`).toContain(l)
   }
 })

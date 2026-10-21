@@ -60,6 +60,24 @@ The lane bus token file lives outside the lane at `<home>/bus/lanes/<sha256(real
 
 The bus itself rings an idle lane through herdr, outside this plugin's events. An `info`, a `nudge`, or an `answer` with no waiter (no `reply_to`) addressed to a lane is queued in `<home>/bus/ring-queue.json`; the ring worker lists agents with `herdr agent list` and, only while the lane's `agent_status` is `idle`, types the fixed line `Run: python3 <skill>/scripts/mk-builder.py inbox` with `herdr agent prompt`. A working lane stays queued and is rung once idle (drain every 5 s, `MK_BUS_RING_INTERVAL_SEC`); one ring per message id, recorded as an event `chan=bus kind=ring`; queued rings survive a bus restart (a typed ring is never typed again); a row older than one hour is dropped. A solicited answer (`reply_to` an ask) is not rung: the lane's `ask`/`wait` is blocked on it. A lane that wants pushed notes between steps runs `mk-builder.py listen` itself. `mk-wake.py ring --lane DIR --text TEXT` (and `probe --lane DIR`) is the separate OpenCode background-server doorbell; the bus does not call it. A lane whose herdr status is `done` is rung like an `idle` one; other states are not rung. The ring runs `herdr agent prompt` with stdout/stderr to DEVNULL: a bus started by `ensure` has a dead stdout pipe and the old ring died of SIGPIPE (exit -13), leaving `ring-failed` events with `herdr prompt failed`. `nudge` is accepted (file mode, which refused it, is dropped).
 
+## Events channels and the inbox channel
+
+The project store's `events` table has one row per event; `chan` says who wrote it: `state` (mk-state transitions and notes, the only channel the orchestrator wake reads), `bus`, `note`, and `inbox`. Every channel but `inbox` belongs to a run and refuses a missing run.
+
+`chan = inbox` (plan inbox-and-parsing, C5) records what happens to the plan files in `<home>/inbox/`. It is project-wide: `run` and `task` are NULL, and `mkdb.append_event` accepts a NULL run for this channel only. `scripts/mk-inbox.py` writes it, best effort (a failed write never fails the action; the reply carries a `warnings` entry); read it with `mkdb.py events --chan inbox --json` (no `--run`; `--since N` is the events.id cursor).
+
+| kind | written by | when |
+|---|---|---|
+| `found` | `list` | once per file never seen before (same file name and plan id) |
+| `checked` | `list` | when a file's class (fit, sections found, missing names) differs from its last `checked` row, so repeated `list` calls add nothing |
+| `import-step` | `import` | each of the three steps (1 Parse the template, 2 Write the project, 3 Write the tasks); `meta` has `step` and `of` |
+| `imported` | `import` | the plan is in the store |
+| `import-failed` | `import` | a step failed; `meta` has `step` and `reason`, and nothing was written to the store |
+| `archived`, `restored` | `archive`, `restore` | the file moved to or from `inbox/archive/` |
+| `deleted` | `delete` | after the copy in `inbox/.deleted/` was verified; `meta.copy` names it |
+
+`meta_json` is `{file, plan, fit, by}` plus the kind's own keys; `by` is the caller (`--by`, default `user`) and `from_id` carries it too. An inbox row never wakes the orchestrator: `hooks/wake.ts` reads `mkdb.py events --run <run>` with the default `state` channel, and an inbox row has no run. The Events tab draws these rows under its Inbox source.
+
 ## Watch-file schema (`<lane>/.matrixkoder-watch.json`)
 
 | Key | Meaning |
