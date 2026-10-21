@@ -4,11 +4,11 @@
 // (the question list, the chip rows, the wrapped text) live in improve.tsx, next to the footer
 // card they serve. A pure render (C10): no $, no state reads.
 import type { Elements, RenderElement } from 'claude-code'
-import { bigDigits, bigNumber, canAccept, clip, finalText, modeOf, wordCount, IMPROVE_FAILED } from '../improve-core'
+import { answeredLabel, bigDigits, bigNumber, CARD_HEAD, canAccept, clip, finalText, improveError, modeOf, pendingPlanPrompt, PLAN_PROMPT_CHIP, planPromptLine, wordCount, workingText } from '../improve-core'
 import { ActionButton, Card, Section } from './kit'
 import { PALETTE, ROLE } from './palette'
 import type { ChipSpec, ImproveKind, ImproveUi, ImproveView } from './improve'
-import { DRAFT_WORDS, chipRows, clean, field, lines, questions } from './improve'
+import { DRAFT_WORDS, chipRows, clean, field, lines, questions, wizardUnusedNote } from './improve'
 
 type Els = Elements[keyof Elements]
 
@@ -26,6 +26,13 @@ export function ImproveTab(els: Els, view: ImproveView, cols: number, ui: Improv
   const f = view.flow
   const w = Math.max(1, cols - 4) // a Card's content width
   const discard: ChipSpec = { key: 'improve-t-discard', label: 'Discard', tone: 'dim', onPress: () => act('discard') }
+  /** the card's head row: the head on the left, the count beside it on the right (the footer's head) */
+  const head = (left: string, right?: string): RenderElement => (
+    <Box flexDirection="row" justifyContent="space-between">
+      <Text bold={true} color={ROLE.live.fg}>{left}</Text>
+      {right != null && <Text dimColor={true}>{right}</Text>}
+    </Box>
+  )
   const status = f == null ? '' : f.step === 'review' ? 'proposal ready' : f.step === 'questions' ? 'questions' : f.step === 'error' ? 'could not improve' : 'working'
 
   let body: RenderElement
@@ -58,7 +65,8 @@ export function ImproveTab(els: Els, view: ImproveView, cols: number, ui: Improv
     const tw = Math.floor((cols - 2) / 3)
     const widths = [tw, tw, cols - 2 - 2 * tw]
     const longs = ['words before', 'words after', 'details added']
-    const isLong = widths.every((tileW, i) => tileW - 2 >= (longs[i] ?? '').length)
+    // the slide's tiles read `before` / `after` / `added`; the long labels need a wide pane
+    const isLong = cols >= 60 && widths.every((tileW, i) => tileW - 2 >= (longs[i] ?? '').length)
     const tile = (i: number, n: number, color: string): RenderElement => {
       const tileW = widths[i] ?? tw
       const inner = tileW - 2
@@ -104,9 +112,11 @@ export function ImproveTab(els: Els, view: ImproveView, cols: number, ui: Improv
                 ]),
             { key: 'improve-t-edit', label: f.isEditing ? 'Stop editing' : 'Edit', tone: 'soft', onPress: () => act('edit') },
             { key: 'improve-t-copy', label: 'Copy', tone: 'soft', onPress: () => act('copy') },
+            ...(pendingPlanPrompt(f) == null ? [] : [{ key: 'improve-t-plan', label: PLAN_PROMPT_CHIP, tone: 'soft' as const, onPress: () => act('plan-prompt') }]),
             discard,
           ], cols, 'improve-t-btns')}
-          {f.note !== '' && <Text dimColor={true} wrap="truncate-end">{f.note}</Text>}
+          {f.note !== '' && pendingPlanPrompt(f) == null && <Text dimColor={true} wrap="truncate-end">{f.note}</Text>}
+          {planPromptLine(f) !== '' && <Text dimColor={true} wrap="truncate-end">{planPromptLine(f)}</Text>}
         </Box>
         <Box flexDirection="column">
           {Section(els, { label: 'What I added' })}
@@ -135,12 +145,20 @@ export function ImproveTab(els: Els, view: ImproveView, cols: number, ui: Improv
       </Box>
     )
   } else if (f.step === 'questions') {
-    body = Card(els, {}, <Box flexDirection="column">{lines(els, 'improve-t-qh', 'A few quick questions', w, 1, { bold: true, color: ROLE.live.fg })}{questions(els, f, w, act, 'improve-t')}</Box>)
+    // the wizard's head is the footer's head: `✦ WIZARD` with the answered count beside it (R-7, R-8)
+    body = Card(els, {}, (
+      <Box flexDirection="column">
+        {head(CARD_HEAD.wizard, answeredLabel(f))}
+        {questions(els, f, w, act, 'improve-t')}
+      </Box>
+    ))
   } else if (f.step === 'error') {
     body = Card(els, {}, (
       <Box flexDirection="column">
+        {head(modeOf(f) === 'improve' ? CARD_HEAD.improve : DRAFT_WORDS[modeOf(f) as 'answer' | 'question'].short)}
         {canAccept(f) && lines(els, 'improve-t-prev', finalText(f), w, 8, { color: PALETTE.fg })}
-        {lines(els, 'improve-t-err', f.error || IMPROVE_FAILED, w, 3, { color: ROLE.warn.fg })}
+        {lines(els, 'improve-t-err', improveError(f), w, 3, { color: ROLE.warn.fg })}
+        {wizardUnusedNote(f) !== '' && lines(els, 'improve-t-note', wizardUnusedNote(f), w, 2, { dimColor: true })}
         {chipRows(els, [
           { key: 'improve-t-retry', label: 'Try again', tone: 'solid', onPress: () => act('retry') },
           ...(canAccept(f) ? [{ key: 'improve-t-accept', label: '↵ Accept', tone: 'soft' as const, onPress: () => act('accept') }] : []),
@@ -149,10 +167,13 @@ export function ImproveTab(els: Els, view: ImproveView, cols: number, ui: Improv
       </Box>
     ))
   } else {
+    // the working card: the same head and the same lines the footer card shows (R-8, R-13)
+    const draft = modeOf(f) !== 'improve'
+    const wt = draft ? { head: DRAFT_WORDS[modeOf(f) as 'answer' | 'question'].short, lines: [DRAFT_WORDS[modeOf(f) as 'answer' | 'question'].doing] } : workingText(f)
     body = Card(els, {}, (
       <Box flexDirection="column">
-        {lines(els, 'improve-t-doing', modeOf(f) !== 'improve' ? DRAFT_WORDS[modeOf(f) as 'answer' | 'question'].doing : f.step === 'asking' ? 'Reading your prompt and working out what to ask…' : 'Writing the new prompt…', w, 2, { dimColor: true })}
-        {lines(els, 'improve-t-mine', f.original, w, 4, { dimColor: true, strikethrough: true })}
+        {head(wt.head)}
+        {wt.lines.map((ln, i) => lines(els, `improve-t-doing${String(i)}`, ln, w, 2, { dimColor: true }))}
         {chipRows(els, [discard], w, 'improve-t-doing')}
       </Box>
     ))
