@@ -11,7 +11,7 @@ import { basename, globalDirPath, join, parseJson } from './data'
 import { listedDataDir, paths as mkPaths, projectYamlPath } from './paths'
 import { parsePluginManifest } from './settings-io'
 import {
-  AGENT_NAMES, WIZARD_STEPS, addToGitignore, buildYaml, dataDirOf, EMPTY_DRAFT, emptyDraft, fallbackText, herdrStateOf, installModeOf, mergeModels, parseModels, parseProviders, parseVersion,
+  AGENT_NAMES, WIZARD_STEPS, addToGitignore, buildYaml, dataDirOf, driftOf, EMPTY_DRAFT, emptyDraft, fallbackText, herdrStateOf, installModeOf, mergeModels, parseModels, parseProviders, parseVersion,
   parseWhich, proposeGates, providerChoices, slugOf, yamlNameOf,
 } from './wizard-core'
 import { StepsA, type WizardAct } from './wizard-steps-a'

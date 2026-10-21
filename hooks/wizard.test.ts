@@ -8,7 +8,7 @@ import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import type { MkWizardDraft } from '../types'
 import { NOW, PROJECT_DIR, DATA_DIR, mockFs, paneProps, sessionStart, type Files } from './testkit'
-import { addToGitignore, buildYaml, emptyDraft, herdrStateOf, inline, mergeModels, parseModels, parseProviders, parseWhich, proposeGates, yamlDiff } from './wizard-core'
+import { addToGitignore, buildYaml, driftOf, emptyDraft, herdrStateOf, inline, mergeModels, parseModels, parseProviders, parseWhich, proposeGates, yamlDiff } from './wizard-core'
 import { resetStoreMemo } from './paths'
 
 const HOME = '/home/mk'
@@ -270,6 +270,42 @@ test('B-19: the replace diff is a real line diff, so an insertion marks one row 
   expect(created.changed).toBe(2)
   expect(created.unchanged).toBe(0)
   expect(created.rows.map(r => r.sign)).toEqual(['+', '+'])
+})
+
+test('B-15: driftOf lists a changed gate and an added agent against the file, and nothing when they agree', () => {
+  const d = emptyDraft()
+  d.gates = { install: '', test: 'pnpm exec vitest run', typecheck: 'tsc -p . --noEmit', lint_changed: 'pnpm exec eslint .', format_changed: '' }
+  d.branch = 'main'
+  d.agents = { ...d.agents, codex: { found: true, path: '/bin/codex', enabled: true, models: [] }, agy: { found: true, path: '/bin/agy', enabled: true, models: [] } }
+  const file = [
+    'repo:',
+    '  integration_branch: main',
+    'gates:',
+    '  install: ""',
+    '  test: pnpm test',
+    '  typecheck: tsc -p . --noEmit',
+    '  lint_changed: pnpm exec eslint .',
+    '  format_changed: ""',
+    'agents:',
+    '  codex: { available: true, models: [] }',
+    '  checked_at: "2026-10-08T06:35:23.052Z"',
+    '',
+  ].join('\n')
+  // the test gate changed, agy is found but not in the file; the branch and the other four gates agree
+  expect(driftOf(file, d)).toEqual([
+    { key: 'gates.test', file: 'pnpm test', detected: 'pnpm exec vitest run' },
+    { key: 'agents.agy', file: 'absent', detected: 'enabled' },
+  ])
+  // an unreadable/absent file is no drift at all
+  expect(driftOf(null, d)).toEqual([])
+  expect(driftOf('', d)).toEqual([])
+  // an agent the file lists but detection no longer finds is drift the other way
+  d.agents = { ...d.agents, agy: { found: false, path: null, enabled: false, models: [] } }
+  const fileWithAgy = `${file}  agy: { available: true, models: [] }\n`
+  expect(driftOf(fileWithAgy, d)).toEqual([
+    { key: 'gates.test', file: 'pnpm test', detected: 'pnpm exec vitest run' },
+    { key: 'agents.agy', file: 'listed', detected: 'not found' },
+  ])
 })
 
 test('baselines stay null and gates are marked proposed', () => {

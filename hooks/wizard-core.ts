@@ -547,6 +547,89 @@ export function yamlDiff(oldText: string | null, newText: string): { rows: YamlD
   return { rows, changed, unchanged }
 }
 
+/** One drift line: the key, what the existing file says, and what detection offers instead (B-15). */
+export type DriftItem = { key: string; file: string; detected: string }
+
+/** The five gates, in the emitted order, with the yaml key each one is written under. The display name
+ *  drops the `_changed` suffix the file keeps: the gate runs on changed files, and the line has 46 columns. */
+const DRIFT_GATES: readonly (readonly [keyof MkWizardGates, string])[] = [
+  ['install', 'gates.install'],
+  ['test', 'gates.test'],
+  ['typecheck', 'gates.typecheck'],
+  ['lint_changed', 'gates.lint_changed'],
+  ['format_changed', 'gates.format_changed'],
+]
+
+/** One scalar from a `name: value` line under a top-level block (`repo`, `gates`), or undefined when the
+ *  block or the key is absent. A line-wise scan like parseCarry — no yaml library, never throws. */
+function scalarUnder(text: string, block: string, key: string): string | undefined {
+  let inside = false
+  for (const raw of text.split('\n')) {
+    const line = raw.replace(/\r$/, '')
+    if (line.trim() === '' || line.trim().startsWith('#')) continue
+    if (/^[A-Za-z_][\w-]*:/.test(line)) {
+      inside = line.slice(0, line.indexOf(':')).trim() === block
+      continue
+    }
+    if (!inside) continue
+    const m = /^\s+([A-Za-z_][\w-]*):\s*(.*)$/.exec(line)
+    if (m?.[1] === key) return unquoteScalar(stripYamlComment(m[2] ?? ''))
+  }
+  return undefined
+}
+
+/** The agent names an existing yaml lists under `agents:` (its keys, minus the `checked_at` stamp), or null
+ *  when the file has no `agents:` block at all — an unreadable or older file must not read as "every agent
+ *  removed". */
+function agentsIn(text: string): string[] | null {
+  let inside = false
+  let seen = false
+  const out: string[] = []
+  for (const raw of text.split('\n')) {
+    const line = raw.replace(/\r$/, '')
+    if (line.trim() === '' || line.trim().startsWith('#')) continue
+    if (/^[A-Za-z_][\w-]*:/.test(line)) {
+      inside = line.slice(0, line.indexOf(':')).trim() === 'agents'
+      seen = seen || inside
+      continue
+    }
+    if (!inside) continue
+    const m = /^\s+([A-Za-z_][\w-]*):/.exec(line)
+    if (m?.[1] != null && m[1] !== 'checked_at') out.push(m[1])
+  }
+  return seen ? out : null
+}
+
+/** B-15: what detection now says that the project's own file does not (display only — nothing is written
+ *  and nothing is changed). Compares the five gates, `repo.integration_branch` and the enabled agents.
+ *  An absent existing file is no drift. A gate detected as `''` is "no command" and matches a file that
+ *  says `""` too, so only a real difference is listed. */
+export function driftOf(existingYamlText: string | null | undefined, d: MkWizardDraft): DriftItem[] {
+  if (existingYamlText == null || existingYamlText.trim() === '') return []
+  const out: DriftItem[] = []
+  for (const [key, label] of DRIFT_GATES) {
+    const inFile = scalarUnder(existingYamlText, 'gates', key)
+    if (inFile == null) continue
+    const detected = d.gates[key].trim()
+    // both empty is not a drift; an empty file value against a detected command (or the reverse) is
+    const file = inFile.trim()
+    if (file === detected) continue
+    if (file === '' && detected === '') continue
+    out.push({ key: label, file: file === '' ? '""' : file, detected: detected === '' ? '""' : detected })
+  }
+  const branch = scalarUnder(existingYamlText, 'repo', 'integration_branch')
+  if (branch != null && branch.trim() !== d.branch.trim()) {
+    out.push({ key: 'repo.integration_branch', file: branch.trim() === '' ? '""' : branch.trim(), detected: d.branch.trim() === '' ? '""' : d.branch.trim() })
+  }
+  const inFile = agentsIn(existingYamlText)
+  if (inFile != null) {
+    const on = enabledAgents(d)
+    for (const n of on.filter(x => !inFile.includes(x))) out.push({ key: `agents.${n}`, file: 'absent', detected: 'enabled' })
+    for (const n of inFile.filter(x => !on.includes(x))) out.push({ key: `agents.${n}`, file: 'listed', detected: 'not found' })
+  }
+  return out
+}
+
 /** Text answer for `/mk setup` outside fullscreen: the detected defaults, one command to continue. */
 export function fallbackText(d: MkWizardDraft): string {
   const found = AGENT_NAMES.filter(n => d.agents[n]?.found)

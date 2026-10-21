@@ -14,7 +14,7 @@ import type { MkWizardDraft } from '../types'
 import { ROLE } from './tabs/palette'
 import { Choice, TextField, YesNo, type WizardAct, type WizardEls } from './wizard-steps-a'
 import { Card } from './tabs/kit'
-import { buildYaml, builderOrderOf, dataDirOf, enabledAgents, splitList, yamlDiff, yamlNameOf } from './wizard-core'
+import { buildYaml, builderOrderOf, dataDirOf, driftOf, enabledAgents, splitList, yamlDiff, yamlNameOf } from './wizard-core'
 
 /** A card's bold heading (the slide's `.hd` in the card's title row). */
 function Hd(els: WizardEls, label: string) {
@@ -97,6 +97,11 @@ function Preview(els: WizardEls, title: string, right: string, rows: readonly st
   ))
 }
 
+/** `…`-truncate to `w` cells (the pane's one cut voice; wizard-local like the other tabs'). */
+function clip(text: string, w: number): string {
+  return text.length <= w ? text : `${text.slice(0, Math.max(1, w) - 1)}…`
+}
+
 function Review(els: WizardEls, d: MkWizardDraft, act: WizardAct, oldYaml: string | null, checkedAt: string) {
   const { Box, Text, Select } = els
   const data = dataDirOf(d)
@@ -136,6 +141,9 @@ function Review(els: WizardEls, d: MkWizardDraft, act: WizardAct, oldYaml: strin
   const newText = buildYaml(d, checkedAt, d.existingYaml && d.replace ? oldYaml : null)
   const yamlRows = newText.replace(/\n$/, '').split('\n')
   const diff = d.existingYaml && d.replace ? yamlDiff(oldYaml, newText) : null
+  // B-15: a later run compares detection against the file already on disk (display only: nothing is written).
+  // An unreadable file draws no card at all: "no drift" would claim a comparison that never happened.
+  const drift = d.existingYaml && oldYaml != null ? driftOf(oldYaml, d) : null
   return (
     <Box flexDirection="column" gap={1}>
       {d.phase === 'error' && <Text color={ROLE.err.fg} bold={true}>{`✗ ${d.error ?? 'write failed'}`}</Text>}
@@ -154,6 +162,16 @@ function Review(els: WizardEls, d: MkWizardDraft, act: WizardAct, oldYaml: strin
           )}
           {d.agents.herdr?.found && d.herdrPlugin === 'linked' && Dim(els, 'herdr plugin already linked')}
           <Text>set     4 dashboard prefs (plugin settings)</Text>
+        </Box>
+      ))}
+      {drift != null && Card(els, {}, (
+        <Box flexDirection="column">
+          <Text bold={true}>{drift.length === 0 ? 'no drift' : `drift · ${String(drift.length)}`}</Text>
+          {drift.length === 0
+            ? Dim(els, 'detection agrees with the file on disk')
+            : drift.map(item => (
+              <Text key={`drift-${item.key}`}>{clip(`${item.key}  file ${item.file} · now ${item.detected}`, 42)}</Text>
+            ))}
         </Box>
       ))}
       {d.existingYaml && (
