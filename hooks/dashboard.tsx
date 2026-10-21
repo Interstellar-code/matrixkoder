@@ -35,7 +35,7 @@ import type { LaneData, LanesView } from './tabs/lanes'
 import { OverviewTab, UsageCard } from './tabs/overview'
 import type { OverviewView } from './tabs/overview'
 import { PlanTab } from './tabs/plan'
-import { pausePrompt, phasePrompt, taskDepsMet, taskPrompt } from './tabs/planrun'
+import { improveItemPrompt, pausePrompt, phasePrompt, taskDepsMet, taskPrompt } from './tabs/planrun'
 import type { PlanView } from './tabs/plan'
 import { PlansTab, planActionLine } from './tabs/plans'
 import type { PlansView } from './tabs/plans'
@@ -61,6 +61,8 @@ import { WaitingTab, waitingAsks, waitingView, readPending, askView, runWaitView
 import type { PendingAsk, RunWait } from './tabs/waiting'
 import { projectStoreDir, storeGroups } from './tabs/plans-map'
 import { TodoTab } from './tabs/todo'
+import { InboxTab } from './tabs/inbox'
+import type { InboxActKind, InboxCardState, InboxFile, InboxFilter, InboxView } from './tabs/inbox'
 import { ImproveFooter, ImproveTab } from './tabs/improve'
 import type { ImproveKind, ImproveView } from './tabs/improve'
 import type { TodoFilter, TodoItem, TodoView } from './tabs/todo'
@@ -121,6 +123,7 @@ const TABS: readonly { key: MkDashTab; hotkey: string; label: string }[] = [
   { key: 'files', hotkey: 'f', label: 'Files' },
   { key: 'events', hotkey: 'e', label: 'Events' },
   { key: 'waiting', hotkey: 'w', label: 'Waiting' },
+  { key: 'inbox', hotkey: 'n', label: 'Inbox' },
   { key: 'todo', hotkey: 't', label: 'Todo' },
   { key: 'improve', hotkey: 'i', label: 'Improve' },
   { key: 'settings', hotkey: '9', label: 'Settings' },
@@ -358,6 +361,7 @@ export function registerDashboard(on: On, options: PluginOptions): void {
       submit: text => { void $.prompt.submit({ text, asUser: true }) },
       planAct: (kind, id) => { void planAction($, kind, id) },
       todoAct: (kind, arg) => { void todoAction($, kind, arg) },
+      inboxAct: (kind, id) => { void inboxAct($, kind, id) },
       improveAct: (kind, a, b) => { void improveAction($, kind, a, b) },
     }
     const improveView: ImproveView = { mock: false, undo: improve.undo, flow: improve.flow, history: improveHistory, menu: improve.menu === true }
@@ -442,6 +446,8 @@ export function registerDashboard(on: On, options: PluginOptions): void {
                       ? withViewState(EventsTab, tabEls, liveEventsView(snap, viewState), cols, ui)
                         : dashTab === 'todo'
                           ? TodoPane($, tabEls, viewState, cols, ui)
+                        : dashTab === 'inbox'
+                          ? InboxPane(tabEls, viewState, cols, ui)
                         : dashTab === 'improve'
                           ? ImproveTab(tabEls, improveView, cols, ui)
                         : pane.src === 'live'
@@ -477,6 +483,8 @@ type TabUi = {
   planAct?: (kind: string, id: string) => void
   /** Todo tab presses: runs `mkdb.py todo <verb>` (see todoAction). */
   todoAct?: (kind: 'add' | 'toggle' | 'delete' | 'undo' | 'clear-done', arg?: string | number) => void
+  /** Inbox tab presses: runs `mk-inbox.py` (see inboxAct); `delete` only asks for the confirm. */
+  inboxAct?: (kind: InboxActKind, id: string) => void
   /** Improve presses (footer card and tab): see improveAction. */
   improveAct?: (kind: ImproveKind, a?: string | number, b?: string) => void
 }
@@ -503,6 +511,7 @@ async function switchTab($: EngineInterface, tab: MkDashTab): Promise<void> {
   await update($, improveAtom, prev => (prev.menu === true ? { ...prev, menu: false } : prev)) // the drop-up closes on a tab switch
   if (tab === 'settings') void ensureSettingsLoaded($)
   if (tab === 'todo') void kickTodos($) // the first list should not wait for the 5 s tick
+  if (tab === 'inbox') void kickInbox($) // the first list should not wait for the 5 s tick
   if (tab === 'plan') void kickPlans($) // the gated tab loads on open, not 5 s later
   if (tab === 'waiting') void kickPending($) // a retry now, whatever the sticky-down backoff says
   if (tab !== 'files') {
@@ -1419,13 +1428,13 @@ export function PlanPane(els: Els, view: Record<string, string>, paneCols: numbe
   // the shown plan's mapped view, filled by the Detail branch below; a Play/Pause press
   // reads it for the row and its phases (the press is drawn before the body is built)
   let shown: PlanView | null = null
-  /** Play/Pause on a phase or task: draft the prompt from the row's own data on the
+  /** Play/Pause/Improve on a phase or task: draft the prompt from the row's own data on the
    *  Improve card. Any miss (no match, no loaded detail, no Improve) keeps today's
    *  `mk: <kind> plan <id>` submit as the fallback. */
   const seedPress = (kind: string, id: string): boolean => {
-    const m = /^(play|resume|pause) (phase|task) (\S+)$/.exec(kind)
+    const m = /^(play|resume|pause|improve) (phase|task) (\S+)$/.exec(kind)
     if (m == null || ui.improveAct == null) return false
-    const what = m[1] === 'pause' ? 'pause' : 'play'
+    const what = m[1] === 'pause' ? 'pause' : m[1] === 'improve' ? 'improve' : 'play'
     const level = m[2] === 'phase' ? 'phase' : 'task'
     const rowId = m[3] ?? ''
     const phases = shown?.phases
@@ -1435,12 +1444,14 @@ export function PlanPane(els: Els, view: Record<string, string>, paneCols: numbe
     if (level === 'phase') {
       const phase = phasesOf.find(p => p.id === rowId)
       if (phase == null) return false
-      text = what === 'play' ? phasePrompt(id, phase, phasesOf) : pausePrompt(id, 'phase', phase, phasesOf)
+      text = what === 'play' ? phasePrompt(id, phase, phasesOf) : what === 'improve' ? improveItemPrompt(id, 'phase', phase, phasesOf) : pausePrompt(id, 'phase', phase, phasesOf)
     } else {
       const task = findPlanTask(phasesOf, rowId)
       if (task == null) return false
-      text = what === 'play' ? taskPrompt(id, task, phasesOf) : pausePrompt(id, 'task', task, phasesOf)
+      text = what === 'play' ? taskPrompt(id, task, phasesOf) : what === 'improve' ? improveItemPrompt(id, 'task', task, phasesOf) : pausePrompt(id, 'task', task, phasesOf)
     }
+    // an Improve prompt asks the model to rewrite the row, so it takes the rewrite path like Play;
+    // Pause only shows its exact words
     ui.improveAct('seed', text, what === 'pause' ? 'pause' : undefined)
     return true
   }
@@ -1823,6 +1834,343 @@ async function todoAction($: EngineInterface, kind: string, arg?: string | numbe
     return
   }
   await loadTodos($, home, slug, true)
+}
+
+// ── Inbox tab: the list is read on the tick (only while the tab is open), presses run mk-inbox.py ──
+
+const INBOX_LIST_KEY = 'inbox:list'
+const INBOX_HOME_KEY = 'inbox:home'
+const INBOX_DATA_KEY = 'inbox:data'
+/** the cards' own states, by plan id: `confirm`, `importing`, `done`, `failed` (C6's per-card state) */
+const INBOX_STATE_KEY = 'inbox:state'
+const INBOX_ERROR_KEY = 'inbox:error'
+
+/** The C3 reply (contract C3): the files and the four counts. `note` is the reply's own extra and
+ *  is not part of InboxFile, so it is dropped at the mapping. */
+type InboxReply = { ok?: boolean; files?: unknown[]; counts?: unknown; errors?: unknown; error?: unknown }
+
+/** One C3 entry as InboxFile holds it, or null when the reply's row is not one (a foreign reply). */
+function inboxFileOf(raw: unknown, state: InboxCardState): InboxFile | null {
+  if (raw == null || typeof raw !== 'object') return null
+  const row = raw as Record<string, unknown>
+  const str = (v: unknown): string => (typeof v === 'string' ? v : '')
+  const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
+  const id = str(row.id)
+  const path = str(row.path)
+  if (id === '' || path === '') return null
+  const fit = row.fit === 'template' || row.fit === 'partial' || row.fit === 'not_a_plan' ? row.fit : 'not_a_plan'
+  const missing = Array.isArray(row.missing) ? row.missing.filter((m): m is string => typeof m === 'string') : []
+  return {
+    id,
+    path,
+    title: str(row.title),
+    fit,
+    sections_found: num(row.sections_found),
+    sections_total: num(row.sections_total),
+    missing,
+    age_s: num(row.age_s),
+    archived: row.archived === true,
+    state,
+  }
+}
+
+/** The four counts a reply carries (`0` for a missing or foreign answer). */
+function inboxCountsOf(raw: unknown): InboxView['counts'] {
+  const row = raw != null && typeof raw === 'object' ? raw as Record<string, unknown> : {}
+  const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
+  return { inbox: num(row.inbox), template: num(row.template), fix: num(row.fix), archived: num(row.archived) }
+}
+
+/** The card states, by plan id, as the press wrote them. */
+function inboxStatesOf(view: Record<string, string>): Record<string, InboxCardState> {
+  let parsed: unknown = null
+  try { parsed = JSON.parse(view[INBOX_STATE_KEY] ?? '') } catch { parsed = null }
+  if (parsed == null || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+  return parsed as Record<string, InboxCardState>
+}
+
+/** The Inbox tab's view (C6): the last list plus the cards' own states and the filter. */
+function inboxPaneView(view: Record<string, string>): InboxView {
+  let parsed: unknown = null
+  try { parsed = JSON.parse(view[INBOX_LIST_KEY] ?? '') } catch { parsed = null }
+  const reply = parsed != null && typeof parsed === 'object' ? parsed as InboxReply : {}
+  const states = inboxStatesOf(view)
+  const files = (Array.isArray(reply.files) ? reply.files : [])
+    .map(raw => inboxFileOf(raw, states[inboxIdOf(raw)] ?? { kind: 'idle' }))
+    .filter((f): f is InboxFile => f != null)
+  const f = view['inbox:filter']
+  const filter: InboxFilter = f === 'template' || f === 'fix' || f === 'archived' ? f : 'inbox'
+  return { files, counts: inboxCountsOf(reply.counts), filter }
+}
+
+/** The plan id of a raw C3 row, '' when it has none. */
+function inboxIdOf(raw: unknown): string {
+  return raw != null && typeof raw === 'object' && typeof (raw as Record<string, unknown>).id === 'string'
+    ? String((raw as Record<string, unknown>).id)
+    : ''
+}
+
+/** The Inbox body: an error line (a failed read or action), then the tab (a pure render, C10). */
+function InboxPane(els: Els, view: Record<string, string>, cols: number, ui: TabUi): RenderElement {
+  const { Box, Text } = els
+  const err = view[INBOX_ERROR_KEY] ?? ''
+  return (
+    <Box flexDirection="column" gap={1}>
+      {err !== '' && <Text color={ROLE.err.fg}>{`⚠ ${sanitizeText(err, Math.max(8, cols - 4))}`}</Text>}
+      {InboxTab(els, inboxPaneView(view), cols, { set: ui.set, inboxAct: (kind, id) => { ui.inboxAct?.(kind, id) } })}
+    </Box>
+  )
+}
+
+let inboxInFlight = false
+let inboxAgain = false
+
+/** `mk-inbox.py list --json` for the MK home; one read in flight. A write that lands while a read
+ *  is out asks for one more read after it, so the list never keeps pre-write rows. */
+async function loadInbox($: EngineInterface, home: string, dataDir: string, again = false): Promise<void> {
+  if (inboxInFlight) { if (again) inboxAgain = true; return }
+  inboxInFlight = true
+  try {
+    const r = await $.process.run(
+      ['python3', `${$.plugin.root}/scripts/mk-inbox.py`, 'list', '--json', '--home', home, ...(dataDir === '' ? [] : ['--data', dataDir])],
+      { timeoutMs: 20_000 },
+    )
+    let reply: InboxReply = {}
+    try { reply = JSON.parse(r.stdout) as InboxReply } catch { reply = {} }
+    if (r.exitCode !== 0 || reply.ok !== true || !Array.isArray(reply.files)) {
+      const why = (Array.isArray(reply.errors) ? reply.errors.find((e): e is string => typeof e === 'string' && e !== '') : undefined)
+        ?? (typeof reply.error === 'string' && reply.error !== '' ? reply.error : undefined)
+        ?? (r.stderr.trim() || `exit ${String(r.exitCode)}`)
+      throw new Error(why)
+    }
+    const body = JSON.stringify({ files: reply.files, counts: reply.counts ?? {} })
+    // a successful read clears its OWN error only: an action's failure line stands until the next press
+    await update($, viewStateAtom, prev => (prev[INBOX_HOME_KEY] !== home
+      ? prev
+      : prev[INBOX_LIST_KEY] === body && !(prev[INBOX_ERROR_KEY] ?? '').startsWith('inbox list:')
+        ? prev
+        : { ...prev, [INBOX_LIST_KEY]: body, [INBOX_ERROR_KEY]: (prev[INBOX_ERROR_KEY] ?? '').startsWith('inbox list:') ? '' : prev[INBOX_ERROR_KEY] ?? '' }))
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    await update($, viewStateAtom, prev => ({ ...prev, [INBOX_ERROR_KEY]: `inbox list: ${msg}` })).catch(() => {})
+  } finally {
+    inboxInFlight = false
+    if (inboxAgain) { inboxAgain = false; void loadInbox($, home, dataDir) }
+  }
+}
+
+/** The tick (and the switch to the tab): the MK home names the inbox folder — `<home>/inbox/`
+ *  exists whether or not the root store does — and the project data dir is where an import
+ *  writes. Only while the Inbox tab is open; no home at all spawns nothing. */
+async function refreshInbox($: EngineInterface, cwd: string): Promise<void> {
+  if ((await read($, dashTabAtom)) !== 'inbox') return
+  const home = await globalDirOf($, await homeDir($)).catch(() => null) ?? ''
+  if (home === '') {
+    await update($, viewStateAtom, prev => (prev[INBOX_HOME_KEY] === '' && prev[INBOX_LIST_KEY] === '' ? prev : { ...prev, [INBOX_HOME_KEY]: '', [INBOX_DATA_KEY]: '', [INBOX_LIST_KEY]: '', [INBOX_STATE_KEY]: '', [INBOX_ERROR_KEY]: '' }))
+    return
+  }
+  const dataDir = await resolveDataDir($, { cwd, home, requireExisting: true, store: true }).catch(() => null) ?? ''
+  await update($, viewStateAtom, prev => (prev[INBOX_HOME_KEY] === home && prev[INBOX_DATA_KEY] === dataDir
+    ? prev
+    : { ...prev, [INBOX_HOME_KEY]: home, [INBOX_DATA_KEY]: dataDir, [INBOX_LIST_KEY]: '', [INBOX_STATE_KEY]: '', [INBOX_ERROR_KEY]: '' }))
+  await loadInbox($, home, dataDir)
+}
+
+async function kickInbox($: EngineInterface): Promise<void> {
+  const cwd = await filesCwd($)
+  await refreshInbox($, cwd).catch(() => {})
+}
+
+/** One card's state, written only when the list still names that file (a reload drops a stale card). */
+async function setInboxCard($: EngineInterface, id: string, state: InboxCardState): Promise<void> {
+  await update($, viewStateAtom, prev => {
+    const states = inboxStatesOf(prev)
+    return { ...prev, [INBOX_STATE_KEY]: JSON.stringify({ ...states, [id]: state }) }
+  })
+}
+
+/** One `mk-inbox.py` action: `<action> [options] -- <id>`, so an id that starts with `-` is read
+ *  as the positional it is (argparse ends option parsing at `--`). Every option must precede the
+ *  `--`; the reply is the last JSON line, with the progress steps before it. */
+async function runInbox(
+  $: EngineInterface,
+  home: string,
+  dataDir: string,
+  action: string,
+  id: string,
+  extra: readonly string[] = [],
+): Promise<{ exitCode: number; stderr: string; reply: Record<string, unknown>; step: number }> {
+  const r = await $.process.run(
+    ['python3', `${$.plugin.root}/scripts/mk-inbox.py`, action, '--home', home,
+      ...(dataDir === '' ? [] : ['--data', dataDir]), ...extra, '--', id],
+    { timeoutMs: 300_000 },
+  )
+  let reply: Record<string, unknown> = {}
+  let step = 0
+  for (const line of r.stdout.split('\n')) {
+    if (line.trim() === '') continue
+    let parsed: unknown = null
+    try { parsed = JSON.parse(line) } catch { continue }
+    if (parsed == null || typeof parsed !== 'object') continue
+    const row = parsed as Record<string, unknown>
+    if (row.progress === true && typeof row.step === 'number') { step = row.step; continue }
+    reply = row
+  }
+  return { exitCode: r.exitCode, stderr: r.stderr, reply, step }
+}
+
+/** The first error a refused reply names, else its reason, else the exit text. */
+function inboxFailure(reply: Record<string, unknown>, stderr: string, exitCode: number): string {
+  const errors = Array.isArray(reply.errors) ? reply.errors.filter((e): e is string => typeof e === 'string' && e !== '') : []
+  const reason = typeof reply.reason === 'string' && reply.reason !== '' ? reply.reason : ''
+  return errors[0] ?? (reason !== '' ? reason : stderr.trim() !== '' ? stderr.trim() : `exit ${String(exitCode)}`)
+}
+
+/** A step a failed import names, clamped to the three the card draws. */
+function inboxStepOf(reply: Record<string, unknown>, seen: number): 1 | 2 | 3 {
+  const raw = typeof reply.step === 'number' ? reply.step : seen
+  return raw === 2 ? 2 : raw === 3 ? 3 : 1
+}
+
+/** The phase and task counts of the plan an import just wrote, from the project store (the same
+ *  reader the Plan tab uses). `plans.counts` is a per-status tally, never the task total, so the
+ *  rows are counted; the reply's own item count is the fallback when the read says nothing. */
+async function inboxImportCounts($: EngineInterface, dataDir: string, planId: string, items: number): Promise<{ phases: number; tasks: number }> {
+  try {
+    const r = await $.process.run(
+      ['python3', `${$.plugin.root}/scripts/mkdb.py`, '--data', dataDir, 'plans', '--json', '--', planId],
+      { timeoutMs: STORE_READ_MS },
+    )
+    const parsed = JSON.parse(r.stdout) as { ok?: boolean; phases?: unknown[] }
+    if (r.exitCode === 0 && parsed.ok === true && Array.isArray(parsed.phases)) {
+      const phases = parsed.phases
+      let tasks = 0
+      for (const ph of phases) {
+        if (ph == null || typeof ph !== 'object') continue
+        const rows = (ph as { tasks?: unknown }).tasks
+        if (Array.isArray(rows)) tasks += rows.length
+      }
+      return { phases: phases.length, tasks: tasks > 0 ? tasks : items }
+    }
+  } catch {
+    // the store read failed: the reply's own item count is the best remaining answer
+  }
+  return { phases: 0, tasks: items }
+}
+
+/** A press: Import (the three steps on the card), Archive, Restore, Delete, Open and Open project.
+ *  A refused action lands in the card's failed state (`step` and `reason` from the reply), never a
+ *  toast alone; every action that changes the inbox reloads the list. */
+async function inboxAct($: EngineInterface, kind: InboxActKind, id: string): Promise<void> {
+  const view = await read($, viewStateAtom)
+  const home = view[INBOX_HOME_KEY] ?? ''
+  const dataDir = view[INBOX_DATA_KEY] ?? ''
+  const file = inboxPaneView(view).files.find(f => f.id === id)
+  if (file == null) return
+  const fail = (step: 1 | 2 | 3, reason: string, what: string): Promise<void> => update($, viewStateAtom, prev => ({
+    ...prev,
+    [INBOX_ERROR_KEY]: `inbox ${what}: ${reason}`,
+    [INBOX_STATE_KEY]: JSON.stringify({ ...inboxStatesOf(prev), [id]: { kind: 'failed', step, reason } }),
+  })).then(() => undefined)
+  if (home === '') { await fail(1, 'no MatrixKoder home', kind); return }
+  if (kind === 'delete') { await setInboxCard($, id, { kind: 'confirm' }); return }
+  if (kind === 'cancel-delete' || kind === 'dismiss') { await setInboxCard($, id, { kind: 'idle' }); return }
+  if (kind === 'open-project') {
+    await update($, viewStateAtom, prev => ({ ...prev, 'plans:sel': id, 'plan:sub': 'detail', 'plans:reload': String(Date.now()) }))
+    await switchTab($, 'plan')
+    return
+  }
+  if (kind === 'open') {
+    // `path` is the entry's name inside the inbox (a folder form reads `<folder>/plan.md`); an
+    // archived entry lives under inbox/archive/, and C3's `path` carries no such prefix.
+    // The name comes from a file on disk, so it is treated as hostile: the resolved target must
+    // stay inside the inbox folder (or its archive/), and a link that lands elsewhere is refused
+    // before any opener runs.
+    const box = paths.inbox(home)
+    const folder = file.archived ? join(box, 'archive') : box
+    const target = join(folder, file.path)
+    // Both sides are compared as RESOLVED paths: a resolved target may have a symlinked ancestor
+    // folded (macOS /var -> /private/var), so comparing it with the plain folder would refuse a
+    // legitimate file. `folderReal` is the folder itself resolved, or the plain folder when the
+    // host cannot resolve it (the entry then has to match it literally).
+    const folderReal = await $.fs.stat(folder, { resolve: true }).then(s => s.realPath).catch(() => undefined)
+    const root = normalizePath(folderReal ?? folder)
+    let real: string | undefined
+    try {
+      const stat = await $.fs.stat(target, { resolve: true })
+      real = stat.realPath
+    } catch {
+      real = undefined
+    }
+    if (real === undefined) {
+      await fail(1, `${file.path} cannot be resolved inside the inbox; refused`, 'open')
+      return
+    }
+    if (normalizePath(real) !== root && !normalizePath(real).startsWith(`${root}/`)) {
+      await fail(1, `${file.path} is outside the inbox folder; refused`, 'open')
+      return
+    }
+    let opened = false
+    for (const opener of ['open', 'xdg-open']) {
+      try {
+        // the resolved path, one argument after `--`: an opener reads it as a path, never a flag
+        const r = await $.process.run([opener, '--', real], { timeoutMs: 5000 })
+        if (r.exitCode === 0) { opened = true; break }
+      } catch {
+        // the opener is not on this host; the next one is tried
+      }
+    }
+    if (!opened) await fail(1, `could not open ${file.path}`, 'open')
+    return
+  }
+  if (kind === 'import' || kind === 'retry') {
+    await setInboxCard($, id, { kind: 'importing', step: 1 })
+    let step: 1 | 2 | 3 = 1
+    let reason = ''
+    let planId = id
+    let items = 0
+    try {
+      const ran = await runInbox($, home, dataDir, 'import', id)
+      step = inboxStepOf(ran.reply, ran.step)
+      if (ran.exitCode === 0 && ran.reply.ok === true) {
+        planId = typeof ran.reply.plan === 'string' && ran.reply.plan !== '' ? ran.reply.plan : id
+        items = typeof ran.reply.items === 'number' ? ran.reply.items : 0
+        const counts = await inboxImportCounts($, dataDir, planId, items)
+        await update($, viewStateAtom, prev => ({
+          ...prev,
+          [INBOX_ERROR_KEY]: '',
+          [INBOX_STATE_KEY]: JSON.stringify({ ...inboxStatesOf(prev), [id]: { kind: 'done', project: planId, phases: counts.phases, tasks: counts.tasks } }),
+        }))
+        await loadInbox($, home, dataDir, true)
+        return
+      }
+      reason = inboxFailure(ran.reply, ran.stderr, ran.exitCode)
+    } catch (e) {
+      reason = e instanceof Error ? e.message : String(e)
+    }
+    await fail(step, reason, 'import')
+    await loadInbox($, home, dataDir, true)
+    return
+  }
+  const action = kind === 'confirm-delete' ? 'delete' : kind === 'archive' || kind === 'restore' ? kind : null
+  if (action == null) return
+  // the archive flag is an OPTION: it goes before the `--` that ends option parsing, never after
+  const extra = action === 'delete' && file.archived ? ['--archived'] : []
+  try {
+    const ran = await runInbox($, home, dataDir, action, id, extra)
+    if (ran.exitCode !== 0 || ran.reply.ok !== true) {
+      await fail(inboxStepOf(ran.reply, ran.step), inboxFailure(ran.reply, ran.stderr, ran.exitCode), action)
+      return
+    }
+    await update($, viewStateAtom, prev => ({
+      ...prev,
+      [INBOX_ERROR_KEY]: '',
+      [INBOX_STATE_KEY]: JSON.stringify({ ...inboxStatesOf(prev), [id]: { kind: 'idle' } }),
+    }))
+  } catch (e) {
+    await fail(1, e instanceof Error ? e.message : String(e), action)
+  }
+  await loadInbox($, home, dataDir, true)
 }
 
 // ── Improve: Claude Code's prompt line and the Improve tab share one proposal (improveAtom). Presses write it and
@@ -2274,6 +2622,7 @@ async function refreshSafe($: EngineInterface, options: PluginOptions, cwd: stri
     await Promise.allSettled([
       refreshPlans($, cwd, overview),
       refreshTodos($, cwd, overview),
+      refreshInbox($, cwd),
       refreshPending($, cwd),
       eventsTick,
     ])
@@ -3323,9 +3672,13 @@ let eventsInFlight = false
 const EVENTS_LIST_KEY = 'events:list'
 const EVENTS_BUS_KEY = 'events:bus'
 const EVENTS_LANES_KEY = 'events:lanes'
+/** the inbox channel's own rows: project-wide, runless (C5), so they are read even with no run */
+const EVENTS_INBOX_KEY = 'events:inbox'
 /** raw store rows kept per run (acks included); the --since cursor reads only newer ones. */
 const EVENTS_KEEP = EVENTS_MAX * 4
 let eventsCache: { run: string; since: number; total: number; rows: Record<string, unknown>[] } | null = null
+/** the inbox channel's rows and its own events.id cursor (the ids are the table's, not a run's) */
+let inboxEventsCache: { since: number; total: number; rows: Record<string, unknown>[] } | null = null
 const LANE_BUCKETS = 24
 const LANE_BUCKET_MS = 5 * 60_000 // 24 × 5 min: the card's "last 2h"
 const LANE_SILENT_MS = 5 * 60_000
@@ -3354,6 +3707,60 @@ export const fullOf = (text: string): string => {
   return `${clean.slice(0, cut)}\n… ${clean.length - cut} more`
 }
 
+/** `mkdb.py events --chan inbox --json` (C5): the project's inbox rows, runless, with their own
+ *  `--since` cursor. Never throws: a refused read keeps the rows in hand, so a store that cannot
+ *  answer does not empty the tab. */
+async function loadInboxEvents($: EngineInterface, dataDir: string): Promise<EventItem[]> {
+  const inbox = inboxEventsCache ?? { since: 0, total: 0, rows: [] }
+  inboxEventsCache = inbox
+  try {
+    const ran = await $.process.run(
+      ['python3', `${$.plugin.root}/scripts/mkdb.py`, '--data', dataDir, 'events', '--chan', 'inbox', '--json',
+        ...(inbox.since > 0 ? ['--since', String(inbox.since)] : [])],
+      { timeoutMs: STORE_READ_MS },
+    )
+    if (ran.exitCode === 0) {
+      const parsed = JSON.parse(ran.stdout) as { ok?: boolean; events?: Record<string, unknown>[] }
+      if (parsed.ok && Array.isArray(parsed.events)) {
+        for (const row of parsed.events) if (typeof row.id === 'number' && row.id > inbox.since) inbox.since = row.id
+        inbox.total += parsed.events.length
+        inbox.rows = [...inbox.rows, ...parsed.events].slice(-EVENTS_KEEP)
+      }
+    }
+  } catch {
+    // subprocess safe catch: the cached inbox rows stand
+  }
+  return [...inbox.rows].reverse().map((row, idx) => {
+    const meta = metaOf(row)
+    const kind = typeof row.kind === 'string' ? row.kind : 'info'
+    const text = typeof row.text === 'string' ? row.text : ''
+    const t = typeof row.t === 'string' ? row.t : ''
+    const fromId = typeof row.from_id === 'string' ? row.from_id : ''
+    const by = typeof meta.by === 'string' && meta.by !== '' ? meta.by : (fromId !== '' ? fromId : 'user')
+    const file = typeof meta.file === 'string' ? meta.file : ''
+    return {
+      id: typeof row.id === 'number' ? `i-${row.id}` : `ie-${idx}`,
+      src: 'inbox' as const,
+      t: hhmm(t),
+      ts: Date.parse(t) || undefined,
+      kind,
+      type: kind,
+      who: by,
+      lane: 'all',
+      text: sanitizeText(text, 120),
+      // C5: an import-failed row is the bad one (the `!` marker and the Problems view)
+      bad: kind === 'import-failed',
+      date: t || undefined,
+      chan: 'inbox',
+      by,
+      file: file === '' ? undefined : file,
+      plan: typeof meta.plan === 'string' && meta.plan !== '' ? meta.plan : undefined,
+      fit: typeof meta.fit === 'string' && meta.fit !== '' ? meta.fit : undefined,
+      full: fullOf(text),
+    }
+  })
+}
+
 async function refreshEvents($: EngineInterface, cwd: string, snap: MkSnapshot): Promise<void> {
   if (eventsInFlight) return
   eventsInFlight = true
@@ -3366,9 +3773,18 @@ async function refreshEvents($: EngineInterface, cwd: string, snap: MkSnapshot):
   try {
     const home = await homeDir($)
     const dataDir = await resolveDataDir($, { cwd, home, requireExisting: true, store: true }).catch(() => null)
-    if (dataDir == null || snap.run == null) {
+    if (dataDir == null) {
       eventsCache = null
-      await write({ [EVENTS_LIST_KEY]: '', [EVENTS_BUS_KEY]: '', [EVENTS_LANES_KEY]: '' })
+      inboxEventsCache = null
+      await write({ [EVENTS_LIST_KEY]: '', [EVENTS_BUS_KEY]: '', [EVENTS_LANES_KEY]: '', [EVENTS_INBOX_KEY]: '' })
+      return
+    }
+    // an inbox row has no run (C5), so the inbox channel is read whatever the run is doing
+    const inboxItems = await loadInboxEvents($, dataDir)
+    // no active run: there is no run feed and no bus of this run's, so only the inbox rows stand
+    if (snap.run == null) {
+      eventsCache = null
+      await write({ [EVENTS_LIST_KEY]: '', [EVENTS_BUS_KEY]: '', [EVENTS_LANES_KEY]: '', [EVENTS_INBOX_KEY]: JSON.stringify(inboxItems.slice(0, EVENTS_MAX)) })
       return
     }
     const busDir = await busDirFor($, dataDir, await globalDirOf($, home))
@@ -3443,7 +3859,7 @@ async function refreshEvents($: EngineInterface, cwd: string, snap: MkSnapshot):
       const level = metaOf(row).ack_level
       ackOf.set(row.reply_to, Math.max(ackOf.get(row.reply_to) ?? 0, typeof level === 'number' ? level : 1))
     }
-    const items: EventItem[] = cache.rows.filter(row => row.kind !== 'ack').reverse().map((row, idx) => {
+    const runItems: EventItem[] = cache.rows.filter(row => row.kind !== 'ack').reverse().map((row, idx) => {
       const meta = metaOf(row)
       const isBus = row.chan === 'bus'
       const kind = typeof row.kind === 'string' ? row.kind : 'info'
@@ -3478,6 +3894,10 @@ async function refreshEvents($: EngineInterface, cwd: string, snap: MkSnapshot):
       }
     })
 
+    // 2b. Inbox rows (C5): project-wide, no run — read above and merged here.
+    // newest first, one list: a run row and an inbox row interleave by their own timestamps
+    const items: EventItem[] = [...runItems, ...inboxItems].sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0))
+
     // 3. Lane activity: 24 time buckets (oldest left), each the colour of its newest event
     const laneMap = new Map<string, { cells: string[]; newest: number }>()
     for (const ev of items) { // newest first
@@ -3500,8 +3920,11 @@ async function refreshEvents($: EngineInterface, cwd: string, snap: MkSnapshot):
 
     await write({
       [EVENTS_BUS_KEY]: JSON.stringify(busView),
-      [EVENTS_LIST_KEY]: JSON.stringify({ run: runId, total: cache.total, events: items.slice(0, EVENTS_MAX) }),
+      // the run's own rows only: the inbox rows live in their key and the view merges both,
+      // so neither is counted twice
+      [EVENTS_LIST_KEY]: JSON.stringify({ run: runId, total: cache.total, events: runItems.slice(0, EVENTS_KEEP) }),
       [EVENTS_LANES_KEY]: JSON.stringify(lanesActivity),
+      [EVENTS_INBOX_KEY]: JSON.stringify(inboxItems.slice(0, EVENTS_KEEP)),
     })
   } catch {
     // safe catch
@@ -3519,20 +3942,34 @@ const parseOr = <T,>(text: string | undefined): T | undefined => {
 }
 
 /** The Events tab's live view: the store's events for this run, else run.recent, newest
- *  first. The fixture is only the no-run (offline) view, labelled mock. */
+ *  first, with the inbox channel's own rows (C5, runless) merged in. The fixture is only the
+ *  no-run AND no-inbox (offline) view, labelled mock. */
 export function liveEventsView(snap: MkSnapshot, viewState?: Record<string, string>): EventsView {
+  const inbox = parseOr<EventItem[]>(viewState?.[EVENTS_INBOX_KEY]) ?? []
   if (snap.run == null) {
+    // an Inbox step is an event of the project, not of a run: it shows with no run at all
+    if (inbox.length > 0) {
+      return {
+        mock: false,
+        bus: parseOr<BusViewData>(viewState?.[EVENTS_BUS_KEY]) ?? BUS_UNKNOWN,
+        events: inbox.slice(0, EVENTS_MAX),
+        lanes: [],
+        earlierCount: Math.max(0, inbox.length - EVENTS_MAX),
+      }
+    }
     return { ...EVENTS_FIXTURE, mock: true }
   }
   const bus = parseOr<BusViewData>(viewState?.[EVENTS_BUS_KEY]) ?? BUS_UNKNOWN
   const stored = parseOr<{ run?: string; total?: number; events?: EventItem[] }>(viewState?.[EVENTS_LIST_KEY])
   if (stored?.run === snap.run.id && Array.isArray(stored.events)) {
+    const merged = [...stored.events, ...inbox].sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0))
+    const shown = merged.slice(0, EVENTS_MAX)
     return {
       mock: false,
       bus,
-      events: stored.events,
+      events: shown,
       lanes: parseOr<LaneActivityItem[]>(viewState?.[EVENTS_LANES_KEY]) ?? [],
-      earlierCount: Math.max(0, (stored.total ?? 0) - stored.events.length),
+      earlierCount: Math.max(0, (stored.total ?? 0) + inbox.length - shown.length),
     }
   }
   const all = [...(snap.run?.recent ?? [])].reverse()

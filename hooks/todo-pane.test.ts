@@ -72,7 +72,7 @@ test('P3.1: the tab bar gains Todo (hotkey t) before Improve and Settings; press
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   const buttons = (await ui.findAll({ type: 'Button' })).filter(b => String(b.props.key).startsWith('dash-tab-'))
   expect(buttons.map(b => b.props.key)).toEqual([
-    'dash-tab-overview', 'dash-tab-lanes', 'dash-tab-plan', 'dash-tab-usage', 'dash-tab-files', 'dash-tab-events', 'dash-tab-waiting', 'dash-tab-todo', 'dash-tab-improve', 'dash-tab-settings',
+    'dash-tab-overview', 'dash-tab-lanes', 'dash-tab-plan', 'dash-tab-usage', 'dash-tab-files', 'dash-tab-events', 'dash-tab-waiting', 'dash-tab-inbox', 'dash-tab-todo', 'dash-tab-improve', 'dash-tab-settings',
   ])
   expect(buttons.find(b => b.props.key === 'dash-tab-todo')?.props.hotkey).toBe('t')
   await ui.press({ key: 'dash-tab-todo' })
@@ -127,7 +127,7 @@ function barRows(buttons: readonly { props: Record<string, unknown> }[], cols: n
   return rows
 }
 
-test('P3.1: the ten-button bar wraps cleanly at 46 and 36 columns, every hotkey distinct', { plugins: [worldFixtures] }, async ($, on) => {
+test('P3.1: the eleven-button bar wraps cleanly at 46 and 36 columns, every hotkey distinct', { plugins: [worldFixtures] }, async ($, on) => {
   const w = await world(on)
   await $.session.start(sessionStart())
   await w.settle()
@@ -135,8 +135,8 @@ test('P3.1: the ten-button bar wraps cleanly at 46 and 36 columns, every hotkey 
   for (const cols of [46, 36] as const) {
     await ui.redraw(paneProps(cols))
     const bar = (await ui.findAll({ type: 'Button' })).filter(b => String(b.props.key).startsWith('dash-tab-'))
-    expect(bar).toHaveLength(10)
-    expect(bar.map(b => b.props.hotkey), `hotkeys at ${cols}`).toEqual(['o', 'l', 'p', 'u', 'f', 'e', 'w', 't', 'i', '9'])
+    expect(bar).toHaveLength(11)
+    expect(bar.map(b => b.props.hotkey), `hotkeys at ${cols}`).toEqual(['o', 'l', 'p', 'u', 'f', 'e', 'w', 'n', 't', 'i', '9'])
     for (const row of barRows(bar, cols)) expect(row, `bar row at ${cols}`).toBeLessThanOrEqual(cols)
   }
 })

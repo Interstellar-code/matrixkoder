@@ -41,6 +41,9 @@ type World = {
   messages?: { role: 'user' | 'assistant'; text: string; toolUses: never[] }[]
   /** the root store lists this plan and `plans <id>` answers the captured detail reply */
   plan?: boolean
+  /** the plan's own status in that reply (the captured one is `running`); `draft` draws the
+   *  Improve buttons on the rows instead of Play/Pause (WIRE.3) */
+  planStatus?: string
 }
 
 /** the world beneath the pane: model, conversation, prompt box, clipboard, store */
@@ -55,9 +58,9 @@ function world(on: Parameters<typeof mockWorld>[0], w: World) {
       }
       if (w.plan !== true) return undefined
       if (argv.includes('overview')) {
-        return mkdb({ ok: true, projects: [], plans: [{ project: 'matrixkoder', plan: detailFixture.id, title: detailFixture.title, status: 'running', created: 'c', live_run: null, counts: { building: 2 } }] })
+        return mkdb({ ok: true, projects: [], plans: [{ project: 'matrixkoder', plan: detailFixture.id, title: detailFixture.title, status: w.planStatus ?? 'running', created: 'c', live_run: null, counts: { building: 2 } }] })
       }
-      if (argv.includes('plans') && argv.includes(detailFixture.id)) return mkdb(detailFixture)
+      if (argv.includes('plans') && argv.includes(detailFixture.id)) return mkdb({ ...detailFixture, status: w.planStatus ?? detailFixture.status })
       return undefined
     },
   })
@@ -1372,4 +1375,35 @@ test('with no readable clipboard a collapsed paste asks for expanding; a prompt 
   await ui.press({ key: 'improve-f-discard' })
   await improve(ui, w, ROUGH)
   expect(w.log.calls, 'a plain prompt is improved as before').toBe(1)
+})
+
+test('WIRE.3.a2: an Improve press on a draft row seeds the card with a prompt naming mk-plan.py item set, and sends nothing before Accept', { timeoutMs: 20000, plugins: [worldFixtures] }, async ($, on) => {
+  const w = world(on, { plan: true, planStatus: 'draft', answer: () => SEED_REWRITE })
+  await $.session.start(sessionStart())
+  const ui = await mount($, 80)
+  type(w, 'my own draft')
+  await openPlan(ui, w)
+  await ui.press({ key: 'plan-task-improve-S1.1' })
+  await w.settle()
+  expect(w.log.reads, 'the seed never reads the prompt line').toBe(0)
+  expect(w.log.calls, 'Improve seeds take the rewrite path, as Play does').toBe(1)
+  const prompt = w.log.prompts[0] ?? ''
+  expect(prompt).toContain('Improve task S1.1 of plan settings-plans-db (draft)')
+  expect(prompt).toContain('mk-plan.py item set settings-plans-db S1.1')
+  expect(boxValue(w), 'nothing is written to the line before Accept').toBe('my own draft')
+  expect(w.log.submitted, 'and nothing is sent').toEqual([])
+  expect(await has(ui, { type: 'Button', key: 'improve-f-accept' }), 'the proposal waits on the card').toBe(true)
+})
+
+test('WIRE.3.a3: an Improve press with no loaded detail (rows folded away) falls back to the mk: line and never throws', { timeoutMs: 20000, plugins: [worldFixtures] }, async ($, on) => {
+  // a draft plan whose detail is not loaded: the List sub-tab is open, so no row and no row data
+  const w = world(on, { plan: true, planStatus: 'draft', answer: () => SEED_REWRITE })
+  await $.session.start(sessionStart())
+  const ui = await mount($, 80)
+  await ui.press({ key: 'dash-tab-plan' })
+  for (let i = 0; i < 5; i++) await w.clock.advance(0)
+  await w.settle()
+  expect(await has(ui, { type: 'Button', key: 'plans-detail-settings-plans-db' }), 'the List draws the plan row').toBe(true)
+  expect(w.log.calls, 'no model call without a row to draft from').toBe(0)
+  expect(w.log.submitted, 'nothing submitted').toEqual([])
 })
