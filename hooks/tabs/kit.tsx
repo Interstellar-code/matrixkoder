@@ -191,6 +191,20 @@ export function BoxButton(els: Els, opts: { key: string; label: string; tone?: A
   )
 }
 
+/** A coloured filter chip: the caller's tint with its colour (a state's glyph, colour and tint),
+ *  filled solid in the colour when it is the picked one. A plain press. */
+export function FilterChip(els: Els, opts: { key: string; label: string; glyph: string; color: string; tint: string; on: boolean; onPress: () => void }): RenderElement {
+  const { Button, Text } = els
+  return Button({
+    key: opts.key,
+    plain: true,
+    onPress: opts.onPress,
+    children: [
+      <Text backgroundColor={opts.on ? opts.color : opts.tint} color={opts.on ? PALETTE.bg : opts.color} bold={opts.on}>{opts.glyph === '' ? ` ${opts.label} ` : ` ${opts.glyph} ${opts.label} `}</Text>,
+    ],
+  })
+}
+
 /** A boxed strip segment (Settings.dc.html's `.seg button` / `.sub`): a plain
  *  press on a filled cell — the blue tint when `on`, the resting button fill
  *  otherwise (`flat`: no fill, for the scope strip's inactive scopes). Drawn
