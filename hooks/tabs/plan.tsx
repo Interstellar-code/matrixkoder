@@ -6,7 +6,7 @@
 import type { Elements, RenderElement } from 'claude-code'
 import { PLAN_FIXTURE } from './plan.fixture'
 import { NARROW, STATUS_GLYPH, fitLegend } from './ui'
-import { ActionButton, BoxButton, Card, Chip, ICONS, IconButton, Segment, TreeRow } from './kit'
+import { ActionButton, BoxButton, Card, Chip, ICONS, IconButton, FilterChip, Segment, TreeRow } from './kit'
 import type { ActionSpec } from './kit'
 import { colorStrip, laneStrip, pickBar } from './raster'
 import { PALETTE, ROLE } from './palette'
@@ -264,20 +264,6 @@ type PhaseFilter = typeof PHASE_FILTERS[number]
 const inFilter = (f: PhaseFilter, state: PlanState): boolean =>
   f === 'all' || (f === 'building' ? state === 'building' || state === 'review' : state === f)
 
-/** A coloured filter chip: the state's tint with its colour, filled solid when it is the picked one. */
-function FilterChip(els: Els, opts: { key: string; label: string; state: PlanState; on: boolean; onPress: () => void }): RenderElement {
-  const { Button, Text } = els
-  const c = PLAN_STATE[opts.state]
-  return Button({
-    key: opts.key,
-    plain: true,
-    onPress: opts.onPress,
-    children: [
-      <Text backgroundColor={opts.on ? c.color : c.tint} color={opts.on ? PALETTE.bg : c.color} bold={opts.on}>{` ${c.glyph} ${opts.label} `}</Text>,
-    ],
-  })
-}
-
 /** The right-hand state chip of a phase: the state's tint and colour. */
 function StateChip(els: Els, label: string, state: PlanState): RenderElement {
   const { Text } = els
@@ -347,7 +333,9 @@ export function PlanTab(els: Els, view: PlanView, cols: number, ui?: TabUi): Ren
             : FilterChip(els, {
               key: `plan-phase-filter-${f}`,
               label: `${f} ${phases.filter(p => inFilter(f, phaseState(p))).length}`,
-              state: f,
+              glyph: PLAN_STATE[f].glyph,
+              color: PLAN_STATE[f].color,
+              tint: PLAN_STATE[f].tint,
               on: activeFilter === f,
               onPress: () => { ui?.set('plan:phase-filter', f) },
             }))}

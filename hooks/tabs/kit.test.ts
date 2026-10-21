@@ -5,7 +5,7 @@
 // calling the closure the Button carries — C10: no press ever leaves the test.
 import { test, expect } from 'claude-code/testing'
 import type { Elements } from 'claude-code'
-import { ICONS, ActionButton, ActionButtons, ActionRow, Card, Chip, ControlRow, IconButton, Section, SettingRow, SmoothBar, TreeRow, actionLabel, iconHint, iconWidth } from './kit'
+import { ICONS, ActionButton, FilterChip, ActionButtons, ActionRow, Card, Chip, ControlRow, IconButton, Section, SettingRow, SmoothBar, TreeRow, actionLabel, iconHint, iconWidth } from './kit'
 import type { IconName } from './kit'
 import type { SettingCtx, SettingField } from './kit'
 import { PALETTE, ROLE } from './palette'
@@ -679,4 +679,26 @@ test('every ICONS glyph is exactly one column: one code point, not an emoji or a
     const wide = (cp >= 0x1100 && cp <= 0x115f) || (cp >= 0x2e80 && cp <= 0xa4cf) || (cp >= 0xac00 && cp <= 0xd7a3) || (cp >= 0xf900 && cp <= 0xfaff) || (cp >= 0xfe30 && cp <= 0xfe6f) || (cp >= 0xff00 && cp <= 0xff60) || cp >= 0x1f000
     expect(wide, `${name} is not in a double-width block`).toBe(false)
   }
+})
+
+test('FilterChip draws on and off', () => {
+  const calls: string[] = []
+  const draw = (on: boolean) => node(FilterChip(stubEls(), { key: 'k', label: 'done 3', glyph: '✓', color: '#00ff00', tint: '#003300', on, onPress: () => { calls.push('press') } }))
+  for (const [on, bg, fg, bold] of [[false, '#003300', '#00ff00', false], [true, '#00ff00', PALETTE.bg, true]] as const) {
+    const btn = draw(on)
+    expect(btn.type).toBe('Button')
+    expect(btn.props.plain).toBe(true)
+    const t = node((btn.props.children as unknown[])[0])
+    expect(t.props.backgroundColor).toBe(bg)
+    expect(t.props.color).toBe(fg)
+    expect(Boolean(t.props.bold)).toBe(bold)
+    expect(text(node({ type: 'x', props: {}, children: [t] }))).toBe(' ✓ done 3 ')
+    ;(btn.props.onPress as () => void)()
+  }
+  expect(calls).toEqual(['press', 'press'])
+})
+
+test('FilterChip with an empty glyph draws no gap for it', () => {
+  const btn = node(FilterChip(stubEls(), { key: 'k', label: 'Inbox 3', glyph: '', color: '#00ff00', tint: '#003300', on: false, onPress: () => {} }))
+  expect(text(node({ type: 'x', props: {}, children: [node((btn.props.children as unknown[])[0])] }))).toBe(' Inbox 3 ')
 })
