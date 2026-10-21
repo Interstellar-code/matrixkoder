@@ -288,10 +288,18 @@ def resolve_data(arg):
 def register_project(slug, repo, data_dir, name=None):
     """Write the project to the root projects table. L10.7: <home>/projects.json is no longer written
     (the resolver still READS it as the last-resort fallback for an old home). The slug is checked
-    (C11) before the root store is opened."""
+    (C11) before the root store is opened.
+
+    B-10: `mode` is derived here, not hard-coded `home` — `repo` when the real data dir sits inside
+    the real repo (the `<repo>/.matrixkoder` layout the wizard defaults to), else `home`. The
+    ON CONFLICT update sets it too, so a re-register corrects a row written by the old rule."""
     _mkdb().check_slug(slug)
     repo = os.path.realpath(repo)
     data_dir = os.path.abspath(data_dir)
+    # the containment test resolves symlinks (/tmp -> /private/tmp on macOS), the stored value does not:
+    # every reader compares data_dir against os.path.abspath (mk-livetest.py, mkpaths), so it keeps that shape
+    inside_repo = os.path.realpath(data_dir).startswith(os.path.realpath(repo) + os.sep)
+    mode = "repo" if inside_repo else "home"
     db = _mkdb()
     con = db.open_root(home())
     try:
@@ -300,8 +308,8 @@ def register_project(slug, repo, data_dir, name=None):
             "INSERT INTO projects(slug, name, repo, data_dir, mode, created, last_activity)"
             " VALUES (?,?,?,?,?,?,?)"
             " ON CONFLICT(slug) DO UPDATE SET name=excluded.name, repo=excluded.repo,"
-            " data_dir=excluded.data_dir, last_activity=excluded.last_activity",
-            (slug, name or slug, repo, data_dir, "home", now(), now()))
+            " data_dir=excluded.data_dir, mode=excluded.mode, last_activity=excluded.last_activity",
+            (slug, name or slug, repo, data_dir, mode, now(), now()))
         con.execute("COMMIT")
     except Exception:
         con.execute("ROLLBACK")
@@ -6167,6 +6175,44 @@ def store_self_test(tmp, env):
             else:
                 os.environ[k] = v
     assert os.path.exists(mkpaths.root_db(reg_home))
+    # B-10: the row's mode follows the data dir's layout — <repo>/.matrixkoder is `repo`, a dir outside
+    # the repo is `home` — and a re-register corrects a row the old hard-coded rule wrote
+    mode_home = os.path.join(tmp, "mode-home")
+    mode_repo = os.path.join(tmp, "mode-repo")
+    os.makedirs(os.path.join(mode_repo, ".git"))
+    os.makedirs(mode_home)
+    inside = os.path.join(mode_repo, ".matrixkoder")
+    outside = os.path.join(mode_home, "projects", "modeproj")
+    os.makedirs(inside)
+    os.makedirs(outside)
+
+    def mode_of(home_dir, slug):
+        con = db.open_root(home_dir)
+        try:
+            row = con.execute("SELECT mode FROM projects WHERE slug=?", (slug,)).fetchone()
+        finally:
+            con.close()
+        return row["mode"] if row else None
+
+    saved = {k: os.environ.get(k) for k in ("MK_HOME", "MATRIXKODER_HOME")}
+    os.environ["MK_HOME"] = mode_home
+    os.environ["MATRIXKODER_HOME"] = mode_home
+    try:
+        register_project("moderepo", mode_repo, inside)
+        register_project("modehome", mode_repo, outside)
+        assert mode_of(mode_home, "moderepo") == "repo", mode_of(mode_home, "moderepo")
+        assert mode_of(mode_home, "modehome") == "home", mode_of(mode_home, "modehome")
+        # a re-register of the same slug with the other layout updates the column (old rows said home)
+        register_project("moderepo", mode_repo, outside)
+        assert mode_of(mode_home, "moderepo") == "home", "a re-register left the stale mode"
+        register_project("moderepo", mode_repo, inside)
+        assert mode_of(mode_home, "moderepo") == "repo", "a re-register left the stale mode"
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
     # the CLI form the wizard calls: root row yes, projects.json no
     cli_home = os.path.join(tmp, "cli-reg-home")
     r = subprocess.run([sys.executable, os.path.abspath(__file__), "project", "register", "--slug", "clireg",

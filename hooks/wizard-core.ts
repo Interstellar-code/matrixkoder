@@ -29,7 +29,7 @@ export function emptyDraft(): MkWizardDraft {
     qaFrontend: false, qaStart: '', qaDevUrl: '', qaThemes: '', qaMockups: '', qaTarget: 'local-main',
     autoOpen: true, chip: true, toasts: true, pollMin: '5',
     existingYaml: false, storeDir: null, migrated: false, replace: false, phase: 'editing', written: [], error: null,
-    herdrPlugin: 'skip', herdrLinkResult: null, prefsSaved: false,
+    herdrPlugin: 'skip', herdrStaleLink: null, herdrLinkResult: null, prefsSaved: false,
   }
 }
 
@@ -116,6 +116,32 @@ export function providerChoices(listed: readonly { name: string; enabled: boolea
 /** Plugin root → install mode: a marketplace install lives in the plugins cache. */
 export function installModeOf(root: string): 'dev' | 'marketplace' {
   return /\/plugins\/(cache|marketplaces)\//.test(root) ? 'marketplace' : 'dev'
+}
+
+/** The matrixkoder line of `herdr plugin list`, and the local path it registers:
+ *  `- matrixkoder (MatrixKoder) enabled [local:/path/to/herdr]`. Null when the list has no
+ *  matrixkoder line, `path: null` when the line names a source that is not `local:` (a
+ *  registry install has no path to compare). */
+export function herdrLinkOf(stdout: string): { path: string | null } | null {
+  for (const line of stdout.split('\n')) {
+    if (!/^(?:-\s+)?matrixkoder\b/.test(line.trim())) continue
+    const m = /\[local:([^\]]+)\]/.exec(line)
+    return { path: m?.[1]?.trim() ?? null }
+  }
+  return null
+}
+
+/** What the herdr plugin link stands at: `linked` when `herdr plugin list` names matrixkoder at this
+ *  plugin's own `<root>/herdr`; `link` when it is absent, names another path (a stale link left by an
+ *  earlier marketplace version — `stale` carries that path so the review can say what is being relinked),
+ *  or the list cannot be read. Detection alone never writes; the write step relinks. */
+export function herdrStateOf(stdout: string | null, root: string): { state: 'linked' | 'link'; stale: string | null } {
+  if (stdout == null) return { state: 'link', stale: null }
+  const link = herdrLinkOf(stdout)
+  if (link == null) return { state: 'link', stale: null }
+  const want = `${root.replace(/\/+$/, '')}/herdr`
+  if (link.path == null || link.path === want) return { state: 'linked', stale: null }
+  return { state: 'link', stale: link.path }
 }
 
 // ---------- gates ----------
@@ -463,29 +489,145 @@ export function addToGitignore(text: string | null): string | null {
 export type YamlDiffRow = { sign: '-' | '+' | ' '; text: string }
 
 /** The review's replace form: line-wise `-`/`+` rows against the file on disk, plus how many lines the
- *  two share. Line-wise, not LCS: the wizard's emitter is one key per line and a replace rewrites whole
- *  blocks, so a positional compare reads exactly as the slides do (`- test: pnpm test`, `+ test: …`) and
- *  costs O(n). Unchanged lines keep their text and draw with a leading space. */
+ *  two share. A real line diff (LCS over lines, O(n·m) — the files are under ~200 lines), not a positional
+ *  compare: one line inserted at the top used to mark every later line changed, which reads as a rewrite
+ *  the write is not (B-19). A changed hunk draws its `-` rows before its `+` rows; unchanged lines keep
+ *  their text and draw with a leading space. `changed` counts changed lines the way the count text reads
+ *  (`N lines changed`): the larger of removed and added per hunk, so one replaced line is 1, not 2. */
 export function yamlDiff(oldText: string | null, newText: string): { rows: YamlDiffRow[]; changed: number; unchanged: number } {
-  const before = (oldText ?? '').replace(/\n$/, '').split('\n')
-  const after = newText.replace(/\n$/, '').split('\n')
+  const before = oldText == null || oldText === '' ? [] : oldText.replace(/\n$/, '').split('\n')
+  const after = newText === '' ? [] : newText.replace(/\n$/, '').split('\n')
   const rows: YamlDiffRow[] = []
   let changed = 0
   let unchanged = 0
-  const n = Math.max(before.length, after.length)
-  for (let i = 0; i < n; i++) {
-    const a = before[i]
-    const b = after[i]
-    if (a === b && a != null) {
-      rows.push({ sign: ' ', text: a })
-      unchanged++
-    } else {
-      if (a != null) rows.push({ sign: '-', text: a })
-      if (b != null) rows.push({ sign: '+', text: b })
-      changed++
+  const n = before.length
+  const m = after.length
+  // lcs[i][j] = the longest common subsequence of before[i..] and after[j..]
+  const width = m + 1
+  const lcs = new Uint32Array((n + 1) * width)
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      lcs[i * width + j] = before[i] === after[j]
+        ? (lcs[(i + 1) * width + j + 1] ?? 0) + 1
+        : Math.max(lcs[(i + 1) * width + j] ?? 0, lcs[i * width + j + 1] ?? 0)
     }
   }
+  const at = (i: number, j: number): number => lcs[i * width + j] ?? 0
+  let removed: string[] = []
+  let added: string[] = []
+  const flush = (): void => {
+    if (removed.length === 0 && added.length === 0) return
+    for (const text of removed) rows.push({ sign: '-', text })
+    for (const text of added) rows.push({ sign: '+', text })
+    changed += Math.max(removed.length, added.length)
+    removed = []
+    added = []
+  }
+  let i = 0
+  let j = 0
+  while (i < n && j < m) {
+    if (before[i] === after[j]) {
+      flush()
+      rows.push({ sign: ' ', text: before[i] ?? '' })
+      unchanged++
+      i++
+      j++
+    } else if (at(i, j + 1) >= at(i + 1, j)) {
+      // a tie takes the insertion first, so an inserted line draws as one `+` row and nothing else moves
+      added.push(after[j] ?? '')
+      j++
+    } else {
+      removed.push(before[i] ?? '')
+      i++
+    }
+  }
+  while (i < n) removed.push(before[i++] ?? '')
+  while (j < m) added.push(after[j++] ?? '')
+  flush()
   return { rows, changed, unchanged }
+}
+
+/** One drift line: the key, what the existing file says, and what detection offers instead (B-15). */
+export type DriftItem = { key: string; file: string; detected: string }
+
+/** The five gates, in the emitted order, with the yaml key each one is written under. The display name
+ *  drops the `_changed` suffix the file keeps: the gate runs on changed files, and the line has 46 columns. */
+const DRIFT_GATES: readonly (readonly [keyof MkWizardGates, string])[] = [
+  ['install', 'gates.install'],
+  ['test', 'gates.test'],
+  ['typecheck', 'gates.typecheck'],
+  ['lint_changed', 'gates.lint_changed'],
+  ['format_changed', 'gates.format_changed'],
+]
+
+/** One scalar from a `name: value` line under a top-level block (`repo`, `gates`), or undefined when the
+ *  block or the key is absent. A line-wise scan like parseCarry — no yaml library, never throws. */
+function scalarUnder(text: string, block: string, key: string): string | undefined {
+  let inside = false
+  for (const raw of text.split('\n')) {
+    const line = raw.replace(/\r$/, '')
+    if (line.trim() === '' || line.trim().startsWith('#')) continue
+    if (/^[A-Za-z_][\w-]*:/.test(line)) {
+      inside = line.slice(0, line.indexOf(':')).trim() === block
+      continue
+    }
+    if (!inside) continue
+    const m = /^\s+([A-Za-z_][\w-]*):\s*(.*)$/.exec(line)
+    if (m?.[1] === key) return unquoteScalar(stripYamlComment(m[2] ?? ''))
+  }
+  return undefined
+}
+
+/** The agent names an existing yaml lists under `agents:` (its keys, minus the `checked_at` stamp), or null
+ *  when the file has no `agents:` block at all — an unreadable or older file must not read as "every agent
+ *  removed". */
+function agentsIn(text: string): string[] | null {
+  let inside = false
+  let seen = false
+  const out: string[] = []
+  for (const raw of text.split('\n')) {
+    const line = raw.replace(/\r$/, '')
+    if (line.trim() === '' || line.trim().startsWith('#')) continue
+    if (/^[A-Za-z_][\w-]*:/.test(line)) {
+      inside = line.slice(0, line.indexOf(':')).trim() === 'agents'
+      seen = seen || inside
+      continue
+    }
+    if (!inside) continue
+    const m = /^\s+([A-Za-z_][\w-]*):/.exec(line)
+    if (m?.[1] != null && m[1] !== 'checked_at') out.push(m[1])
+  }
+  return seen ? out : null
+}
+
+/** B-15: what detection now says that the project's own file does not (display only — nothing is written
+ *  and nothing is changed). Compares the five gates, `repo.integration_branch` and the enabled agents.
+ *  An absent existing file is no drift. A gate detected as `''` is "no command" and matches a file that
+ *  says `""` too, so only a real difference is listed. */
+export function driftOf(existingYamlText: string | null | undefined, d: MkWizardDraft): DriftItem[] {
+  if (existingYamlText == null || existingYamlText.trim() === '') return []
+  const out: DriftItem[] = []
+  for (const [key, label] of DRIFT_GATES) {
+    const inFile = scalarUnder(existingYamlText, 'gates', key)
+    if (inFile == null) continue
+    const detected = d.gates[key].trim()
+    // both empty is not a drift; an empty file value against a detected command (or the reverse) is
+    const file = inFile.trim()
+    if (file === detected) continue
+    if (file === '' && detected === '') continue
+    out.push({ key: label, file: file === '' ? '""' : file, detected: detected === '' ? '""' : detected })
+  }
+  const branch = scalarUnder(existingYamlText, 'repo', 'integration_branch')
+  if (branch != null && branch.trim() !== d.branch.trim()) {
+    out.push({ key: 'repo.integration_branch', file: branch.trim() === '' ? '""' : branch.trim(), detected: d.branch.trim() === '' ? '""' : d.branch.trim() })
+  }
+  const inFile = agentsIn(existingYamlText)
+  if (inFile != null) {
+    const on = enabledAgents(d)
+    for (const n of on.filter(x => !inFile.includes(x))) out.push({ key: `agents.${n}`, file: 'absent', detected: 'enabled' })
+    for (const n of inFile.filter(x => !on.includes(x))) out.push({ key: `agents.${n}`, file: 'listed', detected: 'not found' })
+  }
+  return out
 }
 
 /** Text answer for `/mk setup` outside fullscreen: the detected defaults, one command to continue. */

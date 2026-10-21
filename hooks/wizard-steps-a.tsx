@@ -194,12 +194,17 @@ export function StepsA(els: WizardEls, d: MkWizardDraft, act: WizardAct, step: n
                 : d.herdrPlugin === 'linked'
                   ? <Text color={ROLE.ok.fg}>✓ MatrixKoder herdr plugin is linked</Text>
                   : (
-                    <Select
-                      key="wz-herdrPlugin" label="herdr plugin"
-                      options={[{ value: 'link', label: 'link it now' }, { value: 'skip', label: 'skip' }]}
-                      value={d.herdrPlugin}
-                      onSelect={v => act.patch({ herdrPlugin: v as 'link' | 'skip' })}
-                    />
+                    <Box flexDirection="column">
+                      {d.herdrStaleLink != null && (
+                        <Text color={ROLE.warn.fg}>{`herdr link is stale (${d.herdrStaleLink})`}</Text>
+                      )}
+                      <Select
+                        key="wz-herdrPlugin" label="herdr plugin"
+                        options={[{ value: 'link', label: d.herdrStaleLink != null ? 'relink it now' : 'link it now' }, { value: 'skip', label: 'skip' }]}
+                        value={d.herdrPlugin}
+                        onSelect={v => act.patch({ herdrPlugin: v as 'link' | 'skip' })}
+                      />
+                    </Box>
                   )}
             </Box>
           ))}
