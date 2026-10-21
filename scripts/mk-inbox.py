@@ -424,8 +424,9 @@ def main(argv):
 
 def self_test():
     mk_config = _load("mk_config", "mk-config.py")
-    real_tpl = "/Users/rohits/.matrixkoder/projects/matrixkoder/plans/plan-inbox-and-parsing/plan.md"
-    real_not = "/Users/rohits/.matrixkoder/projects/matrixkoder/plans/mk-ponytail-hooks/plan.md"
+    # byte copies of two real plans taken 2026-10-21: plan-inbox-and-parsing (a template plan) and mk-ponytail-hooks (no phase blocks)
+    real_tpl = os.path.join(HERE, "fixtures", "inbox-plan-template.md")
+    real_not = os.path.join(HERE, "fixtures", "inbox-plan-not-a-plan.md")
     tmp = tempfile.mkdtemp(prefix="mk-inbox-test-")
     restore_env = mk_config.pin_tmp_data(tmp)  # data = tmp/data, home = tmp/home, MK_SELFTEST=1
     data, home = os.path.join(tmp, "data"), os.path.join(tmp, "home")
