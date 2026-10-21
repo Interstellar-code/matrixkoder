@@ -494,6 +494,74 @@ def _v7(con):
                 "key TEXT PRIMARY KEY, seq INTEGER NOT NULL, started TEXT, updated TEXT)")
 
 
+# STORE.1 (C4): versioned plan items. plan_items holds every version's phases, tasks and subtasks;
+# plan_versions is its small companion: the sha of the file a version was imported from and whether
+# (when) the version was approved. Both are created in place, only when missing, by the commands that
+# write plans (mk-plan.py import/approve/item set) — the schema version stays as it is, so an older
+# store still opens for a read and nothing existing is copied, converted or rewritten.
+PLAN_ITEMS_DDL = (
+    """CREATE TABLE IF NOT EXISTS plan_items(
+      plan TEXT, version INTEGER, id TEXT, parent TEXT, type TEXT, title TEXT, acceptance TEXT,
+      owned TEXT, deps TEXT, parallel INTEGER, route_json TEXT, extra_json TEXT, ord INTEGER,
+      PRIMARY KEY(plan, version, id))""",
+    """CREATE TABLE IF NOT EXISTS plan_versions(
+      plan TEXT, version INTEGER, sha TEXT, created TEXT, approved_at TEXT,
+      PRIMARY KEY(plan, version))""",
+)
+
+
+def ensure_plan_items(con):
+    """Create plan_items and plan_versions when missing. Idempotent: CREATE TABLE IF NOT EXISTS
+    never touches an existing table, so a second call changes nothing."""
+    for ddl in PLAN_ITEMS_DDL:
+        con.execute(ddl)
+    con.commit()
+
+
+def _has_table(con, name):
+    return con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
+
+
+def _json_obj(text):
+    try:
+        got = json.loads(text or "")
+    except (TypeError, ValueError):
+        return {}
+    return got if isinstance(got, dict) else {}
+
+
+def _plan_item_obj(row):
+    route = _json_obj(row["route_json"])
+    return {"plan": row["plan"], "version": row["version"], "id": row["id"], "parent": row["parent"],
+            "type": row["type"], "title": row["title"] or "", "acceptance": row["acceptance"] or "",
+            "owned": _deps_of(row["owned"]), "deps": _deps_of(row["deps"]),
+            "parallel": bool(row["parallel"]), "route_json": row["route_json"],
+            "route": route or None, "extra": _json_obj(row["extra_json"]), "ord": row["ord"]}
+
+
+def plan_items(con, plan, version=None):
+    """A plan version's items in ord order (C4). version None = the plan's current (plans.version).
+    [] when the table, the plan or the version has no rows, so a caller falls back to header_json.
+    Read-only: it never creates the table."""
+    if not _has_table(con, "plan_items"):
+        return []
+    if version is None:
+        row = con.execute("SELECT version FROM plans WHERE id=?", (plan,)).fetchone()
+        if not row or row["version"] is None:
+            return []
+        version = row["version"]
+    return [_plan_item_obj(r) for r in con.execute(
+        "SELECT * FROM plan_items WHERE plan=? AND version=? ORDER BY ord", (plan, version))]
+
+
+def plan_version_row(con, plan, version):
+    """The plan_versions row of one version as a dict, or None."""
+    if not _has_table(con, "plan_versions"):
+        return None
+    row = con.execute("SELECT * FROM plan_versions WHERE plan=? AND version=?", (plan, version)).fetchone()
+    return dict(row) if row else None
+
+
 def open_project(home, slug=None, data_dir=None, version=SCHEMA, migrations=(), legacy=False):
     """Open or create the project store (C2). check_home runs before any directory is created.
     `legacy=True` opens the literal --data store of a migrated project (rollback fixtures only)."""
@@ -1716,6 +1784,46 @@ def _phases_from_header(header):
     return out
 
 
+def _header_of_items(items):
+    """header_json-shaped phases rebuilt from plan_items rows: the columns plus extra_json, which
+    holds every other key of the phase, task or subtask (wave, description, gate, ...)."""
+    nodes, phases = {}, []
+    for it in items:
+        node = dict(it["extra"])
+        node.update({"id": it["id"], "title": it["title"], "deps": it["deps"], "owned": it["owned"],
+                     "acceptance": it["acceptance"], "parallel": it["parallel"]})
+        if it["route"]:
+            node["route"] = it["route"]
+        if it["type"] == "phase":
+            node["tasks"] = []
+            phases.append(node)
+        elif it["type"] == "task":
+            node["subtasks"] = []
+            (nodes.get(it["parent"]) or {}).get("tasks", []).append(node)
+        else:
+            (nodes.get(it["parent"]) or {}).get("subtasks", []).append(node)
+        nodes[it["id"]] = node
+    return {"phases": phases}
+
+
+def _phases_from_items(items):
+    """The phase shape of _phases_from_header, built from a version's plan_items rows. The rows
+    also carry each item's acceptance and owned files, which the header view leaves null."""
+    phases = _phases_from_header(_header_of_items(items))
+    by_id = {it["id"]: it for it in items}
+
+    def fill(node):
+        it = by_id.get(node["id"])
+        if it:
+            node["acceptance"] = it["acceptance"] or None
+            node["owned"] = list(it["owned"])
+        for child in node.get("tasks", []) + node.get("subtasks", []):
+            fill(child)
+    for ph in phases:
+        fill(ph)
+    return phases
+
+
 def _integration_of(text):
     """mk-plan stores integration as a JSON array (one header key may hold one value); the pane
     reads one branch name. A plain string is passed through."""
@@ -1763,7 +1871,8 @@ def _plan_obj(con, row, detail=False):
         if detail:
             phases = _phases_from_run(rows, header, newest, con)
     elif detail:
-        phases = _phases_from_header(header)
+        items = plan_items(con, row["id"])
+        phases = _phases_from_items(items) if items else _phases_from_header(header)
     obj["counts"] = counts
     if detail:
         obj["phases"] = phases
@@ -3233,6 +3342,7 @@ def self_test():
         _plans_query(home)
         _plans_detail(home)
         _plans_reparent(home)
+        _plan_items(home)
         _plans_description(home)
         _card_verdict(home)
         _summary_idempotent(home)
@@ -4607,6 +4717,81 @@ def _plans_detail(home):
     _check(proc.returncode == 2 and "Traceback" not in proc.stderr,
            f"unknown id rc={proc.returncode} err={proc.stderr[-300:]}")
     _check(json.loads(proc.stdout)["ok"] is False, f"unknown id out {proc.stdout!r}")
+
+
+def _plan_items(home):
+    """STORE.1 (a1, a4): plan_items and plan_versions are added to a store made before this change
+    without touching a byte of it; running the step again changes nothing; the reader returns a
+    version's rows in ord order and `plans <id>` shows them instead of header_json."""
+    data = os.path.join(home, "pitems")
+    hdr = json.dumps({"phases": [{"id": "P1", "title": "header phase", "wave": 1, "tasks": [
+        {"id": "P1.1", "title": "header task"}]}]})
+    con = open_project(home, data_dir=data)  # open_project does not create the new tables: an old store
+    try:
+        _check(not _has_table(con, "plan_items") and not _has_table(con, "plan_versions"),
+               "an old-shape store must not carry plan_items")
+        _begin(con)
+        con.execute("INSERT INTO plans(id, version, title, header_json, body_md, status) VALUES (?,?,?,?,?,?)",
+                    ("old", 1, "Old", hdr, "# body", "approved"))
+        con.execute("INSERT INTO runs(id, plan, status, started) VALUES ('r', 'old', 'active', '2026-01-01T00:00:00Z')")
+        con.execute("COMMIT")
+        add_task(con, "r", "P1", "phase", title="header phase")
+        add_task(con, "r", "P1.1", "task", title="header task", parent="P1")
+
+        def dump():
+            out = {}
+            for (name, sql) in con.execute("SELECT name, sql FROM sqlite_master WHERE type IN ('table','index') "
+                                           "AND name NOT LIKE 'plan_%' AND name NOT LIKE 'sqlite_%' ORDER BY name"):
+                out[name] = (sql, [tuple(r) for r in con.execute(f"SELECT * FROM {name} ORDER BY rowid")]
+                             if sql.startswith("CREATE TABLE") else None)
+            return out
+        before = dump()
+        ensure_plan_items(con)
+        first = dump()
+        ensure_plan_items(con)
+        second = dump()
+        _check(before == first == second, "ensure_plan_items changed an existing table, index or row")
+        cols = [r["name"] for r in con.execute("PRAGMA table_info(plan_items)")]
+        _check(cols == ["plan", "version", "id", "parent", "type", "title", "acceptance", "owned", "deps",
+                        "parallel", "route_json", "extra_json", "ord"], f"plan_items columns {cols}")
+        _check(con.execute("SELECT COUNT(*) c FROM plan_items").fetchone()["c"] == 0, "plan_items not empty")
+        _check(plan_items(con, "old") == [] and plan_items(con, "nope") == [], "empty reader")
+    finally:
+        con.close()
+    con = open_project(home, data_dir=data)
+    try:  # a run's rows answer first, so drop the run to reach the planned view (header_json / plan_items)
+        con.execute("DELETE FROM tasks WHERE run='r'")
+        con.execute("DELETE FROM runs WHERE id='r'")
+        con.commit()
+    finally:
+        con.close()
+    got = plans(home, data_dir=data, plan_id="old")
+    _check(got["phases"][0]["title"] == "header phase" and got["phases"][0]["tasks"][0]["title"] == "header task",
+           f"header_json fallback {got}")
+    con = open_project(home, data_dir=data)
+    try:  # rows written out of id order: ord decides the order, and an older version stays unseen
+        ensure_plan_items(con)
+        rows = [("old", 1, "P1.1", "P1", "task", "row task", "line a\nline b", "a.py,b.py", "P1", 0, None,
+                 json.dumps({"description": "task why"}), 1),
+                ("old", 1, "P1", None, "phase", "row phase", "", "src/", "", 0, None,
+                 json.dumps({"wave": 2, "description": "phase why"}), 0),
+                ("old", 0, "P1", None, "phase", "stale version", "", "", "", 0, None, "{}", 0)]
+        con.executemany("INSERT INTO plan_items VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        con.commit()
+        got_rows = plan_items(con, "old")
+        _check([r["id"] for r in got_rows] == ["P1", "P1.1"], f"reader order {got_rows}")
+        _check(got_rows[1]["owned"] == ["a.py", "b.py"] and got_rows[1]["deps"] == ["P1"]
+               and got_rows[1]["extra"] == {"description": "task why"}, f"reader fields {got_rows[1]}")
+        _check([r["title"] for r in plan_items(con, "old", 0)] == ["stale version"], "explicit version")
+    finally:
+        con.close()
+    got = plans(home, data_dir=data, plan_id="old")  # rows exist: they answer, not header_json
+    ph = got["phases"][0]
+    t = ph["tasks"][0]
+    _check(ph["title"] == "row phase" and ph["wave"] == 2 and ph["description"] == "phase why"
+           and ph["owned"] == ["src/"] and t["title"] == "row task" and t["description"] == "task why"
+           and t["acceptance"] == "line a\nline b" and t["owned"] == ["a.py", "b.py"]
+           and t["deps"] == ["P1"], f"plans from rows {got}")
 
 
 def _plans_description(home):

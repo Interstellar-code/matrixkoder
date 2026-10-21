@@ -868,7 +868,9 @@ def write_atomic(path, text):
         raise
 
 
-def set_status(path, value):
+def status_precheck(path, value):
+    """The checks every `set --status` runs before it writes anything (file or store): a known
+    status, and for approved the plan check (F3.1). Returns the cross-run note, or None."""
     if value not in STATUSES:
         raise Fail([f"bad status {value!r} ({'|'.join(STATUSES)})"])
     note = None
@@ -881,6 +883,11 @@ def set_status(path, value):
         cross = [w for w in warnings if "cross-run" in w]
         if cross:
             note = "; ".join(cross)
+    return note
+
+
+def set_status(path, value):
+    note = status_precheck(path, value)
     text, _ = load(path)
     lines, close = split_plan(text)
     span = key_span(lines, "status", close)
@@ -929,7 +936,7 @@ def add_run(path, run_id):
 # ---------- commands ----------
 
 def cmd_parse(a):
-    return read_plan(a.path)[1]
+    return with_store_state(read_plan(a.path)[1], a.data, a.home)
 
 
 def cmd_check(a):
@@ -948,51 +955,164 @@ def cmd_check(a):
         raise Fail(errors, warnings=warnings, **(cls if a.classify else {}))
     out["warnings"] = warnings
     out.update(cls)
-    return out
+    return with_store_state(out, a.data, a.home)
 
 
-def sync_store_status(path, data, home, status):
-    """Keep plans.status (a column only once D1.1 adds it) in step with the file. A store without
-    the column, no store at all, or a plan the store does not know: nothing to do, never an error —
-    the file is still the record for every command that does not read the store."""
+def plan_in_store(path, data, home):
+    """(db, con, plan_id, row) when the store already holds this file's plan, else None: a file
+    plan with no store row keeps today's file-only behaviour. The connection stays open for the
+    caller to close. A file that does not parse is None too: the file path reports its own error."""
     data = resolve_data_arg(data)
     if not store_present(data):
         return None
     try:
-        header, out, _sha = read_plan(path)
+        _header, out, _sha = read_plan(path)
     except Fail:
         return None
     plan_id = str(out.get("plan") or "")
     if not plan_id:
         return None
     db = _mkdb()
-    home = db.resolve_home(home)
-    con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
-    try:
-        if "status" not in plan_columns(con):
-            return None
-        if not con.execute("SELECT 1 FROM plans WHERE id=?", (plan_id,)).fetchone():
-            return None
-        con.execute("UPDATE plans SET status=? WHERE id=?", (status, plan_id))
-        con.commit()
-    finally:
+    con = db.open_project(db.resolve_home(home), data_dir=mkpaths.project_folder(data, home))
+    row = con.execute("SELECT status, header_json FROM plans WHERE id=?", (plan_id,)).fetchone()
+    if not row:
         con.close()
-    return plan_id
+        return None
+    return db, con, plan_id, row
 
 
 def cmd_set(a):
-    """set --status parked and back is pause/resume (C10): the file is rewritten as before and,
-    when a store holds this plan, plans.status follows (guarded on the column existing)."""
-    out = set_status(a.path, a.status)
-    plan_id = sync_store_status(a.path, a.data, a.home, a.status)
-    if plan_id:
-        out["plan"] = plan_id
-        out["store"] = True
+    """set --status parked and back is pause/resume (C10). When the store holds the plan, plans.status
+    changes there and the file's bytes are not touched (STORE.2: after import the store is the
+    source); a file plan with no store row is rewritten as before."""
+    held = plan_in_store(a.path, a.data, a.home)
+    if held is None:
+        return set_status(a.path, a.status)
+    _db, con, plan_id, row = held
+    try:
+        note = status_precheck(a.path, a.status)
+        header = header_of(row)
+        header["status"] = a.status
+        con.execute("UPDATE plans SET status=?, header_json=? WHERE id=?",
+                    (a.status, json.dumps(header, sort_keys=True), plan_id))
+        con.commit()
+    finally:
+        con.close()
+    out = {"ok": True, "status": a.status, "plan": plan_id, "store": True}
+    if note:
+        out["warnings"] = [note]
     return out
 
 
 def cmd_add_run(a):
-    return add_run(a.path, a.run)
+    """add-run: with the plan in the store the run list changes there (header_json runs) and the
+    file is not touched; a file plan with no store row keeps today's file rewrite."""
+    held = plan_in_store(a.path, a.data, a.home)
+    if held is None:
+        return add_run(a.path, a.run)
+    _db, con, plan_id, row = held
+    try:
+        if not a.run or not RUN_ID_RE.fullmatch(a.run):
+            raise Fail([f"bad run id {a.run!r} (letters, digits, . _ -; max 64)"])
+        header = header_of(row)
+        runs = [str(r) for r in as_list(header.get("runs"))]
+        if a.run in runs:  # idempotent, like the file form
+            return {"ok": True, "runs": runs, "added": False}
+        header["runs"] = runs + [a.run]
+        con.execute("UPDATE plans SET header_json=? WHERE id=?",
+                    (json.dumps(header, sort_keys=True), plan_id))
+        con.commit()
+        return {"ok": True, "runs": header["runs"], "added": True}
+    finally:
+        con.close()
+
+
+def _id_list(text):
+    """A comma-separated --owned / --deps value as a clean list: spaces and empty parts dropped."""
+    return [x.strip() for x in str(text).split(",") if x.strip()]
+
+
+def item_set(plan_id, item_id, fields, data, home):
+    """STORE.3: change one phase, task or subtask row of a DRAFT plan's current version in the store.
+    The plan file is neither read nor written. Everything is checked before the one UPDATE, so a
+    refusal (exit 2) writes nothing: no plan, a plan that is not a draft, no stored items, no such
+    id, a dep that is not an item of this version, a self-dep or a dep cycle."""
+    if not PLAN_ID_RE.fullmatch(plan_id):
+        raise Fail([f"bad plan id {plan_id!r} ({PLAN_ID_RE.pattern})"])
+    if not any(v is not None for v in fields.values()):
+        raise Fail(["nothing to change: give --title, --description, --acceptance, --owned or --deps"])
+    if fields.get("title") is not None and not fields["title"].strip():
+        raise Fail(["--title must not be empty"])
+    data = resolve_data_arg(data)
+    if not store_present(data):
+        raise Fail([f"no store: item set needs the project store ({data})"])
+    db = _mkdb()  # no ensure here: a store with no plan_items has nothing to edit, and a refusal writes nothing
+    con = db.open_project(db.resolve_home(home), data_dir=mkpaths.project_folder(data, home))
+    try:
+        row = con.execute("SELECT version, status, header_json FROM plans WHERE id=?", (plan_id,)).fetchone()
+        if not row:
+            raise Fail([f"no plan {plan_id} in the store"])
+        status = row["status"] or header_of(row).get("status") or "draft"
+        if status != "draft":
+            raise Fail([f"plan {plan_id} is {status}, not draft: item set edits a draft plan only"])
+        version = int(row["version"] or 0)
+        items = db.plan_items(con, plan_id, version)
+        if not items:
+            raise Fail([f"plan {plan_id} has no stored items for version {version}: import it first"])
+        by_id = {it["id"]: it for it in items}
+        if item_id not in by_id:
+            raise Fail([f"no item {item_id} in plan {plan_id} version {version}"])
+        it = by_id[item_id]
+        new = {"title": it["title"], "acceptance": it["acceptance"], "owned": ",".join(it["owned"]),
+               "deps": ",".join(it["deps"])}
+        extra = dict(it["extra"])
+        if fields["title"] is not None:
+            new["title"] = fields["title"].strip()
+        if fields["acceptance"] is not None:
+            new["acceptance"] = fields["acceptance"]
+        if fields["owned"] is not None:
+            new["owned"] = ",".join(_id_list(fields["owned"]))
+        if fields["description"] is not None:
+            if fields["description"].strip():
+                extra["description"] = fields["description"]
+            else:
+                extra.pop("description", None)
+        if fields["deps"] is not None:
+            deps = _id_list(fields["deps"])
+            for d in deps:
+                if d == item_id:
+                    raise Fail([f"self-dep: {item_id} depends on itself"])
+                if d not in by_id:
+                    raise Fail([f"missing dep: {d} is not an item of plan {plan_id} version {version}"])
+            edges = {i["id"]: [d for d in i["deps"] if d in by_id] for i in items}
+            edges[item_id] = deps
+            path = db._cycle_through(item_id, edges)
+            if path:
+                raise Fail(["cycle: " + " -> ".join(path)])
+            new["deps"] = ",".join(deps)
+        extra_json = json.dumps(extra, sort_keys=True)
+        old = {"title": it["title"], "acceptance": it["acceptance"], "owned": ",".join(it["owned"]),
+               "deps": ",".join(it["deps"]), "description": it["extra"].get("description", "")}
+        now = dict(new, description=extra.get("description", ""))
+        changed = {k: now[k] for k in old if fields[k] is not None and old[k] != now[k]}
+        db._begin(con)
+        try:
+            con.execute("UPDATE plan_items SET title=?, acceptance=?, owned=?, deps=?, extra_json=? "
+                        "WHERE plan=? AND version=? AND id=?",
+                        (new["title"], new["acceptance"], new["owned"], new["deps"], extra_json,
+                         plan_id, version, item_id))
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+    finally:
+        con.close()
+    return {"ok": True, "plan": plan_id, "id": item_id, "version": version, "changed": changed}
+
+
+def cmd_item_set(a):
+    return item_set(a.plan, a.id, {k: getattr(a, k) for k in ("title", "description", "acceptance",
+                                                              "owned", "deps")}, a.data, a.home)
 
 
 # ---------- approve / export (D4): the store is optional ----------
@@ -1177,6 +1297,147 @@ def new_plan_columns(header, out):
             "integration": json.dumps(as_list(header.get("integration")))}
 
 
+# ---------- STORE: versioned plan items (C4) ----------
+
+# keys of a phase, task or subtask dict that have a plan_items column of their own; every other key
+# (wave, description, gate, manual, critical, risk, refs, ...) travels in extra_json
+ITEM_COLUMN_KEYS = {
+    "phase": {"id", "title", "deps", "owned", "route", "parallel", "tasks"},
+    "task": {"id", "title", "acceptance", "acceptance_lines", "owned", "deps", "parallel", "route",
+             "subtasks"},
+    "subtask": {"id", "title", "acceptance", "acceptance_lines", "owned", "deps", "parallel", "route"},
+}
+
+
+def plan_item_rows(out):
+    """The plan_items rows of one parsed plan, in flat_items order: the id, parent, type, title,
+    acceptance, owned, deps, parallel and route columns plus extra_json (every other key of the
+    item, so the rows alone rebuild the plan). A duplicate or empty id is refused: it would be two
+    rows for one primary key."""
+    nodes = {}
+    for ph in out["phases"]:
+        nodes[ph["id"]] = ("phase", ph)
+        for t in ph["tasks"]:
+            nodes.setdefault(t["id"], ("task", t))
+            for sub in t.get("subtasks") or []:
+                nodes.setdefault(sub["id"], ("subtask", sub))
+    rows, seen = [], set()
+    for n, (iid, typ, parent, title, acceptance, owned, deps, parallel, route) in enumerate(flat_items(out)):
+        if not iid or iid in seen:
+            raise Fail([f"item id {iid!r} is empty or repeated: a plan version holds one row per id "
+                        f"(run check for the list)"], code=0, reason="empty or repeated item id")
+        seen.add(iid)
+        extra = {k: jsonable(v) for k, v in nodes[iid][1].items() if k not in ITEM_COLUMN_KEYS[typ]}
+        try:
+            route_json = route_json_of(route)
+        except Fail:  # an unusable route is kept raw; check/approve refuse it, import does not
+            route_json, extra["route"] = None, jsonable(route)
+        rows.append({"id": iid, "parent": parent, "type": typ, "title": title, "acceptance": acceptance,
+                     "owned": ",".join(str(x) for x in owned), "deps": ",".join(str(d) for d in deps),
+                     "parallel": 1 if parallel else 0, "route_json": route_json,
+                     "extra_json": json.dumps(extra, sort_keys=True), "ord": n})
+    return rows
+
+
+def _row_sig(r):
+    return (r["parent"], r["type"], r["title"], r["acceptance"], r["owned"], r["deps"],
+            r["parallel"], r["route_json"], r["extra_json"])
+
+
+def item_changes(old_rows, new_rows):
+    """The import change report: ids added, changed and removed versus the previous version."""
+    old = {r["id"]: _row_sig(r) for r in old_rows}
+    new = {r["id"]: _row_sig(r) for r in new_rows}
+    return {"added": [r["id"] for r in new_rows if r["id"] not in old],
+            "changed": [r["id"] for r in new_rows if r["id"] in old and old[r["id"]] != new[r["id"]]],
+            "removed": [r["id"] for r in old_rows if r["id"] not in new]}
+
+
+def stored_rows(db, con, plan_id, version, prev_header):
+    """The previous version as plan_items-shaped rows: its stored rows, else (a plan stored before
+    versioned items) rebuilt from the phases kept in header_json. [] when there is nothing."""
+    got = db.plan_items(con, plan_id, version) if version else []
+    if got:
+        return [{"id": g["id"], "parent": g["parent"], "type": g["type"], "title": g["title"],
+                 "acceptance": g["acceptance"], "owned": ",".join(g["owned"]),
+                 "deps": ",".join(g["deps"]), "parallel": 1 if g["parallel"] else 0,
+                 "route_json": g["route_json"],
+                 "extra_json": json.dumps(g["extra"], sort_keys=True)} for g in got]
+    phases = prev_header.get("phases")
+    if isinstance(phases, list) and phases:
+        try:
+            return plan_item_rows({"phases": phases})
+        except Fail:
+            return []
+    return []
+
+
+def insert_items(con, plan_id, version, rows):
+    for r in rows:
+        con.execute(
+            "INSERT INTO plan_items(plan, version, id, parent, type, title, acceptance, owned, deps,"
+            " parallel, route_json, extra_json, ord) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (plan_id, version, r["id"], r["parent"], r["type"], r["title"], r["acceptance"], r["owned"],
+             r["deps"], r["parallel"], r["route_json"], r["extra_json"], r["ord"]))
+
+
+def merged_header_json(out, sha, body_md, status, prev_header, source=None):
+    """header_json_of plus what the store already holds: the run list (the store, not the file, owns
+    it after import: runs the file lacks stay) and the import `source`."""
+    hdr = json.loads(header_json_of(out, sha, body_md, status))
+    runs = [str(r) for r in as_list(prev_header.get("runs"))]
+    hdr["runs"] = runs + [str(r) for r in hdr["runs"] if str(r) not in runs]
+    src = source or prev_header.get("source")
+    if src:
+        hdr["source"] = src
+    return json.dumps(hdr, sort_keys=True)
+
+
+def header_of(row):
+    try:
+        got = json.loads(row["header_json"] or "{}") if row else {}
+    except ValueError:
+        got = {}
+    return got if isinstance(got, dict) else {}
+
+
+def stored_plan(plan_id, data, home):
+    """(status, runs, version) the store holds for a plan, read-only and never raising: a reader
+    (parse/check) must work with no store, an unreadable one, or a plan the store does not know
+    (None then, and the file answers as it always did)."""
+    data = resolve_data_arg(data)
+    if not plan_id or not store_present(data):
+        return None
+    try:
+        db = _mkdb()
+        home = db.resolve_home(home)
+        con = db._open_read(mkpaths.project_db_in(mkpaths.project_folder(data, home)), db.SCHEMA)
+        if con is None:
+            return None
+        try:
+            row = con.execute("SELECT status, version, header_json FROM plans WHERE id=?",
+                              (plan_id,)).fetchone()
+        finally:
+            con.close()
+    except Exception:
+        return None
+    if not row:
+        return None
+    return row["status"], [str(r) for r in as_list(header_of(row).get("runs"))], row["version"]
+
+
+def with_store_state(out, data=None, home=None):
+    """Once a plan is in the store, its status and run list live there (STORE.2): the parse and check
+    replies carry the store's values over the file's, so a run reads the same answer as before."""
+    got = stored_plan(str(out.get("plan") or ""), data, home)
+    if got:
+        status, runs, _version = got
+        if status:
+            out["status"] = status
+        out["runs"] = runs
+    return out
+
+
 def validate_tree(out, db, con, run):
     """Ids, self-deps and cycles, named the way mkdb names them. Nothing is written."""
     rows = flat_items(out)
@@ -1249,8 +1510,11 @@ def changed_gate_names(prev, out):
 
 def approve_file(path, data, home, run, user_ack=None):
     """No store: validate and mark approved, exactly as set --status approved.
-    With a store: validate, write the plan version and its tasks, copy the approved bytes into
-    the archive and leave the original file in place (C13 — approve copies, never moves).
+    With a store: validate, mark the plan version approved (STORE.1: the version a prior import
+    wrote when the file is that same import, else a new version with its plan_items rows), write the
+    run's tasks, copy the approved bytes into the archive and leave the original file untouched
+    (C13 — approve copies, never moves; STORE.2 — approve no longer rewrites the file). An older
+    version's plan_items rows are never deleted or rewritten.
 
     F.2 freezes the gate fields of an approved version: a changed file is a NEW version, never an
     overwrite, and the reply names the fields that moved (`P1.1.gate`, `gates.test`,
@@ -1297,17 +1561,20 @@ def approve_file(path, data, home, run, user_ack=None):
     else:
         body_md = body
     con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
+    db.ensure_plan_items(con)
     added = []
     try:
-        validate_tree(out, db, con, run_id)
         row = con.execute(
             "SELECT version, header_json, archived_path FROM plans WHERE id=?", (plan_id,)).fetchone()
-        prev = {}
-        if row and row["header_json"]:
-            try:
-                prev = json.loads(row["header_json"])
-            except ValueError:
-                prev = {}
+        prev = header_of(row)
+        if run is None and prev.get("runs"):  # after import the run list is the store's
+            run_id = str(prev["runs"][0])
+            if not RUN_ID_RE.fullmatch(run_id):
+                raise Fail([f"bad run id {run_id!r} (letters, digits, . _ -; max 64)"])
+        validate_tree(out, db, con, run_id)
+        row_before = con.execute("SELECT * FROM plans WHERE id=?", (plan_id,)).fetchone()
+        cur = int(row["version"] or 0) if row else 0
+        pv = db.plan_version_row(con, plan_id, cur) if row else None
         # F.2: the gate fields of the approved version are frozen. Name what moved, and refuse a
         # lowering of the bar (risk down, critical off) unless the caller recorded the user's word.
         changed = changed_gate_names(prev, out)
@@ -1321,20 +1588,17 @@ def approve_file(path, data, home, run, user_ack=None):
         if user_ack is not None:
             reply["user_ack"] = user_ack
         # the archived file holds the approved bytes; a second approve of those bytes is a no-op.
-        # a kill after the archive was written leaves the original on its old bytes: copy them.
+        # the file itself is never rewritten (STORE.2): the store and the archive are the record.
         current = open(path, "rb").read()
         approved = approved_bytes(current)
-        if row and os.path.isfile(row["archived_path"] or ""):
+        archive_cur = os.path.join(mkpaths.plan_archives_dir(data, plan_id), f"{plan_id}-v{cur}.md")
+        if pv and pv["sha"] == sha and pv["approved_at"] and os.path.isfile(archive_cur):
+            return {**reply, "noop": True, "version": cur, "archived": archive_cur,
+                    "tasks_run": run_id, "warnings": warnings}
+        if row and os.path.isfile(row["archived_path"] or ""):  # a plan approved before versioned items
             archived_now = open(row["archived_path"], "rb").read()
             if archived_now == approved or archived_now == current:
-                # the archive is the approved version and the original stays (C13). a kill between
-                # the archive and the original leaves the file on its pre-approve bytes, so bring
-                # it back to what the archive holds; a separate copy that already matches is
-                # left byte-identical.
-                if (archived_now != current
-                        and os.path.abspath(path) != os.path.abspath(row["archived_path"])):
-                    write_atomic(path, archived_now)
-                return {**reply, "noop": True, "version": row["version"],
+                return {**reply, "noop": True, "version": cur,
                         "archived": row["archived_path"], "tasks_run": run_id,
                         "warnings": warnings}
         # a kill after the plans row committed and before the archive existed: finish THAT
@@ -1342,7 +1606,10 @@ def approve_file(path, data, home, run, user_ack=None):
         resume = None
         if row and row["archived_path"] and not os.path.isfile(row["archived_path"]):
             resume = row["archived_path"]
-        version = row["version"] if resume else (row["version"] if row else 0) + 1
+        # the file is the version a prior import wrote (same sha, not yet approved): approve THAT
+        # version as it is, edited rows and all; anything else is a new version
+        reuse = bool(not resume and pv and pv["sha"] == sha and not pv["approved_at"])
+        version = cur if (resume or reuse) else cur + 1
         # a new version replaces this run's tasks from the previous import; other runs stay.
         # a resume keeps the tasks the killed approve already committed.
         if not resume:
@@ -1352,7 +1619,7 @@ def approve_file(path, data, home, run, user_ack=None):
                 con.execute("DELETE FROM tasks WHERE run=? AND id=?", (run_id, tid))
             con.commit()
         archive = os.path.join(mkpaths.plan_archives_dir(data, plan_id), f"{plan_id}-v{version}.md")
-        header_json = header_json_of(out, sha, body_md, "approved")
+        header_json = merged_header_json(out, sha, body_md, "approved", prev)
         # tasks first (each add_task commits its own transaction), plans row next, archive last.
         # a later failure deletes only the tasks this call inserted. a resume only writes the archive.
         try:
@@ -1374,6 +1641,15 @@ def approve_file(path, data, home, run, user_ack=None):
                 con.commit()
             db._begin(con)
             try:
+                if not resume:
+                    if not reuse:  # a new version: its rows (an older version's rows stay as they are)
+                        con.execute("DELETE FROM plan_items WHERE plan=? AND version=?", (plan_id, version))
+                        con.execute("DELETE FROM plan_versions WHERE plan=? AND version=?", (plan_id, version))
+                        insert_items(con, plan_id, version, plan_item_rows(out))
+                        con.execute("INSERT INTO plan_versions(plan, version, sha, created) VALUES (?,?,?,?)",
+                                    (plan_id, version, sha, now_local()))
+                    con.execute("UPDATE plan_versions SET approved_at=? WHERE plan=? AND version=?",
+                                (now_local(), plan_id, version))
                 row_values = dict(version=version, title=plan_title(body_md, plan_id),
                                   header_json=header_json, body_md=body_md,
                                   approved_at=now_local(), archived_path=archive,
@@ -1402,17 +1678,25 @@ def approve_file(path, data, home, run, user_ack=None):
         except Exception as e:
             for tid in added:
                 con.execute("DELETE FROM tasks WHERE run=? AND id=?", (run_id, tid))
-            con.execute("DELETE FROM plans WHERE id=? AND version=?", (plan_id, version))
+            if not resume:  # undo this approve only; an earlier version's rows are never touched
+                if reuse:
+                    con.execute("UPDATE plan_versions SET approved_at=NULL WHERE plan=? AND version=?",
+                                (plan_id, version))
+                else:
+                    con.execute("DELETE FROM plan_items WHERE plan=? AND version=?", (plan_id, version))
+                    con.execute("DELETE FROM plan_versions WHERE plan=? AND version=?", (plan_id, version))
+                if row_before:  # put the plans row back as it was
+                    cols = row_before.keys()
+                    con.execute(f"INSERT OR REPLACE INTO plans({', '.join(cols)}) "
+                                f"VALUES ({', '.join('?' * len(cols))})", tuple(row_before))
+                else:
+                    con.execute("DELETE FROM plans WHERE id=?", (plan_id,))
             con.commit()
             raise Fail([f"archive failed: {e}"])
         if os.environ.get("MK_PLAN_KILL_AFTER") == "archive":
             raise SystemExit("MK_PLAN_KILL_AFTER=archive")
-        # C13: approve copies, it never moves. the original file stays in place and now carries
-        # the approved bytes, so `run init --plan <original path>` still resolves after an approve
-        # (the hermes-switchui issue). a write failure here is not a lost approve: the archive
-        # and the row are already there and the next approve converges.
-        if current != approved and os.path.abspath(path) != os.path.abspath(archive):
-            write_atomic(path, approved)
+        # C13/STORE.2: approve copies, it never moves and never rewrites the file: the original keeps
+        # its bytes (the store row, not the file's status line, says approved).
         # C2 (L3.2): a MIGRATED project keeps its live plan at <project>/plans/<id>/plan.md, the
         # reference the run tree hangs off. Copy the approved bytes there too (still a copy — the
         # user's file is untouched). A pre-migration project is unchanged: its plan_file is
@@ -1420,8 +1704,9 @@ def approve_file(path, data, home, run, user_ack=None):
         # row are the record.
         if mkpaths.migrated_slug(data):
             plan_md = mkpaths.plan_file(data, plan_id)
-            with contextlib.suppress(OSError):
-                write_atomic(plan_md, approved)
+            if os.path.abspath(plan_md) != os.path.abspath(path):  # never rewrite the file approved
+                with contextlib.suppress(OSError):
+                    write_atomic(plan_md, approved)
             _ensure_plan_assets(data, plan_id)
         return {**reply, "version": version, "archived": archive, "tasks_run": run_id,
                 "warnings": warnings}
@@ -1517,6 +1802,12 @@ def export_plan(path, data, home):
         row = con.execute(
             "SELECT version, header_json, body_md, archived_path FROM plans WHERE id=? ORDER BY version DESC LIMIT 1",
             (plan_id,)).fetchone()
+        approved_v = None
+        if db._has_table(con, "plan_versions"):  # the archive is the last APPROVED version, which an
+            got = con.execute(  # import of a newer draft does not move
+                "SELECT MAX(version) AS v FROM plan_versions WHERE plan=? AND approved_at IS NOT NULL",
+                (plan_id,)).fetchone()
+            approved_v = got["v"] if got else None
     finally:
         con.close()
     if not row:
@@ -1533,7 +1824,8 @@ def export_plan(path, data, home):
         raise Fail([f"archived plan missing: {archived}"])
     if path != archived:
         write_atomic(path, raw)  # the archive bytes, CRLF included
-    return {"ok": True, "plan": plan_id, "version": row["version"], "path": archived, "text": rebuilt}
+    return {"ok": True, "plan": plan_id, "version": approved_v or row["version"], "path": archived,
+            "text": rebuilt}
 
 
 def cmd_approve(a):
@@ -1613,11 +1905,15 @@ def _inbox_move(moves, folder):
 
 
 def import_file(path, data, home, dry_run=False):
-    """Load one +++ plan into the store without approving it (C4): a plans row and nothing else.
-    No task rows, no file change, no status flip — approve is the command that does those.
-    Idempotent: the same bytes upsert onto the same row and change nothing.
+    """Load one +++ plan into the store without approving it (C4): a new plan version — a plans row
+    plus one plan_items row per phase, task and subtask (STORE.1) — and no task rows, no file
+    change, no status flip; approve is the command that marks a version approved.
+    Idempotent: re-importing the same bytes writes nothing. A changed file is a new version and the
+    reply's `changes` lists the item ids added, changed and removed versus the previous one.
+    The path given is kept in header_json as `source` (a reference only; nothing re-reads it).
     L10.6: a plan in <home>/inbox/<plan-id>/ (the folder or its plan.md) is then MOVED into the
     project: plan.md to the plan file, other files to <plan dir>/assets/; reply `moved` lists them."""
+    source = os.path.abspath(path)
     data = resolve_data_arg(data)
     inbox = _inbox_plan(path, home)
     if inbox:
@@ -1645,46 +1941,65 @@ def import_file(path, data, home, dry_run=False):
     db = _mkdb()
     home = db.resolve_home(home)
     moves = _inbox_moves(inbox[0], data, plan_id) if inbox else []
-    header_json = header_json_of(out, sha, body_md, str(out["status"] or "draft"))
+    new_rows = plan_item_rows(out)
     if not dry_run and mkpaths.migrated_slug(data):
         _ensure_plan_assets(data, plan_id)
     con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
     try:
-        row = con.execute("SELECT version, approved_at, header_json FROM plans WHERE id=?",
+        row = con.execute("SELECT version, approved_at, header_json, status FROM plans WHERE id=?",
                           (plan_id,)).fetchone()
-        version = row["version"] if row and row["version"] is not None else 0
+        cur = int(row["version"] or 0) if row else 0
+        prev = header_of(row)
         if row and row["approved_at"]:
             # F.2: an approved version's gate fields are frozen. Overwriting header_json here would
             # make the next approve compare the file against itself and skip the --user-ack check
             # for a lowered risk/critical, so an import that would move a gate field is refused.
-            try:
-                prev = json.loads(row["header_json"] or "{}")
-            except ValueError:
-                prev = {}
-            moved = changed_gate_names(prev if isinstance(prev, dict) else {}, out)
+            moved = changed_gate_names(prev, out)
             if moved:
                 raise Fail([f"plan {plan_id} is approved; import would change frozen gate field(s): "
                             f"{', '.join(moved)} — approve the edited file instead (a new version, "
                             f"--user-ack if it lowers risk or critical)"])
-        if not dry_run:
-            db._begin(con)
-            try:
+        pv = db.plan_version_row(con, plan_id, cur) if row else None
+        unchanged = bool(row) and ((pv or {}).get("sha") or prev.get("sha")) == sha
+        if unchanged:  # the same bytes: nothing is written, the version stays
+            version = cur
+            changes = {"added": [], "changed": [], "removed": []}
+            n_items = len(db.plan_items(con, plan_id, cur))
+        else:
+            version = cur + 1
+            changes = item_changes(stored_rows(db, con, plan_id, cur, prev), new_rows)
+            n_items = len(new_rows)
+            if not dry_run:
+                db.ensure_plan_items(con)
                 cols = new_plan_columns(header, out)
-                write_plan_row(con, plan_id, dict(
-                    version=version, title=title, header_json=header_json, body_md=body_md,
-                    **cols),
-                    # a re-import must not move the plan's version or stamp it as approved again;
-                    # status stays the store's once set (after import the store is the source)
-                    update=["title", "header_json", "body_md", "created", "design", "integration"])
-                if row and "status" in plan_columns(con):
-                    con.execute("UPDATE plans SET status=? WHERE id=? AND status IS NULL",
-                                (cols["status"], plan_id))
-                con.execute("COMMIT")
-            except Exception:
-                con.execute("ROLLBACK")
-                raise
+                header_json = merged_header_json(
+                    out, sha, body_md, str((row["status"] if row else None) or out["status"] or "draft"),
+                    prev, source)
+                db._begin(con)
+                try:
+                    # rows of a version nobody references yet (a half-removed plan) are replaced
+                    con.execute("DELETE FROM plan_items WHERE plan=? AND version=?", (plan_id, version))
+                    con.execute("DELETE FROM plan_versions WHERE plan=? AND version=?", (plan_id, version))
+                    insert_items(con, plan_id, version, new_rows)
+                    con.execute("INSERT INTO plan_versions(plan, version, sha, created) VALUES (?,?,?,?)",
+                                (plan_id, version, sha, now_local()))
+                    write_plan_row(con, plan_id, dict(
+                        version=version, title=title, header_json=header_json, body_md=body_md,
+                        **cols),
+                        # approved_at and status stay the store's once set (after import the store
+                        # is the source); the version moves to the one just imported
+                        update=["version", "title", "header_json", "body_md", "created", "design",
+                                "integration"])
+                    if row and "status" in plan_columns(con):
+                        con.execute("UPDATE plans SET status=? WHERE id=? AND status IS NULL",
+                                    (cols["status"], plan_id))
+                    con.execute("COMMIT")
+                except Exception:
+                    con.execute("ROLLBACK")
+                    raise
         reply = {"ok": True, "store": True, "plan": plan_id, "version": version,
-                 "title": title, "noop": bool(row), "dry_run": bool(dry_run)}
+                 "title": title, "noop": unchanged, "dry_run": bool(dry_run),
+                 "items": n_items, "changes": changes}
     finally:
         con.close()
     if dry_run:
@@ -1958,6 +2273,11 @@ def delete_plan(plan_id, data, home):
                         f"DELETE FROM {t} WHERE {RUN_KEYED}", (plan_id, plan_id)).rowcount
                 if t == "tasks" and os.environ.get("MK_PURGE_FAIL") == "1":  # test seam: dies mid-purge
                     raise RuntimeError("injected purge failure")
+            for t in ("plan_items", "plan_versions"):  # the plan's versioned items go with it
+                if t in have:
+                    n = con.execute(f"DELETE FROM {t} WHERE plan=?", (plan_id,)).rowcount
+                    if n:
+                        purged[t] = n
             purged["runs"] = con.execute("DELETE FROM runs WHERE plan=?", (plan_id,)).rowcount
             purged["plans"] = con.execute("DELETE FROM plans WHERE id=?", (plan_id,)).rowcount
             con.commit()
@@ -2030,6 +2350,7 @@ def build_parser():
     for name, func in (("parse", cmd_parse), ("check", cmd_check)):
         c = sub.add_parser(name)
         c.add_argument("path")
+        c.add_argument("--data", default=None), c.add_argument("--home", default=None)
         if name == "check":
             c.add_argument("--classify", action="store_true")
         c.set_defaults(func=func)
@@ -2039,7 +2360,15 @@ def build_parser():
     s.set_defaults(func=cmd_set)
     r = sub.add_parser("add-run")
     r.add_argument("path"), r.add_argument("--run", required=True)
+    r.add_argument("--data", default=None), r.add_argument("--home", default=None)
     r.set_defaults(func=cmd_add_run)
+    it = sub.add_parser("item").add_subparsers(dest="item_cmd", required=True)
+    i = it.add_parser("set")
+    i.add_argument("plan"), i.add_argument("id")
+    for flag in ("title", "description", "acceptance", "owned", "deps"):
+        i.add_argument(f"--{flag}", default=None)
+    i.add_argument("--data", default=None), i.add_argument("--home", default=None)
+    i.set_defaults(func=cmd_item_set)
     for name, func in (("approve", cmd_approve), ("export", cmd_export), ("import", cmd_import)):
         c = sub.add_parser(name)
         c.add_argument("path")
@@ -2397,6 +2726,240 @@ def f2_approve_self_test(tmp, mk, write, plan_text, phase, task, db, mkpaths):
                                   '[[final_gate]]\ncovers = ["P1.1"]\n'))
     bad2 = mk("check", nocmd, code=2)
     assert any(e.startswith("final gate 2: needs cmd") for e in bad2["errors"]), bad2
+
+
+def store_self_test(tmp, mk, write, plan_text, phase, task, db, mkpaths):
+    """STORE.1-3: versioned plan_items, status and runs in the store, and item set. Every write goes
+    to a temp home; `mk` runs the real CLI."""
+    import subprocess
+    sdata = os.path.join(tmp, "st-store")
+    shome = os.path.join(sdata, ".mk-home")
+    os.makedirs(shome)
+    folder = mkpaths.project_folder(sdata, shome)
+    db.open_project(shome, data_dir=folder).close()
+
+    def st(*args, code=0):
+        return mk(*args, "--data", sdata, "--home", shome, code=code)
+
+    def conn():
+        return db.open_project(shome, data_dir=folder)
+
+    def rows(plan, version):
+        con = conn()
+        try:
+            return [tuple(r) for r in con.execute(
+                "SELECT * FROM plan_items WHERE plan=? AND version=? ORDER BY ord", (plan, version))]
+        finally:
+            con.close()
+
+    def one(sql, *args):
+        con = conn()
+        try:
+            r = con.execute(sql, args).fetchone()
+            return dict(r) if r else None
+        finally:
+            con.close()
+
+    def dump():
+        con = conn()
+        try:
+            return {t: [tuple(r) for r in con.execute(f"SELECT * FROM {t} ORDER BY rowid")]
+                    for t in ("plans", "plan_items", "plan_versions", "tasks", "runs")}
+        finally:
+            con.close()
+
+    def sha_of(path):
+        return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+    sub = ('  [[phase.task.subtask]]\n  id = "S1.1.1"\n  title = "leaf"\n  acceptance = "leaf done"\n'
+           '  deps = "S1.1"\n  parallel = true\n  route = ""\n  owned = []\n')
+
+    def stp(extra_task="", s11_title="first task", with_s21=True):
+        body = phase("S1", extra='description = "phase why"\n', owned='"src/"', tasks=(
+            task("S1.1", title=s11_title, acceptance="a1", owned='"src/a.py"',
+                 extra='  description = "task why"\n' + sub) + task("S1.2", acceptance="b1") + extra_task)) + "\n"
+        if with_s21:
+            body += phase("S2", wave=2, deps='"S1"', tasks=task("S2.1", acceptance="c1")) + "\n"
+        return plan_text(plan='plan = "stp"', phases=body).replace("# body", "# stp — Store Plan")
+
+    # ---- STORE.1: import writes versioned rows; the same bytes again write nothing ----
+    f = write("stp.md", stp())
+    original = open(f, "rb").read()
+    out = st("import", f)
+    assert out["ok"] and out["version"] == 1 and out["noop"] is False and out["items"] == 6, out
+    ids = ["S1", "S1.1", "S1.1.1", "S1.2", "S2", "S2.1"]
+    assert out["changes"] == {"added": ids, "changed": [], "removed": []}, out
+    v1 = rows("stp", 1)
+    assert [r[2] for r in v1] == ids and [r[12] for r in v1] == list(range(6)), v1
+    assert [r[4] for r in v1] == ["phase", "task", "subtask", "task", "phase", "task"], v1
+    assert v1[2][3] == "S1.1" and v1[1][3] == "S1" and v1[0][3] is None  # parent
+    assert json.loads(v1[0][11])["description"] == "phase why" and json.loads(v1[0][11])["wave"] == 1
+    assert v1[1][9] == 0 and v1[2][9] == 1 and v1[1][7] == "src/a.py" and v1[4][8] == "S1"  # parallel, owned, deps
+    row = one("SELECT version, status, header_json FROM plans WHERE id='stp'")
+    hdr = json.loads(row["header_json"])
+    assert row["version"] == 1 and hdr["source"] == os.path.abspath(f) and hdr["sha"] == sha_of(f), hdr  # a6
+    assert one("SELECT sha, approved_at FROM plan_versions WHERE plan='stp' AND version=1") == {
+        "sha": sha_of(f), "approved_at": None}
+    assert open(f, "rb").read() == original
+    before = dump()
+    out = st("import", f)  # a2: the same bytes: nothing is written
+    assert out["ok"] and out["noop"] is True and out["version"] == 1 and out["changes"] == {
+        "added": [], "changed": [], "removed": []}, out
+    assert dump() == before
+
+    # an edited file is a new version; the change report names added, changed and removed ids (a2, a5)
+    s2 = stp(extra_task=task("S1.3", acceptance="d1"), s11_title="renamed task", with_s21=False)
+    open(f, "w").write(s2)
+    out = st("import", f)
+    assert out["ok"] and out["version"] == 2 and out["noop"] is False, out
+    assert out["changes"] == {"added": ["S1.3"], "changed": ["S1.1"], "removed": ["S2", "S2.1"]}, out
+    assert rows("stp", 1) == v1, "an older version's rows changed"
+    assert [r[2] for r in rows("stp", 2)] == ["S1", "S1.1", "S1.1.1", "S1.2", "S1.3"]
+    assert one("SELECT version FROM plans WHERE id='stp'")["version"] == 2
+
+    # a plan stored before versioned items: the same bytes are a no-op, an edit diffs against header_json
+    legacy = write("legacy.md", plan_text(plan='plan = "legacy"', phases=phase("L1", tasks=task("L1.1")) + "\n"))
+    lparsed = mk("parse", legacy)
+    con = conn()
+    con.execute("INSERT INTO plans(id, version, title, header_json, body_md, status) VALUES (?,?,?,?,?,?)",
+                ("legacy", 1, "legacy", json.dumps({"sha": lparsed["sha"], "phases": lparsed["phases"],
+                                                   "runs": []}), "# body", "draft"))
+    con.commit()
+    con.close()
+    before = dump()
+    out = st("import", legacy)
+    assert out["noop"] is True and out["version"] == 1 and dump() == before, out
+    open(legacy, "w").write(plan_text(plan='plan = "legacy"', phases=phase("L1", tasks=task("L1.1", title="new")) + "\n"))
+    out = st("import", legacy)
+    assert out["version"] == 2 and out["changes"] == {"added": [], "changed": ["L1.1"], "removed": []}, out
+
+    # ---- STORE.1/2: approve marks the imported version, never rewrites the file or an older version ----
+    v2 = rows("stp", 2)
+    file_bytes = open(f, "rb").read()
+    out = st("approve", f, "--run", "rA")
+    assert out["ok"] and out["version"] == 2 and "noop" not in out, out  # a3: THAT version, no v3
+    assert open(f, "rb").read() == file_bytes  # STORE.2 a2: the file is not rewritten
+    assert one("SELECT approved_at FROM plan_versions WHERE plan='stp' AND version=2")["approved_at"]
+    assert one("SELECT approved_at FROM plan_versions WHERE plan='stp' AND version=1")["approved_at"] is None
+    assert rows("stp", 1) == v1 and rows("stp", 2) == v2
+    assert os.path.basename(out["archived"]) == "stp-v2.md" and os.path.isfile(out["archived"])
+    assert one("SELECT status, version FROM plans WHERE id='stp'") == {"status": "approved", "version": 2}
+    assert hdr_source(one, "stp") == os.path.abspath(f)  # approve keeps the import source
+    assert st("approve", f, "--run", "rA")["noop"] is True
+    # an edited file approved without a prior import is a NEW version; versions 1 and 2 stay
+    open(f, "w").write(stp(extra_task=task("S1.3", acceptance="d1"), s11_title="third title", with_s21=False))
+    out = st("approve", f, "--run", "rA")
+    assert out["ok"] and out["version"] == 3, out
+    assert rows("stp", 1) == v1 and rows("stp", 2) == v2 and len(rows("stp", 3)) == 5
+    assert one("SELECT approved_at FROM plan_versions WHERE plan='stp' AND version=3")["approved_at"]
+    # a4: `mkdb plans <id>` reads the rows, not header_json (the current version's task titles)
+    got = db.plans(shome, data_dir=sdata, plan_id="stp")
+    assert [t["title"] for t in got["phases"][0]["tasks"]] == ["third title", "t", "t"], got
+    assert got["version"] == 3 and got["phases"][0]["description"] == "phase why", got
+
+    # ---- STORE.2: status and runs live in the store; the file's bytes stay ----
+    sha_before = sha_of(f)
+    out = st("set", f, "--status", "running")
+    assert out["ok"] and out["status"] == "running" and out["store"] is True, out
+    out = st("add-run", f, "--run", "rB")
+    assert out["ok"] and out["runs"] == ["rB"] and out["added"] is True, out
+    assert st("add-run", f, "--run", "rB")["added"] is False
+    assert sha_of(f) == sha_before, "set/add-run rewrote the file"
+    assert one("SELECT status FROM plans WHERE id='stp'")["status"] == "running"
+    assert json.loads(one("SELECT header_json FROM plans WHERE id='stp'")["header_json"])["runs"] == ["rB"]
+    parsed = st("parse", f)  # a run reads status and runs from the store through parse/check
+    assert parsed["status"] == "running" and parsed["runs"] == ["rB"] and parsed["sha"] == sha_before, parsed
+    assert st("check", f)["status"] == "running"
+    os.makedirs(os.path.join(tmp, "exp-out"))
+    exp = os.path.join(tmp, "exp-out", "stp.md")
+    ex = st("export", exp)
+    assert ex["ok"] and ex["version"] == 3 and open(exp, "rb").read() == open(ex["path"], "rb").read()  # a3
+    assert b'status = "approved"' in open(ex["path"], "rb").read()
+    # approve after status moved on keeps the store's run list (the file has none)
+    assert "rB" in json.loads(one("SELECT header_json FROM plans WHERE id='stp'")["header_json"])["runs"]
+    # regression guard (passes on the old code too): a file plan the store does not hold is read
+    # as before, and a read writes nothing
+    fo = write("fileonly.md", plan_text(plan='plan = "fileonly"', phases=phase("F1") + "\n"))
+    fo_bytes, store_dump = open(fo, "rb").read(), dump()
+    assert st("parse", fo)["status"] == "draft" and st("check", fo)["ok"]
+    assert open(fo, "rb").read() == fo_bytes and dump() == store_dump
+    st("set", fo, "--status", "approved")  # no store row: the file is rewritten as it always was
+    assert b'status = "approved"' in open(fo, "rb").read() and dump() == store_dump
+
+    # ---- STORE.3: item set edits one row of a draft plan, in the store only ----
+    itp = write("itp.md", plan_text(plan='plan = "itp"', phases=(
+        phase("I1", tasks=task("I1.1", acceptance="old acc") + task("I1.2")) + "\n"
+        + phase("I2", wave=2, tasks=task("I2.1")) + "\n")))
+    assert st("import", itp)["version"] == 1
+    itp_bytes = open(itp, "rb").read()
+    os.unlink(itp)  # the plan file is not read: the edit works with no file at all
+    base = dump()
+    out = st("item", "set", "itp", "I1.1", "--title", "better title", "--description", "why now",
+             "--acceptance", "line one\nline two", "--owned", "a.py, b.py", "--deps", "I1.2")
+    assert out["ok"] and out["id"] == "I1.1" and out["version"] == 1, out
+    assert out["changed"] == {"title": "better title", "description": "why now", "acceptance": "line one\nline two",
+                              "owned": "a.py,b.py", "deps": "I1.2"}, out
+    after = dump()
+    assert after["plans"] == base["plans"], "item set moved the plans row or its version"
+    changed_rows = [(a, b) for a, b in zip(base["plan_items"], after["plan_items"]) if a != b]
+    assert len(changed_rows) == 1 and changed_rows[0][0][2] == "I1.1", changed_rows  # every other row is unchanged
+    ph = {t["id"]: t for t in db.plans(shome, data_dir=sdata, plan_id="itp")["phases"][0]["tasks"]}["I1.1"]
+    assert ph["title"] == "better title" and ph["description"] == "why now", ph  # a3: plans <id> shows it
+    assert ph["acceptance"] == "line one\nline two" and ph["owned"] == ["a.py", "b.py"] and ph["deps"] == ["I1.2"], ph
+    assert st("item", "set", "itp", "I1.1", "--title", "better title")["changed"] == {}  # nothing differs
+    # refusals: exit 2 and nothing written (a2)
+    base = dump()
+    for args, needle in (
+            (("stp", "S1.1", "--title", "x"), "not draft"),                       # approved/running plan
+            (("nope", "I1.1", "--title", "x"), "no plan nope"),                    # unknown plan
+            (("itp", "ZZ", "--title", "x"), "no item ZZ"),                         # unknown id
+            (("itp", "I1.1", "--deps", "ghost"), "missing dep: ghost"),            # a dep not in the plan
+            (("itp", "I1.1", "--deps", "I1.1"), "self-dep"),                       # self dep
+            (("itp", "I1.2", "--deps", "I1.1"), "cycle:"),                         # I1.1 -> I1.2 -> I1.1
+            (("itp", "I1.1", "--title", " "), "title must not be empty"),
+            (("itp", "I1.1"), "nothing to change")):
+        bad = st("item", "set", *args, code=2)
+        assert bad["ok"] is False and any(needle in e for e in bad["errors"]), (args, bad)
+        assert dump() == base, args
+    legacy_only = st("item", "set", "legacy", "L1.1", "--title", "x", "--description", "d")  # legacy v2 has rows
+    assert legacy_only["ok"]
+    # a plan whose rows were never written (stored before versioned items) is refused, not guessed at
+    con = conn()
+    con.execute("INSERT INTO plans(id, version, title, header_json, status) VALUES ('bare', 1, 'bare', '{}', 'draft')")
+    con.commit()
+    con.close()
+    assert any("no stored items" in e for e in st("item", "set", "bare", "X", "--title", "x", code=2)["errors"])
+
+    # ---- delete takes the plan's versioned rows with it ----
+    out = st("archive", "itp")
+    out = st("delete", "itp")
+    assert out["ok"] and out["purged"].get("plan_items") == 5 and out["purged"].get("plan_versions") == 1, out
+    assert rows("itp", 1) == [] and one("SELECT 1 AS x FROM plan_versions WHERE plan='itp'") is None
+    assert len(rows("stp", 1)) == 6, "delete of one plan touched another plan's rows"
+
+    # ---- hazard (STORE.2): `mk-state run init --plan <file>` calls check, set and add-run through
+    # plan_tool and keeps working on a stored plan: it reads approved from the store, then the
+    # store (not the file) learns running and the run
+    state = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mk-state.py")
+    rp = write("rinit.md", plan_text(plan='plan = "rinit"', status='status = "draft"',
+                                     phases=phase("R1", tasks=task("R1.1")) + "\n"))
+    st("import", rp)
+    st("approve", rp)
+    rp_bytes = open(rp, "rb").read()
+    r = subprocess.run([sys.executable, state, "--data", sdata, "run", "init", "--id", "rx",
+                        "--feature", "F", "--branch", "b", "--plan", rp],
+                       capture_output=True, text=True, env=dict(os.environ, MATRIXKODER_DATA=sdata))
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    run_out = json.loads(r.stdout.strip().splitlines()[-1])
+    assert run_out["ok"] and run_out["run"]["plan_status"] == "running", run_out
+    assert open(rp, "rb").read() == rp_bytes  # the file was not rewritten by set / add-run
+    assert one("SELECT status FROM plans WHERE id='rinit'")["status"] == "running"
+    assert json.loads(one("SELECT header_json FROM plans WHERE id='rinit'")["header_json"])["runs"] == ["rx"]
+    return itp_bytes
+
+
+def hdr_source(one, plan):
+    return json.loads(one("SELECT header_json FROM plans WHERE id=?", plan)["header_json"]).get("source")
 
 
 def self_test():
@@ -2967,11 +3530,14 @@ def self_test():
                 '  [[phase.task.subtask]]\n  id = "P1.1.1"\n  title = "leaf"\n'
                 '  acceptance = "leaf done"\n  deps = "P1.1"\n  parallel = true\n  route = ""\n  owned = []\n'
             ))) + "\n"))
+        good_before = open(good, "rb").read()
         out = mk("approve", good, "--data", data, "--home", home, "--run", "r1")
         assert out["ok"] and out["store"] is True and out["version"] == 1, out
-        # C13: approve copies, the original file stays (with the approved status line)
+        # C13 + STORE.2: approve copies; the original file stays, byte for byte (the store row and
+        # the archive carry the approved status, the file's status line is not rewritten)
         assert os.path.isfile(good), "approve must leave the original in place"
-        assert b'status = "approved"' in open(good, "rb").read()
+        assert open(good, "rb").read() == good_before
+        assert b'status = "approved"' in open(out["archived"], "rb").read()
         assert "run" not in out and out["tasks_run"] == "r1", out
         arch = out["archived"]
         assert os.path.isfile(arch)
@@ -3139,7 +3705,7 @@ def self_test():
         out = mk("approve", bom, "--data", data, "--home", home, "--run", "rbom")
         assert out["ok"] and os.path.isfile(bom), out  # the BOM file stays too
         archived_bom = open(out["archived"], "rb").read()
-        assert open(bom, "rb").read() == archived_bom  # original synced to the approved bytes
+        assert open(bom, "rb").read() == raw_bom  # STORE.2: the file is not rewritten, the archive holds the approved bytes
         assert archived_bom.startswith(b"\xef\xbb\xbf") and b"\r\n" in archived_bom
         assert b'status = "approved"' in archived_bom
         dest = os.path.join(tmp, "bomplan.md")
@@ -3155,6 +3721,7 @@ def self_test():
                 db.open_project(shome, data_dir=sdata).close()
                 src = write(f"seam-{step}-{n}.md", plan_text(
                     plan=f'plan = "seam{step}{n}"', phases=phase("P1", tasks=task("P1.1")) + "\n"))
+                src_before = open(src, "rb").read()
                 env = dict(os.environ, MATRIXKODER_DATA=sdata, MK_PLAN_KILL_AFTER=step)
                 r = subprocess.run([sys.executable, os.path.abspath(__file__), "approve", src,
                                     "--data", sdata, "--home", shome, "--run", "s1"],
@@ -3172,10 +3739,10 @@ def self_test():
                 assert got["ok"] and got["version"] == 1, got
                 if step == "archive":
                     assert got.get("noop") is True, got
-                # C13: a kill leaves the original in place, and the converging approve brings it
-                # back to the approved bytes the archive holds
+                # C13 + STORE.2: a kill leaves the original in place and the converging approve
+                # does not rewrite it; the archive holds the approved bytes
                 assert os.path.isfile(src), step
-                assert open(src, "rb").read() == open(got["archived"], "rb").read()
+                assert open(src, "rb").read() == src_before
                 assert os.path.isfile(got["archived"])
                 assert b'status = "approved"' in open(got["archived"], "rb").read()
 
@@ -3211,7 +3778,7 @@ def self_test():
             return n, (dict(row) if row is not None else None)
 
         # 1. a good file imports into exactly one plans row and touches no file byte.
-        # the stored version is 0 for a fresh id and the reply reports that same number.
+        # the stored version is 1 for a fresh id (STORE.1: an import is a version) and the reply reports it.
         imp1 = write("imp1.md", plan_text(plan='plan = "imp1"', status='status = "draft"',
                                           phases=phase("P1", tasks=task("P1.1")) + "\n").replace(
             "# body", "# imp1 — Sample Title"))
@@ -3221,7 +3788,7 @@ def self_test():
         assert out["title"] == "Sample Title", out  # the H1 text after the em dash
         n, row1 = plans_rows("imp1")
         assert n == 1, n
-        assert row1["version"] == 0 and out["version"] == row1["version"], (row1, out)
+        assert row1["version"] == 1 and out["version"] == row1["version"], (row1, out)
         assert row1["title"] == "Sample Title"
         con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
         n_tasks = con.execute(
@@ -3574,20 +4141,26 @@ def self_test():
         assert mk("import", plain, "--data", data, "--home", home)["ok"]
         assert mk("approve", plain, "--data", data, "--home", home, "--run", "plainrun")["ok"]
 
-        # pause and back: the file and, with the column, plans.status
+        # pause and back (STORE.2): plans.status changes in the store and the file's bytes stay; parse
+        # and check answer with the store's status once the plan is stored
+        col_before = open(colp, "rb").read()
         parked = mk("set", colp, "--status", "parked", "--data", cols_data, "--home", cols_home)
         assert parked["status"] == "parked" and parked.get("store") is True, parked
-        assert mk("parse", colp)["status"] == "parked"
+        assert open(colp, "rb").read() == col_before
+        assert mk("parse", colp, "--data", cols_data, "--home", cols_home)["status"] == "parked"
+        assert mk("parse", colp)["status"] == "draft"  # no store resolved: the file answers as before
         n, crow = plans_rows("cols", cols_data, cols_home)
         assert crow["status"] == "parked", crow
         back = mk("set", colp, "--status", "approved", "--data", cols_data, "--home", cols_home)
         assert back["status"] == "approved", back
         n, crow = plans_rows("cols", cols_data, cols_home)
         assert crow["status"] == "approved", crow
-        # a store without the column: set still rewrites the file and does not error
+        # the plan is in the store: set changes the store row and never the file
+        plain_before = open(plain, "rb").read()
         assert mk("set", plain, "--status", "parked", "--data", data, "--home", home)["status"] == "parked"
-        assert mk("parse", plain)["status"] == "parked"
+        assert mk("parse", plain, "--data", data, "--home", home)["status"] == "parked"
         assert mk("set", plain, "--status", "approved", "--data", data, "--home", home)["status"] == "approved"
+        assert open(plain, "rb").read() == plain_before
 
         # no --data, cwd = a temp repo whose .matrixkoder/mk.db exists -> store: true
         repo = os.path.join(tmp, "repo")
@@ -3705,6 +4278,9 @@ def self_test():
                           )["description"] == "Why this plan"
         for none in ({}, {"description": ""}, {"description": "  "}, {"description": 5}):
             assert "description" not in json.loads(header_json_of(dict(base, **none), "s", "b", "draft"))
+
+        # STORE: versioned plan_items, status/runs in the store, item set
+        store_self_test(tmp, mk, write, plan_text, phase, task, db, mkpaths)
 
         print("mk-plan self-test ok")
     finally:
