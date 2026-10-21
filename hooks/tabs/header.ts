@@ -8,6 +8,7 @@
 // count come from it and the rest from their own files.
 import type { MkDashTab } from '../../types'
 import { LANES_FIXTURE } from './lanes.fixture'
+import { INBOX_FIXTURE } from './inbox.fixture'
 import { OVERVIEW_FIXTURE } from './overview.fixture'
 import { WAITING_FIXTURE } from './waiting.fixture'
 
@@ -42,7 +43,8 @@ export function waitingCount(openDecisions: number): string {
 
 /** The tab bar's per-tab counts on a mock tab, from the same fixtures:
  *  Lanes = live lanes, Plan = done/total, Waiting = open decisions
- *  (Controls.dc.html's `l 4`, `p 3/8`, `w !1`). The other tabs carry none. */
+ *  (Controls.dc.html's `l 4`, `p 3/8`, `w !1`), Inbox = files waiting. The
+ *  other tabs carry none. */
 export function mockTabCounts(): Record<MkDashTab, string> {
   const plan = OVERVIEW_FIXTURE.plan
   return {
@@ -53,6 +55,7 @@ export function mockTabCounts(): Record<MkDashTab, string> {
     files: '',
     events: '',
     waiting: waitingCount(WAITING_FIXTURE.options.length > 0 ? 1 : 0),
+    inbox: String(INBOX_FIXTURE.counts.inbox),
     todo: '',
     improve: '',
     settings: '',

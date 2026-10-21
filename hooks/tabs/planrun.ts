@@ -132,6 +132,26 @@ export function taskPrompt(planId: string, task: PlanTask, phases: readonly Plan
   return [HEADING, `${verb} task ${task.id} of plan ${planId}${inPhase}: ${quote(task.title)}.`, ...numbered(parts)].join('\n')
 }
 
+/** The prompt for Improve on a draft plan's phase or task: what the row says now and the one
+ *  command that writes a change into its stored row (STORE.3). A draft has no builder to start,
+ *  so this asks for a better row, not for work; nothing is sent until the person accepts. */
+export function improveItemPrompt(planId: string, what: 'phase' | 'task', row: PlanPhase | PlanTask, phases: readonly PlanPhase[]): string {
+  const parts: string[] = []
+  if (row.description != null && row.description !== '') parts.push(`What it says now: ${row.description}`)
+  const acceptance = row.acceptance != null && row.acceptance.trim() !== '' ? row.acceptance.trim() : ''
+  if (acceptance !== '') parts.push(`Done means now: ${acceptance}`)
+  const owned = row.owned ?? []
+  if (owned.length > 0) parts.push(`Files it owns now: ${owned.join(', ')}.`)
+  const needs = needsFirst(depStatuses(row.deps, phases))
+  if (needs !== '') parts.push(`Needs first now: ${needs}.`)
+  parts.push(`Make this ${what} clearer and tighter for its builder: the title says what it delivers, the description says why and how in plain words, acceptance says what done means. Keep what already reads well.`)
+  parts.push(`Write the change into the plan's stored row; a field left out keeps its stored value:`)
+  parts.push(`mk-plan.py item set ${planId} ${row.id} --title "…" --description "…" --acceptance "…" --owned "<paths>" --deps "<ids>"`)
+  parts.push(`Change only ${row.id}. Nothing else in the plan changes.`)
+  const verb = what === 'phase' ? 'phase' : 'task'
+  return [HEADING, `Improve ${verb} ${row.id} of plan ${planId} (draft): ${quote(row.title)}.`, ...numbered(parts)].join('\n')
+}
+
 /** The prompt for Pause on a phase or task: what to stop, what is left, and the
  *  loop. Pause asks; it stops nothing by itself. */
 export function pausePrompt(planId: string, what: 'phase' | 'task', row: PlanPhase | PlanTask, phases: readonly PlanPhase[]): string {

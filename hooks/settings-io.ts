@@ -262,6 +262,7 @@ const TAB_OPTS: readonly (readonly [string, string])[] = [
   ['files', ''],
   ['events', ''],
   ['waiting', ''],
+  ['inbox', ''],
   ['todo', ''],
   ['improve', ''],
   ['settings', 'this tab'],
@@ -315,6 +316,7 @@ export const TAB_VISIBILITY: readonly { id: string; hotkey: string; label: strin
   { id: 'usage', hotkey: 'u', label: 'u Usage', help: 'Quota bars per agent.' },
   { id: 'events', hotkey: 'e', label: 'e Events', help: 'The run’s event log.' },
   { id: 'waiting', hotkey: 'w', label: 'w Waiting', help: 'Decisions open on you.' },
+  { id: 'inbox', hotkey: 'n', label: 'n Inbox', help: 'Plan files waiting to become projects.' },
 ]
 
 /** A hiddenTabs value as a set of tab ids (keys or labels, like the

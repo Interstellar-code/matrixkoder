@@ -2099,3 +2099,54 @@ test('wake off: no lease is ever written', { options: { wake: false } }, async (
   expect(noWakeKeys(w)).toEqual([])
   expect(w.lease.size, 'no lease').toBe(0)
 })
+
+// ---------- WIRE.1.a5: an inbox event never wakes the orchestrator ----------
+
+test('WIRE.1.a5: an inbox row in the store wakes nothing — wake reads the state channel by run', { options: { wake: true } }, async ($, on) => {
+  // A real inbox row (C5): chan inbox, run NULL, a kind wake has never heard of. It sits in the
+  // same store beside the run's own feed; wake's reader passes no --chan, so it reads chan state
+  // for the active run only, and this row is not in that answer.
+  const clock = mock.clock(on)
+  const files: Record<string, string> = {
+    '/data/mk.db': '',
+    '/data/runs/index.json': JSON.stringify([{ id: 'r1', status: 'active' }]),
+    '/data/runs/r1/events.jsonl': '',
+  }
+  const w = wakeWorld(on, files, [], { MATRIXKODER_DATA: '/data' }, '/tmp')
+  const seen: string[][] = []
+  const inboxRow = {
+    id: 9, run: null, task: null, t: '2026-10-21T23:16:15+02:00', chan: 'inbox', kind: 'imported',
+    from_id: 'user', to_id: null, reply_to: null, text: 'imported plan-inbox-and-parsing.md as plan-inbox-and-parsing',
+    meta_json: JSON.stringify({ file: 'plan-inbox-and-parsing.md', plan: 'plan-inbox-and-parsing', fit: 'template', by: 'user' }),
+  }
+  const ok = (body: unknown) => ({ value: { exitCode: 0, stdout: JSON.stringify(body), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+  on('process.run', (_$, e, next) => {
+    const argv = [...e.argv] as string[]
+    if (argv.includes('run-snapshot')) {
+      seen.push(argv)
+      return ok({ ok: true, store: true, runs: [{ id: 'r1', status: 'active' }], active: 'r1', run: { id: 'r1', status: 'active', stage: 0, tasks: [] } })
+    }
+    if (argv.includes('events')) {
+      seen.push(argv)
+      // the reader is asked for a run and no explicit channel: the inbox row is not in this answer
+      if (argv.includes('--chan') && argv[argv.indexOf('--chan') + 1] === 'inbox') return ok({ ok: true, events: [inboxRow] })
+      return ok({ ok: true, events: [] })
+    }
+    return next(e)
+  })
+  await $.session.start(START('/tmp'))
+  await clock.advance(30000)
+  await clock.advance(60000)
+  await clock.advance(300000)
+  expect(w.submitted, 'an inbox step never wakes').toEqual([])
+  expect(w.seenAtSubmit, 'prompt.submit was never even called').toEqual([])
+  const reads = seen.filter(a => a.includes('events'))
+  expect(reads.length, 'wake did read its own feed').toBeGreaterThan(0)
+  for (const argv of reads) {
+    expect(argv[argv.indexOf('--chan') + 1], 'never the inbox channel').not.toBe('inbox')
+    expect(argv, 'and always a run').toContain('--run')
+  }
+  // the run's own feed is empty, so no cursor is written at all: the inbox row's id 9 never
+  // reaches wake's cursor, and a later real transition starts from the feed's own ids
+  expect(w.store.get('wakeEventLines:r1'), 'the inbox row sets no wake cursor').toBeUndefined()
+})

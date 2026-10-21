@@ -288,7 +288,10 @@ a safety gate writes exactly one `decision` event `forced by <by>: <command summ
 `--by` flag, default `orchestrator`): `task set` past unmet own+ancestor deps, `run init --plan` past
 an unapproved plan status. `text` must be non-empty; a `transition` event needs `to`.
 
-`chan` is `state` on a state event, `bus` on a live bus message (C6) and `note` for an ad-hoc note.
+`chan` is `state` on a state event, `bus` on a live bus message (C6), `note` for an ad-hoc note and
+`inbox` for a plan file's step in the Inbox (C5: `run`/`task` NULL, so no run owns it — only this
+channel may omit the run; `scripts/mk-inbox.py` writes it and the Events tab reads it with
+`mkdb.py events --chan inbox --json`, never waking the orchestrator).
 Status changes go **only** through `mkdb.transition()`: `append_event` refuses `chan='state'` with
 `kind='transition'`. A live bus message stays in the project DB while the run is open; at run end the
 run's messages, acks and bus artifacts are archived (count-checked) to
@@ -894,7 +897,8 @@ status is not transitioned again. The tasks table inserts parents before childre
 the reader overlays the rows back onto the run's task order.
 
 `events(id INTEGER PRIMARY KEY, run, task, t, chan, kind, from_id, to_id, reply_to, text,
-artifact_id, meta_json)` with index `ev_task(run, task, id)`. `chan` is `state`, `bus` or `note`;
+artifact_id, meta_json)` with index `ev_task(run, task, id)`. `chan` is `state`, `bus`, `note` or
+`inbox` (C5: an inbox row has `run` and `task` NULL; `meta_json` is `{file, plan, fit, by}`);
 `kind` is the event type. Status changes go only through `transition()` (`chan='state'`,
 `kind='transition'`); `append_event` refuses that pair.
 `change_log(change_no INTEGER PRIMARY KEY, run, task, t)` — `change_no` is the rowid, gap-free.

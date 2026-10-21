@@ -3,7 +3,8 @@
 // prompt, pinned for rows of the captured `mkdb plans <id> --json` reply.
 import { test, expect } from 'claude-code/testing'
 import { canPause, canPlay, depsMet } from './planrun'
-import { pausePrompt, phasePrompt, taskPrompt } from './planrun'
+import { improveItemPrompt, pausePrompt, phasePrompt, taskPrompt } from './planrun'
+import { PLAN_PROMPT_HEADING } from '../improve-core'
 import { planFromReply } from './plans-map'
 import detailFixture from './fixtures/plan-detail'
 
@@ -131,4 +132,37 @@ test('every prompt opens with the dashboard heading and names no loop, lane or r
     expect(text).not.toContain('MatrixKoder loop')
     expect(text).not.toContain('Do not edit plan statuses by hand')
   }
+})
+
+// ---------- WIRE.3: the Improve prompt a draft row drafts ----------
+
+test('WIRE.3.a2: the Improve prompt names the row data and mk-plan.py item set as the way to write it', () => {
+  const phase = phaseOf('R1')
+  const text = improveItemPrompt('settings-plans-db', 'phase', phase, phases)
+  expect(text.startsWith(PLAN_PROMPT_HEADING), 'the Plan prompt heading').toBe(true)
+  expect(text).toContain('Improve phase R1 of plan settings-plans-db (draft)')
+  expect(text).toContain('"Self-tests never write a real DB"') // the title, cut at its first colon
+  expect(text).toContain('What it says now: Every self-test now runs in a throwaway home folder.')
+  expect(text).toContain('Files it owns now: scripts/*.py, scripts/selftest.sh, child-skills/mk-builder/scripts/.')
+  expect(text).toContain('mk-plan.py item set settings-plans-db R1 --title "…" --description "…" --acceptance "…" --owned "<paths>" --deps "<ids>"')
+  expect(text).toContain('Change only R1.')
+})
+
+test('WIRE.3.a2: a task Improve prompt carries its acceptance, owned files, deps and its phase id', () => {
+  const task = taskOf('R1.1')
+  const text = improveItemPrompt('settings-plans-db', 'task', task, phases)
+  expect(text).toContain('Improve task R1.1 of plan settings-plans-db (draft)')
+  expect(text).toContain('Done means now: C16 holds.')
+  expect(text).toContain('Files it owns now:')
+  expect(text).toContain('mk-plan.py item set settings-plans-db R1.1')
+  expect(text).toContain('Change only R1.1.')
+})
+
+test('WIRE.3.a2: an empty row still names the row and the command, and never asks for a model call of its own', () => {
+  const bare = { id: 'R9', title: 'a bare row', status: 'planned', right: '', rows: [] }
+  const text = improveItemPrompt('p1', 'phase', bare, [])
+  expect(text).toContain('Improve phase R9 of plan p1 (draft): "a bare row".')
+  expect(text).not.toContain('What it says now:')
+  expect(text).not.toContain('Files it owns now:')
+  expect(text).toContain('mk-plan.py item set p1 R9')
 })

@@ -638,3 +638,54 @@ test('P1.3: a folded phase row draws no Play; an expanded one does', () => {
   const open = nodesOf(PlanTab(stubEls, runningView(), 80, new Map([['plan:phase:S1', '1']])), 'Button').map(b => String(b.props?.key))
   expect(open).toContain('plan-phase-play-S1')
 })
+
+/** ── WIRE.3: Improve on a draft plan's rows ─────────────────────────────── */
+
+/** the same fixture with the plan still a draft (no run, so no task rows exist yet) */
+const draftView = () => {
+  const v = runningView()
+  return { ...v, plan: { ...v.plan!, status: 'draft' } }
+}
+
+test('WIRE.3.a1: a draft plan draws Improve on every phase and task row, and no Play or Pause', () => {
+  const ui = new Map<string, string>([['plan:phase:S1', '1'], ['plan:phase:V1.5', '1']])
+  const keys = nodesOf(PlanTab(stubEls, draftView(), 80, ui), 'Button').map(b => String(b.props?.key))
+  expect(keys).toContain('plan-phase-improve-S1')
+  expect(keys).toContain('plan-phase-improve-V1.5')
+  expect(keys).toContain('plan-task-improve-S1.1')
+  expect(keys).toContain('plan-task-improve-V1.5.2')
+  expect(keys.filter(k => k.startsWith('plan-phase-play-') || k.startsWith('plan-phase-pause-'))).toEqual([])
+  expect(keys.filter(k => k.startsWith('plan-task-play-') || k.startsWith('plan-task-pause-'))).toEqual([])
+})
+
+test('WIRE.3.a1: an approved, running or done plan draws no Improve at all, and Play/Pause stay', () => {
+  for (const status of ['approved', 'running', 'done']) {
+    const v = draftView()
+    const view = { ...v, plan: { ...v.plan!, status } }
+    const ui = new Map<string, string>([['plan:phase:S1', '1']])
+    const keys = nodesOf(PlanTab(stubEls, view, 80, ui), 'Button').map(b => String(b.props?.key))
+    expect(keys.filter(k => k.includes('-improve-')), `${status} draws no Improve`).toEqual([])
+  }
+  // running still offers Play/Pause exactly as before
+  const ui = new Map<string, string>([['plan:phase:S1', '1'], ['plan:phase:V1.5', '1']])
+  const runningKeys = nodesOf(PlanTab(stubEls, runningView(), 80, ui), 'Button').map(b => String(b.props?.key))
+  expect(runningKeys).toContain('plan-task-play-S1.1')
+  expect(runningKeys).toContain('plan-task-pause-V1.5.2')
+  expect(runningKeys.filter(k => k.includes('-improve-'))).toEqual([])
+})
+
+test('WIRE.3.a1: a folded draft phase draws the phase Improve and no task Improve', () => {
+  const keys = nodesOf(PlanTab(stubEls, draftView(), 80, new Map()), 'Button').map(b => String(b.props?.key))
+  expect(keys).toContain('plan-phase-improve-S1')
+  expect(keys.filter(k => k.startsWith('plan-task-improve-'))).toEqual([])
+})
+
+test('WIRE.3.a2: pressing a draft row Improve calls onAction once with `improve task <id>`, never a plan kind', () => {
+  const ui = new Map<string, string>([['plan:phase:S1', '1']])
+  const calls: string[] = []
+  const base = draftView()
+  const view = { ...base, onAction: (kind: string) => { calls.push(kind) } }
+  press(PlanTab(stubEls, view, 80, ui), 'plan-task-improve-S1.1')
+  press(PlanTab(stubEls, view, 80, ui), 'plan-phase-improve-S1')
+  expect(calls).toEqual(['improve task S1.1', 'improve phase S1'])
+})
