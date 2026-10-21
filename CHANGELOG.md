@@ -2,6 +2,35 @@
 
 All notable changes to this project. Format: Keep a Changelog; versions: SemVer.
 
+## [0.7.2] - 2026-10-21
+
+### Added
+- **improve:** the Improve tab follows the slides, with fixes (5ae6205)
+- **improve:** the footer Run Wizard card follows the slides, with fixes (5894e5a)
+- **wizard:** steps 6-10 and review follow the slides, with fixes (02717fd)
+- **wizard:** steps 1-5 follow the slides, with fixes (285ef29)
+- **wizard:** shared header, progress, nav and states follow the slides (255632f)
+
+### Fixed
+- **wizard:** review minors — drop unused driftOf import, drift lines dim (a39d39f)
+- **wizard:** the setup pane wears the Matrix theme (2cfaded)
+- **wizard:** list drift against the existing yaml on Review (B-15) (d0a6c77)
+- **wizard:** read the herdr link path and relink a stale one (B-17) (dbc6c9f)
+- **state:** the root row's mode follows the data dir layout (B-10) (b4cddd7)
+- **wizard:** the replace diff is a real line diff, not positional (B-19) (d7ef210)
+- **wizard:** yaml file names come from paths.ts (C1) (b38bff9)
+- **improve:** Run Wizard flow fixes (questions, rewrite, edit, cancel, seed) (77836fb)
+- **wizard:** a migrated project writes in its C2 folder, as the pane reads it (da542af)
+
+### Docs
+- **claude-md:** name the CodeGraph tool in full, mcp__codegraph__codegraph_explore (bc48ae0)
+- **plan-template:** fixed Summary and body sections, new-plan rules, header notes (e39e33c)
+- the setup wizard and the Run Wizard after the redesign (f853dc3)
+
+### Other
+- **improve:** move ImproveTab into its own file (8ebcdbb)
+- **wizard:** move step bodies into two files (a6c1b52)
+
 ## [0.7.1] - 2026-10-20
 
 ### Added
