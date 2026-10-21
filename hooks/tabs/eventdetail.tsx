@@ -1,8 +1,8 @@
 // The /mk pane's Events tab detail card: the full content of one event row,
 // drawn in place of the list when a row is pressed (`events:detail` holds its
 // id) — a kit Card titled `<id> · <kind>`: when (full date and time), source,
-// from → to, task (or lane), reply_to, ack (bus rows), problem (a bad row) and
-// the author, then the whole text (wrapped, one line per newline). An answer
+// from → to, task (or lane), reply_to, ack (bus rows), problem (a bad row), an
+// inbox row's file, plan id and fit, and the author, then the whole text (wrapped, one line per newline). An answer
 // shows the ask it replies to, an ask the answer to it, when the view carries
 // that row. A field the row does not carry is simply left out — no `undefined`
 // text. The footer dim line `esc close` is pressable (`onClose` clears
@@ -75,6 +75,9 @@ export function EventDetailPanel(els: Els, ev: EventItem, related: EventItem | n
           <Text color={ROLE.err.fg}>{'! yes'}</Text>
         </Box>
       )}
+      {has(ev.file) && fieldRow(els, 'file', ev.file)}
+      {has(ev.plan) && fieldRow(els, 'plan', ev.plan)}
+      {has(ev.fit) && fieldRow(els, 'fit', ev.fit)}
       {has(ev.by) && fieldRow(els, 'by', ev.by)}
       {lines.length > 0 && (
         <Box flexDirection="column" marginTop={1}>

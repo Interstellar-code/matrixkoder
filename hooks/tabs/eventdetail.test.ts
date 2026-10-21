@@ -170,3 +170,32 @@ test('the header yields to the close button at a narrow width', () => {
   expect(header(24).length).toBeLessThanOrEqual(24 - 4 - 1 - iconWidth('close', true))
   expect(header(24).endsWith('…')).toBe(true)
 })
+
+// ---------- EVT.2: an inbox row (plan inbox-and-parsing, C5) ----------
+
+/** a row as the loader builds it from a real inbox event: no from, to, task, lane or ack; its file, plan id and fit from the meta */
+const INBOX: EventItem = {
+  id: 'i-10', src: 'inbox', t: '23:16', date: '2026-10-21T23:16:15+02:00', kind: 'imported', chan: 'inbox', by: 'user',
+  file: 'plan-inbox-and-parsing.md', plan: 'plan-inbox-and-parsing', fit: 'template',
+  text: 'imported plan-inbox-and-parsing.md as plan-inbox-and-parsing',
+}
+
+test('an inbox row shows its file name and plan id (and fit), with no ack line and no empty field', () => {
+  for (const cols of [36, 40, 46] as const) {
+    const drawn = EventDetailPanel(stubEls(), INBOX, undefined, cols)
+    const keys = keysOf(drawn)
+    expect(keys).toEqual(expect.arrayContaining(['when', 'source', 'file', 'plan', 'fit', 'by']))
+    expect(keys).not.toContain('ack')
+    expect(keys).not.toContain('task')
+    const flat = allText(drawn)
+    expect(flat).toContain('i-10 · imported')
+    expect(flat).toContain('plan-inbox-and-parsing.md')
+    expect(flat).toContain('inbox') // the source
+    expect(flat).toContain('template')
+    expect(flat).not.toMatch(/undefined|null/)
+  }
+  // a row without them draws neither line
+  const bare = keysOf(EventDetailPanel(stubEls(), { id: 'x', kind: 'info', t: '1:00', text: 't' }, undefined, 46))
+  expect(bare).not.toContain('file')
+  expect(bare).not.toContain('plan')
+})

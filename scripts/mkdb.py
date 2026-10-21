@@ -8,6 +8,7 @@
   overview --json                            # the root's projects + plans: numbers and db_path (C3)
   run-snapshot --project P [--run R] --json    # the runs list, the active run and its tasks (L5)
   events --project P --run R [--task T] [--chan C] [--since N] --json   # the run's events (L5)
+  events --project P --chan inbox [--since N] --json                    # the inbox channel: no run (C5)
 
 Common: --data DIR (the project data dir; until DM a project lives at <repo>/.matrixkoder/),
 --home DIR (the MK home, default $MK_HOME or ~/.matrixkoder), --project SLUG.
@@ -1244,6 +1245,11 @@ def import_history(home, project, run, *, run_row=None, tasks=(), events=(), art
 # Live bus writers (D1D). change_log is written only when a task row changes — the same rule
 # import_history uses — so these helpers do not write change_log: they never touch tasks.status.
 LIVE_CHANS = ("state", "bus", "note")
+# plan inbox-and-parsing C5: the inbox channel is project-wide, so its rows carry run NULL (and no
+# task). It is the only channel that may omit the run; wake.ts reads the state channel only, so an
+# inbox row never wakes the orchestrator.
+INBOX_CHAN = "inbox"
+INBOX_KINDS = ("found", "checked", "import-step", "imported", "import-failed", "archived", "restored", "deleted")
 ARTIFACT_MAX = 256 * 1024
 
 
@@ -1270,9 +1276,17 @@ def append_event(home, project, run, *, task=None, chan, kind, from_id=None, to_
     Does not touch tasks.status and does not write change_log (import_history's rule: a change_log
     row is written only when a task row changes). chan='state' with kind='transition' is refused —
     status changes go through transition() only (C10).
+
+    chan='inbox' (C5) is the one channel without a run: run and task must be None, kind one of
+    INBOX_KINDS, and the row is stored with run NULL. Every other channel refuses a missing run.
     """
-    if chan not in LIVE_CHANS:
-        raise Fail(f"unknown chan {chan!r}: expected state|bus|note")
+    inbox = chan == INBOX_CHAN
+    if chan not in LIVE_CHANS and not inbox:
+        raise Fail(f"unknown chan {chan!r}: expected state|bus|note|inbox")
+    if inbox and (run is not None or task is not None or artifact_id is not None):
+        raise Fail("chan='inbox' has no run, task or artifact: pass run=None")
+    if inbox and kind not in INBOX_KINDS:
+        raise Fail(f"unknown inbox kind {kind!r}: expected one of {', '.join(INBOX_KINDS)}")
     if chan == "state" and kind == "transition":
         raise Fail("chan='state' kind='transition' is refused; status changes go through transition()")
     if not isinstance(kind, str) or not kind:
@@ -1289,8 +1303,9 @@ def append_event(home, project, run, *, task=None, chan, kind, from_id=None, to_
     try:
         _begin(con)
         try:
-            _require_run(con, run)
-            _require_task(con, run, task)
+            if not inbox:
+                _require_run(con, run)
+                _require_task(con, run, task)
             if artifact_id is not None:
                 art = con.execute("SELECT 1 FROM artifacts WHERE id=? AND run=?",
                                   (artifact_id, run)).fetchone()
@@ -1428,11 +1443,17 @@ def events(home, project, run, data_dir=None, task=None, chan="state", since=Non
     from; pass '' for every channel. Read-only like timeline(): a missing store is an empty
     list, no file and no directory is created. meta_json carries `by` and the source key; a
     direct mkdb.transition() leaves it NULL, which the reader maps to "orchestrator".
+    chan='inbox' (C5) is project-wide: its rows have run NULL, so `run` is ignored and may be None.
+    Any other channel needs a run.
     """
+    if chan != INBOX_CHAN and not run:
+        raise Fail(f"events needs a run unless chan is {INBOX_CHAN!r}")
     con = _open_read(_store_path(home, project, data_dir), SCHEMA)
     if con is None:
         return []
-    where, params = ["run=?"], [run]
+    where, params = ["run IS NULL"], []
+    if chan != INBOX_CHAN:
+        where, params = ["run=?"], [run]
     if task:
         where.append("task=?")
         params.append(task)
@@ -2669,9 +2690,9 @@ def _cli(argv):
     rs.add_argument("--run", help="one run id; omit for the newest active run")
     rs.add_argument("--json", action="store_true")
     ev = sub.add_parser("events")
-    ev.add_argument("--run", required=True)
+    ev.add_argument("--run", help="run id; not needed with --chan inbox (project-wide, run NULL)")
     ev.add_argument("--task")
-    ev.add_argument("--chan", default="state", help="channel; '' reads every channel")
+    ev.add_argument("--chan", default="state", help="channel; '' reads every channel; inbox needs no --run")
     ev.add_argument("--since", type=int, help="only rows past this events.id (the wake cursor)")
     ev.add_argument("--json", action="store_true")
     td = sub.add_parser("todo")
@@ -4977,6 +4998,49 @@ def _live_writers(home):
             _check(blame in str(e), f"expected {blame} in {e}")
         else:
             raise SystemExit(f"SELF-TEST FAIL: {blame} accepted")
+    # EVT.1 (C5): the inbox channel is project-wide — written with run NULL, read back by
+    # `events --chan inbox` with no --run; every other channel still refuses a missing run (pinned)
+    for chan in ("state", "bus", "note"):
+        try:
+            append_event(home, "live", None, chan=chan, kind="info", data_dir=data)
+        except Fail as e:
+            _check("invalid run" in str(e), f"{chan} without a run: expected 'invalid run' in {e}")
+        else:
+            raise SystemExit(f"SELF-TEST FAIL: chan={chan} without a run accepted")
+    ia = append_event(home, "live", None, chan="inbox", kind="found", text="plan.md found",
+                      meta={"file": "plan.md", "plan": "p1", "fit": "template", "by": "user"}, data_dir=data)
+    ib = append_event(home, "live", None, chan="inbox", kind="deleted", text="plan.md deleted",
+                      meta={"file": "plan.md", "plan": "p1", "fit": "template", "by": "user"}, data_dir=data)
+    _check(ib == ia + 1, f"inbox ids not increasing: {ia}, {ib}")
+    con = open_project(home, data_dir=data)
+    try:
+        row = dict(con.execute("SELECT * FROM events WHERE id=?", (ia,)).fetchone())
+        _check(row["run"] is None and row["task"] is None and row["chan"] == "inbox", row)
+        _check(json.loads(row["meta_json"])["plan"] == "p1", row["meta_json"])
+    finally:
+        con.close()
+    got_inbox = _cli(["events", "--json", "--home", home, "--data", data, "--chan", "inbox"])
+    _check(got_inbox["ok"] and [e["id"] for e in got_inbox["events"]] == [ia, ib]
+           and [e["kind"] for e in got_inbox["events"]] == ["found", "deleted"], got_inbox)
+    _check(events(home, "live", None, data_dir=data, chan="inbox", since=ia)[0]["kind"] == "deleted", "inbox --since")
+    # the other channels never see them: not in the run's state feed, nor in its every-channel feed
+    _check(all(e["chan"] != "inbox" for e in events(home, "live", "r", data_dir=data, chan="")), "inbox row leaked into a run feed")
+    _check(events(home, "live", "r", data_dir=data) == [], "inbox row leaked into the state feed")
+    for bad, blame in ((dict(run="r", chan="inbox", kind="found"), "no run"), (dict(run=None, chan="inbox", kind="bogus"), "unknown inbox kind"),
+                       (dict(run=None, task="t", chan="inbox", kind="found"), "no run, task")):
+        try:
+            append_event(home, "live", bad.pop("run"), data_dir=data, **bad)
+        except Fail as e:
+            _check(blame in str(e), f"expected {blame} in {e}")
+        else:
+            raise SystemExit(f"SELF-TEST FAIL: bad inbox write {bad} accepted")
+    for cmd in (["events", "--json", "--home", home, "--data", data], ["events", "--json", "--home", home, "--data", data, "--chan", ""]):
+        try:
+            _cli(cmd)
+        except Fail as e:
+            _check("needs a run" in str(e), str(e))
+        else:
+            raise SystemExit(f"SELF-TEST FAIL: events without --run accepted for {cmd}")
     _check(append_ack(home, "live", "r", "m1", "lane", 1, data_dir=data) is True, "ack insert")
     _check(append_ack(home, "live", "r", "m1", "lane", 1, data_dir=data) is False, "ack not idempotent")
     _check(append_ack(home, "live", "r", "m1", "lane", 0, data_dir=data) is False, "ack level decreased")

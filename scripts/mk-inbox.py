@@ -5,8 +5,9 @@
   list --json [--home DIR] [--data DIR]
                          one JSON line: {ok, files:[{id, path, title, fit, sections_found,
                          sections_total, missing, age_s, archived, note}], counts:{inbox, template,
-                         fix, archived}}. Read-only. The class of each file is `mk-plan.py check
-                         --classify` (a subprocess, the C2 reply); nothing is parsed twice.
+                         fix, archived}}. Never writes or moves a plan file. The class of each file is
+                         `mk-plan.py check --classify` (a subprocess, the C2 reply); nothing is parsed
+                         twice. It records inbox events (below) in the project store, best effort.
   import <id>            mk-plan.py import into the project store, in three reported steps; a flat
                          <topic>.md then moves to inbox/archive/ (a plan folder moves itself)
   archive <id>           inbox/ -> inbox/archive/ (refused when the target exists)
@@ -18,6 +19,13 @@ The standard is one flat <inbox>/<topic>.md per plan; a folder holding plan.md (
 imports) is still listed and acted on. A plan's id is the `plan = "..."` of its header (a file with
 no header falls back to its file name without .md). `path` is the base name (`<folder>/plan.md` for
 a folder), never an absolute path.
+
+Every action is recorded as an event on the project store's inbox channel (C5, run NULL):
+found, checked, import-step, imported, import-failed, archived, restored, deleted, each with
+meta {file, plan, fit, by}; `by` is --by (default user). list writes `found` once per file it has
+never seen (same file name and plan id) and `checked` only when a file's class (fit, sections found,
+missing names) differs from its last `checked` event, so repeated list calls add nothing. A failed
+event write never fails the action: the reply carries a `warnings` entry instead.
 
 Every command prints ONE final JSON line, {"ok": true, ...} exit 0 or {"ok": false, "errors": [...]}
 exit 2, like mk-plan.py. `import` prints one {"progress": ...} line per step before it. The script
@@ -185,16 +193,97 @@ def describe(e, data, home, now):
             "missing": cls["missing"], "age_s": age, "archived": e["archived"], "note": cls["note"]}
 
 
+# ---------- inbox events (C5) ----------
+
+class EventLog:
+    """Best-effort writer of the project store's inbox channel. It never creates a store and never
+    raises: a missing store or a failed write becomes one entry in `warnings` and the action goes on."""
+
+    def __init__(self, data, home, by):
+        self.home, self.by, self.warnings, self.ok, self.db, self.data = home, by, [], False, None, None
+        try:
+            self.data = mkpaths.data_dir(data, required=False)
+            self.db = _load("mkdb", "mkdb.py")
+            self.ok = self.data is not None and self.db._store_present(home, None, self.data)
+            if not self.ok:
+                self.warnings.append("no project store: inbox events not recorded")
+        except Exception as err:  # noqa: BLE001 - the action must not fail on its event log
+            self.warnings.append(f"inbox events not recorded: {type(err).__name__}: {err}")
+
+    def write(self, kind, file, plan, fit, text, **extra):
+        if not self.ok:
+            return
+        meta = {"file": file, "plan": plan, "fit": fit, "by": self.by, **extra}
+        try:
+            self.db.append_event(self.home, None, None, chan="inbox", kind=kind, from_id=self.by,
+                                 text=text, meta=meta, data_dir=self.data)
+        except Exception as err:  # noqa: BLE001
+            self.ok = False  # one warning, not one per remaining event
+            self.warnings.append(f"inbox event {kind} not recorded: {type(err).__name__}: {err}")
+
+    def seen(self):
+        """({(file, plan)} that have a `found` event, {(file, plan): class of the last `checked`})."""
+        found, checked = set(), {}
+        if not self.ok:
+            return found, checked
+        try:
+            rows = self.db.events(self.home, None, None, data_dir=self.data, chan="inbox")
+        except Exception as err:  # noqa: BLE001
+            self.ok = False
+            self.warnings.append(f"inbox events not read: {type(err).__name__}: {err}")
+            return found, checked
+        for row in rows:
+            try:
+                meta = json.loads(row.get("meta_json") or "{}")
+            except ValueError:
+                continue
+            key = (meta.get("file"), meta.get("plan"))
+            if row.get("kind") == "found":
+                found.add(key)
+            elif row.get("kind") == "checked":
+                checked[key] = class_sig(meta)
+        return found, checked
+
+    def fit_of(self, entry, home, data):
+        """The fit of an entry, only worth a subprocess when events are being recorded."""
+        return check_plan_file(entry["md"], data, home)["fit"] if self.ok else None
+
+
+def class_sig(meta_or_file):
+    """What `checked` compares: fit, sections found and the missing names."""
+    m = meta_or_file
+    return (m.get("fit"), m.get("sections_found"), tuple(m.get("missing") or ()))
+
+
+def with_warnings(out, log):
+    if log.warnings:
+        out["warnings"] = list(out.get("warnings") or []) + log.warnings
+    return out
+
+
 # ---------- list ----------
 
 def cmd_list(a):
     box, home = inbox_root(a.home), mkpaths.home(a.home)
     now = time.time()
     files = [describe(e, a.data, home, now) for e in all_entries(box)]
+    log = EventLog(a.data, home, a.by) if files else None
+    if log is not None and log.ok:
+        found, checked = log.seen()
+        for f in files:
+            key, sig = (f["path"], f["id"]), class_sig(f)
+            where = f"{f['path']}{' (archived)' if f['archived'] else ''}"
+            if key not in found:
+                log.write("found", f["path"], f["id"], f["fit"], f"found {where}")
+            if checked.get(key) != sig:
+                log.write("checked", f["path"], f["id"], f["fit"],
+                          f"checked {where}: {f['fit']}, {f['sections_found']} of {f['sections_total']} sections",
+                          sections_found=f["sections_found"], sections_total=f["sections_total"], missing=f["missing"])
     live = [f for f in files if not f["archived"]]
     counts = {"inbox": len(live), "template": sum(f["fit"] == "template" for f in live),
               "fix": sum(f["fit"] != "template" for f in live), "archived": len(files) - len(live)}
-    return {"ok": True, "files": files, "counts": counts}
+    out = {"ok": True, "files": files, "counts": counts}
+    return out if log is None else with_warnings(out, log)
 
 
 # ---------- finding one plan ----------
@@ -257,15 +346,21 @@ def move_entry(box, e, to_archive):
 def cmd_archive(a):
     box = inbox_root(a.home)
     e = find(box, a.id, "inbox")
+    log = EventLog(a.data, mkpaths.home(a.home), a.by)
+    fit = log.fit_of(e, mkpaths.home(a.home), a.data)  # before the move: the check reads the file where it is
     dst = move_entry(box, e, True)
-    return {"ok": True, "id": a.id, "path": os.path.relpath(dst, box)}
+    log.write("archived", e["shown"], a.id, fit, f"archived {e['shown']}")
+    return with_warnings({"ok": True, "id": a.id, "path": os.path.relpath(dst, box)}, log)
 
 
 def cmd_restore(a):
     box = inbox_root(a.home)
     e = find(box, a.id, "archive")
+    log = EventLog(a.data, mkpaths.home(a.home), a.by)
+    fit = log.fit_of(e, mkpaths.home(a.home), a.data)
     dst = move_entry(box, e, False)
-    return {"ok": True, "id": a.id, "path": os.path.relpath(dst, box)}
+    log.write("restored", e["shown"], a.id, fit, f"restored {e['shown']}")
+    return with_warnings({"ok": True, "id": a.id, "path": os.path.relpath(dst, box)}, log)
 
 
 # ---------- delete ----------
@@ -300,6 +395,8 @@ def cmd_delete(a):
     box = inbox_root(a.home)
     e = find(box, a.id, "archive" if a.archived else "any")
     need_inside(box, e)
+    log = EventLog(a.data, mkpaths.home(a.home), a.by)
+    fit = log.fit_of(e, mkpaths.home(a.home), a.data)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     base = os.path.join(box, DELETED, f"{safe_name(a.id)}-{stamp}")
     keep, n = base, 1
@@ -326,7 +423,9 @@ def cmd_delete(a):
             os.unlink(e["path"])
     except OSError as err:
         raise Fail(f"delete failed: {err}; the copy is at {copy}")
-    return {"ok": True, "id": a.id, "deleted": e["shown"], "copy": os.path.relpath(copy, box)}
+    kept = os.path.relpath(copy, box)
+    log.write("deleted", e["shown"], a.id, fit, f"deleted {e['shown']}; a copy is kept in {kept}", copy=kept)
+    return with_warnings({"ok": True, "id": a.id, "deleted": e["shown"], "copy": kept}, log)
 
 
 # ---------- import ----------
@@ -357,9 +456,31 @@ def cmd_import(a):
     box, home = inbox_root(a.home), mkpaths.home(a.home)
     e = find(box, a.id, "inbox")
     need_inside(box, e)
+    log, seen = EventLog(a.data, home, a.by), {"fit": None}
+    try:
+        out = do_import(a, box, home, e, log, seen)
+    except Fail as err:
+        if "step" in err.extra:
+            log.write("import-failed", e["shown"], a.id, seen["fit"],
+                      f"import failed at step {err.extra['step']}: {err.extra['reason']}",
+                      step=err.extra["step"], reason=err.extra["reason"])
+        err.extra.update(with_warnings({}, log))
+        raise
+    log.write("imported", e["shown"], a.id, seen["fit"], f"imported {e['shown']} as {out.get('plan')}",
+              plan_in_store=out.get("plan"), archived_to=out.get("archived_to"))
+    return with_warnings(out, log)
+
+
+def step_event(log, seen, e, pid, n):
+    log.write("import-step", e["shown"], pid, seen["fit"], f"import step {n} of 3: {STEPS[n]}", step=n, of=3, name=STEPS[n])
+
+
+def do_import(a, box, home, e, log, seen):
     # step 1: the check, before anything is written
     progress(1)
     cls = check_plan_file(e["md"], a.data, home)
+    seen["fit"] = cls["fit"]
+    step_event(log, seen, e, a.id, 1)
     if cls["fit"] == "not_a_plan":
         raise step_fail(1, cls["note"] or NOT_A_PLAN_NOTE)
     target = os.path.join(box, ARCHIVE, e["name"])
@@ -367,6 +488,7 @@ def cmd_import(a):
         raise step_fail(1, f"inbox/archive/{e['name']} already exists; nothing imported")
     # step 2: the project store row (mk-plan.py import)
     progress(2)
+    step_event(log, seen, e, a.id, 2)
     args = ["import", e["path"], "--home", home] + (["--data", a.data] if a.data else [])
     code, reply = run_plan(args, a.data, home)
     if code != 0 or reply.get("ok") is not True:
@@ -374,6 +496,7 @@ def cmd_import(a):
         raise step_fail(2, why)
     # step 3: the tasks come with the import call; this step finishes it (the flat file leaves the inbox)
     progress(3)
+    step_event(log, seen, e, a.id, 3)
     archived_to = None
     if e["kind"] == "file":
         try:
@@ -404,6 +527,7 @@ def build_parser():
             c.add_argument("--archived", action="store_true")
         c.add_argument("--home", default=None)
         c.add_argument("--data", default=None)
+        c.add_argument("--by", default="user", help="who asked, recorded on the inbox events (default user)")
         c.set_defaults(func=func)
     return p
 
@@ -464,6 +588,20 @@ def self_test():
     def tree(path):
         return sorted(os.path.relpath(os.path.join(d, n), path) for d, ds, fs in os.walk(path) for n in ds + fs)
 
+    def evs(after=0):
+        """The project's inbox-channel events past an id, as written by this script (read back through mkdb)."""
+        rows = _load("mkdb", "mkdb.py").events(home, None, None, data_dir=data, chan="inbox")
+        return [dict(r, meta=json.loads(r["meta_json"])) for r in rows if r["id"] > after]
+
+    def last_id():
+        return max([e["id"] for e in evs()] or [0])
+
+    def raw(*args, data_arg=None):
+        """Run mk-inbox.py with its own --data (mi always passes the good store)."""
+        r = subprocess.run([sys.executable, me, *args, "--home", home, "--data", data_arg or data], capture_output=True, text=True)
+        lines = [json.loads(l) for l in r.stdout.strip().splitlines()]
+        return r.returncode, lines
+
     try:
         with open(real_tpl) as f:
             tpl_text = f.read()
@@ -519,6 +657,33 @@ def self_test():
             assert set(f) == {"id", "path", "title", "fit", "sections_found", "sections_total", "missing", "age_s", "archived", "note"}, f
             assert not os.path.isabs(f["path"]), f
 
+        # ---- EVT.1 list records `found` once per new file and `checked` when its class changes ----
+        ev = evs()
+        want = ["inbox-partial.md", "loose-note.md", "old-one.md", "plan-inbox-and-parsing.md", "ponytail-notes.md"]
+        assert sorted(e["meta"]["file"] for e in ev if e["kind"] == "found") == want, ev
+        assert sorted(e["meta"]["file"] for e in ev if e["kind"] == "checked") == want, ev
+        assert all(e["run"] is None and e["task"] is None and e["chan"] == "inbox" and e["from_id"] == "user" for e in ev), ev
+        m = next(e["meta"] for e in ev if e["kind"] == "checked" and e["meta"]["file"] == "inbox-partial.md")
+        assert m["plan"] == "inbox-partial" and m["fit"] == "partial" and m["by"] == "user" and m["missing"] == ["Risks"], m
+        n_before = len(ev)
+        mi("list", "--json")
+        assert len(evs()) == n_before, "a second list with nothing new added events"
+        # the class of a file changes -> exactly one new `checked`, no new `found`
+        with open(os.path.join(box, "inbox-partial.md"), "a") as f:
+            f.write("\n## Hazards again\n")
+        mi("list", "--json")
+        assert len(evs()) == n_before, "an edit that leaves the class alone added an event"
+        os.replace(os.path.join(box, "inbox-partial.md"), os.path.join(tmp, "partial.bak"))
+        put("inbox-partial.md", tpl_text.replace('plan = "plan-inbox-and-parsing"', 'plan = "inbox-partial"', 1))
+        mi("list", "--json")
+        new = evs(after=max(e["id"] for e in ev))
+        assert [(e["kind"], e["meta"]["file"], e["meta"]["fit"]) for e in new] == [("checked", "inbox-partial.md", "template")], new
+        os.replace(os.path.join(tmp, "partial.bak"), os.path.join(box, "inbox-partial.md"))
+        with open(os.path.join(box, "inbox-partial.md"), "w") as f:
+            f.write(partial)
+        mi("list", "--json")  # back to the partial class: one more `checked`
+        assert len(evs()) == n_before + 2, evs()
+
         # a folder-form plan lists (path is <folder>/plan.md) and archives, folder intact
         put("fold-plan/plan.md", tpl_text.replace('plan = "plan-inbox-and-parsing"', 'plan = "fold-plan"', 1))
         put("fold-plan/notes.md", "side notes\n")
@@ -526,14 +691,22 @@ def self_test():
         fp = next(f for f in out["files"] if f["id"] == "fold-plan")
         assert fp["path"] == "fold-plan/plan.md" and fp["fit"] == "template" and fp["archived"] is False, fp
         assert out["counts"]["inbox"] == 5, out["counts"]
-        _, out = mi("archive", "fold-plan")
+        mark = last_id()
+        _, out = mi("archive", "fold-plan", "--by", "lane-x")
         assert out["ok"] and out["path"] == "archive/fold-plan", out
+        assert "warnings" not in out, out
+        new = evs(after=mark)
+        assert [(e["kind"], e["meta"]) for e in new] == [("archived", {"file": "fold-plan/plan.md", "plan": "fold-plan", "fit": "template", "by": "lane-x"})], new
+        assert new[0]["from_id"] == "lane-x" and new[0]["run"] is None, new
         assert os.path.isfile(os.path.join(box, "archive", "fold-plan", "plan.md")) and os.path.isfile(os.path.join(box, "archive", "fold-plan", "notes.md"))
         assert not os.path.exists(os.path.join(box, "fold-plan"))
         _, out = mi("list", "--json")
         assert next(f for f in out["files"] if f["id"] == "fold-plan")["archived"] is True and out["counts"]["archived"] == 2, out["counts"]
+        mark = last_id()
         _, out = mi("restore", "fold-plan")
         assert out["ok"] and os.path.isfile(os.path.join(box, "fold-plan", "notes.md")), out
+        new = evs(after=mark)
+        assert [(e["kind"], e["meta"]["file"], e["meta"]["plan"], e["meta"]["fit"], e["meta"]["by"]) for e in new] == [("restored", "fold-plan/plan.md", "fold-plan", "template", "user")], new
 
         # ---- INBOX.2 archive / restore round trip, and each refuses when the target exists ----
         blob = open(os.path.join(box, "inbox-partial.md"), "rb").read()
@@ -566,8 +739,12 @@ def self_test():
         # ---- INBOX.2 import ----
         # a not-a-plan file fails at step 1, nothing written, the file stays
         notb = open(os.path.join(box, "ponytail-notes.md"), "rb").read()
+        mark = last_id()
         lines, out = mi("import", "mk-ponytail-hooks", code=2)
         assert [l["step"] for l in lines] == [1] and out["ok"] is False and out["step"] == 1, (lines, out)
+        new = evs(after=mark)
+        assert [(e["kind"], e["meta"].get("step")) for e in new] == [("import-step", 1), ("import-failed", 1)], new
+        assert new[1]["meta"]["fit"] == "not_a_plan" and NOT_A_PLAN_NOTE in new[1]["meta"]["reason"] and new[1]["meta"]["plan"] == "mk-ponytail-hooks", new
         assert NOT_A_PLAN_NOTE in out["reason"], out
         assert plan_rows() == {} and open(os.path.join(box, "ponytail-notes.md"), "rb").read() == notb
         lines, out = mi("import", "loose-note", code=2)  # no header at all: also step 1
@@ -580,7 +757,12 @@ def self_test():
         os.unlink(os.path.join(box, "archive", "plan-inbox-and-parsing.md"))
         # a template file: three progress lines in order, then the reply; the row is in the store, the file in archive/
         tpl_blob = open(os.path.join(box, "plan-inbox-and-parsing.md"), "rb").read()
+        mark = last_id()
         lines, out = mi("import", "plan-inbox-and-parsing")
+        new = evs(after=mark)
+        assert [(e["kind"], e["meta"].get("step")) for e in new] == [("import-step", 1), ("import-step", 2), ("import-step", 3), ("imported", None)], new
+        assert all(e["meta"]["fit"] == "template" and e["meta"]["plan"] == "plan-inbox-and-parsing" and e["meta"]["file"] == "plan-inbox-and-parsing.md" and e["meta"]["by"] == "user" for e in new), new
+        assert [e["meta"].get("of") for e in new[:3]] == [3, 3, 3] and new[3]["meta"]["archived_to"] == "archive/plan-inbox-and-parsing.md", new
         assert lines == [{"progress": True, "step": s, "of": 3, "name": STEPS[s]} for s in (1, 2, 3)], lines
         assert out["ok"] and out["plan"] == "plan-inbox-and-parsing" and out["archived_to"] == "archive/plan-inbox-and-parsing.md", out
         assert plan_rows() == {"plan-inbox-and-parsing": out["title"]}, plan_rows()
@@ -600,14 +782,19 @@ def self_test():
                            capture_output=True, text=True)
         lines = [json.loads(l) for l in r.stdout.strip().splitlines()]
         assert r.returncode == 2 and [l.get("step") for l in lines] == [1, 2, 2] and lines[-1]["ok"] is False and lines[-1]["step"] == 2, r.stdout
+        assert any("no project store" in w for w in lines[-1]["warnings"]), lines[-1]  # no store: no events, said in the reply
         assert os.path.isfile(os.path.join(box, "nostore.md")) and not os.path.exists(mkpaths.db_in(os.path.join(tmp, "empty-data")))
         os.unlink(os.path.join(box, "nostore.md"))
 
         # ---- INBOX.2 delete ----
         put("kill-me.md", tpl_text.replace('plan = "plan-inbox-and-parsing"', 'plan = "kill-me"', 1))
         kill_blob = open(os.path.join(box, "kill-me.md"), "rb").read()
+        mark = last_id()
         _, out = mi("delete", "kill-me")
         assert out["ok"] and out["deleted"] == "kill-me.md" and out["copy"].startswith(".deleted/kill-me-"), out
+        new = evs(after=mark)
+        assert [(e["kind"], e["meta"]["file"], e["meta"]["plan"], e["meta"]["fit"], e["meta"]["by"]) for e in new] == [("deleted", "kill-me.md", "kill-me", "template", "user")], new
+        assert new[0]["meta"]["copy"] == out["copy"], new
         assert not os.path.exists(os.path.join(box, "kill-me.md"))
         assert open(os.path.join(box, out["copy"]), "rb").read() == kill_blob, "the kept copy differs"
         # a folder is copied whole, then removed
@@ -643,6 +830,24 @@ def self_test():
         assert snapshot(outside) == before_out and os.path.isdir(os.path.join(box, "evil-dir")) is True
         assert not any(n.startswith("evil") for n in os.listdir(os.path.join(box, DELETED))), "a copy of an outside path was made"
         os.unlink(os.path.join(box, "evil-dir"))
+        # a refused action records nothing
+        mark = last_id()
+        mi("delete", "evil-none", code=2)
+        assert evs(after=mark) == []
+        # a failed event write never fails the action: a store that is not a database
+        bad = os.path.join(tmp, "bad-data")
+        os.makedirs(bad)
+        with open(mkpaths.project_db_in(mkpaths.project_folder(bad, home)), "wb") as f:
+            f.write(b"this is not a database")
+        put("quiet.md", tpl_text.replace('plan = "plan-inbox-and-parsing"', 'plan = "quiet"', 1))
+        code, lines = raw("archive", "quiet", data_arg=bad)
+        assert code == 0 and lines[-1]["ok"] is True and any("not recorded" in w for w in lines[-1]["warnings"]), lines
+        assert os.path.isfile(os.path.join(box, "archive", "quiet.md")) and not os.path.exists(os.path.join(box, "quiet.md"))
+        code, lines = raw("list", "--json", data_arg=bad)
+        assert code == 0 and lines[-1]["ok"] is True and lines[-1]["files"] and any("inbox events not" in w for w in lines[-1]["warnings"]), lines
+        code, lines = raw("delete", "quiet", "--archived", data_arg=bad)
+        assert code == 0 and lines[-1]["ok"] is True and not os.path.exists(os.path.join(box, "archive", "quiet.md")), lines
+        assert open(mkpaths.project_db_in(mkpaths.project_folder(bad, home)), "rb").read() == b"this is not a database"
         # ids that resolve outside: .. and a header id holding a slash can never become a path
         for bad in ("..", "../x", ".deleted"):
             _, out = mi("delete", bad, code=2)

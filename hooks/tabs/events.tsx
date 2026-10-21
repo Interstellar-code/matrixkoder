@@ -20,7 +20,7 @@ type Els = Elements[keyof Elements]
 /** one timeline event row: clock time, type/kind, who, lane, text, and ack/status markers */
 export type EventItem = {
   readonly id?: string
-  readonly src?: 'bus' | 'run'
+  readonly src?: 'bus' | 'run' | 'inbox'
   readonly t: string
   readonly kind?: string
   readonly who?: string
@@ -45,6 +45,10 @@ export type EventItem = {
   readonly chan?: string
   /** the author the row's meta names */
   readonly by?: string
+  /** an inbox row: the plan file's name, the plan id and how well the file fits the template (the row's meta) */
+  readonly file?: string
+  readonly plan?: string
+  readonly fit?: string
   /** the whole text, newlines kept (capped by the store reader): the detail card reads it */
   readonly full?: string
   /** Backwards compatibility for earlier tests */
@@ -90,6 +94,10 @@ export const EVENTS_MAX = 50
 
 export const BUSK = ['ask', 'answer', 'info', 'ack', 'task', 'status', 'commit', 'report', 'review', 'nudge', 'ring'] as const
 
+/** the kinds of the inbox channel (plan inbox-and-parsing C5), in the order the kind menu lists them */
+export const INBOXK = ['found', 'checked', 'import-step', 'imported', 'import-failed', 'archived', 'restored', 'deleted'] as const
+const isInboxKind = (k: string): boolean => (INBOXK as readonly string[]).includes(k)
+
 export const VIEWS = [
   ['none', 'Any'],
   ['needs', 'Unanswered'],
@@ -115,6 +123,13 @@ export const SHORT: Record<string, string> = {
   report: 'rep',
   review: 'rev',
   commit: 'commit',
+  checked: 'check',
+  'import-step': 'step',
+  imported: 'import',
+  'import-failed': 'failed',
+  archived: 'arch',
+  restored: 'rest',
+  deleted: 'del',
 }
 
 /** Type role mapping matching HTML design colors */
@@ -149,6 +164,22 @@ export const TYPE_ROLE: Record<string, PaletteRole> = {
   fix: 'ok',
   merged: 'ok',
   verified: 'ok',
+  // the inbox kinds, by kind (wide rows) and by chip word (narrow rows)
+  found: 'idle',
+  checked: 'idle',
+  check: 'idle',
+  'import-step': 'live',
+  step: 'live',
+  imported: 'ok',
+  import: 'ok',
+  'import-failed': 'err',
+  failed: 'err',
+  archived: 'idle',
+  arch: 'idle',
+  restored: 'live',
+  rest: 'live',
+  deleted: 'warn',
+  del: 'warn',
 }
 
 /** Default fixture view */
@@ -179,7 +210,7 @@ const isRing = (k: string): boolean => k === 'ring' || k.startsWith('ring-')
 
 type NormalizedEvent = {
   id: string
-  src: 'bus' | 'run'
+  src: 'bus' | 'run' | 'inbox'
   t: string
   kind: string
   who: string
@@ -196,6 +227,9 @@ type NormalizedEvent = {
   task?: string
   chan?: string
   by?: string
+  file?: string
+  plan?: string
+  fit?: string
   full?: string
   short?: { readonly type: string; readonly text: string }
 }
@@ -210,7 +244,9 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
   const source = ui?.get('events:source') ?? 'all'
   const kindsRaw = ui?.get('events:kinds') ?? ''
   const selectedKinds = new Set(kindsRaw ? kindsRaw.split(',') : [])
-  const anyKind = selectedKinds.size > 0
+  // a picked kind filters the rows of its own channel: the inbox kinds the inbox rows, any other kind the bus rows
+  const pickedInbox = new Set(Array.from(selectedKinds).filter(isInboxKind))
+  const pickedBus = new Set(Array.from(selectedKinds).filter(k => !isInboxKind(k)))
   const viewFilter = ui?.get('events:view') ?? 'none'
   const laneFilter = ui?.get('events:lane') ?? 'all'
   const q = (ui?.get('events:q') ?? '').trim().toLowerCase()
@@ -221,14 +257,15 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
   // Normalize events: ensure kind, id, who, lane are populated
   const allEvents: NormalizedEvent[] = view.events.map((e, idx) => ({
     id: e.id ?? `e-${idx}`,
-    src: e.src ?? (e.type === 'review' || e.type === 'dispatched' || e.type === 'fix' || e.type === 'stage' || e.type === 'lanes' || e.type === 'brief' ? 'run' : 'bus'),
+    // an inbox row (chan inbox) is never given the run source below
+    src: e.src ?? (e.chan === 'inbox' ? 'inbox' : e.type === 'review' || e.type === 'dispatched' || e.type === 'fix' || e.type === 'stage' || e.type === 'lanes' || e.type === 'brief' ? 'run' : 'bus'),
     t: e.t ?? '12:00',
     kind: e.kind ?? e.type ?? 'info',
-    who: e.who ?? (e.src === 'run' ? 'run' : 'orch'),
+    who: e.who ?? (e.src === 'run' ? 'run' : e.src === 'inbox' || e.chan === 'inbox' ? (e.by ?? 'user') : 'orch'),
     lane: e.lane ?? 'all',
     text: e.text ?? '',
     ack: e.ack,
-    bad: e.bad ?? (e.kind === 'ring-failed' || e.type === 'ring-failed'),
+    bad: e.bad ?? (e.kind === 'ring-failed' || e.type === 'ring-failed' || e.kind === 'import-failed'),
     answered: e.answered,
     reply_to: e.reply_to,
     ts: e.ts,
@@ -238,6 +275,9 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
     task: e.task,
     chan: e.chan,
     by: e.by,
+    file: e.file,
+    plan: e.plan,
+    fit: e.fit,
     full: e.full,
     short: e.short,
   }))
@@ -258,10 +298,11 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
   const filtered = allEvents.filter(e => {
     if (isNew(e)) return false
     if (source !== 'all' && e.src !== source) return false
-    if (source !== 'run' && anyKind && e.src === 'bus') {
+    if (source !== 'run' && pickedBus.size > 0 && e.src === 'bus') {
       const k = isRing(e.kind) ? 'ring' : e.kind
-      if (!selectedKinds.has(k)) return false
+      if (!pickedBus.has(k)) return false
     }
+    if (pickedInbox.size > 0 && e.src === 'inbox' && !pickedInbox.has(e.kind)) return false
     if (inView[viewFilter] && !inView[viewFilter]!(e)) return false
     if (laneFilter !== 'all' && e.lane !== laneFilter) return false
     if (q) {
@@ -301,7 +342,11 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
   }
 
   // Kind count helper
-  const countKind = (k: string) => allEvents.filter(e => e.src === 'bus' && (k === 'ring' ? isRing(e.kind) : e.kind === k)).length
+  const countKind = (k: string) => isInboxKind(k)
+    ? allEvents.filter(e => e.src === 'inbox' && e.kind === k).length
+    : allEvents.filter(e => e.src === 'bus' && (k === 'ring' ? isRing(e.kind) : e.kind === k)).length
+  // the kind menu lists the inbox kinds under the Inbox source, the bus kinds otherwise
+  const kindOptions: readonly string[] = source === 'inbox' ? INBOXK : BUSK
 
   // Kind label
   const activeKindsList = Array.from(selectedKinds)
@@ -383,28 +428,35 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
       {/* ── CARD 2: FILTERS ── */}
       {Card(els, {}, (
         <Box flexDirection="column" gap={1}>
-          {/* Source Filter */}
-          <Box flexDirection="row" gap={1} alignItems="center">
-            <Text dimColor={true}>{(compact ? 'src' : 'source').padEnd(labelW)}</Text>
-            {Segment(els, {
-              key: 'ev-src-all',
-              label: 'All',
-              on: source === 'all',
-              onPress: () => ui?.set('events:source', 'all'),
-            })}
-            {Segment(els, {
-              key: 'ev-src-bus',
-              label: 'Bus',
-              on: source === 'bus',
-              onPress: () => ui?.set('events:source', 'bus'),
-            })}
-            {Segment(els, {
-              key: 'ev-src-run',
-              label: 'Run',
-              on: source === 'run',
-              onPress: () => ui?.set('events:source', 'run'),
-            })}
-          </Box>
+          {/* Source Filter: All, Bus, Run, Inbox; where the four do not fit beside the label, Inbox takes a second line */}
+          {(() => {
+            const segs = [['all', 'All'], ['bus', 'Bus'], ['run', 'Run'], ['inbox', 'Inbox']] as const
+            const seg = (k: typeof segs[number][0], label: string): RenderElement => Segment(els, {
+              key: `ev-src-${k}`,
+              label,
+              on: source === k,
+              onPress: () => ui?.set('events:source', k),
+            })
+            const oneRow = labelW + 1 + segs.reduce((n, [, l]) => n + l.length + 4, 0) + (segs.length - 1) <= W
+            const label = <Text dimColor={true}>{(compact ? 'src' : 'source').padEnd(labelW)}</Text>
+            return oneRow ? (
+              <Box flexDirection="row" gap={1} alignItems="center">
+                {label}
+                {segs.map(([k, l]) => seg(k, l))}
+              </Box>
+            ) : (
+              <Box flexDirection="column">
+                <Box flexDirection="row" gap={1} alignItems="center">
+                  {label}
+                  {segs.slice(0, 3).map(([k, l]) => seg(k, l))}
+                </Box>
+                <Box flexDirection="row" gap={1} alignItems="center">
+                  <Text>{' '.repeat(labelW)}</Text>
+                  {segs.slice(3).map(([k, l]) => seg(k, l))}
+                </Box>
+              </Box>
+            )
+          })()}
 
           {/* Kind Dropdown (shown when source !== 'run') */}
           {source !== 'run' && (
@@ -421,7 +473,7 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
               </Box>
               {openMenu === 'kind' && (
                 <Box flexDirection="column" paddingX={1} backgroundColor={PALETTE.field}>
-                  {BUSK.map(k => {
+                  {kindOptions.map(k => {
                     const isChecked = selectedKinds.has(k)
                     const count = countKind(k)
                     return (
