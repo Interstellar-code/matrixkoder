@@ -170,7 +170,7 @@ function Review(els: WizardEls, d: MkWizardDraft, act: WizardAct, oldYaml: strin
           {drift.length === 0
             ? Dim(els, 'detection agrees with the file on disk')
             : drift.map(item => (
-              <Text key={`drift-${item.key}`}>{clip(`${item.key}  file ${item.file} · now ${item.detected}`, 42)}</Text>
+              <Text key={`drift-${item.key}`} dimColor={true}>{clip(`${item.key}  file ${item.file} · now ${item.detected}`, 42)}</Text>
             ))}
         </Box>
       ))}
