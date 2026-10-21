@@ -2501,9 +2501,43 @@ def phase_of(task):
     return task.split(".", 1)[0] if "." in task else task
 
 
-def plan_tasks(plan_path, task):
-    """The phase's task list from a plan file: id, title, parallel, deps. Empty when the
-    plan cannot be read — connect still prints the brief."""
+def plan_tasks_from_store(plan_id, task, data, run=None):
+    """RUN.2: the phase's task list from the project store's `plan_items` rows: the version the
+    run started from (runs.plan_version), else the latest approved one, else the plan's current.
+    Empty when the store, the plan or the rows are not there — connect still prints the brief."""
+    if not data or not store_present(data):
+        return []
+    plan_id = plan_id or ""
+    version = None
+    if run:
+        row = (store_rows(data, "SELECT plan, plan_version FROM runs WHERE id=?", (run,)) or [None])[0]
+        if row:
+            plan_id = plan_id or row["plan"] or ""
+            version = row["plan_version"] if row["plan"] == plan_id else None
+    if not plan_id:
+        return []
+    if not version:
+        got = store_rows(data, "SELECT MAX(version) AS v FROM plan_versions WHERE plan=? "
+                               "AND approved_at IS NOT NULL", (plan_id,))
+        version = (got or [{}])[0].get("v")
+    if not version:
+        got = store_rows(data, "SELECT version AS v FROM plans WHERE id=?", (plan_id,))
+        version = (got or [{}])[0].get("v")
+    if not version:
+        return []
+    rows = store_rows(data, "SELECT id, title, parallel, deps FROM plan_items WHERE plan=? AND version=? "
+                            "AND type='task' AND parent=? ORDER BY ord",
+                      (plan_id, version, phase_of(task))) or []
+    return [{"id": r["id"], "title": r["title"] or "", "parallel": bool(r["parallel"]),
+             "deps": [d.strip() for d in (r["deps"] or "").split(",") if d.strip()]} for r in rows]
+
+
+def plan_tasks(plan_path, task, data=None, run=None):
+    """The phase's task list: id, title, parallel, deps. From the project store's plan items when
+    `plan_path` is a plan id or empty (a run started from a stored plan version), else from a plan
+    file (an older run). Empty when the plan cannot be read — connect still prints the brief."""
+    if not plan_path or not ("/" in plan_path or plan_path.endswith(".md") or os.path.exists(plan_path)):
+        return plan_tasks_from_store(plan_path, task, data, run)
     try:
         with open(plan_path, "rb") as f:
             raw = f.read().decode("utf-8")
@@ -2939,7 +2973,7 @@ def cmd_connect(a):
         print("# brief: none found")
         raise Handled(0)
     plan = a.plan or os.environ.get("MK_PLAN") or ""
-    tasks = plan_tasks(plan, old.get("task") or "") if plan else []
+    tasks = plan_tasks(plan, old.get("task") or "", data, old.get("run"))
     body, part, pages = page_slice(text, 1)
     # Todo 150: the path line comes first, so a compressed body still leaves it readable.
     copy = (os.path.abspath(path) if path and os.path.isfile(path)
@@ -3315,7 +3349,8 @@ def build_parser():
     sp.add_argument("--timeout", type=float, default=5.0,
                     help=f"seconds to wait, 1..{LISTEN_TIMEOUT_MAX:g} (default 5)")
     sp = lane_cmd("connect", cmd_connect, "print the brief (paged) and the phase task list [D7.1]")
-    sp.add_argument("--plan", default=None, help="plan file; default $MK_PLAN")
+    sp.add_argument("--plan", default=None, help="plan id (or an older plan file); default $MK_PLAN, "
+                                                 "else the run's own plan")
     sp.add_argument("--data", default=None, help="project data dir (else $MK_BUS_DATA or the token file)")
     sp.add_argument("--role", default="builder", help="builder | reviewer (alias: review): which brief to print")
     sp = lane_cmd("read", cmd_read, "print one page of a paged brief or message [D7.1]")
@@ -5074,6 +5109,52 @@ def t_d7_connect_pages_and_tasks(root):
     assert "todo done <id>" in text and 'progress "<id>:' in text, text[-400:]
     code, lines = cli(lane, "read", "brief", "--part", "2")
     assert code == 0 and lines[0].startswith("# part 2/"), lines[:1]
+
+
+def t_run_plan_tasks_from_the_store(root):
+    """RUN.2.2: `plan_tasks` lists a phase's tasks from the store's plan_items rows: the version the
+    run started from, else the latest approved, else the plan's current; no plan file is read.
+    A plan FILE path (an older run) still parses the file."""
+    mkdb = _mkdb_mod()
+    data = os.path.join(root, "run_pt_data")
+    home = os.path.join(root, "run_pt_home")
+    os.makedirs(home)
+    con = mkdb.open_project(home, data_dir=data)
+    try:
+        mkdb.ensure_plan_items(con)
+        con.execute("INSERT INTO plans(id, version, title, header_json, status) VALUES ('rpt', 2, 't', '{}', 'approved')")
+        con.execute("INSERT INTO runs(id, plan, plan_version, status) VALUES ('rpt-r1', 'rpt', 1, 'active')")
+        con.execute("INSERT INTO runs(id, plan, plan_version, status) VALUES ('rpt-old', 'rpt', NULL, 'active')")
+        con.execute("INSERT INTO plan_versions(plan, version, sha, approved_at) VALUES ('rpt', 1, 's1', 'x')")
+        con.execute("INSERT INTO plan_versions(plan, version, sha, approved_at) VALUES ('rpt', 2, 's2', 'y')")
+        rows = [(1, "D7", None, "phase", "phase", "", "", "", 0, None, "{}", 0),
+                (1, "D7.1", "D7", "task", "v1 first", "", "", "", 0, None, "{}", 1),
+                (1, "D7.2", "D7", "task", "v1 second", "", "", "D7.1", 1, None, "{}", 2),
+                (2, "D7", None, "phase", "phase", "", "", "", 0, None, "{}", 0),
+                (2, "D7.1", "D7", "task", "v2 first", "", "", "", 0, None, "{}", 1),
+                (2, "D7.9", "D7", "task", "v2 only", "", "", "D7.1,D7.2", 0, None, "{}", 2)]
+        for v, i, par, typ, title, acc, owned, deps, par_flag, route, extra, n in rows:
+            con.execute("INSERT INTO plan_items VALUES ('rpt',?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (v, i, par, typ, title, acc, owned, deps, par_flag, route, extra, n))
+        con.commit()
+    finally:
+        con.close()
+    assert not os.path.exists(os.path.join(root, "rpt.md"))  # there is no plan file
+    # the run's own version (1), found through runs.plan_version, with no --plan at all
+    got = plan_tasks("", "D7.1", data, "rpt-r1")
+    assert got == [{"id": "D7.1", "title": "v1 first", "parallel": False, "deps": []},
+                   {"id": "D7.2", "title": "v1 second", "parallel": True, "deps": ["D7.1"]}], got
+    # a plan id given explicitly, and a run with no version: the latest approved version (2)
+    got = plan_tasks("rpt", "D7.2", data, "rpt-old")
+    assert [t["id"] for t in got] == ["D7.1", "D7.9"] and got[1]["deps"] == ["D7.1", "D7.2"], got
+    assert plan_tasks("rpt", "D7", data) == got  # a phase id lists its tasks too
+    assert plan_tasks("nope", "D7.1", data) == [] and plan_tasks("rpt", "ZZ.1", data) == []
+    assert plan_tasks("rpt", "D7.1", os.path.join(root, "no-such-data")) == []
+    # an older run: a plan FILE path still parses the file (the old path stays)
+    plan = os.path.join(root, "run_pt_plan.md")
+    with open(plan, "w") as f:
+        f.write('+++\nplan = "t"\n[[phase]]\nid = "D7"\n[[phase.task]]\nid = "D7.1"\ntitle = "from file"\n+++\n')
+    assert plan_tasks(plan, "D7.1", data) == [{"id": "D7.1", "title": "from file", "parallel": False, "deps": []}]
 
 
 def t_d7b_connect_reads_the_bus_brief(root):

@@ -3272,7 +3272,7 @@ def self_test():
         _check(rc == 0, f"Z15 approve rc={rc} {out[-300:]}")
         rc, out, err = _tool("mk-state.py", z15_home, "run", "init", "--data", z15_data,
                              "--by", "orch", "--id", "z15plan-r1", "--feature", "z15plan",
-                             "--branch", "mk/z15plan/lane", "--plan", z15_plan,
+                             "--branch", "mk/z15plan/lane", "--plan", "z15plan",
                              env={"MATRIXKODER_DATA": z15_data})
         _check(rc == 0, f"Z15 run init rc={rc} {out[-300:]}")
         # BEFORE the switch the plan folder does not exist at all (the gap this task closes)
@@ -3336,7 +3336,7 @@ def self_test():
         _check(rc == 0, f"Z15c approve rc={rc} {out[-300:]}")
         rc, out, err = _tool("mk-state.py", z15b_home, "run", "init", "--data", z15b_data,
                              "--by", "orch", "--id", "z15bplan-r1", "--feature", "z15bplan",
-                             "--branch", "mk/z15bplan/lane", "--plan", z15b_plan,
+                             "--branch", "mk/z15bplan/lane", "--plan", "z15bplan",
                              env={"MATRIXKODER_DATA": z15b_data})
         _check(rc == 0, f"Z15c run init rc={rc} {out[-300:]}")
         rc, out, err = _cli(z15b_home, ["--switch", "--slug", "fixture", "--data", z15b_data,

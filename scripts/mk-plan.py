@@ -958,25 +958,41 @@ def cmd_check(a):
     return with_store_state(out, a.data, a.home)
 
 
+def is_plan_id_arg(arg):
+    """RUN: `set` and `add-run` also take a plan id: no `/`, no `.md` suffix and not an existing
+    file. The file-path form is exactly as it was."""
+    arg = str(arg)
+    return "/" not in arg and not arg.endswith(".md") and not os.path.exists(arg) \
+        and PLAN_ID_RE.fullmatch(arg) is not None
+
+
 def plan_in_store(path, data, home):
-    """(db, con, plan_id, row) when the store already holds this file's plan, else None: a file
-    plan with no store row keeps today's file-only behaviour. The connection stays open for the
+    """(db, con, plan_id, row) when the store already holds this plan, else None: a file plan with
+    no store row keeps today's file-only behaviour. `path` is the plan file, or (RUN) a plan id:
+    the id form reads no file and must name a stored plan. The connection stays open for the
     caller to close. A file that does not parse is None too: the file path reports its own error."""
     data = resolve_data_arg(data)
-    if not store_present(data):
-        return None
-    try:
-        _header, out, _sha = read_plan(path)
-    except Fail:
-        return None
-    plan_id = str(out.get("plan") or "")
-    if not plan_id:
-        return None
+    if is_plan_id_arg(path):
+        if not store_present(data):
+            raise Fail([f"no store: {path!r} is a plan id and needs the project store ({data})"])
+        plan_id = str(path)
+    else:
+        if not store_present(data):
+            return None
+        try:
+            _header, out, _sha = read_plan(path)
+        except Fail:
+            return None
+        plan_id = str(out.get("plan") or "")
+        if not plan_id:
+            return None
     db = _mkdb()
     con = db.open_project(db.resolve_home(home), data_dir=mkpaths.project_folder(data, home))
     row = con.execute("SELECT status, header_json FROM plans WHERE id=?", (plan_id,)).fetchone()
     if not row:
         con.close()
+        if is_plan_id_arg(path):
+            raise Fail([f"no plan {plan_id} in the store"])
         return None
     return db, con, plan_id, row
 
@@ -984,13 +1000,20 @@ def plan_in_store(path, data, home):
 def cmd_set(a):
     """set --status parked and back is pause/resume (C10). When the store holds the plan, plans.status
     changes there and the file's bytes are not touched (STORE.2: after import the store is the
-    source); a file plan with no store row is rewritten as before."""
+    source); a file plan with no store row is rewritten as before. A plan id (RUN) works on the
+    store row only, and refreshes the root plan_summary the dashboard List reads."""
+    by_id = is_plan_id_arg(a.path)
     held = plan_in_store(a.path, a.data, a.home)
     if held is None:
         return set_status(a.path, a.status)
-    _db, con, plan_id, row = held
+    db, con, plan_id, row = held
     try:
-        note = status_precheck(a.path, a.status)
+        note = None
+        if by_id:
+            if a.status not in STATUSES:
+                raise Fail([f"bad status {a.status!r} ({'|'.join(STATUSES)})"])
+        else:
+            note = status_precheck(a.path, a.status)
         header = header_of(row)
         header["status"] = a.status
         con.execute("UPDATE plans SET status=?, header_json=? WHERE id=?",
@@ -1001,16 +1024,22 @@ def cmd_set(a):
     out = {"ok": True, "status": a.status, "plan": plan_id, "store": True}
     if note:
         out["warnings"] = [note]
+    if by_id:
+        err = _sync_summary(db, resolve_data_arg(a.data), db.resolve_home(a.home), plan_id)
+        if err:
+            out["warnings"] = out.get("warnings", []) + [err]
     return out
 
 
 def cmd_add_run(a):
     """add-run: with the plan in the store the run list changes there (header_json runs) and the
-    file is not touched; a file plan with no store row keeps today's file rewrite."""
+    file is not touched; a file plan with no store row keeps today's file rewrite. A plan id (RUN)
+    works on the store row only and refreshes the root plan_summary."""
+    by_id = is_plan_id_arg(a.path)
     held = plan_in_store(a.path, a.data, a.home)
     if held is None:
         return add_run(a.path, a.run)
-    _db, con, plan_id, row = held
+    db, con, plan_id, row = held
     try:
         if not a.run or not RUN_ID_RE.fullmatch(a.run):
             raise Fail([f"bad run id {a.run!r} (letters, digits, . _ -; max 64)"])
@@ -1022,9 +1051,14 @@ def cmd_add_run(a):
         con.execute("UPDATE plans SET header_json=? WHERE id=?",
                     (json.dumps(header, sort_keys=True), plan_id))
         con.commit()
-        return {"ok": True, "runs": header["runs"], "added": True}
+        out = {"ok": True, "runs": header["runs"], "added": True}
     finally:
         con.close()
+    if by_id:
+        err = _sync_summary(db, resolve_data_arg(a.data), db.resolve_home(a.home), plan_id)
+        if err:
+            out["warnings"] = [err]
+    return out
 
 
 def _id_list(text):
@@ -2877,6 +2911,23 @@ def store_self_test(tmp, mk, write, plan_text, phase, task, db, mkpaths):
     assert b'status = "approved"' in open(ex["path"], "rb").read()
     # approve after status moved on keeps the store's run list (the file has none)
     assert "rB" in json.loads(one("SELECT header_json FROM plans WHERE id='stp'")["header_json"])["runs"]
+    # RUN: set and add-run also take a plan id, which works on the store row only (no file read)
+    out = st("set", "stp", "--status", "parked")
+    assert out["ok"] and out["status"] == "parked" and out["plan"] == "stp" and out["store"] is True, out
+    assert one("SELECT status FROM plans WHERE id='stp'")["status"] == "parked"
+    assert sha_of(f) == sha_before, "set by id touched the file"
+    out = st("add-run", "stp", "--run", "rC")
+    assert out["ok"] and out["runs"] == ["rB", "rC"] and out["added"] is True, out
+    assert st("add-run", "stp", "--run", "rC")["added"] is False
+    assert st("parse", f)["status"] == "parked" and st("parse", f)["runs"] == ["rB", "rC"]
+    st("set", "stp", "--status", "running")
+    before_ids = dump()
+    for args, needle in ((("set", "ghost-plan", "--status", "running"), "no plan ghost-plan"),
+                         (("add-run", "ghost-plan", "--run", "rZ"), "no plan ghost-plan"),
+                         (("set", "stp", "--status", "bogus"), "bad status")):
+        bad = st(*args, code=2)
+        assert bad["ok"] is False and any(needle in e for e in bad["errors"]), (args, bad)
+    assert dump() == before_ids
     # regression guard (passes on the old code too): a file plan the store does not hold is read
     # as before, and a read writes nothing
     fo = write("fileonly.md", plan_text(plan='plan = "fileonly"', phases=phase("F1") + "\n"))
@@ -2937,9 +2988,8 @@ def store_self_test(tmp, mk, write, plan_text, phase, task, db, mkpaths):
     assert rows("itp", 1) == [] and one("SELECT 1 AS x FROM plan_versions WHERE plan='itp'") is None
     assert len(rows("stp", 1)) == 6, "delete of one plan touched another plan's rows"
 
-    # ---- hazard (STORE.2): `mk-state run init --plan <file>` calls check, set and add-run through
-    # plan_tool and keeps working on a stored plan: it reads approved from the store, then the
-    # store (not the file) learns running and the run
+    # ---- hazard (STORE.2, RUN): `mk-state run init --plan <plan id>` copies a stored version and calls
+    # set and add-run by id: the store (not the file) learns running and the run, the file is not read
     state = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mk-state.py")
     rp = write("rinit.md", plan_text(plan='plan = "rinit"', status='status = "draft"',
                                      phases=phase("R1", tasks=task("R1.1")) + "\n"))
@@ -2947,12 +2997,13 @@ def store_self_test(tmp, mk, write, plan_text, phase, task, db, mkpaths):
     st("approve", rp)
     rp_bytes = open(rp, "rb").read()
     r = subprocess.run([sys.executable, state, "--data", sdata, "run", "init", "--id", "rx",
-                        "--feature", "F", "--branch", "b", "--plan", rp],
+                        "--feature", "F", "--branch", "b", "--plan", "rinit"],
                        capture_output=True, text=True, env=dict(os.environ, MATRIXKODER_DATA=sdata))
     assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
     run_out = json.loads(r.stdout.strip().splitlines()[-1])
     assert run_out["ok"] and run_out["run"]["plan_status"] == "running", run_out
     assert open(rp, "rb").read() == rp_bytes  # the file was not rewritten by set / add-run
+    assert run_out["run"]["plan_version"] == 1 and run_out["run"].get("plan_sha") is None
     assert one("SELECT status FROM plans WHERE id='rinit'")["status"] == "running"
     assert json.loads(one("SELECT header_json FROM plans WHERE id='rinit'")["header_json"])["runs"] == ["rx"]
     return itp_bytes
@@ -3753,7 +3804,8 @@ def self_test():
         open(link, "w").write(plan_text(plan='plan = "link"', phases=phase("P1") + "\n"))
         r = subprocess.run([sys.executable, state, "--data", data, "run", "init", "--force",
                             "--id", "lk", "--feature", "L", "--branch", "bl", "--plan", link],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True,  # an old-shape run: it starts from the plan FILE
+                           env=dict(os.environ, MK_LEGACY_RUN_INIT="1"))
         assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
         ap = mk("approve", link, "--data", data, "--home", home, "--run", "lk")
         # the original path still resolves after the approve (the hermes-switchui issue): C13

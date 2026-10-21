@@ -581,8 +581,9 @@ def do_run(slug="e2e", keep=False):
     tool("mk-plan.py", "import", plan_path, "--data", data, "--home", home)
     tool("mk-plan.py", "approve", plan_path, "--data", data, "--home", home)
     run = f"{plan_id}-r1"
+    # RUN: the run starts from the stored plan version, by plan id (never the file)
     tool("mk-state.py", "run", "init", "--data", data, "--by", "orch", "--id", run,
-         "--feature", plan_id, "--branch", f"mk/{plan_id}/lane", "--plan", plan_path)
+         "--feature", plan_id, "--branch", f"mk/{plan_id}/lane", "--plan", plan_id)
 
     # (e) the second project, left on the pre-migration layout: a data dir with the project
     # store at <data>/mk.db, never switched. It has its OWN clean scratch repo, which is what
