@@ -146,7 +146,12 @@ function Review(els: WizardEls, d: MkWizardDraft, act: WizardAct, oldYaml: strin
           <Text>{`create  ${data ?? '?'}/plans/ and runs/`}</Text>
           {d.dataEnv == null && d.dataMode === 'repo' && d.gitignore && !d.gitignoreHas && <Text>add     /.matrixkoder/ to .gitignore</Text>}
           <Text>{`register this repo in the root projects table`}</Text>
-          {d.agents.herdr?.found && d.herdrPlugin === 'link' && <Text>{`link    ${d.pluginRoot}/herdr in herdr`}</Text>}
+          {d.agents.herdr?.found && d.herdrPlugin === 'link' && (
+            <Text>{`link    ${d.pluginRoot}/herdr in herdr`}</Text>
+          )}
+          {d.agents.herdr?.found && d.herdrPlugin === 'link' && d.herdrStaleLink != null && (
+            <Text color={ROLE.warn.fg}>{`herdr link is stale (${d.herdrStaleLink}), relinking to ${d.pluginRoot}/herdr`}</Text>
+          )}
           {d.agents.herdr?.found && d.herdrPlugin === 'linked' && Dim(els, 'herdr plugin already linked')}
           <Text>set     4 dashboard prefs (plugin settings)</Text>
         </Box>

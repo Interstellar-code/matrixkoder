@@ -8,7 +8,7 @@ import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import type { MkWizardDraft } from '../types'
 import { NOW, PROJECT_DIR, DATA_DIR, mockFs, paneProps, sessionStart, type Files } from './testkit'
-import { addToGitignore, buildYaml, emptyDraft, inline, mergeModels, parseModels, parseProviders, parseWhich, proposeGates, yamlDiff } from './wizard-core'
+import { addToGitignore, buildYaml, emptyDraft, herdrStateOf, inline, mergeModels, parseModels, parseProviders, parseWhich, proposeGates, yamlDiff } from './wizard-core'
 import { resetStoreMemo } from './paths'
 
 const HOME = '/home/mk'
@@ -880,6 +880,51 @@ test('yaml quoting: numberish, date-ish and NEL values are quoted', () => {
 })
 
 // ---------- H2B: herdr plugin link and Ollama Cloud models ----------
+
+test('B-17: the herdr link is read from the plugin list line, and a link at another path is stale', () => {
+  const root = '/plug/matrixkoder'
+  // the real list line: linked to this plugin's own folder
+  expect(herdrStateOf(`1 plugin installed:\n- matrixkoder (MatrixKoder) enabled [local:${root}/herdr]\n`, root))
+    .toEqual({ state: 'linked', stale: null })
+  // linked elsewhere (an earlier marketplace version): relink offered, the old path recorded
+  const stale = herdrStateOf('1 plugin installed:\n- matrixkoder (MatrixKoder) enabled [local:/Users/x/plugins/cache/mk/0.5.0/herdr]\n', root)
+  expect(stale).toEqual({ state: 'link', stale: '/Users/x/plugins/cache/mk/0.5.0/herdr' })
+  // no matrixkoder line at all, and an unreadable list: link, nothing stale
+  expect(herdrStateOf('No plugins installed.\n', root)).toEqual({ state: 'link', stale: null })
+  expect(herdrStateOf(null, root)).toEqual({ state: 'link', stale: null })
+})
+
+test('wizard detects whether the MatrixKoder herdr plugin is linked', async ($, on) => {
+  const files = repoFiles()
+  world(on, files, { 'herdr plugin list': 'matrixkoder\n' })
+  await $.session.start(sessionStart())
+  await mk($, 'setup')
+  expect(draftOf().herdrPlugin).toBe('linked')
+})
+
+test('B-17: a link at another path is detected as stale, says so on Review, and the write relinks it', async ($, on) => {
+  const files = repoFiles()
+  const oldPath = '/Users/x/plugins/cache/matrixkoder/0.5.0/herdr'
+  const w = world(on, files, { 'herdr plugin list': `1 plugin installed:\n- matrixkoder (MatrixKoder) enabled [local:${oldPath}]\n` }, {}, [], argv => {
+    if (argv[0] === 'herdr' && argv[1] === 'plugin' && (argv[2] === 'link' || argv[2] === 'unlink')) {
+      return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
+  })
+  await $.session.start(sessionStart())
+  await mk($, 'setup')
+  expect(draftOf().herdrPlugin, 'linked elsewhere is offered as a relink').toBe('link')
+  expect(draftOf().herdrStaleLink).toBe(oldPath)
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: WIZARD, props: paneProps(64) })
+  await toReview(ui)
+  expect(await ui.find({ text: new RegExp(`herdr link is stale \\(${oldPath.replace(/[/.]/g, ch => `\\${ch}`)}\\), relinking to `) }), 'the old path is named').toBeTruthy()
+  await ui.press({ key: 'wz-write' })
+  const links = w.argv.filter(a => a[0] === 'herdr' && a[1] === 'plugin' && a[2] === 'link')
+  expect(links.length).toBe(1)
+  expect(links[0]?.[3], 'the relink points at this plugin').toBe(`${draftOf().pluginRoot}/herdr`)
+  // `link` replaces an existing registration (probed), so no unlink is run
+  expect(w.argv.some(a => a[1] === 'plugin' && a[2] === 'unlink'), 'no unlink: link replaces').toBe(false)
+  expect(await ui.find({ text: /✓ herdr plugin relinked \(was / })).toBeTruthy()
+})
 
 test('wizard links the herdr plugin on write when link, and only once', async ($, on) => {
   const files = repoFiles()

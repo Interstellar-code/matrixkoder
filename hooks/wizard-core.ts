@@ -29,7 +29,7 @@ export function emptyDraft(): MkWizardDraft {
     qaFrontend: false, qaStart: '', qaDevUrl: '', qaThemes: '', qaMockups: '', qaTarget: 'local-main',
     autoOpen: true, chip: true, toasts: true, pollMin: '5',
     existingYaml: false, storeDir: null, migrated: false, replace: false, phase: 'editing', written: [], error: null,
-    herdrPlugin: 'skip', herdrLinkResult: null, prefsSaved: false,
+    herdrPlugin: 'skip', herdrStaleLink: null, herdrLinkResult: null, prefsSaved: false,
   }
 }
 
@@ -116,6 +116,32 @@ export function providerChoices(listed: readonly { name: string; enabled: boolea
 /** Plugin root → install mode: a marketplace install lives in the plugins cache. */
 export function installModeOf(root: string): 'dev' | 'marketplace' {
   return /\/plugins\/(cache|marketplaces)\//.test(root) ? 'marketplace' : 'dev'
+}
+
+/** The matrixkoder line of `herdr plugin list`, and the local path it registers:
+ *  `- matrixkoder (MatrixKoder) enabled [local:/path/to/herdr]`. Null when the list has no
+ *  matrixkoder line, `path: null` when the line names a source that is not `local:` (a
+ *  registry install has no path to compare). */
+export function herdrLinkOf(stdout: string): { path: string | null } | null {
+  for (const line of stdout.split('\n')) {
+    if (!/^(?:-\s+)?matrixkoder\b/.test(line.trim())) continue
+    const m = /\[local:([^\]]+)\]/.exec(line)
+    return { path: m?.[1]?.trim() ?? null }
+  }
+  return null
+}
+
+/** What the herdr plugin link stands at: `linked` when `herdr plugin list` names matrixkoder at this
+ *  plugin's own `<root>/herdr`; `link` when it is absent, names another path (a stale link left by an
+ *  earlier marketplace version — `stale` carries that path so the review can say what is being relinked),
+ *  or the list cannot be read. Detection alone never writes; the write step relinks. */
+export function herdrStateOf(stdout: string | null, root: string): { state: 'linked' | 'link'; stale: string | null } {
+  if (stdout == null) return { state: 'link', stale: null }
+  const link = herdrLinkOf(stdout)
+  if (link == null) return { state: 'link', stale: null }
+  const want = `${root.replace(/\/+$/, '')}/herdr`
+  if (link.path == null || link.path === want) return { state: 'linked', stale: null }
+  return { state: 'link', stale: link.path }
 }
 
 // ---------- gates ----------

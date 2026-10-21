@@ -304,6 +304,9 @@ export type MkWizardDraft = {
   written: readonly string[]
   error: string | null
   herdrPlugin: 'linked' | 'link' | 'skip'
+  /** B-17: the path the linked matrixkoder herdr plugin pointed at when it is not this plugin's own
+   *  `<root>/herdr` — a stale link left by an earlier version. null = linked here, or not linked. */
+  herdrStaleLink: string | null
   herdrLinkResult: { ok: boolean; text: string } | null
   /** the four dashboard prefs were written with everything else at step 10 (B-5) */
   prefsSaved: boolean

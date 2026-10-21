@@ -11,7 +11,7 @@ import { basename, globalDirPath, join, parseJson } from './data'
 import { listedDataDir, paths as mkPaths, projectYamlPath } from './paths'
 import { parsePluginManifest } from './settings-io'
 import {
-  AGENT_NAMES, WIZARD_STEPS, addToGitignore, buildYaml, dataDirOf, EMPTY_DRAFT, emptyDraft, fallbackText, installModeOf, mergeModels, parseModels, parseProviders, parseVersion,
+  AGENT_NAMES, WIZARD_STEPS, addToGitignore, buildYaml, dataDirOf, EMPTY_DRAFT, emptyDraft, fallbackText, herdrStateOf, installModeOf, mergeModels, parseModels, parseProviders, parseVersion,
   parseWhich, proposeGates, providerChoices, slugOf, yamlNameOf,
 } from './wizard-core'
 import { StepsA, type WizardAct } from './wizard-steps-a'
@@ -299,8 +299,14 @@ async function detect($: EngineInterface, options: PluginOptions): Promise<MkWiz
     AGENT_NAMES.map(n => [n, { found: n in paths, path: paths[n] ?? null, enabled: n in paths, models: models[n] ?? [] }]),
   )
   d.agents = agents
-  const herdrLinked = herdrList?.ok ? herdrList.out.includes('matrixkoder') : false
-  d.herdrPlugin = agents.herdr?.found ? (herdrLinked ? 'linked' : 'link') : 'skip'
+  const herdr = agents.herdr?.found && paths.herdr ? herdrStateOf(herdrList?.ok ? herdrList.out : null, $.plugin.root) : null
+  if (agents.herdr?.found && herdr != null) {
+    d.herdrPlugin = herdr.state
+    d.herdrStaleLink = herdr.stale
+  } else {
+    d.herdrPlugin = 'skip'
+    d.herdrStaleLink = null
+  }
   if (cbVersion.ok) {
     d.codexbarVersion = parseVersion(cbVersion.out) ?? 'unknown'
     const choices = providerChoices(parseProviders(cbProviders.out))
@@ -483,9 +489,14 @@ async function writeAll($: EngineInterface): Promise<void> {
     const prefsError = await applyPrefs($)
     let herdrLinkResult = d.herdrLinkResult
     if (d.herdrPlugin === 'link') {
+      const target = `${d.pluginRoot}/herdr`
+      const stale = d.herdrStaleLink
       try {
-        const link = await $.process.run(['herdr', 'plugin', 'link', `${d.pluginRoot}/herdr`], { timeoutMs: PROBE_MS })
-        herdrLinkResult = { ok: link.exitCode === 0, text: link.exitCode === 0 ? 'herdr plugin linked' : `herdr plugin link failed: ${link.stderr.trim().slice(0, 120)}` }
+        // B-17: `herdr plugin link <path>` on an already-linked name REPLACES the registration (probed:
+        // link at a second path exits 0 and `plugin list` names the new path), so no unlink precedes it.
+        const link = await $.process.run(['herdr', 'plugin', 'link', target], { timeoutMs: PROBE_MS })
+        const okText = stale != null && stale !== target ? `herdr plugin relinked (was ${stale})` : 'herdr plugin linked'
+        herdrLinkResult = { ok: link.exitCode === 0, text: link.exitCode === 0 ? okText : `herdr plugin link failed: ${link.stderr.trim().slice(0, 120)}` }
       } catch (err) {
         herdrLinkResult = { ok: false, text: `herdr plugin link failed: ${String(err instanceof Error ? err.message : err).slice(0, 120)}` }
       }
