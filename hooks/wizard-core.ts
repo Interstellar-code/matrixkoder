@@ -263,6 +263,13 @@ export function builderOrderOf(d: MkWizardDraft): string[] {
   return DEFAULT_BUILDER_ORDER.filter(n => on.has(n))
 }
 
+/** The settings file's NAME (`project.yaml` or `matrixkoder.yaml`), asked of paths.ts rather than
+ *  spelled: C1 keeps every store and config file name in one place, and the c1 gate fails on a literal
+ *  in any other file. `migrated` is the draft's own flag (B-1). */
+export function yamlNameOf(migrated: boolean): string {
+  return basename(paths.projectYaml('', migrated))
+}
+
 export function dataDirOf(d: MkWizardDraft): string | null {
   if (d.dataEnv != null) return d.dataEnv // readers check $MATRIXKODER_DATA first
   // The root store's row for this repo wins: it names the folder the pane itself reads (mkpaths.data_dir,
@@ -365,8 +372,8 @@ export function buildYaml(d: MkWizardDraft, checkedAt: string, existingYaml?: st
   }
   const g = d.gates
   const proposed = (v: string): string | undefined => (v !== '' ? 'proposed' : undefined)
-  // the header names the file it is: a migrated project's is <data>/project.yaml (B-1)
-  L.push(`# <data>/${d.migrated ? 'project.yaml' : 'matrixkoder.yaml'} — written by the MatrixKoder onboarding wizard after the user confirmed.`)
+  // the header names the file it is (B-1); the name itself comes from paths.ts (C1)
+  L.push(`# <data>/${yamlNameOf(d.migrated)} — written by the MatrixKoder onboarding wizard after the user confirmed.`)
   L.push('# Re-checked for drift on every run; the user\'s explicit statements override any value.')
   // B-8: with no global dir to name in home mode, dataDirOf is null and the old `${dir ?? ''}/`
   // wrote the value `/` — a data dir of the filesystem root. The locks line below already spells

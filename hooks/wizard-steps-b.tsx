@@ -14,7 +14,7 @@ import type { MkWizardDraft } from '../types'
 import { ROLE } from './tabs/palette'
 import { Choice, TextField, YesNo, type WizardAct, type WizardEls } from './wizard-steps-a'
 import { Card } from './tabs/kit'
-import { buildYaml, builderOrderOf, dataDirOf, enabledAgents, splitList, yamlDiff } from './wizard-core'
+import { buildYaml, builderOrderOf, dataDirOf, enabledAgents, splitList, yamlDiff, yamlNameOf } from './wizard-core'
 
 /** A card's bold heading (the slide's `.hd` in the card's title row). */
 function Hd(els: WizardEls, label: string) {
@@ -100,7 +100,8 @@ function Preview(els: WizardEls, title: string, right: string, rows: readonly st
 function Review(els: WizardEls, d: MkWizardDraft, act: WizardAct, oldYaml: string | null, checkedAt: string) {
   const { Box, Text, Select } = els
   const data = dataDirOf(d)
-  const yamlName = d.migrated ? 'project.yaml' : 'matrixkoder.yaml'
+  // the name comes from paths.ts (C1), never from a literal here
+  const yamlName = yamlNameOf(d.migrated)
   const yamlPath = data == null ? null : `${data}/${yamlName}`
   if (d.phase === 'written') {
     return (
