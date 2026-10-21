@@ -88,6 +88,12 @@ TASK_KEYS = ("id", "title", "acceptance", "refs", "subagent", "owned", "deps", "
 SUB_KEYS = ("id", "title", "acceptance", "refs", "owned", "deps", "parallel", "route",
             "gate", "manual", "critical", "risk")
 TOML_LINE_RE = re.compile(r"line (\d+)")
+NEW_PLAN_FROM = "2026-10-20"  # a plan created on or after this day gets the strict required-key check
+BODY_SECTIONS = ("Summary", "Goal", "Design / context", "Phases", "Risks", "Open questions", "Log")
+HEADER_PARTS = ("header phases", "tasks", "acceptance", "final gate")  # C1: facts read from the header
+HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+H2_RE = re.compile(r"##[ \t]+(.+?)[ \t]*")
+SUMMARY_LINE_RE = re.compile(r"\s*-\s*(Phases|Method|Lanes|Gates)\s*:\s*(.*?)\s*")
 
 
 class Fail(Exception):
@@ -398,6 +404,108 @@ def has_h1(body):
     return False
 
 
+def body_lines(body):
+    """The body's lines outside HTML comments (the template's worked examples) and fenced code."""
+    kept, fenced = [], False
+    for line in HTML_COMMENT_RE.sub("", body).split("\n"):
+        st = line.lstrip()
+        if st.startswith("```") or st.startswith("~~~"):
+            fenced = not fenced
+        elif not fenced:
+            kept.append(line.rstrip("\r"))
+    return kept
+
+
+def section_block(body, name):
+    """The lines under the `## <name>` heading, up to the next `##` heading; [] when absent."""
+    block, inside = [], False
+    for line in body_lines(body):
+        m = H2_RE.fullmatch(line)
+        if m:
+            inside = m.group(1).casefold() == name.casefold()
+        elif inside:
+            block.append(line)
+    return block
+
+
+def body_sections(body):
+    """C1: {section name: found?} for the seven body sections. Found = a `## <name>` heading."""
+    heads = {m.group(1).casefold() for m in map(H2_RE.fullmatch, body_lines(body)) if m}
+    return {name: name.casefold() in heads for name in BODY_SECTIONS}
+
+
+def header_parts(out):
+    """C1: the four facts read from the header. "header phases" counts [[phase]] blocks, never the
+    Phases body section."""
+    phases = out["phases"]
+    tasks = [t for p in phases for t in p["tasks"]]
+    return {"header phases": bool(phases), "tasks": bool(tasks),
+            "acceptance": bool(tasks) and all(t["acceptance_lines"] for t in tasks),
+            "final gate": any(isinstance(g, dict) and g.get("covers") for g in out.get("final_gates") or [])}
+
+
+def classify(out, body):
+    """C2: sections/parts (found|missing), sections_found, sections_total, missing and fit.
+    fit: not_a_plan = no phase and no task; template = every section and part found; else partial."""
+    secs, parts = body_sections(body), header_parts(out)
+    missing = [n for n in BODY_SECTIONS if not secs[n]] + [n for n in HEADER_PARTS if not parts[n]]
+    if not parts["header phases"] and not parts["tasks"]:
+        fit = "not_a_plan"
+    else:
+        fit = "partial" if missing else "template"
+    word = lambda ok: "found" if ok else "missing"
+    return {"sections": {n: word(v) for n, v in secs.items()},
+            "parts": {n: word(v) for n, v in parts.items()},
+            "sections_found": sum(secs.values()), "sections_total": len(BODY_SECTIONS),
+            "missing": missing, "fit": fit}
+
+
+def is_new_plan(header):
+    """True when `created` is a date on or after NEW_PLAN_FROM; an undated plan is an old one."""
+    c = header.get("created")
+    s = c.isoformat() if hasattr(c, "isoformat") else str(c or "")
+    return re.match(r"\d{4}-\d{2}-\d{2}", s) is not None and s[:10] >= NEW_PLAN_FROM
+
+
+def unticked_questions(body):
+    """How many `- [ ]` lines the Open questions section holds."""
+    return sum(1 for line in section_block(body, "Open questions") if re.match(r"\s*[-*]\s+\[ \]", line))
+
+
+def summary_drift(out, body):
+    """Warnings for a Summary line that differs from the header. A value still in <placeholder>
+    form is not compared, and a missing line is not reported."""
+    phases, finals, warnings = out["phases"], out.get("final_gates") or [], []
+    for line in section_block(body, "Summary"):
+        m = SUMMARY_LINE_RE.fullmatch(line)
+        if not m or m.group(2).startswith("<"):
+            continue
+        key, val = m.groups()
+        if key == "Phases":
+            n = re.match(r"\d+", val)
+            if n and int(n.group()) != len(phases):
+                warnings.append(f"Summary says {n.group()} phases; the header has {len(phases)}")
+        elif key == "Method" and phases:
+            mm = re.match(r"(waves|single lane)\s*·\s*subagents\s+(on|off|mixed)\b", val, re.I)
+            if mm:
+                waves = "waves" if len({repr(p["wave"]) for p in phases}) > 1 else "single lane"
+                subs = {bool(p["subagents"]) for p in phases}
+                sub = "mixed" if len(subs) > 1 else ("on" if True in subs else "off")
+                if (mm.group(1).lower(), mm.group(2).lower()) != (waves, sub):
+                    warnings.append(f"Summary Method says {mm.group(1)} · subagents {mm.group(2)}; "
+                                    f"the header says {waves} · subagents {sub}")
+        elif key == "Lanes":
+            for g in sorted({p["lane_group"] for p in phases if p["lane_group"]}):
+                if not re.search(r"(?<![\w-])" + re.escape(g) + r"(?![\w-])", val):
+                    warnings.append(f"Summary Lanes does not name lane_group {g}")
+        elif key == "Gates":
+            for i, g in enumerate(finals):
+                if isinstance(g, dict) and (str(final_gate_id(g, i)) not in val
+                                            or (g.get("cmd") and g["cmd"] not in val)):
+                    warnings.append(f"Summary Gates does not list final gate {final_gate_id(g, i)} as id = cmd")
+    return warnings
+
+
 def check_plan(header, out, body=None):
     """→ (errors, warnings). Errors are exactly the P1.2 contract rules; anything
     advisory (cross-run deps, malformed id shapes) is a warning. `body` is the markdown
@@ -442,6 +550,18 @@ def check_plan(header, out, body=None):
                         "D1, header_json until then) — the date the plan was drafted")
     if body is not None and not has_h1(body):
         warnings.append("body has no H1 line; the first '# ' line is what becomes plans.title")
+    if not str(header.get("description") or "").strip():
+        warnings.append("no description key in the header; advised: two to five plain sentences "
+                        "(plans.header_json only)")
+    # TPL.2: a plan created on or after NEW_PLAN_FROM gets the REQUIRED keys as errors; an older or
+    # undated plan only a warning
+    strict = errors if is_new_plan(header) else warnings
+    if body is not None:
+        secs = body_sections(body)
+        for name in ("Summary", "Goal"):
+            if not secs[name]:
+                warnings.append(f"body has no '## {name}' section (see templates/plan.md)")
+        warnings.extend(summary_drift(out, body))
 
     ids = [p["id"] for p in phases if p["id"]]
     for pid in sorted({i for i in ids if ids.count(i) > 1}):
@@ -457,9 +577,15 @@ def check_plan(header, out, body=None):
     for n, p in enumerate(phases):
         pid = p["id"] or f"phase {n + 1}"
         if not p["id"]:
-            warnings.append(f"phase {n + 1} has no id")
+            strict.append(f"phase {n + 1} has no id")
         elif not PHASE_ID_RE.fullmatch(p["id"]):
             warnings.append(f"phase id {pid!r} does not match [A-Z][A-Z0-9]{{0,7}}")
+        rp = raw[n] if n < len(raw) and isinstance(raw[n], dict) else {}
+        for key in ("title", "wave", "owned", "commit"):
+            if key not in rp:
+                strict.append(f"{pid}: no {key} key (required in a plan created on or after {NEW_PLAN_FROM})")
+        if not str(rp.get("description") or "").strip():
+            warnings.append(f"{pid}: no description; advised: two to five plain sentences")
         w = raw[n].get("wave", 1) if n < len(raw) else 1
         if not isinstance(w, int) or isinstance(w, bool) or w < 1:
             warnings.append(f"{pid}: wave {w!r} is not an int >= 1")
@@ -485,10 +611,22 @@ def check_plan(header, out, body=None):
             errors.append(f'{pid}: bad route {p["route"]!r} ("" or "<agent> <model> [<effort>]")')
         if not isinstance(p["reviewer"], str):
             errors.append(f'{pid}: reviewer {p["reviewer"]!r} is not a string ("" = the orchestrator decides)')
-        for t in p["tasks"]:
+        raw_tasks = as_list(rp.get("task"))
+        for ti, t in enumerate(p["tasks"]):
             tid = t["id"] or f"{pid} task"
             if not t["id"]:
                 errors.append(f"{pid}: task has no id")
+            rt = raw_tasks[ti] if ti < len(raw_tasks) and isinstance(raw_tasks[ti], dict) else {}
+            if "title" not in rt:
+                strict.append(f"{tid}: no title key (required in a plan created on or after {NEW_PLAN_FROM})")
+            if not t["acceptance_lines"]:
+                warnings.append(f"{tid}: no acceptance")
+            elif any(isinstance(g, dict) for g in t["gate"]):
+                proved = {str(x) for g in t["gate"] if isinstance(g, dict) and isinstance(g.get("lines"), list)
+                          for x in g["lines"]}
+                loose = [ln["id"] for ln in t["acceptance_lines"] if ln["id"] not in proved]
+                if loose:
+                    warnings.append(f"{tid}: acceptance line(s) {', '.join(loose)} proved by no gate")
             if t["id"] and pid in by_id and not re.fullmatch(re.escape(pid) + r"\.\d+", t["id"]):
                 warnings.append(f"task id {t['id']!r} is not <phase id>.<n> ({pid}.<n>)")
             for s in t.get("subtasks") or []:
@@ -795,13 +933,21 @@ def cmd_parse(a):
 
 
 def cmd_check(a):
+    if a.classify:  # a file with no +++ first line is a class (not_a_plan), not an error
+        text, sha = load(a.path)
+        if text.lstrip("﻿").split("\n", 1)[0].strip() != "+++":
+            return {"ok": True, "plan": "", "sha": sha, "warnings": [],
+                    **classify({"phases": [], "final_gates": []}, text)}
     header, out, _ = read_plan(a.path)
     text, _ = load(a.path)
     _lines, close = split_plan(text)
-    errors, warnings = check_plan(header, out, body_md_of(text, close))
+    body = body_md_of(text, close)
+    errors, warnings = check_plan(header, out, body)
+    cls = classify(out, body)
     if errors:
-        raise Fail(errors, warnings=warnings)
+        raise Fail(errors, warnings=warnings, **(cls if a.classify else {}))
     out["warnings"] = warnings
+    out.update(cls)
     return out
 
 
@@ -1118,6 +1264,10 @@ def approve_file(path, data, home, run, user_ack=None):
     errors, warnings = check_plan(header, out)
     if errors:
         raise Fail(errors, warnings=warnings)
+    text, _ = load(path)
+    open_qs = unticked_questions(body_md_of(text, split_plan(text)[1]))
+    if open_qs:  # a question the author lives with stays unticked: warn, never block
+        warnings = warnings + [f"{open_qs} unticked open questions"]
     counts = gate_counts_of(out)
     if not store_present(data):
         side = side_store_warning(path)
@@ -1880,6 +2030,8 @@ def build_parser():
     for name, func in (("parse", cmd_parse), ("check", cmd_check)):
         c = sub.add_parser(name)
         c.add_argument("path")
+        if name == "check":
+            c.add_argument("--classify", action="store_true")
         c.set_defaults(func=func)
     s = sub.add_parser("set")
     s.add_argument("path"), s.add_argument("--status", required=True)
@@ -1919,6 +2071,11 @@ def main(argv):
 
 
 # ---------- self-test ----------
+
+
+# the advisories TPL.2 added to check (the self-test filters them out of the "otherwise quiet" asserts)
+TPL_ADVICE_RE = re.compile(r"no description|body has no '## |: no acceptance$|proved by no gate"
+                           r"|: no (title|wave|owned|commit) key|^Summary ")
 
 
 def f2_check_self_test(tmp, mk, write, plan_text, phase, task):
@@ -2055,7 +2212,7 @@ def f2_check_self_test(tmp, mk, write, plan_text, phase, task):
 
     # ---------- check warnings: W1, W2, and the plan that carries neither ----------
     def t1(w):  # the pre-existing T1 warnings: created/status/H1
-        return ("created" in w) or ("status" in w) or ("H1" in w)
+        return ("created" in w) or ("status" in w) or ("H1" in w) or bool(TPL_ADVICE_RE.search(w))
 
     out = mk("check", write("f2-w1.md", plan_text(phases=phase("P1", tasks=gated) + "\n")))
     assert out["ok"] is True and not [w for w in out["warnings"] if "neither gate nor manual" in w] \
@@ -2293,8 +2450,12 @@ def self_test():
         """F.2: the two advisory warnings a pre-F plan now carries (no plan-level final gate, an
         item with neither gate nor manual). The assertions below compare against the warnings
         that are NOT these, so an old plan still has to be otherwise quiet."""
+        # TPL.2 added advisories (missing description, Summary/Goal, no acceptance, a line no gate
+        # proves, a missing required key on an old plan) are filtered the same way: an old plan
+        # must still be otherwise quiet
         return [w for w in warnings if "no final_gate in the plan" not in w
-                and not w.endswith(": neither gate nor manual line")]
+                and not w.endswith(": neither gate nor manual line")
+                and not TPL_ADVICE_RE.search(w)]
 
     try:
         # P1.1 parse — the two real files (read-only) must give the C2 JSON
@@ -2488,6 +2649,145 @@ def self_test():
         assert out["ok"] is True, out
         assert any("created" in w for w in out["warnings"]) and any("status" in w for w in out["warnings"])
         assert any("H1" in w for w in out["warnings"]), out
+
+        # ---------- TPL.2: per-section result, fit class, --classify, date strictness ----------
+        sections_md = "".join(f"## {n}\ntext\n\n" for n in BODY_SECTIONS)
+        fin = '[[final_gate]]\nid = "F1"\ncmd = "true"\ncovers = ["P1.1"]\n'
+        ph_head = ('[[phase]]\nid = "P1"\ntitle = "phase P1"\ndescription = "d"\nwave = 1\n'
+                   'owned = []\n{commit}subagents = false\n')
+        ph_task = ('  [[phase.task]]\n  id = "P1.1"\n  title = "t"\n  acceptance = ["a"]\n'
+                   '  gate = { cmd = "true", expect = 0, timeout = 60, lines = ["P1.1.a1"] }\n')
+
+        def tpl_plan(name, created="2026-10-08", head=ph_head.format(commit='commit = "c"\n'),
+                     task_md=ph_task, final=fin, body=None, status='status = "draft"'):
+            cr = f"created = {created}\n" if created else ""
+            return write(name, f'+++\nplan = "t1"\n{status}\n{cr}runs = []\ndescription = "d"\n{final}\n'
+                               f'{head}{task_md}+++\n\n# t1 — title\n\n'
+                               f'{sections_md if body is None else body}')
+
+        # template class: all seven sections and four parts found, no warning (TPL.2.a1)
+        out = mk("check", tpl_plan("tpl-full.md"))
+        assert out["ok"] and out["fit"] == "template" and out["missing"] == [], out
+        assert out["sections_found"] == 7 and out["sections_total"] == 7 and out["warnings"] == [], out
+        assert set(out["sections"]) == set(BODY_SECTIONS) and set(out["sections"].values()) == {"found"}
+        assert set(out["parts"]) == set(HEADER_PARTS) and set(out["parts"].values()) == {"found"}
+        # the shipped template and the repo's real plan fixture class by the same rule
+        assert mk("check", template)["fit"] == "template"
+        assert mk("check", real_plan)["fit"] in ("template", "partial")
+
+        # partial class: a valid header with no task lists tasks and acceptance (TPL.2.a2)
+        out = mk("check", tpl_plan("tpl-notask.md", task_md="", final=""))
+        assert out["ok"] and out["fit"] == "partial", out
+        assert out["missing"] == ["tasks", "acceptance", "final gate"], out
+        assert out["parts"]["header phases"] == "found" and out["parts"]["tasks"] == "missing"
+        assert out["sections_found"] == 7
+        # a missing body section is named and counted (TPL.2.a9)
+        out = mk("check", tpl_plan("tpl-norisks.md", body=sections_md.replace("## Risks\ntext\n\n", "")
+                                   + "### Risks\nonly a ### heading\n"))
+        assert out["fit"] == "partial" and out["missing"] == ["Risks"], out
+        assert out["sections_found"] == 6 and out["sections"]["Risks"] == "missing", out
+        # "header phases" means [[phase]] blocks, never the Phases body section
+        out = mk("check", write("tpl-nophase.md", '+++\nplan = "t1"\nstatus = "draft"\n'
+                                                 'created = 2026-10-08\nruns = []\n+++\n\n# t1\n\n'
+                                + sections_md))
+        assert out["fit"] == "not_a_plan" and out["sections"]["Phases"] == "found", out
+        assert out["parts"]["header phases"] == "missing" and out["sections_found"] == 7, out
+        # a section heading inside a comment or a fence is not a section
+        out = mk("check", tpl_plan("tpl-hidden.md", body=sections_md.replace("## Log\ntext\n\n", "")
+                                   + "<!-- ## Log -->\n```\n## Log\n```\n"))
+        assert out["missing"] == ["Log"], out
+
+        # not a plan: no +++ first line. --classify returns a class with exit 0; without it the
+        # old error and exit code stay (TPL.2.a3)
+        np = write("not-a-plan.md", "# just notes\n\n## Summary\nhello\n")
+        out = mk("check", np, "--classify")
+        assert out["ok"] is True and out["fit"] == "not_a_plan" and out["sections_found"] == 1, out
+        assert out["sections_total"] == 7 and "Goal" in out["missing"] and "tasks" in out["missing"], out
+        out = mk("check", np, code=2)
+        assert out["ok"] is False and out["errors"] == ["line 1: first line must be '+++'"], out
+        assert "fit" not in out
+        mk("check", os.path.join(tmp, "no-such-plan.md"), "--classify", code=3)  # a missing file stays an error
+
+        # date strictness: the same phase without commit is an error for a new plan and a warning
+        # for an older or undated one (TPL.2.a4, a5)
+        nocommit = ph_head.format(commit="")
+        out = mk("check", tpl_plan("tpl-new.md", created="2026-10-20", head=nocommit), code=2)
+        assert out["errors"] == ["P1: no commit key (required in a plan created on or after 2026-10-20)"], out
+        assert "fit" not in out  # an error reply carries the class only under --classify
+        out = mk("check", tpl_plan("tpl-new2.md", created="2026-10-20", head=nocommit), "--classify", code=2)
+        assert out["fit"] == "template" and out["missing"] == [], out  # the class rides on the error reply
+        for name, created in (("tpl-old.md", "2026-10-19"), ("tpl-undated.md", "")):
+            out = mk("check", tpl_plan(name, created=created, head=nocommit))
+            assert out["ok"] and any("P1: no commit key" in w for w in out["warnings"]), out
+        out = mk("check", tpl_plan("tpl-notitle.md", created="2026-10-21",
+                                   task_md=ph_task.replace('  title = "t"\n', "")), code=2)
+        assert any("P1.1: no title key" in e for e in out["errors"]), out
+        out = mk("check", tpl_plan("tpl-notitle-old.md", task_md=ph_task.replace('  title = "t"\n', "")))
+        assert out["ok"] and any("P1.1: no title key" in w for w in out["warnings"]), out
+        # a task with no acceptance / a line no gate proves is a warning for a new plan too
+        out = mk("check", tpl_plan("tpl-noacc.md", created="2026-10-21",
+                                   task_md=ph_task.replace('  acceptance = ["a"]\n', "")
+                                   .replace(', lines = ["P1.1.a1"]', "")))
+        assert out["ok"] and "P1.1: no acceptance" in out["warnings"], out
+        out = mk("check", tpl_plan("tpl-loose.md", created="2026-10-21",
+                                   task_md=ph_task.replace('acceptance = ["a"]', 'acceptance = ["a", "b"]')))
+        assert out["ok"] and "P1.1: acceptance line(s) P1.1.a2 proved by no gate" in out["warnings"], out
+        # a missing description is only ever a warning, at the top and phase level
+        out = mk("check", write("tpl-nodesc.md", open(os.path.join(tmp, "tpl-full.md")).read()
+                                .replace('description = "d"\n', "")), )
+        assert out["ok"] and "no description key in the header; advised: two to five plain sentences " \
+            "(plans.header_json only)" in out["warnings"], out
+        assert "P1: no description; advised: two to five plain sentences" in out["warnings"], out
+        # description at the top, phase and task level: accepted, passed through, no warning (TPL.1.a4).
+        # A regression guard: the old check never warned on an unknown key, so this passes on the old code too
+        dp = tpl_plan("tpl-desc.md", created="2026-10-21",
+                      task_md=ph_task + '  description = "what the task is"\n')
+        out = mk("check", dp)
+        assert out["ok"] and not [w for w in out["warnings"] if "description" in w], out
+        parsed = mk("parse", dp)
+        assert parsed["description"] == "d" and parsed["phases"][0]["description"] == "d"
+        assert parsed["phases"][0]["tasks"][0]["description"] == "what the task is"
+
+        # Summary drift warns, never errors (TPL.2.a7); matching lines are quiet
+        summ = ("## Summary\n- Phases: 1 — P1\n- Method: single lane · subagents off\n"
+                "- Lanes: P1 is its own lane\n- Delivery: main · pushed: no\n- Gates: F1 = true\n\n")
+        quiet = sections_md.replace("## Summary\ntext\n\n", summ)
+        out = mk("check", tpl_plan("tpl-sum-ok.md", created="2026-10-21", body=quiet))
+        assert out["ok"] and out["warnings"] == [], out
+        drift = quiet.replace("Phases: 1", "Phases: 3").replace("single lane · subagents off", "waves · subagents on") \
+            .replace("F1 = true", "G9 = other")
+        out = mk("check", tpl_plan("tpl-sum-drift.md", created="2026-10-21", body=drift))
+        assert out["ok"] is True, out
+        assert "Summary says 3 phases; the header has 1" in out["warnings"], out
+        assert any(w.startswith("Summary Method says waves · subagents on") for w in out["warnings"]), out
+        assert "Summary Gates does not list final gate F1 as id = cmd" in out["warnings"], out
+        out = mk("check", tpl_plan("tpl-sum-lane.md", created="2026-10-21", body=quiet.replace(
+            "P1 is its own lane", "each phase alone"), head=ph_head.format(commit='commit = "c"\n')
+            + 'lane_group = "A"\n'))
+        assert "Summary Lanes does not name lane_group A" in out["warnings"], out
+        # a missing Summary or Goal is a warning, not an error
+        out = mk("check", tpl_plan("tpl-nosum.md", created="2026-10-21", body=sections_md.replace(
+            "## Summary\ntext\n\n", "").replace("## Goal\ntext\n\n", "")))
+        assert out["ok"] and "body has no '## Summary' section (see templates/plan.md)" in out["warnings"], out
+        assert "body has no '## Goal' section (see templates/plan.md)" in out["warnings"], out
+
+        # approve warns "N unticked open questions" and still approves; check never errors on them (a8)
+        oq = sections_md.replace("## Open questions\ntext\n", "## Open questions\n- [ ] one — decides a\n"
+                                 "- [x] two — decided\n- [ ] three — decides b\n")
+        p = tpl_plan("tpl-oq.md", body=oq)
+        assert mk("check", p)["ok"] is True and not any("unticked" in w for w in mk("check", p)["warnings"])
+        tdata, thome = os.path.join(tmp, "tpl-data"), os.path.join(tmp, "tpl-home")
+        out = mk("approve", p, "--data", tdata, "--home", thome)
+        assert out["ok"] and out["status"] == "approved" and "2 unticked open questions" in out["warnings"], out
+        p = tpl_plan("tpl-oq0.md", body=oq.replace("- [ ] ", "- [x] "))
+        out = mk("approve", p, "--data", tdata, "--home", thome)
+        assert out["ok"] and not any("unticked" in w for w in out["warnings"]), out
+
+        # regression guard (TPL.2.a6, passes on the old code too): the old errors and exit code are
+        # unchanged by the new fields
+        out = mk("check", write("tpl-guard.md", plan_text(phases=phase("P1", route="opencode") + "\n")), code=2)
+        assert out["ok"] is False and any("bad route" in e for e in out["errors"]), out
+        assert "fit" not in out and "sections" not in out
 
         # the shipped template is the contract: it names every key's home and checks with
         # no new warning (the whole set above is empty for it)
