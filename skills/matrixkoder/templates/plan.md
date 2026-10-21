@@ -2,15 +2,13 @@
 # The plan file — every header key below names where it lands in the project store
 # (mk.db; docs/state-schema.md § "Plan file → DB" says the same). This template is the
 # contract between a plan file and the DB, so a writer never has to read the code.
-# Every key is optional and additive: a plan that omits one still checks clean.
+# Keys are optional unless marked REQUIRED; a plan that omits an optional key still checks clean. REQUIRED keys (id, title, wave, owned, commit on a phase; id, title on a task) are a check error for a NEW plan and only a warning for an older or undated one. A new plan is one whose `created` date is on or after 2026-10-20.
 #
 # Lifecycle (C13):
-#   import <file>    loads the file into the store WITHOUT approving it (command added by D1)
-#   approve <file>   checks it, versions it, writes the tasks, copies the file to
-#                    <project>/plans/<id>/archive/plan-v<n>.md and leaves <project>/plans/<id>/plan.md
+#   import <file>    loads the file into the store WITHOUT approving it
+#   approve <file>   checks it, versions it, writes the tasks, copies the file to <project>/plans/<id>/archive/<id>-v<n>.md (an unmigrated project: <data>/plans/archive/) and leaves <project>/plans/<id>/plan.md
 #   run init --plan  starts the run for an approved plan
-#   After import the run and the project DB are the source: status, tasks, rounds and verdicts
-#   change there, never in this file — MK does not edit the file, it is a reference.
+#   After approve the run and the project DB are the source: status, tasks, rounds and verdicts change there. Today approve, set and add-run rewrite only the status and runs lines of this file; nothing else in it is edited.
 #   When the plan is done, the file stays where it is, with its versions in archive/.
 #
 # F.2 gates — two levels, one rule each:
@@ -23,12 +21,12 @@
 #                       exists (a string, never run). Both in one table is a check error;
 #                       neither is a check warning. `critical`/`risk` (task level) feed the
 #                       same approval guard as the phase-level risk.
-plan = "feature-id"                       # id [a-z0-9][a-z0-9-]{0,40}; the file is <project>/plans/<id>/plan.md — plans.id (plans.title until D1 fills the H1 title)
-status = "draft"                          # draft|approved|running|done|parked; run init --plan wants approved — plans.status (column added by D1; header_json until then)
-created = 2026-10-08                      # date the plan was drafted — plans.created (column added by D1; header_json until then)
+plan = "feature-id"                       # id [a-z0-9][a-z0-9-]{0,40}; the file is <project>/plans/<id>/plan.md — plans.id
+status = "draft"                          # draft|approved|running|done|parked; run init --plan wants approved — plans.status
+created = 2026-10-08                      # the day you draft the plan — set it to today; a date on or after 2026-10-20 makes it a NEW plan (the stricter check, see the top) — plans.created
 runs = []                                 # run ids; mk-plan.py add-run appends, never by hand — plans.header_json
-design = []                               # optional: research/spike docs behind the decisions (paths) — plans.design (column added by D1; header_json until then)
-integration = "mk/<feature>/integration"  # optional: branch the lanes merge into; default from the project.yaml `repo.integration_branch` — plans.integration (column added by D1; header_json until then)
+design = []                               # optional: the research, spike or design documents behind the decisions — paths or links (https://…); a design that exists as a file goes in this plan's inbox folder so it travels with the plan into assets/ — plans.design
+integration = "mk/<feature>/integration"  # optional: branch the lanes merge into; default from the project.yaml `repo.integration_branch` — plans.integration
 description = "A short plain-English summary of what this plan builds and why it matters. Two to five sentences, no test steps and no lists of names."  # optional: plain English, 2-5 sentences, what it is and why — plans.header_json only
 
 [gates]                                   # full-suite gates the orchestrator reruns at merge and QA; scoped forms go in briefs — plans.header_json
@@ -57,13 +55,13 @@ cmd = "python3 scripts/mk-e2e-layout.py audit"  # never writes the home: reads e
 every = "merge"                           # rerun after every lane merge, so a merge that leaves a stray file or table fails at once — plans.header_json
 covers = ["P1.1", "P1.2"]                 # the tasks whose merge can change the home layout; same rule as above: non-empty and real task ids — plans.header_json
 
-[[phase]]                                 # one block per phase; phases in one wave must own disjoint files — plans.header_json
-id = "P1"                                 # [A-Z][A-Z0-9]{0,7}, unique; tasks are <phase id>.<n> — tasks.id
-title = "what this phase delivers, one line"   # becomes the phase task title — tasks.title
-description = "A short plain-English summary of what this phase is and why it exists. Two to five sentences."  # optional: plain English, 2-5 sentences — header_json only
-wave = 1                                  # int >= 1; same-wave phases run in parallel — header_json only (the wave is not a tasks column)
-deps = []                                 # phase ids, or <run>:<task> to wait on another run's task — tasks.deps
-owned = ["src/area/", "src/file.ts"]      # the only files this phase touches; overlap within a wave is a check error — tasks.owned
+[[phase]]                                 # one block per phase; phases in one wave must own disjoint files. REQUIRED keys per phase: id, title, wave, owned, commit (a check error for a new plan, see the top; an older plan only gets a warning). description is strongly advised (a warning when missing). All other keys are optional with the default shown — plans.header_json
+id = "P1"                                 # REQUIRED. [A-Z][A-Z0-9]{0,7}, unique; tasks are <phase id>.<n> — tasks.id
+title = "what this phase delivers, one line"   # REQUIRED. becomes the phase task title — tasks.title
+description = "A short plain-English summary of what this phase is and why it exists. Two to five sentences."  # advised (warning when missing): plain English, 2-5 sentences — header_json only
+wave = 1                                  # REQUIRED. int >= 1; same-wave phases run in parallel — header_json only (the wave is not a tasks column)
+deps = []                                 # optional, default []. phase ids, or <run>:<task> to wait on another run's task — tasks.deps
+owned = ["src/area/", "src/file.ts"]      # REQUIRED. the only files this phase touches; overlap within a wave is a check error — tasks.owned
 forbidden = []                            # optional: hot files this phase must leave alone (sequence them instead) — header_json only
 route = ""                                # "" = jev_decide at stage 2; "<agent> <model> [<effort>]" = pinned, skips Jev — tasks.route_json
 reviewer = "opencode opencode-go/kimi-k3" # optional: <agent> <model> for the stage 8 reviewer pane; "" = the orchestrator decides — header_json only
@@ -71,15 +69,27 @@ size = "standard"                         # trivial|standard|complex — feeds j
 risk = "reversible"                       # read_only|reversible|destructive — feeds jev_classify evidence — header_json only
 review = "standard"                       # light|standard|data-loss — sets reviewer depth at stage 8 — header_json only
 qa = []                                   # QA flows for stage 11 (frontend changes) — header_json only
-commit = "feat(scope): one phase, one commit"  # the phase commit subject the builder uses — header_json only
+commit = "feat(scope): one phase, one commit"  # REQUIRED. the phase commit subject the builder uses — header_json only
 subagents = true                          # default true: the builder hands each task to one subagent (its own default model); false = the builder works every task itself — header_json only
 lane_group = ""                           # same value = same wave, one shared worktree and lead session; "" = own lane — header_json only
 
-  [[phase.task]]                          # optional: splits a phase into separately accepted tasks — plans.header_json; the rows below are what the importer writes
-  id = "P1.1"                             # <phase id>.<n> — tasks.id
-  title = "what this task delivers, one line"  # tasks.title
+  # Writing a task (REQUIRED for a new plan: id, title; advised: acceptance and exactly one of gate or manual, a warning when missing; the rest is optional):
+  #   title      one line saying what the task delivers, not how.
+  #   acceptance one outcome per line, each checkable by the reviewer; no "works well".
+  #   gate       the one command that proves it; `lines` names the acceptance lines it proves. A task whose lines no gate proves gets a warning. A task that changes behaviour proves it with a test: name it in `refs` or run it in the gate.
+  #   manual     when no command exists: who checks and how.
+  #   Subtasks (below) are optional and rare: use one only when a task has parts that are accepted separately.
+  # Worked example (delete when writing a plan):
+  #   id = "P1.1"
+  #   title = "run init copies a stored plan"
+  #   acceptance = ["run init --plan <id> creates the run's tasks from the store"]
+  #   gate = { cmd = "python3 scripts/mk-state.py --self-test", expect = 0, timeout = 600, lines = ["P1.1.a1"] }
+  #   a second task with no command: manual = "the user opens the Plan tab and checks the rows"
+  [[phase.task]]                          # REQUIRED keys: id, title (an error for a new plan only); the rest see the guide above — plans.header_json; the rows below are what the importer writes
+  id = "P1.1"                             # REQUIRED. <phase id>.<n> — tasks.id
+  title = "what this task delivers, one line"  # REQUIRED — tasks.title
   description = "A short plain-English summary of what this task is and why it is needed. Two to five sentences."  # optional: plain English, 2-5 sentences — header_json; copied to tasks.extra_json at run init / plan sync
-  acceptance = ["the outcome that decides done, checkable by the reviewer", "the second outcome the same task must also meet"]  # tasks.acceptance; a list = two acceptance lines, and every line gets an id by position: <task id>.a1, <task id>.a2 (a plain string is the single line <task id>.a1)
+  acceptance = ["the outcome that decides done, checkable by the reviewer", "the second outcome the same task must also meet"]  # advised (warning when missing): tasks.acceptance; a list = two acceptance lines, and every line gets an id by position: <task id>.a1, <task id>.a2 (a plain string is the single line <task id>.a1)
   refs = []                               # optional: path:line pointers the brief quotes — header_json only
   subagent = false                        # true only inside a subagents=true phase; then owned is required — header_json only
   owned = []                              # required when subagent = true; subset of the phase's owned — tasks.owned
@@ -109,29 +119,89 @@ lane_group = ""                           # same value = same wave, one shared w
 +++
 
 # <plan id> — <one line: what this plan delivers>
-# This H1 line is what becomes plans.title (after D1; the plan id is the title until then),
+# This H1 line is what becomes plans.title,
 # so keep it to one line and start it with the plan id. `mk-plan.py check` warns when it is missing.
 
-<Where the request came from and what is already decided: user words, research docs (`design`), prior runs. The header is the contract every phase builds against; the body is the context.>
+## Summary
+<Five fixed lines, right under the title, so a card or a reader sees the plan at a glance. Phases, method, lanes and the gate are read from the header, so keep them equal to it; the check warns when they differ. Method is "waves" when the phases use more than one wave value, else "single lane"; "mixed" when some phases run subagents and others do not. A lane that runs across waves is described in Design / context, since a lane_group stays inside one wave.>
+- Phases: <n> — <P1 title; P2 title; …>
+- Method: <waves | single lane> · subagents <on | off | mixed>
+- Lanes: <each lane_group value with its phases; every other phase is its own lane>
+- Delivery: <the branch it merges to> · pushed: <yes | no>
+- Gates: <each final_gate as id = cmd, separated by ;>
+
+<!-- Worked example (delete when writing a plan):
+- Phases: 2 — RUN reads the store only; WIRE connects the tab
+- Method: waves · subagents on
+- Lanes: RUN and WIRE are each their own lane
+- Delivery: main · pushed: no
+- Gates: SUITE = claude plugin test . ; TYPES = tsc -p . --noEmit -->
 
 ## Goal
-<One paragraph: what is true when this plan is done.>
+<Three lines. First: what is true when this plan is done, in one sentence. Second: why it matters. Then, in one line, where the request came from: user words, research docs (`design`), prior runs. The header is the contract every phase builds against; the body is the context.>
+
+<!-- Worked example (delete when writing a plan):
+A run starts from a stored plan and never reads the plan file again.
+Why: the file and the store drift apart, and two sources of truth break resume.
+From: the user, 2026-10-20, after the Play/Pause work. -->
 
 ## Design / context
-<What is wrong today. The shape of the change, with a file map if it helps. Anything the phases must agree on goes here as a numbered contract (C1, C2, …) — phases own disjoint files and meet only through it.>
+<What the phases need to know that is not in the phases themselves. Four parts, in this order; keep each short.>
 
-## Phase notes
-<One `### <phase id> — <title>` block per phase: build order, pointers the briefs need (`path:line`), hazards.>
+### What is wrong today
+<Required when the plan changes existing behaviour; write "none, this is new" otherwise. Three to six numbered facts you checked, each with a `path:line`. No opinions, no "might".>
+
+### Shape of the change
+<One short paragraph, plus a file map (file → what changes) when more than two files are involved.>
+
+### Contracts
+<Numbered agreements (C1, C2, …) the phases meet through, since phases own disjoint files. Each names what is agreed, the phase that writes it and the phase that reads it. None is fine for a one-phase plan.>
+
+### Out of scope
+<One to three lines on what this plan deliberately does not do.>
+
+<!-- Worked example (delete when writing a plan):
+### What is wrong today
+1. `run init` reads the plan file, not the store (`scripts/mk-state.py:1495`).
+### Shape of the change
+Run init takes a plan id and copies the stored items. Files: `scripts/mk-state.py` → read from the store.
+### Contracts
+C1 — plan items: table `plan_items`; STORE writes it, RUN reads it.
+### Out of scope
+No change to how a plan is written. -->
+
+## Phases
+<One `### <phase id> — <title>` block per phase, with exactly these four lines. The files a phase owns are not repeated here; the header holds them. Every header phase has a block and every block has a header phase.>
+
+### P1 — <title>
+- Delivers: <one sentence>
+- Needs first: <the phases it waits on and why, or "nothing">
+- Build order: <the order of its tasks, and what to read first (`path:line`)>
+- Hazards: <what can go wrong here, and the guard: a review depth, a test, a fallback>
+
+<!-- Worked example (delete when writing a plan):
+### RUN — A run reads the store only
+- Delivers: `run init` copies a stored plan version and no later step opens the file.
+- Needs first: STORE, because the rows must exist before a run can copy them.
+- Build order: RUN.1 then RUN.2; read `scripts/mk-state.py:1495` first.
+- Hazards: old runs hold only a file path and keep it until they finish; nothing is migrated. -->
+
 
 ## Risks
-<What can go wrong and the guard for each: a review depth, a test, a fallback.>
+<Three to six numbered risks, each "what can go wrong — the guard — the phase or task it belongs to". A guard is something concrete (a review depth, a test, a gate, a fallback), never "be careful". A risk of data loss means that phase has review = "data-loss".>
+
+<!-- Worked example (delete when writing a plan):
+1. Old runs hold only a file path — a test that an old run still closes — RUN.2. -->
 
 ## Open questions
-<None left, or the question plus who answers it. Anything here blocks approval.>
-<Write every unresolved question, deferred decision or item needing clarification here, as `- [ ] <question> — <why it matters>`; never scatter them through the phase notes.>
-<Questions raised by an analysis or review of the plan are copied here too; ask the user only for preferences, never for codebase facts you can read.>
+<One line per question: `- [ ] <question> — <what it decides>`. Ask the user only for preferences, never for facts the code can answer. `approve` warns "n unticked open questions"; it does not block (a question you decide to live with stays unticked). Write "none" when there are none.>
+<Every unresolved question, deferred decision or item needing clarification goes here, never scattered through the Phases; questions raised by a review of the plan are copied here too.>
 <A question is closed by ticking it `- [x]` and adding a Log line with the answer and who gave it; never by deleting it.>
 
 ## Log
-- <date> — drafted.
-- <date> — <decision + who took it; one line each; append only.>
+<One line per entry: `- <date> — <what was decided or changed> — <who>`. Decisions, answers to open questions, scope cuts and approvals only, oldest first, append only (correct a mistake with a new line). It covers the time up to approval; after that the run records decisions as events and this Log is not added to.>
+- <date> — drafted — <who>
+- <date> — <decision> — <who>
+
+<!-- Worked example (delete when writing a plan):
+- 2026-10-20 — scope cut: old runs are not migrated; they keep the file path until they finish — user -->
