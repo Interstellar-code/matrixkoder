@@ -18,7 +18,8 @@ import type { MkPaneSnapshot } from './data'
 import { beginStoreTick, endStoreTick, globalDirOf, homeDir, paths, projectYamlPath, resolveDataDir, resetStoreMemo } from './paths'
 import {
   DRAFT_EMPTY, DRAFT_SEND_FAILED, DRAFT_SYSTEM, IMPROVE_EMPTY, IMPROVE_PASTE, expandPaste, IMPROVE_FAILED, IMPROVE_FILL_FAILED, IMPROVE_MODEL, QUESTIONS_SYSTEM, REWRITE_SYSTEM,
-  answeredPairs, canAccept, contextBlock, draftContext, draftPrompt, finalText, modeOf, newImproveFlow, questionsPrompt, readQuestions, readRewrite, rewritePrompt,
+  NO_QUESTION_NOTE, answeredPairs, canAccept, contextBlock, draftContext, draftPrompt, finalText, isPlanProposal, keepPlanPrompt, modeOf, newImproveFlow,
+  pendingPlanPrompt, planPromptNote, questionsPrompt, readQuestionsAnswer, readRewrite, rewritePrompt, wizardSubject,
 } from './improve-core'
 import { NARROW, STATUS_GLYPH } from './tabs/ui'
 import { stageWord, STAGE_TOTAL } from './tabs/header'
@@ -1868,15 +1869,30 @@ async function resetImproveWork($: EngineInterface): Promise<void> {
   }
 }
 
-/** the model call failed or its answer was unreadable: one calm line and a Try again; nothing is changed or sent */
+/** the model call failed or its answer was unreadable: one calm line and a Try again; nothing is changed or sent.
+ *  The line itself is left to `improveError`, which names the call that failed (R-2); a failed wizard
+ *  rewrite adds the note that the answers were not used (R-5, drawn from the flow by the card). */
 const failFlow = ($: EngineInterface, id: string, failedStep: 'questions' | 'rewrite'): Promise<unknown> =>
   update($, improveAtom, s => (s.flow != null && s.flow.id === id && (s.flow.step === 'asking' || s.flow.step === 'writing')
-    ? { ...s, flow: { ...s.flow, step: 'error' as const, failedStep, error: IMPROVE_FAILED } }
+    ? { ...s, flow: { ...s.flow, step: 'error' as const, failedStep, error: '' } }
     : s))
 
-/** Model work outlives a press, so it starts on a timer (as the standalone Prompt Upgrade mod does), never as a dangling promise. */
-function improveLater($: EngineInterface, id: string, failedStep: 'questions' | 'rewrite', fn: () => Promise<void>): void {
-  $.clock.after(1, () => { void fn().catch(() => failFlow($, id, failedStep).catch(() => {})) })
+/** Model work outlives a press, so it starts on a timer (as the standalone Prompt Upgrade mod does), never as a dangling promise.
+ *  The timer and the call it starts are kept by flow id, so a Discard stops both (R-22): a timer that has not
+ *  fired never starts, and a call already sent is cut. The map hangs off this function, so the module keeps
+ *  no state of its own. */
+function improveLater($: EngineInterface, id: string, failedStep: 'questions' | 'rewrite', fn: (signal: AbortSignal) => Promise<void>): void {
+  // the pending work hangs off this function: only the Improve flow functions may change in this file
+  const work = improveLater as unknown as { pending?: Map<string, () => void> }
+  const pending = (work.pending ??= new Map())
+  const abort = new AbortController()
+  const timer = $.clock.after(1, () => {
+    void fn(abort.signal)
+      .catch(() => failFlow($, id, failedStep).catch(() => {}))
+      .finally(() => { if (pending.get(id) === stop) pending.delete(id) })
+  })
+  const stop = (): void => { timer.cancel(); abort.abort() }
+  pending.set(id, stop)
 }
 
 /** the system clipboard's text (macOS `pbpaste`); null where it cannot be read. Never throws. */
@@ -1898,13 +1914,14 @@ async function improveContext($: EngineInterface): Promise<string> {
   }
 }
 
-/** Run Wizard: ask the model for up to three questions; none that help leaves the rewrite on show standing */
-async function improveAsk($: EngineInterface, id: string): Promise<void> {
+/** Run Wizard: ask the model for up to three questions about the proposal on show; none that help
+ *  leaves the rewrite on show standing, and an answer that cannot be read is a failure (R-3) */
+async function improveAsk($: EngineInterface, id: string, signal: AbortSignal): Promise<void> {
   const f = (await read($, improveAtom)).flow
   if (f == null || f.id !== id || f.step !== 'asking') return
   let r
   try {
-    r = await $.model.complete({ model: IMPROVE_MODEL, system: QUESTIONS_SYSTEM, prompt: questionsPrompt(f.original, await improveContext($)), maxTokens: 900, timeoutMs: 45_000 })
+    r = await $.model.complete({ model: IMPROVE_MODEL, system: QUESTIONS_SYSTEM, prompt: questionsPrompt(wizardSubject(f), await improveContext($)), maxTokens: 900, timeoutMs: 45_000 }, { signal })
   } catch {
     await failFlow($, id, 'questions')
     return
@@ -1912,20 +1929,23 @@ async function improveAsk($: EngineInterface, id: string): Promise<void> {
   const cur = (await read($, improveAtom)).flow
   if (cur == null || cur.id !== id || cur.step !== 'asking') return
   if (!r.isAnswered) { await failFlow($, id, 'questions'); return }
-  const questions = readQuestions(r.text)
+  const questions = readQuestionsAnswer(r.text)
+  // an answer that is not a questions list at all is a failed call, not "no question would help" (R-3)
+  if (questions == null) { await failFlow($, id, 'questions'); return }
   await patchFlow($, id, questions.length === 0
-    ? { step: 'review', note: 'No question would help. This rewrite stands.' }
+    ? { step: 'review', note: NO_QUESTION_NOTE }
     : { step: 'questions', questions, answers: {}, other: null, note: '' })
 }
 
 /** The rewrite: one model call with the recent conversation and any wizard answers; the result is saved in the list */
-async function improveWrite($: EngineInterface, id: string): Promise<void> {
+async function improveWrite($: EngineInterface, id: string, signal: AbortSignal): Promise<void> {
   const f = (await read($, improveAtom)).flow
   if (f == null || f.id !== id || f.step !== 'writing') return
   const mode = modeOf(f)
   let call
   if (mode === 'improve') {
-    call = { system: REWRITE_SYSTEM, prompt: rewritePrompt(f.original, answeredPairs(f), await improveContext($)) }
+    // the wizard rewrites the proposal on show — the person's own edit when there is one (R-4)
+    call = { system: REWRITE_SYSTEM, prompt: rewritePrompt(wizardSubject(f), answeredPairs(f), await improveContext($)) }
   } else {
     // Answer / Question read the last DRAFT_MESSAGES messages; with none there is nothing to reply to
     // the latest exchange is sent whole and apart from the earlier rows, so the draft answers it, not an old message
@@ -1939,7 +1959,7 @@ async function improveWrite($: EngineInterface, id: string): Promise<void> {
   }
   let r
   try {
-    r = await $.model.complete({ model: IMPROVE_MODEL, ...call, maxTokens: 2000, timeoutMs: 60_000 })
+    r = await $.model.complete({ model: IMPROVE_MODEL, ...call, maxTokens: 2000, timeoutMs: 60_000 }, { signal })
   } catch {
     await failFlow($, id, 'rewrite')
     return
@@ -1948,7 +1968,8 @@ async function improveWrite($: EngineInterface, id: string): Promise<void> {
   if (cur == null || cur.id !== id || cur.step !== 'writing') return
   const out = r.isAnswered ? readRewrite(r.text) : null
   if (out == null) { await failFlow($, id, 'rewrite'); return }
-  await patchFlow($, id, { step: 'review', upgraded: out.upgraded, added: out.added, draft: '', isEditing: false, note: mode === 'improve' ? wizardNote(f) : '' })
+  // a Plan prompt parked behind the proposal stays parked; the wizard's note waits for it (R-23)
+  await patchFlow($, id, { step: 'review', upgraded: out.upgraded, added: out.added, draft: '', isEditing: false, note: keepPlanPrompt(f.note, mode === 'improve' ? wizardNote(f) : '') })
   void $.ui.scroll({ in: PANE_ID, to: 'end' }).catch(() => {}) // the card ends the content; docked, the pinned strip sits under it
   if (mode !== 'improve') return // a drafted message is not a saved improvement
   const entry: MkImproveEntry = { id, at: await $.clock.now(), original: f.original.slice(0, IMPROVE_SAVED_CHARS), upgraded: out.upgraded.slice(0, IMPROVE_SAVED_CHARS), added: out.added }
@@ -1993,12 +2014,31 @@ async function improveAction($: EngineInterface, kind: ImproveKind, a?: string |
       await update($, improveAtom, prev => ({ ...prev, menu: false, flow: { ...newImproveFlow(id, '', 'error'), error: IMPROVE_EMPTY } }))
       return
     }
+    // R-23: a seed must not replace a proposal the person is reading. The Plan tab's own Plan prompt may
+    // replace an older Plan prompt; the person's own proposal waits, with the seed in the note.
+    if (f != null && canAccept(f) && !isPlanProposal(f)) {
+      await update($, improveAtom, prev => (prev.flow == null ? prev : { ...prev, menu: false, flow: { ...prev.flow, note: planPromptNote(b === 'pause' ? 'pause' : 'play', seed) } }))
+      return
+    }
     if (b === 'pause') {
       await update($, improveAtom, prev => ({ ...prev, menu: false, flow: { ...newImproveFlow(id, seed, 'review'), upgraded: seed } }))
       return
     }
     await update($, improveAtom, prev => ({ ...prev, menu: false, flow: newImproveFlow(id, seed) }))
-    improveLater($, id, 'rewrite', () => improveWrite($, id))
+    improveLater($, id, 'rewrite', signal => improveWrite($, id, signal))
+  } else if (kind === 'plan-prompt') {
+    // the chip opens the Plan prompt that waited behind the proposal (R-23): a pause prompt stands as it
+    // is, a play prompt is rewritten by the model, exactly as a fresh seed
+    if (f == null) return
+    const waiting = pendingPlanPrompt(f)
+    if (waiting == null) return
+    const id = `${String(await $.clock.now())}-${String(++improveSeq)}`
+    if (waiting.kind === 'pause') {
+      await update($, improveAtom, prev => ({ ...prev, menu: false, flow: { ...newImproveFlow(id, waiting.text, 'review'), upgraded: waiting.text } }))
+      return
+    }
+    await update($, improveAtom, prev => ({ ...prev, menu: false, flow: newImproveFlow(id, waiting.text) }))
+    improveLater($, id, 'rewrite', signal => improveWrite($, id, signal))
   } else if (kind === 'improve' || (kind === 'retry' && f != null && f.step === 'error' && f.original.trim() === '' && modeOf(f) === 'improve')) {
     if (f != null && (f.step === 'asking' || f.step === 'writing')) {
       await update($, improveAtom, prev => ({ ...prev, menu: false }))
@@ -2019,7 +2059,7 @@ async function improveAction($: EngineInterface, kind: ImproveKind, a?: string |
     }
     const original = expanded.text.trim()
     await update($, improveAtom, prev => ({ ...prev, menu: false, flow: newImproveFlow(id, original) }))
-    improveLater($, id, 'rewrite', () => improveWrite($, id))
+    improveLater($, id, 'rewrite', signal => improveWrite($, id, signal))
   } else if (kind === 'compose' && (a === 'answer' || a === 'question')) {
     // draft the person's next message from the conversation; what the prompt line holds is a hint, never required
     if (f != null && (f.step === 'asking' || f.step === 'writing')) {
@@ -2029,7 +2069,7 @@ async function improveAction($: EngineInterface, kind: ImproveKind, a?: string |
     const hint = (await $.prompt.read()).text.trim()
     const id = `${String(await $.clock.now())}-${String(++improveSeq)}`
     await update($, improveAtom, prev => ({ ...prev, menu: false, flow: newImproveFlow(id, hint, 'writing', a) }))
-    improveLater($, id, 'rewrite', () => improveWrite($, id))
+    improveLater($, id, 'rewrite', signal => improveWrite($, id, signal))
   } else if (kind === 'send') {
     // a drafted message goes in as the person's own words; a hint left in the prompt line is cleared with it
     if (f == null || modeOf(f) === 'improve' || !canAccept(f) || draftSending.has(f.id)) return
@@ -2060,7 +2100,13 @@ async function improveAction($: EngineInterface, kind: ImproveKind, a?: string |
       ? { ...prev, undo: /\[Pasted text #\d+/.test(before.text) ? f.original : before.text, written: filled.text, flow: null }
       : prev))
   } else if (kind === 'discard') {
+    // the flow goes first, so a call that is cut lands nowhere; then the pending work stops: a timer
+    // that has not fired never starts, and a call already sent is cut (R-22)
     await update($, improveAtom, prev => ({ ...prev, flow: null }))
+    const work = improveLater as unknown as { pending?: Map<string, () => void> }
+    const stopped = f == null ? undefined : work.pending?.get(f.id)
+    stopped?.()
+    if (f != null) work.pending?.delete(f.id)
   } else if (kind === 'undo') {
     // only while the line still holds what Accept wrote: newer typing is never overwritten
     if (s.undo == null) return
@@ -2084,8 +2130,8 @@ async function improveAction($: EngineInterface, kind: ImproveKind, a?: string |
     const ix = typeof a === 'number' ? String(a) : ''
     if (kind === 'wizard') {
       // Run Wizard on the proposal on show: the same card turns to the questions (improvements only)
-      if (modeOf(f) === 'improve' && await moveFlow($, id, ['review'], cur => ({ upgraded: cur.isEditing && cur.draft.trim() !== '' ? cur.draft : cur.upgraded, step: 'asking', questions: [], answers: {}, other: null, otherDraft: '', isEditing: false, note: '' }))) {
-        improveLater($, id, 'questions', () => improveAsk($, id))
+      if (modeOf(f) === 'improve' && await moveFlow($, id, ['review'], cur => ({ upgraded: cur.isEditing && cur.draft.trim() !== '' ? cur.draft : cur.upgraded, step: 'asking', questions: [], answers: {}, other: null, otherDraft: '', isEditing: false, note: keepPlanPrompt(cur.note, '') }))) {
+        improveLater($, id, 'questions', signal => improveAsk($, id, signal))
       }
     } else if (kind === 'answer' && typeof a === 'number') {
       // merged into the CURRENT answers, so two quick picks both land; an Other field open on another question stays
@@ -2110,15 +2156,15 @@ async function improveAction($: EngineInterface, kind: ImproveKind, a?: string |
         cur.questions.forEach((_, i) => { if (answers[String(i)] === undefined) answers[String(i)] = { kind: 'skip' } })
         return { answers, other: null, otherDraft: '', step: 'writing' }
       })
-      if (next != null) improveLater($, id, 'rewrite', () => improveWrite($, id))
+      if (next != null) improveLater($, id, 'rewrite', signal => improveWrite($, id, signal))
     } else if (kind === 'retry') {
       const next = await moveFlow($, id, ['error'], cur => ({ step: cur.failedStep === 'questions' ? 'asking' : 'writing', error: '' }))
-      if (next != null) improveLater($, id, next.failedStep, () => (next.failedStep === 'questions' ? improveAsk($, id) : improveWrite($, id)))
+      if (next != null) improveLater($, id, next.failedStep, signal => (next.failedStep === 'questions' ? improveAsk($, id, signal) : improveWrite($, id, signal)))
     } else if (kind === 'edit' && f.step === 'review') {
       // leaving the editor keeps the draft as the proposal
-      await moveFlow($, id, ['review'], cur => (cur.isEditing ? { isEditing: false, upgraded: cur.draft.trim() === '' ? cur.upgraded : cur.draft, note: '' } : { isEditing: true, draft: cur.upgraded, note: '' }))
+      await moveFlow($, id, ['review'], cur => (cur.isEditing ? { isEditing: false, upgraded: cur.draft.trim() === '' ? cur.upgraded : cur.draft, note: keepPlanPrompt(cur.note, '') } : { isEditing: true, draft: cur.upgraded, note: keepPlanPrompt(cur.note, '') }))
     } else if (kind === 'edit-save' && f.step === 'review') {
-      await moveFlow($, id, ['review'], cur => ({ isEditing: false, upgraded: text.trim() === '' ? cur.upgraded : text, note: '' }))
+      await moveFlow($, id, ['review'], cur => ({ isEditing: false, upgraded: text.trim() === '' ? cur.upgraded : text, note: keepPlanPrompt(cur.note, '') }))
     } else if (kind === 'draft' && f.step === 'review') {
       await patchFlow($, id, { draft: text })
     } else if (kind === 'copy' && f.step === 'review') {

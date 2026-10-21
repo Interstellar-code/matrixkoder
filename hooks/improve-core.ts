@@ -10,12 +10,97 @@ export const IMPROVE_MODEL = 'haiku'
 export const IMPROVE_FAILED = 'Could not improve that one. Your prompt is untouched.'
 export const IMPROVE_EMPTY = 'Type a prompt in Claude Code’s prompt line, then press Improve.'
 /** the prompt line refused the write (a dialog, or no composer): nothing is lost, Accept can be tried again */
-export const IMPROVE_FILL_FAILED = 'Prompt line busy. Close dialogs, Accept again.'
+export const IMPROVE_FILL_FAILED = 'A dialog holds the prompt line. Close it, then press Accept again.'
 
 /** an Answer or Question press with no conversation to read */
 export const DRAFT_EMPTY = 'Nothing to reply to yet: the conversation is empty.'
-/** the prompt queue refused the message: it stays on show, Edit puts it in the prompt line */
+/** the question queue refused the message: it stays on show, Edit puts it in the prompt line */
 export const DRAFT_SEND_FAILED = 'Could not send it. Press Edit to put it in the prompt line.'
+
+/** A Plan prompt (the Plan tab's Play or Pause) that arrived while a proposal was on show: it waits in the
+ *  note instead of replacing the proposal (R-23). The kind ('pause' or 'play') and the prompt follow it. */
+export const PLAN_PROMPT_NOTE = 'Plan prompt waiting: '
+
+/** The note a Plan prompt waits in, behind the proposal on show (R-23). */
+export const planPromptNote = (kind: 'pause' | 'play', text: string): string => `${PLAN_PROMPT_NOTE}${kind}: ${text}`
+
+/** The note a flow keeps: a Plan prompt that waits stays put, whatever else the note said (R-23). */
+export const keepPlanPrompt = (note: string, next: string): string => (pendingPlanPrompt({ note }) == null ? next : note)
+
+/** The Plan prompt waiting in a note, or null when the note is something else. */
+export const pendingPlanPrompt = (f: { note: string }): { kind: 'pause' | 'play'; text: string } | null => {
+  if (!f.note.startsWith(PLAN_PROMPT_NOTE)) return null
+  const rest = f.note.slice(PLAN_PROMPT_NOTE.length)
+  const sep = rest.indexOf(': ')
+  if (sep < 0) return null
+  const kind = rest.slice(0, sep)
+  if (kind !== 'pause' && kind !== 'play') return null
+  return { kind, text: rest.slice(sep + 2) }
+}
+
+// ── the Run Wizard card's shared words ───────────────────────────────────────────
+// The footer card and the Improve tab draw the same card, so its heads, its counted answers and
+// its waiting Plan prompt live here and both surfaces read them from one place.
+
+/** the head of each card state */
+export const CARD_HEAD = {
+  proposal: '✦ IMPROVED PROMPT',
+  wizard: '✦ WIZARD',
+  improve: '✦ IMPROVE',
+  improving: '✦ IMPROVING',
+  plan: '✦ PLAN PROMPT',
+} as const
+
+/** the note a wizard rewrite carries: `Built from your answers · N of M used` */
+export const WIZARD_NOTE = 'Built from your answers'
+
+/** the note the wizard leaves when no question would help */
+export const NO_QUESTION_NOTE = 'No question would help. This rewrite stands.'
+
+/** the chip that opens a Plan prompt waiting behind the proposal */
+export const PLAN_PROMPT_CHIP = 'Use the Plan prompt'
+
+/** the calm line a failed question call shows: it names the call that failed (R-2) */
+export const IMPROVE_QUESTIONS_FAILED = 'The wizard could not write its questions. Your prompt line is untouched.'
+
+/** the line a failed flow shows: what failed, and what the person can do about it */
+export const improveError = (f: { error: string; failedStep: 'questions' | 'rewrite' }): string =>
+  f.error !== '' ? f.error : f.failedStep === 'questions' ? IMPROVE_QUESTIONS_FAILED : IMPROVE_FAILED
+
+/** the questions answered: a Skip is not an answer (R-1), and the count and the "N of M used" note agree (R-26) */
+export const answeredCount = (f: { questions: readonly MkImproveQuestion[]; answers: Readonly<Record<string, MkImproveAnswer>> }): number =>
+  answeredPairs(f).length
+
+/** the count the wizard's head shows: `0 of 3 answered` */
+export const answeredLabel = (f: { questions: readonly MkImproveQuestion[]; answers: Readonly<Record<string, MkImproveAnswer>> }): string =>
+  `${String(answeredCount(f))} of ${String(f.questions.length)} answered`
+
+/** the heading every Plan prompt starts with (the Plan tab's Play and Pause prompts) */
+export const PLAN_PROMPT_HEADING = 'Sent from the MK dashboard (button press)'
+
+/** a proposal that came from the Plan tab's Play or Pause press, not from the prompt line */
+export const isPlanProposal = (f: { original: string }): boolean => f.original.startsWith(PLAN_PROMPT_HEADING)
+
+/** the dim line a waiting Plan prompt leaves under the card */
+export const planPromptLine = (f: { note: string }): string => {
+  const p = pendingPlanPrompt(f)
+  if (p == null) return ''
+  const first = p.text.split('\n')[0] ?? ''
+  return `A Plan prompt is waiting: ${first}`
+}
+
+/** The note a failed wizard rewrite leaves: the answers were not used (R-5) */
+export const WIZARD_ANSWERS_UNUSED = 'Your answers were not used. The earlier rewrite is still here.'
+
+/** the working card's head and its lines: what the wizard is doing right now (R-8, R-13) */
+export const workingText = (f: { step: MkImproveStep; questions: readonly MkImproveQuestion[]; answers: Readonly<Record<string, MkImproveAnswer>> }): { head: string; lines: string[] } => {
+  if (f.step === 'asking') return { head: CARD_HEAD.improving, lines: ['Reading your prompt and working out what to ask…'] }
+  const n = answeredCount(f)
+  return {
+    head: CARD_HEAD.improve,
+    lines: ['Reading the last 150 messages…', n > 0 ? `Writing the new prompt with your ${String(n)} ${n === 1 ? 'answer' : 'answers'}.` : 'Writing the new prompt…'],
+  }
+}
 
 /** a fresh improvement for `original`, in `step` (writing = the default one-call rewrite) */
 export const newImproveFlow = (id: string, original: string, step: MkImproveStep = 'writing', mode: MkImproveMode = 'improve'): MkImproveFlow => ({
@@ -56,6 +141,12 @@ export const finalText = (f: Pick<MkImproveFlow, 'isEditing' | 'draft' | 'upgrad
 export const canAccept = (f: Pick<MkImproveFlow, 'step' | 'isEditing' | 'draft' | 'upgraded'>): boolean =>
   (f.step === 'review' || f.step === 'error') && finalText(f).trim() !== ''
 
+/** What the wizard works on: the proposal on show — the person's own edit when there is one — and the
+ *  prompt they typed when there is none (R-4). A first rewrite has no proposal yet, so it works on
+ *  the prompt; a wizard rewrite works on the proposal the person is looking at. */
+export const wizardSubject = (f: Pick<MkImproveFlow, 'original' | 'upgraded'>): string =>
+  (f.upgraded.trim() !== '' ? f.upgraded : f.original)
+
 export const wordCount = (t: string): number => (t.trim() === '' ? 0 : t.trim().split(/\s+/).length)
 
 /** a JSON object out of a model answer, fences and chatter around it ignored; null when none parses */
@@ -90,6 +181,14 @@ export function readQuestions(text: string): MkImproveQuestion[] {
     if (question !== '' && options.length >= 2) out.push({ question: clip(question, 160), options })
   }
   return out
+}
+
+/** The questions in a model answer, or null when the answer is not a readable questions list (R-3):
+ *  an empty list is a real answer — "no question would help" — but prose or broken JSON is not. */
+export function readQuestionsAnswer(text: string): MkImproveQuestion[] | null {
+  const raw = extractJson(text) as { questions?: unknown } | null
+  if (!raw || !Array.isArray(raw.questions)) return null
+  return readQuestions(text)
 }
 
 export function readRewrite(text: string): { upgraded: string; added: string[] } | null {

@@ -2,8 +2,8 @@
 // ported from the standalone Prompt Upgrade mod.
 import { test, expect } from 'claude-code/testing'
 import {
-  FORMAT_RULE, answeredPairs, expandPaste, bigDigits, bigNumber, clip, contextBlock, draftContext, draftPrompt, extractJson, finalText, newImproveFlow, questionsPrompt,
-  readQuestions, readRewrite, rewritePrompt, wordCount, wrap,
+  FORMAT_RULE, answeredPairs, expandPaste, bigDigits, bigNumber, clip, contextBlock, draftContext, draftPrompt, extractJson, finalText, keepPlanPrompt, newImproveFlow,
+  pendingPlanPrompt, planPromptLine, planPromptNote, questionsPrompt, readQuestions, readQuestionsAnswer, readRewrite, rewritePrompt, wizardSubject, wordCount, wrap,
 } from './improve-core'
 
 const QUESTIONS = JSON.stringify({
@@ -205,4 +205,28 @@ test('expandPaste: one placeholder with a matching line count is filled; anythin
   expect(expandPaste('[Pasted text #1 +2 lines]', null).ok, 'no clipboard').toBe(false)
   expect(expandPaste('[Pasted text #1 +2 lines]', '   ').ok, 'empty clipboard').toBe(false)
   expect(expandPaste('x [Pasted text #1] y', 'one line').text, 'no line count: filled').toBe('x one line y')
+})
+
+test('readQuestionsAnswer: an empty list is a real answer, prose is not (R-3)', () => {
+  expect(readQuestionsAnswer('not json at all'), 'prose').toBeNull()
+  expect(readQuestionsAnswer('{"other":1}'), 'no questions key').toBeNull()
+  expect(readQuestionsAnswer('{"questions":[]}'), 'no question would help').toEqual([])
+  expect(readQuestionsAnswer(QUESTIONS)).toHaveLength(2)
+  expect(readQuestionsAnswer(QUESTIONS)?.[0]?.question).toBe('Who is it for?')
+})
+
+test('wizardSubject: the proposal on show wins over the prompt that was typed (R-4)', () => {
+  expect(wizardSubject({ original: 'rough prompt', upgraded: '' })).toBe('rough prompt')
+  expect(wizardSubject({ original: 'rough prompt', upgraded: 'my own edit' })).toBe('my own edit')
+  expect(wizardSubject({ original: 'rough prompt', upgraded: '   ' })).toBe('rough prompt')
+})
+
+test('a Plan prompt waits in the note and comes back out of it (R-23)', () => {
+  const note = planPromptNote('pause', 'Start task S1.1 of plan settings-plans-db')
+  expect(pendingPlanPrompt({ note })).toEqual({ kind: 'pause', text: 'Start task S1.1 of plan settings-plans-db' })
+  expect(planPromptLine({ note })).toBe('A Plan prompt is waiting: Start task S1.1 of plan settings-plans-db')
+  expect(pendingPlanPrompt({ note: 'No question would help. This rewrite stands.' }), 'another note').toBeNull()
+  expect(planPromptLine({ note: 'No question would help. This rewrite stands.' })).toBe('')
+  expect(keepPlanPrompt(note, ''), 'a waiting Plan prompt stays put').toBe(note)
+  expect(keepPlanPrompt('Copied.', ''), 'any other note gives way').toBe('')
 })
