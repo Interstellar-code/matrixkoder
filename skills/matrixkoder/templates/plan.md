@@ -4,11 +4,18 @@
 # contract between a plan file and the DB, so a writer never has to read the code.
 # Keys are optional unless marked REQUIRED; a plan that omits an optional key still checks clean. REQUIRED keys (id, title, wave, owned, commit on a phase; id, title on a task) are a check error for a NEW plan and only a warning for an older or undated one. A new plan is one whose `created` date is on or after 2026-10-20.
 #
+# What a new plan looks like (plain words):
+#   A new plan is one whose `created` date is on or after 2026-10-20. The `created = 2026-10-08` example below is a placeholder: set it to today.
+#   A plan has seven body sections, the `##` headings below the closing +++: Summary, Goal, Design / context, Phases, Risks, Open questions, Log. The `# <plan id> — …` title line is checked separately (a warning when missing).
+#   The check also reports four header parts: header phases (at least one `[[phase]]` block; never the Phases body section), tasks (at least one task), acceptance (every task has some) and final gate (a `[[final_gate]]` with covers).
+#   TEMPLATE = all seven sections and all four parts found. PARTIAL = a valid +++ header with something missing; the check lists the missing names (for example "missing: tasks, acceptance" or "missing: Risks"). NOT A PLAN = no +++ header, or no phase and no task. An Inbox card shows "n of 7 sections found" plus the missing names.
+#   Method in the Summary is "mixed" when phases differ on `subagents`.
+#
 # Lifecycle (C13):
 #   import <file>    loads the file into the store WITHOUT approving it
 #   approve <file>   checks it, versions it, writes the tasks, copies the file to <project>/plans/<id>/archive/<id>-v<n>.md (an unmigrated project: <data>/plans/archive/) and leaves <project>/plans/<id>/plan.md
 #   run init --plan  starts the run for an approved plan
-#   After approve the run and the project DB are the source: status, tasks, rounds and verdicts change there. Today approve, set and add-run rewrite only the status and runs lines of this file; nothing else in it is edited.
+#   `set`, `add-run` and `approve` rewrite the header of this file (the status and runs lines). The file is the source only until import; after import, status, tasks and runs live in the store (mk.db), and rounds and verdicts change there.
 #   When the plan is done, the file stays where it is, with its versions in archive/.
 #
 # F.2 gates — two levels, one rule each:
@@ -90,10 +97,13 @@ lane_group = ""                           # same value = same wave, one shared w
   title = "what this task delivers, one line"  # REQUIRED — tasks.title
   description = "A short plain-English summary of what this task is and why it is needed. Two to five sentences."  # optional: plain English, 2-5 sentences — header_json; copied to tasks.extra_json at run init / plan sync
   acceptance = ["the outcome that decides done, checkable by the reviewer", "the second outcome the same task must also meet"]  # advised (warning when missing): tasks.acceptance; a list = two acceptance lines, and every line gets an id by position: <task id>.a1, <task id>.a2 (a plain string is the single line <task id>.a1)
+  deps = []                               # optional: ids in the same plan, or <run>:<id> to wait on another run — tasks.deps
+  parallel = false                        # optional; true: parallel-flagged siblings with no dep between them may run at once — tasks.parallel
+  route = ""                              # optional; "" or "<agent> <model> [<effort>]" — tasks.route_json
   refs = []                               # optional: path:line pointers the brief quotes — header_json only
   subagent = false                        # true only inside a subagents=true phase; then owned is required — header_json only
   owned = []                              # required when subagent = true; subset of the phase's owned — tasks.owned
-  gate = { cmd = "<the command that proves this task>", expect = 0, timeout = 600, lines = ["P1.1.a1"] }  # the task must pass this command; `lines` names the acceptance line ids (above) it proves and mk-plan check errors on an id that is not one of <task id>'s lines; `gate` may also be a LIST of such tables when the task needs several commands — plans.header_json
+  gate = { cmd = "<the command that proves this task>", expect = 0, timeout = 600, lines = ["P1.1.a1", "P1.1.a2"] }  # the task must pass this command; `lines` names the acceptance line ids (above) it proves and mk-plan check errors on an id that is not one of <task id>'s lines; `gate` may also be a LIST of such tables when the task needs several commands — plans.header_json
   critical = true                         # bool, default false: a task the plan cannot ship without; approving a file that flips this true -> false needs --user-ack — header_json only
   risk = 3                                # this task's base risk as an int 1-5 (default 1): approving a file that LOWERS it needs --user-ack; separate from the phase-level risk string above — header_json only
 
