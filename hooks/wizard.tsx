@@ -7,12 +7,12 @@
 import { atom, read, update } from 'claude-code'
 import type { Elements as ElementTables, EngineInterface, On, PluginOptions, RenderChildren, RenderElement } from 'claude-code'
 import type { MkWizardDraft } from '../types'
-import { globalDirPath, join, parseJson } from './data'
+import { basename, globalDirPath, join, parseJson } from './data'
 import { listedDataDir, paths as mkPaths, projectYamlPath } from './paths'
 import { parsePluginManifest } from './settings-io'
 import {
   AGENT_NAMES, WIZARD_STEPS, addToGitignore, buildYaml, dataDirOf, EMPTY_DRAFT, emptyDraft, fallbackText, installModeOf, mergeModels, parseModels, parseProviders, parseVersion,
-  parseWhich, proposeGates, providerChoices, slugOf,
+  parseWhich, proposeGates, providerChoices, slugOf, yamlNameOf,
 } from './wizard-core'
 import { StepsA, type WizardAct } from './wizard-steps-a'
 import { StepsB } from './wizard-steps-b'
@@ -435,7 +435,7 @@ async function writeAll($: EngineInterface): Promise<void> {
     const data = dataDirOf(d)
     if (d.repo == null || data == null || d.home == null || d.globalDir == null) throw new Error('no git repository (or HOME) detected — run /mk setup from inside the project')
     const yamlPath = await yamlPathOf($, d, data)
-    const yamlName = yamlPath.split('/').pop() ?? 'project.yaml'
+    const yamlName = basename(yamlPath) || yamlNameOf(d.migrated)
     // detection is a snapshot: a yaml that appeared since goes back to the replace confirm, nothing is written
     const yamlExists = await $.fs.exists(yamlPath)
     if (yamlExists && !d.existingYaml) {
