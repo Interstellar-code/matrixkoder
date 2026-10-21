@@ -19,7 +19,7 @@ gone, and `mk-migrate.py` is the ONE migration tool.
 | Root store | `<home>/mk-overview.db` on a new home, `<home>/mk.db` on an existing one (`mkpaths.root_db`) — the overview numbers and linkage (the `projects` row per project and one `plan_summary` row per plan, C3), the agent catalog tables and the user's `todos`. No task row, no event |
 | Project store | `<home>/projects/<slug>/mk-project.db` on a new home, `.../mk.db` on an existing one (`mkpaths.project_db`) — the project DB, the only per-project DB and the ONE source of truth (C4). A migrated project's root `projects.db_path` names this file; `mkpaths.project_db(slug)` resolves it (the bus follows every switch through it) |
 | Project folder | `<home>/projects/<slug>/` — holds the project DB (`mk-project.db`, or `mk.db` on an existing home), `project.yaml` (today's `matrixkoder.yaml`), `legacy/` and `plans/` (the C2 tree below). `watch-cursors.json` is no longer written: the bus watch cursors are `watch_cursors` rows in the project DB, and the file is read once as an import source |
-| Plan folder | `<home>/projects/<slug>/plans/<plan-id>/` — `plan.md`, `assets/`, `archive/` (`plan-v1.md`, `plan-v2.md` …) and `runs/` |
+| Plan folder | `<home>/projects/<slug>/plans/<plan-id>/` — `plan.md`, `assets/`, `archive/` (`<plan-id>-v1.md`, `<plan-id>-v2.md` …) and `runs/` |
 | Run folder | `plans/<plan-id>/runs/<run-id>/` — `bus.jsonl` (C6) and one folder per task |
 | Task round files | `plans/<plan-id>/runs/<run-id>/<task-id>/`: `brief-rN.md`, `report-rN.md`, `review-rN.md` (paths returned by `task round`; written by the orchestrator / agents, not by mk-state; `task round --undo` refuses while any of them exists for the latest round) |
 | Lane registry | With a project DB: the `lane_slots` rows of the project DB, written **only** by `mk-lane.py`; `lanes.json` is neither read nor written. File mode (no project DB) only: `<data>/lanes.json`, written only by `mk-lane.py` (see below). `mk-lane.py carry-legacy` carries a pre-switch registry into the rows once. `mk-state.py` never touches either |
@@ -571,23 +571,64 @@ files stay.
 
 The task rows come from the importer `approve_file` (`scripts/mk-plan.py`): its `flat_items`
 yields `(id, type, parent, title, acceptance, owned, deps, parallel, route)` per phase, task and
-subtask, parent first, and each becomes one `tasks` row of the run.
+subtask, parent first, and each becomes one `tasks` row of the run (and, for a new version, one
+`plan_items` row, below).
+
+### Versioned plan items (`plan_items`, `plan_versions`; STORE.1, contract C4)
+
+Two tables, created in place when missing by the commands that write plans (`import`, `approve`;
+`mkdb.ensure_plan_items`, idempotent `CREATE TABLE IF NOT EXISTS`). The schema version is
+unchanged: an older store still opens for a read, and nothing existing is copied, converted or
+rewritten. A store with no `plan_items` table reads exactly as before (`plans <id>` falls back to
+`header_json`).
+
+`plan_items(plan, version, id, parent, type, title, acceptance, owned, deps, parallel, route_json,
+extra_json, ord)`, primary key `(plan, version, id)`. One row per phase, task and subtask of one
+plan version, in `ord` order (parent first). `type` is `phase|task|subtask`; `owned` and `deps` are
+comma-separated; `acceptance` is the flat text (acceptance lines joined by a newline); `route_json`
+is `{agent, effort, model}` or NULL; `extra_json` holds every other key of the item (`wave`,
+`description`, `gate`, `manual`, `critical`, `risk`, `refs`, …), so the rows alone rebuild the plan.
+
+`plan_versions(plan, version, sha, created, approved_at)`, primary key `(plan, version)`: the
+approved mark is per version (`approved_at` NULL = not approved) and `sha` is the sha256 of the file
+the version was imported or approved from. This companion table is what makes "this version is
+approved" and "this file is that import" answerable; a version with no phases would still have a row.
+
+- `import` writes a new version (`plans.version` + 1) with its rows and a `plan_versions` row.
+  The same bytes again (same sha) write nothing. A changed file is a new version and the reply
+  carries `items` and `changes: {added, changed, removed}` (item ids versus the previous version; a
+  plan stored before versioned items is compared with the phases kept in `header_json`).
+- `import` records the path it was given as `header_json.source`. A reference only: nothing
+  re-reads the file through it.
+- `approve` marks a version approved and never deletes or rewrites an older version's rows. When the
+  file is the version a prior import wrote (same sha), that version is approved as it is (edited rows
+  included); otherwise approve writes a new version with its rows. The archive copy is
+  `<id>-v<version>.md`.
+- `item set <plan> <id> [--title] [--description] [--acceptance] [--owned] [--deps]` edits one row
+  of a **draft** plan's current version in the store (the file is not read or written); see
+  *Plan commands*.
+- Reader: `mkdb.plan_items(con, plan, version=None)` returns a version's items in `ord` order
+  (`[]` when there are none) and `mkdb.py plans <id> --json` builds `phases` from them instead of
+  `header_json` when rows exist, adding each item's `acceptance` and `owned`.
+- `delete` removes the plan's `plan_items` and `plan_versions` rows with the plan.
 
 Lifecycle (C13): `import` loads the file into the store without approving it; `approve` checks
-the file, versions it, writes the tasks and copies it to
-`<home>/projects/<slug>/plans/<id>/archive/<id>-v<n>.md`, leaving the original as the plan's
-`plan.md`; `run init --plan` starts the run. After import the run
-and this DB are the source — status, tasks, rounds and verdicts change there, and MK does not
-edit the plan file. When the plan is done the file moves into the plan folder's `archive/`.
+the file, marks a version approved, writes the tasks and copies the file to
+`<home>/projects/<slug>/plans/<id>/archive/<id>-v<n>.md`; `run init --plan` starts the run. The plan
+file is a source only until import: after import status, runs, tasks, rounds and verdicts live in
+this DB, and `set`, `add-run` and `approve` do not rewrite the file when the store holds the plan
+(a file plan with no store row is still rewritten by `set` and `add-run` as before). `parse` and
+`check` answer with the store's `status` and `runs` once the plan is stored, so `run init --plan`
+keeps working. When the plan is done the file moves into the plan folder's `archive/`.
 
 `mk-plan.py check` reports a missing `status`, a missing `created` and a body with no H1 line as
 **warnings**, never errors, so an older plan still checks `ok: true`.
 
 ## Plan commands (`mk-plan.py`)
 
-`import`, `approve`, `delete` and pause/resume, as `scripts/mk-plan.py` `build_parser` ships them
-(C4, C10, C13). Every command prints one JSON line. `--data` and `--home` are optional on
-`import`, `approve`, `delete` and `set`.
+`import`, `approve`, `delete`, `item set` and pause/resume, as `scripts/mk-plan.py` `build_parser`
+ships them (C4, C10, C13). Every command prints one JSON line. `--data` and `--home` are optional on
+`import`, `approve`, `delete`, `set`, `add-run`, `item set`, `parse` and `check`.
 
 Data-dir resolution (`resolve_data_arg`), the same order as `mk-state` and copied rather than
 imported: `--data`, then `$MATRIXKODER_DATA`, then the data dir this repo registered (the root
@@ -600,28 +641,41 @@ data dir.
 
 `import <file> [--dry-run] [--data DIR] [--home DIR]` loads one plan and does not approve it. It
 writes one `plans` row (status, created, design, integration, the H1 title, `header_json`,
-`body_md`) and no task rows, and it never edits the file. A file whose first line is not `+++`,
+`body_md`) and one `plan_items` row per phase, task and subtask for the new version, and no task
+rows, and it never edits the file. A file whose first line is not `+++`,
 or whose header does not parse, is refused (`ok: false`, `reason` set, exit 0). A header with no
 `plan` id is refused the same way. The same bytes imported again upsert the same row and change
-nothing (`noop: true`); version is left as stored, or `0` when the row is new. `--dry-run`
-returns the same reply and writes nothing. Import needs a store; without the project DB it errors.
+nothing (`noop: true`, version unchanged); a changed file is the next version (`1` when the plan is
+new) and the reply lists `changes` (added, changed and removed item ids). `--dry-run` returns the
+same reply and writes nothing. Import needs a store; without the project DB it errors.
 
 `approve <path> [--data DIR] [--home DIR] [--run ID]` checks the file, writes the plan version and
 its tasks, and copies the approved bytes to `plans/<id>/archive/<id>-v<n>.md` in the project
 folder. The original
-stays in place (refreshed to those approved bytes, so `run init --plan <original path>` still
-resolves). The reply names the run id as `tasks_run` (the `--run` value, else the plan's first
-`runs` entry, else the plan id) — no run row exists until `run init`. Approving the same approved
-bytes again is a no-op.
+stays in place and is **not rewritten** (STORE.2; the store row and the archive say approved, and
+`parse`/`check` answer with the store's status, so `run init --plan <original path>` still
+resolves). The reply names the run id as `tasks_run` (the `--run` value, else the stored run list's
+first entry, else the file's first `runs` entry, else the plan id) — no run row exists until `run
+init`. Approving the same approved bytes again is a no-op. It warns `N unticked open questions` and
+still approves.
 
 `delete <id> [--data DIR] [--home DIR]` is refused while any `runs` row has `plan=<id>` and
 `status='active'` (exit 2, the live run ids named). Otherwise it removes the `plans` row and
 moves the plan's `plan.md` into the plan folder's `archive/` (a timestamp suffix when that name is
 already taken). The file is never unlinked. Tasks of finished runs stay.
 
-Pause and resume are `set <path> --status parked` and `set` back to the previous status. The file
-is rewritten as before, and when the store has a `plans.status` column and a row for this plan,
-that column follows.
+Pause and resume are `set <path> --status parked` and `set` back to the previous status. When the
+store holds the plan, `plans.status` changes and the file is not touched (STORE.2); `add-run
+<path> --run ID` appends to the stored run list (`header_json.runs`) the same way. A file plan the
+store does not hold keeps today's behaviour: the status or runs line of the file is rewritten.
+
+`item set <plan> <id> [--title T] [--description D] [--acceptance A] [--owned a,b] [--deps x,y]`
+(STORE.3) changes one `plan_items` row of the plan's current version and prints
+`{ok, plan, id, version, changed}` (`changed` maps each field whose value changed to its new value).
+The plan file is not read or written; the plan row and every other row stay as they were. It
+refuses, with exit 2 and nothing written: a plan that is not a draft, an unknown plan, a plan with
+no stored items, an unknown id, a dep that is not an item of the same version, a self-dep and a dep
+cycle. `--description` is stored in `extra_json` (empty clears it).
 
 ### Notes
 
