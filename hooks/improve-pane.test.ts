@@ -5,7 +5,7 @@ import { test, expect } from 'claude-code/testing'
 import type { Engine, Mounted } from 'claude-code/testing'
 import { DATA_DIR, mockFs, mockWorld, paneProps, sessionStart, worldFiles, worldFixtures } from './testkit'
 import detailFixture from './tabs/fixtures/plan-detail'
-import { DRAFT_EMPTY, DRAFT_SEND_FAILED, IMPROVE_FAILED, IMPROVE_PASTE, IMPROVE_FILL_FAILED, wordCount } from './improve-core'
+import { DRAFT_EMPTY, DRAFT_SEND_FAILED, IMPROVE_FAILED, IMPROVE_PASTE, IMPROVE_FILL_FAILED, IMPROVE_QUESTIONS_FAILED, PLAN_PROMPT_CHIP, WIZARD_ANSWERS_UNUSED, wordCount } from './improve-core'
 
 const PLAN_HOME = '/tmp/mk-improve-plan'
 const SEED_TASK = 'Sent from the MK dashboard (button press)\nStart task S1.1 of plan settings-plans-db (phase S1): "Scope-home map".\n1. Done means (acceptance S1.1.a1 onwards): C6 holds. The drift test passes. No storage moves: every reader keeps reading where it reads today.\n2. Depends on: phase S1 needs V1 merged.\n3. Files this task owns: scripts/mk-config.py, scripts/settings-drift.py, hooks/tabs/settings.schema.ts.\n4. Run this one task, not the rest of S1.'
@@ -416,6 +416,135 @@ test('Run Wizard: when no question would help the rewrite stands, nothing is los
   expect(w.log.calls).toBe(2)
 })
 
+test('R-3: a questions answer that cannot be read lands on the error card with Try again', { plugins: [worldFixtures] }, async ($, on) => {
+  const w = world(on, { answer: (_n, isQuestions) => (isQuestions ? 'not json at all' : REWRITE) })
+  await $.session.start(sessionStart())
+  const ui = await mount($)
+  await improve(ui, w)
+  await ui.press({ key: 'improve-f-wizard' })
+  await w.settle()
+  expect(w.log.calls).toBe(2)
+  expect(await has(ui, { type: 'Button', key: 'improve-f-retry' }), 'the card offers Try again').toBe(true)
+  expect(await says(ui, 'No question would help'), 'an unreadable answer is not "no question would help"').toBe(false)
+  expect(await says(ui, IMPROVE_QUESTIONS_FAILED), 'the calm line names the questions call').toBe(true)
+  expect(boxValue(w), 'the prompt line is untouched').toBe(ROUGH)
+  expect(w.log.submitted, 'nothing is sent').toEqual([])
+})
+
+test('R-4: the wizard asks about the edited proposal, and rewrites that', { plugins: [worldFixtures] }, async ($, on) => {
+  const w = world(on, { answer: (n, isQuestions) => (isQuestions ? QUESTIONS : n === 0 ? REWRITE : WIZARD_REWRITE) })
+  await $.session.start(sessionStart())
+  const ui = await mount($, 80)
+  await improve(ui, w)
+  await ui.press({ key: 'dash-tab-improve' })
+  await ui.press({ key: 'improve-t-edit' })
+  await ui.input({ key: 'improve-edit', text: 'my own edit', kind: 'change' })
+  await ui.press({ key: 'improve-t-wizard' })
+  await w.settle()
+  expect(w.log.calls).toBe(2)
+  expect(w.log.prompts[1], 'the questions are about the edit').toContain('my own edit')
+  expect(w.log.prompts[1], 'not about the prompt that was typed').not.toContain(ROUGH)
+  await ui.press({ key: 'improve-t-q0o1' }) // My team
+  await ui.press({ key: 'improve-t-upgrade' })
+  await w.settle()
+  expect(w.log.calls).toBe(3)
+  expect(w.log.prompts[2], 'the rewrite works on the edit').toContain('my own edit')
+  expect(w.log.prompts[2], 'not on the prompt that was typed').not.toContain(ROUGH)
+})
+
+test('R-5: a failed wizard rewrite says the answers were not used; the earlier rewrite stays on show', { plugins: [worldFixtures] }, async ($, on) => {
+  const w = world(on, { answer: (n, isQuestions) => (isQuestions ? QUESTIONS : n === 0 ? REWRITE : 'not json at all') })
+  await $.session.start(sessionStart())
+  const ui = await mount($)
+  await improve(ui, w)
+  await ui.press({ key: 'improve-f-wizard' })
+  await w.settle()
+  await ui.press({ key: 'improve-f-q0o1' }) // My team
+  await ui.press({ key: 'improve-f-upgrade' })
+  await w.settle()
+  expect(w.log.calls).toBe(3)
+  expect(await says(ui, WIZARD_ANSWERS_UNUSED), 'the card says the answers were not used').toBe(true)
+  expect(await has(ui, { text: /Run tsc --noEmit and list every file/ }), 'the earlier rewrite is still on show').toBe(true)
+  expect(await has(ui, { type: 'Button', key: 'improve-f-accept' }), 'Accept is offered, with the note').toBe(true)
+  expect(boxValue(w), 'the prompt line is untouched').toBe(ROUGH)
+})
+
+test('R-22: a Discard stops the pending work: the timer never starts a call, and a call already sent lands nowhere', { plugins: [worldFixtures] }, async ($, on) => {
+  // the improve atom's reads: the pending timer reads it once, when it fires
+  let reads = 0
+  on('state.get', (_$, e, next) => { if (e.key === 'improve') reads += 1; return next(e) })
+  let release: (text: string) => void = () => undefined
+  const first = new Promise<string>(res => { release = res })
+  const w = world(on, { answer: n => (n === 0 ? first : REWRITE) })
+  await $.session.start(sessionStart())
+  const ui = await mount($)
+  // a Discard before the timer fires: the model is never asked, and the timer never runs
+  type(w, ROUGH)
+  await pick(ui, 'improve')
+  await ui.press({ key: 'improve-f-discard' })
+  await w.clock.advance(0) // the redraw settles; the timer is due in a millisecond, not now
+  const before = reads
+  await w.clock.advance(5)
+  expect(reads, 'the pending timer never ran').toBe(before)
+  expect(w.log.calls, 'the model was never asked').toBe(0)
+  expect(await has(ui, { text: '✦ IMPROVED PROMPT' }), 'the card is gone').toBe(false)
+  // a Discard while the call is out: the answer lands nowhere
+  type(w, ROUGH)
+  await pick(ui, 'improve')
+  await w.settle()
+  expect(w.log.calls).toBe(1)
+  await ui.press({ key: 'improve-f-discard' })
+  release(REWRITE)
+  await w.settle()
+  expect(await has(ui, { text: '✦ IMPROVED PROMPT' }), 'the late answer landed nowhere').toBe(false)
+  expect(boxValue(w), 'the prompt line is untouched').toBe(ROUGH)
+  expect(w.log.submitted, 'nothing is sent').toEqual([])
+  expect((w.stored.get('improveHistory') ?? []) as { original: string }[], 'nothing was saved').toEqual([])
+})
+
+test('R-23: a Plan prompt that arrives while a proposal is on show waits in the note; the proposal stays', { timeoutMs: 20000, plugins: [worldFixtures] }, async ($, on) => {
+  const w = world(on, { plan: true, answer: () => REWRITE })
+  await $.session.start(sessionStart())
+  const ui = await mount($, 80)
+  await improve(ui, w) // the person's own proposal is on show
+  expect(w.log.calls).toBe(1)
+  await openPlan(ui, w)
+  await ui.press({ key: 'plan-task-play-S1.1' })
+  await w.settle()
+  expect(w.log.calls, 'the Plan prompt waits; it does not rewrite over the proposal').toBe(1)
+  expect(await has(ui, { text: /Run tsc --noEmit and list every file/ }), 'the proposal is still on show').toBe(true)
+  expect(await says(ui, 'A Plan prompt is waiting'), 'the waiting Plan prompt is named').toBe(true)
+  const chip = await ui.find({ type: 'Button', text: PLAN_PROMPT_CHIP })
+  expect(chip, 'the chip that opens it').toBeDefined()
+  await ui.press({ key: String(chip?.props.key) })
+  await w.settle()
+  expect(w.log.calls, 'the chip opens it: the Plan prompt is rewritten').toBe(2)
+  expect(w.log.prompts[1]).toContain('Start task S1.1 of plan settings-plans-db')
+})
+
+test('the prompt line is never written while the wizard asks, writes and reviews; only Accept writes it', { plugins: [worldFixtures] }, async ($, on) => {
+  const w = world(on, { answer: (n, isQuestions) => (isQuestions ? QUESTIONS : n === 0 ? REWRITE : WIZARD_REWRITE) })
+  await $.session.start(sessionStart())
+  const ui = await mount($)
+  await improve(ui, w)
+  expect(boxValue(w)).toBe(ROUGH)
+  expect(w.fills, 'the line was not filled').toEqual([])
+  await ui.press({ key: 'improve-f-wizard' })
+  await w.settle() // the questions call
+  expect(boxValue(w), 'asking writes nothing').toBe(ROUGH)
+  expect(w.fills).toEqual([])
+  await ui.press({ key: 'improve-f-q0o1' })
+  await ui.press({ key: 'improve-f-upgrade' })
+  expect(await says(ui, 'Writing the new prompt'), 'the rewrite is on its way').toBe(true)
+  await w.settle() // the rewrite call
+  expect(boxValue(w), 'writing writes nothing').toBe(ROUGH)
+  expect(w.fills, 'the line was never filled').toEqual([])
+  expect(w.log.submitted, 'nothing is sent').toEqual([])
+  expect(await has(ui, { text: '✦ IMPROVED PROMPT' }), 'the proposal is on show').toBe(true)
+  await ui.press({ key: 'improve-f-accept' })
+  expect(boxValue(w), 'Accept writes the line').toBe('Run tsc --noEmit for my team and list every file. [the folder]')
+})
+
 test('a failing model call shows one calm line and Try again; the box is untouched and nothing is sent', { plugins: [worldFixtures] }, async ($, on) => {
   const answers: Answer[] = [null, 'throw', 'not json at all', REWRITE]
   const w = world(on, { answer: n => (n < answers.length ? answers[n] as Answer : REWRITE) })
@@ -449,7 +578,7 @@ test('a failing question call shows the calm line; Try again asks again', { plug
   await improve(ui, w)
   await ui.press({ key: 'improve-f-wizard' })
   await w.settle()
-  expect(await says(ui, IMPROVE_FAILED)).toBe(true)
+  expect(await says(ui, IMPROVE_QUESTIONS_FAILED), 'the line names the call that failed').toBe(true)
   await ui.press({ key: 'improve-f-retry' })
   await w.settle()
   expect(await has(ui, { text: '✦ WIZARD' })).toBe(true)
@@ -714,7 +843,7 @@ test('review 6: Run Wizard keeps an edit in progress as the proposal, even when 
   await ui.input({ key: 'improve-edit', text: 'my own edit', kind: 'change' })
   await ui.press({ key: 'improve-t-wizard' })
   await w.settle()
-  expect(await has(ui, { text: IMPROVE_FAILED }), 'the question call failed').toBe(true)
+  expect(await has(ui, { text: IMPROVE_QUESTIONS_FAILED }), 'the question call failed').toBe(true)
   await ui.press({ key: 'improve-t-accept' })
   expect(boxValue(w), 'the edit, not the older rewrite, is what Accept takes').toBe('my own edit')
 })
@@ -834,7 +963,7 @@ test('F8: a failed wizard call keeps the shown rewrite visible with the calm lin
   await improve(ui, w)
   await ui.press({ key: 'improve-f-wizard' })
   await w.settle()
-  expect(await says(ui, IMPROVE_FAILED)).toBe(true)
+  expect(await says(ui, IMPROVE_QUESTIONS_FAILED)).toBe(true)
   expect(await has(ui, { text: /Run tsc --noEmit and list every file/ }), 'the earlier rewrite is still on show').toBe(true)
   expect(await has(ui, { type: 'Button', key: 'improve-f-retry' })).toBe(true)
   expect(await has(ui, { type: 'Button', key: 'improve-f-accept' })).toBe(true)
