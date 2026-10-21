@@ -7,12 +7,16 @@ created through mkdb.open_project on first use; `store enable` / `export-legacy`
 no-op commands for callers. `render` prints the board text from the DB (stdout), never board.md.
 Legacy projects whose runs live only in files migrate through mk-store-import.py.
 
-  run init --id ID --feature F --branch B [--plan PATH --force]
-      --plan: the plan file drives the run — the plan tool (mk-plan.py, or $MK_PLAN_CMD) `check`
-      must pass and its status be `approved`; --force overrides an unapproved status (with an event).
-      The plan gets `set --status running` + `add-run`, then phase tasks (plan_phase, route,
-      lane_group, reviewer) and child tasks (plan_task, --parent) are created through the task-add path.
-      plan_sha comes from a final `parse` AFTER those mutations, so the board ⚠ does not fire at once
+  run init --id ID --feature F --branch B [--plan PLAN_ID [--version N] --force]
+      --plan: a plan ID of the project store (RUN): import and approve the plan file first
+      (mk-plan.py import / approve). The run copies its phases, tasks, gates and final gates from
+      the `plan_items` rows of that version (default: the latest approved) and records the version
+      in runs.plan_version; it keeps no plan file path and no sha, and never reads the file again.
+      A path is refused with a hint to import it; a plan that is not approved is refused unless
+      --force (with an event); a plan approved before versioned items is refused ("import this plan
+      again first"). The plan gets `set --status running` + `add-run` by id, then phase tasks
+      (plan_phase, route, lane_group, reviewer) and child tasks (plan_task, --parent) are created
+      through the task-add path. A run that already holds a plan file path keeps reading the file.
   plan sync [--run ID] [--apply] — diff the run's plan against its tasks; the dry run changes
       nothing: new phase/task → added (the add path), changed title/wave/owned/deps on a
       planned|routed task → updated, on a started task → warning only, removed → warning (never
@@ -198,7 +202,8 @@ TASK_FILE_KEYS = ("wave", "ready", "workspace", "last_commit", "gates", "rounds"
 # `plan` (the file path) and `plan_id` ride here, not the runs.plan column: that column holds
 # the plan id for a plan-tool run and the bare path for a legacy one, so it cannot carry both. `task_order` is the task-add order (the rows store parent-before-child, which is not that order).
 RUN_FILE_KEYS = ("feature", "waiting", "recent", "plan_sha", "plan_status", "updated",
-                 "plan_id", "plan", "fidelity", "final_gates")  # F.2: set only for a plan with the contract
+                 "plan_id", "plan", "fidelity", "final_gates",  # F.2: set only for a plan with the contract
+                 "plan_gates")  # RUN: the plan's [gates] copied from the stored version at run init
 
 
 def _load_sibling(name):
@@ -614,11 +619,26 @@ class Store:
                 out.append(json.loads(self.event_line(row)))
         return out[-n:]
 
+    def stored_plan_status(self, plan_id):
+        """plans.status of a stored plan, or None (no store, no row, unreadable)."""
+        try:
+            con = self.store_open()
+            try:
+                row = con.execute("SELECT status FROM plans WHERE id=?", (plan_id,)).fetchone()
+            finally:
+                con.close()
+        except Exception:
+            return None
+        return row["status"] if row else None
+
     def render(self, run):
         w = run.get("waiting")
         out = [f"# {run['id']} — {run['feature']}", "",
                f"branch `{run['branch']}` · stage {run['stage']} · {run['status']} · updated {run['updated']}"]
-        if run.get("plan_id"):  # plan-linked run: id · status · sha (+ ⚠ when the file changed)
+        if run.get("plan_id") and run.get("plan_version"):  # RUN: status comes from the store
+            out.append(f"plan: `{run['plan_id']}` · {self.stored_plan_status(run['plan_id']) or '—'}"
+                       f" · version {run['plan_version']}")
+        elif run.get("plan_id"):  # plan-linked run: id · status · sha (+ ⚠ when the file changed)
             sha = run.get("plan_sha")
             out.append(f"plan: `{run['plan_id']}` · {run.get('plan_status') or '—'}"
                        + (f" · sha `{sha[:12]}`" if sha else ""))
@@ -906,7 +926,8 @@ class Store:
     def run_row(self, run):
         # runs.plan is the plan id (C5); the file path stays in runs.extra_json. Writing the path
         # here left a run started from plans/archive/<id>-v<n>.md unlinked from its plan.
-        return {"id": run["id"], "plan": run.get("plan_id") or run.get("plan"), "plan_version": None,
+        return {"id": run["id"], "plan": run.get("plan_id") or run.get("plan"),
+                "plan_version": run.get("plan_version"),
                 "branch": run.get("branch"), "status": run.get("status"),
                 "stage": str(run.get("stage")) if run.get("stage") is not None else None,
                 "next": run.get("next"), "started": run.get("started"), "ended": run.get("ended"),
@@ -1163,6 +1184,9 @@ class Store:
                     "next": row["next"], "started": row["started"], "ended": row["ended"]})
         if "plan" not in run_x:
             run["plan"] = row["plan"]  # legacy/hand-written row: the column is the only path we have
+        if row["plan_version"]:  # RUN: started from a stored plan version: no plan file, no sha
+            run["plan_version"], run["plan"] = int(row["plan_version"]), None
+            run.pop("plan_sha", None)
         if "plan_id" not in run_x and row["plan"]:
             # an extra_json-less row: runs.plan is the plan id only when it is not a file path
             run["plan_id"] = None if ("/" in row["plan"] or row["plan"].endswith(".md")) else row["plan"]
@@ -1265,6 +1289,8 @@ class Store:
 
     def plan_file(self, run):
         """The run's plan path, or plans.archived_path of the latest approved version when missing."""
+        if run.get("plan_version"):  # RUN: a stored-version run has no plan file at all
+            return None
         path = run.get("plan")
         if path and os.path.exists(path):
             return path
@@ -1432,6 +1458,123 @@ def plan_tool(*args):
                f"{detail or (r.stdout + r.stderr).strip()[:200] or f'exit {r.returncode}'}")
 
 
+# ---------- a run starts from a stored plan version (RUN) ----------
+
+LEGACY_INIT_ENV = "MK_LEGACY_RUN_INIT"  # self-test seam only: builds an old-shape run from a plan FILE
+
+
+def plan_arg_is_path(arg):
+    """A `--plan` value that names a file, not a plan id: it holds a `/`, ends `.md` or exists."""
+    arg = str(arg)
+    return "/" in arg or arg.endswith(".md") or os.path.exists(arg)
+
+
+def route_text(route, raw=None):
+    """A stored item's route as the plan tool's parse gives it: "" or "<agent> <model> [<effort>]"."""
+    if isinstance(route, dict) and (route.get("agent") or route.get("model")):
+        return " ".join(str(route[k]) for k in ("agent", "model", "effort") if route.get(k))
+    return raw if isinstance(raw, (str, dict)) and raw else ""
+
+
+def plan_dict_from_items(plan_id, row, header, items, gates=None, final_gates=None):
+    """The shape of the plan tool's `parse` reply, built from `plan_items` rows (C4) and the plan's
+    row: nested phases -> tasks -> subtasks with every key the readers use (acceptance_lines,
+    gate, manual, critical, risk, refs, description, ...). Nothing here opens a plan file."""
+    phases, nodes = [], {}
+    for it in items:
+        node = dict(it["extra"])
+        node.update({"id": it["id"], "title": it["title"], "deps": list(it["deps"]),
+                     "owned": list(it["owned"]), "parallel": bool(it["parallel"]),
+                     "route": route_text(it["route"], it["extra"].get("route"))})
+        if it["type"] == "phase":
+            node.setdefault("wave", 1)
+            node["tasks"] = []
+            phases.append(node)
+        else:
+            text = it["acceptance"] or ""
+            node["acceptance"] = text
+            node["acceptance_lines"] = ([{"id": f"{it['id']}.a{n}", "text": t}
+                                         for n, t in enumerate(text.split("\n"), 1)] if text else [])
+            for k, dflt in (("gate", []), ("manual", ""), ("critical", False), ("risk", 1), ("refs", [])):
+                node.setdefault(k, dflt)
+            if it["type"] == "task":
+                node["subtasks"] = []
+                (nodes.get(it["parent"]) or {}).get("tasks", []).append(node)
+            else:
+                (nodes.get(it["parent"]) or {}).get("subtasks", []).append(node)
+        nodes[it["id"]] = node
+    out = {"ok": True, "plan": plan_id, "status": row["status"] or header.get("status"),
+           "runs": [str(r) for r in header.get("runs") or []], "sha": None,
+           "gates": header.get("gates") if gates is None else gates,
+           "final_gates": header.get("final_gates") or [] if final_gates is None else final_gates,
+           "phases": phases}
+    if isinstance(header.get("description"), str) and header["description"].strip():
+        out["description"] = header["description"]
+    return out
+
+
+def stored_plan(st, plan_id, version=None, force=False, run=None):
+    """-> (cur, version): the plan of one stored version, shaped like the plan tool's `parse`.
+    run=None is `run init --plan <id>`: unknown plan, a plan that is not approved (unless force)
+    and a plan with no stored items (approved before versioned items: import it again) are refused,
+    and the default version is the latest approved one. run=<run> re-reads the run's own version
+    (close, sync, backfill): a missing plan or version is a named Fail, never a silent skip, and
+    the plan's [gates] are the ones the run copied at init."""
+    if not st.store_on:
+        raise Fail("plans are read from the project store, and it is off")
+    db = st.db()
+    con = st.store_open()
+    try:
+        row = con.execute("SELECT id, version, status, header_json FROM plans WHERE id=?",
+                          (plan_id,)).fetchone()
+        if not row:
+            raise Fail(f"plan {plan_id!r} is not in the store"
+                       + (f" (run {run['id']} started from its version {version})" if run else
+                          "; import the file first (mk-plan.py import <path>)"))
+        header = db._hdr_of(row)
+        if run is None:
+            if (row["status"] or header.get("status")) != "approved" and not force:
+                raise Fail(f"plan {plan_id} is {row['status'] or header.get('status')!r}, not approved; "
+                           "approve it (mk-plan.py set --status approved) or pass --force")
+            approved = None
+            if db._has_table(con, "plan_versions"):
+                approved = con.execute("SELECT MAX(version) AS v FROM plan_versions WHERE plan=? "
+                                       "AND approved_at IS NOT NULL", (plan_id,)).fetchone()["v"]
+            if version is None:
+                version = approved or (row["version"] if force else None)
+            elif not force and not (db.plan_version_row(con, plan_id, version) or {}).get("approved_at"):
+                raise Fail(f"plan {plan_id} version {version} is not approved; approve it or pass --force")
+        items = db.plan_items(con, plan_id, version) if version else []
+        if not items:
+            raise Fail(f"plan {plan_id} has no stored items"
+                       + (f" for version {version}" if version else "")
+                       + (" (run " + run["id"] + " started from it)" if run else
+                          ": import this plan again first (mk-plan.py import <path>)"))
+        gates = final_gates = None
+        if run is not None and "plan_gates" in run:  # the gates the run copied at init
+            gates, final_gates = run.get("plan_gates") or {}, run.get("final_gates") or []
+        elif version != row["version"]:  # the header is stored for the current version only
+            raise Fail(f"plan {plan_id} version {version} is not its current version ({row['version']}): "
+                       "its gates are stored for the current version only; approve that one")
+        return plan_dict_from_items(plan_id, row, header, items, gates, final_gates), version
+    finally:
+        con.close()
+
+
+def plan_view(st, run):
+    """The run's plan as the plan tool's `parse` reply. A run started from a stored version reads
+    the store and never a plan file; an older run (a plan file path, no version) keeps parsing the
+    file through the plan tool."""
+    if run.get("plan_version"):
+        return stored_plan(st, run["plan_id"], run["plan_version"], run=run)[0]
+    return plan_tool("parse", st.plan_file(run))
+
+
+def plan_linked(run):
+    """True when the run has a plan to read: a stored version, or an old-shape plan file path."""
+    return bool(run.get("plan_version") or run.get("plan"))
+
+
 def file_sha(path):
     """sha256 of a file's bytes, None when unreadable — the board render must never crash on it."""
     try:
@@ -1500,7 +1643,15 @@ def cmd_run(a, st):
         if not (a.feature and a.branch):
             raise Fail("run init needs --id --feature --branch")
         gate = None  # C5: check + the approved gate run BEFORE the lock, before any local write
-        if a.plan:
+        stored, version = None, None  # RUN: the plan's stored version the run copies its items from
+        legacy = bool(a.plan) and plan_arg_is_path(a.plan)
+        if legacy and os.environ.get(LEGACY_INIT_ENV) != "1":
+            raise Fail(f"--plan takes a plan id, not a file ({a.plan!r}): import the file first "
+                       f"(mk-plan.py import <path>), then run init --plan <plan id>")
+        if a.plan and not legacy:
+            stored, version = stored_plan(st, a.plan, getattr(a, "version", None), a.force)
+            plan_preflight(st, stored, rid)
+        elif a.plan:  # self-test seam: an old-shape run that holds its plan file path
             gate = plan_tool("check", a.plan)
             if gate.get("status") != "approved" and not a.force:
                 raise Fail(f"plan {gate.get('plan') or a.plan} is {gate.get('status')!r}, not approved; "
@@ -1516,27 +1667,40 @@ def cmd_run(a, st):
             if exists:
                 raise Fail(f"run {rid} exists")
             cur = None
-            if a.plan:  # the plan learns the run before the run learns its tasks (C5)
+            was = (gate or stored or {}).get("status")  # the plan's status before this run touches it
+            if stored is not None:  # RUN: the plan learns the run through the store, by id (C5)
+                scope = ["--data", st.data, "--home", st.home_dir()]
+                plan_tool("set", a.plan, "--status", "running", *scope)
+                plan_tool("add-run", a.plan, "--run", rid, *scope)
+                cur = stored
+            elif a.plan:  # the plan learns the run before the run learns its tasks (C5)
                 plan_tool("set", a.plan, "--status", "running")
                 plan_tool("add-run", a.plan, "--run", rid)
                 cur = plan_tool("parse", a.plan)  # sha AFTER set/add-run: no board ⚠ at birth
             os.makedirs(mkpaths.tasks_dir(st.data, rid), exist_ok=True)
-            run = {"schema": SCHEMA, "id": rid, "feature": a.feature, "branch": a.branch, "plan": a.plan,
-                   "plan_id": cur.get("plan") if cur else None, "plan_sha": cur.get("sha") if cur else None,
-                   "plan_status": cur.get("status") if cur else None,
-                   "status": "active", "stage": 0, "next": None, "waiting": None,
-                   "started": now(), "ended": None, "updated": None, "tasks": [], "recent": []}
+            if stored is not None:  # a new run keeps no plan file path and no sha: the version is the link
+                run = {"schema": SCHEMA, "id": rid, "feature": a.feature, "branch": a.branch,
+                       "plan_id": cur.get("plan"), "plan_version": version, "plan_status": "running",
+                       "plan_gates": cur.get("gates") or {},
+                       "status": "active", "stage": 0, "next": None, "waiting": None,
+                       "started": now(), "ended": None, "updated": None, "tasks": [], "recent": []}
+            else:
+                run = {"schema": SCHEMA, "id": rid, "feature": a.feature, "branch": a.branch, "plan": a.plan,
+                       "plan_id": cur.get("plan") if cur else None, "plan_sha": cur.get("sha") if cur else None,
+                       "plan_status": cur.get("status") if cur else None,
+                       "status": "active", "stage": 0, "next": None, "waiting": None,
+                       "started": now(), "ended": None, "updated": None, "tasks": [], "recent": []}
             fid = plan_fidelity(cur) if cur else False
             if fid:  # F.2: the run carries the plan's gate contract; a pre-F plan sets nothing
                 run["fidelity"], run["final_gates"] = True, list(cur.get("final_gates") or [])
             st.event(run, "note", f"run init: {a.feature} on {a.branch}")
-            if cur and gate.get("status") != "approved":
-                st.event(run, "note", f"plan {run['plan_id']} was {gate.get('status')!r}, not approved; "
+            if cur and was != "approved":
+                st.event(run, "note", f"plan {run['plan_id']} was {was!r}, not approved; "
                                       "run init forced with --force")
                 st.event(run, "decision", f"forced by {a.by}: run init --plan {a.plan} "
-                                          f"(plan status {gate.get('status')})", by=a.by)
+                                          f"(plan status {was})", by=a.by)
             st.save(run)
-            warnings = list(gate.get("warnings") or []) if gate else []
+            warnings = list(gate.get("warnings") or []) if gate else []  # a stored plan was checked at approve
             for ph in (cur.get("phases") or []) if cur else []:
                 pid = str(ph.get("id") or "")
                 _, w = add_task(st, run, pid, ph.get("title") or pid, ph.get("wave"),
@@ -1562,7 +1726,7 @@ def cmd_run(a, st):
         with st.locked():
             st.repair()
             run = st.load(a.run)
-            if not (run.get("plan_id") and run.get("plan")):
+            if not (run.get("plan_id") and plan_linked(run)):
                 raise Fail(f"run {run['id']} has no plan link (run init --plan)")
             return backfill_fields(st, run, a.by)
     a.run = a.run or getattr(a, "pos_id", None)
@@ -2378,12 +2542,21 @@ def close_checks(st, run):
     fidelity_gate(st, run, [t["id"] for t in run.get("tasks") or []
                             if t.get("id") and t.get("status") in CLOSED_STATUSES], final=True)
     reconcile_open(st, run)
-    if not run.get("plan"):
+    if not plan_linked(run):
         return {}
-    try:
-        cur = plan_tool("parse", st.plan_file(run))
-    except Fail as e:
-        return {"gate_error": f"plan gates not run: {e}"}
+    if run.get("plan_version"):
+        # RUN.2.3: a run started from a stored plan never closes without its plan: a missing stored
+        # plan or version fails the close with a named error instead of skipping the gates
+        try:
+            cur = plan_view(st, run)
+        except Fail as e:
+            raise Fail(f"run {run['id']} is not closed: its stored plan cannot be read ({e}); "
+                       "plan gates are never skipped")
+    else:
+        try:
+            cur = plan_tool("parse", st.plan_file(run))
+        except Fail as e:
+            return {"gate_error": f"plan gates not run: {e}"}
     gates = cur.get("gates") if isinstance(cur.get("gates"), dict) else {}
     if not gates:
         return {}
@@ -2402,7 +2575,7 @@ def set_run_status(st, run, status):
         st.event(run, "note", f"run {run['status']} → {status}")
         run["status"] = status
         run["ended"] = None if status == "active" else (run.get("ended") or now())
-        if status == "done" and run.get("plan_id") and run.get("plan"):
+        if status == "done" and run.get("plan_id") and plan_linked(run):
             return plan_done_if_last(st, run)  # C5: best-effort, never fatal
     return None
 
@@ -2413,10 +2586,14 @@ def plan_done_if_last(st, run):
     the message rides back as the command's "warning". Only Fail is caught; anything else is a real
     bug and still raises."""
     try:
-        cur = plan_tool("parse", st.plan_file(run))
+        cur = plan_view(st, run)
         runs = [str(x) for x in cur.get("runs") or []]
         if runs and runs[-1].lower() == run["id"].lower():
-            plan_tool("set", st.plan_file(run), "--status", "done")
+            if run.get("plan_version"):  # RUN: the store row, by plan id
+                plan_tool("set", run["plan_id"], "--status", "done", "--data", st.data,
+                          "--home", st.home_dir())
+            else:
+                plan_tool("set", st.plan_file(run), "--status", "done")
             run["plan_status"] = "done"
             st.event(run, "note", f"plan {run['plan_id']} done (last run finished)")
     except Fail as e:
@@ -3184,7 +3361,7 @@ def cmd_plan(a, st):
     with st.locked():
         st.repair()
         run = st.load(a.run)
-        if not (run.get("plan_id") and run.get("plan")):
+        if not (run.get("plan_id") and plan_linked(run)):
             raise Fail(f"run {run['id']} has no plan link (run init --plan)")
         # T1: the tasks are the source once a run is live. A plan sync rewrites title/acceptance/
         # owned/deps from the file, which silently drops `task set` edits — so it refuses while
@@ -3196,9 +3373,10 @@ def cmd_plan(a, st):
             raise Fail("plan sync on a live run overwrites task edits made with task set; "
                        "change tasks with 'task set T title=… acceptance=… owned=… deps=…' "
                        "or pass --from-file", live=live)
-        cur = plan_tool("parse", st.plan_file(run))
+        cur = plan_view(st, run)  # a stored-version run reads its version from the store, never a file
+        from_store = bool(run.get("plan_version"))
         stored = plan_store_row(st, run["plan_id"])
-        version_diff = plan_version_diff(stored, cur) if st.store_on else []
+        version_diff = plan_version_diff(stored, cur) if st.store_on and not from_store else []
         changes, warnings, adds, updates = [], [], [], []
         ph_by = {str(t.get("plan_phase")).lower(): t for t in run["tasks"] if t.get("plan_phase")}
         ck_by = {str(t.get("plan_task")).lower(): t for t in run["tasks"] if t.get("plan_task")}
@@ -3303,8 +3481,9 @@ def cmd_plan(a, st):
                             del t["description"]
                         else:
                             t["description"] = new
-            run["plan_sha"] = cur.get("sha")
-            run["plan_status"] = cur.get("status")
+            if not from_store:  # a stored-version run keeps no plan sha
+                run["plan_sha"] = cur.get("sha")
+                run["plan_status"] = cur.get("status")
             st.save(run)
         finally:
             sunk = st.sunk
@@ -3399,7 +3578,7 @@ def backfill_fields(st, run, by):
     and route_json stays whatever dispatch (D1.5.3) put there. The writes go through the
     normal save path, so the store mirror and the run-doc artifact update together, and the
     field list lands on the file view where the D1.5.2 merge-keep then protects it."""
-    cur = plan_tool("parse", st.plan_file(run))
+    cur = plan_view(st, run)
     by_phase = {str(t.get("plan_phase")).lower(): t for t in run["tasks"] if t.get("plan_phase")}
     by_task = {str(t.get("plan_task")).lower(): t for t in run["tasks"] if t.get("plan_task")}
     by_id = {str(t.get("id")).lower(): t for t in run["tasks"] if t.get("id")}
@@ -3544,6 +3723,8 @@ def build_parser():
     r = run.choices["init"]
     r.add_argument("--feature"), r.add_argument("--branch"), r.add_argument("--plan")
     r.add_argument("--force", action="store_true")  # run init --plan: init an unapproved plan
+    r.add_argument("--version", type=int, default=None,
+                   help="run init --plan <id>: the stored plan version to copy (default: latest approved)")
     run.choices["set"].add_argument("--next")
     run.choices["set"].add_argument("--plan-id", help="link the run to plan <id> (repair)")
     run.choices["set"].add_argument("--status", choices=("active", "done"),
@@ -3983,6 +4164,10 @@ def self_test():
     os.environ["MK_HOME"] = tmp_home
     os.environ["MATRIXKODER_HOME"] = tmp_home
     os.environ["MK_SELFTEST"] = "1"
+    # RUN: `run init --plan` takes a plan id. The tests below that build an OLD-shape run (it holds a
+    # plan file path, which every run before RUN did) start it from a plan file through this seam;
+    # the RUN block near the end removes it and starts runs the new way.
+    os.environ[LEGACY_INIT_ENV] = "1"
     # Z3: every fixture root projection is keyed by this one slug, so the assertions below keep
     # the spelling they had under the old <data>/.mk-home. It also tells mk-state NOT to register
     # a root row for a temp data dir (a self-test must add none).
@@ -5509,6 +5694,8 @@ def self_test():
         lessons_lint_self_test()
         reconcile_self_test(tmp, env)
         print("mk-state gate-run self-test ok")
+        run_store_self_test(tmp, env)
+        print("mk-state run-store self-test ok")
         # R1.2: the mkdb write guard refuses the real home from this suite too.
         _mkdb().selftest_guard_probe(tmp_home)
     finally:
@@ -7104,6 +7291,189 @@ def gate_run_self_test(tmp, env):
     # exactly one of <task> | --final | --due
     assert gr("gate", "run", "--run", "gr", code=2)["ok"] is False
     assert gr("gate", "run", "G1", "--final", "--run", "gr", code=2)["ok"] is False
+
+
+def run_store_self_test(tmp, env):
+    """RUN.1/RUN.2: a run starts from a stored plan version and never reads the plan file; a run that
+    holds a plan file path (every run before RUN) keeps working through it. The plan tool is the
+    real mk-plan.py against a temp store; the seam env is removed so `--plan` means a plan id."""
+    H = env["MK_HOME"]
+    DB = _mkdb()
+    data = os.path.join(tmp, "rs-data")
+    os.makedirs(data)
+    DB.open_project(H, STORE_PROJECT_FALLBACK, data_dir=data).close()
+    new_env = {k: v for k, v in env.items() if k != LEGACY_INIT_ENV}
+    plan_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mk-plan.py")
+
+    def call(script, *args, code=0, e=None):
+        r = subprocess.run([sys.executable, script, *args], capture_output=True, text=True,
+                           env=e or new_env, cwd=tmp, timeout=300)
+        lines = r.stdout.strip().splitlines()
+        assert len(lines) == 1, (args, r.stdout, r.stderr)
+        assert r.returncode == code, (args, r.returncode, r.stdout, r.stderr)
+        return json.loads(lines[0])
+
+    def st(*args, code=0, e=None):
+        return call(os.path.abspath(__file__), *args, "--data", data, code=code, e=e)
+
+    def pl(*args, code=0):
+        return call(plan_py, *args, "--data", data, "--home", H, code=code)
+
+    def q(sql, args=()):
+        con = DB.open_project(H, STORE_PROJECT_FALLBACK, data_dir=data)
+        try:
+            return [dict(r) for r in con.execute(sql, args).fetchall()]
+        finally:
+            con.close()
+
+    def plan_file(pid, ph, gate="true", status="draft"):
+        path = os.path.join(tmp, f"{pid}.md")
+        with open(path, "w") as f:
+            f.write(f'''+++
+plan = "{pid}"
+status = "{status}"
+created = 2026-10-08
+runs = []
+description = "a plan for the RUN self-test"
+
+[gates]
+g1 = {{ cmd = "{gate}", expect = 0, timeout = 30 }}
+
+[[phase]]
+id = "{ph}"
+title = "the phase"
+wave = 1
+owned = ["src/"]
+commit = "c"
+route = "claude sonnet medium"
+reviewer = "agy gemini"
+
+  [[phase.task]]
+  id = "{ph}.1"
+  title = "first task"
+  description = "why the first task"
+  acceptance = ["line one", "line two"]
+  owned = ["src/a.py"]
+  refs = ["src/a.py:1"]
+
+    [[phase.task.subtask]]
+    id = "{ph}.1.1"
+    title = "leaf"
+    acceptance = "leaf done"
+
+  [[phase.task]]
+  id = "{ph}.2"
+  title = "second task"
+  deps = ["{ph}.1"]
++++
+
+# {pid} — a plan for the RUN self-test
+''')
+        return path
+
+    def stored(pid, ph, gate="true", approve=True):
+        path = plan_file(pid, ph, gate)
+        pl("import", path)
+        if approve:
+            pl("approve", path)
+        return path
+
+    def close_all(rid, ids):
+        for tid in ids:
+            st("task", "set", tid, "status=done", "--run", rid)
+
+    # ---- RUN.1: a stored, approved plan starts a run from its rows, with the file deleted ----
+    path_a = stored("rsa", "RA")
+    os.unlink(path_a)  # 1.3: the plan file is gone
+    out = st("run", "init", "--id", "rsa1", "--feature", "F", "--branch", "b", "--plan", "rsa")
+    run = out["run"]
+    assert [t["id"] for t in run["tasks"]] == ["RA", "RA.1", "RA.1.1", "RA.2"], run["tasks"]
+    t1 = {t["id"]: t for t in run["tasks"]}["RA.1"]
+    assert t1["acceptance"] == "line one\nline two" and t1["owned"] == ["src/a.py"] and t1["refs"] == ["src/a.py:1"], t1
+    assert t1["description"] == "why the first task" and {t["id"]: t for t in run["tasks"]}["RA.2"]["deps"] == ["RA.1"]
+    ph = {t["id"]: t for t in run["tasks"]}["RA"]
+    assert ph["route"] == "claude sonnet medium" and ph["reviewer"] == "agy gemini" and ph["wave"] == 1, ph
+    assert run["plan_version"] == 1 and run["plan_id"] == "rsa", run  # 1.1: the version, never NULL
+    assert run.get("plan") is None and run.get("plan_sha") is None, run  # 1.6: no file path, no sha
+    row = q("SELECT plan, plan_version FROM runs WHERE id='rsa1'")[0]
+    assert row == {"plan": "rsa", "plan_version": 1}, row
+    assert q("SELECT status FROM plans WHERE id='rsa'")[0]["status"] == "running"  # 1.7: through the store
+    assert json.loads(q("SELECT header_json FROM plans WHERE id='rsa'")[0]["header_json"])["runs"] == ["rsa1"]
+    assert "plan: `rsa` · running · version 1" in st("render", "--run", "rsa1")["board"]  # board: from the store
+    assert not os.path.exists(path_a)  # nothing wrote the file back
+
+    # ---- 1.2 not approved: refused with today's message, --force works; 1.4 a path; 1.5 no rows ----
+    path_d = stored("rsd", "RD", approve=False)
+    e = st("run", "init", "--id", "rsd1", "--feature", "F", "--branch", "b", "--plan", "rsd", code=2)
+    assert "plan rsd is 'draft', not approved; approve it (mk-plan.py set --status approved) or pass --force" in e["error"], e
+    assert q("SELECT 1 x FROM runs WHERE id='rsd1'") == []
+    out = st("run", "init", "--id", "rsd1", "--feature", "F", "--branch", "b", "--plan", "rsd", "--force")
+    assert out["run"]["plan_version"] == 1 and [t["id"] for t in out["run"]["tasks"]][0] == "RD"
+    for bad in (path_d, "plans/x", "x.md"):
+        e = st("run", "init", "--id", "rsx", "--feature", "F", "--branch", "b", "--plan", bad, code=2)
+        assert "import the file first" in e["error"] and "mk-plan.py import" in e["error"], e
+    assert q("SELECT 1 x FROM runs WHERE id='rsx'") == []
+    con = DB.open_project(H, STORE_PROJECT_FALLBACK, data_dir=data)
+    con.execute("INSERT INTO plans(id, version, title, header_json, status, approved_at) "
+                "VALUES ('prestore', 1, 't', '{}', 'approved', '2026-01-01')")
+    con.commit()
+    con.close()
+    e = st("run", "init", "--id", "rsp1", "--feature", "F", "--branch", "b", "--plan", "prestore", code=2)
+    assert "import this plan again first" in e["error"], e  # 1.5: nothing migrated, nothing copied
+    assert q("SELECT 1 x FROM runs WHERE id='rsp1'") == [] and q("SELECT COUNT(*) n FROM plan_items WHERE plan='prestore'")[0]["n"] == 0
+    e = st("run", "init", "--id", "rsg1", "--feature", "F", "--branch", "b", "--plan", "ghost", code=2)
+    assert "not in the store" in e["error"], e
+
+    # ---- RUN.2: with the file gone, backfill, sync, close and plan_done never open it ----
+    assert st("run", "backfill-fields", "--run", "rsa1")["ok"]
+    out = st("plan", "sync", "--run", "rsa1", "--from-file")
+    assert out["ok"] and out["changes"] == [] and out["sha"] is None, out
+    close_all("rsa1", ["RA.1.1", "RA.1", "RA.2"])
+    out = st("run", "set", "--id", "rsa1", "--status", "done")
+    assert out["ok"] and out["gates"] == {"g1": "pass"}, out  # the plan's [gates] came from the store
+    assert "warning" not in out, out  # plan_done_if_last read the store and set it done
+    assert q("SELECT status FROM plans WHERE id='rsa'")[0]["status"] == "done"
+    # a plan gate that fails refuses the close, again with no file
+    path_f = stored("rsf", "RF", gate="false")
+    os.unlink(path_f)
+    st("run", "init", "--id", "rsf1", "--feature", "F", "--branch", "b", "--plan", "rsf")
+    close_all("rsf1", ["RF.1.1", "RF.1", "RF.2"])
+    e = st("run", "set", "--id", "rsf1", "--status", "done", code=2)
+    assert "g1" in json.dumps(e) and e.get("failed") == ["g1"], e
+    # 2.3: a missing stored plan fails the close with a named error, never a silent skip
+    path_m = stored("rsm", "RM")
+    st("run", "init", "--id", "rsm1", "--feature", "F", "--branch", "b", "--plan", "rsm")
+    close_all("rsm1", ["RM.1.1", "RM.1", "RM.2"])
+    con = DB.open_project(H, STORE_PROJECT_FALLBACK, data_dir=data)
+    con.execute("DELETE FROM plan_items WHERE plan='rsm'")
+    con.commit()
+    con.close()
+    e = st("run", "set", "--id", "rsm1", "--status", "done", code=2)
+    assert "stored plan cannot be read" in e["error"] and "no stored items" in e["error"], e
+    assert q("SELECT status FROM runs WHERE id='rsm1'")[0]["status"] == "active"
+
+    # ---- 2.4: an old-shape run (a plan file path, no plan_version) keeps working through the file ----
+    old_path = plan_file("rso", "RO")
+    old_env = dict(new_env, **{LEGACY_INIT_ENV: "1"})
+    st("run", "init", "--id", "rso1", "--feature", "F", "--branch", "b", "--plan", old_path, "--force", e=old_env)
+    got = st("run", "get", "--id", "rso1")["run"]
+    assert got["plan"] == old_path and got.get("plan_version") is None and got["plan_sha"], got
+    assert q("SELECT plan_version FROM runs WHERE id='rso1'")[0]["plan_version"] is None
+    out = st("plan", "sync", "--run", "rso1", "--from-file")  # reads the FILE through the plan tool
+    assert out["ok"] and out["sha"] == got["plan_sha"], out
+    close_all("rso1", ["RO.1.1", "RO.1", "RO.2"])
+    out = st("run", "set", "--id", "rso1", "--status", "done")
+    assert out["ok"] and out["gates"] == {"g1": "pass"}, out  # the file's [gates]
+    after = st("run", "get", "--id", "rso1")["run"]
+    assert after["plan"] == old_path and after.get("plan_version") is None, after  # not migrated
+    assert q("SELECT plan_version FROM runs WHERE id='rso1'")[0]["plan_version"] is None
+    # and a file that is gone fails the OLD run's close the old, best-effort way (a gate_error, not a store read)
+    path_g = plan_file("rsg", "RG")
+    st("run", "init", "--id", "rsg2", "--feature", "F", "--branch", "b", "--plan", path_g, "--force", e=old_env)
+    close_all("rsg2", ["RG.1.1", "RG.1", "RG.2"])
+    os.unlink(path_g)
+    out = st("run", "set", "--id", "rsg2", "--status", "done")
+    assert out["ok"] and "plan gates not run" in out.get("gate_error", ""), out
 
 
 def lessons_lint_self_test():
