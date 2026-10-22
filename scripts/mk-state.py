@@ -2588,6 +2588,12 @@ def plan_done_if_last(st, run):
     try:
         cur = plan_view(st, run)
         runs = [str(x) for x in cur.get("runs") or []]
+        if run["id"].lower() not in [r.lower() for r in runs]:
+            # the plan never saw this run (an empty or stale runs list): say so, change nothing
+            msg = (f"plan {run['plan_id']} not marked done: run {run['id']} is not in its"
+                   f" runs list ({', '.join(runs)})")
+            st.event(run, "note", msg)
+            return msg
         if runs and runs[-1].lower() == run["id"].lower():
             if run.get("plan_version"):  # RUN: the store row, by plan id
                 plan_tool("set", run["plan_id"], "--status", "done", "--data", st.data,
@@ -7433,6 +7439,45 @@ reviewer = "agy gemini"
     assert out["ok"] and out["gates"] == {"g1": "pass"}, out  # the plan's [gates] came from the store
     assert "warning" not in out, out  # plan_done_if_last read the store and set it done
     assert q("SELECT status FROM plans WHERE id='rsa'")[0]["status"] == "done"
+
+    # ---- PDW: a closing run missing from the plan's runs list is said out loud, and nothing moves ----
+    stored("rsu", "RU")
+    st("run", "init", "--id", "rsu1", "--feature", "F", "--branch", "b", "--plan", "rsu")
+    close_all("rsu1", ["RU.1.1", "RU.1", "RU.2"])
+    con = DB.open_project(H, STORE_PROJECT_FALLBACK, data_dir=data)
+    hdr = json.loads(con.execute("SELECT header_json FROM plans WHERE id='rsu'").fetchone()["header_json"])
+    hdr["runs"] = ["rso1"]  # a stale list: the plan never learned rsu1 (the real inbox-r1 case)
+    con.execute("UPDATE plans SET header_json=? WHERE id='rsu'", (json.dumps(hdr, sort_keys=True),))
+    con.commit()
+    con.close()
+    n_ev = q("SELECT COUNT(*) n FROM events WHERE run='rsu1'")[0]["n"]
+    out = st("run", "set", "--id", "rsu1", "--status", "done")
+    assert out["ok"] and out["gates"] == {"g1": "pass"}, out
+    want = "plan rsu not marked done: run rsu1 is not in its runs list (rso1)"
+    assert out.get("warning") == want, out  # said out loud, never swallowed
+    evs = q("SELECT kind, text FROM events WHERE run='rsu1' ORDER BY id")[n_ev:]
+    # one note carries that text; the run's own "active → done" note is the only other one
+    assert [e["text"] for e in evs if e["kind"] == "note" and "not marked done" in e["text"]] == [want], evs
+    assert len([e for e in evs if e["kind"] == "note"]) == 2, evs
+    assert q("SELECT status FROM plans WHERE id='rsu'")[0]["status"] == "running"  # unchanged
+    con = DB.open_project(H, STORE_PROJECT_FALLBACK, data_dir=data)
+    hdr = json.loads(con.execute("SELECT header_json FROM plans WHERE id='rsu'").fetchone()["header_json"])
+    con.close()
+    assert hdr["runs"] == ["rso1"], hdr  # the runs list is not touched
+    assert st("run", "get", "--id", "rsu1")["run"]["plan_status"] == "running"
+
+    # a listed run that is not last closes quietly: the plan expects a later run
+    stored("rsl", "RL")
+    st("run", "init", "--id", "rsl1", "--feature", "F", "--branch", "b", "--plan", "rsl")
+    st("run", "init", "--id", "rsl2", "--feature", "F", "--branch", "b", "--plan", "rsl", "--force")
+    close_all("rsl1", ["RL.1.1", "RL.1", "RL.2"])
+    n_ev = q("SELECT COUNT(*) n FROM events WHERE run='rsl1'")[0]["n"]
+    out = st("run", "set", "--id", "rsl1", "--status", "done")
+    assert out["ok"] and "warning" not in out, out
+    evs = q("SELECT kind, text FROM events WHERE run='rsl1' ORDER BY id")[n_ev:]
+    assert [e["text"] for e in evs if e["kind"] == "note"] == ["run active → done"], evs  # no plan note
+    assert q("SELECT status FROM plans WHERE id='rsl'")[0]["status"] == "running"
+
     # a plan gate that fails refuses the close, again with no file
     path_f = stored("rsf", "RF", gate="false")
     os.unlink(path_f)
