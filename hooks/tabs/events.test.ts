@@ -724,3 +724,41 @@ test('the Inbox filter keeps every drawn row within the pane at 36, 40 and 46 co
     for (const l of ['All', 'Bus', 'Run', 'Inbox']) expect(srcTexts, `${l} at ${cols}`).toContain(l)
   }
 })
+
+test('the Bug segment shows only rows whose run is bugs; a row without a run is unaffected elsewhere', () => {
+  const rows: EventItem[] = [
+    { id: 'p', type: 'review', run: 'plan-r1', t: '10:00', text: 'a plan run row' },
+    { id: 'q', kind: 'transition', src: 'run', run: 'bugs', task: 'B5.1', t: '10:01', text: 'B5.1 to building' },
+    { id: 'r', kind: 'transition', src: 'run', run: 'BUGS', task: 'B2', t: '10:02', text: 'B2 to done' },
+    { id: 's', kind: 'ask', t: '10:03', text: 'an old row with no run' },
+  ]
+  const ids = (source: string): string[] => shownIds(drawEvents({ 'events:source': source }, 46, eventsViewOf(rows)).tree)
+  expect(ids('bug')).toEqual(['q', 'r'])
+  expect(ids('all')).toEqual(['p', 'q', 'r', 's'])
+  expect(ids('bus')).toEqual(['s'])
+})
+
+test('a row with src bug is its own source: in All and Bug, never under Bus, Run or Inbox', () => {
+  const rows: EventItem[] = [
+    { id: 'b1', kind: 'transition', src: 'bug', run: 'bugs', task: 'B5.1', t: '10:01', text: 'B5.1 to building' },
+    { id: 'b2', kind: 'info', src: 'bug', t: '10:02', text: 'a bug row that lost its run' },
+    { id: 'm', kind: 'ask', src: 'bus', t: '10:03', text: 'a bus row' },
+    { id: 'u', kind: 'transition', src: 'run', run: 'plan-r1', t: '10:04', text: 'a run row' },
+  ]
+  const ids = (source: string): string[] => shownIds(drawEvents({ 'events:source': source }, 46, eventsViewOf(rows)).tree)
+  expect(ids('bug')).toEqual(['b1', 'b2'])
+  expect(ids('all')).toEqual(['b1', 'b2', 'm', 'u'])
+  expect(ids('bus')).toEqual(['m'])
+  expect(ids('run')).toEqual(['u'])
+  expect(ids('inbox')).toEqual([])
+})
+
+test('the source row draws a Bug segment at 36, 40 and 46 cols and a press picks it', () => {
+  for (const cols of [36, 40, 46] as const) {
+    const { map } = drawEvents({}, cols)
+    for (const k of ['all', 'bus', 'run', 'inbox', 'bug']) expect(pressed.has(`ev-src-${k}`), `${k} segment at ${cols}`).toBe(true)
+    pressed.get('ev-src-bug')?.()
+    expect(map.get('events:source')).toBe('bug')
+    expect(textOwn(drawEvents({ 'events:source': 'bug' }, cols).tree)).toContain('Bug')
+  }
+})

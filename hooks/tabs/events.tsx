@@ -7,6 +7,7 @@
 // 4. LANE ACTIVITY Card (per-lane 24-cell sparkline & silence age)
 // Pure render: elements only, no $, no direct state mutation. Filter and selection state flows through TabUi.
 import type { Elements, RenderElement } from 'claude-code'
+import { isBugsRun } from '../data'
 import { NARROW } from './ui'
 import { ActionButton, Card, Chip, IconButton, Section, Segment, iconWidth } from './kit'
 import type { IconName } from './kit'
@@ -20,7 +21,7 @@ type Els = Elements[keyof Elements]
 /** one timeline event row: clock time, type/kind, who, lane, text, and ack/status markers */
 export type EventItem = {
   readonly id?: string
-  readonly src?: 'bus' | 'run' | 'inbox'
+  readonly src?: 'bus' | 'run' | 'inbox' | 'bug'
   readonly t: string
   readonly kind?: string
   readonly who?: string
@@ -41,6 +42,8 @@ export type EventItem = {
   readonly to?: string
   /** the plan task the row belongs to */
   readonly task?: string
+  /** the run the row was written in: a row of run `bugs` is what the Bug filter shows */
+  readonly run?: string
   /** the store channel the row was written on */
   readonly chan?: string
   /** the author the row's meta names */
@@ -210,7 +213,7 @@ const isRing = (k: string): boolean => k === 'ring' || k.startsWith('ring-')
 
 type NormalizedEvent = {
   id: string
-  src: 'bus' | 'run' | 'inbox'
+  src: 'bus' | 'run' | 'inbox' | 'bug'
   t: string
   kind: string
   who: string
@@ -225,6 +228,7 @@ type NormalizedEvent = {
   from?: string
   to?: string
   task?: string
+  run?: string
   chan?: string
   by?: string
   file?: string
@@ -273,6 +277,7 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
     from: e.from,
     to: e.to,
     task: e.task,
+    run: e.run,
     chan: e.chan,
     by: e.by,
     file: e.file,
@@ -297,7 +302,7 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
   // Filter list
   const filtered = allEvents.filter(e => {
     if (isNew(e)) return false
-    if (source !== 'all' && e.src !== source) return false
+    if (source === 'bug' ? e.src !== 'bug' && !isBugsRun(e.run) : source !== 'all' && e.src !== source) return false
     if (source !== 'run' && pickedBus.size > 0 && e.src === 'bus') {
       const k = isRing(e.kind) ? 'ring' : e.kind
       if (!pickedBus.has(k)) return false
@@ -428,9 +433,9 @@ export function EventsTab(els: Els, view: EventsView, cols: number, ui?: TabUi):
       {/* ── CARD 2: FILTERS ── */}
       {Card(els, {}, (
         <Box flexDirection="column" gap={1}>
-          {/* Source Filter: All, Bus, Run, Inbox; where the four do not fit beside the label, Inbox takes a second line */}
+          {/* Source Filter: All, Bus, Run, Inbox, Bug; where the five do not fit beside the label, Inbox and Bug take a second line */}
           {(() => {
-            const segs = [['all', 'All'], ['bus', 'Bus'], ['run', 'Run'], ['inbox', 'Inbox']] as const
+            const segs = [['all', 'All'], ['bus', 'Bus'], ['run', 'Run'], ['inbox', 'Inbox'], ['bug', 'Bug']] as const
             const seg = (k: typeof segs[number][0], label: string): RenderElement => Segment(els, {
               key: `ev-src-${k}`,
               label,

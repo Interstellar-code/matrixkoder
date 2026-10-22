@@ -177,7 +177,7 @@ test('WIRE.1.a1: the bar draws n Inbox after Waiting and before Todo, and hidden
   const ui = await mount($)
   const bar = (await ui.findAll({ type: 'Button' })).filter(b => String(b.props.key).startsWith('dash-tab-'))
   expect(bar.map(b => b.props.key)).toEqual([
-    'dash-tab-overview', 'dash-tab-lanes', 'dash-tab-plan', 'dash-tab-usage', 'dash-tab-files', 'dash-tab-events', 'dash-tab-waiting', 'dash-tab-inbox', 'dash-tab-todo', 'dash-tab-improve', 'dash-tab-settings',
+    'dash-tab-overview', 'dash-tab-lanes', 'dash-tab-plan', 'dash-tab-usage', 'dash-tab-files', 'dash-tab-events', 'dash-tab-waiting', 'dash-tab-inbox', 'dash-tab-bugs', 'dash-tab-todo', 'dash-tab-improve', 'dash-tab-settings',
   ])
   const inbox = bar.find(b => b.props.key === 'dash-tab-inbox')
   expect(inbox?.props.hotkey).toBe('n')

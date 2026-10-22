@@ -12,7 +12,7 @@ import type { MkDashTab, MkFileAct, MkImprove, MkImproveEntry, MkImproveFlow, Mk
 import {
   AGENT_ORDER, PANE_ID, EMPTY_SNAPSHOT, basename, coerceIndex, coerceRun, coerceUsage, join,
   mainCheckout, mkSnapshot, normalizePath, orderAgents, parentOf, parseGitdir, parseJson, parseYamlAgents, parseYamlProviders,
-  sanitizeText, timerRegistry,
+  sanitizeText, timerRegistry, BUGS_RUN_ID, isBugsRun,
 } from './data'
 import type { MkPaneSnapshot } from './data'
 import { beginStoreTick, endStoreTick, globalDirOf, homeDir, paths, projectYamlPath, resolveDataDir, resetStoreMemo } from './paths'
@@ -61,6 +61,8 @@ import { WaitingTab, waitingAsks, waitingView, readPending, askView, runWaitView
 import type { PendingAsk, RunWait } from './tabs/waiting'
 import { projectStoreDir, storeGroups } from './tabs/plans-map'
 import { TodoTab } from './tabs/todo'
+import { BugsTab } from './tabs/bugs'
+import { BUGS_KEYS, BUGS_RELOAD_ON, bugPressPatch, bugsViewOf, readBugs, runBug, showTarget, todoBugTail } from './bugs-core'
 import { InboxTab } from './tabs/inbox'
 import type { InboxActKind, InboxCardState, InboxFile, InboxFilter, InboxView } from './tabs/inbox'
 import { ImproveFooter, ImproveTab } from './tabs/improve'
@@ -124,6 +126,7 @@ const TABS: readonly { key: MkDashTab; hotkey: string; label: string }[] = [
   { key: 'events', hotkey: 'e', label: 'Events' },
   { key: 'waiting', hotkey: 'w', label: 'Waiting' },
   { key: 'inbox', hotkey: 'n', label: 'Inbox' },
+  { key: 'bugs', hotkey: 'b', label: 'Bugs' },
   { key: 'todo', hotkey: 't', label: 'Todo' },
   { key: 'improve', hotkey: 'i', label: 'Improve' },
   { key: 'settings', hotkey: '9', label: 'Settings' },
@@ -361,6 +364,7 @@ export function registerDashboard(on: On, options: PluginOptions): void {
       submit: text => { void $.prompt.submit({ text, asUser: true }) },
       planAct: (kind, id) => { void planAction($, kind, id) },
       todoAct: (kind, arg) => { void todoAction($, kind, arg) },
+      bugAct: (kind, id, text) => { void bugAction($, kind, id, text) },
       inboxAct: (kind, id) => { void inboxAct($, kind, id) },
       improveAct: (kind, a, b) => { void improveAction($, kind, a, b) },
     }
@@ -448,6 +452,8 @@ export function registerDashboard(on: On, options: PluginOptions): void {
                           ? TodoPane($, tabEls, viewState, cols, ui)
                         : dashTab === 'inbox'
                           ? InboxPane(tabEls, viewState, cols, ui)
+                        : dashTab === 'bugs'
+                          ? BugsPane($, tabEls, viewState, cols, ui)
                         : dashTab === 'improve'
                           ? ImproveTab(tabEls, improveView, cols, ui)
                         : pane.src === 'live'
@@ -482,7 +488,9 @@ type TabUi = {
   /** archive | unarchive | delete: runs mk-plan.py directly (see planAction). */
   planAct?: (kind: string, id: string) => void
   /** Todo tab presses: runs `mkdb.py todo <verb>` (see todoAction). */
-  todoAct?: (kind: 'add' | 'toggle' | 'delete' | 'undo' | 'clear-done', arg?: string | number) => void
+  todoAct?: (kind: 'add' | 'toggle' | 'delete' | 'undo' | 'clear-done' | 'to-bug', arg?: string | number) => void
+  /** Bugs tab presses: runs `mk-bug.py` (see bugAction). */
+  bugAct?: (kind: string, id?: string, text?: string) => void
   /** Inbox tab presses: runs `mk-inbox.py` (see inboxAct); `delete` only asks for the confirm. */
   inboxAct?: (kind: InboxActKind, id: string) => void
   /** Improve presses (footer card and tab): see improveAction. */
@@ -511,6 +519,7 @@ async function switchTab($: EngineInterface, tab: MkDashTab): Promise<void> {
   await update($, improveAtom, prev => (prev.menu === true ? { ...prev, menu: false } : prev)) // the drop-up closes on a tab switch
   if (tab === 'settings') void ensureSettingsLoaded($)
   if (tab === 'todo') void kickTodos($) // the first list should not wait for the 5 s tick
+  if (tab === 'bugs') void kickBugs($) // the first list should not wait for the 5 s tick
   if (tab === 'inbox') void kickInbox($) // the first list should not wait for the 5 s tick
   if (tab === 'plan') void kickPlans($) // the gated tab loads on open, not 5 s later
   if (tab === 'waiting') void kickPending($) // a retry now, whatever the sticky-down backoff says
@@ -1748,6 +1757,7 @@ function TodoPane($: EngineInterface, els: Els, view: Record<string, string>, co
   return (
     <Box flexDirection="column" gap={1}>
       {err !== '' && <Text color={ROLE.err.fg}>{`⚠ ${sanitizeText(err, Math.max(8, cols - 4))}`}</Text>}
+      {err === '' && (view['todo:note'] ?? '') !== '' && <Text color={ROLE.ok.fg}>{sanitizeText(view['todo:note'] ?? '', Math.max(8, cols - 4))}</Text>}
       {TodoTab(els, todoPaneView(view), cols, ui)}
       <Box flexDirection="row" gap={1} paddingX={1}>
         <Button key="todo-key-a" hotkey={typing ? undefined : 'a'} label="add" plain={true} onPress={() => filesFocus($, 'todo-q')} />
@@ -1789,7 +1799,7 @@ async function refreshTodos($: EngineInterface, cwd: string, overview: RootOverv
   const slug = home === '' ? '' : activeSlug(overview.doc, dataDir)
   await update($, viewStateAtom, prev => (prev[TODO_HOME_KEY] === home && prev[TODO_SLUG_KEY] === slug ? prev
     // a new project: the old rows, the undo row and the error belong to the old one, so a press cannot send their ids here
-    : { ...prev, [TODO_HOME_KEY]: home, [TODO_SLUG_KEY]: slug, [TODO_ITEMS_KEY]: '', [TODO_UNDO_KEY]: '', [TODO_ERROR_KEY]: '' }))
+    : { ...prev, [TODO_HOME_KEY]: home, [TODO_SLUG_KEY]: slug, [TODO_ITEMS_KEY]: '', [TODO_UNDO_KEY]: '', [TODO_ERROR_KEY]: '', 'todo:note': '' }))
   if (home !== '' && slug !== '') await loadTodos($, home, slug)
 }
 
@@ -1802,6 +1812,8 @@ async function kickTodos($: EngineInterface): Promise<void> {
  *  so a leading dash is not read as a flag), then reload the list. A failure keeps the list and
  *  shows an error line. */
 async function todoAction($: EngineInterface, kind: string, arg?: string | number): Promise<void> {
+  if (kind === 'to-bug') { await todoToBug($, Number(arg)); return }
+  await update($, viewStateAtom, prev => (prev['todo:note'] ? { ...prev, 'todo:note': '' } : prev))
   const view = await read($, viewStateAtom)
   const home = view[TODO_HOME_KEY] ?? ''
   const slug = view[TODO_SLUG_KEY] ?? ''
@@ -1834,6 +1846,85 @@ async function todoAction($: EngineInterface, kind: string, arg?: string | numbe
     return
   }
   await loadTodos($, home, slug, true)
+}
+
+/** `→ bug` on a todo row: `mk-bug new` in the same project, the todo text the title, source `todo #<id>`. */
+async function todoToBug($: EngineInterface, id: number): Promise<void> {
+  const view = await read($, viewStateAtom)
+  const home = view[TODO_HOME_KEY] ?? ''
+  const slug = view[TODO_SLUG_KEY] ?? ''
+  let items: TodoItem[] = []
+  try { items = JSON.parse(view[TODO_ITEMS_KEY] ?? '[]') as TodoItem[] } catch { items = [] }
+  const todo = items.find(t => t.id === id)
+  if (home === '' || slug === '' || todo == null) return
+  const r = await runBug((argv, init) => $.process.run(argv, init), $.plugin.root, home, slug, todoBugTail(todo))
+  const bugId = 'reply' in r && r.reply.bug != null && typeof r.reply.bug === 'object' ? String((r.reply.bug as { id?: unknown }).id ?? '') : ''
+  await update($, viewStateAtom, prev => ({ ...prev, ...('error' in r ? { [TODO_ERROR_KEY]: `todo to bug: ${r.error}`, 'todo:note': '' } : { [TODO_ERROR_KEY]: '', 'todo:note': `→ ${bugId} filed from todo #${String(id)}` }) }))
+}
+
+// ── Bugs tab: mk-bug list (+ show) on the tick while the tab is open; presses run mk-bug verbs (logic: bugs-core.ts) ──
+
+/** The Bugs body: the error line, then the tab. A press that opens or expands a bug reloads at once. */
+function BugsPane($: EngineInterface, els: Els, view: Record<string, string>, cols: number, ui: TabUi): RenderElement {
+  const { Box, Text } = els
+  const err = view[BUGS_KEYS.error] || view[BUGS_KEYS.readError] || ''
+  // the form's fields (or the one that opened it) leave a stale focus behind, which mutes the s / k / a hotkeys
+  const bui: TabUi = { ...ui, set: (key, value) => { void update($, viewStateAtom, prev => ({ ...prev, [key]: value, ...(key === BUGS_KEYS.sel ? { 'settings:focus': '' } : {}) })).then(() => { if (BUGS_RELOAD_ON.has(key)) void reloadBugs($) }) } }
+  return (
+    <Box flexDirection="column" gap={1}>
+      {err !== '' && <Text color={ROLE.err.fg}>{`⚠ ${sanitizeText(err, Math.max(8, cols - 4))}`}</Text>}
+      {BugsTab(els, bugsViewOf(view, new Date().toISOString()), cols, bui)}
+    </Box>
+  )
+}
+
+let bugsInFlight = false
+let bugsAgain = false
+
+/** list (+ show) for one project; one read in flight, a write during a read asks for one more (as loadTodos). */
+async function loadBugs($: EngineInterface, home: string, slug: string, again = false): Promise<void> {
+  if (bugsInFlight) { if (again) bugsAgain = true; return }
+  bugsInFlight = true
+  try {
+    const patch = await readBugs((argv, init) => $.process.run(argv, init), $.plugin.root, home, slug, showTarget(await read($, viewStateAtom)))
+    await update($, viewStateAtom, prev => (prev[BUGS_KEYS.slug] !== slug || Object.keys(patch).every(k => (prev[k] ?? '') === patch[k]) ? prev : { ...prev, ...patch }))
+  } catch {
+    // readBugs never throws; a refused atom write keeps the last rows
+  } finally {
+    bugsInFlight = false
+    if (bugsAgain) { bugsAgain = false; void loadBugs($, home, slug) }
+  }
+}
+
+/** The tick (and the tab switch): the project the Todo tab uses, then the read. Only while Bugs is open. */
+async function refreshBugs($: EngineInterface, cwd: string, overview: RootOverview): Promise<void> {
+  if ((await read($, dashTabAtom)) !== 'bugs') return
+  const home = overview.exists ? overview.home ?? '' : ''
+  const dataDir = home === '' ? null : await resolveDataDir($, { cwd, home, requireExisting: true, store: true }).catch(() => null)
+  const slug = home === '' ? '' : activeSlug(overview.doc, dataDir)
+  await update($, viewStateAtom, prev => (prev[BUGS_KEYS.home] === home && prev[BUGS_KEYS.slug] === slug ? prev
+    // a new project: the old rows and the open bug belong to the old one
+    : { ...prev, [BUGS_KEYS.home]: home, [BUGS_KEYS.slug]: slug, [BUGS_KEYS.list]: '', [BUGS_KEYS.show]: '', [BUGS_KEYS.sel]: '', [BUGS_KEYS.error]: '', [BUGS_KEYS.readError]: '', [BUGS_KEYS.note]: '' }))
+  if (home !== '' && slug !== '') await loadBugs($, home, slug)
+}
+
+async function kickBugs($: EngineInterface): Promise<void> {
+  await refreshBugs($, await filesCwd($), await readRootOverview($)).catch(() => {})
+}
+
+/** a reload on the project already resolved (no root read) */
+async function reloadBugs($: EngineInterface): Promise<void> {
+  const view = await read($, viewStateAtom)
+  const home = view[BUGS_KEYS.home] ?? ''
+  const slug = view[BUGS_KEYS.slug] ?? ''
+  if (home !== '' && slug !== '') await loadBugs($, home, slug, true)
+}
+
+/** A press: run its verbs (bugs-core bugPressPatch), apply the patch, then reload. */
+async function bugAction($: EngineInterface, kind: string, id?: string, text?: string): Promise<void> {
+  const patch = await bugPressPatch((argv, init) => $.process.run(argv, init), $.plugin.root, await read($, viewStateAtom), kind, id ?? '', text ?? '')
+  if (Object.keys(patch).length > 0) await update($, viewStateAtom, prev => ({ ...prev, ...patch }))
+  await reloadBugs($)
 }
 
 // ── Inbox tab: the list is read on the tick (only while the tab is open), presses run mk-inbox.py ──
@@ -2622,6 +2713,7 @@ async function refreshSafe($: EngineInterface, options: PluginOptions, cwd: stri
     await Promise.allSettled([
       refreshPlans($, cwd, overview),
       refreshTodos($, cwd, overview),
+      refreshBugs($, cwd, overview),
       refreshInbox($, cwd),
       refreshPending($, cwd),
       eventsTick,
@@ -3679,6 +3771,9 @@ const EVENTS_KEEP = EVENTS_MAX * 4
 let eventsCache: { run: string; since: number; total: number; rows: Record<string, unknown>[] } | null = null
 /** the inbox channel's rows and its own events.id cursor (the ids are the table's, not a run's) */
 let inboxEventsCache: { since: number; total: number; rows: Record<string, unknown>[] } | null = null
+/** the bugs run's rows (project-wide like the inbox): their own key and cursor */
+const EVENTS_BUGS_KEY = 'events:bugs'
+let bugEventsCache: { since: number; rows: Record<string, unknown>[] } | null = null
 const LANE_BUCKETS = 24
 const LANE_BUCKET_MS = 5 * 60_000 // 24 × 5 min: the card's "last 2h"
 const LANE_SILENT_MS = 5 * 60_000
@@ -3761,6 +3856,68 @@ async function loadInboxEvents($: EngineInterface, dataDir: string): Promise<Eve
   })
 }
 
+/** one run-feed store row (state or bus channel) as an Events row; an ack row's level comes from `ackOf` */
+function storeEventItem(row: Record<string, unknown>, idx: number, ackOf: ReadonlyMap<string, number>): EventItem {
+  const meta = metaOf(row)
+  const isBus = row.chan === 'bus'
+  const kind = typeof row.kind === 'string' ? row.kind : 'info'
+  const fromId = typeof row.from_id === 'string' ? row.from_id : ''
+  const toId = typeof row.to_id === 'string' ? row.to_id : ''
+  const task = typeof row.task === 'string' ? row.task : ''
+  const who = fromId && toId ? `${fromId}→${toId}` : (isBus ? fromId || 'orch' : 'run')
+  const lane = task || (fromId.startsWith('p') ? fromId : toId.startsWith('p') ? toId : 'all')
+  const text = typeof row.text === 'string' ? row.text : ''
+  const id = typeof row.id === 'number' ? (isBus ? `m-${row.id}` : `r-${row.id}`) : `ev-${idx}`
+  const t = typeof row.t === 'string' ? row.t : ''
+  return {
+    id,
+    src: isBus ? 'bus' : 'run',
+    t: hhmm(t),
+    ts: Date.parse(t) || undefined,
+    kind,
+    type: kind,
+    who,
+    lane,
+    text: sanitizeText(text, 120),
+    ack: ackOf.get(id) ?? (meta.delivered === true ? 1 : 0),
+    bad: meta.bad === true || kind.startsWith('ring-failed') || meta.delivered === false,
+    reply_to: typeof row.reply_to === 'string' ? row.reply_to : undefined,
+    date: t || undefined,
+    from: fromId || undefined,
+    to: toId || undefined,
+    task: task || undefined,
+    // the Bug source segment keys on the row's run (`bugs`)
+    run: typeof row.run === 'string' && row.run !== '' ? row.run : undefined,
+    chan: typeof row.chan === 'string' && row.chan !== '' ? row.chan : undefined,
+    by: typeof meta.by === 'string' && meta.by !== '' ? meta.by : undefined,
+    full: fullOf(text),
+  }
+}
+
+/** `mkdb.py events --run bugs --json`: the project's permanent bugs run, read like the inbox rows (with or
+ *  without a live run) under its own `--since` cursor, so the Events tab's Bug segment fills. Never throws. */
+async function loadBugEvents($: EngineInterface, dataDir: string): Promise<EventItem[]> {
+  const cache = bugEventsCache ?? { since: 0, rows: [] }
+  bugEventsCache = cache
+  try {
+    const ran = await $.process.run(
+      ['python3', `${$.plugin.root}/scripts/mkdb.py`, '--data', dataDir, 'events', '--run', BUGS_RUN_ID, '--chan', '', '--json',
+        ...(cache.since > 0 ? ['--since', String(cache.since)] : [])],
+      { timeoutMs: STORE_READ_MS },
+    )
+    if (ran.exitCode === 0) {
+      const parsed = JSON.parse(ran.stdout) as { ok?: boolean; events?: Record<string, unknown>[] }
+      if (parsed.ok && Array.isArray(parsed.events)) {
+        for (const row of parsed.events) if (typeof row.id === 'number' && row.id > cache.since) cache.since = row.id
+        cache.rows = [...cache.rows, ...parsed.events].slice(-EVENTS_KEEP)
+      }
+    }
+  } catch {
+    // subprocess safe catch: the cached rows stand
+  }
+  return cache.rows.filter(row => row.kind !== 'ack' && isBugsRun(row.run)).reverse().map((row, idx) => ({ ...storeEventItem(row, idx, new Map()), src: 'bug' as const }))
+}
+
 async function refreshEvents($: EngineInterface, cwd: string, snap: MkSnapshot): Promise<void> {
   if (eventsInFlight) return
   eventsInFlight = true
@@ -3776,15 +3933,18 @@ async function refreshEvents($: EngineInterface, cwd: string, snap: MkSnapshot):
     if (dataDir == null) {
       eventsCache = null
       inboxEventsCache = null
-      await write({ [EVENTS_LIST_KEY]: '', [EVENTS_BUS_KEY]: '', [EVENTS_LANES_KEY]: '', [EVENTS_INBOX_KEY]: '' })
+      bugEventsCache = null
+      await write({ [EVENTS_LIST_KEY]: '', [EVENTS_BUS_KEY]: '', [EVENTS_LANES_KEY]: '', [EVENTS_INBOX_KEY]: '', [EVENTS_BUGS_KEY]: '' })
       return
     }
     // an inbox row has no run (C5), so the inbox channel is read whatever the run is doing
     const inboxItems = await loadInboxEvents($, dataDir)
+    // the bugs run never closes and is never the live run: its rows are read like the inbox's
+    const bugItems = await loadBugEvents($, dataDir)
     // no active run: there is no run feed and no bus of this run's, so only the inbox rows stand
     if (snap.run == null) {
       eventsCache = null
-      await write({ [EVENTS_LIST_KEY]: '', [EVENTS_BUS_KEY]: '', [EVENTS_LANES_KEY]: '', [EVENTS_INBOX_KEY]: JSON.stringify(inboxItems.slice(0, EVENTS_MAX)) })
+      await write({ [EVENTS_LIST_KEY]: '', [EVENTS_BUS_KEY]: '', [EVENTS_LANES_KEY]: '', [EVENTS_INBOX_KEY]: JSON.stringify(inboxItems.slice(0, EVENTS_MAX)), [EVENTS_BUGS_KEY]: JSON.stringify(bugItems.slice(0, EVENTS_MAX)) })
       return
     }
     const busDir = await busDirFor($, dataDir, await globalDirOf($, home))
@@ -3859,40 +4019,7 @@ async function refreshEvents($: EngineInterface, cwd: string, snap: MkSnapshot):
       const level = metaOf(row).ack_level
       ackOf.set(row.reply_to, Math.max(ackOf.get(row.reply_to) ?? 0, typeof level === 'number' ? level : 1))
     }
-    const runItems: EventItem[] = cache.rows.filter(row => row.kind !== 'ack').reverse().map((row, idx) => {
-      const meta = metaOf(row)
-      const isBus = row.chan === 'bus'
-      const kind = typeof row.kind === 'string' ? row.kind : 'info'
-      const fromId = typeof row.from_id === 'string' ? row.from_id : ''
-      const toId = typeof row.to_id === 'string' ? row.to_id : ''
-      const task = typeof row.task === 'string' ? row.task : ''
-      const who = fromId && toId ? `${fromId}→${toId}` : (isBus ? fromId || 'orch' : 'run')
-      const lane = task || (fromId.startsWith('p') ? fromId : toId.startsWith('p') ? toId : 'all')
-      const text = typeof row.text === 'string' ? row.text : ''
-      const id = typeof row.id === 'number' ? (isBus ? `m-${row.id}` : `r-${row.id}`) : `ev-${idx}`
-      const t = typeof row.t === 'string' ? row.t : ''
-      return {
-        id,
-        src: isBus ? 'bus' : 'run',
-        t: hhmm(t),
-        ts: Date.parse(t) || undefined,
-        kind,
-        type: kind,
-        who,
-        lane,
-        text: sanitizeText(text, 120),
-        ack: ackOf.get(id) ?? (meta.delivered === true ? 1 : 0),
-        bad: meta.bad === true || kind.startsWith('ring-failed') || meta.delivered === false,
-        reply_to: typeof row.reply_to === 'string' ? row.reply_to : undefined,
-        date: t || undefined,
-        from: fromId || undefined,
-        to: toId || undefined,
-        task: task || undefined,
-        chan: typeof row.chan === 'string' && row.chan !== '' ? row.chan : undefined,
-        by: typeof meta.by === 'string' && meta.by !== '' ? meta.by : undefined,
-        full: fullOf(text),
-      }
-    })
+    const runItems: EventItem[] = cache.rows.filter(row => row.kind !== 'ack').reverse().map((row, idx) => storeEventItem(row, idx, ackOf))
 
     // 2b. Inbox rows (C5): project-wide, no run — read above and merged here.
     // newest first, one list: a run row and an inbox row interleave by their own timestamps
@@ -3925,6 +4052,7 @@ async function refreshEvents($: EngineInterface, cwd: string, snap: MkSnapshot):
       [EVENTS_LIST_KEY]: JSON.stringify({ run: runId, total: cache.total, events: runItems.slice(0, EVENTS_KEEP) }),
       [EVENTS_LANES_KEY]: JSON.stringify(lanesActivity),
       [EVENTS_INBOX_KEY]: JSON.stringify(inboxItems.slice(0, EVENTS_KEEP)),
+      [EVENTS_BUGS_KEY]: JSON.stringify(bugItems.slice(0, EVENTS_KEEP)),
     })
   } catch {
     // safe catch
@@ -3945,7 +4073,9 @@ const parseOr = <T,>(text: string | undefined): T | undefined => {
  *  first, with the inbox channel's own rows (C5, runless) merged in. The fixture is only the
  *  no-run AND no-inbox (offline) view, labelled mock. */
 export function liveEventsView(snap: MkSnapshot, viewState?: Record<string, string>): EventsView {
-  const inbox = parseOr<EventItem[]>(viewState?.[EVENTS_INBOX_KEY]) ?? []
+  // the runless rows: the inbox channel's and the bugs run's, newest first
+  const inbox = [...(parseOr<EventItem[]>(viewState?.[EVENTS_INBOX_KEY]) ?? []), ...(parseOr<EventItem[]>(viewState?.[EVENTS_BUGS_KEY]) ?? [])]
+    .sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0))
   if (snap.run == null) {
     // an Inbox step is an event of the project, not of a run: it shows with no run at all
     if (inbox.length > 0) {
@@ -3988,6 +4118,7 @@ export function liveEventsView(snap: MkSnapshot, viewState?: Record<string, stri
       text: sanitizeText(ev.text ?? '', 120),
       date: ev.t || undefined,
       task: ev.task || undefined,
+      run: snap.run?.id,
       full: fullOf(ev.text ?? ''),
     })),
     lanes: [],
