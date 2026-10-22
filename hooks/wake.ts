@@ -2,7 +2,7 @@
 // transition events; the project DB is the only source (strict types)
 import type { EngineInterface, On, PluginOptions, Timer } from 'claude-code'
 import type { MkWakePending } from '../types'
-import { join, parseJson, sanitizeText } from './data'
+import { isBugsRun, join, parseJson, sanitizeText } from './data'
 import { homeDir, paths, resolveDataDir, sessionCwd } from './paths'
 import { isLaneCwd } from './stop-guard'
 
@@ -284,8 +284,9 @@ async function flushBatch($: EngineInterface): Promise<void> {
     // as well would suppress an unrelated later plain blocked wake for the same task
     // inside the 5-min window (and vice versa the ask key never blocks a plain wake).
     // The ask id carries the run (pend.run): ids repeat across runs, so an id-only key
-    // would let run A's m-1 throttle run B's m-1 for the same task (review LOW 3).
-    const cooldownId = p.askId === undefined ? `${p.task}:${p.to}` : `${p.task}:blocked:${pend.run}:${p.askId}`
+    // would let run A's m-1 throttle run B's m-1 for the same task (review LOW 3). The plain
+    // key carries the run too: a bug task and a plan task may share an id (B1 in run bugs).
+    const cooldownId = p.askId === undefined ? `${p.task}:${p.to}:${pend.run}` : `${p.task}:blocked:${pend.run}:${p.askId}`
     await $.state
       .set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: cooldownId } as const, now)
       .catch(() => {})
@@ -369,7 +370,8 @@ async function readStoreEvents($: EngineInterface, dataDir: string, runId: strin
  *  the reader says the store is MISSING; without it its no-store reply would read as a store with
  *  no active run. The pick is the FIRST active entry of the list ordered by `started` ascending,
  *  i.e. the OLDEST active run; the reader's own `active` field is the newest one (the dashboard's
- *  pick), which would move wake onto a different run of a busy project. */
+ *  pick), which would move wake onto a different run of a busy project. The permanent `bugs` run
+ *  is never the pick: it is always active and usually the oldest, so it would hide every plan run. */
 async function storeProbe($: EngineInterface, dataDir: string): Promise<StoreProbe | undefined> {
   let ran: { exitCode: number; stdout: string }
   try {
@@ -391,7 +393,7 @@ async function storeProbe($: EngineInterface, dataDir: string): Promise<StorePro
   const list = (doc as { runs: unknown[] }).runs
   const first = list.find(r =>
     r !== null && typeof r === 'object' && (r as { status?: unknown }).status === 'active'
-    && typeof (r as { id?: unknown }).id === 'string')
+    && typeof (r as { id?: unknown }).id === 'string' && !isBugsRun((r as { id: string }).id))
   // store: false → no store file at all: nothing to read (activeId undefined).
   // store: true  → the reader answered; an empty list is the end of the poll (activeId null).
   if (doc.store === false) return { store: false, activeId: undefined }
@@ -503,7 +505,7 @@ async function pollEvents($: EngineInterface): Promise<void> {
           const askMatch =
             ev.to === 'blocked' && typeof ev.text === 'string' ? /^bus ask (m-\d+):/.exec(ev.text) : null
           const askId = askMatch?.[1]
-          const throttleKey = askId === undefined ? `${ev.task}:${ev.to}` : `${ev.task}:blocked:${active.id}:${askId}`
+          const throttleKey = askId === undefined ? `${ev.task}:${ev.to}:${active.id}` : `${ev.task}:blocked:${active.id}:${askId}`
           const sentRef = { plugin: 'matrixkoder', key: 'wakeSentAt', id: throttleKey } as const
           const sentRes = await $.state.get(sentRef).catch(() => ({ value: undefined }))
           const lastSent = typeof sentRes.value === 'number' ? sentRes.value : undefined

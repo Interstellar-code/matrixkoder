@@ -4201,7 +4201,7 @@ def cmd_metrics(args):
     store = StoreAdapter(data_dir)
     if run is None:
         active = [r["id"] for r in store.store_select("SELECT id FROM runs WHERE status=? ORDER BY id", ("active",))
-                  if is_valid_id(r.get("id"))]
+                  if is_valid_id(r.get("id")) and not store._mod().is_bugs_run(r.get("id"))]  # bugs-tab
         res = {"ok": True, "run": "*", "runs": [_run_metrics(store, r) for r in active]}
         out(res)
         return res
@@ -6529,7 +6529,15 @@ def _store_self_test_body(mod):
         assert rc_m.returncode == 0, rc_m.stdout
         metrics = json.loads(rc_m.stdout.strip().splitlines()[-1])
         assert metrics["ok"] is True and "latency_p50" in metrics and "obedience" in metrics and "false_stall" in metrics, metrics
-        # metrics without --run: every active run, each equal to its --run output
+        # metrics without --run: every active run, each equal to its --run output; the
+        # permanent bugs run is no active run (bugs-tab)
+        con = mod.open_project(data, data_dir=data)
+        try:
+            con.execute("INSERT INTO runs(id, plan, branch, status, started)"
+                        " VALUES ('bugs', NULL, 'main', 'active', '2026-01-01T00:00:00+00:00')")
+            con.commit()
+        finally:
+            con.close()
         rc_ma = subprocess.run([sys.executable, os.path.abspath(__file__), "metrics", "--data", data],
                                stdout=subprocess.PIPE, text=True)
         assert rc_ma.returncode == 0, rc_ma.stdout

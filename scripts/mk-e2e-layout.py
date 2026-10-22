@@ -1284,7 +1284,7 @@ AUDIT_BAK_PREFIXES = tuple(n + ".bak-" for n in AUDIT_ROOT_STORES)
 AUDIT_PROJECT_FILES = {n + suf for n in AUDIT_PROJECT_STORES for suf in ("", "-wal", "-shm")} | {
                        mkpaths.PROJECT_YAML_NAME, mkpaths.PROJECT_YAML_NAME + ".lock", mkpaths.PROJECT_YAML_NAME + ".bak",
                        ".migrate.json"}
-AUDIT_PROJECT_DIRS = {mkpaths.TARGET_PLANS_DIR, "archive", "runs", "legacy"}   # legacy/ = the user-confirmed `--archive` tarball of the old data dir
+AUDIT_PROJECT_DIRS = {mkpaths.TARGET_PLANS_DIR, "archive", "runs", "legacy", mkpaths.BUGS_DIR}   # legacy/ = the user-confirmed `--archive` tarball of the old data dir; bugs/ = bug draft files
 AUDIT_PLAN_ENTRIES = {"plan.md", "assets", "archive", "runs"}
 # the root store also carries mk-catalog's C8 tables (agents, catalog_user, models) and the user's todos table
 AUDIT_ROOT_CATALOG_TABLES = {"agents", "catalog_user", "models", "todos"}   # optional: allowed when present, never required
@@ -1343,6 +1343,13 @@ def _audit_tree_rules(home):
                     # stray FOLDER name is drift
                     plan_files = _audit_scan(os.path.join(home, rel, "plans", plan))[0]
                     _audit_names(home, f"{rel}/plans/{plan}", plan_files, AUDIT_PLAN_ENTRIES - {"plan.md"}, names)
+            if mkpaths.BUGS_DIR in pdirs:
+                # bug drafts: <slug>.md files and archive/ (imported drafts, also *.md)
+                for sub in (mkpaths.BUGS_DIR, os.path.join(mkpaths.BUGS_DIR, mkpaths.BUGS_ARCHIVE_DIR)):
+                    if os.path.isdir(os.path.join(home, rel, sub)):
+                        b_files = _audit_scan(os.path.join(home, rel, sub))[0]
+                        ok = {mkpaths.BUGS_ARCHIVE_DIR} if sub == mkpaths.BUGS_DIR else set()
+                        _audit_names(home, f"{rel}/{sub}", {n for n in b_files if n.endswith(".md")}, ok, names)
     if mkpaths.TARGET_BUS_DIR in top_dirs:
         bus = mkpaths.TARGET_BUS_DIR
         _, bdirs = _audit_names(home, bus, AUDIT_BUS_FILES, {mkpaths.TARGET_LANES_DIR}, names)
@@ -1793,6 +1800,13 @@ def _audit_mutations():
         with open(os.path.join(f["home"], "notes.txt"), "w") as fh:
             fh.write("x")
 
+    @m("A01", "a non-draft file in a project's bugs folder", "notes.txt")
+    def _(f):
+        bugs = mkpaths.bugs_dir(mkpaths.target_project_dir(f["slug"], f["home"]))
+        os.makedirs(bugs, exist_ok=True)
+        with open(os.path.join(bugs, "notes.txt"), "w") as fh:
+            fh.write("x")
+
     @m("A02", "a missing table in the project DB", "watch_cursors")
     def _(f):
         _drop_table(f, "watch_cursors")
@@ -1957,6 +1971,14 @@ def audit_self_test():
             fh.write(b"old root store")
         rep = do_audit(home)
         _check(rep["ok"], f"the old root store beside the new one fails the audit: {[r for r in rep['rules'] if not r['pass']]}")
+        # (e) bug drafts: bugs/<slug>.md and bugs/archive/<slug>.md
+        bugs = mkpaths.bugs_dir(mkpaths.target_project_dir(f["slug"], home))
+        os.makedirs(mkpaths.bugs_archive_dir(mkpaths.target_project_dir(f["slug"], home)))
+        for p in (os.path.join(bugs, "crash.md"), os.path.join(bugs, mkpaths.BUGS_ARCHIVE_DIR, "old.md")):
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write("+++\ntitle = \"x\"\n+++\n")
+        rep = do_audit(home)
+        _check(rep["ok"], f"bug drafts fail the audit: {[r for r in rep['rules'] if not r['pass']]}")
         _check(_audit_exit(home) == 0, "audit exit code is not 0 with the L10.Y shapes")
     finally:
         shutil.rmtree(f["root"], ignore_errors=True)

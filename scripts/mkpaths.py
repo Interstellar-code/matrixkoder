@@ -83,6 +83,9 @@ SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
 TARGET_BUS_DIR = "bus"
 TARGET_PROJECTS_DIR = "projects"
 TARGET_PLANS_DIR = "plans"
+# bugs-tab DRAFT: <project folder>/bugs/<slug>.md drafts; an imported draft moves to bugs/archive/
+BUGS_DIR = "bugs"
+BUGS_ARCHIVE_DIR = "archive"
 
 
 class Fail(RuntimeError):
@@ -734,6 +737,17 @@ def plan_legacy_files(data, plan, run_ids):
             if os.path.isdir(p):
                 out.append(p)
     return out
+
+
+def bugs_dir(data, home_arg=None):
+    """<project>/bugs — the project's bug draft files (bugs-tab DRAFT); the C2 project folder for a
+    migrated project. Never creates anything."""
+    return os.path.join(project_folder(data, home_arg), BUGS_DIR)
+
+
+def bugs_archive_dir(data, home_arg=None):
+    """<project>/bugs/archive — where an imported bug draft is moved."""
+    return os.path.join(bugs_dir(data, home_arg), BUGS_ARCHIVE_DIR)
 
 
 def plan_archives_dir(data, plan=None):
@@ -1471,6 +1485,8 @@ def self_test():
         _check(plan_dir(data, "p1") == os.path.join(data, "plans", "p1"), plan_dir(data, "p1"))
         _check(plan_archives_dir(data) == os.path.join(data, "plans", "archive"),
                plan_archives_dir(data))
+        _check(bugs_dir(data) == os.path.join(data, "bugs")
+               and bugs_archive_dir(data) == os.path.join(data, "bugs", "archive"), bugs_archive_dir(data))
         _check(watch_cursors(data) == os.path.join(data, CURSORS_NAME), watch_cursors(data))
         _check(usage_ledger() == os.path.join(tmp_home, "usage.json"), usage_ledger())
         _check(nudge_state(data) == os.path.join(data, "nudge-state.json"), nudge_state(data))
@@ -1766,6 +1782,7 @@ def self_test():
         _check(plan_archives_dir(data, "p1") == os.path.join(proj, "plans", "p1", "archive"),
                plan_archives_dir(data, "p1"))
         _check(project_folder(data) == proj, project_folder(data))
+        _check(bugs_archive_dir(data) == os.path.join(proj, "bugs", "archive"), bugs_archive_dir(data))
         # L10.1: the --data form of a MIGRATED project resolves to its C2 folder (fails on the old
         # literal rule); the old folder only on request, which is what mk-migrate's rollback asks for
         _check(project_dir(home_arg=tmp_home, data_dir=data) == proj, project_dir(home_arg=tmp_home, data_dir=data))

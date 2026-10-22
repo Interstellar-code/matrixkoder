@@ -1027,8 +1027,8 @@ test('a still-current transition still wakes after the flush-time status re-read
   await clock.advance(30000) // poll: E4 → stalled and F2 → stalled enter the batch
   await clock.advance(60000) // debounce fires: only F2 still holds stalled
   expect(w.submitted).toEqual(['MatrixKoder: F2 → stalled. Continue the run from its Next action.'])
-  expect(w.store.get('wakeSentAt:F2:stalled')).toBeDefined()
-  expect(w.store.get('wakeSentAt:E4:stalled'), 'no cooldown stamped for the dropped item').toBeUndefined()
+  expect(w.store.get('wakeSentAt:F2:stalled:r1')).toBeDefined()
+  expect(w.store.get('wakeSentAt:E4:stalled:r1'), 'no cooldown stamped for the dropped item').toBeUndefined()
   expect(w.store.get('wakeEventLines:r1')).toBe(3)
   expect(w.store.get('wakePending:')).toMatchObject({ items: [] })
 })
@@ -1683,6 +1683,97 @@ test('store mode: the run and its events come from the store with no file views 
   await clock.advance(30000)
   await clock.advance(60000)
   expect(w.submitted).toEqual(['MatrixKoder: F9 → quota. Continue the run from its Next action.'])
+})
+
+// ---------- BRUN.1: the permanent `bugs` run is never wake's active run ----------
+
+/** storeReader with a real runs list (ordered by `started`, oldest first) and a feed per run. */
+function runsReader(
+  on: On,
+  state: { runs: Array<{ id: string; status: string; started: string }>; rows: Record<string, Record<string, unknown>[]>; tasks: Record<string, string> },
+  seen: string[][],
+): void {
+  const ok = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+  on('process.run', (_$, e) => {
+    const argv = [...e.argv] as string[]
+    seen.push(argv)
+    const run = argv.includes('--run') ? argv[argv.indexOf('--run') + 1] : undefined
+    if (argv.includes('events')) return ok(JSON.stringify({ ok: true, events: state.rows[run ?? ''] ?? [] }))
+    if (argv.includes('run-snapshot')) {
+      const tasks = Object.entries(state.tasks).map(([id, status]) => ({ id, status }))
+      return ok(JSON.stringify({ ok: true, store: true, runs: state.runs, active: null, run: run === undefined ? null : { id: run, status: 'active', stage: 0, tasks } }))
+    }
+    return ok('')
+  })
+}
+
+const BUGS = { id: 'bugs', status: 'active', started: '2026-01-01T00:00:00+00:00' }
+const RUN = (id: string) => ({ id, status: 'active', started: '2026-10-07T16:00:00+02:00' })
+const eventRuns = (seen: string[][]): string[] => seen.filter(a => a.includes('events')).map(a => a[a.indexOf('--run') + 1] ?? '')
+
+test('BRUN.1: storeProbe polls the plan run when the bugs run is older', { options: { wake: true } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const w = wakeWorld(on, { '/data/mk.db': '' }, [], { MATRIXKODER_DATA: '/data' }, '/tmp')
+  const seen: string[][] = []
+  const feed = { runs: [BUGS, RUN('r1')], rows: { bugs: [storeRow(1, 'B1', 'verifying', 'lane-watch')], r1: [storeRow(1, 'F6', 'verifying', 'lane-watch')] }, tasks: { F6: 'verifying' } as Record<string, string> }
+  runsReader(on, feed, seen)
+  await $.session.start(START('/tmp'))
+  await clock.advance(30000)
+  expect(eventRuns(seen), 'only the plan run is read').toEqual(['r1'])
+  expect(w.store.get('wakeEventLines:r1'), 'baseline is on the plan run').toBe(-2)
+  expect(w.store.has('wakeEventLines:bugs')).toBe(false)
+
+  feed.rows.r1 = [...feed.rows.r1, storeRow(2, 'F8', 'stalled', 'lane-watch')]
+  feed.tasks = { F6: 'verifying', F8: 'stalled' }
+  await clock.advance(30000)
+  await clock.advance(30000)
+  await clock.advance(60000)
+  expect(w.submitted).toEqual(['MatrixKoder: F8 → stalled. Continue the run from its Next action.'])
+})
+
+test('BRUN.1: with only the bugs run active there is no active run', { options: { wake: true } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const w = wakeWorld(on, { '/data/mk.db': '' }, [], { MATRIXKODER_DATA: '/data' }, '/tmp')
+  const seen: string[][] = []
+  runsReader(on, { runs: [BUGS], rows: { bugs: [storeRow(1, 'B1', 'verifying', 'lane-watch')] }, tasks: { B1: 'verifying' } }, seen)
+  await $.session.start(START('/tmp'))
+  await clock.advance(30000)
+  await clock.advance(30000)
+  await clock.advance(60000)
+  expect(seen.some(a => a.includes('run-snapshot')), 'the store was asked').toBe(true)
+  expect(eventRuns(seen), 'no feed is read: there is no active run').toEqual([])
+  expect(w.store.has('wakeEventLines:bugs')).toBe(false)
+  expect(w.submitted).toEqual([])
+})
+
+test('BRUN.1: the plain cooldown key carries the run, so the same task id in another run still wakes', { options: { wake: true } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const w = wakeWorld(on, { '/data/mk.db': '' }, [], { MATRIXKODER_DATA: '/data' }, '/tmp')
+  const seen: string[][] = []
+  const feed = { runs: [RUN('r1')], rows: { r1: [storeRow(1, 'F1', 'verifying', 'orchestrator')] } as Record<string, Record<string, unknown>[]>, tasks: {} as Record<string, string> }
+  runsReader(on, feed, seen)
+  await $.session.start(START('/tmp'))
+  await clock.advance(30000) // baseline r1
+
+  feed.rows.r1 = [...(feed.rows.r1 ?? []), storeRow(2, 'B1', 'verifying', 'lane-watch')]
+  feed.tasks = { B1: 'verifying' }
+  await clock.advance(30000)
+  await clock.advance(30000)
+  await clock.advance(60000)
+  expect(w.submitted).toEqual(['MatrixKoder: B1 → verifying. Continue the run from its Next action.'])
+  expect(w.store.get('wakeSentAt:B1:verifying:r1'), 'the stamp names its run').toBeDefined()
+  expect(w.store.has('wakeSentAt:B1:verifying')).toBe(false)
+
+  // r1 ends and r2 starts inside the 5-min cooldown; r2 has its own B1.
+  feed.runs = [RUN('r2')]
+  feed.rows.r2 = [{ ...storeRow(1, 'F1', 'verifying', 'orchestrator'), run: 'r2' }]
+  await clock.advance(30000) // baseline r2
+  feed.rows.r2 = [...feed.rows.r2, { ...storeRow(2, 'B1', 'verifying', 'lane-watch'), run: 'r2' }, { ...storeRow(3, 'F7', 'stalled', 'lane-watch'), run: 'r2' }]
+  feed.tasks = { B1: 'verifying', F7: 'stalled' }
+  await clock.advance(30000)
+  await clock.advance(30000)
+  await clock.advance(60000)
+  expect(w.submitted[1], "r1's B1 stamp does not throttle r2's B1").toBe('MatrixKoder: B1 → verifying, F7 → stalled. Continue the run from its Next action.')
 })
 
 // ---------- R2: the REAL no-store reply, captured off the real command ----------

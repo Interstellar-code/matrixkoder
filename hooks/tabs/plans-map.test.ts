@@ -150,6 +150,21 @@ test('plansFromOverview keeps only the active project\'s plans', () => {
   expect(other.plans.map(p => p.id)).toEqual(['beta-plan'])
 })
 
+test('BRUN.1: the permanent bugs row is never a plan or an ongoing run; other rows are unchanged', () => {
+  // The overview holds one plan_summary row per project with plan = live_run = "bugs".
+  const bugs = { project: 'alpha', plan: 'bugs', title: 'Bugs', status: 'running', live_run: 'bugs', counts: { building: 2 } }
+  const withBugs = { ...TWO_PROJECTS, plans: [bugs, ...TWO_PROJECTS.plans] }
+  expect(plansFromOverview(withBugs)).toEqual(plansFromOverview(TWO_PROJECTS))
+  const active = plansFromOverview(withBugs, '/home/mk/projects/alpha')
+  expect(active.plans.map(p => p.id)).toEqual(['alpha-plan'])
+  expect(active.runs).toEqual([])
+
+  const live = { id: 'p', title: 'T', status: 'running', created: 'c', runs: ['p-r1'], live_run: 'p-r1', counts: { building: 1 } }
+  const listed = plansFromReply({ ok: true, plans: [{ ...live, id: 'bugs', runs: ['bugs'], live_run: 'bugs' }, live] })
+  expect(listed).toEqual(plansFromReply({ ok: true, plans: [live] }))
+  expect(listed.runs.map(r => r.id)).toEqual(['p-r1'])
+})
+
 test('Z20.4a: an empty or missing activeDir keeps every plan (null, not an empty filter)', () => {
   expect(plansFromOverview(TWO_PROJECTS, null).plans.map(p => p.id)).toEqual(['alpha-plan', 'beta-plan'])
   // a reply whose projects lists nothing is a pre-projects root: no filter

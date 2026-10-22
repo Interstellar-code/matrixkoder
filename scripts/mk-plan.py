@@ -78,6 +78,8 @@ REVIEWS = ("light", "standard", "data-loss")
 PLAN_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,40}")
 PHASE_ID_RE = re.compile(r"[A-Z][A-Z0-9]{0,7}")
 RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+# bugs-tab: plan id `bugs` would collide with the permanent bugs run's plan_summary row
+RESERVED_PLAN_ERR = "plan id 'bugs' is reserved for the project's bugs run: pick another plan id"
 ROUTE_RE = re.compile(r"\S+( \S+){1,2}")  # "<agent> <model> [<effort>]"; "" means Jev
 TOP_KEYS = ("plan", "status", "runs", "gates", "final_gate", "phase")  # header keys consumed by C2
 FINAL_EVERY = ("merge", "phase", "run_end")  # when a [[final_gate]] runs (F.2)
@@ -517,6 +519,8 @@ def check_plan(header, out, body=None):
 
     if str(out["plan"]) and not PLAN_ID_RE.fullmatch(str(out["plan"])):
         warnings.append(f"plan id {out['plan']!r} does not match [a-z0-9][a-z0-9-]{{0,40}}")
+    if _mkdb().is_bugs_run(str(out["plan"])):
+        errors.append(RESERVED_PLAN_ERR)
 
     # F.0 gate shape: a plain string gate is manual (never run, never blocks), a
     # [gates.<name>] table is runnable. Only its shape is checked here — running it is the
@@ -1965,6 +1969,8 @@ def import_file(path, data, home, dry_run=False):
     if not plan_id:
         raise Fail(["the header has no plan id (C4: only a +++ file with plan = \"<id>\" imports)"],
                    code=0, reason="no plan id in the header")
+    if _mkdb().is_bugs_run(plan_id):
+        raise Fail([RESERVED_PLAN_ERR])
     if inbox and inbox[1] != plan_id:
         raise Fail([f"inbox folder {inbox[1]!r} must equal the header plan id {plan_id!r}"],
                    code=0, reason="inbox folder name differs from the plan id")
@@ -4333,6 +4339,20 @@ def self_test():
 
         # STORE: versioned plan_items, status/runs in the store, item set
         store_self_test(tmp, mk, write, plan_text, phase, task, db, mkpaths)
+
+        # bugs-tab: plan id `bugs` is reserved for the permanent bugs run — check and import refuse it
+        bp = write("bugs-plan.md", plan_text(plan='plan = "bugs"', phases=phase("P1", tasks=task("P1.1")) + "\n"))
+        got = mk("check", bp, code=2)
+        assert RESERVED_PLAN_ERR in got["errors"], got
+        bdata = os.path.join(tmp, "bugs-plan-data")
+        db.open_project(home, data_dir=bdata).close()  # a real store: the refusal is not "no store"
+        got = mk("import", bp, "--data", bdata, "--home", home, code=2)
+        assert RESERVED_PLAN_ERR in got["errors"], got
+        bcon = db.open_project(home, data_dir=bdata)
+        try:
+            assert bcon.execute("SELECT COUNT(*) c FROM plans").fetchone()["c"] == 0, "bugs plan imported"
+        finally:
+            bcon.close()
 
         print("mk-plan self-test ok")
     finally:

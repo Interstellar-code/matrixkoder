@@ -17,6 +17,10 @@ Legacy projects whose runs live only in files migrate through mk-store-import.py
       again first"). The plan gets `set --status running` + `add-run` by id, then phase tasks
       (plan_phase, route, lane_group, reviewer) and child tasks (plan_task, --parent) are created
       through the task-add path. A run that already holds a plan file path keeps reading the file.
+  run init --bugs-run --branch B [--feature F]
+      bugs-tab: create the project's permanent `bugs` run (no plan; feature defaults to "bugs").
+      `--id bugs` is refused without it; re-running it when the run exists is an ok no-op. The
+      bugs run is never a default --run target and `run set --status`/`run archive` refuse it.
   plan sync [--run ID] [--apply] — diff the run's plan against its tasks; the dry run changes
       nothing: new phase/task → added (the add path), changed title/wave/owned/deps on a
       planned|routed task → updated, on a started task → warning only, removed → warning (never
@@ -197,7 +201,9 @@ TASK_FILE_KEYS = ("wave", "ready", "workspace", "last_commit", "gates", "rounds"
                   # `risk` under the name mkdb._task_risk reads (derived risk = base + open reasons).
                   "gate", "manual", "critical", "base_risk", "acceptance_lines",
                   # C1: the plan's optional plain-English description (task and subtask only)
-                  "description")
+                  "description",
+                  # bugs-tab: mk-bug.py's bug metadata dict on a bug row; listed so a load+save keeps it
+                  "bug")
 # run-level fields the runs table has no column for; they live in the runs.extra_json column.
 # `plan` (the file path) and `plan_id` ride here, not the runs.plan column: that column holds
 # the plan id for a plan-tool run and the bare path for a legacy one, so it cannot carry both. `task_order` is the task-add order (the rows store parent-before-child, which is not that order).
@@ -443,7 +449,11 @@ class Store:
 
     def load(self, rid=None, task=None):
         if rid is None:
-            active = [r["id"] for r in self.index() if r.get("status") == "active"]
+            # bugs-tab: the permanent bugs run is never a default target; name it with --run, or
+            # name a task only it owns (a plan run that owns the same id wins)
+            act = [r["id"] for r in self.index() if r.get("status") == "active"]
+            bugs = [r for r in act if self.db().is_bugs_run(r)]
+            active = [r for r in act if r not in bugs]
 
             def owns(r):  # a corrupt sibling must not crash the pick
                 try:
@@ -451,8 +461,8 @@ class Store:
                 except Fail:
                     return False
                 return any(t.get("id") == task for t in src.get("tasks") or [] if isinstance(t, dict))
-            if len(active) > 1 and task:  # several active runs: the one that owns the task wins
-                owners = [r for r in active if owns(r)]
+            if task and (len(active) > 1 or bugs):  # several active runs: the one that owns the task wins
+                owners = [r for r in active if owns(r)] or [r for r in bugs if owns(r)]
                 active = owners if len(owners) == 1 else active
             if len(active) != 1:
                 raise Fail(f"{len(active)} active runs {active}; pass --run/--id")
@@ -536,14 +546,15 @@ class Store:
             hit = row["id"] if row else None
         return (rid + ":" if rid else "") + (hit or did)
 
-    def active_runs(self, run):
+    def active_runs(self, run, skip_bugs=False):
         """-> ([run, *other active runs], warnings): the given run first, the other active runs
         loaded from the store. An unreadable or wrong-shape sibling is skipped and named in
-        warnings, never fatal. L4: no runs/<id>/run.json is read."""
+        warnings, never fatal. L4: no runs/<id>/run.json is read. skip_bugs drops the bugs run."""
         others, warnings = [], []
         for r in self.index():
             rid = r.get("id")
-            if r.get("status") != "active" or rid in (None, run.get("id")):
+            if r.get("status") != "active" or rid in (None, run.get("id")) or (
+                    skip_bugs and self.db().is_bugs_run(rid)):
                 continue
             try:
                 x = self.load_store(rid)
@@ -578,7 +589,7 @@ class Store:
         and their boards show "blocks" markers. An unusable sibling is skipped and warned. -> warnings"""
         # ponytail: every add/set re-renders every other active run, each render re-reading them
         # all — ~N² in active runs; a per-command {rid: run} cache when that ever shows up
-        runs, warnings = self.active_runs(run)
+        runs, warnings = self.active_runs(run, skip_bugs=True)  # bugs-tab: the bugs run is no sibling plan run
         for o in runs[1:]:
             try:
                 if self.refresh_ready(o, by):
@@ -1639,6 +1650,15 @@ def cmd_run(a, st):
     if a.action == "list":
         return {"ok": True, "runs": st.index()}
     if a.action == "init":
+        bugs = st.db().is_bugs_run
+        if getattr(a, "bugs_run", False):  # bugs-tab: the permanent bugs run
+            if a.run and not bugs(a.run):
+                raise Fail(f"--bugs-run creates run {st.db().BUGS_RUN!r}, not {a.run!r}")
+            if a.plan:
+                raise Fail("--bugs-run takes no --plan: the bugs run has no plan")
+            a.run, a.feature = st.db().BUGS_RUN, a.feature or "bugs"
+        elif bugs(a.run):
+            raise Fail(f"run id {a.run!r} is reserved for the bugs run: use run init --bugs-run")
         rid = check_id(a.run, "run id")
         if not (a.feature and a.branch):
             raise Fail("run init needs --id --feature --branch")
@@ -1661,9 +1681,14 @@ def cmd_run(a, st):
             st.repair()
             con = st.store_open()
             try:
-                exists = con.execute("SELECT 1 FROM runs WHERE id=?", (rid,)).fetchone()
+                exists = con.execute("SELECT status FROM runs WHERE id=?", (rid,)).fetchone()
             finally:
                 con.close()
+            if exists and bugs(rid) and exists["status"] != "active":
+                raise Fail(f"run {rid} exists with status {exists['status']!r}, not active: "
+                           f"run set --id {rid} --status active")
+            if exists and bugs(rid):  # bugs-tab: re-running --bugs-run is an ok no-op
+                return {"ok": True, "run": st.load(rid), "existed": True}
             if exists:
                 raise Fail(f"run {rid} exists")
             cur = None
@@ -1740,6 +1765,10 @@ def cmd_run(a, st):
     with st.locked():
         st.repair()
         run = st.load(a.run)
+        if st.db().is_bugs_run(run["id"]) and (a.action == "archive" or (a.action == "set" and (
+                (a.status and a.status != "active") or a.plan_id is not None))):
+            raise Fail(f"run {run['id']} is the permanent bugs run: it is never closed, archived "
+                       "or linked to a plan")
         if a.action == "set":
             if a.next is None and a.status is None and a.plan_id is None:
                 raise Fail("run set needs --next, --status and/or --plan-id")
@@ -3729,6 +3758,8 @@ def build_parser():
     r = run.choices["init"]
     r.add_argument("--feature"), r.add_argument("--branch"), r.add_argument("--plan")
     r.add_argument("--force", action="store_true")  # run init --plan: init an unapproved plan
+    r.add_argument("--bugs-run", action="store_true",
+                   help="create the project's permanent bugs run (id bugs, no plan); idempotent")
     r.add_argument("--version", type=int, default=None,
                    help="run init --plan <id>: the stored plan version to copy (default: latest approved)")
     run.choices["set"].add_argument("--next")
@@ -5702,10 +5733,79 @@ def self_test():
         print("mk-state gate-run self-test ok")
         run_store_self_test(tmp, env)
         print("mk-state run-store self-test ok")
+        bugs_run_self_test(tmp, env)
+        print("mk-state bugs-run self-test ok")
         # R1.2: the mkdb write guard refuses the real home from this suite too.
         _mkdb().selftest_guard_probe(tmp_home)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def bugs_run_self_test(tmp, env):
+    """bugs-tab BRUN.1: `--id bugs` is reserved for `run init --bugs-run` (idempotent, no plan);
+    the bugs run is never the default --run target nor a sibling active run, and it is never
+    closed or archived. Every case fails on the code before BRUN.1."""
+    H = env["MK_HOME"]
+    data = os.path.join(tmp, "bugs-data")
+    os.makedirs(data)
+    _mkdb().open_project(H, STORE_PROJECT_FALLBACK, data_dir=data).close()
+
+    def st(*args, code=0):
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), *args, "--data", data],
+                           capture_output=True, text=True, env=env, cwd=tmp, timeout=300)
+        lines = r.stdout.strip().splitlines()
+        assert len(lines) == 1 and r.returncode == code, (args, r.returncode, r.stdout, r.stderr)
+        return json.loads(lines[0])
+
+    out = st("run", "init", "--id", "bugs", "--feature", "B", "--branch", "main", code=2)
+    assert "reserved" in out["error"], out
+    out = st("run", "init", "--id", "BUGS", "--feature", "B", "--branch", "main", code=2)
+    assert "reserved" in out["error"], out
+    assert "--plan" in st("run", "init", "--bugs-run", "--branch", "main", "--plan", "p", code=2)["error"]
+    assert "not 'x1'" in st("run", "init", "--bugs-run", "--id", "x1", "--branch", "main", code=2)["error"]
+    out = st("run", "init", "--bugs-run", "--branch", "main")
+    assert out["run"]["id"] == "bugs" and out["run"]["feature"] == "bugs" and not out.get("existed"), out
+    assert not out["run"].get("plan_id") and not out["run"].get("plan"), out
+    again = st("run", "init", "--bugs-run", "--branch", "main")
+    assert again["ok"] and again["existed"] and again["run"]["id"] == "bugs", again
+    # only the bugs run is active: a run-less write is "0 active runs", never a silent bugs target
+    out = st("task", "add", "--root", "--id", "X1", "--title", "x", code=2)
+    assert "0 active runs" in out["error"], out
+    assert st("task", "add", "--root", "--id", "B1", "--title", "bug one", "--run", "bugs")["ok"]
+    st("run", "init", "--id", "r1", "--feature", "F", "--branch", "mk/r1")
+    st("task", "add", "--root", "--id", "T1", "--title", "t")  # beside bugs: lands in r1
+    s = Store(data)
+    assert any(t["id"] == "T1" for t in s.load("r1")["tasks"]), "run-less task add missed r1"
+    # the bugs run stays a sibling for overlap warnings and markers, never for refresh_others
+    assert [r["id"] for r in s.active_runs(s.load("r1"))[0]] == ["r1", "bugs"], "bugs run not a sibling"
+    assert [r["id"] for r in s.active_runs(s.load("r1"), skip_bugs=True)[0]] == ["r1"]
+    rendered = []
+    s.render = lambda o: rendered.append(o["id"])
+    s.refresh_others(s.load("r1"))
+    assert "bugs" not in rendered, rendered
+    assert st("task", "add", "--root", "--id", "B2", "--title", "b2", "--owned", "src/x.py", "--run", "bugs")["ok"]
+    out = st("task", "add", "--root", "--id", "T2", "--title", "t2", "--owned", "src/x.py")
+    assert any("bugs:B2" in w for w in out.get("warnings") or []), out
+    # a task only the bugs run owns picks bugs; a plan run that owns the same id wins
+    assert st("task", "get", "B1")["task"]["title"] == "bug one", "named bug task missed the bugs run"
+    st("task", "add", "--root", "--id", "B1", "--title", "plan b1", "--run", "r1")
+    assert st("task", "get", "B1")["task"]["title"] == "plan b1", "plan run lost to the bugs run"
+    for args in (["run", "set", "--id", "bugs", "--status", "done"], ["run", "archive", "bugs"],
+                 ["run", "set", "--id", "bugs", "--plan-id", "p1"]):
+        assert "never closed" in st(*args, code=2)["error"], args
+    assert not Store(data).load("bugs").get("plan_id"), "the bugs run linked to a plan"
+    assert st("run", "set", "--id", "bugs", "--status", "active")["run"]["status"] == "active"
+    assert Store(data).load("bugs")["status"] == "active", "the bugs run left active"
+    con = _mkdb().open_project(H, STORE_PROJECT_FALLBACK, data_dir=data)
+    try:  # a non-active bugs run: --bugs-run fails loud, never a silent existed:true
+        con.execute("UPDATE runs SET status='paused' WHERE id='bugs'")
+        con.commit()
+        out = st("run", "init", "--bugs-run", "--branch", "main", code=2)
+        assert "not active" in out["error"], out
+        con.execute("UPDATE runs SET status='active' WHERE id='bugs'")
+        con.commit()
+    finally:
+        con.close()
 
 
 def reconcile_self_test(tmp, env):

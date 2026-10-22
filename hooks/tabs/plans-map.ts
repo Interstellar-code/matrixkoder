@@ -1,4 +1,5 @@
 // Pure mappers from mkdb plans JSON to the Plan tab view types. No I/O.
+import { isBugsRun } from '../data'
 import type { PlanRow, RunRow } from './plans'
 import type { PlanPhase, PlanRoute, PlanSub, PlanTask, PlanView } from './plan'
 
@@ -312,6 +313,7 @@ export function plansFromReply(reply: unknown): { plans: PlanRow[]; runs: RunRow
   if (!isRecord(reply) || !Array.isArray(reply.plans)) return { plans, runs }
   for (const raw of reply.plans) {
     if (!isRecord(raw) || typeof raw.id !== 'string') continue
+    if (isBugsRun(raw.id)) continue // the permanent bugs run's row is not a plan
     const live = typeof raw.live_run === 'string' && raw.live_run !== '' ? raw.live_run : null
     const row: PlanRow = {
       id: raw.id,
@@ -373,6 +375,7 @@ export function plansFromOverview(reply: unknown, activeDir?: string | null): { 
   const wanted = activeSlugs(reply, activeDir)
   for (const raw of reply.plans) {
     if (!isRecord(raw) || typeof raw.plan !== 'string' || raw.plan === '') continue
+    if (isBugsRun(raw.plan)) continue // the permanent bugs run's row is not a plan
     const project = str(raw.project)
     if (wanted != null && !wanted.has(project)) continue
     const live = typeof raw.live_run === 'string' && raw.live_run !== '' ? raw.live_run : null

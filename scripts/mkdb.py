@@ -56,6 +56,16 @@ COLUMNS = {"planned": "Backlog", "routed": "Backlog", "ready": "Ready",
            "merged": "Done", "qa": "Done", "done": "Done"}
 ATTENTION = ("rework", "blocked", "stalled", "quota", "provider", "paused")
 ROUTE_KEYS = ("agent", "model", "effort")
+# bugs-tab: each project store holds one PERMANENT run with this id (status active, plan NULL,
+# never closed). A bug is a top-level row in it. Every "pick the active run" reader skips it.
+BUGS_RUN = "bugs"
+
+
+def is_bugs_run(run_id):
+    """True when run_id names the permanent bugs run (case-insensitive)."""
+    return isinstance(run_id, str) and run_id.lower() == BUGS_RUN
+
+
 # shortcut: the synced-folder check is a path-string heuristic, not a mount probe. It catches the
 # macOS iCloud container ("Mobile Documents"), the CloudStorage symlink tree, Dropbox, and anything
 # under /Volumes (network shares and most external disks). It misses a custom sync root with none
@@ -839,6 +849,13 @@ def _plan_summary_values(con):
         obj = _plan_obj(con, row)
         out.append((row["id"], obj["title"], obj["status"],
                     json.dumps(obj["counts"], sort_keys=True), obj["live_run"]))
+    # bugs-tab: the permanent bugs run has no plans row but keeps one overview row; its counts
+    # are the bugs themselves (top-level rows), not their tasks.
+    if con.execute("SELECT 1 FROM runs WHERE id=?", (BUGS_RUN,)).fetchone():
+        counts = {}
+        for r in con.execute("SELECT status FROM tasks WHERE run=? AND parent IS NULL", (BUGS_RUN,)):
+            counts[r["status"]] = counts.get(r["status"], 0) + 1
+        out.append((BUGS_RUN, "Bugs", "running", json.dumps(counts, sort_keys=True), BUGS_RUN))
     return out
 
 
@@ -2081,7 +2098,8 @@ def run_snapshot(home, project=None, run=None, data_dir=None):
     when it exists — including when it holds no run. A named run that is not there is a Fail
     (exit 2), the same error shape as the other subcommands. Without --run the run is the
     newest active one (runs.status='active', newest `started` first — the pane's own active-run
-    order), or null when no run is active.
+    order), or null when no run is active. The permanent bugs run is never that default; it
+    stays in `runs` and an explicit run="bugs" still reads it.
     """
     con, store = _store_open(home, project, data_dir)
     if con is None:
@@ -2096,7 +2114,8 @@ def run_snapshot(home, project=None, run=None, data_dir=None):
             docs[r["id"]] = doc
             runs.append({"id": r["id"], "feature": doc.get("feature"), "status": r["status"],
                          "started": r["started"], "ended": r["ended"], "plan": r["plan"]})
-        active = next((r["id"] for r in reversed(runs) if r["status"] == "active"), None)
+        active = next((r["id"] for r in reversed(runs)
+                       if r["status"] == "active" and not is_bugs_run(r["id"])), None)
         want = run or active
         if run and not any(r["id"] == run for r in runs):
             raise Fail(f"no run {run!r} in {_store_path(home, project, data_dir)}")
@@ -3380,6 +3399,7 @@ def self_test():
         _run_snapshot_migrated(home)
         _run_snapshot_no_store(home)
         _run_snapshot_zero_runs(home)
+        _bugs_run(home)
         _plans_timeline_migrated(home)
         _plans_timeline_premigration(home)
         _plans_timeline_no_store(home)
@@ -6775,6 +6795,50 @@ def _run_snapshot_zero_runs(home):
            f"the zero-run reply is wrong: {got}")
     _check(_cli(["run-snapshot", "--json", "--home", home, "--data", data]) == got,
            "cli run-snapshot on a store with no run")
+
+
+def _bugs_run(home):
+    """bugs-tab BRUN.1: the permanent bugs run is never the default active run, and it keeps
+    one plan_summary row counted over its top-level rows; catch_up reaches a fixed point."""
+    _check(is_bugs_run("bugs") and is_bugs_run("BUGS") and not is_bugs_run("bugs-1")
+           and not is_bugs_run(None), "is_bugs_run")
+    data = os.path.join(home, "bugsrun")
+    con = open_project(home, data_dir=data)
+    try:
+        con.execute("INSERT INTO runs(id, plan, branch, status, started)"
+                    " VALUES ('bugs', NULL, 'main', 'active', '2026-01-01T00:00:00+00:00')")
+        con.commit()
+        add_task(con, "bugs", "B1", "phase", title="Bug one")
+        add_task(con, "bugs", "B2", "phase", title="Bug two", status="building")
+        add_task(con, "bugs", "B1.1", "task", title="fix", parent="B1")
+        add_task(con, "bugs", "B1.2", "task", title="test", parent="B1")
+    finally:
+        con.close()
+    only = run_snapshot(home, data_dir=data)
+    _check(only["active"] is None and only["run"] is None, f"bugs run picked as active: {only}")
+    _check([r["id"] for r in only["runs"]] == ["bugs"], f"bugs run left out of runs: {only['runs']}")
+    named = run_snapshot(home, run="bugs", data_dir=data)
+    _check(named["run"] and named["run"]["id"] == "bugs", "explicit run=bugs not returned")
+    con = open_project(home, data_dir=data)
+    try:
+        # the plan run is OLDER than bugs, so a newest-active pick would land on bugs
+        con.execute("INSERT INTO runs(id, plan, branch, status, started)"
+                    " VALUES ('r-p', 'p', 'mk/p', 'active', '2025-12-01T00:00:00+00:00')")
+        con.commit()
+        vals = {v[0]: v for v in _plan_summary_values(con)}
+    finally:
+        con.close()
+    both = run_snapshot(home, data_dir=data)
+    _check(both["active"] == "r-p" and both["run"]["id"] == "r-p", f"plan run not picked: {both}")
+    _check(vals.get("bugs") == ("bugs", "Bugs", "running",
+                                json.dumps({"building": 1, "planned": 1}, sort_keys=True), "bugs"),
+           f"bugs plan_summary row: {vals}")
+    _check(catch_up(home, "bugsrun", data_dir=data) == 1, "first catch_up did not write the bugs row")
+    _check(catch_up(home, "bugsrun", data_dir=data) == 0, "second catch_up wrote again")
+    transition(home, "bugsrun", "bugs", "B1", "done", data_dir=data)
+    row = _plan_summary_snapshot(home, "bugsrun")["bugs"]
+    _check(json.loads(row[2]) == {"building": 1, "done": 1}, f"transition left the bugs row stale: {row}")
+    _check(catch_up(home, "bugsrun", data_dir=data) == 0, "catch_up after a transition not idempotent")
 
 
 def _task_type_default(home):
