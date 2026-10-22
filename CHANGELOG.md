@@ -2,6 +2,11 @@
 
 All notable changes to this project. Format: Keep a Changelog; versions: SemVer.
 
+## [0.7.5] - 2026-10-22
+
+### Fixed
+- **run:** say when a closing run is not in its plan's runs list (114d6f3)
+
 ## [0.7.4] - 2026-10-22
 
 ### Added
