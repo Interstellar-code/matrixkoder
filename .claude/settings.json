@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(jq *)",
+      "Bash(tsc -p . --noEmit)",
+      "Bash(claude plugin validate *)",
+      "Bash(pgrep *)",
+      "Bash(claude plugin list *)",
+      "Bash(ps *)",
+      "mcp__mnemosyne__memory_recall",
+      "Bash(sysctl vm.swapusage)",
+      "Bash(lsof *)",
+      "mcp__plugin_context-mode_context-mode__ctx_search"
+    ]
+  }
+}
