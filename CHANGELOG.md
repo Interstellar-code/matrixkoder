@@ -2,6 +2,24 @@
 
 All notable changes to this project. Format: Keep a Changelog; versions: SemVer.
 
+## [0.7.4] - 2026-10-22
+
+### Added
+- **inbox:** the Inbox tab in the dashboard with its settings and docs (f85c795)
+- **events:** an inbox source for plan inbox steps (3c582e5)
+- **store:** versioned plan items; the plan file is a source only until import (f1050d5)
+- **inbox:** mk-inbox.py lists, classifies, imports, archives and deletes plan files (fd20380)
+- **plan:** the check reports each template section and classes a file (f49c5f0)
+- **inbox:** the Inbox tab render, filter chips and file cards (d71058e)
+
+### Fixed
+- **inbox:** Open stays inside the inbox and ids pass after -- (7b58c11)
+- **inbox:** the mk-inbox self-test reads its plans from scripts/fixtures (521d492)
+
+### Other
+- **claude:** project read-only permission allowlist (ab37b59)
+- **run:** a run starts from a stored plan version and never reads the plan file (4de4107)
+
 ## [0.7.3] - 2026-10-21
 
 ### Added

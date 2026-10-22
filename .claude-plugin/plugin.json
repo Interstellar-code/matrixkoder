@@ -1,6 +1,6 @@
 {
   "name": "matrixkoder",
-  "version": "0.7.3",
+  "version": "0.7.4",
   "description": "Orchestrate multi-phase builds across Claude Code, Codex, OpenCode and AGY in herdr worktree lanes, with usage-aware routing, durable run state and an in-session dashboard.",
   "author": {
     "name": "Interstellar-code"
