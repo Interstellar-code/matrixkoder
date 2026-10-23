@@ -11,6 +11,7 @@ severity = "med"              # high|med|low, default med
 found_in = ""                 # version, commit or branch where it shows
 area = ""                     # the part of the product, e.g. "plan check"
 labels = []                   # list of strings, e.g. ["regression"]
+links = []                    # list of strings, e.g. ["todo #22", "plan-done-warn"]
 source = ""                   # where the report came from: a todo, an issue link, a run id
 
 [[task]]                      # optional, one block per task (B<n>.1, B<n>.2 …); a bug may start with none

@@ -3895,8 +3895,10 @@ function storeEventItem(row: Record<string, unknown>, idx: number, ackOf: Readon
 }
 
 /** `mkdb.py events --run bugs --json`: the project's permanent bugs run, read like the inbox rows (with or
- *  without a live run) under its own `--since` cursor, so the Events tab's Bug segment fills. Never throws. */
-async function loadBugEvents($: EngineInterface, dataDir: string): Promise<EventItem[]> {
+ *  without a live run) under its own `--since` cursor, so the Events tab's Bug segment fills. The run is
+ *  created by the first `mk-bug.py` write: until the snapshot's runs list names it, nothing is spawned. Never throws. */
+async function loadBugEvents($: EngineInterface, dataDir: string, runs: readonly { id: string }[]): Promise<EventItem[]> {
+  if (!runs.some(r => isBugsRun(r.id))) return []
   const cache = bugEventsCache ?? { since: 0, rows: [] }
   bugEventsCache = cache
   try {
@@ -3940,7 +3942,7 @@ async function refreshEvents($: EngineInterface, cwd: string, snap: MkSnapshot):
     // an inbox row has no run (C5), so the inbox channel is read whatever the run is doing
     const inboxItems = await loadInboxEvents($, dataDir)
     // the bugs run never closes and is never the live run: its rows are read like the inbox's
-    const bugItems = await loadBugEvents($, dataDir)
+    const bugItems = await loadBugEvents($, dataDir, snap.runs)
     // no active run: there is no run feed and no bus of this run's, so only the inbox rows stand
     if (snap.run == null) {
       eventsCache = null

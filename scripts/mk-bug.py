@@ -4,9 +4,9 @@
   list [--status WORD] [--kind K]
   show <id>
   new --title=T [--kind=K] [--severity=S] [--description=D] [--area=A] [--found-in=F] [--source=S]
-      [--steps=X] [--expected=X] [--actual=X] [--labels=a,b]
+      [--steps=X] [--expected=X] [--actual=X] [--labels=a,b] [--links=a,b]
   set <id> [--status=WORD] [--kind=K] [--severity=S] [--title=T] [--description=D] [--area=A]
-      [--found-in=F] [--source=S] [--steps=X] [--expected=X] [--actual=X] [--labels=a,b] [--assignee=X]
+      [--found-in=F] [--source=S] [--steps=X] [--expected=X] [--actual=X] [--labels=a,b] [--links=a,b] [--assignee=X]
   close <id> [--wontfix]  |  reopen <id>  |  delete <id>
   task add <bug id> --title=T [--acceptance=A]
   task set <task id> [--status=STATUS] [--title=T] [--acceptance=A]
@@ -240,12 +240,12 @@ def _locked(ctx, fn):
 
 
 def _write(ctx, tid, cols=None, mutate=None):
-    """Title/acceptance columns and/or extra_json.bug of one row, under mk-state's lock. Never a
+    """Title/acceptance/verdict columns and/or extra_json.bug of one row, under mk-state's lock. Never a
     status: those go through mk-state. mutate(meta) edits extra_json.bug as read INSIDE the lock, so
     two concurrent writers never drop each other's fields; a row out of done loses wontfix. A changed
     title/acceptance logs a decision event with the old and new value, as mk-state task set does."""
     def go(con):
-        row = con.execute("SELECT title, acceptance, status, extra_json FROM tasks WHERE run=? AND id=?",
+        row = con.execute("SELECT title, acceptance, status, verdict, extra_json FROM tasks WHERE run=? AND id=?",
                           (BUGS, tid)).fetchone()
         if row is None:
             raise Fail(f"no task {tid}")
@@ -337,8 +337,10 @@ def _meta_changes(a, meta):
         v = getattr(a, k, None)
         if v is not None:
             meta[k] = v
-    if a.labels is not None:  # a --labels text, or a draft's list
-        meta["labels"] = _labels(a.labels) if isinstance(a.labels, str) else list(a.labels)
+    for k in ("labels", "links"):
+        v = getattr(a, k, None)
+        if v is not None:  # a --labels / --links text, or a draft's list
+            meta[k] = _labels(v) if isinstance(v, str) else list(v)
     return meta
 
 
@@ -446,6 +448,10 @@ def cmd_set(ctx, a):
     # a word the bug already shows is a no-op; otherwise only a different task status is written
     if a.status is not None and bug["status"] != a.status and STATUS_OF[a.status] != bug["task_status"]:
         _set_status(ctx, a.id, STATUS_OF[a.status])
+    if a.status in ("open", "fixing") and bug["status"] != a.status:
+        row = _task_obj(ctx, a.id)  # a non-approve verdict alone keeps the word at needs: clear it
+        if row["verdict"] and word_of(row["status"], False, row["verdict"]) != a.status == word_of(row["status"]):
+            cols = {**(cols or {}), "verdict": None}
 
     def mutate(meta):  # on the row as read under the lock: a concurrent set keeps its own fields
         _meta_changes(a, meta)
@@ -469,7 +475,7 @@ def cmd_reopen(ctx, bid):
 
 # tables whose rows belong to one task of a run: a deleted bug takes its rows along. Kept: events
 # and change_log (the history; the note event also keeps the id from being reused). reconcile_due is
-# keyed by run + scope, not by task, so it holds nothing of one bug.
+# keyed by run + scope, not by task, so it holds nothing of one bug. watch_cursors rows go too (below).
 TASK_TABLES = ("tasks", "artifacts", "evidence", "risk_reasons")
 
 
@@ -491,6 +497,8 @@ def cmd_delete(ctx, bid):
         for table in TASK_TABLES:
             key = "id" if table == "tasks" else "task"
             con.execute(f"DELETE FROM {table} WHERE run=? AND ({key}=? OR {key} LIKE ?)", like)
+        # watch_cursors is keyed "<run>|<task>"; waits is keyed by run + question (no task column)
+        con.execute("DELETE FROM watch_cursors WHERE key=? OR key LIKE ?", (f"{BUGS}|{bid}", f"{BUGS}|{bid}.%"))
         mkdb._change_log(con, BUGS, bid)
     _locked(ctx, go)
     ctx.refresh()
@@ -674,10 +682,13 @@ def cmd_dispatch(ctx, a):
         prior = con.execute("SELECT round FROM tasks WHERE run=? AND id=?", (BUGS, tid)).fetchone()["round"] or 0
     finally:
         con.close()
-    if prior > 0:
-        raise Fail(f"task {tid} is at round {prior} with no lane: an earlier dispatch stopped part way (its error "
-                   "named what was done). Finish that by hand (mk-state task check, then mk-lane.py acquire "
-                   f"--run {BUGS} --task {tid} from the repo), never a second round")
+    # a reopened task (planned/routed/ready, its last brief on disk, lane freed) takes a fresh round;
+    # only a dispatch that stopped part way (no brief for the last round, or a status past ready) is refused
+    if prior > 0 and (row["status"] not in ("planned", "routed", "ready")
+                      or not os.path.isfile(os.path.join(mkpaths.task_dir(ctx.folder, BUGS, tid), f"brief-r{prior}.md"))):
+        raise Fail(f"task {tid} is at round {prior} ({row['status']}) with no lane or no brief: an earlier dispatch "
+                   "stopped part way (its error named what was done). Finish that by hand (mk-state task check, "
+                   f"then mk-lane.py acquire --run {BUGS} --task {tid} from the repo), never a second round")
     route = _route(a.route)
     owned = _labels(a.owned) if a.owned is not None else ctx.state("--run", BUGS, "task", "get", tid)["task"].get("owned") or []
     if not owned:
@@ -783,7 +794,7 @@ def cmd_dispatch(ctx, a):
 
 # --- drafts (phase DRAFT): <project>/bugs/<slug>.md, templates/bug.md -----------------------------
 
-DRAFT_KEYS = ("bug", "title", "kind", "severity", "found_in", "area", "labels", "source")
+DRAFT_KEYS = ("bug", "title", "kind", "severity", "found_in", "area", "labels", "links", "source")
 SECTIONS = ("description", "steps", "expected", "actual")  # the `## ` body sections, as metadata keys
 TASK_KEYS = ("title", "acceptance", "subtask")
 
@@ -853,7 +864,7 @@ def check_draft(text):
     for k in sorted(set(head) - set(DRAFT_KEYS) - {"task"}):
         warnings.append(f"unknown header key {k!r}")
     for k in DRAFT_KEYS:
-        if k in head and k != "labels" and not isinstance(head[k], str):
+        if k in head and k not in ("labels", "links") and not isinstance(head[k], str):
             errors.append(f"{k} must be a string")
     if not isinstance(head.get("title"), str) or not head["title"].strip():
         errors.append("missing title")
@@ -865,9 +876,10 @@ def check_draft(text):
         warnings.append("no bug slug")
     elif isinstance(head["bug"], str) and not mkpaths.SLUG_RE.match(head["bug"]):
         errors.append(f"bad bug slug {head['bug']!r}: want [a-z0-9][a-z0-9-]{{0,40}}")
-    labels = head.get("labels", [])
-    if not isinstance(labels, list) or not all(isinstance(x, str) for x in labels):
-        errors.append("labels must be a list of strings")
+    for k in ("labels", "links"):
+        vals = head.get(k, [])
+        if not isinstance(vals, list) or not all(isinstance(x, str) for x in vals):
+            errors.append(f"{k} must be a list of strings")
     tasks = head.get("task", [])
     if not isinstance(tasks, list) or not all(isinstance(t, dict) for t in tasks):
         errors.append("task must be [[task]] blocks")
@@ -899,7 +911,7 @@ def cmd_check(path):
 def _draft_ns(head, body):
     """The `new` flags a checked draft stands for."""
     a = argparse.Namespace(title=head["title"], kind=head.get("kind"), severity=head.get("severity"),
-                           labels=head.get("labels"), assignee=None)
+                           labels=head.get("labels"), links=head.get("links"), assignee=None)
     for k in ("found_in", "area", "source"):
         setattr(a, k, head.get(k))
     for k in SECTIONS:
@@ -1038,6 +1050,8 @@ def cmd_draft(ctx, a):
         head = [f"bug = {_toml(slug)}", f"title = {_toml(title)}"]
         head += [f"{k} = {_toml(meta[k])}" for k in ("kind", "severity", "found_in", "area")]
         head += [f"labels = [{', '.join(_toml(x) for x in meta['labels'])}]", f"source = {_toml(meta['source'])}"]
+        if meta["links"]:
+            head.append(f"links = [{', '.join(_toml(x) for x in meta['links'])}]")
         for t in tasks:
             head += ["", "[[task]]", f"title = {_toml(t.strip())}"]
         text = "+++\n" + "\n".join(head) + "\n+++\n"
@@ -1063,7 +1077,7 @@ def cmd_draft(ctx, a):
 
 def _meta_flags(sp, title_required=False):
     sp.add_argument("--title", required=title_required)
-    sp.add_argument("--kind"), sp.add_argument("--severity"), sp.add_argument("--labels")
+    sp.add_argument("--kind"), sp.add_argument("--severity"), sp.add_argument("--labels"), sp.add_argument("--links")
     for k in TEXT_KEYS:
         if k != "assignee":
             sp.add_argument("--" + k.replace("_", "-"), dest=k)
@@ -1237,6 +1251,24 @@ def _review_fixes(home, data, run, refused):
         undo()
     _check(len(evs) == 50 and [e["id"] for e in evs] == sorted((e["id"] for e in evs), reverse=True)
            and all(e["task"] in (bid, tid, f"{bid}.2") for e in evs), f"show events {len(evs)}")
+    # followup 2: a bug whose word is needs only for a non-approve verdict, row already planned: set --status=open
+    # clears the verdict (a decision event), so the word changes
+    v2 = run("new", "--title=verdict")["bug"]["id"]
+    _sql(home, data, "UPDATE tasks SET verdict='Changes requested' WHERE run='bugs' AND id=?", (v2,))
+    _check(run("show", v2)["bug"]["status"] == "needs", "verdict did not make the word needs")
+    got = run("set", v2, "--status=open")
+    _check(got["bug"]["status"] == "open" and got["bug"]["task_status"] == "planned"
+           and any("verdict" in e["text"] for e in run("show", v2)["events"] if e["kind"] == "decision"),
+           f"set --status=open kept the verdict word: {got['bug']}")
+    # followup 3: --links=a,b on new / set / draft, like --labels
+    l3 = run("new", "--title=links", "--links=a, b,")["bug"]
+    _check(l3["links"] == ["a", "b"], f"new --links {l3['links']}")
+    _check(run("set", l3["id"], "--links=c")["bug"]["links"] == ["c"], "set --links")
+    _check(run("set", l3["id"], "--title=links2")["bug"]["links"] == ["c"], "set without --links dropped links")
+    dpath = run("draft", "--title=drafted links", "--links=x,y")["path"]
+    _check(run("check", dpath)["ok"] and run("import", dpath, "--dry-run")["would"]["bug"]["links"] == ["x", "y"],
+           "draft --links did not reach the draft file")
+    os.unlink(dpath)
     # 6: delete drops the bug's rows in every task-keyed table ...
     d6 = run("new", "--title=six")["bug"]["id"]
     t6 = run("task", "add", d6, "--title=t")["task"]["id"]
@@ -1244,12 +1276,18 @@ def _review_fixes(home, data, run, refused):
                 "INSERT INTO evidence(run, task, line) VALUES ('bugs', ?, 'x')",
                 "INSERT INTO risk_reasons(run, task, kind) VALUES ('bugs', ?, 'x')"):
         _sql(home, data, sql, (t6,))
+    for key in (f"bugs|{d6}", f"bugs|{t6}", "bugs|B999", "bugs|*"):  # task-keyed bus cursors; the last two stay
+        _sql(home, data, "INSERT INTO watch_cursors(key, seq) VALUES (?, 1)", (key,))
     run("delete", d6)
     con = mkdb._open_read(mkdb._store_path(home, data_dir=data), mkdb.SCHEMA)
     left = {t: con.execute(f"SELECT count(*) FROM {t} WHERE run='bugs' AND task LIKE ?", (d6 + "%",)).fetchone()[0]
             for t in ("artifacts", "evidence", "risk_reasons")}
     con.close()
     _check(not any(left.values()), f"delete left rows: {left}")
+    con = mkdb._open_read(mkdb._store_path(home, data_dir=data), mkdb.SCHEMA)
+    keys = sorted(r[0] for r in con.execute("SELECT key FROM watch_cursors WHERE key LIKE 'bugs|%'"))
+    con.close()
+    _check(keys == ["bugs|*", "bugs|B999"], f"delete left or took watch cursors: {keys}")
     # ... and checks the lane inside its locked transaction (a lane set just before the lock stops it)
     d7 = run("new", "--title=seven")["bug"]["id"]
     t7 = run("task", "add", d7, "--title=t")["task"]["id"]
@@ -1521,8 +1559,9 @@ def _dispatch(home, data, run, refused):
         msg = str(e)
     point(repo)
     _check("done: task set owned=b.py; task round; task brief; task check; then lane acquire failed" in msg, msg)
-    # that half-dispatched task (round 1, no lane) is refused, never a round 2
-    refused("dispatch", late, "--owned=b.py", want=f"task {late} is at round 1 with no lane")
+    # a planned task with round 1, its brief on disk and no lane (a reopened one) takes a fresh round 2
+    got = run("dispatch", late, "--owned=b.py")
+    _check(got["task"]["round"] == 2 and got["lane"] and got["brief"].endswith("brief-r2.md"), f"no round 2: {got}")
     # a step after the round that raises a non-Fail (a missing brief template: OSError) still names what was done
     drift = run("task", "add", bid, "--title=third", "--acceptance=ok")["task"]["id"]
     saved = globals()["BRIEF_TMPL"]
@@ -1535,6 +1574,12 @@ def _dispatch(home, data, run, refused):
     finally:
         globals()["BRIEF_TMPL"] = saved
     _check("done: task set owned=c.py; task round; then brief text failed" in msg and "no-such-brief" in msg, msg)
+    # that half-dispatched task (round 1, no brief, no lane) is refused, never a round 2; so is one past ready
+    refused("dispatch", drift, "--owned=c.py", want=f"task {drift} is at round 1 (planned) with no lane or no brief")
+    run("task", "set", drift, "--status=building")
+    os.makedirs(mkpaths.task_dir(data, BUGS, drift), exist_ok=True)
+    open(os.path.join(mkpaths.task_dir(data, BUGS, drift), "brief-r1.md"), "w").close()
+    refused("dispatch", drift, "--owned=c.py", want=f"task {drift} is at round 1 (building)")
     # a done task, or a task of a fixed / wontfix bug, is refused
     b2 = run("new", "--title=closed bug", "--kind=cli")["bug"]["id"]
     t2 = run("task", "add", b2, "--title=t", "--acceptance=ok")["task"]["id"]

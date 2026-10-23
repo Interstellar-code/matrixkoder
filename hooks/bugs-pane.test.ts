@@ -3,7 +3,7 @@
 // `mk-bug.py` argv against a stateful fake of the CLI keyed on argv.
 import { test, expect } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
-import { DATA_DIR, mockFs, mockWorld, paneProps, sessionStart, worldFiles, worldFixtures } from './testkit'
+import { DATA_DIR, RUNS_INDEX, mockFs, mockWorld, paneProps, sessionStart, worldFiles, worldFixtures } from './testkit'
 
 const HOME = '/tmp/mk-bugs-home'
 const overview = { ok: true, projects: [{ slug: 'matrixkoder', repo: '/x/matrixkoder', data_dir: DATA_DIR }], plans: [] }
@@ -271,7 +271,8 @@ test('UI.2: s / k / a stand down while the quick-add field has the focus; a fail
 test('UI.4: the Events loader reads run bugs too; its rows carry run bugs and the Bug segment shows only them', { plugins: [worldFixtures], timeoutMs: 15000 }, async ($, on) => {
   const runRows = [{ id: 11, run: 'wfv2', t: '2026-10-07T17:50:00+02:00', chan: 'state', kind: 'transition', to_id: 'building', task: 'F6', text: 'plan task moves', meta_json: '' }]
   const bugRows = [{ id: 12, run: 'bugs', t: '2026-10-07T17:51:00+02:00', chan: 'state', kind: 'transition', to_id: 'planned', task: 'B1', text: 'task added: pane crashes', meta_json: '' }]
-  mockFs(on, worldFiles())
+  const files = worldFiles()
+  mockFs(on, files)
   const calls: string[][] = []
   const clock = mockWorld(on, {
     process: argv => {
@@ -287,6 +288,8 @@ test('UI.4: the Events loader reads run bugs too; its rows carry run bugs and th
     return next(e)
   })
   await $.session.start(sessionStart())
+  // the permanent bugs run exists once mk-bug.py wrote its first bug: the snapshot's runs list names it
+  files[RUNS_INDEX] = JSON.stringify([...(JSON.parse(files[RUNS_INDEX] ?? '[]') as unknown[]), { id: 'bugs', status: 'done', started: '2026-10-07T09:00:00+02:00' }])
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(80) })
   await ui.press({ key: 'dash-tab-events' })
   for (let i = 0; i < 10; i++) await clock.advance(0)
@@ -308,6 +311,32 @@ test('UI.4: the Events loader reads run bugs too; its rows carry run bugs and th
     await ui.press({ key: `ev-src-${k}` })
     expect(await ui.find({ text: /task added: pane crashes/ }), `not under ${k}`).toBeUndefined()
   }
+})
+
+test('UI.4: the Events loader spawns no bugs read until the runs list names the bugs run (first use)', { plugins: [worldFixtures], timeoutMs: 15000 }, async ($, on) => {
+  const files = worldFiles()
+  mockFs(on, files)
+  const calls: string[][] = []
+  const clock = mockWorld(on, {
+    process: argv => {
+      if (!(argv.some(a => a.endsWith('mkdb.py')) && argv.includes('events'))) return undefined
+      calls.push([...argv])
+      return { value: { exitCode: 0, stdout: JSON.stringify({ ok: true, events: [] }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    },
+  })
+  await $.session.start(sessionStart())
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(80) })
+  await ui.press({ key: 'dash-tab-events' })
+  for (let i = 0; i < 10; i++) await clock.advance(0)
+  await clock.advance(5000)
+  for (let i = 0; i < 10; i++) await clock.advance(0)
+  const bugReads = () => calls.filter(a => a[a.indexOf('--run') + 1] === 'bugs').length
+  expect(calls.length, 'the events tab did read').toBeGreaterThan(0)
+  expect(bugReads(), 'no bugs run in the runs list: no bugs spawn').toBe(0)
+  files[RUNS_INDEX] = JSON.stringify([...(JSON.parse(files[RUNS_INDEX] ?? '[]') as unknown[]), { id: 'bugs', status: 'done', started: '2026-10-07T09:00:00+02:00' }])
+  await clock.advance(5000)
+  for (let i = 0; i < 10; i++) await clock.advance(0)
+  expect(bugReads(), 'the bugs run now exists: it is read').toBeGreaterThan(0)
 })
 
 test('DRAFT: save draft runs mk-bug draft (one argv element per flag, tasks one per line), notes the path and closes the form', { plugins: [worldFixtures] }, async ($, on) => {
