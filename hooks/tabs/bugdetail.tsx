@@ -13,7 +13,7 @@ import { ActionButton, Card, Chip, Section, Segment } from './kit'
 import { PALETTE, ROLE } from './palette'
 import type { PaletteRole } from './palette'
 import { clip, planStatusGlyph, planStatusRole } from './plan'
-import type { PlanView } from './plan'
+import type { PlanTask, PlanView } from './plan'
 import { planFromReply } from './plans-map'
 import { PlanTaskPanel, findPlanTask } from './plantask'
 
@@ -59,12 +59,48 @@ export type BugDetailView = {
 
 export type BugActKind = 'open-pane' | 'handoff' | 'nudge' | 'fixed'
 
-/** C12: the tab's view-state handle; `bugAct` is the pane's action callback */
+/** C12: the tab's view-state handle; `bugAct` is the pane's action callback, `submit` the plan tab's
+ *  `mk:` line path to the orchestrator */
 export type TabUi = {
   get(key: string): string | undefined
   set(key: string, value: string): void
   bugAct?(kind: BugActKind, id: string): void
+  submit?(text: string): void
 }
+
+/** The lane actions (contract LANE 5) and their button words. */
+export type BugLaneKind = 'dispatch' | 'handoff' | 'nudge' | 'open-pane'
+const LANE_WORD: Record<BugLaneKind, string> = { dispatch: 'to lane', handoff: 'hand off', nudge: 'nudge', 'open-pane': 'open pane' }
+
+/** The task the lane actions act on: the picked task, else the bug's only task; null = pick one first. */
+export function laneTaskOf(plan: PlanView, taskSel: string): PlanTask | null {
+  const rows = plan.phases?.flatMap(p => p.rows) ?? []
+  if (taskSel !== '') return rows.find(r => r.id === taskSel) ?? null
+  return rows.length === 1 ? rows[0] ?? null : null
+}
+
+/** Why a lane action is off for the task ('' = on): no task, no lane (nudge, open pane), no acceptance (to lane). */
+export function laneActOff(kind: BugLaneKind, task: PlanTask | null): string {
+  if (task == null) return 'pick a task'
+  if ((kind === 'nudge' || kind === 'open-pane') && task.slot == null && (task.pane ?? '') === '') return 'no lane'
+  if (kind === 'dispatch' && (task.acceptance ?? '').trim() === '') return 'no acceptance'
+  return ''
+}
+
+/** The one-line note for the off actions, grouped by reason: `nudge, open pane: no lane`. '' when all are on. */
+export function laneOffNote(kinds: readonly BugLaneKind[], task: PlanTask | null): string {
+  const by = new Map<string, string[]>()
+  for (const k of kinds) {
+    const why = laneActOff(k, task)
+    if (why !== '') by.set(why, [...(by.get(why) ?? []), LANE_WORD[k]])
+  }
+  return [...by].map(([why, words]) => `${words.join(', ')}: ${why}`).join(' · ')
+}
+
+const LANE_VERB: Record<BugLaneKind, string> = { dispatch: 'dispatch', handoff: 'hand off', nudge: 'nudge', 'open-pane': 'open pane' }
+
+/** The `mk:` line a lane press submits to the orchestrator, which runs the MK loop on run bugs. */
+export const bugLaneLine = (kind: BugLaneKind, taskId: string): string => `mk: ${LANE_VERB[kind]} bug ${taskId}`
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 const str = (v: unknown): string => (typeof v === 'string' ? v : '')
@@ -196,6 +232,11 @@ export function BugDetailTab(els: Els, view: BugDetailView, cols: number, ui?: T
   }
 
   const selRow = taskSel !== '' ? findPlanTask(view.plan.phases, taskSel) : null
+  // the lane actions act on one task (the picked one, else the only one); off ones draw disabled with a note
+  const target = laneTaskOf(view.plan, taskSel)
+  const on = (kind: BugLaneKind): boolean => laneActOff(kind, target) === ''
+  const offNote = laneOffNote(['dispatch', 'open-pane', 'handoff', 'nudge'], target)
+  const send = (kind: BugLaneKind): void => { if (target != null) ui?.submit?.(bugLaneLine(kind, target.id)) }
   return (
     <Box flexDirection="column" gap={1}>
       <Box flexDirection="row" gap={1}>
@@ -249,13 +290,15 @@ export function BugDetailTab(els: Els, view: BugDetailView, cols: number, ui?: T
         </Box>
       ))}
 
-      <Box flexDirection="row" gap={1}>
-        {ActionButton(els, { key: 'bug-act-open-pane', glyph: '↗', word: 'open pane', tone: 'primary', primary: true, onPress: () => { act('open-pane') } })}
-        {ActionButton(els, { key: 'bug-act-handoff', glyph: 'h', word: 'hand off', plain: true, hotkey: 'h', onPress: () => { act('handoff') } })}
-        {ActionButton(els, { key: 'bug-act-nudge', glyph: '↻', word: 'nudge', plain: true, onPress: () => { act('nudge') } })}
+      <Box flexDirection="row" gap={1} flexWrap="wrap">
+        {ActionButton(els, { key: 'bug-act-dispatch', glyph: '▶', word: 'to lane', tone: on('dispatch') ? 'default' : 'disabled', onPress: () => { send('dispatch') } })}
+        {ActionButton(els, { key: 'bug-act-open-pane', glyph: '↗', word: 'open pane', tone: on('open-pane') ? 'primary' : 'disabled', primary: true, onPress: () => { send('open-pane') } })}
+        {ActionButton(els, { key: 'bug-act-handoff', glyph: 'h', word: 'hand off', plain: true, hotkey: 'h', ...(on('handoff') ? {} : { tone: 'disabled' as const }), onPress: () => { send('handoff') } })}
+        {ActionButton(els, { key: 'bug-act-nudge', glyph: '↻', word: 'nudge', plain: true, ...(on('nudge') ? {} : { tone: 'disabled' as const }), onPress: () => { send('nudge') } })}
         <Box flexGrow={1} />
         {!closed && ActionButton(els, { key: 'bug-act-fixed', glyph: '✓', word: 'fixed', plain: true, tone: 'quiet', onPress: () => { act('fixed') } })}
       </Box>
+      {offNote !== '' && <Text dimColor={true} wrap="wrap">{clean(offNote)}</Text>}
       {ActionButton(els, { key: 'bug-esc-back', glyph: 'esc back', word: '', plain: true, tone: 'quiet', onPress: () => { ui?.set('bugs:sel', '') } })}
     </Box>
   )

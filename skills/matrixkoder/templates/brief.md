@@ -2,6 +2,8 @@
 
 Repo: this folder (worktree `<path>`, branch `<branch>`, at `<sha>`: <what is already in>). Stack: <stack>. Plan `<plan id>`: `<project>/plans/<plan id>/plan.md` (read-only) — phase `<PHASE id>`, its tasks `<P.n>`, `<P.n>` (acceptance lines in the plan header); history for this task: `<project>/plans/<plan>/runs/<run>/<T>/` (read-only). Do ONLY <PHASE>. Other agents work on: <lanes + their areas> — do not touch them.
 
+Repo, bug variant (a task of run `bugs`, no plan; keep ONE Repo line, `mk-bug dispatch` fills this one): this folder (worktree `<path>`, branch `<branch>`, at `<sha>`). Stack: <stack>. Bug `<bug id>` (run `bugs`, no plan file) — task `<T>`; the bug's text and the task's acceptance are in Spec; history for this task: `<bug task folder>` (read-only). Do ONLY <T>. Other agents work on: <lanes + their areas> — do not touch them.
+
 What it is (plain English): <the task's description from the plan file; delete this line when the task has none>
 
 ## Risk and gates

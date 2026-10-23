@@ -26,10 +26,12 @@ export const BUGS_KEYS = {
   sel: 'bugs:sel',
   /** the expanded list card */
   open: 'bugs:open',
+  /** the simple view's picked card (its ▶ to lane needs the bug's tasks) */
+  pick: 'bugs:pick',
 } as const
 
 /** a press that writes one of these keys reloads at once (the detail should not wait for the tick) */
-export const BUGS_RELOAD_ON = new Set<string>([BUGS_KEYS.sel, BUGS_KEYS.open])
+export const BUGS_RELOAD_ON = new Set<string>([BUGS_KEYS.sel, BUGS_KEYS.open, BUGS_KEYS.pick])
 
 /** B<n>, B<n>.<m>, B<n>.<m>.<k>: an id that is never read as a flag */
 export const isBugId = (id: string): boolean => /^B\d+(\.\d+){0,2}$/.test(id)
@@ -54,11 +56,13 @@ export async function runBug(run: RunFn, root: string, home: string, slug: strin
   }
 }
 
-/** The bug the tick also shows: the open detail, else the expanded list card. */
+/** The bug the tick also shows: the open detail, else the expanded list card, else the simple view's picked card. */
 export function showTarget(view: Record<string, string>): string {
   const sel = view[BUGS_KEYS.sel] ?? ''
   if (sel !== '' && sel !== 'new') return sel
-  return (view[BUGS_KEYS.sub] ?? '') === 'list' ? view[BUGS_KEYS.open] ?? '' : ''
+  const sub = view[BUGS_KEYS.sub] ?? ''
+  if (sub === 'list') return view[BUGS_KEYS.open] ?? ''
+  return sub === 'kanban' ? '' : view[BUGS_KEYS.pick] ?? ''
 }
 
 /** The tick's read: `list`, plus `show <id>` when a bug is open or expanded. The view-state patch to apply. */
@@ -80,12 +84,11 @@ const DRAFT_KEYS = ['title', 'kind', 'severity', 'found_in', 'description', 'tas
 /** A press → its mk-bug verbs, run in order; the view-state patch to apply (error or note, cleared fields).
  *  create = `new` then one `task add` per task line; save-draft = `draft` (the tasks one per line in one
  *  `--tasks=` argument), which closes the form and notes the returned path; fixed = `close`. The lane actions
- *  are a later phase: they only leave a note. */
+ *  (to lane, hand off, nudge, open pane) never come here: the tab submits their `mk:` line to the orchestrator. */
 export async function bugPressPatch(run: RunFn, root: string, view: Record<string, string>, kind: string, id = '', text = ''): Promise<Record<string, string>> {
   const home = view[BUGS_KEYS.home] ?? ''
   const slug = view[BUGS_KEYS.slug] ?? ''
   const note = (n: string): Record<string, string> => ({ [BUGS_KEYS.note]: n, [BUGS_KEYS.error]: '' })
-  if (kind === 'open-pane' || kind === 'handoff' || kind === 'nudge') return note(`${kind}: comes with lane dispatch`)
   if (home === '' || slug === '') return { [BUGS_KEYS.error]: `bugs ${kind}: no project` }
   const fail = (e: string): Record<string, string> => ({ [BUGS_KEYS.error]: `bugs ${e}`, [BUGS_KEYS.note]: '' })
   const call = (tail: readonly string[]) => runBug(run, root, home, slug, tail)

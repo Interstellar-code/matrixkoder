@@ -81,6 +81,20 @@ Checked against `--help`. `S=${CLAUDE_PLUGIN_ROOT}/scripts`; mk-state and mk-lan
 - `dispatch --role review` refuses a pane with no agent. Start the reviewer first.
 - After a quota block where the user changes the lane's model, record it: `task set <T> status=building model=<m> effort=<e>`.
 
+## Bugs
+
+Pick the container: a plan is a topic (feature, refactor, batch of fixes) that runs autonomously through this loop; a bug is one specific problem, tracked per repo in the project db's permanent run `bugs` (a bug `B<n>` is a top-level row, its tasks `B<n>.<m>` and subtasks sit under it); a todo is a manual checklist line. File a bug from the Bugs tab (`b`), a todo (`→ bug`) or a draft file; never wrap one bug in an MK plan.
+
+| Job | Command (`B=python3 $S/mk-bug.py`; every verb prints one JSON line) |
+|---|---|
+| List / read | `$B list [--status <s>] [--kind <k>]`; `$B show B<n>` (tasks tree + the bug's events) |
+| File / edit / close | `$B new --title=<t> [--kind --severity --area --found-in --description …]`; `$B set B<n> [--status --assignee …]`; `$B close B<n> [--wontfix]` |
+| Tasks | `$B task add B<n> --title=<t> --acceptance=<a>`; `$B subtask add B<n>.<m> --title=<t>`; `$B task set B<n>.<m> [--status --title --acceptance]` |
+| Drafts | `$B draft --title=<t> [--tasks=<one per line>]` writes `projects/<repo>/bugs/<slug>.md`; `$B check <file>`; `$B import <file> [--dry-run]` |
+| Send to a lane | `$B dispatch B<n>.<m> [--route="<agent> <model> [<effort>]"] [--owned=<glob,glob>]` — refused without acceptance; `--owned` required when the task owns no files |
+
+Dispatch flow: a bug task is autonomous work, so it runs this loop on run `bugs` in place of a plan run (Jev routing, brief, worktree lane, separate review all apply). `mk-bug dispatch` only prepares: task round (brief from `templates/brief.md`, plan-less variant naming `Bug B<n>`) and `mk-lane.py acquire --run bugs`; it never starts an agent. Then start the agent in the lane and run the reply's `next` commands in order, filling `<pane>` (and `<kind>` when the route named no agent): `next[0]` arms the watch (`mk-lane-event.py arm …`), then `next[1]` sends the brief (`mk-lane-event.py dispatch …`); watch, review and merge as for a plan task, with `--run bugs` on every mk-state/mk-lane call. The Bugs tab sends you four lines (task = `B<n>.<m>`): `mk: dispatch bug <task>` (run the flow above), `mk: hand off bug <task>` (re-route the task to another lane/agent), `mk: nudge bug <task>` (message its lane: bus `--kind nudge`), `mk: open pane bug <task>` (bring its lane pane into view in herdr). Wake names `run bugs` when a bug lane reaches a wake status.
+
 ## Files
 
 Two SQLite stores and nothing else: the root `~/.matrixkoder/mk-overview.db` (`mk.db` on a home that already has one) holds overview numbers and linkage only (C3), and the project's own DB is the ONLY source of truth (C4). The repo keeps no MK data. `<project>` below is the project folder `~/.matrixkoder/projects/<slug>/`; every path comes from `scripts/mkpaths.py` / `hooks/paths.ts` (C1). Fresh homes name the stores `mk-overview.db` and `mk-project.db`; an existing `mk.db` keeps resolving and is never renamed or shadowed by a new-name file (migrate v2 is not shipped); store-creating calls name their kind (`root_db_in` / `project_db_in`). Before the projects/ layout (until 2026-10-15) project data lived in `<repo>/.matrixkoder/` under the old `matrixkoder.yaml` name.

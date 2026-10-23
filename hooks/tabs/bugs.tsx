@@ -9,7 +9,7 @@
 // the detail. Pure render — no $, no state; a press only calls `ui.set` or
 // `ui.bugAct` (C1). The letter hotkeys stand down while a field has the focus.
 import type { Elements, RenderElement } from 'claude-code'
-import { BUG_SEVERITY_ROLE, BUG_STATUS_ROLE, BugDetailTab } from './bugdetail'
+import { BUG_SEVERITY_ROLE, BUG_STATUS_ROLE, BugDetailTab, bugLaneLine, laneOffNote, laneTaskOf } from './bugdetail'
 import type { BugDetailView } from './bugdetail'
 import { BUG_KINDS, BUG_SEVERITIES, BugNewForm } from './bugnew'
 import type { BugDraft } from './bugnew'
@@ -57,15 +57,17 @@ export type BugsView = {
   readonly draft: BugDraft
   /** ISO now for the age column; '' draws no age */
   readonly now: string
-  /** a one-line note (a press that only explains, e.g. `comes with lane dispatch`) */
+  /** a one-line note (a press's result, e.g. `+ B3 filed`) */
   readonly note: string
 }
 
-/** C12: the tab's view-state handle; `bugAct` runs a mk-bug verb (see the pane's bugAction) */
+/** C12: the tab's view-state handle; `bugAct` runs a mk-bug verb (see the pane's bugAction), `submit`
+ *  sends an `mk:` line to the orchestrator (the plan tab's Play path) */
 export type BugsUi = {
   get(key: string): string | undefined
   set(key: string, value: string): void
   bugAct?(kind: string, id?: string, text?: string): void
+  submit?(text: string): void
 }
 
 export const BUG_GLYPH: Readonly<Record<string, string>> = { open: '○', fixing: '◐', needs: '⚠', fixed: '✓', wontfix: '⊘' }
@@ -134,6 +136,15 @@ export function SimpleView(els: Els, view: BugsView, cols: number, ui: BugsUi): 
     ? Input({ key: 'bugs-q', placeholder: '+ what broke? Enter', value: q, onInput: (v: string) => { ui.set('bugs:q', v) }, onSubmit: submit })
     : <Text dimColor={true}>{clip(q === '' ? '+ what broke? Enter' : clean(q), W)}</Text>
   const nOpen = view.bugs.filter(b => !closed(b)).length
+  // ▶ to lane acts on the picked bug's only task (its show reply is the tick's detail); else pick one in the detail
+  const picked = pick != null && view.detail?.bug?.id === pick.id ? view.detail : null
+  const laneTask = picked == null ? null : laneTaskOf(picked.plan, '')
+  const nRows = picked?.plan.phases?.flatMap(p => p.rows).length ?? 0
+  const laneOff = pick == null ? ''
+    : picked == null ? 'to lane: loading tasks…'
+      : nRows === 0 ? 'to lane: add a task first'
+        : nRows > 1 ? 'to lane: pick a task in the detail'
+          : laneOffNote(['dispatch'], laneTask)
   const empty = !view.loaded ? 'loading…' : view.bugs.length === 0 ? 'no bugs yet. type above, Enter.' : 'all clear'
   return (
     <Box flexDirection="column" gap={1}>
@@ -185,10 +196,10 @@ export function SimpleView(els: Els, view: BugsView, cols: number, ui: BugsUi): 
           <Text wrap="wrap">{clean(pick.title)}</Text>
           <Box flexDirection="row" gap={1} flexWrap="wrap">
             {ActionButton(els, { key: 'bugs-pick-open', glyph: '↵', word: 'open', tone: 'primary', onPress: () => { ui.set('bugs:sel', pick.id) } })}
-            {/* lane dispatch is the LANE phase: drawn, inert */}
-            {ActionButton(els, { key: 'bugs-pick-lane', glyph: '▶', word: 'to lane', tone: 'disabled' })}
+            {ActionButton(els, { key: 'bugs-pick-lane', glyph: '▶', word: 'to lane', tone: laneOff === '' ? 'default' : 'disabled', onPress: () => { if (laneTask != null) ui.submit?.(bugLaneLine('dispatch', laneTask.id)) } })}
             {!closed(pick) && ActionButton(els, { key: 'bugs-pick-fixed', glyph: '✓', word: 'fixed', onPress: () => { ui.bugAct?.('fixed', pick.id) } })}
           </Box>
+          {laneOff !== '' && <Text dimColor={true} wrap="wrap">{clean(laneOff)}</Text>}
         </Box>
       ))}
     </Box>

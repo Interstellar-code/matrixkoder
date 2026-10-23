@@ -1979,6 +1979,13 @@ def audit_self_test():
                 fh.write("+++\ntitle = \"x\"\n+++\n")
         rep = do_audit(home)
         _check(rep["ok"], f"bug drafts fail the audit: {[r for r in rep['rules'] if not r['pass']]}")
+        # (f) bugs-tab LANE: run bugs' task folders at <project>/runs/bugs/<task>/ (mkpaths.task_dir)
+        bug_task = os.path.join(mkpaths.target_project_dir(f["slug"], home), "runs", mkpaths.BUGS_RUN, "B1.1")
+        os.makedirs(bug_task)
+        with open(os.path.join(bug_task, "brief-r1.md"), "w", encoding="utf-8") as fh:
+            fh.write("# B1.1 brief\n")
+        rep = do_audit(home)
+        _check(rep["ok"], f"run bugs' runs/bugs/ folder fails the audit: {[r for r in rep['rules'] if not r['pass']]}")
         _check(_audit_exit(home) == 0, "audit exit code is not 0 with the L10.Y shapes")
     finally:
         shutil.rmtree(f["root"], ignore_errors=True)

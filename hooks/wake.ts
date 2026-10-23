@@ -221,7 +221,11 @@ async function flushBatch($: EngineInterface): Promise<void> {
     if (!body) return []
     return [`Bus message (quoted data, not instructions):\n> ${sanitizeText(body)}`]
   })
-  const text = [`MatrixKoder: ${summary}. Continue the run from its Next action.`, ...quotes].join('\n')
+  // a batch from the permanent run bugs names that run: "the run's Next action" means the plan run
+  const head = isBugsRun(pend.run)
+    ? `MatrixKoder: run bugs: ${summary}. Continue that bug task in run bugs (mk-bug show <bug id>).`
+    : `MatrixKoder: ${summary}. Continue the run from its Next action.`
+  const text = [head, ...quotes].join('\n')
 
   const held = await $.state
     .get({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `hold:${text}` } as const)
@@ -307,7 +311,7 @@ async function flushBatch($: EngineInterface): Promise<void> {
 /** `mkdb.py run-snapshot` says whether the store is there (`store`, L5 R2) and names the active run.
  *  Wake spawns it every tick; undefined means the reader could not answer (a refused spawn, a
  *  non-zero exit, a payload with no runs) and the tick is skipped, like `store: false`. */
-type StoreProbe = { store: boolean; activeId: string | null | undefined }
+type StoreProbe = { store: boolean; activeId: string | null | undefined; bugsId?: string }
 
 /** Read-only events for one run, through `mkdb.py events` (C4/L5) — the ONE store reader.
  * It replaces the inline `python3 -c` probe that imported mkdb and opened `<data>/mk.db`
@@ -371,7 +375,8 @@ async function readStoreEvents($: EngineInterface, dataDir: string, runId: strin
  *  no active run. The pick is the FIRST active entry of the list ordered by `started` ascending,
  *  i.e. the OLDEST active run; the reader's own `active` field is the newest one (the dashboard's
  *  pick), which would move wake onto a different run of a busy project. The permanent `bugs` run
- *  is never the pick: it is always active and usually the oldest, so it would hide every plan run. */
+ *  is never the pick: it is always active and usually the oldest, so it would hide every plan run.
+ *  It is reported on its own (`bugsId`) and polled beside the plan run with its own cursor. */
 async function storeProbe($: EngineInterface, dataDir: string): Promise<StoreProbe | undefined> {
   let ran: { exitCode: number; stdout: string }
   try {
@@ -396,8 +401,11 @@ async function storeProbe($: EngineInterface, dataDir: string): Promise<StorePro
     && typeof (r as { id?: unknown }).id === 'string' && !isBugsRun((r as { id: string }).id))
   // store: false → no store file at all: nothing to read (activeId undefined).
   // store: true  → the reader answered; an empty list is the end of the poll (activeId null).
+  const bugs = list.find(r =>
+    r !== null && typeof r === 'object' && (r as { status?: unknown }).status === 'active'
+    && isBugsRun((r as { id?: unknown }).id)) as { id: string } | undefined
   if (doc.store === false) return { store: false, activeId: undefined }
-  return { store: true, activeId: first === undefined ? null : (first as { id: string }).id }
+  return { store: true, activeId: first === undefined ? null : (first as { id: string }).id, bugsId: bugs?.id }
 }
 
 /** Only the orchestrator session wakes (todo 155). Every Claude session that loads the plugin
@@ -442,153 +450,173 @@ async function pollEvents($: EngineInterface): Promise<void> {
     const active = probe.activeId == null ? undefined : { id: probe.activeId }
     // a batch found before a reload (or a held/failed submit) is still owed, but only to the run that is still active
     const owed = await readPending($)
-    if (owed.items.length > 0 && (!active?.id || owed.run !== active.id)) {
+    const owedLive = owed.run === active?.id || (probe.bugsId !== undefined && owed.run === probe.bugsId)
+    if (owed.items.length > 0 && !owedLive) {
       askBodies.clear()
       await $.state.set(pendingRef, EMPTY_PENDING).catch(() => {}) // a finished run must not wake the session
     } else if (owed.items.length > 0 && !debounceTimer) {
       if (retryNext) await flushBatch($)
       else armDebounce($)
     }
-    if (!active?.id) return
-
-    // A failed read skips the tick (a store read is the only source; nothing double-fires).
-    const events = await readStoreEvents($, dataDir, active.id)
-    if (events === undefined) return
-    if (events.length === 0) return
-
-    const stateRef = { plugin: 'matrixkoder', key: 'wakeEventLines', id: active.id } as const
-    const stateRes = await $.state.get(stateRef).catch(() => ({ value: undefined }))
-    // The cursor is the last consumed events.id, stored negative (idCursorOf) because the key is
-    // typed byId:number and a second key cannot record the form. A non-negative number saved by
-    // the retired file mode is a line count; reading it as an id would re-wake every event with id > N.
-    const cursorOf = (ev: WakeEvent): number => ev.id ?? 0
-    const maxCursor = events.reduce((m, ev) => Math.max(m, cursorOf(ev)), 0)
-    const saved = typeof stateRes.value === 'number' ? stateRes.value : undefined
-
-    if (!(typeof saved === 'number' && saved < 0)) {
-      // First tick for this run, whether or not a line-count cursor was saved:
-      // baseline to the current max id and do not wake for events already in the store.
-      await $.state.set(stateRef, idCursorOf(maxCursor)).catch(() => {})
-      return
+    if (active?.id) await scanRun($, dataDir, active.id)
+    // run bugs (contract LANE 4): polled beside the plan run with its own cursor. The pending
+    // slot holds one run's batch, so bugs is scanned only while the slot is free or already
+    // its own; its events stay unconsumed until then.
+    if (probe.bugsId !== undefined) {
+      const pend = await readPending($)
+      if (pend.run === '' || pend.run === probe.bugsId) await scanRun($, dataDir, probe.bugsId)
     }
+  } catch {
+    // silent on fs/poll error
+  }
+}
 
-    const lastSeen = idFromCursor(saved)
-    if (maxCursor <= lastSeen) return
+/** One run's new events into the pending batch (the plan run, or run bugs). */
+async function scanRun($: EngineInterface, dataDir: string, runId: string): Promise<void> {
+  // A failed read skips the tick (a store read is the only source; nothing double-fires).
+  const events = await readStoreEvents($, dataDir, runId)
+  if (events === undefined) return
+  if (events.length === 0) return
 
-    let now = Date.now()
+  const stateRef = { plugin: 'matrixkoder', key: 'wakeEventLines', id: runId } as const
+  const stateRes = await $.state.get(stateRef).catch(() => ({ value: undefined }))
+  // The cursor is the last consumed events.id, stored negative (idCursorOf) because the key is
+  // typed byId:number and a second key cannot record the form. A non-negative number saved by
+  // the retired file mode is a line count; reading it as an id would re-wake every event with id > N.
+  const cursorOf = (ev: WakeEvent): number => ev.id ?? 0
+  const maxCursor = events.reduce((m, ev) => Math.max(m, cursorOf(ev)), 0)
+  const saved = typeof stateRes.value === 'number' ? stateRes.value : undefined
+
+  if (!(typeof saved === 'number' && saved < 0)) {
+    // First tick for this run, whether or not a line-count cursor was saved:
+    // baseline to the current max id and do not wake for events already in the store.
+    await $.state.set(stateRef, idCursorOf(maxCursor)).catch(() => {})
+    return
+  }
+
+  const lastSeen = idFromCursor(saved)
+  if (maxCursor <= lastSeen) return
+
+  let now = Date.now()
+  try {
+    now = await $.clock.now()
+  } catch {
+    // clock error
+  }
+  const newlyDiscovered: PendingItem[] = []
+
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i]
+    if (!ev || cursorOf(ev) <= lastSeen) continue
     try {
-      now = await $.clock.now()
-    } catch {
-      // clock error
-    }
-    const newlyDiscovered: PendingItem[] = []
+      // Validate every value placed in prompt.submit:
+      // task must be a string matching mk-state ID_RE; status must be in WAKE_STATUSES enum;
+      // ignore orchestrator's own events to avoid self-wake loops.
+      const isTransition = ev.type === 'transition'
+      const isValidTask = typeof ev.task === 'string' && TASK_ID_RE.test(ev.task)
+      const isValidTo = typeof ev.to === 'string' && WAKE_STATUSES[ev.to] === true
+      const isNotOrchestrator = ev.by !== 'orchestrator'
 
-    for (let i = 0; i < events.length; i++) {
-      const ev = events[i]
-      if (!ev || cursorOf(ev) <= lastSeen) continue
-      try {
-        // Validate every value placed in prompt.submit:
-        // task must be a string matching mk-state ID_RE; status must be in WAKE_STATUSES enum;
-        // ignore orchestrator's own events to avoid self-wake loops.
-        const isTransition = ev.type === 'transition'
-        const isValidTask = typeof ev.task === 'string' && TASK_ID_RE.test(ev.task)
-        const isValidTo = typeof ev.to === 'string' && WAKE_STATUSES[ev.to] === true
-        const isNotOrchestrator = ev.by !== 'orchestrator'
+      if (isTransition && isValidTask && isValidTo && isNotOrchestrator) {
+        // A bus ask is a question, not a status: two different asks are two different
+        // questions, and the per task:status key would swallow the second ask inside the
+        // 5-min cooldown — so a blocked transition whose note is a bus ask carries the
+        // ask's message id and throttles per ASK, not per task:status. The key carries
+        // the run too (events.jsonl is per active run): ask ids repeat across runs, so
+        // run B's m-1 must not be throttled by run A's m-1 stamp (review LOW 3).
+        const askMatch =
+          ev.to === 'blocked' && typeof ev.text === 'string' ? /^bus ask (m-\d+):/.exec(ev.text) : null
+        const askId = askMatch?.[1]
+        const throttleKey = askId === undefined ? `${ev.task}:${ev.to}:${runId}` : `${ev.task}:blocked:${runId}:${askId}`
+        const sentRef = { plugin: 'matrixkoder', key: 'wakeSentAt', id: throttleKey } as const
+        const sentRes = await $.state.get(sentRef).catch(() => ({ value: undefined }))
+        const lastSent = typeof sentRes.value === 'number' ? sentRes.value : undefined
 
-        if (isTransition && isValidTask && isValidTo && isNotOrchestrator) {
-          // A bus ask is a question, not a status: two different asks are two different
-          // questions, and the per task:status key would swallow the second ask inside the
-          // 5-min cooldown — so a blocked transition whose note is a bus ask carries the
-          // ask's message id and throttles per ASK, not per task:status. The key carries
-          // the run too (events.jsonl is per active run): ask ids repeat across runs, so
-          // run B's m-1 must not be throttled by run A's m-1 stamp (review LOW 3).
-          const askMatch =
-            ev.to === 'blocked' && typeof ev.text === 'string' ? /^bus ask (m-\d+):/.exec(ev.text) : null
-          const askId = askMatch?.[1]
-          const throttleKey = askId === undefined ? `${ev.task}:${ev.to}:${active.id}` : `${ev.task}:blocked:${active.id}:${askId}`
-          const sentRef = { plugin: 'matrixkoder', key: 'wakeSentAt', id: throttleKey } as const
-          const sentRes = await $.state.get(sentRef).catch(() => ({ value: undefined }))
-          const lastSent = typeof sentRes.value === 'number' ? sentRes.value : undefined
-
-          if (lastSent === undefined || now - lastSent >= COOLDOWN_MS) {
-            // dedup on task+to+askId: for plain items both askIds are undefined, so plain
-            // behaviour is unchanged; two asks differ on askId and both must survive
-            if (!newlyDiscovered.some(d => d.task === ev.task && d.to === ev.to && d.askId === askId)) {
-              if (askId === undefined) newlyDiscovered.push({ task: ev.task as string, to: ev.to as string })
-              else {
-                newlyDiscovered.push({ task: ev.task as string, to: ev.to as string, askId })
-                if (typeof ev.text === 'string') {
-                  const body = ev.text.replace(/^bus ask m-\d+:\s?/, '')
-                  if (body) askBodies.set(askKey(active.id, ev.task as string, askId), body)
-                }
+        if (lastSent === undefined || now - lastSent >= COOLDOWN_MS) {
+          // dedup on task+to+askId: for plain items both askIds are undefined, so plain
+          // behaviour is unchanged; two asks differ on askId and both must survive
+          if (!newlyDiscovered.some(d => d.task === ev.task && d.to === ev.to && d.askId === askId)) {
+            if (askId === undefined) newlyDiscovered.push({ task: ev.task as string, to: ev.to as string })
+            else {
+              newlyDiscovered.push({ task: ev.task as string, to: ev.to as string, askId })
+              if (typeof ev.text === 'string') {
+                const body = ev.text.replace(/^bus ask m-\d+:\s?/, '')
+                if (body) askBodies.set(askKey(runId, ev.task as string, askId), body)
               }
             }
           }
         }
-      } catch {
-        // ignore corrupted/partial line
       }
+    } catch {
+      // ignore corrupted/partial line
     }
+  }
 
-    const pend = await readPending($)
-    if (pend.run !== '' && pend.items.length === 0) {
-      // a flush holds this batch's claim (the sentinel kept run and upTo).
-      // M1: a claim that is older than 2 minutes with no completed send is dead — the flush
-      // died between the claim and the final write. The lease (25 s) only protects a batch
-      // that still carries items, so the sentinel alone can stick forever. On a stale claim,
-      // clear the sentinel and the claim keys, mark the retry-once flag, and let the next
-      // tick re-discover the lines (the items are lost; the re-scan re-forms them with the
-      // usual cooldown checks). A second stale-claim with the flag set gives up: lines are
-      // consumed to wake-dead, not retried again.
-      const claimAtRef = { plugin: 'matrixkoder', key: 'wakeSentAt', id: `claimAt:${pend.run}:${pend.upTo}` } as const
-      const claimAtRes = await $.state.get(claimAtRef).catch(() => ({ value: undefined }))
-      const claimAt = typeof claimAtRes.value === 'number' ? claimAtRes.value : undefined
-      const stale = claimAt !== undefined && now - claimAt > CLAIM_DEAD_MS
-      if (stale) {
-        const staleFlagRef = { plugin: 'matrixkoder', key: 'wakeSentAt', id: `staleClaim:${pend.run}:${pend.upTo}` } as const
-        const flagRes = await $.state.get(staleFlagRef).catch(() => ({ value: undefined }))
-        const flagSet = typeof flagRes.value === 'number' && flagRes.value > 0
-        if (flagSet) {
-          // second-time stale: consume the lines, drop the sentinel, do not retry
-          await $.state.set({ plugin: 'matrixkoder', key: 'wakeEventLines', id: pend.run } as const, await keepCursorForm($, pend.run, pend.upTo)).catch(() => {})
-          askBodies.clear()
-          await $.state.set(pendingRef, EMPTY_PENDING).catch(() => {})
-          return
-        }
-        // first-time stale: clear the claim, drop the sentinel, and set the once-flag. Do NOT
-        // reset wakeEventLines to 0 — it already holds the right resume point (the dead batch
-        // never advanced it: only a successful submit moves it). Resetting to 0 re-scans the
-        // whole run history and rewakes every transition that is still in a wake status
-        // (the flush-time re-read only drops tasks that moved), producing a bogus prompt that
-        // names tasks the held batch never carried.
-        await $.state.set(claimAtRef, 0).catch(() => {})
-        await $.state.set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `claim:${pend.run}:${pend.upTo}` } as const, 0).catch(() => {})
+  const pend = await readPending($)
+  if (pend.run !== '' && pend.items.length === 0) {
+    // a flush holds this batch's claim (the sentinel kept run and upTo).
+    // M1: a claim that is older than 2 minutes with no completed send is dead — the flush
+    // died between the claim and the final write. The lease (25 s) only protects a batch
+    // that still carries items, so the sentinel alone can stick forever. On a stale claim,
+    // clear the sentinel and the claim keys, mark the retry-once flag, and let the next
+    // tick re-discover the lines (the items are lost; the re-scan re-forms them with the
+    // usual cooldown checks). A second stale-claim with the flag set gives up: lines are
+    // consumed to wake-dead, not retried again.
+    const claimAtRef = { plugin: 'matrixkoder', key: 'wakeSentAt', id: `claimAt:${pend.run}:${pend.upTo}` } as const
+    const claimAtRes = await $.state.get(claimAtRef).catch(() => ({ value: undefined }))
+    const claimAt = typeof claimAtRes.value === 'number' ? claimAtRes.value : undefined
+    const stale = claimAt !== undefined && now - claimAt > CLAIM_DEAD_MS
+    if (stale) {
+      const staleFlagRef = { plugin: 'matrixkoder', key: 'wakeSentAt', id: `staleClaim:${pend.run}:${pend.upTo}` } as const
+      const flagRes = await $.state.get(staleFlagRef).catch(() => ({ value: undefined }))
+      const flagSet = typeof flagRes.value === 'number' && flagRes.value > 0
+      if (flagSet) {
+        // second-time stale: consume the lines, drop the sentinel, do not retry
+        await $.state.set({ plugin: 'matrixkoder', key: 'wakeEventLines', id: pend.run } as const, await keepCursorForm($, pend.run, pend.upTo)).catch(() => {})
         askBodies.clear()
         await $.state.set(pendingRef, EMPTY_PENDING).catch(() => {})
-        await $.state.set(staleFlagRef, 1).catch(() => {})
         return
       }
-      // a flush holds this batch's claim (the sentinel kept run and upTo):
-      // rewriting the batch now would resurrect it under the flush — the
-      // lines stay unconsumed and re-enter the next tick's scan instead
+      // first-time stale: clear the claim, drop the sentinel, and set the once-flag. Do NOT
+      // reset wakeEventLines to 0 — it already holds the right resume point (the dead batch
+      // never advanced it: only a successful submit moves it). Resetting to 0 re-scans the
+      // whole run history and rewakes every transition that is still in a wake status
+      // (the flush-time re-read only drops tasks that moved), producing a bogus prompt that
+      // names tasks the held batch never carried.
+      await $.state.set(claimAtRef, 0).catch(() => {})
+      await $.state.set({ plugin: 'matrixkoder', key: 'wakeSentAt', id: `claim:${pend.run}:${pend.upTo}` } as const, 0).catch(() => {})
+      askBodies.clear()
+      await $.state.set(pendingRef, EMPTY_PENDING).catch(() => {})
+      await $.state.set(staleFlagRef, 1).catch(() => {})
       return
     }
-    const items = [...pend.items]
-    for (const item of newlyDiscovered) {
-      // askId joins the identity: undefined === undefined keeps plain items deduped as before
-      if (!items.some(p => p.task === item.task && p.to === item.to && p.askId === item.askId)) items.push(item)
-    }
-    if (items.length === 0) {
-      await $.state.set(stateRef, idCursorOf(maxCursor)).catch(() => {}) // nothing to wake for: safe to move on
-      return
-    }
-    // lines are NOT marked seen yet: that happens after the submit (flushBatch)
-    // upTo is the last event considered (store: its id, so a gap 2,4 leaves the cursor at 4), not a row count
-    await $.state.set(pendingRef, { run: active.id, upTo: maxCursor, items }).catch(() => {})
-    armDebounce($)
-  } catch {
-    // silent on fs/poll error
+    // a flush holds this batch's claim (the sentinel kept run and upTo):
+    // rewriting the batch now would resurrect it under the flush — the
+    // lines stay unconsumed and re-enter the next tick's scan instead
+    return
   }
+  // the other run's batch holds the one pending slot: these events stay unconsumed for a later tick.
+  // A plan run's new wake outranks a waiting bugs batch: the plan batch takes the slot (and the debounce
+  // or retry the bugs batch armed); the bugs cursor has not moved (only a submit moves it), so the
+  // bugs events re-form on a later scan.
+  let kept = pend.items
+  if (pend.items.length > 0 && pend.run !== runId) {
+    if (!(isBugsRun(pend.run) && !isBugsRun(runId) && newlyDiscovered.length > 0)) return
+    kept = []
+  }
+  const items = [...kept]
+  for (const item of newlyDiscovered) {
+    // askId joins the identity: undefined === undefined keeps plain items deduped as before
+    if (!items.some(p => p.task === item.task && p.to === item.to && p.askId === item.askId)) items.push(item)
+  }
+  if (items.length === 0) {
+    await $.state.set(stateRef, idCursorOf(maxCursor)).catch(() => {}) // nothing to wake for: safe to move on
+    return
+  }
+  // lines are NOT marked seen yet: that happens after the submit (flushBatch)
+  // upTo is the last event considered (store: its id, so a gap 2,4 leaves the cursor at 4), not a row count
+  await $.state.set(pendingRef, { run: runId, upTo: maxCursor, items }).catch(() => {})
+  armDebounce($)
 }
 
 export function registerWake(on: On, options: PluginOptions): void {

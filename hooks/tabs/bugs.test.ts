@@ -136,6 +136,26 @@ test('SIMPLE: Enter with text files it, an empty Enter opens the form; the picke
   expect(acts.at(-1)).toEqual(['fixed', 'B3'])
   expect(sets.at(-1)).toEqual(['bugs:sel', 'B3'])
   expect(acts, 'to lane is inert').toHaveLength(2)
+  expect(allText(picked), 'its tasks are not loaded yet').toContain('to lane: loading tasks…')
+})
+
+test('LANE 5: SIMPLE ▶ to lane submits mk: dispatch bug <task id> for the picked bug\'s only task; off with a note otherwise', () => {
+  const state = new Map<string, string>([['bugs:pick', 'B3']])
+  const sent: string[] = []
+  const { ui } = uiOf(state)
+  const withSubmit: BugsUi = { ...ui, submit: t => { sent.push(t) } }
+  const task = (over: Record<string, unknown>) => ({ ...SHOW_B3, plan: { ...SHOW_B3.plan, phases: [{ ...SHOW_B3.plan.phases[0]!, tasks: [{ id: 'B3.2', title: 'draw the column', status: 'building', subtasks: [], ...over }] }] } })
+  const ok = SimpleView(stubEls, viewOf({ detail: bugDetailView(task({ acceptance: 'the column draws' }), 'matrixkoder') }), 46, withSubmit)
+  expect(button(ok, 'bugs-pick-lane')?.props?.dimColor).not.toBe(true)
+  press(ok, 'bugs-pick-lane')
+  expect(sent).toEqual(['mk: dispatch bug B3.2'])
+  const noAcc = SimpleView(stubEls, viewOf({ detail: bugDetailView(task({}), 'matrixkoder') }), 46, withSubmit)
+  expect(allText(noAcc)).toContain('to lane: no acceptance')
+  press(noAcc, 'bugs-pick-lane')
+  const two = SimpleView(stubEls, viewOf({ detail: bugDetailView(SHOW_B3, 'matrixkoder') }), 46, withSubmit)
+  expect(allText(two)).toContain('to lane: pick a task in the detail')
+  press(two, 'bugs-pick-lane')
+  expect(sent, 'off presses send nothing').toEqual(['mk: dispatch bug B3.2'])
 })
 
 test('LIST: the status, kind and sort filters; a card has its two-line head and expands to the task tree', () => {

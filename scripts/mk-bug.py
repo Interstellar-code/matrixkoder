@@ -13,6 +13,9 @@
   subtask add <task id> --title=T [--acceptance=A]
   check <file>  |  import <file> [--dry-run]  |  drafts      bug draft files (templates/bug.md)
   draft --title=T [the flags of new] [--tasks=<one task title per line>]
+  dispatch <task id> [--route="<agent> <model> [<effort>]"] [--owned=<glob,glob>]
+      task round + brief (templates/brief.md, bug variant) + mk-lane.py acquire on run bugs; replies
+      the mk-lane-event.py arm/dispatch commands to run next. Never starts an agent.
   --self-test
 
 Common: --home DIR, --project SLUG or --data DIR (as mkdb.py), --by WHO (default mk-bug). Every
@@ -28,7 +31,7 @@ writes keep it. A deleted bug leaves a note event, so its id is never handed out
 Drafts are <project>/bugs/<slug>.md (mkpaths.bugs_dir); `import` creates the bug through new/task
 add and moves the file to bugs/archive/B<n>-<file> (a file outside bugs/ is copied there and kept).
 """
-import argparse, datetime, hashlib, importlib.util, json, os, re, shutil, subprocess, sys, tempfile, tomllib
+import argparse, datetime, hashlib, importlib.util, json, os, re, shlex, shutil, subprocess, sys, tempfile, tomllib
 
 sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -538,6 +541,246 @@ def cmd_task_set(ctx, a):
     return {"ok": True, "task": _task_obj(ctx, a.id)}
 
 
+# --- dispatch (phase LANE): round + brief + lane acquire on run bugs; never starts an agent --------
+
+BRIEF_TMPL = os.path.join(os.path.dirname(HERE), "skills", "matrixkoder", "templates", "brief.md")
+
+
+def kinds_arm():
+    """lane-health.py's KINDS (the mk-lane-event.py arm --kind values), loaded by path."""
+    spec = importlib.util.spec_from_file_location("lane_health", os.path.join(HERE, "lane-health.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.KINDS
+
+
+def _repo(ctx):
+    """The project's registered repo (root projects.repo) when it is a folder, else the cwd: the
+    main checkout mk-lane.py acquire works from."""
+    con = mkdb._open_read(mkpaths.root_db(ctx.home), mkdb.ROOT_SCHEMA)
+    try:
+        row = con.execute("SELECT repo FROM projects WHERE slug=?", (ctx.slug,)).fetchone() if con else None
+    finally:
+        if con is not None:
+            con.close()
+    return row["repo"] if row and row["repo"] and os.path.isdir(row["repo"]) else os.getcwd()
+
+
+def _other_lanes(ctx, tid):
+    con = ctx.ro()
+    try:
+        rows = con.execute("SELECT run, id FROM tasks WHERE lane IS NOT NULL AND lane != '' AND NOT"
+                           " (run=? AND id=?) ORDER BY run, id", (BUGS, tid)).fetchall()
+    finally:
+        con.close()
+    return ", ".join(f"{r['id']} (run {r['run']})" for r in rows) or "no other lane"
+
+
+def _base_sha(repo, ref):
+    r = subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "--quiet", "--end-of-options",
+                        ref + "^{commit}"], capture_output=True, text=True, timeout=60)
+    return r.stdout.strip()[:12] if r.returncode == 0 and r.stdout.strip() else f"the tip of {ref}"
+
+
+def _slots(line, values):
+    """Fill every `<slot>` of one template line from values; an unknown slot is a template drift."""
+    def one(m):
+        if m.group(1) not in values:
+            raise Fail(f"brief template slot <{m.group(1)}> has no bug value: update mk-bug dispatch")
+        return values[m.group(1)]
+    return re.sub(r"<([^<>\n]+)>", one, line)
+
+
+def brief_text(v):
+    """templates/brief.md filled for one bug task (the plan-less variant). v: the values below."""
+    with open(BRIEF_TMPL, encoding="utf-8") as fh:
+        tmpl = fh.read().splitlines()
+    t, n = v["task"], v["round"]
+    bodies = {"## Spec": v["spec"], "## Files you own": v["owned"], "## Real inputs": v["inputs"],
+              "## Parallel parts": ["none, because a bug task is one focused fix: work it alone."]}
+    lines = {"- Risk:": f"- Risk: {v['risk']}. Critical: no.",
+             "- Gates:": "- Gates: none (run bugs has no plan gates). You run the ones in Commands.",
+             "<required tests": "A test that reproduces the bug through the real code path: it fails on the "
+                                "old code and passes with the fix; the acceptance in Spec is what it checks. Mock "
+                                "only the network edge (fetch / engine client), never the module under test. Prove "
+                                "the fail-on-old-code with the mk-builder skill's proof method "
+                                "(reference/lane-rules.md R13) — follow it as written.",
+             "- Install:": "- Install: none, unless the repo's README needs a step for the files you change",
+             "- Tests:": "- Tests: the tests covering the files you change, one command each (known unrelated "
+                         "failures: none known). Not the full suite; mk-builder skill R33.",
+             "- Types:": "- Types: the repo's typecheck, when it has one, gains no new error; nothing new in "
+                         "the files you own",
+             "- Lint/format": "- Lint/format ONLY changed files with the repo's own tools — never repo-wide",
+             "- Banned commands": "- Banned commands (repo list): none beyond the mk-builder lane rules",
+             "- Commit:": f"- Commit: subject `fix(bugs): {t} ` plus a short summary, blank line, "
+                          "`Co-Authored-By: ` your agent/model name and email."}
+    rules = {"n": str(n), "PHASE": t, "report path in this lane": f".matrixkoder-report-r{n}.md",
+             "question": "<question>"}  # the BLOCKED token's own syntax stays
+    out, skip, sec = [], None, None
+    for line in tmpl:
+        if line.startswith("## "):
+            sec = line
+            skip = line if line.startswith(("## TAKEOVER", "## FIX", "## LEAD")) or line in bodies else None
+            if line in bodies:
+                out += [line, *bodies[line], ""]
+                continue
+        if skip == "plan repo":
+            skip = None
+            if not line.strip():
+                continue
+        if skip:
+            continue
+        if line.startswith("# <PHASE>"):
+            line = f"# {t} — {v['title']}"
+        elif line.startswith("Repo: "):
+            skip = "plan repo"  # the plan variant and the blank line after it
+            continue
+        elif line.startswith("Repo, bug variant"):
+            line = "Repo: " + _slots(line.split("): ", 1)[1], v["repo"])
+        elif line.startswith("What it is"):
+            line = f"What it is (plain English): {v['what']}"
+        elif any(line.startswith(k) for k in lines):
+            line = next(lines[k] for k in lines if line.startswith(k))
+        elif sec == "## Rules":
+            line = _slots(line, rules)
+        out.append(line)
+    return "\n".join(out).rstrip("\n") + "\n"
+
+
+def _route(text):
+    parts = (text or "").split()
+    if text is not None and len(parts) not in (2, 3):
+        raise Fail(f"--route {text!r}: want \"<agent> <model> [<effort>]\"")
+    return dict(zip(("agent", "model", "effort"), parts))
+
+
+def cmd_dispatch(ctx, a):
+    """Contract LANE.1: validate, round, brief, lane acquire; the arm/dispatch commands to run next."""
+    tid = a.id
+    if not isinstance(tid, str) or not re.match(r"^B[1-9][0-9]*(\.[1-9][0-9]*){1,2}$", tid):
+        raise Fail(f"bad task id {tid!r}: want B<n>.<m> or B<n>.<m>.<k> (a bug row B<n> is never dispatched)")
+    row = _task_obj(ctx, tid)
+    if row["type"] not in ("task", "subtask"):
+        raise Fail(f"{tid} is a {row['type']} row: dispatch takes a task or subtask")
+    if not (row["acceptance"] or "").strip():
+        raise Fail(f"task {tid} has no acceptance: set it first (mk-bug task set {tid} --acceptance=...)")
+    if row["lane"]:
+        raise Fail(f"task {tid} already has a lane ({row['lane']}): a fix round reuses it, never a second acquire")
+    bug = _one(ctx, tid.split(".")[0])
+    if row["status"] in DONE or bug["status"] in ("fixed", "wontfix"):
+        raise Fail(f"task {tid} is {row['status']} and bug {bug['id']} is {bug['status']}: reopen it before a dispatch")
+    con = ctx.ro()
+    try:
+        prior = con.execute("SELECT round FROM tasks WHERE run=? AND id=?", (BUGS, tid)).fetchone()["round"] or 0
+    finally:
+        con.close()
+    if prior > 0:
+        raise Fail(f"task {tid} is at round {prior} with no lane: an earlier dispatch stopped part way (its error "
+                   "named what was done). Finish that by hand (mk-state task check, then mk-lane.py acquire "
+                   f"--run {BUGS} --task {tid} from the repo), never a second round")
+    route = _route(a.route)
+    owned = _labels(a.owned) if a.owned is not None else ctx.state("--run", BUGS, "task", "get", tid)["task"].get("owned") or []
+    if not owned:
+        raise Fail(f"task {tid} owns no files: pass --owned=<glob,glob> (a briefed task needs owned)")
+    done = []
+
+    def step(what, fn, wrote=True):  # wrote=False: a lookup, never listed as done
+        try:
+            out = fn()
+        except Exception as e:  # Fail, and a TimeoutExpired / OSError from a step's subprocess or file
+            if not done:
+                raise
+            raise Fail(f"dispatch {tid}: done: {'; '.join(done)}; then {what} failed: {e}. "
+                       "Nothing was undone: fix the cause and finish by hand, or free what was done")
+        if wrote:
+            done.append(what)
+        return out
+
+    sets = ([f"owned={','.join(owned)}"] if a.owned is not None else []) + [f"{k}={v}" for k, v in route.items()]
+    if sets:
+        step("task set " + " ".join(sets), lambda: ctx.state("--run", BUGS, "task", "set", tid, *sets))
+    rnd = step("task round", lambda: ctx.state("--run", BUGS, "task", "round", tid, "--kind", "build",
+                                               "--cause", "mk-bug dispatch"))
+    n, path = rnd["round"], rnd["brief"]
+    repo = step("repo lookup", wrote=False, fn=lambda: _repo(ctx))
+    integ = step("integration branch", wrote=False, fn=lambda: _integration(ctx))
+    reasons = step("risk list", wrote=False, fn=lambda: ctx.state("--run", BUGS, "risk", "list", tid))
+    open_r = [r for r in reasons.get("reasons") or [] if not r.get("cleared")]
+    risk = (f"{reasons['risk'].get(tid, 1)}: " + "; ".join(f"{r['kind']} {r['points']} ({r.get('source') or 'no source'})"
+                                                          for r in open_r)) if open_r else "1, no open reasons"
+    m = bug
+    facts = [f"{k}: {m[k]}" for k in ("kind", "severity", "area", "found_in", "source") if m.get(k)]
+    parts = [[f"Bug {bug['id']}: {bug['title']} ({', '.join(facts)})."]]
+    for k, label in (("description", "Description"), ("steps", "Steps"), ("expected", "Expected"),
+                     ("actual", "Actual")):
+        if m.get(k):
+            parts.append([f"{label}:", *("   " + x for x in m[k].splitlines())])
+    if row["type"] == "subtask":
+        ptitle = step("parent lookup", wrote=False, fn=lambda: _task_obj(ctx, row["parent"])["title"])
+        parts.append([f"This is a subtask of {row['parent']} ({ptitle})."])
+    parts.append([f"Task {tid}: {row['title']}. Fix the cause, the smallest change that meets:",
+                  *("   Acceptance: " + x for x in row["acceptance"].splitlines() if x.strip())])
+    spec = [f"{i}. {p[0]}" if j == 0 else p[j] for i, p in enumerate(parts, 1) for j in range(len(p))]
+    sha = step("base sha", wrote=False, fn=lambda: _base_sha(repo, integ))
+    text = step("brief text", wrote=False, fn=lambda: brief_text({
+        "task": tid, "round": n, "title": row["title"], "risk": risk, "spec": spec,
+        "what": f"bug {bug['id']}: {bug['title']}." + (f" {' '.join(bug['description'].split())}"
+                                                       if bug["description"] else ""),
+        "owned": [*owned, "Do NOT touch: anything outside the list above."],
+        "inputs": ["The bug's own steps in Spec, run on the real code path; real data where the steps name it."],
+        "repo": {"path": "this lane's worktree", "branch": f"mk/{BUGS}/{tid.lower()}", "sha": sha,
+                 "stack": "see the repo README", "bug id": bug["id"], "T": tid,
+                 "bug task folder": os.path.dirname(path), "lanes + their areas": _other_lanes(ctx, tid)}}))
+    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as fh:
+        fh.write(text)
+    try:
+        step("task brief", lambda: ctx.state("--run", BUGS, "task", "brief", tid, "--file", fh.name))
+    finally:
+        os.unlink(fh.name)
+    def check():  # passes when the checks above hold; never acquire on a failing check
+        r = subprocess.run([sys.executable, os.path.join(HERE, "mk-state.py"), "--data", ctx.folder, "--run", BUGS,
+                            "task", "check", tid], capture_output=True, text=True, timeout=600)
+        try:
+            got = json.loads(r.stdout.strip().splitlines()[-1])
+        except (IndexError, ValueError):
+            got = {}
+        if not got.get("ok"):
+            raise Fail(f"missing {got.get('missing')}" if got.get("missing") else (r.stderr or r.stdout).strip()[:300])
+    step("task check", check)
+
+    def acquire():
+        r = subprocess.run([sys.executable, os.path.join(HERE, "mk-lane.py"), "--data", ctx.folder, "acquire",
+                            "--run", BUGS, "--task", tid], capture_output=True, text=True, timeout=600, cwd=repo)
+        try:
+            got = json.loads(r.stdout.strip().splitlines()[-1])
+        except (IndexError, ValueError):
+            raise Fail((r.stderr or r.stdout).strip()[:400] or f"exit {r.returncode}")
+        if r.returncode != 0 or not got.get("ok"):
+            raise Fail(" ".join(str(got.get(k)) for k in ("error", "stderr") if got.get(k)) or f"exit {r.returncode}")
+        return got
+    lane = step("lane acquire", acquire)
+    con = ctx.ro()
+    try:
+        r = con.execute("SELECT * FROM tasks WHERE run=? AND id=?", (BUGS, tid)).fetchone()
+    finally:
+        con.close()
+    task = {**_task_obj(ctx, tid), "slot": r["slot"], "branch": r["branch"], "round": r["round"]}
+    q = shlex.quote
+    py = f"python3 {q(os.path.join(HERE, 'mk-lane-event.py'))}"
+    kind = route.get("agent") if route.get("agent") in kinds_arm() else "<kind>"
+    grep = r"^fix\(bugs\): " + re.escape(tid) + " "
+    report = os.path.join(lane["path"], f".matrixkoder-report-r{n}.md")
+    arm = (f"{py} arm --lane {q(lane['path'])} --pane <pane> --task {tid} --run {BUGS} --data {q(ctx.folder)}"
+           f" --phase {q(f'{tid} R{n}')} --commit-grep {q(grep)} --report {q(report)} --kind {kind}")
+    say = f"Read and follow {path} exactly; the last line of your reply must be {tid} R{n} DONE"
+    disp = f"{py} dispatch --connect --pane <pane> --task {tid} --text {q(say)}" + "".join(
+        f" --{k} {q(v)}" for k, v in route.items())
+    out = {"ok": True, "task": task, "lane": r["lane"], "branch": r["branch"], "brief": path, "next": [arm, disp]}
+    if lane.get("warning"):
+        out["warning"] = lane["warning"]
+    return out
+
+
 # --- drafts (phase DRAFT): <project>/bugs/<slug>.md, templates/bug.md -----------------------------
 
 DRAFT_KEYS = ("bug", "title", "kind", "severity", "found_in", "area", "labels", "source")
@@ -859,10 +1102,12 @@ def _cli(argv):
     dr = sub.add_parser("draft")
     _meta_flags(dr, title_required=True)
     dr.add_argument("--tasks")
+    dp = sub.add_parser("dispatch")
+    dp.add_argument("id"), dp.add_argument("--route"), dp.add_argument("--owned")
     a = p.parse_args(rest)
     if a.cmd is None or (a.cmd in ("task", "subtask") and a.verb is None):
         raise Fail("usage: mk-bug.py list|show|new|set|close|reopen|delete|task add|task set|subtask add"
-                   "|check|import|drafts|draft  (or --self-test)")
+                   "|check|import|drafts|draft|dispatch  (or --self-test)")
     if a.cmd == "check":  # a file check needs no project
         return cmd_check(a.file)
     ctx = Ctx(known.home, known.project, known.data, known.by)
@@ -887,6 +1132,8 @@ def _cli(argv):
         return cmd_reopen(ctx, a.id)
     if a.cmd == "delete":
         return cmd_delete(ctx, a.id)
+    if a.cmd == "dispatch":
+        return cmd_dispatch(ctx, a)
     if a.verb == "add":
         return cmd_add(ctx, a.id, a.title, a.acceptance, a.cmd == "subtask")
     return cmd_task_set(ctx, a)
@@ -1196,11 +1443,118 @@ def _import_fixes(home, data, run):
     _check(msg == "store file exists but is read-only", f"retry on a non-clash: {msg}")
 
 
+def _dispatch(home, data, run, refused):
+    """Phase LANE: dispatch refusals, a good dispatch on a temp git repo (MK_HERDR=none, as
+    mk-lane.py's own self-test), the brief it writes, and a failure after round/brief reported."""
+    tmp = os.path.dirname(data)
+    repo, other = os.path.join(tmp, "repo"), os.path.join(tmp, "notgit")
+    os.makedirs(repo), os.makedirs(other)
+
+    def g(*args):
+        r = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True, timeout=60)
+        _check(r.returncode == 0, f"git {args}: {r.stderr}")
+    g("init", "-q", "-b", "main"), g("config", "user.email", "t@t"), g("config", "user.name", "t")
+    with open(os.path.join(repo, "README.md"), "w") as fh:
+        fh.write("x\n")
+    g("add", "-A"), g("commit", "-qm", "base"), g("branch", "dev")  # dev: the config's integration branch
+
+    def point(path):  # the registered project's repo, which dispatch runs mk-lane.py acquire from
+        root = mkdb.open_root(home)
+        try:
+            root.execute("UPDATE projects SET repo=? WHERE slug='bugdemo'", (path,))
+            root.commit()
+        finally:
+            root.close()
+    point(repo)
+    bid = run("new", "--title=lane bug", "--kind=cli", "--description=crash on <x>", "--steps=run it")["bug"]["id"]
+    bare = run("task", "add", bid, "--title=no acceptance")["task"]["id"]
+    good = run("task", "add", bid, "--title=fix the crash", "--acceptance=no crash\nexit 0")["task"]["id"]
+    late = run("task", "add", bid, "--title=second", "--acceptance=works")["task"]["id"]
+    # LANE.1.a2: refusals, nothing written; mk-state's own task check refuses the same task
+    refused("dispatch", bid, want="bug row")
+    refused("dispatch", bare, want="no acceptance")
+    def chk(tid, *flags):
+        r = subprocess.run([sys.executable, os.path.join(HERE, "mk-state.py"), "--data", data, "--run", BUGS,
+                            "task", "check", tid, *flags], capture_output=True, text=True, timeout=120)
+        return json.loads(r.stdout.strip().splitlines()[-1])
+    got = chk(bare)
+    _check(got["ok"] is False and got["type"] == "task" and "acceptance" in got["missing"], f"task check {got}")
+    refused("dispatch", good, want="owns no files")
+    refused("dispatch", good, "--owned=a.py", "--route=claude", want="--route")
+    _check(_task_obj(Ctx(home, None, data, None), good)["lane"] is None
+           and not os.path.exists(mkpaths.task_dir(data, BUGS, good)), "a refused dispatch wrote")
+    # LANE.1.a1: round, brief, acquire; lane/branch/slot on the row; next = arm + dispatch
+    got = run("dispatch", good, "--owned=src/x.py,tests/x_test.py", "--route=claude opus high")
+    lane = got["lane"]
+    _check(set(got) == {"ok", "task", "lane", "branch", "brief", "next"} and got["ok"]
+           and got["branch"] == f"mk/{BUGS}/{good.lower()}" and lane and os.path.isdir(lane)
+           and str(got["task"]["slot"]) == "1" and got["task"]["lane"] == lane and got["task"]["round"] == 1
+           and got["brief"] == os.path.join(mkpaths.task_dir(data, BUGS, good), "brief-r1.md"), f"dispatch {got}")
+    arm, disp = got["next"]
+    _check("mk-lane-event.py arm" in arm and f"--task {good}" in arm and "--kind claude" in arm
+           and "--run bugs" in arm and lane in arm, f"next arm {arm}")
+    _check("mk-lane-event.py dispatch --connect --pane <pane>" in disp and got["brief"] in disp
+           and f"{good} R1 DONE" in disp and "--agent claude --model opus --effort high" in disp, f"next {disp}")
+    with open(got["brief"], encoding="utf-8") as fh:
+        text = fh.read()
+    spec = importlib.util.spec_from_file_location("brief_check", os.path.join(HERE, "brief-check.py"))
+    bc = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bc)
+    rules = [x for x in bc.rules_block(text) if x.strip()]
+    _check(bc.placeholder_failures(text) == [] and len(rules) <= 4 and "mk-builder" in rules[0]
+           and "round R1" in rules[0] and f"`{good} R1 DONE`" in rules[0], f"brief-check: {text}")
+    _check(text.startswith(f"# {good} — fix the crash\n") and "Plan `" not in text and f"Bug `{bid}`" in text
+           and "Acceptance: no crash" in text and "Acceptance: exit 0" in text and "crash on <x>" in text
+           and "src/x.py" in text and "## TAKEOVER" not in text and "## FIX" not in text, f"brief text {text}")
+    bc_cli = subprocess.run([sys.executable, os.path.join(HERE, "brief-check.py"), got["brief"]],
+                            capture_output=True, text=True, timeout=60)
+    _check(bc_cli.returncode == 0 and "brief-check ok" in bc_cli.stdout, f"brief-check CLI {bc_cli.stdout}")
+    at = chk(good, "--at-dispatch")
+    _check(at["ok"] and at["type"] == "task", f"task check --at-dispatch {at}")
+    refused("dispatch", good, want="already has a lane")
+    # a failure after round/brief names what was done (no silent half-state)
+    point(other)
+    try:
+        run("dispatch", late, "--owned=b.py")
+        raise SystemExit("SELF-TEST FAIL: dispatch on a non-git repo succeeded")
+    except Fail as e:
+        msg = str(e)
+    point(repo)
+    _check("done: task set owned=b.py; task round; task brief; task check; then lane acquire failed" in msg, msg)
+    # that half-dispatched task (round 1, no lane) is refused, never a round 2
+    refused("dispatch", late, "--owned=b.py", want=f"task {late} is at round 1 with no lane")
+    # a step after the round that raises a non-Fail (a missing brief template: OSError) still names what was done
+    drift = run("task", "add", bid, "--title=third", "--acceptance=ok")["task"]["id"]
+    saved = globals()["BRIEF_TMPL"]
+    globals()["BRIEF_TMPL"] = os.path.join(tmp, "no-such-brief.md")
+    try:
+        run("dispatch", drift, "--owned=c.py")
+        raise SystemExit("SELF-TEST FAIL: dispatch without a brief template succeeded")
+    except Fail as e:
+        msg = str(e)
+    finally:
+        globals()["BRIEF_TMPL"] = saved
+    _check("done: task set owned=c.py; task round; then brief text failed" in msg and "no-such-brief" in msg, msg)
+    # a done task, or a task of a fixed / wontfix bug, is refused
+    b2 = run("new", "--title=closed bug", "--kind=cli")["bug"]["id"]
+    t2 = run("task", "add", b2, "--title=t", "--acceptance=ok")["task"]["id"]
+    run("close", b2)
+    refused("dispatch", t2, "--owned=d.py", want=f"bug {b2} is fixed")
+    run("close", b2, "--wontfix")
+    refused("dispatch", t2, "--owned=d.py", want=f"bug {b2} is wontfix")
+    run("reopen", b2)
+    run("task", "set", t2, "--status=done")
+    refused("dispatch", t2, "--owned=d.py", want=f"task {t2} is done")
+
+
 def self_test():
     with tempfile.TemporaryDirectory() as tmp:
         home = os.path.join(tmp, "home")
-        saved = {k: os.environ.get(k) for k in ("MK_HOME", "MATRIXKODER_HOME", "MK_SELFTEST", "MATRIXKODER_DATA")}
-        os.environ.update(MK_HOME=home, MATRIXKODER_HOME=home, MK_SELFTEST="1")
+        saved = {k: os.environ.get(k) for k in ("MK_HOME", "MATRIXKODER_HOME", "MK_SELFTEST", "MATRIXKODER_DATA",
+                                                "MK_HERDR", "MK_OMP_USER_SKILLS")}
+        # dispatch's mk-lane.py acquire: no herdr, and a temp stand-in for the user-level omp skills
+        os.environ.update(MK_HOME=home, MATRIXKODER_HOME=home, MK_SELFTEST="1", MK_HERDR="none",
+                          MK_OMP_USER_SKILLS=os.path.join(tmp, "omp-skills"))
         os.environ.pop("MATRIXKODER_DATA", None)
         data, bare = os.path.join(tmp, "proj"), os.path.join(tmp, "bare")
         os.makedirs(data), os.makedirs(bare)
@@ -1350,6 +1704,7 @@ def self_test():
         _review_fixes(home, data, run, refused)
         _drafts(home, data, run, refused)
         _import_fixes(home, data, run)
+        _dispatch(home, data, run, refused)
         mkdb.selftest_guard_probe(home)
         for k, v in saved.items():
             if v is None:

@@ -10,7 +10,7 @@ const overview = { ok: true, projects: [{ slug: 'matrixkoder', repo: '/x/matrixk
 const reply = (body: unknown, exitCode = 0) => ({
   value: { exitCode, stdout: JSON.stringify(body), stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
 })
-type Task = { id: string; title: string; status: string }
+type Task = { id: string; title: string; status: string; acceptance?: string; slot?: number }
 type Bug = { id: string; title: string; status: string; task_status: string; severity: string; kind: string; source: string; tasks: Task[] }
 const SEED = (): Bug[] => [
   { id: 'B2', title: 'kanban drops a card', status: 'fixing', task_status: 'building', severity: 'high', kind: 'frontend', source: '', tasks: [{ id: 'B2.1', title: 'map the status', status: 'building' }] },
@@ -146,11 +146,47 @@ test('UI.4: a row opens its card, ↵ open reads show and draws the detail, ✓ 
   await w.settle()
   expect(w.bugCalls('close').at(-1)!.slice(2)).toEqual([...HEAD, 'close', 'B2'])
   expect(await ui.find({ type: 'Button', key: 'bug-act-fixed' }), 'a fixed bug offers no ✓ fixed').toBeUndefined()
-  await ui.press({ key: 'bug-act-handoff' })
-  await w.settle()
   await ui.press({ key: 'bug-back' })
   await w.settle()
-  expect(await ui.find({ text: /handoff: comes with lane dispatch/ })).toBeTruthy()
+  expect(await ui.find({ text: /comes with lane dispatch/ }), 'the placeholder note is gone').toBeUndefined()
+})
+
+test('LANE 5: ▶ to lane, hand off, nudge and open pane submit their mk: line through the prompt path; nudge and open pane are off without a lane', { plugins: [worldFixtures] }, async ($, on) => {
+  const w = await world(on)
+  const submitted: { text: string; asUser?: boolean }[] = []
+  on('prompt.submit', (_$, e) => { submitted.push({ text: e.text, asUser: (e.origin as { asUser?: boolean }).asUser }); return { text: e.text } })
+  w.bugs[0]!.tasks[0]!.acceptance = 'the card stays on its column'
+  await $.session.start(sessionStart())
+  await w.settle()
+  const ui = await mount($)
+  await ui.press({ key: 'dash-tab-bugs' })
+  await w.settle()
+  await ui.press({ key: 'bugs-row-B2' }) // the pick loads the bug's tasks at once
+  await w.settle()
+  expect(w.bugCalls('show').at(-1)!.slice(2)).toEqual([...HEAD, 'show', 'B2'])
+  await ui.press({ key: 'bugs-pick-lane' })
+  await w.settle()
+  expect(submitted).toEqual([{ text: 'mk: dispatch bug B2.1', asUser: true }])
+  await ui.press({ key: 'bugs-pick-open' })
+  await w.settle()
+  await ui.press({ key: 'bug-act-handoff' })
+  await w.settle()
+  expect(submitted.at(-1)).toEqual({ text: 'mk: hand off bug B2.1', asUser: true })
+  expect(await ui.find({ text: /open pane, nudge: no lane/ })).toBeTruthy()
+  const n = w.calls.length
+  await ui.press({ key: 'bug-act-nudge' })
+  await w.settle()
+  expect(w.calls.length, 'an off nudge runs nothing').toBe(n)
+  expect(submitted).toHaveLength(2)
+  w.bugs[0]!.tasks[0]!.slot = 2 // the task gets a lane
+  await w.clock.advance(5000)
+  await w.settle()
+  expect(await ui.find({ text: /no lane/ }), 'the lane turns nudge and open pane on').toBeUndefined()
+  await ui.press({ key: 'bug-act-nudge' })
+  await ui.press({ key: 'bug-act-open-pane' })
+  await w.settle()
+  expect(submitted.slice(2)).toEqual([{ text: 'mk: nudge bug B2.1', asUser: true }, { text: 'mk: open pane bug B2.1', asUser: true }])
+  expect(w.bugCalls().every(a => a[6] === 'list' || a[6] === 'show'), 'the lane presses run no mk-bug verb').toBe(true)
 })
 
 test('UI.3: the kanban sub-tab draws the bug board and a card press opens the detail', { plugins: [worldFixtures] }, async ($, on) => {

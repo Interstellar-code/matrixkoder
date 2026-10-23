@@ -1719,9 +1719,9 @@ test('BRUN.1: storeProbe polls the plan run when the bugs run is older', { optio
   runsReader(on, feed, seen)
   await $.session.start(START('/tmp'))
   await clock.advance(30000)
-  expect(eventRuns(seen), 'only the plan run is read').toEqual(['r1'])
+  expect(eventRuns(seen), 'the plan run first, then run bugs (LANE 4)').toEqual(['r1', 'bugs'])
   expect(w.store.get('wakeEventLines:r1'), 'baseline is on the plan run').toBe(-2)
-  expect(w.store.has('wakeEventLines:bugs')).toBe(false)
+  expect(w.store.get('wakeEventLines:bugs'), 'run bugs keeps its own cursor').toBe(-2)
 
   feed.rows.r1 = [...feed.rows.r1, storeRow(2, 'F8', 'stalled', 'lane-watch')]
   feed.tasks = { F6: 'verifying', F8: 'stalled' }
@@ -1731,7 +1731,7 @@ test('BRUN.1: storeProbe polls the plan run when the bugs run is older', { optio
   expect(w.submitted).toEqual(['MatrixKoder: F8 → stalled. Continue the run from its Next action.'])
 })
 
-test('BRUN.1: with only the bugs run active there is no active run', { options: { wake: true } }, async ($, on) => {
+test('BRUN.1: with only the bugs run active there is no plan run; bugs history does not wake', { options: { wake: true } }, async ($, on) => {
   const clock = mock.clock(on)
   const w = wakeWorld(on, { '/data/mk.db': '' }, [], { MATRIXKODER_DATA: '/data' }, '/tmp')
   const seen: string[][] = []
@@ -1741,9 +1741,98 @@ test('BRUN.1: with only the bugs run active there is no active run', { options: 
   await clock.advance(30000)
   await clock.advance(60000)
   expect(seen.some(a => a.includes('run-snapshot')), 'the store was asked').toBe(true)
-  expect(eventRuns(seen), 'no feed is read: there is no active run').toEqual([])
-  expect(w.store.has('wakeEventLines:bugs')).toBe(false)
+  expect(eventRuns(seen).every(r => r === 'bugs'), 'only run bugs is read: there is no plan run').toBe(true)
+  expect(w.store.get('wakeEventLines:bugs'), 'baseline, no wake for history').toBe(-2)
   expect(w.submitted).toEqual([])
+})
+
+// ---------- LANE.1: run bugs wakes the orchestrator for lane-written transitions ----------
+
+test('LANE.1: a lane-written bug task transition wakes and the prompt names run bugs', { options: { wake: true } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const w = wakeWorld(on, { '/data/mk.db': '' }, [], { MATRIXKODER_DATA: '/data' }, '/tmp')
+  const seen: string[][] = []
+  const feed = { runs: [BUGS], rows: { bugs: [storeRow(1, 'B1', 'open', 'orchestrator')] } as Record<string, Record<string, unknown>[]>, tasks: {} as Record<string, string> }
+  runsReader(on, feed, seen)
+  await $.session.start(START('/tmp'))
+  await clock.advance(30000) // baseline run bugs
+  feed.rows.bugs = [...(feed.rows.bugs ?? []), { ...storeRow(2, 'B1.1', 'verifying', 'lane-2'), run: 'bugs' }]
+  feed.tasks = { 'B1.1': 'verifying' }
+  await clock.advance(30000)
+  await clock.advance(30000)
+  await clock.advance(60000)
+  expect(w.submitted).toEqual(['MatrixKoder: run bugs: B1.1 → verifying. Continue that bug task in run bugs (mk-bug show <bug id>).'])
+  expect(w.store.get('wakeEventLines:bugs'), 'the bugs cursor moves past the woken id').toBe(-3)
+  expect(w.store.get('wakeSentAt:B1.1:verifying:bugs'), 'the cooldown key names run bugs').toBeDefined()
+})
+
+test('LANE.1: an orchestrator-written bug task transition does not wake', { options: { wake: true } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const w = wakeWorld(on, { '/data/mk.db': '' }, [], { MATRIXKODER_DATA: '/data' }, '/tmp')
+  const seen: string[][] = []
+  const feed = { runs: [BUGS], rows: { bugs: [storeRow(1, 'B1', 'open', 'orchestrator')] } as Record<string, Record<string, unknown>[]>, tasks: {} as Record<string, string> }
+  runsReader(on, feed, seen)
+  await $.session.start(START('/tmp'))
+  await clock.advance(30000) // baseline run bugs
+  feed.rows.bugs = [...(feed.rows.bugs ?? []), { ...storeRow(2, 'B1.1', 'blocked', 'orchestrator'), run: 'bugs' }]
+  feed.tasks = { 'B1.1': 'blocked' }
+  await clock.advance(30000)
+  await clock.advance(30000)
+  await clock.advance(60000)
+  expect(w.submitted, 'the orchestrator never wakes itself').toEqual([])
+  expect(w.store.get('wakeEventLines:bugs'), 'nothing to wake for: the cursor moves on').toBe(-3)
+})
+
+test('LANE.1: a plan run beside run bugs still wakes with its own prompt, then the bug wakes', { options: { wake: true } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const w = wakeWorld(on, { '/data/mk.db': '' }, [], { MATRIXKODER_DATA: '/data' }, '/tmp')
+  const seen: string[][] = []
+  const feed = { runs: [BUGS, RUN('r1')], rows: { bugs: [storeRow(1, 'B1', 'open', 'orchestrator')], r1: [storeRow(1, 'F6', 'planned', 'orchestrator')] } as Record<string, Record<string, unknown>[]>, tasks: {} as Record<string, string> }
+  runsReader(on, feed, seen)
+  await $.session.start(START('/tmp'))
+  await clock.advance(30000) // baseline both runs
+  feed.rows.r1 = [...(feed.rows.r1 ?? []), storeRow(2, 'F8', 'stalled', 'lane-watch')]
+  feed.rows.bugs = [...(feed.rows.bugs ?? []), { ...storeRow(2, 'B1.1', 'rework', 'lane-2'), run: 'bugs' }]
+  feed.tasks = { F8: 'stalled', 'B1.1': 'rework' }
+  await clock.advance(30000)
+  await clock.advance(30000)
+  await clock.advance(60000)
+  expect(w.submitted[0], 'the plan-run prompt is unchanged').toBe('MatrixKoder: F8 → stalled. Continue the run from its Next action.')
+  await clock.advance(30000)
+  await clock.advance(30000)
+  await clock.advance(60000)
+  expect(w.submitted, 'the bug batch follows once the slot is free').toEqual([
+    'MatrixKoder: F8 → stalled. Continue the run from its Next action.',
+    'MatrixKoder: run bugs: B1.1 → rework. Continue that bug task in run bugs (mk-bug show <bug id>).',
+  ])
+})
+
+test('LANE.1: a plan-run event takes the slot from a pending bugs batch; the bugs events wake after', { options: { wake: true } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const w = wakeWorld(on, { '/data/mk.db': '' }, [], { MATRIXKODER_DATA: '/data' }, '/tmp')
+  const seen: string[][] = []
+  const feed = { runs: [BUGS, RUN('r1')], rows: { bugs: [storeRow(1, 'B1', 'open', 'orchestrator')], r1: [storeRow(1, 'F6', 'planned', 'orchestrator')] } as Record<string, Record<string, unknown>[]>, tasks: {} as Record<string, string> }
+  runsReader(on, feed, seen)
+  await $.session.start(START('/tmp'))
+  await clock.advance(30000) // baseline both runs
+  feed.rows.bugs = [...(feed.rows.bugs ?? []), { ...storeRow(2, 'B1.1', 'rework', 'lane-2'), run: 'bugs' }]
+  feed.tasks = { 'B1.1': 'rework' }
+  await clock.advance(30000) // the bugs batch holds the slot, its debounce armed
+  expect(w.store.get('wakePending:'), 'the bugs batch is pending').toMatchObject({ run: 'bugs' })
+  feed.rows.r1 = [...(feed.rows.r1 ?? []), storeRow(2, 'F8', 'stalled', 'lane-watch')]
+  feed.tasks = { F8: 'stalled', 'B1.1': 'rework' }
+  await clock.advance(30000) // the plan event arrives while the bugs batch waits
+  await clock.advance(30000)
+  expect(w.submitted, 'the plan wake goes out first, on the armed debounce').toEqual([
+    'MatrixKoder: F8 → stalled. Continue the run from its Next action.',
+  ])
+  expect(w.store.get('wakeEventLines:bugs'), 'the bugs cursor did not move: its events re-form').toBe(-2)
+  await clock.advance(30000)
+  await clock.advance(60000)
+  expect(w.submitted, 'the bug batch follows once the slot is free').toEqual([
+    'MatrixKoder: F8 → stalled. Continue the run from its Next action.',
+    'MatrixKoder: run bugs: B1.1 → rework. Continue that bug task in run bugs (mk-bug show <bug id>).',
+  ])
 })
 
 test('BRUN.1: the plain cooldown key carries the run, so the same task id in another run still wakes', { options: { wake: true } }, async ($, on) => {

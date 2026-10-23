@@ -78,9 +78,11 @@ const SHOW = {
 function draw(state: Record<string, string> = {}, reply: unknown = SHOW, cols = 46) {
   const map = new Map(Object.entries(state))
   const acts: [BugActKind, string][] = []
-  const ui = { get: (k: string) => map.get(k), set: (k: string, v: string) => { map.set(k, v) }, bugAct: (kind: BugActKind, id: string) => { acts.push([kind, id]) } }
-  return { tree: BugDetailTab(stubEls, bugDetailView(reply, 'matrixkoder'), cols, ui), map, acts }
+  const sent: string[] = []
+  const ui = { get: (k: string) => map.get(k), set: (k: string, v: string) => { map.set(k, v) }, bugAct: (kind: BugActKind, id: string) => { acts.push([kind, id]) }, submit: (t: string) => { sent.push(t) } }
+  return { tree: BugDetailTab(stubEls, bugDetailView(reply, 'matrixkoder'), cols, ui), map, acts, sent }
 }
+const dimOf = (drawn: unknown, key: string): boolean => nodesOf(drawn, 'Button').find(x => String(x.props?.key) === key)?.props?.dimColor === true
 
 test('the mapper reads the bug, the plan tree and the events from a show reply', () => {
   const v = bugDetailView(SHOW, 'matrixkoder')
@@ -150,13 +152,42 @@ test('the tasks tree shows status glyphs, the lane chip and the subtask; a press
   expect(open.map.get('bugs:task')).toBe('')
 })
 
-test('the action row calls bugAct with the bug id; a closed bug has no fixed action', () => {
-  const d = draw()
-  press(d.tree, 'bug-act-open-pane')
+test('LANE 5: the lane actions act on the picked task: each submits its mk: line to the orchestrator', () => {
+  const d = draw({ 'bugs:task': 'B5.1' }) // B5.1 has a lane (slot 3) and acceptance
+  for (const k of ['bug-act-dispatch', 'bug-act-open-pane', 'bug-act-handoff', 'bug-act-nudge']) expect(dimOf(d.tree, k), k).toBe(false)
+  press(d.tree, 'bug-act-dispatch')
   press(d.tree, 'bug-act-handoff')
+  press(d.tree, 'bug-act-open-pane')
   press(d.tree, 'bug-act-nudge')
+  expect(d.sent).toEqual(['mk: dispatch bug B5.1', 'mk: hand off bug B5.1', 'mk: open pane bug B5.1', 'mk: nudge bug B5.1'])
+  expect(d.acts, 'no mk-bug verb runs').toEqual([])
+  expect(allText(d.tree)).not.toMatch(/no lane|no acceptance|pick a task/)
+})
+
+test('LANE 5: off lane actions draw disabled with a note and do nothing: no task picked, no lane, no acceptance', () => {
+  const none = draw() // two tasks, none picked
+  expect(allText(none.tree)).toContain('to lane, open pane, hand off, nudge: pick a task')
+  for (const k of ['bug-act-dispatch', 'bug-act-open-pane', 'bug-act-handoff', 'bug-act-nudge']) { expect(dimOf(none.tree, k), k).toBe(true); press(none.tree, k) }
+  expect(none.sent).toEqual([])
+  expect(none.acts).toEqual([])
+  // B5.2: no lane and no acceptance; hand off stays on
+  const bare = draw({ 'bugs:task': 'B5.2' })
+  expect(allText(bare.tree)).toContain('to lane: no acceptance · open pane, nudge: no lane')
+  for (const k of ['bug-act-dispatch', 'bug-act-open-pane', 'bug-act-nudge']) { press(bare.tree, k) }
+  press(bare.tree, 'bug-act-handoff')
+  expect(bare.sent).toEqual(['mk: hand off bug B5.2'])
+  expect(bare.acts).toEqual([])
+  // a bug with one task acts on it without a pick
+  const one = { ...SHOW, plan: { ...SHOW.plan, phases: [{ ...SHOW.plan.phases[0]!, tasks: [SHOW.plan.phases[0]!.tasks[0]!] }] } }
+  const solo = draw({}, one)
+  press(solo.tree, 'bug-act-dispatch')
+  expect(solo.sent).toEqual(['mk: dispatch bug B5.1'])
+})
+
+test('the action row: ✓ fixed calls bugAct with the bug id; a closed bug has no fixed action', () => {
+  const d = draw()
   press(d.tree, 'bug-act-fixed')
-  expect(d.acts).toEqual([['open-pane', 'B5'], ['handoff', 'B5'], ['nudge', 'B5'], ['fixed', 'B5']])
+  expect(d.acts).toEqual([['fixed', 'B5']])
   press(d.tree, 'bug-back')
   expect(d.map.get('bugs:sel')).toBe('')
   const closed = draw({}, { ...SHOW, bug: { ...SHOW.bug, status: 'fixed' } })
