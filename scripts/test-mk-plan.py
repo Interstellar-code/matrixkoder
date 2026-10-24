@@ -1690,6 +1690,7 @@ acceptance = "a1"
 plan = "low8"
 status = "draft"
 created = "2026-10-24"
+design = []
 /+++
 
 +++ 4 Design / context
@@ -1721,15 +1722,28 @@ acceptance = "a1"
 gate = "echo test-gate"
 risk = 3
 /+++
+
++++ 5.1.2 P1.2 task [toml]
+id = "P1.2"
+title = "T2"
+acceptance = "a2"
+manual = "tested by hand"
+/+++
 """)
         out_low8 = mk("parse", bp_low8)
         assert len(out_low8["contracts"]) == 1 and out_low8["contracts"][0]["id"] == "C1"
         assert len(out_low8["tests"]) == 1 and out_low8["tests"][0]["id"] == "T1"
+        assert out_low8["design"] == []
         t0 = out_low8["phases"][0]["tasks"][0]
         # task gate string -> C1 table equivalent
         assert t0["gate"] == [{"cmd": "echo test-gate", "expect": 0, "timeout": 600, "lines": []}]
         # risk value equivalent
         assert t0["risk"] == 3
+        # manual equivalent
+        assert any(t["manual"] for t in out_low8["phases"][0]["tasks"])
+        # warnings and use_gates equivalents (which fail on fde91aa)
+        assert out_low8["warnings"] == []
+        assert [g["id"] for g in out_low8["use_gates"]] == ["test", "typecheck"]
 
         # Test LOW 9: task with no gate and no manual warns 'neither gate nor manual line' regardless of risk level
         bp_low9 = write("test-low9.md", """+++ 1 Top block [toml]
@@ -1832,18 +1846,146 @@ This is an unparseable question line!
         assert any("Risks block" in w and "unparseable risk line" in w for w in warns), warns
         assert any("Open questions block" in w and "unparseable question line" in w for w in warns), warns
 
+        # Test Round 3 Item 2: fail with line number on bad +++ header, stray /+++, and duplicate block name
+        bp_bad_hdr = write("test-round3-item2-badheader.md", """+++ 1 Top block [toml]
+plan = "badhdr"
+status = "draft"
+created = "2026-10-24"
+/+++
++++ not-a-valid-header
+/+++
+""")
+        out_bad_hdr = mk("parse", bp_bad_hdr, code=2)
+        assert out_bad_hdr["ok"] is False
+        assert any("line 6:" in e and "does not match block pattern" in e for e in out_bad_hdr["errors"]), out_bad_hdr
+
+        bp_stray = write("test-round3-item2-strayclose.md", """+++ 1 Top block [toml]
+plan = "stray"
+status = "draft"
+created = "2026-10-24"
+/+++
+/+++
+""")
+        out_stray = mk("parse", bp_stray, code=2)
+        assert out_stray["ok"] is False
+        assert any("line 6:" in e and "stray '/+++'" in e for e in out_stray["errors"]), out_stray
+
+        bp_dup = write("test-round3-item2-dupblock.md", """+++ 1 Top block [toml]
+plan = "dup"
+status = "draft"
+created = "2026-10-24"
+/+++
++++ 2 Summary
+summary 1
+/+++
++++ 3 Summary
+summary 2
+/+++
+""")
+        out_dup = mk("parse", bp_dup, code=2)
+        assert out_dup["ok"] is False
+        assert any("line 9:" in e and "duplicate block name 'Summary'" in e for e in out_dup["errors"]), out_dup
+
+        # Test Round 3 Item 3: by-name fallback lookups must skip 5.x blocks (GATEKEY phase never taken as Gates block)
+        bp_gatekey = write("test-round3-item3-gatekey.md", """+++ 1 Top block [toml]
+plan = "gatekey-test"
+status = "draft"
+created = "2026-10-24"
+/+++
++++ 5 Phases
+/+++
++++ 5.1 P1
+- Goal: P1
+/+++
++++ 5.1.0 P1 settings [toml]
+id = "P1"
+title = "P1"
+wave = 1
+owned = ["a.py"]
+commit = "feat: p1"
+/+++
++++ 5.1.1 P1.1 task [toml]
+id = "P1.1"
+title = "T1"
+acceptance = "a1"
+/+++
++++ 5.2 GATEKEY — Gate names agree
+- g1 — proves G1 — gatekey phase line
+/+++
++++ 5.2.0 GATEKEY settings [toml]
+id = "GATEKEY"
+title = "GATEKEY"
+wave = 1
+owned = ["b.py"]
+commit = "feat: gatekey"
+/+++
++++ 5.2.1 GATEKEY.1 task [toml]
+id = "GATEKEY.1"
+title = "GK1"
+acceptance = "a2"
+/+++
+""")
+        out_gatekey = mk("parse", bp_gatekey)
+        assert out_gatekey["ok"] is True
+        assert out_gatekey["gate_lines"] == [], out_gatekey["gate_lines"]
+
+        # Test Round 3 Item 4: a gate named in both use and [extra] appears only in final_gates, not in use_gates
+        bp_use_extra = write("test-round3-item4-use-extra.md", """+++ 1 Top block [toml]
+plan = "use-extra"
+status = "draft"
+created = "2026-10-24"
+/+++
++++ 5 Phases
+/+++
++++ 5.1 P1
+- Goal: P1
+/+++
++++ 5.1.0 P1 settings [toml]
+id = "P1"
+title = "P1"
+wave = 1
+owned = ["a.py"]
+commit = "feat: p1"
+/+++
++++ 5.1.1 P1.1 task [toml]
+id = "P1.1"
+title = "T1"
+acceptance = "a1"
+/+++
++++ 6 Gates
+/+++
++++ 6.0 Gate settings [toml]
+use = ["test", "typecheck"]
+[extra]
+test = "pytest plugins"
+/+++
+""")
+        out_use_extra = mk("parse", bp_use_extra)
+        assert out_use_extra["ok"] is True
+        assert "test" in [g["id"] for g in out_use_extra["final_gates"]]
+        assert "test" not in [g["id"] for g in out_use_extra["use_gates"]]
+        assert [g["id"] for g in out_use_extra["use_gates"]] == ["typecheck"]
+
         # T2 — copy the three project DBs read-only and assert every stored plan's file or archived version still parses
         import sqlite3, glob
         dbs = sorted(glob.glob(os.path.expanduser("~/.matrixkoder/projects/*/mk-project.db")))
         if not dbs:
             print("note: no project DB exists, skipping T2")
         else:
-            main_py = os.path.join(os.path.dirname(MK_PLAN_PY), ".tmp-main-mk-plan.py")
+            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            tmp_main_dir = tempfile.mkdtemp(prefix="main-mk-plan-")
             try:
+                main_py = os.path.join(tmp_main_dir, "mk-plan.py")
                 with open(main_py, "wb") as f:
-                    subprocess.check_call(["git", "show", "main:scripts/mk-plan.py"], stdout=f)
+                    subprocess.check_call(["git", "show", "main:scripts/mk-plan.py"], cwd=repo_root, stdout=f)
+                scripts_dir = os.path.dirname(MK_PLAN_PY)
+                for mod in ["mk-config.py", "mkpaths.py", "mkdb.py", "mk-state.py"]:
+                    src_mod = os.path.join(scripts_dir, mod)
+                    if os.path.exists(src_mod):
+                        shutil.copy(src_mod, tmp_main_dir)
                 total_stored = 0
                 stored_parsed = 0
+                fallback_count = 0
                 for project_db in dbs:
                     proj_dir = os.path.dirname(project_db)
                     con = sqlite3.connect(f"file:{project_db}?mode=ro", uri=True)
@@ -1862,15 +2004,22 @@ This is an unparseable question line!
                             out_main = subprocess.check_output([sys.executable, main_py, "parse", target_file])
                             parsed_main = json.loads(out_main)
                             assert p_out == parsed_main, f"parse mismatch with main for {plan_id}"
+                            stored_parsed += 1
                         else:
                             hdr = json.loads(hdr_json)
-                            assert "phases" in hdr
-                        stored_parsed += 1
+                            # assert the phases and final_gates shape against the stored json, not only that a "phases" key exists
+                            assert "phases" in hdr and isinstance(hdr["phases"], list) and len(hdr["phases"]) > 0
+                            assert all(isinstance(p, dict) and "id" in p for p in hdr["phases"])
+                            fg = hdr.get("final_gates")
+                            if fg is not None:
+                                assert isinstance(fg, list)
+                                assert all(isinstance(g, dict) and ("covers" in g or "id" in g) for g in fg)
+                            fallback_count += 1
                     con.close()
-                assert stored_parsed == total_stored, f"expected {total_stored} stored plans, got {stored_parsed}"
+                assert stored_parsed + fallback_count == total_stored, f"expected {total_stored} stored plans, got {stored_parsed} parsed and {fallback_count} fallback"
+                assert stored_parsed == 15 and fallback_count == 3, f"expected 15 parsed and 3 fallback, got {stored_parsed} and {fallback_count}"
             finally:
-                if os.path.exists(main_py):
-                    os.remove(main_py)
+                shutil.rmtree(tmp_main_dir, ignore_errors=True)
 
         print("mk-plan self-test ok")
     finally:

@@ -147,6 +147,9 @@ def split_plan(text):
                 return lines, i
         raise Fail([f"line {len(lines)}: no closing '+++' for the header"])
     elif first.startswith("+++ "):
+        m = re.match(r"^\+\+\+\s+([0-9.]+)\s+(.*?)(?:\s+\[toml\])?$", first)
+        if not m or not m.group(2).strip():
+            raise Fail([f"line 1: '+++ ' header does not match block pattern: '{lines[0]}'"])
         for i in range(1, len(lines)):
             if lines[i].strip().startswith("+++ "):
                 raise Fail([f"line {i + 1}: '+++ ' header before previous block closed with '/+++'"])
@@ -343,13 +346,22 @@ def is_block_format(text):
 def parse_blocks(text):
     lines = text.split("\n")
     blocks = []
+    seen_names = {}
     i = 0
     while i < len(lines):
         line = lines[i]
         st = line.strip()
-        m = re.match(r"^\+\+\+\s+([0-9.]+)\s+(.*?)(?:\s+\[toml\])?$", st)
-        if m:
+        if st == "/+++" or st.startswith("/+++"):
+            raise Fail([f"line {i + 1}: stray '/+++' outside of any block"])
+        if st.startswith("+++ "):
+            m = re.match(r"^\+\+\+\s+([0-9.]+)\s+(.*?)(?:\s+\[toml\])?$", st)
+            if not m or not m.group(2).strip():
+                raise Fail([f"line {i + 1}: '+++ ' header does not match block pattern: '{line}'"])
             num, name = m.group(1), m.group(2).strip()
+            name_norm = name.lower()
+            if name_norm in seen_names:
+                raise Fail([f"line {i + 1}: duplicate block name '{name}' (previously on line {seen_names[name_norm]})"])
+            seen_names[name_norm] = i + 1
             is_toml = st.endswith("[toml]")
             start_line = i + 1
             b_lines = []
@@ -381,10 +393,14 @@ def parse_blocks(text):
 def block_by_name(blocks, name):
     name_norm = name.strip().lower()
     for b in blocks:
+        if b.get("num", "").startswith("5.") or b.get("num") == "5":
+            continue
         b_name = b["name"].strip().lower()
         if b_name == name_norm:
             return b
     for b in blocks:
+        if b.get("num", "").startswith("5.") or b.get("num") == "5":
+            continue
         b_name = b["name"].strip().lower()
         if name_norm == "top block" and b_name.startswith("top block"):
             return b
@@ -516,6 +532,7 @@ def read_block_plan(text, sha=""):
     use_gates = [
         {"id": g, "cmd": None, "use": True, "every": "run_end"}
         for g in use_names
+        if g not in extra_gates
     ]
 
     proves_map = {}
@@ -685,7 +702,8 @@ def read_block_plan(text, sha=""):
     final_gates = []
     gates_dict = {}
     for gname in use_names:
-        gates_dict[gname] = gname
+        if gname not in extra_gates:
+            gates_dict[gname] = gname
     for gname, cmd in extra_gates.items():
         final_gates.append({
             "id": gname,
