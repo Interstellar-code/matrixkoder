@@ -612,8 +612,11 @@ export function driftOf(existingYamlText: string | null | undefined, d: MkWizard
   const out: DriftItem[] = []
   for (const [key, label] of DRIFT_GATES) {
     const alias = GATE_KEY_ALIASES[key]
-    const inFile = scalarUnder(existingYamlText, 'gates', key)
-      ?? (alias != null ? scalarUnder(existingYamlText, 'gates', alias) : undefined)
+    const own = scalarUnder(existingYamlText, 'gates', key)
+    const oldName = alias != null ? scalarUnder(existingYamlText, 'gates', alias) : undefined
+    // an empty new-name value falls back to the old key too (``lint: ""`` beside `lint_changed: x` reads
+    // x), which is what scripts/mk-config.py gates_of does — the two must agree on a hand-edited file
+    const inFile = own == null || own.trim() === '' ? oldName ?? own : own
     if (inFile == null) continue
     const detected = d.gates[key].trim()
     // both empty is not a drift; an empty file value against a detected command (or the reverse) is

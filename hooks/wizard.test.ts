@@ -349,6 +349,14 @@ test('T6: an old yaml written before the gate rename reads lint_changed as lint,
   // a new-name key wins over the old one when a hand-edited file carries both
   const both = oldFile.replace('  typecheck: tsc -p . --noEmit\n', '  typecheck: tsc -p . --noEmit\n  lint: pnpm exec eslint src\n')
   expect(driftOf(both, d)).toEqual([])
+  // an empty new-name value falls back to the old key as well, as scripts/mk-config.py gates_of does:
+  // `lint: ""` beside `lint_changed: <cmd>` reads <cmd> in both places, so the file does not drift
+  const emptyNew = ['gates:', '  lint: ""', '  lint_changed: pnpm exec eslint src'].join('\n')
+  expect(driftOf(emptyNew, d)).toEqual([])
+  // …and the old key's value is still what drifts when detection disagrees, under the new name
+  expect(driftOf(emptyNew, { ...d, gates: { ...d.gates, lint: 'pnpm exec eslint .' } })).toEqual([
+    { key: 'gates.lint', file: 'pnpm exec eslint src', detected: 'pnpm exec eslint .' },
+  ])
   // and the yaml the wizard writes carries the four names and no old key
   const written = buildYaml(d, ISO_NOW)
   expect(written).toContain('  lint: pnpm exec eslint src   # proposed')
