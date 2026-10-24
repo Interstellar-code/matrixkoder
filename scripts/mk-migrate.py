@@ -1988,6 +1988,7 @@ subagents = false
 +++ 5.1.1 P1.1 — one task [toml]
 id = "P1.1"
 title = "one task"
+covers = ["T1", "R1"]
 acceptance = ["it works"]
 risk = 2
 /+++
