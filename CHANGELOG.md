@@ -4,6 +4,12 @@ All notable changes to this project. Format: Keep a Changelog; versions: SemVer.
 
 ## [0.8.0] - 2026-10-24
 
+### Summary
+- **plan:** numbered-block plan format (`+++ <n> <name>` ... `/+++`): one file of numbered blocks — Top block, Summary, Goal, Design / context, Phases, Gates, Risks, Open questions, Log; old TOML plans still read.
+- **plan:** `mk-plan.py` parses, checks, imports and approves the new format; the check enforces links (goals served and proved, block-4 ids carried, covers <= 5), risk rules, Log kinds, Summary legend, lanes per wave, active agents and defined `use` gates.
+- **gates:** project gate names are test, typecheck, lint, build (`lint_changed` reads as lint; install and format_changed are no longer gates).
+- **store:** keeps the new fields; a store command writes Log lines, question answers and overrides after approval.
+
 ### Added
 - **store:** store the new plan shape (bf91c10)
 - **plan:** check the new plan rules (e962865)
@@ -33,18 +39,6 @@ All notable changes to this project. Format: Keep a Changelog; versions: SemVer.
 - **plan:** move the plan consumers to the new format (13c9993)
 - **gates:** rename project gate names in the wizard and types (180521d)
 - **gates:** rename project gate names (b4fe975)
-
-## [Unreleased]
-
-### Added
-- **plan:** numbered-block plan format (`+++ <n> <name>` ... `/+++`): one file of numbered blocks — Top block, Summary, Goal, Design / context, Phases, Gates, Risks, Open questions, Log; old TOML plans still read.
-- **plan:** `mk-plan.py` parses, checks, imports and approves the new format; the check enforces links (goals served and proved, block-4 ids carried, covers <= 5), risk rules, Log kinds, Summary legend, lanes per wave, active agents and defined `use` gates.
-- **gates:** project gate names are test, typecheck, lint, build (`lint_changed` reads as lint; install and format_changed are no longer gates).
-- **store:** keeps the new fields; a store command writes Log lines, question answers and overrides after approval.
-
-# Changelog
-
-All notable changes to this project. Format: Keep a Changelog; versions: SemVer.
 
 ## [0.7.5] - 2026-10-22
 
