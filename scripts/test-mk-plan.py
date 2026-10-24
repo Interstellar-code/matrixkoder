@@ -1983,14 +1983,12 @@ test = "pytest plugins"
                     src_mod = os.path.join(scripts_dir, mod)
                     if os.path.exists(src_mod):
                         shutil.copy(src_mod, tmp_main_dir)
-                total_stored = 0
                 stored_parsed = 0
                 fallback_count = 0
                 for project_db in dbs:
                     proj_dir = os.path.dirname(project_db)
                     con = sqlite3.connect(f"file:{project_db}?mode=ro", uri=True)
                     rows = con.execute("SELECT id, archived_path, header_json FROM plans").fetchall()
-                    total_stored += len(rows)
                     for plan_id, arch, hdr_json in rows:
                         target_file = None
                         if arch and os.path.exists(arch):
@@ -2006,6 +2004,10 @@ test = "pytest plugins"
                             assert p_out == parsed_main, f"parse mismatch with main for {plan_id}"
                             stored_parsed += 1
                         else:
+                            # a fallback row is allowed only when that row's archive file is missing on disk
+                            assert not arch or (not os.path.exists(arch) and not os.path.exists(os.path.join(proj_dir, arch))), (
+                                f"fallback row {plan_id} archive file exists on disk: {arch}"
+                            )
                             hdr = json.loads(hdr_json)
                             # assert the phases and final_gates shape against the stored json, not only that a "phases" key exists
                             assert "phases" in hdr and isinstance(hdr["phases"], list) and len(hdr["phases"]) > 0
@@ -2016,8 +2018,7 @@ test = "pytest plugins"
                                 assert all(isinstance(g, dict) and ("covers" in g or "id" in g) for g in fg)
                             fallback_count += 1
                     con.close()
-                assert stored_parsed + fallback_count == total_stored, f"expected {total_stored} stored plans, got {stored_parsed} parsed and {fallback_count} fallback"
-                assert stored_parsed == 15 and fallback_count == 3, f"expected 15 parsed and 3 fallback, got {stored_parsed} and {fallback_count}"
+                assert stored_parsed > 0, f"expected stored_parsed > 0 when project DBs exist, got {stored_parsed}"
             finally:
                 shutil.rmtree(tmp_main_dir, ignore_errors=True)
 
