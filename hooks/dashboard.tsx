@@ -1961,6 +1961,7 @@ function inboxFileOf(raw: unknown, state: InboxCardState): InboxFile | null {
     missing,
     age_s: num(row.age_s),
     archived: row.archived === true,
+    blocks: row.blocks === true,
     state,
   }
 }

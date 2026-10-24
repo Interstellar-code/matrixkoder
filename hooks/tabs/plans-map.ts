@@ -107,10 +107,9 @@ export function routeFields(raw: Record<string, unknown>): {
   route?: PlanRoute | null
   plannedRoute?: PlanRoute | null
   reviewer?: string
-  /** F.1 contract: the derived risk (int 1-5), its critical flag, and the open
-   *  reasons. All optional — an old row carries none of them. */
+  /** F.1 contract: the derived risk (int 1-5) and the open reasons. All optional —
+   *  an old row carries none of them. */
   risk?: number
-  critical?: boolean
   openReasons?: readonly { readonly kind: string; readonly points: number; readonly source: string; readonly opened: string }[]
 } {
   const out: {
@@ -126,7 +125,6 @@ export function routeFields(raw: Record<string, unknown>): {
     plannedRoute?: PlanRoute | null
     reviewer?: string
     risk?: number
-    critical?: boolean
     openReasons?: readonly { readonly kind: string; readonly points: number; readonly source: string; readonly opened: string }[]
   } = {}
   const slot = slotOf(raw.slot)
@@ -152,7 +150,6 @@ export function routeFields(raw: Record<string, unknown>): {
   const reviewer = descOf(raw.reviewer)
   if (reviewer != null) out.reviewer = reviewer
   if (typeof raw.risk === 'number' && Number.isInteger(raw.risk) && raw.risk >= 1 && raw.risk <= 5) out.risk = raw.risk
-  if (raw.critical === true) out.critical = true
   if (Array.isArray(raw.open_reasons)) {
     const reasons = raw.open_reasons.filter((r): r is { kind: string; points: number; source: string; opened: string } =>
       isRecord(r) && typeof r.kind === 'string' && typeof r.points === 'number' &&
@@ -324,7 +321,6 @@ export function plansFromReply(reply: unknown): { plans: PlanRow[]; runs: RunRow
       live_run: live,
       counts: { tasks: sumCounts(raw.counts), phases: 0, byStatus: statusCounts(raw.counts) },
       ...(str(raw.project) !== '' ? { project: str(raw.project) } : {}),
-      ...(Array.isArray(raw.design) ? { design: strList(raw.design) } : {}),
       ...(branchOf(raw.integration) !== '' ? { mergesTo: branchOf(raw.integration) } : {}),
     }
     plans.push(row)
@@ -464,6 +460,9 @@ export function planFromReply(reply: unknown): PlanView {
     }
     rows.sort(byTaskId)
     const wave = typeof raw.wave === 'number' ? raw.wave : undefined
+    // the phase's Goal fills the description slot when the reply carries it (the numbered-block
+    // plan's `- Goal:` line); an old reply keeps its own `description`
+    const goal = descOf(raw.goal)
     phases.push({
       id: raw.id,
       title: str(raw.title),
@@ -472,12 +471,12 @@ export function planFromReply(reply: unknown): PlanView {
       header: status,
       rows,
       ...routeFields(raw),
+      ...(goal != null ? { description: goal } : {}),
     })
   }
   const summed = sumCounts(reply.counts)
   const taskCount = summed > 0 ? summed : tasksInPhases
   const status = str(reply.status)
-  const description = descOf(reply.description)
   return {
     mock: false,
     plan: {
@@ -488,14 +487,12 @@ export function planFromReply(reply: unknown): PlanView {
       created: str(reply.created),
       runs: strList(reply.runs).join(' '),
       mergesTo: branchOf(reply.integration),
-      design: Array.isArray(reply.design) ? strList(reply.design).join(' ') : '',
       // C5/L7.2: a DONE plan's round files left the project folder for the legacy
       // tarball the migration wrote, so the Detail names that instead of letting them
       // read as absent. Any other plan keeps them in its project folder (the running
       // plan renders exactly as before), so no row is added.
       ...(status === 'done' ? { roundFiles: 'archived · legacy tarball' } : {}),
       counts: `${taskCount} tasks · ${phases.length} phases`,
-      ...(description != null ? { description } : {}),
     },
     phases,
     footer: [`${phases.length} phases · all folded by default`, 'source project'],

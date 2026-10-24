@@ -39,6 +39,8 @@ export type InboxFile = {
   missing: readonly string[]
   age_s: number
   archived: boolean
+  /** CONSUM.1: true when the count reads blocks (a numbered-block plan), false for sections */
+  blocks: boolean
   state: InboxCardState
 }
 
@@ -121,7 +123,7 @@ const FIT: Record<InboxFit, { badge: string; role: PaletteRole }> = {
 function fitNote(f: InboxFile): string {
   if (f.fit === 'not_a_plan') return 'no phase or task headings'
   if (f.missing.length > 0) return `missing: ${f.missing.map(clean).join(', ')}`
-  return `${String(f.sections_found)} of ${String(f.sections_total)} sections found`
+  return `${String(f.sections_found)} of ${String(f.sections_total)} ${f.blocks ? 'blocks' : 'sections'} found`
 }
 
 const STEP_NAME: Record<InboxStep, string> = { 1: 'Parse the template', 2: 'Write the project', 3: 'Write the tasks' }

@@ -9,11 +9,12 @@ export const INBOX_FILES: readonly InboxFile[] = [
     path: 'plan-inbox-and-parsing.md',
     title: 'Plan Inbox and Parsing',
     fit: 'template',
-    sections_found: 7,
-    sections_total: 7,
+    sections_found: 9,
+    sections_total: 9,
     missing: [],
     age_s: 7200,
     archived: false,
+    blocks: true,
     state: { kind: 'idle' },
   },
   {
@@ -26,6 +27,7 @@ export const INBOX_FILES: readonly InboxFile[] = [
     missing: ['Tasks', 'Acceptance'],
     age_s: 86400,
     archived: false,
+    blocks: false,
     state: { kind: 'idle' },
   },
   {
@@ -38,6 +40,7 @@ export const INBOX_FILES: readonly InboxFile[] = [
     missing: [],
     age_s: 1814400,
     archived: false,
+    blocks: false,
     state: { kind: 'idle' },
   },
   {
@@ -50,6 +53,7 @@ export const INBOX_FILES: readonly InboxFile[] = [
     missing: [],
     age_s: 1036800,
     archived: true,
+    blocks: false,
     state: { kind: 'idle' },
   },
 ]

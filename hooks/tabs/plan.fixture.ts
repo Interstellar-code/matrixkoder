@@ -91,9 +91,7 @@ export const PLAN_REAL_FIXTURE: PlanView = {
     created: '2026-10-13',
     runs: 'settings-plans-db-r1',
     mergesTo: 'main',
-    design: 'settings-tab · settings-wire · dashboard-v2 · mk-store',
     counts: '14 tasks · 5 phases',
-    description: 'This plan makes the settings screen and the saved plans use one database. Tests stop touching the real one, plans move into the project store, and the Plan tab gets list, detail and board views.',
   },
   phases: [
     { id: 'R1', title: 'Self-tests never write a real DB', status: 'merged', header: '✓ merged', headerRole: 'ok', wave: 1,

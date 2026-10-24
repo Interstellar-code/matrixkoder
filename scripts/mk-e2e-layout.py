@@ -334,81 +334,149 @@ def run_tool(script, *args, home, data=None, timeout=120, ok=(0,), extra_env=Non
 
 # --------------------------------------------------------------------------- the plan
 
-PLAN_TEMPLATE = """+++
+PLAN_TEMPLATE = """+++ 1 Top block — plan identity [toml]
 plan = "{plan}"
 status = "draft"
 created = {created}
 runs = []
-design = ["research.md"]
 integration = "mk/{plan}/integration"
+/+++
 
-[gates]
-test = "python3 scripts/mk-e2e-layout.py --self-test"
-typecheck = "python3 -m py_compile scripts/mk-e2e-layout.py"
-selftest = "python3 scripts/mk-e2e-layout.py --self-test"
-validate = "claude plugin validate ."
++++ 2 Summary
+# {plan} — the mock feature of the e2e layout run
 
-[[phase]]
+## Summary
+- Phases: 2 — P1: first phase of the mock feature; P2: second phase of the mock feature
+- Method: waves · subagents off
+- Lanes: P1 (own lane); P2 (own lane)
+- Delivery: mk/{plan}/integration · pushed: no
+- Gates: test; typecheck
+/+++
+
++++ 3 Goal
+## Goal
+- Done when:
+  - G1 — the two phases merge in order into the integration branch
+- Why: the e2e layout audit drives a whole project through the C2 tree
+- From: the self-test
+- Sources: `research.md`
+/+++
+
++++ 4 Design / context
+## Design / context
+### What is wrong today
+1. none, this is new
+### Shape of the change
+Two phases with three tasks; the mock feature adds `scripts/a.py`, `scripts/b.py` and `scripts/c.py`.
+### Contracts
+C1 — the phase file each phase writes — written by P1, read by P2
+### Test plan
+T1 — the two phases merge and the audit passes — end-to-end — `scripts/mk-e2e-layout.py` — written by P2.1
+### Assumptions and dependencies
+none
+### Rollout and undo
+R1 — ships by merge; undo = revert the merge — P2.1
+### Settings and limits
+S1 — most lanes at once — 3 — mk-config.py list --json — 2026-10-15
+### Out of scope
+Nothing.
+/+++
+
++++ 5 Phases
+## Phases
+/+++
+
++++ 5.1 P1 — first phase of the mock feature
+### P1 — first phase of the mock feature
+- Goal: `scripts/a.py` exists and its self-test passes
+- Serves: G1
+- Needs first: nothing
+- Build order: P1.1 then P1.2
+- Hazards: none
+- Carries: C1, T1
+/+++
+
++++ 5.1.0 P1 settings [toml]
 id = "P1"
 title = "first phase of the mock feature"
 wave = 1
-deps = []
 owned = ["scripts/a.py"]
-forbidden = []
-route = ""
-reviewer = ""
-size = "standard"
-risk = "reversible"
-review = "light"
-qa = []
 commit = "feat(a): the first phase"
 subagents = false
-lane_group = ""
+/+++
 
-  [[phase.task]]
-  id = "P1.1"
-  title = "first task of the mock feature"
-  acceptance = "scripts/a.py exists and its self-test passes"
-  subagent = false
-  owned = []
++++ 5.1.1 P1.1 — first task of the mock feature [toml]
+id = "P1.1"
+title = "first task of the mock feature"
+covers = ["C1", "T1"]
+acceptance = ["scripts/a.py exists and its self-test passes"]
+risk = 1
+/+++
 
-  [[phase.task]]
-  id = "P1.2"
-  title = "second task of the mock feature"
-  acceptance = "scripts/b.py exists and its self-test passes"
-  subagent = false
-  owned = []
++++ 5.1.2 P1.2 — second task of the mock feature [toml]
+id = "P1.2"
+title = "second task of the mock feature"
+acceptance = ["scripts/b.py exists and its self-test passes"]
+risk = 1
+/+++
 
-[[phase]]
++++ 5.2 P2 — second phase of the mock feature
+### P2 — second phase of the mock feature
+- Goal: `scripts/c.py` exists and its self-test passes
+- Serves: G1
+- Needs first: P1, because the second phase merges after the first
+- Build order: P2.1
+- Hazards: none
+- Carries: T1, R1
+/+++
+
++++ 5.2.0 P2 settings [toml]
 id = "P2"
 title = "second phase of the mock feature"
 wave = 2
-deps = ["P1"]
 owned = ["scripts/c.py"]
-forbidden = []
-route = ""
-reviewer = ""
-size = "standard"
-risk = "reversible"
-review = "light"
-qa = []
 commit = "feat(c): the second phase"
+deps = ["P1"]
 subagents = false
-lane_group = ""
+/+++
 
-  [[phase.task]]
-  id = "P2.1"
-  title = "third task of the mock feature"
-  acceptance = "scripts/c.py exists and its self-test passes"
-  subagent = false
-  owned = []
-+++
++++ 5.2.1 P2.1 — third task of the mock feature [toml]
+id = "P2.1"
+title = "third task of the mock feature"
+covers = ["T1", "R1"]
+acceptance = ["scripts/c.py exists and its self-test passes"]
+risk = 1
+/+++
+
++++ 6 Gates
+## Gates
+- test — proves G1 — the project's test gate passes
+- typecheck — proves G1 — the project's typecheck gate passes
+/+++
+
++++ 6.0 Gate settings [toml]
+timeout = 1200
+/+++
+
++++ 7 Risks
+## Risks
+- K1 — the phases merge out of order — level 3 — guard: T1, the end-to-end run — P2.1
+/+++
+
++++ 8 Open questions
+## Open questions
+/+++
+
++++ 9 Log
+## Log
+- {created} — drafted — the mock feature of the e2e layout run — user
+/+++
 """
 
 
 def write_plan(repo, plan_id):
     """The plan file, written from skills/matrixkoder/templates/plan.md's shape, plus the
-    design ref assets/ will carry."""
+    design note the Goal block's `Sources:` line names and assets/ will carry."""
     path = os.path.join(repo, f"{plan_id}.md")
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(PLAN_TEMPLATE.format(plan=plan_id, created="2026-10-15"))

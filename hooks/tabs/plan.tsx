@@ -49,9 +49,8 @@ export type PlanSub = {
   readonly type?: string
   readonly round?: number
   readonly verdict?: string
-  /** F.1 contract: the derived risk, its critical flag and the open reasons. */
+  /** F.1 contract: the derived risk and the open reasons. */
   readonly risk?: number
-  readonly critical?: boolean
   readonly openReasons?: readonly { readonly kind: string; readonly points: number; readonly source: string; readonly opened: string }[]
 }
 
@@ -88,10 +87,9 @@ export type PlanTask = {
    *  commit (drawn as 7 chars on a done task) and its open review findings. */
   readonly last_commit?: string
   readonly findings?: number
-  /** F.1 contract: the derived risk (int 1-5), its critical flag, and the open
-   *  reasons. All optional — an old row carries none of them. */
+  /** F.1 contract: the derived risk and the open reasons. All optional — an old row carries
+   *  none of them. */
   readonly risk?: number
-  readonly critical?: boolean
   readonly openReasons?: readonly { readonly kind: string; readonly points: number; readonly source: string; readonly opened: string }[]
 }
 
@@ -142,10 +140,7 @@ export type PlanView = {
     readonly created: string
     readonly runs: string
     readonly mergesTo: string
-    readonly design: string
     readonly counts: string
-    /** optional plain-English description (2-5 sentences), trimmed; absent when empty */
-    readonly description?: string
     /** L7.2: where this plan's round files (briefs/reports/reviews) are — a DONE
      *  plan's were archived (the legacy tarball), `archived · legacy tarball
      *  <path>`; anything else reads `missing` (they are not in the project
@@ -401,8 +396,6 @@ function HeaderCard(els: Els, view: PlanView, W: number, compact: boolean): Rend
       <Text wrap="truncate-end">{clip(v, Math.max(1, W - KEY_W))}</Text>
     </Box>
   )
-  // design docs as short names (`settings-tab · dashboard-v2`), not full paths
-  const design = head.design.split(/\s+/).filter(d => d !== '').map(d => (d.split('/').pop() ?? d).replace(/\.md$/, '')).join(' · ')
   const running = head.status === 'running'
   const chipRole: PaletteRole = running ? 'live' : isDoneStatus(head.status) ? 'ok' : head.status === 'parked' ? 'warn' : 'idle'
   const fire = (kind: string): void => { view.onAction?.(kind, head.id) }
@@ -418,11 +411,9 @@ function HeaderCard(els: Els, view: PlanView, W: number, compact: boolean): Rend
         {Chip(els, { label: compact ? clip(head.statusChip, 12) : head.statusChip, role: chipRole })}
       </Box>
       <Text color={ROLE.idle.fg} wrap="truncate-end">{clip(head.title, W)}</Text>
-      {head.description != null && Describe(els, 'plan-head-desc', head.description, W, 4)}
       {kv('created', head.created)}
       {kv('runs', head.runs)}
       {kv('merges to', head.mergesTo)}
-      {kv('design', design)}
       {head.roundFiles != null && head.roundFiles !== '' && kv('round files', head.roundFiles)}
       <Box flexDirection="row" justifyContent="space-between" gap={1}>
         <Text dimColor={true} wrap="truncate-end">{clip(head.counts, Math.max(1, W - 24))}</Text>

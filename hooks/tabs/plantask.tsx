@@ -113,8 +113,7 @@ export function PlanTaskPanel(els: Els, row: PlanTask, cols: number, onClose?: (
       {row.risk != null && row.risk >= 1 && row.risk <= 5 && (
         <Box flexDirection="row" gap={1}>
           <Text dimColor={true}>risk</Text>
-          {Chip(els, { label: `R${row.risk}`, role: row.risk <= 2 ? 'ok' : row.risk >= 4 ? 'warn' : 'idle', solid: row.critical === true })}
-          {row.critical === true && <Text color={ROLE.err.fg}>{'!!'}</Text>}
+          {Chip(els, { label: `R${row.risk}`, role: row.risk <= 2 ? 'ok' : row.risk >= 4 ? 'warn' : 'idle' })}
         </Box>
       )}
       {row.openReasons != null && row.openReasons.length > 0 && (

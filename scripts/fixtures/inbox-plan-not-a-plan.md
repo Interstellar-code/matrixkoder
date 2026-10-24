@@ -1,24 +1,14 @@
-+++
++++ 1 Top block — plan identity [toml]
 # Parked. Not imported, not approved. Pick up later.
 # Skills already written: skills/mk-ponytail, skills/mk-ponytail-review, skills/mk-ponytail-debt.
 plan = "mk-ponytail-hooks"
 status = "parked"
 created = 2026-10-15
 runs = []
-design = []
+/+++
 
-[gates]
-selftest = "python3 scripts/mk-lane.py --self-test"
-
-[[final_gate]]
-id = "F1"
-cmd = "python3 scripts/mk-lane.py --self-test"
-expect = 0
-every = "merge"
-covers = ["H1", "H2", "H3"]
-+++
-
-# Goal
++++ 3 Goal
+## Goal
 
 Install the mk-ponytail ruleset into a lane so the lane agent follows it, without the orchestrator restating it in a brief. omp lanes first. Other hosts later.
 
@@ -28,8 +18,10 @@ Settled already (grilling, 2026-10-15):
 - Mode lives in `.matrixkoder/matrixkoder.yaml` under `session.ponytail.mode`: `off` | `lite` | `full` | `ultra`. Missing key means `full`. No `plugin.json` `userConfig` key.
 - Debt ledger greps both `shortcut:` and `# ponytail:`.
 - `templates/brief.md`, `templates/matrixkoder.yaml`, and `skills/matrixkoder/SKILL.md` are not edited by this plan.
+/+++
 
-# Design
++++ 4 Design
+## Design
 
 omp discovers hooks from `<cwd>/.omp/hooks/pre|post/*.{ts,js}` (`omp://hooks.md`). `mk-lane.py` `install_lane_skill` already copies `child-skills/mk-builder/` into `<lane>/.omp/skills/mk-builder` and `<lane>/.claude/skills/mk-builder` on every acquire (`scripts/mk-lane.py:1006-1061`). A hook factory is not a skill, so that copy does not install it. The hook has to be copied to `<lane>/.omp/hooks/pre/` by the same acquire.
 
@@ -37,14 +29,16 @@ The hook reads `session.ponytail.mode` from the project yaml and, unless `off`, 
 
 Claude, OpenCode, and AGY lanes do not load omp hooks. They are out of this plan.
 
-# Contract
+## Contract
 
 - `off` injects nothing.
 - A missing `session.ponytail` key injects `full`.
 - The hook never writes the yaml and never writes a mode flag file.
 - A lane that is not omp is unchanged.
+/+++
 
-# Risks
++++ 7 Risks
+## Risks
 
 - `install_lane_skill` treats `.omp/` as disposable and replaces the skill dir wholesale. The hook dir must be installed by the same function or a later acquire will not refresh it, and a release must not delete a hook the slot still needs. Check `DISPOSABLE` at `scripts/mk-lane.py:60-62` before adding a path.
 - omp's native discovery only scans `hooks/pre/` and `hooks/post/`, not `hooks/` itself.
@@ -85,9 +79,12 @@ Facts, not blockers:
 - The subagent must run in the pane's own session so its report returns to that pane.
 - `mk-ponytail-debt` is a grep with no model, so `mk-builder.py commit` can print it directly. `mk-ponytail-review` needs the lane model; it is the part that wants the subagent.
 - The hook writes no report and posts nothing; the pane agent does both after the subagent returns.
+/+++
 
-Open questions for pickup:
++++ 8 Open questions
+## Open questions
 
-- Trigger point: an omp `tool_result` hook on `git commit`, or `mk-builder.py commit` (every host), or both.
-- Review before or after the lane posts its own `commit` bus message.
-- Whether a review run counts against the task's fix-loop budget (3 loops on a HIGH).
+- [ ] Q1 — trigger point: an omp `tool_result` hook on `git commit`, or `mk-builder.py commit` (every host), or both — blocks: none — pick: both, with the commit command the portable one
+- [ ] Q2 — review before or after the lane posts its own `commit` bus message — blocks: none — pick: after, so the orchestrator reads one message with the report on it
+- [ ] Q3 — whether a review run counts against the task's fix-loop budget (3 loops on a HIGH) — blocks: none — pick: no, a review is not a fix round
+/+++
