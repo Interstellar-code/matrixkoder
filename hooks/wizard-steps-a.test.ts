@@ -224,7 +224,7 @@ test('step 4 (Usage) is the slide: CodexBar, Providers with the short names, and
   await ui.unmount()
 })
 
-test('step 5 (Gates) is the slide: Commands with the five fields, then Baselines and banned', async ($, on) => {
+test('step 5 (Gates) is the slide: Commands with the four fields, then Baselines and banned', async ($, on) => {
   world(on, repoFiles())
   await $.session.start(sessionStart())
   await mk($)
@@ -237,11 +237,11 @@ test('step 5 (Gates) is the slide: Commands with the five fields, then Baselines
     'Banned (dev servers): pnpm run dev',
   ])
   const inputs = await ui.findAll({ type: 'Input' })
-  expect(inputs.map(i => i.key)).toEqual(['wz-gate-install', 'wz-gate-test', 'wz-gate-typecheck', 'wz-gate-lint_changed', 'wz-gate-format_changed'])
-  // every gate here came from detection, so nothing is empty and no B-11 line is due
-  expect((await texts(ui)).some(t => t.startsWith('empty gates:')), 'nothing empty, nothing to warn about').toBe(false)
-  await ui.input({ key: 'wz-gate-install', text: 'pnpm i' })
-  expect(draftOf().gates.install).toBe('pnpm i')
+  expect(inputs.map(i => i.key)).toEqual(['wz-gate-test', 'wz-gate-typecheck', 'wz-gate-lint', 'wz-gate-build'])
+  // the fixture repo has no build script, so build is the one empty gate and the only B-11 line
+  expect(await texts(ui)).toContain('empty gates: build — written as "" (no command).')
+  await ui.input({ key: 'wz-gate-lint', text: 'pnpm lint' })
+  expect(draftOf().gates.lint).toBe('pnpm lint')
   await ui.unmount()
 })
 
@@ -316,7 +316,7 @@ test('the states the slides lack: nothing detected says so in the Commands card'
 // ---------- B-11: the gate fields ----------
 
 test('B-11: an empty gate command is named in one dim line and never blocks Next', async ($, on) => {
-  // this repo's own shape: plugin.json + selftest + tsconfig proposes no install and no format command
+  // this repo's own shape: plugin.json + selftest + tsconfig proposes no build command
   const files: Files = {
     [`${PROJECT_DIR}/.claude-plugin/plugin.json`]: '{}',
     [`${PROJECT_DIR}/scripts/selftest.sh`]: '#!/usr/bin/env bash\n',
@@ -327,17 +327,16 @@ test('B-11: an empty gate command is named in one dim line and never blocks Next
   await mk($)
   const ui = await mountAt($, 5)
   const d = draftOf()
-  expect(d.gates.install).toBe('')
-  expect(d.gates.format_changed).toBe('')
-  await pins(ui, ['Commands', 'empty gates: install, format_changed — written as "" (no command).'])
+  expect(d.gates.build).toBe('')
+  await pins(ui, ['Commands', 'empty gates: build — written as "" (no command).'])
   // non-blocking: the slide draws no error state and Next still walks on
   expect(await ui.find({ key: 'wz-next' })).toBeTruthy()
   await ui.press({ key: 'wz-next' })
   expect(await ui.find({ text: /STEP 6\/10/ })).toBeTruthy()
-  // typing one clears its name from the line; the other stays named
+  // typing the command clears its name from the line
   await ui.press({ key: 'wz-back' })
-  await ui.input({ key: 'wz-gate-install', text: 'pnpm i' })
-  expect(await texts(ui)).toContain('empty gates: format_changed — written as "" (no command).')
+  await ui.input({ key: 'wz-gate-build', text: 'pnpm build' })
+  expect((await texts(ui)).some(t => t.startsWith('empty gates:')), 'nothing empty any more').toBe(false)
   await ui.unmount()
 })
 
@@ -346,7 +345,10 @@ test('B-11: an emptied gate is named again; none left draws no line', async ($, 
   await $.session.start(sessionStart())
   await mk($)
   const ui = await mountAt($, 5)
-  expect((await texts(ui)).some(t => t.startsWith('empty gates:')), 'all five proposed').toBe(false)
+  // the fixture repo declares no build script, so build alone is named
+  expect(await texts(ui)).toContain('empty gates: build — written as "" (no command).')
+  await ui.input({ key: 'wz-gate-build', text: 'pnpm build' })
+  expect((await texts(ui)).some(t => t.startsWith('empty gates:')), 'nothing empty any more').toBe(false)
   await ui.input({ key: 'wz-gate-typecheck', text: '' })
   expect(draftOf().gates.typecheck).toBe('')
   expect(await texts(ui)).toContain('empty gates: typecheck — written as "" (no command).')

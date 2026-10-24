@@ -7,11 +7,10 @@ repo:
   lanes: { slots: 3, pattern: "../{repo}-mk-{n}", reuse: true, copy: [".claude-plugin/types"] }   # reusable worktree slots; copy = untracked paths a new slot needs
   conventions: []
 gates:
-  install: ""
   test: ""
   typecheck: ""
-  lint_changed: ""
-  format_changed: ""
+  lint: ""
+  build: ""
 baselines:                            # measured at first run, refreshed each run
   type_errors: null
   lint_errors: null

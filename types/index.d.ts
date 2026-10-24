@@ -237,12 +237,13 @@ export type MkWizardAgent = {
   models: readonly string[]
 }
 
+/** The project's gate commands (C3): the four names a plan's `use` list may name. Installers and
+ *  formatters are not gates — they change files. */
 export type MkWizardGates = {
-  install: string
   test: string
   typecheck: string
-  lint_changed: string
-  format_changed: string
+  lint: string
+  build: string
 }
 
 export type MkWizardDraft = {

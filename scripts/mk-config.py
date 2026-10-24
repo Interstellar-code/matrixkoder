@@ -333,6 +333,34 @@ def agents(lines):
             if sr[2] <= i < sr[3] and indent == ind and flow_map(rest)]
 
 
+# C3: the four project gate names a plan's `use` list may name. `install` and `format_changed` are
+# not gates — they change files — so an old file's lines for them are ignored here.
+GATE_NAMES = ("test", "typecheck", "lint", "build")
+# old key -> the name it reads as. A yaml written before the rename holds the lint gate as
+# `lint_changed`; it must keep working, and the next write emits the new key.
+GATE_ALIASES = {"lint_changed": "lint"}
+
+
+def gates_of(lines):
+    """-> {name: command} for the project's `gates:` block: all four names, '' when no command.
+    An old key reads as its new name (`lint_changed` as `lint`, a new key of the same name winning);
+    an old `install`/`format_changed` line is not a gate and is ignored. A file with no gates block
+    reads as four empty gates rather than failing (K7)."""
+    out = {name: "" for name in GATE_NAMES}
+    kl = key_lines(lines)
+    sr = section_range(lines, kl, ["gates"])
+    if not sr:
+        return out
+    ind = child_indent(lines, sr)
+    found = {k: scalar(rest) for (i, indent, k, rest) in kl if sr[2] <= i < sr[3] and indent == ind}
+    for old, new in GATE_ALIASES.items():
+        if found.get(new, "") == "" and old in found:
+            found[new] = found[old]
+    for name in GATE_NAMES:
+        out[name] = found.get(name, "")
+    return out
+
+
 def rows(lines):
     """The static schema rows plus one `agents.<a>.available` row per agent in the file and one
     `picks.<a>` row per agent that lists models, so a key that is not a known agent simply does not
@@ -1657,6 +1685,7 @@ def cmd_context(path, lines, usage_arg=None):
         "providers": val("usage.providers"),
         "launch_flags": launch_flags,
         "default_agent": val("lanes.default_agent"),
+        "gates": gates_of(lines),
         "agents": agents_map,
         "sources": sources,
     })
@@ -2603,6 +2632,36 @@ def self_test():
             f.write(fixture + "  selftest_jobs_total: abc\n")
         garbled = run("get", "session.selftest_jobs_total")
         assert garbled["value"] == want and garbled.get("derived") is True, garbled
+        with open(yaml_path, "w") as f:
+            f.write(fixture)
+
+        # 28b. C3 gates reader (GATEKEY.1): the fixture's four names, an old `lint_changed` read as
+        #      `lint` (a new key of that name wins), `install`/`format_changed` ignored, and a file
+        #      with no gates block reading as four empty gates rather than failing (K7).
+        assert run("context")["gates"] == {"test": "", "typecheck": "", "lint": "", "build": ""}, run("context")
+        old_gates = fixture.replace(
+            '  lint: ""\n  build: ""\n',
+            '  lint_changed: "pnpm exec eslint ."\n  format_changed: "pnpm exec prettier --write ."\n  install: "pnpm install"\n')
+        assert old_gates != fixture
+        with open(yaml_path, "w") as f:
+            f.write(old_gates)
+        g = run("context")["gates"]
+        assert g == {"test": "", "typecheck": "", "lint": "pnpm exec eslint .", "build": ""}, g
+        both = old_gates.replace('  lint_changed:', '  lint: "pnpm exec eslint src"\n  lint_changed:')
+        with open(yaml_path, "w") as f:
+            f.write(both)
+        g = run("context")["gates"]
+        assert g["lint"] == "pnpm exec eslint src", g
+        no_gates = "".join(line + "\n" for line in fixture.splitlines()
+                           if line != "gates:" and not (line.startswith("  ") and line.split(":")[0].strip()
+                                                        in ("test", "typecheck", "lint", "build")))
+        with open(yaml_path, "w") as f:
+            f.write(no_gates)
+        assert run("context")["gates"] == {"test": "", "typecheck": "", "lint": "", "build": ""}, run("context")
+        # and the shipped template carries the four names, no old key
+        with open(os.path.join(HERE, "..", "skills", "matrixkoder", "templates", "matrixkoder.yaml")) as f:
+            templ = f.read().splitlines()
+        assert gates_of(templ) == {"test": "", "typecheck": "", "lint": "", "build": ""}, gates_of(templ)
         with open(yaml_path, "w") as f:
             f.write(fixture)
 

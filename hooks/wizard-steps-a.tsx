@@ -25,7 +25,7 @@ export type WizardEls = ElementTables['terminal'] | ElementTables['desktop'] | E
 
 export type StrField = 'maxLanes' | 'claudeFiveHour' | 'claudeWeekly' | 'branch' | 'preauthorised' | 'qaStart' | 'qaDevUrl' | 'qaThemes' | 'qaMockups' | 'pollMin'
 export type BoolField = 'gitignore' | 'skipPermissions' | 'qaFrontend' | 'autoOpen' | 'chip' | 'toasts' | 'replace'
-export type GateFieldName = 'install' | 'test' | 'typecheck' | 'lint_changed' | 'format_changed'
+export type GateFieldName = 'test' | 'typecheck' | 'lint' | 'build'
 
 /** What a step body may do: patch the draft, re-check the existing yaml, write, close.
  *  wizard.tsx owns all four; the steps only call them. */
@@ -38,8 +38,8 @@ export type WizardAct = {
 
 const YES_NO = [{ value: 'yes', label: 'yes' }, { value: 'no', label: 'no' }] as const
 
-/** The five gate commands in the order step 5 draws — and the yaml writes — them. */
-const GATE_FIELDS: readonly GateFieldName[] = ['install', 'test', 'typecheck', 'lint_changed', 'format_changed']
+/** The four gate commands in the order step 5 draws — and the yaml writes — them. */
+const GATE_FIELDS: readonly GateFieldName[] = ['test', 'typecheck', 'lint', 'build']
 
 /** the agents the step-3 hotkeys 1..4 toggle (claude is always on and drawn as a line) */
 const toggleable: readonly string[] = AGENT_NAMES.filter(n => n !== 'claude')
@@ -270,11 +270,10 @@ export function StepsA(els: WizardEls, d: MkWizardDraft, act: WizardAct, step: n
             <Box flexDirection="column">
               {Head(els, 'Commands')}
               <Text dimColor={true}>{d.gatesFrom !== '' ? `Proposed from ${d.gatesFrom}. Test suites are not run.` : 'Nothing detected — Tab to a field and type the command you use.'}</Text>
-              {GateField(els, d, act, 'install', 'install', gatesEmpty)}
-              {GateField(els, d, act, 'test', 'test')}
+              {GateField(els, d, act, 'test', 'test', gatesEmpty)}
               {GateField(els, d, act, 'typecheck', 'typecheck')}
-              {GateField(els, d, act, 'lint_changed', 'lint_changed')}
-              {GateField(els, d, act, 'format_changed', 'format_changed')}
+              {GateField(els, d, act, 'lint', 'lint')}
+              {GateField(els, d, act, 'build', 'build')}
               {empty.length > 0 && <Text dimColor={true}>{`empty gates: ${empty.join(', ')} — written as "" (no command).`}</Text>}
             </Box>
           ))}
