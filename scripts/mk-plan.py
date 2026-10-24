@@ -2114,6 +2114,138 @@ def cmd_item_set(a):
                                                               "owned", "deps")}, a.data, a.home)
 
 
+def log_plan(plan, kind, text, who, data=None, home=None, date=None):
+    """STORE.2: append a Log line to the plan's log in the store (header_json).
+    The approved version file under archive/ is never changed."""
+    if not plan:
+        raise Fail(["plan id required"])
+    if not kind or not str(kind).strip():
+        raise Fail(["log needs non-empty --kind"])
+    kind = str(kind).strip()
+    if kind not in ALLOWED_LOG_KINDS:
+        raise Fail([f"log: unknown kind {kind!r} (allowed: {', '.join(sorted(ALLOWED_LOG_KINDS))})"])
+    if not text or not str(text).strip():
+        raise Fail(["log needs non-empty --text"])
+    text = str(text).strip()
+    if not who or not str(who).strip():
+        raise Fail(["log needs non-empty --by"])
+    who = str(who).strip()
+    held = plan_in_store(plan, data, home)
+    if held is None:
+        raise Fail([f"no plan {plan} in the store"])
+    db, con, plan_id, row = held
+    try:
+        header = header_of(row)
+        today = date or datetime.date.today().isoformat()
+        entry = {"date": today, "kind": kind, "text": text, "who": who,
+                 "raw": f"- {today} — {kind} — {text} — {who}"}
+        header.setdefault("log", []).append(entry)
+        con.execute("UPDATE plans SET header_json=? WHERE id=?",
+                    (json.dumps(header, sort_keys=True), plan_id))
+        con.commit()
+    finally:
+        con.close()
+    return {"ok": True, "plan": plan_id, "store": True, "log": entry}
+
+
+def answer_plan(plan, question, text, who, data=None, home=None, date=None):
+    """STORE.2: tick a question and record the answer in the store (header_json).
+    Also appends a Log line. The approved version file under archive/ is never changed."""
+    if not plan:
+        raise Fail(["plan id required"])
+    if not question or not str(question).strip():
+        raise Fail(["answer needs a question id (e.g. Q1)"])
+    qid = str(question).strip()
+    if not qid.startswith("Q") and qid.isdigit():
+        qid = f"Q{qid}"
+    if not who or not str(who).strip():
+        raise Fail(["answer needs non-empty --by"])
+    who = str(who).strip()
+    text = (text or "").strip()
+    held = plan_in_store(plan, data, home)
+    if held is None:
+        raise Fail([f"no plan {plan} in the store"])
+    db, con, plan_id, row = held
+    try:
+        header = header_of(row)
+        questions = header.setdefault("questions", [])
+        q_match = next((q for q in questions if q.get("id") == qid), None)
+        if not q_match:
+            raise Fail([f"no question {qid} in plan {plan_id}"])
+        q_match["ticked"] = True
+        if text:
+            q_match["pick"] = text
+            q_match["answer"] = text
+        q_match["answered_by"] = who
+        today = date or datetime.date.today().isoformat()
+        log_text = f"{qid}: {text}" if text else qid
+        entry = {"date": today, "kind": "answer", "text": log_text, "who": who,
+                 "raw": f"- {today} — answer — {log_text} — {who}"}
+        header.setdefault("log", []).append(entry)
+        con.execute("UPDATE plans SET header_json=? WHERE id=?",
+                    (json.dumps(header, sort_keys=True), plan_id))
+        con.commit()
+    finally:
+        con.close()
+    return {"ok": True, "plan": plan_id, "question": qid, "store": True, "log": entry}
+
+
+def override_plan(plan, question, task, who, text="", data=None, home=None, date=None):
+    """STORE.2: record an override for a question on a task in the store (header_json).
+    Also appends a Log line. The approved version file under archive/ is never changed."""
+    if not plan:
+        raise Fail(["plan id required"])
+    if not question or not str(question).strip():
+        raise Fail(["override needs a question id (e.g. Q1)"])
+    qid = str(question).strip()
+    if not qid.startswith("Q") and qid.isdigit():
+        qid = f"Q{qid}"
+    if not task or not str(task).strip():
+        raise Fail(["override needs non-empty --task"])
+    task = str(task).strip()
+    if not who or not str(who).strip():
+        raise Fail(["override needs non-empty --by"])
+    who = str(who).strip()
+    text = (text or "").strip()
+    held = plan_in_store(plan, data, home)
+    if held is None:
+        raise Fail([f"no plan {plan} in the store"])
+    db, con, plan_id, row = held
+    try:
+        header = header_of(row)
+        questions = header.setdefault("questions", [])
+        q_match = next((q for q in questions if q.get("id") == qid), None)
+        if not q_match:
+            raise Fail([f"no question {qid} in plan {plan_id}"])
+        today = date or datetime.date.today().isoformat()
+        ovr = {"question": qid, "task": task, "by": who, "date": today, "text": text}
+        header.setdefault("overrides", []).append(ovr)
+        q_match.setdefault("overrides", []).append(task)
+        log_text = f"{qid} for {task}" + (f": {text}" if text else "")
+        entry = {"date": today, "kind": "override", "text": log_text, "who": who,
+                 "raw": f"- {today} — override — {log_text} — {who}"}
+        header.setdefault("log", []).append(entry)
+        con.execute("UPDATE plans SET header_json=? WHERE id=?",
+                    (json.dumps(header, sort_keys=True), plan_id))
+        con.commit()
+    finally:
+        con.close()
+    return {"ok": True, "plan": plan_id, "question": qid, "task": task, "store": True,
+            "override": ovr, "log": entry}
+
+
+def cmd_log(a):
+    return log_plan(a.plan, a.kind, a.text, a.by, a.data, a.home, getattr(a, "date", None))
+
+
+def cmd_answer(a):
+    return answer_plan(a.plan, a.question, a.text, a.by, a.data, a.home, getattr(a, "date", None))
+
+
+def cmd_override(a):
+    return override_plan(a.plan, a.question, a.task, a.by, a.text, a.data, a.home, getattr(a, "date", None))
+
+
 # ---------- approve / export (D4): the store is optional ----------
 
 def _mkdb():
@@ -2259,12 +2391,22 @@ def header_json_of(out, sha, body_md, status):
     """The header_json approve and import both write: the sha of the file, the status, runs,
     gates, the F.2 final gates, phases and the body, plus the plan-level `description` when it
     is a non-empty string. Other unknown header keys (created, design, integration, …) live
-    here on a store without the D1.1 columns."""
+    here on a store without the D1.1 columns.
+    For numbered-block plans (STORE.1 / C2), also writes goals, items, risks, questions, log,
+    summary, gate_lines, use_gates, pushed, integration."""
     hdr = {"sha": sha, "status": status, "runs": out["runs"], "gates": out["gates"],
            "final_gates": out["final_gates"], "phases": out["phases"], "body": body_md}
     desc = out.get("description")
     if isinstance(desc, str) and desc.strip():
         hdr["description"] = desc
+    # New fields (STORE.1 / C2)
+    for k in ("goals", "items", "risks", "questions", "log", "summary", "gate_lines", "use_gates", "proves"):
+        if k in out and out[k] is not None:
+            hdr[k] = out[k]
+    if "pushed" in out and out["pushed"] is not None:
+        hdr["pushed"] = bool(out["pushed"])
+    if "integration" in out and out["integration"] is not None:
+        hdr["integration"] = out["integration"]
     return json.dumps(hdr, sort_keys=True)
 
 
@@ -2389,6 +2531,8 @@ def merged_header_json(out, sha, body_md, status, prev_header, source=None):
     src = source or prev_header.get("source")
     if src:
         hdr["source"] = src
+    if "overrides" in prev_header and "overrides" not in hdr:
+        hdr["overrides"] = prev_header["overrides"]
     return json.dumps(hdr, sort_keys=True)
 
 
@@ -3394,6 +3538,38 @@ def build_parser():
         d.add_argument("--data", default=None)
         d.add_argument("--home", default=None)
         d.set_defaults(func=func)
+
+    lg = sub.add_parser("log")
+    lg.add_argument("plan")
+    lg.add_argument("--kind", required=True)
+    lg.add_argument("--text", required=True)
+    lg.add_argument("--by", required=True)
+    lg.add_argument("--data", default=None)
+    lg.add_argument("--home", default=None)
+    lg.add_argument("--date", default=None)
+    lg.set_defaults(func=cmd_log)
+
+    ans = sub.add_parser("answer")
+    ans.add_argument("plan")
+    ans.add_argument("question")
+    ans.add_argument("--text", default="")
+    ans.add_argument("--by", required=True)
+    ans.add_argument("--data", default=None)
+    ans.add_argument("--home", default=None)
+    ans.add_argument("--date", default=None)
+    ans.set_defaults(func=cmd_answer)
+
+    ovr = sub.add_parser("override")
+    ovr.add_argument("plan")
+    ovr.add_argument("question")
+    ovr.add_argument("--task", required=True)
+    ovr.add_argument("--by", required=True)
+    ovr.add_argument("--text", default="")
+    ovr.add_argument("--data", default=None)
+    ovr.add_argument("--home", default=None)
+    ovr.add_argument("--date", default=None)
+    ovr.set_defaults(func=cmd_override)
+
     return p
 
 

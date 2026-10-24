@@ -2730,6 +2730,223 @@ gates:
             finally:
                 shutil.rmtree(tmp_main_dir, ignore_errors=True)
 
+        # =====================================================================
+        # Phase STORE tests: STORE.1, STORE.2, STORE.3
+        # =====================================================================
+        store_data = os.path.join(tmp, "store-pfr")
+        store_home = os.path.join(store_data, ".mk-home")
+        os.makedirs(store_data, exist_ok=True)
+        os.makedirs(store_home, exist_ok=True)
+        db = _mkdb()
+        db.open_project(store_home, data_dir=mkpaths.project_folder(store_data, store_home)).close()
+
+        # Write project YAML with defined gates for test and typecheck
+        pfr_yaml = mkpaths.project_yaml(store_data)
+        os.makedirs(os.path.dirname(pfr_yaml), exist_ok=True)
+        with open(pfr_yaml, "w") as f:
+            f.write("""repo:
+  integration_branch: main
+routing_preferences:
+  max_build_lanes: 4
+gates:
+  test: pytest -q
+  typecheck: mypy --strict
+  selftest: bash scripts/selftest.sh
+  oldnames: "! rg -n 'lint_changed' ."
+""")
+
+        real_blocks_plan = os.path.join(root, "scripts", "fixtures", "plan-blocks.md")
+
+        # STORE.1: import and approve write the new fields into plans.header_json and plan_items.extra_json
+        imp_pfr = mk("import", real_blocks_plan, "--data", store_data, "--home", store_home)
+        assert imp_pfr["ok"] is True and imp_pfr["plan"] == "plan-format-refactor"
+        assert imp_pfr["version"] == 1
+
+        app_pfr = mk("approve", real_blocks_plan, "--data", store_data, "--home", store_home)
+        assert app_pfr["ok"] is True and app_pfr["status"] == "approved"
+        pfr_archive = app_pfr["archived"]
+        assert os.path.isfile(pfr_archive)
+        arch_bytes_before = open(pfr_archive, "rb").read()
+
+        con_pfr = db.open_project(store_home, data_dir=mkpaths.project_folder(store_data, store_home))
+        try:
+            row_pfr = con_pfr.execute("SELECT * FROM plans WHERE id='plan-format-refactor'").fetchone()
+            assert row_pfr is not None
+            hdr_pfr = json.loads(row_pfr["header_json"])
+
+            # Verify C2 fields in plans.header_json
+            assert isinstance(hdr_pfr.get("goals"), list) and len(hdr_pfr["goals"]) > 0
+            assert isinstance(hdr_pfr.get("items"), list) and len(hdr_pfr["items"]) > 0
+            assert isinstance(hdr_pfr.get("risks"), list) and len(hdr_pfr["risks"]) > 0
+            assert isinstance(hdr_pfr.get("questions"), list) and len(hdr_pfr["questions"]) > 0
+            assert isinstance(hdr_pfr.get("log"), list) and len(hdr_pfr["log"]) > 0
+            assert isinstance(hdr_pfr.get("summary"), dict) and "title" in hdr_pfr["summary"]
+            assert isinstance(hdr_pfr.get("gate_lines"), list) and len(hdr_pfr["gate_lines"]) > 0
+            assert isinstance(hdr_pfr.get("use_gates"), list) and len(hdr_pfr["use_gates"]) > 0
+            assert any(ug.get("id") == "test" for ug in hdr_pfr["use_gates"])
+            assert any(ug.get("id") == "typecheck" for ug in hdr_pfr["use_gates"])
+            assert hdr_pfr.get("pushed") is False
+            assert hdr_pfr.get("integration") == "main"
+
+            # Verify plan_items.extra_json has per-phase and per-task fields
+            p_items = con_pfr.execute("SELECT * FROM plan_items WHERE plan='plan-format-refactor'").fetchall()
+            assert len(p_items) > 0
+            phases_in_items = [r for r in p_items if r["type"] == "phase"]
+            tasks_in_items = [r for r in p_items if r["type"] == "task"]
+            assert len(phases_in_items) > 0 and len(tasks_in_items) > 0
+
+            for ph_row in phases_in_items:
+                pe = json.loads(ph_row["extra_json"])
+                assert "goal" in pe, f"phase {ph_row['id']} missing goal in extra_json"
+                assert "serves" in pe, f"phase {ph_row['id']} missing serves in extra_json"
+                assert "carries" in pe, f"phase {ph_row['id']} missing carries in extra_json"
+                assert "hazards" in pe, f"phase {ph_row['id']} missing hazards in extra_json"
+
+            for t_row in tasks_in_items:
+                te = json.loads(t_row["extra_json"])
+                assert "covers" in te, f"task {t_row['id']} missing covers in extra_json"
+                assert "size" in te, f"task {t_row['id']} missing size in extra_json"
+        finally:
+            con_pfr.close()
+
+        # STORE.1 run init: resolve each `use` name to the project's gate command through mk-config gates_of
+        state_py = os.path.join(HERE, "mk-state.py")
+        env_pfr = dict(os.environ, MATRIXKODER_DATA=store_data, MATRIXKODER_HOME=store_home, MK_HOME=store_home)
+        r_init = subprocess.run([
+            sys.executable, state_py, "--data", store_data, "run", "init",
+            "--id", "r-pfr-1", "--feature", "pfr", "--branch", "plan-format-refactor",
+            "--plan", "plan-format-refactor"
+        ], capture_output=True, text=True, env=env_pfr)
+        assert r_init.returncode == 0, (r_init.returncode, r_init.stdout, r_init.stderr)
+        init_out = json.loads(r_init.stdout.strip().splitlines()[-1])
+        assert init_out["ok"] is True
+        r_run = init_out["run"]
+        assert r_run["fidelity"] is True
+        # Resolved gates: 'test' -> 'pytest -q', 'typecheck' -> 'mypy --strict'
+        assert "final_gates" in r_run
+        fg_test = next(fg for fg in r_run["final_gates"] if fg.get("id") == "test")
+        assert fg_test["cmd"] == "pytest -q"
+        assert fg_test["expect"] == 0
+        fg_tc = next(fg for fg in r_run["final_gates"] if fg.get("id") == "typecheck")
+        assert fg_tc["cmd"] == "mypy --strict"
+        assert fg_tc["expect"] == 0
+        assert r_run["plan_gates"]["test"]["cmd"] == "pytest -q"
+        assert r_run["plan_gates"]["typecheck"]["cmd"] == "mypy --strict"
+
+        # STORE.1 run init refusal: an undefined use gate is refused at run start
+        p_bad_use = write("bad-use.md", make_base_plan(
+            plan_id="bad-use",
+            summary_gates="nonexistent_gate",
+            gate_lines="- nonexistent_gate — proves G1 — bad gate line",
+            use_gates='["nonexistent_gate"]',
+        ))
+        mk("import", p_bad_use, "--data", store_data, "--home", store_home)
+        mk("approve", p_bad_use, "--data", store_data, "--home", store_home)
+        r_init_bad = subprocess.run([
+            sys.executable, state_py, "--data", store_data, "run", "init",
+            "--id", "r-bad-use", "--feature", "bad", "--branch", "bad",
+            "--plan", "bad-use"
+        ], capture_output=True, text=True, env=env_pfr)
+        assert r_init_bad.returncode != 0
+        bad_err = json.loads(r_init_bad.stdout.strip().splitlines()[-1])
+        assert bad_err["ok"] is False
+        assert "use gate 'nonexistent_gate' is not defined by the project" in bad_err["error"]
+
+        # STORE.1: rows of old-format plans read back exactly as before
+        old_fmt_p = write("old-format.md", plan_text(plan='plan = "old-fmt"', phases=phase("P1", tasks=task("P1.1")) + "\n"))
+        mk("import", old_fmt_p, "--data", store_data, "--home", store_home)
+        mk("approve", old_fmt_p, "--data", store_data, "--home", store_home)
+        con_pfr = db.open_project(store_home, data_dir=mkpaths.project_folder(store_data, store_home))
+        try:
+            old_row = con_pfr.execute("SELECT header_json FROM plans WHERE id='old-fmt'").fetchone()
+            old_hdr = json.loads(old_row["header_json"])
+            assert "phases" in old_hdr and old_hdr.get("goals") is None
+        finally:
+            con_pfr.close()
+
+        # STORE.2: store commands (log, answer, override)
+        # 1. log
+        log_res = mk("log", "plan-format-refactor", "--kind", "decision",
+                     "--text", "architecture decision on store", "--by", "architect",
+                     "--data", store_data, "--home", store_home)
+        assert log_res["ok"] is True and log_res["store"] is True
+        assert log_res["log"]["kind"] == "decision"
+        assert log_res["log"]["who"] == "architect"
+        assert open(pfr_archive, "rb").read() == arch_bytes_before, "archive file was modified by log!"
+
+        # 2. answer
+        ans_res = mk("answer", "plan-format-refactor", "Q3",
+                     "--text", "push the branch upon final gate pass", "--by", "lead",
+                     "--data", store_data, "--home", store_home)
+        assert ans_res["ok"] is True and ans_res["store"] is True
+        assert ans_res["question"] == "Q3"
+        assert open(pfr_archive, "rb").read() == arch_bytes_before, "archive file was modified by answer!"
+
+        # 3. override
+        ovr_res = mk("override", "plan-format-refactor", "Q4",
+                     "--task", "STORE.1", "--text", "override for phase subagent flag", "--by", "lead",
+                     "--data", store_data, "--home", store_home)
+        assert ovr_res["ok"] is True and ovr_res["store"] is True
+        assert ovr_res["question"] == "Q4" and ovr_res["task"] == "STORE.1"
+        assert open(pfr_archive, "rb").read() == arch_bytes_before, "archive file was modified by override!"
+
+        # Verify DB reflects STORE.2 writes
+        con_pfr = db.open_project(store_home, data_dir=mkpaths.project_folder(store_data, store_home))
+        try:
+            row_pfr_after = con_pfr.execute("SELECT header_json FROM plans WHERE id='plan-format-refactor'").fetchone()
+            hdr_after = json.loads(row_pfr_after["header_json"])
+            # log entry present
+            assert any(entry.get("kind") == "decision" and "architecture decision on store" in entry.get("text", "")
+                       for entry in hdr_after.get("log", []))
+            # question Q3 answered/ticked
+            q3_found = next((q for q in hdr_after.get("questions", []) if q.get("id") == "Q3"), None)
+            assert q3_found is not None
+            assert q3_found.get("ticked") is True
+            assert q3_found.get("answer") == "push the branch upon final gate pass"
+            # override recorded
+            assert any(ov.get("question") == "Q4" and ov.get("task") == "STORE.1" and ov.get("by") == "lead"
+                       for ov in hdr_after.get("overrides", []))
+        finally:
+            con_pfr.close()
+
+        # STORE.3: mkdb.py readers: mkdb.py plans <id> --json carries new fields and no longer emits critical
+        mkdb_py = os.path.join(HERE, "mkdb.py")
+        r_mkdb = subprocess.run([
+            sys.executable, mkdb_py, "--data", store_data, "--home", store_home,
+            "plans", "plan-format-refactor", "--json"
+        ], capture_output=True, text=True)
+        assert r_mkdb.returncode == 0, (r_mkdb.returncode, r_mkdb.stdout, r_mkdb.stderr)
+        p_json = json.loads(r_mkdb.stdout.strip())
+        assert p_json["id"] == "plan-format-refactor"
+        assert "goals" in p_json and len(p_json["goals"]) > 0
+        assert "items" in p_json and len(p_json["items"]) > 0
+        assert "risks" in p_json and len(p_json["risks"]) > 0
+        assert "questions" in p_json and len(p_json["questions"]) > 0
+        assert "log" in p_json and len(p_json["log"]) > 0
+        assert "summary" in p_json and isinstance(p_json["summary"], dict)
+        assert "use_gates" in p_json and len(p_json["use_gates"]) > 0
+        assert "gate_lines" in p_json and len(p_json["gate_lines"]) > 0
+        assert "pushed" in p_json
+        assert "phases" in p_json and len(p_json["phases"]) > 0
+        for ph in p_json["phases"]:
+            assert "goal" in ph and "serves" in ph and "carries" in ph and "hazards" in ph
+            for t in ph.get("tasks") or []:
+                assert "covers" in t and "size" in t
+                assert "critical" not in t, f"task {t['id']} still has 'critical'"
+                for st in t.get("subtasks") or []:
+                    assert "critical" not in st, f"subtask {st['id']} still has 'critical'"
+
+        # STORE.3: old plan via mkdb.py plans old-fmt --json has no critical either
+        r_mkdb_old = subprocess.run([
+            sys.executable, mkdb_py, "--data", store_data, "--home", store_home,
+            "plans", "old-fmt", "--json"
+        ], capture_output=True, text=True)
+        assert r_mkdb_old.returncode == 0, (r_mkdb_old.returncode, r_mkdb_old.stdout, r_mkdb_old.stderr)
+        p_old_json = json.loads(r_mkdb_old.stdout.strip())
+        assert p_old_json["id"] == "old-fmt"
+        assert len(p_old_json["phases"]) == 1
+        assert "critical" not in p_old_json["phases"][0]["tasks"][0]
+
         print("mk-plan self-test ok")
     finally:
         restore_data()

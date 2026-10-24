@@ -549,27 +549,36 @@ the plan's runs (`tasks`, `events`, `artifacts`, `acks`, `waits`, `change_log`, 
 `risk_reasons`, `reconcile_due`, `event_src`), the `runs` rows and the `plans` row. The archived
 files stay.
 
-| Header key | DB home |
+| Header / block element | DB home |
 |---|---|
 | `plan` | `plans.id` |
 | `status` | `plans.status` |
 | `created` | `plans.created` |
 | `runs` | `plans.header_json` |
 | `design` | `plans.design` (JSON array text) |
-| `integration` | `plans.integration` (JSON array text) |
-| `[gates]` (`test`, `typecheck`, `selftest`, `validate`) | `plans.header_json` |
-| `[[phase]]` blocks | `plans.header_json` |
-| `[[phase]] id` / `[[phase.task]] id` / `[[phase.task.subtask]] id` | `tasks.id` |
-| `title` (phase, task, subtask) | `tasks.title` |
+| `integration` | `plans.integration` (JSON array text) and `plans.header_json` |
+| `pushed` | `plans.header_json` |
+| `[gates]` / `[[final_gate]]` / `use_gates` / `gate_lines` | `plans.header_json` (`use_gates` resolved to project gate commands at run init) |
+| Block 2 Summary (`title`, `phases`, `method`, `lanes`, `delivery`, `gates`) | `plans.header_json` (`summary`) |
+| Block 3 Goal (`G<n>` goals, `goal_meta`) | `plans.header_json` (`goals`) |
+| Block 4 Design / context (`C/T/A/R/S` items) | `plans.header_json` (`items`) |
+| Block 5 Phases: phase `id` / task `id` / subtask `id` | `tasks.id` (and `plan_items.id`) |
+| `title` (phase, task, subtask) | `tasks.title` (and `plan_items.title`) |
+| Phase `goal`, `serves`, `carries`, `hazards` | `plans.header_json` (inside `phases`) and `plan_items.extra_json` |
+| Task `covers`, `size` | `plans.header_json` (inside `phases.tasks`) and `plan_items.extra_json` |
 | `description` (header) | `plans.header_json` |
 | `description` (phase, task, subtask) | `plans.header_json`; task and subtask also `tasks.extra_json` (copied at run init and plan sync) |
-| `acceptance` (task, subtask) | `tasks.acceptance` |
-| `owned` (phase, task, subtask) | `tasks.owned` |
-| `deps` (phase, task, subtask) | `tasks.deps` |
-| `parallel` (task, subtask) | `tasks.parallel` |
+| `acceptance` (task, subtask) | `tasks.acceptance` (and `plan_items.acceptance`) |
+| `owned` (phase, task, subtask) | `tasks.owned` (and `plan_items.owned`) |
+| `deps` (phase, task, subtask) | `tasks.deps` (and `plan_items.deps`) |
+| `parallel` (task, subtask) | `tasks.parallel` (and `plan_items.parallel`) |
 | `route` (phase, task, subtask) | `tasks.route_json` (`{"agent","model","effort"}` or empty) |
-| nesting of `[[phase.task]]` / `[[phase.task.subtask]]` | `tasks.type` (`phase\|task\|subtask`) and `tasks.parent` |
-| `wave`, `forbidden`, `reviewer`, `size`, `risk`, `review`, `qa`, `commit`, `subagents`, `lane_group`, `refs`, `subagent` | `header_json` only — no column |
+| nesting of `phase` / `task` / `subtask` | `tasks.type` (`phase\|task\|subtask`) and `tasks.parent` (and `plan_items.type`, `plan_items.parent`) |
+| Block 7 Risks (`K<n>` risks, levels, guards, targets) | `plans.header_json` (`risks`) |
+| Block 8 Open questions (`Q<n>`, ticked, question, blocks, pick) | `plans.header_json` (`questions`), ticked and answered in store |
+| Block 9 Log (`date`, `kind`, `text`, `who`) | `plans.header_json` (`log`), appended via `mk-plan.py log` |
+| Recorded question overrides | `plans.header_json` (`overrides`) and question `overrides` list |
+| `wave`, `forbidden`, `reviewer`, `size`, `risk`, `review`, `qa`, `commit`, `subagents`, `lane_group`, `refs`, `subagent` | `header_json` and `plan_items.extra_json` — no column (`critical` is removed) |
 | the body below the closing `+++` | `plans.body_md` |
 | the body H1 line | `plans.title` — the H1 text after the em dash (`# <id> — <title>`); the plan id when there is no H1 (C3) |
 
@@ -577,6 +586,14 @@ The task rows come from the importer `approve_file` (`scripts/mk-plan.py`): its 
 yields `(id, type, parent, title, acceptance, owned, deps, parallel, route)` per phase, task and
 subtask, parent first, and each becomes one `tasks` row of the run (and, for a new version, one
 `plan_items` row, below).
+
+### Store modifications after approval (STORE.2, contract C4)
+
+After a plan is approved, its approved version file under `archive/` is immutable and never changed.
+The following commands update the plan state directly in the store (`plans.header_json`):
+- `mk-plan.py log <plan id> --kind <k> --text <t> --by <who>` appends a Log entry to `header_json.log`.
+- `mk-plan.py answer <plan id> Q<n> --text <t> --by <who>` ticks the question in `header_json.questions` and records an answer Log line.
+- `mk-plan.py override <plan id> Q<n> --task <id> --by <who>` records a question override on a task in `header_json.overrides` and an override Log line.
 
 ### Versioned plan items (`plan_items`, `plan_versions`; STORE.1, contract C4)
 
@@ -591,7 +608,9 @@ extra_json, ord)`, primary key `(plan, version, id)`. One row per phase, task an
 plan version, in `ord` order (parent first). `type` is `phase|task|subtask`; `owned` and `deps` are
 comma-separated; `acceptance` is the flat text (acceptance lines joined by a newline); `route_json`
 is `{agent, effort, model}` or NULL; `extra_json` holds every other key of the item (`wave`,
-`description`, `gate`, `manual`, `critical`, `risk`, `refs`, …), so the rows alone rebuild the plan.
+`description`, `gate`, `manual`, `risk`, `refs`, per-phase `goal`/`serves`/`carries`/`hazards`,
+per-task `covers`/`size`, … — `critical` is removed and no longer stored), so the rows alone
+rebuild the plan.
 
 `plan_versions(plan, version, sha, created, approved_at)`, primary key `(plan, version)`: the
 approved mark is per version (`approved_at` NULL = not approved) and `sha` is the sha256 of the file

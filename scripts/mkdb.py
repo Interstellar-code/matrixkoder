@@ -1744,6 +1744,8 @@ def _phases_from_run(rows, header, run, con):
              if isinstance(p, dict) and p.get("id")}
     hphase = {str(p.get("id")): p for p in header.get("phases") or []
               if isinstance(p, dict) and p.get("id")}
+    htasks = {str(t.get("id")): t for p in header.get("phases") or []
+              if isinstance(p, dict) for t in p.get("tasks") or [] if isinstance(t, dict) and t.get("id")}
     ids = {r["id"] for r in rows}
     roots = {r["id"] for r in rows if not r["parent"] or r["parent"] not in ids}
     phases, nodes = {}, {}
@@ -1754,6 +1756,10 @@ def _phases_from_run(rows, header, run, con):
             ph.update(_routing_of(r))
             ph.update(_task_history(con, run, r["id"], _task_extra(con, run, r["id"]), r["round"]))
             _desc_into(ph, hphase.get(r["id"]))
+            hp = hphase.get(r["id"]) or {}
+            for k in ("goal", "serves", "carries", "hazards"):
+                if k in hp:
+                    ph[k] = hp[k]
             ph["tasks"] = []
             phases[r["id"]] = ph
         else:
@@ -1765,9 +1771,17 @@ def _phases_from_run(rows, header, run, con):
             reasons = _open_reasons(con, run, r["id"])
             nodes[r["id"]].update(_task_history(con, run, r["id"], extra, r["round"]))
             nodes[r["id"]]["risk"] = _risk_of(extra, reasons)
-            nodes[r["id"]]["critical"] = extra.get("critical") is True
             _desc_into(nodes[r["id"]], extra)
             nodes[r["id"]]["open_reasons"] = reasons
+            ht = htasks.get(r["id"]) or {}
+            if "covers" in extra:
+                nodes[r["id"]]["covers"] = extra["covers"]
+            elif "covers" in ht:
+                nodes[r["id"]]["covers"] = ht["covers"]
+            if "size" in extra:
+                nodes[r["id"]]["size"] = extra["size"]
+            elif "size" in ht:
+                nodes[r["id"]]["size"] = ht["size"]
     for r in rows:  # pass 2: attach in rowid order — the parent node already exists, any depth
         node = nodes.get(r["id"])
         if node is None:
@@ -1801,7 +1815,7 @@ def _phases_from_header(header):
                     "branch": None, "updated": None, "acceptance": None, "owned": [],
                     "deps": list(d.get("deps") or []), "route": None, "subtasks": [],
                     "last_commit": None, "rounds": None, "gates": None, "findings": None,
-                    "risk": 1, "critical": False, "open_reasons": []}
+                    "risk": 1, "open_reasons": []}
 
         tasks = []
         for t in ph.get("tasks") or []:
@@ -1809,14 +1823,22 @@ def _phases_from_header(header):
                 continue
             tid = str(t.get("id", ""))
             task = _planned_into(_desc_into(_node(tid, t, pid, "task"), t), ph, t)
+            if "covers" in t:
+                task["covers"] = t["covers"]
+            if "size" in t:
+                task["size"] = t["size"]
             task["subtasks"] = [_planned_into(_desc_into(_node(str(s.get("id", "")), s, tid, "subtask"), s), ph, s)
                                 for s in t.get("subtasks") or [] if isinstance(s, dict)]
             tasks.append(task)
-        out.append({"id": pid, "title": ph.get("title", ""), "wave": ph.get("wave"),
-                    "deps": list(ph.get("deps") or []), "status": "planned", "slot": None,
-                    "pane": None, "branch": None, "updated": None, "acceptance": None,
-                    "owned": [], "route": None, "last_commit": None, "rounds": None,
-                    "gates": None, "findings": None, "tasks": tasks})
+        ph_node = {"id": pid, "title": ph.get("title", ""), "wave": ph.get("wave"),
+                   "deps": list(ph.get("deps") or []), "status": "planned", "slot": None,
+                   "pane": None, "branch": None, "updated": None, "acceptance": None,
+                   "owned": [], "route": None, "last_commit": None, "rounds": None,
+                   "gates": None, "findings": None, "tasks": tasks}
+        for k in ("goal", "serves", "carries", "hazards"):
+            if k in ph:
+                ph_node[k] = ph[k]
+        out.append(ph_node)
         _desc_into(out[-1], ph)
         _planned_into(out[-1], ph, ph)
     return out
@@ -1855,6 +1877,13 @@ def _phases_from_items(items):
         if it:
             node["acceptance"] = it["acceptance"] or None
             node["owned"] = list(it["owned"])
+            extra = it.get("extra") or {}
+            for k in ("covers", "size"):
+                if k in extra and k not in node:
+                    node[k] = extra[k]
+            for k in ("goal", "serves", "carries", "hazards"):
+                if k in extra and k not in node:
+                    node[k] = extra[k]
         for child in node.get("tasks", []) + node.get("subtasks", []):
             fill(child)
     for ph in phases:
@@ -1914,6 +1943,11 @@ def _plan_obj(con, row, detail=False):
     obj["counts"] = counts
     if detail:
         obj["phases"] = phases
+        for k in ("goals", "items", "risks", "questions", "log", "summary", "use_gates", "gate_lines", "pushed", "overrides"):
+            if k in header:
+                obj[k] = header[k]
+        if obj.get("integration") is None and header.get("integration"):
+            obj["integration"] = _integration_of(header.get("integration"))
     return obj
 
 
@@ -3222,22 +3256,22 @@ def _derived_risk(home):
     finally:
         con.close()
 
-    # plans --json carries risk, critical, open_reasons
+    # plans --json carries risk, open_reasons (critical is no longer emitted)
     got = plans(home, data_dir=data, plan_id="rp")
     tasks = got["phases"][0]["tasks"] if got["phases"] else []
     by_id = {t["id"]: t for t in tasks}
     _check(by_id["R1"]["risk"] == 1, f"R1 plans risk {by_id['R1']['risk']} != 1")
-    _check(by_id["R1"]["critical"] is False, f"R1 critical {by_id['R1']['critical']} != False")
+    _check("critical" not in by_id["R1"], f"R1 critical {by_id['R1'].get('critical')} should be absent")
     _check(len(by_id["R1"]["open_reasons"]) == 5, f"R1 open_reasons {by_id['R1']['open_reasons']} should have 5")
     _check(by_id["R2"]["risk"] == 4, f"R2 plans risk {by_id['R2']['risk']} != 4")
-    _check(by_id["R2"]["critical"] is True, f"R2 critical {by_id['R2']['critical']} != True")
+    _check("critical" not in by_id["R2"], f"R2 critical {by_id['R2'].get('critical')} should be absent")
     _check(len(by_id["R2"]["open_reasons"]) == 1, f"R2 plans open_reasons {by_id['R2']['open_reasons']}")
     _check(by_id["R3"]["risk"] == 5, f"R3 plans risk {by_id['R3']['risk']} != 5")
     _check(by_id["R4"]["risk"] == 3, f"R4 plans risk {by_id['R4']['risk']} != 3")
     # Existing keys unchanged
     _check("id" in by_id["R1"] and "title" in by_id["R1"] and "status" in by_id["R1"],
            "existing task keys missing")
-    # R2: critical as string "false" → False (is True, not bool())
+    # R2: critical as string "false" → not in output
     con2 = open_project(home, data_dir=data)
     try:
         con2.execute("UPDATE tasks SET extra_json='{\"base_risk\":1,\"critical\":\"false\"}'"
@@ -3248,9 +3282,9 @@ def _derived_risk(home):
     got2 = plans(home, data_dir=data, plan_id="rp")
     tasks2 = got2["phases"][0]["tasks"] if got2["phases"] else []
     by_id2 = {t["id"]: t for t in tasks2}
-    _check(by_id2["R1"]["critical"] is False,
-           f"critical string 'false' → {by_id2['R1']['critical']!r} (should be False)")
-    # critical as string "true" → False (is True, not truthy)
+    _check("critical" not in by_id2["R1"],
+           f"critical string 'false' should not be emitted: {by_id2['R1'].get('critical')!r}")
+    # critical as string "true" → not in output
     con3 = open_project(home, data_dir=data)
     try:
         con3.execute("UPDATE tasks SET extra_json='{\"base_risk\":1,\"critical\":\"true\"}'"
@@ -3261,9 +3295,9 @@ def _derived_risk(home):
     got3 = plans(home, data_dir=data, plan_id="rp")
     tasks3 = got3["phases"][0]["tasks"] if got3["phases"] else []
     by_id3 = {t["id"]: t for t in tasks3}
-    _check(by_id3["R1"]["critical"] is False,
-           f"critical string 'true' → {by_id3['R1']['critical']!r} (should be False)")
-    # critical as int 1 → False (is True)
+    _check("critical" not in by_id3["R1"],
+           f"critical string 'true' should not be emitted: {by_id3['R1'].get('critical')!r}")
+    # critical as int 1 → not in output
     con4 = open_project(home, data_dir=data)
     try:
         con4.execute("UPDATE tasks SET extra_json='{\"base_risk\":1,\"critical\":1}'"
@@ -3274,8 +3308,8 @@ def _derived_risk(home):
     got4 = plans(home, data_dir=data, plan_id="rp")
     tasks4 = got4["phases"][0]["tasks"] if got4["phases"] else []
     by_id4 = {t["id"]: t for t in tasks4}
-    _check(by_id4["R1"]["critical"] is False,
-           f"critical int 1 → {by_id4['R1']['critical']!r} (should be False)")
+    _check("critical" not in by_id4["R1"],
+           f"critical int 1 should not be emitted: {by_id4['R1'].get('critical')!r}")
 
 
 
@@ -4693,8 +4727,9 @@ def _plans_detail(home):
     _check([t["id"] for t in ph1["tasks"]] == ["a1", "a2", "a3", "a4"], f"ph1 tasks {ph1['tasks']}")
     task_keys = {"id", "title", "status", "parent", "type", "round", "verdict", "slot", "pane",
                  "branch", "updated", "acceptance", "owned", "deps", "route", "subtasks",
-                 "risk", "critical", "open_reasons", "last_commit", "rounds", "gates", "findings"}
+                 "risk", "open_reasons", "last_commit", "rounds", "gates", "findings"}
     a1, a2, a3, a4 = ph1["tasks"]
+    _check("critical" not in a1, f"critical should not be in a1: {a1}")
     _check(a1["parent"] == "ph1" and a1["type"] == "task" and a1["status"] == "planned"
            and set(a1) == task_keys, f"a1 {a1}")
     _check(a1["slot"] == 3 and a1["pane"] == "mk:0.1" and a1["branch"] == "mk/r2/v1"
@@ -4747,6 +4782,60 @@ def _plans_detail(home):
            f"beta header phase shape {ph1b}")
     _check(ph2b["tasks"][0]["deps"] == ["a1"],
            f"beta header task deps {ph2b['tasks'][0]}")  # deps from the header task dict
+
+    # Test STORE.3: a stored plan carrying the new numbered-block fields
+    con_gamma = open_project(home, data_dir=data)
+    try:
+        hdr_gamma = {
+            "goals": [{"id": "G1", "text": "goal 1"}],
+            "items": [{"id": "C1", "type": "contract", "text": "contract 1"}],
+            "risks": [{"id": "K1", "level": 3, "what": "risk 1"}],
+            "questions": [{"id": "Q1", "ticked": True, "question": "q 1"}],
+            "log": [{"date": "2026-10-24", "kind": "drafted", "text": "log 1", "who": "user"}],
+            "summary": {"title": "Summary title", "phases": "1 — P1: Phase 1"},
+            "gate_lines": [{"name": "test", "proves": ["G1"]}],
+            "use_gates": [{"id": "test", "cmd": "pytest"}],
+            "pushed": False,
+            "phases": [{
+                "id": "P1", "title": "Phase 1", "wave": 1, "goal": "phase goal",
+                "serves": ["G1"], "carries": ["C1"], "hazards": ["K1"],
+                "tasks": [{
+                    "id": "P1.1", "title": "Task 1", "covers": ["C1"], "size": "standard",
+                    "deps": []
+                }]
+            }]
+        }
+        con_gamma.execute("INSERT INTO plans(id, version, title, status, header_json)"
+                          " VALUES ('gamma', 1, 'Gamma title', 'approved', ?)",
+                          (json.dumps(hdr_gamma),))
+        con_gamma.commit()
+    finally:
+        con_gamma.close()
+    gamma = plans(home, data_dir=data, plan_id="gamma")
+    _check(gamma["ok"] is True and gamma["id"] == "gamma", f"gamma detail {gamma}")
+    _check(gamma.get("goals") == hdr_gamma["goals"], f"gamma goals {gamma.get('goals')}")
+    _check(gamma.get("items") == hdr_gamma["items"], f"gamma items {gamma.get('items')}")
+    _check(gamma.get("risks") == hdr_gamma["risks"], f"gamma risks {gamma.get('risks')}")
+    _check(gamma.get("questions") == hdr_gamma["questions"], f"gamma questions {gamma.get('questions')}")
+    _check(gamma.get("log") == hdr_gamma["log"], f"gamma log {gamma.get('log')}")
+    _check(gamma.get("summary") == hdr_gamma["summary"], f"gamma summary {gamma.get('summary')}")
+    _check(gamma.get("use_gates") == hdr_gamma["use_gates"], f"gamma use_gates {gamma.get('use_gates')}")
+    _check(gamma.get("gate_lines") == hdr_gamma["gate_lines"], f"gamma gate_lines {gamma.get('gate_lines')}")
+    _check(gamma.get("pushed") is False, f"gamma pushed {gamma.get('pushed')}")
+    gp = gamma["phases"][0]
+    _check(gp.get("goal") == "phase goal" and gp.get("serves") == ["G1"]
+           and gp.get("carries") == ["C1"] and gp.get("hazards") == ["K1"], f"gamma phase {gp}")
+    gt = gp["tasks"][0]
+    _check(gt.get("covers") == ["C1"] and gt.get("size") == "standard", f"gamma task {gt}")
+    _check("critical" not in gt, f"critical must not be in task {gt}")
+
+    # Also check through the CLI
+    proc_gamma = subprocess.run([sys.executable, os.path.abspath(__file__), "plans", "gamma", "--home",
+                                 home, "--data", data, "--json"], capture_output=True, text=True)
+    _check(proc_gamma.returncode == 0, f"cli plans gamma rc={proc_gamma.returncode}")
+    cli_gamma = json.loads(proc_gamma.stdout)
+    _check(cli_gamma.get("goals") == hdr_gamma["goals"], f"cli gamma goals {cli_gamma.get('goals')}")
+    _check("critical" not in cli_gamma["phases"][0]["tasks"][0], "critical in cli gamma task")
     try:
         plans(home, data_dir=data, plan_id="nope")
     except Fail:

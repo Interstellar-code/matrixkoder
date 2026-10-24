@@ -1521,6 +1521,9 @@ def plan_dict_from_items(plan_id, row, header, items, gates=None, final_gates=No
            "phases": phases}
     if isinstance(header.get("description"), str) and header["description"].strip():
         out["description"] = header["description"]
+    for k in ("goals", "items", "risks", "questions", "log", "summary", "use_gates", "gate_lines", "pushed"):
+        if k in header:
+            out[k] = header[k]
     return out
 
 
@@ -1718,6 +1721,34 @@ def cmd_run(a, st):
             fid = plan_fidelity(cur) if cur else False
             if fid:  # F.2: the run carries the plan's gate contract; a pre-F plan sets nothing
                 run["fidelity"], run["final_gates"] = True, list(cur.get("final_gates") or [])
+            if cur and cur.get("use_gates"):
+                mk_config = _load_sibling("mk-config")
+                mk_plan = _load_sibling("mk-plan")
+                refusals = [r for r in mk_plan.run_start_check(cur, st.data, st.home_dir())
+                            if "is not defined by the project" in r]
+                if refusals:
+                    raise Fail(refusals[0])
+                proj_gates = mk_config.project_gates(st.data) or {}
+                run["fidelity"] = True
+                if "final_gates" not in run:
+                    run["final_gates"] = list(cur.get("final_gates") or [])
+                all_tids = [c["id"] for ph in (cur.get("phases") or []) for c in (ph.get("tasks") or []) if c.get("id")]
+                for ug in cur.get("use_gates"):
+                    gid = ug.get("id")
+                    cmd = proj_gates.get(gid)
+                    if cmd:
+                        resolved = dict(ug)
+                        resolved["cmd"] = cmd
+                        resolved["expect"] = 0
+                        resolved.setdefault("timeout", 600)
+                        resolved.setdefault("every", "run_end")
+                        resolved.setdefault("covers", list(all_tids))
+                        existing_fg = next((fg for fg in run["final_gates"] if fg.get("id") == gid), None)
+                        if existing_fg:
+                            existing_fg["cmd"] = cmd
+                        else:
+                            run["final_gates"].append(resolved)
+                        run.setdefault("plan_gates", {})[gid] = {"cmd": cmd, "expect": 0, "timeout": resolved["timeout"]}
             st.event(run, "note", f"run init: {a.feature} on {a.branch}")
             if cur and was != "approved":
                 st.event(run, "note", f"plan {run['plan_id']} was {was!r}, not approved; "
@@ -2848,7 +2879,7 @@ def plan_fidelity(cur):
     """F.2: True when the parsed plan carries the gate contract: any final gate, or any task or
     subtask with a gate, a manual line, critical, or a risk other than the default 1. A pre-F plan
     parses to all defaults and gets no flag. (An explicit `risk = 1` alone is not detectable.)"""
-    if cur.get("final_gates"):
+    if cur.get("final_gates") or cur.get("use_gates"):
         return True
     for ph in cur.get("phases") or []:
         for c in ph.get("tasks") or []:
